@@ -35,8 +35,11 @@ type
     FBreakStack: TStringList; // stack of break labels
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
     FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
+    FGlobalVars: TStringList; // global variable name -> TAstVarDecl (as object)
 
     function NewTemp: Integer;
+    function IsGlobalVar(const name: string): Boolean;
+    function GetGlobalVarDecl(const name: string): TAstVarDecl;
     function NewLabel(const prefix: string): string;
     function AllocLocal(const name: string; aType: TAurumType): Integer;
     function AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
@@ -92,6 +95,8 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FStructTypes.Sorted := False;
     FClassTypes := TStringList.Create;
     FClassTypes.Sorted := False;
+    FGlobalVars := TStringList.Create;
+    FGlobalVars.Sorted := False;
     SetLength(FLocalTypes, 0);
     SetLength(FLocalElemSize, 0);
     SetLength(FLocalIsStruct, 0);
@@ -115,10 +120,27 @@ begin
   SetLength(FLocalIsStruct, 0);
   SetLength(FLocalTypeNames, 0);
   FBreakStack.Free;
-  // Don't free objects in FStructTypes/FClassTypes - they belong to the AST
+  // Don't free objects in FStructTypes/FClassTypes/FGlobalVars - they belong to the AST
   FStructTypes.Free;
   FClassTypes.Free;
+  FGlobalVars.Free;
   inherited Destroy;
+end;
+
+function TIRLowering.IsGlobalVar(const name: string): Boolean;
+begin
+  Result := FGlobalVars.IndexOf(name) >= 0;
+end;
+
+function TIRLowering.GetGlobalVarDecl(const name: string): TAstVarDecl;
+var
+  idx: Integer;
+begin
+  idx := FGlobalVars.IndexOf(name);
+  if idx >= 0 then
+    Result := TAstVarDecl(FGlobalVars.Objects[idx])
+  else
+    Result := nil;
 end;
 
 
@@ -228,9 +250,10 @@ var
   instr: TIRInstr;
 begin
   instr := Default(TIRInstr);
-  // First pass: collect all struct and class declarations for size lookups
+  // First pass: collect all struct, class, and global variable declarations
   FStructTypes.Clear;
   FClassTypes.Clear;
+  FGlobalVars.Clear;
   for i := 0 to High(prog.Decls) do
   begin
     node := prog.Decls[i];
@@ -241,6 +264,19 @@ begin
       // Classes are stored in both maps - they have the same field layout logic
       FStructTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
       FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+    end
+    else if node is TAstVarDecl then
+    begin
+      // Global variable declaration
+      if TAstVarDecl(node).IsGlobal then
+      begin
+        FGlobalVars.AddObject(TAstVarDecl(node).Name, TObject(node));
+        // Register in module with init value if it's a constant integer
+        if TAstVarDecl(node).InitExpr is TAstIntLit then
+          FModule.AddGlobalVar(TAstVarDecl(node).Name, TAstIntLit(TAstVarDecl(node).InitExpr).Value, True)
+        else
+          FModule.AddGlobalVar(TAstVarDecl(node).Name, 0, False);
+      end;
     end;
   end;
 
@@ -666,6 +702,19 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkIdent:
       begin
+        // Check if it's a global variable first
+        if IsGlobalVar(TAstIdent(expr).Name) then
+        begin
+          // Load global variable
+          t0 := NewTemp;
+          instr.Op := irLoadGlobal;
+          instr.Dest := t0;
+          instr.ImmStr := TAstIdent(expr).Name;
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
+        
         // Look up local variable
         loc := ResolveLocal(TAstIdent(expr).Name);
         if loc < 0 then
@@ -1569,6 +1618,17 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
 
     if stmt is TAstAssign then
     begin
+      // Check if it's a global variable assignment
+      if IsGlobalVar(TAstAssign(stmt).Name) then
+      begin
+        tmp := LowerExpr(TAstAssign(stmt).Value);
+        instr.Op := irStoreGlobal;
+        instr.ImmStr := TAstAssign(stmt).Name;
+        instr.Src1 := tmp;
+        Emit(instr);
+        Exit(True);
+      end;
+      
       loc := ResolveLocal(TAstAssign(stmt).Name);
       if loc < 0 then
       begin

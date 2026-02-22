@@ -24,6 +24,8 @@ type
     ParamTypes: array of TAurumType;
     ParamCount: Integer;
     IsVarArgs: Boolean; // true for variadic functions like printf
+    // for global variables
+    IsGlobal: Boolean; // true if this is a global variable
     constructor Create(const AName: string);
     destructor Destroy; override;
   end;
@@ -83,6 +85,7 @@ begin
   ArrayLen := 0;
   ParamCount := 0;
   IsVarArgs := False;
+  IsGlobal := False;
   SetLength(ParamTypes, 0);
 end;
 
@@ -1787,7 +1790,7 @@ begin
        // type declarations: register as named types (future work)
        // for now, skip
      end
-     else if node is TAstConDecl then
+      else if node is TAstConDecl then
     begin
       con := TAstConDecl(node);
       if ResolveSymbol(con.Name) <> nil then
@@ -1803,6 +1806,38 @@ begin
       sym.Kind := symCon;
       sym.DeclType := con.DeclType;
       AddSymbolToCurrent(sym, con.Span);
+    end
+    else if node is TAstVarDecl then
+    begin
+      // Global variable declaration
+      if TAstVarDecl(node).IsGlobal then
+      begin
+        if ResolveSymbol(TAstVarDecl(node).Name) <> nil then
+        begin
+          FDiag.Error('redeclaration of global variable: ' + TAstVarDecl(node).Name, node.Span);
+          Continue;
+        end;
+        // typecheck init expr
+        itype := CheckExpr(TAstVarDecl(node).InitExpr);
+        if (TAstVarDecl(node).DeclType <> atUnresolved) and not TypeEqual(itype, TAstVarDecl(node).DeclType) then
+          FDiag.Error(Format('global %s: expected type %s but got %s', 
+            [TAstVarDecl(node).Name, AurumTypeToStr(TAstVarDecl(node).DeclType), AurumTypeToStr(itype)]), node.Span);
+        sym := TSymbol.Create(TAstVarDecl(node).Name);
+        case TAstVarDecl(node).Storage of
+          skVar: sym.Kind := symVar;
+          skLet: sym.Kind := symLet;
+        else
+          sym.Kind := symVar;
+        end;
+        if TAstVarDecl(node).DeclType = atUnresolved then
+          sym.DeclType := itype
+        else
+          sym.DeclType := TAstVarDecl(node).DeclType;
+        sym.TypeName := TAstVarDecl(node).DeclTypeName;
+        sym.ArrayLen := TAstVarDecl(node).ArrayLen;
+        sym.IsGlobal := True;
+        AddSymbolToCurrent(sym, node.Span);
+      end;
     end;
   end;
 

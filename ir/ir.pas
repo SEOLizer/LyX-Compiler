@@ -27,6 +27,9 @@ type
     irNot, irAnd, irOr, irNor, irXor,
      irLoadLocal, irStoreLocal, irLoadLocalAddr,
      irLoadStructAddr,  // load base address of struct local (needs StructSize for correct calculation)
+     // global variable operations
+     irLoadGlobal,   // load global: Dest = globals[ImmStr]
+     irStoreGlobal,  // store global: globals[ImmStr] = Src1
     // width/sign helpers
     irSExt,    // sign-extend Src1 to ImmInt bits -> Dest
     irZExt,    // zero-extend Src1 to ImmInt bits -> Dest
@@ -96,15 +99,24 @@ type
     procedure Emit(const instr: TIRInstr);
   end;
 
+  TGlobalVar = record
+    Name: string;
+    InitValue: Int64;
+    HasInitValue: Boolean;
+  end;
+  TGlobalVarArray = array of TGlobalVar;
+
   TIRModule = class
   public
     Functions: array of TIRFunction;
     Strings: TStringList; // deduplicated strings
+    GlobalVars: TGlobalVarArray; // global variables with init values
     constructor Create;
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
     function FindFunction(const name: string): TIRFunction;
     function InternString(const s: string): Integer;
+    function AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
   end;
 
 implementation
@@ -142,6 +154,7 @@ begin
   Strings := TStringList.Create;
   Strings.Sorted := False;
   Strings.Duplicates := dupIgnore;
+  GlobalVars := nil;
 end;
 
 destructor TIRModule.Destroy;
@@ -180,6 +193,22 @@ begin
   if Result >= 0 then Exit;
   Strings.Add(s);
   Result := Strings.Count - 1;
+end;
+
+function TIRModule.AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
+var
+  i: Integer;
+begin
+  // Check if already exists
+  for i := 0 to High(GlobalVars) do
+    if GlobalVars[i].Name = name then
+      Exit(i);
+  // Add new
+  Result := Length(GlobalVars);
+  SetLength(GlobalVars, Result + 1);
+  GlobalVars[Result].Name := name;
+  GlobalVars[Result].InitValue := initVal;
+  GlobalVars[Result].HasInitValue := hasInit;
 end;
 
 { Initialize a TIRInstr with safe default values }
