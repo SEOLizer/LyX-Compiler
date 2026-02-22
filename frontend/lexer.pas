@@ -32,6 +32,8 @@ type
     tkColon, tkComma, tkSemicolon, tkEllipsis, tkDot, tkAt,
     // Null-Safety Operatoren
     tkQuestion, tkNullCoalesce, tkSafeCall,
+    // Pipe-Operator
+    tkPipe,
     // Sonstiges
     tkEOF, tkError
   );
@@ -160,6 +162,7 @@ begin
     tkQuestion:  Result := '?';
     tkNullCoalesce: Result := '??';
     tkSafeCall:  Result := '?.';
+    tkPipe:      Result := '|>';
     tkEOF:       Result := 'EOF';
     tkError:     Result := 'ERROR';
   end;
@@ -686,9 +689,14 @@ begin
         Advance;
         Result := MakeToken(tkNor, '|~', startLine, startCol, 2);
       end
+      else if (not IsAtEnd) and (CurrentChar = '>') then
+      begin
+        Advance;
+        Result := MakeToken(tkPipe, '|>', startLine, startCol, 2);
+      end
       else
       begin
-        FDiag.Error('unexpected ''|'', did you mean ''||'' or ''|~''?',
+        FDiag.Error('unexpected ''|'', did you mean ''||'', ''|~'' or ''|>''?',
           MakeSpan(startLine, startCol, 1, FFileName));
         Result := MakeToken(tkError, '|', startLine, startCol, 1);
       end;

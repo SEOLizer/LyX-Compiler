@@ -37,8 +37,9 @@ type
     function ParseRepeatUntilStmt: TAstRepeatUntil;
     function ParseAssignStmtOrExprStmt: TAstStmt;
 
-    // Expressions (Präzedenz): Or -> And -> Cmp -> Add -> Mul -> Unary -> Primary -> Postfix
+    // Expressions (Präzedenz): Pipe -> NullCoalesce -> Or -> And -> Cmp -> Add -> Mul -> Unary -> Primary -> Postfix
     function ParseExpr: TAstExpr;
+    function ParsePipeExpr: TAstExpr;
     function ParseNullCoalesceExpr: TAstExpr;
     function ParseOrExpr: TAstExpr;
     function ParseAndExpr: TAstExpr;
@@ -933,7 +934,65 @@ end;
 
 function TParser.ParseExpr: TAstExpr;
 begin
+  Result := ParsePipeExpr;
+end;
+
+function TParser.ParsePipeExpr: TAstExpr;
+var
+  funcName: string;
+  args, newArgs: TAstExprList;
+  i: Integer;
+  span: TSourceSpan;
+begin
   Result := ParseNullCoalesceExpr;
+  while Accept(tkPipe) do
+  begin
+    span := FCurTok.Span;
+    // Nach |> muss ein Ident oder ein Call kommen
+    if Check(tkIdent) then
+    begin
+      funcName := FCurTok.Value;
+      Advance;
+      
+      // Prüfen ob es ein Call ist (mit Klammern)
+      if Accept(tkLParen) then
+      begin
+        // Parse Argumente
+        args := nil;
+        if not Check(tkRParen) then
+        begin
+          while True do
+          begin
+            SetLength(args, Length(args) + 1);
+            args[High(args)] := ParseExpr;
+            if Accept(tkComma) then Continue;
+            Break;
+          end;
+        end;
+        Expect(tkRParen);
+        
+        // Desugar: expr |> func(a, b) -> func(expr, a, b)
+        SetLength(newArgs, Length(args) + 1);
+        newArgs[0] := Result;  // Pipe-Ergebnis als erstes Argument
+        for i := 0 to High(args) do
+          newArgs[i + 1] := args[i];
+        
+        Result := TAstCall.Create(funcName, newArgs, span);
+      end
+      else
+      begin
+        // Desugar: expr |> func -> func(expr)
+        SetLength(newArgs, 1);
+        newArgs[0] := Result;
+        Result := TAstCall.Create(funcName, newArgs, span);
+      end;
+    end
+    else
+    begin
+      FDiag.Error('expected function name after |>', span);
+      Exit;
+    end;
+  end;
 end;
 
 function TParser.ParseNullCoalesceExpr: TAstExpr;
