@@ -20,6 +20,7 @@ type
     FModule: TIRModule;
     FCurrentFunc: TIRFunction;
     FCurrentFuncDecl: TAstFuncDecl;  // current AST function being lowered (for return type info)
+    FCurrentClassDecl: TAstClassDecl; // current class being lowered (for super calls)
     FDiag: TDiagnostics;
     FTempCounter: Integer;
     FLabelCounter: Integer;
@@ -32,6 +33,7 @@ type
     FLocalConst: array of TConstValue; // per-function local constant values (or nil)
     FBreakStack: TStringList; // stack of break labels
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
+    FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
 
     function NewTemp: Integer;
     function NewLabel(const prefix: string): string;
@@ -76,6 +78,7 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FModule := modul;
     FDiag := diag;
     FCurrentFuncDecl := nil;
+    FCurrentClassDecl := nil;
     FTempCounter := 0;
     FLabelCounter := 0;
     FLocalMap := TStringList.Create;
@@ -86,6 +89,8 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FBreakStack.Sorted := False;
     FStructTypes := TStringList.Create;
     FStructTypes.Sorted := False;
+    FClassTypes := TStringList.Create;
+    FClassTypes.Sorted := False;
     SetLength(FLocalTypes, 0);
     SetLength(FLocalElemSize, 0);
     SetLength(FLocalIsStruct, 0);
@@ -95,7 +100,7 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
 
 
 destructor TIRLowering.Destroy;
-  var
+var
   i: Integer;
 begin
   FLocalMap.Free;
@@ -107,8 +112,9 @@ begin
   SetLength(FLocalConst, 0);
   SetLength(FLocalIsStruct, 0);
   FBreakStack.Free;
-  // Don't free objects in FStructTypes - they belong to the AST
+  // Don't free objects in FStructTypes/FClassTypes - they belong to the AST
   FStructTypes.Free;
+  FClassTypes.Free;
   inherited Destroy;
 end;
 
@@ -214,14 +220,18 @@ begin
   instr := Default(TIRInstr);
   // First pass: collect all struct and class declarations for size lookups
   FStructTypes.Clear;
+  FClassTypes.Clear;
   for i := 0 to High(prog.Decls) do
   begin
     node := prog.Decls[i];
     if node is TAstStructDecl then
       FStructTypes.AddObject(TAstStructDecl(node).Name, TObject(node))
     else if node is TAstClassDecl then
-      // Classes are stored in the same map - they have the same field layout logic
+    begin
+      // Classes are stored in both maps - they have the same field layout logic
       FStructTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+      FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+    end;
   end;
 
   // iterate top-level decls, create functions
@@ -346,6 +356,7 @@ begin
     else if node is TAstClassDecl then
     begin
       // Lower each class method as a top-level mangled function: _L_<Class>_<Method>
+      FCurrentClassDecl := TAstClassDecl(node); // set for super calls
       for j := 0 to High(TAstClassDecl(node).Methods) do
       begin
         m := TAstClassDecl(node).Methods[j];
@@ -419,6 +430,7 @@ begin
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
+      FCurrentClassDecl := nil; // clear after processing all methods of this class
     end
     else if node is TAstConDecl then
     begin
@@ -583,6 +595,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     fldOffset: Integer;
     ownerName: string;
     slotCount: Integer;
+    baseIdx: Integer;
+    mangled: string;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -933,15 +947,30 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         t0 := NewTemp;
         if fldOffset >= 0 then
         begin
-          instr.Op := irLoadField;
-          instr.Dest := t0;
-          instr.Src1 := t1;
-          instr.ImmInt := fldOffset; // use ImmInt for immediate offset
-          Emit(instr);
+          // Check if owner is a class (heap) or struct (stack)
+          if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
+          begin
+            // Class: use positive offset (heap access)
+            instr.Op := irLoadFieldHeap;
+            instr.Dest := t0;
+            instr.Src1 := t1;
+            instr.ImmInt := fldOffset; // positive offset for heap
+            Emit(instr);
+          end
+          else
+          begin
+            // Struct: use negative offset (stack access)
+            instr.Op := irLoadField;
+            instr.Dest := t0;
+            instr.Src1 := t1;
+            instr.ImmInt := fldOffset; // will be negated in backend
+            Emit(instr);
+          end;
         end
         else
         begin
           // Fallback to name-based access (slower / requires runtime lookup)
+          // Assume struct for fallback
           instr.Op := irLoadField;
           instr.Dest := t0;
           instr.Src1 := t1;
@@ -983,7 +1012,11 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         t0 := NewTemp;
         instr.Op := irAlloc;
         instr.Dest := t0;
-        instr.ImmInt := TAstStructDecl(FStructTypes.Objects[i]).Size;
+        // Check if it's a class or struct - they have different layouts
+        if FStructTypes.Objects[i] is TAstClassDecl then
+          instr.ImmInt := TAstClassDecl(FStructTypes.Objects[i]).Size
+        else
+          instr.ImmInt := TAstStructDecl(FStructTypes.Objects[i]).Size;
         if instr.ImmInt = 0 then
           instr.ImmInt := 8; // minimum allocation
         Emit(instr);
@@ -993,22 +1026,51 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     nkSuperCall:
       begin
         // super.method(args) - call base class method
-        // For now, treat as a regular call (super resolution happens in sema)
-        // The method name should have been resolved to a mangled name
-        argCount := Length(TAstSuperCall(expr).Args);
-        SetLength(argTemps, argCount);
-        for i := 0 to argCount - 1 do
-          argTemps[i] := LowerExpr(TAstSuperCall(expr).Args[i]);
+        // Requires FCurrentClassDecl to be set (we're in a class method)
+        if not Assigned(FCurrentClassDecl) or (FCurrentClassDecl.BaseClassName = '') then
+        begin
+          FDiag.Error('super call outside of derived class method', expr.Span);
+          Result := -1;
+          Exit;
+        end;
         
+        // Find base class in FClassTypes
+        baseIdx := FClassTypes.IndexOf(FCurrentClassDecl.BaseClassName);
+        if baseIdx < 0 then
+        begin
+          FDiag.Error('unknown base class: ' + FCurrentClassDecl.BaseClassName, expr.Span);
+          Result := -1;
+          Exit;
+        end;
+        
+        // Build mangled name: _L_<BaseClass>_<MethodName>
+        mangled := '_L_' + FCurrentClassDecl.BaseClassName + '_' + TAstSuperCall(expr).MethodName;
+        
+        // Build args: [self, originalArgs...]
+        argCount := Length(TAstSuperCall(expr).Args);
+        SetLength(argTemps, argCount + 1);
+        
+        // First arg is self (local index 0)
+        t0 := NewTemp;
+        instr.Op := irLoadLocal;
+        instr.Dest := t0;
+        instr.Src1 := 0; // self is always at local index 0
+        Emit(instr);
+        argTemps[0] := t0;
+        
+        // Lower remaining args
+        for i := 0 to argCount - 1 do
+          argTemps[i + 1] := LowerExpr(TAstSuperCall(expr).Args[i]);
+        
+        // Emit call
         t0 := NewTemp;
         instr.Op := irCall;
         instr.Dest := t0;
-        // Method name will be resolved by sema to the base class mangled name
-        instr.ImmStr := '_SUPER_' + TAstSuperCall(expr).MethodName;
-        instr.ImmInt := argCount;
+        instr.ImmStr := mangled;
+        instr.ImmInt := argCount + 1; // +1 for self
         instr.CallMode := cmInternal;
-        SetLength(instr.ArgTemps, argCount);
-        for i := 0 to argCount - 1 do
+        SetLength(instr.ArgTemps, argCount + 1);
+        for i := 0 to argCount do
           instr.ArgTemps[i] := argTemps[i];
         Emit(instr);
         Result := t0;
@@ -1192,6 +1254,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     call: TAstCall;
     argCount: Integer;
     argTemps: array of Integer;
+    ownerName: string;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -1267,55 +1330,86 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
        end;
        Exit(True);
      end
-     else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
-     begin
-       // Named struct type: allocate slots for the whole struct
-       // Size is in bytes, each slot is 8 bytes
-       i := FStructTypes.IndexOf(vd.DeclTypeName);
-       if TAstStructDecl(FStructTypes.Objects[i]).Size > 0 then
-       begin
-         loc := AllocLocalMany(vd.Name, atUnresolved, 
-           (TAstStructDecl(FStructTypes.Objects[i]).Size + 7) div 8, True);
-       end
-       else
-       begin
-         // fallback: 1 slot
-         loc := AllocLocal(vd.Name, atUnresolved);
-         FLocalIsStruct[loc] := True;
-       end;
-       // Initialize based on InitExpr type
-       if (vd.InitExpr is TAstIntLit) and (TAstIntLit(vd.InitExpr).Value = 0) then
-       begin
-         // Zero initialization
-         t0 := NewTemp;
-         instr.Op := irConstInt; instr.Dest := t0; instr.ImmInt := 0; Emit(instr);
-         instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := t0; Emit(instr);
-       end
-      else if vd.InitExpr is TAstStructLit then
+      else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
+      begin
+        // Check if this is a class (reference type) or struct (value type)
+        i := FStructTypes.IndexOf(vd.DeclTypeName);
+        
+        // Classes are stored in FStructTypes but are reference types (pointers)
+        if FStructTypes.Objects[i] is TAstClassDecl then
         begin
-          // Struct literal: initialize fields directly into the variable's stack slots
-          LowerStructLitIntoLocal(TAstStructLit(vd.InitExpr), loc, TAstStructDecl(FStructTypes.Objects[i]));
-        end
-        else if vd.InitExpr is TAstCall then
-        begin
-          // Call returning struct: use irCallStruct to handle RAX+RDX properly
-          call := TAstCall(vd.InitExpr);
-          argCount := Length(call.Args);
-          SetLength(argTemps, argCount);
-          for k := 0 to argCount - 1 do
-            argTemps[k] := LowerExpr(call.Args[k]);
+          // Class: allocate 1 slot for pointer, handle new expression
+          loc := AllocLocal(vd.Name, atUnresolved);
           
-          // Emit irCallStruct with struct size info
-          instr.Op := irCallStruct;
-          instr.Dest := loc;  // destination is the struct variable slot
-          instr.ImmStr := call.Name;
-          instr.ImmInt := argCount;
-          instr.StructSize := TAstStructDecl(FStructTypes.Objects[i]).Size;
-          instr.CallMode := cmInternal;
-          SetLength(instr.ArgTemps, argCount);
-          for k := 0 to argCount - 1 do
-            instr.ArgTemps[k] := argTemps[k];
-          Emit(instr);
+          // Handle initializer
+          if vd.InitExpr is TAstNewExpr then
+          begin
+            // new ClassName() - already lowered to irAlloc in LowerExpr
+            tmp := LowerExpr(vd.InitExpr);
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end
+          else
+          begin
+            // Other initializer (shouldn't happen for classes, but handle gracefully)
+            tmp := LowerExpr(vd.InitExpr);
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          // Struct: allocate slots for the whole struct
+          // Size is in bytes, each slot is 8 bytes
+          if TAstStructDecl(FStructTypes.Objects[i]).Size > 0 then
+          begin
+            loc := AllocLocalMany(vd.Name, atUnresolved, 
+              (TAstStructDecl(FStructTypes.Objects[i]).Size + 7) div 8, True);
+          end
+          else
+          begin
+            // fallback: 1 slot
+            loc := AllocLocal(vd.Name, atUnresolved);
+            FLocalIsStruct[loc] := True;
+          end;
+          // Initialize based on InitExpr type
+          if (vd.InitExpr is TAstIntLit) and (TAstIntLit(vd.InitExpr).Value = 0) then
+          begin
+            // Zero initialization
+            t0 := NewTemp;
+            instr.Op := irConstInt; instr.Dest := t0; instr.ImmInt := 0; Emit(instr);
+            instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := t0; Emit(instr);
+          end
+          else if vd.InitExpr is TAstStructLit then
+          begin
+            // Struct literal: initialize fields directly into the variable's stack slots
+            LowerStructLitIntoLocal(TAstStructLit(vd.InitExpr), loc, TAstStructDecl(FStructTypes.Objects[i]));
+          end
+          else if vd.InitExpr is TAstCall then
+          begin
+            // Call returning struct: use irCallStruct to handle RAX+RDX properly
+            call := TAstCall(vd.InitExpr);
+            argCount := Length(call.Args);
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do
+              argTemps[k] := LowerExpr(call.Args[k]);
+            
+            // Emit irCallStruct with struct size info
+            instr.Op := irCallStruct;
+            instr.Dest := loc;  // destination is the struct variable slot
+            instr.ImmStr := call.Name;
+            instr.ImmInt := argCount;
+            instr.StructSize := TAstStructDecl(FStructTypes.Objects[i]).Size;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for k := 0 to argCount - 1 do
+              instr.ArgTemps[k] := argTemps[k];
+            Emit(instr);
+          end;
         end;
         Exit(True);
       end
@@ -1437,14 +1531,33 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       if t1 < 0 then Exit(False);
       t2 := LowerExpr(fa.Value);
       if t2 < 0 then Exit(False);
-      instr.Op := irStoreField;
-      instr.Src1 := t1; // base pointer
-      instr.Src2 := t2; // value temp
-      if fa.Target.FieldOffset >= 0 then
-        instr.ImmInt := fa.Target.FieldOffset
+      
+      // Check if target's owner is a class (heap) or struct (stack)
+      ownerName := fa.Target.OwnerName;
+      if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
+      begin
+        // Class: use positive offset (heap access)
+        instr.Op := irStoreFieldHeap;
+        instr.Src1 := t1; // base pointer (heap address)
+        instr.Src2 := t2; // value temp
+        if fa.Target.FieldOffset >= 0 then
+          instr.ImmInt := fa.Target.FieldOffset // positive offset for heap
+        else
+          instr.LabelName := fa.Target.Field;
+        Emit(instr);
+      end
       else
-        instr.LabelName := fa.Target.Field;
-      Emit(instr);
+      begin
+        // Struct: use negative offset (stack access)
+        instr.Op := irStoreField;
+        instr.Src1 := t1; // base pointer
+        instr.Src2 := t2; // value temp
+        if fa.Target.FieldOffset >= 0 then
+          instr.ImmInt := fa.Target.FieldOffset
+        else
+          instr.LabelName := fa.Target.Field;
+        Emit(instr);
+      end;
       Exit(True);
     end;
 

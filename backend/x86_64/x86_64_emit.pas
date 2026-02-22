@@ -519,7 +519,6 @@ begin
       SetLength(tempStrIndex, maxTemp);
       for k := 0 to maxTemp - 1 do tempStrIndex[k] := -1;
 
-
     for j := 0 to High(module.Functions[i].Instructions) do
     begin
       instr := module.Functions[i].Instructions[j];
@@ -1573,7 +1572,7 @@ begin
           end;
         irCall:
           begin
-            // Call user-defined function (simple SysV-ish implementation)
+            // Call user-defined functions (simple SysV-ish implementation)
             // Args info: instr.ImmInt = argCount, instr.Src1/Src2 first two temp indices,
             // remaining temps serialized in instr.LabelName as CSV starting from index 2.
             argCount := instr.ImmInt;
@@ -1894,6 +1893,53 @@ begin
             end;
           end;
 
+        irLoadFieldHeap:
+          begin
+            // Load field from heap object: Dest = *(Src1 + ImmInt)
+            // Src1 = temp holding heap pointer (positive offset)
+            // ImmInt = field offset in bytes (POSITIVE for heap objects)
+            // Load heap pointer into RAX
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Load field value: mov rcx, [rax + offset] (positive!)
+            if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+            begin
+              // mov rcx, [rax + disp8]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+            end
+            else
+            begin
+              // mov rcx, [rax + disp32]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(instr.ImmInt));
+            end;
+            // Store result in destination temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irStoreFieldHeap:
+          begin
+            // Store field into heap object: *(Src1 + ImmInt) = Src2
+            // Src1 = temp holding heap pointer (positive offset)
+            // Src2 = temp holding value to store
+            // ImmInt = field offset in bytes (POSITIVE for heap objects)
+            // Load heap pointer into RAX
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Load value to store into RCX
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            // Store field value: mov [rax + offset], rcx (positive!)
+            if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+            begin
+              // mov [rax + disp8], rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+            end
+            else
+            begin
+              // mov [rax + disp32], rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(instr.ImmInt));
+            end;
+          end;
+
         irAlloc:
           begin
             // Heap allocation: Dest = alloc(ImmInt bytes)
@@ -1924,22 +1970,9 @@ begin
         irFree:
           begin
             // Heap deallocation: free(Src1)
-            // Use munmap syscall: sys_munmap(addr=Src1, len=0) - we don't track size, just free the page
-            // Actually, we need to be more careful here. For now, just skip freeing.
-            // A proper implementation would track allocation sizes.
-            // Alternative: Use brk for smaller allocations
-            
-            // For now, load pointer and call munmap with a reasonable size
-            // syscall number 11 on x86_64 (munmap)
-            // Load pointer into RDI
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
-            // mov rax, 11 (sys_munmap)
-            WriteMovRegImm64(FCode, RAX, 11);
-            // mov rsi, 4096 (length - assume page-sized allocation for now)
-            WriteMovRegImm64(FCode, RSI, 4096);
-            // syscall
-            WriteSyscall(FCode);
-            // Ignore result for now
+            // TODO: Proper implementation needs to track allocation sizes
+            // For now, skip freeing to avoid munmap with wrong size
+            // This causes a memory leak but prevents crashes
           end;
       end;
     end;

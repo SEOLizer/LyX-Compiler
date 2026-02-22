@@ -46,12 +46,15 @@ type
      irStoreElem,   // store element at array[index] (static index in ImmInt)
      irLoadElem,    // load element from array[index] (dynamic index in Src2)
      irStoreElemDyn,// store element at array[index] (dynamic index, uses 3 sources)
-     // struct field operations
-     irLoadField,   // load field: Dest = *(Src1 + fieldOffset)
-    irStoreField,   // store field: *(Src1 + fieldOffset) = Src2
-    // heap allocation (for classes)
-    irAlloc,        // heap allocate: Dest = alloc(ImmInt bytes) -> pointer in Dest
-    irFree,         // heap free: free(Src1) - frees memory at pointer
+     // struct field operations (stack-based, negative offsets)
+     irLoadField,   // load field: Dest = *(Src1 - ImmInt)
+    irStoreField,   // store field: *(Src1 - ImmInt) = Src2
+     // heap object field operations (positive offsets from pointer)
+     irLoadFieldHeap,  // load field from heap: Dest = *(Src1 + ImmInt)
+     irStoreFieldHeap, // store field to heap: *(Src1 + ImmInt) = Src2
+    // heap memory management
+    irAlloc,          // heap allocate: Dest = alloc(ImmInt bytes) -> pointer
+    irFree,           // heap free: free(Src1 pointer)
     // exception handler ops
     irPushHandler,  // push handler frame: Src1 = handler_addr, LabelName = catch_label
     irPopHandler,   // pop handler frame: Src1 = handler_addr
