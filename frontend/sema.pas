@@ -637,10 +637,48 @@ begin
             call.SetName(mangledName);
             // no change to args (receiver stays as first param)
           end
-          else if (s = nil) and Assigned(sSym) and (not Assigned(sSym.StructDecl)) then
+          // Instance method call (receiver is a variable with class type)
+          else if (s = nil) and Assigned(sSym) and Assigned(sSym.ClassDecl) then
           begin
-            // sSym found but StructDecl is nil - this is a bug in registration
-            FDiag.Error('internal error: variable ' + TAstIdent(recv).Name + ' has no StructDecl', call.Span);
+            mangledName := '_L_' + sSym.ClassDecl.Name + '_' + mName;
+            s := ResolveSymbol(mangledName);
+            if s = nil then
+            begin
+              FDiag.Error('call to undeclared method: ' + mangledName, call.Span);
+              Result := atUnresolved;
+              Exit;
+            end;
+            // perform in-place rewrite of call node to point to mangled function
+            call.SetName(mangledName);
+            // no change to args (receiver stays as first param)
+          end
+          else if (s = nil) and Assigned(sSym) and (not Assigned(sSym.StructDecl)) and (not Assigned(sSym.ClassDecl)) then
+          begin
+            // sSym found but no type decl - this might be a class variable without ClassDecl set
+            // Try to resolve using TypeName
+            if (sSym.TypeName <> '') and Assigned(FClassTypes) then
+            begin
+              fi := FClassTypes.IndexOf(sSym.TypeName);
+              if fi >= 0 then
+              begin
+                mangledName := '_L_' + sSym.TypeName + '_' + mName;
+                s := ResolveSymbol(mangledName);
+                if s <> nil then
+                begin
+                  call.SetName(mangledName);
+                  // Continue with normal function call checking
+                end
+                else
+                begin
+                  FDiag.Error('call to undeclared method: ' + mangledName, call.Span);
+                  Result := atUnresolved;
+                  Exit;
+                end;
+              end;
+            end;
+            
+            if s = nil then
+              FDiag.Error('internal error: variable ' + TAstIdent(recv).Name + ' has no type declaration', call.Span);
           end;
           
           if s = nil then
@@ -885,11 +923,28 @@ begin
           sym.DeclType := vd.DeclType;
         // record named type if present
         sym.TypeName := vd.DeclTypeName;
-        if (sym.TypeName <> '') and Assigned(FStructTypes) then
+        if (sym.TypeName <> '') then
         begin
-          i := FStructTypes.IndexOf(sym.TypeName);
-          if i >= 0 then
-            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[i]);
+          // Check for struct type
+          if Assigned(FStructTypes) then
+          begin
+            i := FStructTypes.IndexOf(sym.TypeName);
+            if i >= 0 then
+            begin
+              // Check if it's actually a class (stored in same map)
+              if FStructTypes.Objects[i] is TAstClassDecl then
+                sym.ClassDecl := TAstClassDecl(FStructTypes.Objects[i])
+              else
+                sym.StructDecl := TAstStructDecl(FStructTypes.Objects[i]);
+            end;
+          end;
+          // Also check FClassTypes directly
+          if (sym.ClassDecl = nil) and Assigned(FClassTypes) then
+          begin
+            i := FClassTypes.IndexOf(sym.TypeName);
+            if i >= 0 then
+              sym.ClassDecl := TAstClassDecl(FClassTypes.Objects[i]);
+          end;
         end;
         // array length metadata
         sym.ArrayLen := vd.ArrayLen;
