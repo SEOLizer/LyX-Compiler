@@ -262,11 +262,14 @@ type
     FArrayLen: Integer;    // 0 = not array, >0 = static length, -1 = dynamic array ([]) 
     FInitExpr: TAstExpr;
     FIsNullable: Boolean;  // true if type ends with ? (null-safety)
+    FIsGlobal: Boolean;    // true if declared at top-level
+    FIsPublic: Boolean;    // true if declared with 'pub'
   public
     constructor Create(aStorage: TStorageKlass; const aName: string;
       aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
       aInitExpr: TAstExpr; aIsNullable: Boolean; aSpan: TSourceSpan);
     destructor Destroy; override;
+    procedure SetGlobal(aIsGlobal, aIsPublic: Boolean);
     property Storage: TStorageKlass read FStorage;
     property Name: string read FName;
     property DeclType: TAurumType read FDeclType;
@@ -274,6 +277,8 @@ type
     property ArrayLen: Integer read FArrayLen;
     property InitExpr: TAstExpr read FInitExpr;
     property IsNullable: Boolean read FIsNullable;
+    property IsGlobal: Boolean read FIsGlobal;
+    property IsPublic: Boolean read FIsPublic;
   end;
 
   { Zuweisung: x := expr; }
@@ -944,6 +949,14 @@ begin
   FArrayLen := aArrayLen;
   FInitExpr := aInitExpr;
   FIsNullable := aIsNullable;
+  FIsGlobal := False;
+  FIsPublic := False;
+end;
+
+procedure TAstVarDecl.SetGlobal(aIsGlobal, aIsPublic: Boolean);
+begin
+  FIsGlobal := aIsGlobal;
+  FIsPublic := aIsPublic;
 end;
 
 destructor TAstVarDecl.Destroy;

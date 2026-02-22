@@ -26,6 +26,7 @@ type
     function ParseFuncDecl(isPub: Boolean): TAstFuncDecl;
     function ParseConDecl(isPub: Boolean): TAstConDecl;
     function ParseTypeDecl(isPub: Boolean): TAstNode;
+    function ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
     function ParseUnitDecl: TAstUnitDecl;
     function ParseImportDecl: TAstImportDecl;
 
@@ -173,9 +174,11 @@ begin
       Exit(ParseConDecl(True))
     else if Check(tkType) then
       Exit(ParseTypeDecl(True))
+    else if Check(tkVar) or Check(tkLet) then
+      Exit(ParseGlobalVarDecl(True))
     else
     begin
-      FDiag.Error('expected fn, con or type after pub', FCurTok.Span);
+      FDiag.Error('expected fn, con, type, var or let after pub', FCurTok.Span);
       Exit(nil);
     end;
   end;
@@ -230,6 +233,9 @@ begin
     Exit(ParseConDecl(False));
   if Check(tkType) then
     Exit(ParseTypeDecl(False));
+  // Global variables: var/let at top-level
+  if Check(tkVar) or Check(tkLet) then
+    Exit(ParseGlobalVarDecl(False));
   // unexpected top-level
   FDiag.Error('unexpected top-level declaration', FCurTok.Span);
   Result := nil;
@@ -780,6 +786,51 @@ begin
   Expect(tkSemicolon);
 
   Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span);
+end;
+
+function TParser.ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
+var
+  storage: TStorageKlass;
+  name: string;
+  declType: TAurumType;
+  declTypeName: string;
+  initExpr: TAstExpr;
+  arrayLen: Integer;
+  isNullable: Boolean;
+  span: TSourceSpan;
+begin
+  span := FCurTok.Span;
+  
+  if Accept(tkVar) then 
+    storage := skVar
+  else if Accept(tkLet) then 
+    storage := skLet
+  else 
+  begin
+    FDiag.Error('expected var or let', FCurTok.Span);
+    Exit(nil);
+  end;
+
+  if Check(tkIdent) then
+  begin
+    name := FCurTok.Value; 
+    Advance;
+  end
+  else
+  begin
+    name := '<anon>'; 
+    FDiag.Error('expected identifier in global declaration', FCurTok.Span);
+  end;
+
+  Expect(tkColon);
+  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
+
+  Expect(tkAssign);
+  initExpr := ParseExpr;
+  Expect(tkSemicolon);
+
+  Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
+  Result.SetGlobal(True, isPub);
 end;
 
 function TParser.ParseForStmt: TAstFor;

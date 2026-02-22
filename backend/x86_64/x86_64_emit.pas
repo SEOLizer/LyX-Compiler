@@ -345,6 +345,13 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   randomSeedAdded: Boolean;
   randomSeedOffset: UInt64;
   randomSeedLeaPositions: array of Integer;
+  // global variables storage
+  globalVarNames: TStringList;          // name -> index
+  globalVarOffsets: array of UInt64;    // index -> offset in data section
+  globalVarLeaPositions: array of record
+    VarIndex: Integer;
+    CodePos: Integer;
+  end;
    nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
    targetPos, jmpPos: Integer;
    jmpAfterPadPos: Integer;
@@ -379,6 +386,8 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   // external symbol search
   found: Boolean;
   ei: Integer;
+  // global variable index
+  varIdx: Integer;
   // diagnostic dump
   dumpStart, dumpEnd, dumpLen, di: Integer;
   dumpBuf: array of Byte;
@@ -412,6 +421,26 @@ begin
   randomSeedAdded := False;
   randomSeedOffset := 0;
   SetLength(randomSeedLeaPositions, 0);
+  
+  // Initialize global variables tracking
+  globalVarNames := TStringList.Create;
+  globalVarNames.Sorted := False;
+  SetLength(globalVarOffsets, 0);
+  SetLength(globalVarLeaPositions, 0);
+  
+  // Pre-allocate all global variables from IR module
+  for i := 0 to High(module.GlobalVars) do
+  begin
+    globalVarNames.Add(module.GlobalVars[i].Name);
+    SetLength(globalVarOffsets, globalVarNames.Count);
+    globalVarOffsets[High(globalVarOffsets)] := totalDataOffset;
+    // Write initial value
+    if module.GlobalVars[i].HasInitValue then
+      FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+    else
+      FData.WriteU64LE(0);
+    Inc(totalDataOffset, 8);
+  end;
 
   // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
   begin
@@ -1305,6 +1334,61 @@ begin
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
             WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
           end;
+        irLoadGlobal:
+          begin
+            // Load global variable into temp: dest = globals[ImmStr]
+            // Find or allocate slot for this global variable
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0); // Initialize to 0
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rcx, [rip+disp32] ; will be patched later
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+            // Record position for patching
+            SetLength(globalVarLeaPositions, Length(globalVarLeaPositions) + 1);
+            globalVarLeaPositions[High(globalVarLeaPositions)].VarIndex := varIdx;
+            globalVarLeaPositions[High(globalVarLeaPositions)].CodePos := leaPos;
+            // mov rax, [rcx]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
+            // Store into temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irStoreGlobal:
+          begin
+            // Store temp into global variable: globals[ImmStr] = src1
+            // Load value from temp
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Find or allocate slot for this global variable
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rcx, [rip+disp32] ; will be patched later
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+            // Record position for patching
+            SetLength(globalVarLeaPositions, Length(globalVarLeaPositions) + 1);
+            globalVarLeaPositions[High(globalVarLeaPositions)].VarIndex := varIdx;
+            globalVarLeaPositions[High(globalVarLeaPositions)].CodePos := leaPos;
+            // mov [rcx], rax
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
+          end;
         irLoadLocalAddr:
           begin
             // Load address of local variable into temp: dest = &locals[src1]
@@ -2118,6 +2202,21 @@ begin
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;
   end;
+
+  // patch global variable LEAs
+  for i := 0 to High(globalVarLeaPositions) do
+  begin
+    leaPos := globalVarLeaPositions[i].CodePos;
+    varIdx := globalVarLeaPositions[i].VarIndex;
+    codeVA := $400000 + 4096;
+    instrVA := codeVA + leaPos + 7;
+    dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + globalVarOffsets[varIdx];
+    disp32 := Int64(dataVA) - Int64(instrVA);
+    FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+  end;
+  
+  // Free global variable names list
+  globalVarNames.Free;
 
   // patch jumps to labels
   for i := 0 to High(FJumpPatches) do
