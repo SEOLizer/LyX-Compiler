@@ -13,6 +13,12 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 - `Div64(a: int64, b: int64): int64`
 - `Mod64(a: int64, b: int64): int64`
 - `TimesTwo(x: int64): int64`
+- `RandomRange(min: int64, max: int64): int64` - Zufallszahl in Bereich
+- `RandomBetween(min: int64, max: int64): int64` - Inklusive min, exklusive max
+
+**Random-Builtins (nativ, kein Import nötig):**
+- `Random(): int64` - Pseudo-Zufallszahl (0..2³¹-1)
+- `RandomSeed(seed: int64): void` - Seed für LCG setzen
 
 *Hinweis: Zusätzlich stehen 22 native Math-Builtins zur Verfügung (siehe Haupt-README).* 
 

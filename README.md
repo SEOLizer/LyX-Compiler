@@ -4,14 +4,16 @@
 Er erzeugt direkt ausführbare **Linux x86_64 ELF64-Binaries** — ohne libc, ohne Linker, rein über Syscalls.
 
 ```
-Lyx Compiler v0.1.6
+Lyx Compiler v0.1.7
 Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 
 ✅ Vollständiges Module System mit Import/Export
 ✅ Cross-Unit Function Calls und Symbol Resolution  
-✅ Standard Library (std.math, std.io)
+✅ Standard Library (std.math, std.io, std.string)
 ✅ Robuste Parser mit While/If/Function Support
-✅ OOP-light: Struct Literals, Instanz-Methoden, Statische Methoden
+✅ OOP: Classes, Vererbung, Konstruktoren, Destruktoren
+✅ Globale Variablen mit Initialisierung
+✅ Random/RandomSeed Builtins
 ```
 
 ---
@@ -67,10 +69,37 @@ fn main(): int64 {
 
 | Keyword | Veränderbar | Compilezeit | Speicher |
 |---------|:-----------:|:-----------:|----------|
-| `var`   | ja          | —           | Stack    |
-| `let`   | nein        | —           | Stack    |
+| `var`   | ja          | —           | Stack/Data (global) |
+| `let`   | nein        | —           | Stack/Data (global) |
 | `co`    | nein        | optional    | Stack    |
 | `con`   | nein        | ja          | Immediate / rodata |
+
+### Globale Variablen
+
+`var` und `let` können auch auf Top-Level deklariert werden. Diese werden im Data-Segment gespeichert und sind global sichtbar:
+
+```lyx
+var globalCounter: int64 := 0;
+let maxSize: int64 := 1024;
+
+fn increment() {
+  globalCounter := globalCounter + 1;
+}
+
+fn main(): int64 {
+  PrintInt(globalCounter);  // 0
+  increment();
+  increment();
+  PrintInt(globalCounter);  // 2
+  return 0;
+}
+```
+
+Globale Variablen:
+- werden im Data-Segment gespeichert (nicht auf dem Stack)
+- können mit konstanten Integer-Werten initialisiert werden
+- sind in allen Funktionen sichtbar
+- können `pub` für exportiert werden
 
 ### Compile-Time-Konstanten
 
@@ -313,6 +342,52 @@ type Point = struct {
 
 **Hinweis:** Struct-Rückgabe by-value ist noch eingeschränkt. Aktuell können statische Methoden primitive Typen zurückgeben, aber keine Structs.
 
+### Klassen (Classes) mit Vererbung
+
+Lyx unterstützt OOP mit Klassen, Vererbung, Konstruktoren und Destruktoren:
+
+```lyx
+type Animal = class {
+  name: pchar;
+  
+  fn speak() {
+    PrintStr("Some sound\n");
+  }
+};
+
+type Dog = class extends Animal {
+  breed: pchar;
+  
+  fn speak() {
+    PrintStr("Woof!\n");
+  }
+  
+  fn Create(n: pchar, b: pchar) {
+    self.name := n;
+    self.breed := b;
+  }
+  
+  fn Destroy() {
+    PrintStr("Dog destroyed\n");
+  }
+};
+
+fn main(): int64 {
+  var d: Dog := new Dog("Buddy", "Labrador");
+  d.speak();              // "Woof!"
+  dispose d;              // Ruft Destroy() auf
+  return 0;
+}
+```
+
+**Klassen-Features:**
+- `class extends BaseClass` für Vererbung
+- `new ClassName()` für Heap-Allokation
+- `new ClassName(args)` ruft Konstruktor `Create` auf
+- `dispose expr` ruft `Destroy()` auf und gibt Speicher frei
+- `super.method()` für Aufruf der Basisklassen-Methode
+- Heap-allokiert (im Gegensatz zu Stack-allokierten Structs)
+
 ### Operatoren
 
 | Priorität | Operatoren           | Beschreibung              |
@@ -482,6 +557,27 @@ fn main(): int64 {
 | `PrintInt(x)`    | `int64 -> void`        | Gibt Integer als Dezimalzahl aus    |
 | `PrintFloat(x)`  | `f64 -> void`          | Gibt Float aus (vereinfacht)        |
 | `exit(code)`      | `int64 -> void`        | Beendet das Programm mit Exit-Code  |
+
+#### Random Builtins
+| Funktion          | Signatur               | Beschreibung                        |
+|-------------------|------------------------|-------------------------------------|
+| `Random()`        | `void -> int64`        | Liefert Pseudo-Zufallszahl (0..2³¹-1) |
+| `RandomSeed(s)`   | `int64 -> void`        | Setzt den Seed für den LCG          |
+
+Beispiel:
+```lyx
+fn main(): int64 {
+  RandomSeed(42);           // Seed setzen
+  
+  var r1: int64 := Random();  // Zufallszahl
+  var r2: int64 := Random();  // Weitere Zufallszahl
+  
+  PrintInt(r1);
+  PrintStr("\n");
+  PrintInt(r2);
+  return 0;
+}
+```
 
 #### String-Manipulation Builtins
 | Funktion                    | Signatur                                    | Beschreibung                        |
@@ -714,13 +810,17 @@ fn main(): int64 {
 ### Reservierte Keywords
 
 ```
-fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self
+fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super
 ```
 
 - `extern` wird für externe Funktionsdeklarationen verwendet
 - `as` wird für Type-Casting verwendet
 - `import`, `pub`, `unit` werden für das Module-System verwendet
 - `type`, `struct` werden für benutzerdefinierte Typen verwendet
+- `class`, `extends` für OOP mit Vererbung
+- `new` für Heap-Allokation von Klasseninstanzen
+- `dispose` für explizite Speicherfreigabe
+- `super` für Aufruf von Basisklassenmethoden
 - `static` markiert statische Methoden (ohne `self`-Parameter)
 - `self` referenziert die aktuelle Instanz in Methoden
 - `Self` als Rückgabetyp in Methoden (wird zum Struct-Typ aufgelöst)
@@ -1037,7 +1137,8 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.4** | ✅ SO-Library Integration, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs, ✅ Module System |
 | **v0.1.5** | ✅ String-Library (20+ Funktionen), ✅ Math-Builtins (22 Funktionen), ✅ Type-Casting (`as`), ✅ String-Konvertierung |
 | **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
-| **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Heap-Allokation |
+| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins |
+| **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Null-Safety Phase 2 |
 | **v1** | Objektdateien, Multi-Unit Linking, Package Manager |
 
 ---
