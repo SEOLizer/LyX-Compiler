@@ -921,6 +921,35 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
+        else if TAstCall(expr).Name = 'Random' then
+        begin
+          // Random() -> int64: returns pseudo-random number
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'Random';
+          instr.ImmInt := 0;
+          SetLength(instr.ArgTemps, 0);
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'RandomSeed' then
+        begin
+          // RandomSeed(seed) -> void: sets the random seed
+          instr.Op := irCallBuiltin;
+          instr.Dest := -1;
+          instr.ImmStr := 'RandomSeed';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then
+            instr.Src1 := argTemps[0]
+          else
+            instr.Src1 := -1;
+          Emit(instr);
+          Result := -1;
+        end
         else
         begin
           // Regular function call
