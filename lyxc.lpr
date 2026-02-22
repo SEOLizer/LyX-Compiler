@@ -6,11 +6,16 @@ uses
   bytes, backend_types,
   diag, lexer, parser, ast, sema, unit_manager,
   ir, lower_ast_to_ir,
-  x86_64_emit, elf64_writer;
+  x86_64_emit, elf64_writer,
+  x86_64_win64, pe64_writer;
+
+type
+  TTarget = (targetLinux, targetWindows);
 
 var
   inputFile: string;
   outputFile: string;
+  target: TTarget;
   src: TStringList;
   d: TDiagnostics;
   lx: TLexer;
@@ -21,11 +26,14 @@ var
   module: TIRModule;
   lower: TIRLowering;
   emit: TX86_64Emitter;
+  winEmit: TWin64Emitter;
   codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64;
   basePath: string;
   externSymbols: TExternalSymbolArray;
   neededLibs: array of string;
+  i: Integer;
+  param: string;
 
 type
   TStringArray = array of string;
@@ -55,26 +63,89 @@ begin
 end;
 
 begin
+  // Default target is the host OS
+  {$IFDEF WINDOWS}
+  target := targetWindows;
+  {$ELSE}
+  target := targetLinux;
+  {$ENDIF}
+  
   if ParamCount < 1 then
   begin
     WriteLn(StdErr, 'Lyx Compiler v0.1.7');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
-    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>]');
+    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux]');
+    WriteLn(StdErr);
+    WriteLn(StdErr, 'Optionen:');
+    WriteLn(StdErr, '  -o <datei>     Ausgabedatei (Standard: a.out bzw. a.exe)');
+    WriteLn(StdErr, '  --target=TARGET Zielplattform (win64 oder linux)');
     Halt(1);
   end;
 
-  inputFile := ParamStr(1);
-  outputFile := 'a.out';
+  inputFile := '';
+  outputFile := '';
 
-  if (ParamCount >= 3) and (ParamStr(2) = '-o') then
-    outputFile := ParamStr(3);
+  // Parse command line arguments
+  i := 1;
+  while i <= ParamCount do
+  begin
+    param := ParamStr(i);
+    
+    if (param = '-o') and (i < ParamCount) then
+    begin
+      outputFile := ParamStr(i + 1);
+      Inc(i, 2);  // Skip -o and the filename
+    end
+    else if Copy(param, 1, 9) = '--target=' then
+    begin
+      param := LowerCase(Copy(param, 10, MaxInt));
+      if (param = 'win64') or (param = 'windows') then
+        target := targetWindows
+      else if (param = 'linux') or (param = 'elf') then
+        target := targetLinux
+      else
+      begin
+        WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
+        WriteLn(StdErr, 'Gültige Werte: win64, linux');
+        Halt(1);
+      end;
+      Inc(i);
+    end
+    else if (param <> '-o') and (Copy(param, 1, 2) <> '--') then
+    begin
+      if inputFile = '' then
+        inputFile := param;
+      Inc(i);
+    end
+    else
+      Inc(i);
+  end;
+
+  if inputFile = '' then
+  begin
+    WriteLn(StdErr, 'Keine Eingabedatei angegeben');
+    Halt(1);
+  end;
+
+  // Default output filename
+  if outputFile = '' then
+  begin
+    if target = targetWindows then
+      outputFile := 'a.exe'
+    else
+      outputFile := 'a.out';
+  end;
 
   WriteLn('Lyx Compiler v0.1.7');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
   WriteLn('Ausgabe:  ', outputFile);
+  if target = targetWindows then
+    WriteLn('Ziel:     Windows x64 (PE32+)')
+  else
+    WriteLn('Ziel:     Linux x86_64 (ELF64)');
 
   basePath := ExtractFilePath(inputFile);
   if basePath = '' then
@@ -133,33 +204,50 @@ begin
         lower := TIRLowering.Create(module, d);
         try
           lower.Lower(prog);
-          emit := TX86_64Emitter.Create;
-          try
-            emit.EmitFromIR(module);
-            codeBuf := emit.GetCodeBuffer;
-            dataBuf := emit.GetDataBuffer;
-            // Entry point is the generated _start placed at code base + 0x1000
-            entryVA := $400000 + 4096;
-            
-            // Check if we have external symbols - if so, generate dynamic ELF
-            externSymbols := emit.GetExternalSymbols;
-            if Length(externSymbols) > 0 then
-            begin
-              // Build unique library list
-              neededLibs := CollectLibraries(externSymbols);
-              WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
-              WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
-            end
-            else
-            begin
-              WriteLn('Generating static ELF (no external symbols)');
-              WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+          
+          if target = targetWindows then
+          begin
+            // Windows x64 Code Generation
+            winEmit := TWin64Emitter.Create;
+            try
+              winEmit.EmitFromIR(module);
+              winEmit.WriteToFile(outputFile);
+              WriteLn('Wrote ', outputFile, ' (PE32+ for Windows x64)');
+            finally
+              winEmit.Free;
             end;
-            
-            FpChmod(PChar(outputFile), 493);
-            WriteLn('Wrote ', outputFile);
-          finally
-            emit.Free;
+          end
+          else
+          begin
+            // Linux x86_64 Code Generation (existing path)
+            emit := TX86_64Emitter.Create;
+            try
+              emit.EmitFromIR(module);
+              codeBuf := emit.GetCodeBuffer;
+              dataBuf := emit.GetDataBuffer;
+              // Entry point is the generated _start placed at code base + 0x1000
+              entryVA := $400000 + 4096;
+              
+              // Check if we have external symbols - if so, generate dynamic ELF
+              externSymbols := emit.GetExternalSymbols;
+              if Length(externSymbols) > 0 then
+              begin
+                // Build unique library list
+                neededLibs := CollectLibraries(externSymbols);
+                WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
+                WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
+              end
+              else
+              begin
+                WriteLn('Generating static ELF (no external symbols)');
+                WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+              end;
+              
+              FpChmod(PChar(outputFile), 493);
+              WriteLn('Wrote ', outputFile);
+            finally
+              emit.Free;
+            end;
           end;
         finally
           lower.Free;
