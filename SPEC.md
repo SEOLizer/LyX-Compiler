@@ -255,6 +255,66 @@ var v: int64 := c.get();                // Instance: instance.method()
 
 **Bekannte Einschränkung**: Struct Return-by-Value nicht vollständig unterstützt (Stack Lifetime Issue).
 
+### v0.1.7 ✅ ABGESCHLOSSEN — "OOP Full & Globals"
+
+- ✅ **Classes mit Vererbung**: `class extends BaseClass` Syntax für OOP mit Single Inheritance
+- ✅ **Heap-Allokation**: `new ClassName()` allokiert Klasseninstanzen auf dem Heap
+- ✅ **Konstruktoren mit Argumenten**: `new ClassName(args)` ruft `Create`-Methode auf
+- ✅ **Destruktoren**: `dispose expr` ruft `Destroy()` auf und gibt Speicher frei
+- ✅ **super-Keyword**: `super.method()` für Aufruf von Basisklassenmethoden
+- ✅ **Globale Variablen**: `var`/`let` auf Top-Level mit Data-Segment-Speicherung
+- ✅ **Random Builtins**: `Random()` und `RandomSeed()` für Pseudo-Zufallszahlen (LCG)
+- ✅ **Null-Safety Phase 1**: `?` Nullable Types, `??` Null-Coalesce Operator, `?.` Safe Call
+
+**Neue Syntax-Elemente**:
+
+```lyx
+// Globale Variable
+var globalCounter: int64 := 0;
+
+// Klasse mit Vererbung
+type Animal = class {
+  name: pchar;
+  fn speak() { PrintStr("Some sound\n"); }
+};
+
+type Dog = class extends Animal {
+  breed: pchar;
+  
+  fn speak() {
+    PrintStr("Woof!\n");
+  }
+  
+  fn Create(n: pchar, b: pchar) {
+    self.name := n;
+    self.breed := b;
+  }
+  
+  fn Destroy() {
+    PrintStr("Dog destroyed\n");
+  }
+};
+
+fn main(): int64 {
+  var d: Dog := new Dog("Buddy", "Labrador");
+  d.speak();              // "Woof!"
+  dispose d;
+  
+  RandomSeed(42);
+  PrintInt(Random());     // Pseudo-Zufallszahl
+  return 0;
+}
+```
+
+**IR-Erweiterungen**:
+- `irLoadGlobal`/`irStoreGlobal` für globale Variablen
+- `irAlloc`/`irFree` für Heap-Speicher
+
+**Backend-Erweiterungen**:
+- RIP-relative Adressierung für globale Variablen
+- `mmap`/`munmap` syscalls für Heap
+- LCG-Implementierung für Random
+
 0.2.0 — “Stabilisierung: Calls, Imports, Relocs”
 
 Ziel: euer aktuelles Known Issue wird endgültig erschlagen, und ihr könnt extern+cross-unit vertrauen.
