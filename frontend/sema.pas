@@ -1834,7 +1834,11 @@ begin
         else
           sym.DeclType := TAstVarDecl(node).DeclType;
         sym.TypeName := TAstVarDecl(node).DeclTypeName;
-        sym.ArrayLen := TAstVarDecl(node).ArrayLen;
+        // If initializer is an array literal, record its length as ArrayLen
+        if TAstVarDecl(node).InitExpr is TAstArrayLit then
+          sym.ArrayLen := Length(TAstArrayLit(TAstVarDecl(node).InitExpr).Items)
+        else
+          sym.ArrayLen := TAstVarDecl(node).ArrayLen;
         sym.IsGlobal := True;
         AddSymbolToCurrent(sym, node.Span);
       end;
