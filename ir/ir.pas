@@ -28,8 +28,9 @@ type
      irLoadLocal, irStoreLocal, irLoadLocalAddr,
      irLoadStructAddr,  // load base address of struct local (needs StructSize for correct calculation)
      // global variable operations
-     irLoadGlobal,   // load global: Dest = globals[ImmStr]
-     irStoreGlobal,  // store global: globals[ImmStr] = Src1
+     irLoadGlobal,      // load global: Dest = globals[ImmStr]
+     irStoreGlobal,     // store global: globals[ImmStr] = Src1
+     irLoadGlobalAddr,  // load address of global: Dest = &globals[ImmStr]
     // width/sign helpers
     irSExt,    // sign-extend Src1 to ImmInt bits -> Dest
     irZExt,    // zero-extend Src1 to ImmInt bits -> Dest
@@ -101,8 +102,11 @@ type
 
   TGlobalVar = record
     Name: string;
-    InitValue: Int64;
+    InitValue: Int64;          // scalar init value
     HasInitValue: Boolean;
+    IsArray: Boolean;         // true if this global is an array
+    ArrayLen: Integer;        // number of elements if IsArray
+    InitValues: array of Int64; // initial values for array (if any)
   end;
   TGlobalVarArray = array of TGlobalVar;
 
@@ -117,6 +121,7 @@ type
     function FindFunction(const name: string): TIRFunction;
     function InternString(const s: string): Integer;
     function AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
+    function AddGlobalArray(const name: string; const values: array of Int64): Integer;
   end;
 
 implementation
@@ -203,12 +208,37 @@ begin
   for i := 0 to High(GlobalVars) do
     if GlobalVars[i].Name = name then
       Exit(i);
-  // Add new
+  // Add new scalar global
   Result := Length(GlobalVars);
   SetLength(GlobalVars, Result + 1);
   GlobalVars[Result].Name := name;
   GlobalVars[Result].InitValue := initVal;
   GlobalVars[Result].HasInitValue := hasInit;
+  GlobalVars[Result].IsArray := False;
+  GlobalVars[Result].ArrayLen := 0;
+  SetLength(GlobalVars[Result].InitValues, 0);
+end;
+
+function TIRModule.AddGlobalArray(const name: string; const values: array of Int64): Integer;
+var
+  i: Integer;
+begin
+  // Check if already exists
+  for i := 0 to High(GlobalVars) do
+    if GlobalVars[i].Name = name then
+      Exit(i);
+  // Add new array global
+  Result := Length(GlobalVars);
+  SetLength(GlobalVars, Result + 1);
+  GlobalVars[Result].Name := name;
+  GlobalVars[Result].HasInitValue := True;
+  GlobalVars[Result].IsArray := True;
+  GlobalVars[Result].ArrayLen := Length(values);
+  SetLength(GlobalVars[Result].InitValues, Length(values));
+  for i := 0 to High(values) do
+    GlobalVars[Result].InitValues[i] := values[i];
+  // scalar InitValue unused
+  GlobalVars[Result].InitValue := 0;
 end;
 
 { Initialize a TIRInstr with safe default values }

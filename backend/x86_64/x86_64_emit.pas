@@ -434,12 +434,43 @@ begin
     globalVarNames.Add(module.GlobalVars[i].Name);
     SetLength(globalVarOffsets, globalVarNames.Count);
     globalVarOffsets[High(globalVarOffsets)] := totalDataOffset;
-    // Write initial value
-    if module.GlobalVars[i].HasInitValue then
-      FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+    // Write initial value(s)
+    if module.GlobalVars[i].IsArray then
+    begin
+      // write each array element as u64
+      if module.GlobalVars[i].HasInitValue and (module.GlobalVars[i].ArrayLen > 0) then
+      begin
+        for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+        begin
+          FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[j]));
+        end;
+        Inc(totalDataOffset, UInt64(8) * UInt64(module.GlobalVars[i].ArrayLen));
+      end
+      else
+      begin
+        // no init values: reserve 8 * ArrayLen bytes (if ArrayLen known), else reserve 8 bytes
+        if module.GlobalVars[i].ArrayLen > 0 then
+        begin
+          for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+            FData.WriteU64LE(0);
+          Inc(totalDataOffset, UInt64(8) * UInt64(module.GlobalVars[i].ArrayLen));
+        end
+        else
+        begin
+          FData.WriteU64LE(0);
+          Inc(totalDataOffset, 8);
+        end;
+      end;
+    end
     else
-      FData.WriteU64LE(0);
-    Inc(totalDataOffset, 8);
+    begin
+      // scalar global
+      if module.GlobalVars[i].HasInitValue then
+        FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+      else
+        FData.WriteU64LE(0);
+      Inc(totalDataOffset, 8);
+    end;
   end;
 
   // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
@@ -1359,6 +1390,32 @@ begin
             // mov rax, [rcx]
             EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
             // Store into temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irLoadGlobalAddr:
+          begin
+            // Load address of global variable into temp: dest = &globals[ImmStr]
+            // This is needed for array accesses on global arrays
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0); // Initialize to 0
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+            // Record position for patching
+            SetLength(globalVarLeaPositions, Length(globalVarLeaPositions) + 1);
+            globalVarLeaPositions[High(globalVarLeaPositions)].VarIndex := varIdx;
+            globalVarLeaPositions[High(globalVarLeaPositions)].CodePos := leaPos;
+            // Store the ADDRESS into temp slot
             slotIdx := localCnt + instr.Dest;
             WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
           end;

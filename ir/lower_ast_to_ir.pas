@@ -248,6 +248,8 @@ var
   mangled: string;
   cv: TConstValue;
   instr: TIRInstr;
+  items: TAstExprList;
+  vals: array of Int64;
 begin
   instr := Default(TIRInstr);
   // First pass: collect all struct, class, and global variable declarations
@@ -271,9 +273,35 @@ begin
       if TAstVarDecl(node).IsGlobal then
       begin
         FGlobalVars.AddObject(TAstVarDecl(node).Name, TObject(node));
-        // Register in module with init value if it's a constant integer
+        // Register in module with init value
         if TAstVarDecl(node).InitExpr is TAstIntLit then
-          FModule.AddGlobalVar(TAstVarDecl(node).Name, TAstIntLit(TAstVarDecl(node).InitExpr).Value, True)
+        begin
+          FModule.AddGlobalVar(TAstVarDecl(node).Name, TAstIntLit(TAstVarDecl(node).InitExpr).Value, True);
+        end
+        else if TAstVarDecl(node).InitExpr is TAstArrayLit then
+        begin
+          // collect integer items if possible
+          items := TAstArrayLit(TAstVarDecl(node).InitExpr).Items;
+          SetLength(vals, 0);
+          for k := 0 to High(items) do
+          begin
+            if items[k] is TAstIntLit then
+            begin
+              SetLength(vals, Length(vals) + 1);
+              vals[High(vals)] := TAstIntLit(items[k]).Value;
+            end
+            else
+            begin
+              // non-integer array initializers not supported for global arrays yet
+              SetLength(vals, 0);
+              Break;
+            end;
+          end;
+          if (Length(vals) > 0) then
+            FModule.AddGlobalArray(TAstVarDecl(node).Name, vals)
+          else
+            FModule.AddGlobalVar(TAstVarDecl(node).Name, 0, False);
+        end
         else
           FModule.AddGlobalVar(TAstVarDecl(node).Name, 0, False);
       end;
@@ -1018,19 +1046,49 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkIndexAccess:
       begin
-        // Lower array and index
-        t1 := LowerExpr(TAstIndexAccess(expr).Obj);
-        t2 := LowerExpr(TAstIndexAccess(expr).Index);
-        if (t1 < 0) or (t2 < 0) then
-          Exit;
+        // Check if accessing a global array
+        if (TAstIndexAccess(expr).Obj is TAstIdent) and
+           IsGlobalVar(TAstIdent(TAstIndexAccess(expr).Obj).Name) then
+        begin
+          // For global arrays: load the ADDRESS, not the value
+          // This is needed because irLoadElem expects a base address
+          t0 := NewTemp;
+          instr.Op := irLoadGlobalAddr;
+          instr.Dest := t0;
+          instr.ImmStr := TAstIdent(TAstIndexAccess(expr).Obj).Name;
+          Emit(instr);
+          t1 := t0;  // t1 now holds the base address
 
-        t0 := NewTemp;
-        instr.Op := irLoadElem;
-        instr.Dest := t0;
-        instr.Src1 := t1;  // array base
-        instr.Src2 := t2;  // index
-        Emit(instr);
-        Result := t0;
+          // Lower index
+          t2 := LowerExpr(TAstIndexAccess(expr).Index);
+          if t2 < 0 then
+            Exit;
+
+          // Load element at index
+          t0 := NewTemp;
+          instr.Op := irLoadElem;
+          instr.Dest := t0;
+          instr.Src1 := t1;  // array base address
+          instr.Src2 := t2;  // index
+          Emit(instr);
+          Result := t0;
+        end
+        else
+        begin
+          // Local array: use normal LowerExpr for base
+          t1 := LowerExpr(TAstIndexAccess(expr).Obj);
+          t2 := LowerExpr(TAstIndexAccess(expr).Index);
+          if (t1 < 0) or (t2 < 0) then
+            Exit;
+
+          t0 := NewTemp;
+          instr.Op := irLoadElem;
+          instr.Dest := t0;
+          instr.Src1 := t1;  // array base
+          instr.Src2 := t2;  // index
+          Emit(instr);
+          Result := t0;
+        end;
       end;
 
     nkFieldAccess:
@@ -1706,8 +1764,24 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     if stmt is TAstIndexAssign then
     begin
       // t1 = base array/pointer
-      t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
-      if t1 < 0 then Exit(False);
+      // Check if target is a global array - need address, not value
+      if (TAstIndexAssign(stmt).Target.Obj is TAstIdent) and
+         IsGlobalVar(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name) then
+      begin
+        // For global arrays: load the ADDRESS
+        t1 := NewTemp;
+        instr.Op := irLoadGlobalAddr;
+        instr.Dest := t1;
+        instr.ImmStr := TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name;
+        Emit(instr);
+      end
+      else
+      begin
+        // Local array: normal LowerExpr
+        t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
+        if t1 < 0 then Exit(False);
+      end;
+      
       // t2 = index expression
       t2 := LowerExpr(TAstIndexAssign(stmt).Target.Index);
       if t2 < 0 then Exit(False);

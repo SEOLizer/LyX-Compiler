@@ -971,7 +971,7 @@ begin
     Expect(tkSemicolon);
     // Build NEW arr[idx] := arr[idx] + 1
     // Don't free old expression, use it one
-    incExpr := TAstBinOp.Create(tkPlus, TAstIndexAccess.Create(TAstIndexAccess(expr).Obj, TAstIntLit.Create(1, expr.Span), expr.Span), expr.Span));
+    incExpr := TAstBinOp.Create(tkPlus, TAstIndexAccess.Create(TAstIndexAccess(expr).Obj, TAstIndexAccess(expr).Index, expr.Span), TAstIntLit.Create(1, expr.Span), expr.Span);
     Exit(TAstIndexAssign.Create(TAstIndexAccess(expr), incExpr, expr.Span));
   end
   else if (expr is TAstIndexAccess) and Check(tkMinusMinus) then
@@ -981,7 +981,7 @@ begin
     Expect(tkSemicolon);
     // Build new arr[idx] := arr[idx] - 1
     // Don't free old expression, use the one
-    incExpr := TAstBinOp.Create(tkMinus, TAstIndexAccess.Create(TAstIndexAccess(expr).obj, TAstIntLit.Create(1, expr.Span), expr.Span), expr.Span));
+    incExpr := TAstBinOp.Create(tkMinus, TAstIndexAccess.Create(TAstIndexAccess(expr).Obj, TAstIndexAccess(expr).Index, expr.Span), TAstIntLit.Create(1, expr.Span), expr.Span);
     Exit(TAstIndexAssign.Create(TAstIndexAccess(expr), incExpr, expr.Span));
   end
   else
@@ -989,8 +989,7 @@ begin
     Expect(tkSemicolon);
     Exit(TAstExprStmt.Create(expr, expr.Span));
   end;
-end;
-end;
+  end;
 
 { Expressions }
 
@@ -1489,13 +1488,23 @@ begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
-  if Check(tkIdent) then
+  if Check(tkIdent) or Check(tkArray) then
   begin
-    s := FCurTok.Value;
-    Advance;
-    Result := StrToAurumType(s);
-    if Result = atUnresolved then
-      typeName := s;
+    if Check(tkArray) then
+    begin
+      // 'array' keyword: shorthand for array of int64
+      s := 'array';
+      Advance;
+      Result := atInt64; // element type
+    end
+    else
+    begin
+      s := FCurTok.Value;
+      Advance;
+      Result := StrToAurumType(s);
+      if Result = atUnresolved then
+        typeName := s;
+    end;
     // optional array suffix: [N] or []
     if Accept(tkLBracket) then
     begin
