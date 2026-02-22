@@ -341,6 +341,10 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   envAdded: Boolean;
   envOffset: UInt64;
   envLeaPositions: array of Integer;
+  // random seed storage
+  randomSeedAdded: Boolean;
+  randomSeedOffset: UInt64;
+  randomSeedLeaPositions: array of Integer;
    nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
    targetPos, jmpPos: Integer;
    jmpAfterPadPos: Integer;
@@ -405,6 +409,9 @@ begin
   envAdded := False;
   envOffset := 0;
   SetLength(envLeaPositions, 0);
+  randomSeedAdded := False;
+  randomSeedOffset := 0;
+  SetLength(randomSeedLeaPositions, 0);
 
   // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
   begin
@@ -1162,6 +1169,60 @@ begin
               WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
               WriteMovRegImm64(FCode, RAX, 60);
               WriteSyscall(FCode);
+            end
+            else if instr.ImmStr = 'Random' then
+            begin
+              // Random() -> int64: Linear Congruential Generator
+              // seed = (seed * 1103515245 + 12345) mod 2^31
+              // Uses global seed stored in data section
+              if not randomSeedAdded then
+              begin
+                randomSeedOffset := totalDataOffset;
+                FData.WriteU64LE(1); // Initial seed = 1
+                Inc(totalDataOffset, 8);
+                randomSeedAdded := True;
+              end;
+              // Load seed: lea rcx, [rip+offset]; mov rax, [rcx]
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+              SetLength(randomSeedLeaPositions, Length(randomSeedLeaPositions) + 1);
+              randomSeedLeaPositions[High(randomSeedLeaPositions)] := leaPos;
+              // mov rax, [rcx]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
+              // Compute: rax = rax * 1103515245 + 12345
+              // imul rax, rax, 1103515245 (= 0x41C64E6D)
+              EmitU8(FCode, $48); EmitU8(FCode, $69); EmitU8(FCode, $C0);
+              EmitU32(FCode, 1103515245);
+              // add rax, 12345 (= 0x3039)
+              EmitU8(FCode, $48); EmitU8(FCode, $05); EmitU32(FCode, 12345);
+              // and rax, 0x7FFFFFFF (mod 2^31)
+              WriteMovRegImm64(FCode, RDX, $7FFFFFFF);
+              EmitU8(FCode, $48); EmitU8(FCode, $21); EmitU8(FCode, $D0); // and rax, rdx
+              // Store seed back: mov [rcx], rax
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
+              // Store result in dest temp
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'RandomSeed' then
+            begin
+              // RandomSeed(seed) -> void: sets the random seed
+              if not randomSeedAdded then
+              begin
+                randomSeedOffset := totalDataOffset;
+                FData.WriteU64LE(1);
+                Inc(totalDataOffset, 8);
+                randomSeedAdded := True;
+              end;
+              // Load arg into rax
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              // lea rcx, [rip+offset]
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+              SetLength(randomSeedLeaPositions, Length(randomSeedLeaPositions) + 1);
+              randomSeedLeaPositions[High(randomSeedLeaPositions)] := leaPos;
+              // mov [rcx], rax
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
             end;
           end;
           irConstInt:
@@ -2039,6 +2100,20 @@ begin
       codeVA := $400000 + 4096;
       instrVA := codeVA + leaPos + 7;
       dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + envOffset;
+      disp32 := Int64(dataVA) - Int64(instrVA);
+      FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+    end;
+  end;
+
+  // patch random seed LEAs
+  if randomSeedAdded then
+  begin
+    for i := 0 to High(randomSeedLeaPositions) do
+    begin
+      leaPos := randomSeedLeaPositions[i];
+      codeVA := $400000 + 4096;
+      instrVA := codeVA + leaPos + 7;
+      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + randomSeedOffset;
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;

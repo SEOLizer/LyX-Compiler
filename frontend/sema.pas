@@ -269,6 +269,23 @@ begin
   SetLength(s.ParamTypes, 1);
   s.ParamTypes[0] := atPChar;
   AddSymbolToCurrent(s, NullSpan);
+
+  // Random() -> int64 (returns pseudo-random number 0..2^31-1)
+  s := TSymbol.Create('Random');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 0;
+  SetLength(s.ParamTypes, 0);
+  AddSymbolToCurrent(s, NullSpan);
+
+  // RandomSeed(seed: int64) -> void (sets the random seed)
+  s := TSymbol.Create('RandomSeed');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
 end;
 
 function IsIntegerType(t: TAurumType): Boolean;
