@@ -24,6 +24,11 @@ type
     // Random LCG State (offset in .data)
     FRandomSeedOffset: Integer;
     
+    // String/LEA patching
+    FStringOffsets: array of UInt64;
+    FLeaPositions: array of Integer;
+    FLeaStrIndex: array of Integer;
+
     // Label/Jump Patching
     FLabelPositions: array of Integer;
     FJumpPatches: array of record
@@ -877,106 +882,467 @@ end;
 
 procedure TWin64Emitter.EmitFromIR(const module: TIRModule);
 var
-  i: Integer;
-  entryOffset, printStrOffset, printIntOffset: Integer;
-  randomOffset, randomSeedOffset, exitOffset: Integer;
-  mainCallPos, mainOffset: Integer;
-  helloOffset, helloStr: Integer;
-  strPatchPos, nlOffset, nlPatchPos: Integer;
-  helloText: string;
+  i, j, k, sidx: Integer;
+  totalDataOffset: UInt64;
+  instr: TIRInstr;
+  localCnt, maxTemp, totalSlots, slotIdx: Integer;
+  leaPos: Integer;
+  disp32, rel32: Int64;
+  tempStrIndex: array of Integer;
+  bufferAdded: Boolean;
+  bufferOffset: UInt64;
+  bufferLeaPositions: array of Integer;
+  envAdded: Boolean;
+  envOffset: UInt64;
+  envLeaPositions: array of Integer;
+  randomSeedAdded: Boolean;
+  randomSeedOffset: UInt64;
+  randomSeedLeaPositions: array of Integer;
+  globalVarNames: TStringList;
+  globalVarOffsets: array of UInt64;
+  globalVarLeaPositions: array of record
+    VarIndex: Integer;
+    CodePos: Integer;
+  end;
+  nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
+  targetPos, jmpPos: Integer;
+  jmpAfterPadPos: Integer;
+  argCount: Integer;
+  argTemps: array of Integer;
+  sParse: string;
+  ppos, ai: Integer;
+  extraCount: Integer;
+  isEntryFunction: Boolean;
+  structBaseOff: Int64;
+  negOffset: Int64;
+  frameBytes: Integer;
+  framePad: Integer;
+  callPad: Integer;
+  allocSize: Integer;
+  elemIndex: Integer;
+  elemOffset: Integer;
+  pushBytes: Integer;
+  restoreBytes: Integer;
+  savedPushBytes: Integer;
+  mask64: UInt64;
+  sh: Integer;
+  argTemp3: Integer;
+  argTemp4: Integer;
+  argTemp5: Integer;
+  argTemp6: Integer;
+  found: Boolean;
+  ei: Integer;
+  varIdx: Integer;
+  dumpStart, dumpEnd, dumpLen, di: Integer;
+  dumpBuf: array of Byte;
+  fs: TFileStream;
+  fname: string;
+  // Builtin stub offsets
+  printStrOffset, printIntOffset, randomOffset, randomSeedOffsetStub, exitOffset: Integer;
 begin
-  // Setup imports
+  // Prepare imports and builtin stubs
   SetupKernel32Imports;
-  
-  // Reserve space for random seed in .data
+
+  // write interned strings from module
+  SetLength(tempStrIndex, 0);
+  totalDataOffset := 0;
+  if Assigned(module) then
+  begin
+    SetLength(tempStrIndex, module.Strings.Count);
+    for i := 0 to module.Strings.Count - 1 do
+    begin
+      tempStrIndex[i] := 0; // placeholder
+      for j := 1 to Length(module.Strings[i]) do
+        FData.WriteU8(Byte(module.Strings[i][j]));
+      FData.WriteU8(0);
+      Inc(totalDataOffset, Length(module.Strings[i]) + 1);
+    end;
+  end;
+
+  // Reserve random seed
+  randomSeedAdded := False;
+  randomSeedOffset := 0;
   FRandomSeedOffset := FData.Size;
-  FData.WriteU64LE(12345);  // Default seed
-  
-  // Emit builtin stubs first
-  printStrOffset := FCode.Size;
-  EmitPrintStrStub;
-  
-  printIntOffset := FCode.Size;
-  EmitPrintIntStub;
-  
-  randomOffset := FCode.Size;
-  EmitRandomStub;
-  
-  randomSeedOffset := FCode.Size;
-  EmitRandomSeedStub;
-  
-  exitOffset := FCode.Size;
-  EmitExitStub;
-  
-  // Entry point (_start)
-  entryOffset := FCode.Size;
-  
-  // Simple entry: call main and exit
-  // sub rsp, 40 (32 shadow + 8 for alignment)
+  FData.WriteU64LE(12345);
+  randomSeedAdded := True;
+  randomSeedOffset := FRandomSeedOffset;
+
+  // Emit builtin stubs and record their offsets
+  printStrOffset := FCode.Size; EmitPrintStrStub;
+  printIntOffset := FCode.Size; EmitPrintIntStub;
+  randomOffset := FCode.Size; EmitRandomStub;
+  randomSeedOffsetStub := FCode.Size; EmitRandomSeedStub;
+  exitOffset := FCode.Size; EmitExitStub;
+
+  // Basic program entry (_start): set up stack for Win64 and call main
+  // sub rsp, 40 (32-byte shadow + alignment)
   WriteSubRegImm32(FCode, RSP, 40);
-  
-  // call main (will be patched)
-  mainCallPos := FCode.Size;
-  WriteCallRel32(FCode, 0);  // Placeholder
-  
+  // call main (patched later)
+  SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+  FJumpPatches[High(FJumpPatches)].CodePos := FCode.Size;
+  FJumpPatches[High(FJumpPatches)].LabelIdx := -1; // use label resolution later via function names
+  WriteCallRel32(FCode, 0); // placeholder
   // mov rcx, rax (exit code)
   WriteMovRegReg(FCode, RCX, RAX);
-  
   // call ExitProcess
   WriteIndirectCall(FKernel32Index, FExitProcessIndex);
-  
-  // Emit user functions
-  // For now, just emit a simple main that returns 0
-  mainOffset := FCode.Size;
-  
-  // Patch main call
-  FCode.PatchU32LE(mainCallPos + 1, mainOffset - (mainCallPos + 5));
-  
-  // Simple main:
-  // push rbp
-  WritePush(FCode, RBP);
-  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
-  WriteSubRegImm32(FCode, RSP, 32);
-  
-  // Call PrintStr("Hello Windows!\n")
-  // First, add string to data segment
-  helloOffset := FData.Size;
-  helloText := 'Hello Windows from Lyx!'#13#10#0;
-  for i := 1 to Length(helloText) do
-    FData.WriteU8(Ord(helloText[i]));
-  
-  // lea rcx, [rip + hello_offset]
-  // This will need to be patched later when we know the data section RVA
-  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D);
-  strPatchPos := FCode.Size;
-  EmitU32(FCode, 0);  // Placeholder
-  
-  // call PrintStr
-  WriteCallRel32(FCode, printStrOffset - (FCode.Size + 5));
-  
-  // Call PrintInt(42)
-  WriteMovRegImm64(FCode, RCX, 42);
-  WriteCallRel32(FCode, printIntOffset - (FCode.Size + 5));
-  
-  // Print newline
-  nlOffset := FData.Size;
-  FData.WriteU8($0D);
-  FData.WriteU8($0A);
-  FData.WriteU8($00);
-  
-  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D);
-  nlPatchPos := FCode.Size;
-  EmitU32(FCode, 0);
-  WriteCallRel32(FCode, printStrOffset - (FCode.Size + 5));
-  
-  // Return 0
-  WriteXorRegReg(FCode, RAX, RAX);
-  WriteAddRegImm32(FCode, RSP, 32);
-  WritePop(FCode, RBP);
-  WriteRet(FCode);
-  
-  // Note: Data section RIP-relative patches will be applied in WriteToFile
-  // For now, store the patch positions
+
+  // If module is nil, emit simple demo main and return
+  if not Assigned(module) then
+  begin
+    // emit a trivial main returning 0
+    // push rbp; mov rbp,rsp; sub rsp,32; xor rax,rax; add rsp,32; pop rbp; ret
+    WritePush(FCode, RBP); EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+    WriteSubRegImm32(FCode, RSP, 32);
+    WriteXorRegReg(FCode, RAX, RAX);
+    WriteAddRegImm32(FCode, RSP, 32);
+    WritePop(FCode, RBP); WriteRet(FCode);
+    Exit;
+  end;
+
+  // Initialize helpers for emit loop
+  bufferAdded := False; bufferOffset := 0; SetLength(bufferLeaPositions, 0);
+  envAdded := False; envOffset := 0; SetLength(envLeaPositions, 0);
+  SetLength(randomSeedLeaPositions, 0);
+  globalVarNames := TStringList.Create; globalVarNames.Sorted := False;
+  SetLength(globalVarOffsets, 0); SetLength(globalVarLeaPositions, 0);
+
+  // Pre-allocate global variables in data section
+  for i := 0 to High(module.GlobalVars) do
+  begin
+    globalVarNames.Add(module.GlobalVars[i].Name);
+    SetLength(globalVarOffsets, globalVarNames.Count);
+    globalVarOffsets[High(globalVarOffsets)] := totalDataOffset;
+    if module.GlobalVars[i].IsArray then
+    begin
+      if module.GlobalVars[i].HasInitValue and (module.GlobalVars[i].ArrayLen > 0) then
+      begin
+        for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+          FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[j]));
+        Inc(totalDataOffset, UInt64(8) * UInt64(module.GlobalVars[i].ArrayLen));
+      end
+      else
+      begin
+        if module.GlobalVars[i].ArrayLen > 0 then
+        begin
+          for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+            FData.WriteU64LE(0);
+          Inc(totalDataOffset, UInt64(8) * UInt64(module.GlobalVars[i].ArrayLen));
+        end
+        else
+        begin
+          FData.WriteU64LE(0); Inc(totalDataOffset, 8);
+        end;
+      end;
+    end
+    else
+    begin
+      if module.GlobalVars[i].HasInitValue then
+        FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+      else
+        FData.WriteU64LE(0);
+      Inc(totalDataOffset, 8);
+    end;
+  end;
+
+  // Main function emission: loop over functions in module
+  for i := 0 to High(module.Functions) do
+  begin
+    // record function offset
+    SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+    FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+
+    // record labels mapping by name -> pos using FFuncOffsets index
+    // compute local slots
+    localCnt := module.Functions[i].LocalCount;
+    isEntryFunction := (module.Functions[i].Name = 'main');
+    maxTemp := -1;
+    for j := 0 to High(module.Functions[i].Instructions) do
+    begin
+      instr := module.Functions[i].Instructions[j];
+      if instr.Dest > maxTemp then maxTemp := instr.Dest;
+      if instr.Src1 > maxTemp then maxTemp := instr.Src1;
+      if instr.Src2 > maxTemp then maxTemp := instr.Src2;
+    end;
+    if maxTemp < 0 then maxTemp := 0 else Inc(maxTemp);
+    totalSlots := localCnt + maxTemp;
+    if totalSlots < 0 then totalSlots := 0;
+    if totalSlots > 1024 then totalSlots := 1024;
+
+    frameBytes := totalSlots * 8;
+    // conservative saved registers: RBX, RDI, RSI, R12-R15 (7 regs) -> 56 bytes
+    savedPushBytes := 8 * 7; // note: earlier Prologue pushed these
+    framePad := (16 - ((frameBytes + 8 + savedPushBytes) mod 16)) mod 16;
+
+    // Prologue
+    EmitPrologue(totalSlots * 8, module.Functions[i].ParamCount);
+
+    // Spill incoming parameters into slots
+    if module.Functions[i].ParamCount > 0 then
+    begin
+      for k := 0 to module.Functions[i].ParamCount - 1 do
+      begin
+        slotIdx := k;
+        if k < Length(Win64ParamRegs) then
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), Win64ParamRegs[k])
+        else
+        begin
+          disp32 := 16 + (k - Length(Win64ParamRegs)) * 8;
+          // load from caller stack area
+          WriteMovRegMem(FCode, RAX, RBP, Integer(disp32));
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+        end;
+      end;
+    end;
+
+    SetLength(tempStrIndex, maxTemp);
+    for k := 0 to maxTemp - 1 do tempStrIndex[k] := -1;
+
+    // Instruction loop
+    for j := 0 to High(module.Functions[i].Instructions) do
+    begin
+      instr := module.Functions[i].Instructions[j];
+      case instr.Op of
+        irConstStr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            leaPos := FCode.Size;
+            // lea rax, [rip + imm32]
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+            SetLength(FLeaPositions, Length(FLeaPositions) + 1);
+            SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
+            FLeaPositions[High(FLeaPositions)] := leaPos;
+            sidx := StrToIntDef(instr.ImmStr, 0);
+            FLeaStrIndex[High(FLeaStrIndex)] := sidx;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            if instr.Dest < Length(tempStrIndex) then
+              tempStrIndex[instr.Dest] := sidx;
+          end;
+        irCallBuiltin:
+          begin
+            // map builtins to stub calls
+            if instr.ImmStr = 'PrintStr' then
+            begin
+              // arg in slot Src1 -> RCX
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteCallRel32(FCode, printStrOffset - (FCode.Size + 5));
+            end
+            else if instr.ImmStr = 'PrintInt' then
+            begin
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteCallRel32(FCode, printIntOffset - (FCode.Size + 5));
+            end
+            else if instr.ImmStr = 'exit' then
+            begin
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteIndirectCall(FKernel32Index, FExitProcessIndex);
+            end
+            else if instr.ImmStr = 'Random' then
+            begin
+              // call Random stub
+              WriteCallRel32(FCode, randomOffset - (FCode.Size + 5));
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'RandomSeed' then
+            begin
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteCallRel32(FCode, randomSeedOffsetStub - (FCode.Size + 5));
+            end
+            else
+            begin
+              // unsupported builtin: no-op / placeholder
+              // set dest to 0 if applicable
+              if instr.Dest >= 0 then
+              begin
+                WriteMovRegImm64(FCode, RAX, 0);
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+              end;
+            end;
+          end;
+        irConstInt:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irLoadLocal:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irAdd:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteAddRegReg(FCode, RAX, RCX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irSub:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irMul:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteImulRegReg(FCode, RAX, RCX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irDiv:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteCqo(FCode);
+            WriteIdivReg(FCode, RCX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irMod:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteCqo(FCode);
+            WriteIdivReg(FCode, RCX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RDX);
+          end;
+        irNeg:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D8); // neg rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irCmpEq:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); // sete al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irReturn:
+          begin
+            // Move return value into RAX (non-entry) or RCX (entry)
+            if isEntryFunction then
+            begin
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1));
+            end
+            else
+            begin
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            end;
+
+            // Epilogue
+            EmitEpilogue(frameBytes + framePad);
+          end;
+        irLabel:
+          begin
+            // labels are implicit via function offsets; for intra-function labels we could record here
+          end;
+        irJmp:
+          begin
+            // For simplicity, use absolute labels via function's LabelName not yet implemented
+            // placeholder: no-op
+            // Real implementation would emit rel32 jump and record for patching
+          end;
+        irBrTrue, irBrFalse:
+          begin
+            // conditional branches: not implemented in detail here
+          end;
+        irCall:
+          begin
+            // user-defined calls: simple implementation
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do argTemps[k] := -1;
+            if argCount > 0 then argTemps[0] := instr.Src1;
+            if argCount > 1 then argTemps[1] := instr.Src2;
+            if (argCount > 2) and (instr.LabelName <> '') then
+            begin
+              sParse := instr.LabelName;
+              ppos := Pos(',', sParse);
+              ai := 2;
+              while (ppos > 0) and (ai < argCount) do
+              begin
+                argTemps[ai] := StrToIntDef(Copy(sParse, 1, ppos - 1), -1);
+                Delete(sParse, 1, ppos);
+                Inc(ai);
+                ppos := Pos(',', sParse);
+              end;
+              if (sParse <> '') and (ai < argCount) then
+                argTemps[ai] := StrToIntDef(sParse, -1);
+            end;
+            // Load up to 4 args into RCX,RDX,R8,R9
+            for k := 0 to Min(argCount - 1, 3) do
+            begin
+              if argTemps[k] >= 0 then
+                WriteMovRegMem(FCode, Win64ParamRegs[k], RBP, SlotOffset(localCnt + argTemps[k]))
+              else
+                WriteMovRegImm64(FCode, Win64ParamRegs[k], 0);
+            end;
+            // Stack args (beyond 4) - write into caller's shadow area
+            if argCount > 4 then
+            begin
+              for k := argCount - 1 downto 4 do
+              begin
+                if argTemps[k] >= 0 then
+                  WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + argTemps[k]))
+                else
+                  WriteMovRegImm64(FCode, RAX, 0);
+                // mov [rsp+32 + (k-4)*8], rax
+                WriteMovMemReg(FCode, RSP, 32 + (k - 4) * 8, RAX);
+              end;
+            end;
+            // Call function: if external -> via IAT, else direct relative to function offsets
+            if instr.ImmStr <> '' then
+            begin
+              // external or named function: find in FFuncOffsets by name
+              found := False;
+              for ei := 0 to High(FFuncOffsets) do
+              begin
+                // No name mapping available here; this is placeholder
+              end;
+            end;
+            // For now, emit a call rel32 to a placeholder 0 (to be patched later)
+            WriteCallRel32(FCode, 0);
+          end;
+        else
+          begin
+            // other ops unimplemented: set dest to 0
+            if instr.Dest >= 0 then
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end;
+          end;
+      end; // case instr.Op
+    end; // for instructions
+
+    // If function didn't end with return, emit epilogue
+    // (simplified) emit epilogue
+    EmitEpilogue(frameBytes + framePad);
+  end; // for functions
+
+  // Cleanup
+  globalVarNames.Free;
 end;
 
 procedure TWin64Emitter.WriteToFile(const filename: string);
