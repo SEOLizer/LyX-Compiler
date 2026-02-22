@@ -392,15 +392,59 @@ fn main(): int64 {
 
 | Priorität | Operatoren           | Beschreibung              |
 |:---------:|----------------------|---------------------------|
-| 1 (niedrig) | `||`            | Logisches Oder            |
-| 2         | `&&`                 | Logisches Und             |
-| 3         | `==` `!=` `<` `<=` `>` `>=` | Vergleich (liefert `bool`) |
-| 4         | `+` `-`              | Addition, Subtraktion     |
-| 5         | `*` `/` `%`          | Multiplikation, Division, Modulo |
-| 6 (hoch)  | `!` `-` (unär)       | Logisches NOT, Negation   |
-| 7         | `as`                 | Type-Casting              |
+| 1 (niedrig) | `\|>`            | Pipe (Funktionsverkettung) |
+| 2         | `||`                 | Logisches Oder            |
+| 3         | `&&`                 | Logisches Und             |
+| 4         | `==` `!=` `<` `<=` `>` `>=` | Vergleich (liefert `bool`) |
+| 5         | `+` `-`              | Addition, Subtraktion     |
+| 6         | `*` `/` `%`          | Multiplikation, Division, Modulo |
+| 7 (hoch)  | `!` `-` (unär)       | Logisches NOT, Negation   |
+| 8         | `as`                 | Type-Casting              |
 
 Zuweisung erfolgt mit `:=` (nicht `=`).
+
+### Pipe-Operator `|>`
+
+Der Pipe-Operator ermöglicht das Verketten von Funktionen in der Reihenfolge des Datenflusses (von links nach rechts):
+
+```lyx
+fn double(x: int64): int64 { return x * 2; }
+fn addOne(x: int64): int64 { return x + 1; }
+
+fn main(): int64 {
+  var x: int64 := 5;
+  
+  // Neu: Pipe-Operator (lesbar von links nach rechts)
+  var result: int64 := x |> double() |> addOne();
+  
+  // Äquivalent zur klassischen Schreibweise:
+  // var result: int64 := addOne(double(x));
+  
+  PrintInt(result);  // 11
+  return 0;
+}
+```
+
+**Mit zusätzlichen Argumenten:**
+
+```lyx
+fn add(a: int64, b: int64): int64 { return a + b; }
+
+fn main(): int64 {
+  var x: int64 := 10;
+  
+  // x wird als erstes Argument eingefügt
+  var result: int64 := x |> add(5);  // äquivalent zu add(x, 5)
+  
+  PrintInt(result);  // 15
+  return 0;
+}
+```
+
+**Vorteile:**
+- Bessere Lesbarkeit: Code liest sich wie der Datenfluss
+- Vermeidet tiefe Schachtelung
+- Einfacheres Debugging durch klare Reihenfolge
 
 ### Type-Casting mit `as`
 
@@ -1137,7 +1181,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.4** | ✅ SO-Library Integration, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs, ✅ Module System |
 | **v0.1.5** | ✅ String-Library (20+ Funktionen), ✅ Math-Builtins (22 Funktionen), ✅ Type-Casting (`as`), ✅ String-Konvertierung |
 | **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
-| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins |
+| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung |
 | **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Null-Safety Phase 2 |
 | **v1** | Objektdateien, Multi-Unit Linking, Package Manager |
 

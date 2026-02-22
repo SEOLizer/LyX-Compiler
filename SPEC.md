@@ -265,6 +265,7 @@ var v: int64 := c.get();                // Instance: instance.method()
 - ✅ **Globale Variablen**: `var`/`let` auf Top-Level mit Data-Segment-Speicherung
 - ✅ **Random Builtins**: `Random()` und `RandomSeed()` für Pseudo-Zufallszahlen (LCG)
 - ✅ **Null-Safety Phase 1**: `?` Nullable Types, `??` Null-Coalesce Operator, `?.` Safe Call
+- ✅ **Pipe-Operator**: `|>` für Funktionsverkettung mit Datenfluss von links nach rechts
 
 **Neue Syntax-Elemente**:
 
@@ -314,6 +315,19 @@ fn main(): int64 {
 - RIP-relative Adressierung für globale Variablen
 - `mmap`/`munmap` syscalls für Heap
 - LCG-Implementierung für Random
+
+**Pipe-Operator Beispiel**:
+```lyx
+fn double(x: int64): int64 { return x * 2; }
+fn addOne(x: int64): int64 { return x + 1; }
+
+fn main(): int64 {
+  var result: int64 := 5 |> double() |> addOne();
+  // Äquivalent zu: addOne(double(5)) = 11
+  PrintInt(result);
+  return 0;
+}
+```
 
 0.2.0 — “Stabilisierung: Calls, Imports, Relocs”
 

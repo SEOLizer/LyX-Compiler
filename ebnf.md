@@ -339,7 +339,13 @@ SafeAccessSuffix := '?.' Ident ;                  // Optionaler Feldzugriff
 ### Ausdrücke (Operatorpräzedenz)
 
 ```
-Expr           := OrExpr ;
+Expr           := PipeExpr ;
+
+PipeExpr       := NullCoalesceExpr { '|>' Ident [ '(' [ ArgList ] ')' ] } ;
+               // x |> f        -> f(x)
+               // x |> f(a, b)  -> f(x, a, b)
+
+NullCoalesceExpr := OrExpr { '??' OrExpr } ;
 
 OrExpr         := AndExpr { '||' AndExpr } ;
 AndExpr        := CmpExpr { '&&' CmpExpr } ;
@@ -356,6 +362,24 @@ ArgList        := Expr { ',' Expr } ;
 
 BoolLit        := 'true' | 'false' ;
 CharLit        := '\'' ( EscapedChar | CharBody ) '\'' ;
+```
+
+### Pipe-Operator Semantik
+
+Der Pipe-Operator `|>` ermöglicht das Verketten von Funktionen:
+
+* `expr |> func` wird zu `func(expr)` desugart
+* `expr |> func(a, b)` wird zu `func(expr, a, b)` desugart
+* Der linke Ausdruck wird als **erstes Argument** in den Funktionsaufruf eingefügt
+* Der Operator ist **links-assoziativ**: `x |> f() |> g()` = `g(f(x))`
+
+Beispiel:
+```lyx
+// Mit Pipe-Operator
+ReadFile("file.txt") |> Trim() |> StrToUpper() |> PrintLn();
+
+// Äquivalent ohne Pipe
+PrintLn(StrToUpper(Trim(ReadFile("file.txt"))));
 ```
 
 ### Konstante Ausdrücke (für `con`)
