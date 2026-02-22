@@ -1,7 +1,7 @@
 # Lyx
 
 **Lyx** ist ein nativer Compiler für die gleichnamige Programmiersprache, geschrieben in FreePascal.
-Er erzeugt direkt ausführbare **Linux x86_64 ELF64-Binaries** — ohne libc, ohne Linker, rein über Syscalls.
+Er erzeugt direkt ausführbare **Linux x86_64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
 
 ```
 Lyx Compiler v0.1.7
@@ -14,6 +14,7 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 ✅ OOP: Classes, Vererbung, Konstruktoren, Destruktoren
 ✅ Globale Variablen mit Initialisierung
 ✅ Random/RandomSeed Builtins
+✅ Cross-Compilation: Linux ELF64 und Windows PE32+
 ```
 
 ---
@@ -24,14 +25,36 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 # Compiler bauen
 make build
 
-# Programm kompilieren und ausführen
+# Linux-Programm kompilieren und ausführen
 ./lyxc examples/hello.lyx -o hello
 ./hello
+
+# Windows-Programm cross-kompilieren
+./lyxc examples/hello.lyx -o hello.exe --target=win64
 ```
 
 ```
 Hello Lyx
 ```
+
+### Cross-Compilation
+
+Lyx unterstützt **Cross-Compilation** zwischen Linux und Windows:
+
+```bash
+# Linux ELF64 (Standard auf Linux-Hosts)
+./lyxc program.lyx -o program --target=linux
+
+# Windows PE32+ (von Linux aus)
+./lyxc program.lyx -o program.exe --target=win64
+```
+
+| Zielplattform | Format | Calling Convention | OS-Interface |
+|---------------|--------|-------------------|--------------|
+| `linux` | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
+| `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
+
+**Hinweis:** Der `--target`-Parameter ist optional. Der Compiler wählt automatisch das Host-Betriebssystem als Ziel.
 
 ---
 
@@ -1069,7 +1092,7 @@ fn main(): int64 {
 ### Voraussetzungen
 
 - **FreePascal Compiler** (FPC 3.2.2+)
-- **Linux x86_64** (Zielplattform der erzeugten Binaries)
+- **Linux x86_64** (Host-Plattform)
 - GNU Make
 
 ### Compiler bauen
@@ -1082,9 +1105,14 @@ make debug          # Debug-Build mit Checks (-g -gl -Ci -Cr -Co -gh)
 ### Lyx-Programm kompilieren
 
 ```bash
+# Linux ELF64 (Standard)
 ./lyxc eingabe.lyx -o ausgabe
 ./ausgabe
 echo $?             # Exit-Code prüfen
+
+# Windows PE32+ (Cross-Compilation)
+./lyxc eingabe.lyx -o ausgabe.exe --target=win64
+# Ausführung unter Windows oder Wine
 ```
 
 ### Tests
@@ -1092,6 +1120,7 @@ echo $?             # Exit-Code prüfen
 ```bash
 make test           # Alle Unit-Tests (FPCUnit)
 make e2e            # End-to-End Smoke-Tests
+./tests/test_pe64   # PE64 Writer Tests
 ```
 
 ---
@@ -1109,11 +1138,13 @@ Quellcode (.lyx)
       |
   [ IR Lowering ]   AST -> 3-Address-Code IR
       |
-  [ x86_64 Emit ]   IR -> Maschinencode (Bytes)
+  [ Backend ]       IR -> Maschinencode (Bytes)
       |
-  [ ELF64 Writer ]  Code + Data -> ausführbares Binary
+      +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
       |
-  Executable (ELF64, statisch, ohne libc)
+      +-- [ Windows: x86_64_win64 + pe64_writer ]  -> PE32+ Binary
+      |
+  Executable (ELF64 oder PE32+, ohne libc)
 ```
 
 ### Projektstruktur
@@ -1129,10 +1160,14 @@ ir/
   ir.pas                    IR-Knotentypen (3-Address-Code)
   lower_ast_to_ir.pas       AST -> IR Transformation
 backend/
+  backend_types.pas         Gemeinsame Typen (External Symbols, Patches)
   x86_64/
-    x86_64_emit.pas         x86_64 Instruktions-Encoding
+    x86_64_emit.pas         x86_64 Instruktions-Encoding (Linux/SysV)
+    x86_64_win64.pas        Windows x64 Emitter (Shadow Space, IAT)
   elf/
     elf64_writer.pas        ELF64 Binary-Writer
+  pe/
+    pe64_writer.pas         PE32+ Binary-Writer (DOS/COFF/Optional Header)
 util/
   diag.pas                  Diagnostik (Fehler mit Zeile/Spalte)
   bytes.pas                 TByteBuffer (Byte-Encoding + Patching)
@@ -1144,7 +1179,9 @@ examples/                   Beispielprogramme in Lyx
 
 - **Frontend/Backend-Trennung**: Kein x86-Code im Frontend, keine AST-Knoten im Backend.
 - **IR als Stabilitätsanker**: Die Pipeline ist immer AST -> IR -> Maschinencode.
+- **Plattform-Abstraktion**: Gleicher IR-Input für Linux und Windows Backends.
 - **ELF64 ohne libc**: `_start` ruft `main()`, danach `sys_exit`. Kein Linking gegen externe Libraries.
+- **PE32+ mit IAT**: Import Address Table für kernel32.dll-Funktionen (GetStdHandle, WriteFile, ExitProcess).
 - **Builtins eingebettet**: `PrintStr`, `PrintInt`, `PrintFloat`, `strlen` und `exit` werden als Runtime-Snippets direkt ins Binary geschrieben.
 - **Jedes Token trägt SourceSpan**: Fehlermeldungen enthalten immer Datei, Zeile und Spalte.
 
@@ -1206,6 +1243,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.5** | ✅ String-Library (20+ Funktionen), ✅ Math-Builtins (22 Funktionen), ✅ Type-Casting (`as`), ✅ String-Konvertierung |
 | **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
 | **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung, ✅ Inkrement/Dekrement (`++`/`--`) als Statements |
+| **v0.1.8** | ✅ Windows x64 Backend: PE32+ Binary-Erzeugung, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory für kernel32.dll |
 | **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Null-Safety Phase 2 |
 | **v1** | Objektdateien, Multi-Unit Linking, Package Manager |
 
