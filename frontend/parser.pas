@@ -1072,10 +1072,28 @@ begin
     span := FCurTok.Span;
     name := FCurTok.Value;
     Advance;
-    // Optional: new ClassName() - we accept empty parens
+    // new ClassName() or new ClassName(args)
     if Accept(tkLParen) then
+    begin
+      args := nil;
+      if not Check(tkRParen) then
+      begin
+        SetLength(args, 1);
+        args[0] := ParseExpr;
+        while Accept(tkComma) do
+        begin
+          SetLength(args, Length(args) + 1);
+          args[High(args)] := ParseExpr;
+        end;
+      end;
       Expect(tkRParen);
-    Exit(TAstNewExpr.Create(name, span));
+      if Length(args) > 0 then
+        Exit(TAstNewExpr.CreateWithArgs(name, args, span))
+      else
+        Exit(TAstNewExpr.Create(name, span));
+    end
+    else
+      Exit(TAstNewExpr.Create(name, span));
   end;
 
   // super.method() - call to base class method

@@ -29,6 +29,7 @@ type
     FLocalElemSize: array of Integer; // index -> element size in bytes for dynamic array locals (0 if not array)
     FLocalIsStruct: array of Boolean; // index -> true if this local is a struct (need address, not value)
     FLocalSlotCount: array of Integer; // index -> number of slots this variable occupies (for structs)
+    FLocalTypeNames: array of string; // index -> type name for classes (for destructor lookup)
     FConstMap: TStringList; // name -> TConstValue (compile-time constants)
     FLocalConst: array of TConstValue; // per-function local constant values (or nil)
     FBreakStack: TStringList; // stack of break labels
@@ -96,6 +97,7 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     SetLength(FLocalIsStruct, 0);
     SetLength(FLocalSlotCount, 0);
     SetLength(FLocalConst, 0);
+    SetLength(FLocalTypeNames, 0);
   end;
 
 
@@ -111,6 +113,7 @@ begin
     if Assigned(FLocalConst[i]) then FLocalConst[i].Free;
   SetLength(FLocalConst, 0);
   SetLength(FLocalIsStruct, 0);
+  SetLength(FLocalTypeNames, 0);
   FBreakStack.Free;
   // Don't free objects in FStructTypes/FClassTypes - they belong to the AST
   FStructTypes.Free;
@@ -153,6 +156,9 @@ begin
   // ensure FLocalIsStruct has same length and initialize to false
   SetLength(FLocalIsStruct, FCurrentFunc.LocalCount);
   FLocalIsStruct[Result] := False;
+  // ensure FLocalTypeNames has same length and initialize to empty
+  SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
+  FLocalTypeNames[Result] := '';
 end;
 
 function TIRLowering.AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
@@ -185,6 +191,10 @@ begin
   FLocalSlotCount[base] := count; // store slot count on first slot
   for i := 1 to count - 1 do
     FLocalSlotCount[base + i] := 0; // other slots don't need count
+  // ensure FLocalTypeNames has same length
+  SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
+  for i := 0 to count - 1 do
+    FLocalTypeNames[base + i] := '';
   Result := base;
 end;
 
@@ -573,7 +583,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     tmp: Integer;
     condTmp: Integer;
     t0, t1, t2: Integer;
-    i: Integer;
+    i, k: Integer;
     strIdx: Integer;
     cv: TConstValue;
     argCount: Integer;
@@ -999,7 +1009,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkNewExpr:
       begin
-        // new ClassName() - allocate heap memory for class
+        // new ClassName() or new ClassName(args) - allocate heap memory for class
         // Look up class type to get size
         i := FStructTypes.IndexOf(TAstNewExpr(expr).ClassName);
         if i < 0 then
@@ -1020,6 +1030,33 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         if instr.ImmInt = 0 then
           instr.ImmInt := 8; // minimum allocation
         Emit(instr);
+        
+        // If new has arguments, call the Create constructor
+        if Length(TAstNewExpr(expr).Args) > 0 then
+        begin
+          // Build args: [self (t0), original args...]
+          argCount := Length(TAstNewExpr(expr).Args);
+          SetLength(argTemps, argCount + 1);
+          argTemps[0] := t0; // self is the allocated object pointer
+          
+          // Lower the constructor arguments
+          for k := 0 to argCount - 1 do
+            argTemps[k + 1] := LowerExpr(TAstNewExpr(expr).Args[k]);
+          
+          // Emit call to Create constructor
+          t1 := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irCall;
+          instr.Dest := t1;
+          instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_Create';
+          instr.ImmInt := argCount + 1; // +1 for self
+          instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, argCount + 1);
+          for k := 0 to argCount do
+            instr.ArgTemps[k] := argTemps[k];
+          Emit(instr);
+        end;
+        
         Result := t0;
       end;
 
@@ -1255,6 +1292,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     argCount: Integer;
     argTemps: array of Integer;
     ownerName: string;
+    mangledName: string;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -1340,6 +1378,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         begin
           // Class: allocate 1 slot for pointer, handle new expression
           loc := AllocLocal(vd.Name, atUnresolved);
+          // Store the class type name for destructor lookup
+          FLocalTypeNames[loc] := vd.DeclTypeName;
           
           // Handle initializer
           if vd.InitExpr is TAstNewExpr then
@@ -1769,8 +1809,40 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
    if stmt is TAstDispose then
    begin
      // dispose expr; - free heap memory
+     // First, call Destroy destructor if it exists
      t1 := LowerExpr(TAstDispose(stmt).Expr);
      if t1 < 0 then Exit(False);
+     
+     // Try to find the class type and check for Destroy method
+     if TAstDispose(stmt).Expr is TAstIdent then
+     begin
+       loc := FLocalMap.IndexOf(TAstIdent(TAstDispose(stmt).Expr).Name);
+       if (loc >= 0) and (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+       begin
+         // Check if there's a Destroy method for this class
+         mangledName := '_L_' + FLocalTypeNames[loc] + '_Destroy';
+         // Check if this function exists in the module
+         for i := 0 to High(FModule.Functions) do
+         begin
+           if FModule.Functions[i].Name = mangledName then
+           begin
+             // Call Destroy with self=t1
+             instr := Default(TIRInstr);
+             instr.Op := irCall;
+             instr.Dest := NewTemp;
+             instr.ImmStr := mangledName;
+             instr.ImmInt := 1; // just self
+             instr.CallMode := cmInternal;
+             SetLength(instr.ArgTemps, 1);
+             instr.ArgTemps[0] := t1;
+             Emit(instr);
+             Break;
+           end;
+         end;
+       end;
+     end;
+     
+     instr := Default(TIRInstr);
      instr.Op := irFree;
      instr.Src1 := t1;
      Emit(instr);

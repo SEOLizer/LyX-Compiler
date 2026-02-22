@@ -561,13 +561,17 @@ type
     procedure SetLayout(aSize, aAlign, aBaseSize: Integer);
   end;
 
-  { new Ausdruck: new ClassName() }
+  { new Ausdruck: new ClassName() oder new ClassName(args) }
   TAstNewExpr = class(TAstExpr)
   private
     FClassName: string;
+    FArgs: TAstExprList;
   public
     constructor Create(const aClassName: string; aSpan: TSourceSpan);
+    constructor CreateWithArgs(const aClassName: string; const aArgs: array of TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
     property ClassName: string read FClassName;
+    property Args: TAstExprList read FArgs;
   end;
 
   { dispose Statement: dispose expr; }
@@ -1335,7 +1339,31 @@ constructor TAstNewExpr.Create(const aClassName: string; aSpan: TSourceSpan);
 begin
   inherited Create(nkNewExpr, aSpan);
   FClassName := aClassName;
+  SetLength(FArgs, 0);
 end;
+
+constructor TAstNewExpr.CreateWithArgs(const aClassName: string; const aArgs: array of TAstExpr; aSpan: TSourceSpan);
+var
+  i: Integer;
+begin
+  inherited Create(nkNewExpr, aSpan);
+  FClassName := aClassName;
+  SetLength(FArgs, Length(aArgs));
+  for i := 0 to High(aArgs) do
+    FArgs[i] := aArgs[i];
+end;
+
+destructor TAstNewExpr.Destroy;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FArgs) do
+    if Assigned(FArgs[i]) then FArgs[i].Free;
+  SetLength(FArgs, 0);
+  inherited Destroy;
+end;
+
+
 
 { TAstDispose }
 

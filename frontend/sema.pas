@@ -316,6 +316,7 @@ var
   mangledName: string;
   args: TAstExprList;
   cd: TAstClassDecl;
+  newExpr: TAstNewExpr;
 begin
   if expr = nil then
   begin
@@ -620,6 +621,37 @@ begin
                 // s is already set to the static method symbol
               end;
             end;
+            // Also check if it's a class type name (static method on class)
+            if (sSym = nil) and (s = nil) and Assigned(FClassTypes) then
+            begin
+              fi := FClassTypes.IndexOf(TAstIdent(recv).Name);
+              if fi >= 0 then
+              begin
+                // Static method call on class: ClassName.method(args)
+                mangledName := '_L_' + TAstIdent(recv).Name + '_' + mName;
+                s := ResolveSymbol(mangledName);
+                if s = nil then
+                begin
+                  FDiag.Error('call to undeclared static method: ' + mangledName, call.Span);
+                  Result := atUnresolved;
+                  Exit;
+                end;
+                // Rewrite call: remove the type name from args, just use the mangled name
+                call.SetName(mangledName);
+                // Remove the first argument (the type name identifier)
+                if Length(call.Args) > 0 then
+                begin
+                  // Free the type name identifier (first arg)
+                  call.Args[0].Free;
+                  // Shift remaining args down
+                  SetLength(args, Length(call.Args) - 1);
+                  for i := 1 to High(call.Args) do
+                    args[i-1] := call.Args[i];
+                  // Replace args without freeing (we already freed the type name)
+                  call.ReplaceArgs(args);
+                end;
+              end;
+            end;
           end;
           
           // Instance method call (receiver is a variable with struct type)
@@ -749,7 +781,7 @@ begin
       end;
     nkNewExpr:
       begin
-        // new ClassName() - returns a pointer to the class instance
+        // new ClassName() or new ClassName(args) - returns a pointer to the class instance
         if not Assigned(FClassTypes) or (FClassTypes.IndexOf(TAstNewExpr(expr).ClassName) < 0) then
         begin
           FDiag.Error('unknown class type: ' + TAstNewExpr(expr).ClassName, expr.Span);
@@ -757,6 +789,34 @@ begin
         end
         else
         begin
+          // Check constructor arguments if any
+          newExpr := TAstNewExpr(expr);
+          if Length(newExpr.Args) > 0 then
+          begin
+            // Look for Create method with matching arguments
+            mangledName := '_L_' + newExpr.ClassName + '_Create';
+            s := ResolveSymbol(mangledName);
+            if s = nil then
+            begin
+              FDiag.Error('class ' + newExpr.ClassName + ' has no Create constructor for new with arguments', expr.Span);
+              Result := atUnresolved;
+              Exit;
+            end;
+            // Check argument count (Create has self as first param, so ParamCount - 1)
+            if Length(newExpr.Args) <> s.ParamCount - 1 then
+            begin
+              FDiag.Error(Format('wrong argument count for %s constructor: expected %d, got %d', 
+                [newExpr.ClassName, s.ParamCount - 1, Length(newExpr.Args)]), expr.Span);
+            end;
+            // Check argument types
+            for i := 0 to High(newExpr.Args) do
+            begin
+              atype := CheckExpr(newExpr.Args[i]);
+              if (i + 1 < s.ParamCount) and (s.ParamTypes[i + 1] <> atUnresolved) and (not TypeEqual(atype, s.ParamTypes[i + 1])) then
+                FDiag.Error(Format('constructor argument %d: expected %s but got %s', 
+                  [i + 1, AurumTypeToStr(s.ParamTypes[i + 1]), AurumTypeToStr(atype)]), newExpr.Args[i].Span);
+            end;
+          end;
           // Classes are reference types (pointers)
           Result := atUnresolved; // Named class type, resolved as pointer
         end;
@@ -1396,6 +1456,12 @@ begin
         // Classes are always pointer-sized (8 bytes) as values
         // But we track the full object size for allocation
         totalSize := off;
+        // Minimum size of 8 bytes for empty classes (allows static-only classes)
+        if totalSize = 0 then
+        begin
+          totalSize := 8;
+          maxAlign := 8;
+        end;
         if (totalSize mod maxAlign) <> 0 then
           totalSize := ((totalSize + maxAlign - 1) div maxAlign) * maxAlign;
         cd.SetLayout(totalSize, maxAlign, baseSize);
@@ -1404,11 +1470,13 @@ begin
     end;
   until (changed = 0) or (pass > 100);
   
-  // Report errors for uncomputed classes
+  // Report errors for uncomputed classes (only if they have fields that couldn't be resolved)
   for i := 0 to FClassTypes.Count - 1 do
   begin
     cd := TAstClassDecl(FClassTypes.Objects[i]);
-    if cd.Size = 0 then
+    // Size = 0 only happens if field types couldn't be resolved
+    // Empty classes now get Size = 8 above
+    if (cd.Size = 0) and (Length(cd.Fields) > 0) then
       FDiag.Error('cannot compute layout for class: ' + cd.Name, cd.Span);
   end;
 end;
