@@ -307,6 +307,150 @@ begin
   EmitU8(buf, $C0 or (reg and 7));
 end;
 
+procedure WriteDecReg(buf: TByteBuffer; reg: Byte);
+begin
+  // dec r64: REX.W(+B) FF C8+reg
+  EmitRex(buf, 1, 0, 0, (reg shr 3) and 1);
+  EmitU8(buf, $FF); EmitU8(buf, $C8 or (reg and $7));
+end;
+
+procedure WriteSubRegReg(buf: TByteBuffer; dst, src: Byte);
+var rexR, rexB: Integer;
+begin
+  // sub r/m64, r64 : REX.W + 29 /r
+  rexR := (src shr 3) and 1;
+  rexB := (dst shr 3) and 1;
+  EmitRex(buf, 1, rexR, 0, rexB);
+  EmitU8(buf, $29);
+  EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
+end;
+
+procedure WriteImulRegReg(buf: TByteBuffer; dst, src: Byte);
+var rexR, rexB: Integer;
+begin
+  // imul r64, r/m64 : REX.W 0F AF /r  (reg=dst, rm=src)
+  rexR := (dst shr 3) and 1;
+  rexB := (src shr 3) and 1;
+  EmitRex(buf, 1, rexR, 0, rexB);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $AF);
+  EmitU8(buf, $C0 or (((dst and 7) shl 3) and $38) or (src and $7));
+end;
+
+procedure WriteCqo(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$99); end;
+
+procedure WriteIdivReg(buf: TByteBuffer; src: Byte);
+var rexB: Integer;
+begin
+  // idiv r/m64 : REX.W + F7 /7 ; modrm = 0xF8 | rm (with mod=11)
+  rexB := (src shr 3) and 1;
+  EmitRex(buf, 1, 0, 0, rexB);
+  EmitU8(buf, $F7);
+  EmitU8(buf, $F8 or (src and $7));
+end;
+
+procedure WriteTestRaxRax(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$85); EmitU8(buf,$C0); end;
+
+procedure WriteTestRegReg(buf: TByteBuffer; r1, r2: Byte);
+var rexR, rexB: Integer;
+begin
+  rexR := (r1 shr 3) and 1;
+  rexB := (r2 shr 3) and 1;
+  EmitRex(buf, 1, rexR, 0, rexB);
+  EmitU8(buf, $85);
+  EmitU8(buf, $C0 or (((r1 and 7) shl 3) and $38) or (r2 and $7));
+end;
+
+procedure WriteMovMemRegByte(buf: TByteBuffer; base: Byte; disp: Integer; reg8: Byte);
+begin
+  // mov byte ptr [base + disp32], r8 -> 88 /0 with mod=10 (disp32)
+  EmitU8(buf, $88);
+  EmitU8(buf, $80 or ((reg8 and $7) shl 3) or (base and $7));
+  EmitU32(buf, Cardinal(disp));
+end;
+
+procedure WriteMovMemRegByteNoDisp(buf: TByteBuffer; base: Byte; reg8: Byte);
+begin
+  // mov byte ptr [base], r8 -> 88 /0 with mod=00 and rm=base
+  EmitU8(buf, $88);
+  EmitU8(buf, ((reg8 and $7) shl 3) or (base and $7));
+end;
+
+procedure WriteMovMemImm8(buf: TByteBuffer; base: Byte; disp: Integer; value: Byte);
+begin
+  // mov byte ptr [base+disp32], imm8 => C6 80 disp32 imm8
+  EmitU8(buf, $C6);
+  EmitU8(buf, $80 or (base and $7));
+  EmitU32(buf, Cardinal(disp));
+  EmitU8(buf, value);
+end;
+
+procedure WriteSetccMem8(buf: TByteBuffer; ccOpcode: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // setcc r/m8 : opcode 0F ccOpcode modrm(mod=10) rm=base
+  EmitU8(buf, $0F);
+  EmitU8(buf, ccOpcode);
+  EmitU8(buf, $80 or ((0 shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movzx r64, r/m8 : rex.w 0F B6 /r with reg=dst, rm=mem
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $B6);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movzx r64, r/m16 : rex.w 0F B7 /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $B7);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsx r64, r/m8 : rex.w 0F BE /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $BE);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsx r64, r/m16 : rex.w 0F BF /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $BF);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsxd r64, r/m32 : rex.w 63 /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $63);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Byte; disp32: Integer);
+begin
+  // mov eax, dword ptr [base+disp32] : 8B 80 disp32
+  EmitU8(buf, $8B);
+  EmitU8(buf, $80 or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
 // Calculate stack slot offset
 function SlotOffset(slot: Integer): Integer;
 begin
