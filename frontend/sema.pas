@@ -1033,8 +1033,11 @@ begin
               sym.ClassDecl := TAstClassDecl(FClassTypes.Objects[i]);
           end;
         end;
-        // array length metadata
-        sym.ArrayLen := vd.ArrayLen;
+        // array length metadata - also check array literal initializer
+        if vd.InitExpr is TAstArrayLit then
+          sym.ArrayLen := Length(TAstArrayLit(vd.InitExpr).Items)
+        else
+          sym.ArrayLen := vd.ArrayLen;
         AddSymbolToCurrent(sym, vd.Span);
       end;
     nkAssign:
