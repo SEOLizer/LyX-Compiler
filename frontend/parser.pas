@@ -890,6 +890,7 @@ var
   fa: TAstFieldAccess;
   objExpr: TAstExpr;
   fieldName: string;
+  incExpr: TAstBinOp;
 begin
   expr := ParseExpr;
   // Assignment pattern: ident := expr ;
@@ -904,6 +905,28 @@ begin
     expr.Free;
     Exit(TAstAssign.Create(name, valExpr, valExpr.Span));
   end
+  else if (expr is TAstIdent) and Check(tkPlusPlus) then
+  begin
+    // Increment: ident++ -> ident := ident + 1
+    name := TAstIdent(expr).Name;
+    Advance; // consume '++'
+    Expect(tkSemicolon);
+    expr.Free;
+    // Build: name := name + 1
+    incExpr := TAstBinOp.Create(tkPlus, TAstIdent.Create(name, expr.Span), TAstIntLit.Create(1, expr.Span), expr.Span);
+    Exit(TAstAssign.Create(name, incExpr, expr.Span));
+  end
+  else if (expr is TAstIdent) and Check(tkMinusMinus) then
+  begin
+    // Decrement: ident-- -> ident := ident - 1
+    name := TAstIdent(expr).Name;
+    Advance; // consume '--'
+    Expect(tkSemicolon);
+    expr.Free;
+    // Build: name := name - 1
+    incExpr := TAstBinOp.Create(tkMinus, TAstIdent.Create(name, expr.Span), TAstIntLit.Create(1, expr.Span), expr.Span);
+    Exit(TAstAssign.Create(name, incExpr, expr.Span));
+  end
   else if (expr is TAstFieldAccess) and Check(tkAssign) then
   begin
     // Field assignment: obj.field := value
@@ -914,6 +937,24 @@ begin
     fa := TAstFieldAccess(expr);
     Exit(TAstFieldAssign.Create(fa, valExpr, valExpr.Span));
   end
+  else if (expr is TAstFieldAccess) and Check(tkPlusPlus) then
+  begin
+    // Field increment: obj.field++ -> obj.field := obj.field + 1
+    Advance; // consume '++'
+    Expect(tkSemicolon);
+    fa := TAstFieldAccess(expr);
+    incExpr := TAstBinOp.Create(tkPlus, TAstFieldAccess.Create(fa.Obj, fa.Field, fa.Span), TAstIntLit.Create(1, fa.Span), fa.Span);
+    Exit(TAstFieldAssign.Create(fa, incExpr, fa.Span));
+  end
+  else if (expr is TAstFieldAccess) and Check(tkMinusMinus) then
+  begin
+    // Field decrement: obj.field-- -> obj.field := obj.field - 1
+    Advance; // consume '--'
+    Expect(tkSemicolon);
+    fa := TAstFieldAccess(expr);
+    incExpr := TAstBinOp.Create(tkMinus, TAstFieldAccess.Create(fa.Obj, fa.Field, fa.Span), TAstIntLit.Create(1, fa.Span), fa.Span);
+    Exit(TAstFieldAssign.Create(fa, incExpr, fa.Span));
+  end
   else if (expr is TAstIndexAccess) and Check(tkAssign) then
   begin
     // Index assignment: arr[idx] := value
@@ -923,11 +964,32 @@ begin
     // create index-assign node using the existing index-access AST as target
     Exit(TAstIndexAssign.Create(TAstIndexAccess(expr), valExpr, valExpr.Span));
   end
+  else if (expr is TAstIndexAccess) and Check(tkPlusPlus) then
+  begin
+    // Index increment: arr[idx]++ -> arr[idx] := arr[idx] + 1
+    Advance; // consume '++'
+    Expect(tkSemicolon);
+    // Build NEW arr[idx] := arr[idx] + 1
+    // Don't free old expression, use it one
+    incExpr := TAstBinOp.Create(tkPlus, TAstIndexAccess.Create(TAstIndexAccess(expr).Obj, TAstIntLit.Create(1, expr.Span), expr.Span), expr.Span));
+    Exit(TAstIndexAssign.Create(TAstIndexAccess(expr), incExpr, expr.Span));
+  end
+  else if (expr is TAstIndexAccess) and Check(tkMinusMinus) then
+  begin
+    // Index decrement: arr[idx]-- -> arr[idx] := arr[idx] - 1
+    Advance; // consume '--'
+    Expect(tkSemicolon);
+    // Build new arr[idx] := arr[idx] - 1
+    // Don't free old expression, use the one
+    incExpr := TAstBinOp.Create(tkMinus, TAstIndexAccess.Create(TAstIndexAccess(expr).obj, TAstIntLit.Create(1, expr.Span), expr.Span), expr.Span));
+    Exit(TAstIndexAssign.Create(TAstIndexAccess(expr), incExpr, expr.Span));
+  end
   else
   begin
     Expect(tkSemicolon);
     Exit(TAstExprStmt.Create(expr, expr.Span));
   end;
+end;
 end;
 
 { Expressions }

@@ -22,6 +22,7 @@ type
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
+    tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
     tkAssign, tkSingleEq,
     tkEq, tkNeq,
     tkLt, tkLe, tkGt, tkGe,
@@ -130,8 +131,10 @@ begin
     tkNew:        Result := 'new';
     tkDispose:    Result := 'dispose';
     tkPlus:       Result := '+';
-    tkMinus:     Result := '-';
-    tkStar:      Result := '*';
+    tkMinus:      Result := '-';
+    tkPlusPlus:   Result := '++';
+    tkMinusMinus: Result := '--';
+    tkStar:       Result := '*';
     tkSlash:     Result := '/';
     tkPercent:   Result := '%';
     tkAssign:    Result := ':=';
@@ -557,8 +560,26 @@ begin
 
   // Operatoren und Trennzeichen
   case c of
-    '+': begin Advance; Result := MakeToken(tkPlus, '+', startLine, startCol, 1); end;
-    '-': begin Advance; Result := MakeToken(tkMinus, '-', startLine, startCol, 1); end;
+    '+': begin
+      Advance;
+      if (not IsAtEnd) and (CurrentChar = '+') then
+      begin
+        Advance;
+        Result := MakeToken(tkPlusPlus, '++', startLine, startCol, 2);
+      end
+      else
+        Result := MakeToken(tkPlus, '+', startLine, startCol, 1);
+    end;
+    '-': begin
+      Advance;
+      if (not IsAtEnd) and (CurrentChar = '-') then
+      begin
+        Advance;
+        Result := MakeToken(tkMinusMinus, '--', startLine, startCol, 2);
+      end
+      else
+        Result := MakeToken(tkMinus, '-', startLine, startCol, 1);
+    end;
     '*': begin Advance; Result := MakeToken(tkStar, '*', startLine, startCol, 1); end;
     '%': begin Advance; Result := MakeToken(tkPercent, '%', startLine, startCol, 1); end;
     '(': begin Advance; Result := MakeToken(tkLParen, '(', startLine, startCol, 1); end;
