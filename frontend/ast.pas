@@ -261,9 +261,11 @@ type
     FDeclTypeName: string; // if named type (struct), store the name here
     FArrayLen: Integer;    // 0 = not array, >0 = static length, -1 = dynamic array ([]) 
     FInitExpr: TAstExpr;
+    FIsNullable: Boolean;  // true if type ends with ? (null-safety)
   public
     constructor Create(aStorage: TStorageKlass; const aName: string;
-      aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; aInitExpr: TAstExpr; aSpan: TSourceSpan);
+      aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
+      aInitExpr: TAstExpr; aIsNullable: Boolean; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Storage: TStorageKlass read FStorage;
     property Name: string read FName;
@@ -271,6 +273,7 @@ type
     property DeclTypeName: string read FDeclTypeName;
     property ArrayLen: Integer read FArrayLen;
     property InitExpr: TAstExpr read FInitExpr;
+    property IsNullable: Boolean read FIsNullable;
   end;
 
   { Zuweisung: x := expr; }
@@ -930,8 +933,8 @@ end;
 // ================================================================
 
 constructor TAstVarDecl.Create(aStorage: TStorageKlass;
-  const aName: string; aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; aInitExpr: TAstExpr;
-  aSpan: TSourceSpan);
+  const aName: string; aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
+  aInitExpr: TAstExpr; aIsNullable: Boolean; aSpan: TSourceSpan);
 begin
   inherited Create(nkVarDecl, aSpan);
   FStorage := aStorage;
@@ -940,6 +943,7 @@ begin
   FDeclTypeName := aDeclTypeName;
   FArrayLen := aArrayLen;
   FInitExpr := aInitExpr;
+  FIsNullable := aIsNullable;
 end;
 
 destructor TAstVarDecl.Destroy;

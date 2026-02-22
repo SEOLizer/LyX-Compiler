@@ -38,6 +38,7 @@ type
 
     // Expressions (Präzedenz): Or -> And -> Cmp -> Add -> Mul -> Unary -> Primary -> Postfix
     function ParseExpr: TAstExpr;
+    function ParseNullCoalesceExpr: TAstExpr;
     function ParseOrExpr: TAstExpr;
     function ParseAndExpr: TAstExpr;
     function ParseCmpExpr: TAstExpr;
@@ -50,6 +51,7 @@ type
 
 
     function ParseTypeEx(out arrayLen: Integer; out typeName: string): TAurumType;
+    function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
     function ParseType: TAurumType;
     function ParseParamList: TAstParamList;
   public
@@ -754,6 +756,7 @@ var
   declTypeName: string;
   initExpr: TAstExpr;
   arrayLen: Integer;
+  isNullable: Boolean;
 begin
   if Accept(tkVar) then storage := skVar
   else if Accept(tkLet) then storage := skLet
@@ -770,13 +773,13 @@ begin
   end;
 
   Expect(tkColon);
-  declType := ParseTypeEx(arrayLen, declTypeName);
+  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
   Expect(tkAssign);
   initExpr := ParseExpr;
   Expect(tkSemicolon);
 
-  Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, initExpr.Span);
+  Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span);
 end;
 
 function TParser.ParseForStmt: TAstFor;
@@ -879,7 +882,19 @@ end;
 
 function TParser.ParseExpr: TAstExpr;
 begin
+  Result := ParseNullCoalesceExpr;
+end;
+
+function TParser.ParseNullCoalesceExpr: TAstExpr;
+var
+  rhs: TAstExpr;
+begin
   Result := ParseOrExpr;
+  while Accept(tkNullCoalesce) do
+  begin
+    rhs := ParseOrExpr;
+    Result := TAstBinOp.Create(tkNullCoalesce, Result, rhs, Result.Span);
+  end;
 end;
 
 function TParser.ParseOrExpr: TAstExpr;
@@ -1290,10 +1305,18 @@ begin
 end;
 
 function TParser.ParseTypeEx(out arrayLen: Integer; out typeName: string): TAurumType;
+var 
+  isNullable: Boolean;
+begin
+  Result := ParseTypeExFull(arrayLen, typeName, isNullable);
+end;
+
+function TParser.ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
 var s: string;
 begin
   arrayLen := 0;
   typeName := '';
+  isNullable := False;
   if Check(tkIdent) then
   begin
     s := FCurTok.Value;
@@ -1323,6 +1346,9 @@ begin
         if Check(tkRBracket) then Advance;
       end;
     end;
+    // optional nullable suffix: ?
+    if Accept(tkQuestion) then
+      isNullable := True;
   end
   else
   begin

@@ -29,7 +29,9 @@ type
     // Trennzeichen
     tkLParen, tkRParen, tkLBrace, tkRBrace,
     tkLBracket, tkRBracket,
-    tkColon, tkComma, tkSemicolon,     tkEllipsis, tkDot, tkAt,
+    tkColon, tkComma, tkSemicolon, tkEllipsis, tkDot, tkAt,
+    // Null-Safety Operatoren
+    tkQuestion, tkNullCoalesce, tkSafeCall,
     // Sonstiges
     tkEOF, tkError
   );
@@ -155,6 +157,9 @@ begin
     tkEllipsis:  Result := '...';
     tkDot:       Result := '.';
     tkAt:        Result := '@';
+    tkQuestion:  Result := '?';
+    tkNullCoalesce: Result := '??';
+    tkSafeCall:  Result := '?.';
     tkEOF:       Result := 'EOF';
     tkError:     Result := 'ERROR';
   end;
@@ -573,6 +578,21 @@ begin
       end;
     end;
     '@': begin Advance; Result := MakeToken(tkAt, '@', startLine, startCol, 1); end;
+    '?': begin
+      Advance;
+      if (not IsAtEnd) and (CurrentChar = '?') then
+      begin
+        Advance;
+        Result := MakeToken(tkNullCoalesce, '??', startLine, startCol, 2);
+      end
+      else if (not IsAtEnd) and (CurrentChar = '.') then
+      begin
+        Advance;
+        Result := MakeToken(tkSafeCall, '?.', startLine, startCol, 2);
+      end
+      else
+        Result := MakeToken(tkQuestion, '?', startLine, startCol, 1);
+    end;
     '[': begin Advance; Result := MakeToken(tkLBracket, '[', startLine, startCol, 1); end;
     ']': begin Advance; Result := MakeToken(tkRBracket, ']', startLine, startCol, 1); end;
 

@@ -534,6 +534,13 @@ begin
                 FDiag.Error('type error: logical operators require bool operands', bin.Span);
               Result := atBool;
             end;
+          tkNullCoalesce:
+            begin
+              // x ?? y: if x is null, use y. Result type is the non-nullable version of lt/rt
+              // For now, just return the left type (Phase 1: no strict enforcement)
+              Result := lt;
+              // TODO Phase 2: Check that lt is nullable and rt is compatible non-nullable type
+            end;
         else
           begin
             FDiag.Error('unsupported binary operator in sema', bin.Span);
