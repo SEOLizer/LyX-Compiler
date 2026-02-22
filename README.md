@@ -403,6 +403,30 @@ fn main(): int64 {
 
 Zuweisung erfolgt mit `:=` (nicht `=`).
 
+### Inkrement- und Dekrement-Operatoren
+
+Die Operatoren `++` und `--` sind als **Postfix-Statements** verfügbar:
+
+```lyx
+var counter: int64 := 0;
+
+fn main(): int64 {
+  counter++;        // counter := counter + 1
+  counter++;        // counter := counter + 1
+  counter--;        // counter := counter - 1
+  
+  PrintInt(counter);  // 1
+  return 0;
+}
+```
+
+**Unterstützte Formen:**
+- `ident++` / `ident--` - Variable inkrementieren/dekrementieren
+- `obj.field++` / `obj.field--` - Feld inkrementieren/dekrementieren
+- `arr[idx]++` / `arr[idx]--` - Array-Element inkrementieren/dekrementieren
+
+**Hinweis:** Dies sind Statement-Formen (keine Expressions). Sie liefern keinen Wert zurück.
+
 ### Pipe-Operator `|>`
 
 Der Pipe-Operator ermöglicht das Verketten von Funktionen in der Reihenfolge des Datenflusses (von links nach rechts):
@@ -1181,7 +1205,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.4** | ✅ SO-Library Integration, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs, ✅ Module System |
 | **v0.1.5** | ✅ String-Library (20+ Funktionen), ✅ Math-Builtins (22 Funktionen), ✅ Type-Casting (`as`), ✅ String-Konvertierung |
 | **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
-| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung |
+| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung, ✅ Inkrement/Dekrement (`++`/`--`) als Statements |
 | **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Null-Safety Phase 2 |
 | **v1** | Objektdateien, Multi-Unit Linking, Package Manager |
 

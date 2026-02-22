@@ -452,6 +452,31 @@ ConstPrimary   := IntLit | FloatLit | BoolLit | StringLit | CharLit | '(' ConstE
 * `let` und `co` dürfen nur bei Deklaration initialisiert werden
 * `con` ist compile-time und nicht zuweisbar
 
+### Inkrement- und Dekrement-Operatoren
+
+Die Operatoren `++` und `--` sind als **Postfix-Statements** verfügbar:
+
+```
+IncDecStmt      := LValue ( '++' | '--' ) ';' ;
+LValue          := Ident { FieldOrIndexSuffix } ;
+FieldOrIndexSuffix
+                := '.' Ident
+                | '[' Expr ']' ;
+```
+
+**Desugaring:**
+- `x++` wird zu `x := x + 1`
+- `x--` wird zu `x := x - 1`
+
+**Beispiele:**
+```lyx
+counter++;           // counter := counter + 1
+arr[idx]++;          // arr[idx] := arr[idx] + 1
+player.health--;     // player.health := player.health - 1
+```
+
+**Wichtig:** Dies sind Statements, keine Expressions. Sie können nicht in Ausdrücken verwendet werden.
+
 ### Return-Regeln
 
 * Funktion mit Rückgabetyp `int64/bool/pchar/f64` muss auf allen Pfaden `return <expr>;` liefern
