@@ -645,8 +645,9 @@ begin
       end
       else
       begin
-        // Single '=' is valid for type declarations: type X = ...
-        Result := MakeToken(tkSingleEq, '=', startLine, startCol, 1);
+        FDiag.Error('unexpected token, single ''='' is not a valid operator',
+          MakeSpan(startLine, startCol, 1, FFileName));
+        Result := MakeToken(tkError, '=', startLine, startCol, 1);
       end;
     end;
 

@@ -29,6 +29,7 @@ type
     FLocalElemSize: array of Integer; // index -> element size in bytes for dynamic array locals (0 if not array)
     FLocalIsStruct: array of Boolean; // index -> true if this local is a struct (need address, not value)
     FLocalSlotCount: array of Integer; // index -> number of slots this variable occupies (for structs)
+    FLocalArrayLen: array of Integer; // index -> array length (0 if not a static array)
     FLocalTypeNames: array of string; // index -> type name for classes (for destructor lookup)
     FConstMap: TStringList; // name -> TConstValue (compile-time constants)
     FLocalConst: array of TConstValue; // per-function local constant values (or nil)
@@ -44,6 +45,7 @@ type
     function AllocLocal(const name: string; aType: TAurumType): Integer;
     function AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
     function GetLocalType(idx: Integer): TAurumType;
+    function GetLocalArrayLen(idx: Integer): Integer;
     function ResolveLocal(const name: string): Integer;
     procedure Emit(instr: TIRInstr);
 
@@ -217,6 +219,14 @@ begin
   SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
   for i := 0 to count - 1 do
     FLocalTypeNames[base + i] := '';
+  // ensure FLocalArrayLen has same length - store array length on first slot
+  SetLength(FLocalArrayLen, FCurrentFunc.LocalCount);
+  if (not isStruct) and (count > 1) then
+    FLocalArrayLen[base] := count  // this is an array
+  else
+    FLocalArrayLen[base] := 0;     // not an array
+  for i := 1 to count - 1 do
+    FLocalArrayLen[base + i] := 0;
   Result := base;
 end;
 
@@ -226,6 +236,14 @@ begin
     Result := FLocalTypes[idx]
   else
     Result := atUnresolved;
+end;
+
+function TIRLowering.GetLocalArrayLen(idx: Integer): Integer;
+begin
+  if (idx >= 0) and (idx < Length(FLocalArrayLen)) then
+    Result := FLocalArrayLen[idx]
+  else
+    Result := 0;
 end;
 
 procedure TIRLowering.Emit(instr: TIRInstr);
@@ -671,6 +689,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     slotCount: Integer;
     baseIdx: Integer;
     mangled: string;
+    arrLen: Integer;
+    baseSlot: Integer;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -1075,7 +1095,44 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         end
         else
         begin
-          // Local array: use normal LowerExpr for base
+          // Local array: need to load ADDRESS of array base, not value
+          if TAstIndexAccess(expr).Obj is TAstIdent then
+          begin
+            loc := ResolveLocal(TAstIdent(TAstIndexAccess(expr).Obj).Name);
+            if loc >= 0 then
+            begin
+              // Array elements are stored in reverse order on stack.
+              // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
+              // Load address of arr[0] (highest slot) so base + index*8 works correctly.
+              arrLen := GetLocalArrayLen(loc);
+              if arrLen > 0 then
+                baseSlot := loc + arrLen - 1  // base address points to arr[0]
+              else
+                baseSlot := loc;  // fallback for non-array locals
+              
+              t1 := NewTemp;
+              instr.Op := irLoadLocalAddr;
+              instr.Dest := t1;
+              instr.Src1 := baseSlot;
+              Emit(instr);
+              
+              // Lower index
+              t2 := LowerExpr(TAstIndexAccess(expr).Index);
+              if t2 < 0 then
+                Exit;
+
+              t0 := NewTemp;
+              instr.Op := irLoadElem;
+              instr.Dest := t0;
+              instr.Src1 := t1;  // array base address
+              instr.Src2 := t2;  // index
+              Emit(instr);
+              Result := t0;
+              Exit;
+            end;
+          end;
+          
+          // Fallback: use normal LowerExpr for base (for other expression types)
           t1 := LowerExpr(TAstIndexAccess(expr).Obj);
           t2 := LowerExpr(TAstIndexAccess(expr).Index);
           if (t1 < 0) or (t2 < 0) then
@@ -1441,28 +1498,37 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     argTemps: array of Integer;
     ownerName: string;
     mangledName: string;
+    arrLen: Integer;
+    baseSlot: Integer;
   begin
   instr := Default(TIRInstr);
   Result := True;
    if stmt is TAstVarDecl then
     begin
       vd := TAstVarDecl(stmt);
-      if vd.ArrayLen > 0 then
+      // If ArrayLen not set but InitExpr is an array literal, infer the length
+      arrLen := vd.ArrayLen;
+      if (arrLen = 0) and (vd.InitExpr is TAstArrayLit) then
+        arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
+      if arrLen > 0 then
       begin
         // static array: allocate consecutive locals and initialize per-item
-        loc := AllocLocalMany(vd.Name, vd.DeclType, vd.ArrayLen);
+        // IMPORTANT: Store elements in REVERSE order so that arr[0] has the 
+        // highest slot index. This way, base_addr + index*8 works correctly
+        // because stack grows downward.
+        loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
         if vd.InitExpr is TAstArrayLit then
         begin
           items := TAstArrayLit(vd.InitExpr).Items;
-          if Length(items) <> vd.ArrayLen then
+          if Length(items) <> arrLen then
             FDiag.Error('array literal length mismatch', vd.Span)
           else
           begin
             for i := 0 to High(items) do
             begin
               tmp := LowerExpr(items[i]);
-              // store into base + i
-              instr.Op := irStoreLocal; instr.Dest := loc + i; instr.Src1 := tmp; Emit(instr);
+              // store into reversed slot: arr[0] -> highest slot, arr[n-1] -> lowest slot
+              instr.Op := irStoreLocal; instr.Dest := loc + (arrLen - 1 - i); instr.Src1 := tmp; Emit(instr);
             end;
           end;
         end
@@ -1777,9 +1843,40 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else
       begin
-        // Local array: normal LowerExpr
-        t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
-        if t1 < 0 then Exit(False);
+        // Local array: need to load ADDRESS of array base, not value
+        if TAstIndexAssign(stmt).Target.Obj is TAstIdent then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
+          if loc >= 0 then
+          begin
+            // Array elements are stored in reverse order on stack.
+            // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
+            // Load address of arr[0] (highest slot) so base + index*8 works correctly.
+            arrLen := GetLocalArrayLen(loc);
+            if arrLen > 0 then
+              baseSlot := loc + arrLen - 1  // base address points to arr[0]
+            else
+              baseSlot := loc;  // fallback for non-array locals
+            
+            t1 := NewTemp;
+            instr.Op := irLoadLocalAddr;
+            instr.Dest := t1;
+            instr.Src1 := baseSlot;
+            Emit(instr);
+          end
+          else
+          begin
+            // Fallback: use normal LowerExpr
+            t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
+            if t1 < 0 then Exit(False);
+          end;
+        end
+        else
+        begin
+          // Non-identifier: use normal LowerExpr
+          t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
+          if t1 < 0 then Exit(False);
+        end;
       end;
       
       // t2 = index expression
