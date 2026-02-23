@@ -77,6 +77,12 @@ const
   // Parameter registers (AAPCS64)
   ParamRegs: array[0..7] of Byte = (X0, X1, X2, X3, X4, X5, X6, X7);
 
+  // ARM64 FP/SIMD Registers (V0-V31, auch nutzbar als D0-D31 für 64-bit Double)
+  V0 = 0; V1 = 1; V2 = 2; V3 = 3; V4 = 4; V5 = 5; V6 = 6; V7 = 7;
+  V8 = 8; V9 = 9; V10 = 10; V11 = 11; V12 = 12; V13 = 13; V14 = 14; V15 = 15;
+  V16 = 16; V17 = 17; V18 = 18; V19 = 19; V20 = 20; V21 = 21; V22 = 22; V23 = 23;
+  V24 = 24; V25 = 25; V26 = 26; V27 = 27; V28 = 28; V29 = 29; V30 = 30; V31 = 31;
+
   // Linux ARM64 Syscall Numbers
   SYS_read = 63;
   SYS_write = 64;
@@ -597,6 +603,206 @@ begin
   immhi := DWord((offset shr 14) and $7FFFF);
   // ADRP: 1 immlo 10000 immhi Rd
   EmitInstr(buf, $90000000 or (immlo shl 29) or (immhi shl 5) or rd);
+end;
+
+// ==========================================================================
+// ARM64 Floating Point Instruction Encoding
+// ==========================================================================
+
+// FMOV Sd, Sn (32-bit float move)
+procedure WriteFmovS(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FMOV (scalar, 32-bit): 000 11110 00 1 00000 Rm 000000 Rn Rd
+  // 0 00 11110 00 1 00000 00000 000000 00000 Rd
+  EmitInstr(buf, $1E204000 or (DWord(rn) shl 5) or rd);
+end;
+
+// FMOV Dd, Dn (64-bit float move)
+procedure WriteFmovD(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FMOV (scalar, 64-bit): 111 1110 0 01 00000 Rm 000000 Rn Rd
+  EmitInstr(buf, $D6000000 or (DWord(rn) shl 5) or rd);
+end;
+
+// FADD Sd, Sn, Sm (32-bit float add)
+procedure WriteFaddS(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FADD (scalar, 32-bit): 000 11110 00 1 00100 Rm 000000 Rn Rd
+  EmitInstr(buf, $1E204800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FADD Dd, Dn, Dm (64-bit float add)
+procedure WriteFaddD(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FADD (scalar, 64-bit): 111 1110 0 01 00100 Rm 000000 Rn Rd
+  EmitInstr(buf, $D6200800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FSUB Sd, Sn, Sm (32-bit float subtract)
+procedure WriteFsubS(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FSUB: 000 11110 00 1 00110 Rm 000000 Rn Rd
+  EmitInstr(buf, $1E205800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FSUB Dd, Dn, Dm (64-bit float subtract)
+procedure WriteFsubD(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FSUB: 111 1110 0 01 00110 Rm 000000 Rn Rd
+  EmitInstr(buf, $D6201800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FMUL Sd, Sn, Sm (32-bit float multiply)
+procedure WriteFmulS(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FMUL: 000 11110 00 1 10010 Rm 000000 Rn Rd
+  EmitInstr(buf, $1E208800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FMUL Dd, Dn, Dm (64-bit float multiply)
+procedure WriteFmulD(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FMUL: 111 1110 0 01 10010 Rm 000000 Rn Rd
+  EmitInstr(buf, $D6208800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FDIV Sd, Sn, Sm (32-bit float divide)
+procedure WriteFdivS(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FDIV: 000 11110 00 1 11110 Rm 000000 Rn Rd
+  EmitInstr(buf, $1E20F800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FDIV Dd, Dn, Dm (64-bit float divide)
+procedure WriteFdivD(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // FDIV: 111 1110 0 01 11110 Rm 000000 Rn Rd
+  EmitInstr(buf, $D620F800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// FNEG Sd, Sn (32-bit float negate)
+procedure WriteFnegS(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FNEG: 000 11110 01 1 00010 Rm 000000 Rn Rd
+  EmitInstr(buf, $1E214000 or (DWord(rn) shl 5) or rd);
+end;
+
+// FNEG Dd, Dn (64-bit float negate)
+procedure WriteFnegD(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FNEG: 111 1110 0 11 00010 Rm 000000 Rn Rd
+  EmitInstr(buf, $D6200C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// FCMP Sd, Sn (compare float)
+procedure WriteFcmpS(buf: TByteBuffer; rn, rm: Byte);
+begin
+  // FCMP: 000 11110 00 1 00100 Rm 000000 Rn 00000
+  EmitInstr(buf, $1E20403E or (DWord(rm) shl 16) or (DWord(rn) shl 5));
+end;
+
+// FCMP Dn, Dm (compare float, 64-bit)
+procedure WriteFcmpD(buf: TByteBuffer; rn, rm: Byte);
+begin
+  // FCMP: 111 1110 0 01 00100 Rm 000000 Rn 00000
+  EmitInstr(buf, $D620043E or (DWord(rm) shl 16) or (DWord(rn) shl 5));
+end;
+
+// FCMP Sd, #0 (compare with zero)
+procedure WriteFcmpSZero(buf: TByteBuffer; rn: Byte);
+begin
+  // FCMP: 000 11110 00 1 00100 Rm=00000 000000 Rn 00000
+  EmitInstr(buf, $1E20403E or (DWord(rn) shl 5));
+end;
+
+// FCMP Dn, #0 (compare with zero, 64-bit)
+procedure WriteFcmpDZero(buf: TByteBuffer; rn: Byte);
+begin
+  // FCMP: 111 1110 0 01 00100 Rm=00000 000000 Rn 00000
+  EmitInstr(buf, $D620043E or (DWord(rn) shl 5));
+end;
+
+// FCSEL Sd, Sn, Sm, cond (conditional select float, 32-bit)
+// cond: 0=EQ, 1=NE, 2=CS, 3=CC, 4=MI, 5=PL, 6=VS, 7=VC, 8=HI, 9=LS, A=GE, B=LT, C=GT, D=LE
+procedure WriteFcselS(buf: TByteBuffer; rd, rn, rm: Byte; cond: Byte);
+begin
+  // FCSEL: 000 11110 01 1 00011 Rm cond 00 Rn Rd
+  EmitInstr(buf, $1E204C00 or (DWord(rm) shl 16) or (DWord(cond) shl 12) or (DWord(rn) shl 5) or rd);
+end;
+
+// FCSEL Dd, Dn, Dm, cond (conditional select float, 64-bit)
+procedure WriteFcselD(buf: TByteBuffer; rd, rn, rm: Byte; cond: Byte);
+begin
+  // FCSEL: 111 1110 0 11 00011 Rm cond 00 Rn Rd
+  EmitInstr(buf, $D6200C00 or (DWord(rm) shl 16) or (DWord(cond) shl 12) or (DWord(rn) shl 5) or rd);
+end;
+
+// FCVTZS Sd, Sn (float to signed int, 32-bit result)
+procedure WriteFcvtzsS(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FCVTZS (scalar): 000 11110 11 1 11000 000000 Rn Rd
+  EmitInstr(buf, $1E21C000 or (DWord(rn) shl 5) or rd);
+end;
+
+// FCVTZS Dd, Dn (float to signed int, 64-bit result)
+procedure WriteFcvtzsD(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // FCVTZS (scalar, 64-bit): 111 1110 1 11 11000 000000 Rn Rd
+  EmitInstr(buf, $D621C000 or (DWord(rn) shl 5) or rd);
+end;
+
+// SCVTF Sd, Sn (signed int to float, 32-bit result)
+procedure WriteScvtfS(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // SCVTF (scalar): 000 11110 10 0 00000 000000 Rn Rd
+  EmitInstr(buf, $1E220000 or (DWord(rn) shl 5) or rd);
+end;
+
+// SCVTF Dd, Dn (signed int to float, 64-bit result)
+procedure WriteScvtfD(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // SCVTF (scalar, 64-bit): 111 1110 1 10 00000 000000 Rn Rd
+  EmitInstr(buf, $D6204000 or (DWord(rn) shl 5) or rd);
+end;
+
+// LDR St, [Xn, #imm] (load 32-bit float)
+procedure WriteLdrFloat(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  // LDR (immediate, scalar, 32-bit): size=01, V=1, opc=01, imm12, Rn, Rt
+  imm12 := DWord((offset div 4) and $FFF);
+  EmitInstr(buf, $BC400000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+end;
+
+// STR St, [Xn, #imm] (store 32-bit float)
+procedure WriteStrFloat(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  imm12 := DWord((offset div 4) and $FFF);
+  // STR (immediate, scalar, 32-bit): size=01, V=1, opc=00, imm12, Rn, Rt
+  EmitInstr(buf, $BC000000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+end;
+
+// LDR Dt, [Xn, #imm] (load 64-bit float/double)
+procedure WriteLdrDouble(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  // LDR (immediate, scalar, 64-bit): size=11, V=1, opc=01, imm12, Rn, Rt
+  imm12 := DWord((offset div 8) and $FFF);
+  EmitInstr(buf, $FD400000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+end;
+
+// STR Dt, [Xn, #imm] (store 64-bit float/double)
+procedure WriteStrDouble(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  // STR (immediate, scalar, 64-bit): size=11, V=1, opc=00, imm12, Rn, Rt
+  imm12 := DWord((offset div 8) and $FFF);
+  EmitInstr(buf, $FD000000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
 end;
 
 // ==========================================================================
@@ -1583,7 +1789,135 @@ begin
             WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
             WriteRet(FCode);
           end;
-          
+        
+        // ========== Float Operations ==========
+        
+        irConstFloat:
+          begin
+            // Float constants are stored in data section
+            // For now, we only support 64-bit doubles
+            slotIdx := localCnt + instr.Dest;
+            // Emit the float value to data section (temporarily, will be patched)
+            // For now, load the float bits from ImmFloat
+            // Use X0 as temporary, then store to slot
+            // We'll use a simpler approach: convert bits to UInt64
+            WriteMovImm64(FCode, X0, PUInt64(@instr.ImmFloat)^);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFAdd:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            // Load first operand (stored as double in stack slot)
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Load second operand
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Move to FP registers
+            WriteFmovD(FCode, V0, X0);  // V0 = X0 bits
+            WriteFmovD(FCode, V1, X1);  // V1 = X1 bits
+            // Add: V0 = V0 + V1
+            WriteFaddD(FCode, V0, V0, V1);
+            // Move result back to general register
+            WriteFmovD(FCode, X0, V0);  // X0 = V0 bits
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFSub:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteFmovD(FCode, V0, X0);
+            WriteFmovD(FCode, V1, X1);
+            // Subtract: V0 = V0 - V1
+            WriteFsubD(FCode, V0, V0, V1);
+            WriteFmovD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFMul:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteFmovD(FCode, V0, X0);
+            WriteFmovD(FCode, V1, X1);
+            // Multiply: V0 = V0 * V1
+            WriteFmulD(FCode, V0, V0, V1);
+            WriteFmovD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFDiv:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteFmovD(FCode, V0, X0);
+            WriteFmovD(FCode, V1, X1);
+            // Divide: V0 = V0 / V1
+            WriteFdivD(FCode, V0, V0, V1);
+            WriteFmovD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFNeg:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteFmovD(FCode, V0, X0);
+            // Negate: V0 = -V0
+            WriteFnegD(FCode, V0, V0);
+            WriteFmovD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            // Load operands
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Move to FP registers
+            WriteFmovD(FCode, V0, X0);
+            WriteFmovD(FCode, V1, X1);
+            // Compare
+            WriteFcmpD(FCode, V0, V1);
+            // Set result based on condition
+            case instr.Op of
+              irFCmpEq:  WriteCset(FCode, X0, COND_EQ);
+              irFCmpNeq: WriteCset(FCode, X0, COND_NE);
+              irFCmpLt:  WriteCset(FCode, X0, COND_LT);
+              irFCmpLe:  WriteCset(FCode, X0, COND_LE);
+              irFCmpGt:  WriteCset(FCode, X0, COND_GT);
+              irFCmpGe:  WriteCset(FCode, X0, COND_GE);
+            end;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irFToI:
+          begin
+            // Convert float to integer
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteFmovD(FCode, V0, X0);
+            // Convert to signed integer (truncates towards zero)
+            WriteFcvtzsD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irIToF:
+          begin
+            // Convert integer to float
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteFmovD(FCode, V0, X0);
+            // Convert to float
+            WriteScvtfD(FCode, V0, V0);
+            WriteFmovD(FCode, X0, V0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
       else
         // Unimplemented: store 0 to dest
         if instr.Dest >= 0 then

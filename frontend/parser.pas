@@ -1216,6 +1216,15 @@ begin
     Exit(TAstIntLit.Create(v, span));
   end;
 
+  if Check(tkFloatLit) then
+  begin
+    span := FCurTok.Span;
+    // Parse als Double
+    s := FCurTok.Value;
+    Advance;
+    Exit(TAstFloatLit.Create(StrToFloat(s), span));
+  end;
+
   if Check(tkStrLit) then
   begin
     s := FCurTok.Value;
@@ -1420,6 +1429,7 @@ var
   a: TAstExpr;
   args2: TAstExprList;
   ii: Integer;
+  s: string;
 begin
   Result := base;
   while True do
@@ -1469,6 +1479,22 @@ begin
       indexExpr := ParseExpr;
       Expect(tkRBracket);
       Result := TAstIndexAccess.Create(Result, indexExpr, Result.Span);
+    end
+    else if Accept(tkAs) then
+    begin
+      // Type cast: expr as Type
+      if Check(tkIdent) then
+      begin
+        // Parse type name
+        s := FCurTok.Value;
+        Advance;
+        Result := TAstCast.Create(Result, atUnresolved, Result.Span);
+        TAstCast(Result).CastTypeName := s;
+      end
+      else
+      begin
+        FDiag.Error('expected type name after as', FCurTok.Span);
+      end;
     end
     else
       Break;

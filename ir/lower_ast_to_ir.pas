@@ -671,7 +671,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     argCount: Integer;
     argTemps: array of Integer;
     fn: TIRFunction;
-    ltype: TAurumType;
+    ltype, rType: TAurumType;
     width: Integer;
     w: Integer;
     lit: Int64;
@@ -688,9 +688,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     ownerName: string;
     slotCount: Integer;
     baseIdx: Integer;
+    isFloatArith: Boolean;
+    isFloatCmp: Boolean;
     mangled: string;
     arrLen: Integer;
     baseSlot: Integer;
+    // bounds-check temporaries
+    gv: TAstVarDecl;
+    tZero, tLen, tGe0, tLtLen, tOk: Integer;
+    msgTmp, codeTmp: Integer;
+    staticIdx: Integer;
+    errLbl: string;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -733,6 +741,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.ImmInt := 1
         else
           instr.ImmInt := 0;
+        Emit(instr);
+        Result := t0;
+      end;
+
+    nkFloatLit:
+      begin
+        // Emit float constant
+        t0 := NewTemp;
+        instr.Op := irConstFloat;
+        instr.Dest := t0;
+        instr.ImmFloat := TAstFloatLit(expr).Value;
         Emit(instr);
         Result := t0;
       end;
@@ -874,19 +893,88 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         if (t1 < 0) or (t2 < 0) then
           Exit;
 
+        // Determine result type based on operand types
+        // Get types from AST
+        lType := TAstBinOp(expr).Left.ResolvedType;
+        rType := TAstBinOp(expr).Right.ResolvedType;
+
+        // Check if both operands are float
+        isFloatArith := (lType = atF64) and (rType = atF64);
+        isFloatCmp := isFloatArith and (TAstBinOp(expr).Op in [tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe]);
+
         t0 := NewTemp;
         case TAstBinOp(expr).Op of
-          tkPlus:  instr.Op := irAdd;
-          tkMinus: instr.Op := irSub;
-          tkStar:  instr.Op := irMul;
-          tkSlash: instr.Op := irDiv;
+          tkPlus:
+            begin
+              if isFloatArith then
+                instr.Op := irFAdd
+              else
+                instr.Op := irAdd;
+            end;
+          tkMinus:
+            begin
+              if isFloatArith then
+                instr.Op := irFSub
+              else
+                instr.Op := irSub;
+            end;
+          tkStar:
+            begin
+              if isFloatArith then
+                instr.Op := irFMul
+              else
+                instr.Op := irMul;
+            end;
+          tkSlash:
+            begin
+              if isFloatArith then
+                instr.Op := irFDiv
+              else
+                instr.Op := irDiv;
+            end;
           tkPercent: instr.Op := irMod;
-          tkEq:    instr.Op := irCmpEq;
-          tkNeq:   instr.Op := irCmpNeq;
-          tkLt:    instr.Op := irCmpLt;
-          tkLe:    instr.Op := irCmpLe;
-          tkGt:    instr.Op := irCmpGt;
-          tkGe:    instr.Op := irCmpGe;
+          tkEq:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpEq
+              else
+                instr.Op := irCmpEq;
+            end;
+          tkNeq:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpNeq
+              else
+                instr.Op := irCmpNeq;
+            end;
+          tkLt:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpLt
+              else
+                instr.Op := irCmpLt;
+            end;
+          tkLe:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpLe
+              else
+                instr.Op := irCmpLe;
+            end;
+          tkGt:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpGt
+              else
+                instr.Op := irCmpGt;
+            end;
+          tkGe:
+            begin
+              if isFloatCmp then
+                instr.Op := irFCmpGe
+              else
+                instr.Op := irCmpGe;
+            end;
           tkAnd:   instr.Op := irAnd;
           tkOr:    instr.Op := irOr;
           tkNor:   instr.Op := irNor;
@@ -1079,19 +1167,42 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           t1 := t0;  // t1 now holds the base address
 
-          // Lower index
-          t2 := LowerExpr(TAstIndexAccess(expr).Index);
-          if t2 < 0 then
-            Exit;
+           // Lower index
+           t2 := LowerExpr(TAstIndexAccess(expr).Index);
+           if t2 < 0 then
+             Exit;
 
-          // Load element at index
-          t0 := NewTemp;
-          instr.Op := irLoadElem;
-          instr.Dest := t0;
-          instr.Src1 := t1;  // array base address
-          instr.Src2 := t2;  // index
-          Emit(instr);
-          Result := t0;
+           // If global array has known static length, emit bounds check
+           gv := GetGlobalVarDecl(TAstIdent(TAstIndexAccess(expr).Obj).Name);
+           if Assigned(gv) and (gv.ArrayLen > 0) then
+           begin
+             tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+             tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := gv.ArrayLen; Emit(instr);
+             tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+             tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+             tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+             errLbl := NewLabel('Larr_oob');
+             instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+           end;
+
+           // Load element at index
+           t0 := NewTemp;
+           instr.Op := irLoadElem;
+           instr.Dest := t0;
+           instr.Src1 := t1;  // array base address
+           instr.Src2 := t2;  // index
+           Emit(instr);
+           Result := t0;
+
+           // Emit error handler if needed
+           if Assigned(gv) and (gv.ArrayLen > 0) then
+           begin
+             instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+             msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+             instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+             codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+             instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+           end;
         end
         else
         begin
@@ -1116,19 +1227,40 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               instr.Src1 := baseSlot;
               Emit(instr);
               
-              // Lower index
-              t2 := LowerExpr(TAstIndexAccess(expr).Index);
-              if t2 < 0 then
-                Exit;
+               // Lower index
+               t2 := LowerExpr(TAstIndexAccess(expr).Index);
+               if t2 < 0 then
+                 Exit;
 
-              t0 := NewTemp;
-              instr.Op := irLoadElem;
-              instr.Dest := t0;
-              instr.Src1 := t1;  // array base address
-              instr.Src2 := t2;  // index
-              Emit(instr);
-              Result := t0;
-              Exit;
+               // If local array has known static length, emit bounds check
+               if arrLen > 0 then
+               begin
+                 tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+                 tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := arrLen; Emit(instr);
+                 tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+                 tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+                 tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+                 errLbl := NewLabel('Larr_oob');
+                 instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+               end;
+
+               t0 := NewTemp;
+               instr.Op := irLoadElem;
+               instr.Dest := t0;
+               instr.Src1 := t1;  // array base address
+               instr.Src2 := t2;  // index
+               Emit(instr);
+               Result := t0;
+
+               if arrLen > 0 then
+               begin
+                 instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+                 msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+                 codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+               end;
+               Exit;
             end;
           end;
           
@@ -1146,6 +1278,48 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end;
+      end;
+
+    nkCast:
+      begin
+        // Type cast: expr as Type
+        // First lower the expression
+        t1 := LowerExpr(TAstCast(expr).Expr);
+        if t1 < 0 then
+          Exit;
+
+        // Get source and target types
+        ltype := TAstCast(expr).Expr.ResolvedType;
+        rType := TAstCast(expr).CastType;
+
+        t0 := NewTemp;
+
+        // Check for int -> float conversion
+        if (ltype = atInt64) and (rType = atF64) then
+        begin
+          instr.Op := irIToF;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end
+        // Check for float -> int conversion
+        else if (ltype = atF64) and (rType = atInt64) then
+        begin
+          instr.Op := irFToI;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end
+        else
+        begin
+          // No conversion needed, just copy
+          instr.Op := irLoadLocal;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end;
+
+        Result := t0;
       end;
 
     nkFieldAccess:
@@ -1500,6 +1674,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     mangledName: string;
     arrLen: Integer;
     baseSlot: Integer;
+    // bounds-check helpers
+    gv: TAstVarDecl;
+    tZero, tLen, tGe0, tLtLen, tOk: Integer;
+    msgTmp, codeTmp: Integer;
+    staticIdx: Integer;
+    errLbl: string;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -1886,26 +2066,86 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       t0 := LowerExpr(TAstIndexAssign(stmt).Value);
       if t0 < 0 then Exit(False);
 
-      // check if index is a constant for static vs dynamic store
-      if TAstIndexAssign(stmt).Target.Index is TAstIntLit then
-      begin
-        // static index: use irStoreElem with ImmInt
-        instr.Op := irStoreElem;
-        instr.Src1 := t1; // array base
-        instr.Src2 := t0; // value
-        instr.ImmInt := TAstIntLit(TAstIndexAssign(stmt).Target.Index).Value; // static index
-        Emit(instr);
-      end
-      else
-      begin
-        // dynamic index: use irStoreElemDyn with 3 sources
-        instr.Op := irStoreElemDyn;
-        instr.Src1 := t1; // array base
-        instr.Src2 := t2; // index temp
-        instr.Src3 := t0; // value temp
-        Emit(instr);
-      end;
-      Exit(True);
+       // check if index is a constant for static vs dynamic store
+       if TAstIndexAssign(stmt).Target.Index is TAstIntLit then
+       begin
+         // static index: use irStoreElem with ImmInt, but first check compile-time bounds if available
+         staticIdx := TAstIntLit(TAstIndexAssign(stmt).Target.Index).Value;
+         // check global array length
+         if (TAstIndexAssign(stmt).Target.Obj is TAstIdent) and IsGlobalVar(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name) then
+         begin
+           gv := GetGlobalVarDecl(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
+           if Assigned(gv) and (gv.ArrayLen > 0) and (staticIdx >= gv.ArrayLen) then
+           begin
+             FDiag.Error('array index out of bounds (static)', stmt.Span);
+           end
+           else
+           begin
+             instr.Op := irStoreElem; instr.Src1 := t1; instr.Src2 := t0; instr.ImmInt := staticIdx; Emit(instr);
+           end;
+         end
+         else
+         begin
+           // local array
+           if (loc >= 0) and (GetLocalArrayLen(loc) > 0) and (staticIdx >= GetLocalArrayLen(loc)) then
+           begin
+             FDiag.Error('array index out of bounds (static)', stmt.Span);
+           end
+           else
+           begin
+             instr.Op := irStoreElem; instr.Src1 := t1; instr.Src2 := t0; instr.ImmInt := staticIdx; Emit(instr);
+           end;
+         end;
+       end
+       else
+       begin
+         // dynamic index: attempt runtime bounds check if length known
+         gv := nil;
+         if (TAstIndexAssign(stmt).Target.Obj is TAstIdent) and IsGlobalVar(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name) then
+           gv := GetGlobalVarDecl(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
+         if Assigned(gv) and (gv.ArrayLen > 0) then
+         begin
+           // emit runtime check for global array
+           tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+           tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := gv.ArrayLen; Emit(instr);
+           tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+           tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+           tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+           errLbl := NewLabel('Larr_oob'); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+
+           instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+
+           instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+           msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+           codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+         end
+         else if (loc >= 0) and (GetLocalArrayLen(loc) > 0) then
+         begin
+           // emit runtime check for local array
+           tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+           tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := GetLocalArrayLen(loc); Emit(instr);
+           tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+           tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+           tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+           errLbl := NewLabel('Larr_oob'); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+
+           instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+
+           instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+           msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+           codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+         end
+         else
+         begin
+           // no bounds info, emit dynamic store
+           instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+         end;
+       end;
+       Exit(True);
     end;
 
   if stmt is TAstExprStmt then
