@@ -19,6 +19,12 @@ type
     CondCode: Integer;  // For B.cond
   end;
 
+  TGlobalVarLeaPatch = record
+    VarIndex: Integer;
+    CodePos: Integer;
+    IsAdrp: Boolean;  // True if ADRP, False if ADR
+  end;
+
   TARM64Emitter = class
   private
     FCode: TByteBuffer;
@@ -34,6 +40,11 @@ type
       CodePos: Integer;
       TargetName: string;
     end;
+    // Global variables
+    FGlobalVarNames: TStringList;
+    FGlobalVarOffsets: array of UInt64;
+    FGlobalVarLeaPatches: array of TGlobalVarLeaPatch;
+    FTotalDataOffset: UInt64;
   public
     constructor Create;
     destructor Destroy; override;
@@ -327,6 +338,106 @@ begin
   EmitInstr(buf, $8A000000 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
 end;
 
+// AND Xd, Xn, #imm (logical immediate)
+// Note: ARM64 has complex immediate encoding for logical ops
+// For simplicity, we use MOV + AND for masks that don't fit
+procedure WriteAndImm(buf: TByteBuffer; rd, rn: Byte; imm: UInt64);
+var
+  encoded: DWord;
+  n, immr, imms: Boolean;
+begin
+  // Try to encode as logical immediate (simplified - only handles power-of-2 minus 1 masks)
+  // For now, use a simpler approach: if imm fits in 32-bit, use 32-bit AND
+  if imm <= $FFFFFFFF then
+  begin
+    // AND (immediate, 32-bit): 00 100100 immr imms Rn Rd
+    // For masks like 0xFF, 0xFFFF, 0xFFFFFF, etc., we can encode directly
+    // Simplified: just AND with lower 32 bits
+    EmitInstr(buf, $12000000 or (DWord(imm and $FFF) shl 10) or (DWord(rn) shl 5) or rd);
+  end
+  else
+  begin
+    // For larger masks, load into register first
+    // This should be handled by caller using MOV + AND
+    WriteAndRegReg(buf, rd, rn, rn);  // Fallback
+  end;
+end;
+
+// LSL Xd, Xn, #amount (Logical Shift Left)
+// LSL is an alias for UBFM: LSL Xd, Xn, #amount = UBFM Xd, Xn, #(64-amount), #(63-amount)
+procedure WriteLslImm(buf: TByteBuffer; rd, rn: Byte; amount: Byte);
+var
+  immr, imms: DWord;
+begin
+  // UBFM: 1 10 100110 immr imms Rn Rd
+  immr := (64 - amount) and $3F;
+  imms := (63 - amount) and $3F;
+  EmitInstr(buf, $D3400000 or (immr shl 16) or (imms shl 10) or (DWord(rn) shl 5) or rd);
+end;
+
+// ASR Xd, Xn, #amount (Arithmetic Shift Right)
+// ASR is an alias for SBFM: ASR Xd, Xn, #amount = SBFM Xd, Xn, #amount, #63
+procedure WriteAsrImm(buf: TByteBuffer; rd, rn: Byte; amount: Byte);
+var
+  immr, imms: DWord;
+begin
+  // SBFM: 1 00 100110 immr imms Rn Rd
+  immr := amount and $3F;
+  imms := 63;
+  EmitInstr(buf, $93400000 or (immr shl 16) or (imms shl 10) or (DWord(rn) shl 5) or rd);
+end;
+
+// SXTW Xd, Wn (Sign Extend Word to Doubleword)
+// SXTW is an alias for SBFM Xd, Xn, #0, #31
+procedure WriteSxtw(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // SBFM Xd, Xn, #0, #31
+  // 1 00 100110 000000 011111 Rn Rd
+  EmitInstr(buf, $93407C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// SXTH Xd, Wn (Sign Extend Halfword to Doubleword)
+procedure WriteSxth(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // SBFM Xd, Xn, #0, #15
+  // 1 00 100110 000000 001111 Rn Rd
+  EmitInstr(buf, $93402C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// SXTB Xd, Wn (Sign Extend Byte to Doubleword)
+procedure WriteSxtb(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // SBFM Xd, Xn, #0, #7
+  // 1 00 100110 000000 000111 Rn Rd
+  EmitInstr(buf, $93401C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// UXTW Xd, Wn (Zero Extend Word to Doubleword)
+// Actually, just using the 32-bit form (Wn) automatically zeros the upper 32 bits
+// But we can also encode it explicitly as UBFM Xd, Xn, #0, #31
+procedure WriteUxtw(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // UBFM Xd, Xn, #0, #31
+  // 1 10 100110 000000 011111 Rn Rd
+  EmitInstr(buf, $D3407C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// UXTH Xd, Wn (Zero Extend Halfword to Doubleword)
+procedure WriteUxth(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // UBFM Xd, Xn, #0, #15
+  // 1 10 100110 000000 001111 Rn Rd
+  EmitInstr(buf, $D3402C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// UXTB Xd, Wn (Zero Extend Byte to Doubleword)
+procedure WriteUxtb(buf: TByteBuffer; rd, rn: Byte);
+begin
+  // UBFM Xd, Xn, #0, #7
+  // 1 10 100110 000000 000111 Rn Rd
+  EmitInstr(buf, $D3401C00 or (DWord(rn) shl 5) or rd);
+end;
+
 // ORR Xd, Xn, Xm
 procedure WriteOrrRegReg(buf: TByteBuffer; rd, rn, rm: Byte);
 begin
@@ -494,6 +605,7 @@ begin
   FCode := TByteBuffer.Create;
   FData := TByteBuffer.Create;
   FFuncNames := TStringList.Create;
+  FGlobalVarNames := TStringList.Create;
   SetLength(FStringOffsets, 0);
   SetLength(FLeaPositions, 0);
   SetLength(FLeaStrIndex, 0);
@@ -501,10 +613,14 @@ begin
   SetLength(FBranchPatches, 0);
   SetLength(FFuncOffsets, 0);
   SetLength(FCallPatches, 0);
+  SetLength(FGlobalVarOffsets, 0);
+  SetLength(FGlobalVarLeaPatches, 0);
+  FTotalDataOffset := 0;
 end;
 
 destructor TARM64Emitter.Destroy;
 begin
+  FGlobalVarNames.Free;
   FFuncNames.Free;
   FData.Free;
   FCode.Free;
@@ -546,7 +662,7 @@ var
   fn: TIRFunction;
   localCnt, maxTemp, slotIdx: Integer;
   totalSlots, frameSize: Integer;
-  strIdx: Integer;
+  strIdx, varIdx: Integer;
   isEntryFunction: Boolean;
   
   // String handling
@@ -571,6 +687,8 @@ var
   // For address calculation
   dataVA, codeVA, instrVA: UInt64;
   disp: Int32;
+  origInstr: DWord;
+  rd, rn: Byte;
   
   // Temporaries
   tmpReg: Byte;
@@ -595,6 +713,47 @@ begin
   // Align data section to 8 bytes
   while (FData.Size mod 8) <> 0 do
     FData.WriteU8(0);
+  
+  // Phase 1b: Write global variables to data section
+  // This is BEFORE FTotalDataOffset is set, so globals are placed right after strings
+  for i := 0 to High(module.GlobalVars) do
+  begin
+    // Record this global's name and offset
+    FGlobalVarNames.Add(module.GlobalVars[i].Name);
+    SetLength(FGlobalVarOffsets, Length(FGlobalVarOffsets) + 1);
+    FGlobalVarOffsets[High(FGlobalVarOffsets)] := FData.Size;
+    
+    if module.GlobalVars[i].IsArray then
+    begin
+      // Global array
+      if module.GlobalVars[i].HasInitValue and (module.GlobalVars[i].ArrayLen > 0) then
+      begin
+        // Write initialized array values
+        for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+          FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[j]));
+      end
+      else
+      begin
+        // Write zero-initialized array
+        if module.GlobalVars[i].ArrayLen > 0 then
+        begin
+          for j := 0 to module.GlobalVars[i].ArrayLen - 1 do
+            FData.WriteU64LE(0);
+        end;
+      end;
+    end
+    else
+    begin
+      // Scalar global variable
+      if module.GlobalVars[i].HasInitValue then
+        FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+      else
+        FData.WriteU64LE(0);
+    end;
+  end;
+  
+  // Sync FTotalDataOffset with the data section size after strings and globals
+  FTotalDataOffset := FData.Size;
   
   // Phase 2: Emit _start entry point
   // _start will call main() and then exit with the return value
@@ -886,6 +1045,74 @@ begin
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
           end;
           
+        irTrunc:
+          begin
+            // Truncate src1 to ImmInt bits
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            if instr.ImmInt < 64 then
+            begin
+              // Create mask: (1 << bits) - 1
+              // For small masks, we can use immediate AND
+              // For larger masks, load mask into register
+              if instr.ImmInt <= 24 then
+              begin
+                // Small mask fits in immediate encoding
+                // Use AND with immediate (simplified - actually need bitfield)
+                // Alternative: AND with register containing mask
+                WriteMovImm64(FCode, X1, (UInt64(1) shl instr.ImmInt) - 1);
+                WriteAndRegReg(FCode, X0, X0, X1);
+              end
+              else
+              begin
+                // Larger mask - load into register
+                WriteMovImm64(FCode, X1, (UInt64(1) shl instr.ImmInt) - 1);
+                WriteAndRegReg(FCode, X0, X0, X1);
+              end;
+            end;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irSExt:
+          begin
+            // Sign-extend src1 (width in ImmInt) into dest
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            case instr.ImmInt of
+              8:  WriteSxtb(FCode, X0, X0);   // Sign-extend byte
+              16: WriteSxth(FCode, X0, X0);   // Sign-extend halfword
+              32: WriteSxtw(FCode, X0, X0);   // Sign-extend word
+            else
+              // Generic sign-extend: shift left then arithmetic shift right
+              if instr.ImmInt < 64 then
+              begin
+                WriteLslImm(FCode, X0, X0, 64 - instr.ImmInt);
+                WriteAsrImm(FCode, X0, X0, 64 - instr.ImmInt);
+              end;
+            end;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irZExt:
+          begin
+            // Zero-extend src1 (width in ImmInt) into dest
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            case instr.ImmInt of
+              8:  WriteUxtb(FCode, X0, X0);   // Zero-extend byte
+              16: WriteUxth(FCode, X0, X0);   // Zero-extend halfword
+              32: WriteUxtw(FCode, X0, X0);   // Zero-extend word (also: using W register clears upper bits)
+            else
+              // For other widths, mask with (1 << bits) - 1
+              if instr.ImmInt < 64 then
+              begin
+                WriteMovImm64(FCode, X1, (UInt64(1) shl instr.ImmInt) - 1);
+                WriteAndRegReg(FCode, X0, X0, X1);
+              end;
+            end;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
         irCmpEq:
           begin
             slotIdx := localCnt + instr.Dest;
@@ -1072,6 +1299,173 @@ begin
             end;
           end;
           
+        // ========== Phase 2: Global Variables ==========
+        
+        irLoadGlobal:
+          begin
+            // Load global variable into temp: dest = globals[ImmStr]
+            slotIdx := localCnt + instr.Dest;
+            varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := FGlobalVarNames.Count;
+              FGlobalVarNames.Add(instr.ImmStr);
+              SetLength(FGlobalVarOffsets, varIdx + 1);
+              FGlobalVarOffsets[varIdx] := FTotalDataOffset;
+              FData.WriteU64LE(0); // Initialize to 0
+              Inc(FTotalDataOffset, 8);
+            end;
+            // Emit ADRP + ADD to get address (will be patched later)
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+            WriteAdrp(FCode, X1, 0);  // Placeholder: ADRP X1, page
+            // Now emit ADD for page offset
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+            WriteAddImm(FCode, X1, X1, 0);  // Placeholder: ADD X1, X1, #offset
+            // LDR X0, [X1]
+            WriteLdrImm(FCode, X0, X1, 0);
+            // Store into temp slot
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irStoreGlobal:
+          begin
+            // Store temp into global variable: globals[ImmStr] = src1
+            // Load value from temp
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := FGlobalVarNames.Count;
+              FGlobalVarNames.Add(instr.ImmStr);
+              SetLength(FGlobalVarOffsets, varIdx + 1);
+              FGlobalVarOffsets[varIdx] := FTotalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(FTotalDataOffset, 8);
+            end;
+            // Emit ADRP + ADD to get address
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+            WriteAdrp(FCode, X1, 0);  // Placeholder
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+            WriteAddImm(FCode, X1, X1, 0);  // Placeholder
+            // STR X0, [X1]
+            WriteStrImm(FCode, X0, X1, 0);
+          end;
+          
+        irLoadGlobalAddr:
+          begin
+            // Load address of global variable into temp: dest = &globals[ImmStr]
+            slotIdx := localCnt + instr.Dest;
+            varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // First access to this global - allocate space in data section
+              varIdx := FGlobalVarNames.Count;
+              FGlobalVarNames.Add(instr.ImmStr);
+              SetLength(FGlobalVarOffsets, varIdx + 1);
+              FGlobalVarOffsets[varIdx] := FTotalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(FTotalDataOffset, 8);
+            end;
+            // Emit ADRP + ADD to get address directly into X0
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+            WriteAdrp(FCode, X0, 0);  // Placeholder: ADRP X0, page
+            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+            WriteAddImm(FCode, X0, X0, 0);  // Placeholder: ADD X0, X0, #offset
+            // Store address into temp slot
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        // ========== Phase 3: Arrays ==========
+        
+        irStackAlloc:
+          begin
+            // Allocate array on stack: dest = stack[ImmInt bytes]
+            // Just compute the address (stack pointer minus size)
+            slotIdx := localCnt + instr.Dest;
+            // We'll use a simple approach: the address is at a known offset from FP
+            // The stack space is already allocated in the function prologue
+            WriteAddImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irLoadElem:
+          begin
+            // Load array element: dest = base[index * scale]
+            slotIdx := localCnt + instr.Dest;
+            // Load base address
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Load index
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Calculate offset: index * 8 (assuming 64-bit elements)
+            // LSL X1, X1, #3 (multiply by 8)
+            WriteLslImm(FCode, X1, X1, 3);
+            // Add base + offset
+            WriteAddRegReg(FCode, X0, X0, X1);
+            // Load element
+            WriteLdrImm(FCode, X0, X0, 0);
+            // Store result
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irStoreElem:
+          begin
+            // Store array element: base[ImmInt] = value
+            // Src1 = base address temp, Src2 = value temp, ImmInt = static index
+            // Load base address
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Calculate address: base + index * 8
+            // For static index, we can use immediate offset in LDR/STR
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Store at base + index*8
+            WriteStrImm(FCode, X1, X0, instr.ImmInt * 8);
+          end;
+          
+        irStoreElemDyn:
+          begin
+            // Store array element with dynamic index
+            // Src1 = base address temp, Src2 = index temp, Src3 = value temp
+            // Load base address
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Load index
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Calculate offset: index * 8
+            WriteLslImm(FCode, X1, X1, 3);
+            // Add base + offset -> X0 = target address
+            WriteAddRegReg(FCode, X0, X0, X1);
+            // Load value to store (Src3)
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            // Store element at [X0]
+            WriteStrImm(FCode, X1, X0, 0);
+          end;
+          
+        irLoadLocalAddr:
+          begin
+            // Load address of local variable: dest = &locals[src1]
+            slotIdx := localCnt + instr.Dest;
+            WriteAddImm(FCode, X0, X29, frameSize + SlotOffset(instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
         irReturn:
           begin
             // Load return value into X0
@@ -1165,6 +1559,48 @@ begin
         (DWord(disp and $3) shl 29) or 
         (DWord((disp shr 2) and $7FFFF) shl 5) or 
         X0);
+    end;
+  end;
+  
+  // Phase 7: Patch global variable addresses (ADRP + ADD)
+  // Global variables are in data section after strings
+  for i := 0 to High(FGlobalVarLeaPatches) do
+  begin
+    patchPos := FGlobalVarLeaPatches[i].CodePos;
+    varIdx := FGlobalVarLeaPatches[i].VarIndex;
+    if (varIdx >= 0) and (varIdx < Length(FGlobalVarOffsets)) then
+    begin
+      strOffset := FGlobalVarOffsets[varIdx];
+      instrVA := codeVA + UInt64(patchPos);
+      
+      if FGlobalVarLeaPatches[i].IsAdrp then
+      begin
+        // ADRP: PC-relative page address
+        // Calculate page offset
+        disp := Int32((dataVA + strOffset) - (instrVA and not UInt64($FFF)));
+        // ADRP: 1 immlo[1:0] 10000 immhi[18:0] Rd
+        // Read original instruction to get Rd (bits 4:0)
+        origInstr := FCode.ReadU32LE(patchPos);
+        rd := origInstr and $1F;  // Extract Rd from original
+        FCode.PatchU32LE(patchPos, $90000000 or 
+          (DWord((disp shr 12) and $3) shl 29) or 
+          (DWord((Int64(disp) shr 14) and $7FFFF) shl 5) or
+          rd);
+      end
+      else
+      begin
+        // ADD: immediate offset within page
+        // disp = (dataVA + strOffset) and $FFF
+        disp := Int32((dataVA + strOffset) and $FFF);
+        // Read original instruction to get Rn (bits 9:5) and Rd (bits 4:0)
+        origInstr := FCode.ReadU32LE(patchPos);
+        rn := (origInstr shr 5) and $1F;  // Extract Rn
+        rd := origInstr and $1F;          // Extract Rd
+        FCode.PatchU32LE(patchPos, $91000000 or 
+          (DWord(disp and $FFF) shl 10) or 
+          (DWord(rn) shl 5) or 
+          rd);
+      end;
     end;
   end;
 end;
