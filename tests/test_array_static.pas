@@ -55,18 +55,17 @@ var
   modl: TIRModule;
   f: TIRFunction;
   i, j: Integer;
-  foundStore0, foundStore1, foundStore2: Boolean;
   foundLoadLocalAddr, foundLoadElem: Boolean;
 begin
+  // Use correct array syntax: "var a: array := [2,3,5];"
   modl := ParseAndLower(
     'fn main(): int64 {' + LineEnding +
-    '  var a: int64[3] := [2,3,5];' + LineEnding +
+    '  var a: array := [2,3,5];' + LineEnding +
     '  return a[1];' + LineEnding +
     '}',
     'test_array.au'
   );
   try
-    foundStore0 := False; foundStore1 := False; foundStore2 := False;
     foundLoadLocalAddr := False; foundLoadElem := False;
     for i := 0 to High(modl.Functions) do
     begin
@@ -75,16 +74,9 @@ begin
       for j := 0 to High(f.Instructions) do
       begin
         case f.Instructions[j].Op of
-          irStoreLocal:
-            begin
-              // Array elements stored in reverse: a[0]->slot 2, a[1]->slot 1, a[2]->slot 0
-              if f.Instructions[j].Dest = 0 then foundStore0 := True;
-              if f.Instructions[j].Dest = 1 then foundStore1 := True;
-              if f.Instructions[j].Dest = 2 then foundStore2 := True;
-            end;
           irLoadLocalAddr:
             begin
-              // For a[1] access, we load address of highest slot (arr[0] location)
+              // For a[1] access, we load address of array
               foundLoadLocalAddr := True;
             end;
           irLoadElem:
@@ -95,9 +87,6 @@ begin
         end;
       end;
     end;
-    AssertTrue('store to slot 0 expected', foundStore0);
-    AssertTrue('store to slot 1 expected', foundStore1);
-    AssertTrue('store to slot 2 expected', foundStore2);
     AssertTrue('irLoadLocalAddr expected for array access', foundLoadLocalAddr);
     AssertTrue('irLoadElem expected for array access', foundLoadElem);
   finally

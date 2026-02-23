@@ -325,7 +325,7 @@ var
   s: TSymbol;
   sSym: TSymbol;
   i, fi, baseIdx, fldOffset: Integer;
-  lt, rt, ot, atype: TAurumType;
+  lt, rt, ot, atype, srcType: TAurumType;
   qualifier: string;
   identName: string;
   fName: string;
@@ -337,6 +337,7 @@ var
   args: TAstExprList;
   cd: TAstClassDecl;
   newExpr: TAstNewExpr;
+  castTypeName: string;
 begin
   if expr = nil then
   begin
@@ -345,6 +346,7 @@ begin
   end;
   case expr.Kind of
     nkIntLit: Result := atInt64;
+    nkFloatLit: Result := atF64;
     nkStrLit: Result := atPChar;
     nkBoolLit: Result := atBool;
     nkCharLit: Result := atChar;
@@ -477,6 +479,34 @@ begin
         // fallback: unresolved
         Result := atUnresolved;
       end;
+    nkCast:
+      begin
+        // Type cast: expr as Type
+        // Check the expression first
+        CheckExpr(TAstCast(expr).Expr);
+        srcType := TAstCast(expr).Expr.ResolvedType;
+
+        // Resolve the target type from the type name
+        castTypeName := TAstCast(expr).CastTypeName;
+        if castTypeName <> '' then
+        begin
+          // Look up the type
+          if castTypeName = 'int64' then
+            TAstCast(expr).CastType := atInt64
+          else if castTypeName = 'f64' then
+            TAstCast(expr).CastType := atF64
+          else if castTypeName = 'f32' then
+            TAstCast(expr).CastType := atF32
+          else if castTypeName = 'int32' then
+            TAstCast(expr).CastType := atInt32
+          else
+            FDiag.Error('unsupported cast type: ' + castTypeName, expr.Span);
+        end;
+
+        Result := TAstCast(expr).CastType;
+        expr.ResolvedType := Result;
+        Exit;
+      end;
     nkIdent:
       begin
         ident := TAstIdent(expr);
@@ -525,15 +555,33 @@ begin
         case bin.Op of
            tkPlus, tkMinus, tkStar, tkSlash, tkPercent:
              begin
-               if not IsIntegerType(lt) or not IsIntegerType(rt) then
-                 FDiag.Error('type error: arithmetic requires integer operands', bin.Span);
-               // promote to 64-bit for now
-               Result := atInt64;
+               // Check for float operands first
+               if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
+               begin
+                 // Float arithmetic
+                 Result := atF64;
+               end
+               else if not IsIntegerType(lt) or not IsIntegerType(rt) then
+               begin
+                 FDiag.Error('type error: arithmetic requires numeric (integer or float) operands', bin.Span);
+                 Result := atInt64;
+               end
+               else
+               begin
+                 // Integer arithmetic
+                 // promote to 64-bit for now
+                 Result := atInt64;
+               end;
              end;
            tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
              begin
                if (IsIntegerType(lt) and IsIntegerType(rt)) then
                begin
+                 Result := atBool;
+               end
+               else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
+               begin
+                 // Float comparison
                  Result := atBool;
                end
                else if (TypeEqual(lt, atPChar) and TypeEqual(rt, atPChar)) then
@@ -543,7 +591,7 @@ begin
                end
                else
                begin
-                 FDiag.Error('type error: comparison requires integer or pchar operands', bin.Span);
+                 FDiag.Error('type error: comparison requires numeric or pchar operands', bin.Span);
                  Result := atUnresolved;
                end;
              end;

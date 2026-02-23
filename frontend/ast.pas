@@ -35,9 +35,9 @@ type
 
   TNodeKind = (
     // Ausdrücke
-    nkIntLit, nkStrLit, nkBoolLit, nkCharLit, nkIdent,
+    nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkIdent,
     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
-    nkFieldAccess, nkIndexAccess,
+    nkFieldAccess, nkIndexAccess, nkCast,
     nkNewExpr, nkSuperCall,  // OOP expressions
     // Statements
     nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
@@ -115,6 +115,15 @@ type
   public
     constructor Create(aValue: Boolean; aSpan: TSourceSpan);
     property Value: Boolean read FValue;
+  end;
+
+  { Float-Literal: 3.14, 2.0 }
+  TAstFloatLit = class(TAstExpr)
+  private
+    FValue: Double;
+  public
+    constructor Create(aValue: Double; aSpan: TSourceSpan);
+    property Value: Double read FValue;
   end;
 
   { Identifier-Referenz: x, counter }
@@ -219,6 +228,20 @@ type
     destructor Destroy; override;
     property Obj: TAstExpr read FObj;
     property Index: TAstExpr read FIndex;
+  end;
+
+  { Type Cast: expr as Type }
+  TAstCast = class(TAstExpr)
+  private
+    FExpr: TAstExpr;
+    FCastType: TAurumType;
+    FCastTypeName: string;  // Type name for resolution in sema
+  public
+    constructor Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Expr: TAstExpr read FExpr;
+    property CastType: TAurumType read FCastType write FCastType;
+    property CastTypeName: string read FCastTypeName write FCastTypeName;
   end;
 
   { Struct-Literal Feld-Initialisierer: name: expr }
@@ -720,6 +743,7 @@ function NodeKindToStr(nk: TNodeKind): string;
 begin
   case nk of
     nkIntLit:      Result := 'IntLit';
+    nkFloatLit:    Result := 'FloatLit';
     nkStrLit:      Result := 'StrLit';
     nkBoolLit:     Result := 'BoolLit';
     nkCharLit:     Result := 'CharLit';
@@ -731,6 +755,7 @@ begin
     nkStructLit:   Result := 'StructLit';
     nkFieldAccess: Result := 'FieldAccess';
     nkIndexAccess: Result := 'IndexAccess';
+    nkCast:       Result := 'Cast';
     nkNewExpr:     Result := 'NewExpr';
     nkSuperCall:   Result := 'SuperCall';
     nkVarDecl:     Result := 'VarDecl';
@@ -816,6 +841,17 @@ begin
   inherited Create(nkBoolLit, aSpan);
   FValue := aValue;
   FResolvedType := atBool;
+end;
+
+// ================================================================
+// TAstFloatLit
+// ================================================================
+
+constructor TAstFloatLit.Create(aValue: Double; aSpan: TSourceSpan);
+begin
+  inherited Create(nkFloatLit, aSpan);
+  FValue := aValue;
+  FResolvedType := atF64;
 end;
 
 // ================================================================
@@ -1183,6 +1219,24 @@ destructor TAstIndexAccess.Destroy;
 begin
   FObj.Free;
   FIndex.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstCast
+// ================================================================
+
+constructor TAstCast.Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
+begin
+  inherited Create(nkCast, aSpan);
+  FExpr := aExpr;
+  FCastType := aCastType;
+  FResolvedType := aCastType;
+end;
+
+destructor TAstCast.Destroy;
+begin
+  FExpr.Free;
   inherited Destroy;
 end;
 
