@@ -1483,19 +1483,56 @@ begin
 end;
 
 function TParser.ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
-var s: string;
+var
+  s: string;
+  baseType: TAurumType;
+  parsedLen: Integer;
+  innerTypeName: string;
+  innerNullable: Boolean;
+  innerArrayLen: Integer;
 begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
-  if Check(tkIdent) or Check(tkArray) then
+
+  if Accept(tkLBracket) then
   begin
-    if Check(tkArray) then
+    // Array type: [IntLit] Type or [] Type
+    parsedLen := 0;
+    if Check(tkIntLit) then
     begin
-      // 'array' keyword: shorthand for array of int64
-      s := 'array';
+      parsedLen := StrToIntDef(FCurTok.Value, 0);
       Advance;
-      Result := atInt64; // element type
+      Expect(tkRBracket);
+    end
+    else if Accept(tkRBracket) then
+    begin
+      // Dynamic array: [] Type
+      parsedLen := -1;
+    end
+    else
+    begin
+      FDiag.Error('expected integer literal or ] in array type', FCurTok.Span);
+      // Try to recover
+      if Check(tkRBracket) then Advance;
+    end;
+    
+    // Recursively parse the base type of the array
+    baseType := ParseTypeExFull(innerArrayLen, innerTypeName, innerNullable);
+    // set the outer arrayLen to the parsed length
+    arrayLen := parsedLen;
+    typeName := innerTypeName;
+    isNullable := innerNullable;
+    Result := baseType; // The array's base type is the result
+  end
+  else if Check(tkIdent) or Check(tkArray) then
+  begin
+    if Accept(tkArray) then
+    begin
+      // 'array' keyword: shorthand for array of int64 (dynamic)
+      s := 'array';
+      arrayLen := -1; // Dynamic array by default for 'array' keyword
+      Result := atInt64; // Element type is int64 for 'array' shorthand
     end
     else
     begin
@@ -1505,37 +1542,16 @@ begin
       if Result = atUnresolved then
         typeName := s;
     end;
-    // optional array suffix: [N] or []
-    if Accept(tkLBracket) then
-    begin
-      if Check(tkRBracket) then
-      begin
-        // [] dynamic array
-        arrayLen := -1;
-        Advance; // consume ]
-      end
-      else if Check(tkIntLit) then
-      begin
-        arrayLen := StrToIntDef(FCurTok.Value, 0);
-        Advance;
-        Expect(tkRBracket);
-      end
-      else
-      begin
-        FDiag.Error('expected integer literal or ] in array type', FCurTok.Span);
-        // try to recover
-        if Check(tkRBracket) then Advance;
-      end;
-    end;
-    // optional nullable suffix: ?
-    if Accept(tkQuestion) then
-      isNullable := True;
   end
   else
   begin
     FDiag.Error('expected type name', FCurTok.Span);
     Result := atUnresolved;
   end;
+
+  // optional nullable suffix: ?
+  if Accept(tkQuestion) then
+    isNullable := True;
 end;
 
 function TParser.ParseType: TAurumType;
