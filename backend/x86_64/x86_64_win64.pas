@@ -1219,6 +1219,25 @@ begin
             slotIdx := localCnt + instr.Dest;
             WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
           end;
+        irStoreLocal:
+          begin
+            // Store temp into local variable: locals[Dest] = temps[Src1]
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+          end;
+        irTrunc:
+          begin
+            // Truncate src1 to ImmInt bits and store to dest
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            if instr.ImmInt < 64 then
+            begin
+              // Mask lower bits: and rax, mask
+              mask64 := (UInt64(1) shl instr.ImmInt) - 1;
+              EmitU8(FCode, $48); EmitU8(FCode, $81); EmitU8(FCode, $E0); // and rax, imm32
+              EmitU32(FCode, Cardinal(mask64 and $FFFFFFFF));
+            end;
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
         irAdd:
           begin
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
@@ -1318,9 +1337,34 @@ begin
             WriteSubRegReg(FCode, RAX, RCX);
             EmitU8(FCode, $0F); EmitU8(FCode, $9D); EmitU8(FCode, $C0); // setge al
             EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
-            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-          end;
-        irReturn:
+             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+           end;
+         irNot:
+           begin
+             // dest = !src1  (boolean not)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1)); // load src1 to RAX
+             WriteTestRaxRax(FCode);                                           // test RAX, RAX (sets ZF if RAX is 0)
+             EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0);       // sete al (AL = 1 if ZF, else 0)
+             EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al (zero-extend AL to RAX)
+             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX); // store result
+           end;
+         irAnd:
+           begin
+             // dest = src1 & src2
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1)); // load src1 to RAX
+             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2)); // load src2 to RCX
+             EmitU8(FCode, $48); EmitU8(FCode, $21); EmitU8(FCode, $C8);       // and rax, rcx
+             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX); // store result
+           end;
+         irOr:
+           begin
+             // dest = src1 | src2
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1)); // load src1 to RAX
+             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2)); // load src2 to RCX
+             EmitU8(FCode, $48); EmitU8(FCode, $09); EmitU8(FCode, $C8);       // or rax, rcx
+             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX); // store result
+           end;
+         irReturn:
           begin
             // Move return value into RAX (non-entry) or RCX (entry)
             if isEntryFunction then
