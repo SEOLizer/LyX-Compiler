@@ -20,6 +20,7 @@ type
     FGetStdHandleIndex: Integer;
     FWriteFileIndex: Integer;
     FExitProcessIndex: Integer;
+    FVirtualAllocIndex: Integer;  // For heap allocation
     
     // Random LCG State (offset in .data)
     FRandomSeedOffset: Integer;
@@ -501,6 +502,7 @@ begin
   FGetStdHandleIndex := -1;
   FWriteFileIndex := -1;
   FExitProcessIndex := -1;
+  FVirtualAllocIndex := -1;
   FRandomSeedOffset := -1;
   FEntryOffset := 0;
   FStartMainCallPos := 0;
@@ -520,7 +522,7 @@ var
 begin
   // Setup kernel32.dll imports
   kernelDll.DllName := 'kernel32.dll';
-  SetLength(kernelDll.Functions, 3);
+  SetLength(kernelDll.Functions, 4);
   
   kernelDll.Functions[0].Name := 'GetStdHandle';
   kernelDll.Functions[0].Hint := 0;
@@ -533,6 +535,10 @@ begin
   kernelDll.Functions[2].Name := 'ExitProcess';
   kernelDll.Functions[2].Hint := 0;
   FExitProcessIndex := 2;
+  
+  kernelDll.Functions[3].Name := 'VirtualAlloc';
+  kernelDll.Functions[3].Hint := 0;
+  FVirtualAllocIndex := 3;
   
   SetLength(FImports, 1);
   FImports[0] := kernelDll;
@@ -1706,6 +1712,163 @@ begin
             
             // Store value at calculated address: [RAX] = RDX
             EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $10);
+          end;
+        irLoadStructAddr:
+          begin
+            // Load base address of struct local for field access
+            // With negative field offsets, base is simply SlotOffset(loc)
+            structBaseOff := SlotOffset(instr.Src1);
+            // LEA rax, [rbp + structBaseOff]
+            EmitU8(FCode, $48); // REX.W
+            EmitU8(FCode, $8D); // LEA opcode
+            if (structBaseOff >= -128) and (structBaseOff <= 127) then
+            begin
+              EmitU8(FCode, $45); // ModR/M: [rbp + disp8], reg=rax
+              EmitU8(FCode, Byte(structBaseOff));
+            end
+            else
+            begin
+              EmitU8(FCode, $85); // ModR/M: [rbp + disp32], reg=rax
+              EmitU32(FCode, Cardinal(structBaseOff));
+            end;
+            // Store result in destination temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irLoadField:
+          begin
+            // Load field from struct: Dest = *(Src1 - ImmInt)
+            // Stack slots grow negative, so we SUBTRACT the field offset
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            negOffset := -instr.ImmInt;
+            if (negOffset >= -128) and (negOffset <= 127) then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(negOffset));
+            end;
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+        irStoreField:
+          begin
+            // Store field into struct: *(Src1 - ImmInt) = Src2
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            negOffset := -instr.ImmInt;
+            if (negOffset >= -128) and (negOffset <= 127) then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(negOffset));
+            end;
+          end;
+        irLoadFieldHeap:
+          begin
+            // Load field from heap object: Dest = *(Src1 + ImmInt)
+            // Positive offset for heap objects
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(instr.ImmInt));
+            end;
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+        irStoreFieldHeap:
+          begin
+            // Store field into heap object: *(Src1 + ImmInt) = Src2
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(instr.ImmInt));
+            end;
+          end;
+        irAlloc:
+          begin
+            // Heap allocation: Dest = alloc(ImmInt bytes)
+            // Use VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+            // MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_READWRITE = 0x04
+            
+            // RCX = lpAddress = NULL (0)
+            WriteMovRegImm64(FCode, RCX, 0);
+            // RDX = dwSize = ImmInt
+            WriteMovRegImm64(FCode, RDX, UInt64(instr.ImmInt));
+            // R8 = flAllocationType = MEM_COMMIT | MEM_RESERVE = 0x3000
+            WriteMovRegImm64(FCode, R8, $3000);
+            // R9 = flProtect = PAGE_READWRITE = 0x04
+            WriteMovRegImm64(FCode, R9, $04);
+            // Call VirtualAlloc
+            WriteIndirectCall(FKernel32Index, FVirtualAllocIndex);
+            // Result (pointer) is now in RAX, store to Dest temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irFree:
+          begin
+            // Heap deallocation: free(Src1)
+            // For now, skip freeing to avoid complexity
+            // Windows will free all memory when process exits
+          end;
+        irConstFloat:
+          begin
+            // Float constant - placeholder: store as 0
+            // TODO: Implement proper float constants in data section
+            slotIdx := localCnt + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irCallStruct:
+          begin
+            // Call returning struct: handled similar to irCall
+            // For now, just call and store result
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do argTemps[k] := -1;
+            if argCount > 0 then argTemps[0] := instr.Src1;
+            if argCount > 1 then argTemps[1] := instr.Src2;
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then argTemps[k] := instr.ArgTemps[k];
+            end;
+            // Load args into registers
+            for k := 0 to Min(argCount - 1, 3) do
+            begin
+              if argTemps[k] >= 0 then
+                WriteMovRegMem(FCode, Win64ParamRegs[k], RBP, SlotOffset(localCnt + argTemps[k]))
+              else
+                WriteMovRegImm64(FCode, Win64ParamRegs[k], 0);
+            end;
+            // Emit call
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+            EmitU8(FCode, $E8);
+            EmitU32(FCode, 0);
+            // Store result in dest slot (struct address)
+            if instr.Dest >= 0 then
+              WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+          end;
+        irReturnStruct:
+          begin
+            // Return struct by value - Src1 is local slot index
+            if instr.Src1 >= 0 then
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+            EmitEpilogue(frameBytes);
           end;
         else
           begin
