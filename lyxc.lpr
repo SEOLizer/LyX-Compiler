@@ -7,10 +7,11 @@ uses
   diag, lexer, parser, ast, sema, unit_manager,
   ir, lower_ast_to_ir,
   x86_64_emit, elf64_writer,
-  x86_64_win64, pe64_writer;
+  x86_64_win64, pe64_writer,
+  arm64_emit, elf64_arm64_writer;
 
 type
-  TTarget = (targetLinux, targetWindows);
+  TTarget = (targetLinux, targetWindows, targetLinuxARM64);
 
 var
   inputFile: string;
@@ -27,6 +28,7 @@ var
   lower: TIRLowering;
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
+  arm64Emit: TARM64Emitter;
   codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64;
   basePath: string;
@@ -70,16 +72,16 @@ begin
   target := targetLinux;
   {$ENDIF}
   
-  if ParamCount < 1 then
+    if ParamCount < 1 then
   begin
     WriteLn(StdErr, 'Lyx Compiler v0.1.7');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
-    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux]');
+    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64]');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>     Ausgabedatei (Standard: a.out bzw. a.exe)');
-    WriteLn(StdErr, '  --target=TARGET Zielplattform (win64 oder linux)');
+    WriteLn(StdErr, '  --target=TARGET Zielplattform (win64, linux oder arm64)');
     Halt(1);
   end;
 
@@ -104,10 +106,12 @@ begin
         target := targetWindows
       else if (param = 'linux') or (param = 'elf') then
         target := targetLinux
+      else if (param = 'arm64') or (param = 'aarch64') or (param = 'linux-arm64') then
+        target := targetLinuxARM64
       else
       begin
         WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
-        WriteLn(StdErr, 'Gültige Werte: win64, linux');
+        WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64');
         Halt(1);
       end;
       Inc(i);
@@ -144,8 +148,10 @@ begin
   WriteLn('Ausgabe:  ', outputFile);
   if target = targetWindows then
     WriteLn('Ziel:     Windows x64 (PE32+)')
-  else
-    WriteLn('Ziel:     Linux x86_64 (ELF64)');
+  else if target = targetLinux then
+    WriteLn('Ziel:     Linux x86_64 (ELF64)')
+  else if target = targetLinuxARM64 then
+    WriteLn('Ziel:     Linux ARM64 (ELF64)');
 
   basePath := ExtractFilePath(inputFile);
   if basePath = '' then
@@ -217,7 +223,7 @@ begin
               winEmit.Free;
             end;
           end
-          else
+          else if target = targetLinux then
           begin
             // Linux x86_64 Code Generation (existing path)
             emit := TX86_64Emitter.Create;
@@ -247,6 +253,26 @@ begin
               WriteLn('Wrote ', outputFile);
             finally
               emit.Free;
+            end;
+          end
+          else
+          begin
+            // Linux ARM64 Code Generation
+            arm64Emit := TARM64Emitter.Create;
+            try
+              arm64Emit.EmitFromIR(module);
+              codeBuf := arm64Emit.GetCodeBuffer;
+              dataBuf := arm64Emit.GetDataBuffer;
+              entryVA := $400000 + 4096;
+              
+              // Note: dynamic linking for ARM64 not implemented yet
+              WriteLn('Generating static ELF for Linux ARM64 (no dynamic linking yet)');
+              WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+              
+              FpChmod(PChar(outputFile), 493);
+              WriteLn('Wrote ', outputFile, ' (ELF64 for Linux ARM64)');
+            finally
+              arm64Emit.Free;
             end;
           end;
         finally
