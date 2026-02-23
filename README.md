@@ -1,7 +1,7 @@
 # Lyx
 
 **Lyx** ist ein nativer Compiler für die gleichnamige Programmiersprache, geschrieben in FreePascal.
-Er erzeugt direkt ausführbare **Linux x86_64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
+Er erzeugt direkt ausführbare **Linux x86_64 ELF64-**, **Linux ARM64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
 
 ```
 Lyx Compiler v0.1.7
@@ -14,7 +14,7 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 ✅ OOP: Classes, Vererbung, Konstruktoren, Destruktoren
 ✅ Globale Variablen mit Initialisierung
 ✅ Random/RandomSeed Builtins
-✅ Cross-Compilation: Linux ELF64 und Windows PE32+
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
 ```
 
 ---
@@ -39,11 +39,14 @@ Hello Lyx
 
 ### Cross-Compilation
 
-Lyx unterstützt **Cross-Compilation** zwischen Linux und Windows:
+Lyx unterstützt **Cross-Compilation** für drei Zielplattformen:
 
 ```bash
-# Linux ELF64 (Standard auf Linux-Hosts)
+# Linux x86_64 ELF64 (Standard auf Linux-Hosts)
 ./lyxc program.lyx -o program --target=linux
+
+# Linux ARM64 ELF64 (für Raspberry Pi, Apple Silicon Linux, Cloud-Server)
+./lyxc program.lyx -o program --target=arm64
 
 # Windows PE32+ (von Linux aus)
 ./lyxc program.lyx -o program.exe --target=win64
@@ -51,10 +54,20 @@ Lyx unterstützt **Cross-Compilation** zwischen Linux und Windows:
 
 | Zielplattform | Format | Calling Convention | OS-Interface |
 |---------------|--------|-------------------|--------------|
-| `linux` | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
+| `linux` | ELF64 | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
+| `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
 | `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
 
 **Hinweis:** Der `--target`-Parameter ist optional. Der Compiler wählt automatisch das Host-Betriebssystem als Ziel.
+
+**ARM64-Binaries testen (auf x86_64):**
+```bash
+# QEMU installieren
+sudo apt install qemu-user-static
+
+# ARM64-Binary ausführen
+qemu-aarch64-static ./program
+```
 
 ---
 
