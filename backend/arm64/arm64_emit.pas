@@ -1538,6 +1538,41 @@ begin
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
           end;
           
+        irAlloc:
+          begin
+            // Heap allocation: Dest = alloc(ImmInt bytes)
+            // Use mmap syscall: sys_mmap(addr=0, len=ImmInt, prot=3, flags=34, fd=-1, off=0)
+            // ARM64 Linux syscall numbers: mmap=222, munmap=215
+            
+            // X0 = addr (0 = NULL, let kernel choose)
+            WriteMovImm64(FCode, X0, 0);
+            // X1 = length (size in bytes)
+            WriteMovImm64(FCode, X1, UInt64(instr.ImmInt));
+            // X2 = prot (PROT_READ | PROT_WRITE = 3)
+            WriteMovImm64(FCode, X2, 3);
+            // X3 = flags (MAP_PRIVATE | MAP_ANONYMOUS = 34)
+            WriteMovImm64(FCode, X3, 34);
+            // X4 = fd (-1)
+            WriteMovImm64(FCode, X4, High(UInt64));  // -1 as unsigned
+            // X5 = offset (0)
+            WriteMovImm64(FCode, X5, 0);
+            // X8 = syscall number (222 = sys_mmap on ARM64 Linux)
+            WriteMovImm64(FCode, X8, SYS_mmap);
+            // SVC #0
+            WriteSvc(FCode, 0);
+            // Result (pointer) is now in X0, store to Dest temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+          
+        irFree:
+          begin
+            // Heap deallocation: free(Src1)
+            // munmap(addr, length) - but we don't track sizes, so skip for now
+            // TODO: Track allocation sizes for proper munmap
+            // This causes a memory leak but prevents crashes
+          end;
+          
         irReturn:
           begin
             // Load return value into X0
@@ -1634,8 +1669,7 @@ begin
     end;
   end;
   
-  // Phase 7: Patch global variable addresses (ADRP + ADD)
-  // Global variables are in data section after strings
+// Phase 7: Patch global variable addresses (ADRP + ADD)
   for i := 0 to High(FGlobalVarLeaPatches) do
   begin
     patchPos := FGlobalVarLeaPatches[i].CodePos;
@@ -1654,6 +1688,7 @@ begin
         // Read original instruction to get Rd (bits 4:0)
         origInstr := FCode.ReadU32LE(patchPos);
         rd := origInstr and $1F;  // Extract Rd from original
+        
         FCode.PatchU32LE(patchPos, $90000000 or 
           (DWord((disp shr 12) and $3) shl 29) or 
           (DWord((Int64(disp) shr 14) and $7FFFF) shl 5) or
@@ -1668,6 +1703,7 @@ begin
         origInstr := FCode.ReadU32LE(patchPos);
         rn := (origInstr shr 5) and $1F;  // Extract Rn
         rd := origInstr and $1F;          // Extract Rd
+        
         FCode.PatchU32LE(patchPos, $91000000 or 
           (DWord(disp and $FFF) shl 10) or 
           (DWord(rn) shl 5) or 

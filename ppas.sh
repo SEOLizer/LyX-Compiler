@@ -7,6 +7,6 @@ echo Linking lyxc
 OFS=$IFS
 IFS="
 "
-/bin/ld.bfd -b elf64-x86-64 -m elf_x86_64     -s  -L. -o lyxc -T link3285316.res -e _start
-if [ $? != 0 ]; then DoExitLink aurumc; fi
+/bin/ld.bfd -b elf64-x86-64 -m elf_x86_64     -s  -L. -o lyxc -T link104556.res -e _start
+if [ $? != 0 ]; then DoExitLink lyxc; fi
 IFS=$OFS
