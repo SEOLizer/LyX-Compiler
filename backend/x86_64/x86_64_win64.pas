@@ -997,6 +997,7 @@ begin
   randomSeedOffset := 0;
   FRandomSeedOffset := FData.Size;
   FData.WriteU64LE(12345);
+  Inc(totalDataOffset, 8);  // Account for random seed in data offset
   randomSeedAdded := True;
   randomSeedOffset := FRandomSeedOffset;
 
@@ -1237,6 +1238,135 @@ begin
               EmitU32(FCode, Cardinal(mask64 and $FFFFFFFF));
             end;
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irSExt:
+          begin
+            // Sign-extend src1 (width in ImmInt) into dest using shl/sar sequence
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            if instr.ImmInt < 64 then
+            begin
+              sh := 64 - instr.ImmInt;
+              // shl rax, sh
+              EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E0); EmitU8(FCode, Byte(sh));
+              // sar rax, sh
+              EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $F8); EmitU8(FCode, Byte(sh));
+            end;
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irZExt:
+          begin
+            // Zero-extend src1 (width in ImmInt) into dest
+            slotIdx := localCnt + instr.Src1;
+            case instr.ImmInt of
+              8: WriteMovzxRegMem8(FCode, RAX, RBP, SlotOffset(slotIdx));
+              16: WriteMovzxRegMem16(FCode, RAX, RBP, SlotOffset(slotIdx));
+              32:
+                begin
+                  // mov eax, dword ptr [base+disp] zero-extends into rax implicitly
+                  WriteMovEAXMem32(FCode, RBP, SlotOffset(slotIdx));
+                end;
+            else
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+            end;
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irLoadLocalAddr:
+          begin
+            // Load address of local variable into temp: dest = &locals[src1]
+            // LEA rax, [rbp + offset]
+            structBaseOff := SlotOffset(instr.Src1);
+            EmitU8(FCode, $48); // REX.W
+            EmitU8(FCode, $8D); // LEA opcode
+            if (structBaseOff >= -128) and (structBaseOff <= 127) then
+            begin
+              EmitU8(FCode, $45); // ModR/M: [rbp + disp8], reg=rax
+              EmitU8(FCode, Byte(structBaseOff));
+            end
+            else
+            begin
+              EmitU8(FCode, $85); // ModR/M: [rbp + disp32], reg=rax
+              EmitU32(FCode, Cardinal(structBaseOff));
+            end;
+            // Store result in destination temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irLoadGlobal:
+          begin
+            // Load global variable into temp: dest = globals[ImmStr]
+            // Globals are pre-allocated in data section during EmitFromIR
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              // Should not happen if frontend correctly registered globals
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rax, [rip+disp32] ; will be patched later
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+            // Record position for patching using FGlobalVarLeaPositions
+            SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+            // mov rax, [rax]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
+            // Store into temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irStoreGlobal:
+          begin
+            // Store temp into global variable: globals[ImmStr] = src1
+            // Load value from temp
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Find slot for this global variable
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rcx, [rip+disp32] ; will be patched later
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+            // Record position for patching
+            SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+            // mov [rcx], rax
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
+          end;
+        irLoadGlobalAddr:
+          begin
+            // Load address of global variable into temp: dest = &globals[ImmStr]
+            varIdx := globalVarNames.IndexOf(instr.ImmStr);
+            if varIdx < 0 then
+            begin
+              varIdx := globalVarNames.Count;
+              globalVarNames.Add(instr.ImmStr);
+              SetLength(globalVarOffsets, varIdx + 1);
+              globalVarOffsets[varIdx] := totalDataOffset;
+              FData.WriteU64LE(0);
+              Inc(totalDataOffset, 8);
+            end;
+            // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+            // Record position for patching
+            SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+            // Store the ADDRESS into temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
           end;
         irAdd:
           begin
@@ -1487,6 +1617,95 @@ begin
             // Store return value from RAX to destination slot
             if instr.Dest >= 0 then
               WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irStackAlloc:
+          begin
+            // Allocate stack space for array: alloc_size = ImmInt bytes
+            allocSize := instr.ImmInt;
+            // Align to 8-byte boundary
+            allocSize := (allocSize + 7) and not 7;
+            
+            // Move current RSP down by allocSize bytes: sub rsp, allocSize
+            if allocSize <= 127 then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, Byte(allocSize));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $81); EmitU8(FCode, $EC);
+              EmitU32(FCode, Cardinal(allocSize));
+            end;
+            
+            // Store current RSP as array base address in temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovRegReg(FCode, RAX, RSP); // mov rax, rsp
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irStoreElem:
+          begin
+            // Store element: array[index] = value
+            // Src1 = array base address temp, Src2 = value temp, ImmInt = index
+            elemIndex := instr.ImmInt;
+            elemOffset := elemIndex * 8; // 8 bytes per element
+            
+            // Load array base address into RAX
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Load element value into RCX
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            // Store value at array[index]: mov [rax + elemOffset], rcx
+            if elemOffset <= 127 then
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(elemOffset));
+            end
+            else
+            begin
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+              EmitU32(FCode, Cardinal(elemOffset));
+            end;
+          end;
+        irLoadElem:
+          begin
+            // Load element: dest = array[index]
+            // Src1 = array base address temp, Src2 = index temp, Dest = result
+            
+            // Load array base address into RAX
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Load index into RCX
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            
+            // Calculate element address: RAX = RAX + RCX * 8
+            // shl rcx, 3   (multiply index by 8)
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03);
+            // add rax, rcx (add scaled offset)
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            
+            // Load value from calculated address: RCX = [RAX]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $08);
+            
+            // Store result in destination temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RCX);
+          end;
+        irStoreElemDyn:
+          begin
+            // Store element dynamically: array[index] = value
+            // Src1 = array base, Src2 = index, Src3 = value
+            
+            // Load array base address into RAX
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            // Load index into RCX
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            // Load value into RDX
+            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src3));
+            
+            // Calculate element address: RAX = RAX + RCX * 8
+            // shl rcx, 3   (multiply index by 8)
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03);
+            // add rax, rcx (add scaled offset)
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            
+            // Store value at calculated address: [RAX] = RDX
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $10);
           end;
         else
           begin
