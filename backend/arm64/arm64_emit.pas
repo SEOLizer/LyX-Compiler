@@ -45,6 +45,10 @@ type
     FGlobalVarOffsets: array of UInt64;
     FGlobalVarLeaPatches: array of TGlobalVarLeaPatch;
     FTotalDataOffset: UInt64;
+    // Random seed
+    FRandomSeedOffset: UInt64;
+    FRandomSeedAdded: Boolean;
+    FRandomSeedLeaPatches: array of Integer;
   public
     constructor Create;
     destructor Destroy; override;
@@ -616,6 +620,9 @@ begin
   SetLength(FGlobalVarOffsets, 0);
   SetLength(FGlobalVarLeaPatches, 0);
   FTotalDataOffset := 0;
+  FRandomSeedOffset := 0;
+  FRandomSeedAdded := False;
+  SetLength(FRandomSeedLeaPatches, 0);
 end;
 
 destructor TARM64Emitter.Destroy;
@@ -1296,6 +1303,71 @@ begin
               // sys_exit(X0)
               WriteMovImm64(FCode, X8, SYS_exit);
               WriteSvc(FCode, 0);
+            end
+            else if instr.ImmStr = 'Random' then
+            begin
+              // Random() -> int64: Linear Congruential Generator
+              // seed = (seed * 1103515245 + 12345) mod 2^31
+              // Uses global seed stored in data section
+              if not FRandomSeedAdded then
+              begin
+                FRandomSeedOffset := FData.Size;
+                FData.WriteU64LE(1); // Initial seed = 1
+                FRandomSeedAdded := True;
+              end;
+              
+              // Load seed address: ADRP X1, page + ADD X1, X1, #offset
+              SetLength(FRandomSeedLeaPatches, Length(FRandomSeedLeaPatches) + 1);
+              FRandomSeedLeaPatches[High(FRandomSeedLeaPatches)] := FCode.Size;
+              WriteAdrp(FCode, X1, 0);  // Placeholder
+              SetLength(FRandomSeedLeaPatches, Length(FRandomSeedLeaPatches) + 1);
+              FRandomSeedLeaPatches[High(FRandomSeedLeaPatches)] := FCode.Size;
+              WriteAddImm(FCode, X1, X1, 0);  // Placeholder
+              
+              // LDR X0, [X1] - load current seed
+              WriteLdrImm(FCode, X0, X1, 0);
+              
+              // Compute: X0 = X0 * 1103515245 + 12345
+              // X2 = 1103515245 (0x41C64E6D)
+              WriteMovImm64(FCode, X2, 1103515245);
+              // X0 = X0 * X2
+              WriteMul(FCode, X0, X0, X2);
+              // X0 = X0 + 12345 (12345 > 4095, need to load into register first)
+              WriteMovImm64(FCode, X2, 12345);
+              WriteAddRegReg(FCode, X0, X0, X2);
+              
+              // AND X0, X0, 0x7FFFFFFF (mod 2^31)
+              WriteMovImm64(FCode, X2, $7FFFFFFF);
+              WriteAndRegReg(FCode, X0, X0, X2);
+              
+              // Store seed back: STR X0, [X1]
+              WriteStrImm(FCode, X0, X1, 0);
+              
+              // Store result in dest temp
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'RandomSeed' then
+            begin
+              // RandomSeed(seed) -> void: sets the random seed
+              // X0 already contains the seed value from Src1
+              if not FRandomSeedAdded then
+              begin
+                FRandomSeedOffset := FData.Size;
+                FData.WriteU64LE(1);
+                FRandomSeedAdded := True;
+              end;
+              
+              // Load seed address: ADRP X1, page + ADD X1, X1, #offset
+              SetLength(FRandomSeedLeaPatches, Length(FRandomSeedLeaPatches) + 1);
+              FRandomSeedLeaPatches[High(FRandomSeedLeaPatches)] := FCode.Size;
+              WriteAdrp(FCode, X1, 0);  // Placeholder
+              SetLength(FRandomSeedLeaPatches, Length(FRandomSeedLeaPatches) + 1);
+              FRandomSeedLeaPatches[High(FRandomSeedLeaPatches)] := FCode.Size;
+              WriteAddImm(FCode, X1, X1, 0);  // Placeholder
+              
+              // STR X0, [X1] - store new seed
+              WriteStrImm(FCode, X0, X1, 0);
             end;
           end;
           
@@ -1596,6 +1668,42 @@ begin
         origInstr := FCode.ReadU32LE(patchPos);
         rn := (origInstr shr 5) and $1F;  // Extract Rn
         rd := origInstr and $1F;          // Extract Rd
+        FCode.PatchU32LE(patchPos, $91000000 or 
+          (DWord(disp and $FFF) shl 10) or 
+          (DWord(rn) shl 5) or 
+          rd);
+      end;
+    end;
+  end;
+  
+  // Phase 8: Patch random seed addresses (ADRP + ADD)
+  if FRandomSeedAdded then
+  begin
+    for i := 0 to High(FRandomSeedLeaPatches) do
+    begin
+      patchPos := FRandomSeedLeaPatches[i];
+      strOffset := FRandomSeedOffset;
+      instrVA := codeVA + UInt64(patchPos);
+      
+      // Determine if this is ADRP or ADD based on even/odd index
+      if (i mod 2) = 0 then
+      begin
+        // ADRP: PC-relative page address
+        disp := Int32((dataVA + strOffset) - (instrVA and not UInt64($FFF)));
+        origInstr := FCode.ReadU32LE(patchPos);
+        rd := origInstr and $1F;
+        FCode.PatchU32LE(patchPos, $90000000 or 
+          (DWord((disp shr 12) and $3) shl 29) or 
+          (DWord((Int64(disp) shr 14) and $7FFFF) shl 5) or
+          rd);
+      end
+      else
+      begin
+        // ADD: immediate offset within page
+        disp := Int32((dataVA + strOffset) and $FFF);
+        origInstr := FCode.ReadU32LE(patchPos);
+        rn := (origInstr shr 5) and $1F;
+        rd := origInstr and $1F;
         FCode.PatchU32LE(patchPos, $91000000 or 
           (DWord(disp and $FFF) shl 10) or 
           (DWord(rn) shl 5) or 
