@@ -26,8 +26,13 @@ type
     
     // String/LEA patching
     FStringOffsets: array of UInt64;
-    FLeaPositions: array of Integer;
-    FLeaStrIndex: array of Integer;
+    FLeaPositions: array of Integer;   // opcode start positions for LEA
+    FLeaStrIndex: array of Integer;    // string offset within data buffer
+    FGlobalVarLeaPositions: array of record
+      VarIndex: Integer;
+      CodePos: Integer;
+    end;
+    FGlobalVarOffsets: array of UInt64;
 
     // Label/Jump Patching
     FLabelPositions: array of Integer;
@@ -35,6 +40,13 @@ type
       CodePos: Integer;
       LabelIdx: Integer;
     end;
+    FCallPatches: array of record
+      CodePos: Integer;
+      TargetName: string;
+    end;
+    
+    // Entry point offset (position of _start code)
+    FEntryOffset: Integer;
     
     // Function Info
     FFuncOffsets: array of Integer;
@@ -478,6 +490,7 @@ begin
   FWriteFileIndex := -1;
   FExitProcessIndex := -1;
   FRandomSeedOffset := -1;
+  FEntryOffset := 0;
 end;
 
 destructor TWin64Emitter.Destroy;
@@ -900,10 +913,7 @@ var
   randomSeedLeaPositions: array of Integer;
   globalVarNames: TStringList;
   globalVarOffsets: array of UInt64;
-  globalVarLeaPositions: array of record
-    VarIndex: Integer;
-    CodePos: Integer;
-  end;
+  // use emitter-level FGlobalVarLeaPositions field to collect patches
   nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
   targetPos, jmpPos: Integer;
   jmpAfterPadPos: Integer;
@@ -939,6 +949,9 @@ var
   fname: string;
   // Builtin stub offsets
   printStrOffset, printIntOffset, randomOffset, randomSeedOffsetStub, exitOffset: Integer;
+  // Call patching temps
+  callPos, foundIdx, targetOffsetInt, relInt: Integer;
+  targetName: string;
 begin
   // Prepare imports and builtin stubs
   SetupKernel32Imports;
@@ -974,6 +987,9 @@ begin
   randomSeedOffsetStub := FCode.Size; EmitRandomSeedStub;
   exitOffset := FCode.Size; EmitExitStub;
 
+  // Record entry point offset (after builtins, before _start code)
+  FEntryOffset := FCode.Size;
+
   // Basic program entry (_start): set up stack for Win64 and call main
   // sub rsp, 40 (32-byte shadow + alignment)
   WriteSubRegImm32(FCode, RSP, 40);
@@ -1005,14 +1021,14 @@ begin
   envAdded := False; envOffset := 0; SetLength(envLeaPositions, 0);
   SetLength(randomSeedLeaPositions, 0);
   globalVarNames := TStringList.Create; globalVarNames.Sorted := False;
-  SetLength(globalVarOffsets, 0); SetLength(globalVarLeaPositions, 0);
+  SetLength(FGlobalVarOffsets, 0); SetLength(FGlobalVarLeaPositions, 0);
 
   // Pre-allocate global variables in data section
   for i := 0 to High(module.GlobalVars) do
   begin
     globalVarNames.Add(module.GlobalVars[i].Name);
-    SetLength(globalVarOffsets, globalVarNames.Count);
-    globalVarOffsets[High(globalVarOffsets)] := totalDataOffset;
+    SetLength(FGlobalVarOffsets, globalVarNames.Count);
+    FGlobalVarOffsets[High(FGlobalVarOffsets)] := totalDataOffset;
     if module.GlobalVars[i].IsArray then
     begin
       if module.GlobalVars[i].HasInitValue and (module.GlobalVars[i].ArrayLen > 0) then
@@ -1321,8 +1337,13 @@ begin
                 // No name mapping available here; this is placeholder
               end;
             end;
-            // For now, emit a call rel32 to a placeholder 0 (to be patched later)
-            WriteCallRel32(FCode, 0);
+            // For now, emit a call rel32 placeholder and record for patching
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+            // emit call rel32 with zero placeholder
+            EmitU8(FCode, $E8);
+            EmitU32(FCode, 0);
           end;
         else
           begin
@@ -1341,13 +1362,93 @@ begin
     EmitEpilogue(frameBytes + framePad);
   end; // for functions
 
+  // Patch call placeholders with actual function offsets
+  if Length(FCallPatches) > 0 then
+  begin
+    for i := 0 to High(FCallPatches) do
+    begin
+      targetName := FCallPatches[i].TargetName;
+      callPos := FCallPatches[i].CodePos;
+      foundIdx := -1;
+      for k := 0 to High(module.Functions) do
+      begin
+        if module.Functions[k].Name = targetName then
+        begin
+          foundIdx := k; Break;
+        end;
+      end;
+      if foundIdx >= 0 then
+      begin
+        targetOffsetInt := Integer(FFuncOffsets[foundIdx]);
+        relInt := Integer(targetOffsetInt) - Integer(callPos + 5);
+        FCode.PatchU32LE(callPos + 1, Cardinal(relInt));
+      end
+      else
+      begin
+        // unresolved: leave as 0 (or could be external)
+      end;
+    end;
+  end;
+
+  // Patch _start -> main call (FJumpPatches with LabelIdx = -1)
+  if Length(FJumpPatches) > 0 then
+  begin
+    for i := 0 to High(FJumpPatches) do
+    begin
+      if FJumpPatches[i].LabelIdx = -1 then
+      begin
+        // This is the _start -> main call
+        callPos := FJumpPatches[i].CodePos;
+        // Find main function offset
+        foundIdx := -1;
+        for k := 0 to High(module.Functions) do
+        begin
+          if module.Functions[k].Name = 'main' then
+          begin
+            foundIdx := k; Break;
+          end;
+        end;
+        if foundIdx >= 0 then
+        begin
+          targetOffsetInt := Integer(FFuncOffsets[foundIdx]);
+          relInt := Integer(targetOffsetInt) - Integer(callPos + 5);
+          FCode.PatchU32LE(callPos + 1, Cardinal(relInt));
+        end;
+      end;
+    end;
+  end;
+
   // Cleanup
   globalVarNames.Free;
 end;
 
 procedure TWin64Emitter.WriteToFile(const filename: string);
+var
+  leaStrPatches: TLeaStrPatchArray;
+  leaVarPatches: TLeaVarPatchArray;
+  i: Integer;
 begin
-  WritePE64(filename, FCode, FData, FImports, FIATPatches);
+  // Build LEA string patches
+  SetLength(leaStrPatches, Length(FLeaPositions));
+  for i := 0 to High(FLeaPositions) do
+  begin
+    leaStrPatches[i].CodeOffset := FLeaPositions[i];
+    leaStrPatches[i].StrIndex := FLeaStrIndex[i];
+  end;
+
+  // Build LEA var patches
+  SetLength(leaVarPatches, Length(FGlobalVarLeaPositions));
+  for i := 0 to High(FGlobalVarLeaPositions) do
+  begin
+    leaVarPatches[i].CodeOffset := FGlobalVarLeaPositions[i].CodePos;
+    // VarIndex in FGlobalVarLeaPositions refers to index in FGlobalVarOffsets
+    if FGlobalVarLeaPositions[i].VarIndex < Length(FGlobalVarOffsets) then
+      leaVarPatches[i].VarIndex := Integer(FGlobalVarOffsets[FGlobalVarLeaPositions[i].VarIndex])
+    else
+      leaVarPatches[i].VarIndex := 0;
+  end;
+
+  WritePE64(filename, FCode, FData, FImports, FIATPatches, leaStrPatches, leaVarPatches, FEntryOffset);
 end;
 
 end.

@@ -29,12 +29,28 @@ type
   end;
   TIATPatchArray = array of TIATPatch;
 
+  // LEA Patch: patch LEA [rip+disp32] to point to string index in .data
+  TLeaStrPatch = record
+    CodeOffset: Integer; // position in code buffer where LEA opcode starts
+    StrIndex: Integer;   // index in data buffer/strings
+  end;
+  TLeaStrPatchArray = array of TLeaStrPatch;
+
+  // LEA Patch for global variable addresses
+  TLeaVarPatch = record
+    CodeOffset: Integer; // position in code buffer where LEA opcode starts
+    VarIndex: Integer;   // index into allocated globals
+  end;
+  TLeaVarPatchArray = array of TLeaVarPatch;
+
 // Minimales PE64 ohne Imports (nur für Tests)
 procedure WritePE64Minimal(const filename: string; const codeBuf: TByteBuffer);
 
 // PE64 mit Imports
 procedure WritePE64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
-  const imports: TImportDllArray; const iatPatches: TIATPatchArray);
+  const imports: TImportDllArray; const iatPatches: TIATPatchArray;
+  const leaStrPatches: TLeaStrPatchArray; const leaVarPatches: TLeaVarPatchArray;
+  entryOffset: Integer);
 
 implementation
 
@@ -401,7 +417,9 @@ begin
 end;
 
 procedure WritePE64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
-  const imports: TImportDllArray; const iatPatches: TIATPatchArray);
+  const imports: TImportDllArray; const iatPatches: TIATPatchArray;
+  const leaStrPatches: TLeaStrPatchArray; const leaVarPatches: TLeaVarPatchArray;
+  entryOffset: Integer);
 var
   fileBuf, rdataBuf: TByteBuffer;
   headerSize, textRVA, textFileSize, rdataRVA, rdataFileSize: DWord;
@@ -617,7 +635,7 @@ begin
     
     // 5. Optional Header
     WriteOptionalHeader(fileBuf,
-      textRVA,           // Entry Point RVA
+      textRVA + DWord(entryOffset),  // Entry Point RVA (offset within .text)
       textRVA,           // Code RVA
       codeBuf.Size,      // Code Size
       rdataRVA,          // .rdata RVA
@@ -702,19 +720,48 @@ begin
             for di := 0 to i - 1 do
               entryRVA := entryRVA + (Length(imports[di].Functions) + 1) * 8;
             entryRVA := entryRVA + DWord(j) * 8;
-            
+
             // Patch position in code
             patchOffset := iatPatches[p].CodeOffset;
             // Instruction end RVA (patch is 4 bytes, instruction is 6 bytes for FF 15 xx xx xx xx)
-            instrEndRVA := textRVA + DWord(patchOffset) + 4;
+            instrEndRVA := textRVA + DWord(patchOffset) + 4; // disp32 is 4 bytes; end = dispStart + 4
             // RIP-relative displacement
             disp32 := Int32(entryRVA) - Int32(instrEndRVA);
-            
+
             // Patch in file buffer (code is at headerSize)
             fileBuf.PatchU32LE(headerSize + patchOffset, Cardinal(disp32));
           end;
         end;
         Inc(k);
+      end;
+    end;
+
+    // Apply LEA patches for strings (lea rax, [rip+disp32] -> opcode length 7 bytes)
+    if Length(leaStrPatches) > 0 then
+    begin
+      for i := 0 to High(leaStrPatches) do
+      begin
+        patchOffset := leaStrPatches[i].CodeOffset;
+        // target RVA = dataRVA + offset of string in dataBuf
+        // For strings we assume they are placed at start of dataBuf in emitter; pass StrIndex as offset
+        // Note: here StrIndex is actually the byte offset within dataBuf where string starts
+        entryRVA := dataRVA + DWord(leaStrPatches[i].StrIndex);
+        instrEndRVA := textRVA + DWord(patchOffset) + 7; // lea imm32 length
+        disp32 := Int32(entryRVA) - Int32(instrEndRVA);
+        fileBuf.PatchU32LE(headerSize + patchOffset + 3, Cardinal(disp32));
+      end;
+    end;
+
+    // Apply LEA patches for global vars
+    if Length(leaVarPatches) > 0 then
+    begin
+      for i := 0 to High(leaVarPatches) do
+      begin
+        patchOffset := leaVarPatches[i].CodeOffset;
+        entryRVA := dataRVA + DWord(leaVarPatches[i].VarIndex);
+        instrEndRVA := textRVA + DWord(patchOffset) + 7;
+        disp32 := Int32(entryRVA) - Int32(instrEndRVA);
+        fileBuf.PatchU32LE(headerSize + patchOffset + 3, Cardinal(disp32));
       end;
     end;
     
