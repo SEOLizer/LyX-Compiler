@@ -52,7 +52,7 @@ type
     FFuncOffsets: array of Integer;
     
     procedure SetupKernel32Imports;
-    procedure EmitPrologue(localBytes, paramCount: Integer);
+    function EmitPrologue(localBytes, paramCount: Integer): Integer;  // Returns actual frameBytes
     procedure EmitEpilogue(frameBytes: Integer);
     
     // Builtin-Stubs
@@ -547,7 +547,7 @@ begin
   EmitU32(FCode, 0);  // Placeholder
 end;
 
-procedure TWin64Emitter.EmitPrologue(localBytes, paramCount: Integer);
+function TWin64Emitter.EmitPrologue(localBytes, paramCount: Integer): Integer;
 var
   frameBytes, framePad: Integer;
   k: Integer;
@@ -580,6 +580,8 @@ begin
   // Spill parameters from registers to stack
   for k := 0 to Min(paramCount - 1, 3) do
     WriteMovMemReg(FCode, RBP, SlotOffset(k), Win64ParamRegs[k]);
+    
+  Result := frameBytes;  // Return actual frame size for epilogue
 end;
 
 procedure TWin64Emitter.EmitEpilogue(frameBytes: Integer);
@@ -628,11 +630,11 @@ begin
   
   strlenLoopStart := FCode.Size;
   // cmp byte [rbx + rdi], 0
-  EmitU8(FCode, $42);  // REX for RDI as index
-  EmitU8(FCode, $80);
-  EmitU8(FCode, $3C);
-  EmitU8(FCode, $3B);  // [rbx + rdi]
-  EmitU8(FCode, $00);
+  // No REX needed: RBX=3, RDI=7 are both in low 8 registers
+  EmitU8(FCode, $80);  // cmp r/m8, imm8
+  EmitU8(FCode, $3C);  // ModR/M: /7, mod=00, r/m=100 (SIB follows)
+  EmitU8(FCode, $3B);  // SIB: scale=1, index=RDI(7), base=RBX(3)
+  EmitU8(FCode, $00);  // imm8 = 0
   
   // je strlen_done (forward jump, patch later)
   EmitU8(FCode, $74);
@@ -901,6 +903,7 @@ var
   localCnt, maxTemp, totalSlots, slotIdx: Integer;
   leaPos: Integer;
   disp32, rel32: Int64;
+  stringByteOffsets: array of Integer;  // byte offsets for each string in data section
   tempStrIndex: array of Integer;
   bufferAdded: Boolean;
   bufferOffset: UInt64;
@@ -959,12 +962,13 @@ begin
   // write interned strings from module
   SetLength(tempStrIndex, 0);
   totalDataOffset := 0;
+  SetLength(stringByteOffsets, 0);
   if Assigned(module) then
   begin
-    SetLength(tempStrIndex, module.Strings.Count);
+    SetLength(stringByteOffsets, module.Strings.Count);
     for i := 0 to module.Strings.Count - 1 do
     begin
-      tempStrIndex[i] := 0; // placeholder
+      stringByteOffsets[i] := totalDataOffset; // store byte offset for this string
       for j := 1 to Length(module.Strings[i]) do
         FData.WriteU8(Byte(module.Strings[i][j]));
       FData.WriteU8(0);
@@ -1085,13 +1089,8 @@ begin
     if totalSlots < 0 then totalSlots := 0;
     if totalSlots > 1024 then totalSlots := 1024;
 
-    frameBytes := totalSlots * 8;
-    // conservative saved registers: RBX, RDI, RSI, R12-R15 (7 regs) -> 56 bytes
-    savedPushBytes := 8 * 7; // note: earlier Prologue pushed these
-    framePad := (16 - ((frameBytes + 8 + savedPushBytes) mod 16)) mod 16;
-
-    // Prologue
-    EmitPrologue(totalSlots * 8, module.Functions[i].ParamCount);
+    // Prologue - returns actual frame size used
+    frameBytes := EmitPrologue(totalSlots * 8, module.Functions[i].ParamCount);
 
     // Spill incoming parameters into slots
     if module.Functions[i].ParamCount > 0 then
@@ -1128,11 +1127,13 @@ begin
             SetLength(FLeaPositions, Length(FLeaPositions) + 1);
             SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
             FLeaPositions[High(FLeaPositions)] := leaPos;
-            sidx := StrToIntDef(instr.ImmStr, 0);
-            FLeaStrIndex[High(FLeaStrIndex)] := sidx;
+            sidx := StrToIntDef(instr.ImmStr, 0);  // string index
+            // Convert string index to byte offset using stringByteOffsets
+            if (sidx >= 0) and (sidx < Length(stringByteOffsets)) then
+              FLeaStrIndex[High(FLeaStrIndex)] := stringByteOffsets[sidx]
+            else
+              FLeaStrIndex[High(FLeaStrIndex)] := 0;
             WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-            if instr.Dest < Length(tempStrIndex) then
-              tempStrIndex[instr.Dest] := sidx;
           end;
         irCallBuiltin:
           begin
@@ -1266,8 +1267,8 @@ begin
                 WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
             end;
 
-            // Epilogue
-            EmitEpilogue(frameBytes + framePad);
+            // Epilogue - frameBytes already includes padding from EmitPrologue
+            EmitEpilogue(frameBytes);
           end;
         irLabel:
           begin
@@ -1305,6 +1306,12 @@ begin
               end;
               if (sParse <> '') and (ai < argCount) then
                 argTemps[ai] := StrToIntDef(sParse, -1);
+            end;
+            // If the IR carries explicit ArgTemps array, use it (newer IR)
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then argTemps[k] := instr.ArgTemps[k];
             end;
             // Load up to 4 args into RCX,RDX,R8,R9
             for k := 0 to Min(argCount - 1, 3) do
@@ -1344,6 +1351,9 @@ begin
             // emit call rel32 with zero placeholder
             EmitU8(FCode, $E8);
             EmitU32(FCode, 0);
+            // Store return value from RAX to destination slot
+            if instr.Dest >= 0 then
+              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
         else
           begin
@@ -1358,8 +1368,8 @@ begin
     end; // for instructions
 
     // If function didn't end with return, emit epilogue
-    // (simplified) emit epilogue
-    EmitEpilogue(frameBytes + framePad);
+    // (simplified) emit epilogue - frameBytes already includes padding
+    EmitEpilogue(frameBytes);
   end; // for functions
 
   // Patch call placeholders with actual function offsets
