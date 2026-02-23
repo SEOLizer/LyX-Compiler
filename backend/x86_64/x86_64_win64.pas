@@ -34,11 +34,12 @@ type
     end;
     FGlobalVarOffsets: array of UInt64;
 
-    // Label/Jump Patching
-    FLabelPositions: array of Integer;
-    FJumpPatches: array of record
+    // Label/Jump Patching (intra-function)
+    FLabelMap: TStringList;  // label name -> code position (for current function)
+    FBranchPatches: array of record
       CodePos: Integer;
-      LabelIdx: Integer;
+      LabelName: string;
+      JmpSize: Integer;  // 2 for short, 6 for near
     end;
     FCallPatches: array of record
       CodePos: Integer;
@@ -47,6 +48,8 @@ type
     
     // Entry point offset (position of _start code)
     FEntryOffset: Integer;
+    // Position of _start -> main call (for patching)
+    FStartMainCallPos: Integer;
     
     // Function Info
     FFuncOffsets: array of Integer;
@@ -316,6 +319,14 @@ begin
   EmitU8(buf, Byte(rel8));
 end;
 
+// JNE rel32
+procedure WriteJneRel32(buf: TByteBuffer; rel32: Integer);
+begin
+  EmitU8(buf, $0F);
+  EmitU8(buf, $85);
+  EmitU32(buf, Cardinal(rel32));
+end;
+
 // INC r64
 procedure WriteIncReg(buf: TByteBuffer; reg: Byte);
 begin
@@ -483,6 +494,7 @@ begin
   inherited Create;
   FCode := TByteBuffer.Create;
   FData := TByteBuffer.Create;
+  FLabelMap := TStringList.Create;
   SetLength(FImports, 0);
   SetLength(FIATPatches, 0);
   FKernel32Index := -1;
@@ -491,10 +503,12 @@ begin
   FExitProcessIndex := -1;
   FRandomSeedOffset := -1;
   FEntryOffset := 0;
+  FStartMainCallPos := 0;
 end;
 
 destructor TWin64Emitter.Destroy;
 begin
+  FLabelMap.Free;
   FCode.Free;
   FData.Free;
   inherited Destroy;
@@ -955,6 +969,8 @@ var
   // Call patching temps
   callPos, foundIdx, targetOffsetInt, relInt: Integer;
   targetName: string;
+  // Branch patching temps
+  labelIdx, patchPos, jmpSize, relOffset: Integer;
 begin
   // Prepare imports and builtin stubs
   SetupKernel32Imports;
@@ -998,10 +1014,8 @@ begin
   // sub rsp, 40 (32-byte shadow + alignment)
   WriteSubRegImm32(FCode, RSP, 40);
   // call main (patched later)
-  SetLength(FJumpPatches, Length(FJumpPatches) + 1);
-  FJumpPatches[High(FJumpPatches)].CodePos := FCode.Size;
-  FJumpPatches[High(FJumpPatches)].LabelIdx := -1; // use label resolution later via function names
-  WriteCallRel32(FCode, 0); // placeholder
+  FStartMainCallPos := FCode.Size;
+  WriteCallRel32(FCode, 0); // placeholder - will be patched after all functions emitted
   // mov rcx, rax (exit code)
   WriteMovRegReg(FCode, RCX, RAX);
   // call ExitProcess
@@ -1088,6 +1102,10 @@ begin
     totalSlots := localCnt + maxTemp;
     if totalSlots < 0 then totalSlots := 0;
     if totalSlots > 1024 then totalSlots := 1024;
+
+    // Reset label tracking for this function
+    FLabelMap.Clear;
+    SetLength(FBranchPatches, 0);
 
     // Prologue - returns actual frame size used
     frameBytes := EmitPrologue(totalSlots * 8, module.Functions[i].ParamCount);
@@ -1253,6 +1271,55 @@ begin
             EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
+        irCmpNeq:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); // setne al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irCmpLt:
+          begin
+            // dest = (src1 < src2) ? 1 : 0 (signed)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9C); EmitU8(FCode, $C0); // setl al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irCmpLe:
+          begin
+            // dest = (src1 <= src2) ? 1 : 0 (signed)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9E); EmitU8(FCode, $C0); // setle al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irCmpGt:
+          begin
+            // dest = (src1 > src2) ? 1 : 0 (signed)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9F); EmitU8(FCode, $C0); // setg al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irCmpGe:
+          begin
+            // dest = (src1 >= src2) ? 1 : 0 (signed)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, RAX, RCX);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9D); EmitU8(FCode, $C0); // setge al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx rax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
         irReturn:
           begin
             // Move return value into RAX (non-entry) or RCX (entry)
@@ -1272,17 +1339,39 @@ begin
           end;
         irLabel:
           begin
-            // labels are implicit via function offsets; for intra-function labels we could record here
+            // Record label position for branch patching
+            FLabelMap.AddObject(instr.LabelName, TObject(PtrInt(FCode.Size)));
           end;
         irJmp:
           begin
-            // For simplicity, use absolute labels via function's LabelName not yet implemented
-            // placeholder: no-op
-            // Real implementation would emit rel32 jump and record for patching
+            // Unconditional jump to label
+            SetLength(FBranchPatches, Length(FBranchPatches) + 1);
+            FBranchPatches[High(FBranchPatches)].CodePos := FCode.Size;
+            FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
+            FBranchPatches[High(FBranchPatches)].JmpSize := 5;  // jmp rel32
+            WriteJmpRel32(FCode, 0);  // placeholder
           end;
-        irBrTrue, irBrFalse:
+        irBrTrue:
           begin
-            // conditional branches: not implemented in detail here
+            // Jump to label if Src1 != 0
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteTestRaxRax(FCode);
+            SetLength(FBranchPatches, Length(FBranchPatches) + 1);
+            FBranchPatches[High(FBranchPatches)].CodePos := FCode.Size;
+            FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
+            FBranchPatches[High(FBranchPatches)].JmpSize := 6;  // jne rel32
+            WriteJneRel32(FCode, 0);  // placeholder
+          end;
+        irBrFalse:
+          begin
+            // Jump to label if Src1 == 0
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteTestRaxRax(FCode);
+            SetLength(FBranchPatches, Length(FBranchPatches) + 1);
+            FBranchPatches[High(FBranchPatches)].CodePos := FCode.Size;
+            FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
+            FBranchPatches[High(FBranchPatches)].JmpSize := 6;  // je rel32
+            WriteJeRel32(FCode, 0);  // placeholder
           end;
         irCall:
           begin
@@ -1367,6 +1456,22 @@ begin
       end; // case instr.Op
     end; // for instructions
 
+    // Apply intra-function branch patches
+    for k := 0 to High(FBranchPatches) do
+    begin
+      labelIdx := FLabelMap.IndexOf(FBranchPatches[k].LabelName);
+      if labelIdx >= 0 then
+      begin
+        targetPos := PtrInt(FLabelMap.Objects[labelIdx]);
+        patchPos := FBranchPatches[k].CodePos;
+        jmpSize := FBranchPatches[k].JmpSize;
+        // rel32 offset is from end of instruction
+        relOffset := targetPos - (patchPos + jmpSize);
+        // Patch the rel32 displacement (last 4 bytes of instruction)
+        FCode.PatchU32LE(patchPos + jmpSize - 4, Cardinal(relOffset));
+      end;
+    end;
+
     // If function didn't end with return, emit epilogue
     // (simplified) emit epilogue - frameBytes already includes padding
     EmitEpilogue(frameBytes);
@@ -1400,32 +1505,20 @@ begin
     end;
   end;
 
-  // Patch _start -> main call (FJumpPatches with LabelIdx = -1)
-  if Length(FJumpPatches) > 0 then
+  // Patch _start -> main call
+  foundIdx := -1;
+  for k := 0 to High(module.Functions) do
   begin
-    for i := 0 to High(FJumpPatches) do
+    if module.Functions[k].Name = 'main' then
     begin
-      if FJumpPatches[i].LabelIdx = -1 then
-      begin
-        // This is the _start -> main call
-        callPos := FJumpPatches[i].CodePos;
-        // Find main function offset
-        foundIdx := -1;
-        for k := 0 to High(module.Functions) do
-        begin
-          if module.Functions[k].Name = 'main' then
-          begin
-            foundIdx := k; Break;
-          end;
-        end;
-        if foundIdx >= 0 then
-        begin
-          targetOffsetInt := Integer(FFuncOffsets[foundIdx]);
-          relInt := Integer(targetOffsetInt) - Integer(callPos + 5);
-          FCode.PatchU32LE(callPos + 1, Cardinal(relInt));
-        end;
-      end;
+      foundIdx := k; Break;
     end;
+  end;
+  if foundIdx >= 0 then
+  begin
+    targetOffsetInt := Integer(FFuncOffsets[foundIdx]);
+    relInt := Integer(targetOffsetInt) - Integer(FStartMainCallPos + 5);
+    FCode.PatchU32LE(FStartMainCallPos + 1, Cardinal(relInt));
   end;
 
   // Cleanup
