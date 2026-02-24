@@ -1,5 +1,35 @@
 # Changelog - Lyx Compiler
 
+## Version 0.3.1 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **std.io: Direkte Syscalls (statisches ELF)**
+Die I/O-Funktionen werden jetzt als **direkte Linux-Syscalls** generiert:
+- Keine libc-Abhängigkeit
+- Statisches ELF ohne externe Symbole
+- Funktioniert auf x86-64 und ARM64
+
+**Unterstützte Funktionen:**
+| Funktion | x86-64 | ARM64 |
+|----------|--------|-------|
+| `open` | Syscall 2 | Syscall 56 |
+| `read` | Syscall 0 | Syscall 63 |
+| `write` | Syscall 1 | Syscall 64 |
+| `close` | Syscall 3 | Syscall 57 |
+| `lseek` | Syscall 8 | Syscall 62 |
+| `unlink` | Syscall 87 | Syscall 87 |
+| `rename` | Syscall 82 | Syscall 82 |
+| `mkdir` | Syscall 83 | Syscall 83 |
+| `rmdir` | Syscall 84 | Syscall 84 |
+| `chmod` | Syscall 90 | Syscall 90 |
+
+### 📊 **Getestete Funktionalität**
+- ✅ `examples/test_syscall.lyx`: Alle I/O-Tests bestanden
+- ✅ Unit-Tests: Alle bestanden
+
+---
+
 ## Version 0.3.0 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
