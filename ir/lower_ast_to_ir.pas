@@ -353,8 +353,13 @@ begin
        // Lower function body
        FCurrentFunc := fn;
        FCurrentFuncDecl := TAstFuncDecl(node);
-       FLocalMap.Clear;
-       FTempCounter := 0;
+        FLocalMap.Clear;
+        // Free old FLocalConst entries before resetting
+        for j := 0 to Length(FLocalConst) - 1 do
+          if Assigned(FLocalConst[j]) then
+            FLocalConst[j].Free;
+        SetLength(FLocalConst, 0);
+        FTempCounter := 0;
        fn.ParamCount := Length(TAstFuncDecl(node).Params);
        fn.LocalCount := fn.ParamCount;
        SetLength(FLocalTypes, fn.LocalCount);
@@ -396,6 +401,11 @@ begin
         FCurrentFunc := fn;
         FCurrentFuncDecl := m;  // set current func decl for return type info
         FLocalMap.Clear;
+        // Free old FLocalConst entries before resetting
+        for k := 0 to Length(FLocalConst) - 1 do
+          if Assigned(FLocalConst[k]) then
+            FLocalConst[k].Free;
+        SetLength(FLocalConst, 0);
         FTempCounter := 0;
         
         if m.IsStatic then
@@ -475,6 +485,11 @@ begin
         FCurrentFunc := fn;
         FCurrentFuncDecl := m;  // set current func decl for return type info
         FLocalMap.Clear;
+        // Free old FLocalConst entries before resetting
+        for k := 0 to Length(FLocalConst) - 1 do
+          if Assigned(FLocalConst[k]) then
+            FLocalConst[k].Free;
+        SetLength(FLocalConst, 0);
         FTempCounter := 0;
         
         if m.IsStatic then
@@ -614,6 +629,11 @@ begin
           FCurrentFunc := fn;
           FCurrentFuncDecl := TAstFuncDecl(node);
           FLocalMap.Clear;
+          // Free old FLocalConst entries before resetting
+          for k := 0 to Length(FLocalConst) - 1 do
+            if Assigned(FLocalConst[k]) then
+              FLocalConst[k].Free;
+          SetLength(FLocalConst, 0);
           FTempCounter := 0;
           fn.ParamCount := Length(TAstFuncDecl(node).Params);
           fn.LocalCount := fn.ParamCount;
