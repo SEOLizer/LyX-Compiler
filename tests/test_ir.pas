@@ -130,6 +130,7 @@ begin
               
             finally
               lower.Free;
+              prog.Free;  // AST wird nach dem Lowering nicht mehr benötigt
             end;
           finally
             modl.Free;
