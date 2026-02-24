@@ -20,6 +20,8 @@ type
     tkTry, tkCatch, tkThrow, tkFinally,
     // OOP Keywords
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
+    // Access Control Keywords
+    tkPrivate, tkProtected,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -131,6 +133,8 @@ begin
     tkSuper:      Result := 'super';
     tkNew:        Result := 'new';
     tkDispose:    Result := 'dispose';
+    tkPrivate:    Result := 'private';
+    tkProtected:  Result := 'protected';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -472,6 +476,9 @@ begin
     'super':      Result := tkSuper;
     'new':        Result := tkNew;
     'dispose':    Result := tkDispose;
+    // Access Control Keywords
+    'private':    Result := tkPrivate;
+    'protected':  Result := tkProtected;
   else
     Result := tkIdent;
   end;

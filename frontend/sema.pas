@@ -63,6 +63,8 @@ type
     procedure ComputeStructLayouts;
     // Class layout
     procedure ComputeClassLayouts;
+    // Member access control
+    procedure CheckMemberAccess(const memberName: string; memberClass: TAstClassDecl; visibility: TVisibility; span: TSourceSpan);
     // AST rewrite helpers
     function RewriteExpr(expr: TAstExpr): TAstExpr;
     function RewriteStmt(stmt: TAstStmt): TAstStmt;
@@ -437,6 +439,8 @@ var
   fName: string;
   found: Boolean;
   fldType: TAurumType;
+  fldVisibility: TVisibility;
+  fldOwnerClass: TAstClassDecl;
   recv: TAstExpr;
   mName: string;
   mangledName: string;
@@ -476,6 +480,8 @@ begin
               fName := TAstFieldAccess(expr).Field;
               found := False;
               fldType := atUnresolved;
+              fldVisibility := visPublic; // Struct fields are always public
+              fldOwnerClass := nil; // No class for structs
               for fi := 0 to High(sSym.StructDecl.Fields) do
               begin
                 if sSym.StructDecl.Fields[fi].Name = fName then
@@ -489,6 +495,7 @@ begin
                 FDiag.Error('unknown field ' + fName + ' in type ' + sSym.StructDecl.Name, expr.Span)
               else
               begin
+                // Struct fields are always accessible
                 Result := fldType;
                 // annotate AST node with offset + owner
                 if expr is TAstFieldAccess then
@@ -507,6 +514,8 @@ begin
               fName := TAstFieldAccess(expr).Field;
               found := False;
               fldType := atUnresolved;
+              fldVisibility := visPublic;
+              fldOwnerClass := sSym.ClassDecl;
               
               // Walk up the class hierarchy
               cd := sSym.ClassDecl;
@@ -518,6 +527,8 @@ begin
                   begin
                     found := True;
                     fldType := cd.Fields[fi].FieldType;
+                    fldVisibility := cd.Fields[fi].Visibility;
+                    fldOwnerClass := cd;
                     // Calculate absolute field offset (base class size + local offset)
                     if cd = sSym.ClassDecl then
                       fldOffset := cd.FieldOffsets[fi]
@@ -548,6 +559,9 @@ begin
                 FDiag.Error('unknown field ' + fName + ' in class ' + sSym.ClassDecl.Name, expr.Span)
               else
               begin
+                // Check visibility before allowing access
+                CheckMemberAccess(fName, fldOwnerClass, fldVisibility, expr.Span);
+                
                 Result := fldType;
                 // annotate AST node with offset + owner
                 if expr is TAstFieldAccess then
@@ -1547,6 +1561,76 @@ begin
     sd := TAstStructDecl(FStructTypes.Objects[i]);
     if sd.Size = 0 then
       FDiag.Error('cannot compute layout for struct: ' + sd.Name, sd.Span);
+  end;
+end;
+
+{ --- Member Access Control --- }
+
+procedure TSema.CheckMemberAccess(const memberName: string; memberClass: TAstClassDecl; visibility: TVisibility; span: TSourceSpan);
+var
+  currentClassName: string;
+  inSubclass: Boolean;
+  baseIdx: Integer;
+  baseClass: TAstClassDecl;
+begin
+  // Public is always accessible
+  if visibility = visPublic then
+    Exit;
+    
+  // If no current class context, private/protected are not accessible
+  if not Assigned(FCurrentClass) then
+  begin
+    case visibility of
+      visPrivate:
+        FDiag.Error(Format('private member %s cannot be accessed from outside the class', [memberName]), span);
+      visProtected:
+        FDiag.Error(Format('protected member %s cannot be accessed from outside the class or a subclass', [memberName]), span);
+    end;
+    Exit;
+  end;
+  
+  currentClassName := FCurrentClass.Name;
+  
+  // Check access from same class
+  if currentClassName = memberClass.Name then
+    Exit; // Same class - all access allowed
+    
+  // For protected: check if current class is a subclass of member's class
+  if visibility = visProtected then
+  begin
+    inSubclass := False;
+    baseClass := FCurrentClass;
+    while Assigned(baseClass) do
+    begin
+      if baseClass.Name = memberClass.Name then
+      begin
+        inSubclass := True;
+        Break;
+      end;
+      if baseClass.BaseClassName <> '' then
+      begin
+        baseIdx := FClassTypes.IndexOf(baseClass.BaseClassName);
+        if baseIdx >= 0 then
+          baseClass := TAstClassDecl(FClassTypes.Objects[baseIdx])
+        else
+          baseClass := nil;
+      end
+      else
+        baseClass := nil;
+    end;
+    
+    if inSubclass then
+      Exit; // Protected access allowed from subclass
+  end;
+  
+  // All other cases: access denied
+  case visibility of
+    visPrivate:
+      FDiag.Error(Format('private member %s of class %s cannot be accessed from class %s', 
+        [memberName, memberClass.Name, currentClassName]), span);
+    visProtected:
+      FDiag.Error(Format('protected member %s of class %s cannot be accessed from class %s (not a subclass)', 
+        [memberName, memberClass.Name, currentClassName]), span);
   end;
 end;
 

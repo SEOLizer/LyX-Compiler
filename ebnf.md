@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected`
 
 ### Operatoren / Trennzeichen
 
@@ -289,14 +289,21 @@ ArrayType      := 'array' ;                      // Stack-allokiertes Array
                  | '[' IntLit ']' Type ;          // z.B. [4]f64 (geplant)
 
 StructType     := 'struct' '{' { StructMember } '}' ;
-StructMember   := FieldDecl | MethodDecl ;
+StructMember   := [ Visibility ] ( FieldDecl | MethodDecl ) ;
+Visibility     := 'pub' | 'private' | 'protected' ;
 FieldDecl      := Ident ':' Type ';' ;
 MethodDecl     := [ 'static' ] 'fn' Ident '(' [ ParamList ] ')' [ ':' RetType ] Block ;
 
 ClassType      := 'class' [ 'extends' Ident ] '{' { ClassMember } '}' ;
-ClassMember    := FieldDecl | MethodDecl | ConstructorDecl | DestructorDecl ;
+ClassMember    := [ Visibility ] ( FieldDecl | MethodDecl | ConstructorDecl | DestructorDecl ) ;
 ConstructorDecl := 'fn' 'Create' '(' [ ParamList ] ')' Block ;
 DestructorDecl  := 'fn' 'Destroy' '(' ')' Block ;
+
+> Hinweis: Sichtbarkeit (Visibility) kann für Felder und Methoden angegeben werden:
+> - `pub` (Standard): Überall zugänglich
+> - `private`: Nur innerhalb der eigenen Klasse zugänglich
+> - `protected`: Innerhalb der eigenen Klasse und in abgeleiteten Klassen zugänglich
+> Wird keine Visibility angegeben, gilt `pub` als Standard.
 
 > Hinweis: Der implizite Parameter `self` ist nicht Teil von `ParamList`.
 > Statische Methoden mit 'static' haben keinen self-Parameter.

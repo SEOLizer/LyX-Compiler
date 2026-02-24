@@ -1,5 +1,30 @@
 # Changelog - Lyx Compiler
 
+## Version 0.4.1 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Access Control (Sichtbarkeit) für Klassen-Member**
+Private, Protected und Public Member für Klassen und Structs:
+
+- **`pub`**: Überall zugänglich (Standard)
+- **`private`**: Nur innerhalb der eigenen Klasse zugänglich
+- **`protected`**: In der eigenen Klasse und in abgeleiteten Klassen zugänglich
+
+**Beispiel:**
+```lyx
+type MyClass = class {
+  pub pubField: int64;           // Überall zugänglich
+  private privField: int64;       // Nur in der Klasse
+  protected protField: int64;    // In Klasse und Subklassen
+  
+  pub fn pubMethod() { }
+  private fn privMethod() { }
+};
+```
+
+---
+
 ## Version 0.4.0 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
