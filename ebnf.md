@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false extern unit import pub as array struct class extends new dispose super static self Self`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self`
 
 ### Operatoren / Trennzeichen
 
@@ -54,8 +54,23 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 * `f32`, `f64`  (Floating-Point Typen: 32-bit und 64-bit)
 * `bool`   (`true` / `false`)
 * `void`   (nur als Funktionsrückgabetyp)
-* `pchar`  (Pointer, 64-bit; bei Stringliteralen: Adresse auf nullterminierte Bytes)
+* `pchar`  (Pointer, 64-bit; non-nullable, Standard für Stringliterale)
+* `pchar?` (Nullable Pointer, kann `null` sein)
 * `array`  (Array-Typ für Stack-allokierte Arrays)
+
+### Nullable Typen (v0.4.0)
+
+Pointer-Typen können als nullable markiert werden mit `?`:
+
+```lyx
+var p: pchar? := null;    // nullable Pointer, kann null sein
+var q: pchar;              // non-nullable Pointer (Standard)
+var r: pchar := p ?? "fallback";  // Null-Coalescing
+```
+
+- `pchar` ist standardmäßig non-nullable
+- `pchar?` ist nullable und kann `null` enthalten
+- Der `??` Operator wandelt nullable zu non-nullable um
 
 ### Namensregeln
 

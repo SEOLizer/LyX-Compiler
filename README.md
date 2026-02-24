@@ -4,7 +4,7 @@
 Er erzeugt direkt ausführbare **Linux x86_64 ELF64-**, **Linux ARM64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
 
 ```
-Lyx Compiler v0.2.0
+Lyx Compiler v0.4.0
 Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 
 ✅ Vollständiges Module System mit Import/Export
@@ -18,6 +18,8 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 ✅ Random/RandomSeed Builtins
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
 ✅ Debugging: --emit-asm und --dump-relocs Flags
+✅ CLI-Argumente (argc/argv) im statischen ELF
+✅ Option Types: Nullable Pointer (pchar?) mit Null-Coalescing (??)
 ```
 
 ---

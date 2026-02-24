@@ -1,5 +1,33 @@
 # Changelog - Lyx Compiler
 
+## Version 0.4.0 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Option Types / Nullable Pointer**
+Statische Typprüfung für Pointer-Sicherheit zur Kompilierzeit:
+
+- **Nullable Typen**: `pchar?` kann `null` sein
+- **Non-nullable Typen**: `pchar` darf nicht `null` sein (Standard)
+- **Null-Coalescing**: `??` Operator für sichere Dereferenzierung
+- **null Keyword**: Explizite Null-Zuweisung
+
+**Beispiel:**
+```lyx
+var p: pchar? := null;    // nullable Pointer
+var q: pchar;              // non-nullable Pointer (Standard)
+var r: pchar := p ?? "default";  // sicherer Zugriff
+```
+
+#### **CLI-Argumente im statischen ELF**
+Statische ELF-Binaries unterstützen jetzt CLI-Argumente:
+
+- `main(argc: int64, argv: pchar)` wird nach SysV ABI aufgerufen
+- argc: Anzahl der Argumente (inkl. Programmname)
+- argv: Array der Argument-Strings
+
+---
+
 ## Version 0.3.1 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
