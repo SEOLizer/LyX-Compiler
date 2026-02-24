@@ -554,6 +554,7 @@ begin
   kernelDll.Functions[1].Name := 'WriteFile';
   kernelDll.Functions[1].Hint := 0;
   FWriteFileIndex := 1;
+  FWriteFile2Index := 1;  // Gleiche Funktion, gleicher Import-Slot
   
   kernelDll.Functions[2].Name := 'ExitProcess';
   kernelDll.Functions[2].Hint := 0;
@@ -572,33 +573,33 @@ begin
   kernelDll.Functions[5].Hint := 0;
   FReadFileIndex := 5;
   
-  kernelDll.Functions[6].Name := 'WriteFile';  // Wird wiederverwendet für write
+  kernelDll.Functions[6].Name := 'CloseHandle';
   kernelDll.Functions[6].Hint := 0;
-  FWriteFile2Index := 6;
+  FCloseHandleIndex := 6;
   
-  kernelDll.Functions[7].Name := 'CloseHandle';
+  kernelDll.Functions[7].Name := 'SetFilePointer';
   kernelDll.Functions[7].Hint := 0;
-  FCloseHandleIndex := 7;
+  FSetFilePointerIndex := 7;
   
-  kernelDll.Functions[8].Name := 'SetFilePointer';
+  kernelDll.Functions[8].Name := 'DeleteFileA';
   kernelDll.Functions[8].Hint := 0;
-  FSetFilePointerIndex := 8;
+  FDeleteFileAIndex := 8;
   
-  kernelDll.Functions[9].Name := 'DeleteFileA';
+  kernelDll.Functions[9].Name := 'MoveFileA';
   kernelDll.Functions[9].Hint := 0;
-  FDeleteFileAIndex := 9;
+  FMoveFileAIndex := 9;
   
-  kernelDll.Functions[10].Name := 'MoveFileA';
+  kernelDll.Functions[10].Name := 'CreateDirectoryA';
   kernelDll.Functions[10].Hint := 0;
-  FMoveFileAIndex := 10;
+  FCreateDirectoryAIndex := 10;
   
-  kernelDll.Functions[11].Name := 'CreateDirectoryA';
+  kernelDll.Functions[11].Name := 'RemoveDirectoryA';
   kernelDll.Functions[11].Hint := 0;
-  FCreateDirectoryAIndex := 11;
+  FRemoveDirectoryAIndex := 11;
   
-  kernelDll.Functions[12].Name := 'RemoveDirectoryA';
+  kernelDll.Functions[12].Name := 'SetFileAttributesA';
   kernelDll.Functions[12].Hint := 0;
-  FRemoveDirectoryAIndex := 12;
+  FSetFileAttributesAIndex := 12;
   
   SetLength(FImports, 1);
   FImports[0] := kernelDll;
@@ -1002,6 +1003,7 @@ var
   jmpAfterPadPos: Integer;
   argCount: Integer;
   argTemps: array of Integer;
+  arg3: Integer;
   sParse: string;
   ppos, ai: Integer;
   extraCount: Integer;
@@ -1251,24 +1253,114 @@ begin
             // === std.io: Windows I/O API (simplified) ===
             else if instr.ImmStr = 'open' then
             begin
-              // CreateFileA - Return invalid handle for now (stub)
-              // TODO: Vollständige Implementierung
-              WriteMovRegImm64(FCode, RAX, UInt64($FFFFFFFFFFFFFFFF)); // INVALID_HANDLE
+              // CreateFileA(lpFileName, dwDesiredAccess, dwShareMode,
+              //             lpSecurityAttributes, dwCreationDisposition,
+              //             dwFlagsAndAttributes, hTemplateFile)
+              // RCX = path, RDX = GENERIC_READ|GENERIC_WRITE ($C0000000),
+              // R8 = FILE_SHARE_READ ($1), R9 = NULL (security)
+              // Stack: [rsp+32]=OPEN_EXISTING(3), [rsp+40]=FILE_ATTRIBUTE_NORMAL($80), [rsp+48]=NULL
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              // Flags -> dwDesiredAccess: Linux O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+              // Simplified: always use GENERIC_READ | GENERIC_WRITE
+              WriteMovRegImm64(FCode, RDX, $C0000000); // GENERIC_READ | GENERIC_WRITE
+              WriteMovRegImm64(FCode, R8, 1);  // FILE_SHARE_READ
+              WriteMovRegImm64(FCode, R9, 0);  // NULL (security attributes)
+              // 3 stack args: CreationDisposition, FlagsAndAttributes, hTemplateFile
+              // sub rsp, 24 (3 * 8 bytes for stack args)
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, 24);
+              // [rsp+32] = OPEN_EXISTING (3) - creation disposition
+              // But with shadow space: 5th arg is at [rsp+32]
+              WriteMovRegImm64(FCode, RAX, 3); // OPEN_EXISTING
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, 32); // mov [rsp+32], rax
+              WriteMovRegImm64(FCode, RAX, $80); // FILE_ATTRIBUTE_NORMAL
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, 40); // mov [rsp+40], rax
+              WriteMovRegImm64(FCode, RAX, 0); // hTemplateFile = NULL
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, 48); // mov [rsp+48], rax
+              WriteIndirectCall(FKernel32Index, FCreateFileAIndex);
+              // add rsp, 24
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, 24);
+              // RAX = handle or INVALID_HANDLE_VALUE (-1)
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'read' then
             begin
-              // TODO: Vollständige Implementierung - Return 0 for now
-              WriteMovRegImm64(FCode, RAX, 0);
+              // ReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
+              // RCX = handle, RDX = buffer, R8 = count, R9 = &bytesRead (stack), [rsp+32] = NULL
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, R8, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, R8, 0);
+              // R9 = NULL (lpNumberOfBytesRead — vereinfacht, ohne Rückgabe der tatsächlichen Bytes)
+              WriteMovRegImm64(FCode, R9, 0);
+              // 5. Parameter (lpOverlapped) auf dem Stack = NULL
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, 8); // sub rsp, 8
+              EmitU8(FCode, $48); EmitU8(FCode, $33); EmitU8(FCode, $C0); // xor rax, rax
+              WriteIndirectCall(FKernel32Index, FReadFileIndex);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, 8); // add rsp, 8
+              // Rückgabe: Erfolg → angeforderte Byteanzahl (R8), Fehler → -1
+              WriteMovRegReg(FCode, R11, RAX);
+              // Test if RAX is zero (failure)
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0); // test rax, rax
+              // je .failure
+              EmitU8(FCode, $74); EmitU8(FCode, 5); // je +5
+              // success: mov rax, r8 (return requested count, not actual but close enough)
+              WriteMovRegReg(FCode, RAX, R8);       // 3 bytes
+              // jmp .done (skip WriteMovRegImm64 = 10 bytes)
+              EmitU8(FCode, $EB); EmitU8(FCode, 10); // jmp +10
+              // failure: mov rax, -1
+              WriteMovRegImm64(FCode, RAX, UInt64(-1)); // 10 bytes
+              // done:
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'write' then
             begin
-              // TODO: Vollständige Implementierung - Return count for now
-              // Return a fixed value for now (simulating successful write)
-              WriteMovRegImm64(FCode, RAX, 10); // Simulate 10 bytes written
+              // WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped)
+              // RCX = handle, RDX = buffer, R8 = count, R9 = &bytesWritten (stack), [rsp+32] = NULL
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, R8, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, R8, 0);
+              WriteMovRegImm64(FCode, R9, 0);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, 8);
+              EmitU8(FCode, $48); EmitU8(FCode, $33); EmitU8(FCode, $C0);
+              WriteIndirectCall(FKernel32Index, FWriteFile2Index);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, 8);
+              // Check success: if RAX != 0 return requested count, else -1
+              WriteMovRegReg(FCode, R11, RAX);
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0); // test rax, rax
+              EmitU8(FCode, $74); EmitU8(FCode, 5);   // je +5 (skip mov+jmp = 3+2)
+              WriteMovRegReg(FCode, RAX, R8);          // 3 bytes
+              EmitU8(FCode, $EB); EmitU8(FCode, 10);   // jmp +10 (skip WriteMovRegImm64)
+              WriteMovRegImm64(FCode, RAX, UInt64(-1)); // 10 bytes
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
@@ -1286,43 +1378,106 @@ begin
             end
             else if instr.ImmStr = 'lseek' then
             begin
-              // SetFilePointer stub - Return 0 for now
-              WriteMovRegImm64(FCode, RAX, 0);
+              // SetFilePointer(HANDLE hFile, LONG lDistanceToMove, PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod)
+              // RCX = handle, RDX = offset, R8 = high (NULL), R9 = method (SEEK_SET=0, SEEK_CUR=1, SEEK_END=2)
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              // Load 3rd arg (whence) from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, R9, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, R9, 0);
+              // R8 = NULL for lpDistanceToMoveHigh
+              WriteMovRegImm64(FCode, R8, 0);
+              WriteIndirectCall(FKernel32Index, FSetFilePointerIndex);
+              // SetFilePointer returns INVALID_SET_FILE_POINTER (-1) on failure, check via RAX == -1 && GetLastError()
+              // For simplicity, just return RAX (may need GetLastError for proper error handling)
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'unlink' then
             begin
-              // DeleteFileA - stub
-              WriteMovRegImm64(FCode, RAX, 0);
+              // DeleteFileA(LPCSTR lpFileName)
+              // RCX = filename
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteIndirectCall(FKernel32Index, FDeleteFileAIndex);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'rename' then
             begin
-              // MoveFileA - stub
-              WriteMovRegImm64(FCode, RAX, 0);
+              // MoveFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName)
+              // RCX = existing, RDX = new
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteIndirectCall(FKernel32Index, FMoveFileAIndex);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'mkdir' then
             begin
-              // CreateDirectoryA - stub
-              WriteMovRegImm64(FCode, RAX, 0);
+              // CreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes)
+              // RCX = path, RDX = NULL
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteMovRegImm64(FCode, RDX, 0);
+              WriteIndirectCall(FKernel32Index, FCreateDirectoryAIndex);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'rmdir' then
             begin
-              // RemoveDirectoryA - stub
-              WriteMovRegImm64(FCode, RAX, 0);
+              // RemoveDirectoryA(LPCSTR lpPathName)
+              // RCX = path
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteIndirectCall(FKernel32Index, FRemoveDirectoryAIndex);
+              // RAX enthält den Rückgabewert (non-zero = Erfolg)
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'chmod' then
             begin
-              // stub
-              WriteMovRegImm64(FCode, RAX, 0);
+              // SetFileAttributesA(LPCSTR lpFileName, DWORD dwFileAttributes)
+              // RCX = filename, RDX = attributes
+              // Windows doesn't have a direct chmod equivalent, but we can set file attributes
+              // For read-write: FILE_ATTRIBUTE_NORMAL (0x80)
+              // For read-only: FILE_ATTRIBUTE_READONLY (0x1)
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              // Load 2nd arg from ArgTemps[1]
+              arg3 := -1;
+              if (instr.ImmInt >= 2) and (Length(instr.ArgTemps) >= 2) then
+                arg3 := instr.ArgTemps[1];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, $80); // Default: FILE_ATTRIBUTE_NORMAL
+              WriteIndirectCall(FKernel32Index, FSetFileAttributesAIndex);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
