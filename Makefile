@@ -1,5 +1,5 @@
 FPC      = fpc
-FPCFLAGS = -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/
+FPCFLAGS = -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/
 
 # Release-Flags
 RELEASE_FLAGS = -O2
@@ -36,6 +36,11 @@ syntax-test:
 	@tests/syntax/test_grammar.sh
 
 tests/test_%: tests/test_%.pas
+	@mkdir -p lib
+	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) $< -o$@
+
+# Integration test for std library (non-FPCUnit)
+tests/test_std_examples: tests/test_std_examples.pas
 	@mkdir -p lib
 	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) $< -o$@
 

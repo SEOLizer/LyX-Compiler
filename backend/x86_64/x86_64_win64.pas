@@ -22,6 +22,18 @@ type
     FExitProcessIndex: Integer;
     FVirtualAllocIndex: Integer;  // For heap allocation
     
+    // Windows I/O API Indices
+    FCreateFileAIndex: Integer;
+    FReadFileIndex: Integer;
+    FWriteFile2Index: Integer;
+    FCloseHandleIndex: Integer;
+    FSetFilePointerIndex: Integer;
+    FDeleteFileAIndex: Integer;
+    FMoveFileAIndex: Integer;
+    FCreateDirectoryAIndex: Integer;
+    FRemoveDirectoryAIndex: Integer;
+    FSetFileAttributesAIndex: Integer;
+    
     // Random LCG State (offset in .data)
     FRandomSeedOffset: Integer;
     
@@ -503,6 +515,17 @@ begin
   FWriteFileIndex := -1;
   FExitProcessIndex := -1;
   FVirtualAllocIndex := -1;
+  // Windows I/O API
+  FCreateFileAIndex := -1;
+  FReadFileIndex := -1;
+  FWriteFile2Index := -1;
+  FCloseHandleIndex := -1;
+  FSetFilePointerIndex := -1;
+  FDeleteFileAIndex := -1;
+  FMoveFileAIndex := -1;
+  FCreateDirectoryAIndex := -1;
+  FRemoveDirectoryAIndex := -1;
+  FSetFileAttributesAIndex := -1;
   FRandomSeedOffset := -1;
   FEntryOffset := 0;
   FStartMainCallPos := 0;
@@ -522,7 +545,7 @@ var
 begin
   // Setup kernel32.dll imports
   kernelDll.DllName := 'kernel32.dll';
-  SetLength(kernelDll.Functions, 4);
+  SetLength(kernelDll.Functions, 13);
   
   kernelDll.Functions[0].Name := 'GetStdHandle';
   kernelDll.Functions[0].Hint := 0;
@@ -539,6 +562,43 @@ begin
   kernelDll.Functions[3].Name := 'VirtualAlloc';
   kernelDll.Functions[3].Hint := 0;
   FVirtualAllocIndex := 3;
+  
+  // Windows I/O API
+  kernelDll.Functions[4].Name := 'CreateFileA';
+  kernelDll.Functions[4].Hint := 0;
+  FCreateFileAIndex := 4;
+  
+  kernelDll.Functions[5].Name := 'ReadFile';
+  kernelDll.Functions[5].Hint := 0;
+  FReadFileIndex := 5;
+  
+  kernelDll.Functions[6].Name := 'WriteFile';  // Wird wiederverwendet für write
+  kernelDll.Functions[6].Hint := 0;
+  FWriteFile2Index := 6;
+  
+  kernelDll.Functions[7].Name := 'CloseHandle';
+  kernelDll.Functions[7].Hint := 0;
+  FCloseHandleIndex := 7;
+  
+  kernelDll.Functions[8].Name := 'SetFilePointer';
+  kernelDll.Functions[8].Hint := 0;
+  FSetFilePointerIndex := 8;
+  
+  kernelDll.Functions[9].Name := 'DeleteFileA';
+  kernelDll.Functions[9].Hint := 0;
+  FDeleteFileAIndex := 9;
+  
+  kernelDll.Functions[10].Name := 'MoveFileA';
+  kernelDll.Functions[10].Hint := 0;
+  FMoveFileAIndex := 10;
+  
+  kernelDll.Functions[11].Name := 'CreateDirectoryA';
+  kernelDll.Functions[11].Hint := 0;
+  FCreateDirectoryAIndex := 11;
+  
+  kernelDll.Functions[12].Name := 'RemoveDirectoryA';
+  kernelDll.Functions[12].Hint := 0;
+  FRemoveDirectoryAIndex := 12;
   
   SetLength(FImports, 1);
   FImports[0] := kernelDll;
@@ -1187,6 +1247,84 @@ begin
               else
                 WriteMovRegImm64(FCode, RCX, 0);
               WriteIndirectCall(FKernel32Index, FExitProcessIndex);
+            end
+            // === std.io: Windows I/O API (simplified) ===
+            else if instr.ImmStr = 'open' then
+            begin
+              // CreateFileA - Return invalid handle for now (stub)
+              // TODO: Vollständige Implementierung
+              WriteMovRegImm64(FCode, RAX, UInt64($FFFFFFFFFFFFFFFF)); // INVALID_HANDLE
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'read' then
+            begin
+              // TODO: Vollständige Implementierung - Return 0 for now
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'write' then
+            begin
+              // TODO: Vollständige Implementierung - Return count for now
+              // Return a fixed value for now (simulating successful write)
+              WriteMovRegImm64(FCode, RAX, 10); // Simulate 10 bytes written
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'close' then
+            begin
+              // CloseHandle(handle) -> bool
+              // RCX = handle
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RCX, 0);
+              WriteIndirectCall(FKernel32Index, FCloseHandleIndex);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'lseek' then
+            begin
+              // SetFilePointer stub - Return 0 for now
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'unlink' then
+            begin
+              // DeleteFileA - stub
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'rename' then
+            begin
+              // MoveFileA - stub
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'mkdir' then
+            begin
+              // CreateDirectoryA - stub
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'rmdir' then
+            begin
+              // RemoveDirectoryA - stub
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'chmod' then
+            begin
+              // stub
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'Random' then
             begin

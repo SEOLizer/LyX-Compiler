@@ -58,5 +58,27 @@ begin
     lines.Free;
   end;
 
-  Writeln('std examples ok');
+   // Test IO functions (open, write, read, close)
+   r := RunCapture('./lyxc examples/io_test.lyx -o /tmp/io_test', txt);
+   if r <> 0 then Halt(11);
+   r := RunCapture('/tmp/io_test', outp);
+   if r <> 0 then Halt(12); // Should return 0 on success
+    if outp <> 'Gelesen: Hello Lyx IO!\n' then
+    begin
+      Writeln('IO Test Output: ', outp);
+      Halt(13);
+    end;
+
+   // Test advanced IO functions (lseek, mkdir, rmdir, rename)
+   r := RunCapture('./lyxc examples/io_advanced.lyx -o /tmp/io_advanced', txt);
+   if r <> 0 then Halt(14);
+   r := RunCapture('/tmp/io_advanced', outp);
+   if r <> 0 then Halt(15);
+   if Pos('Alle erweiterten IO-Tests bestanden!', outp) = 0 then
+   begin
+     Writeln('IO Advanced Test Output: ', outp);
+     Halt(16);
+   end;
+
+   Writeln('std examples ok');
 end.
