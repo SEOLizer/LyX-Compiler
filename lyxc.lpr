@@ -17,6 +17,8 @@ var
   inputFile: string;
   outputFile: string;
   target: TTarget;
+  flagEmitAsm: Boolean;
+  flagDumpRelocs: Boolean;
   src: TStringList;
   d: TDiagnostics;
   lx: TLexer;
@@ -34,11 +36,128 @@ var
   basePath: string;
   externSymbols: TExternalSymbolArray;
   neededLibs: array of string;
-  i: Integer;
+  pltPatches: TPLTGOTPatchArray;
+  i, j: Integer;
   param: string;
 
 type
   TStringArray = array of string;
+
+procedure DumpIRAsAsm(m: TIRModule);
+var
+  fi, ii, sidx: Integer;
+  fn: TIRFunction;
+  ins: TIRInstr;
+  opName: string;
+  argStr: string;
+  ai: Integer;
+begin
+  WriteLn('; === Lyx IR Pseudo-Assembly ===');
+  WriteLn('; Strings: ', m.Strings.Count);
+  for fi := 0 to m.Strings.Count - 1 do
+    WriteLn(';   .str', fi, ': "', m.Strings[fi], '"');
+  WriteLn('; Globals: ', Length(m.GlobalVars));
+  for fi := 0 to High(m.GlobalVars) do
+    WriteLn(';   .global ', m.GlobalVars[fi].Name, ' = ', m.GlobalVars[fi].InitValue);
+  WriteLn;
+
+  for fi := 0 to High(m.Functions) do
+  begin
+    fn := m.Functions[fi];
+    WriteLn(fn.Name, ':  ; params=', fn.ParamCount, ' locals=', fn.LocalCount);
+    for ii := 0 to High(fn.Instructions) do
+    begin
+      ins := fn.Instructions[ii];
+      WriteStr(opName, ins.Op);
+      Write('  ', opName);
+      case ins.Op of
+        irConstInt: WriteLn(' t', ins.Dest, ', ', ins.ImmInt);
+        irConstStr: begin
+          sidx := StrToIntDef(ins.ImmStr, -1);
+          if (sidx >= 0) and (sidx < m.Strings.Count) then
+            WriteLn(' t', ins.Dest, ', .str', sidx, '  ; "', m.Strings[sidx], '"')
+          else
+            WriteLn(' t', ins.Dest, ', "', ins.ImmStr, '"');
+        end;
+        irConstFloat: WriteLn(' t', ins.Dest, ', ', ins.ImmFloat:0:6);
+        irAdd, irSub, irMul, irDiv, irMod:
+          WriteLn(' t', ins.Dest, ', t', ins.Src1, ', t', ins.Src2);
+        irFAdd, irFSub, irFMul, irFDiv:
+          WriteLn(' t', ins.Dest, ', t', ins.Src1, ', t', ins.Src2);
+        irNeg, irFNeg, irNot:
+          WriteLn(' t', ins.Dest, ', t', ins.Src1);
+        irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe:
+          WriteLn(' t', ins.Dest, ', t', ins.Src1, ', t', ins.Src2);
+        irLoadLocal: WriteLn(' t', ins.Dest, ', [local', ins.Src1, ']');
+        irStoreLocal: WriteLn(' [local', ins.Dest, '], t', ins.Src1);
+        irLoadGlobal: WriteLn(' t', ins.Dest, ', [', ins.ImmStr, ']');
+        irStoreGlobal: WriteLn(' [', ins.ImmStr, '], t', ins.Src1);
+        irJmp: WriteLn(' ', ins.LabelName);
+        irBrTrue: WriteLn(' t', ins.Src1, ', ', ins.LabelName);
+        irBrFalse: WriteLn(' t', ins.Src1, ', ', ins.LabelName);
+        irLabel: WriteLn(' ', ins.LabelName, ':');
+        irReturn: begin
+          if ins.Src1 >= 0 then WriteLn(' t', ins.Src1)
+          else WriteLn;
+        end;
+        irCall, irCallBuiltin, irCallStruct: begin
+          argStr := '';
+          for ai := 0 to High(ins.ArgTemps) do
+          begin
+            if ai > 0 then argStr := argStr + ', ';
+            argStr := argStr + 't' + IntToStr(ins.ArgTemps[ai]);
+          end;
+          if ins.Dest >= 0 then
+            Write(' t', ins.Dest, ' = ')
+          else
+            Write(' ');
+          Write(ins.ImmStr, '(', argStr, ')');
+          case ins.CallMode of
+            cmInternal: WriteLn('  ; internal');
+            cmImported: WriteLn('  ; imported');
+            cmExternal: WriteLn('  ; EXTERN');
+          end;
+        end;
+        irAlloc: WriteLn(' t', ins.Dest, ', ', ins.ImmInt, ' bytes');
+        irFree: WriteLn(' t', ins.Src1);
+        irSExt, irZExt, irTrunc: WriteLn(' t', ins.Dest, ', t', ins.Src1, ', ', ins.ImmInt, 'bit');
+        irCast: WriteLn(' t', ins.Dest, ', t', ins.Src1);
+        irIToF: WriteLn(' t', ins.Dest, ', t', ins.Src1);
+        irFToI: WriteLn(' t', ins.Dest, ', t', ins.Src1);
+      else
+        WriteLn(' d=', ins.Dest, ' s1=', ins.Src1, ' s2=', ins.Src2,
+                ' imm=', ins.ImmInt, ' str=', ins.ImmStr, ' lbl=', ins.LabelName);
+      end;
+    end;
+    WriteLn;
+  end;
+end;
+
+procedure DumpRelocs(e: TX86_64Emitter);
+var
+  syms: TExternalSymbolArray;
+  patches: TPLTGOTPatchArray;
+  i: Integer;
+begin
+  syms := e.GetExternalSymbols;
+  patches := e.GetPLTGOTPatches;
+
+  WriteLn('; === Relocation Dump ===');
+  WriteLn('; External Symbols: ', Length(syms));
+  for i := 0 to High(syms) do
+    WriteLn(';   [', i, '] ', syms[i].Name, ' from "', syms[i].LibraryName, '"');
+
+  WriteLn('; PLT/GOT Patches: ', Length(patches));
+  for i := 0 to High(patches) do
+    WriteLn(';   [', i, '] pos=0x', IntToHex(patches[i].Pos, 4),
+            ' sym=', patches[i].SymbolName,
+            ' idx=', patches[i].SymbolIndex);
+
+  if Length(syms) = 0 then
+    WriteLn('; -> Static ELF (no dynamic linking needed)')
+  else
+    WriteLn('; -> Dynamic ELF (', Length(syms), ' external symbols)');
+end;
 
 function CollectLibraries(const symbols: TExternalSymbolArray): TStringArray;
 var
@@ -80,13 +199,17 @@ begin
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64]');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
-    WriteLn(StdErr, '  -o <datei>     Ausgabedatei (Standard: a.out bzw. a.exe)');
-    WriteLn(StdErr, '  --target=TARGET Zielplattform (win64, linux oder arm64)');
+    WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
+    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux oder arm64)');
+    WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
+    WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
     Halt(1);
   end;
 
   inputFile := '';
   outputFile := '';
+  flagEmitAsm := False;
+  flagDumpRelocs := False;
 
   // Parse command line arguments
   i := 1;
@@ -114,6 +237,16 @@ begin
         WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64');
         Halt(1);
       end;
+      Inc(i);
+    end
+    else if param = '--emit-asm' then
+    begin
+      flagEmitAsm := True;
+      Inc(i);
+    end
+    else if param = '--dump-relocs' then
+    begin
+      flagDumpRelocs := True;
       Inc(i);
     end
     else if (param <> '-o') and (Copy(param, 1, 2) <> '--') then
@@ -210,7 +343,13 @@ begin
         lower := TIRLowering.Create(module, d);
         try
           lower.Lower(prog);
-          
+          // Lower imported unit functions into the IR module
+          lower.LowerImportedUnits(um);
+
+          // --emit-asm: Dump IR as pseudo-assembly
+          if flagEmitAsm then
+            DumpIRAsAsm(module);
+
           if target = targetWindows then
           begin
             // Windows x64 Code Generation
@@ -234,6 +373,10 @@ begin
               // Entry point is the generated _start placed at code base + 0x1000
               entryVA := $400000 + 4096;
               
+              // --dump-relocs: show external symbols and PLT patches
+              if flagDumpRelocs then
+                DumpRelocs(emit);
+
               // Check if we have external symbols - if so, generate dynamic ELF
               externSymbols := emit.GetExternalSymbols;
               if Length(externSymbols) > 0 then

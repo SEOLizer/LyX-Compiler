@@ -651,11 +651,13 @@ end;
 procedure TLexerTest.TestSingleEquals;
 var
   l: TLexer;
+  tok: TToken;
 begin
   l := Lex('=');
   try
-    l.NextToken;
-    AssertTrue('Fehler für einzelnes = erwartet', FDiag.HasErrors);
+    tok := l.NextToken;
+    AssertEquals('tkSingleEq erwartet', Ord(tkSingleEq), Ord(tok.Kind));
+    AssertFalse('Kein Fehler für einzelnes = erwartet', FDiag.HasErrors);
   finally
     l.Free;
   end;

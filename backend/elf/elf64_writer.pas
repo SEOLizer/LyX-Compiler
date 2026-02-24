@@ -529,8 +529,8 @@ begin
       for i := 0 to libNames.Count - 1 do
       begin
         dyn.d_tag := DT_NEEDED;
-        // DT_NEEDED requires a pointer to the library name in memory (virtual address)
-        dyn.d_un := dynInfo.dynStrVA + GetStringOffset(strOffsets, libNames[i]);
+        // DT_NEEDED uses an offset into .dynstr (relative to DT_STRTAB start)
+        dyn.d_un := GetStringOffset(strOffsets, libNames[i]);
         dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
       end;
 
@@ -542,6 +542,11 @@ begin
       // DT_PLTRELSZ (size of .rela.plt)
       dyn.d_tag := DT_PLTRELSZ;
       dyn.d_un := relaPltTable.Size;
+      dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
+
+      // DT_PLTREL -> type of PLT relocations (DT_RELA = 7)
+      dyn.d_tag := DT_PLTREL;
+      dyn.d_un := DT_RELA;
       dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
 
       // DT_JMPREL -> .rela.plt VA

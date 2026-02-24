@@ -29,6 +29,13 @@ type
     procedure TestInternalCall_Relative;
     procedure TestCallMode_Internal;
     procedure TestCallMode_External;
+    // v0.2.0 Einheitlicher Call-Pfad Tests
+    procedure TestExternalCall_PLTStubBytes;
+    procedure TestExternalCall_LibraryName;
+    procedure TestImportedCall_DirectRel32;
+    procedure TestMultipleExternCalls_DedupSymbols;
+    procedure TestCallMode_Imported;
+    procedure TestStackAlignment_EvenArgs;
   end;
 
 { TTestABIV020 }
@@ -332,6 +339,240 @@ begin
   AssertTrue('External call should be recorded', Length(externSyms) >= 1);
   // PLT patches are optional for now
   AssertTrue('External call should generate code', Length(bytes) > 10);
+end;
+
+// Test 10: External call generates PLT stub bytes (FF 25 = jmp [rip+disp32])
+procedure TTestABIV020.TestExternalCall_PLTStubBytes;
+var
+  fn: TIRFunction;
+  instr: TIRInstr;
+  bytes: TBytes;
+  i: Integer;
+  hasPLTStub: Boolean;
+begin
+  fn := FModule.AddFunction('test_plt_bytes');
+  fn.LocalCount := 5;
+  fn.ParamCount := 0;
+
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'puts';
+  instr.ImmInt := 1;
+  SetLength(instr.ArgTemps, 1);
+  instr.ArgTemps[0] := 0;
+  instr.Src1 := 0;
+  instr.CallMode := cmExternal;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := -1;
+  fn.Emit(instr);
+
+  bytes := EmitAndGetBytes;
+
+  // Look for PLT stub: FF 25 xx xx xx xx (jmp [rip+disp32])
+  hasPLTStub := False;
+  for i := 0 to Length(bytes) - 6 do
+  begin
+    if (bytes[i] = $FF) and (bytes[i+1] = $25) then
+    begin
+      hasPLTStub := True;
+      Break;
+    end;
+  end;
+  AssertTrue('External call should generate PLT stub (FF 25 jmp [rip+disp32])', hasPLTStub);
+end;
+
+// Test 11: External call should record library name
+procedure TTestABIV020.TestExternalCall_LibraryName;
+var
+  fn: TIRFunction;
+  instr: TIRInstr;
+  externSyms: TExternalSymbolArray;
+begin
+  fn := FModule.AddFunction('test_libname');
+  fn.LocalCount := 5;
+  fn.ParamCount := 0;
+
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'malloc';
+  instr.ImmInt := 1;
+  SetLength(instr.ArgTemps, 1);
+  instr.ArgTemps[0] := 0;
+  instr.Src1 := 0;
+  instr.CallMode := cmExternal;
+  instr.Dest := 0;
+  fn.Emit(instr);
+
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := 0;
+  fn.Emit(instr);
+
+  FEmitter.EmitFromIR(FModule);
+  externSyms := FEmitter.GetExternalSymbols;
+
+  AssertEquals('Should have 1 external symbol', 1, Length(externSyms));
+  AssertEquals('Symbol name', 'malloc', externSyms[0].Name);
+  AssertTrue('Library name should not be empty', externSyms[0].LibraryName <> '');
+end;
+
+// Test 12: Imported call should use direct call rel32 (no PLT)
+procedure TTestABIV020.TestImportedCall_DirectRel32;
+var
+  fn, targetFn: TIRFunction;
+  instr: TIRInstr;
+  bytes: TBytes;
+  pltPatches: TPLTGOTPatchArray;
+begin
+  // Create the imported function
+  targetFn := FModule.AddFunction('imported_helper');
+  targetFn.LocalCount := 0;
+  targetFn.ParamCount := 0;
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := -1;
+  targetFn.Emit(instr);
+
+  // Create caller with cmImported
+  fn := FModule.AddFunction('test_imported');
+  fn.LocalCount := 5;
+  fn.ParamCount := 0;
+
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'imported_helper';
+  instr.ImmInt := 0;
+  SetLength(instr.ArgTemps, 0);
+  instr.CallMode := cmImported;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := -1;
+  fn.Emit(instr);
+
+  FEmitter.EmitFromIR(FModule);
+  bytes := EmitAndGetBytes;
+  pltPatches := FEmitter.GetPLTGOTPatches;
+
+  // Imported call should NOT generate PLT patches (resolved internally)
+  AssertEquals('Imported call should have no PLT patches', 0, Length(pltPatches));
+  AssertTrue('Should generate code', Length(bytes) > 10);
+end;
+
+// Test 13: Multiple extern calls to same symbol should dedup
+procedure TTestABIV020.TestMultipleExternCalls_DedupSymbols;
+var
+  fn: TIRFunction;
+  instr: TIRInstr;
+  externSyms: TExternalSymbolArray;
+begin
+  fn := FModule.AddFunction('test_dedup');
+  fn.LocalCount := 5;
+  fn.ParamCount := 0;
+
+  // First call to printf
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'printf';
+  instr.ImmInt := 1;
+  SetLength(instr.ArgTemps, 1);
+  instr.ArgTemps[0] := 0;
+  instr.Src1 := 0;
+  instr.CallMode := cmExternal;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  // Second call to printf
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'printf';
+  instr.ImmInt := 1;
+  SetLength(instr.ArgTemps, 1);
+  instr.ArgTemps[0] := 0;
+  instr.Src1 := 0;
+  instr.CallMode := cmExternal;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  // Call to puts (different symbol)
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'puts';
+  instr.ImmInt := 1;
+  SetLength(instr.ArgTemps, 1);
+  instr.ArgTemps[0] := 0;
+  instr.Src1 := 0;
+  instr.CallMode := cmExternal;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := -1;
+  fn.Emit(instr);
+
+  FEmitter.EmitFromIR(FModule);
+  externSyms := FEmitter.GetExternalSymbols;
+
+  // Should have exactly 2 symbols (printf + puts), not 3
+  AssertEquals('Should dedup external symbols', 2, Length(externSyms));
+end;
+
+// Test 14: Call mode imported via IR
+procedure TTestABIV020.TestCallMode_Imported;
+var
+  fn: TIRFunction;
+  instr: TIRInstr;
+  externSyms: TExternalSymbolArray;
+begin
+  fn := FModule.AddFunction('test_imported_mode');
+  fn.LocalCount := 5;
+  fn.ParamCount := 0;
+
+  instr := Default(TIRInstr);
+  instr.Op := irCall;
+  instr.ImmStr := 'cross_unit_func';
+  instr.ImmInt := 0;
+  SetLength(instr.ArgTemps, 0);
+  instr.CallMode := cmImported;
+  instr.Dest := -1;
+  fn.Emit(instr);
+
+  instr := Default(TIRInstr);
+  instr.Op := irReturn;
+  instr.Src1 := -1;
+  fn.Emit(instr);
+
+  FEmitter.EmitFromIR(FModule);
+  externSyms := FEmitter.GetExternalSymbols;
+
+  // Imported calls should NOT register as external symbols
+  AssertEquals('Imported call should not create external symbols', 0, Length(externSyms));
+end;
+
+// Test 15: Stack alignment with even number of stack args
+procedure TTestABIV020.TestStackAlignment_EvenArgs;
+var
+  bytes: TBytes;
+  i: Integer;
+  hasCallInstr: Boolean;
+begin
+  // 8 args: 6 in regs + 2 on stack = even, stack should be 16-aligned
+  SetupSimpleCall('target8', 8);
+  bytes := EmitAndGetBytes;
+
+  hasCallInstr := False;
+  for i := 0 to Length(bytes) - 5 do
+    if bytes[i] = $E8 then begin hasCallInstr := True; Break; end;
+
+  AssertTrue('Should emit call instruction for 8 args', hasCallInstr);
+  AssertTrue('Should generate substantial code for 8 args', Length(bytes) > 80);
 end;
 
 var

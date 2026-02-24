@@ -644,11 +644,7 @@ begin
         Result := MakeToken(tkEq, '==', startLine, startCol, 2);
       end
       else
-      begin
-        FDiag.Error('unexpected token, single ''='' is not a valid operator',
-          MakeSpan(startLine, startCol, 1, FFileName));
-        Result := MakeToken(tkError, '=', startLine, startCol, 1);
-      end;
+        Result := MakeToken(tkSingleEq, '=', startLine, startCol, 1);
     end;
 
     '!': begin
