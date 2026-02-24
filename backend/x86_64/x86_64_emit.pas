@@ -583,6 +583,7 @@ begin
   end;
 
   // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
+  // Nach SysV ABI: RDI = argc, RSI = argv
   begin
     // Reserve env data in data segment (16 bytes: argc,qword + argv_ptr,qword)
     if not envAdded then
@@ -593,20 +594,11 @@ begin
       envAdded := True;
     end;
 
-    // Load argc from [rsp] into RAX
-    WriteMovRegMem(FCode, RAX, RSP, 0);
-    // lea rsi, [rip + disp32] ; patch later
-    leaPos := FCode.Size;
-    EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
-    SetLength(envLeaPositions, Length(envLeaPositions) + 1);
-    envLeaPositions[High(envLeaPositions)] := leaPos;
-    // store argc at [rsi]
-    WriteMovMemReg(FCode, RSI, 0, RAX);
+    // Load argc from [rsp] into RDI (erstes Argument nach SysV ABI)
+    WriteMovRegMem(FCode, RDI, RSP, 0);
 
-    // load argv ptr from [rsp+8] into RAX
-    WriteMovRegMem(FCode, RAX, RSP, 8);
-    // store argv ptr at [rsi+8]
-    WriteMovMemReg(FCode, RSI, 8, RAX);
+    // Load argv from [rsp+8] into RSI (zweites Argument nach SysV ABI)
+    WriteMovRegMem(FCode, RSI, RSP, 8);
 
     // call main (patched later)
     SetLength(FJumpPatches, Length(FJumpPatches) + 1);

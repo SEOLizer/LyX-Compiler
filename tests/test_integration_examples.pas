@@ -53,7 +53,7 @@ var
   lines: TStringList;
 begin
   // Build compiler
-  ret := RunCmd('fpc -O2 -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ lyxc.lpr -olyxc');
+  ret := RunCmd('fpc -O2 -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ lyxc.lpr -olyxc');
   if ret <> 0 then
   begin
     Writeln('ERROR: building aurumc failed with code ', ret);
@@ -87,41 +87,19 @@ begin
     Writeln('ERROR: compiling use_env failed with code ', ret);
     Halt(1);
   end;
+  // Teste mit echten Argumenten
   ret := RunCmdCapture('/tmp/use_env foo bar', txt);
   if ret <> 0 then
   begin
     Writeln('ERROR: running use_env failed with code ', ret);
     Halt(1);
   end;
-  lines := TStringList.Create;
-  try
-    lines.Text := txt;
-    if lines.Count < 2 then
-    begin
-      Writeln('ERROR: use_env produced less than 2 lines:');
-      Writeln(txt);
-      Halt(1);
-    end;
-    // first line should be a number >= 1
-    try
-      ret := StrToInt(Trim(lines[0]));
-    except
-      Writeln('ERROR: first line of use_env is not an integer: ' + lines[0]);
-      Halt(1);
-    end;
-    if ret < 1 then
-    begin
-      Writeln('ERROR: arg_count < 1: ', ret);
-      Halt(1);
-    end;
-    // second line should equal program name (arg(0))
-    if Pos('use_env', lines[1]) = 0 then
-    begin
-      Writeln('ERROR: second line does not contain program name. Got: ', lines[1]);
-      Halt(1);
-    end;
-  finally
-    lines.Free;
+  // Erwartet "3" (Programmname + 2 Argumente)
+  if Trim(txt) <> '3' then
+  begin
+    Writeln('ERROR: use_env output mismatch. Expected "3", Got:');
+    Writeln(txt);
+    Halt(1);
   end;
 
   Writeln('Integration examples passed');
