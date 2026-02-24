@@ -299,6 +299,114 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
+// === SSE2 Float-Instruktionen (f64 / double) ===
+
+// XMM-Register-Nummern (0..15, gleiche Nummerierung wie GPR)
+const
+  XMM0 = 0; XMM1 = 1; XMM2 = 2; XMM3 = 3;
+  XMM4 = 4; XMM5 = 5; XMM6 = 6; XMM7 = 7;
+
+// movsd xmm, [base+disp32] — F2 REX? 0F 10 /r
+procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Byte; disp: Integer);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $10);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// movsd [base+disp32], xmm — F2 REX? 0F 11 /r
+procedure WriteMovsdStore(buf: TByteBuffer; base: Byte; disp: Integer; xmm: Byte);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $11);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// addsd xmm0, xmm1 — F2 0F 58 /r
+procedure WriteAddsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $58);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// subsd xmm0, xmm1 — F2 0F 5C /r
+procedure WriteSubsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5C);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// mulsd xmm0, xmm1 — F2 0F 59 /r
+procedure WriteMulsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $59);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// divsd xmm0, xmm1 — F2 0F 5E /r
+procedure WriteDivsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// xorpd xmm, xmm — 66 0F 57 /r (für FNeg: XOR mit Sign-Bit-Maske)
+procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $57);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// ucomisd xmm0, xmm1 — 66 0F 2E /r
+procedure WriteUcomisd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $2E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// cvtsi2sd xmm, r64 — F2 REX.W 0F 2A /r (int64 → f64)
+procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2A);
+  EmitU8(buf, $C0 or ((xmm and 7) shl 3) or (gpr and 7));
+end;
+
+// cvttsd2si r64, xmm — F2 REX.W 0F 2C /r (f64 → int64 mit Truncation)
+procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (gpr shr 3) and 1, 0, (xmm shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2C);
+  EmitU8(buf, $C0 or ((gpr and 7) shl 3) or (xmm and 7));
+end;
+
+// movq xmm, r64 — 66 REX.W 0F 6E /r
+procedure WriteMovqToXmm(buf: TByteBuffer; xmm, gpr: Byte);
+begin
+  EmitU8(buf, $66);
+  EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $6E);
+  EmitU8(buf, $C0 or ((xmm and 7) shl 3) or (gpr and 7));
+end;
+
 function SlotOffset(slot: Integer): Integer;
 begin
   Result := -8 * (slot + 1);
@@ -1482,14 +1590,96 @@ begin
             end;
           irConstFloat:
             begin
-              // Load float constant - for now, store as zero (placeholder)
-              // TODO: Implement proper float constants in data section
+              // Float-Konstante als Bit-Pattern in den Slot schreiben
+              // PUInt64(@ImmFloat)^ liefert das IEEE-754 Double-Bitmuster
               slotIdx := localCnt + instr.Dest;
-              WriteMovRegImm64(FCode, RAX, 0); // placeholder: float as zero
+              WriteMovRegImm64(FCode, RAX, PUInt64(@instr.ImmFloat)^);
               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-              // Note: Real implementation needs data section with float constants
-              // and MOVSD/MOVSS instructions to load into XMM registers
             end;
+          // === SSE2 Float-Arithmetik ===
+          irFAdd:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+              WriteAddsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFSub:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+              WriteSubsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFMul:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+              WriteMulsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFDiv:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+              WriteDivsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFNeg:
+            begin
+              // FNeg: XOR des Sign-Bits (Bit 63) mit einer Maske
+              // Lade den Wert, XOR mit $8000000000000000 als Integer, speichere zurück
+              slotIdx := localCnt + instr.Dest;
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              // btc rax, 63 — Toggle Bit 63 (Sign-Bit)
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $BA);
+              EmitU8(FCode, $F8); EmitU8(FCode, 63); // btc rax, 63
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          // === SSE2 Float-Vergleiche ===
+          irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+              WriteUcomisd(FCode, XMM0, XMM1);
+              // setcc al — Condition-Code abhängig vom Vergleich
+              case instr.Op of
+                irFCmpEq:  begin EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); end; // sete al
+                irFCmpNeq: begin EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); end; // setne al
+                irFCmpLt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $92); EmitU8(FCode, $C0); end; // setb al (below, unsigned für Float)
+                irFCmpLe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $96); EmitU8(FCode, $C0); end; // setbe al
+                irFCmpGt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $97); EmitU8(FCode, $C0); end; // seta al (above)
+                irFCmpGe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $93); EmitU8(FCode, $C0); end; // setae al
+              end;
+              // movzx rax, al — Zero-Extend auf 64 Bit
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          // === Float ↔ Integer Konvertierung ===
+          irFToI:
+            begin
+              // f64 → int64 mit Truncation (cvttsd2si)
+              slotIdx := localCnt + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteCvttsd2si(FCode, RAX, XMM0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+          irIToF:
+            begin
+              // int64 → f64 (cvtsi2sd)
+              slotIdx := localCnt + instr.Dest;
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteCvtsi2sd(FCode, XMM0, RAX);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+
          irLoadLocal:
            begin
              // Load local variable into temp: dest = locals[src1]
@@ -2342,36 +2532,66 @@ begin
         irAlloc:
           begin
             // Heap allocation: Dest = alloc(ImmInt bytes)
-            // Use mmap syscall: sys_mmap(addr=0, len=ImmInt, prot=3, flags=34, fd=-1, off=0)
-            // syscall number 9 on x86_64
+            // Wir allokieren ImmInt + 8 Bytes und speichern die Größe im Header
+            // Der返回-Zeiger zeigt auf User-Data (nach dem 8-Byte-Header)
             
-            // Save current RAX if needed
-            // mov rax, 9 (sys_mmap)
+            // syscall number 9 (sys_mmap)
             WriteMovRegImm64(FCode, RAX, 9);
-            // mov rdi, 0 (addr = NULL)
+            // rdi = 0 (addr = NULL)
             WriteMovRegImm64(FCode, RDI, 0);
-            // mov rsi, ImmInt (length = size)
-            WriteMovRegImm64(FCode, RSI, UInt64(instr.ImmInt));
-            // mov rdx, 3 (prot = PROT_READ | PROT_WRITE)
+            // rsi = ImmInt + 8 (extra 8 bytes for size header)
+            WriteMovRegImm64(FCode, RSI, UInt64(instr.ImmInt + 8));
+            // rdx = 3 (prot = PROT_READ | PROT_WRITE)
             WriteMovRegImm64(FCode, RDX, 3);
-            // mov r10, 34 (flags = MAP_PRIVATE | MAP_ANONYMOUS)
+            // r10 = 34 (flags = MAP_PRIVATE | MAP_ANONYMOUS)
             WriteMovRegImm64(FCode, R10, 34);
-            // mov r8, -1 (fd = -1)
-            WriteMovRegImm64(FCode, R8, High(UInt64)); // -1 as unsigned
-            // mov r9, 0 (offset = 0)
+            // r8 = -1 (fd = -1)
+            WriteMovRegImm64(FCode, R8, High(UInt64));
+            // r9 = 0 (offset = 0)
             WriteMovRegImm64(FCode, R9, 0);
-            // syscall
+            // syscall — RAX = Zeiger auf allocated Memory
             WriteSyscall(FCode);
-            // Result (pointer) is now in RAX, store to Dest temp slot
+            
+            // Speichere die Größe im Header: [RAX] = ImmInt
+            WriteMovRegImm64(FCode, RDI, UInt64(instr.ImmInt)); // Größe nach RAX + 0
+            WriteMovMemReg(FCode, RAX, 0, RDI);
+            
+            // RAX += 8 (skip header, return user pointer)
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C0); EmitU8(FCode, 8); // add rax, 8
+            
+            // Store user pointer to Dest temp slot
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
 
         irFree:
           begin
             // Heap deallocation: free(Src1)
-            // TODO: Proper implementation needs to track allocation sizes
-            // For now, skip freeing to avoid munmap with wrong size
-            // This causes a memory leak but prevents crashes
+            // Src1 ist der User-Zeiger, wir müssen 8 subtrahieren um den Header zu finden
+            
+            // Lade den User-Zeiger nach R11 (brauchen RAX für Syscall)
+            WriteMovRegMem(FCode, R11, RBP, SlotOffset(localCnt + instr.Src1));
+            
+            // RAX = R11 - 8 (Header-Zeiger)
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $E3); EmitU8(FCode, 8); // sub r11, 8
+            
+            // Lade die Größe aus dem Header: RAX = [R11]
+            WriteMovRegMem(FCode, RAX, R11, 0);
+            
+            // Speichere die Größe + 8 (Header) in RDI (Length für munmap)
+            // RDI = RAX + 8
+            WriteMovRegReg(FCode, RDI, RAX);
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C7); EmitU8(FCode, 8); // add rdi, 8
+            
+            // RSI = R11 (Adresse für munmap)
+            WriteMovRegReg(FCode, RSI, R11);
+            
+            // RAX = 11 (sys_munmap)
+            WriteMovRegImm64(FCode, RAX, 11);
+            // RDX = 0 (ignored)
+            WriteMovRegImm64(FCode, RDX, 0);
+            
+            // syscall
+            WriteSyscall(FCode);
           end;
       end;
     end;

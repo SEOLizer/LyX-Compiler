@@ -710,6 +710,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     isFloatArith: Boolean;
     isFloatCmp: Boolean;
     mangled: string;
+    // Null-Coalesce Phase 2
+    zeroSlot: Integer;
+    resultSlot: Integer;
+    cmpSlot: Integer;
+    useRightLabel: string;
+    endLabel: string;
     arrLen: Integer;
     baseSlot: Integer;
     // bounds-check temporaries
@@ -1001,13 +1007,63 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           tkNullCoalesce:
             begin
               // x ?? y: if x == 0 (null), use y, else use x
-              // This is a conditional, similar to: x != 0 ? x : y
-              // For Phase 1, we emit a simple conditional move pattern:
-              // t0 = x != 0
-              // result = t0 ? t1 : t2
-              // Simplified: For now, just return left value (no null check)
-              // TODO Phase 2: Implement proper null check with branches
-              Result := t1; // Just use left value for now
+              // Phase 2: Proper null check with branches
+              // Ergebnis-Slot allozieren
+              resultSlot := NewTemp;
+              
+              // Konstante 0 für den Vergleich
+              zeroSlot := NewTemp;
+              instr.Op := irConstInt;
+              instr.Dest := zeroSlot;
+              instr.ImmInt := 0;
+              Emit(instr);
+              
+              // cmpSlot prüfen ob x == 0
+              cmpSlot := NewTemp;
+              instr.Op := irCmpEq;
+              instr.Dest := cmpSlot;
+              instr.Src1 := t1;  // x
+              instr.Src2 := zeroSlot;
+              Emit(instr);
+              
+              // Labels für die Verzweigung
+              useRightLabel := NewLabel('Lcoalesce_right');
+              endLabel := NewLabel('Lcoalesce_end');
+              
+              // Wenn x == null (cmpSlot == true), gehe zu use_right
+              instr.Op := irBrTrue;
+              instr.Src1 := cmpSlot;
+              instr.LabelName := useRightLabel;
+              Emit(instr);
+              
+              // x != null, verwende x: result = x
+              instr.Op := irLoadLocal;
+              instr.Dest := resultSlot;
+              instr.Src1 := t1;
+              Emit(instr);
+              
+              // Springe zum Ende
+              instr.Op := irJmp;
+              instr.LabelName := endLabel;
+              Emit(instr);
+              
+              // use_right: y
+              instr.Op := irLabel;
+              instr.LabelName := useRightLabel;
+              Emit(instr);
+              
+              // result = y
+              instr.Op := irLoadLocal;
+              instr.Dest := resultSlot;
+              instr.Src1 := t2;
+              Emit(instr);
+              
+              // end:
+              instr.Op := irLabel;
+              instr.LabelName := endLabel;
+              Emit(instr);
+              
+              Result := resultSlot;
               Exit;
             end;
         else

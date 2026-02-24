@@ -492,6 +492,103 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
+// === SSE2 Float-Instruktionen (f64 / double) ===
+const
+  XMM0 = 0; XMM1 = 1; XMM2 = 2; XMM3 = 3;
+  XMM4 = 4; XMM5 = 5; XMM6 = 6; XMM7 = 7;
+
+// movsd xmm, [base+disp32]
+procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Byte; disp: Integer);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $10);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// movsd [base+disp32], xmm
+procedure WriteMovsdStore(buf: TByteBuffer; base: Byte; disp: Integer; xmm: Byte);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $11);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// addsd xmm0, xmm1
+procedure WriteAddsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $58);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// subsd xmm0, xmm1
+procedure WriteSubsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5C);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// mulsd xmm0, xmm1
+procedure WriteMulsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $59);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// divsd xmm0, xmm1
+procedure WriteDivsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// xorpd xmm, xmm
+procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $57);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// ucomisd xmm0, xmm1
+procedure WriteUcomisd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $2E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// cvtsi2sd xmm, r64
+procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2A);
+  EmitU8(buf, $C0 or ((xmm and 7) shl 3) or (gpr and 7));
+end;
+
+// cvttsd2si r64, xmm
+procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (gpr shr 3) and 1, 0, (xmm shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2C);
+  EmitU8(buf, $C0 or ((gpr and 7) shl 3) or (xmm and 7));
+end;
+
 // Calculate stack slot offset
 function SlotOffset(slot: Integer): Integer;
 begin
@@ -2118,12 +2215,91 @@ begin
           end;
         irConstFloat:
           begin
-            // Float constant - placeholder: store as 0
-            // TODO: Implement proper float constants in data section
+            // Float-Konstante als Bit-Pattern in den Slot schreiben
             slotIdx := localCnt + instr.Dest;
-            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovRegImm64(FCode, RAX, PUInt64(@instr.ImmFloat)^);
             WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
           end;
+
+        // === SSE2 Float-Arithmetik ===
+        irFAdd:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteAddsd(FCode, XMM0, XMM1);
+            WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+          end;
+        irFSub:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteSubsd(FCode, XMM0, XMM1);
+            WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+          end;
+        irFMul:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteMulsd(FCode, XMM0, XMM1);
+            WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+          end;
+        irFDiv:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteDivsd(FCode, XMM0, XMM1);
+            WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+          end;
+        irFNeg:
+          begin
+            // FNeg: Toggle Sign-Bit (Bit 63)
+            slotIdx := localCnt + instr.Dest;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $BA);
+            EmitU8(FCode, $F8); EmitU8(FCode, 63); // btc rax, 63
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === SSE2 Float-Vergleiche ===
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteUcomisd(FCode, XMM0, XMM1);
+            case instr.Op of
+              irFCmpEq:  begin EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); end;
+              irFCmpNeq: begin EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); end;
+              irFCmpLt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $92); EmitU8(FCode, $C0); end;
+              irFCmpLe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $96); EmitU8(FCode, $C0); end;
+              irFCmpGt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $97); EmitU8(FCode, $C0); end;
+              irFCmpGe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $93); EmitU8(FCode, $C0); end;
+            end;
+            // movzx rax, al
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Float ↔ Integer Konvertierung ===
+        irFToI:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteCvttsd2si(FCode, RAX, XMM0);
+            WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+          end;
+        irIToF:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteCvtsi2sd(FCode, XMM0, RAX);
+            WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+          end;
+
         irCallStruct:
           begin
             // Call returning struct: handled similar to irCall
