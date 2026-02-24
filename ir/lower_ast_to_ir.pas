@@ -1125,6 +1125,164 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
+        // === std.io: fd-basierte I/O Syscalls (v0.3.1) ===
+        else if TAstCall(expr).Name = 'open' then
+        begin
+          // open(path: pchar, flags: int64, mode: int64) -> int64 (fd or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'open';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'read' then
+        begin
+          // read(fd: int64, buf: pchar, count: int64) -> int64 (bytes read or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'read';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'write' then
+        begin
+          // write(fd: int64, buf: pchar, count: int64) -> int64 (bytes written or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'write';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'close' then
+        begin
+          // close(fd: int64) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'close';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'lseek' then
+        begin
+          // lseek(fd: int64, offset: int64, whence: int64) -> int64
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'lseek';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'unlink' then
+        begin
+          // unlink(path: pchar) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'unlink';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'rename' then
+        begin
+          // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'rename';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'mkdir' then
+        begin
+          // mkdir(path: pchar, mode: int64) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'mkdir';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'rmdir' then
+        begin
+          // rmdir(path: pchar) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'rmdir';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if TAstCall(expr).Name = 'chmod' then
+        begin
+          // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'chmod';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
         else if TAstCall(expr).Name = 'Random' then
         begin
           // Random() -> int64: returns pseudo-random number

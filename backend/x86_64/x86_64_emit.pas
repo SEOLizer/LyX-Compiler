@@ -383,6 +383,7 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   argTemp4: Integer;
   argTemp5: Integer;
   argTemp6: Integer;
+  arg3: Integer;
   // external symbol search
   found: Boolean;
   ei: Integer;
@@ -1229,6 +1230,207 @@ begin
               WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
               WriteMovRegImm64(FCode, RAX, 60);
               WriteSyscall(FCode);
+            end
+            // === std.io: fd-basierte I/O Syscalls (Linux x86-64) ===
+            else if instr.ImmStr = 'open' then
+            begin
+              // open(path: pchar, flags: int64, mode: int64) -> int64 (fd or -1)
+              // syscall: open(path, flags, mode) = sys_open (2)
+              // RDI = path, RSI = flags, RDX = mode
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load 3rd arg from ArgTemps[2] if available
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteMovRegImm64(FCode, RAX, 2); // sys_open
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'read' then
+            begin
+              // read(fd: int64, buf: pchar, count: int64) -> int64
+              // syscall: read(fd, buf, count) = sys_read (0)
+              // RDI = fd, RSI = buf, RDX = count
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteMovRegImm64(FCode, RAX, 0); // sys_read
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'write' then
+            begin
+              // write(fd: int64, buf: pchar, count: int64) -> int64
+              // syscall: write(fd, buf, count) = sys_write (1)
+              // RDI = fd, RSI = buf, RDX = count
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteMovRegImm64(FCode, RAX, 1); // sys_write
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'close' then
+            begin
+              // close(fd: int64) -> int64
+              // syscall: close(fd) = sys_close (3)
+              // RDI = fd
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              WriteMovRegImm64(FCode, RAX, 3); // sys_close
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'lseek' then
+            begin
+              // lseek(fd: int64, offset: int64, whence: int64) -> int64
+              // syscall: lseek(fd, offset, whence) = sys_lseek (8)
+              // RDI = fd, RSI = offset, RDX = whence
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteMovRegImm64(FCode, RAX, 8); // sys_lseek
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'unlink' then
+            begin
+              // unlink(path: pchar) -> int64
+              // syscall: unlink(path) = sys_unlink (87)
+              // RDI = path
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              WriteMovRegImm64(FCode, RAX, 87); // sys_unlink
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'rename' then
+            begin
+              // rename(oldpath: pchar, newpath: pchar) -> int64
+              // syscall: rename(oldpath, newpath) = sys_rename (82)
+              // RDI = oldpath, RSI = newpath
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              WriteMovRegImm64(FCode, RAX, 82); // sys_rename
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'mkdir' then
+            begin
+              // mkdir(path: pchar, mode: int64) -> int64
+              // syscall: mkdir(path, mode) = sys_mkdir (83)
+              // RDI = path, RSI = mode
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              WriteMovRegImm64(FCode, RAX, 83); // sys_mkdir
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'rmdir' then
+            begin
+              // rmdir(path: pchar) -> int64
+              // syscall: rmdir(path) = sys_rmdir (84)
+              // RDI = path
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              WriteMovRegImm64(FCode, RAX, 84); // sys_rmdir
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'chmod' then
+            begin
+              // chmod(path: pchar, mode: int64) -> int64
+              // syscall: chmod(path, mode) = sys_chmod (90)
+              // RDI = path, RSI = mode
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              WriteMovRegImm64(FCode, RAX, 90); // sys_chmod
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'Random' then
             begin
