@@ -2585,6 +2585,39 @@ begin
             // syscall
             WriteSyscall(FCode);
           end;
+        irPanic:
+          begin
+            // panic(message): write message to stderr and exit with error code
+            // SysV ABI: RDI = fd (2 for stderr), RSI = msg, RDX = len
+            // We need to use ImmInt for string length
+            
+            if instr.ImmInt = 0 then
+            begin
+              // Unknown length - use a default message or just exit
+              // For now, just exit with code 1
+              WriteMovRegImm64(FCode, RAX, 60); // sys_exit
+              WriteMovRegImm64(FCode, RDI, 1);  // exit code 1
+              WriteSyscall(FCode);
+            end
+            else
+            begin
+              // Load message pointer into RSI
+              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+              // RDI = 2 (stderr)
+              WriteMovRegImm64(FCode, RDI, 2);
+              // RDX = length
+              WriteMovRegImm64(FCode, RDX, instr.ImmInt);
+              // RAX = 1 (sys_write)
+              WriteMovRegImm64(FCode, RAX, 1);
+              // syscall
+              WriteSyscall(FCode);
+              
+              // After write, exit with code 1
+              WriteMovRegImm64(FCode, RAX, 60); // sys_exit
+              WriteMovRegImm64(FCode, RDI, 1);  // exit code 1
+              WriteSyscall(FCode);
+            end;
+          end;
       end;
     end;
   end;

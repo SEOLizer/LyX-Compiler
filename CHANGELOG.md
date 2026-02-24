@@ -1,5 +1,38 @@
 # Changelog - Lyx Compiler
 
+## Version 0.4.2 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Panic und Assert - Fehlerbehandlung zur Laufzeit**
+
+- **`panic(message)`**: Bricht das Programm mit einer Fehlermeldung ab
+  - Expression, die nie zurückkehrt
+  - Argument muss ein String sein
+  - Nachricht wird auf stderr ausgegeben
+  - Exit-Code: 1
+
+- **`assert(cond, msg)`**: Runtime-Assertion für Invariantenprüfung
+  - `cond` muss ein Boolean sein
+  - `msg` muss ein String sein
+  - Wenn `cond` false ist, wird `panic(msg)` aufgerufen
+
+**Beispiel:**
+```lyx
+fn divide(a: int64, b: int64) -> int64 {
+    if b == 0 {
+        panic("Division by zero!");
+    };
+    return a / b;
+}
+
+fn setAge(age: int64) -> void {
+    assert(age >= 0 && age < 150, "Age must be between 0 and 149");
+}
+```
+
+---
+
 ## Version 0.4.1 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**

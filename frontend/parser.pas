@@ -770,6 +770,19 @@ begin
     Exit(TAstDispose.Create(vExpr, FCurTok.Span));
   end;
 
+  // assert(cond, msg); - runtime assertion
+  if Check(tkAssert) then
+  begin
+    Advance; // consume 'assert'
+    Expect(tkLParen);
+    cond := ParseExpr;
+    Expect(tkComma);
+    valExpr := ParseExpr; // reuse valExpr for message
+    Expect(tkRParen);
+    Expect(tkSemicolon);
+    Exit(TAstAssert.Create(cond, valExpr, FCurTok.Span));
+  end;
+
   if Check(tkLBrace) then
     Exit(ParseBlock);
 
@@ -1348,17 +1361,27 @@ begin
     args := nil;
     if not Check(tkRParen) then
     begin
-      while True do
+      SetLength(args, 1);
+      args[0] := ParseExpr;
+      while Accept(tkComma) do
       begin
-        a := ParseExpr;
         SetLength(args, Length(args) + 1);
-        args[High(args)] := a;
-        if Accept(tkComma) then Continue;
-        Break;
+        args[High(args)] := ParseExpr;
       end;
     end;
     Expect(tkRParen);
     Exit(TAstSuperCall.Create(mName, args, span));
+  end;
+
+  // panic(message) - abort with error message
+  if Check(tkPanic) then
+  begin
+    span := FCurTok.Span;
+    Advance; // consume 'panic'
+    Expect(tkLParen);
+    e := ParseExpr;
+    Expect(tkRParen);
+    Exit(TAstPanicExpr.Create(e, span));
   end;
 
   if Accept(tkLBracket) then
