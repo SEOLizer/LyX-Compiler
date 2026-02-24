@@ -1279,8 +1279,7 @@ begin
                 WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
               else
                 WriteMovRegImm64(FCode, RDX, 0);
-              WriteMovRegImm64(FCode, RAX, 0); // sys_read
-              WriteSyscall(FCode);
+               WriteMovRegImm64(FCode, RAX, 0); // sys_read
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
@@ -1306,20 +1305,6 @@ begin
               else
                 WriteMovRegImm64(FCode, RDX, 0);
               WriteMovRegImm64(FCode, RAX, 1); // sys_write
-              WriteSyscall(FCode);
-              if instr.Dest >= 0 then
-                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-            end
-            else if instr.ImmStr = 'close' then
-            begin
-              // close(fd: int64) -> int64
-              // syscall: close(fd) = sys_close (3)
-              // RDI = fd
-              if instr.Src1 >= 0 then
-                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
-              else
-                WriteMovRegImm64(FCode, RDI, 0);
-              WriteMovRegImm64(FCode, RAX, 3); // sys_close
               WriteSyscall(FCode);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);

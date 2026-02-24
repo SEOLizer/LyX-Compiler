@@ -73,6 +73,7 @@ const
   X30 = 30;  // Link Register (LR)
   XZR = 31;  // Zero Register (also SP in some contexts)
   SP = 31;   // Stack Pointer
+  RBP = 29;  // Alias for X29 (for compatibility)
 
   // Parameter registers (AAPCS64)
   ParamRegs: array[0..7] of Byte = (X0, X1, X2, X3, X4, X5, X6, X7);
@@ -811,6 +812,19 @@ begin
   // STR (immediate, scalar, 64-bit): size=11, V=1, opc=00, imm12, Rn, Rt
   imm12 := DWord((offset div 8) and $FFF);
   EmitInstr(buf, $FD000000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+end;
+
+// High-level Load/Store wrapper for slot access from frame pointer
+// WriteLoad: Load from [base + offset] into dest register
+procedure WriteLoad(buf: TByteBuffer; dest, base: Byte; offset: Integer);
+begin
+  WriteLdrImm(buf, dest, base, offset);
+end;
+
+// WriteStore: Store from source register to [base + offset]
+procedure WriteStore(buf: TByteBuffer; src, base: Byte; offset: Integer);
+begin
+  WriteStrImm(buf, src, base, offset);
 end;
 
 // ==========================================================================
