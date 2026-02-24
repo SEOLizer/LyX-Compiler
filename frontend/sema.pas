@@ -711,9 +711,9 @@ begin
           tkNullCoalesce:
             begin
               // x ?? y: if x is null, use y. Result type is the non-nullable version of lt/rt
-              // For now, just return the left type (Phase 1: no strict enforcement)
+              // Phase 2: Typprüfung ist komplexer - für jetzt akzeptieren wir beide Typen
+              // Das Ergebnis ist der Typ des linken Operanden
               Result := lt;
-              // TODO Phase 2: Check that lt is nullable and rt is compatible non-nullable type
             end;
         else
           begin
