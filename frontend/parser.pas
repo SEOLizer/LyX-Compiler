@@ -1262,6 +1262,14 @@ begin
     Exit(TAstBoolLit.Create(b, span));
   end;
 
+  // null literal for nullable pointers
+  if Check(tkNull) then
+  begin
+    span := FCurTok.Span;
+    Advance;
+    Exit(TAstIntLit.Create(0, span)); // null as integer 0 (pointer representation)
+  end;
+
   if Check(tkIdent) then
     Exit(ParseCallOrIdent);
 
@@ -1588,6 +1596,10 @@ begin
   // optional nullable suffix: ?
   if Accept(tkQuestion) then
     isNullable := True;
+
+  // Convert to nullable type if needed
+  if isNullable and (Result = atPChar) then
+    Result := atPCharNullable;
 end;
 
 function TParser.ParseType: TAurumType;

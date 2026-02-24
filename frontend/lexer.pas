@@ -14,7 +14,7 @@ type
     // Keywords
     tkFn, tkVar, tkLet, tkCo, tkCon,
     tkIf, tkElse, tkWhile, tkReturn,
-    tkTrue, tkFalse, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault,
+    tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault,
     tkUnit, tkImport, tkPub, tkAs, tkType, tkStruct, tkArray, tkStatic,
     tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil,
     tkTry, tkCatch, tkThrow, tkFinally,
@@ -102,6 +102,7 @@ begin
     tkReturn:    Result := 'return';
     tkTrue:      Result := 'true';
     tkFalse:     Result := 'false';
+    tkNull:      Result := 'null';
     tkExtern:    Result := 'extern';
     tkCase:      Result := 'case';
     tkSwitch:    Result := 'switch';
@@ -441,6 +442,7 @@ begin
     'return':  Result := tkReturn;
     'true':    Result := tkTrue;
     'false':   Result := tkFalse;
+    'null':    Result := tkNull;
     'extern':  Result := tkExtern;
     'case':    Result := tkCase;
     'switch':  Result := tkSwitch;

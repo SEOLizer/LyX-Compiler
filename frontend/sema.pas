@@ -1147,8 +1147,17 @@ begin
         vd := TAstVarDecl(stmt);
         // check init expr type
         vtype := CheckExpr(vd.InitExpr);
+        // Allow integer literal 0 to be assigned to nullable pointer types
         if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
-          FDiag.Error(Format('type mismatch in declaration of %s: expected %s but got %s', [vd.Name, AurumTypeToStr(vd.DeclType), AurumTypeToStr(vtype)]), vd.Span);
+        begin
+          // Special case: integer literal 0 can be assigned to nullable pointer
+          if (vtype = atInt64) and (vd.DeclType = atPCharNullable) and 
+             Assigned(vd.InitExpr) and (vd.InitExpr is TAstIntLit) and 
+             (TAstIntLit(vd.InitExpr).Value = 0) then
+            vtype := atPCharNullable  // Treat 0 as null for nullable pointers
+          else
+            FDiag.Error(Format('type mismatch in declaration of %s: expected %s but got %s', [vd.Name, AurumTypeToStr(vd.DeclType), AurumTypeToStr(vtype)]), vd.Span);
+        end;
         sym := TSymbol.Create(vd.Name);
         case vd.Storage of
           skVar: sym.Kind := symVar;
