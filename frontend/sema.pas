@@ -244,6 +244,67 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // === std.io: Weitere fd-basierte I/O (v0.3.1) ===
+  // lseek(fd: int64, offset: int64, whence: int64) -> int64 (new position or -1)
+  // whence: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+  s := TSymbol.Create('lseek');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // unlink(path: pchar) -> int64 (0 or -1)
+  s := TSymbol.Create('unlink');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
+  s := TSymbol.Create('rename');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // mkdir(path: pchar, mode: int64) -> int64 (0 or -1)
+  s := TSymbol.Create('mkdir');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // rmdir(path: pchar) -> int64 (0 or -1)
+  s := TSymbol.Create('rmdir');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+  s := TSymbol.Create('chmod');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
   // Buffer/runtime primitives for time formatter
   // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
   s := TSymbol.Create('buf_put_byte');
