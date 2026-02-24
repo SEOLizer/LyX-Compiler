@@ -24,6 +24,8 @@ type
     ParamTypes: array of TAurumType;
     ParamCount: Integer;
     IsVarArgs: Boolean; // true for variadic functions like printf
+    IsExtern: Boolean;  // true for extern fn declarations (libc etc.)
+    IsImported: Boolean; // true for functions imported from another unit
     // for global variables
     IsGlobal: Boolean; // true if this is a global variable
     constructor Create(const AName: string);
@@ -1620,6 +1622,7 @@ begin
         sym.Kind := symFunc;
         sym.DeclType := fn.ReturnType;
         sym.ReturnTypeName := fn.ReturnTypeName;
+        sym.IsImported := True;
         sym.ParamCount := Length(fn.Params);
         SetLength(sym.ParamTypes, sym.ParamCount);
         for j := 0 to sym.ParamCount - 1 do
@@ -1714,6 +1717,8 @@ begin
        sym.Kind := symFunc;
        sym.DeclType := fn.ReturnType;
        sym.ReturnTypeName := fn.ReturnTypeName;
+       sym.IsExtern := fn.IsExtern;
+       sym.IsVarArgs := fn.IsVarArgs;
        // If return type is a struct, look up and store the struct decl
        if (fn.ReturnTypeName <> '') and Assigned(FStructTypes) then
        begin

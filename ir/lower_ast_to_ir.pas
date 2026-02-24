@@ -37,6 +37,8 @@ type
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
     FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
     FGlobalVars: TStringList; // global variable name -> TAstVarDecl (as object)
+    FExternFuncs: TStringList; // names of extern fn declarations
+    FImportedFuncs: TStringList; // names of functions from imported units
 
     function NewTemp: Integer;
     function IsGlobalVar(const name: string): Boolean;
@@ -99,6 +101,12 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FClassTypes.Sorted := False;
     FGlobalVars := TStringList.Create;
     FGlobalVars.Sorted := False;
+    FExternFuncs := TStringList.Create;
+    FExternFuncs.Sorted := True;
+    FExternFuncs.Duplicates := dupIgnore;
+    FImportedFuncs := TStringList.Create;
+    FImportedFuncs.Sorted := True;
+    FImportedFuncs.Duplicates := dupIgnore;
     SetLength(FLocalTypes, 0);
     SetLength(FLocalElemSize, 0);
     SetLength(FLocalIsStruct, 0);
@@ -126,6 +134,8 @@ begin
   FStructTypes.Free;
   FClassTypes.Free;
   FGlobalVars.Free;
+  FExternFuncs.Free;
+  FImportedFuncs.Free;
   inherited Destroy;
 end;
 
@@ -332,6 +342,13 @@ begin
     node := prog.Decls[i];
     if node is TAstFuncDecl then
     begin
+       // Skip extern function declarations (no body to lower)
+       if TAstFuncDecl(node).IsExtern then
+       begin
+         // Register as extern so call sites can set cmExternal
+         FExternFuncs.Add(TAstFuncDecl(node).Name);
+         Continue;
+       end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
        // Lower function body
        FCurrentFunc := fn;
@@ -587,6 +604,8 @@ begin
         if not TAstFuncDecl(node).IsPublic then
           Continue;
 
+        // Track as imported function for CallMode resolution
+        FImportedFuncs.Add(TAstFuncDecl(node).Name);
         // Check if function already exists (avoid duplicates)
         fn := FModule.FindFunction(TAstFuncDecl(node).Name);
         if not Assigned(fn) then
@@ -1143,7 +1162,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Dest := t0;
           instr.ImmStr := TAstCall(expr).Name;
           instr.ImmInt := argCount; // Backend needs argCount in ImmInt
-          instr.CallMode := cmInternal; // Default to internal
+          // Determine call mode based on function origin
+          if FExternFuncs.IndexOf(TAstCall(expr).Name) >= 0 then
+            instr.CallMode := cmExternal
+          else if FImportedFuncs.IndexOf(TAstCall(expr).Name) >= 0 then
+            instr.CallMode := cmImported
+          else
+            instr.CallMode := cmInternal;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
             instr.ArgTemps[i] := argTemps[i];

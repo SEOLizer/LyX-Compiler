@@ -1148,10 +1148,20 @@ var
   span: TSourceSpan;
 begin
   // Collect consecutive prefix unary operators (e.g. - - ! !)
-  while Check(tkMinus) or Check(tkNot) do
+  while Check(tkMinus) or Check(tkNot) or Check(tkMinusMinus) do
   begin
-    SetLength(ops, Length(ops) + 1);
-    ops[High(ops)] := FCurTok.Kind;
+    if Check(tkMinusMinus) then
+    begin
+      // Treat -- as two consecutive unary minus operators
+      SetLength(ops, Length(ops) + 2);
+      ops[High(ops) - 1] := tkMinus;
+      ops[High(ops)] := tkMinus;
+    end
+    else
+    begin
+      SetLength(ops, Length(ops) + 1);
+      ops[High(ops)] := FCurTok.Kind;
+    end;
     Advance;
   end;
 
@@ -1181,7 +1191,7 @@ begin
     begin
       if Result is TAstBoolLit then
       begin
-        boolVal := TAstBoolLit(Result).Value;
+        boolVal := not TAstBoolLit(Result).Value;
         span := Result.Span;
         Result.Free;
         Result := TAstBoolLit.Create(boolVal, span);

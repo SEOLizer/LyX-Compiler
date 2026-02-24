@@ -1842,12 +1842,11 @@ begin
             end;
 
             // emit call and patch later
-             // record external symbols for PLT if needed
              if instr.CallMode = cmExternal then
              begin
+               // External call: record symbol for PLT/GOT generation
                if instr.ImmStr <> '' then
                begin
-                 // add to FExternalSymbols if not present
                  found := False;
                  for ei := 0 to High(FExternalSymbols) do
                    if FExternalSymbols[ei].Name = instr.ImmStr then begin found := True; Break; end;
@@ -1855,17 +1854,27 @@ begin
                  begin
                    SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                    FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
-                   FExternalSymbols[High(FExternalSymbols)].LibraryName := '';
+                   FExternalSymbols[High(FExternalSymbols)].LibraryName := 'libc.so.6';
                  end;
                end;
+               // Emit call to PLT stub label (generated after all functions)
+               SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+               FJumpPatches[High(FJumpPatches)].Pos := FCode.Size;
+               FJumpPatches[High(FJumpPatches)].LabelName := '__plt_' + instr.ImmStr;
+               FJumpPatches[High(FJumpPatches)].JmpSize := 5;
+               EmitU8(FCode, $E8); // call rel32
+               EmitU32(FCode, 0);  // placeholder
+             end
+             else
+             begin
+               // Internal or imported call: direct call rel32
+               SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+               FJumpPatches[High(FJumpPatches)].Pos := FCode.Size;
+               FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
+               FJumpPatches[High(FJumpPatches)].JmpSize := 5; // call rel32
+               EmitU8(FCode, $E8); // call rel32
+               EmitU32(FCode, 0);  // placeholder offset
              end;
-
-             SetLength(FJumpPatches, Length(FJumpPatches) + 1);
-             FJumpPatches[High(FJumpPatches)].Pos := FCode.Size;
-             FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
-             FJumpPatches[High(FJumpPatches)].JmpSize := 5; // call rel32
-             EmitU8(FCode, $E8); // call rel32
-             EmitU32(FCode, 0);  // placeholder offset
 
              // restore stack: remove padding + extra pushed args
              restoreBytes := callPad + pushBytes;
@@ -2274,6 +2283,24 @@ begin
   
   // Free global variable names list
   globalVarNames.Free;
+
+  // Generate PLT stubs for external symbols at end of code section
+  for i := 0 to High(FExternalSymbols) do
+  begin
+    // Register PLT stub label
+    SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+    FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
+    FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+    // Emit: jmp [rip+disp32] = FF 25 xx xx xx xx
+    // The disp32 placeholder will be patched by the ELF writer to point to the GOT entry
+    SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
+    FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size + 2; // position of disp32 within jmp
+    FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
+    FPLTGOTPatches[High(FPLTGOTPatches)].SymbolIndex := i;
+    EmitU8(FCode, $FF); // jmp [rip+disp32]
+    EmitU8(FCode, $25);
+    EmitU32(FCode, 0);  // placeholder for GOT-relative offset
+  end;
 
   // patch jumps to labels
   for i := 0 to High(FJumpPatches) do
