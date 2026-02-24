@@ -4,17 +4,20 @@
 Er erzeugt direkt ausführbare **Linux x86_64 ELF64-**, **Linux ARM64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
 
 ```
-Lyx Compiler v0.1.7
+Lyx Compiler v0.2.0
 Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 
 ✅ Vollständiges Module System mit Import/Export
 ✅ Cross-Unit Function Calls und Symbol Resolution  
+✅ Einheitlicher Call-Pfad (internal/imported/extern)
+✅ PLT/GOT Dynamic Linking für externe Libraries
 ✅ Standard Library (std.math, std.io, std.string)
 ✅ Robuste Parser mit While/If/Function Support
 ✅ OOP: Classes, Vererbung, Konstruktoren, Destruktoren
 ✅ Globale Variablen mit Initialisierung
 ✅ Random/RandomSeed Builtins
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
+✅ Debugging: --emit-asm und --dump-relocs Flags
 ```
 
 ---
@@ -31,6 +34,10 @@ make build
 
 # Windows-Programm cross-kompilieren
 ./lyxc examples/hello.lyx -o hello.exe --target=win64
+
+# Debug-Flags
+./lyxc examples/hello.lyx --emit-asm      # IR als Pseudo-Assembler ausgeben
+./lyxc examples/hello.lyx --dump-relocs   # Relocations und Symbole anzeigen
 ```
 
 ```
@@ -716,9 +723,9 @@ fn main(): int64 {
 | `pi()`            | `void -> f64`          | π-Konstante                         |
 | `sin(x)`, `cos(x)`, `exp(x)`, `ln(x)`, `arctan(x)` | `f64 -> f64` | Transzendente Funktionen (Placeholder) |
 
-### Externe Funktionen (v0.1.5+)
+### Externe Funktionen (v0.2.0)
 
-Der Lyx-Compiler unterstützt jetzt Deklarationen externer Funktionen aus System-Libraries:
+Der Lyx-Compiler unterstützt jetzt Deklarationen externer Funktionen aus System-Libraries mit einem einheitlichen Call-Pfad:
 
 ```lyx
 extern fn malloc(size: int64): pchar;
@@ -732,6 +739,16 @@ fn main(): int64 {
   return 0;
 }
 ```
+
+#### Einheitlicher Call-Pfad (v0.2.0)
+
+Der Compiler unterscheidet jetzt korrekt zwischen drei Call-Arten:
+
+| Call-Typ | Beschreibung | Codegen |
+|----------|--------------|---------|
+| `cmInternal` | Aufruf einer Funktion in derselben Unit | `call rel32` (direkt) |
+| `cmImported` | Aufruf einer Funktion aus importierter Unit | `call rel32` (direkt) |
+| `cmExternal` | Aufruf einer externen Library-Funktion | `call __plt_<name>` (PLT/GOT) |
 
 #### Varargs-Unterstützung
 
@@ -785,6 +802,10 @@ Dynamische Binaries nutzen die **Procedure Linkage Table (PLT)** und **Global Of
 # ELF-Struktur analysieren
 readelf -l extern_binary    # PT_INTERP, PT_DYNAMIC Headers
 readelf -d extern_binary    # NEEDED libraries, Symbol tables
+
+# Debug-Ausgabe mit neuem Flag
+./lyxc program.lyx --dump-relocs    # Zeigt externe Symbole und PLT-Patches
+./lyxc program.lyx --emit-asm        # Zeigt IR als Pseudo-Assembler
 ```
 
 ### Standard-Units
@@ -1131,9 +1152,9 @@ echo $?             # Exit-Code prüfen
 ### Tests
 
 ```bash
-make test           # Alle Unit-Tests (FPCUnit)
+make test           # Alle Unit-Tests (FPCUnit) - 15 Suiten, alle bestehen
 make e2e            # End-to-End Smoke-Tests
-./tests/test_pe64   # PE64 Writer Tests
+./tests/test_pe64  # PE64 Writer Tests
 ```
 
 ---
@@ -1257,8 +1278,12 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
 | **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung, ✅ Inkrement/Dekrement (`++`/`--`) als Statements |
 | **v0.1.8** | ✅ Windows x64 Backend: PE32+ Binary-Erzeugung, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory für kernel32.dll |
-| **v0.2** | Struct by-value Rückgabe, Pointer-Typen, Null-Safety Phase 2 |
-| **v1** | Objektdateien, Multi-Unit Linking, Package Manager |
+| **v0.2.0** | ✅ **Einheitlicher Call-Pfad** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub Generierung für externe Calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI-Flags (`--emit-asm`, `--dump-relocs`), ✅ ABI-Testkatalog erweitert |
+| **v0.3.0** | std.io: fd-basierte I/O (open/read/write/close Syscalls) |
+| **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
+| **v0.3.2** | Directories: getdents64, DirIter |
+| **v0.4.1** | Strings & Slices: `type string = {pchar, len}`, `slice_u8` |
+| **v1.0.0** | Stabile Systemsprache: Module stabil, SysV ABI stabil, std.io/fs, Diagnostics |
 
 ---
 
