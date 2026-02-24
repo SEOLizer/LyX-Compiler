@@ -1,8 +1,8 @@
 Bugreport — Status & ToDo
 =========================
 
-Datum: 2026-02-21
-Arbeitszweig: main (lokales Commit: 2f14218)
+Datum: 2026-02-24
+Arbeitszweig: main (lokales Commit: f673bb2)
 
 Kurzüberblick
 -------------
@@ -10,47 +10,82 @@ Dieses Dokument fasst den aktuellen Status von Bugs zusammen, entfernt Einträge
 
 Bereinigte / inzwischen behobene Fehler
 --------------------------------------
-Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen nicht mehr reproduzierbar und wurden aus der Liste entfernt:
+Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen (v0.2.0) nicht mehr reproduzierbar und wurden aus der Liste entfernt:
 
 - Parser: fehlerhafte Behandlung verschachtelter unärer Operatoren (--, !!)
   - Symptom: Eingaben wie `--5` oder `!!true` liefen nicht korrekt durch den Parser bzw. führten zu fehlerhaften AST-/Werteinträgen.
-  - Status: BEHOBEN (commit 2f14218)
-  - Änderung: ParseUnaryExpr überarbeitet — jetzt werden Präfix-Operatoren gesammelt, Operand geparst und Operatoren rechts-nach-links angewendet; Literal-Folding korrekt.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: ParseUnaryExpr überarbeitet — `--` wird als zwei `tkMinus`-Tokens behandelt; Bool-Literal-Faltung mit korrekter Negation (`!true` → `false`).
 
 - Lowering/IR: fehlende Sign-/Zero-Extension beim Laden schmalerer Integer-Lokalen
   - Symptom: Test erwartete irSExt/irZExt beim Laden eines int8/int16-local, wurde aber nicht erzeugt.
-  - Status: BEHOBEN (commit 2f14218)
-  - Änderung: Nach irLoadLocal wird je nach deklariertem Lokaltyp irSExt (signed) oder irZExt (unsigned) emitttet.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: Nach irLoadLocal wird je nach deklariertem Lokaltyp irSExt (signed) oder irZExt (unsigned) emittiert.
 
-Anmerkung: Die oben genannten Fixes wurden getestet mit den Unit-Tests (tests/test_parser.pas und tests/test_codegen_widths.pas). Die betroffenen Unit-Tests laufen jetzt erfolgreich.
+- Lexer: Einzelnes '=' erzeugte Fehler
+  - Symptom: `type Foo = struct { ... }` führte zu Lexer-Fehler weil einzelnes '=' nicht als Token erkannt wurde.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: Einzelnes '=' erzeugt jetzt `tkSingleEq` Token (statt `tkError`).
+
+- Cross-Unit Function Calls (v0.2.0 Hauptfeature)
+  - Symptom: Aufrufe von Funktionen aus importierten Units wurden nicht korrekt behandelt; LowerImportedUnits() wurde nie aufgerufen.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: LowerImportedUnits(um) wird in lyxc.lpr aufgerufen; IR-Lowering unterscheidet jetzt korrekt zwischen cmInternal, cmImported und cmExternal.
+
+- ELF Dynamic Linking: DT_NEEDED Offset-Problem
+  - Symptom: Dynamic ELF mit externen Funktionen könnte vom dynamic linker falsch geladen werden.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: DT_NEEDED verwendet jetzt korrekten String-Table-Offset (nicht VA+Offset); DT_PLTREL-Tag hinzugefügt.
+
+- x86_64 Emitter: PLT-Stub Generierung
+  - Symptom: Externe Funktionsaufrufe nutzten direkten Call statt PLT/GOT-Indirektion.
+  - Status: BEHOBEN (commit f673bb2)
+  - Änderung: Bei cmExternal wird ein PLT-Stub generiert (`jmp [rip+disp32]`); FPLTGOTPatches wird befüllt.
+
+Anmerkung: Die oben genannten Fixet mit den Unites wurden getest-Tests (tests/test_*.pas). Alle 15 Test-Suiten bestehen mit 0 Failures.
 
 Verbleibende, offene Probleme
 -----------------------------
 Diese Probleme sind weiterhin offen und sollten separat adressiert:
 
-1) Beispiele/Integration: Fehler beim Kompilieren von std/io.lyx / examples/use_math.lyx
-   - Symptom: Beim Durchlauf der Integrationstests tritt ein Fehler in std/io.lyx (z. B. "unexpected token in expression: FloatLit") auf; einige Beispiel-Quellen erzeugen Diagnosefehler.
-   - Status: offen
-   - Reproduktion: make test → Integration schritt schlägt fehl; konkrete Fehlermeldung in Test-Output (siehe make test-Ausgabe). Beispiel-Fehler: ./std/io.lyx:52:11: error: unexpected token in expression: FloatLit
-   - Nächste Schritte: Lexer/Parser-Analyse der Float-Literal-Erkennung und deren Verwendung in Standardbibliotheksdateien; prüfen, ob Float-Literale im Parser korrekt als Primaries akzeptiert und an den richtigen Orten erlaubt werden. Alternativ: Tests isoliert gegen std/io.lyx laufen lassen, um genaue Stelle zu lokalisieren.
-   - Priorität: Medium
-
-2) tmp_* Hilfsdateien und temporäre Artefakte im Repo
-   - Symptom: Verschiedene temporäre Dateien (tmp_parse_unary_test.pas, tmp_token_dump.pas) liegen untracked im Arbeitsverzeichnis.
-   - Status: offen (nicht kritisch)
-   - Nächste Schritte: Temporäre Dateien löschen oder in .gitignore aufnehmen. Prüfen, ob einige sinnvoll als Entwickler-Utilities ins Verzeichnis util/dev/ gehören.
+1) Beispiele/Integration: Fehler beim Kompilieren von examples/use_math.lyx
+   - Symptom: use_math.lyx nutzt falsche Funktionsnamen (`print_int`, `print_str` statt `PrintInt`, `PrintStr`) und hat Import-Konflikte mit Builtins.
+   - Status: offen (keine Regression)
+   - Reproduktion: make test → test_integration_examples schlägt fehl mit "call to undeclared function: print_int"
+   - Nächste Schritte: use_math.lyx korrigieren → Kleinbuchstaben-Funktionsnamen durch korrekte Builtin-Namen ersetzen.
    - Priorität: Niedrig
 
-3) Warnungen in Code
-   - Beispiel: lower_ast_to_ir.pas zeigte Compiler-Warnungen wie "Local variable ops of a managed type does not seem to be initialized" und einige "Conversion between ordinals and pointers is not portable".
-   - Status: offen (Warnungen, keine Fehler)
-   - Nächste Schritte: Optionales Aufräumen/Initialisieren von Variablen und Portabilitätsprüfungen, um saubere Builds/CI zu gewährleisten.
-   - Priorität: Niedrig bis Mittel
+2) LibraryName für extern fn hartcodiert
+   - Symptom: Alle externen Funktionsaufrufe bekommen 'libc.so.6' als Library, unabhängig von der tatsächlichen Quelle.
+   - Status: offen
+   - Nächste Schritte: Syntax für `extern fn libname:symbol` ergänzen oder aus Library-Declaration ableiten.
+   - Priorität: Mittel
+
+3) Stack-Alignment callPad-Formel
+   - Symptom: Die mathematische Formel für Stack-Alignment bei ungeraden Stack-Argumenten ist fragwürdig.
+   - Status: offen (funktioniert durch konservative Reserve im Prolog)
+   - Nächste Schritte: Formel überprüfen und ggf. optimieren.
+   - Priorität: Niedrig
+
+4) irVarCall toter Code
+   - Symptom: Der IR-Opcode irVarCall existiert, wird aber nie generiert (Function-Pointer-Support fehlt).
+   - Status: offen
+   - Nächste Schritte: Function-Pointer-Typen und Aufrufe implementieren.
+   - Priorität: Niedrig
+
+5) Windows PE64 / ARM64 Backend Stabilisierung
+   - Symptom: Beide Backends haben Grundfunktionalität, aber es fehlen Tests und ggf. Feature-Parität.
+   - Status: offen
+   - Nächste Schritte: Mehr Integrationstests für beide Plattformen.
+   - Priorität: Mittel
 
 Weitere Hinweise
 ----------------
-- Commit-Referenz: 2f14218 (lokal, nicht gepusht). Enthält die Fixes für Parser und Lowering.
-- Tests: Ich habe make test lokal durchlaufen lassen; die Unit-Test-Suite zeigt jetzt keine Fails für die zuvor genannten Parser-/Codegen-Tests. Integration/Beispiel-Testfehler bleibten (siehe Punkt 1).
+- Commit-Referenz: f673bb2 (lokal, nicht gepusht). Enthält v0.2.0 mit unified call path, Bugfixes und neuen CLI-Flags.
+- Tests: make test → 15 Test-Suiten, alle bestehen (0 Failures). Nur test_integration_examples hat einen bekannten Fehler (use_math.lyx).
+- Neue CLI-Flags (v0.2.0):
+  - `--emit-asm`: Gibt IR als Pseudo-Assembler aus
+  - `--dump-relocs`: Zeigt externe Symbole und PLT-Patches
 
 Anfrage: Datei "aurumc_dbg" entfernen
 -------------------------------------
