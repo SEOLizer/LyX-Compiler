@@ -734,6 +734,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     zeroSlot: Integer;
     resultSlot: Integer;
     cmpSlot: Integer;
+    xSlot: Integer;
+    ySlot: Integer;
     useRightLabel: string;
     endLabel: string;
     arrLen: Integer;
@@ -1027,9 +1029,35 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           tkNullCoalesce:
             begin
               // x ?? y: if x == 0 (null), use y, else use x
-              // Phase 2: Proper null check with branches
+              // t1 und t2 sind temporäre IR-Werte. Wir müssen sie zuerst in 
+              // lokale Slots speichern, damit irLoadLocal funktioniert.
+              
+              // Speichere t1 (x) in einen temporären lokalen Slot
+              // Wir allozieren einen echten lokalen Slot via NewTemp + erhöhe LocalCount
+              xSlot := NewTemp;
+              // Reserviere einen lokalen Slot dafür
+              if xSlot >= FCurrentFunc.LocalCount then
+                FCurrentFunc.LocalCount := xSlot + 1;
+              
+              instr.Op := irStoreLocal;
+              instr.Dest := xSlot;
+              instr.Src1 := t1;
+              Emit(instr);
+              
+              // Speichere t2 (y) in einen temporären lokalen Slot
+              ySlot := NewTemp;
+              if ySlot >= FCurrentFunc.LocalCount then
+                FCurrentFunc.LocalCount := ySlot + 1;
+              
+              instr.Op := irStoreLocal;
+              instr.Dest := ySlot;
+              instr.Src1 := t2;
+              Emit(instr);
+              
               // Ergebnis-Slot allozieren
               resultSlot := NewTemp;
+              if resultSlot >= FCurrentFunc.LocalCount then
+                FCurrentFunc.LocalCount := resultSlot + 1;
               
               // Konstante 0 für den Vergleich
               zeroSlot := NewTemp;
@@ -1042,7 +1070,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               cmpSlot := NewTemp;
               instr.Op := irCmpEq;
               instr.Dest := cmpSlot;
-              instr.Src1 := t1;  // x
+              instr.Src1 := xSlot;
               instr.Src2 := zeroSlot;
               Emit(instr);
               
@@ -1059,7 +1087,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               // x != null, verwende x: result = x
               instr.Op := irLoadLocal;
               instr.Dest := resultSlot;
-              instr.Src1 := t1;
+              instr.Src1 := xSlot;
               Emit(instr);
               
               // Springe zum Ende
@@ -1075,7 +1103,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               // result = y
               instr.Op := irLoadLocal;
               instr.Dest := resultSlot;
-              instr.Src1 := t2;
+              instr.Src1 := ySlot;
               Emit(instr);
               
               // end:
@@ -2154,11 +2182,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
            Exit(True);
          end;
        end;
-       tmp := LowerExpr(vd.InitExpr);
-       // If local has narrower integer width, truncate before store
-       ltype := GetLocalType(loc);
-       if (ltype <> atUnresolved) and (ltype <> atInt64) then
-       begin
+        tmp := LowerExpr(vd.InitExpr);
+        // If local has narrower integer width, truncate before store
+        ltype := GetLocalType(loc);
+        if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64)
+           and (ltype <> atPChar) and (ltype <> atPCharNullable) then
+        begin
          // determine width in bits
          width := 64;
          case ltype of
@@ -2207,7 +2236,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       tmp := LowerExpr(TAstAssign(stmt).Value);
       // truncate if local has narrower integer width
       ltype := GetLocalType(loc);
-      if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64) then
+      if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64) 
+         and (ltype <> atPChar) and (ltype <> atPCharNullable) then
       begin
         width := 64;
         case ltype of

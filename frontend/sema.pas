@@ -710,10 +710,12 @@ begin
             end;
           tkNullCoalesce:
             begin
-              // x ?? y: if x is null, use y. Result type is the non-nullable version of lt/rt
-              // Phase 2: Typprüfung ist komplexer - für jetzt akzeptieren wir beide Typen
-              // Das Ergebnis ist der Typ des linken Operanden
-              Result := lt;
+              // x ?? y: if x is null, use y. Result type is the non-nullable version of left
+              // Left must be nullable, right must be compatible
+              if not IsNullableType(lt) then
+                FDiag.Error('type error: left operand of ?? must be nullable', bin.Span);
+              // Das Ergebnis ist der non-nullable Typ
+              Result := NonNullableVersion(lt);
             end;
         else
           begin
@@ -938,7 +940,13 @@ begin
               begin
                 atype := CheckExpr(call.Args[i]);
                 if (s.ParamTypes[i] <> atUnresolved) and (not TypeEqual(atype, s.ParamTypes[i])) then
-                  FDiag.Error(Format('argument %d of %s: expected %s but got %s', [i, call.Name, AurumTypeToStr(s.ParamTypes[i]), AurumTypeToStr(atype)]), call.Args[i].Span);
+                begin
+                  // Spezifischere Fehlermeldung für nullable Typen
+                  if IsNullableType(atype) and not IsNullableType(s.ParamTypes[i]) then
+                    FDiag.Error(Format('argument %d of %s: nullable type %s cannot be used here, use ?? for null-coalescing', [i, call.Name, AurumTypeToStr(atype)]), call.Args[i].Span)
+                  else
+                    FDiag.Error(Format('argument %d of %s: expected %s but got %s', [i, call.Name, AurumTypeToStr(s.ParamTypes[i]), AurumTypeToStr(atype)]), call.Args[i].Span);
+                end;
               end;
               // Check remaining args (varargs)
               for i := s.ParamCount to High(call.Args) do
@@ -954,7 +962,13 @@ begin
             begin
               atype := CheckExpr(call.Args[i]);
               if (i < s.ParamCount) and (s.ParamTypes[i] <> atUnresolved) and (not TypeEqual(atype, s.ParamTypes[i])) then
-                FDiag.Error(Format('argument %d of %s: expected %s but got %s', [i, call.Name, AurumTypeToStr(s.ParamTypes[i]), AurumTypeToStr(atype)]), call.Args[i].Span);
+              begin
+                // Spezifischere Fehlermeldung für nullable Typen
+                if IsNullableType(atype) and not IsNullableType(s.ParamTypes[i]) then
+                  FDiag.Error(Format('argument %d of %s: nullable type %s cannot be used here, use ?? for null-coalescing', [i, call.Name, AurumTypeToStr(atype)]), call.Args[i].Span)
+                else
+                  FDiag.Error(Format('argument %d of %s: expected %s but got %s', [i, call.Name, AurumTypeToStr(s.ParamTypes[i]), AurumTypeToStr(atype)]), call.Args[i].Span);
+              end;
             end;
           end;
           Result := s.DeclType;
