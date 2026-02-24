@@ -1,5 +1,27 @@
 # Changelog - Lyx Compiler
 
+## Version 0.3.0 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **std.io: fd-basierte I/O via libc Wrappers**
+- `open(path: pchar, flags: int64, mode: int64): int64` – Datei öffnen
+- `read(fd: int64, buf: pchar, count: int64): int64` – von File-Descriptor lesen
+- `write(fd: int64, buf: pchar, count: int64): int64` – auf File-Descriptor schreiben
+- `close(fd: int64): int64` – File-Descriptor schließen
+
+Die Funktionen sind als Builtins registriert und werden als externe libc-Calls
+via PLT/GOT generiert (dynamic ELF mit `-rdynamic` Linker-Flag).
+
+### 🔧 **Behobene Bugs**
+- Keine neuen Bugs in dieser Version
+
+### 📊 **Getestete Funktionalität**
+- ✅ `examples/test_syscall.lyx`: open/write/read/close funktionieren
+- ✅ Unit-Tests: 157+ Tests bestanden
+
+---
+
 ## Version 0.1.4 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**

@@ -201,6 +201,49 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // === std.io: fd-basierte I/O via libc wrappers (v0.3.0) ===
+  // open(path: pchar, flags: int32, mode: int32) -> int64 (fd or -1)
+  s := TSymbol.Create('open');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // read(fd: int64, buf: pchar, len: int64) -> int64 (bytes read or -1)
+  s := TSymbol.Create('read');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atPChar;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
+  s := TSymbol.Create('write');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atPChar;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // close(fd: int64) -> int32 (0 or -1)
+  s := TSymbol.Create('close');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
   // Buffer/runtime primitives for time formatter
   // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
   s := TSymbol.Create('buf_put_byte');
