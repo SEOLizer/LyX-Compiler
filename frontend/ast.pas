@@ -32,6 +32,10 @@ type
 
   TStorageKlass = (skVar, skLet, skCo, skCon);
 
+  { --- Sichtbarkeit für Klassen-Member (Access Control) --- }
+
+  TVisibility = (visPrivate, visProtected, visPublic);
+
   { --- Knotenarten (für schnellen Typcheck ohne 'is') --- }
 
   TNodeKind = (
@@ -485,6 +489,7 @@ type
     FIsExtern: Boolean;
     FIsVarArgs: Boolean;
     FIsStatic: Boolean; // true for static methods (no self parameter)
+    FVisibility: TVisibility; // for class members (default: visPublic)
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -498,6 +503,7 @@ type
     property IsExtern: Boolean read FIsExtern write FIsExtern;
     property IsVarArgs: Boolean read FIsVarArgs write FIsVarArgs;
     property IsStatic: Boolean read FIsStatic write FIsStatic;
+    property Visibility: TVisibility read FVisibility write FVisibility;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -535,6 +541,7 @@ type
     FieldType: TAurumType;
     FieldTypeName: string; // if named type
     ArrayLen: Integer; // 0 = scalar, >0 static, -1 dynamic
+    Visibility: TVisibility; // for class fields (default: visPublic)
   end;
   TStructFieldList = array of TStructField;
   TMethodList = array of TAstFuncDecl;
@@ -1584,6 +1591,7 @@ begin
   FBody := aBody;
   FIsPublic := aIsPublic;
   FIsStatic := False;
+  FVisibility := visPublic; // default: public
 end;
 
 destructor TAstFuncDecl.Destroy;

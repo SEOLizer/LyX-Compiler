@@ -21,6 +21,8 @@ type
     function Accept(kind: TTokenKind): Boolean;
     procedure Expect(kind: TTokenKind);
 
+    function ParseVisibility: TVisibility;
+
     // Parsing-Methoden
     function ParseTopDecl: TAstNode;
     function ParseFuncDecl(isPub: Boolean): TAstFuncDecl;
@@ -97,6 +99,17 @@ begin
     // try to continue: advance once
     Advance;
   end;
+end;
+
+function TParser.ParseVisibility: TVisibility;
+begin
+  Result := visPublic; // default
+  if Accept(tkPrivate) then
+    Result := visPrivate
+  else if Accept(tkProtected) then
+    Result := visProtected
+  else if Accept(tkPub) then
+    Result := visPublic;
 end;
 
 { Parsing }
@@ -328,6 +341,7 @@ var
   dummy: Integer;
   isStatic: Boolean;
   baseClassName: string;
+  curVisibility: TVisibility;
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -370,6 +384,8 @@ begin
     methods := nil;
     while not Check(tkRBrace) and not Check(tkEOF) do
     begin
+      // parse optional visibility modifier
+      curVisibility := ParseVisibility;
       if Check(tkFn) or Check(tkStatic) then
       begin
         // parse method declaration
@@ -400,6 +416,7 @@ begin
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
+        m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
       end
@@ -410,6 +427,7 @@ begin
         Expect(tkColon);
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
+        fld.Visibility := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
@@ -435,6 +453,8 @@ begin
     methods := nil;
     while not Check(tkRBrace) and not Check(tkEOF) do
     begin
+      // parse optional visibility modifier
+      curVisibility := ParseVisibility;
       if Check(tkFn) or Check(tkStatic) then
       begin
         // parse method declaration
@@ -468,6 +488,7 @@ begin
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
+        m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
       end
@@ -478,6 +499,7 @@ begin
         Expect(tkColon);
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
+        fld.Visibility := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
