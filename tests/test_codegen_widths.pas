@@ -47,6 +47,7 @@ begin
         Result := lower.Lower(prog);
       finally
         lower.Free;
+        prog.Free;  // AST wird nach dem Lowering nicht mehr benötigt
       end;
     finally
       p.Free;
