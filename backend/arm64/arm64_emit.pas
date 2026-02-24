@@ -87,6 +87,14 @@ const
   SYS_read = 63;
   SYS_write = 64;
   SYS_exit = 93;
+  SYS_open = 56;
+  SYS_close = 57;
+  SYS_lseek = 62;
+  SYS_unlink = 87;
+  SYS_rename = 82;
+  SYS_mkdir = 83;
+  SYS_rmdir = 84;
+  SYS_chmod = 90;
   SYS_mmap = 222;
   SYS_munmap = 215;
   SYS_brk = 214;
@@ -893,6 +901,7 @@ var
   // Function arguments
   argCount: Integer;
   argTemps: array of Integer;
+  arg3: Integer;
   
   // Comparison result
   cond: Byte;
@@ -1509,6 +1518,207 @@ begin
               // sys_exit(X0)
               WriteMovImm64(FCode, X8, SYS_exit);
               WriteSvc(FCode, 0);
+            end
+            // === std.io: fd-basierte I/O Syscalls (Linux ARM64) ===
+            else if instr.ImmStr = 'open' then
+            begin
+              // open(path: pchar, flags: int64, mode: int64) -> int64
+              // X0 = path, X1 = flags, X2 = mode
+              // syscall number = 56
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              WriteMovImm64(FCode, X8, SYS_open);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'read' then
+            begin
+              // read(fd: int64, buf: pchar, count: int64) -> int64
+              // X0 = fd, X1 = buf, X2 = count
+              // syscall number = 63
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              WriteMovImm64(FCode, X8, SYS_read);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'write' then
+            begin
+              // write(fd: int64, buf: pchar, count: int64) -> int64
+              // X0 = fd, X1 = buf, X2 = count
+              // syscall number = 64
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              WriteMovImm64(FCode, X8, SYS_write);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'close' then
+            begin
+              // close(fd: int64) -> int64
+              // X0 = fd
+              // syscall number = 57
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X8, SYS_close);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'lseek' then
+            begin
+              // lseek(fd: int64, offset: int64, whence: int64) -> int64
+              // X0 = fd, X1 = offset, X2 = whence
+              // syscall number = 62
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              WriteMovImm64(FCode, X8, SYS_lseek);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'unlink' then
+            begin
+              // unlink(path: pchar) -> int64
+              // X0 = path
+              // syscall number = 87
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X8, SYS_unlink);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rename' then
+            begin
+              // rename(oldpath: pchar, newpath: pchar) -> int64
+              // X0 = oldpath, X1 = newpath
+              // syscall number = 82
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              WriteMovImm64(FCode, X8, SYS_rename);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'mkdir' then
+            begin
+              // mkdir(path: pchar, mode: int64) -> int64
+              // X0 = path, X1 = mode
+              // syscall number = 83
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              WriteMovImm64(FCode, X8, SYS_mkdir);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rmdir' then
+            begin
+              // rmdir(path: pchar) -> int64
+              // X0 = path
+              // syscall number = 84
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X8, SYS_rmdir);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'chmod' then
+            begin
+              // chmod(path: pchar, mode: int64) -> int64
+              // X0 = path, X1 = mode
+              // syscall number = 90
+              if instr.Src1 >= 0 then
+                WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              WriteMovImm64(FCode, X8, SYS_chmod);
+              WriteSvc(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'Random' then
             begin
