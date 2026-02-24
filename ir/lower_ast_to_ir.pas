@@ -1163,8 +1163,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         for i := 0 to argCount - 1 do
           argTemps[i] := LowerExpr(TAstCall(expr).Args[i]);
 
-        // Check for builtins
-        if TAstCall(expr).Name = 'PrintStr' then
+        // Check for builtins (both with and without namespace, e.g., PrintStr and IO.PrintStr)
+        // Namespace is already resolved in Sema, so we just check the Name
+        if (TAstCall(expr).Name = 'PrintStr') or 
+           ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintStr')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1;
@@ -1180,7 +1182,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if TAstCall(expr).Name = 'PrintInt' then
+        else if (TAstCall(expr).Name = 'PrintInt') or 
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintInt')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1;
@@ -1196,7 +1199,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if TAstCall(expr).Name = 'printf' then
+        else if (TAstCall(expr).Name = 'printf') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'printf')) then
         begin
           // printf is varargs - emit as builtin with all args
           instr.Op := irCallBuiltin;
@@ -1213,7 +1217,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if TAstCall(expr).Name = 'exit' then
+        else if (TAstCall(expr).Name = 'exit') or
+                ((TAstCall(expr).Namespace = 'OS') and (TAstCall(expr).Name = 'exit')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1;
@@ -1230,7 +1235,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Result := -1;
         end
         // === std.io: fd-basierte I/O Syscalls (v0.3.1) ===
-        else if TAstCall(expr).Name = 'open' then
+        else if (TAstCall(expr).Name = 'open') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'open')) then
         begin
           // open(path: pchar, flags: int64, mode: int64) -> int64 (fd or -1)
           t0 := NewTemp;
@@ -1246,7 +1252,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'read' then
+        else if (TAstCall(expr).Name = 'read') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'read')) then
         begin
           // read(fd: int64, buf: pchar, count: int64) -> int64 (bytes read or -1)
           t0 := NewTemp;
@@ -1262,7 +1269,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'write' then
+        else if (TAstCall(expr).Name = 'write') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'write')) then
         begin
           // write(fd: int64, buf: pchar, count: int64) -> int64 (bytes written or -1)
           t0 := NewTemp;
@@ -1278,7 +1286,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'close' then
+        else if (TAstCall(expr).Name = 'close') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'close')) then
         begin
           // close(fd: int64) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1293,7 +1302,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'lseek' then
+        else if (TAstCall(expr).Name = 'lseek') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'lseek')) then
         begin
           // lseek(fd: int64, offset: int64, whence: int64) -> int64
           t0 := NewTemp;
@@ -1309,7 +1319,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'unlink' then
+        else if (TAstCall(expr).Name = 'unlink') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'unlink')) then
         begin
           // unlink(path: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1324,7 +1335,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'rename' then
+        else if (TAstCall(expr).Name = 'rename') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'rename')) then
         begin
           // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1340,7 +1352,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'mkdir' then
+        else if (TAstCall(expr).Name = 'mkdir') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'mkdir')) then
         begin
           // mkdir(path: pchar, mode: int64) -> int64 (0 or -1)
           t0 := NewTemp;
