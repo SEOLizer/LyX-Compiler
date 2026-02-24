@@ -1421,6 +1421,7 @@ end;
 function TParser.ParseCallOrIdent: TAstExpr;
 var
   name: string;
+  namespace: string;
   args: TAstExprList;
   span: TSourceSpan;
   a: TAstExpr;
@@ -1431,6 +1432,18 @@ begin
   name := FCurTok.Value;
   span := FCurTok.Span;
   Advance; // consume ident
+  
+  // Check for namespace qualifier: Ident.Ident (e.g., IO.PrintStr)
+  namespace := '';
+  if Accept(tkDot) then
+  begin
+    // This is a qualified call like IO.PrintStr
+    namespace := name;  // first ident is the namespace
+    name := FCurTok.Value;  // second ident is the function name
+    span := FCurTok.Span;  // update span to include both
+    Advance; // consume the function name
+  end;
+  
   if Accept(tkLParen) then
   begin
     args := nil;
@@ -1448,10 +1461,14 @@ begin
     end;
     Expect(tkRParen);
     Result := ParsePostfix(TAstCall.Create(name, args, span));
+    // Set namespace if present
+    if namespace <> '' then
+      TAstCall(Result).Namespace := namespace;
   end
   else if Accept(tkLBrace) then
   begin
     // Struct literal: TypeName { field: value, ... }
+    // Note: for struct literals, namespace is not supported yet
     fields := nil;
     if not Check(tkRBrace) then
     begin

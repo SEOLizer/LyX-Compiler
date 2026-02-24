@@ -168,11 +168,12 @@ type
     property Operand: TAstExpr read FOperand;
   end;
 
-  { Funktionsaufruf: print_str("hi"), foo(1, 2) }
+  { Funktionsaufruf: print_str("hi"), foo(1, 2), IO.print_str("hi") }
   TAstCall = class(TAstExpr)
   private
     FName: string;
     FArgs: TAstExprList;
+    FNamespace: string;  // z.B. "IO" für "IO.PrintStr"
   public
     constructor Create(const aName: string; const aArgs: TAstExprList;
       aSpan: TSourceSpan);
@@ -182,6 +183,7 @@ type
     procedure ReplaceArgs(const aArgs: TAstExprList); // replaces without freeing old args
     property Name: string read FName;
     property Args: TAstExprList read FArgs;
+    property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
   end;
 
   { Array-Literal: [expr, expr, ...] }

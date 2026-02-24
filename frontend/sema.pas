@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager;
+  SysUtils, Classes, ast, diag, lexer, unit_manager, builtins;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -165,108 +165,26 @@ end;
 procedure TSema.DeclareBuiltinFunctions;
 var
   s: TSymbol;
+  biArr: TBuiltinInfoArray;
+  bi: TBuiltinInfo;
+  i, j: Integer;
 begin
-  // PrintStr(pchar) -> void
-  s := TSymbol.Create('PrintStr');
-  s.Kind := symFunc;
-  s.DeclType := atVoid;
-  s.ParamCount := 1;
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // PrintInt(int64) -> void
-  s := TSymbol.Create('PrintInt');
-  s.Kind := symFunc;
-  s.DeclType := atVoid;
-  s.ParamCount := 1;
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // printf(pchar, ...) -> void (varargs) - libc function, keep lowercase
-  s := TSymbol.Create('printf');
-  s.Kind := symFunc;
-  s.DeclType := atVoid;
-  s.ParamCount := 1;  // at least 1 required (format string)
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
-  s.IsVarArgs := True;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // exit(int64) -> void - libc function, keep lowercase
-  s := TSymbol.Create('exit');
-  s.Kind := symFunc;
-  s.DeclType := atVoid;
-  s.ParamCount := 1;
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // === std.io: fd-basierte I/O via libc wrappers (v0.3.0) ===
-  // open(path: pchar, flags: int32, mode: int32) -> int64 (fd or -1)
-  s := TSymbol.Create('open');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 3;
-  SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atPChar;
-  s.ParamTypes[1] := atInt64;
-  s.ParamTypes[2] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // read(fd: int64, buf: pchar, len: int64) -> int64 (bytes read or -1)
-  s := TSymbol.Create('read');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 3;
-  SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atInt64;
-  s.ParamTypes[1] := atPChar;
-  s.ParamTypes[2] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
-  s := TSymbol.Create('write');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 3;
-  SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atInt64;
-  s.ParamTypes[1] := atPChar;
-  s.ParamTypes[2] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // close(fd: int64) -> int32 (0 or -1)
-  s := TSymbol.Create('close');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 1;
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // === std.io: Weitere fd-basierte I/O (v0.3.1) ===
-  // lseek(fd: int64, offset: int64, whence: int64) -> int64 (new position or -1)
-  // whence: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
-  s := TSymbol.Create('lseek');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 3;
-  SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atInt64;
-  s.ParamTypes[1] := atInt64;
-  s.ParamTypes[2] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
-
-  // unlink(path: pchar) -> int64 (0 or -1)
-  s := TSymbol.Create('unlink');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 1;
-  SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
-  AddSymbolToCurrent(s, NullSpan);
+  // Register builtins from the centralized builtins registry.
+  biArr := GetAllBuiltins();
+  for i := 0 to High(biArr) do
+  begin
+    bi := biArr[i];
+    s := TSymbol.Create(bi.Name);
+    s.Kind := symFunc;
+    s.DeclType := bi.RetType;
+    s.ParamCount := bi.ParamCount;
+    SetLength(s.ParamTypes, s.ParamCount);
+    for j := 0 to s.ParamCount - 1 do
+      s.ParamTypes[j] := bi.ParamTypes[j];
+    s.IsVarArgs := bi.IsVarArgs;
+    // Add unqualified name for backward compatibility (PrintStr etc.)
+    AddSymbolToCurrent(s, NullSpan);
+  end;
 
   // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
   s := TSymbol.Create('rename');
@@ -929,13 +847,24 @@ begin
         end
         else
         begin
-          s := ResolveSymbol(call.Name);
-          if (s = nil) and (Pos('.', call.Name) > 0) then
+          // Handle namespace-qualified calls (e.g., IO.PrintStr)
+          if call.Namespace <> '' then
           begin
-            // Handle qualified name (e.g., 'module.function')
-            qualifier := Copy(call.Name, 1, Pos('.', call.Name) - 1);
-            identName := Copy(call.Name, Pos('.', call.Name) + 1, MaxInt);
-            s := ResolveQualifiedName(qualifier, identName, call.Span);
+            // Qualified call: namespace.function
+            s := ResolveQualifiedName(call.Namespace, call.Name, call.Span);
+          end
+          else
+          begin
+            // Regular call: try simple name first
+            s := ResolveSymbol(call.Name);
+            // Then try qualified name (for compatibility)
+            if (s = nil) and (Pos('.', call.Name) > 0) then
+            begin
+              // Handle qualified name (e.g., 'module.function')
+              qualifier := Copy(call.Name, 1, Pos('.', call.Name) - 1);
+              identName := Copy(call.Name, Pos('.', call.Name) + 1, MaxInt);
+              s := ResolveQualifiedName(qualifier, identName, call.Span);
+            end;
           end;
         end;
 
@@ -1884,8 +1813,26 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  bi: TBuiltinInfo;
 begin
   Result := nil;
+  
+  // Central builtin lookup (uses frontend.builtins)
+  if FindBuiltin(qualifier, name, bi) then
+  begin
+    Result := TSymbol.Create(name);
+    Result.Kind := symFunc;
+    Result.DeclType := bi.RetType;
+    Result.ParamCount := bi.ParamCount;
+    SetLength(Result.ParamTypes, Result.ParamCount);
+    for j := 0 to Result.ParamCount - 1 do
+      Result.ParamTypes[j] := bi.ParamTypes[j];
+    Result.IsVarArgs := bi.IsVarArgs;
+    AddSymbolToCurrent(Result, span);
+    Exit;
+  end;
+  
+  // === Imported Units ===
   
   // Finde Unit mit diesem Alias
   idx := FImportedUnits.IndexOf(qualifier);
