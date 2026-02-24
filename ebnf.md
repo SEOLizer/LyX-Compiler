@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert`
 
 ### Operatoren / Trennzeichen
 
@@ -236,6 +236,7 @@ Stmt           := VarDecl
                | RepeatUntilStmt
                | ReturnStmt
                | ExprStmt
+               | AssertStmt
                | Block ;
 
 VarDecl        := 'var' Ident ':' Type ':=' Expr ';' ;
@@ -259,7 +260,41 @@ RepeatUntilStmt:= 'repeat' Block 'until' '(' Expr ')' ';' ;
 ReturnStmt     := 'return' [ Expr ] ';' ;
 
 ExprStmt       := Expr ';' ;
+
+AssertStmt     := 'assert' '(' Expr ',' Expr ')' ';' ;  // assert(condition, message)
 ```
+
+### Panic und Assert (v0.3.2)
+
+**panic(message)** - bricht das Programm mit einer Fehlermeldung ab:
+
+```lyx
+fn divide(a: int64, b: int64) -> int64 {
+    if b == 0 {
+        panic("Division by zero!");
+    };
+    return a / b;
+}
+```
+
+* `panic` ist eine Expression, die nie zurückkehrt
+* Das Argument muss ein String sein
+* Die Nachricht wird auf stderr ausgegeben
+* Das Programm wird mit Exit-Code 1 beendet
+
+**assert(cond, msg)** - Runtime-Assertion:
+
+```lyx
+fn setAge(age: int64) -> void {
+    assert(age >= 0 && age < 150, "Age must be between 0 and 149");
+    // ...
+}
+```
+
+* `cond` muss ein Boolean-Ausdruck sein
+* `msg` muss ein String sein
+* Wenn `cond` false ist, wird `panic(msg)` aufgerufen
+* Nützlich für Debugging und Invariantenprüfung
 
 ### Typen
 
@@ -320,6 +355,7 @@ Primary        := IntLit
                 | CharLit
                 | 'null'                         // Null-Literal für Nullable-Typen
                 | 'new' Ident '(' [ ArgList ] ')' // Heap-Allokation (Klassen)
+                | 'panic' '(' Expr ')'           // Panic-Expression (bricht Programm ab)
                 | StructLit
                 | ArrayLit
                 | Ident

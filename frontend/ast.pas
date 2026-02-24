@@ -43,12 +43,12 @@ type
     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkIdent,
     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
     nkFieldAccess, nkIndexAccess, nkCast,
-    nkNewExpr, nkSuperCall,  // OOP expressions
+    nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
     // Statements
     nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
     nkIf, nkWhile, nkFor, nkRepeatUntil,
     nkReturn, nkBreak, nkSwitch,
-    nkBlock, nkExprStmt, nkDispose,  // OOP statement
+    nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
     // Top-Level
     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl,
     nkUnitDecl, nkImportDecl,
@@ -623,6 +623,18 @@ type
     property Expr: TAstExpr read FExpr;
   end;
 
+  { assert Statement: assert(condition, message); }
+  TAstAssert = class(TAstStmt)
+  private
+    FCondition: TAstExpr;
+    FMessage: TAstExpr;
+  public
+    constructor Create(aCondition, aMessage: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Condition: TAstExpr read FCondition;
+    property Message: TAstExpr read FMessage;
+  end;
+
   { super.method() Aufruf }
   TAstSuperCall = class(TAstExpr)
   private
@@ -633,6 +645,16 @@ type
     destructor Destroy; override;
     property MethodName: string read FMethodName;
     property Args: TAstExprList read FArgs;
+  end;
+
+  { panic(message) - bricht Programm mit Fehlermeldung ab }
+  TAstPanicExpr = class(TAstExpr)
+  private
+    FMessage: TAstExpr;
+  public
+    constructor Create(aMessage: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Message: TAstExpr read FMessage;
   end;
 
   { Unit-Deklaration: unit path.to.name; }
@@ -1498,6 +1520,22 @@ begin
   inherited Destroy;
 end;
 
+{ TAstAssert }
+
+constructor TAstAssert.Create(aCondition, aMessage: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkAssert, aSpan);
+  FCondition := aCondition;
+  FMessage := aMessage;
+end;
+
+destructor TAstAssert.Destroy;
+begin
+  if Assigned(FCondition) then FCondition.Free;
+  if Assigned(FMessage) then FMessage.Free;
+  inherited Destroy;
+end;
+
 { TAstSuperCall }
 
 constructor TAstSuperCall.Create(const aMethodName: string; const aArgs: TAstExprList; aSpan: TSourceSpan);
@@ -1516,6 +1554,20 @@ begin
   for i := 0 to High(FArgs) do
     if Assigned(FArgs[i]) then FArgs[i].Free;
   FArgs := nil;
+  inherited Destroy;
+end;
+
+{ TAstPanicExpr }
+
+constructor TAstPanicExpr.Create(aMessage: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkPanic, aSpan);
+  FMessage := aMessage;
+end;
+
+destructor TAstPanicExpr.Destroy;
+begin
+  if Assigned(FMessage) then FMessage.Free;
   inherited Destroy;
 end;
 

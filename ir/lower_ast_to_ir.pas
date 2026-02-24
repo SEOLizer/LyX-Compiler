@@ -1779,6 +1779,28 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         Result := t0;
       end;
 
+    nkPanic:
+      begin
+        // panic(message) - write message to stderr and exit with error code
+        // Lower the message expression first
+        msgTmp := LowerExpr(TAstPanicExpr(expr).Message);
+        if msgTmp < 0 then
+          Exit(-1);
+        
+        // Emit panic instruction with string length info
+        instr.Op := irPanic;
+        instr.Src1 := msgTmp;
+        // Store string length in ImmInt for the backend
+        if TAstPanicExpr(expr).Message is TAstStrLit then
+          instr.ImmInt := Length(TAstStrLit(TAstPanicExpr(expr).Message).Value)
+        else
+          instr.ImmInt := 0; // Will need runtime strlen
+        Emit(instr);
+        
+        // panic never returns - emit unreachable code (or just return -1)
+        Result := -1;
+      end;
+
   else
     FDiag.Error('lowering: unsupported expression kind', expr.Span);
     Result := -1;
@@ -1964,12 +1986,23 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     // bounds-check helpers
     gv: TAstVarDecl;
     tZero, tLen, tGe0, tLtLen, tOk: Integer;
+    // assert/panic helpers
+    cond, msg: Integer;
+    skipLbl: string;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
     errLbl: string;
   begin
   instr := Default(TIRInstr);
   Result := True;
+  // Handle expression statements (e.g., function calls, panic as statement)
+  if stmt is TAstExprStmt then
+  begin
+    // Just lower the expression, discard the result
+    LowerExpr(TAstExprStmt(stmt).Expr);
+    Exit(True);
+  end;
+
    if stmt is TAstVarDecl then
     begin
       vd := TAstVarDecl(stmt);
@@ -2432,238 +2465,48 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
          begin
            // no bounds info, emit dynamic store
            instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
-         end;
-       end;
-       Exit(True);
-    end;
-
-  if stmt is TAstExprStmt then
-  begin
-    LowerExpr(TAstExprStmt(stmt).Expr);
-    Exit(True);
-  end;
-
-  if stmt is TAstReturn then
-  begin
-    if Assigned(TAstReturn(stmt).Value) then
-    begin
-      retStructDecl := GetReturnStructDecl;
-      if Assigned(retStructDecl) then
-      begin
-        // Struct return - use irReturnStruct with size info
-        tmp := LowerExpr(TAstReturn(stmt).Value);
-        instr.Op := irReturnStruct;
-        instr.Src1 := tmp;
-        instr.StructSize := retStructDecl.Size;
-        instr.StructAlign := retStructDecl.Align;
-        Emit(instr);
-      end
-      else
-      begin
-        // Scalar return
-        tmp := LowerExpr(TAstReturn(stmt).Value);
-        instr.Op := irReturn;
-        instr.Src1 := tmp;
-        Emit(instr);
+        end;
       end;
-    end
-    else
-    begin
-      instr.Op := irReturn;
-      instr.Src1 := -1;
-      Emit(instr);
-    end;
-    Exit(True);
-  end;
-
-  if stmt is TAstIf then
-  begin
-    condTmp := LowerExpr(TAstIf(stmt).Cond);
-    thenLabel := NewLabel('Lthen');
-    elseLabel := NewLabel('Lelse');
-    endLabel := NewLabel('Lend');
-
-    // br false -> else
-    instr.Op := irBrFalse;
-    instr.Src1 := condTmp;
-    instr.LabelName := elseLabel;
-    Emit(instr);
-
-    // then branch
-    LowerStmt(TAstIf(stmt).ThenBranch);
-    // jmp end
-    instr.Op := irJmp;
-    instr.LabelName := endLabel;
-    Emit(instr);
-
-    // else label
-    instr.Op := irLabel;
-    instr.LabelName := elseLabel;
-    Emit(instr);
-    if Assigned(TAstIf(stmt).ElseBranch) then
-      LowerStmt(TAstIf(stmt).ElseBranch);
-
-    // end label
-    instr.Op := irLabel;
-    instr.LabelName := endLabel;
-    Emit(instr);
-    Exit(True);
-  end;
-
-    if stmt is TAstWhile then
-    begin
-      whileNode := TAstWhile(stmt);
-      startLabel := NewLabel('Lwhile');
-      bodyLabel := NewLabel('Lwhile_body');
-      exitLabel := NewLabel('Lwhile_end');
-
-      // start label
-      instr.Op := irLabel; instr.LabelName := startLabel; Emit(instr);
-      condTmp := LowerExpr(whileNode.Cond);
-      instr.Op := irBrFalse; instr.Src1 := condTmp; instr.LabelName := exitLabel; Emit(instr);
-      // body (support break -> exitLabel)
-      FBreakStack.AddObject(exitLabel, nil);
-      LowerStmt(whileNode.Body);
-      FBreakStack.Delete(FBreakStack.Count - 1);
-      // jump to start
-      instr.Op := irJmp; instr.LabelName := startLabel; Emit(instr);
-      // exit label
-      instr.Op := irLabel; instr.LabelName := exitLabel; Emit(instr);
       Exit(True);
     end;
 
+    // assert(cond, msg); - expand to if (!cond) { panic(msg); }
+    if stmt is TAstAssert then
+    begin
+      // Lower: if (!condition) panic(message);
+      cond := LowerExpr(TAstAssert(stmt).Condition);
+      if cond < 0 then Exit(False);
+      msg := LowerExpr(TAstAssert(stmt).Message);
+      if msg < 0 then Exit(False);
 
-   if stmt is TAstFor then
-   begin
-     // for varName := start to/downto end do body
-     // lower as: var = start; while (var <= end) { body; var := var +/- 1 }
-     with TAstFor(stmt) do
-     begin
-       loc := AllocLocal(VarName, atInt64);
-       tmp := LowerExpr(StartExpr);
-       instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := tmp; Emit(instr);
-       startLabel := NewLabel('Lfor');
-       exitLabel := NewLabel('Lfor_end');
-       // start label
-       instr.Op := irLabel; instr.LabelName := startLabel; Emit(instr);
-       // load var and end, compare
-       t1 := NewTemp;
-       instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
-       t2 := LowerExpr(EndExpr);
-       condTmp := NewTemp;
-       if IsDownto then
-         begin instr.Op := irCmpGe; end
-       else
-         begin instr.Op := irCmpLe; end;
-       instr.Dest := condTmp; instr.Src1 := t1; instr.Src2 := t2; Emit(instr);
-       instr.Op := irBrFalse; instr.Src1 := condTmp; instr.LabelName := exitLabel; Emit(instr);
-       // body
-       FBreakStack.AddObject(exitLabel, nil);
-       LowerStmt(Body);
-       FBreakStack.Delete(FBreakStack.Count - 1);
-       // increment/decrement
-       t1 := NewTemp;
-       instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
-       t2 := NewTemp;
-       instr.Op := irConstInt; instr.Dest := t2; instr.ImmInt := 1; Emit(instr);
-       condTmp := NewTemp;
-       if IsDownto then
-         instr.Op := irSub
-       else
-         instr.Op := irAdd;
-       instr.Dest := condTmp; instr.Src1 := t1; instr.Src2 := t2; Emit(instr);
-       instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := condTmp; Emit(instr);
-       // jump to start
-       instr.Op := irJmp; instr.LabelName := startLabel; Emit(instr);
-       // exit label
-       instr.Op := irLabel; instr.LabelName := exitLabel; Emit(instr);
-     end;
-     Exit(True);
-   end;
+      skipLbl := NewLabel('Lassert_ok');
+      // if cond is true, jump to skip (use irBrTrue to jump if condition is true)
+      instr := Default(TIRInstr);
+      instr.Op := irBrTrue; // jump if true -> skip panic
+      instr.Src1 := cond;
+      instr.LabelName := skipLbl;
+      Emit(instr);
 
-   if stmt is TAstRepeatUntil then
-   begin
-     startLabel := NewLabel('Lrepeat');
-     exitLabel := NewLabel('Lrepeat_end');
-     // start label
-     instr.Op := irLabel; instr.LabelName := startLabel; Emit(instr);
-     // body
-     FBreakStack.AddObject(exitLabel, nil);
-     LowerStmt(TAstRepeatUntil(stmt).Body);
-     FBreakStack.Delete(FBreakStack.Count - 1);
-     // condition
-     condTmp := LowerExpr(TAstRepeatUntil(stmt).Cond);
-     // if condition false, jump back to start (repeat until cond is true)
-     instr.Op := irBrFalse; instr.Src1 := condTmp; instr.LabelName := startLabel; Emit(instr);
-     // exit label
-     instr.Op := irLabel; instr.LabelName := exitLabel; Emit(instr);
-     Exit(True);
-   end;
+      // panic(msg);
+      instr := Default(TIRInstr);
+      instr.Op := irPanic;
+      instr.Src1 := msg;
+      // Store string length in ImmInt for the backend
+      if TAstAssert(stmt).Message is TAstStrLit then
+        instr.ImmInt := Length(TAstStrLit(TAstAssert(stmt).Message).Value)
+      else
+        instr.ImmInt := 0; // Will need runtime strlen
+      Emit(instr);
 
-   if stmt is TAstBlock then
-   begin
-     for i := 0 to High(TAstBlock(stmt).Stmts) do
-       LowerStmt(TAstBlock(stmt).Stmts[i]);
-     Exit(True);
-   end;
+      // skip label
+      instr := Default(TIRInstr);
+      instr.Op := irLabel;
+      instr.LabelName := skipLbl;
+      Emit(instr);
+      Exit(True);
+    end;
 
-   if stmt is TAstDispose then
-   begin
-     // dispose expr; - free heap memory
-     // First, call Destroy destructor if it exists
-     t1 := LowerExpr(TAstDispose(stmt).Expr);
-     if t1 < 0 then Exit(False);
-     
-     // Try to find the class type and check for Destroy method
-     if TAstDispose(stmt).Expr is TAstIdent then
-     begin
-       loc := FLocalMap.IndexOf(TAstIdent(TAstDispose(stmt).Expr).Name);
-       if (loc >= 0) and (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
-       begin
-         // Check if there's a Destroy method for this class
-         mangledName := '_L_' + FLocalTypeNames[loc] + '_Destroy';
-         // Check if this function exists in the module
-         for i := 0 to High(FModule.Functions) do
-         begin
-           if FModule.Functions[i].Name = mangledName then
-           begin
-             // Call Destroy with self=t1
-             instr := Default(TIRInstr);
-             instr.Op := irCall;
-             instr.Dest := NewTemp;
-             instr.ImmStr := mangledName;
-             instr.ImmInt := 1; // just self
-             instr.CallMode := cmInternal;
-             SetLength(instr.ArgTemps, 1);
-             instr.ArgTemps[0] := t1;
-             Emit(instr);
-             Break;
-           end;
-         end;
-       end;
-     end;
-     
-     instr := Default(TIRInstr);
-     instr.Op := irFree;
-     instr.Src1 := t1;
-     Emit(instr);
-     Exit(True);
-   end;
-
-   if stmt is TAstBreak then
-   begin
-     if FBreakStack.Count = 0 then
-       FDiag.Error('break outside of loop/switch', stmt.Span)
-     else
-     begin
-       instr.Op := irJmp;
-       instr.LabelName := FBreakStack.Strings[FBreakStack.Count - 1];
-       Emit(instr);
-     end;
-     Exit(True);
-   end;
-
-   if stmt is TAstSwitch then
+    if stmt is TAstSwitch then
    begin
      // Lower switch by generating compares and branches
       sw := TAstSwitch(stmt);

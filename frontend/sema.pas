@@ -410,6 +410,16 @@ begin
   end;
 end;
 
+function IsBoolType(t: TAurumType): Boolean;
+begin
+  Result := (t = atBool);
+end;
+
+function IsStringType(t: TAurumType): Boolean;
+begin
+  Result := (t = atPChar);
+end;
+
 function IsNumericType(t: TAurumType): Boolean;
 begin
   Result := IsIntegerType(t) or (t in [atF32, atF64]);
@@ -1067,6 +1077,16 @@ begin
           end;
         end;
       end;
+    nkPanic:
+      begin
+        // panic(message) - expression that never returns
+        CheckExpr(TAstPanicExpr(expr).Message);
+        // message must be pchar or string
+        if not IsStringType(TAstPanicExpr(expr).Message.ResolvedType) then
+          FDiag.Error('panic message must be a string', TAstPanicExpr(expr).Message.Span);
+        // panic never returns, so we can assign any type
+        Result := atVoid;
+      end;
   else
     begin
       FDiag.Error('sema: unsupported expr kind', expr.Span);
@@ -1402,6 +1422,18 @@ begin
         // dispose expr; - free heap-allocated class instance
         // Just check the expression
         CheckExpr(TAstDispose(stmt).Expr);
+      end;
+    nkAssert:
+      begin
+        // assert(cond, msg); - runtime assertion
+        CheckExpr(TAstAssert(stmt).Condition);
+        CheckExpr(TAstAssert(stmt).Message);
+        // condition must be bool
+        if not IsBoolType(TAstAssert(stmt).Condition.ResolvedType) then
+          FDiag.Error('assert condition must be boolean', TAstAssert(stmt).Condition.Span);
+        // message must be pchar or string
+        if not IsStringType(TAstAssert(stmt).Message.ResolvedType) then
+          FDiag.Error('assert message must be a string', TAstAssert(stmt).Message.Span);
       end;
     nkFuncDecl:
       begin

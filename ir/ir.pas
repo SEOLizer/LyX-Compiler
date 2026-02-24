@@ -63,7 +63,9 @@ type
     irPushHandler,  // push handler frame: Src1 = handler_addr, LabelName = catch_label
     irPopHandler,   // pop handler frame: Src1 = handler_addr
     irLoadHandlerExn, // load exception value from handler into Dest: Src1=handler_addr
-    irThrow         // perform throw: Src1 = exception temp
+    irThrow,        // perform throw: Src1 = exception temp
+    // panic / abort
+    irPanic         // panic: write message to stderr and exit with error code
    );
 
   TIRInstr = record

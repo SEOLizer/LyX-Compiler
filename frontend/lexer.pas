@@ -22,6 +22,8 @@ type
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
     // Access Control Keywords
     tkPrivate, tkProtected,
+    // Error Handling Keywords
+    tkPanic, tkAssert,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -135,6 +137,8 @@ begin
     tkDispose:    Result := 'dispose';
     tkPrivate:    Result := 'private';
     tkProtected:  Result := 'protected';
+    tkPanic:      Result := 'panic';
+    tkAssert:     Result := 'assert';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -479,6 +483,9 @@ begin
     // Access Control Keywords
     'private':    Result := tkPrivate;
     'protected':  Result := tkProtected;
+    // Error Handling Keywords
+    'panic':      Result := tkPanic;
+    'assert':     Result := tkAssert;
   else
     Result := tkIdent;
   end;
