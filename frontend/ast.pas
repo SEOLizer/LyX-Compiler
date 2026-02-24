@@ -24,7 +24,8 @@ type
     atChar,
     atBool,
     atVoid,
-    atPChar
+    atPChar,
+    atPCharNullable  // nullable pointer type (Option Type)
   );
 
   { --- Speicherklassen --- }
@@ -667,6 +668,13 @@ type
     property Decls: TAstNodeList read FDecls;
   end;
 
+{ --- Hilfsfunktionen für Nullable-Typen --- }
+
+function IsNullableType(t: TAurumType): Boolean;
+function BaseTypeOf(t: TAurumType): TAurumType;
+function NullableVersion(t: TAurumType): TAurumType;
+function NonNullableVersion(t: TAurumType): TAurumType;
+
 { --- Hilfsfunktionen --- }
 
 function AurumTypeToStr(t: TAurumType): string;
@@ -675,6 +683,37 @@ function StorageKlassToStr(sk: TStorageKlass): string;
 function NodeKindToStr(nk: TNodeKind): string;
 
 implementation
+
+{ --- Hilfsfunktionen für Nullable-Typen --- }
+
+function IsNullableType(t: TAurumType): Boolean;
+begin
+  Result := t = atPCharNullable;
+end;
+
+function BaseTypeOf(t: TAurumType): TAurumType;
+begin
+  if t = atPCharNullable then
+    Result := atPChar
+  else
+    Result := t;
+end;
+
+function NullableVersion(t: TAurumType): TAurumType;
+begin
+  if t = atPChar then
+    Result := atPCharNullable
+  else
+    Result := t;
+end;
+
+function NonNullableVersion(t: TAurumType): TAurumType;
+begin
+  if t = atPCharNullable then
+    Result := atPChar
+  else
+    Result := t;
+end;
 
 { --- Hilfsfunktionen --- }
 
@@ -698,6 +737,7 @@ begin
     atBool:       Result := 'bool';
     atVoid:       Result := 'void';
     atPChar:      Result := 'pchar';
+    atPCharNullable: Result := 'pchar?';
   else
     Result := '<unknown>';
   end;
@@ -723,6 +763,7 @@ begin
     'bool':   Result := atBool;
     'void':   Result := atVoid;
     'pchar':  Result := atPChar;
+    'pchar?': Result := atPCharNullable;
     'string': Result := atPChar; // map string to pchar for now
   else
     Result := atUnresolved;
