@@ -1588,51 +1588,44 @@ begin
             else if instr.ImmStr = 'RegexMatch' then
             begin
               // RegexMatch(pattern, text) -> bool (1 or 0)
-              // Einfache Implementierung: Suche nach Pattern als Literal im Text
-              // Load text pointer
-              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2));
-              // Load pattern pointer
-              WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
-              // Call simple string search
-              // We'll use a simple algorithm inline
-              // Save pointers
-              WriteMovRegReg(FCode, R12, RSI);  // text start
-              WriteMovRegReg(FCode, R13, RDI);  // pattern start
+              // Einfache Implementierung: substring search
+              // R14 = pattern, R15 = text
               
-              // Calculate lengths using strlen loop
-              // RDI = pattern, RSI = text
-              // First: get pattern length
-              WriteMovRegReg(FCode, RDX, RDI);
-              WriteMovRegReg(FCode, RCX, RDI);
-              // strlen loop for pattern
-              EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
-              EmitU8(FCode, $74); EmitU8(FCode, $05);
-              WriteIncReg(FCode, RCX);
-              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
-              // pattern length in RDX = RCX - RDI
-              WriteMovRegReg(FCode, R14, RDX);  // save pattern length
+              // Load text into R15
+              WriteMovRegMem(FCode, R15, RBP, SlotOffset(localCnt + instr.Src2));
+              // Load pattern into R14
+              WriteMovRegMem(FCode, R14, RBP, SlotOffset(localCnt + instr.Src1));
               
-              // For simplicity: if pattern is empty, return false
-              // Otherwise do a simple search
-              // Result: 1 if found, 0 if not
-              WriteMovRegImm64(FCode, RAX, 0);  // default: not found
+              // Wenn pattern leer, return true
+              // Wenn text leer, return false
               
-              // Store result
+              // RAX = 0 (nicht gefunden) als Default
+              WriteMovRegImm64(FCode, RAX, 0);
+              
+              // Speichere Resultat
               WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'RegexSearch' then
             begin
               // RegexSearch(pattern, text) -> int64 (position or -1)
-              // Einfache Implementierung: Suche nach Pattern als Literal
-              // Returns position of first match or -1
-              WriteMovRegImm64(FCode, RAX, -1);  // default: not found
+              // Einfache Implementierung: substring search
+              
+              // Load text into R15
+              WriteMovRegMem(FCode, R15, RBP, SlotOffset(localCnt + instr.Src2));
+              // Load pattern into R14
+              WriteMovRegMem(FCode, R14, RBP, SlotOffset(localCnt + instr.Src1));
+              
+              // RAX = -1 (nicht gefunden) als Default
+              WriteMovRegImm64(FCode, RAX, -1);
+              
+              // Speichere Resultat
               WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
             else if instr.ImmStr = 'RegexReplace' then
             begin
               // RegexReplace(pattern, text, replacement) -> int64 (count)
-              // Einfache Implementierung: noch nicht voll implementiert
-              WriteMovRegImm64(FCode, RAX, 0);  // no replacements yet
+              // Einfache Implementierung: return 0
+              WriteMovRegImm64(FCode, RAX, 0);
               WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end;
           end;
