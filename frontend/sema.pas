@@ -398,6 +398,39 @@ begin
   SetLength(s.ParamTypes, 1);
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
+
+  // === std.regex: Regex support (v0.4.2) ===
+  // RegexMatch(pattern: pchar, text: pchar) -> bool
+  s := TSymbol.Create('RegexMatch');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;  // pattern
+  s.ParamTypes[1] := atPChar;  // text
+  AddSymbolToCurrent(s, NullSpan);
+
+  // RegexSearch(pattern: pchar, text: pchar) -> int64 (position or -1)
+  s := TSymbol.Create('RegexSearch');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;  // pattern
+  s.ParamTypes[1] := atPChar;  // text
+  AddSymbolToCurrent(s, NullSpan);
+
+  // RegexReplace(pattern: pchar, text: pchar, replacement: pchar) -> int64 (count)
+  s := TSymbol.Create('RegexReplace');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;  // pattern
+  s.ParamTypes[1] := atPChar;  // text
+  s.ParamTypes[2] := atPChar;  // replacement
+  AddSymbolToCurrent(s, NullSpan);
+
 end;
 
 function IsIntegerType(t: TAurumType): Boolean;
@@ -2139,6 +2172,52 @@ begin
     else
     begin
       FDiag.Error('unknown builtin in Math: ' + name, span);
+      Exit;
+    end;
+  end
+  else if qualifier = 'Regex' then
+  begin
+    // Regex.* functions
+    if name = 'Match' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atBool;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'Search' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'Replace' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown builtin in Regex: ' + name, span);
       Exit;
     end;
   end
