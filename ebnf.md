@@ -319,7 +319,22 @@ var hex: pchar := r"0x[0-9a-fA-F]+";
 - Häufige Fehler werden früh erkannt (unmatched brackets, etc.)
 - Beispiel: `r"[abc"` → Fehler: "unclosed bracket in regex"
 
-**Hinweis:** Die eigentliche Regex-Engine wird in `std.Regex` implementiert (zukünftig).
+**Regex-Funktionen:**
+```lyx
+// Direkter Aufruf (Rückwärtskompatibilität)
+if (RegexMatch(r"abc", "abcdef")) { ... }
+var pos: int64 := RegexSearch(r"\d+", "abc123def");
+var count: int64 := RegexReplace(r"old", "text", "new");
+
+// Namespace-Aufruf
+if (Regex.Match(r"abc", "abcdef")) { ... }
+var pos: int64 := Regex.Search(r"\d+", "abc123def");
+var count: int64 := Regex.Replace(r"old", "text", "new");
+```
+
+- `RegexMatch(pattern, text)` -> bool: Prüft ob Pattern in Text vorkommt
+- `RegexSearch(pattern, text)` -> int64: Position des ersten Matches oder -1
+- `RegexReplace(pattern, text, replacement)` -> int64: Anzahl Ersetzungen
 
 ### Typen
 

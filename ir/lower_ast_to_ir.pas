@@ -1460,6 +1460,58 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
+        else if ((TAstCall(expr).Name = 'RegexMatch') or
+                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Match'))) then
+        begin
+          // RegexMatch(pattern, text) -> bool
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'RegexMatch';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if ((TAstCall(expr).Name = 'RegexSearch') or
+                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Search'))) then
+        begin
+          // RegexSearch(pattern, text) -> int64 (position or -1)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'RegexSearch';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if ((TAstCall(expr).Name = 'RegexReplace') or
+                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Replace'))) then
+        begin
+          // RegexReplace(pattern, text, replacement) -> int64 (count)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'RegexReplace';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          if argCount >= 3 then instr.Src3 := argTemps[2] else instr.Src3 := -1;
+          Emit(instr);
+          Result := t0;
+        end
         else
         begin
           // Regular function call

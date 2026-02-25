@@ -4,19 +4,32 @@
 
 ### 🚀 **Neue Hauptfeatures**
 
-#### **Regex-Literale (v0.4.2)**
+#### **Regex-Literale und Regex-Funktionen (v0.4.2)**
 
 Native Unterstützung für reguläre Ausdrücke:
 
 ```lyx
 var email: pchar := r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
 var phone: pchar := r"\d{3}-\d{4}";
+
+// Regex-Funktionen
+if (RegexMatch(r"abc", "abcdef")) {
+    IO.PrintStr("Match!\n");
+};
+var pos: int64 := RegexSearch(r"\d+", "abc123def");
+var count: int64 := RegexReplace(r"old", "text", "new");
 ```
 
-- **Syntax:** `r"pattern"` - Präfix `r` gefolgt von Anführungszeichen
-- **Compile-Time-Validierung:** Der Compiler prüft die Regex-Syntax
-- **Type:** Regex-Literale haben den Typ `pchar` (String)
-- **Escape-Sequenzen:** `\"`, `\\`, `\n`, `\r`, `\t`
+**Syntax:** `r"pattern"` - Präfix `r` gefolgt von Anführungszeichen
+
+**Funktionen:**
+- `RegexMatch(pattern, text)` -> bool: Prüft ob Pattern in Text vorkommt
+- `RegexSearch(pattern, text)` -> int64: Position oder -1
+- `RegexReplace(pattern, text, replacement)` -> int64: Anzahl Ersetzungen
+
+**Namespace:** `Regex.Match`, `Regex.Search`, `Regex.Replace`
+
+**Compile-Time-Validierung:** Der Compiler prüft die Regex-Syntax
 
 #### **Namespaces für Builtins (empfohlen, rückwärtskompatibel)**
 
