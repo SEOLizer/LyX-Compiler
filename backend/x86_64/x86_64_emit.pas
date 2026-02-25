@@ -504,6 +504,10 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   dumpBuf: array of Byte;
   fs: TFileStream;
   fname: string;
+  // PLT patching
+  pltNStart: Integer;
+  jmpPlt0OffsetPos: Integer;
+  pltRel32: Int64;
 begin
   // reset patch arrays
   SetLength(FLeaPositions, 0);
@@ -2847,21 +2851,90 @@ begin
   globalVarNames.Free;
 
   // Generate PLT stubs for external symbols at end of code section
+  // Standard x86-64 PLT layout (each entry 16 bytes):
+  //   PLT0: pushq GOT[1](%rip) ; jmpq *GOT[2](%rip) ; nopl
+  //   PLTn: jmpq *GOT[n+3](%rip) ; pushq $reloc_index ; jmpq PLT0
+  
+  // First, generate PLT0 (resolver stub - 16 bytes)
+  // This is called on first use of any external function
+  SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+  FLabelPositions[High(FLabelPositions)].Name := '__plt_0';
+  FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+  
+  // PLT0:
+  // pushq GOT+8(%rip) - push link_map pointer
+  EmitU8(FCode, $FF); // FF 35 = pushq disp32
+  EmitU8(FCode, $35);
+  EmitU32(FCode, 0);  // placeholder for GOT[1] offset (will be patched)
+  
+  // jmpq *GOT+16(%rip) - jump to resolver
+  EmitU8(FCode, $FF); // FF 25 = jmpq disp32
+  EmitU8(FCode, $25);
+  EmitU32(FCode, 0);  // placeholder for GOT[2] offset (will be patched)
+  
+  // nopl 0(%rax) - padding to make PLT0 exactly 16 bytes
+  EmitU8(FCode, $0F);
+  EmitU8(FCode, $1F);
+  EmitU8(FCode, $40);
+  EmitU8(FCode, $00);
+  
+  // Store PLT0 positions (same for all external symbols)
+  // PLT0 push offset is at buffer position 2 (after FF 35)
+  // PLT0 jmp offset is at buffer position 8 (after FF 25)
+  // These are used by the ELF writer to patch PLT0
+  
+  // Now generate PLT entries for each external symbol (16 bytes each)
   for i := 0 to High(FExternalSymbols) do
   begin
     // Register PLT stub label
     SetLength(FLabelPositions, Length(FLabelPositions) + 1);
     FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
     FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
-    // Emit: jmp [rip+disp32] = FF 25 xx xx xx xx
-    // The disp32 placeholder will be patched by the ELF writer to point to the GOT entry
+    
+    // PLTn entry (16 bytes):
+    // jmpq *GOT[n+3](%rip)
     SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
-    FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size + 2; // position of disp32 within jmp
+    FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size; // position of jmp opcode (FF 25)
     FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
     FPLTGOTPatches[High(FPLTGOTPatches)].SymbolIndex := i;
+    // Store PLT0 positions for patching (same for all entries)
+    // PLT0 push offset at buffer pos 2, jmp offset at buffer pos 8
+    FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 2;
+    FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 8;
+    FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := 0;  // filled by writer
+    FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;    // filled by writer
     EmitU8(FCode, $FF); // jmp [rip+disp32]
     EmitU8(FCode, $25);
-    EmitU32(FCode, 0);  // placeholder for GOT-relative offset
+    EmitU32(FCode, 0);  // placeholder for GOT entry offset (patched by ELF writer)
+    
+    // pushq $reloc_index - push relocation index for dynamic linker
+    EmitU8(FCode, $68); // push imm32
+    EmitU32(FCode, Cardinal(i)); // relocation index
+    
+    // jmpq PLT0 - jump to resolver stub
+    // Calculate relative offset from end of this instruction to PLT0
+    // PLT0 starts at offset 0, this jmp is at: current position + 5 (for push instruction)
+    // rel32 = target - (current + 5) = 0 - (FCode.Size + 5)
+    EmitU8(FCode, $E9); // jmp rel32
+    EmitU32(FCode, 0);  // placeholder - will be patched after we know final positions
+  end;
+  
+  // Now patch the jmp PLT0 in each PLTn entry
+  // PLT0 is at offset 0, each PLTn entry is 16 bytes
+  for i := 0 to High(FExternalSymbols) do
+  begin
+    // Position of jmp PLT0 in PLTn:
+    // PLTn starts at: 16 (PLT0 is 16 bytes) + i*16
+    // jmp PLT0 is at: start + 6 (jmp GOT) + 5 (push) = start + 11
+    // rel32 field is at: start + 12
+    // Target = 0 (PLT0)
+    // rel32 = 0 - (start + 12 + 5) = -(start + 17)
+    // start = 16 + i*16 = 16*(i+1)
+    // rel32 = -(16*(i+1) + 17) = -(16*i + 33)
+    pltNStart := 16 + i * 16; // PLT0 is 16 bytes, each PLTn is 16 bytes
+    jmpPlt0OffsetPos := pltNStart + 12; // jmp opcode at +11, rel32 at +12
+    pltRel32 := -Int64(pltNStart + 17); // target (0) - (position + 5 for jmp instruction)
+    FCode.PatchU32LE(jmpPlt0OffsetPos, Cardinal(pltRel32));
   end;
 
   // patch jumps to labels

@@ -356,6 +356,10 @@ var
   nextInstrVA: UInt64;
   ripOffset: Int64;
   gotBufOffset: Integer;
+  plt0VA: UInt64;
+  pushOffset: Int64;
+  jmpOffset: Int64;
+  plt0StartInBuffer: Integer;
 
   // Local helper to dump first bytes of a TByteBuffer for debugging
   procedure DumpBuf(const name: string; buf: TByteBuffer);
@@ -402,7 +406,7 @@ begin
       libNames.Add(externSymbols[i].LibraryName);
       symNames.Add(externSymbols[i].Name);
     end;
-    
+
     symCount := symNames.Count;
     
     // Build string table
@@ -633,40 +637,88 @@ begin
        dyn.d_un := 0;
        dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
        
-       // Apply PLT patches if provided
-       WriteLn('DEBUG: Applying ', Length(pltPatches), ' PLT patches');
-       if Length(pltPatches) > 0 then
-       begin
+        // Apply PLT patches if provided
+        WriteLn('DEBUG: Applying ', Length(pltPatches), ' PLT patches');
+        if Length(pltPatches) > 0 then
+        begin
+          // First, patch PLT0 (the resolver stub)
+          // PLT0 is at the start of the code section
+          // pushq GOT+8: FF 35 at offset 0, rel32 at offset 2
+          // jmpq GOT+16: FF 25 at offset 6, rel32 at offset 8
+          plt0VA := baseVA + codeOffset;
+          
+          // Push offset: (GOT+8) - (PLT0VA + 6)
+          // After pushq instruction reads its 4-byte displacement, RIP is at PLT0VA + 6
+          pushOffset := Int64(dynInfo.gotVA + 8) - Int64(plt0VA + 6);
+          // Jmp offset: (GOT+16) - (PLT0VA + 12)
+          // After jmpq instruction reads its 4-byte displacement, RIP is at PLT0VA + 12
+          jmpOffset := Int64(dynInfo.gotVA + 16) - Int64(plt0VA + 12);
+          
+          WriteLn('DEBUG PLT0: plt0VA=', UInt64(plt0VA), 
+                  ' gotVA=', UInt64(dynInfo.gotVA),
+                  ' pushOffset=', pushOffset, 
+                  ' jmpOffset=', jmpOffset,
+                  ' codeOffset=', codeOffset);
+          
+          // PLT0 starts 16 bytes before the first PLT stub (pltStubPos - 16)
+          // For PLT1: pltStubPos = 116, so PLT0 starts at 100
+          plt0StartInBuffer := pltPatches[0].Pos - 16;
+          WriteLn('DEBUG PLT0: pltStubPos[0]=', pltPatches[0].Pos, ' plt0StartInBuffer=', plt0StartInBuffer);
+          
+          // Patch PLT0 pushq GOT+8 at position plt0StartInBuffer + 2
+          codeBuf.PatchU32LE(plt0StartInBuffer + 2, Cardinal(pushOffset));
+          // Patch PLT0 jmpq GOT+16 at position plt0StartInBuffer + 8
+          codeBuf.PatchU32LE(plt0StartInBuffer + 8, Cardinal(jmpOffset));
+          
+          // Now patch PLT stubs for each external symbol
          for i := 0 to High(pltPatches) do
-         begin
-           // Calculate the GOT entry address for this symbol
-           // GOT layout: [0]=_DYNAMIC, [1]=link_map, [2]=_dl_runtime_resolve, [3..]=functions
-           gotEntryVA := dynInfo.gotVA + 24 + (pltPatches[i].SymbolIndex * 8);
+          begin
+            // Calculate the GOT entry address for this symbol
+            // GOT layout: [0]=_DYNAMIC, [1]=link_map, [2]=_dl_runtime_resolve, [3..]=functions
+            gotEntryVA := dynInfo.gotVA + 24 + (pltPatches[i].SymbolIndex * 8);
 
-           // Calculate RIP-relative offset from PLT stub to GOT entry
-           pltStubVA := baseVA + codeOffset + pltPatches[i].Pos - 2;
-           nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx
-           ripOffset := Int64(gotEntryVA) - Int64(nextInstrVA);
+            // Calculate RIP-relative offset from PLT stub to GOT entry
+            // pltStubPos is the position of the jmp opcode (FF 25) within the PLT stub
+            // The jmp is at pltStubPos, the disp32 is at pltStubPos + 2
+            // So pltStubVA = baseVA + codeOffset + pltStubPos
+            // nextInstrVA = pltStubVA + 6 (after jmp [rip+disp32])
+            pltStubVA := baseVA + codeOffset + pltPatches[i].Pos;
+            nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx (6 bytes total)
+            ripOffset := Int64(gotEntryVA) - Int64(nextInstrVA);
 
-           WriteLn('DEBUG PLT patch ', i, ': sym=', pltPatches[i].SymbolName, ' symIdx=', pltPatches[i].SymbolIndex,
-                   ' gotEntryVA=', UInt64(gotEntryVA), ' pltStubPos=', pltPatches[i].Pos, ' ripOffset=', ripOffset);
+            WriteLn('DEBUG PLT patch ', i, ': sym=', pltPatches[i].SymbolName, ' symIdx=', pltPatches[i].SymbolIndex,
+                    ' gotEntryVA=', UInt64(gotEntryVA), 
+                    ' pltStubPos=', pltPatches[i].Pos, 
+                    ' pltStubVA=', UInt64(pltStubVA),
+                    ' nextInstrVA=', UInt64(nextInstrVA),
+                    ' ripOffset=', ripOffset);
 
-           // Patch the code buffer
-           codeBuf.PatchU32LE(pltPatches[i].Pos, Cardinal(ripOffset));
-         end;
+            // Patch jmp [rip+disp32] to GOT entry - use buffer index directly
+            codeBuf.PatchU32LE(pltPatches[i].Pos + 2, Cardinal(ripOffset));
+            
+            // Patch the jmp PLT0 at offset +12 within the PLT stub
+            // PLTn starts at pltStubPos, jmp opcode at +6, rel32 at +12
+            // rel32 = plt0VA - (pltStubVA + 11 + 5) = plt0VA - pltStubVA - 16
+            pltStubVA := baseVA + codeOffset + pltPatches[i].Pos;
+            jmpOffset := Int64(plt0VA) - Int64(pltStubVA + 16);
+            WriteLn('DEBUG jmp PLT0: pltStubVA=', UInt64(pltStubVA), ' plt0VA=', UInt64(plt0VA), 
+                    ' jmpOffset=', jmpOffset, ' bufPos=', pltPatches[i].Pos + 12);
+            codeBuf.PatchU32LE(pltPatches[i].Pos + 12, Cardinal(jmpOffset));
+          end;
 
-         // Initialize GOT entries for PLT resolution: set GOT[3 + symIdx]
-         // to point to the PLT stub's second instruction (so the first indirect
-         // jmp lands inside the PLT which then calls the resolver).
-         for i := 0 to High(pltPatches) do
-         begin
-           pltStubVA := baseVA + codeOffset + pltPatches[i].Pos - 2;
-           nextInstrVA := pltStubVA + 6;
-           gotBufOffset := (3 + pltPatches[i].SymbolIndex) * 8;
-           gotTable.PatchU64LE(gotBufOffset, QWord(nextInstrVA));
-           WriteLn('DBG GOT init symIdx=', pltPatches[i].SymbolIndex, ' GOTbufOff=', gotBufOffset, ' val=', UInt64(nextInstrVA));
-         end;
-       end;
+          // Initialize GOT entries for PLT resolution: set GOT[3 + symIdx]
+          // to point to the PLT stub's second instruction (so the first indirect
+          // jmp lands inside the PLT which then calls the resolver).
+          for i := 0 to High(pltPatches) do
+          begin
+            pltStubVA := baseVA + codeOffset + pltPatches[i].Pos;
+            nextInstrVA := pltStubVA + 6;
+            gotBufOffset := (3 + pltPatches[i].SymbolIndex) * 8;
+            gotTable.PatchU64LE(gotBufOffset, QWord(nextInstrVA));
+            WriteLn('DBG GOT init symIdx=', pltPatches[i].SymbolIndex, ' GOTbufOff=', gotBufOffset, 
+                    ' pltStubVA=', UInt64(pltStubVA), ' nextInstrVA=', UInt64(nextInstrVA), ' val=', UInt64(nextInstrVA));
+          end;
+        end;
 
        // Build ELF header
        FillChar(elfHeader, SizeOf(elfHeader), 0);
