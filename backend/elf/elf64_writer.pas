@@ -355,8 +355,33 @@ var
   pltStubVA: UInt64;
   nextInstrVA: UInt64;
   ripOffset: Int64;
-  
+  gotBufOffset: Integer;
+
+  // Local helper to dump first bytes of a TByteBuffer for debugging
+  procedure DumpBuf(const name: string; buf: TByteBuffer);
+  var
+    i, lim: Integer;
+    p: PByte;
+  begin
+    if buf = nil then
+    begin
+      WriteLn('DBG ', name, ': <nil>');
+      Exit;
+    end;
+    WriteLn('DBG ', name, ' size=', buf.Size);
+    if buf.Size = 0 then Exit;
+    p := buf.GetBuffer;
+    lim := buf.Size;
+    if lim > 64 then lim := 64;
+    for i := 0 to lim - 1 do
+      Write(IntToHex(p[i], 2), ' ');
+    if buf.Size > lim then
+      Write('...');
+    WriteLn;
+  end;
+
 begin
+
   codeSize := codeBuf.Size;
   dataSize := dataBuf.Size;
   interpSize := Length(interpPath) + 1;
@@ -418,7 +443,13 @@ begin
         sym.st_shndx := 0; // SHN_UNDEF
         sym.st_value := 0;
         sym.st_size := 0;
-        dynSymTable.WriteBuffer(sym, SizeOf(sym));
+        // Write individual fields to ensure correct byte order
+        dynSymTable.WriteU32LE(sym.st_name);
+        dynSymTable.WriteU8(sym.st_info);
+        dynSymTable.WriteU8(sym.st_other);
+        dynSymTable.WriteU16LE(sym.st_shndx);
+        dynSymTable.WriteU64LE(sym.st_value);
+        dynSymTable.WriteU64LE(sym.st_size);
       end;
       
       // Build .got.plt
@@ -439,7 +470,10 @@ begin
         rela.r_offset := 0; // Will be filled with GOT entry VA
         rela.r_info := ((UInt64(i) + 1) shl 32) or R_X86_64_JUMP_SLOT;
         rela.r_addend := 0;
-        relaPltTable.WriteBuffer(rela, SizeOf(rela));
+        // Write individual fields to ensure correct byte order
+        relaPltTable.WriteU64LE(rela.r_offset);
+        relaPltTable.WriteU64LE(rela.r_info);
+        relaPltTable.WriteU64LE(rela.r_addend);
       end;
       
       // Prepare rela.dyn table (will contain R_X86_64_RELATIVE entries)
@@ -589,33 +623,54 @@ begin
       dyn.d_un := dynStrTable.Size;
       dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
 
-      // DT_NULL terminator
-      dyn.d_tag := DT_NULL;
-      dyn.d_un := 0;
-      dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
-      
-      // Apply PLT patches if provided
-      WriteLn('DEBUG: Applying ', Length(pltPatches), ' PLT patches');
-      if Length(pltPatches) > 0 then
-      begin
-        for i := 0 to High(pltPatches) do
-        begin
-          // Calculate the GOT entry address for this symbol
-          // GOT layout: [0]=_DYNAMIC, [1]=link_map, [2]=_dl_runtime_resolve, [3..]=functions
-          gotEntryVA := dynInfo.gotVA + 24 + (pltPatches[i].SymbolIndex * 8);
+       // DT_BIND_NOW - force eager binding at load time (resolves GOT before run)
+       dyn.d_tag := DT_BIND_NOW;
+       dyn.d_un := 1;
+       dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
 
-          // Calculate RIP-relative offset from PLT stub to GOT entry
-          pltStubVA := baseVA + codeOffset + pltPatches[i].Pos - 2;
-          nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx
-          ripOffset := Int64(gotEntryVA) - Int64(nextInstrVA);
+       // DT_NULL terminator
+       dyn.d_tag := DT_NULL;
+       dyn.d_un := 0;
+       dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
+       
+       // Apply PLT patches if provided
+       WriteLn('DEBUG: Applying ', Length(pltPatches), ' PLT patches');
+       if Length(pltPatches) > 0 then
+       begin
+         for i := 0 to High(pltPatches) do
+         begin
+           // Calculate the GOT entry address for this symbol
+           // GOT layout: [0]=_DYNAMIC, [1]=link_map, [2]=_dl_runtime_resolve, [3..]=functions
+           gotEntryVA := dynInfo.gotVA + 24 + (pltPatches[i].SymbolIndex * 8);
 
-          WriteLn('DEBUG PLT patch ', i, ': sym=', pltPatches[i].SymbolName, ' symIdx=', pltPatches[i].SymbolIndex,
-                  ' gotEntryVA=', UInt64(gotEntryVA), ' pltStubPos=', pltPatches[i].Pos, ' ripOffset=', ripOffset);
+           // Calculate RIP-relative offset from PLT stub to GOT entry
+           pltStubVA := baseVA + codeOffset + pltPatches[i].Pos - 2;
+           nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx
+           ripOffset := Int64(gotEntryVA) - Int64(nextInstrVA);
 
-          // Patch the code buffer
-          codeBuf.PatchU32LE(pltPatches[i].Pos, Cardinal(ripOffset));
-        end;
-      end;
+           WriteLn('DEBUG PLT patch ', i, ': sym=', pltPatches[i].SymbolName, ' symIdx=', pltPatches[i].SymbolIndex,
+                   ' gotEntryVA=', UInt64(gotEntryVA), ' pltStubPos=', pltPatches[i].Pos, ' ripOffset=', ripOffset);
+
+           // Patch the code buffer
+           codeBuf.PatchU32LE(pltPatches[i].Pos, Cardinal(ripOffset));
+         end;
+
+         // Initialize GOT entries for PLT resolution: set GOT[3 + symIdx]
+         // to point to the PLT stub's second instruction (so the first indirect
+         // jmp lands inside the PLT which then calls the resolver).
+         for i := 0 to High(pltPatches) do
+         begin
+           pltStubVA := baseVA + codeOffset + pltPatches[i].Pos - 2;
+           nextInstrVA := pltStubVA + 6;
+           gotBufOffset := (3 + pltPatches[i].SymbolIndex) * 8;
+           gotTable.PatchU64LE(gotBufOffset, QWord(nextInstrVA));
+           WriteLn('DBG GOT init symIdx=', pltPatches[i].SymbolIndex, ' GOTbufOff=', gotBufOffset, ' val=', UInt64(nextInstrVA));
+         end;
+       end;
+
+       // Build ELF header
+       FillChar(elfHeader, SizeOf(elfHeader), 0);
+
       
       // Build ELF header
       FillChar(elfHeader, SizeOf(elfHeader), 0);
@@ -681,17 +736,25 @@ begin
       dynamicPhdr.p_memsz := dynamicTable.Size;
       dynamicPhdr.p_align := 8;
       
-      // Debug: print computed layout before writing file
-      WriteLn('DEBUG ELF LAYOUT:');
-      WriteLn('  codeOffset=', codeOffset, ' codeSize=', codeSize);
-      WriteLn('  dataOffset=', dataOffset, ' dataSize=', dataSize);
-      WriteLn('  gotOffset=', dynInfo.gotOffset, ' gotVA=', UInt64(dynInfo.gotVA));
-      WriteLn('  relaPltOffset=', dynInfo.relaPltOffset, ' relaPltVA=', UInt64(dynInfo.relaPltVA), ' relaPltSize=', relaPltTable.Size);
-      WriteLn('  relaDynOffset=', dynInfo.relaDynOffset, ' relaDynVA=', UInt64(dynInfo.relaDynVA), ' relaDynSize=', relaDynTable.Size);
-      WriteLn('  dynStrOffset=', dynInfo.dynStrOffset, ' dynStrVA=', UInt64(dynInfo.dynStrVA), ' dynStrSize=', dynStrTable.Size);
-      WriteLn('  dynSymOffset=', dynInfo.dynSymOffset, ' dynSymVA=', UInt64(dynInfo.dynSymVA), ' dynSymSize=', dynSymTable.Size);
-      WriteLn('  dynamicOffset=', dynInfo.dynamicOffset, ' dynamicVA=', UInt64(dynInfo.dynamicVA), ' dynamicSize=', dynamicTable.Size);
-      WriteLn('  headersSize=', headersSize);
+       // Debug: print computed layout before writing file
+       WriteLn('DEBUG ELF LAYOUT:');
+       WriteLn('  codeOffset=', codeOffset, ' codeSize=', codeSize);
+       WriteLn('  dataOffset=', dataOffset, ' dataSize=', dataSize);
+       WriteLn('  gotOffset=', dynInfo.gotOffset, ' gotVA=', UInt64(dynInfo.gotVA));
+       WriteLn('  relaPltOffset=', dynInfo.relaPltOffset, ' relaPltVA=', UInt64(dynInfo.relaPltVA), ' relaPltSize=', relaPltTable.Size);
+       WriteLn('  relaDynOffset=', dynInfo.relaDynOffset, ' relaDynVA=', UInt64(dynInfo.relaDynVA), ' relaDynSize=', relaDynTable.Size);
+       WriteLn('  dynStrOffset=', dynInfo.dynStrOffset, ' dynStrVA=', UInt64(dynInfo.dynStrVA), ' dynStrSize=', dynStrTable.Size);
+       WriteLn('  dynSymOffset=', dynInfo.dynSymOffset, ' dynSymVA=', UInt64(dynInfo.dynSymVA), ' dynSymSize=', dynSymTable.Size);
+       WriteLn('  dynamicOffset=', dynInfo.dynamicOffset, ' dynamicVA=', UInt64(dynInfo.dynamicVA), ' dynamicSize=', dynamicTable.Size);
+       WriteLn('  headersSize=', headersSize);
+
+       DumpBuf('.got.plt', gotTable);
+       DumpBuf('.rela.plt', relaPltTable);
+       DumpBuf('.rela.dyn', relaDynTable);
+       DumpBuf('.dynstr', dynStrTable);
+       DumpBuf('.dynsym', dynSymTable);
+       DumpBuf('.dynamic', dynamicTable);
+
 
       // Write ELF file
       fileBuf := TFileStream.Create(filename, fmCreate);
