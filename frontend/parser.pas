@@ -1289,6 +1289,14 @@ begin
     Exit;
   end;
 
+  if Check(tkRegexLit) then
+  begin
+    span := FCurTok.Span;
+    Result := TAstRegexLit.Create(FCurTok.Value, span);
+    Advance;
+    Exit;
+  end;
+
   if Check(tkTrue) or Check(tkFalse) then
   begin
     b := Check(tkTrue);

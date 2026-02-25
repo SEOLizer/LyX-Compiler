@@ -296,6 +296,31 @@ fn setAge(age: int64) -> void {
 * Wenn `cond` false ist, wird `panic(msg)` aufgerufen
 * Nützlich für Debugging und Invariantenprüfung
 
+### Regex-Literale (v0.4.2)
+
+Regex-Literale ermöglichen typsichere reguläre Ausdrücke:
+
+```lyx
+var email: pchar := r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+var phone: pchar := r"\d{3}-\d{4}";
+var hex: pchar := r"0x[0-9a-fA-F]+";
+```
+
+**Syntax:** `r"pattern"`
+
+- Das Präfix `r` gefolgt von Anführungszeichen markiert ein Regex-Literal
+- Escape-Sequenzen: `\"`, `\\`, `\n`, `\r`, `\t`
+- Klassen: `[abc]`, `[^abc]`, `[a-z]`
+- Quantoren: `*`, `+`, `?`, `{n}`, `{n,m}`
+- Gruppen: `(...)`
+
+**Compile-Time-Validierung:**
+- Der Compiler prüft die Regex-Syntax beim Kompilieren
+- Häufige Fehler werden früh erkannt (unmatched brackets, etc.)
+- Beispiel: `r"[abc"` → Fehler: "unclosed bracket in regex"
+
+**Hinweis:** Die eigentliche Regex-Engine wird in `std.Regex` implementiert (zukünftig).
+
 ### Typen
 
 ```
@@ -356,10 +381,14 @@ Primary        := IntLit
                 | 'null'                         // Null-Literal für Nullable-Typen
                 | 'new' Ident '(' [ ArgList ] ')' // Heap-Allokation (Klassen)
                 | 'panic' '(' Expr ')'           // Panic-Expression (bricht Programm ab)
+                | 'r"' RegexPattern '"'           // Regex-Literal (v0.4.2)
                 | StructLit
                 | ArrayLit
                 | Ident
                 | '(' Expr ')' ;
+
+RegexPattern  := { Beliebiges Zeichen except '"' | EscapeSeq } ;
+EscapeSeq      := '\' ( 'n' | 'r' | 't' | '\' | '"' | '[' | ']' | '(' | ')' | '{' | '}' ) ;
 
 PostfixExpr    := Primary { PostfixSuffix } ;
 PostfixSuffix  := '(' [ ArgList ] ')'            // Funktions- oder Methodenaufruf

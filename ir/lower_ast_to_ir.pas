@@ -778,6 +778,19 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         Result := t0;
       end;
 
+    nkRegexLit:
+      begin
+        // Regex-Literal: like string, store pattern in data section
+        // Syntax validation happens in Sema already
+        strIdx := FModule.InternString(TAstRegexLit(expr).Pattern);
+        t0 := NewTemp;
+        instr.Op := irConstStr;
+        instr.Dest := t0;
+        instr.ImmStr := IntToStr(strIdx);
+        Emit(instr);
+        Result := t0;
+      end;
+
     nkBoolLit:
       begin
         // Emit boolean as 0 or 1

@@ -51,6 +51,7 @@ type
     procedure ProcessImports(prog: TAstProgram);
     procedure ImportUnit(imp: TAstImportDecl);
     function TypeEqual(a, b: TAurumType): Boolean;
+    function ValidateRegex(const pattern: string; span: TSourceSpan): Boolean;
     function CheckExpr(expr: TAstExpr): TAurumType;
     function CheckStructLit(sl: TAstStructLit): TAurumType;
     procedure CheckStmt(stmt: TAstStmt);
@@ -470,6 +471,14 @@ begin
     nkStrLit: Result := atPChar;
     nkBoolLit: Result := atBool;
     nkCharLit: Result := atChar;
+    nkRegexLit:
+      begin
+        // Compile-Time Regex-Validierung
+        Result := atPChar;
+        // Einfache Syntax-Validierung
+        if not ValidateRegex(TAstRegexLit(expr).Pattern, expr.Span) then
+          Result := atUnresolved;
+      end;
     nkFieldAccess:
       begin
         // resolve object expression first
@@ -2181,6 +2190,71 @@ begin
   
   if Result = nil then
     FDiag.Error('symbol not found in module ' + qualifier + ': ' + name, span);
+end;
+
+function TSema.ValidateRegex(const pattern: string; span: TSourceSpan): Boolean;
+{ Validate basic regex syntax at compile-time }
+var
+  i: Integer;
+  openBrackets: Integer;
+begin
+  Result := True;
+  openBrackets := 0;
+  i := 1;
+  while i <= Length(pattern) do
+  begin
+    case pattern[i] of
+      '[': Inc(openBrackets);
+      ']': 
+        begin
+          Dec(openBrackets);
+          if openBrackets < 0 then
+          begin
+            FDiag.Error('unmatched closing bracket ] in regex', span);
+            Result := False;
+            Exit;
+          end;
+        end;
+      '(': Inc(openBrackets);
+      ')':
+        begin
+          Dec(openBrackets);
+          if openBrackets < 0 then
+          begin
+            FDiag.Error('unmatched closing parenthesis ) in regex', span);
+            Result := False;
+            Exit;
+          end;
+        end;
+      '\':
+        // Escape sequence - skip next character
+        if i < Length(pattern) then
+          Inc(i);
+      '{':
+        begin
+          // Quantifier {n} or {n,m}
+          if i + 1 > Length(pattern) then
+          begin
+            FDiag.Error('incomplete quantifier in regex', span);
+            Result := False;
+            Exit;
+          end;
+          if not (pattern[i + 1] in ['0'..'9']) then
+          begin
+            FDiag.Error('invalid quantifier in regex', span);
+            Result := False;
+            Exit;
+          end;
+        end;
+    end;
+    Inc(i);
+  end;
+  
+  if openBrackets > 0 then
+  begin
+    FDiag.Error('unclosed bracket in regex', span);
+    Result := False;
+  end;
 end;
 
 procedure TSema.Analyze(prog: TAstProgram);

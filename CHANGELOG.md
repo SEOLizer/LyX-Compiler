@@ -4,6 +4,20 @@
 
 ### 🚀 **Neue Hauptfeatures**
 
+#### **Regex-Literale (v0.4.2)**
+
+Native Unterstützung für reguläre Ausdrücke:
+
+```lyx
+var email: pchar := r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+var phone: pchar := r"\d{3}-\d{4}";
+```
+
+- **Syntax:** `r"pattern"` - Präfix `r` gefolgt von Anführungszeichen
+- **Compile-Time-Validierung:** Der Compiler prüft die Regex-Syntax
+- **Type:** Regex-Literale haben den Typ `pchar` (String)
+- **Escape-Sequenzen:** `\"`, `\\`, `\n`, `\r`, `\t`
+
 #### **Namespaces für Builtins (empfohlen, rückwärtskompatibel)**
 
 Funktionen können jetzt über Namespaces aufgerufen werden:

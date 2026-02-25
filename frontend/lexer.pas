@@ -10,7 +10,7 @@ uses
 type
   TTokenKind = (
     // Literale
-    tkIntLit, tkFloatLit, tkStrLit, tkCharLit, tkIdent,
+    tkIntLit, tkFloatLit, tkStrLit, tkCharLit, tkRegexLit, tkIdent,
     // Keywords
     tkFn, tkVar, tkLet, tkCo, tkCon,
     tkIf, tkElse, tkWhile, tkReturn,
@@ -73,6 +73,7 @@ type
     function ReadNumber: TToken;
     function ReadString: TToken;
     function ReadCharLit: TToken;
+    function ReadRegexLit: TToken;
     function ReadIdentOrKeyword: TToken;
     function LookupKeyword(const s: string): TTokenKind;
   public
@@ -94,6 +95,7 @@ begin
     tkFloatLit:  Result := 'FloatLit';
     tkStrLit:    Result := 'StrLit';
     tkCharLit:   Result := 'CharLit';
+    tkRegexLit:  Result := 'RegexLit';
     tkIdent:     Result := 'Ident';
     tkFn:        Result := 'fn';
     tkVar:       Result := 'var';
@@ -436,6 +438,58 @@ begin
     FCol - startCol);
 end;
 
+function TLexer.ReadRegexLit: TToken;
+{ Regex-Literal: r"..." }
+var
+  startLine, startCol: Integer;
+  s: string;
+begin
+  startLine := FLine;
+  startCol := FCol;
+  Advance; // 'r'
+  Advance; // öffnendes "
+  s := '';
+  while (not IsAtEnd) and (CurrentChar <> '"') do
+  begin
+    if CurrentChar = #10 then
+    begin
+      FDiag.Error('unterminated regex literal',
+        MakeSpan(startLine, startCol, 1, FFileName));
+      Result := MakeToken(tkError, '', startLine, startCol, 1);
+      Exit;
+    end;
+    // Support basic escape sequences in regex
+    if CurrentChar = '\' then
+    begin
+      Advance;
+      if IsAtEnd then
+      begin
+        FDiag.Error('unexpected end of file in regex escape',
+          MakeSpan(FLine, FCol, 1, FFileName));
+        Result := MakeToken(tkError, '', startLine, startCol, 1);
+        Exit;
+      end;
+      // Pass through escape sequences - regex engine handles them
+      s := s + '\';
+      s := s + CurrentChar;
+      Advance;
+      Continue;
+    end;
+    s := s + CurrentChar;
+    Advance;
+  end;
+  if IsAtEnd then
+  begin
+    FDiag.Error('unterminated regex literal',
+      MakeSpan(startLine, startCol, 1, FFileName));
+    Result := MakeToken(tkError, '', startLine, startCol, 1);
+    Exit;
+  end;
+  Advance; // schließendes "
+  Result := MakeToken(tkRegexLit, s, startLine, startCol,
+    FCol - startCol);
+end;
+
 function TLexer.LookupKeyword(const s: string): TTokenKind;
 begin
   case s of
@@ -564,6 +618,13 @@ begin
   if c = '''' then
   begin
     Result := ReadCharLit;
+    Exit;
+  end;
+
+  // Regex literals: r"..."
+  if (c = 'r') and (PeekChar = '"') then
+  begin
+    Result := ReadRegexLit;
     Exit;
   end;
 
