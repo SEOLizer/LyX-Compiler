@@ -445,6 +445,8 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   bufferAdded: Boolean;
   bufferOffset: UInt64;
   bufferLeaPositions: array of Integer;
+  // newline constant for PrintLn
+  nlGlobalPos: UInt64;
   // env data storage (argc, argv)
   envAdded: Boolean;
   envOffset: UInt64;
@@ -520,6 +522,12 @@ begin
     FData.WriteU8(0);
     Inc(totalDataOffset, Length(module.Strings[i]) + 1);
   end;
+
+  // Add newline constant for PrintLn
+  nlGlobalPos := totalDataOffset;
+  FData.WriteU8(Ord(^M));  // Carriage return
+  FData.WriteU8(Ord(^J));  // Line feed
+  Inc(totalDataOffset, 2);
 
   bufferAdded := False;
   bufferOffset := 0;
@@ -737,6 +745,11 @@ begin
               WriteMovRegImm64(FCode, RDI, 1);
               WriteSyscall(FCode);
             end
+            // PrintLn - temporarily disabled, use IO.PrintStr with explicit newline
+            // else if instr.ImmStr = 'PrintLn' then
+            // begin
+            //   ...
+            // end
             else if instr.ImmStr = 'PrintInt' then
             begin
               if not bufferAdded then
@@ -2645,19 +2658,28 @@ begin
     end;
   end;
 
-  // patch string LEAs
+  // patch string LEAs (including PrintLn newline)
   for i := 0 to High(FLeaPositions) do
   begin
     leaPos := FLeaPositions[i];
     sidx := FLeaStrIndex[i];
-      if (sidx >= 0) and (sidx < Length(FStringOffsets)) then
-     begin
-       codeVA := $400000 + 4096;
-       instrVA := codeVA + leaPos + 7;
-       dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FStringOffsets[sidx];
-       disp32 := Int64(dataVA) - Int64(instrVA);
-        FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
-     end;
+    if sidx = -1 then
+    begin
+      // Special case: newline for PrintLn
+      codeVA := $400000 + 4096;
+      instrVA := codeVA + leaPos + 7;
+      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + nlGlobalPos;
+      disp32 := Int64(dataVA) - Int64(instrVA);
+      FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+    end
+    else if (sidx >= 0) and (sidx < Length(FStringOffsets)) then
+    begin
+      codeVA := $400000 + 4096;
+      instrVA := codeVA + leaPos + 7;
+      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FStringOffsets[sidx];
+      disp32 := Int64(dataVA) - Int64(instrVA);
+      FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+    end;
   end;
 
   // patch buffer LEAs for print_int

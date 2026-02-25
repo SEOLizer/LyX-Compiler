@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, builtins;
+  SysUtils, Classes, ast, diag, lexer, unit_manager;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -165,26 +165,108 @@ end;
 procedure TSema.DeclareBuiltinFunctions;
 var
   s: TSymbol;
-  biArr: TBuiltinInfoArray;
-  bi: TBuiltinInfo;
-  i, j: Integer;
 begin
-  // Register builtins from the centralized builtins registry.
-  biArr := GetAllBuiltins();
-  for i := 0 to High(biArr) do
-  begin
-    bi := biArr[i];
-    s := TSymbol.Create(bi.Name);
-    s.Kind := symFunc;
-    s.DeclType := bi.RetType;
-    s.ParamCount := bi.ParamCount;
-    SetLength(s.ParamTypes, s.ParamCount);
-    for j := 0 to s.ParamCount - 1 do
-      s.ParamTypes[j] := bi.ParamTypes[j];
-    s.IsVarArgs := bi.IsVarArgs;
-    // Add unqualified name for backward compatibility (PrintStr etc.)
-    AddSymbolToCurrent(s, NullSpan);
-  end;
+  // PrintStr(pchar) -> void
+  s := TSymbol.Create('PrintStr');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // PrintInt(int64) -> void
+  s := TSymbol.Create('PrintInt');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // printf(pchar, ...) -> void (varargs) - libc function, keep lowercase
+  s := TSymbol.Create('printf');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;  // at least 1 required (format string)
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  s.IsVarArgs := True;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // exit(int64) -> void - libc function, keep lowercase
+  s := TSymbol.Create('exit');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === std.io: fd-basierte I/O via libc wrappers (v0.3.0) ===
+  // open(path: pchar, flags: int32, mode: int32) -> int64 (fd or -1)
+  s := TSymbol.Create('open');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // read(fd: int64, buf: pchar, len: int64) -> int64 (bytes read or -1)
+  s := TSymbol.Create('read');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atPChar;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
+  s := TSymbol.Create('write');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atPChar;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // close(fd: int64) -> int32 (0 or -1)
+  s := TSymbol.Create('close');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === std.io: Weitere fd-basierte I/O (v0.3.1) ===
+  // lseek(fd: int64, offset: int64, whence: int64) -> int64 (new position or -1)
+  // whence: SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+  s := TSymbol.Create('lseek');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // unlink(path: pchar) -> int64 (0 or -1)
+  s := TSymbol.Create('unlink');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
 
   // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
   s := TSymbol.Create('rename');
@@ -1813,22 +1895,248 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
-  bi: TBuiltinInfo;
 begin
   Result := nil;
   
-  // Central builtin lookup (uses frontend.builtins)
-  if FindBuiltin(qualifier, name, bi) then
+  // === Builtin Namespaces ===
+  // Handle builtin namespaces like IO, OS, etc.
+  if qualifier = 'IO' then
   begin
-    Result := TSymbol.Create(name);
-    Result.Kind := symFunc;
-    Result.DeclType := bi.RetType;
-    Result.ParamCount := bi.ParamCount;
-    SetLength(Result.ParamTypes, Result.ParamCount);
-    for j := 0 to Result.ParamCount - 1 do
-      Result.ParamTypes[j] := bi.ParamTypes[j];
-    Result.IsVarArgs := bi.IsVarArgs;
-    AddSymbolToCurrent(Result, span);
+    // IO.* functions
+    if name = 'PrintStr' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'PrintInt' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'Println' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'printf' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      Result.IsVarArgs := True;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'open' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atInt64;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'read' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'write' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'close' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'lseek' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;
+      Result.ParamTypes[1] := atInt64;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'unlink' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'rename' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'mkdir' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'rmdir' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'chmod' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown builtin in IO: ' + name, span);
+      Exit;
+    end;
+  end
+  else if qualifier = 'OS' then
+  begin
+    // OS.* functions
+    if name = 'exit' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'getpid' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 0;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown builtin in OS: ' + name, span);
+      Exit;
+    end;
+  end
+  else if qualifier = 'Math' then
+  begin
+    // Math.* functions
+    if name = 'Random' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 0;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'RandomSeed' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atVoid;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown builtin in Math: ' + name, span);
+      Exit;
+    end;
+  end
+  else if qualifier = 'String' then
+  begin
+    // String.* functions (placeholder for future)
+    FDiag.Error('String module not yet implemented', span);
     Exit;
   end;
   
