@@ -40,7 +40,7 @@ type
 
   TNodeKind = (
     // Ausdrücke
-    nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkIdent,
+    nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit, nkIdent,
     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
     nkFieldAccess, nkIndexAccess, nkCast,
     nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
@@ -203,6 +203,15 @@ type
   public
     constructor Create(aValue: Char; aSpan: TSourceSpan);
     property Value: Char read FValue;
+  end;
+
+  { Regex-Literal: r"pattern" }
+  TAstRegexLit = class(TAstExpr)
+  private
+    FPattern: string;
+  public
+    constructor Create(const aPattern: string; aSpan: TSourceSpan);
+    property Pattern: string read FPattern;
   end;
 
   { Feldzugriff: expr.field }
@@ -819,6 +828,7 @@ begin
     nkStrLit:      Result := 'StrLit';
     nkBoolLit:     Result := 'BoolLit';
     nkCharLit:     Result := 'CharLit';
+    nkRegexLit:    Result := 'RegexLit';
     nkIdent:       Result := 'Ident';
     nkBinOp:       Result := 'BinOp';
     nkUnaryOp:     Result := 'UnaryOp';
@@ -1237,6 +1247,17 @@ begin
   inherited Create(nkCharLit, aSpan);
   FValue := aValue;
   FResolvedType := atChar;
+end;
+
+// ================================================================
+// TAstRegexLit
+// ================================================================
+
+constructor TAstRegexLit.Create(const aPattern: string; aSpan: TSourceSpan);
+begin
+  inherited Create(nkRegexLit, aSpan);
+  FPattern := aPattern;
+  // Regex type - will be resolved in sema
 end;
 
 // ================================================================
