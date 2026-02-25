@@ -371,16 +371,12 @@ begin
               codeBuf := emit.GetCodeBuffer;
               dataBuf := emit.GetDataBuffer;
               // Entry point is the generated _start placed at code base + 0x1000
-              entryVA := $400000 + 4096;
-              
-              // --dump-relocs: show external symbols and PLT patches
-              if flagDumpRelocs then
-                DumpRelocs(emit);
-
-              // Check if we have external symbols - if so, generate dynamic ELF
+              // For static ELF: entryVA := $400000 + 4096;
+              // For dynamic (PIE) ELF: entryVA := 4096 (page-aligned)
               externSymbols := emit.GetExternalSymbols;
               if Length(externSymbols) > 0 then
               begin
+                entryVA := 4096;  // PIE: entry at page start
                 // Build unique library list
                 neededLibs := CollectLibraries(externSymbols);
                 WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
@@ -388,6 +384,7 @@ begin
               end
               else
               begin
+                entryVA := $400000 + 4096;  // Static: traditional address
                 WriteLn('Generating static ELF (no external symbols)');
                 WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
               end;

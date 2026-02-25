@@ -1233,11 +1233,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         else if (TAstCall(expr).Name = 'printf') or
                 ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'printf')) then
         begin
-          // printf is varargs - emit as builtin with all args
-          instr.Op := irCallBuiltin;
+          // printf is varargs - emit as generic external call
+          instr.Op := irCall;
           instr.Dest := -1;
           instr.ImmStr := 'printf';
           instr.ImmInt := argCount;
+          instr.CallMode := cmExternal;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
             instr.ArgTemps[i] := argTemps[i];
@@ -1252,11 +1253,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 ((TAstCall(expr).Namespace = 'OS') and (TAstCall(expr).Name = 'getpid')) then
         begin
           // getpid() -> int64: returns process ID
+          // Use generic external call (like user-defined extern functions)
           t0 := NewTemp;
-          instr.Op := irCallBuiltin;
+          instr.Op := irCall;
           instr.Dest := t0;
           instr.ImmStr := 'getpid';
-          instr.ImmInt := 0;
+          instr.ImmInt := 0; // argCount
+          instr.CallMode := cmExternal;
           SetLength(instr.ArgTemps, 0);
           Emit(instr);
           Result := t0;
@@ -1464,11 +1467,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                  ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Match'))) then
         begin
           // RegexMatch(pattern, text) -> bool
+          // Use generic external call
           t0 := NewTemp;
-          instr.Op := irCallBuiltin;
+          instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'RegexMatch';
+          instr.ImmStr := 'strstr';  // Use libc's strstr
           instr.ImmInt := argCount;
+          instr.CallMode := cmExternal;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
             instr.ArgTemps[i] := argTemps[i];
@@ -1481,11 +1486,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                  ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Search'))) then
         begin
           // RegexSearch(pattern, text) -> int64 (position or -1)
+          // Use generic external call
           t0 := NewTemp;
-          instr.Op := irCallBuiltin;
+          instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'RegexSearch';
+          instr.ImmStr := 'strstr';
           instr.ImmInt := argCount;
+          instr.CallMode := cmExternal;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
             instr.ArgTemps[i] := argTemps[i];
@@ -1498,11 +1505,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                  ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Replace'))) then
         begin
           // RegexReplace(pattern, text, replacement) -> int64 (count)
+          // Use generic external call
           t0 := NewTemp;
-          instr.Op := irCallBuiltin;
+          instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'RegexReplace';
+          instr.ImmStr := 'strstr';
           instr.ImmInt := argCount;
+          instr.CallMode := cmExternal;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
             instr.ArgTemps[i] := argTemps[i];
