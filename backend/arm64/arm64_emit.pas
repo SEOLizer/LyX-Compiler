@@ -1798,6 +1798,33 @@ begin
               
               // STR X0, [X1] - store new seed
               WriteStrImm(FCode, X0, X1, 0);
+            end
+            else if instr.ImmStr = 'RegexMatch' then
+            begin
+              // RegexMatch(pattern, text) -> bool (1 or 0)
+              // X0 = pattern, X1 = text
+              // Einfache Implementierung: noch nicht vollstaendig
+              // Return 0 fuer jetzt
+              WriteMovImm64(FCode, X0, 0);
+              // Store result in dest temp
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'RegexSearch' then
+            begin
+              // RegexSearch(pattern, text) -> int64 (position or -1)
+              // Einfache Implementierung: return -1
+              WriteMovImm64(FCode, X0, -1);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'RegexReplace' then
+            begin
+              // RegexReplace(pattern, text, replacement) -> int64 (count)
+              // Einfache Implementierung: return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end;
           end;
           

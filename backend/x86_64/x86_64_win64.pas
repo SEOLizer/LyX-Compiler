@@ -1593,6 +1593,30 @@ begin
                 WriteMovRegImm64(FCode, RCX, 0);
               WriteCallRel32(FCode, randomSeedOffsetStub - (FCode.Size + 5));
             end
+            else if instr.ImmStr = 'RegexMatch' then
+            begin
+              // RegexMatch(pattern, text) -> bool (1 or 0)
+              // Einfache Implementierung: return 0
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'RegexSearch' then
+            begin
+              // RegexSearch(pattern, text) -> int64 (position or -1)
+              // Einfache Implementierung: return -1
+              WriteMovRegImm64(FCode, RAX, -1);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'RegexReplace' then
+            begin
+              // RegexReplace(pattern, text, replacement) -> int64 (count)
+              // Einfache Implementierung: return 0
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
             else
             begin
               // unsupported builtin: no-op / placeholder
