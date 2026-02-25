@@ -4,6 +4,24 @@
 
 ### 🚀 **Neue Hauptfeatures**
 
+#### **Namespaces für Builtins (empfohlen, rückwärtskompatibel)**
+
+Funktionen können jetzt über Namespaces aufgerufen werden:
+```lyx
+// Direkter Aufruf (Rückwärtskompatibilität)
+PrintStr("Hallo");
+
+// Namespace-Aufruf (empfohlen)
+IO.PrintStr("Hallo");
+OS.exit(0);
+Math.Random();
+```
+
+**Verfügbare Namespaces:**
+- `IO`: PrintStr, PrintInt, open, read, write, close, etc.
+- `OS`: exit, getpid
+- `Math`: Random, RandomSeed
+
 #### **Panic und Assert - Fehlerbehandlung zur Laufzeit**
 
 - **`panic(message)`**: Bricht das Programm mit einer Fehlermeldung ab

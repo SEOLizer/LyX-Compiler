@@ -1182,6 +1182,24 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
+        else if (TAstCall(expr).Name = 'PrintLn') or 
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintLn')) then
+        begin
+          // PrintLn: like PrintStr but adds newline
+          instr.Op := irCallBuiltin;
+          instr.Dest := -1;
+          instr.ImmStr := 'PrintLn';
+          if argCount >= 1 then
+            instr.Src1 := argTemps[0]
+          else
+            instr.Src1 := -1;
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+          Result := -1;
+        end
         else if (TAstCall(expr).Name = 'PrintInt') or 
                 ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintInt')) then
         begin
@@ -1217,22 +1235,18 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (TAstCall(expr).Name = 'exit') or
-                ((TAstCall(expr).Namespace = 'OS') and (TAstCall(expr).Name = 'exit')) then
+        else if (TAstCall(expr).Name = 'getpid') or
+                ((TAstCall(expr).Namespace = 'OS') and (TAstCall(expr).Name = 'getpid')) then
         begin
+          // getpid() -> int64: returns process ID
+          t0 := NewTemp;
           instr.Op := irCallBuiltin;
-          instr.Dest := -1;
-          instr.ImmStr := 'exit';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then
-            instr.Src1 := argTemps[0]
-          else
-            instr.Src1 := -1;
+          instr.Dest := t0;
+          instr.ImmStr := 'getpid';
+          instr.ImmInt := 0;
+          SetLength(instr.ArgTemps, 0);
           Emit(instr);
-          Result := -1;
+          Result := t0;
         end
         // === std.io: fd-basierte I/O Syscalls (v0.3.1) ===
         else if (TAstCall(expr).Name = 'open') or
@@ -1369,7 +1383,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'rmdir' then
+        else if (TAstCall(expr).Name = 'rmdir') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'rmdir')) then
         begin
           // rmdir(path: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1384,7 +1399,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'chmod' then
+        else if (TAstCall(expr).Name = 'chmod') or
+                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'chmod')) then
         begin
           // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1400,7 +1416,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'Random' then
+        else if (TAstCall(expr).Name = 'Random') or
+                ((TAstCall(expr).Namespace = 'Math') and (TAstCall(expr).Name = 'Random')) then
         begin
           // Random() -> int64: returns pseudo-random number
           t0 := NewTemp;
@@ -1412,7 +1429,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if TAstCall(expr).Name = 'RandomSeed' then
+        else if (TAstCall(expr).Name = 'RandomSeed') or
+                ((TAstCall(expr).Namespace = 'Math') and (TAstCall(expr).Name = 'RandomSeed')) then
         begin
           // RandomSeed(seed) -> void: sets the random seed
           instr.Op := irCallBuiltin;

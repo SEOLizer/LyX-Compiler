@@ -386,6 +386,27 @@ DisposeStmt    := 'dispose' Expr ';' ;           // Speicherfreigabe mit Destroy
 SuperCall      := 'super' '.' Ident '(' [ ArgList ] ')' ; // Basisklassen-Methodenaufruf
 ```
 
+### Namespaces und Module (v0.4.2)
+
+Funktionen können über Namespaces aufgerufen werden:
+
+```lyx
+// Direkter Aufruf (Rückwärtskompatibilität)
+PrintStr("Hallo");
+
+// Namespace-Aufruf (empfohlen)
+IO.PrintStr("Hallo");
+OS.exit(0);
+Math.Random();
+```
+
+**Verfügbare Namespaces:**
+- `IO` - Ein-/Ausgabe: PrintStr, PrintInt, open, read, write, close, etc.
+- `OS` - System: exit, getpid
+- `Math` - Mathematik: Random, RandomSeed
+
+Der Namespace-Qualifier muss ein gültiger Identifier sein, gefolgt von einem Punkt und dem Funktionsnamen.
+
 ### Null-Safety Operatoren (Phase 1)
 
 ```
