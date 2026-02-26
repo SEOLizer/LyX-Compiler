@@ -1605,7 +1605,7 @@ begin
             begin
               // RegexSearch(pattern, text) -> int64 (position or -1)
               // Einfache Implementierung: return -1
-              WriteMovRegImm64(FCode, RAX, -1);
+              WriteMovRegImm64(FCode, RAX, UInt64(-1));
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
