@@ -16,6 +16,17 @@ procedure WriteDynamicElf64WithPatches(const filename: string; const codeBuf, da
 
 implementation
 
+// Allokiert Platz im Segment mit korrektem Alignment
+// Gibt den Offset VOR dem Allokieren zurück (also den Start der Sektion)
+function AllocateSpace(var currentOffset: QWord; size: QWord; alignment: QWord): QWord;
+begin
+  // Alignment anwenden
+  currentOffset := (currentOffset + alignment - 1) and not (alignment - 1);
+  Result := currentOffset;
+  // Dann Platz für die Sektion reservieren
+  currentOffset := currentOffset + size;
+end;
+
 const
   // ELF Dynamic Tag Types
   DT_NULL = 0;
@@ -156,7 +167,7 @@ var
   elfHeader: TByteBuffer;
   phdr: TByteBuffer;
   filesz, memsz: UInt64;
-  baseVA: UInt64 = $400000;
+  baseVA: UInt64 = 0;  // PIE: base address is 0, loader will relocate
 begin
   codeSize := codeBuf.Size;
   dataSize := dataBuf.Size;
@@ -312,7 +323,7 @@ procedure WriteDynamicElf64WithPatches(const filename: string; const codeBuf, da
   const neededLibs: array of string; const pltPatches: TPLTGOTPatchArray);
 const
   pageSize: UInt64 = 4096;
-  baseVA: UInt64 = $400000;
+  baseVA: UInt64 = 0;  // PIE: base address is 0, loader will relocate
   interpPath: string = '/lib64/ld-linux-x86-64.so.2';
 var
   // Layout offsets
@@ -468,7 +479,8 @@ begin
       for i := 0 to symCount - 1 do
         gotTable.WriteU64LE(0); // Function entries
       
-      // Build .rela.plt (placeholder entries - r_offset will be computed after layout)
+      // Build .rela.plt - fill with actual GOT offsets now that we know gotVA will be at this offset
+      // We'll recalculate these after layout, but initialize first
       for i := 0 to symCount - 1 do
       begin
         rela.r_offset := 0; // Will be filled with GOT entry VA
@@ -480,87 +492,79 @@ begin
         relaPltTable.WriteU64LE(rela.r_addend);
       end;
       
-      // Prepare rela.dyn table (will contain R_X86_64_RELATIVE entries)
+      // Build .rela.dyn with R_X86_64_RELATIVE (we know the structure)
+      // r_offset: GOT[0] address (relative to baseVA)
+      // r_addend: address of _DYNAMIC (will be set after we know dynamicVA)
       relaDynTable := TByteBuffer.Create;
-      try
-        // (entries will be added after we know GOT VA)
-      finally
-        relaDynTable.Clear;
-      end;
       
-      // Calculate section offsets and virtual addresses
+      // === PHASE 1: Calculate all offsets based on table sizes ===
+      
+      // Data section (user data) comes first
       dataOffset := codeOffset + AlignUp(codeSize, pageSize);
       
-      // Dynamic sections come after data
+      // All dynamic sections come after user data, 8-byte aligned
       currentOffset := dataOffset + AlignUp(dataSize, 8);
       
-      dynInfo.gotOffset := currentOffset;
+      // Layout: GOT -> RELA.PLT -> RELA.DYN -> DYNSZSTR -> DYNSYM -> DYNAMIC
+      // Each section is 8-byte aligned
+      
+      // Debug: show currentOffset before allocations
+      // Write to stderr to ensure it's flushed immediately
+      System.WriteLn('DEBUG: currentOffset before GOT: ', currentOffset);
+      System.Flush(StdOut);
+      
+      // GOT section - use AllocateSpace for consistency
+      dynInfo.gotOffset := AllocateSpace(currentOffset, gotTable.Size, 8);
+      System.WriteLn('DEBUG: after GOT: offset=', dynInfo.gotOffset, ' currentOffset=', currentOffset);
+      System.Flush(StdOut);
       dynInfo.gotVA := baseVA + dynInfo.gotOffset;
-      currentOffset := currentOffset + AlignUp(gotTable.Size, 8);
       
-      dynInfo.relaPltOffset := currentOffset;
+      // RELA.PLT section - use AllocateSpace
+      dynInfo.relaPltOffset := AllocateSpace(currentOffset, symCount * 24, 8);
+      System.WriteLn('DEBUG: after RELA.PLT: offset=', dynInfo.relaPltOffset, ' currentOffset=', currentOffset);
+      System.Flush(StdOut);
       dynInfo.relaPltVA := baseVA + dynInfo.relaPltOffset;
-      currentOffset := currentOffset + AlignUp(relaPltTable.Size, 8);
       
-      // Now we will place rela.dyn after rela.plt
-      dynInfo.relaDynOffset := currentOffset;
+      // RELA.DYN section (1 entry for R_X86_64_RELATIVE = 24 bytes) - use AllocateSpace
+      dynInfo.relaDynOffset := AllocateSpace(currentOffset, 24, 8); // sizeof(TElf64Rela)
+      System.WriteLn('DEBUG: after RELA.DYN: offset=', dynInfo.relaDynOffset, ' currentOffset=', currentOffset);
+      System.Flush(StdOut);
       dynInfo.relaDynVA := baseVA + dynInfo.relaDynOffset;
-      currentOffset := currentOffset + 0; // will add size after building relaDynTable
       
-      dynInfo.dynStrOffset := currentOffset;
+      // DYNSTR section - use AllocateSpace
+      dynInfo.dynStrOffset := AllocateSpace(currentOffset, dynStrTable.Size, 8);
+      System.WriteLn('DEBUG: after DYNSTR: offset=', dynInfo.dynStrOffset, ' currentOffset=', currentOffset);
+      System.Flush(StdOut);
       dynInfo.dynStrVA := baseVA + dynInfo.dynStrOffset;
-      currentOffset := currentOffset + AlignUp(dynStrTable.Size, 8);
       
-      dynInfo.dynSymOffset := currentOffset;
+      // DYNSYM section - use AllocateSpace
+      dynInfo.dynSymOffset := AllocateSpace(currentOffset, dynSymTable.Size, 8);
+      System.WriteLn('DEBUG: after DYNSYM: offset=', dynInfo.dynSymOffset, ' currentOffset=', currentOffset);
+      System.Flush(StdOut);
       dynInfo.dynSymVA := baseVA + dynInfo.dynSymOffset;
-      currentOffset := currentOffset + AlignUp(dynSymTable.Size, 8);
       
+      // DYNAMIC section - just set offset (size determined after building)
       dynInfo.dynamicOffset := currentOffset;
       dynInfo.dynamicVA := baseVA + dynInfo.dynamicOffset;
       
-      // Update GOT entry addresses in rela.plt (now we know gotVA)
+      // === PHASE 2: Build tables with correct values now that we know offsets ===
+      
+      // Build .rela.plt with actual GOT entry offsets
       relaPltTable.Clear;
       for i := 0 to symCount - 1 do
       begin
-        rela.r_offset := dynInfo.gotVA + 24 + (i * 8); // GOT[3+i]
+        rela.r_offset := dynInfo.gotVA + 24 + (i * 8); // GOT[3+i] - 3 reserved entries * 8 bytes
         rela.r_info := ((UInt64(i) + 1) shl 32) or R_X86_64_JUMP_SLOT;
         rela.r_addend := 0;
         relaPltTable.WriteBuffer(rela, SizeOf(rela));
       end;
-
-      // Build rela.dyn entries: at minimum, set R_X86_64_RELATIVE for GOT[0]
-      relaDynTable.Clear;
-      // r_offset: GOT[0] - points to where _DYNAMIC should be stored
+      
+      // Build .rela.dyn with R_X86_64_RELATIVE for GOT[0]
+      // This tells the dynamic linker to add the load bias to GOT[0]
       rela.r_offset := dynInfo.gotVA; // GOT[0] address
       rela.r_info := R_X86_64_RELATIVE;
       rela.r_addend := dynInfo.dynamicVA; // Absolute address of _DYNAMIC
       relaDynTable.WriteBuffer(rela, SizeOf(rela));
-
-      // Now that relaDynTable has content, update offsets
-      dynInfo.relaDynOffset := dynInfo.relaPltOffset + AlignUp(relaPltTable.Size, 8);
-      dynInfo.relaDynVA := baseVA + dynInfo.relaDynOffset;
-
-      // dynstr comes after rela.dyn
-      dynInfo.dynStrOffset := dynInfo.relaDynOffset + AlignUp(relaDynTable.Size, 8);
-      dynInfo.dynStrVA := baseVA + dynInfo.dynStrOffset;
-
-      // dynsym comes after dynstr
-      dynInfo.dynSymOffset := dynInfo.dynStrOffset + AlignUp(dynStrTable.Size, 8);
-      dynInfo.dynSymVA := baseVA + dynInfo.dynSymOffset;
-
-      // dynamic comes after dynsym
-      dynInfo.dynamicOffset := dynInfo.dynSymOffset + AlignUp(dynSymTable.Size, 8);
-      dynInfo.dynamicVA := baseVA + dynInfo.dynamicOffset;
-
-      // Update GOT entry addresses in rela.plt
-      relaPltTable.Clear;
-      for i := 0 to symCount - 1 do
-      begin
-        rela.r_offset := dynInfo.gotVA + 24 + (i * 8); // GOT[3+i]
-        rela.r_info := ((UInt64(i) + 1) shl 32) or R_X86_64_JUMP_SLOT;
-        rela.r_addend := 0;
-        relaPltTable.WriteBuffer(rela, SizeOf(rela));
-      end;
       
       // Build .dynamic section
       // DT_NEEDED entries
@@ -678,12 +682,8 @@ begin
             gotEntryVA := dynInfo.gotVA + 24 + (pltPatches[i].SymbolIndex * 8);
 
             // Calculate RIP-relative offset from PLT stub to GOT entry
-            // pltStubPos is the position of the jmp opcode (FF 25) within the PLT stub
-            // The jmp is at pltStubPos, the disp32 is at pltStubPos + 2
-            // So pltStubVA = baseVA + codeOffset + pltStubPos
-            // nextInstrVA = pltStubVA + 6 (after jmp [rip+disp32])
             pltStubVA := baseVA + codeOffset + pltPatches[i].Pos;
-            nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx (6 bytes total)
+            nextInstrVA := pltStubVA + 6; // After FF 25 xx xx xx xx
             ripOffset := Int64(gotEntryVA) - Int64(nextInstrVA);
 
             WriteLn('DEBUG PLT patch ', i, ': sym=', pltPatches[i].SymbolName, ' symIdx=', pltPatches[i].SymbolIndex,
@@ -724,8 +724,13 @@ begin
        FillChar(elfHeader, SizeOf(elfHeader), 0);
 
       
-      // Build ELF header
+      // Build ELF header and initialize all structures
       FillChar(elfHeader, SizeOf(elfHeader), 0);
+      FillChar(interpPhdr, SizeOf(interpPhdr), 0);
+      FillChar(loadPhdr, SizeOf(loadPhdr), 0);
+      FillChar(dataLoadPhdr, SizeOf(dataLoadPhdr), 0);
+      FillChar(dynamicPhdr, SizeOf(dynamicPhdr), 0);
+      
       elfHeader.e_ident[0] := $7F;
       elfHeader.e_ident[1] := Ord('E');
       elfHeader.e_ident[2] := Ord('L');
@@ -761,10 +766,12 @@ begin
       // PT_LOAD for code (RX)
       loadPhdr.p_type := 1; // PT_LOAD
       loadPhdr.p_flags := 5; // PF_R | PF_X
-      loadPhdr.p_offset := codeOffset;
-      loadPhdr.p_vaddr := baseVA + codeOffset;
-      loadPhdr.p_paddr := baseVA + codeOffset;
-      loadPhdr.p_filesz := AlignUp(codeSize, pageSize);
+      // Start at offset 0 to include ELF header and program headers
+      loadPhdr.p_offset := 0;
+      loadPhdr.p_vaddr := baseVA;
+      loadPhdr.p_paddr := baseVA;
+      // Cover: ELF header (64) + PHDRs (224) + interp string + code
+      loadPhdr.p_filesz := codeOffset + AlignUp(codeSize, pageSize);
       loadPhdr.p_memsz := loadPhdr.p_filesz;
       loadPhdr.p_align := pageSize;
       
@@ -788,10 +795,30 @@ begin
       dynamicPhdr.p_memsz := dynamicTable.Size;
       dynamicPhdr.p_align := 8;
       
-       // Debug: print computed layout before writing file
-       WriteLn('DEBUG ELF LAYOUT:');
-       WriteLn('  codeOffset=', codeOffset, ' codeSize=', codeSize);
-       WriteLn('  dataOffset=', dataOffset, ' dataSize=', dataSize);
+      // Debug: print computed layout before writing file
+      WriteLn('DEBUG ELF LAYOUT:');
+      WriteLn('  codeOffset=', codeOffset, ' codeSize=', codeSize);
+      WriteLn('  dataOffset=', dataOffset, ' dataSize=', dataSize);
+      WriteLn('  gotOffset=', dynInfo.gotOffset, ' gotVA=', UInt64(dynInfo.gotVA));
+      WriteLn('  relaPltOffset=', dynInfo.relaPltOffset, ' relaPltVA=', UInt64(dynInfo.relaPltVA), ' relaPltSize=', relaPltTable.Size);
+      WriteLn('  relaDynOffset=', dynInfo.relaDynOffset, ' relaDynVA=', UInt64(dynInfo.relaDynVA), ' relaDynSize=', relaDynTable.Size);
+      WriteLn('  dynStrOffset=', dynInfo.dynStrOffset, ' dynStrVA=', UInt64(dynInfo.dynStrVA), ' dynStrSize=', dynStrTable.Size);
+      WriteLn('  dynSymOffset=', dynInfo.dynSymOffset, ' dynSymVA=', UInt64(dynInfo.dynSymVA), ' dynSymSize=', dynSymTable.Size);
+      WriteLn('  dynamicOffset=', dynInfo.dynamicOffset, ' dynamicVA=', UInt64(dynInfo.dynamicVA), ' dynamicSize=', dynamicTable.Size);
+      WriteLn('  headersSize=', headersSize);
+
+      DumpBuf('.got.plt', gotTable);
+      DumpBuf('.rela.plt', relaPltTable);
+      DumpBuf('.rela.dyn', relaDynTable);
+      DumpBuf('.dynstr', dynStrTable);
+      DumpBuf('.dynsym', dynSymTable);
+      DumpBuf('.dynamic', dynamicTable);
+
+      // Debug: print computed layout before writing file
+      System.WriteLn('DEBUG ELF LAYOUT (with currentOffset):');
+      System.WriteLn('  currentOffset=', currentOffset);
+      System.WriteLn('  codeOffset=', codeOffset, ' codeSize=', codeSize);
+      WriteLn('  dataOffset=', dataOffset, ' dataSize=', dataSize);
        WriteLn('  gotOffset=', dynInfo.gotOffset, ' gotVA=', UInt64(dynInfo.gotVA));
        WriteLn('  relaPltOffset=', dynInfo.relaPltOffset, ' relaPltVA=', UInt64(dynInfo.relaPltVA), ' relaPltSize=', relaPltTable.Size);
        WriteLn('  relaDynOffset=', dynInfo.relaDynOffset, ' relaDynVA=', UInt64(dynInfo.relaDynVA), ' relaDynSize=', relaDynTable.Size);
@@ -800,15 +827,7 @@ begin
        WriteLn('  dynamicOffset=', dynInfo.dynamicOffset, ' dynamicVA=', UInt64(dynInfo.dynamicVA), ' dynamicSize=', dynamicTable.Size);
        WriteLn('  headersSize=', headersSize);
 
-       DumpBuf('.got.plt', gotTable);
-       DumpBuf('.rela.plt', relaPltTable);
-       DumpBuf('.rela.dyn', relaDynTable);
-       DumpBuf('.dynstr', dynStrTable);
-       DumpBuf('.dynsym', dynSymTable);
-       DumpBuf('.dynamic', dynamicTable);
-
-
-      // Write ELF file
+       // Write ELF file
       fileBuf := TFileStream.Create(filename, fmCreate);
       try
         // Write ELF header
