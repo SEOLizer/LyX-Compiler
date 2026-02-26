@@ -1655,6 +1655,8 @@ begin
                 FExternalSymbols[High(FExternalSymbols)].Name := 'strstr';
                 FExternalSymbols[High(FExternalSymbols)].LibraryName := 'libc.so.6';
               end;
+              // RAX = -1 (nicht gefunden) als Default
+              WriteMovRegImm64(FCode, RAX, UInt64(-1));
               
               // Call strstr via PLT
               SetLength(FJumpPatches, Length(FJumpPatches) + 1);
@@ -2777,17 +2779,17 @@ begin
     if sidx = -1 then
     begin
       // Special case: newline for PrintLn
-      codeVA := $400000 + 4096;
+      codeVA := 4096;
       instrVA := codeVA + leaPos + 7;
-      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + nlGlobalPos;
+      dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + nlGlobalPos;
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end
     else if (sidx >= 0) and (sidx < Length(FStringOffsets)) then
     begin
-      codeVA := $400000 + 4096;
+      codeVA := 4096;
       instrVA := codeVA + leaPos + 7;
-      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FStringOffsets[sidx];
+      dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FStringOffsets[sidx];
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;
@@ -2799,9 +2801,9 @@ begin
     for i := 0 to High(bufferLeaPositions) do
     begin
       leaPos := bufferLeaPositions[i];
-      codeVA := $400000 + 4096;
+      codeVA := 4096;
       instrVA := codeVA + leaPos + 7;
-      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + bufferOffset;
+      dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + bufferOffset;
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;
@@ -2813,9 +2815,9 @@ begin
     for i := 0 to High(envLeaPositions) do
     begin
       leaPos := envLeaPositions[i];
-      codeVA := $400000 + 4096;
+      codeVA := 4096;
       instrVA := codeVA + leaPos + 7;
-      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + envOffset;
+      dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + envOffset;
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;
@@ -2827,9 +2829,9 @@ begin
     for i := 0 to High(randomSeedLeaPositions) do
     begin
       leaPos := randomSeedLeaPositions[i];
-      codeVA := $400000 + 4096;
+      codeVA := 4096;
       instrVA := codeVA + leaPos + 7;
-      dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + randomSeedOffset;
+      dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + randomSeedOffset;
       disp32 := Int64(dataVA) - Int64(instrVA);
       FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
     end;
@@ -2840,9 +2842,9 @@ begin
   begin
     leaPos := globalVarLeaPositions[i].CodePos;
     varIdx := globalVarLeaPositions[i].VarIndex;
-    codeVA := $400000 + 4096;
+    codeVA := 4096;
     instrVA := codeVA + leaPos + 7;
-    dataVA := $400000 + 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + globalVarOffsets[varIdx];
+    dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + globalVarOffsets[varIdx];
     disp32 := Int64(dataVA) - Int64(instrVA);
     FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
   end;

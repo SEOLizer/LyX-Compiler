@@ -1814,7 +1814,7 @@ begin
             begin
               // RegexSearch(pattern, text) -> int64 (position or -1)
               // Einfache Implementierung: return -1
-              WriteMovImm64(FCode, X0, -1);
+              WriteMovImm64(FCode, X0, UInt64(-1));
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
