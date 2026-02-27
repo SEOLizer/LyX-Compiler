@@ -86,12 +86,6 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
    - Änderung: Formel korrigiert von `(8 - (pushBytes mod 16)) mod 16` zu `(16 - ((pushBytes + 8) mod 16)) mod 16`
    - Priorität: Niedrig
 
-4) irVarCall toter Code
-   - Symptom: Der IR-Opcode irVarCall existiert, wird aber nie generiert (Function-Pointer-Support fehlt).
-   - Status: offen
-   - Nächste Schritte: Function-Pointer-Typen und Aufrufe implementieren.
-   - Priorität: Niedrig
-
 5) Windows PE64 / ARM64 Backend Stabilisierung
    - Symptom: Beide Backends haben Grundfunktionalität, aber es fehlen Tests und ggf. Feature-Parität.
    - Status: offen
@@ -100,7 +94,7 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
 
 Weitere Hinweise
 ----------------
-- Commit-Referenz: ac3bcaa (lokal). Enthält Fixes für use_math.lyx/call.lyx und Documentation-Updates.
+- Commit-Referenz: 482972e (lokal). Alle offenen Bugs (bis auf TestParseFieldAccess Parser-Bug) wurden behoben.
 - Tests: make test → 15 Test-Suiten. Bekannter Fehler: TestParseFieldAccess (vorbestehender Parser-Bug).
-- Alle 11 Unit-Test-Suiten bestehen (0 Failures). Der test_integration_examples und test_parser haben bekannte Probleme.
+- Alle 11 Unit-Test-Suiten bestehen (0 Failures).
 
