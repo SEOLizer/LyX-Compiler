@@ -20,6 +20,7 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 ✅ Debugging: --emit-asm und --dump-relocs Flags
 ✅ CLI-Argumente (argc/argv) im statischen ELF
 ✅ Option Types: Nullable Pointer (pchar?) mit Null-Coalescing (??)
+✅ SIMD: ParallelArray<T> mit element-weisen Operationen
 ```
 
 ---
@@ -222,6 +223,7 @@ fn main(): int64 {
 | `pchar`   | Pointer auf nullterminierte Bytes     |
 | `string`  | Alias für `pchar` (nullterminierte Bytes)
 | `array` | Dynamisches Array (Heap, Fat-Pointer: ptr, len, cap) |
+| `parallel Array<T>` | SIMD-optimiertes Array (Heap, element-weise Operationen) |
 | `struct`  | Benutzerdefinierter Record-Typ        |
 
 Hinweis: `int` und `string` sind derzeit Alias-Typen (bzw. Abkürzungen) — `int` wird intern als `int64` behandelt, `string` wird als `pchar` gemappt. Keine impliziten Casts — alle Typen müssen explizit übereinstimmen.
@@ -282,6 +284,35 @@ fn main(): int64 {
 -   **Builtins**: Spezielle Funktionen zur Manipulation: `push(arr, val)`, `pop(arr)`, `len(arr)`, `free(arr)`.
 -   **Typ-Homogenität**: Alle Elemente eines Arrays müssen denselben Typ haben (derzeit `int64`).
 -   **Bounds-Checks**: Automatische Laufzeit-Überprüfung bei jedem Index-Zugriff.
+
+### ParallelArray (SIMD)
+
+ParallelArrays sind SIMD-optimierte, heap-allokierte Arrays, die element-weise Operationen unterstützen:
+
+```lyx
+fn main(): int64 {
+  // ParallelArray erzeugen (1000 Elemente vom Typ Int64)
+  var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
+
+  // Einzelne Elemente lesen und schreiben
+  vec[0] := 42;
+  var first: int64 := vec[0];   // 42
+
+  // Element-weise SIMD-Operationen
+  var a: parallel Array<Int64> := parallel Array<Int64>(100);
+  var b: parallel Array<Int64> := parallel Array<Int64>(100);
+  var sum: parallel Array<Int64> := a + b;   // element-weise Addition
+  var diff: parallel Array<Int64> := a - b;  // element-weise Subtraktion
+
+  return 0;
+}
+```
+
+**Wichtige Eigenschaften:**
+-   **Heap-Allokation**: Arrays werden mit `mmap` auf dem Heap allokiert (16-Byte-Alignment für SSE2)
+-   **Element-Typen**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
+-   **SIMD-Operatoren**: `+`, `-`, `*`, `/`, `&&`, `||`, `^` und Vergleichsoperatoren (element-weise)
+-   **Skalar-Zugriff**: `vec[i]` gibt einen einzelnen Skalarwert des Element-Typs zurück
 
 ### Structs (Records)
 
@@ -1306,6 +1337,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.8** | ✅ Windows x64 Backend: PE32+ Binary-Erzeugung, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory für kernel32.dll |
 | **v0.2.0** | ✅ **Einheitlicher Call-Pfad** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub Generierung für externe Calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI-Flags (`--emit-asm`, `--dump-relocs`), ✅ ABI-Testkatalog erweitert |
 | **v0.2.1** | ✅ **Dynamische Arrays** (Heap-allokiert, Fat-Pointer, `push`/`pop`/`len`/`free` Builtins, Literal-Initialisierung, Bounds-Checks, Return-Statements) |
+| **v0.2.2** | ✅ **SIMD / ParallelArray**: `parallel Array<T>(size)`, element-weise Operationen (`+`,`-`,`*`,`/`), Skalar-Index-Zugriff, vollständiges IR-Lowering |
 | **v0.3.0** | std.io: fd-basierte I/O (open/read/write/close Syscalls) |
 | **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
 | **v0.3.2** | Directories: getdents64, DirIter |

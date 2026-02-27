@@ -1,5 +1,45 @@
 # Changelog - Lyx Compiler
 
+## Version 0.2.2 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **SIMD / ParallelArray (v0.2.2)**
+
+SIMD-optimierte Arrays mit element-weisen Operationen:
+
+```lyx
+var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
+vec[0] := 42;
+var first: int64 := vec[0];
+var sum: parallel Array<Int64> := vec + vec;  // element-weise Addition
+```
+
+**Frontend (Lexer/Parser/AST/Sema):**
+- `parallel` und `simd` als Keywords im Lexer
+- Parser: `parallel Array<T>(size)` Syntax
+- AST: `TAstSIMDNew`, `TAstSIMDBinOp`, `TAstSIMDUnaryOp`, `TAstSIMDIndexAccess`
+- Sema: Typprüfung, SIMDKind-Propagierung, Operator-Validierung
+
+**IR-Lowering (vollständig):**
+- `nkSIMDNew` → `irAlloc` (Heap-Allokation mit Element-Größe)
+- `nkSIMDBinOp` → `irSIMDAdd/Sub/Mul/Div/And/Or/Xor` + Vergleiche
+- `nkSIMDUnaryOp` → `irSIMDNeg`
+- `nkSIMDIndexAccess` → `irLoadElem` mit korrekter Element-Größe aus SIMDKind
+- VarDecl für `atParallelArray`: Heap-Pointer als einzelner Stack-Slot
+- Index-Assignment (`vec[i] := value`): Pointer via `irLoadLocal` statt `irLoadLocalAddr`
+
+**Element-Typen:** Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, F32, F64
+
+**SIMD-Operatoren:** `+`, `-`, `*`, `/`, `&&`, `||`, `^`, `==`, `!=`, `<`, `<=`, `>`, `>=`
+
+### ⚠️ **Noch offen (Backend)**
+- x86_64 Backend: SSE2/AVX-Instruktionen für `irSIMD*`-Opcodes
+- Bounds-Checks bei ParallelArray Index-Zugriff
+- Reduce-Operationen (`irSIMDAddReduce`, etc.)
+
+---
+
 ## Version 0.4.2 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**

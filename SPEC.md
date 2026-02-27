@@ -329,7 +329,29 @@ fn main(): int64 {
 }
 ```
 
-0.2.0 — “Stabilisierung: Calls, Imports, Relocs”
+### v0.2.2 — "SIMD / ParallelArray"
+
+- ✅ **ParallelArray-Typ**: `parallel Array<T>(size)` – SIMD-optimiertes, heap-allokiertes Array
+- ✅ **SIMD-AST-Knoten**: `TAstSIMDNew`, `TAstSIMDBinOp`, `TAstSIMDUnaryOp`, `TAstSIMDIndexAccess`
+- ✅ **SIMD-IR-Opcodes**: `irSIMDAdd/Sub/Mul/Div/And/Or/Xor/Neg/Shl/Shr`, Vergleiche, Reduce-Ops
+- ✅ **Lexer/Parser**: `parallel Array<T>(size)` Parsing
+- ✅ **Sema**: Typprüfung, SIMDKind-Propagierung, Operator-Validierung
+- ✅ **IR-Lowering**: Vollständig für alle 4 SIMD-Knotentypen + VarDecl + IndexAssign
+
+**Neue Syntax**:
+
+```lyx
+var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
+var first: int64 := vec[0];       // Skalar-Zugriff
+vec[0] := 42;                      // Element-Zuweisung
+var sum: parallel Array<Int64> := vec + vec;  // SIMD element-weise
+```
+
+**Noch offen** (Backend): SSE2/AVX-Emission, Bounds-Checks, Reduce-Ops
+
+---
+
+0.2.0 — "Stabilisierung: Calls, Imports, Relocs"
 
 Ziel: euer aktuelles Known Issue wird endgültig erschlagen, und ihr könnt extern+cross-unit vertrauen.
 
@@ -656,6 +678,10 @@ Implementiert in v0.1.3-v0.1.4:
 
 - `f32`, `f64` (Floating-Point)
 - `array` (Stack-allokierte Arrays)
+
+Implementiert in v0.2.2:
+
+- `parallel Array<T>` (SIMD-optimiertes, heap-allokiertes Array)
 
 Optional später:
 
