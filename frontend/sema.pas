@@ -335,51 +335,51 @@ begin
   AddSymbolToCurrent(s, NullSpan);
 
   // Dynamic array builtins
-  // append(arrVar: pchar, val: int64) -> void  (alias: push)
+  // append(arrVar: array, val: int64) -> void  (alias: push)
   s := TSymbol.Create('append');
   s.Kind := symFunc;
   s.DeclType := atVoid;
   s.ParamCount := 2;
   SetLength(s.ParamTypes, 2);
-  s.ParamTypes[0] := atPChar; // pointer to array header stored in variable (we'll pass variable slot)
+  s.ParamTypes[0] := atDynArray; // dynamic array type
   s.ParamTypes[1] := atInt64; // value
   AddSymbolToCurrent(s, NullSpan);
 
-  // push(arrVar: pchar, val: int64) -> void  (legacy name)
+  // push(arrVar: array, val: int64) -> void  (legacy name)
   s := TSymbol.Create('push');
   s.Kind := symFunc;
   s.DeclType := atVoid;
   s.ParamCount := 2;
   SetLength(s.ParamTypes, 2);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atDynArray;
   s.ParamTypes[1] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
-  // pop(arrVar: pchar) -> int64
+  // pop(arrVar: array) -> int64
   s := TSymbol.Create('pop');
   s.Kind := symFunc;
   s.DeclType := atInt64;
   s.ParamCount := 1;
   SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atDynArray;
   AddSymbolToCurrent(s, NullSpan);
 
-  // len(arrVar: pchar) -> int64
+  // len(arrVar: array) -> int64
   s := TSymbol.Create('len');
   s.Kind := symFunc;
   s.DeclType := atInt64;
   s.ParamCount := 1;
   SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atDynArray;
   AddSymbolToCurrent(s, NullSpan);
 
-  // free(arrVar: pchar) -> void
+  // free(arrVar: array) -> void
   s := TSymbol.Create('free');
   s.Kind := symFunc;
   s.DeclType := atVoid;
   s.ParamCount := 1;
   SetLength(s.ParamTypes, 1);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atDynArray;
   AddSymbolToCurrent(s, NullSpan);
 
   // Random() -> int64 (returns pseudo-random number 0..2^31-1)
@@ -641,9 +641,13 @@ begin
         if TAstIndexAccess(expr).Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAccess(expr).Obj).Name);
-          if Assigned(s) and (s.ArrayLen <> 0) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray)) then
           begin
-            Result := s.DeclType;
+            // For dynamic arrays, return atInt64 (default element type)
+            if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
+              Result := atInt64
+            else
+              Result := s.DeclType;
             expr.ResolvedType := Result;
             Exit;
           end;
@@ -697,8 +701,8 @@ begin
       begin
         if Length(TAstArrayLit(expr).Items) = 0 then
         begin
-          // empty array literal: type unresolved until context gives it
-          Result := atUnresolved;
+          // empty array literal: treat as atDynArray for now
+          Result := atDynArray;
         end
         else
         begin
@@ -1256,6 +1260,9 @@ begin
              Assigned(vd.InitExpr) and (vd.InitExpr is TAstIntLit) and 
              (TAstIntLit(vd.InitExpr).Value = 0) then
             vtype := atPCharNullable  // Treat 0 as null for nullable pointers
+          // Special case: dynamic array (atDynArray) with empty literal or atDynArray init
+          else if (vd.ArrayLen = -1) and ((vtype = atDynArray) or (vtype = atUnresolved)) then
+            vtype := vd.DeclType  // Accept dynamic array type
           else
             FDiag.Error(Format('type mismatch in declaration of %s: expected %s but got %s', [vd.Name, AurumTypeToStr(vd.DeclType), AurumTypeToStr(vtype)]), vd.Span);
         end;

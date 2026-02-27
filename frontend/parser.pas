@@ -1609,9 +1609,52 @@ begin
   typeName := '';
   isNullable := False;
 
-  if Accept(tkLBracket) then
+  // Check for array type syntax: Type[N] or []Type
+  // First parse the base type
+  if Check(tkIdent) or Check(tkArray) then
   begin
-    // Array type: [IntLit] Type or [] Type
+    if Accept(tkArray) then
+    begin
+      // 'array' keyword: dynamic array
+      s := 'array';
+      arrayLen := -1; // Dynamic array by default for 'array' keyword
+      Result := atDynArray; // Return atDynArray for dynamic array type
+    end
+    else
+    begin
+      s := FCurTok.Value;
+      Advance;
+      Result := StrToAurumType(s);
+      if Result = atUnresolved then
+        typeName := s;
+    end;
+
+    // Check for array suffix: type[N] or type[]
+    if Accept(tkLBracket) then
+    begin
+      // Array type: type[N] or type[]
+      if Check(tkIntLit) then
+      begin
+        parsedLen := StrToIntDef(FCurTok.Value, 0);
+        Advance;
+        Expect(tkRBracket);
+        arrayLen := parsedLen;
+      end
+      else if Accept(tkRBracket) then
+      begin
+        // Dynamic array: type[]
+        arrayLen := -1;
+      end
+      else
+      begin
+        FDiag.Error('expected integer literal or ] in array type', FCurTok.Span);
+        if Check(tkRBracket) then Advance;
+      end;
+    end;
+  end
+  else if Accept(tkLBracket) then
+  begin
+    // Array type: [N] Type (alternative syntax)
     parsedLen := 0;
     if Check(tkIntLit) then
     begin
@@ -1627,35 +1670,15 @@ begin
     else
     begin
       FDiag.Error('expected integer literal or ] in array type', FCurTok.Span);
-      // Try to recover
       if Check(tkRBracket) then Advance;
     end;
     
     // Recursively parse the base type of the array
     baseType := ParseTypeExFull(innerArrayLen, innerTypeName, innerNullable);
-    // set the outer arrayLen to the parsed length
     arrayLen := parsedLen;
     typeName := innerTypeName;
     isNullable := innerNullable;
-    Result := baseType; // The array's base type is the result
-  end
-  else if Check(tkIdent) or Check(tkArray) then
-  begin
-    if Accept(tkArray) then
-    begin
-      // 'array' keyword: shorthand for array of int64 (dynamic)
-      s := 'array';
-      arrayLen := -1; // Dynamic array by default for 'array' keyword
-      Result := atInt64; // Element type is int64 for 'array' shorthand
-    end
-    else
-    begin
-      s := FCurTok.Value;
-      Advance;
-      Result := StrToAurumType(s);
-      if Result = atUnresolved then
-        typeName := s;
-    end;
+    Result := baseType;
   end
   else
   begin
