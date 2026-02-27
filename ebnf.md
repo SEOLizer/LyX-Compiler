@@ -57,6 +57,27 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 * `pchar`  (Pointer, 64-bit; non-nullable, Standard für Stringliterale)
 * `pchar?` (Nullable Pointer, kann `null` sein)
 * `array`  (Array-Typ für Stack-allokierte Arrays)
+* `parallel Array<T>` (SIMD-optimiertes, heap-allokiertes Array mit Element-Typ T; v0.2.2)
+
+### SIMD / ParallelArray (v0.2.2)
+
+ParallelArrays sind heap-allokierte, SIMD-optimierte Arrays mit einem festen Element-Typ:
+
+```lyx
+var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
+var first: int64 := vec[0];       // Skalar-Rückgabe
+vec[0] := 42;                      // Element-Zuweisung
+var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
+```
+
+**Element-Typen**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
+
+**SIMD-Operatoren** (element-weise): `+`, `-`, `*`, `/`, `&&`, `||`, `^`, `==`, `!=`, `<`, `<=`, `>`, `>=`
+
+**Speichermodell**:
+- Heap-allokiert via `irAlloc`/mmap mit 16-Byte-Alignment (SSE2)
+- Gespeichert als einzelner Pointer-Slot im Stack-Frame
+- Index-Zugriff gibt einen Skalar des Element-Typs zurück
 
 ### Nullable Typen (v0.4.0)
 
@@ -360,8 +381,11 @@ PrimitiveType  := 'int8' | 'int16' | 'int32' | 'int64'
 
 PointerType    := '*' Type ;
 
-ArrayType      := 'array' ;                      // Stack-allokiertes Array
-                 | '[' IntLit ']' Type ;          // z.B. [4]f64 (geplant)
+ArrayType      := 'array'                         // Stack-allokiertes Array
+                 | '[' IntLit ']' Type            // z.B. [4]f64 (geplant)
+                 | ParallelArrayType ;
+
+ParallelArrayType := 'parallel' 'Array' '<' Ident '>' ;  // SIMD-optimiertes Array (v0.2.2)
 
 StructType     := 'struct' '{' { StructMember } '}' ;
 StructMember   := [ Visibility ] ( FieldDecl | MethodDecl ) ;
@@ -397,10 +421,13 @@ Primary        := IntLit
                 | 'new' Ident '(' [ ArgList ] ')' // Heap-Allokation (Klassen)
                 | 'panic' '(' Expr ')'           // Panic-Expression (bricht Programm ab)
                 | 'r"' RegexPattern '"'           // Regex-Literal (v0.4.2)
+                | ParallelArrayNew                // SIMD ParallelArray (v0.2.2)
                 | StructLit
                 | ArrayLit
                 | Ident
                 | '(' Expr ')' ;
+
+ParallelArrayNew := 'parallel' 'Array' '<' Ident '>' '(' Expr ')' ;  // parallel Array<Int64>(size)
 
 RegexPattern  := { Beliebiges Zeichen except '"' | EscapeSeq } ;
 EscapeSeq      := '\' ( 'n' | 'r' | 't' | '\' | '"' | '[' | ']' | '(' | ')' | '{' | '}' ) ;
@@ -472,6 +499,7 @@ NullCoalesceExpr := OrExpr { '??' OrExpr } ;
 
 OrExpr         := AndExpr { '||' AndExpr } ;
 AndExpr        := CmpExpr { '&&' CmpExpr } ;
+
 
 CmpExpr        := AddExpr [ ( '==' | '!=' | '<' | '<=' | '>' | '>=' ) AddExpr ] ;
 
