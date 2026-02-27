@@ -221,7 +221,7 @@ fn main(): int64 {
 | `void`    | Nur als Funktions-Rückgabetyp         |
 | `pchar`   | Pointer auf nullterminierte Bytes     |
 | `string`  | Alias für `pchar` (nullterminierte Bytes)
-| `array`   | Array-Typ (Stack-allokiert)           |
+| `array` | Dynamisches Array (Heap, Fat-Pointer: ptr, len, cap) |
 | `struct`  | Benutzerdefinierter Record-Typ        |
 
 Hinweis: `int` und `string` sind derzeit Alias-Typen (bzw. Abkürzungen) — `int` wird intern als `int64` behandelt, `string` wird als `pchar` gemappt. Keine impliziten Casts — alle Typen müssen explizit übereinstimmen.
@@ -242,30 +242,46 @@ fn main(): int64 {
 }
 ```
 
-### Arrays
+### Dynamische Arrays
 
-Arrays werden auf dem Stack allokiert und können literale Initialisierung, Lesezugriff und Zuweisung:
+Lyx unterstützt dynamische Arrays, die auf dem Heap allokiert und über einen Fat-Pointer (ptr, len, cap) verwaltet werden. Sie sind resizable und können mit Builtins wie `push`, `pop`, `len` und `free` manipuliert werden.
 
 ```lyx
 fn main(): int64 {
-  // Array-Literal
-  var arr: array := [10, 20, 30];
+  // Dynamisches Array-Literal (Heap-allokiert)
+  var dyn_arr: array := [10, 20, 30]; // ptr, len=3, cap=3
 
-  // Element lesen
-  var first: int64 := arr[0];    // 10
+  PrintInt(len(dyn_arr)); // Output: 3
+  PrintStr("\n");
+
+  // Elemente hinzufügen und entfernen
+  push(dyn_arr, 40);      // dyn_arr ist jetzt [10, 20, 30, 40]
+  push(dyn_arr, 50);      // dyn_arr ist jetzt [10, 20, 30, 40, 50]
+  var last: int64 := pop(dyn_arr); // last = 50, dyn_arr ist [10, 20, 30, 40]
+
+  PrintInt(len(dyn_arr)); // Output: 4
+  PrintStr("\n");
+  PrintInt(dyn_arr[0]);   // Output: 10
+  PrintStr("\n");
+  PrintInt(dyn_arr[3]);   // Output: 40
+  PrintStr("\n");
 
   // Element zuweisen
-  arr[0] := 100;
+  dyn_arr[0] := 100;
 
-  // Dynamischer Index
-  var i: int64 := 1;
-  var second: int64 := arr[i];   // 20
-
+  // Speicher freigeben (explizit oder am Funktionsende)
+  free(dyn_arr);
+  // Achtung: Nach free ist dyn_arr ungültig!
   return 0;
 }
 ```
 
-Alle Elemente eines Arrays müssen denselben Typ haben (derzeit `int64`).
+**Wichtige Eigenschaften:**
+-   **Heap-Allokation**: Arrays werden mit `mmap` auf dem Heap allokiert und wachsen bei Bedarf.
+-   **Fat-Pointer**: Intern als `{ pchar ptr, int64 len, int64 cap }` repräsentiert.
+-   **Builtins**: Spezielle Funktionen zur Manipulation: `push(arr, val)`, `pop(arr)`, `len(arr)`, `free(arr)`.
+-   **Typ-Homogenität**: Alle Elemente eines Arrays müssen denselben Typ haben (derzeit `int64`).
+-   **Bounds-Checks**: Automatische Laufzeit-Überprüfung bei jedem Index-Zugriff.
 
 ### Structs (Records)
 
@@ -691,6 +707,14 @@ fn main(): int64 {
   return 0;
 }
 ```
+
+#### Array Builtins
+| Funktion          | Signatur               | Beschreibung                        |
+|-------------------|------------------------|-------------------------------------|
+| `push(arr, val)`  | `array, int64 -> void` | Fügt Element am Ende hinzu          |
+| `pop(arr)`        | `array -> int64`       | Entfernt und liefert letztes Element|
+| `len(arr)`        | `array -> int64`       | Liefert aktuelle Anzahl Elemente    |
+| `free(arr)`       | `array -> void`        | Gibt Heap-Speicher frei             |
 
 #### String-Manipulation Builtins
 | Funktion                    | Signatur                                    | Beschreibung                        |
@@ -1281,6 +1305,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung, ✅ Inkrement/Dekrement (`++`/`--`) als Statements |
 | **v0.1.8** | ✅ Windows x64 Backend: PE32+ Binary-Erzeugung, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory für kernel32.dll |
 | **v0.2.0** | ✅ **Einheitlicher Call-Pfad** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub Generierung für externe Calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI-Flags (`--emit-asm`, `--dump-relocs`), ✅ ABI-Testkatalog erweitert |
+| **v0.2.1** | ✅ **Dynamische Arrays** (Heap-allokiert, Fat-Pointer, `push`/`pop`/`len`/`free` Builtins, Literal-Initialisierung, Bounds-Checks, Return-Statements) |
 | **v0.3.0** | std.io: fd-basierte I/O (open/read/write/close Syscalls) |
 | **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
 | **v0.3.2** | Directories: getdents64, DirIter |
