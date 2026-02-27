@@ -81,9 +81,9 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
    - Priorität: Mittel
 
 2) Stack-Alignment callPad-Formel
-   - Symptom: Die mathematische Formel für Stack-Alignment bei ungeraden Stack-Argumenten ist fragwürdig.
-   - Status: offen (funktioniert durch konservative Reserve im Prolog)
-   - Nächste Schritte: Formel überprüfen und ggf. optimieren.
+   - Symptom: Die mathematische Formel für Stack-Alignment bei ungeraden Stack-Argumenten war fehlerhaft.
+   - Status: BEHOBEN (commit 35ce5b3)
+   - Änderung: Formel korrigiert von `(8 - (pushBytes mod 16)) mod 16` zu `(16 - ((pushBytes + 8) mod 16)) mod 16`
    - Priorität: Niedrig
 
 4) irVarCall toter Code
