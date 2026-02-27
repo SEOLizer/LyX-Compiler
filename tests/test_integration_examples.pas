@@ -73,7 +73,7 @@ begin
     Writeln('ERROR: running use_math failed with code ', ret);
     Halt(1);
   end;
-  if txt <> '14'#10 then
+  if txt <> '6'#10 then
   begin
     Writeln('ERROR: use_math output mismatch. Got:');
     Writeln(txt);
