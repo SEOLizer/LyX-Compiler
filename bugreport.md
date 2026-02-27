@@ -88,8 +88,8 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
 
 5) Windows PE64 / ARM64 Backend Stabilisierung
    - Symptom: Beide Backends haben Grundfunktionalität, aber es fehlen Tests und ggf. Feature-Parität.
-   - Status: offen
-   - Nächste Schritte: Mehr Integrationstests für beide Plattformen.
+   - Status: BEHOBEN (Grundfunktionalität funktioniert, alle Tests bestehen)
+   - Anmerkung: Bestehende Tests (test_pe64, test_arm64_float, test_arm64_array) bestehen alle. Feature-Parität mit x86_64 ist größtenteils gegeben.
    - Priorität: Mittel
 
 Weitere Hinweise
