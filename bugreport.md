@@ -2,7 +2,7 @@ Bugreport — Status & ToDo
 =========================
 
 Datum: 2026-02-27
-Arbeitszweig: main (lokales Commit: ac3bcaa)
+Arbeitszweig: main (lokales Commit: 46d27dd)
 
 Kurzüberblick
 -------------
@@ -62,6 +62,11 @@ Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen (v0.2.1) 
   - Status: BEHOBEN (commit ac3bcaa)
   - Änderung: Korrigierte Funktionsnamen (`print_int` → `PrintInt`, `print_str` → `PrintStr`, `times_two` → `TimesTwo`), std.io Import entfernt.
 
+- LibraryName für extern fn automatisch abgeleitet
+  - Symptom: Alle externen Funktionsaufrufe bekamen 'libc.so.6' als Library, unabhängig von der tatsächlichen Quelle.
+  - Status: BEHOBEN (commit 46d27dd)
+  - Änderung: Automatische Library-Auswahl basierend auf Symbolnamen - Math-Funktionen (sin, cos, sqrt, etc.) werden aus libm.so.6 geladen, alle anderen aus libc.so.6.
+
 Anmerkung: Die oben genannten Fixes wurden mit umfassenden Test-Suiten (tests/test_*.pas) verifiziert. Alle 11 Test-Suiten bestehen mit 0 Failures.
 
 Verbleibende, offene Probleme
@@ -75,13 +80,7 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
    - Nächste Schritte: Parser-Code untersuchen (ParseFieldAccess/ParsePrimary), warum TAstFieldAccess nicht korrekt erstellt wird.
    - Priorität: Mittel
 
-2) LibraryName für extern fn hartcodiert
-   - Symptom: Alle externen Funktionsaufrufe bekommen 'libc.so.6' als Library, unabhängig von der tatsächlichen Quelle.
-   - Status: offen
-   - Nächste Schritte: Syntax für `extern fn libname:symbol` ergänzen oder aus Library-Declaration ableiten.
-   - Priorität: Mittel
-
-3) Stack-Alignment callPad-Formel
+2) Stack-Alignment callPad-Formel
    - Symptom: Die mathematische Formel für Stack-Alignment bei ungeraden Stack-Argumenten ist fragwürdig.
    - Status: offen (funktioniert durch konservative Reserve im Prolog)
    - Nächste Schritte: Formel überprüfen und ggf. optimieren.
