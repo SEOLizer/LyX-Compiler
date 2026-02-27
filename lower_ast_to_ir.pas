@@ -194,6 +194,9 @@ begin
   // ensure FLocalTypeNames has same length and initialize to empty
   SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
   FLocalTypeNames[Result] := '';
+  // ensure FLocalIsDynArray has same length and initialize to false
+  SetLength(FLocalIsDynArray, FCurrentFunc.LocalCount);
+  FLocalIsDynArray[Result] := False;
 end;
 
 function TIRLowering.AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
@@ -751,6 +754,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
     errLbl: string;
+    okLbl: string;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -1181,9 +1185,123 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         for i := 0 to argCount - 1 do
           argTemps[i] := LowerExpr(TAstCall(expr).Args[i]);
 
+        // === Dynamic array builtins: push, pop, len, free ===
+        // These need the base local slot index, not a lowered temp value.
+        if (TAstCall(expr).Name = 'push') and (argCount = 2) and
+           (TAstCall(expr).Args[0] is TAstIdent) then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
+          if (loc >= 0) and (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+          begin
+            instr.Op := irDynArrayPush;
+            instr.Dest := -1;
+            instr.Src1 := loc;         // base local slot (fat-pointer)
+            instr.Src2 := argTemps[1]; // value temp
+            Emit(instr);
+            Result := -1;
+          end
+          else
+          begin
+            // fallback: regular call (e.g. user-defined push function)
+            t0 := NewTemp;
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := 'push';
+            instr.ImmInt := argCount;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end;
+        end
+        else if (TAstCall(expr).Name = 'pop') and (argCount = 1) and
+                (TAstCall(expr).Args[0] is TAstIdent) then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
+          if (loc >= 0) and (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+          begin
+            t0 := NewTemp;
+            instr.Op := irDynArrayPop;
+            instr.Dest := t0;
+            instr.Src1 := loc; // base local slot (fat-pointer)
+            Emit(instr);
+            Result := t0;
+          end
+          else
+          begin
+            t0 := NewTemp;
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := 'pop';
+            instr.ImmInt := argCount;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end;
+        end
+        else if (TAstCall(expr).Name = 'len') and (argCount = 1) and
+                (TAstCall(expr).Args[0] is TAstIdent) then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
+          if (loc >= 0) and (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+          begin
+            t0 := NewTemp;
+            instr.Op := irDynArrayLen;
+            instr.Dest := t0;
+            instr.Src1 := loc; // base local slot (fat-pointer)
+            Emit(instr);
+            Result := t0;
+          end
+          else
+          begin
+            t0 := NewTemp;
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := 'len';
+            instr.ImmInt := argCount;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end;
+        end
+        else if (TAstCall(expr).Name = 'free') and (argCount = 1) and
+                (TAstCall(expr).Args[0] is TAstIdent) then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
+          if (loc >= 0) and (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+          begin
+            instr.Op := irDynArrayFree;
+            instr.Dest := -1;
+            instr.Src1 := loc; // base local slot (fat-pointer)
+            Emit(instr);
+            Result := -1;
+          end
+          else
+          begin
+            t0 := NewTemp;
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := 'free';
+            instr.ImmInt := argCount;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end;
+        end
         // Check for builtins (both with and without namespace, e.g., PrintStr and IO.PrintStr)
         // Namespace is already resolved in Sema, so we just check the Name
-        if (TAstCall(expr).Name = 'PrintStr') or 
+        else if (TAstCall(expr).Name = 'PrintStr') or 
            ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintStr')) then
         begin
           instr.Op := irCallBuiltin;
@@ -1594,11 +1712,18 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
            // Emit error handler if needed
            if Assigned(gv) and (gv.ArrayLen > 0) then
            begin
+             // Jump over the OOB error handler
+             okLbl := NewLabel('Larr_ok');
+             instr.Op := irJmp; instr.LabelName := okLbl; Emit(instr);
+
              instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
              msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
              instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
              codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
              instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+
+             // Continue after bounds check
+             instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
            end;
         end
         else
@@ -1643,12 +1768,19 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 Emit(instr);
                 Result := t0;
 
+                // Jump over the OOB error handler
+                okLbl := NewLabel('Larr_ok');
+                instr.Op := irJmp; instr.LabelName := okLbl; Emit(instr);
+
                 // Error handler
                 instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
                 msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
                 codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+
+                // Continue after bounds check
+                instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
                 Exit;
               end;
 
@@ -1694,11 +1826,18 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
                if arrLen > 0 then
                begin
+                 // Jump over the OOB error handler
+                 okLbl := NewLabel('Larr_ok');
+                 instr.Op := irJmp; instr.LabelName := okLbl; Emit(instr);
+
                  instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
                  msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
                  instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
                  codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
                  instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+
+                 // Continue after bounds check
+                 instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
                end;
                Exit;
             end;
@@ -2156,16 +2295,34 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     Exit(True);
   end;
 
+  // return [expr];
+  if stmt is TAstReturn then
+  begin
+    if Assigned(TAstReturn(stmt).Value) then
+    begin
+      tmp := LowerExpr(TAstReturn(stmt).Value);
+      instr.Op := irReturn;
+      instr.Src1 := tmp;
+      Emit(instr);
+    end
+    else
+    begin
+      instr.Op := irReturn;
+      instr.Src1 := -1;
+      Emit(instr);
+    end;
+    Exit(True);
+  end;
+
    if stmt is TAstVarDecl then
-   begin
-     vd := TAstVarDecl(stmt);
-     // If ArrayLen not set but InitExpr is an array literal, infer the length
-     arrLen := vd.ArrayLen;
-     if (arrLen = 0) and (vd.InitExpr is TAstArrayLit) then
-       arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
-     // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
-     if (arrLen = -1) or (vd.DeclType = atDynArray) then
-     begin
+    begin
+      vd := TAstVarDecl(stmt);
+      // If ArrayLen not set but InitExpr is an array literal, infer the length
+      arrLen := vd.ArrayLen;
+      if (arrLen = 0) and (vd.InitExpr is TAstArrayLit) then
+        arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
+      if arrLen > 0 then
+      begin
         // static array: allocate consecutive locals and initialize per-item
         // IMPORTANT: Store elements in REVERSE order so that arr[0] has the 
         // highest slot index. This way, base_addr + index*8 works correctly
@@ -2196,51 +2353,57 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else if vd.ArrayLen = -1 then
       begin
-
         // dynamic array: fat-pointer with 3 slots (ptr, len, cap)
         loc := AllocLocalMany(vd.Name, atPChar, 3);
         // mark base slot as dynamic array
-        if loc >= Length(FLocalIsDynArray) then SetLength(FLocalIsDynArray, loc + 3);
+        if loc + 2 >= Length(FLocalIsDynArray) then
+          SetLength(FLocalIsDynArray, loc + 3);
         FLocalIsDynArray[loc] := True;
-        // record element size for this local slot (needed by backend for element addressing)
-          begin
-            elemSize := 8; // default
-            case vd.DeclType of
-              atInt8, atUInt8: elemSize := 1;
-              atInt16, atUInt16: elemSize := 2;
-              atInt32, atUInt32: elemSize := 4;
-              atInt64, atUInt64: elemSize := 8;
-              atChar: elemSize := 1;
-              atPChar: elemSize := 8;
-            else
-              elemSize := 8; // conservative default
-            end;
-            if loc >= Length(FLocalElemSize) then SetLength(FLocalElemSize, loc+1);
-            FLocalElemSize[loc] := elemSize;
+        // record element size for this local slot
+        begin
+          elemSize := 8; // default
+          case vd.DeclType of
+            atInt8, atUInt8: elemSize := 1;
+            atInt16, atUInt16: elemSize := 2;
+            atInt32, atUInt32: elemSize := 4;
+            atInt64, atUInt64: elemSize := 8;
+            atChar: elemSize := 1;
+            atPChar: elemSize := 8;
+          else
+            elemSize := 8; // conservative default
           end;
+          if loc >= Length(FLocalElemSize) then SetLength(FLocalElemSize, loc + 1);
+          FLocalElemSize[loc] := elemSize;
+        end;
 
-        // initializer: if empty array literal -> set nil (0)
+        // initializer
         if vd.InitExpr is TAstArrayLit then
         begin
-          // only allow empty literal for now
-          if Length(TAstArrayLit(vd.InitExpr).Items) <> 0 then
-            FDiag.Error('cannot initialize dynamic array with non-empty literal', vd.Span);
-           // emit const 0 -> store
-           t0 := NewTemp;
-           instr.Op := irConstInt; instr.Dest := t0; instr.ImmInt := 0; Emit(instr);
-           instr.Op := irStoreLocal; instr.Dest := loc;     instr.Src1 := t0; Emit(instr); // ptr = 0
-           instr.Op := irStoreLocal; instr.Dest := loc + 1; instr.Src1 := t0; Emit(instr); // len = 0
-           instr.Op := irStoreLocal; instr.Dest := loc + 2; instr.Src1 := t0; Emit(instr); // cap = 0
-
+          items := TAstArrayLit(vd.InitExpr).Items;
+          // emit const 0 -> initialize all 3 slots to 0
+          t0 := NewTemp;
+          instr.Op := irConstInt; instr.Dest := t0; instr.ImmInt := 0; Emit(instr);
+          instr.Op := irStoreLocal; instr.Dest := loc;     instr.Src1 := t0; Emit(instr); // ptr = 0
+          instr.Op := irStoreLocal; instr.Dest := loc + 1; instr.Src1 := t0; Emit(instr); // len = 0
+          instr.Op := irStoreLocal; instr.Dest := loc + 2; instr.Src1 := t0; Emit(instr); // cap = 0
+          // non-empty literal: emit irDynArrayPush for each element
+          for i := 0 to High(items) do
+          begin
+            tmp := LowerExpr(items[i]);
+            instr.Op := irDynArrayPush;
+            instr.Dest := -1;
+            instr.Src1 := loc;  // base local slot (fat-pointer)
+            instr.Src2 := tmp;  // value temp
+            Emit(instr);
+          end;
         end
-
-       else
-       begin
-         tmp := LowerExpr(vd.InitExpr);
-         instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := tmp; Emit(instr);
-       end;
-       Exit(True);
-     end
+        else
+        begin
+          tmp := LowerExpr(vd.InitExpr);
+          instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := tmp; Emit(instr);
+        end;
+        Exit(True);
+      end
       else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
       begin
         // Check if this is a class (reference type) or struct (value type)
@@ -2510,20 +2673,31 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           loc := ResolveLocal(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
           if loc >= 0 then
           begin
-            // Array elements are stored in reverse order on stack.
-            // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
-            // Load address of arr[0] (highest slot) so base + index*8 works correctly.
-            arrLen := GetLocalArrayLen(loc);
-            if arrLen > 0 then
-              baseSlot := loc + arrLen - 1  // base address points to arr[0]
+            // Check if this is a dynamic array (fat-pointer)
+            if (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+            begin
+              // Dynamic array: load the heap pointer from slot loc
+              t1 := NewTemp;
+              instr.Op := irLoadLocal;
+              instr.Dest := t1;
+              instr.Src1 := loc;  // load ptr from fat-pointer slot 0
+              Emit(instr);
+            end
             else
-              baseSlot := loc;  // fallback for non-array locals
-            
-            t1 := NewTemp;
-            instr.Op := irLoadLocalAddr;
-            instr.Dest := t1;
-            instr.Src1 := baseSlot;
-            Emit(instr);
+            begin
+              // Static array: elements are stored in reverse order on stack.
+              arrLen := GetLocalArrayLen(loc);
+              if arrLen > 0 then
+                baseSlot := loc + arrLen - 1
+              else
+                baseSlot := loc;
+              
+              t1 := NewTemp;
+              instr.Op := irLoadLocalAddr;
+              instr.Dest := t1;
+              instr.Src1 := baseSlot;
+              Emit(instr);
+            end;
           end
           else
           begin
