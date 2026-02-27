@@ -167,8 +167,11 @@ var
   elfHeader: TByteBuffer;
   phdr: TByteBuffer;
   filesz, memsz: UInt64;
-  baseVA: UInt64 = 0;  // PIE: base address is 0, loader will relocate
+  baseVA: UInt64;
 begin
+  // For static ELF, use 0x400000 as base
+  baseVA := $400000;
+
   codeSize := codeBuf.Size;
   dataSize := dataBuf.Size;
 

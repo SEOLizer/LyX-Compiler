@@ -1604,7 +1604,50 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             loc := ResolveLocal(TAstIdent(TAstIndexAccess(expr).Obj).Name);
             if loc >= 0 then
             begin
-              // Array elements are stored in reverse order on stack.
+              // Check if this is a dynamic array (fat-pointer)
+              arrLen := GetLocalArrayLen(loc);
+              if (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+              begin
+                // Dynamic array: ptr is stored in slot loc, load it as base address
+                t1 := NewTemp;
+                instr.Op := irLoadLocal;
+                instr.Dest := t1;
+                instr.Src1 := loc;  // load ptr from fat-pointer slot 0
+                Emit(instr);
+
+                // Lower index
+                t2 := LowerExpr(TAstIndexAccess(expr).Index);
+                if t2 < 0 then
+                  Exit;
+
+                // Runtime bounds check against len (slot loc+1)
+                tLen := NewTemp;
+                instr.Op := irLoadLocal; instr.Dest := tLen; instr.Src1 := loc + 1; Emit(instr);
+                tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+                tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+                tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+                tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+                errLbl := NewLabel('Larr_oob');
+                instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+
+                t0 := NewTemp;
+                instr.Op := irLoadElem;
+                instr.Dest := t0;
+                instr.Src1 := t1;  // heap pointer (array data)
+                instr.Src2 := t2;  // index
+                Emit(instr);
+                Result := t0;
+
+                // Error handler
+                instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+                msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+                instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+                codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+                instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+                Exit;
+              end;
+
+              // Static array: elements are stored in reverse order on stack.
               // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
               // Load address of arr[0] (highest slot) so base + index*8 works correctly.
               arrLen := GetLocalArrayLen(loc);

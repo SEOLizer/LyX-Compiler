@@ -25,7 +25,9 @@ type
     atBool,
     atVoid,
     atPChar,
-    atPCharNullable  // nullable pointer type (Option Type)
+    atPCharNullable,  // nullable pointer type (Option Type)
+    atDynArray,       // dynamic array (fat-pointer)
+    atArray           // static array type
   );
 
   { --- Speicherklassen --- }
@@ -778,6 +780,8 @@ begin
     atVoid:       Result := 'void';
     atPChar:      Result := 'pchar';
     atPCharNullable: Result := 'pchar?';
+    atDynArray:    Result := 'array';
+    atArray:       Result := 'static_array';
   else
     Result := '<unknown>';
   end;
@@ -805,6 +809,7 @@ begin
     'pchar':  Result := atPChar;
     'pchar?': Result := atPCharNullable;
     'string': Result := atPChar; // map string to pchar for now
+    'array':  Result := atDynArray;
   else
     Result := atUnresolved;
   end;

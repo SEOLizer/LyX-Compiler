@@ -46,10 +46,15 @@ type
     irReturn,
     irReturnStruct,  // return struct by value (uses StructSize for ABI decision)
      // array operations
-     irStackAlloc,  // allocate space on stack for array
-     irStoreElem,   // store element at array[index] (static index in ImmInt)
-     irLoadElem,    // load element from array[index] (dynamic index in Src2)
-     irStoreElemDyn,// store element at array[index] (dynamic index, uses 3 sources)
+      irStackAlloc,  // allocate space on stack for array
+      irStoreElem,   // store element at array[index] (static index in ImmInt)
+      irLoadElem,    // load element from array[index] (dynamic index in Src2)
+      irStoreElemDyn,// store element at array[index] (dynamic index, uses 3 sources)
+      // dynamic array operations (fat-pointer: 3 slots = ptr, len, cap)
+      irDynArrayPush,  // push element: Src1 = base local (ptr slot), Src2 = value temp
+      irDynArrayPop,   // pop element:  Src1 = base local (ptr slot), Dest = popped value
+      irDynArrayLen,   // get length:   Src1 = base local (ptr slot), Dest = length
+      irDynArrayFree,  // free array:   Src1 = base local (ptr slot)
      // struct field operations (stack-based, negative offsets)
      irLoadField,   // load field: Dest = *(Src1 - ImmInt)
     irStoreField,   // store field: *(Src1 - ImmInt) = Src2
