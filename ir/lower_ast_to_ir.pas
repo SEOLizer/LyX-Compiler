@@ -708,7 +708,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     loc: Integer;
     tmp: Integer;
     condTmp: Integer;
-    t0, t1, t2: Integer;
+    t0, t1, t2, tResult, tVec, tIdx: Integer;
     i, k: Integer;
     strIdx: Integer;
     cv: TConstValue;
@@ -1954,6 +1954,196 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         Result := -1;
       end;
 
+    // SIMD Expressions (v0.2.0)
+    nkSIMDNew:
+      begin
+        // ParallelArray<T>(size) - SIMD-optimized array allocation
+        // Allocate space on heap with proper alignment for SIMD (16-byte alignment for SSE/AVX)
+        
+        // Lower the size expression
+        t0 := LowerExpr(TAstSIMDNew(expr).Size);
+        if t0 < 0 then
+          Exit(-1);
+        
+        // Calculate element size based on type
+        case TAstSIMDNew(expr).ElementType of
+          atInt8, atUInt8:   elemSize := 1;
+          atInt16, atUInt16: elemSize := 2;
+          atInt32, atUInt32, atF32: elemSize := 4;
+          atInt64, atUInt64, atF64: elemSize := 8;
+        else
+          elemSize := 8; // default to 8 bytes
+        end;
+        
+        // For SIMD, we need vector size alignment (16 bytes for SSE, 32 for AVX)
+        // We'll use a multiple of 16 for alignment
+        // Round up size to next multiple of 16 for SIMD alignment
+        // This is a simplified version - full implementation would use aligned allocation
+        
+        // Allocate: totalSize = size * elementSize (rounded up to 16-byte alignment)
+        instr.Op := irAlloc;
+        t1 := NewTemp; // result pointer
+        instr.Dest := t1;
+        instr.Src1 := t0;  // size in elements
+        instr.ImmInt := elemSize; // element size in ImmInt (abused field)
+        Emit(instr);
+        
+        Result := t1;
+      end;
+
+    nkSIMDBinOp:
+      begin
+        // SIMD binary operation: element-wise operation on two vectors
+        // TAstSIMDBinOp has: Op (token), Left, Right (both should be TAstSIMDNew or SIMD index access)
+        
+        // Lower left operand (should return a pointer to SIMD vector)
+        t1 := LowerExpr(TAstSIMDBinOp(expr).Left);
+        if t1 < 0 then
+          Exit(-1);
+        
+        // Lower right operand
+        t2 := LowerExpr(TAstSIMDBinOp(expr).Right);
+        if t2 < 0 then
+          Exit(-1);
+        
+        // Allocate result vector (same size as inputs)
+        // For now, we allocate a new vector for the result
+        tResult := NewTemp;
+        // Copy the allocation logic from nkSIMDNew but with same size
+        // Actually, we need to store the result somewhere - let's use a stack temporary
+        // The backend will handle this by using XMM registers
+        
+        // Map operator to SIMD IR operation
+        case TAstSIMDBinOp(expr).Op of
+          tkPlus:   instr.Op := irSIMDAdd;
+          tkMinus:  instr.Op := irSIMDSub;
+          tkStar:   instr.Op := irSIMDMul;
+          tkSlash:  instr.Op := irSIMDDiv;
+          tkAnd:    instr.Op := irSIMDAnd;
+          tkOr:     instr.Op := irSIMDOr;
+          tkXor:    instr.Op := irSIMDXor;
+          tkEq:     instr.Op := irSIMDCmpEq;
+          tkNeq:    instr.Op := irSIMDCmpNe;
+          tkLt:     instr.Op := irSIMDCmpLt;
+          tkLe:     instr.Op := irSIMDCmpLe;
+          tkGt:     instr.Op := irSIMDCmpGt;
+          tkGe:     instr.Op := irSIMDCmpGe;
+        else
+          begin
+            FDiag.Error('unsupported SIMD operator', expr.Span);
+            Exit(-1);
+          end;
+        end;
+        
+        // Emit SIMD binary operation
+        // Note: The current backend expects:
+        // - Src1, Src2: stack slots containing vector addresses
+        // - Dest: stack slot for result
+        // This needs proper handling in the backend
+        instr.Dest := tResult;
+        instr.Src1 := t1;
+        instr.Src2 := t2;
+        Emit(instr);
+        
+        Result := tResult;
+      end;
+
+    nkSIMDUnaryOp:
+      begin
+        // SIMD unary operation: element-wise operation on a vector
+        
+        // Lower operand
+        t1 := LowerExpr(TAstSIMDUnaryOp(expr).Operand);
+        if t1 < 0 then
+          Exit(-1);
+        
+        tResult := NewTemp;
+        
+        // Map operator to SIMD IR operation
+        case TAstSIMDUnaryOp(expr).Op of
+          tkMinus: instr.Op := irSIMDNeg;
+          // Add more unary ops as needed
+        else
+          begin
+            FDiag.Error('unsupported SIMD unary operator', expr.Span);
+            Exit(-1);
+          end;
+        end;
+        
+        instr.Dest := tResult;
+        instr.Src1 := t1;
+        Emit(instr);
+        
+        Result := tResult;
+      end;
+
+    nkSIMDIndexAccess:
+      begin
+        // SIMD index access: vec[index] - returns scalar element at index
+        // The vector expression evaluates to a heap pointer (from irAlloc).
+        // We compute: element_addr = vec_ptr + index * elemSize
+        // Then load the scalar value from that address.
+
+        // Lower the vector (returns a temp holding the heap pointer)
+        tVec := LowerExpr(TAstSIMDIndexAccess(expr).Obj);
+        if tVec < 0 then
+          Exit(-1);
+
+        // Lower the index (must be integer)
+        tIdx := LowerExpr(TAstSIMDIndexAccess(expr).Index);
+        if tIdx < 0 then
+          Exit(-1);
+
+        // Determine element size from the SIMDKind of the object
+        elemSize := 8; // default fallback
+        if TAstSIMDIndexAccess(expr).Obj is TAstSIMDNew then
+        begin
+          case TAstSIMDNew(TAstSIMDIndexAccess(expr).Obj).SIMDKind of
+            simdI8:  elemSize := 1;
+            simdI16: elemSize := 2;
+            simdI32: elemSize := 4;
+            simdI64: elemSize := 8;
+            simdF32: elemSize := 4;
+            simdF64: elemSize := 8;
+          end;
+        end
+        else if TAstSIMDIndexAccess(expr).Obj is TAstSIMDBinOp then
+        begin
+          case TAstSIMDBinOp(TAstSIMDIndexAccess(expr).Obj).SIMDKind of
+            simdI8:  elemSize := 1;
+            simdI16: elemSize := 2;
+            simdI32: elemSize := 4;
+            simdI64: elemSize := 8;
+            simdF32: elemSize := 4;
+            simdF64: elemSize := 8;
+          end;
+        end
+        else if TAstSIMDIndexAccess(expr).Obj is TAstSIMDUnaryOp then
+        begin
+          case TAstSIMDUnaryOp(TAstSIMDIndexAccess(expr).Obj).SIMDKind of
+            simdI8:  elemSize := 1;
+            simdI16: elemSize := 2;
+            simdI32: elemSize := 4;
+            simdI64: elemSize := 8;
+            simdF32: elemSize := 4;
+            simdF64: elemSize := 8;
+          end;
+        end;
+
+        // Use irLoadElem to load the element at the given index.
+        // irLoadElem: Dest = *(Src1 + Src2 * elemSize)
+        // We pass elemSize via ImmInt so the backend knows the stride.
+        t0 := NewTemp;
+        instr.Op := irLoadElem;
+        instr.Dest := t0;
+        instr.Src1 := tVec;   // base pointer (heap address)
+        instr.Src2 := tIdx;   // index
+        instr.ImmInt := elemSize; // element size for address calculation
+        Emit(instr);
+
+        Result := t0;
+      end;
+
   else
     FDiag.Error('lowering: unsupported expression kind', expr.Span);
     Result := -1;
@@ -2241,6 +2431,31 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
        end;
        Exit(True);
      end
+      else if (vd.DeclType = atParallelArray) or (vd.InitExpr is TAstSIMDNew) then
+      begin
+        // ParallelArray: heap-allocated SIMD array, stored as a single pointer slot.
+        // The initializer (TAstSIMDNew) lowers to irAlloc which returns a heap pointer.
+        loc := AllocLocal(vd.Name, atParallelArray);
+        tmp := LowerExpr(vd.InitExpr);
+        instr.Op := irStoreLocal;
+        instr.Dest := loc;
+        instr.Src1 := tmp;
+        Emit(instr);
+        // Record element size for this local (needed by index access in backend)
+        elemSize := 8; // default
+        if vd.InitExpr is TAstSIMDNew then
+        begin
+          case TAstSIMDNew(vd.InitExpr).ElementType of
+            atInt8, atUInt8:   elemSize := 1;
+            atInt16, atUInt16: elemSize := 2;
+            atInt32, atUInt32, atF32: elemSize := 4;
+            atInt64, atUInt64, atF64: elemSize := 8;
+          end;
+        end;
+        if loc >= Length(FLocalElemSize) then SetLength(FLocalElemSize, loc + 1);
+        FLocalElemSize[loc] := elemSize;
+        Exit(True);
+      end
       else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
       begin
         // Check if this is a class (reference type) or struct (value type)
@@ -2510,6 +2725,17 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           loc := ResolveLocal(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
           if loc >= 0 then
           begin
+            // ParallelArray: heap pointer stored in single slot - load pointer directly
+            if GetLocalType(loc) = atParallelArray then
+            begin
+              t1 := NewTemp;
+              instr.Op := irLoadLocal;
+              instr.Dest := t1;
+              instr.Src1 := loc;
+              Emit(instr);
+            end
+            else
+            begin
             // Array elements are stored in reverse order on stack.
             // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
             // Load address of arr[0] (highest slot) so base + index*8 works correctly.
@@ -2524,6 +2750,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             instr.Dest := t1;
             instr.Src1 := baseSlot;
             Emit(instr);
+            end;
           end
           else
           begin
