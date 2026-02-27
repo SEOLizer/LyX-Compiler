@@ -2349,7 +2349,7 @@ begin
                 Inc(pushBytes, 8);
               end;
             end;
-            callPad := (8 - (pushBytes mod 16)) mod 16;
+            callPad := (16 - ((pushBytes + 8) mod 16)) mod 16;
             if callPad > 0 then
             begin
               EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, Byte(callPad));
