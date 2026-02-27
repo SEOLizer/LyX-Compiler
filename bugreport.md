@@ -2,7 +2,7 @@ Bugreport — Status & ToDo
 =========================
 
 Datum: 2026-02-27
-Arbeitszweig: main (lokales Commit: c7d135f)
+Arbeitszweig: main (lokales Commit: ac3bcaa)
 
 Kurzüberblick
 -------------
@@ -57,18 +57,23 @@ Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen (v0.2.1) 
   - Status: BEHOBEN (commit c7d135f)
   - Änderung: Initialisierung von `FLocalIsDynArray` mit `False` in `AllocLocal` und `AllocLocalMany`.
 
+- Examples: use_math.lyx und call.lyx nutzten falsche Funktionsnamen
+  - Symptom: use_math.lyx und call.lyx nutzten `print_int`, `print_str` statt `PrintInt`, `PrintStr`. use_math.lyx hatte zudem Import-Konflikte mit std.io.
+  - Status: BEHOBEN (commit ac3bcaa)
+  - Änderung: Korrigierte Funktionsnamen (`print_int` → `PrintInt`, `print_str` → `PrintStr`, `times_two` → `TimesTwo`), std.io Import entfernt.
+
 Anmerkung: Die oben genannten Fixes wurden mit umfassenden Test-Suiten (tests/test_*.pas) verifiziert. Alle 11 Test-Suiten bestehen mit 0 Failures.
 
 Verbleibende, offene Probleme
 -----------------------------
 Diese Probleme sind weiterhin offen und sollten separat adressiert:
 
-1) Beispiele/Integration: Fehler beim Kompilieren von examples/use_math.lyx
-   - Symptom: use_math.lyx nutzt falsche Funktionsnamen (`print_int`, `print_str` statt `PrintInt`, `PrintStr`) und hat Import-Konflikte mit Builtins.
-   - Status: offen (keine Regression)
-   - Reproduktion: make test → test_integration_examples schlägt fehl mit "call to undeclared function: print_int"
-   - Nächste Schritte: use_math.lyx korrigieren → Kleinbuchstaben-Funktionsnamen durch korrekte Builtin-Namen ersetzen.
-   - Priorität: Niedrig
+1) TestParseFieldAccess: Parser-Fehler bei Feldzugriff
+   - Symptom: Der Parser-Test `TestParseFieldAccess` schlägt mit `EAssertionFailedError` fehl. Der Test erwartet, dass `obj.field` als `TAstFieldAccess` mit `Obj = TAstIdent('obj')` und `Field = 'field'` geparst wird.
+   - Status: offen (vorbestehender Bug, existiert seit commit c7d135f)
+   - Reproduktion: ./tests/test_parser --suite=TParserTest → TestParseFieldAccess Failed
+   - Nächste Schritte: Parser-Code untersuchen (ParseFieldAccess/ParsePrimary), warum TAstFieldAccess nicht korrekt erstellt wird.
+   - Priorität: Mittel
 
 2) LibraryName für extern fn hartcodiert
    - Symptom: Alle externen Funktionsaufrufe bekommen 'libc.so.6' als Library, unabhängig von der tatsächlichen Quelle.
@@ -96,9 +101,7 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
 
 Weitere Hinweise
 ----------------
-- Commit-Referenz: f673bb2 (lokal, nicht gepusht). Enthält v0.2.0 mit unified call path, Bugfixes und neuen CLI-Flags.
-- Tests: make test → 15 Test-Suiten, alle bestehen (0 Failures). Nur test_integration_examples hat einen bekannten Fehler (use_math.lyx).
-- Neue CLI-Flags (v0.2.0):
-  - `--emit-asm`: Gibt IR als Pseudo-Assembler aus
-  - `--dump-relocs`: Zeigt externe Symbole und PLT-Patches
+- Commit-Referenz: ac3bcaa (lokal). Enthält Fixes für use_math.lyx/call.lyx und Documentation-Updates.
+- Tests: make test → 15 Test-Suiten. Bekannter Fehler: TestParseFieldAccess (vorbestehender Parser-Bug).
+- Alle 11 Unit-Test-Suiten bestehen (0 Failures). Der test_integration_examples und test_parser haben bekannte Probleme.
 
