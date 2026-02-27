@@ -50,6 +50,22 @@ const
   RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7; R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
   ParamRegs: array[0..5] of Byte = (RDI, RSI, RDX, RCX, R8, R9);
 
+// Determine which library a symbol belongs to based on common conventions
+function GetLibraryForSymbol(const symbolName: string): string;
+begin
+  // Math functions typically come from libm
+  if (symbolName = 'sin') or (symbolName = 'cos') or (symbolName = 'tan') or
+     (symbolName = 'asin') or (symbolName = 'acos') or (symbolName = 'atan') or
+     (symbolName = 'sinh') or (symbolName = 'cosh') or (symbolName = 'tanh') or
+     (symbolName = 'sqrt') or (symbolName = 'pow') or (symbolName = 'exp') or
+     (symbolName = 'log') or (symbolName = 'log10') or (symbolName = 'floor') or
+     (symbolName = 'ceil') or (symbolName = 'fabs') then
+    Result := 'libm.so.6'
+  // Most other functions are in libc
+  else
+    Result := 'libc.so.6';
+end;
+
 procedure EmitU8(b: TByteBuffer; v: Byte); begin b.WriteU8(v); end;
 procedure EmitU32(b: TByteBuffer; v: Cardinal); begin b.WriteU32LE(v); end;
 procedure EmitU64(b: TByteBuffer; v: UInt64); begin b.WriteU64LE(v); end;
@@ -1608,7 +1624,7 @@ begin
               begin
                 SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                 FExternalSymbols[High(FExternalSymbols)].Name := 'strstr';
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := 'libc.so.6';
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol('strstr');
               end;
               
               // Call strstr via PLT
@@ -1655,7 +1671,7 @@ begin
               begin
                 SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                 FExternalSymbols[High(FExternalSymbols)].Name := 'strstr';
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := 'libc.so.6';
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol('strstr');
               end;
               // RAX = -1 (nicht gefunden) als Default
               WriteMovRegImm64(FCode, RAX, UInt64(-1));
@@ -2352,7 +2368,8 @@ begin
                  begin
                    SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                    FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
-                   FExternalSymbols[High(FExternalSymbols)].LibraryName := 'libc.so.6';
+                  // Determine library based on symbol name
+                   FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol(instr.ImmStr);
                  end;
                end;
                // Emit call to PLT stub label (generated after all functions)
