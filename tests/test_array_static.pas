@@ -56,9 +56,11 @@ var
   modl: TIRModule;
   f: TIRFunction;
   i, j: Integer;
-  foundLoadLocalAddr, foundLoadElem: Boolean;
+  foundLoadLocal, foundLoadElem, foundDynArrayPush: Boolean;
 begin
-  // Use correct array syntax: "var a: array := [2,3,5];"
+  // 'array' keyword creates a dynamic array (fat-pointer: ptr, len, cap)
+  // Initialization with [2,3,5] emits 3x irDynArrayPush
+  // Index access loads the heap pointer via irLoadLocal (not irLoadLocalAddr)
   modl := ParseAndLower(
     'fn main(): int64 {' + LineEnding +
     '  var a: array := [2,3,5];' + LineEnding +
@@ -67,7 +69,7 @@ begin
     'test_array.au'
   );
   try
-    foundLoadLocalAddr := False; foundLoadElem := False;
+    foundLoadLocal := False; foundLoadElem := False; foundDynArrayPush := False;
     for i := 0 to High(modl.Functions) do
     begin
       f := modl.Functions[i];
@@ -75,20 +77,23 @@ begin
       for j := 0 to High(f.Instructions) do
       begin
         case f.Instructions[j].Op of
-          irLoadLocalAddr:
+          irDynArrayPush:
+            foundDynArrayPush := True;
+          irLoadLocal:
             begin
-              // For a[1] access, we load address of array
-              foundLoadLocalAddr := True;
+              // For dynamic array a[1] access, we load the heap pointer
+              foundLoadLocal := True;
             end;
           irLoadElem:
             begin
-              // Element load from array base + index
+              // Element load from heap pointer + index
               foundLoadElem := True;
             end;
         end;
       end;
     end;
-    AssertTrue('irLoadLocalAddr expected for array access', foundLoadLocalAddr);
+    AssertTrue('irDynArrayPush expected for array literal init', foundDynArrayPush);
+    AssertTrue('irLoadLocal expected for dynamic array access', foundLoadLocal);
     AssertTrue('irLoadElem expected for array access', foundLoadElem);
   finally
     modl.Free;
