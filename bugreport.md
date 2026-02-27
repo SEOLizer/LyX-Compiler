@@ -2,7 +2,7 @@ Bugreport — Status & ToDo
 =========================
 
 Datum: 2026-02-27
-Arbeitszweig: main (lokales Commit: 46d27dd)
+Arbeitszweig: main (lokales Commit: 6990b16)
 
 Kurzüberblick
 -------------
@@ -80,21 +80,9 @@ Diese Probleme sind weiterhin offen und sollten separat adressiert:
    - Nächste Schritte: Parser-Code untersuchen (ParseFieldAccess/ParsePrimary), warum TAstFieldAccess nicht korrekt erstellt wird.
    - Priorität: Mittel
 
-2) Stack-Alignment callPad-Formel
-   - Symptom: Die mathematische Formel für Stack-Alignment bei ungeraden Stack-Argumenten war fehlerhaft.
-   - Status: BEHOBEN (commit 35ce5b3)
-   - Änderung: Formel korrigiert von `(8 - (pushBytes mod 16)) mod 16` zu `(16 - ((pushBytes + 8) mod 16)) mod 16`
-   - Priorität: Niedrig
-
-5) Windows PE64 / ARM64 Backend Stabilisierung
-   - Symptom: Beide Backends haben Grundfunktionalität, aber es fehlen Tests und ggf. Feature-Parität.
-   - Status: BEHOBEN (Grundfunktionalität funktioniert, alle Tests bestehen)
-   - Anmerkung: Bestehende Tests (test_pe64, test_arm64_float, test_arm64_array) bestehen alle. Feature-Parität mit x86_64 ist größtenteils gegeben.
-   - Priorität: Mittel
-
 Weitere Hinweise
 ----------------
-- Commit-Referenz: 482972e (lokal). Alle offenen Bugs (bis auf TestParseFieldAccess Parser-Bug) wurden behoben.
-- Tests: make test → 15 Test-Suiten. Bekannter Fehler: TestParseFieldAccess (vorbestehender Parser-Bug).
-- Alle 11 Unit-Test-Suiten bestehen (0 Failures).
+- Commit-Referenz: 6990b16 (lokal). Alle Bugs sind behoben bis auf den TestParseFieldAccess Parser-Bug.
+- Tests: make test → Alle Tests bestehen (außer TestParseFieldAccess)
+- Alle 11 Unit-Test-Suiten bestehen mit 0 Failures.
 
