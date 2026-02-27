@@ -39,6 +39,7 @@ type
     FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
     FGlobalVars: TStringList; // global variable name -> TAstVarDecl (as object)
     FExternFuncs: TStringList; // names of extern fn declarations
+    FExternFuncLibraries: TStringList; // extern fn name -> library name
     FImportedFuncs: TStringList; // names of functions from imported units
 
     function NewTemp: Integer;
@@ -63,6 +64,7 @@ type
 
     function Lower(prog: TAstProgram): TIRModule;
     procedure LowerImportedUnits(um: TUnitManager);
+    function GetExternFuncLibrary(const funcName: string): string; // returns library name or ''
   end;
 
 implementation
@@ -105,6 +107,9 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FExternFuncs := TStringList.Create;
     FExternFuncs.Sorted := True;
     FExternFuncs.Duplicates := dupIgnore;
+    FExternFuncLibraries := TStringList.Create;
+    FExternFuncLibraries.Sorted := True;
+    FExternFuncLibraries.Duplicates := dupIgnore;
     FImportedFuncs := TStringList.Create;
     FImportedFuncs.Sorted := True;
     FImportedFuncs.Duplicates := dupIgnore;
@@ -136,8 +141,14 @@ begin
   FClassTypes.Free;
   FGlobalVars.Free;
   FExternFuncs.Free;
+  FExternFuncLibraries.Free;
   FImportedFuncs.Free;
   inherited Destroy;
+end;
+
+function TIRLowering.GetExternFuncLibrary(const funcName: string): string;
+begin
+  Result := FExternFuncLibraries.Values[funcName];
 end;
 
 function TIRLowering.IsGlobalVar(const name: string): Boolean;
@@ -355,6 +366,9 @@ begin
        begin
          // Register as extern so call sites can set cmExternal
          FExternFuncs.Add(TAstFuncDecl(node).Name);
+         // Register library name if specified
+         if TAstFuncDecl(node).LibraryName <> '' then
+           FExternFuncLibraries.Values[TAstFuncDecl(node).Name] := TAstFuncDecl(node).LibraryName;
          Continue;
        end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);

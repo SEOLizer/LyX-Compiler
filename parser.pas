@@ -175,6 +175,7 @@ function TParser.ParseTopDecl: TAstNode;
 var
   isExtern: Boolean;
   name: string;
+  libName: string;
   params: TAstParamList;
   retType: TAurumType;
 begin
@@ -210,9 +211,28 @@ begin
       Expect(tkFn);
       // reuse ParseFuncDecl for name/params/retType parsing by peeking and backtracking is complex
       // Instead, parse inline here
+      
+      // Check for optional library name: extern fn libname:symbol(...)
+      libName := '';
       if Check(tkIdent) then
       begin
+        // Look ahead to see if next token is a colon (library:name syntax)
+        // For now, just parse the function name
         name := FCurTok.Value; Advance;
+        
+        // Check for library:symbol syntax
+        if Accept(tkColon) then
+        begin
+          libName := name;  // first ident was library name
+          if Check(tkIdent) then
+          begin
+            name := FCurTok.Value; Advance;  // second ident is function name
+          end
+          else
+          begin
+            name := '<anon>'; FDiag.Error('expected function name after library:', FCurTok.Span);
+          end;
+        end;
       end
       else
       begin
@@ -233,6 +253,7 @@ begin
       // mark extern and varargs if parser recorded them
       TAstFuncDecl(Result).IsExtern := True;
       TAstFuncDecl(Result).IsVarArgs := FLastParamListVarArgs;
+      TAstFuncDecl(Result).LibraryName := libName;  // set library name
       Exit(Result);
     end
     else
