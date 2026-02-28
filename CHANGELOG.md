@@ -196,7 +196,7 @@ Die I/O-Funktionen werden jetzt als **direkte Linux-Syscalls** generiert:
 | `chmod` | Syscall 90 | Syscall 90 |
 
 ### 📊 **Getestete Funktionalität**
-- ✅ `examples/test_syscall.lyx`: Alle I/O-Tests bestanden
+- ✅ `tests/lyx/io/test_syscall.lyx`: Alle I/O-Tests bestanden
 - ✅ Unit-Tests: Alle bestanden
 
 ---
@@ -218,7 +218,7 @@ via PLT/GOT generiert (dynamic ELF mit `-rdynamic` Linker-Flag).
 - Keine neuen Bugs in dieser Version
 
 ### 📊 **Getestete Funktionalität**
-- ✅ `examples/test_syscall.lyx`: open/write/read/close funktionieren
+- ✅ `tests/lyx/io/test_syscall.lyx`: open/write/read/close funktionieren
 - ✅ Unit-Tests: 157+ Tests bestanden
 
 ---
@@ -245,8 +245,8 @@ via PLT/GOT generiert (dynamic ELF mit `-rdynamic` Linker-Flag).
 - **Import-Parsing**: Units mit komplexen Control-Flow-Konstrukten parsen korrekt
 
 ### 📊 **Getestete Funktionalität**
-- ✅ `examples/for_loop.lyx`: While-Schleifen (Output: 15, 15)
-- ✅ `examples/use_math.lyx`: Module Import mit dynamischem ELF
+- ✅ `tests/lyx/control/for_loop.lyx`: While-Schleifen (Output: 15, 15)
+- ✅ `tests/lyx/stdlib/use_math.lyx`: Module Import mit dynamischem ELF
 - ✅ `std/math.lyx`: Standard Library kompiliert erfolgreich
 - ✅ Complex Functions: `Abs64()`, `Min64()`, `Max64()` Implementierungen
 - ✅ Cross-File Compilation: Multi-Unit Projekte funktionieren

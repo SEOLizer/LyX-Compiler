@@ -65,7 +65,17 @@ lyxc/
     test_parser.pas        # Tests für Parser
     test_codegen.pas       # Tests für Backend
   examples/
-    hello.lyx               # Beispiel-Quelldateien in Lyx
+    hello.lyx               # Kuratierte Showcase-Programme
+  tests/lyx/
+    basic/                  # Grundlegende Sprach-Features
+    functions/              # Funktionsaufrufe
+    arrays/                 # Statische Arrays
+    dynarray/               # Dynamische Arrays
+    oop/                    # OOP, Structs, VMT
+    io/                     # I/O & Syscalls
+    strings/                # String-Tests
+    stdlib/                 # Stdlib-Nutzung
+    ...                     # Weitere Kategorien
 ```
 
 ## FreePascal Code-Style

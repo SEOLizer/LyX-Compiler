@@ -875,7 +875,7 @@ Ein umfassendes Set von Standard-Units befindet sich im Verzeichnis `std/` und b
 - **std/env.lyx** – Environment-API (`init`, `ArgCount`, `Arg`)
 - **std/time.lyx** – Datums- und Zeit-Berechnungen (numerische Berechnungen)
 - **std/geo.lyx** – Geolocation-Parser für Decimal Degrees
-- **std/crt.lyx** – ANSI Console Utilities (Farben, Cursor, clrscr). Siehe `examples/test_crt_ansi.lyx` für eine Demo.
+- **std/crt.lyx** – ANSI Console Utilities (Farben, Cursor, clrscr). Siehe `tests/lyx/crt/test_crt_ansi.lyx` für eine Demo.
 
 #### String-Library Beispiel
 
@@ -948,7 +948,7 @@ fn main(argc: int64, argv: pchar): int64 {
 
 CI / Integrationstests
 
-- Die GitHub Actions CI baut den Compiler, führt Unit-Tests und zusätzlich kompiliert und führt die Beispielprogramme in `examples/` (inkl. `examples/test_crt_ansi.lyx`) aus, um die Laufzeitintegration zu prüfen. Das `make e2e`-Target kompiliert und führt `hello.lyx`, `PrintInt.lyx` und `test_crt_ansi.lyx`; optionales `test_crt_raw.lyx` wird nur ausgeführt, wenn die CI-Variable `CRT_RAW` gesetzt ist.
+- Die GitHub Actions CI baut den Compiler, führt Unit-Tests und zusätzlich kompiliert und führt die Test-Programme in `tests/lyx/` aus, um die Laufzeitintegration zu prüfen. Das `make e2e`-Target kompiliert und führt `hello.lyx`, `print_int.lyx` und `test_crt_ansi.lyx`; optionales `test_crt_raw.lyx` wird nur ausgeführt, wenn die CI-Variable `CRT_RAW` gesetzt ist.
 
 
 ```lyx
@@ -1263,7 +1263,8 @@ util/
   diag.pas                  Diagnostik (Fehler mit Zeile/Spalte)
   bytes.pas                 TByteBuffer (Byte-Encoding + Patching)
 tests/                      FPCUnit-Tests
-examples/                   Beispielprogramme in Lyx
+  lyx/                      Lyx-Testprogramme (thematisch unterteilt)
+examples/                   Kuratierte Showcase-Programme
 ```
 
 ### Design-Prinzipien

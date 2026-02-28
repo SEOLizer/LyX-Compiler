@@ -15,7 +15,7 @@ uses
 // Da die Test-Suite in FreePascal läuft (für den Compiler selbst), testen wir die
 // numerischen Algorithmen durch Vergleich der Referenzimplementierung in Pascal.
 // Die tatsächlichen Lyx-Unit-Funktionen werden durch Integrationstests geprüft
-// (Build + Ausführung von examples/use_time_format.lyx). Daher implementieren wir
+// (Build + Ausführung von tests/lyx/stdlib/use_time_format.lyx). Daher implementieren wir
 // hier Überschlagsprüfungen für die Kernalgorithmen.
 
 type
