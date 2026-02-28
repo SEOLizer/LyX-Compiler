@@ -76,6 +76,69 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 - `IsPowerOfTwo(x: int64): bool` - Ist 2er-Potenz?
 - `PopCount(x: int64): int64` - Anzahl gesetzter Bits
 - `Log2(x: int64): int64` - Logarithmus zur Basis 2
+- `Atan2Microdegrees(y, x: int64): int64` - Atan2 in Microdegrees
+- `Cos64Inverse(cos_value: int64): int64` - Inverser Kosinus
+
+---
+
+## std/conv.lyx
+
+Conversion & Bit-Manipulation utilities.
+
+### Integer zu String
+- `IntToStr(n: int64): pchar` - Dezimal-String
+- `IntToHex(val, digits: int64): pchar` - Hex-String (1-16 Stellen)
+- `IntToHex8/16/32/64(val: int64): pchar` - Hex mit fester Breite
+- `IntToBin(val, bits: int64): pchar` - Binary-String
+- `IntToBin8/16/32/64(val: int64): pchar` - Binary mit fester Breite
+- `IntToOct(val, digits: int64): pchar` - Oktal-String
+- `IntToStrWithComma(n: int64): pchar` - Mit Tausendertrennzeichen
+- `IntToStrWithUnderscore(n: int64): pchar` - Mit Underscore
+
+### String zu Integer
+- `ParseHex(s: pchar): int64` - Hex-String zu int64
+- `ParseBin(s: pchar): int64` - Binary-String zu int64
+- `ParseOct(s: pchar): int64` - Oktal-String zu int64
+
+### Bit-Manipulation
+- `GetBit(val, bit_pos: int64): bool` - Bit lesen
+- `SetBit(val, bit_pos: int64): int64` - Bit auf 1 setzen
+- `ClearBit(val, bit_pos: int64): int64` - Bit auf 0 setzen
+- `ToggleBit(val, bit_pos: int64): int64` - Bit invertieren
+- `ExtractBits(val, start, count: int64): int64` - Bits extrahieren
+- `InsertBits(val, bits, start, count: int64): int64` - Bits einfügen
+
+### Bit-Zählen
+- `CountLeadingZeros(val: int64): int64` - Führende Nullen
+- `CountTrailingZeros(val: int64): int64` - Nachfolgende Nullen
+
+### Endianness
+- `SwapEndian16(val: int64): int64` - 16-Bit Byte-Reihenfolge tauschen
+- `SwapEndian32(val: int64): int64` - 32-Bit Byte-Reihenfolge tauschen
+- `SwapEndian64(val: int64): int64` - 64-Bit Byte-Reihenfolge tauschen
+
+### Byte-Operationen
+- `GetByte(val, byte_pos: int64): int64` - Einzelnes Byte lesen
+- `SetByte(val, byte_pos, byte_val: int64): int64` - Einzelnes Byte schreiben
+
+### Bit-Rotation
+- `RotateLeft32(val, n: int64): int64` - Links rotieren (32-Bit)
+- `RotateRight32(val, n: int64): int64` - Rechts rotieren (32-Bit)
+
+### Vorzeichen-Erweiterung
+- `SignExtend8(val: int64): int64` - 8-Bit Vorzeichen erweitern
+- `SignExtend16(val: int64): int64` - 16-Bit Vorzeichen erweitern
+- `SignExtend32(val: int64): int64` - 32-Bit Vorzeichen erweitern
+
+### Null-Erweiterung
+- `ZeroExtend8(val: int64): int64` - 8-Bit Null erweitern
+- `ZeroExtend16(val: int64): int64` - 16-Bit Null erweitern
+- `ZeroExtend32(val: int64): int64` - 32-Bit Null erweitern
+
+### Alignment
+- `AlignDown(addr, alignment: int64): int64` - Abwärts ausrichten
+- `AlignUp(addr, alignment: int64): int64` - Aufwärts ausrichten
+- `IsAligned(addr, alignment: int64): bool` - Prüfen ob ausgerichtet
 
 ---
 

@@ -734,6 +734,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     baseIdx: Integer;
     isFloatArith: Boolean;
     isFloatCmp: Boolean;
+    isStringConcat: Boolean;
     mangled: string;
     // Null-Coalesce Phase 2
     zeroSlot: Integer;
@@ -967,239 +968,31 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         isFloatArith := (lType = atF64) and (rType = atF64);
         isFloatCmp := isFloatArith and (TAstBinOp(expr).Op in [tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe]);
 
+        // Check for string concatenation (pchar + pchar)
+        isStringConcat := (lType = atPChar) and (rType = atPChar) and (TAstBinOp(expr).Op = tkPlus);
+
         t0 := NewTemp;
         case TAstBinOp(expr).Op of
           tkPlus:
             begin
               if isFloatArith then
                 instr.Op := irFAdd
+              else if isStringConcat then
+              begin
+                // String concatenation: call str_concat builtin
+                instr.Op := irCallBuiltin;
+                instr.Dest := t0;
+                instr.ImmStr := 'str_concat';
+                instr.ImmInt := 2;
+                SetLength(instr.ArgTemps, 2);
+                instr.ArgTemps[0] := t1;
+                instr.ArgTemps[1] := t2;
+                Emit(instr);
+                Exit;
+              end
               else
                 instr.Op := irAdd;
-            end;
-          tkMinus:
-            begin
-              if isFloatArith then
-                instr.Op := irFSub
-              else
-                instr.Op := irSub;
-            end;
-          tkStar:
-            begin
-              if isFloatArith then
-                instr.Op := irFMul
-              else
-                instr.Op := irMul;
-            end;
-          tkSlash:
-            begin
-              if isFloatArith then
-                instr.Op := irFDiv
-              else
-                instr.Op := irDiv;
-            end;
-          tkPercent: instr.Op := irMod;
-          tkEq:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpEq
-              else
-                instr.Op := irCmpEq;
-            end;
-          tkNeq:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpNeq
-              else
-                instr.Op := irCmpNeq;
-            end;
-          tkLt:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpLt
-              else
-                instr.Op := irCmpLt;
-            end;
-          tkLe:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpLe
-              else
-                instr.Op := irCmpLe;
-            end;
-          tkGt:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpGt
-              else
-                instr.Op := irCmpGt;
-            end;
-          tkGe:
-            begin
-              if isFloatCmp then
-                instr.Op := irFCmpGe
-              else
-                instr.Op := irCmpGe;
-            end;
-          tkAnd:   instr.Op := irAnd;
-          tkOr:    instr.Op := irOr;
-          tkNor:   instr.Op := irNor;
-          tkXor:   instr.Op := irXor;
-          tkNullCoalesce:
-            begin
-              // x ?? y: if x == 0 (null), use y, else use x
-              // t1 und t2 sind temporäre IR-Werte. Wir müssen sie zuerst in 
-              // lokale Slots speichern, damit irLoadLocal funktioniert.
-              
-              // Speichere t1 (x) in einen temporären lokalen Slot
-              // Wir allozieren einen echten lokalen Slot via NewTemp + erhöhe LocalCount
-              xSlot := NewTemp;
-              // Reserviere einen lokalen Slot dafür
-              if xSlot >= FCurrentFunc.LocalCount then
-                FCurrentFunc.LocalCount := xSlot + 1;
-              
-              instr.Op := irStoreLocal;
-              instr.Dest := xSlot;
-              instr.Src1 := t1;
-              Emit(instr);
-              
-              // Speichere t2 (y) in einen temporären lokalen Slot
-              ySlot := NewTemp;
-              if ySlot >= FCurrentFunc.LocalCount then
-                FCurrentFunc.LocalCount := ySlot + 1;
-              
-              instr.Op := irStoreLocal;
-              instr.Dest := ySlot;
-              instr.Src1 := t2;
-              Emit(instr);
-              
-              // Ergebnis-Slot allozieren
-              resultSlot := NewTemp;
-              if resultSlot >= FCurrentFunc.LocalCount then
-                FCurrentFunc.LocalCount := resultSlot + 1;
-              
-              // Konstante 0 für den Vergleich
-              zeroSlot := NewTemp;
-              instr.Op := irConstInt;
-              instr.Dest := zeroSlot;
-              instr.ImmInt := 0;
-              Emit(instr);
-              
-              // cmpSlot prüfen ob x == 0
-              cmpSlot := NewTemp;
-              instr.Op := irCmpEq;
-              instr.Dest := cmpSlot;
-              instr.Src1 := xSlot;
-              instr.Src2 := zeroSlot;
-              Emit(instr);
-              
-              // Labels für die Verzweigung
-              useRightLabel := NewLabel('Lcoalesce_right');
-              endLabel := NewLabel('Lcoalesce_end');
-              
-              // Wenn x == null (cmpSlot == true), gehe zu use_right
-              instr.Op := irBrTrue;
-              instr.Src1 := cmpSlot;
-              instr.LabelName := useRightLabel;
-              Emit(instr);
-              
-              // x != null, verwende x: result = x
-              instr.Op := irLoadLocal;
-              instr.Dest := resultSlot;
-              instr.Src1 := xSlot;
-              Emit(instr);
-              
-              // Springe zum Ende
-              instr.Op := irJmp;
-              instr.LabelName := endLabel;
-              Emit(instr);
-              
-              // use_right: y
-              instr.Op := irLabel;
-              instr.LabelName := useRightLabel;
-              Emit(instr);
-              
-              // result = y
-              instr.Op := irLoadLocal;
-              instr.Dest := resultSlot;
-              instr.Src1 := ySlot;
-              Emit(instr);
-              
-              // end:
-              instr.Op := irLabel;
-              instr.LabelName := endLabel;
-              Emit(instr);
-              
-              Result := resultSlot;
-              Exit;
-            end;
-        else
-          FDiag.Error('unsupported binary operator', expr.Span);
-          Exit;
-        end;
-        instr.Dest := t0;
-        instr.Src1 := t1;
-        instr.Src2 := t2;
-        Emit(instr);
-        Result := t0;
-      end;
-
-    nkUnaryOp:
-      begin
-        // Lower operand
-        t1 := LowerExpr(TAstUnaryOp(expr).Operand);
-        if t1 < 0 then
-          Exit;
-
-        t0 := NewTemp;
-        case TAstUnaryOp(expr).Op of
-          tkMinus:
-            begin
-              instr.Op := irNeg;
-              instr.Dest := t0;
-              instr.Src1 := t1;
-              Emit(instr);
-            end;
-          tkNot:
-            begin
-              instr.Op := irNot;
-              instr.Dest := t0;
-              instr.Src1 := t1;
-              Emit(instr);
-            end;
-        else
-          FDiag.Error('unsupported unary operator', expr.Span);
-          Exit;
-        end;
-        Result := t0;
-      end;
-
-    nkCall:
-      begin
-        // Lower arguments
-        argCount := Length(TAstCall(expr).Args);
-        SetLength(argTemps, argCount);
-        for i := 0 to argCount - 1 do
-          argTemps[i] := LowerExpr(TAstCall(expr).Args[i]);
-
-        // Check for builtins (both with and without namespace, e.g., PrintStr and IO.PrintStr)
-        // Namespace is already resolved in Sema, so we just check the Name
-        if (TAstCall(expr).Name = 'PrintStr') or 
-           ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintStr')) then
-        begin
-          instr.Op := irCallBuiltin;
-          instr.Dest := -1;
-          instr.ImmStr := 'PrintStr';
-          if argCount >= 1 then
-            instr.Src1 := argTemps[0]
-          else
-            instr.Src1 := -1;
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          Emit(instr);
-          Result := -1;
-        end
+            end
         else if (TAstCall(expr).Name = 'PrintLn') or 
                 ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintLn')) then
         begin

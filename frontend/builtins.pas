@@ -93,4 +93,7 @@ initialization
   // Math
   AddBuiltin('Math', 'Random', 'Random', atInt64, []);
   AddBuiltin('Math', 'RandomSeed', 'RandomSeed', atVoid, [atInt64]);
+
+  // String operations
+  AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
 end.

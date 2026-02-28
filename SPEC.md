@@ -1024,3 +1024,23 @@ skCon
 - `con int64` → immediate
 - `con pchar` → rodata label
 - `co` → stack slot, aber keine Store-Operation nach Init zulassen
+
+---
+
+## String-Verkettung (v0.4.1)
+
+Der `+` Operator kann für String-Verkettung verwendet werden:
+
+```lyx
+fn main(): int64 {
+  var s1: pchar := "Hello";
+  var s2: pchar := " World";
+  var result: pchar := s1 + s2;  // "Hello World"
+  return 0;
+}
+```
+
+**Implementierung:**
+- IR: Erkennung von `pchar + pchar` im Lowering
+- Runtime: `str_concat` builtin mit inline mmap und memcpy
+- Keine externen Dependencies (libc-frei)
