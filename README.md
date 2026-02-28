@@ -4,31 +4,28 @@
 It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.4.1
+Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
 ✅ PLT/GOT Dynamic Linking for External Libraries
-✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs)
-✅ Robust Parser with While/If/Function Support
+✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
+✅ IR-Level Inlining Optimization (v0.4.3)
+✅ PascalCase Naming Conventions (v0.4.3)
+✅ Integrated Linter with 10 Rules (v0.4.3)
+✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
+✅ Robust Parser with While/If/For/Switch/Function Support
 ✅ OOP: Classes, Inheritance, Constructors, Destructors
 ✅ Global Variables with Initialization
 ✅ Random/RandomSeed Builtins
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
-✅ Debugging: --emit-asm and --dump-relocs Flags
 ✅ CLI Arguments (argc/argv) in Static ELF
 ✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
 ✅ Dynamic Arrays: push/pop/len/free
-✅ Strings & Slices: string type, slice_u8
-✅ std/geo: GeoPoint, Distance, BoundingBox, DMS parsing
-✅ std/time: Date/Time, Timezone support
-✅ std/fs: File I/O, Directory operations
-✅ std/pack: Binary serialization
-✅ std/regex: Regex matching
-✅ std/crt: ANSI Terminal control
+✅ QBool: Probabilistic Boolean Type for quantum-like computing
 ```
 
 ---
@@ -325,6 +322,45 @@ fn main(): int64 {
 - **Element Types**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
 - **SIMD Operators**: `+`, `-`, `*`, `/`, `&&`, `||`, `^` and comparison operators (element-wise)
 - **Scalar Access**: `vec[i]` returns a single scalar value of the element type
+
+### QBool - Probabilistic Boolean Type
+
+QBool is a probabilistic boolean type for quantum-like computing and uncertain reasoning. It stores a probability value between 0.0 (definitely false) and 1.0 (definitely true).
+
+```lyx
+import std.qbool;
+
+fn main(): int64 {
+  // Create uncertain values with Maybe()
+  var is_rainy: QBool := Maybe(0.7);  // 70% chance of rain
+  var is_cold: QBool := Maybe(0.4);   // 40% chance of cold
+  
+  // Probabilistic logical operators
+  var will_stay_home: QBool := QBoolAnd(is_rainy, is_cold);
+  
+  // Observe - collapse to classical bool (random based on probability)
+  var decision: bool := Observe(will_stay_home);
+  
+  // AI decision tree example
+  var diagnosis: bool := Diagnose(0.8, 0.6, 0.7);
+  
+  return 0;
+}
+```
+
+**Core Features:**
+- `Maybe(probability)` - Creates a QBool with given probability (0.0 to 1.0)
+- `Observe(q)` - Collapses quantum state to classical bool using random
+- Deterministic borders: `Maybe(1.0)` = true, `Maybe(0.0)` = false
+
+**Logical Operators (Probabilistic Algebra):**
+- `QBoolAnd(a, b)`: P(A ∧ B) = P(A) × P(B)
+- `QBoolOr(a, b)`: P(A ∨ B) = P(A) + P(B) - P(A) × P(B)
+- `QBoolNot(a)`: P(¬A) = 1.0 - P(A)
+
+**Advanced:**
+- `EntangledPair` - Correlated QBool pairs (observing one affects the other)
+- AI examples: Weather prediction, Medical diagnosis, Game AI decisions
 
 ### Structs (Records)
 
