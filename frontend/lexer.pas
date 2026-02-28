@@ -16,7 +16,7 @@ type
     tkIf, tkElse, tkWhile, tkReturn,
     tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault,
     tkUnit, tkImport, tkPub, tkAs, tkType, tkStruct, tkArray, tkStatic,
-    tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil,
+    tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil, tkPool,
     tkTry, tkCatch, tkThrow, tkFinally,
     // OOP Keywords
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
@@ -128,6 +128,7 @@ begin
     tkDo:        Result := 'do';
     tkRepeat:     Result := 'repeat';
     tkUntil:      Result := 'until';
+    tkPool:       Result := 'pool';
     tkTry:        Result := 'try';
     tkCatch:      Result := 'catch';
     tkThrow:      Result := 'throw';
@@ -524,6 +525,7 @@ begin
     'do':      Result := tkDo;
     'repeat':     Result := tkRepeat;
     'until':      Result := tkUntil;
+    'pool':       Result := tkPool;
     'try':        Result := tkTry;
     'catch':      Result := tkCatch;
     'throw':      Result := tkThrow;
