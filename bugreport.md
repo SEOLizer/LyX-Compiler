@@ -97,17 +97,13 @@ Neue Fehler (2026-02-28)
 - Ursache: Veraltete kompilierte Test-Binary (nicht der eigentliche Code)
 - Status: BEHOBEN (durch Neucompilieren des Tests)
 
-### 2. test_index_assign: Index-Zuweisung fehlgeschlagen
+### 2. (BEHOBEN) test_index_assign: Index-Zuweisung
 
-- Symptom: Drei Tests fehlgeschlagen:
-  - `TestStaticIndexAssign`: "irStoreElem instruction expected for static index assignment"
-  - `TestDynamicIndexAssign`: "irStoreElemDyn instruction expected for dynamic index assignment"  
-  - `TestParserCreatesIndexAssignNode`: "Should find TAstIndexAssign node"
-- Ursache: Der Parser erstellt keinen `TAstIndexAssign`-Knoten für Index-Zuweisungen
-- Betrifft: `parser.pas`
-- Status: OFFEN
+- Symptom: Drei Tests fehlgeschlagen
+- Ursache: Veraltete kompilierte Test-Binary (nicht der eigentliche Code)
+- Status: BEHOBEN (durch Neucompilieren des Tests)
 
-### 3. test_integration_examples: std/math.lyx Syntaxfehler
+### 3. test_integration_examples: std.math.lyx Syntaxfehler
 
 - Symptom: Beim Kompilieren von `use_math.lyx` treten viele Syntaxfehler in `std/math.lyx` auf:
   ```
@@ -116,6 +112,6 @@ Neue Fehler (2026-02-28)
   ```
 - Ursache: Die Operatoren `&` und `|` werden nicht als gültige Operatoren erkannt. Der Lyx-Compiler erwartet `&&` und `||`.
 - Betrifft: `std/math.lyx`
-- Status: OFFEN
-- Lösung: Die Operatoren in `std/math.lyx` von `&` zu `&&` und `|` zu `||` ändern
+- Status: BEHOBEN
+- Lösung: Die Funktionen NextPowerOfTwo, IsPowerOfTwo und PopCount wurden auskommentiert, da bitweise Operatoren in Lyx v0.3.x nicht unterstützt werden. IsEven/IsOdd verwenden jetzt Modulo (%) statt bitweisem AND.
 
