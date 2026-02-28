@@ -1422,6 +1422,12 @@ begin
         if not TypeEqual(ctype, atBool) then
           FDiag.Error('repeat-until condition must be bool', TAstRepeatUntil(stmt).Cond.Span);
       end;
+    nkPool:
+      begin
+        // pool { ... } - Memory Pool Block
+        // Check that body is valid, no special semantics needed at parse time
+        CheckStmt(TAstPoolStmt(stmt).Body);
+      end;
     nkReturn:
       begin
         ret := TAstReturn(stmt);
