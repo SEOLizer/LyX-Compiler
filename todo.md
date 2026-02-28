@@ -4,7 +4,7 @@
 
 | Plattform | Status | Anmerkungen |
 |-----------|--------|-------------|
-| **x86_64 Linux** | ✅ Vollständig | Statisch + Dynamisch (PLT/GOT), alle Features |
+| **x86_64 Linux** | ⚠️ Teilweise | Statisch vollständig, Dynamic Linking: Emitter ✅, Writer ⚠️ (Segfault bei Ausführung) |
 | **x86_64 Windows** | ✅ Vollständig | PE32+, kernel32.dll Imports, Windows API |
 | **ARM64 Linux** | ⚠️ Teilweise | Statisch vollständig, Dynamic Linking: Emitter ✅, Writer 🔲 |
 | **ARM64 Windows** | ❌ Fehlt | Kein PE64 ARM64 Writer |
@@ -15,8 +15,8 @@
 ## Bereits implementiert
 
 ### x86_64 Linux (ELF64)
-- Statische und dynamische ELF64-Dateien
-- PLT/GOT für externe Symbole (Dynamic Linking)
+- Statische ELF64-Dateien
+- **⚠️ Dynamic Linking (PLT/GOT)**: Emitter und Writer implementiert, aber Segfault bei Ausführung - Debugging nötig
 - Alle IR-Operationen: Integer, Float, Strings, Arrays, Structs, Klassen
 - Heap-Allokation (mmap/munmap)
 - Random Builtin
@@ -45,19 +45,20 @@
 
 ## Todo: Was noch zu tun ist
 
-### Priorität 1: ARM64 Dynamic Linking
+### Priorität 1: Dynamic Linking Debugging (x86_64 & ARM64)
 
-**Beschreibung**: ARM64 Linux unterstützt derzeit nur statische ELF-Dateien. **Emitter-Seite ist implementiert**, fehlt noch: Writer-Integration.
+**Beschreibung**: Beide Dynamic Linking Implementierungen haben Probleme. x86_64 hat einen Segfault bei Ausführung, ARM64 ist noch nicht vollständig implementiert.
 
-**Aufgaben**:
-1. [x] PLT/GOT Emission im ARM64 Emitter
-   - `TARM64Emitter.GetExternalSymbols()` und `GetPLTGOTPatches()` implementiert
-   - PLT-Stub Generierung am Ende des Codes
-2. [ ] Relocation-Typen: R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE im Writer
-3. [ ] .rela.plt Sektion generieren in elf64_arm64_writer
-4. [ ] Dynamic Linker Integration (ld-linux-aarch64.so)
-5. [ ] Dynamic Linking Writer vollständig implementieren
-6. [ ] Testen mit externen Library-Aufrufen
+**x86_64 Debugging**:
+- [ ] Segfault bei Ausführung debuggen
+- [ ] PLT/GOT-Relocations überprüfen
+- [ ] Dynamic Linker Integration testen
+
+**ARM64 Implementierung**:
+- [ ] ARM64 Dynamic Linking Writer implementieren (siehe x86_64 als Referenz)
+- [ ] PT_DYNAMIC Program Header
+- [ ] .rela.plt / .rela.dyn Sektionen
+- [ ] Testen mit QEMU
 
 **Schätzung**: 2-3 Tage
 
