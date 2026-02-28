@@ -37,6 +37,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 * Zuweisung: `:=`
 * Arithmetik: `+ - * / %`
+* **String-Verkettung**: `+` (bei pchar + pchar)
 * Vergleich: `== != < <= > >=`
 * Logik: `&& || !`
 * Null-Safety: `? ?? ?.`
