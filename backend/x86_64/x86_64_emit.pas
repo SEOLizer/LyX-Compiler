@@ -2711,6 +2711,71 @@ begin
             // syscall
             WriteSyscall(FCode);
           end;
+
+        irPoolAlloc:
+          begin
+            // Pool allocation: Dest = pool_alloc(ImmInt bytes)
+            // Für jetzt: nutze einfachen Ansatz - allocate with mmap like irAlloc
+            // TODO: Implement real pool with pre-allocated arena
+            
+            // syscall number 9 (sys_mmap)
+            WriteMovRegImm64(FCode, RAX, 9);
+            // rdi = 0 (addr = NULL)
+            WriteMovRegImm64(FCode, RDI, 0);
+            // rsi = ImmInt + 8 (extra 8 bytes for size header)
+            WriteMovRegImm64(FCode, RSI, UInt64(instr.ImmInt + 8));
+            // rdx = 3 (prot = PROT_READ | PROT_WRITE)
+            WriteMovRegImm64(FCode, RDX, 3);
+            // r10 = 34 (flags = MAP_PRIVATE | MAP_ANONYMOUS)
+            WriteMovRegImm64(FCode, R10, 34);
+            // r8 = -1 (fd = -1)
+            WriteMovRegImm64(FCode, R8, High(UInt64));
+            // r9 = 0 (offset = 0)
+            WriteMovRegImm64(FCode, R9, 0);
+            // syscall — RAX = Zeiger auf allocated Memory
+            WriteSyscall(FCode);
+            
+            // Speichere die Größe im Header: [RAX] = ImmInt
+            WriteMovRegImm64(FCode, RDI, UInt64(instr.ImmInt));
+            WriteMovMemReg(FCode, RAX, 0, RDI);
+            
+            // RAX += 8 (skip header, return user pointer)
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C0); EmitU8(FCode, 8);
+            
+            // Store user pointer to Dest temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irPoolFree:
+          begin
+            // Pool free all: free(Src1 pointer)
+            // Gibt den gesamten Pool auf einmal frei
+            
+            // Lade den User-Zeiger nach R11
+            WriteMovRegMem(FCode, R11, RBP, SlotOffset(localCnt + instr.Src1));
+            
+            // RAX = R11 - 8 (Header-Zeiger)
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $E3); EmitU8(FCode, 8);
+            
+            // Lade die Größe aus dem Header: RAX = [R11]
+            WriteMovRegMem(FCode, RAX, R11, 0);
+            
+            // RDI = RAX + 8 (Größe + Header)
+            WriteMovRegReg(FCode, RDI, RAX);
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C7); EmitU8(FCode, 8);
+            
+            // RSI = R11 (Adresse für munmap)
+            WriteMovRegReg(FCode, RSI, R11);
+            
+            // RAX = 11 (sys_munmap)
+            WriteMovRegImm64(FCode, RAX, 11);
+            // RDX = 0 (ignored)
+            WriteMovRegImm64(FCode, RDX, 0);
+            
+            // syscall
+            WriteSyscall(FCode);
+          end;
+
         irPanic:
           begin
             // panic(message): write message to stderr and exit with error code

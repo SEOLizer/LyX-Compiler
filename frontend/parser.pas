@@ -685,6 +685,15 @@ begin
     Exit(TAstWhile.Create(cond, bodyStmt, cond.Span));
   end;
 
+  // pool { ... } - Memory Pool Block
+  if Check(tkPool) then
+  begin
+    Advance; // pool
+    Expect(tkLBrace);
+    bodyStmt := ParseBlock;
+    Exit(TAstPoolStmt.Create(bodyStmt, FCurTok.Span));
+  end;
+
   // switch (expr) { case CONST: stmt ... default: stmt }
   if Check(tkSwitch) then
   begin

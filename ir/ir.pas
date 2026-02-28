@@ -64,6 +64,9 @@ type
     // heap memory management
     irAlloc,          // heap allocate: Dest = alloc(ImmInt bytes) -> pointer
     irFree,           // heap free: free(Src1 pointer)
+    // memory pool operations
+    irPoolAlloc,      // pool allocate: Dest = pool_alloc(ImmInt bytes) -> pointer from pool
+    irPoolFree,       // pool free all: free entire pool (Src1 = pool base pointer)
     // exception handler ops
     irPushHandler,  // push handler frame: Src1 = handler_addr, LabelName = catch_label
     irPopHandler,   // pop handler frame: Src1 = handler_addr

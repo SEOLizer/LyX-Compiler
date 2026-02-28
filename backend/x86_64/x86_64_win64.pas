@@ -2237,6 +2237,34 @@ begin
             // For now, skip freeing to avoid complexity
             // Windows will free all memory when process exits
           end;
+
+        irPoolAlloc:
+          begin
+            // Pool allocation: Dest = pool_alloc(ImmInt bytes)
+            // Use VirtualAlloc like irAlloc for now
+            // TODO: Implement real pool with pre-allocated arena
+            
+            // RCX = lpAddress = NULL (0)
+            WriteMovRegImm64(FCode, RCX, 0);
+            // RDX = dwSize = ImmInt
+            WriteMovRegImm64(FCode, RDX, UInt64(instr.ImmInt));
+            // R8 = flAllocationType = MEM_COMMIT | MEM_RESERVE = 0x3000
+            WriteMovRegImm64(FCode, R8, $3000);
+            // R9 = flProtect = PAGE_READWRITE = 0x04
+            WriteMovRegImm64(FCode, R9, $04);
+            // Call VirtualAlloc
+            WriteIndirectCall(FKernel32Index, FVirtualAllocIndex);
+            // Result (pointer) is now in RAX, store to Dest temp slot
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irPoolFree:
+          begin
+            // Pool free all: free entire pool
+            // For now, skip freeing like irFree
+            // Windows will free all memory when process exits
+          end;
+
         irConstFloat:
           begin
             // Float-Konstante als Bit-Pattern in den Slot schreiben

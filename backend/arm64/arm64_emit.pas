@@ -2115,7 +2115,41 @@ begin
             // TODO: Track allocation sizes for proper munmap
             // This causes a memory leak but prevents crashes
           end;
-          
+
+        irPoolAlloc:
+          begin
+            // Pool allocation: Dest = pool_alloc(ImmInt bytes)
+            // Use mmap like irAlloc for now
+            // TODO: Implement real pool with pre-allocated arena
+            
+            // X0 = addr (0 = NULL)
+            WriteMovImm64(FCode, X0, 0);
+            // X1 = length (size in bytes)
+            WriteMovImm64(FCode, X1, UInt64(instr.ImmInt));
+            // X2 = prot (PROT_READ | PROT_WRITE = 3)
+            WriteMovImm64(FCode, X2, 3);
+            // X3 = flags (MAP_PRIVATE | MAP_ANONYMOUS = 34)
+            WriteMovImm64(FCode, X3, 34);
+            // X4 = fd (-1)
+            WriteMovImm64(FCode, X4, High(UInt64));
+            // X5 = offset (0)
+            WriteMovImm64(FCode, X5, 0);
+            // X8 = syscall number (222 = sys_mmap on ARM64 Linux)
+            WriteMovImm64(FCode, X8, SYS_mmap);
+            // SVC #0
+            WriteSvc(FCode, 0);
+            // Result (pointer) is now in X0, store to Dest temp slot
+            slotIdx := localCnt + instr.Dest;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irPoolFree:
+          begin
+            // Pool free all: free entire pool
+            // Skip for now like irFree
+            // TODO: Track pool sizes for proper munmap
+          end;
+        
         irReturn:
           begin
             // Load return value into X0

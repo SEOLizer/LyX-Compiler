@@ -2944,15 +2944,25 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
 
        // end label
        instr.Op := irLabel; instr.LabelName := endLbl; Emit(instr);
-     finally
-       caseLabels.Free;
-     end;
-     Exit(True);
-   end;
+      finally
+        caseLabels.Free;
+      end;
+      Exit(True);
+    end;
 
-   FDiag.Error('lowering: unsupported statement', stmt.Span);
-   Result := False;
- end;
+    // pool { ... } - Memory Pool Block
+    if stmt is TAstPoolStmt then
+    begin
+      // Pool-Block: Allokiere Pool-Speicher am Anfang und gib ihn am Ende frei
+      // Für jetzt: Pool direkt als normalen Block behandeln
+      // Die IR-Operationen irPoolAlloc/irPoolFree werden vom Backend verwendet
+      LowerStmt(TAstPoolStmt(stmt).Body);
+      Exit(True);
+    end;
+
+    FDiag.Error('lowering: unsupported statement', stmt.Span);
+    Result := False;
+  end;
 
 
 end.

@@ -30,8 +30,8 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 - `PrintIntLn(x: int64): void` - Print Integer mit Newline  
 - `ExitProc(code: int64): void` - Wrapper für `exit`
 
-**printf (pure-Lyx)**
-- `printf(fmt: pchar, ...)` ist eine reine-Lyx-Implementierung, die ohne libc auskommt.
+**Printf (pure-Lyx)**
+  - `Printf(fmt: pchar, ...)` ist eine reine-Lyx-Implementierung, die ohne libc auskommt.
 - Unterstützte Platzhalter: `%s` (pchar), `%d` (int64), `%f` (f64), `%%` → literal `%`.
 - Maximal unterstützte Platzhalter pro Aufruf: 4
 - Standard-Precision für `%f`: 6 Dezimalstellen.
@@ -106,22 +106,22 @@ printf("Formatted: %s = %s, pi=%s\n", "answer", s_num, s_pi);
 - Ziel: Farben, Cursorsteuerung, Bildschirmoperationen mit ANSI-ESC-Sequenzen
 - **Keine externen Abhängigkeiten** → statische ELFs möglich
 
-Wichtige API-Funktionen (pub):
-- `text_color(c: crt_color)` – Vordergrundfarbe setzen
-- `text_background(c: crt_color)` – Hintergrundfarbe setzen
-- `text_attr(fg,bg)` – Vorder- und Hintergrund zusammen
-- `reset_attr()` – Attribute zurücksetzen
-- `clrscr()` – Bildschirm löschen und Cursor nach Home
-- `clreol()` – Lösche bis EOL
-- `gotoxy(col,row)` – Cursor setzen (1-basiert)
-- `hide_cursor()`, `show_cursor()` – Cursor sichtbar/unsichtbar
-- `write_str_at(col,row,s)` – Schreibe String an Position
+Wichtige API-Funktionen (pub, PascalCase):
+- `TextColor(c: crt_color)` – Vordergrundfarbe setzen
+- `TextBackground(c: crt_color)` – Hintergrundfarbe setzen
+- `TextAttr(fg,bg)` – Vorder- und Hintergrund zusammen
+- `ResetAttr()` – Attribute zurücksetzen
+- `ClrScr()` – Bildschirm löschen und Cursor nach Home
+- `ClrEol()` – Lösche bis EOL
+- `GoToXY(col,row)` – Cursor setzen (1-basiert)
+- `HideCursor()`, `ShowCursor()` – Cursor sichtbar/unsichtbar
+- `WriteStrAt(col,row,s)` – Schreibe String an Position
 
-Hinweis: `read_char()` in std/crt ist nur ein dokumentierter Platzhalter (kanonisches/blocking input). Für rohe Terminal-Eingaben siehe std/crt_raw.
+Hinweis: `ReadChar()` in std/crt ist nur ein dokumentierter Platzhalter (kanonisches/blocking input). Für rohe Terminal-Eingaben sieh std/crt_raw.
 
 ### std/crt_raw ⭐ **NEU, experimentell**
 **Raw-Mode und Nicht-Blocking Input (termios-basierte Erweiterung)**
-- Bietet Prototypen: `set_raw_mode(enabled)`, `key_pressed()`, `read_key_raw()`
+- Bietet Prototypen: `SetRawMode(enabled)`, `KeyPressed()`, `ReadKeyRaw()`
 - Implementiert über `extern`-Deklarationen (tcgetattr/tcsetattr/read/select/ioctl)
 - **WICHTIG**: Verwendung dieser Unit führt zu dynamischen ELFs (libc wird benötigt). Die Unit ist experimentell; termios-Struct-Layout ist plattformabhängig.
 
@@ -134,11 +134,11 @@ import std.crt;
 import std.io;
 
 fn main(): int64 {
-  clrscr();
-  text_attr(white, blue);
-  write_str_at(1,1," Lyx CRT ANSI Demo ");
-  reset_attr();
-  text_color(red); gotoxy(5,4); PrintStr("This is red text");
+  ClrScr();
+  TextAttr(white, blue);
+  WriteStrAt(1,1," Lyx CRT ANSI Demo ");
+  ResetAttr();
+  TextColor(red); GoToXY(5,4); PrintStr("This is red text");
   return 0;
 }
 ```
