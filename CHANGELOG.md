@@ -1,5 +1,57 @@
 # Changelog - Lyx Compiler
 
+## Version 0.4.3 (Februar 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **IR-Level Inlining (v0.4.3)**
+
+Automatische Inlining-Optimierung auf IR-Ebene für bessere Performance:
+
+```lyx
+// Funktionen mit ≤12 IR-Anweisungen werden automatisch inlined
+fn add(a: int64, b: int64): int64 {
+    return a + b;
+}
+
+fn main(): int64 {
+    var x: int64 := add(10, 20);  // Wird zu: var x: int64 := 10 + 20;
+    return x;
+}
+```
+
+**Implementierung:**
+- `ir_inlining.pas`: Vollständiger Inlining-Pass
+- Rekursionserkennung vermeidet selbstreferenzielle Inlinings
+- Korrektes Argument-Mapping zwischen Caller/Callee
+- Return-Statements werden durch Jumps ersetzt
+- Mehrere Pässe für verschachtelte Funktionen
+
+#### **Naming Conventions: PascalCase (v0.4.3)**
+
+Alle stdlib-Funktionen verwenden jetzt PascalCase gemäß AGENTS.md:
+
+```lyx
+// Vorher (lowercase/snake_case)
+printf("Hello %d\n", 42);
+clrscr();
+gotoxy(10, 5);
+
+// Jetzt (PascalCase)
+Printf("Hello %d\n", 42);
+ClrScr();
+GoToXY(10, 5);
+```
+
+**Umbenannte Funktionen:**
+- `std/crt`: `TextColor`, `TextBackground`, `TextAttr`, `ClrScr`, `ClrEol`, `GoToXY`, `HideCursor`, `ShowCursor`, `WriteStrAt`, `ReadChar`
+- `std/io`: `Printf`
+- `std/env`: `Init`, `Arg`
+- `std/string`: `StrCmp`, `StrCpy`
+- `std/time`: `Now`
+
+---
+
 ## Version 0.2.2 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
