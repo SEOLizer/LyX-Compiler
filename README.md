@@ -1,46 +1,46 @@
 # Lyx
 
-**Lyx** ist ein nativer Compiler für die gleichnamige Programmiersprache, geschrieben in FreePascal.
-Er erzeugt direkt ausführbare **Linux x86_64 ELF64-**, **Linux ARM64 ELF64-** und **Windows x64 PE32+-Binaries** — ohne libc, ohne Linker, rein über Syscalls bzw. WinAPI.
+**Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
+It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
 Lyx Compiler v0.4.0
-Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
+Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Vollständiges Module System mit Import/Export
-✅ Cross-Unit Function Calls und Symbol Resolution  
-✅ Einheitlicher Call-Pfad (internal/imported/extern)
-✅ PLT/GOT Dynamic Linking für externe Libraries
+✅ Complete Module System with Import/Export
+✅ Cross-Unit Function Calls and Symbol Resolution
+✅ Unified Call Path (internal/imported/extern)
+✅ PLT/GOT Dynamic Linking for External Libraries
 ✅ Standard Library (std.math, std.io, std.string)
-✅ Robuste Parser mit While/If/Function Support
-✅ OOP: Classes, Vererbung, Konstruktoren, Destruktoren
-✅ Globale Variablen mit Initialisierung
+✅ Robust Parser with While/If/Function Support
+✅ OOP: Classes, Inheritance, Constructors, Destructors
+✅ Global Variables with Initialization
 ✅ Random/RandomSeed Builtins
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
-✅ Debugging: --emit-asm und --dump-relocs Flags
-✅ CLI-Argumente (argc/argv) im statischen ELF
-✅ Option Types: Nullable Pointer (pchar?) mit Null-Coalescing (??)
-✅ SIMD: ParallelArray<T> mit element-weisen Operationen
+✅ Debugging: --emit-asm and --dump-relocs Flags
+✅ CLI Arguments (argc/argv) in Static ELF
+✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
+✅ SIMD: ParallelArray<T> with Element-wise Operations
 ```
 
 ---
 
-## Schnellstart
+## Quick Start
 
 ```bash
-# Compiler bauen
+# Build compiler
 make build
 
-# Linux-Programm kompilieren und ausführen
+# Compile and run Linux program
 ./lyxc examples/hello.lyx -o hello
 ./hello
 
-# Windows-Programm cross-kompilieren
+# Cross-compile for Windows
 ./lyxc examples/hello.lyx -o hello.exe --target=win64
 
-# Debug-Flags
-./lyxc examples/hello.lyx --emit-asm      # IR als Pseudo-Assembler ausgeben
-./lyxc examples/hello.lyx --dump-relocs   # Relocations und Symbole anzeigen
+# Debug flags
+./lyxc examples/hello.lyx --emit-asm      # Output IR as pseudo-assembler
+./lyxc examples/hello.lyx --dump-relocs   # Show relocations and symbols
 ```
 
 ```
@@ -49,41 +49,41 @@ Hello Lyx
 
 ### Cross-Compilation
 
-Lyx unterstützt **Cross-Compilation** für drei Zielplattformen:
+Lyx supports **cross-compilation** for three target platforms:
 
 ```bash
-# Linux x86_64 ELF64 (Standard auf Linux-Hosts)
+# Linux x86_64 ELF64 (default on Linux hosts)
 ./lyxc program.lyx -o program --target=linux
 
-# Linux ARM64 ELF64 (für Raspberry Pi, Apple Silicon Linux, Cloud-Server)
+# Linux ARM64 ELF64 (for Raspberry Pi, Apple Silicon Linux, cloud servers)
 ./lyxc program.lyx -o program --target=arm64
 
-# Windows PE32+ (von Linux aus)
+# Windows PE32+ (from Linux)
 ./lyxc program.lyx -o program.exe --target=win64
 ```
 
-| Zielplattform | Format | Calling Convention | OS-Interface |
-|---------------|--------|-------------------|--------------|
+| Target Platform | Format | Calling Convention | OS Interface |
+|-----------------|--------|-------------------|--------------|
 | `linux` | ELF64 | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
 | `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
 | `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
 
-**Hinweis:** Der `--target`-Parameter ist optional. Der Compiler wählt automatisch das Host-Betriebssystem als Ziel.
+**Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
 
-**ARM64-Binaries testen (auf x86_64):**
+**Testing ARM64 binaries (on x86_64):**
 ```bash
-# QEMU installieren
+# Install QEMU
 sudo apt install qemu-user-static
 
-# ARM64-Binary ausführen
+# Run ARM64 binary
 qemu-aarch64-static ./program
 ```
 
 ---
 
-## Die Sprache Lyx
+## The Lyx Language
 
-Lyx ist **prozedural** und **statisch typisiert** — inspiriert von C und Rust, mit einer eigenen, kompakten Syntax.
+Lyx is **procedural** and **statically typed** — inspired by C and Rust, with its own compact syntax.
 
 ### Hello World
 
@@ -94,18 +94,18 @@ fn main(): int64 {
 }
 ```
 
-### Variablen und Arithmetik
+### Variables and Arithmetic
 
-Vier Speicherklassen steuern Veränderbarkeit und Lebensdauer:
+Four storage classes control mutability and lifetime:
 
 ```lyx
 fn main(): int64 {
   var x: int64 := 10;       // mutable
-  let y: int64 := 20;       // immutable nach Init
-  co  z: int64 := x + y;    // readonly (Runtime-Konstante)
+  let y: int64 := 20;       // immutable after init
+  co  z: int64 := x + y;    // readonly (runtime constant)
 
-  x := x + 1;               // erlaubt: var ist mutable
-  // y := 0;                 // verboten: let ist immutable
+  x := x + 1;               // allowed: var is mutable
+  // y := 0;                 // forbidden: let is immutable
 
   PrintInt(x + y + z);
   PrintStr("\n");
@@ -113,16 +113,16 @@ fn main(): int64 {
 }
 ```
 
-| Keyword | Veränderbar | Compilezeit | Speicher |
-|---------|:-----------:|:-----------:|----------|
-| `var`   | ja          | —           | Stack/Data (global) |
-| `let`   | nein        | —           | Stack/Data (global) |
-| `co`    | nein        | optional    | Stack    |
-| `con`   | nein        | ja          | Immediate / rodata |
+| Keyword | Mutable | Compile-time | Storage |
+|---------|:--------:|:------------:|---------|
+| `var`   | yes      | —            | Stack/Data (global) |
+| `let`   | no       | —            | Stack/Data (global) |
+| `co`    | no       | optional     | Stack    |
+| `con`   | no       | yes          | Immediate / rodata |
 
-### Globale Variablen
+### Global Variables
 
-`var` und `let` können auch auf Top-Level deklariert werden. Diese werden im Data-Segment gespeichert und sind global sichtbar:
+`var` and `let` can also be declared at the top level. These are stored in the data segment and are globally visible:
 
 ```lyx
 var globalCounter: int64 := 0;
@@ -141,15 +141,15 @@ fn main(): int64 {
 }
 ```
 
-Globale Variablen:
-- werden im Data-Segment gespeichert (nicht auf dem Stack)
-- können mit konstanten Integer-Werten initialisiert werden
-- sind in allen Funktionen sichtbar
-- können `pub` für exportiert werden
+Global variables:
+- are stored in the data segment (not on the stack)
+- can be initialized with constant integer values
+- are visible in all functions
+- can be marked `pub` for export
 
-### Compile-Time-Konstanten
+### Compile-Time Constants
 
-`con`-Deklarationen existieren auf Top-Level und werden zur Compilezeit aufgelöst — kein Stackslot, direkt als Immediate eingebettet:
+`con` declarations exist at the top level and are resolved at compile time — no stack slot, directly embedded as immediate:
 
 ```lyx
 con LIMIT: int64 := 5;
@@ -173,9 +173,9 @@ Loop
 Loop
 ```
 
-### Module System und Standard Library
+### Module System and Standard Library
 
-Lyx unterstützt ein vollständiges **Import/Export-System** für die Organisation von Code in wiederverwendbare Module:
+Lyx supports a complete **import/export system** for organizing code into reusable modules:
 
 ```lyx
 // std/math.lyx
@@ -202,64 +202,64 @@ fn main(): int64 {
 }
 ```
 
-**Verfügbare Standard Library:**
-- `std.math`: Mathematische Funktionen (`Abs64`, `Min64`, `Max64`, `TimesTwo`)
-- `std.io`: I/O Funktionen (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
-- `std.string`: Umfassende String-Manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, etc.)
-- `std.env`: Environment-API (`ArgCount`, `Arg`, `init`)
-- `std.time`: Datums- und Zeit-Funktionen (numerische Berechnungen)
-- `std.geo`: Geolocation-Parser für Decimal Degrees
+**Available Standard Library:**
+- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `TimesTwo`)
+- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
+- `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, etc.)
+- `std.env`: Environment API (`ArgCount`, `Arg`, `init`)
+- `std.time`: Date and time functions (numerical calculations)
+- `std.geo`: Geolocation parser for Decimal Degrees
 
-### Typen
+### Types
 
-| Typ       | Beschreibung                          |
+| Type       | Description                          |
 |-----------|---------------------------------------|
 | `int64`   | Signed 64-bit Integer                 |
-| `int`     | Alias für `int64` (konventionell)     |
+| `int`     | Alias for `int64` (convention)        |
 | `f32`     | 32-bit Floating-Point (IEEE 754)      |
-| `f64`     | 64-bit Floating-Point (IEEE 754)      |
-| `bool`    | `true` / `false`                      |
-| `void`    | Nur als Funktions-Rückgabetyp         |
-| `pchar`   | Pointer auf nullterminierte Bytes     |
-| `string`  | Alias für `pchar` (nullterminierte Bytes)
-| `array` | Dynamisches Array (Heap, Fat-Pointer: ptr, len, cap) |
-| `parallel Array<T>` | SIMD-optimiertes Array (Heap, element-weise Operationen) |
-| `struct`  | Benutzerdefinierter Record-Typ        |
+| `f64`     | 64-bit Floating-Point (IEEE 754)     |
+| `bool`    | `true` / `false`                     |
+| `void`    | Only as function return type          |
+| `pchar`   | Pointer to null-terminated bytes      |
+| `string`  | Alias for `pchar` (null-terminated bytes)
+| `array`   | Dynamic array (Heap, Fat-Pointer: ptr, len, cap) |
+| `parallel Array<T>` | SIMD-optimized array (Heap, element-wise operations) |
+| `struct`  | User-defined record type             |
 
-Hinweis: `int` und `string` sind derzeit Alias-Typen (bzw. Abkürzungen) — `int` wird intern als `int64` behandelt, `string` wird als `pchar` gemappt. Keine impliziten Casts — alle Typen müssen explizit übereinstimmen.
+Note: `int` and `string` are currently alias types (shortcuts) — `int` is internally treated as `int64`, `string` is mapped to `pchar`. No implicit casts — all types must match explicitly.
 
-### Float-Literale
+### Float Literals
 
-Float-Literale werden mit Dezimalpunkt geschrieben und sind vom Typ `f64`:
+Float literals are written with a decimal point and are of type `f64`:
 
 ```lyx
 fn main(): int64 {
   var pi: f64 := 3.14159;
   var e: f64 := 2.71828;
 
-  // Float-Konstanten auf Top-Level
+  // Float constants at top level
   con PI: f64 := 3.1415926535;
 
   return 0;
 }
 ```
 
-### Dynamische Arrays
+### Dynamic Arrays
 
-Lyx unterstützt dynamische Arrays, die auf dem Heap allokiert und über einen Fat-Pointer (ptr, len, cap) verwaltet werden. Sie sind resizable und können mit Builtins wie `push`, `pop`, `len` und `free` manipuliert werden.
+Lyx supports dynamic arrays, which are allocated on the heap and managed via a fat pointer (ptr, len, cap). They are resizable and can be manipulated with builtins like `push`, `pop`, `len`, and `free`.
 
 ```lyx
 fn main(): int64 {
-  // Dynamisches Array-Literal (Heap-allokiert)
+  // Dynamic array literal (heap-allocated)
   var dyn_arr: array := [10, 20, 30]; // ptr, len=3, cap=3
 
   PrintInt(len(dyn_arr)); // Output: 3
   PrintStr("\n");
 
-  // Elemente hinzufügen und entfernen
-  push(dyn_arr, 40);      // dyn_arr ist jetzt [10, 20, 30, 40]
-  push(dyn_arr, 50);      // dyn_arr ist jetzt [10, 20, 30, 40, 50]
-  var last: int64 := pop(dyn_arr); // last = 50, dyn_arr ist [10, 20, 30, 40]
+  // Add and remove elements
+  push(dyn_arr, 40);      // dyn_arr is now [10, 20, 30, 40]
+  push(dyn_arr, 50);      // dyn_arr is now [10, 20, 30, 40, 50]
+  var last: int64 := pop(dyn_arr); // last = 50, dyn_arr is [10, 20, 30, 40]
 
   PrintInt(len(dyn_arr)); // Output: 4
   PrintStr("\n");
@@ -268,55 +268,55 @@ fn main(): int64 {
   PrintInt(dyn_arr[3]);   // Output: 40
   PrintStr("\n");
 
-  // Element zuweisen
+  // Assign element
   dyn_arr[0] := 100;
 
-  // Speicher freigeben (explizit oder am Funktionsende)
+  // Free memory (explicitly or at function end)
   free(dyn_arr);
-  // Achtung: Nach free ist dyn_arr ungültig!
+  // Warning: After free, dyn_arr is invalid!
   return 0;
 }
 ```
 
-**Wichtige Eigenschaften:**
--   **Heap-Allokation**: Arrays werden mit `mmap` auf dem Heap allokiert und wachsen bei Bedarf.
--   **Fat-Pointer**: Intern als `{ pchar ptr, int64 len, int64 cap }` repräsentiert.
--   **Builtins**: Spezielle Funktionen zur Manipulation: `push(arr, val)`, `pop(arr)`, `len(arr)`, `free(arr)`.
--   **Typ-Homogenität**: Alle Elemente eines Arrays müssen denselben Typ haben (derzeit `int64`).
--   **Bounds-Checks**: Automatische Laufzeit-Überprüfung bei jedem Index-Zugriff.
+**Important properties:**
+- **Heap Allocation**: Arrays are allocated with `mmap` on the heap and grow as needed.
+- **Fat Pointer**: Internally represented as `{ pchar ptr, int64 len, int64 cap }`.
+- **Builtins**: Special functions for manipulation: `push(arr, val)`, `pop(arr)`, `len(arr)`, `free(arr)`.
+- **Type Homogeneity**: All elements of an array must have the same type (currently `int64`).
+- **Bounds Checks**: Automatic runtime check on every index access.
 
 ### ParallelArray (SIMD)
 
-ParallelArrays sind SIMD-optimierte, heap-allokierte Arrays, die element-weise Operationen unterstützen:
+ParallelArrays are SIMD-optimized, heap-allocated arrays that support element-wise operations:
 
 ```lyx
 fn main(): int64 {
-  // ParallelArray erzeugen (1000 Elemente vom Typ Int64)
+  // Create ParallelArray (1000 elements of type Int64)
   var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
 
-  // Einzelne Elemente lesen und schreiben
+  // Read and write individual elements
   vec[0] := 42;
   var first: int64 := vec[0];   // 42
 
-  // Element-weise SIMD-Operationen
+  // Element-wise SIMD operations
   var a: parallel Array<Int64> := parallel Array<Int64>(100);
   var b: parallel Array<Int64> := parallel Array<Int64>(100);
-  var sum: parallel Array<Int64> := a + b;   // element-weise Addition
-  var diff: parallel Array<Int64> := a - b;  // element-weise Subtraktion
+  var sum: parallel Array<Int64> := a + b;   // element-wise addition
+  var diff: parallel Array<Int64> := a - b;  // element-wise subtraction
 
   return 0;
 }
 ```
 
-**Wichtige Eigenschaften:**
--   **Heap-Allokation**: Arrays werden mit `mmap` auf dem Heap allokiert (16-Byte-Alignment für SSE2)
--   **Element-Typen**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
--   **SIMD-Operatoren**: `+`, `-`, `*`, `/`, `&&`, `||`, `^` und Vergleichsoperatoren (element-weise)
--   **Skalar-Zugriff**: `vec[i]` gibt einen einzelnen Skalarwert des Element-Typs zurück
+**Important properties:**
+- **Heap Allocation**: Arrays are allocated with `mmap` on the heap (16-byte alignment for SSE2)
+- **Element Types**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
+- **SIMD Operators**: `+`, `-`, `*`, `/`, `&&`, `||`, `^` and comparison operators (element-wise)
+- **Scalar Access**: `vec[i]` returns a single scalar value of the element type
 
 ### Structs (Records)
 
-Structs werden mit `type Name = struct { ... };` definiert und mit `TypeName { field: value, ... }` instanziiert:
+Structs are defined with `type Name = struct { ... };` and instantiated with `TypeName { field: value, ... }`:
 
 ```lyx
 type Point = struct {
@@ -332,21 +332,21 @@ type Rect = struct {
 };
 
 fn main(): int64 {
-  // Struct-Literal mit Feldinitialisierung
+  // Struct literal with field initialization
   var p: Point := Point { x: 10, y: 20 };
 
-  // Feldzugriff mit Punkt-Notation
+  // Field access with dot notation
   PrintInt(p.x);        // 10
   PrintInt(p.y);        // 20
 
-  // Feldzuweisung
+  // Field assignment
   p.x := 42;
   PrintInt(p.x);        // 42
 
-  // Structs in Ausdrücken
+  // Structs in expressions
   var sum: int64 := p.x + p.y;  // 62
 
-  // Größere Structs
+  // Larger structs
   var r: Rect := Rect { left: 0, top: 0, right: 100, bottom: 50 };
   var width: int64 := r.right - r.left;   // 100
 
@@ -354,11 +354,11 @@ fn main(): int64 {
 }
 ```
 
-Structs werden auf dem Stack allokiert (8 Bytes pro Feld). Der Zugriff erfolgt direkt über Offset-Berechnung.
+Structs are allocated on the stack (8 bytes per field). Access is done directly via offset calculation.
 
-#### Instanz-Methoden und `self`
+#### Instance Methods and `self`
 
-Structs können Methoden enthalten, die über `self` auf die Instanz zugreifen:
+Structs can contain methods that access the instance via `self`:
 
 ```lyx
 type Counter = struct {
@@ -377,23 +377,23 @@ type Counter = struct {
 fn main(): int64 {
   var c: Counter := 0;
   c.count := 10;
-  c.increment();     // count ist jetzt 11
-  return c.get();    // gibt 11 zurück
+  c.increment();     // count is now 11
+  return c.get();    // returns 11
 }
 ```
 
-**Wichtig:**
-- `self` ist automatisch in Instanz-Methoden verfügbar
-- `self` ist ein Pointer auf die Struct-Instanz
-- Methoden werden intern als `_L_<Struct>_<Method>(self, ...)` gemangled
+**Important:**
+- `self` is automatically available in instance methods
+- `self` is a pointer to the struct instance
+- Methods are internally mangled as `_L_<Struct>_<Method>(self, ...)`
 
-#### Statische Methoden mit `static`
+#### Static Methods with `static`
 
-Statische Methoden haben keinen `self`-Parameter und werden mit `Type.method()` aufgerufen:
+Static methods have no `self` parameter and are called with `Type.method()`:
 
 ```lyx
 type Math = struct {
-  dummy: int64;   // Platzhalter-Feld
+  dummy: int64;   // placeholder field
   
   static fn add(a: int64, b: int64): int64 {
     return a + b;
@@ -411,15 +411,15 @@ fn main(): int64 {
 }
 ```
 
-**Statische Methoden:**
-- Werden mit `static fn` deklariert
-- Haben keinen impliziten `self`-Parameter
-- Werden mit `TypeName.method()` aufgerufen
-- Nützlich für Utility-Funktionen und "Konstruktoren"
+**Static methods:**
+- Are declared with `static fn`
+- Have no implicit `self` parameter
+- Are called with `TypeName.method()`
+- Useful for utility functions and "constructors"
 
-#### Der `Self`-Typ
+#### The `Self` Type
 
-In Methoden kann `Self` als Rückgabetyp verwendet werden (wird zum Struct-Typ aufgelöst):
+In methods, `Self` can be used as a return type (resolves to the struct type):
 
 ```lyx
 type Point = struct {
@@ -432,11 +432,11 @@ type Point = struct {
 };
 ```
 
-**Hinweis:** Struct-Rückgabe by-value ist noch eingeschränkt. Aktuell können statische Methoden primitive Typen zurückgeben, aber keine Structs.
+**Note:** Struct return by value is still limited. Currently, static methods can return primitive types, but not structs.
 
-### Klassen (Classes) mit Vererbung
+### Classes (OOP) with Inheritance
 
-Lyx unterstützt OOP mit Klassen, Vererbung, Konstruktoren und Destruktoren:
+Lyx supports OOP with classes, inheritance, constructors, and destructors:
 
 ```lyx
 type Animal = class {
@@ -467,37 +467,37 @@ type Dog = class extends Animal {
 fn main(): int64 {
   var d: Dog := new Dog("Buddy", "Labrador");
   d.speak();              // "Woof!"
-  dispose d;              // Ruft Destroy() auf
+  dispose d;              // Calls Destroy()
   return 0;
 }
 ```
 
-**Klassen-Features:**
-- `class extends BaseClass` für Vererbung
-- `new ClassName()` für Heap-Allokation
-- `new ClassName(args)` ruft Konstruktor `Create` auf
-- `dispose expr` ruft `Destroy()` auf und gibt Speicher frei
-- `super.method()` für Aufruf der Basisklassen-Methode
-- Heap-allokiert (im Gegensatz zu Stack-allokierten Structs)
+**Class features:**
+- `class extends BaseClass` for inheritance
+- `new ClassName()` for heap allocation
+- `new ClassName(args)` calls constructor `Create`
+- `dispose expr` calls `Destroy()` and frees memory
+- `super.method()` for calling base class methods
+- Heap-allocated (vs. stack-allocated structs)
 
-### Operatoren
+### Operators
 
-| Priorität | Operatoren           | Beschreibung              |
-|:---------:|----------------------|---------------------------|
-| 1 (niedrig) | `\|>`            | Pipe (Funktionsverkettung) |
-| 2         | `||`                 | Logisches Oder            |
-| 3         | `&&`                 | Logisches Und             |
-| 4         | `==` `!=` `<` `<=` `>` `>=` | Vergleich (liefert `bool`) |
-| 5         | `+` `-`              | Addition, Subtraktion     |
-| 6         | `*` `/` `%`          | Multiplikation, Division, Modulo |
-| 7 (hoch)  | `!` `-` (unär)       | Logisches NOT, Negation   |
-| 8         | `as`                 | Type-Casting              |
+| Priority | Operators           | Description              |
+|:--------:|---------------------|-------------------------|
+| 1 (low) | `\|>`            | Pipe (function chaining) |
+| 2         | `\|\|`            | Logical Or              |
+| 3         | `&&`               | Logical And             |
+| 4         | `==` `!=` `<` `<=` `>` `>=` | Comparison (returns `bool`) |
+| 5         | `+` `-`            | Addition, Subtraction  |
+| 6         | `*` `/` `%`        | Multiplication, Division, Modulo |
+| 7 (high) | `!` `-` (unary)   | Logical NOT, Negation  |
+| 8         | `as`               | Type-Casting            |
 
-Zuweisung erfolgt mit `:=` (nicht `=`).
+Assignment uses `:=` (not `=`).
 
-### Inkrement- und Dekrement-Operatoren
+### Increment and Decrement Operators
 
-Die Operatoren `++` und `--` sind als **Postfix-Statements** verfügbar:
+The `++` and `--` operators are available as **postfix statements**:
 
 ```lyx
 var counter: int64 := 0;
@@ -512,16 +512,16 @@ fn main(): int64 {
 }
 ```
 
-**Unterstützte Formen:**
-- `ident++` / `ident--` - Variable inkrementieren/dekrementieren
-- `obj.field++` / `obj.field--` - Feld inkrementieren/dekrementieren
-- `arr[idx]++` / `arr[idx]--` - Array-Element inkrementieren/dekrementieren
+**Supported forms:**
+- `ident++` / `ident--` - increment/decrement variable
+- `obj.field++` / `obj.field--` - increment/decrement field
+- `arr[idx]++` / `arr[idx]--` - increment/decrement array element
 
-**Hinweis:** Dies sind Statement-Formen (keine Expressions). Sie liefern keinen Wert zurück.
+**Note:** These are statement forms (not expressions). They do not return a value.
 
-### Pipe-Operator `|>`
+### Pipe Operator `|>`
 
-Der Pipe-Operator ermöglicht das Verketten von Funktionen in der Reihenfolge des Datenflusses (von links nach rechts):
+The pipe operator enables chaining functions in data flow order (left to right):
 
 ```lyx
 fn double(x: int64): int64 { return x * 2; }
@@ -530,10 +530,10 @@ fn addOne(x: int64): int64 { return x + 1; }
 fn main(): int64 {
   var x: int64 := 5;
   
-  // Neu: Pipe-Operator (lesbar von links nach rechts)
+  // New: Pipe operator (readable left to right)
   var result: int64 := x |> double() |> addOne();
   
-  // Äquivalent zur klassischen Schreibweise:
+  // Equivalent to classic notation:
   // var result: int64 := addOne(double(x));
   
   PrintInt(result);  // 11
@@ -541,7 +541,7 @@ fn main(): int64 {
 }
 ```
 
-**Mit zusätzlichen Argumenten:**
+**With additional arguments:**
 
 ```lyx
 fn add(a: int64, b: int64): int64 { return a + b; }
@@ -549,30 +549,30 @@ fn add(a: int64, b: int64): int64 { return a + b; }
 fn main(): int64 {
   var x: int64 := 10;
   
-  // x wird als erstes Argument eingefügt
-  var result: int64 := x |> add(5);  // äquivalent zu add(x, 5)
+  // x is inserted as the first argument
+  var result: int64 := x |> add(5);  // equivalent to add(x, 5)
   
   PrintInt(result);  // 15
   return 0;
 }
 ```
 
-**Vorteile:**
-- Bessere Lesbarkeit: Code liest sich wie der Datenfluss
-- Vermeidet tiefe Schachtelung
-- Einfacheres Debugging durch klare Reihenfolge
+**Benefits:**
+- Better readability: code reads like data flow
+- Avoids deep nesting
+- Simpler debugging through clear order
 
-### Type-Casting mit `as`
+### Type-Casting with `as`
 
-Lyx unterstützt explizite Type-Casts mit der `as`-Syntax:
+Lyx supports explicit type casts with the `as` syntax:
 
 ```lyx
 fn main(): int64 {
   var x: int64 := 42;
-  var f: f64 := x as f64;      // int64 -> f64 Konvertierung
-  var back: int64 := f as int64; // f64 -> int64 Konvertierung
+  var f: f64 := x as f64;      // int64 -> f64 conversion
+  var back: int64 := f as int64; // f64 -> int64 conversion
   
-  // String-Konvertierungen
+  // String conversions
   var s: pchar := IntToStr(x);
   var parsed: int64 := str_to_int(s);
   
@@ -581,13 +581,13 @@ fn main(): int64 {
 }
 ```
 
-**Unterstützte Casts:**
-- `int64 as f64`: Integer zu Float (SSE2 cvtsi2sd)
-- `f64 as int64`: Float zu Integer mit Truncation (SSE2 cvttsd2si)
+**Supported casts:**
+- `int64 as f64`: Integer to Float (SSE2 cvtsi2sd)
+- `f64 as int64`: Float to Integer with Truncation (SSE2 cvttsd2si)
 - Identity Casts: `int64 as int64`, `f64 as f64`
-- String-Konvertierungen über Builtin-Funktionen
+- String conversions via builtin functions
 
-### Kontrollfluss
+### Control Flow
 
 #### if / else
 
@@ -595,15 +595,15 @@ fn main(): int64 {
 fn main(): int64 {
   var x: int64 := 42;
   if (x > 10) {
-    PrintStr("gross\n");
+    PrintStr("greater\n");
   } else {
-    PrintStr("klein\n");
+    PrintStr("smaller\n");
   }
   return 0;
 }
 ```
 
-#### while-Schleife
+#### while loop
 
 ```lyx
 fn main(): int64 {
@@ -625,22 +625,22 @@ fn main(): int64 {
 4
 ```
 
-#### Bool-Ausdrücke als Bedingung
+#### Bool expressions as condition
 
 ```lyx
 fn main(): int64 {
   var active: bool := true;
   if (active)
-    PrintStr("aktiv\n");
+    PrintStr("active\n");
   return 0;
 }
 ```
 
 #### switch / case
 
-switch/case wurde ergänzt und unterstützt nun fallweise sowohl Block‑Bodies als auch einzelne Statements. `break` beendet die nächsthöhere Schleife oder den aktuellen switch‑Fall.
+switch/case has been added and now supports both block bodies and single statements per case. `break` terminates the nearest loop or current switch case.
 
-Beispiel (Block‑Bodies):
+Example (block bodies):
 
 ```lyx
 fn classify(x: int64): int64 {
@@ -661,7 +661,7 @@ fn classify(x: int64): int64 {
 }
 ```
 
-Beispiel (Single‑Statement‑Bodies):
+Example (single-statement bodies):
 
 ```lyx
 switch (n) {
@@ -671,10 +671,11 @@ switch (n) {
 }
 ```
 
-Hinweis: `case`‑Labels müssen momentan Ganzzahlen (int/int64) sein; Semantik und Codegen behandeln `int` als 64‑Bit.
-### Funktionen
+Note: `case` labels must currently be integers (int/int64); semantics and codegen treat `int` as 64-bit.
 
-Funktionen sind global, folgen der SysV ABI (Parameter in Registern) und unterstützen bis zu 6 Parameter:
+### Functions
+
+Functions are global, follow the SysV ABI (parameters in registers), and support up to 6 parameters:
 
 ```lyx
 fn add(a: int64, b: int64): int64 {
@@ -693,11 +694,11 @@ fn main(): int64 {
 5
 ```
 
-Funktionen ohne Rückgabetyp sind implizit `void`:
+Functions without return type are implicitly `void`:
 
 ```lyx
 fn greet() {
-  PrintStr("Hallo!\n");
+  PrintStr("Hello!\n");
 }
 
 fn main(): int64 {
@@ -708,29 +709,29 @@ fn main(): int64 {
 
 ### Builtins
 
-Über 30 eingebaute Funktionen stehen ohne Import zur Verfügung:
+Over 30 built-in functions are available without import:
 
-#### Basis I/O Builtins
-| Funktion          | Signatur               | Beschreibung                        |
+#### Basic I/O Builtins
+| Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `PrintStr(s)`    | `pchar -> void`        | Gibt String bis `\0` aus            |
-| `PrintInt(x)`    | `int64 -> void`        | Gibt Integer als Dezimalzahl aus    |
-| `PrintFloat(x)`  | `f64 -> void`          | Gibt Float aus (vereinfacht)        |
-| `exit(code)`      | `int64 -> void`        | Beendet das Programm mit Exit-Code  |
+| `PrintStr(s)`    | `pchar -> void`        | Outputs string until `\0`           |
+| `PrintInt(x)`    | `int64 -> void`        | Outputs integer as decimal          |
+| `PrintFloat(x)`  | `f64 -> void`          | Outputs float (simplified)          |
+| `exit(code)`      | `int64 -> void`        | Terminates program with exit code   |
 
 #### Random Builtins
-| Funktion          | Signatur               | Beschreibung                        |
+| Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `Random()`        | `void -> int64`        | Liefert Pseudo-Zufallszahl (0..2³¹-1) |
-| `RandomSeed(s)`   | `int64 -> void`        | Setzt den Seed für den LCG          |
+| `Random()`        | `void -> int64`        | Returns pseudo-random number (0..2³¹-1) |
+| `RandomSeed(s)`   | `int64 -> void`        | Sets seed for LCG                  |
 
-Beispiel:
+Example:
 ```lyx
 fn main(): int64 {
-  RandomSeed(42);           // Seed setzen
+  RandomSeed(42);           // Set seed
   
-  var r1: int64 := Random();  // Zufallszahl
-  var r2: int64 := Random();  // Weitere Zufallszahl
+  var r1: int64 := Random();  // Random number
+  var r2: int64 := Random();  // Another random number
   
   PrintInt(r1);
   PrintStr("\n");
@@ -740,49 +741,49 @@ fn main(): int64 {
 ```
 
 #### Array Builtins
-| Funktion          | Signatur               | Beschreibung                        |
+| Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `push(arr, val)`  | `array, int64 -> void` | Fügt Element am Ende hinzu          |
-| `pop(arr)`        | `array -> int64`       | Entfernt und liefert letztes Element|
-| `len(arr)`        | `array -> int64`       | Liefert aktuelle Anzahl Elemente    |
-| `free(arr)`       | `array -> void`        | Gibt Heap-Speicher frei             |
+| `push(arr, val)`  | `array, int64 -> void` | Appends element at end             |
+| `pop(arr)`        | `array -> int64`       | Removes and returns last element   |
+| `len(arr)`        | `array -> int64`       | Returns current element count      |
+| `free(arr)`       | `array -> void`        | Frees heap memory                  |
 
-#### String-Manipulation Builtins
-| Funktion                    | Signatur                                    | Beschreibung                        |
+#### String Manipulation Builtins
+| Function                    | Signature                                    | Description                        |
 |-----------------------------|---------------------------------------------|-------------------------------------|
-| `StrLength(s)`             | `pchar -> int64`                           | Berechnet String-Länge              |
-| `str_char_at(s, index)`     | `pchar, int64 -> int64`                    | Liest Character an Position         |
-| `str_set_char(s, index, c)` | `pchar, int64, int64 -> void`             | Setzt Character an Position         |
-| `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                   | String-Vergleich (0=gleich)         |
-| `str_copy_builtin(dest, src)` | `pchar, pchar -> void`                   | Kopiert String                      |
+| `StrLength(s)`             | `pchar -> int64`                           | Calculates string length           |
+| `str_char_at(s, index)`     | `pchar, int64 -> int64`                    | Reads character at position        |
+| `str_set_char(s, index, c)` | `pchar, int64, int64 -> void`             | Sets character at position         |
+| `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                   | String comparison (0=equal)        |
+| `str_copy_builtin(dest, src)` | `pchar, pchar -> void`                   | Copies string                      |
 
-#### String-Konvertierung Builtins
-| Funktion          | Signatur               | Beschreibung                        |
+#### String Conversion Builtins
+| Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `IntToStr(x)`   | `int64 -> pchar`       | Konvertiert Integer zu String       |
-| `str_to_int(s)`   | `pchar -> int64`       | Konvertiert String zu Integer       |
+| `IntToStr(x)`   | `int64 -> pchar`       | Converts integer to string          |
+| `str_to_int(s)`   | `pchar -> int64`       | Converts string to integer          |
 
-#### Math Builtins (22 Funktionen)
-| Funktion          | Signatur               | Beschreibung                        |
+#### Math Builtins (22 functions)
+| Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `abs(x)`          | `int64 -> int64`       | Absoluter Wert                      |
-| `odd(x)`          | `int64 -> bool`        | Prüft ob ungerade                   |
-| `hi(x)`           | `int64 -> int64`       | Hohe 32 Bits                        |
-| `lo(x)`           | `int64 -> int64`       | Niedrige 32 Bits                    |
-| `swap(x)`         | `int64 -> int64`       | Vertauscht 32-Bit Words             |
-| `fabs(x)`         | `f64 -> f64`           | Absoluter Wert (Float)              |
-| `sqrt(x)`         | `f64 -> f64`           | Quadratwurzel                       |
-| `sqr(x)`          | `f64 -> f64`           | Quadrat (x²)                        |
-| `round(x)`        | `f64 -> int64`         | Rundet zur nächsten Ganzzahl       |
-| `trunc(x)`        | `f64 -> int64`         | Schneidet Nachkommastellen ab      |
-| `IntPart(x)`     | `f64 -> int64`         | Alias für `trunc()`                 |
-| `frac(x)`         | `f64 -> f64`           | Nachkommateil                       |
-| `pi()`            | `void -> f64`          | π-Konstante                         |
-| `sin(x)`, `cos(x)`, `exp(x)`, `ln(x)`, `arctan(x)` | `f64 -> f64` | Transzendente Funktionen (Placeholder) |
+| `abs(x)`          | `int64 -> int64`       | Absolute value                     |
+| `odd(x)`          | `int64 -> bool`        | Checks if odd                      |
+| `hi(x)`           | `int64 -> int64`       | High 32 bits                       |
+| `lo(x)`           | `int64 -> int64`       | Low 32 bits                       |
+| `swap(x)`         | `int64 -> int64`       | Swaps 32-bit words                 |
+| `fabs(x)`         | `f64 -> f64`           | Absolute value (Float)             |
+| `sqrt(x)`         | `f64 -> f64`           | Square root                        |
+| `sqr(x)`          | `f64 -> f64`           | Square (x²)                        |
+| `round(x)`        | `f64 -> int64`         | Rounds to nearest integer          |
+| `trunc(x)`        | `f64 -> int64`         | Truncates fractional part          |
+| `IntPart(x)`     | `f64 -> int64`         | Alias for `trunc()`                |
+| `frac(x)`         | `f64 -> f64`           | Fractional part                   |
+| `pi()`            | `void -> f64`          | π constant                         |
+| `sin(x)`, `cos(x)`, `exp(x)`, `ln(x)`, `arctan(x)` | `f64 -> f64` | Transcendental functions (Placeholder) |
 
-### Externe Funktionen (v0.2.0)
+### External Functions (v0.2.0)
 
-Der Lyx-Compiler unterstützt jetzt Deklarationen externer Funktionen aus System-Libraries mit einem einheitlichen Call-Pfad:
+The Lyx compiler now supports declarations of external functions from system libraries with a unified call path:
 
 ```lyx
 extern fn malloc(size: int64): pchar;
@@ -797,19 +798,19 @@ fn main(): int64 {
 }
 ```
 
-#### Einheitlicher Call-Pfad (v0.2.0)
+#### Unified Call Path (v0.2.0)
 
-Der Compiler unterscheidet jetzt korrekt zwischen drei Call-Arten:
+The compiler now correctly distinguishes between three call types:
 
-| Call-Typ | Beschreibung | Codegen |
-|----------|--------------|---------|
-| `cmInternal` | Aufruf einer Funktion in derselben Unit | `call rel32` (direkt) |
-| `cmImported` | Aufruf einer Funktion aus importierter Unit | `call rel32` (direkt) |
-| `cmExternal` | Aufruf einer externen Library-Funktion | `call __plt_<name>` (PLT/GOT) |
+| Call Type | Description | Codegen |
+|-----------|--------------|---------|
+| `cmInternal` | Call to function in same unit | `call rel32` (direct) |
+| `cmImported` | Call to function from imported unit | `call rel32` (direct) |
+| `cmExternal` | Call to external library function | `call __plt_<name>` (PLT/GOT) |
 
-#### Varargs-Unterstützung
+#### Varargs Support
 
-Externe Funktionen können variable Argumentlisten mit `...` deklarieren:
+External functions can declare variable argument lists with `...`:
 
 ```lyx
 extern fn printf(fmt: pchar, ...): int64;
@@ -820,64 +821,64 @@ fn main(): int64 {
 }
 ```
 
-#### Dynamische vs. Statische ELF-Binaries
+#### Dynamic vs. Static ELF Binaries
 
-Der Compiler erkennt automatisch, ob externe Symbole verwendet werden:
+The compiler automatically detects whether external symbols are used:
 
-- **Statische ELF**: Wenn keine externen Funktionen aufgerufen werden
-- **Dynamische ELF**: Automatisch bei Verwendung externer Symbole
+- **Static ELF**: When no external functions are called
+- **Dynamic ELF**: Automatically when using external symbols
 
 ```bash
-# Statisches Binary (keine externen Aufrufe)
+# Static binary (no external calls)
 ./lyxc hello.lyx -o hello_static
 # Output: "Generating static ELF (no external symbols)"
 
-# Dynamisches Binary (mit malloc/printf)
+# Dynamic binary (with malloc/printf)
 ./lyxc extern_example.lyx -o extern_dynamic  
 # Output: "Generating dynamic ELF with 2 external symbols"
 ```
 
-#### Library-Zuordnung
+#### Library Mapping
 
-Der Compiler ordnet Symbole automatisch den passenden Libraries zu:
+The compiler automatically maps symbols to appropriate libraries:
 
 | Symbol | Library |
 |--------|---------|
 | `printf`, `malloc`, `strlen`, `exit` | `libc.so.6` |
 | `sin`, `cos`, `sqrt` | `libm.so.6` |
-| Unbekannte Symbole | `libc.so.6` (Fallback) |
+| Unknown symbols | `libc.so.6` (fallback) |
 
-#### PLT/GOT-Mechanik
+#### PLT/GOT Mechanism
 
-Dynamische Binaries nutzen die **Procedure Linkage Table (PLT)** und **Global Offset Table (GOT)**:
+Dynamic binaries use the **Procedure Linkage Table (PLT)** and **Global Offset Table (GOT)**:
 
-- **PLT-Stubs**: Jede externe Funktion erhält einen PLT-Eintrag
-- **GOT-Entries**: Enthalten Runtime-Adressen der Library-Funktionen
-- **Relocations**: Dynamic Linker patcht GOT zur Laufzeit
+- **PLT Stubs**: Each external function gets a PLT entry
+- **GOT Entries**: Contain runtime addresses of library functions
+- **Relocations**: Dynamic linker patches GOT at runtime
 
 ```bash
-# ELF-Struktur analysieren
-readelf -l extern_binary    # PT_INTERP, PT_DYNAMIC Headers
+# Analyze ELF structure
+readelf -l extern_binary    # PT_INTERP, PT_DYNAMIC headers
 readelf -d extern_binary    # NEEDED libraries, Symbol tables
 
-# Debug-Ausgabe mit neuem Flag
-./lyxc program.lyx --dump-relocs    # Zeigt externe Symbole und PLT-Patches
-./lyxc program.lyx --emit-asm        # Zeigt IR als Pseudo-Assembler
+# Debug output with new flag
+./lyxc program.lyx --dump-relocs    # Shows external symbols and PLT patches
+./lyxc program.lyx --emit-asm        # Shows IR as pseudo-assembler
 ```
 
-### Standard-Units
+### Standard Units
 
-Ein umfassendes Set von Standard-Units befindet sich im Verzeichnis `std/` und bietet ergonomische Bibliotheksfunktionen:
+A comprehensive set of standard units is located in the `std/` directory, providing ergonomic library functions:
 
-- **std/math.lyx** – Integer-Hilfen (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`)
-- **std/io.lyx** – I/O-Wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
-- **std/string.lyx** – Umfassende String-Library mit über 15 Funktionen
-- **std/env.lyx** – Environment-API (`init`, `ArgCount`, `Arg`)
-- **std/time.lyx** – Datums- und Zeit-Berechnungen (numerische Berechnungen)
-- **std/geo.lyx** – Geolocation-Parser für Decimal Degrees
-- **std/crt.lyx** – ANSI Console Utilities (Farben, Cursor, clrscr). Siehe `tests/lyx/crt/test_crt_ansi.lyx` für eine Demo.
+- **std/math.lyx** – Integer helpers (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`)
+- **std/io.lyx** – I/O wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
+- **std/string.lyx** – Comprehensive string library with 15+ functions
+- **std/env.lyx** – Environment API (`init`, `ArgCount`, `Arg`)
+- **std/time.lyx** – Date and time calculations (numerical)
+- **std/geo.lyx** – Geolocation parser for Decimal Degrees
+- **std/crt.lyx** – ANSI Console Utilities (colors, cursor, clrscr). See `tests/lyx/crt/test_crt_ansi.lyx` for a demo.
 
-#### String-Library Beispiel
+#### String Library Example
 
 ```lyx
 import std.string;
@@ -887,11 +888,11 @@ fn main(): int64 {
   var len: int64 := StrLength(text);           // Native Builtin
   var first: int64 := str_char_at(text, 0);     // 'H' = 72
   
-  // String-Manipulation
+  // String manipulation
   var lower: pchar := "buffer_space_here";
   StrToLower(lower, text);                    // "hello world"
   
-  // String-Tests  
+  // String tests  
   var starts: bool := StrStartsWith(text, "Hello"); // true
   var pos: int64 := StrFind(text, "World");          // 6
   
@@ -901,19 +902,19 @@ fn main(): int64 {
 }
 ```
 
-#### Math-Builtins Beispiel
+#### Math Builtins Example
 
 ```lyx
 fn main(): int64 {
   var x: int64 := -42;
   var y: f64 := 16.0;
   
-  // Native Integer-Math (keine Imports nötig)
+  // Native Integer Math (no imports needed)
   PrintInt(abs(x));         // 42
-  PrintInt(hi(x));          // Hohe 32 Bits
-  PrintInt(lo(x));          // Niedrige 32 Bits
+  PrintInt(hi(x));          // High 32 bits
+  PrintInt(lo(x));          // Low 32 bits
   
-  // Native Float-Math  
+  // Native Float Math  
   var root: f64 := sqrt(y);  // 4.0
   var square: f64 := sqr(y); // 256.0
   var rounded: int64 := round(root); // 4
@@ -923,7 +924,7 @@ fn main(): int64 {
 }
 ```
 
-#### Import-Beispiel
+#### Import Example
 
 ```lyx
 import std.math;
@@ -932,12 +933,12 @@ import std.string;
 import std.env; // optional
 
 fn main(argc: int64, argv: pchar): int64 {
-  // Automatische argc/argv-Initialisierung (kein manuelles init() nötig)
+  // Automatic argc/argv initialization (no manual init() needed)
   PrintIntLn(ArgCount());
   PrintStr(Arg(0));
   PrintStr("\n");
   
-  // Kombinierte Verwendung verschiedener Libraries
+  // Combined usage of different libraries
   var result: int64 := Abs64(-123);
   var str_result: pchar := IntToStr(result);
   PrintLn(str_result);
@@ -946,10 +947,9 @@ fn main(argc: int64, argv: pchar): int64 {
 }
 ```
 
-CI / Integrationstests
+### CI / Integration Tests
 
-- Die GitHub Actions CI baut den Compiler, führt Unit-Tests und zusätzlich kompiliert und führt die Test-Programme in `tests/lyx/` aus, um die Laufzeitintegration zu prüfen. Das `make e2e`-Target kompiliert und führt `hello.lyx`, `print_int.lyx` und `test_crt_ansi.lyx`; optionales `test_crt_raw.lyx` wird nur ausgeführt, wenn die CI-Variable `CRT_RAW` gesetzt ist.
-
+- GitHub Actions CI builds the compiler, runs unit tests, and additionally compiles and executes the test programs in `tests/lyx/` to verify runtime integration. The `make e2e` target compiles and runs `hello.lyx`, `print_int.lyx`, and `test_crt_ansi.lyx`; optional `test_crt_raw.lyx` is only executed if the `CRT_RAW` CI variable is set.
 
 ```lyx
 fn main(): int64 {
@@ -969,62 +969,62 @@ fn main(): int64 {
 -42
 ```
 
-### String-Escape-Sequenzen
+### String Escape Sequences
 
-| Escape | Bedeutung       |
-|--------|-----------------|
-| `\n`   | Zeilenumbruch   |
-| `\r`   | Wagenrücklauf   |
-| `\t`   | Tabulator        |
-| `\\`   | Backslash        |
-| `\"`   | Anführungszeichen|
-| `\0`   | Null-Byte        |
+| Escape | Meaning       |
+|--------|---------------|
+| `\n`   | Newline       |
+| `\r`   | Carriage return |
+| `\t`   | Tabulator     |
+| `\\`   | Backslash     |
+| `\"`   | Quote         |
+| `\0`   | Null byte     |
 
-### Kommentare
+### Comments
 
 ```lyx
-// Zeilenkommentar
+// Line comment
 
-/* Blockkommentar
-   über mehrere Zeilen */
+/* Block comment
+   spanning multiple lines */
 ```
 
-### Reservierte Keywords
+### Reserved Keywords
 
 ```
 fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super
 ```
 
-- `extern` wird für externe Funktionsdeklarationen verwendet
-- `as` wird für Type-Casting verwendet
-- `import`, `pub`, `unit` werden für das Module-System verwendet
-- `type`, `struct` werden für benutzerdefinierte Typen verwendet
-- `class`, `extends` für OOP mit Vererbung
-- `new` für Heap-Allokation von Klasseninstanzen
-- `dispose` für explizite Speicherfreigabe
-- `super` für Aufruf von Basisklassenmethoden
-- `static` markiert statische Methoden (ohne `self`-Parameter)
-- `self` referenziert die aktuelle Instanz in Methoden
-- `Self` als Rückgabetyp in Methoden (wird zum Struct-Typ aufgelöst)
+- `extern` is used for external function declarations
+- `as` is used for type casting
+- `import`, `pub`, `unit` are used for the module system
+- `type`, `struct` are used for user-defined types
+- `class`, `extends` for OOP with inheritance
+- `new` for heap allocation of class instances
+- `dispose` for explicit memory deallocation
+- `super` for calling base class methods
+- `static` marks static methods (without `self` parameter)
+- `self` references the current instance in methods
+- `Self` as return type in methods (resolves to struct type)
 
 ---
 
-## Praktische SO-Library Beispiele (v0.1.5)
+## Practical SO Library Examples (v0.1.5)
 
-### Memory Management mit malloc/free
+### Memory Management with malloc/free
 
 ```lyx
 extern fn malloc(size: int64): pchar;
 extern fn free(ptr: pchar): void;
 
 fn main(): int64 {
-  // Dynamischer Speicher allokieren
+  // Allocate dynamic memory
   let buffer: pchar := malloc(256);
   
-  // Buffer verwenden (vereinfacht)
+  // Use buffer (simplified)
   PrintStr("Buffer allocated at: ");
   
-  // Speicher wieder freigeben
+  // Free memory again
   free(buffer);
   
   PrintStr("Memory freed\n");
@@ -1032,7 +1032,7 @@ fn main(): int64 {
 }
 ```
 
-### Formatierte Ausgabe mit printf
+### Formatted Output with printf
 
 ```lyx
 extern fn printf(format: pchar, ...): int64;
@@ -1042,7 +1042,7 @@ fn main(): int64 {
   var pi: f64 := 3.14159;
   var name: pchar := "Lyx";
   
-  // Verschiedene Datentypen ausgeben
+  // Output various data types
   printf("Language: %s\n", name);
   printf("Count: %d\n", count);  
   printf("Pi: %.2f\n", pi);
@@ -1052,7 +1052,7 @@ fn main(): int64 {
 }
 ```
 
-### String-Verarbeitung
+### String Processing
 
 ```lyx
 extern fn strlen(str: pchar): int64;
@@ -1073,7 +1073,7 @@ fn main(): int64 {
 }
 ```
 
-### Math-Library Funktionen
+### Math Library Functions
 
 ```lyx
 extern fn sin(x: f64): f64;
@@ -1092,9 +1092,9 @@ fn main(): int64 {
 }
 ```
 
-## Vollständige Beispiele
+## Complete Examples
 
-### FizzBuzz mit Math-Builtins
+### FizzBuzz with Math Builtins
 
 ```lyx
 import std.string;
@@ -1116,7 +1116,7 @@ fn main(): int64 {
         if (div5) {
           PrintStr("Buzz\n");
         } else {
-          // Native String-Konvertierung
+          // Native string conversion
           var str: pchar := IntToStr(i);
           PrintStr(str);
           PrintStr("\n");
@@ -1129,7 +1129,7 @@ fn main(): int64 {
 }
 ```
 
-### String- und Math-Operations kombiniert
+### Combined String and Math Operations
 
 ```lyx
 import std.string;
@@ -1139,7 +1139,7 @@ fn analyze_number(x: int64): void {
   PrintInt(x);
   PrintStr("\n");
   
-  // Native Math-Builtins
+  // Native Math Builtins
   PrintStr("Absolute: ");
   PrintInt(abs(x));
   PrintStr("\n");
@@ -1150,7 +1150,7 @@ fn analyze_number(x: int64): void {
     PrintStr("Number is even\n");  
   }
   
-  // String-Konvertierung und -Manipulation
+  // String conversion and manipulation
   var str_val: pchar := IntToStr(abs(x));
   var len: int64 := StrLength(str_val);
   
@@ -1160,7 +1160,7 @@ fn analyze_number(x: int64): void {
   PrintInt(len);
   PrintStr(")\n");
   
-  // Float-Casting und Math
+  // Float casting and math
   var float_val: f64 := (abs(x) as f64);
   var sqrt_val: f64 := sqrt(float_val);
   PrintStr("Square root: ");
@@ -1180,118 +1180,118 @@ fn main(): int64 {
 
 ## Build & Test
 
-### Voraussetzungen
+### Prerequisites
 
 - **FreePascal Compiler** (FPC 3.2.2+)
-- **Linux x86_64** (Host-Plattform)
+- **Linux x86_64** (host platform)
 - GNU Make
 
-### Compiler bauen
+### Build Compiler
 
 ```bash
-make build          # Release-Build (-O2)
-make debug          # Debug-Build mit Checks (-g -gl -Ci -Cr -Co -gh)
+make build          # Release build (-O2)
+make debug          # Debug build with checks (-g -gl -Ci -Cr -Co -gh)
 ```
 
-### Lyx-Programm kompilieren
+### Compile Lyx Program
 
 ```bash
-# Linux ELF64 (Standard)
-./lyxc eingabe.lyx -o ausgabe
-./ausgabe
-echo $?             # Exit-Code prüfen
+# Linux ELF64 (default)
+./lyxc input.lyx -o output
+./output
+echo $?             # Check exit code
 
-# Windows PE32+ (Cross-Compilation)
-./lyxc eingabe.lyx -o ausgabe.exe --target=win64
-# Ausführung unter Windows oder Wine
+# Windows PE32+ (Cross-compilation)
+./lyxc input.lyx -o output.exe --target=win64
+# Run on Windows or Wine
 ```
 
 ### Tests
 
 ```bash
-make test           # Alle Unit-Tests (FPCUnit) - 15 Suiten, alle bestehen
-make e2e            # End-to-End Smoke-Tests
-./tests/test_pe64  # PE64 Writer Tests
+make test           # All unit tests (FPCUnit) - 15 suites, all pass
+make e2e            # End-to-end smoke tests
+./tests/test_pe64  # PE64 writer tests
 ```
 
 ---
 
-## Architektur
+## Architecture
 
 ```
-Quellcode (.lyx)
+Source code (.lyx)
       |
   [ Lexer ]         Tokenizer -> TToken-Stream
       |
   [ Parser ]        Recursive-Descent -> AST
       |
-  [ Sema ]          Semantische Analyse (Scopes, Typen)
+  [ Sema ]          Semantic analysis (Scopes, Types)
       |
   [ IR Lowering ]   AST -> 3-Address-Code IR
       |
-  [ Backend ]       IR -> Maschinencode (Bytes)
+  [ Backend ]       IR -> Machine code (Bytes)
       |
       +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
       |
       +-- [ Windows: x86_64_win64 + pe64_writer ]  -> PE32+ Binary
       |
-  Executable (ELF64 oder PE32+, ohne libc)
+  Executable (ELF64 or PE32+, without libc)
 ```
 
-### Projektstruktur
+### Project Structure
 
 ```
-lyxc.lpr                  Hauptprogramm
+lyxc.lpr                  Main program
 frontend/
   lexer.pas                 Tokenizer
   parser.pas                Recursive-Descent Parser
-  ast.pas                   AST-Knotentypen
-  sema.pas                  Semantische Analyse
+  ast.pas                   AST node types
+  sema.pas                  Semantic analysis
 ir/
-  ir.pas                    IR-Knotentypen (3-Address-Code)
-  lower_ast_to_ir.pas       AST -> IR Transformation
+  ir.pas                    IR node types (3-Address-Code)
+  lower_ast_to_ir.pas       AST -> IR transformation
 backend/
-  backend_types.pas         Gemeinsame Typen (External Symbols, Patches)
+  backend_types.pas         Shared types (External Symbols, Patches)
   x86_64/
-    x86_64_emit.pas         x86_64 Instruktions-Encoding (Linux/SysV)
-    x86_64_win64.pas        Windows x64 Emitter (Shadow Space, IAT)
+    x86_64_emit.pas         x86_64 instruction encoding (Linux/SysV)
+    x86_64_win64.pas        Windows x64 emitter (Shadow Space, IAT)
   elf/
-    elf64_writer.pas        ELF64 Binary-Writer
+    elf64_writer.pas        ELF64 binary writer
   pe/
-    pe64_writer.pas         PE32+ Binary-Writer (DOS/COFF/Optional Header)
+    pe64_writer.pas         PE32+ binary writer (DOS/COFF/Optional Header)
 util/
-  diag.pas                  Diagnostik (Fehler mit Zeile/Spalte)
-  bytes.pas                 TByteBuffer (Byte-Encoding + Patching)
-tests/                      FPCUnit-Tests
-  lyx/                      Lyx-Testprogramme (thematisch unterteilt)
-examples/                   Kuratierte Showcase-Programme
+  diag.pas                  Diagnostics (errors with line/column)
+  bytes.pas                 TByteBuffer (byte encoding + patching)
+tests/                      FPCUnit tests
+  lyx/                      Lyx test programs (thematic)
+examples/                   Curated showcase programs
 ```
 
-### Design-Prinzipien
+### Design Principles
 
-- **Frontend/Backend-Trennung**: Kein x86-Code im Frontend, keine AST-Knoten im Backend.
-- **IR als Stabilitätsanker**: Die Pipeline ist immer AST -> IR -> Maschinencode.
-- **Plattform-Abstraktion**: Gleicher IR-Input für Linux und Windows Backends.
-- **ELF64 ohne libc**: `_start` ruft `main()`, danach `sys_exit`. Kein Linking gegen externe Libraries.
-- **PE32+ mit IAT**: Import Address Table für kernel32.dll-Funktionen (GetStdHandle, WriteFile, ExitProcess).
-- **Builtins eingebettet**: `PrintStr`, `PrintInt`, `PrintFloat`, `strlen` und `exit` werden als Runtime-Snippets direkt ins Binary geschrieben.
-- **Jedes Token trägt SourceSpan**: Fehlermeldungen enthalten immer Datei, Zeile und Spalte.
+- **Frontend/Backend Separation**: No x86 code in frontend, no AST nodes in backend.
+- **IR as Stability Anchor**: Pipeline is always AST -> IR -> machine code.
+- **Platform Abstraction**: Same IR input for Linux and Windows backends.
+- **ELF64 without libc**: `_start` calls `main()`, then `sys_exit`. No linking against external libraries.
+- **PE32+ with IAT**: Import Address Table for kernel32.dll functions (GetStdHandle, WriteFile, ExitProcess).
+- **Builtins embedded**: `PrintStr`, `PrintInt`, `PrintFloat`, `strlen` and `exit` are embedded as runtime snippets directly into the binary.
+- **Every token carries SourceSpan**: Error messages always include file, line, and column.
 
 ---
 
-## Editor-Hervorhebung & Grammatik
+## Editor Highlighting & Grammar
 
-- Eine initiale TextMate/VSCode‑Grammatik liegt im Repo unter `syntaxes/lyx.tmLanguage.json`. Sie deckt Keywords, Typen, Literale, Kommentare und grundlegende Konstrukte ab und wird iterativ verfeinert.
-- Kurzfristig wird ein pragmatisches Mapping per `.gitattributes` genutzt, damit GitHub‑Highlighting sofort sichtbar ist: `*.lyx linguist-language=Rust` (Fallback).
-- Ziel: Contribution zur GitHub‑Linguist‑Bibliothek mit einer finalen TextMate‑Grammatik, damit `.lyx`‑Dateien nativ auf GitHub hervorgehoben werden.
+- An initial TextMate/VSCode grammar is in the repo at `syntaxes/lyx.tmLanguage.json`. It covers keywords, types, literals, comments, and basic constructs and is iteratively refined.
+- Short-term, a pragmatic mapping via `.gitattributes` is used so GitHub highlighting is immediately visible: `*.lyx linguist-language=Rust` (fallback).
+- Goal: Contribution to the GitHub Linguist library with a final TextMate grammar so `.lyx` files are natively highlighted on GitHub.
 
-Hinweis zum Testen lokal (VSCode)
-- Öffne das Repo in VSCode und nutze den "Extension Development Host", um `syntaxes/aurum.tmLanguage.json` zu laden.
-- Mit "Developer: Inspect TM Scopes" kannst du Token‑Scopes prüfen.
+Note for local testing (VSCode)
+- Open the repo in VSCode and use "Extension Development Host" to load `syntaxes/aurum.tmLanguage.json`.
+- With "Developer: Inspect TM Scopes" you can check token scopes.
 
-## Grammatik (EBNF)
+## Grammar (EBNF)
 
-Die vollständige formale Grammatik befindet sich in [`ebnf.md`](ebnf.md).
+The complete formal grammar is in [`ebnf.md`](ebnf.md).
 
 ```ebnf
 Program     := { TopDecl } ;
@@ -1308,7 +1308,7 @@ Expr        := OrExpr ;
 OrExpr      := AndExpr { '||' AndExpr } ;
 AndExpr     := CmpExpr { '&&' CmpExpr } ;
 CmpExpr     := AddExpr [ CmpOp AddExpr ] ;
-AddExpr     := MulExpr { ( '+' | '-' ) MulExpr } ;
+AddExpr     := MulExpr { ( '+' | '-' ) MulExpr} ;
 MulExpr     := UnaryExpr { ( '*' | '/' | '%' ) UnaryExpr } ;
 UnaryExpr   := ( '!' | '-' ) UnaryExpr | Primary ;
 Primary     := IntLit | FloatLit | BoolLit | StringLit | ArrayLit | StructLit
@@ -1327,26 +1327,26 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 
 | Version | Features |
 |---------|----------|
-| **v0.0.1** | `PrintStr("...")`, `exit(n)`, ELF64 läuft |
-| **v0.0.2** | Integer-Ausdrücke, `PrintInt(expr)` |
-| **v0.1.2** | `var`, `let`, `co`, `con`, `if`, `while`, `return`, Funktionen, SysV ABI |
-| **v0.1.3** | ✅ Float-Literale (`f32`, `f64`), ✅ Arrays (Literale, Indexing, Zuweisung) |
+| **v0.0.1** | `PrintStr("...")`, `exit(n)`, ELF64 runs |
+| **v0.0.2** | Integer expressions, `PrintInt(expr)` |
+| **v0.1.2** | `var`, `let`, `co`, `con`, `if`, `while`, `return`, functions, SysV ABI |
+| **v0.1.3** | ✅ Float literals (`f32`, `f64`), ✅ Arrays (literals, indexing, assignment) |
 | **v0.1.4** | ✅ SO-Library Integration, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs, ✅ Module System |
-| **v0.1.5** | ✅ String-Library (20+ Funktionen), ✅ Math-Builtins (22 Funktionen), ✅ Type-Casting (`as`), ✅ String-Konvertierung |
-| **v0.1.6** | ✅ Struct-Literale (`Point { x: 10, y: 20 }`), ✅ Instanz-Methoden mit `self`, ✅ Statische Methoden (`static fn`), ✅ `Self`-Typ, ✅ Feld-Zuweisung (`p.x := value`), ✅ Index-Zuweisung (`arr[i] := value`) |
-| **v0.1.7** | ✅ OOP: Classes mit Vererbung (`class extends`), ✅ `new`/`dispose` für Heap-Objekte, ✅ Konstruktoren mit Argumenten, ✅ Destruktoren, ✅ `super` für Basisklassenaufrufe, ✅ Globale Variablen (`var`/`let` auf Top-Level), ✅ `Random()`/`RandomSeed()` Builtins, ✅ Pipe-Operator (`|>`) für Funktionsverkettung, ✅ Inkrement/Dekrement (`++`/`--`) als Statements |
-| **v0.1.8** | ✅ Windows x64 Backend: PE32+ Binary-Erzeugung, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory für kernel32.dll |
-| **v0.2.0** | ✅ **Einheitlicher Call-Pfad** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub Generierung für externe Calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI-Flags (`--emit-asm`, `--dump-relocs`), ✅ ABI-Testkatalog erweitert |
-| **v0.2.1** | ✅ **Dynamische Arrays** (Heap-allokiert, Fat-Pointer, `push`/`pop`/`len`/`free` Builtins, Literal-Initialisierung, Bounds-Checks, Return-Statements) |
-| **v0.2.2** | ✅ **SIMD / ParallelArray**: `parallel Array<T>(size)`, element-weise Operationen (`+`,`-`,`*`,`/`), Skalar-Index-Zugriff, vollständiges IR-Lowering |
-| **v0.3.0** | std.io: fd-basierte I/O (open/read/write/close Syscalls) |
+| **v0.1.5** | ✅ String-Library (20+ functions), ✅ Math-Builtins (22 functions), ✅ Type-Casting (`as`), ✅ String conversion |
+| **v0.1.6** | ✅ Struct literals (`Point { x: 10, y: 20 }`), ✅ Instance methods with `self`, ✅ Static methods (`static fn`), ✅ `Self` type, ✅ Field assignment (`p.x := value`), ✅ Index assignment (`arr[i] := value`) |
+| **v0.1.7** | ✅ OOP: Classes with inheritance (`class extends`), ✅ `new`/`dispose` for heap objects, ✅ Constructors with arguments, ✅ Destructors, ✅ `super` for base class calls, ✅ Global variables (`var`/`let` at top-level), ✅ `Random()`/`RandomSeed()` builtins, ✅ Pipe operator (`|>`) for function chaining, ✅ Increment/Decrement (`++`/`--`) as statements |
+| **v0.1.8** | ✅ Windows x64 Backend: PE32+ binary generation, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory for kernel32.dll |
+| **v0.2.0** | ✅ **Unified Call Path** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub generation for external calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI Flags (`--emit-asm`, `--dump-relocs`), ✅ Extended ABI test catalog |
+| **v0.2.1** | ✅ **Dynamic Arrays** (heap-allocated, fat-pointer, `push`/`pop`/`len`/`free` builtins, literal initialization, bounds checks, return statements) |
+| **v0.2.2** | ✅ **SIMD / ParallelArray**: `parallel Array<T>(size)`, element-wise operations (`+`,`-`,`*`,`/`), scalar index access, complete IR lowering |
+| **v0.3.0** | std.io: fd-based I/O (open/read/write/close syscalls) |
 | **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
 | **v0.3.2** | Directories: getdents64, DirIter |
 | **v0.4.1** | Strings & Slices: `type string = {pchar, len}`, `slice_u8` |
-| **v1.0.0** | Stabile Systemsprache: Module stabil, SysV ABI stabil, std.io/fs, Diagnostics |
+| **v1.0.0** | Stable systems language: Modules stable, SysV ABI stable, std.io/fs, Diagnostics |
 
 ---
 
-## Lizenz
+## License
 
-Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
+Copyright (c) 2026 Andreas Röne. All rights reserved.
