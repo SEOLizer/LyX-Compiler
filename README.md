@@ -4,31 +4,28 @@
 It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.4.1
+Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
 ✅ PLT/GOT Dynamic Linking for External Libraries
-✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs)
-✅ Robust Parser with While/If/Function Support
+✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
+✅ IR-Level Inlining Optimization (v0.4.3)
+✅ PascalCase Naming Conventions (v0.4.3)
+✅ Integrated Linter with 10 Rules (v0.4.3)
+✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
+✅ Robust Parser with While/If/For/Switch/Function Support
 ✅ OOP: Classes, Inheritance, Constructors, Destructors
 ✅ Global Variables with Initialization
 ✅ Random/RandomSeed Builtins
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
-✅ Debugging: --emit-asm and --dump-relocs Flags
 ✅ CLI Arguments (argc/argv) in Static ELF
 ✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
 ✅ Dynamic Arrays: push/pop/len/free
-✅ Strings & Slices: string type, slice_u8
-✅ std/geo: GeoPoint, Distance, BoundingBox, DMS parsing
-✅ std/time: Date/Time, Timezone support
-✅ std/fs: File I/O, Directory operations
-✅ std/pack: Binary serialization
-✅ std/regex: Regex matching
-✅ std/crt: ANSI Terminal control
+✅ QBool: Probabilistic Boolean Type for quantum-like computing
 ```
 
 ---
@@ -221,6 +218,11 @@ fn main(): int64 {
 - `std.crt`: ANSI Terminal Utilities (colors, cursor control)
 - `std.pack`: Binary serialization (VarInt, int/float/string packing)
 - `std.regex`: Regex matching
+- `std.qbool`: Probabilistic Boolean Type (`QBool`, `Maybe()`, `Observe()`, `QBoolAnd`, `QBoolOr`, `QBoolNot`, Entanglement)
+- `std.vector`: 2D Vector library (`Vec2`)
+- `std.list`: Collections (`StaticList8`, `StackInt64`, `QueueInt64`, `RingBufferVec2`)
+- `std.rect`: Rectangle utilities (`Rect`)
+- `std.color`: RGBA Color utilities
 
 ### Types
 
@@ -237,6 +239,7 @@ fn main(): int64 {
 | `array`   | Dynamic array (Heap, Fat-Pointer: ptr, len, cap) |
 | `parallel Array<T>` | SIMD-optimized array (Heap, element-wise operations) |
 | `struct`  | User-defined record type             |
+| `QBool`   | Probabilistic boolean (0.0 to 1.0 probability) |
 
 Note: `int` and `string` are currently alias types (shortcuts) — `int` is internally treated as `int64`, `string` is mapped to `pchar`. No implicit casts — all types must match explicitly.
 
