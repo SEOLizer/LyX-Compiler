@@ -1,8 +1,8 @@
 Bugreport — Status & ToDo
 =========================
 
-Datum: 2026-02-27
-Arbeitszweig: main (lokales Commit: 6990b16)
+Datum: 2026-02-28
+Arbeitszweig: std/rename/PascalCase
 
 Kurzüberblick
 -------------
@@ -10,6 +10,15 @@ Dieses Dokument fasst den aktuellen Status von Bugs zusammen, entfernt Einträge
 
 Bereinigte / inzwischen behobene Fehler
 --------------------------------------
+Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen (v0.2.2) nicht mehr reproduzierbar und wurden aus der Liste entfernt:
+
+- TestParseFieldAccess: Parser-Fehler bei Feldzugriff
+  - Symptom: Der Parser-Test `TestParseFieldAccess` schlug mit `EAssertionFailedError` fehl. `obj.field` wurde nicht als `TAstFieldAccess` geparst, sondern die Namespace-Logik in `ParseCallOrIdent` konsumierte den Dot bedingungslos via `Accept(tkDot)`. Wenn der folgende Check fehlschlug (z.B. Kleinbuchstabe bei `obj`), war der Dot-Token bereits verbraucht und der Token-Stream korrupt.
+  - Ursache: In `ParseCallOrIdent` wurde `Accept(tkDot)` aufgerufen, bevor geprüft wurde, ob es sich tatsächlich um einen Namespace-qualifizierten Aufruf (z.B. `IO.PrintStr(...)`) handelt. Für einfache Feldzugriffe (`obj.field`) ohne nachfolgendes `(` oder `{` wurde kein `TAstFieldAccess` erzeugt.
+  - Fix: Namespace-Erkennung umgeschrieben: Zuerst `Check(tkDot)` + `FLexer.PeekToken` für Lookahead, dann Dot und zweiten Identifier konsumieren. Nur wenn danach `tkLParen` oder `tkLBrace` folgt, wird es als Namespace-Aufruf behandelt. Andernfalls wird korrekt ein `TAstFieldAccess`-Knoten erzeugt.
+  - Status: BEHOBEN
+  - Betrifft: `parser.pas` und `frontend/parser.pas`
+
 Die folgenden Probleme sind nach den zuletzt ausgeführten Änderungen (v0.2.1) nicht mehr reproduzierbar und wurden aus der Liste entfernt:
 
 - DynArray: Extra 'end;' verhinderte Build in x86_64_emit.pas
@@ -72,16 +81,6 @@ Anmerkung: Die oben genannten Fixes wurden mit umfassenden Test-Suiten (tests/te
 Verbleibende, offene Probleme
 -----------------------------
 Aktuell sind keine offenen Bugs bekannt.
-
-Zuletzt behobene Probleme (nach v0.2.1)
-----------------------------------------
-
-- TestParseFieldAccess: Parser-Fehler bei Feldzugriff
-  - Symptom: Der Parser-Test `TestParseFieldAccess` schlug mit `EAssertionFailedError` fehl. `obj.field` wurde nicht als `TAstFieldAccess` geparst, sondern die Namespace-Logik in `ParseCallOrIdent` konsumierte den Dot bedingungslos via `Accept(tkDot)`. Wenn der folgende Check fehlschlug (z.B. Kleinbuchstabe bei `obj`), war der Dot-Token bereits verbraucht und der Token-Stream korrupt.
-  - Ursache: In `ParseCallOrIdent` wurde `Accept(tkDot)` aufgerufen, bevor geprüft wurde, ob es sich tatsächlich um einen Namespace-qualifizierten Aufruf (z.B. `IO.PrintStr(...)`) handelt. Für einfache Feldzugriffe (`obj.field`) ohne nachfolgendes `(` oder `{` wurde kein `TAstFieldAccess` erzeugt.
-  - Fix: Namespace-Erkennung umgeschrieben: Zuerst `Check(tkDot)` + `FLexer.PeekToken` für Lookahead, dann Dot und zweiten Identifier konsumieren. Nur wenn danach `tkLParen` oder `tkLBrace` folgt, wird es als Namespace-Aufruf behandelt. Andernfalls wird korrekt ein `TAstFieldAccess`-Knoten erzeugt.
-  - Status: BEHOBEN
-  - Betrifft: `parser.pas` und `frontend/parser.pas`
 
 Weitere Hinweise
 ----------------

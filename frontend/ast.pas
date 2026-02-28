@@ -48,7 +48,7 @@ type
     nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
     // Statements
     nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
-    nkIf, nkWhile, nkFor, nkRepeatUntil,
+    nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
     nkReturn, nkBreak, nkSwitch,
     nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
     // Top-Level
@@ -468,6 +468,16 @@ type
     property Stmts: TAstStmtList read FStmts;
   end;
 
+  // Pool-Block: pool { ... } - Memory Pool für schnelle Allokation
+  TAstPoolStmt = class(TAstStmt)
+  private
+    FBody: TAstStmt;
+  public
+    constructor Create(aBody: TAstStmt; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Body: TAstStmt read FBody;
+  end;
+
   { Expression-Statement: expr; }
   TAstExprStmt = class(TAstStmt)
   private
@@ -853,6 +863,7 @@ begin
     nkWhile:       Result := 'While';
     nkFor:         Result := 'For';
     nkRepeatUntil: Result := 'RepeatUntil';
+    nkPool:        Result := 'Pool';
     nkReturn:      Result := 'Return';
     nkBreak:       Result := 'Break';
     nkSwitch:      Result := 'Switch';
@@ -1224,6 +1235,22 @@ begin
   for i := 0 to High(FStmts) do
     FStmts[i].Free;
   FStmts := nil;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstPoolStmt
+// ================================================================
+
+constructor TAstPoolStmt.Create(aBody: TAstStmt; aSpan: TSourceSpan);
+begin
+  inherited Create(nkPool, aSpan);
+  FBody := aBody;
+end;
+
+destructor TAstPoolStmt.Destroy;
+begin
+  FBody.Free;
   inherited Destroy;
 end;
 
