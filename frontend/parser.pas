@@ -330,18 +330,6 @@ var
   declType: TAurumType;
   fields: TStructFieldList;
   methods: TMethodList;
-  fld: TStructField;
-  m: TAstFuncDecl;
-  fldTypeName: string;
-  mName: string;
-  mParams: TAstParamList;
-  mRetType: TAurumType;
-  mRetTypeName: string;
-  mBody: TAstBlock;
-  dummy: Integer;
-  isStatic: Boolean;
-  baseClassName: string;
-  curVisibility: TVisibility;
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -386,10 +374,16 @@ begin
     begin
       // parse optional visibility modifier
       curVisibility := ParseVisibility;
-      if Check(tkFn) or Check(tkStatic) then
+      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) then
       begin
         // parse method declaration
         isStatic := Accept(tkStatic);
+        isVirtual := Accept(tkVirtual);
+        // After static/virtual, we expect fn
+        if not Check(tkFn) then
+        begin
+          FDiag.Error('expected ''fn'' keyword', FCurTok.Span);
+        end;
         Expect(tkFn);
         if Check(tkIdent) then
         begin
@@ -488,11 +482,12 @@ begin
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
+        m.IsVirtual := isVirtual;
         m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
       end
-      else if Check(tkIdent) then
+      else
       begin
         // field: name : Type ;
         fld.Name := FCurTok.Value; Advance;
@@ -1436,20 +1431,43 @@ var
   fields: TStructFieldInitList;
   fld: TStructFieldInit;
   fldName: string;
+  savedName: string;
+  savedSpan: TSourceSpan;
+  nsCandidate: string;
+  nsSpan: TSourceSpan;
 begin
   name := FCurTok.Value;
   span := FCurTok.Span;
   Advance; // consume ident
   
-  // Check for namespace qualifier: Ident.Ident (e.g., IO.PrintStr)
+  // Check for namespace qualifier: Ident.Ident( or Ident.Ident{
+  // Only treat as namespace if followed by call or struct literal,
+  // otherwise it is a field access (handled by ParsePostfix).
   namespace := '';
-  if Accept(tkDot) then
+  if Check(tkDot) and (FLexer.PeekToken.Kind = tkIdent) then
   begin
-    // This is a qualified call like IO.PrintStr
-    namespace := name;  // first ident is the namespace
-    name := FCurTok.Value;  // second ident is the function name
-    span := FCurTok.Span;  // update span to include both
-    Advance; // consume the function name
+    // Save state so we can backtrack if this is not a namespace call
+    savedName := name;
+    savedSpan := span;
+    Advance; // consume dot
+    nsCandidate := FCurTok.Value;  // second ident (potential function name)
+    nsSpan := FCurTok.Span;
+    Advance; // consume the second ident
+    if Check(tkLParen) or Check(tkLBrace) then
+    begin
+      // Confirmed: namespace-qualified call or struct literal
+      namespace := savedName;
+      name := nsCandidate;
+      span := nsSpan;
+    end
+    else
+    begin
+      // Not a namespace call → treat as field access: ident.field
+      // Build TAstIdent for the first name, then wrap in TAstFieldAccess
+      Result := ParsePostfix(TAstFieldAccess.Create(
+        TAstIdent.Create(savedName, savedSpan), nsCandidate, savedSpan));
+      Exit;
+    end;
   end;
   
   if Accept(tkLParen) then

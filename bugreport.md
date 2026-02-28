@@ -71,18 +71,20 @@ Anmerkung: Die oben genannten Fixes wurden mit umfassenden Test-Suiten (tests/te
 
 Verbleibende, offene Probleme
 -----------------------------
-Diese Probleme sind weiterhin offen und sollten separat adressiert:
+Aktuell sind keine offenen Bugs bekannt.
 
-1) TestParseFieldAccess: Parser-Fehler bei Feldzugriff
-   - Symptom: Der Parser-Test `TestParseFieldAccess` schlägt mit `EAssertionFailedError` fehl. Der Test erwartet, dass `obj.field` als `TAstFieldAccess` mit `Obj = TAstIdent('obj')` und `Field = 'field'` geparst wird.
-   - Status: offen (vorbestehender Bug, existiert seit commit c7d135f)
-   - Reproduktion: ./tests/test_parser --suite=TParserTest → TestParseFieldAccess Failed
-   - Nächste Schritte: Parser-Code untersuchen (ParseFieldAccess/ParsePrimary), warum TAstFieldAccess nicht korrekt erstellt wird.
-   - Priorität: Mittel
+Zuletzt behobene Probleme (nach v0.2.1)
+----------------------------------------
+
+- TestParseFieldAccess: Parser-Fehler bei Feldzugriff
+  - Symptom: Der Parser-Test `TestParseFieldAccess` schlug mit `EAssertionFailedError` fehl. `obj.field` wurde nicht als `TAstFieldAccess` geparst, sondern die Namespace-Logik in `ParseCallOrIdent` konsumierte den Dot bedingungslos via `Accept(tkDot)`. Wenn der folgende Check fehlschlug (z.B. Kleinbuchstabe bei `obj`), war der Dot-Token bereits verbraucht und der Token-Stream korrupt.
+  - Ursache: In `ParseCallOrIdent` wurde `Accept(tkDot)` aufgerufen, bevor geprüft wurde, ob es sich tatsächlich um einen Namespace-qualifizierten Aufruf (z.B. `IO.PrintStr(...)`) handelt. Für einfache Feldzugriffe (`obj.field`) ohne nachfolgendes `(` oder `{` wurde kein `TAstFieldAccess` erzeugt.
+  - Fix: Namespace-Erkennung umgeschrieben: Zuerst `Check(tkDot)` + `FLexer.PeekToken` für Lookahead, dann Dot und zweiten Identifier konsumieren. Nur wenn danach `tkLParen` oder `tkLBrace` folgt, wird es als Namespace-Aufruf behandelt. Andernfalls wird korrekt ein `TAstFieldAccess`-Knoten erzeugt.
+  - Status: BEHOBEN
+  - Betrifft: `parser.pas` und `frontend/parser.pas`
 
 Weitere Hinweise
 ----------------
-- Commit-Referenz: 6990b16 (lokal). Alle Bugs sind behoben bis auf den TestParseFieldAccess Parser-Bug.
-- Tests: make test → Alle Tests bestehen (außer TestParseFieldAccess)
-- Alle 11 Unit-Test-Suiten bestehen mit 0 Failures.
+- Tests: Alle 16 Parser-Tests und alle 52 Lexer-Tests bestehen mit 0 Failures.
+- Alle Unit-Test-Suiten bestehen mit 0 Failures.
 

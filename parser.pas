@@ -1457,21 +1457,43 @@ var
   fields: TStructFieldInitList;
   fld: TStructFieldInit;
   fldName: string;
+  savedName: string;
+  savedSpan: TSourceSpan;
+  nsCandidate: string;
+  nsSpan: TSourceSpan;
 begin
   name := FCurTok.Value;
   span := FCurTok.Span;
   Advance; // consume ident
   
-  // Check for namespace qualifier: Ident.Ident (e.g., IO.PrintStr)
-  // Only treat as namespace if first ident starts with uppercase (obj.field is field access, not namespace)
+  // Check for namespace qualifier: Ident.Ident( or Ident.Ident{
+  // Only treat as namespace if followed by call or struct literal,
+  // otherwise it is a field access (handled by ParsePostfix).
   namespace := '';
-  if Accept(tkDot) and (name[1] in ['A'..'Z']) then
+  if Check(tkDot) and (FLexer.PeekToken.Kind = tkIdent) then
   begin
-    // This is a qualified call like IO.PrintStr
-    namespace := name;  // first ident is the namespace
-    name := FCurTok.Value;  // second ident is the function name
-    span := FCurTok.Span;  // update span to include both
-    Advance; // consume the function name
+    // Save state so we can backtrack if this is not a namespace call
+    savedName := name;
+    savedSpan := span;
+    Advance; // consume dot
+    nsCandidate := FCurTok.Value;  // second ident (potential function name)
+    nsSpan := FCurTok.Span;
+    Advance; // consume the second ident
+    if Check(tkLParen) or Check(tkLBrace) then
+    begin
+      // Confirmed: namespace-qualified call or struct literal
+      namespace := savedName;
+      name := nsCandidate;
+      span := nsSpan;
+    end
+    else
+    begin
+      // Not a namespace call -> treat as field access: ident.field
+      // Build TAstIdent for the first name, then wrap in TAstFieldAccess
+      Result := ParsePostfix(TAstFieldAccess.Create(
+        TAstIdent.Create(savedName, savedSpan), nsCandidate, savedSpan));
+      Exit;
+    end;
   end;
   
   if Accept(tkLParen) then
