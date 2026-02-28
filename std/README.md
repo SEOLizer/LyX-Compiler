@@ -410,6 +410,13 @@ Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
 
 ### Cryptographic (Simplified)
 - `HashSHA256(data: pchar): int64` - SHA-256 (vereinfacht)
+- `HashMD5String(data: pchar): array[4]int64` - MD5 (128-bit als Array)
+- `HashMD5StringHex(data: pchar): pchar` - MD5 als Hex-String
+- `HashMD5Bytes(data: array[256]int64, len: int64): array[4]int64` - MD5 für Byte-Array
+- `HashMD5Quick(data: pchar): int64` - Schneller MD5-ähnlicher Hash
+- `HashMD5FileInit(): array[4]int64` - Initialer State für File-Hashing
+- `HashMD5FileChunk(chunk, len, state): array[4]int64` - File-Chunk verarbeiten
+- `MD5Verify(data: pchar, expected_hex: pchar): bool` - MD5 verifizieren
 
 ### Password Hashing
 - `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
