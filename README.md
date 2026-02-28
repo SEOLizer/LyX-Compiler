@@ -4,14 +4,14 @@
 It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.4.0
+Lyx Compiler v0.4.1
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
 ✅ PLT/GOT Dynamic Linking for External Libraries
-✅ Standard Library (std.math, std.io, std.string)
+✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs)
 ✅ Robust Parser with While/If/Function Support
 ✅ OOP: Classes, Inheritance, Constructors, Destructors
 ✅ Global Variables with Initialization
@@ -21,6 +21,14 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ CLI Arguments (argc/argv) in Static ELF
 ✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
+✅ Dynamic Arrays: push/pop/len/free
+✅ Strings & Slices: string type, slice_u8
+✅ std/geo: GeoPoint, Distance, BoundingBox, DMS parsing
+✅ std/time: Date/Time, Timezone support
+✅ std/fs: File I/O, Directory operations
+✅ std/pack: Binary serialization
+✅ std/regex: Regex matching
+✅ std/crt: ANSI Terminal control
 ```
 
 ---
@@ -203,12 +211,16 @@ fn main(): int64 {
 ```
 
 **Available Standard Library:**
-- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `TimesTwo`)
-- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
-- `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, etc.)
+- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`, etc.)
+- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-conversion)
+- `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, `StrToUpper`, `StrConcat`, `StrReplace`, etc.)
 - `std.env`: Environment API (`ArgCount`, `Arg`, `init`)
-- `std.time`: Date and time functions (numerical calculations)
-- `std.geo`: Geolocation parser for Decimal Degrees
+- `std.time`: Date and time functions (numerical calculations, timezone support)
+- `std.geo`: Geolocation parser for Decimal Degrees, GeoPoint, Distance calculations, BoundingBox, DMS parsing
+- `std.fs`: Filesystem operations (open, read, write, close, file existence)
+- `std.crt`: ANSI Terminal Utilities (colors, cursor control)
+- `std.pack`: Binary serialization (VarInt, int/float/string packing)
+- `std.regex`: Regex matching
 
 ### Types
 
@@ -870,13 +882,16 @@ readelf -d extern_binary    # NEEDED libraries, Symbol tables
 
 A comprehensive set of standard units is located in the `std/` directory, providing ergonomic library functions:
 
-- **std/math.lyx** – Integer helpers (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`)
-- **std/io.lyx** – I/O wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`)
-- **std/string.lyx** – Comprehensive string library with 15+ functions
+- **std/math.lyx** – Integer helpers (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`)
+- **std/io.lyx** – I/O wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-type-conversion)
+- **std/string.lyx** – Comprehensive string library with 25+ functions
 - **std/env.lyx** – Environment API (`init`, `ArgCount`, `Arg`)
-- **std/time.lyx** – Date and time calculations (numerical)
-- **std/geo.lyx** – Geolocation parser for Decimal Degrees
+- **std/time.lyx** – Date and time calculations (numerical, timezone support)
+- **std/geo.lyx** – Geolocation: GeoPoint, DistanceM, BoundingBox, DMS parsing, Navigation
+- **std/fs.lyx** – Filesystem: open, read, write, close, file operations
 - **std/crt.lyx** – ANSI Console Utilities (colors, cursor, clrscr). See `tests/lyx/crt/test_crt_ansi.lyx` for a demo.
+- **std/pack.lyx** – Binary serialization (VarInt, int/float/string)
+- **std/regex.lyx** – Regex matching
 
 #### String Library Example
 
@@ -1342,7 +1357,8 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.3.0** | std.io: fd-based I/O (open/read/write/close syscalls) |
 | **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
 | **v0.3.2** | Directories: getdents64, DirIter |
-| **v0.4.1** | Strings & Slices: `type string = {pchar, len}`, `slice_u8` |
+| **v0.4.0** | std/math: Fixed-Point math (Sqrt64, Clamp64, Lerp64, Map64, Sin64, Cos64, Hypot64) |
+| **v0.4.1** | std/geo: GeoPoint type, DistanceM, BoundingBox, DMS parsing, Navigation |
 | **v1.0.0** | Stable systems language: Modules stable, SysV ABI stable, std.io/fs, Diagnostics |
 
 ---

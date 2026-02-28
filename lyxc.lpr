@@ -28,6 +28,7 @@ var
   um: TUnitManager;
   module: TIRModule;
   lower: TIRLowering;
+  inliner: TIRInlining;
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
@@ -348,7 +349,7 @@ begin
 
           // IR-Level Inlining Optimization
           WriteLn('[IR] Running inlining optimization...');
-          var inliner: TIRInlining := TIRInlining.Create(module);
+          inliner := TIRInlining.Create(module);
           try
             inliner.Optimize;
           finally
