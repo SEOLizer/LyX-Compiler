@@ -5,7 +5,7 @@ uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types,
   diag, lexer, parser, ast, sema, unit_manager,
-  ir, lower_ast_to_ir,
+  ir, lower_ast_to_ir, ir_inlining,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer;
@@ -345,6 +345,15 @@ begin
           lower.Lower(prog);
           // Lower imported unit functions into the IR module
           lower.LowerImportedUnits(um);
+
+          // IR-Level Inlining Optimization
+          WriteLn('[IR] Running inlining optimization...');
+          var inliner: TIRInlining := TIRInlining.Create(module);
+          try
+            inliner.Optimize;
+          finally
+            inliner.Free;
+          end;
 
           // --emit-asm: Dump IR as pseudo-assembly
           if flagEmitAsm then
