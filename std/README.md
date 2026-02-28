@@ -15,6 +15,7 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/list` | Dynamische Listen, RingBuffer, Stack, Queue |
 | `std/result` | Result/Option Pattern für Error-Handling |
 | `std/conv` | Integer-Formatierung, Bit-Manipulation, Endianness |
+| `std/hash` | FNV-1a, DJB2, CRC32, SHA-256 (simplified), Password-Hashing |
 | `std/string` | String-Manipulation und -Suche |
 | `std/io` | Print/Printf, Formatierung |
 | `std/env` | Command-Line Argumente |
@@ -448,6 +449,88 @@ struct QueueInt64 {
 - `QueueInt64New(): QueueInt64`
 - `QueueInt64Enqueue(q: QueueInt64, value: int64): bool`
 - `QueueInt64Dequeue(q: QueueInt64): int64`
+
+---
+
+## std/hash.lyx
+
+Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
+
+### FNV-1a (Fast Non-Cryptographic)
+- `HashFNV1a32(data: pchar): int64` - 32-bit FNV-1a
+- `HashFNV1a64(data: pchar): int64` - 64-bit FNV-1a
+- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+
+### Weitere Non-Cryptographic
+- `HashDJB2(data: pchar): int64` - DJB2 Hash
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur2Default(data: pchar): int64` - MurmurHash2 mit seed=0
+- `HashCRC32(data: pchar): int64` - CRC32 Checksum
+- `HashBytes(data: array[256]int64, len: int64): int64` - Byte-Array Hash
+- `HashInt64(key: int64): int64` - Integer Hash (64-bit)
+- `HashInt32(key: int64): int64` - Integer Hash (32-bit)
+
+### Cryptographic (Simplified)
+- `HashSHA256(data: pchar): int64` - SHA-256 (vereinfacht)
+- `HashSHA3_224(data: pchar): int64` - SHA-3-224
+- `HashSHA3_256(data: pchar): int64` - SHA-3-256
+- `HashSHA3_512(data: pchar): int64` - SHA-3-512
+- `HashSHA3_256Hex(data: pchar): pchar` - SHA-3-256 als Hex
+- `HashKeccak(data: pchar): int64` - Raw Keccak-1600
+- `HashSHAKE128(data: pchar, output_bits: int64): int64` - SHAKE128 XOF
+- `HashSHAKE256(data: pchar, output_bits: int64): int64` - SHAKE256 XOF
+- `HashBLAKE3(data: pchar): int64` - BLAKE3 (schnell)
+- `HashBLAKE3Hex(data: pchar): pchar` - BLAKE3 als Hex
+
+### Non-Cryptographic (Fast)
+- `HashFNV1a32/64(data: pchar): int64` - FNV-1a
+- `HashDJB2(data: pchar): int64` - DJB2
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur3_32(data: pchar, seed: int64): int64` - MurmurHash3
+- `HashCity32(data: pchar): int64` - CityHash32
+- `HashCity64(data: pchar): int64` - CityHash64
+- `HashCity64Hex(data: pchar): pchar` - CityHash64 als Hex
+- `HashFarm32(data: pchar): int64` - FarmHash32
+- `HashFarm64(data: pchar): int64` - FarmHash64
+- `HashFarm64Hex(data: pchar): pchar` - FarmHash64 als Hex
+- `HashxxHash32(data: pchar): int64` - xxHash32 (sehr schnell)
+- `HashxxHash64(data: pchar): int64` - xxHash64
+- `HashCRC32(data: pchar): int64` - CRC32
+- `HashInt64/32(key: int64): int64` - Integer Hash
+
+### Password Hashing
+- `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
+- `HashPasswordSimple(password: pchar, salt: int64): int64` - Mit Numeric-Salt
+
+### Secure Password Hashing (KDF)
+- `HashPBKDF2(password, salt: pchar, iterations: int64): int64` - PBKDF2-HMAC-SHA256
+- `HashPBKDF2Default(password, salt: pchar): int64` - PBKDF2 mit Standard-Iterationen
+- `HashPBKDF2Hex(password, salt: pchar, iterations: int64): pchar` - PBKDF2 als Hex
+- `HashBCrypt(password: pchar, cost: int64): int64` - bcrypt
+- `HashBCryptHex(password: pchar, cost: int64): pchar` - bcrypt als Hex
+- `HashBCryptFormatted(password: pchar, cost: int64): pchar` - bcrypt Formatted ($2a$...)
+- `BCryptVerify(password: pchar, hash: int64): bool` - bcrypt verifizieren
+- `HashArgon2d/i/id(password, salt: pchar, memory, iterations, parallelism): int64` - Argon2
+- `HashArgon2(password, salt: pchar): int64` - Argon2id (Standard)
+- `HashArgon2Hex(password, salt: pchar): pchar` - Argon2 als Hex
+- `HashArgon2Formatted(password, salt: pchar): pchar` - Argon2 Formatted
+- `Argon2Verify(password: pchar, hash: int64): bool` - Argon2 verifizieren
+- `HashScrypt(password, salt: pchar, n, r, p: int64): int64` - Scrypt
+- `HashScryptDefault(password, salt: pchar): int64` - Scrypt mit Standard-Parametern
+- `HashScryptHex(password, salt: pchar): pchar` - Scrypt als Hex
+
+### Password Utilities
+- `ComparePasswordHashes(hash1, hash2: int64): bool` - Constant-time Vergleich
+- `GenerateSalt(len: int64): int64` - Salt generieren
+- `PasswordStrength(password: pchar): int64` - Stärke-Score (0-4)
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
+- `VerifyHash(data: pchar, algorithm: int64, expected_hex: pchar): bool` - Hash verifizieren
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
 
 ---
 
