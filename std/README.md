@@ -419,17 +419,30 @@ Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
 - `HashSHAKE256(data: pchar, output_bits: int64): int64` - SHAKE256 XOF
 - `HashBLAKE3(data: pchar): int64` - BLAKE3 (schnell)
 - `HashBLAKE3Hex(data: pchar): pchar` - BLAKE3 als Hex
-- `HashMD5String(data: pchar): array[4]int64` - MD5 (128-bit als Array)
-- `HashMD5StringHex(data: pchar): pchar` - MD5 als Hex-String
-- `HashMD5Bytes(data: array[256]int64, len: int64): array[4]int64` - MD5 für Byte-Array
-- `HashMD5Quick(data: pchar): int64` - Schneller MD5-ähnlicher Hash
-- `HashMD5FileInit(): array[4]int64` - Initialer State für File-Hashing
-- `HashMD5FileChunk(chunk, len, state): array[4]int64` - File-Chunk verarbeiten
-- `MD5Verify(data: pchar, expected_hex: pchar): bool` - MD5 verifizieren
+
+### Non-Cryptographic (Fast)
+- `HashFNV1a32/64(data: pchar): int64` - FNV-1a
+- `HashDJB2(data: pchar): int64` - DJB2
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur3_32(data: pchar, seed: int64): int64` - MurmurHash3
+- `HashCity32(data: pchar): int64` - CityHash32
+- `HashCity64(data: pchar): int64` - CityHash64
+- `HashCity64Hex(data: pchar): pchar` - CityHash64 als Hex
+- `HashFarm32(data: pchar): int64` - FarmHash32
+- `HashFarm64(data: pchar): int64` - FarmHash64
+- `HashFarm64Hex(data: pchar): pchar` - FarmHash64 als Hex
+- `HashxxHash32(data: pchar): int64` - xxHash32 (sehr schnell)
+- `HashxxHash64(data: pchar): int64` - xxHash64
+- `HashCRC32(data: pchar): int64` - CRC32
+- `HashInt64/32(key: int64): int64` - Integer Hash
 
 ### Password Hashing
 - `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
 - `HashPasswordSimple(password: pchar, salt: int64): int64` - Mit Numeric-Salt
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
+- `VerifyHash(data: pchar, algorithm: int64, expected_hex: pchar): bool` - Hash verifizieren
 
 ### Utilities
 - `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
