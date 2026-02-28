@@ -4,7 +4,7 @@ program lyxc;
 uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types,
-  diag, lexer, parser, ast, sema, unit_manager,
+  diag, lexer, parser, ast, sema, unit_manager, linter,
   ir, lower_ast_to_ir, ir_inlining,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
@@ -19,6 +19,9 @@ var
   target: TTarget;
   flagEmitAsm: Boolean;
   flagDumpRelocs: Boolean;
+  flagLint: Boolean;
+  flagLintOnly: Boolean;
+  lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
   lx: TLexer;
@@ -204,6 +207,9 @@ begin
     WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux oder arm64)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
+    WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
+    WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
+    WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
     Halt(1);
   end;
 
@@ -211,6 +217,8 @@ begin
   outputFile := '';
   flagEmitAsm := False;
   flagDumpRelocs := False;
+  flagLint := False;
+  flagLintOnly := False;
 
   // Parse command line arguments
   i := 1;
@@ -248,6 +256,22 @@ begin
     else if param = '--dump-relocs' then
     begin
       flagDumpRelocs := True;
+      Inc(i);
+    end
+    else if param = '--lint' then
+    begin
+      flagLint := True;
+      Inc(i);
+    end
+    else if param = '--lint-only' then
+    begin
+      flagLint := True;
+      flagLintOnly := True;
+      Inc(i);
+    end
+    else if param = '--no-lint' then
+    begin
+      flagLint := False;
       Inc(i);
     end
     else if (param <> '-o') and (Copy(param, 1, 2) <> '--') then
@@ -338,6 +362,27 @@ begin
           end;
         finally
           s.Free;
+        end;
+
+        // Phase 3b: Linter (optional)
+        if flagLint then
+        begin
+          lint := TLinter.Create(d);
+          try
+            lint.Lint(prog);
+            if lint.WarnCount > 0 then
+              WriteLn(StdErr, '[lint] ', lint.WarnCount, ' warning(s)');
+          finally
+            lint.Free;
+          end;
+          if flagLintOnly then
+          begin
+            d.PrintAll;
+            if d.HasErrors then
+              Halt(1)
+            else
+              Halt(0);
+          end;
         end;
 
         module := TIRModule.Create;
