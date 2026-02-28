@@ -440,6 +440,28 @@ Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
 - `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
 - `HashPasswordSimple(password: pchar, salt: int64): int64` - Mit Numeric-Salt
 
+### Secure Password Hashing (KDF)
+- `HashPBKDF2(password, salt: pchar, iterations: int64): int64` - PBKDF2-HMAC-SHA256
+- `HashPBKDF2Default(password, salt: pchar): int64` - PBKDF2 mit Standard-Iterationen
+- `HashPBKDF2Hex(password, salt: pchar, iterations: int64): pchar` - PBKDF2 als Hex
+- `HashBCrypt(password: pchar, cost: int64): int64` - bcrypt
+- `HashBCryptHex(password: pchar, cost: int64): pchar` - bcrypt als Hex
+- `HashBCryptFormatted(password: pchar, cost: int64): pchar` - bcrypt Formatted ($2a$...)
+- `BCryptVerify(password: pchar, hash: int64): bool` - bcrypt verifizieren
+- `HashArgon2d/i/id(password, salt: pchar, memory, iterations, parallelism): int64` - Argon2
+- `HashArgon2(password, salt: pchar): int64` - Argon2id (Standard)
+- `HashArgon2Hex(password, salt: pchar): pchar` - Argon2 als Hex
+- `HashArgon2Formatted(password, salt: pchar): pchar` - Argon2 Formatted
+- `Argon2Verify(password: pchar, hash: int64): bool` - Argon2 verifizieren
+- `HashScrypt(password, salt: pchar, n, r, p: int64): int64` - Scrypt
+- `HashScryptDefault(password, salt: pchar): int64` - Scrypt mit Standard-Parametern
+- `HashScryptHex(password, salt: pchar): pchar` - Scrypt als Hex
+
+### Password Utilities
+- `ComparePasswordHashes(hash1, hash2: int64): bool` - Constant-time Vergleich
+- `GenerateSalt(len: int64): int64` - Salt generieren
+- `PasswordStrength(password: pchar): int64` - Stärke-Score (0-4)
+
 ### Utilities
 - `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
 - `VerifyHash(data: pchar, algorithm: int64, expected_hex: pchar): bool` - Hash verifizieren
