@@ -411,8 +411,15 @@ begin
               dataBuf := arm64Emit.GetDataBuffer;
               entryVA := 4096;
               
-              // Note: dynamic linking for ARM64 not implemented yet
-              WriteLn('Generating static ELF for Linux ARM64 (no dynamic linking yet)');
+              // Check if we have external symbols - if so, note about dynamic linking
+              externSymbols := arm64Emit.GetExternalSymbols;
+              if Length(externSymbols) > 0 then
+              begin
+                WriteLn('Note: ARM64 dynamic linking not yet fully implemented');
+                WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+              end;
+              
+              WriteLn('Generating static ELF for Linux ARM64');
               WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
               
               FpChmod(PChar(outputFile), 493);
