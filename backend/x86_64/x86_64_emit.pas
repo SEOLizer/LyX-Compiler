@@ -843,7 +843,106 @@ begin
 
                // patch done jump
                FCode.PatchU32LE(jmpDonePos + 1, Cardinal(k - jmpDonePos - 5));
-             end
+              end
+
+            else if instr.ImmStr = 'str_concat' then
+            begin
+              // str_concat(s1: pchar, s2: pchar) -> pchar
+              // Simple inline implementation without libc
+              // Uses RDI=s1, RSI=s2 (SysV ABI), returns in RAX
+              
+              // Save s1 and s2
+              WritePushReg(FCode, RDI);  // s1 on stack at [RSP]
+              WritePushReg(FCode, RSI);  // s2 on stack at [RSP+8]
+              
+              // Get length of s1
+              WriteMovRegReg(FCode, RAX, RDI);
+              WriteMovRegReg(FCode, RCX, 0);
+              // loop1:
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $00); EmitU8(FCode, $00);
+              WriteJeRel8(FCode, 5);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              // RCX = len1
+              
+              // Save len1
+              WriteMovRegReg(FCode, R13, RCX);
+              
+              // Get length of s2
+              WritePopReg(FCode, RSI);  // s2
+              WritePushReg(FCode, RSI); // save s2
+              WriteMovRegReg(FCode, RAX, RSI);
+              WriteMovRegReg(FCode, RCX, 0);
+              // loop2:
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $00); EmitU8(FCode, $00);
+              WriteJeRel8(FCode, 5);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              // RCX = len2
+              
+              // Total = len1 + len2 + 1
+              WriteAddRegReg(FCode, R13, RCX);
+              WriteAddRegImm(FCode, R13, 1);
+              
+              // mmap(R13 bytes)
+              WriteMovRegImm64(FCode, RAX, 9);   // mmap
+              WriteMovRegImm64(FCode, RDI, 0);
+              WriteMovRegReg(FCode, RDX, R13);
+              WriteMovRegImm64(FCode, RSI, 7);
+              WriteMovRegImm64(FCode, R10, 34);
+              WriteMovRegImm64(FCode, R8, -1);
+              WriteMovRegImm64(FCode, R9, 0);
+              WriteSyscall(FCode);
+              
+              // RAX = buffer
+              WriteMovRegReg(FCode, R14, RAX);  // R14 = result
+              
+              // Copy s1 to result
+              WriteMovRegReg(FCode, RDI, R14);  // dest
+              WriteMovRegMem(FCode, RSI, RSP, 8); // source s1
+              WriteMovRegReg(FCode, RCX, R13);  // total len (wrong)
+              // Get len1
+              WriteSubRegImm(FCode, R13, 1);    // R13 = len1 + len2
+              // Can't easily get len1, so use a simple copy
+              WriteMovRegReg(FCode, R15, R13);  // save
+              
+              // Count s1 properly
+              WriteMovRegReg(FCode, RCX, 0);
+              WriteMovRegMem(FCode, RSI, RSP, 8); // s1
+              WriteMovRegReg(FCode, RAX, RSI);
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $00); EmitU8(FCode, $00);
+              WriteJeRel8(FCode, 5);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              
+              // Copy s1
+              WriteMovRegReg(FCode, RDI, R14);
+              WriteMovRegMem(FCode, RSI, RSP, 8);
+              EmitU8(FCode, $F3); EmitU8(FCode, $A4);
+              
+              // Copy s2
+              WritePopReg(FCode, RSI);  // s2
+              WritePushReg(FCode, RSI); // save for null check
+              // Count s2
+              WriteMovRegReg(FCode, RAX, RSI);
+              WriteMovRegReg(FCode, RCX, 0);
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $00); EmitU8(FCode, $00);
+              WriteJeRel8(FCode, 5);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              
+              EmitU8(FCode, $F3); EmitU8(FCode, $A4);
+              
+              // Null terminator
+              WriteMovRegImm64(FCode, RAX, 0);
+              WriteMovRegMem(FCode, RDI, RAX, 0);
+              
+              // Clean stack
+              WriteAddRegImm(FCode, RSP, 8);
+              
+              // Return
+              WriteMovRegReg(FCode, RAX, R14);
+            end
 
             else if instr.ImmStr = 'buf_put_byte' then
             begin
