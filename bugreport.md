@@ -87,3 +87,40 @@ Weitere Hinweise
 - Tests: Alle 16 Parser-Tests und alle 52 Lexer-Tests bestehen mit 0 Failures.
 - Alle Unit-Test-Suiten bestehen mit 0 Failures.
 
+
+Neue Fehler (2026-02-28)
+----------------------
+
+### 1. test_array_static: Statische Array-Indizierung fehlgeschlagen
+
+- Symptom: Test `TestStaticArrayInitAndIndex` schlägt fehl mit:
+  ```
+  Failed: irLoadLocalAddr expected for array access
+  Exception: irLoadLocalAddr expected for array access
+  ```
+- Ursache: Der Lowerer erwartet `irLoadLocalAddr` für Array-Zugriffe, aber der Parser erzeugt möglicherweise einen anderen Knotentyp.
+- Betrifft: `lower_ast_to_ir.pas` und Parser
+- Status: OFFEN
+
+### 2. test_index_assign: Index-Zuweisung fehlgeschlagen
+
+- Symptom: Drei Tests fehlgeschlagen:
+  - `TestStaticIndexAssign`: "irStoreElem instruction expected for static index assignment"
+  - `TestDynamicIndexAssign`: "irStoreElemDyn instruction expected for dynamic index assignment"  
+  - `TestParserCreatesIndexAssignNode`: "Should find TAstIndexAssign node"
+- Ursache: Der Parser erstellt keinen `TAstIndexAssign`-Knoten für Index-Zuweisungen
+- Betrifft: `parser.pas`
+- Status: OFFEN
+
+### 3. test_integration_examples: std/math.lyx Syntaxfehler
+
+- Symptom: Beim Kompilieren von `use_math.lyx` treten viele Syntaxfehler in `std/math.lyx` auf:
+  ```
+  ./std/math.lyx:223:13: error: unexpected '&', did you mean '&&'?
+  ./std/math.lyx:237:10: error: unexpected '|', did you mean '||', '|~' or '|>'?
+  ```
+- Ursache: Die Operatoren `&` und `|` werden nicht als gültige Operatoren erkannt. Der Lyx-Compiler erwartet `&&` und `||`.
+- Betrifft: `std/math.lyx`
+- Status: OFFEN
+- Lösung: Die Operatoren in `std/math.lyx` von `&` zu `&&` und `|` zu `||` ändern
+

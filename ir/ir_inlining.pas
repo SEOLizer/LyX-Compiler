@@ -25,8 +25,6 @@ type
     function GetReturnTemp(instrs: TIRInstructionList): Integer;
     function FindReturnJmpLabel(const instrs: TIRInstructionList; returnTemp: Integer): Integer;
     function GetArgCount(func: TIRFunction): Integer;
-    function BuildArgMap(func: TIRFunction; argTemps: array of Integer; 
-                        callDest: Integer): array of Integer;
     procedure AddInlinedFunc(funcName: string);
     function WasInlined(funcName: string): Boolean;
     function CountNonLabelInstructions(const instrs: TIRInstructionList): Integer;
@@ -148,21 +146,6 @@ begin
   Result := True;
 end;
 
-function TIRInlining.BuildArgMap(func: TIRFunction; argTemps: array of Integer; 
-                                  callDest: Integer): array of Integer;
-var
-  i: Integer;
-begin
-  Result := nil;
-  SetLength(Result, Length(argTemps) + 1);
-  
-  for i := 0 to High(argTemps) do
-    Result[i] := argTemps[i];
-  
-  if callDest >= 0 then
-    Result[Length(argTemps)] := callDest;
-end;
-
 procedure TIRInlining.CloneAndMapInstructions(srcFunc: TIRFunction; argTemps: array of Integer; 
                                               callDest: Integer; var newInstrs: TIRInstructionList);
 var
@@ -225,6 +208,7 @@ procedure TIRInlining.InlineCall(callerFunc: TIRFunction; callInstr: TIRInstr; t
 var
   argTemps: array of Integer;
   argMap: array of Integer;
+  argMapIdx: Integer;
 begin
   inlined := False;
   
@@ -236,7 +220,12 @@ begin
     Exit;
   end;
   
-  argMap := BuildArgMap(targetFunc, argTemps, callInstr.Dest);
+  // Build arg map inline
+  SetLength(argMap, Length(argTemps) + 1);
+  for argMapIdx := 0 to High(argTemps) do
+    argMap[argMapIdx] := argTemps[argMapIdx];
+  if callInstr.Dest >= 0 then
+    argMap[Length(argTemps)] := callInstr.Dest;
   
   CloneAndMapInstructions(targetFunc, argMap, callInstr.Dest, newInstrs);
   
