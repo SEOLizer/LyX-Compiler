@@ -14,6 +14,8 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/color` | RGBA Farben, HSL, Hex-Konvertierung |
 | `std/list` | Dynamische Listen, RingBuffer, Stack, Queue |
 | `std/result` | Result/Option Pattern für Error-Handling |
+| `std/conv` | Integer-Formatierung, Bit-Manipulation, Endianness |
+| `std/hash` | FNV-1a, DJB2, CRC32, SHA-256 (simplified), Password-Hashing |
 | `std/string` | String-Manipulation und -Suche |
 | `std/io` | Print/Printf, Formatierung |
 | `std/env` | Command-Line Argumente |
@@ -384,6 +386,37 @@ struct QueueInt64 {
 - `QueueInt64New(): QueueInt64`
 - `QueueInt64Enqueue(q: QueueInt64, value: int64): bool`
 - `QueueInt64Dequeue(q: QueueInt64): int64`
+
+---
+
+## std/hash.lyx
+
+Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
+
+### FNV-1a (Fast Non-Cryptographic)
+- `HashFNV1a32(data: pchar): int64` - 32-bit FNV-1a
+- `HashFNV1a64(data: pchar): int64` - 64-bit FNV-1a
+- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+
+### Weitere Non-Cryptographic
+- `HashDJB2(data: pchar): int64` - DJB2 Hash
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur2Default(data: pchar): int64` - MurmurHash2 mit seed=0
+- `HashCRC32(data: pchar): int64` - CRC32 Checksum
+- `HashBytes(data: array[256]int64, len: int64): int64` - Byte-Array Hash
+- `HashInt64(key: int64): int64` - Integer Hash (64-bit)
+- `HashInt32(key: int64): int64` - Integer Hash (32-bit)
+
+### Cryptographic (Simplified)
+- `HashSHA256(data: pchar): int64` - SHA-256 (vereinfacht)
+
+### Password Hashing
+- `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
+- `HashPasswordSimple(password: pchar, salt: int64): int64` - Mit Numeric-Salt
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
 
 ---
 
