@@ -49,6 +49,9 @@ type
     FRandomSeedOffset: UInt64;
     FRandomSeedAdded: Boolean;
     FRandomSeedLeaPatches: array of Integer;
+    // External symbols for PLT/GOT (Dynamic Linking)
+    FExternalSymbols: array of TExternalSymbol;
+    FPLTGOTPatches: array of TPLTGOTPatch;
   public
     constructor Create;
     destructor Destroy; override;
@@ -56,6 +59,8 @@ type
     function GetCodeBuffer: TByteBuffer;
     function GetDataBuffer: TByteBuffer;
     function GetFunctionOffset(const name: string): Integer;
+    function GetExternalSymbols: TExternalSymbolArray;
+    function GetPLTGOTPatches: TPLTGOTPatchArray;
   end;
 
 implementation
@@ -828,6 +833,49 @@ begin
 end;
 
 // ==========================================================================
+// Helper function to get library name for external symbols
+// ==========================================================================
+
+function GetLibraryForSymbol(const symbolName: string): string;
+begin
+  // Map common symbols to their libraries
+  if (symbolName = 'strlen') or (symbolName = 'strcmp') or
+     (symbolName = 'strcpy') or (symbolName = 'strcat') or
+     (symbolName = 'strstr') or (symbolName = 'strchr') or
+     (symbolName = 'strdup') or (symbolName = 'malloc') or
+     (symbolName = 'free') or (symbolName = 'realloc') or
+     (symbolName = 'memcpy') or (symbolName = 'memmove') or
+     (symbolName = 'memset') or (symbolName = 'memcmp') or
+     (symbolName = 'printf') or (symbolName = 'sprintf') or
+     (symbolName = 'fopen') or (symbolName = 'fclose') or
+     (symbolName = 'fread') or (symbolName = 'fwrite') or
+     (symbolName = 'fprintf') or (symbolName = 'fscanf') or
+     (symbolName = 'atoi') or (symbolName = 'atof') or
+     (symbolName = 'strtol') or (symbolName = 'strtod') or
+     (symbolName = 'exit') or (symbolName = 'abort') or
+     (symbolName = 'system') or (symbolName = 'getenv') or
+     (symbolName = 'setenv') or (symbolName = 'unsetenv') then
+    Result := 'libc.so.6'
+  else if (symbolName = 'pthread_create') or (symbolName = 'pthread_join') or
+          (symbolName = 'pthread_mutex_init') or (symbolName = 'pthread_mutex_lock') or
+          (symbolName = 'pthread_mutex_unlock') or (symbolName = 'pthread_cond_init') or
+          (symbolName = 'pthread_cond_wait') or (symbolName = 'pthread_cond_signal') or
+          (symbolName = 'pthread_cond_broadcast') then
+    Result := 'libpthread.so.0'
+  else if (symbolName = 'sqrt') or (symbolName = 'sin') or
+          (symbolName = 'cos') or (symbolName = 'tan') or
+          (symbolName = 'asin') or (symbolName = 'acos') or
+          (symbolName = 'atan') or (symbolName = 'exp') or
+          (symbolName = 'log') or (symbolName = 'log10') or
+          (symbolName = 'pow') or (symbolName = 'floor') or
+          (symbolName = 'ceil') or (symbolName = 'fabs') then
+    Result := 'libm.so.6'
+  else
+    // Default to libc
+    Result := 'libc.so.6';
+end;
+
+// ==========================================================================
 // TARM64Emitter Implementation
 // ==========================================================================
 
@@ -851,6 +899,9 @@ begin
   FRandomSeedOffset := 0;
   FRandomSeedAdded := False;
   SetLength(FRandomSeedLeaPatches, 0);
+  // External symbols for PLT/GOT
+  SetLength(FExternalSymbols, 0);
+  SetLength(FPLTGOTPatches, 0);
 end;
 
 destructor TARM64Emitter.Destroy;
@@ -928,6 +979,10 @@ var
   
   // Temporaries
   tmpReg: Byte;
+  
+  // External symbol search
+  found: Boolean;
+  ei: Integer;
 begin
   // Phase 1: Write interned strings to data section
   totalDataOffset := 0;
@@ -1495,11 +1550,42 @@ begin
                 WriteLdrImm(FCode, ParamRegs[k], X29, frameSize + SlotOffset(localCnt + argTemps[k]));
             end;
             
-            // Emit BL (will be patched)
-            SetLength(FCallPatches, Length(FCallPatches) + 1);
-            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
-            WriteBranchLink(FCode, 0);  // Placeholder
+            // Check if this is an external call (cmExternal)
+            if instr.CallMode = cmExternal then
+            begin
+              // External call: record symbol for PLT/GOT generation
+              found := False;
+              for ei := 0 to High(FExternalSymbols) do
+                if FExternalSymbols[ei].Name = instr.ImmStr then
+                begin
+                  found := True;
+                  Break;
+                end;
+              
+              if not found then
+              begin
+                SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
+                FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol(instr.ImmStr);
+              end;
+              
+              // Emit call to PLT stub label (generated after all functions)
+              // Use BLR to call PLT stub (will be patched later)
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__plt_' + instr.ImmStr;
+              // BLR X16 (call via PLT entry in X16)
+              // For now, use simple BL - will be patched to PLT
+              WriteBranchLink(FCode, 0);  // Placeholder
+            end
+            else
+            begin
+              // Internal or imported call: emit BL (will be patched)
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+              WriteBranchLink(FCode, 0);  // Placeholder
+            end;
             
             // Store return value
             if instr.Dest >= 0 then
@@ -2332,6 +2418,106 @@ begin
       end;
     end;
   end;
+  
+  // Phase 9: Generate PLT stubs for external symbols
+  if Length(FExternalSymbols) > 0 then
+  begin
+    // Generate PLT0 (resolver stub)
+    // PLT0: ldr x16, [x16, #got_offset] ; br x16
+    // Standard ARM64 PLT entry is 16 bytes
+    
+    // Record PLT0 position
+    // PLT0: 
+    //   ldr x16, [x16, #12]  ; load got entry (offset will be patched)
+    //   br x16               ; jump to resolved address
+    
+    // First, generate PLT0 (resolver stub) - 16 bytes
+    // ldr x16, [x16, #0] - placeholder (will be patched to point to GOT)
+    // br x16
+    EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0]
+    EmitInstr(FCode, $D61F0200);  // br x16
+    
+    // Pad to 16 bytes
+    EmitInstr(FCode, $D503201F);  // nop
+    EmitInstr(FCode, $D503201F);  // nop
+    
+    // Now generate PLT entries for each external symbol (16 bytes each)
+    for i := 0 to High(FExternalSymbols) do
+    begin
+      // Register PLT stub label
+      SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+      FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
+      FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+      
+      // PLTn entry (16 bytes):
+      // ldr x16, [x16, #offset]  ; load GOT entry
+      // br x16                    ; jump to resolved address
+      SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
+      FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
+      FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
+      FPLTGOTPatches[High(FPLTGOTPatches)].SymbolIndex := i;
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 0;
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 4;
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := 0;
+      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;
+      
+      // ldr x16, [x16, #offset] - offset will be patched by writer
+      // Offset to GOT entry: 16 (PLT0) + i * 16 + 8
+      EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0] (placeholder)
+      // br x16
+      EmitInstr(FCode, $D61F0200);  // br x16
+      
+      // Pad to 16 bytes
+      EmitInstr(FCode, $D503201F);  // nop
+      EmitInstr(FCode, $D503201F);  // nop
+    end;
+    
+    // Now patch the calls to PLT stubs (BL __plt_<name>)
+    for i := 0 to High(FCallPatches) do
+    begin
+      // Check if this call is to a PLT stub
+      if Pos('__plt_', FCallPatches[i].TargetName) = 1 then
+      begin
+        // Find the PLT stub position
+        targetFuncIdx := -1;
+        for j := 0 to High(FLabelPositions) do
+        begin
+          if FLabelPositions[j].Name = FCallPatches[i].TargetName then
+          begin
+            targetFuncIdx := j;
+            Break;
+          end;
+        end;
+        
+        if targetFuncIdx >= 0 then
+        begin
+          patchPos := FCallPatches[i].CodePos;
+          targetPos := FLabelPositions[targetFuncIdx].Pos;
+          branchOffset := targetPos - patchPos;
+          // Patch BL instruction
+          FCode.PatchU32LE(patchPos, $94000000 or DWord((branchOffset div 4) and $3FFFFFF));
+        end;
+      end;
+    end;
+  end;
+end;
+
+function TARM64Emitter.GetExternalSymbols: TExternalSymbolArray;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(FExternalSymbols));
+  for i := 0 to High(FExternalSymbols) do
+    Result[i] := FExternalSymbols[i];
+end;
+
+function TARM64Emitter.GetPLTGOTPatches: TPLTGOTPatchArray;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(FPLTGOTPatches));
+  for i := 0 to High(FPLTGOTPatches) do
+    Result[i] := FPLTGOTPatches[i];
 end;
 
 end.
