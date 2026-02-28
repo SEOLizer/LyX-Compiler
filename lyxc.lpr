@@ -1,11 +1,16 @@
 {$mode objfpc}{$H+}
 program lyxc;
 
+{$IFDEF UNIX}
 uses
   SysUtils, Classes, BaseUnix,
+{$ELSE}
+uses
+  SysUtils, Classes,
+{$ENDIF}
   bytes, backend_types,
-  diag, lexer, parser, ast, sema, unit_manager, linter,
-  ir, lower_ast_to_ir, ir_inlining,
+  diag, lexer, parser, ast, sema, unit_manager,
+  ir, lower_ast_to_ir, ir_inlining, ir_peephole,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer;
@@ -32,6 +37,7 @@ var
   module: TIRModule;
   lower: TIRLowering;
   inliner: TIRInlining;
+  peephole: TIRPeepholeOptimizer;
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
@@ -401,6 +407,16 @@ begin
             inliner.Free;
           end;
 
+          // Peephole Optimization
+          WriteLn('[IR] Running peephole optimization...');
+          peephole := TIRPeepholeOptimizer.Create(module);
+          try
+            peephole.Optimize;
+            peephole.PrintStats;
+          finally
+            peephole.Free;
+          end;
+
           // --emit-asm: Dump IR as pseudo-assembly
           if flagEmitAsm then
             DumpIRAsAsm(module);
@@ -447,10 +463,12 @@ begin
               begin
                 entryVA := $400000 + 4096;  // Static: traditional address
                 WriteLn('Generating static ELF (no external symbols)');
-                WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+              WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
               end;
               
+              {$IFDEF UNIX}
               FpChmod(PChar(outputFile), 493);
+              {$ENDIF}
               WriteLn('Wrote ', outputFile);
             finally
               emit.Free;
@@ -477,7 +495,9 @@ begin
               WriteLn('Generating static ELF for Linux ARM64');
               WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
               
+              {$IFDEF UNIX}
               FpChmod(PChar(outputFile), 493);
+              {$ENDIF}
               WriteLn('Wrote ', outputFile, ' (ELF64 for Linux ARM64)');
             finally
               arm64Emit.Free;
