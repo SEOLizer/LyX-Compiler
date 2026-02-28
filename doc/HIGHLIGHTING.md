@@ -30,7 +30,7 @@ How to test locally (VSCode)
 ----------------------------
 1. Open this repository in VSCode.
 2. Use "Extension Development Host" (Command Palette: "Developer: Reload Window in Extension Development Host") and load the grammar by opening the file syntaxes/lyx.tmLanguage.json in the host.
-3. Open any .lyx file (e.g. examples/if_test.lyx) and use "Developer: Inspect TM Scopes" to inspect token scopes.
+3. Open any .lyx file (e.g. tests/lyx/basic/if_test.lyx) and use "Developer: Inspect TM Scopes" to inspect token scopes.
 
 Fallback
 --------

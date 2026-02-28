@@ -14,9 +14,9 @@ var
 begin
   src := TStringList.Create;
   try
-    src.LoadFromFile('examples/call.lyx');
+    src.LoadFromFile('tests/lyx/functions/call.lyx');
     d := TDiagnostics.Create;
-    lx := TLexer.Create(src.Text, 'examples/call.lyx', d);
+    lx := TLexer.Create(src.Text, 'tests/lyx/functions/call.lyx', d);
     p := TParser.Create(lx, d);
     prog := p.ParseProgram;
     p.Free; lx.Free;

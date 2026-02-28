@@ -61,7 +61,7 @@ begin
   end;
 
   // Compile and run use_math example
-  ret := RunCmd('./lyxc examples/use_math.lyx -o /tmp/use_math');
+  ret := RunCmd('./lyxc tests/lyx/stdlib/use_math.lyx -o /tmp/use_math');
   if ret <> 0 then
   begin
     Writeln('ERROR: compiling use_math failed with code ', ret);
@@ -81,7 +81,7 @@ begin
   end;
 
   // Compile and run use_env example with arguments
-  ret := RunCmd('./lyxc examples/use_env.lyx -o /tmp/use_env');
+  ret := RunCmd('./lyxc tests/lyx/stdlib/use_env.lyx -o /tmp/use_env');
   if ret <> 0 then
   begin
     Writeln('ERROR: compiling use_env failed with code ', ret);

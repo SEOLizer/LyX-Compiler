@@ -32,21 +32,21 @@ begin
   if r <> 0 then Halt(1);
 
   // use_string -> expect 5
-  r := RunCapture('./lyxc examples/use_string.lyx -o /tmp/use_string', txt);
+  r := RunCapture('./lyxc tests/lyx/strings/use_string.lyx -o /tmp/use_string', txt);
   if r <> 0 then Halt(2);
   r := RunCapture('/tmp/use_string', txt);
   if r <> 0 then Halt(3);
   if txt <> '5'#10 then Halt(4);
 
   // use_time -> expect numeric (>= 0)
-  r := RunCapture('./lyxc examples/use_time.lyx -o /tmp/use_time', txt);
+  r := RunCapture('./lyxc tests/lyx/stdlib/use_time.lyx -o /tmp/use_time', txt);
   if r <> 0 then Halt(5);
   r := RunCapture('/tmp/use_time', txt);
   if r <> 0 then Halt(6);
   if Length(Trim(txt)) = 0 then Halt(7);
 
   // use_geo -> expect two numbers
-  r := RunCapture('./lyxc examples/use_geo.lyx -o /tmp/use_geo', txt);
+  r := RunCapture('./lyxc tests/lyx/stdlib/use_geo.lyx -o /tmp/use_geo', txt);
   if r <> 0 then Halt(8);
   r := RunCapture('/tmp/use_geo', txt);
   if r <> 0 then Halt(9);
@@ -59,7 +59,7 @@ begin
   end;
 
    // Test IO functions (open, write, read, close)
-   r := RunCapture('./lyxc examples/io_test.lyx -o /tmp/io_test', txt);
+   r := RunCapture('./lyxc tests/lyx/io/io_test.lyx -o /tmp/io_test', txt);
    if r <> 0 then Halt(11);
    r := RunCapture('/tmp/io_test', outp);
    if r <> 0 then Halt(12); // Should return 0 on success
@@ -70,7 +70,7 @@ begin
     end;
 
    // Test advanced IO functions (lseek, mkdir, rmdir, rename)
-   r := RunCapture('./lyxc examples/io_advanced.lyx -o /tmp/io_advanced', txt);
+   r := RunCapture('./lyxc tests/lyx/io/io_advanced.lyx -o /tmp/io_advanced', txt);
    if r <> 0 then Halt(14);
    r := RunCapture('/tmp/io_advanced', outp);
    if r <> 0 then Halt(15);

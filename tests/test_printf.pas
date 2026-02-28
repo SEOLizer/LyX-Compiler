@@ -32,7 +32,7 @@ begin
   if r <> 0 then Halt(1);
 
   // compile example
-  r := RunCapture('./lyxc examples/test_println.lyx -o /tmp/test_println', txt);
+  r := RunCapture('./lyxc tests/lyx/printf/test_println.lyx -o /tmp/test_println', txt);
   if r <> 0 then Halt(2);
 
   // run example
@@ -48,7 +48,7 @@ begin
   if Pos('Formatted: answer = 42, pi=3.141500', txt) = 0 then Halt(8);
 
   // run negative printf example
-  r := RunCapture('./lyxc examples/test_printf_negative.lyx -o /tmp/test_printf_negative', txt);
+  r := RunCapture('./lyxc tests/lyx/printf/test_printf_negative.lyx -o /tmp/test_printf_negative', txt);
   if r <> 0 then Halt(9);
   r := RunCapture('/tmp/test_printf_negative', txt);
   if r <> 0 then Halt(10);

@@ -50,18 +50,18 @@ e2e: build
 	@./lyxc examples/hello.lyx -o /tmp/hello || exit 1
 	@/tmp/hello || exit 1
 	@echo "=== E2E: print_int.au ==="
-	@./lyxc examples/print_int.lyx -o /tmp/print_int || exit 1
+	@./lyxc tests/lyx/printf/print_int.lyx -o /tmp/print_int || exit 1
 	@/tmp/print_int || exit 1
 	@echo "=== E2E: crt ANSI demo ==="
-	@./lyxc examples/test_crt_ansi.lyx -o /tmp/test_crt_ansi || exit 1
+	@./lyxc tests/lyx/crt/test_crt_ansi.lyx -o /tmp/test_crt_ansi || exit 1
 	@/tmp/test_crt_ansi || exit 1
 	@echo "=== E2E: println/printf demo ==="
-	@./lyxc examples/test_println.lyx -o /tmp/test_println || exit 1
+	@./lyxc tests/lyx/printf/test_println.lyx -o /tmp/test_println || exit 1
 	@/tmp/test_println || exit 1
 	@echo "=== E2E: crt Raw demo (optional) ==="
 	@if [ -n "$$CRT_RAW" ]; then \
 		echo "=== E2E: crt raw demo ==="; \
-		./lyxc examples/test_crt_raw.lyx -o /tmp/test_crt_raw || exit 1; \
+		./lyxc tests/lyx/crt/test_crt_raw.lyx -o /tmp/test_crt_raw || exit 1; \
 		/tmp/test_crt_raw || exit 1; \
 	fi
 	@echo "=== E2E passed ==="

@@ -8,7 +8,7 @@ if [ ! -x ./lyxc ]; then
 fi
 
 OUT=/tmp/int_widths_test
-./lyxc examples/int_widths.lyx -o "$OUT"
+./lyxc tests/lyx/misc/int_widths.lyx -o "$OUT"
 OUTPUT=$("$OUT" | tr -d '\r')
 # Expect print_int(x) where a=int8(130)->trunc(130)->-126? But truncation semantics: storing 130 into int8 signed gives -126.
 # b = uint8 250, so a + b (promoted) = -126 + 250 = 124

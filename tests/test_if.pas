@@ -55,7 +55,7 @@ var
   stmt: TAstStmt;
   if1, if2, if3: TAstIf;
 begin
-  prog := ParseProgramFromFile('examples/if_test.lyx');
+  prog := ParseProgramFromFile('tests/lyx/basic/if_test.lyx');
   try
     // Erwartet: eine fn main plus con NL -> zwei Decls
     AssertTrue(Length(prog.Decls) >= 2);
