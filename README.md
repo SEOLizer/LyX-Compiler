@@ -218,6 +218,11 @@ fn main(): int64 {
 - `std.crt`: ANSI Terminal Utilities (colors, cursor control)
 - `std.pack`: Binary serialization (VarInt, int/float/string packing)
 - `std.regex`: Regex matching
+- `std.qbool`: Probabilistic Boolean Type (`QBool`, `Maybe()`, `Observe()`, `QBoolAnd`, `QBoolOr`, `QBoolNot`, Entanglement)
+- `std.vector`: 2D Vector library (`Vec2`)
+- `std.list`: Collections (`StaticList8`, `StackInt64`, `QueueInt64`, `RingBufferVec2`)
+- `std.rect`: Rectangle utilities (`Rect`)
+- `std.color`: RGBA Color utilities
 
 ### Types
 
@@ -234,6 +239,7 @@ fn main(): int64 {
 | `array`   | Dynamic array (Heap, Fat-Pointer: ptr, len, cap) |
 | `parallel Array<T>` | SIMD-optimized array (Heap, element-wise operations) |
 | `struct`  | User-defined record type             |
+| `QBool`   | Probabilistic boolean (0.0 to 1.0 probability) |
 
 Note: `int` and `string` are currently alias types (shortcuts) — `int` is internally treated as `int64`, `string` is mapped to `pchar`. No implicit casts — all types must match explicitly.
 
