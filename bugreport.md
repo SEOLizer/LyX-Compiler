@@ -91,16 +91,11 @@ Weitere Hinweise
 Neue Fehler (2026-02-28)
 ----------------------
 
-### 1. test_array_static: Statische Array-Indizierung fehlgeschlagen
+### 1. (BEHOBEN) test_array_static: Statische Array-Indizierung
 
-- Symptom: Test `TestStaticArrayInitAndIndex` schlägt fehl mit:
-  ```
-  Failed: irLoadLocalAddr expected for array access
-  Exception: irLoadLocalAddr expected for array access
-  ```
-- Ursache: Der Lowerer erwartet `irLoadLocalAddr` für Array-Zugriffe, aber der Parser erzeugt möglicherweise einen anderen Knotentyp.
-- Betrifft: `lower_ast_to_ir.pas` und Parser
-- Status: OFFEN
+- Symptom: Test `TestStaticArrayInitAndIndex` schlug fehl
+- Ursache: Veraltete kompilierte Test-Binary (nicht der eigentliche Code)
+- Status: BEHOBEN (durch Neucompilieren des Tests)
 
 ### 2. test_index_assign: Index-Zuweisung fehlgeschlagen
 
