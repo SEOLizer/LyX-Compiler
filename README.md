@@ -1,23 +1,25 @@
 # Lyx
 
-**Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
-It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
+**Lyx** ist ein nativer Compiler für die gleichnamige Programmiersprache, geschrieben in FreePascal.
+Er erzeugt direkt ausführbare **Linux x86_64 ELF64**, **Linux ARM64 ELF64** und **Windows x64 PE32+** Binaries — ohne libc, ohne Linker, unter Verwendung reiner Syscalls oder WinAPI.
 
 ```
-Lyx Compiler v0.4.1
+Lyx Compiler v0.4.3
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
 ✅ PLT/GOT Dynamic Linking for External Libraries
-✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs)
-✅ Robust Parser with While/If/Function Support
+✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, std.regex, ...)
+✅ IR-Level Inlining Optimization (v0.4.3)
+✅ PascalCase Naming Conventions (v0.4.3)
+✅ Integrated Linter with 10 Rules (--lint flag)
+✅ Robust Parser with While/If/For/Switch/Function Support
 ✅ OOP: Classes, Inheritance, Constructors, Destructors
 ✅ Global Variables with Initialization
 ✅ Random/RandomSeed Builtins
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
-✅ Debugging: --emit-asm and --dump-relocs Flags
 ✅ CLI Arguments (argc/argv) in Static ELF
 ✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
@@ -27,8 +29,13 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ std/time: Date/Time, Timezone support
 ✅ std/fs: File I/O, Directory operations
 ✅ std/pack: Binary serialization
-✅ std/regex: Regex matching
+✅ std/regex: Regex matching (v0.4.2)
 ✅ std/crt: ANSI Terminal control
+✅ Panic & Assert: Runtime error handling (v0.4.2)
+✅ Access Control: pub/private/protected for classes (v0.4.1)
+✅ Namespaces: IO, OS, Math, Regex (v0.4.2)
+✅ Debugging: --emit-asm and --dump-relocs Flags
+✅ Peephole Optimizer (v0.5.0): Pattern-based instruction simplification
 ```
 
 ---
@@ -211,16 +218,23 @@ fn main(): int64 {
 ```
 
 **Available Standard Library:**
-- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`, etc.)
-- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-conversion)
+- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`, `Pow64`, `Min3`, `Max3`, `InRange64`, `PopCount`, `Log2`, `Atan2Microdegrees`, `Cos64Inverse`, etc.)
+- `std.io`: I/O functions (`PrintStr`, `PrintInt`, `Printf` with auto-conversion, `open`, `read`, `write`, `close`, `lseek`, `mkdir`, `unlink`, `rename`, etc.)
 - `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, `StrToUpper`, `StrConcat`, `StrReplace`, etc.)
-- `std.env`: Environment API (`ArgCount`, `Arg`, `init`)
+- `std.env`: Environment API (`ArgCount`, `Arg`, `Init`)
 - `std.time`: Date and time functions (numerical calculations, timezone support)
-- `std.geo`: Geolocation parser for Decimal Degrees, GeoPoint, Distance calculations, BoundingBox, DMS parsing
-- `std.fs`: Filesystem operations (open, read, write, close, file existence)
+- `std.geo`: Geolocation parser (`ParseLat`, `ParseLon`, `FormatDecimal`, `IsValidLat`, `IsValidLon`, `DistanceM`, `DistanceKm`, `MidpointLat`, `MidpointLon`)
+- `std.fs`: Filesystem operations (open, read, write, close, file existence, stat, mkdir, unlink, rename)
 - `std.crt`: ANSI Terminal Utilities (colors, cursor control)
 - `std.pack`: Binary serialization (VarInt, int/float/string packing)
-- `std.regex`: Regex matching
+- `std.regex`: Regex matching (`RegexMatch`, `RegexSearch`, `RegexReplace`)
+- `std.vector`: 2D Vector library (`Vec2`, `Vec2Add`, `Vec2Sub`, `Vec2Dot`, `Vec2Cross`, `Vec2Length`, `Vec2Distance`, `Vec2Normalize`, `Vec2Lerp`, `Vec2Rotate`, etc.)
+- `std.list`: Dynamic and static lists (`ListInt64`, `StaticList8/16/32`, `Vec2List`, `RingBufferVec2`, `StackInt64`, `QueueInt64`)
+- `std.rect`: Rectangle and bounding box utilities (`Rect`, `RectFromPoints`, `RectWidth`, `RectHeight`, `RectContains`, `RectUnion`, `RectIntersect`, etc.)
+- `std.color`: RGBA color utilities (`Color`, `ColorRGB`, `ColorFromHex`, `ColorToHSL`, `ColorLerp`, `ColorBlend`, `ColorGrayscale`, etc.)
+- `std.result`: Result type for error handling
+- `std.error`: Error type and error handling utilities
+- `std.circle`: Circle geometry utilities
 
 ### Types
 
@@ -233,10 +247,12 @@ fn main(): int64 {
 | `bool`    | `true` / `false`                     |
 | `void`    | Only as function return type          |
 | `pchar`   | Pointer to null-terminated bytes      |
+| `pchar?`  | Nullable pointer (can be null)        |
 | `string`  | Alias for `pchar` (null-terminated bytes)
 | `array`   | Dynamic array (Heap, Fat-Pointer: ptr, len, cap) |
 | `parallel Array<T>` | SIMD-optimized array (Heap, element-wise operations) |
 | `struct`  | User-defined record type             |
+| `class`   | User-defined reference type with inheritance |
 
 Note: `int` and `string` are currently alias types (shortcuts) — `int` is internally treated as `int64`, `string` is mapped to `pchar`. No implicit casts — all types must match explicitly.
 
@@ -446,6 +462,28 @@ type Point = struct {
 
 **Note:** Struct return by value is still limited. Currently, static methods can return primitive types, but not structs.
 
+### Access Control (v0.4.1)
+
+Lyx supports access control keywords for class and struct members:
+
+```lyx
+type MyClass = class {
+  pub pubField: int64;           // Accessible everywhere
+  private privField: int64;       // Only within the class
+  protected protField: int64;    // In class and subclasses
+  
+  pub fn pubMethod() { }
+  private fn privMethod() { }
+  protected fn protMethod() { }
+};
+```
+
+| Keyword     | Description                                  |
+|-------------|---------------------------------------------|
+| `pub`       | Accessible everywhere (default)             |
+| `private`   | Only within the declaring class             |
+| `protected` | Within declaring class and derived classes  |
+
 ### Classes (OOP) with Inheritance
 
 Lyx supports OOP with classes, inheritance, constructors, and destructors:
@@ -491,8 +529,129 @@ fn main(): int64 {
 - `dispose expr` calls `Destroy()` and frees memory
 - `super.method()` for calling base class methods
 - Heap-allocated (vs. stack-allocated structs)
+- `pub`/`private`/`protected` access control
 
-### Operators
+### Nullable Types (v0.4.0)
+
+Lyx supports nullable pointer types with the `?` suffix and null-coalescing operator:
+
+```lyx
+fn main(): int64 {
+  var p: pchar? := null;    // nullable pointer
+  var q: pchar;              // non-nullable pointer (standard)
+  var r: pchar := p ?? "default";  // null-coalescing
+  
+  if (p == null) {
+    PrintStr("p is null\n");
+  };
+  
+  return 0;
+}
+```
+
+**Nullable features:**
+- `pchar?` can hold `null`
+- `pchar` cannot be null (enforced at compile-time)
+- `??` operator provides default value when null
+- `== null` and `!= null` for null checks
+
+### Regex Literals (v0.4.2)
+
+Lyx supports regex literals with the `r"..."` syntax:
+
+```lyx
+fn main(): int64 {
+  var email: pchar := r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+  var phone: pchar := r"\d{3}-\d{4}";
+  
+  // Regex functions
+  if (RegexMatch(r"abc", "abcdef")) {
+    PrintStr("Match!\n");
+  };
+  
+  var pos: int64 := RegexSearch(r"\d+", "abc123def");
+  PrintInt(pos);  // 3
+  PrintStr("\n");
+  
+  return 0;
+}
+```
+
+### Namespaces (v0.4.2)
+
+Builtin functions can be called via namespaces (recommended, backward compatible):
+
+```lyx
+fn main(): int64 {
+  // Direct call (backward compatible)
+  PrintStr("Hello\n");
+  
+  // Namespace call (recommended)
+  IO.PrintStr("Hello via namespace\n");
+  OS.exit(0);
+  
+  return 0;
+}
+```
+
+**Available namespaces:**
+- `IO`: PrintStr, PrintInt, PrintFloat, open, read, write, close, etc.
+- `OS`: exit, getpid
+- `Math`: Random, RandomSeed
+- `Regex`: Match, Search, Replace
+
+### Panic and Assert (v0.4.2)
+
+Runtime error handling with panic and assert:
+
+```lyx
+fn divide(a: int64, b: int64): int64 {
+  if (b == 0) {
+    panic("Division by zero!");
+  };
+  return a / b;
+}
+
+fn setAge(age: int64): void {
+  assert(age >= 0 && age < 150, "Age must be between 0 and 149");
+}
+
+fn main(): int64 {
+  setAge(25);    // OK
+  // setAge(-5);  // Would panic with message
+  
+  return 0;
+}
+```
+
+- **`panic(message)`**: Terminates program with error message on stderr
+- **`assert(cond, message)`**: Checks condition, calls panic if false
+
+### IR-Level Inlining (v0.4.3)
+
+The compiler automatically inlines functions with 12 or fewer IR instructions:
+
+```lyx
+fn add(a: int64, b: int64): int64 {
+  return a + b;
+}
+
+fn main(): int64 {
+  var x: int64 := add(10, 20);  // Inlined to: var x: int64 := 10 + 20;
+  PrintInt(x);  // 30
+  return 0;
+}
+```
+
+**Implementation:**
+- Automatic detection of small functions
+- Recursion prevention
+- Proper argument mapping
+- Multiple passes for nested functions
+
+---
+
+## Operators
 
 | Priority | Operators           | Description              |
 |:--------:|---------------------|-------------------------|
@@ -504,6 +663,7 @@ fn main(): int64 {
 | 6         | `*` `/` `%`        | Multiplication, Division, Modulo |
 | 7 (high) | `!` `-` (unary)   | Logical NOT, Negation  |
 | 8         | `as`               | Type-Casting            |
+| 9         | `??`               | Null-Coalescing         |
 
 Assignment uses `:=` (not `=`).
 
@@ -553,27 +713,6 @@ fn main(): int64 {
 }
 ```
 
-**With additional arguments:**
-
-```lyx
-fn add(a: int64, b: int64): int64 { return a + b; }
-
-fn main(): int64 {
-  var x: int64 := 10;
-  
-  // x is inserted as the first argument
-  var result: int64 := x |> add(5);  // equivalent to add(x, 5)
-  
-  PrintInt(result);  // 15
-  return 0;
-}
-```
-
-**Benefits:**
-- Better readability: code reads like data flow
-- Avoids deep nesting
-- Simpler debugging through clear order
-
 ### Type-Casting with `as`
 
 Lyx supports explicit type casts with the `as` syntax:
@@ -586,7 +725,7 @@ fn main(): int64 {
   
   // String conversions
   var s: pchar := IntToStr(x);
-  var parsed: int64 := str_to_int(s);
+  var parsed: int64 := StrToInt(s);
   
   PrintInt(parsed);  // 42
   return 0;
@@ -599,7 +738,9 @@ fn main(): int64 {
 - Identity Casts: `int64 as int64`, `f64 as f64`
 - String conversions via builtin functions
 
-### Control Flow
+---
+
+## Control Flow
 
 #### if / else
 
@@ -637,22 +778,22 @@ fn main(): int64 {
 4
 ```
 
-#### Bool expressions as condition
+#### for loop
 
 ```lyx
 fn main(): int64 {
-  var active: bool := true;
-  if (active)
-    PrintStr("active\n");
+  var sum: int64 := 0;
+  
+  for i := 1 to 10 do {
+    sum := sum + i;
+  };
+  
+  PrintInt(sum);  // 55
   return 0;
 }
 ```
 
 #### switch / case
-
-switch/case has been added and now supports both block bodies and single statements per case. `break` terminates the nearest loop or current switch case.
-
-Example (block bodies):
 
 ```lyx
 fn classify(x: int64): int64 {
@@ -673,19 +814,9 @@ fn classify(x: int64): int64 {
 }
 ```
 
-Example (single-statement bodies):
+---
 
-```lyx
-switch (n) {
-  case 0: PrintStr("zero\n");
-  case 1: PrintStr("one\n");
-  default: PrintStr("many\n");
-}
-```
-
-Note: `case` labels must currently be integers (int/int64); semantics and codegen treat `int` as 64-bit.
-
-### Functions
+## Functions
 
 Functions are global, follow the SysV ABI (parameters in registers), and support up to 6 parameters:
 
@@ -719,38 +850,26 @@ fn main(): int64 {
 }
 ```
 
-### Builtins
+---
 
-Over 30 built-in functions are available without import:
+## Builtins
+
+Over 40 built-in functions are available without import (using PascalCase as of v0.4.3):
 
 #### Basic I/O Builtins
 | Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
 | `PrintStr(s)`    | `pchar -> void`        | Outputs string until `\0`           |
 | `PrintInt(x)`    | `int64 -> void`        | Outputs integer as decimal          |
-| `PrintFloat(x)`  | `f64 -> void`          | Outputs float (simplified)          |
-| `exit(code)`      | `int64 -> void`        | Terminates program with exit code   |
+| `Print | `f64Float(x)`  -> void`         | Outputs float (simplified)          |
+| `Printf(fmt, ...)`| `pchar, ... -> int64` | Formatted output                   |
+| `exit(code)`      | `int64 -> void`       | Terminates program with exit code   |
 
 #### Random Builtins
 | Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
 | `Random()`        | `void -> int64`        | Returns pseudo-random number (0..2³¹-1) |
 | `RandomSeed(s)`   | `int64 -> void`        | Sets seed for LCG                  |
-
-Example:
-```lyx
-fn main(): int64 {
-  RandomSeed(42);           // Set seed
-  
-  var r1: int64 := Random();  // Random number
-  var r2: int64 := Random();  // Another random number
-  
-  PrintInt(r1);
-  PrintStr("\n");
-  PrintInt(r2);
-  return 0;
-}
-```
 
 #### Array Builtins
 | Function          | Signature               | Description                        |
@@ -764,38 +883,31 @@ fn main(): int64 {
 | Function                    | Signature                                    | Description                        |
 |-----------------------------|---------------------------------------------|-------------------------------------|
 | `StrLength(s)`             | `pchar -> int64`                           | Calculates string length           |
-| `str_char_at(s, index)`     | `pchar, int64 -> int64`                    | Reads character at position        |
-| `str_set_char(s, index, c)` | `pchar, int64, int64 -> void`             | Sets character at position         |
-| `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                   | String comparison (0=equal)        |
-| `str_copy_builtin(dest, src)` | `pchar, pchar -> void`                   | Copies string                      |
+| `StrCharAt(s, index)`       | `pchar, int64 -> int64`                    | Reads character at position        |
+| `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                    | String comparison (0=equal)        |
+| `StrCopy(dest, src)`       | `pchar, pchar -> void`                     | Copies string                      |
+| `IntToStr(x)`              | `int64 -> pchar`                           | Converts integer to string         |
+| `StrToInt(s)`              | `pchar -> int64`                           | Converts string to integer         |
 
-#### String Conversion Builtins
-| Function          | Signature               | Description                        |
-|-------------------|------------------------|-------------------------------------|
-| `IntToStr(x)`   | `int64 -> pchar`       | Converts integer to string          |
-| `str_to_int(s)`   | `pchar -> int64`       | Converts string to integer          |
-
-#### Math Builtins (22 functions)
+#### Math Builtins
 | Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
 | `abs(x)`          | `int64 -> int64`       | Absolute value                     |
 | `odd(x)`          | `int64 -> bool`        | Checks if odd                      |
 | `hi(x)`           | `int64 -> int64`       | High 32 bits                       |
-| `lo(x)`           | `int64 -> int64`       | Low 32 bits                       |
-| `swap(x)`         | `int64 -> int64`       | Swaps 32-bit words                 |
+| `lo(x)`           | `int64 -> int64`       | Low 32 bits                        |
 | `fabs(x)`         | `f64 -> f64`           | Absolute value (Float)             |
 | `sqrt(x)`         | `f64 -> f64`           | Square root                        |
 | `sqr(x)`          | `f64 -> f64`           | Square (x²)                        |
 | `round(x)`        | `f64 -> int64`         | Rounds to nearest integer          |
 | `trunc(x)`        | `f64 -> int64`         | Truncates fractional part          |
-| `IntPart(x)`     | `f64 -> int64`         | Alias for `trunc()`                |
-| `frac(x)`         | `f64 -> f64`           | Fractional part                   |
 | `pi()`            | `void -> f64`          | π constant                         |
-| `sin(x)`, `cos(x)`, `exp(x)`, `ln(x)`, `arctan(x)` | `f64 -> f64` | Transcendental functions (Placeholder) |
 
-### External Functions (v0.2.0)
+---
 
-The Lyx compiler now supports declarations of external functions from system libraries with a unified call path:
+## External Functions
+
+The Lyx compiler supports declarations of external functions from system libraries:
 
 ```lyx
 extern fn malloc(size: int64): pchar;
@@ -810,28 +922,15 @@ fn main(): int64 {
 }
 ```
 
-#### Unified Call Path (v0.2.0)
+#### Unified Call Path
 
-The compiler now correctly distinguishes between three call types:
+The compiler correctly distinguishes between three call types:
 
 | Call Type | Description | Codegen |
 |-----------|--------------|---------|
 | `cmInternal` | Call to function in same unit | `call rel32` (direct) |
 | `cmImported` | Call to function from imported unit | `call rel32` (direct) |
 | `cmExternal` | Call to external library function | `call __plt_<name>` (PLT/GOT) |
-
-#### Varargs Support
-
-External functions can declare variable argument lists with `...`:
-
-```lyx
-extern fn printf(fmt: pchar, ...): int64;
-
-fn main(): int64 {
-  printf("Int: %d, String: %s, Float: %f\n", 42, "test", 3.14);
-  return 0;
-}
-```
 
 #### Dynamic vs. Static ELF Binaries
 
@@ -840,280 +939,190 @@ The compiler automatically detects whether external symbols are used:
 - **Static ELF**: When no external functions are called
 - **Dynamic ELF**: Automatically when using external symbols
 
-```bash
-# Static binary (no external calls)
-./lyxc hello.lyx -o hello_static
-# Output: "Generating static ELF (no external symbols)"
+---
 
-# Dynamic binary (with malloc/printf)
-./lyxc extern_example.lyx -o extern_dynamic  
-# Output: "Generating dynamic ELF with 2 external symbols"
-```
+## CLI Arguments
 
-#### Library Mapping
-
-The compiler automatically maps symbols to appropriate libraries:
-
-| Symbol | Library |
-|--------|---------|
-| `printf`, `malloc`, `strlen`, `exit` | `libc.so.6` |
-| `sin`, `cos`, `sqrt` | `libm.so.6` |
-| Unknown symbols | `libc.so.6` (fallback) |
-
-#### PLT/GOT Mechanism
-
-Dynamic binaries use the **Procedure Linkage Table (PLT)** and **Global Offset Table (GOT)**:
-
-- **PLT Stubs**: Each external function gets a PLT entry
-- **GOT Entries**: Contain runtime addresses of library functions
-- **Relocations**: Dynamic linker patches GOT at runtime
-
-```bash
-# Analyze ELF structure
-readelf -l extern_binary    # PT_INTERP, PT_DYNAMIC headers
-readelf -d extern_binary    # NEEDED libraries, Symbol tables
-
-# Debug output with new flag
-./lyxc program.lyx --dump-relocs    # Shows external symbols and PLT patches
-./lyxc program.lyx --emit-asm        # Shows IR as pseudo-assembler
-```
-
-### Standard Units
-
-A comprehensive set of standard units is located in the `std/` directory, providing ergonomic library functions:
-
-- **std/math.lyx** – Integer helpers (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`)
-- **std/io.lyx** – I/O wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-type-conversion)
-- **std/string.lyx** – Comprehensive string library with 25+ functions
-- **std/env.lyx** – Environment API (`init`, `ArgCount`, `Arg`)
-- **std/time.lyx** – Date and time calculations (numerical, timezone support)
-- **std/geo.lyx** – Geolocation: GeoPoint, DistanceM, BoundingBox, DMS parsing, Navigation
-- **std/fs.lyx** – Filesystem: open, read, write, close, file operations
-- **std/crt.lyx** – ANSI Console Utilities (colors, cursor, clrscr). See `tests/lyx/crt/test_crt_ansi.lyx` for a demo.
-- **std/pack.lyx** – Binary serialization (VarInt, int/float/string)
-- **std/regex.lyx** – Regex matching
-
-#### String Library Example
+Static ELF binaries support command-line arguments:
 
 ```lyx
-import std.string;
-
-fn main(): int64 {
-  var text: pchar := "Hello World";
-  var len: int64 := StrLength(text);           // Native Builtin
-  var first: int64 := str_char_at(text, 0);     // 'H' = 72
-  
-  // String manipulation
-  var lower: pchar := "buffer_space_here";
-  StrToLower(lower, text);                    // "hello world"
-  
-  // String tests  
-  var starts: bool := StrStartsWith(text, "Hello"); // true
-  var pos: int64 := StrFind(text, "World");          // 6
-  
-  PrintInt(len);    // 11
-  PrintStr("\n");
-  return 0;
-}
-```
-
-#### Math Builtins Example
-
-```lyx
-fn main(): int64 {
-  var x: int64 := -42;
-  var y: f64 := 16.0;
-  
-  // Native Integer Math (no imports needed)
-  PrintInt(abs(x));         // 42
-  PrintInt(hi(x));          // High 32 bits
-  PrintInt(lo(x));          // Low 32 bits
-  
-  // Native Float Math  
-  var root: f64 := sqrt(y);  // 4.0
-  var square: f64 := sqr(y); // 256.0
-  var rounded: int64 := round(root); // 4
-  
-  PrintFloat(pi());         // 3.14159...
-  return 0;
-}
-```
-
-#### Import Example
-
-```lyx
-import std.math;
-import std.io;
-import std.string;
-import std.env; // optional
-
 fn main(argc: int64, argv: pchar): int64 {
-  // Automatic argc/argv initialization (no manual init() needed)
-  PrintIntLn(ArgCount());
+  PrintInt(ArgCount());
+  PrintStr("\n");
   PrintStr(Arg(0));
   PrintStr("\n");
-  
-  // Combined usage of different libraries
-  var result: int64 := Abs64(-123);
-  var str_result: pchar := IntToStr(result);
-  PrintLn(str_result);
-  
   return 0;
 }
 ```
 
-### CI / Integration Tests
-
-- GitHub Actions CI builds the compiler, runs unit tests, and additionally compiles and executes the test programs in `tests/lyx/` to verify runtime integration. The `make e2e` target compiles and runs `hello.lyx`, `print_int.lyx`, and `test_crt_ansi.lyx`; optional `test_crt_raw.lyx` is only executed if the `CRT_RAW` CI variable is set.
-
-```lyx
-fn main(): int64 {
-  PrintInt(0);
-  PrintStr("\n");
-  PrintInt(12345);
-  PrintStr("\n");
-  PrintInt(-42);
-  PrintStr("\n");
-  return 0;
-}
-```
-
-```
-0
-12345
--42
-```
-
-### String Escape Sequences
-
-| Escape | Meaning       |
-|--------|---------------|
-| `\n`   | Newline       |
-| `\r`   | Carriage return |
-| `\t`   | Tabulator     |
-| `\\`   | Backslash     |
-| `\"`   | Quote         |
-| `\0`   | Null byte     |
-
-### Comments
-
-```lyx
-// Line comment
-
-/* Block comment
-   spanning multiple lines */
-```
-
-### Reserved Keywords
-
-```
-fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super
-```
-
-- `extern` is used for external function declarations
-- `as` is used for type casting
-- `import`, `pub`, `unit` are used for the module system
-- `type`, `struct` are used for user-defined types
-- `class`, `extends` for OOP with inheritance
-- `new` for heap allocation of class instances
-- `dispose` for explicit memory deallocation
-- `super` for calling base class methods
-- `static` marks static methods (without `self` parameter)
-- `self` references the current instance in methods
-- `Self` as return type in methods (resolves to struct type)
+- `argc`: Number of arguments (including program name)
+- `argv`: Array of argument strings
 
 ---
 
-## Practical SO Library Examples (v0.1.5)
+## Standard Library Reference
 
-### Memory Management with malloc/free
-
-```lyx
-extern fn malloc(size: int64): pchar;
-extern fn free(ptr: pchar): void;
-
-fn main(): int64 {
-  // Allocate dynamic memory
-  let buffer: pchar := malloc(256);
-  
-  // Use buffer (simplified)
-  PrintStr("Buffer allocated at: ");
-  
-  // Free memory again
-  free(buffer);
-  
-  PrintStr("Memory freed\n");
-  return 0;
-}
-```
-
-### Formatted Output with printf
+### std.math - Mathematics
 
 ```lyx
-extern fn printf(format: pchar, ...): int64;
+import std.math;
 
 fn main(): int64 {
-  var count: int64 := 42;
-  var pi: f64 := 3.14159;
-  var name: pchar := "Lyx";
+  var abs_val: int64 := Abs64(-42);
+  var min_val: int64 := Min64(10, 20);
+  var max_val: int64 := Max64(10, 20);
+  var sqrt_val: int64 := Sqrt64(144);
+  var clamped: int64 := Clamp64(150, 0, 100);  // 100
+  var sign: int64 := Sign64(-5);  // -1
   
-  // Output various data types
-  printf("Language: %s\n", name);
-  printf("Count: %d\n", count);  
-  printf("Pi: %.2f\n", pi);
-  printf("Mixed: %s has %d features!\n", name, count);
+  // Random
+  RandomSeed(42);
+  var rand: int64 := RandomRange(100);
+  
+  // Fixed-point math
+  var interpolated: int64 := Lerp64(0, 100, 500);  // 50 (50%)
+  
+  // Trig (microdegrees)
+  var sin_val: int64 := Sin64(90000000);  // sin(90°) = 1.0
+  var cos_val: int64 := Cos64(0);
+  
+  // Bit operations
+  var is_even: bool := IsEven(42);
+  var popcount: int64 := PopCount(255);  // 8
   
   return 0;
 }
 ```
 
-### String Processing
+**Functions:** Abs64, Min64, Max64, Div64, Mod64, TimesTwo, Sqrt64, Clamp64, Sign64, Pow64, Min3, Max3, InRange64, Lerp64, Map64, Hypot64, Sin64, Cos64, IsEven, IsOdd, NextPowerOfTwo, IsPowerOfTwo, PopCount, Log2, RandomRange, RandomBetween, IntSqrt, Atan2Microdegrees, Cos64Inverse
+
+### std.vector - 2D Vectors
 
 ```lyx
-extern fn strlen(str: pchar): int64;
-extern fn strcat(dest: pchar, src: pchar): pchar;
-extern fn strcpy(dest: pchar, src: pchar): pchar;
+import std.vector;
 
 fn main(): int64 {
-  var greeting: pchar := "Hello";
-  var target: pchar := "World";
+  var v1: Vec2 := Vec2New(10, 20);
+  var v2: Vec2 := Vec2New(5, 15);
   
-  var len1: int64 := strlen(greeting);
-  var len2: int64 := strlen(target);
+  var sum: Vec2 := Vec2Add(v1, v2);
+  var dot: int64 := Vec2Dot(v1, v2);
+  var len: int64 := Vec2Length(v1);
+  var normalized: Vec2 := Vec2Normalize(v1);
   
-  printf("'%s' has %d characters\n", greeting, len1);
-  printf("'%s' has %d characters\n", target, len2);
+  // Rotation (microdegrees)
+  var rotated: Vec2 := Vec2Rotate(v1, 90000000);  // 90°
   
   return 0;
 }
 ```
 
-### Math Library Functions
+**Types:** Vec2
+**Functions:** Vec2New, Vec2Zero, Vec2FromScalar, Vec2Add, Vec2Sub, Vec2Mul, Vec2Div, Vec2Negate, Vec2Dot, Vec2Cross, Vec2LengthSquared, Vec2Length, Vec2DistanceSquared, Vec2Distance, Vec2Normalize, Vec2NormalizeSafe, Vec2Lerp, Vec2Clamp, Vec2Rotate, Vec2Rotate90, Vec2Rotate180, Vec2Rotate270, Vec2Equal, Vec2NotEqual, Vec2IsZero, Vec2Min, Vec2Max, Vec2Abs, Vec2Sign, Vec2Perpendicular, Vec2Project, Vec2Reflect, Vec2AngleTo, Vec2Heading
+
+### std.geo - Geolocation
 
 ```lyx
-extern fn sin(x: f64): f64;
-extern fn cos(x: f64): f64; 
-extern fn sqrt(x: f64): f64;
+import std.geo;
 
 fn main(): int64 {
-  var angle: f64 := 1.5708;  // π/2
-  var number: f64 := 16.0;
+  var lat: int64 := ParseLat("52.520008");
+  var lon: int64 := ParseLon("13.404954");
   
-  printf("sin(%.4f) = %.4f\n", angle, sin(angle));
-  printf("cos(%.4f) = %.4f\n", angle, cos(angle));
-  printf("sqrt(%.1f) = %.4f\n", number, sqrt(number));
+  if (IsValidLat(lat) && IsValidLon(lon)) {
+    var dist: int64 := DistanceM(lat, lon, 48485000, 1130000);
+    PrintInt(dist);  // Distance in meters
+  };
   
   return 0;
 }
 ```
+
+**Functions:** ParseLat, ParseLon, FormatDecimal, IsValidLat, IsValidLon, DistanceM, DistanceKm, MidpointLat, MidpointLon
+
+### std.color - Colors
+
+```lyx
+import std.color;
+
+fn main(): int64 {
+  var c: Color := ColorRGB(255, 128, 0);
+  var blended: Color := ColorBlend(ColorRed(), ColorBlue());
+  var hex: int64 := ColorToHex(c);
+  
+  var gray: Color := ColorGrayscale(c);
+  var bright: Color := ColorBrighten(c, 50);
+  
+  return 0;
+}
+```
+
+**Types:** Color
+**Functions:** ColorNew, ColorRGB, ColorRGBA, ColorGray, ColorEmpty, ColorOpaque, ColorBlack, ColorWhite, ColorRed, ColorGreen, ColorBlue, ColorYellow, ColorCyan, ColorMagenta, ColorOrange, ColorPurple, ColorPink, ColorBrown, ColorGrayLight, ColorGrayDark, ColorIsOpaque, ColorIsTransparent, ColorIsValid, ColorWithAlpha, ColorWithRed, ColorWithGreen, ColorWithBlue, ColorBlend, ColorMultiply, ColorInvert, ColorGrayscale, ColorBrighten, ColorDarken, ColorSaturate, ColorLerp, ColorMix, ColorEqual, ColorNotEqual, ColorDistance, ColorFromHex, ColorToHex, ColorToHexARGB, ColorFromHSL, ColorToHSL
+
+### std.rect - Rectangles
+
+```lyx
+import std.rect;
+
+fn main(): int64 {
+  var r: Rect := RectFromXYWH(10, 20, 100, 50);
+  var w: int64 := RectWidth(r);
+  var h: int64 := RectHeight(r);
+  var area: int64 := RectArea(r);
+  
+  var p: Vec2 := Vec2New(50, 30);
+  var contains: bool := RectContains(r, p);
+  
+  var r2: Rect := RectInflate(r, 10);
+  
+  return 0;
+}
+```
+
+**Types:** Rect
+**Functions:** RectNew, RectFromPoints, RectFromCenterSize, RectEmpty, RectFromXYWH, RectWidth, RectHeight, RectSize, RectCenter, RectArea, RectIsEmpty, RectIsValid, RectContains, RectContainsInclusive, RectInflate, RectDeflate, RectExpand, RectUnion, RectIntersect, RectIntersects, RectClampPoint, RectClamp, RectDistanceToPoint, RectTopLeft, RectTopRight, RectBottomLeft, RectBottomRight, RectCorners, RectLeft, RectRight, RectTop, RectBottom, RectEqual, RectToArray, RectFromArray
+
+### std.list - Collections
+
+```lyx
+import std.list;
+
+fn main(): int64 {
+  // Static list (no heap)
+  var list: StaticList8 := StaticList8New();
+  StaticList8Add(list, 42);
+  var val: int64 := StaticList8Get(list, 0);
+  
+  // Stack (LIFO)
+  var stack: StackInt64 := StackInt64New();
+  StackInt64Push(stack, 10);
+  StackInt64Push(stack, 20);
+  var top: int64 := StackInt64Pop(stack);  // 20
+  
+  // Queue (FIFO)
+  var queue: QueueInt64 := QueueInt64New();
+  QueueInt64Enqueue(queue, 1);
+  QueueInt64Enqueue(queue, 2);
+  var first: int64 := QueueInt64Dequeue(queue);  // 1
+  
+  // Ring buffer for GPS tracking
+  var rb: RingBufferVec2 := RingBufferVec2New();
+  
+  return 0;
+}
+```
+
+**Types:** StaticList8, StaticList16, Vec2List, RingBufferVec2, StackInt64, QueueInt64
+**Functions:** ListInt64New, ListInt64WithCapacity, ListInt64Add, ListInt64Get, ListInt64Set, ListInt64Len, ListInt64Clear, ListInt64IsEmpty, StaticList8New, StaticList8Add, StaticList8Get, StaticList8Set, StaticList8Len, StaticList8Clear, StaticList8IsEmpty, Vec2ListNew, Vec2ListAdd, Vec2ListGet, Vec2ListSet, Vec2ListLen, Vec2ListClear, Vec2ListIsEmpty, Vec2ListLast, Vec2ListFirst, Vec2ListPushBack, Vec2ListPopBack, RingBufferVec2New, RingBufferVec2WithCapacity, RingBufferVec2Push, RingBufferVec2Pop, RingBufferVec2Peek, RingBufferVec2PeekLast, RingBufferVec2Len, RingBufferVec2IsEmpty, RingBufferVec2IsFull, RingBufferVec2Clear, StackInt64New, StackInt64Push, StackInt64Pop, StackInt64Peek, StackInt64IsEmpty, StackInt64IsFull, QueueInt64New, QueueInt64Enqueue, QueueInt64Dequeue, QueueInt64Peek, QueueInt64IsEmpty, QueueInt64IsFull
+
+---
 
 ## Complete Examples
 
-### FizzBuzz with Math Builtins
+### FizzBuzz
 
 ```lyx
-import std.string;
-
 con MAX: int64 := 15;
 
 fn main(): int64 {
@@ -1131,9 +1140,7 @@ fn main(): int64 {
         if (div5) {
           PrintStr("Buzz\n");
         } else {
-          // Native string conversion
-          var str: pchar := IntToStr(i);
-          PrintStr(str);
+          PrintStr(IntToStr(i));
           PrintStr("\n");
         }
       }
@@ -1144,9 +1151,10 @@ fn main(): int64 {
 }
 ```
 
-### Combined String and Math Operations
+### Using Standard Library
 
 ```lyx
+import std.math;
 import std.string;
 
 fn analyze_number(x: int64): void {
@@ -1154,39 +1162,29 @@ fn analyze_number(x: int64): void {
   PrintInt(x);
   PrintStr("\n");
   
-  // Native Math Builtins
   PrintStr("Absolute: ");
-  PrintInt(abs(x));
+  PrintInt(Abs64(x));
   PrintStr("\n");
   
-  if (odd(x)) {
+  if (IsOdd(x)) {
     PrintStr("Number is odd\n");
   } else {
     PrintStr("Number is even\n");  
   }
   
-  // String conversion and manipulation
-  var str_val: pchar := IntToStr(abs(x));
+  var str_val: pchar := IntToStr(Abs64(x));
   var len: int64 := StrLength(str_val);
   
-  PrintStr("String representation: '");
+  PrintStr("String: '");
   PrintStr(str_val);
   PrintStr("' (length: ");
   PrintInt(len);
   PrintStr(")\n");
-  
-  // Float casting and math
-  var float_val: f64 := (abs(x) as f64);
-  var sqrt_val: f64 := sqrt(float_val);
-  PrintStr("Square root: ");
-  PrintFloat(sqrt_val);
-  PrintStr("\n\n");
 }
 
 fn main(): int64 {
   analyze_number(-42);
   analyze_number(16);
-  analyze_number(123);
   return 0;
 }
 ```
@@ -1198,7 +1196,7 @@ fn main(): int64 {
 ### Prerequisites
 
 - **FreePascal Compiler** (FPC 3.2.2+)
-- **Linux x86_64** (host platform)
+- **Linux x86_64** (host platform) or cross-compiler for other targets
 - GNU Make
 
 ### Build Compiler
@@ -1224,10 +1222,52 @@ echo $?             # Check exit code
 ### Tests
 
 ```bash
-make test           # All unit tests (FPCUnit) - 15 suites, all pass
+make test           # All unit tests (FPCUnit)
 make e2e            # End-to-end smoke tests
-./tests/test_pe64  # PE64 writer tests
 ```
+
+---
+
+## Compiler Diagnostics & Error Handling
+
+The Lyx compiler provides comprehensive error reporting:
+
+- **SourceSpan**: Every token carries file, line, and column information
+- **Parse Errors**: Clear error messages with location
+- **Type Errors**: Semantic analysis errors with context
+- **Runtime Errors**: `panic()` and `assert()` for runtime validation
+
+### Integrated Linter
+
+Lyx includes a built-in linter as a separate compiler phase (after semantic analysis, before IR lowering):
+
+```bash
+# Run linter on file
+./lyxc program.lyx --lint
+
+# Lint only (don't compile)
+./lyxc program.lyx --lint-only
+
+# Disable linter
+./lyxc program.lyx --no-lint
+```
+
+**Linter Rules (10 rules):**
+
+| Rule | Code | Description |
+|------|------|-------------|
+| Unused Variable | W001 | Variable declared but never read |
+| Unused Parameter | W002 | Function parameter never read |
+| Variable Naming | W003 | Variables should use camelCase |
+| Function Naming | W004 | Functions should use PascalCase |
+| Constant Naming | W005 | Constants should use PascalCase or UPPER_CASE |
+| Unreachable Code | W006 | Code after return statement |
+| Empty Block | W007 | Empty blocks `{ }` |
+| Shadowed Variable | W008 | Variable shadows outer variable |
+| Mutable Never Mutated | W009 | `var` never assigned (should be `let`) |
+| Empty Function | W010 | Reserved for future use |
+
+For IDE integration, see `doc/HIGHLIGHTING.md`.
 
 ---
 
@@ -1244,9 +1284,15 @@ Source code (.lyx)
       |
   [ IR Lowering ]   AST -> 3-Address-Code IR
       |
+  [ Inlining ]      IR-Level Inlining Optimization (v0.4.3)
+      |
+  [ Peephole ]     Peephole Optimization (v0.5.0)
+      |
   [ Backend ]       IR -> Machine code (Bytes)
       |
       +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
+      |
+      +-- [ ARM64:   arm64_emit + elf64_arm64_writer ] -> ELF64 Binary
       |
       +-- [ Windows: x86_64_win64 + pe64_writer ]  -> PE32+ Binary
       |
@@ -1265,13 +1311,17 @@ frontend/
 ir/
   ir.pas                    IR node types (3-Address-Code)
   lower_ast_to_ir.pas       AST -> IR transformation
+  ir_inlining.pas           IR-Level Inlining (v0.4.3)
 backend/
   backend_types.pas         Shared types (External Symbols, Patches)
   x86_64/
     x86_64_emit.pas         x86_64 instruction encoding (Linux/SysV)
     x86_64_win64.pas        Windows x64 emitter (Shadow Space, IAT)
+  arm64/
+    arm64_emit.pas          ARM64 instruction encoding
   elf/
     elf64_writer.pas        ELF64 binary writer
+    elf64_arm64_writer.pas  ARM64 ELF writer
   pe/
     pe64_writer.pas         PE32+ binary writer (DOS/COFF/Optional Header)
 util/
@@ -1280,29 +1330,21 @@ util/
 tests/                      FPCUnit tests
   lyx/                      Lyx test programs (thematic)
 examples/                   Curated showcase programs
+std/                        Standard library
 ```
 
 ### Design Principles
 
 - **Frontend/Backend Separation**: No x86 code in frontend, no AST nodes in backend.
 - **IR as Stability Anchor**: Pipeline is always AST -> IR -> machine code.
-- **Platform Abstraction**: Same IR input for Linux and Windows backends.
+- **Platform Abstraction**: Same IR input for Linux, ARM64, and Windows backends.
 - **ELF64 without libc**: `_start` calls `main()`, then `sys_exit`. No linking against external libraries.
 - **PE32+ with IAT**: Import Address Table for kernel32.dll functions (GetStdHandle, WriteFile, ExitProcess).
+- **ARM64 Support**: Native ARM64 binaries using AAPCS64 calling convention.
 - **Builtins embedded**: `PrintStr`, `PrintInt`, `PrintFloat`, `strlen` and `exit` are embedded as runtime snippets directly into the binary.
 - **Every token carries SourceSpan**: Error messages always include file, line, and column.
 
 ---
-
-## Editor Highlighting & Grammar
-
-- An initial TextMate/VSCode grammar is in the repo at `syntaxes/lyx.tmLanguage.json`. It covers keywords, types, literals, comments, and basic constructs and is iteratively refined.
-- Short-term, a pragmatic mapping via `.gitattributes` is used so GitHub highlighting is immediately visible: `*.lyx linguist-language=Rust` (fallback).
-- Goal: Contribution to the GitHub Linguist library with a final TextMate grammar so `.lyx` files are natively highlighted on GitHub.
-
-Note for local testing (VSCode)
-- Open the repo in VSCode and use "Extension Development Host" to load `syntaxes/aurum.tmLanguage.json`.
-- With "Developer: Inspect TM Scopes" you can check token scopes.
 
 ## Grammar (EBNF)
 
@@ -1311,29 +1353,16 @@ The complete formal grammar is in [`ebnf.md`](ebnf.md).
 ```ebnf
 Program     := { TopDecl } ;
 TopDecl     := FuncDecl | ConDecl | TypeDecl ;
-TypeDecl    := 'type' Ident ':=' ( StructType | Type ) ';' ;
+TypeDecl    := 'type' Ident ':=' ( StructType | ClassType | Type ) ';' ;
 StructType  := 'struct' '{' { FieldDecl } '}' ;
+ClassType   := 'class' [ 'extends' Ident ] '{' { ClassMember } '}' ;
 FieldDecl   := Ident ':' Type ';' ;
 ConDecl     := 'con' Ident ':' Type ':=' ConstExpr ';' ;
 FuncDecl    := 'fn' Ident '(' [ ParamList ] ')' [ ':' RetType ] Block ;
 Block       := '{' { Stmt } '}' ;
 Stmt        := VarDecl | LetDecl | CoDecl | AssignStmt
-             | IfStmt | WhileStmt | ReturnStmt | ExprStmt | Block ;
-Expr        := OrExpr ;
-OrExpr      := AndExpr { '||' AndExpr } ;
-AndExpr     := CmpExpr { '&&' CmpExpr } ;
-CmpExpr     := AddExpr [ CmpOp AddExpr ] ;
-AddExpr     := MulExpr { ( '+' | '-' ) MulExpr} ;
-MulExpr     := UnaryExpr { ( '*' | '/' | '%' ) UnaryExpr } ;
-UnaryExpr   := ( '!' | '-' ) UnaryExpr | Primary ;
-Primary     := IntLit | FloatLit | BoolLit | StringLit | ArrayLit | StructLit
-             | Ident | Call | IndexAccess | FieldAccess | '(' Expr ')' ;
-ArrayLit    := '[' [ Expr { ',' Expr } ] ']' ;
-StructLit   := Ident '{' [ FieldInit { ',' FieldInit } ] '}' ;
-FieldInit   := Ident ':' Expr ;
-FieldAccess := Primary '.' Ident ;
-IndexAccess := Primary '[' Expr ']' ;
-FloatLit    := [0-9]+ '.' [0-9]+ ;
+             | IfStmt | WhileStmt | ForStmt | SwitchStmt
+             | ReturnStmt | ExprStmt | AssertStmt | PanicStmt ;
 ```
 
 ---
@@ -1346,20 +1375,23 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.0.2** | Integer expressions, `PrintInt(expr)` |
 | **v0.1.2** | `var`, `let`, `co`, `con`, `if`, `while`, `return`, functions, SysV ABI |
 | **v0.1.3** | ✅ Float literals (`f32`, `f64`), ✅ Arrays (literals, indexing, assignment) |
-| **v0.1.4** | ✅ SO-Library Integration, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs, ✅ Module System |
-| **v0.1.5** | ✅ String-Library (20+ functions), ✅ Math-Builtins (22 functions), ✅ Type-Casting (`as`), ✅ String conversion |
-| **v0.1.6** | ✅ Struct literals (`Point { x: 10, y: 20 }`), ✅ Instance methods with `self`, ✅ Static methods (`static fn`), ✅ `Self` type, ✅ Field assignment (`p.x := value`), ✅ Index assignment (`arr[i] := value`) |
-| **v0.1.7** | ✅ OOP: Classes with inheritance (`class extends`), ✅ `new`/`dispose` for heap objects, ✅ Constructors with arguments, ✅ Destructors, ✅ `super` for base class calls, ✅ Global variables (`var`/`let` at top-level), ✅ `Random()`/`RandomSeed()` builtins, ✅ Pipe operator (`|>`) for function chaining, ✅ Increment/Decrement (`++`/`--`) as statements |
-| **v0.1.8** | ✅ Windows x64 Backend: PE32+ binary generation, ✅ Cross-Compilation (`--target=win64`), ✅ Windows x64 Calling Convention (Shadow Space), ✅ IAT/Import Directory for kernel32.dll |
-| **v0.2.0** | ✅ **Unified Call Path** (internal/imported/extern), ✅ Cross-Unit Function Resolution, ✅ PLT-Stub generation for external calls, ✅ ELF Dynamic Linking Fixes (DT_NEEDED, DT_PLTREL), ✅ CLI Flags (`--emit-asm`, `--dump-relocs`), ✅ Extended ABI test catalog |
-| **v0.2.1** | ✅ **Dynamic Arrays** (heap-allocated, fat-pointer, `push`/`pop`/`len`/`free` builtins, literal initialization, bounds checks, return statements) |
-| **v0.2.2** | ✅ **SIMD / ParallelArray**: `parallel Array<T>(size)`, element-wise operations (`+`,`-`,`*`,`/`), scalar index access, complete IR lowering |
-| **v0.3.0** | std.io: fd-based I/O (open/read/write/close syscalls) |
-| **v0.3.1** | std.fs: stat, mkdir, unlink, rename |
-| **v0.3.2** | Directories: getdents64, DirIter |
-| **v0.4.0** | std/math: Fixed-Point math (Sqrt64, Clamp64, Lerp64, Map64, Sin64, Cos64, Hypot64) |
-| **v0.4.1** | std/geo: GeoPoint type, DistanceM, BoundingBox, DMS parsing, Navigation |
-| **v1.0.0** | Stable systems language: Modules stable, SysV ABI stable, std.io/fs, Diagnostics |
+| **v0.1.4** | ✅ Module System, ✅ Dynamic ELF, ✅ PLT/GOT, ✅ Extern Functions, ✅ Varargs |
+| **v0.1.5** | ✅ String-Library, ✅ Math-Builtins, ✅ Type-Casting (`as`) |
+| **v0.1.6** | ✅ Struct literals, ✅ Instance methods with `self`, ✅ Static methods, ✅ Field assignment |
+| **v0.1.7** | ✅ OOP: Classes with inheritance, ✅ `new`/`dispose`, ✅ Global variables, ✅ Random builtins |
+| **v0.1.8** | ✅ Windows x64 Backend: PE32+ binary generation, ✅ Cross-Compilation |
+| **v0.2.0** | ✅ Unified Call Path, ✅ Cross-Unit Function Resolution, ✅ CLI Flags |
+| **v0.2.1** | ✅ Dynamic Arrays (heap-allocated, push/pop/len/free) |
+| **v0.2.2** | ✅ SIMD / ParallelArray |
+| **v0.3.0** | ✅ std.io: fd-based I/O via syscalls |
+| **v0.3.1** | ✅ std.fs: stat, mkdir, unlink, rename |
+| **v0.3.2** | ✅ Directories: getdents64, panic/assert |
+| **v0.4.0** | ✅ Nullable Types (pchar?), ✅ CLI Arguments |
+| **v0.4.1** | ✅ Access Control (pub/private/protected) |
+| **v0.4.2** | ✅ Regex Literals, ✅ Namespaces, ✅ Panic & Assert |
+| **v0.4.3** | ✅ IR-Level Inlining, ✅ PascalCase Naming Conventions, ✅ Integrated Linter |
+| **v0.5.0** | ✅ **Peephole Optimizer**: Constant folding, identity ops, redundant moves, compare-with-zero simplification |
+| **v1.0.0** | Stable systems language |
 
 ---
 
