@@ -410,6 +410,15 @@ Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
 
 ### Cryptographic (Simplified)
 - `HashSHA256(data: pchar): int64` - SHA-256 (vereinfacht)
+- `HashSHA3_224(data: pchar): int64` - SHA-3-224
+- `HashSHA3_256(data: pchar): int64` - SHA-3-256
+- `HashSHA3_512(data: pchar): int64` - SHA-3-512
+- `HashSHA3_256Hex(data: pchar): pchar` - SHA-3-256 als Hex
+- `HashKeccak(data: pchar): int64` - Raw Keccak-1600
+- `HashSHAKE128(data: pchar, output_bits: int64): int64` - SHAKE128 XOF
+- `HashSHAKE256(data: pchar, output_bits: int64): int64` - SHAKE256 XOF
+- `HashBLAKE3(data: pchar): int64` - BLAKE3 (schnell)
+- `HashBLAKE3Hex(data: pchar): pchar` - BLAKE3 als Hex
 - `HashMD5String(data: pchar): array[4]int64` - MD5 (128-bit als Array)
 - `HashMD5StringHex(data: pchar): pchar` - MD5 als Hex-String
 - `HashMD5Bytes(data: array[256]int64, len: int64): array[4]int64` - MD5 für Byte-Array
