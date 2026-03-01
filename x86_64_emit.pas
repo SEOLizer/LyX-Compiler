@@ -18,6 +18,9 @@ type
     JmpSize: Integer; // 5 for rel8, 6 for rel32 (jcc rel32)
   end;
 
+  { Kategorie für Energy-Tracking }
+  TEnergyOpKind = (eokALU, eokFPU, eokMemory, eokBranch, eokSyscall);
+
   TX86_64Emitter = class
   private
     FCode: TByteBuffer;
@@ -35,8 +38,8 @@ type
     FEnergyContext: TEnergyContext;
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
-    FRegisterPressure: Integer;
     FCurrentFunctionEnergy: UInt64;
+    procedure TrackEnergy(kind: TEnergyOpKind);
   public
     constructor Create;
     destructor Destroy; override;
@@ -452,13 +455,51 @@ begin
   FEnergyContext.Config := GetEnergyConfig;
   FEnergyContext.CurrentCPU := FCurrentCPU;
   FMemoryAccessCount := 0;
-  FRegisterPressure := 0;
   FCurrentFunctionEnergy := 0;
+  FillChar(FEnergyStats, SizeOf(FEnergyStats), 0);
+  FEnergyStats.DetailedBreakdown := nil;
 end;
 
 destructor TX86_64Emitter.Destroy;
 begin
   FCode.Free; FData.Free; inherited Destroy;
+end;
+
+procedure TX86_64Emitter.TrackEnergy(kind: TEnergyOpKind);
+var
+  cost: UInt64;
+begin
+  case kind of
+    eokALU:
+    begin
+      Inc(FEnergyStats.TotalALUOps);
+      cost := FCurrentCPU.InstructionCosts.ALU_OPS[0];
+    end;
+    eokFPU:
+    begin
+      Inc(FEnergyStats.TotalFPUOps);
+      cost := FCurrentCPU.InstructionCosts.FPU_OPS[0];
+    end;
+    eokMemory:
+    begin
+      Inc(FEnergyStats.TotalMemoryAccesses);
+      Inc(FMemoryAccessCount);
+      cost := FCurrentCPU.InstructionCosts.MEMORY_OPS[0];
+    end;
+    eokBranch:
+    begin
+      Inc(FEnergyStats.TotalBranches);
+      cost := FCurrentCPU.InstructionCosts.BRANCH_OPS[0];
+    end;
+    eokSyscall:
+    begin
+      Inc(FEnergyStats.TotalSyscalls);
+      cost := FCurrentCPU.InstructionCosts.SYS_CALL_COST;
+    end;
+    else
+      cost := 0;
+  end;
+  FCurrentFunctionEnergy := FCurrentFunctionEnergy + cost;
 end;
 
 function TX86_64Emitter.GetCodeBuffer: TByteBuffer; begin Result := FCode; end;
@@ -736,6 +777,43 @@ begin
     for j := 0 to High(module.Functions[i].Instructions) do
     begin
       instr := module.Functions[i].Instructions[j];
+
+      // Energy-Tracking: Kategorie pro IR-Instruktion zählen
+      case instr.Op of
+        irAdd, irSub, irMul, irDiv, irMod, irNeg, irNot, irAnd, irOr,
+        irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
+        irSExt, irZExt, irTrunc:
+          TrackEnergy(eokALU);
+        irFAdd, irFSub, irFMul, irFDiv, irFNeg,
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
+        irFToI, irIToF:
+          TrackEnergy(eokFPU);
+        irLoadLocal, irStoreLocal, irLoadGlobal, irStoreGlobal,
+        irLoadGlobalAddr, irLoadLocalAddr, irLoadStructAddr,
+        irStackAlloc, irStoreElem, irLoadElem, irStoreElemDyn,
+        irLoadField, irStoreField, irLoadFieldHeap, irStoreFieldHeap,
+        irAlloc, irFree,
+        irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
+          TrackEnergy(eokMemory);
+        irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
+        irReturn, irReturnStruct:
+          TrackEnergy(eokBranch);
+        irCallBuiltin:
+          if (instr.ImmStr = 'exit') or (instr.ImmStr = 'PrintStr') or
+             (instr.ImmStr = 'PrintInt') or (instr.ImmStr = 'open') or
+             (instr.ImmStr = 'read') or (instr.ImmStr = 'write') or
+             (instr.ImmStr = 'lseek') or (instr.ImmStr = 'unlink') or
+             (instr.ImmStr = 'rename') or (instr.ImmStr = 'mkdir') or
+             (instr.ImmStr = 'rmdir') or (instr.ImmStr = 'chmod') or
+             (instr.ImmStr = 'now_unix') or (instr.ImmStr = 'now_unix_ms') or
+             (instr.ImmStr = 'sleep_ms') then
+            TrackEnergy(eokSyscall)
+          else
+            TrackEnergy(eokALU);
+        irPanic:
+          TrackEnergy(eokSyscall);
+      end;
+
       case instr.Op of
         irConstStr:
           begin
