@@ -1084,6 +1084,47 @@ Bei der Nutzung von `DistanceMCorrected` in `std/geo` wird die Längengrad-Dista
 d ≈ √((x₂ - x₁)² · cos(lat)² + (y₂ - y₁)²)
 ```
 
+### 4. Speicher-Management Guide (Ownership)
+Die meisten String-Funktionen in `std/string` **erwarten einen vorallozierten Destination-Buffer** (`dest`), um versteckte Heap-Allokationen zu vermeiden:
+
+```lyx
+import std.string;
+
+var dest: pchar := "                                                                                ";
+StrCopy(dest, source);  // User stellt Buffer bereit
+```
+
+**Regeln:**
+- **Destination-Buffer selbst bereitstellen** - Nie davon ausgehen, dass Funktionen Speicher allozieren
+- **Buffergröße validieren** - Vor Kopieroperationen mit `StrLength()` prüfen
+- **Bei Unsicherheit** - `std/alloc` für explizite Allokation nutzen
+
+### 5. Visuelle Unterstützung (Koordinatensystem)
+Lyx nutzt ein **Screen-Koordinatensystem** (Y zeigt nach unten):
+
+```
+std/vector (Vec2):
+┌─────────────────────┐
+│ (0,0)        (w,0) │
+│                     │
+│                     │
+│ (0,h)        (w,h) │
+└─────────────────────┘
+```
+
+**Wichtig:** Bei geo-Berechnungen wird **mathematisch** gerechnet (Y zeigt nach oben), bei UI-Grafiken **screen-basiert** (Y zeigt nach unten).
+
+### 6. The Lyx Way (Best Practices)
+
+> **Tipp:** Vermeide nach Möglichkeit `f64` für kritische Berechnungen. Nutze die `std/math` Fixed-Point-Funktionen für maximale Performance und deterministische Ergebnisse auf allen Zielsystemen.
+
+**Best Practices:**
+1. **int64 bevorzugen** - Für Koordinaten, Winkel, Geldbeträge
+2. **Microdegrees nutzen** - `1° = 1.000.000 µ°` für Geodaten
+3. **Pool-Allocator** - Bei vielen gleichartigen Objekten
+4. **Result-Typen** - Bei Funktionen die fehlschlagen können
+5. **Buffer selbst bereitstellen** - Keine versteckten Allokationen
+
 ---
 
 *Hinweis: Zusätzlich stehen 22 native Math-Builtins zur Verfügung (siehe Haupt-README).*
