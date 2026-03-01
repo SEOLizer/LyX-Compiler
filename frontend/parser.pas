@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, lexer, ast;
+  diag, lexer, ast, backend_types;
 
 type
   TParser = class
@@ -58,6 +58,7 @@ type
     function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
     function ParseType: TAurumType;
     function ParseParamList: TAstParamList;
+    function ParseEnergyAttr: TEnergyLevel; // Energy-Aware-Compiling Attribut parsen
   public
     constructor Create(lexer: TLexer; diag: TDiagnostics);
     destructor Destroy; override;
@@ -243,6 +244,13 @@ begin
   end;
   if Check(tkFn) then
     Exit(ParseFuncDecl(False));
+  // @energy(level) Attribut vor Funktion
+  if Check(tkAt) then
+  begin
+    // Peek next token to see if it's @energy followed by fn
+    // For now, just try parsing as function (ParseFuncDecl handles @energy)
+    Exit(ParseFuncDecl(False));
+  end;
   if Check(tkCon) then
     Exit(ParseConDecl(False));
   if Check(tkType) then
@@ -263,7 +271,11 @@ var
   retTypeName: string;
   body: TAstBlock;
   arrLen: Integer;
+  energyLevel: TEnergyLevel;
 begin
+  // @energy(level) Attribut parsen, falls vorhanden
+  energyLevel := ParseEnergyAttr;
+  
   // fn
   Expect(tkFn);
   if Check(tkIdent) then
@@ -297,6 +309,7 @@ begin
   body := ParseBlock;
   Result := TAstFuncDecl.Create(name, params, retType, body, FCurTok.Span, isPub);
   Result.ReturnTypeName := retTypeName;
+  Result.EnergyLevel := energyLevel;
 end;
 
 function TParser.ParseConDecl(isPub: Boolean): TAstConDecl;
@@ -1765,7 +1778,49 @@ begin
     params[High(params)] := p;
     if Accept(tkComma) then Continue else Break;
   end;
-  Result := params;
-end;
-
+    Result := params;
+  end;
 end.
+
+{ Parst @energy(level) Attribut, falls vorhanden }
+function TParser.ParseEnergyAttr: TEnergyLevel;
+var
+  level: Integer;
+begin
+  Result := eelNone; // Standard: verwende globales Level
+  if not Check(tkAt) then
+    Exit;
+  
+  // @energy
+  Advance;
+  if not Check(tkIdent) or (FCurTok.Value <> 'energy') then
+  begin
+    FDiag.Error('expected @energy attribute', FCurTok.Span);
+    Exit;
+  end;
+  Advance;
+  
+  // (level)
+  Expect(tkLParen);
+  if Check(tkIntLit) then
+  begin
+    try
+      level := StrToInt(FCurTok.Value);
+      if (level < 1) or (level > 5) then
+      begin
+        FDiag.Error('energy level must be between 1 and 5', FCurTok.Span);
+        level := 3;
+      end;
+      Result := TEnergyLevel(level);
+    except
+      FDiag.Error('invalid energy level', FCurTok.Span);
+      Result := eelMedium;
+    end;
+    Advance;
+  end
+  else
+  begin
+    FDiag.Error('expected energy level (1-5)', FCurTok.Span);
+  end;
+  Expect(tkRParen);
+end;
