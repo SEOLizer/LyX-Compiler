@@ -31,6 +31,9 @@ type
     tkEq, tkNeq,
     tkLt, tkLe, tkGt, tkGe,
     tkAnd, tkOr, tkNot, tkNor, tkXor,
+    // Bitwise Operatoren
+    tkBitAnd, tkBitOr, tkBitXor, tkBitNot,
+    tkShiftLeft, tkShiftRight,
     // Trennzeichen
     tkLParen, tkRParen, tkLBrace, tkRBrace,
     tkLBracket, tkRBracket,
@@ -726,20 +729,15 @@ begin
         Result := MakeToken(tkSingleEq, '=', startLine, startCol, 1);
     end;
 
-    '!': begin
-      Advance;
-      if (not IsAtEnd) and (CurrentChar = '=') then
-      begin
-        Advance;
-        Result := MakeToken(tkNeq, '!=', startLine, startCol, 2);
-      end
-      else
-        Result := MakeToken(tkNot, '!', startLine, startCol, 1);
-    end;
-
     '<': begin
       Advance;
-      if (not IsAtEnd) and (CurrentChar = '=') then
+      if (not IsAtEnd) and (CurrentChar = '<') then
+      begin
+        // Shift Left
+        Advance;
+        Result := MakeToken(tkShiftLeft, '<<', startLine, startCol, 2);
+      end
+      else if (not IsAtEnd) and (CurrentChar = '=') then
       begin
         Advance;
         Result := MakeToken(tkLe, '<=', startLine, startCol, 2);
@@ -750,7 +748,13 @@ begin
 
     '>': begin
       Advance;
-      if (not IsAtEnd) and (CurrentChar = '=') then
+      if (not IsAtEnd) and (CurrentChar = '>') then
+      begin
+        // Shift Right
+        Advance;
+        Result := MakeToken(tkShiftRight, '>>', startLine, startCol, 2);
+      end
+      else if (not IsAtEnd) and (CurrentChar = '=') then
       begin
         Advance;
         Result := MakeToken(tkGe, '>=', startLine, startCol, 2);
@@ -768,10 +772,21 @@ begin
       end
       else
       begin
-        FDiag.Error('unexpected ''&'', did you mean ''&&''?',
-          MakeSpan(startLine, startCol, 1, FFileName));
-        Result := MakeToken(tkError, '&', startLine, startCol, 1);
+        // Bitwise AND
+        Result := MakeToken(tkBitAnd, '&', startLine, startCol, 1);
       end;
+    end;
+
+    '^': begin
+      // Bitwise XOR
+      Advance;
+      Result := MakeToken(tkBitXor, '^', startLine, startCol, 1);
+    end;
+
+    '~': begin
+      // Bitwise NOT
+      Advance;
+      Result := MakeToken(tkBitNot, '~', startLine, startCol, 1);
     end;
 
     '|': begin
@@ -793,30 +808,9 @@ begin
       end
       else
       begin
-        FDiag.Error('unexpected ''|'', did you mean ''||'', ''|~'' or ''|>''?',
-          MakeSpan(startLine, startCol, 1, FFileName));
-        Result := MakeToken(tkError, '|', startLine, startCol, 1);
+        // Bitwise OR
+        Result := MakeToken(tkBitOr, '|', startLine, startCol, 1);
       end;
-    end;
-
-    '~': begin
-      Advance;
-      if (not IsAtEnd) and (CurrentChar = '|') then
-      begin
-        Advance;
-        Result := MakeToken(tkNor, '~|', startLine, startCol, 2);
-      end
-      else
-      begin
-        FDiag.Error('unexpected ''~'', did you mean ''~|''?',
-          MakeSpan(startLine, startCol, 1, FFileName));
-        Result := MakeToken(tkError, '~', startLine, startCol, 1);
-      end;
-    end;
-
-    '^': begin
-      Advance;
-      Result := MakeToken(tkXor, '^', startLine, startCol, 1);
     end;
 
   else

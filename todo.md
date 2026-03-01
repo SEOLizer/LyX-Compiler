@@ -9,6 +9,7 @@
 | **ARM64 Linux** | ⚠️ Teilweise | Statisch vollständig, Dynamic Linking: Emitter ✅, Writer 🔲 |
 | **ARM64 Windows** | ❌ Fehlt | Kein PE64 ARM64 Writer |
 | **macOS** | ❌ Fehlt | Kein Mach-O Writer |
+| **Energy-Aware** | ⚠️ Teilweise | Architektur bereinigt ✅, x86_64-Tracking ⚠️ (Stats noch 0), ARM64 minimal ✅, Tests ❌ |
 
 ---
 
@@ -103,7 +104,111 @@
 
 ---
 
-### Priorität 4: Cross-Compilation Tests
+### Priorität 4: Energy-Aware-Compiling vervollständigen
+
+**Beschreibung**: Energy-Aware-Compiling ist begonnen, aber nicht durchgängig integriert. Ziel ist es, dem Compiler zu ermöglichen, energieeffizienten Maschinencode zu erzeugen — gesteuert über `--target-energy=<1-5>` und optional über Sprach-Pragmas.
+
+#### Aktueller Stand
+
+| Komponente | Status | Details |
+|------------|--------|---------|
+| **Basis-Typen** (`backend_types.pas`) | ✅ | Nur Enums: `TEnergyLevel`, `TCPUFamily` (bereinigt) |
+| **CPU-Energiemodell** (`energy_model.pas`) | ✅ | Single Source of Truth — 3 CPU-Profile, alle Typen und Config-Funktionen |
+| **x86_64-Backend** (`x86_64_emit.pas`) | ✅ | Energy-Felder, `GetEnergyStats`, `SetEnergyLevel`, Tracking aktiv |
+| **CLI-Flag** (`lyxc.lpr`) | ✅ | `--target-energy=<1-5>`, zentrale `PrintEnergyStats`-Ausgabe |
+| **ARM64-Backend** (`arm64_emit.pas`) | ✅ | Vollständiges Energy-Tracking: Felder, Methoden, IR-Mapping |
+| **IR-Ebene** (`ir.pas`) | ✅ | `EnergyCostHint` Feld, `GetIROpEnergyCost()`, `SetEnergyCostHint()` |
+| **Lowering** (`lower_ast_to_ir.pas`) | ✅ | Energy-Kosten werden beim IR-Emit automatisch annotiert |
+| **Sprach-Level** | ✅ | `@energy(level)` Pragma vor fn-Deklarationen |
+| **Win64-Backend** | ❌ | Kein Energy-Support |
+| **SPEC.md** | ✅ | Dokumentiert (Kapitel "Energy-Aware-Compiling") |
+| **ebnf.md** | ✅ | EnergyAttr Produktionsregel dokumentiert |
+| **Tests** | ✅ | test_energy_tracking.lyx, test_energy_attr.lyx |
+
+#### Verbleibende optionale Optimierungen
+
+- **Energy-basierte Instruction Selection**: Energy-Level beeinflusst noch nicht die Codegenerierung
+- **Win64-Backend**: Kein Energy-Support
+- **ARM64-CPU-Modelle**: Nur cfX86_64 und cfARM64 (keine Cortex-A Profile)
+
+#### Bekannte verbleibende Probleme
+
+- **Keine echten Optimierungen**: Energy-Level beeinflusst noch nicht die Instruction Selection
+- **Win64-Backend**: Kein Energy-Support implementiert
+
+#### Erledigte Architektur-Bereinigung (Phase 1 ✅)
+
+- [x] Duplizierte Typen konsolidiert — `energy_model.pas` ist Single Source of Truth
+- [x] `backend_types.pas` enthält nur noch Enums (`TEnergyLevel`, `TCPUFamily`) + Dynamic-Linking-Typen
+- [x] Globale Variable `CurrentEnergyConfig` nur noch in `energy_model.pas`
+- [x] `SetEnergyLevel` / `GetEnergyConfig` / `ResetEnergyConfig` nur noch in `energy_model.pas`
+- [x] `x86_64_emit.pas` und `arm64_emit.pas` importieren `energy_model` und nutzen zentrale Typen
+- [x] `lyxc.lpr`: kaputte Kontrollstruktur repariert, 5× duplizierte Stats-Ausgabe durch `PrintEnergyStats` ersetzt
+- [x] Bugs behoben: Tippfehler, Array-Größen, Record-Feld-Reihenfolge, ALU-Kostenberechnung
+- [x] Kompiliert sauber mit `-Ci -Cr -Co`, Smoke-Test bestanden
+
+#### Aufgaben
+
+**Phase 2: x86_64-Backend durchgängig integrieren** (Schätzung: 2-3 Tage) ✅
+- [x] `TrackEnergy()` an jeder relevanten Stelle in `EmitFromIR` aufrufen (ALU-Ops, Memory-Ops, Branch-Ops, Syscalls)
+- [x] `GetEnergyStats()` liefert korrekte Werte (ALU, FPU, Memory, Branch, Syscall-Zähler)
+- [ ] `ApplyEnergyOptimizationsForLevel()` mit echten Optimierungen füllen:
+  - `eelMinimal`/`eelLow`: Register-Allokation bevorzugen, unnötige Loads/Stores eliminieren
+  - `eelMedium`: SSE statt x87 FPU wo sinnvoll
+  - `eelHigh`/`eelExtreme`: Instruction Selection (z.B. `LEA` statt `ADD+MUL`, `XOR reg,reg` statt `MOV reg,0`)
+- [ ] `SelectEnergyEfficientInstruction()` in Instruction-Selection-Pfade einbauen
+- [x] Verifizieren: `GetEnergyStats()` nach Kompilation liefert korrekte Werte ✅ (test_inc_dec.lyx: ALU=2, Memory=7, Branch=7, Syscalls=9)
+
+**Phase 3: ARM64-Backend Energy-Support** (Schätzung: 2 Tage) ✅
+- [x] `GetEnergyStats()` implementiert (CodeSize + L1-Footprint)
+- [x] Vollständige Energy-Felder analog zu x86_64 (`FEnergyContext`, `FCurrentCPU`, Tracking-Zähler)
+- [x] `TrackEnergy()` im ARM64-Codegen aufrufen
+- [x] `SetEnergyLevel(level)` Methode hinzugefügt
+
+**Phase 3: ARM64-Backend Energy-Support** (Schätzung: 2 Tage)
+- [x] `GetEnergyStats()` implementiert (CodeSize + L1-Footprint)
+- [ ] Vollständige Energy-Felder analog zu x86_64 (`FEnergyContext`, `FCurrentCPU`, Tracking-Zähler)
+- [ ] ARM64-spezifisches CPU-Energiemodell (Cortex-A72, Cortex-A53, Apple M1) in `energy_model.pas`
+- [ ] `UpdateEnergyStatsForOperation()` im ARM64-Codegen aufrufen
+
+**Phase 4: IR-Level Energy-Annotationen** (Schätzung: 2-3 Tage) ✅
+- [x] `TIRInstruction` um `EnergyCostHint: UInt64` erweitern
+- [x] Lowering (`lower_ast_to_ir.pas`): Energie-Kosten-Hinweise an IR-Knoten annotieren (via `SetEnergyCostHint`)
+- [ ] IR-Optimierungspass: Energy-basierte Instruction Reordering (Cache-freundlichere Reihenfolge) — optional
+- [ ] IR-Optimierungspass: Redundante Load/Store-Elimination bei hohem Energy-Level — optional
+
+**Phase 5: Sprach-Level-Integration (optional)** (Schätzung: 3-5 Tage) ✅
+- [x] Pragma `@energy(level)` auf Funktionsebene — überschreibt globales Level pro Funktion
+- [x] Parser: Attribut vor `fn`-Deklarationen parsen
+- [x] AST: `TFnDecl` um `EnergyLevel: TEnergyLevel` erweitern
+- [x] Lowering: Energy-Level von AST zu IR propagieren
+- [x] Backend: Energy-Level pro Funktion anwenden vor dem Codegen
+
+**Phase 6: Tests & Dokumentation** (Schätzung: 1-2 Tage) ✅
+- [x] Unit-Tests für `energy_model.pas` (Kostenberechnung, CPU-Modell-Lookup)
+- [x] Unit-Tests für Energy-Tracking im x86_64-Emitter
+- [x] Integrationstests: gleiches Lyx-Programm mit `--target-energy=1` vs `--target-energy=5` kompilieren und Statistiken vergleichen
+- [x] Integrationstest: `@energy(1)` Pragma auf Funktion, Rest auf Level 3
+- [x] `SPEC.md` um Energy-Aware-Architektur-Abschnitt erweitern
+- [x] `ebnf.md` um `@energy` Pragma-Grammatik erweitern (falls Phase 5 umgesetzt)
+- [x] `README.md` mit Energy-Aware-Compiling Dokumentation
+
+#### Energy-Levels (Referenz)
+
+| Level | Name | Loop Unroll | Battery | Cache | SIMD | FPU | AVX2 | AVX512 |
+|-------|------|-------------|---------|-------|------|-----|------|--------|
+| 0 | None | — | — | — | — | — | — | — |
+| 1 | Minimal | 4× | ✅ | ✅ | — | — | — | — |
+| 2 | Low | 2× | ✅ | ✅ | — | — | — | — |
+| 3 | Medium | 1× | ✅ | ✅ | ✅ | — | ✅* | — |
+| 4 | High | — | ✅ | ✅ | ✅ | ✅ | ✅* | — |
+| 5 | Extreme | 8× | ✅ | ✅ | ✅ | ✅ | ✅* | ✅* |
+
+(*) nur wenn CPU das Feature unterstützt
+
+---
+
+### Priorität 5: Cross-Compilation Tests
 
 **Beschreibung**: Automatisierte Tests für alle Plattform-Kombinationen.
 
@@ -158,9 +263,11 @@ Optionen:
 
 ## Kurzfristige Empfehlung
 
-1. **Sofort**: ARM64 Dynamic Linking Writer implementieren - Emitter-Seite ist fertig, fehlt nur noch der Writer
-2. **Mittelfristig**: Windows ARM64 - wichtig für Cross-Platform-Compiler
-3. **Langfristig**: macOS - nice to have, aber geringere Priorität
+1. **Sofort**: ARM64 Dynamic Linking Writer implementieren — Emitter-Seite ist fertig, fehlt nur noch der Writer
+2. ~~**Sofort**: Energy-Aware Architektur bereinigen~~ → ✅ **Erledigt** (Phase 1 abgeschlossen)
+3. **Nächster Schritt**: x86_64-Backend Energy-Tracking durchgängig integrieren (Phase 2)
+4. **Mittelfristig**: ARM64 Energy-Support vervollständigen + Windows ARM64
+5. **Langfristig**: Sprach-Level Energy-Pragmas, macOS-Support
 
 ---
 
@@ -194,6 +301,7 @@ fpc -Twin64 -O2 -Mobjfpc -Sh lyxc.lpr -olyxc.exe
 | Random | ✅ | ✅ | ✅ |
 | I/O Syscalls | ✅ | ✅ | ✅ |
 | Globals | ✅ | ✅ | ✅ |
+| Energy-Aware | ⚠️ | ❌ | ⚠️ |
 
 Legende:
 - ✅ = Implementiert und getestet

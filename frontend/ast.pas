@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, lexer;
+  diag, lexer, backend_types;
 
 type
   { --- Aurum-Typsystem --- }
@@ -41,20 +41,23 @@ type
   { --- Knotenarten (für schnellen Typcheck ohne 'is') --- }
 
   TNodeKind = (
-    // Ausdrücke
-    nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit, nkIdent,
-    nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
-    nkFieldAccess, nkIndexAccess, nkCast,
-    nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
-    // Statements
-    nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
-    nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
-    nkReturn, nkBreak, nkSwitch,
-    nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
-    // Top-Level
-    nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl,
-    nkUnitDecl, nkImportDecl,
-    nkProgram
+     // Ausdrücke
+     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit, nkIdent,
+     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
+     nkFieldAccess, nkIndexAccess, nkCast,
+     nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
+     // Statements
+     nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
+     nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
+     nkReturn, nkBreak, nkSwitch,
+     nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
+     // Top-Level
+     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl,
+     nkUnitDecl, nkImportDecl,
+     nkProgram,
+     // Bitwise AST nodes
+     nkBitAnd, nkBitOr, nkBitXor, nkBitNot,
+     nkShiftLeft, nkShiftRight
   );
 
   { --- Vorwärtsdeklarationen --- }
@@ -513,6 +516,7 @@ type
     FIsVarArgs: Boolean;
     FIsStatic: Boolean; // true for static methods (no self parameter)
     FVisibility: TVisibility; // for class members (default: visPublic)
+    FEnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -527,6 +531,7 @@ type
     property IsVarArgs: Boolean read FIsVarArgs write FIsVarArgs;
     property IsStatic: Boolean read FIsStatic write FIsStatic;
     property Visibility: TVisibility read FVisibility write FVisibility;
+    property EnergyLevel: TEnergyLevel read FEnergyLevel write FEnergyLevel;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -998,6 +1003,60 @@ destructor TAstUnaryOp.Destroy;
 begin
   FOperand.Free;
   inherited Destroy;
+end;
+
+{ Bitweise NOT: ~x }
+TAstBitNot = class(TAstUnaryOp)
+private
+  FOperand: TAstExpr;
+public
+  constructor Create(aOperand: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
+end;
+
+{ Bitweise AND: a & b }
+TAstBitAnd = class(TAstBinOp)
+private
+  FLeft, FRight: TAstExpr;
+public
+  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
+end;
+
+{ Bitweise OR: a | b }
+TAstBitOr = class(TAstBinOp)
+private
+  FLeft, FRight: TAstExpr;
+public
+  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
+end;
+
+{ Bitweise XOR: a ^ b }
+TAstBitXor = class(TAstBinOp)
+private
+  FLeft, FRight: TAstExpr;
+public
+  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
+end;
+
+{ Shift Left: a << b }
+TAstShiftLeft = class(TAstBinOp)
+private
+  FLeft, FRight: TAstExpr;
+public
+  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
+end;
+
+{ Shift Right: a >> b }
+TAstShiftRight = class(TAstBinOp)
+private
+  FLeft, FRight: TAstExpr;
+public
+  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
+  destructor Destroy; override;
 end;
 
 // ================================================================
@@ -1699,6 +1758,7 @@ begin
   FIsPublic := aIsPublic;
   FIsStatic := False;
   FVisibility := visPublic; // default: public
+  FEnergyLevel := eelNone; // eelNone = use global level from --target-energy
 end;
 
 destructor TAstFuncDecl.Destroy;
