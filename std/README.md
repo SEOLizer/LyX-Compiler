@@ -27,6 +27,7 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/process` | Prozess-Management (fork/exec/wait) |
 | `std/json` | JSON Parser und Serializer |
 | `std/alloc` | Explizite Speicherverwaltung (malloc/free, Pool) |
+| `std/hash` | Hash-Funktionen (FNV, CRC32, SHA-256) |
 
 ---
 
