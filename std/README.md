@@ -25,6 +25,7 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/regex` | Regex-Matching |
 | `std/fs` | Dateisystem-Operationen, Path-Funktionen |
 | `std/process` | Prozess-Management (fork/exec/wait) |
+| `std/json` | JSON Parser und Serializer |
 
 ---
 
@@ -836,6 +837,54 @@ fn main(): int64 {
   
   return 0;
 }
+```
+
+---
+
+## std/json.lyx
+
+JSON Parser und Serializer für Lyx.
+
+### Typen
+- `JSON` - JSON Value Handle
+- `JSON_NULL`, `JSON_BOOL`, `JSON_NUMBER`, `JSON_STRING`, `JSON_ARRAY`, `JSON_OBJECT`
+
+### Fehler-Codes
+- `ERR_JSON_OK` - Kein Fehler
+- `ERR_JSON_INVALID` - Ungültiges JSON
+- `ERR_JSON_EXPECTED` - Erwartetes Token nicht gefunden
+- `ERR_JSON_EOF` - Unerwartetes Ende
+- `ERR_JSON_ESCAPE` - Ungültige Escape-Sequenz
+
+### Validierung
+- `isValidJSON(s: pchar): bool` - Prüft ob String gültiges JSON ist
+
+### Parsing
+- `parseArray(dest, src: pchar): int64` - Parst JSON-Array zu Pipe-getrenntem String
+- `parseValue(dest, src: pchar): int64` - Parst einzelnen JSON-Wert (gibt Typ zurück)
+- `toArray(dest, json_str: pchar): pchar` - Komfort-Wrapper für parseArray
+
+### Serialisierung
+- `serializeArray(dest, src: pchar): pchar` - Pipe-String zu JSON-Array
+- `serializeValue(dest, value: pchar, json_type: int64): pchar` - Einzelwert zu JSON
+- `JSONEscape(dest, src: pchar): pchar` - String für JSON escapen
+- `stringify(dest, pipe_str: pchar): pchar` - Komfort-Wrapper für serializeArray
+
+**Hinweis**: Arrays werden intern als Pipe-getrennte Strings verarbeitet (`"a|b|c"`).
+
+**Beispiel:**
+```lyx
+import std.json;
+
+// Parse
+var arr: pchar := "                                                                                ";
+toArray(arr, '["Node1","Node2","Node3"]');
+// arr = "Node1|Node2|Node3"
+
+// Serialize
+var json: pchar := "                                                                                ";
+stringify(json, "Status|200|OK");
+// json = ["Status","200","OK"]
 ```
 
 ---
