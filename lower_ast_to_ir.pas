@@ -279,6 +279,8 @@ procedure TIRLowering.Emit(instr: TIRInstr);
 begin
   if not Assigned(FCurrentFunc) then
     Exit;
+  // Energy-Kosten-Hinweis setzen basierend auf OpCode
+  SetEnergyCostHint(instr);
   FCurrentFunc.Emit(instr);
 end;
 
