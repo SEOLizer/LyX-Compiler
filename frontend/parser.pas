@@ -39,13 +39,18 @@ type
     function ParseRepeatUntilStmt: TAstRepeatUntil;
     function ParseAssignStmtOrExprStmt: TAstStmt;
 
-    // Expressions (Präzedenz): Pipe -> NullCoalesce -> Or -> And -> Cmp -> Add -> Mul -> Unary -> Primary -> Postfix
+    // Expressions (Präzedenz): Pipe -> NullCoalesce -> Or -> And
+    //   -> BitOr -> BitXor -> BitAnd -> Cmp -> Shift -> Add -> Mul -> Unary -> Primary -> Postfix
     function ParseExpr: TAstExpr;
     function ParsePipeExpr: TAstExpr;
     function ParseNullCoalesceExpr: TAstExpr;
     function ParseOrExpr: TAstExpr;
     function ParseAndExpr: TAstExpr;
+    function ParseBitOrExpr: TAstExpr;
+    function ParseBitXorExpr: TAstExpr;
+    function ParseBitAndExpr: TAstExpr;
     function ParseCmpExpr: TAstExpr;
+    function ParseShiftExpr: TAstExpr;
     function ParseAddExpr: TAstExpr;
     function ParseMulExpr: TAstExpr;
     function ParseUnaryExpr: TAstExpr;
@@ -1136,11 +1141,47 @@ function TParser.ParseAndExpr: TAstExpr;
 var
   rhs: TAstExpr;
 begin
-  Result := ParseCmpExpr;
+  Result := ParseBitOrExpr;
   while Accept(tkAnd) do
   begin
-    rhs := ParseCmpExpr;
+    rhs := ParseBitOrExpr;
     Result := TAstBinOp.Create(tkAnd, Result, rhs, Result.Span);
+  end;
+end;
+
+function TParser.ParseBitOrExpr: TAstExpr;
+var
+  rhs: TAstExpr;
+begin
+  Result := ParseBitXorExpr;
+  while Accept(tkBitOr) do
+  begin
+    rhs := ParseBitXorExpr;
+    Result := TAstBinOp.Create(tkBitOr, Result, rhs, Result.Span);
+  end;
+end;
+
+function TParser.ParseBitXorExpr: TAstExpr;
+var
+  rhs: TAstExpr;
+begin
+  Result := ParseBitAndExpr;
+  while Accept(tkBitXor) do
+  begin
+    rhs := ParseBitAndExpr;
+    Result := TAstBinOp.Create(tkBitXor, Result, rhs, Result.Span);
+  end;
+end;
+
+function TParser.ParseBitAndExpr: TAstExpr;
+var
+  rhs: TAstExpr;
+begin
+  Result := ParseCmpExpr;
+  while Accept(tkBitAnd) do
+  begin
+    rhs := ParseCmpExpr;
+    Result := TAstBinOp.Create(tkBitAnd, Result, rhs, Result.Span);
   end;
 end;
 
@@ -1149,8 +1190,22 @@ var
   op: TTokenKind;
   rhs: TAstExpr;
 begin
-  Result := ParseAddExpr;
+  Result := ParseShiftExpr;
   if Check(tkEq) or Check(tkNeq) or Check(tkLt) or Check(tkLe) or Check(tkGt) or Check(tkGe) then
+  begin
+    op := FCurTok.Kind; Advance;
+    rhs := ParseShiftExpr;
+    Result := TAstBinOp.Create(op, Result, rhs, Result.Span);
+  end;
+end;
+
+function TParser.ParseShiftExpr: TAstExpr;
+var
+  op: TTokenKind;
+  rhs: TAstExpr;
+begin
+  Result := ParseAddExpr;
+  while Check(tkShiftLeft) or Check(tkShiftRight) do
   begin
     op := FCurTok.Kind; Advance;
     rhs := ParseAddExpr;

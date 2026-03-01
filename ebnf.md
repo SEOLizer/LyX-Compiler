@@ -40,7 +40,9 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 * **String-Verkettung**: `+` (bei pchar + pchar)
 * Vergleich: `== != < <= > >=`
 * Logik: `&& || !`
+* Bitweise: `& | ^ ~ << >>`
 * Null-Safety: `? ?? ?.`
+* Pipe: `|>`
 * Sonstiges: `(` `)` `{` `}` `:` `,` `;` `.` `@`
 
 ---
@@ -527,6 +529,8 @@ SafeAccessSuffix := '?.' Ident ;                  // Optionaler Feldzugriff
 
 ### Ausdrücke (Operatorpräzedenz)
 
+Von niedrigster zu höchster Priorität:
+
 ```
 Expr           := PipeExpr ;
 
@@ -537,16 +541,20 @@ PipeExpr       := NullCoalesceExpr { '|>' Ident [ '(' [ ArgList ] ')' ] } ;
 NullCoalesceExpr := OrExpr { '??' OrExpr } ;
 
 OrExpr         := AndExpr { '||' AndExpr } ;
-AndExpr        := CmpExpr { '&&' CmpExpr } ;
+AndExpr        := BitOrExpr { '&&' BitOrExpr } ;
 
+BitOrExpr      := BitXorExpr { '|' BitXorExpr } ;
+BitXorExpr     := BitAndExpr { '^' BitAndExpr } ;
+BitAndExpr     := CmpExpr { '&' CmpExpr } ;
 
-CmpExpr        := AddExpr [ ( '==' | '!=' | '<' | '<=' | '>' | '>=' ) AddExpr ] ;
+CmpExpr        := ShiftExpr [ ( '==' | '!=' | '<' | '<=' | '>' | '>=' ) ShiftExpr ] ;
 
+ShiftExpr      := AddExpr { ( '<<' | '>>' ) AddExpr } ;
 AddExpr        := MulExpr { ( '+' | '-' ) MulExpr } ;
 MulExpr        := CastExpr { ( '*' | '/' | '%' ) CastExpr } ;
 
 CastExpr       := UnaryExpr [ 'as' Type ] ;
-UnaryExpr      := ( '!' | '-' ) UnaryExpr | PostfixExpr ;
+UnaryExpr      := ( '!' | '-' | '~' ) UnaryExpr | PostfixExpr ;
 
 ArgList        := Expr { ',' Expr } ;
 
@@ -809,6 +817,30 @@ fn main(): int64 {
   return 0;
 }
 ```
+
+### Bitweise Operatoren
+
+```lyx
+fn main(): int64 {
+  var a: int64 := 12;
+  var b: int64 := 10;
+
+  PrintInt(a & b);    // AND:  8
+  PrintInt(a | b);    // OR:  14
+  PrintInt(a ^ b);    // XOR:  6
+  PrintInt(1 << 4);   // SHL: 16
+  PrintInt(256 >> 3); // SHR: 32
+  PrintInt(~0);       // NOT: -1
+
+  // Kombination: Mask-and-Shift
+  var flags: int64 := (5 << 4) | 3;  // = 83
+  PrintInt(flags);
+
+  return 0;
+}
+```
+
+**Präzedenz** (niedrig → hoch): `||` → `&&` → `|` → `^` → `&` → Vergleich → `<< >>` → `+ -` → `* / %` → Unär (`! - ~`)
 
 ### Variablen + while + Type-Casting
 

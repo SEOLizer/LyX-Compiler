@@ -98,6 +98,9 @@ begin
   AddTest('tests/lyx/pipe/test_pipe_args.lyx', 0, 'pipe: pipe with args');
   AddTest('tests/lyx/pipe/test_pipe_compare.lyx', 0, 'pipe: pipe vs classic');
 
+  // === bitwise ===
+  AddTest('tests/lyx/bitwise/test_bitwise_ops.lyx', 0, 'bitwise: & | ^ ~ << >>');
+
   // === operators ===
   AddTest('tests/lyx/operators/test_inc_dec.lyx', 0, 'operators: inc/dec');
 

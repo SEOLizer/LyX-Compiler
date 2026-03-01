@@ -180,6 +180,12 @@ begin
     tkQuestion:  Result := '?';
     tkNullCoalesce: Result := '??';
     tkSafeCall:  Result := '?.';
+    tkBitAnd:    Result := '&';
+    tkBitOr:     Result := '|';
+    tkBitXor:    Result := '^';
+    tkBitNot:    Result := '~';
+    tkShiftLeft: Result := '<<';
+    tkShiftRight:Result := '>>';
     tkPipe:      Result := '|>';
     tkEOF:       Result := 'EOF';
     tkError:     Result := 'ERROR';
