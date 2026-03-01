@@ -25,6 +25,8 @@ type
     IsAdrp: Boolean;  // True if ADRP, False if ADR
   end;
 
+  TEnergyOpKind = (eokALU, eokFPU, eokMemory, eokBranch, eokSyscall);
+
   TARM64Emitter = class
   private
     FCode: TByteBuffer;
@@ -54,6 +56,11 @@ type
     FPLTGOTPatches: array of TPLTGOTPatch;
     // Energy tracking (minimal — vollständige Integration in Phase 3)
     FEnergyStats: TEnergyStats;
+    FEnergyContext: TEnergyContext;
+    FCurrentCPU: TCPUEnergyModel;
+    FMemoryAccessCount: UInt64;
+    FCurrentFunctionEnergy: UInt64;
+    procedure TrackEnergy(kind: TEnergyOpKind);
   public
     constructor Create;
     destructor Destroy; override;
@@ -64,6 +71,7 @@ type
     function GetExternalSymbols: TExternalSymbolArray;
     function GetPLTGOTPatches: TPLTGOTPatchArray;
     function GetEnergyStats: TEnergyStats;
+    procedure SetEnergyLevel(level: TEnergyLevel);
   end;
 
 implementation
@@ -905,6 +913,14 @@ begin
   // External symbols for PLT/GOT
   SetLength(FExternalSymbols, 0);
   SetLength(FPLTGOTPatches, 0);
+  // Energy tracking initialization
+  FCurrentCPU := GetCPUEnergyModel(cfARM64);
+  FEnergyContext.CurrentCPU := FCurrentCPU;
+  FEnergyContext.Config := GetEnergyConfig;
+  FMemoryAccessCount := 0;
+  FCurrentFunctionEnergy := 0;
+  FillChar(FEnergyStats, SizeOf(FEnergyStats), 0);
+  FEnergyStats.DetailedBreakdown := nil;
 end;
 
 destructor TARM64Emitter.Destroy;
@@ -914,6 +930,43 @@ begin
   FData.Free;
   FCode.Free;
   inherited Destroy;
+end;
+
+procedure TARM64Emitter.TrackEnergy(kind: TEnergyOpKind);
+var
+  cost: UInt64;
+begin
+  case kind of
+    eokALU:
+    begin
+      Inc(FEnergyStats.TotalALUOps);
+      cost := FCurrentCPU.InstructionCosts.ALU_OPS[0];
+    end;
+    eokFPU:
+    begin
+      Inc(FEnergyStats.TotalFPUOps);
+      cost := FCurrentCPU.InstructionCosts.FPU_OPS[0];
+    end;
+    eokMemory:
+    begin
+      Inc(FEnergyStats.TotalMemoryAccesses);
+      Inc(FMemoryAccessCount);
+      cost := FCurrentCPU.InstructionCosts.MEMORY_OPS[0];
+    end;
+    eokBranch:
+    begin
+      Inc(FEnergyStats.TotalBranches);
+      cost := FCurrentCPU.InstructionCosts.BRANCH_OPS[0];
+    end;
+    eokSyscall:
+    begin
+      Inc(FEnergyStats.TotalSyscalls);
+      cost := FCurrentCPU.InstructionCosts.SYS_CALL_COST;
+    end;
+    else
+      cost := 0;
+  end;
+  FCurrentFunctionEnergy := FCurrentFunctionEnergy + cost;
 end;
 
 function TARM64Emitter.GetCodeBuffer: TByteBuffer;
@@ -1247,6 +1300,42 @@ begin
     begin
       instr := fn.Instructions[j];
       
+      // Energy-Tracking: Kategorie pro IR-Instruktion zählen
+      case instr.Op of
+        irAdd, irSub, irMul, irDiv, irMod, irNeg, irNot, irAnd, irOr,
+        irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
+        irSExt, irZExt, irTrunc:
+          TrackEnergy(eokALU);
+        irFAdd, irFSub, irFMul, irFDiv, irFNeg,
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
+        irFToI, irIToF:
+          TrackEnergy(eokFPU);
+        irLoadLocal, irStoreLocal, irLoadGlobal, irStoreGlobal,
+        irLoadGlobalAddr, irLoadLocalAddr, irLoadStructAddr,
+        irStackAlloc, irStoreElem, irLoadElem, irStoreElemDyn,
+        irLoadField, irStoreField, irLoadFieldHeap, irStoreFieldHeap,
+        irAlloc, irFree,
+        irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
+          TrackEnergy(eokMemory);
+        irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
+        irReturn, irReturnStruct:
+          TrackEnergy(eokBranch);
+        irCallBuiltin:
+          if (instr.ImmStr = 'exit') or (instr.ImmStr = 'PrintStr') or
+             (instr.ImmStr = 'PrintInt') or (instr.ImmStr = 'open') or
+             (instr.ImmStr = 'read') or (instr.ImmStr = 'write') or
+             (instr.ImmStr = 'lseek') or (instr.ImmStr = 'unlink') or
+             (instr.ImmStr = 'rename') or (instr.ImmStr = 'mkdir') or
+             (instr.ImmStr = 'rmdir') or (instr.ImmStr = 'chmod') or
+             (instr.ImmStr = 'now_unix') or (instr.ImmStr = 'now_unix_ms') or
+             (instr.ImmStr = 'sleep_ms') then
+            TrackEnergy(eokSyscall)
+          else
+            TrackEnergy(eokALU);
+        irPanic:
+          TrackEnergy(eokSyscall);
+      end;
+
       case instr.Op of
         irConstInt:
           begin
@@ -2527,7 +2616,17 @@ function TARM64Emitter.GetEnergyStats: TEnergyStats;
 begin
   FEnergyStats.CodeSizeBytes := FCode.Size;
   FEnergyStats.L1CacheFootprint := EstimateL1CacheFootprint(FCode.Size);
+  FEnergyStats.EstimatedEnergyUnits := FCurrentFunctionEnergy;
+  FEnergyStats.TotalMemoryAccesses := FMemoryAccessCount;
   Result := FEnergyStats;
+end;
+
+procedure TARM64Emitter.SetEnergyLevel(level: TEnergyLevel);
+begin
+  energy_model.SetEnergyLevel(level, cfARM64);
+  FEnergyContext.Config := GetEnergyConfig;
+  FCurrentCPU := GetCPUEnergyModel(cfARM64);
+  FEnergyContext.CurrentCPU := FCurrentCPU;
 end;
 
 end.
