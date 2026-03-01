@@ -41,7 +41,45 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 * Vergleich: `== != < <= > >=`
 * Logik: `&& || !`
 * Null-Safety: `? ?? ?.`
-* Sonstiges: `(` `)` `{` `}` `:` `,` `;` `.`
+* Sonstiges: `(` `)` `{` `}` `:` `,` `;` `.` `@`
+
+---
+
+## Energy-Aware-Compiling (v0.3.1+)
+
+### @energy Pragma
+
+Funktionen können mit einem Energy-Level kompiliert werden:
+
+```
+EnergyAttr = "@energy" "(" IntLiteral ")"
+FnDecl = [ EnergyAttr ] "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
+```
+
+Beispiele:
+```lyx
+@energy(1)
+fn low_power_mode(): int64 {
+  // Kompiliert mit Energy-Level 1 (minimal)
+  return 0;
+}
+
+@energy(5)
+fn high_performance(): int64 {
+  // Kompiliert mit Energy-Level 5 (extrem)
+  return compute();
+}
+```
+
+### Energy-Levels
+
+| Level | Name | Loop Unroll | Battery | SIMD | FPU |
+|-------|------|-------------|---------|------|-----|
+| 1 | Minimal | 4× | ✅ | — | — |
+| 2 | Low | 2× | ✅ | — | — |
+| 3 | Medium | 1× | ✅ | ✅ | — |
+| 4 | High | — | ✅ | ✅ | ✅ |
+| 5 | Extreme | 8× | ✅ | ✅ | ✅ |
 
 ---
 
