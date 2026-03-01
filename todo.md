@@ -184,13 +184,14 @@
 - [x] Lowering: Energy-Level von AST zu IR propagieren
 - [x] Backend: Energy-Level pro Funktion anwenden vor dem Codegen
 
-**Phase 6: Tests & Dokumentation** (Schätzung: 1-2 Tage)
-- [ ] Unit-Tests für `energy_model.pas` (Kostenberechnung, CPU-Modell-Lookup)
-- [ ] Unit-Tests für Energy-Tracking im x86_64-Emitter
-- [ ] Integrationstests: gleiches Lyx-Programm mit `--target-energy=1` vs `--target-energy=5` kompilieren und Statistiken vergleichen
-- [ ] Integrationstest: `@energy(1)` Pragma auf Funktion, Rest auf Level 3
-- [ ] `SPEC.md` um Energy-Aware-Architektur-Abschnitt erweitern
-- [ ] `ebnf.md` um `@energy` Pragma-Grammatik erweitern (falls Phase 5 umgesetzt)
+**Phase 6: Tests & Dokumentation** (Schätzung: 1-2 Tage) ✅
+- [x] Unit-Tests für `energy_model.pas` (Kostenberechnung, CPU-Modell-Lookup)
+- [x] Unit-Tests für Energy-Tracking im x86_64-Emitter
+- [x] Integrationstests: gleiches Lyx-Programm mit `--target-energy=1` vs `--target-energy=5` kompilieren und Statistiken vergleichen
+- [x] Integrationstest: `@energy(1)` Pragma auf Funktion, Rest auf Level 3
+- [x] `SPEC.md` um Energy-Aware-Architektur-Abschnitt erweitern
+- [x] `ebnf.md` um `@energy` Pragma-Grammatik erweitern (falls Phase 5 umgesetzt)
+- [x] `README.md` mit Energy-Aware-Compiling Dokumentation
 
 #### Energy-Levels (Referenz)
 
