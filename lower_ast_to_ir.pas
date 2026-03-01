@@ -1206,7 +1206,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
         // === Dynamic array builtins: push, pop, len, free ===
         // These need the base local slot index, not a lowered temp value.
-        if (TAstCall(expr).Name = 'push') and (argCount = 2) and
+        if ((TAstCall(expr).Name = 'push') or (TAstCall(expr).Name = 'append')) and (argCount = 2) and
            (TAstCall(expr).Args[0] is TAstIdent) then
         begin
           loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
