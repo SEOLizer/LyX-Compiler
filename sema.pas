@@ -772,6 +772,12 @@ begin
                end;
              end;
 
+          tkBitAnd, tkBitOr, tkBitXor, tkShiftLeft, tkShiftRight:
+            begin
+              if not IsIntegerType(lt) or not IsIntegerType(rt) then
+                FDiag.Error('type error: bitwise operators require integer operands', bin.Span);
+              Result := lt; // Ergebnis hat den Typ des linken Operanden
+            end;
           tkAnd, tkOr:
             begin
               if not TypeEqual(lt, atBool) or not TypeEqual(rt, atBool) then
@@ -809,6 +815,12 @@ begin
           if not TypeEqual(ot, atBool) then
             FDiag.Error('type error: unary ! requires bool', un.Span);
           Result := atBool;
+        end
+        else if un.Op = tkBitNot then
+        begin
+          if not IsIntegerType(ot) then
+            FDiag.Error('type error: unary ~ requires integer', un.Span);
+          Result := ot; // Ergebnis hat gleichen Typ wie Operand
         end
         else
         begin
