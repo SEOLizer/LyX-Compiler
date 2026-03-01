@@ -23,7 +23,8 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/crt_raw` | Raw-Mode Input (experimentell) |
 | `std/pack` | Binary Serialisierung |
 | `std/regex` | Regex-Matching |
-| `std/fs` | Dateisystem-Operationen |
+| `std/fs` | Dateisystem-Operationen, Path-Funktionen |
+| `std/process` | Prozess-Management (fork/exec/wait) |
 
 ---
 
@@ -782,6 +783,60 @@ Dateisystem-Operationen.
 - `StdoutWrite(buf: pchar, len: int64): int64` - stdout
 - `StderrWrite(buf: pchar, len: int64): int64` - stderr
 - `PutChar(c: int64): int64` - Zeichen ausgeben
+
+### Path-Funktionen
+- `PathNormalize(dest, src: pchar): pchar` - Pfad normalisieren (`./`, `../`, `//` auflösen)
+- `PathDir(dest, path: pchar): pchar` - Verzeichnis-Teil zurückgeben
+- `PathExt(dest, path: pchar): pchar` - Extension mit Punkt zurückgeben
+- `PathBase(dest, path: pchar): pchar` - Basis-Dateiname ohne Extension
+- `PathResolve(dest, base, relative: pchar): pchar` - Pfad auflösen (JoinHoch)
+
+---
+
+## std/process.lyx
+
+Prozess-Management für CLI-Tools und System-Integration.
+
+### Typen
+- `Process` - Process Handle (int64, speichert PID)
+- `ExitCode` - Exit-Status (0 = Erfolg, >0 = Fehler)
+
+### Konstanten
+- `WNOHANG` - Non-blocking wait
+- `SIGTERM` - 15 (graceful termination)
+- `SIGKILL` - 9 (force termination)
+
+### Process API
+- `spawn(prog: pchar): Process` - Prozess asynchron starten, gibt PID zurück
+- `run(prog: pchar): ExitCode` - Prozess synchron starten & warten
+- `wait(pid: int64): ExitCode` - Auf Prozess warten (blockierend)
+- `try_wait(pid: int64): ExitCode` - Warten ohne Blockieren (-2 wenn noch läuft)
+- `is_running(pid: int64): bool` - Prüfen ob Prozess läuft
+- `kill(pid, sig: int64): int64` - Signal senden
+- `terminate(pid: int64): int64` - Graceful beenden (SIGTERM)
+- `terminate_force(pid: int64): int64` - Force beenden (SIGKILL)
+- `self_pid(): int64` - Eigene PID abrufen
+
+### Shell
+- `shell(cmd: pchar): ExitCode` - Shell-Befehl ausführen (`/bin/sh -c "cmd"`)
+  - **Warnung**: Sicherheitsrisiko bei User-Input!
+
+**Beispiel:**
+```lyx
+import std.process;
+
+fn main(): int64 {
+  // Synchron: warten auf Beendigung
+  var exit_code: int64 := run("/bin/ls");
+  
+  // Asynchron: PID holen und später warten
+  var pid: int64 := spawn("/bin/sleep");
+  // ... andere Arbeit ...
+  exit_code := wait(pid);
+  
+  return 0;
+}
+```
 
 ---
 
