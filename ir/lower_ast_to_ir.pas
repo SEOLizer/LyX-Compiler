@@ -993,8 +993,101 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               else
                 instr.Op := irAdd;
             end
-        else if (TAstCall(expr).Name = 'PrintLn') or 
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintLn')) then
+            tkMinus:
+              instr.Op := irSub;
+            tkStar:
+              instr.Op := irMul;
+            tkSlash:
+              instr.Op := irDiv;
+            tkPercent:
+              instr.Op := irMod;
+
+            // Bitwise operators
+            tkBitAnd:   instr.Op := irAnd;
+            tkBitOr:    instr.Op := irOr;
+            tkBitXor:   instr.Op := irXor;
+            tkShiftLeft: instr.Op := irShl;
+            tkShiftRight: instr.Op := irShr;
+
+            tkEq:
+              if isFloatCmp then instr.Op := irFCmpEq else instr.Op := irCmpEq;
+            tkNeq:
+              if isFloatCmp then instr.Op := irFCmpNe else instr.Op := irCmpNe;
+            tkLt:
+              if isFloatCmp then instr.Op := irFCmpLt else instr.Op := irCmpLt;
+            tkLe:
+              if isFloatCmp then instr.Op := irFCmpLe else instr.Op := irCmpLe;
+            tkGt:
+              if isFloatCmp then instr.Op := irFCmpGt else instr.Op := irCmpGt;
+            tkGe:
+              if isFloatCmp then instr.Op := irFCmpGe else instr.Op := irCmpGe;
+            tkAnd:
+              instr.Op := irAnd;
+            tkOr:
+              instr.Op := irOr;
+          else
+            FDiag.Error('unsupported binary operator ' + TokenKindToStr(TAstBinOp(expr).Op), expr.Span);
+            Exit;
+          end;
+
+        // Set Dest, Src1, Src2 for binary operation
+        instr.Dest := t0;
+        instr.Src1 := t1;
+        instr.Src2 := t2;
+        Emit(instr);
+        Result := t0;
+      end;
+
+    nkUnaryOp:
+      begin
+        t1 := LowerExpr(TAstUnaryOp(expr).Operand);
+        if t1 < 0 then Exit;
+
+        t0 := NewTemp;
+        instr.Dest := t0;
+        instr.Src1 := t1;
+        case TAstUnaryOp(expr).Op of
+          tkMinus:
+            instr.Op := irNeg;
+          tkNot:
+            instr.Op := irNot; // Logical NOT (for boolean)
+          tkBitNot:
+            instr.Op := irBitNot; // Bitwise NOT (for integers)
+        else
+          FDiag.Error('unsupported unary operator ' + TokenKindToStr(TAstUnaryOp(expr).Op), expr.Span);
+          Exit;
+        end;
+        Emit(instr);
+        Result := t0;
+      end;
+
+    nkCall:
+      begin
+        call := TAstCall(expr);
+        argCount := Length(call.Args);
+        SetLength(argTemps, argCount);
+        for i := 0 to High(call.Args) do
+          argTemps[i] := LowerExpr(call.Args[i]);
+
+        // Builtin calls
+        if (call.Name = 'PrintStr') or ((call.Namespace = 'IO') and (call.Name = 'PrintStr')) then
+        begin
+          instr.Op := irCallBuiltin;
+          instr.Dest := -1; // no return value
+          instr.ImmStr := 'PrintStr';
+          if argCount >= 1 then
+            instr.Src1 := argTemps[0]
+          else
+            instr.Src1 := -1;
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+          Result := -1;
+        end
+        else if (call.Name = 'PrintLn') or 
+                ((call.Namespace = 'IO') and (call.Name = 'PrintLn')) then
         begin
           // PrintLn: like PrintStr but adds newline
           instr.Op := irCallBuiltin;
@@ -1011,8 +1104,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (TAstCall(expr).Name = 'PrintInt') or 
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'PrintInt')) then
+        else if (call.Name = 'PrintInt') or 
+                ((call.Namespace = 'IO') and (call.Name = 'PrintInt')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1;
@@ -1028,8 +1121,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (TAstCall(expr).Name = 'printf') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'printf')) then
+        else if (call.Name = 'printf') or
+                ((call.Namespace = 'IO') and (call.Name = 'printf')) then
         begin
           // printf is varargs - emit as generic external call
           instr.Op := irCall;
@@ -1047,8 +1140,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (TAstCall(expr).Name = 'getpid') or
-                ((TAstCall(expr).Namespace = 'OS') and (TAstCall(expr).Name = 'getpid')) then
+        else if (call.Name = 'getpid') or
+                ((call.Namespace = 'OS') and (call.Name = 'getpid')) then
         begin
           // getpid() -> int64: returns process ID
           // Use generic external call (like user-defined extern functions)
@@ -1063,8 +1156,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Result := t0;
         end
         // === std.io: fd-basierte I/O Syscalls (v0.3.1) ===
-        else if (TAstCall(expr).Name = 'open') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'open')) then
+        else if (call.Name = 'open') or
+                ((call.Namespace = 'IO') and (call.Name = 'open')) then
         begin
           // open(path: pchar, flags: int64, mode: int64) -> int64 (fd or -1)
           t0 := NewTemp;
@@ -1080,8 +1173,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'read') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'read')) then
+        else if (call.Name = 'read') or
+                ((call.Namespace = 'IO') and (call.Name = 'read')) then
         begin
           // read(fd: int64, buf: pchar, count: int64) -> int64 (bytes read or -1)
           t0 := NewTemp;
@@ -1097,8 +1190,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'write') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'write')) then
+        else if (call.Name = 'write') or
+                ((call.Namespace = 'IO') and (call.Name = 'write')) then
         begin
           // write(fd: int64, buf: pchar, count: int64) -> int64 (bytes written or -1)
           t0 := NewTemp;
@@ -1114,8 +1207,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'close') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'close')) then
+        else if (call.Name = 'close') or
+                ((call.Namespace = 'IO') and (call.Name = 'close')) then
         begin
           // close(fd: int64) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1130,8 +1223,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'lseek') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'lseek')) then
+        else if (call.Name = 'lseek') or
+                ((call.Namespace = 'IO') and (call.Name = 'lseek')) then
         begin
           // lseek(fd: int64, offset: int64, whence: int64) -> int64
           t0 := NewTemp;
@@ -1147,8 +1240,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'unlink') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'unlink')) then
+        else if (call.Name = 'unlink') or
+                ((call.Namespace = 'IO') and (call.Name = 'unlink')) then
         begin
           // unlink(path: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1163,8 +1256,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'rename') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'rename')) then
+        else if (call.Name = 'rename') or
+                ((call.Namespace = 'IO') and (call.Name = 'rename')) then
         begin
           // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1180,8 +1273,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'mkdir') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'mkdir')) then
+        else if (call.Name = 'mkdir') or
+                ((call.Namespace = 'IO') and (call.Name = 'mkdir')) then
         begin
           // mkdir(path: pchar, mode: int64) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1197,8 +1290,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'rmdir') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'rmdir')) then
+        else if (call.Name = 'rmdir') or
+                ((call.Namespace = 'IO') and (call.Name = 'rmdir')) then
         begin
           // rmdir(path: pchar) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1213,8 +1306,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'chmod') or
-                ((TAstCall(expr).Namespace = 'IO') and (TAstCall(expr).Name = 'chmod')) then
+        else if (call.Name = 'chmod') or
+                ((call.Namespace = 'IO') and (call.Name = 'chmod')) then
         begin
           // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
           t0 := NewTemp;
@@ -1230,8 +1323,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'Random') or
-                ((TAstCall(expr).Namespace = 'Math') and (TAstCall(expr).Name = 'Random')) then
+        else if (call.Name = 'Random') or
+                ((call.Namespace = 'Math') and (call.Name = 'Random')) then
         begin
           // Random() -> int64: returns pseudo-random number
           t0 := NewTemp;
@@ -1243,8 +1336,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (TAstCall(expr).Name = 'RandomSeed') or
-                ((TAstCall(expr).Namespace = 'Math') and (TAstCall(expr).Name = 'RandomSeed')) then
+        else if (call.Name = 'RandomSeed') or
+                ((call.Namespace = 'Math') and (call.Name = 'RandomSeed')) then
         begin
           // RandomSeed(seed) -> void: sets the random seed
           instr.Op := irCallBuiltin;
@@ -1261,8 +1354,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if ((TAstCall(expr).Name = 'RegexMatch') or
-                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Match'))) then
+        else if ((call.Name = 'RegexMatch') or
+                 ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
         begin
           // RegexMatch(pattern, text) -> bool
           // Use generic external call
@@ -1280,8 +1373,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if ((TAstCall(expr).Name = 'RegexSearch') or
-                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Search'))) then
+        else if ((call.Name = 'RegexSearch') or
+                 ((call.Namespace = 'Regex') and (call.Name = 'Search'))) then
         begin
           // RegexSearch(pattern, text) -> int64 (position or -1)
           // Use generic external call
@@ -1299,8 +1392,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if ((TAstCall(expr).Name = 'RegexReplace') or
-                 ((TAstCall(expr).Namespace = 'Regex') and (TAstCall(expr).Name = 'Replace'))) then
+        else if ((call.Name = 'RegexReplace') or
+                 ((call.Namespace = 'Regex') and (call.Name = 'Replace'))) then
         begin
           // RegexReplace(pattern, text, replacement) -> int64 (count)
           // Use generic external call
@@ -1325,12 +1418,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           t0 := NewTemp;
           instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := TAstCall(expr).Name;
+          instr.ImmStr := call.Name;
           instr.ImmInt := argCount; // Backend needs argCount in ImmInt
           // Determine call mode based on function origin
-          if FExternFuncs.IndexOf(TAstCall(expr).Name) >= 0 then
+          if FExternFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmExternal
-          else if FImportedFuncs.IndexOf(TAstCall(expr).Name) >= 0 then
+          else if FImportedFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmImported
           else
             instr.CallMode := cmInternal;
