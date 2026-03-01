@@ -31,6 +31,23 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 
 ---
 
+## Namensraum-Konvention
+
+Nach `import std.math;` werden alle Funktionen **global** importiert und können direkt aufgerufen werden:
+
+```lyx
+import std.math;
+
+var x: int64 := Abs64(-42);  // Nicht: math.Abs64()
+var y: int64 := Min64(1, 2);
+```
+
+**Achtung:** Bei Namenskollisionen (z.B. `std.list` und `std.string` haben beide `Length()`) gewinnt der zuletzt importierte Namespace. Um Kollisionen zu vermeiden:
+
+1. **Reihenfolge beachten** - Imports nach Priorität sortieren
+2. **Direktimport** - Nur benötigte Funktionen importieren (falls unterstützt)
+3. **Vermeiden** - Nicht mehrere Units mit gleichen Funktionsnamen mischen
+
 ## std/math.lyx
 
 ### Basis-Integer-Mathematik
