@@ -935,4 +935,58 @@ fn main(): int64 {
 
 ---
 
+## std/alloc.lyx
+
+Explizite Speicherverwaltung für performante Systemprogrammierung.
+
+### Typen
+- `Ptr` - Roh-Pointer (int64)
+- `Pool` - Pool-Allocator Handle
+
+### Konstanten
+- `ALIGNMENT` - 8 Bytes (x86_64)
+- `ERR_ALLOC_OK` - Kein Fehler
+- `ERR_ALLOC_OOM` - Out of Memory
+- `ERR_ALLOC_INVALID` - Ungültiger Pointer
+
+### malloc/free API
+- `malloc(size: int64): Ptr` - Speicher anfordern
+- `calloc(count, elem_size: int64): Ptr` - Anfordern + Null-initialisieren
+- `free_mem(ptr: Ptr): int64` - Speicher freigeben
+- `realloc_mem(ptr: Ptr, new_size: int64): Ptr` - Neu reservieren
+
+### Pool-Allocator (Arena)
+- `createPool(capacity: int64): Pool` - Pool erstellen
+- `pool_alloc(pool: Ptr, size: int64): Ptr` - O(1) Allokation aus Pool
+- `pool_release(pool: Ptr): int64` - Pool komplett freigeben
+
+### Utility
+- `size_of_int64(): int64` - Größe von int64
+- `size_of_ptr(): int64` - Größe eines Pointers
+- `is_aligned(ptr: Ptr): bool` - Prüft 8-Byte-Alignment
+- `malloc_safe(size: int64): Ptr` - Mit Fehlerprüfung (gibt 0 bei OOM)
+- `malloc_orpanic(size: int64): Ptr` - Allozieren oder Panic
+
+**Performance-Vergleich:**
+| Methode | Speed | Fragmentierung |
+|---------|-------|----------------|
+| malloc | Mittel | Ja |
+| Pool | O(1) | Nein |
+
+**Beispiel:**
+```lyx
+import std.alloc;
+
+// Pool für 1000 Elemente
+var pool: Pool := createPool(8192);
+
+// O(1) Allokation
+var ptr: Ptr := pool_alloc(pool, 256);
+
+// Alles freigeben
+pool_release(pool);
+```
+
+---
+
 *Hinweis: Zusätzlich stehen 22 native Math-Builtins zur Verfügung (siehe Haupt-README).*
