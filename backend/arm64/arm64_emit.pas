@@ -4,7 +4,7 @@ unit arm64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, backend_types;
+  SysUtils, Classes, bytes, ir, backend_types, energy_model;
 
 type
   TLabelPos = record
@@ -52,6 +52,8 @@ type
     // External symbols for PLT/GOT (Dynamic Linking)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
+    // Energy tracking (minimal — wird in Phase 3 vollständig integriert)
+    FEnergyStats: TEnergyStats;
   public
     constructor Create;
     destructor Destroy; override;
@@ -61,6 +63,7 @@ type
     function GetFunctionOffset(const name: string): Integer;
     function GetExternalSymbols: TExternalSymbolArray;
     function GetPLTGOTPatches: TPLTGOTPatchArray;
+    function GetEnergyStats: TEnergyStats;
   end;
 
 implementation
@@ -2552,6 +2555,15 @@ begin
   SetLength(Result, Length(FPLTGOTPatches));
   for i := 0 to High(FPLTGOTPatches) do
     Result[i] := FPLTGOTPatches[i];
+end;
+
+function TARM64Emitter.GetEnergyStats: TEnergyStats;
+begin
+  // Minimale Implementierung — gibt aktuelle Stats zurück.
+  // Vollständiges Energy-Tracking wird in Phase 3 ergänzt.
+  FEnergyStats.CodeSizeBytes := FCode.Size;
+  FEnergyStats.L1CacheFootprint := EstimateL1CacheFootprint(FCode.Size);
+  Result := FEnergyStats;
 end;
 
 end.

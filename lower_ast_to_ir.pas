@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager;
+  ast, ir, diag, lexer, unit_manager, backend_types;
 
 type
   TConstValue = class
@@ -279,6 +279,8 @@ procedure TIRLowering.Emit(instr: TIRInstr);
 begin
   if not Assigned(FCurrentFunc) then
     Exit;
+  // Energy-Kosten-Hinweis setzen basierend auf OpCode
+  SetEnergyCostHint(instr);
   FCurrentFunc.Emit(instr);
 end;
 
@@ -372,7 +374,10 @@ begin
          Continue;
        end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
-       // Lower function body
+        // Energy-Level aus AST übernehmen
+        // Workaround: Cast zu Integer und zurück, um Compiler-Problem zu umgehen
+        fn.EnergyLevel := TEnergyLevel(Ord(TAstFuncDecl(node).EnergyLevel));
+        // Lower function body
        FCurrentFunc := fn;
        FCurrentFuncDecl := TAstFuncDecl(node);
         FLocalMap.Clear;
@@ -1201,7 +1206,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
         // === Dynamic array builtins: push, pop, len, free ===
         // These need the base local slot index, not a lowered temp value.
-        if (TAstCall(expr).Name = 'push') and (argCount = 2) and
+        if ((TAstCall(expr).Name = 'push') or (TAstCall(expr).Name = 'append')) and (argCount = 2) and
            (TAstCall(expr).Args[0] is TAstIdent) then
         begin
           loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);

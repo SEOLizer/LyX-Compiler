@@ -1024,3 +1024,88 @@ skCon
 - `con int64` → immediate
 - `con pchar` → rodata label
 - `co` → stack slot, aber keine Store-Operation nach Init zulassen
+
+---
+
+## String-Verkettung (v0.4.1)
+
+Der `+` Operator kann für String-Verkettung verwendet werden:
+
+```lyx
+fn main(): int64 {
+  var s1: pchar := "Hello";
+  var s2: pchar := " World";
+  var result: pchar := s1 + s2;  // "Hello World"
+  return 0;
+}
+```
+
+**Implementierung:**
+- IR: Erkennung von `pchar + pchar` im Lowering
+- Runtime: `str_concat` builtin mit inline mmap und memcpy
+- Keine externen Dependencies (libc-frei)
+
+---
+
+## Energy-Aware-Compiling (v0.3.1+)
+
+Der Lyx-Compiler unterstützt Energy-Aware-Compiling, um energieeffizienten Maschinencode zu erzeugen.
+
+### CLI-Option
+
+```bash
+lyxc input.lyx -o output --target-energy=<1-5>
+```
+
+| Level | Name | Beschreibung |
+|-------|------|--------------|
+| 1 | Minimal | Loop Unrolling 4×, Battery-Optimierung, Cache-Lokalität |
+| 2 | Low | Loop Unrolling 2×, Battery-Optimierung |
+| 3 | Medium | Performance-optimiert, SIMD erlaubt |
+| 4 | High | Volle Performance, FPU erlaubt |
+| 5 | Extreme | Loop Unrolling 8×, AVX512 wenn verfügbar |
+
+### Sprach-Level-Pragma
+
+```lyx
+@energy(1)
+fn low_energy_function(): int64 {
+  // Diese Funktion wird mit Energy-Level 1 compiliert
+  return 0;
+}
+
+@energy(5)
+fn high_performance_function(): int64 {
+  // Diese Funktion wird mit Energy-Level 5 compiliert
+  return compute_heavy();
+}
+```
+
+### Energy-Statistiken
+
+Der Compiler gibt nach der Kompilation detaillierte Energie-Statistiken aus:
+
+```
+=== Energy Statistics ===
+Energy level:           3
+CPU family:             1
+Optimize for battery:   TRUE
+
+Total ALU operations:   42
+Total FPU operations:   0
+Total memory accesses:  17
+Total branches:         8
+Total syscalls:         3
+
+Estimated energy units: 16955
+Code size:              846 bytes
+L1 cache footprint:     846 bytes
+```
+
+### Architektur
+
+- **energy_model.pas**: Zentrale Energy-Konfiguration, CPU-Modelle, Kosten-Tabellen
+- **backend_types.pas**: TEnergyLevel, TCPUFamily Enums
+- **IR**: EnergyCostHint pro Instruktion, GetIROpEnergyCost()
+- **x86_64_emit.pas / arm64_emit.pas**: TrackEnergy(), SetEnergyLevel()
+- **Parser**: @energy(level) Attribut vor Funktionen
