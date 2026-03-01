@@ -1098,6 +1098,7 @@ StrCopy(dest, source);  // User stellt Buffer bereit
 - **Destination-Buffer selbst bereitstellen** - Nie davon ausgehen, dass Funktionen Speicher allozieren
 - **Buffergröße validieren** - Vor Kopieroperationen mit `StrLength()` prüfen
 - **Bei Unsicherheit** - `std/alloc` für explizite Allokation nutzen
+- **Puffer vorinitialisieren** - Mit Leerzeichen oder Nullen, um alte Daten zu überschreiben
 
 ### 5. Visuelle Unterstützung (Koordinatensystem)
 Lyx nutzt ein **Screen-Koordinatensystem** (Y zeigt nach unten):
@@ -1112,6 +1113,10 @@ std/vector (Vec2):
 └─────────────────────┘
 ```
 
+**Rect:** `min` ist oben-links (Top-Left), `max` ist unten-rechts (Bottom-Right)
+
+**Rotation:** Positive Winkel rotieren im Uhrzeigersinn (aufgrund der invertierten Y-Achse)
+
 **Wichtig:** Bei geo-Berechnungen wird **mathematisch** gerechnet (Y zeigt nach oben), bei UI-Grafiken **screen-basiert** (Y zeigt nach unten).
 
 ### 6. The Lyx Way (Best Practices)
@@ -1124,6 +1129,23 @@ std/vector (Vec2):
 3. **Pool-Allocator** - Bei vielen gleichartigen Objekten
 4. **Result-Typen** - Bei Funktionen die fehlschlagen können
 5. **Buffer selbst bereitstellen** - Keine versteckten Allokationen
+
+**Fehlerbehandlung mit std/result:**
+Nutze konsequent `std/result`. Anstatt bei einer Division durch Null abzustürzen, erlaubt SafeDiv einen eleganten Fallback:
+
+```lyx
+import std.result;
+import std.io;
+
+fn divide(a, b: int64): void {
+  var res := SafeDiv(a, b);
+  if (ResultInt64IsOk(res)) {
+    PrintIntLn(ResultInt64Unwrap(res));
+  } else {
+    PrintLn("Fehler: Division durch Null!");
+  }
+}
+```
 
 ---
 
