@@ -14,6 +14,8 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/color` | RGBA Farben, HSL, Hex-Konvertierung |
 | `std/list` | Dynamische Listen, RingBuffer, Stack, Queue |
 | `std/result` | Result/Option Pattern für Error-Handling |
+| `std/conv` | Integer-Formatierung, Bit-Manipulation, Endianness |
+| `std/hash` | FNV-1a, DJB2, CRC32, SHA-256 (simplified), Password-Hashing |
 | `std/string` | String-Manipulation und -Suche |
 | `std/io` | Print/Printf, Formatierung |
 | `std/env` | Command-Line Argumente |
@@ -96,6 +98,69 @@ var y: int64 := Min64(1, 2);
 - `IsPowerOfTwo(x: int64): bool` - Ist 2er-Potenz?
 - `PopCount(x: int64): int64` - Anzahl gesetzter Bits
 - `Log2(x: int64): int64` - Logarithmus zur Basis 2
+- `Atan2Microdegrees(y, x: int64): int64` - Atan2 in Microdegrees
+- `Cos64Inverse(cos_value: int64): int64` - Inverser Kosinus
+
+---
+
+## std/conv.lyx
+
+Conversion & Bit-Manipulation utilities.
+
+### Integer zu String
+- `IntToStr(n: int64): pchar` - Dezimal-String
+- `IntToHex(val, digits: int64): pchar` - Hex-String (1-16 Stellen)
+- `IntToHex8/16/32/64(val: int64): pchar` - Hex mit fester Breite
+- `IntToBin(val, bits: int64): pchar` - Binary-String
+- `IntToBin8/16/32/64(val: int64): pchar` - Binary mit fester Breite
+- `IntToOct(val, digits: int64): pchar` - Oktal-String
+- `IntToStrWithComma(n: int64): pchar` - Mit Tausendertrennzeichen
+- `IntToStrWithUnderscore(n: int64): pchar` - Mit Underscore
+
+### String zu Integer
+- `ParseHex(s: pchar): int64` - Hex-String zu int64
+- `ParseBin(s: pchar): int64` - Binary-String zu int64
+- `ParseOct(s: pchar): int64` - Oktal-String zu int64
+
+### Bit-Manipulation
+- `GetBit(val, bit_pos: int64): bool` - Bit lesen
+- `SetBit(val, bit_pos: int64): int64` - Bit auf 1 setzen
+- `ClearBit(val, bit_pos: int64): int64` - Bit auf 0 setzen
+- `ToggleBit(val, bit_pos: int64): int64` - Bit invertieren
+- `ExtractBits(val, start, count: int64): int64` - Bits extrahieren
+- `InsertBits(val, bits, start, count: int64): int64` - Bits einfügen
+
+### Bit-Zählen
+- `CountLeadingZeros(val: int64): int64` - Führende Nullen
+- `CountTrailingZeros(val: int64): int64` - Nachfolgende Nullen
+
+### Endianness
+- `SwapEndian16(val: int64): int64` - 16-Bit Byte-Reihenfolge tauschen
+- `SwapEndian32(val: int64): int64` - 32-Bit Byte-Reihenfolge tauschen
+- `SwapEndian64(val: int64): int64` - 64-Bit Byte-Reihenfolge tauschen
+
+### Byte-Operationen
+- `GetByte(val, byte_pos: int64): int64` - Einzelnes Byte lesen
+- `SetByte(val, byte_pos, byte_val: int64): int64` - Einzelnes Byte schreiben
+
+### Bit-Rotation
+- `RotateLeft32(val, n: int64): int64` - Links rotieren (32-Bit)
+- `RotateRight32(val, n: int64): int64` - Rechts rotieren (32-Bit)
+
+### Vorzeichen-Erweiterung
+- `SignExtend8(val: int64): int64` - 8-Bit Vorzeichen erweitern
+- `SignExtend16(val: int64): int64` - 16-Bit Vorzeichen erweitern
+- `SignExtend32(val: int64): int64` - 32-Bit Vorzeichen erweitern
+
+### Null-Erweiterung
+- `ZeroExtend8(val: int64): int64` - 8-Bit Null erweitern
+- `ZeroExtend16(val: int64): int64` - 16-Bit Null erweitern
+- `ZeroExtend32(val: int64): int64` - 32-Bit Null erweitern
+
+### Alignment
+- `AlignDown(addr, alignment: int64): int64` - Abwärts ausrichten
+- `AlignUp(addr, alignment: int64): int64` - Aufwärts ausrichten
+- `IsAligned(addr, alignment: int64): bool` - Prüfen ob ausgerichtet
 
 ---
 
@@ -406,6 +471,88 @@ struct QueueInt64 {
 - `QueueInt64New(): QueueInt64`
 - `QueueInt64Enqueue(q: QueueInt64, value: int64): bool`
 - `QueueInt64Dequeue(q: QueueInt64): int64`
+
+---
+
+## std/hash.lyx
+
+Hash-Funktionen für Datenstrukturen, Integrität und Passwörter.
+
+### FNV-1a (Fast Non-Cryptographic)
+- `HashFNV1a32(data: pchar): int64` - 32-bit FNV-1a
+- `HashFNV1a64(data: pchar): int64` - 64-bit FNV-1a
+- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Längenangabe
+
+### Weitere Non-Cryptographic
+- `HashDJB2(data: pchar): int64` - DJB2 Hash
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur2Default(data: pchar): int64` - MurmurHash2 mit seed=0
+- `HashCRC32(data: pchar): int64` - CRC32 Checksum
+- `HashBytes(data: array[256]int64, len: int64): int64` - Byte-Array Hash
+- `HashInt64(key: int64): int64` - Integer Hash (64-bit)
+- `HashInt32(key: int64): int64` - Integer Hash (32-bit)
+
+### Cryptographic (Simplified)
+- `HashSHA256(data: pchar): int64` - SHA-256 (vereinfacht)
+- `HashSHA3_224(data: pchar): int64` - SHA-3-224
+- `HashSHA3_256(data: pchar): int64` - SHA-3-256
+- `HashSHA3_512(data: pchar): int64` - SHA-3-512
+- `HashSHA3_256Hex(data: pchar): pchar` - SHA-3-256 als Hex
+- `HashKeccak(data: pchar): int64` - Raw Keccak-1600
+- `HashSHAKE128(data: pchar, output_bits: int64): int64` - SHAKE128 XOF
+- `HashSHAKE256(data: pchar, output_bits: int64): int64` - SHAKE256 XOF
+- `HashBLAKE3(data: pchar): int64` - BLAKE3 (schnell)
+- `HashBLAKE3Hex(data: pchar): pchar` - BLAKE3 als Hex
+
+### Non-Cryptographic (Fast)
+- `HashFNV1a32/64(data: pchar): int64` - FNV-1a
+- `HashDJB2(data: pchar): int64` - DJB2
+- `HashMurmur2(data: pchar, seed: int64): int64` - MurmurHash2
+- `HashMurmur3_32(data: pchar, seed: int64): int64` - MurmurHash3
+- `HashCity32(data: pchar): int64` - CityHash32
+- `HashCity64(data: pchar): int64` - CityHash64
+- `HashCity64Hex(data: pchar): pchar` - CityHash64 als Hex
+- `HashFarm32(data: pchar): int64` - FarmHash32
+- `HashFarm64(data: pchar): int64` - FarmHash64
+- `HashFarm64Hex(data: pchar): pchar` - FarmHash64 als Hex
+- `HashxxHash32(data: pchar): int64` - xxHash32 (sehr schnell)
+- `HashxxHash64(data: pchar): int64` - xxHash64
+- `HashCRC32(data: pchar): int64` - CRC32
+- `HashInt64/32(key: int64): int64` - Integer Hash
+
+### Password Hashing
+- `HashPassword(password: pchar, salt: pchar): int64` - Mit String-Salt
+- `HashPasswordSimple(password: pchar, salt: int64): int64` - Mit Numeric-Salt
+
+### Secure Password Hashing (KDF)
+- `HashPBKDF2(password, salt: pchar, iterations: int64): int64` - PBKDF2-HMAC-SHA256
+- `HashPBKDF2Default(password, salt: pchar): int64` - PBKDF2 mit Standard-Iterationen
+- `HashPBKDF2Hex(password, salt: pchar, iterations: int64): pchar` - PBKDF2 als Hex
+- `HashBCrypt(password: pchar, cost: int64): int64` - bcrypt
+- `HashBCryptHex(password: pchar, cost: int64): pchar` - bcrypt als Hex
+- `HashBCryptFormatted(password: pchar, cost: int64): pchar` - bcrypt Formatted ($2a$...)
+- `BCryptVerify(password: pchar, hash: int64): bool` - bcrypt verifizieren
+- `HashArgon2d/i/id(password, salt: pchar, memory, iterations, parallelism): int64` - Argon2
+- `HashArgon2(password, salt: pchar): int64` - Argon2id (Standard)
+- `HashArgon2Hex(password, salt: pchar): pchar` - Argon2 als Hex
+- `HashArgon2Formatted(password, salt: pchar): pchar` - Argon2 Formatted
+- `Argon2Verify(password: pchar, hash: int64): bool` - Argon2 verifizieren
+- `HashScrypt(password, salt: pchar, n, r, p: int64): int64` - Scrypt
+- `HashScryptDefault(password, salt: pchar): int64` - Scrypt mit Standard-Parametern
+- `HashScryptHex(password, salt: pchar): pchar` - Scrypt als Hex
+
+### Password Utilities
+- `ComparePasswordHashes(hash1, hash2: int64): bool` - Constant-time Vergleich
+- `GenerateSalt(len: int64): int64` - Salt generieren
+- `PasswordStrength(password: pchar): int64` - Stärke-Score (0-4)
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
+- `VerifyHash(data: pchar, algorithm: int64, expected_hex: pchar): bool` - Hash verifizieren
+
+### Utilities
+- `HashTableIndex(key: pchar, table_size: int64): int64` - Hash-Tabellen Index
 
 ---
 
