@@ -31,6 +31,23 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 
 ---
 
+## Namensraum-Konvention
+
+Nach `import std.math;` werden alle Funktionen **global** importiert und können direkt aufgerufen werden:
+
+```lyx
+import std.math;
+
+var x: int64 := Abs64(-42);  // Nicht: math.Abs64()
+var y: int64 := Min64(1, 2);
+```
+
+**Achtung:** Bei Namenskollisionen (z.B. `std.list` und `std.string` haben beide `Length()`) gewinnt der zuletzt importierte Namespace. Um Kollisionen zu vermeiden:
+
+1. **Reihenfolge beachten** - Imports nach Priorität sortieren
+2. **Direktimport** - Nur benötigte Funktionen importieren (falls unterstützt)
+3. **Vermeiden** - Nicht mehrere Units mit gleichen Funktionsnamen mischen
+
 ## std/math.lyx
 
 ### Basis-Integer-Mathematik
@@ -985,6 +1002,149 @@ var ptr: Ptr := pool_alloc(pool, 256);
 
 // Alles freigeben
 pool_release(pool);
+```
+
+---
+
+## std/hash.lyx
+
+Hash-Funktionen für Datenstrukturen, Integritätsprüfungen und Passwort-Hashing.
+
+### FNV-1a (Fast Non-Cryptographic)
+- `HashFNV1a32(data: pchar): int64` - FNV-1a 32-bit Hash
+- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Länge
+- `HashFNV1a64(data: pchar): int64` - FNV-1a 64-bit Hash
+- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### CRC32 (Checksum)
+- `HashCRC32(data: pchar): int64` - CRC32 Checksum
+- `HashCRC32Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### SHA-256 (Cryptographic)
+- `SHA256(data: pchar): int64` - SHA-256 Hash (erste 8 Bytes)
+- `SHA256Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### MD5 (Legacy)
+- `HashMD5(data: pchar): int64` - MD5 Hash
+- `HashMD5Bytes(data: pchar, len: int64): int64` - Mit Länge
+- `HashMD5File(path: pchar, chunk_size: int64): int64` - Datei-Hashing
+
+### Passwort-Hashing
+- `Argon2(password: pchar, salt: pchar): int64` - Argon2
+- `Bcrypt(password: pchar, salt: pchar): int64` - Bcrypt
+- `PBKDF2(password: pchar, salt: pchar, iterations: int64): int64` - PBKDF2
+- `Scrypt(password: pchar, salt: pchar): int64` - Scrypt
+
+---
+
+## Highlights der Architektur
+
+### Microdegrees
+Die Entscheidung, **int64 für Koordinaten und Winkel** zu nutzen (`1° = 1.000.000 µ°`), umgeht geschickt die typischen Präzisionsprobleme von Floating-Point-Zahlen in kritischen Bereichen wie GPS oder Trigonometrie.
+
+### Erhöhte Robustheit
+Die **`std/result`** Unit bringt moderne Error-Handling-Patterns in eine systemnahe Sprache, was besonders bei Dateioperationen (`std/fs`) und Speicherallokation (`std/alloc`) Abstürze verhindert.
+
+### Vielseitigkeit
+Von **Low-Level-Bit-Manipulationen** bis hin zu **High-Level-JSON-Parsing** ist alles abgedeckt, was man für moderne CLI- oder System-Tools benötigt.
+
+---
+
+## Koordinatensysteme (Geo-Übersicht)
+
+Lyx nutzt **Microdegrees** für alle Geodaten:
+- `1° = 1.000.000 µ°`
+- Koordinaten werden als int64 gespeichert
+
+**Beispiel:** Berlin
+```
+Breite: 52.52° → 52520000 µ°
+Länge:  13.405° → 13405000 µ°
+```
+
+---
+
+## Pro-Tipps für die Verwendung
+
+### 1. Performance bei Listen
+In `std/list.lyx` hast du die Wahl zwischen **ListInt64** (Heap) und **StaticList** (Stack).
+
+- **Nutze StaticList**, wenn die maximale Anzahl an Elementen (8 oder 16) bekannt ist. Das spart den Overhead für malloc/free.
+- **Nutze den Pool-Allocator** aus `std/alloc`, wenn du viele kleine Objekte derselben Lebensdauer hast (z.B. beim Parsen eines JSON-Baums).
+
+### 2. Sicherer Umgang mit Strings
+Da `pchar` in Lyx ein klassischer Null-terminierter Pointer ist, solltest du bei `StrConcat` und `StrCopy` immer sicherstellen, dass der Ziel-Buffer groß genug ist.
+
+**Wichtig:** Nutze `StrLength(s)` aus den Builtins, um vor Kopieroperationen die Buffergröße zu validieren.
+
+### 3. Geodaten-Berechnungen
+Bei der Nutzung von `DistanceMCorrected` in `std/geo` wird die Längengrad-Distanz basierend auf dem Breitengrad angepasst. Das ist für kurze bis mittlere Distanzen (bis zu ein paar hundert Kilometern) extrem performant und präzise genug, ohne die rechenintensive Haversine-Formel nutzen zu müssen:
+
+```
+d ≈ √((x₂ - x₁)² · cos(lat)² + (y₂ - y₁)²)
+```
+
+### 4. Speicher-Management Guide (Ownership)
+Die meisten String-Funktionen in `std/string` **erwarten einen vorallozierten Destination-Buffer** (`dest`), um versteckte Heap-Allokationen zu vermeiden:
+
+```lyx
+import std.string;
+
+var dest: pchar := "                                                                                ";
+StrCopy(dest, source);  // User stellt Buffer bereit
+```
+
+**Regeln:**
+- **Destination-Buffer selbst bereitstellen** - Nie davon ausgehen, dass Funktionen Speicher allozieren
+- **Buffergröße validieren** - Vor Kopieroperationen mit `StrLength()` prüfen
+- **Bei Unsicherheit** - `std/alloc` für explizite Allokation nutzen
+- **Puffer vorinitialisieren** - Mit Leerzeichen oder Nullen, um alte Daten zu überschreiben
+
+### 5. Visuelle Unterstützung (Koordinatensystem)
+Lyx nutzt ein **Screen-Koordinatensystem** (Y zeigt nach unten):
+
+```
+std/vector (Vec2):
+┌─────────────────────┐
+│ (0,0)        (w,0) │
+│                     │
+│                     │
+│ (0,h)        (w,h) │
+└─────────────────────┘
+```
+
+**Rect:** `min` ist oben-links (Top-Left), `max` ist unten-rechts (Bottom-Right)
+
+**Rotation:** Positive Winkel rotieren im Uhrzeigersinn (aufgrund der invertierten Y-Achse)
+
+**Wichtig:** Bei geo-Berechnungen wird **mathematisch** gerechnet (Y zeigt nach oben), bei UI-Grafiken **screen-basiert** (Y zeigt nach unten).
+
+### 6. The Lyx Way (Best Practices)
+
+> **Tipp:** Vermeide nach Möglichkeit `f64` für kritische Berechnungen. Nutze die `std/math` Fixed-Point-Funktionen für maximale Performance und deterministische Ergebnisse auf allen Zielsystemen.
+
+**Best Practices:**
+1. **int64 bevorzugen** - Für Koordinaten, Winkel, Geldbeträge
+2. **Microdegrees nutzen** - `1° = 1.000.000 µ°` für Geodaten
+3. **Pool-Allocator** - Bei vielen gleichartigen Objekten
+4. **Result-Typen** - Bei Funktionen die fehlschlagen können
+5. **Buffer selbst bereitstellen** - Keine versteckten Allokationen
+
+**Fehlerbehandlung mit std/result:**
+Nutze konsequent `std/result`. Anstatt bei einer Division durch Null abzustürzen, erlaubt SafeDiv einen eleganten Fallback:
+
+```lyx
+import std.result;
+import std.io;
+
+fn divide(a, b: int64): void {
+  var res := SafeDiv(a, b);
+  if (ResultInt64IsOk(res)) {
+    PrintIntLn(ResultInt64Unwrap(res));
+  } else {
+    PrintLn("Fehler: Division durch Null!");
+  }
+}
 ```
 
 ---
