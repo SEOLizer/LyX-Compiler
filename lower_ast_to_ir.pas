@@ -1067,6 +1067,11 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           tkOr:    instr.Op := irOr;
           tkNor:   instr.Op := irNor;
           tkXor:   instr.Op := irXor;
+          tkBitAnd:    instr.Op := irAnd;
+          tkBitOr:     instr.Op := irOr;
+          tkBitXor:    instr.Op := irXor;
+          tkShiftLeft: instr.Op := irShl;
+          tkShiftRight:instr.Op := irShr;
           tkNullCoalesce:
             begin
               // x ?? y: if x == 0 (null), use y, else use x
@@ -1185,6 +1190,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           tkNot:
             begin
               instr.Op := irNot;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              Emit(instr);
+            end;
+          tkBitNot:
+            begin
+              instr.Op := irBitNot;
               instr.Dest := t0;
               instr.Src1 := t1;
               Emit(instr);
