@@ -989,4 +989,53 @@ pool_release(pool);
 
 ---
 
+## Highlights der Architektur
+
+### Microdegrees
+Die Entscheidung, **int64 für Koordinaten und Winkel** zu nutzen (`1° = 1.000.000 µ°`), umgeht geschickt die typischen Präzisionsprobleme von Floating-Point-Zahlen in kritischen Bereichen wie GPS oder Trigonometrie.
+
+### Erhöhte Robustheit
+Die **`std/result`** Unit bringt moderne Error-Handling-Patterns in eine systemnahe Sprache, was besonders bei Dateioperationen (`std/fs`) und Speicherallokation (`std/alloc`) Abstürze verhindert.
+
+### Vielseitigkeit
+Von **Low-Level-Bit-Manipulationen** bis hin zu **High-Level-JSON-Parsing** ist alles abgedeckt, was man für moderne CLI- oder System-Tools benötigt.
+
+---
+
+## Koordinatensysteme (Geo-Übersicht)
+
+Lyx nutzt **Microdegrees** für alle Geodaten:
+- `1° = 1.000.000 µ°`
+- Koordinaten werden als int64 gespeichert
+
+**Beispiel:** Berlin
+```
+Breite: 52.52° → 52520000 µ°
+Länge:  13.405° → 13405000 µ°
+```
+
+---
+
+## Pro-Tipps für die Verwendung
+
+### 1. Performance bei Listen
+In `std/list.lyx` hast du die Wahl zwischen **ListInt64** (Heap) und **StaticList** (Stack).
+
+- **Nutze StaticList**, wenn die maximale Anzahl an Elementen (8 oder 16) bekannt ist. Das spart den Overhead für malloc/free.
+- **Nutze den Pool-Allocator** aus `std/alloc`, wenn du viele kleine Objekte derselben Lebensdauer hast (z.B. beim Parsen eines JSON-Baums).
+
+### 2. Sicherer Umgang mit Strings
+Da `pchar` in Lyx ein klassischer Null-terminierter Pointer ist, solltest du bei `StrConcat` und `StrCopy` immer sicherstellen, dass der Ziel-Buffer groß genug ist.
+
+**Wichtig:** Nutze `StrLength(s)` aus den Builtins, um vor Kopieroperationen die Buffergröße zu validieren.
+
+### 3. Geodaten-Berechnungen
+Bei der Nutzung von `DistanceMCorrected` in `std/geo` wird die Längengrad-Distanz basierend auf dem Breitengrad angepasst. Das ist für kurze bis mittlere Distanzen (bis zu ein paar hundert Kilometern) extrem performant und präzise genug, ohne die rechenintensive Haversine-Formel nutzen zu müssen:
+
+```
+d ≈ √((x₂ - x₁)² · cos(lat)² + (y₂ - y₁)²)
+```
+
+---
+
 *Hinweis: Zusätzlich stehen 22 native Math-Builtins zur Verfügung (siehe Haupt-README).*
