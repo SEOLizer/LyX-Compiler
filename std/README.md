@@ -28,6 +28,7 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/json` | JSON Parser und Serializer |
 | `std/alloc` | Explizite Speicherverwaltung (malloc/free, Pool) |
 | `std/hash` | Hash-Funktionen (FNV, CRC32, SHA-256) |
+| `std/sort` | Effiziente Sortieralgorithmen (QuickSort) |
 
 ---
 
@@ -1144,6 +1145,37 @@ fn divide(a, b: int64): void {
   } else {
     PrintLn("Fehler: Division durch Null!");
   }
+}
+```
+
+---
+
+## std/sort.lyx
+
+Effiziente Sortieralgorithmen für int64-Arrays.
+
+### SortInt64
+- `SortInt64(arr: Ptr, len: int64): void` - Sortiert ein int64-Array in-place
+
+### Algorithmus
+- **Hybrid QuickSort** mit Median-of-Three Pivot-Strategie
+- **InsertionSort** für kleine Partitionen (< 10 Elemente)
+- **In-Place** - Minimaler Speicherverbrauch (nur Stack für Rekursion)
+
+### Median-of-Three
+Die Pivot-Auswahl nutzt den Median aus erstem, mittlerem und letztem Element, um den Worst-Case bei bereits sortierten Daten zu vermeiden.
+
+**Beispiel:**
+```lyx
+import std.sort;
+
+fn main(): int64 {
+  var arr: array[5]int64;
+  arr[0] := 5; arr[1] := 3; arr[2] := 8; arr[3] := 1; arr[4] := 9;
+  
+  SortInt64(arr, 5);  // arr ist jetzt [1, 3, 5, 8, 9]
+  
+  return 0;
 }
 ```
 
