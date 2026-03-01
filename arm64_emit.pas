@@ -1254,6 +1254,10 @@ begin
   begin
     fn := module.Functions[i];
     
+    // Energy-Level für diese Funktion setzen (falls spezifiziert)
+    if fn.EnergyLevel > eelNone then
+      SetEnergyLevel(fn.EnergyLevel);
+    
     // Record function offset
     SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
     FFuncOffsets[High(FFuncOffsets)] := FCode.Size;

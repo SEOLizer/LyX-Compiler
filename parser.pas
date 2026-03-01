@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, lexer, ast;
+  diag, lexer, ast, backend_types;
 
 type
   TParser = class
@@ -264,6 +264,12 @@ begin
   end;
   if Check(tkFn) then
     Exit(ParseFuncDecl(False));
+  // @energy(level) Attribut vor Funktion
+  if Check(tkAt) then
+  begin
+    // Try parsing as function (ParseFuncDecl handles @energy)
+    Exit(ParseFuncDecl(False));
+  end;
   if Check(tkCon) then
     Exit(ParseConDecl(False));
   if Check(tkType) then
@@ -284,7 +290,32 @@ var
   retTypeName: string;
   body: TAstBlock;
   arrLen: Integer;
+  energyLevel: TEnergyLevel;
+  level: Integer;
 begin
+  // @energy(level) Attribut parsen, falls vorhanden
+  energyLevel := eelNone;
+  if Check(tkAt) then
+  begin
+    Advance;
+    if Check(tkIdent) and (FCurTok.Value = 'energy') then
+    begin
+      Advance;
+      Expect(tkLParen);
+      if Check(tkIntLit) then
+      begin
+        try
+          level := StrToInt(FCurTok.Value);
+          if (level >= 1) and (level <= 5) then
+            energyLevel := TEnergyLevel(level);
+        except
+        end;
+        Advance;
+      end;
+      Expect(tkRParen);
+    end;
+  end;
+  
   // fn
   Expect(tkFn);
   if Check(tkIdent) then
@@ -318,6 +349,7 @@ begin
   body := ParseBlock;
   Result := TAstFuncDecl.Create(name, params, retType, body, FCurTok.Span, isPub);
   Result.ReturnTypeName := retTypeName;
+  Result.EnergyLevel := energyLevel;
 end;
 
 function TParser.ParseConDecl(isPub: Boolean): TAstConDecl;
@@ -1782,7 +1814,6 @@ begin
     params[High(params)] := p;
     if Accept(tkComma) then Continue else Break;
   end;
-  Result := params;
-end;
-
+    Result := params;
+  end;
 end.

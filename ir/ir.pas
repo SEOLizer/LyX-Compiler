@@ -4,7 +4,7 @@ unit ir;
 interface
 
 uses
-  SysUtils, Classes, ast; // für TAurumType
+  SysUtils, Classes, ast, backend_types; // für TAurumType und TEnergyLevel
 
 type
   TIRCallMode = (
@@ -107,6 +107,7 @@ type
     Instructions: TIRInstructionList;
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
+    EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
@@ -152,6 +153,7 @@ begin
   Instructions := nil;
   LocalCount := 0;
   ParamCount := 0;
+  EnergyLevel := eelNone; // eelNone = use global level
 end;
 
 destructor TIRFunction.Destroy;
