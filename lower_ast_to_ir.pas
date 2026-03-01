@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager;
+  ast, ir, diag, lexer, unit_manager, backend_types;
 
 type
   TConstValue = class
@@ -374,7 +374,10 @@ begin
          Continue;
        end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
-       // Lower function body
+        // Energy-Level aus AST übernehmen
+        // Workaround: Cast zu Integer und zurück, um Compiler-Problem zu umgehen
+        fn.EnergyLevel := TEnergyLevel(Ord(TAstFuncDecl(node).EnergyLevel));
+        // Lower function body
        FCurrentFunc := fn;
        FCurrentFuncDecl := TAstFuncDecl(node);
         FLocalMap.Clear;

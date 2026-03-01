@@ -705,6 +705,10 @@ begin
 
     for i := 0 to High(module.Functions) do
     begin
+      // Energy-Level für diese Funktion setzen (falls spezifiziert)
+      if module.Functions[i].EnergyLevel > eelNone then
+        SetEnergyLevel(module.Functions[i].EnergyLevel);
+        
       // record function start label for calls
       SetLength(FLabelPositions, Length(FLabelPositions) + 1);
       FLabelPositions[High(FLabelPositions)].Name := module.Functions[i].Name;

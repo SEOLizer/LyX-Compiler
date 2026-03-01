@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, lexer;
+  diag, lexer, backend_types;
 
 type
   { --- Aurum-Typsystem --- }
@@ -504,6 +504,7 @@ type
     FIsStatic: Boolean; // true for static methods (no self parameter)
     FVisibility: TVisibility; // for class members (default: visPublic)
     FLibraryName: string; // for extern functions: e.g., "libm.so.6"
+    FEnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (eelNone = use global)
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -519,6 +520,7 @@ type
     property IsStatic: Boolean read FIsStatic write FIsStatic;
     property Visibility: TVisibility read FVisibility write FVisibility;
     property LibraryName: string read FLibraryName write FLibraryName;
+    property EnergyLevel: TEnergyLevel read FEnergyLevel write FEnergyLevel;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -1674,6 +1676,7 @@ begin
   FIsPublic := aIsPublic;
   FIsStatic := False;
   FVisibility := visPublic; // default: public
+  FEnergyLevel := eelNone; // eelNone = use global level from --target-energy
 end;
 
 destructor TAstFuncDecl.Destroy;
