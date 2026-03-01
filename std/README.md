@@ -821,6 +821,7 @@ Prozess-Management für CLI-Tools und System-Integration.
 ### Typen
 - `Process` - Process Handle (int64, speichert PID)
 - `ExitCode` - Exit-Status (0 = Erfolg, >0 = Fehler)
+- `StringList` - Argumentliste für run_args (statisches Array von pchar)
 
 ### Konstanten
 - `WNOHANG` - Non-blocking wait
@@ -838,9 +839,13 @@ Prozess-Management für CLI-Tools und System-Integration.
 - `terminate_force(pid: int64): int64` - Force beenden (SIGKILL)
 - `self_pid(): int64` - Eigene PID abrufen
 
-### Shell
+### Shell & Argument-Programme
 - `shell(cmd: pchar): ExitCode` - Shell-Befehl ausführen (`/bin/sh -c "cmd"`)
-  - **Warnung**: Sicherheitsrisiko bei User-Input!
+  - ⚠️ **Sicherheitsrisiko**: Nutzer-Input kann Shell-Metacharacter interpretieren
+  - Vermeide bei User-Input — nutze stattdessen `run_args()`
+- `run_args(prog: pchar, args: StringList): ExitCode` - Programm direkt ausführen (empfohlen)
+  - Nutzt `execvp` statt Shell — keine Shell-Injection möglich
+  - `args` muss mit NULL (0) enden
 
 **Beispiel:**
 ```lyx
@@ -854,6 +859,14 @@ fn main(): int64 {
   var pid: int64 := spawn("/bin/sleep");
   // ... andere Arbeit ...
   exit_code := wait(pid);
+  
+  // Sicher: run_args statt shell() bei User-Input
+  var args: StringList;
+  args.data[0] := "/bin/ls";     // Programmname
+  args.data[1] := "-la";          // Argument 1
+  args.data[2] := "/tmp";         // Argument 2
+  args.data[3] := 0;              // NULL-terminieren!
+  exit_code := run_args("/bin/ls", args);
   
   return 0;
 }
