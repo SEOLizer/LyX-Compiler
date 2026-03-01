@@ -4,7 +4,7 @@ unit ir;
 interface
 
 uses
-  SysUtils, Classes, ast; // für TAurumType
+  SysUtils, Classes, ast, backend_types; // für TAurumType und TEnergyLevel
 
 type
   TIRCallMode = (
@@ -82,19 +82,21 @@ type
     Src1: Integer;
     Src2: Integer;
     Src3: Integer; // for 3-operand instructions like irStoreElemDyn
-     ImmInt: Int64; // usage depends on Op: e.g., const int or width bits for ext/trunc
-     ImmFloat: Double; // for irConstFloat - stores actual float value
-     ImmStr: string;
-     LabelName: string;
-     // Cast-specific fields
-      CastFromType: TAurumType;  // source type for cast operations
-      CastToType: TAurumType;    // target type for cast operations
-     // Call-specific fields
-     CallMode: TIRCallMode;   // mode for irCall/irVarCall
-     ArgTemps: array of Integer; // argument temp indices for calls (replaces CSV in LabelName)
-     // Struct return fields (for irReturnStruct)
-     StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
-     StructAlign: Integer;  // alignment of struct
+    ImmInt: Int64; // usage depends on Op: e.g., const int or width bits for ext/trunc
+    ImmFloat: Double; // for irConstFloat - stores actual float value
+    ImmStr: string;
+    LabelName: string;
+    // Energy-Tracking: geschätzter Energieverbrauch dieser Instruktion
+    EnergyCostHint: UInt64;
+    // Cast-specific fields
+    CastFromType: TAurumType;  // source type for cast operations
+    CastToType: TAurumType;    // target type for cast operations
+    // Call-specific fields
+    CallMode: TIRCallMode;   // mode for irCall/irVarCall
+    ArgTemps: array of Integer; // argument temp indices for calls (replaces CSV in LabelName)
+    // Struct return fields (for irReturnStruct)
+    StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
+    StructAlign: Integer;  // alignment of struct
   end;
 
    TIRInstructionList = array of TIRInstr;
@@ -105,6 +107,7 @@ type
     Instructions: TIRInstructionList;
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
+    EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
@@ -134,6 +137,11 @@ type
     function AddGlobalArray(const name: string; const values: array of Int64): Integer;
   end;
 
+{ Berechnet die geschätzten Energiekosten für einen IR-OpCode }
+function GetIROpEnergyCost(op: TIROpKind): UInt64;
+{ Setzt die Energiekosten-Hinweis für eine IR-Instruktion basierend auf ihrem OpCode }
+procedure SetEnergyCostHint(var instr: TIRInstr);
+
 implementation
 
 { TIRFunction }
@@ -145,6 +153,7 @@ begin
   Instructions := nil;
   LocalCount := 0;
   ParamCount := 0;
+  EnergyLevel := eelNone; // eelNone = use global level
 end;
 
 destructor TIRFunction.Destroy;
@@ -251,6 +260,59 @@ begin
   GlobalVars[Result].InitValue := 0;
 end;
 
+{ Berechnet die geschätzten Energiekosten für einen IR-OpCode }
+function GetIROpEnergyCost(op: TIROpKind): UInt64;
+begin
+  Result := 0;
+  case op of
+    // ALU-Operationen (niedrige Kosten)
+    irAdd, irSub, irMul, irDiv, irMod, irNeg, irNot,
+    irAnd, irOr, irNor, irXor,
+    irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
+    irSExt, irZExt, irTrunc:
+      Result := 1;
+    // FPU-Operationen (mittlere Kosten)
+    irFAdd, irFSub, irFMul, irFDiv, irFNeg,
+    irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
+    irFToI, irIToF:
+      Result := 3;
+    // Speicher-Operationen (hohe Kosten)
+    irLoadLocal, irStoreLocal, irLoadLocalAddr,
+    irLoadGlobal, irStoreGlobal, irLoadGlobalAddr,
+    irLoadStructAddr, irStackAlloc,
+    irStoreElem, irLoadElem, irStoreElemDyn,
+    irLoadField, irStoreField, irLoadFieldHeap, irStoreFieldHeap,
+    irAlloc, irFree,
+    irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
+      Result := 100;
+    // Branch-Operationen (mittlere Kosten)
+    irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
+    irReturn, irReturnStruct, irVarCall:
+      Result := 50;
+    // Builtin-Calls (können Syscalls sein)
+    irCallBuiltin:
+      Result := 10; // Wird zur Laufzeit genauer aufgelöst
+    // Konstanten (sehr niedrige Kosten)
+    irConstInt, irConstStr, irConstFloat:
+      Result := 0;
+    // Andere
+    irLabel:
+      Result := 0;
+    irCast:
+      Result := 1;
+    irPanic:
+      Result := 5000;
+    else
+      Result := 1;
+  end;
+end;
+
+{ Setzt die Energiekosten-Hinweis für eine IR-Instruktion basierend auf ihrem OpCode }
+procedure SetEnergyCostHint(var instr: TIRInstr);
+begin
+  instr.EnergyCostHint := GetIROpEnergyCost(instr.Op);
+end;
+
 { Initialize a TIRInstr with safe default values }
 procedure InitInstr(out instr: TIRInstr);
 begin
@@ -263,6 +325,7 @@ begin
   instr.ImmFloat := 0.0;
   instr.ImmStr := '';
   instr.LabelName := '';
+  instr.EnergyCostHint := 0;
   instr.CastFromType := atVoid;
   instr.CastToType := atVoid;
   instr.CallMode := cmInternal;
