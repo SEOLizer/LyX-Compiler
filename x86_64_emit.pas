@@ -784,7 +784,8 @@ begin
 
       // Energy-Tracking: Kategorie pro IR-Instruktion zählen
       case instr.Op of
-        irAdd, irSub, irMul, irDiv, irMod, irNeg, irNot, irAnd, irOr,
+        irAdd, irSub, irMul, irDiv, irMod, irNeg, irNot, irAnd, irOr, irXor,
+        irShl, irShr, irBitNot,
         irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
         irSExt, irZExt, irTrunc:
           TrackEnergy(eokALU);
@@ -2231,6 +2232,37 @@ begin
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
             EmitU8(FCode, $48); EmitU8(FCode, $09); EmitU8(FCode, $C8); // or rax, rcx
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irXor:
+          begin
+            // dest = src1 ^ src2 (bitwise XOR)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C8); // xor rax, rcx
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irShl:
+          begin
+            // dest = src1 << src2 (shift left)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $E0); // shl rax, cl
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irShr:
+          begin
+            // dest = src1 >> src2 (arithmetic shift right)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $F8); // sar rax, cl
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+        irBitNot:
+          begin
+            // dest = ~src1 (bitwise NOT)
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D0); // not rax
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
         irReturn:
