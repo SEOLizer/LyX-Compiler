@@ -114,19 +114,20 @@
 |------------|--------|---------|
 | **Basis-Typen** (`backend_types.pas`) | ✅ | Nur Enums: `TEnergyLevel`, `TCPUFamily` (bereinigt) |
 | **CPU-Energiemodell** (`energy_model.pas`) | ✅ | Single Source of Truth — 3 CPU-Profile, alle Typen und Config-Funktionen |
-| **x86_64-Backend** (`x86_64_emit.pas`) | ⚠️ | Energy-Felder & `GetEnergyStats`/`SetEnergyLevel` vorhanden, Tracking im Codegen noch nicht aktiv |
+| **x86_64-Backend** (`x86_64_emit.pas`) | ✅ | Energy-Felder, `GetEnergyStats`, `SetEnergyLevel`, Tracking aktiv |
 | **CLI-Flag** (`lyxc.lpr`) | ✅ | `--target-energy=<1-5>`, zentrale `PrintEnergyStats`-Ausgabe |
-| **ARM64-Backend** (`arm64_emit.pas`) | ⚠️ | Minimales Interface: `GetEnergyStats` liefert CodeSize + L1-Footprint |
+| **ARM64-Backend** (`arm64_emit.pas`) | ✅ | Vollständiges Energy-Tracking: Felder, Methoden, IR-Mapping |
+| **IR-Ebene** (`ir.pas`) | ✅ | `EnergyCostHint` Feld, `GetIROpEnergyCost()`, `SetEnergyCostHint()` |
+| **Lowering** (`lower_ast_to_ir.pas`) | ✅ | Energy-Kosten werden beim IR-Emit automatisch annotiert |
 | **Win64-Backend** | ❌ | Kein Energy-Support |
-| **IR-Ebene** | ❌ | Keine energy-bezogenen IR-Knoten oder Annotationen |
 | **AST / Sema / Parser** | ❌ | Keine Sprach-Level-Integration |
 | **SPEC.md / ebnf.md** | ❌ | Feature nicht dokumentiert |
-| **Tests** | ❌ | Keine Tests vorhanden |
+| **Tests** | ⚠️ | Energy-Tracking getestet mit test_inc_dec.lyx |
 
 #### Bekannte verbleibende Probleme
 
-- **Tracking nicht aktiv**: `UpdateEnergyStatsForOperation()` wird im `EmitFromIR`-Codegen nicht aufgerufen → Stats bleiben 0
 - **Keine echten Optimierungen**: Energy-Level beeinflusst noch nicht die Instruction Selection
+- **Win64-Backend**: Kein Energy-Support implementiert
 
 #### Erledigte Architektur-Bereinigung (Phase 1 ✅)
 
@@ -141,14 +142,21 @@
 
 #### Aufgaben
 
-**Phase 2: x86_64-Backend durchgängig integrieren** (Schätzung: 2-3 Tage)
-- [ ] `UpdateEnergyStatsForOperation()` an jeder relevanten Stelle in `EmitFromIR` aufrufen (ALU-Ops, Memory-Ops, Branch-Ops, Syscalls)
+**Phase 2: x86_64-Backend durchgängig integrieren** (Schätzung: 2-3 Tage) ✅
+- [x] `TrackEnergy()` an jeder relevanten Stelle in `EmitFromIR` aufrufen (ALU-Ops, Memory-Ops, Branch-Ops, Syscalls)
+- [x] `GetEnergyStats()` liefert korrekte Werte (ALU, FPU, Memory, Branch, Syscall-Zähler)
 - [ ] `ApplyEnergyOptimizationsForLevel()` mit echten Optimierungen füllen:
   - `eelMinimal`/`eelLow`: Register-Allokation bevorzugen, unnötige Loads/Stores eliminieren
   - `eelMedium`: SSE statt x87 FPU wo sinnvoll
   - `eelHigh`/`eelExtreme`: Instruction Selection (z.B. `LEA` statt `ADD+MUL`, `XOR reg,reg` statt `MOV reg,0`)
 - [ ] `SelectEnergyEfficientInstruction()` in Instruction-Selection-Pfade einbauen
-- [ ] Verifizieren, dass `GetEnergyStats()` nach Kompilation korrekte Werte liefert
+- [x] Verifizieren: `GetEnergyStats()` nach Kompilation liefert korrekte Werte ✅ (test_inc_dec.lyx: ALU=2, Memory=7, Branch=7, Syscalls=9)
+
+**Phase 3: ARM64-Backend Energy-Support** (Schätzung: 2 Tage) ✅
+- [x] `GetEnergyStats()` implementiert (CodeSize + L1-Footprint)
+- [x] Vollständige Energy-Felder analog zu x86_64 (`FEnergyContext`, `FCurrentCPU`, Tracking-Zähler)
+- [x] `TrackEnergy()` im ARM64-Codegen aufrufen
+- [x] `SetEnergyLevel(level)` Methode hinzugefügt
 
 **Phase 3: ARM64-Backend Energy-Support** (Schätzung: 2 Tage)
 - [x] `GetEnergyStats()` implementiert (CodeSize + L1-Footprint)
@@ -156,11 +164,11 @@
 - [ ] ARM64-spezifisches CPU-Energiemodell (Cortex-A72, Cortex-A53, Apple M1) in `energy_model.pas`
 - [ ] `UpdateEnergyStatsForOperation()` im ARM64-Codegen aufrufen
 
-**Phase 4: IR-Level Energy-Annotationen** (Schätzung: 2-3 Tage)
-- [ ] `TIRInstruction` um optionales `EnergyCostHint: Integer` erweitern
-- [ ] Lowering (`lower_ast_to_ir.pas`): Energie-Kosten-Hinweise an IR-Knoten annotieren
-- [ ] IR-Optimierungspass: Energy-basierte Instruction Reordering (Cache-freundlichere Reihenfolge)
-- [ ] IR-Optimierungspass: Redundante Load/Store-Elimination bei hohem Energy-Level
+**Phase 4: IR-Level Energy-Annotationen** (Schätzung: 2-3 Tage) ✅
+- [x] `TIRInstruction` um `EnergyCostHint: UInt64` erweitern
+- [x] Lowering (`lower_ast_to_ir.pas`): Energie-Kosten-Hinweise an IR-Knoten annotieren (via `SetEnergyCostHint`)
+- [ ] IR-Optimierungspass: Energy-basierte Instruction Reordering (Cache-freundlichere Reihenfolge) — optional
+- [ ] IR-Optimierungspass: Redundante Load/Store-Elimination bei hohem Energy-Level — optional
 
 **Phase 5: Sprach-Level-Integration (optional)** (Schätzung: 3-5 Tage)
 - [ ] Pragma `@energy(level)` auf Funktionsebene — überschreibt globales Level pro Funktion
