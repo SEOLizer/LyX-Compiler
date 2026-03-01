@@ -24,7 +24,9 @@ type
     irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
     // float comparisons
     irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
-    irNot, irAnd, irOr, irNor, irXor,
+     irNot, irAnd, irOr, irNor, irXor,
+     irBitAnd, irBitOr, irBitXor, irBitNot,
+     irShl, irShr,
      irLoadLocal, irStoreLocal, irLoadLocalAddr,
      irLoadStructAddr,  // load base address of struct local (needs StructSize for correct calculation)
      // global variable operations

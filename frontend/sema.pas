@@ -749,74 +749,93 @@ begin
                  Result := atInt64;
                end;
              end;
-           tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
-             begin
-               if (IsIntegerType(lt) and IsIntegerType(rt)) then
-               begin
-                 Result := atBool;
-               end
-               else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
-               begin
-                 // Float comparison
-                 Result := atBool;
-               end
-               else if (TypeEqual(lt, atPChar) and TypeEqual(rt, atPChar)) then
-               begin
-                 // pointer/string comparison
-                 Result := atBool;
-               end
-               else
-               begin
-                 FDiag.Error('type error: comparison requires numeric or pchar operands', bin.Span);
-                 Result := atUnresolved;
-               end;
-             end;
+            tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
+              begin
+                if (IsIntegerType(lt) and IsIntegerType(rt)) then
+                begin
+                  Result := atBool;
+                end
+                else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
+                begin
+                  // Float comparison
+                  Result := atBool;
+                end
+                else if (TypeEqual(lt, atPChar) and TypeEqual(rt, atPChar)) then
+                begin
+                  // pointer/string comparison
+                  Result := atBool;
+                end
+                else
+                begin
+                  FDiag.Error('type error: comparison requires numeric or pchar operands', bin.Span);
+                  Result := atUnresolved;
+                end;
+              end;
 
-          tkAnd, tkOr:
-            begin
-              if not TypeEqual(lt, atBool) or not TypeEqual(rt, atBool) then
-                FDiag.Error('type error: logical operators require bool operands', bin.Span);
-              Result := atBool;
-            end;
-          tkNullCoalesce:
-            begin
-              // x ?? y: if x is null, use y. Result type is the non-nullable version of left
-              // Left must be nullable, right must be compatible
-              if not IsNullableType(lt) then
-                FDiag.Error('type error: left operand of ?? must be nullable', bin.Span);
-              // Das Ergebnis ist der non-nullable Typ
-              Result := NonNullableVersion(lt);
-            end;
-        else
-          begin
-            FDiag.Error('unsupported binary operator in sema', bin.Span);
-            Result := atUnresolved;
-          end;
-        end;
-      end;
-    nkUnaryOp:
-      begin
-        un := TAstUnaryOp(expr);
-        ot := CheckExpr(un.Operand);
-        if un.Op = tkMinus then
-        begin
-          if not IsIntegerType(ot) then
-            FDiag.Error('type error: unary - requires integer', un.Span);
-          Result := atInt64;
-        end
-        else if un.Op = tkNot then
-        begin
-          if not TypeEqual(ot, atBool) then
-            FDiag.Error('type error: unary ! requires bool', un.Span);
-          Result := atBool;
-        end
-        else
-        begin
-          FDiag.Error('unsupported unary operator in sema', un.Span);
-          Result := atUnresolved;
-        end;
-      end;
-    nkCall:
+           tkAnd, tkOr:
+             begin
+               if not TypeEqual(lt, atBool) or not TypeEqual(rt, atBool) then
+                 FDiag.Error('type error: logical operators require bool operands', bin.Span);
+               Result := atBool;
+             end;
+            tkBitAnd, tkBitOr, tkBitXor, tkShiftLeft, tkShiftRight:
+              begin
+                if not IsIntegerType(lt) or not IsIntegerType(rt) then
+                begin
+                  FDiag.Error('type error: bitwise operators require integer operands', bin.Span);
+                  Result := atUnresolved;
+                end
+                else
+                begin
+                  // For now, result type is always int64 for bitwise ops
+                  Result := atInt64;
+                end;
+              end;
+           tkNullCoalesce:
+             begin
+               // x ?? y: if x is null, use y. Result type is the non-nullable version of left
+               // Left must be nullable, right must be compatible
+               if not IsNullableType(lt) then
+                 FDiag.Error('type error: left operand of ?? must be nullable', bin.Span);
+               // Das Ergebnis ist der non-nullable Typ
+               Result := NonNullableVersion(lt);
+             end;
+         else
+           begin
+             FDiag.Error('unsupported binary operator in sema', bin.Span);
+             Result := atUnresolved;
+           end;
+         end;
+       end;
+     nkUnaryOp:
+       begin
+         un := TAstUnaryOp(expr);
+         ot := CheckExpr(un.Operand);
+         if un.Op = tkMinus then
+         begin
+           if not IsIntegerType(ot) then
+             FDiag.Error('type error: unary - requires integer', un.Span);
+           Result := atInt64;
+         end
+         else if un.Op = tkNot then
+         begin
+           if not TypeEqual(ot, atBool) then
+             FDiag.Error('type error: unary ! requires bool', un.Span);
+           Result := atBool;
+         end
+         else if un.Op = tkBitNot then
+         begin
+           if not IsIntegerType(ot) then
+             FDiag.Error('type error: bitwise NOT requires integer', un.Span);
+           Result := atInt64;
+         end
+         else
+           begin
+             FDiag.Error('unsupported unary operator in sema', un.Span);
+             Result := atUnresolved;
+           end;
+         end;
+     nkCall:
       begin
         call := TAstCall(expr);
         s := nil; // Initialize to nil

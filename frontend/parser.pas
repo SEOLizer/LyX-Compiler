@@ -1199,8 +1199,8 @@ var
   boolVal: Boolean;
   span: TSourceSpan;
 begin
-  // Collect consecutive prefix unary operators (e.g. - - ! !)
-  while Check(tkMinus) or Check(tkNot) or Check(tkMinusMinus) do
+    // Collect consecutive prefix unary operators (e.g. - - ! ! ~ ~)
+  while Check(tkMinus) or Check(tkNot) or Check(tkMinusMinus) or Check(tkBitNot) do
   begin
     if Check(tkMinusMinus) then
     begin
@@ -1252,6 +1252,10 @@ begin
       begin
         Result := TAstUnaryOp.Create(tkNot, Result, Result.Span);
       end;
+    end
+    else if op = tkBitNot then
+    begin
+      Result := TAstUnaryOp.Create(tkBitNot, Result, Result.Span);
     end;
   end;
 end;
