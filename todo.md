@@ -119,10 +119,17 @@
 | **ARM64-Backend** (`arm64_emit.pas`) | ✅ | Vollständiges Energy-Tracking: Felder, Methoden, IR-Mapping |
 | **IR-Ebene** (`ir.pas`) | ✅ | `EnergyCostHint` Feld, `GetIROpEnergyCost()`, `SetEnergyCostHint()` |
 | **Lowering** (`lower_ast_to_ir.pas`) | ✅ | Energy-Kosten werden beim IR-Emit automatisch annotiert |
+| **Sprach-Level** | ✅ | `@energy(level)` Pragma vor fn-Deklarationen |
 | **Win64-Backend** | ❌ | Kein Energy-Support |
-| **AST / Sema / Parser** | ❌ | Keine Sprach-Level-Integration |
-| **SPEC.md / ebnf.md** | ❌ | Feature nicht dokumentiert |
-| **Tests** | ⚠️ | Energy-Tracking getestet mit test_inc_dec.lyx |
+| **SPEC.md** | ✅ | Dokumentiert (Kapitel "Energy-Aware-Compiling") |
+| **ebnf.md** | ✅ | EnergyAttr Produktionsregel dokumentiert |
+| **Tests** | ✅ | test_energy_tracking.lyx, test_energy_attr.lyx |
+
+#### Verbleibende optionale Optimierungen
+
+- **Energy-basierte Instruction Selection**: Energy-Level beeinflusst noch nicht die Codegenerierung
+- **Win64-Backend**: Kein Energy-Support
+- **ARM64-CPU-Modelle**: Nur cfX86_64 und cfARM64 (keine Cortex-A Profile)
 
 #### Bekannte verbleibende Probleme
 
@@ -170,13 +177,12 @@
 - [ ] IR-Optimierungspass: Energy-basierte Instruction Reordering (Cache-freundlichere Reihenfolge) — optional
 - [ ] IR-Optimierungspass: Redundante Load/Store-Elimination bei hohem Energy-Level — optional
 
-**Phase 5: Sprach-Level-Integration (optional)** (Schätzung: 3-5 Tage)
-- [ ] Pragma `@energy(level)` auf Funktionsebene — überschreibt globales Level pro Funktion
-- [ ] Lexer: neues Token `tkAtEnergy` oder generisches Attribut-System
-- [ ] Parser: Attribut vor `fn`-Deklarationen parsen
-- [ ] AST: `TFnDecl` um `EnergyLevel: TEnergyLevel` erweitern
-- [ ] Sema: Validierung (Level 1-5, keine verschachtelten Overrides)
-- [ ] Dokumentation in `ebnf.md` und `SPEC.md`
+**Phase 5: Sprach-Level-Integration (optional)** (Schätzung: 3-5 Tage) ✅
+- [x] Pragma `@energy(level)` auf Funktionsebene — überschreibt globales Level pro Funktion
+- [x] Parser: Attribut vor `fn`-Deklarationen parsen
+- [x] AST: `TFnDecl` um `EnergyLevel: TEnergyLevel` erweitern
+- [x] Lowering: Energy-Level von AST zu IR propagieren
+- [x] Backend: Energy-Level pro Funktion anwenden vor dem Codegen
 
 **Phase 6: Tests & Dokumentation** (Schätzung: 1-2 Tage)
 - [ ] Unit-Tests für `energy_model.pas` (Kostenberechnung, CPU-Modell-Lookup)

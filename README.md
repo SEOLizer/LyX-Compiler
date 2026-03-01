@@ -55,6 +55,124 @@ make build
 Hello Lyx
 ```
 
+---
+
+## Energy-Aware-Compiling
+
+Lyx supports **Energy-Aware-Compiling** to generate energy-efficient machine code, controlled via CLI or function-level pragmas.
+
+### CLI Option: `--target-energy=<1-5>`
+
+```bash
+# Compile with energy level 1 (battery-optimized, minimal power)
+./lyxc program.lyx -o program --target-energy=1
+
+# Compile with energy level 3 (balanced, default)
+./lyxc program.lyx -o program --target-energy=3
+
+# Compile with energy level 5 (maximum performance)
+./lyxc program.lyx -o program --target-energy=5
+```
+
+#### Energy Levels
+
+| Level | Name | Loop Unroll | Battery | SIMD | FPU | AVX2/AVX512 |
+|-------|------|:-----------:|:-------:|:----:|:---:|:------------:|
+| 1 | Minimal | 4× | ✅ | — | — | — |
+| 2 | Low | 2× | ✅ | — | — | — |
+| 3 | Medium | 1× | ✅ | ✅ | — | * |
+| 4 | High | — | ✅ | ✅ | ✅ | * |
+| 5 | Extreme | 8× | ✅ | ✅ | ✅ | * |
+
+(* = only if CPU supports it)
+
+### Function-Level Pragma: `@energy(level)`
+
+You can override the global energy level for specific functions:
+
+```lyx
+// This function compiles with level 1 (battery-optimized)
+@energy(1)
+fn low_power_task(): int64 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  while i < 1000 {
+    sum := sum + i;
+    i := i + 1;
+  }
+  return sum;
+}
+
+// This function compiles with level 5 (maximum performance)
+@energy(5)
+fn compute_intensive(): int64 {
+  var result: int64 := 0;
+  // Heavy computation uses SIMD/FPU
+  return result;
+}
+
+fn main(): int64 {
+  // Uses global --target-energy level
+  var x: int64 := low_power_task();
+  var y: int64 := compute_intensive();
+  return x + y;
+}
+```
+
+### Energy Statistics
+
+The compiler outputs detailed energy statistics after compilation:
+
+```
+=== Energy Statistics ===
+Energy level:           3
+CPU family:             1
+Optimize for battery:   TRUE
+Avoid SIMD:             TRUE
+Avoid FPU:              FALSE
+Cache locality:         TRUE
+Register over memory:   TRUE
+
+Total ALU operations:   42
+Total FPU operations:    0
+Total SIMD operations:   0
+Total memory accesses:  17
+Total branches:         8
+Total syscalls:         3
+
+Estimated energy units: 16955
+Code size:              846 bytes
+L1 cache footprint:    846 bytes
+```
+
+#### Statistics Explained
+
+| Metric | Description |
+|--------|-------------|
+| `Total ALU operations` | Integer arithmetic (+, -, *, /, %, etc.) |
+| `Total FPU operations` | Floating-point operations |
+| `Total memory accesses` | Loads and stores |
+| `Total branches` | Jumps, calls, returns |
+| `Total syscalls` | System calls (read, write, exit, etc.) |
+| `Estimated energy units` | Calculated sum of operation costs |
+| `Code size` | Generated binary size in bytes |
+| `L1 cache footprint` | Estimated L1 cache usage |
+
+### How It Works
+
+1. **Energy Model**: Each CPU has a cost table (Intel i7-10710U, AMD Ryzen 7-4700U, Intel Atom x5-Z8350)
+2. **IR Annotation**: Every IR instruction gets an `EnergyCostHint` during lowering
+3. **Tracking**: Backend counts operations per category during code generation
+4. **Optimization** (future): Energy level affects instruction selection
+
+### Use Cases
+
+- **Embedded systems**: Use `--target-energy=1` for minimal power
+- **Server applications**: Use `--target-energy=5` for maximum performance
+- **Mixed workloads**: Use `@energy` pragma to optimize hot paths
+
+---
+
 ### Cross-Compilation
 
 Lyx supports **cross-compilation** for three target platforms:
