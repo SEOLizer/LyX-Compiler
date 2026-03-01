@@ -4,7 +4,7 @@ unit x86_64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, backend_types;
+  SysUtils, Classes, bytes, ir, backend_types, energy_model;
 
 type
   TLabelPos = record
@@ -30,6 +30,13 @@ type
     // External symbols recorded for PLT/GOT (name, libname)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
+    // Energy tracking
+    FEnergyStats: TEnergyStats;
+    FEnergyContext: TEnergyContext;
+    FCurrentCPU: TCPUEnergyModel;
+    FMemoryAccessCount: UInt64;
+    FRegisterPressure: Integer;
+    FCurrentFunctionEnergy: UInt64;
   public
     constructor Create;
     destructor Destroy; override;
@@ -39,6 +46,8 @@ type
     function GetFunctionOffset(const name: string): Integer;
     function GetExternalSymbols: TExternalSymbolArray;
     function GetPLTGOTPatches: TPLTGOTPatchArray;
+    function GetEnergyStats: TEnergyStats;
+    procedure SetEnergyLevel(level: TEnergyLevel);
   end;
 
 implementation
@@ -438,6 +447,13 @@ begin
   SetLength(FLeaStrIndex, 0);
   SetLength(FLabelPositions, 0);
   SetLength(FJumpPatches, 0);
+  // Energy-Modell initialisieren
+  FCurrentCPU := GetCPUEnergyModel(cfX86_64);
+  FEnergyContext.Config := GetEnergyConfig;
+  FEnergyContext.CurrentCPU := FCurrentCPU;
+  FMemoryAccessCount := 0;
+  FRegisterPressure := 0;
+  FCurrentFunctionEnergy := 0;
 end;
 
 destructor TX86_64Emitter.Destroy;
@@ -3227,6 +3243,23 @@ begin
   SetLength(Result, Length(FPLTGOTPatches));
   for i := 0 to High(Result) do
     Result[i] := FPLTGOTPatches[i];
+end;
+
+function TX86_64Emitter.GetEnergyStats: TEnergyStats;
+begin
+  FEnergyStats.CodeSizeBytes := FCode.Size;
+  FEnergyStats.L1CacheFootprint := EstimateL1CacheFootprint(FCode.Size);
+  FEnergyStats.EstimatedEnergyUnits := FCurrentFunctionEnergy;
+  FEnergyStats.TotalMemoryAccesses := FMemoryAccessCount;
+  Result := FEnergyStats;
+end;
+
+procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
+begin
+  energy_model.SetEnergyLevel(level, cfX86_64);
+  FEnergyContext.Config := GetEnergyConfig;
+  FCurrentCPU := GetCPUEnergyModel(cfX86_64);
+  FEnergyContext.CurrentCPU := FCurrentCPU;
 end;
 
 end.

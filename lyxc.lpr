@@ -3,7 +3,7 @@ program lyxc;
 
 uses
   SysUtils, Classes, BaseUnix,
-  bytes, backend_types,
+  bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
   ir, lower_ast_to_ir, ir_inlining,
   x86_64_emit, elf64_writer,
@@ -21,6 +21,7 @@ var
   flagDumpRelocs: Boolean;
   flagLint: Boolean;
   flagLintOnly: Boolean;
+  flagEnergyLevel: Integer;  // 0 = disabled, 1-5 = energy level
   lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
@@ -46,6 +47,33 @@ var
 
 type
   TStringArray = array of string;
+
+procedure PrintEnergyStats(const stats: TEnergyStats);
+var
+  cfg: TEnergyConfig;
+begin
+  cfg := GetEnergyConfig;
+  WriteLn;
+  WriteLn('=== Energy Statistics ===');
+  WriteLn('Energy level:           ', Ord(cfg.Level));
+  WriteLn('CPU family:             ', Ord(cfg.CPUFamily));
+  WriteLn('Optimize for battery:   ', cfg.OptimizeForBattery);
+  WriteLn('Avoid SIMD:             ', cfg.AvoidSIMD);
+  WriteLn('Avoid FPU:              ', cfg.AvoidFPU);
+  WriteLn('Cache locality:         ', cfg.PrioritizeCacheLocality);
+  WriteLn('Register over memory:   ', cfg.PreferRegisterOverMemory);
+  WriteLn;
+  WriteLn('Total ALU operations:   ', stats.TotalALUOps);
+  WriteLn('Total FPU operations:   ', stats.TotalFPUOps);
+  WriteLn('Total SIMD operations:  ', stats.TotalSIMDOps);
+  WriteLn('Total memory accesses:  ', stats.TotalMemoryAccesses);
+  WriteLn('Total branches:         ', stats.TotalBranches);
+  WriteLn('Total syscalls:         ', stats.TotalSyscalls);
+  WriteLn;
+  WriteLn('Estimated energy units: ', stats.EstimatedEnergyUnits);
+  WriteLn('Code size:              ', stats.CodeSizeBytes, ' bytes');
+  WriteLn('L1 cache footprint:     ', stats.L1CacheFootprint, ' bytes');
+end;
 
 procedure DumpIRAsAsm(m: TIRModule);
 var
@@ -205,6 +233,7 @@ begin
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
     WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux oder arm64)');
+    WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
@@ -219,6 +248,7 @@ begin
   flagDumpRelocs := False;
   flagLint := False;
   flagLintOnly := False;
+  flagEnergyLevel := 0;
 
   // Parse command line arguments
   i := 1;
@@ -274,6 +304,16 @@ begin
       flagLint := False;
       Inc(i);
     end
+    else if Copy(param, 1, 16) = '--target-energy=' then
+    begin
+      flagEnergyLevel := StrToIntDef(Copy(param, 17, MaxInt), 0);
+      if (flagEnergyLevel < 1) or (flagEnergyLevel > 5) then
+      begin
+        WriteLn(StdErr, 'Ungültiger Energy-Level: ', flagEnergyLevel, '. Erlaubt: 1-5.');
+        Halt(1);
+      end;
+      Inc(i);
+    end
     else if (param <> '-o') and (Copy(param, 1, 2) <> '--') then
     begin
       if inputFile = '' then
@@ -310,6 +350,29 @@ begin
     WriteLn('Ziel:     Linux x86_64 (ELF64)')
   else if target = targetLinuxARM64 then
     WriteLn('Ziel:     Linux ARM64 (ELF64)');
+
+  // Energy-Konfiguration setzen (vor der Statusausgabe)
+  if flagEnergyLevel > 0 then
+  begin
+    case target of
+      targetLinux: SetEnergyLevel(TEnergyLevel(flagEnergyLevel), cfX86_64);
+      targetLinuxARM64: SetEnergyLevel(TEnergyLevel(flagEnergyLevel), cfARM64);
+      targetWindows: SetEnergyLevel(TEnergyLevel(flagEnergyLevel), cfX86_64);
+    end;
+  end;
+
+  if flagEnergyLevel > 0 then
+  begin
+    WriteLn('Energy-Level: ', flagEnergyLevel);
+    case flagEnergyLevel of
+      1: WriteLn('Target: Minimal energy consumption (battery optimized)');
+      2: WriteLn('Target: Low energy consumption (balanced)');
+      3: WriteLn('Target: Medium energy consumption (performance optimized)');
+      4: WriteLn('Target: High energy consumption (performance first)');
+      5: WriteLn('Target: Extreme energy consumption (maximum performance)');
+    end;
+    WriteLn;
+  end;
 
   basePath := ExtractFilePath(inputFile);
   if basePath = '' then
@@ -419,17 +482,16 @@ begin
           end
           else if target = targetLinux then
           begin
-            // Linux x86_64 Code Generation (existing path)
+            // Linux x86_64 Code Generation
             emit := TX86_64Emitter.Create;
             try
+              if flagEnergyLevel > 0 then
+                emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+
               emit.EmitFromIR(module);
               codeBuf := emit.GetCodeBuffer;
               dataBuf := emit.GetDataBuffer;
-              // Entry point is the generated _start placed at code base + 0x1000
-              // For static ELF: entryVA := $400000 + 4096;
-              // For dynamic (PIE) ELF: entryVA := 4096 (page-aligned)
-              entryVA := 4096;
-              
+
               // --dump-relocs: show external symbols and PLT patches
               if flagDumpRelocs then
                 DumpRelocs(emit);
@@ -438,18 +500,22 @@ begin
               externSymbols := emit.GetExternalSymbols;
               if Length(externSymbols) > 0 then
               begin
-                // Build unique library list
                 neededLibs := CollectLibraries(externSymbols);
+                entryVA := 4096;
                 WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
                 WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
               end
               else
               begin
-                entryVA := $400000 + 4096;  // Static: traditional address
+                entryVA := $400000 + 4096;
                 WriteLn('Generating static ELF (no external symbols)');
                 WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
               end;
-              
+
+              // Energy statistics output
+              if flagEnergyLevel > 0 then
+                PrintEnergyStats(emit.GetEnergyStats);
+
               FpChmod(PChar(outputFile), 493);
               WriteLn('Wrote ', outputFile);
             finally
@@ -465,18 +531,22 @@ begin
               codeBuf := arm64Emit.GetCodeBuffer;
               dataBuf := arm64Emit.GetDataBuffer;
               entryVA := 4096;
-              
-              // Check if we have external symbols - if so, note about dynamic linking
+
+              // Check if we have external symbols
               externSymbols := arm64Emit.GetExternalSymbols;
               if Length(externSymbols) > 0 then
               begin
                 WriteLn('Note: ARM64 dynamic linking not yet fully implemented');
                 WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
               end;
-              
+
               WriteLn('Generating static ELF for Linux ARM64');
               WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
-              
+
+              // Energy statistics output
+              if flagEnergyLevel > 0 then
+                PrintEnergyStats(arm64Emit.GetEnergyStats);
+
               FpChmod(PChar(outputFile), 493);
               WriteLn('Wrote ', outputFile, ' (ELF64 for Linux ARM64)');
             finally
