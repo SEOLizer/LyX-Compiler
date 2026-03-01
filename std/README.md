@@ -989,6 +989,37 @@ pool_release(pool);
 
 ---
 
+## std/hash.lyx
+
+Hash-Funktionen für Datenstrukturen, Integritätsprüfungen und Passwort-Hashing.
+
+### FNV-1a (Fast Non-Cryptographic)
+- `HashFNV1a32(data: pchar): int64` - FNV-1a 32-bit Hash
+- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Länge
+- `HashFNV1a64(data: pchar): int64` - FNV-1a 64-bit Hash
+- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### CRC32 (Checksum)
+- `HashCRC32(data: pchar): int64` - CRC32 Checksum
+- `HashCRC32Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### SHA-256 (Cryptographic)
+- `SHA256(data: pchar): int64` - SHA-256 Hash (erste 8 Bytes)
+- `SHA256Bytes(data: pchar, len: int64): int64` - Mit Länge
+
+### MD5 (Legacy)
+- `HashMD5(data: pchar): int64` - MD5 Hash
+- `HashMD5Bytes(data: pchar, len: int64): int64` - Mit Länge
+- `HashMD5File(path: pchar, chunk_size: int64): int64` - Datei-Hashing
+
+### Passwort-Hashing
+- `Argon2(password: pchar, salt: pchar): int64` - Argon2
+- `Bcrypt(password: pchar, salt: pchar): int64` - Bcrypt
+- `PBKDF2(password: pchar, salt: pchar, iterations: int64): int64` - PBKDF2
+- `Scrypt(password: pchar, salt: pchar): int64` - Scrypt
+
+---
+
 ## Highlights der Architektur
 
 ### Microdegrees
