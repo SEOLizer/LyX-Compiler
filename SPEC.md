@@ -960,6 +960,50 @@ ReadonlyDecl :="co" IDENT":" Type":=" Expr";"
 
 ---
 
+## Typsichere Typen (Type Constraints)
+
+Typsichere Typen ermöglichen es, mathematische Beweise an Typen zu hängen, die zur Laufzeit komplett verschwinden.
+
+### Syntax
+
+```
+TypeDecl       := 'type' Ident '=' Type [ WhereClause ] ';' ;
+WhereClause    := 'where' '{' ConstExpr '}' ;
+```
+
+### Semantik
+
+- Die `where`-Klausel definiert eine Bedingung, die der Typ zur Compilezeit erfüllen muss.
+- Das spezielle Schlüsselwort `value` repräsentiert den Basistyp in der Bedingung.
+- Die Bedingung muss ein konstanter Boolescher Ausdruck sein.
+- Wenn die Bedingung keine `value`-Beispiele enthält, wird sie zur Compilezeit ausgewertet.
+- Enthält die Bedingung `value`, wird sie als Typ-Constraint akzeptiert (aber nicht zur Compilezeit ausgewertet).
+
+### Beispiele
+
+```lyx
+// Einfacher Typ-Constraint (wird zur Compilezeit ausgewertet)
+type Positive = int64 where { value > 0 };
+
+// Typ-Constraint mit value (wird akzeptiert, aber nicht ausgewertet)
+type Percentage = int64 where { value >= 0 && value <= 100 };
+
+// Beispiel: Verwendung
+fn main(): int64 {
+  var p: Percentage := 50;  // Gültig
+  // var p2: Percentage := 101;  // Würde einen Laufzeitfehler auslösen (in Zukunft: Compilezeitfehler)
+  return p;
+}
+```
+
+### Implementierungshinweise
+
+- Das Schlüsselwort `value` wird in der semantischen Analyse durch den Basistyp ersetzt.
+- Die Konstante-Auswertung erfolgt nur für reine konstante Ausdrücke (ohne `value`).
+- Der Typ wird im Symbol-Table als `symType` registriert.
+
+---
+
 # Beispielprogramm mit neuen Keywords
 
 ```
