@@ -40,3 +40,8 @@
     *   Compiler kann erfolgreich `type Percentage = int64 where { value >= 0 && value <= 100 };` parsen und typisieren.
     *   Compiler meldet Fehler für ungültige Constraints wie `where { false }`.
     *   Compiler kann den neuen Typ in Variablendeklarationen verwenden.
+*   **Zahlenbasen-Unterstützung im Lexer:**
+    *   Hexadezimal: `0xFF`, `$FF`
+    *   Binär: `0b1010`, `%1010`
+    *   Oktal: `0o77`, `&77`
+    *   Unterstriche als Trenner: `0b1100_1010`
