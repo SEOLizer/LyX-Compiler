@@ -7,7 +7,7 @@ uses
   SysUtils, Classes, ast, diag, lexer, unit_manager;
 
 type
-  TSymbolKind = (symVar, symLet, symCon, symFunc);
+  TSymbolKind = (symVar, symLet, symCon, symFunc, symType);
 
   TSymbol = class
   public
@@ -52,6 +52,9 @@ type
     procedure ImportUnit(imp: TAstImportDecl);
     function TypeEqual(a, b: TAurumType): Boolean;
     function ValidateRegex(const pattern: string; span: TSourceSpan): Boolean;
+    procedure ReplaceValueIdent(expr: TAstExpr; baseType: TAurumType);
+    function IsPureConstExpr(expr: TAstExpr): Boolean;
+    function EvalConstExpr(expr: TAstExpr): Boolean;
     function CheckExpr(expr: TAstExpr): TAurumType;
     function CheckStructLit(sl: TAstStructLit): TAurumType;
     procedure CheckStmt(stmt: TAstStmt);
@@ -686,15 +689,26 @@ begin
     nkIdent:
       begin
         ident := TAstIdent(expr);
-        s := ResolveSymbol(ident.Name);
-        if s = nil then
+        // Special case: 'value' in type constraint is resolved by ReplaceValueIdent
+        // Don't resolve it as a normal symbol
+        if ident.Name = 'value' then
         begin
-          FDiag.Error('use of undeclared identifier: ' + ident.Name, ident.Span);
-          Result := atUnresolved;
+          Result := ident.ResolvedType;
+          if Result = atUnresolved then
+            Result := atInt64; // default to int64 if not resolved
         end
         else
         begin
-          Result := s.DeclType;
+          s := ResolveSymbol(ident.Name);
+          if s = nil then
+          begin
+            FDiag.Error('use of undeclared identifier: ' + ident.Name, ident.Span);
+            Result := atUnresolved;
+          end
+          else
+          begin
+            Result := s.DeclType;
+          end;
         end;
       end;
     nkArrayLit:
@@ -2368,6 +2382,8 @@ var
   s: TSymbol;
   sym: TSymbol;
   itype: TAurumType;
+  td: TAstTypeDecl;
+  constraintType: TAurumType;
 begin
   // Phase 0: Verarbeite Imports
   ProcessImports(prog);
@@ -2514,10 +2530,50 @@ begin
         end;
       end
       else if node is TAstTypeDecl then
-     begin
-       // type declarations: register as named types (future work)
-       // for now, skip
-     end
+      begin
+        // type declarations: register as named types
+        td := TAstTypeDecl(node);
+        // Check for duplicate
+        if ResolveSymbol(td.Name) <> nil then
+        begin
+          FDiag.Error('redeclaration of type: ' + td.Name, td.Span);
+        end
+        else
+        begin
+          // Register the type name in the current scope
+          sym := TSymbol.Create(td.Name);
+          sym.Kind := symType;
+          sym.DeclType := td.DeclType;
+          sym.TypeName := ''; // For named types, we'll store the constraint
+          AddSymbolToCurrent(sym, td.Span);
+        end;
+        // Check if there's a where clause (constraint)
+        if Assigned(td.Constraint) then
+        begin
+          // Replace 'value' identifiers with the base type
+          ReplaceValueIdent(td.Constraint, td.DeclType);
+          
+          // Type constraint: evaluate at compile time
+          // The constraint must be a boolean constant expression
+          constraintType := CheckExpr(td.Constraint);
+          if constraintType <> atBool then
+          begin
+            FDiag.Error('type constraint must evaluate to bool', td.Constraint.Span);
+          end
+          else
+          begin
+            // Only evaluate at compile time if it's a pure constant expression (no identifiers)
+            if IsPureConstExpr(td.Constraint) then
+            begin
+              if not EvalConstExpr(td.Constraint) then
+              begin
+                FDiag.Error('type constraint must be true at compile time', td.Constraint.Span);
+              end;
+            end;
+            // If it contains 'value', we can't evaluate at compile time - just accept it as a type constraint
+          end;
+        end;
+      end
       else if node is TAstConDecl then
     begin
       con := TAstConDecl(node);
@@ -2760,6 +2816,191 @@ begin
       begin
         for j := 0 to High(fn.Body.Stmts) do
           fn.Body.Stmts[j] := RewriteStmt(fn.Body.Stmts[j]);
+      end;
+    end;
+  end;
+end;
+
+{ Replace 'value' identifier in constraint expressions with the base type }
+procedure TSema.ReplaceValueIdent(expr: TAstExpr; baseType: TAurumType);
+var
+  i: Integer;
+begin
+  if not Assigned(expr) then Exit;
+  
+  if expr is TAstIdent then
+  begin
+    if TAstIdent(expr).Name = 'value' then
+    begin
+      expr.ResolvedType := baseType;
+    end;
+  end
+  else if expr is TAstBinOp then
+  begin
+    ReplaceValueIdent(TAstBinOp(expr).Left, baseType);
+    ReplaceValueIdent(TAstBinOp(expr).Right, baseType);
+  end
+  else if expr is TAstUnaryOp then
+  begin
+    ReplaceValueIdent(TAstUnaryOp(expr).Operand, baseType);
+  end
+  else if expr is TAstCall then
+  begin
+    // Replace in arguments
+    for i := 0 to High(TAstCall(expr).Args) do
+      ReplaceValueIdent(TAstCall(expr).Args[i], baseType);
+  end;
+end;
+
+{ Check if an expression is a pure constant (no identifiers, no function calls) }
+function TSema.IsPureConstExpr(expr: TAstExpr): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if not Assigned(expr) then Exit(True);
+  
+  if expr is TAstIntLit then
+    Result := True
+  else if expr is TAstFloatLit then
+    Result := True
+  else if expr is TAstBoolLit then
+    Result := True
+  else if expr is TAstStrLit then
+    Result := True
+  else if expr is TAstCharLit then
+    Result := True
+  else if expr is TAstIdent then
+    Result := False  // identifiers are not constants
+  else if expr is TAstBinOp then
+  begin
+    Result := IsPureConstExpr(TAstBinOp(expr).Left) and IsPureConstExpr(TAstBinOp(expr).Right);
+  end
+  else if expr is TAstUnaryOp then
+  begin
+    Result := IsPureConstExpr(TAstUnaryOp(expr).Operand);
+  end
+  else if expr is TAstCall then
+  begin
+    // Function calls are not constants
+    Result := False;
+  end
+  else
+    Result := False;
+end;
+
+{ Evaluate a constant boolean expression at compile time }
+function TSema.EvalConstExpr(expr: TAstExpr): Boolean;
+var
+  binOp: TAstBinOp;
+  unaryOp: TAstUnaryOp;
+  leftVal, rightVal: Int64;
+  leftBool, rightBool: Boolean;
+begin
+  Result := False;
+  if not Assigned(expr) then Exit;
+  
+  if expr is TAstBoolLit then
+  begin
+    Result := TAstBoolLit(expr).Value;
+  end
+  else if expr is TAstIntLit then
+  begin
+    Result := TAstIntLit(expr).Value <> 0;
+  end
+  else if expr is TAstBinOp then
+  begin
+    binOp := TAstBinOp(expr);
+    case binOp.Op of
+      tkAnd:
+      begin
+        Result := EvalConstExpr(binOp.Left) and EvalConstExpr(binOp.Right);
+      end;
+      tkOr:
+      begin
+        Result := EvalConstExpr(binOp.Left) or EvalConstExpr(binOp.Right);
+      end;
+      tkEq:
+      begin
+        // Try to evaluate as integer
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal = rightVal;
+        end
+        else if (binOp.Left is TAstBoolLit) and (binOp.Right is TAstBoolLit) then
+        begin
+          leftBool := TAstBoolLit(binOp.Left).Value;
+          rightBool := TAstBoolLit(binOp.Right).Value;
+          Result := leftBool = rightBool;
+        end;
+      end;
+      tkNeq:
+      begin
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal <> rightVal;
+        end
+        else if (binOp.Left is TAstBoolLit) and (binOp.Right is TAstBoolLit) then
+        begin
+          leftBool := TAstBoolLit(binOp.Left).Value;
+          rightBool := TAstBoolLit(binOp.Right).Value;
+          Result := leftBool <> rightBool;
+        end;
+      end;
+      tkLt:
+      begin
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal < rightVal;
+        end;
+      end;
+      tkLe:
+      begin
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal <= rightVal;
+        end;
+      end;
+      tkGt:
+      begin
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal > rightVal;
+        end;
+      end;
+      tkGe:
+      begin
+        if (binOp.Left is TAstIntLit) and (binOp.Right is TAstIntLit) then
+        begin
+          leftVal := TAstIntLit(binOp.Left).Value;
+          rightVal := TAstIntLit(binOp.Right).Value;
+          Result := leftVal >= rightVal;
+        end;
+      end;
+    end;
+  end
+  else if expr is TAstUnaryOp then
+  begin
+    unaryOp := TAstUnaryOp(expr);
+    if unaryOp.Op = tkNot then
+    begin
+      Result := not EvalConstExpr(unaryOp.Operand);
+    end
+    else if unaryOp.Op = tkMinus then
+    begin
+      if unaryOp.Operand is TAstIntLit then
+      begin
+        Result := -TAstIntLit(unaryOp.Operand).Value <> 0;
       end;
     end;
   end;

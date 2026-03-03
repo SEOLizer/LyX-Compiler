@@ -348,6 +348,7 @@ var
   declType: TAurumType;
   fields: TStructFieldList;
   methods: TMethodList;
+  constraintExpr: TAstExpr;
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -531,8 +532,16 @@ begin
   else
   begin
     declType := ParseType;
+    // Parse optional where clause
+    constraintExpr := nil;
+    if Accept(tkWhere) then
+    begin
+      Expect(tkLBrace);
+      constraintExpr := ParseExpr; // ConstExpr restriction checked in sema
+      Expect(tkRBrace);
+    end;
     Expect(tkSemicolon);
-    Result := TAstTypeDecl.Create(name, declType, isPub, FCurTok.Span);
+    Result := TAstTypeDecl.Create(name, declType, isPub, constraintExpr, FCurTok.Span);
   end;
 end;
 
@@ -1708,13 +1717,75 @@ begin
   typeName := '';
   isNullable := False;
 
-  // Check for array type syntax: Type[N] or []Type
+  // Check for array type syntax: Type[N] or []Type or Array<T>
   // First parse the base type
-  if Check(tkIdent) or Check(tkArray) then
+  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) then
   begin
+    // Handle 'parallel Array<T>' first
+    if Check(tkParallel) then
+    begin
+      Advance; // consume 'parallel'
+      Expect(tkArray);
+      // Now we have 'parallel' - check for generic syntax Array<T>
+      if Accept(tkLt) then
+      begin
+        // Generic array: Array<T>
+        // Parse element type
+        if Check(tkIdent) then
+        begin
+          s := FCurTok.Value;
+          Advance;
+          Result := StrToAurumType(s);
+          if Result = atUnresolved then
+            typeName := s;
+        end
+        else
+        begin
+          FDiag.Error('expected element type in Array<T>', FCurTok.Span);
+          Result := atVoid;
+        end;
+        Expect(tkGt); // '>'
+        // Mark as parallel array
+        arrayLen := -2;
+        Exit;
+      end
+      else
+      begin
+        // Just 'parallel' without generic - treat as unresolved type
+        typeName := 'parallel';
+        Result := atUnresolved;
+        Exit;
+      end;
+    end;
+
+    // Handle 'Array<T>' generic syntax
     if Accept(tkArray) then
     begin
-      // 'array' keyword: dynamic array
+      // Check for generic syntax: Array<T>
+      if Accept(tkLt) then
+      begin
+        // Generic array: Array<T>
+        s := 'array'; // Mark as array type
+        // Parse element type
+        if Check(tkIdent) then
+        begin
+          innerTypeName := FCurTok.Value;
+          Advance;
+          // Store the element type name for later resolution
+          typeName := 'Array<' + innerTypeName + '>';
+        end
+        else
+        begin
+          FDiag.Error('expected element type in Array<T>', FCurTok.Span);
+        end;
+        Expect(tkGt); // '>'
+        // Mark as generic array (-3 indicates generic array)
+        arrayLen := -3;
+        Result := atDynArray;
+        Exit;
+      end;
+      
+      // Old syntax: 'array' keyword for dynamic array
       s := 'array';
       arrayLen := -1; // Dynamic array by default for 'array' keyword
       Result := atDynArray; // Return atDynArray for dynamic array type
