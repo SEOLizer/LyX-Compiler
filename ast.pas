@@ -43,6 +43,7 @@ type
   TNodeKind = (
     // Ausdrücke
     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit, nkIdent,
+    nkConstrainedTypeDecl,
     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
     nkFieldAccess, nkIndexAccess, nkCast,
     nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
@@ -544,12 +545,15 @@ type
     FName: string;
     FDeclType: TAurumType;
     FIsPublic: Boolean;
+    FConstraint: TAstExpr; // Bedingung für typsichere Typen (z.B. value >= 0 && value <= 100)
   public
     constructor Create(const aName: string; aDeclType: TAurumType;
-      aPublic: Boolean; aSpan: TSourceSpan);
+      aPublic: Boolean; aConstraint: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
     property Name: string read FName;
     property DeclType: TAurumType read FDeclType;
     property IsPublic: Boolean read FIsPublic;
+    property Constraint: TAstExpr read FConstraint;
   end;
 
   { Struct/Type-Deklaration mit Feldern und Methoden }
@@ -866,6 +870,7 @@ begin
     nkFuncDecl:    Result := 'FuncDecl';
     nkConDecl:     Result := 'ConDecl';
     nkTypeDecl:    Result := 'TypeDecl';
+    nkConstrainedTypeDecl: Result := 'ConstrainedTypeDecl';
     nkStructDecl:  Result := 'StructDecl';
     nkClassDecl:   Result := 'ClassDecl';
     nkUnitDecl:     Result := 'UnitDecl';
@@ -1418,12 +1423,20 @@ end;
 // ================================================================
 
 constructor TAstTypeDecl.Create(const aName: string; aDeclType: TAurumType;
-  aPublic: Boolean; aSpan: TSourceSpan);
+  aPublic: Boolean; aConstraint: TAstExpr; aSpan: TSourceSpan);
 begin
   inherited Create(nkTypeDecl, aSpan);
   FName := aName;
   FDeclType := aDeclType;
   FIsPublic := aPublic;
+  FConstraint := aConstraint;
+  if Assigned(aConstraint) then FKind := nkConstrainedTypeDecl;
+end;
+
+destructor TAstTypeDecl.Destroy;
+begin
+  if Assigned(FConstraint) then FConstraint.Free;
+  inherited Destroy;
 end;
 
 constructor TAstStructDecl.Create(const aName: string; const aFields: TStructFieldList;

@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value`
 
 ### Operatoren / Trennzeichen
 
@@ -273,7 +273,9 @@ GlobalVarDecl  := ( 'var' | 'let' ) Ident ':' Type ':=' Expr ';' ;
 
 ConDecl        := 'con' Ident ':' Type ':=' ConstExpr ';' ;
 
-TypeDecl       := 'type' Ident '=' ( StructType | ClassType | Type ) ';' ;
+TypeDecl       := 'type' Ident '=' ( StructType | ClassType | Type ) [ WhereClause ] ';' ;
+
+WhereClause    := 'where' '{' ConstExpr '}' ;
 
 FuncDecl       := 'fn' Ident '(' [ ParamList ] ')' [ ':' RetType ] Block ;
 

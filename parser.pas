@@ -400,6 +400,7 @@ var
   isStatic: Boolean;
   baseClassName: string;
   curVisibility: TVisibility;
+  constraintExpr: TAstExpr;
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -576,8 +577,16 @@ begin
   else
   begin
     declType := ParseType;
+    // Parse optional where clause
+    constraintExpr := nil;
+    if Accept(tkWhere) then
+    begin
+      Expect(tkLBrace);
+      constraintExpr := ParseExpr; // ConstExpr restriction checked in sema
+      Expect(tkRBrace);
+    end;
     Expect(tkSemicolon);
-    Result := TAstTypeDecl.Create(name, declType, isPub, FCurTok.Span);
+    Result := TAstTypeDecl.Create(name, declType, isPub, constraintExpr, FCurTok.Span);
   end;
 end;
 
@@ -1425,7 +1434,7 @@ begin
     Exit(TAstIntLit.Create(0, span)); // null as integer 0 (pointer representation)
   end;
 
-  if Check(tkIdent) then
+  if Check(tkIdent) or Check(tkValue) then
     Exit(ParseCallOrIdent);
 
   // new ClassName() - heap allocation for classes
