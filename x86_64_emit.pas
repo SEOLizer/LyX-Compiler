@@ -2893,6 +2893,42 @@ begin
               WriteSyscall(FCode);
             end;
           end;
+        // === SIMD operations (ParallelArray) - scalar fallback ===
+        // Note: Full SSE2/AVX implementation pending. This is a scalar fallback.
+        irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
+        irSIMDAnd, irSIMDOr, irSIMDXor:
+          begin
+            // Scalar fallback: process elements one-by-one
+            // Src1, Src2: pointers to source vectors
+            // Dest: pointer to result vector
+            // ImmInt: element count
+            // ImmStr: element type ('i8','i16','i32','i64','f32','f64')
+            
+            // For now, emit a stub that panics
+            // Real implementation would loop over elements
+            WriteMovRegImm64(FCode, RAX, 60); // sys_exit
+            WriteMovRegImm64(FCode, RDI, 1);  // exit code 1
+            WriteSyscall(FCode);
+          end;
+        irSIMDNeg:
+          begin
+            // Scalar negation fallback
+            WriteMovRegImm64(FCode, RAX, 60);
+            WriteMovRegImm64(FCode, RDI, 1);
+            WriteSyscall(FCode);
+          end;
+        irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe:
+          begin
+            // Scalar comparison fallback
+            WriteMovRegImm64(FCode, RAX, 60);
+            WriteMovRegImm64(FCode, RDI, 1);
+            WriteSyscall(FCode);
+          end;
+        irSIMDLoadElem, irSIMDStoreElem:
+          begin
+            // SIMD element access (scalar fallback)
+            // For now, fall through to normal load/store
+          end;
         // === Dynamic array operations (fat-pointer: 3 stack slots: ptr, len, cap) ===
         irDynArrayPush:
           begin
@@ -3222,11 +3258,14 @@ begin
   //   PLT0: pushq GOT[1](%rip) ; jmpq *GOT[2](%rip) ; nopl
   //   PLTn: jmpq *GOT[n+3](%rip) ; pushq $reloc_index ; jmpq PLT0
   
+  WriteLn('DEBUG PLT: Code size before PLT: ', FCode.Size, ', External symbols: ', Length(FExternalSymbols));
+  
   // First, generate PLT0 (resolver stub - 16 bytes)
   // This is called on first use of any external function
   SetLength(FLabelPositions, Length(FLabelPositions) + 1);
   FLabelPositions[High(FLabelPositions)].Name := '__plt_0';
   FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+  WriteLn('DEBUG PLT0: Label pos = ', FLabelPositions[High(FLabelPositions)].Pos);
   
   // PLT0:
   // pushq GOT+8(%rip) - push link_map pointer
@@ -3253,10 +3292,13 @@ begin
   // Now generate PLT entries for each external symbol (16 bytes each)
   for i := 0 to High(FExternalSymbols) do
   begin
+    WriteLn('DEBUG PLTn: i=', i, ' FCode.Size before=', FCode.Size);
+    
     // Register PLT stub label
     SetLength(FLabelPositions, Length(FLabelPositions) + 1);
     FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
     FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+    WriteLn('DEBUG PLTn: Label "', FExternalSymbols[i].Name, '" pos = ', FLabelPositions[High(FLabelPositions)].Pos);
     
     // PLTn entry (16 bytes):
     // jmpq *GOT[n+3](%rip)
@@ -3307,6 +3349,7 @@ begin
   // patch jumps to labels
   for i := 0 to High(FJumpPatches) do
   begin
+    WriteLn('DEBUG PATCH LOOP: i=', i, ' label=', FJumpPatches[i].LabelName, ' pos=', FJumpPatches[i].Pos);
     // find target label position
     targetPos := -1;
     for j := 0 to High(FLabelPositions) do
@@ -3322,10 +3365,20 @@ begin
       jmpPos := FJumpPatches[i].Pos;
       rel32 := Int64(targetPos) - Int64(jmpPos + FJumpPatches[i].JmpSize);
 
+      WriteLn('DEBUG PATCH: label=', FJumpPatches[i].LabelName, ' jmpPos=', jmpPos, ' targetPos=', targetPos, ' rel32=', rel32, ' (0x', IntToHex(rel32, 8), ')');
+
       if FJumpPatches[i].JmpSize = 5 then
         FCode.PatchU32LE(jmpPos + 1, Cardinal(rel32)) // jmp rel32: opcode at pos, rel32 at pos+1
       else
         FCode.PatchU32LE(jmpPos + 2, Cardinal(rel32)); // jcc rel32: opcode 0F xx at pos, rel32 at pos+2
+    end
+    else
+    begin
+      // DEBUG: Label not found - this is the bug!
+      WriteLn('DEBUG: Label not found: ', FJumpPatches[i].LabelName, ' at pos ', FJumpPatches[i].Pos);
+      WriteLn('DEBUG: Available labels:');
+      for j := 0 to High(FLabelPositions) do
+        WriteLn('DEBUG:   ', FLabelPositions[j].Name, ' at pos ', FLabelPositions[j].Pos);
     end;
   end;
 

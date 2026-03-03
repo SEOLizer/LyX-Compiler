@@ -75,7 +75,12 @@ type
     irLoadHandlerExn, // load exception value from handler into Dest: Src1=handler_addr
     irThrow,        // perform throw: Src1 = exception temp
     // panic / abort
-    irPanic         // panic: write message to stderr and exit with error code
+    irPanic,
+    // SIMD operations (ParallelArray)
+    irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
+    irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,
+    irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe,
+    irSIMDLoadElem, irSIMDStoreElem
    );
 
   TIRInstr = record
@@ -304,6 +309,12 @@ begin
       Result := 1;
     irPanic:
       Result := 5000;
+    // SIMD operations (mittlere bis hohe Kosten - vectorized ops)
+    irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
+    irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,
+    irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe,
+    irSIMDLoadElem, irSIMDStoreElem:
+      Result := 2;
     else
       Result := 1;
   end;
