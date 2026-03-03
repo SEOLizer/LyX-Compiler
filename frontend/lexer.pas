@@ -78,6 +78,9 @@ type
     function MakeToken(kind: TTokenKind; const value: string;
       startLine, startCol, len: Integer): TToken;
     function ReadNumber: TToken;
+    function ParseNumberWithBase(startPos: Integer): Int64;
+    function IsValidDigit(c: Char; base: Integer): Boolean;
+    function DigitValue(c: Char): Integer;
     function ReadString: TToken;
     function ReadCharLit: TToken;
     function ReadRegexLit: TToken;
@@ -298,35 +301,175 @@ begin
   Result.Span := MakeSpan(startLine, startCol, len, FFileName);
 end;
 
+{ Helper function to check if character is a valid digit for given base }
+function TLexer.IsValidDigit(c: Char; base: Integer): Boolean;
+begin
+  case base of
+    2:   Result := (c in ['0', '1']);
+    8:   Result := (c in ['0'..'7']);
+    10:  Result := (c in ['0'..'9']);
+    16:  Result := (c in ['0'..'9', 'a'..'f', 'A'..'F']);
+  else
+    Result := False;
+  end;
+end;
+
+{ Helper function to convert digit character to integer value }
+function TLexer.DigitValue(c: Char): Integer;
+begin
+  case c of
+    '0'..'9': Result := Ord(c) - Ord('0');
+    'a'..'f': Result := Ord(c) - Ord('a') + 10;
+    'A'..'F': Result := Ord(c) - Ord('A') + 10;
+  else
+    Result := 0;
+  end;
+end;
+
+{ Parse number with support for different bases }
+function TLexer.ParseNumberWithBase(startPos: Integer): Int64;
+var
+  base: Integer;
+  digit: Integer;
+  c: Char;
+  hasDigits: Boolean;
+begin
+  Result := 0;
+  hasDigits := False;
+  base := 10; // default
+  
+  // Check for prefix
+  if not IsAtEnd and (CurrentChar = '0') and (FPos + 1 <= Length(FSource)) then
+  begin
+    case FSource[FPos + 1] of
+      'x', 'X': begin base := 16; Advance; Advance; end;
+      'b', 'B': begin base := 2; Advance; Advance; end;
+      'o', 'O': begin base := 8; Advance; Advance; end;
+    end;
+  end
+  else if not IsAtEnd and (CurrentChar = '$') then
+  begin
+    base := 16;
+    Advance;
+  end
+  else if not IsAtEnd and (CurrentChar = '%') then
+  begin
+    base := 2;
+    Advance;
+  end
+  else if not IsAtEnd and (CurrentChar = '&') then
+  begin
+    base := 8;
+    Advance;
+  end;
+  
+  // Parse digits
+  while not IsAtEnd do
+  begin
+    c := CurrentChar;
+    
+    // Skip underscores (digit separators)
+    if c = '_' then
+    begin
+      Advance;
+      Continue;
+    end;
+    
+    // Check if valid digit for current base
+    if not IsValidDigit(c, base) then
+      Break;
+    
+    digit := DigitValue(c);
+    Result := Result * base + digit;
+    hasDigits := True;
+    Advance;
+  end;
+  
+  // Error if no valid digits found
+  if not hasDigits then
+  begin
+    FDiag.Error('invalid number literal for base ' + IntToStr(base), MakeSpan(FLine, FCol, 1, FFileName));
+    Result := 0;
+  end;
+end;
+
 function TLexer.ReadNumber: TToken;
 var
   startPos, startCol: Integer;
   s: string;
   isFloat: Boolean;
   currentLen: Integer;
+  numValue: Int64;
 begin
   startPos := FPos;
   startCol := FCol;
   isFloat := False;
 
-  while (not IsAtEnd) and (CurrentChar in ['0'..'9']) do
-    Advance;
+  // Check for hex/binary/octal prefix first
+  if (not IsAtEnd) and (CurrentChar = '0') and (FPos + 1 <= Length(FSource)) then
+  begin
+    case FSource[FPos + 1] of
+      'x', 'X', 'b', 'B', 'o', 'O':
+      begin
+        // Parse number with base
+        numValue := ParseNumberWithBase(startPos);
+        s := IntToStr(numValue); // Store as decimal string internally
+        currentLen := FPos - startPos;
+        Exit(MakeToken(tkIntLit, s, FLine, startCol, currentLen));
+      end;
+    end;
+  end
+  // Check for $ (hex) or % (binary) or & (octal)
+  else if (not IsAtEnd) and (CurrentChar in ['$', '%', '&']) then
+  begin
+    numValue := ParseNumberWithBase(startPos);
+    s := IntToStr(numValue);
+    currentLen := FPos - startPos;
+    Exit(MakeToken(tkIntLit, s, FLine, startCol, currentLen));
+  end;
 
-  // Prüfen auf Dezimalpunkt für Float-Literale
+  // Default: decimal number
+  while (not IsAtEnd) and (CurrentChar in ['0'..'9', '_']) do
+  begin
+    // Skip underscores but don't advance past them
+    if CurrentChar = '_' then
+    begin
+      Advance;
+      if IsAtEnd then Break;
+      Continue;
+    end;
+    Advance;
+  end;
+
+  // Check for decimal point for Float-Literale
   if (not IsAtEnd) and (CurrentChar = '.') then
   begin
-    // Prüfen, ob nach dem Punkt eine Ziffer kommt, sonst ist es ein Dot-Token
+    // Check if after the dot there's a digit, otherwise it's a Dot-Token
     if (FPos + 1 <= Length(FSource)) and (FSource[FPos + 1] in ['0'..'9']) then
     begin
       isFloat := True;
-      Advance; // Punkt überspringen
-      while (not IsAtEnd) and (CurrentChar in ['0'..'9']) do
+      Advance; // skip dot
+      while (not IsAtEnd) and (CurrentChar in ['0'..'9', '_']) do
+      begin
+        if CurrentChar = '_' then
+        begin
+          Advance;
+          if IsAtEnd then Break;
+          Continue;
+        end;
         Advance;
+      end;
     end;
   end;
 
   currentLen := FPos - startPos;
   s := Copy(FSource, startPos, currentLen);
+
+  // Remove underscores from number string
+  if not isFloat then
+  begin
+    s := StringReplace(s, '_', '', [rfReplaceAll]);
+  end;
 
   if isFloat then
     Result := MakeToken(tkFloatLit, s, FLine, startCol, currentLen)
@@ -622,8 +765,8 @@ begin
   startCol := FCol;
   c := CurrentChar;
 
-  // Zahlen
-  if c in ['0'..'9'] then
+  // Zahlen (decimal, hex 0x, binary 0b, octal 0o, or $ hex, % binary, & octal)
+  if c in ['0'..'9', '$', '%', '&'] then
   begin
     Result := ReadNumber;
     Exit;
