@@ -22,8 +22,12 @@ type
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
     // Access Control Keywords
     tkPrivate, tkProtected,
+    // SIMD Keywords
+    tkParallel,
     // Error Handling Keywords
     tkPanic, tkAssert,
+    // Constraint Keywords
+    tkWhere, tkValue,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -145,6 +149,8 @@ begin
     tkProtected:  Result := 'protected';
     tkPanic:      Result := 'panic';
     tkAssert:     Result := 'assert';
+    tkWhere:      Result := 'where';
+    tkValue:      Result := 'value';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -548,9 +554,14 @@ begin
     // Access Control Keywords
     'private':    Result := tkPrivate;
     'protected':  Result := tkProtected;
+    // SIMD Keywords
+    'parallel':   Result := tkParallel;
     // Error Handling Keywords
     'panic':      Result := tkPanic;
     'assert':     Result := tkAssert;
+    // Constraint Keywords
+    'where':      Result := tkWhere;
+    'value':      Result := tkValue;
   else
     Result := tkIdent;
   end;
