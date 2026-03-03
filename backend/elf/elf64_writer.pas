@@ -573,13 +573,16 @@ begin
           codeBuf.PatchU32LE(pltPatches[i].Pos + 12, Cardinal(jmpOffset));
         end;
 
-        // Initialize GOT[3+symIdx] to PLTn+6 (pushq instruction)
+        // Initialize GOT[3+symIdx] to PLT0 (first instruction) for lazy binding
+        // When the external function is called for the first time, the dynamic linker
+        // will be invoked via PLT0 to resolve the symbol
         for i := 0 to High(pltPatches) do
         begin
-          pltStubVA := baseVA + codeOffset + UInt64(pltPatches[i].Pos);
-          nextInstrVA := pltStubVA + 6;
+          // Point GOT entry to PLT0, not to PLTn+6
+          // PLT0 is at codeOffset (relative to baseVA)
+          pltStubVA := baseVA + codeOffset;  // PLT0 address
           gotBufOffset := (3 + pltPatches[i].SymbolIndex) * 8;
-          gotTable.PatchU64LE(gotBufOffset, QWord(nextInstrVA));
+          gotTable.PatchU64LE(gotBufOffset, QWord(pltStubVA));
         end;
       end;
 
