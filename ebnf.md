@@ -33,6 +33,32 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 `fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value`
 
+### Integer-Literale mit verschiedenen Basen
+
+Lyx unterstützt Integer-Literale in verschiedenen Zahlenbasen:
+
+```
+IntLiteral    := DecimalLiteral | HexLiteral | BinaryLiteral | OctalLiteral ;
+DecimalLiteral := [0-9] { [0-9_] } ;
+HexLiteral     := ( '0x' | '0X' | '$' ) [0-9a-fA-F_] { [0-9a-fA-F_] } ;
+BinaryLiteral  := ( '0b' | '0B' | '%' ) [01_] { [01_] } ;
+OctalLiteral   := ( '0o' | '0o' | '&' ) [0-7_] { [0-7_] } ;
+```
+
+Unterstriche (`_`) können als Trenner zur Lesbarkeit verwendet werden.
+
+**Beispiele:**
+```
+42           // Dezimal
+0xFF, $FF   // Hexadezimal (255)
+0b1010, %1010 // Binär (10)
+0o77, &77    // Oktal (63)
+1_000_000    // Mit Unterstrich
+0b1100_1010  // Binär mit Unterstrich (202)
+```
+
+Alle Integer-Literale werden intern als `int64` behandelt.
+
 ### Operatoren / Trennzeichen
 
 * Zuweisung: `:=`
