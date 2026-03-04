@@ -115,3 +115,42 @@ Neue Fehler (2026-02-28)
 - Status: BEHOBEN
 - Lösung: Die Funktionen NextPowerOfTwo, IsPowerOfTwo und PopCount wurden auskommentiert, da bitweise Operatoren in Lyx v0.3.x nicht unterstützt werden. IsEven/IsOdd verwenden jetzt Modulo (%) statt bitweisem AND.
 
+---
+
+### 4. IR-Optimizer verursacht Illegal Instruction
+
+- Datum: 2026-03-04
+- Symptom: Der IR-Optimizer (ir_optimize.pas) verursacht bei bestimmten Testprogrammen einen "Ungültiger Maschinenbefehl" (Segfault/Illegal Instruction). Das kompilierte Binary stürzt beim Ausführen ab.
+- Betroffene Programme: `tests/lyx/basic/minimal_test.lyx` (und möglicherweise andere mit dynamischem Linking)
+- Funktioniert: `examples/hello.lyx` (statisches ELF ohne externe Symbole)
+
+**Reproduktion:**
+```bash
+./lyxc examples/hello.lyx -o hello     # Funktioniert
+./lyxc tests/lyx/basic/minimal_test.lyx -o test  # Crashed bei Ausführung
+```
+
+**Analyse:**
+- Das Problem tritt auf, wenn der IR-Optimizer aktiviert ist (Standard)
+- Das Binary wird korrekt erzeugt, stürzt aber beim Start ab
+- Mit `--no-opt` funktioniert alles normal
+- Der Fehler tritt bei dynamischen ELF-Binaries auf (die externe Symbole wie `exit` haben)
+
+**Workaround:**
+```bash
+./lyxc input.lyx -o output --no-opt
+```
+
+**Verdachtete Ursache:**
+- Möglicherweise ein Bug in der Liveness-Analyse (`ComputeLiveness`)
+- Oder beim Modifizieren der IR-Instruktionen während der Optimierung
+- Der `ImmInt`-Wert wird für die Liveness-Markierung missbraucht, was zu Inkonsistenzen führen könnte
+
+**Nächste Schritte:**
+1. IR-Dump vor und nach der Optimierung vergleichen (--emit-asm)
+2. Liveness-Analyse überprüfen
+3. Prüfen ob Instruktionen korrekt aktualisiert werden
+4. Eventuell die Liveness-Information in einem separaten Array statt im IR speichern
+
+- Status: OFFEN
+
