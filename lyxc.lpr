@@ -252,7 +252,7 @@ begin
   flagLint := False;
   flagLintOnly := False;
   flagEnergyLevel := 0;
-  flagOptimize := True;  // IR optimizations enabled by default
+  flagOptimize := False;  // IR optimizations disabled by default (see bug #4)
 
   // Parse command line arguments
   i := 1;

@@ -765,11 +765,39 @@ begin
   startCol := FCol;
   c := CurrentChar;
 
-  // Zahlen (decimal, hex 0x, binary 0b, octal 0o, or $ hex, % binary, & octal)
-  if c in ['0'..'9', '$', '%', '&'] then
+  // Zahlen (decimal, hex, binary, octal)
+  if c in ['0'..'9'] then
   begin
     Result := ReadNumber;
     Exit;
+  end;
+  
+  if c = '$' then // Hex-Literal ($FF)
+  begin
+    Result := ReadNumber;
+    Exit;
+  end;
+
+  if c = '%' then // Binary-Literal (%1010) oder Modulo Operator
+  begin
+    if (not IsAtEnd) and (FPos + 1 <= Length(FSource)) and (FSource[FPos + 1] in ['0', '1']) then
+    begin
+      // % gefolgt von Binärziffer - parse als Binärzahl
+      Result := ReadNumber;
+      Exit;
+    end;
+    // Ansonsten, wenn nicht gefolgt von Binärziffer, dann ist es der Modulo Operator
+  end;
+
+  if c = '&' then // Octal-Literal (&77) oder Bitwise AND Operator
+  begin
+    if (not IsAtEnd) and (FPos + 1 <= Length(FSource)) and (FSource[FPos + 1] in ['0'..'7']) then
+    begin
+      // & gefolgt von Oktalziffer - parse als Oktalzahl
+      Result := ReadNumber;
+      Exit;
+    end;
+    // Ansonsten, wenn nicht gefolgt von Oktalziffer, dann ist es der Bitwise AND Operator
   end;
 
   // Strings
