@@ -28,7 +28,7 @@ var
   r: Integer; outp: string; txt: string; lines: TStringList;
 begin
   // build compiler
-  r := RunCapture('fpc -O2 -Mobjfpc -Sh lyxc.lpr -olyxc', txt);
+  r := RunCapture('fpc -O2 -Mobjfpc -Sh -Fuir -Fulib lyxc.lpr -olyxc', txt);
   if r <> 0 then Halt(1);
 
   // use_string -> expect 5
