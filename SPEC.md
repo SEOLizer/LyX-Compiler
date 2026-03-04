@@ -66,6 +66,15 @@ Ein IR, das du später in jedes Target übersetzen kannst, z.B.:
 
 Du musst nicht gleich SSA machen. Ein *3-Address-Code* reicht erstmal.
 
+**IR-Optimierungen** (v0.5.0):
+
+- Constant Folding: Compile-time Auswertung von Konstantenausdrücken
+- Dead Code Elimination: Entfernung von unbenutztem Code
+- Common Subexpression Elimination (CSE): Erkennung von wiederholten Berechnungen
+- Copy Propagation: Ersetzen von Kopien durch ihre Quelle
+- Strength Reduction: Ersetzen von teuren Operationen (z.B. `x * 2` → `x + x`)
+- Function Inlining: Direktes Einfügen von Funktionsaufrufen
+
 ### 2) Target-Contract (ISA)
 
 Ein Interface wie:
@@ -104,6 +113,8 @@ lyxc/
   ir/
     ir.pas
     lower_ast_to_ir.pas
+    ir_optimize.pas          IR optimizations (Constant Folding, CSE, DCE, etc.)
+    ir_inlining.pas         Function inlining
   backend/
     backend_intf.pas        (Interfaces)
     x86_64/
@@ -496,6 +507,16 @@ type slice_u8 = {*u8, len:int64}
 type string = {pchar, len} (oder alias auf slice_u8)
 
 Basisfunktionen: concat/splice später; erstmal: length, compare, to_cstr (wenn nötig)
+
+### v0.5.0 — "IR Optimizer Pipeline"
+
+- ✅ **Constant Folding**: Compile-time Auswertung von Konstantenausdrücken
+- ✅ **Dead Code Elimination**: Entfernung von unbenutztem Code
+- ✅ **Common Subexpression Elimination (CSE)**: Erkennung von wiederholten Berechnungen
+- ✅ **Copy Propagation**: Ersetzen von Kopien durch ihre Quelle
+- ✅ **Strength Reduction**: Ersetzen von teuren Operationen (x * 2 -> x + x)
+- ✅ **Function Inlining**: Direktes Einfügen von Funktionsaufrufen
+- ✅ **CLI-Option --no-opt**: Deaktiviert IR-Optimierungen
 
 v1.0: “Stabile Systemsprache”
 1.0.0 — “Stabil, testbar, nutzbar”
