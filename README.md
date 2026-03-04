@@ -14,6 +14,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ PLT/GOT Dynamic Linking for External Libraries
 ✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
 ✅ IR-Level Inlining Optimization (v0.4.3)
+✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
 ✅ PascalCase Naming Conventions (v0.4.3)
 ✅ Integrated Linter with 10 Rules (v0.4.3)
 ✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
@@ -46,6 +47,7 @@ make build
 # Debug flags
 ./lyxc examples/hello.lyx --emit-asm      # Output IR as pseudo-assembler
 ./lyxc examples/hello.lyx --dump-relocs   # Show relocations and symbols
+./lyxc examples/hello.lyx --no-opt         # Disable IR optimizations
 ```
 
 ```
@@ -1404,6 +1406,10 @@ Source code (.lyx)
       |
   [ IR Lowering ]   AST -> 3-Address-Code IR
       |
+  [ IR Optimizer ]  Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
+      |
+  [ Inlining ]      Function inlining optimization
+      |
   [ Backend ]       IR -> Machine code (Bytes)
       |
       +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
@@ -1425,6 +1431,8 @@ frontend/
 ir/
   ir.pas                    IR node types (3-Address-Code)
   lower_ast_to_ir.pas       AST -> IR transformation
+  ir_optimize.pas           IR optimizations (Constant Folding, CSE, DCE, etc.)
+  ir_inlining.pas           Function inlining
 backend/
   backend_types.pas         Shared types (External Symbols, Patches)
   x86_64/
