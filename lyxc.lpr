@@ -5,7 +5,7 @@ uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
-  ir, lower_ast_to_ir, ir_inlining,
+  ir, lower_ast_to_ir, ir_inlining, ir_optimize,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer;
@@ -22,6 +22,7 @@ var
   flagLint: Boolean;
   flagLintOnly: Boolean;
   flagEnergyLevel: Integer;  // 0 = disabled, 1-5 = energy level
+  flagOptimize: Boolean;  // IR optimizations enabled by default
   lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
@@ -33,6 +34,7 @@ var
   module: TIRModule;
   lower: TIRLowering;
   inliner: TIRInlining;
+  optimizer: TIROptimizer;
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
@@ -239,6 +241,7 @@ begin
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
     WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
     WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
+    WriteLn(StdErr, '  --no-opt         IR-Optimierungen deaktivieren');
     Halt(1);
   end;
 
@@ -249,6 +252,7 @@ begin
   flagLint := False;
   flagLintOnly := False;
   flagEnergyLevel := 0;
+  flagOptimize := True;  // IR optimizations enabled by default
 
   // Parse command line arguments
   i := 1;
@@ -302,6 +306,11 @@ begin
     else if param = '--no-lint' then
     begin
       flagLint := False;
+      Inc(i);
+    end
+    else if param = '--no-opt' then
+    begin
+      flagOptimize := False;
       Inc(i);
     end
     else if Copy(param, 1, 16) = '--target-energy=' then
@@ -463,6 +472,22 @@ begin
           finally
             inliner.Free;
           end;
+
+          // IR-Level Optimizations (Constant Folding, CSE, DCE, etc.)
+          if flagOptimize then
+          begin
+            WriteLn('[IR] Running IR optimizations...');
+            optimizer := TIROptimizer.Create(module);
+            try
+              optimizer.Optimize;
+              if optimizer.Changed then
+                WriteLn('[IR] IR optimized: ', optimizer.PassCount, ' passes');
+            finally
+              optimizer.Free;
+            end;
+          end
+          else
+            WriteLn('[IR] IR optimizations disabled');
 
           // --emit-asm: Dump IR as pseudo-assembly
           if flagEmitAsm then
