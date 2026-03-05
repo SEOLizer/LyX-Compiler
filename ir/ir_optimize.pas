@@ -7,6 +7,8 @@ uses
   SysUtils, Classes, ir;
 
 type
+  TBoolArray = array of Boolean;
+
   { IR-Optimierungspipeline }
   TIROptimizer = class
   private
@@ -24,9 +26,10 @@ type
     function GetConstValue(instr: TIRInstr): Int64;
     function GetConstFloat(instr: TIRInstr): Double;
     
-    { Dead Code Elimination }
-    function EliminateDeadCode(func: TIRFunction): Boolean;
-    function ComputeLiveness(func: TIRFunction): Boolean;
+  { Dead Code Elimination }
+  function EliminateDeadCode(func: TIRFunction): Boolean;
+  function ComputeLiveness(func: TIRFunction; out liveDest: TBoolArray): Boolean;
+
     
     { Common Subexpression Elimination }
     function EliminateCommonSubexpr(func: TIRFunction): Boolean;
@@ -319,49 +322,51 @@ end;
 
 { ===== DEAD CODE ELIMINATION ===== }
 
-function TIROptimizer.ComputeLiveness(func: TIRFunction): Boolean;
+function TIROptimizer.ComputeLiveness(func: TIRFunction; out liveDest: TBoolArray): Boolean;
 var
   i, j: Integer;
   instr: TIRInstr;
   used: array of Boolean;
+  maxLen: Integer;
 begin
   Result := False;
   if not Assigned(func) or not Assigned(func.Instructions) then Exit;
-  
-  SetLength(used, func.LocalCount + Length(func.Instructions));
+
+  maxLen := func.LocalCount + Length(func.Instructions);
+  SetLength(used, maxLen);
   for i := 0 to High(used) do
     used[i] := False;
-  
+
   // Markiere alle Temps die gelesen werden
   for i := 0 to High(func.Instructions) do
   begin
     instr := func.Instructions[i];
-    
+
     // Check all source operands
-    if instr.Src1 >= 0 then
+    if (instr.Src1 >= 0) and (instr.Src1 < Length(used)) then
       used[instr.Src1] := True;
-    if instr.Src2 >= 0 then
+    if (instr.Src2 >= 0) and (instr.Src2 < Length(used)) then
       used[instr.Src2] := True;
-    if instr.Src3 >= 0 then
+    if (instr.Src3 >= 0) and (instr.Src3 < Length(used)) then
       used[instr.Src3] := True;
-      
+
     // Check argument temps for calls
     for j := 0 to High(instr.ArgTemps) do
-      if instr.ArgTemps[j] >= 0 then
+      if (instr.ArgTemps[j] >= 0) and (instr.ArgTemps[j] < Length(used)) then
         used[instr.ArgTemps[j]] := True;
   end;
-  
-  // Store liveness info in instruction for later use
+
+  // Export liveness info per Dest, without mutating ImmInt
+  SetLength(liveDest, maxLen);
+  for i := 0 to High(liveDest) do
+    liveDest[i] := False;
+
   for i := 0 to High(func.Instructions) do
   begin
-    func.Instructions[i].ImmInt := 0;  // Reuse for liveness flag
-    if func.Instructions[i].Dest >= 0 then
-    begin
-      if func.Instructions[i].Dest < Length(used) then
-        func.Instructions[i].ImmInt := Ord(used[func.Instructions[i].Dest]);
-    end;
+    if (func.Instructions[i].Dest >= 0) and (func.Instructions[i].Dest < Length(used)) then
+      liveDest[func.Instructions[i].Dest] := used[func.Instructions[i].Dest];
   end;
-  
+
   Result := True;
 end;
 
@@ -369,23 +374,23 @@ function TIROptimizer.EliminateDeadCode(func: TIRFunction): Boolean;
 var
   i: Integer;
   instr: TIRInstr;
+  liveDest: TBoolArray;
 begin
   Result := False;
   if not Assigned(func) or not Assigned(func.Instructions) then Exit;
-  
+
   // Compute liveness
-  if not ComputeLiveness(func) then Exit;
-  
+  if not ComputeLiveness(func, liveDest) then Exit;
+
   // Remove dead instructions (simple version: remove stores to unused temps)
   for i := 0 to High(func.Instructions) do
   begin
     instr := func.Instructions[i];
-    
+
     // Store instructions whose dest is never used
     if (instr.Op = irStoreLocal) and (instr.Dest >= 0) then
     begin
-      // ImmInt stores the liveness flag from ComputeLiveness
-      if instr.ImmInt = 0 then
+      if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
       begin
         // This store is dead
         func.Instructions[i].Op := irInvalid;
@@ -393,13 +398,13 @@ begin
         SetChanged;
       end;
     end;
-    
+
     // Other operations that write to unused temps
-    if (instr.Dest >= 0) and (instr.Op <> irLabel) and 
-       (instr.Op <> irJmp) and (instr.Op <> irBrTrue) and 
+    if (instr.Dest >= 0) and (instr.Op <> irLabel) and
+       (instr.Op <> irJmp) and (instr.Op <> irBrTrue) and
        (instr.Op <> irBrFalse) and (instr.Op <> irReturn) then
     begin
-      if instr.ImmInt = 0 then
+      if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
       begin
         // Check if it's a side-effect free operation
         case instr.Op of

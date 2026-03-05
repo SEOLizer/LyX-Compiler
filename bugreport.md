@@ -117,40 +117,38 @@ Neue Fehler (2026-02-28)
 
 ---
 
-### 4. IR-Optimizer verursacht Illegal Instruction
+### 4. (BEHOBEN) IR-Optimizer verursacht Illegal Instruction
 
 - Datum: 2026-03-04
 - Symptom: Der IR-Optimizer (ir_optimize.pas) verursacht bei bestimmten Testprogrammen einen "Ungültiger Maschinenbefehl" (Segfault/Illegal Instruction). Das kompilierte Binary stürzt beim Ausführen ab.
 - Betroffene Programme: `tests/lyx/basic/minimal_test.lyx` (und möglicherweise andere mit dynamischem Linking)
 - Funktioniert: `examples/hello.lyx` (statisches ELF ohne externe Symbole)
 
-**Reproduktion:**
+**Reproduktion (vor Fix):**
 ```bash
 ./lyxc examples/hello.lyx -o hello     # Funktioniert
-./lyxc tests/lyx/basic/minimal_test.lyx -o test  # Crashed bei Ausführung
+./lyxc tests/lyx/basic/minimal_test.lyx -o test  # Crash bei Ausführung
 ```
 
 **Analyse:**
-- Das Problem tritt auf, wenn der IR-Optimizer aktiviert ist (Standard)
-- Das Binary wird korrekt erzeugt, stürzt aber beim Start ab
-- Mit `--no-opt` funktioniert alles normal
-- Der Fehler tritt bei dynamischen ELF-Binaries auf (die externe Symbole wie `exit` haben)
+- Der IR-Optimizer überschreibt `Instr.ImmInt` für die Liveness-Markierung.
+- Dadurch werden echte Immediate-Werte (z.B. Konstanten, Bitbreiten) zerstört.
+- Das erzeugte Binary enthält dadurch fehlerhafte Werte und stürzt ab.
 
-**Workaround:**
+**Fix:**
+- Liveness wird jetzt in einem separaten Boolean-Array verwaltet.
+- `ImmInt` bleibt unverändert.
+- Zusätzliche Bounds-Checks für Temp-Indices.
+- Optimizer wieder standardmäßig aktivierbar, `--no-opt` bleibt verfügbar.
+
+**Verifikation:**
 ```bash
-./lyxc input.lyx -o output --no-opt
+./lyxc tests/lyx/basic/minimal_test.lyx -o out/minimal_test_opt
+./out/minimal_test_opt  # Exit:42
+
+./lyxc tests/lyx/basic/minimal_test.lyx -o out/minimal_test_noopt --no-opt
+./out/minimal_test_noopt  # Exit:42
 ```
 
-**Verdachtete Ursache:**
-- Möglicherweise ein Bug in der Liveness-Analyse (`ComputeLiveness`)
-- Oder beim Modifizieren der IR-Instruktionen während der Optimierung
-- Der `ImmInt`-Wert wird für die Liveness-Markierung missbraucht, was zu Inkonsistenzen führen könnte
-
-**Nächste Schritte:**
-1. IR-Dump vor und nach der Optimierung vergleichen (--emit-asm)
-2. Liveness-Analyse überprüfen
-3. Prüfen ob Instruktionen korrekt aktualisiert werden
-4. Eventuell die Liveness-Information in einem separaten Array statt im IR speichern
-
-- Status: OFFEN
+- Status: BEHOBEN
 
