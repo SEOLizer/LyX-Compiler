@@ -103,6 +103,56 @@ type
     r_addend: Int64;
   end;
 
+  TElf64Shdr = packed record
+    sh_name: DWord;
+    sh_type: DWord;
+    sh_flags: UInt64;
+    sh_addr: UInt64;
+    sh_offset: UInt64;
+    sh_size: UInt64;
+    sh_link: DWord;
+    sh_info: DWord;
+    sh_addralign: UInt64;
+    sh_entsize: UInt64;
+  end;
+
+const
+  // Section Header Types (SHT)
+  SHT_NULL = 0;           // Inactive
+  SHT_PROGBITS = 1;       // Program data
+  SHT_SYMTAB = 2;         // Symbol table
+  SHT_STRTAB = 3;         // String table
+  SHT_RELA = 4;           // Relocation entries with addends
+  SHT_HASH = 5;           // Symbol hash table
+  SHT_DYNAMIC = 6;        // Dynamic linking information
+  SHT_NOBITS = 8;         // Program space with no file data (bss)
+  SHT_DYNSYM = 11;        // Dynamic linker symbol table
+
+  // Section Header Flags (SHF)
+  SHF_WRITE = $1;         // Writable
+  SHF_ALLOC = $2;         // Occupies memory during execution
+  SHF_EXECINSTR = $4;     // Executable
+  SHF_MASKPROC = $F0000000; // Processor-specific
+
+  // Special Section Indices (SHN)
+  SHN_UNDEF = 0;          // Undefined, signifies an absent or irrelevant section reference
+  SHN_ABS = $FFF1;        // Absolute values
+  SHN_COMMON = $FFF2;     // Common symbols
+
+  // Project specific: to store offsets into shStrTable
+  SHStr_shstrtab = 1;
+  SHStr_dynsym = 9;
+  SHStr_dynstr = 17;
+  SHStr_hash = 25;
+  SHStr_got = 31;
+  SHStr_rela_plt = 37;
+  SHStr_rela_dyn = 47;
+  SHStr_dynamic = 57;
+  SHStr_text = 67;
+  SHStr_data = 73;
+  SHStr_bss = 79;
+
+
 // ============================================================
 // Static ELF writer (no dynamic linking)
 // ============================================================
@@ -284,7 +334,7 @@ procedure WriteDynamicElf64WithPatches(const filename: string;
   const externSymbols: TExternalSymbolArray;
   const neededLibs: array of string;
   const pltPatches: TPLTGOTPatchArray);
-const
+  const
   pageSize: UInt64 = 4096;
   baseVA: UInt64 = 0;  // PIE: base = 0, loader relocates
   interpPath: string = '/lib64/ld-linux-x86-64.so.2';
@@ -322,6 +372,50 @@ var
   gotEntryVA, pltStubVA, nextInstrVA, plt0VA: UInt64;
   ripOffset, pushOffset, jmpOffset: Int64;
   gotBufOffset, plt0StartInBuffer: Integer;
+
+  // Section headers
+  shStrTableBuf: TByteBuffer;
+  shdrsBuf: TByteBuffer;
+  shStrOffsets: TStringList;
+  numShdrs: Integer;
+  shStrTabOff, shStrTabVAddr: UInt64;
+  shdrsOff, shdrsVAddr: UInt64;
+  shdr: TElf64Shdr;
+
+  // Section offsets and sizes
+  textOff, textVAddr: UInt64;
+  dataOff, dataVAddr: UInt64;
+  bssOff, bssVAddr, bssSize: UInt64;
+  pltOff, pltVAddr, pltSize: UInt64;
+
+procedure BuildSectionStringTable(out shStrTableBuf: TByteBuffer; out shStrOffsets: TStringList);
+var
+  currentOffset: Integer;
+begin
+  shStrTableBuf := TByteBuffer.Create;
+  shStrOffsets := TStringList.Create;
+
+  // First entry is empty string at offset 0
+  shStrTableBuf.WriteU8(0);
+  currentOffset := 1;
+
+  // Add standard section names
+  shStrOffsets.AddObject('.shstrtab', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.shstrtab'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.dynsym', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.dynsym'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.dynstr', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.dynstr'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.hash', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.hash'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.got.plt', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.got.plt'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.rela.plt', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.rela.plt'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.rela.dyn', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.rela.dyn'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.dynamic', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.dynamic'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.text', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.text'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.data', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.data'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.bss', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.bss'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.interp', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.interp'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.symtab', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.symtab'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+  shStrOffsets.AddObject('.strtab', TObject(PtrUInt(currentOffset))); WriteStringToBuffer(shStrTableBuf, '.strtab'); shStrTableBuf.WriteU8(0); currentOffset := shStrTableBuf.Size;
+end;
+
 begin
   codeSize := codeBuf.Size;
   dataSize := dataBuf.Size;
@@ -334,6 +428,7 @@ begin
   libNames.Duplicates := dupIgnore;
   libNames.Sorted := True;
   symNames := TStringList.Create;
+  BuildSectionStringTable(shStrTableBuf, shStrOffsets); // Build section header string table
   try
     for i := 0 to High(neededLibs) do
       libNames.Add(neededLibs[i]);
@@ -402,18 +497,39 @@ begin
       headersSize := 64 + UInt64(numPhdrs) * 56;
       interpOffset := headersSize;
 
+      // Code segment starts after interpreter string, page-aligned
       codeOffset := AlignUp(interpOffset + interpSize, pageSize);
+      textOff := codeOffset;
+      textVAddr := baseVA + textOff;
+
+      // PLT section is a sub-range inside the code buffer
+      if Length(pltPatches) > 0 then
+      begin
+        plt0StartInBuffer := pltPatches[0].Pos - 16;
+        pltOff := codeOffset + UInt64(plt0StartInBuffer);
+        pltVAddr := baseVA + pltOff;
+        pltSize := codeSize - UInt64(plt0StartInBuffer);
+      end
+      else
+      begin
+        pltOff := 0;
+        pltVAddr := 0;
+        pltSize := 0;
+      end;
+
+      // .data section layout - starts on a new page boundary after code
       dataOffset := codeOffset + AlignUp(codeSize, pageSize);
+      dataVAddr := baseVA + dataOffset;
 
       // Inside the RW segment: user data first, then dynamic structures
-      curOff := dataOffset + AlignUp(dataSize, 8);
+      curOff := dataOffset + AlignUp(dataSize, 8); // Start of dynamic structures after user data and padding
 
       // .dynsym (8-byte aligned)
       dynSymOff := AlignUp(curOff, 8);
       curOff := dynSymOff + UInt64(dynSymTable.Size);
 
       // .dynstr
-      dynStrOff := AlignUp(curOff, 1); // no alignment needed
+      dynStrOff := AlignUp(curOff, 1); // No alignment needed
       curOff := dynStrOff + UInt64(dynStrTable.Size);
 
       // .hash (4-byte aligned)
@@ -434,6 +550,24 @@ begin
 
       // .dynamic (8-byte aligned) — size computed below
       dynamicOff := AlignUp(curOff, 8);
+      curOff := dynamicOff + UInt64(dynamicTable.Size); // Placeholder, will be updated after dynamicTable is built
+
+      // .bss section (empty for now)
+      bssOff := AlignUp(curOff, pageSize);
+      bssVAddr := baseVA + bssOff;
+      bssSize := 0; // Assuming .bss is empty for now
+
+      // Section Header String Table (.shstrtab)
+      shStrTabOff := AlignUp(bssOff + bssSize, pageSize);
+      shStrTabVAddr := baseVA + shStrTabOff;
+
+      // Section Headers themselves
+      numShdrs := 13; // NULL, .interp, .text, .data, .bss, .dynsym, .dynstr, .hash, .got.plt, .rela.plt, .rela.dyn, .dynamic, .shstrtab
+      shdrsOff := AlignUp(shStrTabOff + UInt64(shStrTableBuf.Size), 8); // Section headers after shstrtab, 8-byte aligned
+      shdrsVAddr := baseVA + shdrsOff; // Not strictly needed, but for consistency
+
+      // End of RW segment file offset (includes all dynamic data + bss + shstrtab + shdrs)
+      dataEndOff := shdrsOff + UInt64(numShdrs) * SizeOf(TElf64Shdr);
 
       // ================================================================
       // PHASE 2: Build tables with final addresses
@@ -540,13 +674,172 @@ begin
       // DT_NULL terminator
       dyn.d_tag := DT_NULL;
       dyn.d_un := 0;
-      dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
+       dynamicTable.WriteBuffer(dyn, SizeOf(dyn));
 
-      dataEndOff := dynamicOff + UInt64(dynamicTable.Size);
+       // After dynamicTable is fully built, ensure curOff reflects its final size
+       curOff := dynamicOff + UInt64(dynamicTable.Size);
 
-      // ================================================================
-      // PHASE 3: Patch PLT stubs in codeBuf
-      // ================================================================
+       // Recalculate bssOff, shStrTabOff, shdrsOff based on final curOff
+       bssOff := AlignUp(curOff, pageSize);
+       bssVAddr := baseVA + bssOff;
+
+       shStrTabOff := AlignUp(bssOff + bssSize, pageSize);
+       shStrTabVAddr := baseVA + shStrTabOff;
+
+       shdrsOff := AlignUp(shStrTabOff + UInt64(shStrTableBuf.Size), 8);
+       shdrsVAddr := baseVA + shdrsOff; // For consistency
+
+       dataEndOff := shdrsOff + UInt64(numShdrs) * SizeOf(TElf64Shdr);
+
+       // Build section headers
+       shdrsBuf := TByteBuffer.Create;
+
+       // SHN_UNDEF (NULL) section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .interp section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.interp');
+       shdr.sh_type := SHT_PROGBITS;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + interpOffset;
+       shdr.sh_offset := interpOffset;
+       shdr.sh_size := interpSize;
+       shdr.sh_addralign := 1;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .text section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.text');
+       shdr.sh_type := SHT_PROGBITS;
+       shdr.sh_flags := SHF_ALLOC or SHF_EXECINSTR;
+       shdr.sh_addr := textVAddr;
+       shdr.sh_offset := textOff;
+       shdr.sh_size := codeSize;
+       shdr.sh_addralign := 16; // Code alignment
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .data section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.data');
+       shdr.sh_type := SHT_PROGBITS;
+       shdr.sh_flags := SHF_ALLOC or SHF_WRITE;
+       shdr.sh_addr := dataVAddr;
+       shdr.sh_offset := dataOffset;
+       shdr.sh_size := dataSize;
+       shdr.sh_addralign := 8;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .bss section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.bss');
+       shdr.sh_type := SHT_NOBITS;
+       shdr.sh_flags := SHF_ALLOC or SHF_WRITE;
+       shdr.sh_addr := bssVAddr;
+       shdr.sh_offset := bssOff; // File offset is still there, but size is 0
+       shdr.sh_size := bssSize;
+       shdr.sh_addralign := 8;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .dynsym section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.dynsym');
+       shdr.sh_type := SHT_DYNSYM;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + dynSymOff;
+       shdr.sh_offset := dynSymOff;
+       shdr.sh_size := dynSymTable.Size;
+       shdr.sh_link := 2; // sh_link to .dynstr (index 2 for us, assuming .dynsym is index 1)
+       shdr.sh_info := 1; // Index of first non-local symbol
+       shdr.sh_addralign := 8;
+       shdr.sh_entsize := SizeOf(TElf64Sym);
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .dynstr section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.dynstr');
+       shdr.sh_type := SHT_STRTAB;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + dynStrOff;
+       shdr.sh_offset := dynStrOff;
+       shdr.sh_size := dynStrTable.Size;
+       shdr.sh_addralign := 1;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .hash section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.hash');
+       shdr.sh_type := SHT_HASH;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + hashOff;
+       shdr.sh_offset := hashOff;
+       shdr.sh_size := hashTable.Size;
+       shdr.sh_link := 1; // sh_link to .dynsym
+       shdr.sh_addralign := 4;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .got.plt section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.got.plt');
+       shdr.sh_type := SHT_PROGBITS;
+       shdr.sh_flags := SHF_ALLOC or SHF_WRITE;
+       shdr.sh_addr := baseVA + gotOff;
+       shdr.sh_offset := gotOff;
+       shdr.sh_size := gotTable.Size;
+       shdr.sh_addralign := 8;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .rela.plt section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.rela.plt');
+       shdr.sh_type := SHT_RELA;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + relaPltOff;
+       shdr.sh_offset := relaPltOff;
+       shdr.sh_size := relaPltTable.Size;
+       shdr.sh_link := 1; // sh_link to .dynsym
+       shdr.sh_info := 8; // sh_info to .got.plt (assuming index 8)
+       shdr.sh_addralign := 8;
+       shdr.sh_entsize := SizeOf(TElf64Rela);
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .rela.dyn section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.rela.dyn');
+       shdr.sh_type := SHT_RELA;
+       shdr.sh_flags := SHF_ALLOC;
+       shdr.sh_addr := baseVA + relaDynOff;
+       shdr.sh_offset := relaDynOff;
+       shdr.sh_size := relaDynTable.Size;
+       shdr.sh_link := 1; // sh_link to .dynsym
+       shdr.sh_addralign := 8;
+       shdr.sh_entsize := SizeOf(TElf64Rela);
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .dynamic section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.dynamic');
+       shdr.sh_type := SHT_DYNAMIC;
+       shdr.sh_flags := SHF_ALLOC or SHF_WRITE;
+       shdr.sh_addr := baseVA + dynamicOff;
+       shdr.sh_offset := dynamicOff;
+       shdr.sh_size := dynamicTable.Size;
+       shdr.sh_link := 2; // sh_link to .dynstr (index 2)
+       shdr.sh_addralign := 8;
+       shdr.sh_entsize := SizeOf(TElf64Dyn);
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
+
+       // .shstrtab section
+       FillChar(shdr, SizeOf(shdr), 0);
+       shdr.sh_name := GetStringOffset(shStrOffsets, '.shstrtab'); // This refers to itself
+       shdr.sh_type := SHT_STRTAB;
+       shdr.sh_flags := 0; // No alloc or write flags
+       shdr.sh_addr := baseVA + shStrTabOff;
+       shdr.sh_offset := shStrTabOff;
+       shdr.sh_size := shStrTableBuf.Size;
+       shdr.sh_addralign := 1;
+       shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
       if Length(pltPatches) > 0 then
       begin
         plt0VA := baseVA + codeOffset;
