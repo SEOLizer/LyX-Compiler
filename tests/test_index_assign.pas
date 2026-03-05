@@ -143,6 +143,7 @@ var
   blk: TAstBlock;
   foundIndexAssign: Boolean;
   i: Integer;
+  decl: TAstNode;
 begin
   d := TDiagnostics.Create;
   try
@@ -159,8 +160,14 @@ begin
         try
           // Find the function
           AssertTrue('Should have at least one declaration', Length(prog.Decls) > 0);
-          AssertTrue('First decl should be FuncDecl', prog.Decls[0] is TAstFuncDecl);
-          fn := TAstFuncDecl(prog.Decls[0]);
+          fn := nil;
+          for decl in prog.Decls do
+            if decl is TAstFuncDecl then
+            begin
+              fn := TAstFuncDecl(decl);
+              Break;
+            end;
+          AssertNotNull('Function declaration should exist', fn);
           blk := fn.Body;
           AssertNotNull('Function body should exist', blk);
 

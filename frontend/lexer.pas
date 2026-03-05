@@ -887,6 +887,16 @@ begin
       else
         Result := MakeToken(tkQuestion, '?', startLine, startCol, 1);
     end;
+    '!': begin
+      Advance;
+      if (not IsAtEnd) and (CurrentChar = '=') then
+      begin
+        Advance;
+        Result := MakeToken(tkNeq, '!=', startLine, startCol, 2);
+      end
+      else
+        Result := MakeToken(tkNot, '!', startLine, startCol, 1);
+    end;
     '[': begin Advance; Result := MakeToken(tkLBracket, '[', startLine, startCol, 1); end;
     ']': begin Advance; Result := MakeToken(tkRBracket, ']', startLine, startCol, 1); end;
 
