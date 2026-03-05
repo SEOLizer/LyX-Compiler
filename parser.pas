@@ -113,7 +113,7 @@ begin
     Result := visPrivate
   else if Accept(tkProtected) then
     Result := visProtected
-  else if Accept(tkPub) then
+  else if Accept(tkPublic) then
     Result := visPublic;
 end;
 
@@ -149,6 +149,12 @@ begin
       decls[High(decls)] := d;
     end;
   end;
+
+  // Impliziter Import von std.system (Auto-Injection)
+  d := TAstImportDecl.Create('std.system', '', nil, MakeSpan(1,1,0,''));
+  SetLength(decls, Length(decls) + 1);
+  decls[High(decls)] := d;
+
   // import declarations
   while Check(tkImport) do
   begin
@@ -185,9 +191,9 @@ var
   retType: TAurumType;
 begin
   isExtern := False;
-  if Check(tkPub) then
+  if Check(tkPublic) then
   begin
-    Advance; // consume 'pub'
+    Advance; // consume 'public'
     if Check(tkFn) then
       Exit(ParseFuncDecl(True))
     else if Check(tkCon) then
@@ -437,7 +443,10 @@ begin
       end
       else
         FDiag.Error('expected base class name after ''extends''', FCurTok.Span);
-    end;
+    end
+    else
+      // Auto-Inheritance: Wenn keine Basisklasse angegeben ist, ist TObject die Basis
+      baseClassName := 'TObject';
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
@@ -916,7 +925,10 @@ begin
 
   if Check(tkIdent) then
   begin
-    name := FCurTok.Value; 
+    name := FCurTok.Value;
+    // Warnung: Klassenname sollte mit 'T' beginnen
+    if (Length(name) > 0) and (name[1] <> 'T') then
+      FDiag.Report(dkWarning, 'Class name ''' + name + ''' should start with ''T'' (naming convention)', FCurTok.Span);
     Advance;
   end
   else
