@@ -580,6 +580,7 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   fs: TFileStream;
   fname: string;
   // PLT patching
+  plt0Start: Integer;
   pltNStart: Integer;
   jmpPlt0OffsetPos: Integer;
   pltRel32: Int64;
@@ -3265,7 +3266,8 @@ begin
   SetLength(FLabelPositions, Length(FLabelPositions) + 1);
   FLabelPositions[High(FLabelPositions)].Name := '__plt_0';
   FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
-  WriteLn('DEBUG PLT0: Label pos = ', FLabelPositions[High(FLabelPositions)].Pos);
+  plt0Start := FLabelPositions[High(FLabelPositions)].Pos;
+  WriteLn('DEBUG PLT0: Label pos = ', plt0Start);
   
   // PLT0:
   // pushq GOT+8(%rip) - push link_map pointer
@@ -3329,20 +3331,16 @@ begin
   end;
   
   // Now patch the jmp PLT0 in each PLTn entry
-  // PLT0 is at offset 0, each PLTn entry is 16 bytes
   for i := 0 to High(FExternalSymbols) do
   begin
     // Position of jmp PLT0 in PLTn:
-    // PLTn starts at: 16 (PLT0 is 16 bytes) + i*16
+    // PLTn starts at: PLT0 + 16 + i*16
     // jmp PLT0 is at: start + 6 (jmp GOT) + 5 (push) = start + 11
     // rel32 field is at: start + 12
-    // Target = 0 (PLT0)
-    // rel32 = 0 - (start + 12 + 5) = -(start + 17)
-    // start = 16 + i*16 = 16*(i+1)
-    // rel32 = -(16*(i+1) + 17) = -(16*i + 33)
-    pltNStart := 16 + i * 16; // PLT0 is 16 bytes, each PLTn is 16 bytes
+    // rel32 = target - (start + 16)
+    pltNStart := plt0Start + 16 + i * 16;
     jmpPlt0OffsetPos := pltNStart + 12; // jmp opcode at +11, rel32 at +12
-    pltRel32 := -Int64(pltNStart + 17); // target (0) - (position + 5 for jmp instruction)
+    pltRel32 := Int64(plt0Start) - Int64(pltNStart + 16);
     FCode.PatchU32LE(jmpPlt0OffsetPos, Cardinal(pltRel32));
   end;
 
