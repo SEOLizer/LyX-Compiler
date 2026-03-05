@@ -897,9 +897,17 @@ Binary Serialisierung für Lyx-Datenstrukturen.
 - `isWhitespace(c: int64): bool` - Whitespace?
 
 ### Regex-Operationen
-- `RegexMatch(pattern, text: pchar): bool` - Vollständiger Match
+- `RegexMatch(pattern, text: pchar): bool` - Match-Suche im Text
 - `RegexSearch(pattern, text: pchar): int64` - Erste Position oder -1
-- `RegexReplace(pattern, text, replacement: pchar): int64` - Ersetzen (0/1)
+- `RegexReplace(pattern, text, replacement: pchar): int64` - Ersetzungen zählen
+- `RegexMatchEx(pattern, text, flags: int64): bool` - Match mit Flags
+- `RegexSearchEx(pattern, text, flags: int64): int64` - Suche mit Flags
+- `RegexReplaceEx(pattern, text, replacement, flags: int64): int64`
+- `RegexReplaceInto(dest, pattern, text, replacement: pchar): int64`
+- `RegexCaptureCount(): int64` - Anzahl Captures
+- `RegexCaptureStart(group: int64): int64` - Startposition Capture
+- `RegexCaptureEnd(group: int64): int64` - Endposition Capture
+- `RegexCaptureText(dest, text: pchar, group: int64): pchar` - Capture-Text
 
 ---
 
