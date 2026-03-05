@@ -215,9 +215,18 @@ type
   TAstRegexLit = class(TAstExpr)
   private
     FPattern: string;
+    FCompiled: string;
+    FCompiledLen: Integer;
+    FCaptureSlots: Integer;
+    FHasCompiled: Boolean;
   public
     constructor Create(const aPattern: string; aSpan: TSourceSpan);
+    procedure SetCompiled(const data: string; capSlots: Integer);
     property Pattern: string read FPattern;
+    property CompiledProgram: string read FCompiled;
+    property CompiledLen: Integer read FCompiledLen;
+    property CaptureSlots: Integer read FCaptureSlots;
+    property HasCompiled: Boolean read FHasCompiled;
   end;
 
   { Feldzugriff: expr.field }
@@ -1351,7 +1360,19 @@ constructor TAstRegexLit.Create(const aPattern: string; aSpan: TSourceSpan);
 begin
   inherited Create(nkRegexLit, aSpan);
   FPattern := aPattern;
+  FCompiled := '';
+  FCompiledLen := 0;
+  FCaptureSlots := 0;
+  FHasCompiled := False;
   // Regex type - will be resolved in sema
+end;
+
+procedure TAstRegexLit.SetCompiled(const data: string; capSlots: Integer);
+begin
+  FCompiled := data;
+  FCompiledLen := Length(data);
+  FCaptureSlots := capSlots;
+  FHasCompiled := True;
 end;
 
 // ================================================================

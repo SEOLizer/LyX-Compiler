@@ -714,6 +714,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     cv: TConstValue;
     argCount: Integer;
     argTemps: array of Integer;
+    callTemps: array of Integer;
+    callName: string;
+    regexLit: TAstRegexLit;
+    useCompiled: Boolean;
+    compiledTemp: Integer;
+    lenTemp: Integer;
     fn: TIRFunction;
     ltype, rType: TAurumType;
     width: Integer;
@@ -1357,58 +1363,142 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         else if ((call.Name = 'RegexMatch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
         begin
-          // RegexMatch(pattern, text) -> bool
-          // Use generic external call
+          useCompiled := (argCount >= 2) and (call.Args[0] is TAstRegexLit) and
+            TAstRegexLit(call.Args[0]).HasCompiled;
+          if useCompiled then
+          begin
+            regexLit := TAstRegexLit(call.Args[0]);
+            strIdx := FModule.InternString(regexLit.CompiledProgram);
+            compiledTemp := NewTemp;
+            instr.Op := irConstStr;
+            instr.Dest := compiledTemp;
+            instr.ImmStr := IntToStr(strIdx);
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr.Op := irConstInt;
+            instr.Dest := lenTemp;
+            instr.ImmInt := regexLit.CompiledLen;
+            Emit(instr);
+            callName := 'RegexMatchCompiled';
+            SetLength(callTemps, 3);
+            callTemps[0] := compiledTemp;
+            callTemps[1] := lenTemp;
+            callTemps[2] := argTemps[1];
+          end
+          else
+          begin
+            callName := 'RegexMatch';
+            callTemps := argTemps;
+          end;
           t0 := NewTemp;
           instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'strstr';  // Use libc's strstr
-          instr.ImmInt := argCount;
-          instr.CallMode := cmExternal;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          instr.ImmStr := callName;
+          instr.ImmInt := Length(callTemps);
+          if FExternFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmExternal
+          else if FImportedFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmImported
+          else
+            instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, Length(callTemps));
+          for i := 0 to High(callTemps) do
+            instr.ArgTemps[i] := callTemps[i];
           Emit(instr);
           Result := t0;
         end
         else if ((call.Name = 'RegexSearch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Search'))) then
         begin
-          // RegexSearch(pattern, text) -> int64 (position or -1)
-          // Use generic external call
+          useCompiled := (argCount >= 2) and (call.Args[0] is TAstRegexLit) and
+            TAstRegexLit(call.Args[0]).HasCompiled;
+          if useCompiled then
+          begin
+            regexLit := TAstRegexLit(call.Args[0]);
+            strIdx := FModule.InternString(regexLit.CompiledProgram);
+            compiledTemp := NewTemp;
+            instr.Op := irConstStr;
+            instr.Dest := compiledTemp;
+            instr.ImmStr := IntToStr(strIdx);
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr.Op := irConstInt;
+            instr.Dest := lenTemp;
+            instr.ImmInt := regexLit.CompiledLen;
+            Emit(instr);
+            callName := 'RegexSearchCompiled';
+            SetLength(callTemps, 3);
+            callTemps[0] := compiledTemp;
+            callTemps[1] := lenTemp;
+            callTemps[2] := argTemps[1];
+          end
+          else
+          begin
+            callName := 'RegexSearch';
+            callTemps := argTemps;
+          end;
           t0 := NewTemp;
           instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'strstr';
-          instr.ImmInt := argCount;
-          instr.CallMode := cmExternal;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          instr.ImmStr := callName;
+          instr.ImmInt := Length(callTemps);
+          if FExternFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmExternal
+          else if FImportedFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmImported
+          else
+            instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, Length(callTemps));
+          for i := 0 to High(callTemps) do
+            instr.ArgTemps[i] := callTemps[i];
           Emit(instr);
           Result := t0;
         end
         else if ((call.Name = 'RegexReplace') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Replace'))) then
         begin
-          // RegexReplace(pattern, text, replacement) -> int64 (count)
-          // Use generic external call
+          useCompiled := (argCount >= 3) and (call.Args[0] is TAstRegexLit) and
+            TAstRegexLit(call.Args[0]).HasCompiled;
+          if useCompiled then
+          begin
+            regexLit := TAstRegexLit(call.Args[0]);
+            strIdx := FModule.InternString(regexLit.CompiledProgram);
+            compiledTemp := NewTemp;
+            instr.Op := irConstStr;
+            instr.Dest := compiledTemp;
+            instr.ImmStr := IntToStr(strIdx);
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr.Op := irConstInt;
+            instr.Dest := lenTemp;
+            instr.ImmInt := regexLit.CompiledLen;
+            Emit(instr);
+            callName := 'RegexReplaceCompiled';
+            SetLength(callTemps, 4);
+            callTemps[0] := compiledTemp;
+            callTemps[1] := lenTemp;
+            callTemps[2] := argTemps[1];
+            callTemps[3] := argTemps[2];
+          end
+          else
+          begin
+            callName := 'RegexReplace';
+            callTemps := argTemps;
+          end;
           t0 := NewTemp;
           instr.Op := irCall;
           instr.Dest := t0;
-          instr.ImmStr := 'strstr';
-          instr.ImmInt := argCount;
-          instr.CallMode := cmExternal;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          if argCount >= 3 then instr.Src3 := argTemps[2] else instr.Src3 := -1;
+          instr.ImmStr := callName;
+          instr.ImmInt := Length(callTemps);
+          if FExternFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmExternal
+          else if FImportedFuncs.IndexOf(callName) >= 0 then
+            instr.CallMode := cmImported
+          else
+            instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, Length(callTemps));
+          for i := 0 to High(callTemps) do
+            instr.ArgTemps[i] := callTemps[i];
           Emit(instr);
           Result := t0;
         end

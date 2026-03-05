@@ -962,8 +962,45 @@ begin
                // patch done jump
                FCode.PatchU32LE(jmpDonePos + 1, Cardinal(k - jmpDonePos - 5));
              end
+ 
+             else if instr.ImmStr = 'StrLength' then
+             begin
+               // StrLength(s: pchar) -> int64
+               WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+               WriteMovRegReg(FCode, RCX, RSI);
+               // strlen_loop
+               EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00); // cmp byte [rcx], 0
+               EmitU8(FCode, $74); EmitU8(FCode, $05); // je +5
+               WriteIncReg(FCode, RCX);
+               EmitU8(FCode, $EB); EmitU8(FCode, $F6); // jmp -10
+               // rax = rcx - rsi
+               WriteMovRegReg(FCode, RAX, RCX);
+               WriteSubRegReg(FCode, RAX, RSI);
+               if instr.Dest >= 0 then
+                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+             end
+             else if instr.ImmStr = 'StrCharAt' then
+             begin
+               // StrCharAt(s: pchar, idx: int64) -> int64
+               WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+               // movzx eax, byte [rsi+rcx]
+               EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $04); EmitU8(FCode, $0E);
+               if instr.Dest >= 0 then
+                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+             end
+             else if instr.ImmStr = 'StrSetChar' then
+             begin
+               // StrSetChar(s: pchar, idx: int64, ch: int64)
+               WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+               WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src3));
+               // mov byte [rsi+rcx], dl
+               EmitU8(FCode, $88); EmitU8(FCode, $14); EmitU8(FCode, $0E);
+             end
+ 
+             else if instr.ImmStr = 'buf_put_byte' then
 
-            else if instr.ImmStr = 'buf_put_byte' then
             begin
               // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
               // Extra arg (b) passed via instr.LabelName (single temp index)
@@ -1707,115 +1744,6 @@ begin
               // mov [rcx], rax
               EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
             end
-            else if instr.ImmStr = 'RegexMatch' then
-            begin
-              // RegexMatch(pattern, text) -> bool (1 or 0)
-              // Uses libc strstr: if strstr(text, pattern) != NULL, return 1
-              
-              // Load args: RDI = text, RSI = pattern (SysV ABI)
-              WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src2));
-              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
-              
-              // Register strstr as external symbol
-              found := False;
-              for ei := 0 to High(FExternalSymbols) do
-                if FExternalSymbols[ei].Name = 'strstr' then begin found := True; Break; end;
-              if not found then
-              begin
-                SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
-                FExternalSymbols[High(FExternalSymbols)].Name := 'strstr';
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol('strstr');
-              end;
-              
-              // Call strstr via PLT
-              SetLength(FJumpPatches, Length(FJumpPatches) + 1);
-              FJumpPatches[High(FJumpPatches)].Pos := FCode.Size;
-              FJumpPatches[High(FJumpPatches)].LabelName := '__plt_strstr';
-              FJumpPatches[High(FJumpPatches)].JmpSize := 5;
-              EmitU8(FCode, $E8); EmitU32(FCode, 0);
-              
-              // If RAX != 0, pattern found -> return 1
-              // cmp rax, 0
-              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $F8); EmitU8(FCode, $00);
-              // je not_found
-              EmitU8(FCode, $74); EmitU8(FCode, $05);
-              // found: mov rax, 1
-              WriteMovRegImm64(FCode, RAX, 1);
-              EmitU8(FCode, $EB); EmitU8(FCode, $03);
-              // not_found: mov rax, 0 (already is)
-              // nop for alignment
-              EmitU8(FCode, $90);
-              
-              // Store result
-              WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-            end
-            else if instr.ImmStr = 'RegexSearch' then
-            begin
-              // RegexSearch(pattern, text) -> int64 (position or -1)
-              // Uses libc strstr: if strstr(text, pattern) != NULL, return position
-              
-              // Save text pointer for offset calculation
-              // RDI = text (first arg)
-              WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src2));
-              // RSI = pattern (second arg)
-              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
-              
-              // Save text pointer in R15 for later
-              WriteMovRegMem(FCode, R15, RBP, SlotOffset(localCnt + instr.Src2));
-              
-              // Register strstr as external symbol (if not already)
-              found := False;
-              for ei := 0 to High(FExternalSymbols) do
-                if FExternalSymbols[ei].Name = 'strstr' then begin found := True; Break; end;
-              if not found then
-              begin
-                SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
-                FExternalSymbols[High(FExternalSymbols)].Name := 'strstr';
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol('strstr');
-              end;
-              // RAX = -1 (nicht gefunden) als Default
-              WriteMovRegImm64(FCode, RAX, UInt64(-1));
-              
-              // Call strstr via PLT
-              SetLength(FJumpPatches, Length(FJumpPatches) + 1);
-              FJumpPatches[High(FJumpPatches)].Pos := FCode.Size;
-              FJumpPatches[High(FJumpPatches)].LabelName := '__plt_strstr';
-              FJumpPatches[High(FJumpPatches)].JmpSize := 5;
-              EmitU8(FCode, $E8); EmitU32(FCode, 0);
-              
-              // If RAX == 0, not found -> return -1
-              // cmp rax, 0
-              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $F8); EmitU8(FCode, $00);
-              // je not_found
-              EmitU8(FCode, $74); EmitU8(FCode, $0A);
-              
-              // Found: calculate offset = result - text
-              // RAX = RAX - R15
-              WriteMovRegReg(FCode, RCX, RAX); // save result
-              WriteMovRegReg(FCode, RAX, R15); // rax = text start
-              // Now we need to calculate: result - text_start
-              // This requires the actual addresses at runtime
-              // For simplicity, just return 0 for now
-              // TODO: proper offset calculation
-              
-              // Just return 0 as position (simplified)
-              // mov rax, 0
-              WriteMovRegImm64(FCode, RAX, 0);
-              EmitU8(FCode, $EB); EmitU8(FCode, $06); // jmp done
-              
-              // not_found: mov rax, -1
-              WriteMovRegImm64(FCode, RAX, UInt64(-1));
-              
-              // Store result
-              WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-            end
-            else if instr.ImmStr = 'RegexReplace' then
-            begin
-              // RegexReplace(pattern, text, replacement) -> int64 (count)
-              // For now, just return 0 (not implemented)
-              WriteMovRegImm64(FCode, RAX, 0);
-              WriteMovRegMem(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-            end;
           end;
           irConstInt:
             begin
