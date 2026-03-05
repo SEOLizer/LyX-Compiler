@@ -399,15 +399,17 @@ var hex: pchar := r"0x[0-9a-fA-F]+";
 **Syntax:** `r"pattern"`
 
 - Das Präfix `r` gefolgt von Anführungszeichen markiert ein Regex-Literal
-- Escape-Sequenzen: `\"`, `\\`, `\n`, `\r`, `\t`
+- Escape-Sequenzen: `\"`, `\\`, `\n`, `\r`, `\t`, `\d`, `\w`, `\s`
 - Klassen: `[abc]`, `[^abc]`, `[a-z]`
 - Quantoren: `*`, `+`, `?`, `{n}`, `{n,m}`
-- Gruppen: `(...)`
+- Gruppen/Captures: `(...)`
+- Alternation: `a|b`
+- Anker: `^` (Start), `$` (Ende)
 
-**Compile-Time-Validierung:**
-- Der Compiler prüft die Regex-Syntax beim Kompilieren
-- Häufige Fehler werden früh erkannt (unmatched brackets, etc.)
-- Beispiel: `r"[abc"` → Fehler: "unclosed bracket in regex"
+**Compile-Time-Validierung & Bytecode:**
+- Der Compiler parst Regex-Literale vollständig und erzeugt Bytecode
+- Syntax- und Strukturfehler werden beim Kompilieren gemeldet
+- Beispiel: `r"[abc"` → Fehler: "unclosed character class"
 
 **Regex-Funktionen:**
 ```lyx
@@ -420,11 +422,23 @@ var count: int64 := RegexReplace(r"old", "text", "new");
 if (Regex.Match(r"abc", "abcdef")) { ... }
 var pos: int64 := Regex.Search(r"\d+", "abc123def");
 var count: int64 := Regex.Replace(r"old", "text", "new");
+
+// Flags, Captures, Replace-Into
+var ok: bool := RegexMatchEx(r"hello", "HeLLo", 1);
+var capPos: int64 := RegexSearch(r"(ab|xy)(cd)", "zzabcdzz");
+var c1: int64 := RegexCaptureStart(1);
+var outBuf: array[64]char;
+var rc: int64 := RegexReplaceInto(outBuf, r"world", "hello world", "Lyx");
 ```
 
 - `RegexMatch(pattern, text)` -> bool: Prüft ob Pattern in Text vorkommt
 - `RegexSearch(pattern, text)` -> int64: Position des ersten Matches oder -1
 - `RegexReplace(pattern, text, replacement)` -> int64: Anzahl Ersetzungen
+- `RegexMatchEx(pattern, text, flags)` -> bool: wie RegexMatch mit Flags
+- `RegexSearchEx(pattern, text, flags)` -> int64: wie RegexSearch mit Flags
+- `RegexReplaceEx(pattern, text, replacement, flags)` -> int64: wie RegexReplace mit Flags
+- `RegexCaptureStart(group)`/`RegexCaptureEnd(group)` -> Positionen der Captures
+- `RegexReplaceInto(dest, pattern, text, replacement)` -> int64: schreibt Ergebnis
 
 ### Typen
 
