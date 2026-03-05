@@ -22,7 +22,7 @@ var
   flagLint: Boolean;
   flagLintOnly: Boolean;
   flagEnergyLevel: Integer;  // 0 = disabled, 1-5 = energy level
-  flagOptimize: Boolean;  // IR optimizations enabled by default
+  flagOptimize: Boolean;  // IR optimizations default aktiviert
   lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
@@ -241,7 +241,7 @@ begin
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
     WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
     WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
-    WriteLn(StdErr, '  --no-opt         IR-Optimierungen deaktivieren');
+    WriteLn(StdErr, '  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)');
     Halt(1);
   end;
 
@@ -252,7 +252,7 @@ begin
   flagLint := False;
   flagLintOnly := False;
   flagEnergyLevel := 0;
-  flagOptimize := False;  // IR optimizations disabled by default (see bug #4)
+  flagOptimize := True;  // IR optimizations enabled by default
 
   // Parse command line arguments
   i := 1;
