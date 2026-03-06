@@ -672,6 +672,7 @@ begin
     'unit':    Result := tkUnit;
     'import':  Result := tkImport;
     'public':  Result := tkPublic;
+    'pub':     Result := tkPublic;
     'as':      Result := tkAs;
     'type':    Result := tkType;
     'struct':  Result := tkStruct;

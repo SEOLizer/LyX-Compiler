@@ -2175,16 +2175,34 @@ begin
           begin
             // dest = src1 << src2 (shift left)
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
-            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
-            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $E0); // shl rax, cl
+            if instr.Src2 < 0 then
+            begin
+              // Immediate shift amount in ImmInt
+              // shl rax, imm8
+              EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E0); EmitU8(FCode, Byte(instr.ImmInt and $3F));
+            end
+            else
+            begin
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+              EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $E0); // shl rax, cl
+            end;
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
         irShr:
           begin
             // dest = src1 >> src2 (arithmetic shift right)
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
-            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
-            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $F8); // sar rax, cl
+            if instr.Src2 < 0 then
+            begin
+              // Immediate shift amount in ImmInt
+              // sar rax, imm8
+              EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $F8); EmitU8(FCode, Byte(instr.ImmInt and $3F));
+            end
+            else
+            begin
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+              EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $F8); // sar rax, cl
+            end;
             WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
           end;
         irBitNot:
