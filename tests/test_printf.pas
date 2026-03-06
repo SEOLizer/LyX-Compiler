@@ -28,7 +28,7 @@ var
   r: Integer; txt: string;
 begin
   // build compiler
-  r := RunCapture('fpc -O2 -Mobjfpc -Sh lyxc.lpr -olyxc', txt);
+  r := RunCapture('fpc -O2 -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ lyxc.lpr -olyxc', txt);
   if r <> 0 then Halt(1);
 
   // compile example
