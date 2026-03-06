@@ -2255,6 +2255,9 @@ begin
           // Special case: dynamic array (atDynArray) with empty literal or atDynArray init
           else if (vd.ArrayLen = -1) and ((vtype = atDynArray) or (vtype = atUnresolved)) then
             vtype := vd.DeclType  // Accept dynamic array type
+          // Special case: dynamic array with array literal initializer
+          else if (vd.ArrayLen = -1) and (vd.DeclType = atDynArray) and Assigned(vd.InitExpr) and (vd.InitExpr is TAstArrayLit) then
+            vtype := vd.DeclType  // Accept array literal as dynamic array initializer
           else
             FDiag.Error(Format('type mismatch in declaration of %s: expected %s but got %s', [vd.Name, AurumTypeToStr(vd.DeclType), AurumTypeToStr(vtype)]), vd.Span);
         end;
