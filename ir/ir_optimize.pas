@@ -227,16 +227,18 @@ end;
 
 function TIROptimizer.FoldConstantsInFunc(func: TIRFunction): Boolean;
 var
-  i, j: Integer;
-  instr, folded: TIRInstr;
+  i: Integer;
+  instr: TIRInstr;
   tempMap: array of Int64;
   tempIsConst: array of Boolean;
+  src1Val, src2Val, foldedVal: Int64;
+  canFold: Boolean;
 begin
   Result := False;
   if not Assigned(func) or not Assigned(func.Instructions) then Exit;
   
   // Temporary map: temp index -> constant value (if known)
-  SetLength(tempMap, func.LocalCount + 1024);  // Reserve space for temps
+  SetLength(tempMap, func.LocalCount + 2048);  // Reserve space for temps
   SetLength(tempIsConst, Length(tempMap));
   for i := 0 to High(tempMap) do
     tempIsConst[i] := False;
@@ -245,59 +247,125 @@ begin
   begin
     instr := func.Instructions[i];
     
-    // Versuche Konstante zu falten
-    if TryFoldInstruction(instr, folded) then
-    begin
-      // Prüfe ob Operanden tatsächlich Konstanten sind
-      if folded.Op in [irConstInt, irConstFloat] then
-      begin
-        // Ersetze mit gefalteter Konstanten
-        func.Instructions[i] := folded;
-        // Merke Konstantenwert für nachfolgende Verwendung
-        if folded.Dest >= 0 then
+    case instr.Op of
+      irConstInt:
         begin
-          if folded.Dest < Length(tempMap) then
+          // Track constant assignment
+          if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
           begin
-            if folded.Op = irConstInt then
-              tempMap[folded.Dest] := folded.ImmInt
-            else
-              tempMap[folded.Dest] := Trunc(folded.ImmFloat);
-            tempIsConst[folded.Dest] := True;
+            tempMap[instr.Dest] := instr.ImmInt;
+            tempIsConst[instr.Dest] := True;
           end;
         end;
-        Result := True;
-        SetChanged;
-      end;
-    end
-    else
-    begin
-      // Update constant tracking: load from local?
-      case instr.Op of
-        irConstInt:
-          if instr.Dest >= 0 then
+        
+      irConstFloat:
+        begin
+          // Track constant float (store as truncated int for now)
+          if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
           begin
-            if instr.Dest < Length(tempMap) then
+            tempMap[instr.Dest] := Trunc(instr.ImmFloat);
+            tempIsConst[instr.Dest] := True;
+          end;
+        end;
+        
+      irLoadLocal, irLoadGlobal, irLoadElem, irCall, irCallBuiltin, irCallStruct:
+        begin
+          // Non-constant operations - mark dest as non-constant
+          if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+            tempIsConst[instr.Dest] := False;
+        end;
+        
+      irAdd, irSub, irMul, irDiv, irMod,
+      irAnd, irOr, irXor, irNor,
+      irShl, irShr,
+      irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe:
+        begin
+          // Binary operation: check if BOTH operands are known constants
+          canFold := False;
+          src1Val := 0;
+          src2Val := 0;
+          
+          if (instr.Src1 >= 0) and (instr.Src1 < Length(tempIsConst)) and tempIsConst[instr.Src1] then
+          begin
+            src1Val := tempMap[instr.Src1];
+            if (instr.Src2 >= 0) and (instr.Src2 < Length(tempIsConst)) and tempIsConst[instr.Src2] then
             begin
-              tempMap[instr.Dest] := instr.ImmInt;
+              src2Val := tempMap[instr.Src2];
+              canFold := True;
+            end;
+          end;
+          
+          if canFold then
+          begin
+            // Both operands are constants - fold the operation
+            foldedVal := EvaluateConstExpr(instr.Op, src1Val, src2Val, instr.ImmInt);
+            
+            // Replace instruction with constant
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := foldedVal;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            
+            // Track the result as constant
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := foldedVal;
               tempIsConst[instr.Dest] := True;
             end;
-          end;
-        irLoadLocal:
-          if instr.Src1 >= 0 then
+            
+            Result := True;
+            SetChanged;
+          end
+          else
           begin
-            // Load von lokaler Variable - Konstantenstatus aufheben
-            if instr.Dest < Length(tempMap) then
+            // Cannot fold - mark dest as non-constant
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
           end;
-        else
+        end;
+        
+      irNeg, irNot, irBitNot:
+        begin
+          // Unary operation: check if operand is constant
+          canFold := False;
+          src1Val := 0;
+          
+          if (instr.Src1 >= 0) and (instr.Src1 < Length(tempIsConst)) and tempIsConst[instr.Src1] then
           begin
-            // Andere Operationen entfernen Konstantenstatus
-            if instr.Dest >= 0 then
-            begin
-              if instr.Dest < Length(tempIsConst) then
-                tempIsConst[instr.Dest] := False;
-            end;
+            src1Val := tempMap[instr.Src1];
+            canFold := True;
           end;
+          
+          if canFold then
+          begin
+            foldedVal := EvaluateConstExpr(instr.Op, src1Val, 0, instr.ImmInt);
+            
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := foldedVal;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := foldedVal;
+              tempIsConst[instr.Dest] := True;
+            end;
+            
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+    else
+      begin
+        // Any other operation that produces a result - mark as non-constant
+        if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+          tempIsConst[instr.Dest] := False;
       end;
     end;
   end;
@@ -467,10 +535,11 @@ begin
     irFAdd, irFSub, irFMul, irFDiv,
     irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
       Result := Format('%d:%d:%d', [Ord(instr.Op), instr.Src1, instr.Src2]);
-    irLoadLocal:
-      Result := Format('%d:%d', [Ord(instr.Op), instr.Src1]);
-    irLoadGlobal:
-      Result := Format('%d:%s', [Ord(instr.Op), instr.ImmStr]);
+    // NOTE: irLoadLocal and irLoadGlobal are NOT included for CSE because
+    // the underlying memory location can change between loads (e.g., dynamic
+    // arrays have their ptr modified by push operations). Eliminating
+    // redundant loads would be incorrect if a store or side-effect occurs
+    // between them.
   else
     Result := '';
   end;
@@ -627,95 +696,413 @@ function TIROptimizer.ReduceStrength(func: TIRFunction): Boolean;
 var
   i: Integer;
   instr: TIRInstr;
+  tempMap: array of Int64;
+  tempIsConst: array of Boolean;
+  src1Val, src2Val: Int64;
+  src1IsConst, src2IsConst: Boolean;
+  shiftAmt: Integer;
 begin
   Result := False;
   if not Assigned(func) or not Assigned(func.Instructions) then Exit;
+  
+  // Track constant values in temps
+  SetLength(tempMap, func.LocalCount + 2048);
+  SetLength(tempIsConst, Length(tempMap));
+  for i := 0 to High(tempMap) do
+    tempIsConst[i] := False;
   
   for i := 0 to High(func.Instructions) do
   begin
     instr := func.Instructions[i];
     
-    // Ersetze Multiplikation durch 2 mit Shift
-    if (instr.Op = irMul) and (instr.Src2 >= 0) then
-    begin
-      if instr.Src2 = 2 then
-      begin
-        // x * 2 -> x + x (oder x << 1)
-        func.Instructions[i].Op := irAdd;
-        func.Instructions[i].Src2 := instr.Src1;
-        Result := True;
-        SetChanged;
-      end
-      else if instr.Src2 = 1 then
-      begin
-        // x * 1 -> x (Identität)
-        func.Instructions[i].Op := irAdd;
-        func.Instructions[i].Src2 := -1;  // Mark as copy
-        Result := True;
-        SetChanged;
-      end
-      else if instr.Src2 = 0 then
-      begin
-        // x * 0 -> 0
-        func.Instructions[i].Op := irConstInt;
-        func.Instructions[i].ImmInt := 0;
-        func.Instructions[i].Src1 := -1;
-        func.Instructions[i].Src2 := -1;
-        Result := True;
-        SetChanged;
-      end;
+    // Update constant tracking
+    case instr.Op of
+      irConstInt:
+        if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+        begin
+          tempMap[instr.Dest] := instr.ImmInt;
+          tempIsConst[instr.Dest] := True;
+        end;
+      irConstFloat:
+        if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+        begin
+          tempMap[instr.Dest] := Trunc(instr.ImmFloat);
+          tempIsConst[instr.Dest] := True;
+        end;
     end;
     
-    // Ersetze Division durch 2 mit Shift (nur für positive Zahlen)
-    if (instr.Op = irDiv) and (instr.Src2 >= 0) then
-    begin
-      if instr.Src2 = 2 then
-      begin
-        // x / 2 -> x >> 1 (für positive Zahlen)
-        func.Instructions[i].Op := irShr;
-        func.Instructions[i].Src2 := 1;
-        Result := True;
-        SetChanged;
-      end
-      else if instr.Src2 = 1 then
-      begin
-        // x / 1 -> x
-        func.Instructions[i].Op := irAdd;
-        func.Instructions[i].Src2 := -1;
-        Result := True;
-        SetChanged;
-      end;
-    end;
+    // Get constant status of operands
+    src1IsConst := (instr.Src1 >= 0) and (instr.Src1 < Length(tempIsConst)) and tempIsConst[instr.Src1];
+    src2IsConst := (instr.Src2 >= 0) and (instr.Src2 < Length(tempIsConst)) and tempIsConst[instr.Src2];
+    if src1IsConst then src1Val := tempMap[instr.Src1] else src1Val := 0;
+    if src2IsConst then src2Val := tempMap[instr.Src2] else src2Val := 0;
     
-    // Ersetze x + 0 mit x
-    if instr.Op = irAdd then
-    begin
-      if (instr.Src1 >= 0) and (instr.Src1 = 0) then
+    // Apply strength reductions
+    case instr.Op of
+      irMul:
+        begin
+          // x * 0 -> 0
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          // 0 * x -> 0
+          else if src1IsConst and (src1Val = 0) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          // x * 1 -> x (identity)
+          else if src2IsConst and (src2Val = 1) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy: dest := src1
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // 1 * x -> x (identity)
+          else if src1IsConst and (src1Val = 1) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src1 := instr.Src2;
+            func.Instructions[i].Src2 := -1;  // Mark as copy: dest := src2
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x * 2 -> x + x (or x << 1)
+          else if src2IsConst and (src2Val = 2) then
+          begin
+            func.Instructions[i].Op := irShl;
+            // Create a temp for constant 1
+            func.Instructions[i].Src2 := -1;  // Will use ImmInt
+            func.Instructions[i].ImmInt := 1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x * power-of-2 -> x << log2(val)
+          else if src2IsConst and (src2Val > 2) and ((src2Val and (src2Val - 1)) = 0) then
+          begin
+            // Calculate log2
+            shiftAmt := 0;
+            while (Int64(1) shl shiftAmt) < src2Val do
+              Inc(shiftAmt);
+            func.Instructions[i].Op := irShl;
+            func.Instructions[i].Src2 := -1;
+            func.Instructions[i].ImmInt := shiftAmt;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            // Non-optimizable mul - mark dest as non-constant
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irDiv:
+        begin
+          // x / 1 -> x
+          if src2IsConst and (src2Val = 1) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x / power-of-2 -> x >> log2(val) (only for unsigned or known positive)
+          // NOTE: For signed division, this is only correct for non-negative values
+          // We skip this optimization for now to be safe
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irAdd:
+        begin
+          // x + 0 -> x
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // 0 + x -> x
+          else if src1IsConst and (src1Val = 0) then
+          begin
+            func.Instructions[i].Src1 := instr.Src2;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irSub:
+        begin
+          // x - 0 -> x
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x - x -> 0 (same temp)
+          else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irShl, irShr:
+        begin
+          // x << 0 -> x, x >> 0 -> x
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // 0 << x -> 0, 0 >> x -> 0
+          else if src1IsConst and (src1Val = 0) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irAnd:
+        begin
+          // x & 0 -> 0
+          if (src1IsConst and (src1Val = 0)) or (src2IsConst and (src2Val = 0)) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          // x & x -> x (same temp)
+          else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irOr:
+        begin
+          // x | 0 -> x
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // 0 | x -> x
+          else if src1IsConst and (src1Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src1 := instr.Src2;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x | x -> x (same temp)
+          else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irXor:
+        begin
+          // x ^ 0 -> x
+          if src2IsConst and (src2Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // 0 ^ x -> x
+          else if src1IsConst and (src1Val = 0) then
+          begin
+            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Src1 := instr.Src2;
+            func.Instructions[i].Src2 := -1;  // Mark as copy
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+            Result := True;
+            SetChanged;
+          end
+          // x ^ x -> 0 (same temp)
+          else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
+          begin
+            func.Instructions[i].Op := irConstInt;
+            func.Instructions[i].ImmInt := 0;
+            func.Instructions[i].Src1 := -1;
+            func.Instructions[i].Src2 := -1;
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempMap)) then
+            begin
+              tempMap[instr.Dest] := 0;
+              tempIsConst[instr.Dest] := True;
+            end;
+            Result := True;
+            SetChanged;
+          end
+          else
+          begin
+            if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+              tempIsConst[instr.Dest] := False;
+          end;
+        end;
+        
+      irStoreLocal, irStoreGlobal, irStoreElem, irStoreElemDyn, irStoreField:
+        begin
+          // Store operations don't define temps, they store to memory
+          // Don't modify tempIsConst for these
+        end;
+        
+      irLoadLocal, irLoadGlobal, irLoadElem, irLoadField, irLoadLocalAddr, irLoadGlobalAddr:
+        begin
+          // Load operations define temps with unknown values
+          if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+            tempIsConst[instr.Dest] := False;
+        end;
+        
+      irCall, irCallBuiltin, irCallStruct, irDynArrayPush, irDynArrayPop, 
+      irDynArrayLen, irDynArrayFree, irAlloc, irFree:
+        begin
+          // Call operations and special ops - mark dest as non-constant
+          if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+            tempIsConst[instr.Dest] := False;
+        end;
+        
+      irLabel, irJmp, irBrTrue, irBrFalse, irReturn:
+        begin
+          // Control flow - no temp modifications
+        end;
+        
+      irConstInt, irConstFloat, irConstStr:
+        begin
+          // Constants are already handled at the beginning of the loop
+          // Don't modify tempIsConst here
+        end;
+        
+    else
       begin
-        // 0 + x -> x
-        func.Instructions[i].Op := irAdd;
-        func.Instructions[i].Src1 := instr.Src2;
-        func.Instructions[i].Src2 := -1;
-        Result := True;
-        SetChanged;
-      end
-      else if (instr.Src2 >= 0) and (instr.Src2 = 0) then
-      begin
-        // x + 0 -> x
-        func.Instructions[i].Op := irAdd;
-        func.Instructions[i].Src2 := -1;
-        Result := True;
-        SetChanged;
+        // Other operations - mark dest as non-constant only if Dest is a valid temp
+        // (not a local variable index which would be used by Store operations)
+        if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
+          tempIsConst[instr.Dest] := False;
       end;
-    end;
-    
-    // Ersetze x - 0 mit x
-    if (instr.Op = irSub) and (instr.Src2 >= 0) and (instr.Src2 = 0) then
-    begin
-      func.Instructions[i].Op := irAdd;
-      func.Instructions[i].Src2 := -1;
-      Result := True;
-      SetChanged;
     end;
   end;
 end;

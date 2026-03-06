@@ -354,6 +354,19 @@ var
   declType: TAurumType;
   fields: TStructFieldList;
   methods: TMethodList;
+  fld: TStructField;
+  m: TAstFuncDecl;
+  fldTypeName: string;
+  mName: string;
+  mParams: TAstParamList;
+  mRetType: TAurumType;
+  mRetTypeName: string;
+  mBody: TAstBlock;
+  dummy: Integer;
+  isStatic: Boolean;
+  isVirtual: Boolean;
+  baseClassName: string;
+  curVisibility: TVisibility;
   constraintExpr: TAstExpr;
 begin
   Expect(tkType);
@@ -1355,7 +1368,7 @@ begin
     v := StrToInt64Def(FCurTok.Value, 0);
     span := FCurTok.Span;
     Advance;
-    Exit(TAstIntLit.Create(v, span));
+    Exit(ParsePostfix(TAstIntLit.Create(v, span)));
   end;
 
   if Check(tkFloatLit) then
@@ -1364,7 +1377,7 @@ begin
     // Parse als Double
     s := FCurTok.Value;
     Advance;
-    Exit(TAstFloatLit.Create(StrToFloat(s), span));
+    Exit(ParsePostfix(TAstFloatLit.Create(StrToFloat(s), span)));
   end;
 
   if Check(tkStrLit) then
@@ -1372,7 +1385,7 @@ begin
     s := FCurTok.Value;
     span := FCurTok.Span;
     Advance;
-    Exit(TAstStrLit.Create(s, span));
+    Exit(ParsePostfix(TAstStrLit.Create(s, span)));
   end;
 
   if Check(tkCharLit) then
@@ -1383,7 +1396,7 @@ begin
     else
       Result := TAstCharLit.Create(#0, span);
     Advance;
-    Exit;
+    Exit(ParsePostfix(Result));
   end;
 
   if Check(tkRegexLit) then
@@ -1391,7 +1404,7 @@ begin
     span := FCurTok.Span;
     Result := TAstRegexLit.Create(FCurTok.Value, span);
     Advance;
-    Exit;
+    Exit(ParsePostfix(Result));
   end;
 
   if Check(tkTrue) or Check(tkFalse) then
@@ -1399,7 +1412,7 @@ begin
     b := Check(tkTrue);
     span := FCurTok.Span;
     Advance;
-    Exit(TAstBoolLit.Create(b, span));
+    Exit(ParsePostfix(TAstBoolLit.Create(b, span)));
   end;
 
   // null literal for nullable pointers
@@ -1407,7 +1420,7 @@ begin
   begin
     span := FCurTok.Span;
     Advance;
-    Exit(TAstIntLit.Create(0, span)); // null as integer 0 (pointer representation)
+    Exit(ParsePostfix(TAstIntLit.Create(0, span))); // null as integer 0 (pointer representation)
   end;
 
   if Check(tkIdent) then
@@ -1441,12 +1454,12 @@ begin
       end;
       Expect(tkRParen);
       if Length(args) > 0 then
-        Exit(TAstNewExpr.CreateWithArgs(name, args, span))
+        Exit(ParsePostfix(TAstNewExpr.CreateWithArgs(name, args, span)))
       else
-        Exit(TAstNewExpr.Create(name, span));
+        Exit(ParsePostfix(TAstNewExpr.Create(name, span)));
     end
     else
-      Exit(TAstNewExpr.Create(name, span));
+      Exit(ParsePostfix(TAstNewExpr.Create(name, span)));
   end;
 
   // super.method() - call to base class method
@@ -1475,7 +1488,7 @@ begin
       end;
     end;
     Expect(tkRParen);
-    Exit(TAstSuperCall.Create(mName, args, span));
+    Exit(ParsePostfix(TAstSuperCall.Create(mName, args, span)));
   end;
 
   // panic(message) - abort with error message
@@ -1486,7 +1499,7 @@ begin
     Expect(tkLParen);
     e := ParseExpr;
     Expect(tkRParen);
-    Exit(TAstPanicExpr.Create(e, span));
+    Exit(ParsePostfix(TAstPanicExpr.Create(e, span)));
   end;
 
   if Accept(tkLBracket) then
@@ -1505,14 +1518,14 @@ begin
       end;
     end;
     Expect(tkRBracket);
-    Exit(TAstArrayLit.Create(items, FCurTok.Span));
+    Exit(ParsePostfix(TAstArrayLit.Create(items, FCurTok.Span)));
   end;
 
   if Accept(tkLParen) then
   begin
     e := ParseExpr;
     Expect(tkRParen);
-    Exit(e);
+    Exit(ParsePostfix(e));
   end;
 
   // unexpected primary
