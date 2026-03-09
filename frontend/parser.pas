@@ -705,7 +705,6 @@ var
   defaultBody: TAstStmt;
   caseObj: TAstCase;
   valExpr: TAstExpr;
-  i: Integer;
 begin
   if Check(tkVar) or Check(tkLet) or Check(tkCo) then
     Exit(ParseVarLetCoDecl);
@@ -979,8 +978,6 @@ var
   name: string;
   valExpr: TAstExpr;
   fa: TAstFieldAccess;
-  objExpr: TAstExpr;
-  fieldName: string;
   incExpr: TAstBinOp;
 begin
   expr := ParseExpr;
@@ -1288,7 +1285,8 @@ var
   boolVal: Boolean;
   span: TSourceSpan;
 begin
-    // Collect consecutive prefix unary operators (e.g. - - ! ! ~ ~)
+  ops := nil; // Initialisierung des dynamischen Arrays
+  // Collect consecutive prefix unary operators (e.g. - - ! ! ~ ~)
   while Check(tkMinus) or Check(tkNot) or Check(tkMinusMinus) or Check(tkBitNot) do
   begin
     if Check(tkMinusMinus) then

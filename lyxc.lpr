@@ -43,8 +43,7 @@ var
   basePath: string;
   externSymbols: TExternalSymbolArray;
   neededLibs: array of string;
-  pltPatches: TPLTGOTPatchArray;
-  i, j: Integer;
+  i: Integer;
   param: string;
 
 type
