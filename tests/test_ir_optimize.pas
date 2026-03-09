@@ -4,7 +4,8 @@ program test_ir_optimize;
 uses
   SysUtils, Classes,
   fpcunit, testregistry, consoletestrunner,
-  diag, lexer, parser, ast, sema, ir, lower_ast_to_ir, ir_optimize;
+  diag, lexer, parser, ast, sema, ir, lower_ast_to_ir, ir_optimize,
+  unit_manager;
 
 type
   TIROptimizerTest = class(TTestCase)
@@ -25,6 +26,7 @@ var
   prog: TAstProgram;
   s: TSema;
   lower: TIRLowering;
+  um: TUnitManager;
 begin
   Result := nil;
   l := TLexer.Create(code, 'test.lyx', d);
@@ -32,20 +34,37 @@ begin
     p := TParser.Create(l, d);
     try
       prog := p.ParseProgram;
-      s := TSema.Create(d);
       try
-        s.Analyze(prog);
-        if d.ErrorCount > 0 then Exit;
-        
-        Result := TIRModule.Create;
-        lower := TIRLowering.Create(Result, d);
+        um := TUnitManager.Create(d);
         try
-          lower.Lower(prog);
+          // Suchpfad zum Projekt-Root hinzufügen (für std.system)
+          um.AddSearchPath('..');
+          um.AddSearchPath('../std');
+          um.AddSearchPath('std');
+          
+          // Lade alle Imports (inkl. std.system)
+          um.LoadAllImports(prog, '');
+          
+          s := TSema.Create(d, um);
+          try
+            s.Analyze(prog);
+            if d.ErrorCount > 0 then Exit;
+            
+            Result := TIRModule.Create;
+            lower := TIRLowering.Create(Result, d);
+            try
+              lower.Lower(prog);
+            finally
+              lower.Free;
+            end;
+          finally
+            s.Free;
+          end;
         finally
-          lower.Free;
+          um.Free;
         end;
       finally
-        s.Free;
+        prog.Free;
       end;
     finally
       p.Free;
