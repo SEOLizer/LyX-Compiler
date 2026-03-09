@@ -523,12 +523,11 @@ begin
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
-        m.IsVirtual := isVirtual;
         m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
       end
-      else
+      else if Check(tkIdent) then
       begin
         // field: name : Type ;
         fld.Name := FCurTok.Value; Advance;
@@ -1225,7 +1224,14 @@ var
   rhs: TAstExpr;
 begin
   Result := ParseShiftExpr;
-  if Check(tkEq) or Check(tkNeq) or Check(tkLt) or Check(tkLe) or Check(tkGt) or Check(tkGe) then
+  // "in" Operator für Map/Set Containment-Check
+  if Check(tkIn) then
+  begin
+    Advance;
+    rhs := ParseShiftExpr;
+    Result := TAstInExpr.Create(Result, rhs, Result.Span);
+  end
+  else if Check(tkEq) or Check(tkNeq) or Check(tkLt) or Check(tkLe) or Check(tkGt) or Check(tkGe) then
   begin
     op := FCurTok.Kind; Advance;
     rhs := ParseShiftExpr;
@@ -1362,6 +1368,8 @@ var
   dummy: TAstIntLit;
   items: TAstExprList;
   args: TAstExprList;
+  firstExpr: TAstExpr;
+  mapEntries: TMapEntryList;
 begin
   if Check(tkIntLit) then
   begin
@@ -1519,6 +1527,52 @@ begin
     end;
     Expect(tkRBracket);
     Exit(ParsePostfix(TAstArrayLit.Create(items, FCurTok.Span)));
+  end;
+
+  // Map/Set Literal: {key: value, ...} oder {value, value, ...}
+  if Accept(tkLBrace) then
+  begin
+    span := FCurTok.Span;
+    // Leeres Map/Set: {}
+    if Accept(tkRBrace) then
+      Exit(ParsePostfix(TAstMapLit.Create(nil, span)));
+    
+    // Erstes Element parsen um Map vs Set zu unterscheiden
+    firstExpr := ParseExpr;
+    
+    if Accept(tkColon) then
+    begin
+      // Es ist ein Map-Literal: {key: value, ...}
+      SetLength(mapEntries, 1);
+      mapEntries[0].Key := firstExpr;
+      mapEntries[0].Value := ParseExpr;
+      
+      while Accept(tkComma) do
+      begin
+        if Check(tkRBrace) then Break; // trailing comma erlaubt
+        SetLength(mapEntries, Length(mapEntries) + 1);
+        mapEntries[High(mapEntries)].Key := ParseExpr;
+        Expect(tkColon);
+        mapEntries[High(mapEntries)].Value := ParseExpr;
+      end;
+      Expect(tkRBrace);
+      Exit(ParsePostfix(TAstMapLit.Create(mapEntries, span)));
+    end
+    else
+    begin
+      // Es ist ein Set-Literal: {value, value, ...}
+      SetLength(items, 1);
+      items[0] := firstExpr;
+      
+      while Accept(tkComma) do
+      begin
+        if Check(tkRBrace) then Break; // trailing comma erlaubt
+        SetLength(items, Length(items) + 1);
+        items[High(items)] := ParseExpr;
+      end;
+      Expect(tkRBrace);
+      Exit(ParsePostfix(TAstSetLit.Create(items, span)));
+    end;
   end;
 
   if Accept(tkLParen) then

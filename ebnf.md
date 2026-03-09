@@ -125,6 +125,8 @@ fn high_performance(): int64 {
 * `pchar?` (Nullable Pointer, kann `null` sein)
 * `array`  (Array-Typ für Stack-allokierte Arrays)
 * `parallel Array<T>` (SIMD-optimiertes, heap-allokiertes Array mit Element-Typ T; ✅ v0.2.2)
+* `Map<K, V>` (Hash-Map mit Key-Typ K und Value-Typ V; v0.5.0)
+* `Set<T>` (Hash-Set mit Element-Typ T; v0.5.0)
 
 ### SIMD / ParallelArray (v0.2.2 ✅ ABGESCHLOSSEN)
 
@@ -149,6 +151,67 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 ### Nullable Typen (v0.4.0 ✅ ABGESCHLOSSEN)
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
+
+### Map und Set (v0.5.0)
+
+Maps und Sets sind heap-allokierte Hash-Datenstrukturen mit O(1) Zugriff.
+
+**Syntax:**
+```
+MapType     := 'Map' '<' Type ',' Type '>' ;
+SetType     := 'Set' '<' Type '>' ;
+MapLiteral  := '{' [ MapEntry { ',' MapEntry } ] '}' ;
+SetLiteral  := '{' Expr { ',' Expr } '}' ;
+MapEntry    := Expr ':' Expr ;
+```
+
+**Map-Literal (Key-Value-Paare mit Doppelpunkt):**
+```lyx
+let scores: Map<pchar, int64> := {"Alice": 95, "Bob": 82};
+let empty_map: Map<int64, bool> := {};
+```
+
+**Set-Literal (Werte ohne Doppelpunkt):**
+```lyx
+let unique_ids: Set<int64> := {1, 2, 3, 4};
+let empty_set: Set<pchar> := {};
+```
+
+**Operationen:**
+
+| Operation | Syntax | Beschreibung |
+|-----------|--------|--------------|
+| Insert/Update | `map[key] := value` | Setzt oder überschreibt |
+| Get | `map[key]` | Gibt Wert zurück (panic bei fehlendem Key) |
+| GetOrDefault | `map.get(key, default)` | Sicherer Zugriff |
+| Contains | `key in map` | Prüft Existenz (bool) |
+| Remove | `map.remove(key)` | Löscht Eintrag |
+| Size | `map.len()` | Anzahl Einträge |
+| Keys | `map.keys()` | Iterator über Keys |
+| Values | `map.values()` | Iterator über Values |
+
+**Iteration:**
+```lyx
+// Über Key-Value-Paare
+for key, value in scores {
+    PrintStr(key);
+    PrintInt(value);
+}
+
+// Nur Keys
+for name in scores.keys() {
+    PrintStr(name);
+}
+```
+
+**Erlaubte Key-Typen:** `int64`, `pchar`, `bool` (immutable Typen)
+**Value-Typen:** Alle Typen erlaubt
+
+**Implementierung:**
+- Open Addressing mit Linear Probing
+- FNV-1a Hash-Algorithmus
+- Automatisches Resize bei Load-Factor > 0.75
+- Initiale Kapazität: 8 Buckets
 
 ### Regex-Literale (v0.4.2 ✅ ABGESCHLOSSEN)
 

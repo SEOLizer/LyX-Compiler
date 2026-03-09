@@ -27,7 +27,9 @@ type
     atPChar,
     atPCharNullable,  // nullable pointer type (Option Type)
     atDynArray,       // dynamic array (fat-pointer)
-    atArray           // static array type
+    atArray,          // static array type
+    atMap,            // hash map type
+    atSet             // hash set type
   );
 
   { --- Speicherklassen --- }
@@ -47,6 +49,7 @@ type
      nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
      nkFieldAccess, nkIndexAccess, nkCast,
      nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
+     nkMapLit, nkSetLit, nkInExpr,     // Map/Set expressions
      // Statements
      nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
      nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
@@ -75,6 +78,13 @@ type
   TAstExprList = array of TAstExpr;
   TAstStmtList = array of TAstStmt;
   TIntArray = array of Integer;
+
+  { Map-Entry: key: value Paar }
+  TMapEntry = record
+    Key: TAstExpr;
+    Value: TAstExpr;
+  end;
+  TMapEntryList = array of TMapEntry;
 
   { --- Basisklasse --- }
 
@@ -200,6 +210,44 @@ type
     constructor Create(const aItems: TAstExprList; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Items: TAstExprList read FItems;
+  end;
+
+  { Map-Literal: {key: value, key: value, ...} }
+  TAstMapLit = class(TAstExpr)
+  private
+    FEntries: TMapEntryList;
+    FKeyType: TAurumType;
+    FValueType: TAurumType;
+  public
+    constructor Create(const aEntries: TMapEntryList; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Entries: TMapEntryList read FEntries;
+    property KeyType: TAurumType read FKeyType write FKeyType;
+    property ValueType: TAurumType read FValueType write FValueType;
+  end;
+
+  { Set-Literal: {value, value, ...} }
+  TAstSetLit = class(TAstExpr)
+  private
+    FItems: TAstExprList;
+    FElemType: TAurumType;
+  public
+    constructor Create(const aItems: TAstExprList; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Items: TAstExprList read FItems;
+    property ElemType: TAurumType read FElemType write FElemType;
+  end;
+
+  { In-Expression: key in map/set }
+  TAstInExpr = class(TAstExpr)
+  private
+    FKey: TAstExpr;
+    FContainer: TAstExpr;
+  public
+    constructor Create(aKey, aContainer: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Key: TAstExpr read FKey;
+    property Container: TAstExpr read FContainer;
   end;
 
   { Char-Literal: 'A' }
@@ -568,10 +616,12 @@ type
     FConstraint: TAstExpr; // Bedingung für typsichere Typen (z.B. value >= 0 && value <= 100)
   public
     constructor Create(const aName: string; aDeclType: TAurumType;
-      aPublic: Boolean; aSpan: TSourceSpan);
+      aPublic: Boolean; aConstraint: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
     property Name: string read FName;
     property DeclType: TAurumType read FDeclType;
     property IsPublic: Boolean read FIsPublic;
+    property Constraint: TAstExpr read FConstraint;
   end;
 
   { Struct/Type-Deklaration mit Feldern und Methoden }
@@ -808,6 +858,8 @@ begin
     atPCharNullable: Result := 'pchar?';
     atDynArray:    Result := 'array';
     atArray:       Result := 'static_array';
+    atMap:         Result := 'Map';
+    atSet:         Result := 'Set';
   else
     Result := '<unknown>';
   end;
@@ -836,6 +888,8 @@ begin
     'pchar?': Result := atPCharNullable;
     'string': Result := atPChar; // map string to pchar for now
     'array':  Result := atDynArray;
+    'Map':    Result := atMap;
+    'Set':    Result := atSet;
   else
     Result := atUnresolved;
   end;
@@ -1017,60 +1071,6 @@ begin
   inherited Destroy;
 end;
 
-{ Bitweise NOT: ~x }
-TAstBitNot = class(TAstUnaryOp)
-private
-  FOperand: TAstExpr;
-public
-  constructor Create(aOperand: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
-{ Bitweise AND: a & b }
-TAstBitAnd = class(TAstBinOp)
-private
-  FLeft, FRight: TAstExpr;
-public
-  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
-{ Bitweise OR: a | b }
-TAstBitOr = class(TAstBinOp)
-private
-  FLeft, FRight: TAstExpr;
-public
-  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
-{ Bitweise XOR: a ^ b }
-TAstBitXor = class(TAstBinOp)
-private
-  FLeft, FRight: TAstExpr;
-public
-  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
-{ Shift Left: a << b }
-TAstShiftLeft = class(TAstBinOp)
-private
-  FLeft, FRight: TAstExpr;
-public
-  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
-{ Shift Right: a >> b }
-TAstShiftRight = class(TAstBinOp)
-private
-  FLeft, FRight: TAstExpr;
-public
-  constructor Create(aLeft, aRight: TAstExpr; aSpan: TSourceSpan);
-  destructor Destroy; override;
-end;
-
 // ================================================================
 // TAstCall
 // ================================================================
@@ -1126,6 +1126,70 @@ begin
   for i := 0 to High(FItems) do
     FItems[i].Free;
   FItems := nil;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstMapLit
+// ================================================================
+
+constructor TAstMapLit.Create(const aEntries: TMapEntryList; aSpan: TSourceSpan);
+begin
+  inherited Create(nkMapLit, aSpan);
+  FEntries := aEntries;
+  FKeyType := atUnresolved;
+  FValueType := atUnresolved;
+end;
+
+destructor TAstMapLit.Destroy;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FEntries) do
+  begin
+    FEntries[i].Key.Free;
+    FEntries[i].Value.Free;
+  end;
+  FEntries := nil;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstSetLit
+// ================================================================
+
+constructor TAstSetLit.Create(const aItems: TAstExprList; aSpan: TSourceSpan);
+begin
+  inherited Create(nkSetLit, aSpan);
+  FItems := aItems;
+  FElemType := atUnresolved;
+end;
+
+destructor TAstSetLit.Destroy;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FItems) do
+    FItems[i].Free;
+  FItems := nil;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstInExpr
+// ================================================================
+
+constructor TAstInExpr.Create(aKey, aContainer: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkInExpr, aSpan);
+  FKey := aKey;
+  FContainer := aContainer;
+end;
+
+destructor TAstInExpr.Destroy;
+begin
+  FKey.Free;
+  FContainer.Free;
   inherited Destroy;
 end;
 
