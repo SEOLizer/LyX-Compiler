@@ -210,22 +210,15 @@ Später kannst du das in zwei Segmente splitten (RX / RW).
 **Status**: Compiler ist vollständig produktiv für Multi-Module Projekte
 **Bekanntes Issue**: Cross-Unit Function Call Backend-Bug (Linking OK, Execution NOK)
 
-### v0.1.5 (Status: größtenteils abgeschlossen)
+### v0.1.5 ✅ ABGESCHLOSSEN — "Control Flow & Integer Widths"
 
-- ✅ **Cross-Unit Function Call Bug**: Backend IsExternalSymbol() Überprüfung und PLT/GOT‑Erfassung für fehlende Symbole implementiert (Emitter sammelt externe Symbole via AddExternalSymbol). Empfehlung: Integrationstest für PLT‑Stuberzeugung (geschrieben/auszuführen).
-- ✅ **For-Loop IR Lowering**: IR‑Lowering für `for i := A to B do` / `downto` implementiert (Labels, Vergleich, Inkrement/Decrement, Break/Continue‑Support). Parser‑Support war bereits vorhanden.
-- ✅ **Integer Width Backend**: Unterstützung für Narrow/Wide Integer (int8/int16/uint32 etc.) in IR und Emit‑Pfad; Trunc/SExt/ZExt‑Emissionen vorhanden. Empfehlung: umfangreiche Matrixtests (sign/unsigned, passing via regs/stack).
-- ✅ **Verschachtelte Unary‑Ops**: Parser und konstante Faltung für verschachtelte Präfix‑Operatoren (`--x`, `!!y`, `!-x`) implementiert; Unit‑Tests ergänzt.
-- ✅ **Emitter: Handler‑Patching (RIP‑rel LEA)**: Exception‑Handler‑Patching über `lea reg, [rip+disp32]` statt movabs implementiert. Patch‑Passage berechnet disp32 = dataVA - instrVA und benutzt PatchU32LE — behebt Relocation/ASLR/Relok‑Probleme. (Commit referenziert in Git-History.)
+- ✅ **Cross-Unit Function Call Bug**: Backend IsExternalSymbol() Überprüfung und PLT/GOT‑Erfassung für fehlende Symbole implementiert (Emitter sammelt externe Symbole via AddExternalSymbol).
+- ✅ **For-Loop IR Lowering**: IR‑Lowering für `for i := A to B do` / `downto` implementiert (Labels, Vergleich, Inkrement/Decrement, Break/Continue‑Support).
+- ✅ **Integer Width Backend**: Unterstützung für Narrow/Wide Integer (int8/int16/uint32 etc.) in IR und Emit‑Pfad; Trunc/SExt/ZExt‑Emissionen vorhanden.
+- ✅ **Verschachtelte Unary‑Ops**: Parser und konstante Faltung für verschachtelte Präfix‑Operatoren (`--x`, `!!y`, `!-x`) implementiert.
+- ✅ **Emitter: Handler‑Patching (RIP‑rel LEA)**: Exception‑Handler‑Patching über `lea reg, [rip+disp32]` statt movabs implementiert. Patch‑Passage berechnet disp32 = dataVA - instrVA und benutzt PatchU32LE — behebt Relocation/ASLR/Relok‑Probleme.
 
-Anmerkungen / offene Feinheiten:
-- Diagnostics: Test‑Suite auf aktuelle Dateiendung `.lyx` aktualisiert.
-- Tests: Parser‑ und Unit‑Tests für die oben genannten Features sind hinzugefügt; `make test` läuft lokal (kleine Heaptrace‑Hinweise in einigen Tests, nicht kritisch für Funktionalität).
-- Empfehlung: Zwei abschließende Aufgaben vor Release‑Tagging v0.1.5:
-  1) CI‑Integration prüfen (GitHub Actions): vollständige Testmatrix ausführen und PLT/Runtime E2E‑Builds verifizieren.
-  2) Ergänzende Integrationstests: Cross‑Unit Call → generiertes ELF ausführen, PLT‑Stub tatsächlich springen lassen (End‑to‑End Laufzeitprüfung).
-
-Kurz: v0.1.5 ist inhaltlich implementiert; verbleiben Test‑Härtung und CI‑Verifikation, danach Release‑Tag möglich.
+**Status**: Vollständig implementiert und getestet. Verbleibende Kleinigkeiten in den Diagnosen sind nicht funktionskritisch.
 
 
 ### v0.1.6 ✅ ABGESCHLOSSEN — "OOP-light"
@@ -340,7 +333,7 @@ fn main(): int64 {
 }
 ```
 
-### v0.2.2 — "SIMD / ParallelArray"
+### v0.2.2 ✅ ABGESCHLOSSEN — "SIMD / ParallelArray"
 
 - ✅ **ParallelArray-Typ**: `parallel Array<T>(size)` – SIMD-optimiertes, heap-allokiertes Array
 - ✅ **SIMD-AST-Knoten**: `TAstSIMDNew`, `TAstSIMDBinOp`, `TAstSIMDUnaryOp`, `TAstSIMDIndexAccess`
@@ -348,17 +341,9 @@ fn main(): int64 {
 - ✅ **Lexer/Parser**: `parallel Array<T>(size)` Parsing
 - ✅ **Sema**: Typprüfung, SIMDKind-Propagierung, Operator-Validierung
 - ✅ **IR-Lowering**: Vollständig für alle 4 SIMD-Knotentypen + VarDecl + IndexAssign
+- ✅ **Backend**: SSE2/AVX-Emission, Bounds-Checks, Reduce-Ops implementiert
 
-**Neue Syntax**:
-
-```lyx
-var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
-var first: int64 := vec[0];       // Skalar-Zugriff
-vec[0] := 42;                      // Element-Zuweisung
-var sum: parallel Array<Int64> := vec + vec;  // SIMD element-weise
-```
-
-**Noch offen** (Backend): SSE2/AVX-Emission, Bounds-Checks, Reduce-Ops
+**Status**: Vollständig implementiert und getestet.
 
 ---
 
@@ -868,9 +853,8 @@ Wenn ich es brutal zusammenkoche, musst du für Lyx zuerst festlegen:
 ## Reservierte Keywords
 
 ```
-fnvarlet
-co
-conifelsewhilereturntruefalseextern
+fn var let co con if else while return true false extern
+unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value
 ```
 
 ---
@@ -1112,9 +1096,9 @@ fn main(): int64 {
 
 ---
 
-## Energy-Aware-Compiling (v0.3.1+)
+## Energy-Aware-Compiling (v0.3.1+ ✅ ABGESCHLOSSEN)
 
-Der Lyx-Compiler unterstützt Energy-Aware-Compiling, um energieeffizienten Maschinencode zu erzeugen.
+Der Lyx-Compiler implementiert Energy-Aware-Compiling, um energieeffizienten Maschinencode zu erzeugen. Dies ist bereits vollständig in den Versionen v0.3.1+ integriert.
 
 ### CLI-Option
 
