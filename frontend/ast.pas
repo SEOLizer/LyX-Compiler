@@ -29,12 +29,17 @@ type
     atDynArray,       // dynamic array (fat-pointer)
     atArray,          // static array type
     atMap,            // hash map type
-    atSet             // hash set type
+    atSet,            // hash set type
+    atParallelArray   // SIMD parallel array
   );
 
   { --- Speicherklassen --- }
 
   TStorageKlass = (skVar, skLet, skCo, skCon);
+
+  { --- SIMD Element-Typen --- }
+
+  TSIMDKind = (simdI8, simdI16, simdI32, simdI64, simdF32, simdF64);
 
   { --- Sichtbarkeit für Klassen-Member (Access Control) --- }
 
@@ -61,7 +66,9 @@ type
      nkProgram,
      // Bitwise AST nodes
      nkBitAnd, nkBitOr, nkBitXor, nkBitNot,
-     nkShiftLeft, nkShiftRight
+     nkShiftLeft, nkShiftRight,
+     // SIMD/ParallelArray AST nodes
+     nkSIMDNew, nkSIMDBinOp, nkSIMDUnaryOp, nkSIMDIndexAccess
   );
 
   { --- Vorwärtsdeklarationen --- }
@@ -248,6 +255,62 @@ type
     destructor Destroy; override;
     property Key: TAstExpr read FKey;
     property Container: TAstExpr read FContainer;
+  end;
+
+  { SIMD New Expression: parallel Array<T>(size) }
+  TAstSIMDNew = class(TAstExpr)
+  private
+    FSize: TAstExpr;
+    FElementType: TAurumType;
+    FSIMDKind: TSIMDKind;
+  public
+    constructor Create(aSize: TAstExpr; aElemType: TAurumType; aKind: TSIMDKind; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Size: TAstExpr read FSize;
+    property ElementType: TAurumType read FElementType;
+    property SIMDKind: TSIMDKind read FSIMDKind;
+  end;
+
+  { SIMD Binary Operation: vec1 + vec2 }
+  TAstSIMDBinOp = class(TAstExpr)
+  private
+    FOp: TTokenKind;
+    FLeft: TAstExpr;
+    FRight: TAstExpr;
+    FSIMDKind: TSIMDKind;
+  public
+    constructor Create(aOp: TTokenKind; aLeft, aRight: TAstExpr; aKind: TSIMDKind; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Op: TTokenKind read FOp;
+    property Left: TAstExpr read FLeft;
+    property Right: TAstExpr read FRight;
+    property SIMDKind: TSIMDKind read FSIMDKind;
+  end;
+
+  { SIMD Unary Operation: -vec }
+  TAstSIMDUnaryOp = class(TAstExpr)
+  private
+    FOp: TTokenKind;
+    FOperand: TAstExpr;
+    FSIMDKind: TSIMDKind;
+  public
+    constructor Create(aOp: TTokenKind; aOperand: TAstExpr; aKind: TSIMDKind; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Op: TTokenKind read FOp;
+    property Operand: TAstExpr read FOperand;
+    property SIMDKind: TSIMDKind read FSIMDKind;
+  end;
+
+  { SIMD Index Access: vec[i] }
+  TAstSIMDIndexAccess = class(TAstExpr)
+  private
+    FObj: TAstExpr;
+    FIndex: TAstExpr;
+  public
+    constructor Create(aObj, aIndex: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Obj: TAstExpr read FObj;
+    property Index: TAstExpr read FIndex;
   end;
 
   { Char-Literal: 'A' }
@@ -575,6 +638,7 @@ type
     FIsStatic: Boolean; // true for static methods (no self parameter)
     FVisibility: TVisibility; // for class members (default: visPublic)
     FEnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
+    FLibraryName: string; // for external functions - library name to link against
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -590,6 +654,7 @@ type
     property IsStatic: Boolean read FIsStatic write FIsStatic;
     property Visibility: TVisibility read FVisibility write FVisibility;
     property EnergyLevel: TEnergyLevel read FEnergyLevel write FEnergyLevel;
+    property LibraryName: string read FLibraryName write FLibraryName;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -1190,6 +1255,80 @@ destructor TAstInExpr.Destroy;
 begin
   FKey.Free;
   FContainer.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstSIMDNew
+// ================================================================
+
+constructor TAstSIMDNew.Create(aSize: TAstExpr; aElemType: TAurumType; aKind: TSIMDKind; aSpan: TSourceSpan);
+begin
+  inherited Create(nkSIMDNew, aSpan);
+  FSize := aSize;
+  FElementType := aElemType;
+  FSIMDKind := aKind;
+end;
+
+destructor TAstSIMDNew.Destroy;
+begin
+  FSize.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstSIMDBinOp
+// ================================================================
+
+constructor TAstSIMDBinOp.Create(aOp: TTokenKind; aLeft, aRight: TAstExpr; aKind: TSIMDKind; aSpan: TSourceSpan);
+begin
+  inherited Create(nkSIMDBinOp, aSpan);
+  FOp := aOp;
+  FLeft := aLeft;
+  FRight := aRight;
+  FSIMDKind := aKind;
+end;
+
+destructor TAstSIMDBinOp.Destroy;
+begin
+  FLeft.Free;
+  FRight.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstSIMDUnaryOp
+// ================================================================
+
+constructor TAstSIMDUnaryOp.Create(aOp: TTokenKind; aOperand: TAstExpr; aKind: TSIMDKind; aSpan: TSourceSpan);
+begin
+  inherited Create(nkSIMDUnaryOp, aSpan);
+  FOp := aOp;
+  FOperand := aOperand;
+  FSIMDKind := aKind;
+end;
+
+destructor TAstSIMDUnaryOp.Destroy;
+begin
+  FOperand.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstSIMDIndexAccess
+// ================================================================
+
+constructor TAstSIMDIndexAccess.Create(aObj, aIndex: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkSIMDIndexAccess, aSpan);
+  FObj := aObj;
+  FIndex := aIndex;
+end;
+
+destructor TAstSIMDIndexAccess.Destroy;
+begin
+  FObj.Free;
+  FIndex.Free;
   inherited Destroy;
 end;
 

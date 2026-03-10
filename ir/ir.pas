@@ -80,7 +80,21 @@ type
     irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
     irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,
     irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe,
-    irSIMDLoadElem, irSIMDStoreElem
+    irSIMDLoadElem, irSIMDStoreElem,
+    // Map/Set operations (v0.5.0)
+    irMapNew,       // create new map: Dest = map_new(ImmInt=initial_capacity)
+    irMapGet,       // get value: Dest = map_get(Src1=map, Src2=key) - panics if not found
+    irMapSet,       // set/update: map_set(Src1=map, Src2=key, Src3=value)
+    irMapContains,  // check key: Dest = map_contains(Src1=map, Src2=key) -> bool
+    irMapRemove,    // remove key: map_remove(Src1=map, Src2=key)
+    irMapLen,       // get size: Dest = map_len(Src1=map)
+    irMapFree,      // free map: map_free(Src1=map)
+    irSetNew,       // create new set: Dest = set_new(ImmInt=initial_capacity)
+    irSetAdd,       // add element: set_add(Src1=set, Src2=value)
+    irSetContains,  // check element: Dest = set_contains(Src1=set, Src2=value) -> bool
+    irSetRemove,    // remove element: set_remove(Src1=set, Src2=value)
+    irSetLen,       // get size: Dest = set_len(Src1=set)
+    irSetFree       // free set: set_free(Src1=set)
    );
 
   TIRInstr = record
@@ -315,6 +329,16 @@ begin
     irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe,
     irSIMDLoadElem, irSIMDStoreElem:
       Result := 2;
+    // Map/Set operations (hohe Kosten - Heap + Hash-Berechnung)
+    irMapNew, irSetNew:
+      Result := 500;  // Allokation
+    irMapGet, irMapSet, irMapContains, irMapRemove,
+    irSetAdd, irSetContains, irSetRemove:
+      Result := 150;  // Hash-Lookup + evtl. Resize
+    irMapLen, irSetLen:
+      Result := 5;    // Einfaches Feld-Zugriff
+    irMapFree, irSetFree:
+      Result := 200;  // Deallokation
     else
       Result := 1;
   end;

@@ -540,6 +540,7 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
    nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
    targetPos, jmpPos: Integer;
    jmpAfterPadPos: Integer;
+   nextLabelPos, doneLabelPos, notFoundPos: Integer;
   // for call/abi
   argCount: Integer;
   argTemps: array of Integer;
@@ -725,6 +726,7 @@ begin
         if instr.Dest > maxTemp then maxTemp := instr.Dest;
         if instr.Src1 > maxTemp then maxTemp := instr.Src1;
         if instr.Src2 > maxTemp then maxTemp := instr.Src2;
+        if instr.Src3 > maxTemp then maxTemp := instr.Src3;
       end;
       if maxTemp < 0 then maxTemp := 0 else Inc(maxTemp);
       totalSlots := localCnt + maxTemp;
@@ -3091,6 +3093,224 @@ begin
             WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1), RAX);     // ptr = 0
             WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1 + 1), RAX); // len = 0
             WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1 + 2), RAX); // cap = 0
+          end;
+
+        // === Map/Set operations (v0.5.0) ===
+        // Simple array-based implementation (linear search)
+        // Map structure: [len:8][cap:8][entries:16*cap]
+        // Entry: [key:8][value:8]
+        irMapNew, irSetNew:
+          begin
+            // Allocate: 16 (header) + 16*8 (8 entries initial)
+            // mmap(addr=0, len=144, prot=RW, flags=MAP_ANON|MAP_PRIVATE, fd=-1, off=0)
+            WriteMovRegImm64(FCode, RAX, 9); // sys_mmap
+            WriteMovRegImm64(FCode, RDI, 0);
+            WriteMovRegImm64(FCode, RSI, 144); // 16 + 16*8
+            WriteMovRegImm64(FCode, RDX, 3); // PROT_READ | PROT_WRITE
+            WriteMovRegImm64(FCode, R10, 34); // MAP_ANON | MAP_PRIVATE
+            WriteMovRegImm64(FCode, R8, High(UInt64)); // fd = -1
+            WriteMovRegImm64(FCode, R9, 0);
+            WriteSyscall(FCode);
+            // Store pointer in dest
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            // Initialize: len=0, cap=8 at [rax+0] and [rax+8]
+            // mov qword [rax], 0
+            EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $00);
+            EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
+            // mov qword [rax+8], 8
+            EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $40); EmitU8(FCode, $08);
+            EmitU8(FCode, $08); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
+          end;
+
+        irMapSet:
+          begin
+            // map_set(map, key, value)
+            // First search for existing key, update if found, else append
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1)); // map ptr
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2)); // key
+            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src3)); // value
+            
+            // rcx = len: mov rcx, [rdi]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $0F);
+            // r8 = 0 (counter): xor r8d, r8d
+            EmitU8(FCode, $45); EmitU8(FCode, $31); EmitU8(FCode, $C0);
+            // r9 = rdi + 16 (first entry): lea r9, [rdi+16]
+            EmitU8(FCode, $4C); EmitU8(FCode, $8D); EmitU8(FCode, $4F); EmitU8(FCode, $10);
+            
+            // Search loop
+            loopStartPos := FCode.Size;
+            // cmp r8, rcx (counter vs len)
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            // jge notFound (will append)
+            jgePos := FCode.Size;
+            EmitU8(FCode, $7D); EmitU8(FCode, $00); // placeholder
+            // r10 = [r9] (entry key)
+            EmitU8(FCode, $4D); EmitU8(FCode, $8B); EmitU8(FCode, $11);
+            // cmp r10, rsi (entry key vs search key)
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $F2);
+            // jne next
+            jneLoopPos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00); // placeholder
+            // Found: update value at [r9+8] and jump to done
+            // mov [r9+8], rdx
+            EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $51); EmitU8(FCode, $08);
+            // jmp done
+            jmpDonePos := FCode.Size;
+            EmitU8(FCode, $EB); EmitU8(FCode, $00); // placeholder
+            // Next: add r9, 16; inc r8; jmp loop
+            nextLabelPos := FCode.Size;
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $C1); EmitU8(FCode, $10); // add r9, 16
+            EmitU8(FCode, $49); EmitU8(FCode, $FF); EmitU8(FCode, $C0); // inc r8
+            // jmp loop
+            EmitU8(FCode, $EB);
+            EmitU8(FCode, Byte(Int8(loopStartPos - (FCode.Size + 1))));
+            
+            // notFound: append new entry
+            notFoundPos := FCode.Size;
+            // r9 = rdi + 16 + rcx*16 (end of entries)
+            // lea r9, [rdi + rcx*1 + 16] won't work, need manual: r9 = rdi; r10 = rcx; shl r10, 4; add r9, r10; add r9, 16
+            WriteMovRegReg(FCode, R9, RDI);
+            WriteMovRegReg(FCode, R10, RCX);
+            EmitU8(FCode, $49); EmitU8(FCode, $C1); EmitU8(FCode, $E2); EmitU8(FCode, $04); // shl r10, 4
+            EmitU8(FCode, $4D); EmitU8(FCode, $01); EmitU8(FCode, $D1); // add r9, r10
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $C1); EmitU8(FCode, $10); // add r9, 16
+            // Store key: mov [r9], rsi
+            EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $31);
+            // Store value: mov [r9+8], rdx
+            EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $51); EmitU8(FCode, $08);
+            // Increment len: inc qword [rdi]
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $07);
+            
+            // Done label
+            doneLabelPos := FCode.Size;
+            // Patch jumps
+            FCode.PatchU8(jgePos + 1, notFoundPos - (jgePos + 2));
+            FCode.PatchU8(jneLoopPos + 1, nextLabelPos - (jneLoopPos + 2));
+            FCode.PatchU8(jmpDonePos + 1, doneLabelPos - (jmpDonePos + 2));
+          end;
+
+        irSetAdd:
+          begin
+            // set_add(set, value) - same as map_set but value=0
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2));
+            // mov rcx, [rdi]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $0F);
+            WriteMovRegReg(FCode, R8, RCX);
+            EmitU8(FCode, $49); EmitU8(FCode, $C1); EmitU8(FCode, $E0); EmitU8(FCode, $04);
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $C0); EmitU8(FCode, $10);
+            WriteMovRegReg(FCode, R9, RDI);
+            WriteAddRegReg(FCode, R9, R8);
+            EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $31);
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $07);
+          end;
+
+        irMapGet:
+          begin
+            // map_get(map, key) -> value
+            // Linear search for key
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1)); // map
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2)); // key
+            // rcx = len: mov rcx, [rdi]
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $0F);
+            // r8 = 0 (counter): xor r8d, r8d
+            EmitU8(FCode, $45); EmitU8(FCode, $31); EmitU8(FCode, $C0);
+            // rax = 0 (default): xor eax, eax
+            EmitU8(FCode, $31); EmitU8(FCode, $C0);
+            // r9 = rdi + 16 (first entry): lea r9, [rdi+16]
+            EmitU8(FCode, $4C); EmitU8(FCode, $8D); EmitU8(FCode, $4F); EmitU8(FCode, $10);
+            
+            // Loop start
+            loopStartPos := FCode.Size;
+            // cmp r8, rcx  (REX.W+REX.B, CMP r/m64,r64, ModRM: reg=rcx, r/m=r8)
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            // jge done (placeholder)
+            jgePos := FCode.Size;
+            EmitU8(FCode, $7D); EmitU8(FCode, $00); // short jge
+            // r10 = [r9] (entry key)
+            EmitU8(FCode, $4D); EmitU8(FCode, $8B); EmitU8(FCode, $11);
+            // cmp r10, rsi  (REX.W+REX.B, CMP r/m64,r64, ModRM: reg=rsi, r/m=r10)
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $F2);
+            // jne next (placeholder)
+            jneLoopPos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00); // short jne
+            // Found: rax = [r9+8]
+            EmitU8(FCode, $49); EmitU8(FCode, $8B); EmitU8(FCode, $41); EmitU8(FCode, $08);
+            // jmp done (placeholder)
+            jmpDonePos := FCode.Size;
+            EmitU8(FCode, $EB); EmitU8(FCode, $00); // short jmp
+            // Next: add r9, 16; inc r8; jmp loop
+            nextLabelPos := FCode.Size;
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $C1); EmitU8(FCode, $10); // add r9, 16
+            EmitU8(FCode, $49); EmitU8(FCode, $FF); EmitU8(FCode, $C0); // inc r8
+            // jmp loop
+            EmitU8(FCode, $EB);
+            EmitU8(FCode, Byte(Int8(loopStartPos - (FCode.Size + 1))));
+            // Done label
+            doneLabelPos := FCode.Size;
+            // Patch jumps
+            FCode.PatchU8(jgePos + 1, doneLabelPos - (jgePos + 2));
+            FCode.PatchU8(jneLoopPos + 1, nextLabelPos - (jneLoopPos + 2));
+            FCode.PatchU8(jmpDonePos + 1, doneLabelPos - (jmpDonePos + 2));
+            
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irMapContains, irSetContains:
+          begin
+            // contains(map, key) -> bool (similar to MapGet but returns 0/1)
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $0F); // mov rcx, [rdi]
+            EmitU8(FCode, $45); EmitU8(FCode, $31); EmitU8(FCode, $C0); // xor r8d, r8d
+            EmitU8(FCode, $31); EmitU8(FCode, $C0); // xor eax, eax (result = false)
+            EmitU8(FCode, $4C); EmitU8(FCode, $8D); EmitU8(FCode, $4F); EmitU8(FCode, $10); // lea r9, [rdi+16]
+            
+            loopStartPos := FCode.Size;
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $C8); // cmp r8, rcx (fixed encoding)
+            jgePos := FCode.Size;
+            EmitU8(FCode, $7D); EmitU8(FCode, $00);
+            EmitU8(FCode, $4D); EmitU8(FCode, $8B); EmitU8(FCode, $11); // mov r10, [r9]
+            EmitU8(FCode, $49); EmitU8(FCode, $39); EmitU8(FCode, $F2); // cmp r10, rsi (fixed encoding)
+            jneLoopPos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00);
+            // Found: rax = 1
+            WriteMovRegImm64(FCode, RAX, 1);
+            jmpDonePos := FCode.Size;
+            EmitU8(FCode, $EB); EmitU8(FCode, $00);
+            nextLabelPos := FCode.Size;
+            EmitU8(FCode, $49); EmitU8(FCode, $83); EmitU8(FCode, $C1); EmitU8(FCode, $10);
+            EmitU8(FCode, $49); EmitU8(FCode, $FF); EmitU8(FCode, $C0);
+            EmitU8(FCode, $EB);
+            EmitU8(FCode, Byte(Int8(loopStartPos - (FCode.Size + 1))));
+            doneLabelPos := FCode.Size;
+            FCode.PatchU8(jgePos + 1, doneLabelPos - (jgePos + 2));
+            FCode.PatchU8(jneLoopPos + 1, nextLabelPos - (jneLoopPos + 2));
+            FCode.PatchU8(jmpDonePos + 1, doneLabelPos - (jmpDonePos + 2));
+            
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irMapLen, irSetLen:
+          begin
+            // len(map) -> int64: return [map+0]
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $07); // mov rax, [rdi]
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irMapRemove, irSetRemove:
+          begin
+            // TODO: implement remove
+          end;
+
+        irMapFree, irSetFree:
+          begin
+            // munmap(ptr, 144)
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegImm64(FCode, RSI, 144);
+            WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
+            WriteSyscall(FCode);
           end;
       end;
     end;
