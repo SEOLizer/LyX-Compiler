@@ -28,6 +28,10 @@ type
     tkPanic, tkAssert,
     // Constraint Keywords
     tkWhere, tkValue,
+    // Map/Set Keywords
+    tkMap, tkSet, tkIn,
+    // OOP Additional Keywords
+    tkVirtual,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -154,6 +158,10 @@ begin
     tkAssert:     Result := 'assert';
     tkWhere:      Result := 'where';
     tkValue:      Result := 'value';
+    tkMap:        Result := 'Map';
+    tkSet:        Result := 'Set';
+    tkIn:         Result := 'in';
+    tkVirtual:    Result := 'virtual';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -706,6 +714,12 @@ begin
     // Constraint Keywords
     'where':      Result := tkWhere;
     'value':      Result := tkValue;
+    // Map/Set Keywords
+    'Map':        Result := tkMap;
+    'Set':        Result := tkSet;
+    'in':         Result := tkIn;
+    // OOP Additional Keywords
+    'virtual':    Result := tkVirtual;
   else
     Result := tkIdent;
   end;

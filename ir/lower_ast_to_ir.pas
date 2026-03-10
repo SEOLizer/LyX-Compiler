@@ -742,6 +742,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     isFloatCmp: Boolean;
     isStringConcat: Boolean;
     mangled: string;
+    // Map/Set lowering (v0.5.0)
+    entryCount: Integer;
+    elemCount: Integer;
+    containerType: TAurumType;
+    // Call handling
+    call: TAstCall;
     // Null-Coalesce Phase 2
     zeroSlot: Integer;
     resultSlot: Integer;
@@ -998,7 +1004,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               end
               else
                 instr.Op := irAdd;
-            end
+            end;
             tkMinus:
               instr.Op := irSub;
             tkStar:
@@ -1018,7 +1024,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             tkEq:
               if isFloatCmp then instr.Op := irFCmpEq else instr.Op := irCmpEq;
             tkNeq:
-              if isFloatCmp then instr.Op := irFCmpNe else instr.Op := irCmpNe;
+              if isFloatCmp then instr.Op := irFCmpNeq else instr.Op := irCmpNeq;
             tkLt:
               if isFloatCmp then instr.Op := irFCmpLt else instr.Op := irCmpLt;
             tkLe:
@@ -1527,6 +1533,37 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkIndexAccess:
       begin
+        // Check if this is a Map access (map[key])
+        if TAstIndexAccess(expr).Obj.ResolvedType = atMap then
+        begin
+          // Map access: map[key] -> irMapGet(map, key)
+          // Lower the map (object)
+          t1 := LowerExpr(TAstIndexAccess(expr).Obj);
+          if t1 < 0 then Exit;
+
+          // Lower the key
+          t2 := LowerExpr(TAstIndexAccess(expr).Index);
+          if t2 < 0 then Exit;
+
+          // Emit map_get
+          t0 := NewTemp;
+          instr.Op := irMapGet;
+          instr.Dest := t0;
+          instr.Src1 := t1;  // map
+          instr.Src2 := t2;  // key
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
+
+        // Check if this is a Set access (not supported - sets are not indexable)
+        if TAstIndexAccess(expr).Obj.ResolvedType = atSet then
+        begin
+          FDiag.Error('sets are not indexable, use "in" operator to check membership', expr.Span);
+          Exit;
+        end;
+
+        // Regular array access
         // Check if accessing a global array
         if (TAstIndexAccess(expr).Obj is TAstIdent) and
            IsGlobalVar(TAstIdent(TAstIndexAccess(expr).Obj).Name) then
@@ -1800,6 +1837,138 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         // Struct literal: TypeName { field1: val1, field2: val2, ... }
         // Allocate stack space for the struct, initialize fields, return address
         Result := LowerStructLit(TAstStructLit(expr));
+      end;
+
+    // Map/Set expressions (v0.5.0)
+    nkMapLit:
+      begin
+        // Map literal: {key1: val1, key2: val2, ...}
+        // Emit: map_new(initial_capacity) + map_set(key, val) for each entry
+
+        // Determine initial capacity (round up to power of 2)
+        entryCount := Length(TAstMapLit(expr).Entries);
+        if entryCount < 4 then
+          entryCount := 4
+        else
+        begin
+          // Round up to next power of 2
+          while (entryCount and (entryCount - 1)) <> 0 do
+            entryCount := entryCount and (entryCount - 1);
+          entryCount := entryCount shl 1;
+        end;
+
+        // Allocate new map
+        t0 := NewTemp;
+        instr.Op := irMapNew;
+        instr.Dest := t0;
+        instr.ImmInt := entryCount;
+        Emit(instr);
+
+        // Add each entry: map_set(map, key, value)
+        for i := 0 to High(TAstMapLit(expr).Entries) do
+        begin
+          // Lower key
+          t1 := LowerExpr(TAstMapLit(expr).Entries[i].Key);
+          if t1 < 0 then Exit;
+
+          // Lower value
+          t2 := LowerExpr(TAstMapLit(expr).Entries[i].Value);
+          if t2 < 0 then Exit;
+
+          // Emit map_set
+          instr := Default(TIRInstr);
+          instr.Op := irMapSet;
+          instr.Src1 := t0;  // map
+          instr.Src2 := t1;  // key
+          instr.Src3 := t2;  // value
+          Emit(instr);
+        end;
+
+        Result := t0;
+      end;
+
+    nkSetLit:
+      begin
+        // Set literal: {val1, val2, val3, ...}
+        // Emit: set_new(initial_capacity) + set_add(set, value) for each element
+
+        // Determine initial capacity (round up to power of 2)
+        elemCount := Length(TAstSetLit(expr).Items);
+        if elemCount < 4 then
+          elemCount := 4
+        else
+        begin
+          // Round up to next power of 2
+          while (elemCount and (elemCount - 1)) <> 0 do
+            elemCount := elemCount and (elemCount - 1);
+          elemCount := elemCount shl 1;
+        end;
+
+        // Allocate new set
+        t0 := NewTemp;
+        instr.Op := irSetNew;
+        instr.Dest := t0;
+        instr.ImmInt := elemCount;
+        Emit(instr);
+
+        // Add each element: set_add(set, value)
+        for i := 0 to High(TAstSetLit(expr).Items) do
+        begin
+          // Lower value
+          t1 := LowerExpr(TAstSetLit(expr).Items[i]);
+          if t1 < 0 then Exit;
+
+          // Emit set_add
+          instr := Default(TIRInstr);
+          instr.Op := irSetAdd;
+          instr.Src1 := t0;  // set
+          instr.Src2 := t1;  // value
+          Emit(instr);
+        end;
+
+        Result := t0;
+      end;
+
+    nkInExpr:
+      begin
+        // In expression: key in map/set
+        // Emit: map_contains(map, key) or set_contains(set, value)
+
+        // Lower the key and container
+        t1 := LowerExpr(TAstInExpr(expr).Key);
+        if t1 < 0 then Exit;
+
+        t2 := LowerExpr(TAstInExpr(expr).Container);
+        if t2 < 0 then Exit;
+
+        // Determine which operation to use based on container type
+        t0 := NewTemp;
+        containerType := TAstInExpr(expr).Container.ResolvedType;
+
+        if containerType = atMap then
+        begin
+          // map contains: irMapContains(map, key) -> bool
+          instr.Op := irMapContains;
+          instr.Dest := t0;
+          instr.Src1 := t2;  // map
+          instr.Src2 := t1;  // key
+        end
+        else if containerType = atSet then
+        begin
+          // set contains: irSetContains(set, value) -> bool
+          instr.Op := irSetContains;
+          instr.Dest := t0;
+          instr.Src1 := t2;  // set
+          instr.Src2 := t1;  // value
+        end
+        else
+        begin
+          FDiag.Error('invalid container type for "in" operator', expr.Span);
+          Exit;
+        end;
+
+        Emit(instr);
+        Result := t0;
       end;
 
     nkNewExpr:
@@ -2314,6 +2483,14 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
   begin
   instr := Default(TIRInstr);
   Result := True;
+  // Handle block statements (multiple statements in braces)
+  if stmt is TAstBlock then
+  begin
+    for i := 0 to High(TAstBlock(stmt).Stmts) do
+      LowerStmt(TAstBlock(stmt).Stmts[i]);
+    Exit(True);
+  end;
+
   // Handle expression statements (e.g., function calls, panic as statement)
   if stmt is TAstExprStmt then
   begin
@@ -2567,9 +2744,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
        end;
         tmp := LowerExpr(vd.InitExpr);
         // If local has narrower integer width, truncate before store
+        // Skip truncation for pointer-like types (Map, Set, DynArray)
         ltype := GetLocalType(loc);
         if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64)
-           and (ltype <> atPChar) and (ltype <> atPCharNullable) then
+           and (ltype <> atPChar) and (ltype <> atPCharNullable)
+           and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray) then
         begin
          // determine width in bits
          width := 64;
@@ -2620,7 +2799,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       // truncate if local has narrower integer width
       ltype := GetLocalType(loc);
       if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64) 
-         and (ltype <> atPChar) and (ltype <> atPCharNullable) then
+         and (ltype <> atPChar) and (ltype <> atPCharNullable)
+         and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray) then
       begin
         width := 64;
         case ltype of
@@ -2681,6 +2861,41 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     // index assignment: arr[idx] := value
     if stmt is TAstIndexAssign then
     begin
+      // Check if this is a Map assignment (map[key] := value)
+      if TAstIndexAssign(stmt).Target.Obj.ResolvedType = atMap then
+      begin
+        // Map assignment: map[key] := value -> irMapSet(map, key, value)
+
+        // Lower the map (object)
+        t1 := LowerExpr(TAstIndexAssign(stmt).Target.Obj);
+        if t1 < 0 then Exit(False);
+
+        // Lower the key
+        t2 := LowerExpr(TAstIndexAssign(stmt).Target.Index);
+        if t2 < 0 then Exit(False);
+
+        // Lower the value
+        t0 := LowerExpr(TAstIndexAssign(stmt).Value);
+        if t0 < 0 then Exit(False);
+
+        // Emit map_set(map, key, value)
+        instr := Default(TIRInstr);
+        instr.Op := irMapSet;
+        instr.Src1 := t1;  // map
+        instr.Src2 := t2;  // key
+        instr.Src3 := t0;  // value
+        Emit(instr);
+        Exit(True);
+      end;
+
+      // Check if this is a Set (not supported for assignment)
+      if TAstIndexAssign(stmt).Target.Obj.ResolvedType = atSet then
+      begin
+        FDiag.Error('sets are not indexable, cannot assign to set elements', stmt.Span);
+        Exit(False);
+      end;
+
+      // Regular array assignment
       // t1 = base array/pointer
       // Check if target is a global array - need address, not value
       if (TAstIndexAssign(stmt).Target.Obj is TAstIdent) and
@@ -2829,6 +3044,155 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
            instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
         end;
       end;
+      Exit(True);
+    end;
+
+    // if (cond) { thenBranch } [else { elseBranch }]
+    if stmt is TAstIf then
+    begin
+      condTmp := LowerExpr(TAstIf(stmt).Cond);
+      if condTmp < 0 then Exit(False);
+
+      if Assigned(TAstIf(stmt).ElseBranch) then
+      begin
+        // if-else: brfalse to else, then to end
+        elseLabel := NewLabel('Lelse');
+        endLabel := NewLabel('Lendif');
+
+        instr := Default(TIRInstr);
+        instr.Op := irBrFalse;
+        instr.Src1 := condTmp;
+        instr.LabelName := elseLabel;
+        Emit(instr);
+
+        // then branch
+        LowerStmt(TAstIf(stmt).ThenBranch);
+
+        // jump to end
+        instr := Default(TIRInstr);
+        instr.Op := irJmp;
+        instr.LabelName := endLabel;
+        Emit(instr);
+
+        // else label
+        instr := Default(TIRInstr);
+        instr.Op := irLabel;
+        instr.LabelName := elseLabel;
+        Emit(instr);
+
+        // else branch
+        LowerStmt(TAstIf(stmt).ElseBranch);
+
+        // end label
+        instr := Default(TIRInstr);
+        instr.Op := irLabel;
+        instr.LabelName := endLabel;
+        Emit(instr);
+      end
+      else
+      begin
+        // if without else: brfalse to end
+        endLabel := NewLabel('Lendif');
+
+        instr := Default(TIRInstr);
+        instr.Op := irBrFalse;
+        instr.Src1 := condTmp;
+        instr.LabelName := endLabel;
+        Emit(instr);
+
+        // then branch
+        LowerStmt(TAstIf(stmt).ThenBranch);
+
+        // end label
+        instr := Default(TIRInstr);
+        instr.Op := irLabel;
+        instr.LabelName := endLabel;
+        Emit(instr);
+      end;
+      Exit(True);
+    end;
+
+    // while (cond) { body }
+    if stmt is TAstWhile then
+    begin
+      startLabel := NewLabel('Lwhile_start');
+      exitLabel := NewLabel('Lwhile_exit');
+
+      // start label
+      instr := Default(TIRInstr);
+      instr.Op := irLabel;
+      instr.LabelName := startLabel;
+      Emit(instr);
+
+      // evaluate condition
+      condTmp := LowerExpr(TAstWhile(stmt).Cond);
+      if condTmp < 0 then Exit(False);
+
+      // brfalse to exit
+      instr := Default(TIRInstr);
+      instr.Op := irBrFalse;
+      instr.Src1 := condTmp;
+      instr.LabelName := exitLabel;
+      Emit(instr);
+
+      // push break label for break statements
+      FBreakStack.AddObject(exitLabel, nil);
+
+      // body
+      LowerStmt(TAstWhile(stmt).Body);
+
+      // pop break label
+      FBreakStack.Delete(FBreakStack.Count - 1);
+
+      // jump back to start
+      instr := Default(TIRInstr);
+      instr.Op := irJmp;
+      instr.LabelName := startLabel;
+      Emit(instr);
+
+      // exit label
+      instr := Default(TIRInstr);
+      instr.Op := irLabel;
+      instr.LabelName := exitLabel;
+      Emit(instr);
+
+      Exit(True);
+    end;
+
+    // return [expr];
+    if stmt is TAstReturn then
+    begin
+      if Assigned(TAstReturn(stmt).Value) then
+      begin
+        tmp := LowerExpr(TAstReturn(stmt).Value);
+        if tmp < 0 then Exit(False);
+        instr := Default(TIRInstr);
+        instr.Op := irReturn;
+        instr.Src1 := tmp;
+        Emit(instr);
+      end
+      else
+      begin
+        instr := Default(TIRInstr);
+        instr.Op := irReturn;
+        instr.Src1 := -1; // void return
+        Emit(instr);
+      end;
+      Exit(True);
+    end;
+
+    // break;
+    if stmt is TAstBreak then
+    begin
+      if FBreakStack.Count = 0 then
+      begin
+        FDiag.Error('break statement outside of loop', stmt.Span);
+        Exit(False);
+      end;
+      instr := Default(TIRInstr);
+      instr.Op := irJmp;
+      instr.LabelName := FBreakStack[FBreakStack.Count - 1];
+      Emit(instr);
       Exit(True);
     end;
 

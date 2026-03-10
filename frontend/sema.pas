@@ -1606,9 +1606,36 @@ begin
     nkIndexAccess:
       begin
         // resolve object and index
-        CheckExpr(TAstIndexAccess(expr).Obj);
-        CheckExpr(TAstIndexAccess(expr).Index);
-        if not IsIntegerType(CheckExpr(TAstIndexAccess(expr).Index)) then
+        ot := CheckExpr(TAstIndexAccess(expr).Obj);
+        lt := CheckExpr(TAstIndexAccess(expr).Index);
+        
+        // Check if this is a Map access
+        if ot = atMap then
+        begin
+          // Map access: map[key] -> value_type
+          // Key must be hashable (integer, pchar, bool)
+          if not (lt in [atInt64, atInt32, atInt16, atInt8,
+                         atUInt64, atUInt32, atUInt16, atUInt8,
+                         atPChar, atBool]) then
+            FDiag.Error('Map key must be hashable type', TAstIndexAccess(expr).Index.Span);
+          
+          // For now, return int64 as default value type (no full generics yet)
+          // In future: extract value type from the Map's generic parameters
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
+        // Check if this is a Set access (not allowed)
+        if ot = atSet then
+        begin
+          FDiag.Error('Sets are not indexable, use "in" operator', expr.Span);
+          Result := atUnresolved;
+          Exit;
+        end;
+        
+        // Array access
+        if not IsIntegerType(lt) then
           FDiag.Error('array index must be integer', TAstIndexAccess(expr).Index.Span);
         // if indexing an identifier with array metadata, return element type
         if TAstIndexAccess(expr).Obj is TAstIdent then
@@ -2135,6 +2162,117 @@ begin
           FDiag.Error('panic message must be a string', TAstPanicExpr(expr).Message.Span);
         // panic never returns, so we can assign any type
         Result := atVoid;
+      end;
+    nkMapLit:
+      begin
+        // Map literal: {key: value, ...}
+        // Check all key-value pairs and infer types
+        if Length(TAstMapLit(expr).Entries) = 0 then
+        begin
+          // Empty map - type inference will be deferred to context
+          TAstMapLit(expr).KeyType := atUnresolved;
+          TAstMapLit(expr).ValueType := atUnresolved;
+          Result := atMap;
+        end
+        else
+        begin
+          // Infer types from first entry
+          TAstMapLit(expr).KeyType := CheckExpr(TAstMapLit(expr).Entries[0].Key);
+          TAstMapLit(expr).ValueType := CheckExpr(TAstMapLit(expr).Entries[0].Value);
+          
+          // Validate key type (must be hashable: int64, pchar, bool)
+          if not (TAstMapLit(expr).KeyType in [atInt64, atInt32, atInt16, atInt8,
+                              atUInt64, atUInt32, atUInt16, atUInt8,
+                              atPChar, atBool]) then
+            FDiag.Error('Map key type must be hashable (integer, pchar, or bool)', TAstMapLit(expr).Entries[0].Key.Span);
+          
+          // Check remaining entries for type consistency
+          for i := 1 to High(TAstMapLit(expr).Entries) do
+          begin
+            lt := CheckExpr(TAstMapLit(expr).Entries[i].Key);
+            rt := CheckExpr(TAstMapLit(expr).Entries[i].Value);
+            
+            if not TypeEqual(lt, TAstMapLit(expr).KeyType) then
+              FDiag.Error(Format('Map key type mismatch: expected %s but got %s',
+                [AurumTypeToStr(TAstMapLit(expr).KeyType), AurumTypeToStr(lt)]), TAstMapLit(expr).Entries[i].Key.Span);
+            
+            if not TypeEqual(rt, TAstMapLit(expr).ValueType) then
+              FDiag.Error(Format('Map value type mismatch: expected %s but got %s',
+                [AurumTypeToStr(TAstMapLit(expr).ValueType), AurumTypeToStr(rt)]), TAstMapLit(expr).Entries[i].Value.Span);
+          end;
+          Result := atMap;
+        end;
+      end;
+    nkSetLit:
+      begin
+        // Set literal: {value, value, ...}
+        // Check all values and infer element type
+        if Length(TAstSetLit(expr).Items) = 0 then
+        begin
+          // Empty set - type inference will be deferred to context
+          TAstSetLit(expr).ElemType := atUnresolved;
+          Result := atSet;
+        end
+        else
+        begin
+          // Infer type from first element
+          TAstSetLit(expr).ElemType := CheckExpr(TAstSetLit(expr).Items[0]);
+          
+          // Validate element type (must be hashable: int64, pchar, bool)
+          if not (TAstSetLit(expr).ElemType in [atInt64, atInt32, atInt16, atInt8,
+                               atUInt64, atUInt32, atUInt16, atUInt8,
+                               atPChar, atBool]) then
+            FDiag.Error('Set element type must be hashable (integer, pchar, or bool)', TAstSetLit(expr).Items[0].Span);
+          
+          // Check remaining elements for type consistency
+          for i := 1 to High(TAstSetLit(expr).Items) do
+          begin
+            lt := CheckExpr(TAstSetLit(expr).Items[i]);
+            if not TypeEqual(lt, TAstSetLit(expr).ElemType) then
+              FDiag.Error(Format('Set element type mismatch: expected %s but got %s',
+                [AurumTypeToStr(TAstSetLit(expr).ElemType), AurumTypeToStr(lt)]), TAstSetLit(expr).Items[i].Span);
+          end;
+          Result := atSet;
+        end;
+      end;
+    nkInExpr:
+      begin
+        // 'in' operator: key in container (Map or Set)
+        // Returns bool
+        lt := CheckExpr(TAstInExpr(expr).Key);
+        rt := CheckExpr(TAstInExpr(expr).Container);
+        
+        // Container must be Map or Set
+        if not (rt in [atMap, atSet]) then
+        begin
+          FDiag.Error('Right operand of ''in'' must be a Map or Set', TAstInExpr(expr).Container.Span);
+          Result := atBool;
+        end
+        else
+        begin
+          // Type check key against container element/key type
+          if rt = atMap then
+          begin
+            if TAstInExpr(expr).Container is TAstMapLit then
+            begin
+              ot := TAstMapLit(TAstInExpr(expr).Container).KeyType;
+              if (ot <> atUnresolved) and not TypeEqual(lt, ot) then
+                FDiag.Error(Format('Map contains key mismatch: expected %s but got %s',
+                  [AurumTypeToStr(ot), AurumTypeToStr(lt)]), TAstInExpr(expr).Key.Span);
+            end;
+          end
+          else // atSet
+          begin
+            if TAstInExpr(expr).Container is TAstSetLit then
+            begin
+              ot := TAstSetLit(TAstInExpr(expr).Container).ElemType;
+              if (ot <> atUnresolved) and not TypeEqual(lt, ot) then
+                FDiag.Error(Format('Set element mismatch: expected %s but got %s',
+                  [AurumTypeToStr(ot), AurumTypeToStr(lt)]), TAstInExpr(expr).Key.Span);
+            end;
+          end;
+          Result := atBool;
+        end;
       end;
   else
     begin
