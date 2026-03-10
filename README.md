@@ -552,6 +552,95 @@ fn main(): int64 {
 - **Key types**: `int64`, `bool` (currently)
 - **Supported operations**: Literal creation, index get/set (Map), `in` operator, `len()`
 
+### Logging (`std.log`)
+
+Lyx includes a simple logging module for debugging and diagnostics:
+
+```lyx
+import std.log;
+
+fn main(): int64 {
+  // Log messages with different levels
+  log_debug("Debug information");
+  log_info("General information");
+  log_warn("Warning message");
+  log_error("Error occurred");
+  
+  // Get log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=FATAL)
+  var level: int64 := get_log_level();
+  
+  // Conditional logging
+  log_debug_if(true, "This will be logged");
+  log_debug_if(false, "This will NOT be logged");
+  
+  // Level to string
+  var level_str: pchar := log_level_to_string(1);  // "INFO"
+  
+  // App lifecycle helpers
+  log_app_start("MyApp");
+  log_app_end(0);
+  
+  return 0;
+}
+```
+
+**Functions:**
+- `get_log_level()` / `set_log_level(level)` - Control minimum log level
+- `log_level_to_string(level)` - Convert level to string
+- `log_debug(msg)`, `log_info(msg)`, `log_warn(msg)`, `log_error(msg)`, `log_fatal(msg)`
+- `log_debug_if(cond, msg)`, etc. - Conditional logging
+- `log_section_enter(name)`, `log_section_exit(name)` - Section tracking
+- `log_app_start(name)`, `log_app_end(code)` - Application lifecycle
+
+### OS / System (`std.os`)
+
+The OS module provides system-level functionality:
+
+```lyx
+import std.os;
+
+fn main(): int64 {
+  // Process information
+  var pid: int64 := get_pid();
+  PrintInt(pid);
+  
+  // Environment variables
+  var home: pchar := env_get("HOME");
+  env_set("MY_VAR", "value");
+  var exists: bool := env_has("PATH");
+  
+  // Time functions
+  var t: int64 := time();           // Unix timestamp (seconds)
+  var t_ms: int64 := time_ms();     // Milliseconds
+  
+  // Sleep (milliseconds)
+  sleep(100);  // 100ms
+  
+  // System information
+  var os_name: pchar := get_os_name();   // "Linux"
+  var arch: pchar := get_arch();         // "x86_64"
+  
+  // File system
+  var exists: bool := path_exists("/tmp");
+  
+  // Path utilities
+  var filename: pchar := path_filename("/path/to/file.txt");  // "file.txt"
+  var is_abs: bool := path_is_absolute("/home/user");        // true
+  
+  return 0;
+}
+```
+
+**Functions:**
+- **Process**: `get_pid()`, `get_uid()`, `get_ppid()`
+- **Environment**: `env_get(key)`, `env_set(key, val)`, `env_unset(key)`, `env_has(key)`
+- **Time**: `time()`, `time_ms()`, `time_us()`
+- **Sleep**: `sleep(ms)`, `sleep_seconds(s)`, `sleep_microseconds(us)`
+- **System**: `get_os_name()`, `get_os_version()`, `get_arch()`, `get_page_size()`, `get_num_cores()`
+- **Files**: `path_exists(path)`, `is_directory(path)`, `is_file(path)`
+- **Paths**: `path_filename(path)`, `path_dirname(path)`, `path_is_absolute(path)`
+- **User**: `get_home_dir()`, `get_temp_dir()`, `get_user_name()`
+
 ### Structs (Records)
 
 Structs are defined with `type Name = struct { ... };` and instantiated with `TypeName { field: value, ... }`:
