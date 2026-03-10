@@ -480,6 +480,11 @@ var
   
   cond: Byte;
   
+  // Map/Set loop variables
+  loopStartPos, loopEndPos: Integer;
+  branchPos1, branchPos2, branchPos3: Integer;
+  notFoundPos, doneLabelPos: Integer;
+  
   dataVA, codeVA, instrVA: UInt64;
   disp: Int32;
   rd, rn: Byte;
@@ -991,6 +996,147 @@ begin
               WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
             WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
             WriteRet(FCode);
+          end;
+
+        // === Map/Set Operations (Windows ARM64) ===
+        // Map structure: [len:8][cap:8][entries:16*cap], Entry: [key:8][value:8]
+        irMapNew, irSetNew:
+          begin
+            // Windows ARM64: Use VirtualAlloc - simplified stack allocation for now
+            // Allocate 144 bytes on stack
+            WriteSubImm(FCode, SP, SP, 144);
+            WriteMovRegReg(FCode, X0, SP);
+            // Store pointer
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            // Initialize len=0, cap=8
+            WriteMovImm64(FCode, X1, 0);
+            WriteStrImm(FCode, X1, X0, 0);
+            WriteMovImm64(FCode, X1, 8);
+            WriteStrImm(FCode, X1, X0, 8);
+          end;
+
+        irMapSet:
+          begin
+            // map_set: Linear search, update or append
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            WriteLdrImm(FCode, X3, X0, 0);  // len
+            WriteMovImm64(FCode, X4, 0);    // counter
+            WriteAddImm(FCode, X5, X0, 16); // first entry
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X4, X3);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge notFound
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteCmpReg(FCode, X6, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            WriteStrImm(FCode, X2, X5, 8);  // found: update
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0);          // b done
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X5, X5, 16);
+            WriteAddImm(FCode, X4, X4, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            // Append new entry
+            WriteLslImm(FCode, X6, X3, 4);
+            WriteAddReg(FCode, X5, X0, X6);
+            WriteAddImm(FCode, X5, X5, 16);
+            WriteStrImm(FCode, X1, X5, 0);
+            WriteStrImm(FCode, X2, X5, 8);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteStrImm(FCode, X3, X0, 0);
+            loopEndPos := FCode.Size;
+            FCode.PatchU32(branchPos3, ((loopEndPos - branchPos3) div 4) shl 5 or $14000000);
+          end;
+
+        irSetAdd:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);
+            WriteLslImm(FCode, X3, X2, 4);
+            WriteAddReg(FCode, X3, X0, X3);
+            WriteAddImm(FCode, X3, X3, 16);
+            WriteStrImm(FCode, X1, X3, 0);
+            WriteAddImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+          end;
+
+        irMapGet:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);
+            WriteMovImm64(FCode, X3, 0);
+            WriteMovImm64(FCode, X7, 0);
+            WriteAddImm(FCode, X4, X0, 16);
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0);
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0);
+            WriteLdrImm(FCode, X7, X4, 8);
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0);
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            FCode.PatchU32(branchPos3, ((doneLabelPos - branchPos3) div 4) shl 5 or $14000000);
+            WriteStrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapContains, irSetContains:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);
+            WriteMovImm64(FCode, X3, 0);
+            WriteMovImm64(FCode, X7, 0);
+            WriteAddImm(FCode, X4, X0, 16);
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0);
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0);
+            WriteMovImm64(FCode, X7, 1);
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0);
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            FCode.PatchU32(branchPos3, ((doneLabelPos - branchPos3) div 4) shl 5 or $14000000);
+            WriteStrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapLen, irSetLen:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X0, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapRemove, irSetRemove, irMapFree, irSetFree:
+          begin
+            // TODO: implement
           end;
         
         else
