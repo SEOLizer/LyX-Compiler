@@ -974,6 +974,11 @@ var
   // Comparison result
   cond: Byte;
   
+  // Map/Set loop variables
+  loopStartPos, loopEndPos: Integer;
+  branchPos1, branchPos2, branchPos3: Integer;
+  notFoundPos, doneLabelPos: Integer;
+  
   // For address calculation
   dataVA, codeVA, instrVA: UInt64;
   disp: Int32;
@@ -2290,6 +2295,167 @@ begin
             WriteScvtfD(FCode, V0, V0);
             WriteFmovD(FCode, X0, V0);
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // === Map/Set Operations (ARM64) ===
+        // Map structure: [len:8][cap:8][entries:16*cap], Entry: [key:8][value:8]
+        irMapNew, irSetNew:
+          begin
+            // Allocate 144 bytes using mmap syscall (222 on ARM64)
+            // x0=addr(0), x1=len(144), x2=prot(3), x3=flags(0x22), x4=fd(-1), x5=off(0)
+            WriteMovImm64(FCode, X0, 0);
+            WriteMovImm64(FCode, X1, 144);
+            WriteMovImm64(FCode, X2, 3);      // PROT_READ | PROT_WRITE
+            WriteMovImm64(FCode, X3, $22);    // MAP_ANONYMOUS | MAP_PRIVATE
+            WriteMovImm64(FCode, X4, High(UInt64)); // -1
+            WriteMovImm64(FCode, X5, 0);
+            WriteMovImm64(FCode, X8, 222);    // sys_mmap
+            WriteSvc(FCode, 0);
+            // Store pointer
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            // Initialize len=0, cap=8
+            WriteMovImm64(FCode, X1, 0);
+            WriteStrImm(FCode, X1, X0, 0);    // [x0] = 0 (len)
+            WriteMovImm64(FCode, X1, 8);
+            WriteStrImm(FCode, X1, X0, 8);    // [x0+8] = 8 (cap)
+          end;
+
+        irMapSet:
+          begin
+            // map_set: Linear search, update or append
+            // Load map, key, value into x0, x1, x2
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            // x3 = len = [x0]
+            WriteLdrImm(FCode, X3, X0, 0);
+            // x4 = 0 (counter)
+            WriteMovImm64(FCode, X4, 0);
+            // x5 = x0 + 16 (first entry)
+            WriteAddImm(FCode, X5, X0, 16);
+            // Loop: compare x4 with x3
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X4, X3);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge notFound (placeholder)
+            // x6 = [x5] (entry key)
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteCmpReg(FCode, X6, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next (placeholder)
+            // Found: [x5+8] = x2, jump done
+            WriteStrImm(FCode, X2, X5, 8);
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0); // b done (placeholder)
+            // next: x5 += 16, x4++
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X5, X5, 16);
+            WriteAddImm(FCode, X4, X4, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            // notFound: append at end
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            // x5 = x0 + 16 + x3*16
+            WriteLslImm(FCode, X6, X3, 4);
+            WriteAddReg(FCode, X5, X0, X6);
+            WriteAddImm(FCode, X5, X5, 16);
+            WriteStrImm(FCode, X1, X5, 0);   // key
+            WriteStrImm(FCode, X2, X5, 8);   // value
+            // len++
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteStrImm(FCode, X3, X0, 0);
+            // done
+            loopEndPos := FCode.Size;
+            FCode.PatchU32(branchPos3, ((loopEndPos - branchPos3) div 4) shl 5 or $14000000);
+          end;
+
+        irSetAdd:
+          begin
+            // Simple append (no duplicate check)
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);  // len
+            WriteLslImm(FCode, X3, X2, 4);
+            WriteAddReg(FCode, X3, X0, X3);
+            WriteAddImm(FCode, X3, X3, 16);
+            WriteStrImm(FCode, X1, X3, 0);
+            WriteAddImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+          end;
+
+        irMapGet:
+          begin
+            // Linear search for key
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);  // len
+            WriteMovImm64(FCode, X3, 0);    // counter
+            WriteMovImm64(FCode, X7, 0);    // result (default 0)
+            WriteAddImm(FCode, X4, X0, 16); // first entry
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge done
+            WriteLdrImm(FCode, X5, X4, 0);  // key
+            WriteCmpReg(FCode, X5, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            WriteLdrImm(FCode, X7, X4, 8);  // found: x7 = value
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0);          // b done
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            FCode.PatchU32(branchPos3, ((doneLabelPos - branchPos3) div 4) shl 5 or $14000000);
+            WriteStrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapContains, irSetContains:
+          begin
+            // Similar to MapGet but returns 0/1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X0, 0);
+            WriteMovImm64(FCode, X3, 0);
+            WriteMovImm64(FCode, X7, 0);  // result = false
+            WriteAddImm(FCode, X4, X0, 16);
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            branchPos1 := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0);
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            branchPos2 := FCode.Size;
+            WriteBranchCond(FCode, $01, 0);
+            WriteMovImm64(FCode, X7, 1);  // found
+            branchPos3 := FCode.Size;
+            WriteBranch(FCode, 0);
+            notFoundPos := FCode.Size;
+            FCode.PatchU32(branchPos2, ((notFoundPos - branchPos2) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+            doneLabelPos := FCode.Size;
+            FCode.PatchU32(branchPos1, ((doneLabelPos - branchPos1) div 4) shl 5 or $5400000A);
+            FCode.PatchU32(branchPos3, ((doneLabelPos - branchPos3) div 4) shl 5 or $14000000);
+            WriteStrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapLen, irSetLen:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X0, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irMapRemove, irSetRemove, irMapFree, irSetFree:
+          begin
+            // TODO: implement
           end;
         
       else
