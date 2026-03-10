@@ -152,66 +152,63 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
 
-### Map und Set (v0.5.0)
+### Map und Set (v0.5.0 ✅ ABGESCHLOSSEN)
 
-Maps und Sets sind heap-allokierte Hash-Datenstrukturen mit O(1) Zugriff.
+Maps und Sets sind heap-allokierte assoziative Datenstrukturen mit linearer Suche (O(n) Lookup).
 
-**Syntax:**
+**Grammatik:**
 ```
-MapType     := 'Map' '<' Type ',' Type '>' ;
-SetType     := 'Set' '<' Type '>' ;
-MapLiteral  := '{' [ MapEntry { ',' MapEntry } ] '}' ;
-SetLiteral  := '{' Expr { ',' Expr } '}' ;
-MapEntry    := Expr ':' Expr ;
+MapType       := 'Map' '<' Type ',' Type '>' ;
+SetType       := 'Set' '<' Type '>' ;
+MapLiteral    := '{' [ MapEntry { ',' MapEntry } ] '}' ;
+SetLiteral    := '{' Expr { ',' Expr } '}' ;
+MapEntry      := Expr ':' Expr ;
+InExpr        := Expr 'in' Expr ;
+MapIndexExpr  := Expr '[' Expr ']' ;
+MapIndexAssign := Expr '[' Expr ']' ':=' Expr ;
 ```
 
 **Map-Literal (Key-Value-Paare mit Doppelpunkt):**
 ```lyx
-let scores: Map<pchar, int64> := {"Alice": 95, "Bob": 82};
-let empty_map: Map<int64, bool> := {};
+var scores: Map<int64, int64> := {1: 100, 2: 200, 3: 300};
+var empty: Map<int64, int64> := {};
 ```
 
 **Set-Literal (Werte ohne Doppelpunkt):**
 ```lyx
-let unique_ids: Set<int64> := {1, 2, 3, 4};
-let empty_set: Set<pchar> := {};
+var ids: Set<int64> := {10, 20, 30};
 ```
 
-**Operationen:**
+**Implementierte Operationen:**
 
 | Operation | Syntax | Beschreibung |
 |-----------|--------|--------------|
-| Insert/Update | `map[key] := value` | Setzt oder überschreibt |
-| Get | `map[key]` | Gibt Wert zurück (panic bei fehlendem Key) |
-| GetOrDefault | `map.get(key, default)` | Sicherer Zugriff |
+| Insert/Update | `map[key] := value` | Setzt oder überschreibt Key |
+| Get | `map[key]` | Gibt Value zurück |
 | Contains | `key in map` | Prüft Existenz (bool) |
-| Remove | `map.remove(key)` | Löscht Eintrag |
-| Size | `map.len()` | Anzahl Einträge |
-| Keys | `map.keys()` | Iterator über Keys |
-| Values | `map.values()` | Iterator über Values |
+| Size | `len(map)` | Anzahl Einträge |
+| Set Add | via Literal | Erstellt Set mit Werten |
+| Set Contains | `value in set` | Prüft Mitgliedschaft (bool) |
 
-**Iteration:**
-```lyx
-// Über Key-Value-Paare
-for key, value in scores {
-    PrintStr(key);
-    PrintInt(value);
-}
+**Erlaubte Key/Element-Typen:** `int64`, `bool` (aktuell)
+**Value-Typen (Map):** `int64` (aktuell)
 
-// Nur Keys
-for name in scores.keys() {
-    PrintStr(name);
-}
-```
+**Speichermodell:**
+- Heap-allokiert via `mmap` syscall
+- Layout: `[len:8 bytes][cap:8 bytes][entries:16*cap bytes]`
+- Entry-Format: `[key:8 bytes][value:8 bytes]`
+- Lineare Suche O(n) — geeignet für kleine Sammlungen (< 100 Einträge)
+- Initiale Kapazität: 8 Entries
 
-**Erlaubte Key-Typen:** `int64`, `pchar`, `bool` (immutable Typen)
-**Value-Typen:** Alle Typen erlaubt
+**IR-Opcodes:**
+- `irMapNew`, `irMapSet`, `irMapGet`, `irMapContains`, `irMapLen`
+- `irSetNew`, `irSetAdd`, `irSetContains`, `irSetLen`
 
-**Implementierung:**
-- Open Addressing mit Linear Probing
-- FNV-1a Hash-Algorithmus
-- Automatisches Resize bei Load-Factor > 0.75
-- Initiale Kapazität: 8 Buckets
+**Nicht implementiert (geplant):**
+- `remove()` — Löschen von Einträgen
+- `keys()` / `values()` — Iteratoren
+- `for key, value in map` — Iteration
+- Hash-basierter O(1) Lookup mit FNV-1a
 
 ### Regex-Literale (v0.4.2 ✅ ABGESCHLOSSEN)
 

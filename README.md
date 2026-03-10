@@ -27,6 +27,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
 ✅ Dynamic Arrays: push/pop/len/free
 ✅ QBool: Probabilistic Boolean Type for quantum-like computing
+✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
 ```
 
 ---
@@ -360,6 +361,8 @@ fn main(): int64 {
 | `parallel Array<T>` | SIMD-optimized array (Heap, element-wise operations) |
 | `struct`  | User-defined record type             |
 | `QBool`   | Probabilistic boolean (0.0 to 1.0 probability) |
+| `Map<K,V>` | Associative array (key-value pairs) |
+| `Set<T>`  | Unordered collection of unique values |
 
 Note: `int` and `string` are currently alias types (shortcuts) — `int` is internally treated as `int64`, `string` is mapped to `pchar`. No implicit casts — all types must match explicitly.
 
@@ -487,6 +490,67 @@ fn main(): int64 {
 **Advanced:**
 - `EntangledPair` - Correlated QBool pairs (observing one affects the other)
 - AI examples: Weather prediction, Medical diagnosis, Game AI decisions
+
+### Associative Arrays (Maps and Sets)
+
+Lyx supports associative data structures for key-value storage and unique collections. Both are heap-allocated and use linear search (O(n) lookup).
+
+#### Maps
+
+Maps store key-value pairs with unique keys:
+
+```lyx
+fn main(): int64 {
+  // Map literal with key:value pairs
+  var scores: Map<int64, int64> := {1: 100, 2: 200, 3: 300};
+  
+  // Index access (get value by key)
+  var score: int64 := scores[1];   // 100
+  PrintInt(score);
+  PrintStr("\n");
+  
+  // Index assignment (insert or update)
+  scores[4] := 400;                // Insert new key
+  scores[1] := 150;                // Update existing key
+  
+  // Check if key exists
+  if (1 in scores) {
+    PrintStr("Key 1 exists\n");
+  }
+  
+  // Get length
+  PrintInt(len(scores));           // 4
+  
+  return 0;
+}
+```
+
+#### Sets
+
+Sets store unique values without duplicates:
+
+```lyx
+fn main(): int64 {
+  // Set literal with values
+  var ids: Set<int64> := {10, 20, 30};
+  
+  // Check membership
+  if (20 in ids) {
+    PrintStr("20 is in the set\n");
+  }
+  
+  // Get length
+  PrintInt(len(ids));              // 3
+  
+  return 0;
+}
+```
+
+**Implementation details:**
+- **Storage**: Heap-allocated with format `[len:8][cap:8][entries:16*cap]`
+- **Lookup**: Linear search O(n) — suitable for small collections
+- **Key types**: `int64`, `bool` (currently)
+- **Supported operations**: Literal creation, index get/set (Map), `in` operator, `len()`
 
 ### Structs (Records)
 
