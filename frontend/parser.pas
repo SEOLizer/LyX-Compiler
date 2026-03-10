@@ -1791,41 +1791,35 @@ var
   innerTypeName: string;
   innerNullable: Boolean;
   innerArrayLen: Integer;
+  innerType, keyType, valueType, elementType: TAurumType;
 begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
 
-  // Check for array type syntax: Type[N] or []Type or Array<T>
+  // Check for array type syntax: Type[N] or []Type or Array<T> or Map<K,V> or Set<T>
   // First parse the base type
-  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) then
+  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) or Check(tkMap) or Check(tkSet) then
   begin
     // Handle 'parallel Array<T>' first
     if Check(tkParallel) then
     begin
       Advance; // consume 'parallel'
       Expect(tkArray);
-      // Now we have 'parallel' - check for generic syntax Array<T>
+      // Now we have 'parallel Array' - check for generic syntax Array<T>
       if Accept(tkLt) then
       begin
-        // Generic array: Array<T>
-        // Parse element type
-        if Check(tkIdent) then
-        begin
-          s := FCurTok.Value;
-          Advance;
-          Result := StrToAurumType(s);
-          if Result = atUnresolved then
-            typeName := s;
-        end
-        else
+        // Generic array: parallel Array<T>
+        innerType := ParseType; // Recursively parse inner type
+        if innerType = atUnresolved then
         begin
           FDiag.Error('expected element type in Array<T>', FCurTok.Span);
           Result := atVoid;
         end;
-        Expect(tkGt); // '>'
+        Expect(tkGt);
         // Mark as parallel array
         arrayLen := -2;
+        Result := atDynArray;
         Exit;
       end
       else
@@ -1837,6 +1831,49 @@ begin
       end;
     end;
 
+    // Handle Map<K,V> generic syntax
+    if Accept(tkMap) then
+    begin
+      Expect(tkLt);
+      // Parse Key Type
+      keyType := ParseType;
+      if keyType = atUnresolved then
+      begin
+        FDiag.Error('expected key type in Map<K,V>', FCurTok.Span);
+        Result := atVoid;
+        Exit;
+      end;
+      Expect(tkComma);
+      // Parse Value Type
+      valueType := ParseType;
+      if valueType = atUnresolved then
+      begin
+        FDiag.Error('expected value type in Map<K,V>', FCurTok.Span);
+        Result := atVoid;
+        Exit;
+      end;
+      Expect(tkGt);
+      Result := atMap;
+      Exit;
+    end;
+
+    // Handle Set<T> generic syntax
+    if Accept(tkSet) then
+    begin
+      Expect(tkLt);
+      // Parse Element Type
+      elementType := ParseType;
+      if elementType = atUnresolved then
+      begin
+        FDiag.Error('expected element type in Set<T>', FCurTok.Span);
+        Result := atVoid;
+        Exit;
+      end;
+      Expect(tkGt);
+      Result := atSet;
+      Exit;
+    end;
+
     // Handle 'Array<T>' generic syntax
     if Accept(tkArray) then
     begin
@@ -1844,33 +1881,28 @@ begin
       if Accept(tkLt) then
       begin
         // Generic array: Array<T>
-        s := 'array'; // Mark as array type
-        // Parse element type
-        if Check(tkIdent) then
-        begin
-          innerTypeName := FCurTok.Value;
-          Advance;
-          // Store the element type name for later resolution
-          typeName := 'Array<' + innerTypeName + '>';
-        end
-        else
+        innerType := ParseType; // Recursively parse inner type
+        if innerType = atUnresolved then
         begin
           FDiag.Error('expected element type in Array<T>', FCurTok.Span);
+          Result := atVoid;
+          Exit;
         end;
-        Expect(tkGt); // '>'
+        Expect(tkGt);
         // Mark as generic array (-3 indicates generic array)
         arrayLen := -3;
         Result := atDynArray;
         Exit;
       end;
-      
+
       // Old syntax: 'array' keyword for dynamic array
       s := 'array';
-      arrayLen := -1; // Dynamic array by default for 'array' keyword
-      Result := atDynArray; // Return atDynArray for dynamic array type
+      arrayLen := -1;
+      Result := atDynArray;
     end
     else
     begin
+      // Regular identifier type (int64, bool, struct name, etc.)
       s := FCurTok.Value;
       Advance;
       Result := StrToAurumType(s);
@@ -1987,9 +2019,8 @@ begin
     params[High(params)] := p;
     if Accept(tkComma) then Continue else Break;
   end;
-    Result := params;
-  end;
-end.
+  Result := params;
+end;
 
 { Parst @energy(level) Attribut, falls vorhanden }
 function TParser.ParseEnergyAttr: TEnergyLevel;
@@ -2033,3 +2064,5 @@ begin
   end;
   Expect(tkRParen);
 end;
+
+end.
