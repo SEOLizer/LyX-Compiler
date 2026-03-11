@@ -114,9 +114,12 @@ type
     // Cast-specific fields
     CastFromType: TAurumType;  // source type for cast operations
     CastToType: TAurumType;    // target type for cast operations
-    // Call-specific fields
+      // Call-specific fields
     CallMode: TIRCallMode;   // mode for irCall/irVarCall
     ArgTemps: array of Integer; // argument temp indices for calls (replaces CSV in LabelName)
+    // Virtual call fields
+    VMTIndex: Integer;        // index in VMT table for virtual calls
+    IsVirtualCall: Boolean;   // true if this is a virtual method call
     // Struct return fields (for irReturnStruct)
     StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
     StructAlign: Integer;  // alignment of struct
@@ -157,6 +160,8 @@ type
     Functions: array of TIRFunction;
     Strings: TStringList; // deduplicated strings
     GlobalVars: TGlobalVarArray; // global variables with init values
+    // VMT: class declarations for VMT table emission
+    ClassDecls: array of TAstClassDecl; // stored class declarations
     constructor Create;
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
@@ -164,6 +169,7 @@ type
     function InternString(const s: string): Integer;
     function AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
     function AddGlobalArray(const name: string; const values: array of Int64): Integer;
+    procedure AddClassDecl(cd: TAstClassDecl);
   end;
 
 { Berechnet die geschätzten Energiekosten für einen IR-OpCode }
@@ -220,6 +226,8 @@ begin
       Functions[i].Free;
   SetLength(Functions, 0);
   Strings.Free;
+  // ClassDecls array - don't free, they belong to AST
+  SetLength(ClassDecls, 0);
   inherited Destroy;
 end;
 
@@ -287,6 +295,12 @@ begin
     GlobalVars[Result].InitValues[i] := values[i];
   // scalar InitValue unused
   GlobalVars[Result].InitValue := 0;
+end;
+
+procedure TIRModule.AddClassDecl(cd: TAstClassDecl);
+begin
+  SetLength(ClassDecls, Length(ClassDecls) + 1);
+  ClassDecls[High(ClassDecls)] := cd;
 end;
 
 { Berechnet die geschätzten Energiekosten für einen IR-OpCode }
