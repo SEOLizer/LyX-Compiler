@@ -19,7 +19,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Integrated Linter with 10 Rules (v0.4.3)
 ✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
 ✅ Robust Parser with While/If/For/Switch/Function Support
-✅ OOP: Classes, Inheritance, Constructors, Destructors
+✅ OOP: Classes, Inheritance, Virtual Methods (VMT), Override
 ✅ Global Variables with Initialization
 ✅ Random/RandomSeed Builtins
 ✅ CLI Arguments (argc/argv) in Static ELF
@@ -764,7 +764,7 @@ type Point = struct {
 
 ### Classes (OOP) with Inheritance
 
-Lyx supports OOP with classes, inheritance, constructors, and destructors:
+Lyx supports OOP with classes, inheritance, constructors, destructors, and **Virtual Method Tables (VMT)** for polymorphism:
 
 ```lyx
 type Animal = class {
@@ -800,12 +800,60 @@ fn main(): int64 {
 }
 ```
 
+#### Virtual Methods and VMT (Polymorphism)
+
+Use `virtual` to declare methods that can be overridden, and `override` to override base class methods:
+
+```lyx
+type TBase = class {
+  val: int64;
+  
+  // Virtual method - can be overridden by derived classes
+  virtual fn GetValue(): int64 {
+    return self.val;
+  }
+};
+
+type TDerived = class extends TBase {
+  extra: int64;
+  
+  // Override the virtual method from base class
+  override fn GetValue(): int64 {
+    return self.val + self.extra;
+  }
+};
+
+fn main(): int64 {
+  var base: TBase := new TBase();
+  base.val := 10;
+  
+  var derived: TDerived := new TDerived();
+  derived.val := 20;
+  derived.extra := 30;
+  
+  // Polymorphic call via VMT
+  PrintStr("Base.GetValue(): ");
+  PrintInt(base.GetValue());    // Calls TBase.GetValue() -> 10
+  PrintStr("\n");
+  
+  PrintStr("Derived.GetValue(): ");
+  PrintInt(derived.GetValue()); // Calls TDerived.GetValue() -> 50
+  PrintStr("\n");
+  
+  dispose base;
+  dispose derived;
+  return 0;
+}
+```
+
 **Class features:**
 - `class extends BaseClass` for inheritance
 - `new ClassName()` for heap allocation
 - `new ClassName(args)` calls constructor `Create`
 - `dispose expr` calls `Destroy()` and frees memory
 - `super.method()` for calling base class methods
+- `virtual fn` declares a virtual method with VMT entry
+- `override fn` overrides a virtual method from base class
 - Heap-allocated (vs. stack-allocated structs)
 
 ### Operators
@@ -1367,7 +1415,7 @@ fn main(): int64 {
 ### Reserved Keywords
 
 ```
-fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super
+fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super  virtual  override
 ```
 
 - `extern` is used for external function declarations
@@ -1379,6 +1427,8 @@ fn  var  let  co  con  if  else  while  switch  case  break  default  return  tr
 - `dispose` for explicit memory deallocation
 - `super` for calling base class methods
 - `static` marks static methods (without `self` parameter)
+- `virtual` declares a method as virtual with VMT entry
+- `override` overrides a virtual method from base class
 - `self` references the current instance in methods
 - `Self` as return type in methods (resolves to struct type)
 
