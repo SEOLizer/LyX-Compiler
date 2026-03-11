@@ -641,6 +641,10 @@ type
     FVisibility: TVisibility; // for class members (default: visPublic)
     FEnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
     FLibraryName: string; // for external functions - library name to link against
+    // VMT fields
+    FIsVirtual: Boolean;
+    FIsOverride: Boolean;
+    FVirtualTableIndex: Integer;
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -657,6 +661,10 @@ type
     property Visibility: TVisibility read FVisibility write FVisibility;
     property EnergyLevel: TEnergyLevel read FEnergyLevel write FEnergyLevel;
     property LibraryName: string read FLibraryName write FLibraryName;
+    // VMT properties
+    property IsVirtual: Boolean read FIsVirtual write FIsVirtual;
+    property IsOverride: Boolean read FIsOverride write FIsOverride;
+    property VirtualTableIndex: Integer read FVirtualTableIndex write FVirtualTableIndex;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -720,8 +728,8 @@ type
     property Fields: TStructFieldList read FFields;
     property Methods: TMethodList read FMethods;
     property IsPublic: Boolean read FIsPublic;
-    property FieldOffsets: TIntArray read FFieldOffsets;
-    property Size: Integer read FSize;
+    property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
+    property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
     procedure SetLayout(aSize, aAlign: Integer);
   end;
@@ -733,6 +741,9 @@ type
     FBaseClassName: string; // nil/empty if no base class
     FFields: TStructFieldList;
     FMethods: TMethodList;
+    // VMT fields
+    FVirtualMethods: TMethodList;  // Nur virtuelle Methoden
+    FVMTName: string;               // "_vmt_ClassName"
     FIsPublic: Boolean;
     // layout info (computed by sema)
     FFieldOffsets: array of Integer;
@@ -748,12 +759,16 @@ type
     property BaseClassName: string read FBaseClassName;
     property Fields: TStructFieldList read FFields;
     property Methods: TMethodList read FMethods;
+    // VMT properties
+    property VirtualMethods: TMethodList read FVirtualMethods write FVirtualMethods;
+    property VMTName: string read FVMTName write FVMTName;
     property IsPublic: Boolean read FIsPublic;
-    property FieldOffsets: TIntArray read FFieldOffsets;
-    property Size: Integer read FSize;
+    property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
+    property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
     property BaseSize: Integer read FBaseSize;
     procedure SetLayout(aSize, aAlign, aBaseSize: Integer);
+    procedure AddVirtualMethod(method: TAstFuncDecl);
   end;
 
   { new Ausdruck: new ClassName() oder new ClassName(args) }
@@ -1836,6 +1851,9 @@ begin
   SetLength(FMethods, Length(aMethods));
   for i := 0 to High(aMethods) do
     FMethods[i] := aMethods[i];
+  // VMT fields initialization
+  SetLength(FVirtualMethods, 0);
+  FVMTName := '_vmt_' + aName;
   FIsPublic := aPublic;
   FSize := 0;
   FAlign := 0;
@@ -1862,6 +1880,12 @@ begin
   FSize := aSize;
   FAlign := aAlign;
   FBaseSize := aBaseSize;
+end;
+
+procedure TAstClassDecl.AddVirtualMethod(method: TAstFuncDecl);
+begin
+  SetLength(FVirtualMethods, Length(FVirtualMethods) + 1);
+  FVirtualMethods[High(FVirtualMethods)] := method;
 end;
 
 { TAstNewExpr }
@@ -2035,6 +2059,10 @@ begin
   FIsStatic := False;
   FVisibility := visPublic; // default: public
   FEnergyLevel := eelNone; // eelNone = use global level from --target-energy
+  // VMT fields initialization
+  FIsVirtual := False;
+  FIsOverride := False;
+  FVirtualTableIndex := -1;
 end;
 
 destructor TAstFuncDecl.Destroy;

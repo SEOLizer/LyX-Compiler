@@ -299,6 +299,8 @@ begin
       // Classes are stored in both maps - they have the same field layout logic
       FStructTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
       FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+      // Also store in IR module for VMT emission
+      FModule.AddClassDecl(TAstClassDecl(node));
     end
     else if node is TAstVarDecl then
     begin
@@ -748,6 +750,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     containerType: TAurumType;
     // Call handling
     call: TAstCall;
+    // Virtual call handling
+    classIdx: Integer;
+    cd: TAstClassDecl;
+    methodIdx: Integer;
+    vmtClassName: string;
+    vmtMethodName: string;
+    posIdx: Integer;
+    hasVMT: Boolean;
     // Null-Coalesce Phase 2
     zeroSlot: Integer;
     resultSlot: Integer;
@@ -1551,6 +1561,43 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Dest := t0;
           instr.ImmStr := call.Name;
           instr.ImmInt := argCount; // Backend needs argCount in ImmInt
+          instr.IsVirtualCall := False;
+          instr.VMTIndex := -1;
+          
+          // Check if this is a method call (mangled name starts with _L_)
+          if (Length(call.Name) > 3) and (Copy(call.Name, 1, 3) = '_L_') then
+          begin
+            // Extract class name and method name from mangled name
+            // Format: _L_ClassName_methodName
+            posIdx := Pos('_', Copy(call.Name, 4, MaxInt));
+            if posIdx > 0 then
+            begin
+              vmtClassName := Copy(call.Name, 4, posIdx - 1);
+              vmtMethodName := Copy(call.Name, 4 + posIdx, MaxInt);
+              
+              // Look up class in FClassTypes
+              classIdx := FClassTypes.IndexOf(vmtClassName);
+              if classIdx >= 0 then
+              begin
+                cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
+                // Find method in class
+                for methodIdx := 0 to High(cd.Methods) do
+                begin
+                  if cd.Methods[methodIdx].Name = vmtMethodName then
+                  begin
+                    if cd.Methods[methodIdx].IsVirtual then
+                    begin
+                      // This is a virtual call
+                      instr.IsVirtualCall := True;
+                      instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                    end;
+                    Break;
+                  end;
+                end;
+              end;
+            end;
+          end;
+          
           // Determine call mode based on function origin
           if FExternFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmExternal
@@ -2017,18 +2064,59 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Exit;
         end;
         
+        // Check if it's a class with virtual methods
+        hasVMT := False;
+        if FStructTypes.Objects[i] is TAstClassDecl then
+        begin
+          cd := TAstClassDecl(FStructTypes.Objects[i]);
+          if Length(cd.VirtualMethods) > 0 then
+            hasVMT := True;
+        end;
+        
         // Allocate temp for pointer, emit irAlloc with size
         t0 := NewTemp;
         instr.Op := irAlloc;
         instr.Dest := t0;
         // Check if it's a class or struct - they have different layouts
         if FStructTypes.Objects[i] is TAstClassDecl then
-          instr.ImmInt := TAstClassDecl(FStructTypes.Objects[i]).Size
+        begin
+          // Classes: Size already includes VMT pointer (added by ResolveVMTForClasses)
+          instr.ImmInt := TAstClassDecl(FStructTypes.Objects[i]).Size;
+        end
         else
           instr.ImmInt := TAstStructDecl(FStructTypes.Objects[i]).Size;
         if instr.ImmInt = 0 then
           instr.ImmInt := 8; // minimum allocation
         Emit(instr);
+        
+        // Initialize VMT pointer if class has virtual methods
+        if hasVMT then
+        begin
+          // VMT pointer goes at offset 0 of the object
+          // We need to store the VMT address into the allocated memory
+          // This will be handled by the backend which knows the VMT data position
+          // For now, emit a placeholder that will be patched
+          // Actually, we can emit this directly: load VMT address from data section
+          
+          // Emit: mov rax, [rel _vmt_ClassName]  (load VMT address)
+          // Then:  mov [t0], rax                   (store VMT pointer to object)
+          
+          // Load VMT address into temporary
+          t1 := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irLoadGlobalAddr;  // Use this to get the VMT address
+          instr.Dest := t1;
+          instr.ImmStr := '_vmt_' + TAstNewExpr(expr).ClassName;
+          Emit(instr);
+          
+          // Store VMT pointer to object at offset 0
+          instr := Default(TIRInstr);
+          instr.Op := irStoreFieldHeap;
+          instr.Src1 := t0;  // object pointer
+          instr.Src2 := t1;  // VMT address
+          instr.ImmInt := 0; // offset 0
+          Emit(instr);
+        end;
         
         // If new has arguments, call the Create constructor
         if Length(TAstNewExpr(expr).Args) > 0 then

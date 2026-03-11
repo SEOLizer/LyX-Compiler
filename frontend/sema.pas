@@ -65,6 +65,8 @@ type
     procedure ComputeStructLayouts;
     // Class layout
     procedure ComputeClassLayouts;
+    // VMT (Virtual Method Table)
+    procedure ResolveVMTForClasses;
     // Member access control
     procedure CheckMemberAccess(const memberName: string; memberClass: TAstClassDecl; visibility: TVisibility; span: TSourceSpan);
     // AST rewrite helpers
@@ -2026,11 +2028,35 @@ begin
         end
         else
         begin
-          // Handle namespace-qualified calls (e.g., IO.PrintStr)
+          // Handle namespace-qualified calls (e.g., IO.PrintStr) or method calls (e.g., obj.Method)
           if call.Namespace <> '' then
           begin
-            // Qualified call: namespace.function
-            s := ResolveQualifiedName(call.Namespace, call.Name, call.Span);
+            // Check if namespace is actually a variable (method call case)
+            sSym := ResolveSymbol(call.Namespace);
+            if Assigned(sSym) and (sSym.Kind in [symVar, symLet, symCon]) then
+            begin
+              // This is a method call: namespace is a variable, rewrite to _METHOD_ call
+              mName := call.Name;
+              // Create receiver expression
+              recv := TAstIdent.Create(call.Namespace, call.Span);
+              // Prepend receiver to args
+              SetLength(args, Length(call.Args) + 1);
+              args[0] := recv;
+              for i := 0 to High(call.Args) do
+                args[i + 1] := call.Args[i];
+              // Rewrite call
+              call.SetName('_METHOD_' + mName);
+              call.Namespace := '';  // Clear namespace
+              call.ReplaceArgs(args);
+              // Now process as _METHOD_ call - recursive call
+              Result := CheckExpr(call);
+              Exit;
+            end
+            else
+            begin
+              // Qualified call: namespace.function
+              s := ResolveQualifiedName(call.Namespace, call.Name, call.Span);
+            end;
           end
           else
           begin
@@ -3035,6 +3061,158 @@ begin
   end;
 end;
 
+{ ResolveVMTForClasses - Build Virtual Method Tables for all classes }
+procedure TSema.ResolveVMTForClasses;
+var
+  i, j, idx, vmtIdx: Integer;
+  cd, baseCd: TAstClassDecl;
+  method, baseMethod: TAstFuncDecl;
+begin
+  if not Assigned(FClassTypes) then Exit;
+
+  // Process each class
+  for i := 0 to FClassTypes.Count - 1 do
+  begin
+    cd := TAstClassDecl(FClassTypes.Objects[i]);
+
+    // Validate virtual/override usage
+    for j := 0 to High(cd.Methods) do
+    begin
+      method := cd.Methods[j];
+
+      // Rule: static + virtual is not allowed
+      if method.IsStatic and method.IsVirtual then
+      begin
+        FDiag.Error('static method cannot be virtual: ' + method.Name, method.Span);
+        Continue;
+      end;
+
+      // Rule: override without base class is an error
+      if method.IsOverride and (cd.BaseClassName = '') then
+      begin
+        FDiag.Error('override requires a base class: ' + method.Name, method.Span);
+        Continue;
+      end;
+
+      // If override, check signature matches base class method
+      if method.IsOverride and (cd.BaseClassName <> '') then
+      begin
+        idx := FClassTypes.IndexOf(cd.BaseClassName);
+        if idx >= 0 then
+        begin
+          baseCd := TAstClassDecl(FClassTypes.Objects[idx]);
+          baseMethod := nil;
+          // Find matching method in base class
+          for vmtIdx := 0 to High(baseCd.Methods) do
+          begin
+            if baseCd.Methods[vmtIdx].Name = method.Name then
+            begin
+              baseMethod := baseCd.Methods[vmtIdx];
+              Break;
+            end;
+          end;
+
+          if Assigned(baseMethod) then
+          begin
+            // Check parameter count
+            if Length(method.Params) <> Length(baseMethod.Params) then
+            begin
+              FDiag.Error('override method has wrong parameter count: ' + method.Name, method.Span);
+              Continue;
+            end;
+
+            // Check return type
+            if method.ReturnType <> baseMethod.ReturnType then
+            begin
+              FDiag.Error('override method has wrong return type: ' + method.Name, method.Span);
+              Continue;
+            end;
+          end
+          else
+          begin
+            FDiag.Error('override method not found in base class: ' + method.Name, method.Span);
+          end;
+        end;
+      end;
+    end;
+
+    // Build VMT: collect virtual methods
+    cd.VirtualMethods := nil;  // Reset using property
+
+    // If there's a base class, inherit its VMT first
+    if cd.BaseClassName <> '' then
+    begin
+      idx := FClassTypes.IndexOf(cd.BaseClassName);
+      if idx >= 0 then
+      begin
+        baseCd := TAstClassDecl(FClassTypes.Objects[idx]);
+        // Copy base VMT (inherited methods keep their indices)
+        for vmtIdx := 0 to High(baseCd.VirtualMethods) do
+        begin
+          baseMethod := baseCd.VirtualMethods[vmtIdx];
+          // Look for override in derived class
+          method := nil;
+          for j := 0 to High(cd.Methods) do
+          begin
+            if cd.Methods[j].Name = baseMethod.Name then
+            begin
+              method := cd.Methods[j];
+              Break;
+            end;
+          end;
+
+          if Assigned(method) and method.IsOverride then
+          begin
+            // Override: use derived class method, keep same VMT index
+            method.VirtualTableIndex := vmtIdx;
+            // Ensure VMT array is large enough
+            while Length(cd.VirtualMethods) <= vmtIdx do
+              cd.AddVirtualMethod(nil);
+            cd.VirtualMethods[vmtIdx] := method;
+          end
+          else
+          begin
+            // No override: inherit base method
+            while Length(cd.VirtualMethods) <= vmtIdx do
+              cd.AddVirtualMethod(nil);
+            cd.VirtualMethods[vmtIdx] := baseMethod;
+          end;
+        end;
+      end;
+    end;
+
+    // Add new virtual methods from this class
+    for j := 0 to High(cd.Methods) do
+    begin
+      method := cd.Methods[j];
+
+      // Only add if virtual (or override) and not already in VMT
+      if method.IsVirtual and (method.VirtualTableIndex < 0) then
+      begin
+        vmtIdx := Length(cd.VirtualMethods);
+        method.VirtualTableIndex := vmtIdx;
+        cd.AddVirtualMethod(method);
+      end;
+    end;
+
+    // Add VMT pointer to class size (8 bytes at offset 0)
+    // The VMT pointer is stored at offset 0 of every instance
+    // So we need to add 8 bytes to the class size and adjust field offsets
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Add 8 bytes for VMT pointer
+      cd.Size := cd.Size + 8;
+
+      // Adjust all field offsets by 8 (VMT pointer at offset 0)
+      for j := 0 to High(cd.FieldOffsets) do
+      begin
+        if cd.FieldOffsets[j] >= 0 then
+          Inc(cd.FieldOffsets[j], 8);
+      end;
+    end;
+  end;
+end;
+
 procedure TSema.ImportUnit(imp: TAstImportDecl);
 { Importiert eine Unit und registriert ihre Symbole }
 var
@@ -3798,6 +3976,7 @@ begin
   // After registration pass, compute struct layouts before checking bodies
   ComputeStructLayouts;
   ComputeClassLayouts;
+  ResolveVMTForClasses;
 
   // Second pass: check function bodies
   for i := 0 to High(prog.Decls) do

@@ -365,6 +365,7 @@ var
   dummy: Integer;
   isStatic: Boolean;
   isVirtual: Boolean;
+  isOverride: Boolean;
   baseClassName: string;
   curVisibility: TVisibility;
   constraintExpr: TAstExpr;
@@ -406,8 +407,9 @@ begin
         FDiag.Error('expected base class name after ''extends''', FCurTok.Span);
     end
     else
-      // Auto-Inheritance: Wenn keine Basisklasse angegeben ist, ist TObject die Basis
-      baseClassName := 'TObject';
+      // No inheritance: classes do not automatically inherit from TObject
+      // This was previously set to 'TObject' but that class doesn't exist in Lyx
+      baseClassName := '';
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
@@ -415,15 +417,17 @@ begin
     begin
       // parse optional visibility modifier
       curVisibility := ParseVisibility;
-      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) then
+      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) or Check(tkOverride) then
       begin
         // parse method declaration
+        // Modifier order: [static] [virtual|override] fn name(...)
         isStatic := Accept(tkStatic);
         isVirtual := Accept(tkVirtual);
-        // After static/virtual, we expect fn
+        isOverride := Accept(tkOverride);
+        // After modifiers, we expect fn
         if not Check(tkFn) then
         begin
-          FDiag.Error('expected ''fn'' keyword', FCurTok.Span);
+          FDiag.Error('expected ''fn'' keyword after modifiers', FCurTok.Span);
         end;
         Expect(tkFn);
         if Check(tkIdent) then
@@ -451,6 +455,8 @@ begin
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
+        m.IsVirtual := isVirtual;
+        m.IsOverride := isOverride;
         m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
