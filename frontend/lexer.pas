@@ -31,7 +31,7 @@ type
     // Map/Set Keywords
     tkMap, tkSet, tkIn,
     // OOP Additional Keywords
-    tkVirtual, tkOverride,
+    tkVirtual, tkOverride, tkAbstract, tkIs,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -163,6 +163,7 @@ begin
     tkIn:         Result := 'in';
     tkVirtual:    Result := 'virtual';
     tkOverride:   Result := 'override';
+    tkAbstract:   Result := 'abstract';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -722,6 +723,8 @@ begin
     // OOP Additional Keywords
     'virtual':    Result := tkVirtual;
     'override':   Result := tkOverride;
+    'abstract':   Result := tkAbstract;
+    'is':         Result := tkIs;
   else
     Result := tkIdent;
   end;

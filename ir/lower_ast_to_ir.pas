@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager;
+  ast, ir, diag, lexer, unit_manager, tobject;
 
 type
   TConstValue = class
@@ -69,12 +69,12 @@ implementation
 
 { Helpers }
 
-function IntToObj(i: Integer): TObject;
+function IntToObj(i: Integer): System.TObject;
 begin
-  Result := TObject(Pointer(i));
+  Result := System.TObject(Pointer(i));
 end;
 
-function ObjToInt(o: TObject): Integer;
+function ObjToInt(o: System.TObject): Integer;
 begin
   Result := Integer(Pointer(o));
 end;
@@ -123,7 +123,7 @@ var
 begin
   FLocalMap.Free;
   for i := 0 to FConstMap.Count - 1 do
-    TObject(FConstMap.Objects[i]).Free;
+    System.TObject(FConstMap.Objects[i]).Free;
   FConstMap.Free;
   for i := 0 to Length(FLocalConst)-1 do
     if Assigned(FLocalConst[i]) then FLocalConst[i].Free;
@@ -293,12 +293,12 @@ begin
   begin
     node := prog.Decls[i];
     if node is TAstStructDecl then
-      FStructTypes.AddObject(TAstStructDecl(node).Name, TObject(node))
+      FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node))
     else if node is TAstClassDecl then
     begin
       // Classes are stored in both maps - they have the same field layout logic
-      FStructTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
-      FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+      FStructTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+      FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
       // Also store in IR module for VMT emission
       FModule.AddClassDecl(TAstClassDecl(node));
     end
@@ -307,7 +307,7 @@ begin
       // Global variable declaration
       if TAstVarDecl(node).IsGlobal then
       begin
-        FGlobalVars.AddObject(TAstVarDecl(node).Name, TObject(node));
+        FGlobalVars.AddObject(TAstVarDecl(node).Name, System.TObject(node));
         // Register in module with init value
         if TAstVarDecl(node).InitExpr is TAstIntLit then
         begin
@@ -341,6 +341,17 @@ begin
           FModule.AddGlobalVar(TAstVarDecl(node).Name, 0, False);
       end;
     end;
+  end;
+  
+  // Add TObject to class types if not already present
+  // TObject is the implicit base class for all classes without explicit base
+  if FClassTypes.IndexOf(TOBJECT_CLASSNAME) < 0 then
+  begin
+    // Create TObject class declaration and add to module
+    node := CreateTObjectClassDecl;
+    FStructTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FModule.AddClassDecl(TAstClassDecl(node));
   end;
 
   // iterate top-level decls, create functions
@@ -604,7 +615,7 @@ begin
         cv.Free;
         Continue;
       end;
-      FConstMap.AddObject(TAstConDecl(node).Name, TObject(cv));
+      FConstMap.AddObject(TAstConDecl(node).Name, System.TObject(cv));
     end;
   end;
   Result := FModule;
@@ -746,6 +757,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     signedVal: Int64;
     cvLocal: TConstValue;
     vd: TAstVarDecl;
+    castTypeName: string;
     items: TAstExprList;
     elemSize: Integer;
     fa: TAstFieldAssign;
@@ -1839,11 +1851,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         // Get source and target types
         ltype := TAstCast(expr).Expr.ResolvedType;
         rType := TAstCast(expr).CastType;
+        castTypeName := TAstCast(expr).CastTypeName;
 
         t0 := NewTemp;
 
+        // Check for class cast (target is a class name)
+        if (castTypeName <> '') and (FClassTypes.IndexOf(castTypeName) >= 0) then
+        begin
+          // Class cast: emit is-type check first
+          // If false, we should panic or return null
+          // For now, we just emit a simple copy (the check is done at runtime via is)
+          
+          // TODO: Add runtime check for class cast
+          // For now, just copy the pointer
+          instr.Op := irLoadLocal;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end
         // Check for int -> float conversion
-        if (ltype = atInt64) and (rType = atF64) then
+        else if (ltype = atInt64) and (rType = atF64) then
         begin
           instr.Op := irIToF;
           instr.Dest := t0;
@@ -2062,6 +2089,33 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Exit;
         end;
 
+        Emit(instr);
+        Result := t0;
+      end;
+
+    nkIsExpr:
+      begin
+        // Is expression: expr is ClassName
+        // Returns true if expr is an instance of ClassName or a derived class
+        // We implement this by checking the class name in the VMT
+        
+        t1 := LowerExpr(TAstIsExpr(expr).Expr);
+        if t1 < 0 then Exit;
+        
+        // Call the ClassName method and compare with target class name
+        // For now, we emit a call to a runtime helper that does the check
+        
+        // Load object pointer into RDI (first arg)
+        // Emit: mov rdi, [rbp - slot]
+        
+        // For simplicity, we emit a call to a builtin that checks the type
+        // Format: irIsType(object, targetClassName) -> bool
+        
+        t0 := NewTemp;
+        instr.Op := irIsType;
+        instr.Dest := t0;
+        instr.Src1 := t1;  // object pointer
+        instr.ImmStr := TAstIsExpr(expr).ClassName;  // target class name
         Emit(instr);
         Result := t0;
       end;

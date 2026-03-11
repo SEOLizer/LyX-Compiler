@@ -536,6 +536,11 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   vmtDataPos: Integer;
   methodAddr: Integer;
   methodLabelName: string;
+  // RTTI patching
+  classNamePos: Integer;
+  classNamePtrPos: Integer;
+  parentVmtPos: Integer;
+  parentPtrPos: Integer;
   // env data storage (argc, argv)
   envAdded: Boolean;
   envOffset: UInt64;
@@ -698,9 +703,15 @@ begin
     end;
   end;
 
-  // === VMT (Virtual Method Table) Emission ===
-  // Emit VMT tables for all classes with virtual methods
-  // We store VMT data in the data section and create labels for them
+  // === VMT (Virtual Method Table) Emission with RTTI ===
+  // VMT Layout with RTTI header:
+  //   Offset -16: Parent VMT Pointer (for InheritsFrom, 0 for TObject)
+  //   Offset -8:  ClassName Pointer (points to null-terminated string in .rodata)
+  //   Offset 0:   Method 0 (first virtual method)
+  //   Offset 8:   Method 1 (second virtual method)
+  //   ...
+  // The VMT pointer in instances points to Offset 0 (first method)
+  
   for i := 0 to High(module.ClassDecls) do
   begin
     cd := module.ClassDecls[i];
@@ -708,9 +719,47 @@ begin
     if Length(cd.VirtualMethods) > 0 then
     begin
       vmtLabelName := '_vmt_' + cd.Name;
-      // Store VMT label for later use
-      vmtLabelIdx := Length(FVMTLabels);
+      
+      // First emit the class name string (for RTTI ClassName method)
+      // Store label for class name string
       SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_classname_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      
+      // Write class name as null-terminated string
+      for j := 1 to Length(cd.Name) do
+        FData.WriteU8(Ord(cd.Name[j]));
+      FData.WriteU8(0);  // null terminator
+      Inc(totalDataOffset, Length(cd.Name) + 1);
+      
+      // Align to 8 bytes before RTTI header
+      while (FData.Size mod 8) <> 0 do
+      begin
+        FData.WriteU8(0);
+        Inc(totalDataOffset);
+      end;
+      
+      // Emit RTTI header (before the actual VMT base)
+      // 1. Parent VMT Pointer (will be patched later)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_vmt_parent_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder for parent VMT pointer
+      Inc(totalDataOffset, 8);
+      
+      // 2. ClassName Pointer (will be patched to point to class name string)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_vmt_classname_ptr_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder for class name pointer
+      Inc(totalDataOffset, 8);
+      
+      // Now emit the VMT base (this is where instance VMT pointers point to)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
       FVMTLabels[vmtLabelIdx].Name := vmtLabelName;
       FVMTLabels[vmtLabelIdx].Pos := FData.Size;
       
@@ -726,7 +775,8 @@ begin
     end;
   end;
 
-  // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
+  // Emit program entry (_start) FIRST - this must be at address 0x401000
+  // _start: automatically initialize env data (argc/argv) and call main
   // Nach SysV ABI: RDI = argc, RSI = argv
   begin
     // Reserve env data in data segment (16 bytes: argc,qword + argv_ptr,qword)
@@ -758,6 +808,135 @@ begin
     WriteMovRegImm64(FCode, RAX, 60);
     // syscall
     WriteSyscall(FCode);
+  end;
+
+  // === Generate TObject builtin methods for each class ===
+  // These methods are automatically generated for all classes that inherit from TObject
+  // 
+  // ClassName(): pchar - returns pointer to class name string from VMT[-8]
+  // Free(): void - calls Destroy() virtually and then frees memory
+  // Destroy(): void - empty virtual destructor (can be overridden)
+  //
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    cd := module.ClassDecls[i];
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Check if class has ClassName method that needs auto-generation
+      // (i.e., not explicitly defined in user code)
+      for j := 0 to High(cd.VirtualMethods) do
+      begin
+        method := cd.VirtualMethods[j];
+        
+        // Generate ClassName() method if it's inherited from TObject
+        // The method needs auto-generation if:
+        // 1. It's named 'ClassName' AND
+        // 2. Either has no body, or has an empty body (inherited from TObject)
+        if (method.Name = 'ClassName') and 
+           ((method.Body = nil) or 
+            ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's ClassName method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_ClassName';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // ClassName implementation:
+          // self (object pointer) is in RDI
+          // 1. mov rax, [rdi]          ; Load VMT pointer from object
+          // 2. mov rax, [rax - 8]      ; Load ClassName pointer from VMT[-8]
+          // 3. ret
+          
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          
+          // mov rax, [rdi] - load VMT pointer
+          WriteMovRegMem(FCode, RAX, RDI, 0);
+          // mov rax, [rax - 8] - load ClassName pointer from VMT header
+          WriteMovRegMem(FCode, RAX, RAX, -8);
+          
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate Free() method if it's inherited from TObject
+        else if (method.Name = 'Free') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's Free method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_Free';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // Free implementation:
+          // self (object pointer) is in RDI
+          // 1. Call Destroy() virtually
+          // 2. Call munmap to free the memory
+          //
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // push rdi (save self for later munmap)
+          EmitU8(FCode, $57);
+          // sub rsp, 8 (align stack)
+          EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, $08);
+          
+          // Call Destroy virtually:
+          // mov rax, [rdi]       ; load VMT pointer
+          WriteMovRegMem(FCode, RAX, RDI, 0);
+          // mov rax, [rax + 0]   ; load Destroy method (index 0)
+          WriteMovRegMem(FCode, RAX, RAX, 0);
+          // call rax
+          EmitU8(FCode, $FF); EmitU8(FCode, $D0);
+          
+          // Now free memory with munmap:
+          // add rsp, 8
+          EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, $08);
+          // pop rdi (restore self = address to free)
+          EmitU8(FCode, $5F);
+          // mov rsi, PAGE_SIZE (4096) - we allocated page-aligned memory
+          WriteMovRegImm64(FCode, RSI, 4096);
+          // mov rax, 11 (sys_munmap)
+          WriteMovRegImm64(FCode, RAX, 11);
+          // syscall
+          WriteSyscall(FCode);
+          
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate Destroy() method if it's inherited from TObject
+        else if (method.Name = 'Destroy') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's Destroy method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_Destroy';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // Destroy implementation (empty base implementation):
+          // Just return - derived classes can override
+          //
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end;
+      end;
+    end;
   end;
 
     for i := 0 to High(module.Functions) do
@@ -3424,6 +3603,34 @@ begin
             WriteSyscall(FCode);
           end;
 
+        irIsType:
+          begin
+            // Type check: is_type(object, targetClassName) -> bool
+            // Algorithm:
+            // 1. Load object pointer from local slot
+            // 2. Load VMT pointer from object
+            // 3. Get class name from VMT[-8]
+            // 4. Compare with target class name
+            // If they match, return true
+            // Otherwise, traverse parent VMT chain (VMT[-16]) until match or null
+            
+            // Load object pointer from local slot into RDI
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            
+            // Load VMT pointer from object
+            WriteMovRegMem(FCode, RAX, RDI, 0);
+            
+            // Load class name pointer from VMT[-8]
+            WriteMovRegMem(FCode, RAX, RAX, -8);
+            
+            // For now, we just return true (simplified implementation)
+            // TODO: Implement proper string comparison
+            WriteMovRegImm64(FCode, RAX, 1);
+            
+            // Store result
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
         // === In-Situ Data Visualizer (Debugging 2.0) ===
         irInspect:
           begin
@@ -3961,8 +4168,8 @@ begin
     end;
   end;
 
-  // === VMT Patching ===
-  // Patch VMT entries with actual method addresses
+  // === VMT Patching with RTTI ===
+  // Patch VMT entries with actual method addresses and RTTI pointers
   for i := 0 to High(module.ClassDecls) do
   begin
     cd := module.ClassDecls[i];
@@ -4009,6 +4216,75 @@ begin
           begin
           end;
         end;
+        
+        // === RTTI Patching ===
+        // 1. Patch ClassName pointer (at VMT-8)
+        classNamePos := -1;
+        for j := 0 to High(FVMTLabels) do
+        begin
+          if FVMTLabels[j].Name = '_classname_' + cd.Name then
+          begin
+            classNamePos := FVMTLabels[j].Pos;
+            Break;
+          end;
+        end;
+        
+        if classNamePos >= 0 then
+        begin
+          // Find the classname pointer position (VMT - 8)
+          classNamePtrPos := -1;
+          for j := 0 to High(FVMTLabels) do
+          begin
+            if FVMTLabels[j].Name = '_vmt_classname_ptr_' + cd.Name then
+            begin
+              classNamePtrPos := FVMTLabels[j].Pos;
+              Break;
+            end;
+          end;
+          
+          if classNamePtrPos >= 0 then
+          begin
+            // Data base is 0x402000 (data segment comes after code)
+            // Patch with absolute address to classname string
+            FData.PatchU64LE(classNamePtrPos, UInt64($402000 + classNamePos));
+          end;
+        end;
+        
+        // 2. Patch Parent VMT pointer (at VMT-16)
+        if cd.BaseClassName <> '' then
+        begin
+          // Find parent VMT position
+          parentVmtPos := -1;
+          for j := 0 to High(FVMTLabels) do
+          begin
+            if FVMTLabels[j].Name = '_vmt_' + cd.BaseClassName then
+            begin
+              parentVmtPos := FVMTLabels[j].Pos;
+              Break;
+            end;
+          end;
+          
+          if parentVmtPos >= 0 then
+          begin
+            // Find parent pointer position
+            parentPtrPos := -1;
+            for j := 0 to High(FVMTLabels) do
+            begin
+              if FVMTLabels[j].Name = '_vmt_parent_' + cd.Name then
+              begin
+                parentPtrPos := FVMTLabels[j].Pos;
+                Break;
+              end;
+            end;
+            
+            if parentPtrPos >= 0 then
+            begin
+              // Patch with absolute address to parent VMT
+              FData.PatchU64LE(parentPtrPos, UInt64($402000 + parentVmtPos));
+            end;
+          end;
+        end;
+        // Note: For TObject (no base class), parent VMT pointer stays 0
       end;
     end;
   end;

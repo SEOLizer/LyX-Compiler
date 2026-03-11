@@ -95,6 +95,8 @@ type
     irSetRemove,    // remove element: set_remove(Src1=set, Src2=value)
     irSetLen,       // get size: Dest = set_len(Src1=set)
     irSetFree,      // free set: set_free(Src1=set)
+    // Type checking (is/as operators)
+    irIsType,       // type check: Dest = is_type(Src1=object, ImmStr=targetClassName) -> bool
     // In-Situ Data Visualizer (Debugging 2.0)
     irInspect       // debug inspect: Src1=value, ImmStr=varname, ImmInt=format, InspectType=type
    );
