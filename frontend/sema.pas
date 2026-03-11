@@ -1400,6 +1400,18 @@ begin
   s.ParamTypes[2] := atPChar;  // replacement
   AddSymbolToCurrent(s, NullSpan);
 
+  // === Debug: In-Situ Data Visualizer (Debugging 2.0) ===
+  // Inspect(any) -> void
+  // Gibt formatierte Debug-Informationen über eine Variable aus
+  // Akzeptiert jeden Typ - spezielle Behandlung in CheckExpr
+  s := TSymbol.Create('Inspect');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atUnresolved;  // Akzeptiert jeden Typ
+  AddSymbolToCurrent(s, NullSpan);
+
 end;
 
 function IsIntegerType(t: TAurumType): Boolean;
@@ -1842,6 +1854,26 @@ begin
         // rewrite nested args first (non-method calls too)
         for i := 0 to High(call.Args) do
           call.Args[i] := RewriteExpr(call.Args[i]);
+        
+        // Special-case: Inspect() - In-Situ Data Visualizer (Debugging 2.0)
+        // Inspect akzeptiert jeden Typ und gibt void zurück
+        if (call.Name = 'Inspect') or 
+           ((call.Namespace = 'Debug') and (call.Name = 'Inspect')) then
+        begin
+          if Length(call.Args) <> 1 then
+          begin
+            FDiag.Error('Inspect() expects exactly 1 argument', call.Span);
+            Result := atUnresolved;
+            Exit;
+          end;
+          // Prüfe den Typ des Arguments - akzeptiere JEDEN Typ
+          atype := CheckExpr(call.Args[0]);
+          // Inspect gibt void zurück
+          expr.ResolvedType := atVoid;
+          Result := atVoid;
+          Exit;
+        end;
+        
         // Special-case: method call desugared by parser to name '_METHOD_<method>'
         if (Length(call.Name) > 8) and (Copy(call.Name,1,8) = '_METHOD_') then
         begin
