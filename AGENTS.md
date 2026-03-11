@@ -2,7 +2,7 @@
 
 Lyx ist ein nativer Compiler für die Sprache **Lyx**, geschrieben in **FreePascal (FPC 3.2.2)**.
 Zielplattform: **Linux x86_64, ELF64**, ohne libc (reine Syscalls).
-Spezifikation: `SPEC.md` (Architektur, Roadmap) · `ebnf.md` (Grammatik, Typen, Semantik).
+Spezifikation: `SPEC.md` (Architektur, Roadmap) · `ebnf.md` (v0.2.0+ Grammatik, Typen, Semantik).
 
 ## Build-Befehle
 
@@ -41,41 +41,40 @@ ihre Suites im `initialization`-Abschnitt.
 
 ```
 lyxc/
-  aurumc.lpr              # Hauptprogramm (Entry)
+  lyxc.lpr                # Hauptprogramm (Entry)
   frontend/
-    lexer.pas              # Tokenizer → TToken-Stream
-    parser.pas             # Recursive-Descent → AST
-    ast.pas                # AST-Knotentypen
-    sema.pas               # Semantische Analyse (Scopes, Typen)
+    lexer.pas              # Tokenizer (Literale: Hex, Bin, Oct, @energy)
+    parser.pas             # Recursive-Descent (SIMD, OOP, Maps, Sets)
+    ast.pas                # AST-Knoten (inkl. EnergyLevel & VMT-Flags)
+    sema.pas               # Semantische Analyse (Scopes, Type-Casting 'as')
   ir/
-    ir.pas                 # 3-Address-Code IR-Knoten
+    ir.pas                 # 3-Address-Code (Opcodes: irMapSet, irSIMDAdd etc.)
     lower_ast_to_ir.pas    # AST → IR Transformation
   backend/
     backend_intf.pas       # Interfaces (ICodeEmitter, IObjectWriter)
     x86_64/
-      x86_64_emit.pas      # x86_64 Instruktions-Encoding
+      x86_64_emit.pas      # x86_64 Encoding (SSE2 für f64/SIMD)
       x86_64_sysv.pas      # SysV Calling Convention
     elf/
-      elf64_writer.pas      # ELF64 Header + Segmente
+      elf64_writer.pas     # ELF64 Header, .text, .data, .rodata (VMTs)
   util/
     diag.pas               # Diagnostik (Fehler, SourceSpan)
-    bytes.pas              # TByteBuffer (WriteU8/U16/U32/U64LE, Patch)
+    bytes.pas              # TByteBuffer (LE-Encoding, Patching)
   tests/
-    test_lexer.pas         # Tests für Lexer
-    test_parser.pas        # Tests für Parser
-    test_codegen.pas       # Tests für Backend
+    test_lexer.pas         # Tests für Literale und Escapes
+    test_parser.pas        # Tests für komplexe Grammatik
   examples/
-    hello.lyx               # Kuratierte Showcase-Programme
+    hello.lyx              # Kuratierte Showcase-Programme
   tests/lyx/
-    basic/                  # Grundlegende Sprach-Features
-    functions/              # Funktionsaufrufe
-    arrays/                 # Statische Arrays
-    dynarray/               # Dynamische Arrays
-    oop/                    # OOP, Structs, VMT
-    io/                     # I/O & Syscalls
-    strings/                # String-Tests
-    stdlib/                 # Stdlib-Nutzung
-    ...                     # Weitere Kategorien
+    basic/                 # Grundlegende Sprach-Features
+    functions/             # Funktionsaufrufe
+    arrays/                # Statische Arrays
+    dynarray/              # Dynamische Arrays
+    oop/                   # OOP, Structs, VMT, Abstract Methods
+    io/                    # I/O & Syscalls
+    strings/               # String-Tests
+    stdlib/                # Stdlib-Nutzung
+    ...                    # Weitere Kategorien
 ```
 
 ## FreePascal Code-Style
@@ -106,16 +105,16 @@ end.
 | Element           | Konvention         | Beispiel                         |
 |-------------------|--------------------|----------------------------------|
 | Unit-Datei        | snake_case         | `elf64_writer.pas`               |
-| Typ (Klasse)      | `T` + PascalCase   | `TLexer`, `TAstNode`             |
+| Typ (Klasse)      | `T` + PascalCase   | `TLexer`, `TAstNode`            |
 | Typ (Enum)        | `T` + PascalCase   | `TTokenKind`, `TStorageKlass`    |
 | Enum-Wert         | Kurzpräfix + Name  | `tkPlus`, `skVar`, `nkBinOp`    |
 | Interface         | `I` + PascalCase   | `ICodeEmitter`                   |
-| Record            | `T` + PascalCase   | `TSourceSpan`, `TToken`          |
-| Variable/Param    | camelCase          | `tokenList`, `currentChar`       |
-| Konstante (lokal) | camelCase          | `maxRegisters`                   |
-| Konstante (Unit)  | PascalCase / UPPER | `MaxParams = 6`                  |
-| Methode           | PascalCase         | `NextToken`, `EmitMovRegImm`     |
-| Privates Feld     | `F` + PascalCase   | `FSource`, `FPosition`           |
+| Record            | `T` + PascalCase   | `TSourceSpan`, `TToken`         |
+| Variable/Param    | camelCase          | `tokenList`, `currentChar`      |
+| Konstante (lokal) | camelCase          | `maxRegisters`                  |
+| Konstante (Unit)  | PascalCase / UPPER | `MaxParams = 6`                 |
+| Methode           | PascalCase         | `NextToken`, `EmitMovRegImm`    |
+| Privates Feld     | `F` + PascalCase   | `FSource`, `FPosition`          |
 
 ### Enum-Präfixe (projektspezifisch)
 
@@ -123,7 +122,7 @@ end.
 TTokenKind   = (tkIdent, tkIntLit, tkStrLit, tkPlus, tkMinus, tkIf, ...);
 TStorageKlass = (skVar, skLet, skCo, skCon);
 TNodeKind    = (nkIntLit, nkStrLit, nkBinOp, nkUnaryOp, nkCall, ...);
-TLyxType   = (atInt64, atBool, atVoid, atPChar);
+TLyxType     = (atInt64, atBool, atVoid, atPChar, atF64, atDynArray, ...);
 ```
 
 ### Formatierung
@@ -160,14 +159,15 @@ Assert(Assigned(Node), 'ICE: Node darf nicht nil sein');
 
 ## Lyx-Sprachübersicht (Kurzreferenz)
 
-Vollständige Spezifikation: siehe `ebnf.md`.
+Vollständige Spezifikation: siehe `SPEC.md` und `ebnf.md`.
 
-**Typen**: `int64`, `bool`, `void`, `pchar`
+**Typen**: `int64`, `bool`, `void`, `pchar`, `pchar?`, `f32`, `f64`, `array`, `Map<K,V>`, `Set<T>`, `parallel Array<T>`
 **Speicherklassen**: `var` (mutable) · `let` (immutable) · `co` (readonly runtime) · `con` (compile-time)
-**Builtins**: `exit(code)` · `PrintStr(s)` · `PrintInt(x)`
-**Keywords**: `fn var let co con if else while return true false extern`
+**Builtins**: `exit(code)` · `PrintStr(s)` · `PrintInt(x)` · `Random()` · `RandomSeed(n)`
+**Keywords**: `fn var let co con if else while return true false extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract`
 **Zuweisung**: `:=` (nicht `=`)
 **Blöcke**: `{ }` (nicht begin/end)
+**Operatoren**: `+ - * / %` · `== != < <= > >=` · `&& || !` · `& | ^ ~ << >>` · `?? ?.` · `|>`
 
 ## Architektur-Regeln
 
@@ -177,6 +177,10 @@ Vollständige Spezifikation: siehe `ebnf.md`.
 4. **SysV ABI**: Parameter in RDI, RSI, RDX, RCX, R8, R9 · Return in RAX
 5. **Builtins sind Spezialfälle**: Runtime-Snippets (PrintStr, PrintInt) werden eingebettet
 6. **Jedes Token trägt SourceSpan**: Zeile + Spalte für Fehlermeldungen
+7. **VMT (Virtual Method Table)**: Jede Klasse mit virtual/override/abstract Methoden generiert im .data-Segment eine VMT. Das erste Quadword eines Objekts auf dem Heap zeigt auf diese VMT.
+8. **SIMD / ParallelArray**: Heap-Allokation für `parallel Array<T>` muss 16-Byte aligned sein (für SSE2). SIMD-Operationen werden auf irSIMD-Opcodes abgebildet.
+9. **Energy-Awareness**: Das `@energy(n)` Pragma wird im `TFunctionNode` gespeichert. Level 1-2: Code-Dichte priorisieren. Level 5: Aggressives Loop Unrolling (8x).
+10. **Null-Safety**: `pchar?` erlaubt Null-Werte, `pchar` (Standard) führt zu einem Compile-Fehler bei Null-Zuweisung.
 
 ## Git-Konventionen
 
@@ -199,3 +203,8 @@ docs: ebnf.md um ConstExpr-Regeln erweitert
 3. Tests schreiben oder erweitern bevor/nachdem Code geändert wird
 4. `fpc -g -Ci -Cr -Co` muss ohne Fehler durchlaufen
 5. Enum-Präfixe konsistent halten (tk/sk/nk/at)
+6. **Lexer**: Unterstützt er die neuen Basen (0x, $, 0b, %, 0o, &) und Unterstriche _?
+7. **Sema**: Ist der Cast via `as` zwischen int64 und f64 valide? (Nutze cvtsi2sd / cvttsd2si)
+8. **Codegen**: Beachtet der x86_64_emit die SysV-Calling Convention (RDI, RSI, RDX, RCX, R8, R9)?
+9. **VMT**: Werden virtual/override/abstract Methoden korrekt in die VMT eingetragen?
+10. **SIMD**: Ist die 16-Byte Ausrichtung für ParallelArray gewährleistet?
