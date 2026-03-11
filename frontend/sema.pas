@@ -1475,6 +1475,7 @@ var
   cd: TAstClassDecl;
   newExpr: TAstNewExpr;
   castTypeName: string;
+  targetClassName: string;
   compiledRegex: string;
   captureSlots: Integer;
 begin
@@ -1689,6 +1690,12 @@ begin
             TAstCast(expr).CastType := atF32
           else if castTypeName = 'int32' then
             TAstCast(expr).CastType := atInt32
+          else if FClassTypes.IndexOf(castTypeName) >= 0 then
+          begin
+            // Class cast - mark as class type
+            // The actual runtime check will be done in IR/Backend
+            TAstCast(expr).CastType := atUnresolved; // Will be resolved later
+          end
           else
             FDiag.Error('unsupported cast type: ' + castTypeName, expr.Span);
         end;
@@ -2331,6 +2338,20 @@ begin
           end;
           Result := atBool;
         end;
+      end;
+    nkIsExpr:
+      begin
+        // 'is' operator: expr is ClassName
+        // Returns bool
+        lt := CheckExpr(TAstIsExpr(expr).Expr);
+        
+        // The target class must be a known class
+        targetClassName := TAstIsExpr(expr).ClassName;
+        if FClassTypes.IndexOf(targetClassName) < 0 then
+        begin
+          FDiag.Error('Unknown class: ' + targetClassName, TAstIsExpr(expr).Span);
+        end;
+        Result := atBool;
       end;
   else
     begin

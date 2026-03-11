@@ -366,6 +366,7 @@ var
   isStatic: Boolean;
   isVirtual: Boolean;
   isOverride: Boolean;
+  isAbstract: Boolean;
   baseClassName: string;
   curVisibility: TVisibility;
   constraintExpr: TAstExpr;
@@ -417,13 +418,17 @@ begin
     begin
       // parse optional visibility modifier
       curVisibility := ParseVisibility;
-      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) or Check(tkOverride) then
+      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) or Check(tkOverride) or Check(tkAbstract) then
       begin
         // parse method declaration
-        // Modifier order: [static] [virtual|override] fn name(...)
+        // Modifier order: [static] [virtual|override|abstract] fn name(...)
         isStatic := Accept(tkStatic);
         isVirtual := Accept(tkVirtual);
         isOverride := Accept(tkOverride);
+        isAbstract := Accept(tkAbstract);
+        // abstract implies virtual
+        if isAbstract then
+          isVirtual := True;
         // After modifiers, we expect fn
         if not Check(tkFn) then
         begin
@@ -451,12 +456,23 @@ begin
           mRetType := ParseTypeEx(dummy, mRetTypeName)
         else
           mRetType := atVoid;
-        mBody := ParseBlock;
+        // Abstract methods have no body - they end with ;
+        if isAbstract then
+        begin
+          if not Check(tkSemicolon) then
+            FDiag.Error('abstract method must not have a body', FCurTok.Span)
+          else
+            Advance;
+          mBody := nil;
+        end
+        else
+          mBody := ParseBlock;
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
         m.IsVirtual := isVirtual;
         m.IsOverride := isOverride;
+        m.IsAbstract := isAbstract;
         m.Visibility := curVisibility;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
@@ -1228,10 +1244,27 @@ function TParser.ParseCmpExpr: TAstExpr;
 var
   op: TTokenKind;
   rhs: TAstExpr;
+  targetClassName: string;
 begin
   Result := ParseShiftExpr;
+  
+  if Result = nil then Exit(nil);
+
+  // "is" Operator für Laufzeit-Typprüfung
+  if Check(tkIs) then
+  begin
+    Advance; // consume 'is'
+    if not (FCurTok.Kind = tkIdent) then
+    begin
+      FDiag.Error('erwartete Klassenname nach is', FCurTok.Span);
+      Exit(nil);
+    end;
+    targetClassName := FCurTok.Value;
+    Advance; // consume class name
+    Result := TAstIsExpr.Create(Result, targetClassName, Result.Span);
+  end
   // "in" Operator für Map/Set Containment-Check
-  if Check(tkIn) then
+  else if Check(tkIn) then
   begin
     Advance;
     rhs := ParseShiftExpr;

@@ -69,7 +69,8 @@ type
      nkBitAnd, nkBitOr, nkBitXor, nkBitNot,
      nkShiftLeft, nkShiftRight,
      // SIMD/ParallelArray AST nodes
-     nkSIMDNew, nkSIMDBinOp, nkSIMDUnaryOp, nkSIMDIndexAccess
+     nkSIMDNew, nkSIMDBinOp, nkSIMDUnaryOp, nkSIMDIndexAccess,
+     nkIsExpr // 'is' operator (type check)
   );
 
   { --- Vorwärtsdeklarationen --- }
@@ -257,6 +258,18 @@ type
     destructor Destroy; override;
     property Key: TAstExpr read FKey;
     property Container: TAstExpr read FContainer;
+  end;
+
+  { Is-Operator: expr is ClassName }
+  TAstIsExpr = class(TAstExpr)
+  private
+    FExpr: TAstExpr;
+    FClassName: string;
+  public
+    constructor Create(aExpr: TAstExpr; const aClassName: string; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Expr: TAstExpr read FExpr;
+    property ClassName: string read FClassName;
   end;
 
   { SIMD New Expression: parallel Array<T>(size) }
@@ -644,6 +657,7 @@ type
     // VMT fields
     FIsVirtual: Boolean;
     FIsOverride: Boolean;
+    FIsAbstract: Boolean;
     FVirtualTableIndex: Integer;
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
@@ -664,6 +678,7 @@ type
     // VMT properties
     property IsVirtual: Boolean read FIsVirtual write FIsVirtual;
     property IsOverride: Boolean read FIsOverride write FIsOverride;
+    property IsAbstract: Boolean read FIsAbstract write FIsAbstract;
     property VirtualTableIndex: Integer read FVirtualTableIndex write FVirtualTableIndex;
   end;
 
@@ -739,11 +754,13 @@ type
   private
     FName: string;
     FBaseClassName: string; // nil/empty if no base class
+    FParentVMTLabel: string; // Label for parent VMT (for RTTI)
     FFields: TStructFieldList;
     FMethods: TMethodList;
     // VMT fields
     FVirtualMethods: TMethodList;  // Nur virtuelle Methoden
     FVMTName: string;               // "_vmt_ClassName"
+    FClassNameLabel: string;        // Label for class name string in .rodata
     FIsPublic: Boolean;
     // layout info (computed by sema)
     FFieldOffsets: array of Integer;
@@ -757,17 +774,20 @@ type
     destructor Destroy; override;
     property Name: string read FName;
     property BaseClassName: string read FBaseClassName;
+    property ParentVMTLabel: string read FParentVMTLabel write FParentVMTLabel;
     property Fields: TStructFieldList read FFields;
     property Methods: TMethodList read FMethods;
     // VMT properties
     property VirtualMethods: TMethodList read FVirtualMethods write FVirtualMethods;
     property VMTName: string read FVMTName write FVMTName;
+    property ClassNameLabel: string read FClassNameLabel write FClassNameLabel;
     property IsPublic: Boolean read FIsPublic;
     property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
     property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
     property BaseSize: Integer read FBaseSize;
     procedure SetLayout(aSize, aAlign, aBaseSize: Integer);
+    procedure SetBaseClassName(const aBaseClass: string);
     procedure AddVirtualMethod(method: TAstFuncDecl);
   end;
 
@@ -1311,6 +1331,23 @@ destructor TAstInExpr.Destroy;
 begin
   FKey.Free;
   FContainer.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstIsExpr
+// ================================================================
+
+constructor TAstIsExpr.Create(aExpr: TAstExpr; const aClassName: string; aSpan: TSourceSpan);
+begin
+  inherited Create(nkIsExpr, aSpan);
+  FExpr := aExpr;
+  FClassName := aClassName;
+end;
+
+destructor TAstIsExpr.Destroy;
+begin
+  FExpr.Free;
   inherited Destroy;
 end;
 
@@ -1880,6 +1917,11 @@ begin
   FSize := aSize;
   FAlign := aAlign;
   FBaseSize := aBaseSize;
+end;
+
+procedure TAstClassDecl.SetBaseClassName(const aBaseClass: string);
+begin
+  FBaseClassName := aBaseClass;
 end;
 
 procedure TAstClassDecl.AddVirtualMethod(method: TAstFuncDecl);
