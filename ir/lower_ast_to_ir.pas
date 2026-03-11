@@ -356,6 +356,11 @@ begin
          FExternFuncs.Add(TAstFuncDecl(node).Name);
          Continue;
        end;
+       // Skip abstract methods (no body to lower)
+       if TAstFuncDecl(node).IsAbstract then
+       begin
+         Continue;
+       end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
        // Lower function body
        FCurrentFunc := fn;
@@ -544,7 +549,15 @@ begin
             FLocalElemSize[k+1] := 0;
           end;
         end;
-        
+
+        // Skip abstract methods (no body to lower)
+        if m.IsAbstract then
+        begin
+          FCurrentFunc := nil;
+          FCurrentFuncDecl := nil;
+          Continue;
+        end;
+
         // lower body
         for k := 0 to High(m.Body.Stmts) do
           LowerStmt(m.Body.Stmts[k]);
