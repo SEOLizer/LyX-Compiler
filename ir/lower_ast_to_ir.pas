@@ -1081,8 +1081,43 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         for i := 0 to High(call.Args) do
           argTemps[i] := LowerExpr(call.Args[i]);
 
+        // === In-Situ Data Visualizer (Debugging 2.0) ===
+        // Inspect(expr) - gibt formatierte Debug-Ausgabe im Terminal aus
+        if (call.Name = 'Inspect') or 
+           ((call.Namespace = 'Debug') and (call.Name = 'Inspect')) then
+        begin
+          // irInspect: Src1=value temp, ImmStr=varname, InspectType=type
+          instr.Op := irInspect;
+          instr.Dest := -1; // void return
+          if argCount >= 1 then
+          begin
+            instr.Src1 := argTemps[0];
+            // Versuche den Variablennamen zu extrahieren
+            if (call.Args[0] is TAstIdent) then
+              instr.ImmStr := TAstIdent(call.Args[0]).Name
+            else
+              instr.ImmStr := '<expr>';
+            // Typinfo aus dem AST-Knoten
+            instr.InspectType := call.Args[0].ResolvedType;
+            // Für Structs: Name und Felder extrahieren
+            if call.Args[0] is TAstIdent then
+            begin
+              loc := ResolveLocal(TAstIdent(call.Args[0]).Name);
+              if loc >= 0 then
+              begin
+                if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+                  instr.InspectStructName := FLocalTypeNames[loc];
+              end;
+            end;
+          end
+          else
+            instr.Src1 := -1;
+          instr.ImmInt := argCount;
+          Emit(instr);
+          Result := -1;
+        end
         // Builtin calls
-        if (call.Name = 'PrintStr') or ((call.Namespace = 'IO') and (call.Name = 'PrintStr')) then
+        else if (call.Name = 'PrintStr') or ((call.Namespace = 'IO') and (call.Name = 'PrintStr')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1; // no return value

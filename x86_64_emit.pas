@@ -4,7 +4,7 @@ unit x86_64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, backend_types, energy_model;
+  SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
 
 type
   TLabelPos = record
@@ -541,6 +541,15 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
    targetPos, jmpPos: Integer;
    jmpAfterPadPos: Integer;
    nextLabelPos, doneLabelPos, notFoundPos: Integer;
+   // Inspect-specific positions
+   jeFalsePos, jmpEndPos, falseLabelPos, endLabelPos: Integer;
+   // Inspect strings storage
+   inspectStrings: array of record
+     Offset: UInt64;  // offset in FData
+     CodePos: Integer; // LEA position in FCode
+   end;
+   inspectStr: string;
+   inspectStrOff: UInt64;
   // for call/abi
   argCount: Integer;
   argTemps: array of Integer;
@@ -3312,6 +3321,295 @@ begin
             WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
             WriteSyscall(FCode);
           end;
+
+        // === In-Situ Data Visualizer (Debugging 2.0) ===
+        irInspect:
+          begin
+            // Inspect(value): Formatierte Debug-Ausgabe im Terminal (stderr)
+            // Schreibt Strings direkt in FData und merkt sich die LEA-Positionen für späteres Patchen
+            
+            // Helper: String in FData schreiben und LEA-Position merken
+            // 1. Box-Header: "=== varname ===\n"
+            inspectStr := '=== ' + instr.ImmStr + ' ===' + #10;
+            inspectStrOff := totalDataOffset;
+            for k := 1 to Length(inspectStr) do
+              FData.WriteU8(Byte(inspectStr[k]));
+            FData.WriteU8(0); // null terminator
+            Inc(totalDataOffset, Length(inspectStr) + 1);
+            
+            // LEA RSI, [rip+offset]
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+            SetLength(inspectStrings, Length(inspectStrings) + 1);
+            inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+            inspectStrings[High(inspectStrings)].CodePos := leaPos;
+            
+            // strlen + write(2, str, len)
+            WriteMovRegReg(FCode, RCX, RSI);
+            EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00); // cmp byte [rcx], 0
+            EmitU8(FCode, $74); EmitU8(FCode, $05);                     // je +5
+            WriteIncReg(FCode, RCX);                                     // inc rcx
+            EmitU8(FCode, $EB); EmitU8(FCode, $F6);                     // jmp -10
+            WriteMovRegReg(FCode, RDX, RCX);
+            WriteSubRegReg(FCode, RDX, RSI);
+            WriteMovRegImm64(FCode, RDI, 2); // stderr
+            WriteMovRegImm64(FCode, RAX, 1); // sys_write
+            WriteSyscall(FCode);
+            
+            // 2. Typ-Label: "Type: <type>\n"
+            // TAurumType Ordinalwerte:
+            // atUnresolved=0, atInt8=1..atInt64=4, atUInt8=5..atUInt64=8,
+            // atISize=9, atUSize=10, atF32=11, atF64=12, atChar=13,
+            // atBool=14, atVoid=15, atPChar=16, atPCharNullable=17,
+            // atDynArray=18, atArray=19, atMap=20, atSet=21, atParallelArray=22
+            case Ord(instr.InspectType) of
+              1, 2, 3, 4: inspectStr := 'Type: int64' + #10;       // atInt8..atInt64
+              5, 6, 7, 8: inspectStr := 'Type: uint64' + #10;      // atUInt8..atUInt64
+              9:  inspectStr := 'Type: isize' + #10;               // atISize
+              10: inspectStr := 'Type: usize' + #10;               // atUSize
+              11, 12: inspectStr := 'Type: f64' + #10;             // atF32, atF64
+              13: inspectStr := 'Type: char' + #10;                // atChar
+              14: inspectStr := 'Type: bool' + #10;                // atBool
+              15: inspectStr := 'Type: void' + #10;                // atVoid
+              16, 17: inspectStr := 'Type: pchar' + #10;           // atPChar, atPCharNullable
+              18: inspectStr := 'Type: []dynamic' + #10;           // atDynArray
+              19: inspectStr := 'Type: []static' + #10;            // atArray
+              20: inspectStr := 'Type: Map' + #10;                 // atMap
+              21: inspectStr := 'Type: Set' + #10;                 // atSet
+              22: inspectStr := 'Type: []parallel' + #10;          // atParallelArray
+            else
+              inspectStr := 'Type: <unknown>' + #10;
+            end;
+            inspectStrOff := totalDataOffset;
+            for k := 1 to Length(inspectStr) do
+              FData.WriteU8(Byte(inspectStr[k]));
+            FData.WriteU8(0);
+            Inc(totalDataOffset, Length(inspectStr) + 1);
+            
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+            SetLength(inspectStrings, Length(inspectStrings) + 1);
+            inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+            inspectStrings[High(inspectStrings)].CodePos := leaPos;
+            
+            WriteMovRegReg(FCode, RCX, RSI);
+            EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+            EmitU8(FCode, $74); EmitU8(FCode, $05);
+            WriteIncReg(FCode, RCX);
+            EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+            WriteMovRegReg(FCode, RDX, RCX);
+            WriteSubRegReg(FCode, RDX, RSI);
+            WriteMovRegImm64(FCode, RDI, 2);
+            WriteMovRegImm64(FCode, RAX, 1);
+            WriteSyscall(FCode);
+            
+            // 3. "Value: " prefix
+            inspectStr := 'Value: ';
+            inspectStrOff := totalDataOffset;
+            for k := 1 to Length(inspectStr) do
+              FData.WriteU8(Byte(inspectStr[k]));
+            FData.WriteU8(0);
+            Inc(totalDataOffset, Length(inspectStr) + 1);
+            
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+            SetLength(inspectStrings, Length(inspectStrings) + 1);
+            inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+            inspectStrings[High(inspectStrings)].CodePos := leaPos;
+            
+            WriteMovRegReg(FCode, RCX, RSI);
+            EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+            EmitU8(FCode, $74); EmitU8(FCode, $05);
+            WriteIncReg(FCode, RCX);
+            EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+            WriteMovRegReg(FCode, RDX, RCX);
+            WriteSubRegReg(FCode, RDX, RSI);
+            WriteMovRegImm64(FCode, RDI, 2);
+            WriteMovRegImm64(FCode, RAX, 1);
+            WriteSyscall(FCode);
+            
+            // 4. Wert basierend auf Typ ausgeben
+            if Ord(instr.InspectType) in [1, 2, 3, 4, 5, 6, 7, 8] then
+            begin
+              // Integer: PrintInt-ähnliche Ausgabe
+              if not bufferAdded then
+              begin
+                bufferOffset := totalDataOffset;
+                for k := 1 to 64 do FData.WriteU8(0);
+                Inc(totalDataOffset, 64);
+                bufferAdded := True;
+              end;
+              
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+              SetLength(bufferLeaPositions, Length(bufferLeaPositions) + 1);
+              bufferLeaPositions[High(bufferLeaPositions)] := leaPos;
+              
+              WriteMovRegReg(FCode, RDI, RSI);
+              WriteMovRegImm64(FCode, RDX, 64);
+              WriteAddRegReg(FCode, RDI, RDX);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $F8); EmitU8(FCode, 0);
+              nonZeroPos := FCode.Size;
+              WriteJneRel32(FCode, 0);
+              WriteMovMemImm8(FCode, RSI, 0, Ord('0'));
+              WriteMovRegImm64(FCode, RDX, 1);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteSyscall(FCode);
+              jmpDonePos := FCode.Size;
+              WriteJmpRel32(FCode, 0);
+              k := FCode.Size;
+              FCode.PatchU32LE(nonZeroPos + 2, Cardinal(k - nonZeroPos - 6));
+              WriteMovRegImm64(FCode, RBX, 0);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $F8); EmitU8(FCode, 0);
+              jgePos := FCode.Size;
+              WriteJgeRel32(FCode, 0);
+              EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D8);
+              WriteMovRegImm64(FCode, RBX, 1);
+              k := FCode.Size;
+              FCode.PatchU32LE(jgePos + 2, Cardinal(k - jgePos - 6));
+              loopStartPos := FCode.Size;
+              WriteCqo(FCode);
+              WriteMovRegImm64(FCode, RCX, 10);
+              WriteIdivReg(FCode, RCX);
+              EmitU8(FCode, $80); EmitU8(FCode, $C2); EmitU8(FCode, Byte(Ord('0')));
+              WriteDecReg(FCode, RDI);
+              EmitU8(FCode, $88); EmitU8(FCode, $17);
+              WriteTestRaxRax(FCode);
+              jneLoopPos := FCode.Size;
+              WriteJneRel32(FCode, 0);
+              EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $FB); EmitU8(FCode, 0);
+              jeSignPos := FCode.Size;
+              WriteJeRel32(FCode, 0);
+              WriteDecReg(FCode, RDI);
+              WriteMovMemImm8(FCode, RDI, 0, Ord('-'));
+              k := FCode.Size;
+              FCode.PatchU32LE(jeSignPos + 2, Cardinal(k - jeSignPos - 6));
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $8E); EmitU32(FCode, 64);
+              WriteSubRegReg(FCode, RCX, RDI);
+              WriteMovRegReg(FCode, RDX, RCX);
+              WriteMovRegReg(FCode, RSI, RDI);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteSyscall(FCode);
+              k := FCode.Size;
+              FCode.PatchU32LE(jmpDonePos + 1, Cardinal(k - jmpDonePos - 5));  // JMP rel32: opcode at +0, offset at +1, total 5 bytes
+              FCode.PatchU32LE(jneLoopPos + 2, Cardinal(loopStartPos - (jneLoopPos + 6)));  // JNE rel32: 2-byte opcode (0F 85), offset at +2
+            end
+            else if Ord(instr.InspectType) = 14 then // atBool = 14
+            begin
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteTestRaxRax(FCode);
+              jeFalsePos := FCode.Size;
+              EmitU8(FCode, $74); EmitU8(FCode, $00);
+              
+              // true branch
+              inspectStr := 'true';
+              inspectStrOff := totalDataOffset;
+              for k := 1 to Length(inspectStr) do
+                FData.WriteU8(Byte(inspectStr[k]));
+              FData.WriteU8(0);
+              Inc(totalDataOffset, Length(inspectStr) + 1);
+              
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+              SetLength(inspectStrings, Length(inspectStrings) + 1);
+              inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+              inspectStrings[High(inspectStrings)].CodePos := leaPos;
+              
+              WriteMovRegImm64(FCode, RDX, 4);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteSyscall(FCode);
+              jmpEndPos := FCode.Size;
+              EmitU8(FCode, $EB); EmitU8(FCode, $00);
+              
+              // false branch
+              falseLabelPos := FCode.Size;
+              FCode.PatchU8(jeFalsePos + 1, falseLabelPos - (jeFalsePos + 2));
+              
+              inspectStr := 'false';
+              inspectStrOff := totalDataOffset;
+              for k := 1 to Length(inspectStr) do
+                FData.WriteU8(Byte(inspectStr[k]));
+              FData.WriteU8(0);
+              Inc(totalDataOffset, Length(inspectStr) + 1);
+              
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+              SetLength(inspectStrings, Length(inspectStrings) + 1);
+              inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+              inspectStrings[High(inspectStrings)].CodePos := leaPos;
+              
+              WriteMovRegImm64(FCode, RDX, 5);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteSyscall(FCode);
+              endLabelPos := FCode.Size;
+              FCode.PatchU8(jmpEndPos + 1, endLabelPos - (jmpEndPos + 2));
+            end
+            else if Ord(instr.InspectType) in [16, 17] then // atPChar=16, atPCharNullable=17
+            begin
+              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+              WriteMovRegReg(FCode, RCX, RSI);
+              EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+              EmitU8(FCode, $74); EmitU8(FCode, $05);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              WriteMovRegReg(FCode, RDX, RCX);
+              WriteSubRegReg(FCode, RDX, RSI);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteSyscall(FCode);
+            end
+            else
+            begin
+              // Unbekannter Typ: "<unknown>" ausgeben
+              inspectStr := '<unknown>';
+              inspectStrOff := totalDataOffset;
+              for k := 1 to Length(inspectStr) do
+                FData.WriteU8(Byte(inspectStr[k]));
+              FData.WriteU8(0);
+              Inc(totalDataOffset, Length(inspectStr) + 1);
+              
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+              SetLength(inspectStrings, Length(inspectStrings) + 1);
+              inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+              inspectStrings[High(inspectStrings)].CodePos := leaPos;
+              
+              WriteMovRegReg(FCode, RCX, RSI);
+              EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+              EmitU8(FCode, $74); EmitU8(FCode, $05);
+              WriteIncReg(FCode, RCX);
+              EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+              WriteMovRegReg(FCode, RDX, RCX);
+              WriteSubRegReg(FCode, RDX, RSI);
+              WriteMovRegImm64(FCode, RDI, 2);
+              WriteMovRegImm64(FCode, RAX, 1);
+              WriteSyscall(FCode);
+            end;
+            
+            // 5. Newline am Ende
+            inspectStr := #10;
+            inspectStrOff := totalDataOffset;
+            for k := 1 to Length(inspectStr) do
+              FData.WriteU8(Byte(inspectStr[k]));
+            FData.WriteU8(0);
+            Inc(totalDataOffset, Length(inspectStr) + 1);
+            
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35); EmitU32(FCode, 0);
+            SetLength(inspectStrings, Length(inspectStrings) + 1);
+            inspectStrings[High(inspectStrings)].Offset := inspectStrOff;
+            inspectStrings[High(inspectStrings)].CodePos := leaPos;
+            
+            WriteMovRegImm64(FCode, RDX, 1);
+            WriteMovRegImm64(FCode, RDI, 2);
+            WriteMovRegImm64(FCode, RAX, 1);
+            WriteSyscall(FCode);
+          end;
       end;
     end;
   end;
@@ -3419,6 +3717,17 @@ begin
   
   // Free global variable names list
   globalVarNames.Free;
+  
+  // patch Inspect string LEAs
+  for i := 0 to High(inspectStrings) do
+  begin
+    leaPos := inspectStrings[i].CodePos;
+    codeVA := 4096;
+    instrVA := codeVA + leaPos + 7;
+    dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + inspectStrings[i].Offset;
+    disp32 := Int64(dataVA) - Int64(instrVA);
+    FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+  end;
 
   // Generate PLT stubs for external symbols at end of code section
   // Standard x86-64 PLT layout (each entry 16 bytes):

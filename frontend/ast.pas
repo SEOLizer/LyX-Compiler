@@ -55,6 +55,7 @@ type
      nkFieldAccess, nkIndexAccess, nkCast,
      nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
      nkMapLit, nkSetLit, nkInExpr,     // Map/Set expressions
+     nkInspect,                         // In-Situ Data Visualizer
      // Statements
      nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
      nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
@@ -85,6 +86,7 @@ type
   TAstExprList = array of TAstExpr;
   TAstStmtList = array of TAstStmt;
   TIntArray = array of Integer;
+  TStringArray = array of string;
 
   { Map-Entry: key: value Paar }
   TMapEntry = record
@@ -811,6 +813,42 @@ type
     property Message: TAstExpr read FMessage;
   end;
 
+  { Inspect(expr) - In-Situ Data Visualizer für Debugging }
+  { Gibt zur Laufzeit eine formatierte Darstellung des Werts aus }
+  TInspectFormat = (
+    ifAuto,       // automatisch basierend auf Typ
+    ifTable,      // Tabelle für Maps/Structs
+    ifTree,       // Baumstruktur für verschachtelte Daten
+    ifHex,        // Hexadezimal für Integers
+    ifBinary      // Binär für Integers
+  );
+
+  TAstInspect = class(TAstExpr)
+  private
+    FExpr: TAstExpr;
+    FVarName: string;        // Name der Variable (für Anzeige)
+    FFormat: TInspectFormat; // Ausgabeformat
+    FInspectedType: TAurumType; // Typ des inspizierten Ausdrucks (von Sema gesetzt)
+    FStructName: string;     // Struct/Class Name wenn relevant
+    FFieldNames: TStringArray; // Feldnamen für Structs (von Sema gefüllt)
+    FFieldOffsets: TIntArray;  // Feldoffsets für Structs
+    FFieldTypes: array of TAurumType; // Feldtypen für Structs
+  public
+    constructor Create(aExpr: TAstExpr; const aVarName: string; 
+      aFormat: TInspectFormat; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    procedure SetTypeInfo(aType: TAurumType; const aStructName: string);
+    procedure SetStructFields(const aNames: TStringArray; 
+      const aOffsets: TIntArray; const aTypes: array of TAurumType);
+    property Expr: TAstExpr read FExpr;
+    property VarName: string read FVarName;
+    property Format: TInspectFormat read FFormat;
+    property InspectedType: TAurumType read FInspectedType;
+    property StructName: string read FStructName;
+    property FieldNames: TStringArray read FFieldNames;
+    property FieldOffsets: TIntArray read FFieldOffsets;
+  end;
+
   { Unit-Deklaration: unit path.to.name; }
   TAstUnitDecl = class(TAstNode)
   private
@@ -1014,8 +1052,11 @@ begin
     nkUnitDecl:     Result := 'UnitDecl';
     nkImportDecl:  Result := 'ImportDecl';
     nkProgram:     Result := 'Program';
+    nkInspect:     Result := 'Inspect';
+  else
+    Result := '<unknown>';
   end;
-  end;
+end;
 
 // ================================================================
 
@@ -2041,6 +2082,52 @@ begin
     FDecls[i].Free;
   FDecls := nil;
   inherited Destroy;
+end;
+
+// ================================================================
+// TAstInspect - In-Situ Data Visualizer
+// ================================================================
+
+constructor TAstInspect.Create(aExpr: TAstExpr; const aVarName: string;
+  aFormat: TInspectFormat; aSpan: TSourceSpan);
+begin
+  inherited Create(nkInspect, aSpan);
+  FExpr := aExpr;
+  FVarName := aVarName;
+  FFormat := aFormat;
+  FInspectedType := atUnresolved;
+  FStructName := '';
+  FFieldNames := nil;
+  FFieldOffsets := nil;
+  FFieldTypes := nil;
+end;
+
+destructor TAstInspect.Destroy;
+begin
+  if Assigned(FExpr) then FExpr.Free;
+  FFieldNames := nil;
+  FFieldOffsets := nil;
+  FFieldTypes := nil;
+  inherited Destroy;
+end;
+
+procedure TAstInspect.SetTypeInfo(aType: TAurumType; const aStructName: string);
+begin
+  FInspectedType := aType;
+  FStructName := aStructName;
+  FResolvedType := atVoid; // Inspect returns void
+end;
+
+procedure TAstInspect.SetStructFields(const aNames: TStringArray;
+  const aOffsets: TIntArray; const aTypes: array of TAurumType);
+var
+  i: Integer;
+begin
+  FFieldNames := aNames;
+  FFieldOffsets := aOffsets;
+  SetLength(FFieldTypes, Length(aTypes));
+  for i := 0 to High(aTypes) do
+    FFieldTypes[i] := aTypes[i];
 end;
 
 end.

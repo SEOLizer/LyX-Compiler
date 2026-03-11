@@ -28,6 +28,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Dynamic Arrays: push/pop/len/free
 ✅ QBool: Probabilistic Boolean Type for quantum-like computing
 ✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
+✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ```
 
 ---
@@ -1045,6 +1046,50 @@ Over 30 built-in functions are available without import:
 | `PrintInt(x)`    | `int64 -> void`        | Outputs integer as decimal          |
 | `PrintFloat(x)`  | `f64 -> void`          | Outputs float (simplified)          |
 | `exit(code)`      | `int64 -> void`        | Terminates program with exit code   |
+
+#### Debugging: In-Situ Data Visualizer
+
+The `Inspect()` builtin provides runtime debugging output for variables directly to stderr:
+
+```lyx
+fn main(): int64 {
+  var count: int64 := 42;
+  var isActive: bool := true;
+  var message: pchar := "Hello, Debug!";
+  
+  Inspect(count);      // Outputs type and value to stderr
+  Inspect(isActive);
+  Inspect(message);
+  
+  return 0;
+}
+```
+
+Output (on stderr):
+```
+=== count ===
+Type: int64
+Value: 42
+=== isActive ===
+Type: bool
+Value: true
+=== message ===
+Type: pchar
+Value: Hello, Debug!
+```
+
+**Supported types:**
+- `int64`, `int32`, `int16`, `int8` (signed integers)
+- `uint64`, `uint32`, `uint16`, `uint8` (unsigned integers)
+- `bool` (outputs "true" or "false")
+- `pchar` (outputs string content)
+- `f32`, `f64` (floating-point, basic support)
+
+**Features:**
+- Output goes to stderr (file descriptor 2), not stdout
+- Variable name is automatically extracted and displayed
+- Type information is shown for each inspected value
+- No imports required - available as builtin
 
 #### Random Builtins
 | Function          | Signature               | Description                        |
