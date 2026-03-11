@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override`
 
 ### Integer-Literale mit verschiedenen Basen
 
@@ -288,7 +288,7 @@ player.health--;     // player.health := player.health - 1
 
 * `new`: `mmap` syscall für Allokation
 * `dispose`: `munmap` syscall für Freigabe
-* VTable für virtuelle Methoden (in Planung)
+* VMT (Virtual Method Table) für virtuelle Methoden ✅ (v0.5.1)
 
 ### Runtime-Snippets (eingebettet)
 
@@ -362,6 +362,75 @@ fn main(): int64 {
   dispose d;
   return 0;
 }
+```
+
+### Virtual Methods und VMT
+
+Virtuelle Methoden ermöglichen Polymorphismus durch eine Virtual Method Table (VMT):
+
+```lyx
+type TBase = class {
+  val: int64;
+  
+  // Virtual method - can be overridden
+  virtual fn GetValue(): int64 {
+    return self.val;
+  }
+};
+
+type TDerived = class extends TBase {
+  extra: int64;
+  
+  // Override the virtual method from base class
+  override fn GetValue(): int64 {
+    return self.val + self.extra;
+  }
+};
+
+fn main(): int64 {
+  var base: TBase := new TBase();
+  base.val := 10;
+  
+  var derived: TDerived := new TDerived();
+  derived.val := 20;
+  derived.extra := 30;
+  
+  // Polymorphic calls via VMT
+  PrintInt(base.GetValue());    // Calls TBase.GetValue() -> 10
+  PrintInt(derived.GetValue()); // Calls TDerived.GetValue() -> 50
+  
+  dispose base;
+  dispose derived;
+  return 0;
+}
+```
+
+**Grammatik für virtuelle Methoden:**
+
+```
+ClassDecl       := 'type' Ident '=' 'class' [ 'extends' Ident ] '{' { ( FieldDecl | MethodDecl ) } '}' ;
+MethodDecl      := [ ( 'virtual' | 'override' ) ] 'fn' Ident '(' [ ParamList ] ')' [ ':' Type ] Block ;
+VirtualFlag     := 'virtual' ;
+OverrideFlag    := 'override' ;
+```
+
+**VMT-Semantik:**
+- `virtual fn` deklariert eine Methode als virtuell. Die Methode erhält einen festen Slot in der VMT der Klasse.
+- `override fn` überschreibt eine virtuelle Methode der Basisklasse. Der Slot bleibt erhalten.
+- Virtuelle Methodenaufrufe werden zur Laufzeit über die VMT dispatcht.
+- Ohne `virtual`/`override` wird die Methode statisch gebunden (direkter `call`).
+
+**Beispiel-VMT-Layout:**
+```
+[type TBase]:
+  .data:
+    _vmt_TBase:
+      dq _L_TBase_GetValue    ; VMT-Index 0
+
+[type TDerived]:
+  .data:
+    _vmt_TDerived:
+      dq _L_TDerived_GetValue  ; überschreibt TBase.GetValue
 ```
 
 ### Random
