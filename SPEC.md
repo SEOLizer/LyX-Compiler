@@ -558,6 +558,29 @@ mov rax, [rax + 0]       ; VMT-Pointer aus erstem Feld laden
 call [rax + methodIndex * 8]  ; virtuelle Methode aufrufen
 ```
 
+### v0.5.2 — "Abstract Methods"
+
+- **Abstract Methods**: `abstract fn` Keyword für Methoden ohne Implementierung
+- **Abstract Class Detection**: Klassen mit abstrakten Methoden können nicht instanziiert werden  
+- **Concrete Override**: Konkrete Subklassen müssen alle abstrakten Methoden implementieren
+
+**Abstract-Syntax:**
+```lyx
+type Animal = class {
+  abstract fn Speak(): int64;
+};
+
+type Dog = class extends Animal {
+  override fn Speak(): int64 { return 1; }
+};
+```
+
+**Abstract-Semantik:**
+- `abstract fn` deklariert eine Methode ohne Body. Die Methode muss von einer konkreten Subklasse überschrieben werden.
+- Eine Klasse mit mindestens einer abstrakten Methode ist automatisch **abstrakt**.
+- **Fehler**: Versucht man, eine abstrakte Klasse zu instanziieren: `cannot instantiate abstract class: <ClassName>`
+- `abstract` impliziert automatisch `virtual`
+
 v1.0: “Stabile Systemsprache”
 1.0.0 — “Stabil, testbar, nutzbar”
 
@@ -909,7 +932,7 @@ Wenn ich es brutal zusammenkoche, musst du für Lyx zuerst festlegen:
 
 ```
 fn var let co con if else while return true false extern
-unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override
+unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract
 ```
 
 ---
