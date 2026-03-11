@@ -94,7 +94,9 @@ type
     irSetContains,  // check element: Dest = set_contains(Src1=set, Src2=value) -> bool
     irSetRemove,    // remove element: set_remove(Src1=set, Src2=value)
     irSetLen,       // get size: Dest = set_len(Src1=set)
-    irSetFree       // free set: set_free(Src1=set)
+    irSetFree,      // free set: set_free(Src1=set)
+    // In-Situ Data Visualizer (Debugging 2.0)
+    irInspect       // debug inspect: Src1=value, ImmStr=varname, ImmInt=format, InspectType=type
    );
 
   TIRInstr = record
@@ -118,6 +120,12 @@ type
     // Struct return fields (for irReturnStruct)
     StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
     StructAlign: Integer;  // alignment of struct
+    // Inspect-specific fields (for irInspect - In-Situ Data Visualizer)
+    InspectType: TAurumType;          // type of the inspected value
+    InspectStructName: string;        // struct/class name if applicable
+    InspectFieldNames: array of string; // field names for struct visualization
+    InspectFieldTypes: array of TAurumType; // field types for struct visualization
+    InspectFieldOffsets: array of Integer;  // field offsets for struct visualization
   end;
 
    TIRInstructionList = array of TIRInstr;

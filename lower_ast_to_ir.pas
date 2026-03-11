@@ -1222,6 +1222,42 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         for i := 0 to argCount - 1 do
           argTemps[i] := LowerExpr(TAstCall(expr).Args[i]);
 
+        // === In-Situ Data Visualizer (Debugging 2.0) ===
+        // Inspect(expr) - gibt formatierte Debug-Ausgabe im Terminal aus
+        if (TAstCall(expr).Name = 'Inspect') or 
+           ((TAstCall(expr).Namespace = 'Debug') and (TAstCall(expr).Name = 'Inspect')) then
+        begin
+          // irInspect: Src1=value temp, ImmStr=varname, InspectType=type
+          instr.Op := irInspect;
+          instr.Dest := -1; // void return
+          if argCount >= 1 then
+          begin
+            instr.Src1 := argTemps[0];
+            // Versuche den Variablennamen zu extrahieren
+            if (TAstCall(expr).Args[0] is TAstIdent) then
+              instr.ImmStr := TAstIdent(TAstCall(expr).Args[0]).Name
+            else
+              instr.ImmStr := '<expr>';
+            // Typinfo aus dem AST-Knoten
+            instr.InspectType := TAstCall(expr).Args[0].ResolvedType;
+            // Für Structs: Name und Felder extrahieren
+            if TAstCall(expr).Args[0] is TAstIdent then
+            begin
+              loc := ResolveLocal(TAstIdent(TAstCall(expr).Args[0]).Name);
+              if loc >= 0 then
+              begin
+                if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+                  instr.InspectStructName := FLocalTypeNames[loc];
+              end;
+            end;
+          end
+          else
+            instr.Src1 := -1;
+          instr.ImmInt := argCount;
+          Emit(instr);
+          Result := -1;
+          Exit; // Inspect fertig, nicht weiter durch die anderen ifs fallen
+        end;
         // === Dynamic array builtins: push, pop, len, free ===
         // These need the base local slot index, not a lowered temp value.
         if ((TAstCall(expr).Name = 'push') or (TAstCall(expr).Name = 'append')) and (argCount = 2) and

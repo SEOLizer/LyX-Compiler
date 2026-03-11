@@ -96,4 +96,11 @@ initialization
 
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
+
+  // Debug namespace - In-Situ Data Visualizer
+  // Inspect akzeptiert jeden Typ - die Typprüfung erfolgt speziell in Sema
+  // Der Parameter wird als int64 deklariert, aber Sema erlaubt jeden Typ
+  AddBuiltin('Debug', 'Inspect', 'Inspect', atVoid, [atInt64]);
+  // Kurzform ohne Namespace
+  AddBuiltin('', 'Inspect', 'Inspect', atVoid, [atInt64]);
 end.
