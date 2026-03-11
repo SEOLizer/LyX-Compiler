@@ -503,6 +503,61 @@ Basisfunktionen: concat/splice später; erstmal: length, compare, to_cstr (wenn 
 - ✅ **Function Inlining**: Direktes Einfügen von Funktionsaufrufen
 - ✅ **CLI-Option --no-opt**: Deaktiviert IR-Optimierungen
 
+### v0.5.1 — "VMT (Virtual Method Table)"
+
+- ✅ **Virtual Methods**: `virtual fn` Keyword für virtuelle Methoden mit VMT-Eintrag
+- ✅ **Override**: `override fn` Keyword zum Überschreiben virtueller Methoden
+- ✅ **VMT Memory Layout**: VMT wird als Daten-Array im .data-Segment gespeichert
+- ✅ **VMT Dispatch**: Aufruf virtueller Methoden via LEA + CALL [VMT+offset]
+- ✅ **VMT Patching**: Absolute Adressen werden zur Compilezeit in VMT-Einträge geschrieben
+
+**VMT-Syntax:**
+```lyx
+type TBase = class {
+  val: int64;
+  
+  virtual fn GetValue(): int64 {
+    return self.val;
+  }
+};
+
+type TDerived = class extends TBase {
+  extra: int64;
+  
+  override fn GetValue(): int64 {
+    return self.val + self.extra;
+  }
+};
+```
+
+**VMT-Semantik:**
+- `virtual` deklariert eine Methode als virtuell. Die Methode erhält einen festen Slot in der VMT der Klasse.
+- `override` überschreibt eine virtuelle Methode der Basisklasse. Der Override muss denselben Signatur haben.
+- Virtuelle Methodenaufrufe werden zur Laufzeit über die VMT dispatcht: `call [obj + VMT_Offset + methodIndex * 8]`
+- Jede Klasse mit virtuellen Methoden hat eine eigene VMT. Abgeleitete Klassen erben die VMT der Basisklasse und fügen neue Einträge hinzu.
+
+**VMT-Speicherlayout:**
+```
+[TBase]:
+  .data:
+    _vmt_TBase:
+      dq TBase_GetValue_Address
+
+[TDerived]:
+  .data:
+    _vmt_TDerived:
+      dq TDerived_GetValue_Address   ; überschreibt TBase.GetValue
+```
+
+**VMT-Aufruf (Pseudocode):**
+```asm
+; obj ist ein Pointer auf die Klasseninstanz
+; VMT-Offset ist固定 (z.B. 0)
+lea rax, [obj]           ; obj Pointer holen
+mov rax, [rax + 0]       ; VMT-Pointer aus erstem Feld laden
+call [rax + methodIndex * 8]  ; virtuelle Methode aufrufen
+```
+
 v1.0: “Stabile Systemsprache”
 1.0.0 — “Stabil, testbar, nutzbar”
 
@@ -848,13 +903,13 @@ Wenn ich es brutal zusammenkoche, musst du für Lyx zuerst festlegen:
 6. Kontrollfluss (if/while/return)
 7. Ziel: Linux x86_64 ELF64
 
-# Lyx v0.1.4 – Keywords (aktualisiert)
+# Lyx v0.2.0 – Keywords (aktualisiert)
 
 ## Reservierte Keywords
 
 ```
 fn var let co con if else while return true false extern
-unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value
+unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override
 ```
 
 ---
