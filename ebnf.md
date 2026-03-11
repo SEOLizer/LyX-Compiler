@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract`
 
 ### Integer-Literale mit verschiedenen Basen
 
@@ -405,20 +405,38 @@ fn main(): int64 {
 }
 ```
 
-**Grammatik für virtuelle Methoden:**
+**Grammatik für virtuelle und abstrakte Methoden:**
 
 ```
 ClassDecl       := 'type' Ident '=' 'class' [ 'extends' Ident ] '{' { ( FieldDecl | MethodDecl ) } '}' ;
-MethodDecl      := [ ( 'virtual' | 'override' ) ] 'fn' Ident '(' [ ParamList ] ')' [ ':' Type ] Block ;
+MethodDecl      := [ ( 'virtual' | 'override' | 'abstract' ) ] 'fn' Ident '(' [ ParamList ] ')' [ ':' Type ] ( Block | ';' ) ;
 VirtualFlag     := 'virtual' ;
 OverrideFlag    := 'override' ;
+AbstractFlag    := 'abstract' ;
 ```
 
 **VMT-Semantik:**
 - `virtual fn` deklariert eine Methode als virtuell. Die Methode erhält einen festen Slot in der VMT der Klasse.
 - `override fn` überschreibt eine virtuelle Methode der Basisklasse. Der Slot bleibt erhalten.
+- `abstract fn` deklariert eine Methode ohne Implementierung. Die Methode muss von einer konkreten Subklasse überschrieben werden.
+- `abstract` impliziert automatisch `virtual`.
 - Virtuelle Methodenaufrufe werden zur Laufzeit über die VMT dispatcht.
-- Ohne `virtual`/`override` wird die Methode statisch gebunden (direkter `call`).
+- Ohne `virtual`/`override`/`abstract` wird die Methode statisch gebunden (direkter `call`).
+
+**Abstract-Syntax:**
+```
+type Animal = class {
+  abstract fn Speak(): int64;
+};
+
+type Dog = class extends Animal {
+  override fn Speak(): int64 { return 1; }
+};
+```
+
+**Fehler bei Abstrakten Klassen:**
+- Eine Klasse mit mindestens einer abstrakten Methode ist abstrakt und kann nicht instanziiert werden.
+- Compiler-Fehler: `cannot instantiate abstract class: <ClassName>`
 
 **Beispiel-VMT-Layout:**
 ```
