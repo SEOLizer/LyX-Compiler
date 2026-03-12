@@ -779,6 +779,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     classIdx: Integer;
     cd: TAstClassDecl;
     methodIdx: Integer;
+    vmtIdx: Integer;
     vmtClassName: string;
     vmtMethodName: string;
     posIdx: Integer;
@@ -1605,18 +1606,38 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               if classIdx >= 0 then
               begin
                 cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
-                // Find method in class
-                for methodIdx := 0 to High(cd.Methods) do
+                // First check if class has virtual methods (VMT exists)
+                if Length(cd.VirtualMethods) > 0 then
                 begin
-                  if cd.Methods[methodIdx].Name = vmtMethodName then
+                  // Look for method in VirtualMethods list (has correct VMT indices)
+                  for vmtIdx := 0 to High(cd.VirtualMethods) do
                   begin
-                    if cd.Methods[methodIdx].IsVirtual then
+                    if Assigned(cd.VirtualMethods[vmtIdx]) and 
+                       (cd.VirtualMethods[vmtIdx].Name = vmtMethodName) then
                     begin
-                      // This is a virtual call
+                      // This is a virtual call - method is in VMT
                       instr.IsVirtualCall := True;
-                      instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                      instr.VMTIndex := vmtIdx;
+                      Break;
                     end;
-                    Break;
+                  end;
+                end;
+                
+                // Fallback: also check in Methods list (for non-virtual methods)
+                if not instr.IsVirtualCall then
+                begin
+                  for methodIdx := 0 to High(cd.Methods) do
+                  begin
+                    if cd.Methods[methodIdx].Name = vmtMethodName then
+                    begin
+                      // Check if method is explicitly virtual
+                      if cd.Methods[methodIdx].IsVirtual then
+                      begin
+                        instr.IsVirtualCall := True;
+                        instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                      end;
+                      Break;
+                    end;
                   end;
                 end;
               end;

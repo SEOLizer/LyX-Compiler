@@ -408,9 +408,9 @@ begin
         FDiag.Error('expected base class name after ''extends''', FCurTok.Span);
     end
     else
-      // No inheritance: classes do not automatically inherit from TObject
-      // This was previously set to 'TObject' but that class doesn't exist in Lyx
-      baseClassName := '';
+      // No explicit inheritance: automatically inherit from TObject
+      // TObject is registered in sema.pas via RegisterTObject
+      baseClassName := 'TObject';
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
