@@ -32,6 +32,7 @@ const
   VMT_INDEX_DESTROY   = 0;
   VMT_INDEX_FREE      = 1;
   VMT_INDEX_CLASSNAME = 2;
+  VMT_INDEX_INHERITSFROM = 3;
   
   { VMT Header Offsets (negative Offsets relativ zu VMT-Basis) }
   VMT_OFFSET_PARENT_VMT   = -16;  // Pointer auf Parent-Klasse VMT
@@ -65,10 +66,11 @@ function CreateTObjectClassDecl: TAstClassDecl;
 var
   fields: TStructFieldList;
   methods: TMethodList;
-  destroyMethod, freeMethod, classNameMethod: TAstFuncDecl;
+  destroyMethod, freeMethod, classNameMethod, inheritsFromMethod: TAstFuncDecl;
   emptyParams: TAstParamList;
   emptyBlock: TAstBlock;
   emptyStmts: TAstStmtList;
+  inheritsFromParams: TAstParamList;
 begin
   // TObject hat keine Felder
   SetLength(fields, 0);
@@ -98,11 +100,24 @@ begin
   classNameMethod.IsVirtual := True;
   classNameMethod.VirtualTableIndex := VMT_INDEX_CLASSNAME;
   
+  // InheritsFrom - prüft ob diese Klasse von einer anderen erbt
+  // Parameter: className: pchar
+  // Rückgabe: bool
+  SetLength(inheritsFromParams, 1);
+  inheritsFromParams[0].Name := 'className';
+  inheritsFromParams[0].ParamType := atPChar;
+  inheritsFromParams[0].Span := NullSpan;
+  inheritsFromMethod := TAstFuncDecl.Create('InheritsFrom', inheritsFromParams, atBool,
+    TAstBlock.Create(emptyStmts, NullSpan), NullSpan, False);
+  inheritsFromMethod.IsVirtual := True;
+  inheritsFromMethod.VirtualTableIndex := VMT_INDEX_INHERITSFROM;
+  
   // Methoden-Array
-  SetLength(methods, 3);
+  SetLength(methods, 4);
   methods[0] := destroyMethod;
   methods[1] := freeMethod;
   methods[2] := classNameMethod;
+  methods[3] := inheritsFromMethod;
   
   // TObject-Klasse erstellen (keine Basisklasse - leerer String)
   Result := TAstClassDecl.Create(TOBJECT_CLASSNAME, '', fields, methods, True, NullSpan);

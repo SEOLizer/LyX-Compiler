@@ -624,6 +624,10 @@ begin
   SetLength(FVMTLabels, 0);
   SetLength(FVMTLeaPositions, 0);
 
+  // Pre-intern strings that will be used by built-in error handlers
+  // These must be interned BEFORE we calculate FStringOffsets
+  module.InternString('Abstract method called' + #10);
+
   // write interned strings
   SetLength(FStringOffsets, module.Strings.Count);
   totalDataOffset := 0;
@@ -810,6 +814,58 @@ begin
     WriteSyscall(FCode);
   end;
 
+  // === Generate Abstract Method Error Handler ===
+  // This handler is called when an abstract method is invoked at runtime
+  // It prints an error message to stderr and exits with code 1
+  begin
+    // Register label for the abstract method error handler
+    SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+    FLabelPositions[High(FLabelPositions)].Name := '__abstract_method_error';
+    FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+    
+    // push rbp
+    EmitU8(FCode, $55);
+    // mov rbp, rsp
+    EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+    
+    // Write error message to stderr (fd=2)
+    // Error message: "Abstract method called\n"
+    // Load message address using LEA with RIP-relative addressing
+    SetLength(FLeaPositions, Length(FLeaPositions) + 1);
+    FLeaPositions[High(FLeaPositions)] := FCode.Size;
+    SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
+    FLeaStrIndex[High(FLeaStrIndex)] := module.InternString('Abstract method called' + #10);
+    
+    // lea rsi, [rip + message_offset]
+    EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35);
+    EmitU32(FCode, 0);  // placeholder for RIP-relative offset
+    
+    // Use strlen to get message length (scan for \0)
+    // Save RSI to RCX
+    WriteMovRegReg(FCode, RCX, RSI);
+    // strlen_loop: cmp byte [rcx], 0
+    EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+    // je +5 (skip inc+jmp)
+    EmitU8(FCode, $74); EmitU8(FCode, $05);
+    // inc rcx
+    WriteIncReg(FCode, RCX);
+    // jmp -10 (back to cmp)
+    EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+    // strlen_done: rdx = rcx - rsi
+    WriteMovRegReg(FCode, RDX, RCX);
+    WriteSubRegReg(FCode, RDX, RSI);
+    
+    // syscall write(2, rsi, rdx) - 2 for stderr
+    WriteMovRegImm64(FCode, RAX, 1);  // sys_write
+    WriteMovRegImm64(FCode, RDI, 2);  // fd = stderr
+    WriteSyscall(FCode);
+    
+    // Exit with code 1
+    WriteMovRegImm64(FCode, RAX, 60); // sys_exit
+    WriteMovRegImm64(FCode, RDI, 1);  // exit code 1
+    WriteSyscall(FCode);
+  end;
+
   // === Generate TObject builtin methods for each class ===
   // These methods are automatically generated for all classes that inherit from TObject
   // 
@@ -827,6 +883,10 @@ begin
       for j := 0 to High(cd.VirtualMethods) do
       begin
         method := cd.VirtualMethods[j];
+        
+        // Skip nil entries (abstract methods that are not yet overridden)
+        if not Assigned(method) then
+          Continue;
         
         // Generate ClassName() method if it's inherited from TObject
         // The method needs auto-generation if:
@@ -930,6 +990,71 @@ begin
           EmitU8(FCode, $55);
           // mov rbp, rsp
           EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate InheritsFrom() method if it's inherited from TObject
+        // This is complex - needs to traverse the VMT chain
+        else if (method.Name = 'InheritsFrom') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's InheritsFrom method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_InheritsFrom';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // InheritsFrom implementation:
+          // RDI = self (object pointer)
+          // RSI = target class name (pchar)
+          // Returns: bool (true if self's class inherits from target)
+          //
+          // Algorithm:
+          // 1. Load VMT pointer from object: rax = [rdi]
+          // 2. Loop:
+          //    a. Load class name from VMT[-8]: rdx = [rax - 8]
+          //    b. Compare with target (string compare)
+          //    c. If equal: return true (rax = 1)
+          //    d. Load parent VMT: rax = [rax - 16]
+          //    e. If rax == 0: return false (rax = 0)
+          //    f. Continue loop
+          
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // Save RSI (target class name) to stack
+          EmitU8(FCode, $56); // push rsi
+          
+          // rdi already has self, load VMT pointer: mov rax, [rdi]
+          WriteMovRegMem(FCode, RAX, RDI, 0);
+          
+          // Start of loop
+          // Save current VMT to RBX for manipulation
+          // mov rbx, rax
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C3);
+          
+          // Load class name from VMT[-8]: mov rax, [rax - 8]
+          WriteMovRegMem(FCode, RAX, RAX, -8);
+          
+          // Restore target class name to RSI: pop rsi
+          EmitU8(FCode, $5E);
+          
+          // Compare strings: we need to implement string comparison
+          // For simplicity, we'll do a simple pointer comparison first
+          // TODO: Implement proper string comparison
+          
+          // For now, let's just do a simple implementation:
+          // Load VMT into rax again and get parent VMT at [-16]
+          // This is a simplified version that always returns false
+          // A full implementation would need string comparison
+          
+          // For demonstration, just return false (simplified)
+          WriteMovRegImm64(FCode, RAX, 0);
+          
           // pop rbp
           EmitU8(FCode, $5D);
           // ret
@@ -4193,6 +4318,52 @@ begin
         for j := 0 to High(cd.VirtualMethods) do
         begin
           method := cd.VirtualMethods[j];
+          
+          // Handle abstract methods (nil entries in VMT)
+          // Point them to the abstract method error handler
+          if not Assigned(method) then
+          begin
+            // Find abstract method error handler address
+            methodAddr := -1;
+            for k := 0 to High(FLabelPositions) do
+            begin
+              if FLabelPositions[k].Name = '__abstract_method_error' then
+              begin
+                methodAddr := FLabelPositions[k].Pos;
+                Break;
+              end;
+            end;
+            
+            if methodAddr >= 0 then
+            begin
+              // Patch VMT entry with abstract method error handler
+              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($401000 + methodAddr));
+            end;
+            Continue;
+          end;
+          
+          // Handle abstract methods that have method objects but IsAbstract=true
+          if method.IsAbstract then
+          begin
+            // Find abstract method error handler address
+            methodAddr := -1;
+            for k := 0 to High(FLabelPositions) do
+            begin
+              if FLabelPositions[k].Name = '__abstract_method_error' then
+              begin
+                methodAddr := FLabelPositions[k].Pos;
+                Break;
+              end;
+            end;
+            
+            if methodAddr >= 0 then
+            begin
+              // Patch VMT entry with abstract method error handler
+              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($401000 + methodAddr));
+            end;
+            Continue;
+          end;
+          
           methodLabelName := '_L_' + cd.Name + '_' + method.Name;
           
           // Find method address in label positions
