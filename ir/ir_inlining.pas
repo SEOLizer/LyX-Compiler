@@ -249,6 +249,23 @@ begin
     
     if (instr.Op = irCall) or (instr.Op = irVarCall) then
     begin
+      // Never inline virtual method calls - they need runtime dispatch
+      if instr.IsVirtualCall then
+      begin
+        SetLength(newInstrs, Length(newInstrs) + 1);
+        newInstrs[High(newInstrs)] := instr;
+        Continue;
+      end;
+      
+      // Never inline method calls (mangled names starting with _L_)
+      // These can be called via super or as base class methods and inlining breaks control flow
+      if (Length(instr.ImmStr) >= 3) and (Copy(instr.ImmStr, 1, 3) = '_L_') then
+      begin
+        SetLength(newInstrs, Length(newInstrs) + 1);
+        newInstrs[High(newInstrs)] := instr;
+        Continue;
+      end;
+      
       if instr.CallMode = cmInternal then
       begin
         targetFunc := FModule.FindFunction(instr.ImmStr);
