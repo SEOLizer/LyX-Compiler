@@ -20,6 +20,7 @@ type
     tkTry, tkCatch, tkThrow, tkFinally,
     // OOP Keywords
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
+    tkInterface, tkImplements,
     // Access Control Keywords
     tkPrivate, tkProtected,
     // SIMD Keywords
@@ -152,6 +153,8 @@ begin
     tkSuper:      Result := 'super';
     tkNew:        Result := 'new';
     tkDispose:    Result := 'dispose';
+    tkInterface:  Result := 'interface';
+    tkImplements: Result := 'implements';
     tkPrivate:    Result := 'private';
     tkProtected:  Result := 'protected';
     tkPanic:      Result := 'panic';
@@ -705,6 +708,8 @@ begin
     'super':      Result := tkSuper;
     'new':        Result := tkNew;
     'dispose':    Result := tkDispose;
+    'interface':   Result := tkInterface;
+    'implements':  Result := tkImplements;
     // Access Control Keywords
     'private':    Result := tkPrivate;
     'protected':  Result := tkProtected;

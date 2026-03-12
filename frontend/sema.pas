@@ -2228,16 +2228,30 @@ begin
           newExpr := TAstNewExpr(expr);
           if Length(newExpr.Args) > 0 then
           begin
-            // Look for Create method with matching arguments
-            mangledName := '_L_' + newExpr.ClassName + '_Create';
+            // Look for constructor method with matching arguments
+            // Constructor is named 'new' or 'Create' in Lyx
+            // Mangled as _L_<ClassName>_new or _L_<ClassName>_Create
+            mangledName := '_L_' + newExpr.ClassName + '_new';
             s := ResolveSymbol(mangledName);
             if s = nil then
             begin
-              FDiag.Error('class ' + newExpr.ClassName + ' has no Create constructor for new with arguments', expr.Span);
+              // Try 'Create' variant
+              mangledName := '_L_' + newExpr.ClassName + '_Create';
+              s := ResolveSymbol(mangledName);
+              if s <> nil then
+                newExpr.ConstructorName := 'Create';
+            end
+            else
+            begin
+              newExpr.ConstructorName := 'new';
+            end;
+            if s = nil then
+            begin
+              FDiag.Error('class ' + newExpr.ClassName + ' has no constructor for new with arguments', expr.Span);
               Result := atUnresolved;
               Exit;
             end;
-            // Check argument count (Create has self as first param, so ParamCount - 1)
+            // Check argument count (constructor has self as first param, so ParamCount - 1)
             if Length(newExpr.Args) <> s.ParamCount - 1 then
             begin
               FDiag.Error(Format('wrong argument count for %s constructor: expected %d, got %d', 
@@ -3233,10 +3247,68 @@ begin
           end;
         end;
       end;
+
+      // Validate constructor/destructor
+      if method.IsConstructor then
+      begin
+        // Constructor must have void return type
+        if method.ReturnType <> atVoid then
+        begin
+          FDiag.Error('constructor must not have a return type', method.Span);
+        end;
+        // Constructor cannot be virtual
+        if method.IsVirtual then
+        begin
+          FDiag.Error('constructor cannot be virtual', method.Span);
+        end;
+        // Constructor cannot be static
+        if method.IsStatic then
+        begin
+          FDiag.Error('constructor cannot be static', method.Span);
+        end;
+      end;
+
+      if method.IsDestructor then
+      begin
+        // Destructor must have void return type
+        if method.ReturnType <> atVoid then
+        begin
+          FDiag.Error('destructor must not have a return type', method.Span);
+        end;
+        // Destructor cannot be virtual
+        if method.IsVirtual then
+        begin
+          FDiag.Error('destructor cannot be virtual', method.Span);
+        end;
+        // Destructor cannot be static
+        if method.IsStatic then
+        begin
+          FDiag.Error('destructor cannot be static', method.Span);
+        end;
+      end;
     end;
 
     // Build VMT: collect virtual methods
-    cd.VirtualMethods := nil;  // Reset using property
+    // For TObject (no base class) or classes with pre-set VirtualMethods, keep existing VMT
+    // For other classes, build VMT from scratch
+    if (cd.BaseClassName = '') and (Length(cd.VirtualMethods) > 0) then
+    begin
+      // TObject or similar: already has VirtualMethods set from CreateTObjectClassDecl
+      // Just add any additional virtual methods from this class
+      for j := 0 to High(cd.Methods) do
+      begin
+        method := cd.Methods[j];
+        if method.IsVirtual and (method.VirtualTableIndex < 0) then
+        begin
+          vmtIdx := Length(cd.VirtualMethods);
+          method.VirtualTableIndex := vmtIdx;
+          cd.AddVirtualMethod(method);
+        end;
+      end;
+      Continue;  // Skip the rest of VMT building for this class
+    end;
+    
+    cd.VirtualMethods := nil;  // Reset using property for non-TObject classes
 
     // If there's a base class, inherit its VMT first
     if cd.BaseClassName <> '' then

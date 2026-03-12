@@ -529,7 +529,7 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   // newline constant for PrintLn
   nlGlobalPos: UInt64;
   // VMT emission
-  cd: TAstClassDecl;
+  cd, baseCd, nextBaseCd: TAstClassDecl;
   method: TAstFuncDecl;
   vmtLabelName: string;
   vmtLabelIdx: Integer;
@@ -2327,8 +2327,8 @@ begin
               end
               else
               begin
-                // VMT not found - should not happen
-                // For now, just emit a placeholder
+                // VMT not found - should not happen, but emit placeholder
+                // This may occur for TObject itself or other edge cases
                 leaPos := FCode.Size;
                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
                 slotIdx := localCnt + instr.Dest;
@@ -4364,6 +4364,7 @@ begin
             Continue;
           end;
           
+          // First try: method defined in this class
           methodLabelName := '_L_' + cd.Name + '_' + method.Name;
           
           // Find method address in label positions
@@ -4374,6 +4375,51 @@ begin
             begin
               methodAddr := FLabelPositions[k].Pos;
               Break;
+            end;
+          end;
+          
+          // Second try: method might be inherited - search in base class chain
+          if (methodAddr < 0) and (cd.BaseClassName <> '') then
+          begin
+            // Walk up the inheritance chain to find the defining class
+            baseCd := nil;
+            for k := 0 to High(module.ClassDecls) do
+            begin
+              if module.ClassDecls[k].Name = cd.BaseClassName then
+              begin
+                baseCd := module.ClassDecls[k];
+                Break;
+              end;
+            end;
+            
+            while Assigned(baseCd) and (methodAddr < 0) do
+            begin
+              methodLabelName := '_L_' + baseCd.Name + '_' + method.Name;
+              for k := 0 to High(FLabelPositions) do
+              begin
+                if FLabelPositions[k].Name = methodLabelName then
+                begin
+                  methodAddr := FLabelPositions[k].Pos;
+                  Break;
+                end;
+              end;
+              
+              // Move to next base class
+              if (methodAddr < 0) and (baseCd.BaseClassName <> '') then
+              begin
+                nextBaseCd := nil;
+                for k := 0 to High(module.ClassDecls) do
+                begin
+                  if module.ClassDecls[k].Name = baseCd.BaseClassName then
+                  begin
+                    nextBaseCd := module.ClassDecls[k];
+                    Break;
+                  end;
+                end;
+                baseCd := nextBaseCd;
+              end
+              else
+                baseCd := nil;
             end;
           end;
           

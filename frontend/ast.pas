@@ -62,7 +62,7 @@ type
      nkReturn, nkBreak, nkSwitch,
      nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
      // Top-Level
-     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl,
+     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl, nkInterfaceDecl,
      nkUnitDecl, nkImportDecl,
      nkProgram,
      // Bitwise AST nodes
@@ -80,6 +80,7 @@ type
   TAstStmt = class;
   TAstStructDecl = class;
   TAstClassDecl = class;
+  TAstInterfaceDecl = class;
 
   { --- Knotenlisten --- }
 
@@ -659,6 +660,9 @@ type
     FIsOverride: Boolean;
     FIsAbstract: Boolean;
     FVirtualTableIndex: Integer;
+    // Constructor/Destructor
+    FIsConstructor: Boolean;
+    FIsDestructor: Boolean;
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -680,6 +684,9 @@ type
     property IsOverride: Boolean read FIsOverride write FIsOverride;
     property IsAbstract: Boolean read FIsAbstract write FIsAbstract;
     property VirtualTableIndex: Integer read FVirtualTableIndex write FVirtualTableIndex;
+    // Constructor/Destructor
+    property IsConstructor: Boolean read FIsConstructor write FIsConstructor;
+    property IsDestructor: Boolean read FIsDestructor write FIsDestructor;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -749,6 +756,23 @@ type
     procedure SetLayout(aSize, aAlign: Integer);
   end;
 
+  { Interface-Deklaration }
+  TAstInterfaceDecl = class(TAstNode)
+  private
+    FName: string;
+    FMethods: TMethodList;  // nur Methodensignaturen (keine bodies)
+    FIsPublic: Boolean;
+    FMethodOffsets: array of Integer;  // für IMT (Interface Method Table)
+  public
+    constructor Create(const aName: string; const aMethods: TMethodList;
+      aPublic: Boolean; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Name: string read FName;
+    property Methods: TMethodList read FMethods;
+    property IsPublic: Boolean read FIsPublic;
+    property MethodOffsets: TIntArray read FMethodOffsets;
+  end;
+
   { Class-Deklaration mit Vererbung }
   TAstClassDecl = class(TAstNode)
   private
@@ -762,6 +786,9 @@ type
     FVMTName: string;               // "_vmt_ClassName"
     FClassNameLabel: string;        // Label for class name string in .rodata
     FIsPublic: Boolean;
+    // Interface fields
+    FImplementedInterfaces: TStringArray;  // Liste der Interface-Namen
+    FIMTName: string;  // "_imt_ClassName" Interface Method Table
     // layout info (computed by sema)
     FFieldOffsets: array of Integer;
     FSize: Integer;  // total size including base class fields
@@ -782,6 +809,9 @@ type
     property VMTName: string read FVMTName write FVMTName;
     property ClassNameLabel: string read FClassNameLabel write FClassNameLabel;
     property IsPublic: Boolean read FIsPublic;
+    // Interface properties
+    property ImplementedInterfaces: TStringArray read FImplementedInterfaces write FImplementedInterfaces;
+    property IMTName: string read FIMTName;
     property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
     property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
@@ -789,6 +819,7 @@ type
     procedure SetLayout(aSize, aAlign, aBaseSize: Integer);
     procedure SetBaseClassName(const aBaseClass: string);
     procedure AddVirtualMethod(method: TAstFuncDecl);
+    procedure AddImplementedInterface(const ifaceName: string);
   end;
 
   { new Ausdruck: new ClassName() oder new ClassName(args) }
@@ -796,12 +827,14 @@ type
   private
     FClassName: string;
     FArgs: TAstExprList;
+    FConstructorName: string;  // 'new' or 'Create'
   public
     constructor Create(const aClassName: string; aSpan: TSourceSpan);
     constructor CreateWithArgs(const aClassName: string; const aArgs: array of TAstExpr; aSpan: TSourceSpan);
     destructor Destroy; override;
     property ClassName: string read FClassName;
     property Args: TAstExprList read FArgs;
+    property ConstructorName: string read FConstructorName write FConstructorName;
   end;
 
   { dispose Statement: dispose expr; }
@@ -1084,6 +1117,7 @@ begin
     nkConstrainedTypeDecl: Result := 'ConstrainedTypeDecl';
     nkStructDecl:  Result := 'StructDecl';
     nkClassDecl:   Result := 'ClassDecl';
+    nkInterfaceDecl: Result := 'InterfaceDecl';
     nkUnitDecl:     Result := 'UnitDecl';
     nkImportDecl:  Result := 'ImportDecl';
     nkProgram:     Result := 'Program';
@@ -1874,6 +1908,29 @@ begin
   FAlign := aAlign;
 end;
 
+{ TAstInterfaceDecl }
+
+constructor TAstInterfaceDecl.Create(const aName: string; const aMethods: TMethodList;
+  aPublic: Boolean; aSpan: TSourceSpan);
+var i: Integer;
+begin
+  inherited Create(nkInterfaceDecl, aSpan);
+  FName := aName;
+  SetLength(FMethods, Length(aMethods));
+  for i := 0 to High(aMethods) do
+    FMethods[i] := aMethods[i];
+  FIsPublic := aPublic;
+  SetLength(FMethodOffsets, Length(FMethods));
+  for i := 0 to High(FMethodOffsets) do
+    FMethodOffsets[i] := -1;
+end;
+
+destructor TAstInterfaceDecl.Destroy;
+begin
+  FMethods := nil;
+  inherited Destroy;
+end;
+
 { TAstClassDecl }
 
 constructor TAstClassDecl.Create(const aName, aBaseClass: string;
@@ -1891,6 +1948,7 @@ begin
   // VMT fields initialization
   SetLength(FVirtualMethods, 0);
   FVMTName := '_vmt_' + aName;
+  FIMTName := '_imt_' + aName;
   FIsPublic := aPublic;
   FSize := 0;
   FAlign := 0;
@@ -1898,6 +1956,7 @@ begin
   SetLength(FFieldOffsets, Length(FFields));
   for i := 0 to High(FFieldOffsets) do
     FFieldOffsets[i] := -1;
+  SetLength(FImplementedInterfaces, 0);
 end;
 
 destructor TAstClassDecl.Destroy;
@@ -1930,6 +1989,12 @@ begin
   FVirtualMethods[High(FVirtualMethods)] := method;
 end;
 
+procedure TAstClassDecl.AddImplementedInterface(const ifaceName: string);
+begin
+  SetLength(FImplementedInterfaces, Length(FImplementedInterfaces) + 1);
+  FImplementedInterfaces[High(FImplementedInterfaces)] := ifaceName;
+end;
+
 { TAstNewExpr }
 
 constructor TAstNewExpr.Create(const aClassName: string; aSpan: TSourceSpan);
@@ -1937,6 +2002,7 @@ begin
   inherited Create(nkNewExpr, aSpan);
   FClassName := aClassName;
   SetLength(FArgs, 0);
+  FConstructorName := 'new';  // default
 end;
 
 constructor TAstNewExpr.CreateWithArgs(const aClassName: string; const aArgs: array of TAstExpr; aSpan: TSourceSpan);
@@ -1948,6 +2014,7 @@ begin
   SetLength(FArgs, Length(aArgs));
   for i := 0 to High(aArgs) do
     FArgs[i] := aArgs[i];
+  FConstructorName := 'new';  // default
 end;
 
 destructor TAstNewExpr.Destroy;
@@ -2105,6 +2172,9 @@ begin
   FIsVirtual := False;
   FIsOverride := False;
   FVirtualTableIndex := -1;
+  // Constructor/Destructor
+  FIsConstructor := False;
+  FIsDestructor := False;
 end;
 
 destructor TAstFuncDecl.Destroy;

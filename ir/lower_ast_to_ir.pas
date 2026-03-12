@@ -353,7 +353,7 @@ begin
     FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
     FModule.AddClassDecl(TAstClassDecl(node));
   end;
-
+  
   // iterate top-level decls, create functions
   for i := 0 to High(prog.Decls) do
   begin
@@ -2206,7 +2206,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
         end;
         
-        // If new has arguments, call the Create constructor
+        // If new has arguments, call the constructor (method named 'new')
         if Length(TAstNewExpr(expr).Args) > 0 then
         begin
           // Build args: [self (t0), original args...]
@@ -2218,18 +2218,23 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           for k := 0 to argCount - 1 do
             argTemps[k + 1] := LowerExpr(TAstNewExpr(expr).Args[k]);
           
-          // Emit call to Create constructor
+          // Emit call to constructor (use the name from AST)
           t1 := NewTemp;
           instr := Default(TIRInstr);
           instr.Op := irCall;
           instr.Dest := t1;
-          instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_Create';
+          instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_' + TAstNewExpr(expr).ConstructorName;
           instr.ImmInt := argCount + 1; // +1 for self
           instr.CallMode := cmInternal;
           SetLength(instr.ArgTemps, argCount + 1);
           for k := 0 to argCount do
             instr.ArgTemps[k] := argTemps[k];
           Emit(instr);
+        end
+        else
+        begin
+          // No arguments, but check if there's a constructor with 0 params
+          // For now, we don't auto-call it - user must call constructor explicitly if needed
         end;
         
         Result := t0;
