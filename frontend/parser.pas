@@ -1701,7 +1701,37 @@ begin
     nsCandidate := FCurTok.Value;  // second ident (potential function name)
     nsSpan := FCurTok.Span;
     Advance; // consume the second ident
-    if Check(tkLParen) or Check(tkLBrace) then
+    
+    // Check for Pascal-style constructor: ClassName.Create or ClassName.Create() = new ClassName()
+    // Note: Create without parentheses is also valid
+    if (nsCandidate = 'Create') and not Check(tkLBrace) then
+    begin
+      // Pascal-style constructor: ClassName.Create = new ClassName()
+      // Check if there are arguments
+      args := nil;
+      if Accept(tkLParen) then
+      begin
+        // With arguments: ClassName.Create(arg1, arg2, ...)
+        if not Check(tkRParen) then
+        begin
+          SetLength(args, 1);
+          args[0] := ParseExpr;
+          while Accept(tkComma) do
+          begin
+            SetLength(args, Length(args) + 1);
+            args[High(args)] := ParseExpr;
+          end;
+        end;
+        Expect(tkRParen);
+      end;
+      // Create as new expression
+      if Length(args) > 0 then
+        Result := ParsePostfix(TAstNewExpr.CreateWithArgs(savedName, args, savedSpan))
+      else
+        Result := ParsePostfix(TAstNewExpr.Create(savedName, savedSpan));
+      Exit;
+    end
+    else if Check(tkLParen) or Check(tkLBrace) then
     begin
       // Confirmed: namespace-qualified call or struct literal
       namespace := savedName;
