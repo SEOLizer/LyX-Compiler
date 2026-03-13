@@ -366,7 +366,9 @@ var
   isStatic: Boolean;
   isVirtual: Boolean;
   isOverride: Boolean;
+  isAbstract: Boolean;
   baseClassName: string;
+  implInterfaces: TStringArray;
   curVisibility: TVisibility;
   constraintExpr: TAstExpr;
 begin
@@ -381,19 +383,72 @@ begin
     name := '<anon>';
     FDiag.Error('expected type name', FCurTok.Span);
   end;
-  // '=' (single equals for type declarations)
-  if Check(tkSingleEq) then
+  // '=' or ':=' (both are valid for type declarations)
+  if Check(tkSingleEq) or Check(tkAssign) then
     Advance
   else
   begin
     FDiag.Error('expected ''='' in type declaration', FCurTok.Span);
   end;
 
-  // class [extends BaseClass] { ... }
-  if Check(tkClass) then
+  // Interface IName { ... }
+  if Check(tkInterface) then
   begin
+    Advance; // interface
+    // Parse interface method signatures (no body)
+    methods := nil;
+    while not Check(tkRBrace) and not Check(tkEOF) do
+    begin
+      // Method signature: fn name(params): retType;
+      if Check(tkFn) then
+      begin
+        Advance; // fn
+        if Check(tkIdent) then
+        begin
+          mName := FCurTok.Value;
+          Advance;
+        end
+        else
+        begin
+          mName := '<anon>';
+          FDiag.Error('expected method name', FCurTok.Span);
+        end;
+        Expect(tkLParen);
+        mParams := nil;
+        if not Check(tkRParen) then
+          mParams := ParseParamList
+        else
+          mParams := nil;
+        Expect(tkRParen);
+        mRetTypeName := '';
+        mRetType := atVoid;
+        if Accept(tkColon) then
+          mRetType := ParseTypeEx(dummy, mRetTypeName);
+        // Interface methods have no body - they end with ;
+        Expect(tkSemicolon);
+        m := TAstFuncDecl.Create(mName, mParams, mRetType, nil, FCurTok.Span, False);
+        m.ReturnTypeName := mRetTypeName;
+        SetLength(methods, Length(methods) + 1);
+        methods[High(methods)] := m;
+      end
+      else
+      begin
+        FDiag.Error('expected method signature in interface', FCurTok.Span);
+        Advance;
+      end;
+    end;
+    Expect(tkRBrace);
+    Expect(tkSemicolon);
+    Result := TAstInterfaceDecl.Create(name, methods, isPub, FCurTok.Span);
+    Exit;
+  end
+  // class [extends BaseClass] [implements IName] { ... }
+  else if Check(tkClass) then
+  begin
+    // class [extends BaseClass] [implements IName] { ... }
     Advance; // class
     baseClassName := '';
+    SetLength(implInterfaces, 0);
     // Check for extends
     if Check(tkExtends) then
     begin
@@ -407,9 +462,27 @@ begin
         FDiag.Error('expected base class name after ''extends''', FCurTok.Span);
     end
     else
-      // No inheritance: classes do not automatically inherit from TObject
-      // This was previously set to 'TObject' but that class doesn't exist in Lyx
-      baseClassName := '';
+    begin
+      // No explicit inheritance: automatically inherit from TObject
+      baseClassName := 'TObject';
+    end;
+    // Check for implements
+    if Check(tkImplements) then
+    begin
+      Advance; // implements
+      // Parse interface names
+      while Check(tkIdent) do
+      begin
+        SetLength(implInterfaces, Length(implInterfaces) + 1);
+        implInterfaces[High(implInterfaces)] := FCurTok.Value;
+        Advance;
+        if Check(tkComma) then
+          Advance  // consume comma
+        else
+          Break;
+      end;
+    end;
+    // Now expect class body
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
@@ -417,20 +490,25 @@ begin
     begin
       // parse optional visibility modifier
       curVisibility := ParseVisibility;
-      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) or Check(tkOverride) then
+      if Check(tkFn) or Check(tkStatic) or Check(tkVirtual) or Check(tkOverride) or Check(tkAbstract) then
       begin
         // parse method declaration
-        // Modifier order: [static] [virtual|override] fn name(...)
+        // Modifier order: [static] [virtual|override|abstract] fn name(...)
         isStatic := Accept(tkStatic);
         isVirtual := Accept(tkVirtual);
         isOverride := Accept(tkOverride);
+        isAbstract := Accept(tkAbstract);
+        // abstract implies virtual
+        if isAbstract then
+          isVirtual := True;
         // After modifiers, we expect fn
         if not Check(tkFn) then
         begin
           FDiag.Error('expected ''fn'' keyword after modifiers', FCurTok.Span);
         end;
         Expect(tkFn);
-        if Check(tkIdent) then
+        // Method name can be: identifier, 'new' (constructor), or 'dispose' (destructor)
+        if Check(tkIdent) or Check(tkNew) or Check(tkDispose) then
         begin
           mName := FCurTok.Value;
           Advance;
@@ -451,13 +529,29 @@ begin
           mRetType := ParseTypeEx(dummy, mRetTypeName)
         else
           mRetType := atVoid;
-        mBody := ParseBlock;
+        // Abstract methods have no body - they end with ;
+        if isAbstract then
+        begin
+          if not Check(tkSemicolon) then
+            FDiag.Error('abstract method must not have a body', FCurTok.Span)
+          else
+            Advance;
+          mBody := nil;
+        end
+        else
+          mBody := ParseBlock;
         m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
         m.ReturnTypeName := mRetTypeName;
         m.IsStatic := isStatic;
         m.IsVirtual := isVirtual;
         m.IsOverride := isOverride;
+        m.IsAbstract := isAbstract;
         m.Visibility := curVisibility;
+        // Constructor/Destructor detection
+        if (mName = 'new') or (mName = 'Create') then
+          m.IsConstructor := True
+        else if (mName = 'dispose') or (mName = 'Destroy') then
+          m.IsDestructor := True;
         SetLength(methods, Length(methods) + 1);
         methods[High(methods)] := m;
       end
@@ -482,72 +576,34 @@ begin
     Expect(tkRBrace);
     Expect(tkSemicolon);
     Result := TAstClassDecl.Create(name, baseClassName, fields, methods, isPub, FCurTok.Span);
+    // Set implemented interfaces
+    TAstClassDecl(Result).ImplementedInterfaces := implInterfaces;
     Exit;
   end
-  // struct { ... }  or simple type
+  // struct { ... }
   else if Check(tkStruct) then
   begin
-    // parse inline struct definition
     Advance; // struct
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
     while not Check(tkRBrace) and not Check(tkEOF) do
     begin
-      // parse optional visibility modifier
-      curVisibility := ParseVisibility;
-      if Check(tkFn) or Check(tkStatic) then
+      // Structs only have fields (no methods, no visibility modifiers)
+      if Check(tkIdent) then
       begin
-        // parse method declaration
-        // check for static modifier
-        isStatic := Accept(tkStatic);
-        Expect(tkFn);
-        // parse method name, params, return type, body inline (similar to ParseFuncDecl but without the 'fn' expect)
-        if Check(tkIdent) then
-        begin
-          mName := FCurTok.Value;
-          Advance;
-        end
-        else
-        begin
-          mName := '<anon>';
-          FDiag.Error('expected method name', FCurTok.Span);
-        end;
-        Expect(tkLParen);
-        if not Check(tkRParen) then
-          mParams := ParseParamList
-        else
-          mParams := nil;
-        Expect(tkRParen);
-        // optional return type
-        mRetTypeName := '';
-        if Accept(tkColon) then
-          mRetType := ParseTypeEx(dummy, mRetTypeName)
-        else
-          mRetType := atVoid;
-        mBody := ParseBlock;
-        m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, False);
-        m.ReturnTypeName := mRetTypeName;
-        m.IsStatic := isStatic;
-        m.Visibility := curVisibility;
-        SetLength(methods, Length(methods) + 1);
-        methods[High(methods)] := m;
-      end
-      else if Check(tkIdent) then
-      begin
-        // field: name : Type ;
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
-        fld.Visibility := curVisibility;
+        fld.Visibility := visPublic;  // Struct fields are always public
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
       end
       else
       begin
-        FDiag.Error('unexpected token in struct body', FCurTok.Span);
+        FDiag.Error('expected field name in struct', FCurTok.Span);
         Advance;
       end;
     end;
@@ -1228,10 +1284,27 @@ function TParser.ParseCmpExpr: TAstExpr;
 var
   op: TTokenKind;
   rhs: TAstExpr;
+  targetClassName: string;
 begin
   Result := ParseShiftExpr;
+  
+  if Result = nil then Exit(nil);
+
+  // "is" Operator für Laufzeit-Typprüfung
+  if Check(tkIs) then
+  begin
+    Advance; // consume 'is'
+    if not (FCurTok.Kind = tkIdent) then
+    begin
+      FDiag.Error('erwartete Klassenname nach is', FCurTok.Span);
+      Exit(nil);
+    end;
+    targetClassName := FCurTok.Value;
+    Advance; // consume class name
+    Result := TAstIsExpr.Create(Result, targetClassName, Result.Span);
+  end
   // "in" Operator für Map/Set Containment-Check
-  if Check(tkIn) then
+  else if Check(tkIn) then
   begin
     Advance;
     rhs := ParseShiftExpr;

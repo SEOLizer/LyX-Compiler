@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager;
+  ast, ir, diag, lexer, unit_manager, tobject;
 
 type
   TConstValue = class
@@ -69,12 +69,12 @@ implementation
 
 { Helpers }
 
-function IntToObj(i: Integer): TObject;
+function IntToObj(i: Integer): System.TObject;
 begin
-  Result := TObject(Pointer(i));
+  Result := System.TObject(Pointer(i));
 end;
 
-function ObjToInt(o: TObject): Integer;
+function ObjToInt(o: System.TObject): Integer;
 begin
   Result := Integer(Pointer(o));
 end;
@@ -123,7 +123,7 @@ var
 begin
   FLocalMap.Free;
   for i := 0 to FConstMap.Count - 1 do
-    TObject(FConstMap.Objects[i]).Free;
+    System.TObject(FConstMap.Objects[i]).Free;
   FConstMap.Free;
   for i := 0 to Length(FLocalConst)-1 do
     if Assigned(FLocalConst[i]) then FLocalConst[i].Free;
@@ -293,12 +293,12 @@ begin
   begin
     node := prog.Decls[i];
     if node is TAstStructDecl then
-      FStructTypes.AddObject(TAstStructDecl(node).Name, TObject(node))
+      FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node))
     else if node is TAstClassDecl then
     begin
       // Classes are stored in both maps - they have the same field layout logic
-      FStructTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
-      FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+      FStructTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+      FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
       // Also store in IR module for VMT emission
       FModule.AddClassDecl(TAstClassDecl(node));
     end
@@ -307,7 +307,7 @@ begin
       // Global variable declaration
       if TAstVarDecl(node).IsGlobal then
       begin
-        FGlobalVars.AddObject(TAstVarDecl(node).Name, TObject(node));
+        FGlobalVars.AddObject(TAstVarDecl(node).Name, System.TObject(node));
         // Register in module with init value
         if TAstVarDecl(node).InitExpr is TAstIntLit then
         begin
@@ -342,7 +342,18 @@ begin
       end;
     end;
   end;
-
+  
+  // Add TObject to class types if not already present
+  // TObject is the implicit base class for all classes without explicit base
+  if FClassTypes.IndexOf(TOBJECT_CLASSNAME) < 0 then
+  begin
+    // Create TObject class declaration and add to module
+    node := CreateTObjectClassDecl;
+    FStructTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FModule.AddClassDecl(TAstClassDecl(node));
+  end;
+  
   // iterate top-level decls, create functions
   for i := 0 to High(prog.Decls) do
   begin
@@ -604,7 +615,7 @@ begin
         cv.Free;
         Continue;
       end;
-      FConstMap.AddObject(TAstConDecl(node).Name, TObject(cv));
+      FConstMap.AddObject(TAstConDecl(node).Name, System.TObject(cv));
     end;
   end;
   Result := FModule;
@@ -746,6 +757,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     signedVal: Int64;
     cvLocal: TConstValue;
     vd: TAstVarDecl;
+    castTypeName: string;
     items: TAstExprList;
     elemSize: Integer;
     fa: TAstFieldAssign;
@@ -767,6 +779,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     classIdx: Integer;
     cd: TAstClassDecl;
     methodIdx: Integer;
+    vmtIdx: Integer;
     vmtClassName: string;
     vmtMethodName: string;
     posIdx: Integer;
@@ -1593,18 +1606,38 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               if classIdx >= 0 then
               begin
                 cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
-                // Find method in class
-                for methodIdx := 0 to High(cd.Methods) do
+                // First check if class has virtual methods (VMT exists)
+                if Length(cd.VirtualMethods) > 0 then
                 begin
-                  if cd.Methods[methodIdx].Name = vmtMethodName then
+                  // Look for method in VirtualMethods list (has correct VMT indices)
+                  for vmtIdx := 0 to High(cd.VirtualMethods) do
                   begin
-                    if cd.Methods[methodIdx].IsVirtual then
+                    if Assigned(cd.VirtualMethods[vmtIdx]) and 
+                       (cd.VirtualMethods[vmtIdx].Name = vmtMethodName) then
                     begin
-                      // This is a virtual call
+                      // This is a virtual call - method is in VMT
                       instr.IsVirtualCall := True;
-                      instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                      instr.VMTIndex := vmtIdx;
+                      Break;
                     end;
-                    Break;
+                  end;
+                end;
+                
+                // Fallback: also check in Methods list (for non-virtual methods)
+                if not instr.IsVirtualCall then
+                begin
+                  for methodIdx := 0 to High(cd.Methods) do
+                  begin
+                    if cd.Methods[methodIdx].Name = vmtMethodName then
+                    begin
+                      // Check if method is explicitly virtual
+                      if cd.Methods[methodIdx].IsVirtual then
+                      begin
+                        instr.IsVirtualCall := True;
+                        instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                      end;
+                      Break;
+                    end;
                   end;
                 end;
               end;
@@ -1839,11 +1872,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         // Get source and target types
         ltype := TAstCast(expr).Expr.ResolvedType;
         rType := TAstCast(expr).CastType;
+        castTypeName := TAstCast(expr).CastTypeName;
 
         t0 := NewTemp;
 
+        // Check for class cast (target is a class name)
+        if (castTypeName <> '') and (FClassTypes.IndexOf(castTypeName) >= 0) then
+        begin
+          // Class cast: emit is-type check first
+          // If false, we should panic or return null
+          // For now, we just emit a simple copy (the check is done at runtime via is)
+          
+          // TODO: Add runtime check for class cast
+          // For now, just copy the pointer
+          instr.Op := irLoadLocal;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end
         // Check for int -> float conversion
-        if (ltype = atInt64) and (rType = atF64) then
+        else if (ltype = atInt64) and (rType = atF64) then
         begin
           instr.Op := irIToF;
           instr.Dest := t0;
@@ -2066,6 +2114,33 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         Result := t0;
       end;
 
+    nkIsExpr:
+      begin
+        // Is expression: expr is ClassName
+        // Returns true if expr is an instance of ClassName or a derived class
+        // We implement this by checking the class name in the VMT
+        
+        t1 := LowerExpr(TAstIsExpr(expr).Expr);
+        if t1 < 0 then Exit;
+        
+        // Call the ClassName method and compare with target class name
+        // For now, we emit a call to a runtime helper that does the check
+        
+        // Load object pointer into RDI (first arg)
+        // Emit: mov rdi, [rbp - slot]
+        
+        // For simplicity, we emit a call to a builtin that checks the type
+        // Format: irIsType(object, targetClassName) -> bool
+        
+        t0 := NewTemp;
+        instr.Op := irIsType;
+        instr.Dest := t0;
+        instr.Src1 := t1;  // object pointer
+        instr.ImmStr := TAstIsExpr(expr).ClassName;  // target class name
+        Emit(instr);
+        Result := t0;
+      end;
+
     nkNewExpr:
       begin
         // new ClassName() or new ClassName(args) - allocate heap memory for class
@@ -2131,7 +2206,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
         end;
         
-        // If new has arguments, call the Create constructor
+        // If new has arguments, call the constructor (method named 'new')
         if Length(TAstNewExpr(expr).Args) > 0 then
         begin
           // Build args: [self (t0), original args...]
@@ -2143,18 +2218,23 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           for k := 0 to argCount - 1 do
             argTemps[k + 1] := LowerExpr(TAstNewExpr(expr).Args[k]);
           
-          // Emit call to Create constructor
+          // Emit call to constructor (use the name from AST)
           t1 := NewTemp;
           instr := Default(TIRInstr);
           instr.Op := irCall;
           instr.Dest := t1;
-          instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_Create';
+          instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_' + TAstNewExpr(expr).ConstructorName;
           instr.ImmInt := argCount + 1; // +1 for self
           instr.CallMode := cmInternal;
           SetLength(instr.ArgTemps, argCount + 1);
           for k := 0 to argCount do
             instr.ArgTemps[k] := argTemps[k];
           Emit(instr);
+        end
+        else
+        begin
+          // No arguments, but check if there's a constructor with 0 params
+          // For now, we don't auto-call it - user must call constructor explicitly if needed
         end;
         
         Result := t0;
@@ -2645,11 +2725,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
      // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
      if (arrLen = -1) or (vd.DeclType = atDynArray) then
      begin
-        // static array: allocate consecutive locals and initialize per-item
+        // dynamic array: allocate 3 slots (ptr, len, cap)
         // IMPORTANT: Store elements in REVERSE order so that arr[0] has the 
         // highest slot index. This way, base_addr + index*8 works correctly
         // because stack grows downward.
-        loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
+        loc := AllocLocalMany(vd.Name, vd.DeclType, 3);  // 3 slots for dynamic array: ptr, len, cap
         if vd.InitExpr is TAstArrayLit then
         begin
           items := TAstArrayLit(vd.InitExpr).Items;

@@ -4,10 +4,10 @@ unit x86_64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
+   SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
 
-type
-  TLabelPos = record
+ type
+   TLabelPos = record
     Name: string;
     Pos: Integer;
   end;
@@ -37,6 +37,11 @@ type
       VMTIndex: Integer;
       CodePos: Integer;
     end;
+    // IsType LEA positions for patching (target class name string -> code position)
+    FIsTypeLeaPositions: array of record
+      DataOffset: Integer;
+      CodePos: Integer;
+    end;
     // External symbols recorded for PLT/GOT (name, libname)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
@@ -44,10 +49,14 @@ type
     FEnergyStats: TEnergyStats;
     FEnergyContext: TEnergyContext;
     FCurrentCPU: TCPUEnergyModel;
-    FMemoryAccessCount: UInt64;
-    FCurrentFunctionEnergy: UInt64;
-    procedure TrackEnergy(kind: TEnergyOpKind);
-  public
+     FMemoryAccessCount: UInt64;
+     FCurrentFunctionEnergy: UInt64;
+      procedure TrackEnergy(kind: TEnergyOpKind);
+
+      // Debugging helpers
+      procedure EmitDebugPrintString(const s: string);
+      procedure EmitDebugPrintInt(valueReg: Integer);
+    public
     constructor Create;
     destructor Destroy; override;
     procedure EmitFromIR(module: TIRModule);
@@ -65,6 +74,7 @@ implementation
 uses
   Math;
 
+// Register constants for use with byte-based helper functions
 const
   RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7; R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
   ParamRegs: array[0..5] of Byte = (RDI, RSI, RDX, RCX, R8, R9);
@@ -98,14 +108,14 @@ begin
 end;
 
 
-procedure WriteMovRegImm64(buf: TByteBuffer; reg: Byte; imm: UInt64);
+procedure WriteMovRegImm64(buf: TByteBuffer; reg: Integer; imm: UInt64);
 begin
   // mov r64, imm64 : REX.W + B8+rd
   EmitRex(buf, 1, 0, 0, (reg shr 3) and 1);
   EmitU8(buf, $B8 + (reg and $7));
   EmitU64(buf, imm);
 end;
-procedure WriteMovRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteMovRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // mov r/m64, r64 : REX.W + 89 /r  (encode reg=src, rm=dst)
@@ -115,7 +125,7 @@ begin
   EmitU8(buf, $89);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteMovRegMem(buf: TByteBuffer; reg, base: Byte; disp: Integer);
+procedure WriteMovRegMem(buf: TByteBuffer; reg, base: Integer; disp: Integer);
 var rexR, rexB: Integer;
     modrm, modBits: Byte;
 begin
@@ -140,7 +150,7 @@ begin
   else
     EmitU32(buf, Cardinal(disp));
 end;
-procedure WriteMovMemReg(buf: TByteBuffer; base: Byte; disp: Integer; reg: Byte);
+procedure WriteMovMemReg(buf: TByteBuffer; base: Integer; disp: Integer; reg: Integer);
 var rexR, rexB: Integer;
     modrm, modBits: Byte;
 begin
@@ -162,7 +172,7 @@ begin
   else
     EmitU32(buf, Cardinal(disp));
 end;
-procedure WriteAddRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteAddRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // add r/m64, r64 : REX.W + 01 /r  (reg=src, rm=dst)
@@ -172,7 +182,7 @@ begin
   EmitU8(buf, $01);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteSubRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteSubRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // sub r/m64, r64 : REX.W + 29 /r
@@ -182,7 +192,7 @@ begin
   EmitU8(buf, $29);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteImulRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteImulRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // imul r64, r/m64 : REX.W 0F AF /r  (reg=dst, rm=src)
@@ -194,7 +204,7 @@ begin
   EmitU8(buf, $C0 or (((dst and 7) shl 3) and $38) or (src and $7));
 end;
 procedure WriteCqo(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$99); end;
-procedure WriteIdivReg(buf: TByteBuffer; src: Byte);
+procedure WriteIdivReg(buf: TByteBuffer; src: Integer);
 var rexB: Integer;
 begin
   // idiv r/m64 : REX.W + F7 /7 ; modrm = 0xF8 | rm (with mod=11)
@@ -204,7 +214,7 @@ begin
   EmitU8(buf, $F8 or (src and $7));
 end;
 procedure WriteTestRaxRax(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$85); EmitU8(buf,$C0); end;
-procedure WriteTestRegReg(buf: TByteBuffer; r1, r2: Byte);
+procedure WriteTestRegReg(buf: TByteBuffer; r1, r2: Integer);
 var rexR, rexB: Integer;
 begin
   rexR := (r1 shr 3) and 1;
@@ -244,7 +254,7 @@ begin
   EmitU8(buf, $FF); EmitU8(buf, $C0 or (reg and $7));
 end;
 
-procedure WriteMovMemRegByte(buf: TByteBuffer; base: Byte; disp: Integer; reg8: Byte);
+procedure WriteMovMemRegByte(buf: TByteBuffer; base: Integer; disp: Integer; reg8: Integer);
 begin
   // mov byte ptr [base + disp32], r8 -> 88 /0 with mod=10 (disp32)
   EmitU8(buf, $88);
@@ -252,14 +262,14 @@ begin
   EmitU32(buf, Cardinal(disp));
 end;
 
-procedure WriteMovMemRegByteNoDisp(buf: TByteBuffer; base: Byte; reg8: Byte);
+procedure WriteMovMemRegByteNoDisp(buf: TByteBuffer; base: Integer; reg8: Integer);
 begin
   // mov byte ptr [base], r8 -> 88 /0 with mod=00 and rm=base
   EmitU8(buf, $88);
   EmitU8(buf, ((reg8 and $7) shl 3) or (base and $7));
 end;
 
-procedure WriteMovMemImm8(buf: TByteBuffer; base: Byte; disp: Integer; value: Byte);
+procedure WriteMovMemImm8(buf: TByteBuffer; base: Integer; disp: Integer; value: Integer);
 begin
   // mov byte ptr [base+disp32], imm8 => C6 80 disp32 imm8
   EmitU8(buf, $C6);
@@ -268,7 +278,7 @@ begin
   EmitU8(buf, value);
 end;
 
-procedure WriteSetccMem8(buf: TByteBuffer; ccOpcode: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteSetccMem8(buf: TByteBuffer; ccOpcode: Integer; baseReg: Integer; disp32: Integer);
 begin
   // setcc r/m8 : opcode 0F ccOpcode modrm(mod=10) rm=base
   EmitU8(buf, $0F);
@@ -277,7 +287,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movzx r64, r/m8 : rex.w 0F B6 /r with reg=dst, rm=mem
   EmitU8(buf, $48);
@@ -287,7 +297,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movzx r64, r/m16 : rex.w 0F B7 /r
   EmitU8(buf, $48);
@@ -297,7 +307,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsx r64, r/m8 : rex.w 0F BE /r
   EmitU8(buf, $48);
@@ -307,7 +317,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsx r64, r/m16 : rex.w 0F BF /r
   EmitU8(buf, $48);
@@ -317,7 +327,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsxd r64, r/m32 : rex.w 63 /r
   EmitU8(buf, $48);
@@ -326,7 +336,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Byte; disp32: Integer);
+procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Integer; disp32: Integer);
 begin
   // mov eax, dword ptr [base+disp32] : 8B 80 disp32
   EmitU8(buf, $8B);
@@ -342,7 +352,7 @@ const
   XMM4 = 4; XMM5 = 5; XMM6 = 6; XMM7 = 7;
 
 // movsd xmm, [base+disp32] — F2 REX? 0F 10 /r
-procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Byte; disp: Integer);
+procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Integer; disp: Integer);
 var modBits: Byte;
 begin
   EmitU8(buf, $F2);
@@ -358,7 +368,7 @@ begin
 end;
 
 // movsd [base+disp32], xmm — F2 REX? 0F 11 /r
-procedure WriteMovsdStore(buf: TByteBuffer; base: Byte; disp: Integer; xmm: Byte);
+procedure WriteMovsdStore(buf: TByteBuffer; base: Integer; disp: Integer; xmm: Integer);
 var modBits: Byte;
 begin
   EmitU8(buf, $F2);
@@ -374,49 +384,49 @@ begin
 end;
 
 // addsd xmm0, xmm1 — F2 0F 58 /r
-procedure WriteAddsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteAddsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $58);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // subsd xmm0, xmm1 — F2 0F 5C /r
-procedure WriteSubsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteSubsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5C);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // mulsd xmm0, xmm1 — F2 0F 59 /r
-procedure WriteMulsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteMulsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $59);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // divsd xmm0, xmm1 — F2 0F 5E /r
-procedure WriteDivsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteDivsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5E);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // xorpd xmm, xmm — 66 0F 57 /r (für FNeg: XOR mit Sign-Bit-Maske)
-procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteXorpd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $57);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // ucomisd xmm0, xmm1 — 66 0F 2E /r
-procedure WriteUcomisd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteUcomisd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $2E);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // cvtsi2sd xmm, r64 — F2 REX.W 0F 2A /r (int64 → f64)
-procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Byte);
+procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Integer);
 begin
   EmitU8(buf, $F2);
   EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
@@ -425,7 +435,7 @@ begin
 end;
 
 // cvttsd2si r64, xmm — F2 REX.W 0F 2C /r (f64 → int64 mit Truncation)
-procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Byte);
+procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Integer);
 begin
   EmitU8(buf, $F2);
   EmitRex(buf, 1, (gpr shr 3) and 1, 0, (xmm shr 3) and 1);
@@ -434,7 +444,7 @@ begin
 end;
 
 // movq xmm, r64 — 66 REX.W 0F 6E /r
-procedure WriteMovqToXmm(buf: TByteBuffer; xmm, gpr: Byte);
+procedure WriteMovqToXmm(buf: TByteBuffer; xmm, gpr: Integer);
 begin
   EmitU8(buf, $66);
   EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
@@ -529,13 +539,18 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   // newline constant for PrintLn
   nlGlobalPos: UInt64;
   // VMT emission
-  cd: TAstClassDecl;
+  cd, baseCd, nextBaseCd: TAstClassDecl;
   method: TAstFuncDecl;
   vmtLabelName: string;
   vmtLabelIdx: Integer;
   vmtDataPos: Integer;
   methodAddr: Integer;
   methodLabelName: string;
+  // RTTI patching
+  classNamePos: Integer;
+  classNamePtrPos: Integer;
+  parentVmtPos: Integer;
+  parentPtrPos: Integer;
   // env data storage (argc, argv)
   envAdded: Boolean;
   envOffset: UInt64;
@@ -566,6 +581,12 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
    end;
    inspectStr: string;
    inspectStrOff: UInt64;
+   // IsType (is operator) specific variables
+   isTypeStrOff: UInt64;
+   isTypeLeaPos, isTypeLoopPos, isTypeStrCmpLoopPos: Integer;
+   isTypeStrCmpNePos, isTypeStrCmpEqPos: Integer;
+   isTypeNullJmpPos, isTypeFalsePos, isTypeTruePos: Integer;
+   isTypeDoneJmpPos, isTypeDonePos: Integer;
   // for call/abi
   argCount: Integer;
   argTemps: array of Integer;
@@ -618,6 +639,11 @@ begin
   SetLength(FJumpPatches, 0);
   SetLength(FVMTLabels, 0);
   SetLength(FVMTLeaPositions, 0);
+  SetLength(FIsTypeLeaPositions, 0);
+
+  // Pre-intern strings that will be used by built-in error handlers
+  // These must be interned BEFORE we calculate FStringOffsets
+  module.InternString('Abstract method called' + #10);
 
   // write interned strings
   SetLength(FStringOffsets, module.Strings.Count);
@@ -698,9 +724,15 @@ begin
     end;
   end;
 
-  // === VMT (Virtual Method Table) Emission ===
-  // Emit VMT tables for all classes with virtual methods
-  // We store VMT data in the data section and create labels for them
+  // === VMT (Virtual Method Table) Emission with RTTI ===
+  // VMT Layout with RTTI header:
+  //   Offset -16: Parent VMT Pointer (for InheritsFrom, 0 for TObject)
+  //   Offset -8:  ClassName Pointer (points to null-terminated string in .rodata)
+  //   Offset 0:   Method 0 (first virtual method)
+  //   Offset 8:   Method 1 (second virtual method)
+  //   ...
+  // The VMT pointer in instances points to Offset 0 (first method)
+  
   for i := 0 to High(module.ClassDecls) do
   begin
     cd := module.ClassDecls[i];
@@ -708,9 +740,47 @@ begin
     if Length(cd.VirtualMethods) > 0 then
     begin
       vmtLabelName := '_vmt_' + cd.Name;
-      // Store VMT label for later use
-      vmtLabelIdx := Length(FVMTLabels);
+      
+      // First emit the class name string (for RTTI ClassName method)
+      // Store label for class name string
       SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_classname_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      
+      // Write class name as null-terminated string
+      for j := 1 to Length(cd.Name) do
+        FData.WriteU8(Ord(cd.Name[j]));
+      FData.WriteU8(0);  // null terminator
+      Inc(totalDataOffset, Length(cd.Name) + 1);
+      
+      // Align to 8 bytes before RTTI header
+      while (FData.Size mod 8) <> 0 do
+      begin
+        FData.WriteU8(0);
+        Inc(totalDataOffset);
+      end;
+      
+      // Emit RTTI header (before the actual VMT base)
+      // 1. Parent VMT Pointer (will be patched later)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_vmt_parent_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder for parent VMT pointer
+      Inc(totalDataOffset, 8);
+      
+      // 2. ClassName Pointer (will be patched to point to class name string)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
+      FVMTLabels[vmtLabelIdx].Name := '_vmt_classname_ptr_' + cd.Name;
+      FVMTLabels[vmtLabelIdx].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder for class name pointer
+      Inc(totalDataOffset, 8);
+      
+      // Now emit the VMT base (this is where instance VMT pointers point to)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      vmtLabelIdx := High(FVMTLabels);
       FVMTLabels[vmtLabelIdx].Name := vmtLabelName;
       FVMTLabels[vmtLabelIdx].Pos := FData.Size;
       
@@ -726,7 +796,8 @@ begin
     end;
   end;
 
-  // Emit program entry (_start): automatically initialize env data (argc/argv) and call main
+  // Emit program entry (_start) FIRST - this must be at address 0x401000
+  // _start: automatically initialize env data (argc/argv) and call main
   // Nach SysV ABI: RDI = argc, RSI = argv
   begin
     // Reserve env data in data segment (16 bytes: argc,qword + argv_ptr,qword)
@@ -758,6 +829,218 @@ begin
     WriteMovRegImm64(FCode, RAX, 60);
     // syscall
     WriteSyscall(FCode);
+  end;
+
+  // === Generate Abstract Method Error Handler ===
+  // This handler is called when an abstract method is invoked at runtime
+  // It prints an error message to stderr and exits with code 1
+  begin
+    // Register label for the abstract method error handler
+    SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+    FLabelPositions[High(FLabelPositions)].Name := '__abstract_method_error';
+    FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+    
+    // push rbp
+    EmitU8(FCode, $55);
+    // mov rbp, rsp
+    EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+    
+    // Write error message to stderr (fd=2)
+    // Error message: "Abstract method called\n"
+    // Load message address using LEA with RIP-relative addressing
+    SetLength(FLeaPositions, Length(FLeaPositions) + 1);
+    FLeaPositions[High(FLeaPositions)] := FCode.Size;
+    SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
+    FLeaStrIndex[High(FLeaStrIndex)] := module.InternString('Abstract method called' + #10);
+    
+    // lea rsi, [rip + message_offset]
+    EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $35);
+    EmitU32(FCode, 0);  // placeholder for RIP-relative offset
+    
+    // Use strlen to get message length (scan for \0)
+    // Save RSI to RCX
+    WriteMovRegReg(FCode, RCX, RSI);
+    // strlen_loop: cmp byte [rcx], 0
+    EmitU8(FCode, $80); EmitU8(FCode, $39); EmitU8(FCode, $00);
+    // je +5 (skip inc+jmp)
+    EmitU8(FCode, $74); EmitU8(FCode, $05);
+    // inc rcx
+    WriteIncReg(FCode, RCX);
+    // jmp -10 (back to cmp)
+    EmitU8(FCode, $EB); EmitU8(FCode, $F6);
+    // strlen_done: rdx = rcx - rsi
+    WriteMovRegReg(FCode, RDX, RCX);
+    WriteSubRegReg(FCode, RDX, RSI);
+    
+    // syscall write(2, rsi, rdx) - 2 for stderr
+    WriteMovRegImm64(FCode, RAX, 1);  // sys_write
+    WriteMovRegImm64(FCode, RDI, 2);  // fd = stderr
+    WriteSyscall(FCode);
+    
+    // Exit with code 1
+    WriteMovRegImm64(FCode, RAX, 60); // sys_exit
+    WriteMovRegImm64(FCode, RDI, 1);  // exit code 1
+    WriteSyscall(FCode);
+  end;
+
+  // === Generate TObject builtin methods for each class ===
+  // These methods are automatically generated for all classes that inherit from TObject
+  // 
+  // ClassName(): pchar - returns pointer to class name string from VMT[-8]
+  // Free(): void - calls Destroy() virtually and then frees memory
+  // Destroy(): void - empty virtual destructor (can be overridden)
+  //
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    cd := module.ClassDecls[i];
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Check if class has ClassName method that needs auto-generation
+      // (i.e., not explicitly defined in user code)
+      for j := 0 to High(cd.VirtualMethods) do
+      begin
+        method := cd.VirtualMethods[j];
+        
+        // Skip nil entries (abstract methods that are not yet overridden)
+        if not Assigned(method) then
+          Continue;
+        
+        // Generate ClassName() method if it's inherited from TObject
+        // The method needs auto-generation if:
+        // 1. It's named 'ClassName' AND
+        // 2. Either has no body, or has an empty body (inherited from TObject)
+        if (method.Name = 'ClassName') and 
+           ((method.Body = nil) or 
+            ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's ClassName method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_ClassName';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // ClassName implementation:
+          // self (object pointer) is in RDI
+          // 1. mov rax, [rdi]          ; Load VMT pointer from object
+          // 2. mov rax, [rax - 8]      ; Load ClassName pointer from VMT[-8]
+          // 3. ret
+          
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          
+          // mov rax, [rdi] - load VMT pointer
+          WriteMovRegMem(FCode, RAX, RDI, 0);
+          // mov rax, [rax - 8] - load ClassName pointer from VMT header
+          WriteMovRegMem(FCode, RAX, RAX, -8);
+          
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate Free() method if it's inherited from TObject
+        else if (method.Name = 'Free') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's Free method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_Free';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // Free implementation:
+          // self (object pointer) is in RDI
+          // 1. Call Destroy() virtually
+          // 2. Call munmap to free the memory
+          //
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // push rdi (save self for later munmap)
+          EmitU8(FCode, $57);
+          // sub rsp, 8 (align stack)
+          EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, $08);
+          
+          // Call Destroy virtually:
+          // mov rax, [rdi]       ; load VMT pointer
+          WriteMovRegMem(FCode, RAX, RDI, 0);
+          // mov rax, [rax + 0]   ; load Destroy method (index 0)
+          WriteMovRegMem(FCode, RAX, RAX, 0);
+          // call rax
+          EmitU8(FCode, $FF); EmitU8(FCode, $D0);
+          
+          // Now free memory with munmap:
+          // add rsp, 8
+          EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, $08);
+          // pop rdi (restore self = address to free)
+          EmitU8(FCode, $5F);
+          // mov rsi, PAGE_SIZE (4096) - we allocated page-aligned memory
+          WriteMovRegImm64(FCode, RSI, 4096);
+          // mov rax, 11 (sys_munmap)
+          WriteMovRegImm64(FCode, RAX, 11);
+          // syscall
+          WriteSyscall(FCode);
+          
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate Destroy() method if it's inherited from TObject
+        else if (method.Name = 'Destroy') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's Destroy method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_Destroy';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // Destroy implementation (empty base implementation):
+          // Just return - derived classes can override
+          //
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // ret
+          EmitU8(FCode, $C3);
+        end
+        
+        // Generate InheritsFrom() method if it's inherited from TObject
+        // Simplified: returns true if class name is readable (placeholder)
+        else if (method.Name = 'InheritsFrom') and 
+                ((method.Body = nil) or 
+                 ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
+        begin
+          // Register label for this class's InheritsFrom method
+          SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+          FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_InheritsFrom';
+          FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          
+          // Simplified: just return true (placeholder)
+          // Note: String parameter handling needs more work in IR/codegen
+          
+          // Function prologue
+          // push rbp
+          EmitU8(FCode, $55);
+          // mov rbp, rsp
+          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+          // pop rbp
+          EmitU8(FCode, $5D);
+          // mov eax, 1 (return true - placeholder)
+          EmitU8(FCode, $B8); EmitU8(FCode, $01); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
+          // ret
+          EmitU8(FCode, $C3);
+        end;
+      end;
+    end;
   end;
 
     for i := 0 to High(module.Functions) do
@@ -2023,8 +2306,8 @@ begin
               end
               else
               begin
-                // VMT not found - should not happen
-                // For now, just emit a placeholder
+                // VMT not found - should not happen, but emit placeholder
+                // This may occur for TObject itself or other edge cases
                 leaPos := FCode.Size;
                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
                 slotIdx := localCnt + instr.Dest;
@@ -3424,6 +3707,155 @@ begin
             WriteSyscall(FCode);
           end;
 
+          irIsType:
+            begin
+              // Type check: is_type(object, targetClassName) -> bool
+              // Algorithm:
+              // 1. Load object pointer from local slot
+              // 2. Load VMT pointer from object
+              // 3. Loop: Get class name from VMT[-8], compare with target
+              // 4. If match: return true
+              // 5. Else: load parent VMT from VMT[-16], if null return false, else goto 3
+              
+              // First, write target class name to .data section
+              isTypeStrOff := totalDataOffset;
+              for k := 1 to Length(instr.ImmStr) do
+                FData.WriteU8(Byte(instr.ImmStr[k]));
+              FData.WriteU8(0);  // null terminator
+              Inc(totalDataOffset, Length(instr.ImmStr) + 1);
+              
+              // Align to 8 bytes
+              while (FData.Size mod 8) <> 0 do
+              begin
+                FData.WriteU8(0);
+                Inc(totalDataOffset);
+              end;
+
+
+
+              // Load object pointer from local slot into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              EmitDebugPrintString('Object ptr (RAX): ');
+              EmitDebugPrintInt(RAX);
+              EmitDebugPrintString(#10);
+              
+              // Check for null object
+              // test rax, rax
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0);
+              // jz .is_false (null object -> false)
+              isTypeNullJmpPos := FCode.Size;
+              EmitU8(FCode, $0F); EmitU8(FCode, $84); EmitU32(FCode, 0); // jz rel32
+              
+              // Load VMT pointer from object into RBX (preserved across loop)
+              // mov rbx, [rax]
+              WriteMovRegMem(FCode, RBX, RAX, 0);
+              EmitDebugPrintString('Initial VMT ptr (RBX): ');
+              EmitDebugPrintInt(RBX);
+              EmitDebugPrintString(#10);
+              
+              // LEA RDI, [rip + targetClassName] - load target class name address
+              isTypeLeaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $3D); EmitU32(FCode, 0);
+              
+              // Loop label position
+              isTypeLoopPos := FCode.Size;
+              EmitDebugPrintString('--- loop start ---'#10);
+              
+              // Load current class name pointer from VMT[-8] into RSI
+              // mov rsi, [rbx - 8]
+              WriteMovRegMem(FCode, RSI, RBX, -8);
+              EmitDebugPrintString('Current Class Name Ptr (RSI): ');
+              EmitDebugPrintInt(RSI);
+              EmitDebugPrintString(#10);
+              EmitDebugPrintString('Comparing with target: ');
+              EmitDebugPrintString(instr.ImmStr);
+              EmitDebugPrintString(#10);
+              
+              // Compare strings (RDI = target, RSI = current)
+              // Save RDI and RBX on stack (they need to survive the comparison)
+              EmitU8(FCode, $57);  // push rdi
+              EmitU8(FCode, $53);  // push rbx
+              
+              // Inline strcmp: compare byte by byte
+              // .strcmp_loop:
+              isTypeStrCmpLoopPos := FCode.Size;
+              //   mov al, [rdi]
+              EmitU8(FCode, $8A); EmitU8(FCode, $07);
+              //   mov cl, [rsi]
+              EmitU8(FCode, $8A); EmitU8(FCode, $0E);
+              //   cmp al, cl
+              EmitU8(FCode, $38); EmitU8(FCode, $C8);
+              //   jne .strcmp_not_equal
+              isTypeStrCmpNePos := FCode.Size;
+              EmitU8(FCode, $75); EmitU8(FCode, 0);  // jne rel8
+              //   test al, al
+              EmitU8(FCode, $84); EmitU8(FCode, $C0);
+              //   jz .strcmp_equal (both are null -> equal)
+              isTypeStrCmpEqPos := FCode.Size;
+              EmitU8(FCode, $74); EmitU8(FCode, 0);  // jz rel8
+              //   inc rdi
+              WriteIncReg(FCode, RDI);
+              //   inc rsi
+              WriteIncReg(FCode, RSI);
+              //   jmp .strcmp_loop
+              EmitU8(FCode, $EB);
+              EmitU8(FCode, Byte(isTypeStrCmpLoopPos - FCode.Size - 1));
+              
+              // .strcmp_not_equal: strings don't match, try parent VMT
+              FCode.PatchU8(isTypeStrCmpNePos + 1, Byte(FCode.Size - isTypeStrCmpNePos - 2));
+              EmitDebugPrintString('Strings do not match. Trying parent VMT...'#10);
+              // Restore registers (RDI & RBX already popped by string compare logic)
+              EmitU8(FCode, $5B);  // pop rbx
+              EmitU8(FCode, $5F);  // pop rdi
+              // Load parent VMT pointer from VMT[-16]
+              // mov rbx, [rbx - 16]
+              WriteMovRegMem(FCode, RBX, RBX, -16);
+              EmitDebugPrintString('Parent VMT ptr (RBX): ');
+              EmitDebugPrintInt(RBX);
+              EmitDebugPrintString(#10);
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $DB); // test rbx, rbx (check if null)
+              // jnz .loop (continue if not null)
+              EmitU8(FCode, $0F); EmitU8(FCode, $85);
+              EmitU32(FCode, UInt32(Int32(isTypeLoopPos - FCode.Size - 4)));
+              // Fall through to false
+              isTypeFalsePos := FCode.Size;
+              EmitDebugPrintString('Reached end of VMT chain. Returning false.'#10);
+              WriteMovRegImm64(FCode, RAX, 0);
+              // jmp .done
+              isTypeDoneJmpPos := FCode.Size;
+              EmitU8(FCode, $EB); EmitU8(FCode, 0);  // jmp rel8
+              
+              // .strcmp_equal: strings match -> return true
+              FCode.PatchU8(isTypeStrCmpEqPos + 1, Byte(FCode.Size - isTypeStrCmpEqPos - 2));
+              EmitDebugPrintString('Strings match! Returning true.'#10);
+              // Restore registers
+              EmitU8(FCode, $5B);  // pop rbx
+              EmitU8(FCode, $5F);  // pop rdi
+              isTypeTruePos := FCode.Size;
+              WriteMovRegImm64(FCode, RAX, 1);
+              // jmp .done
+              EmitU8(FCode, $EB); EmitU8(FCode, 0);
+              
+              // .is_false (null object case)
+              // Patch the null check jump
+              FCode.PatchU32LE(isTypeNullJmpPos + 2, UInt32(isTypeFalsePos - isTypeNullJmpPos - 6));
+              EmitDebugPrintString('Object is null. Returning false.'#10);
+              
+              // .done:
+              isTypeDonePos := FCode.Size;
+              FCode.PatchU8(isTypeDoneJmpPos + 1, Byte(isTypeDonePos - isTypeDoneJmpPos - 2));
+              // Also patch the true->done jump
+              FCode.PatchU8(isTypeTruePos + 10 + 1, Byte(isTypeDonePos - (isTypeTruePos + 10) - 2));
+              
+              // Store result
+              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+              
+              // Record LEA position for patching with actual data address
+              SetLength(FIsTypeLeaPositions, Length(FIsTypeLeaPositions) + 1);
+              FIsTypeLeaPositions[High(FIsTypeLeaPositions)].DataOffset := isTypeStrOff;
+              FIsTypeLeaPositions[High(FIsTypeLeaPositions)].CodePos := isTypeLeaPos;
+            end;
+
         // === In-Situ Data Visualizer (Debugging 2.0) ===
         irInspect:
           begin
@@ -3843,6 +4275,17 @@ begin
     disp32 := Int64(dataVA) - Int64(instrVA);
     FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
   end;
+  
+  // patch IsType string LEAs (for 'is' operator target class names)
+  for i := 0 to High(FIsTypeLeaPositions) do
+  begin
+    leaPos := FIsTypeLeaPositions[i].CodePos;
+    codeVA := 4096;
+    instrVA := codeVA + leaPos + 7;
+    dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FIsTypeLeaPositions[i].DataOffset;
+    disp32 := Int64(dataVA) - Int64(instrVA);
+    FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+  end;
 
   // Generate PLT stubs for external symbols at end of code section
   // Standard x86-64 PLT layout (each entry 16 bytes):
@@ -3961,8 +4404,8 @@ begin
     end;
   end;
 
-  // === VMT Patching ===
-  // Patch VMT entries with actual method addresses
+  // === VMT Patching with RTTI ===
+  // Patch VMT entries with actual method addresses and RTTI pointers
   for i := 0 to High(module.ClassDecls) do
   begin
     cd := module.ClassDecls[i];
@@ -3986,6 +4429,53 @@ begin
         for j := 0 to High(cd.VirtualMethods) do
         begin
           method := cd.VirtualMethods[j];
+          
+          // Handle abstract methods (nil entries in VMT)
+          // Point them to the abstract method error handler
+          if not Assigned(method) then
+          begin
+            // Find abstract method error handler address
+            methodAddr := -1;
+            for k := 0 to High(FLabelPositions) do
+            begin
+              if FLabelPositions[k].Name = '__abstract_method_error' then
+              begin
+                methodAddr := FLabelPositions[k].Pos;
+                Break;
+              end;
+            end;
+            
+            if methodAddr >= 0 then
+            begin
+              // Patch VMT entry with abstract method error handler
+              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($401000 + methodAddr));
+            end;
+            Continue;
+          end;
+          
+          // Handle abstract methods that have method objects but IsAbstract=true
+          if method.IsAbstract then
+          begin
+            // Find abstract method error handler address
+            methodAddr := -1;
+            for k := 0 to High(FLabelPositions) do
+            begin
+              if FLabelPositions[k].Name = '__abstract_method_error' then
+              begin
+                methodAddr := FLabelPositions[k].Pos;
+                Break;
+              end;
+            end;
+            
+            if methodAddr >= 0 then
+            begin
+              // Patch VMT entry with abstract method error handler
+              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($401000 + methodAddr));
+            end;
+            Continue;
+          end;
+          
+          // First try: method defined in this class
           methodLabelName := '_L_' + cd.Name + '_' + method.Name;
           
           // Find method address in label positions
@@ -3999,6 +4489,51 @@ begin
             end;
           end;
           
+          // Second try: method might be inherited - search in base class chain
+          if (methodAddr < 0) and (cd.BaseClassName <> '') then
+          begin
+            // Walk up the inheritance chain to find the defining class
+            baseCd := nil;
+            for k := 0 to High(module.ClassDecls) do
+            begin
+              if module.ClassDecls[k].Name = cd.BaseClassName then
+              begin
+                baseCd := module.ClassDecls[k];
+                Break;
+              end;
+            end;
+            
+            while Assigned(baseCd) and (methodAddr < 0) do
+            begin
+              methodLabelName := '_L_' + baseCd.Name + '_' + method.Name;
+              for k := 0 to High(FLabelPositions) do
+              begin
+                if FLabelPositions[k].Name = methodLabelName then
+                begin
+                  methodAddr := FLabelPositions[k].Pos;
+                  Break;
+                end;
+              end;
+              
+              // Move to next base class
+              if (methodAddr < 0) and (baseCd.BaseClassName <> '') then
+              begin
+                nextBaseCd := nil;
+                for k := 0 to High(module.ClassDecls) do
+                begin
+                  if module.ClassDecls[k].Name = baseCd.BaseClassName then
+                  begin
+                    nextBaseCd := module.ClassDecls[k];
+                    Break;
+                  end;
+                end;
+                baseCd := nextBaseCd;
+              end
+              else
+                baseCd := nil;
+            end;
+          end;
+          
           if methodAddr >= 0 then
           begin
             // Patch VMT entry with ABSOLUTE method address (code base + offset)
@@ -4009,6 +4544,75 @@ begin
           begin
           end;
         end;
+        
+        // === RTTI Patching ===
+        // 1. Patch ClassName pointer (at VMT-8)
+        classNamePos := -1;
+        for j := 0 to High(FVMTLabels) do
+        begin
+          if FVMTLabels[j].Name = '_classname_' + cd.Name then
+          begin
+            classNamePos := FVMTLabels[j].Pos;
+            Break;
+          end;
+        end;
+        
+        if classNamePos >= 0 then
+        begin
+          // Find the classname pointer position (VMT - 8)
+          classNamePtrPos := -1;
+          for j := 0 to High(FVMTLabels) do
+          begin
+            if FVMTLabels[j].Name = '_vmt_classname_ptr_' + cd.Name then
+            begin
+              classNamePtrPos := FVMTLabels[j].Pos;
+              Break;
+            end;
+          end;
+          
+          if classNamePtrPos >= 0 then
+          begin
+            // Data base is 0x402000 (data segment comes after code)
+            // Patch with absolute address to classname string
+            FData.PatchU64LE(classNamePtrPos, UInt64($402000 + classNamePos));
+          end;
+        end;
+        
+        // 2. Patch Parent VMT pointer (at VMT-16)
+        if cd.BaseClassName <> '' then
+        begin
+          // Find parent VMT position
+          parentVmtPos := -1;
+          for j := 0 to High(FVMTLabels) do
+          begin
+            if FVMTLabels[j].Name = '_vmt_' + cd.BaseClassName then
+            begin
+              parentVmtPos := FVMTLabels[j].Pos;
+              Break;
+            end;
+          end;
+          
+          if parentVmtPos >= 0 then
+          begin
+            // Find parent pointer position
+            parentPtrPos := -1;
+            for j := 0 to High(FVMTLabels) do
+            begin
+              if FVMTLabels[j].Name = '_vmt_parent_' + cd.Name then
+              begin
+                parentPtrPos := FVMTLabels[j].Pos;
+                Break;
+              end;
+            end;
+            
+            if parentPtrPos >= 0 then
+            begin
+              // Patch with absolute address to parent VMT
+              FData.PatchU64LE(parentPtrPos, UInt64($402000 + parentVmtPos));
+            end;
+          end;
+        end;
+        // Note: For TObject (no base class), parent VMT pointer stays 0
       end;
     end;
   end;
@@ -4052,7 +4656,7 @@ begin
   Result := FEnergyStats;
 end;
 
-procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
+  procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
 begin
   energy_model.SetEnergyLevel(level, cfX86_64);
   FEnergyContext.Config := GetEnergyConfig;
@@ -4060,5 +4664,23 @@ begin
   FEnergyContext.CurrentCPU := FCurrentCPU;
 end;
 
+  // Debugging helper implementations
+  procedure TX86_64Emitter.EmitDebugPrintString(const s: string);
+  var
+    strOffset: UInt64;
+    leaPos: Integer;
+    i: Integer;
+  begin
+    // Placeholder - actual implementation would emit debug output
+    // This is disabled to avoid complexity
+  end;
+
+  procedure TX86_64Emitter.EmitDebugPrintInt(valueReg: Integer);
+  begin
+    // Placeholder - actual implementation would emit debug output
+    // This is disabled to avoid complexity
+  end;
+
 end.
+
 
