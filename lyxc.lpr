@@ -229,14 +229,14 @@ begin
   
     if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.2.0');
+    WriteLn(StdErr, 'Lyx Compiler v0.5.0');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64]');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
-    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux oder arm64)');
+    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64 oder macosx64)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
@@ -350,7 +350,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.3.1');
+  WriteLn('Lyx Compiler v0.5.0');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
@@ -360,7 +360,9 @@ begin
   else if target = targetLinux then
     WriteLn('Ziel:     Linux x86_64 (ELF64)')
   else if target = targetLinuxARM64 then
-    WriteLn('Ziel:     Linux ARM64 (ELF64)');
+    WriteLn('Ziel:     Linux ARM64 (ELF64)')
+  else if target = targetMacOSX64 then
+    WriteLn('Ziel:     macOS x86_64 (Mach-O)');
 
   // Energy-Konfiguration setzen (vor der Statusausgabe)
   if flagEnergyLevel > 0 then
