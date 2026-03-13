@@ -1,13 +1,13 @@
 # Lyx
 
 **Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
-It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
+It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, **Windows x64 PE32+**, and **macOS x86_64 Mach-O** binaries — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
 Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -176,7 +176,7 @@ L1 cache footprint:    846 bytes
 
 ### Cross-Compilation
 
-Lyx supports **cross-compilation** for three target platforms:
+Lyx supports **cross-compilation** for four target platforms:
 
 ```bash
 # Linux x86_64 ELF64 (default on Linux hosts)
@@ -187,6 +187,9 @@ Lyx supports **cross-compilation** for three target platforms:
 
 # Windows PE32+ (from Linux)
 ./lyxc program.lyx -o program.exe --target=win64
+
+# macOS x86_64 Mach-O (from Linux)
+./lyxc program.lyx -o program --target=macosx64
 ```
 
 | Target Platform | Format | Calling Convention | OS Interface |
@@ -194,6 +197,7 @@ Lyx supports **cross-compilation** for three target platforms:
 | `linux` | ELF64 | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
 | `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
 | `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
+| `macosx64` | Mach-O | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls (BSD) |
 
 **Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
 
@@ -204,6 +208,13 @@ sudo apt install qemu-user-static
 
 # Run ARM64 binary
 qemu-aarch64-static ./program
+```
+
+**Testing macOS binaries (on Linux):**
+```bash
+# Copy to a macOS machine via SSH/SCP
+scp program user@mac:/tmp/
+ssh user@mac "/tmp/program"
 ```
 
 ---
@@ -1660,11 +1671,15 @@ Source code (.lyx)
       |
   [ Backend ]       IR -> Machine code (Bytes)
       |
-      +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
+      +-- [ Linux x86_64: x86_64_emit + elf64_writer ]   -> ELF64 Binary
       |
-      +-- [ Windows: x86_64_win64 + pe64_writer ]  -> PE32+ Binary
+      +-- [ Linux ARM64:  arm64_emit + elf64_writer ]    -> ELF64 Binary
       |
-  Executable (ELF64 or PE32+, without libc)
+      +-- [ Windows x64:  x86_64_win64 + pe64_writer ]   -> PE32+ Binary
+      |
+      +-- [ macOS x86_64: macosx64_emit + macho64_writer ] -> Mach-O Binary
+      |
+  Executable (ELF64, PE32+, or Mach-O, without libc)
 ```
 
 ### Project Structure
@@ -1686,10 +1701,17 @@ backend/
   x86_64/
     x86_64_emit.pas         x86_64 instruction encoding (Linux/SysV)
     x86_64_win64.pas        Windows x64 emitter (Shadow Space, IAT)
+  arm64/
+    arm64_emit.pas          ARM64 instruction encoding (AAPCS64)
   elf/
-    elf64_writer.pas        ELF64 binary writer
+    elf64_writer.pas        ELF64 binary writer (Linux x86_64/ARM64)
   pe/
     pe64_writer.pas         PE32+ binary writer (DOS/COFF/Optional Header)
+  macho/
+    macho64_writer.pas      Mach-O 64-bit binary writer (macOS)
+    syscalls_macos.pas      macOS BSD syscall constants
+  macosx64/
+    macosx64_emit.pas       macOS x86_64 code emitter
 util/
   diag.pas                  Diagnostics (errors with line/column)
   bytes.pas                 TByteBuffer (byte encoding + patching)
