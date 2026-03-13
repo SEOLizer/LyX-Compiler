@@ -4,10 +4,10 @@ unit x86_64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
+   SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
 
-type
-  TLabelPos = record
+ type
+   TLabelPos = record
     Name: string;
     Pos: Integer;
   end;
@@ -37,6 +37,11 @@ type
       VMTIndex: Integer;
       CodePos: Integer;
     end;
+    // IsType LEA positions for patching (target class name string -> code position)
+    FIsTypeLeaPositions: array of record
+      DataOffset: Integer;
+      CodePos: Integer;
+    end;
     // External symbols recorded for PLT/GOT (name, libname)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
@@ -44,10 +49,14 @@ type
     FEnergyStats: TEnergyStats;
     FEnergyContext: TEnergyContext;
     FCurrentCPU: TCPUEnergyModel;
-    FMemoryAccessCount: UInt64;
-    FCurrentFunctionEnergy: UInt64;
-    procedure TrackEnergy(kind: TEnergyOpKind);
-  public
+     FMemoryAccessCount: UInt64;
+     FCurrentFunctionEnergy: UInt64;
+      procedure TrackEnergy(kind: TEnergyOpKind);
+
+      // Debugging helpers
+      procedure EmitDebugPrintString(const s: string);
+      procedure EmitDebugPrintInt(valueReg: Integer);
+    public
     constructor Create;
     destructor Destroy; override;
     procedure EmitFromIR(module: TIRModule);
@@ -65,6 +74,7 @@ implementation
 uses
   Math;
 
+// Register constants for use with byte-based helper functions
 const
   RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7; R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
   ParamRegs: array[0..5] of Byte = (RDI, RSI, RDX, RCX, R8, R9);
@@ -98,14 +108,14 @@ begin
 end;
 
 
-procedure WriteMovRegImm64(buf: TByteBuffer; reg: Byte; imm: UInt64);
+procedure WriteMovRegImm64(buf: TByteBuffer; reg: Integer; imm: UInt64);
 begin
   // mov r64, imm64 : REX.W + B8+rd
   EmitRex(buf, 1, 0, 0, (reg shr 3) and 1);
   EmitU8(buf, $B8 + (reg and $7));
   EmitU64(buf, imm);
 end;
-procedure WriteMovRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteMovRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // mov r/m64, r64 : REX.W + 89 /r  (encode reg=src, rm=dst)
@@ -115,7 +125,7 @@ begin
   EmitU8(buf, $89);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteMovRegMem(buf: TByteBuffer; reg, base: Byte; disp: Integer);
+procedure WriteMovRegMem(buf: TByteBuffer; reg, base: Integer; disp: Integer);
 var rexR, rexB: Integer;
     modrm, modBits: Byte;
 begin
@@ -140,7 +150,7 @@ begin
   else
     EmitU32(buf, Cardinal(disp));
 end;
-procedure WriteMovMemReg(buf: TByteBuffer; base: Byte; disp: Integer; reg: Byte);
+procedure WriteMovMemReg(buf: TByteBuffer; base: Integer; disp: Integer; reg: Integer);
 var rexR, rexB: Integer;
     modrm, modBits: Byte;
 begin
@@ -162,7 +172,7 @@ begin
   else
     EmitU32(buf, Cardinal(disp));
 end;
-procedure WriteAddRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteAddRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // add r/m64, r64 : REX.W + 01 /r  (reg=src, rm=dst)
@@ -172,7 +182,7 @@ begin
   EmitU8(buf, $01);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteSubRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteSubRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // sub r/m64, r64 : REX.W + 29 /r
@@ -182,7 +192,7 @@ begin
   EmitU8(buf, $29);
   EmitU8(buf, $C0 or (((src and 7) shl 3) and $38) or (dst and $7));
 end;
-procedure WriteImulRegReg(buf: TByteBuffer; dst, src: Byte);
+procedure WriteImulRegReg(buf: TByteBuffer; dst, src: Integer);
 var rexR, rexB: Integer;
 begin
   // imul r64, r/m64 : REX.W 0F AF /r  (reg=dst, rm=src)
@@ -194,7 +204,7 @@ begin
   EmitU8(buf, $C0 or (((dst and 7) shl 3) and $38) or (src and $7));
 end;
 procedure WriteCqo(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$99); end;
-procedure WriteIdivReg(buf: TByteBuffer; src: Byte);
+procedure WriteIdivReg(buf: TByteBuffer; src: Integer);
 var rexB: Integer;
 begin
   // idiv r/m64 : REX.W + F7 /7 ; modrm = 0xF8 | rm (with mod=11)
@@ -204,7 +214,7 @@ begin
   EmitU8(buf, $F8 or (src and $7));
 end;
 procedure WriteTestRaxRax(buf: TByteBuffer); begin EmitU8(buf,$48); EmitU8(buf,$85); EmitU8(buf,$C0); end;
-procedure WriteTestRegReg(buf: TByteBuffer; r1, r2: Byte);
+procedure WriteTestRegReg(buf: TByteBuffer; r1, r2: Integer);
 var rexR, rexB: Integer;
 begin
   rexR := (r1 shr 3) and 1;
@@ -244,7 +254,7 @@ begin
   EmitU8(buf, $FF); EmitU8(buf, $C0 or (reg and $7));
 end;
 
-procedure WriteMovMemRegByte(buf: TByteBuffer; base: Byte; disp: Integer; reg8: Byte);
+procedure WriteMovMemRegByte(buf: TByteBuffer; base: Integer; disp: Integer; reg8: Integer);
 begin
   // mov byte ptr [base + disp32], r8 -> 88 /0 with mod=10 (disp32)
   EmitU8(buf, $88);
@@ -252,14 +262,14 @@ begin
   EmitU32(buf, Cardinal(disp));
 end;
 
-procedure WriteMovMemRegByteNoDisp(buf: TByteBuffer; base: Byte; reg8: Byte);
+procedure WriteMovMemRegByteNoDisp(buf: TByteBuffer; base: Integer; reg8: Integer);
 begin
   // mov byte ptr [base], r8 -> 88 /0 with mod=00 and rm=base
   EmitU8(buf, $88);
   EmitU8(buf, ((reg8 and $7) shl 3) or (base and $7));
 end;
 
-procedure WriteMovMemImm8(buf: TByteBuffer; base: Byte; disp: Integer; value: Byte);
+procedure WriteMovMemImm8(buf: TByteBuffer; base: Integer; disp: Integer; value: Integer);
 begin
   // mov byte ptr [base+disp32], imm8 => C6 80 disp32 imm8
   EmitU8(buf, $C6);
@@ -268,7 +278,7 @@ begin
   EmitU8(buf, value);
 end;
 
-procedure WriteSetccMem8(buf: TByteBuffer; ccOpcode: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteSetccMem8(buf: TByteBuffer; ccOpcode: Integer; baseReg: Integer; disp32: Integer);
 begin
   // setcc r/m8 : opcode 0F ccOpcode modrm(mod=10) rm=base
   EmitU8(buf, $0F);
@@ -277,7 +287,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movzx r64, r/m8 : rex.w 0F B6 /r with reg=dst, rm=mem
   EmitU8(buf, $48);
@@ -287,7 +297,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movzx r64, r/m16 : rex.w 0F B7 /r
   EmitU8(buf, $48);
@@ -297,7 +307,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsx r64, r/m8 : rex.w 0F BE /r
   EmitU8(buf, $48);
@@ -307,7 +317,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsx r64, r/m16 : rex.w 0F BF /r
   EmitU8(buf, $48);
@@ -317,7 +327,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Integer; baseReg: Integer; disp32: Integer);
 begin
   // movsxd r64, r/m32 : rex.w 63 /r
   EmitU8(buf, $48);
@@ -326,7 +336,7 @@ begin
   EmitU32(buf, Cardinal(disp32));
 end;
 
-procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Byte; disp32: Integer);
+procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Integer; disp32: Integer);
 begin
   // mov eax, dword ptr [base+disp32] : 8B 80 disp32
   EmitU8(buf, $8B);
@@ -342,7 +352,7 @@ const
   XMM4 = 4; XMM5 = 5; XMM6 = 6; XMM7 = 7;
 
 // movsd xmm, [base+disp32] — F2 REX? 0F 10 /r
-procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Byte; disp: Integer);
+procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Integer; disp: Integer);
 var modBits: Byte;
 begin
   EmitU8(buf, $F2);
@@ -358,7 +368,7 @@ begin
 end;
 
 // movsd [base+disp32], xmm — F2 REX? 0F 11 /r
-procedure WriteMovsdStore(buf: TByteBuffer; base: Byte; disp: Integer; xmm: Byte);
+procedure WriteMovsdStore(buf: TByteBuffer; base: Integer; disp: Integer; xmm: Integer);
 var modBits: Byte;
 begin
   EmitU8(buf, $F2);
@@ -374,49 +384,49 @@ begin
 end;
 
 // addsd xmm0, xmm1 — F2 0F 58 /r
-procedure WriteAddsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteAddsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $58);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // subsd xmm0, xmm1 — F2 0F 5C /r
-procedure WriteSubsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteSubsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5C);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // mulsd xmm0, xmm1 — F2 0F 59 /r
-procedure WriteMulsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteMulsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $59);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // divsd xmm0, xmm1 — F2 0F 5E /r
-procedure WriteDivsd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteDivsd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5E);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // xorpd xmm, xmm — 66 0F 57 /r (für FNeg: XOR mit Sign-Bit-Maske)
-procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteXorpd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $57);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // ucomisd xmm0, xmm1 — 66 0F 2E /r
-procedure WriteUcomisd(buf: TByteBuffer; dst, src: Byte);
+procedure WriteUcomisd(buf: TByteBuffer; dst, src: Integer);
 begin
   EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $2E);
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
 // cvtsi2sd xmm, r64 — F2 REX.W 0F 2A /r (int64 → f64)
-procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Byte);
+procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Integer);
 begin
   EmitU8(buf, $F2);
   EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
@@ -425,7 +435,7 @@ begin
 end;
 
 // cvttsd2si r64, xmm — F2 REX.W 0F 2C /r (f64 → int64 mit Truncation)
-procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Byte);
+procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Integer);
 begin
   EmitU8(buf, $F2);
   EmitRex(buf, 1, (gpr shr 3) and 1, 0, (xmm shr 3) and 1);
@@ -434,7 +444,7 @@ begin
 end;
 
 // movq xmm, r64 — 66 REX.W 0F 6E /r
-procedure WriteMovqToXmm(buf: TByteBuffer; xmm, gpr: Byte);
+procedure WriteMovqToXmm(buf: TByteBuffer; xmm, gpr: Integer);
 begin
   EmitU8(buf, $66);
   EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
@@ -571,6 +581,12 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
    end;
    inspectStr: string;
    inspectStrOff: UInt64;
+   // IsType (is operator) specific variables
+   isTypeStrOff: UInt64;
+   isTypeLeaPos, isTypeLoopPos, isTypeStrCmpLoopPos: Integer;
+   isTypeStrCmpNePos, isTypeStrCmpEqPos: Integer;
+   isTypeNullJmpPos, isTypeFalsePos, isTypeTruePos: Integer;
+   isTypeDoneJmpPos, isTypeDonePos: Integer;
   // for call/abi
   argCount: Integer;
   argTemps: array of Integer;
@@ -623,6 +639,7 @@ begin
   SetLength(FJumpPatches, 0);
   SetLength(FVMTLabels, 0);
   SetLength(FVMTLeaPositions, 0);
+  SetLength(FIsTypeLeaPositions, 0);
 
   // Pre-intern strings that will be used by built-in error handlers
   // These must be interned BEFORE we calculate FStringOffsets
@@ -997,7 +1014,7 @@ begin
         end
         
         // Generate InheritsFrom() method if it's inherited from TObject
-        // This is complex - needs to traverse the VMT chain
+        // Currently returns false - needs proper implementation with VMT chain traversal
         else if (method.Name = 'InheritsFrom') and 
                 ((method.Body = nil) or 
                  ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
@@ -1007,56 +1024,19 @@ begin
           FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_InheritsFrom';
           FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
           
-          // InheritsFrom implementation:
+          // Simplified InheritsFrom implementation:
           // RDI = self (object pointer)
-          // RSI = target class name (pchar)
-          // Returns: bool (true if self's class inherits from target)
-          //
-          // Algorithm:
-          // 1. Load VMT pointer from object: rax = [rdi]
-          // 2. Loop:
-          //    a. Load class name from VMT[-8]: rdx = [rax - 8]
-          //    b. Compare with target (string compare)
-          //    c. If equal: return true (rax = 1)
-          //    d. Load parent VMT: rax = [rax - 16]
-          //    e. If rax == 0: return false (rax = 0)
-          //    f. Continue loop
+          // RSI = target class name (pchar) - currently ignored
+          // Returns: bool (always returns false for now)
           
           // push rbp
           EmitU8(FCode, $55);
           // mov rbp, rsp
           EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
-          // Save RSI (target class name) to stack
-          EmitU8(FCode, $56); // push rsi
-          
-          // rdi already has self, load VMT pointer: mov rax, [rdi]
-          WriteMovRegMem(FCode, RAX, RDI, 0);
-          
-          // Start of loop
-          // Save current VMT to RBX for manipulation
-          // mov rbx, rax
-          EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C3);
-          
-          // Load class name from VMT[-8]: mov rax, [rax - 8]
-          WriteMovRegMem(FCode, RAX, RAX, -8);
-          
-          // Restore target class name to RSI: pop rsi
-          EmitU8(FCode, $5E);
-          
-          // Compare strings: we need to implement string comparison
-          // For simplicity, we'll do a simple pointer comparison first
-          // TODO: Implement proper string comparison
-          
-          // For now, let's just do a simple implementation:
-          // Load VMT into rax again and get parent VMT at [-16]
-          // This is a simplified version that always returns false
-          // A full implementation would need string comparison
-          
-          // For demonstration, just return false (simplified)
-          WriteMovRegImm64(FCode, RAX, 0);
-          
           // pop rbp
           EmitU8(FCode, $5D);
+          // mov eax, 0 (return false)
+          WriteMovRegImm64(FCode, RAX, 0);
           // ret
           EmitU8(FCode, $C3);
         end;
@@ -3728,33 +3708,154 @@ begin
             WriteSyscall(FCode);
           end;
 
-        irIsType:
-          begin
-            // Type check: is_type(object, targetClassName) -> bool
-            // Algorithm:
-            // 1. Load object pointer from local slot
-            // 2. Load VMT pointer from object
-            // 3. Get class name from VMT[-8]
-            // 4. Compare with target class name
-            // If they match, return true
-            // Otherwise, traverse parent VMT chain (VMT[-16]) until match or null
-            
-            // Load object pointer from local slot into RDI
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
-            
-            // Load VMT pointer from object
-            WriteMovRegMem(FCode, RAX, RDI, 0);
-            
-            // Load class name pointer from VMT[-8]
-            WriteMovRegMem(FCode, RAX, RAX, -8);
-            
-            // For now, we just return true (simplified implementation)
-            // TODO: Implement proper string comparison
-            WriteMovRegImm64(FCode, RAX, 1);
-            
-            // Store result
-            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
-          end;
+          irIsType:
+            begin
+              // Type check: is_type(object, targetClassName) -> bool
+              // Algorithm:
+              // 1. Load object pointer from local slot
+              // 2. Load VMT pointer from object
+              // 3. Loop: Get class name from VMT[-8], compare with target
+              // 4. If match: return true
+              // 5. Else: load parent VMT from VMT[-16], if null return false, else goto 3
+              
+              // First, write target class name to .data section
+              isTypeStrOff := totalDataOffset;
+              for k := 1 to Length(instr.ImmStr) do
+                FData.WriteU8(Byte(instr.ImmStr[k]));
+              FData.WriteU8(0);  // null terminator
+              Inc(totalDataOffset, Length(instr.ImmStr) + 1);
+              
+              // Align to 8 bytes
+              while (FData.Size mod 8) <> 0 do
+              begin
+                FData.WriteU8(0);
+                Inc(totalDataOffset);
+              end;
+
+
+
+              // Load object pointer from local slot into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+              EmitDebugPrintString('Object ptr (RAX): ');
+              EmitDebugPrintInt(RAX);
+              EmitDebugPrintString(#10);
+              
+              // Check for null object
+              // test rax, rax
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0);
+              // jz .is_false (null object -> false)
+              isTypeNullJmpPos := FCode.Size;
+              EmitU8(FCode, $0F); EmitU8(FCode, $84); EmitU32(FCode, 0); // jz rel32
+              
+              // Load VMT pointer from object into RBX (preserved across loop)
+              // mov rbx, [rax]
+              WriteMovRegMem(FCode, RBX, RAX, 0);
+              EmitDebugPrintString('Initial VMT ptr (RBX): ');
+              EmitDebugPrintInt(RBX);
+              EmitDebugPrintString(#10);
+              
+              // LEA RDI, [rip + targetClassName] - load target class name address
+              isTypeLeaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $3D); EmitU32(FCode, 0);
+              
+              // Loop label position
+              isTypeLoopPos := FCode.Size;
+              EmitDebugPrintString('--- loop start ---'#10);
+              
+              // Load current class name pointer from VMT[-8] into RSI
+              // mov rsi, [rbx - 8]
+              WriteMovRegMem(FCode, RSI, RBX, -8);
+              EmitDebugPrintString('Current Class Name Ptr (RSI): ');
+              EmitDebugPrintInt(RSI);
+              EmitDebugPrintString(#10);
+              EmitDebugPrintString('Comparing with target: ');
+              EmitDebugPrintString(instr.ImmStr);
+              EmitDebugPrintString(#10);
+              
+              // Compare strings (RDI = target, RSI = current)
+              // Save RDI and RBX on stack (they need to survive the comparison)
+              EmitU8(FCode, $57);  // push rdi
+              EmitU8(FCode, $53);  // push rbx
+              
+              // Inline strcmp: compare byte by byte
+              // .strcmp_loop:
+              isTypeStrCmpLoopPos := FCode.Size;
+              //   mov al, [rdi]
+              EmitU8(FCode, $8A); EmitU8(FCode, $07);
+              //   mov cl, [rsi]
+              EmitU8(FCode, $8A); EmitU8(FCode, $0E);
+              //   cmp al, cl
+              EmitU8(FCode, $38); EmitU8(FCode, $C8);
+              //   jne .strcmp_not_equal
+              isTypeStrCmpNePos := FCode.Size;
+              EmitU8(FCode, $75); EmitU8(FCode, 0);  // jne rel8
+              //   test al, al
+              EmitU8(FCode, $84); EmitU8(FCode, $C0);
+              //   jz .strcmp_equal (both are null -> equal)
+              isTypeStrCmpEqPos := FCode.Size;
+              EmitU8(FCode, $74); EmitU8(FCode, 0);  // jz rel8
+              //   inc rdi
+              WriteIncReg(FCode, RDI);
+              //   inc rsi
+              WriteIncReg(FCode, RSI);
+              //   jmp .strcmp_loop
+              EmitU8(FCode, $EB);
+              EmitU8(FCode, Byte(isTypeStrCmpLoopPos - FCode.Size - 1));
+              
+              // .strcmp_not_equal: strings don't match, try parent VMT
+              FCode.PatchU8(isTypeStrCmpNePos + 1, Byte(FCode.Size - isTypeStrCmpNePos - 2));
+              EmitDebugPrintString('Strings do not match. Trying parent VMT...'#10);
+              // Restore registers (RDI & RBX already popped by string compare logic)
+              EmitU8(FCode, $5B);  // pop rbx
+              EmitU8(FCode, $5F);  // pop rdi
+              // Load parent VMT pointer from VMT[-16]
+              // mov rbx, [rbx - 16]
+              WriteMovRegMem(FCode, RBX, RBX, -16);
+              EmitDebugPrintString('Parent VMT ptr (RBX): ');
+              EmitDebugPrintInt(RBX);
+              EmitDebugPrintString(#10);
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $DB); // test rbx, rbx (check if null)
+              // jnz .loop (continue if not null)
+              EmitU8(FCode, $0F); EmitU8(FCode, $85);
+              EmitU32(FCode, UInt32(Int32(isTypeLoopPos - FCode.Size - 4)));
+              // Fall through to false
+              isTypeFalsePos := FCode.Size;
+              EmitDebugPrintString('Reached end of VMT chain. Returning false.'#10);
+              WriteMovRegImm64(FCode, RAX, 0);
+              // jmp .done
+              isTypeDoneJmpPos := FCode.Size;
+              EmitU8(FCode, $EB); EmitU8(FCode, 0);  // jmp rel8
+              
+              // .strcmp_equal: strings match -> return true
+              FCode.PatchU8(isTypeStrCmpEqPos + 1, Byte(FCode.Size - isTypeStrCmpEqPos - 2));
+              EmitDebugPrintString('Strings match! Returning true.'#10);
+              // Restore registers
+              EmitU8(FCode, $5B);  // pop rbx
+              EmitU8(FCode, $5F);  // pop rdi
+              isTypeTruePos := FCode.Size;
+              WriteMovRegImm64(FCode, RAX, 1);
+              // jmp .done
+              EmitU8(FCode, $EB); EmitU8(FCode, 0);
+              
+              // .is_false (null object case)
+              // Patch the null check jump
+              FCode.PatchU32LE(isTypeNullJmpPos + 2, UInt32(isTypeFalsePos - isTypeNullJmpPos - 6));
+              EmitDebugPrintString('Object is null. Returning false.'#10);
+              
+              // .done:
+              isTypeDonePos := FCode.Size;
+              FCode.PatchU8(isTypeDoneJmpPos + 1, Byte(isTypeDonePos - isTypeDoneJmpPos - 2));
+              // Also patch the true->done jump
+              FCode.PatchU8(isTypeTruePos + 10 + 1, Byte(isTypeDonePos - (isTypeTruePos + 10) - 2));
+              
+              // Store result
+              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+              
+              // Record LEA position for patching with actual data address
+              SetLength(FIsTypeLeaPositions, Length(FIsTypeLeaPositions) + 1);
+              FIsTypeLeaPositions[High(FIsTypeLeaPositions)].DataOffset := isTypeStrOff;
+              FIsTypeLeaPositions[High(FIsTypeLeaPositions)].CodePos := isTypeLeaPos;
+            end;
 
         // === In-Situ Data Visualizer (Debugging 2.0) ===
         irInspect:
@@ -4175,6 +4276,17 @@ begin
     disp32 := Int64(dataVA) - Int64(instrVA);
     FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
   end;
+  
+  // patch IsType string LEAs (for 'is' operator target class names)
+  for i := 0 to High(FIsTypeLeaPositions) do
+  begin
+    leaPos := FIsTypeLeaPositions[i].CodePos;
+    codeVA := 4096;
+    instrVA := codeVA + leaPos + 7;
+    dataVA := 4096 + ((UInt64(FCode.Size) + 4095) and not UInt64(4095)) + FIsTypeLeaPositions[i].DataOffset;
+    disp32 := Int64(dataVA) - Int64(instrVA);
+    FCode.PatchU32LE(leaPos + 3, Cardinal(disp32));
+  end;
 
   // Generate PLT stubs for external symbols at end of code section
   // Standard x86-64 PLT layout (each entry 16 bytes):
@@ -4545,7 +4657,7 @@ begin
   Result := FEnergyStats;
 end;
 
-procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
+  procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
 begin
   energy_model.SetEnergyLevel(level, cfX86_64);
   FEnergyContext.Config := GetEnergyConfig;
@@ -4553,5 +4665,23 @@ begin
   FEnergyContext.CurrentCPU := FCurrentCPU;
 end;
 
+  // Debugging helper implementations
+  procedure TX86_64Emitter.EmitDebugPrintString(const s: string);
+  var
+    strOffset: UInt64;
+    leaPos: Integer;
+    i: Integer;
+  begin
+    // Placeholder - actual implementation would emit debug output
+    // This is disabled to avoid complexity
+  end;
+
+  procedure TX86_64Emitter.EmitDebugPrintInt(valueReg: Integer);
+  begin
+    // Placeholder - actual implementation would emit debug output
+    // This is disabled to avoid complexity
+  end;
+
 end.
+
 

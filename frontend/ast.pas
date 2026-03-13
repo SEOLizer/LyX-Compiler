@@ -786,6 +786,7 @@ type
     FVMTName: string;               // "_vmt_ClassName"
     FClassNameLabel: string;        // Label for class name string in .rodata
     FIsPublic: Boolean;
+    FIsAbstract: Boolean;
     // Interface fields
     FImplementedInterfaces: TStringArray;  // Liste der Interface-Namen
     FIMTName: string;  // "_imt_ClassName" Interface Method Table
@@ -809,6 +810,7 @@ type
     property VMTName: string read FVMTName write FVMTName;
     property ClassNameLabel: string read FClassNameLabel write FClassNameLabel;
     property IsPublic: Boolean read FIsPublic;
+    property IsAbstract: Boolean read FIsAbstract write FIsAbstract;
     // Interface properties
     property ImplementedInterfaces: TStringArray read FImplementedInterfaces write FImplementedInterfaces;
     property IMTName: string read FIMTName;
@@ -1950,6 +1952,7 @@ begin
   FVMTName := '_vmt_' + aName;
   FIMTName := '_imt_' + aName;
   FIsPublic := aPublic;
+  FIsAbstract := False;
   FSize := 0;
   FAlign := 0;
   FBaseSize := 0;

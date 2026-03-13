@@ -586,6 +586,9 @@ begin
         um.Free;
       end;
 
+      // Free the AST after compilation is complete
+      prog.Free;
+
     finally
       d.Free;
     end;

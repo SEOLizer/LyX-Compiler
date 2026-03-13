@@ -1510,7 +1510,7 @@ var
   call: TAstCall;
   s: TSymbol;
   sSym: TSymbol;
-  i, fi, baseIdx, fldOffset: Integer;
+  i, fi, baseIdx, fldOffset, idx: Integer;
   lt, rt, ot, atype, srcType: TAurumType;
   qualifier: string;
   identName: string;
@@ -2224,6 +2224,18 @@ begin
         end
         else
         begin
+          // Check if trying to instantiate an abstract class
+          idx := FClassTypes.IndexOf(TAstNewExpr(expr).ClassName);
+          if idx >= 0 then
+          begin
+            cd := TAstClassDecl(FClassTypes.Objects[idx]);
+            if cd.IsAbstract then
+            begin
+              FDiag.Error('cannot instantiate abstract class: ' + TAstNewExpr(expr).ClassName, expr.Span);
+              Result := atUnresolved;
+              Exit;
+            end;
+          end;
           // Check constructor arguments if any
           newExpr := TAstNewExpr(expr);
           if Length(newExpr.Args) > 0 then
@@ -4070,6 +4082,19 @@ begin
           Continue;
         end;
         FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+        
+        // Check if class has abstract methods - if so, mark class as abstract
+        if not TAstClassDecl(node).IsAbstract then
+        begin
+          for j := 0 to High(TAstClassDecl(node).Methods) do
+          begin
+            if TAstClassDecl(node).Methods[j].IsAbstract then
+            begin
+              TAstClassDecl(node).IsAbstract := True;
+              Break;
+            end;
+          end;
+        end;
         
         // Register methods as functions with mangled names
         for j := 0 to High(TAstClassDecl(node).Methods) do
