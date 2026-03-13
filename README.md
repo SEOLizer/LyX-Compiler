@@ -190,6 +190,9 @@ Lyx supports **cross-compilation** for four target platforms:
 
 # macOS x86_64 Mach-O (from Linux)
 ./lyxc program.lyx -o program --target=macosx64
+
+# macOS ARM64 Mach-O (Apple Silicon)
+./lyxc program.lyx -o program --target=macos-arm64
 ```
 
 | Target Platform | Format | Calling Convention | OS Interface |
@@ -198,6 +201,7 @@ Lyx supports **cross-compilation** for four target platforms:
 | `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
 | `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
 | `macosx64` | Mach-O | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls (BSD) |
+| `macos-arm64` | Mach-O | AAPCS64 (X0-X7) | Syscalls (BSD) |
 | `esp32` | ELF32 | Xtensa (A2-A7 params, A8-A15 temps) | Syscalls |
 
 **Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
@@ -227,6 +231,15 @@ ssh user@mac "/tmp/program"
 readelf -h esp32_hello.elf
 ```
 
+**macOS ARM64 Target Details:**
+| Property | Value |
+|----------|-------|
+| Architecture | ARM64 (Apple Silicon) |
+| Register Set | X0-X30 (31 × 64-bit registers) |
+| ABI | AAPCS64 (X0-X7 params, X8-X28 temps) |
+| Object Format | Mach-O 64-bit (Executable) |
+| Syscalls | BSD Syscalls via syscall instruction |
+
 **ESP32 Target Details:**
 | Property | Value |
 |----------|-------|
@@ -250,6 +263,14 @@ readelf -h esp32_hello.elf
 - `SYS_DELAY_MS = 301` - Delay in milliseconds
 - `SYS_RANDOM = 302` - Generate random number
 - `SYS_RANDOM_SEED = 303` - Set random seed
+
+**macOS ARM64 Example (hello.macos-arm64.lyx):**
+```lyx
+fn main(): int64 {
+  PrintStr("Hello from macOS ARM64 (Apple Silicon)!\n");
+  return 0;
+}
+```
 
 **ESP32 Example (hello.esp32.lyx):**
 ```lyx
