@@ -1,13 +1,13 @@
 # Lyx
 
 **Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
-It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, **Windows x64 PE32+**, and **macOS x86_64 Mach-O** binaries — without libc, without linker, using pure syscalls or WinAPI.
+It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, **Windows x64 PE32+**, **macOS x86_64 Mach-O**, and **ESP32/Xtensa ELF32** binaries — without libc, without linker, using pure syscalls or WinAPI.
 
 ```
 Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, ESP32/Xtensa
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -198,6 +198,7 @@ Lyx supports **cross-compilation** for four target platforms:
 | `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
 | `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
 | `macosx64` | Mach-O | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls (BSD) |
+| `esp32` | ELF32 | Xtensa (A2-A7 params, A8-A15 temps) | Syscalls |
 
 **Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
 
@@ -217,7 +218,50 @@ scp program user@mac:/tmp/
 ssh user@mac "/tmp/program"
 ```
 
+**Cross-compile for ESP32 (Xtensa):**
+```bash
+# Compile for ESP32 microcontroller
+./lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
+
+# Check ELF32 structure
+readelf -h esp32_hello.elf
+```
+
+**ESP32 Target Details:**
+| Property | Value |
+|----------|-------|
+| Architecture | Xtensa (Tensilica L106 for ESP32) |
+| Register Set | A0-A15 (16 × 32-bit registers) |
+| ABI | Simplified SysV-like (A2-A7 params, A8-A15 temps) |
+| Object Format | ELF32 (Executable) |
+| Syscalls | Linux-compatible via Xtensa ABI |
+
+**ESP32 Built-in Syscalls:**
+- `SYS_EXIT = 1` - Terminate program
+- `SYS_WRITE = 4` - Write to STDOUT
+- `SYS_READ = 3` - Read from STDIN
+- `SYS_GPIO_SET_MODE = 100` - Configure GPIO pin
+- `SYS_GPIO_WRITE = 101` - Write to GPIO
+- `SYS_GPIO_READ = 102` - Read from GPIO
+- `SYS_UART_WRITE = 200` - UART transmit
+- `SYS_UART_READ = 201` - UART receive
+- `SYS_UART_CONFIG = 202` - Configure UART
+- `SYS_GET_TIME = 300` - Get timestamp
+- `SYS_DELAY_MS = 301` - Delay in milliseconds
+- `SYS_RANDOM = 302` - Generate random number
+- `SYS_RANDOM_SEED = 303` - Set random seed
+
+**ESP32 Example (hello.esp32.lyx):**
+```lyx
+fn main(): int64 {
+  PrintStr("Hello from ESP32!\n");
+  return 0;
+}
+```
+
 ---
+
+###
 
 ## The Lyx Language
 
