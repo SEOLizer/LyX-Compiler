@@ -1,13 +1,13 @@
 # Lyx
 
 **Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
-It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, **Windows x64 PE32+**, **macOS x86_64 Mach-O**, and **ESP32/Xtensa ELF32** binaries — without libc, without linker, using pure syscalls or WinAPI.
+It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
 Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, ESP32/Xtensa
+✅ Cross-Compilation: Linux (x86_64/ARM64), Windows x64, macOS (x86_64/ARM64), ESP32/Xtensa
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -176,7 +176,7 @@ L1 cache footprint:    846 bytes
 
 ### Cross-Compilation
 
-Lyx supports **cross-compilation** for four target platforms:
+Lyx supports **cross-compilation** for multiple target platforms and architectures:
 
 ```bash
 # Linux x86_64 ELF64 (default on Linux hosts)
@@ -188,21 +188,46 @@ Lyx supports **cross-compilation** for four target platforms:
 # Windows PE32+ (from Linux)
 ./lyxc program.lyx -o program.exe --target=win64
 
-# macOS x86_64 Mach-O (from Linux)
+# macOS x86_64 Mach-O (Intel Macs)
 ./lyxc program.lyx -o program --target=macosx64
 
-# macOS ARM64 Mach-O (Apple Silicon)
+# macOS ARM64 Mach-O (Apple Silicon Macs)
 ./lyxc program.lyx -o program --target=macos-arm64
+
+# ESP32/Xtensa ELF32 (microcontroller)
+./lyxc program.lyx -o program.elf --target=esp32
 ```
 
-| Target Platform | Format | Calling Convention | OS Interface |
-|-----------------|--------|-------------------|--------------|
-| `linux` | ELF64 | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
-| `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
-| `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
-| `macosx64` | Mach-O | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls (BSD) |
-| `macos-arm64` | Mach-O | AAPCS64 (X0-X7) | Syscalls (BSD) |
-| `esp32` | ELF32 | Xtensa (A2-A7 params, A8-A15 temps) | Syscalls |
+#### Available Targets and Architectures
+
+| Target Flag | Architecture | Object Format | Calling Convention | OS Interface |
+|-------------|--------------|---------------|-------------------|--------------|
+| `--target=linux` | x86_64 | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Linux Syscalls |
+| `--target=arm64` | ARM64 | ELF64 | AAPCS64 (X0-X7) | Linux Syscalls |
+| `--target=win64` | x86_64 | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow) | kernel32.dll |
+| `--target=macosx64` | x86_64 | Mach-O | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | BSD Syscalls |
+| `--target=macos-arm64` | ARM64 | Mach-O | AAPCS64 (X0-X7) | BSD Syscalls |
+| `--target=esp32` | Xtensa | ELF32 | Simplified SysV (A2-A7 params) | Syscalls |
+
+#### Architecture Parameter
+
+You can also explicitly specify the architecture using `--arch`:
+
+```bash
+# Default behavior (architecture inferred from target)
+./lyxc program.lyx -o program --target=macos-arm64
+
+# Explicit architecture specification
+./lyxc program.lyx -o program --target=macosx64 --arch=x86_64
+./lyxc program.lyx -o program --target=macos-arm64 --arch=arm64
+./lyxc program.lyx -o program --target=esp32 --arch=xtensa
+```
+
+| Architecture Flag | Description |
+|-------------------|-------------|
+| `--arch=x86_64` | 64-bit x86 (Intel/AMD) |
+| `--arch=arm64` | 64-bit ARM (Apple Silicon, Raspberry Pi 4+) |
+| `--arch=xtensa` | Xtensa (ESP32 microcontroller) |
 
 **Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
 
@@ -215,12 +240,14 @@ sudo apt install qemu-user-static
 qemu-aarch64-static ./program
 ```
 
-**Testing macOS binaries (on Linux):**
-```bash
-# Copy to a macOS machine via SSH/SCP
-scp program user@mac:/tmp/
-ssh user@mac "/tmp/program"
-```
+**Testing binaries on target platforms:**
+
+| Platform | Testing Method |
+|----------|----------------|
+| Linux | Direct execution (`./program`) |
+| Windows | Run via Wine or on Windows machine |
+| macOS | Copy to Mac via SSH/SCP and execute |
+| ESP32 | Flash to device and monitor via serial |
 
 **Cross-compile for ESP32 (Xtensa):**
 ```bash
@@ -231,40 +258,37 @@ ssh user@mac "/tmp/program"
 readelf -h esp32_hello.elf
 ```
 
-**macOS ARM64 Target Details:**
-| Property | Value |
-|----------|-------|
-| Architecture | ARM64 (Apple Silicon) |
-| Register Set | X0-X30 (31 × 64-bit registers) |
-| ABI | AAPCS64 (X0-X7 params, X8-X28 temps) |
-| Object Format | Mach-O 64-bit (Executable) |
-| Syscalls | BSD Syscalls via syscall instruction |
+**Platform-Specific Details:**
 
-**ESP32 Target Details:**
-| Property | Value |
-|----------|-------|
-| Architecture | Xtensa (Tensilica L106 for ESP32) |
-| Register Set | A0-A15 (16 × 32-bit registers) |
-| ABI | Simplified SysV-like (A2-A7 params, A8-A15 temps) |
-| Object Format | ELF32 (Executable) |
-| Syscalls | Linux-compatible via Xtensa ABI |
+| Platform | Architecture | Register Set | ABI |
+|----------|--------------|--------------|-----|
+| **Linux x86_64** | x86_64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **Linux ARM64** | ARM64 | X0-X30 | AAPCS64 (X0-X7) |
+| **Windows x64** | x86_64 | RAX-R15 | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) |
+| **macOS x86_64** | x86_64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **macOS ARM64** | ARM64 | X0-X30 | AAPCS64 (X0-X7) |
+| **ESP32** | Xtensa | A0-A15 | Simplified SysV (A2-A7 params) |
 
 **ESP32 Built-in Syscalls:**
-- `SYS_EXIT = 1` - Terminate program
-- `SYS_WRITE = 4` - Write to STDOUT
-- `SYS_READ = 3` - Read from STDIN
-- `SYS_GPIO_SET_MODE = 100` - Configure GPIO pin
-- `SYS_GPIO_WRITE = 101` - Write to GPIO
-- `SYS_GPIO_READ = 102` - Read from GPIO
-- `SYS_UART_WRITE = 200` - UART transmit
-- `SYS_UART_READ = 201` - UART receive
-- `SYS_UART_CONFIG = 202` - Configure UART
-- `SYS_GET_TIME = 300` - Get timestamp
-- `SYS_DELAY_MS = 301` - Delay in milliseconds
-- `SYS_RANDOM = 302` - Generate random number
-- `SYS_RANDOM_SEED = 303` - Set random seed
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `SYS_EXIT` | 1 | Terminate program |
+| `SYS_WRITE` | 4 | Write to STDOUT |
+| `SYS_READ` | 3 | Read from STDIN |
+| `SYS_GPIO_SET_MODE` | 100 | Configure GPIO pin |
+| `SYS_GPIO_WRITE` | 101 | Write to GPIO |
+| `SYS_GPIO_READ` | 102 | Read from GPIO |
+| `SYS_UART_WRITE` | 200 | UART transmit |
+| `SYS_UART_READ` | 201 | UART receive |
+| `SYS_UART_CONFIG` | 202 | Configure UART |
+| `SYS_GET_TIME` | 300 | Get timestamp |
+| `SYS_DELAY_MS` | 301 | Delay in milliseconds |
+| `SYS_RANDOM` | 302 | Generate random number |
+| `SYS_RANDOM_SEED` | 303 | Set random seed |
 
-**macOS ARM64 Example (hello.macos-arm64.lyx):**
+**Cross-Platform Examples:**
+
+macOS ARM64 (`examples/hello_macos_arm64.lyx`):
 ```lyx
 fn main(): int64 {
   PrintStr("Hello from macOS ARM64 (Apple Silicon)!\n");
@@ -272,7 +296,7 @@ fn main(): int64 {
 }
 ```
 
-**ESP32 Example (hello.esp32.lyx):**
+ESP32 (`examples/esp32_hello.lyx`):
 ```lyx
 fn main(): int64 {
   PrintStr("Hello from ESP32!\n");
