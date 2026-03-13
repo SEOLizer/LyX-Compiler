@@ -4,7 +4,7 @@ unit arm64_emit;
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, backend_types, energy_model;
+  SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
 
 type
   TLabelPos = record
@@ -54,6 +54,17 @@ type
     FPLTGOTPatches: array of TPLTGOTPatch;
     // Energy tracking (minimal — wird in Phase 3 vollständig integriert)
     FEnergyStats: TEnergyStats;
+    // VMT Labels for OOP (Virtual Method Table)
+    FVMTLabels: array of record
+      Name: string;
+      Pos: Integer;
+    end;
+    // VMT address patches (ADRP+ADD pairs that load VMT addresses)
+    FVMTAddrPatches: array of record
+      CodePos: Integer;
+      VMTName: string;
+      IsAdrp: Boolean;
+    end;
   public
     constructor Create;
     destructor Destroy; override;
@@ -941,7 +952,7 @@ end;
 // Slot 0 is at [FP-8], slot 1 at [FP-16], etc.
 function SlotOffset(slot: Integer): Integer;
 begin
-  Result := -(slot + 1) * 8;
+  Result := -(slot + 2) * 8;
 end;
 
 procedure TARM64Emitter.EmitFromIR(module: TIRModule);
@@ -991,6 +1002,12 @@ var
   // External symbol search
   found: Boolean;
   ei: Integer;
+  
+  // VMT handling
+  cd: TAstClassDecl;
+  vmtDataPos, classNamePos, classNamePtrPos, parentPtrPos, parentVmtPos: Integer;
+  methodName: string;
+  methodFuncIdx: Integer;
 begin
   // Phase 1: Write interned strings to data section
   totalDataOffset := 0;
@@ -1053,6 +1070,53 @@ begin
   
   // Sync FTotalDataOffset with the data section size after strings and globals
   FTotalDataOffset := FData.Size;
+  
+  // Phase 1c: Emit VMT tables for classes with virtual methods
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    cd := module.ClassDecls[i];
+    // Only emit VMT if class has virtual methods
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Emit class name string (for RTTI ClassName method)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_classname_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      
+      // Write class name as null-terminated string
+      for j := 1 to Length(cd.Name) do
+        FData.WriteU8(Ord(cd.Name[j]));
+      FData.WriteU8(0);  // null terminator
+      
+      // Align to 8 bytes before RTTI header
+      while (FData.Size mod 8) <> 0 do
+        FData.WriteU8(0);
+      
+      // Emit RTTI header
+      // 1. Parent VMT Pointer
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_parent_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder - will be patched
+      
+      // 2. ClassName Pointer
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_classname_ptr_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder - will be patched
+      
+      // 3. VMT base (where instance VMT pointers point to)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      
+      // Emit VMT entries (method pointers) - one 8-byte pointer per virtual method
+      for j := 0 to High(cd.VirtualMethods) do
+      begin
+        FData.WriteU64LE(0);  // Placeholder - will be patched with method address
+      end;
+    end;
+  end;
   
   // Phase 2: Emit _start entry point
   // _start will call main() and then exit with the return value
@@ -1240,7 +1304,7 @@ begin
     for j := 0 to Min(fn.ParamCount - 1, 7) do
     begin
       // Parameter j is in ParamRegs[j], store to slot j
-      WriteStrImm(FCode, ParamRegs[j], X29, frameSize + SlotOffset(j));
+            WriteSturImm(FCode, ParamRegs[j], X29, SlotOffset(j));
     end;
     
     // Clear label/branch tracking for this function
@@ -1276,9 +1340,10 @@ begin
           
         irLoadLocal:
           begin
-            slotIdx := localCnt + instr.Dest;
-            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Src1));
-            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            // Load local variable: Dest = locals[Src1]
+            slotIdx := localCnt + instr.Src1;
+            WriteLdurImm(FCode, X0, X29, SlotOffset(slotIdx));
+            WriteSturImm(FCode, X0, X29, SlotOffset(localCnt + instr.Dest));
           end;
           
         irStoreLocal:
@@ -1555,11 +1620,23 @@ begin
             for k := 0 to Min(argCount - 1, 7) do
             begin
               if argTemps[k] >= 0 then
-                WriteLdrImm(FCode, ParamRegs[k], X29, frameSize + SlotOffset(localCnt + argTemps[k]));
+                WriteLdurImm(FCode, ParamRegs[k], X29, SlotOffset(localCnt + argTemps[k]));
             end;
             
-            // Check if this is an external call (cmExternal)
-            if instr.CallMode = cmExternal then
+            // Handle virtual method calls
+            if instr.IsVirtualCall and (instr.VMTIndex >= 0) then
+            begin
+              // Virtual call: self is in X0 (first arg for ARM64 AAPCS)
+              // 1. Load VMT pointer from object: ldr x9, [x0]
+              WriteLdrImm(FCode, X9, X0, 0);
+              // 2. Load method pointer from VMT table: ldr x9, [x9, #vmtIndex*8]
+              WriteLdrImm(FCode, X9, X9, instr.VMTIndex * 8);
+              // 3. Indirect call through the method pointer: blr x9
+              // BLR X9 = 1101011 0 0 01 11111 0000 00 01001 00000
+              // = D63F0120
+              EmitInstr(FCode, $D63F0120);
+            end
+            else if instr.CallMode = cmExternal then
             begin
               // External call: record symbol for PLT/GOT generation
               found := False;
@@ -1990,32 +2067,54 @@ begin
           
         irLoadGlobalAddr:
           begin
-            // Load address of global variable into temp: dest = &globals[ImmStr]
+            // Load address of global variable OR VMT label into temp: dest = &globals[ImmStr]
             slotIdx := localCnt + instr.Dest;
-            varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
-            if varIdx < 0 then
+            
+            // Check if this is a VMT label (_vmt_ClassName)
+            if Pos('_vmt_', instr.ImmStr) = 1 then
             begin
-              // First access to this global - allocate space in data section
-              varIdx := FGlobalVarNames.Count;
-              FGlobalVarNames.Add(instr.ImmStr);
-              SetLength(FGlobalVarOffsets, varIdx + 1);
-              FGlobalVarOffsets[varIdx] := FTotalDataOffset;
-              FData.WriteU64LE(0);
-              Inc(FTotalDataOffset, 8);
+              // This is a VMT label - emit ADRP+ADD with VMT patching
+              SetLength(FVMTAddrPatches, Length(FVMTAddrPatches) + 1);
+              FVMTAddrPatches[High(FVMTAddrPatches)].CodePos := FCode.Size;
+              FVMTAddrPatches[High(FVMTAddrPatches)].VMTName := instr.ImmStr;
+              FVMTAddrPatches[High(FVMTAddrPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X0, 0);  // Placeholder: ADRP X0, page
+              SetLength(FVMTAddrPatches, Length(FVMTAddrPatches) + 1);
+              FVMTAddrPatches[High(FVMTAddrPatches)].CodePos := FCode.Size;
+              FVMTAddrPatches[High(FVMTAddrPatches)].VMTName := instr.ImmStr;
+              FVMTAddrPatches[High(FVMTAddrPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X0, X0, 0);  // Placeholder: ADD X0, X0, #offset
+              // Store VMT address into temp slot
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end
+            else
+            begin
+              // Regular global variable
+              varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
+              if varIdx < 0 then
+              begin
+                // First access to this global - allocate space in data section
+                varIdx := FGlobalVarNames.Count;
+                FGlobalVarNames.Add(instr.ImmStr);
+                SetLength(FGlobalVarOffsets, varIdx + 1);
+                FGlobalVarOffsets[varIdx] := FTotalDataOffset;
+                FData.WriteU64LE(0);
+                Inc(FTotalDataOffset, 8);
+              end;
+              // Emit ADRP + ADD to get address directly into X0
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X0, 0);  // Placeholder: ADRP X0, page
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X0, X0, 0);  // Placeholder: ADD X0, X0, #offset
+              // Store address into temp slot
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
             end;
-            // Emit ADRP + ADD to get address directly into X0
-            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
-            WriteAdrp(FCode, X0, 0);  // Placeholder: ADRP X0, page
-            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
-            WriteAddImm(FCode, X0, X0, 0);  // Placeholder: ADD X0, X0, #offset
-            // Store address into temp slot
-            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
           end;
           
         // ========== Phase 3: Arrays ==========
@@ -2087,6 +2186,30 @@ begin
             slotIdx := localCnt + instr.Dest;
             WriteAddImm(FCode, X0, X29, frameSize + SlotOffset(instr.Src1));
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irLoadFieldHeap:
+          begin
+            // Load field from heap object: Dest = *(Src1 + ImmInt)
+            // Positive offset for heap objects
+            slotIdx := localCnt + instr.Dest;
+            // Load base pointer from Src1 slot
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Load value from [X0 + offset] into X1
+            WriteLdrImm(FCode, X1, X0, instr.ImmInt);
+            // Store result to Dest slot
+            WriteStrImm(FCode, X1, X29, frameSize + SlotOffset(slotIdx));
+          end;
+        
+        irStoreFieldHeap:
+          begin
+            // Store field into heap object: *(Src1 + ImmInt) = Src2
+            // Load base pointer from Src1 slot
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Load value from Src2 slot
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // Store value to [X0 + offset]
+            WriteStrImm(FCode, X1, X0, instr.ImmInt);
           end;
           
         irAlloc:
@@ -2622,7 +2745,127 @@ begin
     end;
   end;
   
-  // Phase 9: Generate PLT stubs for external symbols
+  // Phase 9: Patch VMT addresses (ADRP + ADD instructions)
+  for i := 0 to High(FVMTAddrPatches) do
+  begin
+    patchPos := FVMTAddrPatches[i].CodePos;
+    
+    // Find the VMT label position in data section
+    vmtDataPos := -1;
+    for k := 0 to High(FVMTLabels) do
+    begin
+      if FVMTLabels[k].Name = FVMTAddrPatches[i].VMTName then
+      begin
+        vmtDataPos := FVMTLabels[k].Pos;
+        Break;
+      end;
+    end;
+    
+    if vmtDataPos >= 0 then
+    begin
+      instrVA := codeVA + UInt64(patchPos);
+      strOffset := UInt64(vmtDataPos);
+      
+      if FVMTAddrPatches[i].IsAdrp then
+      begin
+        // ADRP: PC-relative page address
+        disp := Int32((dataVA + strOffset) - (instrVA and not UInt64($FFF)));
+        origInstr := FCode.ReadU32LE(patchPos);
+        rd := origInstr and $1F;
+        FCode.PatchU32LE(patchPos, $90000000 or 
+          (DWord((disp shr 12) and $3) shl 29) or 
+          (DWord((Int64(disp) shr 14) and $7FFFF) shl 5) or
+          rd);
+      end
+      else
+      begin
+        // ADD: immediate offset within page
+        disp := Int32((dataVA + strOffset) and $FFF);
+        origInstr := FCode.ReadU32LE(patchPos);
+        rn := (origInstr shr 5) and $1F;
+        rd := origInstr and $1F;
+        FCode.PatchU32LE(patchPos, $91000000 or 
+          (DWord(disp and $FFF) shl 10) or 
+          (DWord(rn) shl 5) or 
+          rd);
+      end;
+    end;
+  end;
+  
+  // Phase 10: Patch VMT method entries with function addresses
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    cd := module.ClassDecls[i];
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Find VMT label position
+      vmtDataPos := -1;
+      for j := 0 to High(FVMTLabels) do
+      begin
+        if FVMTLabels[j].Name = '_vmt_' + cd.Name then
+        begin
+          vmtDataPos := FVMTLabels[j].Pos;
+          Break;
+        end;
+      end;
+      
+      if vmtDataPos >= 0 then
+      begin
+        // Patch each VMT entry with the method address
+        for j := 0 to High(cd.VirtualMethods) do
+        begin
+          methodName := cd.VirtualMethods[j].Name;
+          
+          // Handle abstract methods (nil entries in VMT)
+          if cd.VirtualMethods[j].IsAbstract then
+          begin
+            // Abstract method: leave as 0 or set to abstract error handler
+            // For now, leave as 0 - calling will crash/segfault
+            Continue;
+          end;
+          
+          // Find the method's code address
+          methodFuncIdx := FFuncNames.IndexOf(methodName);
+          if methodFuncIdx >= 0 then
+          begin
+            // Calculate absolute address: codeVA + function offset
+            // Write to data section at VMT entry position
+            FData.PatchU64LE(vmtDataPos + j * 8, codeVA + UInt64(FFuncOffsets[methodFuncIdx]));
+          end;
+        end;
+      end;
+      
+      // Patch RTTI pointers
+      parentPtrPos := -1;
+      classNamePos := -1;
+      classNamePtrPos := -1;
+      parentVmtPos := -1;
+      
+      for j := 0 to High(FVMTLabels) do
+      begin
+        if FVMTLabels[j].Name = '_vmt_parent_' + cd.Name then
+          parentPtrPos := FVMTLabels[j].Pos;
+        if FVMTLabels[j].Name = '_classname_' + cd.Name then
+          classNamePos := FVMTLabels[j].Pos;
+        if FVMTLabels[j].Name = '_vmt_classname_ptr_' + cd.Name then
+          classNamePtrPos := FVMTLabels[j].Pos;
+        if (cd.BaseClassName <> '') and (FVMTLabels[j].Name = '_vmt_' + cd.BaseClassName) then
+          parentVmtPos := FVMTLabels[j].Pos;
+      end;
+      
+      // Patch parent VMT pointer (dataVA + offset)
+      if (parentPtrPos >= 0) and (parentVmtPos >= 0) then
+        FData.PatchU64LE(parentPtrPos, dataVA + UInt64(parentVmtPos))
+      else if parentPtrPos >= 0 then
+        FData.PatchU64LE(parentPtrPos, 0);  // No parent class
+      
+      // Patch class name pointer (dataVA + offset)
+      if (classNamePtrPos >= 0) and (classNamePos >= 0) then
+        FData.PatchU64LE(classNamePtrPos, dataVA + UInt64(classNamePos));
+    end;
+  end;
+  
+  // Phase 11: Generate PLT stubs for external symbols
   if Length(FExternalSymbols) > 0 then
   begin
     // Generate PLT0 (resolver stub)
