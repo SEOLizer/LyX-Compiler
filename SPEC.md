@@ -1236,3 +1236,67 @@ L1 cache footprint:     846 bytes
 - **IR**: EnergyCostHint pro Instruktion, GetIROpEnergyCost()
 - **x86_64_emit.pas / arm64_emit.pas**: TrackEnergy(), SetEnergyLevel()
 - **Parser**: @energy(level) Attribut vor Funktionen
+
+---
+
+### ESP32/Xtensa Backend (v0.5.3)
+
+- ✅ **ESP32 Target**: Unterstützung für ESP32-Mikrocontroller via Xtensa-Architektur
+- ✅ **Xtensa Code-Emitter**: Basis-Instruktionen (ADD, SUB, MOVI, LOAD/STORE, etc.)
+- ✅ **ESP32 Syscalls**: Syscall-Nummern für Exit, Write, GPIO, UART, Time, Random
+- ✅ **ELF32 Writer**: Erzeugung von 32-Bit ELF-Dateien für Xtensa
+- ✅ **Energy-Awareness**: Energy-Level-Unterstützung für IoT-Geräte
+
+**ESP32-Syntax (Beispiel):**
+```lyx
+fn main(): int64 {
+  // Hello World für ESP32
+  PrintStr("Hello from ESP32!\n");
+  return 0;
+}
+```
+
+**ESP32-Kompilierung:**
+```bash
+lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
+```
+
+**ESP32-Syscalls (Xtensa ABI):**
+- `a2`: Syscall-Nummer
+- `a3-a6`: Argumente
+- `a8`: Rückgabewert
+
+**Syscall-Liste:**
+- `SYS_EXIT = 1` - Programm beenden
+- `SYS_WRITE = 4` - Schreiben auf STDOUT
+- `SYS_READ = 3` - Lesen von STDIN
+- `SYS_GPIO_SET_MODE = 100` - GPIO-Modus setzen
+- `SYS_GPIO_WRITE = 101` - GPIO schreiben
+- `SYS_GPIO_READ = 102` - GPIO lesen
+- `SYS_UART_WRITE = 200` - UART schreiben
+- `SYS_UART_READ = 201` - UART lesen
+- `SYS_UART_CONFIG = 202` - UART konfigurieren
+- `SYS_GET_TIME = 300` - Zeit abfragen
+- `SYS_DELAY_MS = 301` - Verzögerung in Millisekunden
+- `SYS_RANDOM = 302` - Zufallszahl generieren
+- `SYS_RANDOM_SEED = 303` - Zufallszahl-Seed setzen
+
+**Architektur-Details:**
+- **ISA**: Xtensa (Tensilica L106 für ESP32)
+- **Register**: A0-A15 (16 32-Bit Register)
+- **ABI**: Vereinfachtes SysV-ähnliches Register-Layout
+  - A2-A7: Parameter/Return-Werte
+  - A8-A15: Temporäre Variablen
+- **Objektformat**: ELF32 (Executable)
+- **Memory Layout**: Code-Segment (.text), Data-Segment (.data)
+
+**Limitierungen (aktuell):**
+- Keine FPU-Unterstützung (FPU-Operationen erfordern Software-Emulation)
+- Keine Multiplikation/Division in Basis-ISA (Software-Implementierung nötig)
+- Dynamisches Linken noch nicht implementiert
+- Einfache Stack-Verwaltung (keine echten Stack-Frames)
+
+**Dateistruktur ESP32-Backend:**
+- `backend/xtensa/xtensa_emit.pas` - Xtensa Code-Emitter
+- `backend/esp32/syscalls_esp32.pas` - ESP32-Syscall-Definitionen
+- `backend/esp32/elf32_writer.pas` - ELF32-Objekt-Writer
