@@ -7,7 +7,10 @@ It produces directly executable binaries for multiple platforms without libc, wi
 Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux (x86_64/ARM64), Windows x64, macOS (x86_64/ARM64), ESP32/Xtensa
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, 
+   macOS x86_64, macOS ARM64, ESP32/Xtensa
+✅ Architecture Parameter: --arch=x86_64|arm64|xtensa
+✅ Target Parameter: --target=linux|arm64|win64|macosx64|macos-arm64|esp32
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -39,12 +42,15 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 # Build compiler
 make build
 
-# Compile and run Linux program
+# Compile and run Linux program (default target)
 ./lyxc examples/hello.lyx -o hello
 ./hello
 
-# Cross-compile for Windows
-./lyxc examples/hello.lyx -o hello.exe --target=win64
+# Cross-compile for different platforms
+./lyxc examples/hello.lyx -o hello.exe --target=win64        # Windows
+./lyxc examples/hello.lyx -o hello --target=macosx64         # macOS Intel
+./lyxc examples/hello.lyx -o hello --target=macos-arm64      # macOS Apple Silicon
+./lyxc examples/hello.lyx -o hello.elf --target=esp32        # ESP32
 
 # Debug flags
 ./lyxc examples/hello.lyx --emit-asm      # Output IR as pseudo-assembler
@@ -200,14 +206,14 @@ Lyx supports **cross-compilation** for multiple target platforms and architectur
 
 #### Available Targets and Architectures
 
-| Target Flag | Architecture | Object Format | Calling Convention | OS Interface |
-|-------------|--------------|---------------|-------------------|--------------|
-| `--target=linux` | x86_64 | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Linux Syscalls |
-| `--target=arm64` | ARM64 | ELF64 | AAPCS64 (X0-X7) | Linux Syscalls |
-| `--target=win64` | x86_64 | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow) | kernel32.dll |
-| `--target=macosx64` | x86_64 | Mach-O | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | BSD Syscalls |
-| `--target=macos-arm64` | ARM64 | Mach-O | AAPCS64 (X0-X7) | BSD Syscalls |
-| `--target=esp32` | Xtensa | ELF32 | Simplified SysV (A2-A7 params) | Syscalls |
+| Target Flag | Architecture | Object Format | Calling Convention | OS Interface | Status |
+|-------------|--------------|---------------|-------------------|--------------|--------|
+| `--target=linux` | x86_64 | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Linux Syscalls | ✅ Stable |
+| `--target=arm64` | ARM64 | ELF64 | AAPCS64 (X0-X7) | Linux Syscalls | ✅ Stable |
+| `--target=win64` | x86_64 | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow) | kernel32.dll | ✅ Stable |
+| `--target=macosx64` | x86_64 | Mach-O | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | BSD Syscalls | ✅ Stable |
+| `--target=macos-arm64` | ARM64 | Mach-O | AAPCS64 (X0-X7) | BSD Syscalls | ✅ Stable |
+| `--target=esp32` | Xtensa | ELF32 | Simplified SysV (A2-A7 params) | Syscalls | ⚠️ Experimental |
 
 #### Architecture Parameter
 
@@ -229,7 +235,32 @@ You can also explicitly specify the architecture using `--arch`:
 | `--arch=arm64` | 64-bit ARM (Apple Silicon, Raspberry Pi 4+) |
 | `--arch=xtensa` | Xtensa (ESP32 microcontroller) |
 
-**Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
+**Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target. The `--arch` parameter is also optional - architecture is automatically inferred from the target.
+
+#### CLI Help
+
+```bash
+./lyxc --help
+```
+
+```
+Lyx Compiler v0.5.0
+Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
+
+Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
+
+Optionen:
+  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)
+  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)
+  --arch=ARCH      Architektur (x86_64, arm64, xtensa)
+  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
+  --emit-asm       IR als Pseudo-Assembler ausgeben
+  --dump-relocs    Relocations und externe Symbole anzeigen
+  --lint           Linter-Warnungen aktivieren
+  --lint-only      Nur linten, nicht kompilieren
+  --no-lint        Linter-Warnungen deaktivieren
+  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)
+```
 
 **Testing ARM64 binaries (on x86_64):**
 ```bash
@@ -260,14 +291,14 @@ readelf -h esp32_hello.elf
 
 **Platform-Specific Details:**
 
-| Platform | Architecture | Register Set | ABI |
-|----------|--------------|--------------|-----|
-| **Linux x86_64** | x86_64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
-| **Linux ARM64** | ARM64 | X0-X30 | AAPCS64 (X0-X7) |
-| **Windows x64** | x86_64 | RAX-R15 | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) |
-| **macOS x86_64** | x86_64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
-| **macOS ARM64** | ARM64 | X0-X30 | AAPCS64 (X0-X7) |
-| **ESP32** | Xtensa | A0-A15 | Simplified SysV (A2-A7 params) |
+| Platform | Architecture | Object Format | Register Set | ABI |
+|----------|--------------|---------------|--------------|-----|
+| **Linux x86_64** | x86_64 | ELF64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **Linux ARM64** | ARM64 | ELF64 | X0-X30 | AAPCS64 (X0-X7) |
+| **Windows x64** | x86_64 | PE32+ | RAX-R15 | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) |
+| **macOS x86_64** | x86_64 | Mach-O | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **macOS ARM64** | ARM64 | Mach-O | X0-X30 | AAPCS64 (X0-X7) |
+| **ESP32** | Xtensa | ELF32 | A0-A15 | Simplified SysV (A2-A7 params) |
 
 **ESP32 Built-in Syscalls:**
 | Syscall | Number | Description |
