@@ -81,6 +81,8 @@ type
     end;
   end;
 
+function GetDefaultEnergyStats: TEnergyStats;
+
 { Predefined CPU energy models }
 const
   // Intel Core i7-10710U (15W TDP, 6 cores, up to 4.7GHz)
@@ -174,10 +176,7 @@ const
     HasAVX2: False;
     HasSSE41: True;
     HasAVX: False;
-  );
-
-var
-  CurrentEnergyConfig: TEnergyConfig;
+   );
 
 { Energy estimation functions }
 function EstimateTotalEnergy(const stats: TEnergyStats): UInt64;
@@ -189,6 +188,15 @@ procedure SetEnergyLevel(level: TEnergyLevel; cpuFamily: TCPUFamily);
 procedure ResetEnergyConfig;
 
 implementation
+
+function GetDefaultEnergyStats: TEnergyStats;
+begin
+  FillChar(Result, SizeOf(TEnergyStats), 0);
+  SetLength(Result.DetailedBreakdown, 0);
+end;
+
+var
+  CurrentEnergyConfig: TEnergyConfig;
 
 function GetCPUEnergyModel(cpuFamily: TCPUFamily): TCPUEnergyModel;
 begin
