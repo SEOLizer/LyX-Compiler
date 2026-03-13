@@ -1,5 +1,68 @@
 # Changelog - Lyx Compiler
 
+## Version 0.5.0 (März 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **macOS x86_64 Backend**
+
+Cross-Compilation für macOS x86_64 Mach-O Binaries:
+
+```bash
+# macOS Binary von Linux aus erstellen
+./lyxc program.lyx -o program --target=macosx64
+```
+
+**Implementierung:**
+- `backend/macho/macho64_writer.pas`: Vollständiger Mach-O 64-bit Writer
+- `backend/macho/syscalls_macos.pas`: BSD Syscall-Konstanten (0x2000000 Prefix)
+- `backend/macosx64/macosx64_emit.pas`: x86_64 Code-Emitter für macOS
+- Mach-O Load Commands: `LC_SEGMENT_64`, `LC_MAIN`, `LC_UUID`
+- Segmente: `__PAGEZERO`, `__TEXT`, `__DATA`, `__LINKEDIT`
+- SysV ABI x86_64 Calling Convention (identisch zu Linux)
+
+**Unterstützte Features:**
+- Statische Mach-O Binaries ohne dyld
+- PrintStr, PrintInt, exit Builtins via BSD Syscalls
+- Entry Point über `LC_MAIN` (nicht LC_UNIXTHREAD)
+
+#### **IR-Level Optimizer (v0.5.0)**
+
+Umfangreiche IR-Optimierungen für bessere Codegenerierung:
+
+- **Constant Folding**: Compile-Zeit-Auswertung konstanter Ausdrücke
+- **Common Subexpression Elimination (CSE)**: Redundante Berechnungen eliminieren
+- **Dead Code Elimination (DCE)**: Unerreichbaren Code entfernen
+- **Copy Propagation**: Unnötige Kopien eliminieren
+- **Strength Reduction**: Teure Operationen durch günstigere ersetzen
+
+#### **Peephole Optimizer (v0.5.0)**
+
+Backend-Level Optimierungen:
+
+- Constant folding auf Maschinencode-Ebene
+- Identity operations entfernen (`x + 0`, `x * 1`)
+- Redundante moves eliminieren
+
+#### **Maps und Sets (v0.5.0)**
+
+Assoziative Datenstrukturen:
+
+```lyx
+// Map mit Key-Value Paaren
+var scores: Map<int64, int64> := {1: 100, 2: 200};
+scores[3] := 300;
+var val: int64 := scores[1];
+
+// Set mit eindeutigen Werten
+var ids: Set<int64> := {10, 20, 30};
+if (20 in ids) {
+  PrintStr("Found!\n");
+}
+```
+
+---
+
 ## Version 0.4.3 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
