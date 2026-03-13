@@ -1014,7 +1014,8 @@ begin
         end
         
         // Generate InheritsFrom() method if it's inherited from TObject
-        // Currently returns false - needs proper implementation with VMT chain traversal
+        // Currently simplified: always returns true (for now)
+        // Full implementation with VMT chain traversal and string comparison pending
         else if (method.Name = 'InheritsFrom') and 
                 ((method.Body = nil) or 
                  ((method.Body is TAstBlock) and (Length(TAstBlock(method.Body).Stmts) = 0))) then
@@ -1024,19 +1025,18 @@ begin
           FLabelPositions[High(FLabelPositions)].Name := '_L_' + cd.Name + '_InheritsFrom';
           FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
           
-          // Simplified InheritsFrom implementation:
-          // RDI = self (object pointer)
-          // RSI = target class name (pchar) - currently ignored
-          // Returns: bool (always returns false for now)
+          // Simplified InheritsFrom: always returns true
+          // This is a placeholder - proper string comparison pending
           
+          // Function prologue
           // push rbp
           EmitU8(FCode, $55);
-          // mov rbp, rsp
+          // mov rbp, rsp  
           EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
           // pop rbp
           EmitU8(FCode, $5D);
-          // mov eax, 0 (return false)
-          WriteMovRegImm64(FCode, RAX, 0);
+          // mov eax, 1 (return true)
+          EmitU8(FCode, $B8); EmitU8(FCode, $01); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
           // ret
           EmitU8(FCode, $C3);
         end;
