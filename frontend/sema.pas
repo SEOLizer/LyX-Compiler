@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, bytes;
+  SysUtils, Classes, ast, diag, lexer, unit_manager, bytes, tobject;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -48,6 +48,7 @@ type
     function ResolveSymbol(const name: string): TSymbol;
     function ResolveQualifiedName(const qualifier, name: string; span: TSourceSpan): TSymbol;
     procedure DeclareBuiltinFunctions;
+    procedure RegisterTObject;
     procedure ProcessImports(prog: TAstProgram);
     procedure ImportUnit(imp: TAstImportDecl);
     function TypeEqual(a, b: TAurumType): Boolean;
@@ -67,6 +68,7 @@ type
     procedure ComputeClassLayouts;
     // VMT (Virtual Method Table)
     procedure ResolveVMTForClasses;
+    procedure RegisterInheritedMethods;
     // Member access control
     procedure CheckMemberAccess(const memberName: string; memberClass: TAstClassDecl; visibility: TVisibility; span: TSourceSpan);
     // AST rewrite helpers
@@ -1092,7 +1094,7 @@ begin
   sl := FScopes[High(FScopes)];
   // free symbols
   for i := 0 to sl.Count - 1 do
-    TObject(sl.Objects[i]).Free;
+    System.TObject(sl.Objects[i]).Free;
   sl.Free;
   SetLength(FScopes, Length(FScopes) - 1);
 end;
@@ -1113,7 +1115,7 @@ begin
     sym.Free;
     Exit;
   end;
-  cur.AddObject(sym.Name, TObject(sym));
+  cur.AddObject(sym.Name, System.TObject(sym));
 end;
 
 function TSema.ResolveSymbol(const name: string): TSymbol;
@@ -1416,6 +1418,55 @@ begin
 
 end;
 
+procedure TSema.RegisterTObject;
+{ Registriert TObject als implizite Basisklasse für alle Klassen.
+  Wird vor der AST-Analyse aufgerufen, damit 'extends TObject' funktioniert. }
+var
+  tobj: TAstClassDecl;
+  m: TAstFuncDecl;
+  sym: TSymbol;
+  j, k: Integer;
+begin
+  // TObject aus tobject.pas erstellen
+  tobj := CreateTObjectClassDecl();
+  
+  // In FClassTypes registrieren
+  if not Assigned(FClassTypes) then
+  begin
+    FClassTypes := TStringList.Create;
+    FClassTypes.Sorted := False;
+  end;
+  FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(tobj));
+  
+  // Auch in FStructTypes registrieren (für einheitliche Lookup-Logik)
+  if not Assigned(FStructTypes) then
+  begin
+    FStructTypes := TStringList.Create;
+    FStructTypes.Sorted := False;
+  end;
+  FStructTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(tobj));
+  
+  // Methoden als Symbole registrieren (wie bei normalen Klassen)
+  for j := 0 to High(tobj.Methods) do
+  begin
+    m := tobj.Methods[j];
+    
+    sym := TSymbol.Create('_L_' + TOBJECT_CLASSNAME + '_' + m.Name);
+    sym.Kind := symFunc;
+    sym.DeclType := m.ReturnType;
+    sym.ReturnTypeName := m.ReturnTypeName;
+    
+    // Instance method: first param is implicit self (pointer)
+    sym.ParamCount := Length(m.Params) + 1;
+    SetLength(sym.ParamTypes, sym.ParamCount);
+    sym.ParamTypes[0] := atUnresolved; // self is a class pointer
+    for k := 0 to High(m.Params) do
+      sym.ParamTypes[k+1] := m.Params[k].ParamType;
+    
+    AddSymbolToCurrent(sym, NullSpan);
+  end;
+end;
+
 function IsIntegerType(t: TAurumType): Boolean;
 begin
   case t of
@@ -1459,7 +1510,7 @@ var
   call: TAstCall;
   s: TSymbol;
   sSym: TSymbol;
-  i, fi, baseIdx, fldOffset: Integer;
+  i, fi, baseIdx, fldOffset, idx: Integer;
   lt, rt, ot, atype, srcType: TAurumType;
   qualifier: string;
   identName: string;
@@ -1475,6 +1526,7 @@ var
   cd: TAstClassDecl;
   newExpr: TAstNewExpr;
   castTypeName: string;
+  targetClassName: string;
   compiledRegex: string;
   captureSlots: Integer;
 begin
@@ -1689,6 +1741,12 @@ begin
             TAstCast(expr).CastType := atF32
           else if castTypeName = 'int32' then
             TAstCast(expr).CastType := atInt32
+          else if FClassTypes.IndexOf(castTypeName) >= 0 then
+          begin
+            // Class cast - mark as class type
+            // The actual runtime check will be done in IR/Backend
+            TAstCast(expr).CastType := atUnresolved; // Will be resolved later
+          end
           else
             FDiag.Error('unsupported cast type: ' + castTypeName, expr.Span);
         end;
@@ -1978,11 +2036,23 @@ begin
           // Instance method call (receiver is a variable with class type)
           else if (s = nil) and Assigned(sSym) and Assigned(sSym.ClassDecl) then
           begin
-            mangledName := '_L_' + sSym.ClassDecl.Name + '_' + mName;
-            s := ResolveSymbol(mangledName);
+            // Search the class hierarchy for the method definition
+            cd := sSym.ClassDecl;
+            mangledName := '';
+            while Assigned(cd) do
+            begin
+              mangledName := '_L_' + cd.Name + '_' + mName;
+              s := ResolveSymbol(mangledName);
+              if s <> nil then Break;
+              // Method not in this class, check base class
+              if cd.BaseClassName = '' then Break;
+              baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
+              if baseIdx < 0 then Break;
+              cd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+            end;
             if s = nil then
             begin
-              FDiag.Error('call to undeclared method: ' + mangledName, call.Span);
+              FDiag.Error('call to undeclared method: ' + mName + ' in class ' + sSym.ClassDecl.Name, call.Span);
               Result := atUnresolved;
               Exit;
             end;
@@ -1999,8 +2069,20 @@ begin
               fi := FClassTypes.IndexOf(sSym.TypeName);
               if fi >= 0 then
               begin
-                mangledName := '_L_' + sSym.TypeName + '_' + mName;
-                s := ResolveSymbol(mangledName);
+                // Search the class hierarchy for the method definition
+                cd := TAstClassDecl(FClassTypes.Objects[fi]);
+                mangledName := '';
+                while Assigned(cd) do
+                begin
+                  mangledName := '_L_' + cd.Name + '_' + mName;
+                  s := ResolveSymbol(mangledName);
+                  if s <> nil then Break;
+                  // Method not in this class, check base class
+                  if cd.BaseClassName = '' then Break;
+                  baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
+                  if baseIdx < 0 then Break;
+                  cd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+                end;
                 if s <> nil then
                 begin
                   call.SetName(mangledName);
@@ -2008,7 +2090,7 @@ begin
                 end
                 else
                 begin
-                  FDiag.Error('call to undeclared method: ' + mangledName, call.Span);
+                  FDiag.Error('call to undeclared method: ' + mName + ' in class ' + sSym.TypeName, call.Span);
                   Result := atUnresolved;
                   Exit;
                 end;
@@ -2142,20 +2224,46 @@ begin
         end
         else
         begin
+          // Check if trying to instantiate an abstract class
+          idx := FClassTypes.IndexOf(TAstNewExpr(expr).ClassName);
+          if idx >= 0 then
+          begin
+            cd := TAstClassDecl(FClassTypes.Objects[idx]);
+            if cd.IsAbstract then
+            begin
+              FDiag.Error('cannot instantiate abstract class: ' + TAstNewExpr(expr).ClassName, expr.Span);
+              Result := atUnresolved;
+              Exit;
+            end;
+          end;
           // Check constructor arguments if any
           newExpr := TAstNewExpr(expr);
           if Length(newExpr.Args) > 0 then
           begin
-            // Look for Create method with matching arguments
-            mangledName := '_L_' + newExpr.ClassName + '_Create';
+            // Look for constructor method with matching arguments
+            // Constructor is named 'new' or 'Create' in Lyx
+            // Mangled as _L_<ClassName>_new or _L_<ClassName>_Create
+            mangledName := '_L_' + newExpr.ClassName + '_new';
             s := ResolveSymbol(mangledName);
             if s = nil then
             begin
-              FDiag.Error('class ' + newExpr.ClassName + ' has no Create constructor for new with arguments', expr.Span);
+              // Try 'Create' variant
+              mangledName := '_L_' + newExpr.ClassName + '_Create';
+              s := ResolveSymbol(mangledName);
+              if s <> nil then
+                newExpr.ConstructorName := 'Create';
+            end
+            else
+            begin
+              newExpr.ConstructorName := 'new';
+            end;
+            if s = nil then
+            begin
+              FDiag.Error('class ' + newExpr.ClassName + ' has no constructor for new with arguments', expr.Span);
               Result := atUnresolved;
               Exit;
             end;
-            // Check argument count (Create has self as first param, so ParamCount - 1)
+            // Check argument count (constructor has self as first param, so ParamCount - 1)
             if Length(newExpr.Args) <> s.ParamCount - 1 then
             begin
               FDiag.Error(Format('wrong argument count for %s constructor: expected %d, got %d', 
@@ -2331,6 +2439,20 @@ begin
           end;
           Result := atBool;
         end;
+      end;
+    nkIsExpr:
+      begin
+        // 'is' operator: expr is ClassName
+        // Returns bool
+        lt := CheckExpr(TAstIsExpr(expr).Expr);
+        
+        // The target class must be a known class
+        targetClassName := TAstIsExpr(expr).ClassName;
+        if FClassTypes.IndexOf(targetClassName) < 0 then
+        begin
+          FDiag.Error('Unknown class: ' + targetClassName, TAstIsExpr(expr).Span);
+        end;
+        Result := atBool;
       end;
   else
     begin
@@ -2718,6 +2840,8 @@ begin
   // create global scope
   PushScope;
   DeclareBuiltinFunctions;
+  // Register TObject as the implicit base class
+  RegisterTObject;
   FCurrentReturn := atVoid;
 end;
 
@@ -2965,7 +3089,7 @@ begin
       if cd.Size <> 0 then Continue;
       
       // Check base class
-      baseSize := 0;
+      baseSize := 8; // VMT pointer at offset 0 (all classes have VMT due to TObject)
       maxAlign := 8; // Pointer alignment for classes
       if cd.BaseClassName <> '' then
       begin
@@ -2981,11 +3105,12 @@ begin
           // Base class not yet computed, try again later
           Continue;
         end;
-        baseSize := baseCd.Size;
-        maxAlign := baseCd.Align;
+        baseSize := baseCd.Size;  // Already includes VMT pointer
+        if baseCd.Align > maxAlign then
+          maxAlign := baseCd.Align;
       end;
       
-      // Compute field offsets starting at baseSize
+      // Compute field offsets starting at baseSize (after VMT and inherited fields)
       off := baseSize;
       ok := True;
       
@@ -3134,10 +3259,68 @@ begin
           end;
         end;
       end;
+
+      // Validate constructor/destructor
+      if method.IsConstructor then
+      begin
+        // Constructor must have void return type
+        if method.ReturnType <> atVoid then
+        begin
+          FDiag.Error('constructor must not have a return type', method.Span);
+        end;
+        // Constructor cannot be virtual
+        if method.IsVirtual then
+        begin
+          FDiag.Error('constructor cannot be virtual', method.Span);
+        end;
+        // Constructor cannot be static
+        if method.IsStatic then
+        begin
+          FDiag.Error('constructor cannot be static', method.Span);
+        end;
+      end;
+
+      if method.IsDestructor then
+      begin
+        // Destructor must have void return type
+        if method.ReturnType <> atVoid then
+        begin
+          FDiag.Error('destructor must not have a return type', method.Span);
+        end;
+        // Destructor cannot be virtual
+        if method.IsVirtual then
+        begin
+          FDiag.Error('destructor cannot be virtual', method.Span);
+        end;
+        // Destructor cannot be static
+        if method.IsStatic then
+        begin
+          FDiag.Error('destructor cannot be static', method.Span);
+        end;
+      end;
     end;
 
     // Build VMT: collect virtual methods
-    cd.VirtualMethods := nil;  // Reset using property
+    // For TObject (no base class) or classes with pre-set VirtualMethods, keep existing VMT
+    // For other classes, build VMT from scratch
+    if (cd.BaseClassName = '') and (Length(cd.VirtualMethods) > 0) then
+    begin
+      // TObject or similar: already has VirtualMethods set from CreateTObjectClassDecl
+      // Just add any additional virtual methods from this class
+      for j := 0 to High(cd.Methods) do
+      begin
+        method := cd.Methods[j];
+        if method.IsVirtual and (method.VirtualTableIndex < 0) then
+        begin
+          vmtIdx := Length(cd.VirtualMethods);
+          method.VirtualTableIndex := vmtIdx;
+          cd.AddVirtualMethod(method);
+        end;
+      end;
+      Continue;  // Skip the rest of VMT building for this class
+    end;
+    
+    cd.VirtualMethods := nil;  // Reset using property for non-TObject classes
 
     // If there's a base class, inherit its VMT first
     if cd.BaseClassName <> '' then
@@ -3150,6 +3333,17 @@ begin
         for vmtIdx := 0 to High(baseCd.VirtualMethods) do
         begin
           baseMethod := baseCd.VirtualMethods[vmtIdx];
+          
+          // Handle nil entries (abstract methods not yet implemented)
+          if not Assigned(baseMethod) then
+          begin
+            // Keep nil in derived VMT - will be caught at runtime
+            while Length(cd.VirtualMethods) <= vmtIdx do
+              cd.AddVirtualMethod(nil);
+            cd.VirtualMethods[vmtIdx] := nil;
+            Continue;
+          end;
+          
           // Look for override in derived class
           method := nil;
           for j := 0 to High(cd.Methods) do
@@ -3161,18 +3355,36 @@ begin
             end;
           end;
 
-          if Assigned(method) and method.IsOverride then
+          // Check if we should override:
+          // 1. method is explicitly marked as override, OR
+          // 2. method exists in derived class (implicit override for abstract/concrete methods)
+          // 3. baseMethod is abstract and method exists (implementing abstract)
+          if Assigned(method) and 
+             (method.IsOverride or (not method.IsVirtual) or baseMethod.IsAbstract) then
           begin
-            // Override: use derived class method, keep same VMT index
-            method.VirtualTableIndex := vmtIdx;
-            // Ensure VMT array is large enough
-            while Length(cd.VirtualMethods) <= vmtIdx do
-              cd.AddVirtualMethod(nil);
-            cd.VirtualMethods[vmtIdx] := method;
+            // Check if signature matches
+            if (method.ReturnType = baseMethod.ReturnType) and
+               (Length(method.Params) = Length(baseMethod.Params)) then
+            begin
+              // Override: use derived class method, keep same VMT index
+              method.VirtualTableIndex := vmtIdx;
+              // Ensure VMT array is large enough
+              while Length(cd.VirtualMethods) <= vmtIdx do
+                cd.AddVirtualMethod(nil);
+              cd.VirtualMethods[vmtIdx] := method;
+            end
+            else
+            begin
+              // Signature mismatch - error will be reported elsewhere
+              // Inherit base method (may still be abstract)
+              while Length(cd.VirtualMethods) <= vmtIdx do
+                cd.AddVirtualMethod(nil);
+              cd.VirtualMethods[vmtIdx] := baseMethod;
+            end;
           end
           else
           begin
-            // No override: inherit base method
+            // No override: inherit base method (keeps abstract status)
             while Length(cd.VirtualMethods) <= vmtIdx do
               cd.AddVirtualMethod(nil);
             cd.VirtualMethods[vmtIdx] := baseMethod;
@@ -3195,22 +3407,17 @@ begin
       end;
     end;
 
-    // Add VMT pointer to class size (8 bytes at offset 0)
-    // The VMT pointer is stored at offset 0 of every instance
-    // So we need to add 8 bytes to the class size and adjust field offsets
-    if Length(cd.VirtualMethods) > 0 then
-    begin
-      // Add 8 bytes for VMT pointer
-      cd.Size := cd.Size + 8;
-
-      // Adjust all field offsets by 8 (VMT pointer at offset 0)
-      for j := 0 to High(cd.FieldOffsets) do
-      begin
-        if cd.FieldOffsets[j] >= 0 then
-          Inc(cd.FieldOffsets[j], 8);
-      end;
-    end;
+    // VMT pointer is already included in class size by ComputeClassLayouts
+    // (all classes inherit from TObject which has virtual methods)
   end;
+end;
+
+procedure TSema.RegisterInheritedMethods;
+{ Diese Prozedur ist jetzt leer - Methodensuche erfolgt dynamisch in CheckExpr.
+  Die Vererbungskette wird bei Methodenaufrufen durchsucht, um die definierende 
+  Klasse zu finden (z.B. _L_TMyClass_SetVal statt _L_TDerivedClass_SetVal). }
+begin
+  // Nichts zu tun - Methodenauflösung erfolgt dynamisch
 end;
 
 procedure TSema.ImportUnit(imp: TAstImportDecl);
@@ -3246,7 +3453,7 @@ begin
     alias := ExtractFileName(StringReplace(upath, '.', '/', [rfReplaceAll]));
   if not Assigned(FImportedUnits) then
     FImportedUnits := TStringList.Create;
-  FImportedUnits.AddObject(alias, TObject(loadedUnit));
+  FImportedUnits.AddObject(alias, System.TObject(loadedUnit));
   
   // Importiere öffentliche Symbole (pub) in den globalen Scope
   if Assigned(loadedUnit.AST) then
@@ -3817,7 +4024,7 @@ begin
          FDiag.Error('redeclaration of type: ' + TAstStructDecl(node).Name, node.Span);
          Continue;
        end;
-       FStructTypes.AddObject(TAstStructDecl(node).Name, TObject(node));
+       FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node));
        // register methods as functions with mangled names
        for j := 0 to High(TAstStructDecl(node).Methods) do
        begin
@@ -3874,7 +4081,20 @@ begin
           FDiag.Error('redeclaration of class: ' + TAstClassDecl(node).Name, node.Span);
           Continue;
         end;
-        FClassTypes.AddObject(TAstClassDecl(node).Name, TObject(node));
+        FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+        
+        // Check if class has abstract methods - if so, mark class as abstract
+        if not TAstClassDecl(node).IsAbstract then
+        begin
+          for j := 0 to High(TAstClassDecl(node).Methods) do
+          begin
+            if TAstClassDecl(node).Methods[j].IsAbstract then
+            begin
+              TAstClassDecl(node).IsAbstract := True;
+              Break;
+            end;
+          end;
+        end;
         
         // Register methods as functions with mangled names
         for j := 0 to High(TAstClassDecl(node).Methods) do
@@ -3977,6 +4197,7 @@ begin
   ComputeStructLayouts;
   ComputeClassLayouts;
   ResolveVMTForClasses;
+  RegisterInheritedMethods;
 
   // Second pass: check function bodies
   for i := 0 to High(prog.Decls) do

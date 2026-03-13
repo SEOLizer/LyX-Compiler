@@ -20,6 +20,7 @@ type
     tkTry, tkCatch, tkThrow, tkFinally,
     // OOP Keywords
     tkClass, tkExtends, tkSuper, tkNew, tkDispose,
+    tkInterface, tkImplements,
     // Access Control Keywords
     tkPrivate, tkProtected,
     // SIMD Keywords
@@ -31,7 +32,7 @@ type
     // Map/Set Keywords
     tkMap, tkSet, tkIn,
     // OOP Additional Keywords
-    tkVirtual, tkOverride,
+    tkVirtual, tkOverride, tkAbstract, tkIs,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -152,6 +153,8 @@ begin
     tkSuper:      Result := 'super';
     tkNew:        Result := 'new';
     tkDispose:    Result := 'dispose';
+    tkInterface:  Result := 'interface';
+    tkImplements: Result := 'implements';
     tkPrivate:    Result := 'private';
     tkProtected:  Result := 'protected';
     tkPanic:      Result := 'panic';
@@ -163,6 +166,7 @@ begin
     tkIn:         Result := 'in';
     tkVirtual:    Result := 'virtual';
     tkOverride:   Result := 'override';
+    tkAbstract:   Result := 'abstract';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -704,6 +708,8 @@ begin
     'super':      Result := tkSuper;
     'new':        Result := tkNew;
     'dispose':    Result := tkDispose;
+    'interface':   Result := tkInterface;
+    'implements':  Result := tkImplements;
     // Access Control Keywords
     'private':    Result := tkPrivate;
     'protected':  Result := tkProtected;
@@ -722,6 +728,8 @@ begin
     // OOP Additional Keywords
     'virtual':    Result := tkVirtual;
     'override':   Result := tkOverride;
+    'abstract':   Result := tkAbstract;
+    'is':         Result := tkIs;
   else
     Result := tkIdent;
   end;
