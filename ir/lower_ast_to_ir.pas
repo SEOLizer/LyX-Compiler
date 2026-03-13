@@ -2725,11 +2725,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
      // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
      if (arrLen = -1) or (vd.DeclType = atDynArray) then
      begin
-        // static array: allocate consecutive locals and initialize per-item
+        // dynamic array: allocate 3 slots (ptr, len, cap)
         // IMPORTANT: Store elements in REVERSE order so that arr[0] has the 
         // highest slot index. This way, base_addr + index*8 works correctly
         // because stack grows downward.
-        loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
+        loc := AllocLocalMany(vd.Name, vd.DeclType, 3);  // 3 slots for dynamic array: ptr, len, cap
         if vd.InitExpr is TAstArrayLit then
         begin
           items := TAstArrayLit(vd.InitExpr).Items;
