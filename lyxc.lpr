@@ -555,7 +555,7 @@ begin
               arm64Emit.EmitFromIR(module);
               codeBuf := arm64Emit.GetCodeBuffer;
               dataBuf := arm64Emit.GetDataBuffer;
-              entryVA := 4096;
+              entryVA := $400000 + 4096;  // Base VA + code offset
 
               // Check if we have external symbols
               externSymbols := arm64Emit.GetExternalSymbols;
