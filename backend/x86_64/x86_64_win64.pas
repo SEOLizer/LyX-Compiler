@@ -4,7 +4,7 @@ unit x86_64_win64;
 interface
 
 uses
-  SysUtils, Classes, Math, bytes, ir, pe64_writer;
+  SysUtils, Classes, Math, bytes, ir, pe64_writer, ast;
 
 type
   // Emitter für Windows x64 Code Generation
@@ -46,6 +46,12 @@ type
       CodePos: Integer;
     end;
     FGlobalVarOffsets: array of UInt64;
+
+    // VMT Labels for OOP (Virtual Method Table)
+    FVMTLabels: array of record
+      Name: string;
+      Pos: Integer;
+    end;
 
     // Label/Jump Patching (intra-function)
     FLabelMap: TStringList;  // label name -> code position (for current function)
@@ -1094,6 +1100,7 @@ var
   randomSeedLeaPositions: array of Integer;
   globalVarNames: TStringList;
   globalVarOffsets: array of UInt64;
+  cd: TAstClassDecl;  // for VMT emission
   // use emitter-level FGlobalVarLeaPositions field to collect patches
   nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
   targetPos, jmpPos: Integer;
@@ -1243,6 +1250,53 @@ begin
       else
         FData.WriteU64LE(0);
       Inc(totalDataOffset, 8);
+    end;
+  end;
+
+  // Emit VMT tables for classes with virtual methods
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    cd := module.ClassDecls[i];
+    // Only emit VMT if class has virtual methods
+    if Length(cd.VirtualMethods) > 0 then
+    begin
+      // Emit class name string (for RTTI ClassName method)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_classname_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      
+      // Write class name as null-terminated string
+      for j := 1 to Length(cd.Name) do
+        FData.WriteU8(Ord(cd.Name[j]));
+      FData.WriteU8(0);  // null terminator
+      
+      // Align to 8 bytes before RTTI header
+      while (FData.Size mod 8) <> 0 do
+        FData.WriteU8(0);
+      
+      // Emit RTTI header
+      // 1. Parent VMT Pointer
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_parent_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder
+      
+      // 2. ClassName Pointer
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_classname_ptr_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FData.WriteU64LE(0);  // Placeholder
+      
+      // 3. VMT base (where instance VMT pointers point to)
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      
+      // Emit VMT entries (method pointers)
+      for j := 0 to High(cd.VirtualMethods) do
+      begin
+        FData.WriteU64LE(0);  // Placeholder - will be patched
+      end;
     end;
   end;
 
@@ -2018,7 +2072,23 @@ begin
                 WriteMovMemReg(FCode, RSP, 32 + (k - 4) * 8, RAX);
               end;
             end;
-            // Call function: if external -> via IAT, else direct relative to function offsets
+            
+            // Handle virtual method calls
+            if instr.IsVirtualCall and (instr.VMTIndex >= 0) then
+            begin
+              // Virtual call: self is in RCX (first arg for Windows x64)
+              // 1. Load VMT pointer from object: mov rax, [rcx]
+              WriteMovRegMem(FCode, RAX, RCX, 0);
+              // 2. Load method pointer from VMT table: mov rax, [rax + vmtIndex*8]
+              WriteMovRegMem(FCode, RAX, RAX, instr.VMTIndex * 8);
+              // 3. Indirect call through the method pointer
+              EmitU8(FCode, $FF); // rex.w + D0 = call r/m64
+              EmitU8(FCode, $D0);
+              // Skip the regular call emission below
+            end
+            else
+            begin
+              // Call function: if external -> via IAT, else direct relative to function offsets
             if instr.ImmStr <> '' then
             begin
               // external or named function: find in FFuncOffsets by name
@@ -2035,6 +2105,7 @@ begin
             // emit call rel32 with zero placeholder
             EmitU8(FCode, $E8);
             EmitU32(FCode, 0);
+            end; // end of virtual call handling
             // Store return value from RAX to destination slot
             if instr.Dest >= 0 then
               WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
@@ -2662,6 +2733,10 @@ begin
     else
       leaVarPatches[i].VarIndex := 0;
   end;
+
+  // TODO: VMT Patching - patch VMT entries with actual method addresses
+  // This requires matching method names to function offsets
+  // For now, VMT entries remain as 0 (will be fixed in future)
 
   WritePE64(filename, FCode, FData, FImports, FIATPatches, leaStrPatches, leaVarPatches, FEntryOffset);
 end;
