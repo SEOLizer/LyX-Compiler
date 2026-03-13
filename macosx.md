@@ -1,6 +1,6 @@
 # Plan: Backend für macOS (Mach‑O 64‑Bit) implementieren
 
-## Status: In Arbeit
+## Status: Fast abgeschlossen
 
 ### Abgeschlossene Arbeitspakete
 
@@ -8,17 +8,17 @@
 - [x] **Arbeitspaket 6**: Statischer Mach-O-Erzeuger implementiert (`backend/macho/macho64_writer.pas`)
 - [x] **Arbeitspaket 7**: Syscall-Anpassungen (`backend/macho/syscalls_macos.pas`)
 - [x] **x86_64 Emitter für macOS**: `backend/macosx64/macosx64_emit.pas`
-
-### Noch ausstehend
-
-- [ ] **Arbeitspaket 8**: Compiler-Frontend anpassen (--target=macosx64)
-- [ ] **Arbeitspaket 9-10**: Build-Prozess und Output-Validierung testen
-- [ ] **Arbeitspaket 11**: Dokumentation vervollständigen
+- [x] **Arbeitspaket 8**: Compiler-Frontend anpassen (--target=macosx64)
+- [x] **Arbeitspaket 9**: Build-Prozess testen
+- [x] **Arbeitspaket 10**: Output-Validierung durchgeführt (otool, nm)
+- [x] **Arbeitspaket 11**: Dokumentation vervollständigen (README.md, CHANGELOG.md)
 
 ---
-
+ 
 ## Ziel
-Ein funktionierendes macOS‑Backend (Mach‑O 64‑Bit) für den Lyx‑Compiler schaffen, das statische ausführbare Dateien für die Zielplattformen **x86_64‑darwin** und **arm64‑darwin** erzeugen kann. Das Backend soll vorhandene Frontend‑ und IR‑Stufen unverändert verwenden und nur die Objektschreibung sowie syscall‑Anpassungen ergänzen.
+Ein funktionierendes macOS‑Backend (Mach‑O 64‑Bit) für den Lyx‑Compiler schaffen, das statische ausführbare Dateien für die Zielplattform **x86_64‑darwin** erzeugen kann. Das Backend soll vorhandene Frontend‑ und IR‑Stufen unverändert verwenden und nur die Objektschreibung sowie syscall‑Anpassungen ergänzen.
+
+**Hinweis:** Der aktuelle Stand unterstützt die statische Mach-O Erzeugung für x86_64. Der ARM64-Darwin-Port sowie die vollständige IR-Opcode-Unterstützung im macOS Emitter sind noch ausstehend.
 
 ## Voraussetzungen / Bestehende Basis
 - Frontend/IR bereits funktioniert (Lexer, Parser, Semantik, IR‑Generierung, Optimierungen).  
