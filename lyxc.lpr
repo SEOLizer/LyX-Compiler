@@ -9,10 +9,11 @@ uses
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer,
-  macosx64_emit, macho64_writer;
+  macosx64_emit, macho64_writer,
+  xtensa_emit, elf32_writer;
 
 type
-  TTarget = (targetLinux, targetWindows, targetLinuxARM64, targetMacOSX64);
+  TTarget = (targetLinux, targetWindows, targetLinuxARM64, targetMacOSX64, targetESP32);
 
 var
   inputFile: string;
@@ -40,6 +41,7 @@ var
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
   macosx64Emit: TMacOSX64Emitter;
+  esp32Emit: ICodeEmitter;
   codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64;
   basePath: string;
@@ -232,11 +234,11 @@ begin
     WriteLn(StdErr, 'Lyx Compiler v0.5.0');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
-    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64]');
+    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64|macosx64|esp32]');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
-    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64 oder macosx64)');
+    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64 oder esp32)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
@@ -267,23 +269,27 @@ begin
       outputFile := ParamStr(i + 1);
       Inc(i, 2);  // Skip -o and the filename
     end
-    else if Copy(param, 1, 9) = '--target=' then
-    begin
-      param := LowerCase(Copy(param, 10, MaxInt));
-      if (param = 'win64') or (param = 'windows') then
-        target := targetWindows
-      else if (param = 'linux') or (param = 'elf') then
-        target := targetLinux
-      else if (param = 'arm64') or (param = 'aarch64') or (param = 'linux-arm64') then
-        target := targetLinuxARM64
-      else
-      begin
-        WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
-        WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64');
-        Halt(1);
-      end;
-      Inc(i);
-    end
+     else if Copy(param, 1, 9) = '--target=' then
+     begin
+       param := LowerCase(Copy(param, 10, MaxInt));
+       if (param = 'win64') or (param = 'windows') then
+         target := targetWindows
+       else if (param = 'linux') or (param = 'elf') then
+         target := targetLinux
+       else if (param = 'arm64') or (param = 'aarch64') or (param = 'linux-arm64') then
+         target := targetLinuxARM64
+       else if (param = 'macosx64') or (param = 'darwin') then
+         target := targetMacOSX64
+       else if (param = 'esp32') or (param = 'xtensa') then
+         target := targetESP32
+       else
+       begin
+         WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
+         WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64, macosx64, esp32');
+         Halt(1);
+       end;
+       Inc(i);
+     end
     else if param = '--emit-asm' then
     begin
       flagEmitAsm := True;
@@ -362,7 +368,9 @@ begin
   else if target = targetLinuxARM64 then
     WriteLn('Ziel:     Linux ARM64 (ELF64)')
   else if target = targetMacOSX64 then
-    WriteLn('Ziel:     macOS x86_64 (Mach-O)');
+    WriteLn('Ziel:     macOS x86_64 (Mach-O)')
+  else if target = targetESP32 then
+    WriteLn('Ziel:     ESP32 (Xtensa, ELF32)');
 
   // Energy-Konfiguration setzen (vor der Statusausgabe)
   if flagEnergyLevel > 0 then
@@ -610,16 +618,50 @@ begin
                if flagEnergyLevel > 0 then
                  PrintEnergyStats(macosx64Emit.GetEnergyStats);
  
-               FpChmod(PChar(outputFile), 493);
-               WriteLn('Wrote ', outputFile);
-             finally
-               macosx64Emit.Free;
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile);
+              finally
+                macosx64Emit.Free;
+              end;
+            end
+            else if target = targetESP32 then
+            begin
+              // ESP32 (Xtensa) Code Generation
+              esp32Emit := TxtensaCodeEmitter.Create;
+              try
+                if flagEnergyLevel > 0 then
+                  esp32Emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+
+                esp32Emit.EmitFromIR(module);
+                codeBuf := esp32Emit.GetCodeBuffer;
+                dataBuf := esp32Emit.GetDataBuffer;
+                entryVA := $400000 + 4096;  // Base VA + code offset
+
+                // Check if we have external symbols (for now ignore, produce static ELF)
+                externSymbols := esp32Emit.GetExternalSymbols;
+                if Length(externSymbols) > 0 then
+                begin
+                  WriteLn('Note: ESP32 dynamic linking not yet implemented');
+                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                end;
+
+                WriteLn('Generating static ELF32 for ESP32 (Xtensa)');
+                WriteElf32(outputFile, codeBuf, dataBuf, entryVA);
+
+                // Energy statistics output
+                if flagEnergyLevel > 0 then
+                  PrintEnergyStats(esp32Emit.GetEnergyStats);
+
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile);
+               finally
+                 // esp32Emit is interface reference, automatically freed
+               end;
              end;
-           end;
-        finally
-          lower.Free;
-          module.Free;
-        end;
+          finally
+            lower.Free;
+            module.Free;
+          end;
       finally
         um.Free;
       end;
