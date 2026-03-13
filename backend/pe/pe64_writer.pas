@@ -43,6 +43,15 @@ type
   end;
   TLeaVarPatchArray = array of TLeaVarPatch;
 
+  // Data-internal reference patch (e.g., VMT RTTI pointers)
+  // Patches a 64-bit address in data section to point to another data location
+  TDataRefPatch = record
+    DataOffset: Integer;    // position in data buffer where address is stored
+    TargetOffset: Integer;  // target offset within data section
+    IsCodeRef: Boolean;     // if true, target is in .text section
+  end;
+  TDataRefPatchArray = array of TDataRefPatch;
+
 // Minimales PE64 ohne Imports (nur für Tests)
 procedure WritePE64Minimal(const filename: string; const codeBuf: TByteBuffer);
 
@@ -50,6 +59,7 @@ procedure WritePE64Minimal(const filename: string; const codeBuf: TByteBuffer);
 procedure WritePE64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   const imports: TImportDllArray; const iatPatches: TIATPatchArray;
   const leaStrPatches: TLeaStrPatchArray; const leaVarPatches: TLeaVarPatchArray;
+  const dataRefPatches: TDataRefPatchArray;
   entryOffset: Integer);
 
 implementation
@@ -419,6 +429,7 @@ end;
 procedure WritePE64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   const imports: TImportDllArray; const iatPatches: TIATPatchArray;
   const leaStrPatches: TLeaStrPatchArray; const leaVarPatches: TLeaVarPatchArray;
+  const dataRefPatches: TDataRefPatchArray;
   entryOffset: Integer);
 var
   fileBuf, rdataBuf: TByteBuffer;
@@ -762,6 +773,23 @@ begin
         instrEndRVA := textRVA + DWord(patchOffset) + 7;
         disp32 := Int32(entryRVA) - Int32(instrEndRVA);
         fileBuf.PatchU32LE(headerSize + patchOffset + 3, Cardinal(disp32));
+      end;
+    end;
+    
+    // Apply data-internal reference patches (VMT RTTI pointers, etc.)
+    if Length(dataRefPatches) > 0 then
+    begin
+      for i := 0 to High(dataRefPatches) do
+      begin
+        // Calculate file offset of the patch location in .data section
+        patchOffset := headerSize + textFileSize + rdataFileSize + dataRefPatches[i].DataOffset;
+        // Calculate target RVA
+        if dataRefPatches[i].IsCodeRef then
+          entryRVA := textRVA + DWord(dataRefPatches[i].TargetOffset)
+        else
+          entryRVA := dataRVA + DWord(dataRefPatches[i].TargetOffset);
+        // Patch the absolute address (full 64-bit RVA)
+        fileBuf.PatchU64LE(patchOffset, UInt64(entryRVA));
       end;
     end;
     
