@@ -659,21 +659,20 @@ begin
       begin
         node := unitAST.Decls[j];
 
-        // PHASE 1: Structs, Classes, and Constants
-        if phase = 1 then
-        begin
-          // Process struct declarations from imported units
-          if node is TAstStructDecl then
+          // PHASE 1: Structs, Classes, and Constants
+          if phase = 1 then
           begin
-            con := TAstConDecl(node);
-            // Only import public structs
-            if not TAstStructDecl(node).IsPublic then
-              Continue;
-            // Check if struct already exists
-            if FStructTypes.IndexOf(TAstStructDecl(node).Name) >= 0 then
-              Continue;
-            FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node));
-          end
+            // Process struct declarations from imported units
+            if node is TAstStructDecl then
+            begin
+              // Only import public structs
+              if not TAstStructDecl(node).IsPublic then
+                Continue;
+              // Check if struct already exists
+              if FStructTypes.IndexOf(TAstStructDecl(node).Name) >= 0 then
+                Continue;
+              FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node));
+            end
           // Process class declarations from imported units
           else if node is TAstClassDecl then
           begin
@@ -810,12 +809,16 @@ begin
               fn.LocalCount := fn.ParamCount;
               SetLength(FLocalTypes, fn.LocalCount);
               SetLength(FLocalConst, fn.LocalCount);
+              SetLength(FLocalIsStruct, fn.LocalCount);
+              SetLength(FLocalElemSize, fn.LocalCount);
 
               for k := 0 to fn.ParamCount - 1 do
               begin
                 FLocalMap.AddObject(TAstFuncDecl(node).Params[k].Name, IntToObj(k));
                 FLocalTypes[k] := TAstFuncDecl(node).Params[k].ParamType;
                 FLocalConst[k] := nil;
+                FLocalIsStruct[k] := False;
+                FLocalElemSize[k] := 0;
               end;
 
               // Lower statements
