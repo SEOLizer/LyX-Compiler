@@ -1570,6 +1570,57 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
+        else if (call.Name = 'ioctl') or
+                ((call.Namespace = 'IO') and (call.Name = 'ioctl')) then
+        begin
+          // ioctl(fd: int64, request: int64, argp: int64) -> int64
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'ioctl';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if (call.Name = 'mmap') or
+                ((call.Namespace = 'IO') and (call.Name = 'mmap')) then
+        begin
+          // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'mmap';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if (call.Name = 'munmap') or
+                ((call.Namespace = 'IO') and (call.Name = 'munmap')) then
+        begin
+          // munmap(addr: int64, length: int64) -> int64
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'munmap';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
         else if (call.Name = 'Random') or
                 ((call.Namespace = 'Math') and (call.Name = 'Random')) then
         begin
@@ -1600,6 +1651,41 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.Src1 := -1;
           Emit(instr);
           Result := -1;
+        end
+        else if call.Name = 'buf_put_byte' then
+        begin
+          // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'buf_put_byte';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          // 3. Argument via LabelName übergeben
+          if argCount >= 3 then
+            instr.LabelName := IntToStr(argTemps[2]);
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'buf_get_byte' then
+        begin
+          // buf_get_byte(buf: int64, idx: int64) -> int64
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'buf_get_byte';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
         end
         else if ((call.Name = 'RegexMatch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
