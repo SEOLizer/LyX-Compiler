@@ -1199,6 +1199,18 @@ begin
   s.ParamTypes[1] := atPChar;
   s.ParamTypes[2] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
+  
+  // read_raw(fd: int64, buf: int64, len: int64) -> int64 (bytes read or -1)
+  // Same as read but accepts int64 for buffer address (for mmap'd buffers)
+  s := TSymbol.Create('read_raw');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
 
   // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
   s := TSymbol.Create('write');
