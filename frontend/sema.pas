@@ -3429,6 +3429,7 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  con: TAstConDecl;
   sym: TSymbol;
 begin
   upath := imp.UnitPath;
@@ -3462,7 +3463,7 @@ begin
     begin
       decl := loadedUnit.AST.Decls[i];
       
-      // Nur Funktionen für jetzt (später auch Variablen/Types)
+      // Nur öffentliche Symbole importieren (Funktionen, Konstanten)
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
@@ -3487,6 +3488,26 @@ begin
         for j := 0 to sym.ParamCount - 1 do
           sym.ParamTypes[j] := fn.Params[j].ParamType;
         AddSymbolToCurrent(sym, fn.Span);
+      end
+      else if decl is TAstConDecl then
+      begin
+        con := TAstConDecl(decl);
+        // Nur öffentliche Konstanten importieren
+        if not con.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(con.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + con.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(con.Name);
+        sym.Kind := symCon;
+        sym.DeclType := con.DeclType;
+        sym.IsImported := True;
+        AddSymbolToCurrent(sym, con.Span);
       end;
     end;
   end;

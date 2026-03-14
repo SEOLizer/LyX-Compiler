@@ -345,7 +345,7 @@ begin
   Expect(tkAssign); // ':='
   initExpr := ParseExpr; // ConstExpr restriction checked in sema
   Expect(tkSemicolon);
-  Result := TAstConDecl.Create(name, declType, initExpr, FCurTok.Span);
+  Result := TAstConDecl.Create(name, declType, initExpr, FCurTok.Span, isPub, skCo);
 end;
 
 function TParser.ParseTypeDecl(isPub: Boolean): TAstNode;
