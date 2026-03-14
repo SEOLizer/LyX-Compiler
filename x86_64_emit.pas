@@ -615,7 +615,7 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   argTemp4: Integer;
   argTemp5: Integer;
   argTemp6: Integer;
-  arg3: Integer;
+  arg3, arg4, arg5, arg6: Integer;
   // external symbol search
   found: Boolean;
   ei: Integer;
@@ -1405,6 +1405,25 @@ begin
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
             end
+            else if instr.ImmStr = 'buf_get_byte' then
+            begin
+              // buf_get_byte(buf: int64, idx: int64) -> int64
+              // Liest ein Byte aus buf[idx] und gibt es zero-extended zurück
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              // address = buf + idx
+              WriteAddRegReg(FCode, RSI, RDX);
+              // movzx eax, byte [rsi]
+              EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $06);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
             else if instr.ImmStr = 'itoa_to_buf' then
             begin
               // itoa_to_buf(val, buf, idx, buflen, minWidth, padZero) -> int64
@@ -2062,6 +2081,90 @@ begin
               else
                 WriteMovRegImm64(FCode, RSI, 0);
               WriteMovRegImm64(FCode, RAX, 90); // sys_chmod
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'ioctl' then
+            begin
+              // ioctl(fd: int64, request: int64, argp: int64) -> int64
+              // syscall: ioctl(fd, request, argp) = sys_ioctl (16)
+              // RDI = fd, RSI = request, RDX = argp
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load 3rd arg from ArgTemps[2]
+              arg3 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              WriteMovRegImm64(FCode, RAX, 16); // sys_ioctl
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'mmap' then
+            begin
+              // mmap(addr, length, prot, flags, fd, offset) -> int64
+              // syscall: mmap = sys_mmap (9)
+              // RDI = addr, RSI = length, RDX = prot, R10 = flags, R8 = fd, R9 = offset
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              // Load remaining args from ArgTemps
+              arg3 := -1; arg4 := -1; arg5 := -1; arg6 := -1;
+              if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then arg3 := instr.ArgTemps[2];
+              if (instr.ImmInt >= 4) and (Length(instr.ArgTemps) >= 4) then arg4 := instr.ArgTemps[3];
+              if (instr.ImmInt >= 5) and (Length(instr.ArgTemps) >= 5) then arg5 := instr.ArgTemps[4];
+              if (instr.ImmInt >= 6) and (Length(instr.ArgTemps) >= 6) then arg6 := instr.ArgTemps[5];
+              if arg3 >= 0 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + arg3))
+              else
+                WriteMovRegImm64(FCode, RDX, 0);
+              if arg4 >= 0 then
+                WriteMovRegMem(FCode, R10, RBP, SlotOffset(localCnt + arg4))
+              else
+                WriteMovRegImm64(FCode, R10, 0);
+              if arg5 >= 0 then
+                WriteMovRegMem(FCode, R8, RBP, SlotOffset(localCnt + arg5))
+              else
+                WriteMovRegImm64(FCode, R8, 0);
+              if arg6 >= 0 then
+                WriteMovRegMem(FCode, R9, RBP, SlotOffset(localCnt + arg6))
+              else
+                WriteMovRegImm64(FCode, R9, 0);
+              WriteMovRegImm64(FCode, RAX, 9); // sys_mmap
+              WriteSyscall(FCode);
+              if instr.Dest >= 0 then
+                WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end
+            else if instr.ImmStr = 'munmap' then
+            begin
+              // munmap(addr: int64, length: int64) -> int64
+              // syscall: munmap = sys_munmap (11)
+              // RDI = addr, RSI = length
+              if instr.Src1 >= 0 then
+                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovRegImm64(FCode, RDI, 0);
+              if instr.Src2 >= 0 then
+                WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovRegImm64(FCode, RSI, 0);
+              WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
               WriteSyscall(FCode);
               if instr.Dest >= 0 then
                 WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);

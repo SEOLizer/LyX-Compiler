@@ -1282,15 +1282,27 @@ begin
   AddSymbolToCurrent(s, NullSpan);
 
   // Buffer/runtime primitives for time formatter
-  // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
+  // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
+  // buf kann entweder pchar oder int64 (Pointer) sein
   s := TSymbol.Create('buf_put_byte');
   s.Kind := symFunc;
   s.DeclType := atInt64;
   s.ParamCount := 3;
   SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atInt64;  // Pointer als int64 oder pchar
   s.ParamTypes[1] := atInt64;
   s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // buf_get_byte(buf: int64, idx: int64) -> int64
+  // Liest ein Byte aus einem Speicherbereich (Pointer als int64)
+  s := TSymbol.Create('buf_get_byte');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atInt64;  // Pointer als int64
+  s.ParamTypes[1] := atInt64;  // Index
   AddSymbolToCurrent(s, NullSpan);
 
   // itoa_to_buf(val: int64, buf: pchar, idx: int64, buflen: int64, minWidth: int64, padZero: int64) -> int64
@@ -3561,8 +3573,18 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  existingSymbol: TSymbol;
 begin
   Result := nil;
+  
+  // First check if symbol already exists in current scope to avoid
+  // creating duplicate symbols and Use-After-Free bugs
+  existingSymbol := ResolveSymbol(name);
+  if existingSymbol <> nil then
+  begin
+    Result := existingSymbol;
+    Exit;
+  end;
   
   // === Builtin Namespaces ===
   // Handle builtin namespaces like IO, OS, etc.
@@ -3732,6 +3754,47 @@ begin
       SetLength(Result.ParamTypes, 2);
       Result.ParamTypes[0] := atPChar;
       Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'ioctl' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;  // fd
+      Result.ParamTypes[1] := atInt64;  // request
+      Result.ParamTypes[2] := atInt64;  // argp (pointer as int64)
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'mmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;  // returns pointer as int64
+      Result.ParamCount := 6;
+      SetLength(Result.ParamTypes, 6);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
+      Result.ParamTypes[2] := atInt64;  // prot
+      Result.ParamTypes[3] := atInt64;  // flags
+      Result.ParamTypes[4] := atInt64;  // fd
+      Result.ParamTypes[5] := atInt64;  // offset
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'munmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
       AddSymbolToCurrent(Result, span);
       Exit;
     end
