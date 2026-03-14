@@ -286,9 +286,8 @@ var
 begin
   instr := Default(TIRInstr);
   // First pass: collect all struct, class, and global variable declarations
-  FStructTypes.Clear;
-  FClassTypes.Clear;
-  FGlobalVars.Clear;
+  // Note: FStructTypes, FClassTypes, FGlobalVars are NOT cleared here
+  // because LowerImportedUnits may have already populated them with imported symbols
   for i := 0 to High(prog.Decls) do
   begin
     node := prog.Decls[i];
@@ -622,7 +621,7 @@ begin
 end;
 
 procedure TIRLowering.LowerImportedUnits(um: TUnitManager);
-{ Lower all functions and constants from imported units }
+{ Lower all functions, constants and global variables from imported units }
 var
   i, j, k: Integer;
   loadedUnit: TLoadedUnit;
@@ -631,6 +630,9 @@ var
   unitAST: TAstProgram;
   cv: TConstValue;
   con: TAstConDecl;
+  vd: TAstVarDecl;
+  items: TAstExprList;
+  vals: array of Int64;
 begin
   if not Assigned(um) then Exit;
 
@@ -686,6 +688,50 @@ begin
           Continue;
         end;
         FConstMap.AddObject(con.Name, System.TObject(cv));
+      end
+      // Process global variable declarations (pub var / pub let)
+      else if node is TAstVarDecl then
+      begin
+        vd := TAstVarDecl(node);
+        // Only import public global variables
+        if not vd.IsPublic then
+          Continue;
+        
+        // Check if variable already exists (avoid duplicates)
+        if FGlobalVars.IndexOf(vd.Name) >= 0 then
+          Continue;
+        
+        // Register global variable
+        FGlobalVars.AddObject(vd.Name, System.TObject(node));
+        
+        // Register in module with init value
+        if vd.InitExpr is TAstIntLit then
+          FModule.AddGlobalVar(vd.Name, TAstIntLit(vd.InitExpr).Value, True)
+        else if vd.InitExpr is TAstArrayLit then
+        begin
+          // Collect integer items if possible
+          items := TAstArrayLit(vd.InitExpr).Items;
+          SetLength(vals, 0);
+          for k := 0 to High(items) do
+          begin
+            if items[k] is TAstIntLit then
+            begin
+              SetLength(vals, Length(vals) + 1);
+              vals[High(vals)] := TAstIntLit(items[k]).Value;
+            end
+            else
+            begin
+              SetLength(vals, 0);
+              Break;
+            end;
+          end;
+          if Length(vals) > 0 then
+            FModule.AddGlobalArray(vd.Name, vals)
+          else
+            FModule.AddGlobalVar(vd.Name, 0, False);
+        end
+        else
+          FModule.AddGlobalVar(vd.Name, 0, False);
       end
       // Process function declarations
       else if node is TAstFuncDecl then
