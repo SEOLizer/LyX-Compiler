@@ -516,9 +516,10 @@ begin
         module := TIRModule.Create;
         lower := TIRLowering.Create(module, d);
         try
-          lower.Lower(prog);
-          // Lower imported unit functions into the IR module
+          // First, register constants from imported units so they're available during lowering
           lower.LowerImportedUnits(um);
+          // Then lower the main program
+          lower.Lower(prog);
 
           // IR-Level Inlining Optimization
           WriteLn('[IR] Running inlining optimization...');

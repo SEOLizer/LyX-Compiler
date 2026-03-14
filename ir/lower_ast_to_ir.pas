@@ -622,13 +622,15 @@ begin
 end;
 
 procedure TIRLowering.LowerImportedUnits(um: TUnitManager);
-{ Lower all functions from imported units }
+{ Lower all functions and constants from imported units }
 var
   i, j, k: Integer;
   loadedUnit: TLoadedUnit;
   node: TAstNode;
   fn: TIRFunction;
   unitAST: TAstProgram;
+  cv: TConstValue;
+  con: TAstConDecl;
 begin
   if not Assigned(um) then Exit;
 
@@ -640,11 +642,53 @@ begin
 
     unitAST := loadedUnit.AST;
 
-    // Lower all function declarations from this unit
+    // Lower all declarations from this unit
     for j := 0 to High(unitAST.Decls) do
     begin
       node := unitAST.Decls[j];
-      if node is TAstFuncDecl then
+      
+      // Process constant declarations
+      if node is TAstConDecl then
+      begin
+        con := TAstConDecl(node);
+        // Only import public constants
+        if not con.IsPublic then
+          Continue;
+        
+        // Check if constant already exists (avoid duplicates)
+        if FConstMap.IndexOf(con.Name) >= 0 then
+          Continue;
+        
+        // Register compile-time constant for inline substitution
+        cv := TConstValue.Create;
+        if con.InitExpr is TAstIntLit then
+        begin
+          cv.IsStr := False;
+          cv.IntVal := TAstIntLit(con.InitExpr).Value;
+        end
+        else if con.InitExpr is TAstStrLit then
+        begin
+          cv.IsStr := True;
+          cv.StrVal := TAstStrLit(con.InitExpr).Value;
+        end
+        else if con.InitExpr is TAstBoolLit then
+        begin
+          cv.IsStr := False;
+          if TAstBoolLit(con.InitExpr).Value then
+            cv.IntVal := 1
+          else
+            cv.IntVal := 0;
+        end
+        else
+        begin
+          FDiag.Error('imported con initializer must be a literal', con.Span);
+          cv.Free;
+          Continue;
+        end;
+        FConstMap.AddObject(con.Name, System.TObject(cv));
+      end
+      // Process function declarations
+      else if node is TAstFuncDecl then
       begin
         // Only lower public functions from imported units
         if not TAstFuncDecl(node).IsPublic then
