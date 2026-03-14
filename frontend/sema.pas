@@ -3430,6 +3430,7 @@ var
   decl: TAstNode;
   fn: TAstFuncDecl;
   con: TAstConDecl;
+  vd: TAstVarDecl;
   sym: TSymbol;
 begin
   upath := imp.UnitPath;
@@ -3463,11 +3464,10 @@ begin
     begin
       decl := loadedUnit.AST.Decls[i];
       
-      // Nur öffentliche Symbole importieren (Funktionen, Konstanten)
+      // Öffentliche Funktionen importieren
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
-        // Nur öffentliche Funktionen importieren
         if not fn.IsPublic then
           Continue;
 
@@ -3489,10 +3489,10 @@ begin
           sym.ParamTypes[j] := fn.Params[j].ParamType;
         AddSymbolToCurrent(sym, fn.Span);
       end
+      // Öffentliche Konstanten importieren
       else if decl is TAstConDecl then
       begin
         con := TAstConDecl(decl);
-        // Nur öffentliche Konstanten importieren
         if not con.IsPublic then
           Continue;
 
@@ -3508,6 +3508,34 @@ begin
         sym.DeclType := con.DeclType;
         sym.IsImported := True;
         AddSymbolToCurrent(sym, con.Span);
+      end
+      // Öffentliche globale Variablen importieren (pub var / pub let)
+      else if decl is TAstVarDecl then
+      begin
+        vd := TAstVarDecl(decl);
+        if not vd.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(vd.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + vd.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(vd.Name);
+        case vd.Storage of
+          skVar: sym.Kind := symVar;
+          skLet: sym.Kind := symLet;
+        else
+          sym.Kind := symVar;
+        end;
+        sym.DeclType := vd.DeclType;
+        sym.TypeName := vd.DeclTypeName;
+        sym.ArrayLen := vd.ArrayLen;
+        sym.IsImported := True;
+        sym.IsGlobal := True;
+        AddSymbolToCurrent(sym, vd.Span);
       end;
     end;
   end;
