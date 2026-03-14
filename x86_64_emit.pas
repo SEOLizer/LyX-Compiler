@@ -621,6 +621,9 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   ei: Integer;
   // global variable index
   varIdx: Integer;
+  // string pointer patching
+  strIdx: Integer;
+  stringAddr: UInt64;
   // diagnostic dump
   dumpStart, dumpEnd, dumpLen, di: Integer;
   dumpBuf: array of Byte;
@@ -631,6 +634,11 @@ procedure TX86_64Emitter.EmitFromIR(module: TIRModule);
   pltNStart: Integer;
   jmpPlt0OffsetPos: Integer;
   pltRel32: Int64;
+  // String pointer patches
+  stringPtrPatches: array of record
+    DataPos: UInt64;  // position in FData to patch
+    StringIdx: Integer;  // string index in module.Strings
+  end;
 begin
   // reset patch arrays
   SetLength(FLeaPositions, 0);
@@ -678,6 +686,8 @@ begin
   globalVarNames.Sorted := False;
   SetLength(globalVarOffsets, 0);
   SetLength(globalVarLeaPositions, 0);
+  // Track string pointer globals for later patching
+  SetLength(stringPtrPatches, 0);
   
   // Pre-allocate all global variables from IR module
   for i := 0 to High(module.GlobalVars) do
@@ -713,6 +723,16 @@ begin
         end;
       end;
     end
+    else if module.GlobalVars[i].IsStringPtr then
+    begin
+      // String pointer: write 0 as placeholder, will be patched later
+      FData.WriteU64LE(0);
+      Inc(totalDataOffset, 8);
+      // Record the patch info: position in data + string index
+      SetLength(stringPtrPatches, Length(stringPtrPatches) + 1);
+      stringPtrPatches[High(stringPtrPatches)].DataPos := globalVarOffsets[i];
+      stringPtrPatches[High(stringPtrPatches)].StringIdx := module.GlobalVars[i].StringIdx;
+    end
     else
     begin
       // scalar global
@@ -721,6 +741,22 @@ begin
       else
         FData.WriteU64LE(0);
       Inc(totalDataOffset, 8);
+    end;
+  end;
+
+  // Patch string pointer globals with actual string addresses
+  // At this point, all strings have been written to FData, so we know their offsets
+  for i := 0 to High(stringPtrPatches) do
+  begin
+    strIdx := stringPtrPatches[i].StringIdx;
+    if (strIdx >= 0) and (strIdx < Length(FStringOffsets)) then
+    begin
+      // Calculate the address of the string in .rodata
+      // Strings start at offset 4096 (after the code segment)
+      stringAddr := UInt64(4096) + FStringOffsets[strIdx];
+      // Patch the global variable with the string address
+      // DataPos is the offset within the data section
+      FData.PatchU64LE(stringPtrPatches[i].DataPos, stringAddr);
     end;
   end;
 
