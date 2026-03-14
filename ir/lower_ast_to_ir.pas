@@ -2125,6 +2125,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Dest := t0;
           instr.Src1 := t1;  // array base
           instr.Src2 := t2;  // index
+          // Check if this is pchar indexing (byte access)
+          if (TAstIndexAccess(expr).Obj.ResolvedType = atPChar) or
+             (TAstIndexAccess(expr).Obj.ResolvedType = atPCharNullable) then
+            instr.ImmInt := 1  // element size = 1 byte for pchar
+          else
+            instr.ImmInt := 8;  // element size = 8 bytes for int64 arrays
           Emit(instr);
           Result := t0;
         end;

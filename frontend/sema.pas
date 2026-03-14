@@ -1727,6 +1727,16 @@ begin
         // Array access
         if not IsIntegerType(lt) then
           FDiag.Error('array index must be integer', TAstIndexAccess(expr).Index.Span);
+        
+        // Check for pchar indexing (string character access)
+        if (ot = atPChar) or (ot = atPCharNullable) then
+        begin
+          // pchar[index] returns int64 (character code)
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
         // if indexing an identifier with array metadata, return element type
         if TAstIndexAccess(expr).Obj is TAstIdent then
         begin
@@ -1740,6 +1750,13 @@ begin
               Result := atInt64  // For static arrays, return int64 as element type
             else
               Result := s.DeclType;
+            expr.ResolvedType := Result;
+            Exit;
+          end;
+          // Check if the symbol is pchar type
+          if Assigned(s) and ((s.DeclType = atPChar) or (s.DeclType = atPCharNullable)) then
+          begin
+            Result := atInt64;
             expr.ResolvedType := Result;
             Exit;
           end;
