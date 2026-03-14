@@ -1114,6 +1114,161 @@ begin
                   slotIdx := fn.LocalCount + instr.Dest;
                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                 end;
+              end
+              else if instr.ImmStr = 'buf_put_byte' then
+              begin
+                // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
+                // Writes byte b to memory at address buf + idx
+                // Returns 0 on success
+                
+                // Get buf (base address)
+                if Length(instr.ArgTemps) >= 1 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0]
+                else if instr.Src1 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src1
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RDI, 0);
+                
+                // Get idx (offset)
+                if Length(instr.ArgTemps) >= 2 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1]
+                else if instr.Src2 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src2
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RSI, 0);
+                
+                // Get b (byte value)
+                arg3 := -1;
+                if Length(instr.ArgTemps) >= 3 then
+                  arg3 := instr.ArgTemps[2];
+                if arg3 >= 0 then
+                begin
+                  slotIdx := fn.LocalCount + arg3;
+                  WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                end
+                else
+                  WriteMovRegImm64(FCode, RAX, 0);
+                
+                // Calculate address: rdi = rdi + rsi
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $01);
+                EmitU8(FCode, $F7);  // add rdi, rsi
+                
+                // Write byte: mov [rdi], al
+                EmitU8(FCode, $88);
+                EmitU8(FCode, $07);  // mov [rdi], al
+                
+                // Return 0
+                WriteMovRegImm64(FCode, RAX, 0);
+                if instr.Dest >= 0 then
+                begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end
+              else if instr.ImmStr = 'buf_get_byte' then
+              begin
+                // buf_get_byte(buf: int64, idx: int64) -> int64
+                // Reads byte from memory at address buf + idx
+                
+                // Get buf (base address)
+                if Length(instr.ArgTemps) >= 1 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0]
+                else if instr.Src1 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src1
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RDI, 0);
+                
+                // Get idx (offset)
+                if Length(instr.ArgTemps) >= 2 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1]
+                else if instr.Src2 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src2
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RSI, 0);
+                
+                // Calculate address: rdi = rdi + rsi
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $01);
+                EmitU8(FCode, $F7);  // add rdi, rsi
+                
+                // Read byte: movzx rax, byte [rdi]
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $0F);
+                EmitU8(FCode, $B6);
+                EmitU8(FCode, $07);  // movzx rax, byte [rdi]
+                
+                if instr.Dest >= 0 then
+                begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end
+              else if instr.ImmStr = 'read' then
+              begin
+                // read(fd, buf, count) -> ssize_t
+                // sys_read = 0
+                
+                // Get fd
+                if Length(instr.ArgTemps) >= 1 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0]
+                else if instr.Src1 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src1
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RDI, 0);
+                
+                // Get buf
+                if Length(instr.ArgTemps) >= 2 then
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1]
+                else if instr.Src2 >= 0 then
+                  slotIdx := fn.LocalCount + instr.Src2
+                else
+                  slotIdx := -1;
+                if slotIdx >= 0 then
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx))
+                else
+                  WriteMovRegImm64(FCode, RSI, 0);
+                
+                // Get count
+                arg3 := -1;
+                if Length(instr.ArgTemps) >= 3 then
+                  arg3 := instr.ArgTemps[2];
+                if arg3 >= 0 then
+                begin
+                  slotIdx := fn.LocalCount + arg3;
+                  WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                end
+                else
+                  WriteMovRegImm64(FCode, RDX, 0);
+                
+                WriteMovRegImm64(FCode, RAX, 0); // sys_read
+                WriteSyscall(FCode);
+                
+                if instr.Dest >= 0 then
+                begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
               end;
             end;
          irCall:

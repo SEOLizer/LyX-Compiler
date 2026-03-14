@@ -1420,14 +1420,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (call.Name = 'read') or
-                ((call.Namespace = 'IO') and (call.Name = 'read')) then
+        else if (call.Name = 'read') or (call.Name = 'read_raw') or
+                ((call.Namespace = 'IO') and ((call.Name = 'read') or (call.Name = 'read_raw'))) then
         begin
-          // read(fd: int64, buf: pchar, count: int64) -> int64 (bytes read or -1)
+          // read/read_raw(fd: int64, buf: pchar/int64, count: int64) -> int64 (bytes read or -1)
           t0 := NewTemp;
           instr.Op := irCallBuiltin;
           instr.Dest := t0;
-          instr.ImmStr := 'read';
+          instr.ImmStr := 'read';  // Both use the same syscall
           instr.ImmInt := argCount;
           SetLength(instr.ArgTemps, argCount);
           for i := 0 to argCount - 1 do
