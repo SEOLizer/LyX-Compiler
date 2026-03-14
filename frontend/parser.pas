@@ -913,7 +913,9 @@ var
   initExpr: TAstExpr;
   arrayLen: Integer;
   isNullable: Boolean;
+  span: TSourceSpan;
 begin
+  span := FCurTok.Span;
   if Accept(tkVar) then storage := skVar
   else if Accept(tkLet) then storage := skLet
   else if Accept(tkCo) then storage := skCo
@@ -931,11 +933,17 @@ begin
   Expect(tkColon);
   declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
-  Expect(tkAssign);
-  initExpr := ParseExpr;
+  // Optional initializer for const
+  if Accept(tkAssign) then
+    initExpr := ParseExpr
+  else
+    initExpr := nil;
   Expect(tkSemicolon);
 
-  Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span);
+  if Assigned(initExpr) then
+    Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span)
+  else
+    Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
 end;
 
 function TParser.ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
@@ -978,8 +986,11 @@ begin
   Expect(tkColon);
   declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
-  Expect(tkAssign);
-  initExpr := ParseExpr;
+  // Optional initializer: var x: int64 := value or just var x: int64
+  if Accept(tkAssign) then
+    initExpr := ParseExpr
+  else
+    initExpr := nil;
   Expect(tkSemicolon);
 
   Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
@@ -2004,10 +2015,22 @@ begin
         Exit;
       end;
 
-      // Old syntax: 'array' keyword for dynamic array
-      s := 'array';
-      arrayLen := -1;
-      Result := atDynArray;
+      // Check if 'array' is followed by [N] for static array BEFORE treating as dynamic
+      // This handles: array[4]int64
+      if Check(tkLBracket) then
+      begin
+        // Static array: array[N]ElementType
+        // Don't advance yet - the code below will handle the bracket
+        s := 'array';
+        Result := atArray;  // Mark as static array type
+      end
+      else
+      begin
+        // Old syntax: 'array' keyword for dynamic array (without [N])
+        s := 'array';
+        arrayLen := -1;
+        Result := atDynArray;
+      end
     end
     else
     begin
@@ -2029,6 +2052,24 @@ begin
         Advance;
         Expect(tkRBracket);
         arrayLen := parsedLen;
+        // If base type was 'array', parse element type after [N]
+        // e.g., array[4]int64 means static array of 4 int64 elements
+        if (s = 'array') and Check(tkIdent) then
+        begin
+          // Parse element type
+          innerTypeName := FCurTok.Value;
+          Advance;
+          innerType := StrToAurumType(innerTypeName);
+          if innerType = atUnresolved then
+          begin
+            // Keep as typeName for struct types
+            typeName := innerTypeName;
+          end
+          else
+          begin
+            Result := atArray;  // This is a static array
+          end;
+        end;
       end
       else if Accept(tkRBracket) then
       begin

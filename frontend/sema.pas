@@ -1707,11 +1707,13 @@ begin
         if TAstIndexAccess(expr).Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAccess(expr).Obj).Name);
-          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray)) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
             // For dynamic arrays, return atInt64 (default element type)
             if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
               Result := atInt64
+            else if s.DeclType = atArray then
+              Result := atInt64  // For static arrays, return int64 as element type
             else
               Result := s.DeclType;
             expr.ResolvedType := Result;
@@ -2549,7 +2551,7 @@ var
   i: Integer;
   s: TSymbol;
   sym: TSymbol;
-  vtype, ctype, rtype: TAurumType;
+  vtype, ctype, rtype, otype: TAurumType;
   sw: TAstSwitch;
   caseVal: TAstExpr;
   cvtype: TAurumType;
@@ -2560,8 +2562,11 @@ begin
     nkVarDecl:
       begin
         vd := TAstVarDecl(stmt);
-        // check init expr type
-        vtype := CheckExpr(vd.InitExpr);
+        // check init expr type (if present)
+        if Assigned(vd.InitExpr) then
+          vtype := CheckExpr(vd.InitExpr)
+        else
+          vtype := vd.DeclType;  // Use declared type if no initializer
         // Allow integer literal 0 to be assigned to nullable pointer types
         if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
         begin
@@ -2665,11 +2670,18 @@ begin
         if TAstIndexAssign(stmt).Target.Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
-          if Assigned(s) and (s.ArrayLen <> 0) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
-            if not TypeEqual(vtype, s.DeclType) then
+            // Determine element type for the assignment
+            if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
+              otype := atInt64  // dynamic array: element type is int64
+            else if s.DeclType = atArray then
+              otype := atInt64  // static array: element type is int64 for now
+            else
+              otype := s.DeclType;
+            if not TypeEqual(vtype, otype) then
               FDiag.Error(Format('index assignment type mismatch: expected %s but got %s',
-                [AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype)]), stmt.Span);
+                [AurumTypeToStr(otype), AurumTypeToStr(vtype)]), stmt.Span);
           end;
         end;
       end;
@@ -4214,8 +4226,11 @@ begin
           FDiag.Error('redeclaration of global variable: ' + TAstVarDecl(node).Name, node.Span);
           Continue;
         end;
-        // typecheck init expr
-        itype := CheckExpr(TAstVarDecl(node).InitExpr);
+        // typecheck init expr (if present)
+        if Assigned(TAstVarDecl(node).InitExpr) then
+          itype := CheckExpr(TAstVarDecl(node).InitExpr)
+        else
+          itype := TAstVarDecl(node).DeclType;  // Use declared type if no initializer
         if (TAstVarDecl(node).DeclType <> atUnresolved) and not TypeEqual(itype, TAstVarDecl(node).DeclType) then
           FDiag.Error(Format('global %s: expected type %s but got %s', 
             [TAstVarDecl(node).Name, AurumTypeToStr(TAstVarDecl(node).DeclType), AurumTypeToStr(itype)]), node.Span);

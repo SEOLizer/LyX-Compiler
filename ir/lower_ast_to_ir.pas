@@ -283,6 +283,7 @@ var
   instr: TIRInstr;
   items: TAstExprList;
   vals: array of Int64;
+  strIdx: Integer;
 begin
   instr := Default(TIRInstr);
   // First pass: collect all struct, class, and global variable declarations
@@ -311,6 +312,12 @@ begin
         if TAstVarDecl(node).InitExpr is TAstIntLit then
         begin
           FModule.AddGlobalVar(TAstVarDecl(node).Name, TAstIntLit(TAstVarDecl(node).InitExpr).Value, True);
+        end
+        else if TAstVarDecl(node).InitExpr is TAstStrLit then
+        begin
+          // String literal initializer: use special function to mark as string pointer
+          strIdx := FModule.InternString(TAstStrLit(TAstVarDecl(node).InitExpr).Value);
+          FModule.AddGlobalStringPtr(TAstVarDecl(node).Name, strIdx);
         end
         else if TAstVarDecl(node).InitExpr is TAstArrayLit then
         begin
@@ -638,6 +645,7 @@ var
   items: TAstExprList;
   vals: array of Int64;
   phase: Integer;
+  instr: TIRInstr;
 begin
   if not Assigned(um) then Exit;
 
@@ -825,6 +833,17 @@ begin
               if Assigned(TAstFuncDecl(node).Body) then
                 for k := 0 to High(TAstFuncDecl(node).Body.Stmts) do
                   LowerStmt(TAstFuncDecl(node).Body.Stmts[k]);
+
+              // Emit implicit return for void functions if last statement wasn't a return
+              if (Length(FCurrentFunc.Instructions) = 0) or
+                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+              begin
+                // Initialize instr locally for this scope
+                instr := Default(TIRInstr);
+                instr.Op := irReturn;
+                instr.Src1 := -1;
+                Emit(instr);
+              end;
 
               FCurrentFunc := nil;
               FCurrentFuncDecl := nil;
@@ -2991,92 +3010,99 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
       begin
-        // Check if this is a class (reference type) or struct (value type)
-        i := FStructTypes.IndexOf(vd.DeclTypeName);
-        
-        // Classes are stored in FStructTypes but are reference types (pointers)
-        if FStructTypes.Objects[i] is TAstClassDecl then
+        // ... existing code ...
+      end
+      else if vd.DeclType = atArray then
+      begin
+        // Static array: allocate multiple slots on stack
+        arrLen := vd.ArrayLen;
+        if arrLen <= 0 then
         begin
-          // Class: allocate 1 slot for pointer, handle new expression
-          loc := AllocLocal(vd.Name, atUnresolved);
-          // Store the class type name for destructor lookup
-          FLocalTypeNames[loc] := vd.DeclTypeName;
-          
-          // Handle initializer
-          if vd.InitExpr is TAstNewExpr then
-          begin
-            // new ClassName() - already lowered to irAlloc in LowerExpr
-            tmp := LowerExpr(vd.InitExpr);
-            instr.Op := irStoreLocal;
-            instr.Dest := loc;
-            instr.Src1 := tmp;
-            Emit(instr);
-          end
+          // Try to infer from initializer
+          if vd.InitExpr is TAstArrayLit then
+            arrLen := Length(TAstArrayLit(vd.InitExpr).Items)
           else
-          begin
-            // Other initializer (shouldn't happen for classes, but handle gracefully)
-            tmp := LowerExpr(vd.InitExpr);
-            instr.Op := irStoreLocal;
-            instr.Dest := loc;
-            instr.Src1 := tmp;
-            Emit(instr);
-          end;
-        end
-        else
+            FDiag.Error('static array requires explicit length or initializer', vd.Span);
+        end;
+        if arrLen > 0 then
         begin
-          // Struct: allocate slots for the whole struct
-          // Size is in bytes, each slot is 8 bytes
-          if TAstStructDecl(FStructTypes.Objects[i]).Size > 0 then
+          loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
+          // Record array length for this local
+          SetLength(FLocalArrayLen, loc + arrLen);
+          for i := 0 to arrLen - 1 do
+            FLocalArrayLen[loc + i] := arrLen;
+          // Initialize with initializer if present
+          if vd.InitExpr is TAstArrayLit then
           begin
-            loc := AllocLocalMany(vd.Name, atUnresolved, 
-              (TAstStructDecl(FStructTypes.Objects[i]).Size + 7) div 8, True);
+            items := TAstArrayLit(vd.InitExpr).Items;
+            if Length(items) <> arrLen then
+              FDiag.Error('array literal length mismatch', vd.Span)
+            else
+            begin
+              for i := 0 to High(items) do
+              begin
+                tmp := LowerExpr(items[i]);
+                instr.Op := irStoreLocal; instr.Dest := loc + i; instr.Src1 := tmp; Emit(instr);
+              end;
+            end;
           end
-          else
+          else if Assigned(vd.InitExpr) then
           begin
-            // fallback: 1 slot
-            loc := AllocLocal(vd.Name, atUnresolved);
-            FLocalIsStruct[loc] := True;
-          end;
-          // Initialize based on InitExpr type
-          if (vd.InitExpr is TAstIntLit) and (TAstIntLit(vd.InitExpr).Value = 0) then
-          begin
-            // Zero initialization
-            t0 := NewTemp;
-            instr.Op := irConstInt; instr.Dest := t0; instr.ImmInt := 0; Emit(instr);
-            instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := t0; Emit(instr);
-          end
-          else if vd.InitExpr is TAstStructLit then
-          begin
-            // Struct literal: initialize fields directly into the variable's stack slots
-            LowerStructLitIntoLocal(TAstStructLit(vd.InitExpr), loc, TAstStructDecl(FStructTypes.Objects[i]));
-          end
-          else if vd.InitExpr is TAstCall then
-          begin
-            // Call returning struct: use irCallStruct to handle RAX+RDX properly
-            call := TAstCall(vd.InitExpr);
-            argCount := Length(call.Args);
-            SetLength(argTemps, argCount);
-            for k := 0 to argCount - 1 do
-              argTemps[k] := LowerExpr(call.Args[k]);
-            
-            // Emit irCallStruct with struct size info
-            instr.Op := irCallStruct;
-            instr.Dest := loc;  // destination is the struct variable slot
-            instr.ImmStr := call.Name;
-            instr.ImmInt := argCount;
-            instr.StructSize := TAstStructDecl(FStructTypes.Objects[i]).Size;
-            instr.CallMode := cmInternal;
-            SetLength(instr.ArgTemps, argCount);
-            for k := 0 to argCount - 1 do
-              instr.ArgTemps[k] := argTemps[k];
-            Emit(instr);
+            // Single expression: broadcast to all elements
+            tmp := LowerExpr(vd.InitExpr);
+            for i := 0 to arrLen - 1 do
+            begin
+              instr.Op := irStoreLocal; instr.Dest := loc + i; instr.Src1 := tmp; Emit(instr);
+            end;
           end;
         end;
         Exit(True);
       end
-     else
-     begin
-       // scalar local
+      else if vd.DeclType = atArray then
+      begin
+        // Static array: allocate multiple slots on stack
+        arrLen := vd.ArrayLen;
+        if arrLen <= 0 then
+        begin
+          if vd.InitExpr is TAstArrayLit then
+            arrLen := Length(TAstArrayLit(vd.InitExpr).Items)
+          else
+            FDiag.Error('static array requires explicit length or initializer', vd.Span);
+        end;
+        if arrLen > 0 then
+        begin
+          loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
+          SetLength(FLocalArrayLen, loc + arrLen);
+          for i := 0 to arrLen - 1 do
+            FLocalArrayLen[loc + i] := arrLen;
+          if vd.InitExpr is TAstArrayLit then
+          begin
+            items := TAstArrayLit(vd.InitExpr).Items;
+            if Length(items) <> arrLen then
+              FDiag.Error('array literal length mismatch', vd.Span)
+            else
+            begin
+              for i := 0 to High(items) do
+              begin
+                tmp := LowerExpr(items[i]);
+                instr.Op := irStoreLocal; instr.Dest := loc + i; instr.Src1 := tmp; Emit(instr);
+              end;
+            end;
+          end
+          else if Assigned(vd.InitExpr) then
+          begin
+            tmp := LowerExpr(vd.InitExpr);
+            for i := 0 to arrLen - 1 do
+            begin
+              instr.Op := irStoreLocal; instr.Dest := loc + i; instr.Src1 := tmp; Emit(instr);
+            end;
+          end;
+        end;
+        Exit(True);
+      end
+      else
+      begin
+        // scalar local
        loc := AllocLocal(vd.Name, vd.DeclType);
        // If initializer is constant integer and the local has narrower signed width, constant fold
        if (vd.InitExpr is TAstIntLit) then
