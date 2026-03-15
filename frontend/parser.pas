@@ -2164,7 +2164,7 @@ begin
     typ := ParseTypeEx(arrLen, typName);
     if arrLen <> 0 then
       FDiag.Error('array parameter types not yet supported', FCurTok.Span);
-    p.Name := name; p.ParamType := typ; p.Span := FCurTok.Span;
+    p.Name := name; p.ParamType := typ; p.TypeName := typName; p.Span := FCurTok.Span;
     SetLength(params, Length(params) + 1);
     params[High(params)] := p;
     if Accept(tkComma) then Continue else Break;
