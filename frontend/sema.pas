@@ -1199,6 +1199,18 @@ begin
   s.ParamTypes[1] := atPChar;
   s.ParamTypes[2] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
+  
+  // read_raw(fd: int64, buf: int64, len: int64) -> int64 (bytes read or -1)
+  // Same as read but accepts int64 for buffer address (for mmap'd buffers)
+  s := TSymbol.Create('read_raw');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
 
   // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
   s := TSymbol.Create('write');
@@ -1282,15 +1294,27 @@ begin
   AddSymbolToCurrent(s, NullSpan);
 
   // Buffer/runtime primitives for time formatter
-  // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
+  // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
+  // buf kann entweder pchar oder int64 (Pointer) sein
   s := TSymbol.Create('buf_put_byte');
   s.Kind := symFunc;
   s.DeclType := atInt64;
   s.ParamCount := 3;
   SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atInt64;  // Pointer als int64 oder pchar
   s.ParamTypes[1] := atInt64;
   s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // buf_get_byte(buf: int64, idx: int64) -> int64
+  // Liest ein Byte aus einem Speicherbereich (Pointer als int64)
+  s := TSymbol.Create('buf_get_byte');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atInt64;  // Pointer als int64
+  s.ParamTypes[1] := atInt64;  // Index
   AddSymbolToCurrent(s, NullSpan);
 
   // itoa_to_buf(val: int64, buf: pchar, idx: int64, buflen: int64, minWidth: int64, padZero: int64) -> int64
@@ -1703,17 +1727,36 @@ begin
         // Array access
         if not IsIntegerType(lt) then
           FDiag.Error('array index must be integer', TAstIndexAccess(expr).Index.Span);
+        
+        // Check for pchar indexing (string character access)
+        if (ot = atPChar) or (ot = atPCharNullable) then
+        begin
+          // pchar[index] returns int64 (character code)
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
         // if indexing an identifier with array metadata, return element type
         if TAstIndexAccess(expr).Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAccess(expr).Obj).Name);
-          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray)) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
             // For dynamic arrays, return atInt64 (default element type)
             if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
               Result := atInt64
+            else if s.DeclType = atArray then
+              Result := atInt64  // For static arrays, return int64 as element type
             else
               Result := s.DeclType;
+            expr.ResolvedType := Result;
+            Exit;
+          end;
+          // Check if the symbol is pchar type
+          if Assigned(s) and ((s.DeclType = atPChar) or (s.DeclType = atPCharNullable)) then
+          begin
+            Result := atInt64;
             expr.ResolvedType := Result;
             Exit;
           end;
@@ -2549,7 +2592,7 @@ var
   i: Integer;
   s: TSymbol;
   sym: TSymbol;
-  vtype, ctype, rtype: TAurumType;
+  vtype, ctype, rtype, otype: TAurumType;
   sw: TAstSwitch;
   caseVal: TAstExpr;
   cvtype: TAurumType;
@@ -2560,8 +2603,11 @@ begin
     nkVarDecl:
       begin
         vd := TAstVarDecl(stmt);
-        // check init expr type
-        vtype := CheckExpr(vd.InitExpr);
+        // check init expr type (if present)
+        if Assigned(vd.InitExpr) then
+          vtype := CheckExpr(vd.InitExpr)
+        else
+          vtype := vd.DeclType;  // Use declared type if no initializer
         // Allow integer literal 0 to be assigned to nullable pointer types
         if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
         begin
@@ -2665,11 +2711,18 @@ begin
         if TAstIndexAssign(stmt).Target.Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
-          if Assigned(s) and (s.ArrayLen <> 0) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
-            if not TypeEqual(vtype, s.DeclType) then
+            // Determine element type for the assignment
+            if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
+              otype := atInt64  // dynamic array: element type is int64
+            else if s.DeclType = atArray then
+              otype := atInt64  // static array: element type is int64 for now
+            else
+              otype := s.DeclType;
+            if not TypeEqual(vtype, otype) then
               FDiag.Error(Format('index assignment type mismatch: expected %s but got %s',
-                [AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype)]), stmt.Span);
+                [AurumTypeToStr(otype), AurumTypeToStr(vtype)]), stmt.Span);
           end;
         end;
       end;
@@ -3429,6 +3482,8 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  con: TAstConDecl;
+  vd: TAstVarDecl;
   sym: TSymbol;
 begin
   upath := imp.UnitPath;
@@ -3462,11 +3517,10 @@ begin
     begin
       decl := loadedUnit.AST.Decls[i];
       
-      // Nur Funktionen für jetzt (später auch Variablen/Types)
+      // Öffentliche Funktionen importieren
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
-        // Nur öffentliche Funktionen importieren
         if not fn.IsPublic then
           Continue;
 
@@ -3487,6 +3541,54 @@ begin
         for j := 0 to sym.ParamCount - 1 do
           sym.ParamTypes[j] := fn.Params[j].ParamType;
         AddSymbolToCurrent(sym, fn.Span);
+      end
+      // Öffentliche Konstanten importieren
+      else if decl is TAstConDecl then
+      begin
+        con := TAstConDecl(decl);
+        if not con.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(con.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + con.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(con.Name);
+        sym.Kind := symCon;
+        sym.DeclType := con.DeclType;
+        sym.IsImported := True;
+        AddSymbolToCurrent(sym, con.Span);
+      end
+      // Öffentliche globale Variablen importieren (pub var / pub let)
+      else if decl is TAstVarDecl then
+      begin
+        vd := TAstVarDecl(decl);
+        if not vd.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(vd.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + vd.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(vd.Name);
+        case vd.Storage of
+          skVar: sym.Kind := symVar;
+          skLet: sym.Kind := symLet;
+        else
+          sym.Kind := symVar;
+        end;
+        sym.DeclType := vd.DeclType;
+        sym.TypeName := vd.DeclTypeName;
+        sym.ArrayLen := vd.ArrayLen;
+        sym.IsImported := True;
+        sym.IsGlobal := True;
+        AddSymbolToCurrent(sym, vd.Span);
       end;
     end;
   end;
@@ -3500,8 +3602,18 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  existingSymbol: TSymbol;
 begin
   Result := nil;
+  
+  // First check if symbol already exists in current scope to avoid
+  // creating duplicate symbols and Use-After-Free bugs
+  existingSymbol := ResolveSymbol(name);
+  if existingSymbol <> nil then
+  begin
+    Result := existingSymbol;
+    Exit;
+  end;
   
   // === Builtin Namespaces ===
   // Handle builtin namespaces like IO, OS, etc.
@@ -3671,6 +3783,47 @@ begin
       SetLength(Result.ParamTypes, 2);
       Result.ParamTypes[0] := atPChar;
       Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'ioctl' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;  // fd
+      Result.ParamTypes[1] := atInt64;  // request
+      Result.ParamTypes[2] := atInt64;  // argp (pointer as int64)
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'mmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;  // returns pointer as int64
+      Result.ParamCount := 6;
+      SetLength(Result.ParamTypes, 6);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
+      Result.ParamTypes[2] := atInt64;  // prot
+      Result.ParamTypes[3] := atInt64;  // flags
+      Result.ParamTypes[4] := atInt64;  // fd
+      Result.ParamTypes[5] := atInt64;  // offset
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'munmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
       AddSymbolToCurrent(Result, span);
       Exit;
     end
@@ -4165,8 +4318,11 @@ begin
           FDiag.Error('redeclaration of global variable: ' + TAstVarDecl(node).Name, node.Span);
           Continue;
         end;
-        // typecheck init expr
-        itype := CheckExpr(TAstVarDecl(node).InitExpr);
+        // typecheck init expr (if present)
+        if Assigned(TAstVarDecl(node).InitExpr) then
+          itype := CheckExpr(TAstVarDecl(node).InitExpr)
+        else
+          itype := TAstVarDecl(node).DeclType;  // Use declared type if no initializer
         if (TAstVarDecl(node).DeclType <> atUnresolved) and not TypeEqual(itype, TAstVarDecl(node).DeclType) then
           FDiag.Error(Format('global %s: expected type %s but got %s', 
             [TAstVarDecl(node).Name, AurumTypeToStr(TAstVarDecl(node).DeclType), AurumTypeToStr(itype)]), node.Span);

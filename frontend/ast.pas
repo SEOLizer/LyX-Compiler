@@ -695,13 +695,17 @@ type
     FName: string;
     FDeclType: TAurumType;
     FInitExpr: TAstExpr;
+    FIsPublic: Boolean;
+    FStorage: TStorageKlass;  // skCo oder skCon
   public
     constructor Create(const aName: string; aDeclType: TAurumType;
-      aInitExpr: TAstExpr; aSpan: TSourceSpan);
+      aInitExpr: TAstExpr; aSpan: TSourceSpan; aIsPublic: Boolean = False; aStorage: TStorageKlass = skCo);
     destructor Destroy; override;
     property Name: string read FName;
     property DeclType: TAurumType read FDeclType;
     property InitExpr: TAstExpr read FInitExpr;
+    property IsPublic: Boolean read FIsPublic;
+    property Storage: TStorageKlass read FStorage;
   end;
 
   { Type-Deklaration (Top-Level): type Name = Type; }
@@ -2192,12 +2196,14 @@ end;
 // ================================================================
 
 constructor TAstConDecl.Create(const aName: string;
-  aDeclType: TAurumType; aInitExpr: TAstExpr; aSpan: TSourceSpan);
+  aDeclType: TAurumType; aInitExpr: TAstExpr; aSpan: TSourceSpan; aIsPublic: Boolean = False; aStorage: TStorageKlass = skCo);
 begin
   inherited Create(nkConDecl, aSpan);
   FName := aName;
   FDeclType := aDeclType;
   FInitExpr := aInitExpr;
+  FIsPublic := aIsPublic;
+  FStorage := aStorage;
 end;
 
 destructor TAstConDecl.Destroy;
