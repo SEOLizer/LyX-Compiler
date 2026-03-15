@@ -2973,6 +2973,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
     errLbl: string;
+    // struct helpers
+    sd: TAstStructDecl;
+    structIdx: Integer;
+    structSlots: Integer;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -3104,7 +3108,26 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
       begin
-        // ... existing code ...
+        // Struct type: allocate multiple slots on stack
+        structIdx := FStructTypes.IndexOf(vd.DeclTypeName);
+        sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+        structSlots := (sd.Size + 7) div 8;
+        if structSlots < 1 then structSlots := 1;
+        
+        // Allocate stack slots for the struct
+        loc := AllocLocalMany(vd.Name, vd.DeclType, structSlots, True);
+        
+        // Initialize with struct literal if present
+        if vd.InitExpr is TAstStructLit then
+        begin
+          LowerStructLitIntoLocal(TAstStructLit(vd.InitExpr), loc, sd);
+        end
+        else if Assigned(vd.InitExpr) then
+        begin
+          // Single expression as initializer (e.g., struct variable assignment)
+          // This should be handled by the assignment statement lowering
+        end;
+        Exit(True);
       end
       else if vd.DeclType = atArray then
       begin
