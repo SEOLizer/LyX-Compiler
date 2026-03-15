@@ -40,11 +40,11 @@ TView                          ←── Basisklasse (alle Views erben hiervon)
 │
 ├── TGroup                     ←── Container für Views
 │   │
-│   └── TProgram             ←── Hauptanwendung
+│   └── TProgram            ←── Hauptanwendung
 │       │
-│       └── TWindow          ←── Fenster mit Rahmen
+│       └── TWindow        ←── Fenster mit Rahmen
 │           │
-│           └── TDialog      ←── Modaler Dialog
+│           └── TDialog    ←── Modaler Dialog
 │
 ├── TStaticText                ←── Statischer Text
 │
@@ -58,7 +58,7 @@ TView                          ←── Basisklasse (alle Views erben hiervon)
 │
 ├── TTerminal                 ←── Terminal-Emulation
 │
-├── TDesktop                  ←── Desktop (geplant)
+├── TDesktop                  ←── Desktop (erweitert TGroup)
 │
 └── TBackground               ←── Hintergrund (geplant)
 ```
@@ -891,25 +891,156 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 29. Geplante Module (TODO)
+## 29. Implementierte Module (TODO)
 
-Diese Module sind noch nicht implementiert:
+Alle geplanten Module wurden implementiert:
 
-- `std.lyxvision.listview` - TListView: Listenansicht
-- `std.lyxvision.menu` - TMenuBar: Menüsystem
-- `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
+### Vollständige Modulliste:
 
-### Bereits implementiert (Sektionen 4-9):
-
+- `std.lyxvision.types` - TPoint, TRect, TEvent
+- `std.lyxvision.consts` - State/Options/GrowMode/DragMode Flags
+- `std.lyxvision.drivers` - Terminal-Treiber (ANSI)
 - `std.lyxvision.view` - TView: Basisklasse
+- `std.lyxvision.frame` - TFrame: Fenster-Rahmen
+- `std.lyxvision.statictext` - TStaticText: Statischer Text
+- `std.lyxvision.staticline` - TStaticLine: Linien
+- `std.lyxvision.button` - TButton: Schaltflächen
+- `std.lyxvision.inputline` - TInputLine: Eingabefeld
+- `std.lyxvision.terminal` - TTerminal: Terminal-Emulation
 - `std.lyxvision.group` - TGroup: Container für Views
 - `std.lyxvision.window` - TWindow: Fenster mit Rahmen
 - `std.lyxvision.dialog` - TDialog: Modaler Dialog
 - `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
 - `std.lyxvision.app` - TProgram: Hauptanwendung
+- `std.lyxvision.tapplication` - TApplication: Erweiterte Anwendung
+- `std.lyxvision.listview` - TListView: Listenansicht
+- `std.lyxvision.menu` - TMenuBar: Menüsystem
+- `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
+
+---
+
+## 30. TListView - Listenansicht
+
+`TListView` ist eine Listenansicht für die Anzeige und Auswahl von Einträgen.
+
+### Funktionen:
+
+```lyx
+// Erstellt eine neue ListView
+fn ListViewNew(x: int64, y: int64, w: int64, h: int64, mode: int64): TListView
+
+// Fügt einen Eintrag hinzu
+fn ListViewAddItem(lv: TListView, text: pchar): TListView
+
+// Setzt den fokussierten Eintrag
+fn ListViewSetFocused(lv: TListView, index: int64): TListView
+fn ListViewGetFocused(lv: TListView): int64
+
+// Setzt die Auswahl
+fn ListViewSetSelection(lv: TListView, index: int64): TListView
+fn ListViewGetSelection(lv: TListView): int64
+
+// Navigation
+fn ListViewSelectNext(lv: TListView): TListView
+fn ListViewSelectPrev(lv: TListView): TListView
+
+// Zeichnen
+fn ListViewDraw(lv: TListView): TListView
+
+// Tastaturbehandlung
+fn ListViewHandleKey(lv: TListView, key: int64): TListView
+```
+
+### Modi:
+- `lvSingle` - Einfachauswahl
+- `lvMulti` - Mehrfachauswahl
+
+---
+
+## 31. TMenuBar - Menüsystem
+
+`TMenuBar` implementiert eine horizontale Menüleiste mit Dropdown-Menüs.
+
+### Typen:
+
+```lyx
+// Ein Menüeintrag
+pub type TMenuItem = struct {
+  name: pchar;      // Anzeigename
+  command: int64;   // Kommando-ID
+  shortcut: int64;  // Tastenkürzel
+  disabled: int64;  // Deaktiviert-Status
+}
+
+// Ein Menü (Dropdown)
+pub type TMenu = class {
+  title: pchar;     // Menütitel
+  items: int64;     // Anzahl Einträge
+}
+```
+
+### Funktionen:
+
+```lyx
+// Erstellt Menüeinträge
+fn MenuItemNew(name: pchar, cmd: int64, key: int64, disabled: int64): TMenuItem
+fn MenuNew(title: pchar): TMenu
+fn MenuAddItem(m: TMenu, name: pchar, cmd: int64, key: int64, disabled: int64): TMenu
+fn MenuAddSeparator(m: TMenu): TMenu
+
+// Menüleiste
+fn MenuBarNew(x: int64, y: int64, w: int64, h: int64): TMenuBar
+fn MenuBarAddMenu(mb: TMenuBar, m: TMenu): TMenuBar
+fn MenuBarDraw(mb: TMenuBar): TMenuBar
+fn MenuBarHandleKey(mb: TMenuBar, key: int64): int64  // Gibt Kommando zurück
+```
+
+---
+
+## 32. TTextDevice - Text-Gerät
+
+`TTextDevice` ist ein Textausgabe-Gerät für Terminal-ähnliche Ausgabe.
+
+### Funktionen:
+
+```lyx
+// Erstellt ein neues TextDevice
+fn TextDeviceNew(x: int64, y: int64, w: int64, h: int64, 
+                 bx: int64, by: int64, mode: int64): TTextDevice
+
+// Modus setzen
+fn TextDeviceSetMode(td: TTextDevice, mode: int64): TTextDevice
+fn TextDeviceGetMode(td: TTextDevice): int64
+
+// Cursor-Position
+fn TextDeviceSetCursor(td: TTextDevice, x: int64, y: int64): TTextDevice
+fn TextDeviceGetCursorX(td: TTextDevice): int64
+fn TextDeviceGetCursorY(td: TTextDevice): int64
+
+// Ausgabe
+fn TextDeviceWriteStr(td: TTextDevice, s: pchar): TTextDevice
+fn TextDeviceWriteLn(td: TTextDevice): TTextDevice
+
+// Steuerung
+fn TextDeviceScrollUp(td: TTextDevice): TTextDevice
+fn TextDeviceClear(td: TTextDevice): TTextDevice
+fn TextDeviceClearLine(td: TTextDevice, y: int64): TTextDevice
+
+// Zeichnen
+fn TextDeviceDraw(td: TTextDevice): TTextDevice
+
+// Puffer-Methoden
+fn TextDeviceGetWidth(td: TTextDevice): int64
+fn TextDeviceGetHeight(td: TTextDevice): int64
+```
+
+### Modi:
+- `tdOverlay` - Überlagerungsmodus
+- `tdReplace` - Ersetzungsmodus
+- `tdUpdate` - Update-Modus
 
 ---
 
 ## Version
 
-Aktuelle Version: **0.1.0**
+Aktuelle Version: **0.2.0**
