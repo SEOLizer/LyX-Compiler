@@ -1828,6 +1828,8 @@ var
   typeName: string;
   structIdx: Integer;
   sd: TAstStructDecl;
+  nestedIdx, fj, nestedOffset: Integer;
+  nestedSd: TAstStructDecl;
 begin
   if expr = nil then
   begin
@@ -1881,21 +1883,22 @@ begin
                   Break;
                 end;
               end;
-              if not found then
-                FDiag.Error('unknown field ' + fName + ' in type ' + sSym.StructDecl.Name, expr.Span)
-              else
-              begin
-                // Struct fields are always accessible
-                Result := fldType;
-                // annotate AST node with offset + owner
-                if expr is TAstFieldAccess then
-                begin
-                  TAstFieldAccess(expr).SetFieldOffset(sSym.StructDecl.FieldOffsets[fi]);
-                  TAstFieldAccess(expr).SetOwnerName(sSym.StructDecl.Name);
-                end;
-              end;
-              expr.ResolvedType := Result;
-              Exit;
+               if not found then
+                 FDiag.Error('unknown field ' + fName + ' in type ' + sSym.StructDecl.Name, expr.Span)
+               else
+               begin
+                 // Struct fields are always accessible
+                 Result := fldType;
+                 // annotate AST node with offset + owner + type
+                 if expr is TAstFieldAccess then
+                 begin
+                   TAstFieldAccess(expr).SetFieldOffset(sSym.StructDecl.FieldOffsets[fi]);
+                   TAstFieldAccess(expr).SetOwnerName(sSym.StructDecl.Name);
+                   TAstFieldAccess(expr).SetFieldType(fldType);
+                 end;
+               end;
+               expr.ResolvedType := Result;
+               Exit;
             end
             // Check for class type
             else if Assigned(sSym.ClassDecl) then
@@ -1952,13 +1955,14 @@ begin
                 // Check visibility before allowing access
                 CheckMemberAccess(fName, fldOwnerClass, fldVisibility, expr.Span);
                 
-                Result := fldType;
-                // annotate AST node with offset + owner
-                if expr is TAstFieldAccess then
-                begin
-                  TAstFieldAccess(expr).SetFieldOffset(fldOffset);
-                  TAstFieldAccess(expr).SetOwnerName(sSym.ClassDecl.Name);
-                end;
+                 Result := fldType;
+                 // annotate AST node with offset + owner + type
+                 if expr is TAstFieldAccess then
+                 begin
+                   TAstFieldAccess(expr).SetFieldOffset(fldOffset);
+                   TAstFieldAccess(expr).SetOwnerName(sSym.ClassDecl.Name);
+                   TAstFieldAccess(expr).SetFieldType(fldType);
+                 end;
               end;
               expr.ResolvedType := Result;
               Exit;
@@ -1991,14 +1995,15 @@ begin
                       end;
                     end;
                     if found then
-                    begin
-                      Result := fldType;
-                      // annotate AST node with offset + owner
-                      if expr is TAstFieldAccess then
-                      begin
-                        TAstFieldAccess(expr).SetFieldOffset(sd.FieldOffsets[fi]);
-                        TAstFieldAccess(expr).SetOwnerName(sd.Name);
-                      end;
+                     begin
+                       Result := fldType;
+                       // annotate AST node with offset + owner + type
+                       if expr is TAstFieldAccess then
+                       begin
+                         TAstFieldAccess(expr).SetFieldOffset(sd.FieldOffsets[fi]);
+                         TAstFieldAccess(expr).SetOwnerName(sd.Name);
+                         TAstFieldAccess(expr).SetFieldType(fldType);
+                       end;
                       expr.ResolvedType := Result;
                       Exit;
                     end;
@@ -2008,6 +2013,66 @@ begin
             end;
           end;
         end;
+        
+        // Handle nested field access: when recv is itself a field access or other expression
+        // that resolves to a struct type
+        if recv.ResolvedType = atUnresolved then
+        begin
+          // Try to find the struct type from the field access's OwnerName
+          if (recv is TAstFieldAccess) and (TAstFieldAccess(recv).OwnerName <> '') then
+          begin
+            // recv is a field access - get its field type's struct name
+            // The field itself might be a struct type
+            // We need to look up what struct type the field 'x' in 'o.x' is
+            idx := FStructTypes.IndexOf(TAstFieldAccess(recv).OwnerName);
+            if idx >= 0 then
+            begin
+              sd := TAstStructDecl(FStructTypes.Objects[idx]);
+              // Find the field that recv refers to
+              for fi := 0 to High(sd.Fields) do
+              begin
+                if sd.Fields[fi].Name = TAstFieldAccess(recv).Field then
+                begin
+                  // Found the field - now check if it's a struct type
+                  if sd.Fields[fi].FieldTypeName <> '' then
+                  begin
+                    // Look up the nested struct
+                    nestedIdx := FStructTypes.IndexOf(sd.Fields[fi].FieldTypeName);
+                    if nestedIdx >= 0 then
+                    begin
+                      nestedSd := TAstStructDecl(FStructTypes.Objects[nestedIdx]);
+                      // Now look up our field in the nested struct
+                      fName := TAstFieldAccess(expr).Field;
+                      for fj := 0 to High(nestedSd.Fields) do
+                      begin
+                        if nestedSd.Fields[fj].Name = fName then
+                        begin
+                          fldType := nestedSd.Fields[fj].FieldType;
+                          Result := fldType;
+                          // Calculate nested offset: parent field offset + nested field offset
+                          nestedOffset := sd.FieldOffsets[fi] + nestedSd.FieldOffsets[fj];
+                          TAstFieldAccess(expr).SetFieldOffset(nestedOffset);
+                          TAstFieldAccess(expr).SetOwnerName(nestedSd.Name);
+                          TAstFieldAccess(expr).SetFieldType(fldType);
+                          // Also update the parent field access to have correct type info
+                          TAstFieldAccess(recv).SetFieldType(atUnresolved); // It's a struct, not primitive
+                          expr.ResolvedType := Result;
+                          Exit;
+                        end;
+                      end;
+                      // Field not found in nested struct
+                      FDiag.Error('unknown field ' + TAstFieldAccess(expr).Field + ' in type ' + nestedSd.Name, expr.Span);
+                      Result := atUnresolved;
+                      Exit;
+                    end;
+                  end;
+                  Break;
+                end;
+              end;
+            end;
+          end;
+        end;
+        
         // fallback: unresolved
         Result := atUnresolved;
       end;
@@ -2093,15 +2158,31 @@ begin
         castTypeName := TAstCast(expr).CastTypeName;
         if castTypeName <> '' then
         begin
-          // Look up the type
+          // Look up the type - support all integer and float types
           if castTypeName = 'int64' then
             TAstCast(expr).CastType := atInt64
+          else if castTypeName = 'int32' then
+            TAstCast(expr).CastType := atInt32
+          else if castTypeName = 'int16' then
+            TAstCast(expr).CastType := atInt16
+          else if castTypeName = 'int8' then
+            TAstCast(expr).CastType := atInt8
+          else if castTypeName = 'uint64' then
+            TAstCast(expr).CastType := atUInt64
+          else if castTypeName = 'uint32' then
+            TAstCast(expr).CastType := atUInt32
+          else if castTypeName = 'uint16' then
+            TAstCast(expr).CastType := atUInt16
+          else if castTypeName = 'uint8' then
+            TAstCast(expr).CastType := atUInt8
           else if castTypeName = 'f64' then
             TAstCast(expr).CastType := atF64
           else if castTypeName = 'f32' then
             TAstCast(expr).CastType := atF32
-          else if castTypeName = 'int32' then
-            TAstCast(expr).CastType := atInt32
+          else if castTypeName = 'bool' then
+            TAstCast(expr).CastType := atBool
+          else if castTypeName = 'char' then
+            TAstCast(expr).CastType := atChar
           else if FClassTypes.IndexOf(castTypeName) >= 0 then
           begin
             // Class cast - mark as class type
