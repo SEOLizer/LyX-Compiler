@@ -439,6 +439,7 @@ var
   mainFnIdx: Integer;
   mainPos: Integer;
   offset: Integer;
+  negOffset: Integer;
   argCount: Integer;
   argTemps: array of Integer;
   stackArgsCount: Integer;
@@ -1911,12 +1912,80 @@ begin
              EmitU8(FCode, $01);
              EmitU8(FCode, $C8);  // add rax, rcx
              
-             // Store value: mov [rax], rdx
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $89);
-             EmitU8(FCode, $10);  // mov [rax], rdx
-           end;
-      end;
+              // Store value: mov [rax], rdx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $89);
+              EmitU8(FCode, $10);  // mov [rax], rdx
+            end;
+
+          irLoadField:
+            begin
+              // Load field from struct: Dest = *(Src1 - ImmInt)
+              // Stack slots grow negative, so we SUBTRACT the field offset
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              negOffset := -instr.ImmInt;
+              if (negOffset >= -128) and (negOffset <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
+                EmitU32(FCode, Cardinal(negOffset));
+              end;
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RCX);
+            end;
+
+          irStoreField:
+            begin
+              // Store field into struct: *(Src1 - ImmInt) = Src2
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              negOffset := -instr.ImmInt;
+              if (negOffset >= -128) and (negOffset <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+                EmitU32(FCode, Cardinal(negOffset));
+              end;
+            end;
+
+          irLoadFieldHeap:
+            begin
+              // Load field from heap object: Dest = *(Src1 + ImmInt)
+              // Positive offset for heap objects
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
+                EmitU32(FCode, Cardinal(instr.ImmInt));
+              end;
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RCX);
+            end;
+
+          irStoreFieldHeap:
+            begin
+              // Store field into heap object: *(Src1 + ImmInt) = Src2
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
+                EmitU32(FCode, Cardinal(instr.ImmInt));
+              end;
+            end;
+       end;
     end;
     
     // Sicherstellen, dass die Funktion einen Return hat
