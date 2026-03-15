@@ -18,12 +18,24 @@ std/lyxvision/
   ├── types.lyx         # Basis-Typen (TPoint, TRect, TEvent)
   ├── consts.lyx        # Konstanten für State, Options, Flags, Dirty
   ├── drivers.lyx       # Terminal-Treiber (ANSI, Screen, Input)
-  └── view.lyx          # TView Basisstruktur
+  ├── view.lyx          # TView Basisstruktur
+  ├── frame.lyx         # TFrame: Fenster-Rahmen
+  ├── statictext.lyx    # TStaticText: Statischer Text
+  ├── staticline.lyx    # TStaticLine: Horizontale/Vertikale Linie
+  ├── button.lyx        # TButton: Klickbare Schaltfläche
+  ├── inputline.lyx    # TInputLine: Eingabefeld
+  └── terminal.lyx     # TTerminal: Terminal-Emulation
 ```
 
 ---
 
-## 3. Basis-Typen (`std.lyxvision.types`)
+## 3. TFrame (`std.lyxvision.frame`)
+
+Fenster-Rahmen mit verschiedenen Stilen.
+
+---
+
+## 4. Basis-Typen (`std.lyxvision.types`)
 
 ### TPoint - 2D-Koordinatenpunkt
 
@@ -34,42 +46,9 @@ type TPoint = struct {
 }
 ```
 
-**Funktionen:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `PointNew(x, y)` | Erstellt einen neuen Punkt |
-| `PointZero()` | Gibt den Nullpunkt (0, 0) zurück |
-| `PointAdd(a, b)` | Addiert zwei Punkte |
-| `PointSub(a, b)` | Subtrahiert zwei Punkte |
-| `PointEqual(a, b)` | Vergleicht zwei Punkte |
-
-### TRect - Rechteck (Bounding Box)
-
-```lyx
-type TRect = struct {
-  ax: int64;   // Linke obere Ecke X
-  ay: int64;   // Linke obere Ecke Y
-  bx: int64;   // Rechte untere Ecke X
-  by: int64;   // Rechte untere Ecke Y
-}
-```
-
-**Funktionen:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `RectFromCoords(ax, ay, bx, by)` | Erstellt Rechteck aus Koordinaten |
-| `RectEmpty()` | Gibt ein leeres Rechteck zurück |
-| `RectWidth(r)` | Gibt die Breite zurück |
-| `RectHeight(r)` | Gibt die Höhe zurück |
-| `RectSize(r)` | Gibt Größe als TPoint zurück |
-| `RectIsEmpty(r)` | Prüft ob Rechteck leer ist |
-| `RectContainsPoint(r, px, py)` | Prüft ob Punkt im Rechteck liegt |
-| `RectMove(r, dx, dy)` | Verschiebt das Rechteck |
-| `RectGrow(r, dx, dy)` | Vergrößert das Rechteck |
-
 ---
 
-## 4. Event-System (`std.lyxvision.types`)
+## 5. Event-System (`std.lyxvision.types`)
 
 ### TEvent - Event-Struktur
 
@@ -176,7 +155,7 @@ type TEvent = struct {
 
 ---
 
-## 5. TView-Struktur (`std.lyxvision.view`)
+## 6. TView-Struktur (`std.lyxvision.view`)
 
 ### TView - Basis-Struktur für alle sichtbaren Objekte
 
@@ -489,11 +468,222 @@ import std.lyxvision.types;           // Typen
 import std.lyxvision.consts;          // Konstanten
 import std.lyxvision.drivers;         // Treiber
 import std.lyxvision.view;            // View-Basis
+import std.lyxvision.frame;           // Rahmen
+import std.lyxvision.statictext;      // Statischer Text
+import std.lyxvision.staticline;      // Linie
+import std.lyxvision.button;          // Button
+import std.lyxvision.inputline;       // Eingabefeld
+import std.lyxvision.terminal;        // Terminal
 ```
 
 ---
 
-## 15. Beispiel
+## 15. TFrame - Fenster-Rahmen (`std.lyxvision.frame`)
+
+### Typ
+
+```lyx
+type TFrame = struct {
+  originX: int64;
+  originY: int64;
+  sizeX: int64;
+  sizeY: int64;
+  cursorX: int64;
+  cursorY: int64;
+  growMode: int64;
+  dragMode: int64;
+  helpCtx: int64;
+  state: int64;
+  options: int64;
+  ownerPtr: int64;
+  nextPtr: int64;
+  viewType: int64;
+  dirtyLevel: int64;
+  parentDirty: int64;
+  frameStyle: int64;
+}
+```
+
+### Rahmen-Stile
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `frThin` | 0 | Dünner Rahmen (ASCII) |
+| `frDouble` | 1 | Doppelter Rahmen |
+| `frBox` | 2 | Einfacher Rahmen |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `FrameCreate(x, y, w, h)` | Erstellt Rahmen |
+| `FrameSetStyle(f, style)` | Setzt Rahmen-Stil |
+| `FrameDraw(f)` | Zeichnet Rahmen |
+| `FrameDrawTitle(f, title, color)` | Zeichnet Rahmen mit Titel |
+
+---
+
+## 16. TStaticText - Statischer Text (`std.lyxvision.statictext`)
+
+### Typ
+
+```lyx
+type TStaticText = struct {
+  // TView Felder...
+  textPtr: int64;
+  text: pchar;
+  centerAlign: int64;
+}
+```
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `StaticTextCreate(x, y, text)` | Erstellt Text |
+| `StaticTextSetText(st, text)` | Setzt Text |
+| `StaticTextSetCenterAlign(st, center)` | Setzt Zentrierung |
+| `StaticTextDraw(st)` | Zeichnet Text |
+| `StaticTextDrawColor(st, fg, bg)` | Zeichnet mit Farben |
+
+---
+
+## 17. TStaticLine - Linie (`std.lyxvision.staticline`)
+
+### Linien-Typen
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `slHorizontal` | 0 | Horizontale Linie |
+| `slVertical` | 1 | Vertikale Linie |
+
+### Linien-Stile
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `slSingle` | 0 | Einfache Linie |
+| `slDouble` | 1 | Doppelte Linie |
+| `slBlock` | 2 | Ausgefüllte Linie |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `StaticLineCreateH(x, y, len)` | Erstellt horizontale Linie |
+| `StaticLineCreateV(x, y, len)` | Erstellt vertikale Linie |
+| `StaticLineSetStyle(sl, style)` | Setzt Stil |
+| `StaticLineDraw(sl)` | Zeichnet Linie |
+| `StaticLineDrawColor(sl, fg, bg)` | Zeichnet mit Farben |
+
+---
+
+## 18. TButton - Schaltfläche (`std.lyxvision.button`)
+
+### Button-Flags
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `bfNormal` | 0 | Normaler Button |
+| `bfDefault` | 1 | Default-Button (Enter) |
+| `bfBold` | 2 | Fetter Text |
+| `bfShadow` | 4 | Schatten |
+| `bfGrabFocus` | 8 | Nimmt Fokus an |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `ButtonCreate(x, y, w, h, title, cmd)` | Erstellt Button |
+| `ButtonCreateStd(x, y, title, cmd)` | Erstellt Standard-Button |
+| `ButtonCreateDefault(x, y, title, cmd)` | Erstellt Default-Button |
+| `ButtonSetPressed(btn, pressed)` | Setzt Gedrückt-Status |
+| `ButtonDraw(btn)` | Zeichnet Button |
+| `ButtonIsKey(btn, key)` | Prüft ob Taste passt |
+| `ButtonPress(btn)` | Führt Button-Aktion aus |
+
+---
+
+## 19. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
+
+### InputLine-Optionen
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `ilValidate` | 1 | Validierung aktiv |
+| `ilCursorIns` | 2 | Insert-Modus |
+| `ilCursorOver` | 4 | Overwrite-Modus |
+| `ilPassword` | 8 | Passwort-Modus |
+| `ilHistory` | 16 | History unterstützt |
+
+### Konstanten
+
+| Konstante | Wert |
+|----------|------|
+| `MAX_INPUT_LENGTH` | 256 |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `InputLineCreate(x, y, maxLen)` | Erstellt Eingabefeld |
+| `InputLineSetInsertMode(il, insert)` | Setzt Insert/Overwrite |
+| `InputLineSetSelection(il, start, end)` | Setzt Markierung |
+| `InputLineClearSelection(il)` | Löscht Markierung |
+| `InputLineSetCurPos(il, pos)` | Setzt Cursor-Position |
+| `InputLineDraw(il)` | Zeichnet Eingabefeld |
+| `InputLineProcessKey(il, key)` | Verarbeitet Taste |
+
+---
+
+## 20. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
+
+### Typ
+
+```lyx
+type TTerminal = struct {
+  // TView Felder...
+  bufferLines: int64;
+  bufferCols: int64;
+  curRow: int64;
+  curCol: int64;
+  startLine: int64;
+  canScroll: int64;
+}
+```
+
+### Konstanten
+
+| Konstante | Wert |
+|----------|------|
+| `TERM_BUFFER_LINES` | 100 |
+| `TERM_BUFFER_COLS` | 80 |
+| `TERM_MAX_LINES` | 1000 |
+| `ANSI_ESC` | 27 |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `TerminalCreate(x, y, w, h)` | Erstellt Terminal |
+| `TerminalSetCursor(term, row, col)` | Setzt Cursor |
+| `TerminalHome(term)` | Cursor nach Hause |
+| `TerminalClear(term)` | Löscht Bildschirm |
+| `TerminalClearEOL(term)` | Löscht bis Zeilenende |
+| `TerminalNewLine(term)` | Zeilenumbruch |
+| `TerminalWriteStr(term, s)` | Schreibt String |
+| `TerminalPutChar(term, ch)` | Schreibt Zeichen |
+| `TerminalWriteAnsi(term, s)` | Schreibt mit ANSI |
+| `TerminalScrollUp(term)` | Scrollt hoch |
+| `TerminalScrollDown(term)` | Scrollt runter |
+| `TerminalSetFG(term, color)` | Setzt Vordergrund |
+| `TerminalSetBG(term, color)` | Setzt Hintergrund |
+| `TerminalSetColor(term, fg, bg)` | Setzt beide Farben |
+| `TerminalResetColor(term)` | Reset Farben |
+| `TerminalDraw(term)` | Zeichnet Terminal |
+
+---
+
+## 21. Beispiel
 
 ```lyx
 import std.lyxvision.main as lv;
@@ -522,7 +712,7 @@ fn main(): int64 {
 
 ---
 
-## 16. Systemabhängigkeiten
+## 22. Systemabhängigkeiten
 
 Das Framework verwendet ausschließlich Linux-Syscalls:
 - `write()` - Terminal-Ausgabe
@@ -532,15 +722,18 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 17. Geplante Module (TODO)
+## 23. Geplante Module (TODO)
+
+Diese Module sind noch nicht implementiert:
 
 - `std.lyxvision.group` - TGroup: Container für Views
 - `std.lyxvision.window` - TWindow: Fenster mit Rahmen
 - `std.lyxvision.dialog` - TDialog: Modale Dialoge
-- `std.lyxvision.button` - TButton: Klickbare Schaltfläche
-- `std.lyxvision.input` - TInputLine: Eingabefeld
+- `std.lyxvision.listview` - TListView: Listenansicht
+- `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
 - `std.lyxvision.menu` - TMenuBar: Menüsystem
 - `std.lyxvision.app` - TApplication: Hauptanwendung
+- `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
 
 ---
 
