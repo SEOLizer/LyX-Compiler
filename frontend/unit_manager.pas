@@ -8,6 +8,14 @@ uses
   ast, diag, lexer, parser;
 
 type
+  { Suchergebnis für Import-Auflösung }
+  TResolveResult = record
+    Found: Boolean;
+    FilePath: string;
+    SearchPath: string;  // Welcher Suchpfad hat gematcht
+    IsStdLib: Boolean;   // War es ein std.* Import
+  end;
+
   { Geladene Unit mit ihrem AST }
   TLoadedUnit = class
   public
@@ -19,22 +27,45 @@ type
     destructor Destroy; override;
   end;
 
-  { Verwaltet alle geladenen Units }
+  { Verwaltet alle geladenen Units mit verbesserter Auflösung }
   TUnitManager = class
   private
-    FUnits: TStringList; // UnitPath -> TLoadedUnit
-    FSearchPaths: TStringList;
+    FUnits: TStringList;           // UnitPath -> TLoadedUnit
+    FIncludePaths: TStringList;    // -I Pfade
+    FStdLibPath: string;           // Pfad zur Standardbibliothek
+    FSourceFilePath: string;       // Pfad der Hauptdatei
+    FProjectRoot: string;          // Projekt-Root (wo lyxc aufgerufen wurde)
     FDiag: TDiagnostics;
-    function ResolveUnitPath(const unitPath: string): string;
-    function LoadUnitFile(const unitPath: string; out fileName: string): TAstProgram;
+    FTraceImports: Boolean;        // --trace-imports Flag
+
+    procedure Trace(const msg: string);
+    function IsStdNamespace(const unitPath: string): Boolean;
+    function UnitPathToRelativePath(const unitPath: string): string;
+    function TryResolvePath(const basePath, relativePath: string; out fullPath: string): Boolean;
+    function ResolveUnitPath(const unitPath: string; const importingFile: string): TResolveResult;
+    function LoadUnitFile(const unitPath: string; const importingFile: string): TAstProgram;
   public
     constructor Create(d: TDiagnostics);
     destructor Destroy; override;
-    procedure AddSearchPath(const path: string);
-    function LoadUnit(const unitPath: string): TLoadedUnit;
+
+    { Konfiguration }
+    procedure SetSourceFile(const path: string);
+    procedure SetProjectRoot(const path: string);
+    procedure SetStdLibPath(const path: string);
+    procedure AddIncludePath(const path: string);
+    procedure SetTraceImports(enabled: Boolean);
+
+    { Unit-Laden }
+    function LoadUnit(const unitPath: string; const importingFile: string): TLoadedUnit;
     function FindUnit(const unitPath: string): TLoadedUnit;
-    procedure LoadAllImports(prog: TAstProgram; const basePath: string);
+    procedure LoadAllImports(prog: TAstProgram; const importingFile: string);
+
+    { Für Abwärtskompatibilität }
+    procedure AddSearchPath(const path: string);
+
     property Units: TStringList read FUnits;
+    property StdLibPath: string read FStdLibPath;
+    property TraceImports: Boolean read FTraceImports write FTraceImports;
   end;
 
 implementation
@@ -60,15 +91,34 @@ end;
 { TUnitManager }
 
 constructor TUnitManager.Create(d: TDiagnostics);
+var
+  envPath: string;
 begin
   inherited Create;
   FDiag := d;
   FUnits := TStringList.Create;
   FUnits.Sorted := False;
-  FSearchPaths := TStringList.Create;
-  // Standard-Suchpfad: aktuelles Verzeichnis
-  FSearchPaths.Add('.');
-  FSearchPaths.Add('./lib');
+  FIncludePaths := TStringList.Create;
+  FTraceImports := False;
+
+  // Standard-Pfade initialisieren
+  FSourceFilePath := '';
+  FProjectRoot := GetCurrentDir;
+
+  // Standardbibliothek-Pfad ermitteln:
+  // 1. Umgebungsvariable LYX_STD_PATH
+  // 2. Relativ zum Compiler-Binary: ../std/
+  // 3. Systemweiter Pfad: /usr/lib/lyx/std/
+  // 4. Fallback: ./std/
+  envPath := GetEnvironmentVariable('LYX_STD_PATH');
+  if (envPath <> '') and DirectoryExists(envPath) then
+    FStdLibPath := envPath
+  else if DirectoryExists(ExtractFilePath(ParamStr(0)) + '../std') then
+    FStdLibPath := ExpandFileName(ExtractFilePath(ParamStr(0)) + '../std')
+  else if DirectoryExists('/usr/lib/lyx/std') then
+    FStdLibPath := '/usr/lib/lyx/std'
+  else
+    FStdLibPath := ExpandFileName('./std');
 end;
 
 destructor TUnitManager.Destroy;
@@ -78,74 +128,242 @@ begin
   for i := 0 to FUnits.Count - 1 do
     TLoadedUnit(FUnits.Objects[i]).Free;
   FUnits.Free;
-  FSearchPaths.Free;
+  FIncludePaths.Free;
   inherited Destroy;
+end;
+
+procedure TUnitManager.Trace(const msg: string);
+begin
+  if FTraceImports then
+    WriteLn('[TRACE] ', msg);
+end;
+
+function TUnitManager.IsStdNamespace(const unitPath: string): Boolean;
+begin
+  // Prüft ob der Import mit 'std.' beginnt
+  Result := (Length(unitPath) >= 4) and (Copy(unitPath, 1, 4) = 'std.');
+end;
+
+function TUnitManager.UnitPathToRelativePath(const unitPath: string): string;
+begin
+  // Wandelt 'std.io' -> 'std/io.lyx'
+  // Wandelt 'mylib.utils' -> 'mylib/utils.lyx'
+  Result := StringReplace(unitPath, '.', DirectorySeparator, [rfReplaceAll]) + '.lyx';
+end;
+
+function TUnitManager.TryResolvePath(const basePath, relativePath: string; out fullPath: string): Boolean;
+var
+  candidate: string;
+begin
+  if basePath = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  candidate := IncludeTrailingPathDelimiter(basePath) + relativePath;
+  fullPath := ExpandFileName(candidate);
+  Result := FileExists(fullPath);
+
+  if FTraceImports then
+  begin
+    if Result then
+      Trace('  -> Trying: ' + fullPath + ' ... FOUND!')
+    else
+      Trace('  -> Trying: ' + fullPath + ' ... NOT FOUND');
+  end;
+end;
+
+function TUnitManager.ResolveUnitPath(const unitPath: string; const importingFile: string): TResolveResult;
+var
+  relativePath: string;
+  importingDir: string;
+  fullPath: string;
+  i: Integer;
+begin
+  Result.Found := False;
+  Result.FilePath := '';
+  Result.SearchPath := '';
+  Result.IsStdLib := False;
+
+  relativePath := UnitPathToRelativePath(unitPath);
+
+  if FTraceImports then
+    Trace('Resolving ''' + unitPath + '''...');
+
+  // ============================================================
+  // SONDERFALL: std.* Namespace
+  // ============================================================
+  // Wenn der Import mit 'std.' beginnt, suchen wir NUR in der
+  // Standardbibliothek. Dies verhindert, dass lokale Dateien
+  // die Standardbibliothek überschatten können.
+  // ============================================================
+  if IsStdNamespace(unitPath) then
+  begin
+    if FTraceImports then
+      Trace('  Reserved prefix ''std'' detected. Jumping to STD_PATH.');
+
+    // Bei std.io -> suche std/io.lyx im StdLibPath
+    // Der Pfad 'std/' ist bereits Teil von relativePath
+    if TryResolvePath(FStdLibPath, Copy(relativePath, 5, MaxInt), fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := FStdLibPath;
+      Result.IsStdLib := True;
+      Exit;
+    end;
+
+    // Alternativ: std/io.lyx direkt im StdLibPath-Parent
+    if TryResolvePath(ExtractFilePath(ExcludeTrailingPathDelimiter(FStdLibPath)), relativePath, fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := ExtractFilePath(ExcludeTrailingPathDelimiter(FStdLibPath));
+      Result.IsStdLib := True;
+      Exit;
+    end;
+
+    // Nicht gefunden - gib Fehler aus
+    Exit;
+  end;
+
+  // ============================================================
+  // STANDARD SUCHREIHENFOLGE (für nicht-std Imports)
+  // ============================================================
+  // 1. Relativ zur importierenden Datei
+  // 2. Projekt-Root
+  // 3. -I Include-Pfade
+  // 4. Standardbibliothek (für nicht-std Module wie 'math')
+  // ============================================================
+
+  // 1. Relativ zur importierenden Datei
+  if importingFile <> '' then
+  begin
+    importingDir := ExtractFilePath(ExpandFileName(importingFile));
+    if TryResolvePath(importingDir, relativePath, fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := importingDir;
+      Exit;
+    end;
+  end;
+
+  // 2. Projekt-Root (Working Directory)
+  if TryResolvePath(FProjectRoot, relativePath, fullPath) then
+  begin
+    Result.Found := True;
+    Result.FilePath := fullPath;
+    Result.SearchPath := FProjectRoot;
+    Exit;
+  end;
+
+  // 3. -I Include-Pfade (in der Reihenfolge wie angegeben)
+  for i := 0 to FIncludePaths.Count - 1 do
+  begin
+    if TryResolvePath(FIncludePaths[i], relativePath, fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := FIncludePaths[i];
+      Exit;
+    end;
+  end;
+
+  // 4. Standardbibliothek (für Module ohne std. Präfix)
+  if TryResolvePath(FStdLibPath, relativePath, fullPath) then
+  begin
+    Result.Found := True;
+    Result.FilePath := fullPath;
+    Result.SearchPath := FStdLibPath;
+    Result.IsStdLib := True;
+    Exit;
+  end;
+
+  // Nicht gefunden
+  if FTraceImports then
+    Trace('  -> Module NOT FOUND in any search path!');
+end;
+
+procedure TUnitManager.SetSourceFile(const path: string);
+begin
+  FSourceFilePath := ExpandFileName(path);
+end;
+
+procedure TUnitManager.SetProjectRoot(const path: string);
+begin
+  if path <> '' then
+    FProjectRoot := ExpandFileName(path)
+  else
+    FProjectRoot := GetCurrentDir;
+end;
+
+procedure TUnitManager.SetStdLibPath(const path: string);
+begin
+  if (path <> '') and DirectoryExists(path) then
+    FStdLibPath := ExpandFileName(path);
+end;
+
+procedure TUnitManager.AddIncludePath(const path: string);
+var
+  expandedPath: string;
+begin
+  expandedPath := ExpandFileName(path);
+  if DirectoryExists(expandedPath) then
+  begin
+    if FIncludePaths.IndexOf(expandedPath) < 0 then
+      FIncludePaths.Add(expandedPath);
+  end;
+end;
+
+procedure TUnitManager.SetTraceImports(enabled: Boolean);
+begin
+  FTraceImports := enabled;
 end;
 
 procedure TUnitManager.AddSearchPath(const path: string);
 begin
-  FSearchPaths.Add(path);
+  // Für Abwärtskompatibilität: fügt als Include-Pfad hinzu
+  AddIncludePath(path);
 end;
 
-function TUnitManager.ResolveUnitPath(const unitPath: string): string;
-{ Wandelt Unit-Pfad (z.B. "std.io") in Dateipfad (z.B. "std/io.au") um }
-var
-  i: Integer;
-  filePath, searchPath, fullPath: string;
-begin
-  // Ersetze '.' durch '/' im Unit-Pfad
-  filePath := StringReplace(unitPath, '.', '/', [rfReplaceAll]) + '.lyx';
-  
-  // Suche in allen Suchpfaden
-  for i := 0 to FSearchPaths.Count - 1 do
-  begin
-    searchPath := FSearchPaths[i];
-    fullPath := searchPath + '/' + filePath;
-    if FileExists(fullPath) then
-    begin
-      Result := fullPath;
-      Exit;
-    end;
-  end;
-  
-  Result := '';
-end;
-
-function TUnitManager.LoadUnitFile(const unitPath: string; out fileName: string): TAstProgram;
-{ Lädt und parst eine Unit-Datei }
+function TUnitManager.LoadUnitFile(const unitPath: string; const importingFile: string): TAstProgram;
 var
   lx: TLexer;
   p: TParser;
   src: TStringList;
+  res: TResolveResult;
 begin
   Result := nil;
-  fileName := ResolveUnitPath(unitPath);
-  
-  if fileName = '' then
+
+  res := ResolveUnitPath(unitPath, importingFile);
+
+  if not res.Found then
   begin
     FDiag.Error('cannot find unit: ' + unitPath, Default(TSourceSpan));
     Exit;
   end;
-  
-  if not FileExists(fileName) then
+
+  if not FileExists(res.FilePath) then
   begin
-    FDiag.Error('unit file not found: ' + fileName, Default(TSourceSpan));
+    FDiag.Error('unit file not found: ' + res.FilePath, Default(TSourceSpan));
     Exit;
   end;
-  
+
   src := TStringList.Create;
   try
     try
-      src.LoadFromFile(fileName);
+      src.LoadFromFile(res.FilePath);
     except
       on E: Exception do
       begin
-        FDiag.Error('cannot read unit file: ' + fileName + ' - ' + E.Message, Default(TSourceSpan));
+        FDiag.Error('cannot read unit file: ' + res.FilePath + ' - ' + E.Message, Default(TSourceSpan));
         Exit;
       end;
     end;
-    
-    lx := TLexer.Create(src.Text, fileName, FDiag);
+
+    lx := TLexer.Create(src.Text, res.FilePath, FDiag);
     try
       p := TParser.Create(lx, FDiag);
       try
@@ -161,34 +379,44 @@ begin
   end;
 end;
 
-function TUnitManager.LoadUnit(const unitPath: string): TLoadedUnit;
-{ Lädt eine Unit (falls noch nicht geladen) }
+function TUnitManager.LoadUnit(const unitPath: string; const importingFile: string): TLoadedUnit;
 var
   idx: Integer;
   ast: TAstProgram;
-  fileName: string;
+  res: TResolveResult;
 begin
   // Prüfe ob Unit bereits geladen
   idx := FUnits.IndexOf(unitPath);
   if idx >= 0 then
   begin
     Result := TLoadedUnit(FUnits.Objects[idx]);
+    if FTraceImports then
+      Trace('Unit ''' + unitPath + ''' already loaded');
     Exit;
   end;
-  
-  // Lade neue Unit
-  ast := LoadUnitFile(unitPath, fileName);
+
+  // Resolve den Pfad
+  res := ResolveUnitPath(unitPath, importingFile);
+  if not res.Found then
+  begin
+    FDiag.Error('cannot find unit: ' + unitPath, Default(TSourceSpan));
+    Result := nil;
+    Exit;
+  end;
+
+  // Lade die Unit
+  ast := LoadUnitFile(unitPath, importingFile);
   if not Assigned(ast) then
   begin
     Result := nil;
     Exit;
   end;
-  
-  Result := TLoadedUnit.Create(unitPath, fileName, ast);
+
+  Result := TLoadedUnit.Create(unitPath, res.FilePath, ast);
   FUnits.AddObject(unitPath, Result);
-  
+
   // Rekursiv alle Imports dieser Unit laden
-  LoadAllImports(ast, ExtractFilePath(fileName));
+  LoadAllImports(ast, res.FilePath);
 end;
 
 function TUnitManager.FindUnit(const unitPath: string): TLoadedUnit;
@@ -202,8 +430,7 @@ begin
     Result := nil;
 end;
 
-procedure TUnitManager.LoadAllImports(prog: TAstProgram; const basePath: string);
-{ Lädt alle Import-Deklarationen eines Programms }
+procedure TUnitManager.LoadAllImports(prog: TAstProgram; const importingFile: string);
 var
   i: Integer;
   decl: TAstNode;
@@ -212,7 +439,7 @@ var
   loadedUnit: TLoadedUnit;
 begin
   if not Assigned(prog) then Exit;
-  
+
   for i := 0 to High(prog.Decls) do
   begin
     decl := prog.Decls[i];
@@ -220,21 +447,13 @@ begin
     begin
       impDecl := TAstImportDecl(decl);
       unitPath := impDecl.UnitPath;
-      
+
       // Prüfe ob Unit bereits geladen
       loadedUnit := FindUnit(unitPath);
       if not Assigned(loadedUnit) then
       begin
-        // Füge basePath temporär zu Suchpfaden hinzu
-        if basePath <> '' then
-          FSearchPaths.Insert(0, basePath);
-        try
-          loadedUnit := LoadUnit(unitPath);
-        finally
-          if basePath <> '' then
-            FSearchPaths.Delete(0);
-        end;
-        
+        loadedUnit := LoadUnit(unitPath, importingFile);
+
         if not Assigned(loadedUnit) then
         begin
           FDiag.Error('failed to load import: ' + unitPath, decl.Span);
