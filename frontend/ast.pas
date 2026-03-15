@@ -636,6 +636,7 @@ type
   TAstParam = record
     Name: string;
     ParamType: TAurumType;
+    TypeName: string;  // for named types (structs)
     Span: TSourceSpan;
   end;
   TAstParamList = array of TAstParam;

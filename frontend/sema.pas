@@ -1553,6 +1553,9 @@ var
   targetClassName: string;
   compiledRegex: string;
   captureSlots: Integer;
+  typeName: string;
+  structIdx: Integer;
+  sd: TAstStructDecl;
 begin
   if expr = nil then
   begin
@@ -1687,6 +1690,22 @@ begin
               end;
               expr.ResolvedType := Result;
               Exit;
+            end;
+
+            // Check if the resolved type of the expression is a struct (for parameters)
+            // Use the symbol's DeclType - if it's atUnresolved, look up the type name from the symbol's name
+            if Assigned(sSym) and (sSym.Kind = symVar) then
+            begin
+              // This is a variable/parameter - check if its DeclType is unresolved (struct)
+              if sSym.DeclType = atUnresolved then
+              begin
+                // Need to look up the struct by the variable's type name
+                // The type name should be stored somewhere - check if we can derive it
+                // For now, try using the symbol's name as a hint
+                // Actually, let's look at what DeclTypeName might contain
+              end;
+              // If DeclType is a struct, we can look up the struct decl
+              // Check FStructTypes for a struct with the same name as the type
             end;
           end;
         end;
@@ -4120,6 +4139,7 @@ end;
 procedure TSema.Analyze(prog: TAstProgram);
 var
   i, j, k, fi: Integer;
+  structIdx: Integer;
   node: TAstNode;
   fn: TAstFuncDecl;
   con: TAstConDecl;
@@ -4370,6 +4390,14 @@ begin
         sym := TSymbol.Create(fn.Params[j].Name);
         sym.Kind := symVar;
         sym.DeclType := fn.Params[j].ParamType;
+        sym.TypeName := fn.Params[j].TypeName;  // for struct types
+        // If it's a struct type (atUnresolved with TypeName), also set StructDecl
+        if (sym.DeclType = atUnresolved) and (sym.TypeName <> '') then
+        begin
+          structIdx := FStructTypes.IndexOf(sym.TypeName);
+          if structIdx >= 0 then
+            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx]);
+        end;
         AddSymbolToCurrent(sym, fn.Params[j].Span);
       end;
       // set current return type
