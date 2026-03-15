@@ -2977,6 +2977,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     sd: TAstStructDecl;
     structIdx: Integer;
     structSlots: Integer;
+    slotCount: Integer;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -3122,10 +3123,41 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         begin
           LowerStructLitIntoLocal(TAstStructLit(vd.InitExpr), loc, sd);
         end
+        else if Assigned(vd.InitExpr) and (vd.InitExpr is TAstCall) then
+        begin
+          // Struct assignment from function call
+          // Use special handling: emit irCallStruct which stores RAX and RDX
+          call := TAstCall(vd.InitExpr);
+          argCount := Length(call.Args);
+          SetLength(argTemps, argCount);
+          for i := 0 to High(call.Args) do
+            argTemps[i] := LowerExpr(call.Args[i]);
+          
+          // Emit irCallStruct with dest being the local base slot
+          instr := Default(TIRInstr);
+          instr.Op := irCallStruct;
+          instr.Dest := loc;  // Base local slot (not temp!)
+          instr.ImmStr := call.Name;
+          instr.ImmInt := argCount;
+          instr.StructSize := structSlots * 8;
+          instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+        end
         else if Assigned(vd.InitExpr) then
         begin
-          // Single expression as initializer (e.g., struct variable assignment)
-          // This should be handled by the assignment statement lowering
+          // Struct assignment from other expression
+          tmp := LowerExpr(vd.InitExpr);
+          if tmp >= 0 then
+          begin
+            // Copy first quadword to first slot
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end;
         end;
         Exit(True);
       end
@@ -3687,6 +3719,30 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     begin
       if Assigned(TAstReturn(stmt).Value) then
       begin
+        // Check if returning a struct variable directly
+        if (TAstReturn(stmt).Value is TAstIdent) then
+        begin
+          loc := ResolveLocal(TAstIdent(TAstReturn(stmt).Value).Name);
+          if (loc >= 0) and (loc < Length(FLocalIsStruct)) and FLocalIsStruct[loc] then
+          begin
+            // Get struct slot count
+            slotCount := 1;
+            if loc < Length(FLocalSlotCount) then
+              slotCount := FLocalSlotCount[loc];
+            if slotCount < 1 then slotCount := 1;
+            
+            // Struct return: use irReturnStruct with base local slot
+            // Backend will load RAX from slot[loc] and RDX from slot[loc+1] for 2-slot structs
+            instr := Default(TIRInstr);
+            instr.Op := irReturnStruct;
+            instr.Src1 := loc;  // Base local slot index
+            instr.StructSize := slotCount * 8;  // Size in bytes
+            Emit(instr);
+            Exit(True);
+          end;
+        end;
+        
+        // Normal return (non-struct or expression)
         tmp := LowerExpr(TAstReturn(stmt).Value);
         if tmp < 0 then Exit(False);
         instr := Default(TIRInstr);
