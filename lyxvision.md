@@ -40,9 +40,11 @@ TView                          ←── Basisklasse (alle Views erben hiervon)
 │
 ├── TGroup                     ←── Container für Views
 │   │
-│   └── TWindow                ←── Fenster mit Rahmen
+│   └── TProgram             ←── Hauptanwendung
 │       │
-│       └── TDialog            ←── Modaler Dialog
+│       └── TWindow          ←── Fenster mit Rahmen
+│           │
+│           └── TDialog      ←── Modaler Dialog
 │
 ├── TStaticText                ←── Statischer Text
 │
@@ -647,7 +649,50 @@ pub type TCluster = class extends TView {
 
 ---
 
-## 21. TStaticText - Statischer Text (`std.lyxvision.statictext`)
+## 21. TProgram - Hauptanwendung (`std.lyxvision.app`)
+
+TProgram ist die Hauptanwendung und erweitert TGroup.
+
+### Typ
+
+```lyx
+pub type TProgram = class extends TGroup {
+  deskTop: int64;
+  background: int64;
+  running: int64;
+  returnCode: int64;
+  
+  fn Init() { ... }
+}
+```
+
+### TProgram Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `ProgramNew()` | Erstellt neues Programm |
+| `ProgramInit(p)` | Initialisiert Programm |
+| `ProgramDone(p)` | Beendet Programm |
+| `ProgramRun(p)` | Startet Event-Loop |
+| `ProgramStop(p)` | Stoppt Event-Loop |
+| `ProgramIsRunning(p)` | Prüft ob Programm läuft |
+| `ProgramSetReturnCode(p, code)` | Setzt Rückgabe-Code |
+| `ProgramGetReturnCode(p)` | Gibt Rückgabe-Code zurück |
+| `ProgramGetDesktop(p)` | Gibt Desktop zurück |
+| `ProgramInsertDesktop(p, view)` | Fügt View zum Desktop hinzu |
+| `ProgramDraw(p)` | Zeichnet Programm |
+| `ProgramExecuteDialog(p, dlg)` | Führt modalen Dialog aus |
+
+### Globale Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `GetProgram()` | Gibt globales Programm zurück |
+| `SetProgram(p)` | Setzt globales Programm |
+
+---
+
+## 22. TStaticText - Statischer Text (`std.lyxvision.statictext`)
 
 ### Typ
 
@@ -672,7 +717,7 @@ type TStaticText = struct {
 
 ---
 
-## 22. TStaticLine - Linie (`std.lyxvision.staticline`)
+## 23. TStaticLine - Linie (`std.lyxvision.staticline`)
 
 ### Linien-Typen
 
@@ -701,7 +746,7 @@ type TStaticText = struct {
 
 ---
 
-## 23. TButton - Schaltfläche (`std.lyxvision.button`)
+## 24. TButton - Schaltfläche (`std.lyxvision.button`)
 
 ### Button-Flags
 
@@ -727,7 +772,7 @@ type TStaticText = struct {
 
 ---
 
-## 24. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
+## 25. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
 
 ### InputLine-Optionen
 
@@ -759,7 +804,7 @@ type TStaticText = struct {
 
 ---
 
-## 25. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
+## 26. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
 
 ### Typ
 
@@ -807,7 +852,7 @@ type TTerminal = struct {
 
 ---
 
-## 26. Beispiel
+## 27. Beispiel
 
 ```lyx
 import std.lyxvision.main as lv;
@@ -836,7 +881,7 @@ fn main(): int64 {
 
 ---
 
-## 27. Systemabhängigkeiten
+## 28. Systemabhängigkeiten
 
 Das Framework verwendet ausschließlich Linux-Syscalls:
 - `write()` - Terminal-Ausgabe
@@ -846,22 +891,22 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 28. Geplante Module (TODO)
+## 29. Geplante Module (TODO)
 
 Diese Module sind noch nicht implementiert:
 
 - `std.lyxvision.listview` - TListView: Listenansicht
 - `std.lyxvision.menu` - TMenuBar: Menüsystem
-- `std.lyxvision.app` - TApplication: Hauptanwendung
 - `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
 
-### Bereits implementiert (Sektionen 4-8):
+### Bereits implementiert (Sektionen 4-9):
 
 - `std.lyxvision.view` - TView: Basisklasse
 - `std.lyxvision.group` - TGroup: Container für Views
 - `std.lyxvision.window` - TWindow: Fenster mit Rahmen
 - `std.lyxvision.dialog` - TDialog: Modaler Dialog
 - `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
+- `std.lyxvision.app` - TProgram: Hauptanwendung
 
 ---
 
