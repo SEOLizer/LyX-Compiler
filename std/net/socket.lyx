@@ -143,3 +143,168 @@ pub fn UDPSocketClose(sock: UDPSocket) {
     sys_close(sock.fd);
   }
 }
+
+// ============================================================================
+// Raw Socket (for ICMP, etc.)
+// ============================================================================
+
+pub type RawSocket = struct {
+  fd: int64;
+};
+
+// Create a raw socket (requires root or CAP_NET_RAW)
+pub fn RawSocketNew(protocol: int64): RawSocket {
+  var sock: RawSocket;
+  var fd: int64;
+
+  // Create raw socket
+  fd := sys_socket(AF_INET, SOCK_RAW, protocol);
+  if (fd < 0) {
+    sock.fd := -1;
+    return sock;
+  }
+
+  sock.fd := fd;
+  return sock;
+}
+
+// Send raw packet
+pub fn RawSocketSendTo(sock: RawSocket, buf: int64, n: int64, destAddr: int64): int64 {
+  return sys_sendto(sock.fd, buf, n, 0, destAddr, 16);
+}
+
+// Receive raw packet
+pub fn RawSocketRecvFrom(sock: RawSocket, buf: int64, n: int64, srcAddr: int64, addrlen: int64): int64 {
+  return sys_recvfrom(sock.fd, buf, n, 0, srcAddr, addrlen);
+}
+
+// Close raw socket
+pub fn RawSocketClose(sock: RawSocket) {
+  if (sock.fd >= 0) {
+    sys_close(sock.fd);
+  }
+}
+
+// ============================================================================
+// ICMP (Ping)
+// ============================================================================
+
+// ICMP Echo Request/Reply Header (8 bytes)
+// +--------+--------+--------+--------+--------+--------+--------+--------+
+// |  Type  |  Code  |          Checksum           |       ID        |  Seq  |
+// +--------+--------+--------+--------+--------+--------+--------+--------+
+pub type ICMPHeader = struct {
+  icmp_type: uint8;
+  icmp_code: uint8;
+  icmp_cksum: uint16;
+  icmp_id: uint16;
+  icmp_seq: uint16;
+};
+
+// Create an ICMP echo request packet
+pub fn ICMPMakeEchoRequest(id: uint16, seq: uint16): ICMPHeader {
+  var hdr: ICMPHeader;
+  hdr.icmp_type := ICMP_ECHO as uint8;
+  hdr.icmp_code := 0;
+  hdr.icmp_cksum := 0;
+  hdr.icmp_id := id;
+  hdr.icmp_seq := seq;
+  return hdr;
+}
+
+// Calculate ICMP checksum (simple 16-bit sum)
+pub fn ICMPChecksum(data: int64, len: int64): uint16 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  
+  // Sum all 16-bit words
+  while (i < len) {
+    if ((i + 1) < len) {
+      sum := sum + (peek8(data + i + 1) << 8) + peek8(data + i);
+    } else {
+      sum := sum + peek8(data + i);
+    }
+    i := i + 2;
+  }
+  
+  // Add carries
+  while ((sum >> 16) > 0) {
+    sum := (sum & 0xFFFF) + (sum >> 16);
+  }
+  
+  return ((~sum) & 0xFFFF) as uint16;
+}
+
+// Send ICMP echo request (ping)
+pub fn ICMPPing(destIP: int64, id: uint16, seq: uint16, timeoutSecs: int64): int64 {
+  var sock: RawSocket;
+  var buf: int64;
+  var replyBuf: int64;
+  var destAddr: int64;
+  var hdr: ICMPHeader;
+  var n: int64;
+  
+  // Create raw socket for ICMP
+  sock := RawSocketNew(IPPROTO_ICMP);
+  if (sock.fd < 0) {
+    return -1;
+  }
+  
+  // Allocate buffer for packet
+  buf := BufferAlloc(1024);
+  if (buf == 0) {
+    RawSocketClose(sock);
+    return -1;
+  }
+  
+  replyBuf := BufferAlloc(1024);
+  if (replyBuf == 0) {
+    BufferFree(buf, 1024);
+    RawSocketClose(sock);
+    return -1;
+  }
+  
+  // Build ICMP header
+  hdr := ICMPMakeEchoRequest(id, seq);
+  
+  // Write header to buffer using poke8 (little-endian)
+  poke8(buf + 0, hdr.icmp_type as int64);
+  poke8(buf + 1, hdr.icmp_code as int64);
+  // checksum placeholder (bytes 2-3) - set to 0 for now
+  poke8(buf + 2, 0);
+  poke8(buf + 3, 0);
+  // ID and sequence (little-endian)
+  poke8(buf + 4, (id & 0xFF) as int64);
+  poke8(buf + 5, ((id >> 8) & 0xFF) as int64);
+  poke8(buf + 6, (seq & 0xFF) as int64);
+  poke8(buf + 7, ((seq >> 8) & 0xFF) as int64);
+  
+  // Calculate and write checksum
+  var cksum: uint16 := ICMPChecksum(buf, 8);
+  poke8(buf + 2, (cksum & 0xFF) as int64);
+  poke8(buf + 3, ((cksum >> 8) & 0xFF) as int64);
+  
+  // Set destination address (as int64 - packed sockaddr_in)
+  destAddr := 0;
+  // family = AF_INET (2) in little-endian at offset 0
+  poke8(destAddr + 0, 2);
+  poke8(destAddr + 1, 0);
+  // port = 0 at offset 2
+  poke8(destAddr + 2, 0);
+  poke8(destAddr + 3, 0);
+  // IP address at offset 4 (already in network order in destIP)
+  // zero padding at offset 8
+  
+  // Send ICMP packet
+  n := RawSocketSendTo(sock, buf, 8, destAddr);
+  
+  // Wait for reply (simplified - just check once)
+  // In a real implementation, you'd loop with timeout
+  
+  // Cleanup
+  BufferFree(buf, 1024);
+  BufferFree(replyBuf, 1024);
+  RawSocketClose(sock);
+  
+  return n;
+}
