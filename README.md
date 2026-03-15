@@ -251,11 +251,14 @@ Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
 
 Optionen:
   -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)
+  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)
+  --std-path=PATH  Pfad zur Standardbibliothek überschreiben
   --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)
   --arch=ARCH      Architektur (x86_64, arm64, xtensa)
   --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
   --emit-asm       IR als Pseudo-Assembler ausgeben
   --dump-relocs    Relocations und externe Symbole anzeigen
+  --trace-imports  Import-Auflösung debuggen
   --lint           Linter-Warnungen aktivieren
   --lint-only      Nur linten, nicht kompilieren
   --no-lint        Linter-Warnungen deaktivieren
@@ -458,6 +461,76 @@ fn main(): int64 {
   PrintInt(TimesTwo(result));  // Output: 84
   return 0;
 }
+```
+
+#### Module Resolution
+
+The compiler resolves imports in the following order:
+
+| Priority | Search Location | Description |
+|----------|----------------|-------------|
+| 1 | Relative to importing file | Local modules in the same directory |
+| 2 | Project root | Working directory where compiler was invoked |
+| 3 | `-I` include paths | Custom paths specified via `-I` flag |
+| 4 | Standard library | System path (`./std/` or `/usr/lib/lyx/std/`) |
+
+**Reserved `std` Namespace:**
+
+Imports starting with `std.` are special: they skip local resolution and go directly to the standard library. This prevents accidental shadowing of standard modules:
+
+```lyx
+// Always loads from standard library, never local files
+import std.math;
+import std.io;
+import std.string;
+```
+
+#### Include Paths (`-I`)
+
+Use `-I` to add custom search paths for modules:
+
+```bash
+# Add external library path
+./lyxc main.lyx -o main -I /path/to/mylib -I /path/to/otherlib
+
+# Multiple -I flags are searched in order
+./lyxc main.lyx -I ./vendor -I ./lib
+```
+
+#### Debugging Import Resolution (`--trace-imports`)
+
+Use `--trace-imports` to debug module resolution issues:
+
+```bash
+./lyxc main.lyx --trace-imports
+```
+
+Output:
+```
+[TRACE] Resolving 'myhelper'...
+[TRACE]   -> Trying: ./myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /project/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /usr/lib/lyx/std/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Module NOT FOUND in any search path!
+
+[TRACE] Resolving 'std.io'...
+[TRACE]   Reserved prefix 'std' detected. Jumping to STD_PATH.
+[TRACE]   -> Trying: /usr/lib/lyx/std/io.lyx ... FOUND!
+```
+
+#### Standard Library Path
+
+The compiler searches for the standard library in this order:
+
+1. `LYX_STD_PATH` environment variable
+2. Relative to compiler binary: `../std/`
+3. System path: `/usr/lib/lyx/std/`
+4. Fallback: `./std/`
+
+Override with `--std-path`:
+
+```bash
+./lyxc main.lyx --std-path=/custom/path/to/std
 ```
 
 **Available Standard Library:**

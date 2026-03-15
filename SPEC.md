@@ -617,6 +617,89 @@ klare ABI-Regeln für dispatch
 Nur falls ihr wirklich “Java/Delphi-like” wollt. Sonst lasst es. Vererbung ist selten die Rendite, die sie verspricht.
 ---
 
+
+---
+
+## Module Resolution (v0.1.8+)
+
+Der Compiler löst Imports hierarchisch auf. Die Suchstrategie ermöglicht flexible Projektstrukturen und verhindert Namenskonflikte mit der Standardbibliothek.
+
+### Suchreihenfolge
+
+| Priorität | Suchort | Beschreibung |
+|-----------|---------|--------------|
+| 1 | Relativ zur importierenden Datei | Lokale Module im selben Verzeichnis |
+| 2 | Projekt-Root | Arbeitsverzeichnis, in dem der Compiler aufgerufen wurde |
+| 3 | `-I` Include-Pfade | Benutzerdefinierte Pfade via `-I` Flag (in Reihenfolge) |
+| 4 | Standardbibliothek | System-Pfad (`./std/`, `../std/` oder `/usr/lib/lyx/std/`) |
+
+### Reservierter `std` Namespace
+
+Imports, die mit `std.` beginnen, sind speziell: Sie überspringen die lokale Auflösung und gehen direkt zur Standardbibliothek. Dies verhindert versehentliches Shadowing von Standard-Modulen:
+
+```lyx
+// Lädt immer aus der Standardbibliothek, niemals lokale Dateien
+import std.math;
+import std.io;
+import std.string;
+```
+
+### Include-Pfade (`-I`)
+
+Verwende `-I` um benutzerdefinierte Suchpfade für Module hinzuzufügen:
+
+```bash
+# Externen Library-Pfad hinzufügen
+./lyxc main.lyx -o main -I /path/to/mylib -I /path/to/otherlib
+
+# Mehrere -I Flags werden in Reihenfolge durchsucht
+./lyxc main.lyx -I ./vendor -I ./lib
+```
+
+### Import-Auflösung debuggen (`--trace-imports`)
+
+Verwende `--trace-imports` um Probleme bei der Modul-Auflösung zu debuggen:
+
+```bash
+./lyxc main.lyx --trace-imports
+```
+
+Ausgabe:
+```
+[TRACE] Resolving 'myhelper'...
+[TRACE]   -> Trying: ./myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /project/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /usr/lib/lyx/std/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Module NOT FOUND in any search path!
+
+[TRACE] Resolving 'std.io'...
+[TRACE]   Reserved prefix 'std' detected. Jumping to STD_PATH.
+[TRACE]   -> Trying: /usr/lib/lyx/std/io.lyx ... FOUND!
+```
+
+### Standardbibliothek-Pfad
+
+Der Compiler sucht die Standardbibliothek in dieser Reihenfolge:
+
+1. `LYX_STD_PATH` Umgebungsvariable
+2. Relativ zum Compiler-Binary: `../std/`
+3. System-Pfad: `/usr/lib/lyx/std/`
+4. Fallback: `./std/`
+
+Überschreiben mit `--std-path`:
+
+```bash
+./lyxc main.lyx --std-path=/custom/path/to/std
+```
+
+### CLI-Optionen (Module)
+
+| Option | Beschreibung |
+|--------|--------------|
+| `-I <pfad>` | Include-Pfad für Module hinzufügen (mehrfach verwendbar) |
+| `--std-path=PATH` | Pfad zur Standardbibliothek überschreiben |
+| `--trace-imports` | Import-Auflösung debuggen |
+
 ## Beispiel: Arrays und Float-Literale (v0.1.3)
 
 ```lyx
