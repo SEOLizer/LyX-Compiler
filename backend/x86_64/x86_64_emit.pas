@@ -751,9 +751,53 @@ begin
                slotIdx := fn.LocalCount + instr.Dest;
                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
              end;
-           end;
+            end;
 
-         irConstInt:
+          irLoadLocalAddr:
+            begin
+              // Load address of local slot into temp: dest = &locals[Src1]
+              // Src1 is a local slot index (0..LocalCount-1)
+              // Dest is a temp index (needs fn.LocalCount added)
+              slotIdx := instr.Src1;
+              // lea rax, [rbp + SlotOffset(slotIdx)]
+              if (SlotOffset(slotIdx) >= -128) and (SlotOffset(slotIdx) <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $45); 
+                EmitU8(FCode, Byte(SlotOffset(slotIdx)));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $85);
+                EmitU32(FCode, Cardinal(SlotOffset(slotIdx)));
+              end;
+              // Store address into temp slot
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          irLoadStructAddr:
+            begin
+              // Load address of struct local (multiple slots) into temp: dest = &locals[Src1]
+              // Src1 is a local slot index (0..LocalCount-1)
+              // StructSize gives the total size in bytes
+              slotIdx := instr.Src1;
+              // lea rax, [rbp + SlotOffset(slotIdx)]
+              if (SlotOffset(slotIdx) >= -128) and (SlotOffset(slotIdx) <= 127) then
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $45); 
+                EmitU8(FCode, Byte(SlotOffset(slotIdx)));
+              end
+              else
+              begin
+                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $85);
+                EmitU32(FCode, Cardinal(SlotOffset(slotIdx)));
+              end;
+              // Store address into temp slot
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          irConstInt:
            begin
               // Load immediate integer into temp slot
               slotIdx := fn.LocalCount + instr.Dest;
