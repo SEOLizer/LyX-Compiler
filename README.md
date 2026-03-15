@@ -2001,6 +2001,7 @@ This software is licensed under the **Lyx Proprietary & Community License (LPCL)
 - **Free for**: Personal use and educational institutions
 - **Commercial use**: Requires a separate license agreement
 - **Forks/Modifications**: Allowed for non-commercial distribution only
+- **AI/ML Training**: Strictly prohibited without written permission
 
 See [LICENSE](LICENSE) for the full license text.
 
