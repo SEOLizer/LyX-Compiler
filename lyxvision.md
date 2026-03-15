@@ -48,6 +48,8 @@ TView                          ←── Basisklasse (alle Views erben hiervon)
 │
 ├── TStaticLine                ←── Horizontale/Vertikale Linie
 │
+├── TCluster                  ←── Basis für RadioButtons/Checkboxes
+│
 ├── TButton                    ←── Klickbare Schaltfläche
 │
 ├── TInputLine                ←── Eingabefeld
@@ -596,6 +598,10 @@ import std.lyxvision.types;           // Typen
 import std.lyxvision.consts;          // Konstanten
 import std.lyxvision.drivers;         // Treiber
 import std.lyxvision.view;            // View-Basis
+import std.lyxvision.group;           // Container
+import std.lyxvision.window;          // Fenster
+import std.lyxvision.dialog;          // Dialog
+import std.lyxvision.cluster;         // Cluster (RadioButtons/Checkboxes)
 import std.lyxvision.frame;           // Rahmen
 import std.lyxvision.statictext;      // Statischer Text
 import std.lyxvision.staticline;      // Linie
@@ -606,7 +612,42 @@ import std.lyxvision.terminal;        // Terminal
 
 ---
 
-## 20. TStaticText - Statischer Text (`std.lyxvision.statictext`)
+## 20. TCluster - Basis für RadioButtons/Checkboxes (`std.lyxvision.cluster`)
+
+TCluster ist die Basisklasse für RadioButtons und Checkboxes.
+
+### Typ
+
+```lyx
+pub type TCluster = class extends TView {
+  buttons: int64;
+  sel: int64;
+  enableMask: int64;
+  valueMask: int64;
+  
+  fn Init(cx, cy, cw, ch, numButtons) { ... }
+}
+```
+
+### TCluster Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `ClusterNew(x, y, w, h, numButtons)` | Erstellt Cluster |
+| `ClusterSetSelected(c, index)` | Setzt Auswahl |
+| `ClusterGetSelected(c)` | Gibt Auswahl zurück |
+| `ClusterMarkButton(c, index)` | Markiert Button |
+| `ClusterUnmarkButton(c, index)` | Entfernt Markierung |
+| `ClusterIsButtonMarked(c, index)` | Prüft Markierung |
+| `ClusterEnableButton(c, index)` | Aktiviert Button |
+| `ClusterDisableButton(c, index)` | Deaktiviert Button |
+| `ClusterIsButtonEnabled(c, index)` | Prüft Aktivierung |
+| `ClusterDraw(c)` | Zeichnet Cluster |
+| `ClusterPressButton(c, index)` | Button drücken |
+
+---
+
+## 21. TStaticText - Statischer Text (`std.lyxvision.statictext`)
 
 ### Typ
 
@@ -631,7 +672,7 @@ type TStaticText = struct {
 
 ---
 
-## 21. TStaticLine - Linie (`std.lyxvision.staticline`)
+## 22. TStaticLine - Linie (`std.lyxvision.staticline`)
 
 ### Linien-Typen
 
@@ -660,7 +701,7 @@ type TStaticText = struct {
 
 ---
 
-## 22. TButton - Schaltfläche (`std.lyxvision.button`)
+## 23. TButton - Schaltfläche (`std.lyxvision.button`)
 
 ### Button-Flags
 
@@ -686,7 +727,7 @@ type TStaticText = struct {
 
 ---
 
-## 23. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
+## 24. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
 
 ### InputLine-Optionen
 
@@ -718,7 +759,7 @@ type TStaticText = struct {
 
 ---
 
-## 24. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
+## 25. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
 
 ### Typ
 
@@ -766,7 +807,7 @@ type TTerminal = struct {
 
 ---
 
-## 25. Beispiel
+## 26. Beispiel
 
 ```lyx
 import std.lyxvision.main as lv;
@@ -795,7 +836,7 @@ fn main(): int64 {
 
 ---
 
-## 26. Systemabhängigkeiten
+## 27. Systemabhängigkeiten
 
 Das Framework verwendet ausschließlich Linux-Syscalls:
 - `write()` - Terminal-Ausgabe
@@ -805,22 +846,22 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 27. Geplante Module (TODO)
+## 28. Geplante Module (TODO)
 
 Diese Module sind noch nicht implementiert:
 
 - `std.lyxvision.listview` - TListView: Listenansicht
-- `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
 - `std.lyxvision.menu` - TMenuBar: Menüsystem
 - `std.lyxvision.app` - TApplication: Hauptanwendung
 - `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
 
-### Bereits implementiert (Sektionen 4-7):
+### Bereits implementiert (Sektionen 4-8):
 
 - `std.lyxvision.view` - TView: Basisklasse
 - `std.lyxvision.group` - TGroup: Container für Views
 - `std.lyxvision.window` - TWindow: Fenster mit Rahmen
 - `std.lyxvision.dialog` - TDialog: Modaler Dialog
+- `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
 
 ---
 
