@@ -527,6 +527,7 @@ var
   stackArgsCount: Integer;
   stackCleanup: Integer;
   disp32: Integer;
+  numSlots: Integer;
   // Global variable tracking
   globalVarNames: TStringList;
   globalVarOffsets: array of Integer;
@@ -648,6 +649,11 @@ begin
     // maxTemp is the highest temp index used, so we need maxTemp + 1 slots for temps
     totalSlots := fn.LocalCount + maxTemp + 1;
     
+    // For large struct returns, add one extra slot for the sret pointer
+    // The sret slot will be at index 'totalSlots' (before incrementing)
+    if fn.ReturnStructSize > 16 then
+      Inc(totalSlots);
+    
     // Stack-Frame für lokale Variablen und Temporaries
     if totalSlots > 0 then
     begin
@@ -659,8 +665,34 @@ begin
     end;
     
     // Spill incoming parameters into local slots (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
-    if fn.ParamCount > 0 then
+    // For large struct returns (>16 bytes), RDI contains the sret pointer
+    // We store it in the last slot (totalSlots - 1 after incrementing)
+    if fn.ReturnStructSize > 16 then
     begin
+      // Large struct return: sret pointer comes in RDI
+      // Store it in the last slot (totalSlots - 1)
+      WriteMovMemReg(FCode, RBP, SlotOffset(totalSlots - 1), RDI);
+      
+      // Actual parameters come in RSI, RDX, RCX, R8, R9 (shifted by 1)
+      // They still go into their normal slots 0, 1, 2, ...
+      for k := 0 to fn.ParamCount - 1 do
+      begin
+        slotIdx := k;
+        if k < 5 then
+          // Parameter came in register (shifted: RSI=param0, RDX=param1, etc.)
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), ParamRegs[k + 1])
+        else
+        begin
+          // Parameter was passed on stack (shifted by 1 position)
+          disp32 := 16 + (k - 5) * 8;
+          WriteMovRegMem(FCode, RAX, RBP, Integer(disp32));
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+        end;
+      end;
+    end
+    else if fn.ParamCount > 0 then
+    begin
+      // Normal function (no sret or small struct return)
       for k := 0 to fn.ParamCount - 1 do
       begin
         // Parameters go into slots 0, 1, 2, ... (first fn.ParamCount slots)
@@ -705,15 +737,63 @@ begin
         irReturnStruct:
         begin
           // Struct-Rückgabe - Src1 ist ein lokaler Slot-Index (nicht Temp!)
-          // SysV ABI: Structs ≤16 Bytes werden in RAX:RDX zurückgegeben
+          // SysV ABI: 
+          //   - Structs ≤16 Bytes: in RAX:RDX zurückgegeben
+          //   - Structs >16 Bytes: versteckter Pointer in RDI, Daten werden dorthin kopiert
           if instr.Src1 >= 0 then
           begin
-            // Erstes Quadword in RAX laden
-            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+            numSlots := (instr.StructSize + 7) div 8;
             
-            // Für Structs > 8 Bytes: zweites Quadword in RDX laden
-            if instr.StructSize > 8 then
-              WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1 + 1));
+            if instr.StructSize <= 16 then
+            begin
+              // Kleine Structs: RAX:RDX verwenden
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+              if instr.StructSize > 8 then
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1 + 1));
+            end
+            else
+            begin
+              // Große Structs: Versteckter sret-Pointer im letzten Slot
+              // Der Caller hat die Zieladresse in RDI übergeben und wir haben sie im sret-Slot gespeichert
+              // Der sret-Slot ist bei totalSlots - 1 (bevor wir für sret erhöht haben)
+              // Das entspricht fn.LocalCount + maxTemp + 1
+              // Da wir maxTemp beim Prolog berechnet haben, verwenden wir hier dieselbe Formel
+              // Hinweis: totalSlots wurde bereits für sret erhöht, also ist der Slot bei totalSlots - 1
+              
+              // Lade sret-Pointer aus dem sret-Slot nach R11 (scratch register)
+              WriteMovRegMem(FCode, R11, RBP, SlotOffset(totalSlots - 1));
+              
+              // Kopiere alle Slots
+              // WICHTIG: In Lyx wachsen Struct-Slots nach UNTEN (niedrigere Adressen für höhere Slot-Indices)
+              // Der sret-Pointer zeigt auf den ersten Slot (höchste Adresse im Struct)
+              // Wir müssen mit NEGATIVEN Offsets schreiben: [r11-0], [r11-8], [r11-16], ...
+              for k := 0 to numSlots - 1 do
+              begin
+                // Lade Quell-Slot in RAX
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1 + k));
+                // Speichere nach [R11 - k*8] (negative Offsets!)
+                // mov [r11 + disp], rax (wobei disp negativ ist)
+                EmitU8(FCode, $49); // REX.WB
+                EmitU8(FCode, $89); // MOV r/m64, r64
+                if k = 0 then
+                begin
+                  EmitU8(FCode, $03); // ModR/M: [r11], rax
+                end
+                else if k * 8 <= 128 then
+                begin
+                  EmitU8(FCode, $43); // ModR/M: [r11 + disp8], rax
+                  EmitU8(FCode, Byte(-k * 8));  // Negativer Offset als signed byte
+                end
+                else
+                begin
+                  EmitU8(FCode, $83); // ModR/M: [r11 + disp32], rax
+                  EmitU32(FCode, Cardinal(-k * 8));  // Negativer Offset als signed dword
+                end;
+              end;
+              
+              // Gib den sret-Pointer in RAX zurück (ABI requirement)
+              WriteMovRegReg(FCode, RAX, R11);
+            end;
           end;
           
           // Epilog
@@ -2733,8 +2813,11 @@ begin
            begin
              // Struct-returning function call (SysV ABI)
              // Dest is a LOCAL slot index (not temp!), StructSize gives size in bytes
-             // After call: RAX has first quadword, RDX has second (if StructSize > 8)
+             // SysV ABI:
+             //   - Structs ≤16 Bytes: returned in RAX:RDX
+             //   - Structs >16 Bytes: caller passes hidden pointer in RDI, callee writes there
              argCount := instr.ImmInt;
+             numSlots := (instr.StructSize + 7) div 8;
              
              // Get argument temps from ArgTemps array
              SetLength(argTemps, argCount);
@@ -2745,45 +2828,107 @@ begin
                  argTemps[k] := instr.ArgTemps[k];
              end;
              
-             // Ensure stack is 16-byte aligned before call
-             stackArgsCount := 0;
-             if argCount > 6 then
-               stackArgsCount := argCount - 6;
-             
-             if (stackArgsCount mod 2) = 1 then
+             // For large structs, we need to pass sret pointer as first argument
+             // This shifts all other arguments by one register
+             if instr.StructSize > 16 then
              begin
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $83);
-               EmitU8(FCode, $EC);
-               EmitU8(FCode, $08);  // sub rsp, 8
-             end;
-             
-             // Push extra args (beyond 6) in reverse order
-             for k := argCount - 1 downto 6 do
-             begin
-               if argTemps[k] >= 0 then
+               // Large struct: use sret ABI
+               // Ensure stack is 16-byte aligned before call
+               stackArgsCount := 0;
+               if argCount + 1 > 6 then  // +1 for hidden sret pointer
+                 stackArgsCount := argCount + 1 - 6;
+               
+               if (stackArgsCount mod 2) = 1 then
                begin
-                 slotIdx := fn.LocalCount + argTemps[k];
-                 WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
-                 EmitU8(FCode, $50);  // push rax
-               end
-               else
-               begin
-                 WriteMovRegImm64(FCode, RAX, 0);
-                 EmitU8(FCode, $50);  // push rax
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $83);
+                 EmitU8(FCode, $EC);
+                 EmitU8(FCode, $08);  // sub rsp, 8
                end;
-             end;
-             
-             // Load first 6 args into registers
-             for k := 0 to Min(argCount - 1, 5) do
-             begin
-               if argTemps[k] >= 0 then
+               
+               // Push extra args (beyond 5 now, since RDI is used for sret) in reverse order
+               for k := argCount - 1 downto 5 do
                begin
-                 slotIdx := fn.LocalCount + argTemps[k];
-                 WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
+                 if argTemps[k] >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + argTemps[k];
+                   WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                   EmitU8(FCode, $50);  // push rax
+                 end
+                 else
+                 begin
+                   WriteMovRegImm64(FCode, RAX, 0);
+                   EmitU8(FCode, $50);  // push rax
+                 end;
+               end;
+               
+               // Load sret pointer into RDI (address of destination struct)
+               // lea rdi, [rbp + SlotOffset(instr.Dest)]
+               if (SlotOffset(instr.Dest) >= -128) and (SlotOffset(instr.Dest) <= 127) then
+               begin
+                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $7D);
+                 EmitU8(FCode, Byte(SlotOffset(instr.Dest)));
                end
                else
-                 WriteMovRegImm64(FCode, ParamRegs[k], 0);
+               begin
+                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $BD);
+                 EmitU32(FCode, Cardinal(SlotOffset(instr.Dest)));
+               end;
+               
+               // Load args into RSI, RDX, RCX, R8, R9 (shifted by 1)
+               for k := 0 to Min(argCount - 1, 4) do
+               begin
+                 if argTemps[k] >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + argTemps[k];
+                   WriteMovRegMem(FCode, ParamRegs[k + 1], RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, ParamRegs[k + 1], 0);
+               end;
+             end
+             else
+             begin
+               // Small struct (≤16 bytes): standard ABI
+               stackArgsCount := 0;
+               if argCount > 6 then
+                 stackArgsCount := argCount - 6;
+               
+               if (stackArgsCount mod 2) = 1 then
+               begin
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $83);
+                 EmitU8(FCode, $EC);
+                 EmitU8(FCode, $08);  // sub rsp, 8
+               end;
+               
+               // Push extra args (beyond 6) in reverse order
+               for k := argCount - 1 downto 6 do
+               begin
+                 if argTemps[k] >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + argTemps[k];
+                   WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                   EmitU8(FCode, $50);  // push rax
+                 end
+                 else
+                 begin
+                   WriteMovRegImm64(FCode, RAX, 0);
+                   EmitU8(FCode, $50);  // push rax
+                 end;
+               end;
+               
+               // Load first 6 args into registers
+               for k := 0 to Min(argCount - 1, 5) do
+               begin
+                 if argTemps[k] >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + argTemps[k];
+                   WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, ParamRegs[k], 0);
+               end;
              end;
              
              // Emit call
@@ -2821,12 +2966,14 @@ begin
              // Dest is a LOCAL slot index (not temp!)
              if instr.Dest >= 0 then
              begin
-               // Store RAX to first slot
-               WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
-               
-               // For structs > 8 bytes, store RDX to second slot
-               if instr.StructSize > 8 then
-                 WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest + 1), RDX);
+               if instr.StructSize <= 16 then
+               begin
+                 // Small struct: copy from RAX:RDX
+                 WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+                 if instr.StructSize > 8 then
+                   WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest + 1), RDX);
+               end;
+               // For large structs, data is already written via sret pointer
              end;
            end;
             

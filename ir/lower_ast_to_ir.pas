@@ -284,6 +284,8 @@ var
   items: TAstExprList;
   vals: array of Int64;
   strIdx: Integer;
+  structIdx: Integer;
+  sd: TAstStructDecl;
 begin
   instr := Default(TIRInstr);
   // First pass: collect all struct, class, and global variable declarations
@@ -391,6 +393,18 @@ begin
         FTempCounter := 0;
        fn.ParamCount := Length(TAstFuncDecl(node).Params);
        fn.LocalCount := fn.ParamCount;
+       
+       // Calculate ReturnStructSize for struct-returning functions
+       fn.ReturnStructSize := 0;
+       if TAstFuncDecl(node).ReturnTypeName <> '' then
+       begin
+         structIdx := FStructTypes.IndexOf(TAstFuncDecl(node).ReturnTypeName);
+         if structIdx >= 0 then
+         begin
+           sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+           fn.ReturnStructSize := sd.Size;
+         end;
+       end;
        SetLength(FLocalTypes, fn.LocalCount);
        SetLength(FLocalConst, fn.LocalCount);
        for j := 0 to fn.ParamCount - 1 do
