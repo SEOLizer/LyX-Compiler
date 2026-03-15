@@ -1,64 +1,195 @@
-Lyx TUI Framework – Überarbeitetes
-Architekturkonzept (MVP)
-Dieses Dokument fasst die überarbeitete Architektur eines minimalen Terminal-UI-Frameworks für
-die Programmiersprache Lyx zusammen. Der Fokus liegt auf einem stabilen, deterministischen
-MVP für Linux x86_64 ohne Garbage Collector, mit explizitem Memory-Management und
-datenorientiertem Design.
-1. Designziele
-   Das Framework verfolgt bewusst ein reduziertes Ziel: ein stabiles, deterministisches
-   Core-TUI-Toolkit. Die Architektur vermeidet komplexe OOP-Hierarchien und setzt stattdessen auf
-   datenorientierte Strukturen, explizite Ownership und vorhersehbare Laufzeitkosten. Kernziele: -
-   deterministisches Memory-Management (kein GC) - minimaler Syscall-Footprint - effiziente
-   Terminal-Ausgabe (Diff-Rendering) - stabile Widget-Hierarchie - klar getrennte Render-, Layoutund Event-Phasen
-2. Architekturüberblick
-   Die Architektur basiert auf drei zentralen Konzepten: 1. Datenorientierte Widget-Struktur 2.
-   Parent-Owned Tree-Modell 3. Drei-Phasen-Laufzeitmodell Widgets bestehen aus: - Header
-   (Framework-Teil) - Props (Konfiguration) - State (mutierbarer Zustand) Render-Operationen sind
-   read-only, Events mutieren ausschließlich State.
-3. Datenstrukturen
-   Flache Datenstrukturen werden als Structs implementiert, um Cache-Lokalität zu erhalten.
-   Beispiele: Rect – Position und Größe eines Widgets Cell – einzelne Terminal-Zelle Style – visuelle
-   Darstellung Widget-spezifischer Zustand wird ebenfalls als Struct modelliert.
-4. Dirty-System
-   Zur effizienten Aktualisierung des Bildschirms wird ein abgestuftes Dirty-System verwendet. Level:
-   CLEAN – keine Änderung VISUAL – nur visuelle Aktualisierung notwendig LAYOUT – Größe oder
-   Position hat sich geändert CHILDREN – Struktur des Widget-Baums wurde verändert Dirty-Flags
-   propagieren entlang des Parent-Pfads nach oben.
-   Dirty-Level Bedeutung
-   CLEAN Keine Änderung
-   VISUAL Nur Render notwendig
-   LAYOUT Layout muss neu berechnet werden
-   CHILDREN Strukturänderung im Widget-Baum
-5. Widget Ownership-Modell
-   Widgets bilden einen Baum. Regeln: - jedes Widget hat maximal einen Parent - Parents besitzen
-   ihre Kinder - Entfernen eines Widgets löst nur die Parent-Beziehung (Detach) - Zerstörung erfolgt
-   explizit über dispose() Diese klare Ownership verhindert Dangling Pointer und Memory-Korruption.
-6. Lifecycle
-   Der Lebenszyklus eines Widgets folgt deterministischen Regeln. 1. Erstellung (new) 2. Einhängen
-   in den Widget-Baum 3. Event-Verarbeitung 4. Layout-Berechnung 5. Rendering 6. Entfernen aus
-   Baum (detach) 7. Freigabe des Speichers (dispose) Das Framework trennt bewusst
-   Strukturänderung und Speicherfreigabe.
-7. Drei-Phasen-Laufzeitmodell
-   Der Main-Loop arbeitet in drei strikt getrennten Phasen: Event Phase Input wird verarbeitet und
-   Widget-State wird aktualisiert. Layout Phase Widgets mit Layout-Dirty-Flag berechnen ihre Frames
-   neu. Render Phase Widgets schreiben ihre Darstellung in den Cell-Buffer. Render darf keine
-   Mutation durchführen.
-8. Rendering-System
-   Das Rendering basiert auf einem Double-Buffer-System. 1. Backbuffer wird neu berechnet 2. Diff
-   gegen Frontbuffer wird erstellt 3. Nur veränderte Regionen werden geschrieben Ziel: Minimierung
-   der Terminal-Bandbreite und der write()-Syscalls.
-9. Unicode-Strategie für MVP
-   Um Layout-Komplexität zu vermeiden unterstützt das MVP ausschließlich UTF■8 Zeichen mit
-   Breite 1. Nicht unterstützt im MVP: - Emoji - CJK Zeichen - komplexe Grapheme Cluster Nicht
-   unterstützte Zeichen werden durch ein Replacement-Zeichen ersetzt.
-10. MVP Widget Set
-    Der erste Release konzentriert sich auf ein extrem kleines Widget-Set. Widgets: Label Button Panel
-    Window Layouts: Row Column
-11. Systemabhängigkeiten
-    Das Runtime-System verwendet ausschließlich minimale Linux-Syscalls: read() write() ioctl()
-    nanosleep() Das Framework ist zunächst ausschließlich auf Linux x86_64 ausgelegt.
-12. Entwicklungs-Roadmap
-    Phase 1 – Core Runtime Memory-Layout, Syscall Layer, Cell Buffer Phase 2 – Widget Tree
-    Ownership, Tree Mutationen, Dirty-System Phase 3 – Layout Engine Row/Column Layout Phase 4
-    – Rendering Engine Diff Rendering und Region Tracking Phase 5 – Input System Keyboard und
-    Maus Dispatch
+# Lyx TUI Framework
+
+## Aktuelle Implementierung (v0.1.0)
+
+Dieses Dokument beschreibt die aktuelle implementierte Version des LyxVision TUI-Frameworks, die als Standardbibliothek (`std/lyxvision`) im Lyx Compiler enthalten ist.
+
+### 1. Architektur
+
+LyxVision basiert auf einem einfachen **Single-Buffer Terminal-UI-Modell** mit ANSI-Escape-Codes für die Bildschirmausgabe.
+
+### 2. Modul-Struktur
+
+Die LyxVision-Units sind im Unterordner `std/lyxvision/` organisiert:
+
+```
+std/lyxvision/
+  ├── main.lyx          # Haupt-Unit, re-exportiert Funktionen
+  ├── types.lyx         # Basis-Typen (TPoint, TRect, TEvent)
+  ├── consts.lyx        # Konstanten für State, Options, Flags
+  ├── drivers.lyx       # Terminal-Treiber (ANSI, Screen, Input)
+  └── view.lyx          # TView Basisstruktur
+```
+
+### 3. Verfügbare Typen
+
+#### Basis-Typen (`std.lyxvision.types`)
+
+```lyx
+type TPoint = struct {
+  x: int64;
+  y: int64;
+}
+
+type TRect = struct {
+  a: TPoint;
+  b: TPoint;
+}
+
+type TEvent = struct {
+  what: int64;
+  keyCode: int64;
+  mouseX: int64;
+  mouseY: int64;
+}
+```
+
+#### TView-Struktur (`std.lyxvision.view`)
+
+```lyx
+type TView = struct {
+  originX: int64;
+  originY: int64;
+  sizeX: int64;
+  sizeY: int64;
+  cursorX: int64;
+  cursorY: int64;
+  growMode: int64;
+  dragMode: int64;
+  helpCtx: int64;
+  state: int64;
+  options: int64;
+  ownerPtr: int64;
+  nextPtr: int64;
+  viewType: int64;
+}
+```
+
+### 4. State-Flags (`std.lyxvision.consts`)
+
+| Flag | Wert | Beschreibung |
+|------|------|--------------|
+| `sfVisible` | 1 | View ist sichtbar |
+| `sfCursorVis` | 2 | Cursor sichtbar |
+| `sfCursorIns` | 4 | Cursor im Insert-Modus |
+| `sfShadow` | 8 | Shadow sichtbar |
+| `sfActive` | 16 | View ist aktiv |
+
+### 5. Option-Flags (`std.lyxvision.consts`)
+
+| Flag | Wert | Beschreibung |
+|------|------|--------------|
+| `ofSelectable` | 1 | View kann selektiert werden |
+| `ofFirstClick` | 2 | Erster Klick geht an den View |
+| `ofFramed` | 4 | View hat Rahmen |
+
+### 6. Terminal-Treiber (`std.lyxvision.drivers`)
+
+Der Treiber stellt Low-Level-Funktionen für Terminal-Steuerung bereit:
+
+**Grundlegende Funktionen:**
+- `ClearScreen()` - Leert den Bildschirm
+- `ClearToEol()` - Leert bis Zeilenende
+- `MoveCursor(x, y)` - Positioniert Cursor
+- `HideCursor()` / `ShowCursor()` - Cursor sichtbar/unsichtbar
+
+**Farb-Funktionen:**
+- `SetForeground(color)` - Vordergrundfarbe
+- `SetBackground(color)` - Hintergrundfarbe
+- `SetColors(fg, bg)` - Beide Farben gleichzeitig
+- `ResetColors()` - Farben zurücksetzen
+
+**Zeichnungs-Funktionen:**
+- `FillRect(x1, y1, x2, y2)` - Rechteck füllen
+- `WriteStr(x, y, text)` - Text schreiben
+- `DrawBox(x1, y1, x2, y2)` - Box zeichnen
+
+**Input-Funktionen:**
+- `ReadKeyRaw()` - Rohes Tastaturlesen
+- `GetKeyEvent()` - Strukturiertes Tastatur-Event
+
+### 7. Hauptmodul (`std.lyxvision.main`)
+
+Das Hauptmodul re-exportiert Funktionen und bietet High-Level-APIs:
+
+**Initialisierung:**
+```lyx
+pub fn Init()           // LyxVision initialisieren
+pub fn Done()           // LyxVision beenden
+```
+
+**Event-Loop:**
+```lyx
+pub fn RunSimple()      // Einfacher Event-Loop (ESC oder 'q' zum Beenden)
+```
+
+**Wrapper-Funktionen:**
+- `SetColors(fg, bg)`
+- `FillRect(x1, y1, x2, y2)`
+- `WriteStr(x, y, s)`
+- `DrawBox(x1, y1, x2, y2)`
+- `ClearScreen()`, `ClearToEol()`
+- `MoveCursor(x, y)`, `HideCursor()`, `ShowCursor()`
+- `SetForeground(color)`, `SetBackground(color)`, `ResetColors()`
+- `GetKeyEvent()`
+
+### 8. Beispiel
+
+```lyx
+import std.lyxvision.main as lv;
+import std.lyxvision.consts;
+
+fn main(): int64 {
+  lv.Init();
+  
+  // Bildschirm vorbereiten
+  lv.SetColors(colorLightGray, colorBlue);
+  lv.FillRect(1, 1, 80, 24);
+  
+  // Titelleiste
+  lv.SetColors(colorBlack, colorLightGray);
+  lv.FillRect(1, 1, 80, 1);
+  lv.WriteStr(30, 1, " LyxVision Demo ");
+  
+  // Event-Loop
+  lv.RunSimple();
+  
+  // Beenden
+  lv.Done();
+  return 0;
+}
+```
+
+### 9. Import-Pfad
+
+Die Units werden über den `std`-Namespace importiert:
+
+```lyx
+import std.lyxvision.main as lv;      // Hauptmodul
+import std.lyxvision.types;           // Typen
+import std.lyxvision.consts;          // Konstanten
+import std.lyxvision.drivers;         // Treiber
+import std.lyxvision.view;            // View-Basis
+```
+
+### 10. Systemabhängigkeiten
+
+Das Framework verwendet ausschließlich Linux-Syscalls:
+- `write()` - Terminal-Ausgabe
+- `read()` - Tastatur-Eingabe
+- `ioctl()` - Terminal-Status
+- `nanosleep()` - Verzögerungen
+
+### 11. Dirty-System (Geplant für zukünftige Version)
+
+Das Dirty-System für effizientes Rendering ist **noch nicht implementiert**. Aktuell wird bei jeder Änderung der gesamte Bildschirm neu gezeichnet.
+
+Geplante Features:
+- `dirtyLevel` und `parentDirty` Felder in `TView`
+- `ViewMarkVisualDirty()`, `ViewMarkLayoutDirty()`, `ViewMarkChildrenDirty()`
+- `ViewIsDirty()`, `ViewGetDirtyLevel()`
+- Drei-Phasen-Laufzeitmodell (Event, Layout, Render)
+
+## Version
+
+Aktuelle Version: **0.1.0**
