@@ -42,7 +42,7 @@ TView                          ←── Basisklasse (alle Views erben hiervon)
 │   │
 │   └── TWindow                ←── Fenster mit Rahmen
 │       │
-│       └── TDialog            ←── Modaler Dialog (geplant)
+│       └── TDialog            ←── Modaler Dialog
 │
 ├── TStaticText                ←── Statischer Text
 │
@@ -205,7 +205,49 @@ pub type TWindow = class extends TGroup {
 
 ---
 
-## 7. TFrame (`std.lyxvision.frame`)
+## 7. TDialog (`std.lyxvision.dialog`) - MODALER DIALOG
+
+TDialog erweitert TWindow um modale Dialog-Funktionalitat.
+
+### Typ
+
+```lyx
+pub type TDialog = class extends TWindow {
+  modalResult: int64;
+  oldFocus: int64;
+  valid: int64;
+  
+  fn Init(dx, dy, dw, dh, title) { ... }
+}
+```
+
+### Modal Results
+
+| Konstante | Wert |
+|----------|------|
+| `mrNone` | 0 |
+| `mrOK` | 10 |
+| `mrCancel` | 11 |
+| `mrYes` | 12 |
+| `mrNo` | 13 |
+
+### TDialog Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `DialogNew(x, y, w, h, title)` | Erstellt Dialog |
+| `DialogNewCentered(w, h, title)` | Erstellt zentrierten Dialog |
+| `DialogSetModalResult(dlg, result)` | Setzt Modal-Result |
+| `DialogGetModalResult(dlg)` | Gibt Modal-Result zurück |
+| `DialogClose(dlg)` | Schließt Dialog |
+| `DialogExecute(dlg)` | Führt modalen Dialog aus |
+| `DialogIsValid(dlg)` | Prüft Gültigkeit |
+| `DialogSetValid(dlg, valid)` | Setzt Gültigkeit |
+| `DialogDraw(dlg)` | Zeichnet Dialog |
+
+---
+
+## 8. TFrame (`std.lyxvision.frame`)
 
 Fenster-Rahmen mit verschiedenen Stilen.
 
@@ -252,7 +294,7 @@ type TFrame = struct {
 
 ---
 
-## 8. Basis-Typen (`std.lyxvision.types`)
+## 9. Basis-Typen (`std.lyxvision.types`)
 
 ### TPoint - 2D-Koordinatenpunkt
 
@@ -265,7 +307,7 @@ type TPoint = struct {
 
 ---
 
-## 9. Event-System (`std.lyxvision.types`)
+## 10. Event-System (`std.lyxvision.types`)
 
 ### TEvent - Event-Struktur
 
@@ -372,7 +414,7 @@ type TEvent = struct {
 
 ---
 
-## 10. State-Flags (`std.lyxvision.consts`)
+## 11. State-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -391,7 +433,7 @@ type TEvent = struct {
 
 ---
 
-## 11. Option-Flags (`std.lyxvision.consts`)
+## 12. Option-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -410,7 +452,7 @@ type TEvent = struct {
 
 ---
 
-## 12. GrowMode-Flags (`std.lyxvision.consts`)
+## 13. GrowMode-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -424,7 +466,7 @@ type TEvent = struct {
 
 ---
 
-## 13. DragMode-Flags (`std.lyxvision.consts`)
+## 14. DragMode-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -438,7 +480,7 @@ type TEvent = struct {
 
 ---
 
-## 14. Dirty-Flags (`std.lyxvision.consts`)
+## 15. Dirty-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -449,7 +491,7 @@ type TEvent = struct {
 
 ---
 
-## 15. Farbkonstanten (`std.lyxvision.consts`)
+## 16. Farbkonstanten (`std.lyxvision.consts`)
 
 | Konstante | Wert | Farbe |
 |-----------|------|-------|
@@ -481,7 +523,7 @@ type TEvent = struct {
 
 ---
 
-## 16. Terminal-Treiber (`std.lyxvision.drivers`)
+## 17. Terminal-Treiber (`std.lyxvision.drivers`)
 
 Der Treiber stellt Low-Level-Funktionen für Terminal-Steuerung bereit:
 
@@ -508,7 +550,7 @@ Der Treiber stellt Low-Level-Funktionen für Terminal-Steuerung bereit:
 
 ---
 
-## 17. Hauptmodul (`std.lyxvision.main`)
+## 18. Hauptmodul (`std.lyxvision.main`)
 
 Das Hauptmodul re-exportiert Funktionen und bietet High-Level-APIs:
 
@@ -544,7 +586,7 @@ pub fn RunSimple()      // Einfacher Event-Loop (ESC oder 'q' zum Beenden)
 
 ---
 
-## 18. Import-Pfad
+## 19. Import-Pfad
 
 Die Units werden über den `std`-Namespace importiert:
 
@@ -564,7 +606,7 @@ import std.lyxvision.terminal;        // Terminal
 
 ---
 
-## 19. TStaticText - Statischer Text (`std.lyxvision.statictext`)
+## 20. TStaticText - Statischer Text (`std.lyxvision.statictext`)
 
 ### Typ
 
@@ -589,7 +631,7 @@ type TStaticText = struct {
 
 ---
 
-## 20. TStaticLine - Linie (`std.lyxvision.staticline`)
+## 21. TStaticLine - Linie (`std.lyxvision.staticline`)
 
 ### Linien-Typen
 
@@ -618,7 +660,7 @@ type TStaticText = struct {
 
 ---
 
-## 21. TButton - Schaltfläche (`std.lyxvision.button`)
+## 22. TButton - Schaltfläche (`std.lyxvision.button`)
 
 ### Button-Flags
 
@@ -644,7 +686,7 @@ type TStaticText = struct {
 
 ---
 
-## 22. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
+## 23. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
 
 ### InputLine-Optionen
 
@@ -676,7 +718,7 @@ type TStaticText = struct {
 
 ---
 
-## 23. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
+## 24. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
 
 ### Typ
 
@@ -724,7 +766,7 @@ type TTerminal = struct {
 
 ---
 
-## 24. Beispiel
+## 25. Beispiel
 
 ```lyx
 import std.lyxvision.main as lv;
@@ -753,7 +795,7 @@ fn main(): int64 {
 
 ---
 
-## 25. Systemabhängigkeiten
+## 26. Systemabhängigkeiten
 
 Das Framework verwendet ausschließlich Linux-Syscalls:
 - `write()` - Terminal-Ausgabe
@@ -763,22 +805,22 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 26. Geplante Module (TODO)
+## 27. Geplante Module (TODO)
 
 Diese Module sind noch nicht implementiert:
 
-- `std.lyxvision.dialog` - TDialog: Modale Dialoge
 - `std.lyxvision.listview` - TListView: Listenansicht
 - `std.lyxvision.cluster` - TCluster: Basis für RadioButtons/Checkboxes
 - `std.lyxvision.menu` - TMenuBar: Menüsystem
 - `std.lyxvision.app` - TApplication: Hauptanwendung
 - `std.lyxvision.textdevice` - TTextDevice: Text-Gerät
 
-### Bereits implementiert (Sektionen 4-6):
+### Bereits implementiert (Sektionen 4-7):
 
 - `std.lyxvision.view` - TView: Basisklasse
 - `std.lyxvision.group` - TGroup: Container für Views
 - `std.lyxvision.window` - TWindow: Fenster mit Rahmen
+- `std.lyxvision.dialog` - TDialog: Modaler Dialog
 
 ---
 
