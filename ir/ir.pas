@@ -142,6 +142,7 @@ type
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
     EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
+    ReturnStructSize: Integer; // size in bytes if function returns struct, 0 otherwise
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
