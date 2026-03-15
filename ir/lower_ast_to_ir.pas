@@ -995,6 +995,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
     errLbl: string;
+    // Nested field access
+    baseExpr: TAstExpr;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -2331,8 +2333,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkFieldAccess:
        begin
-         // Lower object
-         t1 := LowerExpr(TAstFieldAccess(expr).Obj);
+         // For nested field access like o.x.a, we need to find the root struct
+         // and use the combined offset. The Sema has already calculated the
+         // combined offset in FieldOffset.
+         
+         // Walk up the chain of field accesses to find the root (non-field) expression
+         baseExpr := TAstFieldAccess(expr).Obj;
+         while (baseExpr is TAstFieldAccess) do
+           baseExpr := TAstFieldAccess(baseExpr).Obj;
+         
+         // Now lower the root expression (e.g., 'o' in 'o.x.a')
+         t1 := LowerExpr(baseExpr);
          if t1 < 0 then
            Exit;
 
@@ -3164,6 +3175,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     structIdx: Integer;
     structSlots: Integer;
     slotCount: Integer;
+    // nested field access helpers
+    baseExpr: TAstExpr;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -3565,7 +3578,18 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     begin
       fa := TAstFieldAssign(stmt);
       // target is a TAstFieldAccess node
-      t1 := LowerExpr(fa.Target.Obj);
+      
+      // For nested field access like o.x.a, we need to find the root struct
+      // and use the combined offset. The Sema has already calculated the
+      // combined offset in fa.Target.FieldOffset.
+      
+      // Walk up the chain of field accesses to find the root (non-field) expression
+      baseExpr := fa.Target.Obj;
+      while (baseExpr is TAstFieldAccess) do
+        baseExpr := TAstFieldAccess(baseExpr).Obj;
+      
+      // Now lower the root expression (e.g., 'o' in 'o.x.a')
+      t1 := LowerExpr(baseExpr);
       if t1 < 0 then Exit(False);
       t2 := LowerExpr(fa.Value);
       if t2 < 0 then Exit(False);
