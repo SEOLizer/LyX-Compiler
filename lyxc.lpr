@@ -27,6 +27,9 @@ var
   flagLintOnly: Boolean;
   flagEnergyLevel: Integer;  // 0 = disabled, 1-5 = energy level
   flagOptimize: Boolean;  // IR optimizations default aktiviert
+  flagTraceImports: Boolean;  // --trace-imports Flag
+  includePaths: TStringList;  // -I Pfade
+  stdLibPath: string;  // --std-path
   lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
@@ -242,11 +245,14 @@ begin
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
+    WriteLn(StdErr, '  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)');
+    WriteLn(StdErr, '  --std-path=PATH  Pfad zur Standardbibliothek überschreiben');
     WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)');
     WriteLn(StdErr, '  --arch=ARCH      Architektur (x86_64, arm64, xtensa)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
+    WriteLn(StdErr, '  --trace-imports  Import-Auflösung debuggen');
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
     WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
     WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
@@ -262,6 +268,9 @@ begin
   flagLintOnly := False;
   flagEnergyLevel := 0;
   flagOptimize := True;  // IR optimizations enabled by default
+  flagTraceImports := False;
+  includePaths := TStringList.Create;
+  stdLibPath := '';
 
   // Parse command line arguments
   i := 1;
@@ -361,6 +370,27 @@ begin
     else if param = '--no-opt' then
     begin
       flagOptimize := False;
+      Inc(i);
+    end
+    else if param = '--trace-imports' then
+    begin
+      flagTraceImports := True;
+      Inc(i);
+    end
+    else if (param = '-I') and (i < ParamCount) then
+    begin
+      includePaths.Add(ParamStr(i + 1));
+      Inc(i, 2);
+    end
+    else if Copy(param, 1, 2) = '-I' then
+    begin
+      // -I/path/to/include (ohne Leerzeichen)
+      includePaths.Add(Copy(param, 3, MaxInt));
+      Inc(i);
+    end
+    else if Copy(param, 1, 11) = '--std-path=' then
+    begin
+      stdLibPath := Copy(param, 12, MaxInt);
       Inc(i);
     end
     else if Copy(param, 1, 16) = '--target-energy=' then
@@ -467,11 +497,23 @@ begin
         Halt(1);
       end;
 
-      // Phase 2: Lade alle Imports (UnitManager)
-      um := TUnitManager.Create(d);
-      try
-        um.AddSearchPath(basePath);
-        um.LoadAllImports(prog, basePath);
+        // Phase 2: Lade alle Imports (UnitManager)
+        um := TUnitManager.Create(d);
+        try
+          // Konfiguriere den UnitManager
+          um.SetSourceFile(inputFile);
+          um.SetProjectRoot(basePath);
+          um.SetTraceImports(flagTraceImports);
+          
+          // Optionaler Std-Lib-Pfad
+          if stdLibPath <> '' then
+            um.SetStdLibPath(stdLibPath);
+          
+          // Include-Pfade von -I hinzufügen
+          for i := 0 to includePaths.Count - 1 do
+            um.AddIncludePath(includePaths[i]);
+          
+          um.LoadAllImports(prog, inputFile);
 
         if d.HasErrors then
         begin
@@ -752,4 +794,7 @@ begin
   finally
     src.Free;
   end;
+  
+  // Cleanup
+  includePaths.Free;
 end.
