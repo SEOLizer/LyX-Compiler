@@ -700,9 +700,10 @@ begin
           else if node is TAstConDecl then
           begin
             con := TAstConDecl(node);
-            // Only import public constants
-            if not con.IsPublic then
-              Continue;
+            // Note: We must include ALL constants (including private ones) from imported units,
+            // because imported functions may use private constants internally.
+            // The visibility check (IsPublic) is only relevant for name resolution in the
+            // importing module - it should not affect code generation.
 
             // Check if constant already exists (avoid duplicates)
             if FConstMap.IndexOf(con.Name) >= 0 then
@@ -787,9 +788,10 @@ begin
           // Process function declarations
           else if node is TAstFuncDecl then
           begin
-            // Only lower public functions from imported units
-            if not TAstFuncDecl(node).IsPublic then
-              Continue;
+            // Note: We must include ALL functions (including private ones) from imported units,
+            // because public functions may call private helper functions.
+            // The visibility check (IsPublic) is only relevant for name resolution in the
+            // importing module - it should not affect code generation.
 
             // Skip if function already imported (avoid duplicate names from different units)
             // This can happen when wrapper functions in one unit call functions with the same name in another unit
@@ -1215,9 +1217,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               instr.Op := irMod;
 
             // Bitwise operators
-            tkBitAnd:   instr.Op := irAnd;
-            tkBitOr:    instr.Op := irOr;
-            tkBitXor:   instr.Op := irXor;
+            tkBitAnd:   instr.Op := irBitAnd;
+            tkBitOr:    instr.Op := irBitOr;
+            tkBitXor:   instr.Op := irBitXor;
             tkShiftLeft: instr.Op := irShl;
             tkShiftRight: instr.Op := irShr;
 

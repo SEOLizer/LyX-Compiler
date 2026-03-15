@@ -865,6 +865,103 @@ begin
              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
            end;
 
+         irBitAnd:
+           begin
+             // dest = src1 & src2 (bitwise AND)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+             // and rax, rcx
+             EmitRex(FCode, 1, 0, 0, 0);
+             EmitU8(FCode, $21);
+             EmitU8(FCode, $C8);  // and rax, rcx
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
+         irBitOr:
+           begin
+             // dest = src1 | src2 (bitwise OR)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+             // or rax, rcx
+             EmitRex(FCode, 1, 0, 0, 0);
+             EmitU8(FCode, $09);
+             EmitU8(FCode, $C8);  // or rax, rcx
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
+         irBitXor:
+           begin
+             // dest = src1 ^ src2 (bitwise XOR)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+             // xor rax, rcx
+             EmitRex(FCode, 1, 0, 0, 0);
+             EmitU8(FCode, $31);
+             EmitU8(FCode, $C8);  // xor rax, rcx
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
+         irBitNot:
+           begin
+             // dest = ~src1 (bitwise NOT)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             // not rax
+             EmitRex(FCode, 1, 0, 0, 0);
+             EmitU8(FCode, $F7);
+             EmitU8(FCode, $D0);  // not rax
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
+         irShl:
+           begin
+             // dest = src1 << src2 (left shift)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             if instr.Src2 >= 0 then
+             begin
+               // Shift amount in register
+               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+               // shl rax, cl (shift amount in CL register)
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $D3);
+               EmitU8(FCode, $E0);  // shl rax, cl
+             end
+             else
+             begin
+               // Shift amount is immediate in ImmInt (from strength reduction)
+               // shl rax, imm8
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $C1);
+               EmitU8(FCode, $E0);  // shl rax, imm8
+               EmitU8(FCode, instr.ImmInt and $FF);
+             end;
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
+         irShr:
+           begin
+             // dest = src1 >> src2 (arithmetic right shift for signed)
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             if instr.Src2 >= 0 then
+             begin
+               // Shift amount in register
+               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+               // sar rax, cl (arithmetic shift right, preserves sign)
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $D3);
+               EmitU8(FCode, $F8);  // sar rax, cl
+             end
+             else
+             begin
+               // Shift amount is immediate in ImmInt
+               // sar rax, imm8
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $C1);
+               EmitU8(FCode, $F8);  // sar rax, imm8
+               EmitU8(FCode, instr.ImmInt and $FF);
+             end;
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
          irCallBuiltin:
            begin
               // Builtin-Calls behandeln
@@ -1877,6 +1974,8 @@ begin
       offset := FLabelPositions[labelIdx].Pos - (FJumpPatches[i].Pos + 4);
       FCode.PatchU32LE(FJumpPatches[i].Pos, Cardinal(offset));
     end;
+    // Note: If labelIdx < 0, the function was not found. This should not happen
+    // if all imported functions (including private ones) are properly loaded.
   end;
   
   // FBranchPatches auflösen (für irJmp, irBrTrue, irBrFalse)
