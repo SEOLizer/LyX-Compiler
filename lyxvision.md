@@ -18,24 +18,241 @@ std/lyxvision/
   ├── types.lyx         # Basis-Typen (TPoint, TRect, TEvent)
   ├── consts.lyx        # Konstanten für State, Options, Flags, Dirty
   ├── drivers.lyx       # Terminal-Treiber (ANSI, Screen, Input)
-  ├── view.lyx          # TView Basisstruktur
-  ├── frame.lyx         # TFrame: Fenster-Rahmen
-  ├── statictext.lyx    # TStaticText: Statischer Text
-  ├── staticline.lyx    # TStaticLine: Horizontale/Vertikale Linie
-  ├── button.lyx        # TButton: Klickbare Schaltfläche
+  ├── view.lyx         # TView: Basisklasse für alle Views
+  ├── group.lyx        # TGroup: Container für Views (extends TView)
+  ├── window.lyx       # TWindow: Fenster mit Rahmen (extends TGroup)
+  ├── frame.lyx        # TFrame: Fenster-Rahmen
+  ├── statictext.lyx   # TStaticText: Statischer Text
+  ├── staticline.lyx   # TStaticLine: Horizontale/Vertikale Linie
+  ├── button.lyx       # TButton: Klickbare Schaltfläche
   ├── inputline.lyx    # TInputLine: Eingabefeld
   └── terminal.lyx     # TTerminal: Terminal-Emulation
 ```
 
 ---
 
-## 3. TFrame (`std.lyxvision.frame`)
+## 3. Klassen-Hierarchie (Vererbungsbaum)
 
-Fenster-Rahmen mit verschiedenen Stilen.
+Die folgende Übersicht zeigt die Vererbungsstruktur der LyxVision-Klassen:
+
+```
+TView                          ←── Basisklasse (alle Views erben hiervon)
+│
+├── TGroup                     ←── Container für Views
+│   │
+│   └── TWindow                ←── Fenster mit Rahmen
+│       │
+│       └── TDialog            ←── Modaler Dialog (geplant)
+│
+├── TStaticText                ←── Statischer Text
+│
+├── TStaticLine                ←── Horizontale/Vertikale Linie
+│
+├── TButton                    ←── Klickbare Schaltfläche
+│
+├── TInputLine                ←── Eingabefeld
+│
+├── TTerminal                 ←── Terminal-Emulation
+│
+├── TDesktop                  ←── Desktop (geplant)
+│
+└── TBackground               ←── Hintergrund (geplant)
+```
+
+### Vererbungsregeln
+
+- **TView** ist die Basisklasse aller sichtbaren Objekte
+- **TGroup** erweitert TView um Container-Funktionalität (Child-Views)
+- **TWindow** erweitert TGroup um Fenster-Funktionalität (Rahmen, Titel)
+- Alle anderen Komponenten erben direkt von TView
+
+### Syntax-Beispiel
+
+```lyx
+// Basisklasse
+pub type TView = class {
+  fn Init(x, y, w, h) { ... }
+};
+
+// Ableitung
+pub type TGroup = class extends TView {
+  fn Init(x, y, w, h) { ... }  // ruft super.Init() auf
+};
+
+// Instanziierung
+var win: TWindow := new TWindow();
+win.Init(10, 5, 60, 20, "Mein Fenster");
+```
 
 ---
 
-## 4. Basis-Typen (`std.lyxvision.types`)
+## 4. TView (`std.lyxvision.view`) - BASISKLASSE
+
+**TView** ist die Basisklasse für alle sichtbaren Objekte in LyxVision.
+
+```lyx
+pub type TView = class {
+  originX: int64;
+  originY: int64;
+  sizeX: int64;
+  sizeY: int64;
+  cursorX: int64;
+  cursorY: int64;
+  growMode: int64;
+  dragMode: int64;
+  helpCtx: int64;
+  state: int64;
+  options: int64;
+  ownerPtr: int64;
+  nextPtr: int64;
+  viewType: int64;
+  dirtyLevel: int64;
+  parentDirty: int64;
+  
+  fn Init(vx, vy, vw, vh) { ... }
+}
+```
+
+### View-Typen
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `vtView` | 0 | Basis-View |
+| `vtGroup` | 1 | Container |
+| `vtWindow` | 2 | Fenster |
+| `vtDialog` | 3 | Dialog |
+| `vtButton` | 4 | Button |
+| `vtInputLine` | 5 | Eingabefeld |
+| `vtDesktop` | 6 | Desktop |
+| `vtBackground` | 7 | Hintergrund |
+
+### TView Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `ViewCreate(ax, ay, bx, by)` | Erstellt View |
+| `ViewInitDirty(v)` | Initialisiert Dirty-Flags |
+| `ViewMarkVisualDirty(v)` | Markiert als visuell geändert |
+| `ViewMarkLayoutDirty(v)` | Markiert als Layout geändert |
+| `ViewMarkChildrenDirty(v)` | Markiert als strukturell geändert |
+| `ViewMarkClean(v)` | Markiert als sauber |
+| `ViewIsDirty(v)` | Prüft Dirty-Status |
+
+---
+
+## 5. TGroup (`std.lyxvision.group`) - CONTAINER
+
+**TGroup** ist ein Container für Views und erweitert TView.
+
+```lyx
+pub type TGroup = class extends TView {
+  firstChild: int64;
+  lastChild: int64;
+  current: int64;
+  buffer: int64;
+  bufferSize: int64;
+  focusChain: int64;
+  
+  fn Init(gx, gy, gw, gh) { ... }
+}
+```
+
+### TGroup Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `GroupNew(x, y, w, h)` | Erstellt neue Gruppe |
+| `GroupInsert(g, viewPtr)` | Fügt View hinzu |
+| `GroupRemove(g, viewPtr)` | Entfernt View |
+| `GroupDraw(g)` | Zeichnet Gruppe |
+| `GroupNext(g)` | Nächster fokussierbarer View |
+| `GroupPrev(g)` | Vorheriger fokussierbarer View |
+| `GroupSetCurrent(g, viewPtr)` | Setzt aktuellen View |
+| `GroupGetCurrent(g)` | Gibt aktuellen View zurück |
+| `GroupExecute(g)` | Event-Loop für Gruppe |
+| `GroupClear(g)` | Entfernt alle Children |
+| `GroupIsEmpty(g)` | Prüft ob leer |
+
+---
+
+## 6. TWindow (`std.lyxvision.window`) - FENSTER
+
+**TWindow** ist ein Fenster mit Rahmen und erweitert TGroup.
+
+```lyx
+pub type TWindow = class extends TGroup {
+  title: pchar;
+  frameHandle: int64;
+  zoomed: int64;
+  number: int64;
+  flags: int64;
+  
+  fn Init(wx, wy, ww, wh, title) { ... }
+}
+```
+
+### TWindow Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `WindowNew(x, y, w, h, title)` | Erstellt Fenster |
+| `WindowNewCentered(w, h, title)` | Erstellt zentriertes Fenster |
+| `WindowSetTitle(win, title)` | Setzt Titel |
+| `WindowGetTitle(win)` | Gibt Titel zurück |
+| `WindowZoom(win)` | Zoom-Toggle |
+| `WindowIsZoomed(win)` | Prüft Zoom-Status |
+| `WindowDraw(win)` | Zeichnet Fenster |
+
+---
+
+## 8. TFrame (`std.lyxvision.frame`)
+
+Fenster-Rahmen mit verschiedenen Stilen.
+
+### Typ
+
+```lyx
+type TFrame = struct {
+  originX: int64;
+  originY: int64;
+  sizeX: int64;
+  sizeY: int64;
+  cursorX: int64;
+  cursorY: int64;
+  growMode: int64;
+  dragMode: int64;
+  helpCtx: int64;
+  state: int64;
+  options: int64;
+  ownerPtr: int64;
+  nextPtr: int64;
+  viewType: int64;
+  dirtyLevel: int64;
+  parentDirty: int64;
+  frameStyle: int64;
+}
+```
+
+### Rahmen-Stile
+
+| Konstante | Wert | Beschreibung |
+|----------|------|--------------|
+| `frThin` | 0 | Dünner Rahmen (ASCII) |
+| `frDouble` | 1 | Doppelter Rahmen |
+| `frBox` | 2 | Einfacher Rahmen |
+
+### Funktionen
+
+| Funktion | Beschreibung |
+|----------|---------------|
+| `FrameCreate(x, y, w, h)` | Erstellt Rahmen |
+| `FrameSetStyle(f, style)` | Setzt Rahmen-Stil |
+| `FrameDraw(f)` | Zeichnet Rahmen |
+| `FrameDrawTitle(f, title, color)` | Zeichnet Rahmen mit Titel |
+
+---
+
+## 9. Basis-Typen (`std.lyxvision.types`)
 
 ### TPoint - 2D-Koordinatenpunkt
 
@@ -48,7 +265,7 @@ type TPoint = struct {
 
 ---
 
-## 5. Event-System (`std.lyxvision.types`)
+## 10. Event-System (`std.lyxvision.types`)
 
 ### TEvent - Event-Struktur
 
@@ -155,138 +372,7 @@ type TEvent = struct {
 
 ---
 
-## 6. TView-Struktur (`std.lyxvision.view`)
-
-### TView - Basis-Struktur für alle sichtbaren Objekte
-
-```lyx
-type TView = struct {
-  // Geometrie
-  originX: int64;    // X-Position (Spalte)
-  originY: int64;    // Y-Position (Zeile)
-  sizeX: int64;      // Breite
-  sizeY: int64;      // Höhe
-  cursorX: int64;    // Cursor-Position X
-  cursorY: int64;    // Cursor-Position Y
-  
-  // Verhalten
-  growMode: int64;   // Resize-Verhalten
-  dragMode: int64;   // Drag-Verhalten
-  helpCtx: int64;    // Help-Kontext
-  
-  // Status
-  state: int64;      // State-Flags (sfXxx)
-  options: int64;    // Option-Flags (ofXxx)
-  
-  // Hierarchie (als int64 Pointer-Werte)
-  ownerPtr: int64;   // Zeiger auf Owner
-  nextPtr: int64;    // Zeiger auf nächsten View
-  
-  // View-Typ für Dispatch
-  viewType: int64;   // vtXxx
-  
-  // Dirty-Management
-  dirtyLevel: int64;    // 0=clean, 1=visual, 2=layout, 3=children
-  parentDirty: int64;    // Vererbter Dirty-Status
-}
-```
-
-### View-Typen
-
-| Konstante | Wert | Beschreibung |
-|----------|------|--------------|
-| `vtView` | 0 | Basis-View |
-| `vtGroup` | 1 | Container |
-| `vtWindow` | 2 | Fenster |
-| `vtDialog` | 3 | Dialog |
-| `vtButton` | 4 | Schaltfläche |
-| `vtInputLine` | 5 | Eingabefeld |
-| `vtDesktop` | 6 | Desktop |
-| `vtBackground` | 7 | Hintergrund |
-
-### TView Funktionen
-
-**Konstruktor:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewCreate(ax, ay, bx, by)` | Erstellt einen neuen View |
-
-**Geometrie:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewGetBounds(v)` | Gibt Bounds als TRect zurück |
-| `ViewSetBounds(v, r)` | Setzt Bounds aus TRect |
-| `ViewMoveTo(v, x, y)` | Verschiebt View |
-| `ViewGrowTo(v, w, h)` | Ändert Größe |
-
-**Sichtbarkeit:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewIsVisible(v)` | Prüft Sichtbarkeit |
-| `ViewShow(v)` | Zeigt View |
-| `ViewHide(v)` | Versteckt View |
-
-**Fokus:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewIsFocused(v)` | Prüft Fokus |
-| `ViewFocus(v)` | Setzt Fokus |
-| `ViewUnfocus(v)` | Entfernt Fokus |
-
-**State:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewSetState(v, state, enable)` | Setzt/Entfernt State-Flag |
-| `ViewGetState(v, state)` | Prüft State-Flag |
-
-**Koordinaten:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewMakeLocalX(v, globalX)` | Konvertiert globale X nach lokal |
-| `ViewMakeLocalY(v, globalY)` | Konvertiert globale Y nach lokal |
-| `ViewMakeGlobalX(v, localX)` | Konvertiert lokale X nach global |
-| `ViewMakeGlobalY(v, localY)` | Konvertiert lokale Y nach global |
-| `ViewContainsPoint(v, x, y)` | Prüft ob Punkt im View |
-
-**Cursor:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewSetCursor(v, x, y)` | Setzt Cursor-Position |
-| `ViewShowCursor(v)` | Zeigt Cursor |
-| `ViewHideCursor(v)` | Versteckt Cursor |
-
-**Zeichnen:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewDrawFrame(v, fg, bg)` | Zeichnet Rahmen |
-| `ViewFillBackground(v, fg, bg)` | Füllt Hintergrund |
-| `ViewWriteStr(v, x, y, s)` | Schreibt Text |
-| `ViewWriteStrAttr(v, x, y, s, fg, bg)` | Schreibt Text mit Farben |
-
-**GrowMode:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewCalcBounds(v, dx, dy)` | Berechnet neue Bounds bei Resize |
-
-**Dirty-Management:**
-| Funktion | Beschreibung |
-|----------|---------------|
-| `ViewInitDirty(v)` | Initialisiert Dirty-Flags |
-| `ViewSetDirtyLevel(v, level)` | Setzt Dirty-Level |
-| `ViewMarkVisualDirty(v)` | Markiert als visuell geändert |
-| `ViewMarkLayoutDirty(v)` | Markiert als Layout geändert |
-| `ViewMarkChildrenDirty(v)` | Markiert als Struktur geändert |
-| `ViewMarkClean(v)` | Markiert als sauber |
-| `ViewIsDirty(v)` | Prüft ob Update nötig |
-| `ViewGetDirtyLevel(v)` | Gibt Dirty-Level zurück |
-| `ViewNeedsLayout(v)` | Prüft ob Layout-Update nötig |
-| `ViewNeedsChildrenUpdate(v)` | Prüft ob Children-Update nötig |
-| `ViewInheritDirtyFromParent(v, parentDirty)` | Erbt Dirty-Status |
-| `ViewResetInheritedDirty(v)` | Setzt vererbten Status zurück |
-
----
-
-## 6. State-Flags (`std.lyxvision.consts`)
+## 11. State-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -305,7 +391,7 @@ type TView = struct {
 
 ---
 
-## 7. Option-Flags (`std.lyxvision.consts`)
+## 12. Option-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -324,7 +410,7 @@ type TView = struct {
 
 ---
 
-## 8. GrowMode-Flags (`std.lyxvision.consts`)
+## 13. GrowMode-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -338,7 +424,7 @@ type TView = struct {
 
 ---
 
-## 9. DragMode-Flags (`std.lyxvision.consts`)
+## 14. DragMode-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -352,7 +438,7 @@ type TView = struct {
 
 ---
 
-## 10. Dirty-Flags (`std.lyxvision.consts`)
+## 15. Dirty-Flags (`std.lyxvision.consts`)
 
 | Flag | Wert | Beschreibung |
 |------|------|--------------|
@@ -363,7 +449,7 @@ type TView = struct {
 
 ---
 
-## 11. Farbkonstanten (`std.lyxvision.consts`)
+## 16. Farbkonstanten (`std.lyxvision.consts`)
 
 | Konstante | Wert | Farbe |
 |-----------|------|-------|
@@ -395,7 +481,7 @@ type TView = struct {
 
 ---
 
-## 12. Terminal-Treiber (`std.lyxvision.drivers`)
+## 17. Terminal-Treiber (`std.lyxvision.drivers`)
 
 Der Treiber stellt Low-Level-Funktionen für Terminal-Steuerung bereit:
 
@@ -422,7 +508,7 @@ Der Treiber stellt Low-Level-Funktionen für Terminal-Steuerung bereit:
 
 ---
 
-## 13. Hauptmodul (`std.lyxvision.main`)
+## 18. Hauptmodul (`std.lyxvision.main`)
 
 Das Hauptmodul re-exportiert Funktionen und bietet High-Level-APIs:
 
@@ -458,7 +544,7 @@ pub fn RunSimple()      // Einfacher Event-Loop (ESC oder 'q' zum Beenden)
 
 ---
 
-## 14. Import-Pfad
+## 19. Import-Pfad
 
 Die Units werden über den `std`-Namespace importiert:
 
@@ -478,52 +564,7 @@ import std.lyxvision.terminal;        // Terminal
 
 ---
 
-## 15. TFrame - Fenster-Rahmen (`std.lyxvision.frame`)
-
-### Typ
-
-```lyx
-type TFrame = struct {
-  originX: int64;
-  originY: int64;
-  sizeX: int64;
-  sizeY: int64;
-  cursorX: int64;
-  cursorY: int64;
-  growMode: int64;
-  dragMode: int64;
-  helpCtx: int64;
-  state: int64;
-  options: int64;
-  ownerPtr: int64;
-  nextPtr: int64;
-  viewType: int64;
-  dirtyLevel: int64;
-  parentDirty: int64;
-  frameStyle: int64;
-}
-```
-
-### Rahmen-Stile
-
-| Konstante | Wert | Beschreibung |
-|----------|------|--------------|
-| `frThin` | 0 | Dünner Rahmen (ASCII) |
-| `frDouble` | 1 | Doppelter Rahmen |
-| `frBox` | 2 | Einfacher Rahmen |
-
-### Funktionen
-
-| Funktion | Beschreibung |
-|----------|---------------|
-| `FrameCreate(x, y, w, h)` | Erstellt Rahmen |
-| `FrameSetStyle(f, style)` | Setzt Rahmen-Stil |
-| `FrameDraw(f)` | Zeichnet Rahmen |
-| `FrameDrawTitle(f, title, color)` | Zeichnet Rahmen mit Titel |
-
----
-
-## 16. TStaticText - Statischer Text (`std.lyxvision.statictext`)
+## 21. TStaticText - Statischer Text (`std.lyxvision.statictext`)
 
 ### Typ
 
@@ -548,7 +589,7 @@ type TStaticText = struct {
 
 ---
 
-## 17. TStaticLine - Linie (`std.lyxvision.staticline`)
+## 22. TStaticLine - Linie (`std.lyxvision.staticline`)
 
 ### Linien-Typen
 
@@ -577,7 +618,7 @@ type TStaticText = struct {
 
 ---
 
-## 18. TButton - Schaltfläche (`std.lyxvision.button`)
+## 23. TButton - Schaltfläche (`std.lyxvision.button`)
 
 ### Button-Flags
 
@@ -603,7 +644,7 @@ type TStaticText = struct {
 
 ---
 
-## 19. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
+## 24. TInputLine - Eingabefeld (`std.lyxvision.inputline`)
 
 ### InputLine-Optionen
 
@@ -635,7 +676,7 @@ type TStaticText = struct {
 
 ---
 
-## 20. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
+## 25. TTerminal - Terminal-Emulation (`std.lyxvision.terminal`)
 
 ### Typ
 
@@ -683,7 +724,7 @@ type TTerminal = struct {
 
 ---
 
-## 21. Beispiel
+## 26. Beispiel
 
 ```lyx
 import std.lyxvision.main as lv;
@@ -712,7 +753,7 @@ fn main(): int64 {
 
 ---
 
-## 22. Systemabhängigkeiten
+## 27. Systemabhängigkeiten
 
 Das Framework verwendet ausschließlich Linux-Syscalls:
 - `write()` - Terminal-Ausgabe
@@ -722,7 +763,7 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 23. Geplante Module (TODO)
+## 28. Geplante Module (TODO)
 
 Diese Module sind noch nicht implementiert:
 
