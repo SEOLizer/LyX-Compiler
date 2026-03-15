@@ -1725,11 +1725,42 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
            for i := 0 to argCount - 1 do
              instr.ArgTemps[i] := argTemps[i];
            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-           Emit(instr);
-           Result := t0;
-         end
-         // Buffer/primitive calls
-         else if call.Name = 'buf_put_byte' then
+            Emit(instr);
+            Result := t0;
+          end
+          // === mmap/munmap for memory allocation ===
+          else if call.Name = 'mmap' then
+          begin
+            // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'mmap';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if call.Name = 'munmap' then
+          begin
+            // munmap(addr, length) -> int64
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'munmap';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Buffer/primitive calls
+          else if call.Name = 'buf_put_byte' then
         begin
           // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
           t0 := NewTemp;
