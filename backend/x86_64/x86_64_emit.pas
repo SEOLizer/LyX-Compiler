@@ -253,6 +253,63 @@ begin
     EmitU32(buf, Cardinal(disp));
 end;
 
+procedure WriteMovzxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movzx r64, byte ptr [base+disp32] : rex.w 0F B6 /r with mod=10
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $B6);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovzxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movzx r64, word ptr [base+disp32] : rex.w 0F B7 /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $B7);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem8(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsx r64, byte ptr [base+disp32] : rex.w 0F BE /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $BE);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem16(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsx r64, word ptr [base+disp32] : rex.w 0F BF /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $0F);
+  EmitU8(buf, $BF);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovSxRegMem32(buf: TByteBuffer; dstReg: Byte; baseReg: Byte; disp32: Integer);
+begin
+  // movsxd r64, dword ptr [base+disp32] : rex.w 63 /r
+  EmitU8(buf, $48);
+  EmitU8(buf, $63);
+  EmitU8(buf, $80 or ((dstReg shl 3) and $38) or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
+procedure WriteMovEAXMem32(buf: TByteBuffer; baseReg: Byte; disp32: Integer);
+begin
+  // mov eax, dword ptr [base+disp32] : 8B 85 disp32 (implicitly zero-extends to rax)
+  EmitU8(buf, $8B);
+  EmitU8(buf, $85 or (baseReg and $7));
+  EmitU32(buf, Cardinal(disp32));
+end;
+
 function SlotOffset(slot: Integer): Integer;
 begin
   Result := -8 * (slot + 1);
@@ -856,6 +913,41 @@ begin
                WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));
                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
              end;
+
+          irSExt:
+            begin
+              // Sign-extend src1 (width in ImmInt) into dest
+              // Load source value and sign-extend to 64 bits
+              slotIdx := fn.LocalCount + instr.Src1;
+              case instr.ImmInt of
+                8: WriteMovSxRegMem8(FCode, RAX, RBP, SlotOffset(slotIdx));
+                16: WriteMovSxRegMem16(FCode, RAX, RBP, SlotOffset(slotIdx));
+                32: WriteMovSxRegMem32(FCode, RAX, RBP, SlotOffset(slotIdx));
+              else
+                // Already 64-bit or unknown width, just copy
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+              end;
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+
+          irZExt:
+            begin
+              // Zero-extend src1 (width in ImmInt) into dest
+              slotIdx := fn.LocalCount + instr.Src1;
+              case instr.ImmInt of
+                8: WriteMovzxRegMem8(FCode, RAX, RBP, SlotOffset(slotIdx));
+                16: WriteMovzxRegMem16(FCode, RAX, RBP, SlotOffset(slotIdx));
+                32:
+                  begin
+                    // mov eax, dword ptr [base+disp] zero-extends into rax implicitly
+                    WriteMovEAXMem32(FCode, RBP, SlotOffset(slotIdx));
+                  end;
+              else
+                // Already 64-bit or unknown width, just copy
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+              end;
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
              
           irAlloc:
             begin
