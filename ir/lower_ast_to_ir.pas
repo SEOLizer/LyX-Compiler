@@ -1555,106 +1555,181 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (call.Name = 'chmod') or
-                ((call.Namespace = 'IO') and (call.Name = 'chmod')) then
-        begin
-          // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'chmod';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'ioctl') or
-                ((call.Namespace = 'IO') and (call.Name = 'ioctl')) then
-        begin
-          // ioctl(fd: int64, request: int64, argp: int64) -> int64
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'ioctl';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'mmap') or
-                ((call.Namespace = 'IO') and (call.Name = 'mmap')) then
-        begin
-          // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'mmap';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'munmap') or
-                ((call.Namespace = 'IO') and (call.Name = 'munmap')) then
-        begin
-          // munmap(addr: int64, length: int64) -> int64
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'munmap';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'Random') or
-                ((call.Namespace = 'Math') and (call.Name = 'Random')) then
-        begin
-          // Random() -> int64: returns pseudo-random number
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'Random';
-          instr.ImmInt := 0;
-          SetLength(instr.ArgTemps, 0);
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'RandomSeed') or
-                ((call.Namespace = 'Math') and (call.Name = 'RandomSeed')) then
-        begin
-          // RandomSeed(seed) -> void: sets the random seed
-          instr.Op := irCallBuiltin;
-          instr.Dest := -1;
-          instr.ImmStr := 'RandomSeed';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then
-            instr.Src1 := argTemps[0]
-          else
-            instr.Src1 := -1;
-          Emit(instr);
-          Result := -1;
-        end
-        else if call.Name = 'buf_put_byte' then
+         else if (call.Name = 'chmod') or
+                 ((call.Namespace = 'IO') and (call.Name = 'chmod')) then
+         begin
+           // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'chmod';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         // === Socket System Calls (for std.net) ===
+         else if call.Name = 'sys_socket' then
+         begin
+           // sys_socket(domain: int64, type: int64, protocol: int64) -> int64
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_socket';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_bind' then
+         begin
+           // sys_bind(sockfd, addr, addrlen) -> int64
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_bind';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_listen' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_listen';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_accept' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_accept';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_connect' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_connect';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_recvfrom' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_recvfrom';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_sendto' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_sendto';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_setsockopt' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_setsockopt';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_getsockopt' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_getsockopt';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_fcntl' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_fcntl';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_shutdown' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_shutdown';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         // Buffer/primitive calls
+         else if call.Name = 'buf_put_byte' then
         begin
           // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
           t0 := NewTemp;

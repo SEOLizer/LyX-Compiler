@@ -1283,17 +1283,147 @@ begin
   s.ParamTypes[0] := atPChar;
   AddSymbolToCurrent(s, NullSpan);
 
-  // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
-  s := TSymbol.Create('chmod');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 2;
-  SetLength(s.ParamTypes, 2);
-  s.ParamTypes[0] := atPChar;
-  s.ParamTypes[1] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
+   // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+   s := TSymbol.Create('chmod');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atPChar;
+   s.ParamTypes[1] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
 
-  // Buffer/runtime primitives for time formatter
+   // === Socket System Calls (for std.net) ===
+   // sys_socket(domain: int64, type: int64, protocol: int64) -> int64
+   s := TSymbol.Create('sys_socket');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_bind(sockfd: int64, addr: Pointer, addrlen: int64) -> int64
+   s := TSymbol.Create('sys_bind');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_listen(sockfd: int64, backlog: int64) -> int64
+   s := TSymbol.Create('sys_listen');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_accept(sockfd: int64, addr: Pointer, addrlen: Pointer) -> int64
+   s := TSymbol.Create('sys_accept');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;  // Pointer as int64
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_connect(sockfd: int64, addr: Pointer, addrlen: int64) -> int64
+   s := TSymbol.Create('sys_connect');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) -> int64
+   s := TSymbol.Create('sys_recvfrom');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 6;
+   SetLength(s.ParamTypes, 6);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;
+   s.ParamTypes[4] := atInt64;  // Pointer
+   s.ParamTypes[5] := atInt64;  // Pointer
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_sendto(sockfd, buf, len, flags, dest_addr, addrlen) -> int64
+   s := TSymbol.Create('sys_sendto');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 6;
+   SetLength(s.ParamTypes, 6);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;
+   s.ParamTypes[4] := atInt64;  // Pointer
+   s.ParamTypes[5] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_setsockopt(sockfd, level, optname, optval, optlen) -> int64
+   s := TSymbol.Create('sys_setsockopt');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 5;
+   SetLength(s.ParamTypes, 5);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;  // Pointer
+   s.ParamTypes[4] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_getsockopt(sockfd, level, optname, optval, optlen) -> int64
+   s := TSymbol.Create('sys_getsockopt');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 5;
+   SetLength(s.ParamTypes, 5);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;  // Pointer
+   s.ParamTypes[4] := atInt64;  // Pointer
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_fcntl(fd, cmd, arg) -> int64
+   s := TSymbol.Create('sys_fcntl');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_shutdown(sockfd, how) -> int64
+   s := TSymbol.Create('sys_shutdown');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // Buffer/runtime primitives for time formatter
   // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
   // buf kann entweder pchar oder int64 (Pointer) sein
   s := TSymbol.Create('buf_put_byte');

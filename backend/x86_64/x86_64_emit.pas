@@ -120,6 +120,31 @@ const
   SYS_MACOS_NANOSLEEP = $20000F0; // sys_nanosleep (240)
   SYS_MACOS_GETTIMEOFDAY = $2000074; // sys_gettimeofday (116)
 
+  // Linux Syscall-Nummern (x86_64 ABI)
+  SYS_LINUX_EXIT    = 60;   // sys_exit
+  SYS_LINUX_READ    = 0;    // sys_read
+  SYS_LINUX_WRITE   = 1;    // sys_write
+  SYS_LINUX_OPEN    = 2;    // sys_open
+  SYS_LINUX_CLOSE   = 3;    // sys_close
+  SYS_LINUX_MMAP    = 9;    // sys_mmap
+  SYS_LINUX_MUNMAP  = 11;   // sys_munmap
+  SYS_LINUX_LSEEK   = 8;    // sys_lseek
+  SYS_LINUX_UNLINK  = 87;   // sys_unlink
+  SYS_LINUX_MKDIR   = 83;   // sys_mkdir
+  SYS_LINUX_RMDIR   = 84;   // sys_rmdir
+  SYS_LINUX_CHMOD   = 90;   // sys_chmod
+  SYS_LINUX_SOCKET  = 41;   // sys_socket
+  SYS_LINUX_BIND    = 49;   // sys_bind
+  SYS_LINUX_LISTEN  = 50;   // sys_listen
+  SYS_LINUX_ACCEPT  = 43;   // sys_accept
+  SYS_LINUX_CONNECT = 42;   // sys_connect
+  SYS_LINUX_RECVFROM = 45;  // sys_recvfrom
+  SYS_LINUX_SENDTO  = 44;   // sys_sendto
+  SYS_LINUX_SETSOCKOPT = 54;  // sys_setsockopt
+  SYS_LINUX_GETSOCKOPT = 55;  // sys_getsockopt
+  SYS_LINUX_FCNTL   = 72;   // sys_fcntl
+  SYS_LINUX_SHUTDOWN = 48;  // sys_shutdown
+
 { Hilfsfunktionen für x86_64 Encoding }
 
 procedure EmitU8(b: TByteBuffer; v: Byte);
@@ -1379,44 +1404,529 @@ begin
                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                end;
               end
-              else if instr.ImmStr = 'munmap' then
-              begin
-                // munmap(addr, length)
-                // RDI = addr, RSI = length
-                if Length(instr.ArgTemps) >= 1 then
-                begin
-                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
-                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
-                end
-                else if instr.Src1 >= 0 then
-                begin
-                  slotIdx := fn.LocalCount + instr.Src1;
-                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
-                end
-                else
-                  WriteMovRegImm64(FCode, RDI, 0);
-                  
-                if Length(instr.ArgTemps) >= 2 then
-                begin
-                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
-                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
-                end
-                else if instr.Src2 >= 0 then
-                begin
-                  slotIdx := fn.LocalCount + instr.Src2;
-                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
-                end
-                else
-                  WriteMovRegImm64(FCode, RSI, 0);
-                  
-                WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
-                WriteSyscall(FCode);
-                if instr.Dest >= 0 then
-                begin
-                  slotIdx := fn.LocalCount + instr.Dest;
-                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-                end;
-              end
+               else if instr.ImmStr = 'munmap' then
+               begin
+                 // munmap(addr, length)
+                 // RDI = addr, RSI = length
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src2 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src2;
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_socket' then
+               begin
+                 // sys_socket(domain: int64, type: int64, protocol: int64) -> int64
+                 // RDI = domain, RSI = type, RDX = protocol
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SOCKET);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_bind' then
+               begin
+                 // sys_bind(sockfd, addr, addrlen) -> int64
+                 // RDI = sockfd, RSI = addr, RDX = addrlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_BIND);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_listen' then
+               begin
+                 // sys_listen(sockfd, backlog) -> int64
+                 // RDI = sockfd, RSI = backlog
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_LISTEN);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_accept' then
+               begin
+                 // sys_accept(sockfd, addr, addrlen) -> int64
+                 // RDI = sockfd, RSI = addr, RDX = addrlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_ACCEPT);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_connect' then
+               begin
+                 // sys_connect(sockfd, addr, addrlen) -> int64
+                 // RDI = sockfd, RSI = addr, RDX = addrlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_CONNECT);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_recvfrom' then
+               begin
+                 // sys_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) -> int64
+                 // RDI=sockfd, RSI=buf, RDX=len, R10=flags, R8=src_addr, R9=addrlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 if Length(instr.ArgTemps) >= 4 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                   WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R10, 0);
+                   
+                 if Length(instr.ArgTemps) >= 5 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                   WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R8, 0);
+                   
+                 if Length(instr.ArgTemps) >= 6 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[5];
+                   WriteMovRegMem(FCode, R9, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R9, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_RECVFROM);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_sendto' then
+               begin
+                 // sys_sendto(sockfd, buf, len, flags, dest_addr, addrlen) -> int64
+                 // RDI=sockfd, RSI=buf, RDX=len, R10=flags, R8=dest_addr, R9=addrlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 if Length(instr.ArgTemps) >= 4 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                   WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R10, 0);
+                   
+                 if Length(instr.ArgTemps) >= 5 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                   WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R8, 0);
+                   
+                 if Length(instr.ArgTemps) >= 6 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[5];
+                   WriteMovRegMem(FCode, R9, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R9, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SENDTO);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_setsockopt' then
+               begin
+                 // sys_setsockopt(sockfd, level, optname, optval, optlen) -> int64
+                 // RDI=sockfd, RSI=level, RDX=optname, R10=optval, R8=optlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 if Length(instr.ArgTemps) >= 4 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                   WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R10, 0);
+                   
+                 if Length(instr.ArgTemps) >= 5 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                   WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R8, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SETSOCKOPT);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_getsockopt' then
+               begin
+                 // sys_getsockopt(sockfd, level, optname, optval, optlen) -> int64
+                 // RDI=sockfd, RSI=level, RDX=optname, R10=optval, R8=optlen
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 if Length(instr.ArgTemps) >= 4 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                   WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R10, 0);
+                   
+                 if Length(instr.ArgTemps) >= 5 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                   WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, R8, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_GETSOCKOPT);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_fcntl' then
+               begin
+                 // sys_fcntl(fd, cmd, arg) -> int64
+                 // RDI = fd, RSI = cmd, RDX = arg
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 3 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                   WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDX, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_FCNTL);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               else if instr.ImmStr = 'sys_shutdown' then
+               begin
+                 // sys_shutdown(sockfd, how) -> int64
+                 // RDI = sockfd, RSI = how
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                   
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                   
+                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SHUTDOWN);
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
               else if instr.ImmStr = 'buf_put_byte' then
               begin
                 // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
