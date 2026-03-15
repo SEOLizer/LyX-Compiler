@@ -607,6 +607,33 @@ begin
       case instr.Op of
         irReturn:
         begin
+          // Rückgabewert in RAX laden (falls vorhanden)
+          // Src1 ist ein Temp-Index, daher fn.LocalCount addieren
+          if instr.Src1 >= 0 then
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+          
+          // Epilog
+          EmitRex(FCode, 1, 0, 0, 0);
+          EmitU8(FCode, $89);
+          EmitU8(FCode, $EC);  // mov rsp, rbp
+          EmitU8(FCode, $5D);  // pop rbp
+          WriteRet(FCode);
+        end;
+        
+        irReturnStruct:
+        begin
+          // Struct-Rückgabe - Src1 ist ein lokaler Slot-Index (nicht Temp!)
+          // SysV ABI: Structs ≤16 Bytes werden in RAX:RDX zurückgegeben
+          if instr.Src1 >= 0 then
+          begin
+            // Erstes Quadword in RAX laden
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+            
+            // Für Structs > 8 Bytes: zweites Quadword in RDX laden
+            if instr.StructSize > 8 then
+              WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1 + 1));
+          end;
+          
           // Epilog
           EmitRex(FCode, 1, 0, 0, 0);
           EmitU8(FCode, $89);
@@ -1663,15 +1690,116 @@ begin
                // Actually, we only add padding when stackArgsCount > 0, so this is not needed
              end;
              
-             // Store return value from RAX to destination slot
+              // Store return value from RAX to destination slot
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end;
+         
+         irCallStruct:
+           begin
+             // Struct-returning function call (SysV ABI)
+             // Dest is a LOCAL slot index (not temp!), StructSize gives size in bytes
+             // After call: RAX has first quadword, RDX has second (if StructSize > 8)
+             argCount := instr.ImmInt;
+             
+             // Get argument temps from ArgTemps array
+             SetLength(argTemps, argCount);
+             for k := 0 to argCount - 1 do argTemps[k] := -1;
+             if Length(instr.ArgTemps) > 0 then
+             begin
+               for k := 0 to Min(argCount - 1, High(instr.ArgTemps)) do
+                 argTemps[k] := instr.ArgTemps[k];
+             end;
+             
+             // Ensure stack is 16-byte aligned before call
+             stackArgsCount := 0;
+             if argCount > 6 then
+               stackArgsCount := argCount - 6;
+             
+             if (stackArgsCount mod 2) = 1 then
+             begin
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $83);
+               EmitU8(FCode, $EC);
+               EmitU8(FCode, $08);  // sub rsp, 8
+             end;
+             
+             // Push extra args (beyond 6) in reverse order
+             for k := argCount - 1 downto 6 do
+             begin
+               if argTemps[k] >= 0 then
+               begin
+                 slotIdx := fn.LocalCount + argTemps[k];
+                 WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                 EmitU8(FCode, $50);  // push rax
+               end
+               else
+               begin
+                 WriteMovRegImm64(FCode, RAX, 0);
+                 EmitU8(FCode, $50);  // push rax
+               end;
+             end;
+             
+             // Load first 6 args into registers
+             for k := 0 to Min(argCount - 1, 5) do
+             begin
+               if argTemps[k] >= 0 then
+               begin
+                 slotIdx := fn.LocalCount + argTemps[k];
+                 WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
+               end
+               else
+                 WriteMovRegImm64(FCode, ParamRegs[k], 0);
+             end;
+             
+             // Emit call
+             SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+             FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+             FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
+             FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+             EmitU8(FCode, $E8);  // call rel32
+             EmitU32(FCode, 0);   // placeholder
+             
+             // Clean up stack args if any
+             if stackArgsCount > 0 then
+             begin
+               stackCleanup := stackArgsCount * 8;
+               if (stackArgsCount mod 2) = 1 then
+                 stackCleanup := stackCleanup + 8;
+               
+               if stackCleanup <= 127 then
+               begin
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $83);
+                 EmitU8(FCode, $C4);
+                 EmitU8(FCode, Byte(stackCleanup));
+               end
+               else
+               begin
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $81);
+                 EmitU8(FCode, $C4);
+                 EmitU32(FCode, Cardinal(stackCleanup));
+               end;
+             end;
+             
+             // Store return values to local struct slots
+             // Dest is a LOCAL slot index (not temp!)
              if instr.Dest >= 0 then
              begin
-               slotIdx := fn.LocalCount + instr.Dest;
-               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+               // Store RAX to first slot
+               WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+               
+               // For structs > 8 bytes, store RDX to second slot
+               if instr.StructSize > 8 then
+                 WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest + 1), RDX);
              end;
            end;
-           
-         irLabel:
+            
+          irLabel:
            begin
              // Record label position for branch patching
              FBranchLabels.AddObject(instr.LabelName, TObject(PtrInt(FCode.Size)));
