@@ -79,6 +79,20 @@ begin
   Result := Integer(Pointer(o));
 end;
 
+// Returns the size in bytes for a given type (for field access width)
+function TypeSizeBytes(t: TAurumType): Integer;
+begin
+  case t of
+    atInt8, atUInt8, atBool, atChar: Result := 1;
+    atInt16, atUInt16: Result := 2;
+    atInt32, atUInt32, atF32: Result := 4;
+    atInt64, atUInt64, atISize, atUSize, atF64, atPChar, atPCharNullable,
+    atDynArray, atArray, atMap, atSet, atParallelArray: Result := 8;
+  else
+    Result := 8; // Default to 8 bytes (full register width) - includes atUnresolved, atVoid
+  end;
+end;
+
 { TIRLowering }
 
 constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
@@ -2331,33 +2345,36 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
          if fldOffset >= 0 then
          begin
            // Check if owner is a class (heap) or struct (stack)
-           if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
-           begin
-             // Class: use positive offset (heap access)
-             instr.Op := irLoadFieldHeap;
-             instr.Dest := t0;
-             instr.Src1 := t1;
-             instr.ImmInt := fldOffset; // positive offset for heap
-             Emit(instr);
-           end
-           else
-           begin
-             // Struct: use negative offset (stack access)
-             instr.Op := irLoadField;
-             instr.Dest := t0;
-             instr.Src1 := t1;
-             instr.ImmInt := fldOffset; // will be negated in backend
-             Emit(instr);
-           end;
-         end
-         else
-         begin
-           // Fallback to name-based access (slower / requires runtime lookup)
-           // Assume struct for fallback
-           instr.Op := irLoadField;
+            if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
+            begin
+              // Class: use positive offset (heap access)
+              instr.Op := irLoadFieldHeap;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.ImmInt := fldOffset; // positive offset for heap
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end
+            else
+            begin
+              // Struct: use negative offset (stack access)
+              instr.Op := irLoadField;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.ImmInt := fldOffset; // will be negated in backend
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end;
+          end
+          else
+          begin
+            // Fallback to name-based access (slower / requires runtime lookup)
+            // Assume struct for fallback
+            instr.Op := irLoadField;
            instr.Dest := t0;
            instr.Src1 := t1;
            instr.LabelName := TAstFieldAccess(expr).Field;
+           instr.FieldSize := TypeSizeBytes(fldType);
            Emit(instr);
          end;
          
@@ -2646,6 +2663,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t0;  // object pointer
           instr.Src2 := t1;  // VMT address
           instr.ImmInt := 0; // offset 0
+          instr.FieldSize := 8; // VMT pointer is always 8 bytes
           Emit(instr);
         end;
         
@@ -3028,6 +3046,7 @@ begin
         instr.Src1 := addrTemp;  // base address
         instr.Src2 := valTemp;   // value
         instr.ImmInt := fldOffset;
+        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
         Emit(instr);
         
         Break;
@@ -3038,7 +3057,7 @@ begin
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
   end;
   
-  // Return the address temp
+  // Return the address temp (LowerStructLit)
   Result := addrTemp;
 end;
 
@@ -3081,6 +3100,7 @@ begin
         instr.Src1 := addrTemp;  // base address
         instr.Src2 := valTemp;   // value
         instr.ImmInt := fldOffset;
+        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
         Emit(instr);
         
         Break;
@@ -3562,6 +3582,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.ImmInt := fa.Target.FieldOffset // positive offset for heap
         else
           instr.LabelName := fa.Target.Field;
+        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
         Emit(instr);
       end
       else
@@ -3574,6 +3595,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.ImmInt := fa.Target.FieldOffset
         else
           instr.LabelName := fa.Target.Field;
+        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
         Emit(instr);
       end;
       Exit(True);

@@ -3271,17 +3271,55 @@ begin
           irLoadField:
             begin
               // Load field from struct: Dest = *(Src1 - ImmInt)
-              // Stack slots grow negative, so we SUBTRACT the field offset
+              // Stack structs grow downward, so field offsets are SUBTRACTED from base
               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
               negOffset := -instr.ImmInt;
-              if (negOffset >= -128) and (negOffset <= 127) then
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
-              end
+              
+              // Use FieldSize to determine load width (default to 8 if not set)
+              case instr.FieldSize of
+                1: begin
+                  // movzx ecx, byte [rax + negOffset] (zero-extend to full register)
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
+                2: begin
+                  // movzx ecx, word [rax + negOffset] (zero-extend to full register)
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B7); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B7); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
+                4: begin
+                  // mov ecx, dword [rax + negOffset] (implicit zero-extend to 64-bit)
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $8B); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
               else
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
-                EmitU32(FCode, Cardinal(negOffset));
+                // 8 bytes (default): mov rcx, qword [rax + negOffset]
+                if (negOffset >= -128) and (negOffset <= 127) then
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                end
+                else
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                end;
               end;
               WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RCX);
             end;
@@ -3289,17 +3327,57 @@ begin
           irStoreField:
             begin
               // Store field into struct: *(Src1 - ImmInt) = Src2
-              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // Stack structs grow downward, so field offsets are SUBTRACTED from base
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // base addr
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2)); // value
               negOffset := -instr.ImmInt;
-              if (negOffset >= -128) and (negOffset <= 127) then
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
-              end
+              
+              // Use FieldSize to determine store width (default to 8 if not set)
+              case instr.FieldSize of
+                1: begin
+                  // mov byte [rax + negOffset], cl
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $88); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $88); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
+                2: begin
+                  // mov word [rax + negOffset], cx
+                  EmitU8(FCode, $66); // operand size prefix
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
+                4: begin
+                  // mov dword [rax + negOffset], ecx (no REX.W)
+                  if (negOffset >= -128) and (negOffset <= 127) then
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                  end;
+                end;
               else
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
-                EmitU32(FCode, Cardinal(negOffset));
+                // 8 bytes (default): mov qword [rax + negOffset], rcx
+                if (negOffset >= -128) and (negOffset <= 127) then
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(negOffset));
+                end
+                else
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(negOffset));
+                end;
               end;
             end;
 
@@ -3308,14 +3386,52 @@ begin
               // Load field from heap object: Dest = *(Src1 + ImmInt)
               // Positive offset for heap objects
               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-              if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
-              end
+              
+              // Use FieldSize to determine load width (default to 8 if not set)
+              case instr.FieldSize of
+                1: begin
+                  // movzx ecx, byte [rax + offset] (zero-extend to full register)
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
+                2: begin
+                  // movzx ecx, word [rax + offset] (zero-extend to full register)
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B7); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $0F); EmitU8(FCode, $B7); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
+                4: begin
+                  // mov ecx, dword [rax + offset] (implicit zero-extend to 64-bit)
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $8B); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
               else
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88);
-                EmitU32(FCode, Cardinal(instr.ImmInt));
+                // 8 bytes (default): mov rcx, qword [rax + offset]
+                if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                end
+                else
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                end;
               end;
               WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RCX);
             end;
@@ -3323,16 +3439,55 @@ begin
           irStoreFieldHeap:
             begin
               // Store field into heap object: *(Src1 + ImmInt) = Src2
-              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
-              if (instr.ImmInt >= -128) and (instr.ImmInt <= 127) then
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
-              end
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // base addr
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2)); // value
+              
+              // Use FieldSize to determine store width (default to 8 if not set)
+              case instr.FieldSize of
+                1: begin
+                  // mov byte [rax + offset], cl
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $88); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $88); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
+                2: begin
+                  // mov word [rax + offset], cx
+                  EmitU8(FCode, $66); // operand size prefix
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
+                4: begin
+                  // mov dword [rax + offset], ecx (no REX.W)
+                  if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                  end
+                  else
+                  begin
+                    EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                  end;
+                end;
               else
-              begin
-                EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88);
-                EmitU32(FCode, Cardinal(instr.ImmInt));
+                // 8 bytes (default): mov qword [rax + offset], rcx
+                if (instr.ImmInt >= 0) and (instr.ImmInt <= 127) then
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $48); EmitU8(FCode, Byte(instr.ImmInt));
+                end
+                else
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $88); EmitU32(FCode, Cardinal(instr.ImmInt));
+                end;
               end;
             end;
        end;
