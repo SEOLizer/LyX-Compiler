@@ -363,16 +363,19 @@ type
     FField: string;
     FFieldOffset: Integer; // -1 if unknown
     FOwnerName: string; // owner struct name if known
+    FFieldType: TAurumType; // resolved field type
   public
     constructor Create(aObj: TAstExpr; const aField: string; aSpan: TSourceSpan);
     destructor Destroy; override;
     procedure SetFieldOffset(aOffset: Integer);
     procedure SetOwnerName(const aName: string);
+    procedure SetFieldType(aType: TAurumType);
     function DetachObj: TAstExpr; // transfer ownership of the Obj out of this node
     property Obj: TAstExpr read FObj;
     property Field: string read FField;
     property FieldOffset: Integer read FFieldOffset;
     property OwnerName: string read FOwnerName;
+    property FieldType: TAurumType read FFieldType write FFieldType;
   end;
 
 
@@ -1734,6 +1737,11 @@ end;
 procedure TAstFieldAccess.SetOwnerName(const aName: string);
 begin
   FOwnerName := aName;
+end;
+
+procedure TAstFieldAccess.SetFieldType(aType: TAurumType);
+begin
+  FFieldType := aType;
 end;
 
 function TAstFieldAccess.DetachObj: TAstExpr;

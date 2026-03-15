@@ -589,14 +589,15 @@ begin
     methods := nil;
     while not Check(tkRBrace) and not Check(tkEOF) do
     begin
-      // Structs only have fields (no methods, no visibility modifiers)
+      // Allow visibility modifiers (pub, private, protected) in structs
+      curVisibility := ParseVisibility;
       if Check(tkIdent) then
       begin
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
-        fld.Visibility := visPublic;  // Struct fields are always public
+        fld.Visibility := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
@@ -2037,6 +2038,23 @@ begin
       // Regular identifier type (int64, bool, struct name, etc.)
       s := FCurTok.Value;
       Advance;
+      
+      // Handle qualified type names (e.g., types.NativeSocket, std.net.IPAddr)
+      while Check(tkDot) do
+      begin
+        Advance; // consume dot
+        if Check(tkIdent) then
+        begin
+          s := s + '.' + FCurTok.Value;
+          Advance;
+        end
+        else
+        begin
+          FDiag.Error('expected identifier after dot in type name', FCurTok.Span);
+          Break;
+        end;
+      end;
+      
       Result := StrToAurumType(s);
       if Result = atUnresolved then
         typeName := s;
