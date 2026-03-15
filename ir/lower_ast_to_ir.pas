@@ -928,6 +928,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     elemSize: Integer;
     fa: TAstFieldAssign;
     fldOffset: Integer;
+    fldType: TAurumType;
     ownerName: string;
     slotCount: Integer;
     baseIdx: Integer;
@@ -2291,62 +2292,107 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         end
         else
         begin
-          // No conversion needed, just copy
-          instr.Op := irLoadLocal;
-          instr.Dest := t0;
-          instr.Src1 := t1;
-          Emit(instr);
+          // No conversion needed - just use the source temp directly
+          // (No need to emit a copy instruction)
+          Result := t1;
+          Exit;
         end;
 
         Result := t0;
       end;
 
     nkFieldAccess:
-      begin
-        // Lower object
-        t1 := LowerExpr(TAstFieldAccess(expr).Obj);
-        if t1 < 0 then
-          Exit;
+       begin
+         // Lower object
+         t1 := LowerExpr(TAstFieldAccess(expr).Obj);
+         if t1 < 0 then
+           Exit;
 
-        // If sema annotated the field offset on the AST node, use it
-        fldOffset := TAstFieldAccess(expr).FieldOffset;
-        ownerName := TAstFieldAccess(expr).OwnerName;
+         // If sema annotated the field offset on the AST node, use it
+         fldOffset := TAstFieldAccess(expr).FieldOffset;
+         ownerName := TAstFieldAccess(expr).OwnerName;
+         fldType := TAstFieldAccess(expr).FieldType; // Get the field type for proper extension
 
-        t0 := NewTemp;
-        if fldOffset >= 0 then
-        begin
-          // Check if owner is a class (heap) or struct (stack)
-          if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
-          begin
-            // Class: use positive offset (heap access)
-            instr.Op := irLoadFieldHeap;
-            instr.Dest := t0;
-            instr.Src1 := t1;
-            instr.ImmInt := fldOffset; // positive offset for heap
-            Emit(instr);
-          end
-          else
-          begin
-            // Struct: use negative offset (stack access)
-            instr.Op := irLoadField;
-            instr.Dest := t0;
-            instr.Src1 := t1;
-            instr.ImmInt := fldOffset; // will be negated in backend
-            Emit(instr);
-          end;
-        end
-        else
-        begin
-          // Fallback to name-based access (slower / requires runtime lookup)
-          // Assume struct for fallback
-          instr.Op := irLoadField;
-          instr.Dest := t0;
-          instr.Src1 := t1;
-          instr.LabelName := TAstFieldAccess(expr).Field;
-          Emit(instr);
-        end;
-        Result := t0;
-      end;
+         t0 := NewTemp;
+         if fldOffset >= 0 then
+         begin
+           // Check if owner is a class (heap) or struct (stack)
+           if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
+           begin
+             // Class: use positive offset (heap access)
+             instr.Op := irLoadFieldHeap;
+             instr.Dest := t0;
+             instr.Src1 := t1;
+             instr.ImmInt := fldOffset; // positive offset for heap
+             Emit(instr);
+           end
+           else
+           begin
+             // Struct: use negative offset (stack access)
+             instr.Op := irLoadField;
+             instr.Dest := t0;
+             instr.Src1 := t1;
+             instr.ImmInt := fldOffset; // will be negated in backend
+             Emit(instr);
+           end;
+         end
+         else
+         begin
+           // Fallback to name-based access (slower / requires runtime lookup)
+           // Assume struct for fallback
+           instr.Op := irLoadField;
+           instr.Dest := t0;
+           instr.Src1 := t1;
+           instr.LabelName := TAstFieldAccess(expr).Field;
+           Emit(instr);
+         end;
+         
+         // Sign/zero-extend the loaded value to full register width based on field type
+         if (fldType <> atUnresolved) and (fldType <> atInt64) and (fldType <> atUInt64) then
+         begin
+           t2 := NewTemp; // temp for extended value
+           case fldType of
+             atInt8, atUInt8:   // 8-bit types
+               begin
+                 if fldType = atInt8 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 8;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+             atInt16, atUInt16: // 16-bit types
+               begin
+                 if fldType = atInt16 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 16;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+             atInt32, atUInt32: // 32-bit types
+               begin
+                 if fldType = atInt32 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 32;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+           end;
+         end;
+         
+         Result := t0;
+       end;
 
     nkArrayLit:
       begin
