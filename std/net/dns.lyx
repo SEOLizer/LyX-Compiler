@@ -1,0 +1,349 @@
+// Lyx Network Library - DNS Resolver
+// Simple DNS client for A record lookups
+
+unit std.net.dns;
+
+import std.net.socket;
+import std.net.types;
+
+// ============================================================================
+// DNS Constants
+// ============================================================================
+
+// DNS header flags
+pub con DNS_QR_QUERY: int64 := 0;       // Query
+pub con DNS_QR_RESPONSE: int64 := 1;    // Response
+pub con DNS_OPCODE_QUERY: int64 := 0;   // Standard query
+pub con DNS_RD: int64 := 1;             // Recursion Desired
+pub con DNS_RA: int64 := 1;             // Recursion Available
+
+// DNS record types
+pub con DNS_TYPE_A: int64 := 1;         // IPv4 address
+pub con DNS_TYPE_AAAA: int64 := 28;     // IPv6 address
+pub con DNS_TYPE_CNAME: int64 := 5;     // Canonical name
+pub con DNS_TYPE_MX: int64 := 15;       // Mail exchange
+pub con DNS_TYPE_TXT: int64 := 16;      // Text record
+pub con DNS_TYPE_NS: int64 := 2;        // Name server
+
+// DNS classes
+pub con DNS_CLASS_IN: int64 := 1;       // Internet
+
+// DNS response codes
+pub con DNS_RCODE_OK: int64 := 0;       // No error
+pub con DNS_RCODE_FORMERR: int64 := 1;  // Format error
+pub con DNS_RCODE_SERVFAIL: int64 := 2; // Server failure
+pub con DNS_RCODE_NXDOMAIN: int64 := 3; // Non-existent domain
+pub con DNS_RCODE_NOTIMP: int64 := 4;   // Not implemented
+pub con DNS_RCODE_REFUSED: int64 := 5;  // Query refused
+
+// Default DNS servers
+pub con DNS_PORT: int64 := 53;
+
+// ============================================================================
+// DNS Result (passed as pointer)
+// ============================================================================
+// Result structure layout (32 bytes):
+// Offset 0: success (bool, 1 byte)
+// Offset 8: ip (int64, 8 bytes)
+// Offset 16: ttl (int64, 8 bytes)
+// Offset 24: rcode (int64, 8 bytes)
+
+// ============================================================================
+// Internal: Random ID generator (simple LCG)
+// ============================================================================
+
+var g_dns_seed: int64 := 12345;
+
+fn dns_random_id(): uint16 {
+  g_dns_seed := (g_dns_seed * 1103515245 + 12345) & 0x7FFFFFFF;
+  return (g_dns_seed & 0xFFFF) as uint16;
+}
+
+// ============================================================================
+// Internal: Encode domain name in DNS format
+// ============================================================================
+
+fn dns_encode_name(buf: int64, offset: int64, name: int64, nameLen: int64): int64 {
+  var i: int64 := 0;
+  var labelStart: int64 := offset;
+  var pos: int64 := offset + 1;
+  var c: int64;
+  var labelLen: int64 := 0;
+  
+  while (i < nameLen) {
+    c := peek8(name + i);
+    
+    if (c == 46) {  // '.' character
+      poke8(buf + labelStart, labelLen);
+      labelStart := pos;
+      pos := pos + 1;
+      labelLen := 0;
+    } else {
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      labelLen := labelLen + 1;
+    }
+    i := i + 1;
+  }
+  
+  poke8(buf + labelStart, labelLen);
+  poke8(buf + pos, 0);
+  pos := pos + 1;
+  
+  return pos - offset;
+}
+
+// ============================================================================
+// Internal: Build DNS query packet
+// ============================================================================
+
+fn dns_build_query(buf: int64, name: int64, nameLen: int64, queryType: int64): int64 {
+  var offset: int64 := 0;
+  var id: uint16 := dns_random_id();
+  
+  // DNS Header (12 bytes)
+  poke8(buf + 0, (id >> 8) & 0xFF);
+  poke8(buf + 1, id & 0xFF);
+  poke8(buf + 2, 0x01);  // Flags: RD=1
+  poke8(buf + 3, 0x00);
+  poke8(buf + 4, 0x00);  // QDCOUNT = 1
+  poke8(buf + 5, 0x01);
+  poke8(buf + 6, 0x00);  // ANCOUNT = 0
+  poke8(buf + 7, 0x00);
+  poke8(buf + 8, 0x00);  // NSCOUNT = 0
+  poke8(buf + 9, 0x00);
+  poke8(buf + 10, 0x00); // ARCOUNT = 0
+  poke8(buf + 11, 0x00);
+  
+  offset := 12;
+  
+  // Question section
+  var nameBytes: int64 := dns_encode_name(buf, offset, name, nameLen);
+  offset := offset + nameBytes;
+  
+  poke8(buf + offset, (queryType >> 8) & 0xFF);
+  poke8(buf + offset + 1, queryType & 0xFF);
+  offset := offset + 2;
+  
+  poke8(buf + offset, 0x00);
+  poke8(buf + offset + 1, 0x01);
+  offset := offset + 2;
+  
+  return offset;
+}
+
+// ============================================================================
+// Internal: Skip DNS name (handles compression)
+// ============================================================================
+
+fn dns_skip_name(buf: int64, offset: int64, maxLen: int64): int64 {
+  var pos: int64 := offset;
+  var len: int64;
+  
+  while (pos < maxLen) {
+    len := peek8(buf + pos);
+    
+    if (len == 0) {
+      return pos + 1;
+    }
+    
+    if ((len & 0xC0) == 0xC0) {
+      return pos + 2;
+    }
+    
+    pos := pos + 1 + len;
+  }
+  
+  return pos;
+}
+
+// ============================================================================
+// Internal: Parse DNS response
+// resultPtr: pointer to 32-byte result buffer
+// Returns: true on success, false on error
+// ============================================================================
+
+fn dns_parse_response(buf: int64, bufLen: int64, resultPtr: int64): bool {
+  var flags: int64;
+  var qdcount: int64;
+  var ancount: int64;
+  var offset: int64;
+  var i: int64;
+  var rtype: int64;
+  var rclass: int64;
+  var ttl: int64;
+  var rdlength: int64;
+  
+  // Initialize result
+  poke8(resultPtr + 0, 0);    // success = false
+  poke8(resultPtr + 8, 0);    // ip = 0
+  poke8(resultPtr + 16, 0);   // ttl = 0
+  poke8(resultPtr + 24, -1);  // rcode = -1 (error)
+  
+  if (bufLen < 12) {
+    return false;
+  }
+  
+  // Parse header
+  flags := (peek8(buf + 2) << 8) | peek8(buf + 3);
+  
+  // Check QR bit (must be response)
+  if ((flags & 0x8000) == 0) {
+    poke8(resultPtr + 24, -2);  // rcode = -2
+    return false;
+  }
+  
+  // Extract RCODE
+  var rcode: int64 := flags & 0x000F;
+  poke8(resultPtr + 24, rcode);
+  
+  if (rcode != DNS_RCODE_OK) {
+    return false;
+  }
+  
+  // Get counts
+  qdcount := (peek8(buf + 4) << 8) | peek8(buf + 5);
+  ancount := (peek8(buf + 6) << 8) | peek8(buf + 7);
+  
+  if (ancount == 0) {
+    poke8(resultPtr + 24, DNS_RCODE_NXDOMAIN);
+    return false;
+  }
+  
+  // Skip header
+  offset := 12;
+  
+  // Skip question section
+  i := 0;
+  while (i < qdcount) {
+    offset := dns_skip_name(buf, offset, bufLen);
+    offset := offset + 4;
+    i := i + 1;
+  }
+  
+  // Parse answer section
+  i := 0;
+  while (i < ancount) {
+    offset := dns_skip_name(buf, offset, bufLen);
+    
+    if (offset + 10 > bufLen) {
+      return false;
+    }
+    
+    rtype := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
+    offset := offset + 2;
+    
+    rclass := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
+    offset := offset + 2;
+    
+    ttl := (peek8(buf + offset) << 24) | (peek8(buf + offset + 1) << 16) |
+           (peek8(buf + offset + 2) << 8) | peek8(buf + offset + 3);
+    offset := offset + 4;
+    
+    rdlength := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
+    offset := offset + 2;
+    
+    // Check if this is an A record
+    if ((rtype == DNS_TYPE_A) && (rclass == DNS_CLASS_IN) && (rdlength == 4)) {
+      var ip: int64 := (peek8(buf + offset) << 24) | (peek8(buf + offset + 1) << 16) |
+                        (peek8(buf + offset + 2) << 8) | peek8(buf + offset + 3);
+      
+      poke8(resultPtr + 8, ip & 0xFF);
+      poke8(resultPtr + 9, (ip >> 8) & 0xFF);
+      poke8(resultPtr + 10, (ip >> 16) & 0xFF);
+      poke8(resultPtr + 11, (ip >> 24) & 0xFF);
+      
+      poke8(resultPtr + 16, ttl & 0xFF);
+      poke8(resultPtr + 17, (ttl >> 8) & 0xFF);
+      poke8(resultPtr + 18, (ttl >> 16) & 0xFF);
+      poke8(resultPtr + 19, (ttl >> 24) & 0xFF);
+      
+      poke8(resultPtr + 0, 1);  // success = true
+      return true;
+    }
+    
+    offset := offset + rdlength;
+    i := i + 1;
+  }
+  
+  return false;
+}
+
+// ============================================================================
+// Public API: DNS Resolve
+// ============================================================================
+
+// Resolve hostname to IPv4 address using specified DNS server
+// resultPtr: pointer to 32-byte result buffer
+// Returns: true on success, false on error
+pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resultPtr: int64): bool {
+  var sock: UDPSocket;
+  var buf: int64;
+  var queryLen: int64;
+  var nread: int64;
+  var ret: int64;
+  
+  // Initialize result
+  poke8(resultPtr + 0, 0);
+  poke8(resultPtr + 8, 0);
+  poke8(resultPtr + 16, 0);
+  poke8(resultPtr + 24, -1);
+  
+  // Create UDP socket
+  sock := UDPSocketNew();
+  if (sock.fd < 0) {
+    return false;
+  }
+  
+  buf := BufferAlloc(512);
+  if (buf == 0) {
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  queryLen := dns_build_query(buf, hostname, hostnameLen, DNS_TYPE_A);
+  
+  ret := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
+  if (ret < 0) {
+    BufferFree(buf, 512);
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  if (nread < 12) {
+    BufferFree(buf, 512);
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  ret := dns_parse_response(buf, nread, resultPtr);
+  
+  BufferFree(buf, 512);
+  UDPSocketClose(sock);
+  
+  return ret;
+}
+
+// Resolve using Google's public DNS (8.8.8.8)
+pub fn DNSResolveGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var googleDNS: int64 := IPPack(8, 8, 8, 8);
+  return DNSResolve(hostname, hostnameLen, googleDNS, resultPtr);
+}
+
+// Resolve using Cloudflare's DNS (1.1.1.1)
+pub fn DNSResolveCloudflare(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var cfDNS: int64 := IPPack(1, 1, 1, 1);
+  return DNSResolve(hostname, hostnameLen, cfDNS, resultPtr);
+}
+
+// Helper: Print IP address
+pub fn DNSPrintIP(ip: int64) {
+  PrintInt((ip >> 24) & 0xFF);
+  PrintStr(".");
+  PrintInt((ip >> 16) & 0xFF);
+  PrintStr(".");
+  PrintInt((ip >> 8) & 0xFF);
+  PrintStr(".");
+  PrintInt(ip & 0xFF);
+}
