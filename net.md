@@ -219,3 +219,44 @@ pub fn (p *Poller) Close(): error;
 - ESP32 optimized for memory
 - WiFi provisioning
 - OTA updates foundation
+
+---
+
+## Current Implementation Status
+
+### ✅ Completed Features
+
+| File | Description |
+|------|-------------|
+| `std/net/types.lyx` | Constants (AF_INET, SOCK_STREAM, etc.), Types (IPAddr, SockAddrIn, MacAddr, EthernetHeader, ARPPacket), Helpers (Htons, Ntohs, IPPack, IPUnpack), TCP/Socket Options |
+| `std/net/socket.lyx` | TCPListener, TCPConn, UDPSocket, RawSocket, ICMP-Ping, ARP packets, Socket Options (Nodelay, KeepAlive, Buffers) |
+| `std/net/dns.lyx` | DNS resolver (A records), DNSResolveGoogle, DNSResolveCloudflare |
+| `std/net/syscalls.lyx` | Low-level syscall declarations |
+| `std/net/internal/types.lyx` | Extended constants + IPv6 structures (SockAddrIn6) |
+
+---
+
+## TODO / Open Items
+
+### High Priority
+
+- [ ] **IPv6 Support** – `SockAddrIn6` struct exists but no implementation uses it
+- [x] **TCP Options** – Missing `setsockopt(TCP_NODELAY)`, `SO_KEEPALIVE` ✅
+- [x] **getsockopt** – Declared in syscalls but never used (socket state queries) ✅
+- [ ] **ParseIPAddr** – Only 3 hardcoded cases, needs proper string parsing
+
+### Medium Priority
+
+- [ ] **Non-blocking I/O** – Only basic `MSG_DONTWAIT` support
+- [ ] **select/poll** – No multiplexing functions
+- [ ] **Unix Domain Sockets** – `AF_UNIX` constant exists but no implementation
+- [ ] **Async connect** – No `EINPROGRESS` handling
+
+### Low Priority
+
+- [ ] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution
+- [ ] **Stack Allocation** – All functions use `mmap` for temporary structures (performance)
+- [ ] **Hostname Resolution** – No `gethostbyname`, only IP-based operations
+- [ ] **Connection Pooling** – Not implemented yet
+- [ ] **HTTP Client** – Not implemented yet
+- [ ] **TLS Support** – Not implemented yet
