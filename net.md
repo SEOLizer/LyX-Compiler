@@ -243,7 +243,7 @@ pub fn (p *Poller) Close(): error;
 - [ ] **IPv6 Support** – `SockAddrIn6` struct exists but no implementation uses it
 - [x] **TCP Options** – Missing `setsockopt(TCP_NODELAY)`, `SO_KEEPALIVE` ✅
 - [x] **getsockopt** – Declared in syscalls but never used (socket state queries) ✅
-- [ ] **ParseIPAddr** – Only 3 hardcoded cases, needs proper string parsing
+- [x] **ParseIPAddr** – Only 3 hardcoded cases, needs proper string parsing ✅
 
 ### Medium Priority
 
