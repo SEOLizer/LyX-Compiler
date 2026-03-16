@@ -254,7 +254,7 @@ pub fn (p *Poller) Close(): error;
 
 ### Low Priority
 
-- [ ] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution
+- [x] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution ✅
 - [ ] **Stack Allocation** – All functions use `mmap` for temporary structures (performance)
 - [ ] **Hostname Resolution** – No `gethostbyname`, only IP-based operations
 - [ ] **Connection Pooling** – Not implemented yet
