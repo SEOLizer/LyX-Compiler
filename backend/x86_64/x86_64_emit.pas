@@ -177,6 +177,15 @@ begin
   EmitU64(buf, imm);
 end;
 
+procedure WriteAndRegImm(buf: TByteBuffer; reg: Integer; imm: UInt64);
+begin
+  // and r64, imm32 - REX.W prefix + opcode 81 /0
+  EmitRex(buf, 1, 0, 0, (reg shr 3) and 1);
+  EmitU8(buf, $81); // AND r/m64, imm8/32
+  EmitU8(buf, $C0 or (reg and $7)); // ModR/M: register direct
+  EmitU32(buf, UInt32(imm)); // Sign-extended immediate
+end;
+
 procedure WriteMovRegReg(buf: TByteBuffer; dst, src: Integer);
 var
   rexR, rexB: Integer;
@@ -1024,7 +1033,7 @@ begin
               WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
             end;
 
-          irZExt:
+           irZExt:
             begin
               // Zero-extend src1 (width in ImmInt) into dest
               slotIdx := fn.LocalCount + instr.Src1;
@@ -1042,8 +1051,30 @@ begin
               end;
               WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
             end;
+
+          irTrunc:
+            begin
+              // Truncate src1 to ImmInt bits
+              // This is done by loading mask into RCX, then ANDing
+              slotIdx := fn.LocalCount + instr.Src1;
+              // Load source value into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+              // Load mask into RCX based on bit width
+              case instr.ImmInt of
+                8:  WriteMovRegImm64(FCode, RCX, $FF);
+                16: WriteMovRegImm64(FCode, RCX, $FFFF);
+                32: WriteMovRegImm64(FCode, RCX, $FFFFFFFF);
+              else
+                WriteMovRegImm64(FCode, RCX, $FFFFFFFFFFFFFFFF);
+              end;
+              // AND RAX, RCX
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $21);
+              EmitU8(FCode, $C8);  // and rax, rcx
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
              
-          irAlloc:
+           irAlloc:
             begin
               // Heap allocation: Dest = alloc(ImmInt bytes)
               // Use mmap syscall: mmap(addr=0, len=ImmInt, prot=RW, flags=MAP_ANONYMOUS|MAP_PRIVATE, fd=-1, offset=0)
