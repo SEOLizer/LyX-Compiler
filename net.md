@@ -260,7 +260,7 @@ The following language features are needed to make the network library fully com
 
 ### High Priority
 
-- [ ] **`break` in while loops** – Required for early loop exit in parsing functions (e.g., `parseOctet`, `parsePort`)
+- [x] **`break` in while loops** – Required for early loop exit in parsing functions (e.g., `parseOctet`, `parsePort`) ✅
   - Workaround: Use boolean flag + `while (condition && !done)`
 
 - [ ] **Variable declaration inside control structures** – Currently fails with `var x := func()` inside if/while blocks
@@ -276,7 +276,7 @@ The following language features are needed to make the network library fully com
 
 ### Known Workarounds
 
-1. Use `while (cond && !done)` instead of `break`
+1. ~~Use `while (cond && !done)` instead of `break`~~ - **Now supported natively!**
 2. Declare all variables at the beginning of functions
 3. Avoid complex expressions in variable initializers inside blocks
 4. Use `peek8()` with manual bit operations instead of typed casts
