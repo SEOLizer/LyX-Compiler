@@ -238,14 +238,26 @@ pub fn (p *Poller) Close(): error;
 
 ## TODO / Open Items
 
-### High Priority
+### High Priority (std.net bugs)
+
+- [ ] **Struct mit Array-Feld** – `array[N]uint8` in structs (z.B. `DNSResult.data`) verursacht "cannot compute layout" Fehler
+  - Betroffene Dateien: `std/net/dns.lyx`, `std/net/internal/types.lyx`
+  - Workaround: Pointer + mmap verwenden statt embedded arrays
+
+- [ ] **Array → Pointer Typ-Mismatch** – Funktionen erwarten `int64` (Pointer), aber Tests übergeben `array[N]uint8`
+  - Beispiel: `DNSResolveGoogle(hostname: int64, ...)` wird mit `var hostname: array[16]uint8` aufgerufen
+  - Workaround: Explizit `hostname as int64` oder `&hostname[0]` verwenden
+
+- [ ] **parsePort Syntax-Fehler** – Fehlende schließende Klammer in `parsePort` (var inside if/else) ✅ **Fixed**
+
+### Medium Priority (std.net features)
 
 - [ ] **IPv6 Support** – `SockAddrIn6` struct exists but no implementation uses it
 - [x] **TCP Options** – Missing `setsockopt(TCP_NODELAY)`, `SO_KEEPALIVE` ✅
 - [x] **getsockopt** – Declared in syscalls but never used (socket state queries) ✅
 - [x] **ParseIPAddr** – Only 3 hardcoded cases, needs proper string parsing ✅
 
-### Medium Priority
+### Low Priority (std.net features)
 
 - [x] **Non-blocking I/O** – Only basic `MSG_DONTWAIT` support ✅
 - [x] **select/poll** – No multiplexing functions ✅
@@ -266,6 +278,7 @@ The following language features are needed to make the network library fully com
   - Example: `if (cond) { var x := foo(); }` compiles successfully
 
 - [ ] **Type casts with `as`** – `int16 := peek8(...) as int16` currently fails in some contexts
+  - Needed for: `addr.port := (peek8(portPtr) | (peek8(portPtr + 1) << 8)) as uint16;`
 
 ### Medium Priority
 
@@ -276,8 +289,8 @@ The following language features are needed to make the network library fully com
 
 1. ~~Use `while (cond && !done)` instead of `break`~~ - **Now supported natively!**
 2. ~~Declare all variables at the beginning of functions~~ - **Now supported inside blocks!**
-3. Avoid complex expressions in variable initializers inside blocks
-4. Use `peek8()` with manual bit operations instead of typed casts
+3. Use manual bit operations instead of typed casts
+4. Pass explicit pointers instead of arrays: use `mmap` + pointer instead of `array[N]uint8`
 
 ### Low Priority
 
