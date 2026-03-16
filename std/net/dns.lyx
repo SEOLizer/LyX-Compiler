@@ -1,5 +1,5 @@
 // Lyx Network Library - DNS Resolver
-// Simple DNS client for A record lookups
+// DNS client for A, AAAA, MX, CNAME record lookups
 
 unit std.net.dns;
 
@@ -24,6 +24,7 @@ pub con DNS_TYPE_CNAME: int64 := 5;     // Canonical name
 pub con DNS_TYPE_MX: int64 := 15;       // Mail exchange
 pub con DNS_TYPE_TXT: int64 := 16;      // Text record
 pub con DNS_TYPE_NS: int64 := 2;        // Name server
+pub con DNS_TYPE_SOA: int64 := 6;       // Start of authority
 
 // DNS classes
 pub con DNS_CLASS_IN: int64 := 1;       // Internet
@@ -40,13 +41,26 @@ pub con DNS_RCODE_REFUSED: int64 := 5;  // Query refused
 pub con DNS_PORT: int64 := 53;
 
 // ============================================================================
-// DNS Result (passed as pointer)
+// DNS Result Structures
 // ============================================================================
-// Result structure layout (32 bytes):
+
+// Generic DNS Result (64 bytes)
+// Used for A, AAAA, MX, CNAME records
 // Offset 0: success (bool, 1 byte)
-// Offset 8: ip (int64, 8 bytes)
-// Offset 16: ttl (int64, 8 bytes)
-// Offset 24: rcode (int64, 8 bytes)
+// Offset 1-7: padding
+// Offset 8: recordType (int64)
+// Offset 16: ttl (int64)
+// Offset 24: rcode (int64)
+// Offset 32: data length (int64)
+// Offset 40: data (24 bytes for AAAA/MX/CNAME)
+pub type DNSResult = struct {
+  success: bool;
+  recordType: int64;
+  ttl: int64;
+  rcode: int64;
+  dataLen: int64;
+  data: array[uint8, 24];
+};
 
 // ============================================================================
 // Internal: Random ID generator (simple LCG)
@@ -158,12 +172,14 @@ fn dns_skip_name(buf: int64, offset: int64, maxLen: int64): int64 {
 }
 
 // ============================================================================
-// Internal: Parse DNS response
-// resultPtr: pointer to 32-byte result buffer
+// Internal: Parse DNS response (extended)
+// Supports A, AAAA, MX, CNAME records
+// resultPtr: pointer to 64-byte result buffer
+// queryType: the type of record we asked for
 // Returns: true on success, false on error
 // ============================================================================
 
-fn dns_parse_response(buf: int64, bufLen: int64, resultPtr: int64): bool {
+fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType: int64): bool {
   var flags: int64;
   var qdcount: int64;
   var ancount: int64;
@@ -174,11 +190,12 @@ fn dns_parse_response(buf: int64, bufLen: int64, resultPtr: int64): bool {
   var ttl: int64;
   var rdlength: int64;
   
-  // Initialize result
-  poke8(resultPtr + 0, 0);    // success = false
-  poke8(resultPtr + 8, 0);    // ip = 0
-  poke8(resultPtr + 16, 0);   // ttl = 0
-  poke8(resultPtr + 24, -1);  // rcode = -1 (error)
+  // Initialize result (64 bytes)
+  poke8(resultPtr + 0, 0);     // success = false
+  poke8(resultPtr + 8, 0);     // recordType = 0
+  poke8(resultPtr + 16, 0);    // ttl = 0
+  poke8(resultPtr + 24, -1);   // rcode = -1 (error)
+  poke8(resultPtr + 32, 0);     // dataLen = 0
   
   if (bufLen < 12) {
     return false;
@@ -243,20 +260,122 @@ fn dns_parse_response(buf: int64, bufLen: int64, resultPtr: int64): bool {
     rdlength := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
     offset := offset + 2;
     
-    // Check if this is an A record
-    if ((rtype == DNS_TYPE_A) && (rclass == DNS_CLASS_IN) && (rdlength == 4)) {
-      var ip: int64 := (peek8(buf + offset) << 24) | (peek8(buf + offset + 1) << 16) |
-                        (peek8(buf + offset + 2) << 8) | peek8(buf + offset + 3);
+    // Check if this is the record type we're looking for
+    if (rclass != DNS_CLASS_IN) {
+      offset := offset + rdlength;
+      i := i + 1;
+      continue;
+    }
+    
+    // A record (IPv4)
+    if ((rtype == DNS_TYPE_A) && (queryType == DNS_TYPE_A) && (rdlength == 4)) {
+      // Store as IPv4 in first 4 bytes of data
+      poke8(resultPtr + 40, peek8(buf + offset));
+      poke8(resultPtr + 41, peek8(buf + offset + 1));
+      poke8(resultPtr + 42, peek8(buf + offset + 2));
+      poke8(resultPtr + 43, peek8(buf + offset + 3));
       
-      poke8(resultPtr + 8, ip & 0xFF);
-      poke8(resultPtr + 9, (ip >> 8) & 0xFF);
-      poke8(resultPtr + 10, (ip >> 16) & 0xFF);
-      poke8(resultPtr + 11, (ip >> 24) & 0xFF);
-      
+      // Store TTL
       poke8(resultPtr + 16, ttl & 0xFF);
       poke8(resultPtr + 17, (ttl >> 8) & 0xFF);
       poke8(resultPtr + 18, (ttl >> 16) & 0xFF);
       poke8(resultPtr + 19, (ttl >> 24) & 0xFF);
+      
+      // Store record type and data length
+      poke8(resultPtr + 8, DNS_TYPE_A);
+      poke8(resultPtr + 32, 4);
+      
+      poke8(resultPtr + 0, 1);  // success = true
+      return true;
+    }
+    
+    // AAAA record (IPv6)
+    if ((rtype == DNS_TYPE_AAAA) && (queryType == DNS_TYPE_AAAA) && (rdlength == 16)) {
+      var j: int64 := 0;
+      while (j < 16) {
+        poke8(resultPtr + 40 + j, peek8(buf + offset + j));
+        j := j + 1;
+      }
+      
+      // Store TTL
+      poke8(resultPtr + 16, ttl & 0xFF);
+      poke8(resultPtr + 17, (ttl >> 8) & 0xFF);
+      poke8(resultPtr + 18, (ttl >> 16) & 0xFF);
+      poke8(resultPtr + 19, (ttl >> 24) & 0xFF);
+      
+      // Store record type and data length
+      poke8(resultPtr + 8, DNS_TYPE_AAAA);
+      poke8(resultPtr + 32, 16);
+      
+      poke8(resultPtr + 0, 1);  // success = true
+      return true;
+    }
+    
+    // CNAME record (canonical name)
+    if ((rtype == DNS_TYPE_CNAME) && (queryType == DNS_TYPE_CNAME)) {
+      // Skip the name and read the canonical name
+      var nameOffset: int64 := dns_skip_name(buf, offset, bufLen);
+      
+      // Copy the canonical name (up to 24 bytes)
+      var copyLen: int64 := rdlength;
+      if (copyLen > 24) {
+        copyLen := 24;
+      }
+      
+      var j: int64 := 0;
+      while (j < copyLen) {
+        poke8(resultPtr + 40 + j, peek8(buf + offset + j));
+        j := j + 1;
+      }
+      
+      // Store TTL
+      poke8(resultPtr + 16, ttl & 0xFF);
+      poke8(resultPtr + 17, (ttl >> 8) & 0xFF);
+      poke8(resultPtr + 18, (ttl >> 16) & 0xFF);
+      poke8(resultPtr + 19, (ttl >> 24) & 0xFF);
+      
+      // Store record type and data length
+      poke8(resultPtr + 8, DNS_TYPE_CNAME);
+      poke8(resultPtr + 32, copyLen);
+      
+      poke8(resultPtr + 0, 1);  // success = true
+      return true;
+    }
+    
+    // MX record (mail exchange)
+    if ((rtype == DNS_TYPE_MX) && (queryType == DNS_TYPE_MX)) {
+      // MX format: 2-byte priority, then domain name
+      // Read priority (2 bytes, big-endian)
+      var priority: int64 := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
+      
+      // Store priority in first 2 bytes of data
+      poke8(resultPtr + 40, (priority >> 8) & 0xFF);
+      poke8(resultPtr + 41, priority & 0xFF);
+      
+      // Skip past the priority to the domain name
+      var nameOffset: int64 := dns_skip_name(buf, offset + 2, bufLen);
+      
+      // Copy domain name (up to 22 bytes to fit in 24)
+      var copyLen: int64 := rdlength - 2;
+      if (copyLen > 22) {
+        copyLen := 22;
+      }
+      
+      var j: int64 := 0;
+      while (j < copyLen) {
+        poke8(resultPtr + 42 + j, peek8(buf + offset + 2 + j));
+        j := j + 1;
+      }
+      
+      // Store TTL
+      poke8(resultPtr + 16, ttl & 0xFF);
+      poke8(resultPtr + 17, (ttl >> 8) & 0xFF);
+      poke8(resultPtr + 18, (ttl >> 16) & 0xFF);
+      poke8(resultPtr + 19, (ttl >> 24) & 0xFF);
+      
+      // Store record type and data length
+      poke8(resultPtr + 8, DNS_TYPE_MX);
+      poke8(resultPtr + 32, 2 + copyLen);  // priority + domain
       
       poke8(resultPtr + 0, 1);  // success = true
       return true;
@@ -317,13 +436,130 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
     return false;
   }
   
-  ret := dns_parse_response(buf, nread, resultPtr);
+  ret := dns_parse_response_ex(buf, nread, resultPtr, DNS_TYPE_A);
   
   BufferFree(buf, 512);
   UDPSocketClose(sock);
   
   return ret;
 }
+
+// ============================================================================
+// Generic DNS Resolve (supports any record type)
+// ============================================================================
+
+// Resolve hostname using specified DNS server and record type
+// queryType: DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_MX, DNS_TYPE_CNAME
+// resultPtr: pointer to 64-byte result buffer
+// Returns: true on success, false on error
+pub fn DNSResolveEx(hostname: int64, hostnameLen: int64, dnsServerIP: int64, queryType: int64, resultPtr: int64): bool {
+  var sock: UDPSocket;
+  var buf: int64;
+  var queryLen: int64;
+  var nread: int64;
+  var ret: int64;
+  
+  // Initialize result
+  poke8(resultPtr + 0, 0);
+  poke8(resultPtr + 8, 0);
+  poke8(resultPtr + 16, 0);
+  poke8(resultPtr + 24, -1);
+  poke8(resultPtr + 32, 0);
+  
+  // Create UDP socket
+  sock := UDPSocketNew();
+  if (sock.fd < 0) {
+    return false;
+  }
+  
+  buf := BufferAlloc(512);
+  if (buf == 0) {
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  queryLen := dns_build_query(buf, hostname, hostnameLen, queryType);
+  
+  ret := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
+  if (ret < 0) {
+    BufferFree(buf, 512);
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  if (nread < 12) {
+    BufferFree(buf, 512);
+    UDPSocketClose(sock);
+    return false;
+  }
+  
+  ret := dns_parse_response_ex(buf, nread, resultPtr, queryType);
+  
+  BufferFree(buf, 512);
+  UDPSocketClose(sock);
+  
+  return ret;
+}
+
+// ============================================================================
+// Specific Record Type Resolvers
+// ============================================================================
+
+// Resolve hostname to IPv6 address (AAAA record)
+pub fn DNSResolveAAAA(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resultPtr: int64): bool {
+  return DNSResolveEx(hostname, hostnameLen, dnsServerIP, DNS_TYPE_AAAA, resultPtr);
+}
+
+// Resolve hostname to IPv6 address using Google DNS
+pub fn DNSResolveAAAAGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var googleDNS: int64 := IPPack(8, 8, 8, 8);
+  return DNSResolveAAAA(hostname, hostnameLen, googleDNS, resultPtr);
+}
+
+// Resolve hostname to IPv6 address using Cloudflare DNS
+pub fn DNSResolveAAAACoudflare(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var cfDNS: int64 := IPPack(1, 1, 1, 1);
+  return DNSResolveAAAA(hostname, hostnameLen, cfDNS, resultPtr);
+}
+
+// Resolve hostname to canonical name (CNAME record)
+pub fn DNSResolveCNAME(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resultPtr: int64): bool {
+  return DNSResolveEx(hostname, hostnameLen, dnsServerIP, DNS_TYPE_CNAME, resultPtr);
+}
+
+// Resolve hostname to canonical name using Google DNS
+pub fn DNSResolveCNAMEGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var googleDNS: int64 := IPPack(8, 8, 8, 8);
+  return DNSResolveCNAME(hostname, hostnameLen, googleDNS, resultPtr);
+}
+
+// Resolve hostname to canonical name using Cloudflare DNS
+pub fn DNSResolveCNAMECloudflare(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var cfDNS: int64 := IPPack(1, 1, 1, 1);
+  return DNSResolveCNAME(hostname, hostnameLen, cfDNS, resultPtr);
+}
+
+// Resolve hostname to mail exchange (MX record)
+pub fn DNSResolveMX(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resultPtr: int64): bool {
+  return DNSResolveEx(hostname, hostnameLen, dnsServerIP, DNS_TYPE_MX, resultPtr);
+}
+
+// Resolve hostname to mail exchange using Google DNS
+pub fn DNSResolveMXGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var googleDNS: int64 := IPPack(8, 8, 8, 8);
+  return DNSResolveMX(hostname, hostnameLen, googleDNS, resultPtr);
+}
+
+// Resolve hostname to mail exchange using Cloudflare DNS
+pub fn DNSResolveMXCloudflare(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
+  var cfDNS: int64 := IPPack(1, 1, 1, 1);
+  return DNSResolveMX(hostname, hostnameLen, cfDNS, resultPtr);
+}
+
+// ============================================================================
+// Legacy API (using old 32-byte result format)
+// ============================================================================
 
 // Resolve using Google's public DNS (8.8.8.8)
 pub fn DNSResolveGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
@@ -337,7 +573,11 @@ pub fn DNSResolveCloudflare(hostname: int64, hostnameLen: int64, resultPtr: int6
   return DNSResolve(hostname, hostnameLen, cfDNS, resultPtr);
 }
 
-// Helper: Print IP address
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Helper: Print IPv4 address
 pub fn DNSPrintIP(ip: int64) {
   PrintInt((ip >> 24) & 0xFF);
   PrintStr(".");
@@ -346,4 +586,56 @@ pub fn DNSPrintIP(ip: int64) {
   PrintInt((ip >> 8) & 0xFF);
   PrintStr(".");
   PrintInt(ip & 0xFF);
+}
+
+// Helper: Print IPv6 address
+pub fn DNSPrintIPV6(data: int64) {
+  var i: int64 := 0;
+  var first: bool := true;
+  
+  while (i < 16) {
+    var word: int64 := (peek8(data + i) << 8) | peek8(data + i + 1);
+    
+    if (word == 0 && first) {
+      // Skip leading zeros
+      i := i + 2;
+      continue;
+    }
+    
+    if (!first) {
+      PrintStr(":");
+    }
+    first := false;
+    
+    // Print in hex
+    var hex: string := "";
+    if ((word >> 12) > 0) {
+      // Simplified hex output
+    }
+    PrintInt(word);
+    
+    i := i + 2;
+  }
+}
+
+// Helper: Get IPv4 from result (for A records)
+pub fn DNSResultGetIPv4(resultPtr: int64): int64 {
+  return (peek8(resultPtr + 40) << 24) | (peek8(resultPtr + 41) << 16) |
+         (peek8(resultPtr + 42) << 8) | peek8(resultPtr + 43);
+}
+
+// Helper: Get TTL from result
+pub fn DNSResultGetTTL(resultPtr: int64): int64 {
+  return (peek8(resultPtr + 16) << 24) | (peek8(resultPtr + 17) << 16) |
+         (peek8(resultPtr + 18) << 8) | peek8(resultPtr + 19);
+}
+
+// Helper: Get record type from result
+pub fn DNSResultGetType(resultPtr: int64): int64 {
+  return peek8(resultPtr + 8);
+}
+
+// Helper: Check if result is success
+pub fn DNSResultIsSuccess(resultPtr: int64): bool {
+  return peek8(resultPtr + 0) != 0;
 }
