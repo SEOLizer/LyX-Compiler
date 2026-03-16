@@ -131,26 +131,234 @@ pub fn Ntohs(port: uint16): uint16 {
   return ((port & 0xFF) << 8) | ((port >> 8) & 0xFF);
 }
 
-// Parse IPv4 address string "a.b.c.d:port"
-pub fn ParseIPAddr(s: string): IPAddr {
+// Parse ASCII digit to integer value (0-9)
+fn asciiToDigit(c: int64): int64 {
+  if (c >= 48 && c <= 57) {  // '0' to '9'
+    return c - 48;
+  }
+  return -1;
+}
+
+// Internal: Parse a single octet from string
+// Returns parsed value and new position, or -1 on error
+fn parseOctet(s: int64, pos: int64, len: int64, outVal: int64): int64 {
+  var val: int64 := 0;
+  var digitCount: int64 := 0;
+  var c: int64;
+  
+  while (pos < len) {
+    c := peek8(s + pos);
+    
+    if (c == 46) {  // '.'
+      break;
+    }
+    if (c == 58) {  // ':'
+      break;
+    }
+    if (c == 0) {   // null terminator
+      break;
+    }
+    
+    var d: int64 := asciiToDigit(c);
+    if (d < 0) {
+      return -1;  // invalid character
+    }
+    
+    val := val * 10 + d;
+    digitCount := digitCount + 1;
+    pos := pos + 1;
+    
+    // Maximum 3 digits per octet
+    if (digitCount > 3) {
+      return -1;
+    }
+  }
+  
+  // Must have at least one digit
+  if (digitCount == 0) {
+    return -1;
+  }
+  
+  // Value must be 0-255
+  if (val > 255) {
+    return -1;
+  }
+  
+  // Write output through pointer
+  poke8(outVal, val);
+  return pos;
+}
+
+// Internal: Parse port number
+// Returns parsed port and new position, or -1 on error
+fn parsePort(s: int64, pos: int64, len: int64, outPort: int64): int64 {
+  var val: int64 := 0;
+  var digitCount: int64 := 0;
+  var c: int64;
+  
+  while (pos < len) {
+    c := peek8(s + pos);
+    
+    if (c == 0) {  // null terminator
+      break;
+    }
+    
+    var d: int64 := asciiToDigit(c);
+    if (d < 0) {
+      return -1;  // invalid character
+    }
+    
+    val := val * 10 + d;
+    digitCount := digitCount + 1;
+    pos := pos + 1;
+    
+    // Maximum 5 digits for port (0-65535)
+    if (digitCount > 5) {
+      return -1;
+    }
+  }
+  
+  // Port is optional - if no digits, default to 0
+  if (digitCount == 0) {
+    val := 0;
+  } else {
+    // Value must be 0-65535
+    if (val > 65535) {
+      return -1;
+    }
+  }
+  
+  // Write port as little-endian 16-bit value
+  poke8(outPort, val & 0xFF);
+  poke8(outPort + 1, (val >> 8) & 0xFF);
+  return pos;
+}
+
+// Parse IPv4 address string to IPAddr
+// Supported formats:
+//   - "a.b.c.d" (e.g., "192.168.1.1")
+//   - "a.b.c.d:port" (e.g., "192.168.1.1:8080")
+//   - ":port" (any IP, specific port)
+// Returns IPAddr with port=0 on parse error
+pub fn ParseIPAddr(s: int64, len: int64): IPAddr {
   var addr: IPAddr;
+  var pos: int64 := 0;
+  var tmp: int64;
+  var portPtr: int64;
+  
+  // Default values
   addr.family := AF_INET;
   addr.a := 0;
   addr.b := 0;
   addr.c := 0;
   addr.d := 0;
-  addr.port := 8080;
+  addr.port := 0;
   
-  // Simple parsing for common cases
-  if (s == "0.0.0.0:8080") {
-    addr.port := 8080;
-  } else if (s == "127.0.0.1:8080") {
-    addr.a := 127;
-    addr.port := 8080;
-  } else if (s == "0.0.0.0:0") {
-    addr.port := 0;
+  // Handle empty string
+  if (len <= 0) {
+    return addr;
   }
   
+  // Check for leading ':' (any IP, just port)
+  if (peek8(s) == 58) {  // ':'
+    pos := 1;
+    portPtr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (portPtr <= 0) {
+      return addr;
+    }
+    pos := parsePort(s, pos, len, portPtr);
+    if (pos < 0) {
+      munmap(portPtr, 16);
+      return addr;
+    }
+    // Read port as little-endian 16-bit value
+    addr.port := (peek8(portPtr) | (peek8(portPtr + 1) << 8)) as uint16;
+    munmap(portPtr, 16);
+    return addr;
+  }
+  
+  // Allocate temporary storage for parsed values
+  tmp := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (tmp <= 0) {
+    return addr;
+  }
+  
+  // Parse first octet (a)
+  pos := parseOctet(s, pos, len, tmp);
+  if (pos < 0) {
+    munmap(tmp, 32);
+    return addr;
+  }
+  addr.a := peek8(tmp) as uint8;
+  
+  // Expect '.'
+  if (pos < len && peek8(s + pos) == 46) {
+    pos := pos + 1;
+  } else {
+    munmap(tmp, 32);
+    return addr;
+  }
+  
+  // Parse second octet (b)
+  pos := parseOctet(s, pos, len, tmp);
+  if (pos < 0) {
+    munmap(tmp, 32);
+    return addr;
+  }
+  addr.b := peek8(tmp) as uint8;
+  
+  // Expect '.'
+  if (pos < len && peek8(s + pos) == 46) {
+    pos := pos + 1;
+  } else {
+    munmap(tmp, 32);
+    return addr;
+  }
+  
+  // Parse third octet (c)
+  pos := parseOctet(s, pos, len, tmp);
+  if (pos < 0) {
+    munmap(tmp, 32);
+    return addr;
+  }
+  addr.c := peek8(tmp) as uint8;
+  
+  // Expect '.'
+  if (pos < len && peek8(s + pos) == 46) {
+    pos := pos + 1;
+  } else {
+    munmap(tmp, 32);
+    return addr;
+  }
+  
+  // Parse fourth octet (d)
+  pos := parseOctet(s, pos, len, tmp);
+  if (pos < 0) {
+    munmap(tmp, 32);
+    return addr;
+  }
+  addr.d := peek8(tmp) as uint8;
+  
+  // Check for port (':')
+  if (pos < len && peek8(s + pos) == 58) {
+    pos := pos + 1;
+    portPtr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (portPtr <= 0) {
+      munmap(tmp, 32);
+      return addr;
+    }
+    pos := parsePort(s, pos, len, portPtr);
+    if (pos < 0) {
+      munmap(portPtr, 16);
+      munmap(tmp, 32);
+      return addr;
+    }
+    // Read port as little-endian 16-bit value
+    addr.port := (peek8(portPtr) | (peek8(portPtr + 1) << 8)) as uint16;
+    munmap(portPtr, 16);
+  }
+
+  munmap(tmp, 32);
   return addr;
 }
 
