@@ -252,10 +252,39 @@ pub fn (p *Poller) Close(): error;
 - [ ] **Unix Domain Sockets** – `AF_UNIX` constant exists but no implementation
 - [x] **Async connect** – No `EINPROGRESS` handling ✅
 
+---
+
+## Language Features Required for std.net
+
+The following language features are needed to make the network library fully compilable:
+
+### High Priority
+
+- [ ] **`break` in while loops** – Required for early loop exit in parsing functions (e.g., `parseOctet`, `parsePort`)
+  - Workaround: Use boolean flag + `while (condition && !done)`
+
+- [ ] **Variable declaration inside control structures** – Currently fails with `var x := func()` inside if/while blocks
+  - Example: `if (cond) { var x := foo(); }` fails
+  - Workaround: Declare all variables at function start
+
+- [ ] **Type casts with `as`** – `int16 := peek8(...) as int16` currently fails in some contexts
+
+### Medium Priority
+
+- [ ] **Function pointers / callbacks** – Needed for async event handlers
+- [ ] **Nested function definitions** – Some internal helpers could be inlined
+
+### Known Workarounds
+
+1. Use `while (cond && !done)` instead of `break`
+2. Declare all variables at the beginning of functions
+3. Avoid complex expressions in variable initializers inside blocks
+4. Use `peek8()` with manual bit operations instead of typed casts
+
 ### Low Priority
 
-- [x] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution ✅
-- [x] **Additional DNS Records** – TXT, NS, SOA, PTR, SRV, CAA, DS, DNSKEY not implemented ✅
+- [ ] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution ✅
+- [ ] **Additional DNS Records** – TXT, NS, SOA, PTR, SRV, CAA, DS, DNSKEY not implemented ✅
 - [ ] **Stack Allocation** – All functions use `mmap` for temporary structures (performance)
 - [ ] **Hostname Resolution** – No `gethostbyname`, only IP-based operations
 - [ ] **Connection Pooling** – Not implemented yet
