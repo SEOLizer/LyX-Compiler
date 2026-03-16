@@ -247,10 +247,10 @@ pub fn (p *Poller) Close(): error;
 
 ### Medium Priority
 
-- [ ] **Non-blocking I/O** – Only basic `MSG_DONTWAIT` support
-- [ ] **select/poll** – No multiplexing functions
+- [x] **Non-blocking I/O** – Only basic `MSG_DONTWAIT` support ✅
+- [x] **select/poll** – No multiplexing functions ✅
 - [ ] **Unix Domain Sockets** – `AF_UNIX` constant exists but no implementation
-- [ ] **Async connect** – No `EINPROGRESS` handling
+- [x] **Async connect** – No `EINPROGRESS` handling ✅
 
 ### Low Priority
 
