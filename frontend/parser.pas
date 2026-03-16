@@ -876,6 +876,14 @@ begin
     end;
   end;
 
+  // break; - exit loop early
+  if Check(tkBreak) then
+  begin
+    Advance;
+    Expect(tkSemicolon);
+    Exit(TAstBreak.Create(FCurTok.Span));
+  end;
+
   // dispose expr; - free heap-allocated class instance
   if Check(tkDispose) then
   begin
