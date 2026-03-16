@@ -277,7 +277,8 @@ The following language features are needed to make the network library fully com
 - [x] **Variable declaration inside control structures** – Works with `var x := func()` inside if/while blocks ✅
   - Example: `if (cond) { var x := foo(); }` compiles successfully
 
-- [ ] **Type casts with `as`** – `int16 := peek8(...) as int16` currently fails in some contexts
+- [x] **Type casts with `as`** – `int16 := peek8(...) as int16` works now ✅
+  - Works for: int64 ↔ uint8/uint16/uint32/int8/int16/int32, int64 ↔ f64
   - Needed for: `addr.port := (peek8(portPtr) | (peek8(portPtr + 1) << 8)) as uint16;`
 
 ### Medium Priority

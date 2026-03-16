@@ -2334,7 +2334,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
-        // Check for int -> float conversion
+        // Check for int64 -> float conversion
         else if (ltype = atInt64) and (rType = atF64) then
         begin
           instr.Op := irIToF;
@@ -2342,10 +2342,74 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
-        // Check for float -> int conversion
+        // Check for float -> int64 conversion
         else if (ltype = atF64) and (rType = atInt64) then
         begin
           instr.Op := irFToI;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          Emit(instr);
+        end
+        // Check for int64 -> uint8 (truncate to 8 bits)
+        else if (ltype = atInt64) and (rType = atUInt8) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 8;  // Truncate to 8 bits
+          Emit(instr);
+        end
+        // Check for int64 -> uint16 (truncate to 16 bits)
+        else if (ltype = atInt64) and (rType = atUInt16) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 16;  // Truncate to 16 bits
+          Emit(instr);
+        end
+        // Check for int64 -> uint32 (truncate to 32 bits)
+        else if (ltype = atInt64) and (rType = atUInt32) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 32;  // Truncate to 32 bits
+          Emit(instr);
+        end
+        // Check for int64 -> int8 (truncate to 8 bits with sign extension)
+        else if (ltype = atInt64) and (rType = atInt8) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 8;  // Truncate to 8 bits
+          Emit(instr);
+          // TODO: Sign extension after truncation
+        end
+        // Check for int64 -> int16 (truncate to 16 bits)
+        else if (ltype = atInt64) and (rType = atInt16) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 16;  // Truncate to 16 bits
+          Emit(instr);
+        end
+        // Check for int64 -> int32 (truncate to 32 bits)
+        else if (ltype = atInt64) and (rType = atInt32) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 32;  // Truncate to 32 bits
+          Emit(instr);
+        end
+        // Check for unsigned -> int64 (no conversion needed, just zero-extend conceptually)
+        else if (rType = atInt64) and (ltype in [atUInt8, atUInt16, atUInt32, atUInt64]) then
+        begin
+          // No conversion needed for unsigned -> signed int64
+          instr.Op := irLoadLocal;
           instr.Dest := t0;
           instr.Src1 := t1;
           Emit(instr);
