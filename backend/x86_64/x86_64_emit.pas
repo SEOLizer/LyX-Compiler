@@ -522,6 +522,8 @@ var
   mainPos: Integer;
   offset: Integer;
   negOffset: Integer;
+  baseOffset: Integer;
+  slotCount: Integer;
   argCount: Integer;
   argTemps: array of Integer;
   stackArgsCount: Integer;
@@ -969,17 +971,29 @@ begin
               // Load address of struct local (multiple slots) into temp: dest = &locals[Src1]
               // Src1 is a local slot index (0..LocalCount-1)
               // StructSize gives the total size in bytes
+              //
+              // Stack layout for a struct with N slots (e.g., 2 slots for 14-byte struct):
+              //   Slot 0 at rbp - 8   (highest address)
+              //   Slot 1 at rbp - 16  (lowest address)
+              // Field byte 0 should be at the LOWEST address, so we need to calculate
+              // the base as the lowest slot address.
+              //
+              // For positive field offsets to work: base = SlotOffset(slotIdx + slotCount - 1)
               slotIdx := instr.Src1;
-              // lea rax, [rbp + SlotOffset(slotIdx)]
-              if (SlotOffset(slotIdx) >= -128) and (SlotOffset(slotIdx) <= 127) then
+              slotCount := (instr.StructSize + 7) div 8; // round up to slot count
+              if slotCount < 1 then slotCount := 1;
+              // Calculate base address (lowest address = last slot)
+              baseOffset := SlotOffset(slotIdx + slotCount - 1);
+              // lea rax, [rbp + baseOffset]
+              if (baseOffset >= -128) and (baseOffset <= 127) then
               begin
                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $45); 
-                EmitU8(FCode, Byte(SlotOffset(slotIdx)));
+                EmitU8(FCode, Byte(baseOffset));
               end
               else
               begin
                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $85);
-                EmitU32(FCode, Cardinal(SlotOffset(slotIdx)));
+                EmitU32(FCode, Cardinal(baseOffset));
               end;
               // Store address into temp slot
               slotIdx := fn.LocalCount + instr.Dest;
@@ -3270,10 +3284,11 @@ begin
 
           irLoadField:
             begin
-              // Load field from struct: Dest = *(Src1 - ImmInt)
-              // Stack structs grow downward, so field offsets are SUBTRACTED from base
+              // Load field from struct: Dest = *(Src1 + ImmInt)
+              // Base address now points to the LOWEST address of the struct (via irLoadStructAddr),
+              // so we ADD the field offset to get the correct byte address.
               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-              negOffset := -instr.ImmInt;
+              negOffset := instr.ImmInt; // positive offset from base (lowest address)
               
               // Use FieldSize to determine load width (default to 8 if not set)
               case instr.FieldSize of
@@ -3326,11 +3341,12 @@ begin
 
           irStoreField:
             begin
-              // Store field into struct: *(Src1 - ImmInt) = Src2
-              // Stack structs grow downward, so field offsets are SUBTRACTED from base
+              // Store field into struct: *(Src1 + ImmInt) = Src2
+              // Base address now points to the LOWEST address of the struct (via irLoadStructAddr),
+              // so we ADD the field offset to get the correct byte address.
               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // base addr
               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2)); // value
-              negOffset := -instr.ImmInt;
+              negOffset := instr.ImmInt; // positive offset from base (lowest address)
               
               // Use FieldSize to determine store width (default to 8 if not set)
               case instr.FieldSize of
