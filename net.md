@@ -229,10 +229,19 @@ pub fn (p *Poller) Close(): error;
 | File | Description |
 |------|-------------|
 | `std/net/types.lyx` | Constants (AF_INET, SOCK_STREAM, etc.), Types (IPAddr, SockAddrIn, MacAddr, EthernetHeader, ARPPacket), Helpers (Htons, Ntohs, IPPack, IPUnpack), TCP/Socket Options |
-| `std/net/socket.lyx` | TCPListener, TCPConn, UDPSocket, RawSocket, ICMP-Ping, ARP packets, Socket Options (Nodelay, KeepAlive, Buffers) |
-| `std/net/dns.lyx` | DNS resolver (A records), DNSResolveGoogle, DNSResolveCloudflare |
+| `std/net/socket.lyx` | TCPListener, TCPConn, UDPSocket, RawSocket, ICMP-Ping, ARP packets, Socket Options (Nodelay, KeepAlive, Buffers), Non-blocking I/O, poll/select support, Async connect |
+| `std/net/dns.lyx` | DNS resolver (A, AAAA, MX, CNAME, NS, TXT, SOA, PTR, SRV, CAA, DS, DNSKEY records), DNSResolveGoogle, DNSResolveCloudflare |
 | `std/net/syscalls.lyx` | Low-level syscall declarations |
 | `std/net/internal/types.lyx` | Extended constants + IPv6 structures (SockAddrIn6) |
+
+### ✅ Function Pointers / Callbacks (NEW!)
+
+| Feature | Status |
+|---------|--------|
+| Function pointer type syntax: `fn(int64, int64) -> int64` | ✅ Done |
+| Assignment: `var cb: Callback := add` | ✅ Done |
+| Indirect call: `cb(10, 20)` | ✅ Done |
+| Function address casting: `add as int64` | ✅ Done |
 
 ---
 
@@ -240,15 +249,17 @@ pub fn (p *Poller) Close(): error;
 
 ### High Priority (std.net bugs)
 
-- [ ] **Struct mit Array-Feld** – `array[N]uint8` in structs (z.B. `DNSResult.data`) verursacht "cannot compute layout" Fehler
+- [x] **Struct mit Array-Feld** – `array[N]uint8` in structs (z.B. `DNSResult.data`) verursacht "cannot compute layout" Fehler
   - Betroffene Dateien: `std/net/dns.lyx`, `std/net/internal/types.lyx`
   - Workaround: Pointer + mmap verwenden statt embedded arrays
+  - **FIXED**: Arrays aus Structs entfernt
 
-- [ ] **Array → Pointer Typ-Mismatch** – Funktionen erwarten `int64` (Pointer), aber Tests übergeben `array[N]uint8`
+- [x] **Array → Pointer Typ-Mismatch** – Funktionen erwarten `int64` (Pointer), aber Tests übergeben `array[N]uint8`
   - Beispiel: `DNSResolveGoogle(hostname: int64, ...)` wird mit `var hostname: array[16]uint8` aufgerufen
   - Workaround: Explizit `hostname as int64` oder `&hostname[0]` verwenden
+  - **FIXED**: Tests verwenden jetzt mmap für Hostnamen
 
-- [ ] **parsePort Syntax-Fehler** – Fehlende schließende Klammer in `parsePort` (var inside if/else) ✅ **Fixed**
+- [x] **parsePort Syntax-Fehler** – Fehlende schließende Klammer in `parsePort` (var inside if/else) ✅ **Fixed**
 
 ### Medium Priority (std.net features)
 
@@ -283,11 +294,11 @@ The following language features are needed to make the network library fully com
 
 ### Medium Priority
 
-- [~] **Function pointers / callbacks** – Partial implementation (as opaque int64) ✅
+- [x] **Function pointers / callbacks** – Partial implementation (as opaque int64) ✅
   - Syntax: `var cb: fn(int64) -> int64;` works
-  - Assignment: `var cb: fn(int64) -> int64 := func;` works  
-  - TODO: Indirect call via register requires IR opcode + codegen
-  - Workaround: Use wrapper functions for now
+  - Assignment: `var cb: fn(int64) -> int64 := func;` works
+  - Indirect call: `cb(arg1, arg2)` works via irVarCall
+  - ✅ **FULLY IMPLEMENTED** (March 2026)
 
 - [ ] **Nested function definitions** – Some internal helpers could be inlined
 
@@ -300,9 +311,14 @@ The following language features are needed to make the network library fully com
 
 ### Low Priority
 
-- [ ] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution ✅
-- [ ] **Additional DNS Records** – TXT, NS, SOA, PTR, SRV, CAA, DS, DNSKEY not implemented ✅
-- [ ] **Stack Allocation** – All functions use `mmap` for temporary structures (performance)
+- [x] **Full DNS** – Only A records, missing AAAA, MX, CNAME resolution ✅
+  - ✅ **IMPLEMENTED**: A, AAAA, MX, CNAME, NS, TXT, SOA, PTR, SRV, CAA, DS, DNSKEY
+
+- [x] **Additional DNS Records** – TXT, NS, SOA, PTR, SRV, CAA, DS, DNSKEY not implemented ✅
+  - ✅ **ALL IMPLEMENTED**
+
+- [x] **Stack Allocation** – All functions use `mmap` for temporary structures (performance) ✅
+
 - [ ] **Hostname Resolution** – No `gethostbyname`, only IP-based operations
 - [ ] **Connection Pooling** – Not implemented yet
 - [ ] **HTTP Client** – Not implemented yet
