@@ -400,12 +400,14 @@ type
     FExpr: TAstExpr;
     FCastType: TAurumType;
     FCastTypeName: string;  // Type name for resolution in sema
+    FIsFunctionToPointer: Boolean;  // True if casting function to pointer (returns address)
   public
     constructor Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Expr: TAstExpr read FExpr;
     property CastType: TAurumType read FCastType write FCastType;
     property CastTypeName: string read FCastTypeName write FCastTypeName;
+    property IsFunctionToPointer: Boolean read FIsFunctionToPointer write FIsFunctionToPointer;
   end;
 
   { Function Pointer Type: fn(param1, param2) -> returnType }
