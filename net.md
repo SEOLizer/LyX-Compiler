@@ -319,7 +319,7 @@ The following language features are needed to make the network library fully com
 
 - [x] **Stack Allocation** – All functions use `mmap` for temporary structures (performance) ✅
 
-- [ ] **Hostname Resolution** – No `gethostbyname`, only IP-based operations
+- [x] **Hostname Resolution** – GetHostByName(), ResolveHost() implemented ✅
 - [ ] **Connection Pooling** – Not implemented yet
 - [ ] **HTTP Client** – Not implemented yet
 - [ ] **TLS Support** – Not implemented yet
