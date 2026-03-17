@@ -272,7 +272,7 @@ pub fn (p *Poller) Close(): error;
 
 - [x] **Non-blocking I/O** – Only basic `MSG_DONTWAIT` support ✅
 - [x] **select/poll** – No multiplexing functions ✅
-- [ ] **Unix Domain Sockets** – `AF_UNIX` constant exists but no implementation
+- [x] **Unix Domain Sockets** – AF_UNIX, sockaddr_un, UnixSocketNew/Bind/Listen/Accept/Connect/Close ✅
 - [x] **Async connect** – No `EINPROGRESS` handling ✅
 
 ---
