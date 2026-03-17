@@ -1920,16 +1920,48 @@ var
   innerTypeName: string;
   innerNullable: Boolean;
   innerArrayLen: Integer;
-  innerType, keyType, valueType, elementType: TAurumType;
+  innerType, keyType, valueType, elementType, paramType, returnType: TAurumType;
+  paramTypes: array of TAurumType;
 begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
 
   // Check for array type syntax: Type[N] or []Type or Array<T> or Map<K,V> or Set<T>
+  // Also check for function pointer type: fn(params) -> returnType
   // First parse the base type
-  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) or Check(tkMap) or Check(tkSet) then
+  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) or Check(tkMap) or Check(tkSet) or Check(tkFn) then
   begin
+    // Handle function pointer type: fn(params) -> returnType
+    if Check(tkFn) then
+    begin
+      Advance; // consume 'fn'
+      Expect(tkLParen);
+      
+      // Parse parameter types
+      paramTypes := nil;
+      if not Check(tkRParen) then
+      begin
+        repeat
+          paramType := ParseType;
+          SetLength(paramTypes, Length(paramTypes) + 1);
+          paramTypes[High(paramTypes)] := paramType;
+        until not Accept(tkComma);
+      end;
+      Expect(tkRParen);
+      
+      // Parse return type
+      Expect(tkMinus);
+      Expect(tkGt);
+      returnType := ParseType;
+      
+      // Create function pointer type AST node
+      Result := atFnPtr;
+      // Note: We store the signature info in a global or pass it through
+      // For now, we'll handle this in sema phase
+      Exit;
+    end;
+    
     // Handle 'parallel Array<T>' first
     if Check(tkParallel) then
     begin

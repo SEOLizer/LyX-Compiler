@@ -3007,10 +3007,22 @@ begin
           vtype := CheckExpr(vd.InitExpr)
         else
           vtype := vd.DeclType;  // Use declared type if no initializer
-        // Allow integer literal 0 to be assigned to nullable pointer types
-        if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
+        
+        // Special case: treat fn(...) types as int64 internally (opaque function pointer)
+        if vd.DeclType = atFnPtr then
         begin
-          // Special case: integer literal 0 can be assigned to nullable pointer
+          // Function pointer - treat as int64 for internal storage
+          // TODO: proper function pointer type checking with signature matching
+          if (vtype = atInt64) or (vtype = atFnPtr) then
+            vtype := atInt64  // Accept int64 or function address
+          else if TypeEqual(vtype, vd.DeclType) then
+            vtype := atInt64  // Same fn type, use int64
+          else
+            FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
+        end
+        else if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
+        begin
+          // Allow integer literal 0 to be assigned to nullable pointer types
           if (vtype = atInt64) and (vd.DeclType = atPCharNullable) and 
              Assigned(vd.InitExpr) and (vd.InitExpr is TAstIntLit) and 
              (TAstIntLit(vd.InitExpr).Value = 0) then

@@ -283,7 +283,12 @@ The following language features are needed to make the network library fully com
 
 ### Medium Priority
 
-- [ ] **Function pointers / callbacks** – Needed for async event handlers
+- [~] **Function pointers / callbacks** – Partial implementation (as opaque int64) ✅
+  - Syntax: `var cb: fn(int64) -> int64;` works
+  - Assignment: `var cb: fn(int64) -> int64 := func;` works  
+  - TODO: Indirect call via register requires IR opcode + codegen
+  - Workaround: Use wrapper functions for now
+
 - [ ] **Nested function definitions** – Some internal helpers could be inlined
 
 ### Known Workarounds
