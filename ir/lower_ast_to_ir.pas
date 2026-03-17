@@ -79,6 +79,20 @@ begin
   Result := Integer(Pointer(o));
 end;
 
+// Returns the size in bytes for a given type (for field access width)
+function TypeSizeBytes(t: TAurumType): Integer;
+begin
+  case t of
+    atInt8, atUInt8, atBool, atChar: Result := 1;
+    atInt16, atUInt16: Result := 2;
+    atInt32, atUInt32, atF32: Result := 4;
+    atInt64, atUInt64, atISize, atUSize, atF64, atPChar, atPCharNullable,
+    atDynArray, atArray, atMap, atSet, atParallelArray: Result := 8;
+  else
+    Result := 8; // Default to 8 bytes (full register width) - includes atUnresolved, atVoid
+  end;
+end;
+
 { TIRLowering }
 
 constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
@@ -284,6 +298,8 @@ var
   items: TAstExprList;
   vals: array of Int64;
   strIdx: Integer;
+  structIdx: Integer;
+  sd: TAstStructDecl;
 begin
   instr := Default(TIRInstr);
   // First pass: collect all struct, class, and global variable declarations
@@ -391,6 +407,18 @@ begin
         FTempCounter := 0;
        fn.ParamCount := Length(TAstFuncDecl(node).Params);
        fn.LocalCount := fn.ParamCount;
+       
+       // Calculate ReturnStructSize for struct-returning functions
+       fn.ReturnStructSize := 0;
+       if TAstFuncDecl(node).ReturnTypeName <> '' then
+       begin
+         structIdx := FStructTypes.IndexOf(TAstFuncDecl(node).ReturnTypeName);
+         if structIdx >= 0 then
+         begin
+           sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+           fn.ReturnStructSize := sd.Size;
+         end;
+       end;
        SetLength(FLocalTypes, fn.LocalCount);
        SetLength(FLocalConst, fn.LocalCount);
        for j := 0 to fn.ParamCount - 1 do
@@ -928,6 +956,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     elemSize: Integer;
     fa: TAstFieldAssign;
     fldOffset: Integer;
+    fldType: TAurumType;
     ownerName: string;
     slotCount: Integer;
     baseIdx: Integer;
@@ -966,6 +995,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
     errLbl: string;
+    // Nested field access
+    baseExpr: TAstExpr;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -1505,23 +1536,53 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (call.Name = 'rename') or
-                ((call.Namespace = 'IO') and (call.Name = 'rename')) then
-        begin
-          // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'rename';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
+          else if (call.Name = 'rename') or
+                  ((call.Namespace = 'IO') and (call.Name = 'rename')) then
+          begin
+            // rename(oldpath: pchar, newpath: pchar) -> int64 (0 or -1)
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'rename';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'peek8') then
+          begin
+            // peek8(addr: int64) -> int64 (byte value)
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'peek8';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'poke8') then
+          begin
+            // poke8(addr: int64, value: int64) -> void
+            instr.Op := irCallBuiltin;
+            instr.Dest := -1;
+            instr.ImmStr := 'poke8';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := -1;
+          end
         else if (call.Name = 'mkdir') or
                 ((call.Namespace = 'IO') and (call.Name = 'mkdir')) then
         begin
@@ -1555,106 +1616,212 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
-        else if (call.Name = 'chmod') or
-                ((call.Namespace = 'IO') and (call.Name = 'chmod')) then
-        begin
-          // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'chmod';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'ioctl') or
-                ((call.Namespace = 'IO') and (call.Name = 'ioctl')) then
-        begin
-          // ioctl(fd: int64, request: int64, argp: int64) -> int64
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'ioctl';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'mmap') or
-                ((call.Namespace = 'IO') and (call.Name = 'mmap')) then
-        begin
-          // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'mmap';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'munmap') or
-                ((call.Namespace = 'IO') and (call.Name = 'munmap')) then
-        begin
-          // munmap(addr: int64, length: int64) -> int64
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'munmap';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
-          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'Random') or
-                ((call.Namespace = 'Math') and (call.Name = 'Random')) then
-        begin
-          // Random() -> int64: returns pseudo-random number
-          t0 := NewTemp;
-          instr.Op := irCallBuiltin;
-          instr.Dest := t0;
-          instr.ImmStr := 'Random';
-          instr.ImmInt := 0;
-          SetLength(instr.ArgTemps, 0);
-          Emit(instr);
-          Result := t0;
-        end
-        else if (call.Name = 'RandomSeed') or
-                ((call.Namespace = 'Math') and (call.Name = 'RandomSeed')) then
-        begin
-          // RandomSeed(seed) -> void: sets the random seed
-          instr.Op := irCallBuiltin;
-          instr.Dest := -1;
-          instr.ImmStr := 'RandomSeed';
-          instr.ImmInt := argCount;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
-          if argCount >= 1 then
-            instr.Src1 := argTemps[0]
-          else
-            instr.Src1 := -1;
-          Emit(instr);
-          Result := -1;
-        end
-        else if call.Name = 'buf_put_byte' then
+         else if (call.Name = 'chmod') or
+                 ((call.Namespace = 'IO') and (call.Name = 'chmod')) then
+         begin
+           // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'chmod';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         // === Socket System Calls (for std.net) ===
+         else if call.Name = 'sys_socket' then
+         begin
+           // sys_socket(domain: int64, type: int64, protocol: int64) -> int64
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_socket';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_bind' then
+         begin
+           // sys_bind(sockfd, addr, addrlen) -> int64
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_bind';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_listen' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_listen';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_accept' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_accept';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_connect' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_connect';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_recvfrom' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_recvfrom';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_sendto' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_sendto';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_setsockopt' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_setsockopt';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_getsockopt' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_getsockopt';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_fcntl' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_fcntl';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+           Emit(instr);
+           Result := t0;
+         end
+         else if call.Name = 'sys_shutdown' then
+         begin
+           t0 := NewTemp;
+           instr.Op := irCallBuiltin;
+           instr.Dest := t0;
+           instr.ImmStr := 'sys_shutdown';
+           instr.ImmInt := argCount;
+           SetLength(instr.ArgTemps, argCount);
+           for i := 0 to argCount - 1 do
+             instr.ArgTemps[i] := argTemps[i];
+           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // === mmap/munmap for memory allocation ===
+          else if call.Name = 'mmap' then
+          begin
+            // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'mmap';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if call.Name = 'munmap' then
+          begin
+            // munmap(addr, length) -> int64
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'munmap';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Buffer/primitive calls
+          else if call.Name = 'buf_put_byte' then
         begin
           // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
           t0 := NewTemp;
@@ -1848,16 +2015,57 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         end
         else
         begin
-          // Regular function call
+          // Regular function call (or function pointer call)
           t0 := NewTemp;
-          instr.Op := irCall;
-          instr.Dest := t0;
-          instr.ImmStr := call.Name;
-          instr.ImmInt := argCount; // Backend needs argCount in ImmInt
-          instr.IsVirtualCall := False;
-          instr.VMTIndex := -1;
           
-          // Check if this is a method call (mangled name starts with _L_)
+          // Check if this is a function pointer call (indirect call)
+          if call.IsIndirectCall then
+          begin
+            // This is an indirect call via function pointer
+            // First, load the function pointer value (the variable name is in call.Name)
+            // We need to resolve the variable and load its value
+            
+            // Load the function pointer value from the variable
+            // call.Name contains the variable name (e.g., "cb")
+            instr := Default(TIRInstr);
+            instr.Op := irLoadLocal;  // Load the function pointer value
+            instr.Dest := t0;
+            instr.Src1 := ResolveLocal(call.Name);  // local slot index
+            if instr.Src1 < 0 then
+            begin
+              // Try as global variable
+              instr.Op := irLoadGlobal;
+              instr.Src1 := -1;
+              instr.ImmStr := call.Name;
+            end;
+            Emit(instr);
+            
+            // Now emit indirect call using the loaded function pointer
+            instr := Default(TIRInstr);
+            instr.Op := irVarCall;
+            instr.Dest := t0;
+            instr.Src1 := t0;  // Use the loaded function pointer as the call target
+            instr.ImmInt := argCount;
+            instr.IsVirtualCall := False;
+            instr.VMTIndex := -1;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end
+          else
+          begin
+            // Regular direct function call
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := call.Name;
+            instr.ImmInt := argCount; // Backend needs argCount in ImmInt
+            instr.IsVirtualCall := False;
+            instr.VMTIndex := -1;
+           
+            // Check if this is a method call (mangled name starts with _L_)
           if (Length(call.Name) > 3) and (Copy(call.Name, 1, 3) = '_L_') then
           begin
             // Extract class name and method name from mangled name
@@ -1927,6 +2135,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.ArgTemps[i] := argTemps[i];
           Emit(instr);
           Result := t0;
+          end;
         end;
       end;
 
@@ -2167,7 +2376,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
-        // Check for int -> float conversion
+        // Check for int64 -> float conversion
         else if (ltype = atInt64) and (rType = atF64) then
         begin
           instr.Op := irIToF;
@@ -2175,7 +2384,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
-        // Check for float -> int conversion
+        // Check for float -> int64 conversion
         else if (ltype = atF64) and (rType = atInt64) then
         begin
           instr.Op := irFToI;
@@ -2183,64 +2392,212 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
-        else
+        // Check for function pointer to int64 (function address cast)
+        else if TAstCast(expr).IsFunctionToPointer then
         begin
-          // No conversion needed, just copy
+          // This is a cast from function to int64 - return the function address
+          // The expression could be a function call or a function name (identifier)
+          
+          // Check if the source expression is a function identifier (not a call)
+          if TAstCast(expr).Expr is TAstIdent then
+          begin
+            // Function name cast to int64 - load the function address
+            // Use irLoadGlobalAddr to get the function address
+            instr := Default(TIRInstr);
+            instr.Op := irLoadGlobalAddr;
+            instr.Dest := t0;
+            instr.ImmStr := TAstIdent(TAstCast(expr).Expr).Name;
+            Emit(instr);
+          end
+          else
+          begin
+            // For other expressions (like function calls), just copy the value
+            // This is a workaround - proper handling would require more changes
+            instr.Op := irLoadLocal;
+            instr.Dest := t0;
+            instr.Src1 := t1;
+            Emit(instr);
+          end;
+        end
+        // Check for int64 -> uint8 (truncate to 8 bits)
+        else if (ltype = atInt64) and (rType = atUInt8) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 8;  // Truncate to 8 bits
+          Emit(instr);
+        end
+        // Check for int64 -> uint16 (truncate to 16 bits)
+        else if (ltype = atInt64) and (rType = atUInt16) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 16;  // Truncate to 16 bits
+          Emit(instr);
+        end
+        // Check for int64 -> uint32 (truncate to 32 bits)
+        else if (ltype = atInt64) and (rType = atUInt32) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 32;  // Truncate to 32 bits
+          Emit(instr);
+        end
+        // Check for int64 -> int8 (truncate to 8 bits with sign extension)
+        else if (ltype = atInt64) and (rType = atInt8) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 8;  // Truncate to 8 bits
+          Emit(instr);
+          // TODO: Sign extension after truncation
+        end
+        // Check for int64 -> int16 (truncate to 16 bits)
+        else if (ltype = atInt64) and (rType = atInt16) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 16;  // Truncate to 16 bits
+          Emit(instr);
+        end
+        // Check for int64 -> int32 (truncate to 32 bits)
+        else if (ltype = atInt64) and (rType = atInt32) then
+        begin
+          instr.Op := irTrunc;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.ImmInt := 32;  // Truncate to 32 bits
+          Emit(instr);
+        end
+        // Check for unsigned -> int64 (no conversion needed, just zero-extend conceptually)
+        else if (rType = atInt64) and (ltype in [atUInt8, atUInt16, atUInt32, atUInt64]) then
+        begin
+          // No conversion needed for unsigned -> signed int64
           instr.Op := irLoadLocal;
           instr.Dest := t0;
           instr.Src1 := t1;
           Emit(instr);
+        end
+        else
+        begin
+          // No conversion needed - just use the source temp directly
+          // (No need to emit a copy instruction)
+          Result := t1;
+          Exit;
         end;
 
         Result := t0;
       end;
 
     nkFieldAccess:
-      begin
-        // Lower object
-        t1 := LowerExpr(TAstFieldAccess(expr).Obj);
-        if t1 < 0 then
-          Exit;
+       begin
+         // For nested field access like o.x.a, we need to find the root struct
+         // and use the combined offset. The Sema has already calculated the
+         // combined offset in FieldOffset.
+         
+         // Walk up the chain of field accesses to find the root (non-field) expression
+         baseExpr := TAstFieldAccess(expr).Obj;
+         while (baseExpr is TAstFieldAccess) do
+           baseExpr := TAstFieldAccess(baseExpr).Obj;
+         
+         // Now lower the root expression (e.g., 'o' in 'o.x.a')
+         t1 := LowerExpr(baseExpr);
+         if t1 < 0 then
+           Exit;
 
-        // If sema annotated the field offset on the AST node, use it
-        fldOffset := TAstFieldAccess(expr).FieldOffset;
-        ownerName := TAstFieldAccess(expr).OwnerName;
+         // If sema annotated the field offset on the AST node, use it
+         fldOffset := TAstFieldAccess(expr).FieldOffset;
+         ownerName := TAstFieldAccess(expr).OwnerName;
+         fldType := TAstFieldAccess(expr).FieldType; // Get the field type for proper extension
 
-        t0 := NewTemp;
-        if fldOffset >= 0 then
-        begin
-          // Check if owner is a class (heap) or struct (stack)
-          if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
-          begin
-            // Class: use positive offset (heap access)
-            instr.Op := irLoadFieldHeap;
-            instr.Dest := t0;
-            instr.Src1 := t1;
-            instr.ImmInt := fldOffset; // positive offset for heap
-            Emit(instr);
+         t0 := NewTemp;
+         if fldOffset >= 0 then
+         begin
+           // Check if owner is a class (heap) or struct (stack)
+            if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
+            begin
+              // Class: use positive offset (heap access)
+              instr.Op := irLoadFieldHeap;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.ImmInt := fldOffset; // positive offset for heap
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end
+            else
+            begin
+              // Struct: use negative offset (stack access)
+              instr.Op := irLoadField;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.ImmInt := fldOffset; // will be negated in backend
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end;
           end
           else
           begin
-            // Struct: use negative offset (stack access)
+            // Fallback to name-based access (slower / requires runtime lookup)
+            // Assume struct for fallback
             instr.Op := irLoadField;
-            instr.Dest := t0;
-            instr.Src1 := t1;
-            instr.ImmInt := fldOffset; // will be negated in backend
-            Emit(instr);
-          end;
-        end
-        else
-        begin
-          // Fallback to name-based access (slower / requires runtime lookup)
-          // Assume struct for fallback
-          instr.Op := irLoadField;
-          instr.Dest := t0;
-          instr.Src1 := t1;
-          instr.LabelName := TAstFieldAccess(expr).Field;
-          Emit(instr);
-        end;
-        Result := t0;
-      end;
+           instr.Dest := t0;
+           instr.Src1 := t1;
+           instr.LabelName := TAstFieldAccess(expr).Field;
+           instr.FieldSize := TypeSizeBytes(fldType);
+           Emit(instr);
+         end;
+         
+         // Sign/zero-extend the loaded value to full register width based on field type
+         if (fldType <> atUnresolved) and (fldType <> atInt64) and (fldType <> atUInt64) then
+         begin
+           t2 := NewTemp; // temp for extended value
+           case fldType of
+             atInt8, atUInt8:   // 8-bit types
+               begin
+                 if fldType = atInt8 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 8;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+             atInt16, atUInt16: // 16-bit types
+               begin
+                 if fldType = atInt16 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 16;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+             atInt32, atUInt32: // 32-bit types
+               begin
+                 if fldType = atInt32 then
+                   instr.Op := irSExt // sign-extend for signed
+                 else
+                   instr.Op := irZExt; // zero-extend for unsigned
+                 instr.Dest := t2;
+                 instr.Src1 := t0;
+                 instr.ImmInt := 32;
+                 Emit(instr);
+                 t0 := t2; // use extended value
+               end;
+           end;
+         end;
+         
+         Result := t0;
+       end;
 
     nkArrayLit:
       begin
@@ -2480,6 +2837,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t0;  // object pointer
           instr.Src2 := t1;  // VMT address
           instr.ImmInt := 0; // offset 0
+          instr.FieldSize := 8; // VMT pointer is always 8 bytes
           Emit(instr);
         end;
         
@@ -2862,6 +3220,7 @@ begin
         instr.Src1 := addrTemp;  // base address
         instr.Src2 := valTemp;   // value
         instr.ImmInt := fldOffset;
+        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
         Emit(instr);
         
         Break;
@@ -2872,7 +3231,7 @@ begin
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
   end;
   
-  // Return the address temp
+  // Return the address temp (LowerStructLit)
   Result := addrTemp;
 end;
 
@@ -2915,6 +3274,7 @@ begin
         instr.Src1 := addrTemp;  // base address
         instr.Src2 := valTemp;   // value
         instr.ImmInt := fldOffset;
+        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
         Emit(instr);
         
         Break;
@@ -2978,6 +3338,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     structIdx: Integer;
     structSlots: Integer;
     slotCount: Integer;
+    // nested field access helpers
+    baseExpr: TAstExpr;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -3249,6 +3611,61 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         end;
         Exit(True);
       end
+      // Check for function pointer: either explicit atFnPtr type OR unresolved with function name as initializer
+      // This handles the case where type declarations aren't resolved in sema
+      else if (vd.DeclType = atFnPtr) or 
+              ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
+               Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
+      begin
+        // Function pointer: allocate one slot and initialize with function address
+        loc := AllocLocal(vd.Name, atFnPtr);  // Use atFnPtr for function pointers
+        
+        // Check if initializer is a function identifier
+        if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) then
+        begin
+          // Function name as initializer - load function address
+          // Use irLoadGlobalAddr to get the function address
+          // First load into a temp, then store to local slot
+          tmp := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irLoadGlobalAddr;
+          instr.Dest := tmp;
+          instr.ImmStr := TAstIdent(vd.InitExpr).Name;
+          Emit(instr);
+          // Store to local slot
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+        end
+        else if Assigned(vd.InitExpr) then
+        begin
+          // Other initializer - lower it normally
+          tmp := LowerExpr(vd.InitExpr);
+          if tmp >= 0 then
+          begin
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          // No initializer - initialize to 0 (null function pointer)
+          tmp := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irConstInt;
+          instr.Dest := tmp;
+          instr.ImmInt := 0;
+          Emit(instr);
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+        end;
+        Exit(True);
+      end
       else
       begin
         // scalar local
@@ -3379,7 +3796,18 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     begin
       fa := TAstFieldAssign(stmt);
       // target is a TAstFieldAccess node
-      t1 := LowerExpr(fa.Target.Obj);
+      
+      // For nested field access like o.x.a, we need to find the root struct
+      // and use the combined offset. The Sema has already calculated the
+      // combined offset in fa.Target.FieldOffset.
+      
+      // Walk up the chain of field accesses to find the root (non-field) expression
+      baseExpr := fa.Target.Obj;
+      while (baseExpr is TAstFieldAccess) do
+        baseExpr := TAstFieldAccess(baseExpr).Obj;
+      
+      // Now lower the root expression (e.g., 'o' in 'o.x.a')
+      t1 := LowerExpr(baseExpr);
       if t1 < 0 then Exit(False);
       t2 := LowerExpr(fa.Value);
       if t2 < 0 then Exit(False);
@@ -3396,6 +3824,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.ImmInt := fa.Target.FieldOffset // positive offset for heap
         else
           instr.LabelName := fa.Target.Field;
+        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
         Emit(instr);
       end
       else
@@ -3408,6 +3837,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.ImmInt := fa.Target.FieldOffset
         else
           instr.LabelName := fa.Target.Field;
+        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
         Emit(instr);
       end;
       Exit(True);
@@ -3882,6 +4312,29 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     FDiag.Error('lowering: unsupported statement', stmt.Span);
     Result := False;
   end;
+
+
+{ TODO: Indirect Call Support (irVarCall)
+  =========================================
+  
+  Wenn Lyx Funktionszeiger unterstützt, muss diese Funktion erweitert werden.
+  
+  Beispiel-AST-Knoten (hypothetisch):
+    TAstCall mit CallKind = ckIndirect
+    - Das erste Argument wäre der Funktionszeiger
+    - Die restlichen Argumente sind die Aufrufargumente
+  
+  IR-Generierung für indirekte Aufrufe:
+    instr.Op := irVarCall;
+    instr.Src1 := <temp index holding function pointer>;
+    instr.Dest := <temp index für Rückgabewert>;
+    instr.ArgTemps := [arg0, arg1, ...];
+  
+  Backend-Unterstützung (x86_64_emit.pas):
+    - Lade Funktionsadresse aus Src1 nach RAX
+    - call rax  (indirekter Aufruf)
+    - Rückgabewert in RAX speichern
+}
 
 
 end.

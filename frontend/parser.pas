@@ -589,14 +589,15 @@ begin
     methods := nil;
     while not Check(tkRBrace) and not Check(tkEOF) do
     begin
-      // Structs only have fields (no methods, no visibility modifiers)
+      // Allow visibility modifiers (pub, private, protected) in structs
+      curVisibility := ParseVisibility;
       if Check(tkIdent) then
       begin
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
-        fld.Visibility := visPublic;  // Struct fields are always public
+        fld.Visibility := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
@@ -873,6 +874,14 @@ begin
       Expect(tkSemicolon);
       Exit(TAstReturn.Create(vExpr, vExpr.Span));
     end;
+  end;
+
+  // break; - exit loop early
+  if Check(tkBreak) then
+  begin
+    Advance;
+    Expect(tkSemicolon);
+    Exit(TAstBreak.Create(FCurTok.Span));
   end;
 
   // dispose expr; - free heap-allocated class instance
@@ -1911,16 +1920,48 @@ var
   innerTypeName: string;
   innerNullable: Boolean;
   innerArrayLen: Integer;
-  innerType, keyType, valueType, elementType: TAurumType;
+  innerType, keyType, valueType, elementType, paramType, returnType: TAurumType;
+  paramTypes: array of TAurumType;
 begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
 
   // Check for array type syntax: Type[N] or []Type or Array<T> or Map<K,V> or Set<T>
+  // Also check for function pointer type: fn(params) -> returnType
   // First parse the base type
-  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) or Check(tkMap) or Check(tkSet) then
+  if Check(tkIdent) or Check(tkArray) or Check(tkParallel) or Check(tkMap) or Check(tkSet) or Check(tkFn) then
   begin
+    // Handle function pointer type: fn(params) -> returnType
+    if Check(tkFn) then
+    begin
+      Advance; // consume 'fn'
+      Expect(tkLParen);
+      
+      // Parse parameter types
+      paramTypes := nil;
+      if not Check(tkRParen) then
+      begin
+        repeat
+          paramType := ParseType;
+          SetLength(paramTypes, Length(paramTypes) + 1);
+          paramTypes[High(paramTypes)] := paramType;
+        until not Accept(tkComma);
+      end;
+      Expect(tkRParen);
+      
+      // Parse return type
+      Expect(tkMinus);
+      Expect(tkGt);
+      returnType := ParseType;
+      
+      // Create function pointer type AST node
+      Result := atFnPtr;
+      // Note: We store the signature info in a global or pass it through
+      // For now, we'll handle this in sema phase
+      Exit;
+    end;
+    
     // Handle 'parallel Array<T>' first
     if Check(tkParallel) then
     begin
@@ -2037,6 +2078,23 @@ begin
       // Regular identifier type (int64, bool, struct name, etc.)
       s := FCurTok.Value;
       Advance;
+      
+      // Handle qualified type names (e.g., types.NativeSocket, std.net.IPAddr)
+      while Check(tkDot) do
+      begin
+        Advance; // consume dot
+        if Check(tkIdent) then
+        begin
+          s := s + '.' + FCurTok.Value;
+          Advance;
+        end
+        else
+        begin
+          FDiag.Error('expected identifier after dot in type name', FCurTok.Span);
+          Break;
+        end;
+      end;
+      
       Result := StrToAurumType(s);
       if Result = atUnresolved then
         typeName := s;

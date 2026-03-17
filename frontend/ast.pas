@@ -30,7 +30,8 @@ type
     atArray,          // static array type
     atMap,            // hash map type
     atSet,            // hash set type
-    atParallelArray   // SIMD parallel array
+    atParallelArray,  // SIMD parallel array
+    atFnPtr           // function pointer type
   );
 
   { --- Speicherklassen --- }
@@ -201,6 +202,7 @@ type
     FName: string;
     FArgs: TAstExprList;
     FNamespace: string;  // z.B. "IO" für "IO.PrintStr"
+    FIsIndirectCall: Boolean;  // true wenn dies ein Funktionszeiger-Aufruf ist
   public
     constructor Create(const aName: string; const aArgs: TAstExprList;
       aSpan: TSourceSpan);
@@ -211,6 +213,7 @@ type
     property Name: string read FName;
     property Args: TAstExprList read FArgs;
     property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
+    property IsIndirectCall: Boolean read FIsIndirectCall write FIsIndirectCall;
   end;
 
   { Array-Literal: [expr, expr, ...] }
@@ -363,16 +366,19 @@ type
     FField: string;
     FFieldOffset: Integer; // -1 if unknown
     FOwnerName: string; // owner struct name if known
+    FFieldType: TAurumType; // resolved field type
   public
     constructor Create(aObj: TAstExpr; const aField: string; aSpan: TSourceSpan);
     destructor Destroy; override;
     procedure SetFieldOffset(aOffset: Integer);
     procedure SetOwnerName(const aName: string);
+    procedure SetFieldType(aType: TAurumType);
     function DetachObj: TAstExpr; // transfer ownership of the Obj out of this node
     property Obj: TAstExpr read FObj;
     property Field: string read FField;
     property FieldOffset: Integer read FFieldOffset;
     property OwnerName: string read FOwnerName;
+    property FieldType: TAurumType read FFieldType write FFieldType;
   end;
 
 
@@ -394,12 +400,31 @@ type
     FExpr: TAstExpr;
     FCastType: TAurumType;
     FCastTypeName: string;  // Type name for resolution in sema
+    FIsFunctionToPointer: Boolean;  // True if casting function to pointer (returns address)
   public
     constructor Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Expr: TAstExpr read FExpr;
     property CastType: TAurumType read FCastType write FCastType;
     property CastTypeName: string read FCastTypeName write FCastTypeName;
+    property IsFunctionToPointer: Boolean read FIsFunctionToPointer write FIsFunctionToPointer;
+  end;
+
+  { Function Pointer Type: fn(param1, param2) -> returnType }
+  TAstFnPtrType = class(TAstExpr)
+  private
+    FParamTypes: array of TAurumType;
+    FReturnType: TAurumType;
+    FSignatureString: string;  // Cached signature for comparison
+    function GetParamCount: Integer;
+    function GetParamType(idx: Integer): TAurumType;
+  public
+    constructor Create(const aParamTypes: array of TAurumType; aReturnType: TAurumType; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property ParamCount: Integer read GetParamCount;
+    property ParamTypes[idx: Integer]: TAurumType read GetParamType;
+    property ReturnType: TAurumType read FReturnType write FReturnType;
+    property SignatureString: string read FSignatureString;
   end;
 
   { Struct-Literal Feld-Initialisierer: name: expr }
@@ -1038,6 +1063,7 @@ begin
     atArray:       Result := 'static_array';
     atMap:         Result := 'Map';
     atSet:         Result := 'Set';
+    atFnPtr:       Result := 'fn';  // Treat as int64 internally for now
   else
     Result := '<unknown>';
   end;
@@ -1736,6 +1762,11 @@ begin
   FOwnerName := aName;
 end;
 
+procedure TAstFieldAccess.SetFieldType(aType: TAurumType);
+begin
+  FFieldType := aType;
+end;
+
 function TAstFieldAccess.DetachObj: TAstExpr;
 begin
   Result := FObj;
@@ -1783,6 +1814,49 @@ destructor TAstCast.Destroy;
 begin
   FExpr.Free;
   inherited Destroy;
+end;
+
+// ================================================================
+// TAstFnPtrType
+// ================================================================
+constructor TAstFnPtrType.Create(const aParamTypes: array of TAurumType; aReturnType: TAurumType; aSpan: TSourceSpan);
+var
+  i: Integer;
+begin
+  inherited Create(nkIdent, aSpan);  // Use nkIdent as base kind
+  SetLength(FParamTypes, Length(aParamTypes));
+  for i := 0 to High(aParamTypes) do
+    FParamTypes[i] := aParamTypes[i];
+  FReturnType := aReturnType;
+  FResolvedType := atFnPtr;
+  
+  // Build signature string for comparison
+  FSignatureString := 'fn(';
+  for i := 0 to High(FParamTypes) do
+  begin
+    if i > 0 then FSignatureString := FSignatureString + ',';
+    FSignatureString := FSignatureString + AurumTypeToStr(FParamTypes[i]);
+  end;
+  FSignatureString := FSignatureString + ')->' + AurumTypeToStr(FReturnType);
+end;
+
+destructor TAstFnPtrType.Destroy;
+begin
+  SetLength(FParamTypes, 0);
+  inherited Destroy;
+end;
+
+function TAstFnPtrType.GetParamCount: Integer;
+begin
+  Result := Length(FParamTypes);
+end;
+
+function TAstFnPtrType.GetParamType(idx: Integer): TAurumType;
+begin
+  if (idx >= 0) and (idx < Length(FParamTypes)) then
+    Result := FParamTypes[idx]
+  else
+    Result := atUnresolved;
 end;
 
 // ================================================================
