@@ -2392,6 +2392,33 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           Emit(instr);
         end
+        // Check for function pointer to int64 (function address cast)
+        else if TAstCast(expr).IsFunctionToPointer then
+        begin
+          // This is a cast from function to int64 - return the function address
+          // The expression could be a function call or a function name (identifier)
+          
+          // Check if the source expression is a function identifier (not a call)
+          if TAstCast(expr).Expr is TAstIdent then
+          begin
+            // Function name cast to int64 - load the function address
+            // Use irLoadGlobalAddr to get the function address
+            instr := Default(TIRInstr);
+            instr.Op := irLoadGlobalAddr;
+            instr.Dest := t0;
+            instr.ImmStr := TAstIdent(TAstCast(expr).Expr).Name;
+            Emit(instr);
+          end
+          else
+          begin
+            // For other expressions (like function calls), just copy the value
+            // This is a workaround - proper handling would require more changes
+            instr.Op := irLoadLocal;
+            instr.Dest := t0;
+            instr.Src1 := t1;
+            Emit(instr);
+          end;
+        end
         // Check for int64 -> uint8 (truncate to 8 bits)
         else if (ltype = atInt64) and (rType = atUInt8) then
         begin

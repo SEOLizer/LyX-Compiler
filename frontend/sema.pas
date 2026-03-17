@@ -2156,6 +2156,34 @@ begin
 
         // Resolve the target type from the type name
         castTypeName := TAstCast(expr).CastTypeName;
+        
+        // Special case: function to int64 cast (for function pointers)
+        // This returns the function address, not the return value
+        if (srcType = atFnPtr) and (castTypeName = 'int64') then
+        begin
+          TAstCast(expr).CastType := atInt64;
+          TAstCast(expr).IsFunctionToPointer := True;  // Mark as function address cast
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
+        // Also check if we're casting a function identifier to int64
+        if (castTypeName = 'int64') and Assigned(TAstCast(expr).Expr) and 
+           (TAstCast(expr).Expr is TAstIdent) then
+        begin
+          // Check if the identifier refers to a function
+          s := ResolveSymbol(TAstIdent(TAstCast(expr).Expr).Name);
+          if Assigned(s) and (s.Kind = symFunc) then
+          begin
+            TAstCast(expr).CastType := atInt64;
+            TAstCast(expr).IsFunctionToPointer := True;  // Mark as function address cast
+            Result := atInt64;
+            expr.ResolvedType := Result;
+            Exit;
+          end;
+        end;
+        
         if castTypeName <> '' then
         begin
           // Look up the type - support all integer and float types
@@ -3038,6 +3066,15 @@ begin
             vtype := atFnPtr  // Keep function pointer type
           else if TypeEqual(vtype, vd.DeclType) then
             vtype := atFnPtr  // Same fn type, use fn pointer
+          else if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) then
+          begin
+            // Check if the initializer is a function name
+            s := ResolveSymbol(TAstIdent(vd.InitExpr).Name);
+            if Assigned(s) and (s.Kind = symFunc) then
+              vtype := atFnPtr  // Function name as initializer -> function pointer
+            else
+              FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
+          end
           else
             FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
         end
