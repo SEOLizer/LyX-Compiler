@@ -362,7 +362,8 @@ begin
     // Branch-Operationen (mittlere Kosten)
     irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
     irReturn, irReturnStruct, irVarCall:
-      Result := 50;
+      Result := 50; // Direkte und indirekte Aufrufe
+
     // Builtin-Calls (können Syscalls sein)
     irCallBuiltin:
       Result := 10; // Wird zur Laufzeit genauer aufgelöst
