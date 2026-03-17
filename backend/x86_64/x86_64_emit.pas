@@ -546,6 +546,7 @@ var
   varIdx: Integer;
   leaPos: Integer;
   vmtDataPos: Integer;
+  funcOffset: Integer;
   FGlobalVarLeaPositions: array of record
     VarIndex: Integer;
     CodePos: Integer;
@@ -926,32 +927,51 @@ begin
                // Store the ADDRESS into temp slot
                slotIdx := fn.LocalCount + instr.Dest;
                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-             end
-             else
-             begin
-               // Regular global variable
-               varIdx := globalVarNames.IndexOf(instr.ImmStr);
-               if varIdx < 0 then
-               begin
-                 varIdx := globalVarNames.Count;
-                 globalVarNames.Add(instr.ImmStr);
-                 SetLength(globalVarOffsets, varIdx + 1);
-                 globalVarOffsets[varIdx] := totalDataOffset;
-                 FData.WriteU64LE(0);
-                 Inc(totalDataOffset, 8);
-               end;
-               // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
-               leaPos := FCode.Size;
-               EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
-               // Record position for patching
-               SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
-               FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
-               FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
-               // Store the ADDRESS into temp slot
-               slotIdx := fn.LocalCount + instr.Dest;
-               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+              end
+              else
+              begin
+                // Check if ImmStr is a function name (for function pointer initialization)
+                funcOffset := GetFunctionOffset(instr.ImmStr);
+                if funcOffset >= 0 then
+                begin
+                  // Function found - load its address using PC-relative LEA
+                  // lea rax, [rip+disp32] - the offset will be patched later
+                  leaPos := FCode.Size;
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+                  // Record position for patching with special flag (negative index = function)
+                  SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := -funcOffset - 1;  // negative = function
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+                  // Store the function address into temp slot
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end
+                else
+                begin
+                  // Regular global variable
+                  varIdx := globalVarNames.IndexOf(instr.ImmStr);
+                  if varIdx < 0 then
+                  begin
+                    varIdx := globalVarNames.Count;
+                    globalVarNames.Add(instr.ImmStr);
+                    SetLength(globalVarOffsets, varIdx + 1);
+                    globalVarOffsets[varIdx] := totalDataOffset;
+                    FData.WriteU64LE(0);
+                    Inc(totalDataOffset, 8);
+                  end;
+                  // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
+                  leaPos := FCode.Size;
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+                  // Record position for patching
+                  SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+                  // Store the ADDRESS into temp slot
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end;
              end;
-            end;
 
           irLoadLocalAddr:
             begin
@@ -3799,6 +3819,14 @@ begin
         // This requires proper ELF section handling - for now, skip VMT patching
         // TODO: Implement proper VMT patching when data section is properly handled
       end
+      else if varIdx < 0 then
+      begin
+        // Function reference - varIdx is -funcOffset - 1
+        // We need to patch with the function's code position
+        funcOffset := -varIdx - 1;
+        offset := funcOffset - (FGlobalVarLeaPositions[i].CodePos + 7);
+        FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
+      end
       else if (varIdx >= 0) and (varIdx < globalVarNames.Count) then
       begin
         // Regular global variable - use code section offset
@@ -3807,7 +3835,7 @@ begin
       end;
     end;
   end;
-  
+   
   // Code-Größe für Energy-Stats aktualisieren
   FEnergyStats.CodeSizeBytes := FCode.Size;
   
