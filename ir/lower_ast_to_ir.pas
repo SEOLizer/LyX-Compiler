@@ -3611,6 +3611,61 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         end;
         Exit(True);
       end
+      // Check for function pointer: either explicit atFnPtr type OR unresolved with function name as initializer
+      // This handles the case where type declarations aren't resolved in sema
+      else if (vd.DeclType = atFnPtr) or 
+              ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
+               Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
+      begin
+        // Function pointer: allocate one slot and initialize with function address
+        loc := AllocLocal(vd.Name, atFnPtr);  // Use atFnPtr for function pointers
+        
+        // Check if initializer is a function identifier
+        if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) then
+        begin
+          // Function name as initializer - load function address
+          // Use irLoadGlobalAddr to get the function address
+          // First load into a temp, then store to local slot
+          tmp := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irLoadGlobalAddr;
+          instr.Dest := tmp;
+          instr.ImmStr := TAstIdent(vd.InitExpr).Name;
+          Emit(instr);
+          // Store to local slot
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+        end
+        else if Assigned(vd.InitExpr) then
+        begin
+          // Other initializer - lower it normally
+          tmp := LowerExpr(vd.InitExpr);
+          if tmp >= 0 then
+          begin
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          // No initializer - initialize to 0 (null function pointer)
+          tmp := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irConstInt;
+          instr.Dest := tmp;
+          instr.ImmInt := 0;
+          Emit(instr);
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+        end;
+        Exit(True);
+      end
       else
       begin
         // scalar local

@@ -2634,7 +2634,10 @@ begin
         begin
           // Check if this is a function pointer call (variable with function type)
           // Function pointers are stored as atFnPtr or atInt64 (for compatibility)
-          if (s.Kind in [symVar, symLet]) and ((s.DeclType = atFnPtr) or (s.DeclType = atInt64)) then
+          // Also handle the case where DeclType is unresolved but TypeName is set (type alias)
+          if (s.Kind in [symVar, symLet]) and 
+             ((s.DeclType = atFnPtr) or (s.DeclType = atInt64) or 
+              ((s.DeclType = atUnresolved) and (s.TypeName <> ''))) then
           begin
             // This is a function pointer call - mark as indirect
             call.IsIndirectCall := True;
@@ -3056,7 +3059,10 @@ begin
           vtype := vd.DeclType;  // Use declared type if no initializer
         
         // Special case: treat fn(...) types as int64 internally (opaque function pointer)
-        if vd.DeclType = atFnPtr then
+        // Also handle the case where DeclType is unresolved but DeclTypeName is set (type alias)
+        if (vd.DeclType = atFnPtr) or 
+           ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
+            Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
         begin
           // Function pointer - keep as fn pointer type for proper resolution
           // Allow int64 as well for compatibility
@@ -3064,7 +3070,7 @@ begin
             vtype := atInt64  // Keep int64 for int64 variables
           else if (vtype = atFnPtr) then
             vtype := atFnPtr  // Keep function pointer type
-          else if TypeEqual(vtype, vd.DeclType) then
+          else if (vd.DeclType <> atUnresolved) and TypeEqual(vtype, vd.DeclType) then
             vtype := atFnPtr  // Same fn type, use fn pointer
           else if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) then
           begin
@@ -4786,10 +4792,13 @@ begin
         end;
       end
       else if node is TAstTypeDecl then
-     begin
-       // type declarations: register as named types (future work)
-       // for now, skip
-     end
+      begin
+        // type declarations: register as named types
+        // For function pointer types (atFnPtr), the DeclType is already set
+        // For named types, we store the type information for later lookup
+        // (Currently the type info is stored in FDeclType, which may be atFnPtr for fn(...) types)
+        // TODO: Add support for full type alias resolution if needed
+      end
       else if node is TAstConDecl then
     begin
       con := TAstConDecl(node);
