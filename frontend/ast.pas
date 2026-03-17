@@ -202,6 +202,7 @@ type
     FName: string;
     FArgs: TAstExprList;
     FNamespace: string;  // z.B. "IO" für "IO.PrintStr"
+    FIsIndirectCall: Boolean;  // true wenn dies ein Funktionszeiger-Aufruf ist
   public
     constructor Create(const aName: string; const aArgs: TAstExprList;
       aSpan: TSourceSpan);
@@ -212,6 +213,7 @@ type
     property Name: string read FName;
     property Args: TAstExprList read FArgs;
     property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
+    property IsIndirectCall: Boolean read FIsIndirectCall write FIsIndirectCall;
   end;
 
   { Array-Literal: [expr, expr, ...] }

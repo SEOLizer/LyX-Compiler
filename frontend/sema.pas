@@ -2604,8 +2604,27 @@ begin
         end
         else if s.Kind <> symFunc then
         begin
-          FDiag.Error('attempt to call non-function: ' + call.Name, call.Span);
-          Result := atUnresolved;
+          // Check if this is a function pointer call (variable with function type)
+          // Function pointers are stored as atFnPtr or atInt64 (for compatibility)
+          if (s.Kind in [symVar, symLet]) and ((s.DeclType = atFnPtr) or (s.DeclType = atInt64)) then
+          begin
+            // This is a function pointer call - mark as indirect
+            call.IsIndirectCall := True;
+            
+            // For now, function pointer calls return int64 as placeholder
+            // TODO: Extract actual return type from function pointer type
+            Result := atInt64;
+            
+            // We still need to check arguments - use param info from the function pointer type
+            // For now, just check that args are valid expressions
+            for i := 0 to High(call.Args) do
+              CheckExpr(call.Args[i]);
+          end
+          else
+          begin
+            FDiag.Error('attempt to call non-function: ' + call.Name, call.Span);
+            Result := atUnresolved;
+          end;
         end
         else
         begin
@@ -3011,12 +3030,14 @@ begin
         // Special case: treat fn(...) types as int64 internally (opaque function pointer)
         if vd.DeclType = atFnPtr then
         begin
-          // Function pointer - treat as int64 for internal storage
-          // TODO: proper function pointer type checking with signature matching
-          if (vtype = atInt64) or (vtype = atFnPtr) then
-            vtype := atInt64  // Accept int64 or function address
+          // Function pointer - keep as fn pointer type for proper resolution
+          // Allow int64 as well for compatibility
+          if (vtype = atInt64) then
+            vtype := atInt64  // Keep int64 for int64 variables
+          else if (vtype = atFnPtr) then
+            vtype := atFnPtr  // Keep function pointer type
           else if TypeEqual(vtype, vd.DeclType) then
-            vtype := atInt64  // Same fn type, use int64
+            vtype := atFnPtr  // Same fn type, use fn pointer
           else
             FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
         end

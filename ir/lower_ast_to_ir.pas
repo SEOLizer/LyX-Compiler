@@ -2015,16 +2015,57 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         end
         else
         begin
-          // Regular function call
+          // Regular function call (or function pointer call)
           t0 := NewTemp;
-          instr.Op := irCall;
-          instr.Dest := t0;
-          instr.ImmStr := call.Name;
-          instr.ImmInt := argCount; // Backend needs argCount in ImmInt
-          instr.IsVirtualCall := False;
-          instr.VMTIndex := -1;
           
-          // Check if this is a method call (mangled name starts with _L_)
+          // Check if this is a function pointer call (indirect call)
+          if call.IsIndirectCall then
+          begin
+            // This is an indirect call via function pointer
+            // First, load the function pointer value (the variable name is in call.Name)
+            // We need to resolve the variable and load its value
+            
+            // Load the function pointer value from the variable
+            // call.Name contains the variable name (e.g., "cb")
+            instr := Default(TIRInstr);
+            instr.Op := irLoadLocal;  // Load the function pointer value
+            instr.Dest := t0;
+            instr.Src1 := ResolveLocal(call.Name);  // local slot index
+            if instr.Src1 < 0 then
+            begin
+              // Try as global variable
+              instr.Op := irLoadGlobal;
+              instr.Src1 := -1;
+              instr.ImmStr := call.Name;
+            end;
+            Emit(instr);
+            
+            // Now emit indirect call using the loaded function pointer
+            instr := Default(TIRInstr);
+            instr.Op := irVarCall;
+            instr.Dest := t0;
+            instr.Src1 := t0;  // Use the loaded function pointer as the call target
+            instr.ImmInt := argCount;
+            instr.IsVirtualCall := False;
+            instr.VMTIndex := -1;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            Result := t0;
+          end
+          else
+          begin
+            // Regular direct function call
+            instr.Op := irCall;
+            instr.Dest := t0;
+            instr.ImmStr := call.Name;
+            instr.ImmInt := argCount; // Backend needs argCount in ImmInt
+            instr.IsVirtualCall := False;
+            instr.VMTIndex := -1;
+           
+            // Check if this is a method call (mangled name starts with _L_)
           if (Length(call.Name) > 3) and (Copy(call.Name, 1, 3) = '_L_') then
           begin
             // Extract class name and method name from mangled name
@@ -2094,6 +2135,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.ArgTemps[i] := argTemps[i];
           Emit(instr);
           Result := t0;
+          end;
         end;
       end;
 
