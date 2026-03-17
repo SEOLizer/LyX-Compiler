@@ -324,5 +324,7 @@ The following language features are needed to make the network library fully com
 - [~] **Connection Pool** – Basic API defined in socket.lyx, needs testing ✅
   - TCPConnectionPool type, New/Acquire/Release/Close functions
   - Requires stable struct support in compiler
+
+- [x] **HTTP Client** – HTTPGet(), HTTPPost(), HTTPSend() implemented ✅
 - [ ] **HTTP Client** – Not implemented yet
 - [ ] **TLS Support** – Not implemented yet
