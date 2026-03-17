@@ -2847,14 +2847,123 @@ begin
              end;
              
               // Store return value from RAX to destination slot
-              if instr.Dest >= 0 then
-              begin
-                slotIdx := fn.LocalCount + instr.Dest;
-                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-              end;
+               if instr.Dest >= 0 then
+               begin
+                 slotIdx := fn.LocalCount + instr.Dest;
+                 WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+               end;
             end;
          
-         irCallStruct:
+         irVarCall:
+           begin
+             // Indirect function call via register (SysV ABI for Linux x86_64)
+             // Src1 contains the temp index that holds the function pointer
+             // This is used for function pointers and virtual method calls
+             
+             argCount := instr.ImmInt;
+             
+             // Get argument temps from ArgTemps array or Src1/Src2
+             SetLength(argTemps, argCount);
+             for k := 0 to argCount - 1 do argTemps[k] := -1;
+             if argCount > 0 then argTemps[0] := instr.Src1;
+             if argCount > 1 then argTemps[1] := instr.Src2;
+             // Additional args from ArgTemps array (newer IR)
+             if Length(instr.ArgTemps) > 0 then
+             begin
+               for k := 0 to Min(argCount - 1, High(instr.ArgTemps)) do
+                 argTemps[k] := instr.ArgTemps[k];
+             end;
+             
+             // Ensure stack is 16-byte aligned before call
+             stackArgsCount := 0;
+             if argCount > 6 then
+               stackArgsCount := argCount - 6;
+             
+             // Calculate alignment
+             if (stackArgsCount mod 2) = 1 then
+             begin
+               // Add 8-byte padding for alignment
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $83);
+               EmitU8(FCode, $EC);
+               EmitU8(FCode, $08);  // sub rsp, 8
+             end;
+             
+             // Push extra args (beyond 6) in reverse order
+             for k := argCount - 1 downto 6 do
+             begin
+               if argTemps[k] >= 0 then
+               begin
+                 slotIdx := fn.LocalCount + argTemps[k];
+                 WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                 EmitU8(FCode, $50);  // push rax
+               end
+               else
+               begin
+                 WriteMovRegImm64(FCode, RAX, 0);
+                 EmitU8(FCode, $50);  // push rax
+               end;
+             end;
+             
+             // Load first 6 args into registers (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
+             for k := 0 to Min(argCount - 1, 5) do
+             begin
+               if argTemps[k] >= 0 then
+               begin
+                 slotIdx := fn.LocalCount + argTemps[k];
+                 WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
+               end
+               else
+                 WriteMovRegImm64(FCode, ParamRegs[k], 0);
+             end;
+             
+             // Load function pointer from Src1 temp into RAX
+             if instr.Src1 >= 0 then
+             begin
+               slotIdx := fn.LocalCount + instr.Src1;
+               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+             end
+             else
+               WriteMovRegImm64(FCode, RAX, 0);
+             
+             // Indirect call through RAX: call rax
+             // Encoding: FF /2 = call r/m64
+             // With REX.W prefix: 48 FF D0 = call rax
+             EmitU8(FCode, $FF);  // opcode
+             EmitU8(FCode, $D0);  // ModR/M: reg=2 (call), mod=11 (register), r/m=000 (rax)
+             
+             // Clean up stack args if any were pushed
+             if stackArgsCount > 0 then
+             begin
+               stackCleanup := stackArgsCount * 8;
+               if (stackArgsCount mod 2) = 1 then
+                 stackCleanup := stackCleanup + 8;  // include padding
+               
+               if stackCleanup <= 127 then
+               begin
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $83);
+                 EmitU8(FCode, $C4);
+                 EmitU8(FCode, Byte(stackCleanup));  // add rsp, imm8
+               end
+               else
+               begin
+                 EmitRex(FCode, 1, 0, 0, 0);
+                 EmitU8(FCode, $81);
+                 EmitU8(FCode, $C4);
+                 EmitU32(FCode, Cardinal(stackCleanup));  // add rsp, imm32
+               end;
+             end;
+             
+             // Store return value from RAX to destination slot
+             if instr.Dest >= 0 then
+             begin
+               slotIdx := fn.LocalCount + instr.Dest;
+               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+             end;
+           end;
+          
+          irCallStruct:
            begin
              // Struct-returning function call (SysV ABI)
              // Dest is a LOCAL slot index (not temp!), StructSize gives size in bytes
