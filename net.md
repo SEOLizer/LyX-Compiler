@@ -320,6 +320,9 @@ The following language features are needed to make the network library fully com
 - [x] **Stack Allocation** – All functions use `mmap` for temporary structures (performance) ✅
 
 - [x] **Hostname Resolution** – GetHostByName(), ResolveHost() implemented ✅
-- [ ] **Connection Pooling** – Not implemented yet
+
+- [~] **Connection Pool** – Basic API defined in socket.lyx, needs testing ✅
+  - TCPConnectionPool type, New/Acquire/Release/Close functions
+  - Requires stable struct support in compiler
 - [ ] **HTTP Client** – Not implemented yet
 - [ ] **TLS Support** – Not implemented yet
