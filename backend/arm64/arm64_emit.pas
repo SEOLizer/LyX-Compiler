@@ -519,6 +519,15 @@ begin
   EmitInstr(buf, $9A9F07E0 or (DWord(invCond) shl 12) or rd);
 end;
 
+// CSNEG Xd, Xn, Xm, cond (conditional negate)
+// Rd = (cond) ? -Rn : Rm
+procedure WriteCneg(buf: TByteBuffer; rd, rn, rm: Byte; cond: Byte);
+begin
+  // CSNEG: sf=1, op=0, S=0, Rm, cond, o2=0, Rn, Rd
+  // 1 00 11010100 Rm cond 0 Rn Rd
+  EmitInstr(buf, $DA80A000 or (DWord(rm) shl 16) or (DWord(cond) shl 12) or (DWord(rn) shl 5) or rd);
+end;
+
 // Condition codes for CSET and B.cond
 const
   COND_EQ = $0;  // Equal (Z=1)
@@ -2415,6 +2424,331 @@ begin
             // Epilogue
             WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
             WriteRet(FCode);
+          end;
+
+        // ========== Struct Return Operations ==========
+
+        irReturnStruct:
+          begin
+            // Return struct by value according to AAPCS64:
+            // <= 8 bytes: load value into X0
+            // 9-16 bytes: first 8 bytes in X0, next in X1
+            // > 16 bytes: hidden pointer was passed in X8, copy to it and X0 = pointer
+            
+            // Src1 holds address of struct on stack
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // X1 = struct addr
+            
+            if instr.StructSize <= 8 then
+            begin
+              // Small struct: load first 8 bytes into X0
+              WriteLdrImm(FCode, X0, X1, 0);
+            end
+            else if instr.StructSize <= 16 then
+            begin
+              // Medium struct: first 8 bytes in X0, next in X1
+              WriteLdrImm(FCode, X0, X1, 0);    // Load first 8 bytes
+              WriteLdrImm(FCode, X1, X1, 8);    // Load next 8 bytes
+            end
+            else
+            begin
+              // Large struct: hidden pointer mechanism
+              // X0 already contains the hidden pointer (passed as first arg)
+              // Copy struct to the hidden pointer location
+              // X1 = struct addr on stack, X0 = dest pointer
+              // Simple memcpy: copy StructSize bytes
+              WriteMovRegReg(FCode, X2, X1);   // X2 = src
+              WriteMovRegReg(FCode, X3, X0);   // X3 = dest (hidden pointer)
+              WriteMovImm64(FCode, X4, instr.StructSize); // X4 = count
+              // copy_loop:
+              WriteLdurImm(FCode, X5, X2, 8);  // LDR X5, [X2], #8
+              WriteSturImm(FCode, X5, X3, 8);  // STR X5, [X3], #8
+              WriteSubImm(FCode, X4, X4, 1);   // SUBS X4, X4, #1
+              WriteCbnz(FCode, X4, -24);       // CBNZ X4, copy_loop
+            end;
+            
+            // Epilogue
+            WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
+            WriteRet(FCode);
+          end;
+
+        irCallStruct:
+          begin
+            // Call function returning struct - handle X0+X1 for 9-16 byte structs
+            // Same setup as irCall for arguments
+            
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do
+              argTemps[k] := -1;
+            
+            // Use ArgTemps array from IR
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then
+                  argTemps[k] := instr.ArgTemps[k];
+            end;
+            
+            // Move args into registers (AAPCS64: X0-X7)
+            if argCount > 0 then
+            begin
+              if (argCount >= 1) and (argTemps[0] >= 0) then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + argTemps[0]));
+              if (argCount >= 2) and (argTemps[1] >= 0) then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + argTemps[1]));
+              if (argCount >= 3) and (argTemps[2] >= 0) then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + argTemps[2]));
+              if (argCount >= 4) and (argTemps[3] >= 0) then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + argTemps[3]));
+              if (argCount >= 5) and (argTemps[4] >= 0) then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + argTemps[4]));
+              if (argCount >= 6) and (argTemps[5] >= 0) then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + argTemps[5]));
+              if (argCount >= 7) and (argTemps[6] >= 0) then
+                WriteLdrImm(FCode, X6, X29, frameSize + SlotOffset(localCnt + argTemps[6]));
+              if (argCount >= 8) and (argTemps[7] >= 0) then
+                WriteLdrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + argTemps[7]));
+            end;
+            
+            // Emit call
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+            WriteBranchLink(FCode, 0);  // Placeholder
+            
+            // Store result based on struct size
+            if instr.Dest >= 0 then
+            begin
+              if instr.StructSize <= 8 then
+              begin
+                // Small struct: result in X0 only
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+              end
+              else if instr.StructSize <= 16 then
+              begin
+                // Medium struct: result in X0 + X1
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+                WriteStrImm(FCode, X1, X29, frameSize + SlotOffset(instr.Dest + 1));
+              end
+              else
+              begin
+                // Large struct: hidden pointer - store the pointer
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+              end;
+            end;
+          end;
+
+        irVarCall:
+          begin
+            // Indirect function call via function pointer
+            // Src1 = local slot containing function pointer
+            // ImmInt = argument count
+            
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do
+              argTemps[k] := -1;
+            
+            // Load arguments
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then
+                  argTemps[k] := instr.ArgTemps[k];
+            end;
+            
+            // Move args into registers (AAPCS64: X0-X7)
+            for k := 0 to Min(argCount - 1, 7) do
+            begin
+              if argTemps[k] >= 0 then
+                WriteLdrImm(FCode, ParamRegs[k], X29, frameSize + SlotOffset(localCnt + argTemps[k]));
+            end;
+            
+            // Load function pointer
+            WriteLdrImm(FCode, X16, X29, frameSize + SlotOffset(instr.Src1));
+            
+            // Call via register: BLR X16 (Branch with Link to Register)
+            // Encoding: 31-26=110101, 25=1, 24-21=0001, 20=0, 19-16=0000, 15-10=000000, 9-5=00000, 4-0=Rn
+            // = 0xD63F0000 | (Rn << 5)
+            EmitInstr(FCode, $D63F0000 or (DWord(X16) shl 5));
+            
+            // Store return value
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irCast:
+          begin
+            // Type cast: Dest = cast(Src1, CastFromType, CastToType)
+            // Fallback implementation using existing conversion ops
+            // Note: irIToF and irFToI should be used when possible
+            
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load source value
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Perform conversion based on CastFromType and CastToType
+            if (instr.CastFromType = atInt64) and (instr.CastToType = atF64) then
+            begin
+              // int64 -> f64: SCVTF
+              WriteFmovD(FCode, V0, X0);
+              WriteScvtfD(FCode, V0, V0);
+              WriteFmovD(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atF64) and (instr.CastToType = atInt64) then
+            begin
+              // f64 -> int64: FCVTZS
+              WriteFmovD(FCode, V0, X0);
+              WriteFcvtzsD(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atInt64) and (instr.CastToType = atF32) then
+            begin
+              // int64 -> f32: SCVTF (32-bit)
+              WriteFmovD(FCode, V0, X0);
+              WriteScvtfS(FCode, V0, V0);
+              WriteFmovS(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atF32) and (instr.CastToType = atInt64) then
+            begin
+              // f32 -> int64: FCVTZS (32-bit to 64-bit)
+              WriteFmovS(FCode, V0, X0);
+              WriteFcvtzsS(FCode, X0, V0);
+            end
+            else
+            begin
+              // Unsupported cast - keep value as-is
+            end;
+            
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // ========== Type Checking ==========
+
+        irIsType:
+          begin
+            // Type check: is_type(object, targetClassName) -> bool
+            // Algorithm:
+            // 1. Load object pointer from local slot
+            // 2. Load VMT pointer from object [ptr]
+            // 3. Loop: Compare class name with target, if no match follow parent pointer
+            
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load object pointer into X0
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Check for null object
+            WriteCmpImm(FCode, X0, 0);
+            WriteCset(FCode, X1, COND_EQ);  // X1 = 1 if null
+            WriteCneg(FCode, X1, XZR, COND_NE); // X1 = -1 if null (for later negation)
+            
+            // Load VMT pointer into X2: VMT is at [object]
+            WriteLdrImm(FCode, X2, X0, 0);   // X2 = VMT pointer
+            
+            // Allocate space for target class name in data section
+            // For now, we'll use a simple implementation that checks VMT pointer equality
+            // A full implementation would compare class names
+            
+            // Simple check: if VMT is non-null, assume true for now
+            // This is a placeholder - proper implementation requires runtime type info
+            WriteCmpImm(FCode, X2, 0);
+            WriteCset(FCode, X0, COND_NE);  // X0 = 1 if VMT != null
+            
+            // Store result
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // ========== Panic/Abort ==========
+
+        irPanic:
+          begin
+            // panic(message): write message to stderr and exit with error code
+            // AAPCS64: X0 = fd (2 for stderr), X1 = msg, X2 = len
+            
+            if instr.Src1 >= 0 then
+            begin
+              // Load message pointer into X1
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              // X0 = 2 (stderr)
+              WriteMovImm64(FCode, X0, 2);
+              // X2 = length (from ImmInt)
+              WriteMovImm64(FCode, X2, instr.ImmInt);
+              // X8 = 64 (sys_write)
+              WriteMovImm64(FCode, X8, SYS_write);
+              WriteSvc(FCode, 0);
+            end;
+            
+            // Exit with code 1
+            WriteMovImm64(FCode, X0, 1);    // exit code 1
+            WriteMovImm64(FCode, X8, SYS_exit);
+            WriteSvc(FCode, 0);
+          end;
+
+        // ========== Exception Handling ==========
+
+        irPushHandler:
+          begin
+            // Push handler frame: Src1 = handler_addr, LabelName = catch_label
+            // Stack layout: [handler_addr, catch_label_ptr]
+            // For now, just save the handler info to the stack
+            
+            // Load handler address
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Push to stack (decrement SP, store)
+            WriteSubImm(FCode, SP, SP, 16);
+            WriteSturImm(FCode, X0, SP, 0);
+          end;
+
+        irPopHandler:
+          begin
+            // Pop handler frame
+            WriteAddImm(FCode, SP, SP, 16);
+          end;
+
+        irLoadHandlerExn:
+          begin
+            // Load exception value from handler into Dest
+            // Src1 = handler_addr slot
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load handler base from stack
+            WriteMovRegReg(FCode, X0, SP);
+            WriteLdrImm(FCode, X0, X0, 8);  // Load exception value
+            
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irThrow:
+          begin
+            // Perform throw: Src1 = exception temp
+            // Load exception value and jump to handler
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Load handler address from stack
+            WriteLdrImm(FCode, X1, SP, 0);
+            
+            // Store exception value at handler + 8
+            WriteStrImm(FCode, X0, X1, 8);
+            
+            // Branch to handler
+            WriteMovRegReg(FCode, X30, X1);
+            WriteRet(FCode);
+          end;
+
+        // ========== Debug/Inspect ==========
+
+        irInspect:
+          begin
+            // In-Situ Data Visualizer - debug inspect
+            // For now, just load the value to trigger any side effects
+            if instr.Src1 >= 0 then
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Store back to dest if needed
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
           end;
         
         // ========== Float Operations ==========
