@@ -33,6 +33,8 @@ var
   pageSize: UInt64 = 4096;
   codeOffset: UInt64;
   codeSize: UInt64;
+  rodataOffset: UInt64;
+  rodataSize: UInt64;
   dataOffset: UInt64;
   dataSize: UInt64;
   fileBuf: TFileStream;
@@ -42,10 +44,12 @@ var
   baseVA: UInt64 = $400000;
 begin
   codeSize := codeBuf.Size;
+  rodataSize := 0;  // Currently no separate rodata
   dataSize := dataBuf.Size;
 
   codeOffset := pageSize; // 0x1000
-  dataOffset := codeOffset + AlignUp(codeSize, pageSize);
+  rodataOffset := codeOffset + AlignUp(codeSize, pageSize);
+  dataOffset := rodataOffset + AlignUp(rodataSize, pageSize);
 
   // Build ELF header
   elfHeader := TByteBuffer.Create;
@@ -74,22 +78,33 @@ begin
     elfHeader.WriteU32LE(0);          // e_flags (no flags for ARM64)
     elfHeader.WriteU16LE(64);         // e_ehsize (ELF header size)
     elfHeader.WriteU16LE(56);         // e_phentsize (program header entry size)
-    elfHeader.WriteU16LE(1);          // e_phnum (1 program header for LOAD segment)
+    elfHeader.WriteU16LE(2);          // e_phnum (2 program headers: text + data)
     elfHeader.WriteU16LE(0);          // e_shentsize
     elfHeader.WriteU16LE(0);          // e_shnum
     elfHeader.WriteU16LE(0);          // e_shstrndx
 
-    // Program header (PT_LOAD for code + data)
+    // Program header 1: PT_LOAD for code (.text)
     phdr.WriteU32LE(1);               // p_type = PT_LOAD
-    phdr.WriteU32LE(4 or 2 or 1);     // p_flags = PF_R | PF_W | PF_X
+    phdr.WriteU32LE(5);              // p_flags = PF_R | PF_X (read + execute)
     phdr.WriteU64LE(codeOffset);      // p_offset (file offset)
-    phdr.WriteU64LE(baseVA + codeOffset); // p_vaddr (virtual address)
-    phdr.WriteU64LE(baseVA + codeOffset); // p_paddr (physical address, same as vaddr)
+    phdr.WriteU64LE(baseVA + codeOffset); // p_vaddr
+    phdr.WriteU64LE(baseVA + codeOffset); // p_paddr
+    
+    filesz := AlignUp(codeSize, pageSize);
+    memsz := filesz;
+    phdr.WriteU64LE(filesz);          // p_filesz
+    phdr.WriteU64LE(memsz);           // p_memsz
+    phdr.WriteU64LE(pageSize);        // p_align
 
-    filesz := AlignUp(codeSize, pageSize) + dataSize;
-    memsz := AlignUp(codeSize + dataSize, pageSize);
-    if memsz < filesz then memsz := filesz;
-
+    // Program header 2: PT_LOAD for data (.data + .rodata)
+    phdr.WriteU32LE(1);               // p_type = PT_LOAD
+    phdr.WriteU32LE(6);              // p_flags = PF_R | PF_W (read + write)
+    phdr.WriteU64LE(rodataOffset);   // p_offset (file offset)
+    phdr.WriteU64LE(baseVA + rodataOffset); // p_vaddr
+    phdr.WriteU64LE(baseVA + rodataOffset); // p_paddr
+    
+    filesz := AlignUp(rodataSize, pageSize) + AlignUp(dataSize, pageSize);
+    memsz := filesz;
     phdr.WriteU64LE(filesz);          // p_filesz
     phdr.WriteU64LE(memsz);           // p_memsz
     phdr.WriteU64LE(pageSize);        // p_align
@@ -100,13 +115,13 @@ begin
       // Verify sizes
       if elfHeader.Size <> 64 then 
         raise Exception.CreateFmt('Invalid ELF header size: %d (expected 64)', [elfHeader.Size]);
-      if phdr.Size <> 56 then 
-        raise Exception.CreateFmt('Invalid PHDR size: %d (expected 56)', [phdr.Size]);
+      if phdr.Size <> 112 then 
+        raise Exception.CreateFmt('Invalid PHDR size: %d (expected 112)', [phdr.Size]);
       
       // Write ELF header
       fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
       
-      // Write program header
+      // Write program headers
       fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
       
       // Pad to code offset
@@ -116,6 +131,14 @@ begin
       // Write code
       if codeSize > 0 then 
         fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+      
+      // Pad to rodata offset
+      while fileBuf.Position < Int64(rodataOffset) do 
+        fileBuf.WriteByte(0);
+      
+      // Write rodata (currently empty)
+      // if rodataSize > 0 then 
+      //   fileBuf.WriteBuffer(rodataBuf.GetBuffer^, rodataSize);
       
       // Pad to data offset
       while fileBuf.Position < Int64(dataOffset) do 
