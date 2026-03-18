@@ -1042,11 +1042,20 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 instr.Op := irAdd;
             end;
             tkMinus:
-              instr.Op := irSub;
+              if isFloatArith then
+                instr.Op := irFSub
+              else
+                instr.Op := irSub;
             tkStar:
-              instr.Op := irMul;
+              if isFloatArith then
+                instr.Op := irFMul
+              else
+                instr.Op := irMul;
             tkSlash:
-              instr.Op := irDiv;
+              if isFloatArith then
+                instr.Op := irFDiv
+              else
+                instr.Op := irDiv;
             tkPercent:
               instr.Op := irMod;
 
