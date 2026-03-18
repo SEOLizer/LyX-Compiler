@@ -125,6 +125,8 @@ type
     // Struct return fields (for irReturnStruct)
     StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
     StructAlign: Integer;  // alignment of struct
+    // Field access fields (for irStoreField/irLoadField)
+    FieldSize: Integer;    // size of field in bytes (1, 2, 4, or 8) for proper memory access width
     // Inspect-specific fields (for irInspect - In-Situ Data Visualizer)
     InspectType: TAurumType;          // type of the inspected value
     InspectStructName: string;        // struct/class name if applicable
@@ -142,6 +144,7 @@ type
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
     EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
+    ReturnStructSize: Integer; // size in bytes if function returns struct, 0 otherwise
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
@@ -154,6 +157,8 @@ type
     IsArray: Boolean;         // true if this global is an array
     ArrayLen: Integer;        // number of elements if IsArray
     InitValues: array of Int64; // initial values for array (if any)
+    IsStringPtr: Boolean;     // true if this is a pchar initialized with a string literal
+    StringIdx: Integer;       // index into Strings list if IsStringPtr is true
   end;
   TGlobalVarArray = array of TGlobalVar;
 
@@ -170,6 +175,7 @@ type
     function FindFunction(const name: string): TIRFunction;
     function InternString(const s: string): Integer;
     function AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
+    function AddGlobalStringPtr(const name: string; strIdx: Integer): Integer;
     function AddGlobalArray(const name: string; const values: array of Int64): Integer;
     procedure AddClassDecl(cd: TAstClassDecl);
   end;
@@ -274,6 +280,29 @@ begin
   GlobalVars[Result].HasInitValue := hasInit;
   GlobalVars[Result].IsArray := False;
   GlobalVars[Result].ArrayLen := 0;
+  GlobalVars[Result].IsStringPtr := False;
+  GlobalVars[Result].StringIdx := -1;
+  SetLength(GlobalVars[Result].InitValues, 0);
+end;
+
+function TIRModule.AddGlobalStringPtr(const name: string; strIdx: Integer): Integer;
+var
+  i: Integer;
+begin
+  // Check if already exists
+  for i := 0 to High(GlobalVars) do
+    if GlobalVars[i].Name = name then
+      Exit(i);
+  // Add new string pointer global
+  Result := Length(GlobalVars);
+  SetLength(GlobalVars, Result + 1);
+  GlobalVars[Result].Name := name;
+  GlobalVars[Result].InitValue := 0;  // Will be patched by backend
+  GlobalVars[Result].HasInitValue := True;
+  GlobalVars[Result].IsArray := False;
+  GlobalVars[Result].ArrayLen := 0;
+  GlobalVars[Result].IsStringPtr := True;
+  GlobalVars[Result].StringIdx := strIdx;
   SetLength(GlobalVars[Result].InitValues, 0);
 end;
 
@@ -333,7 +362,8 @@ begin
     // Branch-Operationen (mittlere Kosten)
     irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
     irReturn, irReturnStruct, irVarCall:
-      Result := 50;
+      Result := 50; // Direkte und indirekte Aufrufe
+
     // Builtin-Calls (können Syscalls sein)
     irCallBuiltin:
       Result := 10; // Wird zur Laufzeit genauer aufgelöst

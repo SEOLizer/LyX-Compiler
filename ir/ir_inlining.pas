@@ -213,10 +213,11 @@ begin
   inlined := False;
   
   argTemps := callInstr.ArgTemps;
+  // Functions with no arguments: don't inline, just keep the call
+  // NOTE: We DON'T add to newInstrs here - let the caller handle it
+  // by checking inlined=False and adding the instruction there.
   if Length(argTemps) = 0 then
   begin
-    SetLength(newInstrs, Length(newInstrs) + 1);
-    newInstrs[High(newInstrs)] := callInstr;
     Exit;
   end;
   

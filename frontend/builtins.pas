@@ -85,6 +85,9 @@ initialization
   AddBuiltin('IO', 'mkdir', 'mkdir', atInt64, [atPChar, atInt64]);
   AddBuiltin('IO', 'rmdir', 'rmdir', atInt64, [atPChar]);
   AddBuiltin('IO', 'chmod', 'chmod', atInt64, [atPChar, atInt64]);
+  AddBuiltin('IO', 'ioctl', 'ioctl', atInt64, [atInt64, atInt64, atInt64]);
+  AddBuiltin('IO', 'mmap', 'mmap', atInt64, [atInt64, atInt64, atInt64, atInt64, atInt64, atInt64]);
+  AddBuiltin('IO', 'munmap', 'munmap', atInt64, [atInt64, atInt64]);
 
   // OS namespace
   AddBuiltin('OS', 'exit', 'exit', atVoid, [atInt64]);
