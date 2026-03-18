@@ -1199,6 +1199,18 @@ begin
   s.ParamTypes[1] := atPChar;
   s.ParamTypes[2] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
+  
+  // read_raw(fd: int64, buf: int64, len: int64) -> int64 (bytes read or -1)
+  // Same as read but accepts int64 for buffer address (for mmap'd buffers)
+  s := TSymbol.Create('read_raw');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
 
   // write(fd: int64, buf: pchar, len: int64) -> int64 (bytes written or -1)
   s := TSymbol.Create('write');
@@ -1271,26 +1283,310 @@ begin
   s.ParamTypes[0] := atPChar;
   AddSymbolToCurrent(s, NullSpan);
 
-  // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
-  s := TSymbol.Create('chmod');
-  s.Kind := symFunc;
-  s.DeclType := atInt64;
-  s.ParamCount := 2;
-  SetLength(s.ParamTypes, 2);
-  s.ParamTypes[0] := atPChar;
-  s.ParamTypes[1] := atInt64;
-  AddSymbolToCurrent(s, NullSpan);
+   // chmod(path: pchar, mode: int64) -> int64 (0 or -1)
+   s := TSymbol.Create('chmod');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atPChar;
+   s.ParamTypes[1] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
 
-  // Buffer/runtime primitives for time formatter
-  // buf_put_byte(buf: pchar, idx: int64, b: int64) -> int64
+   // === Socket System Calls (for std.net) ===
+   // sys_socket(domain: int64, type: int64, protocol: int64) -> int64
+   s := TSymbol.Create('sys_socket');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_bind(sockfd: int64, addr: Pointer, addrlen: int64) -> int64
+   s := TSymbol.Create('sys_bind');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_listen(sockfd: int64, backlog: int64) -> int64
+   s := TSymbol.Create('sys_listen');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_accept(sockfd: int64, addr: Pointer, addrlen: Pointer) -> int64
+   s := TSymbol.Create('sys_accept');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;  // Pointer as int64
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_connect(sockfd: int64, addr: Pointer, addrlen: int64) -> int64
+   s := TSymbol.Create('sys_connect');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer as int64
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_recvfrom(sockfd, buf, len, flags, src_addr, addrlen) -> int64
+   s := TSymbol.Create('sys_recvfrom');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 6;
+   SetLength(s.ParamTypes, 6);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;
+   s.ParamTypes[4] := atInt64;  // Pointer
+   s.ParamTypes[5] := atInt64;  // Pointer
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_sendto(sockfd, buf, len, flags, dest_addr, addrlen) -> int64
+   s := TSymbol.Create('sys_sendto');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 6;
+   SetLength(s.ParamTypes, 6);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;  // Pointer
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;
+   s.ParamTypes[4] := atInt64;  // Pointer
+   s.ParamTypes[5] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_setsockopt(sockfd, level, optname, optval, optlen) -> int64
+   s := TSymbol.Create('sys_setsockopt');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 5;
+   SetLength(s.ParamTypes, 5);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;  // Pointer
+   s.ParamTypes[4] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_getsockopt(sockfd, level, optname, optval, optlen) -> int64
+   s := TSymbol.Create('sys_getsockopt');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 5;
+   SetLength(s.ParamTypes, 5);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   s.ParamTypes[3] := atInt64;  // Pointer
+   s.ParamTypes[4] := atInt64;  // Pointer
+   AddSymbolToCurrent(s, NullSpan);
+
+   // sys_fcntl(fd, cmd, arg) -> int64
+   s := TSymbol.Create('sys_fcntl');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;
+   s.ParamTypes[1] := atInt64;
+   s.ParamTypes[2] := atInt64;
+   AddSymbolToCurrent(s, NullSpan);
+
+    // sys_shutdown(sockfd, how) -> int64
+    s := TSymbol.Create('sys_shutdown');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 2;
+    SetLength(s.ParamTypes, 2);
+    s.ParamTypes[0] := atInt64;
+    s.ParamTypes[1] := atInt64;
+    AddSymbolToCurrent(s, NullSpan);
+
+    // sys_read(fd, buf, count) -> int64
+    s := TSymbol.Create('sys_read');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 3;
+    SetLength(s.ParamTypes, 3);
+    s.ParamTypes[0] := atInt64;
+    s.ParamTypes[1] := atInt64;  // Pointer as int64
+    s.ParamTypes[2] := atInt64;
+    AddSymbolToCurrent(s, NullSpan);
+
+    // sys_write(fd, buf, count) -> int64
+    s := TSymbol.Create('sys_write');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 3;
+    SetLength(s.ParamTypes, 3);
+    s.ParamTypes[0] := atInt64;
+    s.ParamTypes[1] := atInt64;  // Pointer as int64
+    s.ParamTypes[2] := atInt64;
+    AddSymbolToCurrent(s, NullSpan);
+
+    // sys_close(fd) -> int64
+    s := TSymbol.Create('sys_close');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 1;
+    SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;
+    AddSymbolToCurrent(s, NullSpan);
+
+    // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+   s := TSymbol.Create('mmap');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 6;
+   SetLength(s.ParamTypes, 6);
+   s.ParamTypes[0] := atInt64;  // addr (0 for let kernel choose)
+   s.ParamTypes[1] := atInt64;  // length
+   s.ParamTypes[2] := atInt64;  // prot
+   s.ParamTypes[3] := atInt64;  // flags
+   s.ParamTypes[4] := atInt64;  // fd (-1 for anonymous)
+   s.ParamTypes[5] := atInt64;  // offset
+   AddSymbolToCurrent(s, NullSpan);
+
+   // munmap(addr, length) -> int64
+   s := TSymbol.Create('munmap');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atInt64;  // addr
+   s.ParamTypes[1] := atInt64;  // length
+   AddSymbolToCurrent(s, NullSpan);
+
+   // poke8(addr, value) - write byte to memory
+   s := TSymbol.Create('poke8');
+   s.Kind := symFunc;
+   s.DeclType := atVoid;
+   s.ParamCount := 2;
+   SetLength(s.ParamTypes, 2);
+   s.ParamTypes[0] := atInt64;  // addr
+   s.ParamTypes[1] := atInt64;  // value (only low 8 bits used)
+   AddSymbolToCurrent(s, NullSpan);
+
+   // peek8(addr) -> int64 - read byte from memory
+   s := TSymbol.Create('peek8');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 1;
+   SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;  // addr
+    AddSymbolToCurrent(s, NullSpan);
+
+    // poke16(addr, value) - write 16-bit word to memory
+    s := TSymbol.Create('poke16');
+    s.Kind := symFunc;
+    s.DeclType := atVoid;
+    s.ParamCount := 2;
+    SetLength(s.ParamTypes, 2);
+    s.ParamTypes[0] := atInt64;  // addr
+    s.ParamTypes[1] := atInt64;  // value (only low 16 bits used)
+    AddSymbolToCurrent(s, NullSpan);
+
+    // peek16(addr) -> int64 - read 16-bit word from memory
+    s := TSymbol.Create('peek16');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 1;
+    SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;  // addr
+    AddSymbolToCurrent(s, NullSpan);
+
+    // poke32(addr, value) - write 32-bit dword to memory
+    s := TSymbol.Create('poke32');
+    s.Kind := symFunc;
+    s.DeclType := atVoid;
+    s.ParamCount := 2;
+    SetLength(s.ParamTypes, 2);
+    s.ParamTypes[0] := atInt64;  // addr
+    s.ParamTypes[1] := atInt64;  // value (only low 32 bits used)
+    AddSymbolToCurrent(s, NullSpan);
+
+    // peek32(addr) -> int64 - read 32-bit dword from memory
+    s := TSymbol.Create('peek32');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 1;
+    SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;  // addr
+    AddSymbolToCurrent(s, NullSpan);
+
+    // poke64(addr, value) - write 64-bit qword to memory
+    s := TSymbol.Create('poke64');
+    s.Kind := symFunc;
+    s.DeclType := atVoid;
+    s.ParamCount := 2;
+    SetLength(s.ParamTypes, 2);
+    s.ParamTypes[0] := atInt64;  // addr
+    s.ParamTypes[1] := atInt64;  // value (64-bit)
+    AddSymbolToCurrent(s, NullSpan);
+
+    // peek64(addr) -> int64 - read 64-bit qword from memory
+    s := TSymbol.Create('peek64');
+    s.Kind := symFunc;
+    s.DeclType := atInt64;
+    s.ParamCount := 1;
+    SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;  // addr
+    AddSymbolToCurrent(s, NullSpan);
+
+    // write_raw(fd, buf, len) -> int64 - write with int64 buffer address
+   s := TSymbol.Create('write_raw');
+   s.Kind := symFunc;
+   s.DeclType := atInt64;
+   s.ParamCount := 3;
+   SetLength(s.ParamTypes, 3);
+   s.ParamTypes[0] := atInt64;  // fd
+   s.ParamTypes[1] := atInt64;  // buf (pointer as int64)
+   s.ParamTypes[2] := atInt64;  // len
+   AddSymbolToCurrent(s, NullSpan);
+
+   // Buffer/runtime primitives for time formatter
+  // buf_put_byte(buf: int64, idx: int64, b: int64) -> int64
+  // buf kann entweder pchar oder int64 (Pointer) sein
   s := TSymbol.Create('buf_put_byte');
   s.Kind := symFunc;
   s.DeclType := atInt64;
   s.ParamCount := 3;
   SetLength(s.ParamTypes, 3);
-  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[0] := atInt64;  // Pointer als int64 oder pchar
   s.ParamTypes[1] := atInt64;
   s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // buf_get_byte(buf: int64, idx: int64) -> int64
+  // Liest ein Byte aus einem Speicherbereich (Pointer als int64)
+  s := TSymbol.Create('buf_get_byte');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atInt64;  // Pointer als int64
+  s.ParamTypes[1] := atInt64;  // Index
   AddSymbolToCurrent(s, NullSpan);
 
   // itoa_to_buf(val: int64, buf: pchar, idx: int64, buflen: int64, minWidth: int64, padZero: int64) -> int64
@@ -1529,6 +1825,11 @@ var
   targetClassName: string;
   compiledRegex: string;
   captureSlots: Integer;
+  typeName: string;
+  structIdx: Integer;
+  sd: TAstStructDecl;
+  nestedIdx, fj, nestedOffset: Integer;
+  nestedSd: TAstStructDecl;
 begin
   if expr = nil then
   begin
@@ -1582,21 +1883,22 @@ begin
                   Break;
                 end;
               end;
-              if not found then
-                FDiag.Error('unknown field ' + fName + ' in type ' + sSym.StructDecl.Name, expr.Span)
-              else
-              begin
-                // Struct fields are always accessible
-                Result := fldType;
-                // annotate AST node with offset + owner
-                if expr is TAstFieldAccess then
-                begin
-                  TAstFieldAccess(expr).SetFieldOffset(sSym.StructDecl.FieldOffsets[fi]);
-                  TAstFieldAccess(expr).SetOwnerName(sSym.StructDecl.Name);
-                end;
-              end;
-              expr.ResolvedType := Result;
-              Exit;
+               if not found then
+                 FDiag.Error('unknown field ' + fName + ' in type ' + sSym.StructDecl.Name, expr.Span)
+               else
+               begin
+                 // Struct fields are always accessible
+                 Result := fldType;
+                 // annotate AST node with offset + owner + type
+                 if expr is TAstFieldAccess then
+                 begin
+                   TAstFieldAccess(expr).SetFieldOffset(sSym.StructDecl.FieldOffsets[fi]);
+                   TAstFieldAccess(expr).SetOwnerName(sSym.StructDecl.Name);
+                   TAstFieldAccess(expr).SetFieldType(fldType);
+                 end;
+               end;
+               expr.ResolvedType := Result;
+               Exit;
             end
             // Check for class type
             else if Assigned(sSym.ClassDecl) then
@@ -1653,19 +1955,124 @@ begin
                 // Check visibility before allowing access
                 CheckMemberAccess(fName, fldOwnerClass, fldVisibility, expr.Span);
                 
-                Result := fldType;
-                // annotate AST node with offset + owner
-                if expr is TAstFieldAccess then
-                begin
-                  TAstFieldAccess(expr).SetFieldOffset(fldOffset);
-                  TAstFieldAccess(expr).SetOwnerName(sSym.ClassDecl.Name);
-                end;
+                 Result := fldType;
+                 // annotate AST node with offset + owner + type
+                 if expr is TAstFieldAccess then
+                 begin
+                   TAstFieldAccess(expr).SetFieldOffset(fldOffset);
+                   TAstFieldAccess(expr).SetOwnerName(sSym.ClassDecl.Name);
+                   TAstFieldAccess(expr).SetFieldType(fldType);
+                 end;
               end;
               expr.ResolvedType := Result;
               Exit;
             end;
+
+            // Check if the resolved type of the expression is a struct (for parameters)
+            // Use the symbol's DeclType - if it's atUnresolved, look up the type name from the symbol's name
+            if Assigned(sSym) and (sSym.Kind = symVar) then
+            begin
+              // This is a variable/parameter - check if its DeclType is unresolved (struct)
+              if sSym.DeclType = atUnresolved then
+              begin
+                // Try to look up the struct by the variable's type name
+                if (sSym.TypeName <> '') and Assigned(FStructTypes) then
+                begin
+                  idx := FStructTypes.IndexOf(sSym.TypeName);
+                  if idx >= 0 then
+                  begin
+                    // Found the struct - now look up the field
+                    sd := TAstStructDecl(FStructTypes.Objects[idx]);
+                    fName := TAstFieldAccess(expr).Field;
+                    found := False;
+                    for fi := 0 to High(sd.Fields) do
+                    begin
+                      if sd.Fields[fi].Name = fName then
+                      begin
+                        found := True;
+                        fldType := sd.Fields[fi].FieldType;
+                        Break;
+                      end;
+                    end;
+                    if found then
+                     begin
+                       Result := fldType;
+                       // annotate AST node with offset + owner + type
+                       if expr is TAstFieldAccess then
+                       begin
+                         TAstFieldAccess(expr).SetFieldOffset(sd.FieldOffsets[fi]);
+                         TAstFieldAccess(expr).SetOwnerName(sd.Name);
+                         TAstFieldAccess(expr).SetFieldType(fldType);
+                       end;
+                      expr.ResolvedType := Result;
+                      Exit;
+                    end;
+                  end;
+                end;
+              end;
+            end;
           end;
         end;
+        
+        // Handle nested field access: when recv is itself a field access or other expression
+        // that resolves to a struct type
+        if recv.ResolvedType = atUnresolved then
+        begin
+          // Try to find the struct type from the field access's OwnerName
+          if (recv is TAstFieldAccess) and (TAstFieldAccess(recv).OwnerName <> '') then
+          begin
+            // recv is a field access - get its field type's struct name
+            // The field itself might be a struct type
+            // We need to look up what struct type the field 'x' in 'o.x' is
+            idx := FStructTypes.IndexOf(TAstFieldAccess(recv).OwnerName);
+            if idx >= 0 then
+            begin
+              sd := TAstStructDecl(FStructTypes.Objects[idx]);
+              // Find the field that recv refers to
+              for fi := 0 to High(sd.Fields) do
+              begin
+                if sd.Fields[fi].Name = TAstFieldAccess(recv).Field then
+                begin
+                  // Found the field - now check if it's a struct type
+                  if sd.Fields[fi].FieldTypeName <> '' then
+                  begin
+                    // Look up the nested struct
+                    nestedIdx := FStructTypes.IndexOf(sd.Fields[fi].FieldTypeName);
+                    if nestedIdx >= 0 then
+                    begin
+                      nestedSd := TAstStructDecl(FStructTypes.Objects[nestedIdx]);
+                      // Now look up our field in the nested struct
+                      fName := TAstFieldAccess(expr).Field;
+                      for fj := 0 to High(nestedSd.Fields) do
+                      begin
+                        if nestedSd.Fields[fj].Name = fName then
+                        begin
+                          fldType := nestedSd.Fields[fj].FieldType;
+                          Result := fldType;
+                          // Calculate nested offset: parent field offset + nested field offset
+                          nestedOffset := sd.FieldOffsets[fi] + nestedSd.FieldOffsets[fj];
+                          TAstFieldAccess(expr).SetFieldOffset(nestedOffset);
+                          TAstFieldAccess(expr).SetOwnerName(nestedSd.Name);
+                          TAstFieldAccess(expr).SetFieldType(fldType);
+                          // Also update the parent field access to have correct type info
+                          TAstFieldAccess(recv).SetFieldType(atUnresolved); // It's a struct, not primitive
+                          expr.ResolvedType := Result;
+                          Exit;
+                        end;
+                      end;
+                      // Field not found in nested struct
+                      FDiag.Error('unknown field ' + TAstFieldAccess(expr).Field + ' in type ' + nestedSd.Name, expr.Span);
+                      Result := atUnresolved;
+                      Exit;
+                    end;
+                  end;
+                  Break;
+                end;
+              end;
+            end;
+          end;
+        end;
+        
         // fallback: unresolved
         Result := atUnresolved;
       end;
@@ -1703,17 +2110,36 @@ begin
         // Array access
         if not IsIntegerType(lt) then
           FDiag.Error('array index must be integer', TAstIndexAccess(expr).Index.Span);
+        
+        // Check for pchar indexing (string character access)
+        if (ot = atPChar) or (ot = atPCharNullable) then
+        begin
+          // pchar[index] returns int64 (character code)
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
         // if indexing an identifier with array metadata, return element type
         if TAstIndexAccess(expr).Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAccess(expr).Obj).Name);
-          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray)) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
             // For dynamic arrays, return atInt64 (default element type)
             if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
               Result := atInt64
+            else if s.DeclType = atArray then
+              Result := atInt64  // For static arrays, return int64 as element type
             else
               Result := s.DeclType;
+            expr.ResolvedType := Result;
+            Exit;
+          end;
+          // Check if the symbol is pchar type
+          if Assigned(s) and ((s.DeclType = atPChar) or (s.DeclType = atPCharNullable)) then
+          begin
+            Result := atInt64;
             expr.ResolvedType := Result;
             Exit;
           end;
@@ -1730,17 +2156,61 @@ begin
 
         // Resolve the target type from the type name
         castTypeName := TAstCast(expr).CastTypeName;
+        
+        // Special case: function to int64 cast (for function pointers)
+        // This returns the function address, not the return value
+        if (srcType = atFnPtr) and (castTypeName = 'int64') then
+        begin
+          TAstCast(expr).CastType := atInt64;
+          TAstCast(expr).IsFunctionToPointer := True;  // Mark as function address cast
+          Result := atInt64;
+          expr.ResolvedType := Result;
+          Exit;
+        end;
+        
+        // Also check if we're casting a function identifier to int64
+        if (castTypeName = 'int64') and Assigned(TAstCast(expr).Expr) and 
+           (TAstCast(expr).Expr is TAstIdent) then
+        begin
+          // Check if the identifier refers to a function
+          s := ResolveSymbol(TAstIdent(TAstCast(expr).Expr).Name);
+          if Assigned(s) and (s.Kind = symFunc) then
+          begin
+            TAstCast(expr).CastType := atInt64;
+            TAstCast(expr).IsFunctionToPointer := True;  // Mark as function address cast
+            Result := atInt64;
+            expr.ResolvedType := Result;
+            Exit;
+          end;
+        end;
+        
         if castTypeName <> '' then
         begin
-          // Look up the type
+          // Look up the type - support all integer and float types
           if castTypeName = 'int64' then
             TAstCast(expr).CastType := atInt64
+          else if castTypeName = 'int32' then
+            TAstCast(expr).CastType := atInt32
+          else if castTypeName = 'int16' then
+            TAstCast(expr).CastType := atInt16
+          else if castTypeName = 'int8' then
+            TAstCast(expr).CastType := atInt8
+          else if castTypeName = 'uint64' then
+            TAstCast(expr).CastType := atUInt64
+          else if castTypeName = 'uint32' then
+            TAstCast(expr).CastType := atUInt32
+          else if castTypeName = 'uint16' then
+            TAstCast(expr).CastType := atUInt16
+          else if castTypeName = 'uint8' then
+            TAstCast(expr).CastType := atUInt8
           else if castTypeName = 'f64' then
             TAstCast(expr).CastType := atF64
           else if castTypeName = 'f32' then
             TAstCast(expr).CastType := atF32
-          else if castTypeName = 'int32' then
-            TAstCast(expr).CastType := atInt32
+          else if castTypeName = 'bool' then
+            TAstCast(expr).CastType := atBool
+          else if castTypeName = 'char' then
+            TAstCast(expr).CastType := atChar
           else if FClassTypes.IndexOf(castTypeName) >= 0 then
           begin
             // Class cast - mark as class type
@@ -2162,8 +2632,30 @@ begin
         end
         else if s.Kind <> symFunc then
         begin
-          FDiag.Error('attempt to call non-function: ' + call.Name, call.Span);
-          Result := atUnresolved;
+          // Check if this is a function pointer call (variable with function type)
+          // Function pointers are stored as atFnPtr or atInt64 (for compatibility)
+          // Also handle the case where DeclType is unresolved but TypeName is set (type alias)
+          if (s.Kind in [symVar, symLet]) and 
+             ((s.DeclType = atFnPtr) or (s.DeclType = atInt64) or 
+              ((s.DeclType = atUnresolved) and (s.TypeName <> ''))) then
+          begin
+            // This is a function pointer call - mark as indirect
+            call.IsIndirectCall := True;
+            
+            // For now, function pointer calls return int64 as placeholder
+            // TODO: Extract actual return type from function pointer type
+            Result := atInt64;
+            
+            // We still need to check arguments - use param info from the function pointer type
+            // For now, just check that args are valid expressions
+            for i := 0 to High(call.Args) do
+              CheckExpr(call.Args[i]);
+          end
+          else
+          begin
+            FDiag.Error('attempt to call non-function: ' + call.Name, call.Span);
+            Result := atUnresolved;
+          end;
         end
         else
         begin
@@ -2549,7 +3041,7 @@ var
   i: Integer;
   s: TSymbol;
   sym: TSymbol;
-  vtype, ctype, rtype: TAurumType;
+  vtype, ctype, rtype, otype: TAurumType;
   sw: TAstSwitch;
   caseVal: TAstExpr;
   cvtype: TAurumType;
@@ -2560,12 +3052,41 @@ begin
     nkVarDecl:
       begin
         vd := TAstVarDecl(stmt);
-        // check init expr type
-        vtype := CheckExpr(vd.InitExpr);
-        // Allow integer literal 0 to be assigned to nullable pointer types
-        if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
+        // check init expr type (if present)
+        if Assigned(vd.InitExpr) then
+          vtype := CheckExpr(vd.InitExpr)
+        else
+          vtype := vd.DeclType;  // Use declared type if no initializer
+        
+        // Special case: treat fn(...) types as int64 internally (opaque function pointer)
+        // Also handle the case where DeclType is unresolved but DeclTypeName is set (type alias)
+        if (vd.DeclType = atFnPtr) or 
+           ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
+            Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
         begin
-          // Special case: integer literal 0 can be assigned to nullable pointer
+          // Function pointer - keep as fn pointer type for proper resolution
+          // Allow int64 as well for compatibility
+          if (vtype = atInt64) then
+            vtype := atInt64  // Keep int64 for int64 variables
+          else if (vtype = atFnPtr) then
+            vtype := atFnPtr  // Keep function pointer type
+          else if (vd.DeclType <> atUnresolved) and TypeEqual(vtype, vd.DeclType) then
+            vtype := atFnPtr  // Same fn type, use fn pointer
+          else if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) then
+          begin
+            // Check if the initializer is a function name
+            s := ResolveSymbol(TAstIdent(vd.InitExpr).Name);
+            if Assigned(s) and (s.Kind = symFunc) then
+              vtype := atFnPtr  // Function name as initializer -> function pointer
+            else
+              FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
+          end
+          else
+            FDiag.Error(Format('type mismatch in declaration of %s: expected fn pointer but got %s', [vd.Name, AurumTypeToStr(vtype)]), vd.Span);
+        end
+        else if (vd.DeclType <> atUnresolved) and (not TypeEqual(vtype, vd.DeclType)) then
+        begin
+          // Allow integer literal 0 to be assigned to nullable pointer types
           if (vtype = atInt64) and (vd.DeclType = atPCharNullable) and 
              Assigned(vd.InitExpr) and (vd.InitExpr is TAstIntLit) and 
              (TAstIntLit(vd.InitExpr).Value = 0) then
@@ -2665,11 +3186,18 @@ begin
         if TAstIndexAssign(stmt).Target.Obj is TAstIdent then
         begin
           s := ResolveSymbol(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
-          if Assigned(s) and (s.ArrayLen <> 0) then
+          if Assigned(s) and ((s.ArrayLen <> 0) or (s.DeclType = atDynArray) or (s.DeclType = atArray)) then
           begin
-            if not TypeEqual(vtype, s.DeclType) then
+            // Determine element type for the assignment
+            if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
+              otype := atInt64  // dynamic array: element type is int64
+            else if s.DeclType = atArray then
+              otype := atInt64  // static array: element type is int64 for now
+            else
+              otype := s.DeclType;
+            if not TypeEqual(vtype, otype) then
               FDiag.Error(Format('index assignment type mismatch: expected %s but got %s',
-                [AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype)]), stmt.Span);
+                [AurumTypeToStr(otype), AurumTypeToStr(vtype)]), stmt.Span);
           end;
         end;
       end;
@@ -3429,6 +3957,8 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  con: TAstConDecl;
+  vd: TAstVarDecl;
   sym: TSymbol;
 begin
   upath := imp.UnitPath;
@@ -3462,11 +3992,10 @@ begin
     begin
       decl := loadedUnit.AST.Decls[i];
       
-      // Nur Funktionen für jetzt (später auch Variablen/Types)
+      // Öffentliche Funktionen importieren
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
-        // Nur öffentliche Funktionen importieren
         if not fn.IsPublic then
           Continue;
 
@@ -3487,6 +4016,83 @@ begin
         for j := 0 to sym.ParamCount - 1 do
           sym.ParamTypes[j] := fn.Params[j].ParamType;
         AddSymbolToCurrent(sym, fn.Span);
+      end
+      // Öffentliche Konstanten importieren
+      else if decl is TAstConDecl then
+      begin
+        con := TAstConDecl(decl);
+        if not con.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(con.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + con.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(con.Name);
+        sym.Kind := symCon;
+        sym.DeclType := con.DeclType;
+        sym.IsImported := True;
+        AddSymbolToCurrent(sym, con.Span);
+      end
+      // Öffentliche globale Variablen importieren (pub var / pub let)
+      else if decl is TAstVarDecl then
+      begin
+        vd := TAstVarDecl(decl);
+        if not vd.IsPublic then
+          Continue;
+
+        // Prüfe auf Konflikte
+        if ResolveSymbol(vd.Name) <> nil then
+        begin
+          FDiag.Error('import conflicts with existing symbol: ' + vd.Name, imp.Span);
+          Continue;
+        end;
+
+        sym := TSymbol.Create(vd.Name);
+        case vd.Storage of
+          skVar: sym.Kind := symVar;
+          skLet: sym.Kind := symLet;
+        else
+          sym.Kind := symVar;
+        end;
+        sym.DeclType := vd.DeclType;
+        sym.TypeName := vd.DeclTypeName;
+        sym.ArrayLen := vd.ArrayLen;
+        sym.IsImported := True;
+        sym.IsGlobal := True;
+        AddSymbolToCurrent(sym, vd.Span);
+      end
+      // Also import public struct types
+      else if decl is TAstStructDecl then
+      begin
+        // Import struct type into FStructTypes for field resolution
+        // But avoid duplicates - only import if not already present
+        if not Assigned(FStructTypes) then
+        begin
+          FStructTypes := TStringList.Create;
+          FStructTypes.Sorted := False;
+        end;
+        if FStructTypes.IndexOf(TAstStructDecl(decl).Name) < 0 then
+        begin
+          FStructTypes.AddObject(TAstStructDecl(decl).Name, System.TObject(decl));
+        end;
+      end
+      // Also import public class types
+      else if decl is TAstClassDecl then
+      begin
+        // Import class type into FClassTypes for field resolution
+        if not Assigned(FClassTypes) then
+        begin
+          FClassTypes := TStringList.Create;
+          FClassTypes.Sorted := False;
+        end;
+        if FClassTypes.IndexOf(TAstClassDecl(decl).Name) < 0 then
+        begin
+          FClassTypes.AddObject(TAstClassDecl(decl).Name, System.TObject(decl));
+        end;
       end;
     end;
   end;
@@ -3500,8 +4106,18 @@ var
   i, j: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  existingSymbol: TSymbol;
 begin
   Result := nil;
+  
+  // First check if symbol already exists in current scope to avoid
+  // creating duplicate symbols and Use-After-Free bugs
+  existingSymbol := ResolveSymbol(name);
+  if existingSymbol <> nil then
+  begin
+    Result := existingSymbol;
+    Exit;
+  end;
   
   // === Builtin Namespaces ===
   // Handle builtin namespaces like IO, OS, etc.
@@ -3671,6 +4287,47 @@ begin
       SetLength(Result.ParamTypes, 2);
       Result.ParamTypes[0] := atPChar;
       Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'ioctl' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atInt64;  // fd
+      Result.ParamTypes[1] := atInt64;  // request
+      Result.ParamTypes[2] := atInt64;  // argp (pointer as int64)
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'mmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;  // returns pointer as int64
+      Result.ParamCount := 6;
+      SetLength(Result.ParamTypes, 6);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
+      Result.ParamTypes[2] := atInt64;  // prot
+      Result.ParamTypes[3] := atInt64;  // flags
+      Result.ParamTypes[4] := atInt64;  // fd
+      Result.ParamTypes[5] := atInt64;  // offset
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'munmap' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atInt64;  // addr
+      Result.ParamTypes[1] := atInt64;  // length
       AddSymbolToCurrent(Result, span);
       Exit;
     end
@@ -3967,6 +4624,7 @@ end;
 procedure TSema.Analyze(prog: TAstProgram);
 var
   i, j, k, fi: Integer;
+  structIdx: Integer;
   node: TAstNode;
   fn: TAstFuncDecl;
   con: TAstConDecl;
@@ -4134,10 +4792,13 @@ begin
         end;
       end
       else if node is TAstTypeDecl then
-     begin
-       // type declarations: register as named types (future work)
-       // for now, skip
-     end
+      begin
+        // type declarations: register as named types
+        // For function pointer types (atFnPtr), the DeclType is already set
+        // For named types, we store the type information for later lookup
+        // (Currently the type info is stored in FDeclType, which may be atFnPtr for fn(...) types)
+        // TODO: Add support for full type alias resolution if needed
+      end
       else if node is TAstConDecl then
     begin
       con := TAstConDecl(node);
@@ -4165,8 +4826,11 @@ begin
           FDiag.Error('redeclaration of global variable: ' + TAstVarDecl(node).Name, node.Span);
           Continue;
         end;
-        // typecheck init expr
-        itype := CheckExpr(TAstVarDecl(node).InitExpr);
+        // typecheck init expr (if present)
+        if Assigned(TAstVarDecl(node).InitExpr) then
+          itype := CheckExpr(TAstVarDecl(node).InitExpr)
+        else
+          itype := TAstVarDecl(node).DeclType;  // Use declared type if no initializer
         if (TAstVarDecl(node).DeclType <> atUnresolved) and not TypeEqual(itype, TAstVarDecl(node).DeclType) then
           FDiag.Error(Format('global %s: expected type %s but got %s', 
             [TAstVarDecl(node).Name, AurumTypeToStr(TAstVarDecl(node).DeclType), AurumTypeToStr(itype)]), node.Span);
@@ -4214,6 +4878,14 @@ begin
         sym := TSymbol.Create(fn.Params[j].Name);
         sym.Kind := symVar;
         sym.DeclType := fn.Params[j].ParamType;
+        sym.TypeName := fn.Params[j].TypeName;  // for struct types
+        // If it's a struct type (atUnresolved with TypeName), also set StructDecl
+        if (sym.DeclType = atUnresolved) and (sym.TypeName <> '') then
+        begin
+          structIdx := FStructTypes.IndexOf(sym.TypeName);
+          if structIdx >= 0 then
+            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx]);
+        end;
         AddSymbolToCurrent(sym, fn.Params[j].Span);
       end;
       // set current return type

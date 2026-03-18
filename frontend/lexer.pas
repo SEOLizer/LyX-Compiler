@@ -85,6 +85,7 @@ type
     function ReadNumber: TToken;
     function ParseNumberWithBase(startPos: Integer): Int64;
     function IsValidDigit(c: Char; base: Integer): Boolean;
+    function IsHexDigit(c: Char): Boolean;
     function DigitValue(c: Char): Integer;
     function ReadString: TToken;
     function ReadCharLit: TToken;
@@ -327,6 +328,12 @@ begin
   end;
 end;
 
+{ Check if character is a hex digit (0-9, a-f, A-F) }
+function TLexer.IsHexDigit(c: Char): Boolean;
+begin
+  Result := c in ['0'..'9', 'a'..'f', 'A'..'F'];
+end;
+
 { Helper function to convert digit character to integer value }
 function TLexer.DigitValue(c: Char): Integer;
 begin
@@ -495,6 +502,8 @@ var
   startLine, startCol: Integer;
   s: string;
   c: Char;
+  hexStr: string;
+  hexVal: Integer;
 begin
   startLine := FLine;
   startCol := FCol;
@@ -521,17 +530,48 @@ begin
       end;
       c := CurrentChar;
       case c of
-        'n':  s := s + #10;
-        'r':  s := s + #13;
-        't':  s := s + #9;
-        '\':  s := s + '\';
-        '"':  s := s + '"';
-        '0':  s := s + #0;
+        'n':  begin s := s + #10; Advance; end;
+        'r':  begin s := s + #13; Advance; end;
+        't':  begin s := s + #9; Advance; end;
+        '\':  begin s := s + '\'; Advance; end;
+        '"':  begin s := s + '"'; Advance; end;
+        '0':  begin s := s + #0; Advance; end;
+        'e':  begin s := s + #27; Advance; end;  // ESC character
+        'a':  begin s := s + #7; Advance; end;   // Bell
+        'b':  begin s := s + #8; Advance; end;   // Backspace
+        'f':  begin s := s + #12; Advance; end;  // Form feed
+        'v':  begin s := s + #11; Advance; end;  // Vertical tab
+        'x':  begin
+                // Hex escape: \xNN
+                Advance;
+                if IsAtEnd or (not IsHexDigit(CurrentChar)) then
+                begin
+                  FDiag.Error('invalid hex escape sequence',
+                    MakeSpan(FLine, FCol - 2, 2, FFileName));
+                end
+                else
+                begin
+                  hexStr := '';
+                  // Read up to 2 hex digits
+                  if IsHexDigit(CurrentChar) then
+                  begin
+                    hexStr := hexStr + CurrentChar;
+                    Advance;
+                  end;
+                  if (not IsAtEnd) and IsHexDigit(CurrentChar) then
+                  begin
+                    hexStr := hexStr + CurrentChar;
+                    Advance;
+                  end;
+                  hexVal := StrToInt('$' + hexStr);
+                  s := s + Chr(hexVal);
+                end;
+              end;
       else
         FDiag.Error('unknown escape sequence: \' + c,
           MakeSpan(FLine, FCol - 1, 2, FFileName));
+        Advance;
       end;
-      Advance;
     end
     else
     begin

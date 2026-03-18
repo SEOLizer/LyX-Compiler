@@ -8,21 +8,28 @@ uses
   ir, lower_ast_to_ir, ir_inlining, ir_optimize,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
-  arm64_emit, elf64_arm64_writer;
+  arm64_emit, elf64_arm64_writer,
+  macosx64_emit, macho64_writer,
+  xtensa_emit, elf32_writer;
 
 type
-  TTarget = (targetLinux, targetWindows, targetLinuxARM64);
+  TTarget = (targetLinux, targetWindows, targetLinuxARM64, targetMacOSX64, targetMacOSARM64, targetESP32);
+  TArchitecture = (archX86_64, archARM64, archXtensa);
 
 var
   inputFile: string;
   outputFile: string;
   target: TTarget;
+  arch: TArchitecture;
   flagEmitAsm: Boolean;
   flagDumpRelocs: Boolean;
   flagLint: Boolean;
   flagLintOnly: Boolean;
   flagEnergyLevel: Integer;  // 0 = disabled, 1-5 = energy level
   flagOptimize: Boolean;  // IR optimizations default aktiviert
+  flagTraceImports: Boolean;  // --trace-imports Flag
+  includePaths: TStringList;  // -I Pfade
+  stdLibPath: string;  // --std-path
   lint: TLinter;
   src: TStringList;
   d: TDiagnostics;
@@ -38,6 +45,8 @@ var
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
+  macosx64Emit: TMacOSX64Emitter;
+  esp32Emit: ICodeEmitter;
   codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64;
   basePath: string;
@@ -221,23 +230,29 @@ begin
   // Default target is the host OS
   {$IFDEF WINDOWS}
   target := targetWindows;
+  arch := archX86_64;
   {$ELSE}
   target := targetLinux;
+  arch := archX86_64;
   {$ENDIF}
   
     if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.2.0');
+    WriteLn(StdErr, 'Lyx Compiler v0.5.0');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
-    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=win64|linux|arm64]');
+    WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Optionen:');
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
-    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux oder arm64)');
+    WriteLn(StdErr, '  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)');
+    WriteLn(StdErr, '  --std-path=PATH  Pfad zur Standardbibliothek überschreiben');
+    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)');
+    WriteLn(StdErr, '  --arch=ARCH      Architektur (x86_64, arm64, xtensa)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
+    WriteLn(StdErr, '  --trace-imports  Import-Auflösung debuggen');
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
     WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
     WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
@@ -253,6 +268,9 @@ begin
   flagLintOnly := False;
   flagEnergyLevel := 0;
   flagOptimize := True;  // IR optimizations enabled by default
+  flagTraceImports := False;
+  includePaths := TStringList.Create;
+  stdLibPath := '';
 
   // Parse command line arguments
   i := 1;
@@ -265,23 +283,64 @@ begin
       outputFile := ParamStr(i + 1);
       Inc(i, 2);  // Skip -o and the filename
     end
-    else if Copy(param, 1, 9) = '--target=' then
-    begin
-      param := LowerCase(Copy(param, 10, MaxInt));
-      if (param = 'win64') or (param = 'windows') then
-        target := targetWindows
-      else if (param = 'linux') or (param = 'elf') then
-        target := targetLinux
-      else if (param = 'arm64') or (param = 'aarch64') or (param = 'linux-arm64') then
-        target := targetLinuxARM64
-      else
-      begin
-        WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
-        WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64');
-        Halt(1);
-      end;
-      Inc(i);
-    end
+     else if Copy(param, 1, 9) = '--target=' then
+     begin
+       param := LowerCase(Copy(param, 10, MaxInt));
+       if (param = 'win64') or (param = 'windows') then
+       begin
+         target := targetWindows;
+         arch := archX86_64;
+       end
+       else if (param = 'linux') or (param = 'elf') then
+       begin
+         target := targetLinux;
+         arch := archX86_64;
+       end
+       else if (param = 'arm64') or (param = 'aarch64') or (param = 'linux-arm64') then
+       begin
+         target := targetLinuxARM64;
+         arch := archARM64;
+       end
+       else if (param = 'macosx64') or (param = 'darwin') then
+       begin
+         target := targetMacOSX64;
+         arch := archX86_64;
+       end
+       else if (param = 'macos-arm64') or (param = 'macos-aarch64') then
+       begin
+         target := targetMacOSARM64;
+         arch := archARM64;
+       end
+       else if (param = 'esp32') or (param = 'xtensa') then
+       begin
+         target := targetESP32;
+         arch := archXtensa;
+       end
+       else
+       begin
+         WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
+         WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64, macosx64, macos-arm64, esp32');
+         Halt(1);
+       end;
+       Inc(i);
+     end
+     else if Copy(param, 1, 6) = '--arch=' then
+     begin
+       param := LowerCase(Copy(param, 7, MaxInt));
+       if (param = 'x86_64') or (param = 'x64') then
+         arch := archX86_64
+       else if (param = 'arm64') or (param = 'aarch64') then
+         arch := archARM64
+       else if (param = 'xtensa') then
+         arch := archXtensa
+       else
+       begin
+         WriteLn(StdErr, 'Unbekannte Architektur: ', param);
+         WriteLn(StdErr, 'Gültige Werte: x86_64, arm64, xtensa');
+         Halt(1);
+       end;
+       Inc(i);
+     end
     else if param = '--emit-asm' then
     begin
       flagEmitAsm := True;
@@ -311,6 +370,27 @@ begin
     else if param = '--no-opt' then
     begin
       flagOptimize := False;
+      Inc(i);
+    end
+    else if param = '--trace-imports' then
+    begin
+      flagTraceImports := True;
+      Inc(i);
+    end
+    else if (param = '-I') and (i < ParamCount) then
+    begin
+      includePaths.Add(ParamStr(i + 1));
+      Inc(i, 2);
+    end
+    else if Copy(param, 1, 2) = '-I' then
+    begin
+      // -I/path/to/include (ohne Leerzeichen)
+      includePaths.Add(Copy(param, 3, MaxInt));
+      Inc(i);
+    end
+    else if Copy(param, 1, 11) = '--std-path=' then
+    begin
+      stdLibPath := Copy(param, 12, MaxInt);
       Inc(i);
     end
     else if Copy(param, 1, 16) = '--target-energy=' then
@@ -348,17 +428,23 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.3.1');
+  WriteLn('Lyx Compiler v0.5.0');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
   WriteLn('Ausgabe:  ', outputFile);
-  if target = targetWindows then
-    WriteLn('Ziel:     Windows x64 (PE32+)')
-  else if target = targetLinux then
-    WriteLn('Ziel:     Linux x86_64 (ELF64)')
-  else if target = targetLinuxARM64 then
-    WriteLn('Ziel:     Linux ARM64 (ELF64)');
+    if target = targetWindows then
+      WriteLn('Ziel:     Windows x64 (PE32+)')
+    else if target = targetLinux then
+      WriteLn('Ziel:     Linux x86_64 (ELF64)')
+    else if target = targetLinuxARM64 then
+      WriteLn('Ziel:     Linux ARM64 (ELF64)')
+    else if target = targetMacOSX64 then
+      WriteLn('Ziel:     macOS x86_64 (Mach-O)')
+    else if target = targetMacOSARM64 then
+      WriteLn('Ziel:     macOS ARM64 (Mach-O)')
+    else if target = targetESP32 then
+      WriteLn('Ziel:     ESP32 (Xtensa, ELF32)');
 
   // Energy-Konfiguration setzen (vor der Statusausgabe)
   if flagEnergyLevel > 0 then
@@ -411,11 +497,23 @@ begin
         Halt(1);
       end;
 
-      // Phase 2: Lade alle Imports (UnitManager)
-      um := TUnitManager.Create(d);
-      try
-        um.AddSearchPath(basePath);
-        um.LoadAllImports(prog, basePath);
+        // Phase 2: Lade alle Imports (UnitManager)
+        um := TUnitManager.Create(d);
+        try
+          // Konfiguriere den UnitManager
+          um.SetSourceFile(inputFile);
+          um.SetProjectRoot(basePath);
+          um.SetTraceImports(flagTraceImports);
+          
+          // Optionaler Std-Lib-Pfad
+          if stdLibPath <> '' then
+            um.SetStdLibPath(stdLibPath);
+          
+          // Include-Pfade von -I hinzufügen
+          for i := 0 to includePaths.Count - 1 do
+            um.AddIncludePath(includePaths[i]);
+          
+          um.LoadAllImports(prog, inputFile);
 
         if d.HasErrors then
         begin
@@ -460,9 +558,10 @@ begin
         module := TIRModule.Create;
         lower := TIRLowering.Create(module, d);
         try
-          lower.Lower(prog);
-          // Lower imported unit functions into the IR module
+          // First, register constants from imported units so they're available during lowering
           lower.LowerImportedUnits(um);
+          // Then lower the main program
+          lower.Lower(prog);
 
           // IR-Level Inlining Optimization
           WriteLn('[IR] Running inlining optimization...');
@@ -493,95 +592,195 @@ begin
           if flagEmitAsm then
             DumpIRAsAsm(module);
 
-          if target = targetWindows then
-          begin
-            // Windows x64 Code Generation
-            winEmit := TWin64Emitter.Create;
-            try
-              winEmit.EmitFromIR(module);
-              winEmit.WriteToFile(outputFile);
-              WriteLn('Wrote ', outputFile, ' (PE32+ for Windows x64)');
-            finally
-              winEmit.Free;
-            end;
-          end
-          else if target = targetLinux then
-          begin
-            // Linux x86_64 Code Generation
-            emit := TX86_64Emitter.Create;
-            try
-              if flagEnergyLevel > 0 then
-                emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
-
-              emit.EmitFromIR(module);
-              codeBuf := emit.GetCodeBuffer;
-              dataBuf := emit.GetDataBuffer;
-
-              // --dump-relocs: show external symbols and PLT patches
-              if flagDumpRelocs then
-                DumpRelocs(emit);
-
-              // Check if we have external symbols - if so, generate dynamic ELF
-              externSymbols := emit.GetExternalSymbols;
-              if Length(externSymbols) > 0 then
-              begin
-                neededLibs := CollectLibraries(externSymbols);
-                entryVA := 4096;
-                WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
-                WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
-              end
-              else
-              begin
-                entryVA := $400000 + 4096;
-                WriteLn('Generating static ELF (no external symbols)');
-                WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+           if target = targetWindows then
+           begin
+             // Windows x64 Code Generation
+             winEmit := TWin64Emitter.Create;
+             try
+               winEmit.EmitFromIR(module);
+               winEmit.WriteToFile(outputFile);
+               WriteLn('Wrote ', outputFile, ' (PE32+ for Windows x64)');
+             finally
+               winEmit.Free;
+             end;
+           end
+           else if target = targetLinux then
+           begin
+             // Linux x86_64 Code Generation
+             emit := TX86_64Emitter.Create;
+             try
+               if flagEnergyLevel > 0 then
+                 emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+ 
+               emit.EmitFromIR(module);
+               codeBuf := emit.GetCodeBuffer;
+               dataBuf := emit.GetDataBuffer;
+ 
+               // --dump-relocs: show external symbols and PLT patches
+               if flagDumpRelocs then
+                 DumpRelocs(emit);
+ 
+               // Check if we have external symbols - if so, generate dynamic ELF
+               externSymbols := emit.GetExternalSymbols;
+               if Length(externSymbols) > 0 then
+               begin
+                 neededLibs := CollectLibraries(externSymbols);
+                 entryVA := 4096;
+                 WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
+                 WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
+               end
+               else
+               begin
+                 entryVA := $400000 + 4096;
+                 WriteLn('Generating static ELF (no external symbols)');
+                 WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+               end;
+ 
+               // Energy statistics output
+               if flagEnergyLevel > 0 then
+                 PrintEnergyStats(emit.GetEnergyStats);
+ 
+               FpChmod(PChar(outputFile), 493);
+               WriteLn('Wrote ', outputFile);
+             finally
+               emit.Free;
+             end;
+           end
+           else if target = targetLinuxARM64 then
+           begin
+             // Linux ARM64 Code Generation
+             arm64Emit := TARM64Emitter.Create;
+             try
+               arm64Emit.EmitFromIR(module);
+               codeBuf := arm64Emit.GetCodeBuffer;
+               dataBuf := arm64Emit.GetDataBuffer;
+               entryVA := $400000 + 4096;  // Base VA + code offset
+ 
+               // Check if we have external symbols
+               externSymbols := arm64Emit.GetExternalSymbols;
+               if Length(externSymbols) > 0 then
+               begin
+                 WriteLn('Note: ARM64 dynamic linking not yet fully implemented');
+                 WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+               end;
+ 
+               WriteLn('Generating static ELF for Linux ARM64');
+               WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+ 
+               // Energy statistics output
+               if flagEnergyLevel > 0 then
+                 PrintEnergyStats(arm64Emit.GetEnergyStats);
+ 
+               FpChmod(PChar(outputFile), 493);
+               WriteLn('Wrote ', outputFile, ' (ELF64 for Linux ARM64)');
+             finally
+               arm64Emit.Free;
+             end;
+           end
+            else if target = targetMacOSX64 then
+            begin
+              // macOS x86_64 Code Generation
+              macosx64Emit := TMacOSX64Emitter.Create;
+              try
+                if flagEnergyLevel > 0 then
+                  macosx64Emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+  
+                macosx64Emit.EmitFromIR(module);
+                codeBuf := macosx64Emit.GetCodeBuffer;
+                dataBuf := macosx64Emit.GetDataBuffer;
+                entryVA := $400000 + 4096;  // Base VA + code offset
+  
+                // Check if we have external symbols (for now ignore, produce static Mach-O)
+                externSymbols := macosx64Emit.GetExternalSymbols;
+                if Length(externSymbols) > 0 then
+                begin
+                  WriteLn('Note: macOS dynamic linking not yet implemented');
+                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                end;
+  
+                WriteLn('Generating static Mach-O for macOS x86_64');
+                WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctX86_64);
+  
+                // Energy statistics output
+                if flagEnergyLevel > 0 then
+                  PrintEnergyStats(macosx64Emit.GetEnergyStats);
+  
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile);
+              finally
+                macosx64Emit.Free;
               end;
-
-              // Energy statistics output
-              if flagEnergyLevel > 0 then
-                PrintEnergyStats(emit.GetEnergyStats);
-
-              FpChmod(PChar(outputFile), 493);
-              WriteLn('Wrote ', outputFile);
-            finally
-              emit.Free;
-            end;
-          end
-          else
-          begin
-            // Linux ARM64 Code Generation
-            arm64Emit := TARM64Emitter.Create;
-            try
-              arm64Emit.EmitFromIR(module);
-              codeBuf := arm64Emit.GetCodeBuffer;
-              dataBuf := arm64Emit.GetDataBuffer;
-              entryVA := $400000 + 4096;  // Base VA + code offset
-
-              // Check if we have external symbols
-              externSymbols := arm64Emit.GetExternalSymbols;
-              if Length(externSymbols) > 0 then
-              begin
-                WriteLn('Note: ARM64 dynamic linking not yet fully implemented');
-                WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+            end
+            else if target = targetMacOSARM64 then
+            begin
+              // macOS ARM64 Code Generation
+              arm64Emit := TARM64Emitter.Create;
+              try
+                arm64Emit.EmitFromIR(module);
+                codeBuf := arm64Emit.GetCodeBuffer;
+                dataBuf := arm64Emit.GetDataBuffer;
+                entryVA := $400000 + 4096;  // Base VA + code offset
+                
+                // Note: Mach-O 64-bit header for ARM64 requires different magic
+                // For now, we'll use the same Mach-O writer but this needs proper ARM64 support
+                externSymbols := arm64Emit.GetExternalSymbols;
+                if Length(externSymbols) > 0 then
+                begin
+                  WriteLn('Note: macOS ARM64 dynamic linking not yet implemented');
+                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                end;
+  
+                WriteLn('Generating static Mach-O for macOS ARM64');
+                WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctARM64);
+  
+                // Energy statistics output
+                if flagEnergyLevel > 0 then
+                  PrintEnergyStats(arm64Emit.GetEnergyStats);
+  
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile, ' (Mach-O for macOS ARM64)');
+              finally
+                arm64Emit.Free;
               end;
+            end
+            else if target = targetESP32 then
+            begin
+              // ESP32 (Xtensa) Code Generation
+              esp32Emit := TxtensaCodeEmitter.Create;
+              try
+                if flagEnergyLevel > 0 then
+                  esp32Emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
 
-              WriteLn('Generating static ELF for Linux ARM64');
-              WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+                esp32Emit.EmitFromIR(module);
+                codeBuf := esp32Emit.GetCodeBuffer;
+                dataBuf := esp32Emit.GetDataBuffer;
+                entryVA := $400000 + 4096;  // Base VA + code offset
 
-              // Energy statistics output
-              if flagEnergyLevel > 0 then
-                PrintEnergyStats(arm64Emit.GetEnergyStats);
+                // Check if we have external symbols (for now ignore, produce static ELF)
+                externSymbols := esp32Emit.GetExternalSymbols;
+                if Length(externSymbols) > 0 then
+                begin
+                  WriteLn('Note: ESP32 dynamic linking not yet implemented');
+                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                end;
 
-              FpChmod(PChar(outputFile), 493);
-              WriteLn('Wrote ', outputFile, ' (ELF64 for Linux ARM64)');
-            finally
-              arm64Emit.Free;
-            end;
+                WriteLn('Generating static ELF32 for ESP32 (Xtensa)');
+                WriteElf32(outputFile, codeBuf, dataBuf, entryVA);
+
+                // Energy statistics output
+                if flagEnergyLevel > 0 then
+                  PrintEnergyStats(esp32Emit.GetEnergyStats);
+
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile);
+               finally
+                 // esp32Emit is interface reference, automatically freed
+               end;
+             end;
+          finally
+            lower.Free;
+            module.Free;
           end;
-        finally
-          lower.Free;
-          module.Free;
-        end;
       finally
         um.Free;
       end;
@@ -595,4 +794,7 @@ begin
   finally
     src.Free;
   end;
+  
+  // Cleanup
+  includePaths.Free;
 end.

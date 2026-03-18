@@ -1,13 +1,16 @@
 # Lyx
 
 **Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
-It produces directly executable **Linux x86_64 ELF64**, **Linux ARM64 ELF64**, and **Windows x64 PE32+ binaries** — without libc, without linker, using pure syscalls or WinAPI.
+It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
 Lyx Compiler v0.5.0
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, 
+   macOS x86_64, macOS ARM64, ESP32/Xtensa
+✅ Architecture Parameter: --arch=x86_64|arm64|xtensa
+✅ Target Parameter: --target=linux|arm64|win64|macosx64|macos-arm64|esp32
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -39,12 +42,15 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 # Build compiler
 make build
 
-# Compile and run Linux program
+# Compile and run Linux program (default target)
 ./lyxc examples/hello.lyx -o hello
 ./hello
 
-# Cross-compile for Windows
-./lyxc examples/hello.lyx -o hello.exe --target=win64
+# Cross-compile for different platforms
+./lyxc examples/hello.lyx -o hello.exe --target=win64        # Windows
+./lyxc examples/hello.lyx -o hello --target=macosx64         # macOS Intel
+./lyxc examples/hello.lyx -o hello --target=macos-arm64      # macOS Apple Silicon
+./lyxc examples/hello.lyx -o hello.elf --target=esp32        # ESP32
 
 # Debug flags
 ./lyxc examples/hello.lyx --emit-asm      # Output IR as pseudo-assembler
@@ -176,7 +182,7 @@ L1 cache footprint:    846 bytes
 
 ### Cross-Compilation
 
-Lyx supports **cross-compilation** for three target platforms:
+Lyx supports **cross-compilation** for multiple target platforms and architectures:
 
 ```bash
 # Linux x86_64 ELF64 (default on Linux hosts)
@@ -187,15 +193,77 @@ Lyx supports **cross-compilation** for three target platforms:
 
 # Windows PE32+ (from Linux)
 ./lyxc program.lyx -o program.exe --target=win64
+
+# macOS x86_64 Mach-O (Intel Macs)
+./lyxc program.lyx -o program --target=macosx64
+
+# macOS ARM64 Mach-O (Apple Silicon Macs)
+./lyxc program.lyx -o program --target=macos-arm64
+
+# ESP32/Xtensa ELF32 (microcontroller)
+./lyxc program.lyx -o program.elf --target=esp32
 ```
 
-| Target Platform | Format | Calling Convention | OS Interface |
-|-----------------|--------|-------------------|--------------|
-| `linux` | ELF64 | SysV ABI x86_64 (RDI, RSI, RDX, RCX, R8, R9) | Syscalls |
-| `arm64` | ELF64 | AAPCS64 (X0-X7) | Syscalls |
-| `win64` | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) | kernel32.dll |
+#### Available Targets and Architectures
 
-**Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target.
+| Target Flag | Architecture | Object Format | Calling Convention | OS Interface | Status |
+|-------------|--------------|---------------|-------------------|--------------|--------|
+| `--target=linux` | x86_64 | ELF64 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | Linux Syscalls | ✅ Stable |
+| `--target=arm64` | ARM64 | ELF64 | AAPCS64 (X0-X7) | Linux Syscalls | ✅ Stable |
+| `--target=win64` | x86_64 | PE32+ | Windows x64 (RCX, RDX, R8, R9 + Shadow) | kernel32.dll | ✅ Stable |
+| `--target=macosx64` | x86_64 | Mach-O | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | BSD Syscalls | ✅ Stable |
+| `--target=macos-arm64` | ARM64 | Mach-O | AAPCS64 (X0-X7) | BSD Syscalls | ✅ Stable |
+| `--target=esp32` | Xtensa | ELF32 | Simplified SysV (A2-A7 params) | Syscalls | ⚠️ Experimental |
+
+#### Architecture Parameter
+
+You can also explicitly specify the architecture using `--arch`:
+
+```bash
+# Default behavior (architecture inferred from target)
+./lyxc program.lyx -o program --target=macos-arm64
+
+# Explicit architecture specification
+./lyxc program.lyx -o program --target=macosx64 --arch=x86_64
+./lyxc program.lyx -o program --target=macos-arm64 --arch=arm64
+./lyxc program.lyx -o program --target=esp32 --arch=xtensa
+```
+
+| Architecture Flag | Description |
+|-------------------|-------------|
+| `--arch=x86_64` | 64-bit x86 (Intel/AMD) |
+| `--arch=arm64` | 64-bit ARM (Apple Silicon, Raspberry Pi 4+) |
+| `--arch=xtensa` | Xtensa (ESP32 microcontroller) |
+
+**Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target. The `--arch` parameter is also optional - architecture is automatically inferred from the target.
+
+#### CLI Help
+
+```bash
+./lyxc --help
+```
+
+```
+Lyx Compiler v0.5.0
+Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
+
+Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
+
+Optionen:
+  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)
+  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)
+  --std-path=PATH  Pfad zur Standardbibliothek überschreiben
+  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)
+  --arch=ARCH      Architektur (x86_64, arm64, xtensa)
+  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
+  --emit-asm       IR als Pseudo-Assembler ausgeben
+  --dump-relocs    Relocations und externe Symbole anzeigen
+  --trace-imports  Import-Auflösung debuggen
+  --lint           Linter-Warnungen aktivieren
+  --lint-only      Nur linten, nicht kompilieren
+  --no-lint        Linter-Warnungen deaktivieren
+  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)
+```
 
 **Testing ARM64 binaries (on x86_64):**
 ```bash
@@ -206,7 +274,73 @@ sudo apt install qemu-user-static
 qemu-aarch64-static ./program
 ```
 
+**Testing binaries on target platforms:**
+
+| Platform | Testing Method |
+|----------|----------------|
+| Linux | Direct execution (`./program`) |
+| Windows | Run via Wine or on Windows machine |
+| macOS | Copy to Mac via SSH/SCP and execute |
+| ESP32 | Flash to device and monitor via serial |
+
+**Cross-compile for ESP32 (Xtensa):**
+```bash
+# Compile for ESP32 microcontroller
+./lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
+
+# Check ELF32 structure
+readelf -h esp32_hello.elf
+```
+
+**Platform-Specific Details:**
+
+| Platform | Architecture | Object Format | Register Set | ABI |
+|----------|--------------|---------------|--------------|-----|
+| **Linux x86_64** | x86_64 | ELF64 | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **Linux ARM64** | ARM64 | ELF64 | X0-X30 | AAPCS64 (X0-X7) |
+| **Windows x64** | x86_64 | PE32+ | RAX-R15 | Windows x64 (RCX, RDX, R8, R9 + Shadow Space) |
+| **macOS x86_64** | x86_64 | Mach-O | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
+| **macOS ARM64** | ARM64 | Mach-O | X0-X30 | AAPCS64 (X0-X7) |
+| **ESP32** | Xtensa | ELF32 | A0-A15 | Simplified SysV (A2-A7 params) |
+
+**ESP32 Built-in Syscalls:**
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `SYS_EXIT` | 1 | Terminate program |
+| `SYS_WRITE` | 4 | Write to STDOUT |
+| `SYS_READ` | 3 | Read from STDIN |
+| `SYS_GPIO_SET_MODE` | 100 | Configure GPIO pin |
+| `SYS_GPIO_WRITE` | 101 | Write to GPIO |
+| `SYS_GPIO_READ` | 102 | Read from GPIO |
+| `SYS_UART_WRITE` | 200 | UART transmit |
+| `SYS_UART_READ` | 201 | UART receive |
+| `SYS_UART_CONFIG` | 202 | Configure UART |
+| `SYS_GET_TIME` | 300 | Get timestamp |
+| `SYS_DELAY_MS` | 301 | Delay in milliseconds |
+| `SYS_RANDOM` | 302 | Generate random number |
+| `SYS_RANDOM_SEED` | 303 | Set random seed |
+
+**Cross-Platform Examples:**
+
+macOS ARM64 (`examples/hello_macos_arm64.lyx`):
+```lyx
+fn main(): int64 {
+  PrintStr("Hello from macOS ARM64 (Apple Silicon)!\n");
+  return 0;
+}
+```
+
+ESP32 (`examples/esp32_hello.lyx`):
+```lyx
+fn main(): int64 {
+  PrintStr("Hello from ESP32!\n");
+  return 0;
+}
+```
+
 ---
+
+###
 
 ## The Lyx Language
 
@@ -327,6 +461,76 @@ fn main(): int64 {
   PrintInt(TimesTwo(result));  // Output: 84
   return 0;
 }
+```
+
+#### Module Resolution
+
+The compiler resolves imports in the following order:
+
+| Priority | Search Location | Description |
+|----------|----------------|-------------|
+| 1 | Relative to importing file | Local modules in the same directory |
+| 2 | Project root | Working directory where compiler was invoked |
+| 3 | `-I` include paths | Custom paths specified via `-I` flag |
+| 4 | Standard library | System path (`./std/` or `/usr/lib/lyx/std/`) |
+
+**Reserved `std` Namespace:**
+
+Imports starting with `std.` are special: they skip local resolution and go directly to the standard library. This prevents accidental shadowing of standard modules:
+
+```lyx
+// Always loads from standard library, never local files
+import std.math;
+import std.io;
+import std.string;
+```
+
+#### Include Paths (`-I`)
+
+Use `-I` to add custom search paths for modules:
+
+```bash
+# Add external library path
+./lyxc main.lyx -o main -I /path/to/mylib -I /path/to/otherlib
+
+# Multiple -I flags are searched in order
+./lyxc main.lyx -I ./vendor -I ./lib
+```
+
+#### Debugging Import Resolution (`--trace-imports`)
+
+Use `--trace-imports` to debug module resolution issues:
+
+```bash
+./lyxc main.lyx --trace-imports
+```
+
+Output:
+```
+[TRACE] Resolving 'myhelper'...
+[TRACE]   -> Trying: ./myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /project/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Trying: /usr/lib/lyx/std/myhelper.lyx ... NOT FOUND
+[TRACE]   -> Module NOT FOUND in any search path!
+
+[TRACE] Resolving 'std.io'...
+[TRACE]   Reserved prefix 'std' detected. Jumping to STD_PATH.
+[TRACE]   -> Trying: /usr/lib/lyx/std/io.lyx ... FOUND!
+```
+
+#### Standard Library Path
+
+The compiler searches for the standard library in this order:
+
+1. `LYX_STD_PATH` environment variable
+2. Relative to compiler binary: `../std/`
+3. System path: `/usr/lib/lyx/std/`
+4. Fallback: `./std/`
+
+Override with `--std-path`:
+
+```bash
+./lyxc main.lyx --std-path=/custom/path/to/std
 ```
 
 **Available Standard Library:**
@@ -1660,11 +1864,15 @@ Source code (.lyx)
       |
   [ Backend ]       IR -> Machine code (Bytes)
       |
-      +-- [ Linux:   x86_64_emit + elf64_writer ]  -> ELF64 Binary
+      +-- [ Linux x86_64: x86_64_emit + elf64_writer ]   -> ELF64 Binary
       |
-      +-- [ Windows: x86_64_win64 + pe64_writer ]  -> PE32+ Binary
+      +-- [ Linux ARM64:  arm64_emit + elf64_writer ]    -> ELF64 Binary
       |
-  Executable (ELF64 or PE32+, without libc)
+      +-- [ Windows x64:  x86_64_win64 + pe64_writer ]   -> PE32+ Binary
+      |
+      +-- [ macOS x86_64: macosx64_emit + macho64_writer ] -> Mach-O Binary
+      |
+  Executable (ELF64, PE32+, or Mach-O, without libc)
 ```
 
 ### Project Structure
@@ -1686,10 +1894,17 @@ backend/
   x86_64/
     x86_64_emit.pas         x86_64 instruction encoding (Linux/SysV)
     x86_64_win64.pas        Windows x64 emitter (Shadow Space, IAT)
+  arm64/
+    arm64_emit.pas          ARM64 instruction encoding (AAPCS64)
   elf/
-    elf64_writer.pas        ELF64 binary writer
+    elf64_writer.pas        ELF64 binary writer (Linux x86_64/ARM64)
   pe/
     pe64_writer.pas         PE32+ binary writer (DOS/COFF/Optional Header)
+  macho/
+    macho64_writer.pas      Mach-O 64-bit binary writer (macOS)
+    syscalls_macos.pas      macOS BSD syscall constants
+  macosx64/
+    macosx64_emit.pas       macOS x86_64 code emitter
 util/
   diag.pas                  Diagnostics (errors with line/column)
   bytes.pas                 TByteBuffer (byte encoding + patching)
@@ -1780,5 +1995,14 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 ---
 
 ## License
+
+This software is licensed under the **Lyx Proprietary & Community License (LPCL) v1.0**.
+
+- **Free for**: Personal use and educational institutions
+- **Commercial use**: Requires a separate license agreement
+- **Forks/Modifications**: Allowed for non-commercial distribution only
+- **AI/ML Training**: Strictly prohibited without written permission
+
+See [LICENSE](LICENSE) for the full license text.
 
 Copyright (c) 2026 Andreas Röne. All rights reserved.
