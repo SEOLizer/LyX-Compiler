@@ -2241,10 +2241,10 @@ begin
           
         irFree:
           begin
-            // Heap deallocation: free(Src1)
-            // munmap(addr, length) - but we don't track sizes, so skip for now
+            // Heap deallocation: munmap(Src1, size)
+            // For now, skip munmap and let OS reclaim memory at process exit
             // TODO: Track allocation sizes for proper munmap
-            // This causes a memory leak but prevents crashes
+            // This causes memory leaks but prevents crashes from wrong sizes
           end;
 
         irPoolAlloc:
@@ -2576,9 +2576,125 @@ begin
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
           end;
 
-        irMapRemove, irSetRemove, irMapFree, irSetFree:
+        irMapRemove:
           begin
-            // TODO: implement
+            // map_remove: Linear search for key and remove
+            // Src1 = map pointer, Src2 = key to remove
+            // Load map and key into x0, x1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // x2 = len = [x0]
+            WriteLdrImm(FCode, X2, X0, 0);
+            // x3 = 0 (counter/i)
+            WriteMovImm64(FCode, X3, 0);
+            // x4 = x0 + 16 (first entry pointer)
+            WriteAddImm(FCode, X4, X0, 16);
+            // Loop: compare i with len
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            loopEndPos := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge done (not found)
+            // Check if key matches: [x4] == x1
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            matchPos := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            // Found match: shift remaining elements left
+            // while i+1 < len: [x4] = [x4+16], i++, x4+=16
+            WriteAddImm(FCode, X3, X3, 1);
+            // x5 = x0 + 16 + i*16 (next entry)
+            WriteAddImm(FCode, X5, X0, 16);
+            WriteLslImm(FCode, X6, X3, 4);
+            WriteAddReg(FCode, X5, X5, X6);
+            // Copy next entry to current: [x4] = [x5], [x4+8] = [x5+8]
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteLdrImm(FCode, X7, X5, 8);
+            WriteStrImm(FCode, X6, X4, 0);
+            WriteStrImm(FCode, X7, X4, 8);
+            // x4 += 16
+            WriteAddImm(FCode, X4, X4, 16);
+            // Decrement len and store
+            WriteSubImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+            // Jump back to loop
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // next: i++, x4+=16, continue loop
+            FCode.PatchU32(matchPos, ((FCode.Size - matchPos) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // done: nop or exit
+            FCode.PatchU32(loopEndPos, ((FCode.Size - loopEndPos) div 4) shl 5 or $5400000A);
+          end;
+
+        irSetRemove:
+          begin
+            // set_remove: Linear search for value and remove
+            // Src1 = set pointer, Src2 = value to remove
+            // Load set and value into x0, x1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // x2 = len = [x0]
+            WriteLdrImm(FCode, X2, X0, 0);
+            // x3 = 0 (counter/i)
+            WriteMovImm64(FCode, X3, 0);
+            // x4 = x0 + 8 (first entry pointer)
+            WriteAddImm(FCode, X4, X0, 8);
+            // Loop: compare i with len
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            loopEndPos := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge done (not found)
+            // Check if value matches: [x4] == x1
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            matchPos := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            // Found match: shift remaining elements left
+            WriteAddImm(FCode, X3, X3, 1);
+            // x5 = x0 + 8 + i*8 (next entry)
+            WriteAddImm(FCode, X5, X0, 8);
+            WriteLslImm(FCode, X6, X3, 3);
+            WriteAddReg(FCode, X5, X5, X6);
+            // Copy next entry to current: [x4] = [x5]
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteStrImm(FCode, X6, X4, 0);
+            // x4 += 8
+            WriteAddImm(FCode, X4, X4, 8);
+            // Decrement len and store
+            WriteSubImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+            // Jump back to loop
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // next: i++, x4+=8, continue loop
+            FCode.PatchU32(matchPos, ((FCode.Size - matchPos) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteAddImm(FCode, X4, X4, 8);
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // done: nop or exit
+            FCode.PatchU32(loopEndPos, ((FCode.Size - loopEndPos) div 4) shl 5 or $5400000A);
+          end;
+
+        irMapFree, irSetFree:
+          begin
+            // map_free/set_free: munmap(ptr, 0x1000)
+            // For simplicity, we don't track exact sizes
+            // Load ptr into x0
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // X1 = size (use 4096 as rough estimate for small maps/sets)
+            WriteMovImm64(FCode, X1, 4096);
+            // X2 = prot (0)
+            WriteMovImm64(FCode, X2, 0);
+            // X3 = flags (MAP_ANONYMOUS)
+            WriteMovImm64(FCode, X3, 34);
+            // X4 = fd (-1)
+            WriteMovImm64(FCode, X4, High(UInt64));
+            // X5 = offset (0)
+            WriteMovImm64(FCode, X5, 0);
+            // X8 = syscall number (222 = sys_munmap on ARM64 Linux)
+            WriteMovImm64(FCode, X8, 215); // SYS_munmap
+            // SVC #0
+            WriteSvc(FCode, 0);
           end;
         
       else
