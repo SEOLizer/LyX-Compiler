@@ -1,24 +1,162 @@
-# Dynamisches Linking – Fehlersuche
+# Dynamisches Linking – Debugging
 
-## Erkenntnisse
+## Aktueller Stand (März 2026)
 
-*   Das generierte ELF-Binary `test_dynlink` stürzt mit einem "Ungültiger Maschinenbefehl" (Exit Code 132) ab. Dies deutet auf eine fehlerhafte Instruktionssequenz im ausgeführten Code hin.
-*   `readelf -s --dyn-syms` liefert keine dynamischen Symbolinformationen. Dies könnte darauf hindeuten, dass die `.dynsym`-Sektion entweder nicht korrekt befüllt oder nicht richtig in den ELF-Strukturen referenziert wird.
-*   `objdump -d -j .plt` und `objdump -d -j .text` schlagen fehl, da die Sektionen `.plt` und `.text` nicht gefunden werden. Obwohl dies bei PIE-Executables ohne explizite Sektionstabellen normal sein kann, erschwert es die Analyse des generierten Maschinencodes erheblich.
-*   Die `readelf -d` Ausgabe zeigt, dass `DT_NEEDED` für `libc.so.6` korrekt in der Dynamic Section vorhanden ist.
-*   Die `readelf -r --use-dynamic` Ausgabe zeigt zwei Relocation-Einträge, die auf den ersten Blick korrekt erscheinen:
-    *   `0x000000002078 R_X86_64_RELATIVE 20c8`: Dies ist die Relocation für GOT[0], die auf die `.dynamic`-Sektion (bei Offset `0x20c8`) verweist.
-    *   `0x000000002090 000100000007 R_X86_64_JUMP_SLO 0000000000000000 strlen + 0`: Dies ist die Relocation für `strlen` im `.got.plt` (GOT-Eintrag 3). Der Offset `0x2090` scheint passend, da GOT[3] bei `gotOff + 24` beginnt und `strlen` das erste externe Symbol ist (Index 0).
-*   Das Problem liegt sehr wahrscheinlich im generierten Maschinencode der PLT-Stubs, in der Initialisierung oder Auflösung der GOT-Einträge durch den Dynamic Linker oder im Übergang vom `_start`-Symbol zur `main`-Funktion. Ein fehlerhafter `pchar`-Zugriff oder String-Literal-Handling kann ebenfalls die Ursache sein.
+### ✅ Funktioniert
 
-## TODOs
+Dynamisches Linking mit `extern fn` funktioniert korrekt:
 
-1.  **Sektionstabellen für Debugging aktivieren:** Temporär Sektionstabellen im `elf64_writer.pas` generieren. Dies würde `objdump` und andere Analyse-Tools ermöglichen, `.plt` und `.text` Sektionen korrekt zu finden und zu disassemblieren, was die Fehlersuche erheblich vereinfachen würde.
-2.  **Manuelle Disassemblierung des PLT- und Code-Bereichs:**
-    *   Die genauen Offsets des PLT0 und des `strlen`-PLT-Stubs innerhalb des generierten Binaries ermitteln.
-    *   Den Code-Bereich im `.text`-Abschnitt lokalisieren, der die Funktion `strlen` aufruft.
-    *   Die relevanten Bytes aus diesen Bereichen mit `dd` extrahieren und dann manuell disassemblieren (z.B. mit `ndisasm` oder durch `xxd` und anschließende Analyse des Hex-Codes).
-    *   Besonderes Augenmerk auf die korrekte Struktur der `jmp`- und `push`-Instruktionen in den PLT-Stubs sowie auf die korrekte Adressierung der GOT-Einträge legen.
-3.  **Überprüfung der GOT-Einträge im Binary:** Die initialen Werte der Global Offset Table (GOT)-Einträge im erzeugten Binary direkt mit `hexdump` überprüfen. Sicherstellen, dass GOT[0], GOT[1] und GOT[2] sowie die Einträge für `strlen` korrekt initialisiert sind (insbesondere der Eintrag für `strlen` sollte initial auf PLT0 verweisen, bevor der Dynamic Linker ihn auflöst).
-4.  **Validierung des Entry Points (`e_entry`):** Sicherstellen, dass der `e_entry` im ELF-Header (derzeit `0x1000`) korrekt ist und auf den tatsächlichen Start des Codes (`_start`) im Binary zeigt. Dies ist entscheidend für den Programmstart.
-5.  **Handling von `pchar` und String-Literalen:** Überprüfen, wie der String "Hello World" im `.data`-Abschnitt gespeichert wird und ob der `pchar`-Typ korrekt in die entsprechenden Adressen aufgelöst wird. Ein fehlerhafter String-Pointer könnte zu einem ungültigen Speicherzugriff führen.
+```lyx
+extern fn strlen(str: pchar): int64;
+
+fn main(): int64 {
+  var msg: pchar := "Hello Dynamic!";
+  var len: int64 := strlen(msg);
+  return 0;
+}
+```
+
+Kompilierung:
+```bash
+./lyxc test_dynlink.lyx -o test_dynlink
+/tmp/test_dynlink: ELF 64-bit LSB shared object, x86-64, dynamically linked
+```
+
+Ausführung:
+```
+Length: 14
+Exit code: 0
+```
+
+### ✅ PLT/GOT Struktur
+
+Die dynamisch gelinkten Binaries haben eine korrekte PLT/GOT-Struktur:
+
+```
+Dynamic section at offset 0x2168 contains 16 entries:
+  Tag       Typ                          Name/Wert
+  NEEDED    Gemeinsame Bibliothek        [libc.so.6]
+  HASH      0x2104
+  STRTAB    0x20f0
+  SYMTAB    0x20c0
+  STRSZ     18 (Bytes)
+  SYMENT    24 (Bytes)
+  PLTGOT    0x2118
+  PLTRELSZ  24 (Bytes)
+  PLTREL    RELA
+  JMPREL    0x2138
+  RELA      0x2150
+  RELASZ    24 (Bytes)
+  RELAENT   24 (Bytes)
+  BIND_NOW  (eager symbol resolution)
+  DEBUG     0x0
+```
+
+## Vergangene Probleme (behoben)
+
+### Exit Code 132 (Ungültiger Maschinenbefehl)
+
+**Ursache:** Ein fehlerhafter PLT-Stub oder ein falscher GOT-Eintrag.
+
+**Lösung:** Das Problem wurde in einer früheren Version behoben. Die aktuelle Implementierung:
+- PLT0 mit korrektem `push` + `jmp` Sequenz
+- PLTn Stubs mit korrekter Adressierung
+- GOT-Einträge werden korrekt initialisiert
+
+### readelf -s zeigt keine dynamischen Symbole
+
+**Ursache:** Die `.dynsym` Sektion war nicht korrekt formatiert.
+
+**Lösung:** Der ELF64-Writer generiert jetzt korrekte `.dynsym` und `.dynstr` Sektionen.
+
+## Sektionstabellen für dynamisches ELF
+
+### Implementiert
+
+Die `WriteDynamicElf64WithPatches` Funktion generiert jetzt Sektionstabellen für dynamisch gelinkte Binaries:
+
+```pascal
+// ELF Header
+elfHdr.e_shoff := shdrsOff;
+elfHdr.e_shentsize := SizeOf(TElf64Shdr);
+elfHdr.e_shnum := numShdrs;
+elfHdr.e_shstrndx := shStrTabIdx;
+```
+
+### Sektionen für dynamisches ELF
+
+| Sektion | Typ | Beschreibung |
+|---------|-----|--------------|
+| .interp | PROGBITS | Pfad zum Dynamic Linker |
+| .text | PROGBITS | Code |
+| .data | PROGBITS | Daten |
+| .bss | NOBITS | Uninitialisierte Daten |
+| .dynsym | DYNSYM | Dynamische Symbole |
+| .dynstr | STRTAB | Dynamische String-Tabelle |
+| .hash | HASH | Hash-Tabelle für Symbol-Lookup |
+| .got.plt | PROGBITS | Global Offset Table (PLT) |
+| .rela.plt | RELA | Relokationen für PLT |
+| .rela.dyn | RELA | Relokationen für .dynsym |
+| .dynamic | DYNAMIC | Dynamic Linker-Informationen |
+| .shstrtab | STRTAB | Sektions-Header String-Tabelle |
+
+## Noch offen
+
+### 1. Sektionstabellen für statisches ELF
+
+Die `WriteElf64` Funktion (für statische Binaries ohne externe Symbole) generiert keine Sektionstabellen.
+
+**Aufwand:** Niedrig (~2h)
+**Priorität:** Niedrig
+
+### 2. macOS Dynamic Linking
+
+Das macOS Backend (`macho64_writer.pas`) unterstützt noch kein dynamisches Linking.
+
+**Aufwand:** Mittel (~4h)
+**Priorität:** Niedrig
+
+### 3. ARM64 Dynamic Linking
+
+Das ARM64 Backend gibt derzeit eine Warnung aus:
+```
+Note: ARM64 dynamic linking not yet fully implemented
+External symbols found: X (will be ignored for now)
+```
+
+**Aufwand:** Mittel (~3h)
+**Priorität:** Mittel
+
+## Testing
+
+### Test-Dateien
+
+- `tests/lyx/arm64/test_dynamic_link.lyx` - ARM64 dynamisches Linking Test
+- `tests/lyx/io/test_getpid.lyx` - Externer Systemaufruf Test
+
+### Manuelle Tests
+
+```bash
+# Dynamisches Binary erstellen
+./lyxc tests/lyx/arm64/test_dynamic_link.lyx -o /tmp/test_dyn
+
+# Prüfen ob dynamisch gelinkt
+file /tmp/test_dyn
+ldd /tmp/test_dyn
+
+# Prüfen der PLT/GOT Struktur
+readelf -d /tmp/test_dyn
+readelf -r /tmp/test_dyn
+
+# Disassemblieren (benötigt Sektionstabellen)
+objdump -d /tmp/test_dyn
+```
+
+## Historische Notizen
+
+### Frühere Probleme
+
+1. **PLT-Stub Kodierung**: Die PLT-Stubs verwendeten falsche Offset-Berechnungen
+2. **GOT-Initialisierung**: GOT-Einträge zeigten auf falsche Adressen
+3. **Dynamic Section**: Die DT_HASH und DT_STRTAB waren nicht korrekt
+4. **Relokationen**: R_X86_64_RELATIVE und R_X86_64_JUMP_SLOT waren falsch

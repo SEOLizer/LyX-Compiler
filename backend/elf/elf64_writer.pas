@@ -379,6 +379,7 @@ var
   shStrOffsets: TStringList;
   numShdrs: Integer;
   shStrTabOff, shStrTabVAddr: UInt64;
+  shStrTabIdx: Integer;  // Index of .shstrtab section
   shdrsOff, shdrsVAddr: UInt64;
   shdr: TElf64Shdr;
 
@@ -689,9 +690,10 @@ begin
        shdrsOff := AlignUp(shStrTabOff + UInt64(shStrTableBuf.Size), 8);
        shdrsVAddr := baseVA + shdrsOff; // For consistency
 
-       dataEndOff := shdrsOff + UInt64(numShdrs) * SizeOf(TElf64Shdr);
+        dataEndOff := shdrsOff + UInt64(numShdrs) * SizeOf(TElf64Shdr);
+        shStrTabIdx := numShdrs - 1;  // .shstrtab is the last section
 
-       // Build section headers
+        // Build section headers
        shdrsBuf := TByteBuffer.Create;
 
        // SHN_UNDEF (NULL) section
@@ -903,14 +905,14 @@ begin
       elfHdr.e_version := 1;
       elfHdr.e_entry := entryVA;
       elfHdr.e_phoff := 64;
-      elfHdr.e_shoff := 0;
+      elfHdr.e_shoff := shdrsOff;
       elfHdr.e_flags := 0;
       elfHdr.e_ehsize := 64;
       elfHdr.e_phentsize := 56;
       elfHdr.e_phnum := numPhdrs;
-      elfHdr.e_shentsize := 0;
-      elfHdr.e_shnum := 0;
-      elfHdr.e_shstrndx := 0;
+      elfHdr.e_shentsize := SizeOf(TElf64Shdr);
+      elfHdr.e_shnum := numShdrs;
+      elfHdr.e_shstrndx := shStrTabIdx;
 
       // PT_PHDR — describes the program header table itself
       phdrPhdr.p_type := 6; // PT_PHDR
@@ -1035,8 +1037,21 @@ begin
           fileBuf.WriteByte(0);
         fileBuf.WriteBuffer(dynamicTable.GetBuffer^, dynamicTable.Size);
 
+        // Write section header string table
+        while fileBuf.Position < Int64(shStrTabOff) do
+          fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shStrTableBuf.GetBuffer^, shStrTableBuf.Size);
+
+        // Write section headers
+        while fileBuf.Position < Int64(shdrsOff) do
+          fileBuf.WriteByte(0);
+        if shdrsBuf.Size > 0 then
+          fileBuf.WriteBuffer(shdrsBuf.GetBuffer^, shdrsBuf.Size);
+
       finally
         fileBuf.Free;
+        shdrsBuf.Free;
+        shStrTableBuf.Free;
       end;
 
     finally
