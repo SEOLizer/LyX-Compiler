@@ -1,5 +1,81 @@
 # Changelog - Lyx Compiler
 
+## Version 0.5.1 (März 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Linux ARM64 Backend: VMT Support (v0.5.1)**
+
+Vollständige Virtual Method Table (VMT) Unterstützung für Linux ARM64:
+
+```lyx
+// Virtual methods on ARM64
+type Animal = class {
+    fn virtual speak() {
+        PrintStr("?\n");
+    }
+};
+
+type Dog = class extends Animal {
+    fn override speak() {
+        PrintStr("Woof!\n");
+    }
+};
+
+fn main(): int64 {
+    var a: Animal := new Dog();
+    a.speak();  // Dynamischer Aufruf → "Woof!"
+    dispose a;
+    return 0;
+}
+```
+
+**Implementierung:**
+- `backend/elf/elf64_arm64_writer.pas`: VMT-Tabelle im .rodata Segment
+- `backend/arm64/arm64_emit.pas`: Virtual Call via VMT (LDR + BLR)
+- `backend/arm64/arm64_emit.pas`: VMT-Pointer bei `new` gesetzt
+- `tests/test_arm64_vmt.pas`: Unit-Tests für ARM64 VMT
+
+#### **ARM64 Backend: 100% IR Opcode Coverage (v0.5.1)**
+
+Alle 93 IR-Opcodes sind jetzt für ARM64 implementiert:
+
+**Neu implementierte Opcodes:**
+- `irCast`: Type casting (int↔float)
+- `irVarCall`: Indirekte Funktionsaufrufe via BLR
+- `irCallStruct`: Struct-by-value calls (AAPCS64 ABI)
+- `irReturnStruct`: Struct return mit Memory-Copy
+- `irIsType`: VMT-basierte Type-Prüfung
+- `irPanic`: Panic/Abort mit stderr + exit
+- `irPushHandler/irPopHandler/irThrow`: Exception-Handling
+- `irInspect`: Debug Visualizer
+
+**ARM64 SIMD/NEON Operationen:**
+- `WriteAddSimd`, `WriteSubSimd`, `WriteMulSimd`
+- `WriteAndSimd`, `WriteOrSimd`, `WriteXorSimd`
+- `WriteNegSimd`, `WriteNotSimd`
+- `WriteCmeqSimd`, `WriteCmhiSimd`, `WriteCmgeSimd`
+
+**ARM64 DynArray Support:**
+- `irDynArrayPush`: Element hinzufügen mit auto-growth
+- `irDynArrayPop`: Element entfernen
+- `irDynArrayLen`: Länge abrufen
+- `irDynArrayFree`: Speicher freigeben
+
+#### **IR Bugfix: Float Arithmetic (v0.5.1)**
+
+Korrigierte Float-Operationen im IR-Generator:
+
+```lyx
+// Vorher: verwendet irSub/irMul/irDiv (Integer)
+var z: f64 := x - y;  // ❌ Falscher Opcode
+
+// Jetzt: verwendet irFSub/irFMul/irFDiv
+var z: f64 := x - y;  // ✅ Korrekter Opcode
+```
+
+---
+
 ## Version 0.4.3 (Februar 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
