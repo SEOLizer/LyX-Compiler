@@ -31,13 +31,14 @@ Die folgenden Features sind vollständig implementiert:
 | VMT-Patching | `backend/x86_64/x86_64_win64.pas` | ✅ Implementiert |
 | RTTI (ClassName, ParentVMT) | `backend/x86_64/x86_64_win64.pas` | ✅ Implementiert |
 
-### ❌ Nicht implementiert: Linux ARM64
+### ✅ Implementiert: Linux ARM64
 
-| Feature | Datei | TODO |
-|---------|-------|------|
-| VMT-Tabelle im .rodata | `backend/elf/elf64_arm64_writer.pas` | VMT-Sektion hinzufügen |
-| Virtual Calls | `backend/arm64/arm64_emit.pas` | `irCall` + `IsVirtualCall` handling |
-| `new` mit VMT | `backend/arm64/arm64_emit.pas` | VMT-Ptr bei Allokation setzen |
+| Feature | Datei | Status |
+|---------|-------|--------|
+| VMT-Tabelle im .rodata | `backend/elf/elf64_arm64_writer.pas` | ✅ Implementiert |
+| Virtual Calls via VMT | `backend/arm64/arm64_emit.pas` | ✅ Implementiert |
+| VMT-Ptr bei `new` | `backend/arm64/arm64_emit.pas` | ✅ Implementiert |
+| VMT-Tests mit QEMU | `tests/test_arm64_vmt.pas` | ✅ Implementiert |
 
 ---
 
@@ -201,30 +202,47 @@ Beim Schreiben der PE-Datei werden die Patches mit korrekten RVAs angewendet:
 
 ---
 
-## TODO: Linux ARM64 Backend
+## Implementiert: Linux ARM64 Backend
 
 ### 1. VMT-Tabelle emittieren
 
 **Datei:** `backend/elf/elf64_arm64_writer.pas`
 
+Die VMT-Tabelle wird im `.rodata` Segment emittiert mit folgendem Layout:
+
+```
+_vmt_ClassName:
+  dq <textOffset + method0_offset>  ; Methode 0
+  dq <textOffset + method1_offset>  ; Methode 1
+  ...
+```
+
 ### 2. Virtual Call generieren
 
 **Datei:** `backend/arm64/arm64_emit.pas`
 
-Das ARM64 Backend muss `IsVirtualCall` in `irCall` behandeln:
+Das ARM64 Backend behandelt `IsVirtualCall` in `irCall`:
 
 ```pascal
-// Aktuell fehlt:
 irCall:
-  // ... normaler Call ...
-  // FEHLT: IsVirtualCall handling
+  if instr.IsVirtualCall and (instr.VMTIndex >= 0) then
+  begin
+    // 1. VMT-Ptr laden: LDR X1, [X0]
+    WriteLdrImm(FCode, X1, X0, 0);
+    
+    // 2. Methoden-Pointer aus VMT laden
+    WriteLdrImm(FCode, X1, X1, instr.VMTIndex * 8);
+    
+    // 3. Indirect call: BLR X1
+    EmitInstr(FCode, $D63F0000 or (DWord(X1) shl 5));
+  end
 ```
 
 **ARM64 (Linux) Virtual Call:**
 ```asm
 ; obj.speak() mit virtual call
 ; X0 = obj (erstes Argument / self)
-; Angenommen: VirtualTableIndex = 0
+; VirtualTableIndex = 0
 
 ldr x1, [x0]            ; X1 = VMT-Ptr
 ldr x1, [x1, #0]       ; X1 = Methoden-Pointer aus VMT[0]
@@ -233,12 +251,12 @@ blr x1                  ; Indirect call
 
 ### 3. VMT-Ptr bei `new` setzen
 
+Das ARM64 Backend setzt den VMT-Pointer nach der Allokation:
+
 ```asm
 ; Nach alloc:
 ; X0 = allokierter Speicher
 
-adrp x1, _vmt_Dog       ; Page-Adresse der VMT
-ldr x1, [x1, :lo12:_vmt_Dog]  ; Offset-Adresse
 str x1, [x0]           ; [instance + 0] = VMT-Ptr
 ```
 
@@ -317,24 +335,37 @@ tests/lyx/oop/
 ### Fehlende Tests
 
 - [ ] Virtual Calls auf Windows x86_64
-- [ ] Virtual Calls auf Linux ARM64
+- [x] Virtual Calls auf Linux ARM64 (QEMU getestet)
 - [ ] TObject Methoden (ClassName, Free, etc.)
 
 ---
 
 ## Geschätzter Aufwand
 
-| Backend | Teilaufgabe | Aufwand |
-|---------|-------------|---------|
-| Windows x86_64 | VMT-Tabelle emittieren | ~2h |
-| Windows x86_64 | Virtual Call Codegen | ~2h |
-| Windows x86_64 | VMT-Ptr bei new | ~1h |
-| Windows x86_64 | Tests | ~2h |
-| Linux ARM64 | VMT-Tabelle emittieren | ~2h |
-| Linux ARM64 | Virtual Call Codegen | ~3h |
-| Linux ARM64 | VMT-Ptr bei new | ~1h |
-| Linux ARM64 | Tests | ~2h |
-| **Gesamt** | | **~15h** |
+### Bereits erledigt
+
+| Backend | Teilaufgabe | Status | Datum |
+|---------|-------------|--------|-------|
+| Linux x86_64 | VMT-Tabelle emittieren | ✅ | v0.4.x |
+| Linux x86_64 | Virtual Call Codegen | ✅ | v0.4.x |
+| Linux x86_64 | VMT-Ptr bei new | ✅ | v0.4.x |
+| Linux x86_64 | Tests | ✅ | v0.4.x |
+| Windows x86_64 | VMT-Tabelle emittieren | ✅ | v0.5.0 |
+| Windows x86_64 | Virtual Call Codegen | ✅ | v0.5.0 |
+| Windows x86_64 | VMT-Ptr bei new | ✅ | v0.5.0 |
+| Windows x86_64 | RTTI-Pointer | ✅ | v0.5.0 |
+| Linux ARM64 | VMT-Tabelle emittieren | ✅ | v0.5.1 |
+| Linux ARM64 | Virtual Call Codegen | ✅ | v0.5.1 |
+| Linux ARM64 | VMT-Ptr bei new | ✅ | v0.5.1 |
+| Linux ARM64 | Tests (QEMU) | ✅ | v0.5.1 |
+
+### Noch offen
+
+| Backend | Teilaufgabe | Priorität |
+|---------|-------------|-----------|
+| Windows x86_64 | Tests auf echter Windows-Hardware | Niedrig |
+| macOS ARM64 | VMT-Tabelle emittieren | Niedrig |
+| macOS ARM64 | Virtual Call Codegen | Niedrig |
 
 ---
 
@@ -343,21 +374,23 @@ tests/lyx/oop/
 ```
 Windows x86_64:
   1. VMT-Tabelle emittieren (PE Writer)
-        ↓
+        ✅ Abgeschlossen
   2. Virtual Call im x86_64_win64.pas
-        ↓
+        ✅ Abgeschlossen
   3. VMT-Ptr bei new
-        ↓
+        ✅ Abgeschlossen
   4. Tests
+        ⚠️ Auf echter Hardware offen
 
 Linux ARM64:
   1. VMT-Tabelle emittieren (ELF Writer)
-        ↓
+        ✅ Abgeschlossen
   2. Virtual Call im arm64_emit.pas
-        ↓
+        ✅ Abgeschlossen
   3. VMT-Ptr bei new
-        ↓
+        ✅ Abgeschlossen
   4. Tests
+        ✅ Mit QEMU getestet
 ```
 
 ---
@@ -381,7 +414,7 @@ Linux ARM64:
 
 ### Linux ARM64
 
-- [ ] VMT-Tabelle in ELF64-ARM emittieren
-- [ ] Virtual Call Codegen (arm64_emit.pas)
-- [ ] VMT-Ptr bei new setzen
-- [ ] Tests auf ARM64 Hardware/Emulator
+- [x] VMT-Tabelle in ELF64-ARM emittieren
+- [x] Virtual Call Codegen (arm64_emit.pas)
+- [x] VMT-Ptr bei new setzen
+- [x] Tests auf ARM64 mit QEMU

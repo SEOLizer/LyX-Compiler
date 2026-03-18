@@ -519,6 +519,15 @@ begin
   EmitInstr(buf, $9A9F07E0 or (DWord(invCond) shl 12) or rd);
 end;
 
+// CSNEG Xd, Xn, Xm, cond (conditional negate)
+// Rd = (cond) ? -Rn : Rm
+procedure WriteCneg(buf: TByteBuffer; rd, rn, rm: Byte; cond: Byte);
+begin
+  // CSNEG: sf=1, op=0, S=0, Rm, cond, o2=0, Rn, Rd
+  // 1 00 11010100 Rm cond 0 Rn Rd
+  EmitInstr(buf, $DA80A000 or (DWord(rm) shl 16) or (DWord(cond) shl 12) or (DWord(rn) shl 5) or rd);
+end;
+
 // Condition codes for CSET and B.cond
 const
   COND_EQ = $0;  // Equal (Z=1)
@@ -844,6 +853,131 @@ end;
 procedure WriteStore(buf: TByteBuffer; src, base: Byte; offset: Integer);
 begin
   WriteStrImm(buf, src, base, offset);
+end;
+
+// ==========================================================================
+// ARM64 SIMD/NEON Instruction Encoding
+// ==========================================================================
+
+// NEON/ADV.SIMD Encoding Overview:
+// Primary op: 0 0 0 0 1 1 1 0 (31-24 = 0x0E für viele NEON-Operationen)
+// Q-bit: Bit 30 (0 = 64-bit/D-reg, 1 = 128-bit/Q-reg)
+// size: Bits 23-22 (00=8bit, 01=16bit, 10=32bit, 11=64bit)
+
+// ADD Vd, Vn, Vm (NEON integer add, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 1 Rm 000 1 Rn Rd
+// = 0x4E608400 | Rm << 16 | Rn << 5 | Rd
+procedure WriteAddSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  // 64-bit NEON add: Q=0, size=11
+  EmitInstr(buf, $4E608400 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// SUB Vd, Vn, Vm (NEON integer subtract, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 1 Rm 001 1 Rn Rd
+// = 0x4E608400 (ADD) XOR mit bit 11 (SUB) = 0x4E608C00
+procedure WriteSubSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E608C00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// MUL Vd, Vn, Vm (NEON integer multiply, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 1 Rm 100 1 Rn Rd
+// = 0x4E608800 | Rm << 16 | Rn << 5 | Rd
+procedure WriteMulSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E608800 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// AND Vd, Vn, Vm (NEON bitwise AND, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 000 1 Rn Rd
+// = 0x4E601C00 | Rm << 16 | Rn << 5 | Rd
+procedure WriteAndSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E601C00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// ORR Vd, Vn, Vm (NEON bitwise OR, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 011 1 Rn Rd
+// = 0x4E601400 | Rm << 16 | Rn << 5 | Rd
+procedure WriteOrSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E601400 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// EOR Vd, Vn, Vm (NEON bitwise XOR, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 000 1 Rn Rd  (with different opc)
+// Actually EOR is 0 0 0 0 1 1 1 0 11 0 Rm 100 1 Rn Rd
+// = 0x4E601C00 | Rm << 16 | Rn << 5 | Rd
+procedure WriteXorSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E603C00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// NEG Vd, Vn (NEON negate, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 11111 010 1 Rn Rd
+// = 0x4E607C00 | Rn << 5 | Rd
+procedure WriteNegSimd(buf: TByteBuffer; rd, rn: Byte);
+begin
+  EmitInstr(buf, $4E607C00 or (DWord(rn) shl 5) or rd);
+end;
+
+// NOT Vd, Vn (NEON bitwise NOT, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 11111 001 1 Rn Rd
+// = 0x4E601C00 | Rn << 5 | Rd  (MVN with all ones)
+procedure WriteNotSimd(buf: TByteBuffer; rd, rn: Byte);
+begin
+  EmitInstr(buf, $4E605800 or (DWord(rn) shl 5) or rd);
+end;
+
+// CMEQ Vd, Vn, Vm (SIMD compare equal, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 1000 1 Rn Rd
+// = 0x4E608C00 | Rm << 16 | Rn << 5 | Rd
+procedure WriteCmeqSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E608E00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// CMHI Vd, Vn, Vm (SIMD compare unsigned higher, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 0010 1 Rn Rd
+// = 0x4E602E00 | Rm << 16 | Rn << 5 | Rd
+procedure WriteCmhiSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E602E00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// CMGE Vd, Vn, Vm (SIMD compare signed greater or equal, 64-bit)
+// Encoding: 0 0 0 0 1 1 1 0 11 0 Rm 0011 1 Rn Rd
+// = 0x4E603E00 | Rm << 16 | Rn << 5 | Rd
+procedure WriteCmgeSimd(buf: TByteBuffer; rd, rn, rm: Byte);
+begin
+  EmitInstr(buf, $4E603E00 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rd);
+end;
+
+// LDR Vd, [Xn, #imm] (load SIMD register, 64-bit)
+// Uses LD1 (single structure) for simplicity
+// Encoding: 0 0 1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 Rn Vd
+// Alternative: use standard LDR with V-reg encoding
+procedure WriteLdrSimd(buf: TByteBuffer; rt: Byte; rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  // LDR (SIMD, 64-bit): size=11, V=1, opc=01, imm12, Rn, Rt
+  // = 0xFD400000 | imm12 << 10 | rn << 5 | rt
+  imm12 := DWord((offset div 8) and $FFF);
+  EmitInstr(buf, $FD400000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+end;
+
+// STR Vd, [Xn, #imm] (store SIMD register, 64-bit)
+// Encoding: 0 0 1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 Rn Vd
+procedure WriteStrSimd(buf: TByteBuffer; rt: Byte; rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  // STR (SIMD, 64-bit): size=11, V=1, opc=00, imm12, Rn, Rt
+  // = 0xFD000000 | imm12 << 10 | rn << 5 | rt
+  imm12 := DWord((offset div 8) and $FFF);
+  EmitInstr(buf, $FD000000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
 end;
 
 // ==========================================================================
@@ -2241,10 +2375,10 @@ begin
           
         irFree:
           begin
-            // Heap deallocation: free(Src1)
-            // munmap(addr, length) - but we don't track sizes, so skip for now
+            // Heap deallocation: munmap(Src1, size)
+            // For now, skip munmap and let OS reclaim memory at process exit
             // TODO: Track allocation sizes for proper munmap
-            // This causes a memory leak but prevents crashes
+            // This causes memory leaks but prevents crashes from wrong sizes
           end;
 
         irPoolAlloc:
@@ -2290,6 +2424,331 @@ begin
             // Epilogue
             WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
             WriteRet(FCode);
+          end;
+
+        // ========== Struct Return Operations ==========
+
+        irReturnStruct:
+          begin
+            // Return struct by value according to AAPCS64:
+            // <= 8 bytes: load value into X0
+            // 9-16 bytes: first 8 bytes in X0, next in X1
+            // > 16 bytes: hidden pointer was passed in X8, copy to it and X0 = pointer
+            
+            // Src1 holds address of struct on stack
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // X1 = struct addr
+            
+            if instr.StructSize <= 8 then
+            begin
+              // Small struct: load first 8 bytes into X0
+              WriteLdrImm(FCode, X0, X1, 0);
+            end
+            else if instr.StructSize <= 16 then
+            begin
+              // Medium struct: first 8 bytes in X0, next in X1
+              WriteLdrImm(FCode, X0, X1, 0);    // Load first 8 bytes
+              WriteLdrImm(FCode, X1, X1, 8);    // Load next 8 bytes
+            end
+            else
+            begin
+              // Large struct: hidden pointer mechanism
+              // X0 already contains the hidden pointer (passed as first arg)
+              // Copy struct to the hidden pointer location
+              // X1 = struct addr on stack, X0 = dest pointer
+              // Simple memcpy: copy StructSize bytes
+              WriteMovRegReg(FCode, X2, X1);   // X2 = src
+              WriteMovRegReg(FCode, X3, X0);   // X3 = dest (hidden pointer)
+              WriteMovImm64(FCode, X4, instr.StructSize); // X4 = count
+              // copy_loop:
+              WriteLdurImm(FCode, X5, X2, 8);  // LDR X5, [X2], #8
+              WriteSturImm(FCode, X5, X3, 8);  // STR X5, [X3], #8
+              WriteSubImm(FCode, X4, X4, 1);   // SUBS X4, X4, #1
+              WriteCbnz(FCode, X4, -24);       // CBNZ X4, copy_loop
+            end;
+            
+            // Epilogue
+            WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
+            WriteRet(FCode);
+          end;
+
+        irCallStruct:
+          begin
+            // Call function returning struct - handle X0+X1 for 9-16 byte structs
+            // Same setup as irCall for arguments
+            
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do
+              argTemps[k] := -1;
+            
+            // Use ArgTemps array from IR
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then
+                  argTemps[k] := instr.ArgTemps[k];
+            end;
+            
+            // Move args into registers (AAPCS64: X0-X7)
+            if argCount > 0 then
+            begin
+              if (argCount >= 1) and (argTemps[0] >= 0) then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + argTemps[0]));
+              if (argCount >= 2) and (argTemps[1] >= 0) then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + argTemps[1]));
+              if (argCount >= 3) and (argTemps[2] >= 0) then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + argTemps[2]));
+              if (argCount >= 4) and (argTemps[3] >= 0) then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + argTemps[3]));
+              if (argCount >= 5) and (argTemps[4] >= 0) then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + argTemps[4]));
+              if (argCount >= 6) and (argTemps[5] >= 0) then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + argTemps[5]));
+              if (argCount >= 7) and (argTemps[6] >= 0) then
+                WriteLdrImm(FCode, X6, X29, frameSize + SlotOffset(localCnt + argTemps[6]));
+              if (argCount >= 8) and (argTemps[7] >= 0) then
+                WriteLdrImm(FCode, X7, X29, frameSize + SlotOffset(localCnt + argTemps[7]));
+            end;
+            
+            // Emit call
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+            WriteBranchLink(FCode, 0);  // Placeholder
+            
+            // Store result based on struct size
+            if instr.Dest >= 0 then
+            begin
+              if instr.StructSize <= 8 then
+              begin
+                // Small struct: result in X0 only
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+              end
+              else if instr.StructSize <= 16 then
+              begin
+                // Medium struct: result in X0 + X1
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+                WriteStrImm(FCode, X1, X29, frameSize + SlotOffset(instr.Dest + 1));
+              end
+              else
+              begin
+                // Large struct: hidden pointer - store the pointer
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
+              end;
+            end;
+          end;
+
+        irVarCall:
+          begin
+            // Indirect function call via function pointer
+            // Src1 = local slot containing function pointer
+            // ImmInt = argument count
+            
+            argCount := instr.ImmInt;
+            SetLength(argTemps, argCount);
+            for k := 0 to argCount - 1 do
+              argTemps[k] := -1;
+            
+            // Load arguments
+            if Length(instr.ArgTemps) > 0 then
+            begin
+              for k := 0 to argCount - 1 do
+                if k <= High(instr.ArgTemps) then
+                  argTemps[k] := instr.ArgTemps[k];
+            end;
+            
+            // Move args into registers (AAPCS64: X0-X7)
+            for k := 0 to Min(argCount - 1, 7) do
+            begin
+              if argTemps[k] >= 0 then
+                WriteLdrImm(FCode, ParamRegs[k], X29, frameSize + SlotOffset(localCnt + argTemps[k]));
+            end;
+            
+            // Load function pointer
+            WriteLdrImm(FCode, X16, X29, frameSize + SlotOffset(instr.Src1));
+            
+            // Call via register: BLR X16 (Branch with Link to Register)
+            // Encoding: 31-26=110101, 25=1, 24-21=0001, 20=0, 19-16=0000, 15-10=000000, 9-5=00000, 4-0=Rn
+            // = 0xD63F0000 | (Rn << 5)
+            EmitInstr(FCode, $D63F0000 or (DWord(X16) shl 5));
+            
+            // Store return value
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irCast:
+          begin
+            // Type cast: Dest = cast(Src1, CastFromType, CastToType)
+            // Fallback implementation using existing conversion ops
+            // Note: irIToF and irFToI should be used when possible
+            
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load source value
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Perform conversion based on CastFromType and CastToType
+            if (instr.CastFromType = atInt64) and (instr.CastToType = atF64) then
+            begin
+              // int64 -> f64: SCVTF
+              WriteFmovD(FCode, V0, X0);
+              WriteScvtfD(FCode, V0, V0);
+              WriteFmovD(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atF64) and (instr.CastToType = atInt64) then
+            begin
+              // f64 -> int64: FCVTZS
+              WriteFmovD(FCode, V0, X0);
+              WriteFcvtzsD(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atInt64) and (instr.CastToType = atF32) then
+            begin
+              // int64 -> f32: SCVTF (32-bit)
+              WriteFmovD(FCode, V0, X0);
+              WriteScvtfS(FCode, V0, V0);
+              WriteFmovS(FCode, X0, V0);
+            end
+            else if (instr.CastFromType = atF32) and (instr.CastToType = atInt64) then
+            begin
+              // f32 -> int64: FCVTZS (32-bit to 64-bit)
+              WriteFmovS(FCode, V0, X0);
+              WriteFcvtzsS(FCode, X0, V0);
+            end
+            else
+            begin
+              // Unsupported cast - keep value as-is
+            end;
+            
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // ========== Type Checking ==========
+
+        irIsType:
+          begin
+            // Type check: is_type(object, targetClassName) -> bool
+            // Algorithm:
+            // 1. Load object pointer from local slot
+            // 2. Load VMT pointer from object [ptr]
+            // 3. Loop: Compare class name with target, if no match follow parent pointer
+            
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load object pointer into X0
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Check for null object
+            WriteCmpImm(FCode, X0, 0);
+            WriteCset(FCode, X1, COND_EQ);  // X1 = 1 if null
+            WriteCneg(FCode, X1, XZR, COND_NE); // X1 = -1 if null (for later negation)
+            
+            // Load VMT pointer into X2: VMT is at [object]
+            WriteLdrImm(FCode, X2, X0, 0);   // X2 = VMT pointer
+            
+            // Allocate space for target class name in data section
+            // For now, we'll use a simple implementation that checks VMT pointer equality
+            // A full implementation would compare class names
+            
+            // Simple check: if VMT is non-null, assume true for now
+            // This is a placeholder - proper implementation requires runtime type info
+            WriteCmpImm(FCode, X2, 0);
+            WriteCset(FCode, X0, COND_NE);  // X0 = 1 if VMT != null
+            
+            // Store result
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // ========== Panic/Abort ==========
+
+        irPanic:
+          begin
+            // panic(message): write message to stderr and exit with error code
+            // AAPCS64: X0 = fd (2 for stderr), X1 = msg, X2 = len
+            
+            if instr.Src1 >= 0 then
+            begin
+              // Load message pointer into X1
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              // X0 = 2 (stderr)
+              WriteMovImm64(FCode, X0, 2);
+              // X2 = length (from ImmInt)
+              WriteMovImm64(FCode, X2, instr.ImmInt);
+              // X8 = 64 (sys_write)
+              WriteMovImm64(FCode, X8, SYS_write);
+              WriteSvc(FCode, 0);
+            end;
+            
+            // Exit with code 1
+            WriteMovImm64(FCode, X0, 1);    // exit code 1
+            WriteMovImm64(FCode, X8, SYS_exit);
+            WriteSvc(FCode, 0);
+          end;
+
+        // ========== Exception Handling ==========
+
+        irPushHandler:
+          begin
+            // Push handler frame: Src1 = handler_addr, LabelName = catch_label
+            // Stack layout: [handler_addr, catch_label_ptr]
+            // For now, just save the handler info to the stack
+            
+            // Load handler address
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Push to stack (decrement SP, store)
+            WriteSubImm(FCode, SP, SP, 16);
+            WriteSturImm(FCode, X0, SP, 0);
+          end;
+
+        irPopHandler:
+          begin
+            // Pop handler frame
+            WriteAddImm(FCode, SP, SP, 16);
+          end;
+
+        irLoadHandlerExn:
+          begin
+            // Load exception value from handler into Dest
+            // Src1 = handler_addr slot
+            slotIdx := localCnt + instr.Dest;
+            
+            // Load handler base from stack
+            WriteMovRegReg(FCode, X0, SP);
+            WriteLdrImm(FCode, X0, X0, 8);  // Load exception value
+            
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irThrow:
+          begin
+            // Perform throw: Src1 = exception temp
+            // Load exception value and jump to handler
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Load handler address from stack
+            WriteLdrImm(FCode, X1, SP, 0);
+            
+            // Store exception value at handler + 8
+            WriteStrImm(FCode, X0, X1, 8);
+            
+            // Branch to handler
+            WriteMovRegReg(FCode, X30, X1);
+            WriteRet(FCode);
+          end;
+
+        // ========== Debug/Inspect ==========
+
+        irInspect:
+          begin
+            // In-Situ Data Visualizer - debug inspect
+            // For now, just load the value to trigger any side effects
+            if instr.Src1 >= 0 then
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            
+            // Store back to dest if needed
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
           end;
         
         // ========== Float Operations ==========
@@ -2576,11 +3035,535 @@ begin
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
           end;
 
-        irMapRemove, irSetRemove, irMapFree, irSetFree:
+        irMapRemove:
           begin
-            // TODO: implement
+            // map_remove: Linear search for key and remove
+            // Src1 = map pointer, Src2 = key to remove
+            // Load map and key into x0, x1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // x2 = len = [x0]
+            WriteLdrImm(FCode, X2, X0, 0);
+            // x3 = 0 (counter/i)
+            WriteMovImm64(FCode, X3, 0);
+            // x4 = x0 + 16 (first entry pointer)
+            WriteAddImm(FCode, X4, X0, 16);
+            // Loop: compare i with len
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            loopEndPos := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge done (not found)
+            // Check if key matches: [x4] == x1
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            matchPos := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            // Found match: shift remaining elements left
+            // while i+1 < len: [x4] = [x4+16], i++, x4+=16
+            WriteAddImm(FCode, X3, X3, 1);
+            // x5 = x0 + 16 + i*16 (next entry)
+            WriteAddImm(FCode, X5, X0, 16);
+            WriteLslImm(FCode, X6, X3, 4);
+            WriteAddReg(FCode, X5, X5, X6);
+            // Copy next entry to current: [x4] = [x5], [x4+8] = [x5+8]
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteLdrImm(FCode, X7, X5, 8);
+            WriteStrImm(FCode, X6, X4, 0);
+            WriteStrImm(FCode, X7, X4, 8);
+            // x4 += 16
+            WriteAddImm(FCode, X4, X4, 16);
+            // Decrement len and store
+            WriteSubImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+            // Jump back to loop
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // next: i++, x4+=16, continue loop
+            FCode.PatchU32(matchPos, ((FCode.Size - matchPos) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteAddImm(FCode, X4, X4, 16);
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // done: nop or exit
+            FCode.PatchU32(loopEndPos, ((FCode.Size - loopEndPos) div 4) shl 5 or $5400000A);
           end;
-        
+
+        irSetRemove:
+          begin
+            // set_remove: Linear search for value and remove
+            // Src1 = set pointer, Src2 = value to remove
+            // Load set and value into x0, x1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            // x2 = len = [x0]
+            WriteLdrImm(FCode, X2, X0, 0);
+            // x3 = 0 (counter/i)
+            WriteMovImm64(FCode, X3, 0);
+            // x4 = x0 + 8 (first entry pointer)
+            WriteAddImm(FCode, X4, X0, 8);
+            // Loop: compare i with len
+            loopStartPos := FCode.Size;
+            WriteCmpReg(FCode, X3, X2);
+            loopEndPos := FCode.Size;
+            WriteBranchCond(FCode, $0A, 0); // b.ge done (not found)
+            // Check if value matches: [x4] == x1
+            WriteLdrImm(FCode, X5, X4, 0);
+            WriteCmpReg(FCode, X5, X1);
+            matchPos := FCode.Size;
+            WriteBranchCond(FCode, $01, 0); // b.ne next
+            // Found match: shift remaining elements left
+            WriteAddImm(FCode, X3, X3, 1);
+            // x5 = x0 + 8 + i*8 (next entry)
+            WriteAddImm(FCode, X5, X0, 8);
+            WriteLslImm(FCode, X6, X3, 3);
+            WriteAddReg(FCode, X5, X5, X6);
+            // Copy next entry to current: [x4] = [x5]
+            WriteLdrImm(FCode, X6, X5, 0);
+            WriteStrImm(FCode, X6, X4, 0);
+            // x4 += 8
+            WriteAddImm(FCode, X4, X4, 8);
+            // Decrement len and store
+            WriteSubImm(FCode, X2, X2, 1);
+            WriteStrImm(FCode, X2, X0, 0);
+            // Jump back to loop
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // next: i++, x4+=8, continue loop
+            FCode.PatchU32(matchPos, ((FCode.Size - matchPos) div 4) shl 5 or $54000001);
+            WriteAddImm(FCode, X3, X3, 1);
+            WriteAddImm(FCode, X4, X4, 8);
+            WriteBranch(FCode, ((loopStartPos - FCode.Size) div 4));
+            // done: nop or exit
+            FCode.PatchU32(loopEndPos, ((FCode.Size - loopEndPos) div 4) shl 5 or $5400000A);
+          end;
+
+        irMapFree, irSetFree:
+          begin
+            // map_free/set_free: munmap(ptr, 0x1000)
+            // For simplicity, we don't track exact sizes
+            // Load ptr into x0
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // X1 = size (use 4096 as rough estimate for small maps/sets)
+            WriteMovImm64(FCode, X1, 4096);
+            // X2 = prot (0)
+            WriteMovImm64(FCode, X2, 0);
+            // X3 = flags (MAP_ANONYMOUS)
+            WriteMovImm64(FCode, X3, 34);
+            // X4 = fd (-1)
+            WriteMovImm64(FCode, X4, High(UInt64));
+            // X5 = offset (0)
+            WriteMovImm64(FCode, X5, 0);
+            // X8 = syscall number (222 = sys_munmap on ARM64 Linux)
+            WriteMovImm64(FCode, X8, 215); // SYS_munmap
+            // SVC #0
+            WriteSvc(FCode, 0);
+          end;
+
+        // ========== Struct Field Operations (Stack-based) ==========
+
+        irLoadField:
+          begin
+            // Load field from stack struct: Dest = *(Src1 - ImmInt)
+            // Src1 = base pointer (negative offset from FP), ImmInt = field offset
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X0, X0, -instr.ImmInt);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irStoreField:
+          begin
+            // Store field to stack struct: *(Src1 - ImmInt) = Src2
+            // Src1 = base pointer, ImmInt = field offset, Src2 = value
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteStrImm(FCode, X1, X0, -instr.ImmInt);
+          end;
+
+        // ========== SIMD Operations ==========
+
+        irSIMDAdd:
+          begin
+            // SIMD add using NEON
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteAddSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDSub:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteSubSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDMul:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteMulSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDDiv:
+          begin
+            // SIMD division not directly available, use scalar fallback
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteFdiv(FCode, D0, D0, D1);
+            WriteStrImm(FCode, D0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irSIMDAnd:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteAndSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDOr:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteOrSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDXor:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteXorSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDNeg:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteNegSimd(FCode, V0, V0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpEq:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmeqSimd(FCode, V0, V0, V1);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpNe:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmeqSimd(FCode, V2, V0, V1); // temp
+            WriteNotSimd(FCode, V0, V2);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpLt:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmhiSimd(FCode, V0, V1, V0); // V0 = V1 > V0
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpLe:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmgeSimd(FCode, V0, V1, V0); // V0 = V1 >= V0
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpGt:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmhiSimd(FCode, V0, V0, V1); // V0 = V0 > V1
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDCmpGe:
+          begin
+            WriteLdrImm(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, V1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmgeSimd(FCode, V0, V0, V1); // V0 = V0 >= V1
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDLoadElem:
+          begin
+            // Load SIMD element: V0 = simd[Src2]
+            WriteLdrSimd(FCode, V0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, V0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irSIMDStoreElem:
+          begin
+            // Store SIMD element: simd[Src3] = Src2
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteStrSimd(FCode, X1, X0, 0);
+          end;
+
+        // ========== Dynamic Array Operations (Fat Pointer: 3 slots: ptr, len, cap) ==========
+
+        irDynArrayPush:
+          begin
+            // Push element onto dynamic array.
+            // Src1 = base local slot index (ptr at Src1, len at Src1+1, cap at Src1+2)
+            // Src2 = value temp to push
+            //
+            // Algorithm:
+            //   if len >= cap then grow(cap = max(8, cap*2))
+            //   ptr[len] := value
+            //   len := len + 1
+
+            // Load len into X0, cap into X1, ptr into X2
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1)); // X0 = len
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 2)); // X1 = cap
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src1));     // X2 = ptr
+
+            // Compare len >= cap (unsigned comparison)
+            WriteCmpRegReg(FCode, X0, X1);
+            // B.CC (CarryClear) = B.hs (unsigned higher or same) is NOT taken when C=0
+            // We want to skip grow when len < cap: use B.CC (unsigned lower)
+            // CBZ/CBNZ don't work for this, need conditional branch
+            // Use CSET to set X3 = 1 if len >= cap (C=1), else X3 = 0
+            WriteCset(FCode, X3, COND_CS);  // X3 = 1 if len >= cap
+            WriteCbz(FCode, X3, 8 * 50);   // Skip grow section if len < cap
+
+            // --- GROW SECTION ---
+            // Save callee-saved registers (X19-X28 are callee-saved)
+            // STR X19, [SP, #-8]!
+            WriteStpPreIndex(FCode, X19, X20, SP, -16);
+
+            // Save len, value, ptr, cap to callee-saved regs
+            WriteMovRegReg(FCode, X19, X0);  // X19 = len
+            WriteLdrImm(FCode, X20, X29, frameSize + SlotOffset(localCnt + instr.Src2)); // X20 = value
+            WriteMovRegReg(FCode, X21, X2);  // X21 = old ptr
+            WriteMovRegReg(FCode, X22, X1);  // X22 = old cap
+
+            // new_cap = cap * 2
+            WriteLslImm(FCode, X23, X22, 1);  // X23 = new_cap
+
+            // if new_cap < 8 then new_cap = 8
+            WriteCmpImm(FCode, X23, 8);
+            WriteCset(FCode, X3, COND_GE);
+            WriteCbnz(FCode, X3, 8);         // If >= 8, skip setting to 8
+            WriteMovImm64(FCode, X23, 8);     // new_cap = 8
+
+            // X23 = new_cap (preserve)
+
+            // new_size = new_cap * 8 (bytes)
+            WriteLslImm(FCode, X1, X23, 3);   // X1 = new_size
+
+            // mmap(0, new_size, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
+            WriteMovImm64(FCode, X0, 0);       // addr = 0
+            WriteMovImm64(FCode, X2, 3);        // prot = 3
+            WriteMovImm64(FCode, X3, 34);       // flags = 34
+            WriteMovImm64(FCode, X4, High(UInt64)); // fd = -1
+            WriteMovImm64(FCode, X5, 0);        // offset = 0
+            WriteMovImm64(FCode, X8, SYS_mmap); // syscall number
+            WriteSvc(FCode, 0);                 // X0 = new ptr
+
+            // Save new ptr in X24
+            WriteMovRegReg(FCode, X24, X0);  // X24 = new ptr
+
+            // Copy old data: memcpy(new_ptr, old_ptr, len * 8)
+            // X0 = dest, X1 = src, X2 = count
+            WriteMovRegReg(FCode, X0, X24);   // dest = new ptr
+            WriteMovRegReg(FCode, X1, X21);    // src = old ptr
+            WriteMovRegReg(FCode, X2, X19);   // count = len
+            // ARM64 memcpy: we use a simple loop since REP MOVSQ isn't available
+            // copy_loop:
+            //   LDR X3, [X1], #8
+            //   STR X3, [X0], #8
+            //   SUBS X2, X2, #1
+            //   CBNZ X2, copy_loop
+            // For simplicity, we'll just skip the copy for empty arrays
+            WriteCbz(FCode, X19, 8 * 6);     // Skip copy if len == 0
+            // copy_loop:
+            WriteLdurImm(FCode, X3, X1, 8);  // LDR X3, [X1], #8 (post-index)
+            WriteSturImm(FCode, X3, X0, 8);  // STR X3, [X0], #8 (post-index)
+            WriteSubImm(FCode, X2, X2, 1);   // SUBS X2, X2, #1
+            WriteCbnz(FCode, X2, -24);       // CBNZ X2, copy_loop
+
+            // munmap old ptr if old_cap > 0
+            WriteCbz(FCode, X22, 8 * 4);     // Skip munmap if old_cap == 0
+            // munmap(old_ptr, old_cap * 8)
+            WriteMovRegReg(FCode, X0, X21);   // X0 = old ptr
+            WriteLslImm(FCode, X1, X22, 3);   // X1 = old_cap * 8
+            WriteMovImm64(FCode, X8, SYS_munmap);
+            WriteSvc(FCode, 0);
+
+            // Store new values: ptr = X24 (new_ptr), cap = X23
+            WriteStrImm(FCode, X24, X29, frameSize + SlotOffset(localCnt + instr.Src1));      // ptr = new_ptr
+            WriteStrImm(FCode, X23, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 2));  // cap = new_cap
+
+            // Restore len (X19) and value (X20) and ptr (X24)
+            WriteMovRegReg(FCode, X0, X19);   // X0 = len
+            WriteMovRegReg(FCode, X1, X20);   // X1 = value
+            WriteMovRegReg(FCode, X2, X24);   // X2 = new ptr
+
+            // Restore callee-saved registers
+            WriteLdpPostIndex(FCode, X19, X20, SP, 16);
+
+            // Load value into X1 (reload from saved temp or from original slot)
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2)); // X1 = value
+
+            // Load len and ptr again (they were saved/restored)
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1)); // X0 = len
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src1));     // X2 = ptr
+
+            // Store value at ptr[len]: STR X1, [X2, X0, LSL #3]
+            // STR Xt, [Xn, Xm, LSL #3] encoding
+            EmitInstr(FCode, $F8000130 or (DWord(X2) shl 5) or X1);
+
+            // len := len + 1
+            WriteAddImm(FCode, X0, X0, 1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1));
+          end;
+
+        irDynArrayPop:
+          begin
+            // Pop last element from dynamic array.
+            // Src1 = base local slot index
+            // Dest = temp to store popped value
+            //
+            // Algorithm:
+            //   len := len - 1
+            //   result := ptr[len]
+
+            // Load ptr into X0, len into X1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));     // X0 = ptr
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1)); // X1 = len
+
+            // Decrement len
+            WriteSubImm(FCode, X1, X1, 1);
+            // Store new len
+            WriteStrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1));
+
+            // Load ptr[len] -> X2: LDR X2, [X0, X1, LSL #3]
+            EmitInstr(FCode, $F8400130 or (DWord(X0) shl 5) or X2);
+
+            // Store result
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteStrImm(FCode, X2, X29, frameSize + SlotOffset(slotIdx));
+            end;
+          end;
+
+        irDynArrayLen:
+          begin
+            // Get length of dynamic array.
+            // Src1 = base local slot index
+            // Dest = temp to store length
+            //
+            // Algorithm:
+            //   result := len
+
+            // Load len into X0
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1)); // X0 = len
+
+            // Store result
+            slotIdx := localCnt + instr.Dest;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irDynArrayFree:
+          begin
+            // Free dynamic array memory.
+            // Src1 = base local slot index
+            //
+            // Algorithm:
+            //   munmap(ptr, cap * 8)
+            //   ptr := 0, len := 0, cap := 0
+
+            // Load ptr into X0, cap into X1
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));     // X0 = ptr
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 2)); // X1 = cap
+
+            // Check if cap > 0
+            WriteCmpImm(FCode, X1, 0);
+            // Skip munmap if cap == 0
+            WriteCset(FCode, X2, COND_NE);
+            WriteCbz(FCode, X2, 8 * 6);     // Skip munmap if cap == 0
+
+            // munmap(ptr, cap * 8)
+            WriteLslImm(FCode, X1, X1, 3);   // X1 = cap * 8
+            WriteMovImm64(FCode, X8, SYS_munmap);
+            WriteSvc(FCode, 0);
+
+            // Set ptr := 0, len := 0, cap := 0
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));     // ptr = 0
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 1)); // len = 0
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1 + 2)); // cap = 0
+          end;
+
       else
         // Unimplemented: store 0 to dest
         if instr.Dest >= 0 then

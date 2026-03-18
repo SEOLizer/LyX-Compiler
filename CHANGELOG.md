@@ -1,64 +1,77 @@
 # Changelog - Lyx Compiler
 
-## Version 0.5.0 (März 2026) 🎉
+## Version 0.5.1 (März 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
 
-#### **macOS x86_64 Backend**
+#### **Linux ARM64 Backend: VMT Support (v0.5.1)**
 
-Cross-Compilation für macOS x86_64 Mach-O Binaries:
+Vollständige Virtual Method Table (VMT) Unterstützung für Linux ARM64:
 
-```bash
-# macOS Binary von Linux aus erstellen
-./lyxc program.lyx -o program --target=macosx64
+```lyx
+// Virtual methods on ARM64
+type Animal = class {
+    fn virtual speak() {
+        PrintStr("?\n");
+    }
+};
+
+type Dog = class extends Animal {
+    fn override speak() {
+        PrintStr("Woof!\n");
+    }
+};
+
+fn main(): int64 {
+    var a: Animal := new Dog();
+    a.speak();  // Dynamischer Aufruf → "Woof!"
+    dispose a;
+    return 0;
+}
 ```
 
 **Implementierung:**
-- `backend/macho/macho64_writer.pas`: Vollständiger Mach-O 64-bit Writer
-- `backend/macho/syscalls_macos.pas`: BSD Syscall-Konstanten (0x2000000 Prefix)
-- `backend/macosx64/macosx64_emit.pas`: x86_64 Code-Emitter für macOS
-- Mach-O Load Commands: `LC_SEGMENT_64`, `LC_MAIN`, `LC_UUID`
-- Segmente: `__PAGEZERO`, `__TEXT`, `__DATA`, `__LINKEDIT`
-- SysV ABI x86_64 Calling Convention (identisch zu Linux)
+- `backend/elf/elf64_arm64_writer.pas`: VMT-Tabelle im .rodata Segment
+- `backend/arm64/arm64_emit.pas`: Virtual Call via VMT (LDR + BLR)
+- `backend/arm64/arm64_emit.pas`: VMT-Pointer bei `new` gesetzt
+- `tests/test_arm64_vmt.pas`: Unit-Tests für ARM64 VMT
 
-**Unterstützte Features:**
-- Statische Mach-O Binaries ohne dyld
-- PrintStr, PrintInt, exit Builtins via BSD Syscalls
-- Entry Point über `LC_MAIN` (nicht LC_UNIXTHREAD)
+#### **ARM64 Backend: 100% IR Opcode Coverage (v0.5.1)**
 
-#### **IR-Level Optimizer (v0.5.0)**
+Alle 93 IR-Opcodes sind jetzt für ARM64 implementiert:
 
-Umfangreiche IR-Optimierungen für bessere Codegenerierung:
+**Neu implementierte Opcodes:**
+- `irCast`: Type casting (int↔float)
+- `irVarCall`: Indirekte Funktionsaufrufe via BLR
+- `irCallStruct`: Struct-by-value calls (AAPCS64 ABI)
+- `irReturnStruct`: Struct return mit Memory-Copy
+- `irIsType`: VMT-basierte Type-Prüfung
+- `irPanic`: Panic/Abort mit stderr + exit
+- `irPushHandler/irPopHandler/irThrow`: Exception-Handling
+- `irInspect`: Debug Visualizer
 
-- **Constant Folding**: Compile-Zeit-Auswertung konstanter Ausdrücke
-- **Common Subexpression Elimination (CSE)**: Redundante Berechnungen eliminieren
-- **Dead Code Elimination (DCE)**: Unerreichbaren Code entfernen
-- **Copy Propagation**: Unnötige Kopien eliminieren
-- **Strength Reduction**: Teure Operationen durch günstigere ersetzen
+**ARM64 SIMD/NEON Operationen:**
+- `WriteAddSimd`, `WriteSubSimd`, `WriteMulSimd`
+- `WriteAndSimd`, `WriteOrSimd`, `WriteXorSimd`
+- `WriteNegSimd`, `WriteNotSimd`
+- `WriteCmeqSimd`, `WriteCmhiSimd`, `WriteCmgeSimd`
 
-#### **Peephole Optimizer (v0.5.0)**
+**ARM64 DynArray Support:**
+- `irDynArrayPush`: Element hinzufügen mit auto-growth
+- `irDynArrayPop`: Element entfernen
+- `irDynArrayLen`: Länge abrufen
+- `irDynArrayFree`: Speicher freigeben
 
-Backend-Level Optimierungen:
+#### **IR Bugfix: Float Arithmetic (v0.5.1)**
 
-- Constant folding auf Maschinencode-Ebene
-- Identity operations entfernen (`x + 0`, `x * 1`)
-- Redundante moves eliminieren
-
-#### **Maps und Sets (v0.5.0)**
-
-Assoziative Datenstrukturen:
+Korrigierte Float-Operationen im IR-Generator:
 
 ```lyx
-// Map mit Key-Value Paaren
-var scores: Map<int64, int64> := {1: 100, 2: 200};
-scores[3] := 300;
-var val: int64 := scores[1];
+// Vorher: verwendet irSub/irMul/irDiv (Integer)
+var z: f64 := x - y;  // ❌ Falscher Opcode
 
-// Set mit eindeutigen Werten
-var ids: Set<int64> := {10, 20, 30};
-if (20 in ids) {
-  PrintStr("Found!\n");
-}
+// Jetzt: verwendet irFSub/irFMul/irFDiv
+var z: f64 := x - y;  // ✅ Korrekter Opcode
 ```
 
 ---

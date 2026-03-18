@@ -305,7 +305,7 @@ end;
 procedure TLexerTest.TestKeywordPub;
 var l: TLexer;
 begin
-  l := Lex('pub'); try AssertToken(l.NextToken, tkPub, 'pub'); finally l.Free; end;
+  l := Lex('pub'); try AssertToken(l.NextToken, tkPublic, 'pub'); finally l.Free; end;
 end;
 
 procedure TLexerTest.TestKeywordAs;
