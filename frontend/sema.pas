@@ -3885,8 +3885,8 @@ begin
 
           // Check if we should override:
           // 1. method is explicitly marked as override, OR
-          // 2. method exists in derived class (implicit override for abstract/concrete methods)
-          // 3. baseMethod is abstract and method exists (implementing abstract)
+          // 2. method exists in derived class and base is abstract (implementing abstract), OR
+          // 3. method exists in derived class and is NOT virtual (shadows base)
           if Assigned(method) and 
              (method.IsOverride or (not method.IsVirtual) or baseMethod.IsAbstract) then
           begin
