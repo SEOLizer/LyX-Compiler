@@ -122,6 +122,7 @@ type
     // Virtual call fields
     VMTIndex: Integer;        // index in VMT table for virtual calls
     IsVirtualCall: Boolean;   // true if this is a virtual method call
+    SelfSlot: Integer;        // local slot index for self pointer (for virtual calls)
     // Struct return fields (for irReturnStruct)
     StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
     StructAlign: Integer;  // alignment of struct

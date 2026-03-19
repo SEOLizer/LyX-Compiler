@@ -769,10 +769,30 @@ begin
       for i := 0 to High(leaVarPatches) do
       begin
         patchOffset := leaVarPatches[i].CodeOffset;
-        entryRVA := dataRVA + DWord(leaVarPatches[i].VarIndex);
-        instrEndRVA := textRVA + DWord(patchOffset) + 7;
+        // VarIndex can be:
+        // 1. Offset in data section (global variables)
+        // 2. VMT label marker (>= $100000) - VarIndex = $100000 + bufferPosition
+        if leaVarPatches[i].VarIndex >= $100000 then
+        begin
+          // This is a VMT label - VarIndex contains buffer position + marker
+          // Extract buffer position and convert to RVA
+          entryRVA := textRVA + DWord(leaVarPatches[i].VarIndex - $100000);
+        end
+        else if leaVarPatches[i].VarIndex >= Integer(textRVA) then
+        begin
+          // This is a VMT label - VarIndex is the RVA directly (in code section)
+          entryRVA := DWord(leaVarPatches[i].VarIndex);
+        end
+        else
+        begin
+          // Regular global variable in data section
+          entryRVA := dataRVA + DWord(leaVarPatches[i].VarIndex);
+        end;
+        // Calculate RIP-relative displacement for LEA instruction
+        // patchOffset points to the displacement field (4 bytes), so instr ends at patchOffset + 4
+        instrEndRVA := textRVA + DWord(patchOffset) + 4;
         disp32 := Int32(entryRVA) - Int32(instrEndRVA);
-        fileBuf.PatchU32LE(headerSize + patchOffset + 3, Cardinal(disp32));
+        fileBuf.PatchU32LE(headerSize + patchOffset, Cardinal(disp32));
       end;
     end;
     
