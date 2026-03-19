@@ -715,6 +715,7 @@ begin
             begin
               // macOS ARM64 Code Generation
               arm64Emit := TARM64Emitter.Create;
+              arm64Emit.SetTargetOS(atmacOS);
               try
                 arm64Emit.EmitFromIR(module);
                 codeBuf := arm64Emit.GetCodeBuffer;

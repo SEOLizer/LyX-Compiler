@@ -7,6 +7,8 @@ uses
   SysUtils, Classes, bytes, ir, backend_types, energy_model;
 
 type
+  TARM64TargetOS = (atLinux, atmacOS);
+
   TLabelPos = record
     Name: string;
     Pos: Integer;
@@ -60,9 +62,14 @@ type
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
+    FTargetOS: TARM64TargetOS;
     procedure TrackEnergy(kind: TEnergyOpKind);
+    // OS-specific syscall helpers
+    procedure WriteSyscall(syscallNum: UInt64);
+    procedure WriteSyscallInsn;
   public
-    constructor Create;
+    constructor Create(targetOS: TARM64TargetOS = atLinux);
+    procedure SetTargetOS(targetOS: TARM64TargetOS);
     destructor Destroy; override;
     procedure EmitFromIR(module: TIRModule);
     function GetCodeBuffer: TByteBuffer;
@@ -115,6 +122,21 @@ const
   SYS_mmap = 222;
   SYS_munmap = 215;
   SYS_brk = 214;
+
+  // macOS ARM64 Syscall Numbers (BSD-style)
+  MACOS_SYS_exit = 1;
+  MACOS_SYS_read = 3;
+  MACOS_SYS_write = 4;
+  MACOS_SYS_open = 5;
+  MACOS_SYS_close = 6;
+  MACOS_SYS_lseek = 199;
+  MACOS_SYS_unlink = 10;
+  MACOS_SYS_rename = 51;
+  MACOS_SYS_mkdir = 54;
+  MACOS_SYS_rmdir = 73;
+  MACOS_SYS_chmod = 15;
+  MACOS_SYS_mmap = 197;
+  MACOS_SYS_munmap = 73;
 
 // ==========================================================================
 // ARM64 Instruction Encoding Helpers
@@ -890,9 +912,10 @@ end;
 // TARM64Emitter Implementation
 // ==========================================================================
 
-constructor TARM64Emitter.Create;
+constructor TARM64Emitter.Create(targetOS: TARM64TargetOS = atLinux);
 begin
   inherited Create;
+  FTargetOS := targetOS;
   FCode := TByteBuffer.Create;
   FData := TByteBuffer.Create;
   FFuncNames := TStringList.Create;
@@ -930,6 +953,36 @@ begin
   FData.Free;
   FCode.Free;
   inherited Destroy;
+end;
+
+procedure TARM64Emitter.SetTargetOS(targetOS: TARM64TargetOS);
+begin
+  FTargetOS := targetOS;
+end;
+
+procedure TARM64Emitter.WriteSyscall(syscallNum: UInt64);
+begin
+  if FTargetOS = atmacOS then
+  begin
+    // macOS ARM64: syscall number in X16, svc #0x80
+    WriteMovImm64(FCode, X16, syscallNum);
+    WriteSvc(FCode, $80);
+  end
+  else
+  begin
+    // Linux ARM64: syscall number in X8, svc #0
+    WriteMovImm64(FCode, X8, syscallNum);
+    WriteSvc(FCode, 0);
+  end;
+end;
+
+// Write just the SVC instruction (after syscall number is set)
+procedure TARM64Emitter.WriteSyscallInsn;
+begin
+  if FTargetOS = atmacOS then
+    WriteSvc(FCode, $80)
+  else
+    WriteSvc(FCode, 0);
 end;
 
 procedure TARM64Emitter.TrackEnergy(kind: TEnergyOpKind);
@@ -1125,8 +1178,7 @@ begin
   // (X0 is already the exit code from main)
   
   // sys_exit(X0)
-  WriteMovImm64(FCode, X8, SYS_exit);
-  WriteSvc(FCode, 0);
+  WriteSyscall(SYS_exit);
   
   // Phase 3: Emit builtin stubs
   
@@ -1167,8 +1219,7 @@ begin
   WriteMovImm64(FCode, X0, 1);       // fd = STDOUT
   WriteMovRegReg(FCode, X1, X9);     // buf = string address
   // X2 already has length
-  WriteMovImm64(FCode, X8, SYS_write);
-  WriteSvc(FCode, 0);
+  WriteSyscall(SYS_write);
   WriteRet(FCode);
   
   // PrintInt builtin: X0 = integer value
@@ -1242,8 +1293,7 @@ begin
   // sys_write(1, X10, X2)
   WriteMovImm64(FCode, X0, 1);
   WriteMovRegReg(FCode, X1, X10);
-  WriteMovImm64(FCode, X8, SYS_write);
-  WriteSvc(FCode, 0);
+  WriteSyscall(SYS_write);
   
   // Epilogue
   WriteLdpPostIndex(FCode, X29, X30, SP, 48);
@@ -1712,8 +1762,7 @@ begin
             else if instr.ImmStr = 'exit' then
             begin
               // sys_exit(X0)
-              WriteMovImm64(FCode, X8, SYS_exit);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_exit);
             end
             // === std.io: fd-basierte I/O Syscalls (Linux ARM64) ===
             else if instr.ImmStr = 'open' then
@@ -1737,8 +1786,7 @@ begin
                 WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
               else
                 WriteMovImm64(FCode, X2, 0);
-              WriteMovImm64(FCode, X8, SYS_open);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_open);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1763,8 +1811,7 @@ begin
                 WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
               else
                 WriteMovImm64(FCode, X2, 0);
-              WriteMovImm64(FCode, X8, SYS_read);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_read);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1789,8 +1836,7 @@ begin
                 WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
               else
                 WriteMovImm64(FCode, X2, 0);
-              WriteMovImm64(FCode, X8, SYS_write);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_write);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1803,8 +1849,7 @@ begin
                 WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
               else
                 WriteMovImm64(FCode, X0, 0);
-              WriteMovImm64(FCode, X8, SYS_close);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_close);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1829,8 +1874,7 @@ begin
                 WriteLoad(FCode, X2, RBP, SlotOffset(localCnt + arg3))
               else
                 WriteMovImm64(FCode, X2, 0);
-              WriteMovImm64(FCode, X8, SYS_lseek);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_lseek);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1843,8 +1887,7 @@ begin
                 WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
               else
                 WriteMovImm64(FCode, X0, 0);
-              WriteMovImm64(FCode, X8, SYS_unlink);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_unlink);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1861,8 +1904,7 @@ begin
                 WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
               else
                 WriteMovImm64(FCode, X1, 0);
-              WriteMovImm64(FCode, X8, SYS_rename);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_rename);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1879,8 +1921,7 @@ begin
                 WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
               else
                 WriteMovImm64(FCode, X1, 0);
-              WriteMovImm64(FCode, X8, SYS_mkdir);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_mkdir);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1893,8 +1934,7 @@ begin
                 WriteLoad(FCode, X0, RBP, SlotOffset(localCnt + instr.Src1))
               else
                 WriteMovImm64(FCode, X0, 0);
-              WriteMovImm64(FCode, X8, SYS_rmdir);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_rmdir);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -1911,8 +1951,7 @@ begin
                 WriteLoad(FCode, X1, RBP, SlotOffset(localCnt + instr.Src2))
               else
                 WriteMovImm64(FCode, X1, 0);
-              WriteMovImm64(FCode, X8, SYS_chmod);
-              WriteSvc(FCode, 0);
+              WriteSyscall(SYS_chmod);
               if instr.Dest >= 0 then
                 WriteStore(FCode, X0, RBP, SlotOffset(localCnt + instr.Dest));
             end
@@ -2195,10 +2234,12 @@ begin
             WriteMovImm64(FCode, X4, High(UInt64));  // -1 as unsigned
             // X5 = offset (0)
             WriteMovImm64(FCode, X5, 0);
-            // X8 = syscall number (222 = sys_mmap on ARM64 Linux)
-            WriteMovImm64(FCode, X8, SYS_mmap);
-            // SVC #0
-            WriteSvc(FCode, 0);
+            // Syscall number (different register for Linux vs macOS)
+            if FTargetOS = atmacOS then
+              WriteMovImm64(FCode, X16, MACOS_SYS_mmap)
+            else
+              WriteMovImm64(FCode, X8, SYS_mmap);
+            WriteSyscallInsn;
             // Result (pointer) is now in X0, store to Dest temp slot
             slotIdx := localCnt + instr.Dest;
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
