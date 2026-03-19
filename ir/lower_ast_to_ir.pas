@@ -997,6 +997,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     errLbl: string;
     // Nested field access
     baseExpr: TAstExpr;
+    // Method call type lookup
+    recvExpr: TAstExpr;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -2057,6 +2059,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.ImmInt := argCount;
             instr.IsVirtualCall := False;
             instr.VMTIndex := -1;
+            instr.SelfSlot := -1;
             instr.CallMode := cmInternal;
             SetLength(instr.ArgTemps, argCount);
             for i := 0 to argCount - 1 do
@@ -2073,60 +2076,109 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.ImmInt := argCount; // Backend needs argCount in ImmInt
             instr.IsVirtualCall := False;
             instr.VMTIndex := -1;
+            instr.SelfSlot := -1;
            
-            // Check if this is a method call (mangled name starts with _L_)
-          if (Length(call.Name) > 3) and (Copy(call.Name, 1, 3) = '_L_') then
-          begin
-            // Extract class name and method name from mangled name
-            // Format: _L_ClassName_methodName
-            posIdx := Pos('_', Copy(call.Name, 4, MaxInt));
-            if posIdx > 0 then
+            // Check if this is a method call (mangled name starts with _L_ or _METHOD_)
+            if (Length(call.Name) > 3) and ((Copy(call.Name, 1, 3) = '_L_') or (Copy(call.Name, 1, 9) = '_METHOD_')) then
             begin
-              vmtClassName := Copy(call.Name, 4, posIdx - 1);
-              vmtMethodName := Copy(call.Name, 4 + posIdx, MaxInt);
-              
-              // Look up class in FClassTypes
-              classIdx := FClassTypes.IndexOf(vmtClassName);
-              if classIdx >= 0 then
+              // For _METHOD_<methodname>: extract method name and look up class from first argument's type
+              // For _L_<ClassName>_<MethodName>: extract class name and method name from mangled name
+              if Copy(call.Name, 1, 9) = '_METHOD_' then
               begin
-                cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
-                // First check if class has virtual methods (VMT exists)
-                if Length(cd.VirtualMethods) > 0 then
+                // Format: _METHOD_<methodname>
+                // Need to look up class from receiver type (call.Args[0])
+                vmtMethodName := Copy(call.Name, 10, MaxInt);
+                vmtClassName := '';
+                
+                // Get receiver's type from semantic analysis
+                if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) then
                 begin
-                  // Look for method in VirtualMethods list (has correct VMT indices)
-                  for vmtIdx := 0 to High(cd.VirtualMethods) do
+                  recvExpr := call.Args[0];
+
+                  // Try to get the variable name from Ident node
+                  if recvExpr is TAstIdent then
                   begin
-                    if Assigned(cd.VirtualMethods[vmtIdx]) and 
-                       (cd.VirtualMethods[vmtIdx].Name = vmtMethodName) then
+                    // Look up the local slot by name
+                    loc := ResolveLocal(TAstIdent(recvExpr).Name);
+                    if loc >= 0 then
                     begin
-                      // This is a virtual call - method is in VMT
-                      instr.IsVirtualCall := True;
-                      instr.VMTIndex := vmtIdx;
-                      Break;
+                      // Check FLocalTypeNames for class types
+                      if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+                        vmtClassName := FLocalTypeNames[loc];
                     end;
                   end;
                 end;
-                
-                // Fallback: also check in Methods list (for non-virtual methods)
-                if not instr.IsVirtualCall then
+              end
+              else
+              begin
+                // Format: _L_ClassName_methodName
+                posIdx := Pos('_', Copy(call.Name, 4, MaxInt));
+                if posIdx > 0 then
                 begin
-                  for methodIdx := 0 to High(cd.Methods) do
+                  vmtClassName := Copy(call.Name, 4, posIdx - 1);
+                  vmtMethodName := Copy(call.Name, 4 + posIdx, MaxInt);
+                  
+                  // Also need to find the receiver's slot for SelfSlot
+                  // The receiver is in call.Args[0]
+                  if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) then
                   begin
-                    if cd.Methods[methodIdx].Name = vmtMethodName then
+                    recvExpr := call.Args[0];
+                    if recvExpr is TAstIdent then
                     begin
-                      // Check if method is explicitly virtual
-                      if cd.Methods[methodIdx].IsVirtual then
+                      loc := ResolveLocal(TAstIdent(recvExpr).Name);
+                    end;
+                  end;
+                end;
+              end;
+              
+              // Look up class in FClassTypes if we have a class name
+              if vmtClassName <> '' then
+              begin
+                classIdx := FClassTypes.IndexOf(vmtClassName);
+                if classIdx >= 0 then
+                begin
+                  cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
+                  // First check if class has virtual methods (VMT exists)
+                  if Length(cd.VirtualMethods) > 0 then
+                  begin
+                    // Look for method in VirtualMethods list (has correct VMT indices)
+                    for vmtIdx := 0 to High(cd.VirtualMethods) do
+                    begin
+                      if Assigned(cd.VirtualMethods[vmtIdx]) and
+                         (cd.VirtualMethods[vmtIdx].Name = vmtMethodName) then
                       begin
+                        // This is a virtual call - method is in VMT
                         instr.IsVirtualCall := True;
-                        instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                        instr.VMTIndex := vmtIdx;
+                        // Store the local slot for self
+                        instr.SelfSlot := loc;
+                        Break;
                       end;
-                      Break;
+                    end;
+                  end;
+
+                  // Fallback: also check in Methods list (for non-virtual methods)
+                  if not instr.IsVirtualCall then
+                  begin
+                    for methodIdx := 0 to High(cd.Methods) do
+                    begin
+                      if cd.Methods[methodIdx].Name = vmtMethodName then
+                      begin
+                        // Check if method is explicitly virtual
+                        if cd.Methods[methodIdx].IsVirtual then
+                        begin
+                          instr.IsVirtualCall := True;
+                          instr.VMTIndex := cd.Methods[methodIdx].VirtualTableIndex;
+                          // Store the local slot for self
+                          instr.SelfSlot := loc;
+                        end;
+                        Break;
+                      end;
                     end;
                   end;
                 end;
               end;
             end;
-          end;
           
           // Determine call mode based on function origin
           // Check if function is defined locally first
@@ -3478,6 +3530,44 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         FLocalElemSize[loc] := elemSize;
         Exit(True);
       end
+      else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) and
+              (FStructTypes.Objects[FStructTypes.IndexOf(vd.DeclTypeName)] is TAstClassDecl) then
+      begin
+        // Class type: allocate a single pointer slot for the object reference
+        loc := AllocLocal(vd.Name, vd.DeclType);
+        
+        // Record the class name for VMT lookup
+        if loc < Length(FLocalTypeNames) then
+          FLocalTypeNames[loc] := vd.DeclTypeName;
+        
+        // Initialize with new expression if present
+        if Assigned(vd.InitExpr) then
+        begin
+          tmp := LowerExpr(vd.InitExpr);
+          if tmp >= 0 then
+          begin
+            instr.Op := irStoreLocal;
+            instr.Dest := loc;
+            instr.Src1 := tmp;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          // No initializer - initialize to 0 (null pointer)
+          tmp := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irConstInt;
+          instr.Dest := tmp;
+          instr.ImmInt := 0;
+          Emit(instr);
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+        end;
+        Exit(True);
+      end
       else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) then
       begin
         // Struct type: allocate multiple slots on stack
@@ -3729,7 +3819,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         ltype := GetLocalType(loc);
         if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64)
            and (ltype <> atPChar) and (ltype <> atPCharNullable)
-           and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray) then
+           and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray)
+           and (ltype <> atParallelArray) then
         begin
          // determine width in bits
          width := 64;
@@ -4315,6 +4406,24 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       // Für jetzt: Pool direkt als normalen Block behandeln
       // Die IR-Operationen irPoolAlloc/irPoolFree werden vom Backend verwendet
       LowerStmt(TAstPoolStmt(stmt).Body);
+      Exit(True);
+    end;
+
+    // dispose expr; - free heap-allocated class instance
+    if stmt is TAstDispose then
+    begin
+      // Lower the expression - this returns a temp index
+      // For identifiers, this returns the slot index, which is fine for irLoadLocal
+      t0 := LowerExpr(TAstDispose(stmt).Expr);
+      if t0 < 0 then Exit(False);
+      
+      // Emit irFree instruction
+      // The temp value t0 contains the pointer to free
+      instr := Default(TIRInstr);
+      instr.Op := irFree;
+      instr.Src1 := t0;
+      instr.ImmInt := 0;  // Default size handling in backend
+      Emit(instr);
       Exit(True);
     end;
 

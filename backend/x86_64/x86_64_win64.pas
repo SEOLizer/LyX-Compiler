@@ -1259,6 +1259,7 @@ begin
   end;
 
   // Emit VMT tables for classes with virtual methods
+  // VMT data is placed in CODE section to avoid relocation issues
   for i := 0 to High(module.ClassDecls) do
   begin
     cd := module.ClassDecls[i];
@@ -1268,39 +1269,44 @@ begin
       // Emit class name string (for RTTI ClassName method)
       SetLength(FVMTLabels, Length(FVMTLabels) + 1);
       FVMTLabels[High(FVMTLabels)].Name := '_classname_' + cd.Name;
-      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FVMTLabels[High(FVMTLabels)].Pos := FCode.Size;
       
       // Write class name as null-terminated string
       for j := 1 to Length(cd.Name) do
-        FData.WriteU8(Ord(cd.Name[j]));
-      FData.WriteU8(0);  // null terminator
+        FCode.WriteU8(Ord(cd.Name[j]));
+      FCode.WriteU8(0);  // null terminator
       
       // Align to 8 bytes before RTTI header
-      while (FData.Size mod 8) <> 0 do
-        FData.WriteU8(0);
+      while (FCode.Size mod 8) <> 0 do
+        FCode.WriteU8(0);
       
-          // Emit RTTI header
-          // 1. Parent VMT Pointer
-          SetLength(FVMTLabels, Length(FVMTLabels) + 1);
-          FVMTLabels[High(FVMTLabels)].Name := '_vmt_parent_' + cd.Name;
-          FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
-          FData.WriteU64LE(0);  // Placeholder
+      // Emit RTTI header
+      // 1. Parent VMT Pointer
+      SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+      FVMTLabels[High(FVMTLabels)].Name := '_vmt_parent_' + cd.Name;
+      FVMTLabels[High(FVMTLabels)].Pos := FCode.Size;
+      FCode.WriteU64LE(0);  // Placeholder
       
       // 2. ClassName Pointer
       SetLength(FVMTLabels, Length(FVMTLabels) + 1);
       FVMTLabels[High(FVMTLabels)].Name := '_vmt_classname_ptr_' + cd.Name;
-      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
-      FData.WriteU64LE(0);  // Placeholder
+      FVMTLabels[High(FVMTLabels)].Pos := FCode.Size;
+      FCode.WriteU64LE(0);  // Placeholder
       
       // 3. VMT base (where instance VMT pointers point to)
       SetLength(FVMTLabels, Length(FVMTLabels) + 1);
       FVMTLabels[High(FVMTLabels)].Name := '_vmt_' + cd.Name;
-      FVMTLabels[High(FVMTLabels)].Pos := FData.Size;
+      FVMTLabels[High(FVMTLabels)].Pos := FCode.Size;
       
       // Emit VMT entries (method pointers)
       for j := 0 to High(cd.VirtualMethods) do
       begin
-        FData.WriteU64LE(0);  // Placeholder - will be patched
+        method := cd.VirtualMethods[j];
+        // For methods without body, write FFFFFFFF as marker
+        if Assigned(method) and Assigned(method.Body) and (Length(method.Body.Stmts) > 0) then
+          FCode.WriteU64LE(0)  // Placeholder for patching
+        else
+          FCode.WriteU64LE($FFFFFFFFFFFFFFFF);  // Marker for unimplemented method
       end;
     end;
   end;
@@ -1836,6 +1842,7 @@ begin
             if Copy(instr.ImmStr, 1, 5) = '_vmt_' then
             begin
               // This is a VMT label - look up its position in FVMTLabels
+              // VMT data is now in CODE section, so vmtDataPos is offset in code
               vmtDataPos := -1;
               for k := 0 to High(FVMTLabels) do
               begin
@@ -1848,18 +1855,18 @@ begin
               
               if vmtDataPos < 0 then
               begin
-                // VMT label not found - this shouldn't happen, but create placeholder
-                vmtDataPos := FData.Size;
-                FData.WriteU64LE(0);
+                // VMT label not found - should not happen
+                vmtDataPos := 0;
               end;
               
-              // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
+              // lea rax, [rip+disp32] ; will be patched later
               leaPos := FCode.Size;
               EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
-              // Record position for patching - add 1000 to indicate VMT offset
+              // Record position for patching - LeaPos points to instruction start, but displacement is at +3
+              // Store LeaPos + 3 so patch offset targets the displacement bytes
               SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
-              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := vmtDataPos + 1000;
-              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := $100000 + vmtDataPos;  // RVA marker
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos + 3;  // +3 to target displacement
               // Store the ADDRESS into temp slot
               slotIdx := localCnt + instr.Dest;
               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
@@ -2761,12 +2768,13 @@ begin
         end;
       end;
       
-      if vmtDataPos >= 0 then
+      if vmtDataPos < 0 then
+        Continue;
+      
+      // Patch each VMT entry with the method address
+      for j := 0 to High(cd.VirtualMethods) do
       begin
-        // Patch each VMT entry with the method address
-        for j := 0 to High(cd.VirtualMethods) do
-        begin
-          method := cd.VirtualMethods[j];
+        method := cd.VirtualMethods[j];
           
           // Handle abstract methods (nil entries in VMT)
           if not Assigned(method) then
@@ -2785,8 +2793,9 @@ begin
             if methodAddr >= 0 then
             begin
               // Patch VMT entry with abstract method error handler
-              // Windows PE: code at offset + entry point (0x1000)
-              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($1000 + UInt64(methodAddr)));
+              // VMT data is now in CODE section, so patch directly
+              // Use absolute address for dereferencing
+              FCode.PatchU64LE(vmtDataPos + (j * 8), UInt64($140001000) + UInt64(methodAddr));
             end;
             Continue;
           end;
@@ -2807,7 +2816,8 @@ begin
             
             if methodAddr >= 0 then
             begin
-              FData.PatchU64LE(vmtDataPos + (j * 8), UInt64($1000 + UInt64(methodAddr)));
+              // Use absolute address for dereferencing
+              FCode.PatchU64LE(vmtDataPos + (j * 8), UInt64($140001000) + UInt64(methodAddr));
             end;
             Continue;
           end;
@@ -2870,13 +2880,12 @@ begin
             end;
           end;
           
-          // Record VMT method pointer patch (code reference)
+          // Record VMT method pointer patch - patch directly to FCode (VMT is in code section now)
           if methodAddr >= 0 then
           begin
-            SetLength(FDataRefPatches, Length(FDataRefPatches) + 1);
-            FDataRefPatches[High(FDataRefPatches)].DataOffset := vmtDataPos + (j * 8);
-            FDataRefPatches[High(FDataRefPatches)].TargetOffset := methodAddr;
-            FDataRefPatches[High(FDataRefPatches)].IsCodeRef := True;
+            // VMT data is in CODE section, patch directly
+            // For indirect calls, we need absolute addresses, not RVAs
+            FCode.PatchU64LE(vmtDataPos + (j * 8), UInt64($140001000) + UInt64(methodAddr));
           end;
         end;
         
@@ -2899,27 +2908,22 @@ begin
             parentVmtPos := FVMTLabels[j].Pos;
         end;
         
-        // Record parent VMT pointer patch (data reference)
+        // Patch parent VMT pointer directly (both in code section)
+        // Use absolute address for dereferencing
         if (parentPtrPos >= 0) and (parentVmtPos >= 0) then
         begin
-          SetLength(FDataRefPatches, Length(FDataRefPatches) + 1);
-          FDataRefPatches[High(FDataRefPatches)].DataOffset := parentPtrPos;
-          FDataRefPatches[High(FDataRefPatches)].TargetOffset := parentVmtPos;
-          FDataRefPatches[High(FDataRefPatches)].IsCodeRef := False;
+          FCode.PatchU64LE(parentPtrPos, UInt64($140001000) + UInt64(parentVmtPos));
         end;
         
-        // Record class name pointer patch (data reference)
+        // Patch class name pointer directly (both in code section)
+        // Use absolute address for dereferencing
         if (classNamePtrPos >= 0) and (classNamePos >= 0) then
         begin
-          SetLength(FDataRefPatches, Length(FDataRefPatches) + 1);
-          FDataRefPatches[High(FDataRefPatches)].DataOffset := classNamePtrPos;
-          FDataRefPatches[High(FDataRefPatches)].TargetOffset := classNamePos;
-          FDataRefPatches[High(FDataRefPatches)].IsCodeRef := False;
+          FCode.PatchU64LE(classNamePtrPos, UInt64($140001000) + UInt64(classNamePos));
         end;
-      end;
-    end;
-  end;
-end;
+      end;  // Ende von if Length(cd.VirtualMethods) > 0
+    end;  // Ende von for i := 0 to High(module.ClassDecls)
+  end;  // Ende von EmitFromIR
 
 procedure TWin64Emitter.WriteToFile(const filename: string);
 var
@@ -2940,12 +2944,14 @@ begin
   for i := 0 to High(FGlobalVarLeaPositions) do
   begin
     leaVarPatches[i].CodeOffset := FGlobalVarLeaPositions[i].CodePos;
-    // VarIndex in FGlobalVarLeaPositions refers to index in globalVarOffsets
-    // BUT for VMT labels, we store the raw data offset directly (>= 1000 to avoid collision)
-    if FGlobalVarLeaPositions[i].VarIndex >= 1000 then
+    // VarIndex in FGlobalVarLeaPositions can be:
+    // 1. Global variable offset (index into globalVarOffsets)
+    // 2. VMT buffer position (>= $100000) - VMT is in CODE section now
+    //    The PE writer will check for >= $100000 and convert to RVA
+    if FGlobalVarLeaPositions[i].VarIndex >= $100000 then
     begin
-      // This is a VMT label - use the offset directly
-      leaVarPatches[i].VarIndex := FGlobalVarLeaPositions[i].VarIndex - 1000;
+      // This is a VMT label - pass the marker through unchanged so PE writer can detect it
+      leaVarPatches[i].VarIndex := FGlobalVarLeaPositions[i].VarIndex;
     end
     else if FGlobalVarLeaPositions[i].VarIndex < Length(FGlobalVarOffsets) then
     begin
