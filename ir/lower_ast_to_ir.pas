@@ -2134,17 +2134,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               // Look up class in FClassTypes if we have a class name
               if vmtClassName <> '' then
               begin
-                WriteLn(StdErr, '[VMT-DEBUG] Looking up class: ', vmtClassName);
                 classIdx := FClassTypes.IndexOf(vmtClassName);
-                WriteLn(StdErr, '[VMT-DEBUG] classIdx = ', classIdx, ', FClassTypes.Count = ', FClassTypes.Count);
                 if classIdx >= 0 then
                 begin
                   cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
-                  WriteLn(StdErr, '[VMT-DEBUG] Found class: ', cd.Name, ', VirtualMethods: ', Length(cd.VirtualMethods));
                   // First check if class has virtual methods (VMT exists)
                   if Length(cd.VirtualMethods) > 0 then
                   begin
-                    WriteLn(StdErr, '[VMT-DEBUG] Searching for method: ', vmtMethodName);
                     // Look for method in VirtualMethods list (has correct VMT indices)
                     for vmtIdx := 0 to High(cd.VirtualMethods) do
                     begin
@@ -2152,7 +2148,6 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                          (cd.VirtualMethods[vmtIdx].Name = vmtMethodName) then
                       begin
                         // This is a virtual call - method is in VMT
-                        WriteLn(StdErr, '[VMT-DEBUG] Found method at VMT index: ', vmtIdx);
                         instr.IsVirtualCall := True;
                         instr.VMTIndex := vmtIdx;
                         // Store the local slot for self
