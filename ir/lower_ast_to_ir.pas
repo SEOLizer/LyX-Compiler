@@ -769,19 +769,15 @@ begin
         // PHASE 2: Functions and Global Variables
         else
         begin
-          // Process global variable declarations (pub var / pub let)
+          // Process global variable declarations (var / let / pub var / pub let)
           if node is TAstVarDecl then
           begin
             vd := TAstVarDecl(node);
-            // Only import public global variables
-            if not vd.IsPublic then
-              Continue;
-
             // Check if variable already exists (avoid duplicates)
             if FGlobalVars.IndexOf(vd.Name) >= 0 then
               Continue;
 
-            // Register global variable
+            // Register global variable (import all, not just public ones)
             FGlobalVars.AddObject(vd.Name, System.TObject(node));
 
             // Register in module with init value
@@ -2334,12 +2330,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 Exit;
               end;
 
-              // Static array: elements are stored in reverse order on stack.
-              // arr[0] is at slot loc + arrayLen - 1, arr[arrayLen-1] is at slot loc.
-              // Load address of arr[0] (highest slot) so base + index*8 works correctly.
+              // For local arrays, elements are stored in REVERSE order:
+              // arr[0] at slot loc + arrLen - 1, arr[1] at slot loc + arrLen - 2, etc.
+              // This is because stack grows downward and we want arr[index] = base + index*8
               arrLen := GetLocalArrayLen(loc);
               if arrLen > 0 then
-                baseSlot := loc + arrLen - 1  // base address points to arr[0]
+                baseSlot := loc + arrLen - 1  // arr[0] at highest slot
               else
                 baseSlot := loc;  // fallback for non-array locals
               
@@ -2349,39 +2345,57 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               instr.Src1 := baseSlot;
               Emit(instr);
               
-               // Lower index
-               t2 := LowerExpr(TAstIndexAccess(expr).Index);
-               if t2 < 0 then
-                 Exit;
+                // Lower index
+                t2 := LowerExpr(TAstIndexAccess(expr).Index);
+                if t2 < 0 then
+                  Exit;
 
-               // If local array has known static length, emit bounds check
-               if arrLen > 0 then
-               begin
-                 tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
-                 tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := arrLen; Emit(instr);
-                 tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
-                 tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
-                 tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
-                 errLbl := NewLabel('Larr_oob');
-                 instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
-               end;
+                // If local array has known static length, emit bounds check
+                // Using CmpGe: if index >= length, jump to error
+                // CmpGe gives 1 when index >= length (invalid), 0 when index < length (valid)
+                // BrTrue jumps when value is 1 (invalid), so BrTrue CmpGe jumps on invalid index
+                if arrLen > 0 then
+                begin
+                  errLbl := NewLabel('Larr_oob');
+                  // tLen = length (constant)
+                  tLen := NewTemp;
+                  instr.Op := irConstInt;
+                  instr.Dest := tLen;
+                  instr.ImmInt := arrLen;
+                  Emit(instr);
+                  
+                  // tOk = (index >= tLen) ? 1 : 0
+                  tOk := NewTemp;
+                  instr.Op := irCmpGe;
+                  instr.Dest := tOk;
+                  instr.Src1 := t2;  // index
+                  instr.Src2 := tLen;  // length
+                  Emit(instr);
+                  
+                // If tOk == 1 (index >= length, invalid), jump to error
+                   instr.Op := irBrTrue;
+                   instr.Src1 := tOk;
+                   instr.LabelName := errLbl;
+                   Emit(instr);
+                end;
 
-               t0 := NewTemp;
-               instr.Op := irLoadElem;
-               instr.Dest := t0;
-               instr.Src1 := t1;  // array base address
-               instr.Src2 := t2;  // index
-               Emit(instr);
-               Result := t0;
+                t0 := NewTemp;
+                instr.Op := irLoadElem;
+                instr.Dest := t0;
+                instr.Src1 := t1;  // array base address
+                instr.Src2 := t2;  // index
+                instr.LabelName := '';  // Clear any residual label
+                Emit(instr);
+                Result := t0;
 
-               if arrLen > 0 then
-               begin
-                 instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
-                 msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
-                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
-                 codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
-                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
-               end;
+                if arrLen > 0 then
+                begin
+                  instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+                  msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+                  instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+                  codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+                  instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+                end;
                Exit;
             end;
           end;
@@ -3423,33 +3437,37 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
    if stmt is TAstVarDecl then
    begin
      vd := TAstVarDecl(stmt);
-     // If ArrayLen not set but InitExpr is an array literal, infer the length
-     arrLen := vd.ArrayLen;
-     if (arrLen = 0) and (vd.InitExpr is TAstArrayLit) then
-       arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
-     // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
-     if (arrLen = -1) or (vd.DeclType = atDynArray) then
-     begin
-        // dynamic array: allocate 3 slots (ptr, len, cap)
-        // IMPORTANT: Store elements in REVERSE order so that arr[0] has the 
-        // highest slot index. This way, base_addr + index*8 works correctly
-        // because stack grows downward.
-        loc := AllocLocalMany(vd.Name, vd.DeclType, 3);  // 3 slots for dynamic array: ptr, len, cap
-        if vd.InitExpr is TAstArrayLit then
-        begin
-          items := TAstArrayLit(vd.InitExpr).Items;
-          if Length(items) <> arrLen then
-            FDiag.Error('array literal length mismatch', vd.Span)
-          else
+      // If ArrayLen not set but InitExpr is an array literal, infer the length
+      arrLen := vd.ArrayLen;
+      if (vd.InitExpr is TAstArrayLit) then
+        arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
+      // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
+      if (arrLen = -1) or (vd.DeclType = atDynArray) then
+      begin
+          // Local array literal: allocate slots for elements only (no fat-pointer).
+          // Store elements in REVERSE order so that arr[0] is at highest address.
+          // This way, baseSlot + index*8 correctly addresses all elements.
+          // Mark as NOT dynamic array - elements are stored inline.
+          loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
+          // Record array length for bounds checking
+          SetLength(FLocalArrayLen, loc + arrLen);
+          for i := 0 to arrLen - 1 do
+            FLocalArrayLen[loc + i] := arrLen;
+           if vd.InitExpr is TAstArrayLit then
           begin
-            for i := 0 to High(items) do
+            items := TAstArrayLit(vd.InitExpr).Items;
+            if Length(items) <> arrLen then
+              FDiag.Error('array literal length mismatch', vd.Span)
+            else
             begin
-              tmp := LowerExpr(items[i]);
-              // store into reversed slot: arr[0] -> highest slot, arr[n-1] -> lowest slot
-              instr.Op := irStoreLocal; instr.Dest := loc + (arrLen - 1 - i); instr.Src1 := tmp; Emit(instr);
+              for i := 0 to High(items) do
+              begin
+                tmp := LowerExpr(items[i]);
+                // store in REVERSE order: arr[0] at highest slot (loc + arrLen - 1 - i)
+                instr.Op := irStoreLocal; instr.Dest := loc + (arrLen - 1 - i); instr.Src1 := tmp; Emit(instr);
+              end;
             end;
-          end;
-        end
+          end
         else
         begin
           // initializer not an array literal: try to lower single expression into first element
