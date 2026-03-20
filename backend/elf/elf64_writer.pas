@@ -211,9 +211,16 @@ begin
     phdr.WriteU64LE(baseVA + codeOffset);
     phdr.WriteU64LE(baseVA + codeOffset);
 
-    filesz := AlignUp(codeSize, pageSize) + dataSize;
-    memsz := AlignUp(codeSize + dataSize, pageSize);
-    if memsz < filesz then memsz := filesz;
+    // filesz must cover from codeOffset to end of file (after alignment)
+    // The file contains: headers + padding + code + padding + data
+    // We need to ensure the entire data section is included
+    filesz := dataOffset - codeOffset + dataSize;
+    // Align to page size
+    filesz := AlignUp(filesz, pageSize);
+    // Ensure at least one full page after code
+    if filesz < pageSize then
+      filesz := pageSize;
+    memsz := filesz;
 
     phdr.WriteU64LE(filesz);
     phdr.WriteU64LE(memsz);

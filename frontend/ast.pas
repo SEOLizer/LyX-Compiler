@@ -220,10 +220,12 @@ type
   TAstArrayLit = class(TAstExpr)
   private
     FItems: TAstExprList;
+    FElemType: TAurumType;  // inferred element type
   public
     constructor Create(const aItems: TAstExprList; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Items: TAstExprList read FItems;
+    property ElemType: TAurumType read FElemType write FElemType;
   end;
 
   { Map-Literal: {key: value, key: value, ...} }
@@ -1325,6 +1327,7 @@ end;
 begin
   inherited Create(nkArrayLit, aSpan);
   FItems := aItems;
+  FElemType := atUnresolved;  // Will be set during semantic analysis
 end;
 
 destructor TAstArrayLit.Destroy;
