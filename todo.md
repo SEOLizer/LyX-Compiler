@@ -26,9 +26,7 @@
 
 ### Sprache / Frontend
 
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Niedrig | **Nested Functions** | Interne Helper könnten als nested functions definiert werden |
+_(keine offenen Aufgaben)_
 
 ### Tech Debts
 
@@ -57,6 +55,13 @@
 - [x] **PLT-Stubs** - PLT0 (16B) + PLTn (16B/Symbol) am Ende des Code-Buffers generiert
 - [x] **Call-Via-PLT** - Externe Calls generieren call @plt_SymName, Labels vor Patching registriert
 - [x] **extern fn strlen** - Funktionalität verifiziert: strlen("Hello") = 5, strlen("Hello Dynamic!") = 14
+
+### Nested Functions (März 2026)
+
+- [x] **Parser** - `fn` in ParseStmt erkannt, erzeugt TAstFuncStmt Wrapper
+- [x] **AST** - TAstFuncStmt (TAstFuncDecl als TAstStmt), Forward-Deklaration für TAstFuncDecl
+- [x] **Sema** - Name im Scope registriert für Call-Resolution
+- [x] **Lower** - LowerNestedFunc: Context save/restore, separate TIRFunction
 
 ### ARM64 VMT Support (März 2026)
 
@@ -126,6 +131,7 @@
 - PLT/GOT Dynamic Linking (extern fn → PLT-Stubs → libc.so.6)
 - cmExternal Call-Routing über PLT
 - ARM64 VMT Support (Virtual Call, ADRP/ADD, VMT-Tabellen)
+- Nested Functions (Lifting-Ansatz, ohne Closures)
 
 ### v0.5.2 (März 2026)
 - SSE2 Float-Codegen für Linux x86_64
