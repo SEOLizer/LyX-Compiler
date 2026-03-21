@@ -333,7 +333,8 @@ begin
   shstrtabBuf := TByteBuffer.Create;
   shstrtabBuf.WriteU8(0); // empty string
   // Section name offsets:
-  // .interp=1, .dynsym=X, .dynstr=Y, .hash=Z, .got.plt=W, .rela.plt=V, .dynamic=U, .shstrtab=T
+  // .text=1, .interp=7, .dynsym=15, .dynstr=23, .hash=31, .got.plt=37, .rela.plt=46, .dynamic=57, .shstrtab=66
+  shstrtabBuf.WriteBytes([Ord('.'), Ord('t'), Ord('e'), Ord('x'), Ord('t'), 0]);
   shstrtabBuf.WriteBytes([Ord('.'), Ord('i'), Ord('n'), Ord('t'), Ord('e'), Ord('r'), Ord('p'), 0]);
   shstrtabBuf.WriteBytes([Ord('.'), Ord('d'), Ord('y'), Ord('n'), Ord('s'), Ord('y'), Ord('m'), 0]);
   shstrtabBuf.WriteBytes([Ord('.'), Ord('d'), Ord('y'), Ord('n'), Ord('s'), Ord('t'), Ord('r'), 0]);
@@ -381,7 +382,6 @@ begin
   // Build ELF header
   elfHeader := TByteBuffer.Create;
   phdrBuf := TByteBuffer.Create;
-  shdrsBuf := TByteBuffer.Create;
   try
     // e_ident
     elfHeader.WriteBytes([$7F, Ord('E'), Ord('L'), Ord('F')]);
@@ -400,9 +400,9 @@ begin
     elfHeader.WriteU32LE(0);
     elfHeader.WriteU16LE(64);
     elfHeader.WriteU16LE(56);
-    elfHeader.WriteU16LE(4);           // e_phnum: PHDR, INTERP, LOAD(RX), LOAD(RW), DYNAMIC
+    elfHeader.WriteU16LE(5);           // e_phnum: PHDR, INTERP, LOAD(RX), LOAD(RW), DYNAMIC
     elfHeader.WriteU16LE(64);          // e_shentsize
-    elfHeader.WriteU16LE(10);          // e_shnum
+    elfHeader.WriteU16LE(11);          // e_shnum (0-10 = 11 sections)
     elfHeader.WriteU16LE(9);           // e_shstrndx (.shstrtab is index 9)
 
     // Program header 0: PT_PHDR
@@ -411,7 +411,7 @@ begin
     phdrBuf.WriteU64LE(64);            // p_offset (after ELF header)
     phdrBuf.WriteU64LE(baseVA + 64);   // p_vaddr
     phdrBuf.WriteU64LE(baseVA + 64);   // p_paddr
-    phdrBuf.WriteU64LE(4 * 56);        // p_filesz (4 phdrs * 56 bytes)
+    phdrBuf.WriteU64LE(5 * 56);        // p_filesz (5 phdrs * 56 bytes)
     phdrBuf.WriteU64LE(4 * 56);        // p_memsz
     phdrBuf.WriteU64LE(8);             // p_align
 
@@ -445,6 +445,19 @@ begin
     phdrBuf.WriteU64LE(AlignUp(shstrtabOffset + shstrtabSize + shdrsSize, pageSize));
     phdrBuf.WriteU64LE(pageSize);
 
+    // Program header 4: PT_DYNAMIC — points to .dynamic section
+    phdrBuf.WriteU32LE(PT_DYNAMIC);
+    phdrBuf.WriteU32LE(4 or 2);        // PF_R | PF_W
+    phdrBuf.WriteU64LE(dynamicOffset);
+    phdrBuf.WriteU64LE(baseVA + dynamicOffset);
+    phdrBuf.WriteU64LE(baseVA + dynamicOffset);
+    phdrBuf.WriteU64LE(dynamicSize);
+    phdrBuf.WriteU64LE(dynamicSize);
+    phdrBuf.WriteU64LE(8);
+
+    // Initialize section header buffer
+    shdrsBuf := TByteBuffer.Create;
+
     // Section Headers
     // 0: NULL
     shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU64LE(0);
@@ -452,57 +465,63 @@ begin
     shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU64LE(0); shdrsBuf.WriteU64LE(0);
 
     // Helper proc for section headers
-    // 1: .interp
-    shdrsBuf.WriteU32LE(1); shdrsBuf.WriteU32LE(SHT_PROGBITS); shdrsBuf.WriteU64LE(SHF_ALLOC);
+    // 1: .text
+    shdrsBuf.WriteU32LE(1); shdrsBuf.WriteU32LE(SHT_PROGBITS); shdrsBuf.WriteU64LE(SHF_ALLOC or SHF_EXECINSTR);
+    shdrsBuf.WriteU64LE(baseVA + codeOffset); shdrsBuf.WriteU64LE(codeOffset);
+    shdrsBuf.WriteU64LE(codeSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
+    shdrsBuf.WriteU64LE(16); shdrsBuf.WriteU64LE(0);
+
+    // 2: .interp
+    shdrsBuf.WriteU32LE(7); shdrsBuf.WriteU32LE(SHT_PROGBITS); shdrsBuf.WriteU64LE(SHF_ALLOC);
     shdrsBuf.WriteU64LE(baseVA + interpOffset); shdrsBuf.WriteU64LE(interpOffset);
     shdrsBuf.WriteU64LE(interpSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
     shdrsBuf.WriteU64LE(1); shdrsBuf.WriteU64LE(0);
 
-    // 2: .dynsym
-    shdrsBuf.WriteU32LE(9); shdrsBuf.WriteU32LE(SHT_DYNSYM); shdrsBuf.WriteU64LE(SHF_ALLOC);
+    // 3: .dynsym
+    shdrsBuf.WriteU32LE(15); shdrsBuf.WriteU32LE(SHT_DYNSYM); shdrsBuf.WriteU64LE(SHF_ALLOC);
     shdrsBuf.WriteU64LE(baseVA + dynsymOffset); shdrsBuf.WriteU64LE(dynsymOffset);
-    shdrsBuf.WriteU64LE(dynsymSize); shdrsBuf.WriteU32LE(3); // sh_link = .dynstr
+    shdrsBuf.WriteU64LE(dynsymSize); shdrsBuf.WriteU32LE(4); // sh_link = .dynstr (index 4)
     shdrsBuf.WriteU32LE(1); // sh_info = 1 (first global symbol)
     shdrsBuf.WriteU64LE(8); shdrsBuf.WriteU64LE(24); // sh_entsize = 24
 
-    // 3: .dynstr
-    shdrsBuf.WriteU32LE(17); shdrsBuf.WriteU32LE(SHT_STRTAB); shdrsBuf.WriteU64LE(SHF_ALLOC);
+    // 4: .dynstr
+    shdrsBuf.WriteU32LE(23); shdrsBuf.WriteU32LE(SHT_STRTAB); shdrsBuf.WriteU64LE(SHF_ALLOC);
     shdrsBuf.WriteU64LE(baseVA + dynstrOffset); shdrsBuf.WriteU64LE(dynstrOffset);
     shdrsBuf.WriteU64LE(dynstrSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
     shdrsBuf.WriteU64LE(1); shdrsBuf.WriteU64LE(0);
 
-    // 4: .hash
-    shdrsBuf.WriteU32LE(25); shdrsBuf.WriteU32LE(SHT_HASH); shdrsBuf.WriteU64LE(SHF_ALLOC);
+    // 5: .hash
+    shdrsBuf.WriteU32LE(31); shdrsBuf.WriteU32LE(SHT_HASH); shdrsBuf.WriteU64LE(SHF_ALLOC);
     shdrsBuf.WriteU64LE(baseVA + hashOffset); shdrsBuf.WriteU64LE(hashOffset);
-    shdrsBuf.WriteU64LE(hashSize); shdrsBuf.WriteU32LE(2); // sh_link = .dynsym
+    shdrsBuf.WriteU64LE(hashSize); shdrsBuf.WriteU32LE(3); // sh_link = .dynsym (index 3)
     shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU64LE(4); shdrsBuf.WriteU64LE(4);
 
-    // 5: .got.plt
-    shdrsBuf.WriteU32LE(31); shdrsBuf.WriteU32LE(SHT_PROGBITS); shdrsBuf.WriteU64LE(SHF_ALLOC or SHF_WRITE);
+    // 6: .got.plt
+    shdrsBuf.WriteU32LE(37); shdrsBuf.WriteU32LE(SHT_PROGBITS); shdrsBuf.WriteU64LE(SHF_ALLOC or SHF_WRITE);
     shdrsBuf.WriteU64LE(baseVA + gotOffset); shdrsBuf.WriteU64LE(gotOffset);
     shdrsBuf.WriteU64LE(gotSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
     shdrsBuf.WriteU64LE(8); shdrsBuf.WriteU64LE(8);
 
-    // 6: .rela.plt
-    shdrsBuf.WriteU32LE(40); shdrsBuf.WriteU32LE(SHT_RELA); shdrsBuf.WriteU64LE(SHF_ALLOC);
+    // 7: .rela.plt
+    shdrsBuf.WriteU32LE(46); shdrsBuf.WriteU32LE(SHT_RELA); shdrsBuf.WriteU64LE(SHF_ALLOC);
     shdrsBuf.WriteU64LE(baseVA + relaOffset); shdrsBuf.WriteU64LE(relaOffset);
-    shdrsBuf.WriteU64LE(relaSize); shdrsBuf.WriteU32LE(2); // sh_link = .dynsym
+    shdrsBuf.WriteU64LE(relaSize); shdrsBuf.WriteU32LE(3); // sh_link = .dynsym (index 3)
     shdrsBuf.WriteU32LE(symCount); // sh_info
     shdrsBuf.WriteU64LE(8); shdrsBuf.WriteU64LE(24); // sh_entsize = 24
 
-    // 7: .dynamic
-    shdrsBuf.WriteU32LE(50); shdrsBuf.WriteU32LE(SHT_DYNAMIC); shdrsBuf.WriteU64LE(SHF_ALLOC or SHF_WRITE);
+    // 8: .dynamic
+    shdrsBuf.WriteU32LE(57); shdrsBuf.WriteU32LE(SHT_DYNAMIC); shdrsBuf.WriteU64LE(SHF_ALLOC or SHF_WRITE);
     shdrsBuf.WriteU64LE(baseVA + dynamicOffset); shdrsBuf.WriteU64LE(dynamicOffset);
-    shdrsBuf.WriteU64LE(dynamicSize); shdrsBuf.WriteU32LE(3); // sh_link = .dynstr
+    shdrsBuf.WriteU64LE(dynamicSize); shdrsBuf.WriteU32LE(4); // sh_link = .dynstr (index 4)
     shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU64LE(8); shdrsBuf.WriteU64LE(16);
 
-    // 8: .shstrtab
-    shdrsBuf.WriteU32LE(59); shdrsBuf.WriteU32LE(SHT_STRTAB); shdrsBuf.WriteU64LE(0);
+    // 9: .shstrtab
+    shdrsBuf.WriteU32LE(66); shdrsBuf.WriteU32LE(SHT_STRTAB); shdrsBuf.WriteU64LE(0);
     shdrsBuf.WriteU64LE(0); shdrsBuf.WriteU64LE(shstrtabOffset);
     shdrsBuf.WriteU64LE(shstrtabSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
     shdrsBuf.WriteU64LE(1); shdrsBuf.WriteU64LE(0);
 
-    // 9: NULL (shstrtab placeholder — actually the index for .shstrtab name)
+    // 10: NULL
     // No, index 9 is the last entry. Actually we need 10 entries: 0-9.
     // We already wrote 9 entries (0-8). Let's add one more NULL for safety.
     shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU64LE(0);
