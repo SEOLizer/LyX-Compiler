@@ -1479,10 +1479,72 @@ begin
              EmitRex(FCode, 1, 0, 0, 0);
              EmitU8(FCode, $F7);
              EmitU8(FCode, $D8);  // neg rax
-             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
-           end;
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
 
-         irBitAnd:
+          // === Logische / Bool-Operationen ===
+          irNot:
+            begin
+              // dest = !src1 (boolean not)
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              // test rax, rax
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $85); EmitU8(FCode, $C0);
+              // sete al
+              EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0);
+              // movzx rax, al
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+          irAnd:
+            begin
+              // dest = src1 & src2
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // and rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $21); EmitU8(FCode, $C8);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+          irOr:
+            begin
+              // dest = src1 | src2
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // or rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $09); EmitU8(FCode, $C8);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+          irNor:
+            begin
+              // dest = !(src1 | src2)
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // or rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $09); EmitU8(FCode, $C8);
+              // test rax, rax
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $85); EmitU8(FCode, $C0);
+              // sete al
+              EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0);
+              // movzx rax, al
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+          irXor:
+            begin
+              // dest = src1 ^ src2
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovMemReg(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // xor rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $31); EmitU8(FCode, $C8);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
+
+          irBitAnd:
            begin
              // dest = src1 & src2 (bitwise AND)
              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
