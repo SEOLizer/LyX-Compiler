@@ -92,6 +92,7 @@ type
     function GetFunctionOffset(const name: string): Integer;
     function GetExternalSymbols: TExternalSymbolArray;
     function GetPLTGOTPatches: TPLTGOTPatchArray;
+    function AddExternalSymbol(const name, libName: string): Integer;
     function GetEnergyStats: TEnergyStats;
     procedure SetEnergyLevel(level: TEnergyLevel);
   end;
@@ -540,6 +541,23 @@ begin
   SetLength(Result, Length(FPLTGOTPatches));
   if Length(FPLTGOTPatches) > 0 then
     Move(FPLTGOTPatches[0], Result[0], Length(FPLTGOTPatches) * SizeOf(TPLTGOTPatch));
+end;
+
+function TX86_64Emitter.AddExternalSymbol(const name, libName: string): Integer;
+var
+  i: Integer;
+begin
+  // Check if already registered
+  for i := 0 to High(FExternalSymbols) do
+  begin
+    if FExternalSymbols[i].Name = name then
+      Exit(i);
+  end;
+  // Add new symbol
+  Result := Length(FExternalSymbols);
+  SetLength(FExternalSymbols, Result + 1);
+  FExternalSymbols[Result].Name := name;
+  FExternalSymbols[Result].LibraryName := libName;
 end;
 
 function TX86_64Emitter.GetEnergyStats: TEnergyStats;
@@ -3110,16 +3128,31 @@ begin
                 EmitU8(FCode, $FF);
                 EmitU8(FCode, $D0);  // call rax
               end
-             else
-             begin
-               // Regular call: emit call rel32 with placeholder for patching
-               SetLength(FJumpPatches, Length(FJumpPatches) + 1);
-               FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;  // Position after E8 opcode
-               FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
-               FJumpPatches[High(FJumpPatches)].JmpSize := 4;
-               EmitU8(FCode, $E8);  // call rel32
-               EmitU32(FCode, 0);   // placeholder
-             end;
+              else
+              begin
+                // External call via PLT: register symbol and call PLT stub
+                if instr.CallMode = cmExternal then
+                begin
+                  AddExternalSymbol(instr.ImmStr, 'libc.so.6');
+                  // call rel32 to PLT stub (@plt_SymbolName)
+                  SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+                  FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+                  FJumpPatches[High(FJumpPatches)].LabelName := '@plt_' + instr.ImmStr;
+                  FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+                  EmitU8(FCode, $E8);  // call rel32
+                  EmitU32(FCode, 0);   // placeholder
+                end
+                else
+                begin
+                  // Regular internal call: emit call rel32 with placeholder
+                  SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+                  FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+                  FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
+                  FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+                  EmitU8(FCode, $E8);  // call rel32
+                  EmitU32(FCode, 0);   // placeholder
+                end;
+              end;
              
              // Clean up stack args if any were pushed
              if stackArgsCount > 0 then
@@ -3985,6 +4018,42 @@ begin
     end;
   end;
   
+  // ================================================================
+  // PLT-Stubs für externe Symbole generieren (VOR dem Patching!)
+  // ================================================================
+  if Length(FExternalSymbols) > 0 then
+  begin
+    // PLT0 (Default Stub, 16 Bytes):
+    SetLength(FPLTGOTPatches, Length(FExternalSymbols));
+    mainPos := FCode.Size; // PLT0 start
+    EmitU8(FCode, $FF); EmitU8(FCode, $35); EmitU32(FCode, 0);  // push qword [rip+0]
+    EmitU8(FCode, $FF); EmitU8(FCode, $25); EmitU32(FCode, 0);  // jmp qword [rip+0]
+    EmitU8(FCode, $90); EmitU8(FCode, $90); EmitU8(FCode, $90); EmitU8(FCode, $90); // nop
+
+    // PLTn Stubs (je 16 Bytes pro Symbol):
+    for i := 0 to High(FExternalSymbols) do
+    begin
+      FPLTGOTPatches[i].Pos := FCode.Size;
+      FPLTGOTPatches[i].SymbolIndex := i;
+      FPLTGOTPatches[i].SymbolName := FExternalSymbols[i].Name;
+
+      // jmp qword [rip+disp32] — placeholder
+      EmitU8(FCode, $FF); EmitU8(FCode, $25); EmitU32(FCode, 0);
+
+      // push imm32 (Symbol-Index)
+      EmitU8(FCode, $68); EmitU32(FCode, Cardinal(i));
+
+      // jmp rel32 zu PLT0
+      offset := mainPos - (FCode.Size + 5);
+      EmitU8(FCode, $E9); EmitU32(FCode, Cardinal(offset));
+
+      // Label registrieren, damit Calls den PLT-Stub finden
+      SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+      FLabelPositions[High(FLabelPositions)].Name := '@plt_' + FExternalSymbols[i].Name;
+      FLabelPositions[High(FLabelPositions)].Pos := FPLTGOTPatches[i].Pos;
+    end;
+  end;
+
   // FJumpPatches auflösen
   for i := 0 to High(FJumpPatches) do
   begin
@@ -4250,9 +4319,9 @@ begin
       // So: disp32 = vmtDataPos - (leaCodePos + 7)
       offset := vmtDataPos - (leaCodePos + 7);
       FCode.PatchU32LE(leaCodePos + 3, Cardinal(offset));
-    end;
+     end;
   end;
-     
+
    // Code-Größe für Energy-Stats aktualisieren
   FEnergyStats.CodeSizeBytes := FCode.Size;
   
