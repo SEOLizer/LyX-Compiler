@@ -16,7 +16,7 @@
 |-----------|------|--------------|
 | Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
 | Niedrig | **macOS Dynamic Linking** | PLT/GOT für Mach-O implementieren |
-| Mittel | **ARM64 PLT-Stub Fix** | PLT-Offset-Berechnung oder GOT-Initialisierung in arm64_emit.pas korrigieren (SIGBUS beim Ausführen) |
+| Mittel | **ARM64 PLT/GOT Implementation** | X16 muss GOT_BASE beim PLT-Aufruf enthalten - Startup-Code oder PLT-Restrukturierung nötig |
 
 ### Backend
 
