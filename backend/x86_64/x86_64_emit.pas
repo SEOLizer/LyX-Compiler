@@ -105,7 +105,14 @@ const
   // Register-Konstanten
   RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7;
   R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
+  XMM0 = 0; XMM1 = 1; XMM2 = 2; XMM3 = 3;
   ParamRegs: array[0..5] of Byte = (RDI, RSI, RDX, RCX, R8, R9);
+
+  // ELF static layout constants (must match elf64_writer.pas)
+  ELF_PAGE_SIZE = 4096;
+  ELF_BASE_VA = $400000;
+  ELF_CODE_OFFSET = ELF_PAGE_SIZE;  // 0x1000
+  ELF_DATA_OFFSET = ELF_CODE_OFFSET + ELF_PAGE_SIZE;  // 0x2000
 
   // macOS Syscall-Nummern (BSD-Layer, 0x2000000 Prefix)
   SYS_MACOS_EXIT    = $2000001;  // sys_exit
@@ -322,6 +329,100 @@ begin
   EmitU8(buf, $8B);
   EmitU8(buf, $85 or (baseReg and $7));
   EmitU32(buf, Cardinal(disp32));
+end;
+
+// === SSE2 Float-Hilfsfunktionen ===
+
+// movsd xmm, [base+disp32]
+procedure WriteMovsdLoad(buf: TByteBuffer; xmm, base: Byte; disp: Integer);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $10);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// movsd [base+disp32], xmm
+procedure WriteMovsdStore(buf: TByteBuffer; base: Byte; disp: Integer; xmm: Byte);
+var modBits: Byte;
+begin
+  EmitU8(buf, $F2);
+  if ((xmm shr 3) <> 0) or ((base shr 3) <> 0) then
+    EmitU8(buf, $40 or ((xmm shr 3) and 1) shl 2 or ((base shr 3) and 1));
+  EmitU8(buf, $0F); EmitU8(buf, $11);
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, modBits or ((xmm and 7) shl 3) or (base and 7));
+  if (base and 7) = 4 then EmitU8(buf, $24);
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// addsd xmm0, xmm1
+procedure WriteAddsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $58);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// subsd xmm0, xmm1
+procedure WriteSubsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5C);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// mulsd xmm0, xmm1
+procedure WriteMulsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $59);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// divsd xmm0, xmm1
+procedure WriteDivsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $5E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// xorpd xmm, xmm
+procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $57);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// ucomisd xmm0, xmm1
+procedure WriteUcomisd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $2E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// cvtsi2sd xmm, r64
+procedure WriteCvtsi2sd(buf: TByteBuffer; xmm, gpr: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (xmm shr 3) and 1, 0, (gpr shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2A);
+  EmitU8(buf, $C0 or ((xmm and 7) shl 3) or (gpr and 7));
+end;
+
+// cvttsd2si r64, xmm
+procedure WriteCvttsd2si(buf: TByteBuffer; gpr, xmm: Byte);
+begin
+  EmitU8(buf, $F2);
+  EmitRex(buf, 1, (gpr shr 3) and 1, 0, (xmm shr 3) and 1);
+  EmitU8(buf, $0F); EmitU8(buf, $2C);
+  EmitU8(buf, $C0 or ((gpr and 7) shl 3) or (xmm and 7));
 end;
 
 function SlotOffset(slot: Integer): Integer;
@@ -547,6 +648,7 @@ var
   // Global variable tracking
   globalVarNames: TStringList;
   globalVarOffsets: array of Integer;
+  globalVarDataOffsets: array of Integer;  // Original data section offsets
   totalDataOffset: Integer;
   varIdx: Integer;
   leaPos: Integer;
@@ -570,20 +672,14 @@ begin
   globalVarNames := TStringList.Create;
   try
   // Minimale Implementierung für grundlegende IR-Generierung
-  // Diese muss für volle Funktionalität erheblich erweitert werden
-  
-  // Strings in den Data-Buffer schreiben
-  for i := 0 to module.Strings.Count - 1 do
-  begin
-    SetLength(FStringOffsets, Length(FStringOffsets) + 1);
-    FStringOffsets[High(FStringOffsets)] := FData.Size;
-    for k := 1 to Length(module.Strings[i]) do
-      FData.WriteU8(Ord(module.Strings[i][k]));
-    FData.WriteU8(0);  // Null-Terminator
-  end;
-  
-  // Initialize global variable offset tracking (after strings in data section)
-  totalDataOffset := FData.Size;
+  // Strings und Globals werden später am Ende des Code-Buffers geschrieben
+  // (siehe PatchGlobalData) - dies ermöglicht RIP-relative Adressierung
+   
+  // Initialize global variable offset tracking
+  SetLength(globalVarOffsets, Length(module.GlobalVars));
+  for i := 0 to High(module.GlobalVars) do
+    globalVarNames.Add(module.GlobalVars[i].Name);
+  totalDataOffset := 0;
   
   // _start Label registrieren (Einstiegspunkt)
   SetLength(FLabelPositions, Length(FLabelPositions) + 1);
@@ -971,16 +1067,21 @@ begin
                 end
                 else
                 begin
-                  // Regular global variable
-                  varIdx := globalVarNames.IndexOf(instr.ImmStr);
+                  // Regular global variable - find index in module.GlobalVars
+                  varIdx := -1;
+                  for k := 0 to High(module.GlobalVars) do
+                  begin
+                    if module.GlobalVars[k].Name = instr.ImmStr then
+                    begin
+                      varIdx := k;
+                      Break;
+                    end;
+                  end;
                   if varIdx < 0 then
                   begin
-                    varIdx := globalVarNames.Count;
-                    globalVarNames.Add(instr.ImmStr);
-                    SetLength(globalVarOffsets, varIdx + 1);
-                    globalVarOffsets[varIdx] := totalDataOffset;
-                    FData.WriteU64LE(0);
-                    Inc(totalDataOffset, 8);
+                    // Global variable not found in module - this shouldn't happen
+                    // Create placeholder
+                    varIdx := Length(module.GlobalVars);
                   end;
                   // lea rax, [rip+disp32] ; will be patched later - loads ADDRESS directly
                   leaPos := FCode.Size;
@@ -1056,11 +1157,98 @@ begin
             begin
                // Load immediate integer into temp slot
                slotIdx := fn.LocalCount + instr.Dest;
-               WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));
-               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-             end;
+                WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));
+                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+              end;
 
-          irSExt:
+          irConstFloat:
+            begin
+              // Float-Konstante als Bit-Pattern in den Slot schreiben
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovRegImm64(FCode, RAX, PUInt64(@instr.ImmFloat)^);
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          // === SSE2 Float-Arithmetik ===
+          irFAdd:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              WriteAddsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFSub:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              WriteSubsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFMul:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              WriteMulsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFDiv:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              WriteDivsd(FCode, XMM0, XMM1);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+          irFNeg:
+            begin
+              // FNeg: Toggle Sign-Bit (Bit 63)
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $BA);
+              EmitU8(FCode, $F8); EmitU8(FCode, 63); // btc rax, 63
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          // === SSE2 Float-Vergleiche ===
+          irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovsdLoad(FCode, XMM1, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              WriteUcomisd(FCode, XMM0, XMM1);
+              case instr.Op of
+                irFCmpEq:  begin EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); end;
+                irFCmpNeq: begin EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); end;
+                irFCmpLt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $92); EmitU8(FCode, $C0); end;
+                irFCmpLe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $96); EmitU8(FCode, $C0); end;
+                irFCmpGt:  begin EmitU8(FCode, $0F); EmitU8(FCode, $97); EmitU8(FCode, $C0); end;
+                irFCmpGe:  begin EmitU8(FCode, $0F); EmitU8(FCode, $93); EmitU8(FCode, $C0); end;
+              end;
+              // movzx rax, al
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+
+          // === Float <-> Integer Konvertierung ===
+          irFToI:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteCvttsd2si(FCode, RAX, XMM0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+            end;
+          irIToF:
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteCvtsi2sd(FCode, XMM0, RAX);
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
+
+           irSExt:
             begin
               // Sign-extend src1 (width in ImmInt) into dest
               // Load source value and sign-extend to 64 bits
@@ -1190,31 +1378,30 @@ begin
               WriteSyscall(FCode);
             end;
             
-          irConstStr:
-           begin
-              // Load string address into temp slot
-              // ImmStr contains the string index as string
-              slotIdx := fn.LocalCount + instr.Dest;
-              arg3 := StrToIntDef(instr.ImmStr, -1);
-              if (arg3 >= 0) and (arg3 <= High(FStringOffsets)) then
-              begin
-                // Save position for later patching by ELF writer
-                // The ELF writer will calculate the actual address based on layout
-                SetLength(FLeaPositions, Length(FLeaPositions) + 1);
-                SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
-                FLeaPositions[High(FLeaPositions)] := FCode.Size + 3;  // Position of disp32
-                FLeaStrIndex[High(FLeaStrIndex)] := arg3;
-                
-                // lea rax, [rip + displacement] - placeholder
-                // Format: REX.W(48) 8D 05 [disp32]
-                EmitRex(FCode, 1, 0, 0, 0);  // REX.W prefix
-                EmitU8(FCode, $8D);          // LEA opcode
-                EmitU8(FCode, $05);          // ModR/M: rax, [rip + disp32]
-                EmitU32(FCode, 0);           // placeholder for displacement (will be patched)
-                
-                WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-              end;
-           end;
+           irConstStr:
+            begin
+               // Load string address into temp slot
+               // ImmStr contains the string index as string
+               slotIdx := fn.LocalCount + instr.Dest;
+               arg3 := StrToIntDef(instr.ImmStr, -1);
+               if (arg3 >= 0) then
+               begin
+                 // Save position for later patching (FStringOffsets filled in PatchGlobalData)
+                 SetLength(FLeaPositions, Length(FLeaPositions) + 1);
+                 SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
+                 FLeaPositions[High(FLeaPositions)] := FCode.Size + 3;  // Position of disp32
+                 FLeaStrIndex[High(FLeaStrIndex)] := arg3;
+                 
+                 // lea rax, [rip + displacement] - placeholder
+                 // Format: REX.W(48) 8D 05 [disp32]
+                 EmitRex(FCode, 1, 0, 0, 0);  // REX.W prefix
+                 EmitU8(FCode, $8D);          // LEA opcode
+                 EmitU8(FCode, $05);          // ModR/M: rax, [rip + disp32]
+                 EmitU32(FCode, 0);           // placeholder for displacement (will be patched)
+                 
+                 WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+               end;
+            end;
            
          irAdd:
            begin
@@ -3187,10 +3374,10 @@ begin
            end;
             
           irLabel:
-           begin
-             // Record label position for branch patching
-             FBranchLabels.AddObject(instr.LabelName, TObject(PtrInt(FCode.Size)));
-           end;
+            begin
+              // Record label position for branch patching
+              FBranchLabels.AddObject(instr.LabelName, TObject(PtrInt(FCode.Size)));
+            end;
            
          irJmp:
            begin
@@ -3203,24 +3390,26 @@ begin
              EmitU32(FCode, 0);   // placeholder
            end;
            
-         irBrTrue:
-           begin
-             // Jump to label if Src1 != 0
-             slotIdx := fn.LocalCount + instr.Src1;
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
-             // test rax, rax
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $85);
-             EmitU8(FCode, $C0);
-             // jne rel32
-             SetLength(FBranchPatches, Length(FBranchPatches) + 1);
-             FBranchPatches[High(FBranchPatches)].Pos := FCode.Size + 2;  // Position after 0F 85
-             FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
-             FBranchPatches[High(FBranchPatches)].JmpSize := 4;
-             EmitU8(FCode, $0F);
-             EmitU8(FCode, $85);  // jne rel32
-             EmitU32(FCode, 0);   // placeholder
-           end;
+           irBrTrue:
+             begin
+               // Jump to label if Src1 != 0
+               slotIdx := fn.LocalCount + instr.Src1;
+               WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+               
+               // test rax, rax
+               EmitRex(FCode, 1, 0, 0, 0);
+               EmitU8(FCode, $85);
+               EmitU8(FCode, $C0);
+               
+               // jne rel32 (this will be patched later)
+               SetLength(FBranchPatches, Length(FBranchPatches) + 1);
+               FBranchPatches[High(FBranchPatches)].Pos := FCode.Size + 2;  // Position after 0F 85
+               FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
+               FBranchPatches[High(FBranchPatches)].JmpSize := 4;
+               EmitU8(FCode, $0F);
+               EmitU8(FCode, $85);  // jne rel32
+               EmitU32(FCode, 0);   // placeholder
+             end;
            
          irBrFalse:
            begin
@@ -3346,135 +3535,153 @@ begin
              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
            end;
            
-         irCmpGe:
-           begin
-             // dest = (src1 >= src2) ? 1 : 0 (signed)
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
-             // cmp rax, rcx
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $39);
-             EmitU8(FCode, $C8);
-             // setge al (greater than or equal, signed)
-             EmitU8(FCode, $0F);
-             EmitU8(FCode, $9D);
-             EmitU8(FCode, $C0);
-             // movzx rax, al
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $0F);
-             EmitU8(FCode, $B6);
-             EmitU8(FCode, $C0);
-             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
-           end;
+          irCmpGe:
+            begin
+              // dest = (src1 >= src2) ? 1 : 0 (signed)
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // cmp rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $39);
+              EmitU8(FCode, $C8);
+              // setge al (greater than or equal, signed)
+              EmitU8(FCode, $0F);
+              EmitU8(FCode, $9D);
+              EmitU8(FCode, $C0);
+              // movzx rax, al
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $0F);
+              EmitU8(FCode, $B6);
+              EmitU8(FCode, $C0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            end;
            
-         irLoadElem:
-           begin
-             // Load element: dest = array[index]
-             // Src1 = array base address temp, Src2 = index temp, Dest = result
-             // For pchar (byte access), we use ImmInt to indicate element size
-             // ImmInt = 1 for byte, 8 for int64
-             
-             // Load array base address into RAX
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-             // Load index into RCX
-             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
-             
-             if instr.ImmInt = 1 then
-             begin
-               // Byte access (pchar): RAX = RAX + RCX, then load byte
-               // add rax, rcx
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $01);
-               EmitU8(FCode, $C8);  // add rax, rcx
-               // movzx rax, byte [rax]
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $0F);
-               EmitU8(FCode, $B6);
-               EmitU8(FCode, $00);  // movzx rax, byte [rax]
-             end
-             else
-             begin
-               // 8-byte access (int64): RAX = RAX + RCX * 8, then load qword
-               // shl rcx, 3  (multiply index by 8)
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $C1);
-               EmitU8(FCode, $E1);
-               EmitU8(FCode, $03);  // shl rcx, 3
-               // add rax, rcx
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $01);
-               EmitU8(FCode, $C8);  // add rax, rcx
-               // mov rax, [rax]
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $8B);
-               EmitU8(FCode, $00);  // mov rax, [rax]
-             end;
-             
-             // Store result in destination temp slot
-             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
-           end;
+          irLoadElem:
+            begin
+              // Load element: dest = array[index]
+              // Src1 = array base address temp, Src2 = index temp, Dest = result
+              // For pchar (byte access), we use ImmInt to indicate element size
+              // ImmInt = 1 for byte, 8 for int64
+              
+              // Save RAX (used for computation) via push
+              EmitU8(FCode, $50);  // push rax
+              
+              // Load array base address into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              // Load index into RCX
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              
+              if instr.ImmInt = 1 then
+              begin
+                // Byte access (pchar): RAX = RAX + RCX, then load byte
+                // add rax, rcx
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $01);
+                EmitU8(FCode, $C8);  // add rax, rcx
+                // movzx rax, byte [rax]
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $0F);
+                EmitU8(FCode, $B6);
+                EmitU8(FCode, $00);  // movzx rax, byte [rax]
+              end
+              else
+              begin
+                // 8-byte access (int64): RAX = RAX + RCX * 8, then load qword
+                // shl rcx, 3  (multiply index by 8)
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $C1);
+                EmitU8(FCode, $E1);
+                EmitU8(FCode, $03);  // shl rcx, 3
+                // add rax, rcx
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $01);
+                EmitU8(FCode, $C8);  // add rax, rcx
+                // mov rax, [rax]
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $8B);
+                EmitU8(FCode, $00);  // mov rax, [rax]
+              end;
+              
+              // Store result in destination temp slot
+              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+              
+              // Restore RAX via pop (discard saved value, RAX now holds result)
+              EmitU8(FCode, $58);  // pop rax
+            end;
            
-         irStoreElem:
-           begin
-             // Store element: array[index] = value
-             // Src1 = array base address temp, Src2 = value temp, ImmInt = static index
-             offset := instr.ImmInt * 8;  // 8 bytes per element
-             
-             // Load array base address into RAX
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-             // Load value into RCX
-             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
-             
-             // Store value at array[index]: mov [rax + offset], rcx
-             if offset = 0 then
-             begin
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $89);
-               EmitU8(FCode, $08);  // mov [rax], rcx
-             end
-             else if (offset >= -128) and (offset <= 127) then
-             begin
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $89);
-               EmitU8(FCode, $48);
-               EmitU8(FCode, Byte(offset));  // mov [rax + disp8], rcx
-             end
-             else
-             begin
-               EmitRex(FCode, 1, 0, 0, 0);
-               EmitU8(FCode, $89);
-               EmitU8(FCode, $88);
-               EmitU32(FCode, Cardinal(offset));  // mov [rax + disp32], rcx
-             end;
-           end;
+          irStoreElem:
+            begin
+              // Store element: array[index] = value
+              // Src1 = array base address temp, Src2 = value temp, ImmInt = static index
+              offset := instr.ImmInt * 8;  // 8 bytes per element
+              
+              // Save RAX (used for computation) via push
+              EmitU8(FCode, $50);  // push rax
+              
+              // Load array base address into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              // Load value into RCX
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              
+              // Store value at array[index]: mov [rax + offset], rcx
+              if offset = 0 then
+              begin
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $89);
+                EmitU8(FCode, $08);  // mov [rax], rcx
+              end
+              else if (offset >= -128) and (offset <= 127) then
+              begin
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $89);
+                EmitU8(FCode, $48);
+                EmitU8(FCode, Byte(offset));  // mov [rax + disp8], rcx
+              end
+              else
+              begin
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $89);
+                EmitU8(FCode, $88);
+                EmitU32(FCode, Cardinal(offset));  // mov [rax + disp32], rcx
+              end;
+              
+              // Restore RAX via pop
+              EmitU8(FCode, $58);  // pop rax
+            end;
            
-         irStoreElemDyn:
-           begin
-             // Store element dynamically: array[index] = value
-             // Src1 = array base, Src2 = index, Src3 = value
-             
-             // Load array base address into RAX
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-             // Load index into RCX
-             WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
-             // Load value into RDX
-             WriteMovRegMem(FCode, RDX, RBP, SlotOffset(fn.LocalCount + instr.Src3));
-             
-             // Calculate element address: RAX = RAX + RCX * 8
-             // shl rcx, 3
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $C1);
-             EmitU8(FCode, $E1);
-             EmitU8(FCode, $03);  // shl rcx, 3
-             // add rax, rcx
-             EmitRex(FCode, 1, 0, 0, 0);
-             EmitU8(FCode, $01);
-             EmitU8(FCode, $C8);  // add rax, rcx
-             
+          irStoreElemDyn:
+            begin
+              // Store element dynamically: array[index] = value
+              // Src1 = array base, Src2 = index, Src3 = value
+              
+              // Save RAX (used for computation) via push
+              EmitU8(FCode, $50);  // push rax
+              
+              // Load array base address into RAX
+              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              // Load index into RCX
+              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+              // Load value into RDX
+              WriteMovRegMem(FCode, RDX, RBP, SlotOffset(fn.LocalCount + instr.Src3));
+              
+              // Calculate element address: RAX = RAX + RCX * 8
+              // shl rcx, 3
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $C1);
+              EmitU8(FCode, $E1);
+              EmitU8(FCode, $03);  // shl rcx, 3
+              // add rax, rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $01);
+              EmitU8(FCode, $C8);  // add rax, rcx
+              
               // Store value: mov [rax], rdx
               EmitRex(FCode, 1, 0, 0, 0);
               EmitU8(FCode, $89);
               EmitU8(FCode, $10);  // mov [rax], rdx
+              
+              // Restore RAX via pop
+              EmitU8(FCode, $58);  // pop rax
             end;
 
           irLoadField:
@@ -3701,7 +3908,8 @@ begin
                 end;
               end;
             end;
-       end;
+
+        end;
     end;
     
     // Sicherstellen, dass die Funktion einen Return hat
@@ -3780,11 +3988,8 @@ begin
   // This is placed AFTER all functions so the VMT entries can be
   // patched with the actual function addresses.
   // ================================================================
-  WriteLn(StdErr, '[DEBUG-VMT-GEN] module.ClassDecls count: ', Length(module.ClassDecls));
-  WriteLn(StdErr, '[DEBUG-VMT-GEN] Code size before VMT generation: ', FCode.Size);
   for i := 0 to High(module.ClassDecls) do
   begin
-    WriteLn(StdErr, '[DEBUG-VMT-GEN] Class ', i, ': ', module.ClassDecls[i].Name, ', VirtualMethods: ', Length(module.ClassDecls[i].VirtualMethods));
     if Length(module.ClassDecls[i].VirtualMethods) = 0 then
       Continue;  // Only classes with virtual methods need a VMT
     
@@ -3796,19 +4001,16 @@ begin
     // Methoden-Pointer in VMT schreiben
     for j := 0 to High(module.ClassDecls[i].VirtualMethods) do
     begin
-      WriteLn(StdErr, '[DEBUG-VMT-GEN] Writing VMT entry ', j, ' for class ', i);
       // Check if this method has a body (is implemented)
       // TObject's methods (Destroy, Free, ClassName, InheritsFrom) have no body
       method := module.ClassDecls[i].VirtualMethods[j];
       if Assigned(method) and Assigned(method.Body) and (Length(method.Body.Stmts) > 0) then
       begin
-        WriteLn(StdErr, '[DEBUG-VMT-GEN] Method has body, writing 0 placeholder');
         // Method has a body - place placeholder for patching
         FCode.WriteU64LE(0);
       end
       else
       begin
-        WriteLn(StdErr, '[DEBUG-VMT-GEN] Method has NO body, writing FFFFFFFF');
         // Method has no body (e.g., TObject's built-in methods) - use a dummy address
         // We'll patch this later with a "not implemented" function or leave as 0
         // For now, write a marker that we'll fix in the patching phase
@@ -3823,8 +4025,6 @@ begin
     end;
   end;
   
-  WriteLn(StdErr, '[DEBUG] Code size after VMT generation: ', FCode.Size);
-  
   // String LEA patches: Calculate RIP-relative offsets
   // The strings are in the data section, which follows the code section
   // For a static ELF: Data starts at codeOffset + alignUp(codeSize, pageSize)
@@ -3836,19 +4036,13 @@ begin
   // Alternative: Store string data positions and let ELF writer handle patching
   // For now, we embed strings in code section (less elegant but works)
   
-  if Length(FLeaPositions) > 0 then
+  // Write strings to end of code buffer
+  if module.Strings.Count > 0 then
   begin
-    // Record current code size (where strings will start)
-    mainPos := FCode.Size;
-    
-    // Copy strings from FData to end of FCode
-    for i := 0 to High(FStringOffsets) do
-    begin
-      // Update FStringOffsets to point to code buffer position
-      FStringOffsets[i] := FCode.Size;
-    end;
-    
-    // Re-copy strings (they were already written to FData, now copy to FCode)
+    // Initialize FStringOffsets array
+    SetLength(FStringOffsets, module.Strings.Count);
+     
+    // Write all strings to code buffer
     for i := 0 to module.Strings.Count - 1 do
     begin
       FStringOffsets[i] := FCode.Size;
@@ -3876,45 +4070,48 @@ begin
   // Global variables are stored after strings in the code section (embedded like strings)
   if Length(FGlobalVarLeaPositions) > 0 then
   begin
-    // First, copy global variables from FData to end of FCode (after strings)
-    // Record where globals start in code section
-    mainPos := FCode.Size;
-    
-    // Update globalVarOffsets to point to code buffer position
-    for i := 0 to globalVarNames.Count - 1 do
+    // Write global variables to end of code buffer
+    for i := 0 to High(module.GlobalVars) do
     begin
       globalVarOffsets[i] := FCode.Size;
-      FCode.WriteU64LE(0);  // Initialize global to 0
+      if module.GlobalVars[i].IsArray then
+      begin
+        // Write array values
+        for k := 0 to module.GlobalVars[i].ArrayLen - 1 do
+          FCode.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[k]));
+      end
+      else
+      begin
+        // Write scalar value
+        if module.GlobalVars[i].HasInitValue then
+          FCode.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+        else
+          FCode.WriteU64LE(0);
+      end;
     end;
     
     // Now patch all global variable LEA instructions
     for i := 0 to High(FGlobalVarLeaPositions) do
     begin
-      // FGlobalVarLeaPositions[i].CodePos points to the start of "lea r, [rip + disp32]"
-      // The disp32 is at CodePos + 3 (after 48 8D 05)
-      // The instruction ends at CodePos + 7
-      // RIP at execution time points to CodePos + 7
-      // So: disp32 = target - (CodePos + 7)
       varIdx := FGlobalVarLeaPositions[i].VarIndex;
       
       if varIdx >= 10000 then
       begin
-        // VMT reference - varIdx is FData offset + 10000
-        // VMT data is NOT copied to code section, it stays in FData
-        // This requires proper ELF section handling - for now, skip VMT patching
-        // TODO: Implement proper VMT patching when data section is properly handled
+        // VMT reference - skip for now
       end
       else if varIdx < 0 then
       begin
         // Function reference - varIdx is -funcOffset - 1
-        // We need to patch with the function's code position
         funcOffset := -varIdx - 1;
+        // RIP-relative: disp32 = funcOffset - (CodePos + 7)
+        // Both offsets are relative to start of code buffer
         offset := funcOffset - (FGlobalVarLeaPositions[i].CodePos + 7);
         FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
       end
-      else if (varIdx >= 0) and (varIdx < globalVarNames.Count) then
+      else if (varIdx >= 0) and (varIdx < Length(module.GlobalVars)) then
       begin
-        // Regular global variable - use code section offset
+        // Regular global variable - data is embedded in code section
+        // RIP-relative: disp32 = targetOffset - (CodePos + 7)
         offset := globalVarOffsets[varIdx] - (FGlobalVarLeaPositions[i].CodePos + 7);
         FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
       end;
@@ -3945,14 +4142,11 @@ begin
 
           // Find function position in FLabelPositions
           funcPos := -1;
-          WriteLn(StdErr, '[DEBUG-VMT] Looking for function: ', mangledName);
           for j := 0 to High(FLabelPositions) do
           begin
-            WriteLn(StdErr, '[DEBUG-VMT] Checking FLabelPositions[', j, ']: ', FLabelPositions[j].Name);
             if FLabelPositions[j].Name = mangledName then
             begin
               funcPos := FLabelPositions[j].Pos;
-              WriteLn(StdErr, '[DEBUG-VMT] Found at pos: ', funcPos);
               Break;
             end;
           end;

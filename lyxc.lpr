@@ -101,7 +101,20 @@ begin
     WriteLn(';   .str', fi, ': "', m.Strings[fi], '"');
   WriteLn('; Globals: ', Length(m.GlobalVars));
   for fi := 0 to High(m.GlobalVars) do
-    WriteLn(';   .global ', m.GlobalVars[fi].Name, ' = ', m.GlobalVars[fi].InitValue);
+  begin
+    if m.GlobalVars[fi].IsArray then
+    begin
+      Write(';   .global ', m.GlobalVars[fi].Name, ' = [');
+      for ai := 0 to m.GlobalVars[fi].ArrayLen - 1 do
+      begin
+        if ai > 0 then Write(', ');
+        Write(m.GlobalVars[fi].InitValues[ai]);
+      end;
+      WriteLn(']');
+    end
+    else
+      WriteLn(';   .global ', m.GlobalVars[fi].Name, ' = ', m.GlobalVars[fi].InitValue);
+  end;
   WriteLn;
 
   for fi := 0 to High(m.Functions) do
@@ -572,6 +585,13 @@ begin
             inliner.Free;
           end;
 
+          // --emit-asm: Dump IR BEFORE optimization
+          if flagEmitAsm then
+          begin
+            WriteLn('; === IR (before optimization) ===');
+            DumpIRAsAsm(module);
+          end;
+
           // IR-Level Optimizations (Constant Folding, CSE, DCE, etc.)
           if flagOptimize then
           begin
@@ -612,11 +632,11 @@ begin
                if flagEnergyLevel > 0 then
                  emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
  
-               emit.EmitFromIR(module);
-               codeBuf := emit.GetCodeBuffer;
-               dataBuf := emit.GetDataBuffer;
- 
-               // --dump-relocs: show external symbols and PLT patches
+                emit.EmitFromIR(module);
+                codeBuf := emit.GetCodeBuffer;
+                dataBuf := emit.GetDataBuffer;
+  
+                // --dump-relocs: show external symbols and PLT patches
                if flagDumpRelocs then
                  DumpRelocs(emit);
  
