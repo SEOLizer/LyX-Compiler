@@ -3046,6 +3046,7 @@ var
   i: Integer;
   s: TSymbol;
   sym: TSymbol;
+  fn: TAstFuncDecl;
   vtype, ctype, rtype, otype: TAurumType;
   sw: TAstSwitch;
   caseVal: TAstExpr;
@@ -3353,8 +3354,23 @@ begin
       end;
     nkFuncDecl:
       begin
-        // nested function? not supported yet
-        FDiag.Error('nested function declarations are not supported', stmt.Span);
+        // Nested function — register name in current scope for call resolution
+        if stmt is TAstFuncStmt then
+        begin
+          fn := TAstFuncStmt(stmt).FuncDecl;
+          if ResolveSymbol(fn.Name) = nil then
+          begin
+            s := TSymbol.Create(fn.Name);
+            s.Kind := symFunc;
+            s.ParamCount := Length(fn.Params);
+            SetLength(s.ParamTypes, s.ParamCount);
+            for i := 0 to High(fn.Params) do
+              s.ParamTypes[i] := fn.Params[i].ParamType;
+            s.ReturnTypeName := fn.ReturnTypeName;
+            s.DeclType := atInt64;  // default, actual type resolved during lowering
+            AddSymbolToCurrent(s, stmt.Span);
+          end;
+        end;
       end;
     else
       FDiag.Error('sema: unsupported statement kind', stmt.Span);
