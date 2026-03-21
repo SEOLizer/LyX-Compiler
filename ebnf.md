@@ -82,7 +82,36 @@ Funktionen können mit einem Energy-Level kompiliert werden:
 ```
 EnergyAttr = "@energy" "(" IntLiteral ")"
 FnDecl = [ EnergyAttr ] "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
+NestedFnDecl = "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
 ```
+
+### Verschachtelte Funktionen (Nested Functions)
+
+Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.
+Sie werden während des Lowering auf Top-Level gehoben (Lifting). Seit v0.5.3+
+unterstützen sie **Closures** — Zugriff auf Variablen des umgebenden Scopes
+via Static-Link (Parent-RBP als versteckter Parameter).
+
+```ebnf
+Block = "{" { Statement } "}"
+Statement = VarDecl | IfStmt | WhileStmt | ReturnStmt | AssignStmt | ExprStmt | Block | NestedFnDecl
+```
+
+Beispiel (Closure):
+```lyx
+fn outer(): int64 {
+  var x: int64 := 42;
+  fn inner(): int64 {
+    return x;  // greift auf x aus outer() zu (Closure)
+  }
+  return inner();
+}
+```
+
+Einschränkungen:
+- Closures sind read-only — Variablen aus dem äußeren Scope können nicht verändert werden
+- Max. Verschachtelungstiefe: beliebig (jede Ebene bekommt einen Static-Link)
+- Kein Heap-Allokation — Static-Link nutzt bestehende Stack-Frames
 
 Beispiele:
 ```lyx

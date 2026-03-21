@@ -56,12 +56,17 @@ _(keine offenen Aufgaben)_
 - [x] **Call-Via-PLT** - Externe Calls generieren call @plt_SymName, Labels vor Patching registriert
 - [x] **extern fn strlen** - Funktionalität verifiziert: strlen("Hello") = 5, strlen("Hello Dynamic!") = 14
 
-### Nested Functions (März 2026)
+### Nested Functions & Closures (März 2026)
 
 - [x] **Parser** - `fn` in ParseStmt erkannt, erzeugt TAstFuncStmt Wrapper
 - [x] **AST** - TAstFuncStmt (TAstFuncDecl als TAstStmt), Forward-Deklaration für TAstFuncDecl
 - [x] **Sema** - Name im Scope registriert für Call-Resolution
 - [x] **Lower** - LowerNestedFunc: Context save/restore, separate TIRFunction
+- [x] **Closures: AST** - TCapturedVar, CapturedVars, NeedsStaticLink, ParentFuncName
+- [x] **Closures: Sema** - Scope-Level-Tracking, ResolveSymbolLevel, Capture-Erkennung
+- [x] **Closures: IR** - irLoadCaptured Opcode, cmStaticLink CallMode, TIRFunction.CapturedVars
+- [x] **Closures: Lower** - Static-Link als Slot 0, Capture-Lade-Code via irLoadCaptured
+- [x] **Closures: Backend** - irLoadCaptured (mov rax,[rbp]+mov rcx,[rax+offset]), cmStaticLink Args
 
 ### ARM64 VMT Support (März 2026)
 
@@ -132,6 +137,7 @@ _(keine offenen Aufgaben)_
 - cmExternal Call-Routing über PLT
 - ARM64 VMT Support (Virtual Call, ADRP/ADD, VMT-Tabellen)
 - Nested Functions (Lifting-Ansatz, ohne Closures)
+- Closures via Static-Link (Parent-RBP als impliziter Parameter)
 
 ### v0.5.2 (März 2026)
 - SSE2 Float-Codegen für Linux x86_64

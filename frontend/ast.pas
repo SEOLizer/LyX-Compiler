@@ -99,6 +99,15 @@ type
   end;
   TMapEntryList = array of TMapEntry;
 
+  { Captured Variable: Referenzierte Variable aus dem äußeren Scope }
+  TCapturedVar = record
+    Name: string;
+    VarType: TAurumType;
+    OuterSlot: Integer;
+    InnerSlot: Integer;
+  end;
+  TAstCapturedVarList = array of TCapturedVar;
+
   { --- Basisklasse --- }
 
   TAstNode = class
@@ -699,6 +708,10 @@ type
     // Constructor/Destructor
     FIsConstructor: Boolean;
     FIsDestructor: Boolean;
+    // Closure / Nested function fields
+    FCapturedVars: TAstCapturedVarList;
+    FParentFuncName: string; // name of enclosing function (if nested)
+    FNeedsStaticLink: Boolean; // true if this function captures variables
   public
     constructor Create(const aName: string; const aParams: TAstParamList;
       aReturnType: TAurumType; aBody: TAstBlock; aSpan: TSourceSpan; aIsPublic: Boolean = False);
@@ -723,6 +736,12 @@ type
     // Constructor/Destructor
     property IsConstructor: Boolean read FIsConstructor write FIsConstructor;
     property IsDestructor: Boolean read FIsDestructor write FIsDestructor;
+    // Closure properties
+    property CapturedVars: TAstCapturedVarList read FCapturedVars;
+    property ParentFuncName: string read FParentFuncName write FParentFuncName;
+    property NeedsStaticLink: Boolean read FNeedsStaticLink write FNeedsStaticLink;
+    procedure AddCapturedVar(const aName: string; aType: TAurumType; aOuterSlot: Integer);
+    function HasCapturedVar(const aName: string): Boolean;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -2274,13 +2293,43 @@ begin
   // Constructor/Destructor
   FIsConstructor := False;
   FIsDestructor := False;
+  // Closure fields
+  FParentFuncName := '';
+  FNeedsStaticLink := False;
+  SetLength(FCapturedVars, 0);
 end;
 
 destructor TAstFuncDecl.Destroy;
 begin
   FBody.Free;
   FParams := nil;
+  FCapturedVars := nil;
   inherited Destroy;
+end;
+
+procedure TAstFuncDecl.AddCapturedVar(const aName: string; aType: TAurumType; aOuterSlot: Integer);
+var
+  idx: Integer;
+begin
+  // Check if already captured
+  if HasCapturedVar(aName) then Exit;
+  idx := Length(FCapturedVars);
+  SetLength(FCapturedVars, idx + 1);
+  FCapturedVars[idx].Name := aName;
+  FCapturedVars[idx].VarType := aType;
+  FCapturedVars[idx].OuterSlot := aOuterSlot;
+  FCapturedVars[idx].InnerSlot := -1; // assigned during lowering
+  FNeedsStaticLink := True;
+end;
+
+function TAstFuncDecl.HasCapturedVar(const aName: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FCapturedVars) do
+    if FCapturedVars[i].Name = aName then
+      Exit(True);
+  Result := False;
 end;
 
 // ================================================================
