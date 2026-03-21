@@ -29,9 +29,15 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Niedrig | **Float Literals** | Dummy-Werte durch echte Float-Literal-Parsing ersetzen |
-| Niedrig | **Array Literals** | Dummy-Werte durch echte Array-Literal-Parsing ersetzen |
 | Niedrig | **Nested Functions** | Interne Helper könnten als nested functions definiert werden |
+
+### Tech Debts
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Niedrig | **Leere Arrays + push** | Compiler-Crash bei `var a := []; push(a, 42)` |
+| Niedrig | **`std/geo.lyx` Return-Type** | `[GeoPoint, GeoPoint]` als generischer Array-Typ im Parser |
+| Niedrig | **`irLoadLocalAddr` Large Offsets** | RBP-relative Offsets > 127 Bytes prüfen |
 
 ### Dokumentation
 
@@ -43,6 +49,28 @@
 ---
 
 ## Abgeschlossene Aufgaben
+
+### SSE2 Float-Codegen Linux x86_64 (März 2026)
+
+- [x] **SSE2-Hilfsfunktionen** - WriteMovsdLoad/Store, WriteAddsd, WriteSubsd, WriteMulsd, WriteDivsd, WriteUcomisd, WriteCvtsi2sd, WriteCvttsd2si
+- [x] **Float IR-Branches** - irConstFloat, irFAdd, irFSub, irFMul, irFDiv, irFNeg, irFCmp*, irFToI, irIToF
+- [x] **Lexer Float-Bug** - Unterstriche bei Float-Literalen entfernen
+- [x] **irConstStr Patching** - FStringOffsets-Prüfung entfernt (verhinderte LEA-Patching)
+- [x] **irLoadElem Slot-Konflikt** - RAX-Save via push/pop statt [rbp-8]
+
+### irAnd/irOr/irNot (März 2026)
+
+- [x] **irAnd** - Bitweises AND (and rax, rcx)
+- [x] **irOr** - Bitweises OR (or rax, rcx)
+- [x] **irNot** - Bool-Not (test + sete + movzx)
+- [x] **irNor** - NOR (or + test + sete)
+- [x] **irXor** - Bitweises XOR (xor rax, rcx)
+
+### Array Literals in Expression-Position (März 2026)
+
+- [x] **LowerArrayLit** - Stack-Allokation, REVERSE-Order Store, irLoadLocalAddr
+- [x] **Bounds-Check-Bugfix** - irJmp skip Labels nach irLoadElem/irStoreElem
+- [x] **irAnd-Ersatz** - Zwei separate irCmpLt/irCmpGe + irBrTrue statt irAnd
 
 ### VMT Support (v0.5.1)
 
@@ -66,11 +94,6 @@
 - [x] **ARM64 DynArray** - irDynArrayPush/Pop/Len/Free
 - [x] **Map/Set** - irMapRemove, irSetRemove, irMapFree, irSetFree
 
-### IR-Lowering
-
-- [x] **Float Literale** - Dummy-Parsing in AST für `3.14`, `-1.5e+10`
-- [x] **Array Literale** - Dummy-Parsing in AST für `[1, 2, 3]`
-
 ### Frontend
 
 - [x] **Zahlenbasen** - Hex (`0xFF`, `$FF`), Binär (`0b1010`, `%1010`), Oktal (`0o77`, `&77`)
@@ -80,6 +103,12 @@
 ---
 
 ## Versionsverlauf
+
+### v0.5.2 (März 2026)
+- SSE2 Float-Codegen für Linux x86_64
+- irAnd/irOr/irNot/irNor/irXor im x86_64 Backend
+- Array-Literale in Expression-Position (LowerArrayLit)
+- Bounds-Checking Bugfix (irJmp skip Labels)
 
 ### v0.5.1 (März 2026)
 - Linux ARM64 VMT Support
