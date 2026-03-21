@@ -116,7 +116,7 @@ Das macOS Backend (`macho64_writer.pas`) unterstützt noch kein dynamisches Link
 
 ### 3. ~~ARM64 Dynamic Linking~~ ⚠️ Teilweise
 
-Das ARM64 Backend generiert jetzt ein korrektes dynamisches ELF mit:
+Das ARM64 Backend generiert ein korrektes dynamisches ELF mit:
 - `.text` — Code-Sektion (PROGBITS, SHF_ALLOC | SHF_EXECINSTR)
 - `.interp` — `/lib/ld-linux-aarch64.so.1`
 - `.dynstr` — Symbol-String-Tabelle
@@ -127,15 +127,25 @@ Das ARM64 Backend generiert jetzt ein korrektes dynamisches ELF mit:
 - `.dynamic` — DT_NEEDED, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_PLTGOT, DT_JMPREL, DT_BIND_NOW, DT_DEBUG, DT_NULL
 - 5 Program Headers (PHDR, INTERP, LOAD RX, LOAD RW, PT_DYNAMIC)
 
-**Offenes Problem:** Exit 135 (SIGBUS) beim Ausführen. Der ARM64-Emitter generiert PLT-Stubs,
-aber die GOT-Initialisierung oder PLT-Offset-Berechnung ist fehlerhaft.
+**Offenes Problem:** Exit 135 (SIGBUS) beim Ausführen.
 
 ```
-$ qemu-aarch64-static /tmp/hello_arm64_static    # funktioniert ✅
+$ qemu-aarch64-static /tmp/hello_arm64_static    # funktioniert ✅ (statisch)
 $ docker --platform linux/arm64 debian:stable-slim /tmp/test_dynamic_arm64  # Bus Error ❌
 ```
 
-**Commit:** 4cd78b8
+**Problem-Analyse:**
+Das PLT/GOT-Design für ARM64 ist komplexer als x86_64:
+1. **X16-Register:** Beim PLT-Aufruf muss X16 die GOT-Basis enthalten
+2. **GOT-Layout:** GOT muss bei festem Offset relativ zum PLT liegen
+3. **Dynamic Linker:** Der Linker muss X16 korrekt setzen
+
+Im Gegensatz zu x86_64 (wo RIP implizit auf die aktuelle Instruktion zeigt), 
+muss bei ARM64 X16 explizit auf die GOT zeigen. Dies erfordert:
+- Entweder: Startup-Code der X16 auf GOT setzt
+- Oder: PLT-Struktur die GOT-Position berechnet
+
+**Commit:** 5dd5460
 
 **Commit:** cb07844
 
