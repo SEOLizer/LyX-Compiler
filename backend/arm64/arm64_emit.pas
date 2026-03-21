@@ -56,6 +56,17 @@ type
     // External symbols for PLT/GOT (Dynamic Linking)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
+    // VMT (Virtual Method Table) support
+    FVMTLabels: array of TLabelPos;
+    FVMTLeaPositions: array of record
+      VMTIndex: Integer;     // Index in module.ClassDecls
+      MethodIndex: Integer;  // Index in VirtualMethods array
+      CodePos: Integer;      // Position of ADRP+ADD placeholder in code
+    end;
+    FVMTAddrLeaPositions: array of record
+      VMTLabelIndex: Integer;
+      CodePos: Integer;      // Position of ADRP+ADD for VMT address load
+    end;
     // Energy tracking (minimal — vollständige Integration in Phase 3)
     FEnergyStats: TEnergyStats;
     FEnergyContext: TEnergyContext;
@@ -578,6 +589,31 @@ begin
   EmitInstr(buf, $94000000 or imm26);
 end;
 
+// BLR Xn - Branch with Link to Register (indirect call)
+procedure WriteBlr(buf: TByteBuffer; rn: Byte);
+begin
+  // BLR Xn: 1101011 0001 00000 000000 rn 00000
+  EmitInstr(buf, $D63F0000 or (DWord(rn and $1F) shl 5));
+end;
+
+// LDR Xd, [Xn, #imm9] - Load register with offset (unscaled, 9-bit signed offset)
+procedure WriteLdrRegOffset(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm9: DWord;
+begin
+  // LDR (immediate, unsigned offset): 111100 011 imm12 rn rt
+  // For 64-bit: opc=11, V=0
+  if offset >= 0 then
+    // LDR Xt, [Xn, #imm12] - unsigned offset
+    EmitInstr(buf, $F9400000 or (DWord(offset and $FFF) shl 10) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F))
+  else
+  begin
+    // Negative offset: use STUR/LDUR encoding (unscaled offset)
+    imm9 := DWord(offset and $1FF);
+    EmitInstr(buf, $F8600000 or (imm9 shl 12) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F));
+  end;
+end;
+
 // B.cond label (conditional branch)
 procedure WriteBranchCond(buf: TByteBuffer; cond: Byte; offset: Int32);
 var
@@ -1082,16 +1118,20 @@ var
   
   // For address calculation
   dataVA, codeVA, instrVA: UInt64;
+  
+  // VMT patching
+  vmtIdx, methodIdx, vmtLabelIdx: Integer;
+  mangledName: string;
+  adrpPos, adrpPage, targetPage: Integer;
+  pageOffset, addOffset: Int32;
+  found: Boolean;
+  ei: Integer;
   disp: Int32;
   origInstr: DWord;
   rd, rn: Byte;
   
   // Temporaries
   tmpReg: Byte;
-  
-  // External symbol search
-  found: Boolean;
-  ei: Integer;
 begin
   // Phase 1: Write interned strings to data section
   totalDataOffset := 0;
@@ -1366,7 +1406,7 @@ begin
           TrackEnergy(eokFPU);
         irLoadLocal, irStoreLocal, irLoadGlobal, irStoreGlobal,
         irLoadGlobalAddr, irLoadLocalAddr, irLoadStructAddr,
-        irStackAlloc, irStoreElem, irLoadElem, irStoreElemDyn,
+        irStoreElem, irLoadElem, irStoreElemDyn,
         irLoadField, irStoreField, irLoadFieldHeap, irStoreFieldHeap,
         irAlloc, irFree,
         irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
@@ -1696,6 +1736,17 @@ begin
                 WriteLdrImm(FCode, ParamRegs[k], X29, frameSize + SlotOffset(localCnt + argTemps[k]));
             end;
             
+            // Virtual method call dispatch
+            if instr.IsVirtualCall and (instr.VMTIndex >= 0) then
+            begin
+              // 1. Load VMT pointer from object: ldr x0, [x0] (VMT at offset 0)
+              WriteLdrImm(FCode, X0, X0, 0);
+              // 2. Load method pointer from VMT: ldr x0, [x0, #(vmtIdx*8)]
+              WriteLdrRegOffset(FCode, X0, X0, instr.VMTIndex * 8);
+              // 3. Indirect call: blr x0
+              WriteBlr(FCode, X0);
+            end
+            else
             // Check if this is an external call (cmExternal)
             if instr.CallMode = cmExternal then
             begin
@@ -2119,30 +2170,63 @@ begin
           begin
             // Load address of global variable into temp: dest = &globals[ImmStr]
             slotIdx := localCnt + instr.Dest;
-            varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
-            if varIdx < 0 then
+            
+            // Check for VMT address load (_vmt_ClassName)
+            if Copy(instr.ImmStr, 1, 5) = '_vmt_' then
             begin
-              // First access to this global - allocate space in data section
-              varIdx := FGlobalVarNames.Count;
-              FGlobalVarNames.Add(instr.ImmStr);
-              SetLength(FGlobalVarOffsets, varIdx + 1);
-              FGlobalVarOffsets[varIdx] := FTotalDataOffset;
-              FData.WriteU64LE(0);
-              Inc(FTotalDataOffset, 8);
+              // VMT address load: ADRP + ADD with placeholder, patched later
+              SetLength(FVMTAddrLeaPositions, Length(FVMTAddrLeaPositions) + 1);
+              FVMTAddrLeaPositions[High(FVMTAddrLeaPositions)].CodePos := FCode.Size;
+              // Find or create VMT label index
+              found := False;
+              for ei := 0 to High(FVMTLabels) do
+              begin
+                if FVMTLabels[ei].Name = instr.ImmStr then
+                begin
+                  FVMTAddrLeaPositions[High(FVMTAddrLeaPositions)].VMTLabelIndex := ei;
+                  found := True;
+                  Break;
+                end;
+              end;
+              if not found then
+              begin
+                // VMT label not yet created - create placeholder
+                FVMTAddrLeaPositions[High(FVMTAddrLeaPositions)].VMTLabelIndex := Length(FVMTLabels);
+                SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+                FVMTLabels[High(FVMTLabels)].Name := instr.ImmStr;
+                FVMTLabels[High(FVMTLabels)].Pos := 0;  // Will be set during VMT generation
+              end;
+              WriteAdrp(FCode, X0, 0);   // Placeholder: ADRP X0, page
+              WriteAddImm(FCode, X0, X0, 0); // Placeholder: ADD X0, X0, #offset
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end
+            else
+            begin
+              varIdx := FGlobalVarNames.IndexOf(instr.ImmStr);
+              if varIdx < 0 then
+              begin
+                // First access to this global - allocate space in data section
+                varIdx := FGlobalVarNames.Count;
+                FGlobalVarNames.Add(instr.ImmStr);
+                SetLength(FGlobalVarOffsets, varIdx + 1);
+                FGlobalVarOffsets[varIdx] := FTotalDataOffset;
+                FData.WriteU64LE(0);
+                Inc(FTotalDataOffset, 8);
+              end;
+              // Emit ADRP + ADD to get address directly into X0
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X0, 0);
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X0, X0, 0);
+              // Store address into temp slot
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
             end;
-            // Emit ADRP + ADD to get address directly into X0
-            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
-            WriteAdrp(FCode, X0, 0);  // Placeholder: ADRP X0, page
-            SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := varIdx;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
-            FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
-            WriteAddImm(FCode, X0, X0, 0);  // Placeholder: ADD X0, X0, #offset
-            // Store address into temp slot
-            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
           end;
           
         // ========== Phase 3: Arrays ==========
@@ -2637,6 +2721,87 @@ begin
       end;
     end;
   end;
+
+  // Phase 10: Generate VMT tables for classes with virtual methods
+  for i := 0 to High(module.ClassDecls) do
+  begin
+    if Length(module.ClassDecls[i].VirtualMethods) = 0 then
+      Continue;
+
+    // Register VMT label
+    SetLength(FVMTLabels, Length(FVMTLabels) + 1);
+    FVMTLabels[High(FVMTLabels)].Name := module.ClassDecls[i].VMTName;
+    FVMTLabels[High(FVMTLabels)].Pos := FCode.Size;
+
+    // Emit VMT entries (8 bytes per virtual method)
+    for j := 0 to High(module.ClassDecls[i].VirtualMethods) do
+    begin
+      // Record position for later patching
+      SetLength(FVMTLeaPositions, Length(FVMTLeaPositions) + 1);
+      FVMTLeaPositions[High(FVMTLeaPositions)].VMTIndex := i;
+      FVMTLeaPositions[High(FVMTLeaPositions)].MethodIndex := j;
+      FVMTLeaPositions[High(FVMTLeaPositions)].CodePos := FCode.Size;
+      
+      // Placeholder: will be patched with function address
+      EmitInstr(FCode, 0);  // 8-byte placeholder (written as two 32-bit zeros)
+      EmitInstr(FCode, 0);
+    end;
+  end;
+
+  // Patch VMT entries with actual function addresses
+  for i := 0 to High(FVMTLeaPositions) do
+  begin
+    vmtIdx := FVMTLeaPositions[i].VMTIndex;
+    methodIdx := FVMTLeaPositions[i].MethodIndex;
+    
+    if (vmtIdx >= 0) and (vmtIdx <= High(module.ClassDecls)) then
+    begin
+      if (methodIdx >= 0) and (methodIdx <= High(module.ClassDecls[vmtIdx].VirtualMethods)) then
+      begin
+        mangledName := '_L_' + module.ClassDecls[vmtIdx].Name + '_' + module.ClassDecls[vmtIdx].VirtualMethods[methodIdx].Name;
+        // Try to find function in label positions
+        found := False;
+        for j := 0 to High(FLabelPositions) do
+        begin
+          if FLabelPositions[j].Name = mangledName then
+          begin
+            // Write function address (relative to code start for PIE)
+            FCode.PatchU64LE(FVMTLeaPositions[i].CodePos, UInt64(FLabelPositions[j].Pos));
+            found := True;
+            Break;
+          end;
+        end;
+        // If not found (abstract method), leave as 0
+      end;
+    end;
+  end;
+
+  // Patch VMT address loads (irLoadGlobalAddr with _vmt_ prefix)
+  for i := 0 to High(FVMTAddrLeaPositions) do
+  begin
+    vmtLabelIdx := FVMTAddrLeaPositions[i].VMTLabelIndex;
+    
+    if (vmtLabelIdx >= 0) and (vmtLabelIdx < Length(FVMTLabels)) then
+    begin
+      // Calculate ADRP page-relative offset
+      adrpPos := FVMTAddrLeaPositions[i].CodePos;
+      targetPos := FVMTLabels[vmtLabelIdx].Pos;
+      
+      // ADRP computes: page(PC + imm21 << 12)
+      // We need: (targetPage - PCPage) >> 12
+      adrpPage := (adrpPos shr 12) shl 12;
+      targetPage := (targetPos shr 12) shl 12;
+      pageOffset := (targetPage - adrpPage) shr 12;
+      
+      // Patch ADRP imm21 (bits 29:5 of the instruction)
+      FCode.PatchU32LE(adrpPos, $90000000 or (DWord((pageOffset and $1FFFFF)) shl 5));
+      
+      // Patch ADD imm12 (offset within page)
+      addOffset := targetPos and $FFF;
+      FCode.PatchU32LE(adrpPos + 4, $91000000 or (DWord(addOffset) shl 10));
+    end;
+  end;
+
 end;
 
 function TARM64Emitter.GetExternalSymbols: TExternalSymbolArray;
