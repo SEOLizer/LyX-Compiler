@@ -222,6 +222,8 @@ begin
     Result := ObjToInt(FLocalMap.Objects[idx]);
     Exit;
   end;
+  if count <= 0 then
+    count := 1; // minimum 1 slot for empty/dynamic arrays
   base := FCurrentFunc.LocalCount;
   FCurrentFunc.LocalCount := FCurrentFunc.LocalCount + count;
   FLocalMap.AddObject(name, IntToObj(base));
