@@ -14,9 +14,9 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Hoch | **PLT/GOT Debugging** | dyn.md Debugging-Tasks für dynamisches Linking |
-| Hoch | Sektionstabellen aktivieren | Temporär Sektionstabellen für objdump aktivieren |
-| Mittel | GOT-Einträge validieren | Initiale Werte der GOT prüfen |
+| Mittel | **GOT-Einträge validieren** | Initiale Werte der GOT prüfen (lazy binding) |
+| Niedrig | **macOS Dynamic Linking** | PLT/GOT für Mach-O implementieren |
+| Niedrig | **ARM64 Dynamic Linking** | PLT/GOT für ARM64 Linux implementieren |
 
 ### Backend
 
@@ -49,6 +49,15 @@
 ---
 
 ## Abgeschlossene Aufgaben
+
+### Dynamic Linking & Section Headers (März 2026)
+
+- [x] **Sektionstabellen (static ELF)** - .text + .shstrtab Section Headers → objdump -d und readelf -S funktionieren
+- [x] **cmExternal Erkennung** - irCall mit CallMode=cmExternal wird im Backend erkannt
+- [x] **AddExternalSymbol** - Externe Symbole werden in FExternalSymbols registriert
+- [x] **PLT-Stubs** - PLT0 (16B) + PLTn (16B/Symbol) am Ende des Code-Buffers generiert
+- [x] **Call-Via-PLT** - Externe Calls generieren call @plt_SymName, Labels vor Patching registriert
+- [x] **extern fn strlen** - Funktionalität verifiziert: strlen("Hello") = 5, strlen("Hello Dynamic!") = 14
 
 ### SSE2 Float-Codegen Linux x86_64 (März 2026)
 
@@ -103,6 +112,11 @@
 ---
 
 ## Versionsverlauf
+
+### v0.5.3 (März 2026)
+- Sektionstabellen für statisches ELF (objdump -d support)
+- PLT/GOT Dynamic Linking (extern fn → PLT-Stubs → libc.so.6)
+- cmExternal Call-Routing über PLT
 
 ### v0.5.2 (März 2026)
 - SSE2 Float-Codegen für Linux x86_64

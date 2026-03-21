@@ -166,6 +166,13 @@ var
   phdr: TByteBuffer;
   filesz, memsz: UInt64;
   baseVA: UInt64;
+  // Section headers for static ELF
+  shStrTab: TByteBuffer;
+  shdrs: TByteBuffer;
+  shStrTabOff, shdrsOff: UInt64;
+  shStrTabSize: UInt64;
+  numShdrs: Integer;
+  shdrSize: UInt64 = 64; // SizeOf(TElf64Shdr)
 begin
   baseVA := $400000;
 
@@ -173,61 +180,131 @@ begin
   codeSize := codeBuf.Size;
   codeOffset := pageSize;  // 0x1000
 
-  elfHeader := TByteBuffer.Create;
-  phdr := TByteBuffer.Create;
+  // Build .shstrtab (section header string table)
+  shStrTab := TByteBuffer.Create;
+  shdrs := TByteBuffer.Create;
   try
-    // e_ident
-    elfHeader.WriteBytes([$7F, Ord('E'), Ord('L'), Ord('F')]);
-    elfHeader.WriteU8(2); // ELFCLASS64
-    elfHeader.WriteU8(1); // ELFDATA2LSB
-    elfHeader.WriteU8(1); // EV_CURRENT
-    elfHeader.WriteU8(0); // OSABI
-    elfHeader.WriteU8(0); // ABI version
-    elfHeader.WriteBytesFill(7, 0);
+    shStrTab.WriteU8(0); // empty string at offset 0
+    // .text at offset 1
+    shStrTab.WriteBytes([Ord('.'), Ord('t'), Ord('e'), Ord('x'), Ord('t'), 0]);
+    // .shstrtab at offset 7
+    shStrTab.WriteBytes([Ord('.'), Ord('s'), Ord('h'), Ord('s'), Ord('t'),
+      Ord('r'), Ord('t'), Ord('a'), Ord('b'), 0]);
+    shStrTabSize := shStrTab.Size;
 
-    elfHeader.WriteU16LE(2); // ET_EXEC
-    elfHeader.WriteU16LE(62); // EM_X86_64
-    elfHeader.WriteU32LE(1);
+    // Layout: ELF header + phdr + padding + code + shstrtab + section headers
+    shStrTabOff := codeOffset + codeSize;
+    // Align shstrtab
+    if (shStrTabOff mod 8) <> 0 then
+      shStrTabOff := shStrTabOff + (8 - (shStrTabOff mod 8));
+    shdrsOff := shStrTabOff + shStrTabSize;
+    // Align section headers
+    if (shdrsOff mod 8) <> 0 then
+      shdrsOff := shdrsOff + (8 - (shdrsOff mod 8));
 
-    elfHeader.WriteU64LE(entryVA);
-    elfHeader.WriteU64LE(64);
-    elfHeader.WriteU64LE(0);
+    numShdrs := 3; // NULL + .text + .shstrtab
 
-    elfHeader.WriteU32LE(0);
-    elfHeader.WriteU16LE(64);
-    elfHeader.WriteU16LE(56);
-    elfHeader.WriteU16LE(1);
-    elfHeader.WriteU16LE(0);
-    elfHeader.WriteU16LE(0);
-    elfHeader.WriteU16LE(0);
+    // Section Header 0: NULL
+    shdrs.WriteU32LE(0); // sh_name
+    shdrs.WriteU32LE(0); // sh_type = SHT_NULL
+    shdrs.WriteU64LE(0); // sh_flags
+    shdrs.WriteU64LE(0); // sh_addr
+    shdrs.WriteU64LE(0); // sh_offset
+    shdrs.WriteU64LE(0); // sh_size
+    shdrs.WriteU32LE(0); // sh_link
+    shdrs.WriteU32LE(0); // sh_info
+    shdrs.WriteU64LE(0); // sh_addralign
+    shdrs.WriteU64LE(0); // sh_entsize
 
-    phdr.WriteU32LE(1); // PT_LOAD
-    phdr.WriteU32LE(4 or 2 or 1); // PF_R|PF_W|PF_X
-    phdr.WriteU64LE(codeOffset);
-    phdr.WriteU64LE(baseVA + codeOffset);
-    phdr.WriteU64LE(baseVA + codeOffset);
+    // Section Header 1: .text
+    shdrs.WriteU32LE(1); // sh_name = ".text" (offset 1 in shstrtab)
+    shdrs.WriteU32LE(1); // sh_type = SHT_PROGBITS
+    shdrs.WriteU64LE(6); // sh_flags = SHF_ALLOC | SHF_EXECINSTR
+    shdrs.WriteU64LE(baseVA + codeOffset); // sh_addr
+    shdrs.WriteU64LE(codeOffset); // sh_offset
+    shdrs.WriteU64LE(codeSize); // sh_size
+    shdrs.WriteU32LE(0); // sh_link
+    shdrs.WriteU32LE(0); // sh_info
+    shdrs.WriteU64LE(16); // sh_addralign
+    shdrs.WriteU64LE(0); // sh_entsize
 
-    // Code segment covers: padding + code (with embedded data)
-    filesz := codeSize;  // No separate data section
-    memsz := filesz;
+    // Section Header 2: .shstrtab
+    shdrs.WriteU32LE(7); // sh_name = ".shstrtab" (offset 7 in shstrtab)
+    shdrs.WriteU32LE(3); // sh_type = SHT_STRTAB
+    shdrs.WriteU64LE(0); // sh_flags
+    shdrs.WriteU64LE(0); // sh_addr (no VA for shstrtab)
+    shdrs.WriteU64LE(shStrTabOff); // sh_offset
+    shdrs.WriteU64LE(shStrTabSize); // sh_size
+    shdrs.WriteU32LE(0); // sh_link
+    shdrs.WriteU32LE(0); // sh_info
+    shdrs.WriteU64LE(1); // sh_addralign
+    shdrs.WriteU64LE(0); // sh_entsize
 
-    phdr.WriteU64LE(filesz);
-    phdr.WriteU64LE(memsz);
-    phdr.WriteU64LE(pageSize);
-
-    fileBuf := TFileStream.Create(filename, fmCreate);
+    elfHeader := TByteBuffer.Create;
+    phdr := TByteBuffer.Create;
     try
-      fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
-      fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
-      while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
-      if codeSize > 0 then 
-        fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+      // e_ident
+      elfHeader.WriteBytes([$7F, Ord('E'), Ord('L'), Ord('F')]);
+      elfHeader.WriteU8(2); // ELFCLASS64
+      elfHeader.WriteU8(1); // ELFDATA2LSB
+      elfHeader.WriteU8(1); // EV_CURRENT
+      elfHeader.WriteU8(0); // OSABI
+      elfHeader.WriteU8(0); // ABI version
+      elfHeader.WriteBytesFill(7, 0);
+
+      elfHeader.WriteU16LE(2); // ET_EXEC
+      elfHeader.WriteU16LE(62); // EM_X86_64
+      elfHeader.WriteU32LE(1); // e_version
+
+      elfHeader.WriteU64LE(entryVA); // e_entry
+      elfHeader.WriteU64LE(64); // e_phoff (right after ELF header)
+      elfHeader.WriteU64LE(shdrsOff); // e_shoff
+
+      elfHeader.WriteU32LE(0); // e_flags
+      elfHeader.WriteU16LE(64); // e_ehsize
+      elfHeader.WriteU16LE(56); // e_phentsize
+      elfHeader.WriteU16LE(1); // e_phnum
+      elfHeader.WriteU16LE(shdrSize); // e_shentsize
+      elfHeader.WriteU16LE(numShdrs); // e_shnum
+      elfHeader.WriteU16LE(2); // e_shstrndx (.shstrtab is index 2)
+
+      phdr.WriteU32LE(1); // PT_LOAD
+      phdr.WriteU32LE(4 or 2 or 1); // PF_R|PF_W|PF_X
+      phdr.WriteU64LE(codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+
+      // Code segment covers: code + shstrtab + section headers
+      filesz := shdrsOff - codeOffset + UInt64(shdrs.Size);
+      memsz := filesz;
+
+      phdr.WriteU64LE(filesz);
+      phdr.WriteU64LE(memsz);
+      phdr.WriteU64LE(pageSize);
+
+      fileBuf := TFileStream.Create(filename, fmCreate);
+      try
+        fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
+        fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
+        while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
+        if codeSize > 0 then
+          fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+        // Pad to shstrtab offset
+        while fileBuf.Position < Int64(shStrTabOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
+        // Pad to section headers offset
+        while fileBuf.Position < Int64(shdrsOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shdrs.GetBuffer^, shdrs.Size);
+      finally
+        fileBuf.Free;
+      end;
     finally
-      fileBuf.Free;
+      phdr.Free;
+      elfHeader.Free;
     end;
   finally
-    phdr.Free;
-    elfHeader.Free;
+    shdrs.Free;
+    shStrTab.Free;
   end;
 end;
 
