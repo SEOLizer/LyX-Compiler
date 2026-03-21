@@ -36,10 +36,7 @@ _(keine offenen Aufgaben)_
 
 ### Dokumentation
 
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Niedrig | **lyxvision.md** | "TODO" Überschrift ist veraltet - Module sind implementiert |
-| Niedrig | **dyn.md** | Debugging-Tasks für PLT/GOT dokumentieren |
+_(keine offenen Aufgaben)_
 
 ---
 
