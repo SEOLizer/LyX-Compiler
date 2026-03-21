@@ -56,6 +56,7 @@ type
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
     function LowerStructLit(sl: TAstStructLit): Integer; // returns temp with struct address
     function LowerArrayLit(al: TAstArrayLit): Integer; // returns temp with array base address
+    procedure LowerNestedFunc(funcDecl: TAstFuncDecl); // lift nested function to top-level
     procedure LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
     function GetReturnStructDecl: TAstStructDecl; // get struct decl for current func's return type
   public
@@ -3364,6 +3365,76 @@ begin
   Result := addrTemp;
 end;
 
+procedure TIRLowering.LowerNestedFunc(funcDecl: TAstFuncDecl);
+var
+  fn: TIRFunction;
+  j: Integer;
+  structIdx: Integer;
+  sd: TAstStructDecl;
+  savedFunc: TIRFunction;
+  savedDecl: TAstFuncDecl;
+  savedLocalMap: TStringList;
+  savedTempCounter: Integer;
+begin
+  // Save current function context
+  savedFunc := FCurrentFunc;
+  savedDecl := FCurrentFuncDecl;
+  savedLocalMap := TStringList.Create;
+  for j := 0 to FLocalMap.Count - 1 do
+    savedLocalMap.AddObject(FLocalMap[j], FLocalMap.Objects[j]);
+  savedTempCounter := FTempCounter;
+
+  try
+    // Create new function in module (use original name)
+    fn := FModule.AddFunction(funcDecl.Name);
+    FCurrentFunc := fn;
+    FCurrentFuncDecl := funcDecl;
+    FLocalMap.Clear;
+    for j := 0 to Length(FLocalConst) - 1 do
+      if Assigned(FLocalConst[j]) then
+        FLocalConst[j].Free;
+    SetLength(FLocalConst, 0);
+    FTempCounter := 0;
+    fn.ParamCount := Length(funcDecl.Params);
+    fn.LocalCount := fn.ParamCount;
+
+    // Calculate ReturnStructSize
+    fn.ReturnStructSize := 0;
+    if funcDecl.ReturnTypeName <> '' then
+    begin
+      structIdx := FStructTypes.IndexOf(funcDecl.ReturnTypeName);
+      if structIdx >= 0 then
+      begin
+        sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+        fn.ReturnStructSize := sd.Size;
+      end;
+    end;
+
+    SetLength(FLocalTypes, fn.LocalCount);
+    SetLength(FLocalConst, fn.LocalCount);
+    for j := 0 to fn.ParamCount - 1 do
+    begin
+      FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j));
+      FLocalTypes[j] := funcDecl.Params[j].ParamType;
+      FLocalConst[j] := nil;
+    end;
+
+    // Lower the function body
+    for j := 0 to High(funcDecl.Body.Stmts) do
+      LowerStmt(funcDecl.Body.Stmts[j]);
+
+  finally
+    // Restore parent function context
+    FCurrentFunc := savedFunc;
+    FCurrentFuncDecl := savedDecl;
+    FLocalMap.Clear;
+    for j := 0 to savedLocalMap.Count - 1 do
+      FLocalMap.AddObject(savedLocalMap[j], savedLocalMap.Objects[j]);
+    savedLocalMap.Free;
+    FTempCounter := savedTempCounter;
+  end;
+end;
+
 procedure TIRLowering.LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
 var
   instr: TIRInstr;
@@ -4506,6 +4577,13 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       instr.Src1 := t0;
       instr.ImmInt := 0;  // Default size handling in backend
       Emit(instr);
+      Exit(True);
+    end;
+
+    // Nested function — lower inline as a separate function in the module
+    if stmt is TAstFuncStmt then
+    begin
+      LowerNestedFunc(TAstFuncStmt(stmt).FuncDecl);
       Exit(True);
     end;
 
