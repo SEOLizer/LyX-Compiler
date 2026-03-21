@@ -23,7 +23,6 @@
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
 | Mittel | **Windows VMT Tests** | Virtual Calls auf echter Windows-Hardware testen |
-| Niedrig | **macOS ARM64 VMT** | VMT-Support für macOS ARM64 (Mach-O) |
 
 ### Sprache / Frontend
 
@@ -58,6 +57,15 @@
 - [x] **PLT-Stubs** - PLT0 (16B) + PLTn (16B/Symbol) am Ende des Code-Buffers generiert
 - [x] **Call-Via-PLT** - Externe Calls generieren call @plt_SymName, Labels vor Patching registriert
 - [x] **extern fn strlen** - Funktionalität verifiziert: strlen("Hello") = 5, strlen("Hello Dynamic!") = 14
+
+### ARM64 VMT Support (März 2026)
+
+- [x] **VMT-Datenstrukturen** - FVMTLabels, FVMTLeaPositions, FVMTAddrLeaPositions im ARM64 Emitter
+- [x] **Virtual Call Dispatch** - ldr x0,[x0] + ldr x0,[x0,#idx*8] + blr x0
+- [x] **VMT-Tabellenerzeugung** - Methoden-Pointer im Code-Segment nach Funktionen
+- [x] **VMT-Entry-Patching** - Funktion-Adressen via Mangled Name in VMT eintragen
+- [x] **VMT-Adresse laden** - ADRP+ADD für irLoadGlobalAddr mit _vmt_ Prefix
+- [x] **Helpers** - WriteBlr (indirekter Call), WriteLdrRegOffset (LDR mit Offset)
 
 ### SSE2 Float-Codegen Linux x86_64 (März 2026)
 
@@ -117,6 +125,7 @@
 - Sektionstabellen für statisches ELF (objdump -d support)
 - PLT/GOT Dynamic Linking (extern fn → PLT-Stubs → libc.so.6)
 - cmExternal Call-Routing über PLT
+- ARM64 VMT Support (Virtual Call, ADRP/ADD, VMT-Tabellen)
 
 ### v0.5.2 (März 2026)
 - SSE2 Float-Codegen für Linux x86_64
