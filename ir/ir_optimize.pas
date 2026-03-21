@@ -474,16 +474,9 @@ begin
     begin
       if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
       begin
-        // Check if it's a side-effect free operation
-        case instr.Op of
-          irConstInt, irConstStr, irConstFloat:
-            begin
-              // Constants without side effects can be removed if dest is dead
-              func.Instructions[i].Op := irInvalid;
-              Result := True;
-              SetChanged;
-            end;
-        end;
+        // DON'T remove constants - they might be needed for correct code generation
+        // even if liveness analysis doesn't detect it (e.g., branch conditions)
+        // This is a conservative fix to ensure correctness
       end;
     end;
   end;

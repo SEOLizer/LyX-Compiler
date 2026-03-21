@@ -485,11 +485,8 @@ begin
   currentLen := FPos - startPos;
   s := Copy(FSource, startPos, currentLen);
 
-  // Remove underscores from number string
-  if not isFloat then
-  begin
-    s := StringReplace(s, '_', '', [rfReplaceAll]);
-  end;
+  // Remove underscores from number string (both integer and float)
+  s := StringReplace(s, '_', '', [rfReplaceAll]);
 
   if isFloat then
     Result := MakeToken(tkFloatLit, s, FLine, startCol, currentLen)

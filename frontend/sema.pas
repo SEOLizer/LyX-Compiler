@@ -2244,19 +2244,24 @@ begin
         if Length(TAstArrayLit(expr).Items) = 0 then
         begin
           // empty array literal: treat as atDynArray for now
+          TAstArrayLit(expr).ElemType := atUnresolved;
           Result := atDynArray;
         end
         else
         begin
-          // infer from first item
-          atype := CheckExpr(TAstArrayLit(expr).Items[0]);
+          // Infer element type from first item
+          TAstArrayLit(expr).ElemType := CheckExpr(TAstArrayLit(expr).Items[0]);
+          
+          // Check remaining elements for type consistency
           for i := 1 to High(TAstArrayLit(expr).Items) do
           begin
             ot := CheckExpr(TAstArrayLit(expr).Items[i]);
-            if not TypeEqual(ot, atype) then
+            if not TypeEqual(ot, TAstArrayLit(expr).ElemType) then
               FDiag.Error('array literal items must have same type', TAstArrayLit(expr).Items[i].Span);
           end;
-          Result := atype;
+          
+          // Return atArray for static array literals
+          Result := atArray;
         end;
       end;
     nkStructLit:
@@ -3097,6 +3102,10 @@ begin
           // Special case: dynamic array with array literal initializer
           else if (vd.ArrayLen = -1) and (vd.DeclType = atDynArray) and Assigned(vd.InitExpr) and (vd.InitExpr is TAstArrayLit) then
             vtype := vd.DeclType  // Accept array literal as dynamic array initializer
+          // Special case: static array with array literal initializer
+          // var arr: array := [10, 20, 30] where both DeclType and vtype are atArray
+          else if (vd.DeclType = atArray) and (vtype = atArray) then
+            vtype := atArray  // Accept array literal for unannotated array type
           else
             FDiag.Error(Format('type mismatch in declaration of %s: expected %s but got %s', [vd.Name, AurumTypeToStr(vd.DeclType), AurumTypeToStr(vtype)]), vd.Span);
         end;
@@ -4831,7 +4840,23 @@ begin
           itype := CheckExpr(TAstVarDecl(node).InitExpr)
         else
           itype := TAstVarDecl(node).DeclType;  // Use declared type if no initializer
-        if (TAstVarDecl(node).DeclType <> atUnresolved) and not TypeEqual(itype, TAstVarDecl(node).DeclType) then
+        
+        // Check type compatibility
+        // Special case: both are atArray (unannotated array) - accept array literals
+        if TypeEqual(itype, TAstVarDecl(node).DeclType) then
+        begin
+          // Types are compatible
+        end
+        else if (TAstVarDecl(node).DeclType = atArray) and (itype = atArray) then
+        begin
+          // Both are unannotated arrays - compatible (type will be inferred from literal)
+        end
+        else if (TAstVarDecl(node).DeclType = atDynArray) and (itype = atArray) then
+        begin
+          // Declared as 'array' (atDynArray), assigned an array literal (atArray)
+          // Compatible - array literals can initialize dynamic arrays
+        end
+        else if (TAstVarDecl(node).DeclType <> atUnresolved) then
           FDiag.Error(Format('global %s: expected type %s but got %s', 
             [TAstVarDecl(node).Name, AurumTypeToStr(TAstVarDecl(node).DeclType), AurumTypeToStr(itype)]), node.Span);
         sym := TSymbol.Create(TAstVarDecl(node).Name);
