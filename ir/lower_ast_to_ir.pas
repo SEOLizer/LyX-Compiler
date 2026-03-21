@@ -55,6 +55,7 @@ type
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
     function LowerStructLit(sl: TAstStructLit): Integer; // returns temp with struct address
+    function LowerArrayLit(al: TAstArrayLit): Integer; // returns temp with array base address
     procedure LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
     function GetReturnStructDecl: TAstStructDecl; // get struct decl for current func's return type
   public
@@ -987,10 +988,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     baseSlot: Integer;
     // bounds-check temporaries
     gv: TAstVarDecl;
-    tZero, tLen, tGe0, tLtLen, tOk: Integer;
+    tZero, tLen, tGe0, tLtLen, tOk, tLtZero, tGeLen: Integer;
     msgTmp, codeTmp: Integer;
     staticIdx: Integer;
-    errLbl: string;
+    errLbl, skipLbl: string;
     // Nested field access
     baseExpr: TAstExpr;
     // Method call type lookup
@@ -2260,23 +2261,27 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
              instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
            end;
 
-           // Load element at index
-           t0 := NewTemp;
-           instr.Op := irLoadElem;
-           instr.Dest := t0;
-           instr.Src1 := t1;  // array base address
-           instr.Src2 := t2;  // index
-           Emit(instr);
-           Result := t0;
+            // Load element at index
+            t0 := NewTemp;
+            instr.Op := irLoadElem;
+            instr.Dest := t0;
+            instr.Src1 := t1;  // array base address
+            instr.Src2 := t2;  // index
+            Emit(instr);
+            Result := t0;
 
-           // Emit error handler if needed
-           if Assigned(gv) and (gv.ArrayLen > 0) then
-           begin
-             instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
-             msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
-             instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
-             codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
-             instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            // Emit error handler if needed
+            if Assigned(gv) and (gv.ArrayLen > 0) then
+            begin
+              // Skip over error handler after successful load
+              skipLbl := NewLabel('Larr_ok');
+              instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+              instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+              msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+              instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+              codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+              instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+              instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
            end;
         end
         else
@@ -2321,12 +2326,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 Emit(instr);
                 Result := t0;
 
+                // Skip over error handler
+                skipLbl := NewLabel('Larr_ok');
+                instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+
                 // Error handler
                 instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
                 msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
                 codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
                 instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+                instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
                 Exit;
               end;
 
@@ -2390,11 +2400,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
                 if arrLen > 0 then
                 begin
+                  skipLbl := NewLabel('Larr_ok');
+                  instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
                   instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
                   msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
                   instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
                   codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
                   instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+                  instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
                 end;
                Exit;
             end;
@@ -2676,12 +2689,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkArrayLit:
       begin
-        // Array literals are typically handled in statement context
-        // Return first element temp for now (or error)
-        if Length(TAstArrayLit(expr).Items) > 0 then
-          Result := LowerExpr(TAstArrayLit(expr).Items[0])
-        else
-          Result := -1;
+        Result := LowerArrayLit(TAstArrayLit(expr));
       end;
 
     nkStructLit:
@@ -3310,6 +3318,52 @@ begin
   Result := addrTemp;
 end;
 
+function TIRLowering.LowerArrayLit(al: TAstArrayLit): Integer;
+var
+  instr: TIRInstr;
+  arrLen, baseLoc, addrTemp, tmp, i: Integer;
+  items: TAstExprList;
+begin
+  Result := -1;
+  instr := Default(TIRInstr);
+
+  items := al.Items;
+  arrLen := Length(items);
+
+  // Empty array: return -1 (no valid temp)
+  if arrLen = 0 then
+    Exit;
+
+  // Allocate stack slots for the array elements
+  baseLoc := AllocLocalMany('_arraylit_' + IntToStr(FTempCounter), atUnresolved, arrLen);
+
+  // Record array length for bounds checking
+  if baseLoc + arrLen > Length(FLocalArrayLen) then
+    SetLength(FLocalArrayLen, baseLoc + arrLen);
+  for i := 0 to arrLen - 1 do
+    FLocalArrayLen[baseLoc + i] := arrLen;
+
+  // Store elements in REVERSE order: arr[0] at highest slot (baseLoc + arrLen - 1 - i)
+  for i := 0 to High(items) do
+  begin
+    tmp := LowerExpr(items[i]);
+    if tmp < 0 then Continue;
+    instr.Op := irStoreLocal;
+    instr.Dest := baseLoc + (arrLen - 1 - i);
+    instr.Src1 := tmp;
+    Emit(instr);
+  end;
+
+  // Load the address of the array base slot
+  addrTemp := NewTemp;
+  instr.Op := irLoadLocalAddr;
+  instr.Dest := addrTemp;
+  instr.Src1 := baseLoc;
+  Emit(instr);
+
+  Result := addrTemp;
+end;
+
 procedure TIRLowering.LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
 var
   instr: TIRInstr;
@@ -3401,7 +3455,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     baseSlot: Integer;
     // bounds-check helpers
     gv: TAstVarDecl;
-    tZero, tLen, tGe0, tLtLen, tOk: Integer;
+    tZero, tLen, tGe0, tLtLen, tOk, tLtZero, tGeLen: Integer;
     // assert/panic helpers
     cond, msg: Integer;
     skipLbl: string;
@@ -4105,42 +4159,52 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
          gv := nil;
          if (TAstIndexAssign(stmt).Target.Obj is TAstIdent) and IsGlobalVar(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name) then
            gv := GetGlobalVarDecl(TAstIdent(TAstIndexAssign(stmt).Target.Obj).Name);
-         if Assigned(gv) and (gv.ArrayLen > 0) then
-         begin
-           // emit runtime check for global array
-           tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
-           tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := gv.ArrayLen; Emit(instr);
-           tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
-           tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
-           tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
-           errLbl := NewLabel('Larr_oob'); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+          if Assigned(gv) and (gv.ArrayLen > 0) then
+          begin
+            // emit runtime check for global array - use two separate branches
+            tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+            tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := gv.ArrayLen; Emit(instr);
+            // Check idx < 0
+            tLtZero := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtZero; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+            errLbl := NewLabel('Larr_oob'); instr.Op := irBrTrue; instr.Src1 := tLtZero; instr.LabelName := errLbl; Emit(instr);
+            // Check idx >= len
+            tGeLen := NewTemp; instr.Op := irCmpGe; instr.Dest := tGeLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+            instr.Op := irBrTrue; instr.Src1 := tGeLen; instr.LabelName := errLbl; Emit(instr);
 
-           instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+             instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
 
-           instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
-           msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
-           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
-           codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
-           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
-         end
-         else if (loc >= 0) and (GetLocalArrayLen(loc) > 0) then
-         begin
-           // emit runtime check for local array
-           tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
-           tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := GetLocalArrayLen(loc); Emit(instr);
-           tGe0 := NewTemp; instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
-           tLtLen := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
-           tOk := NewTemp; instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
-           errLbl := NewLabel('Larr_oob'); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+            skipLbl := NewLabel('Larr_ok');
+            instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+          end
+          else if (loc >= 0) and (GetLocalArrayLen(loc) > 0) then
+          begin
+            // emit runtime check for local array - use two separate branches
+            tZero := NewTemp; instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+            tLen := NewTemp; instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := GetLocalArrayLen(loc); Emit(instr);
+            // Check idx < 0
+            tLtZero := NewTemp; instr.Op := irCmpLt; instr.Dest := tLtZero; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+            errLbl := NewLabel('Larr_oob'); instr.Op := irBrTrue; instr.Src1 := tLtZero; instr.LabelName := errLbl; Emit(instr);
+            // Check idx >= len
+            tGeLen := NewTemp; instr.Op := irCmpGe; instr.Dest := tGeLen; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+            instr.Op := irBrTrue; instr.Src1 := tGeLen; instr.LabelName := errLbl; Emit(instr);
 
-           instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+            instr.Op := irStoreElemDyn; instr.Src1 := t1; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
 
-           instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
-           msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
-           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
-           codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
-           instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
-         end
+            skipLbl := NewLabel('Larr_ok');
+            instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+          end
          else
          begin
            // no bounds info, emit dynamic store
