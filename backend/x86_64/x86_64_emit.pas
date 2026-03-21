@@ -945,19 +945,28 @@ begin
           WriteRet(FCode);
         end;
         
-         irLoadLocal:
-           begin
-             // Load local variable into temp: dest = locals[src1]
-             // Src1 is a local slot index (0..LocalCount-1)
-             // Dest is a temp index (needs fn.LocalCount added)
-             slotIdx := instr.Src1;  // Local slot (no offset)
-             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
-             slotIdx := fn.LocalCount + instr.Dest;  // Temp slot
-             WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-           end;
-         
-         irStoreLocal:
-           begin
+        irLoadLocal:
+        begin
+          // Load local variable into temp: dest = locals[src1]
+          slotIdx := instr.Src1;
+          WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+          slotIdx := fn.LocalCount + instr.Dest;
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+        end;
+
+        irLoadCaptured:
+        begin
+          // Load captured variable from parent frame via static link
+          // Src1 = slot containing static link (parent RBP)
+          // ImmInt = outerSlot in parent function
+          WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));       // RAX = parent RBP
+          WriteMovRegMem(FCode, RCX, RAX, SlotOffset(instr.ImmInt));     // RCX = [parent_RBP + SlotOffset(outerSlot)]
+          slotIdx := fn.LocalCount + instr.Dest;
+          WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RCX);
+        end;
+
+        irStoreLocal:
+        begin
              // Store temp into local variable: locals[dest] = src1
              // Src1 is a temp index (needs fn.LocalCount added)
              // Dest is a local slot index (0..LocalCount-1)
@@ -3088,21 +3097,41 @@ begin
                  WriteMovRegImm64(FCode, RAX, 0);
                  EmitU8(FCode, $50);  // push rax
                end;
-             end;
-             
-             // Load first 6 args into registers (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
-             for k := 0 to Min(argCount - 1, 5) do
-             begin
-               if argTemps[k] >= 0 then
-               begin
-                 slotIdx := fn.LocalCount + argTemps[k];
-                 WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
-               end
-               else
-                 WriteMovRegImm64(FCode, ParamRegs[k], 0);
-             end;
-             
-              // Handle virtual method calls
+              end;
+              
+              // Load first 6 args into registers (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
+              if instr.CallMode = cmStaticLink then
+              begin
+                // Static link call: RDI = current RBP (parent frame pointer)
+                // User args go into RSI, RDX, RCX, R8, R9 (shifted by 1)
+                EmitRex(FCode, 1, 0, 0, 0);
+                EmitU8(FCode, $89); EmitU8(FCode, $EF);  // mov rdi, rbp
+                for k := 0 to Min(argCount - 1, 4) do
+                begin
+                  if argTemps[k] >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + argTemps[k];
+                    WriteMovRegMem(FCode, ParamRegs[k + 1], RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, ParamRegs[k + 1], 0);
+                end;
+              end
+              else
+              begin
+                for k := 0 to Min(argCount - 1, 5) do
+                begin
+                  if argTemps[k] >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + argTemps[k];
+                    WriteMovRegMem(FCode, ParamRegs[k], RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, ParamRegs[k], 0);
+                end;
+              end;
+              
+               // Handle virtual method calls
               if instr.IsVirtualCall and (instr.VMTIndex >= 0) then
               begin
                 // Virtual call: self should be in RDI (first arg for SysV ABI)

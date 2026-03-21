@@ -42,10 +42,14 @@ type
     FStructTypes: TStringList; // name -> TAstStructDecl as object
     FClassTypes: TStringList; // name -> TAstClassDecl as object
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
+    // Closure support
+    FFuncScopeDepth: Integer; // scope depth of current function boundary
+    FCurrentNestedFunc: TAstFuncDecl; // nested function currently being analyzed
     procedure PushScope;
     procedure PopScope;
     procedure AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
     function ResolveSymbol(const name: string): TSymbol;
+    function ResolveSymbolLevel(const name: string): Integer; // returns scope depth or -1
     function ResolveQualifiedName(const qualifier, name: string; span: TSourceSpan): TSymbol;
     procedure DeclareBuiltinFunctions;
     procedure RegisterTObject;
@@ -1136,6 +1140,24 @@ begin
   end;
 end;
 
+function TSema.ResolveSymbolLevel(const name: string): Integer;
+var
+  i, idx: Integer;
+  sl: TStringList;
+begin
+  Result := -1;
+  for i := High(FScopes) downto 0 do
+  begin
+    sl := FScopes[i];
+    idx := sl.IndexOf(name);
+    if idx >= 0 then
+    begin
+      Result := i;
+      Exit;
+    end;
+  end;
+end;
+
 procedure TSema.DeclareBuiltinFunctions;
 var
   s: TSymbol;
@@ -1806,7 +1828,7 @@ var
   call: TAstCall;
   s: TSymbol;
   sSym: TSymbol;
-  i, fi, baseIdx, fldOffset, idx: Integer;
+  i, fi, baseIdx, fldOffset, idx, symLvl: Integer;
   lt, rt, ot, atype, srcType: TAurumType;
   qualifier: string;
   identName: string;
@@ -2237,6 +2259,17 @@ begin
         else
         begin
           Result := s.DeclType;
+          // Closure capture detection: if we're in a nested function and
+          // the symbol comes from an outer scope, mark it as captured
+          if Assigned(FCurrentNestedFunc) and (s.Kind in [symVar, symLet, symCon]) then
+          begin
+            symLvl := ResolveSymbolLevel(ident.Name);
+            if (symLvl >= 0) and (symLvl < FFuncScopeDepth) then
+            begin
+              // Variable is from outer scope — add to captured vars
+              FCurrentNestedFunc.AddCapturedVar(ident.Name, s.DeclType, symLvl);
+            end;
+          end;
         end;
       end;
     nkArrayLit:
@@ -3047,6 +3080,8 @@ var
   s: TSymbol;
   sym: TSymbol;
   fn: TAstFuncDecl;
+  savedNestedFunc: TAstFuncDecl;
+  savedScopeDepth: Integer;
   vtype, ctype, rtype, otype: TAurumType;
   sw: TAstSwitch;
   caseVal: TAstExpr;
@@ -3354,10 +3389,14 @@ begin
       end;
     nkFuncDecl:
       begin
-        // Nested function — register name in current scope for call resolution
+        // Nested function — register name and analyze body for captures
         if stmt is TAstFuncStmt then
         begin
           fn := TAstFuncStmt(stmt).FuncDecl;
+          // Set parent function name
+          if Assigned(FCurrentNestedFunc) then
+            fn.ParentFuncName := FCurrentNestedFunc.Name;
+          // Register function name in current scope
           if ResolveSymbol(fn.Name) = nil then
           begin
             s := TSymbol.Create(fn.Name);
@@ -3367,9 +3406,31 @@ begin
             for i := 0 to High(fn.Params) do
               s.ParamTypes[i] := fn.Params[i].ParamType;
             s.ReturnTypeName := fn.ReturnTypeName;
-            s.DeclType := atInt64;  // default, actual type resolved during lowering
+            s.DeclType := atInt64;
             AddSymbolToCurrent(s, stmt.Span);
           end;
+          // Save nested func context and analyze body for captures
+          savedNestedFunc := FCurrentNestedFunc;
+          savedScopeDepth := FFuncScopeDepth;
+          FCurrentNestedFunc := fn;
+          FFuncScopeDepth := Length(FScopes);
+          // Push scope for parameters
+          PushScope;
+          for i := 0 to High(fn.Params) do
+          begin
+            s := TSymbol.Create(fn.Params[i].Name);
+            s.Kind := symVar;
+            s.DeclType := fn.Params[i].ParamType;
+            AddSymbolToCurrent(s, fn.Params[i].Span);
+          end;
+          // Analyze body (triggers capture detection in CheckExpr)
+          if Assigned(fn.Body) then
+            for i := 0 to High(fn.Body.Stmts) do
+              CheckStmt(fn.Body.Stmts[i]);
+          PopScope;
+          // Restore context
+          FCurrentNestedFunc := savedNestedFunc;
+          FFuncScopeDepth := savedScopeDepth;
         end;
       end;
     else
@@ -3389,6 +3450,8 @@ begin
   FClassTypes := TStringList.Create;
   FClassTypes.Sorted := False;
   FCurrentClass := nil;
+  FCurrentNestedFunc := nil;
+  FFuncScopeDepth := 0;
   SetLength(FScopes, 0);
   // create global scope
   PushScope;

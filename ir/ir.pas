@@ -10,7 +10,8 @@ type
   TIRCallMode = (
     cmInternal,   // Call to function defined in current module
     cmImported,   // Call to function imported from another unit
-    cmExternal    // Call to external library (libc, etc.)
+    cmExternal,   // Call to external library (libc, etc.)
+    cmStaticLink  // Call to nested function (needs parent RBP as hidden param)
   );
 
   TIROpKind = (
@@ -64,8 +65,10 @@ type
      irLoadFieldHeap,  // load field from heap: Dest = *(Src1 + ImmInt)
      irStoreFieldHeap, // store field to heap: *(Src1 + ImmInt) = Src2
     // heap memory management
-    irAlloc,          // heap allocate: Dest = alloc(ImmInt bytes) -> pointer
-    irFree,           // heap free: free(Src1 pointer)
+     irAlloc,          // heap allocate: Dest = alloc(ImmInt bytes) -> pointer
+     irFree,           // heap free: free(Src1 pointer)
+    // closure support
+     irLoadCaptured,   // load captured var from parent frame: Dest = *(Src1 + ImmInt)
     // memory pool operations
     irPoolAlloc,      // pool allocate: Dest = pool_alloc(ImmInt bytes) -> pointer from pool
     irPoolFree,       // pool free all: free entire pool (Src1 = pool base pointer)
@@ -146,6 +149,14 @@ type
     ParamCount: Integer;
     EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
     ReturnStructSize: Integer; // size in bytes if function returns struct, 0 otherwise
+    // Closure support
+    ParentFuncName: string; // enclosing function name (if nested)
+    NeedsStaticLink: Boolean; // true if captures variables from outer scope
+    CapturedVars: array of record
+      Name: string;
+      OuterSlot: Integer; // slot in parent function
+      InnerSlot: Integer; // slot in this function
+    end;
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
