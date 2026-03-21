@@ -56,6 +56,7 @@ type
     // External symbols for PLT/GOT (Dynamic Linking)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
+    FPLT0CodePos: Integer;  // Position of PLT0 in code buffer
     // VMT (Virtual Method Table) support
     FVMTLabels: array of TLabelPos;
     FVMTLeaPositions: array of record
@@ -972,6 +973,7 @@ begin
   // External symbols for PLT/GOT
   SetLength(FExternalSymbols, 0);
   SetLength(FPLTGOTPatches, 0);
+  FPLT0CodePos := 0;
   // Energy tracking initialization
   FCurrentCPU := GetCPUEnergyModel(cfARM64);
   FEnergyContext.CurrentCPU := FCurrentCPU;
@@ -2643,52 +2645,47 @@ begin
   // Phase 9: Generate PLT stubs for external symbols
   if Length(FExternalSymbols) > 0 then
   begin
-    // Generate PLT0 (resolver stub)
-    // PLT0: ldr x16, [x16, #got_offset] ; br x16
-    // Standard ARM64 PLT entry is 16 bytes
-    
+    // NOTE: ARM64 PLT/GOT implementation is complex and not fully working yet.
+    // For now, we just emit PLT stubs that the ELF writer will set up.
+    // The PLT structure is:
+    // PLT0: ldr x17, [x16, #0] ; br x17 ; nop ; nop
+    // PLT[i]: ldr x17, [x16, #offset] ; br x17 ; nop ; nop
+    //
+    // X16 must contain GOT_BASE when PLT is called. This requires:
+    // 1. The dynamic linker to set up X16 correctly
+    // 2. The GOT to be placed at a fixed offset from PLT
+    //
+    // This is a known issue - the PLT/GOT implementation needs more work.
+
     // Record PLT0 position
-    // PLT0: 
-    //   ldr x16, [x16, #12]  ; load got entry (offset will be patched)
-    //   br x16               ; jump to resolved address
-    
-    // First, generate PLT0 (resolver stub) - 16 bytes
-    // ldr x16, [x16, #0] - placeholder (will be patched to point to GOT)
-    // br x16
-    EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0]
-    EmitInstr(FCode, $D61F0200);  // br x16
-    
-    // Pad to 16 bytes
+    FPLT0CodePos := FCode.Size;
+
+    // PLT0: ldr x17, [x16, #0] ; br x17
+    EmitInstr(FCode, $F9400211);  // ldr x17, [x16, #0]
+    EmitInstr(FCode, $D61F0220);  // br x17
     EmitInstr(FCode, $D503201F);  // nop
     EmitInstr(FCode, $D503201F);  // nop
-    
-    // Now generate PLT entries for each external symbol (16 bytes each)
+
+    // Generate PLT entries for each external symbol (16 bytes each)
     for i := 0 to High(FExternalSymbols) do
     begin
       // Register PLT stub label
       SetLength(FLabelPositions, Length(FLabelPositions) + 1);
       FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
       FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
-      
-      // PLTn entry (16 bytes):
-      // ldr x16, [x16, #offset]  ; load GOT entry
-      // br x16                    ; jump to resolved address
+
+      // PLTn entry (16 bytes)
       SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
       FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolIndex := i;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 0;
-      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 4;
-      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := 0;
-      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;
-      
-      // ldr x16, [x16, #offset] - offset will be patched by writer
-      // Offset to GOT entry: 16 (PLT0) + i * 16 + 8
-      EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0] (placeholder)
-      // br x16
-      EmitInstr(FCode, $D61F0200);  // br x16
-      
-      // Pad to 16 bytes
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 0;
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := FPLT0CodePos;
+      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := gotOffset + 24 + i * 8;
+
+      EmitInstr(FCode, $F9400211);  // ldr x17, [x16, #0]
+      EmitInstr(FCode, $D61F0220);  // br x17
       EmitInstr(FCode, $D503201F);  // nop
       EmitInstr(FCode, $D503201F);  // nop
     end;
