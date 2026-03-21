@@ -678,14 +678,16 @@ begin
  
                // Check if we have external symbols
                externSymbols := arm64Emit.GetExternalSymbols;
-               if Length(externSymbols) > 0 then
-               begin
-                 WriteLn('Note: ARM64 dynamic linking not yet fully implemented');
-                 WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
-               end;
- 
-               WriteLn('Generating static ELF for Linux ARM64');
-               WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+                if Length(externSymbols) > 0 then
+                begin
+                  WriteLn('Generating dynamic ELF for Linux ARM64 with ', Length(externSymbols), ' external symbols');
+                  WriteDynamicElf64ARM64(outputFile, codeBuf, dataBuf, entryVA, externSymbols, arm64Emit.GetPLTGOTPatches);
+                end
+                else
+                begin
+                  WriteLn('Generating static ELF for Linux ARM64');
+                  WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+                end;
  
                // Energy statistics output
                if flagEnergyLevel > 0 then
