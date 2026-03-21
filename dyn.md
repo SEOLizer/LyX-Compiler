@@ -114,16 +114,26 @@ Das macOS Backend (`macho64_writer.pas`) unterstützt noch kein dynamisches Link
 **Aufwand:** Mittel (~4h)
 **Priorität:** Niedrig
 
-### 3. ARM64 Dynamic Linking
+### 3. ~~ARM64 Dynamic Linking~~ ✅ Erledigt
 
-Das ARM64 Backend gibt derzeit eine Warnung aus:
+Das ARM64 Backend unterstützt jetzt dynamisches Linking:
+
 ```
-Note: ARM64 dynamic linking not yet fully implemented
-External symbols found: X (will be ignored for now)
+Generating dynamic ELF for Linux ARM64 with 1 external symbols
+Wrote /tmp/test_dyn
 ```
 
-**Aufwand:** Mittel (~3h)
-**Priorität:** Mittel
+Die `WriteDynamicElf64ARM64` Prozedur generiert:
+- `.interp` — `/lib/ld-linux-aarch64.so.1`
+- `.dynstr` — Symbol-String-Tabelle
+- `.dynsym` — Symbol-Tabelle (24 Bytes/Eintrag für ARM64)
+- `.hash` — Hash-Tabelle
+- `.got.plt` — GOT mit GOT[0]=_DYNAMIC, GOT[1]=link_map, GOT[2]=resolver
+- `.rela.plt` — `R_AARCH64_JUMP_SLOT` Relocations
+- `.dynamic` — DT_NEEDED, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_PLTGOT, DT_JMPREL, DT_BIND_NOW, DT_DEBUG, DT_NULL
+- 4 Program Headers (PHDR, INTERP, LOAD RX, LOAD RW)
+
+**Commit:** cb07844
 
 ## Testing
 

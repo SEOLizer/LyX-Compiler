@@ -14,9 +14,9 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Mittel | **GOT-Einträge validieren** | Initiale Werte der GOT prüfen (lazy binding) |
+| Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
 | Niedrig | **macOS Dynamic Linking** | PLT/GOT für Mach-O implementieren |
-| Niedrig | **ARM64 Dynamic Linking** | PLT/GOT für ARM64 Linux implementieren |
+| Niedrig | ~~**ARM64 Dynamic Linking**~~ ✅ | PLT/GOT für ARM64 Linux implementieren |
 
 ### Backend
 
