@@ -82,6 +82,7 @@ type
   TAstStructDecl = class;
   TAstClassDecl = class;
   TAstInterfaceDecl = class;
+  TAstFuncDecl = class;
 
   { --- Knotenlisten --- }
 
@@ -458,6 +459,13 @@ type
   TAstStmt = class(TAstNode)
   public
     constructor Create(aKind: TNodeKind; aSpan: TSourceSpan);
+  end;
+
+  { Nested function wrapper: fn innerName() { ... } inside a function body }
+  TAstFuncStmt = class(TAstStmt)
+  public
+    FuncDecl: TAstFuncDecl;
+    constructor Create(aFuncDecl: TAstFuncDecl);
   end;
 
   { Variable/Let/Co-Deklaration: var x: int64 := 42; }
@@ -1502,6 +1510,12 @@ end;
 constructor TAstStmt.Create(aKind: TNodeKind; aSpan: TSourceSpan);
 begin
   inherited Create(aKind, aSpan);
+end;
+
+constructor TAstFuncStmt.Create(aFuncDecl: TAstFuncDecl);
+begin
+  inherited Create(nkFuncDecl, aFuncDecl.Span);
+  FuncDecl := aFuncDecl;
 end;
 
 // ================================================================
