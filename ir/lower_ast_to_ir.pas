@@ -385,12 +385,11 @@ begin
     if node is TAstFuncDecl then
     begin
        // Skip extern function declarations (no body to lower)
-       if TAstFuncDecl(node).IsExtern then
-       begin
-         // Register as extern so call sites can set cmExternal
-         FExternFuncs.Add(TAstFuncDecl(node).Name);
-         Continue;
-       end;
+        if TAstFuncDecl(node).IsExtern then
+        begin
+          FExternFuncs.Add(TAstFuncDecl(node).Name);
+          Continue;
+        end;
        // Skip abstract methods (no body to lower)
        if TAstFuncDecl(node).IsAbstract then
        begin
@@ -942,6 +941,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     ltype, rType: TAurumType;
     width: Integer;
     w: Integer;
+    captureIdx: Integer;
     lit: Int64;
     mask64: UInt64;
     truncated: UInt64;
@@ -1095,6 +1095,35 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         
         // Look up local variable
         loc := ResolveLocal(TAstIdent(expr).Name);
+        if loc < -1 then
+        begin
+          // Captured variable: load from parent frame via static link
+          // loc = -100 - captureIndex
+          captureIdx := -100 - loc;
+          if Assigned(FCurrentFuncDecl) and (captureIdx <= High(FCurrentFuncDecl.CapturedVars)) then
+          begin
+            // The OuterSlot in CapturedVars needs to be looked up in parent's FLocalMap
+            // But we cleared FLocalMap when we entered this function.
+            // For now, use the captured var index as a hint — the actual slot is determined
+            // by the parent function's local map at the time of the call.
+            // We'll load from static_link + SlotOffset(outerSlot) where outerSlot is 
+            // the index in the parent's locals.
+            // Since we don't have the parent's FLocalMap here, we use a convention:
+            // The captured var's OuterSlot is stored as the slot index in the parent function.
+            // This was set by the Sema, but the Sema doesn't know slot indices.
+            // WORKAROUND: Use the captured var index as outerSlot (0-based).
+            // This works because the parent's captured vars are allocated in order.
+            t0 := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op := irLoadCaptured;
+            instr.Dest := t0;
+            instr.Src1 := 0; // static link is in slot 0
+            instr.ImmInt := captureIdx; // use capture index as outer slot (patched later)
+            Emit(instr);
+            Result := t0;
+            Exit;
+          end;
+        end;
         if loc < 0 then
         begin
           // Check if it's a compile-time constant
@@ -1900,15 +1929,20 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Dest := t0;
           instr.ImmStr := callName;
           instr.ImmInt := Length(callTemps);
-          // Determine call mode: check if function is defined locally first
-          // If defined in module -> internal
-          // If only in FImportedFuncs (not in module) -> imported
-          // If in FExternFuncs -> external
+          // Determine call mode
           fn := FModule.FindFunction(callName);
-          if Assigned(fn) then
-            instr.CallMode := cmInternal
-          else if FExternFuncs.IndexOf(callName) >= 0 then
+          // cmExternal has highest priority
+          if FExternFuncs.IndexOf(callName) >= 0 then
+          begin
             instr.CallMode := cmExternal
+          end
+          else if Assigned(fn) then
+          begin
+            if fn.NeedsStaticLink then
+              instr.CallMode := cmStaticLink
+            else
+              instr.CallMode := cmInternal;
+          end
           else if FImportedFuncs.IndexOf(callName) >= 0 then
             instr.CallMode := cmImported
           else
@@ -2071,7 +2105,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.Op := irCall;
             instr.Dest := t0;
             instr.ImmStr := call.Name;
-            instr.ImmInt := argCount; // Backend needs argCount in ImmInt
+            instr.ImmInt := argCount;
+            callName := call.Name; // for call mode determination
             instr.IsVirtualCall := False;
             instr.VMTIndex := -1;
             instr.SelfSlot := -1;
@@ -2179,19 +2214,24 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             end;
           
           // Determine call mode based on function origin
-          // Check if function is defined locally first
           fn := FModule.FindFunction(call.Name);
-          if Assigned(fn) then
-            instr.CallMode := cmInternal
-          else if FExternFuncs.IndexOf(call.Name) >= 0 then
+          // cmExternal has highest priority
+          if FExternFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmExternal
+          else if Assigned(fn) then
+          begin
+            if fn.NeedsStaticLink then
+              instr.CallMode := cmStaticLink
+            else
+              instr.CallMode := cmInternal;
+          end
           else if FImportedFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmImported
           else
             instr.CallMode := cmInternal;
-          SetLength(instr.ArgTemps, argCount);
-          for i := 0 to argCount - 1 do
-            instr.ArgTemps[i] := argTemps[i];
+          SetLength(instr.ArgTemps, Length(callTemps));
+          for i := 0 to High(callTemps) do
+            instr.ArgTemps[i] := callTemps[i];
           Emit(instr);
           Result := t0;
           end;
@@ -3368,13 +3408,14 @@ end;
 procedure TIRLowering.LowerNestedFunc(funcDecl: TAstFuncDecl);
 var
   fn: TIRFunction;
-  j: Integer;
+  j, captureSlot, outerSlot: Integer;
   structIdx: Integer;
   sd: TAstStructDecl;
   savedFunc: TIRFunction;
   savedDecl: TAstFuncDecl;
   savedLocalMap: TStringList;
   savedTempCounter: Integer;
+  instr: TIRInstr;
 begin
   // Save current function context
   savedFunc := FCurrentFunc;
@@ -3395,8 +3436,53 @@ begin
         FLocalConst[j].Free;
     SetLength(FLocalConst, 0);
     FTempCounter := 0;
-    fn.ParamCount := Length(funcDecl.Params);
-    fn.LocalCount := fn.ParamCount;
+
+    // Copy closure info from AST to IR
+    fn.ParentFuncName := funcDecl.ParentFuncName;
+    fn.NeedsStaticLink := funcDecl.NeedsStaticLink;
+
+    // Params: if needs static link, add as implicit first param (slot 0 = static link)
+    if funcDecl.NeedsStaticLink then
+    begin
+      fn.ParamCount := Length(funcDecl.Params) + 1; // +1 for static link
+      fn.LocalCount := fn.ParamCount;
+      SetLength(FLocalTypes, fn.LocalCount);
+      SetLength(FLocalConst, fn.LocalCount);
+      // Slot 0 = static link pointer (parent RBP)
+      // Slots 1..N = regular params
+      FLocalMap.AddObject('__static_link__', IntToObj(0));
+      FLocalTypes[0] := atInt64;
+      FLocalConst[0] := nil;
+      for j := 0 to High(funcDecl.Params) do
+      begin
+        FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j + 1));
+        FLocalTypes[j + 1] := funcDecl.Params[j].ParamType;
+        FLocalConst[j + 1] := nil;
+      end;
+      // Register captured vars by name — they will be loaded via irLoadCaptured
+      for j := 0 to High(funcDecl.CapturedVars) do
+      begin
+        captureSlot := fn.LocalCount;
+        Inc(fn.LocalCount);
+        SetLength(FLocalTypes, fn.LocalCount);
+        SetLength(FLocalConst, fn.LocalCount);
+        FLocalTypes[captureSlot] := funcDecl.CapturedVars[j].VarType;
+        FLocalConst[captureSlot] := nil;
+        // Register: name -> special marker slot (captured vars use irLoadCaptured)
+        FLocalMap.AddObject(funcDecl.CapturedVars[j].Name, IntToObj(-100 - j));
+      end;
+    end
+    else
+    begin
+      fn.ParamCount := Length(funcDecl.Params);
+      fn.LocalCount := fn.ParamCount;
+      for j := 0 to fn.ParamCount - 1 do
+      begin
+        FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j));
+        FLocalTypes[j] := funcDecl.Params[j].ParamType;
+        FLocalConst[j] := nil;
+      end;
+    end;
 
     // Calculate ReturnStructSize
     fn.ReturnStructSize := 0;
@@ -3408,15 +3494,6 @@ begin
         sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
         fn.ReturnStructSize := sd.Size;
       end;
-    end;
-
-    SetLength(FLocalTypes, fn.LocalCount);
-    SetLength(FLocalConst, fn.LocalCount);
-    for j := 0 to fn.ParamCount - 1 do
-    begin
-      FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j));
-      FLocalTypes[j] := funcDecl.Params[j].ParamType;
-      FLocalConst[j] := nil;
     end;
 
     // Lower the function body

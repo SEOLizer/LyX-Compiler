@@ -911,9 +911,9 @@ Wenn du native x86 willst, musst du das definieren.
 
 ## Funktionsmodell
 
-- nur globale Funktionen?
-- nested functions?
-- closures? (würde ich vermeiden am Anfang)
+- ~~nur globale Funktionen?~~ — Nested Functions implementiert (v0.5.3)
+- ~~nested functions?~~ — Ja, via Lifting auf Top-Level
+- ~~closures? (würde ich vermeiden am Anfang)~~ — Ja, via Static-Link implementiert (v0.5.3+)
 
 ## Calling Convention
 
@@ -989,7 +989,7 @@ Keine:
 
 - Klassen
 - Generics
-- Closures
+- ~~Closures~~ — implementiert via Static-Link (v0.5.3+)
 - Heap
 - Strings als dynamischer Typ
 
