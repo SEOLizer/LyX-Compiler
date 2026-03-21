@@ -891,7 +891,7 @@ Das Framework verwendet ausschließlich Linux-Syscalls:
 
 ---
 
-## 29. Implementierte Module (TODO)
+## 29. Implementierte Module
 
 Alle geplanten Module wurden implementiert:
 

@@ -32,14 +32,26 @@ _(keine offenen Aufgaben)_
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Niedrig | **`std/geo.lyx` Return-Type** | `[GeoPoint, GeoPoint]` erfordert neue Array-Type-Literal-Parser-Regel |
+| Niedrig | **`std/geo.lyx` Return-Type** | `[GeoPoint, GeoPoint]` als Array-Type-Literal im Parser |
+
+#### `std/geo.lyx` — Teilaufgaben
+
+| # | Aufgabe | Datei | Beschreibung |
+|---|---------|-------|--------------|
+| 1 | **`atTuple` Typ definieren** | `ast.pas` | Neues `TAurumType.atTuple` + `TTupleElemTypes` Record |
+| 2 | **Parser: `[T, T, ...]` parsen** | `parser.pas` | In `ParseTypeExFull` nach `[`: wenn Identifier statt Integer → Tuple-Type parsen |
+| 3 | **Parser: Tuple-Elementtypen speichern** | `parser.pas` | `ParseTypeEx` erweitern um `out tupleElemTypes` oder separate Liste |
+| 4 | **Sema: Tuple-Return prüfen** | `sema.pas` | Return-Type-Check: `[GeoPoint, GeoPoint]` Literal passt zu `[GeoPoint, GeoPoint]` Annotation |
+| 5 | **IR: Tuple-Return lowering** | `lower_ast_to_ir.pas` | Array-Literal mit Struct-Elementen als Tuple-Return → `irReturnStruct` oder Hidden-Ptr |
+| 6 | **Backend: Tuple-Return codegen** | `x86_64_emit.pas` | SysV ABI: 2 Structs ≤16B → RAX:RDX, >16B → Hidden-Ptr in RDI |
+
+**Betroffene Funktionen in `std/geo.lyx`:**
+- `BoundingBoxFromPoints(p1, p2): [GeoPoint, GeoPoint]` (Zeile 247)
+- `CalculateBoundingBox(center, radiusM): [GeoPoint, GeoPoint]` (Zeile 496)
 
 ### Dokumentation
 
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Niedrig | **lyxvision.md** | "TODO" Überschrift ist veraltet - Module sind implementiert |
-| Niedrig | **dyn.md** | Debugging-Tasks für PLT/GOT dokumentieren |
+_(keine offenen Aufgaben)_
 
 ---
 
