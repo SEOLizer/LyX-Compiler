@@ -161,8 +161,6 @@ var
   pageSize: UInt64 = 4096;
   codeOffset: UInt64;
   codeSize: UInt64;
-  dataOffset: UInt64;
-  dataSize: UInt64;
   fileBuf: TFileStream;
   elfHeader: TByteBuffer;
   phdr: TByteBuffer;
@@ -171,11 +169,9 @@ var
 begin
   baseVA := $400000;
 
+  // All data (code + embedded strings + globals) is in the code buffer
   codeSize := codeBuf.Size;
-  dataSize := dataBuf.Size;
-
-  codeOffset := pageSize;
-  dataOffset := codeOffset + AlignUp(codeSize, pageSize);
+  codeOffset := pageSize;  // 0x1000
 
   elfHeader := TByteBuffer.Create;
   phdr := TByteBuffer.Create;
@@ -211,15 +207,8 @@ begin
     phdr.WriteU64LE(baseVA + codeOffset);
     phdr.WriteU64LE(baseVA + codeOffset);
 
-    // filesz must cover from codeOffset to end of file (after alignment)
-    // The file contains: headers + padding + code + padding + data
-    // We need to ensure the entire data section is included
-    filesz := dataOffset - codeOffset + dataSize;
-    // Align to page size
-    filesz := AlignUp(filesz, pageSize);
-    // Ensure at least one full page after code
-    if filesz < pageSize then
-      filesz := pageSize;
+    // Code segment covers: padding + code (with embedded data)
+    filesz := codeSize;  // No separate data section
     memsz := filesz;
 
     phdr.WriteU64LE(filesz);
@@ -231,9 +220,8 @@ begin
       fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
       fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
       while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
-      if codeSize > 0 then fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
-      while fileBuf.Position < Int64(dataOffset) do fileBuf.WriteByte(0);
-      if dataSize > 0 then fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataSize);
+      if codeSize > 0 then 
+        fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
     finally
       fileBuf.Free;
     end;
