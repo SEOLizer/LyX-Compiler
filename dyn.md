@@ -114,16 +114,10 @@ Das macOS Backend (`macho64_writer.pas`) unterstützt noch kein dynamisches Link
 **Aufwand:** Mittel (~4h)
 **Priorität:** Niedrig
 
-### 3. ~~ARM64 Dynamic Linking~~ ✅ Erledigt
+### 3. ~~ARM64 Dynamic Linking~~ ⚠️ Teilweise
 
-Das ARM64 Backend unterstützt jetzt dynamisches Linking:
-
-```
-Generating dynamic ELF for Linux ARM64 with 1 external symbols
-Wrote /tmp/test_dyn
-```
-
-Die `WriteDynamicElf64ARM64` Prozedur generiert:
+Das ARM64 Backend generiert jetzt ein korrektes dynamisches ELF mit:
+- `.text` — Code-Sektion (PROGBITS, SHF_ALLOC | SHF_EXECINSTR)
 - `.interp` — `/lib/ld-linux-aarch64.so.1`
 - `.dynstr` — Symbol-String-Tabelle
 - `.dynsym` — Symbol-Tabelle (24 Bytes/Eintrag für ARM64)
@@ -131,7 +125,17 @@ Die `WriteDynamicElf64ARM64` Prozedur generiert:
 - `.got.plt` — GOT mit GOT[0]=_DYNAMIC, GOT[1]=link_map, GOT[2]=resolver
 - `.rela.plt` — `R_AARCH64_JUMP_SLOT` Relocations
 - `.dynamic` — DT_NEEDED, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_PLTGOT, DT_JMPREL, DT_BIND_NOW, DT_DEBUG, DT_NULL
-- 4 Program Headers (PHDR, INTERP, LOAD RX, LOAD RW)
+- 5 Program Headers (PHDR, INTERP, LOAD RX, LOAD RW, PT_DYNAMIC)
+
+**Offenes Problem:** Exit 135 (SIGBUS) beim Ausführen. Der ARM64-Emitter generiert PLT-Stubs,
+aber die GOT-Initialisierung oder PLT-Offset-Berechnung ist fehlerhaft.
+
+```
+$ qemu-aarch64-static /tmp/hello_arm64_static    # funktioniert ✅
+$ docker --platform linux/arm64 debian:stable-slim /tmp/test_dynamic_arm64  # Bus Error ❌
+```
+
+**Commit:** 4cd78b8
 
 **Commit:** cb07844
 
