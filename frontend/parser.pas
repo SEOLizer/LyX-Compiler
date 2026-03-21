@@ -772,6 +772,10 @@ begin
   if Check(tkVar) or Check(tkLet) or Check(tkCo) then
     Exit(ParseVarLetCoDecl);
 
+  // Nested function declaration
+  if Check(tkFn) then
+    Exit(TAstFuncStmt.Create(ParseFuncDecl(False)));
+
   if Check(tkIf) then
   begin
     // if (Expr) Stmt [else Stmt]
