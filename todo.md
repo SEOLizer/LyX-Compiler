@@ -32,9 +32,7 @@ _(keine offenen Aufgaben)_
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Niedrig | **Leere Arrays + push** | Compiler-Crash bei `var a := []; push(a, 42)` |
-| Niedrig | **`std/geo.lyx` Return-Type** | `[GeoPoint, GeoPoint]` als generischer Array-Typ im Parser |
-| Niedrig | **`irLoadLocalAddr` Large Offsets** | RBP-relative Offsets > 127 Bytes prüfen |
+| Niedrig | **`std/geo.lyx` Return-Type** | `[GeoPoint, GeoPoint]` erfordert neue Array-Type-Literal-Parser-Regel |
 
 ### Dokumentation
 
