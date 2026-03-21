@@ -100,14 +100,12 @@ elfHdr.e_shstrndx := shStrTabIdx;
 | .dynamic | DYNAMIC | Dynamic Linker-Informationen |
 | .shstrtab | STRTAB | Sektions-Header String-Tabelle |
 
-## Noch offen
+## Offene Aufgaben
 
-### 1. Sektionstabellen für statisches ELF
+### 1. ~~Sektionstabellen für statisches ELF~~ ✅ Erledigt
 
-Die `WriteElf64` Funktion (für statische Binaries ohne externe Symbole) generiert keine Sektionstabellen.
-
-**Aufwand:** Niedrig (~2h)
-**Priorität:** Niedrig
+Die `WriteElf64` Funktion generiert jetzt `.text` und `.shstrtab` Sektionstabellen.
+`objdump -d` und `readelf -S` funktionieren für statische Binaries.
 
 ### 2. macOS Dynamic Linking
 
@@ -148,7 +146,7 @@ ldd /tmp/test_dyn
 readelf -d /tmp/test_dyn
 readelf -r /tmp/test_dyn
 
-# Disassemblieren (benötigt Sektionstabellen)
+# Disassemblieren (Sektionstabellen jetzt verfügbar)
 objdump -d /tmp/test_dyn
 ```
 
