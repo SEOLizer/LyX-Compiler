@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.5.0
+Lyx Compiler v0.5.5
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, 
@@ -15,7 +15,9 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
 ✅ PLT/GOT Dynamic Linking for External Libraries
+✅ ARM64 Dynamic Linking fully functional (PLT/GOT, Hash Table, Relocations)
 ✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
+✅ Network Library (std.net): 14 Protocols with RFC Compliance
 ✅ IR-Level Inlining Optimization (v0.4.3)
 ✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
 ✅ PascalCase Naming Conventions (v0.4.3)
@@ -33,6 +35,122 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ```
+
+---
+
+## Network Library (std.net)
+
+Lyx includes a comprehensive network library with **14 protocol implementations**, all written in pure Lyx (no external dependencies except for TLS, SSH, and HTTPS which use system libraries via FFI).
+
+### Supported Protocols
+
+| Protocol | Type | Port | RFC | Module | Status |
+|----------|------|------|-----|--------|--------|
+| **TCP Sockets** | - | - | - | `std.net.socket` | ✅ |
+| **UDP Sockets** | - | - | - | `std.net.socket` | ✅ |
+| **DNS** | UDP | 53 | RFC 1035 | `std.net.dns` | ✅ |
+| **HTTP** | TCP | 80 | RFC 2616 | `std.net.http` | ✅ |
+| **HTTPS** | TCP | 443 | RFC 2818 | `std.net.https` | ✅ |
+| **TLS/SSL** | - | - | RFC 5246 | `std.net.tls` | ✅ |
+| **SMTP** | TCP | 25/587 | RFC 5321 | `std.net.smtp` | ✅ |
+| **IMAP** | TCP | 143/993 | RFC 3501 | `std.net.imap` | ✅ |
+| **Telnet** | TCP | 23 | RFC 854 | `std.net.telnet` | ✅ |
+| **NTP** | UDP | 123 | RFC 5905 | `std.net.ntp` | ✅ |
+| **SNMP** | UDP | 161 | RFC 1157 | `std.net.snmp` | ✅ |
+| **LDAP** | TCP | 389 | RFC 4511 | `std.net.ldap` | ✅ |
+| **SSH** | TCP | 22 | RFC 4251 | `std.net.ssh` | ✅ |
+| **BGP** | TCP | 179 | RFC 4271 | `std.net.bgp` | ✅ |
+| **MQTT** | TCP | 1883 | MQTT 3.1.1 | `std.net.mqtt` | ✅ |
+| **SIP** | UDP | 5060 | RFC 3261 | `std.net.sip` | ✅ |
+| **QUIC** | UDP | 443 | RFC 9000 | `std.net.quic` | ⚠️ |
+
+### Quick Examples
+
+```lyx
+// HTTP GET
+import std.net.http;
+var resp: HTTPResponse := HTTPGet("example.com", "/");
+PrintStr(resp.bodyPtr);
+HTTPResponseFree(resp);
+
+// HTTPS (OpenSSL)
+import std.net.https;
+var resp: HTTPResponse := HTTPSGet("api.example.com", "/data");
+
+// DNS
+import std.net.dns;
+var ip: int64 := GetHostByName("example.com");
+
+// SMTP Email
+import std.net.smtp;
+var conn: SMTPConn := SMTPConnect("smtp.example.com", 587);
+var email: SMTPEmail;
+email.from := "sender@example.com";
+email.to := "recipient@example.com";
+email.subject := "Hello";
+email.body := "Test from Lyx!";
+SMTPSend(conn, email);
+SMTPQuit(conn);
+
+// IMAP Email
+import std.net.imap;
+var imap: IMAPConn := IMAPConnect("imap.example.com", 143);
+IMAPLogin(imap, "user", "pass");
+var mbox: IMAPMailbox := IMAPSelect(imap, "INBOX");
+PrintInt(mbox.exists);
+IMAPLogout(imap);
+
+// NTP Time
+import std.net.ntp;
+var time: NTPTime := NTPGetTime("pool.ntp.org");
+PrintInt(time.unixTime);
+
+// MQTT Pub/Sub
+import std.net.mqtt;
+var mqtt: MQTTConn := MQTTConnect("broker.example.com", 1883, "client001");
+MQTTSubscribe(mqtt, "sensor/#", 0);
+MQTTPublishMsg(mqtt, "sensor/temp", "22.5", 4, 0);
+
+// SNMP Network Management
+import std.net.snmp;
+var resp: SNMPResponse := SNMPGet("192.168.1.1", "public", oid, 9);
+
+// LDAP Directory
+import std.net.ldap;
+var ldap: LDAPConn := LDAPConnect("ldap.example.com", 389);
+LDAPBind(ldap, "cn=admin,dc=example,dc=com", "password");
+LDAPSearch(ldap, "dc=example,dc=com", "(objectClass=*)", LDAP_SCOPE_SUBTREE);
+
+// SSH Remote
+import std.net.ssh;
+var session: SSHSession := SSHSessionNew();
+SSHConnect(session, "server.example.com", 22);
+SSHAuth(session, "user", "pass");
+var buf: int64 := SSHExecOutput(session, "ls -la\n", 4096);
+
+// Telnet
+import std.net.telnet;
+var conn: TelnetConn := TelnetConnect("towel.blinkenlights.nl", 23);
+
+// BGP Routing
+import std.net.bgp;
+var peer: BGPPeer := BGPConnect(BGPIPv4(192,168,1,1), 65001, 65000);
+BGPWaitEstablished(peer);
+BGPAdvertiseRoute(peer, BGPIPv4(10,0,0,0), 24, BGPIPv4(10,0,0,1));
+
+// SIP VoIP
+import std.net.sip;
+var sip: SIPConn := SIPConnect("sip.example.com", 5060);
+SIPRegister(sip, "alice", "secret", "example.com");
+```
+
+### Dependencies
+
+| Module | External Dependency |
+|--------|---------------------|
+| Most protocols | None (pure syscall) |
+| TLS/HTTPS | `libssl.so.3` (OpenSSL 3.x) |
+| SSH | `libssh2.so.1` |
 
 ---
 
