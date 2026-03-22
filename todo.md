@@ -6,9 +6,9 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
+| Mittel | ~~**HTTP/HTTPS Client**~~ ✅ | HTTPS-Client via OpenSSL 3.x FFI (std.net.tls + std.net.https) |
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
-| Mittel | **HTTP Client** | HTTPS-Client für std.net implementieren |
-| Niedrig | **TLS Support** | TLS/SSL für sichere Verbindungen |
+| Niedrig | ~~**TLS Support**~~ ✅ | TLS/SSL via OpenSSL 3.x FFI (std.net.tls) |
 
 ### Dynamic Linking
 
@@ -67,6 +67,14 @@ _(keine offenen Aufgaben)_
 ---
 
 ## Abgeschlossene Aufgaben
+
+### HTTPS Client via OpenSSL 3.x (März 2026)
+
+- [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
+- [x] **SNI Support** - Server Name Indication für moderne HTTPS-Server
+- [x] **Zertifikatsprüfung** - SSL_CTX_set_default_verify_paths + SSL_get_verify_result
+- [x] **std/net/https.lyx** - HTTPS Client (HTTPSGet, HTTPSPost) über TLS-verschlüsseltem TCP
+- [x] **Test-Programm** - tests/lyx/net/test_https.lyx
 
 ### ARM64 Dynamic Linking – ELF Generation Fixes (März 2026)
 
