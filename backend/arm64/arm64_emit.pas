@@ -903,6 +903,52 @@ begin
 end;
 
 // ==========================================================================
+// Compute the GOT VA that WriteDynamicElf64ARM64 will place the GOT at,
+// given the final code size and external symbol list.
+// Mirrors the layout calculation in elf64_arm64_writer.pas.
+// ==========================================================================
+
+function ComputeExpectedGotVA(const externalSymbols: array of TExternalSymbol;
+  codeSize: UInt64; dataSize: UInt64): UInt64;
+const
+  pageSize: UInt64 = 4096;
+  baseVA:   UInt64 = $400000;
+  interpSize: UInt64 = 27;  // Length('/lib/ld-linux-aarch64.so.1'#0)
+var
+  interpOffset, dynstrOffset: UInt64;
+  dynstrSize, dynsymSize, dynsymOffset: UInt64;
+  hashSize, hashOffset, gotOffsetSeg: UInt64;
+  dataShift: UInt64;
+  symCount, i: Integer;
+begin
+  symCount := Length(externalSymbols);
+
+  interpOffset := pageSize + codeSize;
+  if (interpOffset mod 8) <> 0 then
+    interpOffset := interpOffset + (8 - (interpOffset mod 8));
+
+  dynstrOffset := (interpOffset + interpSize + pageSize - 1) and not (pageSize - 1);
+
+  // dataShift: user data lives at the start of the RW segment, before dynstr
+  dataShift := (dataSize + 7) and not UInt64(7);
+
+  // dynstrSize: 1 null byte + library names + symbol names (each NUL-terminated)
+  dynstrSize := 1;
+  for i := 0 to symCount - 1 do
+    dynstrSize := dynstrSize + UInt64(Length(externalSymbols[i].LibraryName)) + 1;
+  for i := 0 to symCount - 1 do
+    dynstrSize := dynstrSize + UInt64(Length(externalSymbols[i].Name)) + 1;
+
+  dynsymSize   := UInt64(symCount + 1) * 24;
+  dynsymOffset := (dataShift + dynstrSize + 7) and not UInt64(7);
+  hashSize     := UInt64(3 + 2 * symCount) * 4;
+  hashOffset   := (dynsymOffset + dynsymSize + 7) and not UInt64(7);
+  gotOffsetSeg := (hashOffset + hashSize + 7) and not UInt64(7);
+
+  Result := baseVA + dynstrOffset + gotOffsetSeg;
+end;
+
+// ==========================================================================
 // Helper function to get library name for external symbols
 // ==========================================================================
 
@@ -1130,6 +1176,11 @@ var
   ei: Integer;
   disp: Int32;
   origInstr: DWord;
+
+  // Phase 11: PLT GOT patching
+  gotBaseVA, gotSlotVA, stubVA: UInt64;
+  ldrPos: Integer;
+  wordOff: Int64;
   rd, rn: Byte;
   
   // Temporaries
@@ -1198,28 +1249,13 @@ begin
   FTotalDataOffset := FData.Size;
   
   // Phase 2: Emit _start entry point
-  // _start will call main() and then exit with the return value
-  // 
-  // IMPORTANT: For dynamic linking, X16 must contain the GOT base address.
-  // We set X16 to GOT_BASE = baseVA + 0x3000 (fixed offset in data segment)
-  
+  // _start calls main() and exits with the return value.
+
   // Save position for _start
   SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
   FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
   FFuncNames.Add('_start');
-  
-  // _start:
-  //   movz x18, #0x0050    ; X18 = lower 16 bits of GOT_BASE
-  //   movk x18, #0x4100, lsl #16  ; X18 = GOT_BASE (0x410050)
-  //   bl main
-  //   mov x8, #93    ; sys_exit
-  //   svc #0
-  
-  // Set X18 to GOT base (0x410050)
-  // GOT is at fixed address in data segment: baseVA + 0x10000 + 0x50
-  EmitInstr(FCode, $D2800A32);  // movz x18, #0x50
-  EmitInstr(FCode, $F2A01478);  // movk x18, #0x4100, lsl #16
-  
+
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
   FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
@@ -2655,25 +2691,21 @@ begin
   // Phase 9: Generate PLT stubs for external symbols
   if Length(FExternalSymbols) > 0 then
   begin
-    // ARM64 PLT/GOT Implementation:
-    // X18 is the GOT base register, set in startup code to GOT_BASE
-    // PLT functions must preserve X18
+    // ARM64 PLT/GOT Implementation using LDR (literal):
+    // Each PLT stub is 8 bytes:
+    //   ldr x17, <GOT_slot>  ; PC-relative load of resolved function address
+    //   br  x17              ; Jump to resolved function
     //
-    // PLT stub structure (12 bytes):
-    //   ldr x17, [x18, #0]    ; Load function address from GOT
-    //   br x17                 ; Jump to function
-    //
-    // Note: This assumes X18 = GOT_BASE when PLT is called.
-    // The startup code sets X18 to GOT_BASE before calling main.
+    // The LDR imm19 offset is patched in Phase 11 once we know the GOT VA.
+    // DT_BIND_NOW is used, so the dynamic linker resolves all GOT entries
+    // before the program runs. PLT0 is never called and can be NOPs.
 
-    // Record PLT0 position
+    // PLT0: two NOPs (never called with DT_BIND_NOW)
     FPLT0CodePos := FCode.Size;
+    EmitInstr(FCode, $D503201F);  // NOP
+    EmitInstr(FCode, $D503201F);  // NOP
 
-    // PLT0: ldr x17, [x18, #0] ; br x17
-    EmitInstr(FCode, $F9001211);  // ldr x17, [x18, #0]
-    EmitInstr(FCode, $D61F03A0);  // br x17
-
-    // Generate PLT entries for each external symbol (12 bytes each)
+    // Generate PLT entries for each external symbol (8 bytes each)
     for i := 0 to High(FExternalSymbols) do
     begin
       // Register PLT stub label
@@ -2681,7 +2713,7 @@ begin
       FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
       FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
 
-      // PLTn entry (12 bytes): same as PLT0
+      // Record patch position so Phase 11 can fill in the correct LDR offset
       SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
       FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
@@ -2689,10 +2721,13 @@ begin
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 0;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 0;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := FPLT0CodePos;
-      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := $410050 + 24 + i * 8;
+      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;  // patched in Phase 11
 
-      EmitInstr(FCode, $F9001211);  // ldr x17, [x18, #0]
-      EmitInstr(FCode, $D61F03A0);  // br x17
+      // ldr x17, #0   (placeholder — imm19=0, patched in Phase 11)
+      // LDR (literal) 64-bit: 0x58000000 | (imm19 << 5) | Rt
+      EmitInstr(FCode, $58000011);  // ldr x17, #0  (placeholder)
+      // br x17 = 0xD61F0000 | (17 << 5) = 0xD61F0220
+      EmitInstr(FCode, $D61F0220);  // br x17
     end;
     
     // Now patch the calls to PLT stubs (BL __plt_<name>)
@@ -2775,6 +2810,24 @@ begin
         end;
         // If not found (abstract method), leave as 0
       end;
+    end;
+  end;
+
+  // Phase 11: Patch PLT LDR (literal) instructions with correct GOT offsets.
+  // Now that all code is emitted we know the final code size, so we can
+  // compute the exact GOT VA that the ELF writer will assign.
+  if Length(FPLTGOTPatches) > 0 then
+  begin
+    gotBaseVA := ComputeExpectedGotVA(FExternalSymbols, FCode.Size, FData.Size);
+    for i := 0 to High(FPLTGOTPatches) do
+    begin
+      ldrPos    := FPLTGOTPatches[i].Pos;
+      gotSlotVA := gotBaseVA + 24 + UInt64(FPLTGOTPatches[i].SymbolIndex) * 8;
+      stubVA    := $400000 + $1000 + UInt64(ldrPos);  // baseVA + codeOffset + pos
+      wordOff   := Int64(gotSlotVA - stubVA) div 4;
+      // LDR X17 (literal): 0x58000011 | (imm19[18:0] << 5)
+      FCode.PatchU32LE(ldrPos, $58000011 or DWord(DWord(wordOff and $7FFFF) shl 5));
+      FPLTGOTPatches[i].GotVA := gotSlotVA;
     end;
   end;
 
