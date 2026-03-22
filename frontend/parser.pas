@@ -1805,6 +1805,7 @@ var
   savedSpan: TSourceSpan;
   nsCandidate: string;
   nsSpan: TSourceSpan;
+  widthVal, decimalsVal: Integer;
 begin
   name := FCurTok.Value;
   span := FCurTok.Span;
@@ -1879,6 +1880,32 @@ begin
       while True do
       begin
         a := ParseExpr;
+        // Check for Pascal format specifier: expr:width:decimals
+        if Check(tkColon) then
+        begin
+          Advance; // consume ':'
+          if Check(tkIntLit) then
+          begin
+            widthVal := StrToIntDef(FCurTok.Value, 0);
+            Advance; // consume width
+            if Check(tkColon) then
+            begin
+              Advance; // consume ':'
+              if Check(tkIntLit) then
+              begin
+                decimalsVal := StrToIntDef(FCurTok.Value, 0);
+                Advance; // consume decimals
+                a := TAstFormatExpr.Create(a, widthVal, decimalsVal, a.Span);
+              end
+              else
+                FDiag.Error('expected integer for decimal places in format specifier', FCurTok.Span);
+            end
+            else
+              FDiag.Error('expected '':'' after width in format specifier', FCurTok.Span);
+          end
+          else
+            FDiag.Error('expected integer for width in format specifier', FCurTok.Span);
+        end;
         SetLength(args, Length(args) + 1);
         args[High(args)] := a;
         if Accept(tkComma) then Continue;

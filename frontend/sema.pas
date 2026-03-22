@@ -1180,6 +1180,15 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // PrintFloat(f64) -> void
+  s := TSymbol.Create('PrintFloat');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atF64;
+  AddSymbolToCurrent(s, NullSpan);
+
   // printf(pchar, ...) -> void (varargs) - libc function, keep lowercase
   s := TSymbol.Create('printf');
   s.Kind := symFunc;
@@ -2311,8 +2320,13 @@ begin
         case bin.Op of
            tkPlus, tkMinus, tkStar, tkSlash, tkPercent:
              begin
-               // Check for float operands first
-               if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
+               // String concatenation: pchar + pchar
+               if (bin.Op = tkPlus) and TypeEqual(lt, atPChar) and TypeEqual(rt, atPChar) then
+               begin
+                 Result := atPChar;
+               end
+               // Check for float operands
+               else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
                begin
                  // Float arithmetic
                  Result := atF64;
@@ -2975,7 +2989,7 @@ begin
         // 'is' operator: expr is ClassName
         // Returns bool
         lt := CheckExpr(TAstIsExpr(expr).Expr);
-        
+
         // The target class must be a known class
         targetClassName := TAstIsExpr(expr).ClassName;
         if FClassTypes.IndexOf(targetClassName) < 0 then
@@ -2983,6 +2997,14 @@ begin
           FDiag.Error('Unknown class: ' + targetClassName, TAstIsExpr(expr).Span);
         end;
         Result := atBool;
+      end;
+    nkFormatExpr:
+      begin
+        lt := CheckExpr(TAstFormatExpr(expr).Expr);
+        if not (TypeEqual(lt, atF64) or TypeEqual(lt, atF32)) then
+          FDiag.Error('format specifier :width:decimals only valid for f32/f64', expr.Span);
+        expr.ResolvedType := atPChar;
+        Result := atPChar;
       end;
   else
     begin
