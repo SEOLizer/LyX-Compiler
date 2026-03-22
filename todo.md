@@ -6,8 +6,7 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwenden |
-| Niedrig | **SSH Client** | SSH-Client via libssh FFI |
+| Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
 ### Dynamic Linking
 
@@ -123,6 +122,17 @@ _(keine offenen Aufgaben)_
 - [x] **LDAP Result Codes** - Vollständige RFC 4511 Fehlercodes (SUCCESS bis OTHER)
 - [x] **Test-Programm** - tests/lyx/net/test_ldap.lyx
 
+### SSH Client (März 2026)
+
+- [x] **std/net/ssh.lyx** - libssh2 FFI Wrapper (SSHSessionNew, SSHConnect, SSHAuth, SSHExec, SSHOpenShell)
+- [x] **SSH Session** - libssh2_session_init_ex, libssh2_session_handshake
+- [x] **SSH Auth** - libssh2_userauth_password_ex (Passwort-Authentifizierung)
+- [x] **SSH Channels** - libssh2_channel_open_ex, libssh2_channel_process_startup
+- [x] **SSH Exec** - SSHExec(session, command) für Remote-Kommandoausführung
+- [x] **SSH Shell** - SSHOpenShell(session) für interaktive Sessions
+- [x] **SSH I/O** - SSHRead, SSHWrite, SSHEof, SSHSendEof
+- [x] **Test-Programm** - tests/lyx/net/test_ssh.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -215,6 +225,7 @@ _(keine offenen Aufgaben)_
 - [x] **NTP Client** - RFC 5905 (NTPGetTime, NTPParseResponse, NTPFormatTime)
 - [x] **SNMP Client** - RFC 1157/1905 (SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding)
 - [x] **LDAP Client** - RFC 4511 (LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind)
+- [x] **SSH Client** - libssh2 FFI (SSHConnect, SSHAuth, SSHExec, SSHOpenShell, SSHRead/Write)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -244,6 +255,7 @@ _(keine offenen Aufgaben)_
 - NTP Client (RFC 5905): NTPGetTime, NTPParseResponse, NTPFormatTime
 - SNMP Client (RFC 1157/1905): SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding
 - LDAP Client (RFC 4511): LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind
+- SSH Client (libssh2): SSHConnect, SSHAuth, SSHExec, SSHOpenShell
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
