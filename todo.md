@@ -114,6 +114,15 @@ _(keine offenen Aufgaben)_
 - [x] **Value Parsing** - SNMPResponseAsString, SNMPResponseAsInteger
 - [x] **Test-Programm** - tests/lyx/net/test_snmp.lyx
 
+### LDAP Client (März 2026)
+
+- [x] **std/net/ldap.lyx** - RFC 4511 LDAP Client (LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind)
+- [x] **LDAP Bind** - Simple Bind mit DN + Password Authentifizierung
+- [x] **LDAP Search** - BASE, ONE_LEVEL, SUBTREE Scopes mit Filter
+- [x] **LDAP Unbind** - Saubere Trennung
+- [x] **LDAP Result Codes** - Vollständige RFC 4511 Fehlercodes (SUCCESS bis OTHER)
+- [x] **Test-Programm** - tests/lyx/net/test_ldap.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -205,6 +214,7 @@ _(keine offenen Aufgaben)_
 - [x] **IMAP Client** - RFC 3501 (IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList)
 - [x] **NTP Client** - RFC 5905 (NTPGetTime, NTPParseResponse, NTPFormatTime)
 - [x] **SNMP Client** - RFC 1157/1905 (SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding)
+- [x] **LDAP Client** - RFC 4511 (LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -233,6 +243,7 @@ _(keine offenen Aufgaben)_
 - IMAP Client (RFC 3501): IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList
 - NTP Client (RFC 5905): NTPGetTime, NTPParseResponse, NTPFormatTime
 - SNMP Client (RFC 1157/1905): SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding
+- LDAP Client (RFC 4511): LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
