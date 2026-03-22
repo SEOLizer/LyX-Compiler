@@ -15,7 +15,7 @@
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
 | Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
-| Niedrig | **macOS Dynamic Linking** | PLT/GOT für Mach-O implementieren (LC_LOAD_DYLIB + Stub-PLT) |
+| Niedrig | ~~**macOS Dynamic Linking**~~ ✅ | PLT/GOT für Mach-O implementieren (LC_LOAD_DYLIB + Stub-PLT) |
 | Niedrig | ~~**ARM64 PLT/GOT Implementation**~~ ✅ | LDR (literal) + BR X17 PLT-Stubs, DT_PLTREL fix, dataBuf im RW-Segment |
 
 ### C FFI
@@ -149,6 +149,13 @@ _(keine offenen Aufgaben)_
 ---
 
 ## Versionsverlauf
+
+### v0.5.4 (März 2026)
+- C FFI: Windows x64 IAT-Import (`GetExternLibrary` → `msvcrt.dll`, `FindOrAddImportDll/Func`)
+- C FFI: macOS x86_64 + ARM64 Dynamic Mach-O (`LC_LOAD_DYLIB` + dyld bind opcodes + Stub-PLT)
+- macOS x86_64: volle IR-Coverage (70 Opcodes) via `TX86_64Emitter` mit `SetTargetOS(atmacOS)`
+- `importC` auf ARM64: extern fn via PLT/GOT statt Inline-Stub
+- `TTargetOS` als gemeinsamer Typ in `backend_types.pas`
 
 ### v0.5.3 (März 2026)
 - Sektionstabellen für statisches ELF (objdump -d support)
