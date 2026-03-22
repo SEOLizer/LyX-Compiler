@@ -22,7 +22,7 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Mittel | **Windows x64 FFI** | `GetExternLibrary` in `win64_emit.pas` auswerten → DLL-Name für IAT-Import |
+| Mittel | ~~**Windows x64 FFI**~~ ✅ | `GetExternLibrary` in `win64_emit.pas` auswerten → DLL-Name für IAT-Import |
 | Niedrig | ~~**macOS x86_64 FFI**~~ ✅ | Dynamic Mach-O: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
 | Niedrig | ~~**macOS ARM64 FFI**~~ ✅ | Dynamic Mach-O ARM64: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
 | Niedrig | ~~**`importC` auf ARM64**~~ ✅ | `importC "header.h"` mit `--target=linux-arm64` testen und verifizieren |
