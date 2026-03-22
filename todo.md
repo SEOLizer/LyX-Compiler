@@ -17,6 +17,8 @@
 | Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
 | Niedrig | ~~**macOS Dynamic Linking**~~ ✅ | PLT/GOT für Mach-O implementieren (LC_LOAD_DYLIB + Stub-PLT) |
 | Niedrig | ~~**ARM64 PLT/GOT Implementation**~~ ✅ | LDR (literal) + BR X17 PLT-Stubs, DT_PLTREL fix, dataBuf im RW-Segment |
+| Mittel | **ARM64 libc init fix** | CRT-Start-Code (crt1.o) emittieren, `__libc_start_main` aufrufen |
+| Niedrig | **ARM64 PIE (ET_DYN) Binary** | Position Independent Executable für bessere libc-Kompatibilität |
 
 ### C FFI
 
@@ -65,6 +67,18 @@ _(keine offenen Aufgaben)_
 ---
 
 ## Abgeschlossene Aufgaben
+
+### ARM64 Dynamic Linking – ELF Generation Fixes (März 2026)
+
+- [x] **DT_NEEDED Library-Name** - Library-Name aus `externSymbols[i].LibraryName` statt Symbolname
+- [x] **dynsymOffset berechnung** - Verwendet dynstrSize (aligned to 8) statt hardcoded 8
+- [x] **LOAD(RW) p_align** - Korrektes p_align (pageSize) in PT_LOAD(RW) Program Header
+- [x] **Hash-Tabelle nchain** - `nchain = symCount + 1` (inkl. null symbol)
+- [x] **MOVZ/MOVK Encoding** - Korrekte Instruktionen für GOT_BASE (0x402058) in _start
+- [x] **Section Header VAs** - Korrekt relativ zu dynstrOffset
+- [x] **PLT mit X17** - GOT-Lookups über X17 statt X16 (vermeidet Register-Kollision)
+- [x] **WriteLdrImm9 Helper** - PLT Instruktion Encoding (LDR mit signed offset)
+- [x] **strlen Inline-Code** - Workaround für libc init: strlen wird inline generiert
 
 ### Dynamic Linking & Section Headers (März 2026)
 
