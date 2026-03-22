@@ -96,6 +96,8 @@ type
     // Helper
     procedure AddIATPatch(codeOffset, dllIdx, funcIdx: Integer);
     procedure WriteIndirectCall(iatDllIdx, iatFuncIdx: Integer);
+    function FindOrAddImportDll(const dllName: string): Integer;
+    function FindOrAddImportFunc(dllIdx: Integer; const funcName: string): Integer;
     
   public
     constructor Create;
@@ -129,6 +131,39 @@ implementation
 // ============================================================================
 // Utility Procedures
 // ============================================================================
+
+// Maps Linux-style library names to Windows DLL names.
+// Falls back to extracting the base name if no known mapping exists.
+function NormalizeWinDllName(const libName: string): string;
+var
+  base: string;
+  dotPos: Integer;
+begin
+  // Known mappings
+  if (libName = 'libc.so.6') or (libName = 'libc') or (libName = 'libm.so.6') then
+    Exit('msvcrt.dll');
+  if (libName = 'libpthread.so.0') or (libName = 'libpthread') then
+    Exit('msvcrt.dll');
+  if libName = 'kernel32.dll' then Exit('kernel32.dll');
+  if libName = 'user32.dll'   then Exit('user32.dll');
+  if libName = 'msvcrt.dll'   then Exit('msvcrt.dll');
+
+  // Strip leading 'lib' and trailing version / .so / .dll
+  base := libName;
+  // Remove path component if any
+  dotPos := LastDelimiter('/', base);
+  if dotPos > 0 then
+    base := Copy(base, dotPos + 1, MaxInt);
+  // Strip .so.X or .so suffix
+  dotPos := Pos('.so', base);
+  if dotPos > 0 then
+    base := Copy(base, 1, dotPos - 1);
+  // Strip leading 'lib'
+  if Copy(base, 1, 3) = 'lib' then
+    base := Copy(base, 4, MaxInt);
+  // Add .dll
+  Result := base + '.dll';
+end;
 
 procedure EmitU8(buf: TByteBuffer; v: Byte);
 begin
@@ -741,6 +776,34 @@ begin
   EmitU32(FCode, 0);  // Placeholder
 end;
 
+function TWin64Emitter.FindOrAddImportDll(const dllName: string): Integer;
+var
+  i, n: Integer;
+begin
+  for i := 0 to High(FImports) do
+    if SameText(FImports[i].DllName, dllName) then
+      Exit(i);
+  n := Length(FImports);
+  SetLength(FImports, n + 1);
+  FImports[n].DllName := dllName;
+  SetLength(FImports[n].Functions, 0);
+  Result := n;
+end;
+
+function TWin64Emitter.FindOrAddImportFunc(dllIdx: Integer; const funcName: string): Integer;
+var
+  i, n: Integer;
+begin
+  for i := 0 to High(FImports[dllIdx].Functions) do
+    if FImports[dllIdx].Functions[i].Name = funcName then
+      Exit(i);
+  n := Length(FImports[dllIdx].Functions);
+  SetLength(FImports[dllIdx].Functions, n + 1);
+  FImports[dllIdx].Functions[n].Name := funcName;
+  FImports[dllIdx].Functions[n].Hint := 0;
+  Result := n;
+end;
+
 function TWin64Emitter.EmitPrologue(localBytes, paramCount: Integer): Integer;
 var
   frameBytes, framePad: Integer;
@@ -1149,6 +1212,9 @@ var
   targetName: string;
   // Branch patching temps
   labelIdx, patchPos, jmpSize, relOffset: Integer;
+  // External FFI call temps
+  extDllName: string;
+  extDllIdx, extFuncIdx: Integer;
 begin
   // Prepare imports and builtin stubs
   SetupKernel32Imports;
@@ -2139,16 +2205,24 @@ begin
               EmitU8(FCode, $D0);
               // Skip the regular call emission below
             end
+            else if instr.CallMode = cmExternal then
+            begin
+              // External FFI call via IAT (FF 15 indirect call)
+              extDllName := NormalizeWinDllName(module.GetExternLibrary(instr.ImmStr));
+              if extDllName = '' then extDllName := 'msvcrt.dll';
+              extDllIdx  := FindOrAddImportDll(extDllName);
+              extFuncIdx := FindOrAddImportFunc(extDllIdx, instr.ImmStr);
+              WriteIndirectCall(extDllIdx, extFuncIdx);
+            end
             else
             begin
-            // For now, emit a call rel32 placeholder and record for patching
-            SetLength(FCallPatches, Length(FCallPatches) + 1);
-            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
-            // emit call rel32 with zero placeholder
-            EmitU8(FCode, $E8);
-            EmitU32(FCode, 0);
-            end; // end of virtual call handling
+              // Internal call: emit call rel32 placeholder
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+              EmitU8(FCode, $E8);
+              EmitU32(FCode, 0);
+            end; // end of call handling
             // Store return value from RAX to destination slot
             if instr.Dest >= 0 then
               WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);

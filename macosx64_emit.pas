@@ -2,25 +2,20 @@
 unit macosx64_emit;
 
 { macOS x86_64 Emitter
-  
-  Dieser Emitter ist weitgehend identisch mit dem Linux x86_64 Emitter,
-  da beide die gleiche CPU-Architektur und Calling Convention verwenden.
-  Der Hauptunterschied sind die Syscall-Nummern.
-  
-  macOS verwendet das XNU-Kernel-Syscall-Interface:
-  - Syscall-Nummern haben ein 0x2000000 Präfix für BSD-Syscalls
-  - Aufrufkonvention: RDI, RSI, RDX, R10, R8, R9 (wie Linux)
+
+  Emitter für macOS x86_64 (Mach-O, dyld FFI).
+  Unterstützt extern fn link "libname" über LC_LOAD_DYLIB + stub-PLT.
+
+  macOS Syscall-Interface (XNU):
+  - Syscall-Nummern: BSD-Syscalls haben Präfix 0x2000000
+  - Calling Convention: RDI, RSI, RDX, RCX, R8, R9 (wie SysV ABI)
   - SYSCALL Instruktion
-  
-  TODO: Derzeit ist dies eine minimale Implementierung, die nur
-  grundlegende Funktionalität bietet. Für volle Kompatibilität
-  müssen alle Linux-Syscall-Nummern durch macOS-Äquivalente ersetzt werden.
 }
 
 interface
 
 uses
-  SysUtils, Classes, bytes, ir, ast, backend_types, energy_model;
+  SysUtils, Classes, Math, bytes, ir, ast, backend_types, energy_model;
 
 type
   TLabelPos = record
@@ -62,11 +57,11 @@ type
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
-    
+
     procedure TrackEnergy(kind: TEnergyOpKind);
     procedure EmitDebugPrintString(const s: string);
     procedure EmitDebugPrintInt(valueReg: Integer);
-    
+
     { Syscall-Helfer für macOS }
     procedure EmitSyscallWrite;   // sys_write = 0x2000004
     procedure EmitSyscallExit;    // sys_exit = 0x2000001
@@ -75,7 +70,12 @@ type
     procedure EmitSyscallClose;   // sys_close = 0x2000006
     procedure EmitSyscallMmap;    // sys_mmap = 0x20000C5
     procedure EmitSyscallMunmap;  // sys_munmap = 0x2000049
-    
+
+    { Memory move helpers (instance methods, emit to FCode) }
+    procedure WriteMovRegMem(reg, base, disp: Integer);
+    procedure WriteMovMemReg(base, disp, reg: Integer);
+    function AddExternalSymbolMacos(const name: string; module: TIRModule): Integer;
+
   public
     constructor Create;
     destructor Destroy; override;
@@ -90,9 +90,6 @@ type
   end;
 
 implementation
-
-uses
-  Math;
 
 const
   // Register-Konstanten
@@ -118,7 +115,7 @@ const
   SYS_MACOS_NANOSLEEP = $20000F0; // sys_nanosleep (240)
   SYS_MACOS_GETTIMEOFDAY = $2000074; // sys_gettimeofday (116)
 
-{ Hilfsfunktionen für x86_64 Encoding }
+{ ---- Free functions (standalone helpers, take TByteBuffer as parameter) ---- }
 
 procedure EmitU8(b: TByteBuffer; v: Byte);
 begin
@@ -177,6 +174,54 @@ begin
   Result := -8 * (slot + 1);
 end;
 
+{ ---- Standalone memory move helpers (used in EmitFromIR before class is fully set up) ---- }
+
+procedure StandaloneWriteMovRegMem(buf: TByteBuffer; reg, base, disp: Integer);
+var
+  rexR, rexB: Integer;
+  modrm, modBits: Byte;
+begin
+  rexR := (reg shr 3) and 1;
+  rexB := (base shr 3) and 1;
+  EmitRex(buf, 1, rexR, 0, rexB);
+  EmitU8(buf, $8B);
+  if (disp >= -128) and (disp <= 127) then
+    modBits := $40
+  else
+    modBits := $80;
+  modrm := modBits or Byte(((reg and 7) shl 3) and $38) or Byte(base and $7);
+  EmitU8(buf, modrm);
+  if (base and 7) = 4 then
+    EmitU8(buf, $24);
+  if modBits = $40 then
+    EmitU8(buf, Byte(disp))
+  else
+    EmitU32(buf, Cardinal(disp));
+end;
+
+procedure StandaloneWriteMovMemReg(buf: TByteBuffer; base, disp, reg: Integer);
+var
+  rexR, rexB: Integer;
+  modrm, modBits: Byte;
+begin
+  rexR := (reg shr 3) and 1;
+  rexB := (base shr 3) and 1;
+  EmitRex(buf, 1, rexR, 0, rexB);
+  EmitU8(buf, $89);
+  if (disp >= -128) and (disp <= 127) then
+    modBits := $40
+  else
+    modBits := $80;
+  modrm := modBits or Byte(((reg and 7) shl 3) and $38) or Byte(base and $7);
+  EmitU8(buf, modrm);
+  if (base and 7) = 4 then
+    EmitU8(buf, $24);
+  if modBits = $40 then
+    EmitU8(buf, Byte(disp))
+  else
+    EmitU32(buf, Cardinal(disp));
+end;
+
 { TMacOSX64Emitter }
 
 constructor TMacOSX64Emitter.Create;
@@ -192,8 +237,7 @@ begin
   SetLength(FVMTLabels, 0);
   SetLength(FExternalSymbols, 0);
   SetLength(FPLTGOTPatches, 0);
-  
-  // Energy-Modell initialisieren
+
   FCurrentCPU := GetCPUEnergyModel(cfX86_64);
   FEnergyContext.Config := GetEnergyConfig;
   FEnergyContext.CurrentCPU := FCurrentCPU;
@@ -245,6 +289,62 @@ begin
     cost := 0;
   end;
   FCurrentFunctionEnergy := FCurrentFunctionEnergy + cost;
+end;
+
+procedure TMacOSX64Emitter.WriteMovRegMem(reg, base, disp: Integer);
+begin
+  StandaloneWriteMovRegMem(FCode, reg, base, disp);
+end;
+
+procedure TMacOSX64Emitter.WriteMovMemReg(base, disp, reg: Integer);
+begin
+  StandaloneWriteMovMemReg(FCode, base, disp, reg);
+end;
+
+function GetMacOSLibraryForSymbol(const symbolName: string): string;
+begin
+  // Map well-known symbols to their macOS library paths
+  if (symbolName = 'strlen') or (symbolName = 'strcmp') or
+     (symbolName = 'strcpy') or (symbolName = 'strcat') or
+     (symbolName = 'strstr') or (symbolName = 'strchr') or
+     (symbolName = 'strdup') or (symbolName = 'malloc') or
+     (symbolName = 'free') or (symbolName = 'realloc') or
+     (symbolName = 'memcpy') or (symbolName = 'memmove') or
+     (symbolName = 'memset') or (symbolName = 'memcmp') or
+     (symbolName = 'printf') or (symbolName = 'sprintf') or
+     (symbolName = 'fopen') or (symbolName = 'fclose') or
+     (symbolName = 'fread') or (symbolName = 'fwrite') or
+     (symbolName = 'fprintf') or (symbolName = 'fscanf') or
+     (symbolName = 'atoi') or (symbolName = 'atof') or
+     (symbolName = 'strtol') or (symbolName = 'strtod') or
+     (symbolName = 'exit') or (symbolName = 'abort') or
+     (symbolName = 'system') or (symbolName = 'getenv') or
+     (symbolName = 'setenv') or (symbolName = 'unsetenv') or
+     (symbolName = 'sqrt') or (symbolName = 'sin') or
+     (symbolName = 'cos') or (symbolName = 'tan') or
+     (symbolName = 'pow') or (symbolName = 'floor') or
+     (symbolName = 'ceil') or (symbolName = 'fabs') then
+    Result := '/usr/lib/libSystem.B.dylib'
+  else
+    Result := '/usr/lib/libSystem.B.dylib';
+end;
+
+function TMacOSX64Emitter.AddExternalSymbolMacos(const name: string; module: TIRModule): Integer;
+var
+  i: Integer;
+  libName: string;
+begin
+  for i := 0 to High(FExternalSymbols) do
+    if FExternalSymbols[i].Name = name then
+    begin
+      Result := i;
+      Exit;
+    end;
+  Result := Length(FExternalSymbols);
+  SetLength(FExternalSymbols, Result + 1);
+  FExternalSymbols[Result].Name := name;
+  libName := GetMacOSLibraryForSymbol(name);
+  FExternalSymbols[Result].LibraryName := libName;
 end;
 
 function TMacOSX64Emitter.GetCodeBuffer: TByteBuffer;
@@ -301,7 +401,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallWrite;
 begin
-  // write(fd, buf, count): fd=RDI, buf=RSI, count=RDX
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -309,7 +408,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallExit;
 begin
-  // exit(status): status=RDI
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_EXIT);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -317,7 +415,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallRead;
 begin
-  // read(fd, buf, count): fd=RDI, buf=RSI, count=RDX
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_READ);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -325,7 +422,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallOpen;
 begin
-  // open(path, flags, mode): path=RDI, flags=RSI, mode=RDX
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_OPEN);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -333,7 +429,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallClose;
 begin
-  // close(fd): fd=RDI
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_CLOSE);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -341,7 +436,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallMmap;
 begin
-  // mmap(addr, len, prot, flags, fd, offset)
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_MMAP);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -349,7 +443,6 @@ end;
 
 procedure TMacOSX64Emitter.EmitSyscallMunmap;
 begin
-  // munmap(addr, len): addr=RDI, len=RSI
   WriteMovRegImm64(FCode, RAX, SYS_MACOS_MUNMAP);
   WriteSyscall(FCode);
   TrackEnergy(eokSyscall);
@@ -357,12 +450,12 @@ end;
 
 procedure TMacOSX64Emitter.EmitDebugPrintString(const s: string);
 begin
-  // TODO: Implementieren
+  // not implemented
 end;
 
 procedure TMacOSX64Emitter.EmitDebugPrintInt(valueReg: Integer);
 begin
-  // TODO: Implementieren
+  // not implemented
 end;
 
 procedure TMacOSX64Emitter.EmitFromIR(module: TIRModule);
@@ -371,91 +464,453 @@ var
   instr: TIRInstr;
   labelIdx: Integer;
   fn: TIRFunction;
+  slotIdx: Integer;
+  arg3: Integer;
+  argCount: Integer;
+  offset: Integer;
+  totalSlots: Integer;
+  maxTemp: Integer;
 begin
-  // Minimale Implementierung für grundlegende IR-Generierung
-  // Diese muss für volle Funktionalität erheblich erweitert werden
-  
-  // Strings in den Data-Buffer schreiben
-  for i := 0 to module.Strings.Count - 1 do
-  begin
-    SetLength(FStringOffsets, Length(FStringOffsets) + 1);
-    FStringOffsets[High(FStringOffsets)] := FData.Size;
-    for k := 1 to Length(module.Strings[i]) do
-      FData.WriteU8(Ord(module.Strings[i][k]));
-    FData.WriteU8(0);  // Null-Terminator
-  end;
-  
-  // Funktionen generieren
+  // Reset state
+  SetLength(FStringOffsets, 0);
+  SetLength(FLeaPositions, 0);
+  SetLength(FLeaStrIndex, 0);
+  SetLength(FLabelPositions, 0);
+  SetLength(FJumpPatches, 0);
+  SetLength(FExternalSymbols, 0);
+  SetLength(FPLTGOTPatches, 0);
+
+  // ----------------------------------------------------------------
+  // Generate per-function code
+  // ----------------------------------------------------------------
   for i := 0 to High(module.Functions) do
   begin
     fn := module.Functions[i];
-    
-    // Label für Funktion registrieren
+
+    // Register function label
     SetLength(FLabelPositions, Length(FLabelPositions) + 1);
     labelIdx := High(FLabelPositions);
     FLabelPositions[labelIdx].Name := fn.Name;
     FLabelPositions[labelIdx].Pos := FCode.Size;
-    
-    // Prolog
-    EmitU8(FCode, $55);  // push rbp
-    EmitRex(FCode, 1, 0, 0, 0);
-    EmitU8(FCode, $89);
-    EmitU8(FCode, $E5);  // mov rbp, rsp
-    
-    // Stack-Frame für lokale Variablen
-    if fn.LocalCount > 0 then
-    begin
-      // sub rsp, n*8
-      EmitRex(FCode, 1, 0, 0, 0);
-      EmitU8(FCode, $81);
-      EmitU8(FCode, $EC);
-      EmitU32(FCode, Cardinal(fn.LocalCount * 8));
-    end;
-    
-    // IR-Instruktionen verarbeiten
+
+    // Compute max temp index
+    maxTemp := 0;
     for j := 0 to High(fn.Instructions) do
     begin
       instr := fn.Instructions[j];
-      
+      if instr.Dest > maxTemp then maxTemp := instr.Dest;
+      if instr.Src1 > maxTemp then maxTemp := instr.Src1;
+      if instr.Src2 > maxTemp then maxTemp := instr.Src2;
+    end;
+
+    // Total slots: locals + temporaries
+    totalSlots := fn.LocalCount + maxTemp + 1;
+
+    // Prolog
+    EmitU8(FCode, $55);             // push rbp
+    EmitRex(FCode, 1, 0, 0, 0);
+    EmitU8(FCode, $89);
+    EmitU8(FCode, $E5);             // mov rbp, rsp
+
+    // Allocate stack frame
+    if totalSlots > 0 then
+    begin
+      EmitRex(FCode, 1, 0, 0, 0);
+      EmitU8(FCode, $81);
+      EmitU8(FCode, $EC);
+      EmitU32(FCode, Cardinal(totalSlots * 8));
+    end;
+
+    // Spill incoming parameters (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
+    for k := 0 to fn.ParamCount - 1 do
+    begin
+      if k < 6 then
+        StandaloneWriteMovMemReg(FCode, RBP, SlotOffset(k), ParamRegs[k])
+      else
+      begin
+        // Stack params: above saved rbp
+        StandaloneWriteMovRegMem(FCode, RAX, RBP, 16 + (k - 6) * 8);
+        StandaloneWriteMovMemReg(FCode, RBP, SlotOffset(k), RAX);
+      end;
+    end;
+
+    // Process IR instructions
+    for j := 0 to High(fn.Instructions) do
+    begin
+      instr := fn.Instructions[j];
+
       case instr.Op of
         irReturn:
         begin
-          // Epilog
+          if instr.Src1 >= 0 then
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
           EmitRex(FCode, 1, 0, 0, 0);
           EmitU8(FCode, $89);
           EmitU8(FCode, $EC);  // mov rsp, rbp
           EmitU8(FCode, $5D);  // pop rbp
           WriteRet(FCode);
         end;
-        
-        irCallBuiltin:
+
+        irConstInt:
         begin
-          // Builtin-Calls behandeln
-          if instr.ImmStr = 'exit' then
+          slotIdx := fn.LocalCount + instr.Dest;
+          WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));
+          WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+        end;
+
+        irConstStr:
+        begin
+          slotIdx := fn.LocalCount + instr.Dest;
+          arg3 := StrToIntDef(instr.ImmStr, -1);
+          if arg3 >= 0 then
           begin
-            // Exit-Syscall: Argument ist in Src1 (temp index)
-            WriteMovRegImm64(FCode, RDI, instr.ImmInt);  // Exit-Code aus ImmInt
-            EmitSyscallExit;
+            SetLength(FLeaPositions, Length(FLeaPositions) + 1);
+            SetLength(FLeaStrIndex, Length(FLeaStrIndex) + 1);
+            FLeaPositions[High(FLeaPositions)] := FCode.Size + 3;
+            FLeaStrIndex[High(FLeaStrIndex)] := arg3;
+            EmitRex(FCode, 1, 0, 0, 0);  // REX.W
+            EmitU8(FCode, $8D);           // LEA
+            EmitU8(FCode, $05);           // ModR/M: rax, [rip + disp32]
+            EmitU32(FCode, 0);            // placeholder
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
           end;
         end;
-        
-        // TODO: Weitere IR-Opcodes implementieren
-        // Dies ist nur eine minimale Implementierung
-      end;
-    end;
-    
-    // Sicherstellen, dass die Funktion einen Return hat
-    if (Length(fn.Instructions) = 0) or (fn.Instructions[High(fn.Instructions)].Op <> irReturn) then
+
+        irLoadLocal:
+        begin
+          slotIdx := instr.Src1;
+          WriteMovRegMem(RAX, RBP, SlotOffset(slotIdx));
+          WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+        end;
+
+        irStoreLocal:
+        begin
+          WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+          WriteMovMemReg(RBP, SlotOffset(instr.Dest), RAX);
+        end;
+
+        irCall:
+        begin
+          argCount := Length(instr.ArgTemps);
+          for k := 0 to Min(argCount, 6) - 1 do
+            WriteMovRegMem(ParamRegs[k], RBP, SlotOffset(fn.LocalCount + instr.ArgTemps[k]));
+
+          if instr.CallMode = cmExternal then
+          begin
+            AddExternalSymbolMacos(instr.ImmStr, module);
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := '@plt_' + instr.ImmStr;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+            EmitU8(FCode, $E8);  // call rel32
+            EmitU32(FCode, 0);   // placeholder
+          end
+          else
+          begin
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+            EmitU8(FCode, $E8);  // call rel32
+            EmitU32(FCode, 0);   // placeholder
+          end;
+
+          if instr.Dest >= 0 then
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+        end;
+
+        irCallBuiltin:
+        begin
+          if instr.ImmStr = 'exit' then
+          begin
+            if instr.Src1 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Src1;
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RDI, UInt64(instr.ImmInt));
+            EmitSyscallExit;
+          end
+          else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
+          begin
+            arg3 := -1;
+            if Length(instr.ArgTemps) > 0 then
+              arg3 := instr.ArgTemps[0]
+            else
+              arg3 := instr.Src1;
+
+            if arg3 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + arg3;
+              StandaloneWriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+
+              // mov rdi, rsi
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $89);
+              EmitU8(FCode, $F7);
+
+              // strlen loop: cmp byte [rdi], 0 / je +5 / inc rdi / jmp -10
+              EmitU8(FCode, $80);
+              EmitU8(FCode, $3F);
+              EmitU8(FCode, $00);  // cmp byte [rdi], 0
+              EmitU8(FCode, $74);
+              EmitU8(FCode, $05);  // je +5
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $FF);
+              EmitU8(FCode, $C7);  // inc rdi
+              EmitU8(FCode, $EB);
+              EmitU8(FCode, $F6);  // jmp -10
+
+              // sub rdi, rsi -> rdi = length
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $29);
+              EmitU8(FCode, $F7);
+
+              // mov rdx, rdi (length)
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $89);
+              EmitU8(FCode, $FA);
+
+              // Reload RSI (buf pointer)
+              StandaloneWriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+
+              // RDI = 1 (stdout fd)
+              WriteMovRegImm64(FCode, RDI, 1);
+
+              // RAX = SYS_MACOS_WRITE
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+            end;
+          end
+          else if instr.ImmStr = 'PrintInt' then
+          begin
+            arg3 := -1;
+            if Length(instr.ArgTemps) > 0 then
+              arg3 := instr.ArgTemps[0]
+            else
+              arg3 := instr.Src1;
+
+            if arg3 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + arg3;
+              StandaloneWriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+
+              // sub rsp, 24
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $83);
+              EmitU8(FCode, $EC);
+              EmitU8(FCode, 24);
+
+              // lea rdi, [rsp+20]
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $8D);
+              EmitU8(FCode, $7C);
+              EmitU8(FCode, $24);
+              EmitU8(FCode, 20);
+
+              // mov byte [rdi], 0
+              EmitU8(FCode, $C6);
+              EmitU8(FCode, $07);
+              EmitU8(FCode, $00);
+
+              // xor r8d, r8d
+              EmitU8(FCode, $45);
+              EmitU8(FCode, $31);
+              EmitU8(FCode, $C0);
+
+              // test rax, rax
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $85);
+              EmitU8(FCode, $C0);
+
+              // jns +9
+              EmitU8(FCode, $79);
+              EmitU8(FCode, $09);
+
+              // neg rax
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $F7);
+              EmitU8(FCode, $D8);
+
+              // mov r8d, 1
+              EmitU8(FCode, $41);
+              EmitU8(FCode, $B8);
+              EmitU32(FCode, 1);
+
+              // mov rcx, 10
+              WriteMovRegImm64(FCode, RCX, 10);
+
+              // .Lloop:
+              // dec rdi
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $FF);
+              EmitU8(FCode, $CF);
+
+              // xor rdx, rdx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $31);
+              EmitU8(FCode, $D2);
+
+              // div rcx
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $F7);
+              EmitU8(FCode, $F1);
+
+              // add dl, '0'
+              EmitU8(FCode, $80);
+              EmitU8(FCode, $C2);
+              EmitU8(FCode, $30);
+
+              // mov [rdi], dl
+              EmitU8(FCode, $88);
+              EmitU8(FCode, $17);
+
+              // test rax, rax
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $85);
+              EmitU8(FCode, $C0);
+
+              // jnz .Lloop
+              EmitU8(FCode, $75);
+              EmitU8(FCode, $ED);
+
+              // test r8d, r8d
+              EmitU8(FCode, $45);
+              EmitU8(FCode, $85);
+              EmitU8(FCode, $C0);
+
+              // jz +6
+              EmitU8(FCode, $74);
+              EmitU8(FCode, $06);
+
+              // dec rdi
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $FF);
+              EmitU8(FCode, $CF);
+
+              // mov byte [rdi], '-'
+              EmitU8(FCode, $C6);
+              EmitU8(FCode, $07);
+              EmitU8(FCode, $2D);
+
+              // mov rsi, rdi
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $89);
+              EmitU8(FCode, $FE);
+
+              // lea rdx, [rsp+20]
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $8D);
+              EmitU8(FCode, $54);
+              EmitU8(FCode, $24);
+              EmitU8(FCode, 20);
+
+              // sub rdx, rdi
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $29);
+              EmitU8(FCode, $FA);
+
+              // RDI = 1 (stdout)
+              WriteMovRegImm64(FCode, RDI, 1);
+
+              // RAX = SYS_MACOS_WRITE
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+
+              // add rsp, 24
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $83);
+              EmitU8(FCode, $C4);
+              EmitU8(FCode, 24);
+            end;
+          end;
+          // Other builtins: ignore for now
+        end;
+
+      end; // case
+    end; // for j
+
+    // Ensure function ends with return
+    if (Length(fn.Instructions) = 0) or
+       (fn.Instructions[High(fn.Instructions)].Op <> irReturn) then
     begin
       EmitRex(FCode, 1, 0, 0, 0);
       EmitU8(FCode, $89);
-      EmitU8(FCode, $EC);
-      EmitU8(FCode, $5D);
+      EmitU8(FCode, $EC);  // mov rsp, rbp
+      EmitU8(FCode, $5D);  // pop rbp
       WriteRet(FCode);
     end;
+  end; // for i (functions)
+
+  // ----------------------------------------------------------------
+  // Generate PLT stubs for external symbols (6 bytes: FF 25 <disp32>)
+  // ----------------------------------------------------------------
+  if Length(FExternalSymbols) > 0 then
+  begin
+    SetLength(FPLTGOTPatches, Length(FExternalSymbols));
+    for i := 0 to High(FExternalSymbols) do
+    begin
+      FPLTGOTPatches[i].Pos := FCode.Size;
+      FPLTGOTPatches[i].SymbolIndex := i;
+      FPLTGOTPatches[i].SymbolName := FExternalSymbols[i].Name;
+      FPLTGOTPatches[i].PLT0PushPos := 0;
+      FPLTGOTPatches[i].PLT0JmpPos := 0;
+      FPLTGOTPatches[i].PLT0VA := 0;
+      FPLTGOTPatches[i].GotVA := 0;
+
+      // Register PLT stub label for call patching
+      SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+      FLabelPositions[High(FLabelPositions)].Name := '@plt_' + FExternalSymbols[i].Name;
+      FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+
+      // jmp qword [rip + disp32] — the disp32 is patched by WriteDynamicMachO64
+      EmitU8(FCode, $FF);
+      EmitU8(FCode, $25);
+      EmitU32(FCode, 0);  // placeholder
+    end;
   end;
-  
-  // Code-Größe für Energy-Stats aktualisieren
+
+  // ----------------------------------------------------------------
+  // Patch CALL rel32 to function / PLT stub labels
+  // ----------------------------------------------------------------
+  for i := 0 to High(FJumpPatches) do
+  begin
+    for j := 0 to High(FLabelPositions) do
+    begin
+      if FLabelPositions[j].Name = FJumpPatches[i].LabelName then
+      begin
+        offset := FLabelPositions[j].Pos - (FJumpPatches[i].Pos + 4);
+        FCode.PatchU32LE(FJumpPatches[i].Pos, Cardinal(offset));
+        Break;
+      end;
+    end;
+  end;
+
+  // ----------------------------------------------------------------
+  // Write strings to FCode (after PLT stubs), then patch LEA disp32
+  // ----------------------------------------------------------------
+  SetLength(FStringOffsets, module.Strings.Count);
+  for i := 0 to module.Strings.Count - 1 do
+  begin
+    FStringOffsets[i] := FCode.Size;
+    for k := 1 to Length(module.Strings[i]) do
+      FCode.WriteU8(Ord(module.Strings[i][k]));
+    FCode.WriteU8(0);  // null terminator
+  end;
+
+  for i := 0 to High(FLeaPositions) do
+  begin
+    if (FLeaStrIndex[i] >= 0) and (FLeaStrIndex[i] <= High(FStringOffsets)) then
+    begin
+      offset := Integer(FStringOffsets[FLeaStrIndex[i]]) - (FLeaPositions[i] + 4);
+      FCode.PatchU32LE(FLeaPositions[i], Cardinal(offset));
+    end;
+  end;
+
+  // Update energy stats
   FEnergyStats.CodeSizeBytes := FCode.Size;
 end;
 
