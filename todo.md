@@ -133,6 +133,18 @@ _(keine offenen Aufgaben)_
 - [x] **SSH I/O** - SSHRead, SSHWrite, SSHEof, SSHSendEof
 - [x] **Test-Programm** - tests/lyx/net/test_ssh.lyx
 
+### QUIC Framework (März 2026)
+
+- [x] **std/net/quic.lyx** - RFC 9000 QUIC v1 Protokoll-Framework (QUICConnect, QUICOpenStream, QUICStreamWrite/Read)
+- [x] **Packet Structure** - Initial, 0-RTT, Handshake, Retry, 1-RTT Pakettypen
+- [x] **Header Encoding** - Long/Short Header, Connection ID, Version
+- [x] **Variable-length Integer** - QUIC Varint Encoding (1/2/4/8 Bytes)
+- [x] **Frame Types** - CRYPTO, STREAM, ACK, PADDING, CONNECTION_CLOSE, RESET_STREAM
+- [x] **Transport Parameters** - Max Data, Max Streams, Idle Timeout, ACK Delay
+- [x] **UDP Transport** - UDPSocket Integration für QUIC-Datenübertragung
+- [x] **Test-Programm** - tests/lyx/net/test_quic.lyx
+- [x] **Hinweis** - Vollständiges QUIC erfordert TLS 1.3 (OpenSSL 3.2+ oder quiche/ngtcp2)
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -226,6 +238,7 @@ _(keine offenen Aufgaben)_
 - [x] **SNMP Client** - RFC 1157/1905 (SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding)
 - [x] **LDAP Client** - RFC 4511 (LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind)
 - [x] **SSH Client** - libssh2 FFI (SSHConnect, SSHAuth, SSHExec, SSHOpenShell, SSHRead/Write)
+- [x] **QUIC Framework** - RFC 9000 (QUICConnect, QUICOpenStream, Packet/Framing Layer)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -256,6 +269,7 @@ _(keine offenen Aufgaben)_
 - SNMP Client (RFC 1157/1905): SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding
 - LDAP Client (RFC 4511): LDAPConnect, LDAPBind, LDAPSearch, LDAPUnbind
 - SSH Client (libssh2): SSHConnect, SSHAuth, SSHExec, SSHOpenShell
+- QUIC Framework (RFC 9000): Packet Structure, Varint Encoding, Stream Framing
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
