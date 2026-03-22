@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, lexer, ast, backend_types;
+  diag, lexer, ast, backend_types, c_header_parser;
 
 type
   TParser = class
@@ -138,6 +138,17 @@ function TParser.ParseProgram: TAstProgram;
 var
   decls: TAstNodeList;
   d: TAstNode;
+  // importC local vars
+  cHeaderFile: string;
+  cLinkName: string;
+  cParser: TCHeaderParser;
+  cResult: TCHeaderParseResult;
+  cFn: TCFunctionDecl;
+  cFuncDecl: TAstFuncDecl;
+  cParams: TAstParamList;
+  cRetType: TAurumType;
+  cLyxType: string;
+  pi: Integer;
 begin
   decls := nil;
   // optional unit declaration
@@ -170,6 +181,78 @@ begin
   while True do
   begin
     if Check(tkEOF) then Break;
+
+    // importC "header.h" link "libname"; — C FFI header import
+    if Check(tkIdent) and (FCurTok.Value = 'importC') then
+    begin
+      Advance;
+      cHeaderFile := '';
+      cLinkName := '';
+      if Check(tkStrLit) then begin cHeaderFile := FCurTok.Value; Advance; end
+      else FDiag.Error('expected header path string after importC', FCurTok.Span);
+      if Check(tkIdent) and (FCurTok.Value = 'link') then
+      begin
+        Advance;
+        if Check(tkStrLit) then begin cLinkName := FCurTok.Value; Advance; end
+        else FDiag.Error('expected library name after link', FCurTok.Span);
+      end;
+      if Check(tkSemicolon) then Advance;
+
+      if cHeaderFile <> '' then
+      begin
+        cParser := TCHeaderParser.Create;
+        try
+          if FileExists(cHeaderFile) then
+            cResult := cParser.ParseFile(cHeaderFile)
+          else
+          begin
+            // Try system include paths
+            if FileExists('/usr/include/' + cHeaderFile) then
+              cResult := cParser.ParseFile('/usr/include/' + cHeaderFile)
+            else if FileExists('/usr/local/include/' + cHeaderFile) then
+              cResult := cParser.ParseFile('/usr/local/include/' + cHeaderFile)
+            else
+            begin
+              FDiag.Error('importC: header not found: ' + cHeaderFile, FCurTok.Span);
+              cResult.Functions := nil;
+              cResult.OpaqueTypes := TStringList.Create;
+            end;
+          end;
+
+          for cFn in cResult.Functions do
+          begin
+            if cFn.IsStatic then Continue; // skip static inline
+            // Build param list
+            SetLength(cParams, Length(cFn.Params));
+            for pi := 0 to High(cFn.Params) do
+            begin
+              cLyxType := MapCTypeToLyx(cFn.Params[pi].CType);
+              cParams[pi].Name := cFn.Params[pi].Name;
+              if cParams[pi].Name = '' then
+                cParams[pi].Name := 'p' + IntToStr(pi);
+              cParams[pi].ParamType := StrToAurumType(cLyxType);
+              cParams[pi].TypeName := cLyxType;
+            end;
+            // Map return type
+            cLyxType := MapCTypeToLyx(cFn.ReturnType);
+            cRetType := StrToAurumType(cLyxType);
+            // Create extern fn declaration
+            cFuncDecl := TAstFuncDecl.Create(cFn.Name, cParams, cRetType,
+              nil, FCurTok.Span, False);
+            cFuncDecl.IsExtern := True;
+            cFuncDecl.IsVarArgs := cFn.IsVariadic;
+            cFuncDecl.LibraryName := cLinkName;
+            SetLength(decls, Length(decls) + 1);
+            decls[High(decls)] := cFuncDecl;
+          end;
+          cResult.OpaqueTypes.Free;
+        finally
+          cParser.Free;
+        end;
+      end;
+      Continue;
+    end;
+
     d := ParseTopDecl;
     if d <> nil then
     begin
@@ -189,6 +272,7 @@ var
   name: string;
   params: TAstParamList;
   retType: TAurumType;
+  linkName: string;
 begin
   isExtern := False;
   if Check(tkPublic) then
@@ -240,11 +324,25 @@ begin
         retType := ParseType
       else
         retType := atVoid;
+      // Optional: link "libname" annotation
+      linkName := '';
+      if Check(tkIdent) and (FCurTok.Value = 'link') then
+      begin
+        Advance;
+        if Check(tkStrLit) then
+        begin
+          linkName := FCurTok.Value;
+          Advance;
+        end
+        else
+          FDiag.Error('expected library name string after link', FCurTok.Span);
+      end;
       Expect(tkSemicolon);
       Result := TAstFuncDecl.Create(name, params, retType, nil, FCurTok.Span, False);
       // mark extern and varargs if parser recorded them
       TAstFuncDecl(Result).IsExtern := True;
       TAstFuncDecl(Result).IsVarArgs := FLastParamListVarArgs;
+      TAstFuncDecl(Result).LibraryName := linkName;
       Exit(Result);
     end
     else

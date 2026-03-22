@@ -1124,6 +1124,7 @@ var
   
   // Call patching
   callPatchIdx, targetFuncIdx: Integer;
+  extLibName: string;
   
   // Function arguments
   argCount: Integer;
@@ -1792,7 +1793,9 @@ begin
               begin
                 SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                 FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol(instr.ImmStr);
+                extLibName := module.GetExternLibrary(instr.ImmStr);
+                if extLibName = '' then extLibName := GetLibraryForSymbol(instr.ImmStr);
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := extLibName;
               end;
               
               // Emit call to PLT stub label (generated after all functions)
