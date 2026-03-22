@@ -73,6 +73,7 @@ initialization
   // IO namespace
   AddBuiltin('IO', 'PrintStr', 'PrintStr', atVoid, [atPChar]);
   AddBuiltin('IO', 'PrintInt', 'PrintInt', atVoid, [atInt64]);
+  AddBuiltin('IO', 'PrintFloat', 'PrintFloat', atVoid, [atF64]);
   AddBuiltin('IO', 'Println', 'Println', atVoid, [atPChar]);
   AddBuiltin('IO', 'printf', 'printf', atVoid, [atPChar], True);
   AddBuiltin('IO', 'open', 'open', atInt64, [atPChar, atInt64, atInt64]);
