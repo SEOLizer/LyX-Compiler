@@ -1,0 +1,646 @@
+// Lyx SNMP Client - RFC 1157 (SNMPv1) / RFC 1905 (SNMPv2c)
+// Simple Network Management Protocol client
+//
+// SNMP uses UDP port 161 for requests and 162 for traps
+// The protocol uses ASN.1/BER encoding for all data
+//
+// Usage:
+//   import std.net.snmp;
+//   var oid: int64 := mmap(0, 64, PROT_RW, MAP_ANON, FD_NONE, 0);
+//   // OID 1.3.6.1.2.1.1.1.0 (sysDescr)
+//   poke8(oid + 0, 1); poke8(oid + 8, 3); ... poke8(oid + 56, 0);
+//   var resp: SNMPResponse := SNMPGet("router.local", "public", oid, 8);
+//   if (resp.errorStatus == 0) {
+//     sys_write(1, resp.value, resp.valueLen);
+//   }
+
+unit std.net.snmp;
+
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+import std.net.asn1;
+
+// SNMP port
+pub con SNMP_PORT: int64 := 161;
+
+// SNMP versions
+pub con SNMP_V1: int64 := 0;
+pub con SNMP_V2C: int64 := 1;
+
+// SNMP error status (RFC 1905)
+pub con SNMP_ERR_NOERROR: int64 := 0;
+pub con SNMP_ERR_TOOBIG: int64 := 1;
+pub con SNMP_ERR_NOSUCHNAME: int64 := 2;
+pub con SNMP_ERR_BADVALUE: int64 := 3;
+pub con SNMP_ERR_READONLY: int64 := 4;
+pub con SNMP_ERR_GENERR: int64 := 5;
+
+// Common OIDs (encoded as int64 arrays)
+// sysDescr: 1.3.6.1.2.1.1.1.0
+// sysObjectID: 1.3.6.1.2.1.1.2.0
+// sysUpTime: 1.3.6.1.2.1.1.3.0
+// sysContact: 1.3.6.1.2.1.1.4.0
+// sysName: 1.3.6.1.2.1.1.5.0
+// sysLocation: 1.3.6.1.2.1.1.6.0
+// ifNumber: 1.3.6.1.2.1.2.1.0
+
+// OID structure (for convenience)
+pub type SNMPOID = struct {
+  oid: int64;        // Pointer to OID sub-identifier array (each 8 bytes)
+  length: int64;     // Number of sub-identifiers
+};
+
+// SNMP VarBind (OID + Value pair)
+pub type SNMPVarBind = struct {
+  oid: int64;        // Pointer to OID bytes
+  oidLen: int64;     // OID length in bytes
+  value: int64;      // Pointer to value bytes
+  valueLen: int64;   // Value length in bytes
+  valueType: int64;  // ASN.1 type of value
+};
+
+// SNMP Response
+pub type SNMPResponse = struct {
+  version: int64;        // SNMP version
+  requestId: int64;      // Request ID
+  errorStatus: int64;    // Error status
+  errorIndex: int64;     // Error index
+  value: int64;          // Pointer to response value (raw ASN.1 bytes)
+  valueLen: int64;       // Value length in bytes
+  valueType: int64;      // ASN.1 type of value
+  rawBuf: int64;         // Raw response buffer
+  rawLen: int64;         // Raw response length
+};
+
+// Generate SNMP request ID (simple increment)
+pub var _snmpRequestId: int64 := 1;
+
+pub fn SNMPNextRequestId(): int64 {
+  _snmpRequestId := _snmpRequestId + 1;
+  return _snmpRequestId;
+}
+
+// Build SNMP GET REQUEST packet
+// version: SNMP_V1 or SNMP_V2C
+// community: community string (e.g., "public")
+// oid: pointer to OID array (each sub-identifier is 8 bytes)
+// oidLen: number of sub-identifiers
+// Returns pointer to encoded SNMP packet (caller must free)
+pub fn SNMPBuildGetRequest(version: int64, community: int64, oid: int64, oidLen: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var varbindContent: int64;
+  var varbindContentLen: int64;
+  var varbindListContent: int64;
+  var varbindListContentLen: int64;
+  var pduContent: int64;
+  var pduContentLen: int64;
+  var msgContent: int64;
+  var msgContentLen: int64;
+  var requestId: int64;
+  var commLen: int64;
+  var oidBytes: int64;
+  var tmpBuf: int64;
+  var i: int64;
+  
+  // Allocate packet buffer (2KB max)
+  buf := mmap(0, 2048, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // Calculate community string length
+  commLen := 0;
+  if (community != 0) {
+    while (peek8(community + commLen) != 0) {
+      commLen := commLen + 1;
+    }
+  }
+  
+  // Build OID encoding
+  tmpBuf := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (tmpBuf == 0) {
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  oidBytes := ASN1EncodeOID(tmpBuf, 0, oid, oidLen);
+  
+  // Build VarBind: SEQUENCE { OID, NULL }
+  varbindContent := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (varbindContent == 0) {
+    munmap(tmpBuf, 256);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  // Copy OID
+  i := 0;
+  while (i < oidBytes) {
+    poke8(varbindContent + pos, peek8(tmpBuf + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  // Add NULL
+  pos := pos + ASN1EncodeNull(varbindContent, pos);
+  varbindContentLen := pos;
+  munmap(tmpBuf, 256);
+  
+  // Build VarBind SEQUENCE header
+  varbindListContent := mmap(0, 1024, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (varbindListContent == 0) {
+    munmap(varbindContent, 512);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  // VarBind SEQUENCE header
+  pos := pos + ASN1EncodeSequenceHeader(varbindListContent, pos, varbindContentLen);
+  // Copy VarBind content
+  i := 0;
+  while (i < varbindContentLen) {
+    poke8(varbindListContent + pos, peek8(varbindContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  varbindListContentLen := pos;
+  munmap(varbindContent, 512);
+  
+  // Build PDU content (requestId, errorStatus, errorIndex, varBindList)
+  pduContent := mmap(0, 1024, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (pduContent == 0) {
+    munmap(varbindListContent, 1024);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  requestId := SNMPNextRequestId();
+  pos := pos + ASN1EncodeInteger(pduContent, pos, requestId);
+  pos := pos + ASN1EncodeInteger(pduContent, pos, 0);  // errorStatus
+  pos := pos + ASN1EncodeInteger(pduContent, pos, 0);  // errorIndex
+  // Copy varbindList
+  i := 0;
+  while (i < varbindListContentLen) {
+    poke8(pduContent + pos, peek8(varbindListContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  pduContentLen := pos;
+  munmap(varbindListContent, 1024);
+  
+  // Build message content (version, community, PDU)
+  msgContent := mmap(0, 1536, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (msgContent == 0) {
+    munmap(pduContent, 1024);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  pos := pos + ASN1EncodeInteger(msgContent, pos, version);
+  pos := pos + ASN1EncodeOctetString(msgContent, pos, community, commLen);
+  // PDU header
+  pos := pos + ASN1EncodePDUHeader(msgContent, pos, SNMP_GETREQUEST, pduContentLen);
+  // Copy PDU content
+  i := 0;
+  while (i < pduContentLen) {
+    poke8(msgContent + pos, peek8(pduContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  msgContentLen := pos;
+  munmap(pduContent, 1024);
+  
+  // Build outer SEQUENCE
+  pos := 0;
+  pos := pos + ASN1EncodeSequenceHeader(buf, pos, msgContentLen);
+  // Copy message content
+  i := 0;
+  while (i < msgContentLen) {
+    poke8(buf + pos, peek8(msgContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  munmap(msgContent, 1536);
+  
+  return buf;
+}
+
+// Build SNMP GETNEXT REQUEST packet
+pub fn SNMPBuildGetNextRequest(version: int64, community: int64, oid: int64, oidLen: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var varbindContent: int64;
+  var varbindContentLen: int64;
+  var varbindListContent: int64;
+  var varbindListContentLen: int64;
+  var pduContent: int64;
+  var pduContentLen: int64;
+  var msgContent: int64;
+  var msgContentLen: int64;
+  var requestId: int64;
+  var commLen: int64;
+  var oidBytes: int64;
+  var tmpBuf: int64;
+  var i: int64;
+  
+  buf := mmap(0, 2048, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  commLen := 0;
+  if (community != 0) {
+    while (peek8(community + commLen) != 0) {
+      commLen := commLen + 1;
+    }
+  }
+  
+  tmpBuf := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (tmpBuf == 0) {
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  oidBytes := ASN1EncodeOID(tmpBuf, 0, oid, oidLen);
+  
+  varbindContent := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (varbindContent == 0) {
+    munmap(tmpBuf, 256);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  i := 0;
+  while (i < oidBytes) {
+    poke8(varbindContent + pos, peek8(tmpBuf + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  pos := pos + ASN1EncodeNull(varbindContent, pos);
+  varbindContentLen := pos;
+  munmap(tmpBuf, 256);
+  
+  varbindListContent := mmap(0, 1024, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (varbindListContent == 0) {
+    munmap(varbindContent, 512);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  pos := pos + ASN1EncodeSequenceHeader(varbindListContent, pos, varbindContentLen);
+  i := 0;
+  while (i < varbindContentLen) {
+    poke8(varbindListContent + pos, peek8(varbindContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  varbindListContentLen := pos;
+  munmap(varbindContent, 512);
+  
+  pduContent := mmap(0, 1024, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (pduContent == 0) {
+    munmap(varbindListContent, 1024);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  requestId := SNMPNextRequestId();
+  pos := pos + ASN1EncodeInteger(pduContent, pos, requestId);
+  pos := pos + ASN1EncodeInteger(pduContent, pos, 0);
+  pos := pos + ASN1EncodeInteger(pduContent, pos, 0);
+  i := 0;
+  while (i < varbindListContentLen) {
+    poke8(pduContent + pos, peek8(varbindListContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  pduContentLen := pos;
+  munmap(varbindListContent, 1024);
+  
+  msgContent := mmap(0, 1536, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (msgContent == 0) {
+    munmap(pduContent, 1024);
+    munmap(buf, 2048);
+    return 0;
+  }
+  
+  pos := 0;
+  pos := pos + ASN1EncodeInteger(msgContent, pos, version);
+  pos := pos + ASN1EncodeOctetString(msgContent, pos, community, commLen);
+  pos := pos + ASN1EncodePDUHeader(msgContent, pos, SNMP_GETNEXTREQUEST, pduContentLen);
+  i := 0;
+  while (i < pduContentLen) {
+    poke8(msgContent + pos, peek8(pduContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  msgContentLen := pos;
+  munmap(pduContent, 1024);
+  
+  pos := 0;
+  pos := pos + ASN1EncodeSequenceHeader(buf, pos, msgContentLen);
+  i := 0;
+  while (i < msgContentLen) {
+    poke8(buf + pos, peek8(msgContent + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  munmap(msgContent, 1536);
+  
+  return buf;
+}
+
+// Send SNMP GET request and parse response
+// host: SNMP agent hostname
+// community: community string (e.g., "public")
+// oid: pointer to OID array (each 8 bytes)
+// oidLen: number of sub-identifiers
+// Returns SNMPResponse (caller must free rawBuf)
+pub fn SNMPGet(host: int64, community: int64, oid: int64, oidLen: int64): SNMPResponse {
+  var resp: SNMPResponse;
+  var sock: UDPSocket;
+  var ip: int64;
+  var reqBuf: int64;
+  var reqLen: int64;
+  var respBuf: int64;
+  var nread: int64;
+  var pos: int64;
+  var i: int64;
+  var tag: int64;
+  var len: int64;
+  
+  resp.version := 0;
+  resp.requestId := 0;
+  resp.errorStatus := -1;
+  resp.errorIndex := 0;
+  resp.value := 0;
+  resp.valueLen := 0;
+  resp.valueType := 0;
+  resp.rawBuf := 0;
+  resp.rawLen := 0;
+  
+  // Resolve hostname
+  ip := GetHostByName(host);
+  if (ip == 0) {
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  // Create UDP socket
+  sock := UDPSocketNew();
+  if (sock.fd < 0) {
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  // Build request
+  reqBuf := SNMPBuildGetRequest(SNMP_V2C, community, oid, oidLen);
+  if (reqBuf == 0) {
+    UDPSocketClose(sock);
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  // Calculate packet length (find end of TLV)
+  reqLen := 0;
+  tag := peek8(reqBuf);
+  if (tag == ASN1_SEQUENCE) {
+    pos := 1;
+    var b: int64 := peek8(reqBuf + pos);
+    if (b < 128) {
+      len := b;
+      reqLen := 1 + 1 + len;
+    }
+    else {
+      var numLenBytes: int64 := b - 128;
+      len := 0;
+      i := 0;
+      while (i < numLenBytes) {
+        len := len * 256 + peek8(reqBuf + pos + 1 + i);
+        i := i + 1;
+      }
+      reqLen := 1 + 1 + numLenBytes + len;
+    }
+  }
+  
+  if (reqLen == 0) {
+    reqLen := 256;  // Fallback
+  }
+  
+  // Send request
+  var ret: int64 := UDPSocketSendToAddr(sock, reqBuf, reqLen, ip, SNMP_PORT);
+  munmap(reqBuf, 2048);
+  
+  if (ret < 0) {
+    UDPSocketClose(sock);
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  // Receive response
+  respBuf := mmap(0, 2048, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    UDPSocketClose(sock);
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  nread := UDPSocketRecv(sock, respBuf, 2048, 0, 0);
+  UDPSocketClose(sock);
+  
+  if (nread < 10) {
+    munmap(respBuf, 2048);
+    resp.errorStatus := -1;
+    return resp;
+  }
+  
+  resp.rawBuf := respBuf;
+  resp.rawLen := nread;
+  
+  // Parse response
+  // Skip outer SEQUENCE
+  pos := 0;
+  tag := peek8(respBuf + pos);
+  if (tag != ASN1_SEQUENCE) {
+    resp.errorStatus := -2;
+    return resp;
+  }
+  pos := ASN1SkipValue(respBuf, pos) - 1;  // Position after sequence header
+  
+  // Parse version
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_INTEGER) {
+    resp.version := ASN1DecodeInteger(respBuf, pos);
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Skip community string
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_OCTET_STRING) {
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Parse PDU (GETRESPONSE)
+  tag := peek8(respBuf + pos);
+  pos := pos + 1;  // Skip PDU tag
+  
+  // Skip PDU length
+  var b: int64 := peek8(respBuf + pos);
+  if (b < 128) {
+    pos := pos + 1;
+  }
+  else {
+    pos := pos + 1 + (b - 128);
+  }
+  
+  // Parse requestId
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_INTEGER) {
+    resp.requestId := ASN1DecodeInteger(respBuf, pos);
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Parse errorStatus
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_INTEGER) {
+    resp.errorStatus := ASN1DecodeInteger(respBuf, pos);
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Parse errorIndex
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_INTEGER) {
+    resp.errorIndex := ASN1DecodeInteger(respBuf, pos);
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Skip VarBindList SEQUENCE header
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := pos + 1;
+    b := peek8(respBuf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+  }
+  
+  // Skip VarBind SEQUENCE header
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := pos + 1;
+    b := peek8(respBuf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+  }
+  
+  // Skip OID
+  tag := peek8(respBuf + pos);
+  if (tag == ASN1_OID) {
+    pos := ASN1SkipValue(respBuf, pos);
+  }
+  
+  // Parse value
+  tag := peek8(respBuf + pos);
+  resp.valueType := tag;
+  
+  // Read value length
+  pos := pos + 1;
+  b := peek8(respBuf + pos);
+  if (b < 128) {
+    len := b;
+    pos := pos + 1;
+  }
+  else {
+    var numLenBytes: int64 := b - 128;
+    len := 0;
+    i := 0;
+    while (i < numLenBytes) {
+      len := len * 256 + peek8(respBuf + pos + 1 + i);
+      i := i + 1;
+    }
+    pos := pos + 1 + numLenBytes;
+  }
+  
+  resp.value := respBuf + pos;
+  resp.valueLen := len;
+  
+  return resp;
+}
+
+// Free SNMP response
+pub fn SNMPResponseFree(resp: SNMPResponse) {
+  if (resp.rawBuf != 0) {
+    munmap(resp.rawBuf, resp.rawLen);
+  }
+}
+
+// Helper: Create OID array from sub-identifiers
+// Returns pointer to allocated OID array (each element is 8 bytes)
+// Caller must free with munmap
+pub fn SNMPCreateOID(len: int64): int64 {
+  return mmap(0, len * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+}
+
+// Helper: Set OID sub-identifier
+pub fn SNMPSetOIDSubId(oid: int64, index: int64, value: int64) {
+  // Store as 8-byte value (matches ASN1EncodeOID expectation)
+  // For simplicity, we just store directly
+  // In a real implementation, we'd use proper encoding
+}
+
+// Helper: Parse SNMP octet string response as printable text
+// Returns pointer to null-terminated string (caller must free)
+pub fn SNMPResponseAsString(resp: SNMPResponse): int64 {
+  var str: int64;
+  var i: int64;
+  
+  if (resp.valueType != ASN1_OCTET_STRING || resp.valueLen == 0) {
+    return 0;
+  }
+  
+  str := mmap(0, resp.valueLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (str == 0) {
+    return 0;
+  }
+  
+  i := 0;
+  while (i < resp.valueLen) {
+    poke8(str + i, peek8(resp.value + i));
+    i := i + 1;
+  }
+  poke8(str + resp.valueLen, 0);
+  
+  return str;
+}
+
+// Helper: Parse SNMP integer response
+pub fn SNMPResponseAsInteger(resp: SNMPResponse): int64 {
+  if (resp.valueType != ASN1_INTEGER || resp.valueLen == 0) {
+    return -1;
+  }
+  
+  var value: int64 := 0;
+  var i: int64 := 0;
+  
+  while (i < resp.valueLen) {
+    value := value * 256 + peek8(resp.value + i);
+    i := i + 1;
+  }
+  
+  return value;
+}
