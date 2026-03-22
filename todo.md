@@ -104,6 +104,16 @@ _(keine offenen Aufgaben)_
 - [x] **UDP Transport** - UDPSocket SendTo/Recv für NTP-Anfragen
 - [x] **Test-Programm** - tests/lyx/net/test_ntp.lyx
 
+### SNMP Client (März 2026)
+
+- [x] **std/net/asn1.lyx** - ASN.1/BER Encoding/Decoding (Integer, OctetString, OID, Null, Sequence)
+- [x] **std/net/snmp.lyx** - RFC 1157/1905 SNMP Client (SNMPGet, SNMPBuildGetRequest, SNMPBuildGetNextRequest)
+- [x] **SNMP PDU** - GET, GETNEXT, GETRESPONSE mit RequestId, ErrorStatus, ErrorIndex
+- [x] **SNMP Types** - COUNTER32, GAUGE32, TIMETICKS, IPADDRESS
+- [x] **SNMPv1/v2c** - Version + Community String Authentifizierung
+- [x] **Value Parsing** - SNMPResponseAsString, SNMPResponseAsInteger
+- [x] **Test-Programm** - tests/lyx/net/test_snmp.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -194,6 +204,7 @@ _(keine offenen Aufgaben)_
 - [x] **SMTP Client** - RFC 5321 (SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/RCPT/DATA)
 - [x] **IMAP Client** - RFC 3501 (IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList)
 - [x] **NTP Client** - RFC 5905 (NTPGetTime, NTPParseResponse, NTPFormatTime)
+- [x] **SNMP Client** - RFC 1157/1905 (SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -221,6 +232,7 @@ _(keine offenen Aufgaben)_
 - SMTP Client (RFC 5321): SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/DATA
 - IMAP Client (RFC 3501): IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList
 - NTP Client (RFC 5905): NTPGetTime, NTPParseResponse, NTPFormatTime
+- SNMP Client (RFC 1157/1905): SNMPGet, SNMPBuildGetRequest, ASN.1/BER Encoding
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
