@@ -672,6 +672,7 @@ var
   leaPos: Integer;
   vmtDataPos: Integer;
   funcOffset: Integer;
+  extLibName: string;
   // VMT generation variables
   cd: TAstClassDecl;
   method: TAstFuncDecl;
@@ -3162,7 +3163,9 @@ begin
                 // External call via PLT: register symbol and call PLT stub
                 if instr.CallMode = cmExternal then
                 begin
-                  AddExternalSymbol(instr.ImmStr, 'libc.so.6');
+                  extLibName := module.GetExternLibrary(instr.ImmStr);
+                  if extLibName = '' then extLibName := 'libc.so.6';  // fallback
+                  AddExternalSymbol(instr.ImmStr, extLibName);
                   // call rel32 to PLT stub (@plt_SymbolName)
                   SetLength(FJumpPatches, Length(FJumpPatches) + 1);
                   FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;

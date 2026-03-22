@@ -390,6 +390,10 @@ begin
         if TAstFuncDecl(node).IsExtern then
         begin
           FExternFuncs.Add(TAstFuncDecl(node).Name);
+          // Register library name if provided via link "..."
+          if TAstFuncDecl(node).LibraryName <> '' then
+            FModule.RegisterExternLibrary(TAstFuncDecl(node).Name,
+              TAstFuncDecl(node).LibraryName);
           Continue;
         end;
        // Skip abstract methods (no body to lower)
