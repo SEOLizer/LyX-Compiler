@@ -167,6 +167,16 @@ _(keine offenen Aufgaben)_
 - [x] **Keepalive** - PINGREQ/PINGRESP Session Maintenance
 - [x] **Test-Programm** - tests/lyx/net/test_mqtt.lyx
 
+### SIP Client (März 2026)
+
+- [x] **std/net/sip.lyx** - RFC 3261 SIP Client (SIPConnect, SIPRegister, SIPSendMessage, SIPOptions)
+- [x] **SIP Methods** - REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE, SUBSCRIBE, NOTIFY
+- [x] **SIP Status Codes** - 1xx-6xx Complete Code Collection (RFC 3261)
+- [x] **SIP Headers** - Via, From, To, Call-ID, CSeq, Contact, Max-Forwards, Expires
+- [x] **Random Generation** - Call-ID, Branch, Tag via /dev/urandom
+- [x] **Status Parsing** - SIPParseStatusCode, SIPParseHeader
+- [x] **Test-Programm** - tests/lyx/net/test_sip.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -263,6 +273,7 @@ _(keine offenen Aufgaben)_
 - [x] **QUIC Framework** - RFC 9000 (QUICConnect, QUICOpenStream, Packet/Framing Layer)
 - [x] **BGP Client** - RFC 4271 (BGPConnect, BGPAdvertiseRoute, BGPWithdrawRoute, BGP FSM)
 - [x] **MQTT Client** - MQTT v3.1.1 (MQTTConnect, MQTTSubscribe, MQTTPublishMsg, MQTTReceive)
+- [x] **SIP Client** - RFC 3261 (SIPConnect, SIPRegister, SIPSendMessage, SIPOptions)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -296,6 +307,7 @@ _(keine offenen Aufgaben)_
 - QUIC Framework (RFC 9000): Packet Structure, Varint Encoding, Stream Framing
 - BGP Client (RFC 4271): BGPConnect, BGPAdvertiseRoute, BGP FSM, Path Attributes
 - MQTT Client (v3.1.1): MQTTConnect, MQTTSubscribe, MQTTPublishMsg, QoS Levels
+- SIP Client (RFC 3261): SIPConnect, SIPRegister, SIPSendMessage, SIPOptions
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
