@@ -171,7 +171,7 @@ const
   DT_NULL = 0; DT_NEEDED = 1; DT_PLTGOT = 3; DT_HASH = 4;
   DT_STRTAB = 5; DT_SYMTAB = 6; DT_RELA = 7; DT_RELASZ = 8;
   DT_RELAENT = 9; DT_STRSZ = 10; DT_SYMENT = 11; DT_DEBUG = 21;
-  DT_JMPREL = 23; DT_PLTRELSZ = 2; DT_BIND_NOW = 24;
+  DT_JMPREL = 23; DT_PLTRELSZ = 2; DT_PLTREL = 20; DT_BIND_NOW = 24;
   // ELF Program Header Types
   PT_LOAD = 1; PT_DYNAMIC = 2; PT_INTERP = 3; PT_PHDR = 6;
   // ELF Section Header Types
@@ -193,6 +193,7 @@ var
   dynstrBuf: TByteBuffer;
   dynstrSize: UInt64;
   dynstrOffset: UInt64;
+  dataShift: UInt64;  // bytes reserved for user dataBuf at start of RW segment
   dynsymBuf: TByteBuffer;
   dynsymSize: UInt64;
   dynsymOffset: UInt64;
@@ -354,14 +355,15 @@ begin
   dynamicBuf.WriteU64LE(DT_JMPREL); dynamicBuf.WriteU64LE(0);
   // Entry 8: DT_PLTRELSZ
   dynamicBuf.WriteU64LE(DT_PLTRELSZ); dynamicBuf.WriteU64LE(relaSize);
-  // Entry 9: DT_BIND_NOW
+  // Entry 9: DT_PLTREL (type of PLT relocations = DT_RELA = 7)
+  dynamicBuf.WriteU64LE(DT_PLTREL); dynamicBuf.WriteU64LE(DT_RELA);
+  // Entry 10: DT_BIND_NOW
   dynamicBuf.WriteU64LE(DT_BIND_NOW); dynamicBuf.WriteU64LE(0);
-  // Entry 10: DT_DEBUG
+  // Entry 11: DT_DEBUG
   dynamicBuf.WriteU64LE(DT_DEBUG); dynamicBuf.WriteU64LE(0);
-  // Entry 11: DT_NULL (terminator)
+  // Entry 12: DT_NULL (terminator)
   dynamicBuf.WriteU64LE(DT_NULL); dynamicBuf.WriteU64LE(0);
   dynamicSize := dynamicBuf.Size;
-  WriteLn('DEBUG ELF: dynamicSize=', dynamicSize, ' (expected ', 12 * 16, ')');
 
   // Build .shstrtab section
   shstrtabBuf := TByteBuffer.Create;
@@ -381,15 +383,17 @@ begin
 
   // Layout for dynamic linking
   // Data segment starts at baseVA + dynstrOffset (dynstrOffset is page-aligned after interp)
-  // Layout: dynstr(8) + dynsym(48) + hash(16) + GOT(32) + rela + dynamic + shstrtab
+  // Layout: [dataBuf] + dynstr + dynsym + hash + GOT + rela + dynamic + shstrtab
   interpOffset := codeOffset + codeSize;
   if (interpOffset mod 8) <> 0 then
     interpOffset := interpOffset + (8 - (interpOffset mod 8));
   // After interp: pad to next page
   dynstrOffset := AlignUp(interpOffset + interpSize, pageSize);
+  // dataShift: user data (strings, globals) lives at the start of the RW segment
+  dataShift := (dataBuf.Size + 7) and not UInt64(7);
   // All following offsets are relative to dynstrOffset (segment start)
-  // dynsym at dynstrSize (aligned to 8)
-  dynsymOffset := AlignUp(dynstrSize, 8);
+  // dynsym at dataShift + dynstrSize (aligned to 8) — after user data and dynstr
+  dynsymOffset := AlignUp(dataShift + dynstrSize, 8);
   // hash at dynsymOffset + dynsymSize (aligned to 8)
   hashOffset := AlignUp(dynsymOffset + dynsymSize, 8);
   // GOT at offset after hash (aligned to 8) within segment
@@ -409,10 +413,6 @@ begin
   // Since the LOAD(RW) segment starts at file offset dynstrOffset with VA baseVA + dynstrOffset,
   // and gotOffsetSeg is the offset from the segment start:
   gotVA := (baseVA + dynstrOffset) + gotOffsetSeg;
-  WriteLn('DEBUG ELF: baseVA=$', IntToHex(baseVA, 8), ' dynstrOffset=$', IntToHex(dynstrOffset, 4),
-          ' gotOffsetSeg=$', IntToHex(gotOffsetSeg, 4), ' gotVA=$', IntToHex(gotVA, 8),
-          ' relaOffset=$', IntToHex(relaOffset, 4), ' dynamicOffset=$', IntToHex(dynamicOffset, 4),
-          ' shstrtabOffset=$', IntToHex(shstrtabOffset, 4), ' shdrsOffset=$', IntToHex(shdrsOffset, 4));
   // GOT[0] = _DYNAMIC (address of .dynamic section)
   // .dynamic is at VA baseVA + dynstrOffset + dynamicOffset
   gotBuf.PatchU64LE(0, baseVA + dynstrOffset + dynamicOffset);
@@ -443,12 +443,13 @@ begin
   //   Entry 6 (offset 96):  DT_PLTGOT
   //   Entry 7 (offset 112): DT_JMPREL
   //   Entry 8 (offset 128): DT_PLTRELSZ
-  //   Entry 9 (offset 144): DT_BIND_NOW
-  //   Entry 10 (offset 160): DT_DEBUG
-  //   Entry 11 (offset 176): DT_NULL
+  //   Entry 9 (offset 144): DT_PLTREL, value=DT_RELA
+  //   Entry 10 (offset 160): DT_BIND_NOW
+  //   Entry 11 (offset 176): DT_DEBUG
+  //   Entry 12 (offset 192): DT_NULL
   // Patching the VALUE fields (offset+8 within each entry):
   dynamicBuf.PatchU64LE(16 + 8, baseVA + dynstrOffset + hashOffset);      // DT_HASH value
-  dynamicBuf.PatchU64LE(32 + 8, baseVA + dynstrOffset);                  // DT_STRTAB value
+  dynamicBuf.PatchU64LE(32 + 8, baseVA + dynstrOffset + dataShift);      // DT_STRTAB value
   dynamicBuf.PatchU64LE(48 + 8, baseVA + dynstrOffset + dynsymOffset);    // DT_SYMTAB value
   dynamicBuf.PatchU64LE(96 + 8, gotVA);                                    // DT_PLTGOT value
   dynamicBuf.PatchU64LE(112 + 8, baseVA + dynstrOffset + relaOffset);      // DT_JMPREL value
@@ -463,7 +464,7 @@ begin
     elfHeader.WriteU8(0); elfHeader.WriteU8(0);
     elfHeader.WriteBytesFill(7, 0);
 
-    elfHeader.WriteU16LE(2);           // ET_EXEC (not PIE for dynamic linking)
+    elfHeader.WriteU16LE(2);           // ET_EXEC (position-dependent executable)
     elfHeader.WriteU16LE(EM_AARCH64);  // EM_AARCH64
     elfHeader.WriteU32LE(1);
 
@@ -565,7 +566,7 @@ begin
 
     // 4: .dynstr
     shdrsBuf.WriteU32LE(23); shdrsBuf.WriteU32LE(SHT_STRTAB); shdrsBuf.WriteU64LE(SHF_ALLOC);
-    shdrsBuf.WriteU64LE(baseVA + dynstrOffset); shdrsBuf.WriteU64LE(dynstrOffset);
+    shdrsBuf.WriteU64LE(baseVA + dynstrOffset + dataShift); shdrsBuf.WriteU64LE(dynstrOffset + dataShift);
     shdrsBuf.WriteU64LE(dynstrSize); shdrsBuf.WriteU32LE(0); shdrsBuf.WriteU32LE(0);
     shdrsBuf.WriteU64LE(1); shdrsBuf.WriteU64LE(0);
 
@@ -622,11 +623,15 @@ begin
       while fileBuf.Position < Int64(interpOffset) do fileBuf.WriteByte(0);
       // Interpreter string
       fileBuf.WriteBuffer(Pointer(@interpStr[1])^, Length(interpStr));
-      // Pad to dynstr offset
+      // Pad to RW segment start (dynstrOffset) — user data goes here
       while fileBuf.Position < Int64(dynstrOffset) do fileBuf.WriteByte(0);
+      // Static data (user strings and global variables)
+      if dataBuf.Size > 0 then fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataBuf.Size);
+      // Pad to .dynstr offset (dynstrOffset + dataShift)
+      while fileBuf.Position < Int64(dynstrOffset + dataShift) do fileBuf.WriteByte(0);
       // .dynstr
       fileBuf.WriteBuffer(dynstrBuf.GetBuffer^, dynstrBuf.Size);
-      // Pad to dynsym offset (relative to dynstrOffset)
+      // Pad to dynsym offset (relative to dynstrOffset, already includes dataShift)
       while fileBuf.Position < Int64(dynstrOffset + dynsymOffset) do fileBuf.WriteByte(0);
       // .dynsym
       fileBuf.WriteBuffer(dynsymBuf.GetBuffer^, dynsymBuf.Size);
@@ -651,12 +656,9 @@ begin
       // .shstrtab
       fileBuf.WriteBuffer(shstrtabBuf.GetBuffer^, shstrtabBuf.Size);
       // Pad to section headers offset
-      WriteLn('DEBUG ELF: Before shdrs, file pos=$', IntToHex(fileBuf.Position, 8), ' target=$', IntToHex(shdrsOffset, 4));
       while fileBuf.Position < Int64(shdrsOffset) do fileBuf.WriteByte(0);
       // Section headers
-      WriteLn('DEBUG ELF: Writing shdrs at pos=$', IntToHex(fileBuf.Position, 8), ' size=$', IntToHex(shdrsBuf.Size, 4));
       fileBuf.WriteBuffer(shdrsBuf.GetBuffer^, shdrsBuf.Size);
-      WriteLn('DEBUG ELF: After shdrs, file pos=$', IntToHex(fileBuf.Position, 8));
     finally
       fileBuf.Free;
     end;

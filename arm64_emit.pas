@@ -56,6 +56,7 @@ type
     // External symbols for PLT/GOT (Dynamic Linking)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
+    FPLT0CodePos: Integer;
     // Energy tracking (minimal — vollständige Integration in Phase 3)
     FEnergyStats: TEnergyStats;
     FEnergyContext: TEnergyContext;
@@ -952,6 +953,7 @@ begin
   // External symbols for PLT/GOT
   SetLength(FExternalSymbols, 0);
   SetLength(FPLTGOTPatches, 0);
+  FPLT0CodePos := 0;
   // Energy tracking initialization
   FCurrentCPU := GetCPUEnergyModel(cfARM64);
   FEnergyContext.CurrentCPU := FCurrentCPU;
@@ -1059,6 +1061,41 @@ begin
     Result := -1;
 end;
 
+// Compute the GOT VA that WriteDynamicElf64ARM64 will assign, mirroring
+// the layout calculation in elf64_arm64_writer.pas.
+function ComputeExpectedGotVA(const externalSymbols: array of TExternalSymbol;
+  codeSize: UInt64; dataSize: UInt64): UInt64;
+const
+  pageSize:   UInt64 = 4096;
+  baseVA:     UInt64 = $400000;
+  interpSize: UInt64 = 27;  // Length('/lib/ld-linux-aarch64.so.1'#0)
+var
+  interpOffset, dynstrOffset: UInt64;
+  dynstrSize, dynsymSize, dynsymOffset: UInt64;
+  hashSize, hashOffset, gotOffsetSeg: UInt64;
+  dataShift: UInt64;
+  symCount, si: Integer;
+begin
+  symCount := Length(externalSymbols);
+  interpOffset := pageSize + codeSize;
+  if (interpOffset mod 8) <> 0 then
+    interpOffset := interpOffset + (8 - (interpOffset mod 8));
+  dynstrOffset := (interpOffset + interpSize + pageSize - 1) and not (pageSize - 1);
+  // dataShift: user data lives at the start of the RW segment, before dynstr
+  dataShift := (dataSize + 7) and not UInt64(7);
+  dynstrSize := 1;
+  for si := 0 to symCount - 1 do
+    dynstrSize := dynstrSize + UInt64(Length(externalSymbols[si].LibraryName)) + 1;
+  for si := 0 to symCount - 1 do
+    dynstrSize := dynstrSize + UInt64(Length(externalSymbols[si].Name)) + 1;
+  dynsymSize   := UInt64(symCount + 1) * 24;
+  dynsymOffset := (dataShift + dynstrSize + 7) and not UInt64(7);
+  hashSize     := UInt64(3 + 2 * symCount) * 4;
+  hashOffset   := (dynsymOffset + dynsymSize + 7) and not UInt64(7);
+  gotOffsetSeg := (hashOffset + hashSize + 7) and not UInt64(7);
+  Result := baseVA + dynstrOffset + gotOffsetSeg;
+end;
+
 // Calculate stack slot offset from FP (X29)
 // Slot 0 is at [FP-8], slot 1 at [FP-16], etc.
 function SlotOffset(slot: Integer): Integer;
@@ -1108,6 +1145,11 @@ var
   // External symbol search
   found: Boolean;
   ei: Integer;
+
+  // Phase 11: PLT GOT patching
+  gotBaseVA, gotSlotVA, stubVA: UInt64;
+  ldrPos: Integer;
+  wordOff: Int64;
 begin
   // Phase 1: Write interned strings to data section
   totalDataOffset := 0;
@@ -1179,18 +1221,6 @@ begin
   FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
   FFuncNames.Add('_start');
   
-  // _start:
-  //   movz x16, #0x2058         ; X16 = 0x2058
-  //   movk x16, #0x0040, lsl #16 ; X16 = 0x402058 (GOT base)
-  //   bl main
-  //   mov x8, #93    ; sys_exit
-  //   svc #0
-   
-  // Set X16 to GOT base (0x402058) for PLT access
-  // GOT is at VA 0x402058 (data segment base 0x400000 + 0x2058)
-  WriteMovz(FCode, 16, Word($2058), 0);   // movz x16, #0x2058
-  WriteMovk(FCode, 16, Word($0040), 16);  // movk x16, #0x0040, lsl #16
-   
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
   FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
@@ -1722,6 +1752,33 @@ begin
             // Check if this is an external call (cmExternal)
             if instr.CallMode = cmExternal then
             begin
+              // Special handling for strlen: generate inline code instead of PLT
+              // This bypasses libc initialization issues
+              if instr.ImmStr = 'strlen' then
+              begin
+                // strlen(X0) -> X0 = length
+                // Input: X0 = string address (already loaded)
+                // Loop: count bytes until null terminator
+                // Uses: X1 = current byte, X0 = counter
+                
+                // Save string address in X9
+                WriteMovRegReg(FCode, X9, X0);
+                // X0 = 0 (length counter)
+                WriteMovImm64(FCode, X0, 0);
+                
+                // strlen_loop:
+                // ldrb w1, [x9, x0]
+                EmitInstr(FCode, $38606921);  // ldrb w1, [x9, x0]
+                // cbz w1, strlen_done (skip 2 instructions = 8 bytes)
+                EmitInstr(FCode, $34000041);  // cbz w1, +8
+                // add x0, x0, #1
+                WriteAddImm(FCode, X0, X0, 1);
+                // b strlen_loop (back 12 bytes)
+                WriteBranch(FCode, -12);
+                // strlen_done: X0 = length
+              end
+              else
+              begin
               // External call: record symbol for PLT/GOT generation
               found := False;
               for ei := 0 to High(FExternalSymbols) do
@@ -1746,7 +1803,8 @@ begin
               // BLR X16 (call via PLT entry in X16)
               // For now, use simple BL - will be patched to PLT
               WriteBranchLink(FCode, 0);  // Placeholder
-            end
+              end;  // end else (not strlen)
+            end   // end cmExternal
             else
             begin
               // Internal or imported call: emit BL (will be patched)
@@ -2580,87 +2638,74 @@ begin
   end;
   
   // Phase 9: Generate PLT stubs for external symbols
-  WriteLn('DEBUG: Phase 9 - FExternalSymbols count: ', Length(FExternalSymbols));
   if Length(FExternalSymbols) > 0 then
   begin
-    // Generate PLT0 (resolver stub)
-    // PLT0: ldr x16, [x16, #got_offset] ; br x16
-    // Standard ARM64 PLT entry is 16 bytes
-    
-    // Record PLT0 position
-    // PLT0: 
-    //   ldr x16, [x16, #12]  ; load got entry (offset will be patched)
-    //   br x16               ; jump to resolved address
-    
-    // First, generate PLT0 (resolver stub) - 16 bytes
-    // PLT0: ldr x17, [x16, #24] ; br x17 ; nop ; nop
-    // GOT[3] points to PLT0, so PLT0 loads from offset 24
-    WriteLn('DEBUG: PLT0 position before: ', FCode.Size);
-    WriteLdrImm9(FCode, 17, 16, 24);   // ldr x17, [x16, #24]
-    EmitInstr(FCode, $D61F03A0);         // br x17
-    
-    // Pad to 16 bytes
-    EmitInstr(FCode, $D503201F);  // nop
-    EmitInstr(FCode, $D503201F);  // nop
-    WriteLn('DEBUG: PLT0 position after: ', FCode.Size);
-    
-    // Now generate PLT entries for each external symbol (16 bytes each)
+    // ARM64 PLT using LDR (literal) — PC-relative, no GOT base register needed.
+    // Each PLT stub (8 bytes):
+    //   ldr x17, <GOT_slot>  ; PC-relative load of resolved function address
+    //   br  x17              ; Jump to resolved function
+    // LDR imm19 is patched in Phase 11 once the GOT VA is known.
+    // DT_BIND_NOW: the dynamic linker fills GOT before program start.
+    // PLT0 is never called; two NOPs keep it aligned.
+
+    FPLT0CodePos := FCode.Size;
+    EmitInstr(FCode, $D503201F);  // NOP
+    EmitInstr(FCode, $D503201F);  // NOP
+
     for i := 0 to High(FExternalSymbols) do
     begin
-      WriteLn('DEBUG: Generating PLT for: ', FExternalSymbols[i].Name, ' at pos: ', FCode.Size);
-      // Register PLT stub label
       SetLength(FLabelPositions, Length(FLabelPositions) + 1);
       FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
       FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
-      
-      // PLTn entry (16 bytes):
-      // ldr x17, [x16, #offset]  ; load GOT entry
-      // br x17                    ; jump to resolved address
+
       SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
       FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolIndex := i;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 0;
-      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 4;
-      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := 0;
-      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;
-      
-      // GOT[3+i] = GOT_BASE + 24 + i*8
-      // PLT[i] loads from its GOT entry at offset (24 + i*8)
-      WriteLdrImm9(FCode, 17, 16, 24 + i * 8);  // ldr x17, [x16, #offset]
-      EmitInstr(FCode, $D61F03A0);                 // br x17
-      
-      // Pad to 16 bytes
-      EmitInstr(FCode, $D503201F);  // nop
-      EmitInstr(FCode, $D503201F);  // nop
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 0;
+      FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := FPLT0CodePos;
+      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;  // patched in Phase 11
+
+      EmitInstr(FCode, $58000011);  // ldr x17, #0  (placeholder)
+      EmitInstr(FCode, $D61F0220);  // br x17
     end;
-    
-    // Now patch the calls to PLT stubs (BL __plt_<name>)
+
+    // Patch BL calls to PLT stubs
     for i := 0 to High(FCallPatches) do
     begin
-      // Check if this call is to a PLT stub
       if Pos('__plt_', FCallPatches[i].TargetName) = 1 then
       begin
-        // Find the PLT stub position
         targetFuncIdx := -1;
         for j := 0 to High(FLabelPositions) do
-        begin
           if FLabelPositions[j].Name = FCallPatches[i].TargetName then
           begin
             targetFuncIdx := j;
             Break;
           end;
-        end;
-        
         if targetFuncIdx >= 0 then
         begin
           patchPos := FCallPatches[i].CodePos;
           targetPos := FLabelPositions[targetFuncIdx].Pos;
           branchOffset := targetPos - patchPos;
-          // Patch BL instruction
           FCode.PatchU32LE(patchPos, $94000000 or DWord((branchOffset div 4) and $3FFFFFF));
         end;
       end;
+    end;
+  end;
+
+  // Phase 11: Patch PLT LDR (literal) instructions with correct GOT offsets.
+  if Length(FPLTGOTPatches) > 0 then
+  begin
+    gotBaseVA := ComputeExpectedGotVA(FExternalSymbols, FCode.Size, FData.Size);
+    for i := 0 to High(FPLTGOTPatches) do
+    begin
+      ldrPos    := FPLTGOTPatches[i].Pos;
+      gotSlotVA := gotBaseVA + 24 + UInt64(FPLTGOTPatches[i].SymbolIndex) * 8;
+      stubVA    := $400000 + $1000 + UInt64(ldrPos);
+      wordOff   := Int64(gotSlotVA - stubVA) div 4;
+      FCode.PatchU32LE(ldrPos, $58000011 or DWord(DWord(wordOff and $7FFFF) shl 5));
+      FPLTGOTPatches[i].GotVA := gotSlotVA;
     end;
   end;
 end;
