@@ -702,22 +702,23 @@ begin
            end
             else if target = targetMacOSX64 then
             begin
-              // macOS x86_64 Code Generation
-              macosx64Emit := TMacOSX64Emitter.Create;
+              // macOS x86_64 Code Generation (reuse Linux emitter with macOS syscall mode)
+              emit := TX86_64Emitter.Create;
+              emit.SetTargetOS(atmacOS);
               try
                 if flagEnergyLevel > 0 then
-                  macosx64Emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+                  emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
 
-                macosx64Emit.EmitFromIR(module);
-                codeBuf := macosx64Emit.GetCodeBuffer;
-                dataBuf := macosx64Emit.GetDataBuffer;
+                emit.EmitFromIR(module);
+                codeBuf := emit.GetCodeBuffer;
+                dataBuf := emit.GetDataBuffer;
 
-                externSymbols := macosx64Emit.GetExternalSymbols;
-                pltPatches := macosx64Emit.GetPLTGOTPatches;
+                externSymbols := emit.GetExternalSymbols;
+                pltPatches := emit.GetPLTGOTPatches;
                 if Length(externSymbols) > 0 then
                 begin
                   WriteLn('Generating dynamic Mach-O for macOS x86_64 with ', Length(externSymbols), ' external symbols');
-                  mainOff := macosx64Emit.GetFunctionOffset('main');
+                  mainOff := emit.GetFunctionOffset('main');
                   if mainOff < 0 then mainOff := 0;
                   WriteDynamicMachO64(outputFile, codeBuf, dataBuf, UInt64(mainOff), mctX86_64,
                     externSymbols, pltPatches);
@@ -725,18 +726,18 @@ begin
                 else
                 begin
                   WriteLn('Generating static Mach-O for macOS x86_64');
-                  entryVA := $400000 + 4096;
+                  entryVA := $100000000;  // macOS: user space starts at 4GB
                   WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctX86_64);
                 end;
 
                 // Energy statistics output
                 if flagEnergyLevel > 0 then
-                  PrintEnergyStats(macosx64Emit.GetEnergyStats);
+                  PrintEnergyStats(emit.GetEnergyStats);
 
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile);
               finally
-                macosx64Emit.Free;
+                emit.Free;
               end;
             end
             else if target = targetMacOSARM64 then

@@ -7,8 +7,6 @@ uses
   SysUtils, Classes, bytes, ir, backend_types, energy_model;
 
 type
-  TARM64TargetOS = (atLinux, atmacOS);
-
   TLabelPos = record
     Name: string;
     Pos: Integer;
@@ -74,14 +72,14 @@ type
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
-    FTargetOS: TARM64TargetOS;
+    FTargetOS: TTargetOS;
     procedure TrackEnergy(kind: TEnergyOpKind);
     // OS-specific syscall helpers
     procedure WriteSyscall(syscallNum: UInt64);
     procedure WriteSyscallInsn;
   public
-    constructor Create(targetOS: TARM64TargetOS = atLinux);
-    procedure SetTargetOS(targetOS: TARM64TargetOS);
+    constructor Create(targetOS: TTargetOS = atLinux);
+    procedure SetTargetOS(targetOS: TTargetOS);
     destructor Destroy; override;
     procedure EmitFromIR(module: TIRModule);
     function GetCodeBuffer: TByteBuffer;
@@ -995,7 +993,7 @@ end;
 // TARM64Emitter Implementation
 // ==========================================================================
 
-constructor TARM64Emitter.Create(targetOS: TARM64TargetOS = atLinux);
+constructor TARM64Emitter.Create(targetOS: TTargetOS = atLinux);
 begin
   inherited Create;
   FTargetOS := targetOS;
@@ -1039,7 +1037,7 @@ begin
   inherited Destroy;
 end;
 
-procedure TARM64Emitter.SetTargetOS(targetOS: TARM64TargetOS);
+procedure TARM64Emitter.SetTargetOS(targetOS: TTargetOS);
 begin
   FTargetOS := targetOS;
 end;
