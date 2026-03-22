@@ -7,8 +7,6 @@ uses
   SysUtils, Classes, bytes, ir, backend_types, energy_model;
 
 type
-  TARM64TargetOS = (atLinux, atmacOS);
-
   TLabelPos = record
     Name: string;
     Pos: Integer;
@@ -63,14 +61,14 @@ type
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
-    FTargetOS: TARM64TargetOS;
+    FTargetOS: TTargetOS;
     procedure TrackEnergy(kind: TEnergyOpKind);
     // OS-specific syscall helpers
     procedure WriteSyscall(syscallNum: UInt64);
     procedure WriteSyscallInsn;
   public
-    constructor Create(targetOS: TARM64TargetOS = atLinux);
-    procedure SetTargetOS(targetOS: TARM64TargetOS);
+    constructor Create(targetOS: TTargetOS = atLinux);
+    procedure SetTargetOS(targetOS: TTargetOS);
     destructor Destroy; override;
     procedure EmitFromIR(module: TIRModule);
     function GetCodeBuffer: TByteBuffer;
@@ -929,7 +927,7 @@ end;
 // TARM64Emitter Implementation
 // ==========================================================================
 
-constructor TARM64Emitter.Create(targetOS: TARM64TargetOS = atLinux);
+constructor TARM64Emitter.Create(targetOS: TTargetOS = atLinux);
 begin
   inherited Create;
   FTargetOS := targetOS;
@@ -973,7 +971,7 @@ begin
   inherited Destroy;
 end;
 
-procedure TARM64Emitter.SetTargetOS(targetOS: TARM64TargetOS);
+procedure TARM64Emitter.SetTargetOS(targetOS: TTargetOS);
 begin
   FTargetOS := targetOS;
 end;
@@ -1124,7 +1122,7 @@ var
   
   // Call patching
   callPatchIdx, targetFuncIdx: Integer;
-  
+
   // Function arguments
   argCount: Integer;
   argTemps: array of Integer;
@@ -1145,6 +1143,7 @@ var
   // External symbol search
   found: Boolean;
   ei: Integer;
+  extLibName: string;
 
   // Phase 11: PLT GOT patching
   gotBaseVA, gotSlotVA, stubVA: UInt64;
@@ -1752,33 +1751,6 @@ begin
             // Check if this is an external call (cmExternal)
             if instr.CallMode = cmExternal then
             begin
-              // Special handling for strlen: generate inline code instead of PLT
-              // This bypasses libc initialization issues
-              if instr.ImmStr = 'strlen' then
-              begin
-                // strlen(X0) -> X0 = length
-                // Input: X0 = string address (already loaded)
-                // Loop: count bytes until null terminator
-                // Uses: X1 = current byte, X0 = counter
-                
-                // Save string address in X9
-                WriteMovRegReg(FCode, X9, X0);
-                // X0 = 0 (length counter)
-                WriteMovImm64(FCode, X0, 0);
-                
-                // strlen_loop:
-                // ldrb w1, [x9, x0]
-                EmitInstr(FCode, $38606921);  // ldrb w1, [x9, x0]
-                // cbz w1, strlen_done (skip 2 instructions = 8 bytes)
-                EmitInstr(FCode, $34000041);  // cbz w1, +8
-                // add x0, x0, #1
-                WriteAddImm(FCode, X0, X0, 1);
-                // b strlen_loop (back 12 bytes)
-                WriteBranch(FCode, -12);
-                // strlen_done: X0 = length
-              end
-              else
-              begin
               // External call: record symbol for PLT/GOT generation
               found := False;
               for ei := 0 to High(FExternalSymbols) do
@@ -1787,23 +1759,21 @@ begin
                   found := True;
                   Break;
                 end;
-              
+
               if not found then
               begin
                 SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                 FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol(instr.ImmStr);
+                extLibName := module.GetExternLibrary(instr.ImmStr);
+                if extLibName = '' then extLibName := GetLibraryForSymbol(instr.ImmStr);
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := extLibName;
               end;
-              
-              // Emit call to PLT stub label (generated after all functions)
-              // Use BLR to call PLT stub (will be patched later)
+
+              // Emit BL placeholder — will be patched to PLT stub address
               SetLength(FCallPatches, Length(FCallPatches) + 1);
               FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
               FCallPatches[High(FCallPatches)].TargetName := '__plt_' + instr.ImmStr;
-              // BLR X16 (call via PLT entry in X16)
-              // For now, use simple BL - will be patched to PLT
               WriteBranchLink(FCode, 0);  // Placeholder
-              end;  // end else (not strlen)
             end   // end cmExternal
             else
             begin
@@ -2695,7 +2665,8 @@ begin
   end;
 
   // Phase 11: Patch PLT LDR (literal) instructions with correct GOT offsets.
-  if Length(FPLTGOTPatches) > 0 then
+  // For macOS targets, WriteDynamicMachO64 patches the stubs with Mach-O GOT VAs.
+  if (FTargetOS = atLinux) and (Length(FPLTGOTPatches) > 0) then
   begin
     gotBaseVA := ComputeExpectedGotVA(FExternalSymbols, FCode.Size, FData.Size);
     for i := 0 to High(FPLTGOTPatches) do

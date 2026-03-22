@@ -53,6 +53,7 @@ var
   externSymbols: TExternalSymbolArray;
   neededLibs: array of string;
   pltPatches: TPLTGOTPatchArray;
+  mainOff: Integer;
   i, j: Integer;
   param: string;
 
@@ -251,7 +252,7 @@ begin
   
     if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.5.0');
+    WriteLn(StdErr, 'Lyx Compiler v0.5.4');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -441,7 +442,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.5.0');
+  WriteLn('Lyx Compiler v0.5.4');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
@@ -701,36 +702,42 @@ begin
            end
             else if target = targetMacOSX64 then
             begin
-              // macOS x86_64 Code Generation
-              macosx64Emit := TMacOSX64Emitter.Create;
+              // macOS x86_64 Code Generation (reuse Linux emitter with macOS syscall mode)
+              emit := TX86_64Emitter.Create;
+              emit.SetTargetOS(atmacOS);
               try
                 if flagEnergyLevel > 0 then
-                  macosx64Emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
-  
-                macosx64Emit.EmitFromIR(module);
-                codeBuf := macosx64Emit.GetCodeBuffer;
-                dataBuf := macosx64Emit.GetDataBuffer;
-                entryVA := $400000 + 4096;  // Base VA + code offset
-  
-                // Check if we have external symbols (for now ignore, produce static Mach-O)
-                externSymbols := macosx64Emit.GetExternalSymbols;
+                  emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+
+                emit.EmitFromIR(module);
+                codeBuf := emit.GetCodeBuffer;
+                dataBuf := emit.GetDataBuffer;
+
+                externSymbols := emit.GetExternalSymbols;
+                pltPatches := emit.GetPLTGOTPatches;
                 if Length(externSymbols) > 0 then
                 begin
-                  WriteLn('Note: macOS dynamic linking not yet implemented');
-                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                  WriteLn('Generating dynamic Mach-O for macOS x86_64 with ', Length(externSymbols), ' external symbols');
+                  mainOff := emit.GetFunctionOffset('main');
+                  if mainOff < 0 then mainOff := 0;
+                  WriteDynamicMachO64(outputFile, codeBuf, dataBuf, UInt64(mainOff), mctX86_64,
+                    externSymbols, pltPatches);
+                end
+                else
+                begin
+                  WriteLn('Generating static Mach-O for macOS x86_64');
+                  entryVA := $100000000;  // macOS: user space starts at 4GB
+                  WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctX86_64);
                 end;
-  
-                WriteLn('Generating static Mach-O for macOS x86_64');
-                WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctX86_64);
-  
+
                 // Energy statistics output
                 if flagEnergyLevel > 0 then
-                  PrintEnergyStats(macosx64Emit.GetEnergyStats);
-  
+                  PrintEnergyStats(emit.GetEnergyStats);
+
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile);
               finally
-                macosx64Emit.Free;
+                emit.Free;
               end;
             end
             else if target = targetMacOSARM64 then
@@ -742,24 +749,28 @@ begin
                 arm64Emit.EmitFromIR(module);
                 codeBuf := arm64Emit.GetCodeBuffer;
                 dataBuf := arm64Emit.GetDataBuffer;
-                entryVA := $400000 + 4096;  // Base VA + code offset
-                
-                // Note: Mach-O 64-bit header for ARM64 requires different magic
-                // For now, we'll use the same Mach-O writer but this needs proper ARM64 support
+
                 externSymbols := arm64Emit.GetExternalSymbols;
+                pltPatches := arm64Emit.GetPLTGOTPatches;
                 if Length(externSymbols) > 0 then
                 begin
-                  WriteLn('Note: macOS ARM64 dynamic linking not yet implemented');
-                  WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                  WriteLn('Generating dynamic Mach-O for macOS ARM64 with ', Length(externSymbols), ' external symbols');
+                  mainOff := arm64Emit.GetFunctionOffset('main');
+                  if mainOff < 0 then mainOff := 0;
+                  WriteDynamicMachO64(outputFile, codeBuf, dataBuf, UInt64(mainOff), mctARM64,
+                    externSymbols, pltPatches);
+                end
+                else
+                begin
+                  WriteLn('Generating static Mach-O for macOS ARM64');
+                  entryVA := $400000 + 4096;
+                  WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctARM64);
                 end;
-  
-                WriteLn('Generating static Mach-O for macOS ARM64');
-                WriteMachO64(outputFile, codeBuf, dataBuf, entryVA, mctARM64);
-  
+
                 // Energy statistics output
                 if flagEnergyLevel > 0 then
                   PrintEnergyStats(arm64Emit.GetEnergyStats);
-  
+
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile, ' (Mach-O for macOS ARM64)');
               finally

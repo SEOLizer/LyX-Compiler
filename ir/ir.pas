@@ -181,6 +181,8 @@ type
     GlobalVars: TGlobalVarArray; // global variables with init values
     // VMT: class declarations for VMT table emission
     ClassDecls: array of TAstClassDecl; // stored class declarations
+    // C FFI: maps extern function name → library name (e.g. 'sqlite3' → 'libsqlite3.so')
+    ExternLibraries: TStringList; // Name=library pairs
     constructor Create;
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
@@ -190,6 +192,8 @@ type
     function AddGlobalStringPtr(const name: string; strIdx: Integer): Integer;
     function AddGlobalArray(const name: string; const values: array of Int64): Integer;
     procedure AddClassDecl(cd: TAstClassDecl);
+    procedure RegisterExternLibrary(const funcName, libName: string);
+    function GetExternLibrary(const funcName: string): string;
   end;
 
 { Berechnet die geschätzten Energiekosten für einen IR-OpCode }
@@ -234,6 +238,8 @@ begin
   Strings.Sorted := False;
   Strings.Duplicates := dupIgnore;
   GlobalVars := nil;
+  ExternLibraries := TStringList.Create;
+  ExternLibraries.Sorted := False;
 end;
 
 destructor TIRModule.Destroy;
@@ -246,6 +252,7 @@ begin
       Functions[i].Free;
   SetLength(Functions, 0);
   Strings.Free;
+  ExternLibraries.Free;
   // ClassDecls array - don't free, they belong to AST
   SetLength(ClassDecls, 0);
   inherited Destroy;
@@ -344,6 +351,16 @@ procedure TIRModule.AddClassDecl(cd: TAstClassDecl);
 begin
   SetLength(ClassDecls, Length(ClassDecls) + 1);
   ClassDecls[High(ClassDecls)] := cd;
+end;
+
+procedure TIRModule.RegisterExternLibrary(const funcName, libName: string);
+begin
+  ExternLibraries.Values[funcName] := libName;
+end;
+
+function TIRModule.GetExternLibrary(const funcName: string): string;
+begin
+  Result := ExternLibraries.Values[funcName];
 end;
 
 { Berechnet die geschätzten Energiekosten für einen IR-OpCode }

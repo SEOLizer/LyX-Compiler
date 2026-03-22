@@ -15,8 +15,17 @@
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
 | Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
-| Niedrig | **macOS Dynamic Linking** | PLT/GOT für Mach-O implementieren |
+| Niedrig | ~~**macOS Dynamic Linking**~~ ✅ | PLT/GOT für Mach-O implementieren (LC_LOAD_DYLIB + Stub-PLT) |
 | Niedrig | ~~**ARM64 PLT/GOT Implementation**~~ ✅ | LDR (literal) + BR X17 PLT-Stubs, DT_PLTREL fix, dataBuf im RW-Segment |
+
+### C FFI
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**Windows x64 FFI**~~ ✅ | `GetExternLibrary` in `win64_emit.pas` auswerten → DLL-Name für IAT-Import |
+| Niedrig | ~~**macOS x86_64 FFI**~~ ✅ | Dynamic Mach-O: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
+| Niedrig | ~~**macOS ARM64 FFI**~~ ✅ | Dynamic Mach-O ARM64: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
+| Niedrig | ~~**`importC` auf ARM64**~~ ✅ | `importC "header.h"` mit `--target=linux-arm64` testen und verifizieren |
 
 ### Backend
 
@@ -141,6 +150,13 @@ _(keine offenen Aufgaben)_
 
 ## Versionsverlauf
 
+### v0.5.4 (März 2026)
+- C FFI: Windows x64 IAT-Import (`GetExternLibrary` → `msvcrt.dll`, `FindOrAddImportDll/Func`)
+- C FFI: macOS x86_64 + ARM64 Dynamic Mach-O (`LC_LOAD_DYLIB` + dyld bind opcodes + Stub-PLT)
+- macOS x86_64: volle IR-Coverage (70 Opcodes) via `TX86_64Emitter` mit `SetTargetOS(atmacOS)`
+- `importC` auf ARM64: extern fn via PLT/GOT statt Inline-Stub
+- `TTargetOS` als gemeinsamer Typ in `backend_types.pas`
+
 ### v0.5.3 (März 2026)
 - Sektionstabellen für statisches ELF (objdump -d support)
 - PLT/GOT Dynamic Linking (extern fn → PLT-Stubs → libc.so.6)
@@ -148,6 +164,8 @@ _(keine offenen Aufgaben)_
 - ARM64 VMT Support (Virtual Call, ADRP/ADD, VMT-Tabellen)
 - Nested Functions (Lifting-Ansatz, ohne Closures)
 - Closures via Static-Link (Parent-RBP als impliziter Parameter)
+- C FFI: `extern fn ... link "libname"` und `importC "header.h" link "libname"`
+- C Header Parser (TCHeaderParser) mit GCC-Attribut-Handling
 
 ### v0.5.2 (März 2026)
 - SSE2 Float-Codegen für Linux x86_64
