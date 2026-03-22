@@ -76,6 +76,15 @@ _(keine offenen Aufgaben)_
 - [x] **IAC Escaping** - IAC-Bytes beim Senden verdoppeln
 - [x] **Test-Programm** - tests/lyx/net/test_telnet.lyx
 
+### SMTP Client (März 2026)
+
+- [x] **std/net/smtp.lyx** - RFC 5321 SMTP Client (SMTPConnect, SMTPSend, SMTPQuit)
+- [x] **SMTP Commands** - EHLO, MAIL FROM, RCPT TO, DATA, QUIT
+- [x] **Response Parsing** - 3-digit SMTP response code parsing
+- [x] **Message Building** - Headers (From, To, Subject) + Body + Dot-stuffing
+- [x] **High-level API** - SMTPSend() - complete email send in one call
+- [x] **Test-Programm** - tests/lyx/net/test_smtp.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -163,6 +172,7 @@ _(keine offenen Aufgaben)_
 - [x] **HTTPS Client** - OpenSSL 3.x FFI (std.net.tls + std.net.https) mit SNI + Zertifikatsprüfung
 - [x] **TLS/SSL** - TLSInit(), TLSConnect(), TLSRead(), TLSWrite() via libssl.so.3
 - [x] **Telnet Client** - RFC 854 (TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation)
+- [x] **SMTP Client** - RFC 5321 (SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/RCPT/DATA)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -182,6 +192,13 @@ _(keine offenen Aufgaben)_
 ---
 
 ## Versionsverlauf
+
+### v0.5.5 (März 2026)
+- HTTPS Client via OpenSSL 3.x FFI (std.net.tls + std.net.https)
+- TLS/SSL: TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree
+- Telnet Client (RFC 854): TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation
+- SMTP Client (RFC 5321): SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/DATA
+- ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
 - C FFI: Windows x64 IAT-Import (`GetExternLibrary` → `msvcrt.dll`, `FindOrAddImportDll/Func`)
