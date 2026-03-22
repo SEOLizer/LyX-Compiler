@@ -1,0 +1,661 @@
+// Lyx SMTP Client - RFC 5321 compliant
+// Email sending via SMTP protocol
+//
+// SMTP uses TCP port 25 (standard) or 587 (submission)
+// The protocol is text-based with 3-digit response codes
+//
+// Usage:
+//   import std.net.smtp;
+//   var smtp: SMTPConn := SMTPConnect("smtp.example.com", 587);
+//   var email: SMTPEmail;
+//   email.from := "sender@example.com";
+//   email.to := "recipient@example.com";
+//   email.subject := "Test Email";
+//   email.body := "Hello from Lyx!";
+//   var ok: int64 := SMTPSend(smtp, email);
+//   SMTPQuit(smtp);
+//   SMTPClose(smtp);
+
+unit std.net.smtp;
+
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+
+// SMTP port constants
+pub con SMTP_PORT: int64 := 25;
+pub con SMTP_SUBMISSION_PORT: int64 := 587;
+pub con SMTPS_PORT: int64 := 465;
+
+// SMTP response codes
+pub con SMTP_READY: int64 := 220;
+pub con SMTP_QUIT: int64 := 221;
+pub con SMTP_OK: int64 := 250;
+pub con SMTP_AUTH_CONTINUE: int64 := 334;
+pub con SMTP_DATA_START: int64 := 354;
+pub con SMTP_AUTH_SUCCESS: int64 := 235;
+
+// SMTP connection wrapper
+pub type SMTPConn = struct {
+  conn: TCPConn;       // Underlying TCP connection
+  connected: int64;    // 1 if connected and greeting received
+};
+
+// SMTP email structure
+pub type SMTPEmail = struct {
+  from: int64;         // Pointer to sender address (pchar)
+  to: int64;           // Pointer to recipient address (pchar)
+  subject: int64;      // Pointer to subject string (pchar)
+  body: int64;         // Pointer to body text (pchar)
+};
+
+// Read SMTP response line
+// Returns response code (first 3 digits), or -1 on error
+// buf must be at least 512 bytes
+pub fn SMTPReadResponse(conn: SMTPConn, buf: int64): int64 {
+  var n: int64;
+  var code: int64;
+  var i: int64;
+  var c: int64;
+  
+  n := TCPConnRead(conn.conn, buf, 511);
+  if (n <= 0) {
+    return -1;
+  }
+  
+  // Null-terminate
+  poke8(buf + n, 0);
+  
+  // Parse 3-digit response code
+  code := 0;
+  i := 0;
+  while (i < 3 && i < n) {
+    c := peek8(buf + i);
+    if (c >= 48 && c <= 57) {
+      code := code * 10 + (c - 48);
+    }
+    i := i + 1;
+  }
+  
+  return code;
+}
+
+// Send SMTP command string (adds CRLF)
+// Returns number of bytes sent, or -1 on error
+pub fn SMTPSendCmd(conn: SMTPConn, cmd: int64, len: int64): int64 {
+  var cmdBuf: int64;
+  var i: int64;
+  var n: int64;
+  
+  // Allocate buffer for command + CRLF
+  cmdBuf := mmap(0, len + 2, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (cmdBuf == 0) {
+    return -1;
+  }
+  
+  // Copy command
+  i := 0;
+  while (i < len) {
+    poke8(cmdBuf + i, peek8(cmd + i));
+    i := i + 1;
+  }
+  
+  // Append CRLF
+  poke8(cmdBuf + len, 13);      // \r
+  poke8(cmdBuf + len + 1, 10);  // \n
+  
+  // Send
+  n := TCPConnWrite(conn.conn, cmdBuf, len + 2);
+  munmap(cmdBuf, len + 2);
+  
+  return n;
+}
+
+// Count string length (null-terminated)
+pub fn SMTPStrLen(s: int64): int64 {
+  var len: int64 := 0;
+  while (peek8(s + len) != 0) {
+    len := len + 1;
+  }
+  return len;
+}
+
+// Build EHLO command string
+// Returns pointer to allocated command string (caller must free)
+pub fn SMTPBuildEhlo(hostname: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var c: int64;
+  
+  buf := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // "EHLO "
+  pos := 0;
+  poke8(buf + pos, 69); pos := pos + 1;  // E
+  poke8(buf + pos, 72); pos := pos + 1;  // H
+  poke8(buf + pos, 76); pos := pos + 1;  // L
+  poke8(buf + pos, 79); pos := pos + 1;  // O
+  poke8(buf + pos, 32); pos := pos + 1;  // space
+  
+  // hostname
+  if (hostname != 0) {
+    i := 0;
+    while (i < 250) {
+      c := peek8(hostname + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  } else {
+    // Default hostname
+    poke8(buf + pos, 108); pos := pos + 1;  // l
+    poke8(buf + pos, 121); pos := pos + 1;  // y
+    poke8(buf + pos, 120); pos := pos + 1;  // x
+    poke8(buf + pos, 45);  pos := pos + 1;  // -
+    poke8(buf + pos, 99);  pos := pos + 1;  // c
+    poke8(buf + pos, 108); pos := pos + 1;  // l
+    poke8(buf + pos, 105); pos := pos + 1;  // i
+  }
+  
+  // Null-terminate (SMTPSendCmd uses length, not null-terminated)
+  // But we return length separately
+  return buf;
+}
+
+// Build MAIL FROM command
+// Returns pointer to allocated command string (caller must free)
+// Sets outLen to the command length
+pub fn SMTPBuildMailFrom(sender: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var c: int64;
+  
+  buf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // "MAIL FROM:<"
+  pos := 0;
+  poke8(buf + pos, 77);  pos := pos + 1;  // M
+  poke8(buf + pos, 65);  pos := pos + 1;  // A
+  poke8(buf + pos, 73);  pos := pos + 1;  // I
+  poke8(buf + pos, 78);  pos := pos + 1;  // N
+  poke8(buf + pos, 32);  pos := pos + 1;  // space
+  poke8(buf + pos, 70);  pos := pos + 1;  // F
+  poke8(buf + pos, 82);  pos := pos + 1;  // R
+  poke8(buf + pos, 79);  pos := pos + 1;  // O
+  poke8(buf + pos, 77);  pos := pos + 1;  // M
+  poke8(buf + pos, 58);  pos := pos + 1;  // :
+  poke8(buf + pos, 60);  pos := pos + 1;  // <
+  
+  // sender address
+  if (sender != 0) {
+    i := 0;
+    while (i < 256) {
+      c := peek8(sender + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // ">"
+  poke8(buf + pos, 62);  pos := pos + 1;  // >
+  
+  return buf;
+}
+
+// Build RCPT TO command
+pub fn SMTPBuildRcptTo(recipient: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var c: int64;
+  
+  buf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // "RCPT TO:<"
+  pos := 0;
+  poke8(buf + pos, 82);  pos := pos + 1;  // R
+  poke8(buf + pos, 67);  pos := pos + 1;  // C
+  poke8(buf + pos, 80);  pos := pos + 1;  // P
+  poke8(buf + pos, 84);  pos := pos + 1;  // T
+  poke8(buf + pos, 32);  pos := pos + 1;  // space
+  poke8(buf + pos, 84);  pos := pos + 1;  // T
+  poke8(buf + pos, 79);  pos := pos + 1;  // O
+  poke8(buf + pos, 58);  pos := pos + 1;  // :
+  poke8(buf + pos, 60);  pos := pos + 1;  // <
+  
+  // recipient address
+  if (recipient != 0) {
+    i := 0;
+    while (i < 256) {
+      c := peek8(recipient + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // ">"
+  poke8(buf + pos, 62);  pos := pos + 1;  // >
+  
+  return buf;
+}
+
+// Build complete email message with headers
+// Returns pointer to allocated message (caller must free)
+pub fn SMTPBuildMessage(email: SMTPEmail): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var c: int64;
+  
+  // Allocate 8KB for message
+  buf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // "From: "
+  i := 0;
+  while (i < 6) {
+    c := peek8("From: " + i);
+    poke8(buf + pos, c);
+    pos := pos + 1;
+    i := i + 1;
+  }
+  
+  // from address
+  if (email.from != 0) {
+    i := 0;
+    while (i < 256) {
+      c := peek8(email.from + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // CRLF
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  
+  // "To: "
+  i := 0;
+  while (i < 4) {
+    c := peek8("To: " + i);
+    poke8(buf + pos, c);
+    pos := pos + 1;
+    i := i + 1;
+  }
+  
+  // to address
+  if (email.to != 0) {
+    i := 0;
+    while (i < 256) {
+      c := peek8(email.to + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // CRLF
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  
+  // "Subject: "
+  i := 0;
+  while (i < 9) {
+    c := peek8("Subject: " + i);
+    poke8(buf + pos, c);
+    pos := pos + 1;
+    i := i + 1;
+  }
+  
+  // subject
+  if (email.subject != 0) {
+    i := 0;
+    while (i < 256) {
+      c := peek8(email.subject + i);
+      if (c == 0) {
+        break;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // CRLF
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  
+  // Empty line (end of headers)
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  
+  // Body
+  if (email.body != 0) {
+    i := 0;
+    while (i < 7000) {
+      c := peek8(email.body + i);
+      if (c == 0) {
+        break;
+      }
+      // Dot-stuffing: lines starting with . need an extra .
+      if (c == 46 && (i == 0 || peek8(email.body + i - 1) == 10)) {
+        poke8(buf + pos, 46);
+        pos := pos + 1;
+      }
+      poke8(buf + pos, c);
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  
+  // End of message (CRLF.CRLF)
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  poke8(buf + pos, 46); pos := pos + 1;  // .
+  poke8(buf + pos, 13); pos := pos + 1;
+  poke8(buf + pos, 10); pos := pos + 1;
+  
+  // Null-terminate (for debugging)
+  poke8(buf + pos, 0);
+  
+  return buf;
+}
+
+// Connect to SMTP server
+// host: hostname (e.g., "smtp.example.com")
+// port: port number (25 or 587)
+// Returns SMTPConn, caller must call SMTPClose()
+pub fn SMTPConnect(host: int64, port: int64): SMTPConn {
+  var sconn: SMTPConn;
+  var conn: TCPConn;
+  var ip: int64;
+  var respBuf: int64;
+  var code: int64;
+  
+  sconn.conn.fd := -1;
+  sconn.connected := 0;
+  
+  // Resolve hostname
+  ip := GetHostByName(host);
+  if (ip == 0) {
+    return sconn;
+  }
+  
+  // Connect TCP
+  conn := TCPConnect(ip, port);
+  if (conn.fd < 0) {
+    return sconn;
+  }
+  
+  // Enable TCP_NODELAY
+  TCPConnSetNodelay(conn, 1);
+  
+  sconn.conn := conn;
+  
+  // Read server greeting (220 ...)
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    TCPConnClose(conn);
+    sconn.conn.fd := -1;
+    return sconn;
+  }
+  
+  code := SMTPReadResponse(sconn, respBuf);
+  munmap(respBuf, 512);
+  
+  if (code != SMTP_READY) {
+    TCPConnClose(conn);
+    sconn.conn.fd := -1;
+    return sconn;
+  }
+  
+  sconn.connected := 1;
+  return sconn;
+}
+
+// Send EHLO command and check response
+// Returns response code (250 = OK), or -1 on error
+pub fn SMTPEhlo(conn: SMTPConn, hostname: int64): int64 {
+  var cmd: int64;
+  var cmdLen: int64;
+  var respBuf: int64;
+  var code: int64;
+  
+  if (conn.connected == 0) {
+    return -1;
+  }
+  
+  // Build EHLO command
+  cmd := SMTPBuildEhlo(hostname);
+  if (cmd == 0) {
+    return -1;
+  }
+  cmdLen := SMTPStrLen(cmd);
+  
+  // Send EHLO
+  SMTPSendCmd(conn, cmd, cmdLen);
+  munmap(cmd, 256);
+  
+  // Read response
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Send MAIL FROM command
+// Returns response code (250 = OK), or -1 on error
+pub fn SMTPMailFrom(conn: SMTPConn, sender: int64): int64 {
+  var cmd: int64;
+  var cmdLen: int64;
+  var respBuf: int64;
+  var code: int64;
+  
+  cmd := SMTPBuildMailFrom(sender);
+  if (cmd == 0) {
+    return -1;
+  }
+  cmdLen := SMTPStrLen(cmd);
+  
+  SMTPSendCmd(conn, cmd, cmdLen);
+  munmap(cmd, 512);
+  
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Send RCPT TO command
+// Returns response code (250 = OK), or -1 on error
+pub fn SMTPRcptTo(conn: SMTPConn, recipient: int64): int64 {
+  var cmd: int64;
+  var cmdLen: int64;
+  var respBuf: int64;
+  var code: int64;
+  
+  cmd := SMTPBuildRcptTo(recipient);
+  if (cmd == 0) {
+    return -1;
+  }
+  cmdLen := SMTPStrLen(cmd);
+  
+  SMTPSendCmd(conn, cmd, cmdLen);
+  munmap(cmd, 512);
+  
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Send DATA command
+// Returns response code (354 = ready for data), or -1 on error
+pub fn SMTPDataStart(conn: SMTPConn): int64 {
+  var respBuf: int64;
+  var code: int64;
+  
+  // Send "DATA" command
+  SMTPSendCmd(conn, "DATA", 4);
+  
+  // Read response
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Send complete email message
+// Returns response code (250 = OK), or -1 on error
+pub fn SMTPSendMessage(conn: SMTPConn, email: SMTPEmail): int64 {
+  var msgBuf: int64;
+  var msgLen: int64;
+  var respBuf: int64;
+  var code: int64;
+  
+  // Build complete message
+  msgBuf := SMTPBuildMessage(email);
+  if (msgBuf == 0) {
+    return -1;
+  }
+  msgLen := SMTPStrLen(msgBuf);
+  
+  // Send message
+  TCPConnWrite(conn.conn, msgBuf, msgLen);
+  munmap(msgBuf, 8192);
+  
+  // Read response
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Send complete email in one call (high-level API)
+// Connects, EHLO, MAIL FROM, RCPT TO, DATA, message, QUIT
+// Returns 1 on success, 0 on failure
+pub fn SMTPSend(conn: SMTPConn, email: SMTPEmail): int64 {
+  var code: int64;
+  
+  // EHLO
+  code := SMTPEhlo(conn, 0);
+  if (code != SMTP_OK) {
+    return 0;
+  }
+  
+  // MAIL FROM
+  code := SMTPMailFrom(conn, email.from);
+  if (code != SMTP_OK) {
+    return 0;
+  }
+  
+  // RCPT TO
+  code := SMTPRcptTo(conn, email.to);
+  if (code != SMTP_OK) {
+    return 0;
+  }
+  
+  // DATA
+  code := SMTPDataStart(conn);
+  if (code != SMTP_DATA_START) {
+    return 0;
+  }
+  
+  // Send message
+  code := SMTPSendMessage(conn, email);
+  if (code != SMTP_OK) {
+    return 0;
+  }
+  
+  return 1;
+}
+
+// Send QUIT command
+// Returns response code (221 = OK), or -1 on error
+pub fn SMTPQuit(conn: SMTPConn): int64 {
+  var respBuf: int64;
+  var code: int64;
+  
+  if (conn.connected == 0) {
+    return -1;
+  }
+  
+  // Send "QUIT" command
+  SMTPSendCmd(conn, "QUIT", 4);
+  
+  // Read response
+  respBuf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return -1;
+  }
+  
+  code := SMTPReadResponse(conn, respBuf);
+  munmap(respBuf, 512);
+  
+  return code;
+}
+
+// Close SMTP connection
+pub fn SMTPClose(conn: SMTPConn) {
+  if (conn.conn.fd >= 0) {
+    TCPConnClose(conn.conn);
+  }
+}
