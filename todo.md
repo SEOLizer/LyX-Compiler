@@ -6,9 +6,8 @@
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Mittel | ~~**HTTP/HTTPS Client**~~ ✅ | HTTPS-Client via OpenSSL 3.x FFI (std.net.tls + std.net.https) |
-| Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
-| Niedrig | ~~**TLS Support**~~ ✅ | TLS/SSL via OpenSSL 3.x FFI (std.net.tls) |
+| Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwenden |
+| Niedrig | **SSH Client** | SSH-Client via libssh FFI |
 
 ### Dynamic Linking
 
@@ -67,6 +66,15 @@ _(keine offenen Aufgaben)_
 ---
 
 ## Abgeschlossene Aufgaben
+
+### Telnet Client (März 2026)
+
+- [x] **std/net/telnet.lyx** - RFC 854 Telnet Client (TelnetConnect, TelnetRead, TelnetWrite)
+- [x] **Telnet Commands** - IAC, DO, DONT, WILL, WONT, SB, SE
+- [x] **Option Negotiation** - ECHO, SUPPRESS-GA, BINARY, TERMINAL_TYPE
+- [x] **IAC Filtering** - Telnet commands aus Read-Daten filtern
+- [x] **IAC Escaping** - IAC-Bytes beim Senden verdoppeln
+- [x] **Test-Programm** - tests/lyx/net/test_telnet.lyx
 
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
@@ -152,6 +160,9 @@ _(keine offenen Aufgaben)_
 - [x] **Unix Domain Sockets** - AF_UNIX, sockaddr_un
 - [x] **DNS Resolution** - GetHostByName(), ResolveHost()
 - [x] **HTTP Client** - HTTPGet(), HTTPPost(), HTTPSend()
+- [x] **HTTPS Client** - OpenSSL 3.x FFI (std.net.tls + std.net.https) mit SNI + Zertifikatsprüfung
+- [x] **TLS/SSL** - TLSInit(), TLSConnect(), TLSRead(), TLSWrite() via libssl.so.3
+- [x] **Telnet Client** - RFC 854 (TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
