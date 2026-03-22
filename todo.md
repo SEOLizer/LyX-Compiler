@@ -95,6 +95,15 @@ _(keine offenen Aufgaben)_
 - [x] **Data Items** - FLAGS, ENVELOPE, BODY, RFC822, UID
 - [x] **Test-Programm** - tests/lyx/net/test_imap.lyx
 
+### NTP Client (März 2026)
+
+- [x] **std/net/ntp.lyx** - RFC 5905 NTP Client (NTPGetTime, NTPParseResponse)
+- [x] **NTP Packet** - 48-byte UDP Paket mit LI+VN+Mode Header
+- [x] **Timestamps** - 64-bit NTP Timestamps (32s + 32f), NTP-Epoch Offset
+- [x] **Time Formatting** - NTPFormatTime() für YYYY-MM-DD HH:MM:SS UTC
+- [x] **UDP Transport** - UDPSocket SendTo/Recv für NTP-Anfragen
+- [x] **Test-Programm** - tests/lyx/net/test_ntp.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -184,6 +193,7 @@ _(keine offenen Aufgaben)_
 - [x] **Telnet Client** - RFC 854 (TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation)
 - [x] **SMTP Client** - RFC 5321 (SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/RCPT/DATA)
 - [x] **IMAP Client** - RFC 3501 (IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList)
+- [x] **NTP Client** - RFC 5905 (NTPGetTime, NTPParseResponse, NTPFormatTime)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -210,6 +220,7 @@ _(keine offenen Aufgaben)_
 - Telnet Client (RFC 854): TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation
 - SMTP Client (RFC 5321): SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/DATA
 - IMAP Client (RFC 3501): IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList
+- NTP Client (RFC 5905): NTPGetTime, NTPParseResponse, NTPFormatTime
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
