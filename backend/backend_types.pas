@@ -7,6 +7,9 @@ uses
   bytes;
 
 type
+  { --- Target OS --- }
+  TTargetOS = (atLinux, atmacOS, atWindows);
+
   { --- Energy-Aware Enums --- }
   TEnergyLevel = (eelNone, eelMinimal, eelLow, eelMedium, eelHigh, eelExtreme);
   TCPUFamily = (cfUnknown, cfX86_64, cfARM64, cfARMCortexM, cfARMCortexA);

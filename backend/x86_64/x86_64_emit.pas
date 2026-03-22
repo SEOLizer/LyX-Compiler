@@ -69,7 +69,9 @@ type
     FCurrentCPU: TCPUEnergyModel;
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
-    
+    FTargetOS: TTargetOS;  // atLinux or atmacOS
+
+    function SysNum(linuxN, macosN: Int64): Int64;
     procedure TrackEnergy(kind: TEnergyOpKind);
     procedure EmitDebugPrintString(const s: string);
     procedure EmitDebugPrintInt(valueReg: Integer);
@@ -95,6 +97,7 @@ type
     function AddExternalSymbol(const name, libName: string): Integer;
     function GetEnergyStats: TEnergyStats;
     procedure SetEnergyLevel(level: TEnergyLevel);
+    procedure SetTargetOS(os: TTargetOS);
   end;
 
 implementation
@@ -132,6 +135,18 @@ const
   SYS_MACOS_CHMOD   = $200000F;  // sys_chmod (15)
   SYS_MACOS_NANOSLEEP = $20000F0; // sys_nanosleep (240)
   SYS_MACOS_GETTIMEOFDAY = $2000074; // sys_gettimeofday (116)
+  SYS_MACOS_SOCKET   = $2000061;  // sys_socket (97)
+  SYS_MACOS_BIND     = $2000068;  // sys_bind (104)
+  SYS_MACOS_LISTEN   = $200006A;  // sys_listen (106)
+  SYS_MACOS_ACCEPT   = $200001E;  // sys_accept (30)
+  SYS_MACOS_CONNECT  = $2000062;  // sys_connect (98)
+  SYS_MACOS_RECVFROM = $200001D;  // sys_recvfrom (29)
+  SYS_MACOS_SENDTO   = $2000085;  // sys_sendto (133)
+  SYS_MACOS_SETSOCKOPT = $2000069; // sys_setsockopt (105)
+  SYS_MACOS_GETSOCKOPT = $200007D; // sys_getsockopt (125)
+  SYS_MACOS_FCNTL    = $200005C;  // sys_fcntl (92)
+  SYS_MACOS_SHUTDOWN = $2000086;  // sys_shutdown (134)
+  SYS_MACOS_IOCTL    = $2000036;  // sys_ioctl (54)
 
   // Linux Syscall-Nummern (x86_64 ABI)
   SYS_LINUX_EXIT    = 60;   // sys_exit
@@ -451,6 +466,8 @@ begin
   SetLength(FExternalSymbols, 0);
   SetLength(FPLTGOTPatches, 0);
   
+  FTargetOS := atLinux;
+
   // Energy-Modell initialisieren
   FCurrentCPU := GetCPUEnergyModel(cfX86_64);
   FEnergyContext.Config := GetEnergyConfig;
@@ -571,6 +588,19 @@ end;
 procedure TX86_64Emitter.SetEnergyLevel(level: TEnergyLevel);
 begin
   FEnergyContext.Config.Level := level;
+end;
+
+procedure TX86_64Emitter.SetTargetOS(os: TTargetOS);
+begin
+  FTargetOS := os;
+end;
+
+function TX86_64Emitter.SysNum(linuxN, macosN: Int64): Int64;
+begin
+  if FTargetOS = atmacOS then
+    Result := macosN
+  else
+    Result := linuxN;
 end;
 
 { Syscall-Helfer }
@@ -752,12 +782,12 @@ begin
     WriteMovRegImm64(FCode, RDI, 0);
   end;
   
-  // mov rax, 60 (sys_exit)
-  WriteMovRegImm64(FCode, RAX, 60);
-  
+  // mov rax, sys_exit
+  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+
   // syscall
   WriteSyscall(FCode);
-  
+
   // Funktionen generieren
   for i := 0 to High(module.Functions) do
   begin
@@ -1362,12 +1392,12 @@ begin
               // R9 = offset = 0
               WriteMovRegImm64(FCode, R9, 0);
               
-              // RAX = sys_mmap = 9
-              WriteMovRegImm64(FCode, RAX, 9);
-              
+              // RAX = sys_mmap
+              WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+
               // syscall
               WriteSyscall(FCode);
-              
+
               // Store result (pointer) to Dest temp slot
               if instr.Dest >= 0 then
               begin
@@ -1399,13 +1429,13 @@ begin
               else
                 WriteMovRegImm64(FCode, RSI, 4096);  // Default page size
               
-              // RAX = sys_munmap = 11
-              WriteMovRegImm64(FCode, RAX, 11);
-              
+              // RAX = sys_munmap
+              WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP)));
+
               // syscall
               WriteSyscall(FCode);
             end;
-            
+
            irConstStr:
             begin
                // Load string address into temp slot
@@ -1677,7 +1707,7 @@ begin
                 // Exit-Syscall: Argument ist in Src1 (temp index)
                 slotIdx := fn.LocalCount + instr.Src1;
                 WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
-                WriteMovRegImm64(FCode, RAX, 60);  // sys_exit
+                WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
                 WriteSyscall(FCode);
               end
               else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
@@ -1743,10 +1773,10 @@ begin
                   
                   // RDI = 1 (stdout)
                   WriteMovRegImm64(FCode, RDI, 1);
-                  
-                  // RAX = 1 (sys_write)
-                  WriteMovRegImm64(FCode, RAX, 1);
-                  
+
+                  // RAX = sys_write
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+
                   // syscall
                   WriteSyscall(FCode);
                 end;
@@ -1891,13 +1921,13 @@ begin
                   
                   // RDI = 1 (stdout)
                   WriteMovRegImm64(FCode, RDI, 1);
-                  
-                  // RAX = 1 (sys_write)
-                  WriteMovRegImm64(FCode, RAX, 1);
-                  
+
+                  // RAX = sys_write
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+
                   // syscall
                   WriteSyscall(FCode);
-                  
+
                   // Restore stack
                   // add rsp, 24
                   EmitRex(FCode, 1, 0, 0, 0);
@@ -1936,7 +1966,7 @@ begin
                end
                else
                  WriteMovRegImm64(FCode, RDX, 0);
-               WriteMovRegImm64(FCode, RAX, 16); // sys_ioctl
+               WriteMovRegImm64(FCode, RAX, UInt64(SysNum(16, SYS_MACOS_IOCTL))); // sys_ioctl
                WriteSyscall(FCode);
                if instr.Dest >= 0 then
                begin
@@ -2006,7 +2036,7 @@ begin
                end
                else
                  WriteMovRegImm64(FCode, R9, 0);
-               WriteMovRegImm64(FCode, RAX, 9); // sys_mmap
+               WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP))); // sys_mmap
                WriteSyscall(FCode);
                if instr.Dest >= 0 then
                begin
@@ -2044,7 +2074,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RSI, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, 11); // sys_munmap
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP))); // sys_munmap
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2085,7 +2115,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RDX, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SOCKET);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SOCKET, SYS_MACOS_SOCKET)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2126,7 +2156,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RDX, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_BIND);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_BIND, SYS_MACOS_BIND)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2159,7 +2189,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RSI, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_LISTEN);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_LISTEN, SYS_MACOS_LISTEN)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2200,7 +2230,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RDX, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_ACCEPT);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_ACCEPT, SYS_MACOS_ACCEPT)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2241,7 +2271,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RDX, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_CONNECT);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_CONNECT, SYS_MACOS_CONNECT)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2301,7 +2331,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, R9, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_RECVFROM);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_RECVFROM, SYS_MACOS_RECVFROM)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2361,7 +2391,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, R9, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SENDTO);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SENDTO, SYS_MACOS_SENDTO)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2413,7 +2443,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, R8, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SETSOCKOPT);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SETSOCKOPT, SYS_MACOS_SETSOCKOPT)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2465,7 +2495,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, R8, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_GETSOCKOPT);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_GETSOCKOPT, SYS_MACOS_GETSOCKOPT)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2501,7 +2531,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RDX, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_FCNTL);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_FCNTL, SYS_MACOS_FCNTL)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2529,7 +2559,7 @@ begin
                  else
                    WriteMovRegImm64(FCode, RSI, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, SYS_LINUX_SHUTDOWN);
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SHUTDOWN, SYS_MACOS_SHUTDOWN)));
                  WriteSyscall(FCode);
                  if instr.Dest >= 0 then
                  begin
@@ -2596,7 +2626,7 @@ begin
                   else
                     WriteMovRegImm64(FCode, R9, 0);
                   
-                  WriteMovRegImm64(FCode, RAX, SYS_LINUX_MMAP);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
                   WriteSyscall(FCode);
                   
                   if instr.Dest >= 0 then
@@ -2626,7 +2656,7 @@ begin
                   else
                     WriteMovRegImm64(FCode, RSI, 0);
                   
-                  WriteMovRegImm64(FCode, RAX, SYS_LINUX_MUNMAP);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP)));
                   WriteSyscall(FCode);
                   
                   if instr.Dest >= 0 then
@@ -2884,7 +2914,7 @@ begin
                   else
                     WriteMovRegImm64(FCode, RDX, 0);
                   
-                  WriteMovRegImm64(FCode, RAX, SYS_LINUX_WRITE);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
                   WriteSyscall(FCode);
                   
                   if instr.Dest >= 0 then
@@ -3039,9 +3069,9 @@ begin
                 else
                   WriteMovRegImm64(FCode, RDX, 0);
                 
-                WriteMovRegImm64(FCode, RAX, 0); // sys_read
+                WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_READ, SYS_MACOS_READ))); // sys_read
                 WriteSyscall(FCode);
-                
+
                 if instr.Dest >= 0 then
                 begin
                   slotIdx := fn.LocalCount + instr.Dest;
