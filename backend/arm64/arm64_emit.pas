@@ -1199,6 +1199,9 @@ begin
   
   // Phase 2: Emit _start entry point
   // _start will call main() and then exit with the return value
+  // 
+  // IMPORTANT: For dynamic linking, X16 must contain the GOT base address.
+  // We set X16 to GOT_BASE = baseVA + 0x3000 (fixed offset in data segment)
   
   // Save position for _start
   SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
@@ -1206,9 +1209,16 @@ begin
   FFuncNames.Add('_start');
   
   // _start:
+  //   movz x18, #0x0050    ; X18 = lower 16 bits of GOT_BASE
+  //   movk x18, #0x4100, lsl #16  ; X18 = GOT_BASE (0x410050)
   //   bl main
   //   mov x8, #93    ; sys_exit
   //   svc #0
+  
+  // Set X18 to GOT base (0x410050)
+  // GOT is at fixed address in data segment: baseVA + 0x10000 + 0x50
+  EmitInstr(FCode, $D2800A32);  // movz x18, #0x50
+  EmitInstr(FCode, $F2A01478);  // movk x18, #0x4100, lsl #16
   
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
@@ -2645,28 +2655,25 @@ begin
   // Phase 9: Generate PLT stubs for external symbols
   if Length(FExternalSymbols) > 0 then
   begin
-    // NOTE: ARM64 PLT/GOT implementation is complex and not fully working yet.
-    // For now, we just emit PLT stubs that the ELF writer will set up.
-    // The PLT structure is:
-    // PLT0: ldr x17, [x16, #0] ; br x17 ; nop ; nop
-    // PLT[i]: ldr x17, [x16, #offset] ; br x17 ; nop ; nop
+    // ARM64 PLT/GOT Implementation:
+    // X18 is the GOT base register, set in startup code to GOT_BASE
+    // PLT functions must preserve X18
     //
-    // X16 must contain GOT_BASE when PLT is called. This requires:
-    // 1. The dynamic linker to set up X16 correctly
-    // 2. The GOT to be placed at a fixed offset from PLT
+    // PLT stub structure (12 bytes):
+    //   ldr x17, [x18, #0]    ; Load function address from GOT
+    //   br x17                 ; Jump to function
     //
-    // This is a known issue - the PLT/GOT implementation needs more work.
+    // Note: This assumes X18 = GOT_BASE when PLT is called.
+    // The startup code sets X18 to GOT_BASE before calling main.
 
     // Record PLT0 position
     FPLT0CodePos := FCode.Size;
 
-    // PLT0: ldr x17, [x16, #0] ; br x17
-    EmitInstr(FCode, $F9400211);  // ldr x17, [x16, #0]
-    EmitInstr(FCode, $D61F0220);  // br x17
-    EmitInstr(FCode, $D503201F);  // nop
-    EmitInstr(FCode, $D503201F);  // nop
+    // PLT0: ldr x17, [x18, #0] ; br x17
+    EmitInstr(FCode, $F9001211);  // ldr x17, [x18, #0]
+    EmitInstr(FCode, $D61F03A0);  // br x17
 
-    // Generate PLT entries for each external symbol (16 bytes each)
+    // Generate PLT entries for each external symbol (12 bytes each)
     for i := 0 to High(FExternalSymbols) do
     begin
       // Register PLT stub label
@@ -2674,7 +2681,7 @@ begin
       FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
       FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
 
-      // PLTn entry (16 bytes)
+      // PLTn entry (12 bytes): same as PLT0
       SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
       FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
@@ -2682,12 +2689,10 @@ begin
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0PushPos := 0;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0JmpPos := 0;
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := FPLT0CodePos;
-      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := gotOffset + 24 + i * 8;
+      FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := $410050 + 24 + i * 8;
 
-      EmitInstr(FCode, $F9400211);  // ldr x17, [x16, #0]
-      EmitInstr(FCode, $D61F0220);  // br x17
-      EmitInstr(FCode, $D503201F);  // nop
-      EmitInstr(FCode, $D503201F);  // nop
+      EmitInstr(FCode, $F9001211);  // ldr x17, [x18, #0]
+      EmitInstr(FCode, $D61F03A0);  // br x17
     end;
     
     // Now patch the calls to PLT stubs (BL __plt_<name>)

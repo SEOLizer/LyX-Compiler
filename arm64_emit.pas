@@ -156,8 +156,8 @@ var
 begin
   hw := shift div 16;  // 0, 1, 2, or 3
   // MOVZ (64-bit): sf=1, opc=10, hw, imm16, Rd
-  // 1 10 100101 hw imm16 Rd
-  EmitInstr(buf, $D2800000 or (DWord(hw) shl 21) or (DWord(imm) shl 5) or rd);
+  // imm16 occupies bits 5-20, so it must be shifted left by 5
+  EmitInstr(buf, $D2800000 or (UInt32(hw) shl 21) or (UInt32(imm) shl 5) or rd);
 end;
 
 // MOVK Xd, #imm16, LSL #shift  (move wide with keep)
@@ -168,8 +168,7 @@ var
 begin
   hw := shift div 16;
   // MOVK (64-bit): sf=1, opc=11, hw, imm16, Rd
-  // 1 11 100101 hw imm16 Rd
-  EmitInstr(buf, $F2800000 or (DWord(hw) shl 21) or (DWord(imm) shl 5) or rd);
+  EmitInstr(buf, $F2800000 or (UInt32(hw) shl 21) or (UInt32(imm) shl 5) or rd);
 end;
 
 // MOVN Xd, #imm16, LSL #shift  (move wide with NOT)
@@ -180,6 +179,23 @@ begin
   hw := shift div 16;
   // MOVN (64-bit): sf=1, opc=00, hw, imm16, Rd
   EmitInstr(buf, $92800000 or (DWord(hw) shl 21) or (DWord(imm) shl 5) or rd);
+end;
+
+// LDR Xt, [Xn, #simm9]  (Load Register with signed immediate offset)
+// imm9 is a 9-bit signed value (-256 to +255)
+procedure WriteLdrImm9(buf: TByteBuffer; rt, xn: Byte; imm9: SmallInt);
+var
+  imm9_val: Word;
+begin
+  if imm9 < 0 then
+    imm9_val := Word((-imm9) and $1FF)
+  else
+    imm9_val := Word(imm9 and $1FF);
+  // LDR (immediate): size=11, opc=01, imm9, opc2=01, Rn, Rt
+  // 11 1 [opc] 01 imm9 01 Rn Rt
+  // opc=00 for 32-bit, opc=01 for 64-bit (size=11)
+  EmitInstr(buf, $F9400000 or (DWord(imm9_val and $1FF) shl 12) or 
+            (DWord(xn) shl 5) or DWord(rt));
 end;
 
 // Load 64-bit immediate into register (up to 4 instructions)
@@ -1164,10 +1180,17 @@ begin
   FFuncNames.Add('_start');
   
   // _start:
+  //   movz x16, #0x2058         ; X16 = 0x2058
+  //   movk x16, #0x0040, lsl #16 ; X16 = 0x402058 (GOT base)
   //   bl main
   //   mov x8, #93    ; sys_exit
   //   svc #0
-  
+   
+  // Set X16 to GOT base (0x402058) for PLT access
+  // GOT is at VA 0x402058 (data segment base 0x400000 + 0x2058)
+  WriteMovz(FCode, 16, Word($2058), 0);   // movz x16, #0x2058
+  WriteMovk(FCode, 16, Word($0040), 16);  // movk x16, #0x0040, lsl #16
+   
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
   FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
@@ -2557,6 +2580,7 @@ begin
   end;
   
   // Phase 9: Generate PLT stubs for external symbols
+  WriteLn('DEBUG: Phase 9 - FExternalSymbols count: ', Length(FExternalSymbols));
   if Length(FExternalSymbols) > 0 then
   begin
     // Generate PLT0 (resolver stub)
@@ -2569,26 +2593,29 @@ begin
     //   br x16               ; jump to resolved address
     
     // First, generate PLT0 (resolver stub) - 16 bytes
-    // ldr x16, [x16, #0] - placeholder (will be patched to point to GOT)
-    // br x16
-    EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0]
-    EmitInstr(FCode, $D61F0200);  // br x16
+    // PLT0: ldr x17, [x16, #24] ; br x17 ; nop ; nop
+    // GOT[3] points to PLT0, so PLT0 loads from offset 24
+    WriteLn('DEBUG: PLT0 position before: ', FCode.Size);
+    WriteLdrImm9(FCode, 17, 16, 24);   // ldr x17, [x16, #24]
+    EmitInstr(FCode, $D61F03A0);         // br x17
     
     // Pad to 16 bytes
     EmitInstr(FCode, $D503201F);  // nop
     EmitInstr(FCode, $D503201F);  // nop
+    WriteLn('DEBUG: PLT0 position after: ', FCode.Size);
     
     // Now generate PLT entries for each external symbol (16 bytes each)
     for i := 0 to High(FExternalSymbols) do
     begin
+      WriteLn('DEBUG: Generating PLT for: ', FExternalSymbols[i].Name, ' at pos: ', FCode.Size);
       // Register PLT stub label
       SetLength(FLabelPositions, Length(FLabelPositions) + 1);
       FLabelPositions[High(FLabelPositions)].Name := '__plt_' + FExternalSymbols[i].Name;
       FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
       
       // PLTn entry (16 bytes):
-      // ldr x16, [x16, #offset]  ; load GOT entry
-      // br x16                    ; jump to resolved address
+      // ldr x17, [x16, #offset]  ; load GOT entry
+      // br x17                    ; jump to resolved address
       SetLength(FPLTGOTPatches, Length(FPLTGOTPatches) + 1);
       FPLTGOTPatches[High(FPLTGOTPatches)].Pos := FCode.Size;
       FPLTGOTPatches[High(FPLTGOTPatches)].SymbolName := FExternalSymbols[i].Name;
@@ -2598,11 +2625,10 @@ begin
       FPLTGOTPatches[High(FPLTGOTPatches)].PLT0VA := 0;
       FPLTGOTPatches[High(FPLTGOTPatches)].GotVA := 0;
       
-      // ldr x16, [x16, #offset] - offset will be patched by writer
-      // Offset to GOT entry: 16 (PLT0) + i * 16 + 8
-      EmitInstr(FCode, $F9400210);  // ldr x16, [x16, #0] (placeholder)
-      // br x16
-      EmitInstr(FCode, $D61F0200);  // br x16
+      // GOT[3+i] = GOT_BASE + 24 + i*8
+      // PLT[i] loads from its GOT entry at offset (24 + i*8)
+      WriteLdrImm9(FCode, 17, 16, 24 + i * 8);  // ldr x17, [x16, #offset]
+      EmitInstr(FCode, $D61F03A0);                 // br x17
       
       // Pad to 16 bytes
       EmitInstr(FCode, $D503201F);  // nop
