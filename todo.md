@@ -157,6 +157,16 @@ _(keine offenen Aufgaben)_
 - [x] **IPv4 Helpers** - BGPIPv4, BGPFormatIPv4
 - [x] **Test-Programm** - tests/lyx/net/test_bgp.lyx
 
+### MQTT Client (März 2026)
+
+- [x] **std/net/mqtt.lyx** - MQTT v3.1.1 Client (MQTTConnect, MQTTSubscribe, MQTTPublishMsg, MQTTReceive)
+- [x] **MQTT Packets** - CONNECT, CONNACK, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE, PINGREQ, PINGRESP, DISCONNECT
+- [x] **QoS Levels** - QOS 0 (At most once), QOS 1 (At least once), QOS 2 (Exactly once)
+- [x] **Variable-length Encoding** - MQTT Remaining Length (1-4 Bytes)
+- [x] **Topic Support** - String Topics mit Wildcards (#, +)
+- [x] **Keepalive** - PINGREQ/PINGRESP Session Maintenance
+- [x] **Test-Programm** - tests/lyx/net/test_mqtt.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -252,6 +262,7 @@ _(keine offenen Aufgaben)_
 - [x] **SSH Client** - libssh2 FFI (SSHConnect, SSHAuth, SSHExec, SSHOpenShell, SSHRead/Write)
 - [x] **QUIC Framework** - RFC 9000 (QUICConnect, QUICOpenStream, Packet/Framing Layer)
 - [x] **BGP Client** - RFC 4271 (BGPConnect, BGPAdvertiseRoute, BGPWithdrawRoute, BGP FSM)
+- [x] **MQTT Client** - MQTT v3.1.1 (MQTTConnect, MQTTSubscribe, MQTTPublishMsg, MQTTReceive)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -284,6 +295,7 @@ _(keine offenen Aufgaben)_
 - SSH Client (libssh2): SSHConnect, SSHAuth, SSHExec, SSHOpenShell
 - QUIC Framework (RFC 9000): Packet Structure, Varint Encoding, Stream Framing
 - BGP Client (RFC 4271): BGPConnect, BGPAdvertiseRoute, BGP FSM, Path Attributes
+- MQTT Client (v3.1.1): MQTTConnect, MQTTSubscribe, MQTTPublishMsg, QoS Levels
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
