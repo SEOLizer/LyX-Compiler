@@ -85,6 +85,16 @@ _(keine offenen Aufgaben)_
 - [x] **High-level API** - SMTPSend() - complete email send in one call
 - [x] **Test-Programm** - tests/lyx/net/test_smtp.lyx
 
+### IMAP Client (März 2026)
+
+- [x] **std/net/imap.lyx** - RFC 3501 IMAP Client (IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw)
+- [x] **IMAP Commands** - LOGIN, SELECT, LIST, FETCH, LOGOUT
+- [x] **Tagged Commands** - A001, A002, ... Sequence-Nummern
+- [x] **Untagged Responses** - * OK, * EXISTS, * RECENT, * UNSEEN, * UIDVALIDITY
+- [x] **Multi-line Reading** - FETCH und LIST Responses mit mehreren Zeilen
+- [x] **Data Items** - FLAGS, ENVELOPE, BODY, RFC822, UID
+- [x] **Test-Programm** - tests/lyx/net/test_imap.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -173,6 +183,7 @@ _(keine offenen Aufgaben)_
 - [x] **TLS/SSL** - TLSInit(), TLSConnect(), TLSRead(), TLSWrite() via libssl.so.3
 - [x] **Telnet Client** - RFC 854 (TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation)
 - [x] **SMTP Client** - RFC 5321 (SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/RCPT/DATA)
+- [x] **IMAP Client** - RFC 3501 (IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -198,6 +209,7 @@ _(keine offenen Aufgaben)_
 - TLS/SSL: TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree
 - Telnet Client (RFC 854): TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation
 - SMTP Client (RFC 5321): SMTPConnect, SMTPSend, SMTPQuit, EHLO/MAIL/DATA
+- IMAP Client (RFC 3501): IMAPConnect, IMAPLogin, IMAPSelect, IMAPFetchRaw, IMAPList
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
