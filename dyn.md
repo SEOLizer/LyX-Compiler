@@ -2,9 +2,7 @@
 
 ## Aktueller Stand (März 2026)
 
-### ✅ Funktioniert
-
-Dynamisches Linking mit `extern fn` funktioniert korrekt:
+### ✅ x86_64 Linux – Vollständig funktional
 
 ```lyx
 extern fn strlen(str: pchar): int64;
@@ -12,21 +10,53 @@ extern fn strlen(str: pchar): int64;
 fn main(): int64 {
   var msg: pchar := "Hello Dynamic!";
   var len: int64 := strlen(msg);
+  PrintInt(len);
   return 0;
 }
 ```
 
-Kompilierung:
+### ✅ ARM64 Linux – PLT/GOT Infrastructure funktional
+
+Die ARM64 Dynamic Linking Infrastructure ist vollständig implementiert:
+
+| Komponente | Status |
+|------------|--------|
+| ELF-Struktur (Header, PHDRs, SHDRs) | ✅ Korrekt |
+| LOAD Segments (RX + RW, p_align) | ✅ Korrekt |
+| Dynamic Section | ✅ Gefunden vom Loader |
+| Symbol Lookup (Hash-Tabelle) | ✅ Korrekt (nchain = symCount + 1) |
+| Relocation Processing | ✅ JUMP_SLOT relocations |
+| PLT/GOT Mechanism | ✅ GOT[3] wird beim Laden aktualisiert |
+| ld.so init | ✅ Wird aufgerufen |
+| libc init | ⚠️ Segfault (CRT-Startup fehlt) |
+
+**Getestet mit:**
 ```bash
-./lyxc test_dynlink.lyx -o test_dynlink
-/tmp/test_dynlink: ELF 64-bit LSB shared object, x86-64, dynamically linked
+# Compilation
+./lyxc tests/lyx/arm64/test_dynamic_link.lyx -o /tmp/test_arm64 --target=arm64
+
+# Docker-Test
+docker run --rm -v /tmp:/tmp --platform linux/arm64 debian:stable-slim \
+  /bin/sh -c 'LD_DEBUG=reloc /lib/ld-linux-aarch64.so.1 /tmp/test_arm64 2>&1'
 ```
 
-Ausführung:
+**Output zeigt erfolgreiche Relocation Processing:**
 ```
-Length: 14
-Exit code: 0
+relocation processing: /tmp/test_arm64       ← Erfolgreich
+relocation processing: /lib/ld-linux-aarch64.so.1
+calling init: /lib/ld-linux-aarch64.so.1     ← Erfolgreich
+calling init: /lib/aarch64-linux-gnu/libc.so.6  ← SEGFAULT (CRT fehlt)
 ```
+
+### ⚠️ Bekanntes Problem: libc __init Segfault
+
+Der Dynamic Linker segfault während libc's `__init` Funktion. Ursache:
+- Unser Binary ist ET_EXEC (nicht PIE)
+- Kein CRT-Start-Code (crt0/crt1)
+- `__libc_start_main` wird nicht aufgerufen
+- libc erwartet bestimmten Initialisierungszustand
+
+**Workaround:** strlen wird als Inline-Code generiert (kein libc nötig)
 
 ### ✅ PLT/GOT Struktur
 
