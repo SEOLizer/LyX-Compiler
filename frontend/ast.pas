@@ -71,7 +71,8 @@ type
      nkShiftLeft, nkShiftRight,
      // SIMD/ParallelArray AST nodes
      nkSIMDNew, nkSIMDBinOp, nkSIMDUnaryOp, nkSIMDIndexAccess,
-     nkIsExpr // 'is' operator (type check)
+     nkIsExpr, // 'is' operator (type check)
+     nkFormatExpr // Pascal format specifier: expr:width:decimals
   );
 
   { --- Vorwärtsdeklarationen --- }
@@ -286,6 +287,20 @@ type
     destructor Destroy; override;
     property Expr: TAstExpr read FExpr;
     property ClassName: string read FClassName;
+  end;
+
+  { Format-Ausdruck: expr:width:decimals (Pascal-Formatierung für f32/f64) }
+  TAstFormatExpr = class(TAstExpr)
+  private
+    FExpr: TAstExpr;
+    FWidth: Integer;
+    FDecimals: Integer;
+  public
+    constructor Create(aExpr: TAstExpr; aWidth, aDecimals: Integer; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Expr: TAstExpr read FExpr;
+    property Width: Integer read FWidth;
+    property Decimals: Integer read FDecimals;
   end;
 
   { SIMD New Expression: parallel Array<T>(size) }
@@ -1268,6 +1283,24 @@ constructor TAstIdent.Create(const aName: string; aSpan: TSourceSpan);
 begin
   inherited Create(nkIdent, aSpan);
   FName := aName;
+end;
+
+// ================================================================
+// TAstFormatExpr
+// ================================================================
+
+constructor TAstFormatExpr.Create(aExpr: TAstExpr; aWidth, aDecimals: Integer; aSpan: TSourceSpan);
+begin
+  inherited Create(nkFormatExpr, aSpan);
+  FExpr := aExpr;
+  FWidth := aWidth;
+  FDecimals := aDecimals;
+end;
+
+destructor TAstFormatExpr.Destroy;
+begin
+  FExpr.Free;
+  inherited Destroy;
 end;
 
 // ================================================================

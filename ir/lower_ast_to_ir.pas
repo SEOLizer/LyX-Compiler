@@ -1003,6 +1003,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     baseExpr: TAstExpr;
     // Method call type lookup
     recvExpr: TAstExpr;
+    // Format expr lowering
+    instr2: TIRInstr;
+    tWidth, tDecimals: Integer;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -1268,6 +1271,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 instr.ArgTemps[0] := t1;
                 instr.ArgTemps[1] := t2;
                 Emit(instr);
+                Result := t0;
                 Exit;
               end
               else
@@ -1428,12 +1432,29 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (call.Name = 'PrintInt') or 
+        else if (call.Name = 'PrintInt') or
                 ((call.Namespace = 'IO') and (call.Name = 'PrintInt')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1;
           instr.ImmStr := 'PrintInt';
+          if argCount >= 1 then
+            instr.Src1 := argTemps[0]
+          else
+            instr.Src1 := -1;
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+          Result := -1;
+        end
+        else if (call.Name = 'PrintFloat') or
+                ((call.Namespace = 'IO') and (call.Name = 'PrintFloat')) then
+        begin
+          instr.Op := irCallBuiltin;
+          instr.Dest := -1;
+          instr.ImmStr := 'PrintFloat';
           if argCount >= 1 then
             instr.Src1 := argTemps[0]
           else
@@ -3267,6 +3288,38 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         instr.ImmInt := elemSize; // element size for address calculation
         Emit(instr);
 
+        Result := t0;
+      end;
+
+    nkFormatExpr:
+      begin
+        t1 := LowerExpr(TAstFormatExpr(expr).Expr);
+        if t1 < 0 then Exit;
+        t0 := NewTemp;
+        instr := Default(TIRInstr);
+        instr.Op := irCallBuiltin;
+        instr.Dest := t0;
+        instr.ImmStr := 'format_float';
+        instr.ImmInt := 3;
+        SetLength(instr.ArgTemps, 3);
+        instr.ArgTemps[0] := t1;
+        // Width as constant temp
+        tWidth := NewTemp;
+        instr2 := Default(TIRInstr);
+        instr2.Op := irConstInt;
+        instr2.Dest := tWidth;
+        instr2.ImmInt := TAstFormatExpr(expr).Width;
+        Emit(instr2);
+        // Decimals as constant temp
+        tDecimals := NewTemp;
+        instr2 := Default(TIRInstr);
+        instr2.Op := irConstInt;
+        instr2.Dest := tDecimals;
+        instr2.ImmInt := TAstFormatExpr(expr).Decimals;
+        Emit(instr2);
+        instr.ArgTemps[1] := tWidth;
+        instr.ArgTemps[2] := tDecimals;
+        Emit(instr);
         Result := t0;
       end;
 
