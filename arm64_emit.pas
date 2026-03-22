@@ -1124,8 +1124,7 @@ var
   
   // Call patching
   callPatchIdx, targetFuncIdx: Integer;
-  extLibName: string;
-  
+
   // Function arguments
   argCount: Integer;
   argTemps: array of Integer;
@@ -1793,9 +1792,7 @@ begin
               begin
                 SetLength(FExternalSymbols, Length(FExternalSymbols) + 1);
                 FExternalSymbols[High(FExternalSymbols)].Name := instr.ImmStr;
-                extLibName := module.GetExternLibrary(instr.ImmStr);
-                if extLibName = '' then extLibName := GetLibraryForSymbol(instr.ImmStr);
-                FExternalSymbols[High(FExternalSymbols)].LibraryName := extLibName;
+                FExternalSymbols[High(FExternalSymbols)].LibraryName := GetLibraryForSymbol(instr.ImmStr);
               end;
               
               // Emit call to PLT stub label (generated after all functions)
@@ -2698,7 +2695,8 @@ begin
   end;
 
   // Phase 11: Patch PLT LDR (literal) instructions with correct GOT offsets.
-  if Length(FPLTGOTPatches) > 0 then
+  // For macOS targets, WriteDynamicMachO64 patches the stubs with Mach-O GOT VAs.
+  if (FTargetOS = atLinux) and (Length(FPLTGOTPatches) > 0) then
   begin
     gotBaseVA := ComputeExpectedGotVA(FExternalSymbols, FCode.Size, FData.Size);
     for i := 0 to High(FPLTGOTPatches) do

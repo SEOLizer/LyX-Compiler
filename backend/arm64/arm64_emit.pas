@@ -2819,7 +2819,8 @@ begin
   // Phase 11: Patch PLT LDR (literal) instructions with correct GOT offsets.
   // Now that all code is emitted we know the final code size, so we can
   // compute the exact GOT VA that the ELF writer will assign.
-  if Length(FPLTGOTPatches) > 0 then
+  // For macOS targets, WriteDynamicMachO64 patches the stubs with Mach-O GOT VAs.
+  if (FTargetOS = atLinux) and (Length(FPLTGOTPatches) > 0) then
   begin
     gotBaseVA := ComputeExpectedGotVA(FExternalSymbols, FCode.Size, FData.Size);
     for i := 0 to High(FPLTGOTPatches) do
