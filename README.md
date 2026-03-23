@@ -21,7 +21,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ IR-Level Inlining Optimization (v0.4.3)
 ✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
 ✅ PascalCase Naming Conventions (v0.4.3)
-✅ Integrated Linter with 10 Rules (v0.4.3)
+✅ Integrated Linter with 13 Rules (v0.4.3 / v0.5.5)
 ✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
 ✅ Robust Parser with While/If/For/Switch/Function Support
 ✅ OOP: Classes, Inheritance, Virtual Methods (VMT), Override
@@ -384,6 +384,24 @@ Optionen:
   --no-lint        Linter-Warnungen deaktivieren
   --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)
 ```
+
+**Linter Rules (13 total):**
+
+| Code | Rule | Description |
+|------|------|-------------|
+| W001 | `unused-variable` | Variable declared but never read |
+| W002 | `unused-parameter` | Function parameter never read |
+| W003 | `naming-variable` | Variable does not use camelCase |
+| W004 | `naming-function` | Function does not use PascalCase |
+| W005 | `naming-constant` | Constant does not use PascalCase or UPPER_CASE |
+| W006 | `unreachable-code` | Code after `return` is unreachable |
+| W007 | `empty-block` | Empty block `{ }` |
+| W008 | `shadowed-variable` | Variable shadows an outer variable |
+| W009 | `mutable-never-mutated` | `var` declared but never mutated — use `let` |
+| W010 | `empty-function` | Non-void function has no `return` |
+| W011 | `format-zero-decimals` | `:width:0` format specifier — use `PrintInt()` instead |
+| W012 | `string-concat-literals` | `"a" + "b"` can be a single literal at compile time |
+| W013 | `print-float-int-arg` | `PrintFloat(intLit as f64)` — use `PrintInt()` instead |
 
 **Testing ARM64 binaries (on x86_64):**
 ```bash

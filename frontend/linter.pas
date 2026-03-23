@@ -19,7 +19,10 @@ type
     lrEmptyBlock,           // W007: Leerer Block { }
     lrShadowedVariable,     // W008: Variable verdeckt eine äußere Variable
     lrMutableNeverMutated,  // W009: var deklariert aber nie zugewiesen (-> let)
-    lrEmptyFunction         // W010: Nicht-void Funktion ohne return
+    lrEmptyFunction,        // W010: Nicht-void Funktion ohne return
+    lrFormatZeroDecimals,   // W011: :width:0 Format-Specifier (0 Dezimalstellen)
+    lrStringConcatLiterals, // W012: Zwei String-Literale mit + (compile-time foldable)
+    lrPrintFloatIntArg      // W013: PrintFloat(f64(intLit)) — unnötiger Float-Cast eines Literals
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -35,7 +38,10 @@ const
     lrUnreachableCode,
     lrEmptyBlock,
     lrShadowedVariable,
-    lrMutableNeverMutated
+    lrMutableNeverMutated,
+    lrFormatZeroDecimals,
+    lrStringConcatLiterals,
+    lrPrintFloatIntArg
   ];
 
   { Human-readable Namen für die Regeln }
@@ -49,12 +55,16 @@ const
     'empty-block',
     'shadowed-variable',
     'mutable-never-mutated',
-    'empty-function'
+    'empty-function',
+    'format-zero-decimals',
+    'string-concat-literals',
+    'print-float-int-arg'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
-    'W006', 'W007', 'W008', 'W009', 'W010'
+    'W006', 'W007', 'W008', 'W009', 'W010',
+    'W011', 'W012', 'W013'
   );
 
 type
@@ -360,6 +370,16 @@ begin
 
     nkBinOp:
     begin
+      { W012: Zwei String-Literale mit + können zur Compile-Zeit zusammengefügt werden }
+      if (TAstBinOp(expr).Op = tkPlus)
+        and (TAstBinOp(expr).Left.Kind = nkStrLit)
+        and (TAstBinOp(expr).Right.Kind = nkStrLit) then
+      begin
+        if lrStringConcatLiterals in FActiveRules then
+          Warn(lrStringConcatLiterals,
+            'string literal concatenation with ''+'' can be folded at compile time; consider using a single string literal',
+            expr.Span);
+      end;
       LintExpr(TAstBinOp(expr).Left);
       LintExpr(TAstBinOp(expr).Right);
     end;
@@ -369,6 +389,17 @@ begin
 
     nkCall:
     begin
+      { W013: PrintFloat(intLit as f64) — unnötiger Cast eines Integer-Literals zu Float }
+      if (TAstCall(expr).Name = 'PrintFloat')
+        and (Length(TAstCall(expr).Args) = 1)
+        and (TAstCall(expr).Args[0].Kind = nkCast)
+        and (TAstCast(TAstCall(expr).Args[0]).Expr.Kind = nkIntLit) then
+      begin
+        if lrPrintFloatIntArg in FActiveRules then
+          Warn(lrPrintFloatIntArg,
+            'PrintFloat() called with a constant integer cast to float; consider using PrintInt() instead',
+            expr.Span);
+      end;
       for i := 0 to High(TAstCall(expr).Args) do
         LintExpr(TAstCall(expr).Args[i]);
     end;
@@ -413,6 +444,19 @@ begin
 
     nkPanic:
       LintExpr(TAstPanicExpr(expr).Message);
+
+    nkFormatExpr:
+    begin
+      { W011: :width:0 Format-Specifier — 0 Dezimalstellen gibt nur den Ganzzahlanteil aus }
+      if TAstFormatExpr(expr).Decimals = 0 then
+      begin
+        if lrFormatZeroDecimals in FActiveRules then
+          Warn(lrFormatZeroDecimals,
+            'format specifier with 0 decimals truncates to integer part; consider using PrintInt() instead',
+            expr.Span);
+      end;
+      LintExpr(TAstFormatExpr(expr).Expr);
+    end;
 
     { Literale benötigen keine weitere Prüfung }
     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit:
