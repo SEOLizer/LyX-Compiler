@@ -177,6 +177,15 @@ _(keine offenen Aufgaben)_
 - [x] **Status Parsing** - SIPParseStatusCode, SIPParseHeader
 - [x] **Test-Programm** - tests/lyx/net/test_sip.lyx
 
+### Whois Client (März 2026)
+
+- [x] **std/net/whois.lyx** - RFC 3912 Whois Client (WhoisQuery, WhoisLookup, WhoisLookupIP)
+- [x] **TLD Auto-Selection** - WhoisServerForDomain für .com, .net, .org, .de, .uk, .eu
+- [x] **IPv4 Lookup** - WhoisLookupIP via whois.arin.net
+- [x] **Field Extraction** - WhoisExtractField für Response-Parsing
+- [x] **IPv4 Formatting** - WhoisFormatIPv4
+- [x] **Test-Programm** - tests/lyx/net/test_whois.lyx
+
 ### HTTPS Client via OpenSSL 3.x (März 2026)
 
 - [x] **std/net/tls.lyx** - OpenSSL 3.x Wrapper (TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree)
@@ -274,6 +283,7 @@ _(keine offenen Aufgaben)_
 - [x] **BGP Client** - RFC 4271 (BGPConnect, BGPAdvertiseRoute, BGPWithdrawRoute, BGP FSM)
 - [x] **MQTT Client** - MQTT v3.1.1 (MQTTConnect, MQTTSubscribe, MQTTPublishMsg, MQTTReceive)
 - [x] **SIP Client** - RFC 3261 (SIPConnect, SIPRegister, SIPSendMessage, SIPOptions)
+- [x] **Whois Client** - RFC 3912 (WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField)
 - [x] **TCP Connection Pool** - TCPConnectionPoolNew/Acquire/Release/Close
 - [x] **Struct Array Bug** - Arrays aus Structs entfernt (Compiler-Bug Workaround)
 
@@ -308,6 +318,7 @@ _(keine offenen Aufgaben)_
 - BGP Client (RFC 4271): BGPConnect, BGPAdvertiseRoute, BGP FSM, Path Attributes
 - MQTT Client (v3.1.1): MQTTConnect, MQTTSubscribe, MQTTPublishMsg, QoS Levels
 - SIP Client (RFC 3261): SIPConnect, SIPRegister, SIPSendMessage, SIPOptions
+- Whois Client (RFC 3912): WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
