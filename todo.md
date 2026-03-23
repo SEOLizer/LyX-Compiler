@@ -107,6 +107,20 @@ _(keine offenen Aufgaben)_
 - [x] **Formatting** - EAN13Format, EAN8Format für Lesbarkeit
 - [x] **Test-Programm** - tests/lyx/validate/test_ean.lyx
 
+### ISBN/ISSN Module (März 2026)
+
+- [x] **std/validate/isbn.lyx** - ISBN/ISSN Validierung und Konvertierung (ISBN13ValidateFull, ISBN10To13, ISBN13To10)
+- [x] **ISBN-13 Validation** - 13-stellig mit Bindestrichen, EAN-13 Format (978/979 Prefix)
+- [x] **ISBN-10 Validation** - 10-stellig mit 'X' Support, mod 11 Checksumme
+- [x] **ISBN-10 ↔ 13 Konvertierung** - Bidirektionale Konvertierung (nur 978 Prefix)
+- [x] **ISBN Formatting** - Standard-Hyphens (978-3-16-148410-0, 0-306-40615-2)
+- [x] **ISBN Normalisierung** - ISBNNormalize für Bindestriche/Leerzeichen
+- [x] **ISSN Validation** - International Standard Serial Number (XXXX-XXXX)
+- [x] **ISSN Checksumme** - Mod 11 Algorithmus (identisch mit ISBN-10)
+- [x] **ISSN Formatting** - Mit Bindestrich formatiert
+- [x] **Type Detection** - ISBNDetectType für ISBN-10/13/ISSN Erkennung
+- [x] **Test-Programm** - tests/lyx/validate/test_isbn.lyx
+
 ### SMTP Client (März 2026)
 
 - [x] **std/net/smtp.lyx** - RFC 5321 SMTP Client (SMTPConnect, SMTPSend, SMTPQuit)
@@ -356,6 +370,7 @@ _(keine offenen Aufgaben)_
 - SIP Client (RFC 3261): SIPConnect, SIPRegister, SIPSendMessage, SIPOptions
 - Whois Client (RFC 3912): WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField
 - EAN/ISBN/UPC Validation: EAN13Validate, EAN13CheckDigit, ISBN13Validate, ISBN10Validate, UPCAValidate, Country Detection
+- ISBN/ISSN Module: ISBN13ValidateFull, ISBN10ValidateFull, ISBN10To13, ISBN13To10, ISSNValidate, ISBN/ISSN Formatting
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
