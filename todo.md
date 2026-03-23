@@ -196,6 +196,19 @@ _(keine offenen Aufgaben)_
 - [x] **Map Stubs** - MapCount, MapSum, MapMin, MapMax, MapAvg (benötigt Iterator-Support)
 - [x] **Test-Programm** - tests/lyx/test_stats.lyx
 
+### Mathematical Constants (März 2026)
+
+- [x] **std/math/constants.lyx** - Fundamental dimensionless constants (PI, E, TAU, PHI, SQRT2, SQRT3)
+- [x] **Circle Constants** - PI, TAU (2π), INV_PI, HALF_PI, THIRD_PI, QUARTER_PI, SIXTH_PI
+- [x] **Exponential** - E, INV_E, E_SQUARED
+- [x] **Golden Ratio** - PHI, INV_PHI, PHI_SQUARED
+- [x] **Square Roots** - SQRT2, SQRT3, SQRT5, INV_SQRT2, INV_SQRT3, SQRT_PI
+- [x] **Logarithms** - LN2, LN10, LOG2E, LOG10E, LOG2_10, LOG10_2
+- [x] **Conversion** - DEG_TO_RAD, RAD_TO_DEG, DegToRad(), RadToDeg()
+- [x] **Machine** - EPSILON, MAX_SAFE_INT, F64_MAX, F64_MIN
+- [x] **Approximate** - ApproxEqual(), ApproxZero(), ApproxOne()
+- [x] **Test-Programm** - tests/lyx/test_math_constants.lyx
+
 ### SMTP Client (März 2026)
 
 - [x] **std/net/smtp.lyx** - RFC 5321 SMTP Client (SMTPConnect, SMTPSend, SMTPQuit)
@@ -451,6 +464,7 @@ _(keine offenen Aufgaben)_
 - Country Codes (ISO 3166-1): CountryGetName, CountryGetCode, CountryGetCurrency, 67 Länder, Region Detection
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
+- Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
