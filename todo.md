@@ -13,9 +13,10 @@
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
 | Mittel | ~~**EAN Validation**~~ ✅ | EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A Check Digit Validation |
+| Niedrig | ~~**ISBN/ISSN**~~ ✅ | ISBN-10/13 Konvertierung, ISSN Validation, Formatting |
+| Niedrig | ~~**Credit Card Validation**~~ ✅ | Luhn-Algorithmus, 8 Kreditkarten-Typen, IMEI, Formatting, Masking |
 | Mittel | **IBAN Validation** | International Bank Account Number Prüfsumme |
 | Niedrig | **VAT ID Validation** | USt-IdNr. Prüfung (EU Längen + Checksum) |
-| Niedrig | **Credit Card Validation** | Luhn-Algorithmus für Kreditkarten |
 
 ### Dynamic Linking
 
@@ -120,6 +121,19 @@ _(keine offenen Aufgaben)_
 - [x] **ISSN Formatting** - Mit Bindestrich formatiert
 - [x] **Type Detection** - ISBNDetectType für ISBN-10/13/ISSN Erkennung
 - [x] **Test-Programm** - tests/lyx/validate/test_isbn.lyx
+
+### Luhn/Credit Card Validation (März 2026)
+
+- [x] **std/validate/luhn.lyx** - Luhn Algorithmus + Credit Card Validierung (LuhnValidate, CreditCardType, CreditCardValidate)
+- [x] **Luhn Algorithmus** - Mod 10 Checksumme (doppeltes Gewicht alle 2 Stellen)
+- [x] **Transposition Detection** - Erkennt Zahlendreher durch fehlerhafte Checksumme
+- [x] **Credit Card Types** - Visa, Mastercard, Amex, Discover, Diners, JCB, Maestro, UnionPay
+- [x] **Type Detection** - CreditCardType nach Prefix (4=Visa, 5=MC, 34/37=Amex, etc.)
+- [x] **Formatting** - CreditCardFormat (4-4-4-4, 4-6-5 für Amex, 4-6-4 für Diners)
+- [x] **Masking** - CreditCardMask (nur letzte 4 Ziffern sichtbar)
+- [x] **Test Numbers** - CreditCardGenerateTest für Testkarten
+- [x] **IMEI Validation** - IMEIValidate (15-stellig, Luhn)
+- [x] **Test-Programm** - tests/lyx/validate/test_luhn.lyx
 
 ### SMTP Client (März 2026)
 
@@ -371,6 +385,7 @@ _(keine offenen Aufgaben)_
 - Whois Client (RFC 3912): WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField
 - EAN/ISBN/UPC Validation: EAN13Validate, EAN13CheckDigit, ISBN13Validate, ISBN10Validate, UPCAValidate, Country Detection
 - ISBN/ISSN Module: ISBN13ValidateFull, ISBN10ValidateFull, ISBN10To13, ISBN13To10, ISSNValidate, ISBN/ISSN Formatting
+- Luhn/Credit Card Validation: LuhnValidate, CreditCardType, CreditCardValidate, CreditCardMask, CreditCardFormat, 8 Kreditkarten-Typen, IMEI Validation
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
