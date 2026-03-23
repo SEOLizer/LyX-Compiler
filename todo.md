@@ -8,6 +8,18 @@
 |-----------|------|--------------|
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
+### std.validate Library
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**EAN Validation**~~ ✅ | EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A Check Digit Validation |
+| Niedrig | ~~**ISBN/ISSN**~~ ✅ | ISBN-10/13 Konvertierung, ISSN Validation, Formatting |
+| Niedrig | ~~**Credit Card Validation**~~ ✅ | Luhn-Algorithmus, 8 Kreditkarten-Typen, IMEI, Formatting, Masking |
+| Mittel | ~~**IBAN Validation**~~ ✅ | ISO 13616 Mod 97, 50+ Länder, Check Digit, Formatting |
+| Niedrig | ~~**VAT ID Validation**~~ ✅ | EU 27 Länder, USt-IdNr., Checksummen, Längenprüfung |
+
+✅ **std.validate Library komplett!**
+
 ### Dynamic Linking
 
 | Priorität | Task | Beschreibung |
@@ -84,6 +96,82 @@ _(keine offenen Aufgaben)_
 - [x] **IAC Filtering** - Telnet commands aus Read-Daten filtern
 - [x] **IAC Escaping** - IAC-Bytes beim Senden verdoppeln
 - [x] **Test-Programm** - tests/lyx/net/test_telnet.lyx
+
+### EAN/ISBN/UPC Validation (März 2026)
+
+- [x] **std/validate/ean.lyx** - Business Identifier Validations (EAN13Validate, EAN13CheckDigit, ISBN13Validate)
+- [x] **EAN-13** - 13-stelliger Barcode mit Checksummen-Algorithmus (1/3 Gewichtung)
+- [x] **EAN-8** - 8-stelliger Barcode (komprimierte Variante)
+- [x] **EAN-14/GTIN-14** - 14-stelliger Trade Item Number
+- [x] **ISBN-13** - International Standard Book Number (978/979 Prefix)
+- [x] **ISBN-10** - Legacy ISBN mit 'X' Support (mod 11 Checksum)
+- [x] **UPC-A** - 12-stelliger North American Barcode
+- [x] **Country Detection** - GS1 Prefix → Land Mapping (80+ Regionen)
+- [x] **Formatting** - EAN13Format, EAN8Format für Lesbarkeit
+- [x] **Test-Programm** - tests/lyx/validate/test_ean.lyx
+
+### ISBN/ISSN Module (März 2026)
+
+- [x] **std/validate/isbn.lyx** - ISBN/ISSN Validierung und Konvertierung (ISBN13ValidateFull, ISBN10To13, ISBN13To10)
+- [x] **ISBN-13 Validation** - 13-stellig mit Bindestrichen, EAN-13 Format (978/979 Prefix)
+- [x] **ISBN-10 Validation** - 10-stellig mit 'X' Support, mod 11 Checksumme
+- [x] **ISBN-10 ↔ 13 Konvertierung** - Bidirektionale Konvertierung (nur 978 Prefix)
+- [x] **ISBN Formatting** - Standard-Hyphens (978-3-16-148410-0, 0-306-40615-2)
+- [x] **ISBN Normalisierung** - ISBNNormalize für Bindestriche/Leerzeichen
+- [x] **ISSN Validation** - International Standard Serial Number (XXXX-XXXX)
+- [x] **ISSN Checksumme** - Mod 11 Algorithmus (identisch mit ISBN-10)
+- [x] **ISSN Formatting** - Mit Bindestrich formatiert
+- [x] **Type Detection** - ISBNDetectType für ISBN-10/13/ISSN Erkennung
+- [x] **Test-Programm** - tests/lyx/validate/test_isbn.lyx
+
+### Luhn/Credit Card Validation (März 2026)
+
+- [x] **std/validate/luhn.lyx** - Luhn Algorithmus + Credit Card Validierung (LuhnValidate, CreditCardType, CreditCardValidate)
+- [x] **Luhn Algorithmus** - Mod 10 Checksumme (doppeltes Gewicht alle 2 Stellen)
+- [x] **Transposition Detection** - Erkennt Zahlendreher durch fehlerhafte Checksumme
+- [x] **Credit Card Types** - Visa, Mastercard, Amex, Discover, Diners, JCB, Maestro, UnionPay
+- [x] **Type Detection** - CreditCardType nach Prefix (4=Visa, 5=MC, 34/37=Amex, etc.)
+- [x] **Formatting** - CreditCardFormat (4-4-4-4, 4-6-5 für Amex, 4-6-4 für Diners)
+- [x] **Masking** - CreditCardMask (nur letzte 4 Ziffern sichtbar)
+- [x] **Test Numbers** - CreditCardGenerateTest für Testkarten
+- [x] **IMEI Validation** - IMEIValidate (15-stellig, Luhn)
+- [x] **Test-Programm** - tests/lyx/validate/test_luhn.lyx
+
+### IBAN Validation (März 2026)
+
+- [x] **std/validate/iban.lyx** - ISO 13616 IBAN Validation (IBANValidate, IBANCalculateCheck, IBANFormat)
+- [x] **Mod 97 Algorithmus** - ISO 13616: Rearrange + Convert Letters + Mod 97 == 1
+- [x] **Check Digit** - IBANCalculateCheck für IBAN-Generierung
+- [x] **Country Support** - 50+ Länder (DE, AT, CH, FR, GB, IT, ES, NL, etc.)
+- [x] **Country Length** - IBANCountryLength für länderspezifische Längenprüfung
+- [x] **Country Name** - IBANGetCountryName (Deutschland, Schweiz, etc.)
+- [x] **Formatting** - IBANFormat mit Leerzeichen (4er-Gruppen)
+- [x] **Bank ID** - IBANGetBankId für Bankleitzahl/Sort Code Extraktion
+- [x] **Normalisierung** - IBANNormalize (Leerzeichen entfernen, Uppercase)
+- [x] **Test-Programm** - tests/lyx/validate/test_iban.lyx
+
+### Country Codes (März 2026)
+
+- [x] **std/country.lyx** - ISO 3166-1 alpha-2 Ländercodes mit Metadaten (CountryGetName, CountryGetCode, CountryGetCurrency)
+- [x] **67 Länder** - Europa (36), Asien (12), Amerika (8), Nahost (5), Afrika (4), Ozeanien (2)
+- [x] **Country Name** - CountryGetName(code) für Ländernamen (Deutschland, Schweiz, etc.)
+- [x] **Code Lookup** - CountryGetCode(name) für Code-Suche nach Name
+- [x] **Currency** - CountryGetCurrency(code) für ISO 4217 Währungscodes (EUR, USD, CHF, etc.)
+- [x] **Region** - CountryGetRegion(code) für Kontinent (Europa, Asien, etc.)
+- [x] **ISO Numeric** - CountryGetNumeric(code) für numerische Ländercodes
+- [x] **Validation** - CountryIsValid(code) für Code-Prüfung
+- [x] **Test-Programm** - tests/lyx/test_country.lyx
+
+### VAT ID Validation (März 2026)
+
+- [x] **std/validate/vat.lyx** - EU VAT Number Validation (VATValidate, VATGetCountryName, VATGetFormat)
+- [x] **27 EU Länder** - DE (9 digits), AT (U+8), BE (10), FR (11 alpha), IT (11), ES (9), NL (12), PL (10), PT (9), SE (12), etc.
+- [x] **Länderspezifische Checksummen** - BE (mod 97), PL (gewichtete Summe), IT (Luhn), PT (mod 11)
+- [x] **Format-Regeln** - AT erfordert 'U', SE endet mit '01', IE letter rules, CY last=letter
+- [x] **VAT Name** - VATGetCountryName (USt-IdNr., BTW-Nr., P.IVA, NIPC, etc.)
+- [x] **Format Description** - VATGetFormat für menschenlesbare Formate
+- [x] **Normalisierung** - VATNormalize (Leerzeichen/Bindestriche, Uppercase)
+- [x] **Test-Programm** - tests/lyx/validate/test_vat.lyx
 
 ### SMTP Client (März 2026)
 
@@ -333,6 +421,12 @@ _(keine offenen Aufgaben)_
 - MQTT Client (v3.1.1): MQTTConnect, MQTTSubscribe, MQTTPublishMsg, QoS Levels
 - SIP Client (RFC 3261): SIPConnect, SIPRegister, SIPSendMessage, SIPOptions
 - Whois Client (RFC 3912): WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField
+- EAN/ISBN/UPC Validation: EAN13Validate, EAN13CheckDigit, ISBN13Validate, ISBN10Validate, UPCAValidate, Country Detection
+- ISBN/ISSN Module: ISBN13ValidateFull, ISBN10ValidateFull, ISBN10To13, ISBN13To10, ISSNValidate, ISBN/ISSN Formatting
+- Luhn/Credit Card Validation: LuhnValidate, CreditCardType, CreditCardValidate, CreditCardMask, CreditCardFormat, 8 Kreditkarten-Typen, IMEI Validation
+- IBAN Validation (ISO 13616): IBANValidate, IBANCalculateCheck, IBANFormat, 50+ Länder, Bank ID Extraktion
+- Country Codes (ISO 3166-1): CountryGetName, CountryGetCode, CountryGetCurrency, 67 Länder, Region Detection
+- VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
