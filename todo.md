@@ -148,6 +148,18 @@ _(keine offenen Aufgaben)_
 - [x] **Normalisierung** - IBANNormalize (Leerzeichen entfernen, Uppercase)
 - [x] **Test-Programm** - tests/lyx/validate/test_iban.lyx
 
+### Country Codes (März 2026)
+
+- [x] **std/country.lyx** - ISO 3166-1 alpha-2 Ländercodes mit Metadaten (CountryGetName, CountryGetCode, CountryGetCurrency)
+- [x] **67 Länder** - Europa (36), Asien (12), Amerika (8), Nahost (5), Afrika (4), Ozeanien (2)
+- [x] **Country Name** - CountryGetName(code) für Ländernamen (Deutschland, Schweiz, etc.)
+- [x] **Code Lookup** - CountryGetCode(name) für Code-Suche nach Name
+- [x] **Currency** - CountryGetCurrency(code) für ISO 4217 Währungscodes (EUR, USD, CHF, etc.)
+- [x] **Region** - CountryGetRegion(code) für Kontinent (Europa, Asien, etc.)
+- [x] **ISO Numeric** - CountryGetNumeric(code) für numerische Ländercodes
+- [x] **Validation** - CountryIsValid(code) für Code-Prüfung
+- [x] **Test-Programm** - tests/lyx/test_country.lyx
+
 ### SMTP Client (März 2026)
 
 - [x] **std/net/smtp.lyx** - RFC 5321 SMTP Client (SMTPConnect, SMTPSend, SMTPQuit)
@@ -400,6 +412,7 @@ _(keine offenen Aufgaben)_
 - ISBN/ISSN Module: ISBN13ValidateFull, ISBN10ValidateFull, ISBN10To13, ISBN13To10, ISSNValidate, ISBN/ISSN Formatting
 - Luhn/Credit Card Validation: LuhnValidate, CreditCardType, CreditCardValidate, CreditCardMask, CreditCardFormat, 8 Kreditkarten-Typen, IMEI Validation
 - IBAN Validation (ISO 13616): IBANValidate, IBANCalculateCheck, IBANFormat, 50+ Länder, Bank ID Extraktion
+- Country Codes (ISO 3166-1): CountryGetName, CountryGetCode, CountryGetCurrency, 67 Länder, Region Detection
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
