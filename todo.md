@@ -8,6 +8,19 @@
 |-----------|------|--------------|
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
+### data Library (Pandas-like)
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**DataFrame/Series**~~ ✅ | 2D-Tabelle mit benannten Spalten, Selection, Filter, Slice |
+| Mittel | ~~**CSV I/O**~~ ✅ | ReadCSV, WriteCSV, Header-Parsing, Type-Inferenz |
+| Mittel | ~~**GroupBy**~~ ✅ | Split-Apply-Combine: GroupBy, GroupBySum, GroupByCount |
+| Mittel | ~~**Missing Values**~~ ✅ | FillNA, DropNA, IsNA |
+| Mittel | ~~**Column Statistics**~~ ✅ | SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesValueCounts |
+| Niedrig | **Join/Merge** | Inner/Left/Right/Outer Join auf Key-Spalten |
+| Niedrig | **Pivot/Melt** | Reshaping: Pivot, Melt (wide ↔ long) |
+| Niedrig | **Correlation** | Corr, Cov, Describe (Count, Mean, Std, Quartile) |
+
 ### std.validate Library
 
 | Priorität | Task | Beschreibung |
@@ -217,6 +230,22 @@ _(keine offenen Aufgaben)_
 - [x] **Message Building** - Headers (From, To, Subject) + Body + Dot-stuffing
 - [x] **High-level API** - SMTPSend() - complete email send in one call
 - [x] **Test-Programm** - tests/lyx/net/test_smtp.lyx
+
+### Data Library - Pandas-like (März 2026)
+
+- [x] **data/core.lyx** - DataFrame, Series, Index, GroupBy, Missing Values (DataFrameNew, DataFrameFilter, DataFrameGroupBy)
+- [x] **Series** - 1D typisierter Array (int64/string) mit Labels
+- [x] **DataFrame** - 2D-Tabelle mit benannten Spalten
+- [x] **Selection/Filter** - DataFrameFilter, DataFrameSlice, CompareInt
+- [x] **Column Ops** - AddColumn, DropColumn, RenameColumn, Cell Access
+- [x] **GroupBy** - DataFrameGroupBy, GroupBySum, GroupByCount (Split-Apply-Combine)
+- [x] **Missing Values** - FillNA, DropNA, IsNA
+- [x] **Statistics** - SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesCount, SeriesValueCounts
+- [x] **data/io.lyx** - CSV I/O (ReadCSV, WriteCSV)
+- [x] **CSV Parsing** - Header, Delimiter, Quotes, Type-Inferenz
+- [x] **CSV Writing** - DataFrame to CSV with header
+- [x] **Display** - DataFramePrint (Table format)
+- [x] **Test-Programm** - tests/lyx/data/test_core.lyx
 
 ### IMAP Client (März 2026)
 
@@ -465,6 +494,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Column Statistics
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
