@@ -37,6 +37,13 @@
 
 _(keine offenen Aufgaben)_
 
+### String / Float Formatting (März 2026)
+
+- [x] **`pchar + pchar` Konkatenation** - `"Hello" + ", " + "World!"` via `mmap`-Buffer und `rep movsb`
+- [x] **`PrintFloat(f64)`** - SSE2-basierte Inline-Ausgabe: Vorzeichen, Ganzzahlanteil, 6 Dezimalstellen
+- [x] **`:width:decimals` Format-Specifier** - Pascal-style `pi:0:2` → `TAstFormatExpr` → `irCallBuiltin 'format_float'`
+- [x] **Runtime Dezimalanzahl** - `format_float` liest Dezimalstellen aus Stack-Slot (nicht hardcoded)
+
 ### Tech Debts
 
 | Priorität | Task | Beschreibung |
@@ -305,6 +312,9 @@ _(keine offenen Aufgaben)_
 ## Versionsverlauf
 
 ### v0.5.5 (März 2026)
+- `pchar + pchar` String-Konkatenation via `mmap`-Buffer und `rep movsb`
+- `PrintFloat(f64)` Builtin: SSE2-basiert, Vorzeichen + Ganzzahl + 6 Dezimalstellen
+- `:width:decimals` Format-Specifier (Pascal-style): `pi:0:2` → `format_float` Builtin
 - HTTPS Client via OpenSSL 3.x FFI (std.net.tls + std.net.https)
 - TLS/SSL: TLSInit, TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree
 - Telnet Client (RFC 854): TelnetConnect, TelnetRead, TelnetWrite, Option Negotiation

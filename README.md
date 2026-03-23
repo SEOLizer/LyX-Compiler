@@ -34,6 +34,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ QBool: Probabilistic Boolean Type for quantum-like computing
 ✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
+✅ String Concatenation: pchar + pchar via mmap'd buffers (v0.5.5)
+✅ Float Formatting: PrintFloat(f64) and :width:decimals format specifier (v0.5.5)
 ```
 
 ---
@@ -1414,7 +1416,7 @@ Over 30 built-in functions are available without import:
 |-------------------|------------------------|-------------------------------------|
 | `PrintStr(s)`    | `pchar -> void`        | Outputs string until `\0`           |
 | `PrintInt(x)`    | `int64 -> void`        | Outputs integer as decimal          |
-| `PrintFloat(x)`  | `f64 -> void`          | Outputs float (simplified)          |
+| `PrintFloat(x)`  | `f64 -> void`          | Outputs float with sign, integer part, and 6 decimal digits |
 | `exit(code)`      | `int64 -> void`        | Terminates program with exit code   |
 
 #### Debugging: In-Situ Data Visualizer
@@ -1498,6 +1500,38 @@ fn main(): int64 {
 | `str_set_char(s, index, c)` | `pchar, int64, int64 -> void`             | Sets character at position         |
 | `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                   | String comparison (0=equal)        |
 | `str_copy_builtin(dest, src)` | `pchar, pchar -> void`                   | Copies string                      |
+| `s1 + s2`                   | `pchar + pchar -> pchar`                   | Concatenates two strings (mmap'd buffer) |
+
+**String Concatenation** uses `+` directly:
+
+```lyx
+fn main(): int64 {
+  var s: pchar := "Hello" + ", " + "World!";
+  PrintStr(s);  // Hello, World!
+  PrintStr("\n");
+  return 0;
+}
+```
+
+#### Float Formatting
+
+`PrintFloat` outputs a float value to stdout. For formatted output with controlled decimal places, use the Pascal-style `:width:decimals` specifier in function arguments:
+
+```lyx
+fn main(): int64 {
+  var pi: f64 := 3.14159265358979;
+  var vol: f64 := 12.5;
+
+  PrintStr(pi:0:2);    // 3.14
+  PrintStr("\n");
+  PrintStr(vol:0:4);   // 12.5000
+  PrintStr("\n");
+
+  return 0;
+}
+```
+
+The `:width:decimals` specifier lowers to `format_float(value, width, decimals)` which returns a `pchar` (heap-allocated, 64 bytes). The `width` field is reserved for future padding support.
 
 #### String Conversion Builtins
 | Function          | Signature               | Description                        |
