@@ -8,6 +8,15 @@
 |-----------|------|--------------|
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
+### std.validate Library
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**EAN Validation**~~ ✅ | EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A Check Digit Validation |
+| Mittel | **IBAN Validation** | International Bank Account Number Prüfsumme |
+| Niedrig | **VAT ID Validation** | USt-IdNr. Prüfung (EU Längen + Checksum) |
+| Niedrig | **Credit Card Validation** | Luhn-Algorithmus für Kreditkarten |
+
 ### Dynamic Linking
 
 | Priorität | Task | Beschreibung |
@@ -84,6 +93,19 @@ _(keine offenen Aufgaben)_
 - [x] **IAC Filtering** - Telnet commands aus Read-Daten filtern
 - [x] **IAC Escaping** - IAC-Bytes beim Senden verdoppeln
 - [x] **Test-Programm** - tests/lyx/net/test_telnet.lyx
+
+### EAN/ISBN/UPC Validation (März 2026)
+
+- [x] **std/validate/ean.lyx** - Business Identifier Validations (EAN13Validate, EAN13CheckDigit, ISBN13Validate)
+- [x] **EAN-13** - 13-stelliger Barcode mit Checksummen-Algorithmus (1/3 Gewichtung)
+- [x] **EAN-8** - 8-stelliger Barcode (komprimierte Variante)
+- [x] **EAN-14/GTIN-14** - 14-stelliger Trade Item Number
+- [x] **ISBN-13** - International Standard Book Number (978/979 Prefix)
+- [x] **ISBN-10** - Legacy ISBN mit 'X' Support (mod 11 Checksum)
+- [x] **UPC-A** - 12-stelliger North American Barcode
+- [x] **Country Detection** - GS1 Prefix → Land Mapping (80+ Regionen)
+- [x] **Formatting** - EAN13Format, EAN8Format für Lesbarkeit
+- [x] **Test-Programm** - tests/lyx/validate/test_ean.lyx
 
 ### SMTP Client (März 2026)
 
@@ -333,6 +355,7 @@ _(keine offenen Aufgaben)_
 - MQTT Client (v3.1.1): MQTTConnect, MQTTSubscribe, MQTTPublishMsg, QoS Levels
 - SIP Client (RFC 3261): SIPConnect, SIPRegister, SIPSendMessage, SIPOptions
 - Whois Client (RFC 3912): WhoisQuery, WhoisLookup, WhoisLookupIP, WhoisExtractField
+- EAN/ISBN/UPC Validation: EAN13Validate, EAN13CheckDigit, ISBN13Validate, ISBN10Validate, UPCAValidate, Country Detection
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
