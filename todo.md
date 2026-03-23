@@ -16,7 +16,9 @@
 | Niedrig | ~~**ISBN/ISSN**~~ ✅ | ISBN-10/13 Konvertierung, ISSN Validation, Formatting |
 | Niedrig | ~~**Credit Card Validation**~~ ✅ | Luhn-Algorithmus, 8 Kreditkarten-Typen, IMEI, Formatting, Masking |
 | Mittel | ~~**IBAN Validation**~~ ✅ | ISO 13616 Mod 97, 50+ Länder, Check Digit, Formatting |
-| Niedrig | **VAT ID Validation** | USt-IdNr. Prüfung (EU Längen + Checksum) |
+| Niedrig | ~~**VAT ID Validation**~~ ✅ | EU 27 Länder, USt-IdNr., Checksummen, Längenprüfung |
+
+✅ **std.validate Library komplett!**
 
 ### Dynamic Linking
 
@@ -159,6 +161,17 @@ _(keine offenen Aufgaben)_
 - [x] **ISO Numeric** - CountryGetNumeric(code) für numerische Ländercodes
 - [x] **Validation** - CountryIsValid(code) für Code-Prüfung
 - [x] **Test-Programm** - tests/lyx/test_country.lyx
+
+### VAT ID Validation (März 2026)
+
+- [x] **std/validate/vat.lyx** - EU VAT Number Validation (VATValidate, VATGetCountryName, VATGetFormat)
+- [x] **27 EU Länder** - DE (9 digits), AT (U+8), BE (10), FR (11 alpha), IT (11), ES (9), NL (12), PL (10), PT (9), SE (12), etc.
+- [x] **Länderspezifische Checksummen** - BE (mod 97), PL (gewichtete Summe), IT (Luhn), PT (mod 11)
+- [x] **Format-Regeln** - AT erfordert 'U', SE endet mit '01', IE letter rules, CY last=letter
+- [x] **VAT Name** - VATGetCountryName (USt-IdNr., BTW-Nr., P.IVA, NIPC, etc.)
+- [x] **Format Description** - VATGetFormat für menschenlesbare Formate
+- [x] **Normalisierung** - VATNormalize (Leerzeichen/Bindestriche, Uppercase)
+- [x] **Test-Programm** - tests/lyx/validate/test_vat.lyx
 
 ### SMTP Client (März 2026)
 
@@ -413,6 +426,7 @@ _(keine offenen Aufgaben)_
 - Luhn/Credit Card Validation: LuhnValidate, CreditCardType, CreditCardValidate, CreditCardMask, CreditCardFormat, 8 Kreditkarten-Typen, IMEI Validation
 - IBAN Validation (ISO 13616): IBANValidate, IBANCalculateCheck, IBANFormat, 50+ Länder, Bank ID Extraktion
 - Country Codes (ISO 3166-1): CountryGetName, CountryGetCode, CountryGetCurrency, 67 Länder, Region Detection
+- VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
