@@ -15,7 +15,7 @@
 | Mittel | ~~**EAN Validation**~~ ✅ | EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A Check Digit Validation |
 | Niedrig | ~~**ISBN/ISSN**~~ ✅ | ISBN-10/13 Konvertierung, ISSN Validation, Formatting |
 | Niedrig | ~~**Credit Card Validation**~~ ✅ | Luhn-Algorithmus, 8 Kreditkarten-Typen, IMEI, Formatting, Masking |
-| Mittel | **IBAN Validation** | International Bank Account Number Prüfsumme |
+| Mittel | ~~**IBAN Validation**~~ ✅ | ISO 13616 Mod 97, 50+ Länder, Check Digit, Formatting |
 | Niedrig | **VAT ID Validation** | USt-IdNr. Prüfung (EU Längen + Checksum) |
 
 ### Dynamic Linking
@@ -134,6 +134,19 @@ _(keine offenen Aufgaben)_
 - [x] **Test Numbers** - CreditCardGenerateTest für Testkarten
 - [x] **IMEI Validation** - IMEIValidate (15-stellig, Luhn)
 - [x] **Test-Programm** - tests/lyx/validate/test_luhn.lyx
+
+### IBAN Validation (März 2026)
+
+- [x] **std/validate/iban.lyx** - ISO 13616 IBAN Validation (IBANValidate, IBANCalculateCheck, IBANFormat)
+- [x] **Mod 97 Algorithmus** - ISO 13616: Rearrange + Convert Letters + Mod 97 == 1
+- [x] **Check Digit** - IBANCalculateCheck für IBAN-Generierung
+- [x] **Country Support** - 50+ Länder (DE, AT, CH, FR, GB, IT, ES, NL, etc.)
+- [x] **Country Length** - IBANCountryLength für länderspezifische Längenprüfung
+- [x] **Country Name** - IBANGetCountryName (Deutschland, Schweiz, etc.)
+- [x] **Formatting** - IBANFormat mit Leerzeichen (4er-Gruppen)
+- [x] **Bank ID** - IBANGetBankId für Bankleitzahl/Sort Code Extraktion
+- [x] **Normalisierung** - IBANNormalize (Leerzeichen entfernen, Uppercase)
+- [x] **Test-Programm** - tests/lyx/validate/test_iban.lyx
 
 ### SMTP Client (März 2026)
 
@@ -386,6 +399,7 @@ _(keine offenen Aufgaben)_
 - EAN/ISBN/UPC Validation: EAN13Validate, EAN13CheckDigit, ISBN13Validate, ISBN10Validate, UPCAValidate, Country Detection
 - ISBN/ISSN Module: ISBN13ValidateFull, ISBN10ValidateFull, ISBN10To13, ISBN13To10, ISSNValidate, ISBN/ISSN Formatting
 - Luhn/Credit Card Validation: LuhnValidate, CreditCardType, CreditCardValidate, CreditCardMask, CreditCardFormat, 8 Kreditkarten-Typen, IMEI Validation
+- IBAN Validation (ISO 13616): IBANValidate, IBANCalculateCheck, IBANFormat, 50+ Länder, Bank ID Extraktion
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
