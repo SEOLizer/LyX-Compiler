@@ -20,6 +20,17 @@
 
 ✅ **std.validate Library komplett!**
 
+### std.stats Library
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**Array Aggregates**~~ ✅ | ArrayMin, ArrayMax, ArraySum, ArrayAvg, ArrayMedian, ArrayCount, ArrayProduct |
+| Mittel | ~~**Sorting**~~ ✅ | ArraySort, ArrayReverse |
+| Mittel | ~~**Filtering**~~ ✅ | ArrayFilterGt, ArrayFilterLt, ArrayFilterRange |
+| Mittel | ~~**Statistical**~~ ✅ | ArrayVariance, ArrayStdDev, ArrayRange, ArraySumSquares |
+| Mittel | ~~**Higher-Order**~~ ✅ | Clamp64, Percentage64, InRange64, AbsDiff64 |
+| Niedrig | **Map Aggregates** | MapSum, MapMin, MapMax, MapAvg (benötigt Iterator-Support) |
+
 ### Dynamic Linking
 
 | Priorität | Task | Beschreibung |
@@ -172,6 +183,18 @@ _(keine offenen Aufgaben)_
 - [x] **Format Description** - VATGetFormat für menschenlesbare Formate
 - [x] **Normalisierung** - VATNormalize (Leerzeichen/Bindestriche, Uppercase)
 - [x] **Test-Programm** - tests/lyx/validate/test_vat.lyx
+
+### Statistics & Aggregation (März 2026)
+
+- [x] **std/stats.lyx** - Array Aggregate Functions (ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArrayProduct)
+- [x] **Array Aggregates** - Sum, Min, Max, Avg, Median, Count, Product, First, Last
+- [x] **Index Operations** - ArrayIndexOf, ArrayLastIndexOf, ArrayContains, ArrayCountValue
+- [x] **Sorting** - ArraySort (Insertion Sort, O(n²)), ArrayReverse
+- [x] **Filtering** - ArrayFilterGt, ArrayFilterLt, ArrayFilterRange
+- [x] **Statistical** - ArrayVariance (Population), ArrayStdDev, ArrayRange, ArraySumSquares
+- [x] **Higher-Order** - Clamp64, Percentage64, InRange64, AbsDiff64
+- [x] **Map Stubs** - MapCount, MapSum, MapMin, MapMax, MapAvg (benötigt Iterator-Support)
+- [x] **Test-Programm** - tests/lyx/test_stats.lyx
 
 ### SMTP Client (März 2026)
 
@@ -427,6 +450,7 @@ _(keine offenen Aufgaben)_
 - IBAN Validation (ISO 13616): IBANValidate, IBANCalculateCheck, IBANFormat, 50+ Länder, Bank ID Extraktion
 - Country Codes (ISO 3166-1): CountryGetName, CountryGetCode, CountryGetCurrency, 67 Länder, Region Detection
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
+- Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
