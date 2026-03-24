@@ -14,12 +14,26 @@
 |-----------|------|--------------|
 | Mittel | ~~**DataFrame/Series**~~ ✅ | 2D-Tabelle mit benannten Spalten, Selection, Filter, Slice |
 | Mittel | ~~**CSV I/O**~~ ✅ | ReadCSV, WriteCSV, Header-Parsing, Type-Inferenz |
-| Mittel | ~~**GroupBy**~~ ✅ | Split-Apply-Combine: GroupBy, GroupBySum, GroupByCount |
+| Mittel | ~~**GroupBy**~~ ✅ | Split-Apply-Combine: GroupBy, GroupBySum, GroupByCount, Multi-Column |
 | Mittel | ~~**Missing Values**~~ ✅ | FillNA, DropNA, IsNA |
 | Mittel | ~~**Column Statistics**~~ ✅ | SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesValueCounts |
-| Niedrig | **Join/Merge** | Inner/Left/Right/Outer Join auf Key-Spalten |
-| Niedrig | **Pivot/Melt** | Reshaping: Pivot, Melt (wide ↔ long) |
-| Niedrig | **Correlation** | Corr, Cov, Describe (Count, Mean, Std, Quartile) |
+| Niedrig | ~~**Join/Merge**~~ ✅ | DataFrameJoinInner, DataFrameJoinLeft |
+| Niedrig | ~~**Pivot/Melt**~~ ✅ | DataFramePivot (long→wide), DataFrameMelt (wide→long) |
+| Niedrig | ~~**Correlation**~~ ✅ | SeriesCorr, SeriesCov, SeriesDescribe |
+| Niedrig | ~~**Float Support**~~ ✅ | DataFrameSetFloat/GetFloat, SeriesSumFloat |
+| Niedrig | ~~**Multi-Column GroupBy**~~ ✅ | DataFrameGroupByMulti, GroupByMultiCount |
+| Niedrig | ~~**SortBy**~~ ✅ | DataFrameSortBy, DataFrameSortByDesc |
+| Niedrig | ~~**Head/Tail/Shape**~~ ✅ | DataFrameHead, DataFrameTail, DataFrameShape, DataFrameInfo |
+| Niedrig | ~~**Concat**~~ ✅ | DataFrameConcat (Append rows from two DataFrames) |
+| Niedrig | ~~**Replace/Clip**~~ ✅ | DataFrameReplace, DataFrameReplaceAll, DataFrameClip |
+| Niedrig | ~~**Map**~~ ✅ | DataFrameMapMul, DataFrameMapAdd |
+| Niedrig | ~~**Duplicated**~~ ✅ | DataFrameDropDuplicates |
+| Niedrig | ~~**Shift/Diff**~~ ✅ | SeriesShift, SeriesDiff |
+| Niedrig | ~~**CumSum/CumProd**~~ ✅ | SeriesCumSum, SeriesCumProd, SeriesCumMax, SeriesCumMin |
+| Niedrig | ~~**Rank/Median**~~ ✅ | SeriesRank, SeriesMedian |
+| Niedrig | ~~**Reverse**~~ ✅ | DataFrameReverse |
+
+✅ **data Library komplett!** (50+ Funktionen)
 
 ### std.validate Library
 
@@ -494,7 +508,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
-- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Column Statistics
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
