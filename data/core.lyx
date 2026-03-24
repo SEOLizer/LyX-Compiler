@@ -336,8 +336,576 @@ pub fn DataFrameFilter(df: DataFrame, colName: int64, op: int64, value: int64): 
   // Find filter column
   colIdx := DataFrameColIndex(df, colName);
   if (colIdx < 0) {
-    return result;
+  return result;
+}
+
+// ============================================================================
+// Sorting
+// ============================================================================
+
+// Sort DataFrame by column (ascending)
+pub fn DataFrameSortBy(df: DataFrame, colName: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64;
+  var j: int64;
+  var col: int64;
+  var srcS: Series;
+  var indices: int64;
+  var key: int64;
+  var keyIdx: int64;
+  var tmp: int64;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
   }
+  
+  // Create index array [0, 1, 2, ...]
+  indices := mmap(0, df.rowCount * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  i := 0;
+  while (i < df.rowCount) {
+    poke8(indices + i * 8, i);
+    i := i + 1;
+  }
+  
+  // Insertion sort on indices
+  i := 1;
+  while (i < df.rowCount) {
+    key := SeriesGetInt(s, peek8(indices + i * 8));
+    keyIdx := peek8(indices + i * 8);
+    j := i - 1;
+    while (j >= 0 && SeriesGetInt(s, peek8(indices + j * 8)) > key) {
+      poke8(indices + (j + 1) * 8, peek8(indices + j * 8));
+      j := j - 1;
+    end;
+    poke8(indices + (j + 1) * 8, keyIdx);
+    i := i + 1;
+  end;
+  
+  // Copy rows in sorted order
+  i := 0;
+  while (i < df.rowCount) {
+    DataFrameAppendRow(result);
+    var srcIdx: int64 := peek8(indices + i * 8);
+    j := 0;
+    while (j < df.colCount) {
+      srcS := peek8(df.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, SeriesGetInt(srcS, srcIdx));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  munmap(indices, df.rowCount * 8);
+  return result;
+}
+
+// Sort descending
+pub fn DataFrameSortByDesc(df: DataFrame, colName: int64): DataFrame {
+  var sorted: DataFrame := DataFrameSortBy(df, colName);
+  return DataFrameReverse(sorted);
+}
+
+// ============================================================================
+// Head / Tail / Shape
+// ============================================================================
+
+// Head: first N rows
+pub fn DataFrameHead(df: DataFrame, n: int64): DataFrame {
+  if (n > df.rowCount) { n := df.rowCount; }
+  return DataFrameSlice(df, 0, n);
+}
+
+// Tail: last N rows
+pub fn DataFrameTail(df: DataFrame, n: int64): DataFrame {
+  var start: int64 := df.rowCount - n;
+  if (start < 0) { start := 0; }
+  return DataFrameSlice(df, start, df.rowCount);
+}
+
+// Shape: return (rows, cols) - prints to stdout
+pub fn DataFrameShape(df: DataFrame) {
+  PrintStr("(");
+  PrintInt(df.rowCount);
+  PrintStr(", ");
+  PrintInt(df.colCount);
+  PrintStr(")");
+}
+
+// Info: print DataFrame summary
+pub fn DataFrameInfo(df: DataFrame) {
+  var i: int64 := 0;
+  var s: Series;
+  
+  PrintStr("DataFrame: ");
+  DataFrameShape(df);
+  PrintStr("\n\n");
+  
+  PrintStr("Columns:\n");
+  while (i < df.colCount) {
+    var name: int64 := peek8(df.columns + i * 16);
+    s := peek8(df.columns + i * 16 + 8);
+    PrintStr("  ");
+    if (name != 0) { PrintStr(name); }
+    PrintStr(" (");
+    if (s.colType == COL_INT64) { PrintStr("int64"); }
+    else if (s.colType == COL_FLOAT) { PrintStr("float64"); }
+    else if (s.colType == COL_STRING) { PrintStr("string"); }
+    else if (s.colType == COL_BOOL) { PrintStr("bool"); }
+    PrintStr(")\n");
+    i := i + 1;
+  end;
+}
+
+// ============================================================================
+// Concat (Append DataFrames)
+// ============================================================================
+
+// Concat: append rows from right to left
+// Columns must match
+pub fn DataFrameConcat(left: DataFrame, right: DataFrame): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var srcS: Series;
+  var srcName: int64;
+  
+  // Add all columns from left
+  j := 0;
+  while (j < left.colCount) {
+    DataFrameAddColumn(result, peek8(left.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows from left
+  i := 0;
+  while (i < left.rowCount) {
+    DataFrameAppendRow(result);
+    j := 0;
+    while (j < left.colCount) {
+      srcS := peek8(left.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  // Append rows from right
+  i := 0;
+  while (i < right.rowCount) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    j := 0;
+    while (j < right.colCount) {
+      srcS := peek8(right.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Replace / Map / Clip
+// ============================================================================
+
+// Replace value in column
+pub fn DataFrameReplace(df: DataFrame, colName: int64, oldVal: int64, newVal: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) == oldVal) {
+      SeriesSetInt(s, i, newVal);
+    }
+    i := i + 1;
+  end;
+}
+
+// Replace value in all columns
+pub fn DataFrameReplaceAll(df: DataFrame, oldVal: int64, newVal: int64) {
+  var j: int64 := 0;
+  while (j < df.colCount) {
+    var s: Series := peek8(df.columns + j * 16 + 8);
+    var i: int64 := 0;
+    while (i < s.length) {
+      if (SeriesGetInt(s, i) == oldVal) {
+        SeriesSetInt(s, i, newVal);
+      end;
+      i := i + 1;
+    end;
+    j := j + 1;
+  end;
+}
+
+// Map: apply function to column (simplified: multiply by factor)
+pub fn DataFrameMapMul(df: DataFrame, colName: int64, factor: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    SeriesSetInt(s, i, SeriesGetInt(s, i) * factor);
+    i := i + 1;
+  end;
+}
+
+// Map: add constant to column
+pub fn DataFrameMapAdd(df: DataFrame, colName: int64, offset: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    SeriesSetInt(s, i, SeriesGetInt(s, i) + offset);
+    i := i + 1;
+  end;
+}
+
+// Clip: clamp values to [min, max]
+pub fn DataFrameClip(df: DataFrame, colName: int64, minValue: int64, maxValue: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  var val: int64;
+  
+  while (i < s.length) {
+    val := SeriesGetInt(s, i);
+    if (val < minValue) {
+      SeriesSetInt(s, i, minValue);
+    } else if (val > maxValue) {
+      SeriesSetInt(s, i, maxValue);
+    end;
+    i := i + 1;
+  end;
+}
+
+// ============================================================================
+// Duplicated / DropDuplicates
+// ============================================================================
+
+// Check if row is duplicated (based on all columns)
+// Returns 1 if same row exists before this index
+pub fn SeriesIsDuplicated(s: Series, idx: int64): int64 {
+  var i: int64 := 0;
+  var val: int64 := SeriesGetInt(s, idx);
+  
+  while (i < idx) {
+    if (SeriesGetInt(s, i) == val) {
+      return 1;
+    }
+    i := i + 1;
+  end;
+  
+  return 0;
+}
+
+// Drop duplicates (keep first occurrence)
+pub fn DataFrameDropDuplicates(df: DataFrame, colName: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(df, colName);
+  var seen: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var seenCount: int64 := 0;
+  var i: int64;
+  var j: int64;
+  var val: int64;
+  var found: int64;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy unique rows
+  i := 0;
+  while (i < df.rowCount) {
+    val := SeriesGetInt(s, i);
+    found := 0;
+    j := 0;
+    while (j < seenCount) {
+      if (peek8(seen + j * 8) == val) {
+        found := 1;
+        break;
+      end;
+      j := j + 1;
+    end;
+    
+    if (found == 0) {
+      // Keep this row
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      j := 0;
+      while (j < df.colCount) {
+        var srcS: Series := peek8(df.columns + j * 16 + 8);
+        DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+        j := j + 1;
+      end;
+      
+      poke8(seen + seenCount * 8, val);
+      seenCount := seenCount + 1;
+    end;
+    
+    i := i + 1;
+  end;
+  
+  munmap(seen, 1024 * 8);
+  return result;
+}
+
+// ============================================================================
+// Shift / Diff / CumSum / CumProd
+// ============================================================================
+
+// Shift: shift values by N positions (positive = down, negative = up)
+// Returns new Series
+pub fn SeriesShift(s: Series, n: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    var srcIdx: int64 := i - n;
+    if (srcIdx >= 0 && srcIdx < s.length) {
+      SeriesSetInt(result, i, SeriesGetInt(s, srcIdx));
+    end else {
+      SeriesSetInt(result, i, 0);  // NA
+    }
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// Diff: difference between consecutive elements
+pub fn SeriesDiff(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 1;
+  
+  result.length := s.length;
+  SeriesSetInt(result, 0, 0);  // First is NA
+  
+  while (i < s.length) {
+    SeriesSetInt(result, i, SeriesGetInt(s, i) - SeriesGetInt(s, i - 1));
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumSum: cumulative sum
+pub fn SeriesCumSum(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var sum: int64 := 0;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    sum := sum + SeriesGetInt(s, i);
+    SeriesSetInt(result, i, sum);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumProd: cumulative product
+pub fn SeriesCumProd(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var prod: int64 := 1;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    prod := prod * SeriesGetInt(s, i);
+    SeriesSetInt(result, i, prod);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumMax: cumulative maximum
+pub fn SeriesCumMax(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var mx: int64;
+  
+  result.length := s.length;
+  
+  if (s.length > 0) {
+    mx := SeriesGetInt(s, 0);
+    SeriesSetInt(result, 0, mx);
+    i := 1;
+    while (i < s.length) {
+      var val: int64 := SeriesGetInt(s, i);
+      if (val > mx) {
+        mx := val;
+      end;
+      SeriesSetInt(result, i, mx);
+      i := i + 1;
+    end;
+  end;
+  
+  return result;
+}
+
+// CumMin: cumulative minimum
+pub fn SeriesCumMin(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var mn: int64;
+  
+  result.length := s.length;
+  
+  if (s.length > 0) {
+    mn := SeriesGetInt(s, 0);
+    SeriesSetInt(result, 0, mn);
+    i := 1;
+    while (i < s.length) {
+      var val: int64 := SeriesGetInt(s, i);
+      if (val < mn) {
+        mn := val;
+      end;
+      SeriesSetInt(result, i, mn);
+      i := i + 1;
+    end;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Rank
+// ============================================================================
+
+// Rank: assign ranks to values (ascending)
+// Returns new Series with rank of each element
+pub fn SeriesRank(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var sorted: int64 := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var indices: int64 := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64;
+  var j: int64;
+  var key: int64;
+  var keyIdx: int64;
+  
+  result.length := s.length;
+  
+  // Copy values
+  i := 0;
+  while (i < s.length) {
+    poke8(sorted + i * 8, SeriesGetInt(s, i));
+    poke8(indices + i * 8, i);
+    i := i + 1;
+  end;
+  
+  // Sort indices by value
+  i := 1;
+  while (i < s.length) {
+    key := peek8(sorted + i * 8);
+    keyIdx := peek8(indices + i * 8);
+    j := i - 1;
+    while (j >= 0 && peek8(sorted + j * 8) > key) {
+      poke8(sorted + (j + 1) * 8, peek8(sorted + j * 8));
+      poke8(indices + (j + 1) * 8, peek8(indices + j * 8));
+      j := j - 1;
+    end;
+    poke8(sorted + (j + 1) * 8, key);
+    poke8(indices + (j + 1) * 8, keyIdx);
+    i := i + 1;
+  end;
+  
+  // Assign ranks
+  i := 0;
+  while (i < s.length) {
+    var idx: int64 := peek8(indices + i * 8);
+    SeriesSetInt(result, idx, i + 1);
+    i := i + 1;
+  end;
+  
+  munmap(sorted, s.length * 8);
+  munmap(indices, s.length * 8);
+  
+  return result;
+}
+
+// ============================================================================
+// Median (enhanced)
+// ============================================================================
+
+// Median for sorted array
+pub fn SeriesMedian(s: Series): int64 {
+  var sorted: DataFrame := DataFrameNew();
+  DataFrameAddColumn(sorted, "val", COL_INT64);
+  var i: int64 := 0;
+  while (i < s.length) {
+    DataFrameAppendRow(sorted);
+    DataFrameSetInt(sorted, "val", i, SeriesGetInt(s, i));
+    i := i + 1;
+  end;
+  
+  var sortedS: Series := DataFrameGetSeries(sorted, "val");
+  // Sort in-place
+  i := 1;
+  while (i < sortedS.length) {
+    var key: int64 := SeriesGetInt(sortedS, i);
+    var j: int64 := i - 1;
+    while (j >= 0 && SeriesGetInt(sortedS, j) > key) {
+      SeriesSetInt(sortedS, j + 1, SeriesGetInt(sortedS, j));
+      j := j - 1;
+    end;
+    SeriesSetInt(sortedS, j + 1, key);
+    i := i + 1;
+  end;
+  
+  var mid: int64 := s.length / 2;
+  var result: int64 := SeriesGetInt(sortedS, mid);
+  
+  return result;
+}
+
+// ============================================================================
+// DataFrame Reverse
+// ============================================================================
+
+// Reverse row order
+pub fn DataFrameReverse(df: DataFrame): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var srcS: Series;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows in reverse
+  i := df.rowCount - 1;
+  while (i >= 0) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    j := 0;
+    while (j < df.colCount) {
+      srcS := peek8(df.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i - 1;
+  end;
+  
+  return result;
+}
+
   
   srcSeries := peek8(df.columns + colIdx * 16 + 8);
   
