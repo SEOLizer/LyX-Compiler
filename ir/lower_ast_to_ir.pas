@@ -2256,6 +2256,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.CallMode := cmImported
           else
             instr.CallMode := cmInternal;
+          // For regular calls, callTemps is never set above — use argTemps directly
+          if Length(callTemps) = 0 then
+            callTemps := argTemps;
           SetLength(instr.ArgTemps, Length(callTemps));
           for i := 0 to High(callTemps) do
             instr.ArgTemps[i] := callTemps[i];
@@ -3373,13 +3376,15 @@ begin
   instr.Src1 := addrTemp;
   Emit(instr);
   
-  // Get address of the struct
+  // Get base address of the struct (lowest address = slot baseLoc + slotCount - 1)
+  // Use irLoadStructAddr so the convention matches irCallStruct / irReturnStruct.
   addrTemp := NewTemp;
-  instr.Op := irLoadLocalAddr;
+  instr.Op := irLoadStructAddr;
   instr.Dest := addrTemp;
   instr.Src1 := baseLoc;
+  instr.StructSize := sd.Size;
   Emit(instr);
-  
+
   // Initialize each field from the literal
   for i := 0 to High(sl.Fields) do
   begin
@@ -3579,12 +3584,15 @@ var
   fieldFound: Boolean;
 begin
   instr := Default(TIRInstr);
-  
-  // Get address of the local struct
+
+  // Get base address of the local struct (lowest address = slot baseLoc + slotCount - 1)
+  // Use irLoadStructAddr (not irLoadLocalAddr) so the address convention matches
+  // irCallStruct and irReturnStruct (both use SlotOffset(base+slotCount-1) as lowest address).
   addrTemp := NewTemp;
-  instr.Op := irLoadLocalAddr;
+  instr.Op := irLoadStructAddr;
   instr.Dest := addrTemp;
   instr.Src1 := baseLoc;
+  instr.StructSize := sd.Size;
   Emit(instr);
   
   // Initialize each field from the literal
@@ -4549,9 +4557,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             if loc < Length(FLocalSlotCount) then
               slotCount := FLocalSlotCount[loc];
             if slotCount < 1 then slotCount := 1;
-            
+
             // Struct return: use irReturnStruct with base local slot
-            // Backend will load RAX from slot[loc] and RDX from slot[loc+1] for 2-slot structs
             instr := Default(TIRInstr);
             instr.Op := irReturnStruct;
             instr.Src1 := loc;  // Base local slot index
@@ -4560,7 +4567,28 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             Exit(True);
           end;
         end;
-        
+
+        // Check if returning a struct literal (e.g. return Pair { a: x, b: y })
+        if (TAstReturn(stmt).Value is TAstStructLit) then
+        begin
+          sd := GetReturnStructDecl;
+          if Assigned(sd) then
+          begin
+            structSlots := (sd.Size + 7) div 8;
+            if structSlots < 1 then structSlots := 1;
+            // Allocate local slots for the return struct and fill via field stores
+            loc := AllocLocalMany('_retval_' + IntToStr(FLabelCounter), atUnresolved, structSlots, True);
+            LowerStructLitIntoLocal(TAstStructLit(TAstReturn(stmt).Value), loc, sd);
+            // Return via irReturnStruct so backend uses RAX/RDX correctly
+            instr := Default(TIRInstr);
+            instr.Op := irReturnStruct;
+            instr.Src1 := loc;
+            instr.StructSize := structSlots * 8;
+            Emit(instr);
+            Exit(True);
+          end;
+        end;
+
         // Normal return (non-struct or expression)
         tmp := LowerExpr(TAstReturn(stmt).Value);
         if tmp < 0 then Exit(False);
