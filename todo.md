@@ -59,7 +59,7 @@
 | Niedrig | **MultiIndex** | df.set_index(['a','b']) |
 | Niedrig | **Excel I/O** | pd.read_excel() |
 
-✅ **data Library: 50+ Funktionen implementiert, ~20 fehlen noch**
+✅ **data Library: 60+ Funktionen implementiert, ~20 fehlen noch**
 
 ### std.validate Library
 
@@ -534,7 +534,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
-- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, SetIndex, ResetIndex
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
