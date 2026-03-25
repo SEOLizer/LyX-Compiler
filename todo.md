@@ -8,6 +8,59 @@
 |-----------|------|--------------|
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
+### data Library (Pandas-like)
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Mittel | ~~**DataFrame/Series**~~ ✅ | 2D-Tabelle mit benannten Spalten, Selection, Filter, Slice |
+| Mittel | ~~**CSV I/O**~~ ✅ | ReadCSV, WriteCSV, Header-Parsing, Type-Inferenz |
+| Mittel | ~~**GroupBy**~~ ✅ | Split-Apply-Combine: GroupBy, GroupBySum, GroupByCount, Multi-Column |
+| Mittel | ~~**Missing Values**~~ ✅ | FillNA, DropNA, IsNA |
+| Mittel | ~~**Column Statistics**~~ ✅ | SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesValueCounts |
+| Niedrig | ~~**Join/Merge**~~ ✅ | DataFrameJoinInner, DataFrameJoinLeft |
+| Niedrig | ~~**Pivot/Melt**~~ ✅ | DataFramePivot (long→wide), DataFrameMelt (wide→long) |
+| Niedrig | ~~**Correlation**~~ ✅ | SeriesCorr, SeriesCov, SeriesDescribe |
+| Niedrig | ~~**Float Support**~~ ✅ | DataFrameSetFloat/GetFloat, SeriesSumFloat |
+| Niedrig | ~~**Multi-Column GroupBy**~~ ✅ | DataFrameGroupByMulti, GroupByMultiCount |
+| Niedrig | ~~**SortBy**~~ ✅ | DataFrameSortBy, DataFrameSortByDesc |
+| Niedrig | ~~**Head/Tail/Shape**~~ ✅ | DataFrameHead, DataFrameTail, DataFrameShape, DataFrameInfo |
+| Niedrig | ~~**Concat**~~ ✅ | DataFrameConcat (Append rows from two DataFrames) |
+| Niedrig | ~~**Replace/Clip**~~ ✅ | DataFrameReplace, DataFrameReplaceAll, DataFrameClip |
+| Niedrig | ~~**Map**~~ ✅ | DataFrameMapMul, DataFrameMapAdd |
+| Niedrig | ~~**Duplicated**~~ ✅ | DataFrameDropDuplicates |
+| Niedrig | ~~**Shift/Diff**~~ ✅ | SeriesShift, SeriesDiff |
+| Niedrig | ~~**CumSum/CumProd**~~ ✅ | SeriesCumSum, SeriesCumProd, SeriesCumMax, SeriesCumMin |
+| Niedrig | ~~**Rank/Median**~~ ✅ | SeriesRank, SeriesMedian |
+| Niedrig | ~~**Reverse**~~ ✅ | DataFrameReverse |
+
+### data Library - Fehlende Features (Pandas-Parität)
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Hoch | ~~**Index Labels**~~ ✅ | String Labels, set_index, reset_index |
+| Hoch | ~~**Float Support (true)**~~ ✅ | Echte f64 Spalten, SeriesFloat64, SeriesMeanF64, SeriesStdDevF64 |
+| Hoch | ~~**Rolling Window**~~ ✅ | SeriesRollingMean/Sum/Min/Max |
+| Hoch | ~~**agg() / transform()**~~ ✅ | DataFrameAgg, GroupByAgg, SeriesTransformMul/Add/Normalize |
+| Hoch | ~~**Apply**~~ ✅ | SeriesApplyAbs/Square/Sqrt, DataFrameApplyAdd/Mul |
+| Hoch | ~~**Boolean Indexing**~~ ✅ | SeriesGreaterThan/LessThan/Equal, BoolSeriesAnd/Or/Not, DataFrameFilterByMask |
+| Mittel | ~~**String Operations**~~ ✅ | StrToUpper, StrToLower, StrTrim, StrSplit, StrJoin, StrContains, StrReplace |
+| Mittel | ~~**Resample**~~ ✅ | SeriesResampleCount |
+| Mittel | ~~**Explode**~~ ✅ | DataFrameExplode |
+| Mittel | ~~**CorrMatrix**~~ ✅ | DataFrameCorrMatrix |
+| Mittel | ~~**GetDummies**~~ ✅ | DataFrameGetDummies One-Hot Encoding |
+| Mittel | ~~**Right/Outer Join**~~ ✅ | DataFrameJoinRight, DataFrameJoinOuter |
+| Mittel | ~~**Normalize**~~ ✅ | SeriesNormalizeMinMax, SeriesNormalizeZScore |
+| Mittel | ~~**DatetimeIndex**~~ ✅ | UnixToDateTime, UnixGetYear/Month/Day |
+| Niedrig | ~~**JSON I/O**~~ ⏳ | Deferred (kein JSON-Parser in Lyx) |
+| Niedrig | ~~**Query**~~ ✅ | DataFrameQuery |
+| Niedrig | ~~**Interpolate**~~ ✅ | SeriesInterpolate (linear) |
+| Niedrig | ~~**Sample**~~ ✅ | DataFrameSample (fraction-based) |
+| Niedrig | ~~**Cut/QCut**~~ ✅ | SeriesCut, SeriesQCut Binning |
+| Niedrig | ~~**MultiIndex**~~ ✅ | DataFrameSetMultiIndex |
+| Niedrig | ~~**Excel I/O**~~ ⏳ | Deferred (kein Excel-Parser in Lyx) |
+
+✅ **data Library komplett!** (80+ Funktionen, 2 Deferred)
+
 ### std.validate Library
 
 | Priorität | Task | Beschreibung |
@@ -217,6 +270,22 @@ _(keine offenen Aufgaben)_
 - [x] **Message Building** - Headers (From, To, Subject) + Body + Dot-stuffing
 - [x] **High-level API** - SMTPSend() - complete email send in one call
 - [x] **Test-Programm** - tests/lyx/net/test_smtp.lyx
+
+### Data Library - Pandas-like (März 2026)
+
+- [x] **data/core.lyx** - DataFrame, Series, Index, GroupBy, Missing Values (DataFrameNew, DataFrameFilter, DataFrameGroupBy)
+- [x] **Series** - 1D typisierter Array (int64/string) mit Labels
+- [x] **DataFrame** - 2D-Tabelle mit benannten Spalten
+- [x] **Selection/Filter** - DataFrameFilter, DataFrameSlice, CompareInt
+- [x] **Column Ops** - AddColumn, DropColumn, RenameColumn, Cell Access
+- [x] **GroupBy** - DataFrameGroupBy, GroupBySum, GroupByCount (Split-Apply-Combine)
+- [x] **Missing Values** - FillNA, DropNA, IsNA
+- [x] **Statistics** - SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesCount, SeriesValueCounts
+- [x] **data/io.lyx** - CSV I/O (ReadCSV, WriteCSV)
+- [x] **CSV Parsing** - Header, Delimiter, Quotes, Type-Inferenz
+- [x] **CSV Writing** - DataFrame to CSV with header
+- [x] **Display** - DataFramePrint (Table format)
+- [x] **Test-Programm** - tests/lyx/data/test_core.lyx
 
 ### IMAP Client (März 2026)
 
@@ -465,6 +534,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, Float64, Rolling, Agg, Apply, Boolean Indexing, String Ops, GetDummies, Normalize, DateTime, Sample, Cut, MultiIndex, Interpolate
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
