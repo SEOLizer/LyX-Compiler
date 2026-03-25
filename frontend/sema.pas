@@ -2242,6 +2242,8 @@ begin
             TAstCast(expr).CastType := atBool
           else if castTypeName = 'char' then
             TAstCast(expr).CastType := atChar
+          else if (castTypeName = 'pchar') or (castTypeName = 'string') then
+            TAstCast(expr).CastType := atPChar
           else if FClassTypes.IndexOf(castTypeName) >= 0 then
           begin
             // Class cast - mark as class type

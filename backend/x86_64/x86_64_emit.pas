@@ -920,9 +920,16 @@ begin
             if instr.StructSize <= 16 then
             begin
               // Kleine Structs: RAX:RDX verwenden
-              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
+              // SysV ABI: Bytes 0-7 → RAX, Bytes 8-15 → RDX
+              // Slot-Layout: SlotOffset(Src1+1) = niedrigere Adresse = Bytes 0-7
+              //              SlotOffset(Src1)   = höhere  Adresse = Bytes 8-15
               if instr.StructSize > 8 then
-                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1 + 1));
+              begin
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1 + 1)); // Bytes 0-7 → RAX
+                WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1));     // Bytes 8-15 → RDX
+              end
+              else
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1));
             end
             else
             begin
@@ -1979,60 +1986,45 @@ begin
              begin
                // mmap(addr, length, prot, flags, fd, offset)
                // RDI=addr, RSI=length, RDX=prot, R10=flags, R8=fd, R9=offset
-               if instr.Src1 >= 0 then
+               // All args from ArgTemps[0..5] (Src1 also = ArgTemps[0])
+               if Length(instr.ArgTemps) >= 1 then
                begin
-                 slotIdx := fn.LocalCount + instr.Src1;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[0];
                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
                end
                else
                  WriteMovRegImm64(FCode, RDI, 0);
-               if instr.Src2 >= 0 then
+               if Length(instr.ArgTemps) >= 2 then
                begin
-                 slotIdx := fn.LocalCount + instr.Src2;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[1];
                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
                end
                else
                  WriteMovRegImm64(FCode, RSI, 0);
-               // 3rd arg from ArgTemps[2]
-               arg3 := -1;
-               if (instr.ImmInt >= 3) and (Length(instr.ArgTemps) >= 3) then
-                 arg3 := instr.ArgTemps[2];
-               if arg3 >= 0 then
+               if Length(instr.ArgTemps) >= 3 then
                begin
-                 slotIdx := fn.LocalCount + arg3;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[2];
                  WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
                end
                else
                  WriteMovRegImm64(FCode, RDX, 0);
-               // 4th arg from ArgTemps[3]
-               arg4 := -1;
-               if (instr.ImmInt >= 4) and (Length(instr.ArgTemps) >= 4) then
-                 arg4 := instr.ArgTemps[3];
-               if arg4 >= 0 then
+               if Length(instr.ArgTemps) >= 4 then
                begin
-                 slotIdx := fn.LocalCount + arg4;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[3];
                  WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
                end
                else
                  WriteMovRegImm64(FCode, R10, 0);
-               // 5th arg from ArgTemps[4]
-               arg5 := -1;
-               if (instr.ImmInt >= 5) and (Length(instr.ArgTemps) >= 5) then
-                 arg5 := instr.ArgTemps[4];
-               if arg5 >= 0 then
+               if Length(instr.ArgTemps) >= 5 then
                begin
-                 slotIdx := fn.LocalCount + arg5;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[4];
                  WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
                end
                else
-                 WriteMovRegImm64(FCode, R8, 0);
-               // 6th arg from ArgTemps[5]
-               arg6 := -1;
-               if (instr.ImmInt >= 6) and (Length(instr.ArgTemps) >= 6) then
-                 arg6 := instr.ArgTemps[5];
-               if arg6 >= 0 then
+                 WriteMovRegImm64(FCode, R8, -1);
+               if Length(instr.ArgTemps) >= 6 then
                begin
-                 slotIdx := fn.LocalCount + arg6;
+                 slotIdx := fn.LocalCount + instr.ArgTemps[5];
                  WriteMovRegMem(FCode, R9, RBP, SlotOffset(slotIdx));
                end
                else
@@ -3929,9 +3921,17 @@ begin
                if instr.StructSize <= 16 then
                begin
                  // Small struct: copy from RAX:RDX
-                 WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+                 // SysV ABI: RAX = bytes 0-7 (lower half), RDX = bytes 8-15 (upper half)
+                 // irLoadStructAddr uses SlotOffset(Dest+1) as the base (lowest address).
+                 // So bytes 0-7 must go to the LOWER address slot (Dest+1)
+                 // and bytes 8-15 to the HIGHER address slot (Dest).
                  if instr.StructSize > 8 then
-                   WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest + 1), RDX);
+                 begin
+                   WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest + 1), RAX); // bytes 0-7 at lower addr
+                   WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest),     RDX); // bytes 8-15 at higher addr
+                 end
+                 else
+                   WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
                end;
                // For large structs, data is already written via sret pointer
              end;
