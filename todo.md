@@ -38,11 +38,11 @@
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
 | Hoch | ~~**Index Labels**~~ ✅ | String Labels, set_index, reset_index |
-| Hoch | **Float Support (true)** | Echte f64 Spalten, nicht nur int64 Bit-Pattern |
-| Hoch | **Rolling Window** | df.rolling(n).mean/sum/min/max |
-| Hoch | **agg() / transform()** | Flexible Aggregation: df.agg(['sum','mean']) |
-| Hoch | **Apply** | df.apply(func), df.map(func) |
-| Hoch | **Boolean Indexing** | df[df.age > 25] |
+| Hoch | ~~**Float Support (true)**~~ ✅ | Echte f64 Spalten, SeriesFloat64, SeriesMeanF64, SeriesStdDevF64 |
+| Hoch | ~~**Rolling Window**~~ ✅ | SeriesRollingMean/Sum/Min/Max |
+| Hoch | ~~**agg() / transform()**~~ ✅ | DataFrameAgg, GroupByAgg, SeriesTransformMul/Add/Normalize |
+| Hoch | ~~**Apply**~~ ✅ | SeriesApplyAbs/Square/Sqrt, DataFrameApplyAdd/Mul |
+| Hoch | ~~**Boolean Indexing**~~ ✅ | SeriesGreaterThan/LessThan/Equal, BoolSeriesAnd/Or/Not, DataFrameFilterByMask |
 | Mittel | **String Operations** | Split, Join, Upper, Lower, Strip |
 | Mittel | **Resample** | df.resample('D').sum() für Zeitserien |
 | Mittel | **Explode** | df.explode('col') für Listen |
@@ -59,7 +59,7 @@
 | Niedrig | **MultiIndex** | df.set_index(['a','b']) |
 | Niedrig | **Excel I/O** | pd.read_excel() |
 
-✅ **data Library: 60+ Funktionen implementiert, ~20 fehlen noch**
+✅ **data Library: 70+ Funktionen implementiert, ~14 fehlen noch**
 
 ### std.validate Library
 
@@ -534,7 +534,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
-- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, SetIndex, ResetIndex
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, Float64, Rolling, Agg, Apply, Boolean Indexing
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
