@@ -33,7 +33,33 @@
 | Niedrig | ~~**Rank/Median**~~ ✅ | SeriesRank, SeriesMedian |
 | Niedrig | ~~**Reverse**~~ ✅ | DataFrameReverse |
 
-✅ **data Library komplett!** (50+ Funktionen)
+### data Library - Fehlende Features (Pandas-Parität)
+
+| Priorität | Task | Beschreibung |
+|-----------|------|--------------|
+| Hoch | ~~**Index Labels**~~ ✅ | String Labels, set_index, reset_index |
+| Hoch | **Float Support (true)** | Echte f64 Spalten, nicht nur int64 Bit-Pattern |
+| Hoch | **Rolling Window** | df.rolling(n).mean/sum/min/max |
+| Hoch | **agg() / transform()** | Flexible Aggregation: df.agg(['sum','mean']) |
+| Hoch | **Apply** | df.apply(func), df.map(func) |
+| Hoch | **Boolean Indexing** | df[df.age > 25] |
+| Mittel | **String Operations** | Split, Join, Upper, Lower, Strip |
+| Mittel | **Resample** | df.resample('D').sum() für Zeitserien |
+| Mittel | **Explode** | df.explode('col') für Listen |
+| Mittel | **CorrMatrix** | df.corr() Pairwise Correlation |
+| Mittel | **GetDummies** | pd.get_dummies() One-Hot Encoding |
+| Mittel | **Right/Outer Join** | DataFrameJoinRight, DataFrameJoinOuter |
+| Mittel | **Normalize** | Min-Max und Z-Score Normalisierung |
+| Mittel | **DatetimeIndex** | pd.to_datetime(), dt.month, dt.day |
+| Niedrig | **JSON I/O** | ReadJSON, WriteJSON |
+| Niedrig | **Query** | df.query('age > 25') |
+| Niedrig | **Interpolate** | df.interpolate() Missing Values |
+| Niedrig | **Sample** | df.sample(0.1) Random Sampling |
+| Niedrig | **Cut/QCut** | pd.cut(), pd.qcut() Binning |
+| Niedrig | **MultiIndex** | df.set_index(['a','b']) |
+| Niedrig | **Excel I/O** | pd.read_excel() |
+
+✅ **data Library: 50+ Funktionen implementiert, ~20 fehlen noch**
 
 ### std.validate Library
 
