@@ -43,23 +43,23 @@
 | Hoch | ~~**agg() / transform()**~~ ✅ | DataFrameAgg, GroupByAgg, SeriesTransformMul/Add/Normalize |
 | Hoch | ~~**Apply**~~ ✅ | SeriesApplyAbs/Square/Sqrt, DataFrameApplyAdd/Mul |
 | Hoch | ~~**Boolean Indexing**~~ ✅ | SeriesGreaterThan/LessThan/Equal, BoolSeriesAnd/Or/Not, DataFrameFilterByMask |
-| Mittel | **String Operations** | Split, Join, Upper, Lower, Strip |
-| Mittel | **Resample** | df.resample('D').sum() für Zeitserien |
-| Mittel | **Explode** | df.explode('col') für Listen |
-| Mittel | **CorrMatrix** | df.corr() Pairwise Correlation |
-| Mittel | **GetDummies** | pd.get_dummies() One-Hot Encoding |
-| Mittel | **Right/Outer Join** | DataFrameJoinRight, DataFrameJoinOuter |
-| Mittel | **Normalize** | Min-Max und Z-Score Normalisierung |
-| Mittel | **DatetimeIndex** | pd.to_datetime(), dt.month, dt.day |
-| Niedrig | **JSON I/O** | ReadJSON, WriteJSON |
-| Niedrig | **Query** | df.query('age > 25') |
-| Niedrig | **Interpolate** | df.interpolate() Missing Values |
-| Niedrig | **Sample** | df.sample(0.1) Random Sampling |
-| Niedrig | **Cut/QCut** | pd.cut(), pd.qcut() Binning |
-| Niedrig | **MultiIndex** | df.set_index(['a','b']) |
-| Niedrig | **Excel I/O** | pd.read_excel() |
+| Mittel | ~~**String Operations**~~ ✅ | StrToUpper, StrToLower, StrTrim, StrSplit, StrJoin, StrContains, StrReplace |
+| Mittel | ~~**Resample**~~ ✅ | SeriesResampleCount |
+| Mittel | ~~**Explode**~~ ✅ | DataFrameExplode |
+| Mittel | ~~**CorrMatrix**~~ ✅ | DataFrameCorrMatrix |
+| Mittel | ~~**GetDummies**~~ ✅ | DataFrameGetDummies One-Hot Encoding |
+| Mittel | ~~**Right/Outer Join**~~ ✅ | DataFrameJoinRight, DataFrameJoinOuter |
+| Mittel | ~~**Normalize**~~ ✅ | SeriesNormalizeMinMax, SeriesNormalizeZScore |
+| Mittel | ~~**DatetimeIndex**~~ ✅ | UnixToDateTime, UnixGetYear/Month/Day |
+| Niedrig | ~~**JSON I/O**~~ ⏳ | Deferred (kein JSON-Parser in Lyx) |
+| Niedrig | ~~**Query**~~ ✅ | DataFrameQuery |
+| Niedrig | ~~**Interpolate**~~ ✅ | SeriesInterpolate (linear) |
+| Niedrig | ~~**Sample**~~ ✅ | DataFrameSample (fraction-based) |
+| Niedrig | ~~**Cut/QCut**~~ ✅ | SeriesCut, SeriesQCut Binning |
+| Niedrig | ~~**MultiIndex**~~ ✅ | DataFrameSetMultiIndex |
+| Niedrig | ~~**Excel I/O**~~ ⏳ | Deferred (kein Excel-Parser in Lyx) |
 
-✅ **data Library: 70+ Funktionen implementiert, ~14 fehlen noch**
+✅ **data Library komplett!** (80+ Funktionen, 2 Deferred)
 
 ### std.validate Library
 
@@ -534,7 +534,7 @@ _(keine offenen Aufgaben)_
 - VAT ID Validation (EU 27): VATValidate, VATGetCountryName, VATGetFormat, 27 Länder mit Checksummen
 - Statistics Module: ArraySum, ArrayMin, ArrayMax, ArrayAvg, ArrayMedian, ArrayCount, ArraySort, ArrayFilter, ArrayVariance, ArrayStdDev
 - Mathematical Constants: PI, E, TAU, PHI, SQRT2, SQRT3, DegToRad, RadToDeg, ApproxEqual
-- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, Float64, Rolling, Agg, Apply, Boolean Indexing
+- Data Library (Pandas): DataFrame, Series, CSV I/O, GroupBy, Filter, Slice, Missing Values, Join, Pivot, Melt, Correlation, Sort, Head/Tail, Concat, Replace, Rank, CumSum, Shift, Diff, Index Labels, Float64, Rolling, Agg, Apply, Boolean Indexing, String Ops, GetDummies, Normalize, DateTime, Sample, Cut, MultiIndex, Interpolate
 - ARM64 Dynamic Linking vollständig funktional (PLT/GOT, Hash-Tabelle, Relocations)
 
 ### v0.5.4 (März 2026)
