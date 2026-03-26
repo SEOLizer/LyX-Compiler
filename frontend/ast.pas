@@ -228,6 +228,9 @@ type
     property Args: TAstExprList read FArgs;
     property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
     property IsIndirectCall: Boolean read FIsIndirectCall write FIsIndirectCall;
+  public
+    // Generic type arguments for monomorphization, e.g., [atInt64] for max[int64](...)
+    TypeArgs: array of TAurumType;
   end;
 
   { Array-Literal: [expr, expr, ...] }
