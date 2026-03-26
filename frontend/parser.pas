@@ -16,6 +16,7 @@ type
     FHasCur: Boolean;
     FLastParamListVarArgs: Boolean;
     FCurrentTypeParams: TStringArray; // type params of current generic function
+    FNoStructLit: Boolean; // when True, suppress struct literal parsing (used for match expr)
 
     procedure Advance; // setzt FCurTok
     function Check(kind: TTokenKind): Boolean;
@@ -36,6 +37,7 @@ type
 
     function ParseBlock: TAstBlock;
     function ParseStmt: TAstStmt;
+    function ParseMatchStmt: TAstStmt;
     function ParseVarLetCoDecl: TAstStmt;
     function ParseForStmt: TAstFor;
     function ParseRepeatUntilStmt: TAstRepeatUntil;
@@ -1070,6 +1072,10 @@ begin
     Exit(TAstSwitch.Create(cond, cases, defaultBody, cond.Span));
   end;
 
+  // match expr { case val => stmt ... default => stmt }
+  if Check(tkMatch) then
+    Exit(ParseMatchStmt);
+
   if Check(tkFor) then
     Exit(ParseForStmt);
 
@@ -1142,6 +1148,69 @@ begin
 
   // Assignment or expression statement
   Exit(ParseAssignStmtOrExprStmt);
+end;
+
+function TParser.ParseMatchStmt: TAstStmt;
+var
+  expr: TAstExpr;
+  cases: TAstCaseList;
+  defaultBody: TAstStmt;
+  valExpr: TAstExpr;
+  extraVal: TAstExpr;
+  bodyStmt: TAstStmt;
+  caseObj: TAstCase;
+begin
+  Expect(tkMatch); // consume 'match'
+  // expression WITHOUT parens (unlike switch)
+  // Suppress struct literal parsing so `match x {` doesn't treat x{ as struct literal
+  FNoStructLit := True;
+  expr := ParseExpr;
+  FNoStructLit := False;
+  Expect(tkLBrace);
+  SetLength(cases, 0);
+  defaultBody := nil;
+  while not Check(tkRBrace) and not Check(tkEOF) do
+  begin
+    if Accept(tkCase) then
+    begin
+      // parse first value - use ParseBitXorExpr to avoid consuming '|' as bitwise-OR
+      valExpr := ParseBitXorExpr;
+      caseObj := TAstCase.Create(valExpr, nil);
+      // OR patterns: case 1 | 2 | 3 =>
+      while Check(tkBitOr) do
+      begin
+        Advance; // consume '|'
+        extraVal := ParseBitXorExpr;
+        SetLength(caseObj.ExtraValues, Length(caseObj.ExtraValues) + 1);
+        caseObj.ExtraValues[High(caseObj.ExtraValues)] := extraVal;
+      end;
+      Expect(tkFatArrow); // consume '=>'
+      if Check(tkLBrace) then
+        bodyStmt := ParseBlock
+      else
+        bodyStmt := ParseStmt;
+      caseObj.Body := bodyStmt;
+      SetLength(cases, Length(cases) + 1);
+      cases[High(cases)] := caseObj;
+      Continue;
+    end
+    else if Accept(tkDefault) then
+    begin
+      Expect(tkFatArrow); // consume '=>'
+      if Check(tkLBrace) then
+        defaultBody := ParseBlock
+      else
+        defaultBody := ParseStmt;
+      Continue;
+    end
+    else
+    begin
+      FDiag.Error('unexpected token in match', FCurTok.Span);
+      Advance;
+    end;
+  end;
+  Expect(tkRBrace);
+  Result := TAstSwitch.Create(expr, cases, defaultBody, expr.Span);
 end;
 
 function TParser.ParseVarLetCoDecl: TAstStmt;
@@ -2083,7 +2152,7 @@ begin
         Result := ParsePostfix(TAstNewExpr.Create(savedName, savedSpan));
       Exit;
     end
-    else if Check(tkLParen) or Check(tkLBrace) then
+    else if Check(tkLParen) or (Check(tkLBrace) and not FNoStructLit) then
     begin
       // Confirmed: namespace-qualified call or struct literal
       namespace := savedName;
@@ -2171,7 +2240,7 @@ begin
       callExpr.TypeArgs := typeArgs;
     Result := ParsePostfix(callExpr);
   end
-  else if Accept(tkLBrace) then
+  else if (not FNoStructLit) and Accept(tkLBrace) then
   begin
     // Struct literal: TypeName { field: value, ... }
     // Note: for struct literals, namespace is not supported yet
