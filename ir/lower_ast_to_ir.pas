@@ -3831,7 +3831,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     thenLabel, elseLabel, endLabel: string;
     whileNode: TAstWhile;
     startLabel, bodyLabel, exitLabel: string;
-    i, k: Integer;
+    i, j, k: Integer;
     sw: TAstSwitch;
     switchTmp: Integer;
     endLbl, defaultLbl: string;
@@ -4902,6 +4902,13 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.Op := irCmpEq; instr.Dest := NewTemp; instr.Src1 := switchTmp; instr.Src2 := caseTmp; Emit(instr);
           // br true -> caseLbl
           instr.Op := irBrTrue; instr.Src1 := instr.Dest; instr.LabelName := lbl; Emit(instr);
+          // OR pattern extra values
+          for j := 0 to High(sw.Cases[i].ExtraValues) do
+          begin
+            caseTmp := LowerExpr(sw.Cases[i].ExtraValues[j]);
+            instr.Op := irCmpEq; instr.Dest := NewTemp; instr.Src1 := switchTmp; instr.Src2 := caseTmp; Emit(instr);
+            instr.Op := irBrTrue; instr.Src1 := instr.Dest; instr.LabelName := lbl; Emit(instr);
+          end;
         end;
 
 

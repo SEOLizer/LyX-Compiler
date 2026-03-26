@@ -14,7 +14,7 @@ type
     // Keywords
     tkFn, tkVar, tkLet, tkCo, tkCon,
     tkIf, tkElse, tkWhile, tkReturn,
-    tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault,
+    tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault, tkMatch,
     tkUnit, tkImport, tkPublic, tkAs, tkType, tkEnum, tkStruct, tkArray, tkStatic,
     tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil, tkPool,
     tkTry, tkCatch, tkThrow, tkFinally,
@@ -51,6 +51,8 @@ type
     tkQuestion, tkNullCoalesce, tkSafeCall,
     // Pipe-Operator
     tkPipe,
+    // Fat Arrow (=>)
+    tkFatArrow,
     // Sonstiges
     tkEOF, tkError
   );
@@ -130,6 +132,7 @@ begin
     tkSwitch:    Result := 'switch';
     tkBreak:     Result := 'break';
     tkDefault:   Result := 'default';
+    tkMatch:     Result := 'match';
     tkUnit:      Result := 'unit';
     tkImport:    Result := 'import';
     tkPublic:    Result := 'public';
@@ -211,6 +214,7 @@ begin
     tkShiftLeft: Result := '<<';
     tkShiftRight:Result := '>>';
     tkPipe:      Result := '|>';
+    tkFatArrow:  Result := '=>';
     tkEOF:       Result := 'EOF';
     tkError:     Result := 'ERROR';
   end;
@@ -720,6 +724,7 @@ begin
     'switch':  Result := tkSwitch;
     'break':   Result := tkBreak;
     'default': Result := tkDefault;
+    'match':   Result := tkMatch;
     'unit':    Result := tkUnit;
     'import':  Result := tkImport;
     'public':  Result := tkPublic;
@@ -986,6 +991,11 @@ begin
       begin
         Advance;
         Result := MakeToken(tkEq, '==', startLine, startCol, 2);
+      end
+      else if (not IsAtEnd) and (CurrentChar = '>') then
+      begin
+        Advance;
+        Result := MakeToken(tkFatArrow, '=>', startLine, startCol, 2);
       end
       else
         Result := MakeToken(tkSingleEq, '=', startLine, startCol, 1);
