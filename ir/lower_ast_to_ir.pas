@@ -2112,6 +2112,101 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
+        // === Dynamic growable strings (F2) ===
+        else if call.Name = 'StrLen' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrLen';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrCharAt' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrCharAt';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrSetChar' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrSetChar';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrNew' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrNew';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrFree' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrFree';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrAppend' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrAppend';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
+        else if call.Name = 'StrFromInt' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin;
+          instr.Dest := t0;
+          instr.ImmStr := 'StrFromInt';
+          instr.ImmInt := argCount;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr);
+          Result := t0;
+        end
         else if ((call.Name = 'RegexMatch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
         begin
