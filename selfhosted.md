@@ -58,7 +58,7 @@ IPv6-Support, DataFrame, LyxVision etc. kommen erst in Stufe 2.
 
 | # | Feature | Workaround möglich? | Aufwand | Prio für Self-Host |
 |---|---------|--------------------|---------|--------------------|
-| F1 | **`enum` Typen** | `con`-Konstanten (int64) | M | Mittel – lesbar aber nicht zwingend |
+| F1 | **`enum` Typen** | `con`-Konstanten (int64) | M | ✅ Implementiert (diese Session) |
 | F2 | **`string` Typ** (dynamisch wachsend) | `pchar` + mmap-Buffer manuell | S | Mittel – aufwändig aber möglich |
 | F3 | **Exception Handling** (try/catch) | `panic()` + Rückkabecode | S | Niedrig – kein harter Blocker |
 | F4 | **Multi-Return** / Tuple | Out-Parameter (Pointer) | S | Niedrig |
