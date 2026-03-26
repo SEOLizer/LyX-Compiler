@@ -628,6 +628,17 @@ begin
       end;
       FCurrentClassDecl := nil; // clear after processing all methods of this class
     end
+    else if node is TAstEnumDecl then
+    begin
+      // Register each enum value as a compile-time integer constant
+      for j := 0 to High(TAstEnumDecl(node).Values) do
+      begin
+        cv := TConstValue.Create;
+        cv.IsStr  := False;
+        cv.IntVal := TAstEnumDecl(node).Values[j].Value;
+        FConstMap.AddObject(TAstEnumDecl(node).Values[j].Name, System.TObject(cv));
+      end;
+    end
     else if node is TAstConDecl then
     begin
       // register compile-time constant for inline substitution
@@ -771,6 +782,19 @@ begin
               Continue;
             end;
             FConstMap.AddObject(con.Name, System.TObject(cv));
+          end
+          // Process enum declarations from imported units
+          else if node is TAstEnumDecl then
+          begin
+            for k := 0 to High(TAstEnumDecl(node).Values) do
+            begin
+              if FConstMap.IndexOf(TAstEnumDecl(node).Values[k].Name) >= 0 then
+                Continue;
+              cv := TConstValue.Create;
+              cv.IsStr  := False;
+              cv.IntVal := TAstEnumDecl(node).Values[k].Value;
+              FConstMap.AddObject(TAstEnumDecl(node).Values[k].Name, System.TObject(cv));
+            end;
           end;
         end
         // PHASE 2: Functions and Global Variables

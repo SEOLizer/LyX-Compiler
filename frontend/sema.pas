@@ -4149,6 +4149,22 @@ begin
         sym.IsImported := True;
         AddSymbolToCurrent(sym, con.Span);
       end
+      // Öffentliche Enum-Typen importieren
+      else if decl is TAstEnumDecl then
+      begin
+        if not TAstEnumDecl(decl).IsPublic then
+          Continue;
+        for j := 0 to High(TAstEnumDecl(decl).Values) do
+        begin
+          if ResolveSymbol(TAstEnumDecl(decl).Values[j].Name) <> nil then
+            Continue;
+          sym := TSymbol.Create(TAstEnumDecl(decl).Values[j].Name);
+          sym.Kind := symCon;
+          sym.DeclType := atInt64;
+          sym.IsImported := True;
+          AddSymbolToCurrent(sym, decl.Span);
+        end;
+      end
       // Öffentliche globale Variablen importieren (pub var / pub let)
       else if decl is TAstVarDecl then
       begin
@@ -4927,6 +4943,22 @@ begin
       sym.Kind := symCon;
       sym.DeclType := con.DeclType;
       AddSymbolToCurrent(sym, con.Span);
+    end
+    else if node is TAstEnumDecl then
+    begin
+      // Register each enum value as a compile-time integer constant
+      for j := 0 to High(TAstEnumDecl(node).Values) do
+      begin
+        if ResolveSymbol(TAstEnumDecl(node).Values[j].Name) <> nil then
+        begin
+          FDiag.Error('redeclaration of enum value: ' + TAstEnumDecl(node).Values[j].Name, node.Span);
+          Continue;
+        end;
+        sym := TSymbol.Create(TAstEnumDecl(node).Values[j].Name);
+        sym.Kind := symCon;
+        sym.DeclType := atInt64;
+        AddSymbolToCurrent(sym, node.Span);
+      end;
     end
     else if node is TAstVarDecl then
     begin
