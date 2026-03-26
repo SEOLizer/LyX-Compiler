@@ -1,5 +1,167 @@
 # Changelog - Lyx Compiler
 
+## Version 0.5.6 (März 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Enum-Typen (v0.5.6)**
+
+Native Aufzählungstypen mit typsicheren Konstanten:
+
+```lyx
+enum Direction { North, South, East, West }
+enum Color { Red = 1, Green = 2, Blue = 4 }
+
+fn main(): int64 {
+    var d: int64 := Direction::North;
+    var c: int64 := Color::Green;
+    PrintInt(d);  // 0
+    PrintInt(c);  // 2
+    return 0;
+}
+```
+
+- `enum Name { Val, Val = N, ... }` Syntax
+- Werte mit optionalem explizitem Integer-Wert
+- Zugriff via `EnumName::Wert` (Namespace-Syntax)
+- Werden intern als `int64`-Konstanten lowered
+
+#### **Exception Handling: try/catch/throw (v0.5.6)**
+
+Strukturierte Fehlerbehandlung:
+
+```lyx
+fn riskyOp(x: int64): int64 {
+    if (x < 0) { throw "negative value"; }
+    return x * 2;
+}
+
+fn main(): int64 {
+    try {
+        var r: int64 := riskyOp(-1);
+    } catch (e) {
+        PrintStr("Caught: "); PrintStr(e); PrintStr("\n");
+    }
+    return 0;
+}
+```
+
+- `try { ... } catch (varname) { ... }` Syntax
+- `throw expr` wirft eine Exception (pchar-Nachricht)
+- Nested try/catch vollständig unterstützt
+- Implementiert via `irPushHandler`/`irPopHandler`/`irThrow` IR-Opcodes
+
+#### **Multi-Return / Tuple-Rückgabe (v0.5.6)**
+
+Funktionen können mehrere Werte zurückgeben:
+
+```lyx
+fn divmod(a: int64, b: int64): (int64, int64) {
+    return (a / b, a % b);
+}
+
+fn main(): int64 {
+    var q, r := divmod(17, 5);
+    PrintInt(q);  // 3
+    PrintInt(r);  // 2
+    return 0;
+}
+```
+
+- Rückgabetyp `(T1, T2)` Syntax
+- `return (expr1, expr2)` Tupel-Literal
+- `var a, b := f()` Tupel-Destrukturierung
+- Implementierung: RAX/RDX Register-Paar (16-Byte Struct Return)
+
+#### **Generics mit Monomorphisierung (v0.5.6)**
+
+Echte generische Funktionen mit Compile-Time-Spezialisierung:
+
+```lyx
+fn max[T](a: T, b: T): T {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn main(): int64 {
+    var x: int64 := max[int64](10, 20);  // spezialisiert zu _G_max__int64
+    PrintInt(x);  // 20
+    return 0;
+}
+```
+
+- `fn name[T](...)` Syntax für generische Typparameter
+- `func[int64](...)` Aufruf-Syntax mit konkreten Typen
+- Monomorphisierung: jede Typen-Kombination erzeugt eine eigene Funktion `_G_name__type`
+- Mehrere Typparameter möglich: `fn zip[A, B](...)`
+
+#### **Pattern Matching mit match/case (v0.5.6)**
+
+Ausdrucksstärkere Alternative zu `switch`:
+
+```lyx
+fn classify(n: int64): int64 {
+    match n {
+        case 0 => { PrintStr("zero\n"); }
+        case 1 | 2 | 3 => { PrintStr("small\n"); }
+        case 10 | 20 | 30 => { PrintStr("tens\n"); }
+        default => { PrintStr("other\n"); }
+    }
+    return 0;
+}
+```
+
+- `match expr { ... }` — kein Klammern um den Ausdruck nötig
+- `case val => body` — `=>` statt `:`
+- OR-Patterns: `case 1 | 2 | 3 =>` — mehrere Werte pro Case
+- `default =>` Fallback
+- Bestehender `switch`-Syntax bleibt vollständig kompatibel
+
+#### **Dynamische String-Builtins (v0.5.6)**
+
+7 neue Built-in-Funktionen für mmap-basierte dynamische Strings:
+
+```lyx
+var s: pchar := StrNew(64);          // Allokiere String-Buffer
+StrSetChar(s, 0, 72);               // s[0] = 'H'
+StrSetChar(s, 1, 105);              // s[1] = 'i'
+StrSetChar(s, 2, 0);                // Null-Terminator
+PrintStr(s);                         // "Hi"
+
+var s2: pchar := StrAppend(s, " World");
+PrintStr(s2);                        // "Hi World"
+
+var ns: pchar := StrFromInt(-42);
+PrintStr(ns);                        // "-42"
+
+PrintInt(StrLen("Hello"));           // 5  (funktioniert auch auf Literalen)
+PrintInt(StrCharAt("ABC", 1));       // 66 ('B')
+
+StrFree(s2);
+StrFree(ns);
+```
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|-------------|
+| `StrNew(cap)` | `(int64) → pchar` | mmap-Allokation mit Header |
+| `StrFree(s)` | `(pchar) → void` | munmap via Header |
+| `StrLen(s)` | `(pchar) → int64` | Strlen (Null-Scan, kompatibel mit Literalen) |
+| `StrCharAt(s, i)` | `(pchar, int64) → int64` | Byte-Zugriff (zero-extended) |
+| `StrSetChar(s, i, c)` | `(pchar, int64, int64) → void` | Byte schreiben |
+| `StrAppend(dest, src)` | `(pchar, pchar) → pchar` | Konkatenation mit Reallokation |
+| `StrFromInt(n)` | `(int64) → pchar` | Integer → Dezimalstring |
+
+**String-Header-Layout:** 16 Byte vor dem Daten-Pointer: `[capacity:8][length:8][data...]`. Der zurückgegebene `pchar` zeigt auf `data` und ist direkt mit `PrintStr` kompatibel.
+
+---
+
+### 🔧 **Bugfixes**
+
+- **Generics arr[i] Regression**: Heuristik für Typarg-Parsing war zu breit — `arr[idx]` wurde fälschlicherweise als generischer Typarg geparst. Fix: `IsKnownTypeIdent()` prüft ob der Token ein bekannter Primitiv-Typ oder deklarierter Typparameter ist.
+- **Generics Commit Unvollständig**: `TAstFuncDecl.TypeParams` Feld und `savedTypeParams`/`typeParams` Variablen fehlten im Commit. Der Branch `fix/generics` enthält den Fix.
+
+---
+
 ## Version 0.5.1 (März 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**

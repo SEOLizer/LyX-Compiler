@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract enum match try catch throw`
 
 ### Integer-Literale mit verschiedenen Basen
 
@@ -69,7 +69,9 @@ Alle Integer-Literale werden intern als `int64` behandelt.
 * Bitweise: `& | ^ ~ << >>`
 * Null-Safety: `? ?? ?.`
 * Pipe: `|>`
-* Sonstiges: `(` `)` `{` `}` `:` `,` `;` `.` `@`
+* Fat Arrow: `=>` (Pattern-Matching-Zweig)
+* Namespace: `::` (Enum-Zugriff: `Color::Red`)
+* Sonstiges: `(` `)` `{` `}` `[` `]` `:` `,` `;` `.` `@`
 
 ---
 
@@ -180,6 +182,116 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 ### Nullable Typen (v0.4.0 ✅ ABGESCHLOSSEN)
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
+
+### Enum-Deklarationen (v0.5.6 ✅ ABGESCHLOSSEN)
+
+```ebnf
+EnumDecl    := 'enum' Ident '{' EnumBody '}' ';'? ;
+EnumBody    := EnumMember { ',' EnumMember } ;
+EnumMember  := Ident [ '=' IntLiteral ] ;
+EnumAccess  := Ident '::' Ident ;
+```
+
+Enum-Werte sind implizit `int64`. Der erste Wert startet bei 0 (sofern nicht explizit angegeben).
+
+```lyx
+enum Direction { North, South, East, West }
+enum HttpStatus { Ok = 200, NotFound = 404, ServerError = 500 }
+
+var d: int64 := Direction::North;   // 0
+var s: int64 := HttpStatus::Ok;     // 200
+```
+
+### Generics / Parametrische Polymorphie (v0.5.6 ✅ ABGESCHLOSSEN)
+
+```ebnf
+GenericFnDecl  := 'fn' Ident '[' TypeParamList ']' '(' [ ParamList ] ')' [ ':' Type ] Block ;
+TypeParamList  := Ident { ',' Ident } ;
+GenericCall    := Ident '[' TypeArgList ']' '(' [ ArgList ] ')' ;
+TypeArgList    := Type { ',' Type } ;
+```
+
+Generics werden über **Monomorphisierung** implementiert: Pro Typ-Argument wird eine spezialisierte Funktion erzeugt (z.B. `max_G_int64`).
+
+```lyx
+fn max[T](a: T, b: T): T {
+  if (a > b) { return a; }
+  return b;
+}
+
+fn main(): int64 {
+  var m: int64 := max[int64](10, 20);  // spezialisiert zu max_G_int64
+  return 0;
+}
+```
+
+### Pattern Matching (v0.5.6 ✅ ABGESCHLOSSEN)
+
+```ebnf
+MatchStmt   := 'match' Expr '{' { CaseClause } [ DefaultClause ] '}' ;
+CaseClause  := 'case' CaseValue { '|' CaseValue } '=>' Block ;
+CaseValue   := Expr ;
+DefaultClause := 'default' '=>' Block ;
+```
+
+**Unterschiede zu `switch`:**
+- Kein `(` `)` um den Match-Ausdruck
+- `=>` statt `:` als Trennzeichen
+- `|` für OR-Patterns innerhalb eines `case`
+- Kein `break` nötig (kein Fall-Through)
+
+```lyx
+fn classify(n: int64): int64 {
+  match n {
+    case 0 => { return 0; }
+    case 1 | 2 | 3 => { return 1; }
+    default => { return 2; }
+  }
+}
+```
+
+### Tuple-Rückgaben (v0.5.6 ✅ ABGESCHLOSSEN)
+
+```ebnf
+TupleReturnType := '(' Type { ',' Type } ')' ;
+TupleReturnExpr := '(' Expr { ',' Expr } ')' ;
+TupleUnpack     := 'var' Ident { ',' Ident } ':=' CallExpr ';' ;
+FnDeclReturn    := ':' ( Type | TupleReturnType ) ;
+```
+
+```lyx
+fn divmod(a: int64, b: int64): (int64, int64) {
+  return (a / b, a % b);
+}
+
+fn main(): int64 {
+  var q, r := divmod(17, 5);
+  return 0;
+}
+```
+
+### Ausnahmebehandlung / Exception Handling (v0.5.6 ✅ ABGESCHLOSSEN)
+
+```ebnf
+TryStmt    := 'try' Block 'catch' '(' Ident ':' Type ')' Block ;
+ThrowStmt  := 'throw' Expr ';' ;
+```
+
+```lyx
+fn risky(x: int64): int64 {
+  if (x < 0) { throw -1; }
+  return x * 2;
+}
+
+fn main(): int64 {
+  try {
+    var r: int64 := risky(-5);
+  } catch (e: int64) {
+    PrintStr("caught\n");
+  }
+  return 0;
+}
+```
 
 ### Map und Set (v0.5.0 ✅ ABGESCHLOSSEN)
 
