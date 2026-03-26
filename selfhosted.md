@@ -61,8 +61,8 @@ IPv6-Support, DataFrame, LyxVision etc. kommen erst in Stufe 2.
 | F1 | **`enum` Typen** | `con`-Konstanten (int64) | M | ✅ Implementiert (diese Session) |
 | F2 | **`string` Typ** (dynamisch wachsend) | `pchar` + mmap-Buffer manuell | S | Mittel – aufwändig aber möglich |
 | F3 | **Exception Handling** (try/catch) | `panic()` + Rückkabecode | S | ✅ Implementiert (diese Session) |
-| F4 | **Multi-Return** / Tuple | Out-Parameter (Pointer) | S | Niedrig |
-| F5 | **Generics** (echte) | Spezialisierte Typen pro Datentyp | XL | Niedrig – Workaround reicht |
+| F4 | **Multi-Return** / Tuple | Out-Parameter (Pointer) | S | ✅ Implementiert (diese Session) |
+| F5 | **Generics** (echte) | Spezialisierte Typen pro Datentyp | XL | ✅ Implementiert (diese Session) |
 | F6 | **Pattern Matching** | `switch` + Hilfsvariablen | M | Niedrig |
 
 **Legende:** S=Klein, M=Mittel, L=Groß, XL=Sehr groß

@@ -15,6 +15,7 @@ type
     FCurTok: TToken;
     FHasCur: Boolean;
     FLastParamListVarArgs: Boolean;
+    FCurrentTypeParams: TStringArray; // type params of current generic function
 
     procedure Advance; // setzt FCurTok
     function Check(kind: TTokenKind): Boolean;
@@ -387,10 +388,12 @@ var
   body: TAstBlock;
   arrLen: Integer;
   energyLevel: TEnergyLevel;
+  savedTypeParams: TStringArray;
+  typeParams: TStringArray;
 begin
   // @energy(level) Attribut parsen, falls vorhanden
   energyLevel := ParseEnergyAttr;
-  
+
   // fn
   Expect(tkFn);
   if Check(tkIdent) then
@@ -403,6 +406,26 @@ begin
     name := '<anon>';
     FDiag.Error('expected function name', FCurTok.Span);
   end;
+
+  // Optional generic type params: fn name[T] or fn name[T, U]
+  savedTypeParams := FCurrentTypeParams;
+  SetLength(typeParams, 0);
+  if Check(tkLBracket) then
+  begin
+    Advance; // consume '['
+    if Check(tkIdent) then
+    begin
+      repeat
+        SetLength(typeParams, Length(typeParams) + 1);
+        typeParams[High(typeParams)] := FCurTok.Value;
+        Advance;
+      until not Accept(tkComma);
+    end;
+    Expect(tkRBracket);
+    FCurrentTypeParams := typeParams;
+  end
+  else
+    SetLength(FCurrentTypeParams, 0);
 
   // (
   Expect(tkLParen);
@@ -425,6 +448,9 @@ begin
   Result := TAstFuncDecl.Create(name, params, retType, body, FCurTok.Span, isPub);
   Result.ReturnTypeName := retTypeName;
   Result.EnergyLevel := energyLevel;
+  Result.TypeParams := typeParams;
+  // Restore type params context after parsing the function
+  FCurrentTypeParams := savedTypeParams;
 end;
 
 function TParser.ParseConDecl(isPub: Boolean): TAstConDecl;
@@ -1923,6 +1949,14 @@ var
   nsCandidate: string;
   nsSpan: TSourceSpan;
   widthVal, decimalsVal: Integer;
+  typeArgs: array of TAurumType;
+  dummyLen: Integer;
+  dummyName: string;
+  dummyNull: Boolean;
+  ta: TAurumType;
+  callExpr: TAstCall;
+  peeked: TToken;
+  i: Integer;
 begin
   name := FCurTok.Value;
   span := FCurTok.Span;
@@ -1987,7 +2021,27 @@ begin
       Exit;
     end;
   end;
-  
+
+  // Parse optional generic type args: name[int64] or name[T] before (
+  // Heuristic: only treat [X] as type args if X is a known type name or current type param
+  typeArgs := nil;
+  if Check(tkLBracket) then
+  begin
+    peeked := FLexer.PeekToken;
+    // Only parse as type args if the content looks like a type (identifier = potential type name)
+    if peeked.Kind = tkIdent then
+    begin
+      Advance; // consume '['
+      repeat
+        dummyLen := 0; dummyName := ''; dummyNull := False;
+        ta := ParseTypeExFull(dummyLen, dummyName, dummyNull);
+        SetLength(typeArgs, Length(typeArgs) + 1);
+        typeArgs[High(typeArgs)] := ta;
+      until not Accept(tkComma);
+      Expect(tkRBracket);
+    end;
+  end;
+
   if Accept(tkLParen) then
   begin
     args := nil;
@@ -2030,10 +2084,13 @@ begin
       end;
     end;
     Expect(tkRParen);
-    Result := ParsePostfix(TAstCall.Create(name, args, span));
-    // Set namespace if present
+    callExpr := TAstCall.Create(name, args, span);
     if namespace <> '' then
-      TAstCall(Result).Namespace := namespace;
+      callExpr.Namespace := namespace;
+    // Attach generic type args if parsed
+    if Length(typeArgs) > 0 then
+      callExpr.TypeArgs := typeArgs;
+    Result := ParsePostfix(callExpr);
   end
   else if Accept(tkLBrace) then
   begin

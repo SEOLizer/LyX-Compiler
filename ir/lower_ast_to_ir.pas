@@ -40,6 +40,11 @@ type
     FGlobalVars: TStringList; // global variable name -> TAstVarDecl (as object)
     FExternFuncs: TStringList; // names of extern fn declarations
     FImportedFuncs: TStringList; // names of functions from imported units
+    // Generics: monomorphization support
+    FGenericFuncs: TStringList;          // name -> TAstFuncDecl
+    FGenericSpecializations: TStringList; // mangled name -> already lowered
+    FTypeSubstParams: TStringArray;      // type param names for current specialization
+    FTypeSubstTypes: array of TAurumType; // concrete types for current specialization
 
     function NewTemp: Integer;
     function IsGlobalVar(const name: string): Boolean;
@@ -51,6 +56,10 @@ type
     function GetLocalArrayLen(idx: Integer): Integer;
     function ResolveLocal(const name: string): Integer;
     procedure Emit(instr: TIRInstr);
+
+    function SubstType(t: TAurumType; const n: string): TAurumType;
+    procedure LowerGenericSpecialization(decl: TAstFuncDecl; const mangledName: string;
+      const typeArgs: array of TAurumType);
 
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
@@ -124,6 +133,13 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FImportedFuncs := TStringList.Create;
     FImportedFuncs.Sorted := True;
     FImportedFuncs.Duplicates := dupIgnore;
+    FGenericFuncs := TStringList.Create;
+    FGenericFuncs.Sorted := False;
+    FGenericSpecializations := TStringList.Create;
+    FGenericSpecializations.Sorted := True;
+    FGenericSpecializations.Duplicates := dupIgnore;
+    SetLength(FTypeSubstParams, 0);
+    SetLength(FTypeSubstTypes, 0);
     SetLength(FLocalTypes, 0);
     SetLength(FLocalElemSize, 0);
     SetLength(FLocalIsStruct, 0);
@@ -153,6 +169,9 @@ begin
   FGlobalVars.Free;
   FExternFuncs.Free;
   FImportedFuncs.Free;
+  // Don't free objects in FGenericFuncs — they belong to the AST
+  FGenericFuncs.Free;
+  FGenericSpecializations.Free;
   inherited Destroy;
 end;
 
@@ -399,6 +418,12 @@ begin
        // Skip abstract methods (no body to lower)
        if TAstFuncDecl(node).IsAbstract then
        begin
+         Continue;
+       end;
+       // Store generic functions for monomorphization; skip normal lowering
+       if Length(TAstFuncDecl(node).TypeParams) > 0 then
+       begin
+         FGenericFuncs.AddObject(TAstFuncDecl(node).Name, System.TObject(node));
          Continue;
        end;
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
@@ -948,6 +973,112 @@ begin
     Result := -1;
 end;
 
+// Substitute type param 'n' with its concrete type if a substitution is active
+function TIRLowering.SubstType(t: TAurumType; const n: string): TAurumType;
+var
+  i: Integer;
+begin
+  if (t = atUnresolved) and (n <> '') then
+    for i := 0 to High(FTypeSubstParams) do
+      if FTypeSubstParams[i] = n then
+        Exit(FTypeSubstTypes[i]);
+  Result := t;
+end;
+
+// Monomorphize a generic function: lower its body with type substitution active
+procedure TIRLowering.LowerGenericSpecialization(decl: TAstFuncDecl;
+  const mangledName: string; const typeArgs: array of TAurumType);
+var
+  fn: TIRFunction;
+  j: Integer;
+  savedFunc: TIRFunction;
+  savedDecl: TAstFuncDecl;
+  savedLocalMap: TStringList;
+  savedTempCounter: Integer;
+  savedSubstParams: TStringArray;
+  savedSubstTypes: array of TAurumType;
+  paramType: TAurumType;
+  instr: TIRInstr;
+begin
+  instr := Default(TIRInstr);
+
+  // Mark as already specialized (before lowering, to handle recursion)
+  FGenericSpecializations.Add(mangledName);
+
+  // Save current function context
+  savedFunc := FCurrentFunc;
+  savedDecl := FCurrentFuncDecl;
+  savedLocalMap := TStringList.Create;
+  for j := 0 to FLocalMap.Count - 1 do
+    savedLocalMap.AddObject(FLocalMap[j], FLocalMap.Objects[j]);
+  savedTempCounter := FTempCounter;
+  savedSubstParams := FTypeSubstParams;
+  savedSubstTypes := FTypeSubstTypes;
+
+  try
+    // Install substitution: decl.TypeParams[i] -> typeArgs[i]
+    SetLength(FTypeSubstParams, Length(decl.TypeParams));
+    SetLength(FTypeSubstTypes, Length(decl.TypeParams));
+    for j := 0 to High(decl.TypeParams) do
+    begin
+      FTypeSubstParams[j] := decl.TypeParams[j];
+      if j < Length(typeArgs) then
+        FTypeSubstTypes[j] := typeArgs[j]
+      else
+        FTypeSubstTypes[j] := atInt64; // fallback
+    end;
+
+    // Create new function in module
+    fn := FModule.AddFunction(mangledName);
+    FCurrentFunc := fn;
+    FCurrentFuncDecl := decl;
+    FLocalMap.Clear;
+    for j := 0 to Length(FLocalConst) - 1 do
+      if Assigned(FLocalConst[j]) then
+        FLocalConst[j].Free;
+    SetLength(FLocalConst, 0);
+    FTempCounter := 0;
+
+    // Set up parameters with type substitution applied
+    fn.ParamCount := Length(decl.Params);
+    fn.LocalCount := fn.ParamCount;
+    SetLength(FLocalTypes, fn.LocalCount);
+    SetLength(FLocalConst, fn.LocalCount);
+    for j := 0 to fn.ParamCount - 1 do
+    begin
+      FLocalMap.AddObject(decl.Params[j].Name, IntToObj(j));
+      paramType := SubstType(decl.Params[j].ParamType, decl.Params[j].TypeName);
+      FLocalTypes[j] := paramType;
+      FLocalConst[j] := nil;
+    end;
+
+    // Lower the function body
+    for j := 0 to High(decl.Body.Stmts) do
+      LowerStmt(decl.Body.Stmts[j]);
+
+    // Emit implicit return for void functions
+    if (Length(FCurrentFunc.Instructions) = 0) or
+       (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+    begin
+      instr.Op := irReturn;
+      instr.Src1 := -1;
+      Emit(instr);
+    end;
+
+  finally
+    // Restore parent function context
+    FCurrentFunc := savedFunc;
+    FCurrentFuncDecl := savedDecl;
+    FLocalMap.Clear;
+    for j := 0 to savedLocalMap.Count - 1 do
+      FLocalMap.AddObject(savedLocalMap[j], savedLocalMap.Objects[j]);
+    savedLocalMap.Free;
+    FTempCounter := savedTempCounter;
+    FTypeSubstParams := savedSubstParams;
+    FTypeSubstTypes := savedSubstTypes;
+  end;
+end;
+
 
 function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
   var
@@ -1030,6 +1161,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     // Format expr lowering
     instr2: TIRInstr;
     tWidth, tDecimals: Integer;
+    // Generic call monomorphization
+    mangledName: string;
+    idx: Integer;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -1385,6 +1519,39 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         SetLength(argTemps, argCount);
         for i := 0 to High(call.Args) do
           argTemps[i] := LowerExpr(call.Args[i]);
+
+        // Generic function call: monomorphize on demand
+        if Length(call.TypeArgs) > 0 then
+        begin
+          // Build mangled name: _G_funcname__type1__type2__...
+          mangledName := '_G_' + call.Name;
+          for i := 0 to High(call.TypeArgs) do
+            mangledName := mangledName + '__' + AurumTypeToStr(call.TypeArgs[i]);
+          // Generate specialization if not already done
+          if FGenericSpecializations.IndexOf(mangledName) < 0 then
+          begin
+            idx := FGenericFuncs.IndexOf(call.Name);
+            if idx >= 0 then
+              LowerGenericSpecialization(TAstFuncDecl(FGenericFuncs.Objects[idx]),
+                mangledName, call.TypeArgs)
+            else
+              FDiag.Error('unknown generic function: ' + call.Name, expr.Span);
+          end;
+          // Emit call to specialized version
+          t0 := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op := irCall;
+          instr.Dest := t0;
+          instr.ImmStr := mangledName;
+          instr.ImmInt := argCount;
+          instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
 
         // === In-Situ Data Visualizer (Debugging 2.0) ===
         // Inspect(expr) - gibt formatierte Debug-Ausgabe im Terminal aus
@@ -4079,7 +4246,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       else
       begin
         // scalar local
-       loc := AllocLocal(vd.Name, vd.DeclType);
+       loc := AllocLocal(vd.Name, SubstType(vd.DeclType, vd.DeclTypeName));
        // If initializer is constant integer and the local has narrower signed width, constant fold
        if (vd.InitExpr is TAstIntLit) then
        begin
