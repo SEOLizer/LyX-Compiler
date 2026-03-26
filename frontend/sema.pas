@@ -3125,7 +3125,7 @@ var
   wh: TAstWhile;
   ret: TAstReturn;
   bs: TAstBlock;
-  i: Integer;
+  i, j: Integer;
   s: TSymbol;
   sym: TSymbol;
   fn: TAstFuncDecl;
@@ -3398,6 +3398,13 @@ begin
           cvtype := CheckExpr(caseVal);
           if not IsIntegerType(cvtype) then
             FDiag.Error('case label must be integer', caseVal.Span);
+          // Also check OR pattern extra values
+          for j := 0 to High(sw.Cases[i].ExtraValues) do
+          begin
+            cvtype := CheckExpr(sw.Cases[i].ExtraValues[j]);
+            if not IsIntegerType(cvtype) then
+              FDiag.Error('case label must be integer', sw.Cases[i].ExtraValues[j].Span);
+          end;
           PushScope;
           CheckStmt(sw.Cases[i].Body);
           PopScope;
