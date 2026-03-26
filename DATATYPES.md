@@ -42,17 +42,99 @@
 | Typ     | Beschreibung               | Status | Literale |
 |---------|----------------------------|--------|----------|
 | `char`  | Einzelnes Zeichen (ASCII/Unicode codepoint) | ✅ Full | `'a'`, Escape-Sequenzen |
-| `pchar` | Null-terminierter String   | ✅ Full | `"hello"` |
-| `string`| Alias für `pchar`          | ✅ Full | `"hello"` |
+| `pchar` | Null-terminierter String (statisch, read-only) | ✅ Full | `"hello"` |
+| `string`| Dynamisch wachsender String (mmap-Heap, v0.5.6) | ✅ Full | via `StrNew` |
 
-### 6. Sonstige Typen
+**Dynamische Strings (v0.5.6):** `string`-Werte verwenden einen 16-Byte-Header vor dem Datenpuffer (`[capacity:8][length:8]`). Der zurückgegebene `pchar`-Zeiger zeigt auf die Nutzdaten und ist kompatibel mit `PrintStr`.
+
+**String-Builtins (v0.5.6):**
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `StrNew` | `(cap: int64): string` | Allokiert neuen String mit Kapazität `cap` |
+| `StrFree` | `(s: string)` | Gibt String-Speicher frei (munmap) |
+| `StrLen` | `(s: string): int64` | Länge des Strings (ohne Null-Terminator) |
+| `StrCharAt` | `(s: string, i: int64): int64` | Zeichen an Position `i` als int64 |
+| `StrSetChar` | `(s: string, i: int64, c: int64)` | Setzt Zeichen an Position `i` |
+| `StrAppend` | `(s: string, c: int64): string` | Hängt Zeichen an, gibt neuen Puffer zurück |
+| `StrFromInt` | `(n: int64): string` | Konvertiert int64 zu String |
+
+```lyx
+var s: string := StrNew(64);
+s := StrAppend(s, 72);   // 'H'
+s := StrAppend(s, 105);  // 'i'
+PrintStr(s);             // "Hi"
+StrFree(s);
+```
+
+### 6. Enum-Typen (v0.5.6)
+
+Enums definieren eine benannte Menge von Integer-Konstanten.
+
+```
+EnumDecl  := 'enum' Ident '{' EnumBody '}' ;
+EnumBody  := EnumMember { ',' EnumMember } ;
+EnumMember := Ident [ '=' IntLiteral ] ;
+EnumAccess := Ident '::' Ident ;
+```
+
+| Merkmal | Beschreibung |
+|---------|--------------|
+| Basistyp | `int64` (implizit) |
+| Auto-Nummerierung | Startet bei 0, inkrementiert automatisch |
+| Explizite Werte | `Name = <literal>` erlaubt |
+| Zugriff | `EnumName::Wert` (Namespace-Operator `::`) |
+| Vergleich | Mit `==` / `!=` gegen int64-Werte |
+
+```lyx
+enum Color { Red, Green, Blue }
+enum Status { Ok = 0, Err = 1 }
+
+fn main(): int64 {
+  var c: int64 := Color::Green;   // c = 1
+  if (c == Color::Green) {
+    PrintStr("green\n");
+  }
+  return 0;
+}
+```
+
+### 7. Tuple-Typen (v0.5.6)
+
+Funktionen können mehrere Werte als Tuple zurückgeben.
+
+```
+TupleReturn  := '(' Expr { ',' Expr } ')' ;
+TupleUnpack  := 'var' Ident { ',' Ident } ':=' CallExpr ';' ;
+```
+
+| Merkmal | Beschreibung |
+|---------|--------------|
+| Max. Elemente | Beliebig (aktuell bis 8 getestet) |
+| Speicher | Stack-basiert via RDX/RAX für 2 Werte |
+| Unpack | `var a, b := f()` — gleichzeitige Zuweisung |
+
+```lyx
+fn divmod(a: int64, b: int64): (int64, int64) {
+  return (a / b, a % b);
+}
+
+fn main(): int64 {
+  var q, r := divmod(17, 5);
+  PrintInt(q);   // 3
+  PrintInt(r);   // 2
+  return 0;
+}
+```
+
+### 8. Sonstige Typen
 
 | Typ    | Beschreibung            | Status | Verwendung |
 |--------|-------------------------|--------|------------|
 | `bool` | Wahrheitswert           | ✅ Full | `true`, `false` |
 | `void` | Kein Rückgabewert       | ✅ Full | Funktionen ohne Return |
 
-### 7. Interne Typen
+### 9. Interne Typen
 
 | Typ            | Verwendung                                 |
 |----------------|--------------------------------------------|
@@ -134,18 +216,19 @@ Die aktuellen Änderungen haben folgende Lücken geschlossen und Features hinzug
 ## Roadmap (aktualisiert)
 
 ### Kurzfristig
-1. Vollständige Float‑Codegen (Rounding, ABI‑Returns in XMM) abschließen
-2. Tests für `isize`/`usize` hinzufügen und ABI‑Konformität prüfen
-3. Erweiterte Array‑Codegen (statische Arrays, Layouts)
+1. Tests für `isize`/`usize` hinzufügen und ABI‑Konformität prüfen
+2. Erweiterte Array‑Codegen (statische Arrays, Layouts)
+3. Pattern Matching: `match` auf Strings und Enums erweitern
 
 ### Mittelfristig
 1. Strukturen/Records implementieren (Layout + Feldzugriff)
 2. Pointer‑Arithmetik und dereferenzierung vervollständigen
+3. Generics auf Strukturen ausweiten (aktuell: nur Funktionen)
 
 ### Langfristig
-1. Generics/Templates
-2. Union‑Typen
-3. Smart‑Pointer
+1. Union‑Typen
+2. Smart‑Pointer
+3. Garbage Collector (optional)
 
 ## Beispiele
 

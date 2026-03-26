@@ -4,10 +4,10 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.5.5
+Lyx Compiler v0.5.6
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
-✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64, 
+✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
    macOS x86_64, macOS ARM64, ESP32/Xtensa
 ✅ Architecture Parameter: --arch=x86_64|arm64|xtensa
 ✅ Target Parameter: --target=linux|arm64|win64|macosx64|macos-arm64|esp32
@@ -36,6 +36,12 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ✅ String Concatenation: pchar + pchar via mmap'd buffers (v0.5.5)
 ✅ Float Formatting: PrintFloat(f64) and :width:decimals format specifier (v0.5.5)
+✅ Enum Types: enum keyword with :: member access (v0.5.6)
+✅ Exception Handling: try/catch/throw with nested scopes (v0.5.6)
+✅ Multi-Return / Tuples: return (a, b) and var a, b := f() (v0.5.6)
+✅ Generics: fn max[T](a: T, b: T): T — monomorphization (v0.5.6)
+✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.6)
+✅ Dynamic String Builtins: StrNew/StrFree/StrLen/StrCharAt/StrSetChar/StrAppend/StrFromInt (v0.5.6)
 ```
 
 ---
