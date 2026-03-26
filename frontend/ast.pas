@@ -62,6 +62,7 @@ type
      nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
      nkReturn, nkBreak, nkSwitch,
      nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
+     nkTry, nkThrow,                             // Exception handling
      // Top-Level
      nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkEnumDecl, nkClassDecl, nkInterfaceDecl,
      nkUnitDecl, nkImportDecl,
@@ -651,6 +652,31 @@ type
   TAstReturn = class(TAstStmt)
   private
     FValue: TAstExpr; // kann nil sein (void-Funktionen)
+  public
+    constructor Create(aValue: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Value: TAstExpr read FValue;
+  end;
+
+  { Try-Statement: try { body } catch (e: int64) { handler } }
+  TAstTry = class(TAstStmt)
+  private
+    FTryBody:    TAstStmt;
+    FCatchVar:   string;    // name of the catch variable
+    FCatchBody:  TAstStmt;
+  public
+    constructor Create(aTryBody: TAstStmt; const aCatchVar: string;
+      aCatchBody: TAstStmt; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property TryBody:   TAstStmt read FTryBody;
+    property CatchVar:  string   read FCatchVar;
+    property CatchBody: TAstStmt read FCatchBody;
+  end;
+
+  { Throw-Statement: throw expr; }
+  TAstThrow = class(TAstStmt)
+  private
+    FValue: TAstExpr;
   public
     constructor Create(aValue: TAstExpr; aSpan: TSourceSpan);
     destructor Destroy; override;
@@ -2417,6 +2443,42 @@ begin
   FName     := aName;
   FValues   := aValues;
   FIsPublic := aPublic;
+end;
+
+// ================================================================
+// TAstTry
+// ================================================================
+
+constructor TAstTry.Create(aTryBody: TAstStmt; const aCatchVar: string;
+  aCatchBody: TAstStmt; aSpan: TSourceSpan);
+begin
+  inherited Create(nkTry, aSpan);
+  FTryBody   := aTryBody;
+  FCatchVar  := aCatchVar;
+  FCatchBody := aCatchBody;
+end;
+
+destructor TAstTry.Destroy;
+begin
+  FTryBody.Free;
+  FCatchBody.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstThrow
+// ================================================================
+
+constructor TAstThrow.Create(aValue: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkThrow, aSpan);
+  FValue := aValue;
+end;
+
+destructor TAstThrow.Destroy;
+begin
+  FValue.Free;
+  inherited Destroy;
 end;
 
 // ================================================================
