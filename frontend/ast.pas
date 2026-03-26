@@ -63,7 +63,7 @@ type
      nkReturn, nkBreak, nkSwitch,
      nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
      // Top-Level
-     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkClassDecl, nkInterfaceDecl,
+     nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkEnumDecl, nkClassDecl, nkInterfaceDecl,
      nkUnitDecl, nkImportDecl,
      nkProgram,
      // Bitwise AST nodes
@@ -776,6 +776,26 @@ type
     property InitExpr: TAstExpr read FInitExpr;
     property IsPublic: Boolean read FIsPublic;
     property Storage: TStorageKlass read FStorage;
+  end;
+
+  { Enum-Deklaration: enum Name { VALUE1; VALUE2 := 5; ... }; }
+  TEnumValue = record
+    Name:  string;
+    Value: Int64;
+  end;
+  TEnumValueList = array of TEnumValue;
+
+  TAstEnumDecl = class(TAstNode)
+  private
+    FName:     string;
+    FValues:   TEnumValueList;
+    FIsPublic: Boolean;
+  public
+    constructor Create(const aName: string; const aValues: TEnumValueList;
+      aPublic: Boolean; aSpan: TSourceSpan);
+    property Name:     string         read FName;
+    property Values:   TEnumValueList read FValues;
+    property IsPublic: Boolean        read FIsPublic;
   end;
 
   { Type-Deklaration (Top-Level): type Name = Type; }
@@ -2384,6 +2404,19 @@ destructor TAstConDecl.Destroy;
 begin
   FInitExpr.Free;
   inherited Destroy;
+end;
+
+// ================================================================
+// TAstEnumDecl
+// ================================================================
+
+constructor TAstEnumDecl.Create(const aName: string; const aValues: TEnumValueList;
+  aPublic: Boolean; aSpan: TSourceSpan);
+begin
+  inherited Create(nkEnumDecl, aSpan);
+  FName     := aName;
+  FValues   := aValues;
+  FIsPublic := aPublic;
 end;
 
 // ================================================================

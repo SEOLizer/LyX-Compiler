@@ -15,7 +15,7 @@ type
     tkFn, tkVar, tkLet, tkCo, tkCon,
     tkIf, tkElse, tkWhile, tkReturn,
     tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault,
-    tkUnit, tkImport, tkPublic, tkAs, tkType, tkStruct, tkArray, tkStatic,
+    tkUnit, tkImport, tkPublic, tkAs, tkType, tkEnum, tkStruct, tkArray, tkStatic,
     tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil, tkPool,
     tkTry, tkCatch, tkThrow, tkFinally,
     // OOP Keywords
@@ -135,6 +135,7 @@ begin
     tkPublic:    Result := 'public';
     tkAs:        Result := 'as';
     tkType:      Result := 'type';
+    tkEnum:      Result := 'enum';
     tkStruct:    Result := 'struct';
     tkArray:     Result := 'array';
     tkStatic:    Result := 'static';
@@ -725,6 +726,7 @@ begin
     'pub':     Result := tkPublic;
     'as':      Result := tkAs;
     'type':    Result := tkType;
+    'enum':    Result := tkEnum;
     'struct':  Result := tkStruct;
     'array':   Result := tkArray;
     'static':  Result := tkStatic;
