@@ -1,1 +1,0 @@
-frontend/linter.pas
