@@ -1,76 +1,19 @@
-FPC      = fpc
-FPCFLAGS = -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ -Fubackend/macho/ -Fubackend/xtensa/ -Fubackend/esp32/ -Fubackend/macosx64/ -Fubackend/win_arm64/
-
-# Release-Flags
-RELEASE_FLAGS = -O2
-# Debug-Flags (Range/Overflow/Stack-Checks, Heaptrace)
-DEBUG_FLAGS   = -g -gl -Ci -Cr -Co -gh
-
-# Alle Test-Units (nur existierende .pas Dateien)
-# Ausgeschlossene Tests: test_printf und test_std_examples (Import-Konflikte durch Funktionsüberladung)
-TEST_SOURCES = $(filter-out tests/test_printf.pas tests/test_std_examples.pas,$(wildcard tests/test_*.pas))
-TESTS        = $(TEST_SOURCES:.pas=)
+# Root Makefile — delegates to compiler/Makefile
+# Build output: ./lyxc (at repo root)
 
 .PHONY: build debug test clean e2e
 
 build:
-	@mkdir -p lib
-	$(FPC) $(FPCFLAGS) $(RELEASE_FLAGS) lyxc.lpr -olyxc
+	$(MAKE) -C compiler build
 
 debug:
-	@mkdir -p lib
-	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) lyxc.lpr -olyxc
+	$(MAKE) -C compiler debug
 
-test: $(TESTS)
-	@echo "=== Alle Tests ==="
-	@fail=0; \
-	for t in $(TESTS); do \
-		echo "--- $$t ---"; \
-		./$$t --all --format=plain || fail=1; \
-	done; \
-	if [ $$fail -eq 1 ]; then echo "FEHLER: Einige Tests fehlgeschlagen"; exit 1; fi; \
-	echo "=== Alle Tests bestanden ==="
+test:
+	$(MAKE) -C compiler test
 
-.PHONY: syntax-test
-syntax-test:
-	@echo "=== Syntax Grammar Tests ==="
-	@tests/syntax/test_grammar.sh
-
-tests/test_%: tests/test_%.pas
-	@mkdir -p lib
-	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) $< -o$@
-
-# Integration test for std library (non-FPCUnit)
-tests/test_std_examples: tests/test_std_examples.pas
-	@mkdir -p lib
-	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) $< -o$@
-
-# End-to-end smoke tests for examples
-e2e: build
-	@echo "=== E2E: hello.au ==="
-	@./lyxc examples/hello.lyx -o /tmp/hello || exit 1
-	@/tmp/hello || exit 1
-	@echo "=== E2E: print_int.au ==="
-	@./lyxc tests/lyx/printf/print_int.lyx -o /tmp/print_int || exit 1
-	@/tmp/print_int || exit 1
-	@echo "=== E2E: crt ANSI demo ==="
-	@./lyxc tests/lyx/crt/test_crt_ansi.lyx -o /tmp/test_crt_ansi || exit 1
-	@/tmp/test_crt_ansi || exit 1
-	@echo "=== E2E: println/printf demo ==="
-	@./lyxc tests/lyx/printf/test_println.lyx -o /tmp/test_println || exit 1
-	@/tmp/test_println || exit 1
-	@echo "=== E2E: crt Raw demo (optional) ==="
-	@if [ -n "$$CRT_RAW" ]; then \
-		echo "=== E2E: crt raw demo ==="; \
-		./lyxc tests/lyx/crt/test_crt_raw.lyx -o /tmp/test_crt_raw || exit 1; \
-		/tmp/test_crt_raw || exit 1; \
-	fi
-	@echo "=== E2E passed ==="
+e2e:
+	$(MAKE) -C compiler e2e
 
 clean:
-	rm -f lyxc
-	rm -f lib/*.ppu lib/*.o
-	rm -f tests/test_bytes tests/test_diag tests/test_lexer tests/test_parser
-	rm -f tests/test_sema tests/test_ir tests/test_elf tests/test_codegen
-	rm -f tests/*.ppu tests/*.o
-	rm -f *.ppu *.o
+	$(MAKE) -C compiler clean
