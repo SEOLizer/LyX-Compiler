@@ -31,7 +31,8 @@ type
     atMap,            // hash map type
     atSet,            // hash set type
     atParallelArray,  // SIMD parallel array
-    atFnPtr           // function pointer type
+    atFnPtr,          // function pointer type
+    atTuple           // multi-return tuple: (T1, T2, ...)
   );
 
   { --- Speicherklassen --- }
@@ -52,7 +53,7 @@ type
       // Ausdrücke
       nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit, nkIdent,
       nkConstrainedTypeDecl,
-     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit,
+     nkBinOp, nkUnaryOp, nkCall, nkArrayLit, nkStructLit, nkTupleLit,
      nkFieldAccess, nkIndexAccess, nkCast,
      nkNewExpr, nkSuperCall, nkPanic,  // OOP expressions + panic
      nkMapLit, nkSetLit, nkInExpr,     // Map/Set expressions
@@ -63,6 +64,7 @@ type
      nkReturn, nkBreak, nkSwitch,
      nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
      nkTry, nkThrow,                             // Exception handling
+     nkTupleVarDecl,                             // var a, b := tupleExpr
      // Top-Level
      nkFuncDecl, nkConDecl, nkTypeDecl, nkStructDecl, nkEnumDecl, nkClassDecl, nkInterfaceDecl,
      nkUnitDecl, nkImportDecl,
@@ -686,6 +688,28 @@ type
     property Value: TAstExpr read FValue;
   end;
 
+  { Tuple literal: (expr1, expr2) — multi-return value }
+  TAstTupleLit = class(TAstExpr)
+  private
+    FElems: TAstExprList;
+  public
+    constructor Create(const aElems: TAstExprList; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Elems: TAstExprList read FElems;
+  end;
+
+  { Tuple var decl: var name1, name2 := expr — destructuring multi-return }
+  TAstTupleVarDecl = class(TAstStmt)
+  private
+    FNames:    TStringArray;
+    FInitExpr: TAstExpr;
+  public
+    constructor Create(const aNames: TStringArray; aInit: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Names:    TStringArray read FNames;
+    property InitExpr: TAstExpr    read FInitExpr;
+  end;
+
   // Block: { stmt1; stmt2; ... }
   TAstBlock = class(TAstStmt)
   private
@@ -787,8 +811,8 @@ type
     procedure AddCapturedVar(const aName: string; aType: TAurumType; aOuterSlot: Integer);
     function HasCapturedVar(const aName: string): Boolean;
   public
-    // Generic type parameters, e.g., ['T'] for fn max[T](...)
-    TypeParams: TStringArray;
+    // Tuple return element types (populated when ReturnType = atTuple)
+    TupleReturnTypes: array of TAurumType;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
@@ -1160,6 +1184,7 @@ begin
     atMap:         Result := 'Map';
     atSet:         Result := 'Set';
     atFnPtr:       Result := 'fn';  // Treat as int64 internally for now
+    atTuple:       Result := 'tuple';
   else
     Result := '<unknown>';
   end;
@@ -2484,6 +2509,40 @@ end;
 destructor TAstThrow.Destroy;
 begin
   FValue.Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstTupleLit
+// ================================================================
+
+constructor TAstTupleLit.Create(const aElems: TAstExprList; aSpan: TSourceSpan);
+begin
+  inherited Create(nkTupleLit, aSpan);
+  FElems := aElems;
+end;
+
+destructor TAstTupleLit.Destroy;
+var i: Integer;
+begin
+  for i := 0 to High(FElems) do FElems[i].Free;
+  inherited Destroy;
+end;
+
+// ================================================================
+// TAstTupleVarDecl
+// ================================================================
+
+constructor TAstTupleVarDecl.Create(const aNames: TStringArray; aInit: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkTupleVarDecl, aSpan);
+  FNames    := aNames;
+  FInitExpr := aInit;
+end;
+
+destructor TAstTupleVarDecl.Destroy;
+begin
+  FInitExpr.Free;
   inherited Destroy;
 end;
 

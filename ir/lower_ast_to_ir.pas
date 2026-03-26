@@ -4759,6 +4759,37 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           end;
         end;
 
+        // Check if returning a tuple literal: return (a, b)
+        if (TAstReturn(stmt).Value is TAstTupleLit) then
+        begin
+          // Allocate two consecutive slots in reverse order so irReturnStruct works:
+          //   irReturnStruct(Src1=loc_b): RAX←slot[loc_b+1]=loc_a, RDX←slot[loc_b]=loc_b
+          loc := AllocLocal('_retb_' + IntToStr(FLabelCounter), atInt64);  // slot N
+          AllocLocal('_reta_' + IntToStr(FLabelCounter), atInt64);          // slot N+1
+          Inc(FLabelCounter);
+          // lower first element → store into slot N+1 (loc+1)
+          t0 := LowerExpr(TAstTupleLit(TAstReturn(stmt).Value).Elems[0]);
+          instr := Default(TIRInstr);
+          instr.Op := irStoreLocal;
+          instr.Dest := loc + 1;
+          instr.Src1 := t0;
+          Emit(instr);
+          // lower second element → store into slot N (loc)
+          tmp := LowerExpr(TAstTupleLit(TAstReturn(stmt).Value).Elems[1]);
+          instr := Default(TIRInstr);
+          instr.Op := irStoreLocal;
+          instr.Dest := loc;
+          instr.Src1 := tmp;
+          Emit(instr);
+          // emit irReturnStruct with base=loc, size=16
+          instr := Default(TIRInstr);
+          instr.Op := irReturnStruct;
+          instr.Src1 := loc;
+          instr.StructSize := 16;
+          Emit(instr);
+          Exit(True);
+        end;
+
         // Check if returning a struct literal (e.g. return Pair { a: x, b: y })
         if (TAstReturn(stmt).Value is TAstStructLit) then
         begin
@@ -5009,6 +5040,38 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       instr.Op := irThrow;
       instr.Src1 := t0;
       Emit(instr);
+      Exit(True);
+    end;
+
+    // var a, b := f() — tuple multi-return destructuring
+    if stmt is TAstTupleVarDecl then
+    begin
+      with TAstTupleVarDecl(stmt) do
+      begin
+        if (Length(Names) = 2) and (InitExpr is TAstCall) then
+        begin
+          call := TAstCall(InitExpr);
+          argCount := Length(call.Args);
+          SetLength(argTemps, argCount);
+          for i := 0 to High(call.Args) do
+            argTemps[i] := LowerExpr(call.Args[i]);
+          // irCallStruct stores RAX→slot[b+1]=a, RDX→slot[b]=b
+          // allocate b first (lower slot index = higher address), then a
+          loc := AllocLocal(Names[1], atInt64); // slot N   → RDX (second return)
+          AllocLocal(Names[0], atInt64);        // slot N+1 → RAX (first return)
+          instr := Default(TIRInstr);
+          instr.Op := irCallStruct;
+          instr.Dest := loc;  // base: RAX→loc+1, RDX→loc
+          instr.ImmStr := call.Name;
+          instr.ImmInt := argCount;
+          instr.StructSize := 16;
+          instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+        end;
+      end;
       Exit(True);
     end;
 

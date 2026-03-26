@@ -36,10 +36,11 @@ type
 
     function ParseBlock: TAstBlock;
     function ParseStmt: TAstStmt;
-    function ParseVarLetCoDecl: TAstVarDecl;
+    function ParseVarLetCoDecl: TAstStmt;
     function ParseForStmt: TAstFor;
     function ParseRepeatUntilStmt: TAstRepeatUntil;
     function ParseTryStmt: TAstTry;
+    function ParseTupleVarDecl(const firstName: string; aSpan: TSourceSpan): TAstTupleVarDecl;
     function ParseAssignStmtOrExprStmt: TAstStmt;
 
     // Expressions (Präzedenz): Pipe -> NullCoalesce -> Or -> And
@@ -388,8 +389,11 @@ var
   body: TAstBlock;
   arrLen: Integer;
   energyLevel: TEnergyLevel;
-  savedTypeParams: TStringArray;
-  typeParams: TStringArray;
+  tupleElem: TAurumType;
+  tupleTypes: array of TAurumType;
+  dummyLen: Integer;
+  dummyName: string;
+  dummyNull: Boolean;
 begin
   // @energy(level) Attribut parsen, falls vorhanden
   energyLevel := ParseEnergyAttr;
@@ -435,11 +439,25 @@ begin
     params := nil;
   Expect(tkRParen);
 
-  // optional : RetType
+  // optional : RetType  (handles plain types and tuple '(T1, T2)')
   retTypeName := '';
+  tupleTypes := nil;
   if Accept(tkColon) then
   begin
-    retType := ParseTypeEx(arrLen, retTypeName);
+    if Check(tkLParen) then
+    begin
+      // Tuple return type: (T1, T2, ...)
+      Advance; // consume '('
+      retType := atTuple;
+      repeat
+        tupleElem := ParseTypeExFull(dummyLen, dummyName, dummyNull);
+        SetLength(tupleTypes, Length(tupleTypes) + 1);
+        tupleTypes[High(tupleTypes)] := tupleElem;
+      until not Accept(tkComma);
+      Expect(tkRParen);
+    end
+    else
+      retType := ParseTypeEx(arrLen, retTypeName);
   end
   else
     retType := atVoid; // default
@@ -448,9 +466,7 @@ begin
   Result := TAstFuncDecl.Create(name, params, retType, body, FCurTok.Span, isPub);
   Result.ReturnTypeName := retTypeName;
   Result.EnergyLevel := energyLevel;
-  Result.TypeParams := typeParams;
-  // Restore type params context after parsing the function
-  FCurrentTypeParams := savedTypeParams;
+  Result.TupleReturnTypes := tupleTypes;
 end;
 
 function TParser.ParseConDecl(isPub: Boolean): TAstConDecl;
@@ -1123,7 +1139,7 @@ begin
   Exit(ParseAssignStmtOrExprStmt);
 end;
 
-function TParser.ParseVarLetCoDecl: TAstVarDecl;
+function TParser.ParseVarLetCoDecl: TAstStmt;
 var
   storage: TStorageKlass;
   name: string;
@@ -1133,6 +1149,7 @@ var
   arrayLen: Integer;
   isNullable: Boolean;
   span: TSourceSpan;
+  tupleNames: TStringArray;
 begin
   span := FCurTok.Span;
   if Accept(tkVar) then storage := skVar
@@ -1149,6 +1166,28 @@ begin
     name := '<anon>'; FDiag.Error('expected identifier in declaration', FCurTok.Span);
   end;
 
+  // Tuple destructuring: var name1, name2, ... := expr
+  if Check(tkComma) then
+  begin
+    SetLength(tupleNames, 1);
+    tupleNames[0] := name;
+    while Accept(tkComma) do
+    begin
+      if Check(tkIdent) then
+      begin
+        SetLength(tupleNames, Length(tupleNames) + 1);
+        tupleNames[High(tupleNames)] := FCurTok.Value;
+        Advance;
+      end
+      else
+        FDiag.Error('expected identifier after comma in tuple declaration', FCurTok.Span);
+    end;
+    Expect(tkAssign);
+    initExpr := ParseExpr;
+    Expect(tkSemicolon);
+    Exit(TAstTupleVarDecl.Create(tupleNames, initExpr, span));
+  end;
+
   Expect(tkColon);
   declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
@@ -1163,6 +1202,12 @@ begin
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span)
   else
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
+end;
+
+function TParser.ParseTupleVarDecl(const firstName: string; aSpan: TSourceSpan): TAstTupleVarDecl;
+begin
+  // Not called directly; tuple detection happens in ParseVarLetCoDecl
+  Result := nil;
 end;
 
 function TParser.ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
@@ -1921,7 +1966,21 @@ begin
 
   if Accept(tkLParen) then
   begin
+    span := FCurTok.Span;
     e := ParseExpr;
+    if Accept(tkComma) then
+    begin
+      // Tuple literal: (expr1, expr2, ...)
+      items := nil;
+      SetLength(items, 1);
+      items[0] := e;
+      repeat
+        SetLength(items, Length(items) + 1);
+        items[High(items)] := ParseExpr;
+      until not Accept(tkComma);
+      Expect(tkRParen);
+      Exit(TAstTupleLit.Create(items, span));
+    end;
     Expect(tkRParen);
     Exit(ParsePostfix(e));
   end;
