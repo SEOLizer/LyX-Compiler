@@ -27,6 +27,7 @@ type
     function ParseTopDecl: TAstNode;
     function ParseFuncDecl(isPub: Boolean): TAstFuncDecl;
     function ParseConDecl(isPub: Boolean): TAstConDecl;
+    function ParseEnumDecl(isPub: Boolean): TAstEnumDecl;
     function ParseTypeDecl(isPub: Boolean): TAstNode;
     function ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
     function ParseUnitDecl: TAstUnitDecl;
@@ -284,11 +285,13 @@ begin
       Exit(ParseConDecl(True))
     else if Check(tkType) then
       Exit(ParseTypeDecl(True))
+    else if Check(tkEnum) then
+      Exit(ParseEnumDecl(True))
     else if Check(tkVar) or Check(tkLet) then
       Exit(ParseGlobalVarDecl(True))
     else
     begin
-      FDiag.Error('expected fn, con, type, var or let after pub', FCurTok.Span);
+      FDiag.Error('expected fn, con, type, enum, var or let after pub', FCurTok.Span);
       Exit(nil);
     end;
   end;
@@ -362,6 +365,8 @@ begin
   end;
   if Check(tkCon) then
     Exit(ParseConDecl(False));
+  if Check(tkEnum) then
+    Exit(ParseEnumDecl(False));
   if Check(tkType) then
     Exit(ParseTypeDecl(False));
   // Global variables: var/let at top-level
@@ -444,6 +449,69 @@ begin
   initExpr := ParseExpr; // ConstExpr restriction checked in sema
   Expect(tkSemicolon);
   Result := TAstConDecl.Create(name, declType, initExpr, FCurTok.Span, isPub, skCo);
+end;
+
+function TParser.ParseEnumDecl(isPub: Boolean): TAstEnumDecl;
+// Syntax:
+//   [pub] enum Name {
+//     VALUE1;           // auto-value: 0, 1, 2, ...
+//     VALUE2 := expr;   // explicit value
+//   };
+var
+  ename:    string;
+  values:   TEnumValueList;
+  valName:  string;
+  nextVal:  Int64;
+  initExpr: TAstExpr;
+  span:     TSourceSpan;
+begin
+  span := FCurTok.Span;
+  Expect(tkEnum);
+  if Check(tkIdent) then
+  begin
+    ename := FCurTok.Value;
+    Advance;
+  end
+  else
+  begin
+    ename := '<anon>';
+    FDiag.Error('expected enum name', FCurTok.Span);
+  end;
+  Expect(tkLBrace);
+  SetLength(values, 0);
+  nextVal := 0;
+  while not Check(tkRBrace) and not Check(tkEOF) do
+  begin
+    if not Check(tkIdent) then
+    begin
+      FDiag.Error('expected enum value name', FCurTok.Span);
+      Break;
+    end;
+    valName := FCurTok.Value;
+    Advance;
+    if Accept(tkAssign) then
+    begin
+      initExpr := ParseExpr;
+      if initExpr is TAstIntLit then
+      begin
+        nextVal := TAstIntLit(initExpr).Value;
+        initExpr.Free;
+      end
+      else
+      begin
+        FDiag.Error('enum value must be an integer literal', initExpr.Span);
+        initExpr.Free;
+      end;
+    end;
+    SetLength(values, Length(values) + 1);
+    values[High(values)].Name  := valName;
+    values[High(values)].Value := nextVal;
+    Inc(nextVal);
+    Expect(tkSemicolon);
+  end;
+  Expect(tkRBrace);
+  Expect(tkSemicolon);
+  Result := TAstEnumDecl.Create(ename, values, isPub, span);
 end;
 
 function TParser.ParseTypeDecl(isPub: Boolean): TAstNode;
