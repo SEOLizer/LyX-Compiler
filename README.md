@@ -46,6 +46,80 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ---
 
+## Repository-Struktur
+
+```
+lyx-lang/                        # Repo-Root
+├── compiler/                    # FPC-basierter Lyx-Compiler (lyxc)
+│   ├── lyxc.lpr                 # Hauptprogramm (Einstiegspunkt)
+│   ├── Makefile                 # Build-Regeln (Output: ../lyxc)
+│   ├── frontend/                # Lexer, Parser, AST, Sema, Builtins
+│   ├── backend/                 # Code-Generierung pro Plattform
+│   │   ├── x86_64/              #   x86-64 Linux/Windows
+│   │   ├── arm64/               #   ARM64 Linux
+│   │   ├── elf/                 #   ELF64 Writer (Linux)
+│   │   ├── pe/                  #   PE64 Writer (Windows)
+│   │   ├── macho/               #   Mach-O Writer (macOS)
+│   │   ├── macosx64/            #   macOS x86-64 Emitter
+│   │   ├── win_arm64/           #   Windows ARM64
+│   │   ├── esp32/               #   ESP32/Xtensa
+│   │   └── xtensa/              #   Xtensa Emitter
+│   ├── ir/                      # IR-Definitionen, Lowering, Optimierung
+│   └── util/                    # Hilfsfunktionen (bytes, diag)
+│
+├── bootstrap/                   # Lyx-in-Lyx (WP-05..WP-09, in Arbeit)
+│   ├── lexer.lyx                # Tokenizer in Lyx
+│   ├── parser.lyx               # Parser in Lyx
+│   ├── codegen.lyx              # Code-Generator in Lyx
+│   └── lyxc_mini.lyx            # Mini-Compiler-Einstiegspunkt
+│
+├── std/                         # Standardbibliothek (Lyx-Code)
+│   ├── math.lyx, io.lyx, ...    # Basis-Module
+│   ├── net/                     # Netzwerk-Protokolle (14+)
+│   └── validate/, math/, ...    # Weitere Module
+│
+├── tests/
+│   ├── regression/              # Kern-Tests — müssen von beiden Compilern bestanden werden
+│   │   ├── basic/               #   Grundlegende Sprachkonstrukte
+│   │   ├── arrays/, control/    #   Arrays, Schleifen, Bedingungen
+│   │   ├── oop/, structs/       #   OOP, Klassen, VMT
+│   │   ├── strings/, math/      #   Strings, Math-Builtins
+│   │   └── ...                  #   (25+ Kategorien)
+│   └── feature_checks/          # Feature-Tests für neue Sprachfeatures
+│       ├── generics/            #   fn max[T](...) — Monomorphisierung
+│       ├── pattern_matching/    #   match/case/| — Pattern Matching
+│       ├── tuples/              #   return (a, b), var a, b := f()
+│       ├── enums/               #   enum Color { Red, Green, Blue }
+│       └── exceptions/          #   try/catch/throw
+│
+├── scripts/                     # Build- und Bootstrap-Skripte
+├── examples/                    # Lyx-Beispielprogramme
+│
+├── Makefile                     # Root-Wrapper (delegiert an compiler/Makefile)
+├── README.md                    # Diese Datei
+├── CHANGELOG.md                 # Versionshistorie
+├── selfhosted.md                # Selfhosting-Roadmap (WP-01..WP-09)
+└── ebnf.md / DATATYPES.md       # Sprachspezifikation
+```
+
+### Bauen
+
+```bash
+# Aus dem Repo-Root (empfohlen):
+make build          # erzeugt ./lyxc
+
+# Direkt aus dem Compiler-Verzeichnis:
+cd compiler && make build
+
+# Debug-Build:
+make debug          # erzeugt ./lyxc_debug
+
+# End-to-End Tests:
+make e2e
+```
+
+---
+
 ## Network Library (std.net)
 
 Lyx includes a comprehensive network library with **14 protocol implementations**, all written in pure Lyx (no external dependencies except for TLS, SSH, and HTTPS which use system libraries via FFI).
