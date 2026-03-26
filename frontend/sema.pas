@@ -28,6 +28,8 @@ type
     IsImported: Boolean; // true for functions imported from another unit
     // for global variables
     IsGlobal: Boolean; // true if this is a global variable
+    // Generic function type parameters, e.g., ['T'] for fn max[T](...)
+    GenericTypeParams: TStringArray;
     constructor Create(const AName: string);
     destructor Destroy; override;
   end;
@@ -1837,7 +1839,7 @@ var
   call: TAstCall;
   s: TSymbol;
   sSym: TSymbol;
-  i, fi, baseIdx, fldOffset, idx, symLvl: Integer;
+  i, j, fi, baseIdx, fldOffset, idx, symLvl: Integer;
   lt, rt, ot, atype, srcType: TAurumType;
   qualifier: string;
   identName: string;
@@ -2757,7 +2759,23 @@ begin
               end;
             end;
           end;
-          Result := s.DeclType;
+          // For generic functions with TypeArgs, resolve the return type via substitution
+          if (Length(call.TypeArgs) > 0) and (Length(s.GenericTypeParams) > 0) and
+             (s.DeclType = atUnresolved) and (s.ReturnTypeName <> '') then
+          begin
+            // Find which type param corresponds to the return type name
+            for j := 0 to High(s.GenericTypeParams) do
+              if s.GenericTypeParams[j] = s.ReturnTypeName then
+              begin
+                if j < Length(call.TypeArgs) then
+                begin
+                  Result := call.TypeArgs[j];
+                  Break;
+                end;
+              end;
+          end
+          else
+            Result := s.DeclType;
         end;
       end;
     nkNewExpr:
@@ -4820,6 +4838,8 @@ begin
        SetLength(sym.ParamTypes, sym.ParamCount);
        for j := 0 to sym.ParamCount - 1 do
          sym.ParamTypes[j] := fn.Params[j].ParamType;
+       // Store generic type params for monomorphization
+       sym.GenericTypeParams := fn.TypeParams;
        AddSymbolToCurrent(sym, fn.Span);
      end
      else if node is TAstStructDecl then
@@ -5055,6 +5075,9 @@ begin
     if node is TAstFuncDecl then
     begin
       fn := TAstFuncDecl(node);
+      // Skip body checking for generic functions — bodies are checked at monomorphization time
+      if Length(fn.TypeParams) > 0 then
+        Continue;
       // enter function scope
       PushScope;
       // declare parameters as vars in local scope

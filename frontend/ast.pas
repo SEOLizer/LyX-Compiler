@@ -226,6 +226,9 @@ type
     property Args: TAstExprList read FArgs;
     property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
     property IsIndirectCall: Boolean read FIsIndirectCall write FIsIndirectCall;
+  public
+    // Generic type arguments for monomorphization, e.g., [atInt64] for max[int64](...)
+    TypeArgs: array of TAurumType;
   end;
 
   { Array-Literal: [expr, expr, ...] }
@@ -783,6 +786,9 @@ type
     property NeedsStaticLink: Boolean read FNeedsStaticLink write FNeedsStaticLink;
     procedure AddCapturedVar(const aName: string; aType: TAurumType; aOuterSlot: Integer);
     function HasCapturedVar(const aName: string): Boolean;
+  public
+    // Generic type parameters, e.g., ['T'] for fn max[T](...)
+    TypeParams: TStringArray;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
