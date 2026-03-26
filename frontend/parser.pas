@@ -38,6 +38,7 @@ type
     function ParseVarLetCoDecl: TAstVarDecl;
     function ParseForStmt: TAstFor;
     function ParseRepeatUntilStmt: TAstRepeatUntil;
+    function ParseTryStmt: TAstTry;
     function ParseAssignStmtOrExprStmt: TAstStmt;
 
     // Expressions (Präzedenz): Pipe -> NullCoalesce -> Or -> And
@@ -1076,6 +1077,19 @@ begin
     Exit(TAstAssert.Create(cond, valExpr, FCurTok.Span));
   end;
 
+  // try { body } catch (e: int64) { handler }
+  if Check(tkTry) then
+    Exit(ParseTryStmt);
+
+  // throw expr;
+  if Check(tkThrow) then
+  begin
+    Advance; // consume 'throw'
+    vExpr := ParseExpr;
+    Expect(tkSemicolon);
+    Exit(TAstThrow.Create(vExpr, vExpr.Span));
+  end;
+
   if Check(tkLBrace) then
     Exit(ParseBlock);
 
@@ -1222,6 +1236,41 @@ begin
   cond := ParseExpr;
   Expect(tkSemicolon);
   Result := TAstRepeatUntil.Create(bodyBlock, cond, span);
+end;
+
+function TParser.ParseTryStmt: TAstTry;
+// try { body } catch (varName: int64) { handler }
+var
+  tryBody:    TAstStmt;
+  catchVar:   string;
+  catchBody:  TAstStmt;
+  span:       TSourceSpan;
+  dummyLen:   Integer;
+  dummyName:  string;
+  dummyNull:  Boolean;
+begin
+  span := FCurTok.Span;
+  Expect(tkTry);
+  tryBody := ParseBlock;
+  Expect(tkCatch);
+  Expect(tkLParen);
+  // catch variable name
+  if Check(tkIdent) then
+  begin
+    catchVar := FCurTok.Value;
+    Advance;
+  end
+  else
+  begin
+    catchVar := '_e';
+    FDiag.Error('expected identifier in catch clause', FCurTok.Span);
+  end;
+  // type annotation (: int64) — consume but ignore
+  if Accept(tkColon) then
+    ParseTypeExFull(dummyLen, dummyName, dummyNull);
+  Expect(tkRParen);
+  catchBody := ParseBlock;
+  Result := TAstTry.Create(tryBody, catchVar, catchBody, span);
 end;
 
 function TParser.ParseAssignStmtOrExprStmt: TAstStmt;

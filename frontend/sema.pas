@@ -3457,6 +3457,31 @@ begin
           FFuncScopeDepth := savedScopeDepth;
         end;
       end;
+    nkTry:
+      begin
+        // try { body } catch (e: int64) { handler }
+        with TAstTry(stmt) do
+        begin
+          PushScope;
+          CheckStmt(TryBody);
+          PopScope;
+          // introduce catch variable as int64
+          PushScope;
+          sym := TSymbol.Create(CatchVar);
+          sym.Kind := symVar;
+          sym.DeclType := atInt64;
+          AddSymbolToCurrent(sym, stmt.Span);
+          CheckStmt(CatchBody);
+          PopScope;
+        end;
+      end;
+    nkThrow:
+      begin
+        // throw expr; — expr must be int64
+        vtype := CheckExpr(TAstThrow(stmt).Value);
+        if not IsIntegerType(vtype) then
+          FDiag.Error('throw expression must be integer', TAstThrow(stmt).Value.Span);
+      end;
     else
       FDiag.Error('sema: unsupported statement kind', stmt.Span);
   end;
