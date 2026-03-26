@@ -61,7 +61,7 @@ type
     function ParsePrimary: TAstExpr;
     function ParseCallOrIdent: TAstExpr;
     function ParsePostfix(base: TAstExpr): TAstExpr;
-
+    function IsKnownTypeIdent(const s: string): Boolean;
 
     function ParseTypeEx(out arrayLen: Integer; out typeName: string): TAurumType;
     function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
@@ -394,6 +394,8 @@ var
   dummyLen: Integer;
   dummyName: string;
   dummyNull: Boolean;
+  savedTypeParams: TStringArray;
+  typeParams: TStringArray;
 begin
   // @energy(level) Attribut parsen, falls vorhanden
   energyLevel := ParseEnergyAttr;
@@ -467,6 +469,9 @@ begin
   Result.ReturnTypeName := retTypeName;
   Result.EnergyLevel := energyLevel;
   Result.TupleReturnTypes := tupleTypes;
+  Result.TypeParams := typeParams;
+  // Restore type params context after parsing the function
+  FCurrentTypeParams := savedTypeParams;
 end;
 
 function TParser.ParseConDecl(isPub: Boolean): TAstConDecl;
@@ -1993,6 +1998,20 @@ begin
   Result := dummy;
 end;
 
+// Returns true if 's' is a known primitive type name or a declared generic type param.
+// Used to disambiguate name[T](...) (generic call) from arr[i] (array subscript).
+function TParser.IsKnownTypeIdent(const s: string): Boolean;
+var
+  k: Integer;
+begin
+  if StrToAurumType(s) <> atUnresolved then
+    Exit(True);
+  for k := 0 to High(FCurrentTypeParams) do
+    if FCurrentTypeParams[k] = s then
+      Exit(True);
+  Result := False;
+end;
+
 function TParser.ParseCallOrIdent: TAstExpr;
 var
   name: string;
@@ -2087,8 +2106,9 @@ begin
   if Check(tkLBracket) then
   begin
     peeked := FLexer.PeekToken;
-    // Only parse as type args if the content looks like a type (identifier = potential type name)
-    if peeked.Kind = tkIdent then
+    // Only parse as type args if the identifier is a known primitive type or a generic type param.
+    // This avoids misparsiing arr[i] (array subscript) as generic type args.
+    if (peeked.Kind = tkIdent) and IsKnownTypeIdent(peeked.Value) then
     begin
       Advance; // consume '['
       repeat

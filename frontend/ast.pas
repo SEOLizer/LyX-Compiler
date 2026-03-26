@@ -813,6 +813,8 @@ type
   public
     // Tuple return element types (populated when ReturnType = atTuple)
     TupleReturnTypes: array of TAurumType;
+    // Generic type parameters, e.g., ['T'] for fn max[T](...)
+    TypeParams: TStringArray;
   end;
 
   { Con-Deklaration (Top-Level): con NAME: type := constExpr; }
