@@ -718,6 +718,8 @@ var
     VarIndex: Integer;
     CodePos: Integer;
   end;
+  // Exception globals tracking (varIdx in globalVarNames, -1 = not registered)
+  excValueIdx, excDepthIdx, excJmpbufsIdx: Integer;
 begin
   globalVarNames := TStringList.Create;
   try
@@ -730,6 +732,9 @@ begin
   for i := 0 to High(module.GlobalVars) do
     globalVarNames.Add(module.GlobalVars[i].Name);
   totalDataOffset := 0;
+  excValueIdx := -1;
+  excDepthIdx := -1;
+  excJmpbufsIdx := -1;
   
   // _start Label registrieren (Einstiegspunkt)
   SetLength(FLabelPositions, Length(FLabelPositions) + 1);
@@ -4473,9 +4478,206 @@ begin
               end;
             end;
 
+        irPushHandler:
+          begin
+            // Inline setjmp: save CPU state to jmpbufs[depth], increment depth,
+            // fall through to try body; branch to catch label on longjmp return.
+            // Register exception globals if not yet done
+            if excDepthIdx < 0 then
+            begin
+              // _lyx_exc_value (8 bytes)
+              excValueIdx := globalVarNames.Count;
+              globalVarNames.Add('_lyx_exc_value');
+              SetLength(globalVarOffsets, excValueIdx + 1);
+              globalVarOffsets[excValueIdx] := 0; // finalized at patching time
+              // _lyx_exc_depth (8 bytes)
+              excDepthIdx := globalVarNames.Count;
+              globalVarNames.Add('_lyx_exc_depth');
+              SetLength(globalVarOffsets, excDepthIdx + 1);
+              globalVarOffsets[excDepthIdx] := 0;
+              // _lyx_exc_jmpbufs (16 × 64 = 1024 bytes)
+              excJmpbufsIdx := globalVarNames.Count;
+              globalVarNames.Add('_lyx_exc_jmpbufs');
+              SetLength(globalVarOffsets, excJmpbufsIdx + 1);
+              globalVarOffsets[excJmpbufsIdx] := 0;
+            end;
+
+            // --- Emit inline setjmp sequence ---
+            // lea rcx, [rip + _lyx_exc_depth]  (48 8D 0D <disp32>)
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+            SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excDepthIdx;
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+            // mov rax, [rcx]   (48 8B 01)
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
+            // imul rax, rax, 64  (48 6B C0 40)
+            EmitU8(FCode, $48); EmitU8(FCode, $6B); EmitU8(FCode, $C0); EmitU8(FCode, $40);
+            // lea rdx, [rip + _lyx_exc_jmpbufs]  (48 8D 15 <disp32>)
+            leaPos := FCode.Size;
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $15); EmitU32(FCode, 0);
+            SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excJmpbufsIdx;
+            FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+            // add rdx, rax  (48 01 C2)
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C2);
+            // Save callee-saved registers + rsp into jmpbuf at [rdx]
+            // mov [rdx+0],  rbx  (48 89 1A)
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $1A);
+            // mov [rdx+8],  rbp  (48 89 6A 08)
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $6A); EmitU8(FCode, $08);
+            // mov [rdx+16], r12  (4C 89 62 10)
+            EmitU8(FCode, $4C); EmitU8(FCode, $89); EmitU8(FCode, $62); EmitU8(FCode, $10);
+            // mov [rdx+24], r13  (4C 89 6A 18)
+            EmitU8(FCode, $4C); EmitU8(FCode, $89); EmitU8(FCode, $6A); EmitU8(FCode, $18);
+            // mov [rdx+32], r14  (4C 89 72 20)
+            EmitU8(FCode, $4C); EmitU8(FCode, $89); EmitU8(FCode, $72); EmitU8(FCode, $20);
+            // mov [rdx+40], r15  (4C 89 7A 28)
+            EmitU8(FCode, $4C); EmitU8(FCode, $89); EmitU8(FCode, $7A); EmitU8(FCode, $28);
+            // mov [rdx+48], rsp  (48 89 62 30)
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $62); EmitU8(FCode, $30);
+            // lea rax, [rip+9] — address of 'test rax,rax' below
+            // 9 = size(mov [rdx+56],rax)=4 + size(inc [rcx])=3 + size(xor eax,eax)=2
+            EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 9);
+            // mov [rdx+56], rax  (48 89 42 38)
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $42); EmitU8(FCode, $38);
+            // inc qword ptr [rcx]  (48 FF 01)
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $01);
+            // xor eax, eax  (31 C0)  — normal setjmp returns 0
+            EmitU8(FCode, $31); EmitU8(FCode, $C0);
+            // === longjmp resumes here ===
+            // test rax, rax  (48 85 C0)
+            EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0);
+            // jne catch_label  (0F 85 <rel32>)
+            SetLength(FBranchPatches, Length(FBranchPatches) + 1);
+            FBranchPatches[High(FBranchPatches)].Pos := FCode.Size + 2;
+            FBranchPatches[High(FBranchPatches)].LabelName := instr.LabelName;
+            FBranchPatches[High(FBranchPatches)].JmpSize := 4;
+            EmitU8(FCode, $0F); EmitU8(FCode, $85); EmitU32(FCode, 0);
+          end;
+
+        irPopHandler:
+          begin
+            // Decrement _lyx_exc_depth
+            if excDepthIdx >= 0 then
+            begin
+              // lea rcx, [rip + _lyx_exc_depth]  (48 8D 0D <disp32>)
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excDepthIdx;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              // dec qword ptr [rcx]  (48 FF 09)
+              EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $09);
+            end;
+          end;
+
+        irLoadHandlerExn:
+          begin
+            // Load _lyx_exc_value into dest slot
+            if excValueIdx >= 0 then
+            begin
+              // lea rax, [rip + _lyx_exc_value]  (48 8D 05 <disp32>)
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $05); EmitU32(FCode, 0);
+              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excValueIdx;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              // mov rax, [rax]  (48 8B 00)
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
+              // store to catch variable's LOCAL slot (instr.Dest is a local index, like irStoreLocal)
+              WriteMovMemReg(FCode, RBP, SlotOffset(instr.Dest), RAX);
+            end;
+          end;
+
+        irThrow:
+          begin
+            // Store exception value to _lyx_exc_value, then longjmp to active handler
+            // Load the exception value from src1 slot
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            if excValueIdx >= 0 then
+            begin
+              // lea rcx, [rip + _lyx_exc_value]  (48 8D 0D <disp32>)
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excValueIdx;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              // mov [rcx], rax  (48 89 01)
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
+              // Compute jmpbuf address: &jmpbufs[(depth-1)*64]
+              // lea rcx, [rip + _lyx_exc_depth]
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excDepthIdx;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              // mov rax, [rcx]  (48 8B 01)
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
+              // dec rax  (48 FF C8)
+              EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C8);
+              // imul rax, rax, 64  (48 6B C0 40)
+              EmitU8(FCode, $48); EmitU8(FCode, $6B); EmitU8(FCode, $C0); EmitU8(FCode, $40);
+              // lea rdx, [rip + _lyx_exc_jmpbufs]  (48 8D 15 <disp32>)
+              leaPos := FCode.Size;
+              EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $15); EmitU32(FCode, 0);
+              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := excJmpbufsIdx;
+              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+              // add rdx, rax  (48 01 C2)
+              EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C2);
+              // Restore callee-saved registers + rsp from jmpbuf
+              // mov rbx, [rdx+0]   (48 8B 1A)
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $1A);
+              // mov rbp, [rdx+8]   (48 8B 6A 08)
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $6A); EmitU8(FCode, $08);
+              // mov r12, [rdx+16]  (4C 8B 62 10)
+              EmitU8(FCode, $4C); EmitU8(FCode, $8B); EmitU8(FCode, $62); EmitU8(FCode, $10);
+              // mov r13, [rdx+24]  (4C 8B 6A 18)
+              EmitU8(FCode, $4C); EmitU8(FCode, $8B); EmitU8(FCode, $6A); EmitU8(FCode, $18);
+              // mov r14, [rdx+32]  (4C 8B 72 20)
+              EmitU8(FCode, $4C); EmitU8(FCode, $8B); EmitU8(FCode, $72); EmitU8(FCode, $20);
+              // mov r15, [rdx+40]  (4C 8B 7A 28)
+              EmitU8(FCode, $4C); EmitU8(FCode, $8B); EmitU8(FCode, $7A); EmitU8(FCode, $28);
+              // mov rsp, [rdx+48]  (48 8B 62 30)
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $62); EmitU8(FCode, $30);
+              // mov eax, 1  (B8 01 00 00 00)  — longjmp value, zero-extends to rax
+              EmitU8(FCode, $B8); EmitU32(FCode, 1);
+              // jmp qword ptr [rdx+56]  (FF 62 38)
+              EmitU8(FCode, $FF); EmitU8(FCode, $62); EmitU8(FCode, $38);
+            end;
+          end;
+
+        irPanic:
+          begin
+            // panic(msg): write msg to stderr and exit(1)
+            // Src1 = temp holding the message pointer (PChar)
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            // strlen(rsi) → rcx
+            WriteMovRegImm64(FCode, RCX, 0);
+            // loop: cmp byte [rsi+rcx], 0
+            EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+            // jz +5 (past inc rcx + jmp)
+            EmitU8(FCode, $74); EmitU8(FCode, $05);
+            // inc rcx  (48 FF C1)
+            EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+            // jmp -11  (EB F5)
+            EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+            // rdx = rcx (length)
+            WriteMovRegReg(FCode, RDX, RCX);
+            // write(fd=2, buf=rsi, len=rdx)
+            WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+            WriteMovRegImm64(FCode, RDI, 2);  // stderr
+            WriteSyscall(FCode);
+            // exit(1)
+            WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+            WriteMovRegImm64(FCode, RDI, 1);
+            WriteSyscall(FCode);
+          end;
+
         end;
     end;
-    
+
     // Sicherstellen, dass die Funktion einen Return hat
     if (Length(fn.Instructions) = 0) or (fn.Instructions[High(fn.Instructions)].Op <> irReturn) then
     begin
@@ -4670,6 +4872,20 @@ begin
   // Global variables are stored after strings in the code section (embedded like strings)
   if Length(FGlobalVarLeaPositions) > 0 then
   begin
+    // Write exception globals to end of code buffer if they were registered
+    if excDepthIdx >= 0 then
+    begin
+      // _lyx_exc_value (8 bytes)
+      globalVarOffsets[excValueIdx] := FCode.Size;
+      FCode.WriteU64LE(0);
+      // _lyx_exc_depth (8 bytes)
+      globalVarOffsets[excDepthIdx] := FCode.Size;
+      FCode.WriteU64LE(0);
+      // _lyx_exc_jmpbufs (16 × 64 = 1024 bytes)
+      globalVarOffsets[excJmpbufsIdx] := FCode.Size;
+      for k := 0 to 127 do FCode.WriteU64LE(0);
+    end;
+
     // Write global variables to end of code buffer
     for i := 0 to High(module.GlobalVars) do
     begin
@@ -4708,9 +4924,9 @@ begin
         offset := funcOffset - (FGlobalVarLeaPositions[i].CodePos + 7);
         FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
       end
-      else if (varIdx >= 0) and (varIdx < Length(module.GlobalVars)) then
+      else if varIdx >= 0 then
       begin
-        // Regular global variable - data is embedded in code section
+        // Regular or exception global variable - data is embedded in code section
         // RIP-relative: disp32 = targetOffset - (CodePos + 7)
         offset := globalVarOffsets[varIdx] - (FGlobalVarLeaPositions[i].CodePos + 7);
         FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));

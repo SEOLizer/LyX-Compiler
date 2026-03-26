@@ -4775,6 +4775,76 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       Exit(True);
     end;
 
+    // try { body } catch (e: int64) { handler }
+    if stmt is TAstTry then
+    begin
+      // catch label is the jump target when an exception is thrown
+      thenLabel := NewLabel('Lcatch');
+      // end label is after the catch block
+      elseLabel := NewLabel('Ltry_end');
+
+      // irPushHandler: tells backend to call setjmp and jump to thenLabel on throw
+      instr := Default(TIRInstr);
+      instr.Op := irPushHandler;
+      instr.LabelName := thenLabel;
+      Emit(instr);
+
+      // lower try body
+      LowerStmt(TAstTry(stmt).TryBody);
+
+      // irPopHandler: remove handler frame (normal path)
+      instr := Default(TIRInstr);
+      instr.Op := irPopHandler;
+      Emit(instr);
+
+      // jump past the catch block
+      instr := Default(TIRInstr);
+      instr.Op := irJmp;
+      instr.LabelName := elseLabel;
+      Emit(instr);
+
+      // catch label: exception occurred
+      instr := Default(TIRInstr);
+      instr.Op := irLabel;
+      instr.LabelName := thenLabel;
+      Emit(instr);
+
+      // irPopHandler: remove handler frame (exception path)
+      instr := Default(TIRInstr);
+      instr.Op := irPopHandler;
+      Emit(instr);
+
+      // allocate the catch variable slot and load exception value into it
+      loc := AllocLocal(TAstTry(stmt).CatchVar, atInt64);
+      instr := Default(TIRInstr);
+      instr.Op := irLoadHandlerExn;
+      instr.Dest := loc;
+      Emit(instr);
+
+      // lower catch body
+      LowerStmt(TAstTry(stmt).CatchBody);
+
+      // end label
+      instr := Default(TIRInstr);
+      instr.Op := irLabel;
+      instr.LabelName := elseLabel;
+      Emit(instr);
+
+      Exit(True);
+    end;
+
+    // throw expr;
+    if stmt is TAstThrow then
+    begin
+      t0 := LowerExpr(TAstThrow(stmt).Value);
+      if t0 < 0 then Exit(False);
+      instr := Default(TIRInstr);
+      instr.Op := irThrow;
+      instr.Src1 := t0;
+      Emit(instr);
+      Exit(True);
+    end;
+
     FDiag.Error('lowering: unsupported statement', stmt.Span);
     Result := False;
   end;
