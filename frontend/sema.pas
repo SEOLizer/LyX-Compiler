@@ -3026,6 +3026,13 @@ begin
         expr.ResolvedType := atPChar;
         Result := atPChar;
       end;
+    nkTupleLit:
+      begin
+        // Tuple literal: (a, b) — check each element, return atTuple
+        for i := 0 to High(TAstTupleLit(expr).Elems) do
+          CheckExpr(TAstTupleLit(expr).Elems[i]);
+        Result := atTuple;
+      end;
   else
     begin
       FDiag.Error('sema: unsupported expr kind', expr.Span);
@@ -3499,6 +3506,19 @@ begin
         vtype := CheckExpr(TAstThrow(stmt).Value);
         if not IsIntegerType(vtype) then
           FDiag.Error('throw expression must be integer', TAstThrow(stmt).Value.Span);
+      end;
+    nkTupleVarDecl:
+      begin
+        // var a, b := f() — multi-return destructuring
+        vtype := CheckExpr(TAstTupleVarDecl(stmt).InitExpr);
+        // Register each name as int64 in scope
+        for i := 0 to High(TAstTupleVarDecl(stmt).Names) do
+        begin
+          sym := TSymbol.Create(TAstTupleVarDecl(stmt).Names[i]);
+          sym.Kind := symVar;
+          sym.DeclType := atInt64;
+          AddSymbolToCurrent(sym, stmt.Span);
+        end;
       end;
     else
       FDiag.Error('sema: unsupported statement kind', stmt.Span);
