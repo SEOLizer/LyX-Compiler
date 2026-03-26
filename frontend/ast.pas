@@ -590,6 +590,7 @@ type
   TAstCase = class
   public
     Value: TAstExpr;
+    ExtraValues: array of TAstExpr;  // additional OR pattern values (for case 1|2|3)
     Body: TAstStmt;
     constructor Create(aValue: TAstExpr; aBody: TAstStmt);
     destructor Destroy; override;
@@ -1758,8 +1759,12 @@ begin
 end;
 
 destructor TAstCase.Destroy;
+var i: Integer;
 begin
   Value.Free;
+  for i := 0 to High(ExtraValues) do
+    ExtraValues[i].Free;
+  SetLength(ExtraValues, 0);
   Body.Free;
   inherited Destroy;
 end;
