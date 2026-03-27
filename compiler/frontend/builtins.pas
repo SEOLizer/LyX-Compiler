@@ -100,6 +100,13 @@ initialization
 
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrLen',    'StrLen',    atInt64,  [atPChar]);
+  AddBuiltin('', 'StrCharAt', 'StrCharAt', atInt64,  [atPChar, atInt64]);
+  AddBuiltin('', 'StrSetChar','StrSetChar',atVoid,   [atPChar, atInt64, atInt64]);
+  AddBuiltin('', 'StrNew',    'StrNew',    atPChar,  [atInt64]);
+  AddBuiltin('', 'StrFree',   'StrFree',   atVoid,   [atPChar]);
+  AddBuiltin('', 'StrAppend', 'StrAppend', atPChar,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrFromInt','StrFromInt',atPChar,  [atInt64]);
 
   // Debug namespace - In-Situ Data Visualizer
   // Inspect akzeptiert jeden Typ - die Typprüfung erfolgt speziell in Sema

@@ -1745,6 +1745,74 @@ begin
   s.ParamTypes[0] := atUnresolved;  // Akzeptiert jeden Typ
   AddSymbolToCurrent(s, NullSpan);
 
+  // === Dynamic growable strings (F2) ===
+  // StrLen(s: pchar): int64 — null-scan strlen, works on literals
+  s := TSymbol.Create('StrLen');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrCharAt(s: pchar, i: int64): int64 — byte at index (zero-extended)
+  s := TSymbol.Create('StrCharAt');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrSetChar(s: pchar, i: int64, c: int64) — write byte at index
+  s := TSymbol.Create('StrSetChar');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrNew(capacity: int64): pchar — mmap-alloc with 16-byte header, return data ptr
+  s := TSymbol.Create('StrNew');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrFree(s: pchar) — munmap(s-16, *(s-16)+16)
+  s := TSymbol.Create('StrFree');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrAppend(dest: pchar, src: pchar): pchar — append src to dest, return new ptr
+  s := TSymbol.Create('StrAppend');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrFromInt(n: int64): pchar — int to decimal string
+  s := TSymbol.Create('StrFromInt');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
 end;
 
 procedure TSema.RegisterTObject;

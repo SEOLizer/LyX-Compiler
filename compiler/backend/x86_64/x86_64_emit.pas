@@ -3076,6 +3076,449 @@ begin
                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                 end;
               end
+              else if instr.ImmStr = 'StrLen' then
+              begin
+                // StrLen(s: pchar): int64 — null-scan strlen, works on literals
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = s
+                  // xor rcx, rcx
+                  EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C9);
+                  // loop: cmp byte [rdi+rcx], 0  (4 bytes)
+                  EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0F); EmitU8(FCode, $00);
+                  // jz +5 (skip inc+jmp)  (2 bytes)
+                  EmitU8(FCode, $74); EmitU8(FCode, $05);
+                  // inc rcx  (3 bytes)
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+                  // jmp -11 (back to cmp)  (2 bytes)
+                  EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+                  // mov rax, rcx
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C8);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end;
+              end
+              else if instr.ImmStr = 'StrCharAt' then
+              begin
+                // StrCharAt(s: pchar, i: int64): int64 — load byte at s[i] zero-extended
+                if Length(instr.ArgTemps) >= 2 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = s
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // rsi = i
+                  // movzx rax, byte [rdi+rsi]:  48 0F B6 04 37
+                  EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6);
+                  EmitU8(FCode, $04); EmitU8(FCode, $37);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end;
+              end
+              else if instr.ImmStr = 'StrSetChar' then
+              begin
+                // StrSetChar(s: pchar, i: int64, c: int64) — write byte c to s[i]
+                if Length(instr.ArgTemps) >= 3 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = s
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // rsi = i
+                  slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                  WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));  // rdx = c
+                  // mov byte [rdi+rsi], dl:  88 14 37
+                  EmitU8(FCode, $88); EmitU8(FCode, $14); EmitU8(FCode, $37);
+                end;
+              end
+              else if instr.ImmStr = 'StrNew' then
+              begin
+                // StrNew(capacity: int64): pchar — mmap alloc with 16-byte header, return data ptr
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = capacity
+                  // push rdi (save capacity)
+                  EmitU8(FCode, $57);
+                  // rsi = capacity + 16 (total mmap size)
+                  WriteMovRegReg(FCode, RSI, RDI);
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C6); EmitU8(FCode, $10); // add rsi, 16
+                  // mmap(NULL, rsi, PROT_READ|WRITE=3, MAP_PRIVATE|ANON=0x22, -1, 0)
+                  WriteMovRegImm64(FCode, RDI, 0);
+                  WriteMovRegImm64(FCode, RDX, 3);
+                  WriteMovRegImm64(FCode, R10, $22);
+                  WriteMovRegImm64(FCode, R8, UInt64(-1));
+                  WriteMovRegImm64(FCode, R9, 0);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+                  WriteSyscall(FCode);
+                  // pop rdi (restore capacity)
+                  EmitU8(FCode, $5F);
+                  // mov [rax], rdi  (store capacity at offset 0):  48 89 38
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $38);
+                  // mov qword [rax+8], 0  (length=0 at offset 8):  48 C7 40 08 00 00 00 00
+                  EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $40); EmitU8(FCode, $08);
+                  EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
+                  // mov byte [rax+16], 0  (null terminator):  C6 40 10 00
+                  EmitU8(FCode, $C6); EmitU8(FCode, $40); EmitU8(FCode, $10); EmitU8(FCode, $00);
+                  // add rax, 16  (return data pointer):  48 83 C0 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C0); EmitU8(FCode, $10);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end;
+              end
+              else if instr.ImmStr = 'StrFree' then
+              begin
+                // StrFree(s: pchar) — munmap(s-16, *(s-16)+16)
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = s (data ptr)
+                  // mov rsi, [rdi-16]  (load capacity):  48 8B 77 F0
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $77); EmitU8(FCode, $F0);
+                  // add rsi, 16  (total size = capacity + 16):  48 83 C6 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C6); EmitU8(FCode, $10);
+                  // sub rdi, 16  (base = s - 16):  48 83 EF 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EF); EmitU8(FCode, $10);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP)));
+                  WriteSyscall(FCode);
+                end;
+              end
+              else if instr.ImmStr = 'StrAppend' then
+              begin
+                // StrAppend(dest: pchar, src: pchar): pchar
+                // Always-reallocate approach.
+                // NOTE: syscall clobbers RCX and R11, so we use stack for all saved values.
+                // Stack layout during execution (from top):
+                //   [rsp+0]  = dest (old data ptr, saved for munmap)
+                //   [rsp+8]  = src (saved for copy)
+                //   [rsp+16] = newDest (= newBase+16, result)
+                if Length(instr.ArgTemps) >= 2 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = dest
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // rsi = src
+
+                  // Save dest and src
+                  EmitU8(FCode, $57);  // push rdi (dest)   [rsp+0]
+                  EmitU8(FCode, $56);  // push rsi (src)    [rsp+0]=src, [rsp+8]=dest
+
+                  // Load destLen = *(dest-8) into RDX (save before scan overwrites RSI)
+                  // dest is now at [rsp+8]; reload it: mov rdi, [rsp+8]:  48 8B 7C 24 08
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $7C); EmitU8(FCode, $24); EmitU8(FCode, $08);
+                  // mov rdx, [rdi-8]  (destLen):  48 8B 57 F8
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $57); EmitU8(FCode, $F8);
+
+                  // Compute srcLen via null scan on RSI: rcx = 0
+                  // rsi = src = [rsp+0]
+                  WriteMovRegImm64(FCode, RCX, 0);
+                  // cmp byte [rsi+rcx], 0  (4 bytes)
+                  EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+                  // jz +5  (2 bytes)
+                  EmitU8(FCode, $74); EmitU8(FCode, $05);
+                  // inc rcx  (3 bytes)
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+                  // jmp -11  (2 bytes)
+                  EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+                  // rcx = srcLen
+
+                  // rsi = mmap total size = destLen(rdx) + srcLen(rcx) + 17
+                  WriteMovRegReg(FCode, RSI, RDX);
+                  // add rsi, rcx:  48 01 CE
+                  EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $CE);
+                  // add rsi, 17:  48 83 C6 11
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C6); EmitU8(FCode, $11);
+
+                  // mmap(NULL, rsi, 3, 0x22, -1, 0)
+                  WriteMovRegImm64(FCode, RDI, 0);
+                  // rsi = size (already set)
+                  WriteMovRegImm64(FCode, RDX, 3);
+                  WriteMovRegImm64(FCode, R10, $22);
+                  WriteMovRegImm64(FCode, R8, UInt64(-1));
+                  WriteMovRegImm64(FCode, R9, 0);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+                  WriteSyscall(FCode);
+                  // rax = newBase (R11 and RCX are clobbered by kernel after syscall)
+
+                  // Compute newDest = newBase + 16
+                  // save newBase+16 on stack
+                  // add rax, 16:  48 83 C0 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C0); EmitU8(FCode, $10);
+                  EmitU8(FCode, $50);  // push rax (newDest)  [rsp+0]=newDest, [rsp+8]=src, [rsp+16]=dest
+
+                  // Reload dest and src to fill header
+                  // dest at [rsp+16], src at [rsp+8]
+                  // rdi = dest:  48 8B 7C 24 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $7C); EmitU8(FCode, $24); EmitU8(FCode, $10);
+                  // rsi = src:  48 8B 74 24 08
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, $08);
+                  // rcx = newDest = [rsp+0]:  48 8B 0C 24
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $0C); EmitU8(FCode, $24);
+
+                  // newBase = newDest - 16 = rcx - 16
+                  // rdx = rcx - 16 (newBase):  48 8D 51 F0
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $51); EmitU8(FCode, $F0);
+
+                  // destLen = *(dest-8):  mov rax, [rdi-8]:  48 8B 47 F8
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $47); EmitU8(FCode, $F8);
+                  // push destLen:
+                  EmitU8(FCode, $50);  // push rax  [rsp+0]=destLen, [rsp+8]=newDest, [rsp+16]=src, [rsp+24]=dest
+
+                  // srcLen via null scan on RSI: reuse rcx=0
+                  WriteMovRegImm64(FCode, RCX, 0);
+                  // cmp byte [rsi+rcx], 0  (4 bytes)
+                  EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+                  // jz +5  (2 bytes)
+                  EmitU8(FCode, $74); EmitU8(FCode, $05);
+                  // inc rcx  (3 bytes)
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+                  // jmp -11  (2 bytes)
+                  EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+                  // rcx = srcLen
+
+                  // Fill header in new buffer (rdx = newBase):
+                  // capacity = destLen + srcLen + 1 = [rsp] + rcx + 1
+                  // rax = [rsp]:  48 8B 04 24
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $04); EmitU8(FCode, $24);
+                  // push srcLen:
+                  EmitU8(FCode, $51);  // push rcx  [rsp]=srcLen, [rsp+8]=destLen, [rsp+16]=newDest, [rsp+24]=src, [rsp+32]=dest
+
+                  // rax = destLen + srcLen + 1 (capacity):
+                  // add rax, rcx:  48 01 C8
+                  EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C8);
+                  // inc rax:  48 FF C0
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C0);
+                  // store capacity at [newBase]: mov [rdx], rax  (48 89 02)
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $02);
+                  // length = destLen + srcLen = capacity - 1:  dec rax:  48 FF C8
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C8);
+                  // store length at [newBase+8]: mov [rdx+8], rax  (48 89 42 08)
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $42); EmitU8(FCode, $08);
+
+                  // Copy old dest content to newDest:
+                  // newDest = [rsp+16], destLen = [rsp+8], dest = [rsp+32]
+                  // rdi = newDest:  48 8B 7C 24 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $7C); EmitU8(FCode, $24); EmitU8(FCode, $10);
+                  // rcx = destLen = [rsp+8]:  48 8B 4C 24 08
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $4C); EmitU8(FCode, $24); EmitU8(FCode, $08);
+                  // rsi = dest (old data ptr) = [rsp+32]:  48 8B 74 24 20
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, $20);
+                  // rep movsb: copy destLen bytes from [rsi] to [rdi]
+                  EmitU8(FCode, $F3); EmitU8(FCode, $A4);
+                  // rdi now = newDest + destLen
+
+                  // Copy src to rdi: rsi = src = [rsp+24]:  48 8B 74 24 18
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, $18);
+                  // lodsb/stosb loop (copies including null terminator)
+                  EmitU8(FCode, $AC);   // lodsb
+                  EmitU8(FCode, $AA);   // stosb
+                  EmitU8(FCode, $84); EmitU8(FCode, $C0);  // test al, al
+                  EmitU8(FCode, $75); EmitU8(FCode, $FA);  // jnz -6
+
+                  // munmap old buffer
+                  // dest = [rsp+32], old capacity = *(dest-16)
+                  // rdi = dest:  48 8B 7C 24 20
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $7C); EmitU8(FCode, $24); EmitU8(FCode, $20);
+                  // rsi = *(dest-16) + 16:  mov rsi, [rdi-16]:  48 8B 77 F0
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $77); EmitU8(FCode, $F0);
+                  // add rsi, 16:  48 83 C6 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C6); EmitU8(FCode, $10);
+                  // sub rdi, 16 (base):  48 83 EF 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EF); EmitU8(FCode, $10);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP)));
+                  WriteSyscall(FCode);
+
+                  // Return newDest = [rsp+16]:  48 8B 44 24 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, $10);
+                  // Restore stack: pop srcLen, pop destLen, pop newDest, pop src, pop dest
+                  EmitU8(FCode, $59);  // pop rcx (srcLen, discard)
+                  EmitU8(FCode, $59);  // pop rcx (destLen, discard)
+                  EmitU8(FCode, $59);  // pop rcx (newDest, discard)
+                  EmitU8(FCode, $59);  // pop rcx (src, discard)
+                  EmitU8(FCode, $59);  // pop rcx (dest, discard)
+
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end;
+              end
+              else if instr.ImmStr = 'StrFromInt' then
+              begin
+                // StrFromInt(n: int64): pchar — convert int64 to decimal string
+                // Uses 32-byte stack buffer, fills digits right-to-left, then allocates result.
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // rdi = n
+
+                  // Reserve 32-byte stack buffer + 8 bytes for flags = 40 bytes total (keep stack aligned)
+                  // sub rsp, 40:  48 83 EC 28
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, $28);
+
+                  // Set null terminator at [rsp+23]:  C6 44 24 17 00
+                  EmitU8(FCode, $C6); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, $17); EmitU8(FCode, $00);
+
+                  // rcx = 23 (write position, we fill backwards)
+                  WriteMovRegImm64(FCode, RCX, 23);
+
+                  // Check if negative: test rdi, rdi; jge .positive
+                  // test rdi, rdi:  48 85 FF
+                  EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF);
+                  // jge +7 (past neg+push1+jmp to reach push0):  7D 07
+                  EmitU8(FCode, $7D); EmitU8(FCode, $07);
+                  // neg rdi:  48 F7 DF
+                  EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $DF);
+                  // push 1 (negative flag):  6A 01
+                  EmitU8(FCode, $6A); EmitU8(FCode, $01);
+                  // jmp +2 (past push 0):  EB 02
+                  EmitU8(FCode, $EB); EmitU8(FCode, $02);
+                  // push 0 (positive flag):  6A 00
+                  EmitU8(FCode, $6A); EmitU8(FCode, $00);
+                  // nop to align (jmp target):  but not needed since jge skips to here
+
+                  // Digit loop: divide rdi by 10, get remainder as digit
+                  // loop_start:
+                  // xor rdx, rdx:  48 31 D2
+                  EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $D2);
+                  // mov rax, rdi:  48 89 F8
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $F8);
+                  // mov r10, 10:  49 BA 0A 00 00 00 00 00 00 00
+                  WriteMovRegImm64(FCode, R10, 10);
+                  // div r10:  49 F7 F2
+                  EmitU8(FCode, $49); EmitU8(FCode, $F7); EmitU8(FCode, $F2);
+                  // rax = n/10, rdx = n%10
+                  // rdi = rax (quotient):  48 89 C7
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C7);
+                  // add dl, '0':  80 C2 30
+                  EmitU8(FCode, $80); EmitU8(FCode, $C2); EmitU8(FCode, $30);
+                  // dec rcx:  48 FF C9
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C9);
+                  // mov [rsp+rcx+8], dl  — note: rsp has 8 extra bytes from push flag
+                  // We need to store at [rsp+rcx+8]: SIB with RSP base, RCX index, disp8=8
+                  // mod=01 (disp8), reg=DL(2), rm=100 (SIB): ModRM=54, SIB=0C (ss=0,idx=RCX=1,base=RSP=4), disp=8
+                  // 88 54 0C 08
+                  EmitU8(FCode, $88); EmitU8(FCode, $54); EmitU8(FCode, $0C); EmitU8(FCode, $08);
+                  // test rdi, rdi:  48 85 FF
+                  EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF);
+                  // jnz back to loop_start
+                  // loop_start is 3+10+3+3+3+4+3+3 = back from here
+                  // Let's count bytes from loop_start to current jnz instruction:
+                  // xor(3)+mov rax(3)+movabs r10(10)+div(3)+mov rdi(3)+add dl(3)+dec rcx(3)+mov [rsp+rcx+8](4)+test(3) = 35 bytes
+                  // jnz: 75 (-37) = 75 DB (35 bytes of loop body + 2 for jnz itself)
+                  EmitU8(FCode, $75); EmitU8(FCode, $DB);
+
+                  // Pop negative flag into r10
+                  EmitU8(FCode, $41); EmitU8(FCode, $5A);  // pop r10
+                  // test r10, r10:  4D 85 D2
+                  EmitU8(FCode, $4D); EmitU8(FCode, $85); EmitU8(FCode, $D2);
+                  // jz +7 (skip dec_rcx(3)+movb_minus(4)=7 bytes):  74 07
+                  EmitU8(FCode, $74); EmitU8(FCode, $07);
+                  // dec rcx (make room for '-'):  48 FF C9
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C9);
+                  // After pop r10 (flag), rsp=RSP0. Digits at [rsp+rcx]. Write '-' at [rsp+rcx] (no +8).
+                  // mov byte [rsp+rcx*1], '-':  C6 04 0C 2D
+                  EmitU8(FCode, $C6); EmitU8(FCode, $04); EmitU8(FCode, $0C); EmitU8(FCode, $2D);
+
+                  // Now: rsp+rcx+8 = start of digit string (with sign if negative)
+                  // length = 23 - rcx
+                  // lea rsi, [rsp+rcx+8]: the data pointer for mmap copy
+                  // But we need to mmap a new buffer first, then copy.
+                  // rsi = mmap size = 24 - rcx (to cover all digits + null)
+                  // mov rax, 24:  B8 18 00 00 00 (but need rex for 64-bit result... use movabs)
+                  WriteMovRegImm64(FCode, RAX, 24);
+                  // sub rax, rcx:  48 29 C8
+                  EmitU8(FCode, $48); EmitU8(FCode, $29); EmitU8(FCode, $C8);
+                  // save length in r11 = rax (= 24-rcx = actual string length incl null)
+                  WriteMovRegReg(FCode, R11, RAX);
+                  // rsi = r11 (mmap size), but we also need to know start offset
+                  // save rcx in R10 for later (digit start offset in stack buf)
+                  WriteMovRegReg(FCode, R10, RCX);
+
+                  // mmap for result: size = r11 (includes null, use as capacity too)
+                  // push r10 (rcx saved)
+                  EmitU8(FCode, $41); EmitU8(FCode, $52);  // push r10
+                  // push r11 (length incl null)
+                  EmitU8(FCode, $41); EmitU8(FCode, $53);  // push r11
+
+                  // mmap size = r11 + 16 (for header)
+                  WriteMovRegReg(FCode, RSI, R11);
+                  // add rsi, 16:  48 83 C6 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C6); EmitU8(FCode, $10);
+                  WriteMovRegImm64(FCode, RDI, 0);
+                  WriteMovRegImm64(FCode, RDX, 3);
+                  WriteMovRegImm64(FCode, R10, $22);
+                  WriteMovRegImm64(FCode, R8, UInt64(-1));
+                  WriteMovRegImm64(FCode, R9, 0);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+                  WriteSyscall(FCode);
+                  // rax = newBase
+
+                  // pop r11 (length incl null), pop r10 (digit start offset in [rsp+8+rcx])
+                  EmitU8(FCode, $41); EmitU8(FCode, $5B);  // pop r11
+                  EmitU8(FCode, $41); EmitU8(FCode, $5A);  // pop r10
+
+                  // capacity = r11 - 1 (exclude null from capacity, or just use r11)
+                  // Store capacity at [newBase]: mov [rax], r11  4C 89 18
+                  EmitU8(FCode, $4C); EmitU8(FCode, $89); EmitU8(FCode, $18);
+                  // length = r11 - 1 (exclude null):  r11 - 1 into rdx
+                  WriteMovRegReg(FCode, RDX, R11);
+                  // dec rdx:  48 FF CA
+                  EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $CA);
+                  // store length at [newBase+8]: mov [rax+8], rdx  48 89 50 08
+                  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $50); EmitU8(FCode, $08);
+
+                  // newDest = newBase + 16; store in RDI for copy target
+                  WriteMovRegReg(FCode, RDI, RAX);
+                  // add rdi, 16:  48 83 C7 10
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C7); EmitU8(FCode, $10);
+                  // save newDest in R11 for return
+                  WriteMovRegReg(FCode, R11, RDI);
+
+                  // Source: rsp + r10 + 8  (digit start in stack buffer; rsp shifted by 2 pushes = +16)
+                  // Wait: after the two push r10/r11 and pop r11/r10, stack is back where it was.
+                  // Stack layout at this point: [rsp+0..7] = nothing (just sub rsp,40 space)
+                  // digit buffer at [rsp+8..rsp+31] (23 bytes of buffer + null at [rsp+31])
+                  // r10 = digit start index in original rcx (= value of rcx when stored)
+                  // So source = rsp + 8 + r10
+                  // lea rsi, [rsp + r10 + 8]:
+                  // mod=00, reg=RSI(6), rm=100 (SIB): ModRM=$34
+                  // SIB: scale=0, index=R10(10 & 7 = 2), base=RSP(4): SIB = (0 shl 6) or (2 shl 3) or 4 = $14
+                  // But R10 is an extended register (bit 3 set), need REX.X
+                  // REX: W=1, R=0(RSI<8), X=1(R10>=8), B=0: REX = 0x48 | 0x02 = 0x4A
+                  // 4A 8D 34 14 (no disp — RSP post-pop so digits at [rsp+r10])
+                  EmitU8(FCode, $4A); EmitU8(FCode, $8D); EmitU8(FCode, $34); EmitU8(FCode, $14);
+                  // rcx = r11_length = length+1 (copy including null)
+                  WriteMovRegReg(FCode, RCX, R11);
+                  // Hmm, R11 now holds newDest. We need the count (length+1 = old r11 before we moved it)
+                  // Recompute: count = 24 - r10 (since null is at position 23, digit start at r10)
+                  WriteMovRegImm64(FCode, RCX, 24);
+                  // sub rcx, r10:  4C 29 D1
+                  EmitU8(FCode, $4C); EmitU8(FCode, $29); EmitU8(FCode, $D1);
+                  // rep movsb: copies rcx bytes from [rsi] to [rdi]
+                  EmitU8(FCode, $F3); EmitU8(FCode, $A4);
+
+                  // Restore stack: add rsp, 40
+                  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, $28);
+
+                  // Return R11 (newDest)
+                  WriteMovRegReg(FCode, RAX, R11);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end;
+              end
               else if instr.ImmStr = 'str_concat' then
               begin
                 // str_concat(a: pchar, b: pchar) -> pchar
