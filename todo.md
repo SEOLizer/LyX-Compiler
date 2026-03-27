@@ -1,5 +1,132 @@
 # Lyx Compiler ToDo Liste
 
+## Backend-Parität (nicht-x86_64)
+
+Das Referenz-Backend ist **x86_64 Linux** (`compiler/backend/x86_64/x86_64_emit.pas`).
+Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
+
+---
+
+### ARM64 Linux (`compiler/backend/arm64/arm64_emit.pas`)
+
+**Implementiert ✅:** PrintStr, PrintInt, exit, open, read, write, close, lseek, unlink, rename, mkdir, rmdir, chmod, Random, RandomSeed, now_unix, now_unix_ms, sleep_ms, RegexMatch/Search/Replace (Stubs), NEON SIMD, DynArray (Push/Pop/Len/Free), VMT, Dynamic Linking (PLT/GOT)
+
+**Fehlt ❌ – String-Builtins (S0 Basis):**
+- [ ] `str_concat` – pchar + pchar via mmap
+- [ ] `StrLen` – null-terminierte Länge
+- [ ] `StrCharAt` / `StrSetChar` – Zeichenzugriff
+- [ ] `StrNew(cap)` / `StrFree(s)` – mmap/munmap
+- [ ] `StrAppend(dest, src)` – reallozierend
+- [ ] `StrFromInt(n)` – Integer→String
+
+**Fehlt ❌ – String-Builtins (S1–S7):**
+- [ ] `StrFindChar(s, ch, start)` / `StrSub(s, start, len)`
+- [ ] `StrAppendStr(dest, src)` / `StrConcat(a, b)` / `StrCopy(s)`
+- [ ] `IntToStr(n)` / `FileGetSize(path)`
+- [ ] `HashNew(cap)` / `HashSet` / `HashGet` / `HashHas`
+- [ ] `GetArgC()` / `GetArg(i)`
+- [ ] `StrStartsWith` / `StrEndsWith` / `StrEquals`
+
+**Fehlt ❌ – Sonstige Builtins:**
+- [ ] `PrintFloat` / `Println` / `printf`
+- [ ] `mmap` / `munmap` (als Builtin-Aufruf, nicht nur intern)
+- [ ] `ioctl` / `getpid`
+- [ ] `peek8/16/32/64` / `poke8/16/32/64` / `buf_get_byte` / `buf_put_byte`
+- [ ] `format_float` (`:width:decimals` Format-Specifier)
+- [ ] `Inspect` (Debug-Visualizer)
+- [ ] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_fcntl`, `sys_shutdown`
+
+**Offen – bekannte Bugs:**
+- [ ] SIGBUS bei PLT/GOT-basiertem Dynamic Linking (X16-Register-Konflikt, `feat/dynlink-v2`)
+- [ ] Float-Codegen (SSE2 → ARM64 NEON Mapping für `format_float`)
+
+---
+
+### macOS x86_64 (`compiler/backend/macosx64/macosx64_emit.pas`)
+
+**Implementiert ✅:** exit, PrintStr, Println, PrintInt
+
+**Fehlt ❌ – IO-Builtins:**
+- [ ] `PrintFloat` / `printf`
+- [ ] `open` / `read` / `write` / `close` / `lseek`
+- [ ] `unlink` / `rename` / `mkdir` / `rmdir` / `chmod`
+- [ ] `ioctl` / `mmap` / `munmap`
+- [ ] `getpid`
+
+**Fehlt ❌ – String-Builtins (alle):**
+- [ ] `str_concat`, `StrLen`, `StrCharAt`, `StrSetChar`, `StrNew`, `StrFree`, `StrAppend`, `StrFromInt`
+- [ ] S1–S7 komplett (StrFindChar, StrSub, StrAppendStr, StrConcat, StrCopy, IntToStr, FileGetSize, Hash*, GetArgC, GetArg, StrStartsWith, StrEndsWith, StrEquals)
+
+**Fehlt ❌ – Sonstige:**
+- [ ] `Random` / `RandomSeed`
+- [ ] `peek*` / `poke*` / `buf_get_byte` / `buf_put_byte`
+- [ ] `format_float`
+- [ ] `Inspect`
+- [ ] Socket-Builtins (Mach-O syscall-Nummern: `SYS_MACOS_*`)
+- [ ] VMT / DynArray / Closures
+
+**Hinweis:** macOS verwendet andere Syscall-Nummern (0x2000000-Präfix) und die System-V ABI.
+Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `SYS_MACOS_*`-Konstanten in x86_64_emit.pas).
+
+---
+
+### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
+
+**Implementiert ✅:** — (Skeleton, keine Builtins)
+
+**Fehlt ❌ – Alle Builtins** (Grundlage zuerst):
+- [ ] `PrintStr` / `PrintInt` / `PrintFloat` / `Println` – via Win32 `WriteFile`
+- [ ] `exit` – via `ExitProcess`
+- [ ] `open` / `read` / `write` / `close` – via `CreateFileW` / `ReadFile` / `WriteFile` / `CloseHandle`
+- [ ] `mmap` / `munmap` – via `VirtualAlloc` / `VirtualFree`
+- [ ] Alle String-Builtins (S0 + S1–S7)
+- [ ] `Random` / `RandomSeed`
+- [ ] `peek*` / `poke*`
+- [ ] Socket-Builtins – via WinSock2 (`WSAStartup`, `socket`, `connect`, etc.)
+- [ ] `GetArgC` / `GetArg` – via `GetCommandLineW` / `CommandLineToArgvW`
+- [ ] `Inspect`
+
+**Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
+Der PE64-Writer (`compiler/backend/win_arm64/pe64_arm64_writer.pas`) existiert bereits.
+Imports müssen als IAT-Einträge in den PE-Header eingetragen werden (kein PLT, sondern `__imp_`-Pointer).
+
+---
+
+### Xtensa / ESP32 (`compiler/backend/xtensa/xtensa_emit.pas`)
+
+**Implementiert ✅:** exit, PrintStr (via sys_write)
+
+**Fehlt ❌ – Builtins:**
+- [ ] `PrintInt` – itoa-Loop + write
+- [ ] `PrintFloat` – nicht sinnvoll ohne FPU; niedrige Priorität
+- [ ] `StrLen` / `StrCharAt` / `StrSetChar` / `StrNew` / `StrFree` / `StrAppend` / `StrFromInt`
+- [ ] `S1–S7` komplett (StrFindChar, StrSub, StrConcat, IntToStr, Hash*, GetArgC/GetArg, StrEquals etc.)
+- [ ] `Random` / `RandomSeed`
+- [ ] `peek8/16/32` / `poke8/16/32` (für Memory-Mapped I/O – besonders wichtig auf ESP32)
+- [ ] `open` / `read` / `write` / `close` (SPIFFS/LittleFS Dateisystem)
+
+**Hinweis:** Xtensa hat kein Linux-Syscall-Interface. Alle I/O-Builtins müssen gegen die ESP-IDF-API (`uart_write_bytes`, `esp_vfs_*`) oder direkt gegen UART-Register implementiert werden.
+`mmap`/`munmap` sind auf ESP32 nicht sinnvoll — `StrNew`/`StrFree` müssen auf `heap_caps_malloc`/`heap_caps_free` gemappt werden.
+
+---
+
+### Empfohlene Reihenfolge
+
+| Priorität | Backend | Aufgabe |
+|-----------|---------|---------|
+| Hoch | ARM64 Linux | String-Builtins S0 (StrNew/StrFree/StrLen/StrAppend/StrFromInt) |
+| Hoch | ARM64 Linux | String-Builtins S1–S7 (port from x86_64) |
+| Hoch | ARM64 Linux | Float-Codegen / format_float (NEON) |
+| Mittel | macOS x86_64 | IO-Builtins (open/read/write/close/lseek) + String S0 |
+| Mittel | macOS x86_64 | String S1–S7 (identisch zu x86_64 — nur Syscall-Nummern tauschen) |
+| Mittel | ARM64 Linux | Socket-Builtins (ARM64-Syscall-Nummern anpassen) |
+| Niedrig | Windows ARM64 | PrintStr/PrintInt/exit via Win32 API als Baseline |
+| Niedrig | Windows ARM64 | mmap→VirtualAlloc + String S0 |
+| Niedrig | Xtensa | PrintInt + peek/poke (für MMIO) |
+| Niedrig | Xtensa | StrNew→heap_caps_malloc + String S0 |
+
+---
+
 ## Aktuelle Aufgaben
 
 ### std.net Library
