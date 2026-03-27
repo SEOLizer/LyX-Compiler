@@ -108,6 +108,36 @@ initialization
   AddBuiltin('', 'StrAppend', 'StrAppend', atPChar,  [atPChar, atPChar]);
   AddBuiltin('', 'StrFromInt','StrFromInt',atPChar,  [atInt64]);
 
+  // S1: String split primitives
+  AddBuiltin('', 'StrFindChar', 'StrFindChar', atInt64,  [atPChar, atInt64, atInt64]);
+  AddBuiltin('', 'StrSub',      'StrSub',      atPChar,  [atPChar, atInt64, atInt64]);
+
+  // S2: StringBuilder / concat
+  AddBuiltin('', 'StrAppendStr', 'StrAppendStr', atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrConcat',    'StrConcat',    atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrCopy',      'StrCopy',      atPChar, [atPChar]);
+
+  // S3: IntToStr alias
+  AddBuiltin('', 'IntToStr', 'IntToStr', atPChar, [atInt64]);
+
+  // S4: FileGetSize
+  AddBuiltin('', 'FileGetSize', 'FileGetSize', atInt64, [atPChar]);
+
+  // S5: O(1) HashMap (string -> int64)
+  AddBuiltin('', 'HashNew', 'HashNew', atPChar,  [atInt64]);
+  AddBuiltin('', 'HashSet', 'HashSet', atVoid,   [atPChar, atPChar, atInt64]);
+  AddBuiltin('', 'HashGet', 'HashGet', atInt64,  [atPChar, atPChar]);
+  AddBuiltin('', 'HashHas', 'HashHas', atBool,   [atPChar, atPChar]);
+
+  // S6: Argv access
+  AddBuiltin('', 'GetArgC', 'GetArgC', atInt64, []);
+  AddBuiltin('', 'GetArg',  'GetArg',  atPChar, [atInt64]);
+
+  // S7: String comparison
+  AddBuiltin('', 'StrStartsWith', 'StrStartsWith', atBool,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrEndsWith',   'StrEndsWith',   atBool,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrEquals',     'StrEquals',     atBool,  [atPChar, atPChar]);
+
   // Debug namespace - In-Situ Data Visualizer
   // Inspect akzeptiert jeden Typ - die Typprüfung erfolgt speziell in Sema
   // Der Parameter wird als int64 deklariert, aber Sema erlaubt jeden Typ

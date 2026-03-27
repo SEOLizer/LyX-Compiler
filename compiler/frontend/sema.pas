@@ -1813,6 +1813,168 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // === S1: String split primitives ===
+  // StrFindChar(s: string, c: int64, from: int64): int64 — scan for char from offset; -1 if not found
+  s := TSymbol.Create('StrFindChar');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrSub(s: string, start: int64, len: int64): string — extract substring (mmap'd)
+  s := TSymbol.Create('StrSub');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S2: StringBuilder / concat ===
+  // StrAppendStr(s: string, other: string): string — append another string
+  s := TSymbol.Create('StrAppendStr');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrConcat(a: string, b: string): string — new string = a+b
+  s := TSymbol.Create('StrConcat');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrCopy(s: string): string — deep copy
+  s := TSymbol.Create('StrCopy');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S3: IntToStr alias ===
+  s := TSymbol.Create('IntToStr');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S4: FileGetSize ===
+  // FileGetSize(path: string): int64 — file size via open+lseek+close; -1 on error
+  s := TSymbol.Create('FileGetSize');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S5: O(1) HashMap (string -> int64) via FNV-1a + open addressing ===
+  // HashNew(cap: int64): string — allocate map with initial capacity cap (rounded to power-of-2)
+  s := TSymbol.Create('HashNew');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // HashSet(map: string, key: string, val: int64)
+  s := TSymbol.Create('HashSet');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // HashGet(map: string, key: string): int64 — returns 0 if not found
+  s := TSymbol.Create('HashGet');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // HashHas(map: string, key: string): bool
+  s := TSymbol.Create('HashHas');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S6: Argv access ===
+  // GetArgC(): int64 — number of command-line arguments
+  s := TSymbol.Create('GetArgC');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 0;
+  SetLength(s.ParamTypes, 0);
+  AddSymbolToCurrent(s, NullSpan);
+
+  // GetArg(idx: int64): string — argv[idx] as pchar (static, no alloc)
+  s := TSymbol.Create('GetArg');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // === S7: String comparison ===
+  // StrStartsWith(s: string, prefix: string): bool
+  s := TSymbol.Create('StrStartsWith');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrEndsWith(s: string, suffix: string): bool
+  s := TSymbol.Create('StrEndsWith');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // StrEquals(a: string, b: string): bool
+  s := TSymbol.Create('StrEquals');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 2;
+  SetLength(s.ParamTypes, 2);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
 end;
 
 procedure TSema.RegisterTObject;

@@ -73,13 +73,13 @@ IPv6-Support, DataFrame, LyxVision etc. kommen erst in Stufe 2.
 
 | # | Feature | Workaround | Priorität |
 |---|---------|------------|-----------|
-| S1 | **StrSplit(s, delim)** | Manuell mit StrCharAt | Hoch |
-| S2 | **StrAppend / StringBuilder** | mmap-Buffer + StrCopy | Hoch |
-| S3 | **IntToStr(n)** | Schon als `itoa`-Pattern in Tests | Mittel |
-| S4 | **FileGetSize(path)** | open+lseek+close | Mittel |
-| S5 | **HashMap O(1)** | std.hash ist O(n) – für Symboltabelle langsam | Mittel |
-| S6 | **Argv[i] als pchar lesen** | `peek64(argv + i*8)` direkt | Mittel |
-| S7 | **StrStartsWith / StrEndsWith** | Manuell | Niedrig |
+| S1 | **StrFindChar + StrSub** | ✅ Implementiert (feat/string-utils) | Hoch |
+| S2 | **StrAppendStr / StrConcat / StrCopy** | ✅ Implementiert (feat/string-utils) | Hoch |
+| S3 | **IntToStr(n)** | ✅ Implementiert (feat/string-utils) | Mittel |
+| S4 | **FileGetSize(path)** | ✅ Implementiert (feat/string-utils) | Mittel |
+| S5 | **HashMap O(1) (string→int64)** | ✅ Implementiert (feat/string-utils) | Mittel |
+| S6 | **GetArgC / GetArg** | ✅ Implementiert (feat/string-utils) | Mittel |
+| S7 | **StrStartsWith / StrEndsWith / StrEquals** | ✅ Implementiert (feat/string-utils) | Niedrig |
 
 ---
 
