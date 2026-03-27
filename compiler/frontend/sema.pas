@@ -42,7 +42,8 @@ type
     FUnitManager: TUnitManager;
     FImportedUnits: TStringList; // Alias -> UnitPath for resolving qualified names
     FStructTypes: TStringList; // name -> TAstStructDecl as object
-    FClassTypes: TStringList; // name -> TAstClassDecl as object
+    FClassTypes: TStringList;  // name -> TAstClassDecl as object
+    FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -3386,10 +3387,20 @@ begin
         else
           vtype := vd.DeclType;  // Use declared type if no initializer
         
+        // Resolve enum type names: var x: TokenKind := ... → treat as int64
+        if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
+           Assigned(FEnumTypes) and (FEnumTypes.IndexOf(vd.DeclTypeName) >= 0) then
+        begin
+          // Enum type: accept int64 values (enum values are int64 constants)
+          if not (vtype in [atInt64, atUnresolved]) then
+            FDiag.Error(Format('type mismatch in declaration of %s: expected enum %s (int64), got %s',
+              [vd.Name, vd.DeclTypeName, AurumTypeToStr(vtype)]), vd.Span);
+          vtype := atInt64;
+        end
         // Special case: treat fn(...) types as int64 internally (opaque function pointer)
         // Also handle the case where DeclType is unresolved but DeclTypeName is set (type alias)
-        if (vd.DeclType = atFnPtr) or 
-           ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
+        else if (vd.DeclType = atFnPtr) or
+           ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
             Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
         begin
           // Function pointer - keep as fn pointer type for proper resolution
@@ -3781,6 +3792,8 @@ begin
   FStructTypes.Sorted := False;
   FClassTypes := TStringList.Create;
   FClassTypes.Sorted := False;
+  FEnumTypes := TStringList.Create;
+  FEnumTypes.Sorted := False;
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
@@ -3802,11 +3815,13 @@ begin
   if Assigned(FImportedUnits) then
     FImportedUnits.Free;
   
-  // FClassTypes und FStructTypes nicht freigeben - sie halten AST-Referenzen
+  // FClassTypes, FStructTypes, FEnumTypes nicht freigeben (sie halten AST-Referenzen)
   if Assigned(FClassTypes) then
     FClassTypes.Free;
   if Assigned(FStructTypes) then
     FStructTypes.Free;
+  if Assigned(FEnumTypes) then
+    FEnumTypes.Free;
 
   // Freigabe aller verbleibenden Scopes (insbesondere globaler Scope)
   while Length(FScopes) > 0 do
@@ -4463,6 +4478,10 @@ begin
       begin
         if not TAstEnumDecl(decl).IsPublic then
           Continue;
+        // Register the enum type name so it can be used as a variable type
+        if TAstEnumDecl(decl).Name <> '<anon>' then
+          if FEnumTypes.IndexOf(TAstEnumDecl(decl).Name) < 0 then
+            FEnumTypes.Add(TAstEnumDecl(decl).Name);
         for j := 0 to High(TAstEnumDecl(decl).Values) do
         begin
           if ResolveSymbol(TAstEnumDecl(decl).Values[j].Name) <> nil then
@@ -5278,6 +5297,12 @@ begin
     end
     else if node is TAstEnumDecl then
     begin
+      // Register the enum type name so it can be used in variable declarations
+      if TAstEnumDecl(node).Name <> '<anon>' then
+      begin
+        if FEnumTypes.IndexOf(TAstEnumDecl(node).Name) < 0 then
+          FEnumTypes.Add(TAstEnumDecl(node).Name);
+      end;
       // Register each enum value as a compile-time integer constant
       for j := 0 to High(TAstEnumDecl(node).Values) do
       begin
@@ -5379,7 +5404,10 @@ begin
         begin
           structIdx := FStructTypes.IndexOf(sym.TypeName);
           if structIdx >= 0 then
-            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx]);
+            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx])
+          // If it's an enum type, resolve to int64
+          else if Assigned(FEnumTypes) and (FEnumTypes.IndexOf(sym.TypeName) >= 0) then
+            sym.DeclType := atInt64;
         end;
         AddSymbolToCurrent(sym, fn.Params[j].Span);
       end;
