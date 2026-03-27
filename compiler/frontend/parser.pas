@@ -502,11 +502,13 @@ begin
 end;
 
 function TParser.ParseEnumDecl(isPub: Boolean): TAstEnumDecl;
-// Syntax:
+// Syntax (new, comma-separated):
 //   [pub] enum Name {
-//     VALUE1;           // auto-value: 0, 1, 2, ...
-//     VALUE2 := expr;   // explicit value
+//     VALUE1,           // auto-value: 0, 1, 2, ...
+//     VALUE2 = expr,    // explicit value
 //   };
+// Also accepts old semicolon-separated syntax for backwards compatibility:
+//   [pub] enum Name { VALUE1; VALUE2 := 5; };
 var
   ename:    string;
   values:   TEnumValueList;
@@ -539,7 +541,8 @@ begin
     end;
     valName := FCurTok.Value;
     Advance;
-    if Accept(tkAssign) then
+    // Accept both = (new) and := (old) for explicit value assignment
+    if Accept(tkSingleEq) or Accept(tkAssign) then
     begin
       initExpr := ParseExpr;
       if initExpr is TAstIntLit then
@@ -557,7 +560,9 @@ begin
     values[High(values)].Name  := valName;
     values[High(values)].Value := nextVal;
     Inc(nextVal);
-    Expect(tkSemicolon);
+    // Accept , (new) or ; (old) as separator; both are optional before }
+    if not Accept(tkComma) then
+      Accept(tkSemicolon);
   end;
   Expect(tkRBrace);
   Expect(tkSemicolon);
