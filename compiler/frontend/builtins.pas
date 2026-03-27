@@ -100,6 +100,43 @@ initialization
 
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrLen',    'StrLen',    atInt64,  [atPChar]);
+  AddBuiltin('', 'StrCharAt', 'StrCharAt', atInt64,  [atPChar, atInt64]);
+  AddBuiltin('', 'StrSetChar','StrSetChar',atVoid,   [atPChar, atInt64, atInt64]);
+  AddBuiltin('', 'StrNew',    'StrNew',    atPChar,  [atInt64]);
+  AddBuiltin('', 'StrFree',   'StrFree',   atVoid,   [atPChar]);
+  AddBuiltin('', 'StrAppend', 'StrAppend', atPChar,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrFromInt','StrFromInt',atPChar,  [atInt64]);
+
+  // S1: String split primitives
+  AddBuiltin('', 'StrFindChar', 'StrFindChar', atInt64,  [atPChar, atInt64, atInt64]);
+  AddBuiltin('', 'StrSub',      'StrSub',      atPChar,  [atPChar, atInt64, atInt64]);
+
+  // S2: StringBuilder / concat
+  AddBuiltin('', 'StrAppendStr', 'StrAppendStr', atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrConcat',    'StrConcat',    atPChar, [atPChar, atPChar]);
+  AddBuiltin('', 'StrCopy',      'StrCopy',      atPChar, [atPChar]);
+
+  // S3: IntToStr alias
+  AddBuiltin('', 'IntToStr', 'IntToStr', atPChar, [atInt64]);
+
+  // S4: FileGetSize
+  AddBuiltin('', 'FileGetSize', 'FileGetSize', atInt64, [atPChar]);
+
+  // S5: O(1) HashMap (string -> int64)
+  AddBuiltin('', 'HashNew', 'HashNew', atPChar,  [atInt64]);
+  AddBuiltin('', 'HashSet', 'HashSet', atVoid,   [atPChar, atPChar, atInt64]);
+  AddBuiltin('', 'HashGet', 'HashGet', atInt64,  [atPChar, atPChar]);
+  AddBuiltin('', 'HashHas', 'HashHas', atBool,   [atPChar, atPChar]);
+
+  // S6: Argv access
+  AddBuiltin('', 'GetArgC', 'GetArgC', atInt64, []);
+  AddBuiltin('', 'GetArg',  'GetArg',  atPChar, [atInt64]);
+
+  // S7: String comparison
+  AddBuiltin('', 'StrStartsWith', 'StrStartsWith', atBool,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrEndsWith',   'StrEndsWith',   atBool,  [atPChar, atPChar]);
+  AddBuiltin('', 'StrEquals',     'StrEquals',     atBool,  [atPChar, atPChar]);
 
   // Debug namespace - In-Situ Data Visualizer
   // Inspect akzeptiert jeden Typ - die Typprüfung erfolgt speziell in Sema
