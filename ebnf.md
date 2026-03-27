@@ -438,6 +438,23 @@ player.health--;     // player.health := player.health - 1
 * `Random`: LCG-Implementierung (seed * 1103515245 + 12345) mod 2^31
 * `RandomSeed`: Setzt LCG-Seed im Data-Segment
 
+**Dynamic String Builtins** (mmap-basierte Strings, Header `[cap:8][len:8][data...]`):
+* `StrNew(cap)` / `StrFree(s)`: Allokation / Freigabe via mmap/munmap
+* `StrLen(s)` / `StrCharAt(s,i)` / `StrSetChar(s,i,c)`: Grundoperationen
+* `StrAppend(dest,src)`: Immer-reallozierende Konkatenation, gibt neuen Pointer zurück
+* `StrAppendStr(dest,src)`: In-place Append, gibt denselben Pointer zurück
+* `StrConcat(a,b)` / `StrCopy(s)`: Neue Puffer-Allokation
+* `StrFindChar(s,ch,start)` / `StrSub(s,start,len)`: Suche und Extraktion
+* `StrStartsWith(s,prefix)` / `StrEndsWith(s,suffix)` / `StrEquals(a,b)`: Vergleiche
+* `IntToStr(n)` / `StrFromInt(n)`: Integer-zu-String-Konvertierung
+* `FileGetSize(path)`: Dateigröße via open+lseek+close
+
+**HashMap Builtins** (FNV-1a O(1), string→int64):
+* `HashNew(cap)` / `HashSet(m,k,v)` / `HashGet(m,k)` / `HashHas(m,k)`
+
+**Argv Builtins**:
+* `GetArgC()` / `GetArg(i)`: Zugriff auf Kommandozeilenargumente
+
 ---
 
 ## 9) Beispiele
