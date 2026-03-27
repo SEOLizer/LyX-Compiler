@@ -4366,9 +4366,10 @@ var
   upath: string;
   loadedUnit: TLoadedUnit;
   alias: string;
-  i, j: Integer;
+  i, j, k: Integer;
   decl: TAstNode;
   fn: TAstFuncDecl;
+  m: TAstFuncDecl;
   con: TAstConDecl;
   vd: TAstVarDecl;
   sym: TSymbol;
@@ -4520,6 +4521,27 @@ begin
         if FClassTypes.IndexOf(TAstClassDecl(decl).Name) < 0 then
         begin
           FClassTypes.AddObject(TAstClassDecl(decl).Name, System.TObject(decl));
+        end;
+        // Also register mangled method symbols so calls like sb.Init() resolve
+        for j := 0 to High(TAstClassDecl(decl).Methods) do
+        begin
+          m := TAstClassDecl(decl).Methods[j];
+          sym := TSymbol.Create('_L_' + TAstClassDecl(decl).Name + '_' + m.Name);
+          if ResolveSymbol(sym.Name) <> nil then
+          begin
+            sym.Free;
+            Continue;
+          end;
+          sym.Kind := symFunc;
+          sym.DeclType := m.ReturnType;
+          sym.ReturnTypeName := m.ReturnTypeName;
+          sym.IsImported := True;
+          sym.ParamCount := Length(m.Params) + 1; // +1 for implicit self
+          SetLength(sym.ParamTypes, sym.ParamCount);
+          sym.ParamTypes[0] := atUnresolved; // self pointer
+          for k := 0 to High(m.Params) do
+            sym.ParamTypes[k+1] := m.Params[k].ParamType;
+          AddSymbolToCurrent(sym, m.Span);
         end;
       end;
     end;
