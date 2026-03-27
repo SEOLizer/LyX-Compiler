@@ -2207,6 +2207,155 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := t0;
         end
+        // S1: String split primitives
+        else if call.Name = 'StrFindChar' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrFindChar';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'StrSub' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrSub';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S2: StringBuilder
+        else if call.Name = 'StrAppendStr' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrAppendStr';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'StrConcat' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrConcat';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'StrCopy' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrCopy';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S3: IntToStr alias
+        else if call.Name = 'IntToStr' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrFromInt';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S4: FileGetSize
+        else if call.Name = 'FileGetSize' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'FileGetSize';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S5: HashMap
+        else if call.Name = 'HashNew' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'HashNew';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'HashSet' then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'HashSet';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        else if call.Name = 'HashGet' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'HashGet';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'HashHas' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'HashHas';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S6: Argv access
+        else if call.Name = 'GetArgC' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'GetArgC';
+          instr.ImmInt := 0; SetLength(instr.ArgTemps, 0);
+          instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'GetArg' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'GetArg';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        // S7: String comparison
+        else if call.Name = 'StrStartsWith' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrStartsWith';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'StrEndsWith' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrEndsWith';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
+        else if call.Name = 'StrEquals' then
+        begin
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'StrEquals';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
         else if ((call.Name = 'RegexMatch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
         begin
