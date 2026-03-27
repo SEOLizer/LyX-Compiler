@@ -46,6 +46,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ HashMap Builtins: HashNew/HashSet/HashGet/HashHas — O(1) FNV-1a string→int64 map (v0.5.6)
 ✅ Argv Builtins: GetArgC/GetArg — access command-line arguments (v0.5.6)
 ✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.6)
+✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ```
 
 ---
@@ -1624,6 +1625,77 @@ fn main(): int64 {
 }
 ```
 
+#### String Library (`std.string`)
+
+Import `std.string` for higher-level string utilities built on top of the builtins above.
+
+**`StrTrim(s)`** — strips leading and trailing whitespace, returns a new heap-allocated string:
+
+```lyx
+import std.string;
+
+var t: pchar := StrTrim("  hello  ");
+PrintStr(t);   // hello
+StrFree(t);
+```
+
+**`StrSplit(s, delim, out, maxParts)`** — splits `s` on `delim`, stores result pointers into `out` (an `int64` pointing to a pchar array), returns the number of parts. Each part is heap-allocated and must be freed with `StrFree`. Pass `maxParts` to limit the number of splits (the last part receives the remainder):
+
+```lyx
+import std.string;
+
+var parts: int64 := mmap(0, 80, 3, 34, -1, 0);
+var n: int64 := StrSplit("a,b,c", ",", parts, 10);
+// n == 3
+var p0: pchar := peek64(parts)      as pchar;   // "a"
+var p1: pchar := peek64(parts + 8)  as pchar;   // "b"
+var p2: pchar := peek64(parts + 16) as pchar;   // "c"
+StrFree(p0); StrFree(p1); StrFree(p2);
+```
+
+**`StringBuilder`** — a growable string builder class:
+
+```lyx
+import std.string;
+
+fn main(): int64 {
+  var sb: StringBuilder := new StringBuilder();
+  sb.Init(16);
+  sb.Append("Hello");
+  sb.Append(", ");
+  sb.Append("World");
+  sb.AppendChar(33);   // '!'
+  sb.AppendInt(42);
+
+  var result: pchar := sb.ToString();
+  PrintStr(result);    // Hello, World!42
+  PrintStr("\n");
+  StrFree(result);
+
+  sb.Clear();
+  sb.Append("After clear");
+  var r2: pchar := sb.ToString();
+  PrintStr(r2);        // After clear
+  StrFree(r2);
+
+  sb.FreeBuffer();
+  dispose sb;
+  return 0;
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `sb.Init(cap)` | Allocate internal buffer with initial capacity |
+| `sb.Append(s)` | Append a `pchar` string |
+| `sb.AppendChar(c)` | Append a single character (as `int64`) |
+| `sb.AppendInt(n)` | Append integer as decimal string |
+| `sb.ToString()` | Return heap-allocated copy of the current content |
+| `sb.Clear()` | Reset length to 0 (keeps buffer allocated) |
+| `sb.FreeBuffer()` | Release the internal buffer (call before `dispose sb`) |
+
+> **Note:** The release method is named `FreeBuffer()`, not `Free()`, because `Free` is a reserved VMT slot on the base `TObject` class.
+
 #### Float Formatting
 
 `PrintFloat` outputs a float value to stdout. For formatted output with controlled decimal places, use the Pascal-style `:width:decimals` specifier in function arguments:
@@ -1776,7 +1848,7 @@ A comprehensive set of standard units is located in the `std/` directory, provid
 
 - **std/math.lyx** – Integer helpers (`Abs64`, `Min64`, `Max64`, `Div64`, `Mod64`, `TimesTwo`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`)
 - **std/io.lyx** – I/O wrappers (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-type-conversion)
-- **std/string.lyx** – Comprehensive string library with 25+ functions
+- **std/string.lyx** – Comprehensive string library with 28+ functions: `StrToUpper`, `StrToLower`, `StrFind`, `StrReplace`, `StrRepeat`, `StrPadLeft`, `StrPadRight`, `StrTrim`, `StrSplit`, `StringBuilder` class, and more
 - **std/env.lyx** – Environment API (`init`, `ArgCount`, `Arg`)
 - **std/time.lyx** – Date and time calculations (numerical, timezone support)
 - **std/geo.lyx** – Geolocation: GeoPoint, DistanceM, BoundingBox, DMS parsing, Navigation
