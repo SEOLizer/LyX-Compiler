@@ -2685,9 +2685,52 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         end
         else
         begin
+          // Handle unprocessed namespace method calls: obj.method(args)
+          // This occurs in imported class method bodies where sema didn't run.
+          // The parser generates call.Namespace = "self" (or another var), call.Name = "method".
+          if call.Namespace <> '' then
+          begin
+            loc := ResolveLocal(call.Namespace);
+            if loc >= 0 then
+            begin
+              // Determine class type of the receiver
+              mangled := '';
+              if (call.Namespace = 'self') and Assigned(FCurrentClassDecl) then
+                mangled := '_L_' + FCurrentClassDecl.Name + '_' + call.Name
+              else if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+                mangled := '_L_' + FLocalTypeNames[loc] + '_' + call.Name;
+              if mangled <> '' then
+              begin
+                // Load receiver
+                t1 := NewTemp;
+                instr.Op := irLoadLocal;
+                instr.Dest := t1;
+                instr.Src1 := loc;
+                Emit(instr);
+                // Emit: _L_ClassName_MethodName(receiver, arg1, arg2, ...)
+                t0 := NewTemp;
+                instr.Op := irCall;
+                instr.Dest := t0;
+                instr.ImmStr := mangled;
+                instr.ImmInt := argCount + 1;
+                instr.IsVirtualCall := False;
+                instr.VMTIndex := -1;
+                instr.SelfSlot := -1;
+                instr.CallMode := cmInternal;
+                SetLength(instr.ArgTemps, argCount + 1);
+                instr.ArgTemps[0] := t1;
+                for i := 0 to argCount - 1 do
+                  instr.ArgTemps[i + 1] := argTemps[i];
+                Emit(instr);
+                Result := t0;
+                Exit;
+              end;
+            end;
+          end;
+
           // Regular function call (or function pointer call)
           t0 := NewTemp;
-          
+
           // Check if this is a function pointer call (indirect call)
           if call.IsIndirectCall then
           begin
@@ -3306,15 +3349,60 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           end
           else
           begin
-            // Fallback to name-based access (slower / requires runtime lookup)
-            // Assume struct for fallback
-            instr.Op := irLoadField;
-           instr.Dest := t0;
-           instr.Src1 := t1;
-           instr.LabelName := TAstFieldAccess(expr).Field;
-           instr.FieldSize := TypeSizeBytes(fldType);
-           Emit(instr);
-         end;
+            // FieldOffset not set by sema (e.g., imported class methods not fully sema'd).
+            // Try to resolve the field by name using the current class context.
+            fldOffset := -1;
+            ownerName := '';
+            if Assigned(FCurrentClassDecl) then
+            begin
+              // Walk current class and base classes to find the field
+              cd := FCurrentClassDecl;
+              while Assigned(cd) do
+              begin
+                for k := 0 to High(cd.Fields) do
+                begin
+                  if cd.Fields[k].Name = TAstFieldAccess(expr).Field then
+                  begin
+                    fldOffset := cd.FieldOffsets[k];
+                    fldType := cd.Fields[k].FieldType;
+                    ownerName := FCurrentClassDecl.Name;
+                    Break;
+                  end;
+                end;
+                if fldOffset >= 0 then Break;
+                if cd.BaseClassName <> '' then
+                begin
+                  i := FClassTypes.IndexOf(cd.BaseClassName);
+                  if i >= 0 then
+                    cd := TAstClassDecl(FClassTypes.Objects[i])
+                  else
+                    cd := nil;
+                end
+                else
+                  cd := nil;
+              end;
+            end;
+            if fldOffset >= 0 then
+            begin
+              // Emit heap access for the class field
+              instr.Op := irLoadFieldHeap;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.ImmInt := fldOffset;
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end
+            else
+            begin
+              // Last resort: name-based fallback (likely wrong for heap objects, but best effort)
+              instr.Op := irLoadField;
+              instr.Dest := t0;
+              instr.Src1 := t1;
+              instr.LabelName := TAstFieldAccess(expr).Field;
+              instr.FieldSize := TypeSizeBytes(fldType);
+              Emit(instr);
+            end;
+          end;
          
          // Sign/zero-extend the loaded value to full register width based on field type
          if (fldType <> atUnresolved) and (fldType <> atInt64) and (fldType <> atUInt64) then
@@ -4289,6 +4377,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     slotCount: Integer;
     // nested field access helpers
     baseExpr: TAstExpr;
+    // class field resolution helpers
+    cd: TAstClassDecl;
+    fi: Integer;
+    fldOffset: Integer;
+    fldType: TAurumType;
   begin
   instr := Default(TIRInstr);
   Result := True;
@@ -4809,17 +4902,46 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       
       // Check if target's owner is a class (heap) or struct (stack)
       ownerName := fa.Target.OwnerName;
+      fldOffset := fa.Target.FieldOffset;
+      fldType := fa.Target.FieldType;
+      // If sema didn't annotate the field offset (imported class method bodies),
+      // resolve it now from the current class context.
+      if (fldOffset < 0) and Assigned(FCurrentClassDecl) then
+      begin
+        cd := FCurrentClassDecl;
+        while Assigned(cd) do
+        begin
+          for fi := 0 to High(cd.Fields) do
+          begin
+            if cd.Fields[fi].Name = fa.Target.Field then
+            begin
+              fldOffset := cd.FieldOffsets[fi];
+              fldType := cd.Fields[fi].FieldType;
+              ownerName := FCurrentClassDecl.Name;
+              Break;
+            end;
+          end;
+          if fldOffset >= 0 then Break;
+          if cd.BaseClassName <> '' then
+          begin
+            i := FClassTypes.IndexOf(cd.BaseClassName);
+            if i >= 0 then cd := TAstClassDecl(FClassTypes.Objects[i])
+            else cd := nil;
+          end
+          else cd := nil;
+        end;
+      end;
       if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
       begin
         // Class: use positive offset (heap access)
         instr.Op := irStoreFieldHeap;
         instr.Src1 := t1; // base pointer (heap address)
         instr.Src2 := t2; // value temp
-        if fa.Target.FieldOffset >= 0 then
-          instr.ImmInt := fa.Target.FieldOffset // positive offset for heap
+        if fldOffset >= 0 then
+          instr.ImmInt := fldOffset // positive offset for heap
         else
           instr.LabelName := fa.Target.Field;
-        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
+        instr.FieldSize := TypeSizeBytes(fldType);
         Emit(instr);
       end
       else
@@ -4828,11 +4950,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         instr.Op := irStoreField;
         instr.Src1 := t1; // base pointer
         instr.Src2 := t2; // value temp
-        if fa.Target.FieldOffset >= 0 then
-          instr.ImmInt := fa.Target.FieldOffset
+        if fldOffset >= 0 then
+          instr.ImmInt := fldOffset
         else
           instr.LabelName := fa.Target.Field;
-        instr.FieldSize := TypeSizeBytes(fa.Target.FieldType);
+        instr.FieldSize := TypeSizeBytes(fldType);
         Emit(instr);
       end;
       Exit(True);

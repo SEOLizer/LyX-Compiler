@@ -192,7 +192,7 @@ Sema: FEnumTypes-Registry; VarDecl + Param-Auflösung für Enum-Typen.
 
 ---
 
-### WP-05: Self-Hosted Lexer
+### WP-05: Self-Hosted Lexer ✅ DONE
 
 **Beschreibung:**
 Schreibe den Lyx-Lexer in Lyx. Dies ist der erste echte Bootstrap-Schritt.
@@ -200,37 +200,23 @@ Der Lexer liest `pchar`-Quelltext und produziert eine Liste von Token.
 
 **Datei:** `bootstrap/lexer.lyx`
 
-**Token-Repräsentation (ohne Enums, mit con-Konstanten):**
-```lyx
-// Token-Typen als Konstanten
-con TK_EOF:     int64 := 0;
-con TK_IDENT:   int64 := 1;
-con TK_INT:     int64 := 2;
-con TK_STRING:  int64 := 3;
-con TK_PLUS:    int64 := 4;
-// ... usw.
+**Umgesetzt:**
+1. `pub type Lexer = class` mit 17 Feldern, 13 Methoden ✅
+2. 120 `pub con TK_*` Token-Konstanten ✅
+3. Keywords, Identifiers, Operatoren (alle Lyx-Operatoren) ✅
+4. Integer-Literale: Dezimal, Hex (`0xFF`), Binär (`0b1010`) ✅
+5. String-Literale mit Escape-Sequenzen ✅
+6. Char-Literale ✅
+7. Zeilenkommentare `//` und Block-Kommentare `/* */` ✅
+8. `Peek()` ohne Verbrauch ✅
+9. `LexerTokKindStr()` Hilfsfunktion ✅
 
-struct Token {
-  kind:  int64;   // TK_xxx Konstante
-  start: int64;   // Offset in Quellpuffer
-  len:   int64;   // Länge in Bytes
-  iVal:  int64;   // Für int-Literale
-}
-```
+**Compiler-Fixes (IR-Lowerer):**
+- Importierte Klassen müssen `pub` deklariert sein (sonst null-Pointer-Allokation)
+- Field-Offset-Fallback für importierte Klassen-Methoden (sema läuft nicht auf importierten Methoden)
+- Namespace-Methodenaufruf-Rewriting (`self.method()` → `_L_ClassName_method(self)`) im IR-Lowerer
 
-**Was zu tun:**
-1. `Lexer`-Klasse mit:
-   - `fn Init(src: pchar, srcLen: int64)`
-   - `fn Next(): Token` – liest nächstes Token
-   - `fn Peek(): Token` – schaut voraus ohne zu konsumieren
-2. Alle Lyx-Tokens implementieren (ca. 60 Token-Typen)
-3. String-Literale (mit Escape-Sequenzen)
-4. Hex/Binary/Dezimal-Zahlen
-5. Zeilenkommentare `//` und Block-Kommentare `/* */`
-
-**Test:** `tests/lyx/bootstrap/test_lexer.lyx`
-Input: Einfache Lyx-Quelldateien
-Expected: Korrekte Token-Sequenz
+**Test:** `tests/lyx/bootstrap/test_lexer.lyx` ✅ (alle 7 Tests bestanden)
 
 **Abhängigkeiten:** WP-02 (StringBuilder), WP-03 (FileReadAll)
 
