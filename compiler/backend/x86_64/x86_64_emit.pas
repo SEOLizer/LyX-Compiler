@@ -4116,9 +4116,9 @@ begin
                   EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $4F); EmitU8(FCode, $F0);  // mov rcx,[rdi-16]
                   // cmp rax, rcx (new_total vs cap) (48 39 C8)
                   EmitU8(FCode, $48); EmitU8(FCode, $39); EmitU8(FCode, $C8);
-                  // jl fits_in_place (if new_total < cap, short forward jump)
-                  EmitU8(FCode, $7C); EmitU8(FCode, $00);
-                  leaPos := FCode.Size - 1;  // patch target for jl
+                  // jl fits_in_place (if new_total < cap, near 32-bit forward jump)
+                  EmitU8(FCode, $0F); EmitU8(FCode, $8C); EmitU32(FCode, 0);
+                  leaPos := FCode.Size - 4;  // patch target for jl (32-bit offset)
 
                   // ELSE: need realloc path
                   // mmap new buf: size = (new_total)*2 + 17
@@ -4177,8 +4177,8 @@ begin
                   EmitU8(FCode, $EB); EmitU8(FCode, $00);
                   arg3 := FCode.Size - 1;  // patch jmp done
 
-                  // fits_in_place: patch jl target
-                  FCode.PatchU8(leaPos, Byte(FCode.Size - (leaPos + 1)));
+                  // fits_in_place: patch jl target (32-bit near jump offset)
+                  FCode.PatchU32LE(leaPos, Cardinal(FCode.Size - (leaPos + 4)));
                   // rdi = s = [rsp+0]
                   EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $3C); EmitU8(FCode, $24);  // mov rdi,[rsp+0]
                   // dst = s + len_s = rdi + [rsp+16]

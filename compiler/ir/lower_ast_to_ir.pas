@@ -705,10 +705,12 @@ procedure TIRLowering.LowerImportedUnits(um: TUnitManager);
   Phase 2: Import all functions and global variables
   This ensures constants are available when function bodies are lowered }
 var
-  i, j, k: Integer;
+  i, j, k, mi: Integer;
   loadedUnit: TLoadedUnit;
   node: TAstNode;
   fn: TIRFunction;
+  m: TAstFuncDecl;
+  mangled: string;
   unitAST: TAstProgram;
   cv: TConstValue;
   con: TAstConDecl;
@@ -766,6 +768,79 @@ begin
             FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
             // Also store in IR module for VMT emission
             FModule.AddClassDecl(TAstClassDecl(node));
+            // Lower each class method so the machine code is generated
+            FCurrentClassDecl := TAstClassDecl(node);
+            for mi := 0 to High(TAstClassDecl(node).Methods) do
+            begin
+              m := TAstClassDecl(node).Methods[mi];
+              mangled := '_L_' + TAstClassDecl(node).Name + '_' + m.Name;
+              fn := FModule.AddFunction(mangled);
+              FCurrentFunc := fn;
+              FCurrentFuncDecl := m;
+              FLocalMap.Clear;
+              for k := 0 to Length(FLocalConst) - 1 do
+                if Assigned(FLocalConst[k]) then
+                  FLocalConst[k].Free;
+              SetLength(FLocalConst, 0);
+              FTempCounter := 0;
+              if m.IsStatic then
+              begin
+                fn.ParamCount := Length(m.Params);
+                fn.LocalCount := fn.ParamCount;
+                SetLength(FLocalTypes, fn.LocalCount);
+                SetLength(FLocalConst, fn.LocalCount);
+                SetLength(FLocalIsStruct, fn.LocalCount);
+                SetLength(FLocalElemSize, fn.LocalCount);
+                for k := 0 to High(m.Params) do
+                begin
+                  FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
+                  FLocalTypes[k] := m.Params[k].ParamType;
+                  FLocalConst[k] := nil;
+                  FLocalIsStruct[k] := False;
+                  FLocalElemSize[k] := 0;
+                end;
+              end
+              else
+              begin
+                fn.ParamCount := Length(m.Params) + 1;
+                fn.LocalCount := fn.ParamCount;
+                SetLength(FLocalTypes, fn.LocalCount);
+                SetLength(FLocalConst, fn.LocalCount);
+                SetLength(FLocalIsStruct, fn.LocalCount);
+                SetLength(FLocalElemSize, fn.LocalCount);
+                FLocalMap.AddObject('self', IntToObj(0));
+                FLocalTypes[0] := atUnresolved;
+                FLocalConst[0] := nil;
+                FLocalIsStruct[0] := False;
+                FLocalElemSize[0] := 0;
+                for k := 0 to High(m.Params) do
+                begin
+                  FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
+                  FLocalTypes[k+1] := m.Params[k].ParamType;
+                  FLocalConst[k+1] := nil;
+                  FLocalIsStruct[k+1] := False;
+                  FLocalElemSize[k+1] := 0;
+                end;
+              end;
+              if m.IsAbstract then
+              begin
+                FCurrentFunc := nil;
+                FCurrentFuncDecl := nil;
+                Continue;
+              end;
+              for k := 0 to High(m.Body.Stmts) do
+                LowerStmt(m.Body.Stmts[k]);
+              if (Length(FCurrentFunc.Instructions) = 0) or
+                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+              begin
+                instr.Op := irReturn;
+                instr.Src1 := -1;
+                Emit(instr);
+              end;
+              FCurrentFunc := nil;
+              FCurrentFuncDecl := nil;
+            end;
+            FCurrentClassDecl := nil;
           end
           // Process constant declarations
           else if node is TAstConDecl then
@@ -1834,6 +1909,84 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             SetLength(instr.ArgTemps, argCount);
             for i := 0 to argCount - 1 do
               instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := -1;
+          end
+          else if (call.Name = 'peek16') then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'peek16';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'poke16') then
+          begin
+            instr.Op := irCallBuiltin;
+            instr.Dest := -1;
+            instr.ImmStr := 'poke16';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := -1;
+          end
+          else if (call.Name = 'peek32') then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'peek32';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'poke32') then
+          begin
+            instr.Op := irCallBuiltin;
+            instr.Dest := -1;
+            instr.ImmStr := 'poke32';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := -1;
+          end
+          else if (call.Name = 'peek64') then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'peek64';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'poke64') then
+          begin
+            instr.Op := irCallBuiltin;
+            instr.Dest := -1;
+            instr.ImmStr := 'poke64';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
             if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
             if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
             Emit(instr);

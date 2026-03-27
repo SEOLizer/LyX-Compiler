@@ -91,50 +91,51 @@ Jedes Paket ist so geschnitten, dass es in **einer Claude-Session** (~2-3h) abge
 
 ### WP-01: Bug Fix – 16-byte Struct Parameter (Blocker)
 
-**Beschreibung:**
+**Status: ✅ Bereits gelöst (nicht durch RDI+RSI-Split, sondern durch Pointer-Passing)**
+
+**Beschreibung (ursprünglich):**
 Wenn eine Funktion einen Struct-Parameter mit >8 Bytes bekommt, schreibt der Prologue
 nur RDI (bytes 0-7) in den Stack, aber nicht RSI (bytes 8-15). Resultat: Felder in der
 zweiten Hälfte des Structs enthalten Garbage.
 
-**Dateien:**
-- `backend/x86_64/x86_64_emit.pas` – Prologue-Generierung bei `irLoadStructAddr` für Parameter
+**Warum bereits gelöst:**
+Lyx übergibt Struct-Parameter grundsätzlich per implizitem Pointer (RDI = Adresse des
+Structs auf dem Caller-Stack), nicht als Wert in RDI+RSI. Der Prologue speichert RDI
+(den Pointer) in Slot 0 — das reicht vollständig. Felder werden über `[rdi+offset]`
+adressiert. Sowohl 16-Byte- als auch 24-Byte-Structs wurden verifiziert (test_struct16_roundtrip.lyx, Exit 0, korrekte Feldwerte).
 
-**Was zu tun:**
-1. In `EmitFunctionPrologue` / Parameterspeicherung: Für 16-byte Struct-Params beide
-   Register (RDI → slot+1, RSI → slot) in den Stack schreiben (analog zum Fix bei Struct-Return).
-2. Test: `tests/lyx/structs/test_struct_param_16.lyx` schreiben und ausführen.
-
-**Akzeptanzkriterium:** Ein 16-byte Struct als Funktionsparameter hat korrekte Feldwerte.
+**Verifiziert mit:**
+- `tests/regression/structs/test_struct16_roundtrip.lyx` → `a: 42`, `b: 99` ✅
+- Inline-Test mit 24-byte Triple-Struct → `sum=6` ✅
 
 **Abhängigkeiten:** keine
 
 ---
 
-### WP-02: Stdlib – StringBuilder & String-Hilfsfunktionen
+### WP-02: Stdlib – StringBuilder & String-Hilfsfunktionen ✅ ERLEDIGT
 
 **Beschreibung:**
 Für den Lexer und Parser brauchen wir dynamisches String-Building und String-Analyse.
 Wir brauchen keinen neuen Sprachtyp – eine `StringBuilder`-Klasse in Lyx reicht.
 
 **Dateien:**
-- `std/string.lyx` – erweitern
+- `std/string.lyx` – erweitert
 
-**Was zu tun:**
-1. **`StringBuilder`-Klasse** (Heap-allokiert):
-   - `new StringBuilder(initialCap: int64)` – allokiert mmap-Buffer
-   - `sb.Append(s: pchar)` – fügt String an
-   - `sb.AppendChar(c: int64)` – fügt ein Zeichen an
-   - `sb.AppendInt(n: int64)` – fügt int64 als Dezimal an
-   - `sb.ToString(): pchar` – gibt null-terminierten String zurück
-   - `sb.Clear()` – setzt Länge auf 0
-   - `sb.Free()` – gibt mmap-Buffer frei
-2. **`StrSplit(s, delim, out: int64, maxParts: int64): int64`** – splittet String
-3. **`StrTrim(s): pchar`** – entfernt führende/schließende Whitespace
-4. **`StrStartsWith(s, prefix): bool`**
-5. **`StrEndsWith(s, suffix): bool`**
-6. **`IntToStr(n: int64, buf: pchar): int64`** – schreibt Dezimaldarstellung, gibt Länge zurück
+**Was erledigt wurde:**
+1. **`StringBuilder`-Klasse** ✅ – `Init`, `Append`, `AppendChar`, `AppendInt`, `ToString`, `Clear`, `FreeBuffer`
+   - Hinweis: Methode heißt `FreeBuffer()` statt `Free()` da `Free` ein TObject-VMT-Slot ist
+2. **`StrSplit(s, delim, out: int64, maxParts: int64): int64`** ✅
+3. **`StrTrim(s): pchar`** ✅ – heap-allocated trimmed copy
+4. **`StrStartsWith(s, prefix): bool`** ✅ – bereits als Builtin vorhanden
+5. **`StrEndsWith(s, suffix): bool`** ✅ – bereits als Builtin vorhanden
+6. **`IntToStr(n: int64): pchar`** ✅ – bereits als Builtin vorhanden
 
-**Test:** `tests/lyx/strings/test_stringbuilder.lyx`
+**Nebenfix (Compiler-Bugs behoben):**
+- `StrAppendStr` `jl`-Overflow (signed byte overflow bei >127 Byte Realloc-Pfad) – gefixt
+- `poke64`/`peek64`/`poke16`/`peek16`/`poke32`/`peek32` fehlten in `lower_ast_to_ir.pas` – gefixt
+- Importierte Klassen-Methoden wurden nicht kompiliert (IR + Sema) – gefixt
+
+**Test:** `tests/feature_checks/strings/test_stringbuilder.lyx` ✅
 
 **Abhängigkeiten:** keine
 
