@@ -141,51 +141,54 @@ Wir brauchen keinen neuen Sprachtyp – eine `StringBuilder`-Klasse in Lyx reich
 
 ---
 
-### WP-03: Stdlib – File Utilities & Argv
+### WP-03: Stdlib – File Utilities & Argv ✅ DONE
 
 **Beschreibung:**
 Vollständige Datei-Lese-Infrastruktur für den Compiler: Quelltext lesen, Dateigröße abfragen,
 und CLI-Argumente als echte `pchar`-Array-Elemente lesen.
 
 **Dateien:**
-- `std/fs.lyx` – erweitern
-- `std/env.lyx` – erweitern
+- `std/fs.lyx` – erweitert
+- `std/env.lyx` – erweitert
 
-**Was zu tun:**
-1. **`FileSize(path: pchar): int64`** – gibt Dateigröße in Bytes zurück (open + lseek(SEEK_END) + close)
-2. **`FileReadAll(path: pchar): pchar`** – allokiert mmap-Buffer in Dateigröße + 1, liest alles, null-terminiert
-3. **`ArgvGet(argv: pchar, i: int64): pchar`** – liest `argv[i]` als Pointer via `peek64(argv + i*8)`
-4. **`ArgvGetStr(argc, argv, name): pchar`** – sucht `--flag=value` Argumente
+**Umgesetzt:**
+1. **`FileSize(path: pchar): int64`** – war bereits vorhanden
+2. **`FileReadAll(path: pchar): pchar`** – mmap-Buffer, liest alles, null-terminiert ✅
+3. **`ArgvGet(argv: pchar, i: int64): pchar`** – `peek64(argv + i*8)` ✅
+4. **`ArgvGetStr(argc, argv, name): pchar`** – `--flag=value` Parser ✅
 
-**Test:** `tests/lyx/stdlib/test_filereadall.lyx` – liest sich selbst und gibt Zeilenanzahl aus
+**Compiler-Fixes:** syscall-Emitter für `open/close/lseek/write/unlink/rename` ergänzt;
+`GetArgV()` als Builtin; kritischer Call-Mode-Bug behoben (cmImported vs cmInternal).
+
+**Test:** `tests/feature_checks/stdlib/test_filereadall.lyx` ✅ (liest sich selbst, 1629 Bytes, 65 Zeilen)
 
 **Abhängigkeiten:** keine
 
 ---
 
-### WP-04: Enum-Typen (Optional, aber empfohlen für Lesbarkeit)
+### WP-04: Enum-Typen ✅ DONE
 
 **Beschreibung:**
 Enums machen Token-Typen, AST-Node-Typen und IR-Opcodes viel lesbarer.
 Als Workaround können `con`-Konstanten verwendet werden, aber echte Enums verbessern
 die Codequalität erheblich.
 
-**Dateien:**
-- `frontend/lexer.pas` – `tkEnum` Token
-- `frontend/parser.pas` – `parseEnumDecl()`
-- `frontend/ast.pas` – `nkEnumDecl`, `TAstEnumDecl`
-- `frontend/sema.pas` – Enum-Typ-Auflösung
-- `ir/lower_ast_to_ir.pas` – Enum → int64
+**Umgesetzt:**
+1. Syntax: `enum TokenKind { tkIdent, tkInt, tkPlus };` → int64-Konstanten (0, 1, 2, ...) ✅
+2. Explizite Werte: `enum HttpStatus { OK = 200, NOT_FOUND = 404 };` ✅
+3. Gemischt: explizit + auto-increment ✅
+4. `switch` auf Enum-Werte funktioniert (int64) ✅
+5. Enum-Typ in Sema: `var x: TokenKind := tkIdent` → `atInt64` ✅
+6. Enum-Typ in Funktionsparametern ✅
+7. Rückwärtskompatibilität: alte Semicolon-Syntax weiterhin unterstützt ✅
 
-**Was zu tun:**
-1. Syntax: `enum TokenKind { tkIdent, tkInt, tkPlus }` → int64-Konstanten (0, 1, 2, ...)
-2. Explizite Werte: `enum TkKind { tkEof = 0, tkIdent = 1 }`
-3. `switch` auf Enum-Werte funktioniert bereits (sind int64)
-4. Enum-Typ in Sema: Zuweisung nur mit gleichen Enum-Werten (oder cast)
+**Compiler-Fixes:** IR-Lowerer: `var x: EnumType := enumValue` wurde fälschlich als
+Funktionszeiger behandelt (TAstIdent-Heuristik). Fix: FConstMap vor fnPtr-Branch prüfen.
+Sema: FEnumTypes-Registry; VarDecl + Param-Auflösung für Enum-Typen.
 
-**Test:** `tests/lyx/enums/test_enum_basic.lyx`
+**Test:** `tests/lyx/enums/test_enum_basic.lyx` ✅
 
-**Abhängigkeiten:** keine (Optional für WP-05+, aber empfohlen)
+**Abhängigkeiten:** keine
 
 ---
 

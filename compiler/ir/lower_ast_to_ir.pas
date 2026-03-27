@@ -4603,10 +4603,13 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         Exit(True);
       end
       // Check for function pointer: either explicit atFnPtr type OR unresolved with function name as initializer
-      // This handles the case where type declarations aren't resolved in sema
-      else if (vd.DeclType = atFnPtr) or 
-              ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and 
-               Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
+      // This handles the case where type declarations aren't resolved in sema.
+      // Exclude the case where the initializer is a compile-time constant (e.g. enum value) —
+      // those must not be treated as function addresses.
+      else if (vd.DeclType = atFnPtr) or
+              ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
+               Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) and
+               (FConstMap.IndexOf(TAstIdent(vd.InitExpr).Name) < 0)) then
       begin
         // Function pointer: allocate one slot and initialize with function address
         loc := AllocLocal(vd.Name, atFnPtr);  // Use atFnPtr for function pointers
