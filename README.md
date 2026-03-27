@@ -42,6 +42,10 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Generics: fn max[T](a: T, b: T): T — monomorphization (v0.5.6)
 ✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.6)
 ✅ Dynamic String Builtins: StrNew/StrFree/StrLen/StrCharAt/StrSetChar/StrAppend/StrFromInt (v0.5.6)
+✅ String Utility Builtins: StrFindChar/StrSub/StrAppendStr/StrConcat/StrCopy/IntToStr/FileGetSize (v0.5.6)
+✅ HashMap Builtins: HashNew/HashSet/HashGet/HashHas — O(1) FNV-1a string→int64 map (v0.5.6)
+✅ Argv Builtins: GetArgC/GetArg — access command-line arguments (v0.5.6)
+✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.6)
 ```
 
 ---
@@ -1591,14 +1595,23 @@ fn main(): int64 {
 | `free(arr)`       | `array -> void`        | Frees heap memory                  |
 
 #### String Manipulation Builtins
-| Function                    | Signature                                    | Description                        |
-|-----------------------------|---------------------------------------------|-------------------------------------|
-| `StrLength(s)`             | `pchar -> int64`                           | Calculates string length           |
-| `str_char_at(s, index)`     | `pchar, int64 -> int64`                    | Reads character at position        |
-| `str_set_char(s, index, c)` | `pchar, int64, int64 -> void`             | Sets character at position         |
-| `StrCompare(s1, s2)`       | `pchar, pchar -> int64`                   | String comparison (0=equal)        |
-| `str_copy_builtin(dest, src)` | `pchar, pchar -> void`                   | Copies string                      |
-| `s1 + s2`                   | `pchar + pchar -> pchar`                   | Concatenates two strings (mmap'd buffer) |
+| Function                        | Signature                          | Description                                    |
+|---------------------------------|------------------------------------|------------------------------------------------|
+| `StrLen(s)`                     | `pchar -> int64`                   | String length (null-terminated)                |
+| `StrCharAt(s, i)`               | `pchar, int64 -> int64`            | Read character at position                     |
+| `StrSetChar(s, i, c)`           | `pchar, int64, int64 -> void`      | Write character at position                    |
+| `StrNew(cap)`                   | `int64 -> pchar`                   | Allocate new string buffer (mmap)              |
+| `StrFree(s)`                    | `pchar -> void`                    | Free string buffer (munmap)                    |
+| `StrAppend(dest, src)`          | `pchar, pchar -> pchar`            | Append src to dest; returns new buffer         |
+| `StrAppendStr(dest, src)`       | `pchar, pchar -> pchar`            | In-place append; returns same pointer          |
+| `StrConcat(a, b)`               | `pchar, pchar -> pchar`            | Concatenate a and b into new buffer            |
+| `StrCopy(s)`                    | `pchar -> pchar`                   | Allocate a copy of s                           |
+| `StrFindChar(s, ch, start)`     | `pchar, int64, int64 -> int64`     | Find first occurrence of char from start       |
+| `StrSub(s, start, len)`         | `pchar, int64, int64 -> pchar`     | Extract substring                              |
+| `StrStartsWith(s, prefix)`      | `pchar, pchar -> bool`             | True if s starts with prefix                   |
+| `StrEndsWith(s, suffix)`        | `pchar, pchar -> bool`             | True if s ends with suffix                     |
+| `StrEquals(a, b)`               | `pchar, pchar -> bool`             | True if a and b are equal                      |
+| `s1 + s2`                       | `pchar + pchar -> pchar`           | Concatenate via operator (mmap'd buffer)       |
 
 **String Concatenation** uses `+` directly:
 
@@ -1634,8 +1647,25 @@ The `:width:decimals` specifier lowers to `format_float(value, width, decimals)`
 #### String Conversion Builtins
 | Function          | Signature               | Description                        |
 |-------------------|------------------------|-------------------------------------|
-| `IntToStr(x)`   | `int64 -> pchar`       | Converts integer to string          |
-| `str_to_int(s)`   | `pchar -> int64`       | Converts string to integer          |
+| `IntToStr(x)`     | `int64 -> pchar`       | Converts integer to string (mmap'd buffer) |
+| `StrFromInt(x)`   | `int64 -> pchar`       | Alias for `IntToStr`               |
+| `FileGetSize(p)`  | `pchar -> int64`       | Returns file size in bytes (open+lseek+close) |
+
+#### HashMap Builtins
+O(1) string→int64 hash map using FNV-1a hashing with open addressing.
+
+| Function                    | Signature                          | Description                        |
+|-----------------------------|------------------------------------|------------------------------------|
+| `HashNew(cap)`              | `int64 -> pchar`                   | Allocate map with `cap` slots (mmap) |
+| `HashSet(m, key, val)`      | `pchar, pchar, int64 -> void`      | Insert or update key→val           |
+| `HashGet(m, key)`           | `pchar, pchar -> int64`            | Lookup value (0 if missing)        |
+| `HashHas(m, key)`           | `pchar, pchar -> bool`             | True if key exists                 |
+
+#### Argv Builtins
+| Function      | Signature        | Description                              |
+|---------------|------------------|------------------------------------------|
+| `GetArgC()`   | `-> int64`       | Number of command-line arguments         |
+| `GetArg(i)`   | `int64 -> pchar` | Pointer to argv[i] (not heap-allocated)  |
 
 #### Math Builtins (22 functions)
 | Function          | Signature               | Description                        |
