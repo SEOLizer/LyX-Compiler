@@ -2481,6 +2481,15 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
           Emit(instr); Result := t0;
         end
+        else if call.Name = 'GetArgV' then
+        begin
+          // GetArgV(): pchar — returns pointer to argv[0] (raw C argv array)
+          t0 := NewTemp;
+          instr.Op := irCallBuiltin; instr.Dest := t0; instr.ImmStr := 'GetArgV';
+          instr.ImmInt := 0; SetLength(instr.ArgTemps, 0);
+          instr.Src1 := -1;
+          Emit(instr); Result := t0;
+        end
         // S7: String comparison
         else if call.Name = 'StrStartsWith' then
         begin
@@ -2545,23 +2554,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.ImmStr := callName;
           instr.ImmInt := Length(callTemps);
           // Determine call mode
-          fn := FModule.FindFunction(callName);
-          // cmExternal has highest priority
+          // cmExternal has highest priority, then cmImported (must check before
+          // FModule.FindFunction because imported functions get added to FModule
+          // when compiled, and we must not treat them as cmInternal).
           if FExternFuncs.IndexOf(callName) >= 0 then
-          begin
             instr.CallMode := cmExternal
-          end
-          else if Assigned(fn) then
-          begin
-            if fn.NeedsStaticLink then
-              instr.CallMode := cmStaticLink
-            else
-              instr.CallMode := cmInternal;
-          end
           else if FImportedFuncs.IndexOf(callName) >= 0 then
             instr.CallMode := cmImported
           else
-            instr.CallMode := cmInternal;
+          begin
+            fn := FModule.FindFunction(callName);
+            if Assigned(fn) then
+            begin
+              if fn.NeedsStaticLink then
+                instr.CallMode := cmStaticLink
+              else
+                instr.CallMode := cmInternal;
+            end
+            else
+              instr.CallMode := cmInternal;
+          end;
           SetLength(instr.ArgTemps, Length(callTemps));
           for i := 0 to High(callTemps) do
             instr.ArgTemps[i] := callTemps[i];
@@ -2829,21 +2841,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             end;
           
           // Determine call mode based on function origin
-          fn := FModule.FindFunction(call.Name);
-          // cmExternal has highest priority
+          // cmExternal has highest priority, then cmImported (must check before
+          // FModule.FindFunction because imported functions get added to FModule
+          // when compiled, and we must not treat them as cmInternal).
           if FExternFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmExternal
-          else if Assigned(fn) then
-          begin
-            if fn.NeedsStaticLink then
-              instr.CallMode := cmStaticLink
-            else
-              instr.CallMode := cmInternal;
-          end
           else if FImportedFuncs.IndexOf(call.Name) >= 0 then
             instr.CallMode := cmImported
           else
-            instr.CallMode := cmInternal;
+          begin
+            fn := FModule.FindFunction(call.Name);
+            if Assigned(fn) then
+            begin
+              if fn.NeedsStaticLink then
+                instr.CallMode := cmStaticLink
+              else
+                instr.CallMode := cmInternal;
+            end
+            else
+              instr.CallMode := cmInternal;
+          end;
           // For regular calls, callTemps is never set above — use argTemps directly
           if Length(callTemps) = 0 then
             callTemps := argTemps;

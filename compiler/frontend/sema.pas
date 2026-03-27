@@ -1944,6 +1944,14 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // GetArgV(): pchar — raw pointer to argv[0] (C argv array base)
+  s := TSymbol.Create('GetArgV');
+  s.Kind := symFunc;
+  s.DeclType := atPChar;
+  s.ParamCount := 0;
+  SetLength(s.ParamTypes, 0);
+  AddSymbolToCurrent(s, NullSpan);
+
   // === S7: String comparison ===
   // StrStartsWith(s: string, prefix: string): bool
   s := TSymbol.Create('StrStartsWith');
