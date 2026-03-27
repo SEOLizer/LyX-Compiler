@@ -91,20 +91,22 @@ Jedes Paket ist so geschnitten, dass es in **einer Claude-Session** (~2-3h) abge
 
 ### WP-01: Bug Fix – 16-byte Struct Parameter (Blocker)
 
-**Beschreibung:**
+**Status: ✅ Bereits gelöst (nicht durch RDI+RSI-Split, sondern durch Pointer-Passing)**
+
+**Beschreibung (ursprünglich):**
 Wenn eine Funktion einen Struct-Parameter mit >8 Bytes bekommt, schreibt der Prologue
 nur RDI (bytes 0-7) in den Stack, aber nicht RSI (bytes 8-15). Resultat: Felder in der
 zweiten Hälfte des Structs enthalten Garbage.
 
-**Dateien:**
-- `backend/x86_64/x86_64_emit.pas` – Prologue-Generierung bei `irLoadStructAddr` für Parameter
+**Warum bereits gelöst:**
+Lyx übergibt Struct-Parameter grundsätzlich per implizitem Pointer (RDI = Adresse des
+Structs auf dem Caller-Stack), nicht als Wert in RDI+RSI. Der Prologue speichert RDI
+(den Pointer) in Slot 0 — das reicht vollständig. Felder werden über `[rdi+offset]`
+adressiert. Sowohl 16-Byte- als auch 24-Byte-Structs wurden verifiziert (test_struct16_roundtrip.lyx, Exit 0, korrekte Feldwerte).
 
-**Was zu tun:**
-1. In `EmitFunctionPrologue` / Parameterspeicherung: Für 16-byte Struct-Params beide
-   Register (RDI → slot+1, RSI → slot) in den Stack schreiben (analog zum Fix bei Struct-Return).
-2. Test: `tests/lyx/structs/test_struct_param_16.lyx` schreiben und ausführen.
-
-**Akzeptanzkriterium:** Ein 16-byte Struct als Funktionsparameter hat korrekte Feldwerte.
+**Verifiziert mit:**
+- `tests/regression/structs/test_struct16_roundtrip.lyx` → `a: 42`, `b: 99` ✅
+- Inline-Test mit 24-byte Triple-Struct → `sum=6` ✅
 
 **Abhängigkeiten:** keine
 
