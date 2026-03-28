@@ -1270,8 +1270,8 @@ begin
   Expect(tkColon);
   declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
-  // Optional initializer for const
-  if Accept(tkAssign) then
+  // Optional initializer for const/var
+  if Accept(tkSingleEq) then
     initExpr := ParseExpr
   else
     initExpr := nil;
@@ -1838,6 +1838,9 @@ var
   args: TAstExprList;
   firstExpr: TAstExpr;
   mapEntries: TMapEntryList;
+  innerType: TAurumType;
+  sizeExpr: TAstExpr;
+  simdKind: TSIMDKind;
 begin
   if Check(tkIntLit) then
   begin
@@ -1976,6 +1979,78 @@ begin
     e := ParseExpr;
     Expect(tkRParen);
     Exit(ParsePostfix(TAstPanicExpr.Create(e, span)));
+  end;
+
+  // parallel Array<T>(size) - SIMD array allocation
+  if Check(tkParallel) then
+  begin
+    span := FCurTok.Span;
+    Advance; // consume 'parallel'
+    
+    Expect(tkArray);
+    Advance; // consume 'Array'
+    
+    Expect(tkLt);
+    Advance; // consume '<'
+    
+    // Parse element type
+    if not Check(tkIdent) then
+    begin
+      FDiag.Error('expected element type in parallel Array<T>', FCurTok.Span);
+      Exit(TAstIntLit.Create(0, span));
+    end;
+    s := FCurTok.Value;
+    Advance;
+    
+    // Map element type name to TAurumType and SIMDKind
+    innerType := atInt64;
+    simdKind := simdI64;
+    if s = 'int64' then
+    begin
+      innerType := atInt64;
+      simdKind := simdI64;
+    end
+    else if s = 'int32' then
+    begin
+      innerType := atInt32;
+      simdKind := simdI32;
+    end
+    else if s = 'f64' then
+    begin
+      innerType := atF64;
+      simdKind := simdF64;
+    end
+    else if s = 'f32' then
+    begin
+      innerType := atF32;
+      simdKind := simdF32;
+    end
+    else if s = 'bool' then
+    begin
+      innerType := atBool;
+      simdKind := simdI8;
+    end
+    else
+    begin
+      FDiag.Error('unsupported element type: ' + s, FCurTok.Span);
+      innerType := atInt64;
+      simdKind := simdI64;
+    end;
+    
+    Expect(tkGt);
+    Advance; // consume '>'
+    
+    Expect(tkLParen);
+    Advance; // consume '('
+    
+    // Parse size expression
+    sizeExpr := ParseExpr;
+    
+    Expect(tkRParen);
+    Advance; // consume ')'
+    
+    // Create TAstSIMDNew expression
+    Exit(ParsePostfix(TAstSIMDNew.Create(sizeExpr, innerType, simdKind, span)));
   end;
 
   if Accept(tkLBracket) then
@@ -2418,34 +2493,133 @@ begin
       Exit;
     end;
     
-    // Handle 'parallel Array<T>' first
+    // Handle 'parallel Array<T>(size)' first
     if Check(tkParallel) then
     begin
       Advance; // consume 'parallel'
-      Expect(tkArray);
-      // Now we have 'parallel Array' - check for generic syntax Array<T>
-      if Accept(tkLt) then
+      
+      // Check for 'parallel Array<T>' or 'parallel <type>'
+      if Check(tkArray) then
       begin
-        // Generic array: parallel Array<T>
-        innerType := ParseType; // Recursively parse inner type
-        if innerType = atUnresolved then
+        Advance; // consume 'Array'
+        // Now we have 'parallel Array' - check for generic syntax Array<T>
+        if Accept(tkLt) then
         begin
-          FDiag.Error('expected element type in Array<T>', FCurTok.Span);
-          Result := atVoid;
+          // Generic array: parallel Array<T>
+          // Parse element type directly (not via ParseType to avoid recursion issues)
+          if not Check(tkIdent) then
+          begin
+            FDiag.Error('expected element type in Array<T>', FCurTok.Span);
+            Result := atVoid;
+          end
+          else
+          begin
+            s := FCurTok.Value;
+            Advance;
+            // Map element type name to TAurumType
+            innerType := atInt64;
+            if s = 'int64' then innerType := atInt64
+            else if s = 'int32' then innerType := atInt32
+            else if s = 'int16' then innerType := atInt16
+            else if s = 'int8' then innerType := atInt8
+            else if s = 'f64' then innerType := atF64
+            else if s = 'f32' then innerType := atF32
+            else if s = 'bool' then innerType := atBool
+            else
+            begin
+              FDiag.Error('unsupported element type: ' + s, FCurTok.Span);
+              innerType := atInt64;
+            end;
+          end;
+          Expect(tkGt);
+          
+          // Parse optional size: (size)
+          if Accept(tkLParen) then
+          begin
+            // Parse size expression
+            if Check(tkIntLit) then
+            begin
+              arrayLen := StrToInt64(FCurTok.Value);
+              Advance;
+            end
+            else
+            begin
+              FDiag.Error('expected array size', FCurTok.Span);
+              arrayLen := 0;
+            end;
+            Expect(tkRParen);
+          end
+          else
+          begin
+            // No size specified - use 0 as marker for unsized
+            arrayLen := 0;
+          end;
+          
+          // Mark as parallel array
+          Result := atParallelArray;
+          Exit;
+        end
+        else
+        begin
+          // Just 'parallel Array' without <T> - treat as unresolved type
+          typeName := 'parallel Array';
+          Result := atUnresolved;
+          Exit;
         end;
-        Expect(tkGt);
+      end
+      else if Check(tkIdent) then
+      begin
+        // Short form: parallel <type>(size), e.g., parallel int64(4)
+        s := FCurTok.Value;
+        Advance;
+        
+        // Map element type name to TAurumType
+        innerType := atInt64;
+        if s = 'int64' then innerType := atInt64
+        else if s = 'int32' then innerType := atInt32
+        else if s = 'int16' then innerType := atInt16
+        else if s = 'int8' then innerType := atInt8
+        else if s = 'f64' then innerType := atF64
+        else if s = 'f32' then innerType := atF32
+        else if s = 'bool' then innerType := atBool
+        else
+        begin
+          FDiag.Error('unsupported element type: ' + s, FCurTok.Span);
+          innerType := atInt64;
+        end;
+        
+        // Parse optional size: (size)
+        if Accept(tkLParen) then
+        begin
+          // Parse size expression
+          if Check(tkIntLit) then
+          begin
+            arrayLen := StrToInt64(FCurTok.Value);
+            Advance;
+          end
+          else
+          begin
+            FDiag.Error('expected array size', FCurTok.Span);
+            arrayLen := 0;
+          end;
+          Expect(tkRParen);
+        end
+        else
+        begin
+          arrayLen := 0;
+        end;
+        
         // Mark as parallel array
-        arrayLen := -2;
-        Result := atDynArray;
+        Result := atParallelArray;
         Exit;
       end
       else
       begin
-        // Just 'parallel' without generic - treat as unresolved type
+        // Just 'parallel' without type - treat as unresolved type
         typeName := 'parallel';
         Result := atUnresolved;
         Exit;
-      end;
+      end
     end;
 
     // Handle Map<K,V> generic syntax

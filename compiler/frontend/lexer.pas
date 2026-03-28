@@ -765,9 +765,10 @@ begin
     // Constraint Keywords
     'where':      Result := tkWhere;
     'value':      Result := tkValue;
-    // Map/Set Keywords
+    // Map/Set/Array Keywords
     'Map':        Result := tkMap;
     'Set':        Result := tkSet;
+    'Array':      Result := tkArray;
     'in':         Result := tkIn;
     // OOP Additional Keywords
     'virtual':    Result := tkVirtual;

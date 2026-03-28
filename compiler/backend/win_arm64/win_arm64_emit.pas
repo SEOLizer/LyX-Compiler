@@ -973,6 +973,120 @@ begin
             WriteBranchLink(FCode, 0);
           end;
         
+        // ========================================================================
+        // SIMD Operations (NEON) for ParallelArray - Windows ARM64
+        // ========================================================================
+        
+        irSIMDAdd:
+          begin
+            // Scalar: dest = src1 + src2
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDSub:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteSubRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDMul:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteMul(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDDiv:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteSdiv(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDAnd:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteAndRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDOr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteOrrRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDXor:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteEorRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDNeg:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteNeg(FCode, X0, X0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteCmpRegReg(FCode, X0, X1);
+            case instr.Op of
+              irSIMDCmpEq: WriteCset(FCode, X0, COND_EQ);
+              irSIMDCmpNe: WriteCset(FCode, X0, COND_NE);
+              irSIMDCmpLt: WriteCset(FCode, X0, COND_LT);
+              irSIMDCmpLe: WriteCset(FCode, X0, COND_LE);
+              irSIMDCmpGt: WriteCset(FCode, X0, COND_GT);
+              irSIMDCmpGe: WriteCset(FCode, X0, COND_GE);
+            end;
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDLoadElem:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLslImm(FCode, X1, X1, 3);
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteLdrReg(FCode, X0, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSIMDStoreElem:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            WriteLslImm(FCode, X1, X1, 3);
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteStrReg(FCode, X2, X0, 0);
+          end;
+        
         irCallBuiltin:
           begin
             // Load parameter into X0
