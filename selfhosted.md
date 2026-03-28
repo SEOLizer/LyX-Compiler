@@ -342,48 +342,65 @@ Drei Compiler-Bugs entdeckt beim Entwickeln von WP-07 und anschließend gefixt:
 
 ---
 
-### WP-08: Self-Hosted x86_64 Code Generator
+### WP-08: Self-Hosted x86_64 Code Generator ✅ DONE
 
 **Beschreibung:**
 Der wichtigste und komplexeste Schritt. Emittiert x86_64 Maschinencode direkt aus dem AST.
-Kein IR – direkter AST → Binärcode Weg für maximale Einfachheit.
+Kein IR – direkter AST → ELF64-Binärcode, stack-basiert, ohne Register-Allokator.
 
 **Datei:** `bootstrap/codegen_x86.lyx`
 
-**Ansatz:**
-- Stack-basierte Auswertung (kein Register-Allokator nötig)
-- Alle Werte auf Stack (`push`/`pop`)
-- Einfaches Frame-Layout: `rbp`-relative Slots
-- Nur statische ELF64 (kein PLT/GOT, kein Dynamic Linking)
+**Umgesetzt:**
+1. **`Codegen`-Klasse** (~900 LOC) ✅
+   - 20 Felder: code/data mmap-Buffer, locals/labels/patches-Tabellen
+   - Alle Methoden mit `cg_`-Präfix (VMT-Kollisions-Workaround)
+   - Lokale `con`-Kopien aller Parser/Lexer-Konstanten (Importierter-Konstanten-Bug-Workaround)
+2. **ELF64-Writer** (minimal, single PT_LOAD) ✅
+   - ELF-Header + PHdr: 120 Bytes Header, dann Code + Daten
+   - Load-Adresse: 0x400000, Entry = 0x400078 (_start)
+   - `WriteELF(path: pchar)` schreibt fertiges ELF via `open/write/close`
+3. **Feste Helper-Stubs** (157 Bytes, offset 0 im Code-Buffer) ✅
+   - `_start` (17 B): ruft `main`, danach sys_exit mit Return-Code
+   - `_lyx_strlen` (15 B): null-terminierte Länge
+   - `_lyx_print_str` (26 B): sys_write(1, buf, len)
+   - `_lyx_print_int` (99 B): int64 → Dezimalstring → sys_write
+4. **Backpatching** ✅
+   - CALL-Patches: rel32 nach allen Funktionen aufgelöst (Labels-Tabelle)
+   - STR-Patches: RIP-relative LEA-Displacements für String-Literale
+5. **Ausdruck-Generierung** (stack-basiert) ✅
+   - Literale: `mov rax, IMM64` / `lea rax, [rip+disp32]`
+   - Variablen: `mov rax, [rbp+off]`
+   - BinOp: LHS→rax, push; RHS→rax; pop rbx; Operation
+   - Alle Vergleichsoperatoren: `cmp + setXX + movzx`
+   - Logisch: `&&`, `||`, `!`
+6. **Statement-Generierung** ✅
+   - `var`/`con`: Slot allokieren, Initialwert berechnen, speichern
+   - `if`/`else`: `cmp + jz` mit Backpatch
+   - `while`: Loop mit Back-Edge
+   - `for` (als while synthetisiert)
+   - `return`: Wert in rax, Epilog, ret
+   - `assign`: Ausdruck berechnen, in Slot speichern
+7. **Builtin-Calls** ✅
+   - `PrintStr` → call _lyx_print_str
+   - `PrintInt` → call _lyx_print_int
+   - `StrLen` → call _lyx_strlen
+   - `mmap` → sys_mmap (9) mit r10=flags, r8=fd, r9=0
+   - `poke8/16/32/64`, `peek8/32/64`: inline Byte/Dword/Qword Zugriff
+   - Alle anderen Aufrufe: normaler CALL + Patch
 
-**Was zu tun:**
-1. **ELF64-Writer** (minimal):
-   - ELF-Header
-   - `.text` Section mit Code
-   - `.data` Section für String-Literale
-   - Symbol-Table für `_start`
-2. **Code Emitter** (Klasse):
-   - `EmitU8(b)`, `EmitU32(n)`, `EmitU64(n)` – Bytes schreiben
-   - `EmitCall(label)`, `EmitRet()`, `EmitPush(reg)`, `EmitPop(reg)`
-   - `EmitMovRegImm(reg, val)`, `EmitMovMemReg(rbp, off, reg)`, etc.
-3. **Ausdruck-Generierung** (rekursiv):
-   - Literale: `mov rax, IMM`
-   - Variablen: `mov rax, [rbp+offset]`
-   - BinOp: beide Seiten auswerten, kombinieren
-   - Funktionsaufruf: Argumente in RDI/RSI/RDX/RCX/R8/R9
-4. **Statement-Generierung:**
-   - `var x: int64 := expr` → allokiere Slot, berechne Wert
-   - `if (cond) { ... } else { ... }` → `cmp + jz/jnz`
-   - `while (cond) { ... }` → Loop mit Rücksprung
-   - `return expr` → `mov rax, val; mov rsp, rbp; pop rbp; ret`
-5. **Funktionsdeklarationen:**
-   - Prologue: `push rbp; mov rbp, rsp; sub rsp, N`
-   - Parameter als Slots
-   - Epilogue: `mov rsp, rbp; pop rbp; ret`
-6. **Builtin-Calls:** PrintStr, PrintInt (direkt als Syscall-Sequenzen)
+**Compiler-Fixes (lyxc FPC source):**
+- `parser.pas`: `:=` in `var`/`con`-Deklarationen nach SIMD-PR kaputt → Accept(tkAssign or tkSingleEq) ✅
+- `sema.pas`: `pchar + int64` und `int64 + pchar` als Pointer-Arithmetik erlaubt ✅
 
-**Test:** `tests/lyx/bootstrap/test_codegen.lyx`
-Kompiliere eine einfache `.lyx`-Datei und führe das Ergebnis aus.
+**Bekannter Bug-Workaround:**
+- `poke8(buf + 0, x)` crasht (Constant-Folding `+0` → Copy-Propagation-Bug im Lyx-Compiler) → Fix: `buf` direkt ohne `+ 0` ✅
+
+**Test:** `tests/lyx/bootstrap/test_codegen.lyx` – alle 5 Tests ✅
+- Test 1: `fn main(): int64 { PrintStr("hello\n"); return 0; }` → `/tmp/test_cg_hello` gibt "hello" aus ✅
+- Test 2: `fn add(x, y): int64 { return x+y; }` → `/tmp/test_cg_add` gibt "7" aus ✅
+- Test 3: `countDown(3)` mit while-Schleife → `/tmp/test_cg_while` gibt "3 2 1 " aus ✅
+- Test 4: ELF-Magic-Verifikation → `127 69 76 70` ✅
+- Test 5: `fn sum(n): int64` mit Akkumulator → `/tmp/test_cg_sum` gibt "55" aus ✅
 
 **Abhängigkeiten:** WP-06 (Parser), WP-07 (Sema)
 
