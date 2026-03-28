@@ -1,0 +1,573 @@
+// bootstrap/sema.lyx
+// Lyx Self-Hosted Semantic Analyzer (WP-07)
+// Minimal two-pass type checker with linear symbol table.
+//
+// Pass 1: collect all top-level declarations (funcs, structs, enums, cons)
+// Pass 2: resolve types, check variable definitions in function bodies
+
+import bootstrap.parser;
+
+// ============================================================================
+// Symbol kinds
+// ============================================================================
+
+pub con SYM_BUILTIN: int64 := 0;
+pub con SYM_FUNC:    int64 := 1;
+pub con SYM_VAR:     int64 := 2;
+pub con SYM_STRUCT:  int64 := 3;
+pub con SYM_PARAM:   int64 := 4;
+pub con SYM_CON:     int64 := 5;
+pub con SYM_ENUM:    int64 := 6;
+pub con SYM_FIELD:   int64 := 7;
+pub con SYM_TYPE:    int64 := 8;
+
+// ============================================================================
+// Primitive type IDs
+// ============================================================================
+
+pub con TY_UNKNOWN: int64 := 0;
+pub con TY_VOID:    int64 := 1;
+pub con TY_BOOL:    int64 := 2;
+pub con TY_INT64:   int64 := 3;
+pub con TY_PCHAR:   int64 := 4;
+pub con TY_FLOAT64: int64 := 5;
+pub con TY_INT32:   int64 := 6;
+pub con TY_ARRAY:   int64 := 7;
+pub con TY_USER:    int64 := 8;
+
+// Local copies of parser constants to avoid import-resolution issues
+// inside Sema class methods (compiler limitation: imported constants from
+// bootstrap.parser do not resolve correctly inside class method bodies).
+
+con SEMA_NODE_SIZE: int64 := 88;   // = PARSER_NODE_SIZE
+con SEMA_TOK_SIZE:  int64 := 40;   // = PARSER_TOK_SIZE
+
+// Node kind constants (mirroring NK_xxx from bootstrap.parser)
+con SNK_FUNC_DECL:   int64 := 2;
+con SNK_PARAM:       int64 := 3;
+con SNK_VAR_DECL:    int64 := 4;
+con SNK_CON_DECL:    int64 := 5;
+con SNK_STRUCT_DECL: int64 := 6;
+con SNK_ENUM_DECL:   int64 := 8;
+con SNK_TYPE_DECL:   int64 := 10;
+con SNK_BLOCK:       int64 := 20;
+con SNK_IF:          int64 := 21;
+con SNK_WHILE:       int64 := 22;
+con SNK_RETURN:      int64 := 23;
+con SNK_EXPR_STMT:   int64 := 24;
+con SNK_ASSIGN:      int64 := 25;
+con SNK_FOR:         int64 := 26;
+con SNK_SWITCH:      int64 := 27;
+con SNK_CASE:        int64 := 28;
+con SNK_DISPOSE:     int64 := 30;
+con SNK_IDENT:       int64 := 46;
+con SNK_BINOP:       int64 := 47;
+con SNK_UNOP:        int64 := 48;
+con SNK_CALL:        int64 := 49;
+con SNK_INDEX:       int64 := 50;
+con SNK_FIELD:       int64 := 51;
+con SNK_NEW:         int64 := 52;
+con SNK_TYPE_NAME:   int64 := 60;
+con SNK_TYPE_ARRAY:  int64 := 61;
+
+// ============================================================================
+// Symbol entry layout: 40 bytes (SEMA_SYM_SIZE)
+//   +0:  name    (int64 = pchar pointer, into src or to literal for builtins)
+//   +8:  nameLen (int64)
+//   +16: kind    (int64)  -- SYM_xxx
+//   +24: typeId  (int64)  -- TY_xxx
+//   +32: nodeIdx (int64)  -- AST node index (-1 = none, -2 = builtin)
+// ============================================================================
+
+pub con SEMA_SYM_SIZE: int64 := 40;
+
+// ============================================================================
+// Sema class
+// Note: internal node-access methods use prefix 'sn_' to avoid VMT
+//       collisions with the Parser class which has methods named NKind etc.
+// ============================================================================
+
+pub type Sema = class {
+
+  // Source and parser data (copied from Parser on Init)
+  src:        pchar;
+  srcLen:     int64;
+  pNodes:     int64;   // Parser.nodes buffer
+  pNodeCount: int64;
+  pToks:      int64;   // Parser.toks buffer
+  pTokCount:  int64;
+
+  // Symbol table (flat buffer of SEMA_SYM_SIZE byte entries)
+  syms:     int64;
+  symCount: int64;
+  symCap:   int64;
+
+  // Scope stack (each entry = int64 = symCount at scope start)
+  scopes:     int64;
+  scopeDepth: int64;
+  scopeCap:   int64;
+
+  // Diagnostics
+  hadError:   int64;
+  errorCount: int64;
+
+  // ------------------------------------------------------------------
+  // Node access helpers
+  // Prefixed sn_ to avoid VMT collision with Parser methods of same name.
+  // ------------------------------------------------------------------
+
+  fn sn_off(i: int64): int64    { return self.pNodes + i * SEMA_NODE_SIZE; }
+  fn sn_kind(i: int64): int64   { return peek64(self.sn_off(i)); }
+  fn sn_c0(i: int64): int64     { return peek64(self.sn_off(i) + 8); }
+  fn sn_c1(i: int64): int64     { return peek64(self.sn_off(i) + 16); }
+  fn sn_c2(i: int64): int64     { return peek64(self.sn_off(i) + 24); }
+  fn sn_next(i: int64): int64   { return peek64(self.sn_off(i) + 40); }
+  fn sn_tokIdx(i: int64): int64 { return peek64(self.sn_off(i) + 48); }
+  fn sn_iVal(i: int64): int64   { return peek64(self.sn_off(i) + 56); }
+  fn sn_sVal(i: int64): pchar   { return self.src + peek64(self.sn_off(i) + 64); }
+  fn sn_sLen(i: int64): int64   { return peek64(self.sn_off(i) + 72); }
+
+  // Token line number (SEMA_TOK_SIZE = 40; line at +32)
+  fn sn_tokLine(i: int64): int64 { return peek64(self.pToks + i * SEMA_TOK_SIZE + 32); }
+
+  // ------------------------------------------------------------------
+  // String comparison (length-delimited, no null terminator required)
+  // ------------------------------------------------------------------
+
+  fn _strNEq(a: pchar, aLen: int64, b: pchar, bLen: int64): bool {
+    if (aLen != bLen) { return false; }
+    var i: int64 := 0;
+    while (i < aLen) {
+      if (StrCharAt(a, i) != StrCharAt(b, i)) { return false; }
+      i := i + 1;
+    }
+    return true;
+  }
+
+  // ------------------------------------------------------------------
+  // Symbol table helpers
+  // ------------------------------------------------------------------
+
+  fn _soff(i: int64): int64      { return self.syms + i * SEMA_SYM_SIZE; }
+  fn SymName(i: int64): pchar    { return peek64(self._soff(i)) as pchar; }
+  fn SymNameLen(i: int64): int64 { return peek64(self._soff(i) + 8); }
+  fn SymKind(i: int64): int64    { return peek64(self._soff(i) + 16); }
+  fn SymTypeId(i: int64): int64  { return peek64(self._soff(i) + 24); }
+  fn SymNodeIdx(i: int64): int64 { return peek64(self._soff(i) + 32); }
+
+  fn _growSyms() {
+    var newCap: int64 := self.symCap * 2;
+    var nb: int64 := mmap(0, newCap * SEMA_SYM_SIZE, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.symCount * SEMA_SYM_SIZE) {
+      poke8(nb + i, peek8(self.syms + i));
+      i := i + 1;
+    }
+    self.syms   := nb;
+    self.symCap := newCap;
+  }
+
+  fn _pushSym(name: pchar, nameLen: int64, kind: int64, typeId: int64, nodeIdx: int64) {
+    if (self.symCount >= self.symCap) { self._growSyms(); }
+    var off: int64 := self._soff(self.symCount);
+    poke64(off,      name as int64);
+    poke64(off + 8,  nameLen);
+    poke64(off + 16, kind);
+    poke64(off + 24, typeId);
+    poke64(off + 32, nodeIdx);
+    self.symCount := self.symCount + 1;
+  }
+
+  // Register a builtin function (name = string literal pointer)
+  fn _regBuiltin(name: pchar) {
+    self._pushSym(name, StrLen(name), SYM_BUILTIN, TY_UNKNOWN, -2);
+  }
+
+  // Lookup by name pointer + length; returns symbol index or -1
+  fn Lookup(name: pchar, nameLen: int64): int64 {
+    var i: int64 := self.symCount - 1;
+    while (i >= 0) {
+      var sName: pchar  := self.SymName(i);
+      var sLen:  int64  := self.SymNameLen(i);
+      if (self._strNEq(sName, sLen, name, nameLen)) { return i; }
+      i := i - 1;
+    }
+    return -1;
+  }
+
+  // ------------------------------------------------------------------
+  // Scope management
+  // ------------------------------------------------------------------
+
+  fn _pushScope() {
+    if (self.scopeDepth >= self.scopeCap) {
+      var newCap: int64 := self.scopeCap * 2;
+      var nb: int64 := mmap(0, newCap * 8, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.scopeDepth * 8) {
+        poke8(nb + i, peek8(self.scopes + i));
+        i := i + 1;
+      }
+      self.scopes   := nb;
+      self.scopeCap := newCap;
+    }
+    poke64(self.scopes + self.scopeDepth * 8, self.symCount);
+    self.scopeDepth := self.scopeDepth + 1;
+  }
+
+  fn _popScope() {
+    if (self.scopeDepth <= 0) { panic("sema: scope underflow"); }
+    self.scopeDepth := self.scopeDepth - 1;
+    self.symCount   := peek64(self.scopes + self.scopeDepth * 8);
+  }
+
+  // ------------------------------------------------------------------
+  // Error reporting
+  // ------------------------------------------------------------------
+
+  fn _error(msg: pchar, line: int64) {
+    PrintStr("sema error (line ");
+    PrintInt(line);
+    PrintStr("): ");
+    PrintStr(msg);
+    PrintStr("\n");
+    self.hadError   := 1;
+    self.errorCount := self.errorCount + 1;
+  }
+
+  fn _errorNode(msg: pchar, ni: int64) {
+    var tokIdx: int64 := self.sn_tokIdx(ni);
+    var line: int64 := 0;
+    if (tokIdx >= 0 && tokIdx < self.pTokCount) {
+      line := self.sn_tokLine(tokIdx);
+    }
+    self._error(msg, line);
+  }
+
+  // ------------------------------------------------------------------
+  // Type resolution
+  // ------------------------------------------------------------------
+
+  fn ResolveType(typeNi: int64): int64 {
+    if (typeNi < 0) { return TY_VOID; }
+    var k: int64 := self.sn_kind(typeNi);
+    if (k == SNK_TYPE_ARRAY) { return TY_ARRAY; }
+    if (k != SNK_TYPE_NAME)  { return TY_UNKNOWN; }
+    var nm: pchar  := self.sn_sVal(typeNi);
+    var nl: int64  := self.sn_sLen(typeNi);
+    if (self._strNEq(nm, nl, "void",    4)) { return TY_VOID;    }
+    if (self._strNEq(nm, nl, "bool",    4)) { return TY_BOOL;    }
+    if (self._strNEq(nm, nl, "int64",   5)) { return TY_INT64;   }
+    if (self._strNEq(nm, nl, "pchar",   5)) { return TY_PCHAR;   }
+    if (self._strNEq(nm, nl, "float64", 7)) { return TY_FLOAT64; }
+    if (self._strNEq(nm, nl, "int32",   5)) { return TY_INT32;   }
+    // Look up user-defined type (struct / enum / type alias)
+    var si: int64 := self.Lookup(nm, nl);
+    if (si >= 0) {
+      var sk: int64 := self.SymKind(si);
+      if (sk == SYM_STRUCT || sk == SYM_ENUM || sk == SYM_TYPE) { return TY_USER; }
+    }
+    return TY_UNKNOWN;
+  }
+
+  // ------------------------------------------------------------------
+  // Pass 1: collect top-level declarations
+  // ------------------------------------------------------------------
+
+  fn _p1Decl(ni: int64) {
+    var k: int64    := self.sn_kind(ni);
+    var name: pchar := self.sn_sVal(ni);
+    var nlen: int64 := self.sn_sLen(ni);
+    if (k == SNK_FUNC_DECL) {
+      self._pushSym(name, nlen, SYM_FUNC, TY_VOID, ni);
+    } else if (k == SNK_STRUCT_DECL) {
+      self._pushSym(name, nlen, SYM_STRUCT, TY_USER, ni);
+    } else if (k == SNK_TYPE_DECL) {
+      self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
+    } else if (k == SNK_ENUM_DECL) {
+      self._pushSym(name, nlen, SYM_ENUM, TY_USER, ni);
+      // Register enum members as int64 constants
+      var mem: int64 := self.sn_c0(ni);
+      while (mem >= 0) {
+        var mName: pchar := self.sn_sVal(mem);
+        var mLen:  int64 := self.sn_sLen(mem);
+        self._pushSym(mName, mLen, SYM_CON, TY_INT64, mem);
+        mem := self.sn_next(mem);
+      }
+    } else if (k == SNK_CON_DECL) {
+      self._pushSym(name, nlen, SYM_CON, TY_INT64, ni);
+    } else if (k == SNK_VAR_DECL) {
+      var typeNi: int64 := self.sn_c0(ni);
+      var tid:    int64 := self.ResolveType(typeNi);
+      self._pushSym(name, nlen, SYM_VAR, tid, ni);
+    }
+    // NK_IMPORT: nothing to register
+  }
+
+  fn Pass1(head: int64) {
+    var ni: int64 := head;
+    while (ni >= 0) {
+      self._p1Decl(ni);
+      ni := self.sn_next(ni);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Pass 2: type-check expressions and statements
+  // ------------------------------------------------------------------
+
+  fn _checkExpr(ni: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.sn_kind(ni);
+
+    if (k == SNK_IDENT) {
+      var nm: pchar := self.sn_sVal(ni);
+      var nl: int64 := self.sn_sLen(ni);
+      // 'self' keyword is always valid inside a method body
+      if (nl == 4) {
+        if (StrCharAt(nm, 0) == 115 && StrCharAt(nm, 1) == 101 &&
+            StrCharAt(nm, 2) == 108 && StrCharAt(nm, 3) == 102) {
+          return;
+        }
+      }
+      var si: int64 := self.Lookup(nm, nl);
+      if (si < 0) {
+        self._errorNode("undefined symbol", ni);
+      }
+
+    } else if (k == SNK_CALL) {
+      var isMethod: int64 := self.sn_iVal(ni);
+      if (isMethod == 1) {
+        // Method call: obj.method(args) — check object, then args
+        self._checkExpr(self.sn_c0(ni));
+        var arg: int64 := self.sn_c1(ni);
+        while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
+      } else {
+        // Bare function call: fn(args) — check function name, then args
+        var nm: pchar := self.sn_sVal(ni);
+        var nl: int64 := self.sn_sLen(ni);
+        var si: int64 := self.Lookup(nm, nl);
+        if (si < 0) {
+          self._errorNode("undefined function", ni);
+        }
+        var arg: int64 := self.sn_c0(ni);
+        while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
+      }
+
+    } else if (k == SNK_BINOP) {
+      self._checkExpr(self.sn_c0(ni));
+      self._checkExpr(self.sn_c1(ni));
+
+    } else if (k == SNK_UNOP) {
+      self._checkExpr(self.sn_c0(ni));
+
+    } else if (k == SNK_INDEX) {
+      self._checkExpr(self.sn_c0(ni));
+      self._checkExpr(self.sn_c1(ni));
+
+    } else if (k == SNK_FIELD) {
+      // child0 = base object; field name is in sn_sVal (not a symbol ref)
+      self._checkExpr(self.sn_c0(ni));
+
+    } else if (k == SNK_NEW) {
+      // Check constructor arguments (child0 = first arg)
+      var arg: int64 := self.sn_c0(ni);
+      while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
+    }
+    // Literals, NK_LIT_NULL, NK_INVALID: nothing to check
+  }
+
+  fn _checkStmt(ni: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.sn_kind(ni);
+
+    if (k == SNK_BLOCK) {
+      self._pushScope();
+      var s: int64 := self.sn_c0(ni);
+      while (s >= 0) { self._checkStmt(s); s := self.sn_next(s); }
+      self._popScope();
+
+    } else if (k == SNK_VAR_DECL) {
+      var typeNi: int64 := self.sn_c0(ni);
+      var initNi: int64 := self.sn_c1(ni);
+      var tid: int64 := self.ResolveType(typeNi);
+      if (tid == TY_UNKNOWN) {
+        self._errorNode("unknown type in var decl", ni);
+      }
+      if (initNi >= 0) { self._checkExpr(initNi); }
+      self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, tid, ni);
+
+    } else if (k == SNK_CON_DECL) {
+      var initNi: int64 := self.sn_c1(ni);
+      if (initNi >= 0) { self._checkExpr(initNi); }
+      self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_CON, TY_INT64, ni);
+
+    } else if (k == SNK_ASSIGN) {
+      self._checkExpr(self.sn_c0(ni));
+      self._checkExpr(self.sn_c1(ni));
+
+    } else if (k == SNK_RETURN) {
+      self._checkExpr(self.sn_c0(ni));
+
+    } else if (k == SNK_EXPR_STMT) {
+      self._checkExpr(self.sn_c0(ni));
+
+    } else if (k == SNK_IF) {
+      self._checkExpr(self.sn_c0(ni));   // condition
+      self._checkStmt(self.sn_c1(ni));   // then-block
+      self._checkStmt(self.sn_c2(ni));   // else-block (or -1)
+
+    } else if (k == SNK_WHILE) {
+      self._checkExpr(self.sn_c0(ni));   // condition
+      self._checkStmt(self.sn_c1(ni));   // body
+
+    } else if (k == SNK_FOR) {
+      // for VAR = start to end { body }
+      // sn_sVal = loop var name, c0 = start, c1 = end, c2 = body
+      self._pushScope();
+      self._checkExpr(self.sn_c0(ni));
+      self._checkExpr(self.sn_c1(ni));
+      self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, TY_INT64, ni);
+      self._checkStmt(self.sn_c2(ni));
+      self._popScope();
+
+    } else if (k == SNK_SWITCH) {
+      // c0 = discriminant, c1 = first case (sn_next-linked)
+      self._checkExpr(self.sn_c0(ni));
+      var c: int64 := self.sn_c1(ni);
+      while (c >= 0) { self._checkStmt(c); c := self.sn_next(c); }
+
+    } else if (k == SNK_CASE) {
+      // iVal = isDefault; c0 = value expr (or -1); c1 = body
+      if (self.sn_iVal(ni) == 0) { self._checkExpr(self.sn_c0(ni)); }
+      self._checkStmt(self.sn_c1(ni));
+
+    } else if (k == SNK_DISPOSE) {
+      self._checkExpr(self.sn_c0(ni));
+    }
+    // NK_BREAK, NK_IMPORT: nothing to check
+  }
+
+  fn _checkFuncDecl(ni: int64) {
+    self._pushScope();
+
+    // Register parameters (c0 = first param, sn_next-linked)
+    var param: int64 := self.sn_c0(ni);
+    while (param >= 0) {
+      var typeNi: int64 := self.sn_c0(param);
+      var tid:    int64 := self.ResolveType(typeNi);
+      if (tid == TY_UNKNOWN) {
+        self._errorNode("unknown param type", param);
+      }
+      self._pushSym(self.sn_sVal(param), self.sn_sLen(param), SYM_PARAM, tid, param);
+      param := self.sn_next(param);
+    }
+
+    // Validate return type (c1)
+    var retNi: int64 := self.sn_c1(ni);
+    if (retNi >= 0) {
+      var tid: int64 := self.ResolveType(retNi);
+      if (tid == TY_UNKNOWN) {
+        self._errorNode("unknown return type", ni);
+      }
+    }
+
+    // Check body (c2)
+    var body: int64 := self.sn_c2(ni);
+    if (body >= 0) { self._checkStmt(body); }
+
+    self._popScope();
+  }
+
+  fn _p2Decl(ni: int64) {
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_FUNC_DECL) {
+      self._checkFuncDecl(ni);
+    }
+    // Struct/enum/type bodies not checked in minimal sema
+  }
+
+  fn Pass2(head: int64) {
+    var ni: int64 := head;
+    while (ni >= 0) {
+      self._p2Decl(ni);
+      ni := self.sn_next(ni);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Builtin registration (compiler-provided identifiers)
+  // ------------------------------------------------------------------
+
+  fn _registerBuiltins() {
+    // Memory
+    self._regBuiltin("mmap");
+    self._regBuiltin("munmap");
+    self._regBuiltin("poke8");
+    self._regBuiltin("poke16");
+    self._regBuiltin("poke32");
+    self._regBuiltin("poke64");
+    self._regBuiltin("peek8");
+    self._regBuiltin("peek16");
+    self._regBuiltin("peek32");
+    self._regBuiltin("peek64");
+    // I/O
+    self._regBuiltin("PrintStr");
+    self._regBuiltin("PrintInt");
+    self._regBuiltin("PrintChar");
+    self._regBuiltin("PrintBool");
+    self._regBuiltin("PrintFloat");
+    // String
+    self._regBuiltin("StrLength");
+    self._regBuiltin("StrLen");
+    self._regBuiltin("StrCharAt");
+    self._regBuiltin("StrEquals");
+    self._regBuiltin("StrStartsWith");
+    self._regBuiltin("StrEndsWith");
+    self._regBuiltin("StrConcat");
+    self._regBuiltin("StrCopy");
+    self._regBuiltin("StrSub");
+    self._regBuiltin("StrTrim");
+    self._regBuiltin("StrSplit");
+    self._regBuiltin("StrAppendStr");
+    self._regBuiltin("IntToStr");
+    self._regBuiltin("FloatToStr");
+    // Control
+    self._regBuiltin("panic");
+    self._regBuiltin("exit");
+  }
+
+  // ------------------------------------------------------------------
+  // Public API
+  // ------------------------------------------------------------------
+
+  fn Init(src: pchar, srcLen: int64, nodes: int64, nodeCount: int64, toks: int64, tokCount: int64) {
+    self.src        := src;
+    self.srcLen     := srcLen;
+    self.pNodes     := nodes;
+    self.pNodeCount := nodeCount;
+    self.pToks      := toks;
+    self.pTokCount  := tokCount;
+
+    self.symCap   := 256;
+    self.syms     := mmap(0, self.symCap * SEMA_SYM_SIZE, 3, 34, -1, 0);
+    self.symCount := 0;
+
+    self.scopeCap   := 64;
+    self.scopes     := mmap(0, self.scopeCap * 8, 3, 34, -1, 0);
+    self.scopeDepth := 0;
+
+    self.hadError   := 0;
+    self.errorCount := 0;
+
+    self._registerBuiltins();
+  }
+
+  // Run both passes; returns hadError
+  fn Check(head: int64): int64 {
+    self.Pass1(head);
+    self.Pass2(head);
+    return self.hadError;
+  }
+
+};
