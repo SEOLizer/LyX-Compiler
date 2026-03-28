@@ -2568,6 +2568,16 @@ begin
                begin
                  Result := atPChar;
                end
+               // Pointer arithmetic: pchar + int64 = pchar
+               else if (bin.Op = tkPlus) and TypeEqual(lt, atPChar) and IsIntegerType(rt) then
+               begin
+                 Result := atPChar;
+               end
+               // Pointer arithmetic: int64 + pchar = pchar
+               else if (bin.Op = tkPlus) and IsIntegerType(lt) and TypeEqual(rt, atPChar) then
+               begin
+                 Result := atPChar;
+               end
                // Check for float operands
                else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
                begin
