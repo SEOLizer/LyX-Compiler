@@ -619,6 +619,149 @@ begin
             WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
         end;
 
+        // ========================================================================
+        // SIMD Operations for ParallelArray - macOS x86_64
+        // ========================================================================
+        
+        irSIMDAdd:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01);
+            EmitU8(FCode, $C8);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDSub:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $29);
+            EmitU8(FCode, $C8);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDMul:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $0F);
+            EmitU8(FCode, $AF);
+            EmitU8(FCode, $C1);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDDiv:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $99);
+            EmitU8(FCode, $F7);
+            EmitU8(FCode, $F9);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDAnd, irSIMDOr, irSIMDXor:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            if instr.Op = irSIMDAnd then
+            begin
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $21);
+              EmitU8(FCode, $C8);
+            end
+            else if instr.Op = irSIMDOr then
+            begin
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $09);
+              EmitU8(FCode, $C8);
+            end
+            else
+            begin
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $31);
+              EmitU8(FCode, $C8);
+            end;
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDNeg:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7);
+            EmitU8(FCode, $D8);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39);
+            EmitU8(FCode, $C8);
+            EmitRex(FCode, 0, 0, 0, 0);
+            EmitU8(FCode, $0F);
+            case instr.Op of
+              irSIMDCmpEq: EmitU8(FCode, $94);
+              irSIMDCmpNe: EmitU8(FCode, $95);
+              irSIMDCmpLt: EmitU8(FCode, $9C);
+              irSIMDCmpLe: EmitU8(FCode, $9E);
+              irSIMDCmpGt: EmitU8(FCode, $9F);
+              irSIMDCmpGe: EmitU8(FCode, $9D);
+            end;
+            EmitU8(FCode, $C0);
+            EmitRex(FCode, 0, 0, 0, 0);
+            EmitU8(FCode, $0F);
+            EmitU8(FCode, $B6);
+            EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDLoadElem:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $C1);
+            EmitU8(FCode, $E1);
+            EmitU8(FCode, 3);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01);
+            EmitU8(FCode, $C8);
+            WriteMovRegMem(RAX, RAX, 0);
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irSIMDStoreElem:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $C1);
+            EmitU8(FCode, $E1);
+            EmitU8(FCode, 3);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01);
+            EmitU8(FCode, $C8);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $89);
+            EmitU8(FCode, $45);
+            EmitU8(FCode, $F8);
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src3));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8B);
+            EmitU8(FCode, $45);
+            EmitU8(FCode, $F8);
+            WriteMovMemReg(RAX, RCX, 0);
+          end;
+
         irCallBuiltin:
         begin
           if instr.ImmStr = 'exit' then
