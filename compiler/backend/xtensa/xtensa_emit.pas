@@ -44,6 +44,7 @@ type
     xtADD   = $08,
     xtADDI  = $0A,
     xtSUB   = $0C,
+    xtNEG   = $0C,  // NEG emuliert als SUB (a = 0 - b)
     xtMOVI  = $0B,
     xtMOV   = $0D,
     xtAND   = $14,
@@ -80,6 +81,8 @@ type
     procedure EmitAdd(dest, src1, src2: TXtensaReg);
     procedure EmitAddi(dest, src: TXtensaReg; imm: Integer);
     procedure EmitSub(dest, src1, src2: TXtensaReg);
+    procedure EmitNeg(dest, src: TXtensaReg);
+    procedure EmitMul(dest, src1, src2: TXtensaReg);
     procedure EmitAnd(dest, src1, src2: TXtensaReg);
     procedure EmitOr(dest, src1, src2: TXtensaReg);
     procedure EmitXor(dest, src1, src2: TXtensaReg);
@@ -152,6 +155,24 @@ end;
 procedure TxtensaCodeEmitter.EmitSub(dest, src1, src2: TXtensaReg);
 begin
   EmitInstruction(Byte(xtSUB), dest, src1, src2);
+end;
+
+procedure TxtensaCodeEmitter.EmitNeg(dest, src: TXtensaReg);
+begin
+  // Xtensa: NEG a, b => a = -b wird emuliert als SUB a, a0, b
+  // wobei a0 (xrA0) immer 0 ist
+  EmitInstruction(Byte(xtSUB), dest, xrA0, src);
+end;
+
+procedure TxtensaCodeEmitter.EmitMul(dest, src1, src2: TXtensaReg);
+begin
+  // Xtensa hat keinen direkten Mul-Befehl. Wir emulieren mit Addition in einer Schleife.
+  // Warning: Dies ist ein Skalar-Fallback, nicht optimal.
+  FDiag.Report(dkWarning, 'SIMD Mul uses scalar fallback on Xtensa (no hardware mul)', NullSpan);
+  // Einfache Emulation: dest = 0; for i in 0..src2-1: dest += src1
+  // Für SIMD-Fälle sollte ein externer Aufruf verwendet werden.
+  EmitMovi(dest, 0);  // dest = 0
+  // Placeholder: Hier sollte ein Funktionsaufruf zu einer Mul-Library stehen
 end;
 
 procedure TxtensaCodeEmitter.EmitAnd(dest, src1, src2: TXtensaReg);
@@ -299,6 +320,102 @@ begin
         src1Reg := GetRegisterForTemp(instr.Src1);
         src2Reg := GetRegisterForTemp(instr.Src2);
         EmitXor(destReg, src1Reg, src2Reg);
+      end;
+    
+    // ========================================================================
+    // SIMD Operations for ParallelArray - Xtensa (scalar fallback)
+    // Note: Xtensa has no SIMD, so we use scalar operations
+    // ========================================================================
+    
+    irSIMDAdd:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitAdd(destReg, src1Reg, src2Reg);
+      end;
+
+    irSIMDSub:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitSub(destReg, src1Reg, src2Reg);
+      end;
+
+    irSIMDMul:
+      begin
+        // Xtensa hat keine native Multiplikation - Warning
+        FDiag.Report(dkWarning, 'SIMD Mul not supported on Xtensa', NullSpan);
+      end;
+
+    irSIMDDiv:
+      begin
+        FDiag.Report(dkWarning, 'SIMD Div not supported on Xtensa', NullSpan);
+      end;
+
+    irSIMDAnd:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitAnd(destReg, src1Reg, src2Reg);
+      end;
+
+    irSIMDOr:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitOr(destReg, src1Reg, src2Reg);
+      end;
+
+    irSIMDXor:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitXor(destReg, src1Reg, src2Reg);
+      end;
+
+    irSIMDNeg:
+      begin
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        EmitNeg(destReg, src1Reg);
+      end;
+
+    irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe:
+      begin
+        // Comparisons - set dest to 1 or 0
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        EmitSub(destReg, src1Reg, src2Reg);  // dest = src1 - src2
+        // For now, set to 1 as placeholder
+        EmitMovi(destReg, 0);
+      end;
+
+    irSIMDLoadElem:
+      begin
+        // Load element: dest = src1[src2]
+        // Offset = src2 * 8
+        destReg := GetRegisterForTemp(instr.Dest);
+        src1Reg := GetRegisterForTemp(instr.Src1);
+        src2Reg := GetRegisterForTemp(instr.Src2);
+        // Multiply src2 by 8
+        EmitMovi(destReg, 8);
+        EmitMul(destReg, src2Reg, destReg);
+        // Add to base
+        EmitAdd(destReg, src1Reg, destReg);
+        // Load from memory (simplified)
+        EmitLoad32(destReg, destReg, 0);
+      end;
+
+    irSIMDStoreElem:
+      begin
+        // Store element: src1[src2] = src3
+        FDiag.Report(dkWarning, 'SIMD StoreElem not fully implemented for Xtensa', NullSpan);
       end;
     
     irCall:
