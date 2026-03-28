@@ -222,7 +222,7 @@ Der Lexer liest `pchar`-Quelltext und produziert eine Liste von Token.
 
 ---
 
-### WP-06: Self-Hosted Parser (Basis)
+### WP-06: Self-Hosted Parser (Basis) ✅ DONE
 
 **Beschreibung:**
 Schreibe den Lyx-Parser in Lyx. Baut einen flachen AST auf, der als int64-indiziertes
@@ -269,7 +269,7 @@ Expected: Korrekte Node-Anzahl, keine Abstürze
 
 ---
 
-### WP-07: Self-Hosted Typ-Checker (Minimal)
+### WP-07: Self-Hosted Typ-Checker (Minimal) ✅ DONE
 
 **Beschreibung:**
 Minimale semantische Analyse: Symboltabelle für Funktionen und Variablen,
