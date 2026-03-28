@@ -302,6 +302,46 @@ struct Symbol {
 
 ---
 
+### WP-07b: Compiler Bug Fixes (lyxc FPC source) ✅ DONE
+
+Drei Compiler-Bugs entdeckt beim Entwickeln von WP-07 und anschließend gefixt:
+
+**Bug 1 – Importierte Konstanten in Klassenmethoden (Priorität: Hoch)**
+- **Problem:** Konstanten wie `PARSER_NODE_SIZE`, `NK_FUNC_DECL` aus `bootstrap.parser`
+  lieferten Garbage-Werte, wenn sie in Methoden einer anderen Klasse (`Sema`) verwendet wurden.
+- **Ursache:** In `LowerImportedUnits` wurde Phase 1 (Klassenmethoden lowern) in der gleichen
+  Iteration wie die Konstantenregistrierung ausgeführt. Da Units in umgekehrter Reihenfolge
+  verarbeitet werden (Sema vor Parser), waren Konstanten aus Parser noch nicht in `FConstMap`,
+  wenn Semas Methoden gelowert wurden.
+- **Fix:** `lower_ast_to_ir.pas` – Drei-Phasen-Ansatz: Phase 0 registriert alle Typen und
+  Konstanten aus ALLEN Units, bevor Phase 1 Klassenmethoden lowert.
+- **Workaround in sema.lyx:** Lokale `con`-Kopien (`SEMA_NODE_SIZE := 88`, `SNK_FUNC_DECL := 2`, …)
+
+**Bug 2 – VMT-Label-Lookup in x86_64-Codegen (Priorität: Mittel)**
+- **Problem:** Bei `new SomeClass()` wurde der VMT-Pointer aller Klassen auf die erste Klasse
+  in `module.ClassDecls` gepatcht, weil `FVMTLabels` zum Zeitpunkt der Funktionsemission leer ist.
+- **Ursache:** `FVMTAddrLeaPositions` speicherte einen `VMTLabelIndex` (default 0), der beim
+  Lookup immer fehlschlug – da `FVMTLabels` erst nach allen Funktionen befüllt wird.
+- **Fix:** `x86_64_emit.pas` – Statt Index jetzt Label-Name speichern; Name-Lookup im
+  Patch-Schritt, nachdem `FVMTLabels` vollständig befüllt ist.
+
+**Bug 3 – Klassen-Instanzen als Methodenparameter (Priorität: Mittel)**
+- **Problem:** Parameter wie `p: Parser` in einer anderen Klasse (`Sema`) hatten kein
+  `ClassDecl` gesetzt → `p.nodes`, `p.NKind(0)` konnten nicht aufgelöst werden.
+- **Ursache:** In `TSema.Analyze` wurden Methodenparameter ohne `TypeName`/`ClassDecl` registriert.
+- **Fix:** `sema.pas` – Parameter-Symbol bekommt jetzt `sym.TypeName := p.TypeName` und
+  `sym.ClassDecl` aus `FClassTypes`-Lookup.
+- **Workaround:** Primitive Werte einzeln übergeben: `s.Init(p.src, p.srcLen, p.nodes, …)`
+
+**Dateien geändert:**
+- `compiler/ir/lower_ast_to_ir.pas` – drei-phasige `LowerImportedUnits`
+- `compiler/backend/x86_64/x86_64_emit.pas` – VMT-Label by name statt by index
+- `compiler/frontend/sema.pas` – `TypeName`/`ClassDecl` für Methodenparameter
+
+**Abhängigkeiten:** WP-07
+
+---
+
 ### WP-08: Self-Hosted x86_64 Code Generator
 
 **Beschreibung:**

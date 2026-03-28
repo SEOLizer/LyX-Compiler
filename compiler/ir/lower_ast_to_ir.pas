@@ -784,10 +784,18 @@ var
 begin
   if not Assigned(um) then Exit;
 
-  { Two-phase approach: Phase 1 = structs/classes/constants, Phase 2 = functions/vars
-    Process units in REVERSE order so that leaf units (implementations) are processed first,
-    then wrapper units are processed and duplicates are skipped. }
-  for phase := 1 to 2 do
+  { Three-phase approach:
+    Phase 0: Pre-register ALL types (structs, classes) and constants/enums.
+             Class method bodies are NOT lowered yet. This ensures that when
+             Phase 1 lowers class method bodies, every imported constant (e.g.
+             PARSER_NODE_SIZE from bootstrap.parser) is already in FConstMap
+             and every imported class type is already in FClassTypes — regardless
+             of which unit appears first in the reverse-order traversal.
+    Phase 1: Lower class method bodies (all types/constants already available).
+    Phase 2: Functions and global variables.
+    Units are processed in REVERSE order so leaf units are handled first;
+    duplicates are skipped via the existing IndexOf() checks. }
+  for phase := 0 to 2 do
   begin
     for i := um.Units.Count - 1 downto 0 do
     begin
@@ -802,178 +810,175 @@ begin
       begin
         node := unitAST.Decls[j];
 
-          // PHASE 1: Structs, Classes, and Constants
-          if phase = 1 then
+          // PHASE 0: Register all types and constants (NO method body lowering).
+          // By registering everything in a dedicated first pass, Phase 1 can lower
+          // class method bodies knowing that all imported constants and class types
+          // are already available — independent of unit processing order.
+          if phase = 0 then
           begin
-            // Process struct declarations from imported units
             if node is TAstStructDecl then
             begin
-              // Only import public structs
               if not TAstStructDecl(node).IsPublic then
                 Continue;
-              // Check if struct already exists
               if FStructTypes.IndexOf(TAstStructDecl(node).Name) >= 0 then
                 Continue;
               FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node));
             end
-          // Process class declarations from imported units
-          else if node is TAstClassDecl then
-          begin
-            // Only import public classes
-            if not TAstClassDecl(node).IsPublic then
-              Continue;
-            // Check if class already exists
-            if FClassTypes.IndexOf(TAstClassDecl(node).Name) >= 0 then
-              Continue;
-            // Store in both maps
-            FStructTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
-            FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
-            // Compute field offsets if sema didn't (transitively imported classes)
-            EnsureClassLayout(TAstClassDecl(node));
-            // Also store in IR module for VMT emission
-            FModule.AddClassDecl(TAstClassDecl(node));
-            // Lower each class method so the machine code is generated
-            FCurrentClassDecl := TAstClassDecl(node);
-            for mi := 0 to High(TAstClassDecl(node).Methods) do
+            else if node is TAstClassDecl then
             begin
-              m := TAstClassDecl(node).Methods[mi];
-              mangled := '_L_' + TAstClassDecl(node).Name + '_' + m.Name;
-              fn := FModule.AddFunction(mangled);
-              FCurrentFunc := fn;
-              FCurrentFuncDecl := m;
-              FLocalMap.Clear;
-              for k := 0 to Length(FLocalConst) - 1 do
-                if Assigned(FLocalConst[k]) then
-                  FLocalConst[k].Free;
-              SetLength(FLocalConst, 0);
-              FTempCounter := 0;
-              if m.IsStatic then
+              if not TAstClassDecl(node).IsPublic then
+                Continue;
+              if FClassTypes.IndexOf(TAstClassDecl(node).Name) >= 0 then
+                Continue;
+              FStructTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+              FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+              EnsureClassLayout(TAstClassDecl(node));
+              FModule.AddClassDecl(TAstClassDecl(node));
+              // Method bodies are NOT lowered here; that happens in Phase 1.
+            end
+            else if node is TAstConDecl then
+            begin
+              con := TAstConDecl(node);
+              if FConstMap.IndexOf(con.Name) >= 0 then
+                Continue;
+              cv := TConstValue.Create;
+              if con.InitExpr is TAstIntLit then
               begin
-                fn.ParamCount := Length(m.Params);
-                fn.LocalCount := fn.ParamCount;
-                SetLength(FLocalTypes, fn.LocalCount);
-                SetLength(FLocalConst, fn.LocalCount);
-                SetLength(FLocalIsStruct, fn.LocalCount);
-                SetLength(FLocalElemSize, fn.LocalCount);
-                SetLength(FLocalTypeNames, fn.LocalCount);
-                for k := 0 to High(m.Params) do
-                begin
-                  FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
-                  FLocalTypes[k] := m.Params[k].ParamType;
-                  FLocalConst[k] := nil;
-                  FLocalIsStruct[k] := False;
-                  FLocalElemSize[k] := 0;
-                  if m.Params[k].TypeName <> '' then
-                    FLocalTypeNames[k] := m.Params[k].TypeName
-                  else
-                    FLocalTypeNames[k] := '';
-                end;
+                cv.IsStr := False;
+                cv.IntVal := TAstIntLit(con.InitExpr).Value;
+              end
+              else if con.InitExpr is TAstStrLit then
+              begin
+                cv.IsStr := True;
+                cv.StrVal := TAstStrLit(con.InitExpr).Value;
+              end
+              else if con.InitExpr is TAstBoolLit then
+              begin
+                cv.IsStr := False;
+                if TAstBoolLit(con.InitExpr).Value then
+                  cv.IntVal := 1
+                else
+                  cv.IntVal := 0;
               end
               else
               begin
-                fn.ParamCount := Length(m.Params) + 1;
-                fn.LocalCount := fn.ParamCount;
-                SetLength(FLocalTypes, fn.LocalCount);
-                SetLength(FLocalConst, fn.LocalCount);
-                SetLength(FLocalIsStruct, fn.LocalCount);
-                SetLength(FLocalElemSize, fn.LocalCount);
-                SetLength(FLocalTypeNames, fn.LocalCount);
-                FLocalMap.AddObject('self', IntToObj(0));
-                FLocalTypes[0] := atUnresolved;
-                FLocalConst[0] := nil;
-                FLocalIsStruct[0] := False;
-                FLocalElemSize[0] := 0;
-                FLocalTypeNames[0] := TAstClassDecl(node).Name;  // 'self' = current class
-                for k := 0 to High(m.Params) do
-                begin
-                  FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
-                  FLocalTypes[k+1] := m.Params[k].ParamType;
-                  FLocalConst[k+1] := nil;
-                  FLocalIsStruct[k+1] := False;
-                  FLocalElemSize[k+1] := 0;
-                  if m.Params[k].TypeName <> '' then
-                    FLocalTypeNames[k+1] := m.Params[k].TypeName
-                  else
-                    FLocalTypeNames[k+1] := '';
-                end;
+                FDiag.Error('imported con initializer must be a literal', con.Span);
+                cv.Free;
+                Continue;
               end;
-              if m.IsAbstract then
+              FConstMap.AddObject(con.Name, System.TObject(cv));
+            end
+            else if node is TAstEnumDecl then
+            begin
+              for k := 0 to High(TAstEnumDecl(node).Values) do
               begin
+                if FConstMap.IndexOf(TAstEnumDecl(node).Values[k].Name) >= 0 then
+                  Continue;
+                cv := TConstValue.Create;
+                cv.IsStr  := False;
+                cv.IntVal := TAstEnumDecl(node).Values[k].Value;
+                FConstMap.AddObject(TAstEnumDecl(node).Values[k].Name, System.TObject(cv));
+              end;
+            end;
+          end
+          // PHASE 1: Lower class method bodies.
+          // All types and constants are already registered (Phase 0), so
+          // imported constants and class types are available during lowering.
+          else if phase = 1 then
+          begin
+            if node is TAstClassDecl then
+            begin
+              if not TAstClassDecl(node).IsPublic then
+                Continue;
+              // Class was already registered in Phase 0; just lower the method bodies.
+              FCurrentClassDecl := TAstClassDecl(node);
+              for mi := 0 to High(TAstClassDecl(node).Methods) do
+              begin
+                m := TAstClassDecl(node).Methods[mi];
+                mangled := '_L_' + TAstClassDecl(node).Name + '_' + m.Name;
+                fn := FModule.AddFunction(mangled);
+                FCurrentFunc := fn;
+                FCurrentFuncDecl := m;
+                FLocalMap.Clear;
+                for k := 0 to Length(FLocalConst) - 1 do
+                  if Assigned(FLocalConst[k]) then
+                    FLocalConst[k].Free;
+                SetLength(FLocalConst, 0);
+                FTempCounter := 0;
+                if m.IsStatic then
+                begin
+                  fn.ParamCount := Length(m.Params);
+                  fn.LocalCount := fn.ParamCount;
+                  SetLength(FLocalTypes, fn.LocalCount);
+                  SetLength(FLocalConst, fn.LocalCount);
+                  SetLength(FLocalIsStruct, fn.LocalCount);
+                  SetLength(FLocalElemSize, fn.LocalCount);
+                  SetLength(FLocalTypeNames, fn.LocalCount);
+                  for k := 0 to High(m.Params) do
+                  begin
+                    FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
+                    FLocalTypes[k] := m.Params[k].ParamType;
+                    FLocalConst[k] := nil;
+                    FLocalIsStruct[k] := False;
+                    FLocalElemSize[k] := 0;
+                    if m.Params[k].TypeName <> '' then
+                      FLocalTypeNames[k] := m.Params[k].TypeName
+                    else
+                      FLocalTypeNames[k] := '';
+                  end;
+                end
+                else
+                begin
+                  fn.ParamCount := Length(m.Params) + 1;
+                  fn.LocalCount := fn.ParamCount;
+                  SetLength(FLocalTypes, fn.LocalCount);
+                  SetLength(FLocalConst, fn.LocalCount);
+                  SetLength(FLocalIsStruct, fn.LocalCount);
+                  SetLength(FLocalElemSize, fn.LocalCount);
+                  SetLength(FLocalTypeNames, fn.LocalCount);
+                  FLocalMap.AddObject('self', IntToObj(0));
+                  FLocalTypes[0] := atUnresolved;
+                  FLocalConst[0] := nil;
+                  FLocalIsStruct[0] := False;
+                  FLocalElemSize[0] := 0;
+                  FLocalTypeNames[0] := TAstClassDecl(node).Name;  // 'self' = current class
+                  for k := 0 to High(m.Params) do
+                  begin
+                    FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
+                    FLocalTypes[k+1] := m.Params[k].ParamType;
+                    FLocalConst[k+1] := nil;
+                    FLocalIsStruct[k+1] := False;
+                    FLocalElemSize[k+1] := 0;
+                    if m.Params[k].TypeName <> '' then
+                      FLocalTypeNames[k+1] := m.Params[k].TypeName
+                    else
+                      FLocalTypeNames[k+1] := '';
+                  end;
+                end;
+                if m.IsAbstract then
+                begin
+                  FCurrentFunc := nil;
+                  FCurrentFuncDecl := nil;
+                  Continue;
+                end;
+                for k := 0 to High(m.Body.Stmts) do
+                  LowerStmt(m.Body.Stmts[k]);
+                if (Length(FCurrentFunc.Instructions) = 0) or
+                   (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+                begin
+                  instr.Op := irReturn;
+                  instr.Src1 := -1;
+                  Emit(instr);
+                end;
                 FCurrentFunc := nil;
                 FCurrentFuncDecl := nil;
-                Continue;
               end;
-              for k := 0 to High(m.Body.Stmts) do
-                LowerStmt(m.Body.Stmts[k]);
-              if (Length(FCurrentFunc.Instructions) = 0) or
-                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
-              begin
-                instr.Op := irReturn;
-                instr.Src1 := -1;
-                Emit(instr);
-              end;
-              FCurrentFunc := nil;
-              FCurrentFuncDecl := nil;
+              FCurrentClassDecl := nil;
             end;
-            FCurrentClassDecl := nil;
+            // Structs, constants, and enums are handled in Phase 0; nothing to do here.
           end
-          // Process constant declarations
-          else if node is TAstConDecl then
-          begin
-            con := TAstConDecl(node);
-            // Note: We must include ALL constants (including private ones) from imported units,
-            // because imported functions may use private constants internally.
-            // The visibility check (IsPublic) is only relevant for name resolution in the
-            // importing module - it should not affect code generation.
-
-            // Check if constant already exists (avoid duplicates)
-            if FConstMap.IndexOf(con.Name) >= 0 then
-              Continue;
-
-            // Register compile-time constant for inline substitution
-            cv := TConstValue.Create;
-            if con.InitExpr is TAstIntLit then
-            begin
-              cv.IsStr := False;
-              cv.IntVal := TAstIntLit(con.InitExpr).Value;
-            end
-            else if con.InitExpr is TAstStrLit then
-            begin
-              cv.IsStr := True;
-              cv.StrVal := TAstStrLit(con.InitExpr).Value;
-            end
-            else if con.InitExpr is TAstBoolLit then
-            begin
-              cv.IsStr := False;
-              if TAstBoolLit(con.InitExpr).Value then
-                cv.IntVal := 1
-              else
-                cv.IntVal := 0;
-            end
-            else
-            begin
-              FDiag.Error('imported con initializer must be a literal', con.Span);
-              cv.Free;
-              Continue;
-            end;
-            FConstMap.AddObject(con.Name, System.TObject(cv));
-          end
-          // Process enum declarations from imported units
-          else if node is TAstEnumDecl then
-          begin
-            for k := 0 to High(TAstEnumDecl(node).Values) do
-            begin
-              if FConstMap.IndexOf(TAstEnumDecl(node).Values[k].Name) >= 0 then
-                Continue;
-              cv := TConstValue.Create;
-              cv.IsStr  := False;
-              cv.IntVal := TAstEnumDecl(node).Values[k].Value;
-              FConstMap.AddObject(TAstEnumDecl(node).Values[k].Name, System.TObject(cv));
-            end;
-          end;
-        end
-        // PHASE 2: Functions and Global Variables
-        else
+          // PHASE 2: Functions and Global Variables
+          else
         begin
           // Process global variable declarations (var / let / pub var / pub let)
           if node is TAstVarDecl then
