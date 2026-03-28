@@ -5524,6 +5524,29 @@ begin
           sym := TSymbol.Create(p.Name);
           sym.Kind := symVar;
           sym.DeclType := p.ParamType;
+          sym.TypeName := p.TypeName;
+          // Set ClassDecl/StructDecl so that method calls and field accesses on
+          // class-typed params (e.g. fn Init(p: Parser)) resolve correctly.
+          if p.TypeName <> '' then
+          begin
+            if Assigned(FClassTypes) then
+            begin
+              fi := FClassTypes.IndexOf(p.TypeName);
+              if fi >= 0 then
+                sym.ClassDecl := TAstClassDecl(FClassTypes.Objects[fi]);
+            end;
+            if (sym.ClassDecl = nil) and Assigned(FStructTypes) then
+            begin
+              fi := FStructTypes.IndexOf(p.TypeName);
+              if fi >= 0 then
+              begin
+                if FStructTypes.Objects[fi] is TAstClassDecl then
+                  sym.ClassDecl := TAstClassDecl(FStructTypes.Objects[fi])
+                else
+                  sym.StructDecl := TAstStructDecl(FStructTypes.Objects[fi]);
+              end;
+            end;
+          end;
           AddSymbolToCurrent(sym, p.Span);
         end;
         // set return type
