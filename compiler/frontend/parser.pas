@@ -1270,8 +1270,8 @@ begin
   Expect(tkColon);
   declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
 
-  // Optional initializer for const/var
-  if Accept(tkSingleEq) then
+  // Optional initializer for const/var (accept both := and = for compatibility)
+  if Accept(tkAssign) or Accept(tkSingleEq) then
     initExpr := ParseExpr
   else
     initExpr := nil;
