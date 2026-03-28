@@ -516,7 +516,7 @@ begin
         try
           // Konfiguriere den UnitManager
           um.SetSourceFile(inputFile);
-          um.SetProjectRoot(basePath);
+          um.SetProjectRoot(GetCurrentDir);
           um.SetTraceImports(flagTraceImports);
           
           // Optionaler Std-Lib-Pfad

@@ -3901,12 +3901,23 @@ begin
         else if f.FieldTypeName <> '' then
         begin
             idx := FStructTypes.IndexOf(f.FieldTypeName);
-            if idx < 0 then begin ok := False; Break; end;
-            other := TAstStructDecl(FStructTypes.Objects[idx]);
-            if other.Size = 0 then begin ok := False; Break; end;
-            fsize := other.Size;
-            falign := other.Align;
-
+            if idx >= 0 then
+            begin
+              other := TAstStructDecl(FStructTypes.Objects[idx]);
+              if other.Size = 0 then begin ok := False; Break; end;
+              fsize := other.Size;
+              falign := other.Align;
+            end
+            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.FieldTypeName) >= 0) then
+            begin
+              // Class-typed field stored as pointer
+              fsize  := 8;
+              falign := 8;
+            end
+            else
+            begin
+              ok := False; Break;
+            end;
         end
         else
         begin
@@ -4097,6 +4108,12 @@ begin
           begin
             fsize := TAstStructDecl(FStructTypes.Objects[baseIdx]).Size;
             falign := TAstStructDecl(FStructTypes.Objects[baseIdx]).Align;
+          end
+          else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.FieldTypeName) >= 0) then
+          begin
+            // Class-typed field: stored as pointer (8 bytes)
+            fsize  := 8;
+            falign := 8;
           end
           else
           begin

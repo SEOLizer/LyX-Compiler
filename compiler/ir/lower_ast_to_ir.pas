@@ -68,6 +68,7 @@ type
     procedure LowerNestedFunc(funcDecl: TAstFuncDecl); // lift nested function to top-level
     procedure LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
     function GetReturnStructDecl: TAstStructDecl; // get struct decl for current func's return type
+    procedure EnsureClassLayout(cd: TAstClassDecl); // compute field offsets if not yet done
   public
     constructor Create(modul: TIRModule; diag: TDiagnostics);
     destructor Destroy; override;
@@ -698,6 +699,67 @@ begin
   Result := FModule;
 end;
 
+procedure TIRLowering.EnsureClassLayout(cd: TAstClassDecl);
+{ Compute field offsets for an imported class if not yet done by sema.
+  Classes imported transitively (e.g., lexer.lyx imported by parser.lyx) may
+  not have been processed by ComputeClassLayouts in sema because they were not
+  directly visible to sema's FClassTypes.  We recompute the layout here so
+  that the fallback field-access code in LowerStmt/LowerExpr uses correct offsets. }
+var
+  fldIdx: Integer;
+  f: TStructField;
+  off, fsize, falign: Integer;
+  baseSize: Integer;
+  baseIdx: Integer;
+  baseCd: TAstClassDecl;
+begin
+  if not Assigned(cd) then Exit;
+  if cd.Size <> 0 then Exit;  // already computed
+
+  // Ensure base class layout first
+  baseSize := 8;  // VMT pointer slot for all classes (even without virtual methods)
+  if cd.BaseClassName <> '' then
+  begin
+    baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
+    if baseIdx >= 0 then
+    begin
+      baseCd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+      EnsureClassLayout(baseCd);
+      if baseCd.Size > 0 then
+        baseSize := baseCd.Size;
+    end;
+  end;
+
+  off := baseSize;
+  for fldIdx := 0 to High(cd.Fields) do
+  begin
+    f := cd.Fields[fldIdx];
+    fsize := 8; falign := 8;  // default: 8-byte pointer/int
+    case f.FieldType of
+      atInt8, atUInt8, atChar, atBool: begin fsize := 1; falign := 1; end;
+      atInt16, atUInt16:               begin fsize := 2; falign := 2; end;
+      atInt32, atUInt32, atF32:        begin fsize := 4; falign := 4; end;
+      atInt64, atUInt64, atISize, atUSize, atF64, atPChar: begin fsize := 8; falign := 8; end;
+      atUnresolved:
+        begin
+          // Named type — assume pointer (8 bytes)
+          fsize := 8; falign := 8;
+        end;
+    else
+      fsize := 8; falign := 8;
+    end;
+    // align offset
+    if (off mod falign) <> 0 then
+      off := ((off + falign - 1) div falign) * falign;
+    cd.FieldOffsets[fldIdx] := off;
+    off := off + fsize;
+  end;
+  // align total size to 8
+  if (off mod 8) <> 0 then
+    off := ((off + 7) div 8) * 8;
+  cd.SetLayout(off, 8, baseSize);
+end;
+
 procedure TIRLowering.LowerImportedUnits(um: TUnitManager);
 { Lower all functions, constants and global variables from imported units
   Uses two-phase approach:
@@ -766,6 +828,8 @@ begin
             // Store in both maps
             FStructTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
             FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+            // Compute field offsets if sema didn't (transitively imported classes)
+            EnsureClassLayout(TAstClassDecl(node));
             // Also store in IR module for VMT emission
             FModule.AddClassDecl(TAstClassDecl(node));
             // Lower each class method so the machine code is generated
@@ -791,6 +855,7 @@ begin
                 SetLength(FLocalConst, fn.LocalCount);
                 SetLength(FLocalIsStruct, fn.LocalCount);
                 SetLength(FLocalElemSize, fn.LocalCount);
+                SetLength(FLocalTypeNames, fn.LocalCount);
                 for k := 0 to High(m.Params) do
                 begin
                   FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
@@ -798,6 +863,10 @@ begin
                   FLocalConst[k] := nil;
                   FLocalIsStruct[k] := False;
                   FLocalElemSize[k] := 0;
+                  if m.Params[k].TypeName <> '' then
+                    FLocalTypeNames[k] := m.Params[k].TypeName
+                  else
+                    FLocalTypeNames[k] := '';
                 end;
               end
               else
@@ -808,11 +877,13 @@ begin
                 SetLength(FLocalConst, fn.LocalCount);
                 SetLength(FLocalIsStruct, fn.LocalCount);
                 SetLength(FLocalElemSize, fn.LocalCount);
+                SetLength(FLocalTypeNames, fn.LocalCount);
                 FLocalMap.AddObject('self', IntToObj(0));
                 FLocalTypes[0] := atUnresolved;
                 FLocalConst[0] := nil;
                 FLocalIsStruct[0] := False;
                 FLocalElemSize[0] := 0;
+                FLocalTypeNames[0] := TAstClassDecl(node).Name;  // 'self' = current class
                 for k := 0 to High(m.Params) do
                 begin
                   FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
@@ -820,6 +891,10 @@ begin
                   FLocalConst[k+1] := nil;
                   FLocalIsStruct[k+1] := False;
                   FLocalElemSize[k+1] := 0;
+                  if m.Params[k].TypeName <> '' then
+                    FLocalTypeNames[k+1] := m.Params[k].TypeName
+                  else
+                    FLocalTypeNames[k+1] := '';
                 end;
               end;
               if m.IsAbstract then
@@ -976,6 +1051,7 @@ begin
               SetLength(FLocalConst, fn.LocalCount);
               SetLength(FLocalIsStruct, fn.LocalCount);
               SetLength(FLocalElemSize, fn.LocalCount);
+              SetLength(FLocalTypeNames, fn.LocalCount);
 
               for k := 0 to fn.ParamCount - 1 do
               begin
@@ -984,6 +1060,11 @@ begin
                 FLocalConst[k] := nil;
                 FLocalIsStruct[k] := False;
                 FLocalElemSize[k] := 0;
+                // Record class type name for method-call resolution on class-typed params
+                if TAstFuncDecl(node).Params[k].TypeName <> '' then
+                  FLocalTypeNames[k] := TAstFuncDecl(node).Params[k].TypeName
+                else
+                  FLocalTypeNames[k] := '';
               end;
 
               // Lower statements
@@ -3350,13 +3431,36 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           else
           begin
             // FieldOffset not set by sema (e.g., imported class methods not fully sema'd).
-            // Try to resolve the field by name using the current class context.
+            // Try to resolve the field by name.
+            // First determine which class the receiver belongs to:
+            //   - If receiver is 'self' → FCurrentClassDecl
+            //   - If receiver is a local variable → look up FLocalTypeNames
             fldOffset := -1;
             ownerName := '';
+            cd := nil;
             if Assigned(FCurrentClassDecl) then
             begin
-              // Walk current class and base classes to find the field
-              cd := FCurrentClassDecl;
+              // Check if the root object is 'self' or a named local
+              if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
+              begin
+                // Named local variable: look up its class type
+                i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
+                if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
+                   (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+                begin
+                  idx := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+                  if idx >= 0 then
+                    cd := TAstClassDecl(FClassTypes.Objects[idx]);
+                end;
+              end;
+              if cd = nil then
+                cd := FCurrentClassDecl;
+            end;
+            if Assigned(cd) then
+            begin
+              // Walk the class and base classes to find the field
+              // ownerName set to root class name for irLoadFieldHeap dispatch
+              ownerName := cd.Name;
               while Assigned(cd) do
               begin
                 for k := 0 to High(cd.Fields) do
@@ -3365,7 +3469,6 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                   begin
                     fldOffset := cd.FieldOffsets[k];
                     fldType := cd.Fields[k].FieldType;
-                    ownerName := FCurrentClassDecl.Name;
                     Break;
                   end;
                 end;
@@ -4515,8 +4618,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         FLocalElemSize[loc] := elemSize;
         Exit(True);
       end
-      else if (vd.DeclTypeName <> '') and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0) and
-              (FStructTypes.Objects[FStructTypes.IndexOf(vd.DeclTypeName)] is TAstClassDecl) then
+      else if (vd.DeclTypeName <> '') and
+              (((FStructTypes.IndexOf(vd.DeclTypeName) >= 0) and
+                (FStructTypes.Objects[FStructTypes.IndexOf(vd.DeclTypeName)] is TAstClassDecl)) or
+               (Assigned(FClassTypes) and (FClassTypes.IndexOf(vd.DeclTypeName) >= 0))) then
       begin
         // Class type: allocate a single pointer slot for the object reference
         loc := AllocLocal(vd.Name, vd.DeclType);
@@ -4904,11 +5009,29 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       ownerName := fa.Target.OwnerName;
       fldOffset := fa.Target.FieldOffset;
       fldType := fa.Target.FieldType;
+      // DEBUG: trace field assign offsets
+      if Assigned(FCurrentClassDecl) then
+        WriteLn(StdErr, '[IR-DBG] FieldAssign field=' + fa.Target.Field + ' fldOffset=' + IntToStr(fldOffset) + ' ownerName=' + ownerName + ' class=' + FCurrentClassDecl.Name);
       // If sema didn't annotate the field offset (imported class method bodies),
-      // resolve it now from the current class context.
+      // resolve it now.  Determine receiver class: 'self' → FCurrentClassDecl,
+      // named local → FLocalTypeNames lookup.
       if (fldOffset < 0) and Assigned(FCurrentClassDecl) then
       begin
-        cd := FCurrentClassDecl;
+        cd := nil;
+        if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
+        begin
+          i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
+          if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
+             (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+          begin
+            j := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+            if j >= 0 then
+              cd := TAstClassDecl(FClassTypes.Objects[j]);
+          end;
+        end;
+        if cd = nil then
+          cd := FCurrentClassDecl;
+        ownerName := cd.Name;
         while Assigned(cd) do
         begin
           for fi := 0 to High(cd.Fields) do
@@ -4917,7 +5040,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             begin
               fldOffset := cd.FieldOffsets[fi];
               fldType := cd.Fields[fi].FieldType;
-              ownerName := FCurrentClassDecl.Name;
+              WriteLn(StdErr, '[IR-DBG] Fallback found field=' + fa.Target.Field + ' fi=' + IntToStr(fi) + ' fldOffset=' + IntToStr(fldOffset));
               Break;
             end;
           end;
