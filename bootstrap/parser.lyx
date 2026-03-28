@@ -1,16 +1,1011 @@
 // bootstrap/parser.lyx
-// Lyx-in-Lyx Parser (WP-06)
-//
-// Ziel: Aufbau eines AST aus dem Token-Stream des Lexers.
-// Status: Stub – Implementierung ausstehend.
-//
-// Der Parser soll folgende Konstrukte erkennen:
-//   FnDecl, VarDecl, LetDecl, IfStmt, WhileStmt,
-//   ReturnStmt, MatchStmt, EnumDecl, CallExpr,
-//   BinaryExpr, UnaryExpr, IndexExpr, FieldExpr,
-//   TupleReturn, GenericCall
+// Lyx Self-Hosted Parser (WP-06)
+// Recursive-descent parser producing a flat index-based AST.
+// Covers the minimal subset needed for bootstrapping.
 
-fn main(): int64 {
-  PrintStr("bootstrap/parser.lyx: stub\n");
-  return 0;
+import bootstrap.lexer;
+
+// ============================================================================
+// AST Node Kind Constants
+// ============================================================================
+
+pub con NK_INVALID:     int64 := 0;
+pub con NK_IMPORT:      int64 := 1;
+pub con NK_FUNC_DECL:   int64 := 2;
+pub con NK_PARAM:       int64 := 3;
+pub con NK_VAR_DECL:    int64 := 4;
+pub con NK_CON_DECL:    int64 := 5;
+pub con NK_STRUCT_DECL: int64 := 6;
+pub con NK_FIELD_DECL:  int64 := 7;
+pub con NK_ENUM_DECL:   int64 := 8;
+pub con NK_ENUM_MEM:    int64 := 9;
+pub con NK_TYPE_DECL:   int64 := 10;
+
+// Statements
+pub con NK_BLOCK:     int64 := 20;
+pub con NK_IF:        int64 := 21;
+pub con NK_WHILE:     int64 := 22;
+pub con NK_RETURN:    int64 := 23;
+pub con NK_EXPR_STMT: int64 := 24;
+pub con NK_ASSIGN:    int64 := 25;
+pub con NK_FOR:       int64 := 26;
+pub con NK_SWITCH:    int64 := 27;
+pub con NK_CASE:      int64 := 28;
+pub con NK_BREAK:     int64 := 29;
+pub con NK_DISPOSE:   int64 := 30;
+
+// Expressions
+pub con NK_LIT_INT:   int64 := 40;
+pub con NK_LIT_FLOAT: int64 := 41;
+pub con NK_LIT_STR:   int64 := 42;
+pub con NK_LIT_CHAR:  int64 := 43;
+pub con NK_LIT_BOOL:  int64 := 44;
+pub con NK_LIT_NULL:  int64 := 45;
+pub con NK_IDENT:     int64 := 46;
+pub con NK_BINOP:     int64 := 47;
+pub con NK_UNOP:      int64 := 48;
+pub con NK_CALL:      int64 := 49;
+pub con NK_INDEX:     int64 := 50;
+pub con NK_FIELD:     int64 := 51;
+pub con NK_NEW:       int64 := 52;
+
+// Type nodes
+pub con NK_TYPE_NAME:  int64 := 60;
+pub con NK_TYPE_ARRAY: int64 := 61;
+
+// ============================================================================
+// Memory layout notes:
+//
+// Token entry (40 bytes each):
+//   +0:  kind  (int64)
+//   +8:  start (int64) -- byte offset in source
+//   +16: len   (int64)
+//   +24: iVal  (int64)
+//   +32: line  (int64)
+//
+// Node entry (80 bytes each):
+//   +0:  kind   (int64)
+//   +8:  child0 (int64, node idx or -1)
+//   +16: child1 (int64)
+//   +24: child2 (int64)
+//   +32: child3 (int64)
+//   +40: next   (int64, sibling list)
+//   +48: tokIdx (int64)
+//   +56: iVal   (int64, op / literal value / flags)
+//   +64: sOff   (int64, byte offset into src for name/sval)
+//   +72: sLen   (int64)
+//   -- also: isPub packed into high bit of iVal (bit 62) to save space --
+//   Actually: keep isPub separate at +80? Makes 88 bytes.
+//   Use +80: isPub (int64) -- 88 bytes total
+// ============================================================================
+
+pub con PARSER_TOK_SIZE:  int64 := 40;
+pub con PARSER_NODE_SIZE: int64 := 88;
+
+// ============================================================================
+// Parser Class
+// (No Lexer field -- Lexer is created locally in Init() and disposed after
+//  tokenization, avoiding class-typed field layout issues.)
+// ============================================================================
+
+pub type Parser = class {
+  src:    pchar;   // source text pointer
+  srcLen: int64;
+
+  // Token array (raw int64 buffer allocated via mmap)
+  toks:     int64;
+  tokCount: int64;
+  tokCap:   int64;
+
+  // Node pool (raw int64 buffer allocated via mmap)
+  nodes:     int64;
+  nodeCount: int64;
+  nodeCap:   int64;
+
+  // Token cursor
+  cur: int64;
+
+  // Error state
+  hadError: int64;
+
+  // ------------------------------------------------------------------
+  // Token array helpers
+  // ------------------------------------------------------------------
+
+  fn _toff(i: int64): int64 { return self.toks + i * PARSER_TOK_SIZE; }
+
+  fn TokKind(i: int64): int64  { return peek64(self._toff(i)); }
+  fn TokStart(i: int64): int64 { return peek64(self._toff(i) + 8); }
+  fn TokLen(i: int64): int64   { return peek64(self._toff(i) + 16); }
+  fn TokIVal(i: int64): int64  { return peek64(self._toff(i) + 24); }
+  fn TokLine(i: int64): int64  { return peek64(self._toff(i) + 32); }
+
+  fn _pushTok(kind: int64, start: int64, len: int64, iVal: int64, line: int64) {
+    if (self.tokCount >= self.tokCap) {
+      var newCap: int64 := self.tokCap * 2;
+      var nb: int64 := mmap(0, newCap * PARSER_TOK_SIZE, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.tokCount * PARSER_TOK_SIZE) {
+        poke8(nb + i, peek8(self.toks + i));
+        i := i + 1;
+      }
+      self.toks   := nb;
+      self.tokCap := newCap;
+    }
+    var off: int64 := self._toff(self.tokCount);
+    poke64(off,      kind);
+    poke64(off + 8,  start);
+    poke64(off + 16, len);
+    poke64(off + 24, iVal);
+    poke64(off + 32, line);
+    self.tokCount := self.tokCount + 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Node pool helpers
+  // ------------------------------------------------------------------
+
+  fn _noff(i: int64): int64 { return self.nodes + i * PARSER_NODE_SIZE; }
+
+  fn NKind(i: int64): int64   { return peek64(self._noff(i)); }
+  fn NChild0(i: int64): int64 { return peek64(self._noff(i) + 8); }
+  fn NChild1(i: int64): int64 { return peek64(self._noff(i) + 16); }
+  fn NChild2(i: int64): int64 { return peek64(self._noff(i) + 24); }
+  fn NChild3(i: int64): int64 { return peek64(self._noff(i) + 32); }
+  fn NNext(i: int64): int64   { return peek64(self._noff(i) + 40); }
+  fn NTokIdx(i: int64): int64 { return peek64(self._noff(i) + 48); }
+  fn NIVal(i: int64): int64   { return peek64(self._noff(i) + 56); }
+  // NSVal returns pointer into src buffer (src + stored offset)
+  fn NSVal(i: int64): pchar   { return self.src + peek64(self._noff(i) + 64); }
+  fn NSLen(i: int64): int64   { return peek64(self._noff(i) + 72); }
+  fn NIsPub(i: int64): int64  { return peek64(self._noff(i) + 80); }
+
+  fn _sc0(i: int64, v: int64) { poke64(self._noff(i) + 8,  v); }
+  fn _sc1(i: int64, v: int64) { poke64(self._noff(i) + 16, v); }
+  fn _sc2(i: int64, v: int64) { poke64(self._noff(i) + 24, v); }
+  fn _sc3(i: int64, v: int64) { poke64(self._noff(i) + 32, v); }
+  fn _sn(i: int64, v: int64)  { poke64(self._noff(i) + 40, v); }
+  fn _siv(i: int64, v: int64) { poke64(self._noff(i) + 56, v); }
+  // _ssv stores offset into src (not a pointer) + length
+  fn _ssv(i: int64, off: int64, len: int64) {
+    poke64(self._noff(i) + 64, off);
+    poke64(self._noff(i) + 72, len);
+  }
+  fn _spub(i: int64, v: int64) { poke64(self._noff(i) + 80, v); }
+
+  fn _alloc(kind: int64, tokIdx: int64): int64 {
+    if (self.nodeCount >= self.nodeCap) {
+      var newCap: int64 := self.nodeCap * 2;
+      var nb: int64 := mmap(0, newCap * PARSER_NODE_SIZE, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.nodeCount * PARSER_NODE_SIZE) {
+        poke8(nb + i, peek8(self.nodes + i));
+        i := i + 1;
+      }
+      self.nodes   := nb;
+      self.nodeCap := newCap;
+    }
+    var idx: int64 := self.nodeCount;
+    var off: int64 := self._noff(idx);
+    poke64(off,      kind);
+    poke64(off + 8,  -1);
+    poke64(off + 16, -1);
+    poke64(off + 24, -1);
+    poke64(off + 32, -1);
+    poke64(off + 40, -1);
+    poke64(off + 48, tokIdx);
+    poke64(off + 56, 0);
+    poke64(off + 64, 0);
+    poke64(off + 72, 0);
+    poke64(off + 80, 0);
+    self.nodeCount := self.nodeCount + 1;
+    return idx;
+  }
+
+  // ------------------------------------------------------------------
+  // Tokenize (using a locally-created Lexer)
+  // ------------------------------------------------------------------
+
+  fn _tokenize() {
+    var lx: Lexer := new Lexer();
+    lx.Init(self.src, self.srcLen);
+    var line: int64 := lx.line;
+    var k: int64 := lx.Next();
+    while (k != TK_EOF) {
+      self._pushTok(k, lx.tokStart, lx.tokLen, lx.tokIVal, line);
+      line := lx.line;
+      k := lx.Next();
+    }
+    self._pushTok(TK_EOF, 0, 0, 0, line);
+    dispose lx;
+  }
+
+  // ------------------------------------------------------------------
+  // Cursor helpers
+  // ------------------------------------------------------------------
+
+  fn Peek(): int64 { return self.TokKind(self.cur); }
+
+  fn Advance(): int64 {
+    var k: int64 := self.TokKind(self.cur);
+    if (k != TK_EOF) { self.cur := self.cur + 1; }
+    return k;
+  }
+
+  fn Check(k: int64): int64 {
+    if (self.Peek() == k) { return 1; }
+    return 0;
+  }
+
+  fn Match(k: int64): int64 {
+    if (self.Peek() == k) { self.Advance(); return 1; }
+    return 0;
+  }
+
+  fn Expect(k: int64): int64 {
+    if (self.Peek() == k) {
+      var idx: int64 := self.cur;
+      self.Advance();
+      return idx;
+    }
+    if (self.hadError == 0) {
+      self.hadError := 1;
+      PrintStr("Parse error at line ");
+      PrintInt(self.TokLine(self.cur));
+      PrintStr(": expected token ");
+      PrintInt(k);
+      PrintStr(", got ");
+      PrintInt(self.Peek());
+      PrintStr("\n");
+    }
+    return self.cur;
+  }
+
+  fn _err(msg: pchar) {
+    if (self.hadError != 0) { return; }
+    self.hadError := 1;
+    PrintStr("Parse error at line ");
+    PrintInt(self.TokLine(self.cur));
+    PrintStr(": ");
+    PrintStr(msg);
+    PrintStr("\n");
+  }
+
+  // Token text: offset and length within src
+  fn _tokOff(i: int64): int64 { return self.TokStart(i); }
+  fn _tokLen(i: int64): int64 { return self.TokLen(i); }
+
+  // ------------------------------------------------------------------
+  // Init / Free
+  // ------------------------------------------------------------------
+
+  fn Init(s: pchar, n: int64) {
+    self.src    := s;
+    self.srcLen := n;
+
+    self.tokCap   := 2048;
+    self.toks     := mmap(0, self.tokCap * PARSER_TOK_SIZE, 3, 34, -1, 0);
+    self.tokCount := 0;
+
+    self.nodeCap   := 8192;
+    self.nodes     := mmap(0, self.nodeCap * PARSER_NODE_SIZE, 3, 34, -1, 0);
+    self.nodeCount := 0;
+
+    self.cur      := 0;
+    self.hadError := 0;
+
+    self._tokenize();
+  }
+
+  // ==================================================================
+  // Type parsing
+  // ==================================================================
+
+  fn ParseType(): int64 {
+    var ti: int64 := self.cur;
+    if (self.Check(TK_ARRAY) != 0) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_TYPE_ARRAY, ti);
+      if (self.Match(TK_LT) != 0) {
+        self._sc0(n, self.ParseType());
+        self.Expect(TK_GT);
+      }
+      return n;
+    }
+    var n: int64 := self._alloc(NK_TYPE_NAME, ti);
+    self._ssv(n, self._tokOff(ti), self._tokLen(ti));
+    self.Advance();
+    return n;
+  }
+
+  // ==================================================================
+  // Expression parsing (precedence climbing)
+  // ==================================================================
+
+  fn ParseExpr(): int64 { return self.ParseOr(); }
+
+  fn ParseOr(): int64 {
+    var lhs: int64 := self.ParseAnd();
+    while (self.Check(TK_OR) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseAnd();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseAnd(): int64 {
+    var lhs: int64 := self.ParseBitOr();
+    while (self.Check(TK_AND) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseBitOr();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseBitOr(): int64 {
+    var lhs: int64 := self.ParseBitXor();
+    while (self.Check(TK_BITOR) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseBitXor();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseBitXor(): int64 {
+    var lhs: int64 := self.ParseBitAnd();
+    while (self.Check(TK_BITXOR) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseBitAnd();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseBitAnd(): int64 {
+    var lhs: int64 := self.ParseEq();
+    while (self.Check(TK_BITAND) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseEq();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseEq(): int64 {
+    var lhs: int64 := self.ParseRel();
+    while (self.Check(TK_EQ2) != 0 || self.Check(TK_NEQ) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseRel();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseRel(): int64 {
+    var lhs: int64 := self.ParseShift();
+    while (self.Check(TK_LT) != 0 || self.Check(TK_LE) != 0 ||
+           self.Check(TK_GT) != 0 || self.Check(TK_GE) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseShift();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseShift(): int64 {
+    var lhs: int64 := self.ParseAdd();
+    while (self.Check(TK_SHL) != 0 || self.Check(TK_SHR) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseAdd();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseAdd(): int64 {
+    var lhs: int64 := self.ParseMul();
+    while (self.Check(TK_PLUS) != 0 || self.Check(TK_MINUS) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseMul();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseMul(): int64 {
+    var lhs: int64 := self.ParseUnary();
+    while (self.Check(TK_STAR) != 0 || self.Check(TK_SLASH) != 0 || self.Check(TK_PERCENT) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var rhs: int64 := self.ParseUnary();
+      var n: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+    }
+    return lhs;
+  }
+
+  fn ParseUnary(): int64 {
+    if (self.Check(TK_NOT) != 0 || self.Check(TK_BITNOT) != 0 || self.Check(TK_MINUS) != 0) {
+      var ti: int64 := self.cur; var op: int64 := self.Advance();
+      var n: int64 := self._alloc(NK_UNOP, ti);
+      self._siv(n, op);
+      self._sc0(n, self.ParseUnary());
+      return n;
+    }
+    return self.ParsePostfix();
+  }
+
+  fn ParsePostfix(): int64 {
+    var base: int64 := self.ParsePrimary();
+    var stop: int64 := 0;
+    while (stop == 0) {
+      if (self.Check(TK_DOT) != 0) {
+        var ti: int64 := self.cur;
+        self.Advance();
+        var nameTok: int64 := self.cur;
+        self.Expect(TK_IDENT);
+        if (self.Check(TK_LPAREN) != 0) {
+          self.Advance();
+          var n: int64 := self._alloc(NK_CALL, ti);
+          self._sc0(n, base);
+          self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+          self._siv(n, 1);  // method call flag
+          self._sc1(n, self._parseArgList());
+          self.Expect(TK_RPAREN);
+          base := n;
+        } else {
+          var n: int64 := self._alloc(NK_FIELD, ti);
+          self._sc0(n, base);
+          self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+          base := n;
+        }
+      } else if (self.Check(TK_LBRACK) != 0) {
+        var ti: int64 := self.cur;
+        self.Advance();
+        var idx: int64 := self.ParseExpr();
+        self.Expect(TK_RBRACK);
+        var n: int64 := self._alloc(NK_INDEX, ti);
+        self._sc0(n, base); self._sc1(n, idx);
+        base := n;
+      } else {
+        stop := 1;
+      }
+    }
+    return base;
+  }
+
+  fn ParsePrimary(): int64 {
+    var ti: int64 := self.cur;
+    var k: int64 := self.Peek();
+
+    if (k == TK_INT) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_INT, ti);
+      self._siv(n, self.TokIVal(ti));
+      return n;
+    }
+    if (k == TK_FLOAT) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_FLOAT, ti);
+      self._ssv(n, self._tokOff(ti), self._tokLen(ti));
+      return n;
+    }
+    if (k == TK_STRING) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_STR, ti);
+      self._ssv(n, self._tokOff(ti), self._tokLen(ti));
+      return n;
+    }
+    if (k == TK_CHAR) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_CHAR, ti);
+      self._siv(n, self.TokIVal(ti));
+      return n;
+    }
+    if (k == TK_TRUE) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_BOOL, ti);
+      self._siv(n, 1);
+      return n;
+    }
+    if (k == TK_FALSE) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_LIT_BOOL, ti);
+      self._siv(n, 0);
+      return n;
+    }
+    if (k == TK_NULL) {
+      self.Advance();
+      return self._alloc(NK_LIT_NULL, ti);
+    }
+    if (k == TK_NEW) {
+      self.Advance();
+      var nameTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      var n: int64 := self._alloc(NK_NEW, ti);
+      self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+      self.Expect(TK_LPAREN);
+      self._sc0(n, self._parseArgList());
+      self.Expect(TK_RPAREN);
+      return n;
+    }
+    if (k == TK_LPAREN) {
+      self.Advance();
+      var inner: int64 := self.ParseExpr();
+      self.Expect(TK_RPAREN);
+      return inner;
+    }
+    if (k == TK_IDENT) {
+      self.Advance();
+      if (self.Check(TK_LPAREN) != 0) {
+        self.Advance();
+        var n: int64 := self._alloc(NK_CALL, ti);
+        self._ssv(n, self._tokOff(ti), self._tokLen(ti));
+        self._siv(n, 0);
+        self._sc0(n, self._parseArgList());
+        self.Expect(TK_RPAREN);
+        return n;
+      }
+      var n: int64 := self._alloc(NK_IDENT, ti);
+      self._ssv(n, self._tokOff(ti), self._tokLen(ti));
+      return n;
+    }
+
+    self._err("expected expression");
+    var dummy: int64 := self._alloc(NK_INVALID, ti);
+    if (self.Peek() != TK_EOF) { self.Advance(); }
+    return dummy;
+  }
+
+  fn _parseArgList(): int64 {
+    if (self.Check(TK_RPAREN) != 0) { return -1; }
+    var head: int64 := self.ParseExpr();
+    var tail: int64 := head;
+    while (self.Match(TK_COMMA) != 0) {
+      var arg: int64 := self.ParseExpr();
+      self._sn(tail, arg);
+      tail := arg;
+    }
+    return head;
+  }
+
+  // ==================================================================
+  // Statement parsing
+  // ==================================================================
+
+  fn ParseStmt(): int64 {
+    var ti: int64 := self.cur;
+    var k: int64 := self.Peek();
+
+    if (k == TK_VAR)    { return self.ParseVarDecl(0); }
+    if (k == TK_CON)    { return self.ParseConDecl(0); }
+    if (k == TK_RETURN) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_RETURN, ti);
+      if (self.Check(TK_SEMI) == 0 && self.Check(TK_RBRACE) == 0) {
+        self._sc0(n, self.ParseExpr());
+      }
+      self.Match(TK_SEMI);
+      return n;
+    }
+    if (k == TK_IF)    { return self._parseIf(); }
+    if (k == TK_WHILE) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_WHILE, ti);
+      self.Expect(TK_LPAREN);
+      self._sc0(n, self.ParseExpr());
+      self.Expect(TK_RPAREN);
+      self._sc1(n, self.ParseBlock());
+      return n;
+    }
+    if (k == TK_FOR)    { return self._parseFor(); }
+    if (k == TK_SWITCH) { return self._parseSwitch(); }
+    if (k == TK_BREAK)  {
+      self.Advance(); self.Match(TK_SEMI);
+      return self._alloc(NK_BREAK, ti);
+    }
+    if (k == TK_DISPOSE) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_DISPOSE, ti);
+      self._sc0(n, self.ParseExpr());
+      self.Match(TK_SEMI);
+      return n;
+    }
+    if (k == TK_LBRACE) { return self.ParseBlock(); }
+
+    var expr: int64 := self.ParseExpr();
+    if (self.Match(TK_ASSIGN) != 0) {
+      var rhs: int64 := self.ParseExpr();
+      self.Match(TK_SEMI);
+      var n: int64 := self._alloc(NK_ASSIGN, ti);
+      self._sc0(n, expr); self._sc1(n, rhs);
+      return n;
+    }
+    self.Match(TK_SEMI);
+    var n: int64 := self._alloc(NK_EXPR_STMT, ti);
+    self._sc0(n, expr);
+    return n;
+  }
+
+  fn _parseIf(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var n: int64 := self._alloc(NK_IF, ti);
+    self.Expect(TK_LPAREN);
+    self._sc0(n, self.ParseExpr());
+    self.Expect(TK_RPAREN);
+    self._sc1(n, self.ParseBlock());
+    if (self.Match(TK_ELSE) != 0) {
+      if (self.Check(TK_IF) != 0) { self._sc2(n, self._parseIf()); }
+      else { self._sc2(n, self.ParseBlock()); }
+    }
+    return n;
+  }
+
+  fn _parseFor(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var n: int64 := self._alloc(NK_FOR, ti);
+    var varTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    self.Expect(TK_ASSIGN);
+    self._ssv(n, self._tokOff(varTok), self._tokLen(varTok));
+    self._sc0(n, self.ParseExpr());
+    var dir: int64 := 0;
+    if (self.Match(TK_DOWNTO) != 0) { dir := 1; } else { self.Expect(TK_TO); }
+    self._siv(n, dir);
+    self._sc1(n, self.ParseExpr());
+    self._sc2(n, self.ParseBlock());
+    return n;
+  }
+
+  fn _parseSwitch(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var n: int64 := self._alloc(NK_SWITCH, ti);
+    self.Expect(TK_LPAREN);
+    self._sc0(n, self.ParseExpr());
+    self.Expect(TK_RPAREN);
+    self.Expect(TK_LBRACE);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var cti: int64 := self.cur;
+      var isDefault: int64 := 0;
+      if (self.Match(TK_CASE) != 0) {
+        isDefault := 0;
+      } else if (self.Match(TK_DEFAULT) != 0) {
+        isDefault := 1;
+      } else {
+        self._err("expected case or default");
+        self.Advance();
+      }
+      var cn: int64 := self._alloc(NK_CASE, cti);
+      self._siv(cn, isDefault);
+      if (isDefault == 0) { self._sc0(cn, self.ParseExpr()); }
+      self.Expect(TK_COLON);
+      self._sc1(cn, self.ParseBlock());
+      if (head == -1) { head := cn; tail := cn; }
+      else { self._sn(tail, cn); tail := cn; }
+    }
+    self.Expect(TK_RBRACE);
+    self._sc1(n, head);
+    return n;
+  }
+
+  fn ParseBlock(): int64 {
+    var ti: int64 := self.cur;
+    self.Expect(TK_LBRACE);
+    var n: int64 := self._alloc(NK_BLOCK, ti);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var stmt: int64 := self.ParseStmt();
+      if (head == -1) { head := stmt; tail := stmt; }
+      else { self._sn(tail, stmt); tail := stmt; }
+    }
+    self.Expect(TK_RBRACE);
+    self._sc0(n, head);
+    return n;
+  }
+
+  // ==================================================================
+  // Declarations
+  // ==================================================================
+
+  fn ParseVarDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_VAR_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  fn ParseConDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_CON_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  fn _parseParam(): int64 {
+    var ti: int64 := self.cur;
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_PARAM, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self.Expect(TK_COLON);
+    self._sc0(n, self.ParseType());
+    return n;
+  }
+
+  fn _parseParamList(): int64 {
+    if (self.Check(TK_RPAREN) != 0) { return -1; }
+    var head: int64 := self._parseParam();
+    var tail: int64 := head;
+    while (self.Match(TK_COMMA) != 0) {
+      var p: int64 := self._parseParam();
+      self._sn(tail, p); tail := p;
+    }
+    return head;
+  }
+
+  fn ParseFuncDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_FUNC_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    self.Expect(TK_LPAREN);
+    self._sc0(n, self._parseParamList());
+    self.Expect(TK_RPAREN);
+    if (self.Match(TK_COLON) != 0) { self._sc1(n, self.ParseType()); }
+    self._sc2(n, self.ParseBlock());
+    return n;
+  }
+
+  fn ParseStructDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_STRUCT_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    self.Expect(TK_LBRACE);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var fTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      var fn2: int64 := self._alloc(NK_FIELD_DECL, fTok);
+      self._ssv(fn2, self._tokOff(fTok), self._tokLen(fTok));
+      self.Expect(TK_COLON);
+      self._sc0(fn2, self.ParseType());
+      self.Match(TK_SEMI);
+      if (head == -1) { head := fn2; tail := fn2; }
+      else { self._sn(tail, fn2); tail := fn2; }
+    }
+    self.Expect(TK_RBRACE);
+    self.Match(TK_SEMI);
+    self._sc0(n, head);
+    return n;
+  }
+
+  fn ParseEnumDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_ENUM_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    self.Expect(TK_LBRACE);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var mTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      var mn: int64 := self._alloc(NK_ENUM_MEM, mTok);
+      self._ssv(mn, self._tokOff(mTok), self._tokLen(mTok));
+      if (self.Match(TK_EQ1) != 0) { self._sc0(mn, self.ParseExpr()); }
+      self.Match(TK_COMMA);
+      if (head == -1) { head := mn; tail := mn; }
+      else { self._sn(tail, mn); tail := mn; }
+    }
+    self.Expect(TK_RBRACE);
+    self.Match(TK_SEMI);
+    self._sc0(n, head);
+    return n;
+  }
+
+  fn _parseImport(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var n: int64 := self._alloc(NK_IMPORT, ti);
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var endTok: int64 := nameTok;
+    while (self.Check(TK_DOT) != 0) {
+      self.Advance();
+      endTok := self.cur;
+      self.Expect(TK_IDENT);
+    }
+    var startOff: int64 := self.TokStart(nameTok);
+    var endOff: int64 := self.TokStart(endTok) + self.TokLen(endTok);
+    self._ssv(n, startOff, endOff - startOff);
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  fn _parseTypeDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var n: int64 := self._alloc(NK_TYPE_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    if (self.Match(TK_EQ1) != 0) {
+      if (self.Check(TK_CLASS) != 0 || self.Check(TK_STRUCT) != 0) {
+        self.Advance();
+        if (self.Check(TK_EXTENDS) != 0) { self.Advance(); self.Expect(TK_IDENT); }
+        if (self.Check(TK_LBRACE) != 0) { self._skipBraces(); }
+      } else {
+        self.ParseType();
+      }
+    }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  fn _parseExternDecl(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var n: int64 := self._alloc(NK_FUNC_DECL, ti);
+    self._siv(n, 1);
+    if (self.Match(TK_FN) != 0) {
+      var nameTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    }
+    while (self.Check(TK_SEMI) == 0 && self.Check(TK_EOF) == 0) { self.Advance(); }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  fn _skipBraces() {
+    self.Expect(TK_LBRACE);
+    var depth: int64 := 1;
+    while (depth > 0 && self.Check(TK_EOF) == 0) {
+      var k: int64 := self.Peek();
+      if (k == TK_LBRACE) { depth := depth + 1; }
+      else if (k == TK_RBRACE) { depth := depth - 1; }
+      self.Advance();
+    }
+  }
+
+  // ==================================================================
+  // Top-level parse -- returns head of declaration list (via NNext)
+  // ==================================================================
+
+  fn Parse(): int64 {
+    var head: int64 := -1;
+    var tail: int64 := -1;
+
+    while (self.Peek() != TK_EOF) {
+      if (self.hadError != 0) { return head; }
+
+      var isPub: int64 := 0;
+      if (self.Match(TK_PUB) != 0) { isPub := 1; }
+
+      var k: int64 := self.Peek();
+      var decl: int64 := -1;
+
+      if (k == TK_FN)          { decl := self.ParseFuncDecl(isPub); }
+      else if (k == TK_VAR)    { decl := self.ParseVarDecl(isPub); }
+      else if (k == TK_CON)    { decl := self.ParseConDecl(isPub); }
+      else if (k == TK_STRUCT) { decl := self.ParseStructDecl(isPub); }
+      else if (k == TK_ENUM)   { decl := self.ParseEnumDecl(isPub); }
+      else if (k == TK_IMPORT) { decl := self._parseImport(); }
+      else if (k == TK_TYPE)   { decl := self._parseTypeDecl(isPub); }
+      else if (k == TK_EXTERN) { decl := self._parseExternDecl(); }
+      else {
+        self._err("unexpected top-level token");
+        self.Advance();
+      }
+
+      if (decl >= 0) {
+        if (head == -1) { head := decl; tail := decl; }
+        else { self._sn(tail, decl); tail := decl; }
+      }
+    }
+
+    return head;
+  }
+};
+
+// ============================================================================
+// Utility: count nodes in a linked list
+// ============================================================================
+
+pub fn ParserListLen(p: Parser, head: int64): int64 {
+  var cnt: int64 := 0;
+  var cur: int64 := head;
+  while (cur != -1) {
+    cnt := cnt + 1;
+    cur := p.NNext(cur);
+  }
+  return cnt;
+}
+
+// ============================================================================
+// Utility: node kind → name string
+// ============================================================================
+
+pub fn ParserNodeKindStr(k: int64): pchar {
+  if (k == NK_INVALID)     { return "INVALID"; }
+  if (k == NK_IMPORT)      { return "IMPORT"; }
+  if (k == NK_FUNC_DECL)   { return "FUNC_DECL"; }
+  if (k == NK_PARAM)       { return "PARAM"; }
+  if (k == NK_VAR_DECL)    { return "VAR_DECL"; }
+  if (k == NK_CON_DECL)    { return "CON_DECL"; }
+  if (k == NK_STRUCT_DECL) { return "STRUCT_DECL"; }
+  if (k == NK_FIELD_DECL)  { return "FIELD_DECL"; }
+  if (k == NK_ENUM_DECL)   { return "ENUM_DECL"; }
+  if (k == NK_ENUM_MEM)    { return "ENUM_MEM"; }
+  if (k == NK_TYPE_DECL)   { return "TYPE_DECL"; }
+  if (k == NK_BLOCK)       { return "BLOCK"; }
+  if (k == NK_IF)          { return "IF"; }
+  if (k == NK_WHILE)       { return "WHILE"; }
+  if (k == NK_FOR)         { return "FOR"; }
+  if (k == NK_SWITCH)      { return "SWITCH"; }
+  if (k == NK_CASE)        { return "CASE"; }
+  if (k == NK_BREAK)       { return "BREAK"; }
+  if (k == NK_RETURN)      { return "RETURN"; }
+  if (k == NK_EXPR_STMT)   { return "EXPR_STMT"; }
+  if (k == NK_ASSIGN)      { return "ASSIGN"; }
+  if (k == NK_DISPOSE)     { return "DISPOSE"; }
+  if (k == NK_LIT_INT)     { return "LIT_INT"; }
+  if (k == NK_LIT_FLOAT)   { return "LIT_FLOAT"; }
+  if (k == NK_LIT_STR)     { return "LIT_STR"; }
+  if (k == NK_LIT_CHAR)    { return "LIT_CHAR"; }
+  if (k == NK_LIT_BOOL)    { return "LIT_BOOL"; }
+  if (k == NK_LIT_NULL)    { return "LIT_NULL"; }
+  if (k == NK_IDENT)       { return "IDENT"; }
+  if (k == NK_BINOP)       { return "BINOP"; }
+  if (k == NK_UNOP)        { return "UNOP"; }
+  if (k == NK_CALL)        { return "CALL"; }
+  if (k == NK_INDEX)       { return "INDEX"; }
+  if (k == NK_FIELD)       { return "FIELD"; }
+  if (k == NK_NEW)         { return "NEW"; }
+  if (k == NK_TYPE_NAME)   { return "TYPE_NAME"; }
+  if (k == NK_TYPE_ARRAY)  { return "TYPE_ARRAY"; }
+  return "?";
 }
