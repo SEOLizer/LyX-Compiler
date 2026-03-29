@@ -406,21 +406,29 @@ Kein IR – direkter AST → ELF64-Binärcode, stack-basiert, ohne Register-Allo
 
 ---
 
-### WP-09: Bootstrap-Test – Kompiliere lyxc-mini mit sich selbst
+### WP-09: Bootstrap-Test – Kompiliere lyxc-mini mit sich selbst ✅ ERLEDIGT
 
 **Beschreibung:**
 Führe den kompletten Bootstrap durch. Schreibe einen minimalen `lyxc-mini.lyx`
 der WP-05 bis WP-08 zusammenführt und als eigenständiger Compiler funktioniert.
 
-**Was zu tun:**
-1. `bootstrap/lyxc_mini.lyx` – verbindet Lexer + Parser + Sema + Codegen
-2. **Stage 1:** `./lyxc bootstrap/lyxc_mini.lyx -o lyxc_mini` (mit FPC-Compiler)
-3. **Stage 2:** `./lyxc_mini bootstrap/lyxc_mini.lyx -o lyxc_mini2`
-4. **Vergleich:** `diff lyxc_mini lyxc_mini2` → muss identisch sein (oder deterministisch gleich)
-5. Wenn Stage 2 korrekt ist: **Self-Hosting erreicht!**
+**Umgesetzt:**
+1. `bootstrap/lyxc_mini.lyx` – verbindet Lexer + Parser + Sema + Codegen ✅
+2. **Stage 1:** `./lyxc bootstrap/lyxc_mini.lyx -o lyxc_mini` (mit FPC-Compiler) ✅
+3. **Stage 2:** `./lyxc_mini bootstrap/lyxc_mini.lyx -o lyxc_mini2` ✅
+4. **Vergleich:** `md5sum lyxc_mini2 lyxc_mini3` → identisch (`0237b1180d92bff8e330ac2f971949c1`) ✅
+5. **Self-Hosting erreicht!** ✅
+
+**Compiler-Bugs entdeckt und gefixt:**
+- Bug 4: 7-Argument-Methoden-Overflow (Sema.Init hatte self+6=7 Total-Args → r9 overflow)
+  Fix: tokCount entfernt, `pTokCount` auf 1000000 hardcoded
+- Bug 5: `break` in while-Schleifen wurde als NOP (0x90) kompiliert
+  Fix: `jmp rel32` + linked-list-in-placeholder-Ansatz in `cg_genWhile`
+- Bug 6: r8/r9 Parameter nicht gespillt in Methoden-Prologs
+  Fix: `cg_spillR8`/`cg_spillR9` in `cg_genMethodDecl`/`cg_genFuncDecl`
 
 **Akzeptanzkriterium:**
-`lyxc_mini` kann eine Teilmenge von Lyx kompilieren und dabei sich selbst reproduzieren.
+`lyxc_mini` kann eine Teilmenge von Lyx kompilieren und dabei sich selbst reproduzieren. ✅ ERREICHT
 
 **Abhängigkeiten:** WP-05 bis WP-08
 
@@ -436,7 +444,7 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 
 | Sub-WP | Feature | Abhängigkeit |
 |--------|---------|--------------|
-| 10a | Klassen + VMT | WP-09 |
+| 10a | Klassen + VMT | WP-09 | ← IN ARBEIT
 | 10b | Dynamische Arrays | WP-09 |
 | 10c | `switch/case` | WP-09 |
 | 10d | Structs mit Feldzugriff | WP-09 |
