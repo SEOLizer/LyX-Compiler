@@ -1,21 +1,146 @@
 // bootstrap/lyxc_mini.lyx
-// Lyx-in-Lyx Mini-Compiler – Einstiegspunkt (WP-09)
-//
-// Ziel: Verbindet Lexer, Parser und Codegen zu einem
-//       funktionierenden Minimal-Compiler, der in Lyx
-//       geschrieben ist und Lyx kompilieren kann.
-// Status: Stub – Implementierung ausstehend.
+// Lyx-in-Lyx Mini-Compiler – WP-09
 //
 // Bootstrap-Sequenz:
-//   Stage 0: lyxc (FPC) kompiliert dieses Programm
-//   Stage 1: lyxc_mini kompiliert sich selbst
-//   Stage 2: Verifikation: beide Binärdateien müssen
-//            bit-identische Ausgabe erzeugen
+//   Stage 0: lyxc (FPC) kompiliert dieses Programm → lyxc_mini
+//   Stage 1: lyxc_mini kompiliert eine Teilmenge von Lyx korrekt
+//   Stage 2: lyxc_mini kompiliert sich selbst → lyxc_mini2
 //
-// Aufruf: lyxc_mini <input.lyx> -o <output>
+// Aufruf: lyxc_mini <input.lyx> [-o <output>]
+//
+// DESIGN: Verwendet main(argc, argv) für argc/argv-Zugang.
+//         Das Bootstrap-Codegen-_start übergibt argc/argv als Parameter.
+//         FileReadAll wird über raw syscalls inline implementiert.
 
-fn main(): int64 {
-  PrintStr("lyxc_mini (bootstrap): stub\n");
-  PrintStr("Usage: lyxc_mini <input.lyx> -o <output>\n");
+import bootstrap.parser;
+import bootstrap.sema;
+import bootstrap.codegen_x86;
+import std.env;
+
+// ============================================================================
+// Inline file reader using raw syscalls (bootstrap-compatible)
+// ============================================================================
+
+fn miniFileReadAll(path: pchar): pchar {
+  // open(path, O_RDONLY=0, 0)
+  var fd: int64 := open(path, 0, 0);
+  if (fd < 0) { return 0 as pchar; }
+
+  // lseek(fd, 0, SEEK_END=2) to get file size
+  var size: int64 := lseek(fd, 0, 2);
+  if (size <= 0) { close(fd); return 0 as pchar; }
+
+  // lseek back to start
+  lseek(fd, 0, 0);
+
+  // mmap anonymous buffer (size+1 for null terminator)
+  var buf: int64 := mmap(0, size + 1, 3, 34, -1, 0);
+
+  // read into buffer
+  read(fd, buf as pchar, size);
+
+  // null-terminate
+  poke8(buf + size, 0);
+
+  close(fd);
+  return buf as pchar;
+}
+
+// ============================================================================
+// Main: parse CLI args, run compiler pipeline
+// ============================================================================
+
+fn main(argc: int64, argv: pchar): int64 {
+  if (argc < 2) {
+    PrintStr("Usage: lyxc_mini <input.lyx> [-o <output>]\n");
+    return 1;
+  }
+
+  // Parse arguments: find input file and -o output
+  var inputFile:  pchar := 0 as pchar;
+  var outputFile: pchar := 0 as pchar;
+  var i: int64 := 1;
+  while (i < argc) {
+    var arg: pchar := ArgvGet(argv, i);
+    // Check for "-o": 45='−', 111='o'
+    if (StrCharAt(arg, 0) == 45 && StrCharAt(arg, 1) == 111) {
+      i := i + 1;
+      if (i < argc) {
+        outputFile := ArgvGet(argv, i);
+      }
+    } else {
+      if (StrCharAt(arg, 0) != 45) {
+        inputFile := arg;
+      }
+    }
+    i := i + 1;
+  }
+
+  if (inputFile == 0 as pchar) {
+    PrintStr("lyxc_mini: error: no input file\n");
+    return 1;
+  }
+  if (outputFile == 0 as pchar) {
+    outputFile := "a.out";
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 1: Read source file
+  // -------------------------------------------------------------------------
+  var src: pchar := miniFileReadAll(inputFile);
+  if (src == 0 as pchar) {
+    PrintStr("lyxc_mini: error: cannot read: ");
+    PrintStr(inputFile);
+    PrintStr("\n");
+    return 1;
+  }
+  var srcLen: int64 := StrLen(src);
+
+  // -------------------------------------------------------------------------
+  // Step 2: Parse
+  // -------------------------------------------------------------------------
+  var p: Parser := new Parser();
+  p.Init(src, srcLen);
+  var head: int64 := p.Parse();
+
+  if (p.hadError != 0) {
+    PrintStr("lyxc_mini: parse error in ");
+    PrintStr(inputFile);
+    PrintStr("\n");
+    dispose p;
+    return 1;
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 3: Semantic analysis
+  // -------------------------------------------------------------------------
+  var s: Sema := new Sema();
+  s.Init(p.src, p.srcLen, p.nodes, p.nodeCount, p.toks);
+  var semErr: int64 := s.Check(head);
+
+  if (semErr != 0) {
+    PrintStr("lyxc_mini: sema error in ");
+    PrintStr(inputFile);
+    PrintStr("\n");
+    dispose s;
+    dispose p;
+    return 1;
+  }
+  dispose s;
+
+  // -------------------------------------------------------------------------
+  // Step 4: Code generation
+  // -------------------------------------------------------------------------
+  var cg: Codegen := new Codegen();
+  cg.Init(p.src, p.nodes, p.toks);
+  cg.Generate(head);
+  cg.WriteELF(outputFile);
+
+  dispose cg;
+  dispose p;
+
+  PrintStr("lyxc_mini: wrote ");
+  PrintStr(outputFile);
+  PrintStr("\n");
   return 0;
 }
