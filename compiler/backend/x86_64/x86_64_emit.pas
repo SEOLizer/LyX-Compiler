@@ -779,6 +779,37 @@ begin
   // mov [r10], rsp  (49 89 22)
   EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $22);
 
+  // Remove stack size limit via prlimit64(0, RLIMIT_STACK, {RLIM_INFINITY, RLIM_INFINITY}, NULL)
+  // sub rsp, 16   (48 83 EC 10)
+  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, $10);
+  // mov rax, -1   (48 C7 C0 FF FF FF FF)  RLIM_INFINITY
+  EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $C0);
+  EmitU8(FCode, $FF); EmitU8(FCode, $FF); EmitU8(FCode, $FF); EmitU8(FCode, $FF);
+  // mov [rsp], rax    (48 89 04 24)  rlim_cur
+  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $04); EmitU8(FCode, $24);
+  // mov [rsp+8], rax  (48 89 44 24 08)  rlim_max
+  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, $08);
+  // xor edi, edi  (31 FF)  pid=0
+  EmitU8(FCode, $31); EmitU8(FCode, $FF);
+  // mov esi, 3    (BE 03 00 00 00)  RLIMIT_STACK
+  EmitU8(FCode, $BE); EmitU8(FCode, $03); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $00);
+  // mov rdx, rsp  (48 89 E2)  new_limit
+  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E2);
+  // xor r10d, r10d  (45 31 D2)  old_limit=NULL
+  EmitU8(FCode, $45); EmitU8(FCode, $31); EmitU8(FCode, $D2);
+  // mov eax, 302  (B8 2E 01 00 00)  SYS_prlimit64
+  EmitU8(FCode, $B8); EmitU8(FCode, $2E); EmitU8(FCode, $01); EmitU8(FCode, $00); EmitU8(FCode, $00);
+  // syscall       (0F 05)
+  EmitU8(FCode, $0F); EmitU8(FCode, $05);
+  // add rsp, 16   (48 83 C4 10)
+  EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, $10);
+
+  // Pass argc/argv to main: argc=[rsp], argv=rsp+8 (Linux ABI at _start entry)
+  // mov rdi, [rsp]  (48 8B 3C 24)
+  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $3C); EmitU8(FCode, $24);
+  // lea rsi, [rsp+8]  (48 8D 74 24 08)
+  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, $08);
+
   EmitU8(FCode, $55);  // push rbp
   EmitRex(FCode, 1, 0, 0, 0);
   EmitU8(FCode, $89);
