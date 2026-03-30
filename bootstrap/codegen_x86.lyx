@@ -180,6 +180,9 @@ pub type Codegen = class {
   vmtPatchCount: int64;
   vmtPatchCap:   int64;
 
+  // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
+  localIsArray: int64;
+
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
   // ------------------------------------------------------------------
@@ -268,6 +271,10 @@ pub type Codegen = class {
       i := 0;
       while (i < self.localCount * 16) { poke8(tb+i, peek8(self.localTypes+i)); i:=i+1; }
       self.localTypes := tb;
+      var ab: int64 := mmap(0, nc, 3, 34, -1, 0);
+      i := 0;
+      while (i < self.localCount) { poke8(ab+i, peek8(self.localIsArray+i)); i:=i+1; }
+      self.localIsArray := ab;
       self.localCap := nc;
     }
     self.frameSize := self.frameSize + 8;
@@ -279,6 +286,7 @@ pub type Codegen = class {
     var toff: int64 := self.localTypes + self.localCount * 16;
     poke64(toff,     0);
     poke64(toff + 8, 0);
+    poke8(self.localIsArray + self.localCount, 0);
     self.localCount := self.localCount + 1;
     return 0 - self.frameSize;
   }
@@ -293,6 +301,27 @@ pub type Codegen = class {
       i := i - 1;
     }
     return 0;  // 0 = not found (valid offsets are always negative)
+  }
+
+  // Returns index (0-based) of local by name, or -1 if not found
+  fn cg_findLocalIdx(name: pchar, nlen: int64): int64 {
+    var i: int64 := self.localCount - 1;
+    while (i >= 0) {
+      var base: int64 := self.locals + i * CG_LOCAL_SZ;
+      var sname: pchar := peek64(base) as pchar;
+      var slen:  int64 := peek64(base + 8);
+      if (self.cg_seq(sname, slen, name, nlen)) { return i; }
+      i := i - 1;
+    }
+    return -1;
+  }
+
+  // Returns 1 if the CGN_IDENT node ni refers to an array-typed local
+  fn cg_identIsArray(ni: int64): int64 {
+    if (self.cg_nkind(ni) != CGN_IDENT) { return 0; }
+    var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (idx < 0) { return 0; }
+    return peek8(self.localIsArray + idx);
   }
 
   // ------------------------------------------------------------------
@@ -836,12 +865,144 @@ pub type Codegen = class {
     return self.cg_getLocalClassIdx(oname, olen);
   }
 
+  // Inline code for arr.push(val): alloc on first use, then append
+  // Layout: [ptr+0]=cap, [ptr+8]=len, [ptr+16+i*8]=data[i]
+  fn cg_genArrayPush(objNode: int64, valNode: int64) {
+    var aname: pchar := self.cg_nsval(objNode);
+    var anlen: int64 := self.cg_nslen(objNode);
+    var off: int64 := self.cg_findLocal(aname, anlen);
+    // Evaluate value → rax
+    self.cg_genExpr(valNode);
+    // push rax (save value)
+    self.cg_e8(0x50);
+    // mov rcx, [rbp+off]  (load array ptr)
+    if (off >= -128 && off <= 127) {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(off);
+    }
+    // test rcx, rcx
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);
+    // jnz skip_alloc (rel32 placeholder)
+    self.cg_e8(0x0F); self.cg_e8(0x85);
+    var jnzPos: int64 := self.codeLen;
+    self.cg_e32(0);
+    // ---- mmap block: allocate (1026)*8 bytes ----
+    // xor edi, edi          (rdi=0, addr=0)
+    self.cg_e8(0x31); self.cg_e8(0xFF);
+    // mov rsi, 8208         ((1024+2)*8)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6);
+    self.cg_e8(0x10); self.cg_e8(0x20); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov edx, 3            (PROT_RW)
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov eax, 34           (MAP_ANON|MAP_PRIVATE)
+    self.cg_e8(0xB8); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov r10, rax          (REX.B extends rm to r10: 49 89 C2)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);
+    // mov rax, -1           (fd=-1)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
+    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    // mov r8, rax
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);
+    // xor r9d, r9d          (offset=0)
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);
+    // mov eax, 9            (SYS_mmap)
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // mov rcx, 1024         (cap)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x00); self.cg_e8(0x04); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov [rax], rcx        ([ptr+0] = cap)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08);
+    // xor rcx, rcx
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC9);
+    // mov [rax+8], rcx      ([ptr+8] = len=0)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0x08);
+    // store rax back to local variable
+    self.cg_storeRax(off);
+    // mov rcx, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);
+    // ---- end mmap block ----
+    // Patch jnz to here (skip_alloc)
+    poke32(self.code + jnzPos, self.codeLen - jnzPos - 4);
+    // pop rax               (restore value)
+    self.cg_e8(0x58);
+    // mov rdx, [rcx+8]      (rdx = len)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x51); self.cg_e8(0x08);
+    // lea rsi, [rcx+16]     (rsi = data start)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x71); self.cg_e8(0x10);
+    // mov [rsi+rdx*8], rax  (data[len] = value)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0xD6);
+    // inc rdx
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC2);
+    // mov [rcx+8], rdx      ([ptr+8] = len+1)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x51); self.cg_e8(0x08);
+    // xor rax, rax          (return 0)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+  }
+
+  // Inline code for arr.pop(): decrement len, return last element (0 if empty)
+  fn cg_genArrayPop(objNode: int64) {
+    var aname: pchar := self.cg_nsval(objNode);
+    var anlen: int64 := self.cg_nslen(objNode);
+    var off: int64 := self.cg_findLocal(aname, anlen);
+    // Load array ptr into rcx
+    if (off >= -128 && off <= 127) {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(off);
+    }
+    // test rcx, rcx; jz empty
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var jz1Pos: int64 := self.codeLen;
+    self.cg_e32(0);
+    // rdx = [rcx+8]  (len)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x51); self.cg_e8(0x08);
+    // test rdx, rdx; jz empty
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var jz2Pos: int64 := self.codeLen;
+    self.cg_e32(0);
+    // dec rdx
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCA);
+    // [rcx+8] = rdx  (new len)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x51); self.cg_e8(0x08);
+    // lea rsi, [rcx+16]
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x71); self.cg_e8(0x10);
+    // rax = [rsi+rdx*8]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD6);
+    // jmp done
+    self.cg_e8(0xE9);
+    var jmpPos: int64 := self.codeLen;
+    self.cg_e32(0);
+    // empty: patch jz targets here
+    poke32(self.code + jz1Pos, self.codeLen - jz1Pos - 4);
+    poke32(self.code + jz2Pos, self.codeLen - jz2Pos - 4);
+    // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    // done:
+    poke32(self.code + jmpPos, self.codeLen - jmpPos - 4);
+  }
+
   // Generate a field load: evaluates object into rax, then loads field
   fn cg_genFieldLoad(ni: int64) {
     var obj: int64 := self.cg_nc0(ni);
     var fieldName: pchar := self.cg_nsval(ni);
     var fieldLen:  int64 := self.cg_nslen(ni);
     self.cg_genExpr(obj);
+    // Array .length: rax = ptr, load [rax+8] = len
+    if (self.cg_identIsArray(obj) != 0) {
+      var lenStr: pchar := "length";
+      if (self.cg_seq(fieldName, fieldLen, lenStr, 6)) {
+        // mov rax, [rax+8]
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08);
+      } else {
+        self.cg_zeroRax();
+      }
+      return;
+    }
     var classIdx: int64 := self.cg_objClassIdx(obj);
     var foff: int64 := -1;
     if (classIdx >= 0) { foff := self.cg_getFieldOffset(classIdx, fieldName, fieldLen); }
@@ -1030,6 +1191,18 @@ pub type Codegen = class {
     } else if (k == CGN_FIELD) {
       self.cg_genFieldLoad(ni);
 
+    } else if (k == CGN_INDEX) {
+      // arr[i]: nc0=arr, nc1=index
+      // Eval index first, push; then eval arr; pop index into rbx
+      self.cg_genExpr(self.cg_nc1(ni));   // rax = index
+      self.cg_pushRax();
+      self.cg_genExpr(self.cg_nc0(ni));   // rax = array ptr
+      self.cg_popRbx();                    // rbx = index
+      // lea rcx, [rax+16]   (data start)
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
+      // mov rax, [rcx+rbx*8]
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD9);
+
     } else {
       // Unknown expression: emit 0
       self.cg_zeroRax();
@@ -1045,6 +1218,23 @@ pub type Codegen = class {
     // Count args
     var argNode: int64 := self.cg_nc0(ni);
     if (isMethod == 1) { argNode := self.cg_nc1(ni); }
+
+    // Intercept array built-in methods before arg evaluation (WP-10b)
+    if (isMethod == 1) {
+      var arrObj: int64 := self.cg_nc0(ni);
+      if (self.cg_identIsArray(arrObj) != 0) {
+        var pushStr: pchar := "push";
+        var popStr:  pchar := "pop";
+        if (self.cg_seq(fname, fnlen, pushStr, 4)) {
+          self.cg_genArrayPush(arrObj, argNode);
+          return;
+        } else if (self.cg_seq(fname, fnlen, popStr, 3)) {
+          self.cg_genArrayPop(arrObj);
+          return;
+        }
+      }
+    }
+
     var argc: int64 := 0;
     var cur: int64 := argNode;
     while (cur != -1) { argc := argc + 1; cur := self.cg_nnext(cur); }
@@ -1239,6 +1429,10 @@ pub type Codegen = class {
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
         self.cg_setLocalType(localIdx, self.cg_nsval(typeNode), self.cg_nslen(typeNode));
       }
+      // Track array locals (NK_TYPE_ARRAY = 61)
+      if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
+        poke8(self.localIsArray + localIdx, 1);
+      }
       var init: int64 := self.cg_nc1(ni);
       if (init >= 0) {
         self.cg_genExpr(init);
@@ -1275,6 +1469,20 @@ pub type Codegen = class {
         } else if (foff > 127) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xB0); self.cg_e32(foff);
         }
+      } else if (self.cg_nkind(lhs) == CGN_INDEX) {
+        // arr[i] := rhs
+        self.cg_genExpr(rhs);              // rax = value
+        self.cg_pushRax();
+        self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
+        self.cg_pushRax();
+        self.cg_genExpr(self.cg_nc0(lhs)); // rax = array ptr
+        self.cg_popRbx();                  // rbx = index
+        // lea rcx, [rax+16]   (data start)
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
+        // pop rsi              (value)
+        self.cg_e8(0x5E);
+        // mov [rcx+rbx*8], rsi
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);
       }
 
     } else if (k == CGN_RETURN) {
@@ -1851,6 +2059,9 @@ pub type Codegen = class {
     self.vmtPatchCap   := 32;
     self.vmtPatches    := mmap(0, self.vmtPatchCap * 24, 3, 34, -1, 0);
     self.vmtPatchCount := 0;
+
+    // Per-local array flag (WP-10b)
+    self.localIsArray := mmap(0, self.localCap, 3, 34, -1, 0);
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
