@@ -444,7 +444,7 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 
 | Sub-WP | Feature | Abhängigkeit |
 |--------|---------|--------------|
-| 10a | Klassen + VMT | WP-09 | ← IN ARBEIT
+| 10a | Klassen + VMT | WP-09 | ✅ COMPLETE
 | 10b | Dynamische Arrays | WP-09 |
 | 10c | `switch/case` | WP-09 |
 | 10d | Structs mit Feldzugriff | WP-09 |
