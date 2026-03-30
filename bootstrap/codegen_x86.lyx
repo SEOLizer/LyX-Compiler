@@ -80,29 +80,31 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:        offset 0   (21 bytes) -- pops argc→rdi, sets rsi=rsp (argv), calls main
-//   _lyx_strlen:   offset 21  (15 bytes)
-//   _lyx_print_str:offset 36  (26 bytes)
-//   _lyx_print_int:offset 62  (99 bytes)
-//   user code:     offset 161
+//   _start:        offset 0   (65 bytes) -- prlimit64(RLIMIT_STACK=unlimited), pop argc→rdi, sets rsi=rsp (argv), calls main
+//   _lyx_strlen:   offset 65  (15 bytes)
+//   _lyx_print_str:offset 80  (26 bytes)
+//   _lyx_print_int:offset 106 (104 bytes)
+//   user code:     offset 210
 con CG_H_START:     int64 := 0;
-con CG_H_STRLEN:    int64 := 21;
-con CG_H_PRINTSTR:  int64 := 36;
-con CG_H_PRINTINT:  int64 := 62;
-con CG_H_USER:      int64 := 166;
+con CG_H_STRLEN:    int64 := 65;
+con CG_H_PRINTSTR:  int64 := 80;
+con CG_H_PRINTINT:  int64 := 106;
+con CG_H_USER:      int64 := 210;
 
 // Patch kinds
-con CG_PATCH_CALL: int64 := 0;
-con CG_PATCH_STR:  int64 := 1;
+con CG_PATCH_CALL:     int64 := 0;
+con CG_PATCH_STR:      int64 := 1;
+con CG_PATCH_VMT_ADDR: int64 := 2;  // absolute 8-byte VMT address in code buffer
 
 // Table entry sizes (bytes)
-con CG_LOCAL_SZ: int64 := 24;   // name(8) + nameLen(8) + rbpOff(8)
-con CG_LABEL_SZ: int64 := 24;   // name(8) + nameLen(8) + codeOff(8)
+con CG_LOCAL_SZ:   int64 := 24;   // name(8) + nameLen(8) + rbpOff(8)
+con CG_LABEL_SZ:   int64 := 24;   // name(8) + nameLen(8) + codeOff(8)
 con CG_PATCH_SZ:   int64 := 32;   // codeOff(8) + namePtr(8) + nameLen(8) + kind(8)
 con CGN_TYPE_DECL: int64 := 10;   // NK_TYPE_DECL from parser
 con CGN_FIELD_DECL:int64 := 7;    // NK_FIELD_DECL from parser
-con CG_CLASS_SZ:   int64 := 32;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)
+con CG_CLASS_SZ:   int64 := 40;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)+vmtDataOff(8)
 con CG_CFIELD_SZ:  int64 := 24;   // fieldName(8)+fieldLen(8)+fieldOffset(8)
+con CG_VMT_PATCH_SZ: int64 := 24; // codeOff(8) + classNamePtr(8) + classNameLen(8)
 
 // ============================================================================
 // Codegen class
@@ -170,6 +172,13 @@ pub type Codegen = class {
   // curBreakHead holds the code offset of the most recent break's 4-byte placeholder,
   // or -1 if no break is pending. Each placeholder stores the previous head as the link.
   curBreakHead: int64;
+
+  // VMT address patch table (WP-10a): {codeOff:8, classNamePtr:8, classNameLen:8}
+  // Each entry says: at code offset codeOff there is a mov-rcx-imm64 placeholder
+  // that needs the absolute vaddr of the VMT table for the named class.
+  vmtPatches:    int64;
+  vmtPatchCount: int64;
+  vmtPatchCap:   int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -398,6 +407,23 @@ pub type Codegen = class {
         poke32(self.code + codeOff, disp32);
       }
       i := i + 1;
+    }
+    // WP-10a: patch VMT address placeholders
+    // vmtVaddr = CG_ELF_BASE + CG_CODE_OFF + codeLen + vmtDataOff
+    var vmtBase: int64 := CG_ELF_BASE + CG_CODE_OFF + self.codeLen;
+    var j: int64 := 0;
+    while (j < self.vmtPatchCount) {
+      var vbase: int64 := self.vmtPatches + j * 24;
+      var codeOff2:  int64 := peek64(vbase);
+      var namePtr2: pchar   := peek64(vbase + 8) as pchar;
+      var nameLen2:  int64 := peek64(vbase + 16);
+      var classIdx: int64 := self.cg_findClass(namePtr2, nameLen2);
+      if (classIdx >= 0) {
+        var cb: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+        var vmtDataOff: int64 := peek64(cb + 32);
+        poke64(self.code + codeOff2, vmtBase + vmtDataOff);
+      }
+      j := j + 1;
     }
   }
 
@@ -726,7 +752,8 @@ pub type Codegen = class {
     while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
     // Allocate field array
     var flds: int64 := mmap(0, (cnt + 1) * CG_CFIELD_SZ, 3, 34, -1, 0);
-    var offset: int64 := 0;
+    // WP-10a: fields start at offset 8 (offset 0 reserved for VMT pointer)
+    var offset: int64 := 8;
     var i: int64 := 0;
     tmp := fieldNode;
     while (tmp != -1) {
@@ -738,6 +765,10 @@ pub type Codegen = class {
       i := i + 1;
       tmp := self.cg_nnext(tmp);
     }
+    // WP-10a: emit 8-byte VMT table placeholder in data section
+    var vmtDataOff: int64 := self.dataLen;
+    var di: int64 := 0;
+    while (di < 8) { self.cg_edata(0); di := di + 1; }
     // Grow class table if needed
     if (self.classCount >= self.classCap) {
       var nc: int64 := self.classCap * 2;
@@ -755,6 +786,7 @@ pub type Codegen = class {
     poke64(base + 8,  classLen);
     poke64(base + 16, flds);
     poke64(base + 24, cnt);
+    poke64(base + 32, vmtDataOff);   // WP-10a: offset of VMT table in data section
     self.classCount := self.classCount + 1;
   }
 
@@ -774,6 +806,22 @@ pub type Codegen = class {
       i := i - 1;
     }
     return -1;
+  }
+
+  // WP-10a: record a VMT address patch (mov rcx,imm64 placeholder at codeOff for class)
+  fn cg_addVmtPatch(codeOff: int64, className: pchar, classLen: int64) {
+    if (self.vmtPatchCount >= self.vmtPatchCap) {
+      var nc: int64 := self.vmtPatchCap * 2;
+      var nb: int64 := mmap(0, nc * 24, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.vmtPatchCount * 24) { poke8(nb+i, peek8(self.vmtPatches+i)); i:=i+1; }
+      self.vmtPatches := nb; self.vmtPatchCap := nc;
+    }
+    var base: int64 := self.vmtPatches + self.vmtPatchCount * 24;
+    poke64(base,      codeOff);
+    poke64(base + 8,  className as int64);
+    poke64(base + 16, classLen);
+    self.vmtPatchCount := self.vmtPatchCount + 1;
   }
 
   // Helper: get class index for object node (IDENT)
@@ -968,6 +1016,16 @@ pub type Codegen = class {
       self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
       self.cg_movRaxImm(9);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      // WP-10a: rax = object ptr; write VMT pointer at [rax+0]
+      // mov rcx, imm64 (placeholder = 0, patched later with VMT vaddr)
+      self.cg_e8(0x48); self.cg_e8(0xB9);
+      var vmtPatchPos: int64 := self.codeLen;
+      self.cg_e64(0);                                         // 8-byte placeholder
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08); // mov [rax], rcx
+      // Record patch: fill in VMT address for this class at vmtPatchPos
+      var tname: pchar := self.cg_nsval(ni);
+      var tlen:  int64 := self.cg_nslen(ni);
+      self.cg_addVmtPatch(vmtPatchPos, tname, tlen);
 
     } else if (k == CGN_FIELD) {
       self.cg_genFieldLoad(ni);
@@ -1433,8 +1491,32 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
 
   fn cg_emitHelpers() {
-    // ---- _start (21 bytes) ----
+    // ---- _start (65 bytes) ----
     // At Linux ABI entry: [rsp]=argc, [rsp+8]=argv[0], ...
+    // First: call prlimit64 to remove RLIMIT_STACK (allows deep recursion in parser)
+    // sub rsp, 16       (48 83 EC 10)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);
+    // mov rax, -1       (48 C7 C0 FF FF FF FF)  RLIM_INFINITY
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
+    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    // mov [rsp], rax    (48 89 04 24)  rlim_cur
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);
+    // mov [rsp+8], rax  (48 89 44 24 08)  rlim_max
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+    // xor edi, edi      (31 FF)  pid = 0
+    self.cg_e8(0x31); self.cg_e8(0xFF);
+    // mov esi, 3        (BE 03 00 00 00)  RLIMIT_STACK
+    self.cg_e8(0xBE); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov rdx, rsp      (48 89 E2)  new_limit = &rlimit_struct
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE2);
+    // xor r10d, r10d    (45 31 D2)  old_limit = NULL
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // mov eax, 302      (B8 2E 01 00 00)  SYS_prlimit64
+    self.cg_e8(0xB8); self.cg_e8(0x2E); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall           (0F 05)
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // add rsp, 16       (48 83 C4 10)  restore stack
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);
     // 5F               pop rdi          -- rdi = argc
     self.cg_e8(0x5F);
     // 48 89 E6         mov rsi, rsp     -- rsi = &argv[0] (argv pointer)
@@ -1451,9 +1533,9 @@ pub type Codegen = class {
     self.cg_e8(0x3C); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
     // 0F 05            syscall
     self.cg_e8(0x0F); self.cg_e8(0x05);
-    // _start is now 21 bytes  ✓
+    // _start is now 65 bytes  ✓
 
-    // ---- _lyx_strlen (15 bytes, starts at offset 21) ----
+    // ---- _lyx_strlen (15 bytes, starts at offset 65) ----
     // xor rax, rax
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
     // cmp byte [rdi+rax], 0
@@ -1468,7 +1550,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // strlen is now 15 bytes  ✓
 
-    // ---- _lyx_print_str (26 bytes, starts at offset 36) ----
+    // ---- _lyx_print_str (26 bytes, starts at offset 80) ----
     // push rdi
     self.cg_e8(0x57);
     // call _lyx_strlen  (rel32 = 21 - 42 = -21; relative offset unchanged after +4 shift)
@@ -1489,7 +1571,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // print_str is now 26 bytes  ✓
 
-    // ---- _lyx_print_int (104 bytes, starts at offset 62) ----
+    // ---- _lyx_print_int (104 bytes, starts at offset 106) ----
     // sub rsp, 24          48 83 EC 18
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x18);
     // lea rsi, [rsp+23]    48 8D 74 24 17
@@ -1558,7 +1640,7 @@ pub type Codegen = class {
     // ret                  C3
     self.cg_e8(0xC3);
     // print_int is 104 bytes  ✓
-    // Total helpers: 21+15+26+104 = 166 = CG_H_USER  ✓
+    // Total helpers: 65+15+26+104 = 210 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -1764,6 +1846,11 @@ pub type Codegen = class {
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
+
+    // VMT address patch table (WP-10a)
+    self.vmtPatchCap   := 32;
+    self.vmtPatches    := mmap(0, self.vmtPatchCap * 24, 3, 34, -1, 0);
+    self.vmtPatchCount := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
