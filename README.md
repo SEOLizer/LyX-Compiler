@@ -51,6 +51,37 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ---
 
+## Singularität: Lyx ist seit dem 30.03.2026 selbst-hostend
+
+Am **30. März 2026** hat Lyx die **Singularität** erreicht — der Lyx-Compiler kompiliert sich vollständig selbst.
+
+### Was bedeutet Singularität?
+
+Ein Compiler ist *selbst-hostend* (self-hosted), wenn er seinen eigenen Quellcode übersetzen und dabei ein binär identisches Ergebnis erzeugen kann. Der Nachweis erfolgt durch eine mehrstufige Bootstrap-Kette:
+
+```
+Stage 1  lyxc (FPC-kompiliert)  →  kompiliert bootstrap/*.lyx  →  Stage 2
+Stage 2  (Lyx-kompiliert)       →  kompiliert bootstrap/*.lyx  →  Stage 3
+Stage 3  (Lyx-kompiliert)       →  kompiliert bootstrap/*.lyx  →  Stage 4
+```
+
+Sobald **MD5(Stage 3) = MD5(Stage 4)** gilt, hat der Compiler einen stabilen Fixpunkt erreicht: Er reproduziert sich selbst Bit für Bit. Das ist die Singularität.
+
+Stage 2 kann dabei von Stage 3 abweichen — der optimierende Compiler erzeugt beim ersten Mal besseren Code für sich selbst. Ab Stage 3 ist der Fixpunkt erreicht.
+
+### Verifizierter Hash (30.03.2026)
+
+```
+MD5  9100b4d4b170c38474ee7a5594023790
+```
+
+Dieser Hash gilt für Stage 3, Stage 4 und alle weiteren Stufen — der Compiler ist stabil selbst-hostend.
+
+Details zur Bootstrap-Roadmap: [`selfhosted.md`](selfhosted.md)
+Implementierung: [`bootstrap/`](bootstrap/)
+
+---
+
 ## Repository-Struktur
 
 ```
