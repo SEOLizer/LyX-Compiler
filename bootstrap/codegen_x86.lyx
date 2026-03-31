@@ -182,6 +182,7 @@ pub type Codegen = class {
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
   localIsArray: int64;
+  foldBuf:      int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -386,6 +387,73 @@ pub type Codegen = class {
       i := i + 1;
     }
     return -1;
+  }
+
+  // ------------------------------------------------------------------
+  // WP-10g: Constant Folding + Peephole CSE helpers
+  // ------------------------------------------------------------------
+
+  // mov rbx, imm64  (48 BB xx ... xx) — for const-LHS binop optimisation
+  fn cg_movRbxImm(val: int64) {
+    self.cg_e8(0x48); self.cg_e8(0xBB); self.cg_e64(val);
+  }
+
+  // Try to evaluate node ni as a compile-time integer constant.
+  // Returns 1 if successful and stores the value in self.foldBuf; 0 otherwise.
+  fn cg_tryFold(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    // Integer / bool literal
+    if (k == CGN_LIT_INT || k == CGN_LIT_BOOL) {
+      self.foldBuf := self.cg_nival(ni);
+      return 1;
+    }
+    // Named constant (con FOO = val)
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(ni);
+      var nl: int64 := self.cg_nslen(ni);
+      if (self.cg_findLocal(nm, nl) != 0) { return 0; }  // local var, not foldable
+      var cv: int64 := self.cg_findConVal(nm, nl);
+      if (cv == -1) { return 0; }  // conservative: treat -1 as "not found"
+      self.foldBuf := cv;
+      return 1;
+    }
+    // Unary: -const, !const, ~const
+    if (k == CGN_UNOP) {
+      if (self.cg_tryFold(self.cg_nc0(ni)) == 0) { return 0; }
+      var uop: int64 := self.cg_nival(ni);
+      if (uop == CGT_MINUS)  { self.foldBuf := 0 - self.foldBuf; return 1; }
+      if (uop == CGT_NOT)    { if (self.foldBuf == 0) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (uop == CGT_BITNOT) { self.foldBuf := -1 - self.foldBuf; return 1; }
+      return 0;
+    }
+    // Binary: both sides must fold
+    if (k == CGN_BINOP) {
+      if (self.cg_tryFold(self.cg_nc0(ni)) == 0) { return 0; }
+      var lv: int64 := self.foldBuf;
+      if (self.cg_tryFold(self.cg_nc1(ni)) == 0) { return 0; }
+      var rv: int64 := self.foldBuf;
+      var bop: int64 := self.cg_nival(ni);
+      if (bop == CGT_PLUS)    { self.foldBuf := lv + rv;  return 1; }
+      if (bop == CGT_MINUS)   { self.foldBuf := lv - rv;  return 1; }
+      if (bop == CGT_STAR)    { self.foldBuf := lv * rv;  return 1; }
+      if (bop == CGT_SLASH)   { if (rv == 0) { return 0; } self.foldBuf := lv / rv; return 1; }
+      if (bop == CGT_PERCENT) { if (rv == 0) { return 0; } self.foldBuf := lv % rv; return 1; }
+      if (bop == CGT_EQ2)  { if (lv == rv) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_NEQ)  { if (lv != rv) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_LT)   { if (lv < rv)  { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_LE)   { if (lv <= rv) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_GT)   { if (lv > rv)  { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_GE)   { if (lv >= rv) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_AND)  { if (lv != 0 && rv != 0) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_OR)   { if (lv != 0 || rv != 0) { self.foldBuf := 1; } else { self.foldBuf := 0; } return 1; }
+      if (bop == CGT_BITAND) { self.foldBuf := lv & rv; return 1; }
+      if (bop == CGT_BITOR)  { self.foldBuf := lv | rv; return 1; }
+      if (bop == CGT_SHL)    { self.foldBuf := lv << rv; return 1; }
+      if (bop == CGT_SHR)    { self.foldBuf := lv >> rv; return 1; }
+      return 0;
+    }
+    return 0;
   }
 
   // ------------------------------------------------------------------
@@ -1167,31 +1235,39 @@ pub type Codegen = class {
 
     } else if (k == CGN_BINOP) {
       var op: int64 := self.cg_nival(ni);
-      // Short-circuit for && and ||
-      if (op == CGT_AND) {
-        // Evaluate left; if 0, result is 0
-        self.cg_genExpr(self.cg_nc0(ni));
-        self.cg_pushRax();
-        self.cg_genExpr(self.cg_nc1(ni));
-        self.cg_popRbx();
+      var lhsNi: int64 := self.cg_nc0(ni);
+      var rhsNi: int64 := self.cg_nc1(ni);
+      // WP-10g: Constant Folding — both sides constant → single immediate
+      if (self.cg_tryFold(ni) != 0) {
+        self.cg_movRaxImm(self.foldBuf);
+      } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(lhsNi) != 0) {
+        // CSE: LHS is constant → load into rbx directly (no push/pop)
+        var lhsVal: int64 := self.foldBuf;
+        self.cg_movRbxImm(lhsVal);
+        self.cg_genExpr(rhsNi);
         self.cg_emitBinOp(op);
-      } else if (op == CGT_OR) {
-        self.cg_genExpr(self.cg_nc0(ni));
-        self.cg_pushRax();
-        self.cg_genExpr(self.cg_nc1(ni));
-        self.cg_popRbx();
+      } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(rhsNi) != 0) {
+        // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
+        var rhsVal: int64 := self.foldBuf;
+        self.cg_genExpr(lhsNi);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);  // mov rbx, rax
+        self.cg_movRaxImm(rhsVal);
         self.cg_emitBinOp(op);
       } else {
-        // left first, push; right, pop into rbx
-        self.cg_genExpr(self.cg_nc0(ni));
+        // General: eval LHS, push; eval RHS; pop rbx
+        self.cg_genExpr(lhsNi);
         self.cg_pushRax();
-        self.cg_genExpr(self.cg_nc1(ni));
+        self.cg_genExpr(rhsNi);
         self.cg_popRbx();
         self.cg_emitBinOp(op);
       }
 
     } else if (k == CGN_UNOP) {
       var op: int64 := self.cg_nival(ni);
+      // WP-10g: fold constant unary expressions
+      if (self.cg_tryFold(ni) != 0) {
+        self.cg_movRaxImm(self.foldBuf);
+      } else {
       self.cg_genExpr(self.cg_nc0(ni));
       if (op == CGT_MINUS) {
         self.cg_negRax();
@@ -1203,6 +1279,7 @@ pub type Codegen = class {
       } else if (op == CGT_BITNOT) {
         self.cg_notRax();
       }
+      }  // end else (not const-foldable)
 
     } else if (k == CGN_CALL) {
       self.cg_genCall(ni);
@@ -1614,8 +1691,25 @@ pub type Codegen = class {
   }
 
   fn cg_genIf(ni: int64) {
+    // WP-10g: dead-branch elimination — if condition is a compile-time constant
+    var condNi: int64 := self.cg_nc0(ni);
+    if (self.cg_tryFold(condNi) != 0) {
+      if (self.foldBuf != 0) {
+        self.cg_genBlock(self.cg_nc1(ni));   // condition always true → emit then only
+      } else {
+        var elseDead: int64 := self.cg_nc2(ni);
+        if (elseDead >= 0) {
+          if (self.cg_nkind(elseDead) == CGN_BLOCK) {
+            self.cg_genBlock(elseDead);
+          } else {
+            self.cg_genStmt(elseDead);
+          }
+        }
+      }
+      return;
+    }
     // Evaluate condition
-    self.cg_genExpr(self.cg_nc0(ni));
+    self.cg_genExpr(condNi);
     // test rax, rax; jz else_label
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
     // jz rel32 (forward)
