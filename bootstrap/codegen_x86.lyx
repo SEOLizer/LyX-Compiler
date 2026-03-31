@@ -819,6 +819,49 @@ pub type Codegen = class {
     self.classCount := self.classCount + 1;
   }
 
+  // Build struct field layout (WP-10d): like cg_buildClassLayout but fields at offset 0
+  // and vmtDataOff stored as -1 (marks this entry as a struct, not a class).
+  fn cg_buildStructLayout(ni: int64) {
+    var sName: pchar := self.cg_nsval(ni);
+    var sLen:  int64 := self.cg_nslen(ni);
+    var fieldNode: int64 := self.cg_nc0(ni);
+    var cnt: int64 := 0;
+    var tmp: int64 := fieldNode;
+    while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
+    var flds: int64 := mmap(0, (cnt + 1) * CG_CFIELD_SZ, 3, 34, -1, 0);
+    // Structs: fields start at offset 0 (no VMT slot)
+    var offset: int64 := 0;
+    var i: int64 := 0;
+    tmp := fieldNode;
+    while (tmp != -1) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      poke64(fb,      self.cg_nsval(tmp) as int64);
+      poke64(fb + 8,  self.cg_nslen(tmp));
+      poke64(fb + 16, offset);
+      offset := offset + 8;
+      i := i + 1;
+      tmp := self.cg_nnext(tmp);
+    }
+    if (self.classCount >= self.classCap) {
+      var nc: int64 := self.classCap * 2;
+      var nb: int64 := mmap(0, nc * CG_CLASS_SZ, 3, 34, -1, 0);
+      var ii: int64 := 0;
+      while (ii < self.classCount * CG_CLASS_SZ) {
+        poke8(nb + ii, peek8(self.classLayouts + ii));
+        ii := ii + 1;
+      }
+      self.classLayouts := nb;
+      self.classCap := nc;
+    }
+    var base: int64 := self.classLayouts + self.classCount * CG_CLASS_SZ;
+    poke64(base,      sName as int64);
+    poke64(base + 8,  sLen);
+    poke64(base + 16, flds);
+    poke64(base + 24, cnt);
+    poke64(base + 32, -1);   // vmtDataOff = -1 signals "struct, no VMT"
+    self.classCount := self.classCount + 1;
+  }
+
   fn cg_getLocalClassIdx(varName: pchar, varLen: int64): int64 {
     var i: int64 := self.localCount - 1;
     while (i >= 0) {
@@ -1177,16 +1220,25 @@ pub type Codegen = class {
       self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
       self.cg_movRaxImm(9);
       self.cg_e8(0x0F); self.cg_e8(0x05);
-      // WP-10a: rax = object ptr; write VMT pointer at [rax+0]
-      // mov rcx, imm64 (placeholder = 0, patched later with VMT vaddr)
-      self.cg_e8(0x48); self.cg_e8(0xB9);
-      var vmtPatchPos: int64 := self.codeLen;
-      self.cg_e64(0);                                         // 8-byte placeholder
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08); // mov [rax], rcx
-      // Record patch: fill in VMT address for this class at vmtPatchPos
+      // WP-10d: check if type is a struct (vmtDataOff == -1) → skip VMT setup
       var tname: pchar := self.cg_nsval(ni);
       var tlen:  int64 := self.cg_nslen(ni);
-      self.cg_addVmtPatch(vmtPatchPos, tname, tlen);
+      var ciNew: int64 := self.cg_findClass(tname, tlen);
+      var isStructNew: int64 := 0;
+      if (ciNew >= 0) {
+        var vmtChk: int64 := peek64(self.classLayouts + ciNew * CG_CLASS_SZ + 32);
+        if (vmtChk == -1) { isStructNew := 1; }
+      }
+      if (isStructNew == 0) {
+        // WP-10a: rax = object ptr; write VMT pointer at [rax+0]
+        // mov rcx, imm64 (placeholder = 0, patched later with VMT vaddr)
+        self.cg_e8(0x48); self.cg_e8(0xB9);
+        var vmtPatchPos: int64 := self.codeLen;
+        self.cg_e64(0);                                         // 8-byte placeholder
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08); // mov [rax], rcx
+        // Record patch: fill in VMT address for this class at vmtPatchPos
+        self.cg_addVmtPatch(vmtPatchPos, tname, tlen);
+      }
 
     } else if (k == CGN_FIELD) {
       self.cg_genFieldLoad(ni);
@@ -1437,7 +1489,30 @@ pub type Codegen = class {
       if (init >= 0) {
         self.cg_genExpr(init);
       } else {
-        self.cg_zeroRax();
+        // WP-10d: auto-allocate struct locals (NK_TYPE_NAME=60, vmtDataOff==-1)
+        var sdoStruct: int64 := 0;
+        if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
+          var sdoIdx: int64 := self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+          if (sdoIdx >= 0) {
+            var sdoVmt: int64 := peek64(self.classLayouts + sdoIdx * CG_CLASS_SZ + 32);
+            if (sdoVmt == -1) { sdoStruct := 1; }
+          }
+        }
+        if (sdoStruct != 0) {
+          // mmap(0, 4096, 3, 34, -1, 0) → rax = struct ptr
+          self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
+          self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,rax
+          self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,rax
+          self.cg_movRaxImm(34);
+          self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
+          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8, r8
+          self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec r8 → r8=-1
+          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
+          self.cg_movRaxImm(9);
+          self.cg_e8(0x0F); self.cg_e8(0x05);
+        } else {
+          self.cg_zeroRax();
+        }
       }
       self.cg_storeRax(off);
 
@@ -1747,6 +1822,11 @@ pub type Codegen = class {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
       var off: int64 := self.cg_addLocal(pname, pnlen);
+      // Track param type if it's a user type (NK_TYPE_NAME = 60)
+      var ptypeNode: int64 := self.cg_nc0(param);
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
+        self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
+      }
       if (paramIdx == 0) { self.cg_spillRdi(off); }
       else if (paramIdx == 1) { self.cg_spillRsi(off); }
       else if (paramIdx == 2) { self.cg_spillRdx(off); }
@@ -2056,16 +2136,26 @@ pub type Codegen = class {
         var modLen:  int64 := self.cg_nslen(cur);
         self.cg_processImport(modName, modLen);
       } else if (k == CGN_TYPE_DECL) {
-        // Build class field layout, then compile methods
-        self.cg_buildClassLayout(cur);
-        var clsName: pchar := self.cg_nsval(cur);
-        var clsLen:  int64 := self.cg_nslen(cur);
-        var method: int64 := self.cg_nc1(cur);
-        while (method != -1) {
-          var nextM: int64 := self.cg_nnext(method);
-          self.cg_genMethodDecl(method, clsName, clsLen);
-          method := nextM;
+        // NK_TYPE_DECL: class if it has methods (nc1 != -1), struct otherwise
+        var hasMethods: int64 := self.cg_nc1(cur);
+        if (hasMethods == -1) {
+          // No methods → treat as struct (fields start at offset 0, no VMT)
+          self.cg_buildStructLayout(cur);
+        } else {
+          // Has methods → class layout (fields at offset 8, VMT at 0)
+          self.cg_buildClassLayout(cur);
+          var clsName: pchar := self.cg_nsval(cur);
+          var clsLen:  int64 := self.cg_nslen(cur);
+          var method: int64 := hasMethods;
+          while (method != -1) {
+            var nextM: int64 := self.cg_nnext(method);
+            self.cg_genMethodDecl(method, clsName, clsLen);
+            method := nextM;
+          }
         }
+      } else if (k == CGN_STRUCT_DECL) {
+        // Standalone struct declaration: register field layout (fields at offset 0)
+        self.cg_buildStructLayout(cur);
       } else if (k == CGN_CON_DECL) {
         // Populate constant table for use inside method bodies
         var initNode: int64 := self.cg_nc1(cur);
@@ -2073,7 +2163,7 @@ pub type Codegen = class {
           self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), self.cg_nival(initNode));
         }
       }
-      // Struct/enum: skip for bootstrap codegen
+      // Enum: skip for bootstrap codegen
       cur := self.cg_nnext(cur);
     }
   }
