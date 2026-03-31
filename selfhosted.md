@@ -448,7 +448,7 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 | 10b | Dynamische Arrays | WP-09 | ✅ COMPLETE
 | 10c | `switch/case` | WP-09 | ✅ COMPLETE
 | 10d | Structs mit Feldzugriff | WP-09 | ✅ COMPLETE
-| 10e | Modulimport | WP-09 |
+| 10e | Modulimport | WP-09 | ✅ COMPLETE
 | 10f | Enum-Typen | WP-04 + WP-09 |
 | 10g | Optimierungen (Constant Folding, CSE) | 10a-10f |
 | 10h | ARM64 Backend | 10a-10f |

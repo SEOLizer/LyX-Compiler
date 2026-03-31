@@ -43,6 +43,7 @@ con SEMA_NODE_SIZE: int64 := 88;   // = PARSER_NODE_SIZE
 con SEMA_TOK_SIZE:  int64 := 40;   // = PARSER_TOK_SIZE
 
 // Node kind constants (mirroring NK_xxx from bootstrap.parser)
+con SNK_IMPORT:      int64 := 1;
 con SNK_FUNC_DECL:   int64 := 2;
 con SNK_PARAM:       int64 := 3;
 con SNK_VAR_DECL:    int64 := 4;
@@ -110,6 +111,11 @@ pub type Sema = class {
   // Diagnostics
   hadError:   int64;
   errorCount: int64;
+
+  // Import deduplication (WP-10e)
+  importedMods:  int64;  // mmap buffer of {ptr:int64, len:int64} pairs (16 bytes)
+  importedCount: int64;
+  importedCap:   int64;
 
   // ------------------------------------------------------------------
   // Node access helpers
@@ -272,6 +278,93 @@ pub type Sema = class {
   }
 
   // ------------------------------------------------------------------
+  // WP-10e: import processing helpers
+  // ------------------------------------------------------------------
+
+  fn _sema_hasImported(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.importedCount) {
+      var base: int64 := self.importedMods + i * 16;
+      var p: pchar    := peek64(base) as pchar;
+      var n: int64    := peek64(base + 8);
+      if (self._strNEq(p, n, name, nameLen)) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  fn _sema_markImported(name: pchar, nameLen: int64) {
+    if (self.importedCount >= self.importedCap) {
+      var nc: int64 := self.importedCap * 2;
+      var nb: int64 := mmap(0, nc * 16, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.importedCount * 16) {
+        poke8(nb + i, peek8(self.importedMods + i));
+        i := i + 1;
+      }
+      self.importedMods := nb;
+      self.importedCap  := nc;
+    }
+    var base: int64 := self.importedMods + self.importedCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    self.importedCount := self.importedCount + 1;
+  }
+
+  fn _sema_readFile(path: pchar): pchar {
+    var fd: int64 := open(path, 0, 0);
+    if (fd < 0) { return 0 as pchar; }
+    var size: int64 := lseek(fd, 0, 2);
+    if (size <= 0) { close(fd); return 0 as pchar; }
+    lseek(fd, 0, 0);
+    var buf: int64 := mmap(0, size + 1, 3, 34, -1, 0);
+    read(fd, buf as pchar, size);
+    poke8(buf + size, 0);
+    close(fd);
+    return buf as pchar;
+  }
+
+  fn _sema_processImport(modName: pchar, modLen: int64) {
+    if (self._sema_hasImported(modName, modLen) != 0) { return; }
+    self._sema_markImported(modName, modLen);
+
+    // Convert "bootstrap.mathlib" → "bootstrap/mathlib.lyx"
+    var pathBuf: int64 := mmap(0, modLen + 8, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < modLen) {
+      var c: int64 := StrCharAt(modName, i);
+      if (c == 46) { c := 47; }  // '.' → '/'
+      poke8(pathBuf + i, c);
+      i := i + 1;
+    }
+    poke8(pathBuf + modLen,     46);   // '.'
+    poke8(pathBuf + modLen + 1, 108);  // 'l'
+    poke8(pathBuf + modLen + 2, 121);  // 'y'
+    poke8(pathBuf + modLen + 3, 120);  // 'x'
+    poke8(pathBuf + modLen + 4, 0);
+
+    var path: pchar := pathBuf as pchar;
+    var src: pchar  := self._sema_readFile(path);
+    if (src == 0 as pchar) { return; }
+
+    var p: Parser := new Parser();
+    p.Init(src, StrLen(src));
+    var head: int64 := p.Parse();
+    if (p.hadError != 0) { dispose p; return; }
+
+    // Save/swap src+nodes, run Pass1 on imported AST, then restore
+    var savedSrc:   pchar := self.src;
+    var savedNodes: int64 := self.pNodes;
+    self.src    := p.src;
+    self.pNodes := p.nodes;
+    self.Pass1(head);
+    self.src    := savedSrc;
+    self.pNodes := savedNodes;
+
+    dispose p;
+  }
+
+  // ------------------------------------------------------------------
   // Pass 1: collect top-level declarations
   // ------------------------------------------------------------------
 
@@ -301,8 +394,9 @@ pub type Sema = class {
       var typeNi: int64 := self.sn_c0(ni);
       var tid:    int64 := self.ResolveType(typeNi);
       self._pushSym(name, nlen, SYM_VAR, tid, ni);
+    } else if (k == SNK_IMPORT) {
+      self._sema_processImport(name, nlen);
     }
-    // NK_IMPORT: nothing to register
   }
 
   fn Pass1(head: int64) {
@@ -578,6 +672,11 @@ pub type Sema = class {
 
     self.hadError   := 0;
     self.errorCount := 0;
+
+    // WP-10e: import dedup table
+    self.importedCap   := 16;
+    self.importedMods  := mmap(0, self.importedCap * 16, 3, 34, -1, 0);
+    self.importedCount := 0;
 
     self._registerBuiltins();
   }
