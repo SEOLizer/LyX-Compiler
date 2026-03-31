@@ -446,7 +446,7 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 |--------|---------|--------------|
 | 10a | Klassen + VMT | WP-09 | ✅ COMPLETE
 | 10b | Dynamische Arrays | WP-09 | ✅ COMPLETE
-| 10c | `switch/case` | WP-09 |
+| 10c | `switch/case` | WP-09 | ✅ COMPLETE
 | 10d | Structs mit Feldzugriff | WP-09 |
 | 10e | Modulimport | WP-09 |
 | 10f | Enum-Typen | WP-04 + WP-09 |
