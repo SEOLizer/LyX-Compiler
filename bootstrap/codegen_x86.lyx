@@ -1506,6 +1506,9 @@ pub type Codegen = class {
     } else if (k == CGN_FOR) {
       self.cg_genFor(ni);
 
+    } else if (k == CGN_SWITCH) {
+      self.cg_genSwitch(ni);
+
     } else if (k == CGN_DISPOSE) {
       // dispose obj: call munmap? Skip for bootstrap.
       // Just evaluate the expression (no-op effect on expr result)
@@ -1641,6 +1644,83 @@ pub type Codegen = class {
     self.cg_e32(loopTop - self.codeLen - 4);
     // Patch exit
     poke32(self.code + jmpExit, self.codeLen - jmpExit - 4);
+  }
+
+  // ------------------------------------------------------------------
+  // Switch/case code generation (WP-10c)
+  // ------------------------------------------------------------------
+  // AST: NK_SWITCH { nc0=subject, nc1=first_case }
+  //      NK_CASE  { ival=0/1, nc0=value(if !default), nc1=body_block }
+  // Strategy: linear if-else chain; default case runs last.
+  // Implicit jmp after each case body uses the curBreakHead linked list,
+  // so explicit break statements and implicit end-of-case jumps are both
+  // patched to the switch_end at once.
+  // ------------------------------------------------------------------
+
+  fn cg_genSwitch(ni: int64) {
+    // Allocate a temp local to hold the subject value
+    var swVar: pchar := "__sw__";
+    var swOff: int64 := self.cg_addLocal(swVar, 6);
+    self.cg_genExpr(self.cg_nc0(ni));
+    self.cg_storeRax(swOff);
+
+    // Save and reset break list (shared between explicit break and implicit case exit)
+    var savedBreakHead: int64 := self.curBreakHead;
+    self.curBreakHead := -1;
+
+    var defaultCaseNode: int64 := -1;
+    var caseCur: int64 := self.cg_nc1(ni);
+    while (caseCur != -1) {
+      var isDefault: int64 := self.cg_nival(caseCur);
+      if (isDefault != 0) {
+        defaultCaseNode := caseCur;
+      } else {
+        // subject → rbx, case value → rax
+        self.cg_loadRax(swOff);
+        self.cg_pushRax();
+        self.cg_genExpr(self.cg_nc0(caseCur));
+        self.cg_popRbx();
+        // cmp rbx, rax; jne skip_case (rel32)
+        self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
+        self.cg_e8(0x0F); self.cg_e8(0x85);
+        var jnePos: int64 := self.codeLen;
+        self.cg_e32(0);
+        // Execute case body
+        self.cg_genBlock(self.cg_nc1(caseCur));
+        // Implicit jmp to switch_end (linked into break list)
+        self.cg_e8(0xE9);
+        var bp: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bp;
+        // Patch jne to next case
+        poke32(self.code + jnePos, self.codeLen - jnePos - 4);
+      }
+      caseCur := self.cg_nnext(caseCur);
+    }
+
+    // Default case executes last if no other case matched
+    if (defaultCaseNode != -1) {
+      self.cg_genBlock(self.cg_nc1(defaultCaseNode));
+      // Implicit jmp to switch_end
+      self.cg_e8(0xE9);
+      var bpd: int64 := self.codeLen;
+      self.cg_e32(self.curBreakHead);
+      self.curBreakHead := bpd;
+    }
+
+    // switch_end: patch all break/implicit-break jmps here
+    var bh: int64 := self.curBreakHead;
+    while (bh != -1) {
+      var b0: int64 := peek8(self.code + bh);
+      var b1: int64 := peek8(self.code + bh + 1);
+      var b2: int64 := peek8(self.code + bh + 2);
+      var b3: int64 := peek8(self.code + bh + 3);
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + bh, self.codeLen - bh - 4);
+      bh := nextLink;
+    }
+    self.curBreakHead := savedBreakHead;
   }
 
   // ------------------------------------------------------------------
