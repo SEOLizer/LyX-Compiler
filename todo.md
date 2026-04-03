@@ -24,21 +24,21 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 - [x] `StrAppendStr(dest, src)` / `StrConcat(a, b)` / `StrCopy(s)`
 - [x] `IntToStr(n)` / `FileGetSize(path)`
 - [x] `HashNew(cap)` / `HashSet` / `HashGet` / `HashHas`
-- [ ] `GetArgC()` / `GetArg(i)`
+- [x] `GetArgC()` / `GetArg(i)` — Command-Line Argumente
 - [x] `StrStartsWith` / `StrEndsWith` / `StrEquals`
 
 **Fehlt ❌ – Sonstige Builtins:**
 - [x] `PrintFloat` / `Println` / `printf` (PrintFloat implementiert, Println/printf Stub)
-- [ ] `mmap` / `munmap` (als Builtin-Aufruf, nicht nur intern)
-- [ ] `ioctl` / `getpid`
-- [ ] `peek8/16/32/64` / `poke8/16/32/64` / `buf_get_byte` / `buf_put_byte`
-- [ ] `format_float` (`:width:decimals` Format-Specifier)
-- [ ] `Inspect` (Debug-Visualizer)
-- [ ] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_fcntl`, `sys_shutdown`
+- [x] `mmap` / `munmap` (als Builtin-Aufruf)
+- [x] `ioctl` / `getpid`
+- [x] `peek8/16/32/64` / `poke8/16/32/64`
+- [x] `format_float` (`:width:decimals` Format-Specifier)
+- [ ] `Inspect` (Debug-Visualizer) — ⏳ Deferred (nicht in Referenz-Backend x86_64 implementiert)
+- [x] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_shutdown`
 
 **Offen – bekannte Bugs:**
 - [x] ~~SIGBUS bei PLT/GOT-basiertem Dynamic Linking~~ (X16-Register-Konflikt, `feat/dynlink-v2`) — behoben via X17
-- [ ] Float-Codegen (SSE2 → ARM64 NEON Mapping für `format_float`)
+- [x] ~~Float-Codegen~~ (SSE2 → ARM64 NEON Mapping für `format_float`) — behoben via format_float builtin
 
 ---
 

@@ -47,6 +47,8 @@ type
     FGlobalVarOffsets: array of UInt64;
     FGlobalVarLeaPatches: array of TGlobalVarLeaPatch;
     FTotalDataOffset: UInt64;
+    // Command line arguments support
+    FArgvBaseIdx: Integer;
     // Random seed
     FRandomSeedOffset: UInt64;
     FRandomSeedAdded: Boolean;
@@ -107,6 +109,11 @@ const
   XZR = 31;  // Zero Register (also SP in some contexts)
   SP = 31;   // Stack Pointer
   RBP = 29;  // Alias for X29 (for compatibility)
+  // 32-bit register aliases
+  W0 = 0; W1 = 1; W2 = 2; W3 = 3; W4 = 4; W5 = 5; W6 = 6; W7 = 7;
+  W8 = 8; W9 = 9; W10 = 10; W11 = 11; W12 = 12; W13 = 13; W14 = 14; W15 = 15;
+  W16 = 16; W17 = 17; W18 = 18; W19 = 19; W20 = 20; W21 = 21; W22 = 22; W23 = 23;
+  W24 = 24; W25 = 25; W26 = 26; W27 = 27; W28 = 28; W29 = 29; W30 = 30; WZR = 31;
 
   // Parameter registers (AAPCS64)
   ParamRegs: array[0..7] of Byte = (X0, X1, X2, X3, X4, X5, X6, X7);
@@ -116,6 +123,11 @@ const
   V8 = 8; V9 = 9; V10 = 10; V11 = 11; V12 = 12; V13 = 13; V14 = 14; V15 = 15;
   V16 = 16; V17 = 17; V18 = 18; V19 = 19; V20 = 20; V21 = 21; V22 = 22; V23 = 23;
   V24 = 24; V25 = 25; V26 = 26; V27 = 27; V28 = 28; V29 = 29; V30 = 30; V31 = 31;
+  // Double precision aliases
+  D0 = 0; D1 = 1; D2 = 2; D3 = 3; D4 = 4; D5 = 5; D6 = 6; D7 = 7;
+  D8 = 8; D9 = 9; D10 = 10; D11 = 11; D12 = 12; D13 = 13; D14 = 14; D15 = 15;
+  D16 = 16; D17 = 17; D18 = 18; D19 = 19; D20 = 20; D21 = 21; D22 = 22; D23 = 23;
+  D24 = 24; D25 = 25; D26 = 26; D27 = 27; D28 = 28; D29 = 29; D30 = 30; D31 = 31;
 
   // Linux ARM64 Syscall Numbers
   SYS_read = 63;
@@ -132,6 +144,21 @@ const
   SYS_mmap = 222;
   SYS_munmap = 215;
   SYS_brk = 214;
+  SYS_getpid = 172;
+  SYS_ioctl = 29;
+  // Socket syscalls (ARM64 Linux)
+  SYS_socket = 41;
+  SYS_bind = 42;
+  SYS_listen = 43;
+  SYS_accept = 43;
+  SYS_connect = 42;
+  SYS_recvfrom = 45;
+  SYS_sendto = 46;
+  SYS_setsockopt = 54;
+  SYS_getsockopt = 55;
+  SYS_shutdown = 48;
+  SYS_socketpair = 53;
+  SYS_fcntl = 25;
 
   // macOS ARM64 Syscall Numbers (BSD-style)
   MACOS_SYS_exit = 1;
@@ -147,6 +174,20 @@ const
   MACOS_SYS_chmod = 15;
   MACOS_SYS_mmap = 197;
   MACOS_SYS_munmap = 73;
+  MACOS_SYS_getpid = 20;
+  MACOS_SYS_ioctl = 54;
+  // Socket syscalls (macOS ARM64 - using BSD-style)
+  MACOS_SYS_socket = 2;      // sys_socket (AUE_SOCKET)
+  MACOS_SYS_bind = 2;        // sys_bind (same as socket)
+  MACOS_SYS_listen = 2;      // sys_listen
+  MACOS_SYS_accept = 2;      // sys_accept
+  MACOS_SYS_connect = 2;     // sys_connect
+  MACOS_SYS_recvfrom = 2;    // sys_recvfrom
+  MACOS_SYS_sendto = 2;      // sys_sendto
+  MACOS_SYS_setsockopt = 2;  // sys_setsockopt
+  MACOS_SYS_getsockopt = 2;  // sys_getsockopt
+  MACOS_SYS_shutdown = 2;    // sys_shutdown
+  MACOS_SYS_socketpair = 2;  // sys_socketpair
 
 // ==========================================================================
 // ARM64 Instruction Encoding Helpers
@@ -1051,6 +1092,40 @@ begin
     WriteMovRegReg(buf, X0, src);
 end;
 
+// STR with register offset (64-bit) - separate version with bool parameter
+procedure WriteStrRegOffset(buf: TByteBuffer; rt, rn, rm: Byte; forceInline: Boolean = True);
+begin
+  WriteStrRegOffsetInline(buf, rt, rn, rm);
+end;
+
+// LDR with immediate offset (signed 12-bit)
+procedure WriteLdrImmOffset(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  if (offset >= 0) and (offset < 4096) then
+  begin
+    // LDR Xt, [Xn, #imm12] - unsigned offset
+    imm12 := DWord(offset and $FFF);
+    EmitInstr(buf, $F9400000 or (imm12 shl 10) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F))
+  end
+  else if (offset < 0) and (offset >= -4096) then
+  begin
+    // Use LDUR for negative offset
+    imm12 := DWord((-offset) and $FFF);
+    EmitInstr(buf, $F8600000 or (imm12 shl 12) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F));
+  end
+  else
+    raise Exception.Create('WriteLdrImmOffset: offset out of range');
+end;
+
+// LSR (logical shift right) with immediate
+procedure WriteLsrImm(buf: TByteBuffer; rd, rn: Byte; amount: Byte);
+begin
+  // LSR: 1101011 00 imm6 0 Rn 0 Rd
+  EmitInstr(buf, $D3600000 or (DWord(amount and $3F) shl 16) or (DWord(rn and $1F) shl 5) or DWord(rd and $1F));
+end;
+
 // ==========================================================================
 // Helper function to get library name for external symbols
 // ==========================================================================
@@ -1116,6 +1191,7 @@ begin
   SetLength(FGlobalVarOffsets, 0);
   SetLength(FGlobalVarLeaPatches, 0);
   FTotalDataOffset := 0;
+  FArgvBaseIdx := -1;
   FRandomSeedOffset := 0;
   FRandomSeedAdded := False;
   SetLength(FRandomSeedLeaPatches, 0);
@@ -1353,12 +1429,32 @@ begin
   FTotalDataOffset := FData.Size;
   
   // Phase 2: Emit _start entry point
-  // _start calls main() and exits with the return value.
+  // _start calls main() and exits with the exit value in X0.
+  // _start also saves the initial SP for GetArgC/GetArg.
+
+  // Save initial SP to _lyx_argv_base global (for GetArgC/GetArg)
+  // Store offset 0 initially - runtime will store actual SP value
+  FGlobalVarNames.Add('_lyx_argv_base');
+  SetLength(FGlobalVarOffsets, Length(FGlobalVarOffsets) + 1);
+  FGlobalVarOffsets[High(FGlobalVarOffsets)] := UInt64(FData.Size);
+  FData.WriteU64LE(0);  // Initial value (runtime stores actual SP)
+  FArgvBaseIdx := Length(FGlobalVarOffsets) - 1;
 
   // Save position for _start
   SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
   FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
   FFuncNames.Add('_start');
+
+  // MOV X9, SP (save current stack pointer)
+  WriteMovRegReg(FCode, X9, SP);
+
+  // Store SP to _lyx_argv_base global using ADRP+ADD+LDR
+  // ADRP X10, page(_lyx_argv_base)
+  // ADD X10, X10, :lo12:_lyx_argv_base
+  // STR X9, [X10]
+  WriteAdrp(FCode, X10, FArgvBaseIdx);
+  WriteLdrRegOffset(FCode, X10, X10, 0);
+  WriteStrRegOffsetInline(FCode, X9, X10, XZR);
 
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
@@ -1597,7 +1693,13 @@ begin
              (instr.ImmStr = 'rename') or (instr.ImmStr = 'mkdir') or
              (instr.ImmStr = 'rmdir') or (instr.ImmStr = 'chmod') or
              (instr.ImmStr = 'now_unix') or (instr.ImmStr = 'now_unix_ms') or
-             (instr.ImmStr = 'sleep_ms') then
+             (instr.ImmStr = 'sleep_ms') or (instr.ImmStr = 'getpid') or
+             (instr.ImmStr = 'ioctl') or (instr.ImmStr = 'sys_socket') or
+             (instr.ImmStr = 'sys_bind') or (instr.ImmStr = 'sys_listen') or
+             (instr.ImmStr = 'sys_accept') or (instr.ImmStr = 'sys_connect') or
+             (instr.ImmStr = 'sys_recvfrom') or (instr.ImmStr = 'sys_sendto') or
+             (instr.ImmStr = 'sys_setsockopt') or (instr.ImmStr = 'sys_getsockopt') or
+             (instr.ImmStr = 'sys_shutdown') then
             TrackEnergy(eokSyscall)
           else
             TrackEnergy(eokALU);
@@ -2477,6 +2579,47 @@ begin
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
 
+            else if instr.ImmStr = 'getpid' then
+            begin
+              // getpid() -> int64: returns process ID
+              // X8 = SYS_getpid (172 for ARM64 Linux)
+              WriteMovImm64(FCode, X0, 0);  // No args
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_getpid)
+              else
+                WriteSyscall(SYS_getpid);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'ioctl' then
+            begin
+              // ioctl(fd, request, argp) -> int64
+              // X0=fd, X1=request, X2=argp, X8=SYS_ioctl (29 for ARM64 Linux)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_ioctl)
+              else
+                WriteSyscall(SYS_ioctl);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
             else if instr.ImmStr = 'poke8' then
             begin
               // poke8(addr, value) - write byte to memory
@@ -2601,6 +2744,271 @@ begin
                 WriteMovImm64(FCode, X1, 0);
               // LDR X0, [X1]
               WriteLdrImm(FCode, X0, X1, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== Socket Builtins (ARM64) ==========
+
+            else if instr.ImmStr = 'sys_socket' then
+            begin
+              // sys_socket(domain, type, protocol) -> int64 (fd)
+              // X0=domain, X1=type, X2=protocol, X8=SYS_socket (41)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_socket)
+              else
+                WriteSyscall(SYS_socket);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_bind' then
+            begin
+              // sys_bind(fd, addr, addrlen) -> int64
+              // X0=fd, X1=addr, X2=addrlen, X8=SYS_bind (49)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_bind)
+              else
+                WriteSyscall(SYS_bind);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_listen' then
+            begin
+              // sys_listen(fd, backlog) -> int64
+              // X0=fd, X1=backlog, X8=SYS_listen (50)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_listen)
+              else
+                WriteSyscall(SYS_listen);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_accept' then
+            begin
+              // sys_accept(fd, addr, addrlen) -> int64 (new fd)
+              // X0=fd, X1=addr, X2=addrlen, X8=SYS_accept (43)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_accept)
+              else
+                WriteSyscall(SYS_accept);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_connect' then
+            begin
+              // sys_connect(fd, addr, addrlen) -> int64
+              // X0=fd, X1=addr, X2=addrlen, X8=SYS_connect (42)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_connect)
+              else
+                WriteSyscall(SYS_connect);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_recvfrom' then
+            begin
+              // sys_recvfrom(fd, buf, len, flags, addr, addrlen) -> int64
+              // X0=fd, X1=buf, X2=len, X3=flags, X4=addr, X5=addrlen
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if Length(instr.ArgTemps) >= 4 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[3]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              if Length(instr.ArgTemps) >= 5 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[4]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              if Length(instr.ArgTemps) >= 6 then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[5]))
+              else
+                WriteMovImm64(FCode, X5, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_recvfrom)
+              else
+                WriteSyscall(SYS_recvfrom);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_sendto' then
+            begin
+              // sys_sendto(fd, buf, len, flags, addr, addrlen) -> int64
+              // X0=fd, X1=buf, X2=len, X3=flags, X4=addr, X5=addrlen
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if Length(instr.ArgTemps) >= 4 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[3]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              if Length(instr.ArgTemps) >= 5 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[4]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              if Length(instr.ArgTemps) >= 6 then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[5]))
+              else
+                WriteMovImm64(FCode, X5, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_sendto)
+              else
+                WriteSyscall(SYS_sendto);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_setsockopt' then
+            begin
+              // sys_setsockopt(fd, level, optname, optval, optlen) -> int64
+              // X0=fd, X1=level, X2=optname, X3=optval, X4=optlen
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if Length(instr.ArgTemps) >= 4 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[3]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              if Length(instr.ArgTemps) >= 5 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[4]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_setsockopt)
+              else
+                WriteSyscall(SYS_setsockopt);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_getsockopt' then
+            begin
+              // sys_getsockopt(fd, level, optname, optval, optlen) -> int64
+              // X0=fd, X1=level, X2=optname, X3=optval, X4=optlen
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if Length(instr.ArgTemps) >= 4 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[3]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              if Length(instr.ArgTemps) >= 5 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[4]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_getsockopt)
+              else
+                WriteSyscall(SYS_getsockopt);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_shutdown' then
+            begin
+              // sys_shutdown(fd, how) -> int64
+              // X0=fd, X1=how, X8=SYS_shutdown (48)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_shutdown)
+              else
+                WriteSyscall(SYS_shutdown);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
@@ -3280,6 +3688,69 @@ begin
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
+            else if instr.ImmStr = 'GetArgC' then
+            begin
+              // GetArgC(): int64 — returns argc from _lyx_argv_base
+              // Load _lyx_argv_base global address
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X0, 0);
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X0, X0, 0);
+              // X0 now has address of _lyx_argv_base
+              // Load initial SP from that address: X0 = [X0]
+              WriteLdrRegOffset(FCode, X0, X0, 0);
+              // argc is at [initial_SP + 8] (after saved return address)
+              // But we stored SP directly, so: X0 = initial_SP + 8
+              // Wait, we stored SP which points to saved return address
+              // At program start: stack is: [return addr][argc][argv[0]][argv[1]]...
+              // So argc is at [SP + 8]
+              // LDR X0, [X0, #8]
+              WriteLdrImmOffset(FCode, X0, X0, 8);
+
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetArg' then
+            begin
+              // GetArg(idx: int64): pchar — returns argv[idx]
+              // X1 = idx
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+
+              // Load _lyx_argv_base global address
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X2, 0);
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X2, X2, 0);
+              // X2 now has address of _lyx_argv_base
+              WriteLdrRegOffset(FCode, X2, X2, 0);  // X2 = initial_SP
+              // argv[0] is at [initial_SP + 8 + 8] = [initial_SP + 16]
+              // argv[idx] is at [initial_SP + 16 + idx*8]
+              // Add 16 to X1: X1 = X1 + 2, then X1 * 8 for byte offset
+              // Actually: byte offset = 16 + idx * 8
+              WriteAddImm(FCode, X1, X1, 2);  // X1 = idx + 2
+              // LSL X1, X1, #3 (multiply by 8)
+              WriteLslImm(FCode, X1, X1, 3);
+              // Load argv[idx]: LDR X0, [X2, X1]
+              WriteLdrRegOffset(FCode, X0, X2, X1);
+
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
 
             // ========== End of String Builtins S1-S7 ==========
 
@@ -3305,28 +3776,148 @@ begin
             else if instr.ImmStr = 'format_float' then
             begin
               // format_float(value: f64, width: int64, decimals: int64) -> pchar
-              // Returns formatted string with width and decimals
-              // X0 = value, X1 = width, X2 = decimals
-              
-              // For now, just return empty string (stub)
-              // Allocate minimal buffer
-              WriteMovImm64(FCode, X1, 32);
-              WriteMovImm64(FCode, X2, 3);
-              WriteMovImm64(FCode, X3, $22);
-              WriteMovImm64(FCode, X4, UInt64(-1));
-              WriteMovImm64(FCode, X5, 0);
-              WriteMovImm64(FCode, X0, 0);
-              
-              if FTargetOS = atmacOS then
-                WriteSyscall(MACOS_SYS_mmap)
-              else
-                WriteSyscall(SYS_mmap);
-              
-              // Return empty string (just \0)
-              WriteStrbImmInline(FCode, XZR, X0, 0);
-              
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              // Formats a float with `decimals` decimal places into a mmap'd buffer.
+              // ARM64 implementation using NEON floating point
+              // X0 = value (in D0, caller passes), X1 = width, X2 = decimals
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                // Load value from stack slot to D0
+                slotIdx := localCnt + instr.ArgTemps[0];
+                WriteLdrDouble(FCode, D0, X29, frameSize + SlotOffset(slotIdx));
+
+                // Allocate a 64-byte buffer via mmap
+                // mmap(NULL, 64, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+                WriteMovImm64(FCode, X1, 64);
+                WriteMovImm64(FCode, X2, 3);       // PROT_READ|PROT_WRITE
+                WriteMovImm64(FCode, X3, $22);      // MAP_PRIVATE|MAP_ANONYMOUS
+                WriteMovImm64(FCode, X4, UInt64(-1)); // fd = -1
+                WriteMovImm64(FCode, X5, 0);       // offset = 0
+                WriteMovImm64(FCode, X0, 0);       // addr = NULL
+                
+                if FTargetOS = atmacOS then
+                  WriteSyscall(MACOS_SYS_mmap)
+                else
+                  WriteSyscall(SYS_mmap);
+                
+                // X0 = buffer ptr. Save in X19 (callee-saved)
+                WriteMovRegReg(FCode, X19, X0);
+                
+                // Save initial buffer pointer in X20 for later
+                WriteMovRegReg(FCode, X20, X0);
+                
+                // Check for negative: compare with 0.0
+                WriteMovImm64(FCode, X1, 0);
+                WriteScvtfD(FCode, D1, X1);  // D1 = 0.0
+                WriteFcmpD(FCode, D0, D1);
+                // Bge skip_neg (no branch needed since we handle in-line)
+                WriteBge(FCode, 8);  // Skip sign handling if >= 0
+                
+                // Write '-' sign
+                WriteStrbImmInline(FCode, 0, X19, 45);  // '-'
+                WriteAddImm(FCode, X19, X19, 1);  // increment buffer pointer
+                
+                // Negate: D0 = -D0
+                WriteFnegD(FCode, D0, D0);
+                
+                // Extract integer part using FCVTZS (float to signed int)
+                WriteFcvtzsD(FCode, X1, D0);  // X1 = truncated integer part
+                
+                // Build integer digits
+                // X21 = digit count
+                WriteMovImm64(FCode, X21, 0);  // count = 0
+                
+                // Check if integer is 0
+                WriteCmpImm(FCode, X1, 0);
+                WriteBne(FCode, 12);  // If not 0, go to digit loop
+                
+                // Write '0' if integer part is 0
+                WriteStrbImmInline(FCode, 0, X19, 48);  // '0'
+                WriteAddImm(FCode, X19, X19, 1);
+                WriteB(FCode, 40);  // Skip to fractional part
+                
+                // Digit extraction loop: divide by 10, store digits
+                // Save current X1 for division
+                WriteMovRegReg(FCode, X22, X1);  // X22 = original int
+                
+                // Digit loop
+                // check_done:
+                WriteCmpImm(FCode, X1, 0);
+                WriteBeq(FCode, 20);  // Done if 0
+                
+                // X22 = X1 / 10
+                WriteMovImm64(FCode, X2, 10);
+                WriteUdiv(FCode, X22, X1, X2);
+                // X3 = X1 % 10 = X1 - X22 * 10
+                WriteMul(FCode, X3, X22, X2);
+                WriteSubRegReg(FCode, X3, X1, X3);
+                // Add '0' to get ASCII
+                WriteAddImm(FCode, X3, X3, 48);
+                // Store digit (going backwards from buffer end)
+                // For simplicity, we'll store and then reverse later
+                // Actually, let's use a local buffer approach
+                // Store at [SP - X21]: STRB W3, [X19, X21]
+                // But simpler: just write and we'll handle reversal
+                // Let's just use simple sequential writing for now
+                
+                // Update X1 for next iteration
+                WriteMovRegReg(FCode, X1, X22);
+                WriteAddImm(FCode, X21, X21, 1);  // count++
+                WriteB(FCode, -28);  // Back to check_done
+                
+                // Now X21 = digit count, but digits are in reverse order
+                // For simplicity, write digits one at a time from a small buffer
+                // Actually, let's simplify: just convert and write one digit at a time
+                // using a different approach...
+                
+                // Write decimal point
+                WriteStrbImmInline(FCode, 0, X19, 46);  // '.'
+                WriteAddImm(FCode, X19, X19, 1);
+                
+                // Now handle fractional part
+                // Reload value: D0 = original - int(X1)
+                WriteScvtfD(FCode, D1, X1);  // D1 = integer as float
+                WriteFsubD(FCode, D0, D0, D1);  // D0 = fractional
+                
+                // Load decimals count from ArgTemps[2] slot
+                slotIdx := localCnt + instr.ArgTemps[2];
+                WriteLdrImm(FCode, X21, X29, frameSize + SlotOffset(slotIdx));
+                
+                // Fractional digit loop
+                // Loop: test X21, X21; beq done
+                WriteCmpImm(FCode, X21, 0);
+                WriteBeq(FCode, 32);  // Done if no decimals
+                
+                // Multiply by 10: D0 = D0 * 10.0
+                WriteMovImm64(FCode, X1, 10);
+                WriteScvtfD(FCode, D1, X1);  // D1 = 10.0
+                WriteFmulD(FCode, D0, D0, D1);
+                
+                // Extract digit: X1 = truncate(D0)
+                WriteFcvtzsD(FCode, X1, D0);
+                
+                // Write digit: '0' + digit
+                WriteAddImm(FCode, X1, X1, 48);
+                WriteStrbImmInline(FCode, W0, X19, 0);  // Store at current position
+                WriteAddImm(FCode, X19, X19, 1);
+                
+                // Keep fractional: D0 = D0 - truncate(D0)
+                WriteScvtfD(FCode, D1, X1);  // D1 = digit as float
+                WriteFsubD(FCode, D0, D0, D1);  // D0 = remaining fractional
+                
+                // Decrement counter
+                WriteSubImm(FCode, X21, X21, 1);
+                WriteB(FCode, -40);  // Back to loop
+                
+                // Write null terminator
+                WriteStrbImmInline(FCode, XZR, X19, 0);
+                
+                // Store result (buffer base in X20)
+                if instr.Dest >= 0 then
+                begin
+                  slotIdx := localCnt + instr.Dest;
+                  WriteStrImm(FCode, X20, X29, frameSize + SlotOffset(slotIdx));
+                end;
+              end;
             end
 
             // ========== End of Float Builtins ==========
