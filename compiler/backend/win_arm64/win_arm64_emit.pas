@@ -714,30 +714,182 @@ begin
   FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
   FFuncNames.Add('__builtin_PrintFloat');
   
-  // Prologue - need more stack for float conversion
-  WriteStpPreIndex(FCode, X29, X30, SP, -64);
+  // Prologue - need stack for buffer and constants
+  WriteStpPreIndex(FCode, X29, X30, SP, -96);
   WriteMovRegReg(FCode, X29, SP);
   
-  // Save D0 to stack (for later reference)
-  // STR Q0, [SP] - store 128-bit float register
-  EmitInstr(FCode, $FD00003C);
+  // Save D0 to stack [SP+80]
+  EmitInstr(FCode, $FD0000A0);  // STR D0, [X29, #80]
   
   // Check sign: fcmp d0, #0.0
-  EmitInstr(FCode, $1E202020);
-  // csneg v0, v0, v0, GE  (conditional select: if GE, keep value)
-  EmitInstr(FCode, $1E204000);
-  // b.neg handle_negative
-  // For now, simplified: print as integer with decimal places
-  // Just call PrintInt with the integer part for now
-  // cvtsd2si x0, d0
-  EmitInstr(FCode, $1E6B0020);
+  // Load 0.0 into D1
+  WriteMovImm64(FCode, X9, 0);
+  EmitInstr(FCode, $FD000049);  // STR D0 -> need to zero D1 first
+  // FCMP D0, #0.0
+  EmitInstr(FCode, $1E202000);
+  // B.NM handle_negative (if negative)
+  // Neg block size ~60 bytes, use placeholder
+  EmitU8(FCode, $54); EmitU8(FCode, $00); EmitU8(FCode, $00); EmitU8(FCode, $04); // b.mi +8 (placeholder)
+  arg3 := FCode.Size - 4;  // position of branch instruction
   
-  // Print integer part via PrintInt stub (built into PrintStr now)
-  // For now, just return
-  // PrintFloat stub complete - need full implementation later
+  // === Negative handling ===
+  // Print '-'
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  WriteMovRegReg(FCode, X8, X0);  // Save handle
+  
+  // Write '-' character
+  WriteMovImm64(FCode, X0, UInt64($000000000000002D));  // '-'
+  EmitInstr(FCode, $F90003E0);  // STR X0, [SP]
+  WriteMovRegReg(FCode, X0, X8);
+  WriteAddImm(FCode, X1, SP, 0);
+  WriteMovImm64(FCode, X2, 1);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
+  
+  // Negate: D0 = -D0
+  EmitInstr(FCode, $FD0000A0);  // Reload D0
+  WriteMovImm64(FCode, X9, UInt64($8000000000000000));  // Sign bit mask
+  EmitInstr(FCode, $FD000049);  // STR X9 as double
+  EmitInstr(FCode, $FD000069);  // LDR D1, [SP+8]
+  // EOR V0.8B, V0.8B, V1.8B (flip sign bit)
+  EmitInstr(FCode, $4E201C00);
+  EmitInstr(FCode, $FD0000A0);  // Store negated D0
+  
+  // Patch negative branch
+  FCode.PatchU32(arg3, $54000004 or (((FCode.Size - arg3) div 4) shl 5));
+  
+  // === Positive path ===
+  // Extract integer part: fcvtzs X9, D0
+  EmitInstr(FCode, $FD0000A0);  // LDR D0
+  EmitInstr(FCode, $1E6B0129);  // FCVTZS X9, D0
+  
+  // Print integer part via itoa loop
+  // Check if zero
+  WriteCmpImm(FCode, X9, 0);
+  WriteCbz(FCode, X9, 24);  // Skip to decimal point if zero
+  
+  // Save integer value
+  WriteMovRegReg(FCode, X10, X9);
+  // Buffer at [SP+48..79], start from end
+  WriteAddImm(FCode, X11, SP, 79);
+  // Null-terminate
+  WriteMovImm64(FCode, X12, 0);
+  EmitInstr(FCode, $3800016C);  // STRB W12, [X11]
+  
+  // Divisor = 10
+  WriteMovImm64(FCode, X13, 10);
+  // Digit loop
+  WriteSubImm(FCode, X11, X11, 1);
+  WriteUdiv(FCode, X14, X10, X13);
+  WriteMsub(FCode, X12, X14, X13, X10);
+  WriteAddImm(FCode, X12, X12, Ord('0'));
+  EmitInstr(FCode, $3800016C);  // STRB W12, [X11]
+  WriteMovRegReg(FCode, X10, X14);
+  WriteCbnz(FCode, X10, -24);
+  
+  // Calculate length and print integer part
+  WriteAddImm(FCode, X2, SP, 79);
+  WriteSubRegReg(FCode, X2, X2, X11);
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  WriteMovRegReg(FCode, X8, X0);
+  WriteMovRegReg(FCode, X0, X8);
+  WriteMovRegReg(FCode, X1, X11);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
+  
+  // Print decimal point '.'
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  WriteMovRegReg(FCode, X8, X0);
+  WriteMovImm64(FCode, X0, UInt64($000000000000002E));  // '.'
+  EmitInstr(FCode, $F90003E0);
+  WriteMovRegReg(FCode, X0, X8);
+  WriteAddImm(FCode, X1, SP, 0);
+  WriteMovImm64(FCode, X2, 1);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
+  
+  // Print 6 decimal digits
+  // fractional = (value - integer_part) * 10^6
+  EmitInstr(FCode, $FD0000A0);  // LDR D0 (original/negated value)
+  WriteMovImm64(FCode, X9, 0);
+  EmitInstr(FCode, $FD000049);  // STR X9 as 0.0
+  EmitInstr(FCode, $FD000069);  // LDR D1 = 0.0
+  // FCVTZS X10, D0 (integer part)
+  EmitInstr(FCode, $1E6B014A);
+  // SCVTF D1, X10 (back to double)
+  EmitInstr(FCode, $1E620141);
+  // FSUB D2, D0, D1 (fractional part)
+  EmitInstr(FCode, $1E612802);
+  // Multiply by 1000000.0
+  WriteMovImm64(FCode, X9, UInt64($412E848000000000));  // 1000000.0
+  EmitInstr(FCode, $FD000049);
+  EmitInstr(FCode, $FD000069);  // LDR D1 = 1000000.0
+  // FMUL D2, D2, D1
+  EmitInstr(FCode, $1E612842);
+  // FCVTZS X10, D2 (6 decimal digits as integer)
+  EmitInstr(FCode, $1E6B004A);
+  
+  // Print 6 digits with leading zeros
+  // Buffer at [SP+48..53], fill from right
+  WriteAddImm(FCode, X11, SP, 54);
+  WriteMovImm64(FCode, X12, 0);
+  EmitInstr(FCode, $3800016C);  // Null-terminate
+  WriteMovImm64(FCode, X13, 10);
+  
+  // Loop 6 times
+  WriteMovImm64(FCode, X14, 6);
+  WriteSubImm(FCode, X11, X11, 1);
+  WriteUdiv(FCode, X15, X10, X13);
+  WriteMsub(FCode, X12, X15, X13, X10);
+  WriteAddImm(FCode, X12, X12, Ord('0'));
+  EmitInstr(FCode, $3800016C);
+  WriteMovRegReg(FCode, X10, X15);
+  WriteSubImm(FCode, X14, X14, 1);
+  WriteCbnz(FCode, X14, -24);
+  
+  // Print 6 decimal digits
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  WriteMovRegReg(FCode, X8, X0);
+  WriteMovRegReg(FCode, X0, X8);
+  WriteAddImm(FCode, X1, SP, 48);
+  WriteMovImm64(FCode, X2, 6);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
   
   // Epilogue
-  WriteLdpPostIndex(FCode, X29, X30, SP, 64);
+  WriteLdpPostIndex(FCode, X29, X30, SP, 96);
   WriteRet(FCode);
   
   // Println: X0 = string address
