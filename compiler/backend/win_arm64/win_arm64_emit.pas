@@ -1716,7 +1716,7 @@ begin
             else if instr.ImmStr = 'StrFindChar' then
             begin
               // StrFindChar(s, ch, start) -> int64 (index or -1)
-              // Linear search
+              // Linear search from start position
               if instr.Src1 >= 0 then
                 WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
               else
@@ -1729,15 +1729,51 @@ begin
                 WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
               else
                 WriteMovImm64(FCode, X2, 0);
-              // Add start offset to string pointer
+              
+              // X0 = string, X1 = char, X2 = start index
+              // X3 = current position (X0 + X2)
               WriteAddReg(FCode, X3, X0, X2);
+              // X4 = current index = X2
+              WriteMovRegReg(FCode, X4, X2);
+              
               // Search loop
-              WriteMovImm64(FCode, X4, 0);  // found = false
-              WriteMovRegReg(FCode, X5, X2); // current index
-              // Loop: LDRB W6, [X3], CBZ -> found
-              // Simplified: call lstrlenA first to get length, then loop
-              // For now: return -1 (not found)
+              var searchLoop := FCode.Size;
+              // LDRB W5, [X3] - load current byte
+              EmitInstr(FCode, $39400065);
+              // CBZ W5, not_found (end of string)
+              var cbzPos := FCode.Size;
+              EmitInstr(FCode, $34000005);  // placeholder
+              // CMP W5, W1 - compare with search char
+              EmitInstr(FCode, $6B0100BF);
+              // B.EQ found
+              var beqPos := FCode.Size;
+              EmitInstr(FCode, $54000000);  // placeholder
+              
+              // X3++, X4++
+              WriteAddImm(FCode, X3, X3, 1);
+              WriteAddImm(FCode, X4, X4, 1);
+              // b search_loop
+              WriteBranch(FCode, (searchLoop - FCode.Size) div 4);
+              
+              // found: X0 = X4
+              var foundPos := FCode.Size;
+              WriteMovRegReg(FCode, X0, X4);
+              var skipNotFound := FCode.Size;
+              WriteBranch(FCode, 0);  // b done
+              
+              // not_found: X0 = -1
+              var notFoundPos := FCode.Size;
               WriteMovImm64(FCode, X0, UInt64(-1));
+              
+              // done:
+              var donePos := FCode.Size;
+              // Patch CBZ
+              FCode.PatchU32(cbzPos, $34000005 or (((notFoundPos - cbzPos) div 4) shl 5));
+              // Patch BEQ
+              FCode.PatchU32(beqPos, $54000000 or (((foundPos - beqPos) div 4) shl 5));
+              // Patch skip
+              FCode.PatchU32(skipNotFound, $14000000 or (((donePos - skipNotFound) div 4)));
+              
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
