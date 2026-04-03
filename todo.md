@@ -69,18 +69,12 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 ### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
 
-**Implementiert ✅:** exit (ExitProcess), PrintStr (OutputDebugStringA), PrintInt (__builtin_PrintInt mit itoa-Loop + WriteFile), PrintFloat (__builtin_PrintFloat mit FCVTZS/FSUB/FMUL, 6 Dezimalstellen), Println (__builtin_Println mit CRLF via WriteFile), printf (Stub), open (CreateFileA), read (ReadFile), write (WriteFile), close (CloseHandle), lseek (SetFilePointerEx), unlink (DeleteFileA), mkdir (CreateDirectoryA), rmdir (RemoveDirectoryA), chmod (SetFileAttributesA), rename (MoveFileA), StrLen (lstrlenA), StrCharAt (LDRB), StrSetChar (STRB), StrNew (VirtualAlloc), StrFree (VirtualFree), StrFromInt (itoa-Loop + VirtualAlloc), StrAppend (Stub), StrFindChar (Stub), StrSub (VirtualAlloc Stub), StrConcat (VirtualAlloc Stub), StrCopy (lstrlenA + VirtualAlloc Stub), FileGetSize (Stub), StrStartsWith (Stub), StrEndsWith (Stub), StrEquals (lstrcmpA), GetArgC (Stub), GetArg (Stub), Random (Stub), RandomSeed (Stub), mmap (VirtualAlloc), munmap (VirtualFree), getpid (GetCurrentProcessId), ioctl (Stub), peek8/16/32/64 (LDRB/LDRH/LDR/LDRX), poke8/16/32/64 (STRB/STRH/STR/STRX), sleep_ms (Sleep), now_unix (GetSystemTimeAsFileTime Stub), now_unix_ms (GetTickCount64), GetLastError, alle Socket builtins (Stubs)
+**Implementiert ✅:** exit (ExitProcess), PrintStr (OutputDebugStringA), PrintInt (__builtin_PrintInt mit itoa-Loop + WriteFile), PrintFloat (__builtin_PrintFloat mit FCVTZS/FSUB/FMUL, 6 Dezimalstellen), Println (__builtin_Println mit CRLF via WriteFile), printf (Stub), open (CreateFileA), read (ReadFile), write (WriteFile), close (CloseHandle), lseek (SetFilePointerEx), unlink (DeleteFileA), mkdir (CreateDirectoryA), rmdir (RemoveDirectoryA), chmod (SetFileAttributesA), rename (MoveFileA), StrLen (lstrlenA), StrCharAt (LDRB), StrSetChar (STRB), StrNew (VirtualAlloc), StrFree (VirtualFree), StrFromInt (itoa-Loop + VirtualAlloc), StrAppend (Stub), StrFindChar (Linear Search), StrSub (VirtualAlloc Stub), StrConcat (VirtualAlloc Stub), StrCopy (lstrlenA + VirtualAlloc Stub), FileGetSize (CreateFileA + GetFileSizeEx + CloseHandle), StrStartsWith (Byte-Vergleich), StrEndsWith (Längen-Vergleich von hinten), StrEquals (lstrcmpA), GetArgC (GetCommandLineA + State Machine), GetArg (GetCommandLineA + Index-Suche), Random (LCG: seed * 1103515245 + 12345), RandomSeed (Global Seed), mmap (VirtualAlloc), munmap (VirtualFree), getpid (GetCurrentProcessId), ioctl (Stub), peek8/16/32/64 (LDRB/LDRH/LDR/LDRX), poke8/16/32/64 (STRB/STRH/STR/STRX), sleep_ms (Sleep), now_unix (GetSystemTimeAsFileTime + FILETIME→Unix), now_unix_ms (GetTickCount64), GetLastError, Socket: sys_socket, sys_bind, sys_listen, sys_accept, sys_connect, sys_recvfrom, sys_sendto, sys_setsockopt, sys_getsockopt, sys_shutdown, sys_closesocket, WSAStartup (alle via WinSock2/ws2_32.dll)
 
 **Fehlt ❌ – Vollständige Implementierungen:**
 - [ ] `printf` – Format-String Parsing via wsprintfA
-- [ ] `Random` / `RandomSeed` – via BCryptGenRandom oder RtlGenRandom
-- [ ] `GetArgC` / `GetArg` – via GetCommandLineW + CommandLineToArgvW
-- [ ] Socket-Builtins – via WinSock2 (ws2_32.dll)
+- [ ] `StrSub` / `StrConcat` / `StrCopy` – Vollständige String-Operationen mit memcpy
 - [ ] `Inspect` (Debug-Visualizer)
-- [ ] `now_unix` – vollständige FILETIME → Unix-Timestamp Konvertierung
-- [ ] `StrFindChar` – Linear Search mit lstrlenA
-- [ ] `StrSub` / `StrConcat` / `StrCopy` – Vollständige String-Operationen
-- [ ] `FileGetSize` – via GetFileSizeEx
 
 **Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
 Der PE64-Writer (`compiler/backend/win_arm64/pe64_arm64_writer.pas`) existiert bereits.
