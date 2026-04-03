@@ -1344,6 +1344,9 @@ var
   // Comparison result
   cond: Byte;
   
+  // Map/Set loop patching
+  loopStartPos, jgePos, jneLoopPos, jmpDonePos, nextLabelPos, notFoundPos, doneLabelPos: Integer;
+  
   // For address calculation
   dataVA, codeVA, instrVA: UInt64;
   
@@ -2201,6 +2204,327 @@ begin
               WriteAddRegReg(FCode, X1, X0, X1);
               // Store from X2 to address in X1 (simplified)
               WriteStrImm(FCode, X2, X1, 0);
+            end;
+
+          // === Bit Operations (TOR-011) ===
+          irXor:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteEorRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irNor:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteOrrRegReg(FCode, X0, X0, X1);
+              WriteMovImm64(FCode, X1, UInt64($FFFFFFFFFFFFFFFF)); WriteEorRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irBitAnd:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteAndRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irBitOr:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteOrrRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irBitXor:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteEorRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irBitNot:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteMovImm64(FCode, X1, UInt64($FFFFFFFFFFFFFFFF)); WriteEorRegReg(FCode, X0, X0, X1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irShl:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              // LSL Xd, Xn, Xm: 11010011 rm 000110 rn rd
+              EmitInstr(FCode, $DACA0000 or (DWord(Byte(X1)) shl 16) or (DWord(Byte(X0)) shl 5) or Byte(X0));
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irShr:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              // LSR Xd, Xn, Xm: 11010011 rm 001110 rn rd
+              EmitInstr(FCode, $DAC80000 or (DWord(Byte(X1)) shl 16) or (DWord(Byte(X0)) shl 5) or Byte(X0));
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Type Cast (TOR-011) ===
+          irCast:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === VarCall (TOR-011) ===
+          irVarCall:
+            begin
+              // Virtual call via VMT
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // object ptr
+              // Load VMT pointer from object
+              WriteLdrImm(FCode, X0, X0, 0);
+              // Load method pointer from VMT[VMTIndex]
+              WriteLdrImm(FCode, X0, X0, instr.VMTIndex * 8);
+              // Call via register
+              WriteBlr(FCode, X0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
+          // === Closure Support (TOR-011) ===
+          irLoadCaptured:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X0, X0, instr.ImmInt);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Memory Pool (TOR-011) ===
+          irPoolAlloc:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              // mmap anonymous
+              WriteMovImm64(FCode, X0, 0);  // addr = NULL
+              WriteMovImm64(FCode, X1, instr.ImmInt); // length
+              WriteMovImm64(FCode, X2, $22);  // MAP_PRIVATE | MAP_ANONYMOUS
+              WriteMovImm64(FCode, X3, -1);  // fd = -1
+              WriteMovImm64(FCode, X4, 0);   // offset
+              WriteMovImm64(FCode, X8, SYS_mmap);
+              WriteSvc(FCode, 0);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irPoolFree:
+            begin
+              // munmap
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteMovImm64(FCode, X1, 4096);
+              WriteMovImm64(FCode, X8, SYS_munmap);
+              WriteSvc(FCode, 0);
+            end;
+
+          // === Exception Handling (TOR-011) ===
+          irPushHandler, irPopHandler, irLoadHandlerExn, irThrow:
+            begin
+              // Stub: Linux signal-based exception handling not yet implemented
+              if instr.Dest >= 0 then
+              begin
+                WriteMovImm64(FCode, X0, 0);
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end;
+            end;
+
+          // === Map/Set Operations (TOR-011) ===
+          // Map structure: [len:8][cap:8][entries:16*cap], Entry: [key:8][value:8]
+          irMapNew, irSetNew:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              // mmap 144 bytes
+              WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X1, 144);
+              WriteMovImm64(FCode, X2, $22);
+              WriteMovImm64(FCode, X3, -1);
+              WriteMovImm64(FCode, X4, 0);
+              WriteMovImm64(FCode, X8, SYS_mmap);
+              WriteSvc(FCode, 0);
+              // Initialize len=0, cap=8
+              WriteMovImm64(FCode, X1, 0);
+              WriteStrImm(FCode, X1, X0, 0);   // len = 0
+              WriteMovImm64(FCode, X1, 8);
+              WriteStrImm(FCode, X1, X0, 8);   // cap = 8
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irMapSet:
+            begin
+              // map_set(map, key, value) - linear search, update or append
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // map
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2)); // key
+              WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3)); // value
+              // X3 = len, X4 = 0 (counter), X5 = map+16 (first entry)
+              WriteLdrImm(FCode, X3, X0, 0);
+              WriteMovImm64(FCode, X4, 0);
+              WriteAddImm(FCode, X5, X0, 16);
+              loopStartPos := FCode.Size;
+              WriteCmpReg(FCode, X4, X3);
+              WriteBCond(FCode, COND_GE, 0); // b.ge notFound
+              jgePos := FCode.Size;
+              WriteLdrImm(FCode, X6, X5, 0);  // entry key
+              WriteCmpReg(FCode, X6, X1);
+              WriteBCond(FCode, COND_NE, 0); // b.ne nextEntry
+              jneLoopPos := FCode.Size;
+              // Found: update value
+              WriteStrImm(FCode, X2, X5, 8);
+              WriteB(FCode, 0); // b done
+              jmpDonePos := FCode.Size;
+              nextLabelPos := FCode.Size;
+              WriteAddImm(FCode, X5, X5, 16);
+              WriteAddImm(FCode, X4, X4, 1);
+              WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+              notFoundPos := FCode.Size;
+              // Append: store at map+16+len*16
+              WriteLslImm(FCode, X6, X3, 4);
+              WriteAddRegReg(FCode, X7, X0, X6);
+              WriteAddImm(FCode, X7, X7, 16);
+              WriteStrImm(FCode, X1, X7, 0);  // key
+              WriteStrImm(FCode, X2, X7, 8);  // value
+              // len++
+              WriteLdrImm(FCode, X6, X0, 0);
+              WriteAddImm(FCode, X6, X6, 1);
+              WriteStrImm(FCode, X6, X0, 0);
+              doneLabelPos := FCode.Size;
+              FCode.PatchU32LE(jgePos, $54000000 or (UInt32((notFoundPos - jgePos) div 4) shl 5) or $0A);
+              FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+              FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+            end;
+
+          irSetAdd:
+            begin
+              // set_add(set, value) - append at end
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // set
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2)); // value
+              WriteLdrImm(FCode, X2, X0, 0);  // len
+              WriteLslImm(FCode, X3, X2, 4);
+              WriteAddImm(FCode, X3, X3, 16);
+              WriteAddRegReg(FCode, X3, X0, X3);
+              WriteStrImm(FCode, X1, X3, 0);  // store value
+              // len++
+              WriteAddImm(FCode, X2, X2, 1);
+              WriteStrImm(FCode, X2, X0, 0);
+            end;
+
+          irMapGet:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1)); // map
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2)); // key
+              WriteLdrImm(FCode, X3, X0, 0);  // len
+              WriteMovImm64(FCode, X4, 0);
+              WriteAddImm(FCode, X5, X0, 16);
+              loopStartPos := FCode.Size;
+              WriteCmpReg(FCode, X4, X3);
+              WriteBCond(FCode, COND_GE, 0);
+              jgePos := FCode.Size;
+              WriteLdrImm(FCode, X6, X5, 0);
+              WriteCmpReg(FCode, X6, X1);
+              WriteBCond(FCode, COND_NE, 0);
+              jneLoopPos := FCode.Size;
+              WriteLdrImm(FCode, X0, X5, 8);  // value
+              WriteB(FCode, 0);
+              jmpDonePos := FCode.Size;
+              nextLabelPos := FCode.Size;
+              WriteAddImm(FCode, X5, X5, 16);
+              WriteAddImm(FCode, X4, X4, 1);
+              WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+              doneLabelPos := FCode.Size;
+              FCode.PatchU32LE(jgePos, $54000000 or (UInt32((doneLabelPos - jgePos) div 4) shl 5) or $0A);
+              FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+              FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irMapContains, irSetContains:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+              WriteLdrImm(FCode, X3, X0, 0);
+              WriteMovImm64(FCode, X4, 0);
+              WriteAddImm(FCode, X5, X0, 16);
+              loopStartPos := FCode.Size;
+              WriteCmpReg(FCode, X4, X3);
+              WriteBCond(FCode, COND_GE, 0);
+              jgePos := FCode.Size;
+              WriteLdrImm(FCode, X6, X5, 0);
+              WriteCmpReg(FCode, X6, X1);
+              WriteBCond(FCode, COND_NE, 0);
+              jneLoopPos := FCode.Size;
+              WriteMovImm64(FCode, X0, 1);
+              WriteB(FCode, 0);
+              jmpDonePos := FCode.Size;
+              nextLabelPos := FCode.Size;
+              WriteAddImm(FCode, X5, X5, 16);
+              WriteAddImm(FCode, X4, X4, 1);
+              WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+              doneLabelPos := FCode.Size;
+              FCode.PatchU32LE(jgePos, $54000000 or (UInt32((doneLabelPos - jgePos) div 4) shl 5) or $0A);
+              FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+              FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irMapLen, irSetLen:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteLdrImm(FCode, X0, X0, 0);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          irMapRemove, irSetRemove, irMapFree, irSetFree:
+            begin
+              // munmap
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              WriteMovImm64(FCode, X1, 144);
+              WriteMovImm64(FCode, X8, SYS_munmap);
+              WriteSvc(FCode, 0);
+            end;
+
+          // === Type Checking (TOR-011) ===
+          irIsType:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              // Load VMT pointer
+              WriteLdrImm(FCode, X0, X0, 0);
+              // Stub: return true
+              WriteMovImm64(FCode, X0, 1);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Debug Inspect (TOR-011) ===
+          irInspect:
+            begin
+              // Stub: write "inspect: <name>" to stderr
+              WriteMovImm64(FCode, X0, 2);  // stderr
+              WriteMovImm64(FCode, X1, 0);  // placeholder string
+              WriteMovImm64(FCode, X2, Length(instr.ImmStr));
+              WriteMovImm64(FCode, X8, SYS_write);
+              WriteSvc(FCode, 0);
             end;
           
         irCallBuiltin:
