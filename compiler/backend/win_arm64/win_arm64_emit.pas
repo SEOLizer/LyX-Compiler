@@ -1701,7 +1701,7 @@ begin
         irCallBuiltin:
           begin
             // Handle specific builtins directly
-            if instr.ImmStr = 'exit' then
+            if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = 'exit' then
             begin
               // exit(code: int64) -> never returns
               // Load code into X0
