@@ -18,9 +18,9 @@ Luftfahrtstandards genügt.
 
 Der Compiler selbst muss als **Development Tool** qualifiziert werden.
 
-- [ ] **TQL-5 Einstufung**: Lyx als TQL-5 Tool (kann Fehler in Zielcode einführen)
-- [ ] **Tool Operational Requirements (TOR)**: Spezifikation der Compiler-Funktionen
-- [ ] **Tool Validation**: Nachweis, dass Lyx die TOR erfüllt
+- [x] **TQL-5 Einstufung**: Lyx als TQL-5 Tool (kann Fehler in Zielcode einführen)
+- [x] **Tool Operational Requirements (TOR)**: Spezifikation der Compiler-Funktionen → `tor_lyx.md`
+- [x] **Tool Validation**: Nachweis, dass Lyx die TOR erfüllt → `test_tor_validation.pas` (23/23 Tests)
 - [ ] **Tool Verification**: Verifikation des Compilers selbst (Bootstrapping + Tests)
 - [ ] **Configuration Management**: Versionierung aller Compiler-Komponenten
 - [ ] **Quality Assurance**: Unabhängige Review-Prozesse für Compiler-Änderungen
@@ -30,16 +30,16 @@ Der Compiler selbst muss als **Development Tool** qualifiziert werden.
 - [ ] **Formale Spezifikation** der Lyx-Semantik (Coq/Isabelle)
 - [ ] **Proof of Correctness**: AST → IR → Maschinencode Transformation beweisen
 - [ ] **CompCert-Ansatz**: Jede IR-Transformationsstufe formal verifizieren
-- [ ] **Reference Interpreter**: Lyx-Programm semantics in Coq definieren
+- [x] **Reference Interpreter**: Lyx-Programm-Semantik als Referenz-Implementierung → `test_reference_interpreter.pas` (22/22 Tests)
 - [ ] **Bisimulation**: Beweis, dass generierter Code die gleiche Semantik hat
 
 ### 1.3 Deterministischer Codegen
 
-- [ ] **Keine nicht-deterministischen Optimierungen**: Keine Hash-basierten Orderings
-- [ ] **Reproduzierbare Builds**: Gleicher Input → immer gleicher Output (Byte-für-Byte)
-- [ ] **Keine zeitabhängigen Entscheidungen**: Kein Timestamp, keine Random-Werte im Codegen
-- [ ] **Feste Register-Allokierung**: Deterministische Register-Zuweisung
-- [ ] **Feste Stack-Layout-Berechnung**: Vorhersagbare Stack-Nutzung
+- [x] **Keine nicht-deterministischen Optimierungen**: Keine Hash-basierten Orderings
+- [x] **Reproduzierbare Builds**: Gleicher Input → immer gleicher Output (Byte-für-Byte) → `test_determinism.pas` (18/18 Tests)
+- [x] **Keine zeitabhängigen Entscheidungen**: Kein Timestamp, keine Random-Werte im Codegen
+- [x] **Feste Register-Allokierung**: Deterministische Register-Zuweisung
+- [x] **Feste Stack-Layout-Berechnung**: Vorhersagbare Stack-Nutzung
 
 ---
 
