@@ -625,6 +625,31 @@ begin
   FFuncOffsets[High(FFuncOffsets)].Name := '_start';
   FFuncOffsets[High(FFuncOffsets)].Offset := FCodeBuffer.Size;
   
+  // === Safety Initialization (aerospace-todo 3.1) ===
+  // 1. Initialize watchdog with default timeout
+  EmitMovI128(xrA2, WDT_TIMEOUT_MS_DEFAULT);
+  EmitMovI128(xrA7, SYS_WATCHDOG_INIT);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($05);
+  
+  // 2. Configure stack MPU region (no exec)
+  EmitMovI128(xrA2, MPU_REGION_STACK);
+  EmitMovI128(xrA3, 0);  // Will be patched with actual stack addr
+  EmitMovI128(xrA4, 0);  // Stack size
+  EmitMovI128(xrA5, MPU_ACCESS_RW);
+  EmitMovI128(xrA7, SYS_MPU_CONFIG);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($05);
+  
+  // 3. Configure brownout detection
+  EmitMovI128(xrA2, BROWNOUT_THRESHOLD_DEFAULT);
+  EmitMovI128(xrA7, SYS_BROWNOUT_CONFIG);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($00);
+  FCodeBuffer.WriteU8($05);
+  
   // Call main
   EmitCall(0);  // Will be patched
   SetLength(FCallPatches, Length(FCallPatches) + 1);
@@ -1497,6 +1522,136 @@ begin
                 // sys_shutdown(fd, how) -> int64
                 // Stub: return -1
                 EmitMovI128(xrA2, -1);
+                if instr.Dest >= 0 then
+                  EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              // === ESP32 Safety Features (aerospace-todo 3.1) ===
+              else if instr.ImmStr = 'watchdog_feed' then
+              begin
+                // watchdog_feed() -> void
+                // SYS_WATCHDOG_FEED = 2000
+                EmitMovI128(xrA7, SYS_WATCHDOG_FEED);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);  // syscall
+              end
+              else if instr.ImmStr = 'watchdog_init' then
+              begin
+                // watchdog_init(timeout_ms) -> void
+                // X2 = timeout_ms
+                if instr.Src1 >= 0 then
+                  EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1))
+                else
+                  EmitMovI128(xrA2, WDT_TIMEOUT_MS_DEFAULT);
+                EmitMovI128(xrA7, SYS_WATCHDOG_INIT);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+              end
+              else if instr.ImmStr = 'brownout_check' then
+              begin
+                // brownout_check() -> int64 (voltage in mV, or 0 if brownout)
+                EmitMovI128(xrA7, SYS_BROWNOUT_CHECK);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+                if instr.Dest >= 0 then
+                  EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else if instr.ImmStr = 'brownout_config' then
+              begin
+                // brownout_config(threshold_mV) -> void
+                if instr.Src1 >= 0 then
+                  EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1))
+                else
+                  EmitMovI128(xrA2, BROWNOUT_THRESHOLD_DEFAULT);
+                EmitMovI128(xrA7, SYS_BROWNOUT_CONFIG);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+              end
+              else if instr.ImmStr = 'flash_verify' then
+              begin
+                // flash_verify(offset, size) -> int64 (CRC32, or -1 on error)
+                if instr.Src1 >= 0 then
+                  EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1))
+                else
+                  EmitMovI128(xrA2, FLASH_APP_OFFSET);
+                if instr.Src2 >= 0 then
+                  EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2))
+                else
+                  EmitMovI128(xrA3, FLASH_PARTITION_SIZE);
+                EmitMovI128(xrA7, SYS_FLASH_VERIFY);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+                if instr.Dest >= 0 then
+                  EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else if instr.ImmStr = 'secure_boot' then
+              begin
+                // secure_boot() -> int64 (0 = OK, -1 = fail)
+                EmitMovI128(xrA7, SYS_SECURE_BOOT);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+                if instr.Dest >= 0 then
+                  EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else if instr.ImmStr = 'mpu_config' then
+              begin
+                // mpu_config(region, addr, size, access) -> void
+                if instr.Src1 >= 0 then
+                  EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1))
+                else
+                  EmitMovI128(xrA2, MPU_REGION_STACK);
+                if instr.Src2 >= 0 then
+                  EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2))
+                else
+                  EmitMovI128(xrA3, 0);
+                if instr.Src3 >= 0 then
+                  EmitL32I(xrA4, xrA1, frameSize + SlotOffset(localCnt + instr.Src3))
+                else
+                  EmitMovI128(xrA4, 0);
+                EmitMovI128(xrA5, MPU_ACCESS_RW);
+                EmitMovI128(xrA7, SYS_MPU_CONFIG);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+              end
+              else if instr.ImmStr = 'cache_flush' then
+              begin
+                // cache_flush() -> void
+                EmitMovI128(xrA7, SYS_CACHE_FLUSH);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+              end
+              else if instr.ImmStr = 'stack_canary' then
+              begin
+                // stack_canary() -> int64 (0 = OK, -1 = overflow detected)
+                EmitMovI128(xrA7, SYS_STACK_CANARY);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+                if instr.Dest >= 0 then
+                  EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else if instr.ImmStr = 'wdt_reset' then
+              begin
+                // wdt_reset() -> never returns
+                EmitMovI128(xrA7, SYS_WDT_RESET);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
+              end
+              else if instr.ImmStr = 'coredump_save' then
+              begin
+                // coredump_save() -> int64 (0 = OK, -1 = fail)
+                EmitMovI128(xrA7, SYS_COREDUMP_SAVE);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($00);
+                FCodeBuffer.WriteU8($05);
                 if instr.Dest >= 0 then
                   EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
               end
