@@ -109,12 +109,12 @@ shared var altitude: Altitude protected by mutex;
 
 ### 3.1 ESP32 / Xtensa
 
-- [ ] **Watchdog-Integration**: Automatischer Watchdog-Reset im Entry-Code
-- [ ] **Brownout-Detection**: Spannungseinbruch-Erkennung
-- [ ] **Flash-Sicherheit**: Code-Integritätsprüfung beim Laden
-- [ ] **Secure Boot**: Signierte Firmware-Verifikation
-- [ ] **Memory Protection Unit (MPU)**: Stack/Heap-Trennung
-- [ ] **Cache-Kohärenz**: Explizite Cache-Flushes für DMA
+- [x] **Watchdog-Integration**: Automatischer Watchdog-Reset im Entry-Code → `watchdog_init()`, `watchdog_feed()`, `wdt_reset()` + Init im `_start`
+- [x] **Brownout-Detection**: Spannungseinbruch-Erkennung → `brownout_check()`, `brownout_config()` + Init im `_start` (2.8V Default)
+- [x] **Flash-Sicherheit**: Code-Integritätsprüfung beim Laden → `flash_verify()` (CRC32), `secure_boot()`
+- [x] **Secure Boot**: Signierte Firmware-Verifikation → `secure_boot()` builtin
+- [x] **Memory Protection Unit (MPU)**: Stack/Heap-Trennung → `mpu_config(region, addr, size, access)`, 5 Regionen definiert
+- [x] **Cache-Kohärenz**: Explizite Cache-Flushes für DMA → `cache_flush()` builtin
 
 ### 3.2 ARM Cortex-M
 
@@ -322,10 +322,10 @@ fn flight_control_loop() {
 
 ### 10.3 Backend
 
-- [ ] Watchdog-Integration (ESP32, ARM, RISC-V)
-- [ ] MPU/PMP-Konfigurations-Generierung
+- [x] Watchdog-Integration (ESP32 ✅, ARM, RISC-V)
+- [x] MPU/PMP-Konfigurations-Generierung (ESP32 ✅)
 - [ ] Fault-Handler-Generierung
-- [ ] Stack-Canary-Insertion
+- [x] Stack-Canary-Insertion (ESP32 ✅)
 - [ ] Assembly-Listing mit Source-Annotation
 - [ ] Deterministische Register-Allokierung
 
