@@ -2255,12 +2255,33 @@ begin
             end
             else if instr.ImmStr = 'now_unix' then
             begin
-              // now_unix() -> int64
+              // now_unix() -> int64 (seconds since 1970-01-01 00:00:00 UTC)
               // Use GetSystemTimeAsFileTime Windows API
+              // FILETIME is 100-nanosecond intervals since 1601-01-01
+              // Unix epoch offset: 11644473600 seconds = 116444736000000000 * 100ns
+              
+              // Allocate 8 bytes on stack for FILETIME
+              WriteSubImm(FCode, SP, SP, 16);
+              WriteMovRegReg(FCode, X0, SP);
               SetLength(FCallPatches, Length(FCallPatches) + 1);
               FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
               FCallPatches[High(FCallPatches)].TargetName := 'GetSystemTimeAsFileTime';
               WriteBranchLink(FCode, 0);
+              
+              // Load FILETIME value (64-bit)
+              WriteLdrImm(FCode, X0, SP, 0);
+              
+              // Subtract Unix epoch offset: 116444736000000000 (0x19DB1DED53E8000)
+              WriteMovImm64(FCode, X1, UInt64($19DB1DED53E8000));
+              WriteSubRegReg(FCode, X0, X0, X1);
+              
+              // Divide by 10000000 to convert 100ns intervals to seconds
+              WriteMovImm64(FCode, X1, 10000000);
+              WriteUdiv(FCode, X0, X0, X1);
+              
+              // Restore stack
+              WriteAddImm(FCode, SP, SP, 16);
+              
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
