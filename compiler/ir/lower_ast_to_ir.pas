@@ -2315,6 +2315,22 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             Emit(instr);
             Result := t0;
           end
+          // write_raw(fd, buf, len) -> int64
+          else if call.Name = 'write_raw' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'write_raw';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
           // Buffer/primitive calls
           else if call.Name = 'buf_put_byte' then
         begin
