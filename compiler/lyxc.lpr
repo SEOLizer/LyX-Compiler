@@ -10,11 +10,12 @@ uses
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer,
   macosx64_emit, macho64_writer,
-  xtensa_emit, elf32_writer;
+  xtensa_emit, elf32_writer,
+  riscv_emit, elf64_riscv_writer;
 
 type
-  TTarget = (targetLinux, targetWindows, targetLinuxARM64, targetMacOSX64, targetMacOSARM64, targetESP32);
-  TArchitecture = (archX86_64, archARM64, archXtensa);
+  TTarget = (targetLinux, targetWindows, targetLinuxARM64, targetMacOSX64, targetMacOSARM64, targetESP32, targetRISCV);
+  TArchitecture = (archX86_64, archARM64, archXtensa, archRISCV);
 
 var
   inputFile: string;
@@ -47,6 +48,7 @@ var
   arm64Emit: TARM64Emitter;
   macosx64Emit: TMacOSX64Emitter;
   esp32Emit: ICodeEmitter;
+  riscvEmit: TRISCVCodeEmitter;
   codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64;
   basePath: string;
@@ -292,10 +294,12 @@ begin
     WriteLn('  - macosx64 / darwin   (macOS x86_64, Mach-O)');
     WriteLn('  - macos-arm64         (macOS ARM64, Mach-O)');
     WriteLn('  - esp32 / xtensa      (ESP32, ELF32)');
+    WriteLn('  - riscv / riscv64     (RISC-V RV64GC, ELF64)');
     WriteLn('Supported Architectures:');
     WriteLn('  - x86_64');
     WriteLn('  - arm64 / aarch64');
     WriteLn('  - xtensa');
+    WriteLn('  - riscv / riscv64');
     WriteLn('IR Features:');
     WriteLn('  - Constant Folding, CSE, DCE');
     WriteLn('  - Function Inlining');
@@ -314,8 +318,8 @@ begin
     WriteLn(StdErr, '  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)');
     WriteLn(StdErr, '  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)');
     WriteLn(StdErr, '  --std-path=PATH  Pfad zur Standardbibliothek überschreiben');
-    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)');
-    WriteLn(StdErr, '  --arch=ARCH      Architektur (x86_64, arm64, xtensa)');
+    WriteLn(StdErr, '  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32, riscv)');
+    WriteLn(StdErr, '  --arch=ARCH      Architektur (x86_64, arm64, xtensa, riscv)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
@@ -383,17 +387,22 @@ begin
          target := targetMacOSARM64;
          arch := archARM64;
        end
-       else if (param = 'esp32') or (param = 'xtensa') then
-       begin
-         target := targetESP32;
-         arch := archXtensa;
-       end
-       else
-       begin
-         WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
-         WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64, macosx64, macos-arm64, esp32');
-         Halt(1);
-       end;
+        else if (param = 'esp32') or (param = 'xtensa') then
+        begin
+          target := targetESP32;
+          arch := archXtensa;
+        end
+        else if (param = 'riscv') or (param = 'riscv64') or (param = 'rv64') then
+        begin
+          target := targetRISCV;
+          arch := archRISCV;
+        end
+        else
+        begin
+          WriteLn(StdErr, 'Unbekanntes Ziel: ', param);
+          WriteLn(StdErr, 'Gültige Werte: win64, linux, arm64, macosx64, macos-arm64, esp32, riscv');
+          Halt(1);
+        end;
        Inc(i);
      end
      else if Copy(param, 1, 6) = '--arch=' then
@@ -403,14 +412,16 @@ begin
          arch := archX86_64
        else if (param = 'arm64') or (param = 'aarch64') then
          arch := archARM64
-       else if (param = 'xtensa') then
-         arch := archXtensa
-       else
-       begin
-         WriteLn(StdErr, 'Unbekannte Architektur: ', param);
-         WriteLn(StdErr, 'Gültige Werte: x86_64, arm64, xtensa');
-         Halt(1);
-       end;
+        else if (param = 'xtensa') then
+          arch := archXtensa
+        else if (param = 'riscv') or (param = 'riscv64') or (param = 'rv64') then
+          arch := archRISCV
+        else
+        begin
+          WriteLn(StdErr, 'Unbekannte Architektur: ', param);
+          WriteLn(StdErr, 'Gültige Werte: x86_64, arm64, xtensa, riscv');
+          Halt(1);
+        end;
        Inc(i);
      end
     else if param = '--emit-asm' then
@@ -868,6 +879,35 @@ begin
                 WriteLn('Wrote ', outputFile);
                finally
                  // esp32Emit is interface reference, automatically freed
+               end;
+             end
+             else if target = targetRISCV then
+             begin
+               // RISC-V RV64GC Code Generation
+               riscvEmit := TRISCVCodeEmitter.Create;
+               try
+                 if flagEnergyLevel > 0 then
+                   riscvEmit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
+
+                 riscvEmit.EmitFromIR(module);
+                 codeBuf := riscvEmit.GetCodeBuffer;
+                 dataBuf := riscvEmit.GetDataBuffer;
+                 entryVA := $400000 + 4096;
+
+                 externSymbols := riscvEmit.GetExternalSymbols;
+                 if Length(externSymbols) > 0 then
+                 begin
+                   WriteLn('Note: RISC-V dynamic linking not yet implemented');
+                   WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
+                 end;
+
+                 WriteLn('Generating static ELF64 for RISC-V RV64GC');
+                 WriteElf64RISCV(outputFile, codeBuf, dataBuf, entryVA);
+
+                 FpChmod(PChar(outputFile), 493);
+                 WriteLn('Wrote ', outputFile, ' (ELF64 for RISC-V RV64GC)');
+               finally
+                 riscvEmit.Free;
                end;
              end;
           finally
