@@ -42,7 +42,7 @@ IntLiteral    := DecimalLiteral | HexLiteral | BinaryLiteral | OctalLiteral ;
 DecimalLiteral := [0-9] { [0-9_] } ;
 HexLiteral     := ( '0x' | '0X' | '$' ) [0-9a-fA-F_] { [0-9a-fA-F_] } ;
 BinaryLiteral  := ( '0b' | '0B' | '%' ) [01_] { [01_] } ;
-OctalLiteral   := ( '0o' | '0o' | '&' ) [0-7_] { [0-7_] } ;
+OctalLiteral   := ( '0o' | '&' ) [0-7_] { [0-7_] } ;
 ```
 
 Unterstriche (`_`) können als Trenner zur Lesbarkeit verwendet werden.
@@ -154,7 +154,7 @@ fn high_performance(): int64 {
 * `void`   (nur als Funktionsrückgabetyp)
 * `pchar`  (Pointer, 64-bit; non-nullable, Standard für Stringliterale)
 * `pchar?` (Nullable Pointer, kann `null` sein)
-* `array`  (Array-Typ für Stack-allokierte Arrays)
+* `array`  (Dynamic Array mit Fat-Pointer: ptr/len/cap, heap-allokiert)
 * `parallel Array<T>` (SIMD-optimiertes, heap-allokiertes Array mit Element-Typ T; ✅ v0.2.2)
 * `Map<K, V>` (Hash-Map mit Key-Typ K und Value-Typ V; v0.5.0)
 * `Set<T>` (Hash-Set mit Element-Typ T; v0.5.0)
@@ -350,6 +350,46 @@ var ids: Set<int64> := {10, 20, 30};
 - `keys()` / `values()` — Iteratoren
 - `for key, value in map` — Iteration
 - Hash-basierter O(1) Lookup mit FNV-1a
+
+### Dynamic Arrays (v0.5.6 ✅ ABGESCHLOSSEN)
+
+Dynamic Arrays sind heap-allokierte Arrays mit Fat-Pointer (ptr/len/cap):
+
+| Operation | Syntax | Beschreibung |
+|-----------|--------|--------------|
+| Create | `var a: array := [];` | Leeres Array erstellen |
+| Create with literal | `var a: array := [1, 2, 3];` | Array mit Initialwerten |
+| Push | `push(a, value)` | Element am Ende hinzufügen |
+| Length | `len(a)` | Anzahl Elemente |
+| Pop | `pop(a)` | Letztes Element entfernen und zurückgeben |
+| Index | `a[i]` | Element lesen/schreiben |
+| Free | `free(a)` | Speicher freigeben |
+
+**Speichermodell:**
+- Fat-Pointer (3 × 8 bytes): `[ptr:8][len:8][cap:8]`
+- ptr zeigt auf heap-allokierten Speicher (via mmap)
+- Automatisches Resizing bei `push` wenn Kapazität erreicht
+
+**IR-Opcodes:**
+- `irDynArrayPush`, `irDynArrayLen`, `irDynArrayPop`, `irDynArrayFree`
+
+**Beispiele:**
+```lyx
+fn main(): int64 {
+  var a: array := [];
+  push(a, 10);
+  push(a, 20);
+  push(a, 30);
+  
+  PrintInt(len(a));  // 3
+  
+  var x: int64 := pop(a);  // x = 30
+  PrintInt(len(a));  // 2
+  
+  free(a);
+  return 0;
+}
+```
 
 ### Regex-Literale (v0.4.2 ✅ ABGESCHLOSSEN)
 
