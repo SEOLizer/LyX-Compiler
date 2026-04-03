@@ -1,5 +1,5 @@
 FPC      = fpc
-FPCFLAGS = -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ -Fubackend/macho/ -Fubackend/xtensa/ -Fubackend/esp32/ -Fubackend/macosx64/ -Fubackend/win_arm64/
+FPCFLAGS = -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ -Fubackend/macho/ -Fubackend/xtensa/ -Fubackend/esp32/ -Fubackend/macosx64/ -Fubackend/win_arm64/ -Fubackend/riscv/ -Fubackend/arm_cm/
 
 # Release-Flags
 RELEASE_FLAGS = -O2
