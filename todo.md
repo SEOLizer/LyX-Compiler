@@ -44,13 +44,11 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 ### macOS x86_64 (`compiler/backend/macosx64/macosx64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir
+**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, mmap, munmap, ioctl, getpid
 
 **Fehlt ❌ – IO-Builtins:**
 - [ ] `PrintFloat` / `printf`
 - [ ] `rmdir` / `chmod` / `rename`
-- [ ] `ioctl` / `mmap` / `munmap`
-- [ ] `getpid`
 
 **Fehlt ❌ – String-Builtins (alle):**
 - [ ] `str_concat`, `StrLen`, `StrCharAt`, `StrSetChar`, `StrNew`, `StrFree`, `StrAppend`, `StrFromInt`
