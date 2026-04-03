@@ -166,13 +166,13 @@ if (a && b) {
 
 ### 5.1 Compiler-interne Analysen
 
-- [ ] **Data-Flow-Analyse**: Def-Use-Ketten für alle Variablen
-- [ ] **Live-Variable-Analyse**: Unbenutzte Variablen erkennen
-- [ ] **Constant-Propagation**: Konstanten-Faltung für Range-Checks
-- [ ] **Null-Pointer-Analyse**: Potenzielle Null-Dereferenzierungen
-- [ ] **Array-Bounds-Analyse**: Statische Index-Prüfung
-- [ ] **Terminierungs-Analyse**: Endlosschleifen-Erkennung (für @total)
-- [ ] **Stack-Nutzungs-Analyse**: Worst-Case-Stack-Berechnung
+- [x] **Data-Flow-Analyse**: Def-Use-Ketten für alle Variablen → `ir_static_analysis.pas`: Def-Use-Chains mit Use-Location-Tracking
+- [x] **Live-Variable-Analyse**: Unbenutzte Variablen erkennen → `--static-analysis` CLI-Flag, Warnung für unused vars
+- [x] **Constant-Propagation**: Konstanten-Faltung für Range-Checks → irConstInt/irAdd/irSub/irMul propagation, 5/10 Konstanten erkannt
+- [x] **Null-Pointer-Analyse**: Potenzielle Null-Dereferenzierungen → ConstStr-Tracking, Null-Check-Erkennung
+- [x] **Array-Bounds-Analyse**: Statische Index-Prüfung → irLoadElem/irStoreElem Tracking, SAFE/UNVERIFIED Status
+- [x] **Terminierungs-Analyse**: Endlosschleifen-Erkennung (für @total) → Loop-Erkennung via irJmp/irBrTrue/irBrFalse, Bounded-Loop-Erkennung
+- [x] **Stack-Nutzungs-Analyse**: Worst-Case-Stack-Berechnung → Slot-Count, Byte-Berechnung, Rekursions-Erkennung
 
 ### 5.2 MISRA-ähnliche Regeln
 

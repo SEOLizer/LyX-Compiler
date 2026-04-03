@@ -46,6 +46,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Generics: fn max[T](a: T, b: T): T — monomorphization (v0.5.7)
 ✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.7)
 ✅ MC/DC Instrumentation: DO-178C DAL A coverage (--mcdc, --mcdc-report) (v0.7.0)
+✅ Static Analysis: Data-Flow, Live-Vars, Const-Prop, Null-Ptr, Array-Bounds, Termination, Stack (--static-analysis) (v0.7.0)
+✅ Test Generation: Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution (v0.7.0)
 ✅ ESP32 Safety: Watchdog, Brownout, Flash-Verify, MPU, Stack-Canary (v0.7.0)
 ✅ ARM Cortex-M Safety: MPU, Fault-Handlers, Stack-Canary, TrustZone stubs (v0.7.0)
 ✅ RISC-V RV64GC Backend: PMP, CSR access, ecall/ebreak, atomic ops (v0.7.0)
@@ -506,6 +508,58 @@ A standalone reference interpreter validates compiler correctness via bisimulati
 cd compiler && ./tests/test_reference_interpreter
 # 22/22 tests passed
 ```
+
+### Static Analysis
+
+Lyx includes a comprehensive static analysis pass for DO-178C compliance:
+
+```bash
+# Run static analysis during compilation
+./lyxc program.lyx -o program --static-analysis
+```
+
+**Analysis Report:**
+```
+=== Static Analysis Report ===
+
+--- Data-Flow Analysis (Def-Use Chains) ---
+Total variables tracked: 10
+  t0: defined at instr 19, used at 48 locations
+  t1: defined at instr 3, used at 2 locations
+
+--- Live Variable Analysis ---
+  [WARN] t5: defined but never used
+
+--- Constant Propagation ---
+  t0 = 10 (known constant)
+  t1 = 20 (known constant)
+Known constants: 5/10
+
+--- Null Pointer Analysis ---
+  No pointer variables found.
+
+--- Array Bounds Analysis ---
+Safe: 0, Unverified: 0
+
+--- Termination Analysis ---
+  main: Terminates
+
+--- Stack Usage Analysis ---
+  Function              | Slots | Bytes | Recursive
+  ----------------------|-------|-------|----------
+  main                  |    13 |   104 | no
+
+=== Warnings: 0 ===
+```
+
+**7 Analysis Passes:**
+1. **Data-Flow Analysis**: Def-Use chains for all variables
+2. **Live Variable Analysis**: Detects unused variables (warnings)
+3. **Constant Propagation**: Tracks known constants through irAdd/irSub/irMul
+4. **Null Pointer Analysis**: Tracks potentially null pointers and missing checks
+5. **Array Bounds Analysis**: Static index safety verification
+6. **Termination Analysis**: Detects unbounded loops and recursive calls
+7. **Stack Usage Analysis**: Worst-case stack calculation per function
 
 ---
 
