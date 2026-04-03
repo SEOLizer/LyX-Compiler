@@ -69,7 +69,7 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 ### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, PrintInt, PrintFloat (Stubs), open/read/write/close (Stubs), StrLen (Stub), mmap/munmap (Stubs)
+**Implementiert ✅:** exit, PrintStr, PrintInt, PrintFloat (Stubs), Println (Stub), printf (Stub), open/read/write/close (Stubs), lseek, unlink, mkdir, rmdir, chmod, rename, StrLen, StrCharAt, StrSetChar, StrNew, StrFree, StrFromInt, StrAppend, StrFindChar, StrSub, StrConcat, StrCopy, FileGetSize, StrStartsWith, StrEndsWith, StrEquals, GetArgC, GetArg, Random, RandomSeed, mmap, munmap, getpid, ioctl, alle Socket builtins (Stubs)
 
 **Fehlt ❌ – Alle Builtins** (Grundlage zuerst):
 - [ ] `Println` / `printf` – via Win32 `WriteFile`
