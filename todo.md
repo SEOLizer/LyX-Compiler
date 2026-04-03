@@ -69,16 +69,12 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 ### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, PrintInt, PrintFloat (Stubs), Println (Stub), printf (Stub), open/read/write/close (Stubs), lseek, unlink, mkdir, rmdir, chmod, rename, StrLen, StrCharAt, StrSetChar, StrNew, StrFree, StrFromInt, StrAppend, StrFindChar, StrSub, StrConcat, StrCopy, FileGetSize, StrStartsWith, StrEndsWith, StrEquals, GetArgC, GetArg, Random, RandomSeed, mmap, munmap, getpid, ioctl, alle Socket builtins (Stubs)
+**Implementiert ✅:** exit (ExitProcess), PrintStr (OutputDebugStringA), PrintInt (__builtin_PrintInt mit itoa-Loop + WriteFile), PrintFloat (__builtin_PrintFloat mit FCVTZS/FSUB/FMUL, 6 Dezimalstellen), Println (__builtin_Println mit CRLF via WriteFile), printf (Stub), open (CreateFileA), read (ReadFile), write (WriteFile), close (CloseHandle), lseek (SetFilePointerEx), unlink (DeleteFileA), mkdir (CreateDirectoryA), rmdir (RemoveDirectoryA), chmod (SetFileAttributesA), rename (MoveFileA), StrLen (lstrlenA), StrCharAt (LDRB), StrSetChar (STRB), StrNew (VirtualAlloc), StrFree (VirtualFree), StrFromInt (itoa-Loop + VirtualAlloc), StrAppend (Stub), StrFindChar (Linear Search), StrSub (VirtualAlloc Stub), StrConcat (VirtualAlloc Stub), StrCopy (lstrlenA + VirtualAlloc Stub), FileGetSize (CreateFileA + GetFileSizeEx + CloseHandle), StrStartsWith (Byte-Vergleich), StrEndsWith (Längen-Vergleich von hinten), StrEquals (lstrcmpA), GetArgC (GetCommandLineA + State Machine), GetArg (GetCommandLineA + Index-Suche), Random (LCG: seed * 1103515245 + 12345), RandomSeed (Global Seed), mmap (VirtualAlloc), munmap (VirtualFree), getpid (GetCurrentProcessId), ioctl (Stub), peek8/16/32/64 (LDRB/LDRH/LDR/LDRX), poke8/16/32/64 (STRB/STRH/STR/STRX), sleep_ms (Sleep), now_unix (GetSystemTimeAsFileTime + FILETIME→Unix), now_unix_ms (GetTickCount64), GetLastError, Socket: sys_socket, sys_bind, sys_listen, sys_accept, sys_connect, sys_recvfrom, sys_sendto, sys_setsockopt, sys_getsockopt, sys_shutdown, sys_closesocket, WSAStartup (alle via WinSock2/ws2_32.dll)
 
-**Fehlt ❌ – Alle Builtins** (Grundlage zuerst):
-- [ ] `Println` / `printf` – via Win32 `WriteFile`
-- [ ] `mmap` / `munmap` – via `VirtualAlloc` / `VirtualFree`
-- [ ] Alle String-Builtins (S0 + S1–S7)
-- [ ] `Random` / `RandomSeed`
-- [ ] `peek*` / `poke*`
-- [ ] Socket-Builtins – via WinSock2
-- [ ] `GetArgC` / `GetArg`
+**Fehlt ❌ – Vollständige Implementierungen:**
+- [ ] `printf` – Format-String Parsing via wsprintfA
+- [ ] `StrSub` / `StrConcat` / `StrCopy` – Vollständige String-Operationen mit memcpy
+- [ ] `Inspect` (Debug-Visualizer)
 
 **Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
 Der PE64-Writer (`compiler/backend/win_arm64/pe64_arm64_writer.pas`) existiert bereits.
