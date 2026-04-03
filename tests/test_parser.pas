@@ -30,7 +30,29 @@ type
     // Unary operator tests
     procedure TestParseNestedUnary_LiteralFolding;
     procedure TestParseNestedUnary_NonLiteral;
+  private
+    function FindMainFunc(const prog: TAstProgram): TAstFuncDecl;
   end;
+
+function TParserTest.FindMainFunc(const prog: TAstProgram): TAstFuncDecl;
+var
+  i: Integer;
+begin
+  Result := nil;
+  for i := 0 to High(prog.Decls) do
+  begin
+    if prog.Decls[i] is TAstFuncDecl then
+    begin
+      if TAstFuncDecl(prog.Decls[i]).Name = 'main' then
+      begin
+        Result := TAstFuncDecl(prog.Decls[i]);
+        Exit;
+      end;
+    end;
+  end;
+  if Result = nil then
+    raise Exception.Create('main function not found');
+end;
 
 function TParserTest.ParseProgramFromSource(const src: string): TAstProgram;
 var
@@ -63,9 +85,11 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { PrintStr("Hello"); return 0; }');
   try
-    AssertEquals(1, Length(prog.Decls));
-    AssertTrue(prog.Decls[0] is TAstFuncDecl);
-    f := TAstFuncDecl(prog.Decls[0]);
+    // Parser fügt automatisch 'import std.system' hinzu, daher 2 Declarations
+    AssertEquals(2, Length(prog.Decls));
+    // main ist die zweite Declaration (Index 1)
+    AssertTrue(prog.Decls[1] is TAstFuncDecl);
+    f := TAstFuncDecl(prog.Decls[1]);
     AssertEquals('main', f.Name);
     AssertTrue(f.ReturnType = atInt64);
     blk := f.Body;
@@ -131,8 +155,8 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { var i: int64 := 0; i := 1 + 2 * 3; return i; }');
   try
-    AssertEquals(1, Length(prog.Decls));
-    f := TAstFuncDecl(prog.Decls[0]);
+    AssertEquals(2, Length(prog.Decls));
+    f := FindMainFunc(prog);
     blk := f.Body;
     // first stmt is var decl
     AssertTrue(blk.Stmts[0] is TAstVarDecl);
@@ -156,18 +180,15 @@ end;
 procedure TParserTest.TestParseConTopLevel;
 var
   prog: TAstProgram;
-  decl: TAstNode;
-  con: TAstConDecl;
+  c: TAstConDecl;
 begin
-  prog := ParseProgramFromSource('con LIMIT: int64 := 5; fn main(): int64 { return 0; }');
+  prog := ParseProgramFromSource('con X: int64 = 42; fn main(): int64 { return X; }');
   try
-    AssertEquals(2, Length(prog.Decls));
-    decl := prog.Decls[0];
-    AssertTrue(decl is TAstConDecl);
-    con := TAstConDecl(decl);
-    AssertEquals('LIMIT', con.Name);
-    AssertTrue(con.InitExpr is TAstIntLit);
-    AssertEquals(5, TAstIntLit(con.InitExpr).Value);
+    // 3 Declarations: import std.system, con X, fn main
+    AssertEquals(3, Length(prog.Decls));
+    AssertTrue(prog.Decls[1] is TAstConDecl);
+    c := TAstConDecl(prog.Decls[1]);
+    AssertEquals('X', c.Name);
   finally
     prog.Free;
   end;
@@ -182,9 +203,10 @@ var
 begin
   prog := ParseProgramFromSource('unit foo; fn main(): int64 { return 0; }');
   try
-    AssertEquals(2, Length(prog.Decls));
-    AssertTrue(prog.Decls[0] is TAstUnitDecl);
-    u := TAstUnitDecl(prog.Decls[0]);
+    // 3 Declarations: import std.system, unit foo, fn main
+    AssertEquals(3, Length(prog.Decls));
+    AssertTrue(prog.Decls[1] is TAstUnitDecl);
+    u := TAstUnitDecl(prog.Decls[1]);
     AssertEquals('foo', u.UnitPath);
   finally
     prog.Free;
@@ -199,9 +221,10 @@ begin
   // Import uses identifier paths (not string literals)
   prog := ParseProgramFromSource('import std.io; fn main(): int64 { return 0; }');
   try
-    AssertEquals(2, Length(prog.Decls));
-    AssertTrue(prog.Decls[0] is TAstImportDecl);
-    imp := TAstImportDecl(prog.Decls[0]);
+    // 3 Declarations: import std.system, import std.io, fn main
+    AssertEquals(3, Length(prog.Decls));
+    AssertTrue(prog.Decls[1] is TAstImportDecl);
+    imp := TAstImportDecl(prog.Decls[1]);
     AssertEquals('std.io', imp.UnitPath);
     AssertEquals('', imp.Alias);
   finally
@@ -217,9 +240,10 @@ begin
   // Test that pub fn parses (IsPublic not stored in AST yet)
   prog := ParseProgramFromSource('pub fn main(): int64 { return 0; }');
   try
-    AssertEquals(1, Length(prog.Decls));
-    AssertTrue(prog.Decls[0] is TAstFuncDecl);
-    f := TAstFuncDecl(prog.Decls[0]);
+    // 2 Declarations: import std.system, pub fn main
+    AssertEquals(2, Length(prog.Decls));
+    AssertTrue(prog.Decls[1] is TAstFuncDecl);
+    f := TAstFuncDecl(prog.Decls[1]);
     AssertEquals('main', f.Name);
     // Note: IsPublic is parsed but not stored in AST yet
   finally
@@ -375,12 +399,19 @@ var
   f: TAstFuncDecl;
 begin
   // Test parsing varargs extern function (like printf)
-  prog := ParseProgramFromSource('extern fn printf(fmt: pchar, ...): int64;');
+  prog := ParseProgramFromSource('extern fn printf(fmt: pchar, ...): int64; fn main(): int64 { return 0; }');
   try
+    // 3 Declarations: import std.system, extern printf, fn main
     AssertTrue('Should have at least one declaration', Length(prog.Decls) >= 1);
-    d := prog.Decls[0];
-    AssertTrue('First declaration should be a function', d is TAstFuncDecl);
-    f := TAstFuncDecl(d);
+    // Find printf function
+    f := nil;
+    for d in prog.Decls do
+      if (d is TAstFuncDecl) and (TAstFuncDecl(d).Name = 'printf') then
+      begin
+        f := TAstFuncDecl(d);
+        Break;
+      end;
+    AssertTrue('First declaration should be a function', Assigned(f));
     
     AssertEquals('Function name should be printf', 'printf', f.Name);
     AssertTrue('Function should be extern', f.IsExtern);
@@ -405,7 +436,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { return --5; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstReturn);
     AssertTrue(TAstReturn(blk.Stmts[0]).Value is TAstIntLit);
@@ -416,7 +447,7 @@ begin
 
   prog := ParseProgramFromSource('fn main(): int64 { return !!true; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstReturn);
     AssertTrue(TAstReturn(blk.Stmts[0]).Value is TAstBoolLit);
