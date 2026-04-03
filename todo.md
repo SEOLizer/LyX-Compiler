@@ -32,7 +32,7 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 - [x] `mmap` / `munmap` (als Builtin-Aufruf)
 - [x] `ioctl` / `getpid`
 - [x] `peek8/16/32/64` / `poke8/16/32/64`
-- [ ] `format_float` (`:width:decimals` Format-Specifier)
+- [x] `format_float` (`:width:decimals` Format-Specifier)
 - [ ] `Inspect` (Debug-Visualizer)
 - [ ] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_fcntl`, `sys_shutdown`
 
