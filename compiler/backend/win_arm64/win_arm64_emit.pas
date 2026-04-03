@@ -1882,20 +1882,80 @@ begin
             end
             else if instr.ImmStr = 'Random' then
             begin
-              // Random() -> f64 (0.0 .. 1.0)
-              // Use BCryptGenRandom or RtlGenRandom
-              // For now: return 0.5
-              WriteMovImm64(FCode, X0, UInt64($3FE0000000000000)); // 0.5 as f64
-              EmitInstr(FCode, $FD000000);  // STR D0, [X0] - need proper float handling
-              // Simplified: return 0 in X0
-              WriteMovImm64(FCode, X0, 0);
+              // Random() -> int64: Linear Congruential Generator
+              // seed = (seed * 1103515245 + 12345) mod 2^31
+              // Uses global seed stored in data section
+              if not FRandomSeedAdded then
+              begin
+                FRandomSeedOffset := FData.Size;
+                FData.WriteU64LE(1); // Initial seed = 1
+                FRandomSeedAdded := True;
+              end;
+              
+              // Load seed address via ADRP+ADD
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := -2; // Special: random seed
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X1, 0);  // Placeholder
+              
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := -2;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X1, X1, 0);  // Placeholder
+              
+              // LDR X0, [X1] - load current seed
+              WriteLdrImm(FCode, X0, X1, 0);
+              
+              // Compute: X0 = X0 * 1103515245 + 12345
+              WriteMovImm64(FCode, X2, 1103515245);
+              WriteMul(FCode, X0, X0, X2);
+              WriteMovImm64(FCode, X2, 12345);
+              WriteAddRegReg(FCode, X0, X0, X2);
+              
+              // AND X0, X0, 0x7FFFFFFF (mod 2^31)
+              WriteMovImm64(FCode, X2, $7FFFFFFF);
+              WriteAndRegReg(FCode, X0, X0, X2);
+              
+              // Store seed back: STR X0, [X1]
+              WriteStrImm(FCode, X0, X1, 0);
+              
+              // Store result in dest temp
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'RandomSeed' then
             begin
-              // RandomSeed(n) -> void
-              // Stub
+              // RandomSeed(seed) -> void: sets the random seed
+              if not FRandomSeedAdded then
+              begin
+                FRandomSeedOffset := FData.Size;
+                FData.WriteU64LE(1);
+                FRandomSeedAdded := True;
+              end;
+              
+              // Load seed address via ADRP+ADD
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := -2;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X1, 0);
+              
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := -2;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X1, X1, 0);
+              
+              // Load seed value from Src1
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 1);
+              
+              // STR X0, [X1] - store new seed
+              WriteStrImm(FCode, X0, X1, 0);
             end
             else if instr.ImmStr = 'getpid' then
             begin
@@ -2357,6 +2417,49 @@ begin
   
   // Phase 5: Patch branches - simplified approach without GetBufferAt
   // We'll skip patching for now as it requires GetBufferAt which doesn't exist
+  
+  // Patch Random Seed ADRP+ADD references
+  if FRandomSeedAdded and (Length(FGlobalVarLeaPatches) > 0) then
+  begin
+    var i: Integer;
+    for i := 0 to High(FGlobalVarLeaPatches) do
+    begin
+      if FGlobalVarLeaPatches[i].VarIndex = -2 then
+      begin
+        var patchPos := FGlobalVarLeaPatches[i].CodePos;
+        var strOffset := FRandomSeedOffset;
+        var codeVA: UInt64 = 0; // Will be set by PE writer
+        var dataVA: UInt64 = 0; // Will be set by PE writer
+        var targetAddr := dataVA + strOffset;
+        var instrAddr := codeVA + patchPos;
+        var pageOffset := targetAddr - (instrAddr and not UInt64($FFF));
+        
+        if FGlobalVarLeaPatches[i].IsAdrp then
+        begin
+          // Patch ADRP: page offset >> 12
+          var page := pageOffset shr 12;
+          var immlo := (page shr 2) and 3;
+          var immhi := page and 3;
+          // ADRP encoding: bits 5,29,30,31 for immlo, bits 8-23 for immhi
+          var instr := FCode.Data[patchPos] or (FCode.Data[patchPos+1] shl 8) or
+                       (FCode.Data[patchPos+2] shl 16) or (FCode.Data[patchPos+3] shl 24);
+          instr := instr or (UInt32(immlo) shl 29) or (UInt32(immhi) shl 5);
+          FCode.PatchU32(patchPos, instr);
+        end
+        else
+        begin
+          // Patch ADD: low 12 bits of offset
+          var low12 := pageOffset and $FFF;
+          var instr := FCode.Data[patchPos] or (FCode.Data[patchPos+1] shl 8) or
+                       (FCode.Data[patchPos+2] shl 16) or (FCode.Data[patchPos+3] shl 24);
+          // Clear old immediate and set new one
+          instr := instr and not $003FFC00;
+          instr := instr or (UInt32(low12) shl 10);
+          FCode.PatchU32(patchPos, instr);
+        end;
+      end;
+    end;
+  end;
   
   // Note: For a complete implementation, you would need to:
   // 1. Add GetBufferAt method to TByteBuffer
