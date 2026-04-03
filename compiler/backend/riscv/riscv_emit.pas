@@ -488,6 +488,9 @@ var
   branchOffset: Int32;
   callPatchIdx, targetFuncIdx: Integer;
   found: Boolean;
+  lenLoop, slenLoop: Integer;
+  patchInstr, patchOpcode: UInt32;
+  patchLo, patchHi: Int64;
 begin
   FCode.Clear;
   FData.Clear;
@@ -548,7 +551,7 @@ begin
   EmitMv(X11, X10);  // save string ptr in x11
   EmitMv(X10, X11);  // x10 = string ptr
   EmitLi(X12, 0);    // x12 = counter
-  var lenLoop := FCode.Size;
+  lenLoop := FCode.Size;
   EmitIType($03, 0, X13, X10, 0);  // lb x13, 0(x10)
   EmitBeqz(X13, 12);
   EmitIType($13, 0, X10, X10, 1);
@@ -1035,7 +1038,7 @@ begin
               begin
                 if instr.Src1 >= 0 then EmitIType($03, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Src1)) else EmitLi(X10, 0);
                 EmitLi(X11, 0);
-                var slenLoop := FCode.Size;
+                slenLoop := FCode.Size;
                 EmitIType($03, 0, X12, X10, 0);
                 EmitBeqz(X12, 12);
                 EmitIType($13, 0, X10, X10, 1);
@@ -1387,24 +1390,24 @@ begin
         targetPos := FLabels[labelIdx].Offset;
         branchOffset := targetPos - patchPos;
         // Patch JAL or B-type instruction
-        var instr := FCode.ReadU32LE(patchPos);
-        var opcode := instr and $7F;
-        if opcode = $6F then  // JAL
+        patchInstr := FCode.ReadU32LE(patchPos);
+        patchOpcode := patchInstr and $7F;
+        if patchOpcode = $6F then  // JAL
         begin
-          instr := (instr and $FFF0007F) or (UInt32(branchOffset and $100000) shl 11) or
+          patchInstr := (patchInstr and $FFF0007F) or (UInt32(branchOffset and $100000) shl 11) or
                    (UInt32(branchOffset and $7FF) shl 12) or
                    (UInt32(branchOffset and $800) shl 11) or
                    (UInt32(branchOffset and $FFE00) shl 0);
-          FCode.PatchU32LE(patchPos, instr);
+          FCode.PatchU32LE(patchPos, patchInstr);
         end
-        else if opcode = $63 then  // B-type
+        else if patchOpcode = $63 then  // B-type
         begin
-          instr := (instr and $FFF0007F) or
+          patchInstr := (patchInstr and $FFF0007F) or
                    (UInt32(branchOffset and $1000) shl 19) or
                    (UInt32(branchOffset and $800) shl 4) or
                    (UInt32(branchOffset and $7E) shl 7) or
                    (UInt32(branchOffset and $10) shl 3);
-          FCode.PatchU32LE(patchPos, instr);
+          FCode.PatchU32LE(patchPos, patchInstr);
         end;
         found := True;
         Break;
@@ -1423,12 +1426,12 @@ begin
       begin
         targetPos := FFuncOffsets[targetFuncIdx].Offset;
         branchOffset := targetPos - patchPos;
-        var instr := FCode.ReadU32LE(patchPos);
-        instr := (instr and $FFF0007F) or (UInt32(branchOffset and $100000) shl 11) or
+        patchInstr := FCode.ReadU32LE(patchPos);
+        patchInstr := (patchInstr and $FFF0007F) or (UInt32(branchOffset and $100000) shl 11) or
                  (UInt32(branchOffset and $7FF) shl 12) or
                  (UInt32(branchOffset and $800) shl 11) or
                  (UInt32(branchOffset and $FFE00) shl 0);
-        FCode.PatchU32LE(patchPos, instr);
+        FCode.PatchU32LE(patchPos, patchInstr);
         found := True;
         Break;
       end;
@@ -1444,11 +1447,11 @@ begin
     begin
       strOffset := stringByteOffsets[strIdx];
       // Patch li instruction (lui + addi)
-      var lo := Int64(Int32(strOffset));
-      var hi := (strOffset - lo) shr 12;
-      if (lo and $800) <> 0 then begin lo := lo - $1000; hi := hi + 1; end;
-      FCode.PatchU32LE(patchPos, (UInt32(hi and $FFFFF) shl 12) or (UInt32(X10) shl 7) or $37);
-      FCode.PatchU32LE(patchPos + 4, (UInt32(lo and $FFF) shl 20) or (UInt32(X10) shl 15) or (UInt32(X10) shl 7) or $13);
+      patchLo := Int64(Int32(strOffset));
+      patchHi := (strOffset - patchLo) shr 12;
+      if (patchLo and $800) <> 0 then begin patchLo := patchLo - $1000; patchHi := patchHi + 1; end;
+      FCode.PatchU32LE(patchPos, (UInt32(patchHi and $FFFFF) shl 12) or (UInt32(X10) shl 7) or $37);
+      FCode.PatchU32LE(patchPos + 4, (UInt32(patchLo and $FFF) shl 20) or (UInt32(X10) shl 15) or (UInt32(X10) shl 7) or $13);
     end;
   end;
   
