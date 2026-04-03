@@ -5,7 +5,7 @@ uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
-  ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc,
+  ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer,
@@ -30,6 +30,7 @@ var
   flagOptimize: Boolean;  // IR optimizations default aktiviert
   flagTraceImports: Boolean;  // --trace-imports Flag
   flagMCDC: Boolean;  // --mcdc MC/DC instrumentation
+  flagStaticAnalysis: Boolean;  // --static-analysis
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -60,6 +61,7 @@ var
   i, j: Integer;
   mcdc: TMCDCInstrumenter;
   mcdcCount: Integer;
+  sa: TStaticAnalyzer;
   param: string;
 
 type
@@ -333,6 +335,7 @@ begin
     WriteLn(StdErr, '  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)');
     WriteLn(StdErr, '  --mcdc           MC/DC-Instrumentierung für DO-178C Coverage');
     WriteLn(StdErr, '  --mcdc-report    MC/DC-Coverage-Bericht nach Kompilierung');
+    WriteLn(StdErr, '  --static-analysis Statische Analyse (Data-Flow, Live-Vars, Stack, ...)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
     WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
@@ -351,6 +354,7 @@ begin
   flagOptimize := True;  // IR optimizations enabled by default
   flagTraceImports := False;
   flagMCDC := False;
+  flagStaticAnalysis := False;
   includePaths := TStringList.Create;
   stdLibPath := '';
 
@@ -469,6 +473,11 @@ begin
     else if param = '--mcdc-report' then
     begin
       flagMCDC := True;
+      Inc(i);
+    end
+    else if param = '--static-analysis' then
+    begin
+      flagStaticAnalysis := True;
       Inc(i);
     end
     else if param = '--trace-imports' then
@@ -706,6 +715,19 @@ begin
               mcdc.GenerateReport;
             finally
               mcdc.Free;
+            end;
+          end;
+
+          // Static Analysis (DO-178C Section 5.1)
+          if flagStaticAnalysis then
+          begin
+            WriteLn('[Static Analysis] Running static analysis...');
+            sa := TStaticAnalyzer.Create(module, d);
+            try
+              sa.RunAll;
+              sa.GenerateReport;
+            finally
+              sa.Free;
             end;
           end;
 
