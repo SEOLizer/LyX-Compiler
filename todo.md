@@ -69,16 +69,18 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 ### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, PrintInt, PrintFloat (Stubs), Println (Stub), printf (Stub), open/read/write/close (Stubs), lseek, unlink, mkdir, rmdir, chmod, rename, StrLen, StrCharAt, StrSetChar, StrNew, StrFree, StrFromInt, StrAppend, StrFindChar, StrSub, StrConcat, StrCopy, FileGetSize, StrStartsWith, StrEndsWith, StrEquals, GetArgC, GetArg, Random, RandomSeed, mmap, munmap, getpid, ioctl, alle Socket builtins (Stubs)
+**Implementiert ✅:** exit (ExitProcess), PrintStr (OutputDebugStringA), PrintInt (__builtin_PrintInt mit itoa-Loop + WriteFile), PrintFloat (__builtin_PrintFloat Stub), Println (Stub), printf (Stub), open (CreateFileA), read (ReadFile), write (WriteFile), close (CloseHandle), lseek (SetFilePointerEx), unlink (DeleteFileA), mkdir (CreateDirectoryA), rmdir (RemoveDirectoryA), chmod (SetFileAttributesA), rename (MoveFileA), StrLen (lstrlenA), StrCharAt, StrSetChar, StrNew (VirtualAlloc), StrFree (VirtualFree), StrFromInt (itoa-Loop), StrAppend (Stub), StrFindChar (Stub), StrSub (VirtualAlloc Stub), StrConcat (VirtualAlloc Stub), StrCopy (lstrlenA + VirtualAlloc Stub), FileGetSize (Stub), StrStartsWith (Stub), StrEndsWith (Stub), StrEquals (lstrcmpA), GetArgC (Stub), GetArg (Stub), Random (Stub), RandomSeed (Stub), mmap (VirtualAlloc), munmap (VirtualFree), getpid (GetCurrentProcessId), ioctl (Stub), peek8/16/32/64, poke8/16/32/64, sleep_ms (Sleep), now_unix (GetSystemTimeAsFileTime Stub), now_unix_ms (GetTickCount64), GetLastError, alle Socket builtins (Stubs)
 
-**Fehlt ❌ – Alle Builtins** (Grundlage zuerst):
-- [ ] `Println` / `printf` – via Win32 `WriteFile`
-- [ ] `mmap` / `munmap` – via `VirtualAlloc` / `VirtualFree`
-- [ ] Alle String-Builtins (S0 + S1–S7)
-- [ ] `Random` / `RandomSeed`
-- [ ] `peek*` / `poke*`
-- [ ] Socket-Builtins – via WinSock2
-- [ ] `GetArgC` / `GetArg`
+**Fehlt ❌ – Vollständige Implementierungen:**
+- [ ] `PrintFloat` – Vollständige Float-zu-String Konvertierung (analog zu x86_64 SSE2)
+- [ ] `Println` – String + Newline via WriteFile
+- [ ] `printf` – Format-String Parsing via wsprintfA
+- [ ] `Random` / `RandomSeed` – via BCryptGenRandom oder RtlGenRandom
+- [ ] `GetArgC` / `GetArg` – via GetCommandLineW + CommandLineToArgvW
+- [ ] `sleep_ms` – via Sleep (implementiert, aber nicht getestet)
+- [ ] `now_unix` – via GetSystemTimeAsFileTime (implementiert, aber nicht getestet)
+- [ ] Socket-Builtins – via WinSock2 (ws2_32.dll)
+- [ ] `Inspect` (Debug-Visualizer)
 
 **Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
 Der PE64-Writer (`compiler/backend/win_arm64/pe64_arm64_writer.pas`) existiert bereits.

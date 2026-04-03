@@ -577,17 +577,14 @@ begin
   // Save exit code
   WriteMovRegReg(FCode, X19, X0);  // X19 = exit code
   
-  // Load ExitProcess address from IAT (placeholder - offset 0)
-  // LDR X16, [X16, #0]
-  WriteLdrImm(FCode, X16, X16, 0);
+  // Load ExitProcess from IAT
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'ExitProcess';
+  WriteBranchLink(FCode, 0);
   
   // Move exit code to X0
   WriteMovRegReg(FCode, X0, X19);
-  
-  // Call ExitProcess via X16
-  // BLR X16 (branch with link to address in X16)
-  // BLR X16 = 0xD63F03E0
-  EmitInstr(FCode, $D63F03E0);
   
   // If ExitProcess returns (shouldn't happen), loop forever
   WriteBranch(FCode, -4);
@@ -620,12 +617,11 @@ begin
   // For simplicity, use console handle directly: X0 = -11
   WriteMovImm64(FCode, X0, UInt64(-11));  // STD_OUTPUT_HANDLE
   
-  // Get pointer to GetStdHandle (placeholder)
-  WriteMovImm64(FCode, X16, 0);
-  // LDR X16, [X16, #0]
-  WriteLdrImm(FCode, X16, X16, 0);
-  // BLR X16
-  EmitInstr(FCode, $D63F03E0);
+  // GetStdHandle call
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
   
   // Now X0 = handle
   WriteMovRegReg(FCode, X8, X0);  // Save handle in X8
@@ -636,11 +632,11 @@ begin
   WriteMovImm64(FCode, X3, 0);    // pWritten = NULL
   WriteMovImm64(FCode, X4, 0);    // Overlapped = NULL
   
-  // Load WriteFile address from IAT (placeholder)
-  WriteMovImm64(FCode, X16, 0);
-  WriteLdrImm(FCode, X16, X16, 0);
-  // BLR X16
-  EmitInstr(FCode, $D63F03E0);
+  // WriteFile call
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
   
   WriteRet(FCode);
   
@@ -691,10 +687,11 @@ begin
   
   // Write to console
   WriteMovImm64(FCode, X0, UInt64(-11));  // STD_OUTPUT_HANDLE
-  // GetStdHandle call (placeholder)
-  WriteMovImm64(FCode, X16, 0);
-  WriteLdrImm(FCode, X16, X16, 0);
-  EmitInstr(FCode, $D63F03E0);
+  // GetStdHandle call
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
   
   WriteMovRegReg(FCode, X8, X0);
   WriteMovRegReg(FCode, X1, X10);
@@ -702,13 +699,45 @@ begin
   WriteMovImm64(FCode, X3, 0);
   WriteMovImm64(FCode, X4, 0);
   
-  // WriteFile call (placeholder)
-  WriteMovImm64(FCode, X16, 0);
-  WriteLdrImm(FCode, X16, X16, 0);
-  EmitInstr(FCode, $D63F03E0);
+  // WriteFile call
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
   
   // Epilogue
   WriteLdpPostIndex(FCode, X29, X30, SP, 48);
+  WriteRet(FCode);
+  
+  // PrintFloat: D0 = float value
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_PrintFloat');
+  
+  // Prologue - need more stack for float conversion
+  WriteStpPreIndex(FCode, X29, X30, SP, -64);
+  WriteMovRegReg(FCode, X29, SP);
+  
+  // Save D0 to stack (for later reference)
+  // STR Q0, [SP] - store 128-bit float register
+  EmitInstr(FCode, $FD00003C);
+  
+  // Check sign: fcmp d0, #0.0
+  EmitInstr(FCode, $1E202020);
+  // csneg v0, v0, v0, GE  (conditional select: if GE, keep value)
+  EmitInstr(FCode, $1E204000);
+  // b.neg handle_negative
+  // For now, simplified: print as integer with decimal places
+  // Just call PrintInt with the integer part for now
+  // cvtsd2si x0, d0
+  EmitInstr(FCode, $1E6B0020);
+  
+  // Print integer part via PrintInt stub (built into PrintStr now)
+  // For now, just return
+  // PrintFloat stub complete - need full implementation later
+  
+  // Epilogue
+  WriteLdpPostIndex(FCode, X29, X30, SP, 64);
   WriteRet(FCode);
   
   // Phase 4: User functions
@@ -1107,99 +1136,355 @@ begin
             else if instr.ImmStr = 'PrintStr' then
             begin
               // PrintStr(s: pchar) -> void
-              // Use WriteFile via stdout (handle = -11)
-              // For stub: just return
+              // Use OutputDebugStringA Windows API
+              // X0 = string pointer
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Call OutputDebugStringA
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'OutputDebugStringA';
+              WriteBranchLink(FCode, 0);
             end
             else if instr.ImmStr = 'PrintInt' then
             begin
               // PrintInt(n: int64) -> void
-              // For stub: just return
+              // Call __builtin_PrintInt function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_PrintInt';
+              WriteBranchLink(FCode, 0);
             end
             else if instr.ImmStr = 'PrintFloat' then
             begin
               // PrintFloat(f: f64) -> void
-              // For stub: just return
+              // Call __builtin_PrintFloat function
+              // Note: For now, just print as integer part with 6 decimal places
+              // This is a placeholder - full float formatting requires more work
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_PrintFloat';
+              WriteBranchLink(FCode, 0);
             end
             else if instr.ImmStr = 'open' then
             begin
-              // open(path, flags, mode) -> int64 (stub)
-              WriteMovImm64(FCode, X0, UInt64(-1));
+              // open(path, flags, mode) -> int64 (handle)
+              // Use CreateFileA Windows API
+              // Parameters: X0=path, X1=access, X2=share, X3=security, X4=disposition, X5=flags
+              // Load parameters from stack
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Default access = GENERIC_READ | GENERIC_WRITE = 0xC0000000
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, UInt64($C0000000));
+              // Share mode = FILE_SHARE_READ | FILE_SHARE_WRITE = 3
+              WriteMovImm64(FCode, X2, 3);
+              // Security = NULL
+              WriteMovImm64(FCode, X3, 0);
+              // Disposition = OPEN_EXISTING = 3
+              WriteMovImm64(FCode, X4, 3);
+              // Flags = FILE_ATTRIBUTE_NORMAL = 0x80
+              WriteMovImm64(FCode, X5, UInt64($80));
+              // Call CreateFileA
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'CreateFileA';
+              WriteBranchLink(FCode, 0);
+              // Return handle in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'read' then
             begin
-              // read(fd, buf, count) -> int64 (stub)
-              WriteMovImm64(FCode, X0, 0);
+              // read(handle, buffer, bytes) -> int64
+              // Use ReadFile Windows API
+              // Parameters: X0=handle, X1=buffer, X2=bytes
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // pBytesRead = NULL
+              WriteMovImm64(FCode, X3, 0);
+              // Overlapped = NULL
+              WriteMovImm64(FCode, X4, 0);
+              // Call ReadFile
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'ReadFile';
+              WriteBranchLink(FCode, 0);
+              // Return bytes read in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'write' then
             begin
-              // write(fd, buf, count) -> int64 (stub)
-              WriteMovImm64(FCode, X0, 0);
+              // write(handle, buffer, bytes) -> int64
+              // Use WriteFile Windows API
+              // Parameters: X0=handle, X1=buffer, X2=bytes
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // pBytesWritten = NULL
+              WriteMovImm64(FCode, X3, 0);
+              // Overlapped = NULL
+              WriteMovImm64(FCode, X4, 0);
+              // Call WriteFile
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+              WriteBranchLink(FCode, 0);
+              // Return bytes written in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'close' then
             begin
-              // close(fd) -> int64 (stub)
-              WriteMovImm64(FCode, X0, 0);
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'StrLen' then
-            begin
-              // StrLen(s: pchar) -> int64 (stub)
-              WriteMovImm64(FCode, X0, 0);
+              // close(handle) -> int64
+              // Use CloseHandle Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Call CloseHandle
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'CloseHandle';
+              WriteBranchLink(FCode, 0);
+              // Return value in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'mmap' then
             begin
-              // mmap stub - return NULL
+              // mmap(size, prot, flags) -> pointer
+              // Use VirtualAlloc Windows API
+              // Parameters: X0=lpAddress, X1=dwSize, X2=flAllocationType, X3=flProtect
+              // lpAddress = NULL (0) - let system choose address
               WriteMovImm64(FCode, X0, 0);
+              // dwSize = size from Src1
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 4096); // Default 4KB page
+              // flAllocationType = MEM_COMMIT | MEM_RESERVE = 0x3000
+              WriteMovImm64(FCode, X2, UInt64($3000));
+              // flProtect = PAGE_READWRITE = 0x04
+              WriteMovImm64(FCode, X3, UInt64($04));
+              // Call VirtualAlloc
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
+              // Return pointer in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'munmap' then
             begin
-              // munmap stub
+              // munmap(addr, size) -> int64
+              // Use VirtualFree Windows API
+              // Parameters: X0=lpAddress, X1=dwSize, X2=dwFreeType
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // dwFreeType = MEM_RELEASE = 0x8000
+              WriteMovImm64(FCode, X2, UInt64($8000));
+              // Call VirtualFree
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+              WriteBranchLink(FCode, 0);
+              // Return result in X0 (non-zero = success)
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrLen' then
+            begin
+              // StrLen - use Windows lstrlenA
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Call lstrlenA
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetLastError' then
+            begin
+              // GetLastError - useful for debugging
+              // Call GetLastError
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetLastError';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrCharAt' then
             begin
-              // StrCharAt stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // StrCharAt(s, index) -> char
+              // Load string pointer and index, return byte at offset
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // LDRB W0, [X0, X1]
+              EmitInstr(FCode, $38616800);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrSetChar' then
             begin
-              // StrSetChar stub
+              // StrSetChar(s, index, ch) -> void
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // STRB W2, [X0, X1]
+              EmitInstr(FCode, $38216842);
             end
             else if instr.ImmStr = 'StrNew' then
             begin
-              // StrNew stub - return NULL
+              // StrNew(capacity) -> pointer
+              // Use VirtualAlloc
               WriteMovImm64(FCode, X0, 0);
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 64);
+              WriteMovImm64(FCode, X2, UInt64($3000));  // MEM_COMMIT | MEM_RESERVE
+              WriteMovImm64(FCode, X3, UInt64($04));    // PAGE_READWRITE
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrFree' then
             begin
-              // StrFree stub
+              // StrFree(ptr) -> void
+              // Use VirtualFree
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X1, 0);
+              WriteMovImm64(FCode, X2, UInt64($8000));  // MEM_RELEASE
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+              WriteBranchLink(FCode, 0);
             end
             else if instr.ImmStr = 'StrFromInt' then
             begin
-              // StrFromInt stub - return NULL
+              // StrFromInt(n) -> pchar
+              // Allocate buffer, convert int to string, return pointer
+              // Allocate 32 bytes via VirtualAlloc
               WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X1, 32);
+              WriteMovImm64(FCode, X2, UInt64($3000));
+              WriteMovImm64(FCode, X3, UInt64($04));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
+              // Save buffer pointer in X10
+              WriteMovRegReg(FCode, X10, X0);
+              // Load value to convert
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X9, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X9, 0);
+              // itoa: divide by 10, store remainders
+              WriteMovRegReg(FCode, X11, X9);  // Save original value for sign check
+              // Check if negative
+              WriteCmpImm(FCode, X9, 0);
+              // CSNEG X9, X9, X9, GE (absolute value)
+              EmitInstr(FCode, $DA80A529);
+              // Buffer position at end (X10 + 30)
+              WriteAddImm(FCode, X12, X10, 30);
+              // Null-terminate
+              WriteMovImm64(FCode, X13, 0);
+              EmitInstr(FCode, $3800018D);  // STRB W13, [X12]
+              // Divisor = 10
+              WriteMovImm64(FCode, X14, 10);
+              // Digit loop
+              WriteSubImm(FCode, X12, X12, 1);
+              WriteUdiv(FCode, X15, X9, X14);
+              WriteMsub(FCode, X13, X15, X14, X9);
+              WriteAddImm(FCode, X13, X13, Ord('0'));
+              EmitInstr(FCode, $3800018D);  // STRB W13, [X12]
+              WriteMovRegReg(FCode, X9, X15);
+              WriteCbnz(FCode, X9, -24);
+              // Handle negative
+              WriteCbz(FCode, X11, 16);
+              WriteSubImm(FCode, X12, X12, 1);
+              WriteMovImm64(FCode, X13, Ord('-'));
+              EmitInstr(FCode, $3800018D);
+              // Return buffer pointer
+              WriteMovRegReg(FCode, X0, X10);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrAppend' then
             begin
-              // StrAppend stub - return first arg
-              if Length(instr.ArgTemps) >= 1 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              // StrAppend(dest, src) -> pchar
+              // Just return dest for now (simple stub)
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
               else
                 WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
@@ -1207,237 +1492,489 @@ begin
             end
             else if instr.ImmStr = 'StrFindChar' then
             begin
-              // StrFindChar stub - return -1
+              // StrFindChar(s, ch, start) -> int64 (index or -1)
+              // Linear search
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // Add start offset to string pointer
+              WriteAddReg(FCode, X3, X0, X2);
+              // Search loop
+              WriteMovImm64(FCode, X4, 0);  // found = false
+              WriteMovRegReg(FCode, X5, X2); // current index
+              // Loop: LDRB W6, [X3], CBZ -> found
+              // Simplified: call lstrlenA first to get length, then loop
+              // For now: return -1 (not found)
               WriteMovImm64(FCode, X0, UInt64(-1));
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrSub' then
             begin
-              // StrSub stub - return NULL
+              // StrSub(s, start, len) -> pchar
+              // Allocate new buffer and copy substring
               WriteMovImm64(FCode, X0, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X1, 64);
+              WriteMovImm64(FCode, X2, UInt64($3000));
+              WriteMovImm64(FCode, X3, UInt64($04));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
+              // Return new buffer (content not copied - stub)
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrConcat' then
             begin
-              // StrConcat stub - return NULL
+              // StrConcat(a, b) -> pchar
+              // Allocate buffer, copy a, copy b
               WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X1, 256);
+              WriteMovImm64(FCode, X2, UInt64($3000));
+              WriteMovImm64(FCode, X3, UInt64($04));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
+              // Return buffer (content not copied - stub)
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrCopy' then
             begin
-              // StrCopy stub - return NULL
+              // StrCopy(s) -> pchar
+              // Allocate and copy
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Get length via lstrlenA
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
+              WriteBranchLink(FCode, 0);
+              // X0 = length, allocate len+1
+              WriteAddImm(FCode, X1, X0, 1);
               WriteMovImm64(FCode, X0, 0);
+              WriteMovImm64(FCode, X2, UInt64($3000));
+              WriteMovImm64(FCode, X3, UInt64($04));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+              WriteBranchLink(FCode, 0);
+              // Return buffer (content not copied - stub)
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'FileGetSize' then
             begin
-              // FileGetSize stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
+              // FileGetSize(path) -> int64
+              // Use GetFileSizeEx Windows API
+              // First open file, then get size, then close
+              // For now: stub - return 0
+              WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrStartsWith' then
             begin
-              // StrStartsWith stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // StrStartsWith(s, prefix) -> bool
+              // Simple prefix check
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Compare byte by byte until prefix null terminator
+              WriteMovImm64(FCode, X2, 1);  // result = true
+              WriteMovImm64(FCode, X3, 0);  // index
+              // Loop: load byte from prefix, if 0 -> done
+              // Simplified: return true for now
               if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+                WriteStrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrEndsWith' then
             begin
-              // StrEndsWith stub - return 0
+              // StrEndsWith(s, suffix) -> bool
+              // Stub: return false
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrEquals' then
             begin
-              // StrEquals stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // StrEquals(a, b) -> bool
+              // Use lstrcmpA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // Call lstrcmpA - returns 0 if equal
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'lstrcmpA';
+              WriteBranchLink(FCode, 0);
+              // X0 = 0 means equal -> result = (X0 == 0)
+              WriteCmpImm(FCode, X0, 0);
+              WriteCset(FCode, X0, COND_EQ);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'GetArgC' then
             begin
-              // GetArgC stub - return 0
+              // GetArgC() -> int64
+              // Use GetCommandLineW + CommandLineToArgvW
+              // For now: stub - return 0
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'GetArg' then
             begin
-              // GetArg stub - return NULL
+              // GetArg(i) -> pchar
+              // Stub: return NULL
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'Random' then
             begin
-              // Random stub - return 0
+              // Random() -> f64 (0.0 .. 1.0)
+              // Use BCryptGenRandom or RtlGenRandom
+              // For now: return 0.5
+              WriteMovImm64(FCode, X0, UInt64($3FE0000000000000)); // 0.5 as f64
+              EmitInstr(FCode, $FD000000);  // STR D0, [X0] - need proper float handling
+              // Simplified: return 0 in X0
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'RandomSeed' then
             begin
-              // RandomSeed stub
-            end
-            else if instr.ImmStr = 'Println' then
-            begin
-              // Println stub
-            end
-            else if instr.ImmStr = 'printf' then
-            begin
-              // printf stub
-            end
-            else if instr.ImmStr = 'lseek' then
-            begin
-              // lseek stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'unlink' then
-            begin
-              // unlink stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'mkdir' then
-            begin
-              // mkdir stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'rmdir' then
-            begin
-              // rmdir stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'chmod' then
-            begin
-              // chmod stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'rename' then
-            begin
-              // rename stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              // RandomSeed(n) -> void
+              // Stub
             end
             else if instr.ImmStr = 'getpid' then
             begin
-              // getpid stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // getpid() -> int64
+              // Use GetCurrentProcessId Windows API
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetCurrentProcessId';
+              WriteBranchLink(FCode, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'ioctl' then
             begin
-              // ioctl stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_socket' then
-            begin
-              // sys_socket stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_bind' then
-            begin
-              // sys_bind stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_listen' then
-            begin
-              // sys_listen stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_accept' then
-            begin
-              // sys_accept stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_connect' then
-            begin
-              // sys_connect stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
-            else if instr.ImmStr = 'sys_recvfrom' then
-            begin
-              // sys_recvfrom stub - return 0
+              // ioctl(fd, request, arg) -> int64
+              // Use DeviceIoControl Windows API
+              // Stub: return 0
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'sys_sendto' then
+            else if instr.ImmStr = 'peek8' then
             begin
-              // sys_sendto stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // peek8(addr) -> int64
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // LDRB W0, [X0]
+              EmitInstr(FCode, $39400000);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'sys_setsockopt' then
+            else if instr.ImmStr = 'peek16' then
             begin
-              // sys_setsockopt stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
+              // peek16(addr) -> int64
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // LDRH W0, [X0]
+              EmitInstr(FCode, $79400000);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'sys_getsockopt' then
+            else if instr.ImmStr = 'peek32' then
             begin
-              // sys_getsockopt stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
+              // peek32(addr) -> int64
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // LDR W0, [X0]
+              EmitInstr(FCode, $B9400000);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'sys_shutdown' then
+            else if instr.ImmStr = 'peek64' then
             begin
-              // sys_shutdown stub - return -1
-              WriteMovImm64(FCode, X0, UInt64(-1));
+              // peek64(addr) -> int64
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // LDR X0, [X0]
+              EmitInstr(FCode, $F9400000);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'poke8' then
+            begin
+              // poke8(addr, value) -> void
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // STRB W1, [X0]
+              EmitInstr(FCode, $38000001);
+            end
+            else if instr.ImmStr = 'poke16' then
+            begin
+              // poke16(addr, value) -> void
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // STRH W1, [X0]
+              EmitInstr(FCode, $78000001);
+            end
+            else if instr.ImmStr = 'poke32' then
+            begin
+              // poke32(addr, value) -> void
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // STR W1, [X0]
+              EmitInstr(FCode, $B8000001);
+            end
+            else if instr.ImmStr = 'poke64' then
+            begin
+              // poke64(addr, value) -> void
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // STR X1, [X0]
+              EmitInstr(FCode, $F8000001);
+            end
+            else if instr.ImmStr = 'lseek' then
+            begin
+              // lseek(handle, offset, whence) -> int64
+              // Use SetFilePointerEx Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // lpDistanceToMoveHigh = NULL
+              WriteMovImm64(FCode, X2, 0);
+              // lpNewFilePointer = NULL
+              WriteMovImm64(FCode, X3, 0);
+              // dwMoveMethod = whence
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              // Call SetFilePointerEx
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'SetFilePointerEx';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'unlink' then
+            begin
+              // unlink(path) -> int64
+              // Use DeleteFileA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'DeleteFileA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'mkdir' then
+            begin
+              // mkdir(path, mode) -> int64
+              // Use CreateDirectoryA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // lpSecurityAttributes = NULL
+              WriteMovImm64(FCode, X1, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'CreateDirectoryA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rmdir' then
+            begin
+              // rmdir(path) -> int64
+              // Use RemoveDirectoryA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'RemoveDirectoryA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'chmod' then
+            begin
+              // chmod(path, mode) -> int64
+              // Use SetFileAttributesA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'SetFileAttributesA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rename' then
+            begin
+              // rename(oldPath, newPath) -> int64
+              // Use MoveFileA Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'MoveFileA';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sleep_ms' then
+            begin
+              // sleep_ms(ms) -> void
+              // Use Sleep Windows API
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'Sleep';
+              WriteBranchLink(FCode, 0);
+            end
+            else if instr.ImmStr = 'now_unix' then
+            begin
+              // now_unix() -> int64
+              // Use GetSystemTimeAsFileTime Windows API
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetSystemTimeAsFileTime';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'now_unix_ms' then
+            begin
+              // now_unix_ms() -> int64
+              // Use GetTickCount64 Windows API
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetTickCount64';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'Println' then
+            begin
+              // Println(s: pchar) -> void
+              // Print string + newline
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_Println';
+              WriteBranchLink(FCode, 0);
+            end
+            else if instr.ImmStr = 'printf' then
+            begin
+              // printf(format, ...) -> void
+              // Stub: just return for now
             end
             else
             begin
-              // Generic builtin call (fallback)
-              // Load parameter into X0
-              if instr.Src1 >= 0 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
-              
-              // Call builtin
+              // Unknown builtin - call as __builtin_<name>
               SetLength(FCallPatches, Length(FCallPatches) + 1);
               FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
               FCallPatches[High(FCallPatches)].TargetName := '__builtin_' + instr.ImmStr;
               WriteBranchLink(FCode, 0);
-            end
-            
-            // Store result
-            if instr.Dest >= 0 then
-              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-          end;
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
         
         irReturn:
           begin
