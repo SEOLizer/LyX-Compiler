@@ -47,6 +47,8 @@ type
     FGlobalVarOffsets: array of UInt64;
     FGlobalVarLeaPatches: array of TGlobalVarLeaPatch;
     FTotalDataOffset: UInt64;
+    // Command line arguments support
+    FArgvBaseIdx: Integer;
     // Random seed
     FRandomSeedOffset: UInt64;
     FRandomSeedAdded: Boolean;
@@ -1051,6 +1053,40 @@ begin
     WriteMovRegReg(buf, X0, src);
 end;
 
+// STR with register offset (64-bit) - separate version with bool parameter
+procedure WriteStrRegOffset(buf: TByteBuffer; rt, rn, rm: Byte; forceInline: Boolean = True);
+begin
+  WriteStrRegOffsetInline(buf, rt, rn, rm);
+end;
+
+// LDR with immediate offset (signed 12-bit)
+procedure WriteLdrImmOffset(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  if (offset >= 0) and (offset < 4096) then
+  begin
+    // LDR Xt, [Xn, #imm12] - unsigned offset
+    imm12 := DWord(offset and $FFF);
+    EmitInstr(buf, $F9400000 or (imm12 shl 10) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F))
+  end
+  else if (offset < 0) and (offset >= -4096) then
+  begin
+    // Use LDUR for negative offset
+    imm12 := DWord((-offset) and $FFF);
+    EmitInstr(buf, $F8600000 or (imm12 shl 12) or (DWord(rn and $1F) shl 5) or DWord(rt and $1F));
+  end
+  else
+    raise Exception.Create('WriteLdrImmOffset: offset out of range');
+end;
+
+// LSR (logical shift right) with immediate
+procedure WriteLsrImm(buf: TByteBuffer; rd, rn: Byte; amount: Byte);
+begin
+  // LSR: 1101011 00 imm6 0 Rn 0 Rd
+  EmitInstr(buf, $D3600000 or (DWord(amount and $3F) shl 16) or (DWord(rn and $1F) shl 5) or DWord(rd and $1F));
+end;
+
 // ==========================================================================
 // Helper function to get library name for external symbols
 // ==========================================================================
@@ -1116,6 +1152,7 @@ begin
   SetLength(FGlobalVarOffsets, 0);
   SetLength(FGlobalVarLeaPatches, 0);
   FTotalDataOffset := 0;
+  FArgvBaseIdx := -1;
   FRandomSeedOffset := 0;
   FRandomSeedAdded := False;
   SetLength(FRandomSeedLeaPatches, 0);
@@ -1353,12 +1390,32 @@ begin
   FTotalDataOffset := FData.Size;
   
   // Phase 2: Emit _start entry point
-  // _start calls main() and exits with the return value.
+  // _start calls main() and exits with the exit value in X0.
+  // _start also saves the initial SP for GetArgC/GetArg.
+
+  // Save initial SP to _lyx_argv_base global (for GetArgC/GetArg)
+  // Store offset 0 initially - runtime will store actual SP value
+  FGlobalVarNames.Add('_lyx_argv_base');
+  SetLength(FGlobalVarOffsets, Length(FGlobalVarOffsets) + 1);
+  FGlobalVarOffsets[High(FGlobalVarOffsets)] := UInt64(FData.Size);
+  FData.WriteU64LE(0);  // Initial value (runtime stores actual SP)
+  FArgvBaseIdx := Length(FGlobalVarOffsets) - 1;
 
   // Save position for _start
   SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
   FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
   FFuncNames.Add('_start');
+
+  // MOV X9, SP (save current stack pointer)
+  WriteMovRegReg(FCode, X9, SP);
+
+  // Store SP to _lyx_argv_base global using ADRP+ADD+LDR
+  // ADRP X10, page(_lyx_argv_base)
+  // ADD X10, X10, :lo12:_lyx_argv_base
+  // STR X9, [X10]
+  WriteAdrp(FCode, X10, FArgvBaseIdx);
+  WriteLdrRegOffset(FCode, X10, X10, 0);
+  WriteStrRegOffsetInline(FCode, X9, X10, XZR);
 
   // BL main (placeholder, will be patched)
   SetLength(FCallPatches, Length(FCallPatches) + 1);
@@ -3277,6 +3334,69 @@ begin
               WriteCset(FCode, X0, COND_EQ);
               WriteXzrToX0(FCode, X0);
               
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetArgC' then
+            begin
+              // GetArgC(): int64 — returns argc from _lyx_argv_base
+              // Load _lyx_argv_base global address
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X0, 0);
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X0, X0, 0);
+              // X0 now has address of _lyx_argv_base
+              // Load initial SP from that address: X0 = [X0]
+              WriteLdrRegOffset(FCode, X0, X0, 0);
+              // argc is at [initial_SP + 8] (after saved return address)
+              // But we stored SP directly, so: X0 = initial_SP + 8
+              // Wait, we stored SP which points to saved return address
+              // At program start: stack is: [return addr][argc][argv[0]][argv[1]]...
+              // So argc is at [SP + 8]
+              // LDR X0, [X0, #8]
+              WriteLdrImmOffset(FCode, X0, X0, 8);
+
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetArg' then
+            begin
+              // GetArg(idx: int64): pchar — returns argv[idx]
+              // X1 = idx
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+
+              // Load _lyx_argv_base global address
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := True;
+              WriteAdrp(FCode, X2, 0);
+              SetLength(FGlobalVarLeaPatches, Length(FGlobalVarLeaPatches) + 1);
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].VarIndex := FArgvBaseIdx;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].CodePos := FCode.Size;
+              FGlobalVarLeaPatches[High(FGlobalVarLeaPatches)].IsAdrp := False;
+              WriteAddImm(FCode, X2, X2, 0);
+              // X2 now has address of _lyx_argv_base
+              WriteLdrRegOffset(FCode, X2, X2, 0);  // X2 = initial_SP
+              // argv[0] is at [initial_SP + 8 + 8] = [initial_SP + 16]
+              // argv[idx] is at [initial_SP + 16 + idx*8]
+              // Add 16 to X1: X1 = X1 + 2, then X1 * 8 for byte offset
+              // Actually: byte offset = 16 + idx * 8
+              WriteAddImm(FCode, X1, X1, 2);  // X1 = idx + 2
+              // LSL X1, X1, #3 (multiply by 8)
+              WriteLslImm(FCode, X1, X1, 3);
+              // Load argv[idx]: LDR X0, [X2, X1]
+              WriteLdrRegOffset(FCode, X0, X2, X1);
+
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
