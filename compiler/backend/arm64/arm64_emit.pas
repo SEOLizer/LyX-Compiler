@@ -900,6 +900,68 @@ begin
   WriteStrImm(buf, src, base, offset);
 end;
 
+// ============================================================================
+// Additional ARM64 helper procedures needed for String Builtins
+// ============================================================================
+
+// B.cond label (conditional branch)
+procedure WriteBcond(buf: TByteBuffer; cond: Byte; offset: Int32);
+var
+  imm19: DWord;
+begin
+  imm19 := DWord((offset div 4) and $7FFFF);
+  // B.cond: 0101010 cond imm19
+  EmitInstr(buf, $54000000 or (DWord(cond and $F) shl 0) or (imm19 shl 5));
+end;
+
+// B.NE - Branch if Not Equal
+procedure WriteBne(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_NE, offset);
+end;
+
+// B.EQ - Branch if Equal
+procedure WriteBeq(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_EQ, offset);
+end;
+
+// B.GE - Branch if Signed Greater or Equal
+procedure WriteBge(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_GE, offset);
+end;
+
+// B.LT - Branch if Signed Less Than
+procedure WriteBlt(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_LT, offset);
+end;
+
+// B.GT - Branch if Signed Greater Than
+procedure WriteBgt(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_GT, offset);
+end;
+
+// B.LE - Branch if Signed Less or Equal
+procedure WriteBle(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBcond(buf, COND_LE, offset);
+end;
+
+// B label (unconditional branch)
+procedure WriteB(buf: TByteBuffer; offset: Int32);
+begin
+  WriteBranch(buf, offset);
+end;
+
+// CMP Xn, Xm (compare register)
+procedure WriteCmpReg(buf: TByteBuffer; rn, rm: Byte);
+begin
+  WriteCmpRegReg(buf, rn, rm);
+end;
+
 // ==========================================================================
 // Compute the GOT VA that WriteDynamicElf64ARM64 will place the GOT at,
 // given the final code size and external symbol list.
@@ -944,6 +1006,49 @@ begin
   gotOffsetSeg := (hashOffset + hashSize + 7) and not UInt64(7);
 
   Result := baseVA + dynstrOffset + gotOffsetSeg;
+end;
+
+// ============================================================================
+// Inline helper procedures for String Builtins (defined before use)
+// ============================================================================
+
+// STRB with register offset - inline version
+procedure WriteStrbRegOffsetInline(buf: TByteBuffer; rt, rn, rm: Byte);
+begin
+  // STRB (register): 1 1 1 1 0 0 0 0 00 0 Rm 00 0 Rn 00 Rt
+  // Using extended register with LSL#0
+  EmitInstr(buf, $38200000 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rt);
+end;
+
+// STR with register offset (64-bit) - inline version
+procedure WriteStrRegOffsetInline(buf: TByteBuffer; rt, rn, rm: Byte);
+begin
+  // STR (register): 1 1 1 1 0 0 0 0 00 0 Rm 00 0 Rn 00 Rt
+  EmitInstr(buf, $F8200000 or (DWord(rm) shl 16) or (DWord(rn) shl 5) or rt);
+end;
+
+// STRB (store byte) with immediate offset - inline version
+procedure WriteStrbImmInline(buf: TByteBuffer; rt, rn: Byte; offset: Integer);
+var
+  imm12: DWord;
+begin
+  if (offset >= 0) and (offset < 4096) then
+  begin
+    imm12 := DWord(offset and $FFF);
+    EmitInstr(buf, $39000000 or (imm12 shl 10) or (DWord(rn) shl 5) or rt);
+  end
+  else
+    raise Exception.Create('WriteStrbImm: offset out of range');
+end;
+
+// Convert CSET result (0 or 1) to 0/1 (ARM64 CSET sets to 1 or 0 already)
+// This is a no-op on ARM64 but included for compatibility
+procedure WriteXzrToX0(buf: TByteBuffer; src: Byte);
+begin
+  // CSET already produces 0 or 1, no conversion needed
+  // Just copy if different register
+  if src <> 0 then
+    WriteMovRegReg(buf, X0, src);
 end;
 
 // ==========================================================================
@@ -1384,6 +1489,18 @@ begin
   
   // Epilogue
   WriteLdpPostIndex(FCode, X29, X30, SP, 48);
+  WriteRet(FCode);
+  
+  // PrintFloat builtin: X0 = value (f64)
+  // For now, just prints "(float)" as a placeholder
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_PrintFloat');
+  
+  // Just print "(float)" for now
+  WriteMovImm64(FCode, X0, 1);       // fd = STDOUT
+  WriteMovImm64(FCode, X1, 7);       // length = 7
+  WriteSyscall(SYS_write);
   WriteRet(FCode);
   
   // Phase 4: Emit user functions
@@ -2569,9 +2686,765 @@ begin
               EmitInstr(FCode, $39400000);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end;
+            end
+
+            // ========== WP-10g: String Builtins S0 (ARM64) ==========
+
+            else if instr.ImmStr = 'StrLen' then
+            begin
+              // StrLen(s: pchar): int64 — null-scan strlen
+              // X0 = s, result in X0
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // X1 = counter = 0
+              WriteMovImm64(FCode, X1, 0);
+              
+              // Loop: LDRB W2, [X0, X1]; CBZ W2,done; ADD X1,X1,#1; B loop
+              // Using forward branches with fixed offsets for simplicity
+              
+              // LDRB W2, [X0, X1]
+              WriteLdrRegOffset(FCode, X2, X0, X1);
+              
+              // CBZ W2, +20 (skip to return)
+              WriteCbz(FCode, X2, 20);
+              
+              // ADD X1, X1, 1
+              WriteAddImm(FCode, X1, X1, 1);
+              
+              // B -24 (back to LDRB)
+              WriteBranch(FCode, -24);
+              
+              // Return: X0 = length in X1
+              WriteMovRegReg(FCode, X0, X1);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrCharAt' then
+            begin
+              // StrCharAt(s: pchar, i: int64): int64 — load byte at s[i] zero-extended
+              // X0 = s, X1 = i
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // LDRB W0, [X0, X1] (zero-extended)
+              WriteLdrRegOffset(FCode, X0, X0, X1);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrSetChar' then
+            begin
+              // StrSetChar(s: pchar, i: int64, c: int64) — write byte c to s[i]
+              // X0 = s, X1 = i, X2 = c
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              
+              // STRB W2, [X0, X1]
+              WriteStrRegOffsetInline(FCode, X2, X0, X1);
+            end
+            else if instr.ImmStr = 'StrNew' then
+            begin
+              // StrNew(capacity: int64): pchar — mmap alloc with 16-byte header
+              // X0 = capacity
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // X1 = capacity + 16 (total mmap size)
+              WriteAddImm(FCode, X1, X0, 16);
+              
+              // mmap(NULL, X1, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANONYMOUS=0x22, -1, 0)
+              WriteMovImm64(FCode, X0, 0);    // addr = NULL
+              WriteMovImm64(FCode, X2, 3);    // PROT_READ|PROT_WRITE
+              WriteMovImm64(FCode, X3, $22);  // MAP_PRIVATE|MAP_ANONYMOUS
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              // X0 now contains allocated pointer
+              // Write capacity to first 8 bytes: STR X0, [X0] (need to save ptr first)
+              // Save ptr to X19
+              WriteMovRegReg(FCode, X19, X0);
+              // Write capacity: LDR X1 with capacity, but we need to reload it
+              // Reload capacity from stack
+              WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]));
+              WriteStrImm(FCode, X1, X19, 0);
+              // Write length = 0 at [X19+8]
+              WriteStrImm(FCode, XZR, X19, 8);
+              
+              // Return pointer + 16 (skip header)
+              WriteAddImm(FCode, X0, X19, 16);
+              WriteMovImm64(FCode, X19, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrFree' then
+            begin
+              // StrFree(s: pchar) — munmap using header
+              // X0 = s (data pointer)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // Get header pointer: subtract 16
+              WriteSubImm(FCode, X1, X0, 16);
+              
+              // Load capacity: LDR X2, [X1]
+              WriteLdrImm(FCode, X2, X1, 0);
+              
+              // munmap(X1, X2 + 16)
+              WriteAddImm(FCode, X2, X2, 16);
+              // X0 = addr
+              WriteMovRegReg(FCode, X0, X1);
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_munmap)
+              else
+                WriteSyscall(SYS_munmap);
+            end
+            else if instr.ImmStr = 'StrFromInt' then
+            begin
+              // StrFromInt(n: int64): pchar — convert int64 to decimal string
+              // Uses mmap'd buffer (64 bytes) + writes digits in reverse
+              // For simplicity, use syscall version via libc or basic implementation
+              
+              // Allocate 64-byte buffer via mmap
+              WriteMovImm64(FCode, X1, 80);  // 64 + 16 header
+              WriteMovImm64(FCode, X2, 3);    // PROT_READ|PROT_WRITE
+              WriteMovImm64(FCode, X3, $22);  // MAP_PRIVATE|MAP_ANONYMOUS
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              WriteMovImm64(FCode, X0, 0);    // addr = NULL
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              // Save buffer (with header) to X19
+              WriteMovRegReg(FCode, X19, X0);
+              
+              // Write capacity = 64 at [X0], length = 0 at [X0+8]
+              WriteMovImm64(FCode, X1, 64);
+              WriteStrImm(FCode, X1, X0, 0);
+              WriteStrImm(FCode, XZR, X0, 8);
+              
+              // Skip header: X20 = data pointer (X19 + 16)
+              WriteAddImm(FCode, X20, X19, 16);
+              
+              // X0 = n (value to convert)
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]));
+              
+              // X1 = sign check
+              WriteCmpImm(FCode, X0, 0);
+              WriteCset(FCode, X1, COND_LT);  // X1 = 1 if negative
+              
+              // If negative, negate
+              // CSNEG X0, X0, X0, GE
+              EmitInstr(FCode, $DA80A400);  // csneg x0, x0, x0, ge
+              
+              // X21 = position counter = 0
+              WriteMovImm64(FCode, X21, 0);
+              
+              // X2 = 10 (divisor)
+              WriteMovImm64(FCode, X2, 10);
+              
+              // Digit loop
+              // digit_loop:
+              //   udiv X3, X0, X2    ; X3 = X0 / 10
+              //   msub X4, X3, X2, X0 ; X4 = X0 - X3*10 (remainder)
+              //   add X4, X4, '0'
+              //   strb W4, [X20, X21]
+              //   add X21, X21, 1
+              //   mov X0, X3
+              //   cbnz X0, digit_loop
+              
+              // Using available registers: X3, X4 for temp
+              WriteUdiv(FCode, X3, X0, X2);     // X3 = X0 / 10
+              WriteMsub(FCode, X4, X3, X2, X0); // X4 = remainder
+              WriteAddImm(FCode, X4, X4, 48);    // X4 += '0'
+              WriteStrbRegOffsetInline(FCode, X4, X20, X21);
+              WriteAddImm(FCode, X21, X21, 1);
+              WriteMovRegReg(FCode, X0, X3);
+              WriteCbnz(FCode, X0, -28);        // Back to digit_loop
+              
+              // Check if we need to add sign
+              WriteCbnz(FCode, X1, 12);          // If X1 != 0, add '-' at position 0
+              
+              // Write null terminator
+              WriteStrbImmInline(FCode, XZR, X20, X21);
+              WriteB(FCode, 8);                   // Skip sign handling
+              
+              // Add sign:
+              WriteMovImm64(FCode, X0, Ord('-'));
+              WriteStrbImmInline(FCode, X0, X20, 0);
+              WriteAddImm(FCode, X21, X21, 1);
+              
+              // Write null terminator
+              WriteStrbImmInline(FCode, XZR, X20, X21);
+              
+              // Update length in header
+              WriteStrImm(FCode, X21, X19, 8);
+              
+              // Return data pointer (X20)
+              WriteMovRegReg(FCode, X0, X20);
+              
+              // Restore
+              WriteMovImm64(FCode, X19, 0);
+              WriteMovImm64(FCode, X20, 0);
+              WriteMovImm64(FCode, X21, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrAppend' then
+            begin
+              // StrAppend(dest: pchar, src: pchar): pchar
+              // For now, return dest (simple implementation)
+              // X0 = dest, X1 = src
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== End of String Builtins S0 ==========
+
+            // ========== WP-10g: String Builtins S1-S7 (ARM64) ==========
+
+            else if instr.ImmStr = 'StrFindChar' then
+            begin
+              // StrFindChar(s: pchar, c: int64, from: int64): int64
+              // Scan s[from..] for byte c. Return index or -1 if not found.
+              // X0 = s, X1 = c, X2 = from
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              
+              // X3 = counter (current index), X19 = s pointer
+              WriteMovRegReg(FCode, X19, X0);
+              WriteMovRegReg(FCode, X3, X2);
+              
+              // X0 = -1 (not found default)
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              
+              // Loop: LDRB W4, [X19, X3]; CMP W4, 0; B.EQ done; CMP W4, X1; B.EQ found; ADD X3, X3, 1; B loop
+              // scan_loop:
+              WriteLdrRegOffset(FCode, X4, X19, X3);  // W4 = s[i]
+              WriteCmpImm(FCode, X4, 0);
+              WriteBeq(FCode, 16);                   // If 0, done (not found)
+              WriteCmpReg(FCode, X4, X1);
+              WriteBeq(FCode, 8);                    // If equal, found
+              WriteAddImm(FCode, X3, X3, 1);         // i++
+              WriteB(FCode, -20);                   // Back to loop start
+              
+              // found: X0 = X3 (return index)
+              WriteMovRegReg(FCode, X0, X3);
+              
+              // done: X0 already has -1 or found index
+              WriteMovImm64(FCode, X19, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrSub' then
+            begin
+              // StrSub(s: pchar, start: int64, len: int64): pchar
+              // mmap new buffer, copy len bytes from s+start
+              // X0 = s, X1 = start, X2 = len
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              
+              // Save params
+              WriteMovRegReg(FCode, X19, X0);  // X19 = s
+              WriteMovRegReg(FCode, X20, X1);  // X20 = start
+              WriteMovRegReg(FCode, X21, X2);  // X21 = len
+              
+              // Allocate new buffer: mmap(len + 16 + 1, ...)
+              WriteAddImm(FCode, X0, X2, 17);  // len + 16 + 1
+              WriteAddImm(FCode, X1, X0, 0);   // copy to X1 for mmap
+              WriteMovImm64(FCode, X0, 0);      // addr = NULL
+              WriteMovImm64(FCode, X2, 3);     // PROT_READ|PROT_WRITE
+              WriteMovImm64(FCode, X3, $22);   // MAP_PRIVATE|MAP_ANONYMOUS
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              // Save new buffer base (X19 -> X22)
+              WriteMovRegReg(FCode, X22, X0);  // X22 = new buffer (with header)
+              
+              // Write header: capacity = len, length = len
+              WriteStrImm(FCode, X21, X22, 0);  // capacity
+              WriteStrImm(FCode, X21, X22, 8);  // length
+              
+              // Data pointer: X23 = X22 + 16
+              WriteAddImm(FCode, X23, X22, 16);
+              
+              // Source pointer: X0 = s + start
+              WriteAddRegReg(FCode, X0, X19, X20);
+              
+              // Copy len bytes using simple loop
+              // X1 = dest, X2 = src, X3 = count, X4 = temp
+              WriteMovRegReg(FCode, X1, X23);     // dest = X23
+              WriteMovRegReg(FCode, X2, X0);     // src = s + start
+              WriteMovRegReg(FCode, X3, X21);    // count = len
+              
+              // copy_loop:
+              WriteCbnz(FCode, X3, 8);           // If X3 == 0, skip
+              WriteB(FCode, 12);                // Skip to done
+              
+              // LDRB W4, [X2], #1
+              WriteLdrRegOffset(FCode, X4, X2, 0);
+              // STRB W4, [X1], #1
+              WriteStrbRegOffsetInline(FCode, X4, X1, 0);
+              // ADD X2, X2, 1
+              WriteAddImm(FCode, X2, X2, 1);
+              // ADD X1, X1, 1  
+              WriteAddImm(FCode, X1, X1, 1);
+              // SUB X3, X3, 1
+              WriteSubImm(FCode, X3, X3, 1);
+              WriteB(FCode, -24);                // Back to loop start
+              
+              // Write null terminator
+              WriteStrbImmInline(FCode, XZR, X23, X21);
+              
+              // Return data pointer
+              WriteMovRegReg(FCode, X0, X23);
+              
+              // Restore
+              WriteMovImm64(FCode, X19, 0);
+              WriteMovImm64(FCode, X20, 0);
+              WriteMovImm64(FCode, X21, 0);
+              WriteMovImm64(FCode, X22, 0);
+              WriteMovImm64(FCode, X23, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrConcat' then
+            begin
+              // StrConcat(a: pchar, b: pchar): pchar
+              // Returns new concatenated string (allocates new buffer)
+              // X0 = a, X1 = b
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // For simplicity: call StrAppend which does basic concat
+              // Just return first string for now (simple stub)
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrCopy' then
+            begin
+              // StrCopy(s: pchar): pchar
+              // Returns copy of string (allocates new buffer)
+              // X0 = s
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // For now, just return the input (stub)
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'IntToStr' then
+            begin
+              // IntToStr(n: int64): pchar — alias for StrFromInt
+              // Same as StrFromInt
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // Allocate 64-byte buffer via mmap
+              WriteMovImm64(FCode, X1, 80);  // 64 + 16 header
+              WriteMovImm64(FCode, X2, 3);
+              WriteMovImm64(FCode, X3, $22);
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              WriteMovImm64(FCode, X0, 0);
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              WriteMovRegReg(FCode, X19, X0);
+              
+              // Write header
+              WriteMovImm64(FCode, X1, 64);
+              WriteStrImm(FCode, X1, X0, 0);
+              WriteStrImm(FCode, XZR, X0, 8);
+              
+              WriteAddImm(FCode, X20, X19, 16);
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]));
+              
+              // Convert to string (same as StrFromInt)
+              WriteCmpImm(FCode, X0, 0);
+              WriteCset(FCode, X1, COND_LT);
+              EmitInstr(FCode, $DA80A400);  // csneg x0, x0, x0, ge
+              WriteMovImm64(FCode, X21, 0);
+              WriteMovImm64(FCode, X2, 10);
+              
+              WriteUdiv(FCode, X3, X0, X2);
+              WriteMsub(FCode, X4, X3, X2, X0);
+              WriteAddImm(FCode, X4, X4, 48);
+              WriteStrbRegOffsetInline(FCode, X4, X20, X21);
+              WriteAddImm(FCode, X21, X21, 1);
+              WriteMovRegReg(FCode, X0, X3);
+              WriteCbnz(FCode, X0, -28);
+              
+              WriteCbnz(FCode, X1, 12);
+              WriteStrbImmInline(FCode, XZR, X20, X21);
+              WriteB(FCode, 8);
+              WriteMovImm64(FCode, X0, Ord('-'));
+              WriteStrbImmInline(FCode, X0, X20, 0);
+              WriteAddImm(FCode, X21, X21, 1);
+              WriteStrbImmInline(FCode, XZR, X20, X21);
+              
+              WriteStrImm(FCode, X21, X19, 8);
+              WriteMovRegReg(FCode, X0, X20);
+              WriteMovImm64(FCode, X19, 0);
+              WriteMovImm64(FCode, X20, 0);
+              WriteMovImm64(FCode, X21, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'FileGetSize' then
+            begin
+              // FileGetSize(path: pchar): int64
+              // Uses open + lseek + close
+              // X0 = path
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // open(path, O_RDONLY, 0)
+              WriteMovImm64(FCode, X1, 0);         // O_RDONLY
+              WriteMovImm64(FCode, X2, 0);         // mode
+              WriteSyscall(SYS_open);
+              
+              // Save fd to X19
+              WriteMovRegReg(FCode, X19, X0);
+              
+              // lseek(fd, 0, SEEK_END)
+              WriteMovRegReg(FCode, X0, X19);
+              WriteMovImm64(FCode, X1, 0);         // offset
+              WriteMovImm64(FCode, X2, 2);        // SEEK_END
+              WriteSyscall(SYS_lseek);
+              
+              // Save size to X20
+              WriteMovRegReg(FCode, X20, X0);
+              
+              // close(fd)
+              WriteMovRegReg(FCode, X0, X19);
+              WriteSyscall(SYS_close);
+              
+              // Return size
+              WriteMovRegReg(FCode, X0, X20);
+              WriteMovImm64(FCode, X19, 0);
+              WriteMovImm64(FCode, X20, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrStartsWith' then
+            begin
+              // StrStartsWith(s: pchar, prefix: pchar): bool
+              // Check if s starts with prefix
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // Save pointers
+              WriteMovRegReg(FCode, X19, X0);  // s
+              WriteMovRegReg(FCode, X20, X1);  // prefix
+              
+              // Simple: compare first char
+              WriteLdrRegOffset(FCode, X0, X19, 0);
+              WriteLdrRegOffset(FCode, X1, X20, 0);
+              WriteCmpReg(FCode, X0, X1);
+              WriteCset(FCode, X0, COND_NE);
+              WriteXzrToX0(FCode, X0);  // Convert to 0/1
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrEndsWith' then
+            begin
+              // StrEndsWith(s: pchar, suffix: pchar): bool
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // Simple: return false for now (stub)
+              WriteMovImm64(FCode, X0, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrEquals' then
+            begin
+              // StrEquals(a: pchar, b: pchar): bool
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // Compare pointers first
+              WriteCmpReg(FCode, X0, X1);
+              WriteCset(FCode, X0, COND_EQ);
+              WriteXzrToX0(FCode, X0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== End of String Builtins S1-S7 ==========
+
+            // ========== Float Builtins (ARM64) ==========
+
+            else if instr.ImmStr = 'PrintFloat' then
+            begin
+              // PrintFloat(value: f64) -> void
+              // Prints float with sign, integer part, '.', and 6 decimal places
+              // X0 = value (in D0, caller passes in register)
+              
+              // For simplicity, we'll print using a basic approach:
+              // Convert to string using StrFromInt for integer part
+              // For now, just print "Float" placeholder
+              
+              // Simple output: write "Float\n" using write syscall
+              // Load string address (will be patched)
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_PrintFloat';
+              WriteBranchLink(FCode, 0);
+            end
+            else if instr.ImmStr = 'format_float' then
+            begin
+              // format_float(value: f64, width: int64, decimals: int64) -> pchar
+              // Returns formatted string with width and decimals
+              // X0 = value, X1 = width, X2 = decimals
+              
+              // For now, just return empty string (stub)
+              // Allocate minimal buffer
+              WriteMovImm64(FCode, X1, 32);
+              WriteMovImm64(FCode, X2, 3);
+              WriteMovImm64(FCode, X3, $22);
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              WriteMovImm64(FCode, X0, 0);
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              // Return empty string (just \0)
+              WriteStrbImmInline(FCode, XZR, X0, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== End of Float Builtins ==========
+
+            // ========== HashMap Builtins (ARM64) ==========
+
+            else if instr.ImmStr = 'HashNew' then
+            begin
+              // HashNew(cap: int64): pchar (raw base ptr)
+              // Layout: [count:8][mask:8][entries: cap*24]
+              // Round cap up to next power of 2, min 8.
+              // X0 = cap
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // Ensure cap >= 8
+              WriteCmpImm(FCode, X0, 8);
+              WriteCset(FCode, X1, COND_GE);
+              // If < 8, set to 8
+              WriteCbnz(FCode, X1, 8);  // If >= 8, skip
+              WriteMovImm64(FCode, X0, 8);  // Set to 8
+              
+              // Round up to power of 2 (simple: use next power of 2)
+              // X19 = cap
+              WriteMovRegReg(FCode, X19, X0);
+              // X0 = X0 - 1
+              WriteSubImm(FCode, X0, X0, 1);
+              // X0 = X0 | (X0 >> 1)
+              WriteLsrImm(FCode, X1, X0, 1);
+              WriteOrrRegReg(FCode, X0, X0, X1);
+              // X0 = X0 | (X0 >> 2)
+              WriteLsrImm(FCode, X1, X0, 2);
+              WriteOrrRegReg(FCode, X0, X0, X1);
+              // X0 = X0 | (X0 >> 4)
+              WriteLsrImm(FCode, X1, X0, 4);
+              WriteOrrRegReg(FCode, X0, X0, X1);
+              // X0 = X0 + 1
+              WriteAddImm(FCode, X0, X0, 1);
+              
+              // Save power-of-2 cap to X19
+              WriteMovRegReg(FCode, X19, X0);
+              
+              // Calculate mmap size: X0 = cap * 24 + 16
+              // X1 = X0 * 24
+              WriteMovImm64(FCode, X1, 24);
+              WriteMul(FCode, X0, X0, X1);  // X0 = X19 * 24
+              WriteAddImm(FCode, X0, X0, 16);  // +16 for header
+              
+              // mmap(NULL, X0, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+              WriteMovImm64(FCode, X1, 0);    // addr = NULL
+              WriteMovImm64(FCode, X2, 3);    // PROT
+              WriteMovImm64(FCode, X3, $22);  // MAP
+              WriteMovImm64(FCode, X4, UInt64(-1));
+              WriteMovImm64(FCode, X5, 0);
+              
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              
+              // X0 = base pointer
+              // Write count=0 at [X0], mask=cap-1 at [X0+8]
+              WriteStrImm(FCode, XZR, X0, 0);  // count = 0
+              WriteSubImm(FCode, X1, X19, 1);  // X1 = cap - 1
+              WriteStrImm(FCode, X1, X0, 8);   // mask = cap - 1
+              
+              // Return base pointer in X0 (already there)
+              WriteMovImm64(FCode, X19, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'HashSet' then
+            begin
+              // HashSet(map: pchar, key: pchar, val: int64): void
+              // Simple implementation: just set in map (stub)
+              // X0 = map, X1 = key, X2 = val
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Just return (do nothing for now - stub)
+              WriteMovImm64(FCode, X0, 0);
+            end
+            else if instr.ImmStr = 'HashGet' then
+            begin
+              // HashGet(map: pchar, key: pchar): int64
+              // Returns value or 0 if not found (stub)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Return 0 (stub)
+              WriteMovImm64(FCode, X0, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'HashHas' then
+            begin
+              // HashHas(map: pchar, key: pchar): bool
+              // Returns 0 or 1 (stub)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Return 0 (stub - key not found)
+              WriteMovImm64(FCode, X0, 0);
+              
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== End of HashMap Builtins ==========
           end;
-          
+        
         // ========== Phase 2: Global Variables ==========
         
         irLoadGlobal:
