@@ -2,8 +2,7 @@
 program test_if;
 
 uses
-  SysUtils,
-  Classes,
+  SysUtils, Classes,
   fpcunit, testregistry, consoletestrunner,
   diag, lexer, parser, ast;
 
@@ -19,20 +18,30 @@ type
 function TIfTest.ParseProgramFromFile(const path: string): TAstProgram;
 var
   sl: TStringList;
-  src: string;
+  src, filePath: string;
   lex: TLexer;
   p: TParser;
 begin
+  // Versuche erst den relativen Pfad, dann vom Projekt-Root
+  if FileExists(path) then
+    filePath := path
+  else if FileExists('tests/lyx/basic/if_test.lyx') then
+    filePath := 'tests/lyx/basic/if_test.lyx'
+  else if FileExists('../tests/lyx/basic/if_test.lyx') then
+    filePath := '../tests/lyx/basic/if_test.lyx'
+  else
+    raise Exception.Create('File not found: ' + path);
+
   sl := TStringList.Create;
   try
-    sl.LoadFromFile(path);
+    sl.LoadFromFile(filePath);
     src := sl.Text;
   finally
     sl.Free;
   end;
 
   FDiag := TDiagnostics.Create;
-  lex := TLexer.Create(src, path, FDiag);
+  lex := TLexer.Create(src, filePath, FDiag);
   try
     p := TParser.Create(lex, FDiag);
     try
@@ -54,10 +63,11 @@ var
   blk: TAstBlock;
   stmt: TAstStmt;
   if1, if2, if3: TAstIf;
+  ifCount, i: Integer;
 begin
   prog := ParseProgramFromFile('tests/lyx/basic/if_test.lyx');
   try
-    // Erwartet: eine fn main plus con NL -> zwei Decls
+    // Erwartet: eine fn main plus import std.system -> zwei Decls
     AssertTrue(Length(prog.Decls) >= 2);
     WriteLn('CHK: decls >=2');
 
@@ -75,32 +85,54 @@ begin
     blk := f.Body;
     AssertTrue(Assigned(blk));
 
-    // Stmts: [let x..., if1, if2, if3, return]
-    AssertTrue(Length(blk.Stmts) >= 4);
+    // Zähle if-Statements im Block
+    ifCount := 0;
+    for i := 0 to High(blk.Stmts) do
+      if blk.Stmts[i] is TAstIf then
+        Inc(ifCount);
+    
+    WriteLn('Number of if statements: ', ifCount);
+    AssertTrue(ifCount >= 3);
     WriteLn('CHK: stmts >=4');
 
-    // Erste If ist an Position 1
+    // Finde if-Statements nach Position (ignoring let/var decls)
+    i := 0;
+    // Skip bis wir zum ersten if kommen
+    while (i < Length(blk.Stmts)) and not (blk.Stmts[i] is TAstIf) do
+      Inc(i);
+    
+    // if1
     WriteLn('CHK: checking if1');
-    stmt := blk.Stmts[1];
+    stmt := blk.Stmts[i];
     AssertTrue(stmt is TAstIf);
     if1 := TAstIf(stmt);
     // Bedingung: x > 5 -> BinOp mit Op = tkGt
     AssertTrue(if1.Cond is TAstBinOp);
     AssertTrue(TAstBinOp(if1.Cond).Op = tkGt);
-    // ThenBranch sollte ein Block mit einem Call PrintStr
+    // ThenBranch sollte ein Block sein
     AssertTrue(if1.ThenBranch is TAstBlock);
 
-    // Zweite If (Position 2) prüft &&
+    // Nächstes if finden
+    Inc(i);
+    while (i < Length(blk.Stmts)) and not (blk.Stmts[i] is TAstIf) do
+      Inc(i);
+    
+    // if2
     WriteLn('CHK: checking if2');
-    stmt := blk.Stmts[2];
+    stmt := blk.Stmts[i];
     AssertTrue(stmt is TAstIf);
     if2 := TAstIf(stmt);
     AssertTrue(if2.Cond is TAstBinOp);
     AssertTrue(TAstBinOp(if2.Cond).Op = tkAnd);
 
-    // Dritte If (Position 3) ist verschachtelt
+    // Nächstes if finden
+    Inc(i);
+    while (i < Length(blk.Stmts)) and not (blk.Stmts[i] is TAstIf) do
+      Inc(i);
+    
+    // if3
     WriteLn('CHK: checking if3');
-    stmt := blk.Stmts[3];
+    stmt := blk.Stmts[i];
     AssertTrue(stmt is TAstIf);
     if3 := TAstIf(stmt);
     // Outer cond: x == 0 -> tkEq
