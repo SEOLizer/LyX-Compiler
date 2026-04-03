@@ -37,6 +37,20 @@ const
   SYS_RANDOM           = 1202;
   SYS_RANDOM_SEED      = 1203;
 
+  // === Safety-Critical ESP32 Features (aerospace-todo 3.1) ===
+  SYS_WATCHDOG_FEED    = 2000;  // TWDT (Task Watchdog Timer) feed
+  SYS_WATCHDOG_INIT    = 2001;  // TWDT initialize
+  SYS_BROWNOUT_CHECK   = 2002;  // Brownout detector read
+  SYS_BROWNOUT_CONFIG  = 2003;  // Brownout threshold config
+  SYS_FLASH_VERIFY     = 2004;  // Flash integrity check (CRC32)
+  SYS_SECURE_BOOT      = 2005;  // Secure boot verification
+  SYS_MPU_CONFIG       = 2006;  // Memory Protection Unit config
+  SYS_CACHE_FLUSH      = 2007;  // Cache flush for DMA coherence
+  SYS_STACK_CANARY     = 2008;  // Stack canary check
+  SYS_PANIC_HANDLER    = 2009;  // Custom panic handler install
+  SYS_WDT_RESET        = 2010;  // Force watchdog reset
+  SYS_COREDUMP_SAVE    = 2011;  // Save coredump to flash
+
 // File descriptors
 const
   STDIN_FD  = 0;
@@ -81,6 +95,38 @@ const
 // ESP32 SPIFFS base path
 const
   SPIFFS_BASE_PATH = '/spiffs';
+
+// === Watchdog Constants ===
+const
+  WDT_TIMEOUT_MS_DEFAULT = 5000;   // 5 seconds default
+  WDT_TIMEOUT_MS_MIN     = 100;    // 100ms minimum
+  WDT_TIMEOUT_MS_MAX     = 30000;  // 30 seconds maximum
+
+// === Brownout Constants ===
+const
+  BROWNOUT_THRESHOLD_MIN = 2400;   // 2.4V minimum
+  BROWNOUT_THRESHOLD_MAX = 3600;   // 3.6V maximum
+  BROWNOUT_THRESHOLD_DEFAULT = 2800; // 2.8V default
+
+// === MPU Constants ===
+const
+  MPU_REGION_CODE   = 0;  // Code region (flash)
+  MPU_REGION_RODATA = 1;  // Read-only data
+  MPU_REGION_STACK  = 2;  // Stack region (no exec)
+  MPU_REGION_HEAP   = 3;  // Heap region
+  MPU_REGION_IO     = 4;  // I/O registers
+  MPU_REGION_COUNT  = 5;
+
+  MPU_ACCESS_RW   = 0;  // Read/Write
+  MPU_ACCESS_RO   = 1;  // Read-Only
+  MPU_ACCESS_X    = 2;  // Execute only
+  MPU_ACCESS_RX   = 3;  // Read/Execute
+
+// === Flash Constants ===
+const
+  FLASH_CRC32_OFFSET  = $0000;  // CRC32 at start of partition
+  FLASH_APP_OFFSET    = $10000; // Application start offset
+  FLASH_PARTITION_SIZE = $100000; // 1MB partition size
 
 implementation
 
