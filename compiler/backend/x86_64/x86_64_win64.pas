@@ -2088,7 +2088,7 @@ begin
              EmitU8(FCode, $48); EmitU8(FCode, $09); EmitU8(FCode, $C8);       // or rax, rcx
              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX); // store result
            end;
-         irReturn:
+         irFuncExit:
           begin
             // Move return value into RAX (non-entry) or RCX (entry)
             if isEntryFunction then

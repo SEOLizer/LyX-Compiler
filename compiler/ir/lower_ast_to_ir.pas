@@ -469,9 +469,9 @@ begin
        
        // Emit implicit return for void functions if last statement wasn't a return
        if (Length(FCurrentFunc.Instructions) = 0) or 
-          (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+          (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
        begin
-         instr.Op := irReturn;
+         instr.Op := irFuncExit;
          instr.Src1 := -1;
          Emit(instr);
        end;
@@ -551,9 +551,9 @@ begin
         
         // Emit implicit return for void methods if last statement wasn't a return
         if (Length(FCurrentFunc.Instructions) = 0) or 
-           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
-          instr.Op := irReturn;
+          instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
@@ -642,9 +642,9 @@ begin
         
         // Emit implicit return for void methods if last statement wasn't a return
         if (Length(FCurrentFunc.Instructions) = 0) or 
-           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
-          instr.Op := irReturn;
+          instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
@@ -964,9 +964,9 @@ begin
                 for k := 0 to High(m.Body.Stmts) do
                   LowerStmt(m.Body.Stmts[k]);
                 if (Length(FCurrentFunc.Instructions) = 0) or
-                   (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+                   (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
                 begin
-                  instr.Op := irReturn;
+                  instr.Op := irFuncExit;
                   instr.Src1 := -1;
                   Emit(instr);
                 end;
@@ -1079,11 +1079,11 @@ begin
 
               // Emit implicit return for void functions if last statement wasn't a return
               if (Length(FCurrentFunc.Instructions) = 0) or
-                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
               begin
                 // Initialize instr locally for this scope
                 instr := Default(TIRInstr);
-                instr.Op := irReturn;
+                instr.Op := irFuncExit;
                 instr.Src1 := -1;
                 Emit(instr);
               end;
@@ -1219,9 +1219,9 @@ begin
 
     // Emit implicit return for void functions
     if (Length(FCurrentFunc.Instructions) = 0) or
-       (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irReturn) then
+       (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
     begin
-      instr.Op := irReturn;
+      instr.Op := irFuncExit;
       instr.Src1 := -1;
       Emit(instr);
     end;
@@ -5552,14 +5552,14 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         tmp := LowerExpr(TAstReturn(stmt).Value);
         if tmp < 0 then Exit(False);
         instr := Default(TIRInstr);
-        instr.Op := irReturn;
+        instr.Op := irFuncExit;
         instr.Src1 := tmp;
         Emit(instr);
       end
       else
       begin
         instr := Default(TIRInstr);
-        instr.Op := irReturn;
+        instr.Op := irFuncExit;
         instr.Src1 := -1; // void return
         Emit(instr);
       end;

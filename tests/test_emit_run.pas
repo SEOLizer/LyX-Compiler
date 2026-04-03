@@ -21,7 +21,7 @@ begin
     // add temp2 = temp0 + temp1
     instr.Op := irAdd; instr.Dest := 2; instr.Src1 := 0; instr.Src2 := 1; fadd.Emit(instr);
     // return temp2
-    instr.Op := irReturn; instr.Src1 := 2; fadd.Emit(instr);
+    instr.Op := irRet; instr.Src1 := 2; fadd.Emit(instr);
 
     // function main(): int64 { var tmp := add(2,3); PrintInt(tmp); return 0 }
     fmain := m.AddFunction('main');
@@ -40,7 +40,7 @@ begin
     instr.Op := irCallBuiltin; instr.ImmStr := 'PrintInt'; instr.Src1 := 3; fmain.Emit(instr);
     // return 0 (call exit or return)
     instr.Op := irConstInt; instr.Dest := 4; instr.ImmInt := 0; fmain.Emit(instr);
-    instr.Op := irReturn; instr.Src1 := 4; fmain.Emit(instr);
+    instr.Op := irRet; instr.Src1 := 4; fmain.Emit(instr);
 
     // Now emit
     emit := TX86_64Emitter.Create;

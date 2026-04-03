@@ -945,7 +945,7 @@ begin
       instr := fn.Instructions[j];
       
       case instr.Op of
-        irReturn:
+        irFuncExit:
         begin
           // Rückgabewert in RAX laden (falls vorhanden)
           // Src1 ist ein Temp-Index, daher fn.LocalCount addieren
@@ -6539,7 +6539,7 @@ begin
     end;
 
     // Sicherstellen, dass die Funktion einen Return hat
-    if (Length(fn.Instructions) = 0) or (fn.Instructions[High(fn.Instructions)].Op <> irReturn) then
+    if (Length(fn.Instructions) = 0) or (fn.Instructions[High(fn.Instructions)].Op <> irFuncExit) then
     begin
       EmitRex(FCode, 1, 0, 0, 0);
       EmitU8(FCode, $89);
