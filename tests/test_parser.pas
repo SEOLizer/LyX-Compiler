@@ -203,10 +203,10 @@ var
 begin
   prog := ParseProgramFromSource('unit foo; fn main(): int64 { return 0; }');
   try
-    // 3 Declarations: import std.system, unit foo, fn main
+    // 3 Declarations: unit foo, import std.system, fn main
     AssertEquals(3, Length(prog.Decls));
-    AssertTrue(prog.Decls[1] is TAstUnitDecl);
-    u := TAstUnitDecl(prog.Decls[1]);
+    AssertTrue(prog.Decls[0] is TAstUnitDecl);
+    u := TAstUnitDecl(prog.Decls[0]);
     AssertEquals('foo', u.UnitPath);
   finally
     prog.Free;
@@ -260,7 +260,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { for i := 0 to 5 do { PrintInt(i); } return 0; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstFor);
     forStmt := TAstFor(blk.Stmts[0]);
@@ -283,7 +283,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { for i := 10 downto 1 do PrintInt(i); return 0; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstFor);
     forStmt := TAstFor(blk.Stmts[0]);
@@ -303,7 +303,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { var x: int64 := 0; repeat { x := x + 1; } until x > 5; return x; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[1] is TAstRepeatUntil);
     repeatStmt := TAstRepeatUntil(blk.Stmts[1]);
@@ -324,7 +324,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { return ''A''; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstReturn);
     ret := TAstReturn(blk.Stmts[0]);
@@ -347,7 +347,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { PrintInt(obj.field); return 0; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstExprStmt);
     exprStmt := TAstExprStmt(blk.Stmts[0]);
@@ -375,7 +375,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { PrintInt(arr[0]); return 0; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstExprStmt);
     exprStmt := TAstExprStmt(blk.Stmts[0]);
@@ -466,7 +466,7 @@ var
 begin
   prog := ParseProgramFromSource('fn main(): int64 { var x: int64 := 1; return --x; }');
   try
-    f := TAstFuncDecl(prog.Decls[0]);
+    f := FindMainFunc(prog);
     blk := f.Body;
     AssertTrue(blk.Stmts[0] is TAstVarDecl);
     AssertTrue(blk.Stmts[1] is TAstReturn);
