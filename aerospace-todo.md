@@ -126,10 +126,10 @@ shared var altitude: Altitude protected by mutex;
 
 ### 3.3 RISC-V
 
-- [ ] **PMP (Physical Memory Protection)**: Automatische PMP-Konfiguration
-- [ ] **Machine Mode**: Nur M-Mode für kritischen Code
-- [ ] **Ecall/Ebreak**: System-Call-Interface für RTOS
-- [ ] **Atomic Operations**: LR/SC für Lock-free Datenstrukturen
+- [x] **PMP (Physical Memory Protection)**: Automatische PMP-Konfiguration → `pmp_config(region, addr, size, cfg)`, `pmp_lock(region)`, 16 Regionen, NAPOT/NA4/TOR Modes
+- [x] **Machine Mode**: Nur M-Mode für kritischen Code → `mret()`, `sret()`, `get_mhartid()`, `get_mcycle()`, CSR-Zugriff via `csr_read/write/set/clear()`
+- [x] **Ecall/Ebreak**: System-Call-Interface für RTOS → `ecall_syscall(num)`, `ebreak()`, `wfi()`, `fence()`, `fence_i()`
+- [x] **Atomic Operations**: LR/SC für Lock-free Datenstrukturen → RV64A Extension im Emitter integriert (LR/SC-Instruktionen verfügbar)
 
 ---
 
