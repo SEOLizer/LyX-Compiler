@@ -29,9 +29,9 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 **Fehlt ❌ – Sonstige Builtins:**
 - [x] `PrintFloat` / `Println` / `printf` (PrintFloat implementiert, Println/printf Stub)
-- [ ] `mmap` / `munmap` (als Builtin-Aufruf, nicht nur intern)
-- [ ] `ioctl` / `getpid`
-- [ ] `peek8/16/32/64` / `poke8/16/32/64` / `buf_get_byte` / `buf_put_byte`
+- [x] `mmap` / `munmap` (als Builtin-Aufruf)
+- [x] `ioctl` / `getpid`
+- [x] `peek8/16/32/64` / `poke8/16/32/64`
 - [ ] `format_float` (`:width:decimals` Format-Specifier)
 - [ ] `Inspect` (Debug-Visualizer)
 - [ ] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_fcntl`, `sys_shutdown`

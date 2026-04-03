@@ -134,6 +134,8 @@ const
   SYS_mmap = 222;
   SYS_munmap = 215;
   SYS_brk = 214;
+  SYS_getpid = 172;
+  SYS_ioctl = 29;
 
   // macOS ARM64 Syscall Numbers (BSD-style)
   MACOS_SYS_exit = 1;
@@ -149,6 +151,8 @@ const
   MACOS_SYS_chmod = 15;
   MACOS_SYS_mmap = 197;
   MACOS_SYS_munmap = 73;
+  MACOS_SYS_getpid = 20;
+  MACOS_SYS_ioctl = 54;
 
 // ==========================================================================
 // ARM64 Instruction Encoding Helpers
@@ -1654,7 +1658,8 @@ begin
              (instr.ImmStr = 'rename') or (instr.ImmStr = 'mkdir') or
              (instr.ImmStr = 'rmdir') or (instr.ImmStr = 'chmod') or
              (instr.ImmStr = 'now_unix') or (instr.ImmStr = 'now_unix_ms') or
-             (instr.ImmStr = 'sleep_ms') then
+             (instr.ImmStr = 'sleep_ms') or (instr.ImmStr = 'getpid') or
+             (instr.ImmStr = 'ioctl') then
             TrackEnergy(eokSyscall)
           else
             TrackEnergy(eokALU);
@@ -2530,6 +2535,47 @@ begin
                 WriteSyscall(MACOS_SYS_munmap)
               else
                 WriteSyscall(SYS_munmap);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'getpid' then
+            begin
+              // getpid() -> int64: returns process ID
+              // X8 = SYS_getpid (172 for ARM64 Linux)
+              WriteMovImm64(FCode, X0, 0);  // No args
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_getpid)
+              else
+                WriteSyscall(SYS_getpid);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'ioctl' then
+            begin
+              // ioctl(fd, request, argp) -> int64
+              // X0=fd, X1=request, X2=argp, X8=SYS_ioctl (29 for ARM64 Linux)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_ioctl)
+              else
+                WriteSyscall(SYS_ioctl);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
