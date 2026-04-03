@@ -1805,10 +1805,55 @@ begin
             else if instr.ImmStr = 'FileGetSize' then
             begin
               // FileGetSize(path) -> int64
-              // Use GetFileSizeEx Windows API
-              // First open file, then get size, then close
-              // For now: stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // Use CreateFileA + GetFileSizeEx + CloseHandle
+              // X0 = path
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // CreateFileA: GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
+              WriteMovImm64(FCode, X1, UInt64($80000000));  // GENERIC_READ
+              WriteMovImm64(FCode, X2, 1);                   // FILE_SHARE_READ
+              WriteMovImm64(FCode, X3, 0);                   // Security = NULL
+              WriteMovImm64(FCode, X4, 3);                   // OPEN_EXISTING
+              WriteMovImm64(FCode, X5, UInt64($80));         // FILE_ATTRIBUTE_NORMAL
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'CreateFileA';
+              WriteBranchLink(FCode, 0);
+              
+              // Check if handle is valid (not INVALID_HANDLE_VALUE)
+              WriteMovImm64(FCode, X1, UInt64($FFFFFFFFFFFFFFFF));
+              WriteCmpReg(FCode, X0, X1);
+              WriteCbz(FCode, X0, 48);  // If invalid, jump to return 0
+              
+              // Save handle
+              WriteMovRegReg(FCode, X9, X0);
+              
+              // GetFileSizeEx(handle, &size)
+              WriteMovRegReg(FCode, X0, X9);
+              // Allocate 8 bytes on stack for size
+              WriteSubImm(FCode, SP, SP, 16);
+              WriteMovRegReg(FCode, X1, SP);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetFileSizeEx';
+              WriteBranchLink(FCode, 0);
+              
+              // Load size value
+              WriteLdrImm(FCode, X0, SP, 0);
+              
+              // CloseHandle
+              WriteMovRegReg(FCode, X0, X9);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'CloseHandle';
+              WriteBranchLink(FCode, 0);
+              
+              // Restore stack
+              WriteAddImm(FCode, SP, SP, 16);
+              
+              // Return size in X0
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
