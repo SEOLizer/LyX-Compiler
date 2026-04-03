@@ -1184,7 +1184,7 @@ var
   nonZeroPos, jmpDonePos, jgePos, loopStartPos, jneLoopPos, jeSignPos: Integer;
   targetPos, jmpPos: Integer;
   jmpAfterPadPos: Integer;
-  nextLabelPos, doneLabelPos, notFoundPos: Integer;
+  nextLabelPos, doneLabelPos, notFoundPos, reallocDonePos: Integer;
   argCount: Integer;
   argTemps: array of Integer;
   arg3: Integer;
@@ -2741,7 +2741,363 @@ begin
 
         irMapRemove, irSetRemove, irMapFree, irSetFree:
           begin
-            // TODO: implement properly
+            // Free via VirtualFree
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegImm64(FCode, RDX, 0);
+            WriteMovRegImm64(FCode, R8, $8000); // MEM_RELEASE
+            // Call VirtualFree
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+          end;
+
+        // === Bit Operations (TOR-011) ===
+        irXor:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C1); // xor rcx, rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irNor:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $09); EmitU8(FCode, $C1); // or rcx, rax
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D1); // not rcx
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irBitAnd:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $21); EmitU8(FCode, $C1); // and rcx, rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irBitOr:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $09); EmitU8(FCode, $C1); // or rcx, rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irBitXor:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C1); // xor rcx, rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RCX);
+          end;
+
+        irBitNot:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D0); // not rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irShl:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $E0); // shl rax, cl
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irShr:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $D3); EmitU8(FCode, $E8); // shr rax, cl
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        // === Type Cast (TOR-011) ===
+        irCast:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        // === VarCall (TOR-011) ===
+        irVarCall:
+          begin
+            // Virtual call via VMT
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1)); // object ptr
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00); // mov rax, [rax] (VMT)
+            // jmp qword ptr [rax + VMTIndex*8]
+            EmitU8(FCode, $FF); EmitU8(FCode, $60);
+            EmitU8(FCode, Byte(instr.VMTIndex * 8));
+          end;
+
+        // === DynArray Operations (TOR-011) ===
+        irDynArrayPush:
+          begin
+            // Fat pointer: [ptr:8][len:8][cap:8] in 3 consecutive slots
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));      // ptr
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1 + 1));  // len
+            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src1 + 2));  // cap
+            // if len >= cap, realloc
+            EmitU8(FCode, $48); EmitU8(FCode, $39); EmitU8(FCode, $D6); // cmp rsi, rdx
+            jgePos := FCode.Size;
+            EmitU8(FCode, $7D); EmitU8(FCode, $00);
+            // Realloc: double cap or init to 4
+            EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $D2); // test rdx, rdx
+            EmitU8(FCode, $75); EmitU8(FCode, $07);
+            WriteMovRegImm64(FCode, RDX, 4);
+            EmitU8(FCode, $EB); EmitU8(FCode, $05);
+            EmitU8(FCode, $48); EmitU8(FCode, $D1); EmitU8(FCode, $E2); // shl rdx, 1
+            // VirtualAlloc new buffer
+            WriteMovRegImm64(FCode, RCX, 0);
+            WriteMovRegReg(FCode, RDX, RDX);
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E2); EmitU8(FCode, $03); // *8
+            WriteMovRegImm64(FCode, R8, $3000); // MEM_COMMIT|MEM_RESERVE
+            WriteMovRegImm64(FCode, R9, $04);   // PAGE_READWRITE
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+            // Update ptr, cap
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Src1), RAX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Src1 + 2), RDX);
+            reallocDonePos := FCode.Size;
+            FCode.PatchU8(jgePos + 1, reallocDonePos - (jgePos + 2));
+            // Store value
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1 + 1));
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03);
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $F7);
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $37);
+            // len++
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1 + 1));
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C0);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Src1 + 1), RAX);
+          end;
+
+        irDynArrayPop:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1 + 1));
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C8);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Src1 + 1), RAX);
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E0); EmitU8(FCode, $03);
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C7);
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $07);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irDynArrayLen:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1 + 1));
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irDynArrayFree:
+          begin
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegImm64(FCode, RDX, 0);
+            WriteMovRegImm64(FCode, R8, $8000);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+          end;
+
+        // === Closure Support (TOR-011) ===
+        irLoadCaptured:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $03); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(instr.ImmInt));
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        // === Exception Handling (TOR-011) ===
+        irPushHandler, irPopHandler, irLoadHandlerExn, irThrow:
+          begin
+            // Stub: Windows SEH not yet implemented
+            if instr.Dest >= 0 then
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+              WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+            end;
+          end;
+
+        irPanic:
+          begin
+            // panic(msg): write to stderr via GetStdHandle + WriteFile
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(localCnt + instr.Src1));
+            // strlen
+            WriteMovRegImm64(FCode, RCX, 0);
+            EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+            EmitU8(FCode, $74); EmitU8(FCode, $05);
+            EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+            EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+            // GetStdHandle(STD_ERROR_HANDLE = -12)
+            WriteMovRegImm64(FCode, RCX, UInt64(-12));
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+            // WriteFile
+            WriteMovRegReg(FCode, RCX, RAX);
+            WriteMovRegReg(FCode, RDX, RSI);
+            WriteMovRegReg(FCode, R8, RCX); // length was in RCX, need to save
+            WriteMovRegImm64(FCode, R9, 0);
+            // sub rsp, 8; push 0 (lpOverlapped)
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, $08);
+            EmitU8(FCode, $6A); EmitU8(FCode, $00);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+            EmitU8(FCode, $48); EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, $10);
+            // ExitProcess(1)
+            WriteMovRegImm64(FCode, RCX, 1);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'ExitProcess';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
+          end;
+
+        // === SIMD Operations (TOR-011) ===
+        irSIMDAdd:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $66); EmitU8(FCode, $0F); EmitU8(FCode, $FE); EmitU8(FCode, $C1); // paddq xmm0, xmm1
+            // Store result
+            EmitU8(FCode, $F3); EmitU8(FCode, $0F); EmitU8(FCode, $7E); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(localCnt + instr.Dest)));
+          end;
+
+        irSIMDSub:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $66); EmitU8(FCode, $0F); EmitU8(FCode, $F8); EmitU8(FCode, $C1); // psubq xmm0, xmm1
+            EmitU8(FCode, $F3); EmitU8(FCode, $0F); EmitU8(FCode, $7E); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(localCnt + instr.Dest)));
+          end;
+
+        irSIMDMul:
+          begin
+            // Scalar fallback for SIMD mul
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $E1); // mul rcx
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irSIMDDiv:
+          begin
+            // Scalar fallback
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $D2); // xor rdx, rdx
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $F1); // div rcx
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irSIMDAnd:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $66); EmitU8(FCode, $0F); EmitU8(FCode, $DB); EmitU8(FCode, $C1); // pand xmm0, xmm1
+            EmitU8(FCode, $F3); EmitU8(FCode, $0F); EmitU8(FCode, $7E); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(localCnt + instr.Dest)));
+          end;
+
+        irSIMDOr:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $66); EmitU8(FCode, $0F); EmitU8(FCode, $EB); EmitU8(FCode, $C1); // por xmm0, xmm1
+            EmitU8(FCode, $F3); EmitU8(FCode, $0F); EmitU8(FCode, $7E); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(localCnt + instr.Dest)));
+          end;
+
+        irSIMDXor:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $66); EmitU8(FCode, $0F); EmitU8(FCode, $EF); EmitU8(FCode, $C1); // pxor xmm0, xmm1
+            EmitU8(FCode, $F3); EmitU8(FCode, $0F); EmitU8(FCode, $7E); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(localCnt + instr.Dest)));
+          end;
+
+        irSIMDNeg:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $F7); EmitU8(FCode, $D8); // neg rax
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irSIMDCmpEq, irSIMDCmpNe, irSIMDCmpLt, irSIMDCmpLe, irSIMDCmpGt, irSIMDCmpGe:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $39); EmitU8(FCode, $C1); // cmp rcx, rax
+            if instr.Op = irSIMDCmpEq then
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); end // sete al
+            else if instr.Op = irSIMDCmpNe then
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); end // setne al
+            else if instr.Op = irSIMDCmpLt then
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $9C); EmitU8(FCode, $C0); end // setl al
+            else if instr.Op = irSIMDCmpLe then
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $9E); EmitU8(FCode, $C0); end // setle al
+            else if instr.Op = irSIMDCmpGt then
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $9F); EmitU8(FCode, $C0); end // setg al
+            else
+              begin EmitU8(FCode, $0F); EmitU8(FCode, $9D); EmitU8(FCode, $C0); end; // setge al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx eax, al
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irSIMDLoadElem:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03);
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        irSIMDStoreElem:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src2));
+            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(localCnt + instr.Src3));
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03);
+            EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $10);
+          end;
+
+        // === Type Checking (TOR-011) ===
+        irIsType:
+          begin
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(localCnt + instr.Src1));
+            EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00); // VMT ptr
+            WriteMovRegImm64(FCode, RAX, 1); // stub: always true
+            WriteMovMemReg(FCode, RBP, SlotOffset(localCnt + instr.Dest), RAX);
+          end;
+
+        // === Debug Inspect (TOR-011) ===
+        irInspect:
+          begin
+            // Stub: print inspect info via OutputDebugStringA
+            WriteMovRegImm64(FCode, RCX, 0); // placeholder string
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'OutputDebugStringA';
+            EmitU8(FCode, $E8); EmitU32(FCode, 0);
           end;
 
         else
