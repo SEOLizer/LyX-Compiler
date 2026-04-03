@@ -1411,6 +1411,9 @@ begin
       if instr.Dest > maxTemp then maxTemp := instr.Dest;
       if instr.Src1 > maxTemp then maxTemp := instr.Src1;
       if instr.Src2 > maxTemp then maxTemp := instr.Src2;
+      // ArgTemps enthalten zusätzliche Argumente (z.B. mmap mit 6 Args)
+      for k := 0 to High(instr.ArgTemps) do
+        if instr.ArgTemps[k] > maxTemp then maxTemp := instr.ArgTemps[k];
     end;
     
     totalSlots := localCnt + maxTemp + 1;
@@ -1420,9 +1423,17 @@ begin
     frameSize := ((totalSlots * 8) + 16 + 15) and not 15;
     
     // Function prologue
-    // stp x29, x30, [sp, #-frameSize]!
-    // mov x29, sp
-    WriteStpPreIndex(FCode, X29, X30, SP, -frameSize);
+    // Für kleine Frames (≤512): stp x29, x30, [sp, #-frameSize]!
+    // Für große Frames (>512):  sub sp, sp, #frameSize
+    //                           stp x29, x30, [sp, #0]
+    // Dann immer: mov x29, sp
+    if frameSize <= 512 then
+      WriteStpPreIndex(FCode, X29, X30, SP, -frameSize)
+    else
+    begin
+      WriteSubImm(FCode, SP, SP, frameSize);
+      WriteStpOffset(FCode, X29, X30, SP, 0);
+    end;
     WriteMovRegReg(FCode, X29, SP);
     
     // Copy parameters from registers to local slots
@@ -2281,6 +2292,283 @@ begin
               WriteMovImm64(FCode, X0, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            // ========== WP-10h-1: Memory & Pointer Builtins ==========
+
+            else if instr.ImmStr = 'mmap' then
+            begin
+              // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+              // ARM64 Linux AAPCS64: X0=addr, X1=length, X2=prot, X3=flags, X4=fd, X5=offset
+              // X8 = SYS_mmap (222), result in X0
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // flags → X3 (ARM64: no R10 workaround needed)
+              if Length(instr.ArgTemps) >= 4 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[3]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              // fd → X4 (default -1 = anonymous)
+              if Length(instr.ArgTemps) >= 5 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[4]))
+              else
+                WriteMovImm64(FCode, X4, UInt64(-1));
+              // offset → X5
+              if Length(instr.ArgTemps) >= 6 then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[5]))
+              else
+                WriteMovImm64(FCode, X5, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_mmap)
+              else
+                WriteSyscall(SYS_mmap);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'munmap' then
+            begin
+              // munmap(addr, length) -> int64
+              // X0=addr, X1=length, X8=SYS_munmap (215)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_munmap)
+              else
+                WriteSyscall(SYS_munmap);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'poke8' then
+            begin
+              // poke8(addr, value) - write byte to memory
+              // addr → X1, value → X0; STRB W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // STRB W0, [X1]  (encoding: 0x39000000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $39000020);
+            end
+
+            else if instr.ImmStr = 'peek8' then
+            begin
+              // peek8(addr) -> int64 - read byte from memory (zero-extended)
+              // addr → X1; LDRB W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // LDRB W0, [X1]  (encoding: 0x39400000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $39400020);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'poke16' then
+            begin
+              // poke16(addr, value) - write 16-bit halfword to memory
+              // addr → X1, value → X0; STRH W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // STRH W0, [X1]  (encoding: 0x79000000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $79000020);
+            end
+
+            else if instr.ImmStr = 'peek16' then
+            begin
+              // peek16(addr) -> int64 - read 16-bit halfword (zero-extended)
+              // addr → X1; LDRH W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // LDRH W0, [X1]  (encoding: 0x79400000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $79400020);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'poke32' then
+            begin
+              // poke32(addr, value) - write 32-bit word to memory
+              // addr → X1, value → X0; STR W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // STR W0, [X1]  (encoding: 0xB9000000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $B9000020);
+            end
+
+            else if instr.ImmStr = 'peek32' then
+            begin
+              // peek32(addr) -> int64 - read 32-bit word (zero-extended)
+              // addr → X1; LDR W0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // LDR W0, [X1]  (encoding: 0xB9400000 | (n<<5) | t, n=1, t=0)
+              EmitInstr(FCode, $B9400020);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'poke64' then
+            begin
+              // poke64(addr, value) - write 64-bit qword to memory
+              // addr → X1, value → X0; STR X0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // STR X0, [X1]
+              WriteStrImm(FCode, X0, X1, 0);
+            end
+
+            else if instr.ImmStr = 'peek64' then
+            begin
+              // peek64(addr) -> int64 - read 64-bit qword
+              // addr → X1; LDR X0, [X1]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // LDR X0, [X1]
+              WriteLdrImm(FCode, X0, X1, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'write_raw' then
+            begin
+              // write_raw(fd, buf, len) -> int64
+              // X0=fd, X1=buf, X2=len, X8=SYS_write (64)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              if FTargetOS = atmacOS then
+                WriteSyscall(MACOS_SYS_write)
+              else
+                WriteSyscall(SYS_write);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'buf_put_byte' then
+            begin
+              // buf_put_byte(buf, idx, b) -> 0
+              // Writes byte b to address buf+idx
+              // X0 = buf, X1 = idx, X2 = b
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              arg3 := -1;
+              if Length(instr.ArgTemps) >= 3 then
+                arg3 := instr.ArgTemps[2];
+              if arg3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + arg3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // X0 = buf + idx
+              WriteAddRegReg(FCode, X0, X0, X1);
+              // STRB W2, [X0]  (encoding: 0x39000000 | (n<<5) | t, n=0, t=2)
+              EmitInstr(FCode, $39000002);
+              // Return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'buf_get_byte' then
+            begin
+              // buf_get_byte(buf, idx) -> int64
+              // Reads byte from address buf+idx (zero-extended)
+              // X0 = buf, X1 = idx
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              // X0 = buf + idx
+              WriteAddRegReg(FCode, X0, X0, X1);
+              // LDRB W0, [X0]  (encoding: 0x39400000 | (n<<5) | t, n=0, t=0)
+              EmitInstr(FCode, $39400000);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end;
           end;
           
@@ -2526,9 +2814,15 @@ begin
             // Load return value into X0
             if instr.Src1 >= 0 then
               WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
-            
-            // Epilogue
-            WriteLdpPostIndex(FCode, X29, X30, SP, frameSize);
+
+            // Epilogue: Für kleine Frames ldp post-index, sonst ldp + add sp
+            if frameSize <= 512 then
+              WriteLdpPostIndex(FCode, X29, X30, SP, frameSize)
+            else
+            begin
+              WriteLdpOffset(FCode, X29, X30, SP, 0);
+              WriteAddImm(FCode, SP, SP, frameSize);
+            end;
             WriteRet(FCode);
           end;
         
