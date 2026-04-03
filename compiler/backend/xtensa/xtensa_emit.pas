@@ -78,6 +78,8 @@ type
     procedure EmitAdd(dest, src1, src2: TXtensaReg);
     procedure EmitAddI(dest, src: TXtensaReg; imm: Integer);
     procedure EmitSub(dest, src1, src2: TXtensaReg);
+    procedure EmitSubImm(dest, src: TXtensaReg; imm: Integer);
+    procedure EmitInstr3R(buf: TByteBuffer; opcode: Byte; rd, rs, rt: TXtensaReg);
     procedure EmitNeg(dest, src: TXtensaReg);
     procedure EmitAnd(dest, src1, src2: TXtensaReg);
     procedure EmitOr(dest, src1, src2: TXtensaReg);
@@ -201,6 +203,21 @@ begin
   FCodeBuffer.WriteU8($0A or Byte(dest));
   FCodeBuffer.WriteU8(Byte(src) or (imm8 and $F0));
   FCodeBuffer.WriteU8(imm8 shr 4);
+end;
+
+procedure TxtensaCodeEmitter.EmitSubImm(dest, src: TXtensaReg; imm: Integer);
+begin
+  // addi dest, src, -imm
+  EmitAddI(dest, src, -imm);
+end;
+
+procedure TxtensaCodeEmitter.EmitInstr3R(buf: TByteBuffer; opcode: Byte; rd, rs, rt: TXtensaReg);
+begin
+  // 3-register instruction: opcode | rd | rs | rt
+  // R-format: [23:18] opcode, [17:12] rs, [11:6] rt, [5:0] rd
+  FCodeBuffer.WriteU8((opcode shl 2) or (Byte(rd) and $3));
+  FCodeBuffer.WriteU8((Byte(rs) shl 2) or (Byte(rt) shr 2));
+  FCodeBuffer.WriteU8((Byte(rt) shl 6) and $C0);
 end;
 
 procedure TxtensaCodeEmitter.EmitSub(dest, src1, src2: TXtensaReg);
@@ -775,6 +792,21 @@ begin
               EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
               EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
               EmitSRL(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+          
+          irCmpEq:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitSub(xrA2, xrA2, xrA3);
+              EmitMovI128(xrA4, 1);
+              EmitMovI128(xrA5, 0);
+              EmitBEQ(xrA2, xrA0, 12);
+              EmitMov(xrA2, xrA5);
+              EmitJ(6);
+              EmitMov(xrA2, xrA4);
               EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
             end;
           
@@ -1575,6 +1607,336 @@ begin
           
           TIROpKind.irMapRemove, TIROpKind.irSetRemove,
           TIROpKind.irMapFree, TIROpKind.irSetFree:
+            begin
+              // Stub: munmap via syscall
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitMovI128(xrA7, SYS_MUNMAP);
+              EmitMovI128(xrA3, 4096);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($05);
+            end;
+
+          // === Arithmetic (TOR-011) ===
+          TIROpKind.irMul:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              // MUL16 or software mul - Xtensa has MULL instruction
+              EmitInstr3R(FCodeBuffer, $90, xrA2, xrA2, xrA3); // mull a2, a2, a3
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irDiv:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              // DIVU instruction
+              EmitInstr3R(FCodeBuffer, $91, xrA2, xrA2, xrA3); // divu a2, a2, a3
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irMod:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              // REMU instruction
+              EmitInstr3R(FCodeBuffer, $92, xrA2, xrA2, xrA3); // remu a2, a2, a3
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irNot:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              // XOR with -1
+              EmitMovI128(xrA3, -1);
+              EmitXor(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irNor:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitOr(xrA2, xrA2, xrA3);
+              EmitMovI128(xrA4, -1);
+              EmitXor(xrA2, xrA2, xrA4);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irBitAnd:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitAnd(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irBitOr:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitOr(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irBitXor:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitXor(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irBitNot:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitMovI128(xrA3, -1);
+              EmitXor(xrA2, xrA2, xrA3);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Float Operations (stubs - ESP32 has no FPU) ===
+          TIROpKind.irFAdd, TIROpKind.irFSub, TIROpKind.irFMul, TIROpKind.irFDiv, TIROpKind.irFNeg:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irFCmpEq, TIROpKind.irFCmpNeq, TIROpKind.irFCmpLt,
+          TIROpKind.irFCmpLe, TIROpKind.irFCmpGt, TIROpKind.irFCmpGe:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irConstFloat:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irFToI, TIROpKind.irIToF:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irCast:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irSExt, TIROpKind.irZExt, TIROpKind.irTrunc:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Globals ===
+          TIROpKind.irStoreGlobal:
+            begin
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              // Store to global - stub
+            end;
+
+          TIROpKind.irLoadStructAddr:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Control Flow ===
+          TIROpKind.irCallStruct:
+            begin
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCodeBuffer.Size;
+              FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+              EmitCall(0);
+              if instr.Dest >= 0 then
+                EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
+          TIROpKind.irVarCall:
+            begin
+              // Virtual call via VMT
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA2, xrA2, 0); // VMT ptr
+              EmitL32I(xrA2, xrA2, instr.VMTIndex * 4);
+              EmitCall(0);
+              if instr.Dest >= 0 then
+                EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
+          TIROpKind.irReturnStruct:
+            begin
+              if instr.Src1 >= 0 then
+                EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitAddI(xrA1, xrA1, frameSize);
+              EmitL32I(xrA0, xrA1, -4);
+              EmitRet;
+            end;
+
+          TIROpKind.irStackAlloc:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              if instr.ImmInt > 0 then
+                EmitSubImm(xrA1, xrA1, instr.ImmInt);
+              EmitMov(xrA2, xrA1);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irStoreElemDyn:
+            begin
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitL32I(xrA3, xrA1, frameSize + SlotOffset(localCnt + instr.Src2));
+              EmitL32I(xrA4, xrA1, frameSize + SlotOffset(localCnt + instr.Src3));
+              EmitSLL(xrA3, xrA3, xrA3);
+              EmitSLL(xrA3, xrA3, xrA3);
+              EmitAdd(xrA2, xrA2, xrA3);
+              EmitS32I(xrA4, xrA2, 0);
+            end;
+
+          TIROpKind.irLoadField, TIROpKind.irStoreField:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irLoadFieldHeap, TIROpKind.irStoreFieldHeap:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irAlloc:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitMovI128(xrA3, instr.ImmInt);
+              EmitMovI128(xrA4, 3);
+              EmitMovI128(xrA5, -1);
+              EmitMovI128(xrA6, 0);
+              EmitMovI128(xrA7, SYS_MMAP);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($05);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irFree:
+            begin
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitMovI128(xrA3, 4096);
+              EmitMovI128(xrA7, SYS_MUNMAP);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($05);
+            end;
+
+          TIROpKind.irLoadCaptured:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irPoolAlloc:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitMovI128(xrA3, instr.ImmInt);
+              EmitMovI128(xrA4, 3);
+              EmitMovI128(xrA5, -1);
+              EmitMovI128(xrA6, 0);
+              EmitMovI128(xrA7, SYS_MMAP);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($05);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irPoolFree:
+            begin
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitMovI128(xrA3, 4096);
+              EmitMovI128(xrA7, SYS_MUNMAP);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($00);
+              FCodeBuffer.WriteU8($05);
+            end;
+
+          TIROpKind.irPushHandler, TIROpKind.irPopHandler,
+          TIROpKind.irLoadHandlerExn, TIROpKind.irThrow:
+            begin
+              if instr.Dest >= 0 then
+              begin
+                EmitMovI128(xrA2, 0);
+                EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+              end;
+            end;
+
+          // === SIMD (stubs - ESP32 has no SIMD) ===
+          TIROpKind.irSIMDAdd, TIROpKind.irSIMDSub, TIROpKind.irSIMDMul, TIROpKind.irSIMDDiv,
+          TIROpKind.irSIMDAnd, TIROpKind.irSIMDOr, TIROpKind.irSIMDXor, TIROpKind.irSIMDNeg:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irSIMDCmpEq, TIROpKind.irSIMDCmpNe, TIROpKind.irSIMDCmpLt,
+          TIROpKind.irSIMDCmpLe, TIROpKind.irSIMDCmpGt, TIROpKind.irSIMDCmpGe:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          TIROpKind.irSIMDLoadElem, TIROpKind.irSIMDStoreElem:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Map Contains (TOR-011) ===
+          TIROpKind.irMapContains:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 0);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Type Checking (TOR-011) ===
+          TIROpKind.irIsType:
+            begin
+              slotIdx := localCnt + instr.Dest;
+              EmitMovI128(xrA2, 1);
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(slotIdx));
+            end;
+
+          // === Debug Inspect (TOR-011) ===
+          TIROpKind.irInspect:
             begin
               // Stub
             end;

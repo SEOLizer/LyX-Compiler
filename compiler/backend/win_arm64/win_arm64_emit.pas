@@ -1038,6 +1038,26 @@ begin
             WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(instr.Dest));
           end;
+
+        irLoadGlobal:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irStoreGlobal:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // Store to global address - stub
+          end;
+
+        irLoadGlobalAddr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
         
         irAdd:
           begin
@@ -1337,6 +1357,345 @@ begin
             WriteLslImm(FCode, X1, X1, 3);
             WriteAddRegReg(FCode, X0, X0, X1);
             WriteStrReg(FCode, X2, X0, 0);
+          end;
+
+        // === Missing IR Operations (TOR-011) ===
+        irXor:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteEorRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irNor:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteOrrRegReg(FCode, X0, X0, X1);
+            WriteMvnReg(FCode, X0, X0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irBitAnd:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteAndRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irBitOr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteOrrRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irBitXor:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteEorRegReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irBitNot:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteMvnReg(FCode, X0, X0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irShl:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLslReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irShr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLsrReg(FCode, X0, X0, X1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        // === Float Operations ===
+        irFAdd, irFSub, irFMul, irFDiv, irFNeg:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irConstFloat:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irFToI, irIToF:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irCast:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irSExt, irZExt, irTrunc:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irLoadLocalAddr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteAddImm(FCode, X0, X29, frameSize + SlotOffset(instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irLoadStructAddr:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irCallStruct:
+          begin
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := instr.ImmStr;
+            WriteBranchLink(FCode, 0);
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irVarCall:
+          begin
+            // Virtual call via VMT
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrReg(FCode, X0, X0, 0); // VMT ptr
+            WriteLdrImm(FCode, X0, X0, instr.VMTIndex * 8);
+            WriteBlr(FCode, X0);
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
+        irReturnStruct:
+          begin
+            if instr.Src1 >= 0 then
+              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdpPostIndex(FCode, X29, X30, SP, 48);
+            WriteRet(FCode);
+          end;
+
+        irStackAlloc:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            if instr.ImmInt > 0 then
+              WriteSubImm(FCode, SP, SP, instr.ImmInt);
+            WriteMovRegReg(FCode, X0, SP);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irStoreElem:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            WriteLslImm(FCode, X1, X1, 3);
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteStrReg(FCode, X2, X0, 0);
+          end;
+
+        irLoadElem:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLslImm(FCode, X1, X1, 3);
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteLdrReg(FCode, X0, X0, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irStoreElemDyn:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2));
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3));
+            WriteLslImm(FCode, X1, X1, 3);
+            WriteAddRegReg(FCode, X0, X0, X1);
+            WriteStrReg(FCode, X2, X0, 0);
+          end;
+
+        irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            if instr.Dest >= 0 then
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irLoadField, irStoreField:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irLoadFieldHeap, irStoreFieldHeap:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irAlloc:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteMovImm64(FCode, X1, instr.ImmInt);
+            WriteMovImm64(FCode, X2, $3000); // MEM_COMMIT|MEM_RESERVE
+            WriteMovImm64(FCode, X3, $04);   // PAGE_READWRITE
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+            WriteBranchLink(FCode, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irFree:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteMovImm64(FCode, X1, 0);
+            WriteMovImm64(FCode, X2, $8000); // MEM_RELEASE
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+            WriteBranchLink(FCode, 0);
+          end;
+
+        irLoadCaptured:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irPoolAlloc:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 0);
+            WriteMovImm64(FCode, X1, instr.ImmInt);
+            WriteMovImm64(FCode, X2, $3000);
+            WriteMovImm64(FCode, X3, $04);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+            WriteBranchLink(FCode, 0);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irPoolFree:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteMovImm64(FCode, X1, 0);
+            WriteMovImm64(FCode, X2, $8000);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'VirtualFree';
+            WriteBranchLink(FCode, 0);
+          end;
+
+        irPushHandler, irPopHandler, irLoadHandlerExn, irThrow:
+          begin
+            if instr.Dest >= 0 then
+            begin
+              WriteMovImm64(FCode, X0, 0);
+              WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+          end;
+
+        irPanic:
+          begin
+            // panic(msg): write to stderr and exit(1)
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // GetStdHandle(STD_ERROR_HANDLE = -12)
+            WriteMovImm64(FCode, X0, UInt64(-12));
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+            WriteBranchLink(FCode, 0);
+            // WriteFile
+            WriteMovRegReg(FCode, X8, X0);
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            // strlen
+            WriteMovImm64(FCode, X1, 0);
+            WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            var panicLoop := FCode.Size;
+            WriteLdrReg(FCode, X3, X2, 0);
+            WriteCmpImm(FCode, X3, 0);
+            WriteBCond(FCode, COND_EQ, 12);
+            WriteAddImm(FCode, X2, X2, 1);
+            WriteAddImm(FCode, X1, X1, 1);
+            WriteBranch(FCode, (panicLoop - FCode.Size) div 4);
+            WriteMovRegReg(FCode, X0, X8);
+            WriteMovRegReg(FCode, X1, X0);
+            WriteMovRegReg(FCode, X2, X1);
+            WriteMovImm64(FCode, X3, 0);
+            WriteMovImm64(FCode, X4, 0);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+            WriteBranchLink(FCode, 0);
+            // ExitProcess(1)
+            WriteMovImm64(FCode, X0, 1);
+            SetLength(FCallPatches, Length(FCallPatches) + 1);
+            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+            FCallPatches[High(FCallPatches)].TargetName := 'ExitProcess';
+            WriteBranchLink(FCode, 0);
+          end;
+
+        irIsType:
+          begin
+            slotIdx := localCnt + instr.Dest;
+            WriteMovImm64(FCode, X0, 1);
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
+          end;
+
+        irInspect:
+          begin
+            // Stub
           end;
         
         irCallBuiltin:
