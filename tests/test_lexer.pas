@@ -666,11 +666,15 @@ end;
 procedure TLexerTest.TestSingleAmpersand;
 var
   l: TLexer;
+  tok: TToken;
 begin
   l := Lex('&');
   try
-    l.NextToken;
-    AssertTrue('Fehler für einzelnes & erwartet', FDiag.HasErrors);
+    tok := l.NextToken;
+    // Einzelnes & ist ein gültiger Bitwise-AND Operator
+    AssertEquals('TokenKind', Ord(tkBitAnd), Ord(tok.Kind));
+    AssertEquals('Value', '&', tok.Value);
+    AssertFalse('Kein Fehler erwartet', FDiag.HasErrors);
   finally
     l.Free;
   end;
@@ -679,11 +683,15 @@ end;
 procedure TLexerTest.TestSinglePipe;
 var
   l: TLexer;
+  tok: TToken;
 begin
   l := Lex('|');
   try
-    l.NextToken;
-    AssertTrue('Fehler für einzelnes | erwartet', FDiag.HasErrors);
+    tok := l.NextToken;
+    // Einzelnes | ist ein gültiger Bitwise-OR Operator
+    AssertEquals('TokenKind', Ord(tkBitOr), Ord(tok.Kind));
+    AssertEquals('Value', '|', tok.Value);
+    AssertFalse('Kein Fehler erwartet', FDiag.HasErrors);
   finally
     l.Free;
   end;
