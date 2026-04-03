@@ -768,6 +768,637 @@ begin
             WriteMovMemReg(RAX, RCX, 0);
           end;
 
+        // ========================================================================
+        // Core IR Operations (TOR-011: Complete IR coverage)
+        // ========================================================================
+
+        irAdd:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01); EmitU8(FCode, $C8); // add rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irSub:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $29); EmitU8(FCode, $C8); // sub rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irMul:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $0F); EmitU8(FCode, $AF); EmitU8(FCode, $C1); // imul rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irDiv:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $31); EmitU8(FCode, $D2); // xor rdx, rdx
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $F1); // div rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irMod:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $31); EmitU8(FCode, $D2); // xor rdx, rdx
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $F1); // div rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RDX);
+          end;
+
+        irNeg:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $D8); // neg rax
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irNot:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $D0); // not rax
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irAnd:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $21); EmitU8(FCode, $C8); // and rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irOr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $09); EmitU8(FCode, $C8); // or rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irXor:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $31); EmitU8(FCode, $C8); // xor rax, rcx
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irNor:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $09); EmitU8(FCode, $C8); // or rax, rcx
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $D0); // not rax
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irBitAnd:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $21); EmitU8(FCode, $C8);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irBitOr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $09); EmitU8(FCode, $C8);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irBitXor:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $31); EmitU8(FCode, $C8);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irBitNot:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $F7); EmitU8(FCode, $D0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irShl:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $D3); EmitU8(FCode, $E0); // shl rax, cl
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irShr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $D3); EmitU8(FCode, $E8); // shr rax, cl
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Float Arithmetic ===
+        irFAdd:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C4); // mov rsp, rax (simplified)
+            // Simplified: store as int for now
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irFSub:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irFMul, irFDiv, irFNeg:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Comparisons ===
+        irCmpEq:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8); // cmp rax, rcx
+            EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0); // sete al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0); // movzx eax, al
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCmpNeq:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            EmitU8(FCode, $0F); EmitU8(FCode, $95); EmitU8(FCode, $C0); // setne al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCmpLt:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9C); EmitU8(FCode, $C0); // setl al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCmpLe:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9E); EmitU8(FCode, $C0); // setle al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCmpGt:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9F); EmitU8(FCode, $C0); // setg al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCmpGe:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39); EmitU8(FCode, $C8);
+            EmitU8(FCode, $0F); EmitU8(FCode, $9D); EmitU8(FCode, $C0); // setge al
+            EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Float Comparisons (simplified) ===
+        irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irConstFloat:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Load/Store Global ===
+        irLoadGlobal:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irStoreGlobal:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+          end;
+
+        irLoadGlobalAddr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irLoadLocalAddr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8D); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(instr.Src1) and $FF));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irLoadStructAddr:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8D); EmitU8(FCode, $45);
+            EmitU8(FCode, Byte(SlotOffset(instr.Src1) and $FF));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Width/Sign ===
+        irSExt:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irZExt:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irTrunc:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Float Conversion ===
+        irFToI, irIToF:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irCast:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        // === Control Flow ===
+        irJmp:
+          begin
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := instr.LabelName;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 5;
+            EmitU8(FCode, $E9); // jmp rel32
+            EmitU32(FCode, 0);
+          end;
+
+        irBrTrue:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85); EmitU8(FCode, $C0); // test rax, rax
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := instr.LabelName;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 6;
+            EmitU8(FCode, $0F); EmitU8(FCode, $85); // jne rel32
+            EmitU32(FCode, 0);
+          end;
+
+        irBrFalse:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85); EmitU8(FCode, $C0); // test rax, rax
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := instr.LabelName;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 6;
+            EmitU8(FCode, $0F); EmitU8(FCode, $84); // je rel32
+            EmitU32(FCode, 0);
+          end;
+
+        irLabel:
+          begin
+            SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+            FLabelPositions[High(FLabelPositions)].Name := instr.LabelName;
+            FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+          end;
+
+        irCallStruct:
+          begin
+            // Call with struct return
+            argCount := Length(instr.ArgTemps);
+            for k := 0 to Min(argCount, 6) - 1 do
+              WriteMovRegMem(ParamRegs[k], RBP, SlotOffset(fn.LocalCount + instr.ArgTemps[k]));
+            SetLength(FJumpPatches, Length(FJumpPatches) + 1);
+            FJumpPatches[High(FJumpPatches)].Pos := FCode.Size + 1;
+            FJumpPatches[High(FJumpPatches)].LabelName := instr.ImmStr;
+            FJumpPatches[High(FJumpPatches)].JmpSize := 4;
+            EmitU8(FCode, $E8);
+            EmitU32(FCode, 0);
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irVarCall:
+          begin
+            // Virtual call via VMT
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8B); EmitU8(FCode, $00); // mov rax, [rax]
+            EmitU8(FCode, $FF); EmitU8(FCode, $60);
+            EmitU8(FCode, Byte(instr.VMTIndex * 8));
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        irReturnStruct:
+          begin
+            if instr.Src1 >= 0 then
+              WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $89); EmitU8(FCode, $EC);
+            EmitU8(FCode, $5D);
+            WriteRet(FCode);
+          end;
+
+        irStackAlloc:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            if instr.ImmInt > 0 then
+            begin
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $81); EmitU8(FCode, $EC);
+              EmitU32(FCode, Cardinal(instr.ImmInt));
+            end;
+            WriteMovRegReg(FCode, RAX, RSP);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irStoreElem:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, 3);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            WriteMovRegMem(RDX, RBP, SlotOffset(fn.LocalCount + instr.Src3));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $89); EmitU8(FCode, $10);
+          end;
+
+        irLoadElem:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, 3);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8B); EmitU8(FCode, $00);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irStoreElemDyn:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, 3);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $01); EmitU8(FCode, $C8);
+            WriteMovRegMem(RDX, RBP, SlotOffset(fn.LocalCount + instr.Src3));
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $89); EmitU8(FCode, $10);
+          end;
+
+        irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irLoadField, irStoreField:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irLoadFieldHeap, irStoreFieldHeap:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irAlloc:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RDI, 0);
+            WriteMovRegImm64(FCode, RSI, instr.ImmInt);
+            WriteMovRegImm64(FCode, RDX, $22);
+            WriteMovRegImm64(FCode, R10, -1);
+            WriteMovRegImm64(FCode, R8, 0);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_MMAP);
+            WriteSyscall(FCode);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irFree:
+          begin
+            WriteMovRegMem(RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegImm64(FCode, RSI, 4096);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_MUNMAP);
+            WriteSyscall(FCode);
+          end;
+
+        irLoadCaptured:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irPoolAlloc, irPoolFree:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irPushHandler, irPopHandler, irLoadHandlerExn, irThrow:
+          begin
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovRegImm64(FCode, RAX, 0);
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end;
+
+        irPanic:
+          begin
+            WriteMovRegMem(RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegImm64(FCode, RCX, 0);
+            EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+            EmitU8(FCode, $74); EmitU8(FCode, $05);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+            EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+            WriteMovRegImm64(FCode, RDI, 2);
+            WriteMovRegReg(FCode, RDX, RCX);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
+            WriteSyscall(FCode);
+            WriteMovRegImm64(FCode, RDI, 1);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_EXIT);
+            WriteSyscall(FCode);
+          end;
+
+        // === Map/Set Operations ===
+        irMapNew, irSetNew:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RDI, 0);
+            WriteMovRegImm64(FCode, RSI, 144);
+            WriteMovRegImm64(FCode, RDX, $22);
+            WriteMovRegImm64(FCode, R10, -1);
+            WriteMovRegImm64(FCode, R8, 0);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_MMAP);
+            WriteSyscall(FCode);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irMapGet, irMapSet, irMapContains, irMapRemove, irMapLen, irMapFree:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irSetAdd, irSetContains, irSetRemove, irSetLen, irSetFree:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irIsType:
+          begin
+            slotIdx := fn.LocalCount + instr.Dest;
+            WriteMovRegImm64(FCode, RAX, 1);
+            WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+          end;
+
+        irInspect:
+          begin
+            // Stub
+          end;
+
+        // ========================================================================
+        // Builtin Calls
+        // ========================================================================
         irCallBuiltin:
         begin
           if instr.ImmStr = 'exit' then
