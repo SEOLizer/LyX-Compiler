@@ -118,11 +118,11 @@ shared var altitude: Altitude protected by mutex;
 
 ### 3.2 ARM Cortex-M
 
-- [ ] **MPU-Konfiguration**: Automatische MPU-Setup-Generierung
-- [ ] **Fault-Handler**: HardFault, MemManage, BusFault Handler
-- [ ] **Stack-Canary**: Stack-Overflow-Erkennung
-- [ ] **Privileged/Unprivileged Mode**: Trennung von kritischem und nicht-kritischem Code
-- [ ] **TrustZone**: Secure/Non-Secure Trennung (für Cortex-M33+)
+- [x] **MPU-Konfiguration**: Automatische MPU-Setup-Generierung → `mpu_config(region, addr, size, ap)`, `mpu_enable()`, 8 Regionen, AP-Bits, Memory Types
+- [x] **Fault-Handler**: HardFault, MemManage, BusFault Handler → Vector Table, CFSR/HFSR/DFSR, MMFAR/BFAR, `get_fault_status()`, `get_fault_address()`, `clear_fault_status()`
+- [x] **Stack-Canary**: Stack-Overflow-Erkennung → `stack_canary_check()`, 3 Canaries (top/middle/bottom), $DEADBEEF pattern
+- [x] **Privileged/Unprivileged Mode**: Trennung von kritischem und nicht-kritischem Code → `set_unprivileged()`, `set_privileged()`, CONTROL register
+- [ ] **TrustZone**: Secure/Non-Secure Trennung (für Cortex-M33+) → `tz_init()`, `tz_enter_nonsecure()`, `tz_sau_config()` (Stubs)
 
 ### 3.3 RISC-V
 
