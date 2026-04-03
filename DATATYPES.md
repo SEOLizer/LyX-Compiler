@@ -43,11 +43,11 @@
 |---------|----------------------------|--------|----------|
 | `char`  | Einzelnes Zeichen (ASCII/Unicode codepoint) | ✅ Full | `'a'`, Escape-Sequenzen |
 | `pchar` | Null-terminierter String (statisch, read-only) | ✅ Full | `"hello"` |
-| `string`| Dynamisch wachsender String (mmap-Heap, v0.5.6) | ✅ Full | via `StrNew` |
+| `string`| Dynamisch wachsender String (mmap-Heap, v0.5.7) | ✅ Full | via `StrNew` |
 
-**Dynamische Strings (v0.5.6):** `string`-Werte verwenden einen 16-Byte-Header vor dem Datenpuffer (`[capacity:8][length:8]`). Der zurückgegebene `pchar`-Zeiger zeigt auf die Nutzdaten und ist kompatibel mit `PrintStr`.
+**Dynamische Strings (v0.5.7):** `string`-Werte verwenden einen 16-Byte-Header vor dem Datenpuffer (`[capacity:8][length:8]`). Der zurückgegebene `pchar`-Zeiger zeigt auf die Nutzdaten und ist kompatibel mit `PrintStr`.
 
-**String-Builtins (v0.5.6):**
+**String-Builtins (v0.5.7):**
 
 | Funktion | Signatur | Beschreibung |
 |----------|----------|--------------|
@@ -67,7 +67,7 @@ PrintStr(s);             // "Hi"
 StrFree(s);
 ```
 
-### 6. Enum-Typen (v0.5.6)
+### 6. Enum-Typen (v0.5.7)
 
 Enums definieren eine benannte Menge von Integer-Konstanten.
 
@@ -99,7 +99,7 @@ fn main(): int64 {
 }
 ```
 
-### 7. Tuple-Typen (v0.5.6)
+### 7. Tuple-Typen (v0.5.7)
 
 Funktionen können mehrere Werte als Tuple zurückgeben.
 

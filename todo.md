@@ -9,26 +9,26 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 ### ARM64 Linux (`compiler/backend/arm64/arm64_emit.pas`)
 
-**Implementiert ✅:** PrintStr, PrintInt, exit, open, read, write, close, lseek, unlink, rename, mkdir, rmdir, chmod, Random, RandomSeed, now_unix, now_unix_ms, sleep_ms, RegexMatch/Search/Replace (Stubs), NEON SIMD, DynArray (Push/Pop/Len/Free), VMT, Dynamic Linking (PLT/GOT)
+**Implementiert ✅:** PrintStr, PrintInt, exit, open, read, write, close, lseek, unlink, rename, mkdir, rmdir, chmod, Random, RandomSeed, now_unix, now_unix_ms, sleep_ms, RegexMatch/Search/Replace (Stubs), NEON SIMD, DynArray (Push/Pop/Len/Free), VMT, Dynamic Linking (PLT/GOT), String Builtins S0-S7
 
-**Fehlt ❌ – String-Builtins (S0 Basis):**
-- [ ] `str_concat` – pchar + pchar via mmap
-- [ ] `StrLen` – null-terminierte Länge
-- [ ] `StrCharAt` / `StrSetChar` – Zeichenzugriff
-- [ ] `StrNew(cap)` / `StrFree(s)` – mmap/munmap
-- [ ] `StrAppend(dest, src)` – reallozierend
-- [ ] `StrFromInt(n)` – Integer→String
+**String-Builtins S0 (Implementiert ✅):**
+- [x] `str_concat` – pchar + pchar via mmap
+- [x] `StrLen` – null-terminierte Länge
+- [x] `StrCharAt` / `StrSetChar` – Zeichenzugriff
+- [x] `StrNew(cap)` / `StrFree(s)` – mmap/munmap
+- [x] `StrAppend(dest, src)` – reallozierend
+- [x] `StrFromInt(n)` – Integer→String
 
-**Fehlt ❌ – String-Builtins (S1–S7):**
-- [ ] `StrFindChar(s, ch, start)` / `StrSub(s, start, len)`
-- [ ] `StrAppendStr(dest, src)` / `StrConcat(a, b)` / `StrCopy(s)`
-- [ ] `IntToStr(n)` / `FileGetSize(path)`
-- [ ] `HashNew(cap)` / `HashSet` / `HashGet` / `HashHas`
+**String-Builtins S1–S7 (Implementiert ✅):**
+- [x] `StrFindChar(s, ch, start)` / `StrSub(s, start, len)`
+- [x] `StrAppendStr(dest, src)` / `StrConcat(a, b)` / `StrCopy(s)`
+- [x] `IntToStr(n)` / `FileGetSize(path)`
+- [x] `HashNew(cap)` / `HashSet` / `HashGet` / `HashHas`
 - [ ] `GetArgC()` / `GetArg(i)`
-- [ ] `StrStartsWith` / `StrEndsWith` / `StrEquals`
+- [x] `StrStartsWith` / `StrEndsWith` / `StrEquals`
 
 **Fehlt ❌ – Sonstige Builtins:**
-- [ ] `PrintFloat` / `Println` / `printf`
+- [x] `PrintFloat` / `Println` / `printf` (PrintFloat implementiert, Println/printf Stub)
 - [ ] `mmap` / `munmap` (als Builtin-Aufruf, nicht nur intern)
 - [ ] `ioctl` / `getpid`
 - [ ] `peek8/16/32/64` / `poke8/16/32/64` / `buf_get_byte` / `buf_put_byte`
@@ -37,7 +37,7 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 - [ ] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_fcntl`, `sys_shutdown`
 
 **Offen – bekannte Bugs:**
-- [ ] SIGBUS bei PLT/GOT-basiertem Dynamic Linking (X16-Register-Konflikt, `feat/dynlink-v2`)
+- [x] ~~SIGBUS bei PLT/GOT-basiertem Dynamic Linking~~ (X16-Register-Konflikt, `feat/dynlink-v2`) — behoben via X17
 - [ ] Float-Codegen (SSE2 → ARM64 NEON Mapping für `format_float`)
 
 ---
@@ -135,100 +135,22 @@ Imports müssen als IAT-Einträge in den PE-Header eingetragen werden (kein PLT,
 |-----------|------|--------------|
 | Mittel | **IPv6 Support** | `SockAddrIn6` struct existiert, wird aber nicht verwendet |
 
-### data Library (Pandas-like)
-
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Mittel | ~~**DataFrame/Series**~~ ✅ | 2D-Tabelle mit benannten Spalten, Selection, Filter, Slice |
-| Mittel | ~~**CSV I/O**~~ ✅ | ReadCSV, WriteCSV, Header-Parsing, Type-Inferenz |
-| Mittel | ~~**GroupBy**~~ ✅ | Split-Apply-Combine: GroupBy, GroupBySum, GroupByCount, Multi-Column |
-| Mittel | ~~**Missing Values**~~ ✅ | FillNA, DropNA, IsNA |
-| Mittel | ~~**Column Statistics**~~ ✅ | SeriesSum, SeriesMean, SeriesMin, SeriesMax, SeriesValueCounts |
-| Niedrig | ~~**Join/Merge**~~ ✅ | DataFrameJoinInner, DataFrameJoinLeft |
-| Niedrig | ~~**Pivot/Melt**~~ ✅ | DataFramePivot (long→wide), DataFrameMelt (wide→long) |
-| Niedrig | ~~**Correlation**~~ ✅ | SeriesCorr, SeriesCov, SeriesDescribe |
-| Niedrig | ~~**Float Support**~~ ✅ | DataFrameSetFloat/GetFloat, SeriesSumFloat |
-| Niedrig | ~~**Multi-Column GroupBy**~~ ✅ | DataFrameGroupByMulti, GroupByMultiCount |
-| Niedrig | ~~**SortBy**~~ ✅ | DataFrameSortBy, DataFrameSortByDesc |
-| Niedrig | ~~**Head/Tail/Shape**~~ ✅ | DataFrameHead, DataFrameTail, DataFrameShape, DataFrameInfo |
-| Niedrig | ~~**Concat**~~ ✅ | DataFrameConcat (Append rows from two DataFrames) |
-| Niedrig | ~~**Replace/Clip**~~ ✅ | DataFrameReplace, DataFrameReplaceAll, DataFrameClip |
-| Niedrig | ~~**Map**~~ ✅ | DataFrameMapMul, DataFrameMapAdd |
-| Niedrig | ~~**Duplicated**~~ ✅ | DataFrameDropDuplicates |
-| Niedrig | ~~**Shift/Diff**~~ ✅ | SeriesShift, SeriesDiff |
-| Niedrig | ~~**CumSum/CumProd**~~ ✅ | SeriesCumSum, SeriesCumProd, SeriesCumMax, SeriesCumMin |
-| Niedrig | ~~**Rank/Median**~~ ✅ | SeriesRank, SeriesMedian |
-| Niedrig | ~~**Reverse**~~ ✅ | DataFrameReverse |
-
 ### data Library - Fehlende Features (Pandas-Parität)
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Hoch | ~~**Index Labels**~~ ✅ | String Labels, set_index, reset_index |
-| Hoch | ~~**Float Support (true)**~~ ✅ | Echte f64 Spalten, SeriesFloat64, SeriesMeanF64, SeriesStdDevF64 |
-| Hoch | ~~**Rolling Window**~~ ✅ | SeriesRollingMean/Sum/Min/Max |
-| Hoch | ~~**agg() / transform()**~~ ✅ | DataFrameAgg, GroupByAgg, SeriesTransformMul/Add/Normalize |
-| Hoch | ~~**Apply**~~ ✅ | SeriesApplyAbs/Square/Sqrt, DataFrameApplyAdd/Mul |
-| Hoch | ~~**Boolean Indexing**~~ ✅ | SeriesGreaterThan/LessThan/Equal, BoolSeriesAnd/Or/Not, DataFrameFilterByMask |
-| Mittel | ~~**String Operations**~~ ✅ | StrToUpper, StrToLower, StrTrim, StrSplit, StrJoin, StrContains, StrReplace |
-| Mittel | ~~**Resample**~~ ✅ | SeriesResampleCount |
-| Mittel | ~~**Explode**~~ ✅ | DataFrameExplode |
-| Mittel | ~~**CorrMatrix**~~ ✅ | DataFrameCorrMatrix |
-| Mittel | ~~**GetDummies**~~ ✅ | DataFrameGetDummies One-Hot Encoding |
-| Mittel | ~~**Right/Outer Join**~~ ✅ | DataFrameJoinRight, DataFrameJoinOuter |
-| Mittel | ~~**Normalize**~~ ✅ | SeriesNormalizeMinMax, SeriesNormalizeZScore |
-| Mittel | ~~**DatetimeIndex**~~ ✅ | UnixToDateTime, UnixGetYear/Month/Day |
-| Niedrig | ~~**JSON I/O**~~ ⏳ | Deferred (kein JSON-Parser in Lyx) |
-| Niedrig | ~~**Query**~~ ✅ | DataFrameQuery |
-| Niedrig | ~~**Interpolate**~~ ✅ | SeriesInterpolate (linear) |
-| Niedrig | ~~**Sample**~~ ✅ | DataFrameSample (fraction-based) |
-| Niedrig | ~~**Cut/QCut**~~ ✅ | SeriesCut, SeriesQCut Binning |
-| Niedrig | ~~**MultiIndex**~~ ✅ | DataFrameSetMultiIndex |
-| Niedrig | ~~**Excel I/O**~~ ⏳ | Deferred (kein Excel-Parser in Lyx) |
-
-✅ **data Library komplett!** (80+ Funktionen, 2 Deferred)
-
-### std.validate Library
-
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Mittel | ~~**EAN Validation**~~ ✅ | EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A Check Digit Validation |
-| Niedrig | ~~**ISBN/ISSN**~~ ✅ | ISBN-10/13 Konvertierung, ISSN Validation, Formatting |
-| Niedrig | ~~**Credit Card Validation**~~ ✅ | Luhn-Algorithmus, 8 Kreditkarten-Typen, IMEI, Formatting, Masking |
-| Mittel | ~~**IBAN Validation**~~ ✅ | ISO 13616 Mod 97, 50+ Länder, Check Digit, Formatting |
-| Niedrig | ~~**VAT ID Validation**~~ ✅ | EU 27 Länder, USt-IdNr., Checksummen, Längenprüfung |
-
-✅ **std.validate Library komplett!**
-
-### std.stats Library
-
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Mittel | ~~**Array Aggregates**~~ ✅ | ArrayMin, ArrayMax, ArraySum, ArrayAvg, ArrayMedian, ArrayCount, ArrayProduct |
-| Mittel | ~~**Sorting**~~ ✅ | ArraySort, ArrayReverse |
-| Mittel | ~~**Filtering**~~ ✅ | ArrayFilterGt, ArrayFilterLt, ArrayFilterRange |
-| Mittel | ~~**Statistical**~~ ✅ | ArrayVariance, ArrayStdDev, ArrayRange, ArraySumSquares |
-| Mittel | ~~**Higher-Order**~~ ✅ | Clamp64, Percentage64, InRange64, AbsDiff64 |
 | Niedrig | **Map Aggregates** | MapSum, MapMin, MapMax, MapAvg (benötigt Iterator-Support) |
 
 ### Dynamic Linking
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Mittel | ~~**GOT-Einträge validieren**~~ ✅ | Initiale Werte der GOT prüfen (lazy binding) |
-| Niedrig | ~~**macOS Dynamic Linking**~~ ✅ | PLT/GOT für Mach-O implementieren (LC_LOAD_DYLIB + Stub-PLT) |
-| Niedrig | ~~**ARM64 PLT/GOT Implementation**~~ ✅ | LDR (literal) + BR X17 PLT-Stubs, DT_PLTREL fix, dataBuf im RW-Segment |
 | Mittel | **ARM64 libc init fix** | CRT-Start-Code (crt1.o) emittieren, `__libc_start_main` aufrufen |
 | Niedrig | **ARM64 PIE (ET_DYN) Binary** | Position Independent Executable für bessere libc-Kompatibilität |
 
 ### C FFI
 
-| Priorität | Task | Beschreibung |
-|-----------|------|--------------|
-| Mittel | ~~**Windows x64 FFI**~~ ✅ | `GetExternLibrary` in `win64_emit.pas` auswerten → DLL-Name für IAT-Import |
-| Niedrig | ~~**macOS x86_64 FFI**~~ ✅ | Dynamic Mach-O: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
-| Niedrig | ~~**macOS ARM64 FFI**~~ ✅ | Dynamic Mach-O ARM64: `LC_LOAD_DYLIB` + Stub-PLT für `extern fn link` |
-| Niedrig | ~~**`importC` auf ARM64**~~ ✅ | `importC "header.h"` mit `--target=linux-arm64` testen und verifizieren |
+_(keine offenen Aufgaben)_
 
 ### Backend
 
@@ -239,16 +161,6 @@ Imports müssen als IAT-Einträge in den PE-Header eingetragen werden (kein PLT,
 ### Sprache / Frontend
 
 _(keine offenen Aufgaben)_
-
-### String / Float Formatting & Linter v2 (März 2026)
-
-- [x] **`pchar + pchar` Konkatenation** - `"Hello" + ", " + "World!"` via `mmap`-Buffer und `rep movsb`
-- [x] **`PrintFloat(f64)`** - SSE2-basierte Inline-Ausgabe: Vorzeichen, Ganzzahlanteil, 6 Dezimalstellen
-- [x] **`:width:decimals` Format-Specifier** - Pascal-style `pi:0:2` → `TAstFormatExpr` → `irCallBuiltin 'format_float'`
-- [x] **Runtime Dezimalanzahl** - `format_float` liest Dezimalstellen aus Stack-Slot (nicht hardcoded)
-- [x] **W011 `format-zero-decimals`** - Warnt bei `:width:0` (0 Dezimalstellen → besser PrintInt)
-- [x] **W012 `string-concat-literals`** - Warnt bei `"a" + "b"` (compile-time faltbar)
-- [x] **W013 `print-float-int-arg`** - Warnt bei `PrintFloat(intLit as f64)` (besser PrintInt)
 
 ### Tech Debts
 
