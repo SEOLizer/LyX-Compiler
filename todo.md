@@ -69,19 +69,16 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 ### Windows ARM64 (`compiler/backend/win_arm64/win_arm64_emit.pas`)
 
-**Implementiert ✅:** — (Skeleton, keine Builtins)
+**Implementiert ✅:** exit, PrintStr, PrintInt, PrintFloat (Stubs), Println (Stub), printf (Stub), open/read/write/close (Stubs), lseek, unlink, mkdir, rmdir, chmod, rename, StrLen, StrCharAt, StrSetChar, StrNew, StrFree, StrFromInt, StrAppend, StrFindChar, StrSub, StrConcat, StrCopy, FileGetSize, StrStartsWith, StrEndsWith, StrEquals, GetArgC, GetArg, Random, RandomSeed, mmap, munmap, getpid, ioctl, alle Socket builtins (Stubs)
 
 **Fehlt ❌ – Alle Builtins** (Grundlage zuerst):
-- [ ] `PrintStr` / `PrintInt` / `PrintFloat` / `Println` – via Win32 `WriteFile`
-- [ ] `exit` – via `ExitProcess`
-- [ ] `open` / `read` / `write` / `close` – via `CreateFileW` / `ReadFile` / `WriteFile` / `CloseHandle`
+- [ ] `Println` / `printf` – via Win32 `WriteFile`
 - [ ] `mmap` / `munmap` – via `VirtualAlloc` / `VirtualFree`
 - [ ] Alle String-Builtins (S0 + S1–S7)
 - [ ] `Random` / `RandomSeed`
 - [ ] `peek*` / `poke*`
-- [ ] Socket-Builtins – via WinSock2 (`WSAStartup`, `socket`, `connect`, etc.)
-- [ ] `GetArgC` / `GetArg` – via `GetCommandLineW` / `CommandLineToArgvW`
-- [ ] `Inspect`
+- [ ] Socket-Builtins – via WinSock2
+- [ ] `GetArgC` / `GetArg`
 
 **Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
 Der PE64-Writer (`compiler/backend/win_arm64/pe64_arm64_writer.pas`) existiert bereits.
