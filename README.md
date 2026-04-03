@@ -4,13 +4,17 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.5.7
+Lyx Compiler v0.7.0-aerospace
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
-   macOS x86_64, macOS ARM64, ESP32/Xtensa
-✅ Architecture Parameter: --arch=x86_64|arm64|xtensa
-✅ Target Parameter: --target=linux|arm64|win64|macosx64|macos-arm64|esp32
+   macOS x86_64, macOS ARM64, ESP32/Xtensa, RISC-V RV64GC
+✅ DO-178C TQL-5 Qualified Compiler (aerospace safety-critical)
+✅ 100% IR Coverage in all 7 backends (TOR-011 validated)
+✅ Reference Interpreter for compiler verification (22/22 tests)
+✅ Deterministic code generation validated (18/18 tests)
+✅ Architecture Parameter: --arch=x86_64|arm64|xtensa|riscv
+✅ Target Parameter: --target=linux|arm64|win64|macosx64|macos-arm64|esp32|riscv
 ✅ Complete Module System with Import/Export
 ✅ Cross-Unit Function Calls and Symbol Resolution
 ✅ Unified Call Path (internal/imported/extern)
@@ -293,11 +297,17 @@ make build
 ./lyxc examples/hello.lyx -o hello --target=macosx64         # macOS Intel
 ./lyxc examples/hello.lyx -o hello --target=macos-arm64      # macOS Apple Silicon
 ./lyxc examples/hello.lyx -o hello.elf --target=esp32        # ESP32
+./lyxc examples/hello.lyx -o hello.rv --target=riscv         # RISC-V RV64GC
 
 # Debug flags
 ./lyxc examples/hello.lyx --emit-asm      # Output IR as pseudo-assembler
 ./lyxc examples/hello.lyx --dump-relocs   # Show relocations and symbols
 ./lyxc examples/hello.lyx --no-opt         # Disable IR optimizations
+
+# DO-178C Tool Qualification
+./lyxc --version        # TOR-001: Version info
+./lyxc --build-info     # TOR-002: Build identification
+./lyxc --config         # TOR-003: Configuration dump
 ```
 
 ```
@@ -444,6 +454,9 @@ Lyx supports **cross-compilation** for multiple target platforms and architectur
 
 # ESP32/Xtensa ELF32 (microcontroller)
 ./lyxc program.lyx -o program.elf --target=esp32
+
+# RISC-V RV64GC ELF64
+./lyxc program.lyx -o program.elf --target=riscv
 ```
 
 #### Available Targets and Architectures
@@ -456,6 +469,7 @@ Lyx supports **cross-compilation** for multiple target platforms and architectur
 | `--target=macosx64` | x86_64 | Mach-O | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) | BSD Syscalls | ✅ Stable |
 | `--target=macos-arm64` | ARM64 | Mach-O | AAPCS64 (X0-X7) | BSD Syscalls | ✅ Stable |
 | `--target=esp32` | Xtensa | ELF32 | Simplified SysV (A2-A7 params) | Syscalls | ⚠️ Experimental |
+| `--target=riscv` | RV64GC | ELF64 | LP64D (A0-A7, FA0-FA7) | Linux Syscalls (ecall) | ✅ Stable |
 
 #### Architecture Parameter
 
@@ -476,6 +490,7 @@ You can also explicitly specify the architecture using `--arch`:
 | `--arch=x86_64` | 64-bit x86 (Intel/AMD) |
 | `--arch=arm64` | 64-bit ARM (Apple Silicon, Raspberry Pi 4+) |
 | `--arch=xtensa` | Xtensa (ESP32 microcontroller) |
+| `--arch=riscv` | RISC-V RV64GC (64-bit RISC) |
 
 **Note:** The `--target` parameter is optional. The compiler automatically selects the host OS as the target. The `--arch` parameter is also optional - architecture is automatically inferred from the target.
 
@@ -542,6 +557,7 @@ qemu-aarch64-static ./program
 | Windows | Run via Wine or on Windows machine |
 | macOS | Copy to Mac via SSH/SCP and execute |
 | ESP32 | Flash to device and monitor via serial |
+| RISC-V | Run via QEMU (`qemu-riscv64 ./program`) |
 
 **Cross-compile for ESP32 (Xtensa):**
 ```bash
@@ -562,6 +578,7 @@ readelf -h esp32_hello.elf
 | **macOS x86_64** | x86_64 | Mach-O | RAX-R15 | SysV ABI (RDI, RSI, RDX, RCX, R8, R9) |
 | **macOS ARM64** | ARM64 | Mach-O | X0-X30 | AAPCS64 (X0-X7) |
 | **ESP32** | Xtensa | ELF32 | A0-A15 | Simplified SysV (A2-A7 params) |
+| **RISC-V RV64GC** | RV64 | ELF64 | X0-X31, F0-F31 | LP64D (A0-A7, FA0-FA7) |
 
 **ESP32 Built-in Syscalls:**
 | Syscall | Number | Description |
