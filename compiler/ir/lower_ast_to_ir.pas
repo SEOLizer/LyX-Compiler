@@ -2830,6 +2830,60 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             end;
           end;
 
+          // === Dynamic Array Operations (push, len, pop, free) ===
+          // These must come BEFORE the regular function call handling
+          if call.Name = 'push' then
+          begin
+            // push(array, value) - adds element to dynamic array
+            // argTemps[0] = array local slot, argTemps[1] = value
+            instr := Default(TIRInstr);
+            instr.Op := irDynArrayPush;
+            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            instr.Src2 := argTemps[1];  // value to push
+            instr.Dest := -1;
+            Emit(instr);
+            Result := -1;
+            Exit;
+          end
+          else if call.Name = 'len' then
+          begin
+            // len(array) - returns length of dynamic array
+            // argTemps[0] = array local slot
+            t0 := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op := irDynArrayLen;
+            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            instr.Dest := t0;
+            Emit(instr);
+            Result := t0;
+            Exit;
+          end
+          else if call.Name = 'pop' then
+          begin
+            // pop(array) - removes and returns last element
+            // argTemps[0] = array local slot
+            t0 := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op := irDynArrayPop;
+            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            instr.Dest := t0;
+            Emit(instr);
+            Result := t0;
+            Exit;
+          end
+          else if call.Name = 'free' then
+          begin
+            // free(array) - frees the dynamic array memory
+            // argTemps[0] = array local slot
+            instr := Default(TIRInstr);
+            instr.Op := irDynArrayFree;
+            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            instr.Dest := -1;
+            Emit(instr);
+            Result := -1;
+            Exit;
+          end;
+
           // Regular function call (or function pointer call)
           t0 := NewTemp;
 
