@@ -252,7 +252,7 @@ begin
   
     if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.5.6');
+    WriteLn(StdErr, 'Lyx Compiler v0.5.7');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -442,7 +442,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.5.6');
+  WriteLn('Lyx Compiler v0.5.7');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);

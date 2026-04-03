@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.5.6
+Lyx Compiler v0.5.7
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -17,7 +17,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ PLT/GOT Dynamic Linking for External Libraries
 ✅ ARM64 Dynamic Linking fully functional (PLT/GOT, Hash Table, Relocations)
 ✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
-✅ Network Library (std.net): 14 Protocols with RFC Compliance
+✅ Network Library (std.net): 17 Protocols with RFC Compliance
 ✅ IR-Level Inlining Optimization (v0.4.3)
 ✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
 ✅ PascalCase Naming Conventions (v0.4.3)
@@ -36,16 +36,16 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ✅ String Concatenation: pchar + pchar via mmap'd buffers (v0.5.5)
 ✅ Float Formatting: PrintFloat(f64) and :width:decimals format specifier (v0.5.5)
-✅ Enum Types: enum keyword with :: member access (v0.5.6)
-✅ Exception Handling: try/catch/throw with nested scopes (v0.5.6)
-✅ Multi-Return / Tuples: return (a, b) and var a, b := f() (v0.5.6)
-✅ Generics: fn max[T](a: T, b: T): T — monomorphization (v0.5.6)
-✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.6)
-✅ Dynamic String Builtins: StrNew/StrFree/StrLen/StrCharAt/StrSetChar/StrAppend/StrFromInt (v0.5.6)
-✅ String Utility Builtins: StrFindChar/StrSub/StrAppendStr/StrConcat/StrCopy/IntToStr/FileGetSize (v0.5.6)
-✅ HashMap Builtins: HashNew/HashSet/HashGet/HashHas — O(1) FNV-1a string→int64 map (v0.5.6)
-✅ Argv Builtins: GetArgC/GetArg — access command-line arguments (v0.5.6)
-✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.6)
+✅ Enum Types: enum keyword with :: member access (v0.5.7)
+✅ Exception Handling: try/catch/throw with nested scopes (v0.5.7)
+✅ Multi-Return / Tuples: return (a, b) and var a, b := f() (v0.5.7)
+✅ Generics: fn max[T](a: T, b: T): T — monomorphization (v0.5.7)
+✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.7)
+✅ Dynamic String Builtins: StrNew/StrFree/StrLen/StrCharAt/StrSetChar/StrAppend/StrFromInt (v0.5.7)
+✅ String Utility Builtins: StrFindChar/StrSub/StrAppendStr/StrConcat/StrCopy/IntToStr/FileGetSize (v0.5.7)
+✅ HashMap Builtins: HashNew/HashSet/HashGet/HashHas — O(1) FNV-1a string→int64 map (v0.5.7)
+✅ Argv Builtins: GetArgC/GetArg — access command-line arguments (v0.5.7)
+✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.7)
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ```
 
@@ -158,14 +158,14 @@ make e2e
 
 ## Network Library (std.net)
 
-Lyx includes a comprehensive network library with **14 protocol implementations**, all written in pure Lyx (no external dependencies except for TLS, SSH, and HTTPS which use system libraries via FFI).
+Lyx includes a comprehensive network library with **17 protocol implementations**, all written in pure Lyx (no external dependencies except for TLS, SSH, and HTTPS which use system libraries via FFI).
 
 ### Supported Protocols
 
 | Protocol | Type | Port | RFC | Module | Status |
 |----------|------|------|-----|--------|--------|
-| **TCP Sockets** | - | - | - | `std.net.socket` | ✅ |
-| **UDP Sockets** | - | - | - | `std.net.socket` | ✅ |
+| **TCP** | Stream | - | - | `std.net.socket` | ✅ |
+| **UDP** | Datagram | - | - | `std.net.socket` | ✅ |
 | **DNS** | UDP | 53 | RFC 1035 | `std.net.dns` | ✅ |
 | **HTTP** | TCP | 80 | RFC 2616 | `std.net.http` | ✅ |
 | **HTTPS** | TCP | 443 | RFC 2818 | `std.net.https` | ✅ |
@@ -181,6 +181,7 @@ Lyx includes a comprehensive network library with **14 protocol implementations*
 | **MQTT** | TCP | 1883 | MQTT 3.1.1 | `std.net.mqtt` | ✅ |
 | **SIP** | UDP | 5060 | RFC 3261 | `std.net.sip` | ✅ |
 | **QUIC** | UDP | 443 | RFC 9000 | `std.net.quic` | ⚠️ |
+| **Whois** | TCP | 43 | RFC 3912 | `std.net.whois` | ✅ |
 
 ### Quick Examples
 
@@ -260,6 +261,11 @@ BGPAdvertiseRoute(peer, BGPIPv4(10,0,0,0), 24, BGPIPv4(10,0,0,1));
 import std.net.sip;
 var sip: SIPConn := SIPConnect("sip.example.com", 5060);
 SIPRegister(sip, "alice", "secret", "example.com");
+
+// Whois Domain Lookup
+import std.net.whois;
+var info: pchar := WhoisLookup("example.com");
+PrintStr(info);
 ```
 
 ### Dependencies
