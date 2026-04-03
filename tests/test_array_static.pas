@@ -1,7 +1,7 @@
 {$mode objfpc}{$H+}
 program test_array_static;
 
-uses SysUtils, Classes, fpcunit, testregistry, consoletestrunner, diag, lexer, parser, ast, sema, ir, lower_ast_to_ir;
+uses SysUtils, Classes, fpcunit, testregistry, consoletestrunner, diag, lexer, parser, ast, sema, ir, lower_ast_to_ir, unit_manager;
 
 type
   TArrayStaticTest = class(TTestCase)
@@ -18,6 +18,7 @@ var
   p: TParser;
   prog: TAstProgram;
   s: TSema;
+  um: TUnitManager;
   lower: TIRLowering;
   modl: TIRModule;
 begin
@@ -27,12 +28,24 @@ begin
     p := TParser.Create(lex, FDiag);
     try
       prog := p.ParseProgram;
-      s := TSema.Create(FDiag, nil);
+      
+      um := TUnitManager.Create(FDiag);
       try
-        s.Analyze(prog);
+        um.AddSearchPath('..');
+        um.AddSearchPath('../std');
+        um.AddSearchPath('std');
+        um.LoadAllImports(prog, '');
+        
+        s := TSema.Create(FDiag, um);
+        try
+          s.Analyze(prog);
+        finally
+          s.Free;
+        end;
       finally
-        s.Free;
+        um.Free;
       end;
+      
       modl := TIRModule.Create;
       lower := TIRLowering.Create(modl, FDiag);
       try
@@ -40,7 +53,7 @@ begin
         Result := modl;
       finally
         lower.Free;
-        prog.Free;  // AST wird nach dem Lowering nicht mehr benötigt
+        prog.Free;
       end;
     finally
       p.Free;
@@ -59,11 +72,13 @@ var
   foundLoadLocal, foundLoadElem, foundDynArrayPush: Boolean;
 begin
   // 'array' keyword creates a dynamic array (fat-pointer: ptr, len, cap)
-  // Initialization with [2,3,5] emits 3x irDynArrayPush
-  // Index access loads the heap pointer via irLoadLocal (not irLoadLocalAddr)
+  // With explicit push calls, irDynArrayPush is emitted
   modl := ParseAndLower(
     'fn main(): int64 {' + LineEnding +
-    '  var a: array := [2,3,5];' + LineEnding +
+    '  var a: array := [];' + LineEnding +
+    '  push(a, 2);' + LineEnding +
+    '  push(a, 3);' + LineEnding +
+    '  push(a, 5);' + LineEnding +
     '  return a[1];' + LineEnding +
     '}',
     'test_array.au'
@@ -92,7 +107,7 @@ begin
         end;
       end;
     end;
-    AssertTrue('irDynArrayPush expected for array literal init', foundDynArrayPush);
+    AssertTrue('irDynArrayPush expected for push() calls', foundDynArrayPush);
     AssertTrue('irLoadLocal expected for dynamic array access', foundLoadLocal);
     AssertTrue('irLoadElem expected for array access', foundLoadElem);
   finally
