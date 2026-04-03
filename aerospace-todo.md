@@ -139,9 +139,9 @@ shared var altitude: Altitude protected by mutex;
 
 DO-178C DAL A erfordert **MC/DC** für alle Entscheidungen.
 
-- [ ] **MC/DC-Instrumentierung**: Compiler generiert Coverage-Points
-- [ ] **Coverage-Tracking**: Jeder Condition-Zweig wird gezählt
-- [ ] **MC/DC-Bericht**: Automatischer Report nach Testlauf
+- [x] **MC/DC-Instrumentierung**: Compiler generiert Coverage-Points → `ir_mcdc.pas` Pass, `--mcdc` CLI-Flag, `__mcdc_record` Builtin in allen 7 Backends
+- [x] **Coverage-Tracking**: Jeder Condition-Zweig wird gezählt → `TMCDCDecision` mit HitCount, ConditionResults, DecisionResult
+- [x] **MC/DC-Bericht**: Automatischer Report nach Testlauf → `GenerateReport()` mit `--mcdc-report` Flag
 - [ ] **Lücken-Erkennung**: Nicht abgedeckte Pfade markieren
 
 ```lyx

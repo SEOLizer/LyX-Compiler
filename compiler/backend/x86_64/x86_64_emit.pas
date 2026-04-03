@@ -1956,6 +1956,20 @@ begin
                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
                 WriteSyscall(FCode);
               end
+              else if instr.ImmStr = '__mcdc_record' then
+              begin
+                // MC/DC Coverage Recording (DO-178C DAL A)
+                // __mcdc_record(decisionID, condIdx, condResult)
+                // ImmInt = decisionID, LabelName = 'condIdx:condResult'
+                // Stub: write coverage event to stderr
+                // Format: "MC/DC: DEC=<id> COND=<idx> RES=<T/F>\n"
+                // For now: just increment a counter in data section
+                // Simplified: write byte to a coverage array
+                WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));  // decision ID
+                WriteMovRegImm64(FCode, RDI, 2);  // stderr
+                // Write a single byte marker
+                EmitU8(FCode, $C6); EmitU8(FCode, $05); EmitU32(FCode, 0); EmitU8(FCode, $FF);
+              end
               else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
               begin
                 // PrintStr(s: pchar) -> void

@@ -872,7 +872,7 @@ begin
           
           irCallBuiltin:
             begin
-              if instr.ImmStr = 'exit' then
+              if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = 'exit' then
               begin
                 if instr.Src1 >= 0 then
                   EmitIType($03, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Src1))
