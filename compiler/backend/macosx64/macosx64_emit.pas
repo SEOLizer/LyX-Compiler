@@ -1712,6 +1712,90 @@ begin
               WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
             end;
           end
+          else if instr.ImmStr = 'printf' then
+          begin
+            // printf: stub - just ignore
+          end
+          else if instr.ImmStr = 'Println' then
+          begin
+            // Println: already handled above as PrintStr variant
+          end
+          else if instr.ImmStr = 'rmdir' then
+          begin
+            // rmdir(path: pchar) -> int64
+            if instr.Src1 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Src1;
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RDI, 0);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_RMDIR);
+            WriteSyscall(FCode);
+            TrackEnergy(eokSyscall);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'chmod' then
+          begin
+            // chmod(path: pchar, mode: int64) -> int64
+            if instr.Src1 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Src1;
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RDI, 0);
+            if instr.Src2 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Src2;
+              WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RSI, 0);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_CHMOD);
+            WriteSyscall(FCode);
+            TrackEnergy(eokSyscall);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'rename' then
+          begin
+            // rename(oldpath: pchar, newpath: pchar) -> int64
+            if instr.Src1 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Src1;
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RDI, 0);
+            arg2 := -1;
+            if (instr.ImmInt >= 2) and (Length(instr.ArgTemps) >= 2) then
+              arg2 := instr.ArgTemps[1]
+            else
+              arg2 := instr.Src2;
+            if arg2 >= 0 then
+            begin
+              slotIdx := fn.LocalCount + arg2;
+              WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RSI, 0);
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_RENAME);
+            WriteSyscall(FCode);
+            TrackEnergy(eokSyscall);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
           // Other builtins: ignore for now
         end;
 
