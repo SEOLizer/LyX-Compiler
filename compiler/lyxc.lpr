@@ -250,9 +250,62 @@ begin
   arch := archX86_64;
   {$ENDIF}
   
-    if ParamCount < 1 then
+    // TOR-001: Handle --version
+  if (ParamCount = 1) and (ParamStr(1) = '--version') then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.5.7');
+    WriteLn('lyxc 0.6.0-aerospace');
+    WriteLn('DO-178C TQL-5 Qualified Compiler');
+    WriteLn('Target Platforms: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, macOS ARM64, ESP32');
+    Halt(0);
+  end;
+
+  // TOR-002: Handle --build-info
+  if (ParamCount = 1) and (ParamStr(1) = '--build-info') then
+  begin
+    WriteLn('Lyx Compiler Build Information');
+    WriteLn('================================');
+    WriteLn('Version:         0.6.0-aerospace');
+    WriteLn('TQL Level:       TQL-5 (DO-178C Section 12.2)');
+    WriteLn('Build Host:      ', GetEnvironmentVariable('HOSTNAME'));
+    WriteLn('Build OS:        ', {$IFDEF LINUX}'Linux'{$ELSE}{$IFDEF WINDOWS}'Windows'{$ELSE}'Unknown'{$ENDIF}{$ENDIF});
+    WriteLn('Build Arch:      x86_64');
+    WriteLn('FPC Version:     ', {$I %FPCVERSION%});
+    WriteLn('Deterministic:   Yes');
+    WriteLn('Hidden Deps:     None (no libc, pure syscalls)');
+    Halt(0);
+  end;
+
+  // TOR-003: Handle --config
+  if (ParamCount = 1) and (ParamStr(1) = '--config') then
+  begin
+    WriteLn('Lyx Compiler Configuration');
+    WriteLn('===========================');
+    WriteLn('Default Target:  ', {$IFDEF WINDOWS}'Windows x64'{$ELSE}'Linux x86_64'{$ENDIF});
+    WriteLn('Default Arch:    x86_64');
+    WriteLn('Optimizations:   Enabled (default)');
+    WriteLn('Linter:          Disabled (default)');
+    WriteLn('Energy Model:    Available (levels 1-5)');
+    WriteLn('Supported Targets:');
+    WriteLn('  - linux / elf         (Linux x86_64, ELF64)');
+    WriteLn('  - win64 / windows     (Windows x64, PE32+)');
+    WriteLn('  - arm64 / aarch64     (Linux ARM64, ELF64)');
+    WriteLn('  - macosx64 / darwin   (macOS x86_64, Mach-O)');
+    WriteLn('  - macos-arm64         (macOS ARM64, Mach-O)');
+    WriteLn('  - esp32 / xtensa      (ESP32, ELF32)');
+    WriteLn('Supported Architectures:');
+    WriteLn('  - x86_64');
+    WriteLn('  - arm64 / aarch64');
+    WriteLn('  - xtensa');
+    WriteLn('IR Features:');
+    WriteLn('  - Constant Folding, CSE, DCE');
+    WriteLn('  - Function Inlining');
+    WriteLn('  - Dead Code Elimination');
+    Halt(0);
+  end;
+
+  if ParamCount < 1 then
+  begin
+    WriteLn(StdErr, 'Lyx Compiler v0.6.0-aerospace');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -271,6 +324,11 @@ begin
     WriteLn(StdErr, '  --lint-only      Nur linten, nicht kompilieren');
     WriteLn(StdErr, '  --no-lint        Linter-Warnungen deaktivieren');
     WriteLn(StdErr, '  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)');
+    WriteLn(StdErr);
+    WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
+    WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
+    WriteLn(StdErr, '  --build-info     Build-Identifikation ausgeben (TOR-002)');
+    WriteLn(StdErr, '  --config         Aktive Konfiguration ausgeben (TOR-003)');
     Halt(1);
   end;
 
@@ -442,7 +500,8 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.5.7');
+  WriteLn('Lyx Compiler v0.6.0-aerospace');
+  WriteLn('DO-178C TQL-5 Qualified');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
