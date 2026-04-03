@@ -1166,6 +1166,260 @@ begin
             begin
               // munmap stub
             end
+            else if instr.ImmStr = 'StrCharAt' then
+            begin
+              // StrCharAt stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrSetChar' then
+            begin
+              // StrSetChar stub
+            end
+            else if instr.ImmStr = 'StrNew' then
+            begin
+              // StrNew stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrFree' then
+            begin
+              // StrFree stub
+            end
+            else if instr.ImmStr = 'StrFromInt' then
+            begin
+              // StrFromInt stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrAppend' then
+            begin
+              // StrAppend stub - return first arg
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrFindChar' then
+            begin
+              // StrFindChar stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrSub' then
+            begin
+              // StrSub stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrConcat' then
+            begin
+              // StrConcat stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrCopy' then
+            begin
+              // StrCopy stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'FileGetSize' then
+            begin
+              // FileGetSize stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrStartsWith' then
+            begin
+              // StrStartsWith stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrEndsWith' then
+            begin
+              // StrEndsWith stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrEquals' then
+            begin
+              // StrEquals stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetArgC' then
+            begin
+              // GetArgC stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'GetArg' then
+            begin
+              // GetArg stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'Random' then
+            begin
+              // Random stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'RandomSeed' then
+            begin
+              // RandomSeed stub
+            end
+            else if instr.ImmStr = 'Println' then
+            begin
+              // Println stub
+            end
+            else if instr.ImmStr = 'printf' then
+            begin
+              // printf stub
+            end
+            else if instr.ImmStr = 'lseek' then
+            begin
+              // lseek stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'unlink' then
+            begin
+              // unlink stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'mkdir' then
+            begin
+              // mkdir stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rmdir' then
+            begin
+              // rmdir stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'chmod' then
+            begin
+              // chmod stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'rename' then
+            begin
+              // rename stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'getpid' then
+            begin
+              // getpid stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'ioctl' then
+            begin
+              // ioctl stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_socket' then
+            begin
+              // sys_socket stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_bind' then
+            begin
+              // sys_bind stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_listen' then
+            begin
+              // sys_listen stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_accept' then
+            begin
+              // sys_accept stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_connect' then
+            begin
+              // sys_connect stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_recvfrom' then
+            begin
+              // sys_recvfrom stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_sendto' then
+            begin
+              // sys_sendto stub - return 0
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_setsockopt' then
+            begin
+              // sys_setsockopt stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_getsockopt' then
+            begin
+              // sys_getsockopt stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_shutdown' then
+            begin
+              // sys_shutdown stub - return -1
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
             else
             begin
               // Generic builtin call (fallback)
@@ -1178,7 +1432,7 @@ begin
               FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
               FCallPatches[High(FCallPatches)].TargetName := '__builtin_' + instr.ImmStr;
               WriteBranchLink(FCode, 0);
-            end;
+            end
             
             // Store result
             if instr.Dest >= 0 then
