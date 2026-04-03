@@ -24,7 +24,7 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 - [x] `StrAppendStr(dest, src)` / `StrConcat(a, b)` / `StrCopy(s)`
 - [x] `IntToStr(n)` / `FileGetSize(path)`
 - [x] `HashNew(cap)` / `HashSet` / `HashGet` / `HashHas`
-- [ ] `GetArgC()` / `GetArg(i)`
+- [x] `GetArgC()` / `GetArg(i)` — Command-Line Argumente
 - [x] `StrStartsWith` / `StrEndsWith` / `StrEquals`
 
 **Fehlt ❌ – Sonstige Builtins:**
