@@ -1683,7 +1683,7 @@ begin
         irDynArrayPush, irDynArrayPop, irDynArrayLen, irDynArrayFree:
           TrackEnergy(eokMemory);
         irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
-        irReturn, irReturnStruct:
+        irFuncExit, irReturnStruct:
           TrackEnergy(eokBranch);
         irCallBuiltin:
           if (instr.ImmStr = 'exit') or (instr.ImmStr = 'PrintStr') or
@@ -4273,7 +4273,7 @@ begin
             // This causes a memory leak but prevents crashes
           end;
           
-        irReturn:
+        irFuncExit:
           begin
             // Load return value into X0
             if instr.Src1 >= 0 then
