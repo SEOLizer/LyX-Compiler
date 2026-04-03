@@ -1860,7 +1860,7 @@ begin
             else if instr.ImmStr = 'StrStartsWith' then
             begin
               // StrStartsWith(s, prefix) -> bool
-              // Simple prefix check
+              // Compare byte by byte until prefix null terminator
               if instr.Src1 >= 0 then
                 WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
               else
@@ -1869,19 +1869,127 @@ begin
                 WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
               else
                 WriteMovImm64(FCode, X1, 0);
-              // Compare byte by byte until prefix null terminator
+              
+              // Loop: compare bytes
               WriteMovImm64(FCode, X2, 1);  // result = true
               WriteMovImm64(FCode, X3, 0);  // index
-              // Loop: load byte from prefix, if 0 -> done
-              // Simplified: return true for now
+              
+              // Loop start
+              var loopStart := FCode.Size;
+              // LDRB W4, [X1, X3] - load prefix byte
+              EmitInstr(FCode, $38636824);
+              // CBZ W4, done (prefix end = match)
+              var cbzPos := FCode.Size;
+              EmitInstr(FCode, $34000004);  // placeholder
+              
+              // LDRB W5, [X0, X3] - load string byte
+              EmitInstr(FCode, $38636805);
+              // CMP W4, W5
+              EmitInstr(FCode, $6B05009F);
+              // B.NE not_match
+              var bnePos := FCode.Size;
+              EmitInstr(FCode, $54000001);  // placeholder
+              
+              // index++
+              WriteAddImm(FCode, X3, X3, 1);
+              // b loop
+              WriteBranch(FCode, (loopStart - FCode.Size) div 4);
+              
+              // not_match:
+              var notMatchPos := FCode.Size;
+              WriteMovImm64(FCode, X2, 0);  // result = false
+              
+              // done:
+              var donePos := FCode.Size;
+              // Patch CBZ
+              FCode.PatchU32(cbzPos, $34000004 or (((donePos - cbzPos) div 4) shl 5));
+              // Patch B.NE
+              FCode.PatchU32(bnePos, $54000001 or (((notMatchPos - bnePos) div 4) shl 5));
+              
+              WriteMovRegReg(FCode, X0, X2);
               if instr.Dest >= 0 then
-                WriteStrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'StrEndsWith' then
             begin
               // StrEndsWith(s, suffix) -> bool
-              // Stub: return false
+              // Get lengths of both strings, compare from end
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              
+              // Get string length (X0)
+              WriteMovRegReg(FCode, X9, X0);
+              WriteMovImm64(FCode, X2, 0);
+              var lenLoop1 := FCode.Size;
+              EmitInstr(FCode, $38626923);  // ldrb w3, [x9, x2]
+              EmitInstr(FCode, $34000063);  // cbz w3, +0
+              var cbz1Pos := FCode.Size;
+              WriteAddImm(FCode, X2, X2, 1);
+              WriteBranch(FCode, -12);
+              var len1Done := FCode.Size;
+              FCode.PatchU32(cbz1Pos, $34000003 or (((len1Done - cbz1Pos) div 4) shl 5));
+              WriteMovRegReg(FCode, X3, X2);  // X3 = len(s)
+              
+              // Get prefix length (X1)
+              WriteMovRegReg(FCode, X9, X1);
+              WriteMovImm64(FCode, X2, 0);
+              var lenLoop2 := FCode.Size;
+              EmitInstr(FCode, $38626924);
+              EmitInstr(FCode, $34000064);
+              var cbz2Pos := FCode.Size;
+              WriteAddImm(FCode, X2, X2, 1);
+              WriteBranch(FCode, -12);
+              var len2Done := FCode.Size;
+              FCode.PatchU32(cbz2Pos, $34000004 or (((len2Done - cbz2Pos) div 4) shl 5));
+              WriteMovRegReg(FCode, X4, X2);  // X4 = len(prefix)
+              
+              // If prefix longer than string, return false
+              WriteCmpReg(FCode, X4, X3);
+              var bgtPos := FCode.Size;
+              WriteBranchCond(FCode, $0A, 0);  // b.gt not_match
+              
+              // Compare from end: offset = len(s) - len(prefix)
+              WriteSubRegReg(FCode, X5, X3, X4);  // X5 = start offset in s
+              WriteMovImm64(FCode, X6, 0);  // index in prefix
+              
+              var cmpLoop := FCode.Size;
+              // LDRB W7, [X1, X6] - prefix byte
+              EmitInstr(FCode, $38666827);
+              EmitInstr(FCode, $34000067);  // cbz w7, match (prefix end)
+              var cbz3Pos := FCode.Size;
+              // LDRB W8, [X0, X5] - string byte
+              EmitInstr(FCode, $38656808);
+              EmitInstr(FCode, $6B0800FF);  // cmp w7, w8
+              var bne2Pos := FCode.Size;
+              WriteBranchCond(FCode, $01, 0);  // b.ne not_match
+              
+              WriteAddImm(FCode, X5, X5, 1);
+              WriteAddImm(FCode, X6, X6, 1);
+              WriteBranch(FCode, (cmpLoop - FCode.Size) div 4);
+              
+              // match:
+              var matchPos := FCode.Size;
+              WriteMovImm64(FCode, X0, 1);
+              var skipNotMatch := FCode.Size;
+              WriteBranch(FCode, 0);  // b done
+              
+              // not_match:
+              var notMatchPos2 := FCode.Size;
+              FCode.PatchU32(bgtPos, $5400000A or (((notMatchPos2 - bgtPos) div 4) shl 5));
+              FCode.PatchU32(bne2Pos, $54000001 or (((notMatchPos2 - bne2Pos) div 4) shl 5));
               WriteMovImm64(FCode, X0, 0);
+              
+              // done:
+              var donePos2 := FCode.Size;
+              FCode.PatchU32(cbz3Pos, $34000007 or (((matchPos - cbz3Pos) div 4) shl 5));
+              FCode.PatchU32(skipNotMatch, $14000000 or (((donePos2 - skipNotMatch) div 4)));
+              
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
