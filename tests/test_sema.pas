@@ -4,7 +4,7 @@ program test_sema;
 uses
   SysUtils,
   fpcunit, testregistry, consoletestrunner,
-  diag, lexer, parser, ast, sema;
+  diag, lexer, parser, ast, sema, ir, unit_manager;
 
 type
   TSemaTest = class(TTestCase)
@@ -34,6 +34,7 @@ var
   p: TParser;
   prog: TAstProgram;
   s: TSema;
+  um: TUnitManager;
 begin
   d := TDiagnostics.Create;
   lx := TLexer.Create(src, 'test.lyx', d);
@@ -48,11 +49,23 @@ begin
     lx.Free;
   end;
 
-  s := TSema.Create(d);
+  um := TUnitManager.Create(d);
   try
-    s.Analyze(prog);
+    um.AddSearchPath('..');
+    um.AddSearchPath('../std');
+    um.AddSearchPath('std');
+    
+    // Load all imports (including std.system)
+    um.LoadAllImports(prog, '');
+    
+    s := TSema.Create(d, um);
+    try
+      s.Analyze(prog);
+    finally
+      s.Free;
+    end;
   finally
-    s.Free;
+    um.Free;
   end;
 
   prog.Free;
