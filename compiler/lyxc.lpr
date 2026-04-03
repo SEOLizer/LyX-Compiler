@@ -153,7 +153,7 @@ begin
         irBrTrue: WriteLn(' t', ins.Src1, ', ', ins.LabelName);
         irBrFalse: WriteLn(' t', ins.Src1, ', ', ins.LabelName);
         irLabel: WriteLn(' ', ins.LabelName, ':');
-        irReturn: begin
+        irFuncExit: begin
           if ins.Src1 >= 0 then WriteLn(' t', ins.Src1)
           else WriteLn;
         end;

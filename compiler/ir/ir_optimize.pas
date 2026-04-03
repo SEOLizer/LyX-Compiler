@@ -470,7 +470,7 @@ begin
     // Other operations that write to unused temps
     if (instr.Dest >= 0) and (instr.Op <> irLabel) and
        (instr.Op <> irJmp) and (instr.Op <> irBrTrue) and
-       (instr.Op <> irBrFalse) and (instr.Op <> irReturn) then
+       (instr.Op <> irBrFalse) and (instr.Op <> irFuncExit) then
     begin
       if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
       begin
@@ -556,7 +556,7 @@ begin
     
     // Stop at control flow boundaries
     case instr.Op of
-      irLabel, irJmp, irBrTrue, irBrFalse, irReturn:
+      irLabel, irJmp, irBrTrue, irBrFalse, irFuncExit:
         Break;
     end;
   end;
@@ -1078,7 +1078,7 @@ begin
             tempIsConst[instr.Dest] := False;
         end;
         
-      irLabel, irJmp, irBrTrue, irBrFalse, irReturn:
+      irLabel, irJmp, irBrTrue, irBrFalse, irFuncExit:
         begin
           // Control flow - no temp modifications
         end;

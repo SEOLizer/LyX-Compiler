@@ -85,7 +85,7 @@ var
   i: Integer;
 begin
   for i := 0 to High(instrs) do
-    if instrs[i].Op = irReturn then
+    if instrs[i].Op = irFuncExit then
       Exit(True);
   Result := False;
 end;
@@ -96,7 +96,7 @@ var
 begin
   Result := -1;
   for i := 0 to High(instrs) do
-    if instrs[i].Op = irReturn then
+    if instrs[i].Op = irFuncExit then
     begin
       Result := instrs[i].Src1;
       Exit;
@@ -110,7 +110,7 @@ begin
   Result := -1;
   for i := 0 to High(instrs) do
   begin
-    if (instrs[i].Op = irReturn) and (instrs[i].Src1 = returnTemp) then
+    if (instrs[i].Op = irFuncExit) and (instrs[i].Src1 = returnTemp) then
     begin
       Result := i;
       Exit;
@@ -167,7 +167,7 @@ begin
     begin
       newInstr.LabelName := instr.LabelName + '_inline_' + IntToStr(Length(newInstrs));
     end
-    else if instr.Op = irReturn then
+    else if instr.Op = irFuncExit then
     begin
       if returnTemp >= 0 then
       begin
