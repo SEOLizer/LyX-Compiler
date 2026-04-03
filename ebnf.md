@@ -183,7 +183,7 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
 
-### Enum-Deklarationen (v0.5.6 ✅ ABGESCHLOSSEN)
+### Enum-Deklarationen (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 EnumDecl    := 'enum' Ident '{' EnumBody '}' ';'? ;
@@ -202,7 +202,7 @@ var d: int64 := Direction::North;   // 0
 var s: int64 := HttpStatus::Ok;     // 200
 ```
 
-### Generics / Parametrische Polymorphie (v0.5.6 ✅ ABGESCHLOSSEN)
+### Generics / Parametrische Polymorphie (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 GenericFnDecl  := 'fn' Ident '[' TypeParamList ']' '(' [ ParamList ] ')' [ ':' Type ] Block ;
@@ -225,7 +225,7 @@ fn main(): int64 {
 }
 ```
 
-### Pattern Matching (v0.5.6 ✅ ABGESCHLOSSEN)
+### Pattern Matching (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 MatchStmt   := 'match' Expr '{' { CaseClause } [ DefaultClause ] '}' ;
@@ -250,7 +250,7 @@ fn classify(n: int64): int64 {
 }
 ```
 
-### Tuple-Rückgaben (v0.5.6 ✅ ABGESCHLOSSEN)
+### Tuple-Rückgaben (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 TupleReturnType := '(' Type { ',' Type } ')' ;
@@ -270,7 +270,7 @@ fn main(): int64 {
 }
 ```
 
-### Ausnahmebehandlung / Exception Handling (v0.5.6 ✅ ABGESCHLOSSEN)
+### Ausnahmebehandlung / Exception Handling (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 TryStmt    := 'try' Block 'catch' '(' Ident ':' Type ')' Block ;
@@ -351,7 +351,7 @@ var ids: Set<int64> := {10, 20, 30};
 - `for key, value in map` — Iteration
 - Hash-basierter O(1) Lookup mit FNV-1a
 
-### Dynamic Arrays (v0.5.6 ✅ ABGESCHLOSSEN)
+### Dynamic Arrays (v0.5.7 ✅ ABGESCHLOSSEN)
 
 Dynamic Arrays sind heap-allokierte Arrays mit Fat-Pointer (ptr/len/cap):
 

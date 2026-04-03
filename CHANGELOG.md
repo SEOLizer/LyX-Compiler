@@ -1,10 +1,145 @@
 # Changelog - Lyx Compiler
 
-## Version 0.5.6 (März 2026) 🎉
+## Version 0.5.7 (April 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
 
-#### **Enum-Typen (v0.5.6)**
+#### **String-Bibliothek (std.string) v0.5.7**
+
+Erweiterte String-Manipulationsfunktionen:
+
+```lyx
+import std.string;
+
+fn main(): int64 {
+    // StringBuilder für effizientes Konkatenieren
+    var sb: StringBuilder := new StringBuilder();
+    sb.Init(64);
+    sb.Append("Hello");
+    sb.Append(", ");
+    sb.Append("World");
+    sb.AppendChar(33);     // '!'
+    sb.AppendInt(42);
+    
+    var result: pchar := sb.ToString();
+    PrintStr(result);       // Hello, World!42
+    StrFree(result);
+    
+    sb.FreeBuffer();
+    dispose sb;
+    return 0;
+}
+```
+
+- **StringBuilder**: Klasse für effizientes String-Building
+- **StrTrim**: Entfernt führende/nachfolgende Leerzeichen
+- **StrSplit**: Splitst Strings nachDelimiter
+
+#### **Data Library (Pandas-like) v0.5.7**
+
+Umfassende Data-Frame-Bibliothek für Datenanalyse:
+
+```lyx
+import std.data.core;
+import std.data.io;
+
+fn main(): int64 {
+    // CSV einlesen
+    var df: DataFrame := ReadCSV("data.csv", true, ",");
+    
+    // Spalten-Operationen
+    var sum: int64 := SeriesSum(df, "sales");
+    var avg: f64 := SeriesMeanF64(df, "price");
+    
+    // Gruppierung
+    var grouped: DataFrame := DataFrameGroupBy(df, "category");
+    var counts: DataFrame := GroupByCount(grouped, "category");
+    
+    DataFrameFree(df);
+    return 0;
+}
+```
+
+- **DataFrame**: 2D-Tabellen mit benannten Spalten
+- **Series**: 1D-Arrays mit Labels
+- **CSV I/O**: ReadCSV, WriteCSV
+- **GroupBy**: Gruppierung und Aggregation
+- **Filter/Slice**: Daten-Teilmengen
+- **Statistik**: Sum, Mean, Min, Max, StdDev, etc.
+
+#### **Validation Library (std.validate) v0.5.7**
+
+Business-Identifier Validierung:
+
+```lyx
+import std.validate.ean;
+import std.validate.iban;
+import std.validate.luhn;
+import std.validate.vat;
+
+fn main(): int64 {
+    // EAN/ISBN Validation
+    var valid: bool := EAN13Validate("4006381333931");
+    var isbn: bool := ISBN13Validate("978-3-16-148410-0");
+    
+    // IBAN Validation
+    var ibanValid: bool := IBANValidate("DE89370400440532013000");
+    
+    // Credit Card
+    var cardType: int64 := CreditCardType("4111111111111111");
+    var isValid: bool := CreditCardValidate("4111111111111111", 12, 25);
+    
+    // VAT ID
+    var vatValid: bool := VATValidate("DE123456789");
+    
+    return 0;
+}
+```
+
+- **EAN/UPC**: EAN-13, EAN-8, EAN-14, ISBN-13/10, UPC-A
+- **IBAN**: ISO 13616 Mod 97, 50+ Länder
+- **Credit Card**: Luhn-Algorithmus, 8 Kartentypen
+- **VAT**: EU 27 Länder mit länderspezifischen Regeln
+
+#### **Statistics Library (std.stats) v0.5.7**
+
+Array-Aggregatfunktionen und Statistik:
+
+```lyx
+import std.stats;
+
+fn main(): int64 {
+    var arr: array := [3, 1, 4, 1, 5, 9, 2, 6];
+    
+    var sum: int64 := ArraySum(arr);
+    var avg: f64 := ArrayAvg(arr);
+    var min: int64 := ArrayMin(arr);
+    var max: int64 := ArrayMax(arr);
+    var median: f64 := ArrayMedian(arr);
+    
+    // Sorting
+    ArraySort(arr);
+    
+    // Variance/StdDev
+    var variance: f64 := ArrayVariance(arr);
+    var stddev: f64 := ArrayStdDev(arr);
+    
+    return 0;
+}
+```
+
+- **Aggregates**: Sum, Min, Max, Avg, Median, Count, Product
+- **Sorting**: ArraySort, ArrayReverse
+- **Filtering**: ArrayFilterGt, ArrayFilterLt, ArrayFilterRange
+- **Statistical**: Variance, StdDev, Range, SumSquares
+
+---
+
+## Version 0.5.7 (März 2026) 🎉
+
+### 🚀 **Neue Hauptfeatures**
+
+#### **Enum-Typen (v0.5.7)**
 
 Native Aufzählungstypen mit typsicheren Konstanten:
 
@@ -26,7 +161,7 @@ fn main(): int64 {
 - Zugriff via `EnumName::Wert` (Namespace-Syntax)
 - Werden intern als `int64`-Konstanten lowered
 
-#### **Exception Handling: try/catch/throw (v0.5.6)**
+#### **Exception Handling: try/catch/throw (v0.5.7)**
 
 Strukturierte Fehlerbehandlung:
 
@@ -51,7 +186,7 @@ fn main(): int64 {
 - Nested try/catch vollständig unterstützt
 - Implementiert via `irPushHandler`/`irPopHandler`/`irThrow` IR-Opcodes
 
-#### **Multi-Return / Tuple-Rückgabe (v0.5.6)**
+#### **Multi-Return / Tuple-Rückgabe (v0.5.7)**
 
 Funktionen können mehrere Werte zurückgeben:
 
@@ -73,7 +208,7 @@ fn main(): int64 {
 - `var a, b := f()` Tupel-Destrukturierung
 - Implementierung: RAX/RDX Register-Paar (16-Byte Struct Return)
 
-#### **Generics mit Monomorphisierung (v0.5.6)**
+#### **Generics mit Monomorphisierung (v0.5.7)**
 
 Echte generische Funktionen mit Compile-Time-Spezialisierung:
 
@@ -95,7 +230,7 @@ fn main(): int64 {
 - Monomorphisierung: jede Typen-Kombination erzeugt eine eigene Funktion `_G_name__type`
 - Mehrere Typparameter möglich: `fn zip[A, B](...)`
 
-#### **Pattern Matching mit match/case (v0.5.6)**
+#### **Pattern Matching mit match/case (v0.5.7)**
 
 Ausdrucksstärkere Alternative zu `switch`:
 
@@ -117,7 +252,7 @@ fn classify(n: int64): int64 {
 - `default =>` Fallback
 - Bestehender `switch`-Syntax bleibt vollständig kompatibel
 
-#### **Dynamische String-Builtins (v0.5.6)**
+#### **Dynamische String-Builtins (v0.5.7)**
 
 7 neue Built-in-Funktionen für mmap-basierte dynamische Strings:
 
