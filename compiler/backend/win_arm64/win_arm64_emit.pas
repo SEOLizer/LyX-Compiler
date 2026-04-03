@@ -2055,17 +2055,135 @@ begin
             else if instr.ImmStr = 'GetArgC' then
             begin
               // GetArgC() -> int64
-              // Use GetCommandLineW + CommandLineToArgvW
-              // For now: stub - return 0
-              WriteMovImm64(FCode, X0, 0);
+              // Use GetCommandLineA and count arguments
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetCommandLineA';
+              WriteBranchLink(FCode, 0);
+              
+              // X0 = command line string
+              // Parse: skip whitespace, count words
+              WriteMovRegReg(FCode, X9, X0);  // Save cmdline pointer
+              WriteMovImm64(FCode, X10, 0);   // arg count
+              WriteMovImm64(FCode, X11, 1);   // state: 1 = in whitespace
+              
+              var parseLoop := FCode.Size;
+              // LDRB W12, [X9]
+              EmitInstr(FCode, $3940012C);
+              // CBZ W12, parse_done
+              var cbzParsePos := FCode.Size;
+              EmitInstr(FCode, $3400000C);  // placeholder
+              
+              // CMP W12, #32 (space)
+              EmitInstr(FCode, $7100819F);
+              // B.EQ is_space
+              var beqSpacePos := FCode.Size;
+              EmitInstr(FCode, $54000000);  // placeholder
+              
+              // Not space: if in_whitespace, increment count
+              WriteCbz(FCode, X11, 8);  // if not in_whitespace, skip
+              WriteAddImm(FCode, X10, X10, 1);
+              WriteMovImm64(FCode, X11, 0);  // in_whitespace = false
+              var skipSpace := FCode.Size;
+              WriteBranch(FCode, 0);  // b next
+              
+              // is_space:
+              var isSpacePos := FCode.Size;
+              WriteMovImm64(FCode, X11, 1);  // in_whitespace = true
+              
+              // next:
+              var nextPos := FCode.Size;
+              FCode.PatchU32(skipSpace, $14000000 or (((nextPos - skipSpace) div 4)));
+              FCode.PatchU32(beqSpacePos, $54000000 or (((isSpacePos - beqSpacePos) div 4) shl 5));
+              WriteAddImm(FCode, X9, X9, 1);
+              WriteBranch(FCode, (parseLoop - FCode.Size) div 4);
+              
+              // parse_done:
+              var parseDonePos := FCode.Size;
+              FCode.PatchU32(cbzParsePos, $3400000C or (((parseDonePos - cbzParsePos) div 4) shl 5));
+              
+              // If count is 0, return 1 (at least program name)
+              WriteCmpImm(FCode, X10, 0);
+              WriteCset(FCode, X0, COND_NE);
+              WriteAddImm(FCode, X0, X0, 1);  // +1 for program name
+              
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'GetArg' then
             begin
               // GetArg(i) -> pchar
-              // Stub: return NULL
-              WriteMovImm64(FCode, X0, 0);
+              // Returns pointer to i-th argument in command line
+              // This is a simplified implementation
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              
+              // Get command line
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'GetCommandLineA';
+              WriteBranchLink(FCode, 0);
+              
+              // X0 = cmdline, X1 = target index
+              WriteMovRegReg(FCode, X9, X0);  // Save cmdline
+              WriteMovImm64(FCode, X10, 0);   // current arg index
+              WriteMovImm64(FCode, X11, 1);   // in_whitespace
+              WriteMovRegReg(FCode, X12, X1); // Save target index
+              
+              var argLoop := FCode.Size;
+              // LDRB W13, [X9]
+              EmitInstr(FCode, $3940012D);
+              // CBZ W13, arg_not_found (end of string)
+              var cbzArgPos := FCode.Size;
+              EmitInstr(FCode, $3400000D);  // placeholder
+              
+              // CMP W13, #32
+              EmitInstr(FCode, $710081BF);
+              // B.EQ arg_is_space
+              var beqArgSpacePos := FCode.Size;
+              EmitInstr(FCode, $54000000);  // placeholder
+              
+              // Not space: if transitioning from whitespace, check index
+              WriteCbz(FCode, X11, 16);  // if not in_whitespace, skip
+              WriteAddImm(FCode, X10, X10, 1);
+              WriteMovImm64(FCode, X11, 0);
+              // Check if this is the target arg
+              WriteCmpReg(FCode, X10, X12);
+              var bneTargetPos := FCode.Size;
+              WriteBranchCond(FCode, $01, 0);  // b.ne skip_found
+              
+              // Found! Return X9 (current position)
+              WriteMovRegReg(FCode, X0, X9);
+              var skipNotFound := FCode.Size;
+              WriteBranch(FCode, 0);  // b arg_done
+              
+              var skipFoundPos := FCode.Size;
+              FCode.PatchU32(bneTargetPos, $54000001 or (((skipFoundPos - bneTargetPos) div 4) shl 5));
+              var skipNext := FCode.Size;
+              WriteBranch(FCode, 0);  // b arg_next
+              
+              // arg_is_space:
+              var argSpacePos := FCode.Size;
+              WriteMovImm64(FCode, X11, 1);
+              
+              // arg_next:
+              var argNextPos := FCode.Size;
+              FCode.PatchU32(skipNext, $14000000 or (((argNextPos - skipNext) div 4)));
+              WriteAddImm(FCode, X9, X9, 1);
+              WriteBranch(FCode, (argLoop - FCode.Size) div 4);
+              
+              // arg_not_found:
+              var argNotFoundPos := FCode.Size;
+              FCode.PatchU32(cbzArgPos, $3400000D or (((argNotFoundPos - cbzArgPos) div 4) shl 5));
+              WriteMovImm64(FCode, X0, 0);  // Return NULL
+              
+              // arg_done:
+              var argDonePos := FCode.Size;
+              FCode.PatchU32(beqArgSpacePos, $54000000 or (((argSpacePos - beqArgSpacePos) div 4) shl 5));
+              FCode.PatchU32(skipNotFound, $14000000 or (((argDonePos - skipNotFound) div 4)));
+              
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
