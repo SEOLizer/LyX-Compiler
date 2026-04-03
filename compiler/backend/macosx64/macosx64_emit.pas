@@ -1401,7 +1401,7 @@ begin
         // ========================================================================
         irCallBuiltin:
         begin
-          if instr.ImmStr = 'exit' then
+          if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = 'exit' then
           begin
             if instr.Src1 >= 0 then
             begin

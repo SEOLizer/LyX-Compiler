@@ -1476,7 +1476,7 @@ begin
                 WriteMovRegImm64(FCode, RCX, 0);
               WriteCallRel32(FCode, printIntOffset - (FCode.Size + 5));
             end
-            else if instr.ImmStr = 'exit' then
+            else if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = 'exit' then
             begin
               if instr.Src1 >= 0 then
                 WriteMovRegMem(FCode, RCX, RBP, SlotOffset(localCnt + instr.Src1))

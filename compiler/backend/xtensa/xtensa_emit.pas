@@ -942,7 +942,7 @@ begin
           
           irCallBuiltin:
             begin
-              if instr.ImmStr = 'exit' then
+              if instr.ImmStr = '__mcdc_record' then begin end else if instr.ImmStr = 'exit' then
               begin
                 EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
                 EmitMovI128(xrA2, SYS_EXIT);
