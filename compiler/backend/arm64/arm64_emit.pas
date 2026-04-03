@@ -2553,6 +2553,11 @@ begin
               // sys_exit(X0)
               WriteSyscall(SYS_exit);
             end
+            else if instr.ImmStr = '__mcdc_record' then
+            begin
+              // MC/DC Coverage Recording (DO-178C DAL A)
+              // Stub: no-op for now (runtime coverage data collection)
+            end
             // === std.io: fd-basierte I/O Syscalls (Linux ARM64) ===
             else if instr.ImmStr = 'open' then
             begin
