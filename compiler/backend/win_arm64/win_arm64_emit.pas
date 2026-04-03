@@ -1089,15 +1089,96 @@ begin
         
         irCallBuiltin:
           begin
-            // Load parameter into X0
-            if instr.Src1 >= 0 then
-              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
-            
-            // Call builtin
-            SetLength(FCallPatches, Length(FCallPatches) + 1);
-            FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-            FCallPatches[High(FCallPatches)].TargetName := '__builtin_' + instr.ImmStr;
-            WriteBranchLink(FCode, 0);
+            // Handle specific builtins directly
+            if instr.ImmStr = 'exit' then
+            begin
+              // exit(code: int64) -> never returns
+              // Load code into X0
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              // Call ExitProcess
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'ExitProcess';
+              WriteBranchLink(FCode, 0);
+            end
+            else if instr.ImmStr = 'PrintStr' then
+            begin
+              // PrintStr(s: pchar) -> void
+              // Use WriteFile via stdout (handle = -11)
+              // For stub: just return
+            end
+            else if instr.ImmStr = 'PrintInt' then
+            begin
+              // PrintInt(n: int64) -> void
+              // For stub: just return
+            end
+            else if instr.ImmStr = 'PrintFloat' then
+            begin
+              // PrintFloat(f: f64) -> void
+              // For stub: just return
+            end
+            else if instr.ImmStr = 'open' then
+            begin
+              // open(path, flags, mode) -> int64 (stub)
+              WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'read' then
+            begin
+              // read(fd, buf, count) -> int64 (stub)
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'write' then
+            begin
+              // write(fd, buf, count) -> int64 (stub)
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'close' then
+            begin
+              // close(fd) -> int64 (stub)
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'StrLen' then
+            begin
+              // StrLen(s: pchar) -> int64 (stub)
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'mmap' then
+            begin
+              // mmap stub - return NULL
+              WriteMovImm64(FCode, X0, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'munmap' then
+            begin
+              // munmap stub
+            end
+            else
+            begin
+              // Generic builtin call (fallback)
+              // Load parameter into X0
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              
+              // Call builtin
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_' + instr.ImmStr;
+              WriteBranchLink(FCode, 0);
+            end;
             
             // Store result
             if instr.Dest >= 0 then
