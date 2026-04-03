@@ -2576,6 +2576,312 @@ begin
               // printf(format, ...) -> void
               // Stub: just return for now
             end
+            else if instr.ImmStr = 'sys_socket' then
+            begin
+              // sys_socket(domain, type, protocol) -> SOCKET (int64)
+              // Use WinSock2 socket() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, 2);  // AF_INET
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 1);  // SOCK_STREAM
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 6);  // IPPROTO_TCP
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'socket';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_bind' then
+            begin
+              // sys_bind(sockfd, addr, addrlen) -> int64
+              // Use WinSock2 bind() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 16);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'bind';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_listen' then
+            begin
+              // sys_listen(sockfd, backlog) -> int64
+              // Use WinSock2 listen() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 128);  // SOMAXCONN
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'listen';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_accept' then
+            begin
+              // sys_accept(sockfd, addr, addrlen) -> SOCKET (int64)
+              // Use WinSock2 accept() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'accept';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_connect' then
+            begin
+              // sys_connect(sockfd, addr, addrlen) -> int64
+              // Use WinSock2 connect() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 16);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'connect';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_recvfrom' then
+            begin
+              // sys_recvfrom(sockfd, buf, len, flags, addr, addrlen) -> int64
+              // Use WinSock2 recvfrom() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // flags from ArgTemps[0]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              // addr from ArgTemps[1]
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              // addrlen from ArgTemps[2]
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X5, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'recvfrom';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_sendto' then
+            begin
+              // sys_sendto(sockfd, buf, len, flags, addr, addrlen) -> int64
+              // Use WinSock2 sendto() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // flags from ArgTemps[0]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              // addr from ArgTemps[1]
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X4, 0);
+              // addrlen from ArgTemps[2]
+              if Length(instr.ArgTemps) >= 3 then
+                WriteLdrImm(FCode, X5, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2]))
+              else
+                WriteMovImm64(FCode, X5, 16);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'sendto';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_setsockopt' then
+            begin
+              // sys_setsockopt(sockfd, level, optname, optval, optlen) -> int64
+              // Use WinSock2 setsockopt() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0xFFFF);  // SOL_SOCKET
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // optval from ArgTemps[0]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              // optlen from ArgTemps[1]
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X4, 4);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'setsockopt';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_getsockopt' then
+            begin
+              // sys_getsockopt(sockfd, level, optname, optval, optlen) -> int64
+              // Use WinSock2 getsockopt() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 0xFFFF);  // SOL_SOCKET
+              if instr.Src3 >= 0 then
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              else
+                WriteMovImm64(FCode, X2, 0);
+              // optval from ArgTemps[0]
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X3, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X3, 0);
+              // optlen from ArgTemps[1]
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X4, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X4, 4);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'getsockopt';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_shutdown' then
+            begin
+              // sys_shutdown(sockfd, how) -> int64
+              // Use WinSock2 shutdown() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteMovImm64(FCode, X1, 2);  // SD_BOTH
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'shutdown';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'sys_closesocket' then
+            begin
+              // sys_closesocket(sockfd) -> int64
+              // Use WinSock2 closesocket() function
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, UInt64(-1));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'closesocket';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+            else if instr.ImmStr = 'WSAStartup' then
+            begin
+              // WSAStartup(version, data) -> int64
+              // Initialize WinSock2
+              if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
+              else
+                WriteMovImm64(FCode, X0, $0202);  // Version 2.2
+              if instr.Src2 >= 0 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src2))
+              else
+                WriteSubImm(FCode, SP, SP, 400);  // Allocate WSADATA on stack
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := 'WSAStartup';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
             else
             begin
               // Unknown builtin - call as __builtin_<name>
