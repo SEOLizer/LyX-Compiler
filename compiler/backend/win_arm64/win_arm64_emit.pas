@@ -740,6 +740,77 @@ begin
   WriteLdpPostIndex(FCode, X29, X30, SP, 64);
   WriteRet(FCode);
   
+  // Println: X0 = string address
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_Println');
+  
+  // Prologue
+  WriteStpPreIndex(FCode, X29, X30, SP, -64);
+  WriteMovRegReg(FCode, X29, SP);
+  
+  // Save string pointer
+  WriteMovRegReg(FCode, X9, X0);
+  
+  // Calculate string length (same as PrintStr)
+  WriteMovImm64(FCode, X2, 0);
+  // ldrb w1, [x9, x2]
+  EmitInstr(FCode, $38626921);
+  // cbz w1, end
+  EmitInstr(FCode, $34000061);
+  // add x2, x2, #1
+  WriteAddImm(FCode, X2, X2, 1);
+  // b -12
+  WriteBranch(FCode, -12);
+  
+  // Now X2 = length, X9 = address
+  // GetStdHandle(STD_OUTPUT_HANDLE)
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  
+  WriteMovRegReg(FCode, X8, X0);  // Save handle
+  
+  // WriteFile(handle, string, length, NULL, NULL)
+  WriteMovRegReg(FCode, X0, X8);
+  WriteMovRegReg(FCode, X1, X9);
+  WriteMovRegReg(FCode, X2, X2);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
+  
+  // Now write "\r\n" (CRLF for Windows console)
+  // Store CRLF on stack at [SP+48]
+  WriteMovImm64(FCode, X0, UInt64($0000000000000A0D));  // \r\n
+  EmitInstr(FCode, $F9001BE0);  // STR X0, [SP+48]
+  
+  // GetStdHandle again
+  WriteMovImm64(FCode, X0, UInt64(-11));
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'GetStdHandle';
+  WriteBranchLink(FCode, 0);
+  
+  // WriteFile(handle, "\r\n", 2, NULL, NULL)
+  WriteMovRegReg(FCode, X1, SP);
+  WriteAddImm(FCode, X1, X1, 48);
+  WriteMovImm64(FCode, X2, 2);
+  WriteMovImm64(FCode, X3, 0);
+  WriteMovImm64(FCode, X4, 0);
+  SetLength(FCallPatches, Length(FCallPatches) + 1);
+  FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+  FCallPatches[High(FCallPatches)].TargetName := 'WriteFile';
+  WriteBranchLink(FCode, 0);
+  
+  // Epilogue
+  WriteLdpPostIndex(FCode, X29, X30, SP, 64);
+  WriteRet(FCode);
+  
   // Phase 4: User functions
   for i := 0 to High(module.Functions) do
   begin
