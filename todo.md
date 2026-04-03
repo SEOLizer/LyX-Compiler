@@ -33,12 +33,12 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 - [x] `ioctl` / `getpid`
 - [x] `peek8/16/32/64` / `poke8/16/32/64`
 - [x] `format_float` (`:width:decimals` Format-Specifier)
-- [ ] `Inspect` (Debug-Visualizer) — nicht in allen Backends implementiert
+- [ ] `Inspect` (Debug-Visualizer) — ⏳ Deferred (nicht in Referenz-Backend x86_64 implementiert)
 - [x] Socket-Builtins: `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect`, `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_shutdown`
 
 **Offen – bekannte Bugs:**
 - [x] ~~SIGBUS bei PLT/GOT-basiertem Dynamic Linking~~ (X16-Register-Konflikt, `feat/dynlink-v2`) — behoben via X17
-- [ ] Float-Codegen (SSE2 → ARM64 NEON Mapping für `format_float`)
+- [x] ~~Float-Codegen~~ (SSE2 → ARM64 NEON Mapping für `format_float`) — behoben via format_float builtin
 
 ---
 
