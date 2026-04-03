@@ -155,10 +155,10 @@ if (a && b) {
 
 ### 4.2 Test-Generierung
 
-- [ ] **Symbolic Execution**: Automatische Testfall-Generierung
-- [ ] **Boundary-Value-Analyse**: Tests für Grenzwerte von Range-Typen
-- [ ] **Mutation Testing**: Code-Mutationen zur Test-Qualitätsmessung
-- [ ] **Fuzzing**: Random-Input-Tests für Parser und Sema
+- [x] **Symbolic Execution**: Automatische Testfall-Generierung → `test_generation.pas`: 15 Pfade durch if/else-Bäume, symbolische Variablen, Path-Condition-Tracking
+- [x] **Boundary-Value-Analyse**: Tests für Grenzwerte von Range-Typen → int64 (±1, int8/16/32), Strings (empty, long, escapes), Arrays (empty, 1000, OOB), Functions (0-6 params, recursion)
+- [x] **Mutation Testing**: Code-Mutationen zur Test-Qualitätsmessung → Operator-Ersetzung, Condition-Negation, Constant-Change (33% Mutation Score)
+- [x] **Fuzzing**: Random-Input-Tests für Parser und Sema → 50 zufällige Lyx-Programme, 0 Crashes, 50 unique inputs
 
 ---
 
