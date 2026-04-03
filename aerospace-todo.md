@@ -273,11 +273,11 @@ fn flight_control_loop() {
 
 ### 8.2 Compiler-Dokumentation
 
-- [ ] **Compiler Manual**: Vollständige Sprachspezifikation
-- [ ] **User Guide**: Bedienung des Compilers
-- [ ] **Verification Report**: Nachweis der Compiler-Korrektheit
-- [ ] **Change Log**: Vollständige Historie aller Änderungen
-- [ ] **Problem Reports**: Bekannte Issues und Workarounds
+- [x] **Compiler Manual**: Vollständige Sprachspezifikation → `COMPILER_MANUAL.md` (700+ Zeilen, Typen, Builtins, CLI, Safety, Stdlib, Version History, Known Issues)
+- [x] **User Guide**: Bedienung des Compilers → `USER_GUIDE.md` (Getting Started, Language Basics, Stdlib, Safety, Advanced Topics, Troubleshooting)
+- [x] **Verification Report**: Nachweis der Compiler-Korrektheit → `VERIFICATION_REPORT.md` (111/111 Tests, TOR, Reference Interpreter, Determinism, MC/DC, Static Analysis, Test Generation)
+- [x] **Change Log**: Vollständige Historie aller Änderungen → `CHANGELOG.md` aktualisiert mit v0.7.0-aerospace Eintrag
+- [x] **Problem Reports**: Bekannte Issues und Workarounds → `COMPILER_MANUAL.md` Section 9 (ESP32, ARM Cortex-M, RISC-V, General issues)
 
 ---
 

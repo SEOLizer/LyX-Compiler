@@ -1,5 +1,97 @@
 # Changelog - Lyx Compiler
 
+## Version 0.7.0-aerospace (April 2026) 🎉
+
+### 🚀 **DO-178C Compliance**
+
+#### **Tool Qualification (TQL-5)**
+- `--version` flag (TOR-001): SemVer + TQL level output
+- `--build-info` flag (TOR-002): Build hash, host, FPC version, determinism
+- `--config` flag (TOR-003): All configuration parameters documented
+- TOR-010: Deterministic code generation validated (SHA-256 comparison)
+- TOR-011: 100% IR coverage in all 6 backends
+- TOR-012: Error messages with source positions
+- TOR-040: Reproducible builds (10x stress test passed)
+- TOR-041: No hidden dependencies (static binary, no libc)
+- TOR-042: Deterministic optimization
+
+#### **MC/DC Instrumentation (DAL A)**
+- `--mcdc` flag for coverage instrumentation
+- `--mcdc-report` for coverage report generation
+- `__mcdc_record` builtin in all 7 backends
+- Coverage report: Decision | Function | Line | T | F | Status
+
+#### **Static Analysis (7 Passes)**
+- `--static-analysis` flag
+- **Data-Flow Analysis**: Def-Use chains with use-location tracking
+- **Live Variable Analysis**: Detects unused variables (warnings)
+- **Constant Propagation**: Tracks known constants through irAdd/irSub/irMul
+- **Null Pointer Analysis**: Tracks potentially null pointers from ConstStr
+- **Array Bounds Analysis**: Static index safety verification
+- **Termination Analysis**: Detects unbounded loops and recursive calls
+- **Stack Usage Analysis**: Worst-case stack calculation per function
+
+#### **Test Generation**
+- **Fuzzing**: 50 random Lyx programs, 0 crashes, 50 unique inputs
+- **Boundary-Value Analysis**: 28 tests across 4 categories (all passed)
+- **Mutation Testing**: 3 mutations generated, 1 killed (33% score)
+- **Symbolic Execution**: 15 paths explored through if/else trees
+
+### 🌐 **New Backends**
+
+#### **RISC-V RV64GC** (`--target=riscv`)
+- Full RV64I emitter with LP64D ABI
+- PMP configuration (16 regions, NAPOT/NA4/TOR modes)
+- CSR access (read/write/set/clear)
+- ECALL/EBREAK, Fence/WFI
+- Machine Mode support (mret, get_mhartid, get_mcycle)
+- ELF64 writer for RISC-V (EM_RISCV=243)
+
+#### **ARM Cortex-M** (`compiler/backend/arm_cm/`)
+- MPU configuration (8 regions, 6 AP modes)
+- Fault handlers (HardFault, MemManage, BusFault, UsageFault)
+- Stack canary detection ($DEADBEEF pattern)
+- Privileged/Unprivileged mode switching
+- TrustZone stubs (M33+)
+
+### 🛡️ **Safety Features**
+
+#### **ESP32 Safety**
+- Watchdog: `watchdog_init()`, `watchdog_feed()`, `wdt_reset()`
+- Brownout: `brownout_check()`, `brownout_config()`
+- Flash: `flash_verify()`, `secure_boot()`
+- MPU: `mpu_config()`, `pmp_lock()`
+- Stack: `stack_canary_check()`
+- Cache: `cache_flush()`
+- Coredump: `coredump_save()`
+
+#### **ARM Cortex-M Safety**
+- MPU: `mpu_enable()`, `mpu_config()`
+- Fault: `get_fault_status()`, `get_fault_address()`, `clear_fault_status()`
+- Stack: `stack_canary_check()`
+- Mode: `set_unprivileged()`, `set_privileged()`
+- Debug: `bkpt()`
+
+#### **RISC-V Safety**
+- PMP: `pmp_config()`, `pmp_lock()`
+- CSR: `csr_read()`, `csr_write()`, `csr_set()`, `csr_clear()`
+- Control: `ebreak()`, `fence()`, `fence_i()`, `wfi()`, `mret()`, `sret()`
+- Info: `get_mhartid()`, `get_mcycle()`, `get_time()`
+
+### 📊 **IR Coverage**
+- **100% IR coverage** in all 7 backends (113/113 operations)
+- x86_64: ✅ 100% · x86_64_win64: ✅ 100% · arm64: ✅ 100%
+- macosx64: ✅ 100% · xtensa: ✅ 100% · win_arm64: ✅ 100% · riscv: ✅ 100%
+
+### 📚 **Documentation**
+- **COMPILER_MANUAL.md**: Complete compiler documentation
+- **USER_GUIDE.md**: User-facing guide with examples
+- **VERIFICATION_REPORT.md**: DO-178C verification report (111/111 tests passed)
+- **aerospace-todo.md**: Updated with completed items
+- **README.md**: Updated with new features
+
+---
+
 ## Version 0.5.7 (April 2026) 🎉
 
 ### 🚀 **Neue Hauptfeatures**
