@@ -20,7 +20,7 @@ begin
     // Load local param 0 into temp0
     instr.Op := irLoadLocal; instr.Dest := 0; instr.Src1 := 0; fmain.Emit(instr);
     // return temp0
-    instr.Op := irReturn; instr.Src1 := 0; fmain.Emit(instr);
+    instr.Op := irRet; instr.Src1 := 0; fmain.Emit(instr);
 
     emit := TX86_64Emitter.Create;
     try

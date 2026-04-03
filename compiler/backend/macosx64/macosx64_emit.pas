@@ -546,7 +546,7 @@ begin
       instr := fn.Instructions[j];
 
       case instr.Op of
-        irReturn:
+        irFuncExit:
         begin
           if instr.Src1 >= 0 then
             WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
@@ -1804,7 +1804,7 @@ begin
 
     // Ensure function ends with return
     if (Length(fn.Instructions) = 0) or
-       (fn.Instructions[High(fn.Instructions)].Op <> irReturn) then
+       (fn.Instructions[High(fn.Instructions)].Op <> irFuncExit) then
     begin
       EmitRex(FCode, 1, 0, 0, 0);
       EmitU8(FCode, $89);

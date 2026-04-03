@@ -2893,7 +2893,7 @@ begin
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end;
         
-        irReturn:
+        irFuncExit:
           begin
             if instr.Src1 >= 0 then
               WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));

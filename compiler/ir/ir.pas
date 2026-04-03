@@ -44,10 +44,10 @@ type
      // type casting
      irCast,    // type cast: Dest = cast(Src1, CastFromType, CastToType)
      irCallBuiltin, irCall, irCallStruct, irVarCall,
-    irJmp, irBrTrue, irBrFalse,
-    irLabel,
-    irReturn,
-    irReturnStruct,  // return struct by value (uses StructSize for ABI decision)
+     irJmp, irBrTrue, irBrFalse,
+     irLabel,
+     irFuncExit,
+     irReturnStruct,  // return struct by value (uses StructSize for ABI decision)
      // array operations
       irStackAlloc,  // allocate space on stack for array
       irStoreElem,   // store element at array[index] (static index in ImmInt)
@@ -390,7 +390,7 @@ begin
       Result := 100;
     // Branch-Operationen (mittlere Kosten)
     irJmp, irBrTrue, irBrFalse, irCall, irCallStruct,
-    irReturn, irReturnStruct, irVarCall:
+    irFuncExit, irReturnStruct, irVarCall:
       Result := 50; // Direkte und indirekte Aufrufe
 
     // Builtin-Calls (können Syscalls sein)
