@@ -1568,6 +1568,150 @@ begin
               WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
             end;
           end
+          else if instr.ImmStr = 'PrintFloat' then
+          begin
+            // PrintFloat(value: f64) -> void
+            // Stub: print "(float)\n" to stdout using write syscall
+            // Just use write with a pre-defined string
+            // Allocate small buffer on stack
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, 16); // sub rsp, 16
+            // Write "(float)\n" to stack buffer
+            EmitU8(FCode, Ord('('));
+            EmitU8(FCode, Ord('f'));
+            EmitU8(FCode, Ord('l'));
+            EmitU8(FCode, Ord('o'));
+            EmitU8(FCode, Ord('a'));
+            EmitU8(FCode, Ord('t'));
+            EmitU8(FCode, Ord(')'));
+            EmitU8(FCode, 10); // newline
+            // Write to stdout: write(1, rsp, 8)
+            WriteMovRegImm64(FCode, RDI, 1);  // stdout
+            // lea rsi, [rsp]
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $8D); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, 0); // lea rsi, [rsp]
+            WriteMovRegImm64(FCode, RDX, 8);  // length
+            WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
+            WriteSyscall(FCode);
+            TrackEnergy(eokSyscall);
+            // Restore stack
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, 16); // add rsp, 16
+          end
+          else if instr.ImmStr = 'Random' then
+          begin
+            // Random() -> int64: LCG random (stub: return 0)
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'RandomSeed' then
+          begin
+            // RandomSeed(seed: int64): void (stub)
+          end
+          else if instr.ImmStr = 'sys_socket' then
+          begin
+            // sys_socket: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_bind' then
+          begin
+            // sys_bind: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_listen' then
+          begin
+            // sys_listen: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_accept' then
+          begin
+            // sys_accept: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_connect' then
+          begin
+            // sys_connect: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_recvfrom' then
+          begin
+            // sys_recvfrom: stub - return 0
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_sendto' then
+          begin
+            // sys_sendto: stub - return 0
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_setsockopt' then
+          begin
+            // sys_setsockopt: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_getsockopt' then
+          begin
+            // sys_getsockopt: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'sys_shutdown' then
+          begin
+            // sys_shutdown: stub - return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
           // Other builtins: ignore for now
         end;
 
