@@ -9,7 +9,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ---
 
-## ✅ Abgeschlossene Tasks (76 von 113)
+## ✅ Abgeschlossene Tasks (79 von 113)
 
 ### 1. DO-178C Software Compliance
 
@@ -139,7 +139,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | ~~7~~ | ~~**Range-Typen im Typsystem**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Lexer `tkDotDot`, Parser `range Min..Max`, Sema Compile-Time-Check, IR Runtime-Check, 33/33 Tests |
 | ~~7b~~ | ~~**check() Builtin**~~ | ~~7.1~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – `check(cond)` → panic bei false; Expression-Form, Typ-Check auf bool, IR-Lowering zu if(!cond) panic |
 | ~~8~~ | ~~**Call-Graph: Statischer Aufrufgraph**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TCallGraph` Klasse, AST-Walking für Funktionsaufrufe, Rekursions-Erkennung via DFS, `--call-graph` CLI-Flag |
-| 9 | **Map-File: Speicherlayout aller Symbole** | 6.1 | Mittel | Debug-Information für Zertifizierung und Audit |
+| ~~9~~ | ~~**Map-File: Speicherlayout aller Symbole**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TMapFileGenerator` Klasse, `--map-file` CLI-Flag, Sections/Functions/Globals mit Adressen, Statistiken |
 | 10 | **Result-Typ mit Pattern-Matching** | 7.2, 10.1 | Mittel | Strukturierte Fehlerbehandlung ohne Exceptions (nicht deterministisch) |
 | 11 | **MC/DC-Test-Suite für alle Backend-Pfade** | 10.4 | Mittel | Sicherstellen dass MC/DC-Instrumentierung in allen 7 Backends korrekt funktioniert |
 | 12 | **TrustZone (Cortex-M33+)** | 3.2 | Hoch | Secure/Non-Secure Trennung – nur relevant wenn M33 Target aktiv genutzt wird |
@@ -192,29 +192,30 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | Kategorie | Erledigt | Offen | Fortschritt |
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
-| **2. Spracherweiterungen** | 1 | 14 | 7% |
+| **2. Spracherweiterungen** | 3 | 12 | 20% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 8 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
-| **6. Codegen-Sicherheit** | 0 | 9 | 0% |
-| **7. Laufzeit-Sicherheit** | 0 | 7 | 0% |
+| **6. Codegen-Sicherheit** | 2 | 7 | 22% |
+| **7. Laufzeit-Sicherheit** | 2 | 5 | 29% |
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
-| **10. Implementierungs-Tasks** | 3 | 11 | 21% |
-| **GESAMT** | **46** | **69** | **40%** |
+| **10. Implementierungs-Tasks** | 5 | 9 | 36% |
+| **GESAMT** | **55** | **60** | **48%** |
 
 ---
 
 ## Empfohlene nächste Schritte (Priorität)
 
-1. **Call-Graph: Statischer Aufrufgraph** (P1 #8) – Voraussetzung für WCET-Analyse und Stack-Berechnung über Call-Grenzen
-2. **Map-File: Speicherlayout aller Symbole** (P1 #9) – Debug/Audit-Information für DO-178C 6.1
-3. **Result-Typ mit Pattern-Matching** (P1 #10) – Strukturierte Fehlerbehandlung ohne Exceptions
-4. ~~**check() Builtin** (P1 #7b)~~ ✅ ERLEDIGT
-5. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
-6. ~~**Range-Typen** (P1 #7)~~ ✅ ERLEDIGT
-7. ~~**Assembly-Listing** (P0 #2)~~ ✅ ERLEDIGT
-8. ~~**assert() Builtin** (P0 #3)~~ ✅ ERLEDIGT
+1. **Result-Typ mit Pattern-Matching** (P1 #10) – Strukturierte Fehlerbehandlung ohne Exceptions
+2. **MC/DC-Test-Suite für alle Backend-Pfade** (P1 #11) – Sicherstellen dass MC/DC-Instrumentierung in allen 7 Backends korrekt funktioniert
+3. ~~**Call-Graph: Statischer Aufrufgraph** (P1 #8)~~ ✅ ERLEDIGT
+4. ~~**Map-File: Speicherlayout aller Symbole** (P1 #9)~~ ✅ ERLEDIGT
+5. ~~**check() Builtin** (P1 #7b)~~ ✅ ERLEDIGT
+6. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
+7. ~~**Range-Typen** (P1 #7)~~ ✅ ERLEDIGT
+8. ~~**Assembly-Listing** (P0 #2)~~ ✅ ERLEDIGT
+9. ~~**assert() Builtin** (P0 #3)~~ ✅ ERLEDIGT
 
 ---
 
