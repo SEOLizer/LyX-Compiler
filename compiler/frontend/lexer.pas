@@ -26,7 +26,7 @@ type
     // SIMD Keywords
     tkParallel,
     // Error Handling Keywords
-    tkPanic, tkAssert,
+    tkPanic, tkAssert, tkCheck,
     // Constraint Keywords
     tkWhere, tkValue,
     // Map/Set Keywords
@@ -164,6 +164,7 @@ begin
     tkProtected:  Result := 'protected';
     tkPanic:      Result := 'panic';
     tkAssert:     Result := 'assert';
+    tkCheck:      Result := 'check';
     tkWhere:      Result := 'where';
     tkValue:      Result := 'value';
     tkMap:        Result := 'Map';
@@ -763,6 +764,7 @@ begin
     // Error Handling Keywords
     'panic':      Result := tkPanic;
     'assert':     Result := tkAssert;
+    'check':      Result := tkCheck;
     // Constraint Keywords
     'where':      Result := tkWhere;
     'value':      Result := tkValue;

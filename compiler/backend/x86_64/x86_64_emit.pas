@@ -6540,27 +6540,60 @@ begin
           begin
             // panic(msg): write msg to stderr and exit(1)
             // Src1 = temp holding the message pointer (PChar)
-            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-            // strlen(rsi) → rcx
-            WriteMovRegImm64(FCode, RCX, 0);
-            // loop: cmp byte [rsi+rcx], 0
-            EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
-            // jz +5 (past inc rcx + jmp)
-            EmitU8(FCode, $74); EmitU8(FCode, $05);
-            // inc rcx  (48 FF C1)
-            EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
-            // jmp -11  (EB F5)
-            EmitU8(FCode, $EB); EmitU8(FCode, $F5);
-            // rdx = rcx (length)
-            WriteMovRegReg(FCode, RDX, RCX);
-            // write(fd=2, buf=rsi, len=rdx)
-            WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
-            WriteMovRegImm64(FCode, RDI, 2);  // stderr
-            WriteSyscall(FCode);
-            // exit(1)
-            WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
-            WriteMovRegImm64(FCode, RDI, 1);
-            WriteSyscall(FCode);
+            // Special case: ImmInt = -1 means "check failed" - use default message
+            if instr.ImmInt = -1 then
+            begin
+              // check() - output default "check failed" message
+              // RSI = address of "check failed\0" in .rodata
+              // We'll encode this in the code - use a workaround with lea
+              // For simplicity, load address of embedded string
+              // Actually, the easiest: just exit(1) with no message for now
+              // Better: write a simple message inline
+              // Use: mov rsi, offset Lcheck_failed  (where we put string in rodata)
+              // But we don't have easy access to label addresses here
+              // Simplest workaround: use write with hardcoded "check failed"
+              // Encode: "check failed\n" as immediate bytes in code (not ideal)
+              // Let's use a different approach: call a runtime function
+              // But we don't have libc...
+              // Final approach: just exit(1) - the user can see the exit code
+              // That's not great for debugging. Let's try one more approach:
+              // Use a fixed buffer on stack
+              // Actually, let's just use the existing panic mechanism with a default
+              // string we'll add to the data section later
+              // For now, use a simple inline message: "check"
+              // Encode "check\0" as: 'c'=63, 'h'=68, 'e'=65, 'c'=63, 'k'=6B, 0=00
+              // mov rsi, rsp (temporarily use stack)
+              // But stack is not guaranteed to be writable at this point...
+              // OK, simplest working solution: just exit(1) for now
+              // A proper solution would require data section support
+              WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+              WriteMovRegImm64(FCode, RDI, 1);
+              WriteSyscall(FCode);
+            end
+            else
+            begin
+              WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              // strlen(rsi) → rcx
+              WriteMovRegImm64(FCode, RCX, 0);
+              // loop: cmp byte [rsi+rcx], 0
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0E); EmitU8(FCode, $00);
+              // jz +5 (past inc rcx + jmp)
+              EmitU8(FCode, $74); EmitU8(FCode, $05);
+              // inc rcx  (48 FF C1)
+              EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+              // jmp -11  (EB F5)
+              EmitU8(FCode, $EB); EmitU8(FCode, $F5);
+              // rdx = rcx (length)
+              WriteMovRegReg(FCode, RDX, RCX);
+              // write(fd=2, buf=rsi, len=rdx)
+              WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+              WriteMovRegImm64(FCode, RDI, 2);  // stderr
+              WriteSyscall(FCode);
+              // exit(1)
+              WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+              WriteMovRegImm64(FCode, RDI, 1);
+              WriteSyscall(FCode);
+            end;
           end;
 
         // === Map/Set Operations (TOR-011) ===
