@@ -316,6 +316,21 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
 
+### check() Builtin (v0.8.1 ✅ ABGESCHLOSSEN)
+
+```ebnf
+CheckExpr := 'check' '(' Expr ')' ;
+```
+
+`check(cond)` ist eine runtime-only Assertion ohne Fehlermeldung. Wenn die Bedingung `false` ist, wird `panic` aufgerufen (Exit-Code 1).
+
+```lyx
+fn main(): int64 {
+  check(x > 0);  // panic wenn x <= 0
+  return 0;
+}
+```
+
 ### Enum-Deklarationen (v0.5.7 ✅ ABGESCHLOSSEN)
 
 ```ebnf

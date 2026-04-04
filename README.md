@@ -60,6 +60,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
 ✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
+✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.1)
 ```
 
 ---
