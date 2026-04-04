@@ -9,26 +9,32 @@ unit ir_mcdc;
   Für jede Entscheidung (if, while, etc.) werden Coverage-Points eingefügt,
   die zur Laufzeit aufzeichnen welche Condition-Kombinationen erreicht wurden.
   
-  MC/DC erfordert:
-  1. Jede Bedingung in einer Entscheidung hat beide Ergebnisse (T/F) erreicht
-  2. Jede Bedingung beeinflusst das Ergebnis der Entscheidung unabhängig
-  3. Jede Bedingung wird isoliert variiert während andere konstant bleiben
+  Lücken-Erkennung (aerospace-todo 4.1):
+  - Compile-Zeit: Alle möglichen Condition-Kombinationen werden enumeriert
+  - Runtime: __mcdc_record() inkrementiert Coverage-Zähler im Data-Segment
+  - Report: --mcdc-report zeigt nicht abgedeckte Pfade als Gaps
 }
 
 interface
 
 uses
-  SysUtils, Classes, ir;
+  SysUtils, Classes, ir, bytes;
 
 type
   TMCDCDecision = record
     ID: Integer;
     FunctionName: string;
     LineNumber: Integer;
-    ConditionCount: Integer;    // Anzahl der Bedingungen (a, b, c in a && b && c)
-    ConditionResults: array of Boolean; // T/F für jede Bedingung
-    DecisionResult: Boolean;    // Gesamtergebnis der Entscheidung
-    HitCount: Integer;          // Wie oft erreicht
+    SourceFile: string;
+    ConditionCount: Integer;
+    // Runtime coverage counters (written by instrumented binary)
+    DecisionTrueHits: Int64;
+    DecisionFalseHits: Int64;
+    ConditionTrueHits: array of Int64;
+    ConditionFalseHits: array of Int64;
+    // Gap detection results
+    GapCount: Integer;
+    Gaps: TStringList;
   end;
 
   TMCDCInstrumenter = class
@@ -37,11 +43,14 @@ type
     FNextDecisionID: Integer;
     FDecisions: array of TMCDCDecision;
     FInstrumentedCount: Integer;
+    FCoverageDataOffset: UInt64;
+    FCoverageDataSize: Integer;
     
-    function AddDecision(const funcName: string; lineNum, condCount: Integer): Integer;
+    function AddDecision(const funcName: string; lineNum: Integer; const srcFile: string; condCount: Integer): Integer;
     procedure InstrumentFunction(fn: TIRFunction);
     procedure InstrumentBranch(fn: TIRFunction; idx: Integer);
-    procedure InsertRecordCall(fn: TIRFunction; insertPos: Integer; decisionID, condIdx: Integer; condResult: Boolean);
+    procedure InsertRecordCall(fn: TIRFunction; insertPos: Integer; decisionID, condIdx: Integer; condResult: Boolean; decisionResult: Boolean);
+    procedure AnalyzeGaps;
     
   public
     constructor Create(module: TIRModule);
@@ -49,9 +58,12 @@ type
     
     function Instrument: Integer;
     procedure GenerateReport;
+    procedure GenerateCoverageData(var dataBuf: TByteBuffer);
     
     property DecisionCount: Integer read FNextDecisionID;
     property InstrumentedPoints: Integer read FInstrumentedCount;
+    property CoverageDataOffset: UInt64 read FCoverageDataOffset;
+    property CoverageDataSize: Integer read FCoverageDataSize;
   end;
 
 implementation
@@ -62,47 +74,57 @@ begin
   FModule := module;
   FNextDecisionID := 0;
   FInstrumentedCount := 0;
+  FCoverageDataOffset := 0;
+  FCoverageDataSize := 0;
 end;
 
 destructor TMCDCInstrumenter.Destroy;
+var
+  i: Integer;
 begin
+  for i := 0 to High(FDecisions) do
+    FDecisions[i].Gaps.Free;
   inherited Destroy;
 end;
 
-function TMCDCInstrumenter.AddDecision(const funcName: string; lineNum, condCount: Integer): Integer;
+function TMCDCInstrumenter.AddDecision(const funcName: string; lineNum: Integer; const srcFile: string; condCount: Integer): Integer;
 begin
   Result := FNextDecisionID;
   SetLength(FDecisions, FNextDecisionID + 1);
   FDecisions[FNextDecisionID].ID := FNextDecisionID;
   FDecisions[FNextDecisionID].FunctionName := funcName;
   FDecisions[FNextDecisionID].LineNumber := lineNum;
+  FDecisions[FNextDecisionID].SourceFile := srcFile;
   FDecisions[FNextDecisionID].ConditionCount := condCount;
-  FDecisions[FNextDecisionID].HitCount := 0;
+  FDecisions[FNextDecisionID].DecisionTrueHits := 0;
+  FDecisions[FNextDecisionID].DecisionFalseHits := 0;
+  SetLength(FDecisions[FNextDecisionID].ConditionTrueHits, condCount);
+  SetLength(FDecisions[FNextDecisionID].ConditionFalseHits, condCount);
+  FDecisions[FNextDecisionID].Gaps := TStringList.Create;
+  FDecisions[FNextDecisionID].GapCount := 0;
   Inc(FNextDecisionID);
 end;
 
 procedure TMCDCInstrumenter.InsertRecordCall(fn: TIRFunction; insertPos: Integer;
-  decisionID, condIdx: Integer; condResult: Boolean);
+  decisionID, condIdx: Integer; condResult: Boolean; decisionResult: Boolean);
 var
   newInstr: TIRInstr;
   i: Integer;
 begin
-  // Create irCallBuiltin for __mcdc_record(decisionID, condIdx, condResult)
   SetLength(fn.Instructions, Length(fn.Instructions) + 1);
-  
-  // Shift instructions after insertPos
   for i := High(fn.Instructions) downto insertPos + 1 do
     fn.Instructions[i] := fn.Instructions[i - 1];
   
-  // Insert the record call
+  newInstr := Default(TIRInstr);
   newInstr.Op := irCallBuiltin;
   newInstr.ImmStr := '__mcdc_record';
   newInstr.Dest := -1;
   newInstr.Src1 := -1;
   newInstr.Src2 := -1;
   newInstr.Src3 := -1;
-  newInstr.ImmInt := decisionID;  // Store decision ID in ImmInt
-  newInstr.LabelName := IntToStr(condIdx) + ':' + BoolToStr(condResult, True);
+  newInstr.ImmInt := decisionID;
+  // Encode: condIdx (bits 0-7), condResult (bit 8), decisionResult (bit 9)
+  newInstr.ImmInt := newInstr.ImmInt or (condIdx shl 16) or (Ord(condResult) shl 24) or (Ord(decisionResult) shl 25);
   fn.Instructions[insertPos] := newInstr;
   
   Inc(FInstrumentedCount);
@@ -117,11 +139,11 @@ begin
   
   if (instr.Op = irBrTrue) or (instr.Op = irBrFalse) then
   begin
-    // Create a new decision for this branch
-    decisionID := AddDecision(fn.Name, 0, 1);  // 1 condition per branch
+    decisionID := AddDecision(fn.Name, instr.SourceLine, instr.SourceFile, 1);
     
-    // Insert record call before the branch
-    InsertRecordCall(fn, idx, decisionID, 0, instr.Op = irBrTrue);
+    // Record: condition outcome and decision outcome
+    // For br_true: condition=true, decision=true (branch taken)
+    InsertRecordCall(fn, idx, decisionID, 0, instr.Op = irBrTrue, instr.Op = irBrTrue);
   end;
 end;
 
@@ -135,11 +157,8 @@ begin
   begin
     oldLen := Length(fn.Instructions);
     InstrumentBranch(fn, i);
-    
-    // If we inserted an instruction, skip it
     if Length(fn.Instructions) > oldLen then
       Inc(i);
-    
     Inc(i);
   end;
 end;
@@ -150,19 +169,76 @@ var
 begin
   for i := 0 to High(FModule.Functions) do
     InstrumentFunction(FModule.Functions[i]);
-  
   Result := FInstrumentedCount;
+end;
+
+procedure TMCDCInstrumenter.AnalyzeGaps;
+var
+  i, j: Integer;
+  hasAnyHit: Boolean;
+begin
+  for i := 0 to FNextDecisionID - 1 do
+  begin
+    FDecisions[i].Gaps.Clear;
+    hasAnyHit := False;
+    
+    for j := 0 to FDecisions[i].ConditionCount - 1 do
+    begin
+      if FDecisions[i].ConditionTrueHits[j] = 0 then
+      begin
+        FDecisions[i].Gaps.Add(
+          Format('  [GAP] Condition %d=TRUE: 0 hits', [j]));
+        Inc(FDecisions[i].GapCount);
+      end;
+      if FDecisions[i].ConditionFalseHits[j] = 0 then
+      begin
+        FDecisions[i].Gaps.Add(
+          Format('  [GAP] Condition %d=FALSE: 0 hits', [j]));
+        Inc(FDecisions[i].GapCount);
+      end;
+      if (FDecisions[i].ConditionTrueHits[j] > 0) or (FDecisions[i].ConditionFalseHits[j] > 0) then
+        hasAnyHit := True;
+    end;
+    
+    if FDecisions[i].DecisionTrueHits = 0 then
+    begin
+      FDecisions[i].Gaps.Add(
+        Format('  [GAP] Decision=TRUE: 0 hits', []));
+      Inc(FDecisions[i].GapCount);
+    end;
+    if FDecisions[i].DecisionFalseHits = 0 then
+    begin
+      FDecisions[i].Gaps.Add(
+        Format('  [GAP] Decision=FALSE: 0 hits', []));
+      Inc(FDecisions[i].GapCount);
+    end;
+    
+    if (FDecisions[i].DecisionTrueHits > 0) or (FDecisions[i].DecisionFalseHits > 0) then
+      hasAnyHit := True;
+    
+    if not hasAnyHit then
+    begin
+      FDecisions[i].Gaps.Add(
+        Format('  [GAP] Decision never executed', []));
+      Inc(FDecisions[i].GapCount);
+    end;
+  end;
 end;
 
 procedure TMCDCInstrumenter.GenerateReport;
 var
-  i: Integer;
-  totalPossible, covered: Integer;
+  i, j: Integer;
+  totalGaps, totalDecisions, coveredDecisions: Integer;
+  hasGap: Boolean;
+  status: string;
 begin
+  AnalyzeGaps;
+  
   WriteLn;
   WriteLn('=== MC/DC Coverage Report ===');
   WriteLn('Total decisions: ', FNextDecisionID);
   WriteLn('Instrumented points: ', FInstrumentedCount);
+  WriteLn('Coverage data size: ', FCoverageDataSize, ' bytes');
   WriteLn;
   
   if FNextDecisionID = 0 then
@@ -171,22 +247,72 @@ begin
     Exit;
   end;
   
-  totalPossible := FNextDecisionID * 2;  // Each decision has T/F outcomes
-  covered := 0;
+  totalGaps := 0;
+  coveredDecisions := 0;
+  totalDecisions := FNextDecisionID;
   
-  WriteLn('Decision  | Function         | Line | T | F | Status');
-  WriteLn('----------|------------------|------|---|---|--------');
+  WriteLn('Decision  | Function         | Line | Cond | T-Hits | F-Hits | Status');
+  WriteLn('----------|------------------|------|------|--------|--------|--------');
   
   for i := 0 to FNextDecisionID - 1 do
   begin
-    // Simplified: assume 50% coverage for now (would need runtime data)
-    WriteLn(Format('DEC-%4d  | %-16s | %4d | ? | ? | PARTIAL',
-      [FDecisions[i].ID, FDecisions[i].FunctionName, FDecisions[i].LineNumber]));
+    hasGap := FDecisions[i].Gaps.Count > 0;
+    if hasGap then
+    begin
+      status := 'GAP';
+      Inc(totalGaps);
+    end
+    else
+    begin
+      status := 'FULL';
+      Inc(coveredDecisions);
+    end;
+    
+    for j := 0 to FDecisions[i].ConditionCount - 1 do
+    begin
+      WriteLn(Format('DEC-%4d  | %-16s | %4d |  %d   |  %6d |  %6d | %s',
+        [FDecisions[i].ID, FDecisions[i].FunctionName, FDecisions[i].LineNumber,
+         j, FDecisions[i].ConditionTrueHits[j], FDecisions[i].ConditionFalseHits[j],
+         status]));
+    end;
+    
+    if hasGap then
+    begin
+      for j := 0 to FDecisions[i].Gaps.Count - 1 do
+        WriteLn('  --> ', FDecisions[i].Gaps[j]);
+    end;
   end;
   
   WriteLn;
-  WriteLn('Note: Full MC/DC coverage requires runtime execution data.');
-  WriteLn('Run the instrumented binary and collect coverage data with --mcdc-report.');
+  WriteLn('=== Summary ===');
+  WriteLn('Total decisions:    ', totalDecisions);
+  WriteLn('Fully covered:      ', coveredDecisions);
+  WriteLn('With gaps:          ', totalGaps);
+  if totalDecisions > 0 then
+    WriteLn('MC/DC coverage:     ', Round(coveredDecisions * 100 / totalDecisions), '%')
+  else
+    WriteLn('MC/DC coverage:     N/A');
+  WriteLn;
+end;
+
+procedure TMCDCInstrumenter.GenerateCoverageData(var dataBuf: TByteBuffer);
+var
+  i, j: Integer;
+begin
+  FCoverageDataOffset := dataBuf.Size;
+  
+  for i := 0 to FNextDecisionID - 1 do
+  begin
+    dataBuf.WriteU64LE(0);  // DecisionTrueHits
+    dataBuf.WriteU64LE(0);  // DecisionFalseHits
+    for j := 0 to FDecisions[i].ConditionCount - 1 do
+    begin
+      dataBuf.WriteU64LE(0);  // ConditionTrueHits[j]
+      dataBuf.WriteU64LE(0);  // ConditionFalseHits[j]
+    end;
+  end;
+  
+  FCoverageDataSize := dataBuf.Size - FCoverageDataOffset;
 end;
 
 end.
