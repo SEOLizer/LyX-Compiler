@@ -189,6 +189,8 @@ type
     ExternLibraries: TStringList; // Name=library pairs
     // AST: Reference to program node for static analysis
     ProgramNode: TAstProgram;
+    // Integrity management: from @integrity before unit declaration (aerospace-todo P0 #43)
+    UnitIntegrity: TIntegrityAttr;
     constructor Create;
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
@@ -219,10 +221,12 @@ begin
   LocalCount := 0;
   ParamCount := 0;
   EnergyLevel := eelNone; // eelNone = use global level
-  SafetyPragmas.DALLevel   := dalNone;
-  SafetyPragmas.IsCritical := False;
-  SafetyPragmas.WCETBudget := 0;
-  SafetyPragmas.StackLimit := 0;
+  SafetyPragmas.DALLevel          := dalNone;
+  SafetyPragmas.IsCritical        := False;
+  SafetyPragmas.WCETBudget        := 0;
+  SafetyPragmas.StackLimit        := 0;
+  SafetyPragmas.Integrity.Mode     := imNone;
+  SafetyPragmas.Integrity.Interval := 0;
 end;
 
 destructor TIRFunction.Destroy;
@@ -250,6 +254,8 @@ begin
   GlobalVars := nil;
   ExternLibraries := TStringList.Create;
   ExternLibraries.Sorted := False;
+  UnitIntegrity.Mode     := imNone;
+  UnitIntegrity.Interval := 0;
 end;
 
 destructor TIRModule.Destroy;

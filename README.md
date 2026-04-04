@@ -61,6 +61,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
 ✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
 ✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.1)
+✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.9.0)
 ```
 
 ---
@@ -499,6 +500,66 @@ var spd: Speed := get_speed();  // panics at runtime if > 300
 Any integer base type (`int8`–`int64`, `uint8`–`uint64`, `isize`, `usize`) can be used.
 The bounds are inclusive on both ends. Violations in constant initializers are caught at compile time.
 Non-constant values receive a runtime bounds check emitted as IR compare+branch+panic.
+
+### Integrity Management (v0.9.0)
+
+Unit-level integrity annotations for radiation-tolerant and safety-critical code (DO-178C, aerospace.pdf Section 2.5):
+
+```lyx
+// Software lockstep: redundant execution, check every 50 ms
+@integrity(mode: software_lockstep, interval: 50)
+unit flight.ctrl;
+
+fn main(): int64 { return 0; }
+```
+
+```lyx
+// Memory scrubbing: background CRC sweep every 100 ms
+@integrity(mode: scrubbed, interval: 100)
+unit nav.core;
+
+fn main(): int64 { return 42; }
+```
+
+```lyx
+// Hardware ECC: relies on hardware memory correction
+@integrity(mode: hardware_ecc, interval: 250)
+unit sensor.fusion;
+
+fn main(): int64 { return 0; }
+```
+
+`@integrity` can also be placed on individual functions:
+
+```lyx
+@integrity(mode: scrubbed, interval: 100)
+fn critical_update(): int64 { return 0; }
+```
+
+| Parameter | Values | Meaning |
+|-----------|--------|---------|
+| `mode` | `software_lockstep` | Redundant execution with result comparison |
+| `mode` | `scrubbed` | Periodic background CRC memory sweep |
+| `mode` | `hardware_ecc` | Relies on hardware ECC memory correction |
+| `interval` | ms > 0 | Integrity check / scrub interval in milliseconds |
+
+**Semantic rules:** `@integrity` on `extern fn` → error. `mode: scrubbed` without `interval` → warning.
+
+**`.meta_safe` ELF section (aerospace.pdf Section 2.5.2):**
+When `@integrity` is present on a `unit` declaration, the compiler emits a custom `.meta_safe` ELF section containing:
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..7 | `code_start_va` | Start VA of the code segment |
+| 8..15 | `code_end_va` | End VA of the code segment |
+| 16..19 | `mode` | 1=lockstep, 2=scrubbed, 3=hardware_ecc |
+| 20..23 | `interval_ms` | Integrity interval in milliseconds |
+| 24..31 | `recovery_ptr` | Recovery function pointer (0 = not set) |
+| 32..8231 | triple CRC32 | Three identical CRC32 copies with 4096-byte separation |
+
+Total section size: **8232 bytes** (0x2028). The triple CRC32 store provides radiation fault tolerance — a single-event upset corrupting one copy is detected by comparing all three.
+
+Supported backends: **x86_64**, **ARM64**, **RISC-V**.
 
 ### Tool Qualification (TQL-5)
 
