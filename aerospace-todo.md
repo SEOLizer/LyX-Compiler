@@ -56,10 +56,11 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ### 4. Test-Abdeckung (MC/DC)
 
-#### 4.1 MC/DC – 3/4 ✅
+#### 4.1 MC/DC – 4/4 ✅ KOMPLETT
 - [x] MC/DC-Instrumentierung → `ir_mcdc.pas` Pass, `--mcdc` CLI-Flag, `__mcdc_record` in allen 7 Backends
 - [x] Coverage-Tracking → `TMCDCDecision` mit HitCount, ConditionResults, DecisionResult
 - [x] MC/DC-Bericht → `GenerateReport()` mit `--mcdc-report` Flag
+- [x] **Lücken-Erkennung** → `AnalyzeGaps()` erkennt nicht abgedeckte Pfade: Condition T/F, Decision T/F, never executed
 
 #### 4.2 Test-Generierung – 4/4 ✅ KOMPLETT
 - [x] Symbolic Execution → 15 Pfade durch if/else-Bäume, Path-Condition-Tracking
@@ -106,10 +107,10 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ### 🔴 P0 – Kritisch (DO-178C DAL A Voraussetzung)
 
-| # | Task | Sektion | Aufwand | Begründung |
-|---|------|---------|---------|------------|
-| 1 | **MC/DC Lücken-Erkennung** | 4.1 | Mittel | Runtime-Coverage-Daten sammeln und nicht abgedeckte Pfade markieren – erforderlich für DAL A Nachweis |
-| 2 | **Assembly-Listing mit Source-Annotation** | 6.1, 10.3 | Mittel | Generierter Code muss mit Source-Zeilen verknüpft sein für Audit und Debugging |
+| # | Task | Sektion | Aufwand | Status |
+|---|------|---------|---------|--------|
+| ~~1~~ | ~~**MC/DC Lücken-Erkennung**~~ | ~~4.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `AnalyzeGaps()`, Runtime-Counter im Data-Segment, `--mcdc-report` zeigt Gaps |
+| 2 | **Assembly-Listing** | 6.1 | Mittel | Generierter Code muss mit Source-Zeilen verknüpft sein für Audit und Debugging |
 | 3 | **assert() / check() Builtins** | 7.1 | Mittel | Runtime-Assertions für DAL A – `assert()` (compile+runtime), `check()` (runtime only) |
 | 4 | **MISRA-Regel: Keine impliziten Typkonvertierungen** | 5.2 | Niedrig | Sema-Checker Erweiterung – einfache Regel, großer Sicherheitsgewinn |
 | 5 | **MISRA-Regel: Keine unbenutzten Variablen/Parameter** | 5.2 | Niedrig | Bereits teilweise durch Live-Variable-Analyse abgedeckt, muss nur als Fehler eskaliert werden |
@@ -175,7 +176,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
 | **2. Spracherweiterungen** | 0 | 15 | 0% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
-| **4. Test-Abdeckung** | 7 | 1 | 88% |
+| **4. Test-Abdeckung** | 8 | 0 | 100% |
 | **5. Statische Analyse** | 7 | 8 | 47% |
 | **6. Codegen-Sicherheit** | 0 | 9 | 0% |
 | **7. Laufzeit-Sicherheit** | 0 | 7 | 0% |
