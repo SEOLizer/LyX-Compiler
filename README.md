@@ -65,6 +65,10 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.9.0)
 ✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.9.0)
 ✅ Endianness Annotations: @big_endian / @little_endian on structs for telemetry byte-order management (v0.9.0)
+✅ Flat Structs: `flat struct` — compiler-enforced zero-pointer guarantee for zero-copy serialization (v0.9.0)
+✅ Bit-Level Memory Mapping: `packed struct` with `at(N)` bit-position fields for hardware register mapping (v0.9.0)
+✅ @redundant: Triple Modular Redundancy for global variables — 3 RAM copies with majority-vote reads (v0.9.0)
+✅ @flight_crit: Strict FP determinism — MXCSR round-to-zero, disabled FP constant folding (v0.9.0)
 ```
 
 ---
