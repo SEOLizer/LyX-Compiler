@@ -62,7 +62,7 @@ type
      nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
      nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
      nkReturn, nkBreak, nkSwitch,
-     nkBlock, nkExprStmt, nkDispose, nkAssert,  // OOP statement + assert
+      nkBlock, nkExprStmt, nkDispose, nkAssert, nkCheck,  // OOP statement + assert (check is expression)
      nkTry, nkThrow,                             // Exception handling
      nkTupleVarDecl,                             // var a, b := tupleExpr
      // Top-Level
@@ -1046,6 +1046,16 @@ type
     constructor Create(aMessage: TAstExpr; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Message: TAstExpr read FMessage;
+  end;
+
+  { check(condition) - runtime-only assertion, panics if false without message }
+  TAstCheckExpr = class(TAstExpr)
+  private
+    FCondition: TAstExpr;
+  public
+    constructor Create(aCondition: TAstExpr; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Condition: TAstExpr read FCondition;
   end;
 
   { Inspect(expr) - In-Situ Data Visualizer für Debugging }
@@ -2342,6 +2352,20 @@ end;
 destructor TAstPanicExpr.Destroy;
 begin
   if Assigned(FMessage) then FMessage.Free;
+  inherited Destroy;
+end;
+
+{ TAstCheckExpr }
+
+constructor TAstCheckExpr.Create(aCondition: TAstExpr; aSpan: TSourceSpan);
+begin
+  inherited Create(nkCheck, aSpan);
+  FCondition := aCondition;
+end;
+
+destructor TAstCheckExpr.Destroy;
+begin
+  if Assigned(FCondition) then FCondition.Free;
   inherited Destroy;
 end;
 

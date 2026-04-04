@@ -2043,6 +2043,17 @@ begin
     Exit(ParsePostfix(TAstPanicExpr.Create(e, span)));
   end;
 
+  // check(cond) - runtime-only assertion without message (expression form)
+  if Check(tkCheck) then
+  begin
+    span := FCurTok.Span;
+    Advance; // consume 'check'
+    Expect(tkLParen);
+    e := ParseExpr;
+    Expect(tkRParen);
+    Exit(ParsePostfix(TAstCheckExpr.Create(e, span)));
+  end;
+
   // parallel Array<T>(size) - SIMD array allocation
   if Check(tkParallel) then
   begin
