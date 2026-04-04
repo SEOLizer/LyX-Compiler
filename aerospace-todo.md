@@ -173,7 +173,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~19~~ | ~~**MISRA: Maximale Funktionslänge (60)**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W019 `lrFunctionTooLong`, Statement-Zählung |
 | ~~20~~ | ~~**MISRA: Zyklomatische Komplexität (15)**~~ | ~~5.2~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Linter W020 `lrComplexFunction`, if/while/for/switch-Zählung |
 | 53 | **WCET-Schätzung** | 10.2 | Hoch | Section 2.1 |
-| 54 | **Stack-Analyse über Call-Grenzen** | 10.2 | Mittel | Section 2.1 |
+| ~~54~~ | ~~**Stack-Analyse über Call-Grenzen**~~ | ~~10.2~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TStaticAnalyzer.AnalyzeStackUsageWithCallGraph`, `TCallGraph.GetCalleesList`, Worst-Case-Stack über Call-Graph |
 | 55 | **Design by Contract (pre/post)** | 3 | Hoch | Section 2.3 |
 | 56 | **RingBuffer<T> Typ** | 4 | Mittel | Section 4 |
 | 57 | **Flat Structs für Zero-Copy** | 4 | Niedrig | Section 4 |
@@ -221,14 +221,14 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **2. Spracherweiterungen** | 9 | 9 | 50% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 9 | 0 | 100% |
-| **5. Statische Analyse** | 9 | 6 | 60% |
+| **5. Statische Analyse** | 10 | 5 | 67% |
 | **6. Codegen-Sicherheit** | 2 | 8 | 20% |
 | **7. Laufzeit-Sicherheit** | 2 | 6 | 25% |
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
-| **10. Implementierungs-Tasks** | 7 | 11 | 39% |
+| **10. Implementierungs-Tasks** | 8 | 10 | 44% |
 | **11. Aerospace Extension (NEW)** | 1 | 13 | 7% |
-| **GESAMT** | **86** | **41** | **68%** |
+| **GESAMT** | **87** | **40** | **68%** |
 
 ---
 

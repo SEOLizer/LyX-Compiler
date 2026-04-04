@@ -36,6 +36,10 @@ type
     function GetAllFunctions: string;
     function HasRecursion: Boolean;
     function ExportText: string;
+    
+    { Öffentliche Accessoren für Stack-Analyse }
+    function GetCalleesList(const funcName: string): TStringList;
+    function FindFunction(const name: string): Integer;
   end;
 
 implementation
@@ -391,6 +395,22 @@ begin
       Result += '  [RECURSIVE]' + LineEnding;
     Result += LineEnding;
   end;
+end;
+
+{ Öffentliche Accessoren für Stack-Analyse }
+function TCallGraph.GetCalleesList(const funcName: string): TStringList;
+var
+  idx: Integer;
+begin
+  Result := nil;
+  idx := FindFunc(funcName);
+  if idx >= 0 then
+    Result := FCallees[idx];
+end;
+
+function TCallGraph.FindFunction(const name: string): Integer;
+begin
+  Result := FindFunc(name);
 end;
 
 end.
