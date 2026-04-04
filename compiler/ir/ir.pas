@@ -136,8 +136,11 @@ type
     InspectStructName: string;        // struct/class name if applicable
     InspectFieldNames: array of string; // field names for struct visualization
     InspectFieldTypes: array of TAurumType; // field types for struct visualization
-    InspectFieldOffsets: array of Integer;  // field offsets for struct visualization
-  end;
+     InspectFieldOffsets: array of Integer;  // field offsets for struct visualization
+     // Source location for assembly listing (aerospace-todo 6.1)
+     SourceLine: Integer;       // source line number
+     SourceFile: string;        // source file name
+   end;
 
    TIRInstructionList = array of TIRInstr;
 
