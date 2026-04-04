@@ -1703,6 +1703,14 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // VerifyIntegrity() -> bool (aerospace-todo P0 #45)
+  // Returns true if code integrity is verified (CRC32 match with .meta_safe section)
+  s := TSymbol.Create('VerifyIntegrity');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 0;
+  AddSymbolToCurrent(s, NullSpan);
+
   // === std.regex: Regex support (v0.4.2) ===
   // RegexMatch(pattern: pchar, text: pchar) -> bool
   s := TSymbol.Create('RegexMatch');
@@ -5004,6 +5012,24 @@ begin
     else
     begin
       FDiag.Error('unknown builtin in Math: ' + name, span);
+      Exit;
+    end;
+  end
+  else if qualifier = 'Integrity' then
+  begin
+    // Integrity.* functions (aerospace-todo P0 #45)
+    if name = 'VerifyIntegrity' then
+    begin
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atBool;
+      Result.ParamCount := 0;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown builtin in Integrity: ' + name, span);
       Exit;
     end;
   end
