@@ -386,6 +386,92 @@ type TelemetryFrame = @big_endian struct {
 - **AST**: `FEndian: TEndianType` in `TAstStructDecl`
 - **Parser**: Endian-Annotation wird in `ParseTypeDecl` vor `struct` geparst
 
+### Flat Structs (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
+
+Structs können mit dem `flat` Keyword annotiert werden, um sicherzustellen, dass sie keine Pointer-Felder enthalten – essentiell für Zero-Copy-Serialisierung:
+
+```ebnf
+FlatStructDecl = "flat" "struct" "{" { StructField } "}" ;
+StructField    = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
+```
+
+**Semantik:**
+- `flat struct` darf keine Pointer-Felder (`pchar`, `pchar?`, `fn ptr`) enthalten
+- Verschachtelte Structs in flat structs werden ebenfalls geprüft
+- Dient der Garantie, dass die Struktur direkt bitweise kopiert werden kann
+
+**Beispiel:**
+```lyx
+type TelemetryFrame = flat struct {
+  timestamp: int64;
+  temperature: int16;
+};
+```
+
+### Bit-Level Memory Mapping (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
+
+In `@packed` Structs können Felder mit `at(N)` eine explizite Bit-Position erhalten:
+
+```ebnf
+PackedStructDecl = "packed" "struct" "{" { PackedField } "}" ;
+PackedField      = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
+```
+
+**Semantik:**
+- `at(N)` gibt die Start-Bitposition des Feldes an (0-basiert)
+- Nur in `packed struct` erlaubt – reguläre Structs verwenden Byte-Alignment
+- Typ bestimmt die Feldbreite (z.B. `bool` = 1 Bit, `int64` = 64 Bits)
+
+**Beispiel:**
+```lyx
+type Thruster = packed struct {
+  power: int64 at(0);
+  is_active: bool at(64);
+};
+```
+
+### @redundant – Triple Modular Redundancy (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
+
+Globale Variablen können mit `@redundant` annotiert werden, um automatisch drei physisch getrennte Kopien im RAM zu erzeugen:
+
+```ebnf
+RedundantVarDecl = "@redundant" ( "var" | "let" ) Ident ":" Type [ ":=" Expr ] ";" ;
+```
+
+**Semantik:**
+- Der Compiler allokiert drei Kopien der Variable
+- Lesezugriff: Majority-Vote (2 von 3 müssen übereinstimmen)
+- Schreibzugriff: Alle drei Kopien werden beschrieben
+- Self-Healing: Abweichende Kopie wird automatisch repariert
+
+**Beispiel:**
+```lyx
+@redundant
+var thrust_vector: int64;
+```
+
+### @flight_crit – FP-Deterministik (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
+
+Funktionen können mit `@flight_crit` annotiert werden, um deterministisches Floating-Point-Verhalten zu garantieren:
+
+```ebnf
+FuncAttr = FuncAttr | "@flight_crit" ;
+```
+
+**Semantik:**
+- Impliziert automatisch `@critical`
+- Setzt MXCSR auf Round-to-Zero (0x7F80) im Prolog
+- Stellt originalen MXCSR im Epilog wieder her
+- Deaktiviert FP-Constant-Folding im Optimizer
+
+**Beispiel:**
+```lyx
+@flight_crit
+fn compute_trajectory(): f64 {
+  return 0.5 * gravity * time * time;
+}
+```
+
 ### Verschachtelte Funktionen (Nested Functions)
 
 Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.
