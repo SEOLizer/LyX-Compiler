@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract enum match try catch throw`
+`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract enum match try catch throw limit`
 
 ### Integer-Literale mit verschiedenen Basen
 
@@ -97,12 +97,14 @@ Mehrere `@`-Attribute können in beliebiger Reihenfolge vor `fn` stehen.
 ### EBNF
 
 ```ebnf
-FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr ;
+FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr ;
 EnergyAttr = "@energy"      "(" IntLiteral ")" ;   // 1..5
 DALAttr    = "@dal"         "(" DALLevel   ")" ;   // A | B | C | D
 CriticalAttr = "@critical" ;                        // kein Argument
 WCETAttr   = "@wcet"        "(" IntLiteral ")" ;   // μs > 0
 StackLimitAttr = "@stack_limit" "(" IntLiteral ")" ; // Bytes > 0
+IntegrityAttr  = "@integrity" "(" "mode" ":" IntegrityMode [ "," "interval" ":" IntLiteral ] ")" ;
+IntegrityMode  = "software_lockstep" | "scrubbed" | "hardware_ecc" ;
 
 DALLevel   = "A" | "B" | "C" | "D" ;
 
@@ -244,6 +246,79 @@ while (x < 100) limit(1000) {
 - **Sema (Compile-Time)**: Literale werden beim ersten Compile-Pass mit `RangeMin`/`RangeMax` verglichen.
 - **IR (Runtime)**: `EmitRangeCheck` erzeugt `cmpge` + `and` + `brfalse` + `panic`-Sequenz.
 - **IR-Optimierung**: Konstante Initialisierungen werden durch Constant Folding ggf. wegeliminiert.
+
+## @integrity – Integritäts-Management (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+
+Einheit- und Funktions-Level-Annotationen für Strahlungstoleranz und DO-178C-Compliance.
+Implementiert aerospace.pdf v2 Sections 2.5.1–2.5.2.
+
+### EBNF
+
+```ebnf
+IntegrityAttr  = "@integrity" "(" IntegrityParams ")" ;
+IntegrityParams = IntegrityMode [ "," IntegrityInterval ] ;
+IntegrityMode   = "mode" ":" ( "software_lockstep" | "scrubbed" | "hardware_ecc" ) ;
+IntegrityInterval = "interval" ":" IntLiteral ;        // ms > 0
+
+(* Unit-Level: steht vor dem unit-Keyword, erste Deklaration der Datei *)
+UnitDecl = [ IntegrityAttr ] "unit" DotPath ";" { TopDecl } ;
+
+(* Funktion-Level: zusammen mit anderen @-Attributen vor fn *)
+FuncAttr = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr ;
+```
+
+### Semantik
+
+| Merkmal | Beschreibung |
+|---------|-------------|
+| `mode: software_lockstep` | Redundante Ausführung mit Ergebnisvergleich |
+| `mode: scrubbed` | Periodischer Hintergrund-CRC-Memory-Sweep |
+| `mode: hardware_ecc` | Vertraut auf Hardware-ECC-Speicherkorrektur |
+| `interval: N` | Prüf-/Scrub-Intervall in Millisekunden |
+| Auf `extern fn` | Fehler: nicht erlaubt |
+| `scrubbed` ohne `interval` | Warnung: Intervall empfohlen |
+
+### Beispiele
+
+```lyx
+// Unit-Level (löst .meta_safe ELF-Sektion aus)
+@integrity(mode: scrubbed, interval: 100)
+unit nav.core;
+
+fn main(): int64 { return 42; }
+
+// Funktion-Level (kein .meta_safe)
+@dal(A) @integrity(mode: software_lockstep, interval: 50)
+fn autopilot_step(): int64 { return 0; }
+```
+
+### .meta_safe ELF-Sektion
+
+Bei Unit-Level `@integrity` erzeugt der Compiler eine `.meta_safe` ELF-Sektion (8232 Bytes):
+
+```
+[0..7]    code_start_va   uint64 LE  – Start-VA des Code-Segments
+[8..15]   code_end_va     uint64 LE  – End-VA des Code-Segments
+[16..19]  mode            uint32 LE  – 1=lockstep, 2=scrubbed, 3=hardware_ecc
+[20..23]  interval_ms     uint32 LE  – Intervall in ms
+[24..31]  recovery_ptr    uint64 LE  – Recovery-Zeiger (0 = nicht gesetzt)
+[32..35]  hash_copy_1     uint32 LE  – CRC32 IEEE 802.3 des Codes
+[36..4127]  padding        4092 B    – 4096-Byte-Separation
+[4128..4131] hash_copy_2  uint32 LE  – identische CRC32-Kopie 2
+[4132..8223] padding       4092 B    – 4096-Byte-Separation
+[8224..8227] hash_copy_3  uint32 LE  – identische CRC32-Kopie 3
+[8228..8231] padding          4 B    – Abschluss-Padding
+```
+
+Drei identische Kopien mit 4096-Byte-Abstand → Single-Event-Upset-Erkennung via Mehrheitsabstimmung.
+
+### Compiler-Verhalten
+
+- **Parser**: `@integrity` vor `unit` oder `fn` – Pending-Feld-Ansatz in `ParseProgram`.
+- **Sema**: extern-fn-Fehler + scrubbed-ohne-interval-Warnung in `sema.pas`.
+- **IR**: `TIRModule.UnitIntegrity` speichert das Unit-Level-Attribut.
+- **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe`-Variante wenn `UnitIntegrity.Mode ≠ imNone`.
+- **Unterstützte Backends**: x86_64, ARM64, RISC-V.
 
 ### Verschachtelte Funktionen (Nested Functions)
 
