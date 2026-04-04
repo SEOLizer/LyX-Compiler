@@ -12,13 +12,13 @@ unit ir_static_analysis;
   4. Null-Pointer-Analyse: Potenzielle Null-Dereferenzierungen
   5. Array-Bounds-Analyse: Statische Index-Prüfung
   6. Terminierungs-Analyse: Endlosschleifen-Erkennung
-  7. Stack-Nutzungs-Analyse: Worst-Case-Stack-Berechnung
+  7. Stack-Nutzungs-Analyse: Worst-Case-Stack-Berechnung mit Call-Grenzen
 }
 
 interface
 
 uses
-  SysUtils, Classes, ir, diag;
+  SysUtils, Classes, ir, diag, ir_call_graph;
 
 type
   // Data-Flow-Analyse
@@ -90,6 +90,7 @@ type
   private
     FModule: TIRModule;
     FDiag: TDiagnostics;
+    FCallGraph: TCallGraph;
     FDefUseChains: array of TDefUseInfo;
     FLiveVars: array of TLiveVarInfo;
     FConstValues: array of TConstValue;
@@ -105,7 +106,7 @@ type
     procedure AnalyzeNullPointers(fn: TIRFunction);
     procedure AnalyzeArrayBounds(fn: TIRFunction);
     procedure AnalyzeTermination(fn: TIRFunction);
-    procedure AnalyzeStackUsage(fn: TIRFunction);
+    procedure AnalyzeStackUsageWithCallGraph(fn: TIRFunction);
     
   public
     constructor Create(module: TIRModule; diag: TDiagnostics);
@@ -124,11 +125,13 @@ begin
   inherited Create;
   FModule := module;
   FDiag := diag;
+  FCallGraph := TCallGraph.Create(diag);
   FWarningCount := 0;
 end;
 
 destructor TStaticAnalyzer.Destroy;
 begin
+  FCallGraph.Free;
   inherited Destroy;
 end;
 
@@ -530,43 +533,121 @@ end;
 // 7. Stack-Nutzungs-Analyse
 // ============================================================================
 
-procedure TStaticAnalyzer.AnalyzeStackUsage(fn: TIRFunction);
+procedure TStaticAnalyzer.AnalyzeStackUsageWithCallGraph(fn: TIRFunction);
+{
+  Stack-Nutzungs-Analyse mit Call-Graph
+  Berechnet Worst-Case-Stack über Call-Grenzen unter Verwendung des Call-Graphs
+}
 var
   maxTemp: Integer;
   i: Integer;
   instr: TIRInstr;
   totalSlots: Integer;
   isRecursive: Boolean;
+  maxCallDepth: Integer;
+  worstCaseBytes: Integer;
+  
+  { Rekursive Tiefensuche zur Berechnung der maximalen Aufruftiefe }
+  function CalculateMaxDepth(const funcName: string; visited: TStringList): Integer;
+  var
+    j: Integer;
+    callees: TStringList;
+    depth, maxDepth: Integer;
+  begin
+    Result := 1;
+    if funcName = '' then Exit;
+    if visited.IndexOf(funcName) >= 0 then
+    begin
+      { Zyklus erkannt - rekursiver Aufruf }
+      Result := 10;  { Annahme: Rekursion kann bis zu 10 Aufrufe tief gehen }
+      Exit;
+    end;
+    
+    visited.Add(funcName);
+    maxDepth := 1;
+    
+    { Hole alle callees dieser Funktion }
+    callees := FCallGraph.GetCalleesList(funcName);
+    if Assigned(callees) then
+    begin
+      for j := 0 to callees.Count - 1 do
+      begin
+        depth := CalculateMaxDepth(callees[j], visited);
+        if depth > maxDepth then
+          maxDepth := depth;
+      end;
+    end;
+    
+    visited.Delete(visited.IndexOf(funcName));
+    Result := maxDepth + 1;
+  end;
+  
+  { Berechne lokale Stack-Nutzung einer Funktion }
+  function CalculateLocalStack(fn: TIRFunction): Integer;
+  var
+    j: Integer;
+    tempMax: Integer;
+    instr: TIRInstr;
+  begin
+    Result := 0;
+    tempMax := -1;
+    
+    for j := 0 to High(fn.Instructions) do
+    begin
+      instr := fn.Instructions[j];
+      if instr.Dest > tempMax then tempMax := instr.Dest;
+      if instr.Src1 > tempMax then tempMax := instr.Src1;
+      if instr.Src2 > tempMax then tempMax := instr.Src2;
+      if instr.Src3 > tempMax then tempMax := instr.Src3;
+    end;
+    
+    Result := fn.LocalCount + tempMax + 1;
+    if Result < 1 then Result := 1;
+  end;
+
+var
+  visited: TStringList;
 begin
   maxTemp := -1;
   isRecursive := False;
   
-  for i := 0 to High(fn.Instructions) do
+  { Zunächst prüfen ob diese Funktion rekursiv ist }
+  isRecursive := FCallGraph.IsRecursive(fn.Name);
+  
+  { Berechne lokale Stack-Nutzung }
+  totalSlots := CalculateLocalStack(fn);
+  
+  { Berechne maximale Aufruftiefe unter Verwendung des Call-Graphs }
+  if not isRecursive then
   begin
-    instr := fn.Instructions[i];
-    if instr.Dest > maxTemp then maxTemp := instr.Dest;
-    if instr.Src1 > maxTemp then maxTemp := instr.Src1;
-    if instr.Src2 > maxTemp then maxTemp := instr.Src2;
-    if instr.Src3 > maxTemp then maxTemp := instr.Src3;
-    
-    if (instr.Op = irCall) and (instr.ImmStr = fn.Name) then
-      isRecursive := True;
+    visited := TStringList.Create;
+    try
+      visited.Sorted := True;
+      maxCallDepth := CalculateMaxDepth(fn.Name, visited);
+    finally
+      visited.Free;
+    end;
+  end
+  else
+  begin
+    { Bei Rekursion: Worst-Case annehmen }
+    maxCallDepth := 10;
   end;
   
-  totalSlots := fn.LocalCount + maxTemp + 1;
-  if totalSlots < 1 then totalSlots := 1;
+  { Worst-Case-Stack = Summe aller Stack-Frames auf dem Aufrufpfad }
+  worstCaseBytes := totalSlots * maxCallDepth * 8;  { 8 bytes per slot }
   
   SetLength(FStackUsage, Length(FStackUsage) + 1);
   FStackUsage[High(FStackUsage)].FunctionName := fn.Name;
   FStackUsage[High(FStackUsage)].LocalSlots := totalSlots;
-  FStackUsage[High(FStackUsage)].LocalBytes := totalSlots * 8;  // 8 bytes per slot (RV64/x86_64)
-  FStackUsage[High(FStackUsage)].MaxCallDepth := 1;  // Simplified
-  FStackUsage[High(FStackUsage)].WorstCaseBytes := totalSlots * 8;
+  FStackUsage[High(FStackUsage)].LocalBytes := totalSlots * 8;
+  FStackUsage[High(FStackUsage)].MaxCallDepth := maxCallDepth;
+  FStackUsage[High(FStackUsage)].WorstCaseBytes := worstCaseBytes;
   FStackUsage[High(FStackUsage)].IsRecursive := isRecursive;
   
   if isRecursive then
   begin
-    FDiag.Report(dkWarning, 'Function "' + fn.Name + '" is recursive - stack usage cannot be bounded', NullSpan);
+    FDiag.Report(dkWarning, 'Function "' + fn.Name + '" is recursive - using estimated max call depth ' + IntToStr(maxCallDepth), NullSpan);
     Inc(FWarningCount);
   end;
 end;
@@ -584,6 +665,9 @@ begin
   SetLength(FStackUsage, 0);
   FWarningCount := 0;
   
+  { Zunächst Call-Graph aufbauen }
+  FCallGraph.BuildFromAST(FModule.ProgramNode);
+  
   for i := 0 to High(FModule.Functions) do
   begin
     fn := FModule.Functions[i];
@@ -594,7 +678,7 @@ begin
     AnalyzeNullPointers(fn);
     AnalyzeArrayBounds(fn);
     AnalyzeTermination(fn);
-    AnalyzeStackUsage(fn);
+    AnalyzeStackUsageWithCallGraph(fn);
   end;
 end;
 

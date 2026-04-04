@@ -715,6 +715,7 @@ begin
         end;
 
         module := TIRModule.Create;
+        module.ProgramNode := prog;  { Für Call-Graph-Analyse }
         lower := TIRLowering.Create(module, d);
         try
           // First, register constants from imported units so they're available during lowering
