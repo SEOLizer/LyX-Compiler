@@ -4027,6 +4027,12 @@ begin
           if IsPointerType(f.FieldType) then
             FDiag.Error('flat struct ''' + sd.Name + ''' cannot have pointer field: ' + f.Name, sd.Span);
         end;
+        // Bit-Level Mapping validation: at(N) requires @packed struct (aerospace-todo P2 #50)
+        if f.BitOffset >= 0 then
+        begin
+          if not sd.IsPacked then
+            FDiag.Error('bit-level mapping at(' + IntToStr(f.BitOffset) + ') requires @packed struct: ' + f.Name, sd.Span);
+        end;
         // determine field size/alignment
         if f.FieldType <> atUnresolved then
         begin

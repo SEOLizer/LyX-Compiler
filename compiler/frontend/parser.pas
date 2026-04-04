@@ -372,7 +372,7 @@ begin
       Exit(ParseTypeDecl(True))
     else if Check(tkEnum) then
       Exit(ParseEnumDecl(True))
-    else if Check(tkVar) or Check(tkLet) then
+    else if Check(tkVar) or Check(tkLet) or Check(tkRedundant) then
       Exit(ParseGlobalVarDecl(True))
     else
     begin
@@ -688,6 +688,7 @@ var
   pendingEndian: TEndianType; // aerospace-todo P2 #52
   structEndian: TEndianType; // aerospace-todo P2 #52
   isFlatStruct: Boolean;     // aerospace-todo P2 #57
+  isPackedStruct: Boolean;   // aerospace-todo P2 #50
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -910,16 +911,25 @@ begin
     TAstClassDecl(Result).ImplementedInterfaces := implInterfaces;
     Exit;
   end
-  // struct { ... } or flat struct { ... }
-  else if Check(tkStruct) or Check(tkFlat) then
+  // struct { ... } or flat struct { ... } or packed struct { ... }
+  else if Check(tkStruct) or Check(tkFlat) or Check(tkPacked) then
   begin
     structEndian := pendingEndian;
     isFlatStruct := Check(tkFlat);
+    isPackedStruct := Check(tkPacked);
     if isFlatStruct then
     begin
       Advance; // flat
       if not Check(tkStruct) then
         FDiag.Error('expected ''struct'' after ''flat''', FCurTok.Span)
+      else
+        Advance; // struct
+    end
+    else if isPackedStruct then
+    begin
+      Advance; // packed
+      if not Check(tkStruct) then
+        FDiag.Error('expected ''struct'' after ''packed''', FCurTok.Span)
       else
         Advance; // struct
     end
@@ -939,6 +949,27 @@ begin
         fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
         fld.Visibility := curVisibility;
+        fld.BitOffset := -1; // default: auto layout
+        // Parse optional bit-level mapping: at(N) (aerospace-todo P2 #50)
+        if Check(tkIdent) and (FCurTok.Value = 'at') then
+        begin
+          Advance; // consume 'at'
+          Expect(tkLParen);
+          if Check(tkIntLit) then
+          begin
+            try
+              fld.BitOffset := StrToInt(FCurTok.Value);
+              if fld.BitOffset < 0 then
+                FDiag.Error('bit offset must be non-negative', FCurTok.Span);
+            except
+              FDiag.Error('invalid bit offset', FCurTok.Span);
+            end;
+            Advance;
+          end
+          else
+            FDiag.Error('expected integer in at(N)', FCurTok.Span);
+          Expect(tkRParen);
+        end;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
@@ -954,6 +985,7 @@ begin
     Result := TAstStructDecl.Create(name, fields, methods, isPub, FCurTok.Span);
     TAstStructDecl(Result).Endian := structEndian; // aerospace-todo P2 #52
     TAstStructDecl(Result).IsFlat := isFlatStruct;  // aerospace-todo P2 #57
+    TAstStructDecl(Result).IsPacked := isPackedStruct; // aerospace-todo P2 #50
     Exit;
   end
   else
@@ -1559,8 +1591,14 @@ var
   arrayLen: Integer;
   isNullable: Boolean;
   span: TSourceSpan;
+  isRedundant: Boolean;
 begin
   span := FCurTok.Span;
+  
+  // Parse optional @redundant annotation (aerospace-todo P2 #51)
+  isRedundant := Check(tkRedundant);
+  if isRedundant then
+    Advance; // consume 'redundant'
   
   if Accept(tkVar) then 
     storage := skVar
@@ -1598,6 +1636,7 @@ begin
 
   Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
   Result.SetGlobal(True, isPub);
+  Result.IsRedundant := isRedundant; // aerospace-todo P2 #51
 end;
 
 function TParser.ParseForStmt: TAstFor;
