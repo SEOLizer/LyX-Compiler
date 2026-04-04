@@ -320,6 +320,72 @@ Drei identische Kopien mit 4096-Byte-Abstand → Single-Event-Upset-Erkennung vi
 - **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe`-Variante wenn `UnitIntegrity.Mode ≠ imNone`.
 - **Unterstützte Backends**: x86_64, ARM64, RISC-V.
 
+### VerifyIntegrity() Builtin (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
+
+Die `VerifyIntegrity()` Funktion führt zur Laufzeit einen TMR (Triple Modular Redundancy) Mehrheitsentscheid durch:
+
+```ebnf
+VerifyIntegrityCall = "VerifyIntegrity" "(" ")" ;
+CallExpr            = VerifyIntegrityCall | Ident "(" [ ArgList ] ")" | Ident "::" Ident "(" [ ArgList ] ")" ;
+```
+
+**Semantik:**
+- Rückgabetyp: `bool` — `true` wenn 2 von 3 CRC32-Hashes übereinstimmen, sonst `false`
+- Parameter: keine
+- Die 3 CRC32-Hashes werden zur Compile-Zeit berechnet und in den Data-Buffer geschrieben
+- Zur Laufzeit liest der generierte Code alle 3 Hashes und führt einen Mehrheitsvergleich durch
+
+**Beispiel:**
+```lyx
+@integrity(mode: scrubbed, interval: 100)
+unit;
+
+fn main(): int64 {
+  if (VerifyIntegrity()) {
+    return 0;  // Integrity verified
+  } else {
+    return 1;  // Integrity check failed
+  }
+}
+```
+
+**Compiler-Architektur:**
+- **Sema**: `VerifyIntegrity() -> bool` als globales Builtin registriert
+- **IR**: Neue Operation `irVerifyIntegrity`
+- **Backend x86_64**: Generiert `movabs rdi, data_va` + 3x `mov` + 3x `cmp`/`inc` + `cmp $2`/`jge`
+- **Patching**: CRC32 wird NACH Code-Generierung berechnet, dann Data-Adresse gepatcht
+
+### Endianness-Annotationen (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
+
+Structs können mit `@big_endian` oder `@little_endian` annotiert werden für Telemetrie-Daten:
+
+```ebnf
+EndianAttr    = "@big_endian" | "@little_endian" ;
+StructDecl    = [ EndianAttr ] "struct" "{" { StructField } "}" ;
+StructField   = Ident ":" Type ";" ;
+```
+
+**Semantik:**
+- `@big_endian`: Struct-Felder werden in Big-Endian-Byte-Reihenfolge serialisiert
+- `@little_endian`: Struct-Felder werden in Little-Endian-Byte-Reihenfolge serialisiert
+- Ohne Annotation: Native Endianness der Zielarchitektur (x86_64 = LE, ARM64 = LE, PowerPC = BE)
+- Kombinierbar mit `@packed` für hardwarenahe Register-Strukturen
+
+**Beispiel:**
+```lyx
+type TelemetryFrame = @big_endian struct {
+  timestamp: int64;
+  temperature: int16;
+  status_flags: int8;
+};
+```
+
+**Compiler-Architektur:**
+- **Lexer**: `tkBigEndian`, `tkLittleEndian` Tokens (erkennt `@big_endian`/`@little_endian` als einzelne Tokens)
+- **Backend-Typen**: `TEndianType = (enNative, enBigEndian, enLittleEndian)`
+- **AST**: `FEndian: TEndianType` in `TAstStructDecl`
+- **Parser**: Endian-Annotation wird in `ParseTypeDecl` vor `struct` geparst
+
 ### Verschachtelte Funktionen (Nested Functions)
 
 Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.
