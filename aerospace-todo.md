@@ -160,6 +160,13 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | 112 | **VerifyIntegrity() Codegen ESP32/Xtensa** | `xtensa_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (bare metal) |
 | 113 | **VerifyIntegrity() Codegen ARM Cortex-M** | `arm_cm_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (bare metal) |
 | 114 | **.meta_safe ELF32 für ESP32** | `elf32_writer.pas` | Mittel | `WriteElf32WithMetaSafe()`: ELF32-Section mit Triple-Hash |
+| 115 | **BUG: .lyx_build Section in ARM64 ELF** | `elf64_arm64_writer.pas` | Niedrig | Section-Header + `.lyx_build` mit Build-Metadaten |
+| 116 | **BUG: .lyx_build Section in RISC-V ELF** | `elf64_riscv_writer.pas` | Niedrig | Section-Header + `.lyx_build` mit Build-Metadaten |
+| 117 | **BUG: .lyx_build Section in ESP32 ELF32** | `elf32_writer.pas` | Mittel | ELF32 Section-Header + `.lyx_build` |
+| 118 | **BUG: Build-Metadaten in macOS Mach-O** | `macho64_writer.pas` | Mittel | Custom Segment `__LYX,__build_info` |
+| 119 | **BUG: Build-Metadaten in Windows x64 PE** | `pe64_writer.pas` | Mittel | PE Section `.lyx_build` |
+| 120 | **BUG: Build-Metadaten in Windows ARM64 PE** | `pe64_arm64_writer.pas` | Mittel | PE Section `.lyx_build` |
+| 121 | **BUG: Section-Header in ARM64 ELF (Basis)** | `elf64_arm64_writer.pas` | Mittel | `WriteElf64ARM64`: `e_shoff = 0` → echte Section-Header |
 
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)
 
@@ -203,7 +210,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
 |---|------|---------|---------|---------------------|
 | 25 | **Tool Verification (Bootstrapping)** | 1.1 | Hoch | - |
-| 26 | **Configuration Management** | 1.1 | Niedrig | - |
+| 26 | **Configuration Management** | 1.1 | Niedrig | x86_64 ELF: `.lyx_build` Section implementiert; **Backend-Tasks**: #115-#121 |
 | 27 | **QA: Review-Prozesse** | 1.1 | Niedrig | - |
 | 28 | **Formale Spezifikation (Coq)** | 1.2 | Sehr Hoch | Section 2.3 |
 | 29 | **Proof of Correctness** | 1.2 | Sehr Hoch | - |
@@ -247,8 +254,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
 | **11. Aerospace Extension (NEW)** | 8 | 6 | 57% |
-| **12. Backend-Abdeckung (NEW)** | 0 | 14 | 0% |
-| **GESAMT** | **30** | **47** | **39%** |
+| **12. Backend-Abdeckung (NEW)** | 0 | 21 | 0% |
+| **GESAMT** | **94** | **54** | **64%** |
 
 ---
 
