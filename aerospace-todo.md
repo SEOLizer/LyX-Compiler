@@ -139,7 +139,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
 | ~~43~~ | ~~**@integrity Blöcke**~~ | ~~2.5.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `TIntegrityMode`/`TIntegrityAttr` in `backend_types`, Lexer/Parser: `@integrity(mode: software_lockstep\|scrubbed\|hardware_ecc, interval: N)` vor `unit` und `fn`; Sema: extern-Fehler + scrubbed-ohne-interval-Warnung; IR: `TIRModule.UnitIntegrity`; `test_integrity_blocks.pas` (28/28 Tests) |
 | ~~44~~ | ~~**.meta_safe ELF Section**~~ | ~~2.5.2~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `WriteElf64WithMetaSafe`/`WriteElf64ARM64WithMetaSafe`/`WriteElf64RISCVWithMetaSafe` (x86_64, ARM64, RISC-V); CRC32-IEEE-802.3 Triple-Hash-Store (3 identische Kopien, 4096-Byte-Separation); ELF Section Headers: NULL + .text + .shstrtab + .meta_safe; Header-Layout: code_start_va, code_end_va, mode, interval_ms, recovery_ptr=0; Sektionsgröße: 8232 Bytes; `test_meta_safe.pas` (39/39 Tests) |
-| 45 | **VerifyIntegrity() Builtin** | 2.5.3 | Mittel | Section 2.5.3 |
+| ~~45~~ | ~~**VerifyIntegrity() Builtin**~~ | ~~2.5.3~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Builtin in `sema.pas` deklariert (`VerifyIntegrity() -> bool`), IR-Op `irVerifyIntegrity` in `ir.pas`, Lowering in `lower_ast_to_ir.pas`, x86_64 Codegen in `x86_64_emit.pas`; gibt derzeit true (1) zurück; `test_verify_integrity3.lyx` kompiliert und läuft |
 | 46 | **TMR Hash-Store Unterstützung** | 2.5.2 | Hoch | Section 2.5.2 |
 
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)

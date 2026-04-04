@@ -100,6 +100,8 @@ type
     irSetFree,      // free set: set_free(Src1=set)
     // Type checking (is/as operators)
     irIsType,       // type check: Dest = is_type(Src1=object, ImmStr=targetClassName) -> bool
+    // Integrity verification (aerospace-todo P0 #45)
+    irVerifyIntegrity, // verify code integrity: Dest = verify_integrity() -> bool
     // In-Situ Data Visualizer (Debugging 2.0)
     irInspect       // debug inspect: Src1=value, ImmStr=varname, ImmInt=format, InspectType=type
    );
