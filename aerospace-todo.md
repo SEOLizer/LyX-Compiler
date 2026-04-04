@@ -5,11 +5,18 @@
 Dieses Dokument beschreibt den Fortschritt und die offenen Tasks zur Qualifizierung
 von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DAL A/B/C).
 
-**Stand:** 2026-04-04 | **Version:** 0.8.1-aerospace
+Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
+- Flightoperations (Deterministik, Echtzeit)
+- Construction (Hardware-Integration)
+- Mission-Handling (Formale Sicherheit)
+- Telemetrie (Datenübertragung)
+- Integritäts-Management-System (TMR, Scrubber)
+
+**Stand:** 2026-04-04 | **Version:** 0.9.0-aerospace
 
 ---
 
-## ✅ Abgeschlossene Tasks (81 von 113)
+## ✅ Abgeschlossene Tasks (81 von 127)
 
 ### 1. DO-178C Software Compliance
 
@@ -119,71 +126,90 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ---
 
-## ❌ Offene Tasks (42), neu bewertet und priorisiert
+## ❌ Offene Tasks (46), priorisiert nach aerospace.pdf v2
 
 ### 🔴 P0 – Kritisch (DO-178C DAL A Voraussetzung)
 
-| # | Task | Sektion | Aufwand | Status |
-|---|------|---------|---------|--------|
-| ~~1~~ | ~~**MC/DC Lücken-Erkennung**~~ | ~~4.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `AnalyzeGaps()`, Runtime-Counter im Data-Segment, `--mcdc-report` zeigt Gaps |
-| ~~2~~ | ~~**Assembly-Listing**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `asm_listing.pas`, `TAsmListingGenerator`, `--asm-listing` Flag, Source-Zeilen-Kommentare für x86_64/ARM64/RISC-V/Xtensa |
-| ~~3~~ | ~~**assert() Builtin**~~ | ~~7.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TAstAssert`, Parser+Sema+IR-Lowering; `assert(cond, msg)` mit bool-Condition und Fehlermeldung |
-| ~~4~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W015 `lrImplicitTypeCast` (identisch mit P2 #16) |
-| ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W001 `lrUnusedVariable`, W002 `lrUnusedParameter` (Live-Variable-Analyse 5.1) |
+| # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
+|---|------|---------|---------|---------------------|
+| ~~1~~ | ~~**MC/DC Lücken-Erkennung**~~ | ~~4.1~~ | ~~Mittel~~ | ✅ |
+| ~~2~~ | ~~**Assembly-Listing**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ |
+| ~~3~~ | ~~**assert() Builtin**~~ | ~~7.1~~ | ~~Mittel~~ | ✅ |
+| ~~4~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ (MISRA C) |
+| ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
+| 43 | **@integrity Blöcke** | 2.5.1 | Hoch | Section 2.5.1 |
+| 44 | **.meta_safe ELF Section** | 2.5.2 | Hoch | Section 2.5.2 |
+| 45 | **VerifyIntegrity() Builtin** | 2.5.3 | Mittel | Section 2.5.3 |
+| 46 | **TMR Hash-Store Unterstützung** | 2.5.2 | Hoch | Section 2.5.2 |
 
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)
 
-| # | Task | Sektion | Aufwand | Begründung |
-|---|------|---------|---------|------------|
-| ~~6~~ | ~~**Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`)~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Parser, AST, IR-Propagation, Sema-Checks, 30/30 Tests |
-| ~~7~~ | ~~**Range-Typen im Typsystem**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Lexer `tkDotDot`, Parser `range Min..Max`, Sema Compile-Time-Check, IR Runtime-Check, 33/33 Tests |
-| ~~7b~~ | ~~**check() Builtin**~~ | ~~7.1~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – `check(cond)` → panic bei false; Expression-Form, Typ-Check auf bool, IR-Lowering zu if(!cond) panic |
-| ~~8~~ | ~~**Call-Graph: Statischer Aufrufgraph**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TCallGraph` Klasse, AST-Walking für Funktionsaufrufe, Rekursions-Erkennung via DFS, `--call-graph` CLI-Flag |
-| ~~9~~ | ~~**Map-File: Speicherlayout aller Symbole**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TMapFileGenerator` Klasse, `--map-file` CLI-Flag, Sections/Functions/Globals mit Adressen, Statistiken |
-| ~~10~~ | ~~**Result-Typ mit Pattern-Matching**~~ | ~~7.2, 10.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Parser `ParseMatchPattern`, AST `IsPatternBinding` Flag, Sema mit Pattern-Binding-Scope; Syntax: `match r { case Ok(v) => ..., case Err(e) => ... }` |
-| ~~11~~ | ~~**MC/DC-Test-Suite für alle Backend-Pfade**~~ | ~~10.4~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `test_mcdc_coverage.pas`, 7/7 Backends bestanden (x86_64, x86_64_win64, arm64, macosx64, xtensa, win_arm64, riscv) |
-| 12 | **TrustZone (Cortex-M33+)** | 3.2 | Hoch | Secure/Non-Secure Trennung – nur relevant wenn M33 Target aktiv genutzt wird |
+| # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
+|---|------|---------|---------|---------------------|
+| ~~6~~ | ~~**Pragma-Parser**~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ |
+| ~~7~~ | ~~**Range-Typen**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ (Einheiten-Sicherheit) |
+| ~~7b~~ | ~~**check() Builtin**~~ | ~~7.1~~ | ~~Niedrig~~ | ✅ |
+| ~~8~~ | ~~**Call-Graph**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ |
+| ~~9~~ | ~~**Map-File**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ |
+| ~~10~~ | ~~**Pattern-Matching**~~ | ~~7.2, 10.1~~ | ~~Mittel~~ | ✅ |
+| ~~11~~ | ~~**MC/DC-Test-Suite**~~ | ~~10.4~~ | ~~Mittel~~ | ✅ |
+| 12 | **TrustZone (Cortex-M33+)** | 3.2 | Hoch | Section 3.2 |
+| 47 | **Bounded While Loops** | 2.1 | Mittel | Section 2.1: `while (...) limit(...)` |
+| 48 | **@flight_crit Sektion** | 2.1 | Mittel | Section 2.1 |
+| 49 | **Priority-Attribute für Funktionen** | 2.1 | Mittel | Section 2.1 (Echtzeit-Scheduling) |
+| 50 | **Bit-Level Memory Mapping** | 2.2 | Mittel | Section 2.2: `at(bit_position)` |
+| 51 | **@redundant Attribut (TMR)** | 2.2 | Mittel | Section 2.2 |
+| 52 | **@big_endian / @little_endian** | 4 | Niedrig | Section 4 |
 
 ### 🟡 P2 – Mittel (nice-to-have für DAL C)
 
-| # | Task | Sektion | Aufwand | Begründung |
-|---|------|---------|---------|------------|
-| 13 | **Symbol-Table: DWARF Debug-Information** | 6.1 | Hoch | Debugger-Unterstützung, aber nicht zwingend für DO-178C erforderlich |
-| 14 | **Objektcode-Diff: Byte-für-Byte-Vergleich** | 6.1 | Niedrig | Automatisierter Diff zwischen Builds – teilweise durch Determinismus-Tests abgedeckt |
-| ~~15~~ | ~~**MISRA-Regel: Keine rekursiven Funktionen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter-Regel W014, erkennt rekursive Calls im AST |
-| ~~16~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter-Regel W015, erkennt int64↔f64, int64↔pchar, int64↔bool, bool↔int64 Casts |
-| 17 | **MISRA-Regel: Keine Pointer-Arithmetik** | 5.2 | Niedrig | Sema-Checker Erweiterung |
-| 18 | **MISRA-Regel: Switch-Cases vollständig** | 5.2 | Niedrig | Parser/Sema-Checker Erweiterung |
-| 19 | **MISRA-Regel: Maximale Funktionslänge (60 Zeilen)** | 5.2 | Niedrig | Linter-Regel |
-| 20 | **MISRA-Regel: Maximale Zyklomatische Komplexität (15)** | 5.2 | Mittel | IR-Pass zur Komplexitätsberechnung |
-| 20 | **WCET-Schätzung als IR-Pass** | 10.2 | Hoch | Worst-Case Execution Time – benötigt @wcet Pragma und Call-Graph |
-| 21 | **Stack-Nutzungs-Analyse über Call-Grenzen** | 10.2 | Mittel | Erweiterung der bestehenden Stack-Analyse |
-| 22 | **Deterministische Register-Allokierung** | 10.3 | Mittel | Backend-Erweiterung für reproduzierbare Register-Zuweisung |
-| 23 | **Fuzzing für Lexer/Parser** | 10.4 | Mittel | Erweiterung des bestehenden Fuzzing-Frameworks |
-| 24 | **Mutation-Testing für Compiler** | 10.4 | Mittel | Erweiterung des bestehenden Mutation-Testing |
+| # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
+|---|------|---------|---------|---------------------|
+| 13 | **Symbol-Table: DWARF** | 6.1 | Hoch | Section 8 |
+| ~~15~~ | ~~**MISRA: Keine rekursiven Funktionen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ (Stack-Safety) |
+| ~~16~~ | ~~**MISRA: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
+| 17 | **MISRA: Keine Pointer-Arithmetik** | 5.2 | Niedrig | Section 5.8 |
+| 18 | **MISRA: Switch-Cases vollständig** | 5.2 | Niedrig | - |
+| 19 | **MISRA: Maximale Funktionslänge (60)** | 5.2 | Niedrig | - |
+| 20 | **MISRA: Zyklomatische Komplexität (15)** | 5.2 | Mittel | Section 5.4 |
+| 53 | **WCET-Schätzung** | 10.2 | Hoch | Section 2.1 |
+| 54 | **Stack-Analyse über Call-Grenzen** | 10.2 | Mittel | Section 2.1 |
+| 55 | **Design by Contract (pre/post)** | 3 | Hoch | Section 2.3 |
+| 56 | **RingBuffer<T> Typ** | 4 | Mittel | Section 4 |
+| 57 | **Flat Structs für Zero-Copy** | 4 | Niedrig | Section 4 |
+| 58 | **Floating Point Deterministik** | 7 | Niedrig | Section 7 |
 
 ### 🟢 P3 – Niedrig (langfristig / formal)
 
-| # | Task | Sektion | Aufwand | Begründung |
-|---|------|---------|---------|------------|
-| 25 | **Tool Verification (Bootstrapping)** | 1.1 | Hoch | Compiler kompiliert sich bereits selbst (Singularität), aber formaler Nachweis fehlt |
-| 26 | **Configuration Management** | 1.1 | Niedrig | Git-basierte Versionierung existiert bereits, muss nur dokumentiert werden |
-| 27 | **Quality Assurance: Review-Prozesse** | 1.1 | Niedrig | Prozess-Definition, keine Code-Änderung |
-| 28 | **Formale Spezifikation (Coq/Isabelle)** | 1.2 | Sehr Hoch | CompCert-Ansatz – langfristiges Forschungsziel |
-| 29 | **Proof of Correctness** | 1.2 | Sehr Hoch | AST → IR → Maschinencode Beweis – langfristiges Forschungsziel |
-| 30 | **Bisimulation** | 1.2 | Sehr Hoch | Beweis dass generierter Code gleiche Semantik hat – langfristiges Forschungsziel |
-| 31 | **Formal-verifizierte Testfälle (Coq)** | 10.4 | Sehr Hoch | Abhängig von formaler Spezifikation |
-| 32 | **Dead-Code-Elimination (DAL D/C)** | 10.2 | Mittel | IR-Pass – nützlich aber nicht kritisch |
-| 33 | **`unsafe`-Block-Semantik** | 10.1 | Mittel | Inline-Assembly nur in `unsafe` Blöcken |
-| 34 | **Inline-Assembly-Sicherheit** | 6.2 | Mittel | Clobber-Liste, Analyse – abhängig von `unsafe`-Block |
-| 35 | **verify() Builtin** | 7.1 | Niedrig | Formale Verifikation-Hinweis – benötigt Coq-Integration |
-| 36 | **Assertion-Levels (@dal)** | 7.1 | Niedrig | Abhängig von Pragma-System |
-| 37 | **Keine dynamische Speicherallokation nach Initialisierung** | 5.2 | Mittel | IR-Pass zur Erkennung von mmap/alloc nach main() |
-| 38 | **Requirement-IDs im Source-Code** | 8.1, 10.1 | Niedrig | `@req("SWR-001")` Pragma – abhängig von Pragma-System |
-| 39 | **Bidirektionale Traceability** | 8.1 | Mittel | Requirement ↔ Code ↔ Test – Tooling, kein Compiler-Feature |
-| 40 | **Automatische Coverage-Reports** | 8.1 | Niedrig | Erweiterung des MC/DC-Reports |
-| 41 | **Task-Deklarationen für Echtzeit-Systeme** | 2.3, 10.1 | Hoch | `task @period(10ms)` – RTOS-Integration, eigenes Feature-Set |
-| 42 | **Concurrency-Modell (Shared Data, Deadlock, Priority-Inversion)** | 2.3 | Sehr Hoch | Vollständiges Concurrency-Modell – langfristiges Ziel |
+| # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
+|---|------|---------|---------|---------------------|
+| 25 | **Tool Verification (Bootstrapping)** | 1.1 | Hoch | - |
+| 26 | **Configuration Management** | 1.1 | Niedrig | - |
+| 27 | **QA: Review-Prozesse** | 1.1 | Niedrig | - |
+| 28 | **Formale Spezifikation (Coq)** | 1.2 | Sehr Hoch | Section 2.3 |
+| 29 | **Proof of Correctness** | 1.2 | Sehr Hoch | - |
+| 30 | **Bisimulation** | 1.2 | Sehr Hoch | - |
+| 31 | **Formal-verifizierte Tests** | 10.4 | Sehr Hoch | - |
+| 59 | **@requirement("ID") Attribut** | 5.4 | Niedrig | Section 5.4 |
+| 60 | **Bidirektionale Traceability** | 5.4 | Mittel | Section 5.4 |
+| 61 | **MIL-STD-1553 / SpaceWire** | 5.5 | Hoch | Section 5.5 |
+| 62 | **HIL/SIL Simulation** | 5.6 | Hoch | Section 5.6 |
+| 63 | **Shadow Stack** | 2.5.4 | Hoch | Section 2.5.4 |
+| 64 | **Parity-Alloc für Heap** | 2.5.4 | Mittel | Section 2.5.4 |
+| 65 | **Panic-Strategien für kritische Sektionen** | 5.1 | Mittel | Section 5.1 |
+| 66 | **Error State Machine** | 5.1 | Mittel | Section 5.1 |
+| 67 | **Static Memory Pools** | 5.2 | Mittel | Section 5.2 |
+| 68 | **@interrupt_handler Attribut** | 5.3 | Mittel | Section 5.3 |
+| 69 | **Priority Ceiling Protocol** | 5.3 | Mittel | Section 5.3 |
+| 70 | **Dead-Code-Elimination** | 10.2 | Mittel | - |
+| 71 | **`unsafe`-Block-Semantik** | 10.1 | Mittel | Section 4 |
+| 72 | **Inline-Assembly-Sicherheit** | 6.2 | Mittel | - |
+| 73 | **verify() Builtin** | 7.1 | Niedrig | Section 2.3 |
+| 74 | **Assertion-Levels (@dal)** | 7.1 | Niedrig | - |
+| 75 | **Keine Heap-Allokation nach Init** | 5.2 | Mittel | Section 4 |
+| 76 | **Automatische Coverage-Reports** | 8.1 | Niedrig | Section 5.4 |
+| 77 | **Task-Deklarationen (@period)** | 2.3, 10.1 | Hoch | Section 2.1 |
+| 78 | **Concurrency-Modell** | 2.3 | Sehr Hoch | Section 5.3 |
 
 ---
 
@@ -192,39 +218,70 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | Kategorie | Erledigt | Offen | Fortschritt |
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
-| **2. Spracherweiterungen** | 4 | 11 | 27% |
+| **2. Spracherweiterungen** | 4 | 14 | 22% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 9 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
-| **6. Codegen-Sicherheit** | 2 | 7 | 22% |
-| **7. Laufzeit-Sicherheit** | 2 | 5 | 29% |
+| **6. Codegen-Sicherheit** | 2 | 8 | 20% |
+| **7. Laufzeit-Sicherheit** | 2 | 6 | 25% |
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
-| **10. Implementierungs-Tasks** | 7 | 7 | 50% |
-| **GESAMT** | **59** | **56** | **51%** |
+| **10. Implementierungs-Tasks** | 7 | 11 | 39% |
+| **11. Aerospace Extension (NEW)** | 0 | 14 | 0% |
+| **GESAMT** | **81** | **46** | **64%** |
+
+---
+
+## Neue Tasks aus aerospace.pdf v2 (Zusammenfassung)
+
+### Flightoperations (Section 2.1)
+- Bounded While Loops: `while (x < y) limit(1000)`
+- @flight_crit / @critical_state
+- Priority-Attribute
+
+### Construction (Section 2.2)
+- Bit-Level Mapping: `field: u12 at(0)`
+- @redundant für TMR
+
+### Mission-Handling (Section 2.3)
+- Design by Contract: `pre()`, `post()`
+- Ranged Types (bereits implementiert!)
+
+### Telemetrie (Section 4)
+- Endianness: @big_endian / @little_endian
+- RingBuffer<T>
+- Flat structs
+
+### Integritäts-Management (Section 2.5)
+- @integrity(mode: scrubbed, interval: 100)
+- .meta_safe Section
+- VerifyIntegrity() builtin
+- Shadow Stack
+
+### Fehlende Bereiche (Section 5)
+- Panic-Strategien
+- Memory Pools
+- Interrupt-Handler
+- Requirement-IDs
+- HIL/SIL Testing
 
 ---
 
 ## Empfohlene nächste Schritte (Priorität)
 
-1. **Result-Typ mit Pattern-Matching** (P1 #10) – Strukturierte Fehlerbehandlung ohne Exceptions
-2. **MC/DC-Test-Suite für alle Backend-Pfade** (P1 #11) – Sicherstellen dass MC/DC-Instrumentierung in allen 7 Backends korrekt funktioniert
-3. ~~**Call-Graph: Statischer Aufrufgraph** (P1 #8)~~ ✅ ERLEDIGT
-4. ~~**Map-File: Speicherlayout aller Symbole** (P1 #9)~~ ✅ ERLEDIGT
-5. ~~**check() Builtin** (P1 #7b)~~ ✅ ERLEDIGT
-6. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
-7. ~~**Range-Typen** (P1 #7)~~ ✅ ERLEDIGT
-8. ~~**Assembly-Listing** (P0 #2)~~ ✅ ERLEDIGT
-9. ~~**assert() Builtin** (P0 #3)~~ ✅ ERLEDIGT
+1. **@integrity Blöcke und .meta_safe Section** (P0) – Core der Aerospace Extension
+2. **Bounded While Loops** (P1) – Deterministik für Echtzeit
+3. **TMR / @redundant Attribut** (P1) – Strahlungstoleranz
+4. **VerifyIntegrity() Builtin** (P0) – Runtime-Validierung
+5. **Shadow Stack** (P3) – Control-Flow-Schutz
+6. **@flight_crit Sektion** (P1) – Kritische Code-Bereiche
 
 ---
 
 ## Referenzen
 
-- **DO-178C**: Software Considerations in Airborne Systems and Equipment Certification
-- **DO-331**: Model-Based Development and Verification
-- **DO-332**: Object-Oriented Technology and Related Techniques
-- **DO-333**: Formal Methods Supplement to DO-178C and DO-278A
-- **CompCert**: The CompCert C Verified Compiler (INRIA)
+- **DO-178C**: Software Considerations in Airborne Systems
 - **MISRA C:2023**: Guidelines for critical systems
-- **ARINC 653**: Avionics Application Software Standard Interface
+- **ECSS-E-ST-40C**: European Co-operation for Space Standardization
+- **ECSS-Q-ST-80C**: Software product and software system assurance
+- **aerospace.pdf v2**: Lyx Aerospace Extension Konzept (2026-04-03)
