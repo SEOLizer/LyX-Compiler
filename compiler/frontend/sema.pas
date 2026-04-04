@@ -2057,6 +2057,13 @@ begin
   Result := (t = atPChar);
 end;
 
+function IsStructType(t: TAurumType): Boolean;
+begin
+  // Struct types are represented differently - check for user-defined types
+  // For now, allow any non-primitive type (except void/bool)
+  Result := (t = atTuple) or (t = atDynArray) or (t = atMap) or (t = atSet);
+end;
+
 function IsNumericType(t: TAurumType): Boolean;
 begin
   Result := IsIntegerType(t) or (t in [atF32, atF64]);
@@ -3395,6 +3402,10 @@ var
   sw: TAstSwitch;
   caseVal: TAstExpr;
   cvtype: TAurumType;
+  // additional variables for pattern matching
+  callExpr: TAstCall;
+  bindName: string;
+  bindType: TAurumType;
   // range type helpers (aerospace-todo P1 #7)
   rtIdx: Integer;
   rtDecl: TAstTypeDecl;
@@ -3682,27 +3693,75 @@ begin
       end;
     nkSwitch:
       begin
-        // switch statement
+        // switch statement - also supports pattern matching for Result/Option
         sw := TAstSwitch(stmt);
         ctype := CheckExpr(sw.Expr);
-        if not IsIntegerType(ctype) then
-          FDiag.Error('switch expression must be integer', sw.Expr.Span);
+        // Allow struct types when using pattern matching (Ok(v), Err(e))
+        // Otherwise require integer type
+        if not (IsIntegerType(ctype) or IsStructType(ctype)) then
+          FDiag.Error('switch/match expression must be integer or struct type', sw.Expr.Span);
         // check cases
         for i := 0 to High(sw.Cases) do
         begin
-          // case value must be constant int
+          // case value - can be constant int OR pattern binding (Ok(v), Err(e))
           caseVal := sw.Cases[i].Value;
-          cvtype := CheckExpr(caseVal);
-          if not IsIntegerType(cvtype) then
-            FDiag.Error('case label must be integer', caseVal.Span);
-          // Also check OR pattern extra values
-          for j := 0 to High(sw.Cases[i].ExtraValues) do
+          // Check if this is a pattern binding
+          if (caseVal is TAstCall) and TAstCall(caseVal).IsPatternBinding then
           begin
-            cvtype := CheckExpr(sw.Cases[i].ExtraValues[j]);
+            // Pattern matching: Ok(v), Err(e), Some(x), None
+            // Add pattern bindings to scope
+            callExpr := TAstCall(caseVal);
+            if Length(callExpr.Args) > 0 then
+            begin
+              // First arg should be identifier (the bound variable name)
+              if callExpr.Args[0] is TAstIdent then
+              begin
+                bindName := TAstIdent(callExpr.Args[0]).Name;
+                // Determine type based on pattern constructor
+                if callExpr.Name = 'Ok' then
+                  bindType := ctype  // Result type - will refine later
+                else if callExpr.Name = 'Err' then
+                  bindType := atInt64  // Error code
+                else if callExpr.Name = 'Some' then
+                  bindType := ctype
+                else if callExpr.Name = 'None' then
+                  bindType := atVoid
+                else
+                begin
+                  // Unknown pattern, use the matched type
+                  bindType := ctype;
+                end;
+                // Add binding to case object for later processing
+                s := TSymbol.Create(bindName);
+                s.Kind := symVar;
+                s.DeclType := bindType;
+                sw.Cases[i].AddBinding(bindName, TAstIdent.Create(bindName, callExpr.Span));
+              end;
+            end;
+          end
+          else
+          begin
+            // Traditional case: must be integer
+            cvtype := CheckExpr(caseVal);
             if not IsIntegerType(cvtype) then
-              FDiag.Error('case label must be integer', sw.Cases[i].ExtraValues[j].Span);
+              FDiag.Error('case label must be integer', caseVal.Span);
+            // Also check OR pattern extra values
+            for j := 0 to High(sw.Cases[i].ExtraValues) do
+            begin
+              cvtype := CheckExpr(sw.Cases[i].ExtraValues[j]);
+              if not IsIntegerType(cvtype) then
+                FDiag.Error('case label must be integer', sw.Cases[i].ExtraValues[j].Span);
+            end;
           end;
+          // Push scope and register pattern bindings
           PushScope;
+          for j := 0 to High(sw.Cases[i].Bindings) do
+          begin
+            s := TSymbol.Create(sw.Cases[i].Bindings[j]);
+            s.Kind := symVar;
+            s.DeclType := atInt64;  // Default to int64, will be refined
+            AddSymbolToCurrent(s, sw.Cases[i].BindingExprs[j].Span);
+          end;
           CheckStmt(sw.Cases[i].Body);
           PopScope;
         end;

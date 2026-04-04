@@ -217,6 +217,7 @@ type
     FArgs: TAstExprList;
     FNamespace: string;  // z.B. "IO" für "IO.PrintStr"
     FIsIndirectCall: Boolean;  // true wenn dies ein Funktionszeiger-Aufruf ist
+    FIsPatternBinding: Boolean;  // true if this is a pattern like Ok(v) in match
   public
     constructor Create(const aName: string; const aArgs: TAstExprList;
       aSpan: TSourceSpan);
@@ -228,6 +229,7 @@ type
     property Args: TAstExprList read FArgs;
     property Namespace: string read FNamespace write FNamespace;  // z.B. "IO" für "IO.PrintStr"
     property IsIndirectCall: Boolean read FIsIndirectCall write FIsIndirectCall;
+    property IsPatternBinding: Boolean read FIsPatternBinding write FIsPatternBinding;
   public
     // Generic type arguments for monomorphization, e.g., [atInt64] for max[int64](...)
     TypeArgs: array of TAurumType;
@@ -592,8 +594,12 @@ type
     Value: TAstExpr;
     ExtraValues: array of TAstExpr;  // additional OR pattern values (for case 1|2|3)
     Body: TAstStmt;
+    // Pattern bindings for struct patterns like Ok(v) or Err(e)
+    Bindings: array of string;      // names of bound variables
+    BindingExprs: array of TAstExpr; // expressions for bindings (e.g., Ok(v) -> result.value)
     constructor Create(aValue: TAstExpr; aBody: TAstStmt);
     destructor Destroy; override;
+    procedure AddBinding(const name: string; expr: TAstExpr);
   end;
   TAstCaseList = array of TAstCase;
 
@@ -1452,6 +1458,7 @@ begin
   inherited Create(nkCall, aSpan);
   FName := aName;
   FArgs := aArgs;
+  FIsPatternBinding := False;
 end;
 
 procedure TAstCall.SetName(const aName: string);
@@ -1778,6 +1785,8 @@ begin
   inherited Create;
   Value := aValue;
   Body := aBody;
+  SetLength(Bindings, 0);
+  SetLength(BindingExprs, 0);
 end;
 
 destructor TAstCase.Destroy;
@@ -1787,8 +1796,20 @@ begin
   for i := 0 to High(ExtraValues) do
     ExtraValues[i].Free;
   SetLength(ExtraValues, 0);
+  for i := 0 to High(BindingExprs) do
+    BindingExprs[i].Free;
+  SetLength(BindingExprs, 0);
   Body.Free;
   inherited Destroy;
+end;
+
+{ Add pattern binding to case }
+procedure TAstCase.AddBinding(const name: string; expr: TAstExpr);
+begin
+  SetLength(Bindings, Length(Bindings) + 1);
+  SetLength(BindingExprs, Length(BindingExprs) + 1);
+  Bindings[High(Bindings)] := name;
+  BindingExprs[High(BindingExprs)] := expr;
 end;
 
 // ================================================================
