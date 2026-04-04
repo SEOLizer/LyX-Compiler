@@ -37,6 +37,107 @@ echo $?   # Exit-Code prüfen
 FPCUnit (aus `fcl-test`) ist das Test-Framework. Jede Test-Unit registriert
 ihre Suites im `initialization`-Abschnitt.
 
+## Debug- und Überprüfungswerkzeuge
+
+Bei jeder Spracherweiterung oder Backend-Änderung **müssen** diese Werkzeuge
+aktiv genutzt werden, um Korrektheit und Sicherheit zu gewährleisten:
+
+### 1. Statische Analyse (`--static-analysis`)
+
+Führt 7 Analyse-Passes über den IR-Code aus. **Immer nach Backend-Änderungen ausführen:**
+
+```bash
+./lyxc test.lyx -o test --static-analysis
+```
+
+| Pass | Erkennt | Wann nutzen |
+|------|---------|-------------|
+| Data-Flow-Analyse | Def-Use-Ketten für alle Variablen | Nach neuen IR-Ops |
+| Live-Variable-Analyse | Ungenutzte Variablen (Warnungen) | Nach Parser-Erweiterungen |
+| Constant-Propagation | Bekannte Konstanten durch irAdd/irSub/irMul | Nach Optimierer-Änderungen |
+| Null-Pointer-Analyse | Potenzielle Null-Dereferenzierungen | Nach neuen Pointer-Ops |
+| Array-Bounds-Analyse | Statische Index-Safety (SAFE/UNVERIFIED) | Nach Array-Features |
+| Terminierungs-Analyse | Unbounded Loops, rekursive Calls | Nach Control-Flow-Änderungen |
+| Stack-Nutzungs-Analyse | Worst-Case-Stack pro Funktion | Nach neuen Builtins |
+
+### 2. MC/DC Coverage (`--mcdc`, `--mcdc-report`)
+
+Instrumentiert den Code für Modified Condition/Decision Coverage. **Für alle Control-Flow-Erweiterungen:**
+
+```bash
+./lyxc test.lyx -o test --mcdc --mcdc-report
+```
+
+- Zeigt **GAP** für nicht abgedeckte Pfade (Condition T/F, Decision T/F, never executed)
+- Runtime-Counter im Data-Segment (`lock inc qword` für Thread-Safety)
+- Report: Total decisions, fully covered, with gaps, MC/DC coverage %
+
+**Bei neuen if/while/switch-Features:** MC/DC-Report prüfen, dass alle Branches instrumentiert sind.
+
+### 3. Assembly Listing (`--asm-listing`)
+
+Generiert source-annotiertes Assembly mit Hex-Bytes. **Für Backend-Debugging:**
+
+```bash
+./lyxc test.lyx -o test --asm-listing
+# Erzeugt: test.lst
+```
+
+Format: `offset  hex_bytes  ir_mnemonic  ; source_file:line`
+
+**Bei neuen IR→Backend-Mappings:** Listing prüfen, dass jede IR-Op korrekt übersetzt wird.
+
+### 4. IR-Coverage-Test
+
+Prüft 100% IR-Abdeckung in allen Backends:
+
+```bash
+cd compiler && ./tests/test_ir_coverage
+```
+
+**Nach jeder neuen IR-Operation:** Test muss in ALLEN Backends grün sein (x86_64, x86_64_win64, arm64, macosx64, xtensa, win_arm64, riscv).
+
+### 5. Determinismus-Test
+
+Validiert bit-für-bit reproduzierbare Builds:
+
+```bash
+cd compiler && ./tests/test_determinism
+```
+
+**Nach Backend-Änderungen:** Muss 18/18 Tests bestehen (10x-Stresstest inklusive).
+
+### 6. Reference Interpreter
+
+Validiert Compiler-Korrektheit via Bisimulation:
+
+```bash
+cd compiler && ./tests/test_reference_interpreter
+```
+
+**Nach IR-Änderungen:** 22/22 Tests müssen bestehen (Arithmetik, Bit-Ops, Vergleiche, Map/Set, Globals).
+
+### 7. Test-Generierung
+
+Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution:
+
+```bash
+cd compiler && ./tests/test_generation
+```
+
+**Nach Parser/Lexer-Erweiterungen:** Fuzzing mit 50+ random Inputs, 0 Crashes erforderlich.
+
+### 8. TOR-Validierung (DO-178C TQL-5)
+
+Tool Operational Requirements:
+
+```bash
+./lyxc --version        # TOR-001
+./lyxc --build-info     # TOR-002
+./lyxc --config         # TOR-003
+cd compiler && ./tests/test_tor_validation  # 23/23 Tests
+```
+
 ## Projektstruktur
 
 ```
@@ -208,3 +309,18 @@ docs: ebnf.md um ConstExpr-Regeln erweitert
 8. **Codegen**: Beachtet der x86_64_emit die SysV-Calling Convention (RDI, RSI, RDX, RCX, R8, R9)?
 9. **VMT**: Werden virtual/override/abstract Methoden korrekt in die VMT eingetragen?
 10. **SIMD**: Ist die 16-Byte Ausrichtung für ParallelArray gewährleistet?
+
+## Checkliste nach Code-Änderungen
+
+Nach jeder Änderung an Lexer, Parser, IR oder Backend **müssen** diese Prüfungen durchlaufen werden:
+
+1. **Compiler baut**: `make build` muss ohne Fehler durchlaufen
+2. **Statische Analyse**: `./lyxc test.lyx -o test --static-analysis` — 0 Warnungen für neue Features
+3. **MC/DC Coverage**: `./lyxc test.lyx -o test --mcdc --mcdc-report` — keine Gaps in neuen Branches
+4. **Assembly Listing**: `./lyxc test.lyx -o test --asm-listing` — Hex-Bytes und IR-Mnemonics prüfen
+5. **IR-Coverage**: `cd compiler && ./tests/test_ir_coverage` — 100% in allen 7 Backends
+6. **Determinismus**: `cd compiler && ./tests/test_determinism` — 18/18 Tests müssen bestehen
+7. **Reference Interpreter**: `cd compiler && ./tests/test_reference_interpreter` — 22/22 Tests
+8. **Test-Generierung**: `cd compiler && ./tests/test_generation` — Fuzzing: 0 Crashes
+9. **TOR-Validierung**: `cd compiler && ./tests/test_tor_validation` — 23/23 Tests
+10. **Integrationstests**: `make test` — alle bestehenden Tests müssen grün bleiben
