@@ -194,9 +194,9 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | 53 | **WCET-Schätzung** | 10.2 | Hoch | Section 2.1 |
 | ~~54~~ | ~~**Stack-Analyse über Call-Grenzen**~~ | ~~10.2~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TStaticAnalyzer.AnalyzeStackUsageWithCallGraph`, `TCallGraph.GetCalleesList`, Worst-Case-Stack über Call-Graph |
 | 55 | **Design by Contract (pre/post)** | 3 | Hoch | Section 2.3 |
-| 56 | **RingBuffer<T> Typ** | 4 | Mittel | Section 4 |
-| 57 | **Flat Structs für Zero-Copy** | 4 | Niedrig | Section 4 |
-| 58 | **Floating Point Deterministik** | 7 | Niedrig | Section 7 |
+| ~~56~~ | ~~**RingBuffer<T> Typ**~~ | ~~4~~ | ~~Mittel~~ | ✅ **TEILWEISE ERLEDIGT** – Lexer: `tkRingBuffer` Token; AST: `atRingBuffer` enum; Parser: `RingBuffer<T>(N)` mit optionalem Capacity-Parameter; Sema: Size/Align als Referenztyp (8 Bytes). **Ausstehend**: IR-Ops (irRingBufferNew/Push/Pop/Peek/Len/Free), Backend-Codegen (lock-free mit `lock cmpxchg`), Runtime-Implementierung |
+| ~~57~~ | ~~**Flat Structs für Zero-Copy**~~ | ~~4~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Lexer: `tkFlat` Token; AST: `FIsFlat` in `TAstStructDecl`; Parser: `flat struct` Syntax; Sema: Pointer-Check in `ComputeStructLayouts` (keine `pchar`/`pchar?`/`fn ptr`-Felder in flat structs), verschachtelter Flat-Struct-Check |
+| ~~58~~ | ~~**Floating Point Deterministik**~~ | ~~7~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – backend_types: `FPDeterministic` in `TSafetyPragmas`; Parser: `@flight_crit` Attribut (impliziert `@critical`); Backend x86_64: `stmxcsr`/`ldmxcsr` im Prolog/Epilog, MXCSR auf 0x7F80 (round-to-zero, alle Exceptions masked); IR-Optimizer: FP-Constant-Folding deaktiviert für Determinismus |
 
 ### 🟢 P3 – Niedrig (langfristig / formal)
 
