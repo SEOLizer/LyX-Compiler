@@ -915,6 +915,7 @@ type
     FFields: TStructFieldList;
     FMethods: TMethodList; // reuse TAstFuncDecl for method declarations
     FIsPublic: Boolean;
+    FEndian: TEndianType; // endianness annotation (aerospace-todo P2 #52)
     // layout info (bytes)
     FFieldOffsets: array of Integer; // offset per field
     FSize: Integer; // total size in bytes
@@ -927,6 +928,7 @@ type
     property Fields: TStructFieldList read FFields;
     property Methods: TMethodList read FMethods;
     property IsPublic: Boolean read FIsPublic;
+    property Endian: TEndianType read FEndian write FEndian; // aerospace-todo P2 #52
     property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
     property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;

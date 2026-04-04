@@ -178,7 +178,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | 49 | **Priority-Attribute für Funktionen** | 2.1 | Mittel | Section 2.1 (Echtzeit-Scheduling) |
 | 50 | **Bit-Level Memory Mapping** | 2.2 | Mittel | Section 2.2: `at(bit_position)` |
 | 51 | **@redundant Attribut (TMR)** | 2.2 | Mittel | Section 2.2 |
-| 52 | **@big_endian / @little_endian** | 4 | Niedrig | Section 4 |
+| ~~52~~ | ~~**@big_endian / @little_endian**~~ | ~~4~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Lexer: `tkBigEndian`/`tkLittleEndian` Tokens; Parser: `@big_endian`/`@little_endian` vor `struct`; AST: `FEndian: TEndianType` in `TAstStructDecl`; Backend-Typen: `TEndianType` Enum; Sema-Validierung; Test: `test_endian.lyx` kompiliert und läuft |
 
 ### 🟡 P2 – Mittel (nice-to-have für DAL C)
 
@@ -246,9 +246,9 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
-| **11. Aerospace Extension (NEW)** | 5 | 9 | 36% |
+| **11. Aerospace Extension (NEW)** | 6 | 8 | 43% |
 | **12. Backend-Abdeckung (NEW)** | 0 | 14 | 0% |
-| **GESAMT** | **91** | **50** | **65%** |
+| **GESAMT** | **92** | **49** | **65%** |
 
 ---
 

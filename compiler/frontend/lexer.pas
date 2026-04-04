@@ -33,6 +33,8 @@ type
     tkMap, tkSet, tkIn,
     // OOP Additional Keywords
     tkVirtual, tkOverride, tkAbstract, tkIs,
+    // Endianness Annotations (aerospace-todo P2 #52)
+    tkBigEndian, tkLittleEndian,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -173,6 +175,8 @@ begin
     tkVirtual:    Result := 'virtual';
     tkOverride:   Result := 'override';
     tkAbstract:   Result := 'abstract';
+    tkBigEndian:  Result := '@big_endian';
+    tkLittleEndian: Result := '@little_endian';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -778,6 +782,8 @@ begin
     'virtual':    Result := tkVirtual;
     'override':   Result := tkOverride;
     'abstract':   Result := tkAbstract;
+    'big_endian':   Result := tkBigEndian;
+    'little_endian': Result := tkLittleEndian;
     'is':         Result := tkIs;
   else
     Result := tkIdent;
@@ -804,6 +810,8 @@ function TLexer.NextToken: TToken;
 var
   startLine, startCol: Integer;
   c: Char;
+  identStart: Integer; // for @big_endian/@little_endian (aerospace-todo P2 #52)
+  identStr: string;
 begin
   if FPeeked then
   begin
@@ -950,7 +958,28 @@ begin
         Advance; Result := MakeToken(tkDot, '.', startLine, startCol, 1);
       end;
     end;
-    '@': begin Advance; Result := MakeToken(tkAt, '@', startLine, startCol, 1); end;
+    '@': begin
+      Advance;
+      // Check for @big_endian or @little_endian (aerospace-todo P2 #52)
+      if (FPos <= Length(FSource)) and (FSource[FPos] in ['a'..'z', 'A'..'Z']) then
+      begin
+        identStart := FPos;
+        while (FPos <= Length(FSource)) and (FSource[FPos] in ['a'..'z', 'A'..'Z', '0'..'9', '_']) do
+          Advance;
+        identStr := Copy(FSource, identStart, FPos - identStart);
+        if identStr = 'big_endian' then
+        begin
+          Result := MakeToken(tkBigEndian, '@big_endian', startLine, startCol, FPos - startCol + 1);
+          Exit;
+        end
+        else if identStr = 'little_endian' then
+        begin
+          Result := MakeToken(tkLittleEndian, '@little_endian', startLine, startCol, FPos - startCol + 1);
+          Exit;
+        end;
+      end;
+      Result := MakeToken(tkAt, '@', startLine, startCol, 1);
+    end;
     '?': begin
       Advance;
       if (not IsAtEnd) and (CurrentChar = '?') then
