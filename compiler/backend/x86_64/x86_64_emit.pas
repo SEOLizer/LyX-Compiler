@@ -447,6 +447,34 @@ begin
   EmitU8(buf, $C0 or ((gpr and 7) shl 3) or (xmm and 7));
 end;
 
+// stmxcsr [rsp+disp] — save MXCSR control register (aerospace-todo P2 #58)
+procedure WriteStmxcsr(buf: TByteBuffer; base: Byte; disp: Integer);
+var modBits: Byte;
+begin
+  // 0F AE /1 — stmxcsr m32
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, $0F); EmitU8(buf, $AE);
+  EmitU8(buf, modBits or ($1 shl 3) or (base and 7)); // /1 = stmxcsr
+  if (base and 7) = 4 then EmitU8(buf, $24); // SIB for RSP
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
+// ldmxcsr [rsp+disp] — load MXCSR control register (aerospace-todo P2 #58)
+procedure WriteLdmxcsr(buf: TByteBuffer; base: Byte; disp: Integer);
+var modBits: Byte;
+begin
+  // 0F AE /2 — ldmxcsr m32
+  if (disp >= -128) and (disp <= 127) then modBits := $40
+  else modBits := $80;
+  EmitU8(buf, $0F); EmitU8(buf, $AE);
+  EmitU8(buf, modBits or ($2 shl 3) or (base and 7)); // /2 = ldmxcsr
+  if (base and 7) = 4 then EmitU8(buf, $24); // SIB for RSP
+  if modBits = $40 then EmitU8(buf, Byte(disp))
+  else EmitU32(buf, Cardinal(disp));
+end;
+
 function SlotOffset(slot: Integer): Integer;
 begin
   Result := -8 * (slot + 1);
@@ -904,6 +932,26 @@ begin
       EmitU8(FCode, $EC);
       EmitU32(FCode, Cardinal(totalSlots * 8));
     end;
+
+    // FP-Deterministik: MXCSR auf Round-to-Zero setzen (aerospace-todo P2 #58)
+    if fn.SafetyPragmas.FPDeterministic then
+    begin
+      // sub rsp, 16 — Platz für MXCSR (16-byte aligned)
+      EmitRex(FCode, 1, 0, 0, 0);
+      EmitU8(FCode, $81);
+      EmitU8(FCode, $EC);
+      EmitU32(FCode, 16);
+
+      // stmxcsr [rsp] — aktuellen MXCSR speichern
+      WriteStmxcsr(FCode, RSP, 0);
+
+      // ldmxcsr [rip + mxcsr_val] — MXCSR auf 0x7F80 laden (round-to-zero, alle Exceptions masked)
+      // Da wir keine Daten-Labels haben, laden wir den Wert direkt:
+      // mov dword [rsp], 0x7F80
+      EmitU8(FCode, $C7); EmitU8(FCode, $04); EmitU8(FCode, $24);  // mov dword [rsp], imm32
+      EmitU32(FCode, $00007F80);  // MXCSR: round-to-zero, all exceptions masked
+      WriteLdmxcsr(FCode, RSP, 0);
+    end;
     
     // Spill incoming parameters into local slots (SysV ABI: RDI, RSI, RDX, RCX, R8, R9)
     // For large struct returns (>16 bytes), RDI contains the sret pointer
@@ -967,6 +1015,19 @@ begin
           if instr.Src1 >= 0 then
             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
           
+          // FP-Deterministik: MXCSR wiederherstellen (aerospace-todo P2 #58)
+          if fn.SafetyPragmas.FPDeterministic then
+          begin
+            // ldmxcsr [rsp-16] — gespeicherten MXCSR wiederherstellen
+            // rsp zeigt auf den MXCSR-Slot (sub rsp, 16 im Prolog)
+            WriteLdmxcsr(FCode, RSP, 0);
+            // add rsp, 16 — MXCSR-Slot freigeben
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $81);
+            EmitU8(FCode, $C4);
+            EmitU32(FCode, 16);
+          end;
+
           // Epilog
           EmitRex(FCode, 1, 0, 0, 0);
           EmitU8(FCode, $89);

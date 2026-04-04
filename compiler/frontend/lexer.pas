@@ -31,10 +31,14 @@ type
     tkWhere, tkValue,
     // Map/Set Keywords
     tkMap, tkSet, tkIn,
+    // RingBuffer Keyword (aerospace-todo P2 #56)
+    tkRingBuffer,
     // OOP Additional Keywords
     tkVirtual, tkOverride, tkAbstract, tkIs,
     // Endianness Annotations (aerospace-todo P2 #52)
     tkBigEndian, tkLittleEndian,
+    // Flat Struct Annotation (aerospace-todo P2 #57)
+    tkFlat,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -172,11 +176,13 @@ begin
     tkMap:        Result := 'Map';
     tkSet:        Result := 'Set';
     tkIn:         Result := 'in';
+    tkRingBuffer: Result := 'RingBuffer';
     tkVirtual:    Result := 'virtual';
     tkOverride:   Result := 'override';
     tkAbstract:   Result := 'abstract';
     tkBigEndian:  Result := '@big_endian';
     tkLittleEndian: Result := '@little_endian';
+    tkFlat:       Result := 'flat';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -776,7 +782,7 @@ begin
     // Map/Set/Array Keywords
     'Map':        Result := tkMap;
     'Set':        Result := tkSet;
-    'Array':      Result := tkArray;
+    'RingBuffer': Result := tkRingBuffer;
     'in':         Result := tkIn;
     // OOP Additional Keywords
     'virtual':    Result := tkVirtual;
@@ -784,6 +790,7 @@ begin
     'abstract':   Result := tkAbstract;
     'big_endian':   Result := tkBigEndian;
     'little_endian': Result := tkLittleEndian;
+    'flat':         Result := tkFlat;
     'is':         Result := tkIs;
   else
     Result := tkIdent;
