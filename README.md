@@ -62,6 +62,9 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
 ✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.1)
 ✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.9.0)
+✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.9.0)
+✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.9.0)
+✅ Endianness Annotations: @big_endian / @little_endian on structs for telemetry byte-order management (v0.9.0)
 ```
 
 ---
@@ -560,6 +563,57 @@ When `@integrity` is present on a `unit` declaration, the compiler emits a custo
 Total section size: **8232 bytes** (0x2028). The triple CRC32 store provides radiation fault tolerance — a single-event upset corrupting one copy is detected by comparing all three.
 
 Supported backends: **x86_64**, **ARM64**, **RISC-V**.
+
+**VerifyIntegrity() Builtin (aerospace.pdf Section 2.5.3):**
+The `VerifyIntegrity()` builtin performs a runtime TMR (Triple Modular Redundancy) majority-vote check:
+
+```lyx
+@integrity(mode: scrubbed, interval: 100)
+unit;
+
+fn main(): int64 {
+  if (VerifyIntegrity()) {
+    PrintStr("Integrity OK\n");
+    return 0;
+  } else {
+    PrintStr("Integrity FAIL\n");
+    return 1;
+  }
+}
+```
+
+The compiler embeds 3 identical CRC32 hashes of the code section into the data section.
+At runtime, `VerifyIntegrity()` reads all 3 hashes and performs a majority vote:
+if 2 or more agree, it returns `true`. This provides protection against single-event upsets (SEU) in memory.
+
+**TMR Hash-Store (aerospace.pdf Section 2.5.2):**
+The TMR hash store is embedded in the ELF data section with the following layout:
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0..3 | `hash_copy_1` | CRC32-IEEE-802.3 of code section |
+| 4..7 | `hash_copy_2` | CRC32-IEEE-802.3 of code section (redundant copy) |
+| 8..11 | `hash_copy_3` | CRC32-IEEE-802.3 of code section (redundant copy) |
+| 12..15 | `code_size` | Size of code section in bytes |
+| 16..23 | `code_start_va` | Virtual address of code section start |
+
+The `.meta_safe` section is marked with `SHF_ALLOC` so it is mapped into memory at runtime,
+allowing `VerifyIntegrity()` to read the stored hashes.
+
+**Endianness Annotations (aerospace.pdf Section 2.4):**
+Structs can be annotated with `@big_endian` or `@little_endian` for telemetry data exchange between heterogeneous architectures:
+
+```lyx
+type TelemetryFrame = @big_endian struct {
+  timestamp: int64;
+  temperature: int16;
+  status_flags: int8;
+};
+```
+
+This marks the struct for explicit byte-order management when sending data from
+a PowerPC (big-endian) to an x86 (little-endian) ground station, or vice versa.
+The annotation is combinable with `@packed` for hardware register mapping.
 
 ### Tool Qualification (TQL-5)
 
