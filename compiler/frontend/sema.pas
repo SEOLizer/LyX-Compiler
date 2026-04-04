@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, bytes, tobject;
+  SysUtils, Classes, ast, diag, lexer, unit_manager, bytes, tobject, backend_types;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -5406,6 +5406,28 @@ begin
   ComputeClassLayouts;
   ResolveVMTForClasses;
   RegisterInheritedMethods;
+
+  // Safety-pragma validation pass (aerospace-todo P1 #6)
+  for i := 0 to High(prog.Decls) do
+  begin
+    node := prog.Decls[i];
+    if node is TAstFuncDecl then
+    begin
+      fn := TAstFuncDecl(node);
+      // @critical on extern function makes no sense
+      if fn.IsExtern and fn.SafetyPragmas.IsCritical then
+        FDiag.Error('@critical pragma on extern function ''' + fn.Name + ''' is not meaningful', fn.Span);
+      // @wcet on extern function: cannot verify WCET
+      if fn.IsExtern and (fn.SafetyPragmas.WCETBudget > 0) then
+        FDiag.Error('@wcet pragma on extern function ''' + fn.Name + ''' cannot be verified', fn.Span);
+      // @stack_limit on extern function: cannot verify stack usage
+      if fn.IsExtern and (fn.SafetyPragmas.StackLimit > 0) then
+        FDiag.Error('@stack_limit pragma on extern function ''' + fn.Name + ''' cannot be verified', fn.Span);
+      // @dal(A) without @critical: note that critical flag is recommended
+      if (fn.SafetyPragmas.DALLevel = dalA) and not fn.SafetyPragmas.IsCritical then
+        FDiag.Warning('DAL-A function ''' + fn.Name + ''' should be marked @critical', fn.Span);
+    end;
+  end;
 
   // Second pass: check function bodies
   for i := 0 to High(prog.Decls) do
