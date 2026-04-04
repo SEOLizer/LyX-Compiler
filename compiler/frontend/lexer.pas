@@ -39,6 +39,10 @@ type
     tkBigEndian, tkLittleEndian,
     // Flat Struct Annotation (aerospace-todo P2 #57)
     tkFlat,
+    // Packed Struct Annotation (aerospace-todo P2 #50)
+    tkPacked,
+    // Redundant Variable Annotation (aerospace-todo P2 #51)
+    tkRedundant,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -183,6 +187,8 @@ begin
     tkBigEndian:  Result := '@big_endian';
     tkLittleEndian: Result := '@little_endian';
     tkFlat:       Result := 'flat';
+    tkPacked:     Result := 'packed';
+    tkRedundant:  Result := 'redundant';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -791,6 +797,8 @@ begin
     'big_endian':   Result := tkBigEndian;
     'little_endian': Result := tkLittleEndian;
     'flat':         Result := tkFlat;
+    'packed':       Result := tkPacked;
+    'redundant':    Result := tkRedundant;
     'is':         Result := tkIs;
   else
     Result := tkIdent;

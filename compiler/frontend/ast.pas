@@ -513,6 +513,7 @@ type
     FIsNullable: Boolean;  // true if type ends with ? (null-safety)
     FIsGlobal: Boolean;    // true if declared at top-level
     FIsPublic: Boolean;    // true if declared with 'pub'
+    FIsRedundant: Boolean; // true if @redundant annotated (aerospace-todo P2 #51)
   public
     constructor Create(aStorage: TStorageKlass; const aName: string;
       aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
@@ -528,6 +529,7 @@ type
     property IsNullable: Boolean read FIsNullable;
     property IsGlobal: Boolean read FIsGlobal;
     property IsPublic: Boolean read FIsPublic;
+    property IsRedundant: Boolean read FIsRedundant write FIsRedundant; // aerospace-todo P2 #51
   end;
 
   { Zuweisung: x := expr; }
@@ -906,6 +908,7 @@ type
     FieldTypeName: string; // if named type
     ArrayLen: Integer; // 0 = scalar, >0 static, -1 dynamic
     Visibility: TVisibility; // for class fields (default: visPublic)
+    BitOffset: Integer;  // -1 = auto (normal), >=0 = explicit bit position (aerospace-todo P2 #50)
   end;
   TStructFieldList = array of TStructField;
   TMethodList = array of TAstFuncDecl;
@@ -918,6 +921,7 @@ type
     FIsPublic: Boolean;
     FEndian: TEndianType; // endianness annotation (aerospace-todo P2 #52)
     FIsFlat: Boolean;     // flat struct: no pointer fields allowed (aerospace-todo P2 #57)
+    FIsPacked: Boolean;   // @packed struct: no padding, bit-level field mapping (aerospace-todo P2 #50)
     // layout info (bytes)
     FFieldOffsets: array of Integer; // offset per field
     FSize: Integer; // total size in bytes
@@ -932,6 +936,7 @@ type
     property IsPublic: Boolean read FIsPublic;
     property Endian: TEndianType read FEndian write FEndian; // aerospace-todo P2 #52
     property IsFlat: Boolean read FIsFlat write FIsFlat;     // aerospace-todo P2 #57
+    property IsPacked: Boolean read FIsPacked write FIsPacked; // aerospace-todo P2 #50
     property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
     property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
