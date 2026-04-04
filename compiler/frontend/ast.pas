@@ -31,6 +31,7 @@ type
     atMap,            // hash map type
     atSet,            // hash set type
     atParallelArray,  // SIMD parallel array
+    atRingBuffer,     // lock-free ring buffer (aerospace-todo P2 #56)
     atFnPtr,          // function pointer type
     atTuple           // multi-return tuple: (T1, T2, ...)
   );
@@ -916,6 +917,7 @@ type
     FMethods: TMethodList; // reuse TAstFuncDecl for method declarations
     FIsPublic: Boolean;
     FEndian: TEndianType; // endianness annotation (aerospace-todo P2 #52)
+    FIsFlat: Boolean;     // flat struct: no pointer fields allowed (aerospace-todo P2 #57)
     // layout info (bytes)
     FFieldOffsets: array of Integer; // offset per field
     FSize: Integer; // total size in bytes
@@ -929,6 +931,7 @@ type
     property Methods: TMethodList read FMethods;
     property IsPublic: Boolean read FIsPublic;
     property Endian: TEndianType read FEndian write FEndian; // aerospace-todo P2 #52
+    property IsFlat: Boolean read FIsFlat write FIsFlat;     // aerospace-todo P2 #57
     property FieldOffsets: TIntArray read FFieldOffsets write FFieldOffsets;
     property Size: Integer read FSize write FSize;
     property Align: Integer read FAlign;
@@ -1153,6 +1156,7 @@ type
 { --- Hilfsfunktionen für Nullable-Typen --- }
 
 function IsNullableType(t: TAurumType): Boolean;
+function IsPointerType(t: TAurumType): Boolean;
 function BaseTypeOf(t: TAurumType): TAurumType;
 function NullableVersion(t: TAurumType): TAurumType;
 function NonNullableVersion(t: TAurumType): TAurumType;
@@ -1171,6 +1175,12 @@ implementation
 function IsNullableType(t: TAurumType): Boolean;
 begin
   Result := t = atPCharNullable;
+end;
+
+// IsPointerType: returns true if t is any pointer type (aerospace-todo P2 #57)
+function IsPointerType(t: TAurumType): Boolean;
+begin
+  Result := t in [atPChar, atPCharNullable, atFnPtr];
 end;
 
 function BaseTypeOf(t: TAurumType): TAurumType;
@@ -1224,6 +1234,7 @@ begin
     atArray:       Result := 'static_array';
     atMap:         Result := 'Map';
     atSet:         Result := 'Set';
+    atRingBuffer:  Result := 'RingBuffer'; // aerospace-todo P2 #56
     atFnPtr:       Result := 'fn';  // Treat as int64 internally for now
     atTuple:       Result := 'tuple';
   else
@@ -1256,6 +1267,7 @@ begin
     'array':  Result := atDynArray;
     'Map':    Result := atMap;
     'Set':    Result := atSet;
+    'RingBuffer': Result := atRingBuffer; // aerospace-todo P2 #56
   else
     Result := atUnresolved;
   end;

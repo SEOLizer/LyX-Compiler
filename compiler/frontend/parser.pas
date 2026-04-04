@@ -687,6 +687,7 @@ var
   rMin, rMax: Int64; // for range type parsing
   pendingEndian: TEndianType; // aerospace-todo P2 #52
   structEndian: TEndianType; // aerospace-todo P2 #52
+  isFlatStruct: Boolean;     // aerospace-todo P2 #57
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -909,11 +910,21 @@ begin
     TAstClassDecl(Result).ImplementedInterfaces := implInterfaces;
     Exit;
   end
-  // struct { ... }
-  else if Check(tkStruct) then
+  // struct { ... } or flat struct { ... }
+  else if Check(tkStruct) or Check(tkFlat) then
   begin
     structEndian := pendingEndian;
-    Advance; // struct
+    isFlatStruct := Check(tkFlat);
+    if isFlatStruct then
+    begin
+      Advance; // flat
+      if not Check(tkStruct) then
+        FDiag.Error('expected ''struct'' after ''flat''', FCurTok.Span)
+      else
+        Advance; // struct
+    end
+    else
+      Advance; // struct
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
@@ -942,6 +953,7 @@ begin
     Expect(tkSemicolon);
     Result := TAstStructDecl.Create(name, fields, methods, isPub, FCurTok.Span);
     TAstStructDecl(Result).Endian := structEndian; // aerospace-todo P2 #52
+    TAstStructDecl(Result).IsFlat := isFlatStruct;  // aerospace-todo P2 #57
     Exit;
   end
   else
@@ -2711,6 +2723,7 @@ var
   innerNullable: Boolean;
   innerArrayLen: Integer;
   innerType, keyType, valueType, elementType, paramType, returnType: TAurumType;
+  rbCapacity: Int64; // for RingBuffer<T>(N) capacity (aerospace-todo P2 #56)
   paramTypes: array of TAurumType;
 begin
   arrayLen := 0;
@@ -2921,6 +2934,47 @@ begin
       end;
       Expect(tkGt);
       Result := atSet;
+      Exit;
+    end;
+
+    // Handle RingBuffer<T> generic syntax (aerospace-todo P2 #56)
+    if Accept(tkRingBuffer) then
+    begin
+      Expect(tkLt);
+      // Parse Element Type
+      elementType := ParseType;
+      if elementType = atUnresolved then
+      begin
+        FDiag.Error('expected element type in RingBuffer<T>', FCurTok.Span);
+        Result := atVoid;
+        Exit;
+      end;
+      Expect(tkGt);
+      // Optional capacity: RingBuffer<T>(N)
+      rbCapacity := 0;
+      if Accept(tkLParen) then
+      begin
+        if Check(tkIntLit) then
+        begin
+          try
+            rbCapacity := StrToInt64(FCurTok.Value);
+            if rbCapacity <= 0 then
+              FDiag.Error('RingBuffer capacity must be positive', FCurTok.Span);
+          except
+            FDiag.Error('invalid RingBuffer capacity', FCurTok.Span);
+          end;
+          Advance;
+        end
+        else
+          FDiag.Error('expected capacity in RingBuffer<T>(N)', FCurTok.Span);
+        Expect(tkRParen);
+      end;
+      // Store capacity in arrayLen field (negative = dynamic capacity)
+      if rbCapacity > 0 then
+        arrayLen := rbCapacity
+      else
+        arrayLen := -1; // default capacity
+      Result := atRingBuffer;
       Exit;
     end;
 
@@ -3209,6 +3263,14 @@ begin
     else if attrName = 'critical' then
     begin
       safetyPragmas.IsCritical := True;
+      // no parentheses expected
+    end
+
+    // --- @flight_crit – strict FP determinism (aerospace-todo P2 #58) ---
+    else if attrName = 'flight_crit' then
+    begin
+      safetyPragmas.FPDeterministic := True;
+      safetyPragmas.IsCritical := True; // flight_crit implies critical
       // no parentheses expected
     end
 
