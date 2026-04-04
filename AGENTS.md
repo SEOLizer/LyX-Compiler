@@ -138,6 +138,36 @@ Tool Operational Requirements:
 cd compiler && ./tests/test_tor_validation  # 23/23 Tests
 ```
 
+### 9. Call-Graph Analyse (`--call-graph`)
+
+Analysiert den statischen Aufrufgraphen. **Bei Problemen mit Rekursion, WCET oder Stack-Tiefe:**
+
+```bash
+./lyxc test.lyx -o test --call-graph
+```
+
+- Zeigt alle Funktionen und ihre Aufrufer
+- Erkennt rekursive Aufrufe (direkt und indirekt)
+- Nützlich für DO-178C WCET-Analyse und Stack-Berechnung
+
+**Bei unerwarteten Rekursionsfehlern oder Stack-Overflows:** Call-Graph prüfen.
+
+### 10. Map-File Generator (`--map-file`)
+
+Generiert Memory-Layout-Dokumentation. **Bei Adressproblemen, Debugging oder Audit:**
+
+```bash
+./lyxc test.lyx -o test --map-file
+# Erzeugt: test.map
+```
+
+- Section-Übersicht (.text, .data, .rodata, .bss)
+- Funktions-Symbole mit Adressen und Größen
+- Globale Variablen mit Adressen
+- Statistiken (Code/Data Size)
+
+**Bei Speicherlayout-Problemen oder DO-178C 6.1 Compliance:** Map-File generieren.
+
 ## Projektstruktur
 
 ```
@@ -318,9 +348,11 @@ Nach jeder Änderung an Lexer, Parser, IR oder Backend **müssen** diese Prüfun
 2. **Statische Analyse**: `./lyxc test.lyx -o test --static-analysis` — 0 Warnungen für neue Features
 3. **MC/DC Coverage**: `./lyxc test.lyx -o test --mcdc --mcdc-report` — keine Gaps in neuen Branches
 4. **Assembly Listing**: `./lyxc test.lyx -o test --asm-listing` — Hex-Bytes und IR-Mnemonics prüfen
-5. **IR-Coverage**: `cd compiler && ./tests/test_ir_coverage` — 100% in allen 7 Backends
-6. **Determinismus**: `cd compiler && ./tests/test_determinism` — 18/18 Tests müssen bestehen
-7. **Reference Interpreter**: `cd compiler && ./tests/test_reference_interpreter` — 22/22 Tests
-8. **Test-Generierung**: `cd compiler && ./tests/test_generation` — Fuzzing: 0 Crashes
-9. **TOR-Validierung**: `cd compiler && ./tests/test_tor_validation` — 23/23 Tests
-10. **Integrationstests**: `make test` — alle bestehenden Tests müssen grün bleiben
+5. **Call-Graph**: `./lyxc test.lyx -o test --call-graph` — Rekursion und Aufrufstruktur prüfen
+6. **Map-File**: `./lyxc test.lyx -o test --map-file` — Speicherlayout verifizieren
+7. **IR-Coverage**: `cd compiler && ./tests/test_ir_coverage` — 100% in allen 7 Backends
+8. **Determinismus**: `cd compiler && ./tests/test_determinism` — 18/18 Tests müssen bestehen
+9. **Reference Interpreter**: `cd compiler && ./tests/test_reference_interpreter` — 22/22 Tests
+10. **Test-Generierung**: `cd compiler && ./tests/test_generation` — Fuzzing: 0 Crashes
+11. **TOR-Validierung**: `cd compiler && ./tests/test_tor_validation` — 23/23 Tests
+12. **Integrationstests**: `make test` — alle bestehenden Tests müssen grün bleiben

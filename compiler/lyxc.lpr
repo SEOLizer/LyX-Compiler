@@ -6,7 +6,7 @@ uses
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
-  asm_listing,
+  asm_listing, map_file,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer,
@@ -34,6 +34,7 @@ var
   flagStaticAnalysis: Boolean;  // --static-analysis
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
+  flagMapFile: Boolean;  // --map-file
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -67,6 +68,7 @@ var
   sa: TStaticAnalyzer;
   al: TAsmListingGenerator;
   cg: TCallGraph;
+  mapGen: TMapFileGenerator;
   listingFile: string;
   sl: TStringList;
   param: string;
@@ -345,6 +347,7 @@ begin
     WriteLn(StdErr, '  --mcdc-report    MC/DC-Coverage-Bericht nach Kompilierung');
     WriteLn(StdErr, '  --static-analysis Statische Analyse (Data-Flow, Live-Vars, Stack, ...)');
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
+    WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
     WriteLn(StdErr);
     WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
     WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
@@ -366,6 +369,7 @@ begin
   flagStaticAnalysis := False;
   flagAsmListing := False;
   flagCallGraph := False;
+  flagMapFile := False;
   includePaths := TStringList.Create;
   stdLibPath := '';
 
@@ -499,6 +503,11 @@ begin
     else if param = '--call-graph' then
     begin
       flagCallGraph := True;
+      Inc(i);
+    end
+    else if param = '--map-file' then
+    begin
+      flagMapFile := True;
       Inc(i);
     end
     else if param = '--trace-imports' then
@@ -744,6 +753,19 @@ begin
           end
           else
             WriteLn('[IR] IR optimizations disabled');
+
+          // Map File Generation (DO-178C Section 6.1 - Memory Layout)
+          if flagMapFile then
+          begin
+            WriteLn('[Map File] Generating memory layout...');
+            mapGen := TMapFileGenerator.Create(d);
+            try
+              mapGen.GenerateFromModule(module, outputFile + '.map');
+              WriteLn('[Map File] Done');
+            finally
+              mapGen.Free;
+            end;
+          end;
 
           // MC/DC Instrumentation (DO-178C DAL A)
           if flagMCDC then
