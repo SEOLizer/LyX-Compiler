@@ -45,6 +45,9 @@ type
     FGenericSpecializations: TStringList; // mangled name -> already lowered
     FTypeSubstParams: TStringArray;      // type param names for current specialization
     FTypeSubstTypes: array of TAurumType; // concrete types for current specialization
+    // Source location tracking for assembly listing (aerospace-todo 6.1)
+    FCurrentSourceLine: Integer;
+    FCurrentSourceFile: string;
 
     function NewTemp: Integer;
     function IsGlobalVar(const name: string): Boolean;
@@ -303,6 +306,9 @@ procedure TIRLowering.Emit(instr: TIRInstr);
 begin
   if not Assigned(FCurrentFunc) then
     Exit;
+  // Attach source location to IR instruction (aerospace-todo 6.1)
+  instr.SourceLine := FCurrentSourceLine;
+  instr.SourceFile := FCurrentSourceFile;
   FCurrentFunc.Emit(instr);
 end;
 
@@ -4561,6 +4567,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     fldOffset: Integer;
     fldType: TAurumType;
   begin
+  // Track source location from AST node for assembly listing (aerospace-todo 6.1)
+  if Assigned(stmt) then
+  begin
+    FCurrentSourceLine := stmt.Span.Line;
+    FCurrentSourceFile := stmt.Span.FileName;
+  end;
   instr := Default(TIRInstr);
   Result := True;
   // Handle block statements (multiple statements in braces)

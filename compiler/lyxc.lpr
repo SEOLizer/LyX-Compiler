@@ -6,6 +6,7 @@ uses
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis,
+  asm_listing,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
   arm64_emit, elf64_arm64_writer,
@@ -31,6 +32,7 @@ var
   flagTraceImports: Boolean;  // --trace-imports Flag
   flagMCDC: Boolean;  // --mcdc MC/DC instrumentation
   flagStaticAnalysis: Boolean;  // --static-analysis
+  flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -62,6 +64,9 @@ var
   mcdc: TMCDCInstrumenter;
   mcdcCount: Integer;
   sa: TStaticAnalyzer;
+  al: TAsmListingGenerator;
+  listingFile: string;
+  sl: TStringList;
   param: string;
 
 type
@@ -327,6 +332,7 @@ begin
     WriteLn(StdErr, '  --arch=ARCH      Architektur (x86_64, arm64, xtensa, riscv)');
     WriteLn(StdErr, '  --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)');
     WriteLn(StdErr, '  --emit-asm       IR als Pseudo-Assembler ausgeben');
+    WriteLn(StdErr, '  --asm-listing    Assembly-Listing mit Source-Zeilen (DO-178C 6.1)');
     WriteLn(StdErr, '  --dump-relocs    Relocations und externe Symbole anzeigen');
     WriteLn(StdErr, '  --trace-imports  Import-Auflösung debuggen');
     WriteLn(StdErr, '  --lint           Linter-Warnungen aktivieren (Stil, ungenutzte Variablen)');
@@ -355,6 +361,7 @@ begin
   flagTraceImports := False;
   flagMCDC := False;
   flagStaticAnalysis := False;
+  flagAsmListing := False;
   includePaths := TStringList.Create;
   stdLibPath := '';
 
@@ -478,6 +485,11 @@ begin
     else if param = '--static-analysis' then
     begin
       flagStaticAnalysis := True;
+      Inc(i);
+    end
+    else if param = '--asm-listing' then
+    begin
+      flagAsmListing := True;
       Inc(i);
     end
     else if param = '--trace-imports' then
@@ -735,6 +747,9 @@ begin
           if flagEmitAsm then
             DumpIRAsAsm(module);
 
+          // --asm-listing: Assembly listing with source lines (DO-178C 6.1)
+          // This is done per-target after code generation
+
            if target = targetWindows then
            begin
              // Windows x64 Code Generation
@@ -779,17 +794,36 @@ begin
                  WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
                end;
  
-               // Energy statistics output
-               if flagEnergyLevel > 0 then
-                 PrintEnergyStats(emit.GetEnergyStats);
- 
-               FpChmod(PChar(outputFile), 493);
-               WriteLn('Wrote ', outputFile);
-             finally
-               emit.Free;
-             end;
-           end
-           else if target = targetLinuxARM64 then
+                // Energy statistics output
+                if flagEnergyLevel > 0 then
+                  PrintEnergyStats(emit.GetEnergyStats);
+  
+                // Assembly listing (DO-178C 6.1)
+                if flagAsmListing then
+                begin
+                  al := TAsmListingGenerator.Create(module, codeBuf, dataBuf, 'x86_64');
+                  try
+                    listingFile := ChangeFileExt(outputFile, '.lst');
+                    sl := TStringList.Create;
+                    try
+                      sl.Text := al.Generate;
+                      sl.SaveToFile(listingFile);
+                    finally
+                      sl.Free;
+                    end;
+                    WriteLn('Wrote ', listingFile, ' (Assembly Listing)');
+                  finally
+                    al.Free;
+                  end;
+                end;
+  
+                FpChmod(PChar(outputFile), 493);
+                WriteLn('Wrote ', outputFile);
+              finally
+                emit.Free;
+              end;
+            end
+            else if target = targetLinuxARM64 then
            begin
              // Linux ARM64 Code Generation
              arm64Emit := TARM64Emitter.Create;
@@ -858,6 +892,25 @@ begin
 
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile);
+
+                // Assembly listing (DO-178C 6.1)
+                if flagAsmListing then
+                begin
+                  al := TAsmListingGenerator.Create(module, codeBuf, dataBuf, 'x86_64');
+                  try
+                    listingFile := ChangeFileExt(outputFile, '.lst');
+                    sl := TStringList.Create;
+                    try
+                      sl.Text := al.Generate;
+                      sl.SaveToFile(listingFile);
+                    finally
+                      sl.Free;
+                    end;
+                    WriteLn('Wrote ', listingFile, ' (Assembly Listing)');
+                  finally
+                    al.Free;
+                  end;
+                end;
               finally
                 emit.Free;
               end;
