@@ -1110,9 +1110,11 @@ type
   TAstUnitDecl = class(TAstNode)
   private
     FUnitPath: string;
+    FIntegrityAttr: TIntegrityAttr; // @integrity(mode:..., interval:N) before unit decl
   public
     constructor Create(const aPath: string; aSpan: TSourceSpan);
     property UnitPath: string read FUnitPath;
+    property IntegrityAttr: TIntegrityAttr read FIntegrityAttr write FIntegrityAttr;
   end;
 
   { Import-Item }
@@ -2453,6 +2455,8 @@ constructor TAstUnitDecl.Create(const aPath: string; aSpan: TSourceSpan);
 begin
   inherited Create(nkUnitDecl, aSpan);
   FUnitPath := aPath;
+  FIntegrityAttr.Mode     := imNone;
+  FIntegrityAttr.Interval := 0;
 end;
 
 // ================================================================
