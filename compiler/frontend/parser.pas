@@ -38,6 +38,7 @@ type
     function ParseBlock: TAstBlock;
     function ParseStmt: TAstStmt;
     function ParseMatchStmt: TAstStmt;
+    function ParseMatchPattern: TAstExpr;
     function ParseVarLetCoDecl: TAstStmt;
     function ParseForStmt: TAstFor;
     function ParseRepeatUntilStmt: TAstRepeatUntil;
@@ -1240,8 +1241,14 @@ begin
   begin
     if Accept(tkCase) then
     begin
-      // parse first value - use ParseBitXorExpr to avoid consuming '|' as bitwise-OR
-      valExpr := ParseBitXorExpr;
+      // Check for struct pattern: Ident(ident) like Ok(v), Err(e)
+      // This must be parsed BEFORE regular expression to capture pattern syntax
+      valExpr := ParseMatchPattern;
+      if valExpr = nil then
+      begin
+        // Not a struct pattern, parse as expression
+        valExpr := ParseBitXorExpr;
+      end;
       caseObj := TAstCase.Create(valExpr, nil);
       // OR patterns: case 1 | 2 | 3 =>
       while Check(tkBitOr) do
@@ -1278,6 +1285,64 @@ begin
   end;
   Expect(tkRBrace);
   Result := TAstSwitch.Create(expr, cases, defaultBody, expr.Span);
+end;
+
+{ Parse pattern for match statement: Ident(expr) for struct patterns }
+function TParser.ParseMatchPattern: TAstExpr;
+var
+  name: string;
+  nameSpan: TSourceSpan;
+  arg: TAstExpr;
+  args: TAstExprList;
+  patSpan: TSourceSpan;
+begin
+  Result := nil;
+  if not Check(tkIdent) then Exit;
+  // Record start position
+  name := FCurTok.Value;
+  nameSpan := FCurTok.Span;
+  Advance; // consume identifier
+  // Check for pattern syntax: Ident(expr) or Ident(ident)
+  if Accept(tkLParen) then
+  begin
+    patSpan := nameSpan;
+    // Check for simple identifier pattern: Ident(varname)
+    if Check(tkIdent) then
+    begin
+      // Pattern variable: capture the identifier name
+      arg := TAstIdent.Create(FCurTok.Value, FCurTok.Span);
+      Advance;
+      Expect(tkRParen);
+      // Create a special call expression to represent the pattern
+      // This will be recognized in sema and turned into bindings
+      Result := TAstCall.Create(name, [arg], patSpan);
+      // Set the pattern binding flag using helper variable
+      TAstCall(Result).IsPatternBinding := True;
+    end
+    else
+    begin
+      // Complex expression: parse as regular expression
+      args := nil;
+      if not Check(tkRParen) then
+      begin
+        while True do
+        begin
+          arg := ParseExpr;
+          SetLength(args, Length(args) + 1);
+          args[High(args)] := arg;
+          if Accept(tkComma) then Continue;
+          Break;
+        end;
+      end;
+      Expect(tkRParen);
+      Result := TAstCall.Create(name, args, patSpan);
+    end;
+  end
+  else
+  begin
+    // Not a pattern (no opening paren), put identifier back
+    // This shouldn't happen as we already consumed it
+  end;
 end;
 
 function TParser.ParseVarLetCoDecl: TAstStmt;
