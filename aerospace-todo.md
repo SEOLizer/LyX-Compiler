@@ -9,7 +9,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ---
 
-## ✅ Abgeschlossene Tasks (80 von 113)
+## ✅ Abgeschlossene Tasks (81 von 113)
 
 ### 1. DO-178C Software Compliance
 
@@ -141,7 +141,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | ~~8~~ | ~~**Call-Graph: Statischer Aufrufgraph**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TCallGraph` Klasse, AST-Walking für Funktionsaufrufe, Rekursions-Erkennung via DFS, `--call-graph` CLI-Flag |
 | ~~9~~ | ~~**Map-File: Speicherlayout aller Symbole**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TMapFileGenerator` Klasse, `--map-file` CLI-Flag, Sections/Functions/Globals mit Adressen, Statistiken |
 | ~~10~~ | ~~**Result-Typ mit Pattern-Matching**~~ | ~~7.2, 10.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Parser `ParseMatchPattern`, AST `IsPatternBinding` Flag, Sema mit Pattern-Binding-Scope; Syntax: `match r { case Ok(v) => ..., case Err(e) => ... }` |
-| 11 | **MC/DC-Test-Suite für alle Backend-Pfade** | 10.4 | Mittel | Sicherstellen dass MC/DC-Instrumentierung in allen 7 Backends korrekt funktioniert |
+| ~~11~~ | ~~**MC/DC-Test-Suite für alle Backend-Pfade**~~ | ~~10.4~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `test_mcdc_coverage.pas`, 7/7 Backends bestanden (x86_64, x86_64_win64, arm64, macosx64, xtensa, win_arm64, riscv) |
 | 12 | **TrustZone (Cortex-M33+)** | 3.2 | Hoch | Secure/Non-Secure Trennung – nur relevant wenn M33 Target aktiv genutzt wird |
 
 ### 🟡 P2 – Mittel (nice-to-have für DAL C)
@@ -194,14 +194,14 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
 | **2. Spracherweiterungen** | 4 | 11 | 27% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
-| **4. Test-Abdeckung** | 8 | 0 | 100% |
+| **4. Test-Abdeckung** | 9 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
 | **6. Codegen-Sicherheit** | 2 | 7 | 22% |
 | **7. Laufzeit-Sicherheit** | 2 | 5 | 29% |
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
-| **10. Implementierungs-Tasks** | 6 | 8 | 43% |
-| **GESAMT** | **57** | **58** | **50%** |
+| **10. Implementierungs-Tasks** | 7 | 7 | 50% |
+| **GESAMT** | **59** | **56** | **51%** |
 
 ---
 
