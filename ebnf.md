@@ -157,6 +157,69 @@ fn sensor_read(): int64 {
   zukünftige WCET-Analyse, Stack-Verifizierung und Assembly-Listing-Annotierung zur Verfügung.
 - **DAL-A ohne `@critical`**: Warning (kein Fehler) – starke Empfehlung zur Markierung.
 
+## Range-Typen (v0.8.1 ✅ ABGESCHLOSSEN – aerospace-todo P1 #7)
+
+Integer-Typen mit eingeschlossenen Wertebereichen für DO-178C-Compliance.
+Compile-Time-Checks für Literale, Runtime-Checks für nicht-konstante Werte.
+
+### EBNF
+
+```ebnf
+TypeDecl     = "type" Ident "=" BaseIntType [ RangeClause ] ";" ;
+RangeClause  = "range" RangeBound ".." RangeBound ;
+RangeBound   = [ "-" ] IntLiteral ;
+BaseIntType  = "int8" | "int16" | "int32" | "int64"
+             | "uint8" | "uint16" | "uint32" | "uint64"
+             | "isize" | "usize" ;
+```
+
+### Semantik
+
+| Merkmal | Beschreibung |
+|---------|-------------|
+| Wertebereich | Inklusive Grenzen: `[Min..Max]` |
+| Basistyp | Muss ein Integer-Typ sein |
+| Compile-Time-Check | Literale außerhalb des Bereichs → `error: value N is out of range [Min..Max] for type T` |
+| Runtime-Check | Nicht-konstante Ausdrücke → IR-Vergleiche + `panic` bei Verletzung |
+| Redeclaration | Zweite Deklaration desselben Namens → Fehler |
+
+### Beispiele
+
+```lyx
+// Aeronautische Wertebereiche
+type Altitude  = int64 range -1000..60000;   // Meter über MSL
+type Speed     = int64 range 0..300;          // Knoten
+type Percent   = int64 range 0..100;          // Prozentwert
+
+// Compile-Time Fehler (Literal außerhalb Bereich):
+var alt: Altitude := 70000;   // error: value 70000 is out of range [-1000..60000] for type Altitude
+
+// Gültige Zuweisung:
+var alt: Altitude := 5000;    // OK
+
+// Runtime-Check (nicht-konstanter Wert):
+var spd: Speed := get_speed();  // Runtime: panic wenn get_speed() > 300
+```
+
+### Kombination mit Safety-Pragmas
+
+```lyx
+type Altitude = int64 range -1000..60000;
+
+@dal(A) @critical @wcet(50)
+fn set_target_altitude(alt: int64): int64 {
+  return 0;
+}
+```
+
+### Compiler-Verhalten
+
+- **Lexer**: `..` wird als Token `tkDotDot` erkannt (vor `.` und vor `...`).
+- **Parser**: `range Min..Max` wird nach dem Basistyp geparst; `ParseRangeInt` akzeptiert optionales `-` + `IntLit`.
+- **Sema (Compile-Time)**: Literale werden beim ersten Compile-Pass mit `RangeMin`/`RangeMax` verglichen.
+- **IR (Runtime)**: `EmitRangeCheck` erzeugt `cmpge` + `and` + `brfalse` + `panic`-Sequenz.
+- **IR-Optimierung**: Konstante Initialisierungen werden durch Constant Folding ggf. wegeliminiert.
+
 ### Verschachtelte Funktionen (Nested Functions)
 
 Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.

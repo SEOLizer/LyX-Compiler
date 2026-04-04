@@ -71,6 +71,8 @@ type
     function ParseParamList: TAstParamList;
     { Parses all @ attributes before 'fn' and returns energy level + safety pragmas }
     procedure ParseFuncAttrs(out energyLevel: TEnergyLevel; out safetyPragmas: TSafetyPragmas);
+    { Parses optional signed integer literal for range bounds }
+    function ParseRangeInt(out value: Int64): Boolean;
   public
     constructor Create(lexer: TLexer; diag: TDiagnostics);
     destructor Destroy; override;
@@ -595,6 +597,7 @@ var
   implInterfaces: TStringArray;
   curVisibility: TVisibility;
   constraintExpr: TAstExpr;
+  rMin, rMax: Int64; // for range type parsing
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -848,8 +851,64 @@ begin
       constraintExpr := ParseExpr; // ConstExpr restriction checked in sema
       Expect(tkRBrace);
     end;
-    Expect(tkSemicolon);
     Result := TAstTypeDecl.Create(name, declType, isPub, constraintExpr, FCurTok.Span);
+    // Parse optional range clause: ... range Min..Max  (aerospace-todo P1 #7)
+    // Must appear after the base type, before the semicolon
+    if Check(tkIdent) and (FCurTok.Value = 'range') then
+    begin
+      Advance; // consume 'range'
+      // Only integer base types are allowed for range
+      if not (declType in [atInt8, atInt16, atInt32, atInt64,
+                            atUInt8, atUInt16, atUInt32, atUInt64,
+                            atISize, atUSize]) then
+        FDiag.Error('range types require an integer base type (e.g. int64)', FCurTok.Span);
+      rMin := 0;
+      rMax := 0;
+      if ParseRangeInt(rMin) then
+      begin
+        if not Check(tkDotDot) then
+          FDiag.Error('expected ''..'' in range type', FCurTok.Span)
+        else
+          Advance; // consume '..'
+        if ParseRangeInt(rMax) then
+        begin
+          if rMin > rMax then
+            FDiag.Error('range lower bound must be <= upper bound', FCurTok.Span);
+          TAstTypeDecl(Result).HasRange := True;
+          TAstTypeDecl(Result).RangeMin := rMin;
+          TAstTypeDecl(Result).RangeMax := rMax;
+        end;
+      end;
+    end;
+    Expect(tkSemicolon);
+  end;
+end;
+
+function TParser.ParseRangeInt(out value: Int64): Boolean;
+{ Parst eine optionale Vorzeichen + IntLit für Range-Bounds.
+  Gibt True zurück wenn erfolgreich. }
+var
+  negative: Boolean;
+begin
+  Result := False;
+  negative := False;
+  if Check(tkMinus) then
+  begin
+    negative := True;
+    Advance;
+  end;
+  if not Check(tkIntLit) then
+  begin
+    FDiag.Error('expected integer literal in range bound', FCurTok.Span);
+    Exit;
+  end;
+  try
+    value := StrToInt64(FCurTok.Value);
+    if negative then value := -value;
+    Advance;
+    Result := True;
+  except
+    FDiag.Error('invalid integer literal in range bound', FCurTok.Span);
   end;
 end;
 
