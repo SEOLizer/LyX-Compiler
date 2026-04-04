@@ -16,7 +16,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 
 ---
 
-## ✅ Abgeschlossene Tasks (82 von 127)
+## ✅ Abgeschlossene Tasks (86 von 127)
 
 ### 1. DO-178C Software Compliance
 
@@ -168,10 +168,10 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | 13 | **Symbol-Table: DWARF** | 6.1 | Hoch | Section 8 |
 | ~~15~~ | ~~**MISRA: Keine rekursiven Funktionen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ (Stack-Safety) |
 | ~~16~~ | ~~**MISRA: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
-| 17 | **MISRA: Keine Pointer-Arithmetik** | 5.2 | Niedrig | Section 5.8 |
-| 18 | **MISRA: Switch-Cases vollständig** | 5.2 | Niedrig | - |
-| 19 | **MISRA: Maximale Funktionslänge (60)** | 5.2 | Niedrig | - |
-| 20 | **MISRA: Zyklomatische Komplexität (15)** | 5.2 | Mittel | Section 5.4 |
+| ~~17~~ | ~~**MISRA: Keine Pointer-Arithmetik**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W017 `lrPointerArithmetic`, erkennt p + n, p - n |
+| ~~18~~ | ~~**MISRA: Switch-Cases vollständig**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W018 `lrIncompleteSwitch`, warnt ohne default |
+| ~~19~~ | ~~**MISRA: Maximale Funktionslänge (60)**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W019 `lrFunctionTooLong`, Statement-Zählung |
+| ~~20~~ | ~~**MISRA: Zyklomatische Komplexität (15)**~~ | ~~5.2~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Linter W020 `lrComplexFunction`, if/while/for/switch-Zählung |
 | 53 | **WCET-Schätzung** | 10.2 | Hoch | Section 2.1 |
 | 54 | **Stack-Analyse über Call-Grenzen** | 10.2 | Mittel | Section 2.1 |
 | 55 | **Design by Contract (pre/post)** | 3 | Hoch | Section 2.3 |
@@ -218,7 +218,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | Kategorie | Erledigt | Offen | Fortschritt |
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
-| **2. Spracherweiterungen** | 5 | 13 | 28% |
+| **2. Spracherweiterungen** | 9 | 9 | 50% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 9 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
@@ -228,7 +228,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 7 | 11 | 39% |
 | **11. Aerospace Extension (NEW)** | 1 | 13 | 7% |
-| **GESAMT** | **82** | **45** | **65%** |
+| **GESAMT** | **86** | **41** | **68%** |
 
 ---
 
