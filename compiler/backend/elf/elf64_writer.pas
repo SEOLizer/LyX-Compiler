@@ -7,6 +7,8 @@ uses
   SysUtils, Classes, bytes, backend_types;
 
 procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; entryVA: UInt64);
+procedure WriteElf64WithMetaSafe(const filename: string; const codeBuf, dataBuf: TByteBuffer;
+  entryVA: UInt64; const integrity: TIntegrityAttr);
 procedure WriteDynamicElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64; const externSymbols: TExternalSymbolArray;
   const neededLibs: array of string);
@@ -303,6 +305,271 @@ begin
       elfHeader.Free;
     end;
   finally
+    shdrs.Free;
+    shStrTab.Free;
+  end;
+end;
+
+// ============================================================
+// CRC32 (IEEE 802.3, polynomial 0xEDB88320) for .meta_safe hashes
+// ============================================================
+function Crc32Buffer(const buf: TByteBuffer): UInt32;
+const
+  POLY: UInt32 = $EDB88320;
+var
+  crc: UInt32;
+  i, j: Integer;
+  b: Byte;
+  p: PByte;
+begin
+  crc := $FFFFFFFF;
+  p := PByte(buf.GetBuffer);
+  for i := 0 to buf.Size - 1 do
+  begin
+    b := p^;
+    Inc(p);
+    for j := 0 to 7 do
+    begin
+      if ((crc xor b) and 1) <> 0 then
+        crc := (crc shr 1) xor POLY
+      else
+        crc := crc shr 1;
+      b := b shr 1;
+    end;
+  end;
+  Result := crc xor $FFFFFFFF;
+end;
+
+// ============================================================
+// Build .meta_safe section buffer (aerospace-todo P0 #44)
+//
+// Layout:
+//   [0..7]     code_start_va  (uint64)
+//   [8..15]    code_end_va    (uint64)
+//   [16..19]   mode           (uint32): 1=lockstep, 2=scrubbed, 3=hw_ecc
+//   [20..23]   interval_ms    (uint32)
+//   [24..31]   recovery_ptr   (uint64): Golden Image VA (0 = not set)
+//   [32..35]   hash_copy_1    (uint32): CRC32 of code
+//   [36..4127] padding_1      (4092 bytes) — 4KB separation
+//   [4128..4131] hash_copy_2  (uint32): CRC32 of code
+//   [4132..8223] padding_2    (4092 bytes) — 4KB separation
+//   [8224..8227] hash_copy_3  (uint32): CRC32 of code
+//   [8228..8231] padding_3    (4 bytes alignment)
+//   Total: 8232 bytes
+// ============================================================
+function BuildMetaSafeSection(const codeBuf: TByteBuffer;
+  codeStartVA, codeEndVA: UInt64; const integrity: TIntegrityAttr): TByteBuffer;
+var
+  sec: TByteBuffer;
+  hashCrc: UInt32;
+  modeVal: UInt32;
+  i: Integer;
+begin
+  sec := TByteBuffer.Create;
+
+  // Compute CRC32 hash of the code buffer
+  hashCrc := Crc32Buffer(codeBuf);
+
+  // Integrity mode → numeric value
+  case integrity.Mode of
+    imSoftwareLockstep: modeVal := 1;
+    imScrubbed:         modeVal := 2;
+    imHardwareEcc:      modeVal := 3;
+  else
+    modeVal := 0;
+  end;
+
+  // Header (32 bytes)
+  sec.WriteU64LE(codeStartVA);            // code_start_va
+  sec.WriteU64LE(codeEndVA);              // code_end_va
+  sec.WriteU32LE(modeVal);                // mode
+  sec.WriteU32LE(UInt32(integrity.Interval)); // interval_ms
+  sec.WriteU64LE(0);                      // recovery_ptr (0 = not set)
+
+  // Hash copy 1
+  sec.WriteU32LE(hashCrc);
+  for i := 1 to 4092 do sec.WriteU8(0);  // 4092 bytes padding → 4KB gap
+
+  // Hash copy 2
+  sec.WriteU32LE(hashCrc);
+  for i := 1 to 4092 do sec.WriteU8(0);  // 4092 bytes padding → 4KB gap
+
+  // Hash copy 3
+  sec.WriteU32LE(hashCrc);
+  sec.WriteU32LE(0);                      // 4 bytes alignment padding
+
+  Result := sec;
+end;
+
+// ============================================================
+// Static ELF writer with .meta_safe section (aerospace P0 #44)
+// ============================================================
+procedure WriteElf64WithMetaSafe(const filename: string; const codeBuf, dataBuf: TByteBuffer;
+  entryVA: UInt64; const integrity: TIntegrityAttr);
+var
+  pageSize: UInt64 = 4096;
+  codeOffset: UInt64;
+  codeSize: UInt64;
+  fileBuf: TFileStream;
+  elfHeader: TByteBuffer;
+  phdr: TByteBuffer;
+  filesz, memsz: UInt64;
+  baseVA: UInt64;
+  // Section headers
+  shStrTab: TByteBuffer;
+  shdrs: TByteBuffer;
+  metaSafeSec: TByteBuffer;
+  shStrTabOff, shdrsOff, metaSafeOff: UInt64;
+  shStrTabSize, metaSafeSize: UInt64;
+  numShdrs: Integer;
+  shdrSize: UInt64 = 64;
+  codeStartVA, codeEndVA: UInt64;
+  // .shstrtab string offsets
+  SHStr_text_off:     Integer;
+  SHStr_shstrtab_off: Integer;
+  SHStr_metasafe_off: Integer;
+begin
+  baseVA := $400000;
+  codeSize := codeBuf.Size;
+  codeOffset := pageSize;
+  codeStartVA := baseVA + codeOffset;
+  codeEndVA   := codeStartVA + codeSize;
+
+  // Build .meta_safe data
+  metaSafeSec := BuildMetaSafeSection(codeBuf, codeStartVA, codeEndVA, integrity);
+  metaSafeSize := metaSafeSec.Size;
+
+  // Build .shstrtab with 4 names: \0 .text .shstrtab .meta_safe
+  shStrTab := TByteBuffer.Create;
+  shdrs := TByteBuffer.Create;
+  try
+    shStrTab.WriteU8(0);                          // offset 0: empty
+    SHStr_text_off := shStrTab.Size;
+    shStrTab.WriteBytes([Ord('.'),Ord('t'),Ord('e'),Ord('x'),Ord('t'),0]); // ".text\0"
+    SHStr_shstrtab_off := shStrTab.Size;
+    shStrTab.WriteBytes([Ord('.'),Ord('s'),Ord('h'),Ord('s'),Ord('t'),
+      Ord('r'),Ord('t'),Ord('a'),Ord('b'),0]);    // ".shstrtab\0"
+    SHStr_metasafe_off := shStrTab.Size;
+    shStrTab.WriteBytes([Ord('.'),Ord('m'),Ord('e'),Ord('t'),Ord('a'),Ord('_'),
+      Ord('s'),Ord('a'),Ord('f'),Ord('e'),0]);    // ".meta_safe\0"
+    shStrTabSize := shStrTab.Size;
+
+    // Layout:
+    //   codeOffset (0x1000) : code
+    //   metaSafeOff         : .meta_safe data
+    //   shStrTabOff         : .shstrtab
+    //   shdrsOff            : section headers
+    metaSafeOff := codeOffset + codeSize;
+    if (metaSafeOff mod 8) <> 0 then
+      metaSafeOff := metaSafeOff + (8 - (metaSafeOff mod 8));
+
+    shStrTabOff := metaSafeOff + metaSafeSize;
+    if (shStrTabOff mod 8) <> 0 then
+      shStrTabOff := shStrTabOff + (8 - (shStrTabOff mod 8));
+
+    shdrsOff := shStrTabOff + shStrTabSize;
+    if (shdrsOff mod 8) <> 0 then
+      shdrsOff := shdrsOff + (8 - (shdrsOff mod 8));
+
+    numShdrs := 4; // NULL + .text + .shstrtab + .meta_safe
+
+    // SHdr 0: NULL
+    shdrs.WriteU32LE(0); shdrs.WriteU32LE(0); shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0); shdrs.WriteU64LE(0); shdrs.WriteU64LE(0);
+    shdrs.WriteU32LE(0); shdrs.WriteU32LE(0); shdrs.WriteU64LE(0); shdrs.WriteU64LE(0);
+
+    // SHdr 1: .text
+    shdrs.WriteU32LE(SHStr_text_off);          // sh_name
+    shdrs.WriteU32LE(SHT_PROGBITS);            // sh_type
+    shdrs.WriteU64LE(SHF_ALLOC or SHF_EXECINSTR); // sh_flags
+    shdrs.WriteU64LE(codeStartVA);             // sh_addr
+    shdrs.WriteU64LE(codeOffset);              // sh_offset
+    shdrs.WriteU64LE(codeSize);                // sh_size
+    shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(16);                      // sh_addralign
+    shdrs.WriteU64LE(0);                       // sh_entsize
+
+    // SHdr 2: .shstrtab
+    shdrs.WriteU32LE(SHStr_shstrtab_off);      // sh_name
+    shdrs.WriteU32LE(SHT_STRTAB);             // sh_type
+    shdrs.WriteU64LE(0);                       // sh_flags
+    shdrs.WriteU64LE(0);                       // sh_addr
+    shdrs.WriteU64LE(shStrTabOff);             // sh_offset
+    shdrs.WriteU64LE(shStrTabSize);            // sh_size
+    shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);                       // sh_addralign
+    shdrs.WriteU64LE(0);
+
+    // SHdr 3: .meta_safe (PROGBITS, not loaded into memory at runtime)
+    shdrs.WriteU32LE(SHStr_metasafe_off);      // sh_name
+    shdrs.WriteU32LE(SHT_PROGBITS);           // sh_type
+    shdrs.WriteU64LE(0);                       // sh_flags (not SHF_ALLOC — metadata only)
+    shdrs.WriteU64LE(0);                       // sh_addr  (not mapped)
+    shdrs.WriteU64LE(metaSafeOff);             // sh_offset
+    shdrs.WriteU64LE(metaSafeSize);            // sh_size
+    shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(8);                       // sh_addralign
+    shdrs.WriteU64LE(0);
+
+    elfHeader := TByteBuffer.Create;
+    phdr := TByteBuffer.Create;
+    try
+      // ELF magic + class/data/version/OS-ABI
+      elfHeader.WriteBytes([$7F, Ord('E'), Ord('L'), Ord('F')]);
+      elfHeader.WriteU8(2); elfHeader.WriteU8(1); elfHeader.WriteU8(1); elfHeader.WriteU8(0);
+      elfHeader.WriteU8(0); elfHeader.WriteBytesFill(7, 0);
+
+      elfHeader.WriteU16LE(2);   // ET_EXEC
+      elfHeader.WriteU16LE(62);  // EM_X86_64
+      elfHeader.WriteU32LE(1);   // e_version
+      elfHeader.WriteU64LE(entryVA);           // e_entry
+      elfHeader.WriteU64LE(64);                // e_phoff
+      elfHeader.WriteU64LE(shdrsOff);          // e_shoff
+      elfHeader.WriteU32LE(0);                 // e_flags
+      elfHeader.WriteU16LE(64);               // e_ehsize
+      elfHeader.WriteU16LE(56);               // e_phentsize
+      elfHeader.WriteU16LE(1);                // e_phnum
+      elfHeader.WriteU16LE(shdrSize);         // e_shentsize
+      elfHeader.WriteU16LE(numShdrs);         // e_shnum
+      elfHeader.WriteU16LE(2);               // e_shstrndx (.shstrtab = idx 2)
+
+      // PT_LOAD covering code (and meta_safe + shstrtab + shdrs)
+      phdr.WriteU32LE(1);                    // PT_LOAD
+      phdr.WriteU32LE(4 or 2 or 1);         // PF_R|PF_W|PF_X
+      phdr.WriteU64LE(codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+      filesz := shdrsOff - codeOffset + UInt64(shdrs.Size);
+      memsz  := filesz;
+      phdr.WriteU64LE(filesz);
+      phdr.WriteU64LE(memsz);
+      phdr.WriteU64LE(pageSize);
+
+      fileBuf := TFileStream.Create(filename, fmCreate);
+      try
+        fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
+        fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
+        while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
+        if codeSize > 0 then
+          fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+        // .meta_safe section
+        while fileBuf.Position < Int64(metaSafeOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(metaSafeSec.GetBuffer^, metaSafeSize);
+        // .shstrtab
+        while fileBuf.Position < Int64(shStrTabOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
+        // section headers
+        while fileBuf.Position < Int64(shdrsOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shdrs.GetBuffer^, shdrs.Size);
+      finally
+        fileBuf.Free;
+      end;
+    finally
+      phdr.Free;
+      elfHeader.Free;
+    end;
+  finally
+    metaSafeSec.Free;
     shdrs.Free;
     shStrTab.Free;
   end;

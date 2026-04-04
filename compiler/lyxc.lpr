@@ -842,8 +842,16 @@ begin
                else
                begin
                  entryVA := $400000 + 4096;
-                 WriteLn('Generating static ELF (no external symbols)');
-                 WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+                 if module.UnitIntegrity.Mode <> imNone then
+                 begin
+                   WriteLn('Generating static ELF with .meta_safe section');
+                   WriteElf64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
+                 end
+                 else
+                 begin
+                   WriteLn('Generating static ELF (no external symbols)');
+                   WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+                 end;
                end;
  
                 // Energy statistics output
@@ -894,8 +902,16 @@ begin
                 end
                 else
                 begin
-                  WriteLn('Generating static ELF for Linux ARM64');
-                  WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+                  if module.UnitIntegrity.Mode <> imNone then
+                  begin
+                    WriteLn('Generating static ELF for Linux ARM64 with .meta_safe section');
+                    WriteElf64ARM64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
+                  end
+                  else
+                  begin
+                    WriteLn('Generating static ELF for Linux ARM64');
+                    WriteElf64ARM64(outputFile, codeBuf, dataBuf, entryVA);
+                  end;
                 end;
  
                // Energy statistics output
@@ -1058,8 +1074,16 @@ begin
                    WriteLn('External symbols found: ', Length(externSymbols), ' (will be ignored for now)');
                  end;
 
-                 WriteLn('Generating static ELF64 for RISC-V RV64GC');
-                 WriteElf64RISCV(outputFile, codeBuf, dataBuf, entryVA);
+                 if module.UnitIntegrity.Mode <> imNone then
+                 begin
+                   WriteLn('Generating static ELF64 for RISC-V RV64GC with .meta_safe section');
+                   WriteElf64RISCVWithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
+                 end
+                 else
+                 begin
+                   WriteLn('Generating static ELF64 for RISC-V RV64GC');
+                   WriteElf64RISCV(outputFile, codeBuf, dataBuf, entryVA);
+                 end;
 
                  FpChmod(PChar(outputFile), 493);
                  WriteLn('Wrote ', outputFile, ' (ELF64 for RISC-V RV64GC)');
