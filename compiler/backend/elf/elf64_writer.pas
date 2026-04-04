@@ -9,6 +9,8 @@ uses
 procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; entryVA: UInt64);
 procedure WriteElf64WithMetaSafe(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64; const integrity: TIntegrityAttr);
+procedure WriteElf64WithBuildId(const filename: string; const codeBuf, dataBuf: TByteBuffer;
+  entryVA: UInt64; const sourceHash: UInt32);
 
 // CRC32 (IEEE 802.3, polynomial 0xEDB88320) for .meta_safe hashes and TMR
 function Crc32Buffer(const buf: TByteBuffer): UInt32;
@@ -1424,6 +1426,259 @@ begin
   finally
     libNames.Free;
     symNames.Free;
+  end;
+end;
+
+// ============================================================
+// Write ELF64 with .lyx_build section (aerospace-todo P1 #26)
+//
+// Configuration Management: Embeds build identification metadata
+// into the ELF binary for DO-178C compliance.
+//
+// .lyx_build section layout (64 bytes total):
+//   [0..15]   compiler_version  (16 bytes, null-padded string)
+//   [16..31]  build_date        (16 bytes, null-padded string, ISO 8601)
+//   [32..35]  source_crc32      (uint32): CRC32 of source file
+//   [36..39]  target_arch       (uint32): 1=x86_64, 2=ARM64, 3=RISC-V
+//   [40..43]  tql_level         (uint32): DO-178C TQL level
+//   [44..47]  feature_flags     (uint32): bitfield of enabled features
+//   [48..63]  reserved          (16 bytes, zero-padded)
+// ============================================================
+procedure WriteElf64WithBuildId(const filename: string; const codeBuf, dataBuf: TByteBuffer;
+  entryVA: UInt64; const sourceHash: UInt32);
+var
+  fileBuf: TMemoryStream;
+  hdr: TByteBuffer;
+  phdr: TByteBuffer;
+  shStrTab, shdrs: TByteBuffer;
+  codeSize, dataBufSize: UInt64;
+  codeOffset, dataOffset, buildIdOffset, shStrTabOff, shdrsOff: UInt64;
+  baseVA, buildIdVA: UInt64;
+  filesz, memsz: UInt64;
+  compilerVersion, buildDate: string;
+  i: Integer;
+  targetArch, tqlLevel, featureFlags: UInt32;
+  // Section name string table offsets
+  SHStr_null_off, SHStr_text_off, SHStr_data_off, SHStr_buildid_off,
+  SHStr_shstrtab_off: Integer;
+begin
+  baseVA := $400000;
+  codeOffset := $1000;  // 4096
+
+  codeSize := codeBuf.Size;
+  if Assigned(dataBuf) then
+    dataBufSize := dataBuf.Size
+  else
+    dataBufSize := 0;
+
+  // Layout: ELF header + phdr + padding + code + data + .lyx_build + shstrtab + section headers
+  dataOffset := codeOffset + codeSize;
+  if (dataOffset mod 8) <> 0 then
+    dataOffset := dataOffset + (8 - (dataOffset mod 8));
+
+  buildIdOffset := dataOffset + dataBufSize;
+  if (buildIdOffset mod 8) <> 0 then
+    buildIdOffset := buildIdOffset + (8 - (buildIdOffset mod 8));
+  buildIdVA := baseVA + buildIdOffset;
+
+  shStrTabOff := buildIdOffset + 64;  // .lyx_build is 64 bytes
+  if (shStrTabOff mod 8) <> 0 then
+    shStrTabOff := shStrTabOff + (8 - (shStrTabOff mod 8));
+
+  // Build section name string table
+  shStrTab := TByteBuffer.Create;
+  try
+    SHStr_null_off := 0;
+    shStrTab.WriteU8(0);  // null
+
+    SHStr_text_off := shStrTab.Size;
+    WriteStringToBuffer(shStrTab, '.text');
+    shStrTab.WriteU8(0);
+
+    SHStr_data_off := shStrTab.Size;
+    WriteStringToBuffer(shStrTab, '.data');
+    shStrTab.WriteU8(0);
+
+    SHStr_buildid_off := shStrTab.Size;
+    WriteStringToBuffer(shStrTab, '.lyx_build');
+    shStrTab.WriteU8(0);
+
+    SHStr_shstrtab_off := shStrTab.Size;
+    WriteStringToBuffer(shStrTab, '.shstrtab');
+    shStrTab.WriteU8(0);
+
+    shStrTabOff := shStrTabOff;  // already computed
+    shdrsOff := shStrTabOff + shStrTab.Size;
+    if (shdrsOff mod 8) <> 0 then
+      shdrsOff := shdrsOff + (8 - (shdrsOff mod 8));
+
+    // Build metadata strings
+    compilerVersion := 'lyxc 0.9.0-aerospace';
+    buildDate := FormatDateTime('yyyy-mm-ddThh:nn:ss', Now);
+
+    // Write ELF file
+    fileBuf := TMemoryStream.Create;
+    try
+      // ELF Header (64 bytes)
+      hdr := TByteBuffer.Create;
+      try
+        // e_ident
+        hdr.WriteU8($7F); hdr.WriteU8(Ord('E')); hdr.WriteU8(Ord('L')); hdr.WriteU8(Ord('F'));
+        hdr.WriteU8(2);   // EI_CLASS: ELFCLASS64
+        hdr.WriteU8(1);   // EI_DATA: ELFDATA2LSB
+        hdr.WriteU8(1);   // EI_VERSION
+        hdr.WriteU8(0);   // EI_OSABI: ELFOSABI_NONE
+        for i := 0 to 7 do hdr.WriteU8(0);  // padding
+        hdr.WriteU16LE(2);    // e_type: ET_EXEC
+        hdr.WriteU16LE($3E);  // e_machine: EM_X86_64
+        hdr.WriteU32LE(1);    // e_version
+        hdr.WriteU64LE(entryVA);  // e_entry
+        hdr.WriteU64LE(64);   // e_phoff
+        hdr.WriteU64LE(shdrsOff);  // e_shoff
+        hdr.WriteU32LE(0);    // e_flags
+        hdr.WriteU16LE(64);   // e_ehsize
+        hdr.WriteU16LE(56);   // e_phentsize
+        hdr.WriteU16LE(1);    // e_phnum: 1 PT_LOAD
+        hdr.WriteU16LE(64);   // e_shentsize
+        hdr.WriteU16LE(5);    // e_shnum: NULL + .text + .data + .lyx_build + .shstrtab
+        hdr.WriteU16LE(4);    // e_shstrndx: index of .shstrtab
+        fileBuf.WriteBuffer(hdr.GetBuffer^, hdr.Size);
+      finally
+        hdr.Free;
+      end;
+
+      // Program Header (56 bytes)
+      phdr := TByteBuffer.Create;
+      try
+        filesz := shdrsOff - codeOffset + 5 * 64;  // 5 section headers
+        memsz := filesz;
+        phdr.WriteU32LE(1);     // p_type: PT_LOAD
+        phdr.WriteU32LE(5);     // p_flags: PF_R | PF_X
+        phdr.WriteU64LE(codeOffset);  // p_offset
+        phdr.WriteU64LE(baseVA + codeOffset);  // p_vaddr
+        phdr.WriteU64LE(baseVA + codeOffset);  // p_paddr
+        phdr.WriteU64LE(filesz);  // p_filesz
+        phdr.WriteU64LE(memsz);   // p_memsz
+        phdr.WriteU64LE($1000);   // p_align
+        fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
+      finally
+        phdr.Free;
+      end;
+
+      // Pad to code offset
+      while fileBuf.Size < codeOffset do
+        fileBuf.WriteByte(0);
+
+      // Code
+      if codeSize > 0 then
+        fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+
+      // Data
+      if dataBufSize > 0 then
+        fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataBufSize);
+
+      // .lyx_build section (64 bytes)
+      // compiler_version (16 bytes)
+      for i := 1 to 16 do
+        if i <= Length(compilerVersion) then
+          fileBuf.WriteByte(Byte(compilerVersion[i]))
+        else
+          fileBuf.WriteByte(0);
+      // build_date (16 bytes)
+      for i := 1 to 16 do
+        if i <= Length(buildDate) then
+          fileBuf.WriteByte(Byte(buildDate[i]))
+        else
+          fileBuf.WriteByte(0);
+      // source_crc32 (4 bytes)
+      fileBuf.WriteBuffer(sourceHash, 4);
+      // target_arch (4 bytes): 1 = x86_64
+      targetArch := 1;
+      fileBuf.WriteBuffer(targetArch, 4);
+      // tql_level (4 bytes): 5 = TQL-5
+      tqlLevel := 5;
+      fileBuf.WriteBuffer(tqlLevel, 4);
+      // feature_flags (4 bytes): bit 0 = integrity, bit 1 = determinism
+      featureFlags := 3;
+      fileBuf.WriteBuffer(featureFlags, 4);
+      // reserved (16 bytes)
+      for i := 0 to 15 do
+        fileBuf.WriteByte(0);
+
+      // Pad to shstrtab offset
+      while fileBuf.Size < shStrTabOff do
+        fileBuf.WriteByte(0);
+
+      // .shstrtab
+      fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTab.Size);
+
+      // Pad to section headers
+      while fileBuf.Size < shdrsOff do
+        fileBuf.WriteByte(0);
+
+      // Section Headers (5 entries)
+      shdrs := TByteBuffer.Create;
+      try
+        // SHdr 0: NULL
+        for i := 0 to 63 do shdrs.WriteU8(0);
+
+        // SHdr 1: .text
+        shdrs.WriteU32LE(SHStr_text_off);
+        shdrs.WriteU32LE(SHT_PROGBITS);
+        shdrs.WriteU64LE(SHF_ALLOC or SHF_EXECINSTR);
+        shdrs.WriteU64LE(baseVA + codeOffset);
+        shdrs.WriteU64LE(codeOffset);
+        shdrs.WriteU64LE(codeSize);
+        shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+        shdrs.WriteU64LE(16);
+        shdrs.WriteU64LE(0);
+
+        // SHdr 2: .data
+        shdrs.WriteU32LE(SHStr_data_off);
+        shdrs.WriteU32LE(SHT_PROGBITS);
+        shdrs.WriteU64LE(SHF_ALLOC or SHF_WRITE);
+        shdrs.WriteU64LE(baseVA + dataOffset);
+        shdrs.WriteU64LE(dataOffset);
+        shdrs.WriteU64LE(dataBufSize);
+        shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+        shdrs.WriteU64LE(8);
+        shdrs.WriteU64LE(0);
+
+        // SHdr 3: .lyx_build (aerospace-todo P1 #26)
+        shdrs.WriteU32LE(SHStr_buildid_off);
+        shdrs.WriteU32LE(SHT_PROGBITS);
+        shdrs.WriteU64LE(SHF_ALLOC);  // readable at runtime
+        shdrs.WriteU64LE(buildIdVA);
+        shdrs.WriteU64LE(buildIdOffset);
+        shdrs.WriteU64LE(64);  // 64 bytes
+        shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+        shdrs.WriteU64LE(8);
+        shdrs.WriteU64LE(0);
+
+        // SHdr 4: .shstrtab
+        shdrs.WriteU32LE(SHStr_shstrtab_off);
+        shdrs.WriteU32LE(SHT_STRTAB);
+        shdrs.WriteU64LE(0);
+        shdrs.WriteU64LE(0);
+        shdrs.WriteU64LE(shStrTabOff);
+        shdrs.WriteU64LE(shStrTab.Size);
+        shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
+        shdrs.WriteU64LE(1);
+        shdrs.WriteU64LE(0);
+
+        fileBuf.WriteBuffer(shdrs.GetBuffer^, shdrs.Size);
+      finally
+        shdrs.Free;
+      end;
+
+      // Write to file
+      fileBuf.Position := 0;
+      fileBuf.SaveToFile(filename);
+    finally
+      fileBuf.Free;
+    end;
+  finally
+    shStrTab.Free;
   end;
 end;
 
