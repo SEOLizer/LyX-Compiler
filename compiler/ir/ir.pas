@@ -151,6 +151,7 @@ type
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
     EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
+    SafetyPragmas: TSafetyPragmas; // Safety pragmas: @dal, @critical, @wcet, @stack_limit
     ReturnStructSize: Integer; // size in bytes if function returns struct, 0 otherwise
     // Closure support
     ParentFuncName: string; // enclosing function name (if nested)
@@ -216,6 +217,10 @@ begin
   LocalCount := 0;
   ParamCount := 0;
   EnergyLevel := eelNone; // eelNone = use global level
+  SafetyPragmas.DALLevel   := dalNone;
+  SafetyPragmas.IsCritical := False;
+  SafetyPragmas.WCETBudget := 0;
+  SafetyPragmas.StackLimit := 0;
 end;
 
 destructor TIRFunction.Destroy;

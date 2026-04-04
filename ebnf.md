@@ -87,6 +87,76 @@ FnDecl = [ EnergyAttr ] "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
 NestedFnDecl = "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
 ```
 
+---
+
+## Safety-Pragmas (v0.8.0 ✅ ABGESCHLOSSEN – aerospace-todo P1 #6)
+
+Funktionen können mit Safety-Annotationen für DO-178C-Compliance versehen werden.
+Mehrere `@`-Attribute können in beliebiger Reihenfolge vor `fn` stehen.
+
+### EBNF
+
+```ebnf
+FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr ;
+EnergyAttr = "@energy"      "(" IntLiteral ")" ;   // 1..5
+DALAttr    = "@dal"         "(" DALLevel   ")" ;   // A | B | C | D
+CriticalAttr = "@critical" ;                        // kein Argument
+WCETAttr   = "@wcet"        "(" IntLiteral ")" ;   // μs > 0
+StackLimitAttr = "@stack_limit" "(" IntLiteral ")" ; // Bytes > 0
+
+DALLevel   = "A" | "B" | "C" | "D" ;
+
+FnDecl = { FuncAttr } "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block ;
+```
+
+### Semantik
+
+| Pragma | Bedeutung | Validierung |
+|--------|-----------|-------------|
+| `@dal(A)` | DO-178C DAL A (höchstes Sicherheitslevel) | `@critical` wird empfohlen (Warning) |
+| `@dal(B)` | DO-178C DAL B | — |
+| `@dal(C)` | DO-178C DAL C | — |
+| `@dal(D)` | DO-178C DAL D (niedrigstes) | — |
+| `@critical` | Sicherheitskritische Funktion | Nicht auf `extern fn` erlaubt |
+| `@wcet(N)` | WCET-Budget in Mikrosekunden | N > 0; nicht auf `extern fn` erlaubt |
+| `@stack_limit(N)` | Maximale Stack-Nutzung in Bytes | N > 0; nicht auf `extern fn` erlaubt |
+
+### Beispiele
+
+```lyx
+// Einfache Annotationen
+@dal(A) @critical @wcet(100) @stack_limit(512)
+fn autopilot_update(): int64 {
+  return 0;
+}
+
+// DAL-B mit WCET-Budget
+@dal(B) @wcet(1000)
+fn fuel_monitor(): int64 {
+  return 1;
+}
+
+// Kombiniert mit @energy
+@energy(3) @dal(C)
+fn sensor_read(): int64 {
+  return 42;
+}
+
+// Mehrere Sicherheitslevel in einem Programm
+@dal(A) @critical @wcet(50)  fn engine_cutoff():   int64 { return 0; }
+@dal(B) @wcet(200)           fn navigation():      int64 { return 1; }
+@dal(C)                      fn cabin_pressure():  int64 { return 2; }
+@dal(D)                      fn log_event():       int64 { return 3; }
+```
+
+### Compiler-Verhalten
+
+- **Parsing**: Alle Attribute werden vor dem `fn`-Keyword gelesen (Reihenfolge beliebig).
+- **Sema-Check**: Ungültige Kombinationen werden als Error oder Warning gemeldet.
+- **IR-Propagation**: `SafetyPragmas` werden in `TIRFunction` übertragen und stehen für
+  zukünftige WCET-Analyse, Stack-Verifizierung und Assembly-Listing-Annotierung zur Verfügung.
+- **DAL-A ohne `@critical`**: Warning (kein Fehler) – starke Empfehlung zur Markierung.
+
 ### Verschachtelte Funktionen (Nested Functions)
 
 Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.

@@ -69,7 +69,8 @@ type
     function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
     function ParseType: TAurumType;
     function ParseParamList: TAstParamList;
-    function ParseEnergyAttr: TEnergyLevel; // Energy-Aware-Compiling Attribut parsen
+    { Parses all @ attributes before 'fn' and returns energy level + safety pragmas }
+    procedure ParseFuncAttrs(out energyLevel: TEnergyLevel; out safetyPragmas: TSafetyPragmas);
   public
     constructor Create(lexer: TLexer; diag: TDiagnostics);
     destructor Destroy; override;
@@ -391,6 +392,7 @@ var
   body: TAstBlock;
   arrLen: Integer;
   energyLevel: TEnergyLevel;
+  safetyPragmas: TSafetyPragmas;
   tupleElem: TAurumType;
   tupleTypes: array of TAurumType;
   dummyLen: Integer;
@@ -399,8 +401,8 @@ var
   savedTypeParams: TStringArray;
   typeParams: TStringArray;
 begin
-  // @energy(level) Attribut parsen, falls vorhanden
-  energyLevel := ParseEnergyAttr;
+  // Parse all @ attributes before 'fn' (@energy, @dal, @critical, @wcet, @stack_limit)
+  ParseFuncAttrs(energyLevel, safetyPragmas);
 
   // fn
   Expect(tkFn);
@@ -470,6 +472,7 @@ begin
   Result := TAstFuncDecl.Create(name, params, retType, body, FCurTok.Span, isPub);
   Result.ReturnTypeName := retTypeName;
   Result.EnergyLevel := energyLevel;
+  Result.SafetyPragmas := safetyPragmas;
   Result.TupleReturnTypes := tupleTypes;
   Result.TypeParams := typeParams;
   // Restore type params context after parsing the function
@@ -2860,47 +2863,138 @@ begin
   Result := params;
 end;
 
-{ Parst @energy(level) Attribut, falls vorhanden }
-function TParser.ParseEnergyAttr: TEnergyLevel;
+{ Parses all @ attributes before 'fn': @energy, @dal, @critical, @wcet, @stack_limit }
+procedure TParser.ParseFuncAttrs(out energyLevel: TEnergyLevel; out safetyPragmas: TSafetyPragmas);
 var
+  attrName: string;
   level: Integer;
+  dalChar: string;
+  budget: Int64;
 begin
-  Result := eelNone; // Standard: verwende globales Level
-  if not Check(tkAt) then
-    Exit;
-  
-  // @energy
-  Advance;
-  if not Check(tkIdent) or (FCurTok.Value <> 'energy') then
+  energyLevel := eelNone;
+  safetyPragmas.DALLevel   := dalNone;
+  safetyPragmas.IsCritical := False;
+  safetyPragmas.WCETBudget := 0;
+  safetyPragmas.StackLimit := 0;
+
+  // Loop: consume zero or more '@attrName[(args)]' sequences
+  while Check(tkAt) do
   begin
-    FDiag.Error('expected @energy attribute', FCurTok.Span);
-    Exit;
-  end;
-  Advance;
-  
-  // (level)
-  Expect(tkLParen);
-  if Check(tkIntLit) then
-  begin
-    try
-      level := StrToInt(FCurTok.Value);
-      if (level < 1) or (level > 5) then
-      begin
-        FDiag.Error('energy level must be between 1 and 5', FCurTok.Span);
-        level := 3;
-      end;
-      Result := TEnergyLevel(level);
-    except
-      FDiag.Error('invalid energy level', FCurTok.Span);
-      Result := eelMedium;
+    Advance; // consume '@'
+
+    if not Check(tkIdent) then
+    begin
+      FDiag.Error('expected attribute name after ''@''', FCurTok.Span);
+      Break;
     end;
-    Advance;
-  end
-  else
-  begin
-    FDiag.Error('expected energy level (1-5)', FCurTok.Span);
-  end;
-  Expect(tkRParen);
+    attrName := FCurTok.Value;
+    Advance; // consume attribute name
+
+    // --- @energy(1..5) ---
+    if attrName = 'energy' then
+    begin
+      Expect(tkLParen);
+      if Check(tkIntLit) then
+      begin
+        try
+          level := StrToInt(FCurTok.Value);
+          if (level < 1) or (level > 5) then
+          begin
+            FDiag.Error('energy level must be between 1 and 5', FCurTok.Span);
+            level := 3;
+          end;
+          energyLevel := TEnergyLevel(level);
+        except
+          FDiag.Error('invalid energy level', FCurTok.Span);
+          energyLevel := eelMedium;
+        end;
+        Advance;
+      end
+      else
+        FDiag.Error('expected energy level (1-5)', FCurTok.Span);
+      Expect(tkRParen);
+    end
+
+    // --- @dal(A|B|C|D) ---
+    else if attrName = 'dal' then
+    begin
+      Expect(tkLParen);
+      if Check(tkIdent) then
+      begin
+        dalChar := FCurTok.Value;
+        if dalChar = 'A' then
+          safetyPragmas.DALLevel := dalA
+        else if dalChar = 'B' then
+          safetyPragmas.DALLevel := dalB
+        else if dalChar = 'C' then
+          safetyPragmas.DALLevel := dalC
+        else if dalChar = 'D' then
+          safetyPragmas.DALLevel := dalD
+        else
+          FDiag.Error('invalid DAL level ''' + dalChar + '''; expected A, B, C or D', FCurTok.Span);
+        Advance;
+      end
+      else
+        FDiag.Error('expected DAL level (A, B, C or D)', FCurTok.Span);
+      Expect(tkRParen);
+    end
+
+    // --- @critical (no arguments) ---
+    else if attrName = 'critical' then
+    begin
+      safetyPragmas.IsCritical := True;
+      // no parentheses expected
+    end
+
+    // --- @wcet(N) – WCET budget in microseconds ---
+    else if attrName = 'wcet' then
+    begin
+      Expect(tkLParen);
+      if Check(tkIntLit) then
+      begin
+        try
+          budget := StrToInt64(FCurTok.Value);
+          if budget <= 0 then
+            FDiag.Error('@wcet budget must be a positive integer (microseconds)', FCurTok.Span)
+          else
+            safetyPragmas.WCETBudget := budget;
+        except
+          FDiag.Error('invalid @wcet value', FCurTok.Span);
+        end;
+        Advance;
+      end
+      else
+        FDiag.Error('expected integer (microseconds) after @wcet(', FCurTok.Span);
+      Expect(tkRParen);
+    end
+
+    // --- @stack_limit(N) – max stack usage in bytes ---
+    else if attrName = 'stack_limit' then
+    begin
+      Expect(tkLParen);
+      if Check(tkIntLit) then
+      begin
+        try
+          budget := StrToInt64(FCurTok.Value);
+          if budget <= 0 then
+            FDiag.Error('@stack_limit must be a positive integer (bytes)', FCurTok.Span)
+          else
+            safetyPragmas.StackLimit := budget;
+        except
+          FDiag.Error('invalid @stack_limit value', FCurTok.Span);
+        end;
+        Advance;
+      end
+      else
+        FDiag.Error('expected integer (bytes) after @stack_limit(', FCurTok.Span);
+      Expect(tkRParen);
+    end
+
+    else
+    begin
+      FDiag.Error('unknown function attribute ''@' + attrName + '''', FCurTok.Span);
+    end;
+  end; // while Check(tkAt)
 end;
 
 end.
