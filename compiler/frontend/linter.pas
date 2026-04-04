@@ -468,6 +468,9 @@ begin
     nkPanic:
       LintExpr(TAstPanicExpr(expr).Message);
 
+    nkCheck:
+      LintExpr(TAstCheckExpr(expr).Condition);
+
     nkFormatExpr:
     begin
       { W011: :width:0 Format-Specifier — 0 Dezimalstellen gibt nur den Ganzzahlanteil aus }

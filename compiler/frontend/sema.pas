@@ -3143,6 +3143,16 @@ begin
         // panic never returns, so we can assign any type
         Result := atVoid;
       end;
+    nkCheck:
+      begin
+        // check(condition) - runtime-only assertion, panics if false
+        CheckExpr(TAstCheckExpr(expr).Condition);
+        // condition must be bool
+        if not IsBoolType(TAstCheckExpr(expr).Condition.ResolvedType) then
+          FDiag.Error('check condition must be boolean', TAstCheckExpr(expr).Condition.Span);
+        // check never returns on false, so we can assign any type
+        Result := atVoid;
+      end;
     nkMapLit:
       begin
         // Map literal: {key: value, ...}

@@ -4048,6 +4048,40 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         Result := -1;
       end;
 
+    nkCheck:
+      begin
+        // check(condition) - runtime-only assertion, panics if false without message
+        // Expand to: if (!condition) panic("check failed")
+        // Lower the condition expression first
+        condTmp := LowerExpr(TAstCheckExpr(expr).Condition);
+        if condTmp < 0 then
+          Exit(-1);
+
+        // Create labels for skip and panic
+        skipLbl := NewLabel('Lcheck_ok');
+        // if cond is true, jump to skip (use irBrTrue to jump if condition is true)
+        instr := Default(TIRInstr);
+        instr.Op := irBrTrue; // jump if true -> skip panic
+        instr.Src1 := condTmp;
+        instr.LabelName := skipLbl;
+        Emit(instr);
+
+        // panic("check failed") - use irPanic with ImmInt = -1 to signal default message
+        instr := Default(TIRInstr);
+        instr.Op := irPanic;
+        instr.ImmInt := -1; // Signal default "check failed" message
+        Emit(instr);
+
+        // skip label
+        instr := Default(TIRInstr);
+        instr.Op := irLabel;
+        instr.LabelName := skipLbl;
+        Emit(instr);
+
+        // check never returns on false, so we can assign any type
+        Result := -1;
+      end;
+
     // SIMD Expressions (v0.2.0)
     nkSIMDNew:
       begin
