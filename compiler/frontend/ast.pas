@@ -859,21 +859,31 @@ type
     property IsPublic: Boolean        read FIsPublic;
   end;
 
-  { Type-Deklaration (Top-Level): type Name = Type; }
+  { Type-Deklaration (Top-Level): type Name = Type; oder type Name = int64 range Min..Max; }
   TAstTypeDecl = class(TAstNode)
   private
     FName: string;
     FDeclType: TAurumType;
+    FTypeName: string;   // for named base types (e.g. structs used as alias base)
     FIsPublic: Boolean;
     FConstraint: TAstExpr; // Bedingung für typsichere Typen (z.B. value >= 0 && value <= 100)
+    // Range-Typ-Felder (aerospace-todo P1 #7)
+    FHasRange: Boolean;  // true wenn range-Annotation vorhanden
+    FRangeMin: Int64;    // untere Schranke (inklusiv)
+    FRangeMax: Int64;    // obere Schranke (inklusiv)
   public
     constructor Create(const aName: string; aDeclType: TAurumType;
       aPublic: Boolean; aConstraint: TAstExpr; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Name: string read FName;
     property DeclType: TAurumType read FDeclType;
+    property TypeName: string read FTypeName write FTypeName;
     property IsPublic: Boolean read FIsPublic;
     property Constraint: TAstExpr read FConstraint;
+    // Range type
+    property HasRange: Boolean read FHasRange write FHasRange;
+    property RangeMin: Int64 read FRangeMin write FRangeMin;
+    property RangeMax: Int64 read FRangeMax write FRangeMax;
   end;
 
   { Struct/Type-Deklaration mit Feldern und Methoden }
@@ -2095,8 +2105,12 @@ begin
   inherited Create(nkTypeDecl, aSpan);
   FName := aName;
   FDeclType := aDeclType;
+  FTypeName := '';
   FIsPublic := aPublic;
   FConstraint := aConstraint;
+  FHasRange := False;
+  FRangeMin := 0;
+  FRangeMax := 0;
   if Assigned(aConstraint) then FKind := nkConstrainedTypeDecl; // If constraint is present, set node kind to nkConstrainedTypeDecl
 end;
 

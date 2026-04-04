@@ -46,7 +46,7 @@ type
     // Trennzeichen
     tkLParen, tkRParen, tkLBrace, tkRBrace,
     tkLBracket, tkRBracket,
-    tkColon, tkComma, tkSemicolon, tkEllipsis, tkDot, tkAt,
+    tkColon, tkComma, tkSemicolon, tkEllipsis, tkDotDot, tkDot, tkAt,
     // Null-Safety Operatoren
     tkQuestion, tkNullCoalesce, tkSafeCall,
     // Pipe-Operator
@@ -202,6 +202,7 @@ begin
     tkComma:     Result := ',';
     tkSemicolon: Result := ';';
     tkEllipsis:  Result := '...';
+    tkDotDot:    Result := '..';
     tkDot:       Result := '.';
     tkAt:        Result := '@';
     tkQuestion:  Result := '?';
@@ -929,12 +930,17 @@ begin
     ',': begin Advance; Result := MakeToken(tkComma, ',', startLine, startCol, 1); end;
     ';': begin Advance; Result := MakeToken(tkSemicolon, ';', startLine, startCol, 1); end;
     '.': begin
-      // handle '...' ellipsis
       if (FPos + 2 <= Length(FSource)) and (FSource[FPos + 1] = '.') and (FSource[FPos + 2] = '.') then
       begin
-        // consume three dots
+        // '...' ellipsis (3 dots)
         Advance; Advance; Advance;
         Result := MakeToken(tkEllipsis, '...', startLine, startCol, 3);
+      end
+      else if (FPos + 1 <= Length(FSource)) and (FSource[FPos + 1] = '.') then
+      begin
+        // '..' range operator (2 dots)
+        Advance; Advance;
+        Result := MakeToken(tkDotDot, '..', startLine, startCol, 2);
       end
       else
       begin

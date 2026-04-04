@@ -37,6 +37,7 @@ type
     FBreakStack: TStringList; // stack of break labels
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
     FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
+    FRangeTypes: TStringList; // range type name -> TAstTypeDecl (aerospace-todo P1 #7)
     FGlobalVars: TStringList; // global variable name -> TAstVarDecl (as object)
     FExternFuncs: TStringList; // names of extern fn declarations
     FImportedFuncs: TStringList; // names of functions from imported units
@@ -63,6 +64,9 @@ type
     function SubstType(t: TAurumType; const n: string): TAurumType;
     procedure LowerGenericSpecialization(decl: TAstFuncDecl; const mangledName: string;
       const typeArgs: array of TAurumType);
+
+    { Emits IR range-check for value in temp tVal against [rMin..rMax] (aerospace-todo P1 #7) }
+    procedure EmitRangeCheck(tVal: Integer; rMin, rMax: Int64; const typeName: string; span: TSourceSpan);
 
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
@@ -129,6 +133,8 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FStructTypes.Sorted := False;
     FClassTypes := TStringList.Create;
     FClassTypes.Sorted := False;
+    FRangeTypes := TStringList.Create;
+    FRangeTypes.Sorted := False;
     FGlobalVars := TStringList.Create;
     FGlobalVars.Sorted := False;
     FExternFuncs := TStringList.Create;
@@ -170,6 +176,8 @@ begin
   // Don't free objects in FStructTypes/FClassTypes/FGlobalVars - they belong to the AST
   FStructTypes.Free;
   FClassTypes.Free;
+  // Don't free objects in FRangeTypes — they belong to the AST
+  FRangeTypes.Free;
   FGlobalVars.Free;
   FExternFuncs.Free;
   FImportedFuncs.Free;
@@ -195,6 +203,54 @@ begin
     Result := nil;
 end;
 
+
+{ Emits runtime bounds-check IR: panics if tVal not in [rMin..rMax] (aerospace-todo P1 #7) }
+procedure TIRLowering.EmitRangeCheck(tVal: Integer; rMin, rMax: Int64;
+  const typeName: string; span: TSourceSpan);
+var
+  instr: TIRInstr;
+  tMin, tMax, tGeMin, tLeMax, tOk, tMsg: Integer;
+  failLbl, okLbl, msgStr: string;
+begin
+  instr := Default(TIRInstr);
+  instr.SourceLine := span.Line;
+  instr.SourceFile := span.FileName;
+
+  // Load constants for min and max
+  tMin := NewTemp;
+  instr.Op := irConstInt; instr.Dest := tMin; instr.ImmInt := rMin; Emit(instr);
+  tMax := NewTemp;
+  instr.Op := irConstInt; instr.Dest := tMax; instr.ImmInt := rMax; Emit(instr);
+
+  // tGeMin = tVal >= rMin
+  tGeMin := NewTemp;
+  instr.Op := irCmpGe; instr.Dest := tGeMin; instr.Src1 := tVal; instr.Src2 := tMin; Emit(instr);
+  // tLeMax = tVal <= rMax  (implemented as rMax >= tVal)
+  tLeMax := NewTemp;
+  instr.Op := irCmpGe; instr.Dest := tLeMax; instr.Src1 := tMax; instr.Src2 := tVal; Emit(instr);
+  // tOk = tGeMin && tLeMax
+  tOk := NewTemp;
+  instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGeMin; instr.Src2 := tLeMax; Emit(instr);
+
+  // Branch to fail-label if not ok
+  failLbl := NewLabel('Lrange_fail');
+  okLbl   := NewLabel('Lrange_ok');
+  instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := failLbl; Emit(instr);
+  // skip to ok
+  instr.Op := irJmp; instr.LabelName := okLbl; Emit(instr);
+
+  // Fail block: panic message
+  instr.Op := irLabel; instr.LabelName := failLbl; Emit(instr);
+  msgStr := 'Range check failed: value out of [' +
+            IntToStr(rMin) + '..' + IntToStr(rMax) + '] for type ' + typeName;
+  tMsg := NewTemp;
+  instr.Op := irConstStr; instr.Dest := tMsg;
+  instr.ImmStr := IntToStr(FModule.InternString(msgStr));
+  instr.ImmInt := Length(msgStr); Emit(instr);
+  instr.Op := irPanic; instr.Src1 := tMsg; instr.ImmInt := Length(msgStr); Emit(instr);
+
+  instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
+end;
 
 function TIRLowering.NewTemp: Integer;
 begin
@@ -671,6 +727,15 @@ begin
         cv.IsStr  := False;
         cv.IntVal := TAstEnumDecl(node).Values[j].Value;
         FConstMap.AddObject(TAstEnumDecl(node).Values[j].Name, System.TObject(cv));
+      end;
+    end
+    else if node is TAstTypeDecl then
+    begin
+      // Register range types for runtime bounds-check emission (aerospace-todo P1 #7)
+      if TAstTypeDecl(node).HasRange then
+      begin
+        if FRangeTypes.IndexOf(TAstTypeDecl(node).Name) < 0 then
+          FRangeTypes.AddObject(TAstTypeDecl(node).Name, System.TObject(node));
       end;
     end
     else if node is TAstConDecl then
@@ -4568,6 +4633,9 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     fi: Integer;
     fldOffset: Integer;
     fldType: TAurumType;
+    // range type helpers (aerospace-todo P1 #7)
+    rtIdx, rtIdx2: Integer;
+    rtDecl, rtDecl2: TAstTypeDecl;
   begin
   // Track source location from AST node for assembly listing (aerospace-todo 6.1)
   if Assigned(stmt) then
@@ -4951,6 +5019,9 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       begin
         // scalar local
        loc := AllocLocal(vd.Name, SubstType(vd.DeclType, vd.DeclTypeName));
+       // Store type name so range checks can be emitted at assignment sites
+       if (vd.DeclTypeName <> '') and (loc < Length(FLocalTypeNames)) then
+         FLocalTypeNames[loc] := vd.DeclTypeName;
        // If initializer is constant integer and the local has narrower signed width, constant fold
        if (vd.InitExpr is TAstIntLit) then
        begin
@@ -5015,6 +5086,16 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
          instr.Op := irTrunc; instr.Dest := NewTemp; instr.Src1 := tmp; instr.ImmInt := width; Emit(instr);
          tmp := instr.Dest;
        end;
+       // Emit runtime range check if this variable has a range type (aerospace-todo P1 #7)
+       if (vd.DeclTypeName <> '') and Assigned(FRangeTypes) then
+       begin
+         rtIdx := FRangeTypes.IndexOf(vd.DeclTypeName);
+         if rtIdx >= 0 then
+         begin
+           rtDecl := TAstTypeDecl(FRangeTypes.Objects[rtIdx]);
+           EmitRangeCheck(tmp, rtDecl.RangeMin, rtDecl.RangeMax, vd.DeclTypeName, vd.Span);
+         end;
+       end;
        instr.Op := irStoreLocal;
        instr.Dest := loc;
        instr.Src1 := tmp;
@@ -5065,6 +5146,16 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         instr.Op := irTrunc; instr.Dest := NewTemp; instr.Src1 := tmp;
         instr.ImmInt := width; Emit(instr);
         tmp := instr.Dest;
+      end;
+      // Emit runtime range check for range-typed local (aerospace-todo P1 #7)
+      if Assigned(FRangeTypes) and (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+      begin
+        rtIdx2 := FRangeTypes.IndexOf(FLocalTypeNames[loc]);
+        if rtIdx2 >= 0 then
+        begin
+          rtDecl2 := TAstTypeDecl(FRangeTypes.Objects[rtIdx2]);
+          EmitRangeCheck(tmp, rtDecl2.RangeMin, rtDecl2.RangeMax, FLocalTypeNames[loc], stmt.Span);
+        end;
       end;
       instr.Op := irStoreLocal;
       instr.Dest := loc;

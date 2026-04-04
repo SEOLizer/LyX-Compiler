@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.0-aerospace
+Lyx Compiler v0.8.1-aerospace
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -59,6 +59,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.7)
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
+✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
 ```
 
 ---
@@ -474,6 +475,29 @@ fn sensor_read(): int64 { return 42; }
 **Semantic rules:** `@critical`/`@wcet`/`@stack_limit` on `extern fn` → error.
 `@dal(A)` without `@critical` → warning (DAL A implies critical).
 Safety pragmas are stored in IR (`TIRFunction.SafetyPragmas`) for future WCET/stack-verification passes.
+
+### Range Types (v0.8.1)
+
+Integer types with inclusive value bounds for DO-178C bounds-correctness requirements:
+
+```lyx
+type Altitude = int64 range -1000..60000;   // meters above MSL
+type Speed    = int64 range 0..300;          // knots
+type Percent  = int64 range 0..100;
+
+// Compile-time error (literal out of range):
+var alt: Altitude := 70000;  // error: value 70000 is out of range [-1000..60000] for type Altitude
+
+// Valid:
+var alt: Altitude := 5000;   // OK
+
+// Runtime check (non-constant value):
+var spd: Speed := get_speed();  // panics at runtime if > 300
+```
+
+Any integer base type (`int8`–`int64`, `uint8`–`uint64`, `isize`, `usize`) can be used.
+The bounds are inclusive on both ends. Violations in constant initializers are caught at compile time.
+Non-constant values receive a runtime bounds check emitted as IR compare+branch+panic.
 
 ### Tool Qualification (TQL-5)
 

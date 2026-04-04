@@ -5,11 +5,11 @@
 Dieses Dokument beschreibt den Fortschritt und die offenen Tasks zur Qualifizierung
 von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DAL A/B/C).
 
-**Stand:** 2026-04-04 | **Version:** 0.8.0-aerospace
+**Stand:** 2026-04-04 | **Version:** 0.8.1-aerospace
 
 ---
 
-## ✅ Abgeschlossene Tasks (72 von 113)
+## ✅ Abgeschlossene Tasks (73 von 113)
 
 ### 1. DO-178C Software Compliance
 
@@ -127,7 +127,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | # | Task | Sektion | Aufwand | Begründung |
 |---|------|---------|---------|------------|
 | ~~6~~ | ~~**Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`)~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Parser, AST, IR-Propagation, Sema-Checks, 30/30 Tests |
-| 7 | **Range-Typen im Typsystem** | 2.2, 10.1 | Hoch | `type Altitude = int64 range -1000..60000` – Compile-Zeit und Runtime-Checks |
+| ~~7~~ | ~~**Range-Typen im Typsystem**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Lexer `tkDotDot`, Parser `range Min..Max`, Sema Compile-Time-Check, IR Runtime-Check, 33/33 Tests |
 | 8 | **Call-Graph: Statischer Aufrufgraph** | 6.1 | Mittel | Erforderlich für WCET-Analyse und Stack-Berechnung über Call-Grenzen hinweg |
 | 9 | **Map-File: Speicherlayout aller Symbole** | 6.1 | Mittel | Debug-Information für Zertifizierung und Audit |
 | 10 | **Result-Typ mit Pattern-Matching** | 7.2, 10.1 | Mittel | Strukturierte Fehlerbehandlung ohne Exceptions (nicht deterministisch) |
@@ -202,7 +202,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 3. **assert()/check() Builtins** (P0 #3) – Runtime-Assertions für DAL A
 4. **MISRA-Regeln** (P0 #4-5) – Sema-Checker Erweiterungen (geringer Aufwand, hoher Nutzen)
 5. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
-6. **Range-Typen** (P1 #7) – `type Altitude = int64 range -1000..60000`
+6. ~~**Range-Typen** (P1 #7)~~ ✅ ERLEDIGT
 
 ---
 
