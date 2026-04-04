@@ -138,7 +138,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | ~~6~~ | ~~**Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`)~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Parser, AST, IR-Propagation, Sema-Checks, 30/30 Tests |
 | ~~7~~ | ~~**Range-Typen im Typsystem**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Lexer `tkDotDot`, Parser `range Min..Max`, Sema Compile-Time-Check, IR Runtime-Check, 33/33 Tests |
 | ~~7b~~ | ~~**check() Builtin**~~ | ~~7.1~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – `check(cond)` → panic bei false; Expression-Form, Typ-Check auf bool, IR-Lowering zu if(!cond) panic |
-| 8 | **Call-Graph: Statischer Aufrufgraph** | 6.1 | Mittel | Erforderlich für WCET-Analyse und Stack-Berechnung über Call-Grenzen hinweg |
+| ~~8~~ | ~~**Call-Graph: Statischer Aufrufgraph**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TCallGraph` Klasse, AST-Walking für Funktionsaufrufe, Rekursions-Erkennung via DFS, `--call-graph` CLI-Flag |
 | 9 | **Map-File: Speicherlayout aller Symbole** | 6.1 | Mittel | Debug-Information für Zertifizierung und Audit |
 | 10 | **Result-Typ mit Pattern-Matching** | 7.2, 10.1 | Mittel | Strukturierte Fehlerbehandlung ohne Exceptions (nicht deterministisch) |
 | 11 | **MC/DC-Test-Suite für alle Backend-Pfade** | 10.4 | Mittel | Sicherstellen dass MC/DC-Instrumentierung in allen 7 Backends korrekt funktioniert |
