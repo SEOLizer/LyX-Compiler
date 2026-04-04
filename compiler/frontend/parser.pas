@@ -20,6 +20,8 @@ type
     // @integrity pre-parsed at top of file before fn or unit (aerospace-todo P0 #43)
     FPendingIntegrity: TIntegrityAttr;
     FHasPendingIntegrity: Boolean;
+    // Endianness annotation pending for next struct (aerospace-todo P2 #52)
+    FPendingEndian: TEndianType;
 
     procedure Advance; // setzt FCurTok
     function Check(kind: TTokenKind): Boolean;
@@ -142,6 +144,7 @@ begin
   FHasPendingIntegrity := False;
   FPendingIntegrity.Mode     := imNone;
   FPendingIntegrity.Interval := 0;
+  FPendingEndian := enNative; // aerospace-todo P2 #52
   Advance; // load first token
 end;
 
@@ -682,6 +685,8 @@ var
   curVisibility: TVisibility;
   constraintExpr: TAstExpr;
   rMin, rMax: Int64; // for range type parsing
+  pendingEndian: TEndianType; // aerospace-todo P2 #52
+  structEndian: TEndianType; // aerospace-todo P2 #52
 begin
   Expect(tkType);
   if Check(tkIdent) then
@@ -700,6 +705,19 @@ begin
   else
   begin
     FDiag.Error('expected ''='' in type declaration', FCurTok.Span);
+  end;
+
+  // Parse optional endianness annotation before struct/class (aerospace-todo P2 #52)
+  pendingEndian := enNative;
+  if Check(tkBigEndian) then
+  begin
+    pendingEndian := enBigEndian;
+    Advance;
+  end
+  else if Check(tkLittleEndian) then
+  begin
+    pendingEndian := enLittleEndian;
+    Advance;
   end;
 
   // Interface IName { ... }
@@ -894,6 +912,7 @@ begin
   // struct { ... }
   else if Check(tkStruct) then
   begin
+    structEndian := pendingEndian;
     Advance; // struct
     Expect(tkLBrace);
     fields := nil;
@@ -922,6 +941,7 @@ begin
     Expect(tkRBrace);
     Expect(tkSemicolon);
     Result := TAstStructDecl.Create(name, fields, methods, isPub, FCurTok.Span);
+    TAstStructDecl(Result).Endian := structEndian; // aerospace-todo P2 #52
     Exit;
   end
   else
