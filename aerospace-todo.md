@@ -142,6 +142,25 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~45~~ | ~~**VerifyIntegrity() Builtin**~~ | ~~2.5.3~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Builtin in `sema.pas` deklariert (`VerifyIntegrity() -> bool`), IR-Op `irVerifyIntegrity` in `ir.pas`, Lowering in `lower_ast_to_ir.pas`, x86_64 Codegen in `x86_64_emit.pas`; TMR-Mehrheitsentscheid (2 von 3 Hashes); `test_tmr.lyx` kompiliert und läuft (Exit 0) |
 | ~~46~~ | ~~**TMR Hash-Store Unterstützung**~~ | ~~2.5.2~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – CRC32-Hashes werden zur Compile-Zeit berechnet und in den Data-Buffer geschrieben; Runtime liest 3 Hashes per `movabs` + TMR-Vergleich (alle 3 identisch → Mehrheit); `.meta_safe` Section mit `SHF_ALLOC` für Runtime-Zugriff; Data-Buffer wird in ELF-Writer geschrieben; Patching der Data-Adresse in lyxc.lpr nach CRC32-Berechnung |
 
+### 🔴 P0 – Backend-Abdeckung (alle Targets müssen aerospace-Features unterstützen)
+
+| # | Task | Backend | Aufwand | Bezug |
+|---|------|---------|---------|-------|
+| 101 | **BUG: SHF_ALLOC für .meta_safe in ARM64 ELF** | `elf64_arm64_writer.pas` | Niedrig | Zeile 277: `WriteU64(0)` → `WriteU64(2)` |
+| 102 | **BUG: dataBuf wird in ARM64 ELF-Writer nicht geschrieben** | `elf64_arm64_writer.pas` | Niedrig | Nach codeBuf: dataBuf schreiben, metaSafeOff anpassen |
+| 103 | **BUG: SHF_ALLOC für .meta_safe in RISC-V ELF** | `elf64_riscv_writer.pas` | Niedrig | Zeile 230: `WriteU64(0)` → `WriteU64(2)` |
+| 104 | **BUG: dataBuf wird in RISC-V ELF-Writer nicht geschrieben** | `elf64_riscv_writer.pas` | Niedrig | Nach codeBuf: dataBuf schreiben, metaSafeOff anpassen |
+| 105 | **VerifyIntegrity() Codegen ARM64** | `arm64_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich mit ARM64-Assembly (adrp/ldr/cmp) |
+| 106 | **VerifyIntegrity() Codegen RISC-V** | `riscv_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich mit RISC-V-Assembly (lui/lw/bne) |
+| 107 | **TMR Patching ARM64 in lyxc.lpr** | `lyxc.lpr` | Gering | Analog zu x86_64: CRC32 berechnen, dataVA patchen |
+| 108 | **TMR Patching RISC-V in lyxc.lpr** | `lyxc.lpr` | Gering | Analog zu x86_64: CRC32 berechnen, dataVA patchen |
+| 109 | **VerifyIntegrity() Codegen Windows x64** | `x86_64_win64.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich mit Win64 ABI |
+| 110 | **VerifyIntegrity() Codegen Windows ARM64** | `win_arm64_emit.pas` | Mittel | `irVerifyIntegrity`: ARM64 TMR mit Win64 ABI |
+| 111 | **VerifyIntegrity() Codegen macOS x64** | `macosx64_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (macOS Syscalls) |
+| 112 | **VerifyIntegrity() Codegen ESP32/Xtensa** | `xtensa_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (bare metal) |
+| 113 | **VerifyIntegrity() Codegen ARM Cortex-M** | `arm_cm_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (bare metal) |
+| 114 | **.meta_safe ELF32 für ESP32** | `elf32_writer.pas` | Mittel | `WriteElf32WithMetaSafe()`: ELF32-Section mit Triple-Hash |
+
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)
 
 | # | Task | Sektion | Aufwand | Bezug aerospace.pdf |
@@ -219,7 +238,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
 | **2. Spracherweiterungen** | 9 | 9 | 50% |
-| **3. Backend-Sicherheit** | 14 | 1 | 93% |
+| **3. Backend-Sicherheit** | 14 | 15 | 48% |
 | **4. Test-Abdeckung** | 9 | 0 | 100% |
 | **5. Statische Analyse** | 10 | 5 | 67% |
 | **6. Codegen-Sicherheit** | 2 | 8 | 20% |
@@ -228,7 +247,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
 | **11. Aerospace Extension (NEW)** | 5 | 9 | 36% |
-| **GESAMT** | **91** | **36** | **72%** |
+| **12. Backend-Abdeckung (NEW)** | 0 | 14 | 0% |
+| **GESAMT** | **91** | **50** | **65%** |
 
 ---
 
@@ -273,8 +293,10 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 2. ~~**`.meta_safe` ELF Section**~~ ✅ ERLEDIGT (P0, #44)
 3. ~~**VerifyIntegrity() Builtin**~~ ✅ ERLEDIGT (P0, #45) – Runtime-Validierung
 4. ~~**TMR Hash-Store**~~ ✅ ERLEDIGT (P0, #46) – Dreifach-redundante Hashes
-5. **TMR / @redundant Attribut** (P1, #51) – Strahlungstoleranz
-6. **Shadow Stack** (P3, #63) – Control-Flow-Schutz
+5. **BUG: SHF_ALLOC + dataBuf in ARM64/RISC-V ELF-Writern** (P0, #101-#104) – Kritische Bugs
+6. **VerifyIntegrity() ARM64 + RISC-V Codegen** (P0, #105-#108) – Linux-Backend-Abdeckung
+7. **VerifyIntegrity() Windows/macOS/ESP32/ARM-CM** (P1, #109-#113) – Vollständige Backend-Abdeckung
+8. **TMR / @redundant Attribut** (P1, #51) – Strahlungstoleranz
 
 ---
 
