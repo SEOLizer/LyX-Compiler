@@ -248,7 +248,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
 | **11. Aerospace Extension (NEW)** | 8 | 6 | 57% |
 | **12. Backend-Abdeckung (NEW)** | 0 | 14 | 0% |
-| **GESAMT** | **94** | **47** | **67%** |
+| **GESAMT** | **30** | **47** | **39%** |
 
 ---
 
