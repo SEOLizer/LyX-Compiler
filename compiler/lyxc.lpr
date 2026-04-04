@@ -5,7 +5,7 @@ uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter,
-  ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis,
+  ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
   asm_listing,
   x86_64_emit, elf64_writer,
   x86_64_win64, pe64_writer,
@@ -33,6 +33,7 @@ var
   flagMCDC: Boolean;  // --mcdc MC/DC instrumentation
   flagStaticAnalysis: Boolean;  // --static-analysis
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
+  flagCallGraph: Boolean;  // --call-graph
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -65,6 +66,7 @@ var
   mcdcCount: Integer;
   sa: TStaticAnalyzer;
   al: TAsmListingGenerator;
+  cg: TCallGraph;
   listingFile: string;
   sl: TStringList;
   param: string;
@@ -342,6 +344,7 @@ begin
     WriteLn(StdErr, '  --mcdc           MC/DC-Instrumentierung für DO-178C Coverage');
     WriteLn(StdErr, '  --mcdc-report    MC/DC-Coverage-Bericht nach Kompilierung');
     WriteLn(StdErr, '  --static-analysis Statische Analyse (Data-Flow, Live-Vars, Stack, ...)');
+    WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
     WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
@@ -362,6 +365,7 @@ begin
   flagMCDC := False;
   flagStaticAnalysis := False;
   flagAsmListing := False;
+  flagCallGraph := False;
   includePaths := TStringList.Create;
   stdLibPath := '';
 
@@ -490,6 +494,11 @@ begin
     else if param = '--asm-listing' then
     begin
       flagAsmListing := True;
+      Inc(i);
+    end
+    else if param = '--call-graph' then
+    begin
+      flagCallGraph := True;
       Inc(i);
     end
     else if param = '--trace-imports' then
@@ -656,6 +665,23 @@ begin
             d.PrintAll;
         finally
           s.Free;
+        end;
+
+        // Call Graph Analysis (DO-178C Section 6.1 - WCET-Analyse)
+        if flagCallGraph then
+        begin
+          WriteLn('[Call Graph] Building static call graph...');
+          cg := TCallGraph.Create(d);
+          try
+            cg.BuildFromAST(prog);
+            WriteLn('[Call Graph] Found ', cg.GetFunctionCount, ' function(s)');
+            if cg.HasRecursion then
+              WriteLn('[Call Graph] WARNING: Recursion detected!');
+            WriteLn;
+            WriteLn(cg.ExportText);
+          finally
+            cg.Free;
+          end;
         end;
 
         // Phase 3b: Linter (optional)
