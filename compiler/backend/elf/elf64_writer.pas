@@ -9,6 +9,9 @@ uses
 procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; entryVA: UInt64);
 procedure WriteElf64WithMetaSafe(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64; const integrity: TIntegrityAttr);
+
+// CRC32 (IEEE 802.3, polynomial 0xEDB88320) for .meta_safe hashes and TMR
+function Crc32Buffer(const buf: TByteBuffer): UInt32;
 procedure WriteDynamicElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64; const externSymbols: TExternalSymbolArray;
   const neededLibs: array of string);
@@ -175,12 +178,20 @@ var
   shStrTabSize: UInt64;
   numShdrs: Integer;
   shdrSize: UInt64 = 64; // SizeOf(TElf64Shdr)
+  // Data section support (aerospace-todo P0 #46)
+  dataBufSize: UInt64;
 begin
   baseVA := $400000;
 
   // All data (code + embedded strings + globals) is in the code buffer
   codeSize := codeBuf.Size;
   codeOffset := pageSize;  // 0x1000
+
+  // Data section size (if any) - append after code (aerospace-todo P0 #46)
+  if Assigned(dataBuf) then
+    dataBufSize := dataBuf.Size
+  else
+    dataBufSize := 0;
 
   // Build .shstrtab (section header string table)
   shStrTab := TByteBuffer.Create;
@@ -194,8 +205,8 @@ begin
       Ord('r'), Ord('t'), Ord('a'), Ord('b'), 0]);
     shStrTabSize := shStrTab.Size;
 
-    // Layout: ELF header + phdr + padding + code + shstrtab + section headers
-    shStrTabOff := codeOffset + codeSize;
+    // Layout: ELF header + phdr + padding + code + data + shstrtab + section headers
+    shStrTabOff := codeOffset + codeSize + dataBufSize;
     // Align shstrtab
     if (shStrTabOff mod 8) <> 0 then
       shStrTabOff := shStrTabOff + (8 - (shStrTabOff mod 8));
@@ -276,9 +287,9 @@ begin
       phdr.WriteU64LE(baseVA + codeOffset);
       phdr.WriteU64LE(baseVA + codeOffset);
 
-      // Code segment covers: code + shstrtab + section headers
-      filesz := shdrsOff - codeOffset + UInt64(shdrs.Size);
-      memsz := filesz;
+       // Code segment covers: code + data + shstrtab + section headers
+       filesz := shdrsOff - codeOffset + UInt64(shdrs.Size);
+       memsz := filesz;
 
       phdr.WriteU64LE(filesz);
       phdr.WriteU64LE(memsz);
@@ -289,9 +300,12 @@ begin
         fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
         fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
         while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
-        if codeSize > 0 then
-          fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
-        // Pad to shstrtab offset
+         if codeSize > 0 then
+           fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+         // Write data section after code (aerospace-todo P0 #46)
+         if dataBufSize > 0 then
+           fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataBufSize);
+         // Pad to shstrtab offset
         while fileBuf.Position < Int64(shStrTabOff) do fileBuf.WriteByte(0);
         fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
         // Pad to section headers offset
@@ -419,7 +433,7 @@ var
   shStrTab: TByteBuffer;
   shdrs: TByteBuffer;
   metaSafeSec: TByteBuffer;
-  shStrTabOff, shdrsOff, metaSafeOff: UInt64;
+  shStrTabOff, shdrsOff, metaSafeOff, metaSafeVA: UInt64;
   shStrTabSize, metaSafeSize: UInt64;
   numShdrs: Integer;
   shdrSize: UInt64 = 64;
@@ -462,6 +476,7 @@ begin
     metaSafeOff := codeOffset + codeSize;
     if (metaSafeOff mod 8) <> 0 then
       metaSafeOff := metaSafeOff + (8 - (metaSafeOff mod 8));
+    metaSafeVA := baseVA + metaSafeOff;  // VA for runtime access (aerospace-todo P0 #46)
 
     shStrTabOff := metaSafeOff + metaSafeSize;
     if (shStrTabOff mod 8) <> 0 then
@@ -500,11 +515,11 @@ begin
     shdrs.WriteU64LE(1);                       // sh_addralign
     shdrs.WriteU64LE(0);
 
-    // SHdr 3: .meta_safe (PROGBITS, not loaded into memory at runtime)
+    // SHdr 3: .meta_safe (PROGBITS, SHF_ALLOC — mapped into memory for runtime access, aerospace-todo P0 #46)
     shdrs.WriteU32LE(SHStr_metasafe_off);      // sh_name
     shdrs.WriteU32LE(SHT_PROGBITS);           // sh_type
-    shdrs.WriteU64LE(0);                       // sh_flags (not SHF_ALLOC — metadata only)
-    shdrs.WriteU64LE(0);                       // sh_addr  (not mapped)
+    shdrs.WriteU64LE(SHF_ALLOC);               // sh_flags — SHF_ALLOC: readable at runtime
+    shdrs.WriteU64LE(metaSafeVA);              // sh_addr  — mapped into memory
     shdrs.WriteU64LE(metaSafeOff);             // sh_offset
     shdrs.WriteU64LE(metaSafeSize);            // sh_size
     shdrs.WriteU32LE(0); shdrs.WriteU32LE(0);
@@ -550,9 +565,12 @@ begin
         fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
         fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
         while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
-        if codeSize > 0 then
-          fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
-        // .meta_safe section
+         if codeSize > 0 then
+           fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+         // Write data section after code (aerospace-todo P0 #46)
+         if Assigned(dataBuf) and (dataBuf.Size > 0) then
+           fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataBuf.Size);
+         // .meta_safe section
         while fileBuf.Position < Int64(metaSafeOff) do fileBuf.WriteByte(0);
         fileBuf.WriteBuffer(metaSafeSec.GetBuffer^, metaSafeSize);
         // .shstrtab

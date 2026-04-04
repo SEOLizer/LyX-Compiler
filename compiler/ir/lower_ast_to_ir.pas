@@ -2699,6 +2699,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
           Emit(instr); Result := t0;
         end
+        else if ((call.Name = 'VerifyIntegrity') or
+                 ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
+        begin
+          // Integrity.VerifyIntegrity() -> bool (aerospace-todo P0 #45)
+          // Returns true if code integrity is verified (CRC32 match with .meta_safe section)
+          t0 := NewTemp;
+          instr.Op := irVerifyIntegrity;
+          instr.Dest := t0;
+          Emit(instr);
+          Result := t0;
+        end
         else if ((call.Name = 'RegexMatch') or
                  ((call.Namespace = 'Regex') and (call.Name = 'Match'))) then
         begin
