@@ -63,6 +63,12 @@ var
   pltPatches: TPLTGOTPatchArray;
   mainOff: Integer;
   i, j: Integer;
+  // TMR Hash Store patching variables (aerospace-todo P0 #46)
+  x86Emit: TX86_64Emitter;
+  hashCrc: UInt32;
+  codeSize, dataSize, alignedCodeSize, hashDataOffset: Integer;
+  codeStartVA, dataVA: UInt64;
+  dataAddrPos: Integer;
   mcdc: TMCDCInstrumenter;
   mcdcCount: Integer;
   sa: TStaticAnalyzer;
@@ -822,13 +828,74 @@ begin
                if flagEnergyLevel > 0 then
                  emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
  
-                emit.EmitFromIR(module);
-                codeBuf := emit.GetCodeBuffer;
-                dataBuf := emit.GetDataBuffer;
+                 emit.EmitFromIR(module);
+                 codeBuf := emit.GetCodeBuffer;
+                 dataBuf := emit.GetDataBuffer;
+   
+                 // --dump-relocs: show external symbols and PLT patches
+                if flagDumpRelocs then
+                  DumpRelocs(emit);
   
-                // --dump-relocs: show external symbols and PLT patches
-               if flagDumpRelocs then
-                 DumpRelocs(emit);
+                // TMR Hash Store: Patch CRC32 hashes if VerifyIntegrity() was used (aerospace-todo P0 #46)
+                if (target = targetLinux) and (arch = archX86_64) then
+                begin
+                  // Cast to access TMR-specific methods
+                  x86Emit := TX86_64Emitter(emit);
+                  if x86Emit.HasVerifyIntegrityCall then
+                  begin
+                    WriteLn('Patching TMR hash store with CRC32 values...');
+                    codeSize := codeBuf.Size;
+                    codeStartVA := $400000 + 4096;
+
+                    // Calculate data section VA: code_start_va + code_size (no alignment needed)
+                    // The ELF writer writes data directly after code without padding
+                    dataVA := codeStartVA + UInt64(codeSize);
+
+                    // Patch the movabs rdi, data_va placeholder in code FIRST
+                    // (this changes the code, so CRC32 must be computed AFTER)
+                    dataAddrPos := x86Emit.GetTMRDataAddrPos;
+                    codeBuf.PatchU64LE(dataAddrPos, dataVA);
+
+                    // NOW compute CRC32 of the patched code
+                    hashCrc := Crc32Buffer(codeBuf);
+
+                    // Write TMR hash store to data buffer at position 0
+                    // The data buffer may already contain strings/globals from the emitter.
+                    // We write the hashes at the START of the data buffer.
+                    // If dataBuf already has content, we need to prepend the hashes.
+                    // Simplest: write hashes at current position, then adjust dataVA.
+                    // But the code already loads from dataVA = code_start_va + aligned(code_size).
+                    // So we need the hashes at the START of the data section.
+                    // If dataBuf is empty, just write. If not, we need to insert at position 0.
+                    if dataBuf.Size = 0 then
+                    begin
+                      dataBuf.WriteU32LE(hashCrc);  // hash1
+                      dataBuf.WriteU32LE(hashCrc);  // hash2
+                      dataBuf.WriteU32LE(hashCrc);  // hash3
+                      dataBuf.WriteU32LE(Cardinal(codeSize));  // code_size
+                      dataBuf.WriteU64LE(codeStartVA);  // code_start_va
+                    end
+                    else
+                    begin
+                      // Data buffer already has content - write hashes at end
+                      // and adjust dataVA to point to the end
+                      hashDataOffset := dataBuf.Size;
+                      dataBuf.WriteU32LE(hashCrc);  // hash1
+                      dataBuf.WriteU32LE(hashCrc);  // hash2
+                      dataBuf.WriteU32LE(hashCrc);  // hash3
+                      dataBuf.WriteU32LE(Cardinal(codeSize));  // code_size
+                      dataBuf.WriteU64LE(codeStartVA);  // code_start_va
+                      // Update dataVA to point to the hashes
+                      dataVA := codeStartVA + UInt64(codeSize) + UInt64(hashDataOffset);
+                      // Re-patch the movabs with the corrected dataVA
+                      codeBuf.PatchU64LE(dataAddrPos, dataVA);
+                    end;
+
+                    WriteLn('  CRC32: ', IntToHex(hashCrc, 8));
+                    WriteLn('  Code size: ', codeSize, ' bytes');
+                    WriteLn('  Data VA: $', IntToHex(dataVA, 8));
+                  end;
+                end;
  
                // Check if we have external symbols - if so, generate dynamic ELF
                externSymbols := emit.GetExternalSymbols;

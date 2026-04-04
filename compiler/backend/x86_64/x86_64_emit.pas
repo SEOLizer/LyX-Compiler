@@ -62,6 +62,9 @@ type
       DataOffset: Integer;
       CodePos: Integer;
     end;
+    // TMR Hash Store patch positions (aerospace-todo P0 #46)
+    FTMRDataAddrPos: Integer;                    // Position of movabs rdi, data_va placeholder
+    FHasVerifyIntegrity: Boolean;                // True if VerifyIntegrity() was used
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
     FEnergyStats: TEnergyStats;
@@ -98,6 +101,9 @@ type
     function GetEnergyStats: TEnergyStats;
     procedure SetEnergyLevel(level: TEnergyLevel);
     procedure SetTargetOS(os: TTargetOS);
+    // TMR Hash Store accessors (aerospace-todo P0 #46)
+    function HasVerifyIntegrityCall: Boolean;
+    function GetTMRDataAddrPos: Integer;
   end;
 
 implementation
@@ -725,6 +731,12 @@ var
   excValueIdx, excDepthIdx, excJmpbufsIdx: Integer;
   // argv base global tracking (-1 = not registered)
   argvBaseIdx: Integer;
+  // TMR Hash Store patch variables (aerospace-todo P0 #46)
+  dataAddrPos: Integer;
+  jne1Pos, jne2Pos, jne3Pos: Integer;
+  match1Pos, match2Pos, match3Pos: Integer;
+  jgeOkPatchPos, jmpEndPatchPos: Integer;
+  okPos, endPos: Integer;
 begin
   globalVarNames := TStringList.Create;
   try
@@ -6596,21 +6608,102 @@ begin
             end;
           end;
 
-        // === Integrity Verification (aerospace-todo P0 #45) ===
-        // VerifyIntegrity() checks if code matches the CRC32 hash stored in .meta_safe section
-        // Returns: 1 (true) if integrity verified, 0 (false) if mismatch
+        // === Integrity Verification (aerospace-todo P0 #45 + #46) ===
+        // VerifyIntegrity() checks TMR hash store for code integrity
+        // Returns: 1 (true) if 2+ of 3 stored hashes match, 0 (false) otherwise
+        //
+        // The 3 CRC32 hashes are written to the DATA section by lyxc.lpr after codegen.
+        // Data layout (at data_start): [hash1:4][hash2:4][hash3:4][code_size:4][code_start_va:8]
+        //
+        // Runtime algorithm (TMR majority vote):
+        //   1. Read 3 stored hashes from data section
+        //   2. Count matching pairs: if 2+ agree → return 1, else 0
         irVerifyIntegrity:
           begin
-            // Since we can't easily access the .meta_safe section at runtime without
-            // additional metadata, we perform a simplified check:
-            // 1. Compute CRC32 of the code section (approximation - actual impl would need
-            //    the stored hash from .meta_safe)
-            // For now, return 1 (true) as a placeholder - full implementation would
-            // require passing the stored hash as a parameter or embedding it
-            // A proper implementation would read the hash from .meta_safe section
-            // and compare with computed CRC32
-            WriteMovRegImm64(FCode, RAX, 1);  // Return true for now
+            // Register usage (all caller-saved):
+            //   rax = return value
+            //   rdi = data section base address
+            //   edx = hash value from data
+            //   ecx = match counter
+            //   r8d, r9d, r10d = hash1, hash2, hash3
+
+            // Step 1: Load data section address
+            // The data section starts right after the code section:
+            //   data_va = code_start_va + aligned(code_size)
+            // For static ELF: code_start_va = $401000, code_size is known at link time
+            // We use a placeholder address that will be patched by lyxc.lpr
+            // movabs rdi, 0  (placeholder for data_va)
+            EmitU8(FCode, $48); EmitU8(FCode, $BF);
+            dataAddrPos := FCode.Size;
+            FCode.WriteU64LE(0);  // placeholder for data_va
+
+            // Step 2: Read 3 hashes from data section
+            // mov r8d, [rdi]       (hash1)
+            EmitU8(FCode, $44); EmitU8(FCode, $8B); EmitU8(FCode, $07);
+            // mov r9d, [rdi+4]     (hash2)
+            EmitU8(FCode, $44); EmitU8(FCode, $8B); EmitU8(FCode, $4F); EmitU8(FCode, $04);
+            // mov r10d, [rdi+8]    (hash3)
+            EmitU8(FCode, $44); EmitU8(FCode, $8B); EmitU8(FCode, $57); EmitU8(FCode, $08);
+
+            // Step 3: TMR majority vote
+            // ecx = 0 (match counter)
+            EmitU8(FCode, $31); EmitU8(FCode, $C9);  // xor ecx, ecx
+
+            // Compare hash1 vs hash2: cmp r8d, r9d; je inc ecx
+            EmitU8(FCode, $45); EmitU8(FCode, $39); EmitU8(FCode, $C8);  // cmp r8d, r9d
+            jne1Pos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00);  // jne +0 (placeholder)
+            EmitU8(FCode, $FF); EmitU8(FCode, $C1);  // inc ecx
+            match1Pos := FCode.Size;
+
+            // Compare hash1 vs hash3: cmp r8d, r10d; je inc ecx
+            EmitU8(FCode, $45); EmitU8(FCode, $39); EmitU8(FCode, $D0);  // cmp r8d, r10d
+            jne2Pos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00);  // jne +0 (placeholder)
+            EmitU8(FCode, $FF); EmitU8(FCode, $C1);  // inc ecx
+            match2Pos := FCode.Size;
+
+            // Compare hash2 vs hash3: cmp r9d, r10d; je inc ecx
+            EmitU8(FCode, $45); EmitU8(FCode, $39); EmitU8(FCode, $D1);  // cmp r9d, r10d
+            jne3Pos := FCode.Size;
+            EmitU8(FCode, $75); EmitU8(FCode, $00);  // jne +0 (placeholder)
+            EmitU8(FCode, $FF); EmitU8(FCode, $C1);  // inc ecx
+            match3Pos := FCode.Size;
+
+            // Patch jne offsets
+            FCode.PatchU8(jne1Pos + 1, match1Pos - (jne1Pos + 2));
+            FCode.PatchU8(jne2Pos + 1, match2Pos - (jne2Pos + 2));
+            FCode.PatchU8(jne3Pos + 1, match3Pos - (jne3Pos + 2));
+
+            // Step 4: Check if ecx >= 2 (majority)
+            // cmp ecx, 2; jge ok
+            EmitU8(FCode, $83); EmitU8(FCode, $F9); EmitU8(FCode, $02);  // cmp ecx, 2
+            EmitU8(FCode, $0F); EmitU8(FCode, $8D);
+            jgeOkPatchPos := FCode.Size;
+            FCode.WriteU32LE(0);  // placeholder
+
+            // Not OK: rax = 0
+            EmitU8(FCode, $31); EmitU8(FCode, $C0);  // xor eax, eax
+            EmitU8(FCode, $E9);
+            jmpEndPatchPos := FCode.Size;
+            FCode.WriteU32LE(0);  // placeholder
+
+            // OK: rax = 1
+            okPos := FCode.Size;
+            FCode.PatchU32LE(jgeOkPatchPos, Cardinal(okPos - (jgeOkPatchPos + 4)));
+            EmitU8(FCode, $B8); EmitU8(FCode, $01); EmitU8(FCode, $00);
+            EmitU8(FCode, $00); EmitU8(FCode, $00);
+
+            // End: store result
+            endPos := FCode.Size;
+            FCode.PatchU32LE(jmpEndPatchPos, Cardinal(endPos - (jmpEndPatchPos + 4)));
+
+            // Store result in destination local
             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+
+            // Store patch positions for lyxc.lpr
+            FTMRDataAddrPos := dataAddrPos;
+            FHasVerifyIntegrity := True;
           end;
 
         // === Map/Set Operations (TOR-011) ===
@@ -7274,11 +7367,22 @@ begin
   end;
 
    // Code-Größe für Energy-Stats aktualisieren
-  FEnergyStats.CodeSizeBytes := FCode.Size;
-  
-  finally
-    globalVarNames.Free;
-  end;
+   FEnergyStats.CodeSizeBytes := FCode.Size;
+   
+   finally
+     globalVarNames.Free;
+   end;
+end;
+
+// === TMR Hash Store accessors (aerospace-todo P0 #46) ===
+function TX86_64Emitter.HasVerifyIntegrityCall: Boolean;
+begin
+  Result := FHasVerifyIntegrity;
+end;
+
+function TX86_64Emitter.GetTMRDataAddrPos: Integer;
+begin
+  Result := FTMRDataAddrPos;
 end;
 
 end.

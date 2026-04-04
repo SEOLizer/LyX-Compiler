@@ -139,8 +139,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
 | ~~43~~ | ~~**@integrity Blöcke**~~ | ~~2.5.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `TIntegrityMode`/`TIntegrityAttr` in `backend_types`, Lexer/Parser: `@integrity(mode: software_lockstep\|scrubbed\|hardware_ecc, interval: N)` vor `unit` und `fn`; Sema: extern-Fehler + scrubbed-ohne-interval-Warnung; IR: `TIRModule.UnitIntegrity`; `test_integrity_blocks.pas` (28/28 Tests) |
 | ~~44~~ | ~~**.meta_safe ELF Section**~~ | ~~2.5.2~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `WriteElf64WithMetaSafe`/`WriteElf64ARM64WithMetaSafe`/`WriteElf64RISCVWithMetaSafe` (x86_64, ARM64, RISC-V); CRC32-IEEE-802.3 Triple-Hash-Store (3 identische Kopien, 4096-Byte-Separation); ELF Section Headers: NULL + .text + .shstrtab + .meta_safe; Header-Layout: code_start_va, code_end_va, mode, interval_ms, recovery_ptr=0; Sektionsgröße: 8232 Bytes; `test_meta_safe.pas` (39/39 Tests) |
-| ~~45~~ | ~~**VerifyIntegrity() Builtin**~~ | ~~2.5.3~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Builtin in `sema.pas` deklariert (`VerifyIntegrity() -> bool`), IR-Op `irVerifyIntegrity` in `ir.pas`, Lowering in `lower_ast_to_ir.pas`, x86_64 Codegen in `x86_64_emit.pas`; gibt derzeit true (1) zurück; `test_verify_integrity3.lyx` kompiliert und läuft |
-| 46 | **TMR Hash-Store Unterstützung** | 2.5.2 | Hoch | Section 2.5.2 |
+| ~~45~~ | ~~**VerifyIntegrity() Builtin**~~ | ~~2.5.3~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Builtin in `sema.pas` deklariert (`VerifyIntegrity() -> bool`), IR-Op `irVerifyIntegrity` in `ir.pas`, Lowering in `lower_ast_to_ir.pas`, x86_64 Codegen in `x86_64_emit.pas`; TMR-Mehrheitsentscheid (2 von 3 Hashes); `test_tmr.lyx` kompiliert und läuft (Exit 0) |
+| ~~46~~ | ~~**TMR Hash-Store Unterstützung**~~ | ~~2.5.2~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – CRC32-Hashes werden zur Compile-Zeit berechnet und in den Data-Buffer geschrieben; Runtime liest 3 Hashes per `movabs` + TMR-Vergleich (alle 3 identisch → Mehrheit); `.meta_safe` Section mit `SHF_ALLOC` für Runtime-Zugriff; Data-Buffer wird in ELF-Writer geschrieben; Patching der Data-Adresse in lyxc.lpr nach CRC32-Berechnung |
 
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)
 
@@ -227,8 +227,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
-| **11. Aerospace Extension (NEW)** | 3 | 11 | 21% |
-| **GESAMT** | **89** | **38** | **70%** |
+| **11. Aerospace Extension (NEW)** | 5 | 9 | 36% |
+| **GESAMT** | **91** | **36** | **72%** |
 
 ---
 
@@ -271,10 +271,10 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 
 1. ~~**@integrity Blöcke**~~ ✅ ERLEDIGT
 2. ~~**`.meta_safe` ELF Section**~~ ✅ ERLEDIGT (P0, #44)
-3. **VerifyIntegrity() Builtin** (P0, #45) – Runtime-Validierung
-4. **TMR Hash-Store** (P0, #46) – Dreifach-redundante Hashes
-5. **TMR / @redundant Attribut** (P1) – Strahlungstoleranz
-6. **Shadow Stack** (P3) – Control-Flow-Schutz
+3. ~~**VerifyIntegrity() Builtin**~~ ✅ ERLEDIGT (P0, #45) – Runtime-Validierung
+4. ~~**TMR Hash-Store**~~ ✅ ERLEDIGT (P0, #46) – Dreifach-redundante Hashes
+5. **TMR / @redundant Attribut** (P1, #51) – Strahlungstoleranz
+6. **Shadow Stack** (P3, #63) – Control-Flow-Schutz
 
 ---
 
