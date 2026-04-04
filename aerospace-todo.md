@@ -16,7 +16,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 
 ---
 
-## ✅ Abgeschlossene Tasks (86 von 127)
+## ✅ Abgeschlossene Tasks (89 von 127)
 
 ### 1. DO-178C Software Compliance
 
@@ -137,8 +137,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~3~~ | ~~**assert() Builtin**~~ | ~~7.1~~ | ~~Mittel~~ | ✅ |
 | ~~4~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ (MISRA C) |
 | ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ |
-| 43 | **@integrity Blöcke** | 2.5.1 | Hoch | Section 2.5.1 |
-| 44 | **.meta_safe ELF Section** | 2.5.2 | Hoch | Section 2.5.2 |
+| ~~43~~ | ~~**@integrity Blöcke**~~ | ~~2.5.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `TIntegrityMode`/`TIntegrityAttr` in `backend_types`, Lexer/Parser: `@integrity(mode: software_lockstep\|scrubbed\|hardware_ecc, interval: N)` vor `unit` und `fn`; Sema: extern-Fehler + scrubbed-ohne-interval-Warnung; IR: `TIRModule.UnitIntegrity`; `test_integrity_blocks.pas` (28/28 Tests) |
+| ~~44~~ | ~~**.meta_safe ELF Section**~~ | ~~2.5.2~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – `WriteElf64WithMetaSafe`/`WriteElf64ARM64WithMetaSafe`/`WriteElf64RISCVWithMetaSafe` (x86_64, ARM64, RISC-V); CRC32-IEEE-802.3 Triple-Hash-Store (3 identische Kopien, 4096-Byte-Separation); ELF Section Headers: NULL + .text + .shstrtab + .meta_safe; Header-Layout: code_start_va, code_end_va, mode, interval_ms, recovery_ptr=0; Sektionsgröße: 8232 Bytes; `test_meta_safe.pas` (39/39 Tests) |
 | 45 | **VerifyIntegrity() Builtin** | 2.5.3 | Mittel | Section 2.5.3 |
 | 46 | **TMR Hash-Store Unterstützung** | 2.5.2 | Hoch | Section 2.5.2 |
 
@@ -227,8 +227,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
-| **11. Aerospace Extension (NEW)** | 1 | 13 | 7% |
-| **GESAMT** | **87** | **40** | **68%** |
+| **11. Aerospace Extension (NEW)** | 3 | 11 | 21% |
+| **GESAMT** | **89** | **38** | **70%** |
 
 ---
 
@@ -269,12 +269,12 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 
 ## Empfohlene nächste Schritte (Priorität)
 
-1. **@integrity Blöcke und .meta_safe Section** (P0) – Core der Aerospace Extension
-2. **Bounded While Loops** (P1) – Deterministik für Echtzeit
-3. **TMR / @redundant Attribut** (P1) – Strahlungstoleranz
-4. **VerifyIntegrity() Builtin** (P0) – Runtime-Validierung
-5. **Shadow Stack** (P3) – Control-Flow-Schutz
-6. **@flight_crit Sektion** (P1) – Kritische Code-Bereiche
+1. ~~**@integrity Blöcke**~~ ✅ ERLEDIGT
+2. ~~**`.meta_safe` ELF Section**~~ ✅ ERLEDIGT (P0, #44)
+3. **VerifyIntegrity() Builtin** (P0, #45) – Runtime-Validierung
+4. **TMR Hash-Store** (P0, #46) – Dreifach-redundante Hashes
+5. **TMR / @redundant Attribut** (P1) – Strahlungstoleranz
+6. **Shadow Stack** (P3) – Control-Flow-Schutz
 
 ---
 

@@ -1383,3 +1383,104 @@ lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
 - `backend/xtensa/xtensa_emit.pas` - Xtensa Code-Emitter
 - `backend/esp32/syscalls_esp32.pas` - ESP32-Syscall-Definitionen
 - `backend/esp32/elf32_writer.pas` - ELF32-Objekt-Writer
+
+---
+
+## @integrity – Integritäts-Management (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+
+Einheit- und Funktions-Level-Annotationen für strahlungstolerante und sicherheitskritische Code-Segmente.
+Implementiert **aerospace.pdf v2 Sections 2.5.1–2.5.2**.
+
+### Syntax
+
+```lyx
+// Unit-Level: gilt für die gesamte Einheit
+@integrity(mode: software_lockstep, interval: 50)
+unit flight.ctrl;
+
+@integrity(mode: scrubbed, interval: 100)
+unit nav.core;
+
+@integrity(mode: hardware_ecc, interval: 250)
+unit sensor.fusion;
+
+// Funktions-Level: gilt nur für diese Funktion
+@integrity(mode: scrubbed, interval: 100)
+fn critical_update(): int64 { return 0; }
+```
+
+### Parameter
+
+| Parameter | Werte | Bedeutung |
+|-----------|-------|-----------|
+| `mode` | `software_lockstep` | Redundante Ausführung mit Ergebnisvergleich |
+| `mode` | `scrubbed` | Periodischer Hintergrund-CRC-Memory-Sweep |
+| `mode` | `hardware_ecc` | Vertraut auf Hardware-ECC-Speicherkorrektur |
+| `interval` | ms > 0 | Integritätsprüf-/Scrub-Intervall in Millisekunden |
+
+### Semantische Regeln
+
+- `@integrity` auf `extern fn` → Fehler (nicht erlaubt)
+- `mode: scrubbed` ohne `interval` → Warnung (Intervall empfohlen)
+- `mode: software_lockstep` ohne `interval` → Warnung
+- Unit-Level `@integrity` steht vor der `unit`-Deklaration (erste Zeile der Datei)
+- Funktion-Level `@integrity` steht zusammen mit anderen `@`-Attributen vor `fn`
+
+### .meta_safe ELF-Sektion (aerospace.pdf Section 2.5.2)
+
+Wenn `@integrity` auf einer `unit`-Deklaration steht, erzeugt der Compiler eine
+benutzerdefinierte `.meta_safe` ELF-Sektion. Diese enthält Integritätsmetadaten
+und einen dreifachen CRC32-Hash-Store für Strahlungstoleranz.
+
+**Sektion-Layout (8232 Bytes = 0x2028):**
+
+| Offset | Feld | Typ | Beschreibung |
+|--------|------|-----|-------------|
+| 0..7 | `code_start_va` | uint64 LE | Start-VA des Code-Segments |
+| 8..15 | `code_end_va` | uint64 LE | End-VA des Code-Segments |
+| 16..19 | `mode` | uint32 LE | 1=lockstep, 2=scrubbed, 3=hardware_ecc |
+| 20..23 | `interval_ms` | uint32 LE | Intervall in Millisekunden |
+| 24..31 | `recovery_ptr` | uint64 LE | Recovery-Funktionszeiger (0 = nicht gesetzt) |
+| 32..35 | `hash_copy_1` | uint32 LE | CRC32 IEEE 802.3 des Code-Segments |
+| 36..4127 | — | 4092 Bytes | Padding (4096-Byte-Separation) |
+| 4128..4131 | `hash_copy_2` | uint32 LE | Identische CRC32-Kopie 2 |
+| 4132..8223 | — | 4092 Bytes | Padding (4096-Byte-Separation) |
+| 8224..8227 | `hash_copy_3` | uint32 LE | Identische CRC32-Kopie 3 |
+| 8228..8231 | — | 4 Bytes | Abschluss-Padding |
+
+**Strahlungstoleranz:** Drei identische CRC32-Kopien mit je 4096-Byte-Abstand.
+Ein Single-Event-Upset (SEU) verfälscht höchstens eine Kopie — erkennbar durch Mehrheitsabstimmung.
+
+**CRC32-Algorithmus:** IEEE 802.3, Polynom `0xEDB88320` (reflected).
+
+**ELF Section Headers:** `NULL` + `.text` + `.shstrtab` + `.meta_safe`
+- `.meta_safe` hat `sh_flags = 0` (kein `SHF_ALLOC` — reine Metadaten, nicht im Adressraum geladen)
+
+**Unterstützte Backends:** x86_64 (`elf64_writer.pas`), ARM64 (`elf64_arm64_writer.pas`), RISC-V (`elf64_riscv_writer.pas`)
+
+### IR-Repräsentation
+
+```pascal
+// backend_types.pas
+TIntegrityMode = (imNone, imSoftwareLockstep, imScrubbed, imHardwareEcc);
+TIntegrityAttr = record
+  Mode:     TIntegrityMode;
+  Interval: Int64;          // ms; 0 = nicht gesetzt
+end;
+
+// TIRModule
+UnitIntegrity: TIntegrityAttr;  // gesetzt wenn @integrity vor unit steht
+
+// TIRFunction.SafetyPragmas
+Integrity: TIntegrityAttr;      // gesetzt wenn @integrity vor fn steht
+```
+
+### Implementierungsdetails
+
+- **Lexer/Parser**: `@integrity(mode: ..., interval: N)` – Pending-Feld-Ansatz:
+  `ParseProgram` liest `@integrity` vorab in `FPendingIntegrity`; `ParseUnitDecl`
+  übernimmt es für die Unit, `ParseFuncAttrs` für Funktionen.
+- **Sema**: `sema.pas` prüft extern-fn-Fehler und scrubbed-ohne-interval-Warnung.
+- **IR-Lowering**: `lower_ast_to_ir.pas` kopiert `IntegrityAttr` → `TIRModule.UnitIntegrity`.
+- **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe` wenn `UnitIntegrity.Mode <> imNone`.
+- **Tests**: `test_integrity_blocks.pas` (28/28), `test_meta_safe.pas` (39/39)

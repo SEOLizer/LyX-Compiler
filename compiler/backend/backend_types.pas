@@ -18,12 +18,23 @@ type
   { DAL (Design Assurance Level): dalNone = not set, dalD..dalA = DO-178C level }
   TDALLevel = (dalNone, dalD, dalC, dalB, dalA);
 
+  { --- Integrity Management Types (aerospace-todo P0 #43) --- }
+  { Integrity mode for @integrity(mode: ...) — imNone = not set }
+  TIntegrityMode = (imNone, imSoftwareLockstep, imScrubbed, imHardwareEcc);
+
+  { Integrity attribute attached to unit or function declarations }
+  TIntegrityAttr = record
+    Mode:     TIntegrityMode; // @integrity(mode: software_lockstep|scrubbed|hardware_ecc)
+    Interval: Int64;          // @integrity(interval: N) — check interval in ms (0 = not set)
+  end;
+
   { Aggregated safety pragmas attached to a function declaration }
   TSafetyPragmas = record
-    DALLevel:   TDALLevel; // @dal(A|B|C|D)  — DO-178C assurance level
-    IsCritical: Boolean;   // @critical       — safety-critical function
-    WCETBudget: Int64;     // @wcet(N)        — WCET budget in microseconds (0 = not set)
-    StackLimit: Int64;     // @stack_limit(N) — max stack usage in bytes     (0 = not set)
+    DALLevel:   TDALLevel;     // @dal(A|B|C|D)  — DO-178C assurance level
+    IsCritical: Boolean;       // @critical       — safety-critical function
+    WCETBudget: Int64;         // @wcet(N)        — WCET budget in microseconds (0 = not set)
+    StackLimit: Int64;         // @stack_limit(N) — max stack usage in bytes     (0 = not set)
+    Integrity:  TIntegrityAttr; // @integrity(mode:..., interval:N) — integrity protection
   end;
 
   { --- Object Writer Interface --- }

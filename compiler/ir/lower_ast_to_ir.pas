@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager, tobject;
+  ast, ir, diag, lexer, unit_manager, tobject, backend_types;
 
 type
   TConstValue = class
@@ -394,7 +394,13 @@ begin
   for i := 0 to High(prog.Decls) do
   begin
     node := prog.Decls[i];
-    if node is TAstStructDecl then
+    if node is TAstUnitDecl then
+    begin
+      // Propagate @integrity attribute from unit declaration to IR module
+      if TAstUnitDecl(node).IntegrityAttr.Mode <> imNone then
+        FModule.UnitIntegrity := TAstUnitDecl(node).IntegrityAttr;
+    end
+    else if node is TAstStructDecl then
       FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node))
     else if node is TAstClassDecl then
     begin

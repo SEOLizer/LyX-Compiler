@@ -17,6 +17,9 @@ type
     FLastParamListVarArgs: Boolean;
     FCurrentTypeParams: TStringArray; // type params of current generic function
     FNoStructLit: Boolean; // when True, suppress struct literal parsing (used for match expr)
+    // @integrity pre-parsed at top of file before fn or unit (aerospace-todo P0 #43)
+    FPendingIntegrity: TIntegrityAttr;
+    FHasPendingIntegrity: Boolean;
 
     procedure Advance; // setzt FCurTok
     function Check(kind: TTokenKind): Boolean;
@@ -136,6 +139,9 @@ begin
   FLexer := lexer;
   FDiag := diag;
   FHasCur := True;
+  FHasPendingIntegrity := False;
+  FPendingIntegrity.Mode     := imNone;
+  FPendingIntegrity.Interval := 0;
   Advance; // load first token
 end;
 
@@ -159,8 +165,74 @@ var
   cRetType: TAurumType;
   cLyxType: string;
   pi: Integer;
+  peekTok: TToken;
+  integrityModeStr: string;
+  integrityInterval: Int64;
 begin
   decls := nil;
+  // Pre-parse optional @integrity(...) at the very start of the file.
+  // Stored in FPendingIntegrity and consumed by either ParseUnitDecl (unit-level)
+  // or ParseFuncAttrs (function-level). (aerospace-todo P0 #43)
+  if Check(tkAt) then
+  begin
+    peekTok := FLexer.PeekToken;
+    if (peekTok.Kind = tkIdent) and (peekTok.Value = 'integrity') then
+    begin
+      Advance; // consume '@'
+      Advance; // consume 'integrity'
+      Expect(tkLParen);
+      if Check(tkIdent) and (FCurTok.Value = 'mode') then
+      begin
+        Advance;
+        Expect(tkColon);
+        if Check(tkIdent) then
+        begin
+          integrityModeStr := FCurTok.Value;
+          if integrityModeStr = 'software_lockstep' then
+            FPendingIntegrity.Mode := imSoftwareLockstep
+          else if integrityModeStr = 'scrubbed' then
+            FPendingIntegrity.Mode := imScrubbed
+          else if integrityModeStr = 'hardware_ecc' then
+            FPendingIntegrity.Mode := imHardwareEcc
+          else
+            FDiag.Error('unknown integrity mode ''' + integrityModeStr +
+              '''; expected software_lockstep, scrubbed or hardware_ecc', FCurTok.Span);
+          Advance;
+        end
+        else
+          FDiag.Error('expected integrity mode after mode:', FCurTok.Span);
+      end
+      else
+        FDiag.Error('expected ''mode'' as first argument of @integrity', FCurTok.Span);
+      if Accept(tkComma) then
+      begin
+        if Check(tkIdent) and (FCurTok.Value = 'interval') then
+        begin
+          Advance;
+          Expect(tkColon);
+          if Check(tkIntLit) then
+          begin
+            try
+              integrityInterval := StrToInt64(FCurTok.Value);
+              if integrityInterval <= 0 then
+                FDiag.Error('@integrity interval must be a positive integer (ms)', FCurTok.Span)
+              else
+                FPendingIntegrity.Interval := integrityInterval;
+            except
+              FDiag.Error('invalid @integrity interval value', FCurTok.Span);
+            end;
+            Advance;
+          end
+          else
+            FDiag.Error('expected integer (ms) after interval:', FCurTok.Span);
+        end
+        else
+          FDiag.Error('expected ''interval'' after comma in @integrity', FCurTok.Span);
+      end;
+      Expect(tkRParen);
+      FHasPendingIntegrity := (FPendingIntegrity.Mode <> imNone);
+    end;
+  end;
   // optional unit declaration
   if Check(tkUnit) then
   begin
@@ -283,6 +355,7 @@ var
   params: TAstParamList;
   retType: TAurumType;
   linkName: string;
+  tmpPragmas: TSafetyPragmas;
 begin
   isExtern := False;
   if Check(tkPublic) then
@@ -355,6 +428,16 @@ begin
       TAstFuncDecl(Result).IsExtern := True;
       TAstFuncDecl(Result).IsVarArgs := FLastParamListVarArgs;
       TAstFuncDecl(Result).LibraryName := linkName;
+      // Inject pending @integrity if pre-parsed at file start (aerospace-todo P0 #43)
+      if FHasPendingIntegrity then
+      begin
+        tmpPragmas := TAstFuncDecl(Result).SafetyPragmas;
+        tmpPragmas.Integrity := FPendingIntegrity;
+        TAstFuncDecl(Result).SafetyPragmas := tmpPragmas;
+        FHasPendingIntegrity := False;
+        FPendingIntegrity.Mode     := imNone;
+        FPendingIntegrity.Interval := 0;
+      end;
       Exit(Result);
     end
     else
@@ -940,6 +1023,12 @@ begin
   end;
   Expect(tkSemicolon);
   Result := TAstUnitDecl.Create(path, FCurTok.Span);
+  // Apply any @integrity pre-parsed at the top of the file
+  if FHasPendingIntegrity then
+  begin
+    Result.IntegrityAttr := FPendingIntegrity;
+    FHasPendingIntegrity := False;
+  end;
 end;
 
 function TParser.ParseImportDecl: TAstImportDecl;
@@ -3019,10 +3108,20 @@ var
   budget: Int64;
 begin
   energyLevel := eelNone;
-  safetyPragmas.DALLevel   := dalNone;
-  safetyPragmas.IsCritical := False;
-  safetyPragmas.WCETBudget := 0;
-  safetyPragmas.StackLimit := 0;
+  safetyPragmas.DALLevel          := dalNone;
+  safetyPragmas.IsCritical        := False;
+  safetyPragmas.WCETBudget        := 0;
+  safetyPragmas.StackLimit        := 0;
+  safetyPragmas.Integrity.Mode     := imNone;
+  safetyPragmas.Integrity.Interval := 0;
+  // Inject any @integrity pre-parsed at the top of the file (aerospace-todo P0 #43)
+  if FHasPendingIntegrity then
+  begin
+    safetyPragmas.Integrity := FPendingIntegrity;
+    FHasPendingIntegrity := False;
+    FPendingIntegrity.Mode     := imNone;
+    FPendingIntegrity.Interval := 0;
+  end;
 
   // Loop: consume zero or more '@attrName[(args)]' sequences
   while Check(tkAt) do
@@ -3134,6 +3233,62 @@ begin
       end
       else
         FDiag.Error('expected integer (bytes) after @stack_limit(', FCurTok.Span);
+      Expect(tkRParen);
+    end
+
+    // --- @integrity(mode: software_lockstep|scrubbed|hardware_ecc, interval: N) ---
+    else if attrName = 'integrity' then
+    begin
+      Expect(tkLParen);
+      // mode: <IntegrityMode>
+      if Check(tkIdent) and (FCurTok.Value = 'mode') then
+      begin
+        Advance; // consume 'mode'
+        Expect(tkColon);
+        if Check(tkIdent) then
+        begin
+          if FCurTok.Value = 'software_lockstep' then
+            safetyPragmas.Integrity.Mode := imSoftwareLockstep
+          else if FCurTok.Value = 'scrubbed' then
+            safetyPragmas.Integrity.Mode := imScrubbed
+          else if FCurTok.Value = 'hardware_ecc' then
+            safetyPragmas.Integrity.Mode := imHardwareEcc
+          else
+            FDiag.Error('unknown integrity mode ''' + FCurTok.Value +
+              '''; expected software_lockstep, scrubbed or hardware_ecc', FCurTok.Span);
+          Advance;
+        end
+        else
+          FDiag.Error('expected integrity mode after mode:', FCurTok.Span);
+      end
+      else
+        FDiag.Error('expected ''mode'' as first argument of @integrity', FCurTok.Span);
+      // , interval: N
+      if Accept(tkComma) then
+      begin
+        if Check(tkIdent) and (FCurTok.Value = 'interval') then
+        begin
+          Advance; // consume 'interval'
+          Expect(tkColon);
+          if Check(tkIntLit) then
+          begin
+            try
+              budget := StrToInt64(FCurTok.Value);
+              if budget <= 0 then
+                FDiag.Error('@integrity interval must be a positive integer (ms)', FCurTok.Span)
+              else
+                safetyPragmas.Integrity.Interval := budget;
+            except
+              FDiag.Error('invalid @integrity interval value', FCurTok.Span);
+            end;
+            Advance;
+          end
+          else
+            FDiag.Error('expected integer (ms) after interval:', FCurTok.Span);
+        end
+        else
+          FDiag.Error('expected ''interval'' after comma in @integrity', FCurTok.Span);
+      end;
       Expect(tkRParen);
     end
 
