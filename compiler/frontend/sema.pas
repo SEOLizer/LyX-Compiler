@@ -5518,11 +5518,20 @@ begin
   ResolveVMTForClasses;
   RegisterInheritedMethods;
 
-  // Safety-pragma validation pass (aerospace-todo P1 #6)
+  // Safety-pragma validation pass (aerospace-todo P1 #6, P0 #43)
   for i := 0 to High(prog.Decls) do
   begin
     node := prog.Decls[i];
-    if node is TAstFuncDecl then
+    // @integrity unit-level validation
+    if node is TAstUnitDecl then
+    begin
+      if (TAstUnitDecl(node).IntegrityAttr.Mode = imScrubbed) and
+         (TAstUnitDecl(node).IntegrityAttr.Interval <= 0) then
+        FDiag.Warning('unit ''' + TAstUnitDecl(node).UnitPath +
+          ''' has @integrity(mode: scrubbed) without interval; scrubbing requires a check interval (ms)',
+          node.Span);
+    end
+    else if node is TAstFuncDecl then
     begin
       fn := TAstFuncDecl(node);
       // @critical on extern function makes no sense
@@ -5537,6 +5546,14 @@ begin
       // @dal(A) without @critical: note that critical flag is recommended
       if (fn.SafetyPragmas.DALLevel = dalA) and not fn.SafetyPragmas.IsCritical then
         FDiag.Warning('DAL-A function ''' + fn.Name + ''' should be marked @critical', fn.Span);
+      // @integrity on extern function cannot be enforced
+      if fn.IsExtern and (fn.SafetyPragmas.Integrity.Mode <> imNone) then
+        FDiag.Error('@integrity pragma on extern function ''' + fn.Name + ''' cannot be enforced', fn.Span);
+      // @integrity(mode: scrubbed) requires a positive interval
+      if (fn.SafetyPragmas.Integrity.Mode = imScrubbed) and
+         (fn.SafetyPragmas.Integrity.Interval <= 0) then
+        FDiag.Warning('@integrity(mode: scrubbed) on ''' + fn.Name +
+          ''' has no interval set; scrubbing requires a check interval (ms)', fn.Span);
     end;
   end;
 
