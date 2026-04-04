@@ -34,11 +34,12 @@ type
 
   { Aggregated safety pragmas attached to a function declaration }
   TSafetyPragmas = record
-    DALLevel:   TDALLevel;     // @dal(A|B|C|D)  — DO-178C assurance level
-    IsCritical: Boolean;       // @critical       — safety-critical function
-    WCETBudget: Int64;         // @wcet(N)        — WCET budget in microseconds (0 = not set)
-    StackLimit: Int64;         // @stack_limit(N) — max stack usage in bytes     (0 = not set)
-    Integrity:  TIntegrityAttr; // @integrity(mode:..., interval:N) — integrity protection
+    DALLevel:        TDALLevel;     // @dal(A|B|C|D)  — DO-178C assurance level
+    IsCritical:      Boolean;       // @critical       — safety-critical function
+    WCETBudget:      Int64;         // @wcet(N)        — WCET budget in microseconds (0 = not set)
+    StackLimit:      Int64;         // @stack_limit(N) — max stack usage in bytes     (0 = not set)
+    Integrity:       TIntegrityAttr; // @integrity(mode:..., interval:N) — integrity protection
+    FPDeterministic: Boolean;       // @flight_crit    — strict FP determinism (aerospace-todo P2 #58)
   end;
 
   { --- Object Writer Interface --- }

@@ -215,12 +215,18 @@ begin
     irFAdd, irFSub, irFMul, irFDiv,
     irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
       begin
+        // FP Constant Folding deaktiviert für Determinismus (aerospace-todo P2 #58)
+        // Compiler-Rundung kann von Runtime-Rundung abweichen (z.B. x86 80-bit FPU vs SSE2)
+        // Für @flight_crit-Funktionen muss FP-Berechnung deterministisch sein
+        Exit;
+        {
         if (instr.Src1 < 0) or (instr.Src2 < 0) then Exit;
         folded.Op := irConstFloat;
         folded.Dest := instr.Dest;
         // Für Float brauchen wir die tatsächlichen Werte - hier vereinfacht
         folded.ImmFloat := EvaluateConstFloat(instr.Op, instr.Src1, instr.Src2);
         Result := True;
+        }
       end;
   end;
 end;

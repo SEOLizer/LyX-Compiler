@@ -3981,6 +3981,8 @@ var
   ok: Boolean;
   idx: Integer;
   other: TAstStructDecl;
+  nestedIdx: Integer;
+  nestedField: TStructField;
   // helper
   function TypeSizeAndAlign(t: TAurumType; out asz, aalign: Integer): Boolean;
   begin
@@ -4019,6 +4021,12 @@ begin
       for fldIdx := 0 to High(sd.Fields) do
       begin
         f := sd.Fields[fldIdx];
+        // Flat struct validation: no pointer fields allowed (aerospace-todo P2 #57)
+        if sd.IsFlat and (f.FieldType <> atUnresolved) then
+        begin
+          if IsPointerType(f.FieldType) then
+            FDiag.Error('flat struct ''' + sd.Name + ''' cannot have pointer field: ' + f.Name, sd.Span);
+        end;
         // determine field size/alignment
         if f.FieldType <> atUnresolved then
         begin
@@ -4033,6 +4041,21 @@ begin
               if other.Size = 0 then begin ok := False; Break; end;
               fsize := other.Size;
               falign := other.Align;
+              // Flat struct: nested struct must also be flat (aerospace-todo P2 #57)
+              if sd.IsFlat and other.IsFlat then
+              begin
+                // Nested flat struct is OK — it has its own pointer check
+              end
+              else if sd.IsFlat and not other.IsFlat then
+              begin
+                // Check if nested struct has pointer fields
+                for nestedIdx := 0 to High(other.Fields) do
+                begin
+                  nestedField := other.Fields[nestedIdx];
+                  if IsPointerType(nestedField.FieldType) then
+                    FDiag.Error('flat struct ''' + sd.Name + ''' cannot have non-flat nested struct field: ' + f.Name, sd.Span);
+                end;
+              end;
             end
             else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.FieldTypeName) >= 0) then
             begin
