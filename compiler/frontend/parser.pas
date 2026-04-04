@@ -1051,6 +1051,7 @@ var
   defaultBody: TAstStmt;
   caseObj: TAstCase;
   valExpr: TAstExpr;
+  limitExpr: TAstExpr;
   i: Integer;
 begin
   if Check(tkVar) or Check(tkLet) or Check(tkCo) then
@@ -1080,8 +1081,19 @@ begin
     Expect(tkLParen);
     cond := ParseExpr;
     Expect(tkRParen);
+    // Check for optional limit clause: limit(max_iterations)
+    limitExpr := nil;
+    if Accept(tkLimit) then
+    begin
+      Expect(tkLParen);
+      limitExpr := ParseExpr;
+      Expect(tkRParen);
+    end;
     bodyStmt := Self.ParseStmt;
-    Exit(TAstWhile.Create(cond, bodyStmt, cond.Span));
+    if Assigned(limitExpr) then
+      Exit(TAstWhile.CreateBounded(cond, limitExpr, bodyStmt, cond.Span))
+    else
+      Exit(TAstWhile.Create(cond, bodyStmt, cond.Span));
   end;
 
   // pool { ... } - Memory Pool Block

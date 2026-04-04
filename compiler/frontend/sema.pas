@@ -3631,6 +3631,13 @@ begin
         ctype := CheckExpr(wh.Cond);
         if not TypeEqual(ctype, atBool) then
           FDiag.Error('while condition must be bool', wh.Cond.Span);
+        // Check limit expression if bounded
+        if Assigned(wh.Limit) then
+        begin
+          vtype := CheckExpr(wh.Limit);
+          if not IsIntegerType(vtype) then
+            FDiag.Error('while limit must be integer', wh.Limit.Span);
+        end;
         PushScope;
         CheckStmt(wh.Body);
         PopScope;

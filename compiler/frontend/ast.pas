@@ -616,17 +616,23 @@ type
     property Default: TAstStmt read FDefault;
   end;
 
-  { While-Statement: while (cond) body }
+  { While-Statement: while (cond) [limit(n)] body }
   TAstWhile = class(TAstStmt)
   private
     FCond: TAstExpr;
     FBody: TAstStmt;
+    FLimit: TAstExpr;  // Optional: Maximum iteration count for bounded while
   public
     constructor Create(aCond: TAstExpr; aBody: TAstStmt;
       aSpan: TSourceSpan);
+    constructor CreateBounded(aCond: TAstExpr; aLimit: TAstExpr; aBody: TAstStmt;
+      aSpan: TSourceSpan);
     destructor Destroy; override;
+    function HasLimit: Boolean;
     property Cond: TAstExpr read FCond;
     property Body: TAstStmt read FBody;
+    property Limit: TAstExpr read FLimit write FLimit;
+    property IsBounded: Boolean read HasLimit;
   end;
 
   { For-Statement: for i := start to/downto end do stmt }
@@ -1822,13 +1828,29 @@ begin
   inherited Create(nkWhile, aSpan);
   FCond := aCond;
   FBody := aBody;
+  FLimit := nil;  // No limit by default
+end;
+
+constructor TAstWhile.CreateBounded(aCond: TAstExpr; aLimit: TAstExpr; aBody: TAstStmt;
+  aSpan: TSourceSpan);
+begin
+  inherited Create(nkWhile, aSpan);
+  FCond := aCond;
+  FLimit := aLimit;
+  FBody := aBody;
 end;
 
 destructor TAstWhile.Destroy;
 begin
   FCond.Free;
   FBody.Free;
+  FLimit.Free;
   inherited Destroy;
+end;
+
+function TAstWhile.HasLimit: Boolean;
+begin
+  Result := (FLimit <> nil);
 end;
 
 // ================================================================
