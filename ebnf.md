@@ -212,6 +212,31 @@ fn set_target_altitude(alt: int64): int64 {
 }
 ```
 
+### Bounded While Loops (aerospace-todo P1 #47)
+
+Für deterministische Echtzeit-Ausführung können While-Schleifen mit einem `limit` versehen werden:
+
+```ebnf
+WhileStmt     := 'while' '(' Expr ')' [ 'limit' '(' Expr ')' ] Block ;
+```
+
+**Beispiel:**
+```lyx
+// Unbounded (wie bisher)
+while (x < 100) {
+  x := x + 1;
+}
+
+// Bounded (max. 1000 Iterationen)
+while (x < 100) limit(1000) {
+  x := x + 1;
+}
+```
+
+- Das `limit` muss ein Integer-Literal oder ein konstanter Ausdruck sein
+- Compiler warnt bei nicht-bounded Loops in @flight_crit Sektionen
+- WCET-Analyse kann bounded loops genauer berechnen
+
 ### Compiler-Verhalten
 
 - **Lexer**: `..` wird als Token `tkDotDot` erkannt (vor `.` und vor `...`).

@@ -16,7 +16,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 
 ---
 
-## ✅ Abgeschlossene Tasks (81 von 127)
+## ✅ Abgeschlossene Tasks (82 von 127)
 
 ### 1. DO-178C Software Compliance
 
@@ -154,7 +154,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~10~~ | ~~**Pattern-Matching**~~ | ~~7.2, 10.1~~ | ~~Mittel~~ | ✅ |
 | ~~11~~ | ~~**MC/DC-Test-Suite**~~ | ~~10.4~~ | ~~Mittel~~ | ✅ |
 | 12 | **TrustZone (Cortex-M33+)** | 3.2 | Hoch | Section 3.2 |
-| 47 | **Bounded While Loops** | 2.1 | Mittel | Section 2.1: `while (...) limit(...)` |
+| ~~47~~ | ~~**Bounded While Loops**~~ | ~~2.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `tkLimit` Token, `TAstWhile.CreateBounded`, Parser mit `limit(...)`, Sema Typ-Check; Syntax: `while (cond) limit(n)` |
 | 48 | **@flight_crit Sektion** | 2.1 | Mittel | Section 2.1 |
 | 49 | **Priority-Attribute für Funktionen** | 2.1 | Mittel | Section 2.1 (Echtzeit-Scheduling) |
 | 50 | **Bit-Level Memory Mapping** | 2.2 | Mittel | Section 2.2: `at(bit_position)` |
@@ -218,7 +218,7 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | Kategorie | Erledigt | Offen | Fortschritt |
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
-| **2. Spracherweiterungen** | 4 | 14 | 22% |
+| **2. Spracherweiterungen** | 5 | 13 | 28% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 9 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
@@ -227,8 +227,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 7 | 11 | 39% |
-| **11. Aerospace Extension (NEW)** | 0 | 14 | 0% |
-| **GESAMT** | **81** | **46** | **64%** |
+| **11. Aerospace Extension (NEW)** | 1 | 13 | 7% |
+| **GESAMT** | **82** | **45** | **65%** |
 
 ---
 
