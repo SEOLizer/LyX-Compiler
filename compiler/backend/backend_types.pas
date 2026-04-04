@@ -22,6 +22,10 @@ type
   { Integrity mode for @integrity(mode: ...) — imNone = not set }
   TIntegrityMode = (imNone, imSoftwareLockstep, imScrubbed, imHardwareEcc);
 
+  { --- Endianness Types (aerospace-todo P2 #52) --- }
+  { Struct endianness annotation: enNative = not set (uses target arch endianness) }
+  TEndianType = (enNative, enBigEndian, enLittleEndian);
+
   { Integrity attribute attached to unit or function declarations }
   TIntegrityAttr = record
     Mode:     TIntegrityMode; // @integrity(mode: software_lockstep|scrubbed|hardware_ecc)
