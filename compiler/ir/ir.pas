@@ -187,6 +187,8 @@ type
     ClassDecls: array of TAstClassDecl; // stored class declarations
     // C FFI: maps extern function name → library name (e.g. 'sqlite3' → 'libsqlite3.so')
     ExternLibraries: TStringList; // Name=library pairs
+    // AST: Reference to program node for static analysis
+    ProgramNode: TAstProgram;
     constructor Create;
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
