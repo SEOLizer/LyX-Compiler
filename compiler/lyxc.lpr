@@ -651,6 +651,9 @@ begin
             d.PrintAll;
             Halt(1);
           end;
+          // Print any warnings (e.g. safety-pragma warnings) even on success
+          if d.WarningCount > 0 then
+            d.PrintAll;
         finally
           s.Free;
         end;

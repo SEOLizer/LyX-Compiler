@@ -768,6 +768,7 @@ type
     FIsStatic: Boolean; // true for static methods (no self parameter)
     FVisibility: TVisibility; // for class members (default: visPublic)
     FEnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
+    FSafetyPragmas: TSafetyPragmas; // Safety pragmas: @dal, @critical, @wcet, @stack_limit
     FLibraryName: string; // for external functions - library name to link against
     // VMT fields
     FIsVirtual: Boolean;
@@ -796,6 +797,7 @@ type
     property IsStatic: Boolean read FIsStatic write FIsStatic;
     property Visibility: TVisibility read FVisibility write FVisibility;
     property EnergyLevel: TEnergyLevel read FEnergyLevel write FEnergyLevel;
+    property SafetyPragmas: TSafetyPragmas read FSafetyPragmas write FSafetyPragmas;
     property LibraryName: string read FLibraryName write FLibraryName;
     // VMT properties
     property IsVirtual: Boolean read FIsVirtual write FIsVirtual;
@@ -2403,6 +2405,10 @@ begin
   FIsStatic := False;
   FVisibility := visPublic; // default: public
   FEnergyLevel := eelNone; // eelNone = use global level from --target-energy
+  FSafetyPragmas.DALLevel   := dalNone;
+  FSafetyPragmas.IsCritical := False;
+  FSafetyPragmas.WCETBudget := 0;
+  FSafetyPragmas.StackLimit := 0;
   // VMT fields initialization
   FIsVirtual := False;
   FIsOverride := False;

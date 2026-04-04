@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.7.0-aerospace
+Lyx Compiler v0.8.0-aerospace
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -58,6 +58,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Argv Builtins: GetArgC/GetArg — access command-line arguments (v0.5.7)
 ✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.7)
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
+✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
 ```
 
 ---
@@ -442,6 +443,37 @@ L1 cache footprint:    846 bytes
 ## DO-178C Safety-Critical Features
 
 Lyx supports **DO-178C DAL A/B/C** compliance for aerospace and safety-critical embedded systems.
+
+### Safety Pragmas (v0.8.0)
+
+Function-level safety annotations for DO-178C compliance can be applied in any combination before `fn`:
+
+```lyx
+// Full set of safety pragmas on one function
+@dal(A) @critical @wcet(100) @stack_limit(512)
+fn autopilot_update(): int64 {
+  return 0;
+}
+
+// DAL-B with WCET budget
+@dal(B) @wcet(1000)
+fn fuel_monitor(): int64 { return 1; }
+
+// Combined with @energy
+@energy(3) @dal(C) @wcet(5000)
+fn sensor_read(): int64 { return 42; }
+```
+
+| Pragma | Argument | Meaning |
+|--------|----------|---------|
+| `@dal(A)` | `A`, `B`, `C`, `D` | DO-178C Design Assurance Level |
+| `@critical` | — | Safety-critical function marker |
+| `@wcet(N)` | μs > 0 | Worst-Case Execution Time budget |
+| `@stack_limit(N)` | Bytes > 0 | Maximum stack usage limit |
+
+**Semantic rules:** `@critical`/`@wcet`/`@stack_limit` on `extern fn` → error.
+`@dal(A)` without `@critical` → warning (DAL A implies critical).
+Safety pragmas are stored in IR (`TIRFunction.SafetyPragmas`) for future WCET/stack-verification passes.
 
 ### Tool Qualification (TQL-5)
 

@@ -446,7 +446,9 @@ begin
         FTempCounter := 0;
        fn.ParamCount := Length(TAstFuncDecl(node).Params);
        fn.LocalCount := fn.ParamCount;
-       
+       // Copy safety pragmas from AST to IR
+       fn.SafetyPragmas := TAstFuncDecl(node).SafetyPragmas;
+
        // Calculate ReturnStructSize for struct-returning functions
        fn.ReturnStructSize := 0;
        if TAstFuncDecl(node).ReturnTypeName <> '' then

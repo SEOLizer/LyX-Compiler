@@ -5,11 +5,11 @@
 Dieses Dokument beschreibt den Fortschritt und die offenen Tasks zur Qualifizierung
 von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DAL A/B/C).
 
-**Stand:** 2026-04-03 | **Version:** 0.7.0-aerospace
+**Stand:** 2026-04-04 | **Version:** 0.8.0-aerospace
 
 ---
 
-## ✅ Abgeschlossene Tasks (71 von 113)
+## ✅ Abgeschlossene Tasks (72 von 113)
 
 ### 1. DO-178C Software Compliance
 
@@ -94,6 +94,13 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ---
 
+### 2. Spracherweiterungen
+
+#### 2.1 Safety-Pragmas – 1/3 ✅
+- [x] **Pragma-Parser** → `@dal(A|B|C|D)`, `@critical`, `@wcet(N)`, `@stack_limit(N)` – Parser, AST, IR-Propagation, Sema-Checks; `test_pragma_parser.pas` (30/30 Tests)
+
+---
+
 ### 10. Spezifische Implementierungs-Tasks (teilweise)
 
 #### 10.3 Backend – 3/6 ✅
@@ -119,7 +126,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 | # | Task | Sektion | Aufwand | Begründung |
 |---|------|---------|---------|------------|
-| 6 | **Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`) | 2.1, 10.1 | Hoch | Grundlage für alle safety-spezifischen Compiler-Features |
+| ~~6~~ | ~~**Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`)~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Parser, AST, IR-Propagation, Sema-Checks, 30/30 Tests |
 | 7 | **Range-Typen im Typsystem** | 2.2, 10.1 | Hoch | `type Altitude = int64 range -1000..60000` – Compile-Zeit und Runtime-Checks |
 | 8 | **Call-Graph: Statischer Aufrufgraph** | 6.1 | Mittel | Erforderlich für WCET-Analyse und Stack-Berechnung über Call-Grenzen hinweg |
 | 9 | **Map-File: Speicherlayout aller Symbole** | 6.1 | Mittel | Debug-Information für Zertifizierung und Audit |
@@ -175,7 +182,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | Kategorie | Erledigt | Offen | Fortschritt |
 |-----------|----------|-------|-------------|
 | **1. DO-178C Compliance** | 9 | 8 | 53% |
-| **2. Spracherweiterungen** | 0 | 15 | 0% |
+| **2. Spracherweiterungen** | 1 | 14 | 7% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 8 | 0 | 100% |
 | **5. Statische Analyse** | 9 | 6 | 60% |
@@ -184,7 +191,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | **8. Dokumentation** | 5 | 3 | 63% |
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 3 | 11 | 21% |
-| **GESAMT** | **45** | **70** | **39%** |
+| **GESAMT** | **46** | **69** | **40%** |
 
 ---
 
@@ -194,7 +201,8 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 2. **Assembly-Listing** (P0 #2) – Source-Zeilennummern in generierten Code einbetten
 3. **assert()/check() Builtins** (P0 #3) – Runtime-Assertions für DAL A
 4. **MISRA-Regeln** (P0 #4-5) – Sema-Checker Erweiterungen (geringer Aufwand, hoher Nutzen)
-5. **Pragma-Parser** (P1 #6) – Grundlage für @dal, @critical, @wcet, @stack_limit
+5. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
+6. **Range-Typen** (P1 #7) – `type Altitude = int64 range -1000..60000`
 
 ---
 
