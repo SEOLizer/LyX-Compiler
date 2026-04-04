@@ -22,7 +22,9 @@ type
     lrEmptyFunction,        // W010: Nicht-void Funktion ohne return
     lrFormatZeroDecimals,   // W011: :width:0 Format-Specifier (0 Dezimalstellen)
     lrStringConcatLiterals, // W012: Zwei String-Literale mit + (compile-time foldable)
-    lrPrintFloatIntArg      // W013: PrintFloat(f64(intLit)) — unnötiger Float-Cast eines Literals
+    lrPrintFloatIntArg,      // W013: PrintFloat(f64(intLit)) — unnötiger Float-Cast eines Literals
+    lrRecursiveFunction,     // W014: Rekursive Funktion (für Stack-Vorhersagbarkeit — MISRA 5.2)
+    lrImplicitTypeCast       // W015: Implizite Typkonvertierung ohne 'as' (MISRA 5.2)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -41,7 +43,9 @@ const
     lrMutableNeverMutated,
     lrFormatZeroDecimals,
     lrStringConcatLiterals,
-    lrPrintFloatIntArg
+    lrPrintFloatIntArg,
+    lrRecursiveFunction,
+    lrImplicitTypeCast
   ];
 
   { Human-readable Namen für die Regeln }
@@ -58,13 +62,15 @@ const
     'empty-function',
     'format-zero-decimals',
     'string-concat-literals',
-    'print-float-int-arg'
+    'print-float-int-arg',
+    'recursive-function',
+    'implicit-type-cast'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
     'W006', 'W007', 'W008', 'W009', 'W010',
-    'W011', 'W012', 'W013'
+    'W011', 'W012', 'W013', 'W014', 'W015'
   );
 
 type
@@ -94,6 +100,8 @@ type
     FScopes: array of TLintScope;
     FScopeCount: Integer;
     FWarnCount: Integer;
+    FCurrentFuncName: string;  // Track current function for recursion detection
+    FCurrentFuncDecl: TAstFuncDecl;  // Current function for implicit cast detection
 
     { Scope-Verwaltung }
     procedure PushScope;
@@ -129,6 +137,7 @@ type
     procedure CheckUnreachableCode(block: TAstBlock);
     procedure CheckEmptyBlock(block: TAstBlock; span: TSourceSpan);
     function BlockHasReturn(stmt: TAstStmt): Boolean;
+    procedure CheckImplicitCast(expr: TAstExpr);
 
     { Scope-Ende: Prüfung auf ungenutzte Variablen }
     procedure CheckUnusedVarsInCurrentScope;
@@ -389,6 +398,15 @@ begin
 
     nkCall:
     begin
+      { W014: Rekursive Funktion erkennen (für Stack-Vorhersagbarkeit — MISRA 5.2) }
+      if (FCurrentFuncName <> '') and (TAstCall(expr).Name = FCurrentFuncName) then
+      begin
+        if lrRecursiveFunction in FActiveRules then
+          Warn(lrRecursiveFunction,
+            'recursive call to ''' + FCurrentFuncName + ''' detected; recursion is not allowed for stack predictability (MISRA 5.2)',
+            expr.Span);
+      end;
+
       { W013: PrintFloat(intLit as f64) — unnötiger Cast eines Integer-Literals zu Float }
       if (TAstCall(expr).Name = 'PrintFloat')
         and (Length(TAstCall(expr).Args) = 1)
@@ -400,8 +418,13 @@ begin
             'PrintFloat() called with a constant integer cast to float; consider using PrintInt() instead',
             expr.Span);
       end;
+
+      { W015: Implizite Typkonvertierung in Funktionsaufrufen erkennen }
       for i := 0 to High(TAstCall(expr).Args) do
+      begin
         LintExpr(TAstCall(expr).Args[i]);
+        CheckImplicitCast(TAstCall(expr).Args[i]);
+      end;
     end;
 
     nkArrayLit:
@@ -622,12 +645,17 @@ end;
 procedure TLinter.LintFuncDecl(fn: TAstFuncDecl);
 var
   i: Integer;
+  oldFuncName: string;
+  oldFuncDecl: TAstFuncDecl;
 begin
   if fn = nil then Exit;
   if fn.IsExtern then Exit; // Extern-Deklarationen haben keinen Body
 
   { Naming-Prüfung für Funktionsnamen }
   CheckFunctionNaming(fn.Name, fn.Span);
+
+  { W014: Rekursive Funktion erkennen (für Stack-Vorhersagbarkeit — MISRA 5.2) }
+  { Wird während AST-Traversal geprüft: wenn ein Call die eigene Funktion aufruft }
 
   { Neuen Scope für den Funktionskörper }
   PushScope;
@@ -637,9 +665,19 @@ begin
     DeclareVar(fn.Params[i].Name, skLet,
       fn.Params[i].Span, True);
 
+  { Track current function for recursion and implicit cast detection }
+  oldFuncName := FCurrentFuncName;
+  oldFuncDecl := FCurrentFuncDecl;
+  FCurrentFuncName := fn.Name;
+  FCurrentFuncDecl := fn;
+
   { Body traversieren }
   if fn.Body <> nil then
     LintBlock(fn.Body);
+
+  { Restore previous function context }
+  FCurrentFuncName := oldFuncName;
+  FCurrentFuncDecl := oldFuncDecl;
 
   PopScope;
 end;
@@ -711,6 +749,64 @@ begin
     if Length(TAstBlock(stmt).Stmts) > 0 then
       Result := BlockHasReturn(
         TAstBlock(stmt).Stmts[High(TAstBlock(stmt).Stmts)]);
+  end;
+end;
+
+{ --- Implicit Type Cast Detection (MISRA 5.2) --- }
+
+procedure TLinter.CheckImplicitCast(expr: TAstExpr);
+var
+  castExpr: TAstCast;
+  srcType, dstType: TAurumType;
+  srcName, dstName: string;
+begin
+  if expr = nil then Exit;
+  if not (lrImplicitTypeCast in FActiveRules) then Exit;
+
+  if expr.Kind = nkCast then
+  begin
+    castExpr := TAstCast(expr);
+    srcType := castExpr.Expr.ResolvedType;
+    dstType := castExpr.CastType;
+
+    // Check for implicit-like casts (int <-> float, int <-> pointer, etc.)
+    // These are dangerous in safety-critical code
+    if (srcType = atInt64) and (dstType = atF64) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from int64 to f64; use explicit ''as f64'' with range check (MISRA 5.2)',
+        expr.Span);
+    end
+    else if (srcType = atF64) and (dstType = atInt64) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from f64 to int64; precision may be lost (MISRA 5.2)',
+        expr.Span);
+    end
+    else if (srcType = atInt64) and (dstType = atPChar) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from int64 to pchar; pointer from integer (MISRA 5.2)',
+        expr.Span);
+    end
+    else if (srcType = atPChar) and (dstType = atInt64) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from pchar to int64; integer from pointer (MISRA 5.2)',
+        expr.Span);
+    end
+    else if (srcType = atInt64) and (dstType = atBool) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from int64 to bool; use explicit comparison (MISRA 5.2)',
+        expr.Span);
+    end
+    else if (srcType = atBool) and (dstType = atInt64) then
+    begin
+      Warn(lrImplicitTypeCast,
+        'implicit type conversion from bool to int64; use explicit cast (MISRA 5.2)',
+        expr.Span);
+    end;
   end;
 end;
 

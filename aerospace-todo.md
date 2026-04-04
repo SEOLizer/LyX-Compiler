@@ -133,11 +133,12 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 |---|------|---------|---------|------------|
 | 13 | **Symbol-Table: DWARF Debug-Information** | 6.1 | Hoch | Debugger-Unterstützung, aber nicht zwingend für DO-178C erforderlich |
 | 14 | **Objektcode-Diff: Byte-für-Byte-Vergleich** | 6.1 | Niedrig | Automatisierter Diff zwischen Builds – teilweise durch Determinismus-Tests abgedeckt |
-| 15 | **MISRA-Regel: Keine rekursiven Funktionen** | 5.2 | Niedrig | Bereits durch Terminierungs-Analyse erkannt, muss nur als Fehler eskaliert werden |
-| 16 | **MISRA-Regel: Keine Pointer-Arithmetik** | 5.2 | Niedrig | Sema-Checker Erweiterung |
-| 17 | **MISRA-Regel: Switch-Cases vollständig** | 5.2 | Niedrig | Parser/Sema-Checker Erweiterung |
-| 18 | **MISRA-Regel: Maximale Funktionslänge (60 Zeilen)** | 5.2 | Niedrig | Linter-Regel |
-| 19 | **MISRA-Regel: Maximale Zyklomatische Komplexität (15)** | 5.2 | Mittel | IR-Pass zur Komplexitätsberechnung |
+| ~~15~~ | ~~**MISRA-Regel: Keine rekursiven Funktionen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter-Regel W014, erkennt rekursive Calls im AST |
+| ~~16~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter-Regel W015, erkennt int64↔f64, int64↔pchar, int64↔bool, bool↔int64 Casts |
+| 17 | **MISRA-Regel: Keine Pointer-Arithmetik** | 5.2 | Niedrig | Sema-Checker Erweiterung |
+| 18 | **MISRA-Regel: Switch-Cases vollständig** | 5.2 | Niedrig | Parser/Sema-Checker Erweiterung |
+| 19 | **MISRA-Regel: Maximale Funktionslänge (60 Zeilen)** | 5.2 | Niedrig | Linter-Regel |
+| 20 | **MISRA-Regel: Maximale Zyklomatische Komplexität (15)** | 5.2 | Mittel | IR-Pass zur Komplexitätsberechnung |
 | 20 | **WCET-Schätzung als IR-Pass** | 10.2 | Hoch | Worst-Case Execution Time – benötigt @wcet Pragma und Call-Graph |
 | 21 | **Stack-Nutzungs-Analyse über Call-Grenzen** | 10.2 | Mittel | Erweiterung der bestehenden Stack-Analyse |
 | 22 | **Deterministische Register-Allokierung** | 10.3 | Mittel | Backend-Erweiterung für reproduzierbare Register-Zuweisung |
@@ -177,7 +178,7 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | **2. Spracherweiterungen** | 0 | 15 | 0% |
 | **3. Backend-Sicherheit** | 14 | 1 | 93% |
 | **4. Test-Abdeckung** | 8 | 0 | 100% |
-| **5. Statische Analyse** | 7 | 8 | 47% |
+| **5. Statische Analyse** | 9 | 6 | 60% |
 | **6. Codegen-Sicherheit** | 0 | 9 | 0% |
 | **7. Laufzeit-Sicherheit** | 0 | 7 | 0% |
 | **8. Dokumentation** | 5 | 3 | 63% |
