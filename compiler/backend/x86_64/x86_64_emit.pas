@@ -688,6 +688,8 @@ var
   offset: Integer;
   negOffset: Integer;
   baseOffset: Integer;
+  mcdcDecisionID, mcdcCondIdx, mcdcCondResult, mcdcDecResult: Integer;
+  mcdcCounterIdx, mcdcCounterOffset: UInt64;
   slotCount: Integer;
   argCount: Integer;
   argTemps: array of Integer;
@@ -1959,16 +1961,27 @@ begin
               else if instr.ImmStr = '__mcdc_record' then
               begin
                 // MC/DC Coverage Recording (DO-178C DAL A)
-                // __mcdc_record(decisionID, condIdx, condResult)
-                // ImmInt = decisionID, LabelName = 'condIdx:condResult'
-                // Stub: write coverage event to stderr
-                // Format: "MC/DC: DEC=<id> COND=<idx> RES=<T/F>\n"
-                // For now: just increment a counter in data section
-                // Simplified: write byte to a coverage array
-                WriteMovRegImm64(FCode, RAX, UInt64(instr.ImmInt));  // decision ID
-                WriteMovRegImm64(FCode, RDI, 2);  // stderr
-                // Write a single byte marker
-                EmitU8(FCode, $C6); EmitU8(FCode, $05); EmitU32(FCode, 0); EmitU8(FCode, $FF);
+                // ImmInt encodes: decisionID (bits 0-15), condIdx (bits 16-23), 
+                //                 condResult (bit 24), decisionResult (bit 25)
+                mcdcDecisionID := instr.ImmInt and $FFFF;
+                mcdcCondIdx := (instr.ImmInt shr 16) and $FF;
+                mcdcCondResult := (instr.ImmInt shr 24) and 1;
+                mcdcDecResult := (instr.ImmInt shr 25) and 1;
+                
+                // Counter index in data section:
+                // Per decision: 2 (decision T/F) + 2*condCount (condition T/F)
+                // For 1-condition decisions: 4 counters per decision
+                if mcdcDecResult = 0 then mcdcCounterIdx := mcdcDecisionID * 4 + 1 else mcdcCounterIdx := mcdcDecisionID * 4;
+                mcdcCounterIdx := mcdcCounterIdx + 2 + mcdcCondIdx * 2;
+                if mcdcCondResult = 0 then mcdcCounterIdx := mcdcCounterIdx + 1;
+                mcdcCounterOffset := mcdcCounterIdx * 8;  // 8 bytes per int64 counter
+                
+                // lock inc qword [rip + data_section_offset + counterOffset]
+                EmitU8(FCode, $F0);  // LOCK prefix
+                EmitU8(FCode, $48);  // REX.W
+                EmitU8(FCode, $FF);  // INC r/m64
+                EmitU8(FCode, $05);  // mod=00, reg=000, rm=101 (RIP-relative)
+                FCode.WriteU32LE(mcdcCounterOffset);  // placeholder - will be patched
               end
               else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
               begin

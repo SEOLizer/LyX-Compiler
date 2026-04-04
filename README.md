@@ -476,9 +476,24 @@ Decision  | Function         | Line | T | F | Status
 ----------|------------------|------|---|---|--------
 DEC-   0  | main             |    0 | ? | ? | PARTIAL
 DEC-   1  | process_data     |    0 | ? | ? | PARTIAL
-DEC-   2  | validate_input   |    0 | ? | ? | PARTIAL
+DEC-   0  | main             |    1 |  0   |       0 |       0 | GAP
+  --> [GAP] Condition 0=TRUE: 0 hits
+  --> [GAP] Condition 0=FALSE: 0 hits
+  --> [GAP] Decision=TRUE: 0 hits
+  --> [GAP] Decision=FALSE: 0 hits
 
-Note: Full MC/DC coverage requires runtime execution data.
+=== Summary ===
+Total decisions:    1
+Fully covered:      0
+With gaps:          1
+MC/DC coverage:     0%
+```
+
+**Gap Detection:**
+- Condition TRUE/FALSE hit tracking per decision
+- Decision TRUE/FALSE hit tracking
+- "Decision never executed" detection
+- Atomic counter increments via `lock inc qword` for thread-safe runtime recording
 ```
 
 ### Deterministic Code Generation
