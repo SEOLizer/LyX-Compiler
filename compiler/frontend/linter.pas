@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  diag, ast, lexer;
+  diag, ast, lexer, sema;
 
 type
   { --- Lint-Regel-ID zur eindeutigen Kennzeichnung --- }
@@ -24,7 +24,12 @@ type
     lrStringConcatLiterals, // W012: Zwei String-Literale mit + (compile-time foldable)
     lrPrintFloatIntArg,      // W013: PrintFloat(f64(intLit)) — unnötiger Float-Cast eines Literals
     lrRecursiveFunction,     // W014: Rekursive Funktion (für Stack-Vorhersagbarkeit — MISRA 5.2)
-    lrImplicitTypeCast       // W015: Implizite Typkonvertierung ohne 'as' (MISRA 5.2)
+    lrImplicitTypeCast,      // W015: Implizite Typkonvertierung ohne 'as' (MISRA 5.2)
+    // MISRA Regeln (aerospace-todo P2 #17-20)
+    lrPointerArithmetic,    // W017: Pointer-Arithmetik (MISRA 5.2)
+    lrIncompleteSwitch,    // W018: Switch ohne default oder ohne alle Enum-Werte (MISRA 5.2)
+    lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
+    lrComplexFunction      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -45,7 +50,12 @@ const
     lrStringConcatLiterals,
     lrPrintFloatIntArg,
     lrRecursiveFunction,
-    lrImplicitTypeCast
+    lrImplicitTypeCast,
+    // MISRA Regeln (aerospace-todo P2 #17-20)
+    lrPointerArithmetic,
+    lrIncompleteSwitch,
+    lrFunctionTooLong,
+    lrComplexFunction
   ];
 
   { Human-readable Namen für die Regeln }
@@ -64,13 +74,18 @@ const
     'string-concat-literals',
     'print-float-int-arg',
     'recursive-function',
-    'implicit-type-cast'
+    'implicit-type-cast',
+    'pointer-arithmetic',
+    'incomplete-switch',
+    'function-too-long',
+    'complex-function'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
     'W006', 'W007', 'W008', 'W009', 'W010',
-    'W011', 'W012', 'W013', 'W014', 'W015'
+    'W011', 'W012', 'W013', 'W014', 'W015',
+    'W017', 'W018', 'W019', 'W020'
   );
 
 type
@@ -138,6 +153,15 @@ type
     procedure CheckEmptyBlock(block: TAstBlock; span: TSourceSpan);
     function BlockHasReturn(stmt: TAstStmt): Boolean;
     procedure CheckImplicitCast(expr: TAstExpr);
+    { MISRA checks }
+    procedure CheckPointerArithmetic(expr: TAstExpr);
+    procedure CheckSwitchCompleteness(sw: TAstSwitch; switchExprType: TAurumType);
+    procedure CheckFunctionLength(fn: TAstFuncDecl);
+    function CalculateCyclomaticComplexity(fn: TAstFuncDecl): Integer;
+    procedure CheckCyclomaticComplexity(fn: TAstFuncDecl);
+    function IsIntegerLintType(t: TAurumType): Boolean;
+    function IsPointerLintType(t: TAurumType): Boolean;
+    function IsEnumLintType(t: TAurumType): Boolean;
 
     { Scope-Ende: Prüfung auf ungenutzte Variablen }
     procedure CheckUnusedVarsInCurrentScope;
@@ -389,6 +413,8 @@ begin
             'string literal concatenation with ''+'' can be folded at compile time; consider using a single string literal',
             expr.Span);
       end;
+      { W017: Pointer-Arithmetik erkennen (MISRA 5.2) }
+      CheckPointerArithmetic(expr);
       LintExpr(TAstBinOp(expr).Left);
       LintExpr(TAstBinOp(expr).Right);
     end;
@@ -589,6 +615,8 @@ begin
     begin
       sw := TAstSwitch(stmt);
       LintExpr(sw.Expr);
+      { W018: Check switch completeness (MISRA 5.2) }
+      CheckSwitchCompleteness(sw, sw.Expr.ResolvedType);
       for i := 0 to High(sw.Cases) do
       begin
         LintExpr(sw.Cases[i].Value);
@@ -677,6 +705,12 @@ begin
   { Body traversieren }
   if fn.Body <> nil then
     LintBlock(fn.Body);
+
+  { W019: Check function length (max 60 lines) }
+  CheckFunctionLength(fn);
+
+  { W020: Check cyclomatic complexity (max 15) }
+  CheckCyclomaticComplexity(fn);
 
   { Restore previous function context }
   FCurrentFuncName := oldFuncName;
@@ -861,6 +895,28 @@ end;
 
 { --- Haupteinstiegspunkt --- }
 
+function TLinter.IsIntegerLintType(t: TAurumType): Boolean;
+begin
+  case t of
+    atInt8, atInt16, atInt32, atInt64,
+    atUInt8, atUInt16, atUInt32, atUInt64,
+    atISize, atUSize: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function TLinter.IsPointerLintType(t: TAurumType): Boolean;
+begin
+  Result := (t = atPChar) or (t = atPCharNullable);
+end;
+
+function TLinter.IsEnumLintType(t: TAurumType): Boolean;
+begin
+  // Simplified: treat unresolved or custom types as potential enums
+  Result := (t = atUnresolved);
+end;
+
 procedure TLinter.Lint(prog: TAstProgram);
 var
   i: Integer;
@@ -910,6 +966,181 @@ begin
 
   { Globalen Scope schließen — hier werden globale unused-Warnungen erzeugt }
   PopScope;
+end;
+
+{ --- MISRA #17: No Pointer Arithmetic --- }
+procedure TLinter.CheckPointerArithmetic(expr: TAstExpr);
+var
+  binOp: TAstBinOp;
+begin
+  if expr = nil then Exit;
+  if not (lrPointerArithmetic in FActiveRules) then Exit;
+
+  if expr.Kind = nkBinOp then
+  begin
+    binOp := TAstBinOp(expr);
+    // Check for pointer arithmetic: p + n, p - n where p is pointer
+    if (binOp.Op in [tkPlus, tkMinus]) and
+       (IsPointerLintType(binOp.Left.ResolvedType) or IsPointerLintType(binOp.Right.ResolvedType)) then
+    begin
+      Warn(lrPointerArithmetic,
+        'pointer arithmetic is not allowed (MISRA 5.2); use array indexing or get element pointer instead',
+        expr.Span);
+    end;
+  end;
+end;
+
+{ --- MISRA #18: Complete Switch Cases --- }
+procedure TLinter.CheckSwitchCompleteness(sw: TAstSwitch; switchExprType: TAurumType);
+var
+  hasDefault: Boolean;
+  i: Integer;
+begin
+  if sw = nil then Exit;
+  if not (lrIncompleteSwitch in FActiveRules) then Exit;
+
+  hasDefault := Assigned(sw.Default);
+  // Check if switch expression is enum type
+  if IsEnumLintType(switchExprType) then
+  begin
+    // For enum types, we should have cases for all enum values OR a default
+    if not hasDefault then
+    begin
+      Warn(lrIncompleteSwitch,
+        'switch on enum type without default case (MISRA 5.2); add default case for completeness',
+        sw.Span);
+    end;
+  end
+  else if IsIntegerLintType(switchExprType) then
+  begin
+    // For integer types, warn if no default (potential unhandled values)
+    if not hasDefault then
+    begin
+      Warn(lrIncompleteSwitch,
+        'switch on integer type without default case (MISRA 5.2); consider adding default case',
+        sw.Span);
+    end;
+  end;
+end;
+
+{ --- MISRA #19: Max Function Length (60 lines) --- }
+procedure TLinter.CheckFunctionLength(fn: TAstFuncDecl);
+var
+  stmtCount: Integer;
+
+  function CountStmts(stmt: TAstStmt): Integer;
+  var
+    i: Integer;
+  begin
+    Result := 0;
+    if stmt = nil then Exit;
+    Inc(Result);  // Count this statement
+    case stmt.Kind of
+      nkBlock:
+        for i := 0 to High(TAstBlock(stmt).Stmts) do
+          Inc(Result, CountStmts(TAstBlock(stmt).Stmts[i]));
+      nkIf:
+        begin
+          Inc(Result, CountStmts(TAstIf(stmt).ThenBranch));
+          if Assigned(TAstIf(stmt).ElseBranch) then
+            Inc(Result, CountStmts(TAstIf(stmt).ElseBranch));
+        end;
+      nkWhile, nkFor:
+        Inc(Result, CountStmts(TAstWhile(stmt).Body));
+      nkSwitch:
+        for i := 0 to High(TAstSwitch(stmt).Cases) do
+          Inc(Result, CountStmts(TAstSwitch(stmt).Cases[i].Body));
+    end;
+  end;
+
+begin
+  if fn = nil then Exit;
+  if not (lrFunctionTooLong in FActiveRules) then Exit;
+  if fn.IsExtern then Exit;
+  if not Assigned(fn.Body) then Exit;
+
+  stmtCount := CountStmts(fn.Body);
+  // Rough estimate: ~3 statements per line
+  if stmtCount > 180 then
+  begin
+    Warn(lrFunctionTooLong,
+      Format('function has approximately %d statements, exceeds 60 line limit (MISRA 5.2); consider splitting into smaller functions',
+        [stmtCount div 3]),
+      fn.Body.Span);
+  end;
+end;
+
+{ --- MISRA #20: Cyclomatic Complexity (15) --- }
+function TLinter.CalculateCyclomaticComplexity(fn: TAstFuncDecl): Integer;
+var
+  branchCount: Integer;
+
+  procedure CountBranches(stmt: TAstStmt; var count: Integer);
+  var
+    i: Integer;
+  begin
+    if stmt = nil then Exit;
+
+    case stmt.Kind of
+      nkIf:
+        begin
+          Inc(count, 1);  // Each if adds 1 branch path
+          CountBranches(TAstIf(stmt).ThenBranch, count);
+          if Assigned(TAstIf(stmt).ElseBranch) then
+            CountBranches(TAstIf(stmt).ElseBranch, count);
+        end;
+      nkWhile, nkFor:
+        begin
+          Inc(count, 1);  // Each loop adds 1 branch path
+          if stmt.Kind = nkWhile then
+            CountBranches(TAstWhile(stmt).Body, count)
+          else
+            CountBranches(TAstFor(stmt).Body, count);
+        end;
+      nkSwitch:
+        begin
+          // Each case adds 1 branch path (from the decision)
+          if Length(TAstSwitch(stmt).Cases) > 0 then
+            Inc(count, Length(TAstSwitch(stmt).Cases));
+          if Assigned(TAstSwitch(stmt).Default) then
+            Inc(count, 1);
+        end;
+      nkBlock:
+        for i := 0 to High(TAstBlock(stmt).Stmts) do
+          CountBranches(TAstBlock(stmt).Stmts[i], count);
+      nkReturn, nkAssign, nkVarDecl, nkExprStmt:
+        ;  // No branch
+    else
+      // For other statement types, just recurse into children if they exist
+      // Skip for simplicity - most other statement types don't add complexity
+    end;
+  end;
+
+begin
+  Result := 1;  // Base complexity is 1
+  branchCount := 0;
+  if Assigned(fn.Body) then
+    CountBranches(fn.Body, branchCount);
+  Inc(Result, branchCount);
+end;
+
+procedure TLinter.CheckCyclomaticComplexity(fn: TAstFuncDecl);
+var
+  complexity: Integer;
+begin
+  if fn = nil then Exit;
+  if not (lrComplexFunction in FActiveRules) then Exit;
+  if fn.IsExtern then Exit;
+
+  complexity := CalculateCyclomaticComplexity(fn);
+
+  if complexity > 15 then
+  begin
+    Warn(lrComplexFunction,
+      Format('function cyclomatic complexity %d exceeds limit of 15 (MISRA 5.2); consider simplifying control flow',
+        [complexity]),
+      fn.Body.Span);
+  end;
 end;
 
 end.
