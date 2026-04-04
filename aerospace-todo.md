@@ -5,11 +5,11 @@
 Dieses Dokument beschreibt den Fortschritt und die offenen Tasks zur Qualifizierung
 von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DAL A/B/C).
 
-**Stand:** 2026-04-04 | **Version:** 0.8.0-aerospace
+**Stand:** 2026-04-04 | **Version:** 0.8.1-aerospace
 
 ---
 
-## ✅ Abgeschlossene Tasks (72 von 113)
+## ✅ Abgeschlossene Tasks (76 von 113)
 
 ### 1. DO-178C Software Compliance
 
@@ -99,6 +99,15 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 #### 2.1 Safety-Pragmas – 1/3 ✅
 - [x] **Pragma-Parser** → `@dal(A|B|C|D)`, `@critical`, `@wcet(N)`, `@stack_limit(N)` – Parser, AST, IR-Propagation, Sema-Checks; `test_pragma_parser.pas` (30/30 Tests)
 
+#### 2.2 Range-Typen – 1/1 ✅ KOMPLETT
+- [x] **Range-Typen** → `type T = intN range Min..Max` – Lexer `tkDotDot`, Parser, Sema Compile-Time-Check, IR Runtime-Check; `test_range_types.pas` (33/33 Tests)
+
+#### 6.1 Codegen-Sicherheit – 1/4 ✅
+- [x] **Assembly-Listing** → `asm_listing.pas`, `TAsmListingGenerator`, `--asm-listing` Flag; Source-Zeilen-Kommentare für alle 4 Hauptarchitekturen (x86_64, ARM64, RISC-V, Xtensa)
+
+#### 7.1 Laufzeit-Sicherheit – 1/2 ✅
+- [x] **assert() Builtin** → `TAstAssert`, `nkAssert` AST-Node, Parser+Sema+IR-Lowering; `assert(cond, msg)` mit bool-Condition und Fehlermeldung
+
 ---
 
 ### 10. Spezifische Implementierungs-Tasks (teilweise)
@@ -117,17 +126,18 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 | # | Task | Sektion | Aufwand | Status |
 |---|------|---------|---------|--------|
 | ~~1~~ | ~~**MC/DC Lücken-Erkennung**~~ | ~~4.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `AnalyzeGaps()`, Runtime-Counter im Data-Segment, `--mcdc-report` zeigt Gaps |
-| 2 | **Assembly-Listing** | 6.1 | Mittel | Generierter Code muss mit Source-Zeilen verknüpft sein für Audit und Debugging |
-| 3 | **assert() / check() Builtins** | 7.1 | Mittel | Runtime-Assertions für DAL A – `assert()` (compile+runtime), `check()` (runtime only) |
-| 4 | **MISRA-Regel: Keine impliziten Typkonvertierungen** | 5.2 | Niedrig | Sema-Checker Erweiterung – einfache Regel, großer Sicherheitsgewinn |
-| 5 | **MISRA-Regel: Keine unbenutzten Variablen/Parameter** | 5.2 | Niedrig | Bereits teilweise durch Live-Variable-Analyse abgedeckt, muss nur als Fehler eskaliert werden |
+| ~~2~~ | ~~**Assembly-Listing**~~ | ~~6.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `asm_listing.pas`, `TAsmListingGenerator`, `--asm-listing` Flag, Source-Zeilen-Kommentare für x86_64/ARM64/RISC-V/Xtensa |
+| ~~3~~ | ~~**assert() Builtin**~~ | ~~7.1~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – `TAstAssert`, Parser+Sema+IR-Lowering; `check()` (runtime-only) noch offen → siehe P1 |
+| ~~4~~ | ~~**MISRA-Regel: Keine impliziten Typkonvertierungen**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W015 `lrImplicitTypeCast` (identisch mit P2 #16) |
+| ~~5~~ | ~~**MISRA-Regel: Keine unbenutzten Variablen/Parameter**~~ | ~~5.2~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – Linter W001 `lrUnusedVariable`, W002 `lrUnusedParameter` (Live-Variable-Analyse 5.1) |
 
 ### 🟠 P1 – Hoch (wichtig für DAL B/C)
 
 | # | Task | Sektion | Aufwand | Begründung |
 |---|------|---------|---------|------------|
 | ~~6~~ | ~~**Pragma-Parser** (`@dal`, `@critical`, `@wcet`, `@stack_limit`)~~ | ~~2.1, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Parser, AST, IR-Propagation, Sema-Checks, 30/30 Tests |
-| 7 | **Range-Typen im Typsystem** | 2.2, 10.1 | Hoch | `type Altitude = int64 range -1000..60000` – Compile-Zeit und Runtime-Checks |
+| ~~7~~ | ~~**Range-Typen im Typsystem**~~ | ~~2.2, 10.1~~ | ~~Hoch~~ | ✅ **ERLEDIGT** – Lexer `tkDotDot`, Parser `range Min..Max`, Sema Compile-Time-Check, IR Runtime-Check, 33/33 Tests |
+| 7b | **check() Builtin** | 7.1 | Niedrig | Runtime-only Assertion ohne Nachricht – `check(cond)` → panic bei false; Ergänzung zu assert() |
 | 8 | **Call-Graph: Statischer Aufrufgraph** | 6.1 | Mittel | Erforderlich für WCET-Analyse und Stack-Berechnung über Call-Grenzen hinweg |
 | 9 | **Map-File: Speicherlayout aller Symbole** | 6.1 | Mittel | Debug-Information für Zertifizierung und Audit |
 | 10 | **Result-Typ mit Pattern-Matching** | 7.2, 10.1 | Mittel | Strukturierte Fehlerbehandlung ohne Exceptions (nicht deterministisch) |
@@ -197,12 +207,14 @@ von **Lyx** als Compiler für **safety-critical Aerospace-Software** (DO-178C DA
 
 ## Empfohlene nächste Schritte (Priorität)
 
-1. **MC/DC Lücken-Erkennung** (P0 #1) – Runtime-Coverage-Daten in den instrumentierten Binarys sammeln
-2. **Assembly-Listing** (P0 #2) – Source-Zeilennummern in generierten Code einbetten
-3. **assert()/check() Builtins** (P0 #3) – Runtime-Assertions für DAL A
-4. **MISRA-Regeln** (P0 #4-5) – Sema-Checker Erweiterungen (geringer Aufwand, hoher Nutzen)
+1. **check() Builtin** (ehem. P0 #3, Rest) – `check(cond)` runtime-only Assertion (ohne Meldungstext) für DAL A
+2. **Call-Graph: Statischer Aufrufgraph** (P1 #8) – Voraussetzung für WCET-Analyse und Stack-Berechnung über Call-Grenzen
+3. **Map-File: Speicherlayout aller Symbole** (P1 #9) – Debug/Audit-Information für DO-178C 6.1
+4. **Result-Typ mit Pattern-Matching** (P1 #10) – Strukturierte Fehlerbehandlung ohne Exceptions
 5. ~~**Pragma-Parser** (P1 #6)~~ ✅ ERLEDIGT
-6. **Range-Typen** (P1 #7) – `type Altitude = int64 range -1000..60000`
+6. ~~**Range-Typen** (P1 #7)~~ ✅ ERLEDIGT
+7. ~~**Assembly-Listing** (P0 #2)~~ ✅ ERLEDIGT
+8. ~~**assert() Builtin** (P0 #3)~~ ✅ ERLEDIGT
 
 ---
 

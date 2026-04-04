@@ -44,6 +44,7 @@ type
     FStructTypes: TStringList; // name -> TAstStructDecl as object
     FClassTypes: TStringList;  // name -> TAstClassDecl as object
     FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
+    FRangeTypes: TStringList;  // name -> TAstTypeDecl (range types, aerospace-todo P1 #7)
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -3384,6 +3385,10 @@ var
   sw: TAstSwitch;
   caseVal: TAstExpr;
   cvtype: TAurumType;
+  // range type helpers (aerospace-todo P1 #7)
+  rtIdx: Integer;
+  rtDecl: TAstTypeDecl;
+  litVal: Int64;
 begin
   if stmt = nil then Exit;
 
@@ -3397,6 +3402,29 @@ begin
         else
           vtype := vd.DeclType;  // Use declared type if no initializer
         
+        // Range type: compile-time bounds check for literal initializers (aerospace-todo P1 #7)
+        if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
+           Assigned(FRangeTypes) then
+        begin
+          rtIdx := FRangeTypes.IndexOf(vd.DeclTypeName);
+          if rtIdx >= 0 then
+          begin
+            rtDecl := TAstTypeDecl(FRangeTypes.Objects[rtIdx]);
+            // Accept the base integer type
+            if not IsIntegerType(vtype) and (vtype <> atUnresolved) then
+              FDiag.Error(Format('type mismatch in declaration of %s: expected integer (range %s), got %s',
+                [vd.Name, vd.DeclTypeName, AurumTypeToStr(vtype)]), vd.Span);
+            // Compile-time check for integer literals
+            if Assigned(vd.InitExpr) and (vd.InitExpr is TAstIntLit) then
+            begin
+              litVal := TAstIntLit(vd.InitExpr).Value;
+              if (litVal < rtDecl.RangeMin) or (litVal > rtDecl.RangeMax) then
+                FDiag.Error(Format('value %d is out of range [%d..%d] for type %s',
+                  [litVal, rtDecl.RangeMin, rtDecl.RangeMax, vd.DeclTypeName]), vd.Span);
+            end;
+            vtype := atInt64;
+          end;
+        end;
         // Resolve enum type names: var x: TokenKind := ... → treat as int64
         if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
            Assigned(FEnumTypes) and (FEnumTypes.IndexOf(vd.DeclTypeName) >= 0) then
@@ -3804,6 +3832,8 @@ begin
   FClassTypes.Sorted := False;
   FEnumTypes := TStringList.Create;
   FEnumTypes.Sorted := False;
+  FRangeTypes := TStringList.Create;
+  FRangeTypes.Sorted := False;
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
@@ -3832,6 +3862,8 @@ begin
     FStructTypes.Free;
   if Assigned(FEnumTypes) then
     FEnumTypes.Free;
+  if Assigned(FRangeTypes) then
+    FRangeTypes.Free;
 
   // Freigabe aller verbleibenden Scopes (insbesondere globaler Scope)
   while Length(FScopes) > 0 do
@@ -5299,11 +5331,14 @@ begin
       end
       else if node is TAstTypeDecl then
       begin
-        // type declarations: register as named types
-        // For function pointer types (atFnPtr), the DeclType is already set
-        // For named types, we store the type information for later lookup
-        // (Currently the type info is stored in FDeclType, which may be atFnPtr for fn(...) types)
-        // TODO: Add support for full type alias resolution if needed
+        // Register range types (aerospace-todo P1 #7)
+        if TAstTypeDecl(node).HasRange then
+        begin
+          if FRangeTypes.IndexOf(TAstTypeDecl(node).Name) < 0 then
+            FRangeTypes.AddObject(TAstTypeDecl(node).Name, System.TObject(node))
+          else
+            FDiag.Error('redeclaration of range type: ' + TAstTypeDecl(node).Name, node.Span);
+        end;
       end
       else if node is TAstConDecl then
     begin
