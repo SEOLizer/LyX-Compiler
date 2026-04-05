@@ -207,7 +207,7 @@ des FPC-Compilers.
 
 ### WP-15: Pattern Matching & Match-Expressions
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11
+**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
 
 **Ziel:** Vollständiges `match`-Statement mit Destrukturierung.
 
@@ -826,6 +826,7 @@ dann in Phase 2 dazu.
 - WP-12: Exception Handling (Parser/Sema) ✅
 - WP-13: Closures & Nested Functions (Parser/Sema) ✅
 - WP-14: Generics / Type-Parameter-Monomorphization ✅
+- WP-15: Pattern Matching & Match-Expressions ✅
 
 ### WP-12: Exception Handling - Verbleibende Stubs
 - ❌ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung
@@ -843,13 +844,19 @@ dann in Phase 2 dazu.
 - ❌ **Sema:** Generischer Call - erzeuge spezialisierte Funktion `Foo_i32`
 - ❌ **Codegen:** Generic Type-Argument handling (Array<T>, Map<K,V>)
 
+### WP-15: Pattern Matching - Verbleibende Stubs
+- ❌ **Codegen:** Entscheidungsbaum-Generierung (Sprung-Tabellen für dichte Ranges)
+- ❌ **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?)
+- ❌ **Sema:** Enum-Payload-Patterns (`case Ok(v) => ...`)
+- ❌ **Sema:** Struct-Destrukturierung
+
 ### WP-11: Bekannte Issues
 - ❌ **Float-Literal-Parsing:** Token-ID-Kollision TK_CHAR (177) verursacht Fehler bei `3.14`
   - Lösung erfordert Refactoring der Token-IDs im Lexer
 
 ### Phase 1: Sprachkern-Vollständigkeit (Offene WPs)
 - ✅ **WP-14:** Generics / Type-Parameter-Monomorphization (Parser + Sema)
-- ❌ **WP-15:** Pattern Matching & Match-Expressions
+- ✅ **WP-15:** Pattern Matching & Match-Expressions (Parser + Sema)
 - ❌ **WP-16:** Vollständiges OOP (Vererbung, Interfaces, Access Control)
 - ❌ **WP-17:** Range Types & Type Constraints
 
