@@ -166,7 +166,7 @@ des FPC-Compilers.
 
 ### WP-13: Closures & Nested Functions
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11
+**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
 
 **Ziel:** Nested Functions mit Zugriff auf umschließende Scope-Variablen (Captured Variables).
 
