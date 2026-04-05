@@ -2513,6 +2513,7 @@ begin
   FSafetyPragmas.IsCritical := False;
   FSafetyPragmas.WCETBudget := 0;
   FSafetyPragmas.StackLimit := 0;
+  FSafetyPragmas.FPDeterministic := False;  // FIX: initialize to avoid uninitialized garbage
   // VMT fields initialization
   FIsVirtual := False;
   FIsOverride := False;
