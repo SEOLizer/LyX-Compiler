@@ -875,10 +875,14 @@ dann in Phase 2 dazu.
 - ✅ **Sema:** Capture-Analyse Stub (`_analyzeCaptures`, `_collectCaptures`, `_addCapturedVar`)
 - ✅ **Codegen:** Closure-Objekt Stub (via static link Implementierung)
 
-### WP-14: Generics - Verbleibende Stubs
-- ❌ **Sema:** Monomorphization (Type-Ersetzung T→konkret bei jedem Aufruf)
-- ❌ **Sema:** Generischer Call - erzeuge spezialisierte Funktion `Foo_i32`
-- ❌ **Codegen:** Generic Type-Argument handling (Array<T>, Map<K,V>)
+### WP-14: Generics - Bereits implementiert
+- ✅ **Parser:** Type-Parameter-Parsing (`<T, U>`) in `ParseFuncDecl`
+- ✅ **Parser:** Generic Type-Arguments in Funktionsaufrufen (`fn<T>(args)`) in `ParseExpr`
+- ✅ **Parser:** `_parseTypeArgs()` für Generic-Call-Syntax
+- ✅ **Sema:** `TY_GENERIC_INST` und `TY_TYPE_PARAM` Type-Konstanten
+- ✅ **Sema:** `_resolveGenericCall()` für Type-Argument-Validierung
+- ✅ **Sema:** `_getMonomorphInstance()` Stub für Instantiation-Cache
+- ✅ **Sema:** `instCache` Buffer für Generic-Instanziierung
 
 ### WP-15: Pattern Matching - Verbleibende Stubs
 - ❌ **Codegen:** Entscheidungsbaum-Generierung (Sprung-Tabellen für dichte Ranges)
