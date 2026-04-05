@@ -1605,7 +1605,243 @@ begin
   WriteMovImm64(FCode, X1, 7);       // length = 7
   WriteSyscall(SYS_write);
   WriteRet(FCode);
-  
+
+  // ========== WP-10h-2: String Builtin Stubs ==========
+
+  // __builtin_PrintLn: X0 = string → PrintStr + newline
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_PrintLn');
+  // Prologue: 32 bytes (X29/X30 + 16 for '\n' storage + padding)
+  WriteStpPreIndex(FCode, X29, X30, SP, -32);
+  WriteMovRegReg(FCode, X29, SP);
+  // Store '\n' at [SP+16]
+  WriteMovImm64(FCode, X9, 10);
+  // STRB W9, [SP, #16]: 0x39000000 | (16<<10) | (31<<5) | 9 = 0x390043E9
+  EmitInstr(FCode, $390043E9);
+  // Save string pointer, compute strlen
+  WriteMovRegReg(FCode, X9, X0);
+  WriteMovImm64(FCode, X10, 0);
+  // loop: LDRB W11, [X9, X10] = 0x386A692B
+  EmitInstr(FCode, $386A692B);
+  WriteCbz(FCode, 11, 12);           // cbz w11, done (+12)
+  WriteAddImm(FCode, X10, X10, 1);
+  WriteBranch(FCode, -12);           // B loop
+  // sys_write(1, X9, X10) — print string
+  WriteMovImm64(FCode, X0, 1);
+  WriteMovRegReg(FCode, X1, X9);
+  WriteMovRegReg(FCode, X2, X10);
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_write) else WriteSyscall(SYS_write);
+  // sys_write(1, X29+16, 1) — print newline
+  WriteMovImm64(FCode, X0, 1);
+  WriteAddImm(FCode, X1, X29, 16);  // X1 = address of '\n' stored at [FP+16]
+  WriteMovImm64(FCode, X2, 1);
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_write) else WriteSyscall(SYS_write);
+  WriteLdpPostIndex(FCode, X29, X30, SP, 32);
+  WriteRet(FCode);
+
+  // __builtin_StrFromInt: X0 = int64 n → pchar (mmap'd decimal string)
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_StrFromInt');
+  // Stack layout (80 bytes):
+  //   [SP+0..7]:   X29, [SP+8..15]: X30
+  //   [SP+16..47]: digit buffer (32 bytes, null at SP+47, digits fill backwards)
+  //   [SP+48..55]: saved digit-start pointer (X10)
+  //   [SP+56..63]: saved mmap result (X0)
+  //   [SP+64..79]: spare (alignment)
+  WriteStpPreIndex(FCode, X29, X30, SP, -80);
+  WriteMovRegReg(FCode, X29, SP);
+  // X9 = abs(n), X13 = neg flag
+  WriteCmpImm(FCode, X0, 0);
+  WriteCset(FCode, X13, COND_LT);       // X13 = 1 if n < 0
+  EmitInstr(FCode, $DA80A409);          // csneg x9, x0, x0, ge (abs value into X9)
+  // null terminator at [SP+47]
+  WriteAddImm(FCode, X10, SP, 47);      // X10 = &[SP+47]
+  WriteMovImm64(FCode, X12, 0);
+  EmitInstr(FCode, $3800014C);          // STURB W12, [X10] (null at position X10)
+  // X11 = 10 (divisor)
+  WriteMovImm64(FCode, X11, 10);
+  // digit_loop: (7 instructions = 28 bytes, CBNZ jumps back -24)
+  WriteSubImm(FCode, X10, X10, 1);      // X10-- (write position)
+  WriteUdiv(FCode, X14, X9, X11);       // X14 = X9 / 10
+  WriteMsub(FCode, X12, X14, X11, X9); // X12 = X9 mod 10
+  WriteAddImm(FCode, X12, X12, Ord('0'));
+  EmitInstr(FCode, $3800014C);          // STURB W12, [X10] (store digit)
+  WriteMovRegReg(FCode, X9, X14);       // X9 = quotient
+  WriteCbnz(FCode, X9, -24);            // loop if quotient != 0
+  // Prepend '-' if negative (3 instructions = 12 bytes, CBZ skips +12)
+  WriteCbz(FCode, X13, 12);             // cbz x13, skip_minus
+  WriteSubImm(FCode, X10, X10, 1);
+  WriteMovImm64(FCode, X12, Ord('-'));
+  EmitInstr(FCode, $3800014C);          // STURB W12, [X10]
+  // skip_minus: save digit-start X10
+  WriteStrImm(FCode, X10, SP, 48);      // [SP+48] = digit-start ptr
+  // mmap(0, count_with_null, 3, 34, -1, 0)
+  WriteAddImm(FCode, X1, SP, 48);       // X1 = SP+48
+  WriteSubRegReg(FCode, X1, X1, X10);  // X1 = SP+48 - X10 = count with null
+  WriteMovImm64(FCode, X0, 0);
+  WriteMovImm64(FCode, X2, 3);
+  WriteMovImm64(FCode, X3, 34);
+  WriteMovImm64(FCode, X4, UInt64(-1));
+  WriteMovImm64(FCode, X5, 0);
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_mmap) else WriteSyscall(SYS_mmap);
+  // X0 = mmap result; save and set up copy
+  WriteStrImm(FCode, X0, SP, 56);       // [SP+56] = mmap result (return value)
+  WriteMovRegReg(FCode, X2, X0);        // X2 = copy dest
+  WriteLdrImm(FCode, X1, SP, 48);       // X1 = digit-start ptr (copy src)
+  WriteAddImm(FCode, X9, SP, 48);       // X9 = SP+48
+  WriteSubRegReg(FCode, X9, X9, X1);   // X9 = count (bytes to copy incl. null)
+  // copy_loop: (4 instructions = 16 bytes, CBNZ jumps back -12)
+  // LDRB W15, [X1], #1 : post-index: 0x38401400 | (1<<5) | 15 = 0x3840142F
+  EmitInstr(FCode, $3840142F);
+  // STRB W15, [X2], #1 : post-index: 0x38001400 | (2<<5) | 15 = 0x3800144F
+  EmitInstr(FCode, $3800144F);
+  WriteSubImm(FCode, X9, X9, 1);
+  WriteCbnz(FCode, X9, -12);            // loop if count != 0
+  // Return mmap result
+  WriteLdrImm(FCode, X0, SP, 56);
+  WriteLdpPostIndex(FCode, X29, X30, SP, 80);
+  WriteRet(FCode);
+
+  // __builtin_str_concat: X0 = a (pchar), X1 = b (pchar) → pchar (new mmap'd buffer)
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_str_concat');
+  // Stack layout (64 bytes):
+  //   [SP+0..7]: X29, [SP+8..15]: X30
+  //   [SP+16..23]: a, [SP+24..31]: b
+  //   [SP+32..39]: len(a), [SP+40..47]: len(b)
+  //   [SP+48..55]: mmap result, [SP+56..63]: spare
+  WriteStpPreIndex(FCode, X29, X30, SP, -64);
+  WriteMovRegReg(FCode, X29, SP);
+  WriteStrImm(FCode, X0, SP, 16);       // [SP+16] = a
+  WriteStrImm(FCode, X1, SP, 24);       // [SP+24] = b
+  // strlen(a): X9 = a, X11 = counter
+  WriteMovRegReg(FCode, X9, X0);
+  WriteMovImm64(FCode, X11, 0);
+  // loop_a: LDRB W12, [X9, X11] = 0x386B692C
+  EmitInstr(FCode, $386B692C);
+  WriteCbz(FCode, 12, 12);              // cbz w12, +12
+  WriteAddImm(FCode, X11, X11, 1);
+  WriteBranch(FCode, -12);
+  // X11 = len(a); strlen(b): X9 = b, X10 = counter
+  WriteStrImm(FCode, X11, SP, 32);      // [SP+32] = len(a)
+  WriteLdrImm(FCode, X9, SP, 24);       // X9 = b
+  WriteMovImm64(FCode, X10, 0);
+  // loop_b: LDRB W12, [X9, X10] = 0x386A692C
+  EmitInstr(FCode, $386A692C);
+  WriteCbz(FCode, 12, 12);              // cbz w12, +12
+  WriteAddImm(FCode, X10, X10, 1);
+  WriteBranch(FCode, -12);
+  // X10 = len(b)
+  WriteStrImm(FCode, X10, SP, 40);      // [SP+40] = len(b)
+  // mmap(0, len(a)+len(b)+1, 3, 34, -1, 0)
+  WriteAddRegReg(FCode, X1, X11, X10); // X1 = len(a)+len(b)
+  WriteAddImm(FCode, X1, X1, 1);       // +1 for null
+  WriteMovImm64(FCode, X0, 0);
+  WriteMovImm64(FCode, X2, 3);
+  WriteMovImm64(FCode, X3, 34);
+  WriteMovImm64(FCode, X4, UInt64(-1));
+  WriteMovImm64(FCode, X5, 0);
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_mmap) else WriteSyscall(SYS_mmap);
+  WriteStrImm(FCode, X0, SP, 48);       // [SP+48] = buffer start
+  // Copy a: X2=dest=X0, X1=a, X9=len(a)
+  WriteMovRegReg(FCode, X2, X0);
+  WriteLdrImm(FCode, X1, SP, 16);       // X1 = a
+  WriteLdrImm(FCode, X9, SP, 32);       // X9 = len(a)
+  WriteCbz(FCode, X9, 16);              // cbz x9, skip copy_a (if len=0)
+  EmitInstr(FCode, $3840142F);          // LDRB W15, [X1], #1
+  EmitInstr(FCode, $3800144F);          // STRB W15, [X2], #1
+  WriteSubImm(FCode, X9, X9, 1);
+  WriteCbnz(FCode, X9, -12);            // loop copy_a
+  // Copy b+null: X1=b, X9=len(b)+1
+  WriteLdrImm(FCode, X1, SP, 24);       // X1 = b
+  WriteLdrImm(FCode, X9, SP, 40);       // X9 = len(b)
+  WriteAddImm(FCode, X9, X9, 1);        // +1 for null terminator
+  EmitInstr(FCode, $3840142F);          // LDRB W15, [X1], #1
+  EmitInstr(FCode, $3800144F);          // STRB W15, [X2], #1
+  WriteSubImm(FCode, X9, X9, 1);
+  WriteCbnz(FCode, X9, -12);            // loop copy_b
+  // Return buffer start
+  WriteLdrImm(FCode, X0, SP, 48);
+  WriteLdpPostIndex(FCode, X29, X30, SP, 64);
+  WriteRet(FCode);
+
+  // __builtin_StrAppend: X0 = dest (pchar w/ 16-byte header), X1 = src → new pchar
+  SetLength(FFuncOffsets, Length(FFuncOffsets) + 1);
+  FFuncOffsets[High(FFuncOffsets)] := FCode.Size;
+  FFuncNames.Add('__builtin_StrAppend');
+  // Stack layout (80 bytes):
+  //   [SP+0..7]: X29, [SP+8..15]: X30
+  //   [SP+16..23]: old dest, [SP+24..31]: src
+  //   [SP+32..39]: destLen, [SP+40..47]: srcLen
+  //   [SP+48..55]: newBase, [SP+56..79]: spare
+  WriteStpPreIndex(FCode, X29, X30, SP, -80);
+  WriteMovRegReg(FCode, X29, SP);
+  WriteStrImm(FCode, X0, SP, 16);       // [SP+16] = dest
+  WriteStrImm(FCode, X1, SP, 24);       // [SP+24] = src
+  // destLen = *(dest-8)
+  WriteLdurImm(FCode, X9, X0, -8);     // X9 = destLen
+  WriteStrImm(FCode, X9, SP, 32);       // [SP+32] = destLen
+  // srcLen: null scan on src
+  WriteMovRegReg(FCode, X0, X1);        // X0 = src
+  WriteMovImm64(FCode, X10, 0);
+  // loop_src: LDRB W11, [X0, X10] = 0x386A680B
+  EmitInstr(FCode, $386A680B);
+  WriteCbz(FCode, 11, 12);              // cbz w11, +12
+  WriteAddImm(FCode, X10, X10, 1);
+  WriteBranch(FCode, -12);
+  WriteStrImm(FCode, X10, SP, 40);      // [SP+40] = srcLen
+  // mmap(0, destLen+srcLen+17, 3, 34, -1, 0)
+  WriteLdrImm(FCode, X9, SP, 32);       // X9 = destLen
+  WriteAddRegReg(FCode, X1, X9, X10);  // X1 = destLen + srcLen
+  WriteAddImm(FCode, X1, X1, 17);       // +17 (16-byte header + null)
+  WriteMovImm64(FCode, X0, 0);
+  WriteMovImm64(FCode, X2, 3);
+  WriteMovImm64(FCode, X3, 34);
+  WriteMovImm64(FCode, X4, UInt64(-1));
+  WriteMovImm64(FCode, X5, 0);
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_mmap) else WriteSyscall(SYS_mmap);
+  WriteStrImm(FCode, X0, SP, 48);       // [SP+48] = newBase
+  // Fill header in newBase: capacity = destLen+srcLen+1, length = destLen+srcLen
+  WriteLdrImm(FCode, X9, SP, 32);       // X9 = destLen
+  WriteLdrImm(FCode, X10, SP, 40);      // X10 = srcLen
+  WriteAddRegReg(FCode, X11, X9, X10); // X11 = destLen + srcLen
+  WriteAddImm(FCode, X11, X11, 1);      // X11 = capacity
+  WriteStrImm(FCode, X11, X0, 0);       // [newBase+0] = capacity
+  WriteSubImm(FCode, X11, X11, 1);
+  WriteStrImm(FCode, X11, X0, 8);       // [newBase+8] = length
+  // X2 = newDest = newBase + 16
+  WriteAddImm(FCode, X2, X0, 16);
+  // Copy destLen bytes from old dest to newDest
+  WriteLdrImm(FCode, X1, SP, 16);       // X1 = old dest
+  WriteLdrImm(FCode, X9, SP, 32);       // X9 = destLen
+  WriteCbz(FCode, X9, 16);              // skip copy_dest if destLen=0
+  EmitInstr(FCode, $3840142F);          // LDRB W15, [X1], #1
+  EmitInstr(FCode, $3800144F);          // STRB W15, [X2], #1
+  WriteSubImm(FCode, X9, X9, 1);
+  WriteCbnz(FCode, X9, -12);            // loop copy_dest
+  // Copy srcLen+1 bytes from src to newDest+destLen (including null)
+  WriteLdrImm(FCode, X1, SP, 24);       // X1 = src
+  WriteLdrImm(FCode, X9, SP, 40);       // X9 = srcLen
+  WriteAddImm(FCode, X9, X9, 1);        // +1 for null
+  EmitInstr(FCode, $3840142F);          // LDRB W15, [X1], #1
+  EmitInstr(FCode, $3800144F);          // STRB W15, [X2], #1
+  WriteSubImm(FCode, X9, X9, 1);
+  WriteCbnz(FCode, X9, -12);            // loop copy_src
+  // munmap old buffer: base = dest-16, size = *(dest-16)+16
+  WriteLdrImm(FCode, X0, SP, 16);       // X0 = old dest (data ptr)
+  WriteLdurImm(FCode, X9, X0, -16);    // X9 = old capacity = *(dest-16)
+  WriteAddImm(FCode, X1, X9, 16);       // X1 = old capacity + 16
+  WriteSubImm(FCode, X0, X0, 16);       // X0 = old base = dest - 16
+  if FTargetOS = atmacOS then WriteSyscall(MACOS_SYS_munmap) else WriteSyscall(SYS_munmap);
+  // Return newBase + 16
+  WriteLdrImm(FCode, X0, SP, 48);       // X0 = newBase
+  WriteAddImm(FCode, X0, X0, 16);       // X0 = newBase + 16
+  WriteLdpPostIndex(FCode, X29, X30, SP, 80);
+  WriteRet(FCode);
+
   // Phase 4: Emit user functions
   for i := 0 to High(module.Functions) do
   begin
@@ -3443,6 +3679,19 @@ begin
 
             // ========== WP-10g: String Builtins S0 (ARM64) ==========
 
+            else if instr.ImmStr = 'PrintLn' then
+            begin
+              // PrintLn(s: pchar) → PrintStr + newline via __builtin_PrintLn
+              if Length(instr.ArgTemps) > 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else if instr.Src1 >= 0 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_PrintLn';
+              WriteBranchLink(FCode, 0);
+            end
+
             else if instr.ImmStr = 'StrLen' then
             begin
               // StrLen(s: pchar): int64 — null-scan strlen
@@ -3586,104 +3835,22 @@ begin
             end
             else if instr.ImmStr = 'StrFromInt' then
             begin
-              // StrFromInt(n: int64): pchar — convert int64 to decimal string
-              // Uses mmap'd buffer (64 bytes) + writes digits in reverse
-              // For simplicity, use syscall version via libc or basic implementation
-              
-              // Allocate 64-byte buffer via mmap
-              WriteMovImm64(FCode, X1, 80);  // 64 + 16 header
-              WriteMovImm64(FCode, X2, 3);    // PROT_READ|PROT_WRITE
-              WriteMovImm64(FCode, X3, $22);  // MAP_PRIVATE|MAP_ANONYMOUS
-              WriteMovImm64(FCode, X4, UInt64(-1));
-              WriteMovImm64(FCode, X5, 0);
-              WriteMovImm64(FCode, X0, 0);    // addr = NULL
-              
-              if FTargetOS = atmacOS then
-                WriteSyscall(MACOS_SYS_mmap)
+              // StrFromInt(n: int64): pchar — call __builtin_StrFromInt (correct digit order)
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
               else
-                WriteSyscall(SYS_mmap);
-              
-              // Save buffer (with header) to X19
-              WriteMovRegReg(FCode, X19, X0);
-              
-              // Write capacity = 64 at [X0], length = 0 at [X0+8]
-              WriteMovImm64(FCode, X1, 64);
-              WriteStrImm(FCode, X1, X0, 0);
-              WriteStrImm(FCode, XZR, X0, 8);
-              
-              // Skip header: X20 = data pointer (X19 + 16)
-              WriteAddImm(FCode, X20, X19, 16);
-              
-              // X0 = n (value to convert)
-              WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]));
-              
-              // X1 = sign check
-              WriteCmpImm(FCode, X0, 0);
-              WriteCset(FCode, X1, COND_LT);  // X1 = 1 if negative
-              
-              // If negative, negate
-              // CSNEG X0, X0, X0, GE
-              EmitInstr(FCode, $DA80A400);  // csneg x0, x0, x0, ge
-              
-              // X21 = position counter = 0
-              WriteMovImm64(FCode, X21, 0);
-              
-              // X2 = 10 (divisor)
-              WriteMovImm64(FCode, X2, 10);
-              
-              // Digit loop
-              // digit_loop:
-              //   udiv X3, X0, X2    ; X3 = X0 / 10
-              //   msub X4, X3, X2, X0 ; X4 = X0 - X3*10 (remainder)
-              //   add X4, X4, '0'
-              //   strb W4, [X20, X21]
-              //   add X21, X21, 1
-              //   mov X0, X3
-              //   cbnz X0, digit_loop
-              
-              // Using available registers: X3, X4 for temp
-              WriteUdiv(FCode, X3, X0, X2);     // X3 = X0 / 10
-              WriteMsub(FCode, X4, X3, X2, X0); // X4 = remainder
-              WriteAddImm(FCode, X4, X4, 48);    // X4 += '0'
-              WriteStrbRegOffsetInline(FCode, X4, X20, X21);
-              WriteAddImm(FCode, X21, X21, 1);
-              WriteMovRegReg(FCode, X0, X3);
-              WriteCbnz(FCode, X0, -28);        // Back to digit_loop
-              
-              // Check if we need to add sign
-              WriteCbnz(FCode, X1, 12);          // If X1 != 0, add '-' at position 0
-              
-              // Write null terminator
-              WriteStrbImmInline(FCode, XZR, X20, X21);
-              WriteB(FCode, 8);                   // Skip sign handling
-              
-              // Add sign:
-              WriteMovImm64(FCode, X0, Ord('-'));
-              WriteStrbImmInline(FCode, X0, X20, 0);
-              WriteAddImm(FCode, X21, X21, 1);
-              
-              // Write null terminator
-              WriteStrbImmInline(FCode, XZR, X20, X21);
-              
-              // Update length in header
-              WriteStrImm(FCode, X21, X19, 8);
-              
-              // Return data pointer (X20)
-              WriteMovRegReg(FCode, X0, X20);
-              
-              // Restore
-              WriteMovImm64(FCode, X19, 0);
-              WriteMovImm64(FCode, X20, 0);
-              WriteMovImm64(FCode, X21, 0);
-              
+                WriteMovImm64(FCode, X0, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_StrFromInt';
+              WriteBranchLink(FCode, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'StrAppend' then
+
+            else if instr.ImmStr = 'str_concat' then
             begin
-              // StrAppend(dest: pchar, src: pchar): pchar
-              // For now, return dest (simple implementation)
-              // X0 = dest, X1 = src
+              // str_concat(a: pchar, b: pchar): pchar — call __builtin_str_concat
               if Length(instr.ArgTemps) >= 1 then
                 WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
               else
@@ -3692,7 +3859,29 @@ begin
                 WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
               else
                 WriteMovImm64(FCode, X1, 0);
-              
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_str_concat';
+              WriteBranchLink(FCode, 0);
+              if instr.Dest >= 0 then
+                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+            end
+
+            else if instr.ImmStr = 'StrAppend' then
+            begin
+              // StrAppend(dest: pchar, src: pchar): pchar — call __builtin_StrAppend
+              if Length(instr.ArgTemps) >= 1 then
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
+              else
+                WriteMovImm64(FCode, X0, 0);
+              if Length(instr.ArgTemps) >= 2 then
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1]))
+              else
+                WriteMovImm64(FCode, X1, 0);
+              SetLength(FCallPatches, Length(FCallPatches) + 1);
+              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+              FCallPatches[High(FCallPatches)].TargetName := '__builtin_StrAppend';
+              WriteBranchLink(FCode, 0);
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
