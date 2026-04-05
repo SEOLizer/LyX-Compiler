@@ -266,15 +266,24 @@ des FPC-Compilers.
 
 ### WP-17: Range Types & Type Constraints
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11
+**Status:** In Bearbeitung (Bootstrap) | **Abhängigkeit:** WP-11
 
 **Ziel:** `1..100`-Range-Typen und Constraint-Expressions für sichere Typdefinitionen.
 
-**Zu implementieren:**
+**Zu implementieren (Bootstrap):**
 1. **Parser:** `type Port = i32 where value >= 0 && value <= 65535`
 2. **Sema:** Constraint-Validierung bei Zuweisung (statisch wo möglich, sonst Runtime-Check)
 3. **Codegen:** Runtime-Assertion für Constraints (`panic` bei Verletzung, konfigurierbar)
 4. **Range-Literal:** `1..100` als Range-Ausdruck (z.B. in for-Schleifen)
+
+**Bereits vorhanden (Bootstrap - Branch feat/wp17-range-types-bootstrap):**
+- `TK_RANGE` Token (Lexer: `..` vs `...`)
+- `NK_RANGE` Node für Range-Ausdruck (c0=start, c1=end)
+- `NK_WHERE` Node für Where-Clause (c0=base type, c1=constraint)
+- Range Expression Parsing in ParsePostfix (`1..100`)
+- Where Clause Parsing in ParseType
+- TY_RANGE Type in Sema
+- Sema-Type-Checking für Range und Where
 
 **Schätzung:** 1 Session
 
