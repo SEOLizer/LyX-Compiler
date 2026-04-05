@@ -451,9 +451,51 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 | 10e | Modulimport | WP-09 | ✅ COMPLETE
 | 10f | Enum-Typen | WP-04 + WP-09 | ✅ COMPLETE
 | 10g | Optimierungen (Constant Folding, CSE) | 10a-10f | ✅ COMPLETE
-| 10h | ARM64 Backend | 10a-10f |
+| 10h-1 | ARM64 Memory & Pointer Builtins | 10a-10f | ✅ COMPLETE
+| 10h-2 | ARM64 String Builtins S0 | 10h-1 | ✅ COMPLETE
+| 10h-3 | ARM64 String Builtins S1–S7 | 10h-2 |
+| 10h | ARM64 Backend (gesamt) | 10h-1..3 |
 | 10i | Linter | 10a-10f |
 | 10j | Vollständiger Self-Host-Test | alle |
+
+---
+
+### WP-10h-1: ARM64 Memory & Pointer Builtins ✅ COMPLETE
+
+**Implementiert:**
+- `mmap` / `munmap` als Builtin-Aufrufe (AAPCS64, 6 Argumente)
+- `poke8/16/32/64` / `peek8/16/32/64` – inline STRB/LDRB/STRH/LDRH/STR/LDR
+- `write_raw(fd, buf, len)` – direkt via sys_write
+- `buf_put_byte(buf, idx, b)` / `buf_get_byte(buf, idx)` – STRB/LDRB mit Register-Offset
+
+**Bugfixes:**
+- ArgTemps nicht in maxTemp-Scan → frameSize zu klein → Stack-Korruption
+- Frames >512 Byte: STP pre-index imm7 überläuft → SUB+STP/LDP+ADD
+- `write_raw` fehlte in lower_ast_to_ir.pas
+
+**Test:** `tests/lyx/arm64/test_memory_builtins.lyx` ✅
+
+---
+
+### WP-10h-2: ARM64 String Builtins S0 ✅ COMPLETE
+
+**Implementiert (alle ARM64-native, ohne libc):**
+
+| Builtin | Implementierung |
+|---------|----------------|
+| `PrintLn(s)` | `__builtin_PrintLn` Stub: strlen-Loop + sys_write + sys_write('\n') |
+| `StrLen(s)` | Inline: `LDRB W11, [X9, X10]` + CBZ-Loop (4 Instr.) |
+| `StrCharAt(s, i)` | Inline: `LDRB W0, [X0, X1]` (register-offset) |
+| `StrSetChar(s, i, c)` | Inline: `STRB W2, [X0, X1]` (register-offset) |
+| `StrNew(cap)` | Inline: mmap + 16-Byte-Header (capacity/length/null) |
+| `StrFree(s)` | Inline: LDUR + munmap(s-16, *(s-16)+16) |
+| `StrFromInt(n)` | `__builtin_StrFromInt` Stub: Stack-Digit-Buffer + CSNEG + UDIV/MSUB-Loop + mmap-Kopie |
+| `str_concat(a, b)` | `__builtin_str_concat` Stub: zwei strlen-Loops + mmap + zwei Copy-Loops |
+| `StrAppend(dest, src)` | `__builtin_StrAppend` Stub: mmap + Header + Copy + munmap-Alt |
+
+**sema.pas:** `PrintLn` als Builtin-Funktion registriert (fehlte bisher)
+
+**Tests:** `tests/lyx/arm64/test_str_basics.lyx`, `test_str_concat.lyx`, `test_str_fromint.lyx`, `test_str_builtins.lyx` ✅
 
 ---
 
