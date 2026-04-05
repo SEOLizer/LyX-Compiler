@@ -243,32 +243,24 @@ korrekt über Funktionsgrenzen (cross-frame exception propagation).
 
 **Ziel:** Feature-Parität mit dem FPC-Compiler für OOP.
 
-**Zu implementieren (Bootstrap):**
-1. **Vererbung:** `type Dog = class extends Animal { ... }`
-   - VMT-Erweiterung: Kind-VMT enthält Eltern-Einträge + neue Methoden
-   - `super.method(...)` — Aufruf der Eltern-Implementierung
-2. **Interfaces:** `type Drawable = interface { fn Draw(): void; }`
-   - `type Circle = class implements Drawable { ... }`
-   - Interface-VMT-Pointer pro Klasse
-   - `x as Drawable` — Interface-Cast mit Runtime-Type-Check
-3. **Access Control:** `pub`, `protected`, `priv` in Sema durchsetzen
-4. **Abstract Classes/Methods:** `abstract fn foo(): void`
-5. **Class-Felder:** Initialisierungs-Reihenfolge, Default-Werte
+**Implementiert (Bootstrap):**
+- ✅ **Vererbung:** `type Dog = class extends Animal { ... }`
+  - `NK_CLASS_DECL.c2` = parent class name
+  - VMT-Erweiterung: Kind-VMT enthält Eltern-Einträge + neue Methoden
+  - `super.method(...)` — `NK_SUPER_CALL` Parser + Codegen
+- ✅ **Interfaces:** `type Drawable = interface { fn Draw(): void; }`
+  - `NK_IFACE_DECL` Parser
+  - `implements` Parser (`NK_CLASS_DECL.c3` = interfaces list)
+  - `TY_INTERFACE` Type in Sema
+- ✅ **Access Control:** `pub` Keyword vorhanden
+- ✅ **Abstract/Override/Virtual:** Keywords (`TK_VIRTUAL`, `TK_ABSTRACT`, `TK_OVERRIDE`) im Lexer
+- ✅ **Class-Felder:** `cg_buildClassLayout()` generiert Feld-Layout
+- ✅ **VMT:** `cg_addVmtPatch()`, VMT-Tabellen in Data-Section
 
-**Bereits vorhanden (Bootstrap - fb50f08):**
-- `extends` Parser (NK_CLASS_DECL.c2 = parent)
-- `implements` Parser (NK_CLASS_DECL.c3 = interfaces list)
-- `interface` Parser (NK_IFACE_DECL)
-- `isType` Expression (NK_IS_EXPR in Parser + Sema)
-
-**Bereits vorhanden (FPC-Compiler):**
-- Classes + VMT (WP-10a)
-- Abstract Methods (partial)
-- `isType` Expression
-
-**Referenz:** `compiler/frontend/ast.pas` (OOP-Nodes), `compiler/backend/x86_64/x86_64_emit.pas`
-
-**Schätzung:** 3 Sessions
+**Zu implementieren (verbleibend):**
+- ❌ Abstract Classes/Methods vollständig in Sema durchsetzen
+- ❌ Private/Protected Access Control in Sema durchsetzen (pub vorhanden, aber nicht durchgesetzt)
+- ❌ Interface-Cast mit Runtime-Type-Check (`x as Drawable`)
 
 ---
 
@@ -859,6 +851,7 @@ dann in Phase 2 dazu.
 - WP-13: Closures & Nested Functions ✅
 - WP-14: Generics / Type-Parameter-Monomorphization ✅
 - WP-15: Pattern Matching & Match-Expressions ✅
+- WP-16: OOP (Vererbung, Interfaces, VMT) ✅ (partial: Access Control, Abstract)
 
 ### WP-12: Exception Handling - Bereits implementiert
 - ✅ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung in `codegen_x86.lyx`
@@ -903,7 +896,7 @@ dann in Phase 2 dazu.
 ### Phase 1: Sprachkern-Vollständigkeit (Offene WPs)
 - ✅ **WP-14:** Generics / Type-Parameter-Monomorphization (Parser + Sema)
 - ✅ **WP-15:** Pattern Matching & Match-Expressions (Parser + Sema)
-- ❌ **WP-16:** Vollständiges OOP (Vererbung, Interfaces, Access Control)
+- ✅ **WP-16:** Vollständiges OOP (Vererbung, Interfaces, VMT, partial Access Control)
 - ❌ **WP-17:** Range Types & Type Constraints
 
 ### Phase 2: IR-Schicht
