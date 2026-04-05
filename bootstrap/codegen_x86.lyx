@@ -59,6 +59,8 @@ con CGN_CALL:        int64 := 49;
 con CGN_INDEX:       int64 := 50;
 con CGN_FIELD:       int64 := 51;
 con CGN_NEW:         int64 := 52;
+con CGN_CAST:        int64 := 53;  // WP-11: x as Type
+con CGN_IS_EXPR:     int64 := 72;  // WP-16: x is Type
 
 // Token kinds for binary operators (mirror TK_xxx from bootstrap.lexer)
 con CGT_PLUS:    int64 := 70;
@@ -112,6 +114,10 @@ con CGN_FIELD_DECL:int64 := 7;    // NK_FIELD_DECL from parser
 con CG_CLASS_SZ:   int64 := 40;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)+vmtDataOff(8)
 con CG_CFIELD_SZ:  int64 := 24;   // fieldName(8)+fieldLen(8)+fieldOffset(8)
 con CG_VMT_PATCH_SZ: int64 := 24; // codeOff(8) + classNamePtr(8) + classNameLen(8)
+
+// WP-12: Exception handling globals pre-reserved at start of data section
+con CG_EXN_VAL: int64 := 0;   // data[0..7]:  current exception value (_lyx_exn_val)
+con CG_EXN_PTR: int64 := 8;   // data[8..15]: current handler jmp_buf ptr (_lyx_exn_ptr)
 
 // ============================================================================
 // Codegen class
@@ -652,6 +658,119 @@ pub type Codegen = class {
     var pos: int64 := self.codeLen;
     self.cg_e32(0);
     return pos;
+  }
+
+  // WP-12: Emit lea rcx, [rip+disp32] to access a data section global.
+  // dataOff = CG_EXN_VAL (0) or CG_EXN_PTR (8). Adds a CG_PATCH_STR patch.
+  fn cg_emitLeaRcxData(dataOff: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0D);  // lea rcx, [rip+disp32]
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
+  }
+
+  // WP-12: Emit longjmp code. rax must hold jmp_buf base pointer.
+  // Restores rbx, rbp, r12..r15; sets rsp=rax; then jmp [rsp+56] (catch label).
+  fn cg_genLongjmp() {
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x18);                     // mov rbx, [rax]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x68); self.cg_e8(0x08);  // mov rbp, [rax+8]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x60); self.cg_e8(0x10);  // mov r12, [rax+16]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x68); self.cg_e8(0x18);  // mov r13, [rax+24]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x70); self.cg_e8(0x20);  // mov r14, [rax+32]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x78); self.cg_e8(0x28);  // mov r15, [rax+40]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC4);                     // mov rsp, rax
+    self.cg_e8(0xFF); self.cg_e8(0x64); self.cg_e8(0x24); self.cg_e8(0x38);  // jmp [rsp+56]
+  }
+
+  // WP-11: Parse float literal string src[off..off+len) to IEEE 754 double bits.
+  // Handles: N, N.M, N[eE][+-]P format.
+  fn cg_parseFloat(src: pchar, off: int64, len: int64): int64 {
+    var i: int64 := off;
+    var end: int64 := off + len;
+    var neg: int64 := 0;
+    if (i < end && StrCharAt(src, i) == 45) { neg := 1; i := i + 1; }
+    var num: int64 := 0;
+    var den: int64 := 1;
+    while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) {
+      if (num < 900000000000000) { num := num * 10 + StrCharAt(src, i) - 48; }
+      i := i + 1;
+    }
+    if (i < end && StrCharAt(src, i) == 46) {
+      i := i + 1;
+      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57 && den < 100000000) {
+        num := num * 10 + StrCharAt(src, i) - 48;
+        den := den * 10;
+        i := i + 1;
+      }
+      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) { i := i + 1; }
+    }
+    var expNeg: int64 := 0;
+    var expVal: int64 := 0;
+    if (i < end && (StrCharAt(src, i) == 101 || StrCharAt(src, i) == 69)) {
+      i := i + 1;
+      if (i < end && StrCharAt(src, i) == 45) { expNeg := 1; i := i + 1; }
+      else if (i < end && StrCharAt(src, i) == 43) { i := i + 1; }
+      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) {
+        expVal := expVal * 10 + StrCharAt(src, i) - 48;
+        i := i + 1;
+      }
+    }
+    if (num == 0) { return 0; }
+    var ej: int64 := 0;
+    if (expNeg == 0) {
+      while (ej < expVal && num < 100000000000000) { num := num * 10; ej := ej + 1; }
+    } else {
+      while (ej < expVal && den < 100000000000000) { den := den * 10; ej := ej + 1; }
+    }
+    // Normalize: find binary exponent so n/d ∈ [1, 2)
+    var n: int64 := num;
+    var d: int64 := den;
+    var binExp: int64 := 0;
+    while (n < d && n > 0) {
+      if (n > 4611686018427387903) { d := d / 2; if (d == 0) { d := 1; } }
+      else { n := n * 2; }
+      binExp := binExp - 1;
+      if (binExp < -1074) { return 0; }
+    }
+    while (d < 4611686018427387903 && n >= d * 2) {
+      d := d * 2; binExp := binExp + 1;
+      if (binExp > 1023) {
+        var pInf: int64 := 2047; pInf := pInf << 52;
+        if (neg != 0) {
+          var smI: int64 := 1; var sI: int64 := 0;
+          while (sI < 63) { smI := smI * 2; sI := sI + 1; }
+          return pInf | smI;
+        }
+        return pInf;
+      }
+    }
+    n := n - d;
+    var mant: int64 := 0;
+    var bit: int64 := 51;
+    while (bit >= 0) {
+      if (n > 4000000000000000) { n := n / 2; d := d / 2; if (d == 0) { d := 1; } }
+      n := n * 2;
+      if (n >= d) { mant := mant | (1 << bit); n := n - d; }
+      bit := bit - 1;
+    }
+    var biasedE: int64 := binExp + 1023;
+    if (biasedE <= 0) { return 0; }
+    if (biasedE >= 2047) {
+      var pInf2: int64 := 2047; pInf2 := pInf2 << 52;
+      if (neg != 0) {
+        var smJ: int64 := 1; var sJ: int64 := 0;
+        while (sJ < 63) { smJ := smJ * 2; sJ := sJ + 1; }
+        return pInf2 | smJ;
+      }
+      return pInf2;
+    }
+    var bits: int64 := (biasedE << 52) | mant;
+    if (neg != 0) {
+      var sm: int64 := 1; var sk: int64 := 0;
+      while (sk < 63) { sm := sm * 2; sk := sk + 1; }
+      bits := bits | sm;
+    }
+    return bits;
   }
 
   // call rel32  — placeholder; returns position of rel32 for patching
@@ -1339,6 +1458,40 @@ pub type Codegen = class {
       // mov rax, [rcx+rbx*8]
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD9);
 
+    } else if (k == CGN_LIT_FLOAT) {
+      // WP-11: float literal — parse IEEE 754 bits and load as immediate
+      var floatBits: int64 := self.cg_parseFloat(self.pSrc, self.cg_nsoff(ni), self.cg_nslen(ni));
+      self.cg_movRaxImm(floatBits);
+
+    } else if (k == CGN_CAST) {
+      // WP-11: x as Type — evaluate source, then apply integer truncation/extension
+      self.cg_genExpr(self.cg_nc0(ni));
+      var typeNode: int64 := self.cg_nc1(ni);
+      if (typeNode >= 0) {
+        var tname: pchar := self.cg_nsval(typeNode);
+        var tlen: int64 := self.cg_nslen(typeNode);
+        if (self.cg_seq(tname, tlen, "i8", 2)) {
+          // movsx rax, al  — sign-extend byte to qword
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0xC0);
+        } else if (self.cg_seq(tname, tlen, "u8", 2)) {
+          // movzx rax, al  — zero-extend byte to qword
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
+        } else if (self.cg_seq(tname, tlen, "i16", 3)) {
+          // movsx rax, ax  — sign-extend word to qword
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0xC0);
+        } else if (self.cg_seq(tname, tlen, "u16", 3)) {
+          // movzx rax, ax  — zero-extend word to qword
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);
+        } else if (self.cg_seq(tname, tlen, "i32", 3)) {
+          // movsxd rax, eax  — sign-extend dword to qword
+          self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0xC0);
+        } else if (self.cg_seq(tname, tlen, "u32", 3)) {
+          // mov eax, eax  — zero-extends to rax automatically on x86-64
+          self.cg_e8(0x89); self.cg_e8(0xC0);
+        }
+        // i64, u64, pchar, bool, char, f32, f64: no-op (already 64-bit in rax)
+      }
+
     } else {
       // Unknown expression: emit 0
       self.cg_zeroRax();
@@ -1537,6 +1690,38 @@ pub type Codegen = class {
       self.cg_movRaxImm(90);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
+    } else if (self.cg_seq(fname, fnlen, "panic", 5)) {
+      // WP-12: panic(msg: pchar) — write msg to stderr, longjmp or exit(1)
+      // rdi = msg pointer (set by argument evaluation above)
+      // Store msg in _lyx_exn_val for catch clause to read
+      self.cg_emitLeaRcxData(CG_EXN_VAL);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x39);   // mov [rcx], rdi
+      // Write msg to stderr: StrLen(rdi)→rax, then write(2, rdi, rax)
+      self.cg_e8(0x57);                                         // push rdi (save msg)
+      var ppSL: int64 := self.cg_emitCall();
+      poke32(self.code + ppSL, CG_H_STRLEN - ppSL - 4);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax (length)
+      self.cg_e8(0x5F);                                         // pop rdi (restore msg)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);   // mov rsi, rdi (buf)
+      self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edi, 2 (stderr)
+      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 1 (sys_write)
+      self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall
+      // Check for exception handler and longjmp if present
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+      self.cg_e8(0x0F); self.cg_e8(0x84);
+      var pNH: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_genLongjmp();
+      poke32(self.code + pNH, self.codeLen - pNH - 4);
+      // no handler: sys_exit(1)
+      self.cg_movRaxImm(1);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      self.cg_movRaxImm(60);
+      self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall (sys_exit)
+      self.cg_zeroRax();
+
     } else {
       // User-defined function call: emit call + patch
       var pp: int64 := self.cg_emitCall();
@@ -1673,17 +1858,100 @@ pub type Codegen = class {
       // Just evaluate the expression (no-op effect on expr result)
       self.cg_genExpr(self.cg_nc0(ni));
 
-    // WP-12: Exception handling - stub implementation
-    } else if (k == CGN_TRY || k == CGN_CATCH || k == CGN_FINALLY) {
-      // Try/catch/finally not fully implemented in bootstrap codegen.
-      // Just generate the try block content.
+    // WP-12: Exception handling — setjmp/longjmp based
+    } else if (k == CGN_TRY) {
+      // jmp_buf layout on stack (80 bytes):
+      //   [rsp+0..39]: callee-saved regs (rbx,rbp,r12,r13,r14,r15)
+      //   [rsp+48]: saved rsp (= jmp_buf base, since mov rax,rsp before sub)
+      //   [rsp+56]: catch_label ip
+      //   [rsp+64]: old _lyx_exn_ptr
+
+      // sub rsp, 80
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
+      self.cg_e8(0x50); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      // Save callee-saved registers
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x1C); self.cg_e8(0x24); // mov [rsp], rbx
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x6C); self.cg_e8(0x24); self.cg_e8(0x08); // mov [rsp+8], rbp
+      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x64); self.cg_e8(0x24); self.cg_e8(0x10); // mov [rsp+16], r12
+      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x6C); self.cg_e8(0x24); self.cg_e8(0x18); // mov [rsp+24], r13
+      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20); // mov [rsp+32], r14
+      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28); // mov [rsp+40], r15
+      // Save rsp value to [rsp+48] (= current rsp = jmp_buf base; longjmp restores rsp←rax)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);                     // mov rax, rsp
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x30); // mov [rsp+48], rax
+      // Save catch_label address to [rsp+56] via forward-patched LEA
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);  // lea rax, [rip+disp32]
+      var catchLblPatch: int64 := self.codeLen;
+      self.cg_e32(0);                                           // patched after catch label is known
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x38); // mov [rsp+56], rax
+      // Save old handler from _lyx_exn_ptr to [rsp+64]
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov [rsp+64], rax
+      // Install new handler: _lyx_exn_ptr ← rsp
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);   // mov rax, rsp
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+      // Generate try body
+      self.cg_genBlock(self.cg_nc0(ni));
+      // Try success: restore old handler
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov rax, [rsp+64]
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+      // Generate finally block on success path (if present)
+      var finallyNi: int64 := self.cg_nc2(ni);
+      if (finallyNi >= 0) { self.cg_genBlock(finallyNi); }
+      // Jump past catch to try_done
+      self.cg_e8(0xE9);
+      var tryDonePatch: int64 := self.codeLen;
+      self.cg_e32(0);
+      // === catch_label ===
+      var catchOff: int64 := self.codeLen;
+      poke32(self.code + catchLblPatch, catchOff - catchLblPatch - 4);
+      // longjmp has restored registers and rsp = jmp_buf base
+      // Restore old handler
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov rax, [rsp+64]
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+      // Load exception value for catch binding
+      self.cg_emitLeaRcxData(CG_EXN_VAL);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+      // Generate catch clauses (c1 = first catch, nnext-linked)
+      var catchNi: int64 := self.cg_nc1(ni);
+      while (catchNi >= 0) {
+        self.cg_genBlock(self.cg_nc0(catchNi));  // catch body
+        catchNi := self.cg_nnext(catchNi);
+      }
+      // Generate finally block on catch path
+      if (finallyNi >= 0) { self.cg_genBlock(finallyNi); }
+      // === try_done ===
+      poke32(self.code + tryDonePatch, self.codeLen - tryDonePatch - 4);
+      // add rsp, 80  — restore stack frame
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC4);
+      self.cg_e8(0x50); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+
+    } else if (k == CGN_CATCH || k == CGN_FINALLY) {
+      // Standalone catch/finally outside try — just generate body
       self.cg_genBlock(self.cg_nc0(ni));
 
     } else if (k == CGN_THROW) {
-      // throw expr: for bootstrap, emit panic with message
-      // Evaluate the expression (sets rax to exception value)
-      self.cg_genExpr(self.cg_nc0(ni));
-      // Currently a stub - in full implementation would call longjmp
+      // WP-12: throw expr — store exception value, longjmp or exit(1)
+      self.cg_genExpr(self.cg_nc0(ni));               // rax = exception value
+      self.cg_emitLeaRcxData(CG_EXN_VAL);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+      self.cg_e8(0x0F); self.cg_e8(0x84);
+      var throwNH: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_genLongjmp();
+      poke32(self.code + throwNH, self.codeLen - throwNH - 4);
+      // no handler: sys_exit(1)
+      self.cg_movRaxImm(1);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      self.cg_movRaxImm(60);
+      self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall (sys_exit)
 
     } else if (k == CGN_BREAK) {
       // jmp rel32 to loop exit; placeholder stores previous break-list head
@@ -2311,7 +2579,7 @@ pub type Codegen = class {
 
     self.dataCap := 16384;
     self.data    := mmap(0, self.dataCap, 3, 34, -1, 0);
-    self.dataLen := 0;
+    self.dataLen := 16;  // WP-12: pre-reserve 16 bytes for exception globals (EXN_VAL@0, EXN_PTR@8)
 
     self.localCap  := 64;
     self.locals    := mmap(0, self.localCap * CG_LOCAL_SZ, 3, 34, -1, 0);
