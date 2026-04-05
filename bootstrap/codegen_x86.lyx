@@ -61,6 +61,8 @@ con CGN_FIELD:       int64 := 51;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
+con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
+con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_IS_EXPR:     int64 := 72;  // WP-16: x is Type
 
 // Token kinds for binary operators (mirror TK_xxx from bootstrap.lexer)
@@ -1906,6 +1908,10 @@ pub type Codegen = class {
     } else if (k == CGN_SWITCH) {
       self.cg_genSwitch(ni);
 
+    // WP-15: Pattern matching - generate like switch
+    } else if (k == CGN_MATCH) {
+      self.cg_genMatch(ni);
+
     } else if (k == CGN_DISPOSE) {
       // dispose obj: call munmap? Skip for bootstrap.
       // Just evaluate the expression (no-op effect on expr result)
@@ -2318,6 +2324,97 @@ pub type Codegen = class {
     }
 
     // switch_end: patch all break/implicit-break jmps here
+    var bh: int64 := self.curBreakHead;
+    while (bh != -1) {
+      var b0: int64 := peek8(self.code + bh);
+      var b1: int64 := peek8(self.code + bh + 1);
+      var b2: int64 := peek8(self.code + bh + 2);
+      var b3: int64 := peek8(self.code + bh + 3);
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + bh, self.codeLen - bh - 4);
+      bh := nextLink;
+    }
+    self.curBreakHead := savedBreakHead;
+  }
+
+  // WP-15: Generate match statement (like switch but for pattern matching)
+  fn cg_genMatch(ni: int64) {
+    // c0 = discriminant expression, c1 = cases (next-linked)
+    // Allocate a temp local to hold the subject value
+    var matchVar: pchar := "__match__";
+    var matchOff: int64 := self.cg_addLocal(matchVar, 8);
+    self.cg_genExpr(self.cg_nc0(ni));
+    self.cg_storeRax(matchOff);
+
+    // Save and reset break list
+    var savedBreakHead: int64 := self.curBreakHead;
+    self.curBreakHead := -1;
+
+    var defaultCaseNode: int64 := -1;
+    var caseCur: int64 := self.cg_nc1(ni);  // first match case
+    while (caseCur != -1) {
+      // WP-15: Match case structure:
+      // c0 = pattern (NK_PATTERN_LIT or NK_PATTERN_WILD)
+      // c1 = body expression
+      var patNode: int64 := self.cg_nc0(caseCur);
+      var bodyNode: int64 := self.cg_nc1(caseCur);
+      var patKind: int64 := self.cg_nkind(patNode);
+      
+      // Wildcard pattern - treat as default
+      if (patKind == 67) {  // NK_PATTERN_WILD = 67
+        defaultCaseNode := caseCur;
+      } else {
+        // Load subject value, compare with pattern
+        self.cg_loadRax(matchOff);
+        self.cg_pushRax();
+        // Pattern literal: c1 = ival for int literals, sval for identifiers
+        var patVal: int64 := self.cg_nival(patNode);
+        if (patVal != 0) {
+          // Integer literal pattern
+          self.cg_movRaxImm(patVal);
+        } else {
+          // Identifier pattern - load from local/symbol
+          // For now, assume string-based pattern comparison
+          var patName: pchar := self.cg_nsval(patNode);
+          var patLen: int64 := self.cg_nslen(patNode);
+          var patOff: int64 := self.cg_findLocal(patName, patLen);
+          if (patOff != 0) {
+            self.cg_loadRax(patOff);
+          } else {
+            self.cg_zeroRax();
+          }
+        }
+        self.cg_popRbx();
+        // cmp rbx, rax; jne skip_case
+        self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
+        self.cg_e8(0x0F); self.cg_e8(0x85);
+        var jnePos: int64 := self.codeLen;
+        self.cg_e32(0);
+        // Execute case body
+        self.cg_genExpr(bodyNode);
+        // Implicit jmp to match_end
+        self.cg_e8(0xE9);
+        var bp: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bp;
+        // Patch jne to next case
+        poke32(self.code + jnePos, self.codeLen - jnePos - 4);
+      }
+      caseCur := self.cg_nnext(caseCur);
+    }
+
+    // Default/wildcard case executes last if no other case matched
+    if (defaultCaseNode != -1) {
+      var bodyNode: int64 := self.cg_nc1(defaultCaseNode);
+      self.cg_genExpr(bodyNode);
+      self.cg_e8(0xE9);
+      var bpd: int64 := self.codeLen;
+      self.cg_e32(self.curBreakHead);
+      self.curBreakHead := bpd;
+    }
+
+    // match_end: patch all break/implicit jmps
     var bh: int64 := self.curBreakHead;
     while (bh != -1) {
       var b0: int64 := peek8(self.code + bh);
