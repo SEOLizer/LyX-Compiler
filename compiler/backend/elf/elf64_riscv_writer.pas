@@ -133,6 +133,10 @@ var
   b: Byte;
   p: PByte;
   filesz: UInt64;
+  metaSafeVA: UInt64;  // aerospace-todo P0 #103
+  dataBufSize: UInt64; // aerospace-todo P0 #104
+  dataOff: UInt64;     // aerospace-todo P0 #104
+  SHF_ALLOC: UInt64;   // aerospace-todo P0 #103
 
   procedure WriteU8(v: Byte); begin f.WriteByte(v); end;
   procedure WriteU16(v: Word); var w: Word; begin w := LEToN(v); f.WriteBuffer(w, 2); end;
@@ -147,6 +151,34 @@ begin
   codeStartVA := baseVA + codeOffset;
   codeEndVA   := codeStartVA + codeSize;
   shdrSize   := 64;
+  metaSafeVA := 0;  // aerospace-todo P0 #103
+  SHF_ALLOC := 2;   // aerospace-todo P0 #103
+
+  // Data buffer support (aerospace-todo P0 #104)
+  if Assigned(dataBuf) then
+    dataBufSize := dataBuf.Size
+  else
+    dataBufSize := 0;
+  if dataBufSize > 0 then
+  begin
+    dataOff := codeOffset + codeSize;
+    if (dataOff mod 8) <> 0 then dataOff := dataOff + (8 - (dataOff mod 8));
+  end
+  else
+    dataOff := 0;
+
+  // Data buffer support (aerospace-todo P0 #104)
+  if Assigned(dataBuf) then
+    dataBufSize := dataBuf.Size
+  else
+    dataBufSize := 0;
+  if dataBufSize > 0 then
+  begin
+    dataOff := codeOffset + codeSize;
+    if (dataOff mod 8) <> 0 then dataOff := dataOff + (8 - (dataOff mod 8));
+  end
+  else
+    dataOff := 0;
 
   POLY := $EDB88320; crc := $FFFFFFFF;
   p := PByte(codeBuf.GetBuffer);
@@ -190,8 +222,9 @@ begin
     Ord('s'),Ord('a'),Ord('f'),Ord('e'),0]);
   shStrTabSize := shStrTab.Size;
 
-  metaSafeOff := codeOffset + codeSize;
+  metaSafeOff := codeOffset + codeSize + dataBufSize;
   if (metaSafeOff mod 8) <> 0 then metaSafeOff := metaSafeOff + (8 - (metaSafeOff mod 8));
+  metaSafeVA := baseVA + metaSafeOff;  // aerospace-todo P0 #103
   shStrTabOff := metaSafeOff + metaSafeSize;
   if (shStrTabOff mod 8) <> 0 then shStrTabOff := shStrTabOff + (8 - (shStrTabOff mod 8));
   shdrsOff := shStrTabOff + shStrTabSize;
@@ -214,6 +247,12 @@ begin
     WriteU64(filesz); WriteU64(filesz); WriteU64(pageSize);
     PadTo(codeOffset);
     if codeSize > 0 then f.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+    // Write data buffer (aerospace-todo P0 #104)
+    if dataBufSize > 0 then
+    begin
+      PadTo(dataOff);
+      f.WriteBuffer(dataBuf.GetBuffer^, dataBufSize);
+    end;
     PadTo(metaSafeOff); f.WriteBuffer(metaSafeSec.GetBuffer^, metaSafeSize);
     PadTo(shStrTabOff); f.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
     PadTo(shdrsOff);
@@ -226,8 +265,8 @@ begin
     // .shstrtab shdr
     WriteU32(SHStr_shstrtab_off); WriteU32(3 {STRTAB}); WriteU64(0); WriteU64(0);
     WriteU64(shStrTabOff); WriteU64(shStrTabSize); WriteU32(0); WriteU32(0); WriteU64(1); WriteU64(0);
-    // .meta_safe shdr
-    WriteU32(SHStr_metasafe_off); WriteU32(1 {PROGBITS}); WriteU64(0); WriteU64(0);
+    // .meta_safe shdr (aerospace-todo P0 #103: SHF_ALLOC)
+    WriteU32(SHStr_metasafe_off); WriteU32(1 {PROGBITS}); WriteU64(SHF_ALLOC); WriteU64(metaSafeVA);
     WriteU64(metaSafeOff); WriteU64(metaSafeSize); WriteU32(0); WriteU32(0); WriteU64(8); WriteU64(0);
   finally
     f.Free; metaSafeSec.Free; shStrTab.Free;
