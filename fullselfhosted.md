@@ -118,7 +118,7 @@ Quelltext (.lyx)
 
 ### WP-11: Erweitertes Typsystem & Operatoren
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-09/WP-10
+**Status:** Abgeschlossen | **Abhängigkeit:** WP-09/WP-10
 
 **Ziel:** Der Bootstrap-Parser und Sema unterstützen das vollständige primitive Typsystem
 des FPC-Compilers.
@@ -143,7 +143,7 @@ des FPC-Compilers.
 
 ### WP-12: Exception Handling (try/catch/finally)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11
+**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
 
 **Ziel:** Vollständige Exception-Handling-Infrastruktur im Bootstrap-Compiler.
 
