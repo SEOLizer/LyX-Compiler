@@ -884,9 +884,12 @@ dann in Phase 2 dazu.
 - ✅ **Sema:** `_getMonomorphInstance()` Stub für Instantiation-Cache
 - ✅ **Sema:** `instCache` Buffer für Generic-Instanziierung
 
-### WP-15: Pattern Matching - Verbleibende Stubs
-- ❌ **Codegen:** Entscheidungsbaum-Generierung (Sprung-Tabellen für dichte Ranges)
-- ❌ **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?)
+### WP-15: Pattern Matching - Bereits implementiert
+- ✅ **Parser:** `NK_MATCH`, `NK_MATCH_CASE`, `_parseMatch()` vollständig
+- ✅ **Parser:** Pattern-Typen: `NK_PATTERN_LIT`, `NK_PATTERN_WILD`, `NK_PATTERN_BIND`
+- ✅ **Codegen:** `cg_genMatch()` für match-Statements (entspricht switch-Logik)
+- ✅ **Sema:** Pattern-Typ-Prüfung in `_checkStmt`
+- ❌ **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?) - Stub
 - ❌ **Sema:** Enum-Payload-Patterns (`case Ok(v) => ...`)
 - ❌ **Sema:** Struct-Destrukturierung
 
