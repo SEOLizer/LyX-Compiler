@@ -891,8 +891,10 @@ dann in Phase 2 dazu.
 - ❌ **Sema:** Struct-Destrukturierung
 
 ### WP-11: Bekannte Issues
-- ❌ **Float-Literal-Parsing:** Token-ID-Kollision TK_CHAR (177) verursacht Fehler bei `3.14`
-  - Lösung erfordert Refactoring der Token-IDs im Lexer
+- ✅ **Float-Literal-Parsing:** Token-ID-Kollision TK_CHAR (177) behoben
+  - TK_CHAR_TYPE (neu: 177) für char-Keyword
+  - TK_F32 (neu: 180), TK_F64 (neu: 181) für Float-Typen
+  - Parser/Sema aktualisiert für TK_CHAR_TYPE
 
 ### Phase 1: Sprachkern-Vollständigkeit (Offene WPs)
 - ✅ **WP-14:** Generics / Type-Parameter-Monomorphization (Parser + Sema)
