@@ -229,6 +229,7 @@ begin
   SafetyPragmas.StackLimit        := 0;
   SafetyPragmas.Integrity.Mode     := imNone;
   SafetyPragmas.Integrity.Interval := 0;
+  SafetyPragmas.FPDeterministic    := False;  // FIX: initialize to avoid uninitialized garbage
 end;
 
 destructor TIRFunction.Destroy;

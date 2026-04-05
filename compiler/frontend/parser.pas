@@ -3227,6 +3227,7 @@ begin
   safetyPragmas.StackLimit        := 0;
   safetyPragmas.Integrity.Mode     := imNone;
   safetyPragmas.Integrity.Interval := 0;
+  safetyPragmas.FPDeterministic    := False;  // FIX: initialize to avoid uninitialized garbage
   // Inject any @integrity pre-parsed at the top of the file (aerospace-todo P0 #43)
   if FHasPendingIntegrity then
   begin
