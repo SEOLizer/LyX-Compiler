@@ -270,22 +270,17 @@ korrekt über Funktionsgrenzen (cross-frame exception propagation).
 
 **Ziel:** `1..100`-Range-Typen und Constraint-Expressions für sichere Typdefinitionen.
 
-**Zu implementieren (Bootstrap):**
-1. **Parser:** `type Port = i32 where value >= 0 && value <= 65535`
-2. **Sema:** Constraint-Validierung bei Zuweisung (statisch wo möglich, sonst Runtime-Check)
-3. **Codegen:** Runtime-Assertion für Constraints (`panic` bei Verletzung, konfigurierbar)
-4. **Range-Literal:** `1..100` als Range-Ausdruck (z.B. in for-Schleifen)
+**Implementiert (Bootstrap):**
+- ✅ **Parser:** `1..100` Range-Ausdruck (`NK_RANGE` Node)
+- ✅ **Parser:** `type Port = i32 where value >= 0 && value <= 65535` (`NK_WHERE`)
+- ✅ **Lexer:** `TK_RANGE` Token (`..`), `TK_WHERE` Keyword
+- ✅ **Sema:** TY_RANGE Type, Type-Checking für Range und Where
+- ✅ **Codegen:** CGN_RANGE, CGN_WHERE Konstanten, Range-Expression Codegen (Stub: eval start)
 
-**Bereits vorhanden (Bootstrap - Branch feat/wp17-range-types-bootstrap):**
-- `TK_RANGE` Token (Lexer: `..` vs `...`)
-- `NK_RANGE` Node für Range-Ausdruck (c0=start, c1=end)
-- `NK_WHERE` Node für Where-Clause (c0=base type, c1=constraint)
-- Range Expression Parsing in ParsePostfix (`1..100`)
-- Where Clause Parsing in ParseType
-- TY_RANGE Type in Sema
-- Sema-Type-Checking für Range und Where
-
-**Schätzung:** 1 Session
+**Verbleibend:**
+- ❌ Sema: Constraint-Validierung bei Zuweisung
+- ❌ Codegen: Runtime-Assertion für Constraints
+- ❌ Codegen: Range-Iteration (for-Schleifen mit Ranges)
 
 ---
 
@@ -852,6 +847,7 @@ dann in Phase 2 dazu.
 - WP-14: Generics / Type-Parameter-Monomorphization ✅
 - WP-15: Pattern Matching & Match-Expressions ✅
 - WP-16: OOP (Vererbung, Interfaces, VMT) ✅ (partial: Access Control, Abstract)
+- WP-17: Range Types & Type Constraints ✅ (partial: Parser+Sema, Codegen Stub)
 
 ### WP-12: Exception Handling - Bereits implementiert
 - ✅ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung in `codegen_x86.lyx`
@@ -897,7 +893,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-14:** Generics / Type-Parameter-Monomorphization (Parser + Sema)
 - ✅ **WP-15:** Pattern Matching & Match-Expressions (Parser + Sema)
 - ✅ **WP-16:** Vollständiges OOP (Vererbung, Interfaces, VMT, partial Access Control)
-- ❌ **WP-17:** Range Types & Type Constraints
+- ✅ **WP-17:** Range Types & Type Constraints (partial: Parser + Sema, Codegen Stub)
 
 ### Phase 2: IR-Schicht
 - ❌ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx)
