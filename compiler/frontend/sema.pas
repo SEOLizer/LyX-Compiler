@@ -1175,6 +1175,15 @@ begin
   s.ParamTypes[0] := atPChar;
   AddSymbolToCurrent(s, NullSpan);
 
+  // PrintLn(pchar) -> void (like PrintStr but adds newline)
+  s := TSymbol.Create('PrintLn');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
   // PrintInt(int64) -> void
   s := TSymbol.Create('PrintInt');
   s.Kind := symFunc;
