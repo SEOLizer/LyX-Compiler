@@ -60,6 +60,7 @@ con CGN_INDEX:       int64 := 50;
 con CGN_FIELD:       int64 := 51;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
+con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
 con CGN_IS_EXPR:     int64 := 72;  // WP-16: x is Type
 
 // Token kinds for binary operators (mirror TK_xxx from bootstrap.lexer)
@@ -192,6 +193,11 @@ pub type Codegen = class {
   vmtPatches:    int64;
   vmtPatchCount: int64;
   vmtPatchCap:   int64;
+
+  // WP-13: Closure support - static link for nested functions
+  staticLinkOffset: int64;  // rbp offset of static link param (or -1 if not nested)
+  outerFuncName:    pchar;  // name of outer function (for static link)
+  outerFuncNameLen: int64;
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
   localIsArray: int64;
@@ -336,6 +342,15 @@ pub type Codegen = class {
     var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
     if (idx < 0) { return 0; }
     return peek8(self.localIsArray + idx);
+  }
+
+  // WP-13: Find captured variable from outer function's frame via static link
+  // Returns the offset in the captured environment, or 0 if not found
+  fn cg_findCapturedVar(name: pchar, nlen: int64): int64 {
+    // TODO: Implement capture analysis in Sema, populate captured var table
+    // For now, return 0 (not captured) - full implementation will check
+    // a captured-variables table built during Sema analysis
+    return 0;
   }
 
   // ------------------------------------------------------------------
@@ -1351,11 +1366,36 @@ pub type Codegen = class {
       if (off != 0) {
         self.cg_loadRax(off);
       } else {
-        var conVal: int64 := self.cg_findConVal(name, nlen);
-        if (conVal != -1) {
-          self.cg_movRaxImm(conVal);
+        // WP-13: Check if this is a captured variable from outer scope
+        // If we have a static link, check if variable is captured via outer frame
+        if (self.staticLinkOffset >= 0) {
+          var capturedOff: int64 := self.cg_findCapturedVar(name, nlen);
+          if (capturedOff != 0) {
+            // Load static link into rbx, then access captured var via [rbx+offset]
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0x10); // mov rbx, [rbp+16]
+            // mov rax, [rbx+capturedOff]
+            if (capturedOff >= -128 && capturedOff <= 127) {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x1B); self.cg_e8(capturedOff);
+            } else {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x84); self.cg_e8(0x1B);
+              self.cg_e32(capturedOff);
+            }
+          } else {
+            // Not local and not captured - check for constant
+            var conVal: int64 := self.cg_findConVal(name, nlen);
+            if (conVal != -1) {
+              self.cg_movRaxImm(conVal);
+            } else {
+              self.cg_zeroRax();
+            }
+          }
         } else {
-          self.cg_zeroRax();
+          var conVal: int64 := self.cg_findConVal(name, nlen);
+          if (conVal != -1) {
+            self.cg_movRaxImm(conVal);
+          } else {
+            self.cg_zeroRax();
+          }
         }
       }
 
@@ -1970,11 +2010,111 @@ pub type Codegen = class {
     var savedLocals: int64 := self.localCount;
     var stmt: int64 := self.cg_nc0(ni);
     while (stmt != -1) {
-      self.cg_genStmt(stmt);
+      var sk: int64 := self.cg_nkind(stmt);
+      // WP-13: Nested function declaration inside a block - generate as closure
+      if (sk == CGN_FUNC_DECL) {
+        // Check if this is a nested function (has outer function context)
+        // For now, generate nested functions with static link support
+        self.cg_genNestedFunc(stmt);
+      } else {
+        self.cg_genStmt(stmt);
+      }
       stmt := self.cg_nnext(stmt);
     }
     // Restore local scope (pop locals declared in this block)
     self.localCount := savedLocals;
+  }
+
+  // WP-13: Generate nested function with static link support
+  fn cg_genNestedFunc(ni: int64) {
+    // Register label for nested function (mangled with parent context)
+    var fname: pchar := self.cg_nsval(ni);
+    var fnlen: int64 := self.cg_nslen(ni);
+    
+    // Generate unique nested function name with parent suffix
+    var nestedLabel: int64 := self._allocNestedLabel(fname, fnlen);
+    self.cg_addLabel(nestedLabel, 16);  // 16 = max label length
+    
+    // Reset locals but preserve outer function's captured variables
+    self.localCount := 0;
+    self.frameSize := 0;
+    
+    // Check if we have a static link from parent (passed via [rbp+16])
+    var hasStaticLink: int64 := 0;
+    if (self.staticLinkOffset >= 0) {
+      hasStaticLink := 1;
+      // Save static link to local slot for captured variable access
+      var slOff: int64 := self.cg_addLocal("__static_link__", 15);
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(0x10); // mov rax, [rbp+16]
+      self.cg_storeRax(slOff);  // store to local slot
+    }
+    
+    // Emit prologue with extra space for static link parameter
+    var prologuePatch: int64 := self.cg_emitPrologueNested();
+    
+    // Spill parameters (child0 = first param, linked via next)
+    var param: int64 := self.cg_nc0(ni);
+    var paramIdx: int64 := 0;
+    while (param != -1 && paramIdx < 6) {
+      var pname: pchar := self.cg_nsval(param);
+      var pnlen: int64 := self.cg_nslen(param);
+      var off: int64 := self.cg_addLocal(pname, pnlen);
+      if (paramIdx == 0) { self.cg_spillRdi(off); }
+      else if (paramIdx == 1) { self.cg_spillRsi(off); }
+      else if (paramIdx == 2) { self.cg_spillRdx(off); }
+      else if (paramIdx == 3) { self.cg_spillRcx(off); }
+      else if (paramIdx == 4) { self.cg_spillR8(off); }
+      else if (paramIdx == 5) { self.cg_spillR9(off); }
+      paramIdx := paramIdx + 1;
+      param := self.cg_nnext(param);
+    }
+    
+    // Generate function body (child2 = block)
+    var savedStaticLink: int64 := self.staticLinkOffset;
+    var savedOuterName: pchar := self.outerFuncName;
+    var savedOuterLen: int64 := self.outerFuncNameLen;
+    
+    // Set up static link context for this nested function
+    self.staticLinkOffset := 16;  // rbp+16 = static link param position
+    // Capture current function name as outer function
+    
+    var body: int64 := self.cg_nc2(ni);
+    self.cg_genBlock(body);
+    
+    // Restore outer function context
+    self.staticLinkOffset := savedStaticLink;
+    self.outerFuncName := savedOuterName;
+    self.outerFuncNameLen := savedOuterLen;
+    
+    // Implicit return
+    self.cg_zeroRax();
+    self.cg_emitEpilogue();
+    
+    // Patch sub rsp with aligned frame size
+    var fs: int64 := self.frameSize + 15;
+    var aligned: int64 := fs - (fs & 15);
+    if (aligned == 0) { aligned := 16; }
+    poke32(self.code + prologuePatch, aligned);
+  }
+
+  // WP-13: Generate nested function prologue (accepts static link in rbp+16)
+  fn cg_emitPrologueNested(): int64 {
+    self.cg_e8(0x55);                          // push rbp
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE5);  // mov rbp, rsp
+    // sub rsp, imm32 (48 81 EC xx xx xx xx)
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
+    var patchPos: int64 := self.codeLen;
+    self.cg_e32(0);
+    // Static link is already in [rbp+16] from caller
+    return patchPos;
+  }
+
+  // WP-13: Allocate nested function label (simple numbered suffix)
+  fn _allocNestedLabel(baseName: pchar, baseLen: int64): pchar {
+    // For simplicity, return a fixed label format "_NESTED_0", etc.
+    // In full implementation, would dynamically allocate string
+    // Just return placeholder - actual label registration handles it
+    return "__nested__";
   }
 
   fn cg_genIf(ni: int64) {

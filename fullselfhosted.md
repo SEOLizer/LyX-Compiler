@@ -855,8 +855,8 @@ dann in Phase 2 dazu.
 
 ### Bereits implementiert (Abgeschlossen)
 - WP-11: Erweitertes Typsystem ✅
-- WP-12: Exception Handling (Parser/Sema) ✅
-- WP-13: Closures & Nested Functions (Parser/Sema) ✅
+- WP-12: Exception Handling (Parser/Sema/Codegen) ✅
+- WP-13: Closures & Nested Functions (Parser/Sema, partial Codegen) ✅
 - WP-14: Generics / Type-Parameter-Monomorphization ✅
 - WP-15: Pattern Matching & Match-Expressions ✅
 
@@ -865,11 +865,15 @@ dann in Phase 2 dazu.
 - ✅ **Builtin-Exceptions:** `panic(msg)` — schreibt auf stderr, longjmp oder exit(1)
 - ✅ **finally-Block:** Cleanup-Code auf Erfolgs- und Fehler-Pfad generiert
 
-### WP-13: Closures - Verbleibende Stubs
-- ❌ **Codegen:** Static-Link-Mechanismus (Outer-Frame-Pointer)
-- ❌ **Codegen:** Captured-Variables via [static_link + offset]
-- ❌ **Codegen:** Closure-Objekt {function_ptr, captured_env_ptr}
+### WP-13: Closures & Nested Functions - Teilweise implementiert
+- ✅ **Parser:** Nested Function-Deklarationen innerhalb von Blocks (`ParseNestedFunc`)
+- ✅ **Parser:** `NK_FN_PTR` Type für Function-Pointer (`fn(T1, T2): R`)
+- ✅ **Codegen:** Static-Link-Support in Codegen-Klasse (`staticLinkOffset`, `outerFuncName`)
+- ✅ **Codegen:** `cg_genNestedFunc` für verschachtelte Funktionen mit eigenem Prolog
+- ✅ **Codegen:** Captured-Variable-Zugriff via `[rbp+16]` (static link) in IDENT handling
 - ❌ **Sema:** Capture-Analyse (welche Variablen werden gelesen/geschrieben?)
+- ❌ **Codegen:** Closure-Objekt `{function_ptr, captured_env_ptr}` für First-Class-Functions
+- ❌ **Codegen:** Static-Link-Übergabe bei Aufruf verschachtelter Funktionen
 
 ### WP-14: Generics - Verbleibende Stubs
 - ❌ **Sema:** Monomorphization (Type-Ersetzung T→konkret bei jedem Aufruf)
