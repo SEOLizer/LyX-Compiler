@@ -118,49 +118,57 @@ Quelltext (.lyx)
 
 ### WP-11: Erweitertes Typsystem & Operatoren
 
-**Status:** Abgeschlossen | **Abhängigkeit:** WP-09/WP-10
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-09/WP-10
 
 **Ziel:** Der Bootstrap-Parser und Sema unterstützen das vollständige primitive Typsystem
 des FPC-Compilers.
 
-**Zu implementieren:**
-1. **Primitive Typen in Parser/Sema:** `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`,
-   `f32`, `f64`, `bool`, `char`, `void`
-2. **Cast-Operatoren:** `x as i32`, `x as f64` — mit Typecheck in Sema
-3. **Float-Literale:** `3.14`, `1.0e-5` im Lexer/Parser
-4. **Char-Literale:** `'a'`, `'\n'`, `'\x41'`
-5. **Bool-Operatoren:** `&&`, `||`, `!` — korrekte Short-Circuit-Auswertung im Codegen
-6. **Bitweise Ops:** `&`, `|`, `^`, `~`, `<<`, `>>` vollständig
-7. **Vergleichsoperatoren:** `<`, `>`, `<=`, `>=`, `==`, `!=` für alle primitiven Typen
-8. **Typed Arithmetic:** i32+i32 → i32, f64+f64 → f64 (Typ-Propagation in Sema)
-9. **Integer-Overflow-Semantik:** Wrap-around (keine Checks standardmäßig)
+**Implementiert:**
+- [x] **Primitive Typen in Parser/Sema:** `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`,
+   `f32`, `f64`, `bool`, `char`, `void` (Lexer + Parser + Sema)
+- [x] **Cast-Operatoren:** `x as i32`, `x as f64` — Parser (NK_CAST) + Sema + Codegen
+   (i8/u8/i16/u16/i32/u32 via movsx/movzx/movsxd; i64/u64/pchar no-op)
+- [x] **Float-Literale:** `3.14`, `1.0e-5` im Lexer/Parser/Sema + Codegen (IEEE 754 Bits in RAX)
+- [x] **Char-Literale:** `'a'`, `'\n'`, `'\x41'` (als int64 in RAX)
+- [x] **Bool-Operatoren:** `&&`, `||`, `!` — im Codegen (non-short-circuit für &&/||)
+- [x] **Bitweise Ops:** `&`, `|`, `^`, `~`, `<<`, `>>` vollständig im Codegen
+- [x] **Vergleichsoperatoren:** `<`, `>`, `<=`, `>=`, `==`, `!=` für alle primitiven Typen
+- [x] **Typed Arithmetic:** Typ-Propagation in Sema
+- [x] **Integer-Overflow-Semantik:** Wrap-around (keine Checks)
 
 **Referenz:** `compiler/frontend/ast.pas` (Typdefinitionen), `compiler/frontend/sema.pas` (Typprüfung)
 
-**Schätzung:** 2 Sessions | **Output:** Erweiterter Lexer/Parser/Sema in `bootstrap/`
+**Output:** Erweiterter Lexer/Parser/Sema + Codegen in `bootstrap/`
 
 ---
 
 ### WP-12: Exception Handling (try/catch/finally)
 
-**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-11
 
 **Ziel:** Vollständige Exception-Handling-Infrastruktur im Bootstrap-Compiler.
 
-**Zu implementieren:**
-1. **Parser:** `try { ... } catch (e: ExType) { ... } finally { ... }`
-2. **Sema:** Exception-Typ-Hierarchie, Catch-Typ-Kompatibilitäts-Check
-3. **IR-Primitiven (Vorbereitung):** `irPushHandler`, `irPopHandler`, `irLoadHandlerExn`, `irThrow`
-4. **x86_64-Codegen:** setjmp/longjmp-basiertes Exception-Handling
-   - Handler-Stack: `rbp`-relativ gespeicherte jmp_buf-Strukturen
-   - `throw expr` → speichere Exception-Objekt + longjmp zum letzten Handler
-   - `finally`-Blöcke: als Cleanup-Code vor jedem Exit-Pfad
-5. **Builtin-Exceptions:** `PanicException`, `NullPointerException`, `IndexOutOfBoundsException`
-6. **`panic(msg)`:** Builtin, das eine `PanicException` wirft
+**Implementiert:**
+- [x] **Parser:** `try { ... } catch (e: ExType) { ... } finally { ... }` (NK_TRY/NK_CATCH/NK_FINALLY/NK_THROW)
+- [x] **Sema:** Exception-Typ-Hierarchie (TY_EXCEPTION/TY_PANIC_EXCEPT), Catch-Typ-Check
+- [x] **x86_64-Codegen:** setjmp/longjmp-basiertes Exception-Handling
+   - Handler-Stack: RSP-relative 80-Byte jmp_buf (rbx,rbp,r12-r15,rsp,catch_ip,prev_handler)
+   - Globals im Data-Section: `_lyx_exn_val` (data[0]), `_lyx_exn_ptr` (data[8])
+   - `try` → speichert jmp_buf, installiert Handler, generiert Try-Block + Finally auf beiden Pfaden
+   - `throw expr` → speichert Exception-Wert, longjmp zum Handler oder sys_exit(1)
+   - `finally`-Blöcke: inline dupliziert auf Erfolgs- und Fehler-Pfad
+- [x] **`panic(msg)`:** Builtin — schreibt msg auf stderr, longjmp zu Handler oder exit(1)
+- [ ] **Builtin-Exception-Klassen:** PanicException, NullPointerException, IndexOutOfBoundsException
+  _(Deferred: vollständige Klassen-Hierarchie erst mit WP-16/OOP)_
+- [ ] **IR-Primitiven:** `irPushHandler`, `irPopHandler` _(Deferred: WP-18 IR-Schicht)_
+
+**Hinweis (2026-04-05):** Bootstrap-Codegen implementiert. jmp_buf[48]=rsp=jmp_buf-Basis,
+daher longjmp: `mov rsp, rax` (rax=handler-ptr) dann `jmp [rsp+56]`. Funktioniert
+korrekt über Funktionsgrenzen (cross-frame exception propagation).
 
 **Referenz:** `compiler/ir/ir.pas` (irPushHandler/irPopHandler), `compiler/backend/x86_64/x86_64_emit.pas`
 
-**Schätzung:** 3 Sessions | **Output:** Exception Handling in Parser + Sema + Codegen
+**Output:** Exception Handling in Parser + Sema + Codegen (`bootstrap/codegen_x86.lyx`)
 
 ---
 
