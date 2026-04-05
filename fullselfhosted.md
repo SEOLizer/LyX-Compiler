@@ -815,4 +815,88 @@ dann in Phase 2 dazu.
 
 ---
 
-*Dokument erstellt: 2026-04-05 | Basis: FPC-Compiler v0.5.5 (~58.990 LOC) + Bootstrap-Compiler WP-10i (~5.642 LOC)*
+*Dokument erstellt: 2026-04-05 | Basis: FPC-Compiler v0.5.5 (~58.990 LOC) + Bootstrap-Compiler WP-13 (~5.715 LOC)*
+
+---
+
+## TODO: Offene Punkte und Stubs
+
+### Bereits implementiert (Abgeschlossen)
+- WP-11: Erweitertes Typsystem ✅
+- WP-12: Exception Handling (Parser/Sema) ✅
+- WP-13: Closures & Nested Functions (Parser/Sema) ✅
+
+### WP-12: Exception Handling - Verbleibende Stubs
+- ❌ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung
+- ❌ **Builtin-Exceptions:** PanicException, NullPointerException, IndexOutOfBoundsException
+- ❌ **finally-Block:** Cleanup-Code vor jedem Exit-Pfad
+
+### WP-13: Closures - Verbleibende Stubs
+- ❌ **Codegen:** Static-Link-Mechanismus (Outer-Frame-Pointer)
+- ❌ **Codegen:** Captured-Variables via [static_link + offset]
+- ❌ **Codegen:** Closure-Objekt {function_ptr, captured_env_ptr}
+- ❌ **Sema:** Capture-Analyse (welche Variablen werden gelesen/geschrieben?)
+
+### WP-11: Bekannte Issues
+- ❌ **Float-Literal-Parsing:** Token-ID-Kollision TK_CHAR (177) verursacht Fehler bei `3.14`
+  - Lösung erfordert Refactoring der Token-IDs im Lexer
+
+### Phase 1: Sprachkern-Vollständigkeit (Offene WPs)
+- ❌ **WP-14:** Generics / Type-Parameter-Monomorphization
+- ❌ **WP-15:** Pattern Matching & Match-Expressions
+- ❌ **WP-16:** Vollständiges OOP (Vererbung, Interfaces, Access Control)
+- ❌ **WP-17:** Range Types & Type Constraints
+
+### Phase 2: IR-Schicht
+- ❌ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx)
+- ❌ **WP-19:** AST→IR Lowering (Basis)
+- ❌ **WP-20:** AST→IR Lowering (OOP, Structs, Generics)
+- ❌ **WP-21:** IR-Optimierungen in Lyx
+- ❌ **WP-22:** Function Inlining
+
+### Phase 3: Backends
+- ❌ **WP-23:** x86_64 Backend via IR (emit_x86.lyx)
+- ❌ **WP-24:** ARM64 Backend via IR (emit_arm64.lyx)
+- ❌ **WP-25:** ELF64/PE64/MachO64 Writer
+
+### Phase 4: Erweiterte Features
+- ❌ **WP-26:** Vollständiger Linter (W001–W020)
+- ❌ **WP-27:** Map/Set Collections
+- ❌ **WP-28:** Statische Analyse
+- ❌ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity)
+- ❌ **WP-30:** Erweiterte Stdlib
+- ❌ **WP-31:** C FFI & Externes Linking
+- ❌ **WP-32:** RISC-V + Embedded Backends
+
+### Phase 5: Volle Selbst-Kompilierung
+- ❌ **WP-33:** lyxc.lyx — Vollständiger Compiler in Lyx
+- ❌ **WP-34:** Vollständiger Singularitäts-Test
+
+### Priorisierung (MVP-Pfad)
+```
+WP-11 → WP-18 → WP-19 → WP-21 → WP-23 → WP-25 → WP-33 → WP-34
+```
+
+### Globale Abhängigkeiten
+```
+WP-11 (Typsystem)
+├── WP-14 (Generics)
+├── WP-16 (OOP)
+├── WP-17 (Range Types)
+└── WP-18 (IR-Daten)
+    ├── WP-19 (IR-Lower Basis)
+    │     └── WP-20 (IR-Lower OOP)
+    │           └── WP-23 (x86 via IR)
+    │                 └── WP-24 (ARM64)
+    │                       └── WP-25 (Writers)
+    ├── WP-21 (IR-Optimize)
+    │     └── WP-22 (Inlining)
+    │     └── WP-28 (Statische Analyse)
+    └── WP-26 (Linter vollständig)
+
+WP-20 + WP-25 → WP-27 (Map/Set)
+WP-27 → WP-30 (Stdlib)
+
+WP-11..31 → WP-33 (lyxc.lyx)
+WP-33 → WP-34 (Singularitäts-Test)
+```
