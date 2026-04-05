@@ -226,11 +226,18 @@ des FPC-Compilers.
 
 ### WP-16: Vollständiges OOP (Vererbung, Interfaces, Zugriffskontrolle)
 
-**Status:** Teilweise vorhanden (WP-10a: Classes + VMT) | **Abhängigkeit:** WP-14
+**Status:** In Bearbeitung | **Abhängigkeit:** WP-14
+
+> **Hinweis (2026-04-05):** Kritischer Bug in `SafetyPragmas.FPDeterministic` gefunden und behoben.
+> Das Feld wurde an 3 Stellen nicht initialisiert, was zu zufälligen Crashes führte.
+> Fix: `FPDeterministic := False` hinzugefügt in:
+> - `compiler/ir/ir.pas:232` (TIRFunction.Create)
+> - `compiler/frontend/ast.pas:2516` (TAstFuncDecl.Create)
+> - `compiler/frontend/parser.pas:3230` (ParseFuncAttrs)
 
 **Ziel:** Feature-Parität mit dem FPC-Compiler für OOP.
 
-**Zu implementieren:**
+**Zu implementieren (Bootstrap):**
 1. **Vererbung:** `type Dog = class extends Animal { ... }`
    - VMT-Erweiterung: Kind-VMT enthält Eltern-Einträge + neue Methoden
    - `super.method(...)` — Aufruf der Eltern-Implementierung
@@ -242,6 +249,11 @@ des FPC-Compilers.
 4. **Abstract Classes/Methods:** `abstract fn foo(): void`
 5. **`isType` / Typ-Test:** `if (x isType Circle) { ... }`
 6. **Class-Felder:** Initialisierungs-Reihenfolge, Default-Werte
+
+**Bereits vorhanden (FPC-Compiler):**
+- Classes + VMT (WP-10a)
+- Abstract Methods (partial)
+- `isType` Expression (FPC-Compiler: `nkIsExpr` in ast.pas, lower_ast_to_ir.pas, sema.pas)
 
 **Referenz:** `compiler/frontend/ast.pas` (OOP-Nodes), `compiler/backend/x86_64/x86_64_emit.pas`
 
