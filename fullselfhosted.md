@@ -881,11 +881,11 @@ dann in Phase 2 dazu.
 - ✅ **Parser:** `NK_MATCH`, `NK_MATCH_CASE`, `_parseMatch()` vollständig
 - ✅ **Parser:** Pattern-Typen: `NK_PATTERN_LIT`, `NK_PATTERN_WILD`, `NK_PATTERN_BIND`
 - ✅ **Parser:** Enum-Payload-Pattern (`NK_PATTERN_ENUM`): `case Ok(v) => ...`
-- ✅ **Codegen:** `cg_genMatch()` für match-Statements (entspricht switch-Logik)
-- ✅ **Codegen:** `CGN_PATTERN_ENUM` Konstanten
+- ✅ **Parser:** Struct-Destrukturierung (`NK_PATTERN_STRUCT`): `case Point { x, y } => ...`
+- ✅ **Codegen:** `cg_genMatch()` für match-Statements
 - ✅ **Sema:** Pattern-Typ-Prüfung in `_checkStmt`
-- ❌ **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?) - Stub (benötigt vollständige Typ-Analyse)
-- ❌ **Sema:** Struct-Destrukturierung (`NK_PATTERN_STRUCT` - Parser Stub, kein Codegen)
+- ❌ **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?) - Stub
+- ❌ **Codegen:** Struct-Destrukturierung Feld-Matching (treat as wildcard)
 
 ### WP-11: Bekannte Issues
 - ✅ **Float-Literal-Parsing:** Token-ID-Kollision TK_CHAR (177) behoben
