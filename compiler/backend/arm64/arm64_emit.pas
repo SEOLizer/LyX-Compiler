@@ -53,6 +53,8 @@ type
     FRandomSeedOffset: UInt64;
     FRandomSeedAdded: Boolean;
     FRandomSeedLeaPatches: array of Integer;
+    // TMR Hash Store (aerospace-todo P0 #105)
+    FHasVerifyIntegrity: Boolean;
     // External symbols for PLT/GOT (Dynamic Linking)
     FExternalSymbols: array of TExternalSymbol;
     FPLTGOTPatches: array of TPLTGOTPatch;
@@ -91,6 +93,8 @@ type
     function GetPLTGOTPatches: TPLTGOTPatchArray;
     function GetEnergyStats: TEnergyStats;
     procedure SetEnergyLevel(level: TEnergyLevel);
+    // TMR Hash Store accessors (aerospace-todo P0 #105)
+    function HasVerifyIntegrityCall: Boolean;
   end;
 
 implementation
@@ -2833,16 +2837,28 @@ begin
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
-            else if instr.ImmStr = 'RegexReplace' then
-            begin
-              // RegexReplace(pattern, text, replacement) -> int64 (count)
-              // Einfache Implementierung: return 0
-              WriteMovImm64(FCode, X0, 0);
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
-            end
+             else if instr.ImmStr = 'RegexReplace' then
+             begin
+               // RegexReplace(pattern, text, replacement) -> int64 (count)
+               // Einfache Implementierung: return 0
+               WriteMovImm64(FCode, X0, 0);
+               if instr.Dest >= 0 then
+                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+             end
+             else if instr.ImmStr = 'VerifyIntegrity' then
+             begin
+               // === Integrity Verification (aerospace-todo P0 #105) ===
+               // ARM64 Stub: Returns true (1) for now.
+               // Full implementation needs: data section address loading,
+               // 3x ldr W-registers, cmp + b.ne + add counter, majority vote.
+               // Blocked by existing variable declaration issues in arm64_emit.pas
+               WriteMovImm64(FCode, X0, 1);
+               if instr.Dest >= 0 then
+                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+               FHasVerifyIntegrity := True;
+             end
 
-            // ========== WP-10h-1: Memory & Pointer Builtins ==========
+             // ========== WP-10h-1: Memory & Pointer Builtins ==========
 
             else if instr.ImmStr = 'mmap' then
             begin
@@ -5116,6 +5132,12 @@ begin
   FEnergyContext.Config := GetEnergyConfig;
   FCurrentCPU := GetCPUEnergyModel(cfARM64);
   FEnergyContext.CurrentCPU := FCurrentCPU;
+end;
+
+// === TMR Hash Store accessors (aerospace-todo P0 #105) ===
+function TARM64Emitter.HasVerifyIntegrityCall: Boolean;
+begin
+  Result := FHasVerifyIntegrity;
 end;
 
 end.
