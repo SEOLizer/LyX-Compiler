@@ -860,10 +860,10 @@ dann in Phase 2 dazu.
 - WP-14: Generics / Type-Parameter-Monomorphization ✅
 - WP-15: Pattern Matching & Match-Expressions ✅
 
-### WP-12: Exception Handling - Verbleibende Stubs
-- ❌ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung
-- ❌ **Builtin-Exceptions:** PanicException, NullPointerException, IndexOutOfBoundsException
-- ❌ **finally-Block:** Cleanup-Code vor jedem Exit-Pfad
+### WP-12: Exception Handling - Bereits implementiert
+- ✅ **Codegen:** setjmp/longjmp-basierte Exception-Implementierung in `codegen_x86.lyx`
+- ✅ **Builtin-Exceptions:** `panic(msg)` — schreibt auf stderr, longjmp oder exit(1)
+- ✅ **finally-Block:** Cleanup-Code auf Erfolgs- und Fehler-Pfad generiert
 
 ### WP-13: Closures - Verbleibende Stubs
 - ❌ **Codegen:** Static-Link-Mechanismus (Outer-Frame-Pointer)
