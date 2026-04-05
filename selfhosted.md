@@ -455,7 +455,7 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 | 10h-2 | ARM64 String Builtins S0 | 10h-1 | ✅ COMPLETE
 | 10h-3 | ARM64 String Builtins S1–S7 | 10h-2 | ✅ COMPLETE
 | 10h | ARM64 Backend (gesamt) | 10h-1..3 | ✅ COMPLETE
-| 10i | Linter | 10a-10f |
+| 10i | Linter | 10a-10f | ✅ COMPLETE
 | 10j | Vollständiger Self-Host-Test | alle |
 
 ---
@@ -540,6 +540,40 @@ Das ARM64 Linux Backend ist vollständig feature-parität mit dem x86_64 Backend
 **ABI:** AAPCS64 (X0–X7 Parameter, X19–X28 callee-saved, 16-Byte Stack-Alignment)
 
 **Syscalls:** Linux ARM64 (mmap=222, munmap=215, write=64, read=63, etc.)
+
+---
+
+### WP-10i: Linter (Bootstrap) ✅ COMPLETE
+
+**Datei:** `bootstrap/linter.lyx`
+
+Statische AST-Analyse für den self-hosted Bootstrap-Compiler (`lyxc_mini`).
+Der Linter läuft nach der Sema-Phase (Schritt 3b) und gibt Warnungen auf stderr aus.
+
+**Implementierte Regeln:**
+
+| Code | Regel | Beschreibung |
+|------|-------|-------------|
+| W001 | unused-variable | Variable deklariert aber nie gelesen (außer `_`-Prefix) |
+| W006 | unreachable-code | Code nach `return` in einem Block |
+| W007 | empty-block | Leerer Block `{ }` |
+| W010 | no-return | Nicht-void Funktion ohne garantierten `return`-Pfad |
+
+**Integration in lyxc_mini:**
+```lyx
+var lnt: Linter := new Linter();
+lnt.Init(p.src, p.nodes, p.toks, inputFile);
+lnt.Lint(head);
+// Warnings gehen an stderr (fd=2)
+```
+
+**Design:**
+- Flat variable table (mmap-Buffer, 32 Bytes/Eintrag: namePtr + nameLen + isRead + line)
+- Scope-Stack (bis 64 Ebenen), push/pop bei jedem Block
+- Keine Abhängigkeit von Sema — arbeitet direkt auf dem Parser-AST
+- Warnungen im Format `file:line: W0xx message`
+
+**Abhängigkeiten:** `bootstrap.parser` (Node-Struktur)
 
 ---
 
