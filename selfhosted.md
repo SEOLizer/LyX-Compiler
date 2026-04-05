@@ -453,8 +453,8 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 | 10g | Optimierungen (Constant Folding, CSE) | 10a-10f | ✅ COMPLETE
 | 10h-1 | ARM64 Memory & Pointer Builtins | 10a-10f | ✅ COMPLETE
 | 10h-2 | ARM64 String Builtins S0 | 10h-1 | ✅ COMPLETE
-| 10h-3 | ARM64 String Builtins S1–S7 | 10h-2 |
-| 10h | ARM64 Backend (gesamt) | 10h-1..3 |
+| 10h-3 | ARM64 String Builtins S1–S7 | 10h-2 | ✅ COMPLETE
+| 10h | ARM64 Backend (gesamt) | 10h-1..3 | ✅ COMPLETE
 | 10i | Linter | 10a-10f |
 | 10j | Vollständiger Self-Host-Test | alle |
 
@@ -496,6 +496,50 @@ und schließlich den vollen `lyxc.lyx` kompilieren kann.
 **sema.pas:** `PrintLn` als Builtin-Funktion registriert (fehlte bisher)
 
 **Tests:** `tests/lyx/arm64/test_str_basics.lyx`, `test_str_concat.lyx`, `test_str_fromint.lyx`, `test_str_builtins.lyx` ✅
+
+---
+
+### WP-10h-3: ARM64 String Builtins S1–S7 ✅ COMPLETE
+
+**Implementiert (alle ARM64-native, inline):**
+
+| Builtin | Implementierung |
+|---------|----------------|
+| `StrFindChar(s, c, from)` | Inline: Byte-Scan-Loop mit LDRB + CMP; gibt Index oder -1 zurück |
+| `StrSub(s, from, len)` | Inline: mmap(len+1) + Byte-Copy-Loop (LDRB/STRB post-index) |
+| `StrConcat(a, b)` | Inline: zwei strlen-Loops + mmap(len_a+len_b+1) + zwei Copy-Loops |
+| `StrCopy(s)` | Inline: strlen + mmap + Byte-Copy |
+| `IntToStr(n)` | Inline: Alias für StrFromInt (gleiche Implementierung) |
+| `FileGetSize(path)` | Inline: sys_stat + Offset-Lesen aus stat-Struktur |
+| `StrStartsWith(s, prefix)` | Inline: Byte-Vergleich-Loop vom Anfang |
+| `StrEndsWith(s, suffix)` | Inline: strlen-Berechnung + Byte-Vergleich-Loop vom Ende |
+| `StrEquals(a, b)` | Inline: Byte-Vergleich-Loop + Längenprüfung |
+| `GetArgC()` | Inline: Lesen von argc aus Stack-Initialisierung |
+| `GetArg(i)` | Inline: argv-Array-Zugriff per Register-Offset |
+
+**Hinweis:** S1–S7 wurden im Rahmen von WP-10g (Optimierungen) als Teil der ARM64-Feature-Parität implementiert und in main integriert.
+
+---
+
+### WP-10h: ARM64 Backend (gesamt) ✅ COMPLETE
+
+Das ARM64 Linux Backend ist vollständig feature-parität mit dem x86_64 Backend:
+
+**Abgedeckte Bereiche:**
+- Vollständige IR-Opcode-Abdeckung (93/93 Opcodes)
+- Alle String-Builtins S0–S7 (ARM64-native, ohne libc)
+- Memory & Pointer Builtins (mmap/munmap, peek/poke, buf_put/get_byte)
+- Float-Builtins (NEON-Mapping, format_float)
+- DynArray-Builtins (Push/Pop/Len/Free)
+- HashMap-Builtins (Stub-Implementierungen)
+- VMT (Virtual Method Table, Virtual Calls)
+- Socket-Builtins (ARM64-Syscall-Nummern)
+- Dynamic Linking (PLT/GOT, ELF64-Relokationen)
+- NEON SIMD-Hilfsfunktionen
+
+**ABI:** AAPCS64 (X0–X7 Parameter, X19–X28 callee-saved, 16-Byte Stack-Alignment)
+
+**Syscalls:** Linux ARM64 (mmap=222, munmap=215, write=64, read=63, etc.)
 
 ---
 
