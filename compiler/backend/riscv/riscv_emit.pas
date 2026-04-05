@@ -31,6 +31,9 @@ type
     FLeaStrIndex: array of Integer;
     FRandomSeedOffset: UInt64;
     FRandomSeedAdded: Boolean;
+    // TMR Hash Store patch positions (aerospace-todo P0 #106)
+    FRISCVDataAddrPos: Integer;
+    FHasVerifyIntegrity: Boolean;
     
     // RISC-V Instruction Encoding (RV64I base)
     procedure EmitRType(opcode, funct3, funct7, rd, rs1, rs2: Byte);
@@ -54,6 +57,8 @@ type
     procedure EmitSgtz(rd, rs: Byte);
     procedure EmitBeqz(rs1: Byte; imm: Integer);
     procedure EmitBnez(rs1: Byte; imm: Integer);
+    procedure EmitBeq(rs1, rs2: Byte; imm: Integer);  // aerospace-todo P0 #106
+    procedure EmitBne(rs1, rs2: Byte; imm: Integer);  // aerospace-todo P0 #106
     procedure EmitBlez(rs1: Byte; imm: Integer);
     procedure EmitBgez(rs1: Byte; imm: Integer);
     procedure EmitBltz(rs1: Byte; imm: Integer);
@@ -94,6 +99,9 @@ type
     function GetExternalSymbols: TExternalSymbolArray;
     procedure SetEnergyLevel(level: TEnergyLevel);
     function GetEnergyStats: TEnergyStats;
+    // TMR Hash Store accessors (aerospace-todo P0 #106)
+    function HasVerifyIntegrityCall: Boolean;
+    function GetDataAddrPos: Integer;
   end;
 
 implementation
@@ -262,6 +270,16 @@ end;
 procedure TRISCVCodeEmitter.EmitBnez(rs1: Byte; imm: Integer);
 begin
   EmitBType($63, 1, rs1, X0, imm);
+end;
+
+procedure TRISCVCodeEmitter.EmitBeq(rs1, rs2: Byte; imm: Integer);  // aerospace-todo P0 #106
+begin
+  EmitBType($63, 0, rs1, rs2, imm);
+end;
+
+procedure TRISCVCodeEmitter.EmitBne(rs1, rs2: Byte; imm: Integer);  // aerospace-todo P0 #106
+begin
+  EmitBType($63, 1, rs1, rs2, imm);
 end;
 
 procedure TRISCVCodeEmitter.EmitBlez(rs1: Byte; imm: Integer);
@@ -491,6 +509,12 @@ var
   lenLoop, slenLoop: Integer;
   patchInstr, patchOpcode: UInt32;
   patchLo, patchHi: Int64;
+  // TMR Hash Store patch variables (aerospace-todo P0 #106)
+  dataAddrPos: Integer;
+  jne1Pos, jne2Pos, jne3Pos: Integer;
+  match1Pos, match2Pos, match3Pos: Integer;
+  jgeOkPos, jmpEndPos, jmpEndPatchPos: Integer;
+  okPos, endPos: Integer;
 begin
   FCode.Clear;
   FData.Clear;
@@ -1258,6 +1282,79 @@ begin
                 EmitJal(X1, 0);
                 if instr.Dest >= 0 then EmitIType($23, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Dest));
               end
+              else if instr.ImmStr = 'VerifyIntegrity' then
+              begin
+                // === Integrity Verification (aerospace-todo P0 #106) ===
+                // VerifyIntegrity() -> bool: TMR majority-vote check
+                // Data layout: [hash1:4][hash2:4][hash3:4][code_size:4][code_start_va:8]
+                
+                // Step 1: Load data section address (patched by lyxc.lpr)
+                dataAddrPos := FCode.Size;
+                EmitLi(X8, 0);  // placeholder for data_va
+
+                // Step 2: Read 3 hashes from data section
+                // lw X9, 0(X8)
+                EmitIType($03, 2, X9, X8, 0);   // lw X9, 0(X8)
+                // lw X10, 4(X8)
+                EmitIType($03, 2, X10, X8, 4);  // lw X10, 4(X8)
+                // lw X11, 8(X8)
+                EmitIType($03, 2, X11, X8, 8);  // lw X11, 8(X8)
+
+                // Step 3: TMR majority vote
+                // X12 = 0 (match counter)
+                EmitLi(X12, 0);
+
+                // Compare hash1 vs hash2: bne X9, X10, skip1; addi X12, X12, 1
+                jne1Pos := FCode.Size;
+                EmitBne(X9, X10, 0);  // placeholder
+                EmitIType($13, 0, X12, X12, 1);
+                match1Pos := FCode.Size;
+
+                // Compare hash1 vs hash3: bne X9, X11, skip2; addi X12, X12, 1
+                jne2Pos := FCode.Size;
+                EmitBne(X9, X11, 0);  // placeholder
+                EmitIType($13, 0, X12, X12, 1);
+                match2Pos := FCode.Size;
+
+                // Compare hash2 vs hash3: bne X10, X11, skip3; addi X12, X12, 1
+                jne3Pos := FCode.Size;
+                EmitBne(X10, X11, 0);  // placeholder
+                EmitIType($13, 0, X12, X12, 1);
+                match3Pos := FCode.Size;
+
+                // Patch bne offsets
+                FCode.PatchU32LE(jne1Pos, UInt32(match1Pos - (jne1Pos + 4)));
+                FCode.PatchU32LE(jne2Pos, UInt32(match2Pos - (jne2Pos + 4)));
+                FCode.PatchU32LE(jne3Pos, UInt32(match3Pos - (jne3Pos + 4)));
+
+                // Step 4: Check if X12 >= 2
+                // slti X13, X12, 2; beq X13, X0, ok
+                EmitIType($13, 0, X13, X12, 2);  // slti X13, X12, 2
+                jgeOkPos := FCode.Size;
+                EmitBeq(X13, X0, 0);  // placeholder: if X13==0 (X12>=2) → ok
+
+                // Not OK: X10 = 0
+                EmitLi(X10, 0);
+                jmpEndPos := FCode.Size;
+                EmitJal(X0, 0);  // placeholder
+                jmpEndPatchPos := FCode.Size - 4;
+
+                // OK: X10 = 1
+                okPos := FCode.Size;
+                FCode.PatchU32LE(jgeOkPos, UInt32(okPos - (jgeOkPos + 4)));
+                EmitLi(X10, 1);
+
+                // End: store result
+                endPos := FCode.Size;
+                FCode.PatchU32LE(jmpEndPatchPos, UInt32(endPos - (jmpEndPatchPos + 4)));
+
+                if instr.Dest >= 0 then
+                  EmitIType($23, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Dest));
+
+                // Store patch position for lyxc.lpr
+                FRISCVDataAddrPos := dataAddrPos;
+                FHasVerifyIntegrity := True;
+              end
               else
               begin
                 EmitLi(X10, 0);
@@ -1482,6 +1579,17 @@ end;
 function TRISCVCodeEmitter.GetEnergyStats: TEnergyStats;
 begin
   Result := FEnergyStats;
+end;
+
+// === TMR Hash Store accessors (aerospace-todo P0 #106) ===
+function TRISCVCodeEmitter.HasVerifyIntegrityCall: Boolean;
+begin
+  Result := FHasVerifyIntegrity;
+end;
+
+function TRISCVCodeEmitter.GetDataAddrPos: Integer;
+begin
+  Result := FRISCVDataAddrPos;
 end;
 
 end.
