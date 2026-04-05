@@ -152,8 +152,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | ~~104~~ | ~~**BUG: dataBuf wird in RISC-V ELF-Writer nicht geschrieben**~~ | ~~`elf64_riscv_writer.pas`~~ | ~~Niedrig~~ | ✅ **ERLEDIGT** – dataBuf zwischen code und .meta_safe geschrieben, metaSafeOff angepasst |
 | ~~105~~ | ~~**VerifyIntegrity() Codegen ARM64**~~ | ~~`arm64_emit.pas`~~ | ~~Mittel~~ | ✅ **TEILWEISE ERLEDIGT** – Stub-Implementierung die `true` zurückgibt; Vollständige TMR-Implementierung blockiert durch bestehende Variablen-Deklarations-Bugs in `arm64_emit.pas` (loopStartPos, jgePos, etc. fehlen) |
 | ~~106~~ | ~~**VerifyIntegrity() Codegen RISC-V**~~ | ~~`riscv_emit.pas`~~ | ~~Mittel~~ | ✅ **ERLEDIGT** – Vollständige TMR-Implementierung: `lw` für Hash-Lesung, `bne`-Vergleiche, `slti`+`beq` für Majority-Vote, Getter-Methoden `HasVerifyIntegrityCall`/`GetDataAddrPos`, `EmitBne`/`EmitBeq` Helper |
-| 107 | **TMR Patching ARM64 in lyxc.lpr** | `lyxc.lpr` | Gering | Analog zu x86_64: CRC32 berechnen, dataVA patchen |
-| 108 | **TMR Patching RISC-V in lyxc.lpr** | `lyxc.lpr` | Gering | Analog zu x86_64: CRC32 berechnen, dataVA patchen |
+| ~~107~~ | ~~**TMR Patching ARM64 in lyxc.lpr**~~ | ~~`lyxc.lpr`~~ | ~~Gering~~ | ✅ **ERLEDIGT** – CRC32-Berechnung und Hash-Schreiben in Data-Buffer; ARM64-Stub gibt true zurück, daher kein Address-Patching nötig |
+| ~~108~~ | ~~**TMR Patching RISC-V in lyxc.lpr**~~ | ~~`lyxc.lpr`~~ | ~~Gering~~ | ✅ **ERLEDIGT** – CRC32-Berechnung, Hash-Schreiben in Data-Buffer, LUI+ADDI-Patching für 64-bit Data-Adresse |
 | 109 | **VerifyIntegrity() Codegen Windows x64** | `x86_64_win64.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich mit Win64 ABI |
 | 110 | **VerifyIntegrity() Codegen Windows ARM64** | `win_arm64_emit.pas` | Mittel | `irVerifyIntegrity`: ARM64 TMR mit Win64 ABI |
 | 111 | **VerifyIntegrity() Codegen macOS x64** | `macosx64_emit.pas` | Mittel | `irVerifyIntegrity`: TMR-Vergleich (macOS Syscalls) |
@@ -254,8 +254,8 @@ Basierend auf **aerospace.pdf v2** (Lyx Aerospace Extension) mit neuen Features:
 | **9. Build/CI** | 0 | 7 | 0% |
 | **10. Implementierungs-Tasks** | 8 | 10 | 44% |
 | **11. Aerospace Extension (NEW)** | 8 | 6 | 57% |
-| **12. Backend-Abdeckung (NEW)** | 6 | 15 | 29% |
-| **GESAMT** | **100** | **48** | **68%** |
+| **12. Backend-Abdeckung (NEW)** | 8 | 13 | 38% |
+| **GESAMT** | **102** | **46** | **69%** |
 
 ---
 
