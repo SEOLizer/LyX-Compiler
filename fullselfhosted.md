@@ -228,12 +228,10 @@ des FPC-Compilers.
 
 **Status:** In Bearbeitung | **Abhängigkeit:** WP-14
 
-> **Hinweis (2026-04-05):** Kritischer Bug in `SafetyPragmas.FPDeterministic` gefunden und behoben.
-> Das Feld wurde an 3 Stellen nicht initialisiert, was zu zufälligen Crashes führte.
-> Fix: `FPDeterministic := False` hinzugefügt in:
-> - `compiler/ir/ir.pas:232` (TIRFunction.Create)
-> - `compiler/frontend/ast.pas:2516` (TAstFuncDecl.Create)
-> - `compiler/frontend/parser.pas:3230` (ParseFuncAttrs)
+> **Hinweis (2026-04-05):** 
+> - Kritischer Bug in `SafetyPragmas.FPDeterministic` gefunden und behoben.
+>   Fix: `FPDeterministic := False` in `ir.pas`, `ast.pas`, `parser.pas`
+> - Bootstrap WP-16: Parser + Sema erweitert für `extends`, `implements`, `interface`, `isType`
 
 **Ziel:** Feature-Parität mit dem FPC-Compiler für OOP.
 
@@ -247,13 +245,18 @@ des FPC-Compilers.
    - `x as Drawable` — Interface-Cast mit Runtime-Type-Check
 3. **Access Control:** `pub`, `protected`, `priv` in Sema durchsetzen
 4. **Abstract Classes/Methods:** `abstract fn foo(): void`
-5. **`isType` / Typ-Test:** `if (x isType Circle) { ... }`
-6. **Class-Felder:** Initialisierungs-Reihenfolge, Default-Werte
+5. **Class-Felder:** Initialisierungs-Reihenfolge, Default-Werte
+
+**Bereits vorhanden (Bootstrap - fb50f08):**
+- `extends` Parser (NK_CLASS_DECL.c2 = parent)
+- `implements` Parser (NK_CLASS_DECL.c3 = interfaces list)
+- `interface` Parser (NK_IFACE_DECL)
+- `isType` Expression (NK_IS_EXPR in Parser + Sema)
 
 **Bereits vorhanden (FPC-Compiler):**
 - Classes + VMT (WP-10a)
 - Abstract Methods (partial)
-- `isType` Expression (FPC-Compiler: `nkIsExpr` in ast.pas, lower_ast_to_ir.pas, sema.pas)
+- `isType` Expression
 
 **Referenz:** `compiler/frontend/ast.pas` (OOP-Nodes), `compiler/backend/x86_64/x86_64_emit.pas`
 
