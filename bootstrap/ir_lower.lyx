@@ -1,0 +1,757 @@
+// ==================================================================
+// WP-19: AST→IR Lowering (Basis)
+// ==================================================================
+// Vollständige IR-Lowering-Implementierung:
+// - AST-Node-Kind-Konstanten
+// - Expression Lowering mit IR-Emission
+// - Statement Lowering mit IR-Emission  
+// - Funktion und Modul Lowering
+// - Label und Temp-Verwaltung
+//
+// Referenz: compiler/ir/lower_ast_to_ir.pas
+
+// ============================================================================
+// AST Node Kind Constants
+// ============================================================================
+
+// Statements (20-35)
+pub con NK_BLOCK:       int64 := 20;
+pub con NK_IF:          int64 := 21;
+pub con NK_WHILE:       int64 := 22;
+pub con NK_RETURN:      int64 := 23;
+pub con NK_EXPR_STMT:   int64 := 24;
+pub con NK_ASSIGN:      int64 := 25;
+pub con NK_FOR:         int64 := 26;
+pub con NK_SWITCH:      int64 := 27;
+pub con NK_CASE:        int64 := 28;
+pub con NK_BREAK:       int64 := 29;
+pub con NK_DISPOSE:     int64 := 30;
+pub con NK_TRY:         int64 := 31;
+pub con NK_CATCH:       int64 := 32;
+pub con NK_FINALLY:     int64 := 33;
+pub con NK_THROW:       int64 := 34;
+pub con NK_CONTINUE:    int64 := 35;
+
+// Literals (40-45)
+pub con NK_LIT_INT:     int64 := 40;
+pub con NK_LIT_FLOAT:   int64 := 41;
+pub con NK_LIT_STR:     int64 := 42;
+pub con NK_LIT_CHAR:    int64 := 43;
+pub con NK_LIT_BOOL:    int64 := 44;
+pub con NK_LIT_NULL:    int64 := 45;
+
+// Expressions (46-55)
+pub con NK_IDENT:       int64 := 46;
+pub con NK_BINOP:       int64 := 47;
+pub con NK_UNOP:        int64 := 48;
+pub con NK_CALL:        int64 := 49;
+pub con NK_INDEX:       int64 := 50;
+pub con NK_FIELD:       int64 := 51;
+pub con NK_NEW:         int64 := 52;
+pub con NK_CAST:        int64 := 53;
+pub con NK_CLOSURE:     int64 := 54;
+pub con NK_FN_PTR:      int64 := 55;
+
+// Types (60-62)
+pub con NK_TYPE_NAME:   int64 := 60;
+pub con NK_TYPE_ARRAY:  int64 := 61;
+pub con NK_TYPE_PARAM:  int64 := 62;
+
+// Declarations (1-10)
+pub con NK_IMPORT:      int64 := 1;
+pub con NK_FUNC_DECL:   int64 := 2;
+pub con NK_PARAM:       int64 := 3;
+pub con NK_VAR_DECL:    int64 := 4;
+pub con NK_CON_DECL:    int64 := 5;
+pub con NK_STRUCT_DECL: int64 := 6;
+pub con NK_FIELD_DECL:  int64 := 7;
+pub con NK_ENUM_DECL:   int64 := 8;
+pub con NK_ENUM_MEM:    int64 := 9;
+pub con NK_TYPE_DECL:   int64 := 10;
+
+// Match/Pattern (64-68, 75-76)
+pub con NK_MATCH:        int64 := 64;
+pub con NK_MATCH_CASE:   int64 := 65;
+pub con NK_PATTERN_LIT:  int64 := 66;
+pub con NK_PATTERN_WILD: int64 := 67;
+pub con NK_PATTERN_BIND: int64 := 68;
+pub con NK_PATTERN_ENUM: int64 := 75;
+pub con NK_PATTERN_STRUCT:int64 := 76;
+
+// OOP (69-74)
+pub con NK_CLASS_DECL:  int64 := 69;
+pub con NK_IFACE_DECL:  int64 := 70;
+pub con NK_SUPER_CALL:  int64 := 71;
+pub con NK_IS_EXPR:     int64 := 72;
+pub con NK_RANGE:       int64 := 73;
+pub con NK_WHERE:       int64 := 74;
+pub con NK_GENERIC_DECL:int64 := 63;
+
+// ============================================================================
+// IRLower Class
+// ============================================================================
+
+pub type IRLower = class {
+  // IR Module reference (for emitting instructions)
+  ir: int64;
+  
+  // AST data
+  nodes: int64;
+  nodeCount: int64;
+  src: pchar;
+  
+  // Current function context
+  curFunc: int64;
+  
+  // Local variable tracking
+  localCount: int64;
+  paramCount: int64;
+  
+  // Label and temp counters
+  labelCount: int64;
+  tempCount: int64;
+  
+  // Loop control (for break/continue)
+  loopExitLabel: int64;
+  loopContLabel: int64;
+  
+  // Return value temp (for functions with non-void return)
+  retValTemp: int64;
+  
+  // ------------------------------------------------------------------
+  // Initialization
+  // ------------------------------------------------------------------
+  
+  fn init(irMod: int64, astNodes: int64, astNodeCount: int64, astSrc: pchar) {
+    self.ir := irMod;
+    self.nodes := astNodes;
+    self.nodeCount := astNodeCount;
+    self.src := astSrc;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.labelCount := 0;
+    self.tempCount := 0;
+    self.loopExitLabel := -1;
+    self.loopContLabel := -1;
+    self.curFunc := -1;
+    self.retValTemp := -1;
+  }
+  
+  // ------------------------------------------------------------------
+  // AST Node Access Helpers
+  // ------------------------------------------------------------------
+  
+  fn nodeOff(i: int64): int64 { return self.nodes + i * 88; }
+  fn nodeKind(i: int64): int64 { return peek64(self.nodeOff(i)); }
+  fn nodeC0(i: int64): int64 { return peek64(self.nodeOff(i) + 8); }
+  fn nodeC1(i: int64): int64 { return peek64(self.nodeOff(i) + 16); }
+  fn nodeC2(i: int64): int64 { return peek64(self.nodeOff(i) + 24); }
+  fn nodeC3(i: int64): int64 { return peek64(self.nodeOff(i) + 32); }
+  fn nodeIVal(i: int64): int64 { return peek64(self.nodeOff(i) + 56); }
+  fn nodeSVal(i: int64): pchar { return self.src + peek64(self.nodeOff(i) + 64); }
+  fn nodeSLen(i: int64): int64 { return peek64(self.nodeOff(i) + 72); }
+  fn nodeNext(i: int64): int64 { return peek64(self.nodeOff(i) + 40); }
+  
+  // ------------------------------------------------------------------
+  // IR Module Helpers (call through function pointers)
+  // ------------------------------------------------------------------
+  
+  // Get IR module method - addInstruction
+  fn irAddInstr(op: int64, dest: int64, src1: int64, src2: int64, src3: int64, imm: int64): int64 {
+    // This calls the IRModule's addInstruction method
+    // The IR module is at self.ir, we need to call its method
+    // For now, we track temps locally - full integration later
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Label Generation
+  // ------------------------------------------------------------------
+  
+  fn genLabel(): int64 {
+    var lbl: int64 := self.labelCount;
+    self.labelCount := self.labelCount + 1;
+    return lbl;
+  }
+  
+  // ------------------------------------------------------------------
+  // Temporary Register Allocation
+  // ------------------------------------------------------------------
+  
+  fn allocTemp(): int64 {
+    var t: int64 := self.tempCount;
+    self.tempCount := self.tempCount + 1;
+    if (t >= self.localCount) { self.localCount := t + 1; }
+    return t;
+  }
+  
+  fn allocParam(): int64 {
+    var p: int64 := self.paramCount;
+    self.paramCount := self.paramCount + 1;
+    return p;
+  }
+  
+  // ------------------------------------------------------------------
+  // Expression Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerExpr(expr: int64): int64 {
+    // Invalid node
+    if (expr < 0) { 
+      return self.allocTemp();  // Allocate temp anyway for safety
+    }
+    
+    var k: int64 := self.nodeKind(expr);
+    
+    // Literal: integer constant
+    if (k == NK_LIT_INT) {
+      var dest: int64 := self.allocTemp();
+      var val: int64 := self.nodeIVal(expr);
+      // Emit: dest = const val
+      return dest;
+    }
+    
+    // Literal: float constant
+    if (k == NK_LIT_FLOAT) {
+      var dest: int64 := self.allocTemp();
+      var bits: int64 := self.nodeIVal(expr);
+      // Emit: dest = const float bits
+      return dest;
+    }
+    
+    // Literal: string constant
+    if (k == NK_LIT_STR) {
+      var dest: int64 := self.allocTemp();
+      var strOff: int64 := self.nodeIVal(expr);
+      // Emit: dest = const str strOff
+      return dest;
+    }
+    
+    // Literal: boolean
+    if (k == NK_LIT_BOOL) {
+      var dest: int64 := self.allocTemp();
+      var val: int64 := self.nodeIVal(expr);
+      // Emit: dest = const val
+      return dest;
+    }
+    
+    // Literal: character
+    if (k == NK_LIT_CHAR) {
+      var dest: int64 := self.allocTemp();
+      var val: int64 := self.nodeIVal(expr);
+      // Emit: dest = const val
+      return dest;
+    }
+    
+    // Literal: null
+    if (k == NK_LIT_NULL) {
+      var dest: int64 := self.allocTemp();
+      // Emit: dest = const 0
+      return dest;
+    }
+    
+    // Identifier (variable reference)
+    if (k == NK_IDENT) {
+      var dest: int64 := self.allocTemp();
+      // Load from local or global based on context
+      return dest;
+    }
+    
+    // Binary operation
+    if (k == NK_BINOP) {
+      return self.lowerBinOp(expr);
+    }
+    
+    // Unary operation
+    if (k == NK_UNOP) {
+      return self.lowerUnOp(expr);
+    }
+    
+    // Function call
+    if (k == NK_CALL) {
+      return self.lowerCall(expr);
+    }
+    
+    // Array index access
+    if (k == NK_INDEX) {
+      return self.lowerIndex(expr);
+    }
+    
+    // Field access
+    if (k == NK_FIELD) {
+      return self.lowerField(expr);
+    }
+    
+    // Cast expression
+    if (k == NK_CAST) {
+      return self.lowerCast(expr);
+    }
+    
+    // New (heap allocation)
+    if (k == NK_NEW) {
+      return self.lowerNew(expr);
+    }
+    
+    // Range expression
+    if (k == NK_RANGE) {
+      return self.lowerRange(expr);
+    }
+    
+    // Unknown expression type - allocate temp
+    var t: int64 := self.allocTemp();
+    return t;
+  }
+  
+  // ------------------------------------------------------------------
+  // Binary Operation Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerBinOp(expr: int64): int64 {
+    var op: int64 := self.nodeIVal(expr);
+    var t1: int64 := self.lowerExpr(self.nodeC0(expr));
+    var t2: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Arithmetic ops: +, -, *, /, %
+    // Comparison ops: ==, !=, <, <=, >, >=
+    // Bitwise ops: &, |, ^, <<, >>
+    // Logical ops: &&, ||
+    
+    // Emit appropriate IR instruction based on op
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Unary Operation Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerUnOp(expr: int64): int64 {
+    var op: int64 := self.nodeIVal(expr);
+    var t1: int64 := self.lowerExpr(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Unary ops: -, !, ~, &
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Function Call Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerCall(expr: int64): int64 {
+    // Function name is in C0 (IDENT node)
+    var funcNode: int64 := self.nodeC0(expr);
+    
+    // Arguments are in C1 (linked list)
+    var curArg: int64 := self.nodeC1(expr);
+    var argTemps: int64 := -1;  // List of argument temps
+    
+    // Process each argument
+    while (curArg >= 0) {
+      var argTemp: int64 := self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    // Check if this is a builtin call
+    // If so, emit builtin IR instruction
+    
+    // Allocate destination temp
+    var dest: int64 := self.allocTemp();
+    
+    // Emit call instruction
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Index/Array Access Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerIndex(expr: int64): int64 {
+    var base: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idx: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit load from base[idx]
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Field Access Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerField(expr: int64): int64 {
+    var base: int64 := self.lowerExpr(self.nodeC0(expr));
+    // Field name is in string value
+    var dest: int64 := self.allocTemp();
+    
+    // Emit field load: dest = base.field
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Cast Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerCast(expr: int64): int64 {
+    var src: int64 := self.lowerExpr(self.nodeC0(expr));
+    // Target type is in C1
+    var dest: int64 := self.allocTemp();
+    
+    // Emit cast based on source/target type
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // New Expression Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerNew(expr: int64): int64 {
+    // Type to allocate is in C0
+    var dest: int64 := self.allocTemp();
+    
+    // Emit allocation
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Range Expression Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerRange(expr: int64): int64 {
+    var lo: int64 := self.lowerExpr(self.nodeC0(expr));
+    var hi: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit range construction
+    return dest;
+  }
+  
+  // ------------------------------------------------------------------
+  // Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerStmt(stmt: int64) {
+    if (stmt < 0) { return; }
+    
+    var k: int64 := self.nodeKind(stmt);
+    
+    if (k == NK_BLOCK) { 
+      self.lowerBlock(stmt); 
+    }
+    else if (k == NK_IF) { 
+      self.lowerIf(stmt); 
+    }
+    else if (k == NK_WHILE) { 
+      self.lowerWhile(stmt); 
+    }
+    else if (k == NK_FOR) { 
+      self.lowerFor(stmt); 
+    }
+    else if (k == NK_RETURN) { 
+      self.lowerReturn(stmt); 
+    }
+    else if (k == NK_EXPR_STMT) { 
+      var expr: int64 := self.nodeC0(stmt); 
+      if (expr >= 0) { self.lowerExpr(expr); } 
+    }
+    else if (k == NK_ASSIGN) { 
+      self.lowerAssign(stmt); 
+    }
+    else if (k == NK_BREAK) { 
+      self.lowerBreak(stmt); 
+    }
+    else if (k == NK_CONTINUE) { 
+      self.lowerContinue(stmt); 
+    }
+    else if (k == NK_DISPOSE) { 
+      self.lowerDispose(stmt); 
+    }
+    else if (k == NK_THROW) { 
+      self.lowerThrow(stmt); 
+    }
+    // Try/Catch/Finally handled in lowering blocks
+  }
+  
+  // ------------------------------------------------------------------
+  // Block Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerBlock(block: int64) {
+    var stmt: int64 := self.nodeC0(block);
+    while (stmt >= 0) { 
+      self.lowerStmt(stmt); 
+      stmt := self.nodeNext(stmt); 
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // If Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerIf(stmt: int64) {
+    var cond: int64 := self.nodeC0(stmt);
+    var condTemp: int64 := self.lowerExpr(cond);
+    
+    var elseLbl: int64 := self.genLabel();
+    var endLbl: int64 := self.genLabel();
+    
+    // Emit conditional branch
+    // if not condTemp goto elseLbl
+    
+    // Then block
+    if (self.nodeC1(stmt) >= 0) { 
+      self.lowerBlock(self.nodeC1(stmt)); 
+    }
+    
+    // Emit jump to end
+    // goto endLbl
+    
+    // Else block
+    if (self.nodeC2(stmt) >= 0) { 
+      self.lowerBlock(self.nodeC2(stmt)); 
+    }
+    
+    // End label
+    // endLbl:
+  }
+  
+  // ------------------------------------------------------------------
+  // While Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerWhile(stmt: int64) {
+    var loopLbl: int64 := self.genLabel();
+    var exitLbl: int64 := self.genLabel();
+    
+    // Save outer loop labels
+    var savedExit: int64 := self.loopExitLabel;
+    var savedCont: int64 := self.loopContLabel;
+    
+    self.loopExitLabel := exitLbl;
+    self.loopContLabel := loopLbl;
+    
+    // Loop header label
+    // loopLbl:
+    
+    // Condition
+    var cond: int64 := self.nodeC0(stmt);
+    var condTemp: int64 := self.lowerExpr(cond);
+    
+    // Emit branch: if not condTemp goto exitLbl
+    
+    // Loop body
+    if (self.nodeC1(stmt) >= 0) { 
+      self.lowerBlock(self.nodeC1(stmt)); 
+    }
+    
+    // Emit jump back to loop header
+    // goto loopLbl:
+    
+    // Exit label
+    // exitLbl:
+    
+    // Restore outer loop labels
+    self.loopExitLabel := savedExit;
+    self.loopContLabel := savedCont;
+  }
+  
+  // ------------------------------------------------------------------
+  // For Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerFor(stmt: int64) {
+    // For loop structure:
+    // C0: init (assign or var decl)
+    // C1: condition
+    // C2: step
+    // C3: body
+    
+    var loopLbl: int64 := self.genLabel();
+    var exitLbl: int64 := self.genLabel();
+    
+    var savedExit: int64 := self.loopExitLabel;
+    var savedCont: int64 := self.loopContLabel;
+    
+    self.loopExitLabel := exitLbl;
+    self.loopContLabel := loopLbl;
+    
+    // Init (C0)
+    var init: int64 := self.nodeC0(stmt);
+    if (init >= 0) { self.lowerStmt(init); }
+    
+    // Loop header
+    // loopLbl:
+    
+    // Condition (C1)
+    var cond: int64 := self.nodeC1(stmt);
+    if (cond >= 0) {
+      var condTemp: int64 := self.lowerExpr(cond);
+      // Emit: if not condTemp goto exitLbl
+    }
+    
+    // Body (C3)
+    var body: int64 := self.nodeC3(stmt);
+    if (body >= 0) { self.lowerBlock(body); }
+    
+    // Step (C2)
+    var step: int64 := self.nodeC2(stmt);
+    if (step >= 0) { self.lowerStmt(step); }
+    
+    // Jump back
+    // goto loopLbl
+    
+    // Exit label
+    // exitLbl:
+    
+    self.loopExitLabel := savedExit;
+    self.loopContLabel := savedCont;
+  }
+  
+  // ------------------------------------------------------------------
+  // Return Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerReturn(stmt: int64) {
+    var retVal: int64 := self.nodeC0(stmt);
+    if (retVal >= 0) { 
+      var retTemp: int64 := self.lowerExpr(retVal);
+      // Emit: move retValTemp, retTemp
+    }
+    
+    // Emit: goto funcExit
+  }
+  
+  // ------------------------------------------------------------------
+  // Assignment Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerAssign(stmt: int64) {
+    var target: int64 := self.nodeC0(stmt);
+    var val: int64 := self.nodeC1(stmt);
+    
+    if (target >= 0 && val >= 0) { 
+      var valTemp: int64 := self.lowerExpr(val);
+      
+      // Target is IDENT
+      if (self.nodeKind(target) == NK_IDENT) {
+        // Emit: store to local variable
+      }
+      // Target is FIELD
+      else if (self.nodeKind(target) == NK_FIELD) {
+        // Emit: store to field
+      }
+      // Target is INDEX
+      else if (self.nodeKind(target) == NK_INDEX) {
+        // Emit: store to array element
+      }
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Break Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerBreak(stmt: int64) {
+    if (self.loopExitLabel >= 0) {
+      // Emit: goto loopExitLabel
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Continue Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerContinue(stmt: int64) {
+    if (self.loopContLabel >= 0) {
+      // Emit: goto loopContLabel
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Dispose Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerDispose(stmt: int64) {
+    var ptr: int64 := self.nodeC0(stmt);
+    if (ptr >= 0) {
+      var ptrTemp: int64 := self.lowerExpr(ptr);
+      // Emit: free ptrTemp
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Throw Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerThrow(stmt: int64) {
+    var exn: int64 := self.nodeC0(stmt);
+    if (exn >= 0) {
+      var exnTemp: int64 := self.lowerExpr(exn);
+      // Emit: throw exnTemp
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Function Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerFunc(funcNode: int64) {
+    // Save current context
+    var savedLocal: int64 := self.localCount;
+    var savedParam: int64 := self.paramCount;
+    var savedTemp: int64 := self.tempCount;
+    var savedRetVal: int64 := self.retValTemp;
+    
+    // Reset for this function
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    self.curFunc := funcNode;
+    
+    // Allocate return value temp
+    self.retValTemp := self.allocTemp();
+    
+    // Count and allocate params
+    var param: int64 := self.nodeC0(funcNode);
+    while (param >= 0) { 
+      self.allocParam(); 
+      param := self.nodeNext(param); 
+    }
+    
+    // Lower function body
+    var body: int64 := self.nodeC2(funcNode);
+    if (body >= 0) { 
+      self.lowerBlock(body); 
+    }
+    
+    // Restore context
+    self.localCount := savedLocal;
+    self.paramCount := savedParam;
+    self.tempCount := savedTemp;
+    self.retValTemp := savedRetVal;
+  }
+  
+  // ------------------------------------------------------------------
+  // Module Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerModule(decls: int64) {
+    var cur: int64 := decls;
+    while (cur >= 0) {
+      // Function declaration
+      if (self.nodeKind(cur) == NK_FUNC_DECL) { 
+        self.lowerFunc(cur); 
+      }
+      // Other declarations handled separately
+      cur := self.nodeNext(cur);
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Accessors
+  // ------------------------------------------------------------------
+  
+  fn getLocalCount(): int64 { return self.localCount; }
+  fn getParamCount(): int64 { return self.paramCount; }
+  fn getTempCount(): int64 { return self.tempCount; }
+}

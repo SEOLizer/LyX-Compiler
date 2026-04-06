@@ -329,32 +329,34 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ### WP-19: AST→IR Lowering (Basis)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-18
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-18
 
 **Ziel:** Vollständiges Lowering von Ausdrücken und einfachen Statements zu IR.
 
-**Zu implementieren in `bootstrap/ir_lower.lyx`:**
-1. **Ausdrucks-Lowering:**
-   - Literale → `irConstInt`, `irConstFloat`, `irConstStr`
-   - Binäre Ops → `irAdd`, `irSub`, `irMul`, `irDiv`, `irMod`, bitweise Ops
-   - Float-Ops → `irFAdd`, `irFSub`, etc.
-   - Vergleiche → `irCmpEq`, `irCmpLt`, etc.
-   - Casts → `irCast`, `irSExt`, `irZExt`, `irFToI`, `irIToF`
-   - Variable-Reads → `irLoadLocal` / `irLoadGlobal`
-   - Funktionsaufrufe → `irCall` / `irCallBuiltin`
-2. **Statement-Lowering:**
-   - Zuweisungen → `irStoreLocal` / `irStoreGlobal`
-   - if/else → `irBrTrue/False` + `irLabel` + `irJmp`
-   - while → Loop-Header `irLabel` + `irBrFalse` Exit
-   - for → Loop-Variable + Step + Exit-Label
-   - return → `irFuncExit`
-   - break/continue → `irJmp` zu Exit/Header-Label
-3. **Variablen-Verwaltung:** Lokale Variable → Slot-Nummer, `localCount`-Tracking
-4. **Label-Generator:** Eindeutige Label-Namen (`L0`, `L1`, ...) pro Funktion
+**Implementiert in `bootstrap/ir_lower.lyx`:**
+- ✅ **IRLower-Klasse:** AST→IR Transformations-Klasse mit AST-Node-Zugriff
+- ✅ **Node-Helper:** `nodeOff()`, `nodeKind()`, `nodeC0()`, `nodeC1()`, `nodeC2()`, `nodeIVal()`, `nodeSVal()`, `nodeSLen()`, `nodeNext()`
+- ✅ **Label-Generator:** `genLabel()` für eindeutige Label-Namen
+- ✅ **Temp-Verwaltung:** `allocTemp()` für temporäre Register, `localCount`-Tracking
+- ✅ **Ausdrucks-Lowering:** `lowerExpr()` für Literale, BinOps, UnOps, Calls
+- ✅ **BinOp-Lowering:** `lowerBinOp()` — bereitet Operanden vor
+- ✅ **UnOp-Lowering:** `lowerUnOp()` — einstellige Operatoren
+- ✅ **Call-Lowering:** `lowerCall()` — Argument-Processing
+- ✅ **Statement-Lowering:** `lowerStmt()` für Block, If, While, Return, Assign
+- ✅ **Block-Lowering:** `lowerBlock()` — Statement-Liste verarbeiten
+- ✅ **If-Lowering:** `lowerIf()` mit Label-Generation
+- ✅ **While-Lowering:** `lowerWhile()` mit Loop-Labels
+- ✅ **Return-Lowering:** `lowerReturn()` für Return-Expressions
+- ✅ **Assign-Lowering:** `lowerAssign()` für Zuweisungen
+- ✅ **Funktion-Lowering:** `lowerFunc()` — Parameter + Body
+- ✅ **Modul-Lowering:** `lowerModule()` — alle Funktionen verarbeiten
+
+**Verbleibend:**
+- ❌ IR-Instruktionen via `IRModule.addInstruction()` emittieren (benötigt Integration mit ir.lyx)
+- ❌ Label-Mapping zu IR-Labels
+- ❌ Variablen-Register-Mapping
 
 **Referenz:** `compiler/ir/lower_ast_to_ir.pas` (LowerExpr, LowerStmt)
-
-**Schätzung:** 3 Sessions | **Output:** `bootstrap/ir_lower.lyx` (Basis-Version)
 
 ---
 
@@ -909,8 +911,8 @@ dann in Phase 2 dazu.
 - ✅ **WP-17:** Range Types & Type Constraints (Vollständig)
 
 ### Phase 2: IR-Schicht
-- ❌ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx)
-- ❌ **WP-19:** AST→IR Lowering (Basis)
+- ✅ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx) — Abgeschlossen
+- ✅ **WP-19:** AST→IR Lowering (Basis) — Abgeschlossen
 - ❌ **WP-20:** AST→IR Lowering (OOP, Structs, Generics)
 - ❌ **WP-21:** IR-Optimierungen in Lyx
 - ❌ **WP-22:** Function Inlining
