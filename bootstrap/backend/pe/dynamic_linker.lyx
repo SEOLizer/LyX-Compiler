@@ -1,0 +1,410 @@
+// ==================================================================
+// WP-31: PE64 Dynamic Linking - Import Tables
+// ==================================================================
+// PE64 (Portable Executable) Dynamic Linker für Windows
+// - Import Lookup Table (ILT)
+// - Import Address Table (IAT)
+// - Bound Imports (optional)
+//
+// Referenz: compiler/backend/pe/pe64_writer.pas
+
+import bootstrap.backend.pe.write_pe;
+
+// ============================================================================
+// PE Dynamic Linking Constants
+// ============================================================================
+
+// PE Machine Types
+pub con IMAGE_FILE_MACHINE_AMD64: int64 := 8664;
+pub con IMAGE_FILE_MACHINE_ARM64: int64 := 43620;
+
+// PE Section Characteristics
+pub con IMAGE_SCN_CNT_CODE: int64 := 32;
+pub con IMAGE_SCN_CNT_INITIALIZED_DATA: int64 := 64;
+pub con IMAGE_SCN_CNT_UNINITIALIZED_DATA: int64 := 128;
+pub con IMAGE_SCN_MEM_EXECUTE: int64 := 536870912;
+pub con IMAGE_SCN_MEM_READ: int64 := 1073741824;
+pub con IMAGE_SCN_MEM_WRITE: int64 := 2147483648;
+
+// PE Directory Types
+pub con IMAGE_DIRECTORY_ENTRY_EXPORT: int64 := 0;
+pub con IMAGE_DIRECTORY_ENTRY_IMPORT: int64 := 1;
+pub con IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT: int64 := 11;
+pub con IMAGE_DIRECTORY_ENTRY_IAT: int64 := 12;
+
+// Import Descriptor Types
+pub con IMAGE_ORDINAL_FLAG64: int64 := 80000000000000000;
+
+// ============================================================================
+// PE Import Descriptor Structures
+// ============================================================================
+
+pub type TImportDescriptor = record {
+  ilt_rva: int64;     // ILT RVA
+  timestamp: int64;   // TimeDateStamp (0 for bind)
+  forwarder_chain: int64;
+  name_rva: int64;    // DLL name RVA
+  iat_rva: int64;     // IAT RVA
+};
+
+pub type TImportLookup = record {
+  // Either ordinal or name RVA
+  value: int64;
+};
+
+// ============================================================================
+// PE Dynamic Linker Class
+// ============================================================================
+
+pub type PEDynamicLinker = class {
+  // Import entries
+  imports: int64;       // Map: dllName -> import list
+  importCount: int64;
+  
+  // Import directory
+  importDescData: int64;
+  importDescCount: int64;
+  
+  // String data for DLL names and function names
+  stringData: int64;
+  stringLen: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(PEDynamicLinker));
+    
+    self.imports := map_new(32);
+    self.importCount := 0;
+    
+    self.stringData := mmap(4096, 1);
+    self.stringLen := 1;
+    poke8(self.stringData, 0);  // Null terminator
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // String Table
+  // ---------------------------------------------------------------------------
+  
+  fn addString(str: int64): int64 {
+    var len: int64 := StrLen(str);
+    var off: int64 := self.stringLen;
+    
+    // Expand if needed
+    if self.stringLen + len + 1 > 4096 {
+      var newData: int64 := mmap(self.stringLen * 2, 1);
+      var i: int64 := 0;
+      while i < self.stringLen {
+        poke8(newData + i, peek8(self.stringData + i));
+        i := i + 1;
+      }
+      munmap(self.stringData, 4096);
+      self.stringData := newData;
+    }
+    
+    // Copy string
+    var i: int64 := 0;
+    while i <= len {
+      poke8(self.stringData + off + i, peek8(str + i));
+      i := i + 1;
+    }
+    
+    self.stringLen := self.stringLen + len + 1;
+    return off;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Import Management
+  // ---------------------------------------------------------------------------
+  
+  // Add DLL dependency
+  pub fn AddDLL(dllName: int64): int64 {
+    var nameLen: int64 := StrLen(dllName);
+    
+    // Check if already added
+    if map_contains(self.imports, dllName, nameLen) {
+      return map_get(self.imports, dllName, nameLen);
+    }
+    
+    // Create import list for this DLL
+    var importList: int64 := map_new(64);
+    
+    // Add null terminator entry
+    map_set(importList, 0 as pchar, 0, 0);
+    
+    map_set(self.imports, dllName, nameLen, importList);
+    self.importCount := self.importCount + 1;
+    
+    return importList;
+  }
+  
+  // Add function import
+  pub fn AddFunction(dllName: int64, funcName: int64): void {
+    var dllLen: int64 := StrLen(dllName);
+    var funcLen: int64 := StrLen(funcName);
+    
+    // Ensure DLL is added
+    var importList: int64 := map_get(self.imports, dllName, dllLen);
+    if importList == 0 {
+      importList := self.AddDLL(dllName);
+    }
+    
+    // Check if function already in list
+    if map_contains(importList, funcName, funcLen) {
+      return;
+    }
+    
+    // Add to list (use string offset as value)
+    var nameOff: int64 := self.addString(funcName);
+    map_set(importList, funcName, funcLen, nameOff);
+  }
+  
+  // Add function by ordinal
+  pub fn AddOrdinal(dllName: int64, ordinal: int64): void {
+    var dllLen: int64 := StrLen(dllName);
+    
+    var importList: int64 := map_get(self.imports, dllName, dllLen);
+    if importList == 0 {
+      importList := self.AddDLL(dllName);
+    }
+    
+    // Mark as ordinal (set high bit)
+    var ordinalVal: int64 := ordinal | IMAGE_ORDINAL_FLAG64;
+    map_set(importList, 0 as pchar, ordinal, ordinalVal);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Import Table Generation
+  // ---------------------------------------------------------------------------
+  
+  fn generateImportDirectory(): int64 {
+    // Each DLL needs: Import Lookup Table + Original Lookup Table
+    // + Import Descriptor + null terminator
+    // + DLL name + function names
+    
+    var entrySize: int64 := 20;  // sizeof(IMAGE_IMPORT_DESCRIPTOR)
+    var totalSize: int64 := (self.importCount + 1) * entrySize;
+    
+    var importDesc: int64 := mmap(totalSize, 1);
+    
+    // Will be filled with RVAs after section layout is known
+    // For now, just return the buffer
+    
+    return importDesc;
+  }
+  
+  fn generateILT(dllName: int64): int64 {
+    var dllLen: int64 := StrLen(dllName);
+    var importList: int64 := map_get(self.imports, dllName, dllLen);
+    
+    if importList == 0 {
+      return 0;
+    }
+    
+    // Count entries
+    var entryCount: int64 := map_len(importList) + 1;  // +1 for null terminator
+    
+    var iltSize: int64 := entryCount * 8;
+    var ilt: int64 := mmap(iltSize, 1);
+    
+    // Fill entries
+    var iter: int64 := map_iter(importList);
+    var idx: int64 := 0;
+    
+    while map_iter_hasnext(iter) {
+      var val: int64 := map_iter_next(iter);
+      poke64(ilt + idx * 8, val);
+      idx := idx + 1;
+    }
+    
+    // Null terminator
+    poke64(ilt + idx * 8, 0);
+    
+    return ilt;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // DLL Name Resolution
+  // ---------------------------------------------------------------------------
+  
+  // Resolve DLL name to standard names
+  pub fn ResolveDLLName(name: int64): int64 {
+    var nameLen: int64 := StrLen(name);
+    
+    // Convert "libc.so.6" -> "msvcrt.dll"
+    if nameLen > 6 {
+      if peek8(name) == 108 && peek8(name + 1) == 105 && 
+         peek8(name + 2) == 98 && peek8(name + 3) == 99 {  // "lib"
+        
+        // Check for various libc patterns
+        if nameLen > 9 {
+          if peek8(name + 4) == 99 {  // "libc"
+            if nameLen > 10 && peek8(name + 5) == 46 {  // "libc."
+              return "msvcrt.dll"c as int64;
+            }
+            return "msvcrt.dll"c as int64;
+          }
+          if peek8(name + 4) == 109 {  // "libm"
+            return "msvcr100.dll"c as int64;
+          }
+          if peek8(name + 4) == 112 {  // "libpthread"
+            return "pthread.dll"c as int64;
+          }
+          if peek8(name + 4) == 108 {  // "libdl"
+            return "kernel32.dll"c as int64;
+          }
+        }
+      }
+    }
+    
+    // Default: add .dll extension
+    var result: int64 := mmap(nameLen + 5, 1);
+    var i: int64 := 0;
+    while i < nameLen {
+      poke8(result + i, peek8(name + i));
+      i := i + 1;
+    }
+    poke8(result + nameLen, 46);  // '.'
+    poke8(result + nameLen + 1, 100);  // 'd'
+    poke8(result + nameLen + 2, 108);  // 'l'
+    poke8(result + nameLen + 3, 108);  // 'l'
+    poke8(result + nameLen + 4, 0);
+    
+    return result;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Export Table Generation
+  // ---------------------------------------------------------------------------
+  
+  // Export directory (for DLLs - simplified)
+  pub fn GenerateExportDirectory(): int64 {
+    // Export Directory Table
+    // Export Directory Table (28 bytes)
+    // Export Address Table
+    // Name Pointers Table
+    // Ordinal Table
+    
+    var expSize: int64 := 40;
+    var expDir: int64 := mmap(expSize, 1);
+    
+    // Characteristics (0)
+    poke32(expDir, 0);
+    // TimeDateStamp
+    poke32(expDir + 4, 0);
+    // Major/Minor Version
+    poke16(expDir + 8, 0);
+    poke16(expDir + 10, 0);
+    // Name RVA (to be filled)
+    poke32(expDir + 12, 0);
+    // Base (ordinal base)
+    poke32(expDir + 16, 1);
+    // Number of functions
+    poke32(expDir + 20, 0);
+    // Number of names
+    poke32(expDir + 24, 0);
+    // Address table RVA
+    poke32(expDir + 28, 0);
+    // Name pointer RVA
+    poke32(expDir + 32, 0);
+    // Ordinal table RVA
+    poke32(expDir + 36, 0);
+    
+    return expDir;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Query Functions
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetImportCount(): int64 {
+    return self.importCount;
+  }
+  
+  pub fn GetImportDLLs(): int64 {
+    return self.imports;
+  }
+  
+  pub fn HasImports(): bool {
+    return self.importCount > 0;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.stringData != 0 {
+      munmap(self.stringData, 4096);
+    }
+    map_free(self.imports);
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global PE Dynamic Linker
+// ============================================================================
+
+var globalPEDynamicLinker: int64 := 0;
+
+pub fn PEDynamicLinkerInit(): void {
+  globalPEDynamicLinker := PEDynamicLinker.Create();
+}
+
+pub fn PEDynamicLinkerGet(): int64 {
+  return globalPEDynamicLinker;
+}
+
+pub fn PEDynamicLinkerShutdown(): void {
+  if globalPEDynamicLinker != 0 {
+    var linker: int64 := globalPEDynamicLinker as PEDynamicLinker;
+    linker.Free();
+    globalPEDynamicLinker := 0;
+  }
+}
+
+// ============================================================================
+// External Symbol Resolution (Windows)
+// ============================================================================
+
+// Add import from DLL
+pub fn AddWindowsImport(dll: int64, func: int64): void {
+  var linker: int64 := globalPEDynamicLinker as PEDynamicLinker;
+  if linker == 0 { return; }
+  
+  // Resolve DLL name
+  var dllName: int64 := linker.ResolveDLLName(dll);
+  
+  linker.AddFunction(dllName, func);
+}
+
+// Add import by ordinal
+pub fn AddWindowsOrdinalImport(dll: int64, ordinal: int64): void {
+  var linker: int64 := globalPEDynamicLinker as PEDynamicLinker;
+  if linker == 0 { return; }
+  
+  var dllName: int64 := linker.ResolveDLLName(dll);
+  
+  linker.AddOrdinal(dllName, ordinal);
+}
+
+// Get import info for code generation
+pub fn GetWindowsImportInfo(dll: int64, func: int64): int64 {
+  // Returns: IAT RVA offset (0 if not found)
+  var linker: int64 := globalPEDynamicLinker as PEDynamicLinker;
+  if linker == 0 { return 0; }
+  
+  var dllName: int64 := linker.ResolveDLLName(dll);
+  var dllLen: int64 := StrLen(dllName);
+  
+  var importList: int64 := map_get(linker.imports, dllName, dllLen);
+  if importList == 0 { return 0; }
+  
+  var funcLen: int64 := StrLen(func);
+  var val: int64 := map_get(importList, func, funcLen);
+  
+  // Return the value (either name RVA or ordinal)
+  return val;
+}
