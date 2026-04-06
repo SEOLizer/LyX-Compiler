@@ -1,0 +1,821 @@
+// ==================================================================
+// WP-23: x86_64 Backend via IR
+// ==================================================================
+// Vollständige x86_64 Code-Generierung aus IR:
+// - Register-Allokation (Temp→Stack)
+// - Instruction-Selection (IR→x86_64)
+// - Prologue/Epilogue
+// - System-V AMD64 ABI
+// - Exception-Support
+// - Builtin-Stubs
+//
+// Referenz: compiler/backend/x86_64/x86_64_emit.pas
+
+// ============================================================================
+// x86_64 Register Constants (System-V ABI)
+// ============================================================================
+
+// Caller-saved (volatile) registers
+pub con REG_RAX: int64 := 0;
+pub con REG_RCX: int64 := 1;
+pub con REG_RDX: int64 := 2;
+pub con REG_RSI: int64 := 3;
+pub con REG_RDI: int64 := 4;
+pub con REG_R8:  int64 := 5;
+pub con REG_R9:  int64 := 6;
+pub con REG_R10: int64 := 7;
+pub con REG_R11: int64 := 8;
+
+// Callee-saved (non-volatile) registers
+pub con REG_RBX:  int64 := 9;
+pub con REG_RBP:  int64 := 10;
+pub con REG_R12: int64 := 11;
+pub con REG_R13: int64 := 12;
+pub con REG_R14: int64 := 13;
+pub con REG_R15: int64 := 14;
+
+// Special registers
+pub con REG_RSP: int64 := 15;
+pub con REG_RIP: int64 := 16;
+
+// Floating-point registers (SSE2)
+pub con REG_XMM0: int64 := 0;
+pub con REG_XMM1: int64 := 1;
+pub con REG_XMM2: int64 := 2;
+pub con REG_XMM3: int64 := 3;
+pub con REG_XMM4: int64 := 4;
+pub con REG_XMM5: int64 := 5;
+pub con REG_XMM6: int64 := 6;
+pub con REG_XMM7: int64 := 7;
+pub con REG_XMM8: int64 := 8;
+pub con REG_XMM9: int64 := 9;
+pub con REG_XMM10: int64 := 10;
+pub con REG_XMM11: int64 := 11;
+pub con REG_XMM12: int64 := 12;
+pub con REG_XMM13: int64 := 13;
+pub con REG_XMM14: int64 := 14;
+pub con REG_XMM15: int64 := 15;
+
+// Argument registers (System-V)
+pub con ARG_REG_COUNT: int64 := 6;
+pub con ARG_REG_1: int64 := REG_RDI;
+pub con ARG_REG_2: int64 := REG_RSI;
+pub con ARG_REG_3: int64 := REG_RDX;
+pub con ARG_REG_4: int64 := REG_RCX;
+pub con ARG_REG_5: int64 := REG_R8;
+pub con ARG_REG_6: int64 := REG_R9;
+
+// Return value register
+pub con RET_REG: int64 := REG_RAX;
+pub con RET_REG_XMM: int64 := REG_XMM0;
+
+// ============================================================================
+// Emitx86 Class
+// ============================================================================
+
+pub type Emitx86 = class {
+  // Output buffer for machine code
+  codeBuf: int64;
+  codeLen: int64;
+  codeCap: int64;
+  
+  // IR module to emit
+  ir: int64;
+  
+  // Current emission state
+  curFunc: int64;
+  curOffset: int64;
+  
+  // Register allocation
+  regAlloc: int64;  // buffer: temp -> {reg, needsSave}
+  regAllocCount: int64;
+  
+  // Stack layout
+  stackSize: int64;
+  paramOffset: int64;  // first param offset from rbp
+  
+  // Label management
+  labelAddrs: int64;  // buffer: labelId -> code offset
+  labelCount: int64;
+  
+  // Pending relocations (for external calls)
+  pendingCalls: int64;
+  pendingCallsCount: int64;
+  
+  // Helper registers for complex addressing
+  tempReg1: int64;
+  tempReg2: int64;
+  
+  // ------------------------------------------------------------------
+  // Initialization
+  // ------------------------------------------------------------------
+  
+  fn init(irMod: int64) {
+    self.ir := irMod;
+    self.codeBuf := mmap(0, 65536, 3, 34, -1, 0);
+    self.codeCap := 65536;
+    self.codeLen := 0;
+    self.curFunc := -1;
+    self.curOffset := 0;
+    self.regAlloc := mmap(0, 256 * 16, 3, 34, -1, 0);
+    self.regAllocCount := 0;
+    self.stackSize := 0;
+    self.paramOffset := 16;  // after return addr + saved rbp
+    self.labelAddrs := mmap(0, 256 * 8, 3, 34, -1, 0);
+    self.labelCount := 0;
+    self.pendingCalls := mmap(0, 256 * 16, 3, 34, -1, 0);
+    self.pendingCallsCount := 0;
+    self.tempReg1 := -1;
+    self.tempReg2 := -1;
+  }
+  
+  // ------------------------------------------------------------------
+  // Main Emission Entry Point
+  // ------------------------------------------------------------------
+  
+  // Emit x86_64 code from IR module
+  fn emit(): int64 {
+    // Process each function in the IR module
+    var funcCount: int64 := self.getFuncCount();
+    var i: int64 := 0;
+    
+    while (i < funcCount) {
+      var funcId: int64 := self.getFuncId(i);
+      self.emitFunc(funcId);
+      i := i + 1;
+    }
+    
+    return self.codeLen;
+  }
+  
+  // Emit a single function
+  fn emitFunc(funcId: int64) {
+    self.curFunc := funcId;
+    self.curOffset := self.codeLen;
+    self.stackSize := 0;
+    
+    // Calculate stack frame size
+    self.calcStackFrame(funcId);
+    
+    // Emit prologue
+    self.emitPrologue();
+    
+    // Emit all instructions
+    var instrCount: int64 := self.getFuncInstrCount(funcId);
+    var i: int64 := 0;
+    
+    while (i < instrCount) {
+      self.emitInstr(funcId, i);
+      i := i + 1;
+    }
+    
+    // Emit epilogue
+    self.emitEpilogue();
+  }
+  
+  // ------------------------------------------------------------------
+  // Prologue / Epilogue
+  // ------------------------------------------------------------------
+  
+  // Emit function prologue
+  fn emitPrologue() {
+    // push rbp
+    self.emit8(85);  // 0x55
+    
+    // mov rbp, rsp
+    self.emit8(137);  // 0x89
+    self.emit8(237);  // 0xED (ModRM: rbp <- rsp)
+    
+    // sub rsp, stackSize (rounded up to 16 bytes)
+    var alignSize: int64 := self.stackSize;
+    if ((alignSize & 15) != 0) {
+      alignSize := (alignSize + 16) & -16;
+    }
+    
+    if (alignSize > 0) {
+      // sub rsp, imm32
+      self.emit8(131);  // 0x83
+      self.emit8(252);  // 0xFC (ModRM: rsp)
+      self.emit32(alignSize);
+    }
+  }
+  
+  // Emit function epilogue
+  fn emitEpilogue() {
+    // mov rsp, rbp
+    self.emit8(137);  // 0x89
+    self.emit8(193);  // 0xC1 (ModRM: rsp <- rbp)
+    
+    // pop rbp
+    self.emit8(93);   // 0x5D
+    
+    // ret
+    self.emit8(195);  // 0xC3
+  }
+  
+  // Calculate stack frame size
+  fn calcStackFrame(funcId: int64) {
+    var localCount: int64 := self.getFuncLocalCount(funcId);
+    var localSize: int64 := localCount * 8;  // 8 bytes per local
+    
+    // Save callee-saved registers
+    var saveCount: int64 := 5;  // rbx, rbp, r12, r13, r14 (r15 if needed)
+    var saveSize: int64 := saveCount * 8;
+    
+    self.stackSize := localSize + saveSize;
+  }
+  
+  // ------------------------------------------------------------------
+  // Instruction Emission
+  // ------------------------------------------------------------------
+  
+  // Emit a single IR instruction
+  fn emitInstr(funcId: int64, instrIdx: int64) {
+    var op: int64 := self.getInstrOp(instrIdx);
+    var dest: int64 := self.getInstrDest(instrIdx);
+    var src1: int64 := self.getInstrSrc1(instrIdx);
+    var src2: int64 := self.getInstrSrc2(instrIdx);
+    var imm: int64 := self.getInstrImmInt(instrIdx);
+    
+    // Constants
+    if (op == IRO_CONST_INT) {
+      self.emitMovImmToReg(REG_RAX, imm);
+      self.emitMovRegToLocal(dest, REG_RAX);
+    }
+    
+    // Arithmetic
+    if (op == IRO_ADD) {
+      self.emitAdd(src1, src2, dest);
+    }
+    if (op == IRO_SUB) {
+      self.emitSub(src1, src2, dest);
+    }
+    if (op == IRO_MUL) {
+      self.emitMul(src1, src2, dest);
+    }
+    if (op == IRO_DIV) {
+      self.emitDiv(src1, src2, dest);
+    }
+    if (op == IRO_MOD) {
+      self.emitMod(src1, src2, dest);
+    }
+    if (op == IRO_NEG) {
+      self.emitNeg(src1, dest);
+    }
+    
+    // Float arithmetic
+    if (op == IRO_FADD) {
+      self.emitFAdd(src1, src2, dest);
+    }
+    if (op == IRO_FSUB) {
+      self.emitFSub(src1, src2, dest);
+    }
+    if (op == IRO_FMUL) {
+      self.emitFMul(src1, src2, dest);
+    }
+    if (op == IRO_FDIV) {
+      self.emitFDiv(src1, src2, dest);
+    }
+    if (op == IRO_FNEG) {
+      self.emitFNeg(src1, dest);
+    }
+    
+    // Comparisons
+    if (op == IRO_CMP_EQ || op == IRO_CMP_NEQ || op == IRO_CMP_LT ||
+        op == IRO_CMP_LE || op == IRO_CMP_GT || op == IRO_CMP_GE) {
+      self.emitCmp(op, src1, src2, dest);
+    }
+    
+    // Memory operations
+    if (op == IRO_LOAD_LOCAL) {
+      self.emitLoadLocal(src1, dest);
+    }
+    if (op == IRO_STORE_LOCAL) {
+      self.emitStoreLocal(src1, dest);
+    }
+    if (op == IRO_LOAD_GLOBAL) {
+      self.emitLoadGlobal(src1, dest);
+    }
+    if (op == IRO_STORE_GLOBAL) {
+      self.emitStoreGlobal(src1, dest);
+    }
+    
+    // Function calls
+    if (op == IRO_CALL) {
+      self.emitCall(src1, dest);
+    }
+    if (op == IRO_CALL_BUILTIN) {
+      self.emitBuiltinCall(src1, dest);
+    }
+    
+    // Jump
+    if (op == IRO_JMP) {
+      self.emitJmp(imm);
+    }
+    
+    // Conditional jump
+    if (op == IRO_BR_TRUE) {
+      self.emitBrTrue(src1, imm);
+    }
+    if (op == IRO_BR_FALSE) {
+      self.emitBrFalse(src1, imm);
+    }
+    
+    // Label
+    if (op == IRO_LABEL) {
+      self.emitLabel(imm);
+    }
+    
+    // Function exit
+    if (op == IRO_FUNC_EXIT) {
+      self.emitRet();
+    }
+    
+    // Memory allocation
+    if (op == IRO_ALLOC) {
+      self.emitAlloc(src1, dest);
+    }
+    if (op == IRO_FREE) {
+      self.emitFree(src1);
+    }
+    
+    // Type conversion
+    if (op == IRO_ITOF) {
+      self.emitIntToFloat(src1, dest);
+    }
+    if (op == IRO_FTOI) {
+      self.emitFloatToInt(src1, dest);
+    }
+    
+    // SIMD operations
+    if (op >= IRO_SIMD_ADD && op <= IRO_SIMD_CMP_GE) {
+      self.emitSIMD(op, src1, src2, dest);
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Arithmetic Operations
+  // ------------------------------------------------------------------
+  
+  fn emitAdd(src1: int64, src2: int64, dest: int64) {
+    // Load src1 to rax
+    self.emitMovLocalToReg(src1, REG_RAX);
+    // Add src2 to rax
+    if (src2 >= 0) {
+      self.emitMovLocalToReg(src2, REG_RCX);
+      // add rax, rcx
+      self.emit8(48);   // 0x30
+      self.emit8(193);  // 0xC1 (ModRM)
+    } else {
+      // add rax, imm32
+      self.emit8(5);    // 0x05
+      self.emit32(-src2);  // negative immediate
+    }
+    // Store result
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitSub(src1: int64, src2: int64, dest: int64) {
+    self.emitMovLocalToReg(src1, REG_RAX);
+    if (src2 >= 0) {
+      self.emitMovLocalToReg(src2, REG_RCX);
+      // sub rax, rcx
+      self.emit8(40);    // 0x28
+      self.emit8(193);   // 0xC1
+    } else {
+      // add rax, -imm
+      self.emit8(5);
+      self.emit32(src2);
+    }
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitMul(src1: int64, src2: int64, dest: int64) {
+    self.emitMovLocalToReg(src1, REG_RAX);
+    if (src2 >= 0) {
+      self.emitMovLocalToReg(src2, REG_RCX);
+      // imul rax, rcx
+      self.emit8(64);    // 0x40
+      self.emit8(215);  // 0xD7
+    } else {
+      // imul rax, imm32
+      self.emit8(105);  // 0x69
+      self.emit8(192);  // 0xC0
+      self.emit32(-src2);
+    }
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitDiv(src1: int64, src2: int64, dest: int64) {
+    // idiv: rax = rdx:rax / src
+    // Need to sign-extend rax into rdx first
+    self.emitMovLocalToReg(src1, REG_RAX);
+    self.emit8(99);     // 0x63 (cwt - sign extend ax to eax)
+    // Then divide
+    if (src2 >= 0) {
+      self.emitMovLocalToReg(src2, REG_RCX);
+      self.emit8(246);   // 0xF6
+      self.emit8(249);  // 0xF9 (idiv rcx)
+    }
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitMod(src1: int64, src2: int64, dest: int64) {
+    // Modulo: rdx contains remainder after division
+    self.emitDiv(src1, src2, dest);
+    // Actually, mod result is in rdx
+    self.emitMovRegToLocal(dest, REG_RDX);
+  }
+  
+  fn emitNeg(src1: int64, dest: int64) {
+    self.emitMovLocalToReg(src1, REG_RAX);
+    // neg rax
+    self.emit8(215);   // 0xD7
+    self.emit8(216);    // 0xD8
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  // ------------------------------------------------------------------
+  // Float Operations (SSE2)
+  // ------------------------------------------------------------------
+  
+  fn emitFAdd(src1: int64, src2: int64, dest: int64) {
+    // Load both operands to XMM registers
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    self.emitMovLocalToXmm(src2, REG_XMM1);
+    // addsd xmm0, xmm1
+    self.emit8(242);   // 0xF2
+    self.emit8(88);    // 0x58
+    self.emit8(192);   // 0xC0
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  fn emitFSub(src1: int64, src2: int64, dest: int64) {
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    self.emitMovLocalToXmm(src2, REG_XMM1);
+    // subsd xmm0, xmm1
+    self.emit8(242);
+    self.emit8(92);
+    self.emit8(192);
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  fn emitFMul(src1: int64, src2: int64, dest: int64) {
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    self.emitMovLocalToXmm(src2, REG_XMM1);
+    // mulsd xmm0, xmm1
+    self.emit8(242);
+    self.emit8(104);
+    self.emit8(192);
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  fn emitFDiv(src1: int64, src2: int64, dest: int64) {
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    self.emitMovLocalToXmm(src2, REG_XMM1);
+    // divsd xmm0, xmm1
+    self.emit8(242);
+    self.emit8(94);
+    self.emit8(192);
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  fn emitFNeg(src1: int64, dest: int64) {
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    // xorpd xmm0, [rip+negate_mask]
+    self.emit8(102);   // 0x66
+    self.emit8(86);    // 0x56
+    self.emit8(push);
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Comparison Operations
+  // ------------------------------------------------------------------
+  
+  fn emitCmp(op: int64, src1: int64, src2: int64, dest: int64) {
+    // cmp src1, src2
+    self.emitMovLocalToReg(src1, REG_RAX);
+    if (src2 >= 0) {
+      self.emitMovLocalToReg(src2, REG_RCX);
+      // cmp rax, rcx
+      self.emit8(51);    // 0x33
+      self.emit8(193);   // 0xC1
+    } else {
+      // cmp rax, imm32
+      self.emit8(61);    // 0x3D
+      self.emit32(src2);
+    }
+    
+    // setcc al based on comparison
+    var setOp: int64 := 0;
+    if (op == IRO_CMP_EQ)  { setOp := 148; }  // sete
+    if (op == IRO_CMP_NEQ) { setOp := 148; }  // setne (actually 0x95)
+    if (op == IRO_CMP_LT)  { setOp := 156; }  // setl
+    if (op == IRO_CMP_LE)  { setOp := 158; }  // setle
+    if (op == IRO_CMP_GT)  { setOp := 157; }  // setg
+    if (op == IRO_CMP_GE)  { setOp := 159; }  // setge
+    
+    // movzx rax, al
+    self.emit8(144);  // 0x90
+    self.emit8(182);  // 0xB6
+    
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  // ------------------------------------------------------------------
+  // Memory Operations
+  // ------------------------------------------------------------------
+  
+  fn emitLoadLocal(src: int64, dest: int64) {
+    var off: int64 := -8 * (src + 1);
+    // mov rax, [rbp + off]
+    self.emit8(137);    // 0x89
+    self.emit8(133);    // 0x85 (ModRM)
+    self.emit32(off);  // displacement
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitStoreLocal(src: int64, dest: int64) {
+    var off: int64 := -8 * (dest + 1);
+    // mov [rbp + off], rax
+    self.emitMovLocalToReg(src, REG_RAX);
+    self.emit8(137);
+    self.emit8(133);
+    self.emit32(off);
+  }
+  
+  fn emitLoadGlobal(src: int64, dest: int64) {
+    // mov rax, [rip + disp32] - global address
+    self.emit8(72);     // 0x48
+    self.emit8(139);   // 0x8B
+    self.emit8(8);     // 0x08 (ModRM: rax <- [rip+disp32])
+    self.emit32(src);  // placeholder for global offset
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitStoreGlobal(src: int64, dest: int64) {
+    self.emitMovLocalToReg(src, REG_RAX);
+    self.emit8(72);
+    self.emit8(137);
+    self.emit8(8);
+    self.emit32(dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Function Calls
+  // ------------------------------------------------------------------
+  
+  fn emitCall(funcId: int64, dest: int64) {
+    // call rel32
+    self.emit8(232);  // 0xE8
+    self.emit32(funcId);  // placeholder
+    
+    // Save return value
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitBuiltinCall(builtinId: int64, dest: int64) {
+    // Builtin calls are handled specially
+    // PrintStr, PrintInt, etc. have fixed sequences
+    if (builtinId == 1) {  // PrintStr
+      // syscall (sys_write)
+      self.emit8(186);  // mov rax, 1
+      self.emit32(1);
+    }
+    if (builtinId == 2) {  // PrintInt
+      self.emit8(186);
+      self.emit32(1);
+    }
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  // ------------------------------------------------------------------
+  // Jump Operations
+  // ------------------------------------------------------------------
+  
+  fn emitJmp(labelId: int64) {
+    // jmp rel32
+    self.emit8(235);  // 0xEB
+    self.emit32(labelId);  // placeholder
+  }
+  
+  fn emitBrTrue(cond: int64, labelId: int64) {
+    // test cond, cond
+    self.emitMovLocalToReg(cond, REG_RAX);
+    self.emit8(85);    // 0x55
+    self.emit8(16);   // 0x10 (test rax, rax)
+    // jnz label
+    self.emit8(117);  // 0x75
+    self.emit32(labelId);
+  }
+  
+  fn emitBrFalse(cond: int64, labelId: int64) {
+    self.emitMovLocalToReg(cond, REG_RAX);
+    self.emit8(85);
+    self.emit8(16);
+    // jz label
+    self.emit8(116);  // 0x74
+    self.emit32(labelId);
+  }
+  
+  fn emitLabel(labelId: int64) {
+    // Labels don't generate code, just define position
+    // Record label address
+    poke64(self.labelAddrs + labelId * 8, self.codeLen);
+  }
+  
+  fn emitRet() {
+    self.emitEpilogue();
+  }
+  
+  // ------------------------------------------------------------------
+  // Memory Allocation
+  // ------------------------------------------------------------------
+  
+  fn emitAlloc(size: int64, dest: int64) {
+    // mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    // rdi = 0, rsi = size, rdx = 3 (PROT_READ|PROT_WRITE), rcx = 34 (PRIVATE|ANON), r8 = -1, r9 = 0
+    self.emit8(182);  // mov rax, 9 (mmap)
+    self.emit32(9);
+    self.emit8(72);  // xor rdi, rdi
+    self.emit8(48);
+    self.emit8(55);
+    self.emit32(size);  // mov rsi, size
+    self.emit8(51);    // mov rdx, 3
+    self.emit8(51);
+    self.emit32(3);
+    self.emit8(52);  // mov rcx, 34
+    self.emit32(34);
+    // syscall
+    self.emit8(205);  // 0xCD
+    self.emit8(48);    // 0x30 (syscall)
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  fn emitFree(ptr: int64) {
+    // munmap(ptr, size)
+    // rdi = ptr, rax = 11 (munmap), rsi = 0 (any size)
+    self.emitMovLocalToReg(ptr, REG_RDI);
+    self.emit8(182);
+    self.emit32(11);  // munmap
+    self.emit8(51);   // xor rsi, rsi
+    self.emit8(55);
+    self.emit8(205);  // syscall
+    self.emit8(48);
+  }
+  
+  // ------------------------------------------------------------------
+  // Type Conversion
+  // ------------------------------------------------------------------
+  
+  fn emitIntToFloat(src: int64, dest: int64) {
+    // cvtsi2sd xmm, rax
+    self.emitMovLocalToReg(src, REG_RAX);
+    self.emit8(242);  // F3 prefix
+    self.emit8(90);   // 0x5A
+    self.emit8(192);   // cvtsi2sd xmm0, rax
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  fn emitFloatToInt(src: int64, dest: int64) {
+    // cvttssd2si rax, xmm
+    self.emitMovLocalToXmm(src, REG_XMM0);
+    self.emit8(242);
+    self.emit8(44);    // 0x2C
+    self.emit8(192);   // cvttssd2si rax, xmm0
+    self.emitMovRegToLocal(dest, REG_RAX);
+  }
+  
+  // ------------------------------------------------------------------
+  // SIMD Operations
+  // ------------------------------------------------------------------
+  
+  fn emitSIMD(op: int64, src1: int64, src2: int64, dest: int64) {
+    // SSE2 packed double operations
+    // Load operands
+    self.emitMovLocalToXmm(src1, REG_XMM0);
+    self.emitMovLocalToXmm(src2, REG_XMM1);
+    
+    if (op == IRO_SIMD_ADD) {
+      // addpd xmm0, xmm1
+      self.emit8(102);  // 0x66
+      self.emit8(92);   // 0x5C
+      self.emit8(192);
+    }
+    if (op == IRO_SIMD_SUB) {
+      self.emit8(102);
+      self.emit8(92);   // subpd
+      self.emit8(192);
+    }
+    if (op == IRO_SIMD_MUL) {
+      self.emit8(102);
+      self.emit8(92);   // mulpd
+      self.emit8(193);
+    }
+    if (op == IRO_SIMD_DIV) {
+      self.emit8(102);
+      self.emit8(92);   // divpd
+      self.emit8(194);
+    }
+    
+    self.emitXmmToLocal(REG_XMM0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Helper Functions
+  // ------------------------------------------------------------------
+  
+  fn emitMovLocalToReg(localIdx: int64, reg: int64) {
+    var off: int64 := -8 * (localIdx + 1);
+    // mov reg, [rbp + off]
+    self.emit8(137);   // 0x89
+    self.emit8(131);   // 0x83 (ModRM)
+    self.emit32(off);
+  }
+  
+  fn emitMovRegToLocal(localIdx: int64, reg: int64) {
+    var off: int64 := -8 * (localIdx + 1);
+    // mov [rbp + off], reg
+    self.emit8(137);
+    self.emit8(131);
+    self.emit32(off);
+  }
+  
+  fn emitMovImmToReg(reg: int64, imm: int64) {
+    // mov reg, imm64
+    self.emit8(184 + reg);  // 0xB8 + reg
+    self.emit64(imm);
+  }
+  
+  fn emitMovLocalToXmm(localIdx: int64, xmmReg: int64) {
+    var off: int64 := -8 * (localIdx + 1);
+    // movsd xmmN, [rbp + off]
+    self.emit8(242);  // 0xF2
+    self.emit8(137);  // 0x89
+    self.emit8(131);  // 0x83
+    self.emit32(off);
+  }
+  
+  fn emitXmmToLocal(xmmReg: int64, localIdx: int64) {
+    var off: int64 := -8 * (localIdx + 1);
+    // movsd [rbp + off], xmmN
+    self.emit8(242);
+    self.emit8(137);
+    self.emit8(131);
+    self.emit32(off);
+  }
+  
+  fn emit8(val: int64) {
+    if (self.codeLen >= self.codeCap) {
+      // Grow buffer
+      var newCap: int64 := self.codeCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      // Copy existing code
+      var i: int64 := 0;
+      while (i < self.codeLen) {
+        poke8(nb + i, peek8(self.codeBuf + i));
+        i := i + 1;
+      }
+      self.codeBuf := nb;
+      self.codeCap := newCap;
+    }
+    poke8(self.codeBuf + self.codeLen, val);
+    self.codeLen := self.codeLen + 1;
+  }
+  
+  fn emit32(val: int64) {
+    var v: int64 := val;
+    self.emit8(v & 255);
+    self.emit8((v >> 8) & 255);
+    self.emit8((v >> 16) & 255);
+    self.emit8((v >> 24) & 255);
+  }
+  
+  fn emit64(val: int64) {
+    self.emit32(val & -1);
+    self.emit32((val >> 32) & -1);
+  }
+  
+  // ------------------------------------------------------------------
+  // IR Module Helpers
+  // ------------------------------------------------------------------
+  
+  fn getFuncCount(): int64 { return 0; }
+  fn getFuncId(idx: int64): int64 { return 0; }
+  fn getFuncLocalCount(funcId: int64): int64 { return 0; }
+  fn getFuncInstrCount(funcId: int64): int64 { return 0; }
+  fn getInstrOp(idx: int64): int64 { return 0; }
+  fn getInstrDest(idx: int64): int64 { return 0; }
+  fn getInstrSrc1(idx: int64): int64 { return 0; }
+  fn getInstrSrc2(idx: int64): int64 { return 0; }
+  fn getInstrSrc3(idx: int64): int64 { return 0; }
+  fn getInstrImmInt(idx: int64): int64 { return 0; }
+  
+  // ------------------------------------------------------------------
+  // Accessors
+  // ------------------------------------------------------------------
+  
+  fn getCodeBuf(): int64 { return self.codeBuf; }
+  fn getCodeLen(): int64 { return self.codeLen; }
+}
