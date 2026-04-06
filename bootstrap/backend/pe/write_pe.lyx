@@ -1,0 +1,683 @@
+// ==================================================================
+// WP-25: PE64 Writer
+// ==================================================================
+// PE64 Binary Writer für Windows x86_64 und ARM64:
+// - DOS Stub + PE Header
+// - COFF Header
+// - Optional Header (PE32+)
+// - Section Headers (.text, .rdata, .data, .bss)
+//
+// Referenz: compiler/backend/pe/pe64_writer.pas
+
+// ============================================================================
+// PE64 Constants
+// ============================================================================
+
+pub con IMAGE_FILE_MACHINE_AMD64: int64 := 16#8664;
+pub con IMAGE_FILE_MACHINE_ARM64: int64 := 16#AA64;
+pub con IMAGE_FILE_EXECUTABLE_IMAGE: int64 := 16#0002;
+pub con IMAGE_FILE_LARGE_ADDRESS_AWARE: int64 := 16#0020;
+
+pub con IMAGE_SUBSYSTEM_WINDOWS_CUI: int64 := 3;  // Console Application
+
+pub con IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA: int64 := 16#0020;
+pub con IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: int64 := 16#0040;
+pub con IMAGE_DLLCHARACTERISTICS_NX_COMPAT: int64 := 16#0100;
+pub con IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE: int64 := 16#8000;
+
+pub con IMAGE_SCN_CNT_CODE: int64 := 16#00000020;
+pub con IMAGE_SCN_CNT_INITIALIZED_DATA: int64 := 16#00000040;
+pub con IMAGE_SCN_CNT_UNINITIALIZED_DATA: int64 := 16#00000080;
+pub con IMAGE_SCN_MEM_EXECUTE: int64 := 16#20000000;
+pub con IMAGE_SCN_MEM_READ: int64 := 16#40000000;
+pub con IMAGE_SCN_MEM_WRITE: int64 := 16#80000000;
+
+pub con DEFAULT_IMAGE_BASE: int64 := 16#0000000140000000;
+pub con SECTION_ALIGNMENT: int64 := 16#1000;  // 4 KB
+pub con FILE_ALIGNMENT: int64 := 16#200;     // 512 Bytes
+
+pub con PE_MAGIC: int64 := 16#00004550;  // "PE\0\0"
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn AlignUp(v: int64, a: int64): int64 {
+  if a == 0 { return v; }
+  return (v + a - 1) and not (a - 1);
+}
+
+fn AlignDown(v: int64, a: int64): int64 {
+  if a == 0 { return v; }
+  return v and not (a - 1);
+}
+
+// ============================================================================
+// TPE64Writer Class
+// ============================================================================
+
+pub type TPE64Writer = class {
+  // Output buffer
+  outBuf: int64;
+  outLen: int64;
+  outCap: int64;
+  
+  // Code and data buffers
+  codeBuf: int64;
+  codeSize: int64;
+  dataBuf: int64;
+  dataSize: int64;
+  rodataBuf: int64;
+  rodataSize: int64;
+  
+  // Virtual addresses
+  imageBase: int64;
+  textRVA: int64;
+  dataRVA: int64;
+  rodataRVA: int64;
+  entryRVA: int64;
+  
+  // Target machine
+  targetMachine: int64;  // IMAGE_FILE_MACHINE_AMD64 oder IMAGE_FILE_MACHINE_ARM64
+  
+  // ============================================================================
+  // Constructor
+  // ============================================================================
+  
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(TPE64Writer));
+    
+    // Output buffer initialisieren (8KB start)
+    self->outBuf := mmap(16384, 7);
+    self->outLen := 0;
+    self->outCap := 16384;
+    
+    self->codeBuf := 0;
+    self->codeSize := 0;
+    self->dataBuf := 0;
+    self->dataSize := 0;
+    self->rodataBuf := 0;
+    self->rodataSize := 0;
+    
+    // Default: x86_64 Windows
+    self->imageBase := DEFAULT_IMAGE_BASE;
+    self->targetMachine := IMAGE_FILE_MACHINE_AMD64;
+    
+    return self;
+  }
+  
+  // ============================================================================
+  // Buffer Management
+  // ============================================================================
+  
+  fn ensureCapacity(minSize: int64) {
+    if self->outCap >= minSize { return; }
+    
+    var newCap: int64 := self->outCap * 2;
+    while newCap < minSize {
+      newCap := newCap * 2;
+    }
+    
+    var newBuf: int64 := mmap(newCap, 7);
+    
+    // Copy existing data
+    var i: int64 := 0;
+    while i < self->outLen {
+      newBuf[i] := self->outBuf[i];
+      i := i + 1;
+    }
+    
+    munmap(self->outBuf, self->outCap);
+    self->outBuf := newBuf;
+    self->outCap := newCap;
+  }
+  
+  pub fn WriteU8(val: int64) {
+    self.ensureCapacity(self->outLen + 1);
+    self->outBuf[self->outLen] := val;
+    self->outLen := self->outLen + 1;
+  }
+  
+  pub fn WriteU16LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+  }
+  
+  pub fn WriteU32LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+  }
+  
+  pub fn WriteU64LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+    self.WriteU8((val shr 32) and 16#FF);
+    self.WriteU8((val shr 40) and 16#FF);
+    self.WriteU8((val shr 48) and 16#FF);
+    self.WriteU8((val shr 56) and 16#FF);
+  }
+  
+  pub fn WriteBytes(data: int64, len: int64) {
+    var i: int64 := 0;
+    while i < len {
+      self.WriteU8(data[i]);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteBytesFill(count: int64, val: int64) {
+    var i: int64 := 0;
+    while i < count {
+      self.WriteU8(val);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteZeros(count: int64) {
+    self.WriteBytesFill(count, 0);
+  }
+  
+  // ============================================================================
+  // Set Code/Data Buffers
+  // ============================================================================
+  
+  pub fn SetCode(buf: int64, size: int64) {
+    self->codeBuf := buf;
+    self->codeSize := size;
+  }
+  
+  pub fn SetData(buf: int64, size: int64) {
+    self->dataBuf := buf;
+    self->dataSize := size;
+  }
+  
+  pub fn SetRodata(buf: int64, size: int64) {
+    self->rodataBuf := buf;
+    self->rodataSize := size;
+  }
+  
+  pub fn SetEntryRVA(rva: int64) {
+    self->entryRVA := rva;
+  }
+  
+  pub fn SetTarget(machine: int64) {
+    self->targetMachine := machine;
+  }
+  
+  // ============================================================================
+  // Write DOS Header
+  // ============================================================================
+  
+  fn WriteDosHeader(peOffset: int64) {
+    // e_magic = "MZ" = 0x5A4D
+    self.WriteU16LE(16#5A4D);
+    // e_cblp
+    self.WriteU16LE(16#0090);
+    // e_cp
+    self.WriteU16LE(16#0003);
+    // e_crlc
+    self.WriteU16LE(16#0000);
+    // e_cparhdr
+    self.WriteU16LE(16#0004);
+    // e_minalloc
+    self.WriteU16LE(16#0000);
+    // e_maxalloc
+    self.WriteU16LE(16#FFFF);
+    // e_ss
+    self.WriteU16LE(16#0000);
+    // e_sp
+    self.WriteU16LE(16#00B8);
+    // e_csum
+    self.WriteU16LE(16#0000);
+    // e_ip
+    self.WriteU16LE(16#0000);
+    // e_cs
+    self.WriteU16LE(16#0000);
+    // e_lfarlc
+    self.WriteU16LE(16#0040);
+    // e_ovno (4 words)
+    self.WriteU16LE(0);
+    self.WriteU16LE(0);
+    self.WriteU16LE(0);
+    self.WriteU16LE(0);
+    // e_oemid
+    self.WriteU16LE(0);
+    // e_oeminfo
+    self.WriteU16LE(0);
+    // e_res2 (10 words)
+    var i: int64 := 0;
+    while i < 10 {
+      self.WriteU16LE(0);
+      i := i + 1;
+    }
+    // e_lfanew
+    self.WriteU32LE(peOffset);
+  }
+  
+  // ============================================================================
+  // Write DOS Stub
+  // ============================================================================
+  
+  fn WriteDosStub() {
+    // Minimal DOS stub: "This program cannot be run in DOS mode.\r\r\n$"
+    var dosStub: int64 := mmap(64, 7);
+    
+    // push cs; pop ds
+    dosStub[0] := 16#0E;
+    dosStub[1] := 16#1F;
+    // mov dx, msg
+    dosStub[2] := 16#BA;
+    dosStub[3] := 16#0E;
+    dosStub[4] := 0;
+    // mov ah, 9
+    dosStub[5] := 16#B4;
+    dosStub[6] := 16#09;
+    // int 21h
+    dosStub[7] := 16#CD;
+    dosStub[8] := 16#21;
+    // mov ax, 4c01h
+    dosStub[9] := 16#B8;
+    dosStub[10] := 16#01;
+    dosStub[11] := 16#4C;
+    // int 21h
+    dosStub[12] := 16#CD;
+    dosStub[13] := 16#21;
+    
+    // Message string
+    var msg: int64 := 14;
+    dosStub[msg+0] := 84;  // 'T'
+    dosStub[msg+1] := 104; // 'h'
+    dosStub[msg+2] := 105; // 'i'
+    dosStub[msg+3] := 115; // 's'
+    dosStub[msg+4] := 32;  // ' '
+    dosStub[msg+5] := 112; // 'p'
+    dosStub[msg+6] := 114; // 'r'
+    dosStub[msg+7] := 111; // 'o'
+    dosStub[msg+8] := 103; // 'g'
+    dosStub[msg+9] := 114; // 'r'
+    dosStub[msg+10] := 97; // 'a'
+    dosStub[msg+11] := 109; // 'm'
+    dosStub[msg+12] := 32; // ' '
+    dosStub[msg+13] := 99; // 'c'
+    dosStub[msg+14] := 97; // 'a'
+    dosStub[msg+15] := 110; // 'n'
+    dosStub[msg+16] := 110; // 'n'
+    dosStub[msg+17] := 111; // 'o'
+    dosStub[msg+18] := 116; // 't'
+    dosStub[msg+19] := 32;  // ' '
+    dosStub[msg+20] := 98;  // 'b'
+    dosStub[msg+21] := 101; // 'e'
+    dosStub[msg+22] := 32;  // ' '
+    dosStub[msg+23] := 114; // 'r'
+    dosStub[msg+24] := 117; // 'u'
+    dosStub[msg+25] := 110; // 'n'
+    dosStub[msg+26] := 32;  // ' '
+    dosStub[msg+27] := 105; // 'i'
+    dosStub[msg+28] := 110; // 'n'
+    dosStub[msg+29] := 32;  // ' '
+    dosStub[msg+30] := 68;  // 'D'
+    dosStub[msg+31] := 79;  // 'O'
+    dosStub[msg+32] := 83;  // 'S'
+    dosStub[msg+33] := 32;  // ' '
+    dosStub[msg+34] := 109; // 'm'
+    dosStub[msg+35] := 111; // 'o'
+    dosStub[msg+36] := 100; // 'd'
+    dosStub[msg+37] := 101; // 'e'
+    dosStub[msg+38] := 46;  // '.'
+    dosStub[msg+39] := 13;  // '\r'
+    dosStub[msg+40] := 10;  // '\n'
+    dosStub[msg+41] := 36;  // '$'
+    dosStub[msg+42] := 0;
+    
+    self.WriteBytes(dosStub, 64);
+    munmap(dosStub, 64);
+  }
+  
+  // ============================================================================
+  // Write PE Signature
+  // ============================================================================
+  
+  fn WritePESignature() {
+    // PE\0\0
+    self.WriteU8(80);  // 'P'
+    self.WriteU8(69);  // 'E'
+    self.WriteU8(0);
+    self.WriteU8(0);
+  }
+  
+  // ============================================================================
+  // Write COFF Header
+  // ============================================================================
+  
+  fn WriteCoffHeader(numSections: int64) {
+    // Machine
+    self.WriteU16LE(self->targetMachine);
+    // NumberOfSections
+    self.WriteU16LE(numSections);
+    // TimeDateStamp (0 für reproducible builds)
+    self.WriteU32LE(0);
+    // PointerToSymbolTable
+    self.WriteU32LE(0);
+    // NumberOfSymbols
+    self.WriteU32LE(0);
+    // SizeOfOptionalHeader
+    self.WriteU16LE(240);  // SizeOf(TOptionalHeader64)
+    // Characteristics
+    self.WriteU16LE(IMAGE_FILE_EXECUTABLE_IMAGE or IMAGE_FILE_LARGE_ADDRESS_AWARE);
+  }
+  
+  // ============================================================================
+  // Write Optional Header (PE32+)
+  // ============================================================================
+  
+  fn WriteOptionalHeader(imageSize: int64, headerSize: int64) {
+    // Magic = 0x020B (PE32+)
+    self.WriteU16LE(16#020B);
+    // MajorLinkerVersion
+    self.WriteU8(1);
+    // MinorLinkerVersion
+    self.WriteU8(0);
+    
+    // SizeOfCode
+    var codeAlign: int64 := AlignUp(self->codeSize, FILE_ALIGNMENT);
+    self.WriteU32LE(codeAlign);
+    
+    // SizeOfInitializedData
+    var dataAlign: int64 := AlignUp(self->rodataSize + self->dataSize, FILE_ALIGNMENT);
+    self.WriteU32LE(dataAlign);
+    
+    // SizeOfUninitializedData
+    self.WriteU32LE(0);
+    
+    // AddressOfEntryPoint
+    self.WriteU32LE(self->entryRVA);
+    
+    // BaseOfCode
+    self.WriteU32LE(16#1000);  // .text starts at RVA 0x1000
+    
+    // ImageBase
+    self.WriteU64LE(self->imageBase);
+    
+    // SectionAlignment
+    self.WriteU32LE(SECTION_ALIGNMENT);
+    
+    // FileAlignment
+    self.WriteU32LE(FILE_ALIGNMENT);
+    
+    // MajorOperatingSystemVersion
+    self.WriteU16LE(6);
+    // MinorOperatingSystemVersion
+    self.WriteU16LE(2);
+    // MajorImageVersion
+    self.WriteU16LE(0);
+    // MinorImageVersion
+    self.WriteU16LE(0);
+    // MajorSubsystemVersion
+    self.WriteU16LE(6);
+    // MinorSubsystemVersion
+    self.WriteU16LE(2);
+    
+    // Win32VersionValue
+    self.WriteU32LE(0);
+    
+    // SizeOfImage
+    self.WriteU32LE(imageSize);
+    
+    // SizeOfHeaders
+    self.WriteU32LE(headerSize);
+    
+    // CheckSum
+    self.WriteU32LE(0);
+    
+    // Subsystem
+    self.WriteU16LE(IMAGE_SUBSYSTEM_WINDOWS_CUI);
+    
+    // DllCharacteristics
+    self.WriteU16LE(IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE or 
+                    IMAGE_DLLCHARACTERISTICS_NX_COMPAT or
+                    IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA or
+                    IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE);
+    
+    // SizeOfStackReserve
+    self.WriteU64LE(16#100000);  // 1 MB
+    // SizeOfStackCommit
+    self.WriteU64LE(16#1000);   // 4 KB
+    // SizeOfHeapReserve
+    self.WriteU64LE(16#100000);  // 1 MB
+    // SizeOfHeapCommit
+    self.WriteU64LE(16#1000);    // 4 KB
+    // LoaderFlags
+    self.WriteU32LE(0);
+    // NumberOfRvaAndSizes
+    self.WriteU32LE(16);
+    
+    // Data Directories (16 entries, all zero for minimal PE)
+    var i: int64 := 0;
+    while i < 16 {
+      self.WriteU32LE(0);  // VirtualAddress
+      self.WriteU32LE(0);  // Size
+      i := i + 1;
+    }
+  }
+  
+  // ============================================================================
+  // Write Section Header
+  // ============================================================================
+  
+  fn WriteSectionHeader(name: int64, nameLen: int64, virtualSize: int64, 
+                        virtualAddr: int64, rawSize: int64, rawOffset: int64,
+                        characteristics: int64) {
+    // Name (8 bytes, null-padded)
+    var i: int64 := 0;
+    while i < 8 {
+      if i < nameLen {
+        self.WriteU8(name[i]);
+      } else {
+        self.WriteU8(0);
+      }
+      i := i + 1;
+    }
+    
+    // VirtualSize
+    self.WriteU32LE(virtualSize);
+    // VirtualAddress
+    self.WriteU32LE(virtualAddr);
+    // SizeOfRawData
+    self.WriteU32LE(rawSize);
+    // PointerToRawData
+    self.WriteU32LE(rawOffset);
+    // PointerToRelocations
+    self.WriteU32LE(0);
+    // PointerToLinenumbers
+    self.WriteU32LE(0);
+    // NumberOfRelocations
+    self.WriteU16LE(0);
+    // NumberOfLinenumbers
+    self.WriteU16LE(0);
+    // Characteristics
+    self.WriteU32LE(characteristics);
+  }
+  
+  // ============================================================================
+  // Write Static PE64 Binary
+  // ============================================================================
+  
+  pub fn WriteStatic(filename: int64, filenameLen: int64) {
+    // Berechne Offsets und Größen
+    var dosHeaderSize: int64 := 64;
+    var dosStubSize: int64 := 64;
+    var peSigSize: int64 := 4;
+    var coffHeaderSize: int64 := 20;
+    var optHeaderSize: int64 := 240;
+    var numSections: int64 := 4;  // .text, .rdata, .data, .bss
+    var sectionHeaderSize: int64 := 40;
+    
+    // Header-Ende (wo .text beginnt)
+    var headerEnd: int64 := dosHeaderSize + dosStubSize + peSigSize + coffHeaderSize + optHeaderSize + numSections * sectionHeaderSize;
+    headerEnd := AlignUp(headerEnd, FILE_ALIGNMENT);
+    
+    // RVA für .text = 0x1000 (Standard für Windows)
+    self->textRVA := 16#1000;
+    // .rdata nach .text
+    self->rodataRVA := AlignUp(self->textRVA + self->codeSize, SECTION_ALIGNMENT);
+    // .data nach .rdata
+    self->dataRVA := AlignUp(self->rodataRVA + self->rodataSize, SECTION_ALIGNMENT);
+    // .bss nach .data (virtual size only, no raw data)
+    var bssRVA: int64 := AlignUp(self->dataRVA + self->dataSize, SECTION_ALIGNMENT);
+    
+    // Image Size berechnen
+    var imageSize: int64 := AlignUp(bssRVA, SECTION_ALIGNMENT);
+    
+    // Schreibe DOS Header
+    var peOffset: int64 := dosHeaderSize + dosStubSize;
+    self.WriteDosHeader(peOffset);
+    
+    // Schreibe DOS Stub
+    self.WriteDosStub();
+    
+    // Schreibe PE Signature
+    self.WritePESignature();
+    
+    // Schreibe COFF Header
+    self.WriteCoffHeader(numSections);
+    
+    // Schreibe Optional Header
+    self.WriteOptionalHeader(imageSize, headerEnd);
+    
+    // Schreibe Section Headers
+    // .text
+    var textName: int64 := 0;
+    self.WriteSectionHeader(textName, 5, self->codeSize, self->textRVA, 
+                          AlignUp(self->codeSize, FILE_ALIGNMENT), headerEnd,
+                          IMAGE_SCN_CNT_CODE or IMAGE_SCN_MEM_EXECUTE or 
+                          IMAGE_SCN_MEM_READ);
+    
+    // .rdata
+    var rdataOffset: int64 := headerEnd + AlignUp(self->codeSize, FILE_ALIGNMENT);
+    self.WriteSectionHeader(textName, 7, self->rodataSize, self->rodataRVA,
+                          AlignUp(self->rodataSize, FILE_ALIGNMENT), rdataOffset,
+                          IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ);
+    
+    // .data
+    var dataOffset: int64 := rdataOffset + AlignUp(self->rodataSize, FILE_ALIGNMENT);
+    self.WriteSectionHeader(textName, 5, self->dataSize, self->dataRVA,
+                          AlignUp(self->dataSize, FILE_ALIGNMENT), dataOffset,
+                          IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE);
+    
+    // .bss
+    var bssSize: int64 := 0;  // Keine Raw-Daten
+    self.WriteSectionHeader(textName, 5, bssSize, bssRVA, 0, 0,
+                          IMAGE_SCN_CNT_UNINITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE);
+    
+    // Pad bis zum Ende der Header
+    while self->outLen < headerEnd {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .text
+    if self->codeSize > 0 {
+      var paddedCodeSize: int64 := AlignUp(self->codeSize, FILE_ALIGNMENT);
+      self.WriteBytes(self->codeBuf, self->codeSize);
+      while self->outLen < headerEnd + paddedCodeSize {
+        self.WriteU8(0);
+      }
+    }
+    
+    // Schreibe .rdata
+    if self->rodataSize > 0 {
+      var paddedRdataSize: int64 := AlignUp(self->rodataSize, FILE_ALIGNMENT);
+      self.WriteBytes(self->rodataBuf, self->rodataSize);
+      while self->outLen < rdataOffset + paddedRdataSize {
+        self.WriteU8(0);
+      }
+    }
+    
+    // Schreibe .data
+    if self->dataSize > 0 {
+      var paddedDataSize: int64 := AlignUp(self->dataSize, FILE_ALIGNMENT);
+      self.WriteBytes(self->dataBuf, self->dataSize);
+      while self->outLen < dataOffset + paddedDataSize {
+        self.WriteU8(0);
+      }
+    }
+    
+    // .bss hat keine Raw-Daten - nichts zu schreiben
+    
+    // Schreibe in Datei
+    self.DumpToFile(filename, filenameLen);
+  }
+  
+  // ============================================================================
+  // Dump Buffer to File
+  // ============================================================================
+  
+  pub fn DumpToFile(filename: int64, filenameLen: int64) {
+    var fd: int64 := syscall_sys_open(filename, filenameLen, 577, 0);  // O_WRONLY | O_CREAT | O_TRUNC = 577
+    if fd < 0 {
+      return;
+    }
+    
+    var written: int64 := syscall_sys_write(fd, self->outBuf, self->outLen);
+    syscall_sys_close(fd);
+  }
+  
+  // ============================================================================
+  // Destroy
+  // ============================================================================
+  
+  pub fn Destroy() {
+    if self->outBuf != 0 {
+      munmap(self->outBuf, self->outCap);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// WritePE64 Stub Function
+// ============================================================================
+
+pub fn WritePE64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryRVA: int64) {
+  var writer: int64 := TPE64Writer.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryRVA(entryRVA);
+  writer.SetTarget(IMAGE_FILE_MACHINE_AMD64);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+pub fn WritePE64ARM64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryRVA: int64) {
+  var writer: int64 := TPE64Writer.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryRVA(entryRVA);
+  writer.SetTarget(IMAGE_FILE_MACHINE_ARM64);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+// ============================================================================
+// Test Entry Point
+// ============================================================================
+
+pub fn main(): int64 {
+  // Minimaler Test: nur ein RET-Instruction
+  var code: int64 := mmap(16, 7);
+  code[0] := 16#C3;  // RET
+  
+  WritePE64("/tmp/test_pe64", 13, code, 1, 16#1000);
+  
+  munmap(code, 16);
+  
+  PrintStr("PE64 Writer Test Complete\n");
+  return 0;
+}
