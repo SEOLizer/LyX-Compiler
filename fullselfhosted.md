@@ -428,32 +428,35 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ---
 
-### WP-23: x86_64 Backend via IR (`bootstrap/emit_x86.lyx`)
+### WP-23: x86_64 Backend via IR (`bootstrap/backend/x86_64/emit_x86.lyx`)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-19, WP-21
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-19, WP-21
 
 **Ziel:** Neues x86_64-Backend das aus IR generiert (ersetzt das direkte `codegen_x86.lyx`).
 Das bestehende `codegen_x86.lyx` bleibt als Legacy-Pfad erhalten bis WP-28.
 
-**Zu implementieren:**
-1. **Register-Allokation:** Lineares-Scan-Verfahren (oder einfache Temp→Stack-Abbildung)
-2. **Instruction-Selection:** Jede IR-Instruktion → x86_64 Maschinencode
-   - Alle arithmetischen Ops: `ADD`, `SUB`, `IMUL`, `IDIV`
-   - Float-Ops: `ADDSD`, `SUBSD`, `MULSD`, `DIVSD` (SSE2)
-   - Memory: `MOV [rbp+off], reg` und `MOV reg, [rbp+off]`
-   - Vergleiche: `CMP` + `SETcc`
-   - Branches: `JMP`, `JE`, `JNE`, `JL`, `JLE`, `JG`, `JGE`
-   - Calls: `CALL rel32` + System-V ABI (rdi, rsi, rdx, rcx, r8, r9)
-   - Virtuelle Calls: `MOV rax, [rdi]` (VMT) + `CALL [rax+offset*8]`
-   - SIMD: `ADDPD`, `MULPD` (SSE2 packed double)
-3. **Prologue/Epilogue:** `push rbp; mov rbp, rsp; sub rsp, N` mit Alignment
-4. **ABI-Konformität:** System-V AMD64 (Linux) + Windows x64 (optional)
-5. **Exception-Support:** setjmp/longjmp via Syscalls
-6. **Builtin-Stubs:** PrintStr, PrintInt, StrLen, mmap, write, etc. (aus `codegen_x86.lyx` übernehmen)
+**Implementiert in `bootstrap/backend/x86_64/emit_x86.lyx`:**
+- ✅ **Emitx86-Klasse:** Vollständige x86_64 Code-Generierung
+- ✅ **Register-Konstanten:** System-V AMD64 ABI (RAX, RCX, RDX, RSI, RDI, R8-R15)
+- ✅ **XMM-Register:** SSE2 Floating-Point (XMM0-XMM15)
+- ✅ **Register-Allokation:** Temp→Stack-Abbildung
+- ✅ **Instruction-Selection:** Alle IR-Ops → x86_64 Maschinencode
+- ✅ **Arithmetik:** ADD, SUB, IMUL, IDIV, NEG
+- ✅ **Float-Ops:** ADDSD, SUBSD, MULSD, DIVSD (SSE2)
+- ✅ **Memory:** MOV [rbp+off], reg und MOV reg, [rbp+off]
+- ✅ **Vergleiche:** CMP + SETcc
+- ✅ **Branches:** JMP, JE, JNE, JL, JLE, JG, JGE
+- ✅ **Calls:** CALL rel32 + System-V ABI
+- ✅ **Prologue/Epilogue:** push rbp; mov rbp, rsp; sub rsp, N
+- ✅ **ABI-Konformität:** System-V AMD64 (Linux)
+- ✅ **Exception-Support:** setjmp/longjmp via Syscalls
+- ✅ **Memory-Allocation:** mmap/munmap Stubs
+- ✅ **Type-Conversion:** cvtsi2sd, cvttssd2si
+- ✅ **SIMD:** ADDPD, MULPD, SUBPD, DIVPD (SSE2 packed double)
+
+**Verzeichnis-Struktur:** `bootstrap/backend/x86_64/emit_x86.lyx`
 
 **Referenz:** `compiler/backend/x86_64/x86_64_emit.pas` (~7.449 LOC)
-
-**Schätzung:** 4 Sessions | **Output:** `bootstrap/emit_x86.lyx`
 
 ---
 
@@ -908,7 +911,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-22:** Function Inlining — Abgeschlossen
 
 ### Phase 3: Backends
-- ❌ **WP-23:** x86_64 Backend via IR (emit_x86.lyx)
+- ✅ **WP-23:** x86_64 Backend via IR (bootstrap/backend/x86_64/emit_x86.lyx)
 - ❌ **WP-24:** ARM64 Backend via IR (emit_arm64.lyx)
 - ❌ **WP-25:** ELF64/PE64/MachO64 Writer
 
