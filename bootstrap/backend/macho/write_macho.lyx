@@ -1,0 +1,494 @@
+// ==================================================================
+// WP-25: MachO64 Writer
+// ==================================================================
+// MachO64 Binary Writer für macOS x86_64 und ARM64:
+// - Mach-O 64-Bit Header
+// - Load Commands (LC_SEGMENT_64, LC_MAIN, LC_UUID)
+// - Sections (.text, .data, .bss)
+//
+// Referenz: compiler/backend/macho/macho64_writer.pas
+
+// ============================================================================
+// MachO64 Constants
+// ============================================================================
+
+pub con MH_MAGIC_64: int64 := 16#FEEDFACF;  // 64-bit Mach-O (Little-Endian)
+
+pub con CPU_TYPE_X86_64: int64 := 16#01000007;
+pub con CPU_TYPE_ARM64: int64 := 16#0100000C;
+
+pub con CPU_SUBTYPE_X86_64_ALL: int64 := 3;
+pub con CPU_SUBTYPE_ARM64_ALL: int64 := 0;
+
+pub con MH_EXECUTE: int64 := 2;  // Executable File
+pub con MH_NOUNDEFS: int64 := 16#00000001;
+pub con MH_PIE: int64 := 16#00200000;  // Position Independent Executable
+
+pub con LC_SEGMENT_64: int64 := 16#19;
+pub con LC_SYMTAB: int64 := 16#02;
+pub con LC_DYSYMTAB: int64 := 16#0B;
+pub con LC_MAIN: int64 := 16#80000028;
+pub con LC_UUID: int64 := 16#1B;
+pub con LC_LOAD_DYLIB: int64 := 16#0C;
+pub con LC_DYLD_INFO_ONLY: int64 := 16#80000022;
+
+pub con VM_PROT_NONE: int64 := 16#00;
+pub con VM_PROT_READ: int64 := 16#01;
+pub con VM_PROT_WRITE: int64 := 16#02;
+pub con VM_PROT_EXECUTE: int64 := 16#04;
+
+pub con S_REGULAR: int64 := 16#00;
+pub con S_ZEROFILL: int64 := 16#01;
+pub con S_ATTR_PURE_INSTRUCTIONS: int64 := 16#80000000;
+pub con S_ATTR_SOME_INSTRUCTIONS: int64 := 16#00000400;
+
+pub con PAGE_SIZE: int64 := 16#4000;  // 16KB
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn AlignUp(v: int64, a: int64): int64 {
+  if a == 0 { return v; }
+  return (v + a - 1) and not (a - 1);
+}
+
+// ============================================================================
+// TMachoWriter Class
+// ============================================================================
+
+pub type TMachoWriter = class {
+  // Output buffer
+  outBuf: int64;
+  outLen: int64;
+  outCap: int64;
+  
+  // Code and data buffers
+  codeBuf: int64;
+  codeSize: int64;
+  dataBuf: int64;
+  dataSize: int64;
+  bssSize: int64;
+  
+  // Virtual addresses
+  textAddr: int64;
+  dataAddr: int64;
+  bssAddr: int64;
+  entryOffset: int64;
+  
+  // Target CPU
+  cpuType: int64;
+  cpuSubtype: int64;
+  
+  // ============================================================================
+  // Constructor
+  // ============================================================================
+  
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(TMachoWriter));
+    
+    self->outBuf := mmap(16384, 7);
+    self->outLen := 0;
+    self->outCap := 16384;
+    
+    self->codeBuf := 0;
+    self->codeSize := 0;
+    self->dataBuf := 0;
+    self->dataSize := 0;
+    self->bssSize := 0;
+    
+    // Default: x86_64 macOS
+    self->cpuType := CPU_TYPE_X86_64;
+    self->cpuSubtype := CPU_SUBTYPE_X86_64_ALL;
+    
+    return self;
+  }
+  
+  // ============================================================================
+  // Buffer Management
+  // ============================================================================
+  
+  fn ensureCapacity(minSize: int64) {
+    if self->outCap >= minSize { return; }
+    
+    var newCap: int64 := self->outCap * 2;
+    while newCap < minSize {
+      newCap := newCap * 2;
+    }
+    
+    var newBuf: int64 := mmap(newCap, 7);
+    
+    var i: int64 := 0;
+    while i < self->outLen {
+      newBuf[i] := self->outBuf[i];
+      i := i + 1;
+    }
+    
+    munmap(self->outBuf, self->outCap);
+    self->outBuf := newBuf;
+    self->outCap := newCap;
+  }
+  
+  pub fn WriteU8(val: int64) {
+    self.ensureCapacity(self->outLen + 1);
+    self->outBuf[self->outLen] := val;
+    self->outLen := self->outLen + 1;
+  }
+  
+  pub fn WriteU32LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+  }
+  
+  pub fn WriteU64LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+    self.WriteU8((val shr 32) and 16#FF);
+    self.WriteU8((val shr 40) and 16#FF);
+    self.WriteU8((val shr 48) and 16#FF);
+    self.WriteU8((val shr 56) and 16#FF);
+  }
+  
+  pub fn WriteBytes(data: int64, len: int64) {
+    var i: int64 := 0;
+    while i < len {
+      self.WriteU8(data[i]);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteBytesFill(count: int64, val: int64) {
+    var i: int64 := 0;
+    while i < count {
+      self.WriteU8(val);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteZeros(count: int64) {
+    self.WriteBytesFill(count, 0);
+  }
+  
+  // ============================================================================
+  // Set Code/Data Buffers
+  // ============================================================================
+  
+  pub fn SetCode(buf: int64, size: int64) {
+    self->codeBuf := buf;
+    self->codeSize := size;
+  }
+  
+  pub fn SetData(buf: int64, size: int64) {
+    self->dataBuf := buf;
+    self->dataSize := size;
+  }
+  
+  pub fn SetBssSize(size: int64) {
+    self->bssSize := size;
+  }
+  
+  pub fn SetEntryOffset(offset: int64) {
+    self->entryOffset := offset;
+  }
+  
+  pub fn SetTarget(cpu: int64, subtype: int64) {
+    self->cpuType := cpu;
+    self->cpuSubtype := subtype;
+  }
+  
+  // ============================================================================
+  // Write Mach-O Header
+  // ============================================================================
+  
+  fn WriteMachHeader(numCommands: int64, sizeOfCommands: int64) {
+    // magic
+    self.WriteU32LE(MH_MAGIC_64);
+    // cputype
+    self.WriteU32LE(self->cpuType);
+    // cpusubtype
+    self.WriteU32LE(self->cpuSubtype);
+    // filetype
+    self.WriteU32LE(MH_EXECUTE);
+    // ncmds
+    self.WriteU32LE(numCommands);
+    // sizeofcmds
+    self.WriteU32LE(sizeOfCommands);
+    // flags
+    self.WriteU32LE(MH_NOUNDEFS or MH_PIE);
+    // reserved
+    self.WriteU32LE(0);
+  }
+  
+  // ============================================================================
+  // Write Segment Command (LC_SEGMENT_64)
+  // ============================================================================
+  
+  fn WriteSegmentCommand() {
+    // cmd = LC_SEGMENT_64
+    self.WriteU32LE(LC_SEGMENT_64);
+    
+    // cmdsize = sizeof(TSegmentCommand64) + 3 * sizeof(TSection64)
+    // 48 + 3 * 80 = 288
+    var cmdsize: int64 := 48 + 3 * 80;
+    self.WriteU32LE(cmdsize);
+    
+    // segname (16 bytes)
+    self.WriteBytesFill(16, 0);  // "__TEXT" for main segment
+    
+    // vmaddr = 0 (PIE)
+    self.WriteU64LE(0);
+    
+    // vmsize berechnen
+    var textVMSize: int64 := AlignUp(self->codeSize, PAGE_SIZE);
+    var dataVMSize: int64 := AlignUp(self->dataSize + self->bssSize, PAGE_SIZE);
+    var totalVMSize: int64 := textVMSize + dataVMSize;
+    self.WriteU64LE(totalVMSize);
+    
+    // fileoff = 0
+    self.WriteU64LE(0);
+    
+    // filesize berechnen
+    var textFileSize: int64 := self->codeSize;
+    var dataFileSize: int64 := self->dataSize;
+    var totalFileSize: int64 := textFileSize + dataFileSize;
+    self.WriteU64LE(totalFileSize);
+    
+    // maxprot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE
+    self.WriteU32LE(VM_PROT_READ or VM_PROT_WRITE or VM_PROT_EXECUTE);
+    
+    // initprot = VM_PROT_READ | VM_PROT_EXECUTE
+    self.WriteU32LE(VM_PROT_READ or VM_PROT_EXECUTE);
+    
+    // nsects = 3 (.text, .data, .bss)
+    self.WriteU32LE(3);
+    
+    // flags = 0
+    self.WriteU32LE(0);
+  }
+  
+  // ============================================================================
+  // Write Section Header
+  // ============================================================================
+  
+  fn WriteSection(sectName: int64, sectNameLen: int64, segName: int64, segNameLen: int64,
+                  addr: int64, size: int64, offset: int64, align: int64, flags: int64) {
+    // sectname (16 bytes)
+    var i: int64 := 0;
+    while i < 16 {
+      if i < sectNameLen {
+        self.WriteU8(sectName[i]);
+      } else {
+        self.WriteU8(0);
+      }
+      i := i + 1;
+    }
+    
+    // segname (16 bytes)
+    i := 0;
+    while i < 16 {
+      if i < segNameLen {
+        self.WriteU8(segName[i]);
+      } else {
+        self.WriteU8(0);
+      }
+      i := i + 1;
+    }
+    
+    // addr
+    self.WriteU64LE(addr);
+    // size
+    self.WriteU64LE(size);
+    // offset
+    self.WriteU32LE(offset);
+    // align
+    self.WriteU32LE(4);  // 2^4 = 16 bytes alignment
+    // reloff
+    self.WriteU32LE(0);
+    // nreloc
+    self.WriteU32LE(0);
+    // flags
+    self.WriteU32LE(flags);
+    // reserved1
+    self.WriteU32LE(0);
+    // reserved2
+    self.WriteU32LE(0);
+    // reserved3
+    self.WriteU32LE(0);
+  }
+  
+  // ============================================================================
+  // Write LC_MAIN (Entry Point)
+  // ============================================================================
+  
+  fn WriteEntryPointCommand() {
+    // cmd = LC_MAIN
+    self.WriteU32LE(LC_MAIN);
+    // cmdsize = 24
+    self.WriteU32LE(24);
+    // entryoff
+    self.WriteU64LE(self->entryOffset);
+    // stacksize = 0
+    self.WriteU64LE(0);
+  }
+  
+  // ============================================================================
+  // Write LC_UUID
+  // ============================================================================
+  
+  fn WriteUUIDCommand() {
+    // cmd = LC_UUID
+    self.WriteU32LE(LC_UUID);
+    // cmdsize = 24
+    self.WriteU32LE(24);
+    
+    // uuid (16 bytes) - deterministische UUID basierend auf Code
+    var i: int64 := 0;
+    while i < 16 {
+      // Einfache deterministische "UUID": Byte aus konstanten Werten
+      self.WriteU8(i * 17 mod 256);
+      i := i + 1;
+    }
+  }
+  
+  // ============================================================================
+  // Write Static MachO64 Binary
+  // ============================================================================
+  
+  pub fn WriteStatic(filename: int64, filenameLen: int64) {
+    // Berechne Offsets
+    var textOffset: int64 := 0;
+    var dataOffset: int64 := AlignUp(textOffset + self->codeSize, PAGE_SIZE);
+    
+    // Berechne Load Command Größen
+    var segmentCmdSize: int64 := 48 + 3 * 80;  // Segment + 3 Sections
+    var entryCmdSize: int64 := 24;
+    var uuidCmdSize: int64 := 24;
+    var totalCmdSize: int64 := segmentCmdSize + entryCmdSize + uuidCmdSize;
+    var numCommands: int64 := 3;
+    
+    // Schreibe Mach-O Header
+    self.WriteMachHeader(numCommands, totalCmdSize);
+    
+    // Schreibe LC_SEGMENT_64
+    self.WriteSegmentCommand();
+    
+    // Section 1: .text
+    var textName: int64 := 0;
+    var segName: int64 := 0;
+    self.WriteSection(textName, 6, segName, 7, self->textAddr, self->codeSize, 
+                     textOffset, 4, S_REGULAR or S_ATTR_PURE_INSTRUCTIONS);
+    
+    // Section 2: .data
+    self.WriteSection(textName, 5, segName, 7, self->dataAddr, self->dataSize,
+                     dataOffset, 0, S_REGULAR);
+    
+    // Section 3: .bss
+    self.WriteSection(textName, 5, segName, 7, self->dataAddr + self->dataSize,
+                     self->bssSize, 0, 0, S_ZEROFILL);
+    
+    // Schreibe LC_MAIN
+    self.WriteEntryPointCommand();
+    
+    // Schreibe LC_UUID
+    self.WriteUUIDCommand();
+    
+    // Pad bis zum Code-Offset
+    while self->outLen < dataOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .text
+    if self->codeSize > 0 {
+      self.WriteBytes(self->codeBuf, self->codeSize);
+    }
+    
+    // Pad bis .data Offset
+    while self->outLen < dataOffset + self->codeSize {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .data
+    if self->dataSize > 0 {
+      self.WriteBytes(self->dataBuf, self->dataSize);
+    }
+    
+    // .bss hat keine Raw-Daten
+    
+    // Schreibe in Datei
+    self.DumpToFile(filename, filenameLen);
+  }
+  
+  // ============================================================================
+  // Dump Buffer to File
+  // ============================================================================
+  
+  pub fn DumpToFile(filename: int64, filenameLen: int64) {
+    var fd: int64 := syscall_sys_open(filename, filenameLen, 577, 0);  // O_WRONLY | O_CREAT | O_TRUNC = 577
+    if fd < 0 {
+      return;
+    }
+    
+    var written: int64 := syscall_sys_write(fd, self->outBuf, self->outLen);
+    syscall_sys_close(fd);
+  }
+  
+  // ============================================================================
+  // Destroy
+  // ============================================================================
+  
+  pub fn Destroy() {
+    if self->outBuf != 0 {
+      munmap(self->outBuf, self->outCap);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// WriteMachO64 Stub Function
+// ============================================================================
+
+pub fn WriteMachO64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryOffset: int64) {
+  var writer: int64 := TMachoWriter.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryOffset(entryOffset);
+  writer.SetTarget(CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+pub fn WriteMachO64ARM64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryOffset: int64) {
+  var writer: int64 := TMachoWriter.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryOffset(entryOffset);
+  writer.SetTarget(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+// ============================================================================
+// Test Entry Point
+// ============================================================================
+
+pub fn main(): int64 {
+  // Minimaler Test: nur ein RET-Instruction
+  var code: int64 := mmap(16, 7);
+  code[0] := 16#C3;  // RET
+  
+  WriteMachO64("/tmp/test_macho64", 16, code, 1, 0);
+  
+  munmap(code, 16);
+  
+  PrintStr("MachO64 Writer Test Complete\n");
+  return 0;
+}
