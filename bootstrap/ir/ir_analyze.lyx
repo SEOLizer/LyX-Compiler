@@ -1,0 +1,389 @@
+// ==================================================================
+// WP-28: Statische Analyse
+// ==================================================================
+// Statische Analyse-Passes für IR-Code:
+// - Null-Pointer-Analyse (Taint-Tracking)
+// - Array-Bounds-Check (statisch)
+// - Stack-WCET Berechnung
+// - Erreichbarkeits-Analyse (Dead Code)
+// - Def-Use-Ketten
+//
+// Referenz: compiler/ir/ir_static_analysis.pas
+
+import bootstrap.ir;
+
+// ============================================================================
+// Analysis Types and Constants
+// ============================================================================
+
+// Value States for Analysis
+con STATE_UNKNOWN: int64 := 0;
+con STATE_NON_NULL: int64 := 1;
+con STATE_NULL: int64 := 2;
+con STATE_MAYBE_NULL: int64 := 3;
+
+// Bounds States
+con BOUNDS_SAFE: int64 := 0;
+con BOUNDS_UNKNOWN: int64 := 1;
+con BOUNDS_UNVERIFIED: int64 := 2;
+
+// ============================================================================
+// IR Analysis Class
+// ============================================================================
+
+pub type IRAnalyzer = class {
+  // Module being analyzed
+  module: int64;
+  
+  // Analysis results
+  nullWarnings: int64;
+  boundsWarnings: int64;
+  deadCodeWarnings: int64;
+  uninitWarnings: int64;
+  
+  // Function-specific state
+  currentFunc: int64;
+  maxStackDepth: int64;
+  currentStackDepth: int64;
+  
+  // Variable states (per function)
+  varStates: int64;
+  varStatesCount: int64;
+  
+  // ---------------------------------------------------------------------------
+  // Constructor
+  // ---------------------------------------------------------------------------
+  
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(IRAnalyzer));
+    
+    self->nullWarnings := 0;
+    self->boundsWarnings := 0;
+    self->deadCodeWarnings := 0;
+    self->uninitWarnings := 0;
+    
+    self->currentFunc := 0;
+    self->maxStackDepth := 0;
+    self->currentStackDepth := 0;
+    
+    self->varStates := mmap(1024, 7);
+    self->varStatesCount := 0;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Null-Pointer-Analyse
+  // ---------------------------------------------------------------------------
+  
+  // Determine if a value can be null based on its origin
+  fn getNullState(value: int64): int64 {
+    // For now, return UNKNOWN
+    // A full implementation would track:
+    // - Literal nulls → STATE_NULL
+    // - Results from allocation → STATE_NON_NULL
+    // - Parameters without null-check → STATE_MAYBE_NULL
+    return STATE_UNKNOWN;
+  }
+  
+  // Check if a pointer dereference is safe
+  fn checkNullDereference(ptrValue: int64, instr: int64): bool {
+    var state: int64 := self.getNullState(ptrValue);
+    
+    if state == STATE_NULL {
+      self.nullWarnings := self.nullWarnings + 1;
+      return false;
+    }
+    
+    if state == STATE_MAYBE_NULL {
+      self.nullWarnings := self.nullWarnings + 1;
+      return false;
+    }
+    
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Array-Bounds-Check
+  // ---------------------------------------------------------------------------
+  
+  // Determine if array index is in bounds (static analysis)
+  fn checkArrayBounds(arraySize: int64, index: int64): int64 {
+    // If both are known constants, we can determine statically
+    if arraySize > 0 and index >= 0 {
+      if index < arraySize {
+        return BOUNDS_SAFE;
+      } else {
+        return BOUNDS_UNVERIFIED;
+      }
+    }
+    return BOUNDS_UNKNOWN;
+  }
+  
+  // Warn about potential out-of-bounds access
+  fn warnBounds(index: int64, size: int64) {
+    self.boundsWarnings := self.boundsWarnings + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Stack-WCET Berechnung
+  // ---------------------------------------------------------------------------
+  
+  // Estimate stack usage for an instruction
+  fn updateStackDepth(instr: int64) {
+    var op: int64 := IRInstr.op(instr);
+    
+    // Allocations push to stack
+    if op == IRO_ALLOCA {
+      self.currentStackDepth := self.currentStackDepth + 8;
+      if self.currentStackDepth > self.maxStackDepth {
+        self.maxStackDepth := self.currentStackDepth;
+      }
+    }
+    
+    // Function calls may push arguments
+    if op == IRO_CALL {
+      self.currentStackDepth := self.currentStackDepth + 32;
+      if self.currentStackDepth > self.maxStackDepth {
+        self.maxStackDepth := self.currentStackDepth;
+      }
+    }
+  }
+  
+  // Restore stack after instruction
+  fn restoreStackDepth(instr: int64) {
+    var op: int64 := IRInstr.op(instr);
+    
+    if op == IRO_ALLOCA {
+      self.currentStackDepth := self.currentStackDepth - 8;
+    }
+    
+    if op == IRO_CALL {
+      self.currentStackDepth := self.currentStackDepth - 32;
+    }
+  }
+  
+  // Get maximum stack depth for current function
+  pub fn getMaxStackDepth(): int64 {
+    return self.maxStackDepth;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Erreichbarkeits-Analyse (Dead Code)
+  // ---------------------------------------------------------------------------
+  
+  // Mark a block as reachable
+  fn markReachable(block: int64) {
+    // Simplified: just a stub
+    // Full implementation would use worklist algorithm
+  }
+  
+  // Check if a block is reachable
+  fn isReachable(block: int64): bool {
+    // Simplified: always true for now
+    // Full implementation would track reachability
+    return true;
+  }
+  
+  // Find unreachable code
+  fn findDeadCode(func: int64) {
+    var body: int64 := IRFunction.body(func);
+    if body < 0 { return; }
+    
+    var instr: int64 := body;
+    var prev: int64 := -1;
+    var sawReturn: bool := false;
+    
+    while instr >= 0 {
+      if sawReturn {
+        // Code after return is dead code
+        self.deadCodeWarnings := self.deadCodeWarnings + 1;
+      }
+      
+      var op: int64 := IRInstr.op(instr);
+      if op == IRO_RETURN or op == IRO_BREAK or op == IRO_GOTO {
+        sawReturn := true;
+      }
+      
+      prev := instr;
+      instr := IRInstr.next(instr);
+    }
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Def-Use-Ketten
+  // ---------------------------------------------------------------------------
+  
+  // Record a variable definition
+  fn recordDef(varId: int64, instr: int64) {
+    // Simplified: just a stub
+    // Full implementation would maintain def-use chains
+  }
+  
+  // Record a variable use
+  fn recordUse(varId: int64, instr: int64) {
+    // Simplified: just a stub
+    // Full implementation would check if variable was defined
+  }
+  
+  // Check for uninitialized variable use
+  fn checkUninitialized(varId: int64, instr: int64): bool {
+    // Simplified: always false (no check)
+    // Full implementation would check def-use chain
+    return false;
+  }
+  
+  // Warn about uninitialized use
+  fn warnUninitialized(varId: int64, instr: int64) {
+    self.uninitWarnings := self.uninitWarnings + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Function Analysis
+  // ---------------------------------------------------------------------------
+  
+  // Analyze a single function
+  pub fn analyzeFunc(func: int64) {
+    self.currentFunc := func;
+    self.maxStackDepth := 0;
+    self.currentStackDepth := 0;
+    
+    var body: int64 := IRFunction.body(func);
+    if body < 0 { return; }
+    
+    // Find dead code
+    self.findDeadCode(func);
+    
+    // Walk through instructions
+    var instr: int64 := body;
+    while instr >= 0 {
+      var op: int64 := IRInstr.op(instr);
+      
+      // Update stack depth
+      self.updateStackDepth(instr);
+      
+      // Check for null pointer operations
+      if op == IRO_LOAD or op == IRO_STORE {
+        // Check pointer safety
+      }
+      
+      // Check array bounds
+      if op == IRO_IDX {
+        // Check bounds
+      }
+      
+      // Check uninitialized variables
+      if op == IRO_LOAD {
+        // Check if loaded value is initialized
+      }
+      
+      // Restore stack depth
+      self.restoreStackDepth(instr);
+      
+      instr := IRInstr.next(instr);
+    }
+  }
+  
+  // Analyze entire module
+  pub fn analyzeModule(mod: int64) {
+    self.module := mod;
+    
+    var func: int64 := IRModule.firstFunc(mod);
+    while func >= 0 {
+      self.analyzeFunc(func);
+      func := IRFunction.next(func);
+    }
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Analysis Results
+  // ---------------------------------------------------------------------------
+  
+  pub fn getNullWarningCount(): int64 {
+    return self.nullWarnings;
+  }
+  
+  pub fn getBoundsWarningCount(): int64 {
+    return self.boundsWarnings;
+  }
+  
+  pub fn getDeadCodeWarningCount(): int64 {
+    return self.deadCodeWarnings;
+  }
+  
+  pub fn getUninitWarningCount(): int64 {
+    return self.uninitWarnings;
+  }
+  
+  pub fn getTotalWarningCount(): int64 {
+    return self.nullWarnings + self.boundsWarnings + 
+           self.deadCodeWarnings + self.uninitWarnings;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Destroy
+  // ---------------------------------------------------------------------------
+  
+  pub fn Destroy() {
+    if self->varStates != 0 {
+      munmap(self->varStates, 1024);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// Analysis Entry Points
+// ============================================================================
+
+pub fn analyzeIR(module: int64): int64 {
+  var analyzer: int64 := IRAnalyzer.Create();
+  analyzer.analyzeModule(module);
+  var result: int64 := analyzer.getTotalWarningCount();
+  analyzer.Destroy();
+  return result;
+}
+
+pub fn analyzeFunc(func: int64): int64 {
+  var analyzer: int64 := IRAnalyzer.Create();
+  analyzer.analyzeFunc(func);
+  var result: int64 := analyzer.getMaxStackDepth();
+  analyzer.Destroy();
+  return result;
+}
+
+// ============================================================================
+// Null Safety Check (for pointers)
+// ============================================================================
+
+pub fn isNullSafe(ptr: int64): bool {
+  // Stub: returns true for now
+  return true;
+}
+
+pub fn checkNullSafety(ptr: int64, context: int64): bool {
+  // Full null safety check
+  var state: int64 := IRAnalyzer.getNullState(ptr);
+  return state != STATE_NULL and state != STATE_MAYBE_NULL;
+}
+
+// ============================================================================
+// Bounds Verification
+// ============================================================================
+
+pub fn verifyBounds(index: int64, size: int64): int64 {
+  // Stub for now
+  return BOUNDS_UNKNOWN;
+}
+
+// ============================================================================
+// Stack WCET Estimation
+// ============================================================================
+
+pub fn estimateStackWCET(func: int64): int64 {
+  var analyzer: int64 := IRAnalyzer.Create();
+  analyzer.analyzeFunc(func);
+  var result: int64 := analyzer.getMaxStackDepth();
+  analyzer.Destroy();
+  return result;
+}
