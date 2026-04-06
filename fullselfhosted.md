@@ -660,20 +660,34 @@ bootstrap/backend/
 
 ### WP-30: Erweiterte Stdlib (string, io, math, fs, os)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-27
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-27
 
 **Ziel:** Kern-Stdlib-Module mit dem Bootstrap-Compiler kompatibel machen.
 
-**Zu implementieren:**
-1. **`std/string.lyx`:** StringBuilder, StrSplit, StrTrim, StrJoin, StrReplace, StrFormat
-2. **`std/io.lyx`:** Readline, Printf, Fprintf, Flush
-3. **`std/math.lyx`:** sin, cos, sqrt, pow, log, floor, ceil (via libm oder Soft-Float)
-4. **`std/fs.lyx`:** ReadFile, WriteFile, FileExists, DirList, mkdir, rm
-5. **`std/os.lyx`:** getenv, setenv, exit, getcwd, chdir
-6. **`std/time.lyx`:** clock_gettime, sleep, Timer
-7. **`std/json.lyx`:** JSON-Parser und -Serializer (kritisch für Compiler-Toolchain)
-8. **`std/process.lyx`:** fork, exec, waitpid, pipe
-9. **Anpassung:** Alle Module müssen ohne Fehlermeldung vom Bootstrap-Compiler kompilieren
+**Implementiert in `bootstrap/std/`:**
+- ✅ **`string.lyx`:** StringBuilder, StrSplit, StrTrim, StrJoin, StrReplace, StrFormat, StrToUpper, StrToLower, StrIndexOf, StrLastIndexOf
+- ✅ **`io.lyx`:** ReadLine, ReadChar, ReadInt, Printf, Fprintf, Flush, FileOpen, FileClose, FileRead, FileWrite, FileSeek, FileSize, FileReadAll, FileWriteAll
+- ✅ **`math.lyx`:** sin, cos, tan, sqrt, pow, exp, log, log10, log2, floor, ceil, round, trunc, sinh, cosh, tanh, atan, atan2, PI, E, INF, NAN
+- ✅ **`fs.lyx`:** FileExists, IsDirectory, IsFile, Mkdir, Rmdir, Remove, Rename, Symlink, DirList, FileSize, FileModTime, FileCopy, FileMove, BaseName, DirName, PathJoin
+- ✅ **`os.lyx`:** GetPID, GetPPID, GetUID, GetGID, GetEnv, SetEnv, UnsetEnv, GetCWD, Chdir, GetHostName, GetLoginName, Time, Sleep, Exit, GetCPUCount, GetTotalMemory, GetAvailMemory
+- ✅ **`time.lyx`:** Time, TimeNano, MonotonicTime, MonotonicTimeNano, ProcessCPUTime, ThreadCPUTime, Sleep, SleepMs, USleep, NanoSleep, Timer-Klasse, FormatTime, FormatDate, FormatDateTime
+- ✅ **`json.lyx`:** JSONParser-Klasse, JSONSerializer-Klasse, JSONParse, JSONStringify, JSONGet, JSONAt, JSONLen
+
+**Verzeichnis-Struktur:**
+```
+bootstrap/std/
+  string.lyx   (StringBuilder, alle String-Hilfsfunktionen)
+  io.lyx      (I/O, Printf, File-I/O)
+  math.lyx    (Trigonometrie, exp, log, floor, ceil)
+  fs.lyx      (Filesystem-Operationen)
+  os.lyx      (Process, Environment, System-Info)
+  time.lyx    (Zeit, Timer, Datumsformatierung)
+  json.lyx    (JSON-Parser/Serializer)
+  map.lyx     (WP-27: Hash-Map)
+  set.lyx     (WP-27: Hash-Set)
+```
+
+**Hinweis:** `std/process.lyx` (fork, exec, waitpid, pipe) ist noch ausstehend.
 
 **Referenz:** `std/` (~87 Module, ~13.000 LOC)
 
