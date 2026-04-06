@@ -575,22 +575,34 @@ bootstrap/backend/
 
 ### WP-27: Map/Set Collections in Stdlib
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-20 (IR-Lowering von Map/Set)
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-20 (IR-Lowering von Map/Set)
 
 **Ziel:** `Map[K,V]` und `Set[T]` als vollwertige Lyx-Collections.
 
-**Zu implementieren:**
-1. **Hash-Map:** Open-Addressing mit Robin-Hood-Hashing
-   - `map_new(cap)`, `map_get(m, key)`, `map_set(m, key, val)`,
-     `map_contains(m, key)`, `map_remove(m, key)`, `map_len(m)`, `map_free(m)`
-2. **Hash-Set:** Wrapper um Hash-Map mit bool-Values
-3. **String-Hash:** FNV-1a oder djb2
-4. **Generic Interface:** `Map<String, i64>`, `Set<i32>`
-5. **Stdlib-Integration:** `std/map.lyx`, `std/set.lyx`
+**Implementiert in `bootstrap/std/map.lyx`:**
+- ✅ **Hash-Map:** Open-Addressing mit Robin-Hood-Hashing
+- ✅ **map_new(capacity)** — Erstellt neue Map
+- ✅ **map_get(m, keyPtr, keyLen)** — Liefert Value oder 0
+- ✅ **map_set(m, keyPtr, keyLen, value)** — Setzt Key-Value-Paar
+- ✅ **map_contains(m, keyPtr, keyLen)** — Prüft Key-Existenz
+- ✅ **map_remove(m, keyPtr, keyLen)** — Entfernt Key-Value
+- ✅ **map_len(m)** — Liefert Anzahl Einträge
+- ✅ **map_free(m)** — Gibt Map-Speicher frei
+- ✅ **FNV-1a String Hash** — Für String-Keys
+- ✅ **HashInt64** — Für Integer-Keys
+
+**Implementiert in `bootstrap/std/set.lyx`:**
+- ✅ **Hash-Set:** Wrapper um Hash-Map
+- ✅ **set_new(capacity)** — Erstellt neues Set
+- ✅ **set_add(s, keyPtr, keyLen)** — Fügt Key hinzu
+- ✅ **set_contains(s, keyPtr, keyLen)** — Prüft Key-Existenz
+- ✅ **set_remove(s, keyPtr, keyLen)** — Entfernt Key
+- ✅ **set_len(s)** — Liefert Anzahl Elemente
+- ✅ **set_free(s)** — Gibt Set-Speicher frei
+
+**Verzeichnis-Struktur:** `bootstrap/std/map.lyx`, `bootstrap/std/set.lyx`
 
 **Referenz:** `compiler/ir/ir.pas` (irMapNew..irMapFree, irSetNew..irSetFree)
-
-**Schätzung:** 2 Sessions | **Output:** `std/map.lyx`, `std/set.lyx`
 
 ---
 
@@ -941,7 +953,7 @@ dann in Phase 2 dazu.
 
 ### Phase 4: Erweiterte Features
 - ✅ **WP-26:** Vollständiger Linter (W001–W020) (bootstrap/frontend/linter.lyx)
-- ❌ **WP-27:** Map/Set Collections
+- ✅ **WP-27:** Map/Set Collections (bootstrap/std/map.lyx, set.lyx)
 - ❌ **WP-28:** Statische Analyse
 - ❌ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity)
 - ❌ **WP-30:** Erweiterte Stdlib
