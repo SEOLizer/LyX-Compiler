@@ -1081,6 +1081,93 @@ dann in Phase 2 dazu.
 - ✅ **WP-33:** lyxc.lyx — Vollständiger Compiler in Lyx (bootstrap/lyxc.lyx)
 - ✅ **WP-34:** Vollständiger Singularitäts-Test (bootstrap/tests/singularity_test.lyx)
 
+---
+
+## Offene TODOs (CLI-Parität)
+
+Nachfolgende CLI-Optionen sind im Bootstrap-Compiler (`bootstrap/lyxc.lyx`) noch nicht implementiert.
+Diese müssen ergänzt werden, um vollständige CLI-Parität mit dem FPC-Compiler zu erreichen:
+
+| # | CLI-Option | Beschreibung | Status |
+|---|------------|--------------|--------|
+| 1 | `--arch=ARCH` | Architektur-Override (x86_64, arm64, xtensa, riscv) | **OFFEN** |
+| 2 | `--std-path=PATH` | Stdlib-Pfad überschreiben | **OFFEN** |
+| 3 | `--target-energy=<1-5>` | Energy-Ziel (1=Minimal, 5=Extreme) | **OFFEN** |
+| 4 | `--emit-asm` | IR als Pseudo-Assembler ausgeben | **OFFEN** |
+| 5 | `--asm-listing` | Assembly-Listing mit Source-Zeilen | **OFFEN** |
+| 6 | `--dump-relocs` | Relocations anzeigen | **OFFEN** |
+| 7 | `--trace-imports` | Import-Auflösung debuggen | **OFFEN** |
+| 8 | `--lint-only` | Nur linten, nicht kompilieren | **OFFEN** |
+| 9 | `--no-lint` | Linter deaktivieren (explizit) | **OFFEN** |
+| 10 | `--no-opt` | IR-Optimierungen deaktivieren | **OFFEN** |
+| 11 | `--mcdc` | MC/DC-Instrumentierung | **OFFEN** |
+| 12 | `--mcdc-report` | MC/DC-Coverage-Bericht | **OFFEN** |
+| 13 | `--static-analysis` | Statische Analyse | **OFFEN** |
+| 14 | `--call-graph` | Aufrufgraph ausgeben | **OFFEN** |
+| 15 | `--map-file` | Map-File generieren | **OFFEN** |
+
+### Detail-Beschreibungen
+
+**TODO-1: --arch=ARCH**
+- Überschreibt die Zielarchitektur (unabhängig von --target)
+- Implementierung: Neues Feld `archOverride` in CLIOptions, Parsing in parseLongFlag()
+
+**TODO-2: --std-path=PATH**
+- Überschreibt den Stdlib-Suchpfad
+- Implementierung: Neues Feld `stdPath` in CLIOptions, Verwendung beim Unit-Laden
+
+**TODO-3: --target-energy=<1-5>**
+- Energy-Ziel für Code-Generierung (1=Minimalgröße, 5=Extreme-Performance)
+- Implementierung: Neues Feld `energyTarget` in CLIOptions, Übergabe an Codegen
+
+**TODO-4: --emit-asm**
+- Gibt IR als Pseudo-Assembler aus statt Binary zu erzeugen
+- Implementierung: Text-Ausgabe der IR-Opcodes
+
+**TODO-5: --asm-listing**
+- Generiert .lst-Datei mit Source-Zeilen und Maschinencode
+- Implementierung: Kombination aus Source-Map und asm-Ausgabe
+
+**TODO-6: --dump-relocs**
+- Zeigt alle Relocations und externe Symbole
+- Implementierung: Debug-Output im ELF-Writer
+
+**TODO-7: --trace-imports**
+- Debug-Output für Import-Auflösung (dynamic linking)
+- Implementierung: Verbose-Output in FFI-Parser
+
+**TODO-8: --lint-only**
+- Nur linten, keine Kompilierung
+- Implementierung: Early return nach Linter-Stage
+
+**TODO-9: --no-lint**
+- Explizite Deaktivierung des Linters (auch wenn default on)
+- Implementierung: CLI-Flag überschreibt Default
+
+**TODO-10: --no-opt**
+- IR-Optimierungen deaktivieren
+- Implementierung: optLevel := OPT_NONE erzwingen
+
+**TODO-11: --mcdc**
+- MC/DC-Instrumentierung für Coverage-Analyse
+- Implementierung: Integration mit ir_safety.lyx
+
+**TODO-12: --mcdc-report**
+- Coverage-Bericht nach Kompilierung
+- Implementierung: Statistik-Ausgabe
+
+**TODO-13: --static-analysis**
+- Führt Data-Flow, Live-Vars, Stack-Analyse aus
+- Implementierung: Integration mit ir_analyze.lyx
+
+**TODO-14: --call-graph**
+- Gibt statischen Aufrufgraphen aus
+- Implementierung: Nutzt ir_analyze.lyx (Call-Graph)
+
+**TODO-15: --map-file**
+- Generiert .map-Datei mit Speicherlayout
+- Implementierung: Text-Ausgabe der Section/Symbol-Info
+
 ## ✅ ALLE WORK PACKAGES ABGESCHLOSSEN
 
 ### Priorisierung (MVP-Pfad)
