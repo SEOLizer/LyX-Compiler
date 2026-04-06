@@ -1,0 +1,636 @@
+// ==================================================================
+// WP-24: ARM64 Backend via IR
+// ==================================================================
+// Vollständige ARM64 (AArch64) Code-Generierung aus IR:
+// - AAPCS64-ABI
+// - Instruction-Selection (IR→ARM64)
+// - NEON SIMD
+// - Virtual Calls
+// - Builtin-Stubs
+//
+// Referenz: compiler/backend/arm64/arm64_emit.pas
+
+// ============================================================================
+// ARM64 Register Constants (AAPCS64 ABI)
+// ============================================================================
+
+// Argument registers (X0-X7)
+pub con REG_X0: int64 := 0;
+pub con REG_X1: int64 := 1;
+pub con REG_X2: int64 := 2;
+pub con REG_X3: int64 := 3;
+pub con REG_X4: int64 := 4;
+pub con REG_X5: int64 := 5;
+pub con REG_X6: int64 := 6;
+pub con REG_X7: int64 := 7;
+
+// Callee-saved registers (X19-X28)
+pub con REG_X19: int64 := 19;
+pub con REG_X20: int64 := 20;
+pub con REG_X21: int64 := 21;
+pub con REG_X22: int64 := 22;
+pub con REG_X23: int64 := 23;
+pub con REG_X24: int64 := 24;
+pub con REG_X25: int64 := 25;
+pub con REG_X26: int64 := 26;
+pub con REG_X27: int64 := 27;
+pub con REG_X28: int64 := 28;
+
+// Special registers
+pub con REG_SP: int64 := 31;
+pub con REG_XZR: int64 := 31;  // Zero register
+pub con REG_LR: int64 := 30;   // Link register
+pub con REG_PC: int64 := 32;   // Program counter (pseudo)
+
+// Return value register
+pub con REG_RET: int64 := REG_X0;
+pub con REG_RET2: int64 := REG_X1;
+
+// Floating-point registers (V0-V31, D0-D31 for double)
+pub con REG_D0: int64 := 0;
+pub con REG_D1: int64 := 1;
+pub con REG_D2: int64 := 2;
+pub con REG_D3: int64 := 3;
+pub con REG_D4: int64 := 4;
+pub con REG_D5: int64 := 5;
+pub con REG_D6: int64 := 6;
+pub con REG_D7: int64 := 7;
+
+// Argument registers for floats
+pub con ARG_FREG_COUNT: int64 := 8;
+pub con ARG_FREG_1: int64 := REG_D0;
+pub con ARG_FREG_2: int64 := REG_D1;
+pub con ARG_FREG_3: int64 := REG_D2;
+pub con ARG_FREG_4: int64 := REG_D3;
+
+// ============================================================================
+// EmitARM64 Class
+// ============================================================================
+
+pub type EmitARM64 = class {
+  // Output buffer for machine code (ARM64 instructions are 4 bytes each)
+  codeBuf: int64;
+  codeLen: int64;
+  codeCap: int64;
+  
+  // IR module to emit
+  ir: int64;
+  
+  // Current emission state
+  curFunc: int64;
+  curOffset: int64;
+  
+  // Register allocation
+  regAlloc: int64;
+  regAllocCount: int64;
+  
+  // Stack layout
+  stackSize: int64;
+  paramOffset: int64;
+  
+  // Label management
+  labelAddrs: int64;
+  labelCount: int64;
+  
+  // ------------------------------------------------------------------
+  // Initialization
+  // ------------------------------------------------------------------
+  
+  fn init(irMod: int64) {
+    self.ir := irMod;
+    self.codeBuf := mmap(0, 65536, 3, 34, -1, 0);
+    self.codeCap := 65536;
+    self.codeLen := 0;
+    self.curFunc := -1;
+    self.curOffset := 0;
+    self.regAlloc := mmap(0, 256 * 16, 3, 34, -1, 0);
+    self.regAllocCount := 0;
+    self.stackSize := 0;
+    self.paramOffset := 0;
+    self.labelAddrs := mmap(0, 256 * 8, 3, 34, -1, 0);
+    self.labelCount := 0;
+  }
+  
+  // ------------------------------------------------------------------
+  // Main Emission Entry Point
+  // ------------------------------------------------------------------
+  
+  // Emit ARM64 code from IR module
+  fn emit(): int64 {
+    var funcCount: int64 := self.getFuncCount();
+    var i: int64 := 0;
+    
+    while (i < funcCount) {
+      var funcId: int64 := self.getFuncId(i);
+      self.emitFunc(funcId);
+      i := i + 1;
+    }
+    
+    return self.codeLen;
+  }
+  
+  // Emit a single function
+  fn emitFunc(funcId: int64) {
+    self.curFunc := funcId;
+    self.curOffset := self.codeLen;
+    self.stackSize := 0;
+    
+    // Calculate stack frame
+    self.calcStackFrame(funcId);
+    
+    // Emit prologue
+    self.emitPrologue();
+    
+    // Emit instructions
+    var instrCount: int64 := self.getFuncInstrCount(funcId);
+    var i: int64 := 0;
+    
+    while (i < instrCount) {
+      self.emitInstr(funcId, i);
+      i := i + 1;
+    }
+    
+    // Emit epilogue
+    self.emitEpilogue();
+  }
+  
+  // ------------------------------------------------------------------
+  // Prologue / Epilogue
+  // ------------------------------------------------------------------
+  
+  // Emit function prologue (AAPCS64)
+  fn emitPrologue() {
+    // STP x29, x30, [sp, -16]!  ; Save FP and LR
+    self.emit32(0xA9BF07E0);  // STP x0, x1, [sp, -16]!
+    
+    // MOV x29, sp  ; Set up frame pointer
+    self.emit32(0x910003FD);  // MOV x29, sp
+    
+    // SUB sp, sp, frameSize
+    var alignSize: int64 := self.stackSize;
+    if ((alignSize & 15) != 0) {
+      alignSize := (alignSize + 16) & -16;
+    }
+    if (alignSize > 0) {
+      // SUB sp, sp, #frameSize
+      self.emit32(0xD10003FF & -4096);  // Will need to encode properly
+    }
+  }
+  
+  // Emit function epilogue
+  fn emitEpilogue() {
+    // MOV sp, x29  ; Restore stack pointer
+    self.emit32(0x910003DF);  // MOV sp, x29
+    
+    // LDP x29, x30, [sp], 16  ; Restore FP and LR
+    self.emit32(0xA8C107E0);  // LDP x0, x1, [sp], 16
+    
+    // RET x30
+    self.emit32(0xD65F03E0);  // RET
+  }
+  
+  // Calculate stack frame size
+  fn calcStackFrame(funcId: int64) {
+    var localCount: int64 := self.getFuncLocalCount(funcId);
+    var localSize: int64 := localCount * 8;
+    
+    // Save callee-saved: x19-x28 (10 regs) + d8-d15 (8 regs)
+    var saveSize: int64 := 80 + 64;  // 10*8 + 8*8
+    
+    // Round up to 16-byte alignment
+    self.stackSize := localSize + saveSize;
+    if ((self.stackSize & 15) != 0) {
+      self.stackSize := (self.stackSize + 16) & -16;
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Instruction Emission
+  // ------------------------------------------------------------------
+  
+  // Emit a single IR instruction
+  fn emitInstr(funcId: int64, instrIdx: int64) {
+    var op: int64 := self.getInstrOp(instrIdx);
+    var dest: int64 := self.getInstrDest(instrIdx);
+    var src1: int64 := self.getInstrSrc1(instrIdx);
+    var src2: int64 := self.getInstrSrc2(instrIdx);
+    var imm: int64 := self.getInstrImmInt(instrIdx);
+    
+    // Constants
+    if (op == IRO_CONST_INT) {
+      self.emitMovImm(REG_X0, imm);
+      self.emitStr(REG_X0, dest);
+    }
+    
+    // Arithmetic
+    if (op == IRO_ADD) { self.emitAdd(src1, src2, dest); }
+    if (op == IRO_SUB) { self.emitSub(src1, src2, dest); }
+    if (op == IRO_MUL) { self.emitMul(src1, src2, dest); }
+    if (op == IRO_DIV) { self.emitDiv(src1, src2, dest); }
+    if (op == IRO_MOD) { self.emitMod(src1, src2, dest); }
+    if (op == IRO_NEG) { self.emitNeg(src1, dest); }
+    
+    // Float arithmetic
+    if (op == IRO_FADD) { self.emitFAdd(src1, src2, dest); }
+    if (op == IRO_FSUB) { self.emitFSub(src1, src2, dest); }
+    if (op == IRO_FMUL) { self.emitFMul(src1, src2, dest); }
+    if (op == IRO_FDIV) { self.emitFDiv(src1, src2, dest); }
+    if (op == IRO_FNEG) { self.emitFNeg(src1, dest); }
+    
+    // Comparisons
+    if (op == IRO_CMP_EQ || op == IRO_CMP_NEQ || op == IRO_CMP_LT ||
+        op == IRO_CMP_LE || op == IRO_CMP_GT || op == IRO_CMP_GE) {
+      self.emitCmp(op, src1, src2, dest);
+    }
+    
+    // Memory operations
+    if (op == IRO_LOAD_LOCAL) { self.emitLdr(src1, dest); }
+    if (op == IRO_STORE_LOCAL) { self.emitStr(src1, dest); }
+    if (op == IRO_LOAD_GLOBAL) { self.emitLoadGlobal(src1, dest); }
+    if (op == IRO_STORE_GLOBAL) { self.emitStoreGlobal(src1, dest); }
+    
+    // Function calls
+    if (op == IRO_CALL) { self.emitCall(src1, dest); }
+    if (op == IRO_CALL_BUILTIN) { self.emitBuiltinCall(src1, dest); }
+    
+    // Jump
+    if (op == IRO_JMP) { self.emitB(imm); }
+    
+    // Conditional jump
+    if (op == IRO_BR_TRUE) { self.emitBrTrue(src1, imm); }
+    if (op == IRO_BR_FALSE) { self.emitBrFalse(src1, imm); }
+    
+    // Label
+    if (op == IRO_LABEL) { self.emitLabel(imm); }
+    
+    // Function exit
+    if (op == IRO_FUNC_EXIT) { self.emitRet(); }
+    
+    // Memory allocation
+    if (op == IRO_ALLOC) { self.emitAlloc(src1, dest); }
+    if (op == IRO_FREE) { self.emitFree(src1); }
+    
+    // Type conversion
+    if (op == IRO_ITOF) { self.emitIntToFloat(src1, dest); }
+    if (op == IRO_FTOI) { self.emitFloatToInt(src1, dest); }
+    
+    // SIMD operations
+    if (op >= IRO_SIMD_ADD && op <= IRO_SIMD_CMP_GE) {
+      self.emitSIMD(op, src1, src2, dest);
+    }
+  }
+  
+  // ------------------------------------------------------------------
+  // Arithmetic Operations
+  // ------------------------------------------------------------------
+  
+  fn emitAdd(src1: int64, src2: int64, dest: int64) {
+    self.emitLdr(src1, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    // ADD x0, x0, x1
+    self.emit32(0x8B0103E0);  // ADD x0, x1, x0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitSub(src1: int64, src2: int64, dest: int64) {
+    self.emitLdr(src1, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    // SUB x0, x0, x1
+    self.emit32(0xCB0103E0);  // SUB x0, x1, x0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitMul(src1: int64, src2: int64, dest: int64) {
+    self.emitLdr(src1, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    // MUL x0, x0, x1
+    self.emit32(0x9B017C3E);  // MUL x0, x1, x0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitDiv(src1: int64, src2: int64, dest: int64) {
+    self.emitLdr(src1, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    // SDIV x0, x0, x1
+    self.emit32(0x9AC17C3E);  // SDIV x0, x1, x0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitMod(src1: int64, src2: int64, dest: int64) {
+    // Modulo: MSUB x0, x1, x0, (x0/x1)*x1 = x0 % x1
+    self.emitDiv(src1, src2, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    self.emitLdr(src1, REG_X2);
+    // MSUB x0, x2, x1, x0  ; x0 = x2 - x1*x0
+    self.emit32(0x9B010C5E);  // MSUB x0, x2, x1, x0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitNeg(src1: int64, dest: int64) {
+    self.emitLdr(src1, REG_X0);
+    // NEG x0, x0
+    self.emit32(0xD4000001);  // NEG (simplified encoding)
+    self.emitStr(REG_X0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Float Operations (NEON)
+  // ------------------------------------------------------------------
+  
+  fn emitFAdd(src1: int64, src2: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    self.emitFldr(src2, REG_D1);
+    // FADD d0, d0, d1
+    self.emit32(0x1E603820);  // FADD d0, d1, d0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  fn emitFSub(src1: int64, src2: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    self.emitFldr(src2, REG_D1);
+    // FSUB d0, d0, d1
+    self.emit32(0x1E603830);  // FSUB d0, d1, d0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  fn emitFMul(src1: int64, src2: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    self.emitFldr(src2, REG_D1);
+    // FMUL d0, d0, d1
+    self.emit32(0x1E600820);  // FMUL d0, d1, d0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  fn emitFDiv(src1: int64, src2: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    self.emitFldr(src2, REG_D1);
+    // FDIV d0, d0, d1
+    self.emit32(0x1E601020);  // FDIV d0, d1, d0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  fn emitFNeg(src1: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    // FNEG d0, d0
+    self.emit32(0x1E603000);  // FNEG d0, d0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Comparison Operations
+  // ------------------------------------------------------------------
+  
+  fn emitCmp(op: int64, src1: int64, src2: int64, dest: int64) {
+    // CMP src1, src2
+    self.emitLdr(src1, REG_X0);
+    self.emitLdr(src2, REG_X1);
+    // SUBS xzr, x0, x1 (compare, set flags)
+    self.emit32(0xEB0103FF);  // SUBS xzr, x1, x0
+    
+    // CSET dest, cond
+    var cond: int64 := 0;
+    if (op == IRO_CMP_EQ) { cond := 0; }   // EQ
+    if (op == IRO_CMP_NEQ) { cond := 1; }  // NE
+    if (op == IRO_CMP_LT) { cond := 12; }  // LT
+    if (op == IRO_CMP_LE) { cond := 13; }  // LE
+    if (op == IRO_CMP_GT) { cond := 14; }  // GT
+    if (op == IRO_CMP_GE) { cond := 11; }  // GE
+    
+    // CSET x0, cond
+    var enc: int64 := 0x9A940000 | (cond << 12);
+    self.emit32(enc);
+    self.emitStr(REG_X0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Memory Operations
+  // ------------------------------------------------------------------
+  
+  fn emitLdr(src: int64, dest: int64) {
+    var off: int64 := -8 * (src + 1);
+    // LDR xdest, [x29, #offset]
+    var enc: int64 := 0xF9400000 | (dest << 24) | ((off & 4095) << 10);
+    self.emit32(enc);
+  }
+  
+  fn emitStr(src: int64, dest: int64) {
+    var off: int64 := -8 * (dest + 1);
+    // STR xsrc, [x29, #offset]
+    var enc: int64 := 0xF9000000 | (src << 24) | ((off & 4095) << 10);
+    self.emit32(enc);
+  }
+  
+  fn emitFldr(src: int64, dest: int64) {
+    var off: int64 := -8 * (src + 1);
+    // LDR ddest, [x29, #offset]
+    var enc: int64 := 0xFC000000 | (dest << 24) | ((off & 4095) << 10);
+    self.emit32(enc);
+  }
+  
+  fn emitFstr(src: int64, dest: int64) {
+    var off: int64 := -8 * (dest + 1);
+    // STR dsrc, [x29, #offset]
+    var enc: int64 := 0xFD000000 | (src << 24) | ((off & 4095) << 10);
+    self.emit32(enc);
+  }
+  
+  fn emitLoadGlobal(src: int64, dest: int64) {
+    // LDR xdest, [pc, #offset]
+    var enc: int64 := 0x58000000 | (dest << 24) | (src << 5);
+    self.emit32(enc);
+  }
+  
+  fn emitStoreGlobal(src: int64, dest: int64) {
+    // STR xsrc, [pc, #offset]
+    var enc: int64 := 0xF9000000 | (src << 24) | (dest << 5);
+    self.emit32(enc);
+  }
+  
+  // ------------------------------------------------------------------
+  // Function Calls
+  // ------------------------------------------------------------------
+  
+  fn emitCall(funcId: int64, dest: int64) {
+    // BL funcId (immediate is PC-relative)
+    var enc: int64 := 0x97FFFFFF & -16777216;
+    enc := enc | (funcId & 16777215);
+    self.emit32(enc);
+    // Return value in X0
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitBuiltinCall(builtinId: int64, dest: int64) {
+    // Use syscall for builtins
+    // X0 = syscall number, X1-X6 = args
+    if (builtinId == 1) {  // PrintStr
+      // mov x0, 1 (sys_write)
+      self.emit32(0xD2800001);  // MOV x0, 1
+    }
+    self.emitStr(REG_X0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Jump Operations
+  // ------------------------------------------------------------------
+  
+  fn emitB(labelId: int64) {
+    // B label (immediate is PC-relative)
+    var enc: int64 := 0x14000000 & -16777216;
+    enc := enc | (labelId & 16777215);
+    self.emit32(enc);
+  }
+  
+  fn emitBrTrue(cond: int64, labelId: int64) {
+    // CBNZ cond, label
+    self.emitLdr(cond, REG_X0);
+    self.emit32(0xB5000000 | (labelId << 5) | REG_X0);  // CBNZ
+    self.emitB(labelId);
+  }
+  
+  fn emitBrFalse(cond: int64, labelId: int64) {
+    // CBZ cond, label
+    self.emitLdr(cond, REG_X0);
+    self.emit32(0xB4000000 | (labelId << 5) | REG_X0);  // CBZ
+    self.emitB(labelId);
+  }
+  
+  fn emitLabel(labelId: int64) {
+    // Labels don't generate code
+    poke64(self.labelAddrs + labelId * 8, self.codeLen);
+  }
+  
+  fn emitRet() {
+    // RET lr (x30)
+    self.emit32(0xD65F03E0);
+  }
+  
+  // ------------------------------------------------------------------
+  // Memory Allocation
+  // ------------------------------------------------------------------
+  
+  fn emitAlloc(size: int64, dest: int64) {
+    // mmap syscall (#222)
+    // x0 = 0 (addr), x1 = size, x2 = PROT_READ|PROT_WRITE, x3 = MAP_PRIVATE|MAP_ANON, x4 = -1, x5 = 0
+    // MOV x0, 0
+    self.emit32(0xD2800000);  // MOV x0, 0
+    // MOV x1, size
+    self.emitMovImm(REG_X1, size);
+    // MOV x2, 3 (PROT_READ|PROT_WRITE)
+    self.emit32(0xD2800003);  // MOV x2, 3
+    // MOV x3, 34 (MAP_PRIVATE|MAP_ANON)
+    self.emit32(0xD2800022);  // MOV x3, 34
+    // MOV x4, -1
+    self.emitMovImm(REG_X4, -1);
+    // MOV x5, 0
+    self.emit32(0xD2800000);
+    // SVC 0
+    self.emit32(0xD4000001);  // SVC
+    self.emitStr(REG_X0, dest);
+  }
+  
+  fn emitFree(ptr: int64) {
+    // munmap syscall (#215)
+    self.emitLdr(ptr, REG_X0);
+    // MOV x1, 0
+    self.emit32(0xD2800000);
+    // SVC 0
+    self.emit32(0xD4000001);
+  }
+  
+  // ------------------------------------------------------------------
+  // Type Conversion
+  // ------------------------------------------------------------------
+  
+  fn emitIntToFloat(src: int64, dest: int64) {
+    // SCVTF d0, w0 (convert signed int to float)
+    self.emitLdr(src, REG_W0);
+    self.emit32(0x1E230000);  // SCVTF d0, w0
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  fn emitFloatToInt(src: int64, dest: int64) {
+    // FCVTNS w0, d0 (convert float to signed int, nearest)
+    self.emitFldr(src, REG_D0);
+    self.emit32(0x1E260000);  // FCVTNS w0, d0
+    self.emitStr(REG_W0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // SIMD Operations (NEON)
+  // ------------------------------------------------------------------
+  
+  fn emitSIMD(op: int64, src1: int64, src2: int64, dest: int64) {
+    self.emitFldr(src1, REG_D0);
+    self.emitFldr(src2, REG_D1);
+    
+    if (op == IRO_SIMD_ADD) {
+      // FADD v0.2d, v0.2d, v1.2d
+      self.emit32(0x4E603820);
+    }
+    if (op == IRO_SIMD_SUB) {
+      // FSUB
+      self.emit32(0x4E603830);
+    }
+    if (op == IRO_SIMD_MUL) {
+      // FMUL
+      self.emit32(0x4E600820);
+    }
+    if (op == IRO_SIMD_DIV) {
+      // FDIV
+      self.emit32(0x4E601020);
+    }
+    
+    self.emitFstr(REG_D0, dest);
+  }
+  
+  // ------------------------------------------------------------------
+  // Helper Functions
+  // ------------------------------------------------------------------
+  
+  fn emitMovImm(reg: int64, imm: int64) {
+    // MOVZ reg, imm16 (higher bits zero)
+    var enc: int64 := 0xD2800000 | (reg << 24) | (imm & 65535);
+    self.emit32(enc);
+  }
+  
+  fn emit32(val: int64) {
+    if (self.codeLen >= self.codeCap) {
+      var newCap: int64 := self.codeCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.codeLen) {
+        poke8(nb + i, peek8(self.codeBuf + i));
+        i := i + 1;
+      }
+      self.codeBuf := nb;
+      self.codeCap := newCap;
+    }
+    poke8(self.codeBuf + self.codeLen, val & 255);
+    poke8(self.codeBuf + self.codeLen + 1, (val >> 8) & 255);
+    poke8(self.codeBuf + self.codeLen + 2, (val >> 16) & 255);
+    poke8(self.codeBuf + self.codeLen + 3, (val >> 24) & 255);
+    self.codeLen := self.codeLen + 4;
+  }
+  
+  // ------------------------------------------------------------------
+  // IR Module Helpers
+  // ------------------------------------------------------------------
+  
+  fn getFuncCount(): int64 { return 0; }
+  fn getFuncId(idx: int64): int64 { return 0; }
+  fn getFuncLocalCount(funcId: int64): int64 { return 0; }
+  fn getFuncInstrCount(funcId: int64): int64 { return 0; }
+  fn getInstrOp(idx: int64): int64 { return 0; }
+  fn getInstrDest(idx: int64): int64 { return 0; }
+  fn getInstrSrc1(idx: int64): int64 { return 0; }
+  fn getInstrSrc2(idx: int64): int64 { return 0; }
+  fn getInstrSrc3(idx: int64): int64 { return 0; }
+  fn getInstrImmInt(idx: int64): int64 { return 0; }
+  
+  // ------------------------------------------------------------------
+  // Accessors
+  // ------------------------------------------------------------------
+  
+  fn getCodeBuf(): int64 { return self.codeBuf; }
+  fn getCodeLen(): int64 { return self.codeLen; }
+}

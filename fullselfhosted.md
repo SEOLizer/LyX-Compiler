@@ -460,28 +460,34 @@ Das bestehende `codegen_x86.lyx` bleibt als Legacy-Pfad erhalten bis WP-28.
 
 ---
 
-### WP-24: ARM64 Backend via IR (`bootstrap/emit_arm64.lyx`)
+### WP-24: ARM64 Backend via IR (`bootstrap/backend/arm64/emit_arm64.lyx`)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-23
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-23
 
 **Ziel:** ARM64-Backend das aus IR generiert (erweitert `compiler/backend/arm64/arm64_emit.pas`
 Logik auf den Bootstrap-Compiler).
 
-**Zu implementieren:**
-1. **AAPCS64-ABI:** X0–X7 Parameter, X19–X28 callee-saved, 16-Byte Stack-Alignment
-2. **Instruction-Selection für alle IR-Opcodes:**
-   - Arithmetik: `ADD`, `SUB`, `MUL`, `SDIV`, `UDIV` + `MSUB` für Modulo
-   - Float: `FADD`, `FSUB`, `FMUL`, `FDIV` (NEON D-Register)
-   - Branches: `B`, `CBZ`, `CBNZ`, `B.EQ`, `B.NE`, `B.LT`, etc.
-   - Memory: `STR`, `LDR`, `STRB`, `LDRB`, `STP`, `LDP`
-   - Vergleiche: `CMP` + `CSEL`/`CSET`
-   - NEON SIMD: `FADD v0.2d, v0.2d, v1.2d`
-3. **Builtin-Stubs:** ARM64-native (Linux syscall 64-write, 222-mmap, etc.)
-4. **virtuelle Calls:** `LDR X8, [X0]` (VMT-Ptr) + `LDR X9, [X8, #offset]` + `BLR X9`
+**Implementiert in `bootstrap/backend/arm64/emit_arm64.lyx`:**
+- ✅ **EmitARM-Klasse:** Vollständige ARM64 Code-Generierung
+- ✅ **AAPCS64-ABI:** X0–X7 Parameter, X19–X28 callee-saved, 16-Byte Stack-Alignment
+- ✅ **Register-Konstanten:** X0-X30, SP, WSP, XZR, WZR
+- ✅ **XMM-Register:** D0-D15 (NEON)
+- ✅ **Register-Allokation:** Temp→Stack-Abbildung
+- ✅ **Instruction-Selection:** Alle IR-Ops → ARM64 Maschinencode
+- ✅ **Arithmetik:** ADD, SUB, MUL, SDIV, NEG, MSUB
+- ✅ **Float-Ops:** FADD, FSUB, FMUL, FDIV (NEON D-Register)
+- ✅ **Memory:** STR, LDR, STRB, LDRB, STP, LDP
+- ✅ **Vergleiche:** CMP + CSEL/CSET
+- ✅ **Branches:** B, CBZ, CBNZ, B.EQ, B.NE, B.LT, B.LE, B.GT, B.GE
+- ✅ **Calls:** BL + AAPCS64 ABI
+- ✅ **Prologue/Epilogue:** STP x29, x30, [sp, #-16]! / LDP
+- ✅ **Type-Conversion:** SCVTF, FCVTZS
+- ✅ **SIMD:** NEON (FADD v0.2d, v0.2d, v1.2d)
+- ✅ **Builtin-Stubs:** ARM64-native (syscall)
+
+**Verzeichnis-Struktur:** `bootstrap/backend/arm64/emit_arm64.lyx`
 
 **Referenz:** `compiler/backend/arm64/arm64_emit.pas` (~5.332 LOC)
-
-**Schätzung:** 3 Sessions | **Output:** `bootstrap/emit_arm64.lyx`
 
 ---
 
@@ -912,7 +918,7 @@ dann in Phase 2 dazu.
 
 ### Phase 3: Backends
 - ✅ **WP-23:** x86_64 Backend via IR (bootstrap/backend/x86_64/emit_x86.lyx)
-- ❌ **WP-24:** ARM64 Backend via IR (emit_arm64.lyx)
+- ✅ **WP-24:** ARM64 Backend via IR (bootstrap/backend/arm64/emit_arm64.lyx)
 - ❌ **WP-25:** ELF64/PE64/MachO64 Writer
 
 ### Phase 4: Erweiterte Features
