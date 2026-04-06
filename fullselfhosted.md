@@ -982,8 +982,8 @@ dann in Phase 2 dazu.
 - ✅ **WP-26:** Vollständiger Linter (W001–W020) (bootstrap/frontend/linter.lyx)
 - ✅ **WP-27:** Map/Set Collections (bootstrap/std/map.lyx, set.lyx)
 - ✅ **WP-28:** Statische Analyse (bootstrap/ir/ir_analyze.lyx)
-- ❌ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity)
-- ❌ **WP-30:** Erweiterte Stdlib
+- ✅ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity) (bootstrap/ir/ir_safety.lyx)
+- ✅ **WP-30:** Erweiterte Stdlib (bootstrap/std/*.lyx)
 - ❌ **WP-31:** C FFI & Externes Linking
 - ❌ **WP-32:** RISC-V + Embedded Backends
 
