@@ -917,12 +917,12 @@ begin
     // Calculate total slots (locals + temporaries)
     // maxTemp is the highest temp index used, so we need maxTemp + 1 slots for temps
     totalSlots := fn.LocalCount + maxTemp + 1;
-    
+
     // For large struct returns, add one extra slot for the sret pointer
     // The sret slot will be at index 'totalSlots' (before incrementing)
     if fn.ReturnStructSize > 16 then
       Inc(totalSlots);
-    
+
     // Stack-Frame für lokale Variablen und Temporaries
     if totalSlots > 0 then
     begin
