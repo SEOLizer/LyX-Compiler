@@ -407,21 +407,20 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ### WP-22: Function Inlining
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-21
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-21
 
 **Ziel:** Inline-Expansion kleiner Funktionen für Performance.
 
-**Zu implementieren in `bootstrap/ir_inline.lyx`:**
-1. **Inline-Heuristik:** Threshold (z.B. ≤20 Instruktionen) + keine Rekursion
-2. **Inline-Expansion:** Kopiere IR-Instruktionen der Callee, ersetze `irFuncExit` durch
-   Sprung zur Fortsetzung, ersetze Parameter durch Argumente
-3. **Label-Umbenennung:** Eindeutige Labels nach Inline (Suffix `_inl_N`)
-4. **Call-Graph-Analyse:** Erkenne rekursive Funktionen (nicht inlinen)
-5. **@noinline-Pragma:** Respektiere Benutzer-Anweisung
+**Implementiert in `bootstrap/ir_inline.lyx`:**
+- ✅ **IRInline-Klasse:** Function-Inlining-Optimierung
+- ✅ **Inline-Heuristik:** Threshold (≤20 Instruktionen) + keine Rekursion
+- ✅ **Inline-Expansion:** Kopiere IR-Instruktionen, ersetze Returns durch Sprünge
+- ✅ **Label-Umbenennung:** Eindeutige Labels nach Inline (`genUniqueLabel`)
+- ✅ **Call-Graph-Analyse:** `buildCallGraph`, `canReach` für Zykluserkennung
+- ✅ **Rekursions-Erkennung:** `markRecursiveFuncs` verhindert Inlining rekursiver Funktionen
+- ✅ **@noinline-Pragma:** `addNoinline`, `isNoinline` Funktionen
 
 **Referenz:** `compiler/ir/ir_inlining.pas` (~320 LOC)
-
-**Schätzung:** 1 Session | **Output:** `bootstrap/ir_inline.lyx`
 
 ---
 
@@ -906,7 +905,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-19:** AST→IR Lowering (Basis) — Abgeschlossen
 - ✅ **WP-20:** AST→IR Lowering (OOP, Structs, Generics) — Abgeschlossen
 - ✅ **WP-21:** IR-Optimierungen in Lyx — Abgeschlossen
-- ❌ **WP-22:** Function Inlining
+- ✅ **WP-22:** Function Inlining — Abgeschlossen
 
 ### Phase 3: Backends
 - ❌ **WP-23:** x86_64 Backend via IR (emit_x86.lyx)
