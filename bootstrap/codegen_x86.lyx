@@ -181,6 +181,13 @@ pub type Codegen = class {
   classCount:   int64;
   classCap:     int64;
 
+  // Enum layout table (BUG-08: enum tag analysis for match)
+  // Each entry: {namePtr:8, nameLen:8, variantsPtr:8, variantCnt:8} = 32 bytes
+  // Each variant: {namePtr:8, nameLen:8, tagValue:8, payloadSize:8} = 32 bytes
+  enumLayouts:  int64;
+  enumCount:    int64;
+  enumCap:      int64;
+
   // Per-local type tracking (parallel to locals, {typePtr:8, typeLen:8} each)
   localTypes:   int64;
 
@@ -1188,6 +1195,90 @@ pub type Codegen = class {
     self.classCount := self.classCount + 1;
     // Track temporary field array for later cleanup (BUG-02)
     self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
+  }
+
+  // BUG-08: Build enum variant layout for match tag analysis
+  // Enum layout: {namePtr:8, nameLen:8, variantsPtr:8, variantCnt:8}
+  // Each variant: {namePtr:8, nameLen:8, tagValue:8, payloadSize:8} = 32 bytes
+  fn cg_buildEnumLayout(ni: int64) {
+    var enumName: pchar := self.cg_nsval(ni);
+    var enumLen:  int64 := self.cg_nslen(ni);
+    // Count variants (child0 chain)
+    var variantNode: int64 := self.cg_nc0(ni);
+    var cnt: int64 := 0;
+    var tmp: int64 := variantNode;
+    while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
+    // Allocate variant array: 32 bytes per variant
+    var vars: int64 := mmap(0, cnt * 32, 3, 34, -1, 0);
+    var i: int64 := 0;
+    tmp := variantNode;
+    while (tmp != -1) {
+      var vb: int64 := vars + i * 32;
+      poke64(vb,      self.cg_nsval(tmp) as int64);   // variant name
+      poke64(vb + 8,  self.cg_nslen(tmp));             // variant name len
+      poke64(vb + 16, i);                              // tag value = index
+      // Payload size: count children of variant (NK_PATTERN_BIND etc.)
+      var payloadCnt: int64 := 0;
+      var pc: int64 := self.cg_nc0(tmp);
+      while (pc != -1) { payloadCnt := payloadCnt + 1; pc := self.cg_nnext(pc); }
+      poke64(vb + 24, payloadCnt);
+      i := i + 1;
+      tmp := self.cg_nnext(tmp);
+    }
+    // Grow enum table if needed
+    if (self.enumCount >= self.enumCap) {
+      var nc: int64 := self.enumCap * 2;
+      var nb: int64 := mmap(0, nc * 32, 3, 34, -1, 0);
+      var ii: int64 := 0;
+      while (ii < self.enumCount * 32) {
+        poke8(nb + ii, peek8(self.enumLayouts + ii));
+        ii := ii + 1;
+      }
+      munmap(self.enumLayouts, self.enumCap * 32);
+      self.enumLayouts := nb;
+      self.enumCap := nc;
+    }
+    var base: int64 := self.enumLayouts + self.enumCount * 32;
+    poke64(base,      enumName as int64);
+    poke64(base + 8,  enumLen);
+    poke64(base + 16, vars);
+    poke64(base + 24, cnt);
+    self.enumCount := self.enumCount + 1;
+  }
+
+  // BUG-08: Find enum layout by name, return index or -1
+  fn cg_findEnum(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.enumCount) {
+      var base: int64 := self.enumLayouts + i * 32;
+      var p: pchar := peek64(base) as pchar;
+      var n: int64 := peek64(base + 8);
+      if (n == nlen && self.cg_seq(p, n, name, nlen)) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // BUG-08: Find variant tag value within enum by variant name
+  // Returns {tagValue: low 32 bits, payloadSize: high 32 bits} packed in int64
+  fn cg_findEnumVariant(enumIdx: int64, varName: pchar, varLen: int64): int64 {
+    if (enumIdx < 0) { return -1; }
+    var ebase: int64 := self.enumLayouts + enumIdx * 32;
+    var vars: int64 := peek64(ebase + 16);
+    var vcnt: int64 := peek64(ebase + 24);
+    var i: int64 := 0;
+    while (i < vcnt) {
+      var vb: int64 := vars + i * 32;
+      var p: pchar := peek64(vb) as pchar;
+      var n: int64 := peek64(vb + 8);
+      if (n == varLen && self.cg_seq(p, n, varName, varLen)) {
+        var tagVal: int64 := peek64(vb + 16);
+        var paySz:  int64 := peek64(vb + 24);
+        return tagVal + (paySz << 32);
+      }
+      i := i + 1;
+    }
+    return -1;
   }
 
   fn cg_getLocalClassIdx(varName: pchar, varLen: int64): int64 {
@@ -2629,10 +2720,81 @@ pub type Codegen = class {
           defaultCaseNode := caseCur;
         }
       } else if (patKind == CGN_PATTERN_ENUM) {
-        // WP-15: Enum payload pattern: Ok(value) or Err(msg)
+        // BUG-08: Enum payload pattern: Ok(value) or Err(msg)
         // sval = enum variant name, c0 = binding pattern for payload
-        // For now, treat as wildcard (full enum support would need enum tag analysis)
-        defaultCaseNode := caseCur;
+        var varName: pchar := self.cg_nsval(patNode);
+        var varLen: int64 := self.cg_nslen(patNode);
+
+        // Find the variant tag across all enums
+        var foundTag: int64 := -1;
+        var payloadSize: int64 := 0;
+        var ei: int64 := 0;
+        while (ei < self.enumCount) {
+          var tagInfo: int64 := self.cg_findEnumVariant(ei, varName, varLen);
+          if (tagInfo >= 0) {
+            foundTag := tagInfo & 0xFFFFFFFF;
+            payloadSize := tagInfo >> 32;
+            break;
+          }
+          ei := ei + 1;
+        }
+
+        if (foundTag >= 0) {
+          // Load subject value (tag is in lower 32 bits)
+          self.cg_loadRax(matchOff);
+          self.cg_pushRax();  // save subject for payload extraction
+
+          // Compare subject tag with variant tag
+          // mov rax, subject_tag (already in rax)
+          // cmp rax, foundTag
+          self.cg_e8(0x48); self.cg_e8(0x3D);
+          self.cg_e32(foundTag);
+          // jne skip_case
+          self.cg_e8(0x0F); self.cg_e8(0x85);
+          var jnePos: int64 := self.codeLen;
+          self.cg_e32(0);
+
+          // Tags match — extract payload bindings if present
+          var bindPat: int64 := self.cg_nc0(patNode);
+          var bindIdx: int64 := 0;
+          while (bindPat != -1) {
+            var bindName: pchar := self.cg_nsval(bindPat);
+            var bindLen: int64 := self.cg_nslen(bindPat);
+            // Payload is at subject + 8 (after tag) + bindIdx * 8
+            self.cg_popRax();
+            self.cg_pushRax();
+            // mov rax, [rax + 8 + bindIdx*8]
+            var payOff: int64 := 8 + bindIdx * 8;
+            if (payOff <= 127) {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40);
+              self.cg_e8(payOff);
+            } else {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80);
+              self.cg_e32(payOff);
+            }
+            // Store payload value in local variable
+            var bindLocalOff: int64 := self.cg_addLocal(bindName, bindLen);
+            self.cg_storeRax(bindLocalOff);
+            self.cg_pushRax();  // restore subject for next binding
+            bindIdx := bindIdx + 1;
+            bindPat := self.cg_nnext(bindPat);
+          }
+          self.cg_popRax();  // discard saved subject
+
+          // Execute case body
+          self.cg_genExpr(bodyNode);
+          // Implicit jmp to match_end
+          self.cg_e8(0xE9);
+          var bp: int64 := self.codeLen;
+          self.cg_e32(self.curBreakHead);
+          self.curBreakHead := bp;
+
+          // Patch jne to next case
+          poke32(self.code + jnePos, self.codeLen - jnePos - 4);
+        } else {
+          // Unknown variant — treat as wildcard/default
+          defaultCaseNode := caseCur;
+        }
       } else {
         // Load subject value, compare with pattern
         self.cg_loadRax(matchOff);
@@ -3075,6 +3237,9 @@ pub type Codegen = class {
       } else if (k == CGN_STRUCT_DECL) {
         // Standalone struct declaration: register field layout (fields at offset 0)
         self.cg_buildStructLayout(cur);
+      } else if (k == CGN_ENUM_DECL) {
+        // BUG-08: Enum declaration: register variant layout for match analysis
+        self.cg_buildEnumLayout(cur);
       } else if (k == CGN_CON_DECL) {
         // Populate constant table for use inside method bodies
         var initNode: int64 := self.cg_nc1(cur);
@@ -3143,6 +3308,11 @@ pub type Codegen = class {
     self.classCap    := 16;
     self.classLayouts := mmap(0, self.classCap * CG_CLASS_SZ, 3, 34, -1, 0);
     self.classCount  := 0;
+
+    // BUG-08: Enum layout table for match tag analysis
+    self.enumCap     := 16;
+    self.enumLayouts := mmap(0, self.enumCap * 32, 3, 34, -1, 0);
+    self.enumCount   := 0;
 
     // Local type tracking (parallel to locals)
     self.localTypes  := mmap(0, self.localCap * 16, 3, 34, -1, 0);
