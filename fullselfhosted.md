@@ -59,7 +59,7 @@ Nachfolgende Features sind noch nicht im Bootstrap-Compiler implementiert:
 | # | Feature | Beschreibung | Aufwand | Status |
 |---|---------|--------------|---------|--------|
 | 1 | `--no-opt` | IR-Optimierungen deaktivieren | 1 Tag | ✅ Erledigt |
-| 2 | `--lint-only` | Nur linten, nicht kompilieren | 1 Tag | |
+| 2 | `--lint-only` | Nur linten, nicht kompilieren | 1 Tag | ✅ Erledigt |
 | 3 | `--no-lint` | Linter deaktivieren (explizit) | 1 Tag | |
 | 4 | `--std-path=PATH` | Stdlib-Pfad überschreiben | 1 Tag | |
 | 5 | `--arch=ARCH` | Architektur-Override | 2 Tage | |
@@ -84,7 +84,7 @@ Nachfolgende Features sind noch nicht im Bootstrap-Compiler implementiert:
 | 14 | `--call-graph` | Aufrufgraph ausgeben | 3-5 Tage |
 | 15 | `--map-file` | Map-File generieren | 2-3 Tage |
 
-### Gesamt: ~39-49 Tage
+### Gesamt: ~38-48 Tage
 
 ---
 
