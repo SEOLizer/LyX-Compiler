@@ -791,20 +791,40 @@ bootstrap/backend/
 
 ### WP-33: lyxc.lyx — Vollständiger Compiler in Lyx
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11–WP-31
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-11–WP-31
 
 **Ziel:** `lyxc.lyx` — der vollständige Self-Hosted-Compiler als einzelne Lyx-Datei/Modul-Suite.
 Dies ist das Herzstück: der Compiler kompiliert sich selbst vollständig.
 
-**Zu implementieren:**
-1. **Entry Point:** `bootstrap/lyxc.lyx` (Ersetzt `lyxc_mini.lyx`)
-   - Kommandozeilen-Parsing (--target, --opt, --output, --lint, etc.)
-   - Pipeline-Orchestrierung (Lexer → Parser → Sema → Linter → IR → Optimize → Emit → Write)
-2. **Multi-Target-Dispatch:** Basierend auf `--target` → Auswahl des richtigen Emitters + Writers
-3. **Unit-Cache:** Bereits kompilierte Module nicht zweimal verarbeiten
-4. **Incremental Compilation:** Timestamps prüfen, nur geänderte Module neu kompilieren
-5. **Fehlerbehandlung:** Vollständige Fehler-Recovery mit Zeile/Spalte + Source-Kontext
-6. **Verbose-Modus:** `--dump-ir`, `--dump-asm`, `--list` für Debugging
+**Implementiert in `bootstrap/lyxc.lyx`:**
+- ✅ **Entry Point:** Kommandozeilen-Parsing (--target, --opt, --output, --lint, etc.)
+- ✅ **Pipeline-Orchestrierung:** Lexer → Parser → Sema → Linter → IR → Optimize → Emit → Write
+- ✅ **Multi-Target-Dispatch:** x86_64, arm64, riscv64, arm_cm Basierend auf `--target`
+- ✅ **Unit-Cache:** Bereits kompilierte Module werden nicht zweimal verarbeitet
+- ✅ **Incremental Compilation:** Timestamps prüfen, nur geänderte Module neu kompilieren
+- ✅ **Fehlerbehandlung:** Vollständige Fehler-Recovery mit Zeile/Spalte + Source-Kontext
+- ✅ **Verbose-Modus:** `--dump-ir`, `--dump-asm`, `--list` für Debugging
+
+**Unterstützte Targets:**
+- x86_64-linux-elf (Standard)
+- arm64-linux-elf
+- riscv64-linux-elf
+- arm_cm-stm32-elf
+
+**CLI Optionen:**
+- `--target=<arch>` - Zielarchitektur
+- `--format=<fmt>` - Ausgabeformat (elf, pe, macho)
+- `--opt=<level>` - Optimierung (O0, O1, O2, O3, Osafe)
+- `--lint` - Linter aktivieren
+- `--debug` - Debug-Info
+- `--verbose` - Ausführliche Ausgabe
+- `--dump-lexer` - Lexer-Output
+- `--dump-parser` - AST-Output
+- `--dump-sema` - Sema-Output
+- `--dump-ir` - IR-Output
+- `--dump-asm` - Assembly-Output
+- `--list` - Listing generieren
+- `--version`, `--help`, `--build-info`, `--config`
 
 **Schätzung:** 3 Sessions | **Output:** `bootstrap/lyxc.lyx`
 
@@ -1035,7 +1055,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-32:** RISC-V + Embedded Backends (bootstrap/backend/riscv/, arm_cm/)
 
 ### Phase 5: Volle Selbst-Kompilierung
-- ❌ **WP-33:** lyxc.lyx — Vollständiger Compiler in Lyx
+- ✅ **WP-33:** lyxc.lyx — Vollständiger Compiler in Lyx (bootstrap/lyxc.lyx)
 - ❌ **WP-34:** Vollständiger Singularitäts-Test
 
 ### Priorisierung (MVP-Pfad)
