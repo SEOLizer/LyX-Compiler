@@ -1,0 +1,577 @@
+// ==================================================================
+// WP-32: ARM Cortex-M Backend (Thumb-2)
+// ==================================================================
+// ARM Cortex-M (Thumb-2) Instruction Emitter
+// - Thumb-2 Instructions: PUSH, POP, MOV, ADD, BL, BX, LDR, STR
+// - Memory-Map: Stack bei 0x20000000, Code bei 0x08000000 (STM32)
+// - ELF32 Writer: write_elf32.lyx
+//
+// Referenz: compiler/backend/arm_cm/arm_cm_emit.pas
+
+import bootstrap.std.io;
+
+// ============================================================================
+// ARM Cortex-M Constants
+// ============================================================================
+
+// Core Registers
+pub con R0: int64 := 0;
+pub con R1: int64 := 1;
+pub con R2: int64 := 2;
+pub con R3: int64 := 3;
+pub con R4: int64 := 4;
+pub con R5: int64 := 5;
+pub con R6: int64 := 6;
+pub con R7: int64 := 7;
+pub con R8: int64 := 8;
+pub con R9: int64 := 9;
+pub con R10: int64 := 10;
+pub con R11: int64 := 11;
+pub con R12: int64 := 12;
+pub con SP: int64 := 13;
+pub con LR: int64 := 14;
+pub con PC: int64 := 15;
+
+// ARM Conditions
+pub con COND_EQ: int64 := 0;   // Equal
+pub con COND_NE: int64 := 1;   // Not equal
+pub con COND_CS: int64 := 2;   // Carry set
+pub con COND_CC: int64 := 3;   // Carry clear
+pub con COND_MI: int64 := 4;   // Minus/negative
+pub con COND_PL: int64 := 5;   // Plus/positive
+pub con COND_VS: int64 := 6;   // Overflow
+pub con COND_VC: int64 := 7;   // No overflow
+pub con COND_HI: int64 := 8;   // Unsigned higher
+pub con COND_LS: int64 := 9;   // Unsigned lower or same
+pub con COND_GE: int64 := 10;  // Greater or equal
+pub con COND_LT: int64 := 11;  // Less than
+pub con COND_GT: int64 := 12;  // Greater than
+pub con COND_LE: int64 := 13;  // Less or equal
+pub con COND_AL: int64 := 14;  // Always
+pub con COND_NV: int64 := 15;  // Never
+
+// Memory Map (STM32)
+pub con FLASH_BASE: int64 := 134217728;     // 0x08000000
+pub con RAM_BASE: int64 := 536870912;       // 0x20000000
+pub con STACK_TOP: int64 := 536879104;      // 0x20000400 (8KB RAM)
+
+// Instruction Encoding
+pub con T1_OP_MASK: int64 := 0xF800;       // 16-bit Thumb
+pub con T2_OP_MASK: int64 := 0xF800;       // 32-bit Thumb-2 first half
+
+// ============================================================================
+// ARM Cortex-M Emitter Class
+// ============================================================================
+
+pub type ARMCMEmitter = class {
+  // Output buffer
+  code: int64;
+  codeSize: int64;
+  codeCap: int64;
+  codePos: int64;
+  
+  // Labels
+  labels: int64;
+  labelAddrs: int64;
+  
+  // Current state
+  currentFunc: int64;
+  stackFrameSize: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(ARMCMEmitter));
+    
+    self.code := mmap(65536, 1);
+    self.codeSize := 0;
+    self.codeCap := 65536;
+    self.codePos := 0;
+    
+    self.labels := map_new(64);
+    self.labelAddrs := map_new(64);
+    
+    self.currentFunc := 0;
+    self.stackFrameSize := 0;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Code Emission
+  // ---------------------------------------------------------------------------
+  
+  fn emitHalf(h: int64): void {
+    if self.codePos + 2 > self.codeCap {
+      return;
+    }
+    poke16(self.code + self.codePos, h & 65535);
+    self.codePos := self.codePos + 2;
+  }
+  
+  fn emitWord(w: int64): void {
+    if self.codePos + 4 > self.codeCap {
+      return;
+    }
+    poke32(self.code + self.codePos, w);
+    self.codePos := self.codePos + 4;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // T1: 16-bit Thumb Instructions
+  // ---------------------------------------------------------------------------
+  
+  // MOVS Rd, #imm8
+  fn emitMOVS_Rd_imm8(rd: int64, imm: int64): void {
+    // 00100 0sd ddddd iiiiiii
+    var instr: int64 := 0x2000;
+    instr := instr | ((rd & 7) << 8);
+    instr := instr | (imm & 255);
+    self.emitHalf(instr);
+  }
+  
+  // MOVS Rd, Rm
+  fn emitMOVS_Rd_Rm(rd: int64, rm: int64): void {
+    // 01000110ddddmmm
+    var instr: int64 := 0x46C0;
+    instr := instr | ((rd & 15) << 8);
+    instr := instr | (rm & 15);
+    self.emitHalf(instr);
+  }
+  
+  // ADDS Rd, Rn, #imm3
+  fn emitADDS_Rd_Rn_imm3(rd: int64, rn: int64, imm: int64): void {
+    // 00011210dddddnnniii
+    var instr: int64 := 0x1C00;
+    instr := instr | ((rd & 7) << 8);
+    instr := instr | ((rn & 7) << 6);
+    instr := instr | (imm & 7);
+    self.emitHalf(instr);
+  }
+  
+  // ADCS Rd, Rm
+  fn emitADCS_Rd_Rm(rd: int64, rm: int64): void {
+    // 01000001dddddmmm
+    var instr: int64 := 0x4140;
+    instr := instr | ((rd & 15) << 8);
+    instr := instr | (rm & 15);
+    self.emitHalf(instr);
+  }
+  
+  // SUBS Rd, Rn, #imm3
+  fn emitSUBS_Rd_Rn_imm3(rd: int64, rn: int64, imm: int64): void {
+    // 00011211dddddnnniii
+    var instr: int64 := 0x1E00;
+    instr := instr | ((rd & 7) << 8);
+    instr := instr | ((rn & 7) << 6);
+    instr := instr | (imm & 7);
+    self.emitHalf(instr);
+  }
+  
+  // CMP Rn, #imm8
+  fn emitCMP_Rn_imm8(rn: int64, imm: int64): void {
+    // 00101 nnn iiiiiii
+    var instr: int64 := 0x2800;
+    instr := instr | ((rn & 7) << 8);
+    instr := instr | (imm & 255);
+    self.emitHalf(instr);
+  }
+  
+  // CMP Rn, Rm
+  fn emitCMP_Rn_Rm(rn: int64, rm: int64): void {
+    // 01000010111mmmnnn
+    var instr: int64 := 0x42A0;
+    instr := instr | ((rm & 7) << 6);
+    instr := instr | (rn & 7);
+    self.emitHalf(instr);
+  }
+  
+  // LDR Rt, [Rn, #imm5*4]
+  fn emitLDR_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 01101tttdddiiiii
+    var instr: int64 := 0x6800;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | ((imm & 31) << 6);
+    self.emitHalf(instr);
+  }
+  
+  // STR Rt, [Rn, #imm5*4]
+  fn emitSTR_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 01100tttdddiiiii
+    var instr: int64 := 0x6000;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | ((imm & 31) << 6);
+    self.emitHalf(instr);
+  }
+  
+  // LDRB Rt, [Rn, #imm5]
+  fn emitLDRB_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 01111tttdddiiiii
+    var instr: int64 := 0x7800;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | (imm & 31);
+    self.emitHalf(instr);
+  }
+  
+  // STRB Rt, [Rn, #imm5]
+  fn emitSTRB_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 01110tttdddiiiii
+    var instr: int64 := 0x7000;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | (imm & 31);
+    self.emitHalf(instr);
+  }
+  
+  // LDRH Rt, [Rn, #imm5*2]
+  fn emitLDRH_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 10001tttdddiiiii
+    var instr: int64 := 0x8800;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | ((imm & 31) << 6);
+    self.emitHalf(instr);
+  }
+  
+  // STRH Rt, [Rn, #imm5*2]
+  fn emitSTRH_Rt_Rn_imm5(rt: int64, rn: int64, imm: int64): void {
+    // 10000tttdddiiiii
+    var instr: int64 := 0x8000;
+    instr := instr | ((rt & 7) << 12);
+    instr := instr | ((rn & 7) << 9);
+    instr := instr | ((imm & 31) << 6);
+    self.emitHalf(instr);
+  }
+  
+  // PUSH {registers}
+  fn emitPUSH(regList: int64): void {
+    // 1011010l nnnn1010
+    var hasLR: int64 := (regList >> 14) & 1;
+    var hasPC: int64 := (regList >> 15) & 1;
+    
+    var instr: int64 := 0xB480;
+    if hasLR == 1 {
+      instr := instr | 256;  // bit 8
+    }
+    
+    // Encode register list
+    var regBits: int64 := 0;
+    var r: int64 := 0;
+    while r < 8 {
+      if (regList >> r) & 1 == 1 {
+        regBits := regBits | (1 << r);
+      }
+      r := r + 1;
+    }
+    instr := instr | regBits;
+    
+    self.emitHalf(instr);
+  }
+  
+  // POP {registers}
+  fn emitPOP(regList: int64): void {
+    var hasPC: int64 := (regList >> 15) & 1;
+    
+    var instr: int64 := 0xBC80;
+    if hasPC == 1 {
+      instr := instr | 256;  // bit 8
+    }
+    
+    var regBits: int64 := 0;
+    var r: int64 := 0;
+    while r < 8 {
+      if (regList >> r) & 1 == 1 {
+        regBits := regBits | (1 << r);
+      }
+      r := r + 1;
+    }
+    instr := instr | regBits;
+    
+    self.emitHalf(instr);
+  }
+  
+  // B label (8-bit offset)
+  fn emitB_imm8(imm: int64): void {
+    // 11100 iiiiiiii
+    var instr: int64 := 0xE000;
+    instr := instr | (imm & 255);
+    self.emitHalf(instr);
+  }
+  
+  // B<cond> label (8-bit offset)
+  fn emitB_cond_imm8(cond: int64, imm: int64): void {
+    // 1101dddiiiiiiii
+    var instr: int64 := 0xD000;
+    instr := instr | ((cond & 15) << 8);
+    instr := instr | (imm & 255);
+    self.emitHalf(instr);
+  }
+  
+  // BL label (24-bit offset, handled as 32-bit)
+  fn emitBL_imm24(imm: int64): void {
+    // Split into two 16-bit instructions
+    var upper: int64 := (imm >> 12) & 255;
+    var lower: int64 := imm & 4095;
+    
+    // First half: 11110offset
+    var instr1: int64 := 0xF000;
+    instr1 := instr1 | (upper & 255);
+    self.emitHalf(instr1);
+    
+    // Second half: 1111sdddddddddddd
+    var instr2: int64 := 0xF800;
+    instr2 := instr2 | (lower & 4095);
+    self.emitHalf(instr2);
+  }
+  
+  // BLX Rm
+  fn emitBLX(rm: int64): void {
+    // 111001111mmm0000
+    var instr: int64 := 0xE770;
+    instr := instr | (rm & 15);
+    self.emitHalf(instr);
+  }
+  
+  // BX Rm
+  fn emitBX(rm: int64): void {
+    // 1110011000010mmm
+    var instr: int64 := 0x4700;
+    instr := instr | ((rm & 15) << 3);
+    self.emitHalf(instr);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // T2: 32-bit Thumb-2 Instructions
+  // ---------------------------------------------------------------------------
+  
+  // MOVW Rd, #imm16
+  fn emitMOVW(rd: int64, imm: int64): void {
+    // 11100i000dddiiii iiiiiiii IIIIIIII
+    var i1: int64 := (imm >> 15) & 1;
+    var i2: int64 := (imm >> 11) & 1;
+    var i3: int64 := (imm >> 7) & 1;
+    var i4: int64 := imm & 127;
+    
+    var high: int64 := 0xF240;
+    high := high | ((rd & 15) << 8);
+    high := high | (i1 << 14);
+    high := high | (i2 << 12);
+    high := high | (i3 << 11);
+    high := high | i4;
+    
+    var low: int64 := (imm >> 16) & 255;
+    
+    self.emitHalf(high);
+    self.emitHalf(low);
+  }
+  
+  // MOVT Rd, #imm16
+  fn emitMOVT(rd: int64, imm: int64): void {
+    // 11100i100dddiiii iiiiiiii IIIIIIII
+    var i1: int64 := (imm >> 15) & 1;
+    var i2: int64 := (imm >> 11) & 1;
+    var i3: int64 := (imm >> 7) & 1;
+    var i4: int64 := imm & 127;
+    
+    var high: int64 := 0xF2C0;
+    high := high | ((rd & 15) << 8);
+    high := high | (i1 << 14);
+    high := high | (i2 << 12);
+    high := high | (i3 << 11);
+    high := high | i4;
+    
+    var low: int64 := (imm >> 16) & 255;
+    
+    self.emitHalf(high);
+    self.emitHalf(low);
+  }
+  
+  // LDR Rt, [PC, #imm12*4] (literal load)
+  fn emitLDR_PC_imm12(rt: int64, imm: int64): void {
+    // 1111100i iiiiittt iiiiiiii iiiiiiii
+    var i: int64 := (imm >> 8) & 15;
+    
+    var high: int64 := 0xF8D0;
+    high := high | ((rt & 15) << 12);
+    high := high | (i & 15);
+    
+    var low: int64 := imm & 255;
+    
+    self.emitHalf(high);
+    self.emitHalf(low);
+  }
+  
+  // LDR Rt, [Rn, Rm, LSL #shift]
+  fn emitLDR_REG_SHIFT(rt: int64, rn: int64, rm: int64, shift: int64): void {
+    // 1111100s ddnnnmmm iiinnttrr
+    var high: int64 := 0xF850;
+    high := high | ((rt & 15) << 12);
+    high := high | ((rn & 15) << 16);
+    
+    var low: int64 := (rm & 15);
+    low := low | ((shift & 3) << 4);
+    low := low | ((rt & 15) << 12);
+    
+    self.emitHalf(high);
+    self.emitHalf(low);
+  }
+  
+  // STR Rt, [Rn, Rm, LSL #shift]
+  fn emitSTR_REG_SHIFT(rt: int64, rn: int64, rm: int64, shift: int64): void {
+    var high: int64 := 0xF840;
+    high := high | ((rt & 15) << 12);
+    high := high | ((rn & 15) << 16);
+    
+    var low: int64 := (rm & 15);
+    low := low | ((shift & 3) << 4);
+    low := low | ((rt & 15) << 12);
+    
+    self.emitHalf(high);
+    self.emitHalf(low);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Higher-Level Operations
+  // ---------------------------------------------------------------------------
+  
+  // Load immediate (32-bit)
+  pub fn EmitLDI32(rd: int64, imm: int64): void {
+    self.EmitMOVW(rd, imm & 65535);
+    if (imm >> 16) != 0 {
+      self.EmitMOVT(rd, (imm >> 16) & 65535);
+    }
+  }
+  
+  // Load address
+  pub fn EmitLDR_ADDR(rd: int64, label: int64): void {
+    var target: int64 := self.GetLabelAddr(label);
+    var offset: int64 := target - (self.codePos + 8);
+    offset := offset & 0xFFF;
+    self.emitLDR_PC_imm12(rd, offset);
+  }
+  
+  // Call function
+  pub fn EmitBL(label: int64): void {
+    var target: int64 := self.GetLabelAddr(label);
+    var offset: int64 := target - (self.codePos + 4);
+    offset := offset >> 1;  // Thumb offset is word-aligned
+    self.emitBL_imm24(offset & 0xFFFFFF);
+  }
+  
+  // Return from function
+  pub fn EmitBX_LR(): void {
+    self.EmitBX(LR);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Label Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn DefineLabel(name: int64): void {
+    map_set(self.labels, name, StrLen(name), self.codePos);
+  }
+  
+  pub fn GetLabelAddr(name: int64): int64 {
+    return map_get(self.labels, name, StrLen(name));
+  }
+  
+  pub fn EmitJ(label: int64): void {
+    var target: int64 := self.GetLabelAddr(label);
+    var offset: int64 := target - (self.codePos + 4);
+    offset := offset >> 1;
+    
+    if offset >= -128 && offset <= 127 {
+      self.emitB_imm8(offset & 255);
+    } else {
+      // Need 32-bit branch, use BLX
+      self.EmitBL(label);
+    }
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Stack Operations
+  // ---------------------------------------------------------------------------
+  
+  pub fn EmitPrologue(frameSize: int64): void {
+    self.EmitPUSH(0x5F00);  // R4-R7, LR
+    self.EmitSUB_SP_imm8((frameSize / 4) & 127);
+  }
+  
+  pub fn EmitEpilogue(frameSize: int64): void {
+    self.EmitADD_SP_imm8((frameSize / 4) & 127);
+    self.EmitPOP(0x5F00);  // R4-R7, PC
+  }
+  
+  fn emitSUB_SP_imm8(imm: int64): void {
+    // 101101000mmmdddd
+    var instr: int64 := 0xB080;
+    instr := instr | (imm & 127);
+    self.emitHalf(instr);
+  }
+  
+  fn emitADD_SP_imm8(imm: int64): void {
+    // 101101001mmmdddd
+    var instr: int64 := 0xB088;
+    instr := instr | (imm & 127);
+    self.emitHalf(instr);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Output
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetCode(): int64 {
+    return self.code;
+  }
+  
+  pub fn GetCodeSize(): int64 {
+    return self.codePos;
+  }
+  
+  pub fn GetCodeBuffer(): int64 {
+    var result: int64 := mmap(self.codePos, 1);
+    var i: int64 := 0;
+    while i < self.codePos {
+      poke8(result + i, peek8(self.code + i));
+      i := i + 1;
+    }
+    return result;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.code != 0 {
+      munmap(self.code, self.codeCap);
+    }
+    map_free(self.labels);
+    map_free(self.labelAddrs);
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global ARM Cortex-M Emitter
+// ============================================================================
+
+var globalARMCMEmitter: int64 := 0;
+
+pub fn ARMCMEmitterInit(): void {
+  globalARMCMEmitter := ARMCMEmitter.Create();
+}
+
+pub fn ARMCMEmitterGet(): int64 {
+  return globalARMCMEmitter;
+}
+
+pub fn ARMCMEmitterShutdown(): void {
+  if globalARMCMEmitter != 0 {
+    var emitter: int64 := globalARMCMEmitter as ARMCMEmitter;
+    emitter.Free();
+    globalARMCMEmitter := 0;
+  }
+}

@@ -1,0 +1,689 @@
+// ==================================================================
+// WP-32: RISC-V RV64I Backend
+// ==================================================================
+// RISC-V RV64I (64-bit) Instruction Emitter
+// - Register: a0-a7 (Args), t0-t6 (Temps), s0-s11 (Saved)
+// - Instructions: ADD, SUB, MUL, DIV, JAL, JALR, BEQ, BNE, BLT, BGE, LW, SW, LI
+// - ELF64 Writer: write_elf_riscv.lyx
+//
+// Referenz: compiler/backend/riscv/riscv_emit.pas
+
+import bootstrap.std.io;
+
+// ============================================================================
+// RISC-V RV64I Constants
+// ============================================================================
+
+// Register Numbers
+pub con ZERO: int64 := 0;   // x0 - constant zero
+pub con RA: int64 := 1;     // x1 - return address
+pub con SP: int64 := 2;     // x2 - stack pointer
+pub con GP: int64 := 3;     // x3 - global pointer
+pub con TP: int64 := 4;     // x4 - thread pointer
+pub con T0: int64 := 5;     // x5 - temporary
+pub con T1: int64 := 6;     // x6
+pub con T2: int64 := 7;     // x7
+pub con T3: int64 := 28;    // x28
+pub con T4: int64 := 29;    // x29
+pub con T5: int64 := 30;    // x30
+pub con T6: int64 := 31;    // x31
+pub con FP: int64 := 8;     // x8 - frame pointer (s0)
+pub con S0: int64 := 8;     // x8 - saved register 0
+pub con S1: int64 := 9;     // x9
+pub con S2: int64 := 18;    // x18
+pub con S3: int64 := 19;    // x19
+pub con S4: int64 := 20;    // x20
+pub con S5: int64 := 21;    // x21
+pub con S6: int64 := 22;    // x22
+pub con S7: int64 := 23;    // x23
+pub con S8: int64 := 24;    // x24
+pub con S9: int64 := 25;    // x25
+pub con S10: int64 := 26;   // x26
+pub con S11: int64 := 27;   // x27
+pub con A0: int64 := 10;    // x10 - argument/return 0
+pub con A1: int64 := 11;    // x11 - argument/return 1
+pub con A2: int64 := 12;    // x12
+pub con A3: int64 := 13;    // x13
+pub con A4: int64 := 14;    // x14
+pub con A5: int64 := 15;    // x15
+pub con A6: int64 := 16;    // x16
+pub con A7: int64 := 17;    // x17
+
+// RISC-V Opcodes
+pub con OPCODE_LOAD: int64 := 3;
+pub con OPCODE_STORE: int64 := 35;
+pub con OPCODE_BRANCH: int64 := 99;
+pub con OPCODE_JAL: int64 := 111;
+pub con OPCODE_JALR: int64 := 103;
+pub con OPCODE_LUI: int64 := 55;
+pub con OPCODE_AUIPC: int64 := 23;
+pub con OPCODE_OP: int64 := 51;
+pub con OPCODE_OP_IMM: int64 := 19;
+pub con OPCODE_SYSTEM: int64 := 115;
+
+// Function codes for OP
+pub con FUNCT_ADD: int64 := 0;
+pub con FUNCT_SUB: int64 := 32;
+pub con FUNCT_SLL: int64 := 1;
+pub con FUNCT_SRL: int64 := 5;
+pub con FUNCT_SRA: int64 := 7;
+pub con FUNCT_SLT: int64 := 2;
+pub con FUNCT_SLTU: int64 := 3;
+pub con FUNCT_XOR: int64 := 4;
+pub con FUNCT_OR: int64 := 6;
+pub con FUNCT_AND: int64 := 7;
+pub con FUNCT_MUL: int64 := 1;
+pub con FUNCT_MULH: int64 := 3;
+pub con FUNCT_DIV: int64 := 4;
+pub con FUNCT_REM: int64 := 6;
+
+// Function codes for OP_IMM
+pub const FUNCT_ADDI: int64 := 0;
+pub con FUNCT_SLLI: int64 := 1;
+pub con FUNCT_SRLI: int64 := 5;
+pub con FUNCT_SRAI: int64 := 7;
+pub con FUNCT_XORI: int64 := 4;
+pub con FUNCT_ORI: int64 := 6;
+pub con FUNCT_ANDI: int64 := 7;
+
+// Branch conditions
+pub con BEQ: int64 := 0;
+pub con BNE: int64 := 1;
+pub con BLT: int64 := 4;
+pub con BGE: int64 := 5;
+pub con BLTU: int64 := 6;
+pub con BGEU: int64 := 7;
+
+// Load/Store width
+pub con WIDTH_BYTE: int64 := 0;
+pub con WIDTH_HALF: int64 := 1;
+pub con WIDTH_WORD: int64 := 2;
+pub con WIDTH_DOUBLE: int64 := 3;
+
+// ============================================================================
+// RISC-V Emitter Class
+// ============================================================================
+
+pub type RISCVEmitter = class {
+  // Output buffer
+  code: int64;
+  codeSize: int64;
+  codeCap: int64;
+  codePos: int64;
+  
+  // Labels
+  labels: int64;
+  labelAddrs: int64;
+  
+  // Current function
+  currentFunc: int64;
+  stackFrameSize: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(RISCVEmitter));
+    
+    self.code := mmap(65536, 1);
+    self.codeSize := 0;
+    self.codeCap := 65536;
+    self.codePos := 0;
+    
+    self.labels := map_new(64);
+    self.labelAddrs := map_new(64);
+    
+    self.currentFunc := 0;
+    self.stackFrameSize := 0;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Code Emission
+  // ---------------------------------------------------------------------------
+  
+  fn emitByte(b: int64): void {
+    if self.codePos >= self.codeCap {
+      return;  // Overflow
+    }
+    poke8(self.code + self.codePos, b);
+    self.codePos := self.codePos + 1;
+  }
+  
+  fn emitWord(w: int64): void {
+    self.emitByte(w & 255);
+    self.emitByte((w >> 8) & 255);
+    self.emitByte((w >> 16) & 255);
+    self.emitByte((w >> 24) & 255);
+  }
+  
+  fn emitDWord(dw: int64): void {
+    self.emitByte(dw & 255);
+    self.emitByte((dw >> 8) & 255);
+    self.emitByte((dw >> 16) & 255);
+    self.emitByte((dw >> 24) & 255);
+    self.emitByte((dw >> 32) & 255);
+    self.emitByte((dw >> 40) & 255);
+    self.emitByte((dw >> 48) & 255);
+    self.emitByte((dw >> 56) & 255);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // R-Type Instructions
+  // ---------------------------------------------------------------------------
+  
+  // R-type: opcode(7) | rd(5) | funct3(3) | rs1(5) | rs2(5) | funct7(7)
+  fn emitRType(opcode: int64, rd: int64, funct3: int64, rs1: int64, rs2: int64, funct7: int64): void {
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((rd & 31) << 7);
+    instr := instr | ((funct3 & 7) << 12);
+    instr := instr | ((rs1 & 31) << 15);
+    instr := instr | ((rs2 & 31) << 20);
+    instr := instr | ((funct7 & 127) << 25);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // I-type: opcode(7) | rd(5) | funct3(3) | rs1(5) | imm(12)
+  fn emitIType(opcode: int64, rd: int64, funct3: int64, rs1: int64, imm: int64): void {
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((rd & 31) << 7);
+    instr := instr | ((funct3 & 7) << 12);
+    instr := instr | ((rs1 & 31) << 15);
+    instr := instr | ((imm & 4095) << 20);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // S-type: opcode(7) | imm11:5(5) | funct3(3) | rs1(5) | rs2(5) | imm4:0(7)
+  fn emitSType(opcode: int64, funct3: int64, rs1: int64, rs2: int64, imm: int64): void {
+    var immLo: int64 := imm & 31;
+    var immHi: int64 := (imm >> 5) & 127;
+    
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((immLo & 31) << 7);
+    instr := instr | ((funct3 & 7) << 12);
+    instr := instr | ((rs1 & 31) << 15);
+    instr := instr | ((rs2 & 31) << 20);
+    instr := instr | ((immHi & 127) << 25);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // B-type: opcode(7) | imm12(1) | imm10:5(6) | funct3(3) | rs1(5) | rs2(5) | imm4:1(4) | imm11(1)
+  fn emitBType(opcode: int64, funct3: int64, rs1: int64, rs2: int64, imm: int64): void {
+    var bit0: int64 := (imm >> 11) & 1;
+    var bits1_4: int64 := (imm >> 1) & 15;
+    var bits5_10: int64 := (imm >> 5) & 63;
+    var bit11: int64 := (imm >> 11) & 1;
+    var bit12: int64 := (imm >> 12) & 1;
+    
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((bit11 & 1) << 7);
+    instr := instr | ((bits5_10 & 63) << 8);
+    instr := instr | ((funct3 & 7) << 12);
+    instr := instr | ((rs1 & 31) << 15);
+    instr := instr | ((rs2 & 31) << 20);
+    instr := instr | ((bits1_4 & 15) << 25);
+    instr := instr | ((bit12 & 1) << 31);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // U-type: opcode(7) | rd(5) | imm31:12(20)
+  fn emitUType(opcode: int64, rd: int64, imm: int64): void {
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((rd & 31) << 7);
+    instr := instr | ((imm & 1048575) << 12);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // J-type: opcode(7) | rd(5) | imm20(1) | imm10:1(10) | imm11(1) | imm19:12(8)
+  fn emitJType(opcode: int64, rd: int64, imm: int64): void {
+    var bit0: int64 := (imm >> 20) & 1;
+    var bits1_10: int64 := (imm >> 1) & 1023;
+    var bit11: int64 := (imm >> 11) & 1;
+    var bits12_19: int64 := (imm >> 12) & 255;
+    
+    var instr: int64 := 0;
+    instr := instr | (opcode & 127);
+    instr := instr | ((rd & 31) << 7);
+    instr := instr | ((bit0 & 1) << 12);
+    instr := instr | ((bits1_10 & 1023) << 13);
+    instr := instr | ((bit11 & 1) << 23);
+    instr := instr | ((bits12_19 & 255) << 24);
+    
+    self.emitDWord(instr & 0xFFFFFFFF);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Register-Register Instructions
+  // ---------------------------------------------------------------------------
+  
+  // ADD rd, rs1, rs2
+  pub fn EmitADD(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 0, rs1, rs2, FUNCT_ADD);
+  }
+  
+  // SUB rd, rs1, rs2
+  pub fn EmitSUB(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 0, rs1, rs2, FUNCT_SUB);
+  }
+  
+  // XOR rd, rs1, rs2
+  pub fn EmitXOR(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 4, rs1, rs2, 0);
+  }
+  
+  // OR rd, rs1, rs2
+  pub fn EmitOR(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 6, rs1, rs2, 0);
+  }
+  
+  // AND rd, rs1, rs2
+  pub fn EmitAND(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 7, rs1, rs2, 0);
+  }
+  
+  // SLL rd, rs1, rs2
+  pub fn EmitSLL(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 1, rs1, rs2, 0);
+  }
+  
+  // SRL rd, rs1, rs2
+  pub fn EmitSRL(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 5, rs1, rs2, 0);
+  }
+  
+  // SRA rd, rs1, rs2
+  pub fn EmitSRA(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 5, rs1, rs2, FUNCT_SRA);
+  }
+  
+  // SLT rd, rs1, rs2
+  pub fn EmitSLT(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 2, rs1, rs2, 0);
+  }
+  
+  // SLTU rd, rs1, rs2
+  pub fn EmitSLTU(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 3, rs1, rs2, 0);
+  }
+  
+  // MUL rd, rs1, rs2
+  pub fn EmitMUL(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 0, rs1, rs2, FUNCT_MUL);
+  }
+  
+  // DIV rd, rs1, rs2
+  pub fn EmitDIV(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 4, rs1, rs2, FUNCT_DIV);
+  }
+  
+  // REM rd, rs1, rs2
+  pub fn EmitREM(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 6, rs1, rs2, FUNCT_REM);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Register-Immediate Instructions
+  // ---------------------------------------------------------------------------
+  
+  // ADDI rd, rs1, imm
+  pub fn EmitADDI(rd: int64, rs1: int64, imm: int64): void {
+    var imm12: int64 := imm & 4095;
+    if imm < 0 {
+      imm12 := (0 - imm) & 4095;
+      imm12 := imm12 ^ 4095;
+      imm12 := imm12 + 1;
+    }
+    self.emitIType(OPCODE_OP_IMM, rd, 0, rs1, imm12);
+  }
+  
+  // XORI rd, rs1, imm
+  pub fn EmitXORI(rd: int64, rs1: int64, imm: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 4, rs1, imm & 4095);
+  }
+  
+  // ORI rd, rs1, imm
+  pub fn EmitORI(rd: int64, rs1: int64, imm: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 6, rs1, imm & 4095);
+  }
+  
+  // ANDI rd, rs1, imm
+  pub fn EmitANDI(rd: int64, rs1: int64, imm: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 7, rs1, imm & 4095);
+  }
+  
+  // SLLI rd, rs1, shamt
+  pub fn EmitSLLI(rd: int64, rs1: int64, shamt: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 1, rs1, shamt & 63);
+  }
+  
+  // SRLI rd, rs1, shamt
+  pub fn EmitSRLI(rd: int64, rs1: int64, shamt: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 5, rs1, shamt & 63);
+  }
+  
+  // SRAI rd, rs1, shamt
+  pub fn EmitSRAI(rd: int64, rs1: int64, shamt: int64): void {
+    self.emitIType(OPCODE_OP_IMM, rd, 5, rs1, (shamt & 63) | 1024);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Load/Store Instructions
+  // ---------------------------------------------------------------------------
+  
+  // LB rd, offset(rs1)
+  pub fn EmitLB(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 0, rs1, offset & 4095);
+  }
+  
+  // LH rd, offset(rs1)
+  pub fn EmitLH(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 1, rs1, offset & 4095);
+  }
+  
+  // LW rd, offset(rs1)
+  pub fn EmitLW(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 2, rs1, offset & 4095);
+  }
+  
+  // LD rd, offset(rs1)
+  pub fn EmitLD(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 3, rs1, offset & 4095);
+  }
+  
+  // LBU rd, offset(rs1)
+  pub fn EmitLBU(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 4, rs1, offset & 4095);
+  }
+  
+  // LHU rd, offset(rs1)
+  pub fn EmitLHU(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_LOAD, rd, 5, rs1, offset & 4095);
+  }
+  
+  // SB rs2, offset(rs1)
+  pub fn EmitSB(rs2: int64, rs1: int64, offset: int64): void {
+    self.emitSType(OPCODE_STORE, 0, rs1, rs2, offset & 4095);
+  }
+  
+  // SH rs2, offset(rs1)
+  pub fn EmitSH(rs2: int64, rs1: int64, offset: int64): void {
+    self.emitSType(OPCODE_STORE, 1, rs1, rs2, offset & 4095);
+  }
+  
+  // SW rs2, offset(rs1)
+  pub fn EmitSW(rs2: int64, rs1: int64, offset: int64): void {
+    self.emitSType(OPCODE_STORE, 2, rs1, rs2, offset & 4095);
+  }
+  
+  // SD rs2, offset(rs1)
+  pub fn EmitSD(rs2: int64, rs1: int64, offset: int64): void {
+    self.emitSType(OPCODE_STORE, 3, rs1, rs2, offset & 4095);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Branch Instructions
+  // ---------------------------------------------------------------------------
+  
+  // BEQ rs1, rs2, label
+  pub fn EmitBEQ(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BEQ, rs1, rs2, offset);
+  }
+  
+  // BNE rs1, rs2, label
+  pub fn EmitBNE(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BNE, rs1, rs2, offset);
+  }
+  
+  // BLT rs1, rs2, label
+  pub fn EmitBLT(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BLT, rs1, rs2, offset);
+  }
+  
+  // BGE rs1, rs2, label
+  pub fn EmitBGE(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BGE, rs1, rs2, offset);
+  }
+  
+  // BLTU rs1, rs2, label
+  pub fn EmitBLTU(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BLTU, rs1, rs2, offset);
+  }
+  
+  // BGEU rs1, rs2, label
+  pub fn EmitBGEU(rs1: int64, rs2: int64, offset: int64): void {
+    self.emitBType(OPCODE_BRANCH, BGEU, rs1, rs2, offset);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Jump Instructions
+  // ---------------------------------------------------------------------------
+  
+  // JAL rd, offset
+  pub fn EmitJAL(rd: int64, offset: int64): void {
+    self.emitJType(OPCODE_JAL, rd, offset);
+  }
+  
+  // JALR rd, rs1, offset
+  pub fn EmitJALR(rd: int64, rs1: int64, offset: int64): void {
+    self.emitIType(OPCODE_JALR, rd, 0, rs1, offset & 4095);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Upper Immediate Instructions
+  // ---------------------------------------------------------------------------
+  
+  // LUI rd, imm
+  pub fn EmitLUI(rd: int64, imm: int64): void {
+    self.emitUType(OPCODE_LUI, rd, imm);
+  }
+  
+  // AUIPC rd, imm
+  pub fn EmitAUIPC(rd: int64, imm: int64): void {
+    self.emitUType(OPCODE_AUIPC, rd, imm);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Special Instructions
+  // ---------------------------------------------------------------------------
+  
+  // NOP (ADDI x0, x0, 0)
+  pub fn EmitNOP(): void {
+    self.emitIType(OPCODE_OP_IMM, 0, 0, 0, 0);
+  }
+  
+  // LI rd, imm (pseudo-instruction)
+  pub fn EmitLI(rd: int64, imm: int64): void {
+    // Load immediate: LUI + ADDI
+    var hi20: int64 := (imm >> 12) & 1048575;
+    var lo12: int64 := imm & 4095;
+    
+    if hi20 != 0 {
+      self.EmitLUI(rd, hi20);
+      if lo12 != 0 {
+        self.EmitADDI(rd, rd, lo12);
+      }
+    } else {
+      self.EmitADDI(rd, ZERO, lo12);
+    }
+  }
+  
+  // MV rd, rs (pseudo-instruction)
+  pub fn EmitMV(rd: int64, rs: int64): void {
+    self.EmitADDI(rd, rs, 0);
+  }
+  
+  // NOT rd, rs (pseudo-instruction)
+  pub fn EmitNOT(rd: int64, rs: int64): void {
+    self.EmitXORI(rd, rs, -1);
+  }
+  
+  // NEG rd, rs (pseudo-instruction)
+  pub fn EmitNEG(rd: int64, rs: int64): void {
+    self.EmitSUB(rd, ZERO, rs);
+  }
+  
+  // NEGW rd, rs (pseudo-instruction, 32-bit)
+  pub fn EmitNEGW(rd: int64, rs: int64): void {
+    self.EmitSUBW(rd, ZERO, rs);
+  }
+  
+  // SUBW rd, rs1, rs2
+  pub fn EmitSUBW(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 0, rs1, rs2, 0x20);
+  }
+  
+  // ADDW rd, rs1, rs2
+  pub fn EmitADDW(rd: int64, rs1: int64, rs2: int64): void {
+    self.emitRType(OPCODE_OP, rd, 0, rs1, rs2, 0x20);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // System Instructions
+  // ---------------------------------------------------------------------------
+  
+  // ECALL
+  pub fn EmitECALL(): void {
+    self.emitIType(OPCODE_SYSTEM, 0, 0, 0, 0);
+  }
+  
+  // EBREAK
+  pub fn EmitEBREAK(): void {
+    self.emitIType(OPCODE_SYSTEM, 0, 0, 0, 1);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Higher-Level Operations
+  // ---------------------------------------------------------------------------
+  
+  // Call function (uses ra)
+  pub fn EmitCall(funcAddr: int64): void {
+    // AUIPC + JALR
+    var offset: int64 := funcAddr - self.codePos - 4;
+    self.EmitAUIPC(RA, (offset + 4) >> 12);
+    self.EmitJALR(RA, RA, (offset + 4) & 4095);
+  }
+  
+  // Return from function
+  pub fn EmitRET(): void {
+    self.EmitJALR(ZERO, RA, 0);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Label Management
+  // ---------------------------------------------------------------------------
+  
+  // Define label
+  pub fn DefineLabel(name: int64): void {
+    map_set(self.labels, name, StrLen(name), self.codePos);
+  }
+  
+  // Get label address
+  pub fn GetLabelAddr(name: int64): int64 {
+    return map_get(self.labels, name, StrLen(name));
+  }
+  
+  // Emit jump to label
+  pub fn EmitJ(name: int64): void {
+    var target: int64 := self.GetLabelAddr(name);
+    var offset: int64 := target - self.codePos;
+    self.EmitJAL(ZERO, offset);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Stack Operations
+  // ---------------------------------------------------------------------------
+  
+  // Push register to stack
+  pub fn EmitPUSH(reg: int64): void {
+    self.EmitSD(reg, SP, self.stackFrameSize);
+    self.stackFrameSize := self.stackFrameSize + 8;
+  }
+  
+  // Pop register from stack
+  pub fn EmitPOP(reg: int64): void {
+    self.stackFrameSize := self.stackFrameSize - 8;
+    self.EmitLD(reg, SP, self.stackFrameSize);
+  }
+  
+  // Prologue
+  pub fn EmitPrologue(frameSize: int64): void {
+    self.EmitADDI(SP, SP, 0 - frameSize);
+    self.EmitSD(RA, SP, frameSize - 8);
+    self.EmitSD(FP, SP, frameSize - 16);
+    self.EmitMV(FP, SP);
+  }
+  
+  // Epilogue
+  pub fn EmitEpilogue(frameSize: int64): void {
+    self.EmitLD(RA, SP, frameSize - 8);
+    self.EmitLD(FP, SP, frameSize - 16);
+    self.EmitADDI(SP, SP, frameSize);
+    self.EmitRET();
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Output
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetCode(): int64 {
+    return self.code;
+  }
+  
+  pub fn GetCodeSize(): int64 {
+    return self.codePos;
+  }
+  
+  pub fn GetCodeBuffer(): int64 {
+    var result: int64 := mmap(self.codePos, 1);
+    var i: int64 := 0;
+    while i < self.codePos {
+      poke8(result + i, peek8(self.code + i));
+      i := i + 1;
+    }
+    return result;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.code != 0 {
+      munmap(self.code, self.codeCap);
+    }
+    map_free(self.labels);
+    map_free(self.labelAddrs);
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global RISC-V Emitter
+// ============================================================================
+
+var globalRISCVEmitter: int64 := 0;
+
+pub fn RISCVEmitterInit(): void {
+  globalRISCVEmitter := RISCVEmitter.Create();
+}
+
+pub fn RISCVEmitterGet(): int64 {
+  return globalRISCVEmitter;
+}
+
+pub fn RISCVEmitterShutdown(): void {
+  if globalRISCVEmitter != 0 {
+    var emitter: int64 := globalRISCVEmitter as RISCVEmitter;
+    emitter.Free();
+    globalRISCVEmitter := 0;
+  }
+}
