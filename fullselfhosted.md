@@ -24,13 +24,13 @@ IR-Inlining → Statische Analyse → MC/DC-Instrumentierung → Maschinencode-E
 
 | Datei                | LOC   | Status |
 |----------------------|-------|--------|
-| `lexer.lyx`          | 763   | ✅ Vollständig |
-| `parser.lyx`         | 1.042 | ✅ Vollständig |
-| `sema.lyx`           | 691   | ✅ Vollständig |
-| `codegen_x86.lyx`    | 2.439 | ✅ Direkte AST→x86_64 ELF64 |
+| `lexer.lyx`          | 827   | ✅ Vollständig (WP-11–17 Tokens) |
+| `parser.lyx`         | 1.480 | ✅ WP-11–17 AST-Nodes |
+| `sema.lyx`           | 979   | ⚠️ WP-13/14/15 Teile als Stubs |
+| `codegen_x86.lyx`    | 2.995 | ⚠️ WP-13/15 Codegen-Stubs |
 | `linter.lyx`         | 547   | ✅ W001/W006/W007/W010 |
 | `lyxc_mini.lyx`      | 160   | ✅ Entry Point |
-| **Gesamt**           | **5.642** | |
+| **Gesamt**           | **6.988** | |
 
 **Besonderheit:** Der Bootstrap-Compiler arbeitet ohne IR-Schicht — er lowert den AST **direkt**
 in x86_64-Maschinencode. Das war für den initialen Self-Hosting-Test (WP-09) ausreichend,
@@ -44,11 +44,11 @@ ist aber nicht skalierbar für Feature-Parität und Multi-Target-Support.
 | **Arrays**                  | Static + Dynamic (fat-pointer)        | Dynamic (basic) |
 | **Collections**             | Map[K,V], Set[T] (Hash-basiert)       | ❌ nicht vorhanden |
 | **OOP**                     | Classes, Interfaces, Virtual Methods, Vererbung | Classes + VMT (basic) |
-| **Exception Handling**      | try/catch/finally/throw               | ❌ |
-| **Closures**                | Nested Functions + Captured Variables | ❌ |
-| **Generics**                | Monomorphization                      | ❌ |
-| **Pattern Matching**        | match + Destrukturierung              | switch/case (basic) |
-| **Range Types**             | `1..100`, Constraint-Expressions      | ❌ |
+| **Exception Handling**      | try/catch/finally/throw               | ✅ try/catch/finally/panic (WP-12) |
+| **Closures**                | Nested Functions + Captured Variables | ⚠️ Static-Link + Parser, Capture-Analyse Stub (WP-13) |
+| **Generics**                | Monomorphization                      | ⚠️ Parser + Sema-Stub, keine Monomorphization (WP-14) |
+| **Pattern Matching**        | match + Destrukturierung              | ⚠️ match Parser+Codegen, Exhaustiveness + Struct-Destruktur fehlen (WP-15) |
+| **Range Types**             | `1..100`, Constraint-Expressions      | ⚠️ Parser+Sema fertig, kein Runtime/Iteration (WP-17) |
 | **Varargs**                 | `...`-Parameter                       | ❌ |
 | **Function Pointers**       | `fn(T): U`                            | ❌ |
 | **C FFI**                   | extern + C-Header-Parsing             | ❌ |
@@ -174,38 +174,56 @@ korrekt über Funktionsgrenzen (cross-frame exception propagation).
 
 ### WP-13: Closures & Nested Functions
 
-**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
+**Status:** ⚠️ Partial (Stubs) | **Abhängigkeit:** WP-11
 
 **Ziel:** Nested Functions mit Zugriff auf umschließende Scope-Variablen (Captured Variables).
 
-**Zu implementieren:**
-1. **Parser:** Nested Function-Deklarationen innerhalb von Functions/Methods
-2. **Sema:** Capture-Analyse — welche Variablen werden von innen gelesen/geschrieben?
-3. **Codegen:** Static-Link-Mechanismus
-   - Outer-Frame-Pointer als versteckter Parameter (via `rdi` oder `[rbp+16]`)
-   - Captured-Variables: Zugriff via `[static_link + offset]`
-4. **Function-Pointer-Typ:** `fn(T1, T2): U` als Erst-Klassen-Typ
-5. **Closure-Objekt:** {function_ptr, captured_env_ptr}
+**Implementiert (Bootstrap):**
+- ✅ **Parser:** `NK_CLOSURE`, `NK_FN_PTR` Nodes; `ParseNestedFunc()` für Nested-Function-Deklarationen
+- ✅ **Codegen:** Static-Link-Mechanismus (`staticLinkOffset`, `outerFuncName`);
+  `cg_genNestedFunc()`, `cg_emitPrologueNested()`; Static-Link-Übergabe via `[rbp+16]`
+- ⚠️ **Sema:** `TY_FN_PTR`, `TY_CLOSURE` Konstanten vorhanden;
+  `_analyzeCaptures()` / `_collectCaptures()` als leere Stubs
+- ⚠️ **Codegen:** `cg_findCapturedVar()` als Stub (TODO-Kommentar im Code)
+
+**Verbleibend:**
+- ❌ `cg_findCapturedVar()` implementieren — Capture-Variable-Zugriff via `[static_link + offset]`
+- ❌ `_addCapturedVar()` in Sema mit echtem Buffer-Management
+- ❌ Closure-Objekt: `{function_ptr, captured_env_ptr}`
+- ❌ Function-Pointer-Typ als Erst-Klassen-Typ (Übergabe, Speicherung, Aufruf)
 
 **Referenz:** `compiler/ir/ir.pas` (TIRClosure), `compiler/ir/lower_ast_to_ir.pas`
 
-**Schätzung:** 3 Sessions
+**Schätzung:** 2 Sessions (Capture-Analyse + Closure-Objekt)
 
 ---
 
 ### WP-14: Generics / Type-Parameter-Monomorphization
 
-**Status:** Abgeschlossen | **Abhängigkeit:** WP-11, WP-12
+**Status:** ⚠️ Partial (Stubs) | **Abhängigkeit:** WP-11, WP-12
 
 **Ziel:** Generische Funktionen und Klassen mit vollständiger Monomorphization.
 
-**Zu implementieren:**
-1. **Parser:** `fn Foo<T>(x: T): T { ... }`, `type Container<T> = class { ... }`
-2. **Sema:** Type-Parameter-Binding, Constraint-Prüfung (`T: Comparable`)
-3. **Monomorphization:** Bei jedem Aufruf von `Foo<i32>(...)` → erzeuge spezialisierte
-   Funktion `Foo_i32` mit konkreten Typen (oder nutze Type-Erasure für einfache Fälle)
-4. **Instantiation-Cache:** Vermeide doppelte Spezialisierungen
-5. **Generic Stdlib-Typen:** `Array<T>`, `List<T>`, `Map<K,V>`, `Set<T>`
+**Implementiert (Bootstrap):**
+- ✅ **Parser:** `fn Foo<T>(x: T): T { ... }` und `type Container<T> = class { ... }`
+  in `ParseFuncDecl()` / `ParseClassDecl()`
+- ✅ **Parser:** Generic-Type-Argumente in Typ-Annotationen: `Array<int64>`, `Map<K, V>`
+  (via `ParseType()`)
+- ⚠️ **Sema:** `TY_GENERIC_INST`, `TY_TYPE_PARAM` Konstanten; Instantiation-Cache-Buffer
+  (`instCache`, `instCount`, `instCap`) vorhanden; `_resolveGenericCall()` /
+  `_getMonomorphInstance()` minimal implementiert, keine echte Monomorphization
+- ⚠️ **Codegen:** Type-Argumente im AST-Node (c2) vorhanden, werden aber ignoriert
+
+**Hinweis (2026-04-06):** Generic-Funktionsaufruf-Syntax `Foo<T>(x)` in Ausdrücken wurde
+aus dem Parser entfernt (Konflikt mit `<`-Vergleichsoperator: `x < 10` wurde fälschlich als
+`x<10>` geparst). Nur Typ-Annotationen (`Array<int64>`) funktionieren weiterhin.
+
+**Verbleibend:**
+- ❌ `_resolveGenericCall()` wirklich implementieren
+- ❌ `_getMonomorphInstance()` mit Instantiation-Cache (Spezialisierung pro Typ-Parametrierung)
+- ❌ Generic-Funktionsaufruf-Syntax `Foo<T>(x)` disambiguieren und wieder einführen
+- ❌ Type-Argument-Validierung gegen Constraints (`T: Comparable`)
+- ❌ Generic Stdlib-Typen: `List<T>`, `Map<K,V>`, `Set<T>`
 
 **Referenz:** `compiler/frontend/sema.pas` (Generic-Tracking), `compiler/ir/lower_ast_to_ir.pas`
 
@@ -215,20 +233,32 @@ korrekt über Funktionsgrenzen (cross-frame exception propagation).
 
 ### WP-15: Pattern Matching & Match-Expressions
 
-**Status:** Abgeschlossen | **Abhängigkeit:** WP-11
+**Status:** ⚠️ Partial | **Abhängigkeit:** WP-11
 
 **Ziel:** Vollständiges `match`-Statement mit Destrukturierung.
 
-**Zu implementieren:**
-1. **Parser:** `match expr { case Pattern => expr, ... }`
-2. **Patterns:** Literal-Patterns, Enum-Patterns, Struct-Destrukturierung, Wildcard `_`, Guards
-3. **Sema:** Exhaustiveness-Check (alle Cases abgedeckt?), Pattern-Typ-Kompatibilität
-4. **Codegen:** Entscheidungsbaum-Generierung (Sprung-Tabellen für dichte Ranges)
-5. **Enum-Payload:** `match result { case Ok(v) => ..., case Err(e) => ... }`
+**Implementiert (Bootstrap):**
+- ✅ **Parser:** `match expr { case Pattern => expr, ... }` vollständig
+  (`_parseMatch()`, `NK_MATCH`, `NK_MATCH_CASE`)
+- ✅ **Parser:** Literal-Patterns (`NK_PATTERN_LIT`), Wildcard `_` (`NK_PATTERN_WILD`),
+  Bind-Pattern (`NK_PATTERN_BIND`)
+- ✅ **Parser:** Enum-Payload-Pattern `case Ok(v) =>` (`NK_PATTERN_ENUM`)
+- ✅ **Parser:** Struct-Destrukturierung `case Point { x, y } =>` (`NK_PATTERN_STRUCT`)
+- ✅ **Lexer:** `TK_MATCH`, `TK_UNDER` (Wildcard `_`)
+- ⚠️ **Sema:** Pattern-Typ-Prüfung vorhanden; Enum-Variant-Validierung als TODO-Stub
+- ✅ **Codegen:** `cg_genMatch()` für Literal-Patterns und Wildcard funktioniert
+
+**Verbleibend:**
+- ❌ **Exhaustiveness-Check** in Sema (TODO-Kommentar: `sema.lyx:683`)
+- ❌ **Enum-Variant-Validierung** in Sema (TODO: `sema.lyx:678`)
+- ❌ **Struct-Destrukturierung** im Codegen — wird derzeit als Wildcard behandelt
+  (TODO: `codegen_x86.lyx:2384`)
+- ❌ Enum-Payload-Pattern im Codegen (Payload-Extraktion fehlt)
+- ❌ Guard-Expressions in Pattern-Cases
 
 **Referenz:** `compiler/frontend/parser.pas` (parseMatch), `compiler/ir/lower_ast_to_ir.pas`
 
-**Schätzung:** 2 Sessions
+**Schätzung:** 1–2 Sessions (Exhaustiveness + Struct-Destrukturierung)
 
 ---
 
