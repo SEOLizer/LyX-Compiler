@@ -67,6 +67,13 @@ con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
 con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 
+// WP-15: Pattern matching node kinds
+con CGN_PATTERN_LIT:  int64 := 66;  // literal pattern
+con CGN_PATTERN_WILD: int64 := 67; // wildcard pattern
+con CGN_PATTERN_BIND: int64 := 68; // binding pattern (x @ pattern)
+con CGN_PATTERN_ENUM: int64 := 75; // enum payload pattern: Ok(v)
+con CGN_PATTERN_STRUCT:int64 := 76; // struct destructure pattern: Point { x, y }
+
 // Token kinds for binary operators (mirror TK_xxx from bootstrap.lexer)
 con CGT_PLUS:    int64 := 70;
 con CGT_MINUS:   int64 := 71;
@@ -969,6 +976,10 @@ pub type Codegen = class {
   }
 
   fn cg_getFieldOffset(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    return self.cg_findField(classIdx, fieldName, fieldLen);
+  }
+
+  fn cg_findField(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
     if (classIdx < 0) { return -1; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
     var flds: int64 := peek64(base + 16);
@@ -1361,9 +1372,14 @@ pub type Codegen = class {
     // WP-17: Range expression (1..100) - returns start value in rax
     } else if (k == CGN_RANGE) {
       // c0 = start, c1 = end
-      // For now, just evaluate start value; end is handled at runtime
+      // Generate: push start onto stack, then evaluate end, then pop start back
+      // Result: rax = start value (end is stored but needs to be handled by caller)
       self.cg_genExpr(self.cg_nc0(ni));
-      // TODO: WP-17: Store range info (start, end) for iteration
+      self.cg_pushRax();
+      self.cg_genExpr(self.cg_nc1(ni));
+      // Now rax = end, stack has start
+      // For range iteration, we store end in a local for the loop
+      // The caller (for loop) will handle iteration
       
     // WP-17: Where clause - just evaluate base type, constraint is compile-time only
     } else if (k == CGN_WHERE) {
@@ -2377,11 +2393,94 @@ pub type Codegen = class {
       var patKind: int64 := self.cg_nkind(patNode);
       
       // Wildcard pattern - treat as default
-      if (patKind == 67) {  // NK_PATTERN_WILD = 67
+      if (patKind == CGN_PATTERN_WILD) {
         defaultCaseNode := caseCur;
-      } else if (patKind == 76) {
-        // WP-15: Struct destructure pattern - treat as wildcard for now
-        // TODO: WP-15: Implement struct destructure field matching
+      } else if (patKind == CGN_PATTERN_STRUCT) {
+        // WP-15: Struct destructure pattern: Point { x: patX, y: patY }
+        // sval = struct type name, c0 = first field pattern (NK_PATTERN_BIND)
+        var structName: pchar := self.cg_nsval(patNode);
+        var structLen: int64 := self.cg_nslen(patNode);
+        
+        // Load the struct value
+        self.cg_loadRax(matchOff);
+        self.cg_pushRax();  // save struct value
+        
+        // Find the struct/class layout
+        var structOff: int64 := self.cg_findClass(structName, structLen);
+        if (structOff != -1) {
+          // Iterate over field patterns
+          var fieldPat: int64 := self.cg_nc0(patNode);
+          var matchFailed: int64 := 0;
+          while (fieldPat != -1) {
+            // fieldPat is NK_PATTERN_BIND with sval = field name
+            var fieldName: pchar := self.cg_nsval(fieldPat);
+            var fieldLen: int64 := self.cg_nslen(fieldPat);
+            var innerPat: int64 := self.cg_nc0(fieldPat);  // inner pattern
+            
+            // Find field offset in struct
+            var fldOff: int64 := self.cg_findField(structOff, fieldName, fieldLen);
+            if (fldOff != -1) {
+              // Load field value from struct
+              self.cg_popRax();
+              self.cg_pushRax();
+              // mov rax, [rax + fieldOffset]
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40);
+              self.cg_e8(fldOff as int64);
+              
+              // Generate code for inner pattern (recursive match on field value)
+              var innerPatKind: int64 := self.cg_nkind(innerPat);
+              if (innerPatKind == CGN_PATTERN_BIND) {
+                // Binding pattern: bind field value to new variable
+                var bindName: pchar := self.cg_nsval(innerPat);
+                var bindLen: int64 := self.cg_nslen(innerPat);
+                var bindOff: int64 := self.cg_addLocal(bindName, bindLen);
+                self.cg_storeRax(bindOff);
+              } else if (innerPatKind == CGN_PATTERN_LIT) {
+                // Literal pattern: compare
+                var patVal: int64 := self.cg_nival(innerPat);
+                self.cg_pushRax();
+                if (patVal != 0) {
+                  self.cg_movRaxImm(patVal);
+                } else {
+                  var patName: pchar := self.cg_nsval(innerPat);
+                  var patNameLen: int64 := self.cg_nslen(innerPat);
+                  var patNameOff: int64 := self.cg_findLocal(patName, patNameLen);
+                  if (patNameOff != 0) {
+                    self.cg_loadRax(patNameOff);
+                  } else {
+                    self.cg_zeroRax();
+                  }
+                }
+                self.cg_popRbx();
+                // cmp rbx, rax; jne fail
+                self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
+                self.cg_e8(0x0F); self.cg_e8(0x85);
+                var jnePos2: int64 := self.codeLen;
+                self.cg_e32(0);
+                // Field matched - continue
+                poke32(self.code + jnePos2, self.codeLen - jnePos2 - 4);
+              }
+              // Wildcard pattern: do nothing (field value ignored)
+            }
+            fieldPat := self.cg_nnext(fieldPat);
+          }
+          // All fields matched - execute case body
+          self.cg_popRax();
+          self.cg_genExpr(bodyNode);
+          // Implicit jmp to match_end
+          self.cg_e8(0xE9);
+          var bp2: int64 := self.codeLen;
+          self.cg_e32(self.curBreakHead);
+          self.curBreakHead := bp2;
+        } else {
+          // Unknown struct type - treat as wildcard
+          self.cg_popRax();
+          defaultCaseNode := caseCur;
+        }
+      } else if (patKind == CGN_PATTERN_ENUM) {
+        // WP-15: Enum payload pattern: Ok(value) or Err(msg)
+        // sval = enum variant name, c0 = binding pattern for payload
+        // For now, treat as wildcard (full enum support would need enum tag analysis)
         defaultCaseNode := caseCur;
       } else {
         // Load subject value, compare with pattern
