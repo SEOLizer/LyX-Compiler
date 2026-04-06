@@ -253,6 +253,7 @@ begin
   Functions := nil;
   Strings := TStringList.Create;
   Strings.Sorted := False;
+  Strings.CaseSensitive := True;
   Strings.Duplicates := dupIgnore;
   GlobalVars := nil;
   ExternLibraries := TStringList.Create;

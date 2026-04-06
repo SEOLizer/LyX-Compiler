@@ -538,9 +538,10 @@ begin
        end;
        
        // Emit implicit return for void functions if last statement wasn't a return
-       if (Length(FCurrentFunc.Instructions) = 0) or 
+       if (Length(FCurrentFunc.Instructions) = 0) or
           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
        begin
+         instr := Default(TIRInstr);
          instr.Op := irFuncExit;
          instr.Src1 := -1;
          Emit(instr);
@@ -623,6 +624,7 @@ begin
         if (Length(FCurrentFunc.Instructions) = 0) or 
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
@@ -714,6 +716,7 @@ begin
         if (Length(FCurrentFunc.Instructions) = 0) or 
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
@@ -1045,6 +1048,7 @@ begin
                 if (Length(FCurrentFunc.Instructions) = 0) or
                    (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
                 begin
+                  instr := Default(TIRInstr);
                   instr.Op := irFuncExit;
                   instr.Src1 := -1;
                   Emit(instr);
@@ -1300,6 +1304,7 @@ begin
     if (Length(FCurrentFunc.Instructions) = 0) or
        (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
     begin
+      instr := Default(TIRInstr);
       instr.Op := irFuncExit;
       instr.Src1 := -1;
       Emit(instr);
@@ -3603,24 +3608,23 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             fldOffset := -1;
             ownerName := '';
             cd := nil;
-            if Assigned(FCurrentClassDecl) then
+            // Try to determine receiver class:
+            //   - Named local variable → look up FLocalTypeNames (works in any function)
+            //   - 'self' → FCurrentClassDecl (only in class methods)
+            if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
             begin
-              // Check if the root object is 'self' or a named local
-              if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
+              // Named local variable: look up its class type
+              i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
+              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
+                 (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
               begin
-                // Named local variable: look up its class type
-                i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
-                if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
-                   (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
-                begin
-                  idx := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
-                  if idx >= 0 then
-                    cd := TAstClassDecl(FClassTypes.Objects[idx]);
-                end;
+                idx := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+                if idx >= 0 then
+                  cd := TAstClassDecl(FClassTypes.Objects[idx]);
               end;
-              if cd = nil then
-                cd := FCurrentClassDecl;
             end;
+            if (cd = nil) and Assigned(FCurrentClassDecl) then
+              cd := FCurrentClassDecl;
             if Assigned(cd) then
             begin
               // Walk the class and base classes to find the field
@@ -5240,13 +5244,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       ownerName := fa.Target.OwnerName;
       fldOffset := fa.Target.FieldOffset;
       fldType := fa.Target.FieldType;
-      // DEBUG: trace field assign offsets
-      if Assigned(FCurrentClassDecl) then
-        WriteLn(StdErr, '[IR-DBG] FieldAssign field=' + fa.Target.Field + ' fldOffset=' + IntToStr(fldOffset) + ' ownerName=' + ownerName + ' class=' + FCurrentClassDecl.Name);
       // If sema didn't annotate the field offset (imported class method bodies),
       // resolve it now.  Determine receiver class: 'self' → FCurrentClassDecl,
       // named local → FLocalTypeNames lookup.
-      if (fldOffset < 0) and Assigned(FCurrentClassDecl) then
+      if fldOffset < 0 then
       begin
         cd := nil;
         if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
@@ -5260,9 +5261,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
               cd := TAstClassDecl(FClassTypes.Objects[j]);
           end;
         end;
-        if cd = nil then
+        if (cd = nil) and Assigned(FCurrentClassDecl) then
           cd := FCurrentClassDecl;
-        ownerName := cd.Name;
+        if Assigned(cd) then
+        begin
+          ownerName := cd.Name;
+        end;
         while Assigned(cd) do
         begin
           for fi := 0 to High(cd.Fields) do
@@ -5271,7 +5275,6 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             begin
               fldOffset := cd.FieldOffsets[fi];
               fldType := cd.Fields[fi].FieldType;
-              WriteLn(StdErr, '[IR-DBG] Fallback found field=' + fa.Target.Field + ' fi=' + IntToStr(fi) + ' fldOffset=' + IntToStr(fldOffset));
               Break;
             end;
           end;
