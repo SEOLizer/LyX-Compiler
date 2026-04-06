@@ -220,6 +220,12 @@ pub type Codegen = class {
   tempBufCount:  int64;
   tempBufCap:    int64;
 
+  // WP-13: Captured variable table for nested functions
+  // Each entry: {outerFuncPtr:8, outerFuncLen:8, varNamePtr:8, varNameLen:8, offset:8} = 40 bytes
+  capturedVars:      int64;
+  capturedCount:     int64;
+  capturedCap:       int64;
+
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
   // ------------------------------------------------------------------
@@ -395,10 +401,63 @@ pub type Codegen = class {
   // WP-13: Find captured variable from outer function's frame via static link
   // Returns the offset in the captured environment, or 0 if not found
   fn cg_findCapturedVar(name: pchar, nlen: int64): int64 {
-    // Capture analysis is implemented in sema.lyx (_addCapturedVar)
-    // This function looks up the captured variable table built during Sema
-    // For now, return 0 (not captured) - full lookup would check the table
+    // Search the captured vars table for the current outer function
+    var i: int64 := 0;
+    while (i < self.capturedCount) {
+      var base: int64 := self.capturedVars + i * 40;
+      var funcPtr:  pchar := peek64(base) as pchar;
+      var funcLen:  int64 := peek64(base + 8);
+      var varPtr:   pchar := peek64(base + 16) as pchar;
+      var varLen:   int64 := peek64(base + 24);
+      var varOff:   int64 := peek64(base + 32);
+      // Match both outer function name and variable name
+      if (funcLen == self.outerFuncNameLen &&
+          self.cg_seq(funcPtr, funcLen, self.outerFuncName, self.outerFuncNameLen) &&
+          varLen == nlen && self.cg_seq(varPtr, varLen, name, nlen)) {
+        return varOff;
+      }
+      i := i + 1;
+    }
     return 0;
+  }
+
+  // WP-13: Register a captured variable for the current outer function
+  fn cg_addCapturedVar(varName: pchar, varLen: int64, off: int64) {
+    // Check if already captured
+    var i: int64 := 0;
+    while (i < self.capturedCount) {
+      var base: int64 := self.capturedVars + i * 40;
+      var funcPtr:  pchar := peek64(base) as pchar;
+      var funcLen:  int64 := peek64(base + 8);
+      var varPtr:   pchar := peek64(base + 16) as pchar;
+      var varLen2:  int64 := peek64(base + 24);
+      if (funcLen == self.outerFuncNameLen &&
+          self.cg_seq(funcPtr, funcLen, self.outerFuncName, self.outerFuncNameLen) &&
+          varLen2 == varLen && self.cg_seq(varPtr, varLen2, varName, varLen)) {
+        return;  // Already captured
+      }
+      i := i + 1;
+    }
+    // Grow table if needed
+    if (self.capturedCount >= self.capturedCap) {
+      var nc: int64 := self.capturedCap * 2;
+      var nb: int64 := mmap(0, nc * 40, 3, 34, -1, 0);
+      var j: int64 := 0;
+      while (j < self.capturedCount * 40) {
+        poke8(nb + j, peek8(self.capturedVars + j));
+        j := j + 1;
+      }
+      munmap(self.capturedVars, self.capturedCap * 40);
+      self.capturedVars := nb;
+      self.capturedCap := nc;
+    }
+    var entry: int64 := self.capturedVars + self.capturedCount * 40;
+    poke64(entry,      self.outerFuncName as int64);
+    poke64(entry + 8,  self.outerFuncNameLen);
+    poke64(entry + 16, varName as int64);
+    poke64(entry + 24, varLen);
+    poke64(entry + 32, off);
+    self.capturedCount := self.capturedCount + 1;
   }
 
   // ------------------------------------------------------------------
@@ -2127,15 +2186,15 @@ pub type Codegen = class {
     // Register label for nested function (mangled with parent context)
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
-    
+
     // Generate unique nested function name with parent suffix
     var nestedLabel: int64 := self._allocNestedLabel(fname, fnlen);
     self.cg_addLabel(nestedLabel, 16);  // 16 = max label length
-    
+
     // Reset locals but preserve outer function's captured variables
     self.localCount := 0;
     self.frameSize := 0;
-    
+
     // Check if we have a static link from parent (passed via [rbp+16])
     var hasStaticLink: int64 := 0;
     if (self.staticLinkOffset >= 0) {
@@ -2145,10 +2204,10 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(0x10); // mov rax, [rbp+16]
       self.cg_storeRax(slOff);  // store to local slot
     }
-    
+
     // Emit prologue with extra space for static link parameter
     var prologuePatch: int64 := self.cg_emitPrologueNested();
-    
+
     // Spill parameters (child0 = first param, linked via next)
     var param: int64 := self.cg_nc0(ni);
     var paramIdx: int64 := 0;
@@ -2165,33 +2224,78 @@ pub type Codegen = class {
       paramIdx := paramIdx + 1;
       param := self.cg_nnext(param);
     }
-    
+
+    // BUG-04: Capture analysis — scan body for identifiers not in local scope
+    // These must be captured from the outer function's frame
+    var body: int64 := self.cg_nc2(ni);
+    self._analyzeCaptured(body);
+
     // Generate function body (child2 = block)
     var savedStaticLink: int64 := self.staticLinkOffset;
     var savedOuterName: pchar := self.outerFuncName;
     var savedOuterLen: int64 := self.outerFuncNameLen;
-    
+
     // Set up static link context for this nested function
     self.staticLinkOffset := 16;  // rbp+16 = static link param position
     // Capture current function name as outer function
-    
-    var body: int64 := self.cg_nc2(ni);
+
+    body := self.cg_nc2(ni);
     self.cg_genBlock(body);
-    
+
     // Restore outer function context
     self.staticLinkOffset := savedStaticLink;
     self.outerFuncName := savedOuterName;
     self.outerFuncNameLen := savedOuterLen;
-    
+
     // Implicit return
     self.cg_zeroRax();
     self.cg_emitEpilogue();
-    
+
     // Patch sub rsp with aligned frame size
     var fs: int64 := self.frameSize + 15;
     var aligned: int64 := fs - (fs & 15);
     if (aligned == 0) { aligned := 16; }
     poke32(self.code + prologuePatch, aligned);
+  }
+
+  // BUG-04: Recursively scan AST for identifiers not in local scope
+  // and register them as captured variables from the outer function.
+  // Must be called AFTER parameter locals are registered but BEFORE codegen.
+  fn _analyzeCaptured(ni: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.cg_nkind(ni);
+
+    if (k == CGN_IDENT) {
+      var name: pchar := self.cg_nsval(ni);
+      var nlen: int64 := self.cg_nslen(ni);
+      // Skip built-in identifiers and constants
+      if (self.cg_findLocal(name, nlen) == 0 &&
+          self.cg_findCon(name, nlen) == 0) {
+        // Not local and not constant — check if already captured
+        if (self.cg_findCapturedVar(name, nlen) == 0) {
+          // Register as captured; offset resolved at runtime via static link
+          self.cg_addCapturedVar(name, nlen, 0);
+        }
+      }
+    }
+
+    // Recurse into children (expressions and sub-statements)
+    // Do NOT follow nnext here — statement lists are handled separately
+    var c0: int64 := self.cg_nc0(ni);
+    if (c0 >= 0) { self._analyzeCaptured(c0); }
+    var c1: int64 := self.cg_nc1(ni);
+    if (c1 >= 0) { self._analyzeCaptured(c1); }
+    var c2: int64 := self.cg_nc2(ni);
+    if (c2 >= 0) { self._analyzeCaptured(c2); }
+  }
+
+  // Walk a statement list (linked via nnext) and analyze each statement
+  fn _analyzeCapturedStmtList(ni: int64) {
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      self._analyzeCaptured(cur);
+      cur := self.cg_nnext(cur);
+    }
   }
 
   // WP-13: Generate nested function prologue (accepts static link in rbp+16)
@@ -2604,6 +2708,12 @@ pub type Codegen = class {
     var fnlen: int64 := self.cg_nslen(ni);
     self.cg_addLabel(fname, fnlen);
 
+    // Save and set outer function context for nested function capture analysis
+    var savedOuterName: pchar := self.outerFuncName;
+    var savedOuterLen: int64 := self.outerFuncNameLen;
+    self.outerFuncName := fname;
+    self.outerFuncNameLen := fnlen;
+
     // Reset locals
     self.localCount := 0;
     self.frameSize  := 0;
@@ -2646,6 +2756,10 @@ pub type Codegen = class {
     var aligned: int64 := fs - (fs & 15);
     if (aligned == 0) { aligned := 16; }
     poke32(self.code + prologuePatch, aligned);
+
+    // Restore outer function context
+    self.outerFuncName := savedOuterName;
+    self.outerFuncNameLen := savedOuterLen;
   }
 
   // ------------------------------------------------------------------
@@ -3062,6 +3176,11 @@ pub type Codegen = class {
     self.tempBufCap   := 64;
     self.tempBufs     := mmap(0, self.tempBufCap * 16, 3, 34, -1, 0);
     self.tempBufCount := 0;
+
+    // WP-13: Captured variable table for nested functions
+    self.capturedCap   := 64;
+    self.capturedVars  := mmap(0, self.capturedCap * 40, 3, 34, -1, 0);
+    self.capturedCount := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
