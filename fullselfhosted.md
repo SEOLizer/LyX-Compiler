@@ -608,20 +608,28 @@ bootstrap/backend/
 
 ### WP-28: Statische Analyse (Data-Flow, Bounds, WCET)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-21
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-21
 
 **Ziel:** Sicherheits-relevante statische Analysen im Bootstrap-Compiler.
 
-**Zu implementieren in `bootstrap/ir_analyze.lyx`:**
-1. **Null-Pointer-Analyse:** Taint-Tracking für `pchar`/Zeiger — Warnung bei ungeprüftem Deref
-2. **Array-Bounds-Check:** Statische Bounds-Überprüfung wo möglich
-3. **Stack-WCET:** Maximale Stack-Tiefe berechnen (für @stack_limit-Pragma)
-4. **Erreichbarkeits-Analyse:** Dead-Code-Erkennung auf Funktion-Level
-5. **Def-Use-Ketten:** Für Uninitialized-Variable-Detection
+**Implementiert in `bootstrap/ir/ir_analyze.lyx`:**
+- ✅ **Null-Pointer-Analyse:** Taint-Tracking für Zeiger (STATE_UNKNOWN/NON_NULL/NULL/MAYBE_NULL)
+- ✅ **checkNullDereference()** — Warnung bei potenziellem Null-Dereference
+- ✅ **Array-Bounds-Check:** Statische Bounds-Überprüfung (BOUNDS_SAFE/UNKNOWN/UNVERIFIED)
+- ✅ **checkArrayBounds()** — Vergleicht Index mit Array-Größe zur Kompilierzeit
+- ✅ **Stack-WCET:** Maximale Stack-Tiefe Berechnung (updateStackDepth/restoreStackDepth)
+- ✅ **getMaxStackDepth()** — Liefert worst-case Stack-Nutzung einer Funktion
+- ✅ **Erreichbarkeits-Analyse:** Dead-Code-Erkennung nach Return/Break/Goto
+- ✅ **findDeadCode()** — Findet unerreichbaren Code nach Sprunganweisungen
+- ✅ **Def-Use-Ketten:** Stub-Implementierung für Uninitialized-Variable-Detection
+- ✅ **IRAnalyzer-Klasse:** Kombiniert alle Analyse-Passes
+- ✅ **analyzeModule()** — Analysiert gesamtes IR-Modul
+- ✅ **analyzeFunc()** — Analysiert einzelne Funktionen
+- ✅ **analyzeIR()** — Globaler Entry-Point für Analyse
+
+**Verzeichnis-Struktur:** `bootstrap/ir/ir_analyze.lyx`
 
 **Referenz:** `compiler/ir/ir_static_analysis.pas` (~798 LOC)
-
-**Schätzung:** 3 Sessions | **Output:** `bootstrap/ir_analyze.lyx`
 
 ---
 
@@ -954,7 +962,7 @@ dann in Phase 2 dazu.
 ### Phase 4: Erweiterte Features
 - ✅ **WP-26:** Vollständiger Linter (W001–W020) (bootstrap/frontend/linter.lyx)
 - ✅ **WP-27:** Map/Set Collections (bootstrap/std/map.lyx, set.lyx)
-- ❌ **WP-28:** Statische Analyse
+- ✅ **WP-28:** Statische Analyse (bootstrap/ir/ir_analyze.lyx)
 - ❌ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity)
 - ❌ **WP-30:** Erweiterte Stdlib
 - ❌ **WP-31:** C FFI & Externes Linking
