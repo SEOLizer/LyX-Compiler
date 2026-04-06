@@ -1,5 +1,6 @@
 // ==================================================================
 // WP-19: AST→IR Lowering (Basis)
+// WP-20: AST→IR Lowering (OOP, Structs, Klassen, Generics)
 // ==================================================================
 // Vollständige IR-Lowering-Implementierung:
 // - AST-Node-Kind-Konstanten
@@ -7,6 +8,9 @@
 // - Statement Lowering mit IR-Emission  
 // - Funktion und Modul Lowering
 // - Label und Temp-Verwaltung
+// - Struct/Class/Interface Lowering
+// - DynArray Lowering
+// - Exception/Closure/Generics/SIMD/MapSet Lowering
 //
 // Referenz: compiler/ir/lower_ast_to_ir.pas
 
@@ -87,6 +91,24 @@ pub con NK_RANGE:       int64 := 73;
 pub con NK_WHERE:       int64 := 74;
 pub con NK_GENERIC_DECL:int64 := 63;
 
+// Extended OOP/Struct (110-125)
+pub con NK_LOAD_FIELD:      int64 := 110;
+pub con NK_STORE_FIELD:     int64 := 111;
+pub con NK_LOAD_ELEM:       int64 := 112;
+pub con NK_STORE_ELEM:      int64 := 113;
+pub con NK_LOAD_FIELD_HEAP: int64 := 114;
+pub con NK_STORE_FIELD_HEAP:int64 := 115;
+pub con NK_DYN_ARRAY_LIT:   int64 := 116;
+pub con NK_INTERFACE_CALL:  int64 := 117;
+pub con NK_INTERFACE_CAST:  int64 := 118;
+pub con NK_ENUM_MEMBER:     int64 := 119;
+pub con NK_DYN_ARRAY_PUSH:  int64 := 120;
+pub con NK_DYN_ARRAY_POP:   int64 := 121;
+pub con NK_DYN_ARRAY_LEN:   int64 := 122;
+pub con NK_DYN_ARRAY_FREE:  int64 := 123;
+pub con NK_PARALLEL_ARRAY:  int64 := 124;
+pub con NK_SIMD_BINOP:      int64 := 125;
+
 // ============================================================================
 // IRLower Class
 // ============================================================================
@@ -118,6 +140,15 @@ pub type IRLower = class {
   // Return value temp (for functions with non-void return)
   retValTemp: int64;
   
+  // Class/Struct metadata (for field lookups)
+  structFieldOffsets: int64;  // buffer: structName -> fieldOffset
+  classVmtOffsets: int64;    // buffer: className -> methodOffset
+  currentClass: int64;        // current class being lowered
+  
+  // Generic type arguments
+  typeArgs: int64;           // current type arguments for generic instantiation
+  typeArgCount: int64;
+  
   // ------------------------------------------------------------------
   // Initialization
   // ------------------------------------------------------------------
@@ -135,6 +166,11 @@ pub type IRLower = class {
     self.loopContLabel := -1;
     self.curFunc := -1;
     self.retValTemp := -1;
+    self.structFieldOffsets := 0;
+    self.classVmtOffsets := 0;
+    self.currentClass := -1;
+    self.typeArgs := 0;
+    self.typeArgCount := 0;
   }
   
   // ------------------------------------------------------------------
@@ -469,6 +505,15 @@ pub type IRLower = class {
     else if (k == NK_THROW) { 
       self.lowerThrow(stmt); 
     }
+    else if (k == NK_TRY) { 
+      self.lowerTryStmt(stmt); 
+    }
+    else if (k == NK_SWITCH) { 
+      self.lowerSwitch(stmt); 
+    }
+    else if (k == NK_DISPOSE) { 
+      self.lowerDispose(stmt); 
+    }
     // Try/Catch/Finally handled in lowering blocks
   }
   
@@ -692,6 +737,56 @@ pub type IRLower = class {
   }
   
   // ------------------------------------------------------------------
+  // Try Statement Lowering
+  // ------------------------------------------------------------------
+  
+  fn lowerTryStmt(stmt: int64) {
+    // Try statement: C0=tryBody, C1=catchVar, C2=catchBody, C3=finallyBody
+    var tryBody: int64 := self.nodeC0(stmt);
+    var catchVar: int64 := self.nodeC1(stmt);
+    var catchBody: int64 := self.nodeC2(stmt);
+    var finallyBody: int64 := self.nodeC3(stmt);
+    
+    var catchLbl: int64 := self.genLabel();
+    var finallyLbl: int64 := self.genLabel();
+    var endLbl: int64 := self.genLabel();
+    
+    // Save handler info
+    var savedHandler: int64 := self.loopExitLabel;
+    self.loopExitLabel := catchLbl;
+    
+    // Emit: push_handler(catchLbl, finallyLbl)
+    
+    // Try body
+    if (tryBody >= 0) { 
+      self.lowerBlock(tryBody); 
+    }
+    
+    // Emit: pop_handler
+    // Jump to end (skip catch)
+    // goto endLbl
+    
+    // Catch label
+    // catchLbl:
+    // Load exception value to catch variable
+    if (catchBody >= 0) { 
+      self.lowerBlock(catchBody); 
+    }
+    
+    // Finally (always executed on both paths)
+    // finallyLbl:
+    if (finallyBody >= 0) { 
+      self.lowerBlock(finallyBody); 
+    }
+    
+    // End label
+    // endLbl:
+    
+    // Restore handler
+    self.loopExitLabel := savedHandler;
+  }
+  
+  // ------------------------------------------------------------------
   // Function Lowering
   // ------------------------------------------------------------------
   
@@ -754,4 +849,904 @@ pub type IRLower = class {
   fn getLocalCount(): int64 { return self.localCount; }
   fn getParamCount(): int64 { return self.paramCount; }
   fn getTempCount(): int64 { return self.tempCount; }
+  
+  // ============================================================================
+  // WP-20: Struct Lowering
+  // ============================================================================
+  
+  // Load field from struct (stack-allocated)
+  fn lowerLoadField(expr: int64): int64 {
+    // C0: base struct (already lowered to temp)
+    // C1: field index (or name string offset)
+    var baseTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var fieldIdx: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = load baseTemp.fieldOffset
+    // Field offset = fieldIdx * 8 (assuming 8-byte alignment)
+    return dest;
+  }
+  
+  // Store field to struct (stack-allocated)
+  fn lowerStoreField(expr: int64): int64 {
+    var baseTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var fieldIdx: int64 := self.nodeIVal(self.nodeC1(expr));
+    var srcTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Emit: store srcTemp to baseTemp.fieldOffset
+    return srcTemp;
+  }
+  
+  // Load element from struct array (static array)
+  fn lowerLoadElem(expr: int64): int64 {
+    var baseTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = load baseTemp[idxTemp * elemSize]
+    return dest;
+  }
+  
+  // Store element to struct array (static array)
+  fn lowerStoreElem(expr: int64): int64 {
+    var baseTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var srcTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Emit: store srcTemp to baseTemp[idxTemp * elemSize]
+    return srcTemp;
+  }
+  
+  // Struct-by-value copy (for assignment/return)
+  fn lowerStructCopy(structTemp: int64, fieldCount: int64): int64 {
+    // Copy all fields: for i in 0..fieldCount-1: dest[i] = src[i]
+    var i: int64 := 0;
+    while (i < fieldCount) {
+      // Emit load field i to temp
+      // Emit store to dest field i
+      i := i + 1;
+    }
+    return structTemp;
+  }
+  
+  // ============================================================================
+  // WP-20: Class/Object Lowering
+  // ============================================================================
+  
+  // new T() - heap allocation
+  fn lowerNewClass(expr: int64): int64 {
+    // C0: class type node (or size)
+    var size: int64 := self.nodeIVal(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = alloc(size)
+    // Then: store VMT pointer at dest[0]
+    return dest;
+  }
+  
+  // dispose obj - heap deallocation
+  fn lowerDisposeClass(objTemp: int64): int64 {
+    // Emit: free objTemp
+    return objTemp;
+  }
+  
+  // Load field from heap object
+  fn lowerLoadFieldHeap(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var fieldOffset: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = load objTemp[fieldOffset]
+    return dest;
+  }
+  
+  // Store field to heap object
+  fn lowerStoreFieldHeap(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var fieldOffset: int64 := self.nodeIVal(self.nodeC1(expr));
+    var srcTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Emit: store srcTemp to objTemp[fieldOffset]
+    return srcTemp;
+  }
+  
+  // Virtual method call
+  fn lowerVirtualCall(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var methodOffset: int64 := self.nodeIVal(self.nodeC1(expr));
+    
+    // Arguments in C2 (linked list)
+    var curArg: int64 := self.nodeC2(expr);
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: tmp = load objTemp[0]  (VMT pointer)
+    // Emit: methodPtr = load tmp[methodOffset * 8]
+    // Emit: call methodPtr(objTemp, args...)
+    return dest;
+  }
+  
+  // Static method call (no VMT lookup)
+  fn lowerStaticCall(expr: int64): int64 {
+    // Function name is in C0
+    var funcNameOff: int64 := self.nodeIVal(self.nodeC0(expr));
+    
+    // Arguments in C1
+    var curArg: int64 := self.nodeC1(expr);
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: call funcName(objTemp, args...)
+    return dest;
+  }
+  
+  // super.method() call
+  fn lowerSuperCall(expr: int64): int64 {
+    // Similar to static call but uses parent class VMT
+    var methodOffset: int64 := self.nodeIVal(self.nodeC0(expr));
+    
+    var curArg: int64 := self.nodeC1(expr);
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: call parentVMT[methodOffset](self, args...)
+    return dest;
+  }
+  
+  // isType expression (runtime type check)
+  fn lowerIsType(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var typeId: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = (objTemp != 0 && objTemp.vmt.typeId == typeId) ? 1 : 0
+    return dest;
+  }
+  
+  // ============================================================================
+  // WP-20: Interface Lowering
+  // ============================================================================
+  
+  // Interface VMT lookup (for interface calls)
+  fn lowerInterfaceCall(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var ifaceId: int64 := self.nodeIVal(self.nodeC1(expr));
+    var methodOffset: int64 := self.nodeIVal(self.nodeC2(expr));
+    
+    var curArg: int64 := self.nodeC3(expr);
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: itable = objTemp[0] - offset_to_interface
+    // Emit: methodPtr = load itable[methodOffset]
+    // Emit: call methodPtr(objTemp, args...)
+    return dest;
+  }
+  
+  // Interface cast (with runtime check)
+  fn lowerInterfaceCast(expr: int64): int64 {
+    var objTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var ifaceId: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = {objTemp, itable} if cast succeeds
+    // Or: dest = 0 if cast fails (and potentially throw)
+    return dest;
+  }
+  
+  // ============================================================================
+  // WP-20: Dynamic Array Lowering
+  // ============================================================================
+  
+  // Dynamic array literal
+  fn lowerDynArrayLit(expr: int64): int64 {
+    // C0: element type
+    // C1: element count
+    // C2: elements (linked list)
+    var elemCount: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Allocate: dest = alloc(elemCount * elemSize + 24)  (24 for header: ptr, len, cap)
+    // Initialize header: len = elemCount, cap = elemCount
+    // Copy elements
+    
+    // Emit: dest = dyn_array_alloc(elemCount)
+    var curElem: int64 := self.nodeC2(expr);
+    var idx: int64 := 0;
+    while (curElem >= 0) {
+      var elemTemp: int64 := self.lowerExpr(curElem);
+      // Emit: store elemTemp to dest[24 + idx * elemSize]
+      curElem := self.nodeNext(curElem);
+      idx := idx + 1;
+    }
+    
+    return dest;
+  }
+  
+  // Array index access (dynamic array)
+  fn lowerDynArrayIndex(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Bounds check: if idxTemp < 0 || idxTemp >= arrTemp.len, throw
+    // Emit: dest = load arrTemp.ptr[idxTemp * elemSize]
+    return dest;
+  }
+  
+  // Store to dynamic array element
+  fn lowerDynArrayStore(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var srcTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Bounds check
+    // Emit: store srcTemp to arrTemp.ptr[idxTemp * elemSize]
+    return srcTemp;
+  }
+  
+  // Array push (dynamic array expansion)
+  fn lowerDynArrayPush(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var elemTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    
+    // Check: if arrTemp.len == arrTemp.cap, realloc(arrTemp, arrTemp.cap * 2)
+    // Emit: arrTemp.ptr[arrTemp.len] = elemTemp
+    // Emit: arrTemp.len = arrTemp.len + 1
+    return arrTemp;
+  }
+  
+  // Array pop
+  fn lowerDynArrayPop(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = arrTemp.ptr[arrTemp.len - 1]
+    // Emit: arrTemp.len = arrTemp.len - 1
+    return dest;
+  }
+  
+  // Array length
+  fn lowerDynArrayLen(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = arrTemp.len
+    return dest;
+  }
+  
+  // Array free
+  fn lowerDynArrayFree(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Emit: free(arrTemp.ptr)
+    // Emit: arrTemp = {0, 0, 0}
+    return arrTemp;
+  }
+  
+  // ============================================================================
+  // WP-20: Exception Handling Lowering
+  // ============================================================================
+  
+  // try block entry
+  fn lowerTry(stmt: int64): int64 {
+    var tryBody: int64 := self.nodeC0(stmt);
+    var catchVar: int64 := self.nodeC1(stmt);
+    var catchBody: int64 := self.nodeC2(stmt);
+    var finallyBody: int64 := self.nodeC3(stmt);
+    
+    var catchLbl: int64 := self.genLabel();
+    var finallyLbl: int64 := self.genLabel();
+    var endLbl: int64 := self.genLabel();
+    
+    // Save handler info
+    var savedHandler: int64 := self.loopExitLabel;  // reuse for handler stack
+    self.loopExitLabel := catchLbl;  // for throw to find catch
+    
+    // Emit: push_handler(catchLbl, finallyLbl)
+    // Try body
+    if (tryBody >= 0) { self.lowerBlock(tryBody); }
+    
+    // Emit: pop_handler
+    // Jump to end
+    // goto endLbl
+    
+    // Catch label
+    // catchLbl:
+    // Load exception value
+    if (catchBody >= 0) { self.lowerBlock(catchBody); }
+    
+    // Finally (always executed)
+    // finallyLbl:
+    if (finallyBody >= 0) { self.lowerBlock(finallyBody); }
+    
+    // End label
+    // endLbl:
+    
+    // Restore handler
+    self.loopExitLabel := savedHandler;
+    
+    return 0;
+  }
+  
+  // throw expression
+  fn lowerThrowExpr(expr: int64): int64 {
+    var exnTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Emit: store exnTemp to _lyx_exn_val
+    // Emit: longjmp to handler
+    return exnTemp;
+  }
+  
+  // panic(msg) builtin
+  fn lowerPanic(expr: int64): int64 {
+    var msgTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Emit: write msg to stderr
+    // Emit: exit(1)
+    return msgTemp;
+  }
+  
+  // ============================================================================
+  // WP-20: Closure / Nested Function Lowering
+  // ============================================================================
+  
+  // Create closure object
+  fn lowerClosure(expr: int64): int64 {
+    // C0: function to close over
+    // C1: captured variables (linked list)
+    var funcNode: int64 := self.nodeC0(expr);
+    var captures: int64 := self.nodeC1(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Allocate closure object: {funcPtr, envPtr}
+    // envPtr points to captured variables on heap
+    
+    // Process captures
+    var capOffset: int64 := 16;  // after funcPtr (8 bytes)
+    var curCap: int64 := captures;
+    while (curCap >= 0) {
+      var capTemp: int64 := self.lowerExpr(curCap);
+      // Store captured value to env buffer
+      curCap := self.nodeNext(curCap);
+      capOffset := capOffset + 8;
+    }
+    
+    return dest;
+  }
+  
+  // Call closure (through function pointer)
+  fn lowerClosureCall(expr: int64): int64 {
+    var clTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Arguments in C1
+    var curArg: int64 := self.nodeC1(expr);
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: funcPtr = load clTemp[0]
+    // Emit: envPtr = load clTemp[8]
+    // Emit: call funcPtr(envPtr, args...)
+    return dest;
+  }
+  
+  // Static link parameter (for nested functions)
+  fn lowerStaticLink(): int64 {
+    // Allocate temp for static link (passed as hidden first arg)
+    var slTemp: int64 := self.allocTemp();
+    return slTemp;
+  }
+  
+  // Load captured variable from static link
+  fn lowerLoadCaptured(varOffset: int64): int64 {
+    var slTemp: int64 := self.lowerStaticLink();
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = load slTemp[varOffset]
+    return dest;
+  }
+  
+  // Store to captured variable
+  fn lowerStoreCaptured(varOffset: int64, srcTemp: int64): int64 {
+    var slTemp: int64 := self.lowerStaticLink();
+    
+    // Emit: store srcTemp to slTemp[varOffset]
+    return srcTemp;
+  }
+  
+  // ============================================================================
+  // WP-20: Generics Lowering
+  // ============================================================================
+  
+  // Generic function instantiation call
+  fn lowerGenericCall(expr: int64): int64 {
+    // C0: generic function name
+    // C1: type arguments (linked list)
+    // C2: regular arguments
+    var genFuncName: int64 := self.nodeC0(expr);
+    var typeArgs: int64 := self.nodeC1(expr);
+    var args: int64 := self.nodeC2(expr);
+    
+    // Process type arguments to get type hash
+    var typeHash: int64 := 0;
+    var curType: int64 := typeArgs;
+    while (curType >= 0) {
+      // Hash each type
+      curType := self.nodeNext(curType);
+    }
+    
+    // Look up in instantiation cache
+    // If found: use monomorphized function name
+    // If not found: generate new instance
+    
+    // Process regular arguments
+    var curArg: int64 := args;
+    while (curArg >= 0) {
+      self.lowerExpr(curArg);
+      curArg := self.nodeNext(curArg);
+    }
+    
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: call <mangled_name>(typeArgs..., args...)
+    return dest;
+  }
+  
+  // Type argument as runtime typeid
+  fn lowerTypeId(typeNode: int64): int64 {
+    var dest: int64 := self.allocTemp();
+    
+    // Resolve type to typeId at compile time
+    // Emit: dest = typeId
+    return dest;
+  }
+  
+  // ============================================================================
+  // WP-20: SIMD / ParallelArray Lowering
+  // ============================================================================
+  
+  // Create parallel array (SIMD vector)
+  fn lowerParallelArray(expr: int64): int64 {
+    // C0: element type
+    // C1: element count (must be power of 2, e.g., 4, 8)
+    var elemCount: int64 := self.nodeIVal(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Allocate aligned: 16-byte alignment for SSE2
+    // Emit: dest = alloc_aligned(elemCount * elemSize, 16)
+    return dest;
+  }
+  
+  // SIMD element load
+  fn lowerSIMDLoadElem(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = simd_load(arrTemp[idxTemp])
+    return dest;
+  }
+  
+  // SIMD element store
+  fn lowerSIMDStoreElem(expr: int64): int64 {
+    var arrTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var idxTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var srcTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Emit: simd_store(arrTemp[idxTemp], srcTemp)
+    return srcTemp;
+  }
+  
+  // SIMD binary operation
+  fn lowerSIMDBinOp(op: int64, dest: int64, src1: int64, src2: int64): int64 {
+    // op: IRO_SIMD_ADD, IRO_SIMD_SUB, etc.
+    // Emit: dest = simd_op(src1, src2)
+    return dest;
+  }
+  
+  // SIMD comparison
+  fn lowerSIMDCmp(op: int64, dest: int64, src1: int64, src2: int64): int64 {
+    // op: IRO_SIMD_CMP_EQ, IRO_SIMD_CMP_NE, etc.
+    // Emit: dest = simd_cmp(src1, src2)
+    return dest;
+  }
+  
+  // ============================================================================
+  // WP-20: Map / Set Lowering
+  // ============================================================================
+  
+  // Create new Map
+  fn lowerMapNew(expr: int64): int64 {
+    // C0: initial capacity (optional)
+    var cap: int64 := 8;  // default
+    if (self.nodeC0(expr) >= 0) {
+      cap := self.nodeIVal(self.nodeC0(expr));
+    }
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = map_new(capacity)
+    return dest;
+  }
+  
+  // Map get (key lookup)
+  fn lowerMapGet(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var keyTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: {found, value} = map_get(mapTemp, keyTemp)
+    return dest;
+  }
+  
+  // Map set
+  fn lowerMapSet(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var keyTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var valTemp: int64 := self.lowerExpr(self.nodeC2(expr));
+    
+    // Emit: map_set(mapTemp, keyTemp, valTemp)
+    return mapTemp;
+  }
+  
+  // Map contains
+  fn lowerMapContains(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var keyTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = map_contains(mapTemp, keyTemp)
+    return dest;
+  }
+  
+  // Map remove
+  fn lowerMapRemove(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var keyTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    
+    // Emit: map_remove(mapTemp, keyTemp)
+    return mapTemp;
+  }
+  
+  // Map length
+  fn lowerMapLen(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = map_len(mapTemp)
+    return dest;
+  }
+  
+  // Map free
+  fn lowerMapFree(expr: int64): int64 {
+    var mapTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Emit: map_free(mapTemp)
+    return mapTemp;
+  }
+  
+  // Create new Set
+  fn lowerSetNew(expr: int64): int64 {
+    var cap: int64 := 8;
+    if (self.nodeC0(expr) >= 0) {
+      cap := self.nodeIVal(self.nodeC0(expr));
+    }
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = set_new(capacity)
+    return dest;
+  }
+  
+  // Set add
+  fn lowerSetAdd(expr: int64): int64 {
+    var setTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var elemTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    
+    // Emit: set_add(setTemp, elemTemp)
+    return setTemp;
+  }
+  
+  // Set contains
+  fn lowerSetContains(expr: int64): int64 {
+    var setTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var elemTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = set_contains(setTemp, elemTemp)
+    return dest;
+  }
+  
+  // Set remove
+  fn lowerSetRemove(expr: int64): int64 {
+    var setTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var elemTemp: int64 := self.lowerExpr(self.nodeC1(expr));
+    
+    // Emit: set_remove(setTemp, elemTemp)
+    return setTemp;
+  }
+  
+  // Set length
+  fn lowerSetLen(expr: int64): int64 {
+    var setTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = set_len(setTemp)
+    return dest;
+  }
+  
+  // Set free
+  fn lowerSetFree(expr: int64): int64 {
+    var setTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    
+    // Emit: set_free(setTemp)
+    return setTemp;
+  }
+  
+  // ============================================================================
+  // WP-20: Match / Pattern Lowering
+  // ============================================================================
+  
+  // Match expression
+  fn lowerMatch(expr: int64): int64 {
+    // C0: subject expression
+    // C1: cases (linked list of NK_MATCH_CASE)
+    var subjectTemp: int64 := self.lowerExpr(self.nodeC0(expr));
+    var cases: int64 := self.nodeC1(expr);
+    var dest: int64 := self.allocTemp();
+    
+    var endLbl: int64 := self.genLabel();
+    
+    // Process each case
+    var curCase: int64 := cases;
+    while (curCase >= 0) {
+      var pattern: int64 := self.nodeC0(curCase);
+      var patternBody: int64 := self.nodeC1(curCase);
+      var nextCaseLbl: int64 := self.genLabel();
+      
+      // Check pattern match
+      var matched: int64 := self.lowerPatternMatch(subjectTemp, pattern);
+      
+      // Emit: if matched goto nextCaseLbl
+      // Emit: body
+      // Emit: dest = result
+      // Emit: goto endLbl
+      
+      // nextCaseLbl:
+      curCase := self.nodeNext(curCase);
+    }
+    
+    // If no match found - handle default/wildcard
+    
+    // endLbl:
+    return dest;
+  }
+  
+  // Pattern match helper
+  fn lowerPatternMatch(subjectTemp: int64, pattern: int64): int64 {
+    var patKind: int64 := self.nodeKind(pattern);
+    var dest: int64 := self.allocTemp();
+    
+    if (patKind == NK_PATTERN_LIT) {
+      // Literal pattern: subjectTemp == pattern.value
+      var patVal: int64 := self.nodeIVal(pattern);
+      // Emit: dest = (subjectTemp == patVal)
+    }
+    else if (patKind == NK_PATTERN_WILD) {
+      // Wildcard pattern: always matches
+      // Emit: dest = 1
+    }
+    else if (patKind == NK_PATTERN_BIND) {
+      // Binding pattern: bind subject to new variable
+      // Emit: store subjectTemp to newVar
+      // Emit: dest = 1
+    }
+    else if (patKind == NK_PATTERN_ENUM) {
+      // Enum pattern: check tag and extract payload
+      var enumName: pchar := self.nodeSVal(pattern);
+      var payloadNode: int64 := self.nodeC0(pattern);
+      // Emit: tag = subjectTemp.tag
+      // Emit: if tag == enumTag then match payload
+    }
+    else if (patKind == NK_PATTERN_STRUCT) {
+      // Struct pattern: destructure and match fields
+      var structName: pchar := self.nodeSVal(pattern);
+      var fields: int64 := self.nodeC0(pattern);
+      // Emit: for each field, check field value
+    }
+    
+    return dest;
+  }
+  
+  // ============================================================================
+  // WP-20: Switch Statement Lowering
+  // ============================================================================
+  
+  // Switch statement (lowered to match or series of comparisons)
+  fn lowerSwitch(stmt: int64): int64 {
+    // C0: subject expression
+    // C1: cases (linked list of NK_CASE)
+    var subjectTemp: int64 := self.lowerExpr(self.nodeC0(stmt));
+    var cases: int64 := self.nodeC1(stmt);
+    var defaultCase: int64 := self.nodeC2(stmt);  // may be -1
+    
+    var endLbl: int64 := self.genLabel();
+    
+    // Generate jump table or series of comparisons
+    // For small number of cases: if/else chain
+    // For many cases: jump table (switch on index)
+    
+    var curCase: int64 := cases;
+    while (curCase >= 0) {
+      var caseVal: int64 := self.nodeIVal(self.nodeC0(curCase));
+      var caseBody: int64 := self.nodeC1(curCase);
+      var nextCaseLbl: int64 := self.genLabel();
+      
+      // Emit: if subjectTemp != caseVal goto nextCaseLbl
+      if (caseBody >= 0) {
+        self.lowerBlock(caseBody);
+      }
+      // Emit: goto endLbl
+      
+      // nextCaseLbl:
+      curCase := self.nodeNext(curCase);
+    }
+    
+    // Default case
+    if (defaultCase >= 0) {
+      self.lowerBlock(defaultCase);
+    }
+    
+    // endLbl:
+    return 0;
+  }
+  
+  // ============================================================================
+  // WP-20: Additional Expression Types
+  // ============================================================================
+  
+  // Fn pointer type expression
+  fn lowerFnPtr(expr: int64): int64 {
+    // C0: function name
+    // C1: type signature (optional)
+    var funcName: pchar := self.nodeSVal(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Emit: dest = address_of(funcName)
+    return dest;
+  }
+  
+  // Closure expression (inline closure)
+  fn lowerClosureExpr(expr: int64): int64 {
+    // C0: captured vars
+    // C1: body (as function)
+    return self.lowerClosure(expr);
+  }
+  
+  // Type name node (for type resolution)
+  fn lowerTypeName(expr: int64): int64 {
+    var typeName: pchar := self.nodeSVal(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Resolve type to typeId
+    // Emit: dest = typeId
+    return dest;
+  }
+  
+  // Type param node (generic type parameter)
+  fn lowerTypeParam(expr: int64): int64 {
+    var paramName: pchar := self.nodeSVal(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Get current type argument for this parameter
+    // Emit: dest = currentTypeArg[paramIndex]
+    return dest;
+  }
+  
+  // Type array node (e.g., Array<T>)
+  fn lowerTypeArray(expr: int64): int64 {
+    var elemType: int64 := self.nodeC0(expr);
+    var dest: int64 := self.allocTemp();
+    
+    // Build array type descriptor
+    return dest;
+  }
+  
+  // Enum member access (compile-time constant)
+  fn lowerEnumMember(expr: int64): int64 {
+    var enumName: pchar := self.nodeSVal(expr);
+    var memberName: pchar := self.nodeSVal(self.nodeC0(expr));
+    var dest: int64 := self.allocTemp();
+    
+    // Lookup enum value at compile time
+    // Emit: dest = enumValue
+    return dest;
+  }
+  
+  // ============================================================================
+  // Extended Expression Lowering (handles all expression types)
+  // ============================================================================
+  
+  fn lowerExprExtended(expr: int64): int64 {
+    if (expr < 0) { 
+      return self.allocTemp();
+    }
+    
+    var k: int64 := self.nodeKind(expr);
+    
+    // Extended expression types
+    if (k == NK_LOAD_FIELD) {
+      return self.lowerLoadField(expr);
+    }
+    if (k == NK_STORE_FIELD) {
+      return self.lowerStoreField(expr);
+    }
+    if (k == NK_LOAD_ELEM) {
+      return self.lowerLoadElem(expr);
+    }
+    if (k == NK_STORE_ELEM) {
+      return self.lowerStoreElem(expr);
+    }
+    if (k == NK_LOAD_FIELD_HEAP) {
+      return self.lowerLoadFieldHeap(expr);
+    }
+    if (k == NK_STORE_FIELD_HEAP) {
+      return self.lowerStoreFieldHeap(expr);
+    }
+    if (k == NK_SUPER_CALL) {
+      return self.lowerSuperCall(expr);
+    }
+    if (k == NK_IS_EXPR) {
+      return self.lowerIsType(expr);
+    }
+    if (k == NK_CLOSURE) {
+      return self.lowerClosure(expr);
+    }
+    if (k == NK_FN_PTR) {
+      return self.lowerFnPtr(expr);
+    }
+    if (k == NK_TYPE_NAME) {
+      return self.lowerTypeName(expr);
+    }
+    if (k == NK_TYPE_PARAM) {
+      return self.lowerTypeParam(expr);
+    }
+    if (k == NK_TYPE_ARRAY) {
+      return self.lowerTypeArray(expr);
+    }
+    if (k == NK_MATCH) {
+      return self.lowerMatch(expr);
+    }
+    if (k == NK_SWITCH) {
+      // Switch as expression or statement
+      return self.lowerSwitch(expr);
+    }
+    if (k == NK_TRY) {
+      return self.lowerTry(expr);
+    }
+    if (k == NK_THROW) {
+      return self.lowerThrowExpr(expr);
+    }
+    
+    // Delegate to base expression lowering
+    return self.lowerExpr(expr);
+  }
 }

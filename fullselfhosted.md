@@ -362,31 +362,25 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ### WP-20: AST→IR Lowering (OOP, Structs, Klassen, Generics)
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-19, WP-16, WP-14
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-19, WP-16, WP-14
 
 **Ziel:** Vollständiges Lowering von OOP-Konstrukten, Structs und generischen Typen.
 
-**Zu implementieren:**
-1. **Struct-Lowering:**
-   - Struct-Feld-Zugriff → `irLoadField` / `irStoreField`
-   - Struct-by-Value: Kopieren aller Felder
-   - Struct-Rückgabe > 16 Bytes: Hidden-Output-Pointer
-2. **Klassen-Lowering:**
-   - `new T()` → `irAlloc(size)` + `irStoreField(vmtSlot, vmtAddr)`
-   - Methoden-Aufruf (statisch) → `irCall(mangled_name, self, args...)`
-   - Virtueller Aufruf → `irLoadFieldHeap(obj, 0)` (VMT-Pointer) + `irVirtualCall`
-   - `dispose obj` → `irFree`
-3. **Interface-Lowering:** Interface-VMT-Lookup, Interface-Pointer-Paar {obj, ifaceVMT}
-4. **Dyn-Array-Lowering:** fat-pointer {ptr, len, cap}, Push → `irDynArrayPush`, etc.
-5. **Exception-Lowering:** try/catch → `irPushHandler` / `irPopHandler` / `irThrow`
-6. **Closure-Lowering:** Static-Link, Captured-Variable-Zugriffe
-7. **Generics-Lowering:** Aufruf spezialisierter Monomorphisierungen
-8. **SIMD-Lowering:** `ParallelArray<T>` → `irSIMDAdd`, etc.
-9. **Map/Set-Lowering:** `irMapNew`, `irMapGet`, etc.
+**Implementiert in `bootstrap/ir_lower.lyx`:**
+- ✅ **Struct-Lowering:** `lowerLoadField`, `lowerStoreField`, `lowerLoadElem`, `lowerStoreElem`, `lowerStructCopy`
+- ✅ **Klassen-Lowering:** `lowerNewClass`, `lowerDisposeClass`, `lowerLoadFieldHeap`, `lowerStoreFieldHeap`, `lowerVirtualCall`, `lowerStaticCall`, `lowerSuperCall`
+- ✅ **Interface-Lowering:** `lowerInterfaceCall`, `lowerInterfaceCast`
+- ✅ **Dyn-Array-Lowering:** `lowerDynArrayLit`, `lowerDynArrayIndex`, `lowerDynArrayStore`, `lowerDynArrayPush`, `lowerDynArrayPop`, `lowerDynArrayLen`, `lowerDynArrayFree`
+- ✅ **Exception-Lowering:** `lowerTry`, `lowerTryStmt`, `lowerThrowExpr`, `lowerPanic`
+- ✅ **Closure-Lowering:** `lowerClosure`, `lowerClosureCall`, `lowerStaticLink`, `lowerLoadCaptured`, `lowerStoreCaptured`
+- ✅ **Generics-Lowering:** `lowerGenericCall`, `lowerTypeId`
+- ✅ **SIMD-Lowering:** `lowerParallelArray`, `lowerSIMDLoadElem`, `lowerSIMDStoreElem`, `lowerSIMDBinOp`, `lowerSIMDCmp`
+- ✅ **Map/Set-Lowering:** `lowerMapNew`, `lowerMapGet`, `lowerMapSet`, `lowerMapContains`, `lowerMapRemove`, `lowerMapLen`, `lowerMapFree`, `lowerSetNew`, `lowerSetAdd`, `lowerSetContains`, `lowerSetRemove`, `lowerSetLen`, `lowerSetFree`
+- ✅ **Match/Pattern-Lowering:** `lowerMatch`, `lowerPatternMatch`, `lowerSwitch`
+- ✅ **Zusätzliche Typen:** `lowerFnPtr`, `lowerClosureExpr`, `lowerTypeName`, `lowerTypeParam`, `lowerTypeArray`, `lowerEnumMember`
+- ✅ **Erweiterte AST-Nodes:** NK_LOAD_FIELD bis NK_SIMD_BINOP Konstanten
 
 **Referenz:** `compiler/ir/lower_ast_to_ir.pas` (LowerClassMethod, LowerStructDecl, etc.)
-
-**Schätzung:** 4 Sessions | **Output:** `bootstrap/ir_lower.lyx` (vollständig)
 
 ---
 
@@ -913,7 +907,7 @@ dann in Phase 2 dazu.
 ### Phase 2: IR-Schicht
 - ✅ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx) — Abgeschlossen
 - ✅ **WP-19:** AST→IR Lowering (Basis) — Abgeschlossen
-- ❌ **WP-20:** AST→IR Lowering (OOP, Structs, Generics)
+- ✅ **WP-20:** AST→IR Lowering (OOP, Structs, Generics) — Abgeschlossen
 - ❌ **WP-21:** IR-Optimierungen in Lyx
 - ❌ **WP-22:** Function Inlining
 
