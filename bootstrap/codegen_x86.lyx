@@ -1760,6 +1760,67 @@ pub type Codegen = class {
         // i64, u64, pchar, bool, char, f32, f64: no-op (already 64-bit in rax)
       }
 
+    } else if (k == CGN_IS_EXPR) {
+      // BUG-08 supplement: x is Type — runtime type check via VMT
+      // c0 = object expression, c1 = type node
+      self.cg_genExpr(self.cg_nc0(ni));
+      var typeNode: int64 := self.cg_nc1(ni);
+      if (typeNode >= 0) {
+        var tname: pchar := self.cg_nsval(typeNode);
+        var tlen: int64 := self.cg_nslen(typeNode);
+        var classIdx: int64 := self.cg_findClass(tname, tlen);
+        if (classIdx >= 0) {
+          // Load VMT pointer from object: mov rcx, [rax]
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x08);
+          // Load expected VMT address
+          var vmtOff: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + 32);
+          var expectedVmt: int64 := CG_ELF_BASE + CG_CODE_OFF + self.codeLen + 20 + vmtOff;
+          // mov rdx, imm64 (expected VMT)
+          self.cg_e8(0x48); self.cg_e8(0xBA);
+          self.cg_e64(expectedVmt);
+          // cmp rcx, rdx; sete al; movzx rax, al
+          self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1);
+          self.cg_e8(0x0F); self.cg_e8(0x94); self.cg_e8(0xC0);
+          self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
+        } else {
+          self.cg_zeroRax();
+        }
+      } else {
+        self.cg_zeroRax();
+      }
+
+    } else if (k == CGN_CLOSURE) {
+      // WP-13: closure expression — allocate closure struct {fnPtr:8, envPtr:8}
+      // c0 = function reference, c1 = captured vars list
+      var fnNode: int64 := self.cg_nc0(ni);
+      // Allocate closure on stack (16 bytes)
+      var closureOff: int64 := self.cg_addLocal("__closure__", 10);
+      // Store function pointer
+      if (fnNode >= 0 && self.cg_nkind(fnNode) == CGN_IDENT) {
+        var fnName: pchar := self.cg_nsval(fnNode);
+        var fnLen: int64 := self.cg_nslen(fnNode);
+        // lea rax, [rip + fnName] — use label reference
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+        var fnPatch: int64 := self.codeLen;
+        self.cg_e32(0);
+        self.cg_addPatch(fnPatch, fnName as int64, fnLen, CG_PATCH_CALL);
+        self.cg_storeRax(closureOff);
+      } else {
+        self.cg_zeroRax();
+        self.cg_storeRax(closureOff);
+      }
+      // Store environment pointer (static link or null)
+      if (self.staticLinkOffset >= 0) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(0x10);
+        self.cg_pushRax();
+        self.cg_loadRax(closureOff);
+        // mov [rax+8], rbx (env ptr)
+        self.cg_popRbx();
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x58); self.cg_e8(0x08);
+      }
+      // Return closure pointer
+      self.cg_loadRax(closureOff);
+
     } else {
       // Unknown expression: emit 0
       self.cg_zeroRax();
@@ -2246,6 +2307,39 @@ pub type Codegen = class {
       var bp: int64 := self.codeLen;
       self.cg_e32(self.curBreakHead);  // link to previous
       self.curBreakHead := bp;
+
+    } else if (k == CGN_CASE) {
+      // Switch case body — generate body expression/block
+      // c0 = case value (or null for default), c1 = body
+      var bodyNode: int64 := self.cg_nc1(ni);
+      if (bodyNode >= 0) {
+        self.cg_genBlock(bodyNode);
+      }
+
+    } else if (k == CGN_MATCH_CASE) {
+      // Match case body — generate body expression
+      // c0 = pattern, c1 = body expression
+      var bodyNode: int64 := self.cg_nc1(ni);
+      if (bodyNode >= 0) {
+        self.cg_genExpr(bodyNode);
+      }
+
+    } else if (k == CGN_FIELD_DECL) {
+      // Field declaration in struct/class — no code generation needed
+      // Layout is handled by cg_buildStructLayout/cg_buildClassLayout
+      // Just skip (fields are processed during layout building)
+
+    } else if (k == CGN_PARAM) {
+      // Parameter declaration — already handled during function prologue generation
+      // In IR-lowering context: register parameter as local variable
+      var pname: pchar := self.cg_nsval(ni);
+      var plen: int64 := self.cg_nslen(ni);
+      var poff: int64 := self.cg_addLocal(pname, plen);
+      // Track type if present (c0 = type node)
+      var ptypeNode: int64 := self.cg_nc0(ni);
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
+        self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
+      }
 
     } else {
       // Other statement kinds: skip
