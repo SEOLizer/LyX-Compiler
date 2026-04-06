@@ -569,6 +569,59 @@ pub type Sema = class {
       // Check constructor arguments (child0 = first arg)
       var arg: int64 := self.sn_c0(ni);
       while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
+
+    } else if (k == SNK_CAST) {
+      // WP-11: x as Type — check source expression and target type
+      self._checkExpr(self.sn_c0(ni));
+      var typeNode: int64 := self.sn_c1(ni);
+      if (typeNode >= 0) {
+        self.ResolveType(typeNode);
+      }
+
+    } else if (k == SNK_CLOSURE) {
+      // WP-13: Closure expression — check captured vars and body
+      // c0 = function reference, c1 = captured vars list, c2 = body
+      var fnRef: int64 := self.sn_c0(ni);
+      if (fnRef >= 0) { self._checkExpr(fnRef); }
+      // Check captured variable references
+      var capVar: int64 := self.sn_c1(ni);
+      while (capVar >= 0) {
+        self._checkExpr(capVar);
+        capVar := self.sn_next(capVar);
+      }
+      // Check closure body
+      var body: int64 := self.sn_c2(ni);
+      if (body >= 0) { self._checkStmt(body); }
+
+    } else if (k == SNK_FN_PTR) {
+      // Function pointer literal — check function reference
+      var fnRef: int64 := self.sn_c0(ni);
+      if (fnRef >= 0 && self.sn_kind(fnRef) == SNK_IDENT) {
+        var nm: pchar := self.sn_sVal(fnRef);
+        var nl: int64 := self.sn_sLen(fnRef);
+        var si: int64 := self.Lookup(nm, nl);
+        if (si < 0) {
+          self._errorNode("undefined function for fn ptr", ni);
+        }
+      }
+
+    } else if (k == SNK_IS_EXPR) {
+      // WP-16: x is Type — check object and type
+      self._checkExpr(self.sn_c0(ni));
+      var typeNode: int64 := self.sn_c1(ni);
+      if (typeNode >= 0) {
+        self.ResolveType(typeNode);
+      }
+
+    } else if (k == SNK_SUPER_CALL) {
+      // WP-10a: super.method() — check method call in parent class context
+      var arg: int64 := self.sn_c0(ni);
+      while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
+
+    } else if (k == SNK_RANGE) {
+      // Range expression: start to/downto end
+      self._checkExpr(self.sn_c0(ni));
+      self._checkExpr(self.sn_c1(ni));
     }
     // Literals, NK_LIT_NULL, NK_INVALID: nothing to check
   }
@@ -919,23 +972,125 @@ pub type Sema = class {
   }
 
   // WP-14: Resolve generic function call with type arguments
+  // WP-14: Resolve generic function call with type arguments
   // e.g., Foo<int64>(arg1, arg2) → instantiate Foo with T=int64
   fn _resolveGenericCall(fnName: pchar, fnLen: int64, typeArgsNi: int64) {
-    // Stub: In full implementation, this would:
-    // 1. Look up the generic function declaration
-    // 2. Check that type arguments satisfy constraints
-    // 3. Create or retrieve a monomorphized instance from instCache
-    // 4. Generate specialized function code with T replaced by concrete type
-    
-    // For now, just validate that type arguments are valid types
+    // 1. Validate that type arguments are valid types
     var ta: int64 := typeArgsNi;
+    var argCount: int64 := 0;
     while (ta >= 0) {
       var tid: int64 := self.ResolveType(ta);
       if (tid == TY_UNKNOWN) {
         self._errorNode("unknown type in generic arguments", ta);
       }
+      argCount := argCount + 1;
       ta := self.sn_next(ta);
     }
+
+    // 2. Look up the generic function declaration and check constraints
+    var fnSym: int64 := self.Lookup(fnName, fnLen);
+    if (fnSym >= 0) {
+      var symKind: int64 := self.SymKind(fnSym);
+      // If it's a generic function (SYM_GENERIC_FUNC), check constraints
+      if (symKind == 10) {  // SYM_GENERIC_FUNC
+        var typeParams: int64 := self.SymTypeId(fnSym);
+        // Count type params and verify count matches
+        var tpCount: int64 := 0;
+        var tp: int64 := typeParams;
+        while (tp >= 0) { tpCount := tpCount + 1; tp := self.sn_next(tp); }
+        if (tpCount != argCount) {
+          self._errorNode("generic type argument count mismatch", typeArgsNi);
+        }
+        // Check constraints on each type argument (where clauses)
+        // This is handled by ResolveType for simple cases
+      }
+    }
+
+    // 3. Try to get existing monomorphized instance, or create one
+    var instIdx: int64 := self._getMonomorphInstance(fnName, fnLen, typeArgsNi);
+    if (instIdx < 0) {
+      // 4. Create new monomorphized instance
+      self._createMonomorphInstance(fnName, fnLen, typeArgsNi);
+    }
+  }
+
+  // WP-14: Create a new monomorphized function instance
+  // Generates a specialized symbol name like "Foo_int64" and registers it
+  fn _createMonomorphInstance(genName: pchar, genLen: int64, typeArgsNi: int64) {
+    // Build specialized name: "genName_type1_type2_..."
+    var nameBuf: int64 := mmap(0, genLen + 256, 3, 34, -1, 0);
+    var pos: int64 := 0;
+    // Copy generic function name
+    var i: int64 := 0;
+    while (i < genLen) {
+      poke8(nameBuf + pos, StrCharAt(genName, i));
+      pos := pos + 1;
+      i := i + 1;
+    }
+    // Append type arguments
+    var ta: int64 := typeArgsNi;
+    while (ta >= 0) {
+      poke8(nameBuf + pos, 95);  // '_'
+      pos := pos + 1;
+      var tid: int64 := self.ResolveType(ta);
+      // Append type name
+      if (self.sn_kind(ta) == SNK_TYPE_NAME) {
+        var tName: pchar := self.sn_sVal(ta);
+        var tLen: int64 := self.sn_sLen(ta);
+        var j: int64 := 0;
+        while (j < tLen) {
+          poke8(nameBuf + pos, StrCharAt(tName, j));
+          pos := pos + 1;
+          j := j + 1;
+        }
+      } else {
+        // Fallback: append type ID as number
+        poke8(nameBuf + pos, 116); pos := pos + 1;  // 't'
+        poke8(nameBuf + pos, 48 + tid); pos := pos + 1;
+      }
+      ta := self.sn_next(ta);
+    }
+    poke8(nameBuf + pos, 0);  // null terminator
+
+    // Register the specialized symbol
+    var instSymIdx: int64 := self._pushSym(9, nameBuf as pchar, pos, 0);  // SYM_FUNC
+    // 9 = SYM_FUNC (same as regular function)
+
+    // Cache the instantiation
+    // Cache entry: {genNamePtr:8, genNameLen:8, typeArgsHash:8, instNamePtr:8, instNameLen:8, instSymIdx:8} = 48 bytes
+    if (self.instCount >= self.instCap) {
+      var nc: int64 := self.instCap * 2;
+      if (nc == 0) { nc := 8; }
+      var nb: int64 := mmap(0, nc * 48, 3, 34, -1, 0);
+      var j: int64 := 0;
+      while (j < self.instCount * 48) {
+        poke8(nb + j, peek8(self.instCache + j));
+        j := j + 1;
+      }
+      if (self.instCache != 0) { munmap(self.instCache, self.instCap * 48); }
+      self.instCache := nb;
+      self.instCap := nc;
+    }
+    var base: int64 := self.instCache + self.instCount * 48;
+    poke64(base,      genName as int64);
+    poke64(base + 8,  genLen);
+    // Compute type hash
+    var typeHash: int64 := 0;
+    var th: int64 := typeArgsNi;
+    while (th >= 0) {
+      var tid: int64 := self.ResolveType(th);
+      typeHash := typeHash * 31 + tid;
+      th := self.sn_next(th);
+    }
+    poke64(base + 16, typeHash);
+    poke64(base + 24, nameBuf);
+    poke64(base + 32, pos);
+    poke64(base + 40, instSymIdx);
+    self.instCount := self.instCount + 1;
+
+    // Note: Full monomorphization would also copy the function body
+    // and replace type parameters with concrete types. For the bootstrap,
+    // we just register the symbol and rely on the codegen to handle it.
   }
   
   // WP-14: Get or create monomorphized function instance
@@ -978,8 +1133,36 @@ pub type Sema = class {
     var k: int64 := self.sn_kind(ni);
     if (k == SNK_FUNC_DECL) {
       self._checkFuncDecl(ni);
+    } else if (k == SNK_STRUCT_DECL) {
+      // Check struct field types
+      var field: int64 := self.sn_c0(ni);
+      while (field >= 0) {
+        var typeNode: int64 := self.sn_c0(field);
+        if (typeNode >= 0) {
+          self.ResolveType(typeNode);
+        }
+        field := self.sn_next(field);
+      }
+    } else if (k == SNK_ENUM_DECL) {
+      // Check enum variant payload types
+      var variant: int64 := self.sn_c0(ni);
+      while (variant >= 0) {
+        var payload: int64 := self.sn_c0(variant);
+        if (payload >= 0) {
+          self._checkExpr(payload);
+        }
+        variant := self.sn_next(variant);
+      }
+    } else if (k == SNK_TYPE_DECL) {
+      // Type alias: check the aliased type
+      var aliasedType: int64 := self.sn_c0(ni);
+      if (aliasedType >= 0) {
+        self.ResolveType(aliasedType);
+      }
+    } else if (k == SNK_IMPORT) {
+      // Mark import as potentially used (will be checked by linter)
+      // Import name is in sn_sVal
     }
-    // Struct/enum/type bodies not checked in minimal sema
   }
 
   fn Pass2(head: int64) {
