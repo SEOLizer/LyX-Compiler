@@ -1,0 +1,588 @@
+// ==================================================================
+// WP-31: ELF64 Dynamic Linker - PLT/GOT Support
+// ==================================================================
+// ELF64 Dynamic Linker mit PLT (Procedure Linkage Table) und GOT (Global Offset Table)
+// für dynamisches Linking gegen Shared Libraries
+//
+// Referenz: compiler/backend/elf/elf64_writer.pas
+
+import bootstrap.backend.elf.write_elf;
+
+// ============================================================================
+// Dynamic Linking Constants
+// ============================================================================
+
+// Dynamic section tags
+pub con DT_NULL: int64 := 0;
+pub con DT_NEEDED: int64 := 1;
+pub con DT_HASH: int64 := 4;
+pub con DT_STRTAB: int64 := 5;
+pub con DT_SYMTAB: int64 := 6;
+pub con DT_STRSZ: int64 := 10;
+pub con DT_SYMENT: int64 := 11;
+pub con DT_PLTGOT: int64 := 14;
+pub con DT_PLTRELSZ: int64 := 2;
+pub con DT_PLTREL: int64 := 17;
+pub con DT_JMPREL: int64 := 23;
+pub con DT_BIND_NOW: int64 := 24;
+pub con DT_REL: int64 := 17;
+pub con DT_RELSZ: int64 := 18;
+pub con DT_RELA: int64 := 7;
+pub con DT_RELASZ: int64 := 8;
+pub con DT_RELAENT: int64 := 9;
+
+// ELF64 relocation types
+pub con R_X86_64_GLOB_DAT: int64 := 6;
+pub con R_X86_64_JUMP_SLOT: int64 := 7;
+pub con R_X86_64_RELATIVE: int64 := 8;
+pub con R_X86_64_IRELATIVE: int64 := 37;
+
+// PLT entry size
+pub con PLT_ENTRY_SIZE: int64 := 16;
+pub con PLT0_SIZE: int64 := 48;
+
+// GOT entry size
+pub con GOT_ENTRY_SIZE: int64 := 8;
+
+// ============================================================================
+// Dynamic Symbol Entry
+// ============================================================================
+
+pub type TDynamicSymbol = record {
+  st_name: int64;     // Symbol name index in strtab
+  st_info: int64;     // Symbol type and binding
+  st_other: int64;    // Symbol visibility
+  st_shndx: int64;   // Section index
+  st_value: int64;    // Symbol value
+  st_size: int64;     // Symbol size
+};
+
+// ============================================================================
+// Dynamic Linker Class
+// ============================================================================
+
+pub type DynamicLinker = class {
+  // Output buffer
+  output: int64;
+  outputSize: int64;
+  outputCap: int64;
+  
+  // Sections
+  textOffset: int64;
+  dataOffset: int64;
+  rodataOffset: int64;
+  dynsymOffset: int64;
+  dynstrOffset: int64;
+  pltOffset: int64;
+  gotOffset: int64;
+  relOffset: int64;
+  dynamicOffset: int64;
+  
+  // Symbol table
+  dynsymMap: int64;
+  dynstrData: int64;
+  dynstrLen: int64;
+  
+  // PLT/GOT
+  pltEntries: int64;
+  pltCount: int64;
+  gotEntries: int64;
+  gotCount: int64;
+  
+  // Required libraries
+  neededLibs: int64;
+  neededCount: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(DynamicLinker));
+    
+    self.output := mmap(65536, 1);
+    self.outputSize := 0;
+    self.outputCap := 65536;
+    
+    self.dynsymMap := map_new(128);
+    self.dynstrData := mmap(4096, 1);
+    self.dynstrLen := 1;  // Start with null byte
+    poke8(self.dynstrData, 0);
+    
+    self.pltEntries := map_new(64);
+    self.pltCount := 0;
+    self.gotEntries := map_new(64);
+    self.gotCount := 0;
+    
+    self.neededLibs := map_new(16);
+    self.neededCount := 0;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // String Table Management
+  // ---------------------------------------------------------------------------
+  
+  fn addString(str: int64): int64 {
+    var len: int64 := StrLen(str);
+    var off: int64 := self.dynstrLen;
+    
+    // Expand if needed
+    if self.dynstrLen + len + 1 > 4096 {
+      var newStr: int64 := mmap(self.dynstrLen * 2, 1);
+      var i: int64 := 0;
+      while i < self.dynstrLen {
+        poke8(newStr + i, peek8(self.dynstrData + i));
+        i := i + 1;
+      }
+      munmap(self.dynstrData, 4096);
+      self.dynstrData := newStr;
+    }
+    
+    // Copy string
+    var i: int64 := 0;
+    while i <= len {
+      poke8(self.dynstrData + off + i, peek8(str + i));
+      i := i + 1;
+    }
+    
+    self.dynstrLen := self.dynstrLen + len + 1;
+    return off;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Symbol Management
+  // ---------------------------------------------------------------------------
+  
+  // Add dynamic symbol
+  pub fn AddSymbol(name: int64, addr: int64, size: int64, symType: int64, bind: int64): int64 {
+    // Check if already exists
+    if map_contains(self.dynsymMap, name, StrLen(name)) {
+      return map_get(self.dynsymMap, name, StrLen(name));
+    }
+    
+    var nameIdx: int64 := self.addString(name);
+    var idx: int64 := map_len(self.dynsymMap);
+    
+    // Store in map
+    map_set(self.dynsymMap, name, StrLen(name), idx);
+    
+    return idx;
+  }
+  
+  // Add undefined symbol (from shared library)
+  pub fn AddUndefined(name: int64): int64 {
+    var idx: int64 := self.AddSymbol(name, 0, 0, 2, 0);  // STB_GLOBAL, STT_NOTYPE
+    return idx;
+  }
+  
+  // Add PLT entry for function call
+  pub fn AddPLTEntry(name: int64, symIdx: int64): int64 {
+    // Check if already added
+    if map_contains(self.pltEntries, name, StrLen(name)) {
+      return map_get(self.pltEntries, name, StrLen(name));
+    }
+    
+    var pltIdx: int64 := self.pltCount;
+    map_set(self.pltEntries, name, StrLen(name), pltIdx);
+    self.pltCount := self.pltCount + 1;
+    
+    return pltIdx;
+  }
+  
+  // Add GOT entry for global variable
+  pub fn AddGOTEntry(name: int64, symIdx: int64): int64 {
+    // Check if already added
+    if map_contains(self.gotEntries, name, StrLen(name)) {
+      return map_get(self.gotEntries, name, StrLen(name));
+    }
+    
+    var gotIdx: int64 := self.gotCount;
+    map_set(self.gotEntries, name, StrLen(name), gotIdx);
+    self.gotCount := self.gotCount + 1;
+    
+    return gotIdx;
+  }
+  
+  // Add required library
+  pub fn AddNeeded(libName: int64): void {
+    var len: int64 := StrLen(libName);
+    
+    // Skip "lib" prefix if present
+    if len > 3 {
+      if peek8(libName) == 108 && peek8(libName + 1) == 105 && peek8(libName + 2) == 98 {  // "lib"
+        libName := libName + 3;
+        len := len - 3;
+      }
+    }
+    
+    // Skip .so suffix
+    if len > 3 {
+      if peek8(libName + len - 3) == 46 && 
+         peek8(libName + len - 2) == 115 && 
+         peek8(libName + len - 1) == 111 {
+        len := len - 3;
+      }
+    }
+    
+    // Add to needed list
+    map_set(self.neededLibs, libName, len, self.neededCount);
+    self.neededCount := self.neededCount + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // PLT Code Generation
+  // ---------------------------------------------------------------------------
+  
+  // Generate PLT0 (lazy binding)
+  fn generatePLT0(): int64 {
+    // x86_64 PLT0 entry:
+    //   push  [got + 8]     # Load GOT[1] into rax
+    //   jmp   [got + 16]   # Jump to GOT[2] (rtld)
+    //   nop
+    //   nop
+    //   nop
+    
+    var plt0: int64 := mmap(PLT0_SIZE, 1);
+    
+    // PLT0 code (16 bytes per entry, 3 entries for PLT0)
+    var i: int64 := 0;
+    
+    // Entry 0: pushq GOT[1](%rip)
+    // ff 35 02 00 00 00    pushq 2(%rip)
+    poke8(plt0 + 0, 255);   // 0xff
+    poke8(plt0 + 1, 53);    // 0x35
+    poke8(plt0 + 2, 2);     // offset 2
+    poke8(plt0 + 3, 0);
+    poke8(plt0 + 4, 0);
+    poke8(plt0 + 5, 0);
+    
+    // jmpq *GOT[2](%rip)
+    // ff 25 02 00 00 00    jmpq 2(%rip)
+    poke8(plt0 + 6, 255);   // 0xff
+    poke8(plt0 + 7, 37);    // 0x25
+    poke8(plt0 + 8, 2);
+    poke8(plt0 + 9, 0);
+    poke8(plt0 + 10, 0);
+    poke8(plt0 + 11, 0);
+    
+    // nops to align
+    poke8(plt0 + 12, 144);  // 0x90 (nop)
+    poke8(plt0 + 13, 144);
+    poke8(plt0 + 14, 144);
+    poke8(plt0 + 15, 144);
+    
+    return plt0;
+  }
+  
+  // Generate PLT entry for function
+  fn generatePLTEntry(pltIdx: int64, gotOffset: int64): int64 {
+    var entry: int64 := mmap(PLT_ENTRY_SIZE, 1);
+    
+    // jmpq *gotOffset(%rip)
+    // ff 25 xx xx xx xx    jmpq offset(%rip)
+    var relOffset: int64 := gotOffset - (pltIdx * PLT_ENTRY_SIZE + 6);
+    
+    poke8(entry + 0, 255);   // 0xff
+    poke8(entry + 1, 37);    // 0x25
+    
+    // Offset to GOT entry (relative to end of jmp instruction)
+    poke8(entry + 2, relOffset & 255);
+    poke8(entry + 3, (relOffset >> 8) & 255);
+    poke8(entry + 4, (relOffset >> 16) & 255);
+    poke8(entry + 5, (relOffset >> 24) & 255);
+    
+    // Push index onto stack
+    // 68 xx xx xx xx    push $index
+    poke8(entry + 6, 104);   // 0x68
+    poke8(entry + 7, (pltIdx + 1) & 255);  // PLT index + 1
+    poke8(entry + 8, 0);
+    poke8(entry + 9, 0);
+    poke8(entry + 10, 0);
+    
+    // jmpq PLT0
+    // e9 xx xx xx xx    jmpq -offset
+    var jmpOffset: int64 := 0 - (pltIdx * PLT_ENTRY_SIZE + 11 + PLT0_SIZE);
+    
+    poke8(entry + 11, 233);  // 0xe9
+    poke8(entry + 12, jmpOffset & 255);
+    poke8(entry + 13, (jmpOffset >> 8) & 255);
+    poke8(entry + 14, (jmpOffset >> 16) & 255);
+    poke8(entry + 15, (jmpOffset >> 24) & 255);
+    
+    return entry;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Relocation Generation
+  // ---------------------------------------------------------------------------
+  
+  // Generate relocation for PLT
+  fn generateRelocation(symIdx: int64, offset: int64, relType: int64): int64 {
+    // ELF64_Rela structure (24 bytes)
+    var rela: int64 := mmap(24, 1);
+    
+    poke64(rela, offset);           // r_offset
+    poke64(rela + 8, (relType << 32) | symIdx);  // r_info
+    poke64(rela + 16, 0);          // r_addend
+    
+    return rela;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Dynamic Section Generation
+  // ---------------------------------------------------------------------------
+  
+  fn generateDynamic(): int64 {
+    // Calculate dynamic section size
+    // Need: DT_NULL, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT,
+    //       DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL, DT_JMPREL, DT_RELA, DT_RELASZ,
+    //       DT_RELAENT, DT_NEEDED (for each lib), DT_NULL
+    var entryCount: int64 := 14 + self.neededCount + 1;
+    var dynSize: int64 := entryCount * 16;  // 16 bytes per entry
+    
+    var dynamic: int64 := mmap(dynSize, 1);
+    var pos: int64 := 0;
+    
+    // DT_NULL (terminator at end, but put first for simplicity)
+    // We'll put it at the end
+    
+    // DT_NEEDED entries
+    var libIdx: int64 := 0;
+    while libIdx < self.neededCount {
+      poke64(dynamic + pos, DT_NEEDED);
+      poke64(dynamic + pos + 8, libIdx);  // String table offset
+      pos := pos + 16;
+      libIdx := libIdx + 1;
+    }
+    
+    // DT_HASH
+    poke64(dynamic + pos, DT_HASH);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_STRTAB
+    poke64(dynamic + pos, DT_STRTAB);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_SYMTAB
+    poke64(dynamic + pos, DT_SYMTAB);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_STRSZ
+    poke64(dynamic + pos, DT_STRSZ);
+    poke64(dynamic + pos + 8, self.dynstrLen);
+    pos := pos + 16;
+    
+    // DT_SYMENT
+    poke64(dynamic + pos, DT_SYMENT);
+    poke64(dynamic + pos + 8, 24);  // sizeof(Elf64_Sym) = 24
+    pos := pos + 16;
+    
+    // DT_PLTGOT
+    poke64(dynamic + pos, DT_PLTGOT);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_PLTRELSZ
+    poke64(dynamic + pos, DT_PLTRELSZ);
+    poke64(dynamic + pos + 8, self.pltCount * 24);  // sizeof(Elf64_Rela)
+    pos := pos + 16;
+    
+    // DT_PLTREL
+    poke64(dynamic + pos, DT_PLTREL);
+    poke64(dynamic + pos + 8, 7);  // RELA
+    pos := pos + 16;
+    
+    // DT_JMPREL
+    poke64(dynamic + pos, DT_JMPREL);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_RELA
+    poke64(dynamic + pos, DT_RELA);
+    poke64(dynamic + pos + 8, 0);  // Will be filled
+    pos := pos + 16;
+    
+    // DT_RELASZ
+    poke64(dynamic + pos, DT_RELASZ);
+    poke64(dynamic + pos + 8, 0);
+    pos := pos + 16;
+    
+    // DT_RELAENT
+    poke64(dynamic + pos, DT_RELAENT);
+    poke64(dynamic + pos + 8, 24);
+    pos := pos + 16;
+    
+    // DT_NULL (terminator)
+    poke64(dynamic + pos, DT_NULL);
+    poke64(dynamic + pos + 8, 0);
+    
+    return dynamic;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Symbol Table Generation
+  // ---------------------------------------------------------------------------
+  
+  fn generateDynsym(): int64 {
+    var symCount: int64 := map_len(self.dynsymMap) + 1;  // +1 for null symbol
+    var symSize: int64 := symCount * 24;  // 24 bytes per symbol
+    
+    var dynsym: int64 := mmap(symSize, 1);
+    
+    // Null symbol at index 0
+    poke64(dynsym, 0);      // st_name
+    poke64(dynsym + 8, 0);  // st_info
+    poke64(dynsym + 16, 0); // st_other
+    poke64(dynsym + 24, 0); // st_shndx
+    poke64(dynsym + 32, 0); // st_value
+    poke64(dynsym + 40, 0); // st_size
+    
+    // Other symbols will be filled later
+    // For now, just return the buffer
+    
+    return dynsym;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Finalization
+  // ---------------------------------------------------------------------------
+  
+  // Get PLT size
+  fn getPLTSize(): int64 {
+    return PLT0_SIZE + self.pltCount * PLT_ENTRY_SIZE;
+  }
+  
+  // Get GOT size
+  fn getGOTSize(): int64 {
+    // GOT[0] = 0, GOT[1] = dl_runtime_resolve, GOT[2] = link_map
+    // Plus entries for each PLT/GOT symbol
+    return (3 + self.pltCount + self.gotCount) * GOT_ENTRY_SIZE;
+  }
+  
+  // Get relocation count
+  fn getRelCount(): int64 {
+    return self.pltCount;  // One relocation per PLT entry
+  }
+  
+  // Get total dynamic section size
+  fn getDynamicSize(): int64 {
+    var entryCount: int64 := 14 + self.neededCount + 1;
+    return entryCount * 16;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Output Generation
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetPLTCount(): int64 {
+    return self.pltCount;
+  }
+  
+  pub fn GetGOTCount(): int64 {
+    return self.gotCount;
+  }
+  
+  pub fn GetNeededCount(): int64 {
+    return self.neededCount;
+  }
+  
+  pub fn GetDynsymCount(): int64 {
+    return map_len(self.dynsymMap) + 1;
+  }
+  
+  pub fn GetDynstrData(): int64 {
+    return self.dynstrData;
+  }
+  
+  pub fn GetDynstrLen(): int64 {
+    return self.dynstrLen;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.output != 0 {
+      munmap(self.output, self.outputCap);
+    }
+    if self.dynstrData != 0 {
+      munmap(self.dynstrData, 4096);
+    }
+    map_free(self.dynsymMap);
+    map_free(self.pltEntries);
+    map_free(self.gotEntries);
+    map_free(self.neededLibs);
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global Dynamic Linker
+// ============================================================================
+
+var globalDynamicLinker: int64 := 0;
+
+pub fn DynamicLinkerInit(): void {
+  globalDynamicLinker := DynamicLinker.Create();
+}
+
+pub fn DynamicLinkerGet(): int64 {
+  return globalDynamicLinker;
+}
+
+pub fn DynamicLinkerShutdown(): void {
+  if globalDynamicLinker != 0 {
+    var linker: int64 := globalDynamicLinker as DynamicLinker;
+    linker.Free();
+    globalDynamicLinker := 0;
+  }
+}
+
+// ============================================================================
+// External Symbol Resolution
+// ============================================================================
+
+// Mark symbol as needing dynamic resolution
+pub fn MarkExternal(name: int64, isFunction: bool): int64 {
+  var linker: int64 := globalDynamicLinker as DynamicLinker;
+  if linker == 0 { return 0; }
+  
+  if isFunction {
+    return linker.AddPLTEntry(name, 0);
+  } else {
+    return linker.AddGOTEntry(name, 0);
+  }
+}
+
+// Add required library
+pub fn AddRequiredLib(lib: int64): void {
+  var linker: int64 := globalDynamicLinker as DynamicLinker;
+  if linker == 0 { return; }
+  
+  linker.AddNeeded(lib);
+}
+
+// Get PLT/GOT info for code generation
+pub fn GetExternalInfo(name: int64): int64 {
+  // Returns: gotOffset (0 if not found)
+  var linker: int64 := globalDynamicLinker as DynamicLinker;
+  if linker == 0 { return 0; }
+  
+  // Check PLT first
+  if map_contains(linker.pltEntries, name, StrLen(name)) {
+    var pltIdx: int64 := map_get(linker.pltEntries, name, StrLen(name));
+    // Return PLT offset (negative for PLT)
+    return 0 - (pltIdx * PLT_ENTRY_SIZE + PLT0_SIZE);
+  }
+  
+  // Then GOT
+  if map_contains(linker.gotEntries, name, StrLen(name)) {
+    var gotIdx: int64 := map_get(linker.gotEntries, name, StrLen(name));
+    return 3 * GOT_ENTRY_SIZE + gotIdx * GOT_ENTRY_SIZE;
+  }
+  
+  return 0;
+}

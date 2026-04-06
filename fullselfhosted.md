@@ -697,16 +697,40 @@ bootstrap/std/
 
 ### WP-31: C FFI & Externes Linking
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-25
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-25
 
 **Ziel:** `extern`-Deklarationen und Linking gegen C-Bibliotheken.
 
-**Zu implementieren:**
-1. **Parser:** `extern fn malloc(size: u64): pchar;`
-2. **Sema:** Extern-Symbol-Registrierung ohne Body-Anforderung
-3. **Linker-Unterstützung:** Unresolved Symbols werden als PLT/GOT-Einträge in ELF/PE/MachO eingetragen
-4. **`@lib("libc.so.6")`-Pragma:** Markiert benötigte Shared Libraries
-5. **C-Header-Import (optional):** Rudimentäres Parsen von C-Prototypes
+**Implementiert in `bootstrap/frontend/` und `bootstrap/backend/`:**
+- ✅ **FFI Parser:** `ffi_parser.lyx` - extern fn, @lib, @ccall, @stdcall, @fastcall
+- ✅ **C-Typ-Mapping:** C-Typen zu Lyx-Typen (void, int64, f64, pchar, etc.)
+- ✅ **Extern-Symbol-Registrierung:** FFIParser mit Symbol-Table und Library-Registry
+- ✅ **ELF PLT/GOT:** `backend/elf/dynamic_linker.lyx` mit PLT, GOT, Relocations
+- ✅ **PE Import Tables:** `backend/pe/dynamic_linker.lyx` mit ILT, IAT, Bound Imports
+- ✅ **MachO dyld:** `backend/macho/dynamic_linker.lyx` mit Lazy Binding, Rebase Info
+- ✅ **C Header Parser:** `c_header_parser.lyx` - rudimentäres C-Prototype-Parsing
+
+**Verzeichnis-Struktur:**
+```
+bootstrap/frontend/
+  ffi_parser.lyx         (FFI Parser, Typ-Mapping, Symbol-Registrierung)
+  c_header_parser.lyx   (C Header Parser)
+
+bootstrap/backend/
+  x86_64/
+    emit_x86.lyx         (WP-23)
+  arm64/
+    emit_arm64.lyx       (WP-24)
+  elf/
+    write_elf.lyx        (WP-25)
+    dynamic_linker.lyx   (WP-31: PLT/GOT)
+  pe/
+    write_pe.lyx         (WP-25)
+    dynamic_linker.lyx   (WP-31: Import Tables)
+  macho/
+    write_macho.lyx     (WP-25)
+    dynamic_linker.lyx  (WP-31: dyld)
+```
 
 **Referenz:** `compiler/frontend/c_header_parser.pas` (~902 LOC)
 
@@ -984,7 +1008,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-28:** Statische Analyse (bootstrap/ir/ir_analyze.lyx)
 - ✅ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity) (bootstrap/ir/ir_safety.lyx)
 - ✅ **WP-30:** Erweiterte Stdlib (bootstrap/std/*.lyx)
-- ❌ **WP-31:** C FFI & Externes Linking
+- ✅ **WP-31:** C FFI & Externes Linking (bootstrap/frontend/ffi_parser.lyx, c_header_parser.lyx)
 - ❌ **WP-32:** RISC-V + Embedded Backends
 
 ### Phase 5: Volle Selbst-Kompilierung
