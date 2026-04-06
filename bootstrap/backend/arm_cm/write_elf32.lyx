@@ -1,0 +1,359 @@
+// ==================================================================
+// WP-32: ELF32 for ARM Cortex-M Writer
+// ==================================================================
+// ELF32 Binary Writer für ARM Cortex-M (Thumb-2)
+// - ELF32 Header
+// - Program Headers (PT_LOAD)
+// - Section Headers
+// - Relocations
+//
+// Referenz: write_elf32_arm_cm.lyx
+
+import bootstrap.backend.arm_cm.emit_arm_cm;
+
+// ============================================================================
+// ELF32 Constants
+// ============================================================================
+
+pub con ELFCLASS32: int64 := 1;
+pub con ELFDATA2LSB: int64 := 1;
+pub con EV_CURRENT: int64 := 1;
+pub con ELFOSABI_SYSV: int64 := 0;
+
+pub con ET_EXEC: int64 := 2;
+pub con EM_ARM: int64 := 40;
+
+pub con PT_LOAD: int64 := 1;
+pub con PT_DYNAMIC: int64 := 2;
+pub con PT_INTERP: int64 := 3;
+pub con PT_NOTE: int64 := 4;
+
+pub con PF_R: int64 := 4;
+pub con PF_W: int64 := 2;
+pub con PF_X: int64 := 1;
+
+pub con SHT_NULL: int64 := 0;
+pub con SHT_PROGBITS: int64 := 1;
+pub con SHT_SYMTAB: int64 := 2;
+pub con SHT_STRTAB: int64 := 3;
+pub con SHT_RELA: int64 := 4;
+pub con SHT_NOBITS: int64 := 8;
+
+pub con SHF_WRITE: int64 := 1;
+pub con SHF_ALLOC: int64 := 2;
+pub con SHF_EXECINSTR: int64 := 4;
+
+pub con ELF_HDR_SIZE: int64 := 52;
+pub con PHDR_SIZE: int64 := 32;
+pub con SHDR_SIZE: int64 := 40;
+
+// Memory Map (STM32)
+pub con STM32_FLASH_BASE: int64 := 134217728;      // 0x08000000
+pub con STM32_RAM_BASE: int64 := 536870912;        // 0x20000000
+pub con STM32_VECTOR_TABLE: int64 := 134217728;    // 0x08000000
+
+// ============================================================================
+// ELF32 Structures
+// ============================================================================
+
+pub type TElf32Header = record {
+  e_ident: int64;      // 16 bytes
+  e_type: int64;      // 2 bytes
+  e_machine: int64;   // 2 bytes
+  e_version: int64;  // 4 bytes
+  e_entry: int64;    // 4 bytes
+  e_phoff: int64;    // 4 bytes
+  e_shoff: int64;    // 4 bytes
+  e_flags: int64;    // 4 bytes
+  e_ehsize: int64;  // 2 bytes
+  e_phentsize: int64; // 2 bytes
+  e_phnum: int64;    // 2 bytes
+  e_shentsize: int64; // 2 bytes
+  e_shnum: int64;    // 2 bytes
+  e_shstrndx: int64; // 2 bytes
+};
+
+pub type TElf32Phdr = record {
+  p_type: int64;
+  p_offset: int64;
+  p_vaddr: int64;
+  p_paddr: int64;
+  p_filesz: int64;
+  p_memsz: int64;
+  p_flags: int64;
+  p_align: int64;
+};
+
+// ============================================================================
+// ARM ELF Writer Class
+// ============================================================================
+
+pub type ARMELFWriter = class {
+  // Output buffer
+  output: int64;
+  outputSize: int64;
+  outputCap: int64;
+  
+  // Sections
+  textData: int64;
+  textSize: int64;
+  textAddr: int64;
+  
+  dataData: int64;
+  dataSize: int64;
+  dataAddr: int64;
+  
+  rodataData: int64;
+  rodataSize: int64;
+  rodataAddr: int64;
+  
+  // Headers
+  headerSize: int64;
+  phdrOffset: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(ARMELFWriter));
+    
+    self.output := mmap(131072, 1);
+    self.outputSize := 0;
+    self.outputCap := 131072;
+    
+    self.textData := 0;
+    self.textSize := 0;
+    self.textAddr := STM32_FLASH_BASE;
+    
+    self.dataData := 0;
+    self.dataSize := 0;
+    self.dataAddr := STM32_RAM_BASE;
+    
+    self.rodataData := 0;
+    self.rodataSize := 0;
+    self.rodataAddr := STM32_FLASH_BASE + 16384;
+    
+    self.headerSize := ELF_HDR_SIZE;
+    self.phdrOffset := ELF_HDR_SIZE;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Section Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn SetTextSection(code: int64, size: int64, addr: int64): void {
+    self.textData := code;
+    self.textSize := size;
+    self.textAddr := addr;
+  }
+  
+  pub fn SetDataSection(data: int64, size: int64, addr: int64): void {
+    self.dataData := data;
+    self.dataSize := size;
+    self.dataAddr := addr;
+  }
+  
+  pub fn SetRodataSection(data: int64, size: int64, addr: int64): void {
+    self.rodataData := data;
+    self.rodataSize := size;
+    self.rodataAddr := addr;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Header Generation
+  // ---------------------------------------------------------------------------
+  
+  fn writeHeader(entry: int64): void {
+    // ELF Header (52 bytes)
+    // e_ident[16]
+    self.emitByte(127);  // 0x7F
+    self.emitByte(69);   // 'E'
+    self.emitByte(76);   // 'L'
+    self.emitByte(70);   // 'F'
+    self.emitByte(ELFCLASS32);
+    self.emitByte(ELFDATA2LSB);
+    self.emitByte(EV_CURRENT);
+    self.emitByte(ELFOSABI_SYSV);
+    self.emitByte(0);    // padding
+    self.emitByte(0);
+    self.emitByte(0);
+    self.emitByte(0);
+    self.emitByte(0);
+    self.emitByte(0);
+    self.emitByte(0);
+    self.emitByte(0);
+    
+    // e_type
+    self.emitHalf(ET_EXEC);
+    
+    // e_machine
+    self.emitHalf(EM_ARM);
+    
+    // e_version
+    self.emitWord(EV_CURRENT);
+    
+    // e_entry
+    self.emitWord(entry);
+    
+    // e_phoff
+    self.emitWord(self.phdrOffset);
+    
+    // e_shoff (0 for ARM)
+    self.emitWord(0);
+    
+    // e_flags (ARM-specific)
+    self.emitWord(0x5000200);  // EABI5, soft-float
+    
+    // e_ehsize
+    self.emitHalf(ELF_HDR_SIZE);
+    
+    // e_phentsize
+    self.emitHalf(PHDR_SIZE);
+    
+    // e_phnum (2: load + dynamic)
+    self.emitHalf(2);
+    
+    // e_shentsize
+    self.emitHalf(0);
+    
+    // e_shnum
+    self.emitHalf(0);
+    
+    // e_shstrndx
+    self.emitHalf(0);
+  }
+  
+  fn writeProgramHeaders(textFileOff: int64, dataFileOff: int64): void {
+    // Program Header 1: LOAD (text + rodata)
+    var progBitsSize: int64 := self.textSize + self.rodataSize;
+    
+    self.emitWord(PT_LOAD);
+    self.emitWord(0);           // offset (filled later)
+    self.emitWord(self.textAddr);  // vaddr
+    self.emitWord(self.textAddr);  // paddr
+    self.emitWord(progBitsSize);    // filesz
+    self.emitWord(progBitsSize);    // memsz
+    self.emitWord(PF_R | PF_X);     // flags
+    self.emitWord(4096);           // align
+    
+    // Program Header 2: LOAD (data)
+    self.emitWord(PT_LOAD);
+    self.emitWord(0);           // offset (filled later)
+    self.emitWord(self.dataAddr);  // vaddr
+    self.emitWord(self.dataAddr);  // paddr
+    self.emitWord(self.dataSize);  // filesz
+    self.emitWord(self.dataSize);  // memsz
+    self.emitWord(PF_R | PF_W);    // flags
+    self.emitWord(4096);           // align
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Byte Emission
+  // ---------------------------------------------------------------------------
+  
+  fn emitByte(b: int64): void {
+    if self.outputSize >= self.outputCap {
+      return;
+    }
+    poke8(self.output + self.outputSize, b & 255);
+    self.outputSize := self.outputSize + 1;
+  }
+  
+  fn emitHalf(h: int64): void {
+    self.emitByte(h & 255);
+    self.emitByte((h >> 8) & 255);
+  }
+  
+  fn emitWord(w: int64): void {
+    self.emitByte(w & 255);
+    self.emitByte((w >> 8) & 255);
+    self.emitByte((w >> 16) & 255);
+    self.emitByte((w >> 24) & 255);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Output Generation
+  // ---------------------------------------------------------------------------
+  
+  pub fn Write(entry: int64): int64 {
+    // Calculate offsets
+    var headerEnd: int64 := self.phdrOffset + 2 * PHDR_SIZE;
+    var textOffset: int64 := headerEnd;
+    var rodataOffset: int64 := textOffset + self.textSize;
+    var dataOffset: int64 := rodataOffset + self.rodataSize;
+    
+    // Write headers
+    self.writeHeader(entry);
+    self.writeProgramHeaders(textOffset, dataOffset);
+    
+    // Write .text section
+    var i: int64 := 0;
+    while i < self.textSize {
+      self.emitByte(peek8(self.textData + i));
+      i := i + 1;
+    }
+    
+    // Write .rodata section
+    i := 0;
+    while i < self.rodataSize {
+      self.emitByte(peek8(self.rodataData + i));
+      i := i + 1;
+    }
+    
+    // Write .data section
+    i := 0;
+    while i < self.dataSize {
+      self.emitByte(peek8(self.dataData + i));
+      i := i + 1;
+    }
+    
+    return self.output;
+  }
+  
+  pub fn GetSize(): int64 {
+    return self.outputSize;
+  }
+  
+  pub fn GetBuffer(): int64 {
+    var result: int64 := mmap(self.outputSize, 1);
+    var i: int64 := 0;
+    while i < self.outputSize {
+      poke8(result + i, peek8(self.output + i));
+      i := i + 1;
+    }
+    return result;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.output != 0 {
+      munmap(self.output, self.outputCap);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global ARM ELF Writer
+// ============================================================================
+
+var globalARMELFWriter: int64 := 0;
+
+pub fn ARMELFWriterInit(): void {
+  globalARMELFWriter := ARMELFWriter.Create();
+}
+
+pub fn ARMELFWriterGet(): int64 {
+  return globalARMELFWriter;
+}
+
+pub fn ARMELFWriterShutdown(): void {
+  if globalARMELFWriter != 0 {
+    var writer: int64 := globalARMELFWriter as ARMELFWriter;
+    writer.Free();
+    globalARMELFWriter := 0;
+  }
+}

@@ -740,21 +740,44 @@ bootstrap/backend/
 
 ### WP-32: RISC-V + Embedded Backends
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-24
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-24
 
 **Ziel:** RISC-V (RV64I) und ARM Cortex-M Backends.
 
-**Zu implementieren:**
+**Implementiert in `bootstrap/backend/`:**
+- ✅ **RISC-V RV64I:** `riscv/emit_riscv.lyx`
+  - Register: a0-a7 (Args), t0-t6 (Temps), s0-s11 (Saved)
+  - Instructions: ADD, SUB, MUL, DIV, JAL, JALR, BEQ, BNE, BLT, BGE, LW, SW, LI
+  - R-Type, I-Type, S-Type, B-Type, U-Type, J-Type Encoding
+  - ELF64 Writer Integration (via write_elf_riscv.lyx)
+- ✅ **ARM Cortex-M:** `arm_cm/emit_arm_cm.lyx`
+  - Thumb-2 Instructions: PUSH, POP, MOV, ADD, BL, BX, LDR, STR
+  - Memory-Map: Stack bei 0x20000000, Code bei 0x08000000 (STM32)
+  - T1 (16-bit) und T2 (32-bit) Thumb Encoding
+  - ELF32 Writer: `arm_cm/write_elf32.lyx`
 
-**`bootstrap/emit_riscv.lyx`** (RISC-V RV64I, RV32I):
-- Register: a0–a7 (Argumente), t0–t6 (Temps), s0–s11 (Saved)
-- Instruktionen: ADD, SUB, MUL, DIV, JAL, JALR, BEQ, BNE, BLT, BGE, LW, SW, LI, etc.
-- ELF-Writer: `write_elf_riscv.lyx`
-
-**`bootstrap/emit_arm_cm.lyx`** (ARM Cortex-M, Thumb-2):
-- Thumb-2-Instruktionen: PUSH, POP, MOV, ADD, BL, BX, LDR, STR
-- Memory-Map: Stack bei 0x20000000, Code bei 0x08000000 (STM32)
-- ELF32-Writer: `write_elf32.lyx`
+**Verzeichnis-Struktur:**
+```
+bootstrap/backend/
+  x86_64/
+    emit_x86.lyx         (WP-23)
+  arm64/
+    emit_arm64.lyx       (WP-24)
+  riscv/
+    emit_riscv.lyx       (WP-32: RV64I)
+  arm_cm/
+    emit_arm_cm.lyx      (WP-32: Cortex-M Thumb-2)
+    write_elf32.lyx      (WP-32: ARM ELF32)
+  elf/
+    write_elf.lyx        (WP-25)
+    dynamic_linker.lyx   (WP-31)
+  pe/
+    write_pe.lyx         (WP-25)
+    dynamic_linker.lyx  (WP-31)
+  macho/
+    write_macho.lyx     (WP-25)
+    dynamic_linker.lyx (WP-31)
+```
 
 **Referenz:** `compiler/backend/riscv/riscv_emit.pas`, `compiler/backend/arm_cm/arm_cm_emit.pas`
 
@@ -1009,7 +1032,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-29:** Safety Pragmas (@dal, @critical, @wcet, @integrity) (bootstrap/ir/ir_safety.lyx)
 - ✅ **WP-30:** Erweiterte Stdlib (bootstrap/std/*.lyx)
 - ✅ **WP-31:** C FFI & Externes Linking (bootstrap/frontend/ffi_parser.lyx, c_header_parser.lyx)
-- ❌ **WP-32:** RISC-V + Embedded Backends
+- ✅ **WP-32:** RISC-V + Embedded Backends (bootstrap/backend/riscv/, arm_cm/)
 
 ### Phase 5: Volle Selbst-Kompilierung
 - ❌ **WP-33:** lyxc.lyx — Vollständiger Compiler in Lyx
