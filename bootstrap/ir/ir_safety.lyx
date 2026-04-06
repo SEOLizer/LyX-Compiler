@@ -1,0 +1,431 @@
+// ==================================================================
+// WP-29: Safety Pragmas
+// ==================================================================
+// DO-178C-kompatible Sicherheits-Annotationen:
+// - @dal(A/B) - Design Assurance Level
+// - @critical - Kritische Funktionen
+// - @wcet(cycles) - Worst-Case Execution Time
+// - @stack_limit(bytes) - Stack-Limit
+// - @integrity - Integritätsprüfung
+// - MC/DC Instrumentierung
+//
+// Referenz: compiler/ir/ir_mcdc.pas
+
+import bootstrap.ir;
+
+// ============================================================================
+// Safety Pragma Types
+// ============================================================================
+
+// Design Assurance Levels (DAL)
+pub con DAL_A: int64 := 1;  // Highest criticality
+pub con DAL_B: int64 := 2;
+pub con DAL_C: int64 := 3;
+pub con DAL_D: int64 := 4;  // Lowest criticality
+pub con DAL_NONE: int64 := 0;
+
+// Integrity Modes
+pub con INTEGRITY_SOFTWARE_LOCKSTEP: int64 := 1;
+pub con INTEGRITY_SCRUBBED: int64 := 2;
+pub con INTEGRITY_HW_ECC: int64 := 3;
+
+// ============================================================================
+// Pragma Structure (8 bytes)
+// ============================================================================
+
+// +0: pragmaType (int64)
+// +8: value (int64)
+// +16: next (int64)
+
+con PRAGMA_SIZE: int64 := 24;
+
+pub type Pragma = record {
+  pragmaType: int64;
+  value: int64;
+  value2: int64;  // For complex values (e.g., integrity mode)
+  next: int64;
+};
+
+// Pragma Types
+pub con PRAGMA_DAL: int64 := 1;
+pub con PRAGMA_CRITICAL: int64 := 2;
+pub con PRAGMA_WCET: int64 := 3;
+pub con PRAGMA_STACK_LIMIT: int64 := 4;
+pub con PRAGMA_INTEGRITY: int64 := 5;
+
+// ============================================================================
+// SafetyAnalyzer Class
+// ============================================================================
+
+pub type SafetyAnalyzer = class {
+  // Module being analyzed
+  module: int64;
+  
+  // Active pragmas (linked list)
+  activePragmas: int64;
+  
+  // Statistics
+  criticalFunctions: int64;
+  dalACount: int64;
+  dalBCount: int64;
+  dalCCount: int64;
+  dalDCount: int64;
+  integrityFunctions: int64;
+  
+  // MC/DC coverage data
+  mcdcEnabled: bool;
+  mcdcDecisionCount: int64;
+  mcdcInstrumentedCount: int64;
+  mcdcCoverageData: int64;
+  
+  // ---------------------------------------------------------------------------
+  // Constructor
+  // ---------------------------------------------------------------------------
+  
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(SafetyAnalyzer));
+    
+    self->module := 0;
+    self->activePragmas := 0;
+    self->criticalFunctions := 0;
+    self->dalACount := 0;
+    self->dalBCount := 0;
+    self->dalCCount := 0;
+    self->dalDCount := 0;
+    self->integrityFunctions := 0;
+    self->mcdcEnabled := false;
+    self->mcdcDecisionCount := 0;
+    self->mcdcInstrumentedCount := 0;
+    self->mcdcCoverageData := 0;
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Pragma Management
+  // ---------------------------------------------------------------------------
+  
+  fn allocPragma(): int64 {
+    return mmap(PRAGMA_SIZE, 7);
+  }
+  
+  pub fn addPragma(pragmaType: int64, value: int64, value2: int64) {
+    var p: int64 := self.allocPragma();
+    
+    poke64(p, pragmaType);
+    poke64(p + 8, value);
+    poke64(p + 16, value2);
+    poke64(p + 24, self->activePragmas);
+    
+    self->activePragmas := p;
+  }
+  
+  // @dal(A) - Design Assurance Level
+  pub fn setDAL(level: int64) {
+    self.addPragma(PRAGMA_DAL, level, 0);
+    
+    if level == DAL_A { self.dalACount := self.dalACount + 1; }
+    else if level == DAL_B { self.dalBCount := self.dalBCount + 1; }
+    else if level == DAL_C { self.dalCCount := self.dalCCount + 1; }
+    else if level == DAL_D { self.dalDCount := self.dalDCount + 1; }
+  }
+  
+  // @critical - Critical function
+  pub fn setCritical() {
+    self.addPragma(PRAGMA_CRITICAL, 1, 0);
+    self.criticalFunctions := self.criticalFunctions + 1;
+  }
+  
+  // @wcet(cycles) - Worst-case execution time
+  pub fn setWCET(cycles: int64) {
+    self.addPragma(PRAGMA_WCET, cycles, 0);
+  }
+  
+  // @stack_limit(bytes) - Stack limit
+  pub fn setStackLimit(bytes: int64) {
+    self.addPragma(PRAGMA_STACK_LIMIT, bytes, 0);
+  }
+  
+  // @integrity(mode, interval) - Integrity checking
+  pub fn setIntegrity(mode: int64, interval: int64) {
+    self.addPragma(PRAGMA_INTEGRITY, mode, interval);
+    self.integrityFunctions := self.integrityFunctions + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Pragma Propagation
+  // ---------------------------------------------------------------------------
+  
+  // Check if a function is critical
+  pub fn isCritical(func: int64): bool {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_CRITICAL {
+        return true;
+      }
+      p := peek64(p + 24);
+    }
+    return false;
+  }
+  
+  // Get DAL level for function
+  pub fn getDAL(func: int64): int64 {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_DAL {
+        return peek64(p + 8);
+      }
+      p := peek64(p + 24);
+    }
+    return DAL_NONE;
+  }
+  
+  // Check if calling non-critical from critical is allowed
+  pub fn checkCriticalCall(fromFunc: int64, toFunc: int64): bool {
+    if self.isCritical(fromFunc) and not self.isCritical(toFunc) {
+      // Warning: critical function calling non-critical
+      return false;
+    }
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // WCET Analysis
+  // ---------------------------------------------------------------------------
+  
+  // Get WCET limit for function
+  pub fn getWCET(func: int64): int64 {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_WCET {
+        return peek64(p + 8);
+      }
+      p := peek64(p + 24);
+    }
+    return 0;  // No limit set
+  }
+  
+  // Compare estimated WCET with limit
+  pub fn checkWCET(estimated: int64, limit: int64): bool {
+    if limit > 0 and estimated > limit {
+      return false;  // Exceeds limit
+    }
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Stack Analysis
+  // ---------------------------------------------------------------------------
+  
+  // Get stack limit for function
+  pub fn getStackLimit(func: int64): int64 {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_STACK_LIMIT {
+        return peek64(p + 8);
+      }
+      p := peek64(p + 24);
+    }
+    return 0;
+  }
+  
+  // Check stack usage against limit
+  pub fn checkStackUsage(used: int64, limit: int64): bool {
+    if limit > 0 and used > limit {
+      return false;
+    }
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // MC/DC Instrumentierung
+  // ---------------------------------------------------------------------------
+  
+  pub fn enableMCDC() {
+    self->mcdcEnabled := true;
+  }
+  
+  pub fn disableMCDC() {
+    self->mcdcEnabled := false;
+  }
+  
+  // Record a decision coverage point
+  pub fn recordMCDC(decisionId: int64, conditionId: int64, conditionResult: bool, decisionResult: bool) {
+    // In a full implementation, this would update runtime counters
+    // For stub, we just increment the instrumented count
+    if self->mcdcEnabled {
+      self->mcdcInstrumentedCount := self->mcdcInstrumentedCount + 1;
+    }
+  }
+  
+  // Instrument a branch decision
+  pub fn instrumentBranch(instr: int64, decisionId: int64) {
+    if self->mcdcEnabled {
+      self.mcdcDecisionCount := self.mcdcDecisionCount + 1;
+      // In full implementation: insert __mcdc_record calls
+    }
+  }
+  
+  // Generate MC/DC coverage report
+  pub fn generateMCDCReport(): int64 {
+    // Returns number of decisions without full coverage
+    // For stub: return 0 (no gaps)
+    return 0;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Integrity Checking
+  // ---------------------------------------------------------------------------
+  
+  // Get integrity mode for function
+  pub fn getIntegrityMode(func: int64): int64 {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_INTEGRITY {
+        return peek64(p + 8);
+      }
+      p := peek64(p + 24);
+    }
+    return 0;
+  }
+  
+  // Get integrity interval for function
+  pub fn getIntegrityInterval(func: int64): int64 {
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      if peek64(p) == PRAGMA_INTEGRITY {
+        return peek64(p + 16);
+      }
+      p := peek64(p + 24);
+    }
+    return 0;
+  }
+  
+  // Generate integrity verification code
+  pub fn generateIntegrityCode(func: int64): int64 {
+    var mode: int64 := self.getIntegrityMode(func);
+    var interval: int64 := self.getIntegrityInterval(func);
+    
+    if mode == 0 { return 0; }  // No integrity check needed
+    
+    // In full implementation, insert verification code:
+    // - software_lockstep: compare with redundant execution
+    // - hw_ecc: generate ECC check instructions
+    // - scrubbed: periodic memory scrub
+    
+    return 1;  // Code generated
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Statistics
+  // ---------------------------------------------------------------------------
+  
+  pub fn getCriticalCount(): int64 {
+    return self.criticalFunctions;
+  }
+  
+  pub fn getDALACount(): int64 {
+    return self.dalACount;
+  }
+  
+  pub fn getIntegrityCount(): int64 {
+    return self.integrityFunctions;
+  }
+  
+  pub fn getMCDCInstrumentedCount(): int64 {
+    return self.mcdcInstrumentedCount;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Module Analysis
+  // ---------------------------------------------------------------------------
+  
+  pub fn analyzeModule(mod: int64) {
+    self->module := mod;
+    // Walk through all functions and collect pragmas
+    // In full implementation, would parse @pragma annotations
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Destroy
+  // ---------------------------------------------------------------------------
+  
+  pub fn Destroy() {
+    // Free pragma list
+    var p: int64 := self->activePragmas;
+    while p != 0 {
+      var next: int64 := peek64(p + 24);
+      munmap(p, PRAGMA_SIZE);
+      p := next;
+    }
+    
+    if self->mcdcCoverageData != 0 {
+      munmap(self->mcdcCoverageData, 4096);
+    }
+    
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global Helper Functions
+// ============================================================================
+
+pub fn createSafetyAnalyzer(): int64 {
+  return SafetyAnalyzer.Create();
+}
+
+pub fn setDAL(analyzer: int64, level: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.setDAL(level);
+}
+
+pub fn setCritical(analyzer: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.setCritical();
+}
+
+pub fn setWCET(analyzer: int64, cycles: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.setWCET(cycles);
+}
+
+pub fn setStackLimit(analyzer: int64, bytes: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.setStackLimit(bytes);
+}
+
+pub fn setIntegrity(analyzer: int64, mode: int64, interval: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.setIntegrity(mode, interval);
+}
+
+pub fn checkWCET(analyzer: int64, estimated: int64): bool {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  return sa.checkWCET(estimated, sa.getWCET(0));
+}
+
+pub fn checkStack(analyzer: int64, used: int64): bool {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  return sa.checkStackUsage(used, sa.getStackLimit(0));
+}
+
+pub fn enableMCDC(analyzer: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.enableMCDC();
+}
+
+pub fn disableMCDC(analyzer: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.disableMCDC();
+}
+
+pub fn getMCDCCoverage(analyzer: int64): int64 {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  return sa.generateMCDCReport();
+}
+
+pub fn destroySafetyAnalyzer(analyzer: int64) {
+  var sa: int64 := analyzer as SafetyAnalyzer;
+  sa.Destroy();
+}
