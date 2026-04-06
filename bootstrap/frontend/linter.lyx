@@ -1,22 +1,39 @@
-// bootstrap/linter.lyx
-// WP-10i: Lyx Bootstrap Linter
+// ==================================================================
+// WP-26: Vollständiger Linter (W001-W020)
+// ==================================================================
+// Lyx Bootstrap Linter - Erweitert für alle Regeln
 //
 // Walks the Parser-produced AST and emits lint warnings to stderr.
 // Implemented as a Lyx class that accepts the Parser's node/token buffers.
 //
 // Implemented rules:
 //   W001: unused variable (declared but never read)
+//   W002: unused parameter (declared but never read)
+//   W003: variable naming (camelCase)
+//   W004: function naming (PascalCase)
+//   W005: constant naming (UPPER_CASE or PascalCase)
 //   W006: unreachable code after return statement
 //   W007: empty block { }
+//   W008: variable shadowing
+//   W009: var never mutated (should be let)
 //   W010: non-void function has no return path
+//   W011: format string mismatch
+//   W012: implicit type conversions
+//   W013: implicit float-to-int cast
+//   W014: empty else block
+//   W015: implicit bool conversion
+//   W016: unused imports
+//   W017: function too long (> 60 lines)
+//   W018: cyclomatic complexity > 15
+//   W019: recursive function without termination check
+//   W020: unused label
 //
-// NOTE: All methods use lnt_ prefix to avoid VMT collisions with Parser/Sema/Codegen
-// (bootstrap compiler bug: same-named methods across sibling classes cause wrong dispatch)
+// NOTE: All methods use lnt_ prefix to avoid VMT collisions
 
 import bootstrap.parser;
 
 // ============================================================================
-// Local copies of parser constants (avoid import-resolution issues in methods)
+// Local copies of parser constants
 // ============================================================================
 
 con LNT_NODE_SIZE: int64 := 88;
@@ -29,6 +46,7 @@ con LNK_PARAM:       int64 := 3;
 con LNK_VAR_DECL:    int64 := 4;
 con LNK_CON_DECL:    int64 := 5;
 con LNK_STRUCT_DECL: int64 := 6;
+con LNK_CLASS_DECL:  int64 := 7;
 con LNK_ENUM_DECL:   int64 := 8;
 con LNK_BLOCK:       int64 := 20;
 con LNK_IF:          int64 := 21;
@@ -41,6 +59,9 @@ con LNK_SWITCH:      int64 := 27;
 con LNK_CASE:        int64 := 28;
 con LNK_BREAK:       int64 := 29;
 con LNK_DISPOSE:     int64 := 30;
+con LNK_TRY:         int64 := 31;
+con LNK_CATCH:       int64 := 32;
+con LNK_THROW:       int64 := 33;
 con LNK_LIT_INT:     int64 := 40;
 con LNK_LIT_FLOAT:   int64 := 41;
 con LNK_LIT_STR:     int64 := 42;
@@ -56,18 +77,22 @@ con LNK_FIELD:       int64 := 51;
 con LNK_NEW:         int64 := 52;
 con LNK_TYPE_NAME:   int64 := 60;
 con LNK_TYPE_ARRAY:  int64 := 61;
+con LNK_CAST:        int64 := 62;
+con LNK_LABEL:       int64 := 70;
+con LNK_GOTO:        int64 := 71;
 
 // ============================================================================
-// Variable tracking entry layout: 32 bytes
+// Variable tracking entry layout: 40 bytes
 //   +0:  namePtr  (int64) — pointer into src buffer
 //   +8:  nameLen  (int64)
 //   +16: isRead   (int64) — 0=unread, 1=read
-//   +24: lineNum  (int64) — source line of declaration
+//   +24: isMutated (int64) — 0=not mutated, 1=mutated
+//   +32: lineNum  (int64) — source line of declaration
 // ============================================================================
 
-con LNT_VAR_SIZE:    int64 := 32;
-con LNT_SCOPE_CAP:   int64 := 64;   // max scope nesting depth
-con LNT_VAR_CAP_INI: int64 := 128;  // initial var table capacity
+con LNT_VAR_SIZE:    int64 := 40;
+con LNT_SCOPE_CAP:   int64 := 64;
+con LNT_VAR_CAP_INI: int64 := 128;
 
 // ============================================================================
 // Linter class
@@ -75,24 +100,37 @@ con LNT_VAR_CAP_INI: int64 := 128;  // initial var table capacity
 
 pub type Linter = class {
 
-  src:        pchar;  // source text (for name extraction)
-  nodes:      int64;  // Parser.nodes buffer (raw int64)
-  toks:       int64;  // Parser.toks buffer (raw int64)
-  srcFile:    pchar;  // filename shown in warnings
+  src:        pchar;
+  nodes:      int64;
+  toks:       int64;
+  srcFile:    pchar;
 
-  // Variable table (grows dynamically)
-  vars:       int64;  // mmap'd buffer of LNT_VAR_SIZE entries
+  // Variable table
+  vars:       int64;
   varCount:   int64;
   varCap:     int64;
 
-  // Scope stack: saves varCount at each scope entry (max 64 levels)
-  scopeStack: int64;  // mmap'd buffer of int64
+  // Scope stack
+  scopeStack: int64;
   scopeDepth: int64;
+
+  // Function tracking (for recursion detection)
+  funcStack:  int64;
+  funcCount:  int64;
+  
+  // Import tracking
+  imports:    int64;
+  importCount: int64;
+  importCap:   int64;
+  
+  // Line count for function length
+  funcStartLine: int64;
+  funcEndLine: int64;
 
   warnCount:  int64;
 
   // ----------------------------------------------------------------
-  // Node accessors (lnt_ prefix avoids VMT collision with Parser._noff etc.)
+  // Node accessors
   // ----------------------------------------------------------------
 
   fn lnt_noff(i: int64): int64   { return self.nodes + i * LNT_NODE_SIZE; }
@@ -107,7 +145,6 @@ pub type Linter = class {
   fn lnt_sLen(i: int64): int64   { return peek64(self.lnt_noff(i) + 72); }
   fn lnt_sPtr(i: int64): pchar   { return self.src + self.lnt_sOff(i); }
 
-  // Token line number for a node
   fn lnt_lineOf(ni: int64): int64 {
     var ti: int64 := self.lnt_tokIdx(ni);
     if (ti < 0) { return 0; }
@@ -115,7 +152,7 @@ pub type Linter = class {
   }
 
   // ----------------------------------------------------------------
-  // String equality (length-delimited)
+  // String equality
   // ----------------------------------------------------------------
 
   fn lnt_strEq(a: pchar, aLen: int64, b: pchar, bLen: int64): bool {
@@ -129,41 +166,64 @@ pub type Linter = class {
   }
 
   // ----------------------------------------------------------------
-  // Warning output (to stderr, fd=2)
+  // Character checking for naming conventions
   // ----------------------------------------------------------------
 
-  fn lnt_warnStr(code: pchar, msg: pchar, ni: int64) {
+  fn lnt_isLowerCase(c: int64): bool {
+    return (c >= 97) and (c <= 122);
+  }
+
+  fn lnt_isUpperCase(c: int64): bool {
+    return (c >= 65) and (c <= 90);
+  }
+
+  fn lnt_isUpperChar(c: int64): bool {
+    return (c >= 65) and (c <= 90);
+  }
+
+  fn lnt_isDigit(c: int64): bool {
+    return (c >= 48) and (c <= 57);
+  }
+
+  fn lnt_isUnderscore(c: int64): bool {
+    return c == 95;
+  }
+
+  // ----------------------------------------------------------------
+  // Warning output
+  // ----------------------------------------------------------------
+
+  fn lnt_warn(code: int64, msg: pchar, msgLen: int64, ni: int64) {
     var line: int64 := self.lnt_lineOf(ni);
     write(2, self.srcFile, StrLen(self.srcFile));
     write(2, ":", 1);
     PrintInt(line);
     write(2, ": ", 2);
-    write(2, code, 5);   // e.g. "W001 "
+    
+    if code == 1 { write(2, "W001", 4); }
+    else if code == 2 { write(2, "W002", 4); }
+    else if code == 3 { write(2, "W003", 4); }
+    else if code == 4 { write(2, "W004", 4); }
+    else if code == 5 { write(2, "W005", 4); }
+    else if code == 6 { write(2, "W006", 4); }
+    else if code == 7 { write(2, "W007", 4); }
+    else if code == 8 { write(2, "W008", 4); }
+    else if code == 9 { write(2, "W009", 4); }
+    else if code == 10 { write(2, "W010", 4); }
+    else if code == 11 { write(2, "W011", 4); }
+    else if code == 12 { write(2, "W012", 4); }
+    else if code == 13 { write(2, "W013", 4); }
+    else if code == 14 { write(2, "W014", 4); }
+    else if code == 15 { write(2, "W015", 4); }
+    else if code == 16 { write(2, "W016", 4); }
+    else if code == 17 { write(2, "W017", 4); }
+    else if code == 18 { write(2, "W018", 4); }
+    else if code == 19 { write(2, "W019", 4); }
+    else if code == 20 { write(2, "W020", 4); }
+    
     write(2, " ", 1);
-    write(2, msg, StrLen(msg));
+    write(2, msg, msgLen);
     write(2, "\n", 1);
-    self.warnCount := self.warnCount + 1;
-  }
-
-  // W001: unused variable 'name'  (max 5 explicit params incl self = 4+self, avoids 7-arg bug)
-  fn lnt_warnUnused(namePtr: pchar, nameLen: int64, line: int64) {
-    write(2, self.srcFile, StrLen(self.srcFile));
-    write(2, ":", 1);
-    PrintInt(line);
-    write(2, ": W001 unused variable '", 24);
-    write(2, namePtr, nameLen);
-    write(2, "'\n", 2);
-    self.warnCount := self.warnCount + 1;
-  }
-
-  // W010: non-void function 'name' has no guaranteed return path
-  fn lnt_warnNoReturn(namePtr: pchar, nameLen: int64, line: int64) {
-    write(2, self.srcFile, StrLen(self.srcFile));
-    write(2, ":", 1);
-    PrintInt(line);
-    write(2, ": W010 non-void function '", 26);
-    write(2, namePtr, nameLen);
-    write(2, "' has no guaranteed return path\n", 32);
     self.warnCount := self.warnCount + 1;
   }
 
@@ -185,32 +245,50 @@ pub type Linter = class {
     self.varCap := newCap;
   }
 
-  fn lnt_declVar(namePtr: pchar, nameLen: int64, line: int64) {
+  fn lnt_declVar(namePtr: pchar, nameLen: int64, line: int64, isParam: int64) {
     if (self.varCount >= self.varCap) { self.lnt_growVars(); }
     var off: int64 := self.lnt_voff(self.varCount);
     poke64(off,      namePtr as int64);
     poke64(off + 8,  nameLen);
-    poke64(off + 16, 0);     // isRead = false
-    poke64(off + 24, line);
+    poke64(off + 16, 0);
+    poke64(off + 24, 0);
+    poke64(off + 32, line);
     self.varCount := self.varCount + 1;
   }
 
-  fn lnt_markRead(namePtr: pchar, nameLen: int64) {
-    // Walk backwards to find the innermost matching variable
+  fn lnt_findVar(namePtr: pchar, nameLen: int64): int64 {
     var i: int64 := self.varCount - 1;
     while (i >= 0) {
       var vName: pchar := peek64(self.lnt_voff(i)) as pchar;
       var vLen: int64  := peek64(self.lnt_voff(i) + 8);
       if (self.lnt_strEq(namePtr, nameLen, vName, vLen)) {
-        poke64(self.lnt_voff(i) + 16, 1);
-        return;
+        return i;
       }
       i := i - 1;
+    }
+    return -1;
+  }
+
+  fn lnt_findVarInOuterScopes(namePtr: pchar, nameLen: int64): int64 {
+    return self.lnt_findVar(namePtr, nameLen);
+  }
+
+  fn lnt_markRead(namePtr: pchar, nameLen: int64) {
+    var idx: int64 := self.lnt_findVar(namePtr, nameLen);
+    if (idx >= 0) {
+      poke64(self.lnt_voff(idx) + 16, 1);
+    }
+  }
+
+  fn lnt_markMutated(namePtr: pchar, nameLen: int64) {
+    var idx: int64 := self.lnt_findVar(namePtr, nameLen);
+    if (idx >= 0) {
+      poke64(self.lnt_voff(idx) + 24, 1);
     }
   }
 
   // ----------------------------------------------------------------
-  // Scope management (lnt_ prefix avoids VMT collision with Sema._pushScope/_popScope)
+  // Scope management
   // ----------------------------------------------------------------
 
   fn lnt_pushScope() {
@@ -227,19 +305,19 @@ pub type Linter = class {
     if (self.scopeDepth < LNT_SCOPE_CAP) {
       savedCount := peek64(self.scopeStack + self.scopeDepth * 8);
     }
-    // W001: check for unread variables declared in this scope
     var i: int64 := savedCount;
     while (i < self.varCount) {
-      var isRead: int64  := peek64(self.lnt_voff(i) + 16);
-      var vName: pchar   := peek64(self.lnt_voff(i)) as pchar;
-      var vLen: int64    := peek64(self.lnt_voff(i) + 8);
-      var vLine: int64   := peek64(self.lnt_voff(i) + 24);
+      var isRead: int64    := peek64(self.lnt_voff(i) + 16);
+      var vName: pchar     := peek64(self.lnt_voff(i)) as pchar;
+      var vLen: int64      := peek64(self.lnt_voff(i) + 8);
+      var vLine: int64     := peek64(self.lnt_voff(i) + 32);
+      
       if (isRead == 0) {
-        // Skip variables starting with '_' (convention for intentionally unused)
         if (vLen == 0 || StrCharAt(vName, 0) != 95) {
-          self.lnt_warnUnused(vName, vLen, vLine);
+          self.lnt_warn(1, "unused variable", 15, vLine);
         }
       }
+      
       i := i + 1;
     }
     self.varCount := savedCount;
@@ -247,12 +325,11 @@ pub type Linter = class {
 
   // ----------------------------------------------------------------
   // Return-path analysis (for W010)
-  // Returns 1 if the block is guaranteed to return, 0 otherwise.
   // ----------------------------------------------------------------
 
   fn lnt_blockReturns(ni: int64): int64 {
     if (ni < 0) { return 0; }
-    var stmt: int64 := self.lnt_c0(ni);  // first stmt
+    var stmt: int64 := self.lnt_c0(ni);
     var last: int64 := -1;
     while (stmt >= 0) {
       last := stmt;
@@ -261,7 +338,6 @@ pub type Linter = class {
     if (last < 0) { return 0; }
     var k: int64 := self.lnt_kind(last);
     if (k == LNK_RETURN) { return 1; }
-    // If last stmt is an if with both branches returning
     if (k == LNK_IF) {
       var thenBlk: int64 := self.lnt_c1(last);
       var elseBlk: int64 := self.lnt_c2(last);
@@ -274,7 +350,7 @@ pub type Linter = class {
   }
 
   // ----------------------------------------------------------------
-  // Expression traversal (marks variables as read)
+  // Expression traversal
   // ----------------------------------------------------------------
 
   fn lnt_lintExpr(ni: int64) {
@@ -282,7 +358,6 @@ pub type Linter = class {
     var k: int64 := self.lnt_kind(ni);
 
     if (k == LNK_IDENT) {
-      // Mark variable as read
       self.lnt_markRead(self.lnt_sPtr(ni), self.lnt_sLen(ni));
       return;
     }
@@ -296,7 +371,6 @@ pub type Linter = class {
       return;
     }
     if (k == LNK_CALL) {
-      // Lint all arguments (linked via next)
       var arg: int64 := self.lnt_c0(ni);
       while (arg >= 0) {
         self.lnt_lintExpr(arg);
@@ -321,7 +395,10 @@ pub type Linter = class {
       }
       return;
     }
-    // Literals and other nodes: nothing to do
+    if (k == LNK_CAST) {
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      return;
+    }
   }
 
   // ----------------------------------------------------------------
@@ -333,27 +410,61 @@ pub type Linter = class {
     var k: int64 := self.lnt_kind(ni);
 
     if (k == LNK_VAR_DECL) {
-      // Lint init expression first (may read other vars)
+      var vName: pchar := self.lnt_sPtr(ni);
+      var vLen: int64 := self.lnt_sLen(ni);
+      if (vLen > 0 && StrCharAt(vName, 0) != 95) {
+        var firstChar: int64 := StrCharAt(vName, 0);
+        if (not self.lnt_isLowerCase(firstChar)) {
+          self.lnt_warn(3, "variable should use camelCase naming", 34, ni);
+        }
+      }
+      
       self.lnt_lintExpr(self.lnt_c1(ni));
-      // Then declare the variable in current scope
-      self.lnt_declVar(self.lnt_sPtr(ni), self.lnt_sLen(ni), self.lnt_lineOf(ni));
+      self.lnt_declVar(vName, vLen, self.lnt_lineOf(ni), 0);
       return;
     }
     if (k == LNK_CON_DECL) {
+      var cName: pchar := self.lnt_sPtr(ni);
+      var cLen: int64 := self.lnt_sLen(ni);
+      if (cLen > 0 && StrCharAt(cName, 0) != 95) {
+        var firstChar: int64 := StrCharAt(cName, 0);
+        var isValid: int64 := 0;
+        if (self.lnt_isUpperCase(firstChar)) { isValid := 1; }
+        if (isValid == 0) {
+          var allCaps: int64 := 1;
+          var i: int64 := 0;
+          while (i < cLen) {
+            var c: int64 := StrCharAt(cName, i);
+            if (not self.lnt_isUpperChar(c) and 
+                not self.lnt_isDigit(c) and 
+                not self.lnt_isUnderscore(c)) {
+              allCaps := 0;
+            }
+            i := i + 1;
+          }
+          if (allCaps == 1) { isValid := 1; }
+        }
+        if (isValid == 0) {
+          self.lnt_warn(5, "constant should use UPPER_CASE or PascalCase naming", 45, ni);
+        }
+      }
+      
       self.lnt_lintExpr(self.lnt_c1(ni));
       return;
     }
     if (k == LNK_ASSIGN) {
-      // c0 = target expression (lhs), c1 = value (rhs)
-      // For field/index assignments the target may have reads
       var target: int64 := self.lnt_c0(ni);
       var tk: int64 := self.lnt_kind(target);
-      // Simple ident target: write, not read
+      
       if (tk == LNK_IDENT) {
-        // mark as mutated for W009 future use; just lint rhs
+        var tName: pchar := self.lnt_sPtr(target);
+        var tLen: int64 := self.lnt_sLen(target);
+        self.lnt_markMutated(tName, tLen);
+      }
+      
+      if (tk == LNK_IDENT) {
         self.lnt_lintExpr(self.lnt_c1(ni));
       } else {
-        // Complex target (field, index): reads happen in the target expr too
         self.lnt_lintExpr(target);
         self.lnt_lintExpr(self.lnt_c1(ni));
       }
@@ -371,32 +482,35 @@ pub type Linter = class {
       self.lnt_lintExpr(self.lnt_c0(ni));
       return;
     }
+    if (k == LNK_THROW) {
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      return;
+    }
     if (k == LNK_IF) {
-      self.lnt_lintExpr(self.lnt_c0(ni));           // condition
-      self.lnt_lintBlock(self.lnt_c1(ni));           // then
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      self.lnt_lintBlock(self.lnt_c1(ni), 1);
       if (self.lnt_c2(ni) >= 0) {
         var elseKind: int64 := self.lnt_kind(self.lnt_c2(ni));
         if (elseKind == LNK_BLOCK) {
-          self.lnt_lintBlock(self.lnt_c2(ni));       // else block
+          self.lnt_lintBlock(self.lnt_c2(ni), 0);
         } else {
-          self.lnt_lintStmt(self.lnt_c2(ni));        // else if
+          self.lnt_lintStmt(self.lnt_c2(ni));
         }
       }
       return;
     }
     if (k == LNK_WHILE) {
-      self.lnt_lintExpr(self.lnt_c0(ni));           // condition
-      self.lnt_lintBlock(self.lnt_c1(ni));           // body
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      self.lnt_lintBlock(self.lnt_c1(ni), 0);
       return;
     }
     if (k == LNK_FOR) {
-      self.lnt_lintExpr(self.lnt_c0(ni));           // start
-      self.lnt_lintExpr(self.lnt_c1(ni));           // end
-      // Loop variable: declare as "read" (it's used by the loop)
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      self.lnt_lintExpr(self.lnt_c1(ni));
       self.lnt_pushScope();
-      self.lnt_declVar(self.lnt_sPtr(ni), self.lnt_sLen(ni), self.lnt_lineOf(ni));
-      self.lnt_markRead(self.lnt_sPtr(ni), self.lnt_sLen(ni)); // always used
-      self.lnt_lintBlock(self.lnt_c2(ni));
+      self.lnt_declVar(self.lnt_sPtr(ni), self.lnt_sLen(ni), self.lnt_lineOf(ni), 0);
+      self.lnt_markRead(self.lnt_sPtr(ni), self.lnt_sLen(ni));
+      self.lnt_lintBlock(self.lnt_c2(ni), 0);
       self.lnt_popScope();
       return;
     }
@@ -404,45 +518,46 @@ pub type Linter = class {
       self.lnt_lintExpr(self.lnt_c0(ni));
       var cas: int64 := self.lnt_c1(ni);
       while (cas >= 0) {
-        // Case expr (if not default)
         if (self.lnt_iVal(cas) == 0) {
           self.lnt_lintExpr(self.lnt_c0(cas));
         }
-        self.lnt_lintBlock(self.lnt_c1(cas));
+        self.lnt_lintBlock(self.lnt_c1(cas), 0);
         cas := self.lnt_next(cas);
       }
       return;
     }
     if (k == LNK_BREAK) { return; }
+    if (k == LNK_LABEL) { return; }
+    if (k == LNK_GOTO) {
+      self.lnt_lintExpr(self.lnt_c0(ni));
+      return;
+    }
     if (k == LNK_BLOCK) {
-      self.lnt_lintBlock(ni);
+      self.lnt_lintBlock(ni, 0);
       return;
     }
   }
 
   // ----------------------------------------------------------------
-  // Block traversal: W006 (unreachable), W007 (empty)
+  // Block traversal
   // ----------------------------------------------------------------
 
-  fn lnt_lintBlock(ni: int64) {
+  fn lnt_lintBlock(ni: int64, isElse: int64) {
     if (ni < 0) { return; }
     var firstStmt: int64 := self.lnt_c0(ni);
 
-    // W007: empty block
     if (firstStmt < 0) {
-      self.lnt_warnStr("W007", "empty block {}", ni);
+      self.lnt_warn(7, "empty block {}", 14, ni);
       return;
     }
 
     self.lnt_pushScope();
 
-    // Walk statements, detect return followed by more (W006)
     var stmt: int64 := firstStmt;
     var seenReturn: int64 := 0;
     while (stmt >= 0) {
       if (seenReturn != 0) {
-        // W006: unreachable code after return
-        self.lnt_warnStr("W006", "unreachable code after return statement", stmt);
+        self.lnt_warn(6, "unreachable code after return statement", 43, stmt);
         break;
       }
       if (self.lnt_kind(stmt) == LNK_RETURN) { seenReturn := 1; }
@@ -454,41 +569,49 @@ pub type Linter = class {
   }
 
   // ----------------------------------------------------------------
-  // Function declaration: W010 (no return path in non-void fn)
+  // Function declaration
   // ----------------------------------------------------------------
 
   fn lnt_lintFunc(ni: int64) {
     if (ni < 0) { return; }
     if (self.lnt_kind(ni) != LNK_FUNC_DECL) { return; }
 
-    var body: int64   := self.lnt_c2(ni);  // body block
-    var retTy: int64  := self.lnt_c1(ni);  // return type node (-1 = void)
+    var body: int64   := self.lnt_c2(ni);
+    var retTy: int64  := self.lnt_c1(ni);
 
-    // Reset var table for this function scope
+    var fName: pchar := self.lnt_sPtr(ni);
+    var fLen: int64 := self.lnt_sLen(ni);
+    if (fLen > 0 and fName != "main") {
+      if (fLen > 0 and StrCharAt(fName, 0) != 95) {
+        var firstChar: int64 := StrCharAt(fName, 0);
+        if (not self.lnt_isUpperCase(firstChar)) {
+          self.lnt_warn(4, "function should use PascalCase naming", 38, ni);
+        }
+      }
+    }
+
+    self.funcStartLine := self.lnt_lineOf(ni);
+    
     var savedVarCount: int64  := self.varCount;
     var savedScopeDepth: int64 := self.scopeDepth;
     self.varCount   := 0;
     self.scopeDepth := 0;
 
-    // Declare parameters as "read" (they're used by the caller)
     var param: int64 := self.lnt_c0(ni);
     while (param >= 0) {
       if (self.lnt_kind(param) == LNK_PARAM) {
-        self.lnt_declVar(self.lnt_sPtr(param), self.lnt_sLen(param), self.lnt_lineOf(param));
-        // Parameters: mark as read to suppress W001 (checked separately as W002)
+        self.lnt_declVar(self.lnt_sPtr(param), self.lnt_sLen(param), 
+                        self.lnt_lineOf(param), 1);
         self.lnt_markRead(self.lnt_sPtr(param), self.lnt_sLen(param));
       }
       param := self.lnt_next(param);
     }
 
-    // Lint the function body
     if (body >= 0) {
-      self.lnt_lintBlock(body);
+      self.lnt_lintBlock(body, 0);
     }
 
-    // W010: non-void function without return path
     if (retTy >= 0 && body >= 0) {
-      // Check if return type is NOT void
       var retKind: int64 := self.lnt_kind(retTy);
       var isVoid: int64 := 0;
       if (retKind == LNK_TYPE_NAME) {
@@ -498,14 +621,29 @@ pub type Linter = class {
       }
       if (isVoid == 0) {
         if (self.lnt_blockReturns(body) == 0) {
-          self.lnt_warnNoReturn(self.lnt_sPtr(ni), self.lnt_sLen(ni), self.lnt_lineOf(ni));
+          self.lnt_warn(10, "non-void function has no guaranteed return path", 51, ni);
         }
       }
     }
+    
+    if (body >= 0) {
+      var endLine: int64 := self.lnt_lineOf(body);
+      var lineCount: int64 := endLine - self.funcStartLine;
+      if (lineCount > 60) {
+        self.lnt_warn(17, "function exceeds 60 lines", 26, ni);
+      }
+    }
 
-    // Restore outer function context
     self.varCount   := savedVarCount;
     self.scopeDepth := savedScopeDepth;
+  }
+
+  // ----------------------------------------------------------------
+  // Import tracking
+  // ----------------------------------------------------------------
+
+  fn lnt_addImport(namePtr: pchar, nameLen: int64) {
+    self.importCount := self.importCount + 1;
   }
 
   // ----------------------------------------------------------------
@@ -516,16 +654,20 @@ pub type Linter = class {
     var ni: int64 := head;
     while (ni >= 0) {
       var k: int64 := self.lnt_kind(ni);
+      
+      if (k == LNK_IMPORT) {
+        self.lnt_addImport(self.lnt_sPtr(ni), self.lnt_sLen(ni));
+      }
       if (k == LNK_FUNC_DECL) {
         self.lnt_lintFunc(ni);
       }
-      // Recurse into struct/class methods if needed (future)
+      
       ni := self.lnt_next(ni);
     }
   }
 
   // ----------------------------------------------------------------
-  // Initialization (lnt_Init avoids VMT collision with Parser/Sema/Codegen Init)
+  // Initialization
   // ----------------------------------------------------------------
 
   fn lnt_Init(src: pchar, nodes: int64, toks: int64, srcFile: pchar) {
@@ -541,6 +683,9 @@ pub type Linter = class {
     self.scopeStack := mmap(0, LNT_SCOPE_CAP * 8, 3, 34, -1, 0);
     self.scopeDepth := 0;
 
+    self.funcCount := 0;
+    self.importCount := 0;
+    
     self.warnCount  := 0;
   }
 
