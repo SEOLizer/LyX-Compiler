@@ -214,9 +214,46 @@ pub type Codegen = class {
   localIsArray: int64;
   foldBuf:      int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
+  // Temporary buffer tracking (BUG-02: prevent mmap leaks)
+  // Each entry: {bufPtr:8, bufSize:8} = 16 bytes
+  tempBufs:      int64;
+  tempBufCount:  int64;
+  tempBufCap:    int64;
+
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
   // ------------------------------------------------------------------
+
+  fn cg_trackTempBuf(buf: int64, size: int64) {
+    if (self.tempBufCount >= self.tempBufCap) {
+      var nc: int64 := self.tempBufCap * 2;
+      var nb: int64 := mmap(0, nc * 16, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.tempBufCount * 16) {
+        poke8(nb + i, peek8(self.tempBufs + i));
+        i := i + 1;
+      }
+      if (self.tempBufs != 0) { munmap(self.tempBufs, self.tempBufCap * 16); }
+      self.tempBufs := nb;
+      self.tempBufCap := nc;
+    }
+    var base: int64 := self.tempBufs + self.tempBufCount * 16;
+    poke64(base,     buf);
+    poke64(base + 8, size);
+    self.tempBufCount := self.tempBufCount + 1;
+  }
+
+  fn cg_freeAllTempBufs() {
+    var i: int64 := 0;
+    while (i < self.tempBufCount) {
+      var base: int64 := self.tempBufs + i * 16;
+      var buf:  int64 := peek64(base);
+      var size: int64 := peek64(base + 8);
+      munmap(buf, size);
+      i := i + 1;
+    }
+    self.tempBufCount := 0;
+  }
 
   fn cg_grow() {
     var nc: int64 := self.codeCap * 2;
@@ -1043,6 +1080,10 @@ pub type Codegen = class {
     poke64(base + 24, cnt);
     poke64(base + 32, vmtDataOff);   // WP-10a: offset of VMT table in data section
     self.classCount := self.classCount + 1;
+    // Track temporary field array for later cleanup (BUG-02)
+    // The flds pointer is stored in classLayouts and used by cg_findField/cg_getFieldOffset
+    // until cg_patchAll() completes. cg_freeAllTempBufs() will release it.
+    self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
   }
 
   // Build struct field layout (WP-10d): like cg_buildClassLayout but fields at offset 0
@@ -1086,6 +1127,8 @@ pub type Codegen = class {
     poke64(base + 24, cnt);
     poke64(base + 32, -1);   // vmtDataOff = -1 signals "struct, no VMT"
     self.classCount := self.classCount + 1;
+    // Track temporary field array for later cleanup (BUG-02)
+    self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
   }
 
   fn cg_getLocalClassIdx(varName: pchar, varLen: int64): int64 {
@@ -1301,6 +1344,8 @@ pub type Codegen = class {
     poke8(mangBuf + mangLen, 0);
     // Register label with mangled name
     self.cg_addLabel(mangBuf as pchar, mangLen);
+    // Track mangled name buffer for cleanup after patching (BUG-02)
+    self.cg_trackTempBuf(mangBuf, mangLen + 1);
     // Reset locals
     self.localCount := 0;
     self.frameSize  := 0;
@@ -1655,6 +1700,8 @@ pub type Codegen = class {
         poke8(mangBuf + mangLen, 0);
         var pp: int64 := self.cg_emitCall();
         self.cg_addPatch(pp, mangBuf, mangLen, CG_PATCH_CALL);
+        // Track mangled method name buffer for cleanup after patching (BUG-02)
+        self.cg_trackTempBuf(mangBuf, mangLen + 1);
       } else {
         var pp: int64 := self.cg_emitCall();
         self.cg_addPatch(pp, fname as int64, fnlen, CG_PATCH_CALL);
@@ -2833,6 +2880,11 @@ pub type Codegen = class {
 
     var path: pchar := pathBuf as pchar;
     var src: pchar := self.cg_readFile(path);
+    var srcSize: int64 := 0;
+    if (src != 0 as pchar) { srcSize := StrLen(src); }
+    // BUG-02: pathBuf no longer needed after readFile — free immediately
+    munmap(pathBuf, nameLen + 8);
+
     if (src == 0 as pchar) {
       PrintStr("codegen: cannot read import: ");
       PrintStr(path);
@@ -2842,13 +2894,15 @@ pub type Codegen = class {
 
     // Parse the imported file
     var p: Parser := new Parser();
-    p.Init(src, StrLen(src));
+    p.Init(src, srcSize);
     var head: int64 := p.Parse();
 
     if (p.hadError != 0) {
       PrintStr("codegen: parse error in import: ");
       PrintStr(path);
       PrintStr("\n");
+      // BUG-03: Free src buffer before disposing parser on error
+      munmap(src, srcSize);
       dispose p;
       return;
     }
@@ -2867,6 +2921,8 @@ pub type Codegen = class {
     self.pNodes := savedNodes;
 
     dispose p;
+    // BUG-02: Free imported source buffer after codegen is complete
+    munmap(src, srcSize);
   }
 
   // ------------------------------------------------------------------
@@ -3002,6 +3058,11 @@ pub type Codegen = class {
     // Per-local array flag (WP-10b)
     self.localIsArray := mmap(0, self.localCap, 3, 34, -1, 0);
 
+    // BUG-02: Temporary buffer tracking (prevent mmap leaks)
+    self.tempBufCap   := 64;
+    self.tempBufs     := mmap(0, self.tempBufCap * 16, 3, 34, -1, 0);
+    self.tempBufCount := 0;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
   }
@@ -3009,6 +3070,8 @@ pub type Codegen = class {
   fn Generate(head: int64) {
     self.cg_genFile(head);
     self.cg_patchAll();
+    // BUG-02: Free all temporary mmap buffers after patching is complete
+    self.cg_freeAllTempBufs();
   }
 
   fn WriteELF(path: pchar) {
