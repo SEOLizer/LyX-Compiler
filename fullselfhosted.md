@@ -386,25 +386,22 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ### WP-21: IR-Optimierungen in Lyx
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-18
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-18
 
 **Ziel:** Die fünf Kern-Optimierungen des FPC-Compilers in Lyx portieren.
 
-**Zu implementieren in `bootstrap/ir_optimize.lyx`:**
-1. **Constant Folding:** `irConstInt(3) irAdd irConstInt(4)` → `irConstInt(7)`
-   - Arithmetik, Float-Ops, Vergleiche, Bitwise
-   - Auch über mehrere Instruktionen (Propagation)
-2. **Copy Propagation:** `t1 = a; t2 = t1 + b` → `t2 = a + b`
-3. **Dead Code Elimination:** Unreachable Code nach `irJmp`/`irFuncExit` entfernen;
-   Instruktionen deren `dest` nie gelesen wird
-4. **Common Subexpression Elimination (CSE):** Gleiche Berechnung in selber Expression
-   → gemeinsames Temp-Register
-5. **Strength Reduction:** `x * 2` → `x << 1`, `x * 0` → `0`, etc.
-6. **Iterativer Durchlauf:** 2-Pass-Optimierung (wie FPC: Pass 1 + Pass 2)
+**Implementiert in `bootstrap/ir_optimize.lyx`:**
+- ✅ **IROptimize-Klasse:** IR-Modul-Optimierung mit State-Tracking
+- ✅ **Constant Folding:** Arithmetik, Float-Ops, Vergleiche, Bitwise mit Konstanten
+- ✅ **Copy Propagation:** t1 = a; t2 = t1 + b → t2 = a + b
+- ✅ **Dead Code Elimination:** Unreachable Code nach Jumps/Returns entfernen
+- ✅ **Common Subexpression Elimination (CSE):** Gleiche Berechnungen → gemeinsames Temp
+- ✅ **Strength Reduction:** x * 2 → x << 1, x * 0 → 0, x + 0 → x
+- ✅ **Iterativer Durchlauf:** 2-Pass-Optimierung (bis zu 10 Passes)
+- ✅ **Zusätzliche Optimierungen:** removeRedundantLoads, mergeStores
+- ✅ **Side-Effect-Analyse:** Verhindert Entfernung von Instruktionen mit Nebenwirkungen
 
 **Referenz:** `compiler/ir/ir_optimize.pas` (~1.161 LOC)
-
-**Schätzung:** 2 Sessions | **Output:** `bootstrap/ir_optimize.lyx`
 
 ---
 
@@ -908,7 +905,7 @@ dann in Phase 2 dazu.
 - ✅ **WP-18:** IR-Datenstrukturen in Lyx (ir.lyx) — Abgeschlossen
 - ✅ **WP-19:** AST→IR Lowering (Basis) — Abgeschlossen
 - ✅ **WP-20:** AST→IR Lowering (OOP, Structs, Generics) — Abgeschlossen
-- ❌ **WP-21:** IR-Optimierungen in Lyx
+- ✅ **WP-21:** IR-Optimierungen in Lyx — Abgeschlossen
 - ❌ **WP-22:** Function Inlining
 
 ### Phase 3: Backends
