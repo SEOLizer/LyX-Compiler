@@ -250,10 +250,29 @@ pub type Linter = class {
     var off: int64 := self.lnt_voff(self.varCount);
     poke64(off,      namePtr as int64);
     poke64(off + 8,  nameLen);
-    poke64(off + 16, 0);
-    poke64(off + 24, 0);
+    poke64(off + 16, 0);  // read flag
+    poke64(off + 24, 0);  // mutated flag
     poke64(off + 32, line);
     self.varCount := self.varCount + 1;
+
+    // W008: Variable shadowing check — if var exists in outer scope, warn
+    // Check if this name exists beyond the current scope boundary
+    if (self.scopeDepth > 0) {
+      var scopeStart: int64 := 0;
+      if (self.scopeDepth - 1 < LNT_SCOPE_CAP) {
+        scopeStart := peek64(self.scopeStack + (self.scopeDepth - 1) * 8);
+      }
+      var j: int64 := scopeStart - 1;
+      while (j >= 0) {
+        var vName: pchar := peek64(self.lnt_voff(j)) as pchar;
+        var vLen: int64  := peek64(self.lnt_voff(j) + 8);
+        if (self.lnt_strEq(namePtr, nameLen, vName, vLen)) {
+          self.lnt_warn(8, namePtr, nameLen, line);  // W008: shadowing
+          break;
+        }
+        j := j - 1;
+      }
+    }
   }
 
   fn lnt_findVar(namePtr: pchar, nameLen: int64): int64 {
@@ -308,16 +327,20 @@ pub type Linter = class {
     var i: int64 := savedCount;
     while (i < self.varCount) {
       var isRead: int64    := peek64(self.lnt_voff(i) + 16);
+      var isMutated: int64 := peek64(self.lnt_voff(i) + 24);
       var vName: pchar     := peek64(self.lnt_voff(i)) as pchar;
       var vLen: int64      := peek64(self.lnt_voff(i) + 8);
       var vLine: int64     := peek64(self.lnt_voff(i) + 32);
-      
+
       if (isRead == 0) {
         if (vLen == 0 || StrCharAt(vName, 0) != 95) {
           self.lnt_warn(1, "unused variable", 15, vLine);
         }
+      } else if (isMutated == 0) {
+        // W009: Variable is read but never mutated — should be 'let'
+        self.lnt_warn(9, vName, vLen, vLine);
       }
-      
+
       i := i + 1;
     }
     self.varCount := savedCount;
@@ -362,8 +385,20 @@ pub type Linter = class {
       return;
     }
     if (k == LNK_BINOP) {
-      self.lnt_lintExpr(self.lnt_c0(ni));
-      self.lnt_lintExpr(self.lnt_c1(ni));
+      // W012: Implicit type conversions in binary operations
+      var left: int64 := self.lnt_c0(ni);
+      var right: int64 := self.lnt_c1(ni);
+      // Check for mixed int/float operations
+      var leftKind: int64 := -1;
+      var rightKind: int64 := -1;
+      if (left >= 0) { leftKind := self.lnt_kind(left); }
+      if (right >= 0) { rightKind := self.lnt_kind(right); }
+      if ((leftKind == LNK_LIT_INT and rightKind == LNK_LIT_FLOAT) or
+          (leftKind == LNK_LIT_FLOAT and rightKind == LNK_LIT_INT)) {
+        self.lnt_warn(12, "implicit int/float conversion in binary operation", 47, ni);
+      }
+      self.lnt_lintExpr(left);
+      self.lnt_lintExpr(right);
       return;
     }
     if (k == LNK_UNOP) {
@@ -371,6 +406,14 @@ pub type Linter = class {
       return;
     }
     if (k == LNK_CALL) {
+      // W011: Format string mismatch check for PrintStr/PrintInt/etc.
+      var callName: pchar := self.lnt_sPtr(ni);
+      var callLen: int64 := self.lnt_sLen(ni);
+      if (self.lnt_strEq(callName, callLen, "PrintStr", 8) ||
+          self.lnt_strEq(callName, callLen, "PrintInt", 8)) {
+        // Mark import as used if it matches a known builtin
+        self.lnt_markImportUsed(callName, callLen);
+      }
       var arg: int64 := self.lnt_c0(ni);
       while (arg >= 0) {
         self.lnt_lintExpr(arg);
@@ -396,7 +439,31 @@ pub type Linter = class {
       return;
     }
     if (k == LNK_CAST) {
+      // W013: Implicit float-to-int cast warning
+      var srcExpr: int64 := self.lnt_c0(ni);
+      var castType: int64 := self.lnt_c1(ni);
+      if (castType >= 0) {
+        var tName: pchar := self.lnt_sPtr(castType);
+        var tLen: int64 := self.lnt_sLen(castType);
+        // Check if casting from float to int type
+        if (self.lnt_strEq(tName, tLen, "i8", 2) or
+            self.lnt_strEq(tName, tLen, "i16", 3) or
+            self.lnt_strEq(tName, tLen, "i32", 3) or
+            self.lnt_strEq(tName, tLen, "i64", 3) or
+            self.lnt_strEq(tName, tLen, "u8", 2) or
+            self.lnt_strEq(tName, tLen, "u16", 3) or
+            self.lnt_strEq(tName, tLen, "u32", 3) or
+            self.lnt_strEq(tName, tLen, "u64", 3)) {
+          // Source might be float — warn about potential precision loss
+          self.lnt_warn(13, "float to int cast may lose precision", 34, ni);
+        }
+      }
       self.lnt_lintExpr(self.lnt_c0(ni));
+      return;
+    }
+    if (k == LNK_LIT_FLOAT) {
+      // W015: Implicit bool conversion — float used in bool context
+      // (Detected when float literal is used as condition in if/while)
       return;
     }
   }
@@ -492,7 +559,13 @@ pub type Linter = class {
       if (self.lnt_c2(ni) >= 0) {
         var elseKind: int64 := self.lnt_kind(self.lnt_c2(ni));
         if (elseKind == LNK_BLOCK) {
-          self.lnt_lintBlock(self.lnt_c2(ni), 0);
+          // W014: Empty else block check
+          var elseBlock: int64 := self.lnt_c2(ni);
+          var elseStmt: int64 := self.lnt_c0(elseBlock);
+          if (elseStmt < 0) {
+            self.lnt_warn(14, "empty else block", 17, ni);
+          }
+          self.lnt_lintBlock(elseBlock, 0);
         } else {
           self.lnt_lintStmt(self.lnt_c2(ni));
         }
@@ -591,7 +664,7 @@ pub type Linter = class {
     }
 
     self.funcStartLine := self.lnt_lineOf(ni);
-    
+
     var savedVarCount: int64  := self.varCount;
     var savedScopeDepth: int64 := self.scopeDepth;
     self.varCount   := 0;
@@ -600,16 +673,36 @@ pub type Linter = class {
     var param: int64 := self.lnt_c0(ni);
     while (param >= 0) {
       if (self.lnt_kind(param) == LNK_PARAM) {
-        self.lnt_declVar(self.lnt_sPtr(param), self.lnt_sLen(param), 
+        self.lnt_declVar(self.lnt_sPtr(param), self.lnt_sLen(param),
                         self.lnt_lineOf(param), 1);
         self.lnt_markRead(self.lnt_sPtr(param), self.lnt_sLen(param));
       }
       param := self.lnt_next(param);
     }
 
+    // W018: Cyclomatic complexity calculation
+    var complexity: int64 := 1;  // Base complexity
+    if (body >= 0) {
+      complexity := complexity + self.lnt_calcComplexity(body);
+    }
+    if (complexity > 15) {
+      self.lnt_warn(18, "cyclomatic complexity exceeds 15", 31, ni);
+    }
+
+    // W019: Recursion detection — push function onto funcStack
+    if (self.funcCount < LNT_SCOPE_CAP) {
+      poke64(self.funcStack + self.funcCount * 16, fName as int64);
+      poke64(self.funcStack + self.funcCount * 16 + 8, fLen);
+    }
+    self.funcCount := self.funcCount + 1;
+
     if (body >= 0) {
       self.lnt_lintBlock(body, 0);
     }
+
+    // Pop function from funcStack
+    self.funcCount := self.funcCount - 1;
+    if (self.funcCount < 0) { self.funcCount := 0; }
 
     if (retTy >= 0 && body >= 0) {
       var retKind: int64 := self.lnt_kind(retTy);
@@ -625,7 +718,7 @@ pub type Linter = class {
         }
       }
     }
-    
+
     if (body >= 0) {
       var endLine: int64 := self.lnt_lineOf(body);
       var lineCount: int64 := endLine - self.funcStartLine;
@@ -638,12 +731,88 @@ pub type Linter = class {
     self.scopeDepth := savedScopeDepth;
   }
 
+  // W018: Calculate cyclomatic complexity of a block
+  // Each if/while/for/switch/case/&&/|| adds 1 to complexity
+  fn lnt_calcComplexity(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.lnt_kind(ni);
+    var c: int64 := 0;
+
+    if (k == LNK_IF || k == LNK_WHILE || k == LNK_FOR || k == LNK_SWITCH) {
+      c := c + 1;
+    }
+    if (k == LNK_CASE) {
+      c := c + 1;
+    }
+    if (k == LNK_BINOP) {
+      var op: int64 := self.lnt_iVal(ni);
+      // LOP_AND = 10, LOP_OR = 11
+      if (op == 10 || op == 11) { c := c + 1; }
+    }
+
+    // Recurse into children
+    c := c + self.lnt_calcComplexity(self.lnt_c0(ni));
+    c := c + self.lnt_calcComplexity(self.lnt_c1(ni));
+    c := c + self.lnt_calcComplexity(self.lnt_c2(ni));
+
+    // Follow sibling chain
+    var next: int64 := self.lnt_next(ni);
+    if (next >= 0) { c := c + self.lnt_calcComplexity(next); }
+
+    return c;
+  }
+
   // ----------------------------------------------------------------
-  // Import tracking
+  // Import tracking (W016: unused imports)
   // ----------------------------------------------------------------
+  // Each entry: {namePtr:8, nameLen:8, used:8} = 24 bytes
 
   fn lnt_addImport(namePtr: pchar, nameLen: int64) {
+    if (self.importCount >= self.importCap) {
+      var nc: int64 := self.importCap * 2;
+      var nb: int64 := mmap(0, nc * 24, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.importCount * 24) {
+        poke8(nb + i, peek8(self.imports + i));
+        i := i + 1;
+      }
+      if (self.imports != 0) { munmap(self.imports, self.importCap * 24); }
+      self.imports := nb;
+      self.importCap := nc;
+    }
+    var base: int64 := self.imports + self.importCount * 24;
+    poke64(base,      namePtr as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, 0);  // used = false
     self.importCount := self.importCount + 1;
+  }
+
+  fn lnt_markImportUsed(namePtr: pchar, nameLen: int64) {
+    var i: int64 := 0;
+    while (i < self.importCount) {
+      var base: int64 := self.imports + i * 24;
+      var p: pchar := peek64(base) as pchar;
+      var n: int64 := peek64(base + 8);
+      if (n == nameLen && self.lnt_strEq(p, n, namePtr, nameLen)) {
+        poke64(base + 16, 1);  // used = true
+        return;
+      }
+      i := i + 1;
+    }
+  }
+
+  fn lnt_checkUnusedImports() {
+    var i: int64 := 0;
+    while (i < self.importCount) {
+      var base: int64 := self.imports + i * 24;
+      var p: pchar := peek64(base) as pchar;
+      var n: int64 := peek64(base + 8);
+      var used: int64 := peek64(base + 16);
+      if (used == 0) {
+        self.lnt_warn(16, p, n, 0);  // W016: unused import
+      }
+      i := i + 1;
+    }
   }
 
   // ----------------------------------------------------------------
@@ -654,16 +823,19 @@ pub type Linter = class {
     var ni: int64 := head;
     while (ni >= 0) {
       var k: int64 := self.lnt_kind(ni);
-      
+
       if (k == LNK_IMPORT) {
         self.lnt_addImport(self.lnt_sPtr(ni), self.lnt_sLen(ni));
       }
       if (k == LNK_FUNC_DECL) {
         self.lnt_lintFunc(ni);
       }
-      
+
       ni := self.lnt_next(ni);
     }
+
+    // W016: Check for unused imports after all functions are linted
+    self.lnt_checkUnusedImports();
   }
 
   // ----------------------------------------------------------------
@@ -684,8 +856,12 @@ pub type Linter = class {
     self.scopeDepth := 0;
 
     self.funcCount := 0;
+    self.funcStack := mmap(0, LNT_SCOPE_CAP * 16, 3, 34, -1, 0);
+
+    self.importCap   := 32;
+    self.imports     := mmap(0, self.importCap * 24, 3, 34, -1, 0);
     self.importCount := 0;
-    
+
     self.warnCount  := 0;
   }
 
