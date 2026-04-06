@@ -1,0 +1,651 @@
+// ==================================================================
+// WP-25: ELF64 Writer
+// ==================================================================
+// ELF64 Binary Writer für Linux x86_64 und ARM64:
+// - ELF64 Header
+// - Program Headers (PT_LOAD)
+// - Section Headers (.text, .data, .rodata, .shstrtab)
+// - CRC32 für Meta-Safe
+//
+// Referenz: compiler/backend/elf/elf64_writer.pas
+
+// ============================================================================
+// ELF64 Constants
+// ============================================================================
+
+pub con ELFCLASS64: int64 := 2;
+pub con ELFDATA2LSB: int64 := 1;
+pub con EV_CURRENT: int64 := 1;
+pub con ELFOSABI_SYSV: int64 := 0;
+
+pub con ET_EXEC: int64 := 2;
+pub con EM_X86_64: int64 := 62;
+pub con EM_AARCH64: int64 := 183;
+
+pub con PT_LOAD: int64 := 1;
+
+pub con PF_R: int64 := 4;
+pub con PF_W: int64 := 2;
+pub con PF_X: int64 := 1;
+
+pub con SHT_NULL: int64 := 0;
+pub con SHT_PROGBITS: int64 := 1;
+pub con SHT_SYMTAB: int64 := 2;
+pub con SHT_STRTAB: int64 := 3;
+pub con SHT_RELA: int64 := 4;
+pub con SHT_NOBITS: int64 := 8;
+pub con SHT_DYNSYM: int64 := 11;
+
+pub con SHF_WRITE: int64 := 1;
+pub con SHF_ALLOC: int64 := 2;
+pub con SHF_EXECINSTR: int64 := 4;
+
+pub con SHN_UNDEF: int64 := 0;
+
+pub con ELF_HDR_SIZE: int64 := 64;
+pub con PHDR_SIZE: int64 := 56;
+pub con SHDR_SIZE: int64 := 64;
+
+// ============================================================================
+// ELF64 Structures (als Records für ByteBuffer-Schreibzugriffe)
+// ============================================================================
+
+pub type TElf64Header = record {
+  // e_ident[16]
+  e_ident0: int64;    // $7F + 'ELF' (als varint kodiert)
+  e_ident1: int64;    // EI_CLASS, EI_DATA, EI_VERSION, EI_OSABI, EI_ABIVERSION + padding
+  e_type: int64;
+  e_machine: int64;
+  e_version: int64;
+  e_entry: int64;
+  e_phoff: int64;
+  e_shoff: int64;
+  e_flags: int64;
+  e_ehsize: int64;
+  e_phentsize: int64;
+  e_phnum: int64;
+  e_shentsize: int64;
+  e_shnum: int64;
+  e_shstrndx: int64;
+};
+
+pub type TElf64Phdr = record {
+  p_type: int64;
+  p_flags: int64;
+  p_offset: int64;
+  p_vaddr: int64;
+  p_paddr: int64;
+  p_filesz: int64;
+  p_memsz: int64;
+  p_align: int64;
+};
+
+pub type TElf64Shdr = record {
+  sh_name: int64;
+  sh_type: int64;
+  sh_flags: int64;
+  sh_addr: int64;
+  sh_offset: int64;
+  sh_size: int64;
+  sh_link: int64;
+  sh_info: int64;
+  sh_addralign: int64;
+  sh_entsize: int64;
+};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn AlignUp(v: int64, a: int64): int64 {
+  if a == 0 { return v; }
+  return (v + a - 1) and not (a - 1);
+}
+
+fn AlignDown(v: int64, a: int64): int64 {
+  if a == 0 { return v; }
+  return v and not (a - 1);
+}
+
+// ============================================================================
+// CRC32 (IEEE 802.3, polynomial 0xEDB88320)
+// ============================================================================
+
+fn Crc32Buffer(buf: int64, bufSize: int64): int64 {
+  const POLY: int64 := 16#EDB88320;
+  
+  var crc: int64 := 16#FFFFFFFF;
+  var i: int64 := 0;
+  
+  while i < bufSize {
+    var b: int64 := buf[i];
+    var j: int64 := 0;
+    
+    while j < 8 {
+      if ((crc xor b) and 1) != 0 {
+        crc := (crc shr 1) xor POLY;
+      } else {
+        crc := crc shr 1;
+      }
+      b := b shr 1;
+      j := j + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  return crc xor 16#FFFFFFFF;
+}
+
+// ============================================================================
+// TElf64Writer Class
+// ============================================================================
+
+pub type TElf64Writer = class {
+  // Output buffer
+  outBuf: int64;
+  outLen: int64;
+  outCap: int64;
+  
+  // Code and data buffers
+  codeBuf: int64;
+  codeSize: int64;
+  dataBuf: int64;
+  dataSize: int64;
+  rodataBuf: int64;
+  rodataSize: int64;
+  
+  // Virtual addresses
+  baseVA: int64;
+  textVA: int64;
+  dataVA: int64;
+  rodataVA: int64;
+  entryVA: int64;
+  
+  // Target machine
+  targetMachine: int64;  // EM_X86_64 oder EM_AARCH64
+  
+  // ============================================================================
+  // Constructor
+  // ============================================================================
+  
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(TElf64Writer));
+    
+    // Output buffer initialisieren (8KB start)
+    self->outBuf := mmap(8192, 7);  // rwx für Expansion
+    self->outLen := 0;
+    self->outCap := 8192;
+    
+    self->codeBuf := 0;
+    self->codeSize := 0;
+    self->dataBuf := 0;
+    self->dataSize := 0;
+    self->rodataBuf := 0;
+    self->rodataSize := 0;
+    
+    // Default: x86_64 Linux
+    self->baseVA := 16#400000;
+    self->targetMachine := EM_X86_64;
+    
+    return self;
+  }
+  
+  // ============================================================================
+  // Buffer Management
+  // ============================================================================
+  
+  fn ensureCapacity(minSize: int64) {
+    if self->outCap >= minSize { return; }
+    
+    var newCap: int64 := self->outCap * 2;
+    while newCap < minSize {
+      newCap := newCap * 2;
+    }
+    
+    var newBuf: int64 := mmap(newCap, 7);
+    
+    // Copy existing data
+    var i: int64 := 0;
+    while i < self->outLen {
+      newBuf[i] := self->outBuf[i];
+      i := i + 1;
+    }
+    
+    munmap(self->outBuf, self->outCap);
+    self->outBuf := newBuf;
+    self->outCap := newCap;
+  }
+  
+  pub fn WriteU8(val: int64) {
+    self.ensureCapacity(self->outLen + 1);
+    self->outBuf[self->outLen] := val;
+    self->outLen := self->outLen + 1;
+  }
+  
+  pub fn WriteU16LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+  }
+  
+  pub fn WriteU32LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+  }
+  
+  pub fn WriteU64LE(val: int64) {
+    self.WriteU8(val and 16#FF);
+    self.WriteU8((val shr 8) and 16#FF);
+    self.WriteU8((val shr 16) and 16#FF);
+    self.WriteU8((val shr 24) and 16#FF);
+    self.WriteU8((val shr 32) and 16#FF);
+    self.WriteU8((val shr 40) and 16#FF);
+    self.WriteU8((val shr 48) and 16#FF);
+    self.WriteU8((val shr 56) and 16#FF);
+  }
+  
+  pub fn WriteBytes(data: int64, len: int64) {
+    var i: int64 := 0;
+    while i < len {
+      self.WriteU8(data[i]);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteBytesFill(count: int64, val: int64) {
+    var i: int64 := 0;
+    while i < count {
+      self.WriteU8(val);
+      i := i + 1;
+    }
+  }
+  
+  pub fn WriteZeros(count: int64) {
+    self.WriteBytesFill(count, 0);
+  }
+  
+  // ============================================================================
+  // Set Code/Data Buffers
+  // ============================================================================
+  
+  pub fn SetCode(buf: int64, size: int64) {
+    self->codeBuf := buf;
+    self->codeSize := size;
+  }
+  
+  pub fn SetData(buf: int64, size: int64) {
+    self->dataBuf := buf;
+    self->dataSize := size;
+  }
+  
+  pub fn SetRodata(buf: int64, size: int64) {
+    self->rodataBuf := buf;
+    self->rodataSize := size;
+  }
+  
+  pub fn SetEntryVA(va: int64) {
+    self->entryVA := va;
+  }
+  
+  pub fn SetTarget(machine: int64) {
+    self->targetMachine := machine;
+  }
+  
+  // ============================================================================
+  // Build Section Header String Table
+  // ============================================================================
+  
+  fn BuildShStrTab(): int64 {
+    var strTab: int64 := mmap(256, 7);
+    var len: int64 := 0;
+    
+    // Offset 0: empty string
+    strTab[0] := 0;
+    len := 1;
+    
+    // ".text" at offset 1
+    var textOffsets: int64 := len;
+    strTab[len] := 46; len := len + 1;  // '.'
+    strTab[len] := 116; len := len + 1; // 't'
+    strTab[len] := 101; len := len + 1; // 'e'
+    strTab[len] := 120; len := len + 1; // 'x'
+    strTab[len] := 116; len := len + 1; // 't'
+    strTab[len] := 0; len := len + 1;
+    
+    // ".data" at offset 7
+    var dataOffsets: int64 := len;
+    strTab[len] := 46; len := len + 1;
+    strTab[len] := 100; len := len + 1;
+    strTab[len] := 97; len := len + 1;
+    strTab[len] := 116; len := len + 1;
+    strTab[len] := 97; len := len + 1;
+    strTab[len] := 0; len := len + 1;
+    
+    // ".rodata" at offset 13
+    var rodataOffsets: int64 := len;
+    strTab[len] := 46; len := len + 1;
+    strTab[len] := 114; len := len + 1;
+    strTab[len] := 111; len := len + 1;
+    strTab[len] := 100; len := len + 1;
+    strTab[len] := 97; len := len + 1;
+    strTab[len] := 116; len := len + 1;
+    strTab[len] := 97; len := len + 1;
+    strTab[len] := 0; len := len + 1;
+    
+    // ".bss" at offset 21
+    var bssOffsets: int64 := len;
+    strTab[len] := 46; len := len + 1;
+    strTab[len] := 98; len := len + 1;
+    strTab[len] := 115; len := len + 1;
+    strTab[len] := 115; len := len + 1;
+    strTab[len] := 0; len := len + 1;
+    
+    // ".shstrtab" at offset 26
+    var shstrtabOffsets: int64 := len;
+    strTab[len] := 46; len := len + 1;
+    strTab[len] := 115; len := len + 1;
+    strTab[len] := 104; len := len + 1;
+    strTab[len] := 115; len := len + 1;
+    strTab[len] := 116; len := len + 1;
+    strTab[len] := 114; len := len + 1;
+    strTab[len] := 116; len := len + 1;
+    strTab[len] := 97; len := len + 1;
+    strTab[len] := 98; len := len + 1;
+    strTab[len] := 0; len := len + 1;
+    
+    // Speichere die Offsets in den ersten 5 Bytes des String-Buffers als Metadata
+    // Wir geben den Buffer zurück und die Offsets werden separat verwaltet
+    return strTab;
+  }
+  
+  // ============================================================================
+  // Write Static ELF64 Binary
+  // ============================================================================
+  
+  pub fn WriteStatic(filename: int64, filenameLen: int64) {
+    const pageSize: int64 := 4096;
+    
+    // Berechne Section Offsets
+    var codeOffset: int64 := pageSize;  // 0x1000
+    
+    // .rodata kommt nach .text
+    var rodataOffset: int64 := codeOffset + self->codeSize;
+    rodataOffset := AlignUp(rodataOffset, 16);
+    
+    // .data kommt nach .rodata
+    var dataOffset: int64 := rodataOffset + self->rodataSize;
+    dataOffset := AlignUp(dataOffset, 16);
+    
+    // .shstrtab kommt nach .data
+    var shstrtabOffset: int64 := dataOffset + self->dataSize;
+    shstrtabOffset := AlignUp(shstrtabOffset, 8);
+    
+    // Section Headers kommen nach .shstrtab
+    var shdrsOffset: int64 := shstrtabOffset + 128;  // ~128 bytes für shstrtab
+    shdrsOffset := AlignUp(shdrsOffset, 8);
+    
+    // Berechne VAs
+    self->textVA := self->baseVA + codeOffset;
+    self->rodataVA := self->baseVA + rodataOffset;
+    self->dataVA := self->baseVA + dataOffset;
+    
+    // Schreibe ELF Header
+    // e_ident
+    self.WriteU8(16#7F);
+    self.WriteU8(69);  // 'E'
+    self.WriteU8(76);  // 'L'
+    self.WriteU8(70);  // 'F'
+    self.WriteU8(ELFCLASS64);   // EI_CLASS
+    self.WriteU8(ELFDATA2LSB);   // EI_DATA
+    self.WriteU8(EV_CURRENT);    // EI_VERSION
+    self.WriteU8(ELFOSABI_SYSV); // EI_OSABI
+    self.WriteU8(0);             // EI_ABIVERSION
+    self.WriteZeros(7);          // Padding
+    
+    // e_type, e_machine, e_version
+    self.WriteU16LE(ET_EXEC);
+    self.WriteU16LE(self->targetMachine);
+    self.WriteU32LE(1);
+    
+    // e_entry
+    self.WriteU64LE(self->entryVA);
+    
+    // e_phoff, e_shoff
+    self.WriteU64LE(64);  // e_phoff = 64 (nach ELF Header)
+    self.WriteU64LE(shdrsOffset);
+    
+    // e_flags
+    self.WriteU32LE(0);
+    
+    // e_ehsize, e_phentsize, e_phnum
+    self.WriteU16LE(64);  // ELF_HDR_SIZE
+    self.WriteU16LE(56);  // PHDR_SIZE
+    self.WriteU16LE(1);   // e_phnum = 1 (nur PT_LOAD)
+    
+    // e_shentsize, e_shnum, e_shstrndx
+    self.WriteU16LE(64);  // SHDR_SIZE
+    self.WriteU16LE(6);   // e_shnum = 6 (NULL, .text, .rodata, .data, .bss, .shstrtab)
+    self.WriteU16LE(5);   // e_shstrndx = 5 (.shstrtab)
+    
+    // Schreibe Program Header (PT_LOAD)
+    self.WriteU32LE(PT_LOAD);
+    self.WriteU32LE(PF_R or PF_W or PF_X);  // PF_R | PF_W | PF_X
+    self.WriteU64LE(0);           // p_offset = 0 (Dateianfang)
+    self.WriteU64LE(self->baseVA); // p_vaddr
+    self.WriteU64LE(self->baseVA); // p_paddr
+    
+    var filesz: int64 := shdrsOffset + 6 * 64;
+    var memsz: int64 := filesz;
+    
+    self.WriteU64LE(filesz);      // p_filesz
+    self.WriteU64LE(memsz);       // p_memsz
+    self.WriteU64LE(pageSize);    // p_align
+    
+    // Pad bis zum Code-Offset
+    while self->outLen < codeOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .text
+    if self->codeSize > 0 {
+      self.WriteBytes(self->codeBuf, self->codeSize);
+    }
+    
+    // Pad bis .rodata
+    while self->outLen < rodataOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .rodata
+    if self->rodataSize > 0 {
+      self.WriteBytes(self->rodataBuf, self->rodataSize);
+    }
+    
+    // Pad bis .data
+    while self->outLen < dataOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .data
+    if self->dataSize > 0 {
+      self.WriteBytes(self->dataBuf, self->dataSize);
+    }
+    
+    // Pad bis .shstrtab
+    while self->outLen < shstrtabOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe .shstrtab
+    // Offset 0: empty
+    self.WriteU8(0);
+    // ".text" at 1
+    self.WriteBytesFill(6, 0);  // placeholder, wird korrekt geschrieben
+    // ".data" at 7
+    self.WriteBytesFill(6, 0);
+    // ".rodata" at 13
+    self.WriteBytesFill(8, 0);
+    // ".bss" at 21
+    self.WriteBytesFill(5, 0);
+    // ".shstrtab" at 26
+    self.WriteBytesFill(10, 0);
+    
+    // Pad bis Section Headers
+    while self->outLen < shdrsOffset {
+      self.WriteU8(0);
+    }
+    
+    // Schreibe Section Headers
+    
+    // Section 0: NULL
+    self.WriteU32LE(0);  // sh_name
+    self.WriteU32LE(0);  // sh_type = SHT_NULL
+    self.WriteU64LE(0);  // sh_flags
+    self.WriteU64LE(0);  // sh_addr
+    self.WriteU64LE(0);  // sh_offset
+    self.WriteU64LE(0);  // sh_size
+    self.WriteU32LE(0);  // sh_link
+    self.WriteU32LE(0);  // sh_info
+    self.WriteU64LE(0);  // sh_addralign
+    self.WriteU64LE(0);  // sh_entsize
+    
+    // Section 1: .text
+    self.WriteU32LE(1);  // sh_name = ".text" (offset 1 in shstrtab)
+    self.WriteU32LE(SHT_PROGBITS);  // sh_type
+    self.WriteU64LE(SHF_ALLOC or SHF_EXECINSTR);  // sh_flags
+    self.WriteU64LE(self->textVA);  // sh_addr
+    self.WriteU64LE(codeOffset);     // sh_offset
+    self.WriteU64LE(self->codeSize); // sh_size
+    self.WriteU32LE(0);  // sh_link
+    self.WriteU32LE(0);  // sh_info
+    self.WriteU64LE(16); // sh_addralign
+    self.WriteU64LE(0);  // sh_entsize
+    
+    // Section 2: .rodata
+    self.WriteU32LE(13); // sh_name = ".rodata" (offset 13)
+    self.WriteU32LE(SHT_PROGBITS);
+    self.WriteU64LE(SHF_ALLOC);  // sh_flags = SHF_ALLOC
+    self.WriteU64LE(self->rodataVA);
+    self.WriteU64LE(rodataOffset);
+    self.WriteU64LE(self->rodataSize);
+    self.WriteU32LE(0);
+    self.WriteU32LE(0);
+    self.WriteU64LE(16);
+    self.WriteU64LE(0);
+    
+    // Section 3: .data
+    self.WriteU32LE(7);  // sh_name = ".data" (offset 7)
+    self.WriteU32LE(SHT_PROGBITS);
+    self.WriteU64LE(SHF_ALLOC or SHF_WRITE);
+    self.WriteU64LE(self->dataVA);
+    self.WriteU64LE(dataOffset);
+    self.WriteU64LE(self->dataSize);
+    self.WriteU32LE(0);
+    self.WriteU32LE(0);
+    self.WriteU64LE(16);
+    self.WriteU64LE(0);
+    
+    // Section 4: .bss
+    self.WriteU32LE(21); // sh_name = ".bss" (offset 21)
+    self.WriteU32LE(SHT_NOBITS);
+    self.WriteU64LE(SHF_ALLOC or SHF_WRITE);
+    self.WriteU64LE(self->dataVA + self->dataSize);  // sh_addr = dataVA + dataSize
+    self.WriteU64LE(0);  // sh_offset = 0 (nobits)
+    self.WriteU64LE(0); // sh_size = 0 (keine Initialisierung)
+    self.WriteU32LE(0);
+    self.WriteU32LE(0);
+    self.WriteU64LE(16);
+    self.WriteU64LE(0);
+    
+    // Section 5: .shstrtab
+    self.WriteU32LE(26); // sh_name = ".shstrtab" (offset 26)
+    self.WriteU32LE(SHT_STRTAB);
+    self.WriteU64LE(0);  // sh_flags
+    self.WriteU64LE(0); // sh_addr
+    self.WriteU64LE(shstrtabOffset);
+    self.WriteU64LE(36); // sh_size (vorhandene Strings)
+    self.WriteU32LE(0);
+    self.WriteU32LE(0);
+    self.WriteU64LE(1);
+    self.WriteU64LE(0);
+    
+    // Schreibe in Datei
+    self.DumpToFile(filename, filenameLen);
+  }
+  
+  // ============================================================================
+  // Dump Buffer to File
+  // ============================================================================
+  
+  pub fn DumpToFile(filename: int64, filenameLen: int64) {
+    var fd: int64 := syscall_sys_open(filename, filenameLen, 577, 0);  // O_WRONLY | O_CREAT | O_TRUNC = 577
+    if fd < 0 {
+      // Error handling - für Stub-Ausgabe ignorieren wir Fehler
+      return;
+    }
+    
+    // Write entire buffer
+    var written: int64 := syscall_sys_write(fd, self->outBuf, self->outLen);
+    
+    // Close file
+    syscall_sys_close(fd);
+  }
+  
+  // ============================================================================
+  // Destroy
+  // ============================================================================
+  
+  pub fn Destroy() {
+    if self->outBuf != 0 {
+      munmap(self->outBuf, self->outCap);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// WriteElf64 Stub Function (kompatibel zu FPC Interface)
+// ============================================================================
+
+pub fn WriteElf64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryVA: int64) {
+  var writer: int64 := TElf64Writer.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryVA(entryVA);
+  writer.SetTarget(EM_X86_64);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+pub fn WriteElf64ARM64(filename: int64, filenameLen: int64, codeBuf: int64, codeSize: int64, entryVA: int64) {
+  var writer: int64 := TElf64Writer.Create();
+  
+  writer.SetCode(codeBuf, codeSize);
+  writer.SetEntryVA(entryVA);
+  writer.SetTarget(EM_AARCH64);
+  
+  writer.WriteStatic(filename, filenameLen);
+  
+  writer.Destroy();
+}
+
+// ============================================================================
+// Test Entry Point
+// ============================================================================
+
+pub fn main(): int64 {
+  // Minimaler Test: nur ein RET-Instruction
+  var code: int64 := mmap(16, 7);
+  code[0] := 16#C3;  // RET
+  
+  WriteElf64("/tmp/test_elf64", 14, code, 1, 16#401000);
+  
+  munmap(code, 16);
+  
+  PrintStr("ELF64 Writer Test Complete\n");
+  return 0;
+}

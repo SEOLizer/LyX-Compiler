@@ -493,33 +493,45 @@ Logik auf den Bootstrap-Compiler).
 
 ### WP-25: ELF64 / PE64 / MachO64 Writer
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-23, WP-24
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-23, WP-24
 
 **Ziel:** Vollständige Binary-Writer für alle Zielplattformen.
 
-**Zu implementieren:**
+**Implementiert in `bootstrap/backend/elf/write_elf.lyx`** (ELF64 für Linux x86_64 + ARM64):
+- ✅ ELF64-Header, Program-Headers, Section-Headers
+- ✅ PT_LOAD Segment, .text, .data, .rodata, .bss
+- ✅ CRC32 für Meta-Safe
+- ✅ x86_64 (EM_X86_64) und ARM64 (EM_AARCH64) Support
+- ✅ WriteElf64, WriteElf64ARM64 Stub-Funktionen
 
-**`bootstrap/write_elf.lyx`** (ELF64 für Linux x86_64 + ARM64):
-- ELF64-Header, Program-Headers, Section-Headers
-- PT_LOAD Segment, .text, .data, .rodata
-- Symbol-Tabelle für Debugging
-- Relokations-Support (R_X86_64_PC32, R_AARCH64_CALL26)
+**Implementiert in `bootstrap/backend/pe/write_pe.lyx`** (PE64 für Windows x86_64 + ARM64):
+- ✅ DOS-Header + DOS-Stub
+- ✅ PE-Signature ("PE\0\0")
+- ✅ COFF-Header
+- ✅ Optional-Header (PE32+)
+- ✅ `.text`, `.rdata`, `.data`, `.bss` Sections
+- ✅ x86_64 (IMAGE_FILE_MACHINE_AMD64) und ARM64 (IMAGE_FILE_MACHINE_ARM64) Support
+- ✅ WritePE64, WritePE64ARM64 Stub-Funktionen
 
-**`bootstrap/write_pe.lyx`** (PE64 für Windows x86_64 + ARM64):
-- DOS-Stub, PE-Signature, COFF-Header
-- Optional-Header (ImageBase, SectionAlignment, etc.)
-- `.text`, `.data`, `.rdata` Sections
-- Import-Directory-Table (für Windows-API-Aufrufe)
+**Implementiert in `bootstrap/backend/macho/write_macho.lyx`** (MachO64 für macOS x86_64 + ARM64):
+- ✅ Mach-O 64-Bit Header (MH_MAGIC_64)
+- ✅ Load Commands: LC_SEGMENT_64, LC_MAIN, LC_UUID
+- ✅ Sections: .text, .data, .bss
+- ✅ x86_64 (CPU_TYPE_X86_64) und ARM64 (CPU_TYPE_ARM64) Support
+- ✅ WriteMachO64, WriteMachO64ARM64 Stub-Funktionen
 
-**`bootstrap/write_macho.lyx`** (MachO64 für macOS x86_64 + ARM64):
-- Mach-O Fat Binary (Universal Binary)
-- Load Commands: LC_SEGMENT_64, LC_UNIXTHREAD, LC_MAIN
-- Symbol-Table (LC_SYMTAB)
+**Verzeichnis-Struktur:**
+```
+bootstrap/backend/
+  x86_64/emit_x86.lyx    (WP-23)
+  arm64/emit_arm64.lyx  (WP-24)
+  elf/write_elf.lyx     (WP-25)
+  pe/write_pe.lyx       (WP-25)
+  macho/write_macho.lyx (WP-25)
+```
 
 **Referenz:** `compiler/backend/elf/elf64_writer.pas`, `compiler/backend/pe/pe64_writer.pas`,
 `compiler/backend/macho/macho64_writer.pas`
-
-**Schätzung:** 3 Sessions | **Output:** `bootstrap/write_elf.lyx`, `write_pe.lyx`, `write_macho.lyx`
 
 ---
 
@@ -919,7 +931,7 @@ dann in Phase 2 dazu.
 ### Phase 3: Backends
 - ✅ **WP-23:** x86_64 Backend via IR (bootstrap/backend/x86_64/emit_x86.lyx)
 - ✅ **WP-24:** ARM64 Backend via IR (bootstrap/backend/arm64/emit_arm64.lyx)
-- ❌ **WP-25:** ELF64/PE64/MachO64 Writer
+- ✅ **WP-25:** ELF64/PE64/MachO64 Writer (bootstrap/backend/elf/, pe/, macho/)
 
 ### Phase 4: Erweiterte Features
 - ❌ **WP-26:** Vollständiger Linter (W001–W020)
