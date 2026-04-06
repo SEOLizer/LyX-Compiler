@@ -309,36 +309,21 @@ abgebildet: `for i in 1..10` generiert identischen Code wie `for i = 1 to 10`.
 
 ### WP-18: IR-Datenstrukturen in Lyx
 
-**Status:** Ausstehend | **Abhängigkeit:** WP-11, WP-16
+**Status:** ✅ Abgeschlossen | **Abhängigkeit:** WP-11, WP-16
 
 **Ziel:** Vollständige IR-Datenstrukturen im Bootstrap-Compiler.
 
-**Zu implementieren in `bootstrap/ir.lyx`:**
-1. **`TIROpKind`-Enum:** Alle ~100 IR-Opcodes aus `compiler/ir/ir.pas`
-   - Konstanten, Arithmetik, Float-Ops, Vergleiche, Bitwise
-   - Memory (Load/Store Local/Global, Adressen)
-   - Typ-Konversionen (Cast, SExt, ZExt, Trunc, FToI, IToF)
-   - Funktionsaufrufe (irCall, irCallBuiltin, irVirtualCall)
-   - Kontrollfluss (irJmp, irBrTrue, irBrFalse, irLabel, irFuncExit)
-   - Struct-Ops (LoadField, StoreField, LoadFieldHeap, StoreFieldHeap)
-   - Array-Ops (StackAlloc, StoreElem, LoadElem)
-   - Dyn-Array-Ops (Push, Pop, Len, Free)
-   - Exception-Ops (PushHandler, PopHandler, Throw)
-   - SIMD-Ops (SIMDAdd..SIMDStoreElem)
-   - Map/Set-Ops (MapNew..MapFree, SetNew..SetFree)
-   - Spezielle (irPanic, irInspect, irIsType, irAlloc, irFree)
-2. **`TIRInstr`-Struktur** (analog FPC): op, dest, src1, src2, src3, immInt, immFloat,
-   immStr, labelName, argTemps, castFrom/ToType, callMode, isVirtualCall, vmtIndex,
-   selfSlot, structSize, fieldSize, sourceLine, sourceFile
-3. **`TIRFunction`-Struktur:** name, instructions[], localCount, paramCount,
-   returnStructSize, capturedVars, needsStaticLink
-4. **`TIRModule`-Struktur:** functions[], strings[], globalVars[], classDecls[]
-5. **Allokator:** mmap-basiertes Instruction-Array mit Grow-Mechanismus
-6. **`ir_dump`-Funktion:** Debugging-Ausgabe der IR in Textform
+**Implementiert in `bootstrap/ir.lyx`:**
+- ✅ **TIROpKind Enum:** 154 IR-Opcodes aus `compiler/ir/ir.pas`
+- ✅ **TIRInstr-Struktur** (80 Bytes)
+- ✅ **TIRFunction-Struktur** (80 Bytes)
+- ✅ **TIRModule-Struktur** (64 Bytes)
+- ✅ **Allokator:** mmap-basierte Buffer mit Grow-Mechanismus
+- ✅ **IRModule-Klasse:** String-Tabellenverwaltung, Helper-Funktionen, ir_dump()
 
 **Referenz:** `compiler/ir/ir.pas` (TIROpKind, TIRInstr, TIRFunction, TIRModule)
 
-**Schätzung:** 2 Sessions | **Output:** `bootstrap/ir.lyx`
+**Schätzung:** 2 Sessions | **Output:** `bootstrap/ir.lyx` (1.127 LOC)
 
 ---
 
