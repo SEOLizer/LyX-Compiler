@@ -39,6 +39,7 @@ con CGN_SWITCH:      int64 := 27;
 con CGN_CASE:        int64 := 28;
 con CGN_BREAK:       int64 := 29;
 con CGN_DISPOSE:     int64 := 30;
+con CGN_CONTINUE:    int64 := 35;
 
 // WP-12: Exception handling nodes
 con CGN_TRY:       int64 := 31;
@@ -204,6 +205,9 @@ pub type Codegen = class {
   // curBreakHead holds the code offset of the most recent break's 4-byte placeholder,
   // or -1 if no break is pending. Each placeholder stores the previous head as the link.
   curBreakHead: int64;
+
+  // Continue support: linked list of pending jmp-rel32 placeholders for continue
+  curContHead: int64;
 
   // VMT address patch table (WP-10a): {codeOff:8, classNamePtr:8, classNameLen:8}
   // Each entry says: at code offset codeOff there is a mov-rcx-imm64 placeholder
@@ -2308,6 +2312,13 @@ pub type Codegen = class {
       self.cg_e32(self.curBreakHead);  // link to previous
       self.curBreakHead := bp;
 
+    } else if (k == CGN_CONTINUE) {
+      // jmp rel32 to loop continue; placeholder stores previous continue-list head
+      self.cg_e8(0xE9);
+      var cp: int64 := self.codeLen;
+      self.cg_e32(self.curContHead);  // link to previous
+      self.curContHead := cp;
+
     } else if (k == CGN_CASE) {
       // Switch case body — generate body expression/block
       // c0 = case value (or null for default), c1 = body
@@ -2563,11 +2574,25 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x84);  // jz exit (forward)
     var jzPos: int64 := self.codeLen;
     self.cg_e32(0);
-    // Save and reset break list for this loop
+    // Save and reset break/continue lists for this loop
     var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead: int64 := self.curContHead;
     self.curBreakHead := -1;
+    self.curContHead := -1;
     // Body
     self.cg_genBlock(self.cg_nc1(ni));
+    // loop_cont: patch all continue jumps to here
+    var ch: int64 := self.curContHead;
+    while (ch != -1) {
+      var b0: int64 := peek8(self.code + ch) as int64;
+      var b1: int64 := peek8(self.code + ch + 1) as int64;
+      var b2: int64 := peek8(self.code + ch + 2) as int64;
+      var b3: int64 := peek8(self.code + ch + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + ch, loopTop - ch - 4);
+      ch := nextLink;
+    }
     // jmp back to loopTop
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
@@ -2588,8 +2613,9 @@ pub type Codegen = class {
       poke32(self.code + bh, self.codeLen - bh - 4);
       bh := nextLink;
     }
-    // Restore outer loop's break list
+    // Restore outer loop's break/continue lists
     self.curBreakHead := savedBreakHead;
+    self.curContHead := savedContHead;
   }
 
   fn cg_genFor(ni: int64) {
@@ -3427,6 +3453,7 @@ pub type Codegen = class {
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
+    self.curContHead := -1;
 
     // VMT address patch table (WP-10a)
     self.vmtPatchCap   := 32;
