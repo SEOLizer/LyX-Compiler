@@ -8,7 +8,7 @@ uses
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
   asm_listing, map_file,
   x86_64_emit, elf64_writer,
-  x86_64_win64, pe64_writer,
+  x86_64_win64{$IFDEF LINUX}, pe64_writer{$ENDIF},
   arm64_emit, elf64_arm64_writer,
   macosx64_emit, macho64_writer,
   xtensa_emit, elf32_writer,

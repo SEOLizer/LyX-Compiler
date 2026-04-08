@@ -87,6 +87,7 @@ initialization
   AddBuiltin('IO', 'rmdir', 'rmdir', atInt64, [atPChar]);
   AddBuiltin('IO', 'chmod', 'chmod', atInt64, [atPChar, atInt64]);
   AddBuiltin('IO', 'ioctl', 'ioctl', atInt64, [atInt64, atInt64, atInt64]);
+  // mmap: erlaubt 1-6 Argumente (wird in lower_ast_to_ir auf 6 erweitert)
   AddBuiltin('IO', 'mmap', 'mmap', atInt64, [atInt64, atInt64, atInt64, atInt64, atInt64, atInt64]);
   AddBuiltin('IO', 'munmap', 'munmap', atInt64, [atInt64, atInt64]);
 
