@@ -2,6 +2,8 @@
 // WP-19: AST→IR Lowering (Basis)
 // WP-20: AST→IR Lowering (OOP, Structs, Klassen, Generics)
 // ==================================================================
+
+import bootstrap.ir;
 // Vollständige IR-Lowering-Implementierung:
 // - AST-Node-Kind-Konstanten
 // - Expression Lowering mit IR-Emission
@@ -115,7 +117,7 @@ pub con NK_SIMD_BINOP:      int64 := 125;
 
 pub type IRLower = class {
   // IR Module reference (for emitting instructions)
-  ir: int64;
+  ir: IRModule;
   
   // AST data
   nodes: int64;
@@ -153,7 +155,7 @@ pub type IRLower = class {
   // Initialization
   // ------------------------------------------------------------------
   
-  fn init(irMod: int64, astNodes: int64, astNodeCount: int64, astSrc: pchar) {
+  fn init(irMod: IRModule, astNodes: int64, astNodeCount: int64, astSrc: pchar) {
     self.ir := irMod;
     self.nodes := astNodes;
     self.nodeCount := astNodeCount;
@@ -192,12 +194,22 @@ pub type IRLower = class {
   // IR Module Helpers (call through function pointers)
   // ------------------------------------------------------------------
   
-  // Get IR module method - addInstruction
+  // Emit one IR instruction into the module's instruction buffer
   fn irAddInstr(op: int64, dest: int64, src1: int64, src2: int64, src3: int64, imm: int64): int64 {
-    // This calls the IRModule's addInstruction method
-    // The IR module is at self.ir, we need to call its method
-    // For now, we track temps locally - full integration later
-    return dest;
+    return self.ir.addInstruction(op, dest, src1, src2, src3, imm);
+  }
+
+  // Control-flow emit helpers
+  fn irEmitLabel(labelId: int64) {
+    self.irAddInstr(IRO_LABEL, -1, -1, -1, -1, labelId);
+  }
+
+  fn irEmitJmp(labelId: int64) {
+    self.irAddInstr(IRO_JMP, -1, -1, -1, -1, labelId);
+  }
+
+  fn irEmitBrFalse(cond: int64, labelId: int64) {
+    self.irAddInstr(IRO_BR_FALSE, -1, cond, -1, -1, labelId);
   }
   
   // ------------------------------------------------------------------
@@ -536,28 +548,31 @@ pub type IRLower = class {
   fn lowerIf(stmt: int64) {
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
-    
+
     var elseLbl: int64 := self.genLabel();
     var endLbl: int64 := self.genLabel();
-    
-    // Emit conditional branch
+
     // if not condTemp goto elseLbl
-    
+    self.irEmitBrFalse(condTemp, elseLbl);
+
     // Then block
-    if (self.nodeC1(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC1(stmt)); 
+    if (self.nodeC1(stmt) >= 0) {
+      self.lowerBlock(self.nodeC1(stmt));
     }
-    
-    // Emit jump to end
-    // goto endLbl
-    
+
+    // goto endLbl (skip else)
+    self.irEmitJmp(endLbl);
+
+    // elseLbl:
+    self.irEmitLabel(elseLbl);
+
     // Else block
-    if (self.nodeC2(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC2(stmt)); 
+    if (self.nodeC2(stmt) >= 0) {
+      self.lowerBlock(self.nodeC2(stmt));
     }
-    
-    // End label
+
     // endLbl:
+    self.irEmitLabel(endLbl);
   }
   
   // ------------------------------------------------------------------
@@ -567,34 +582,35 @@ pub type IRLower = class {
   fn lowerWhile(stmt: int64) {
     var loopLbl: int64 := self.genLabel();
     var exitLbl: int64 := self.genLabel();
-    
+
     // Save outer loop labels
     var savedExit: int64 := self.loopExitLabel;
     var savedCont: int64 := self.loopContLabel;
-    
+
     self.loopExitLabel := exitLbl;
     self.loopContLabel := loopLbl;
-    
-    // Loop header label
+
     // loopLbl:
-    
+    self.irEmitLabel(loopLbl);
+
     // Condition
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
-    
-    // Emit branch: if not condTemp goto exitLbl
-    
+
+    // if not condTemp goto exitLbl
+    self.irEmitBrFalse(condTemp, exitLbl);
+
     // Loop body
-    if (self.nodeC1(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC1(stmt)); 
+    if (self.nodeC1(stmt) >= 0) {
+      self.lowerBlock(self.nodeC1(stmt));
     }
-    
-    // Emit jump back to loop header
-    // goto loopLbl:
-    
-    // Exit label
+
+    // goto loopLbl
+    self.irEmitJmp(loopLbl);
+
     // exitLbl:
-    
+    self.irEmitLabel(exitLbl);
+
     // Restore outer loop labels
     self.loopExitLabel := savedExit;
     self.loopContLabel := savedCont;
@@ -610,44 +626,48 @@ pub type IRLower = class {
     // C1: condition
     // C2: step
     // C3: body
-    
+
     var loopLbl: int64 := self.genLabel();
+    var contLbl: int64 := self.genLabel();  // continue target: before step
     var exitLbl: int64 := self.genLabel();
-    
+
     var savedExit: int64 := self.loopExitLabel;
     var savedCont: int64 := self.loopContLabel;
-    
+
     self.loopExitLabel := exitLbl;
-    self.loopContLabel := loopLbl;
-    
+    self.loopContLabel := contLbl;
+
     // Init (C0)
     var init: int64 := self.nodeC0(stmt);
     if (init >= 0) { self.lowerStmt(init); }
-    
-    // Loop header
+
     // loopLbl:
-    
+    self.irEmitLabel(loopLbl);
+
     // Condition (C1)
     var cond: int64 := self.nodeC1(stmt);
     if (cond >= 0) {
       var condTemp: int64 := self.lowerExpr(cond);
-      // Emit: if not condTemp goto exitLbl
+      self.irEmitBrFalse(condTemp, exitLbl);
     }
-    
+
     // Body (C3)
     var body: int64 := self.nodeC3(stmt);
     if (body >= 0) { self.lowerBlock(body); }
-    
+
+    // contLbl: (continue lands here, then executes step)
+    self.irEmitLabel(contLbl);
+
     // Step (C2)
     var step: int64 := self.nodeC2(stmt);
     if (step >= 0) { self.lowerStmt(step); }
-    
-    // Jump back
+
     // goto loopLbl
-    
-    // Exit label
+    self.irEmitJmp(loopLbl);
+
     // exitLbl:
-    
+    self.irEmitLabel(exitLbl);
+
     self.loopExitLabel := savedExit;
     self.loopContLabel := savedCont;
   }
@@ -698,7 +718,7 @@ pub type IRLower = class {
   
   fn lowerBreak(stmt: int64) {
     if (self.loopExitLabel >= 0) {
-      // Emit: goto loopExitLabel
+      self.irEmitJmp(self.loopExitLabel);
     }
   }
   
@@ -708,7 +728,7 @@ pub type IRLower = class {
   
   fn lowerContinue(stmt: int64) {
     if (self.loopContLabel >= 0) {
-      // Emit: goto loopContLabel
+      self.irEmitJmp(self.loopContLabel);
     }
   }
   
