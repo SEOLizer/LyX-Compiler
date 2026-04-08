@@ -691,7 +691,8 @@ var
   isPackedStruct: Boolean;   // aerospace-todo P2 #50
 begin
   Expect(tkType);
-  if Check(tkIdent) then
+  // Allow keywords as type names (e.g. 'Map', 'Set' used as class names in bootstrap sources)
+  if FCurTok.Kind <> tkEOF then
   begin
     name := FCurTok.Value;
     Advance;
@@ -734,7 +735,8 @@ begin
       if Check(tkFn) then
       begin
         Advance; // fn
-        if Check(tkIdent) then
+        // Method name: allow any non-EOF token (keywords used as method names in bootstrap)
+        if FCurTok.Kind <> tkEOF then
         begin
           mName := FCurTok.Value;
           Advance;
@@ -838,8 +840,8 @@ begin
           FDiag.Error('expected ''fn'' keyword after modifiers', FCurTok.Span);
         end;
         Expect(tkFn);
-        // Method name can be: identifier, 'new' (constructor), or 'dispose' (destructor)
-        if Check(tkIdent) or Check(tkNew) or Check(tkDispose) then
+        // Method name: allow any non-EOF token (keywords used as method names in bootstrap)
+        if FCurTok.Kind <> tkEOF then
         begin
           mName := FCurTok.Value;
           Advance;
@@ -879,7 +881,8 @@ begin
         m.IsAbstract := isAbstract;
         m.Visibility := curVisibility;
         // Constructor/Destructor detection
-        if (mName = 'new') or (mName = 'Create') then
+        // Only if no explicit return type (bootstrap uses Create(): int64 as factory fn)
+        if ((mName = 'new') or (mName = 'Create')) and (mRetType = atVoid) then
           m.IsConstructor := True
         else if (mName = 'dispose') or (mName = 'Destroy') then
           m.IsDestructor := True;
@@ -905,7 +908,7 @@ begin
       end;
     end;
     Expect(tkRBrace);
-    Expect(tkSemicolon);
+    Accept(tkSemicolon); // optional: bootstrap sources omit trailing ';' after class }
     Result := TAstClassDecl.Create(name, baseClassName, fields, methods, isPub, FCurTok.Span);
     // Set implemented interfaces
     TAstClassDecl(Result).ImplementedInterfaces := implInterfaces;
@@ -981,7 +984,7 @@ begin
       end;
     end;
     Expect(tkRBrace);
-    Expect(tkSemicolon);
+    Accept(tkSemicolon); // optional: bootstrap sources omit trailing ';' after struct }
     Result := TAstStructDecl.Create(name, fields, methods, isPub, FCurTok.Span);
     TAstStructDecl(Result).Endian := structEndian; // aerospace-todo P2 #52
     TAstStructDecl(Result).IsFlat := isFlatStruct;  // aerospace-todo P2 #57
@@ -1207,8 +1210,9 @@ var
   limitExpr: TAstExpr;
   i: Integer;
 begin
-  if Check(tkVar) or Check(tkLet) or Check(tkCo) then
+  if Check(tkVar) or Check(tkLet) or Check(tkCo) or Check(tkCon) then
     Exit(ParseVarLetCoDecl);
+
 
   // Nested function declaration
   if Check(tkFn) then
@@ -1216,11 +1220,11 @@ begin
 
   if Check(tkIf) then
   begin
-    // if (Expr) Stmt [else Stmt]
+    // if (Expr) Stmt [else Stmt]  OR  if Expr { ... } [else { ... }]
     Advance; // if
-    Expect(tkLParen);
+    FNoStructLit := True;
     cond := ParseExpr;
-    Expect(tkRParen);
+    FNoStructLit := False;
     thenStmt := Self.ParseStmt;
     elseStmt := nil;
     if Accept(tkElse) then
@@ -1231,9 +1235,9 @@ begin
   if Check(tkWhile) then
   begin
     Advance;
-    Expect(tkLParen);
+    FNoStructLit := True;
     cond := ParseExpr;
-    Expect(tkRParen);
+    FNoStructLit := False;
     // Check for optional limit clause: limit(max_iterations)
     limitExpr := nil;
     if Accept(tkLimit) then
@@ -1306,7 +1310,8 @@ begin
   end;
 
   // match expr { case val => stmt ... default => stmt }
-  if Check(tkMatch) then
+  // But 'match' used as identifier in bootstrap sources (e.g. match := 0)
+  if Check(tkMatch) and (FLexer.PeekToken.Kind <> tkAssign) then
     Exit(ParseMatchStmt);
 
   if Check(tkFor) then
@@ -1339,6 +1344,14 @@ begin
     Advance;
     Expect(tkSemicolon);
     Exit(TAstBreak.Create(FCurTok.Span));
+  end;
+
+  // continue; - jump to next loop iteration
+  if Check(tkContinue) then
+  begin
+    Advance;
+    Expect(tkSemicolon);
+    Exit(TAstContinue.Create(FCurTok.Span));
   end;
 
   // dispose expr; - free heap-allocated class instance
@@ -1526,9 +1539,11 @@ begin
   if Accept(tkVar) then storage := skVar
   else if Accept(tkLet) then storage := skLet
   else if Accept(tkCo) then storage := skCo
+  else if Accept(tkCon) then storage := skVar  // local const treated as var
   else storage := skVar; // unreachable
 
-  if Check(tkIdent) then
+  // Allow any token as var name (keywords used as soft identifiers in bootstrap sources)
+  if FCurTok.Kind <> tkEOF then
   begin
     name := FCurTok.Value; Advance;
   end
@@ -2043,9 +2058,12 @@ var
 begin
   Result := ParseUnaryExpr;
   if Result = nil then Exit(nil);
-  while Check(tkStar) or Check(tkSlash) or Check(tkPercent) do
+  while Check(tkStar) or Check(tkSlash) or Check(tkPercent)
+        or (Check(tkIdent) and (FCurTok.Value = 'mod')) do
   begin
-    op := FCurTok.Kind; Advance;
+    if Check(tkIdent) and (FCurTok.Value = 'mod') then op := tkPercent
+    else op := FCurTok.Kind;
+    Advance;
     rhs := ParseUnaryExpr;
     if rhs = nil then Exit(nil);
     Result := TAstBinOp.Create(op, Result, rhs, Result.Span);
@@ -2163,6 +2181,9 @@ begin
     s := FCurTok.Value;
     span := FCurTok.Span;
     Advance;
+    // Optional 'c' suffix marks C-style pchar string literal (consume silently)
+    if Check(tkIdent) and (FCurTok.Value = 'c') then
+      Advance;
     Exit(ParsePostfix(TAstStrLit.Create(s, span)));
   end;
 
@@ -2202,6 +2223,11 @@ begin
   end;
 
   if Check(tkIdent) then
+    Exit(ParseCallOrIdent);
+
+  // Allow keyword tokens as identifiers in expression context (bootstrap soft keywords)
+  // match/Map/Set used as type/variable names
+  if Check(tkMatch) or Check(tkMap) or Check(tkSet) then
     Exit(ParseCallOrIdent);
 
   // new ClassName() - heap allocation for classes
@@ -2494,6 +2520,7 @@ var
   callExpr: TAstCall;
   peeked: TToken;
   i: Integer;
+  newExpr: TAstNewExpr;
 begin
   name := FCurTok.Value;
   span := FCurTok.Span;
@@ -2535,11 +2562,15 @@ begin
         end;
         Expect(tkRParen);
       end;
-      // Create as new expression
+      // Bootstrap compat: ClassName.Create(args) uses the constructor name 'Create'.
+      // The Create method handles its own allocation internally (bootstrap pattern),
+      // so the lowerer must use the return value of the constructor call as the result.
       if Length(args) > 0 then
-        Result := ParsePostfix(TAstNewExpr.CreateWithArgs(savedName, args, savedSpan))
+        newExpr := TAstNewExpr.CreateWithArgs(savedName, args, savedSpan)
       else
-        Result := ParsePostfix(TAstNewExpr.Create(savedName, savedSpan));
+        newExpr := TAstNewExpr.Create(savedName, savedSpan);
+      newExpr.ConstructorName := 'Create';
+      Result := ParsePostfix(newExpr);
       Exit;
     end
     else if Check(tkLParen) or (Check(tkLBrace) and not FNoStructLit) then
@@ -2679,9 +2710,9 @@ begin
   Result := base;
   while True do
   begin
-    if Accept(tkDot) then
+    if Accept(tkDot) or Accept(tkArrow) then  // -> is alias for . (pointer field access)
     begin
-      if Check(tkIdent) then
+      if FCurTok.Kind <> tkEOF then
       begin
         fieldName := FCurTok.Value;
         Advance;
@@ -2712,11 +2743,6 @@ begin
         end
         else
           Result := TAstFieldAccess.Create(Result, fieldName, Result.Span);
-      end
-      else
-      begin
-        FDiag.Error('expected field name after .', FCurTok.Span);
-        Exit;
       end;
     end
     else if Accept(tkLBracket) then
@@ -2727,10 +2753,9 @@ begin
     end
     else if Accept(tkAs) then
     begin
-      // Type cast: expr as Type
-      if Check(tkIdent) then
+      // Type cast: expr as Type (allow any non-EOF token as type name for bootstrap compat)
+      if FCurTok.Kind <> tkEOF then
       begin
-        // Parse type name
         s := FCurTok.Value;
         Advance;
         Result := TAstCast.Create(Result, atUnresolved, Result.Span);
