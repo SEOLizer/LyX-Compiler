@@ -197,6 +197,7 @@ type
     destructor Destroy; override;
     function AddFunction(const name: string): TIRFunction;
     function FindFunction(const name: string): TIRFunction;
+    procedure RemoveFunction(const name: string);
     function InternString(const s: string): Integer;
     function AddGlobalVar(const name: string; initVal: Int64; hasInit: Boolean): Integer;
     function AddGlobalStringPtr(const name: string; strIdx: Integer): Integer;
@@ -283,6 +284,21 @@ begin
   SetLength(Functions, Length(Functions) + 1);
   Functions[High(Functions)] := TIRFunction.Create(name);
   Result := Functions[High(Functions)];
+end;
+
+procedure TIRModule.RemoveFunction(const name: string);
+var
+  i, j: Integer;
+begin
+  for i := 0 to High(Functions) do
+    if Functions[i].Name = name then
+    begin
+      Functions[i].Free;
+      for j := i to High(Functions) - 1 do
+        Functions[j] := Functions[j+1];
+      SetLength(Functions, Length(Functions) - 1);
+      Exit;
+    end;
 end;
 
 function TIRModule.FindFunction(const name: string): TIRFunction;

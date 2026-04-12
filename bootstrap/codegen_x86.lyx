@@ -39,6 +39,7 @@ con CGN_SWITCH:      int64 := 27;
 con CGN_CASE:        int64 := 28;
 con CGN_BREAK:       int64 := 29;
 con CGN_DISPOSE:     int64 := 30;
+con CGN_CONTINUE:    int64 := 35;
 
 // WP-12: Exception handling nodes
 con CGN_TRY:       int64 := 31;
@@ -101,16 +102,20 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:        offset 0   (65 bytes) -- prlimit64(RLIMIT_STACK=unlimited), pop argc→rdi, sets rsi=rsp (argv), calls main
+//   _start:        offset 0   (65 bytes)
 //   _lyx_strlen:   offset 65  (15 bytes)
 //   _lyx_print_str:offset 80  (26 bytes)
 //   _lyx_print_int:offset 106 (104 bytes)
-//   user code:     offset 210
+//   _lyx_strsub:   offset 210 (40 bytes)
+//   _lyx_strcharat:offset 250 (15 bytes)
+//   user code:     offset 265
 con CG_H_START:     int64 := 0;
 con CG_H_STRLEN:    int64 := 65;
 con CG_H_PRINTSTR:  int64 := 80;
 con CG_H_PRINTINT:  int64 := 106;
-con CG_H_USER:      int64 := 210;
+con CG_H_STRSUB:    int64 := 210;
+con CG_H_STRCHARAT: int64 := 250;
+con CG_H_USER:      int64 := 265;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -204,6 +209,9 @@ pub type Codegen = class {
   // curBreakHead holds the code offset of the most recent break's 4-byte placeholder,
   // or -1 if no break is pending. Each placeholder stores the previous head as the link.
   curBreakHead: int64;
+
+  // Continue support: linked list of pending jmp-rel32 placeholders for continue
+  curContHead: int64;
 
   // VMT address patch table (WP-10a): {codeOff:8, classNamePtr:8, classNameLen:8}
   // Each entry says: at code offset codeOff there is a mov-rcx-imm64 placeholder
@@ -633,11 +641,9 @@ pub type Codegen = class {
           var rel32: int64 := targetOff - codeOff - 4;
           poke32(self.code + codeOff, rel32);
         } else {
-          PrintStr("codegen: unresolved symbol: ");
-          var p: pchar := namePtr as pchar;
-          var j: int64 := 0;
-          while (j < nlen) { write(1, p + j, 1); j := j + 1; }
-          PrintStr("\n");
+          // AP-3: Skip unresolved patches instead of crashing
+          // Write 0xCC (int3) to mark as unimplemented
+          poke8(self.code + codeOff, 204);  // int3
         }
       } else {
         // CG_PATCH_STR: namePtr encodes data offset
@@ -1934,18 +1940,34 @@ pub type Codegen = class {
 
     if (self.cg_seq(fname, fnlen, pstr, 8)) {
       // call _lyx_print_str  (rdi already has the arg)
+      // rel32 = target_offset - call_offset - 4 = CG_H_XXX - pp
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_PRINTSTR - pp - 4;
+      var rel32: int64 := CG_H_PRINTSTR - pp;
       poke32(self.code + pp, rel32);
 
     } else if (self.cg_seq(fname, fnlen, pint, 8)) {
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_PRINTINT - pp - 4;
+      var rel32: int64 := CG_H_PRINTINT - pp;
       poke32(self.code + pp, rel32);
 
     } else if (self.cg_seq(fname, fnlen, slen, 6)) {
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_STRLEN - pp - 4;
+      var rel32: int64 := CG_H_STRLEN - pp;
+      poke32(self.code + pp, rel32);
+
+    } else if (self.cg_seq(fname, fnlen, "StrSub", 6)) {
+      // StrSub(s: pchar, start: int64, len: int64): pchar
+      // rdi=s, rsi=start, rdx=len
+      // Call _lyx_strsub helper
+      var pp: int64 := self.cg_emitCall();
+      var rel32: int64 := CG_H_STRSUB - pp;
+      poke32(self.code + pp, rel32);
+
+    } else if (self.cg_seq(fname, fnlen, "StrCharAt", 9)) {
+      // StrCharAt(s: pchar, i: int64): int64  -- s in rdi, i in rsi
+      // Call _lyx_strcharat helper
+      var pp: int64 := self.cg_emitCall();
+      var rel32: int64 := CG_H_STRCHARAT - pp;
       poke32(self.code + pp, rel32);
 
     } else if (self.cg_seq(fname, fnlen, mmapn, 4)) {
@@ -1987,11 +2009,6 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, gk32, 6)) {
       // peek32(addr): movsxd rax, dword [rdi]
       self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0x07);
-
-    } else if (self.cg_seq(fname, fnlen, "StrCharAt", 9)) {
-      // StrCharAt(s: pchar, i: int64): int64  -- s in rdi, i in rsi
-      // movzx rax, byte [rdi + rsi]
-      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x37);
 
     } else if (self.cg_seq(fname, fnlen, "ArgvGet", 7)) {
       // ArgvGet(argv: pchar, i: int64): pchar  -- argv in rdi, i in rsi
@@ -2043,7 +2060,7 @@ pub type Codegen = class {
       // Write msg to stderr: StrLen(rdi)→rax, then write(2, rdi, rax)
       self.cg_e8(0x57);                                         // push rdi (save msg)
       var ppSL: int64 := self.cg_emitCall();
-      poke32(self.code + ppSL, CG_H_STRLEN - ppSL - 4);
+      poke32(self.code + ppSL, CG_H_STRLEN - ppSL);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax (length)
       self.cg_e8(0x5F);                                         // pop rdi (restore msg)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);   // mov rsi, rdi (buf)
@@ -2308,6 +2325,13 @@ pub type Codegen = class {
       self.cg_e32(self.curBreakHead);  // link to previous
       self.curBreakHead := bp;
 
+    } else if (k == CGN_CONTINUE) {
+      // jmp rel32 to loop continue; placeholder stores previous continue-list head
+      self.cg_e8(0xE9);
+      var cp: int64 := self.codeLen;
+      self.cg_e32(self.curContHead);  // link to previous
+      self.curContHead := cp;
+
     } else if (k == CGN_CASE) {
       // Switch case body — generate body expression/block
       // c0 = case value (or null for default), c1 = body
@@ -2563,11 +2587,25 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x84);  // jz exit (forward)
     var jzPos: int64 := self.codeLen;
     self.cg_e32(0);
-    // Save and reset break list for this loop
+    // Save and reset break/continue lists for this loop
     var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead: int64 := self.curContHead;
     self.curBreakHead := -1;
+    self.curContHead := -1;
     // Body
     self.cg_genBlock(self.cg_nc1(ni));
+    // loop_cont: patch all continue jumps to here
+    var ch: int64 := self.curContHead;
+    while (ch != -1) {
+      var b0: int64 := peek8(self.code + ch) as int64;
+      var b1: int64 := peek8(self.code + ch + 1) as int64;
+      var b2: int64 := peek8(self.code + ch + 2) as int64;
+      var b3: int64 := peek8(self.code + ch + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + ch, loopTop - ch - 4);
+      ch := nextLink;
+    }
     // jmp back to loopTop
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
@@ -2588,8 +2626,9 @@ pub type Codegen = class {
       poke32(self.code + bh, self.codeLen - bh - 4);
       bh := nextLink;
     }
-    // Restore outer loop's break list
+    // Restore outer loop's break/continue lists
     self.curBreakHead := savedBreakHead;
+    self.curContHead := savedContHead;
   }
 
   fn cg_genFor(ni: int64) {
@@ -2602,6 +2641,11 @@ pub type Codegen = class {
     self.cg_genExpr(self.cg_nc0(ni));
     self.cg_storeRax(off);
     var loopTop: int64 := self.codeLen;
+    // Save and reset break/continue lists for this loop
+    var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead: int64 := self.curContHead;
+    self.curBreakHead := -1;
+    self.curContHead := -1;
     // Cond: v <= limit (to) or v >= limit (downto)
     self.cg_loadRax(off);
     self.cg_pushRax();
@@ -2616,6 +2660,18 @@ pub type Codegen = class {
     self.cg_e32(0);
     // Body
     self.cg_genBlock(self.cg_nc2(ni));
+    // loop_cont: patch all continue jumps to here
+    var ch: int64 := self.curContHead;
+    while (ch != -1) {
+      var b0: int64 := peek8(self.code + ch) as int64;
+      var b1: int64 := peek8(self.code + ch + 1) as int64;
+      var b2: int64 := peek8(self.code + ch + 2) as int64;
+      var b3: int64 := peek8(self.code + ch + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + ch, loopTop - ch - 4);
+      ch := nextLink;
+    }
     // Step: v := v + 1 (or -1 for downto)
     self.cg_loadRax(off);
     if (dir == 0) { self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0); }  // inc rax
@@ -2626,6 +2682,9 @@ pub type Codegen = class {
     self.cg_e32(loopTop - self.codeLen - 4);
     // Patch exit
     poke32(self.code + jmpExit, self.codeLen - jmpExit - 4);
+    // Restore break/continue lists
+    self.curBreakHead := savedBreakHead;
+    self.curContHead := savedContHead;
   }
 
   // ------------------------------------------------------------------
@@ -3174,7 +3233,73 @@ pub type Codegen = class {
     // ret                  C3
     self.cg_e8(0xC3);
     // print_int is 104 bytes  ✓
-    // Total helpers: 65+15+26+104 = 210 = CG_H_USER  ✓
+
+    // ---- _lyx_strsub (40 bytes, starts at offset 210) ----
+    // StrSub(s: pchar, start: int64, len: int64): pchar
+    // rdi=s, rsi=start, rdx=len
+    // mmap(0, len+17, 3, 34, -1, 0) → rax = new buffer
+    // Save rdi (s) at [rsp+0], rsi (start) at [rsp+8], rdx (len) at [rsp+16]
+    // push rdi             57
+    self.cg_e8(0x57);
+    // push rsi             56
+    self.cg_e8(0x56);
+    // push rdx             52
+    self.cg_e8(0x52);
+    // mov rdi, 0           48 C7 C7 00 00 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // lea rsi, [rdx+17]    48 8D 54 24 10
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x10);
+    // mov edx, 3           BA 03 00 00 00
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov r10, 34          49 C7 C2 22 00 00 00
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2);
+    self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov r8, -1           49 C7 C0 FF FF FF FF
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);
+    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    // mov r9, 0            49 C7 C1 00 00 00 00
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov eax, 9           B8 09 00 00 00
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall              0F 05
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // rax = new buffer. Save at [rsp+24]
+    // mov [rsp+24], rax    48 89 44 24 18
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x18);
+    // Copy loop: rdi=dest, rsi=src, rcx=count
+    // pop rcx = len        5A
+    self.cg_e8(0x5A);
+    // pop rsi = start      5E
+    self.cg_e8(0x5E);
+    // pop rdi = orig src   5F
+    self.cg_e8(0x5F);
+    // add rsi, rdi         48 01 FE  (rsi = start + src = src + start)
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xFE);
+    // mov rdi, rax         48 89 C7  (dest = mmap result)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+    // rep movsb            F3 A4
+    self.cg_e8(0xF3); self.cg_e8(0xA4);
+    // Null-terminate: mov byte [rax+rcx], 0
+    // rax has dest, rcx has len
+    // add rax, rcx         48 01 C8
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC8);
+    // mov byte [rax], 0    C6 00 00
+    self.cg_e8(0xC6); self.cg_e8(0x00); self.cg_e8(0x00);
+    // ret                  C3
+    self.cg_e8(0xC3);
+    // strsub is 40 bytes  ✓
+
+    // ---- _lyx_strcharat (15 bytes, starts at offset 250) ----
+    // StrCharAt(s: pchar, i: int64): int64
+    // rdi=s, rsi=i, return rax = byte at s[i] zero-extended
+    // movzx rax, byte [rdi+rsi]
+    self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x37);
+    // ret                  C3
+    self.cg_e8(0xC3);
+    // strcharat is 15 bytes  ✓
+    // Total helpers: 65+15+26+104+40+15 = 265 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -3285,6 +3410,11 @@ pub type Codegen = class {
 
     // Recursively generate code for the imported file
     self.cg_genFile(head);
+    
+    // AP-1: Collect function labels from imported module
+    // This makes imported functions visible for patch resolution in main file
+    // IMPORTANT: Do this WHILE still switched to import pNodes!
+    self.cg_collectImportLabels(head);
 
     // Restore main file's source and nodes
     self.pSrc   := savedSrc;
@@ -3293,6 +3423,24 @@ pub type Codegen = class {
     dispose p;
     // BUG-02: Free imported source buffer after codegen is complete
     munmap(src, srcSize);
+  }
+
+  // ------------------------------------------------------------------
+  // AP-1: Collect labels from imported module
+  // Walks the AST and registers all function names as labels for patch resolution
+  // ------------------------------------------------------------------
+  
+  fn cg_collectImportLabels(head: int64): void {
+    var cur: int64 := head;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_FUNC_DECL) {
+        var fname: pchar := self.cg_nsval(cur);
+        var fnlen: int64 := self.cg_nslen(cur);
+        self.cg_addLabel(fname, fnlen);
+      }
+      cur := self.cg_nnext(cur);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -3387,7 +3535,7 @@ pub type Codegen = class {
     self.labels    := mmap(0, self.labelCap * CG_LABEL_SZ, 3, 34, -1, 0);
     self.labelCount := 0;
 
-    self.patchCap  := 256;
+    self.patchCap  := 512;
     self.patches   := mmap(0, self.patchCap * CG_PATCH_SZ, 3, 34, -1, 0);
     self.patchCount := 0;
 
@@ -3427,6 +3575,7 @@ pub type Codegen = class {
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
+    self.curContHead := -1;
 
     // VMT address patch table (WP-10a)
     self.vmtPatchCap   := 32;

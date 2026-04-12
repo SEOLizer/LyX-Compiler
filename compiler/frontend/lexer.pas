@@ -14,7 +14,7 @@ type
     // Keywords
     tkFn, tkVar, tkLet, tkCo, tkCon,
     tkIf, tkElse, tkWhile, tkReturn,
-    tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkDefault, tkMatch,
+    tkTrue, tkFalse, tkNull, tkExtern, tkCase, tkSwitch, tkBreak, tkContinue, tkDefault, tkMatch,
     tkUnit, tkImport, tkPublic, tkAs, tkType, tkEnum, tkStruct, tkArray, tkStatic,
     tkFor, tkTo, tkDownto, tkDo, tkRepeat, tkUntil, tkPool, tkLimit,
     tkTry, tkCatch, tkThrow, tkFinally,
@@ -63,6 +63,8 @@ type
     tkPipe,
     // Fat Arrow (=>)
     tkFatArrow,
+    // Arrow (->)
+    tkArrow,
     // Sonstiges
     tkEOF, tkError
   );
@@ -141,6 +143,7 @@ begin
     tkCase:      Result := 'case';
     tkSwitch:    Result := 'switch';
     tkBreak:     Result := 'break';
+    tkContinue:  Result := 'continue';
     tkDefault:   Result := 'default';
     tkMatch:     Result := 'match';
     tkUnit:      Result := 'unit';
@@ -233,6 +236,7 @@ begin
     tkShiftRight:Result := '>>';
     tkPipe:      Result := '|>';
     tkFatArrow:  Result := '=>';
+    tkArrow:     Result := '->';
     tkEOF:       Result := 'EOF';
     tkError:     Result := 'ERROR';
   end;
@@ -482,6 +486,33 @@ begin
       Continue;
     end;
     Advance;
+  end;
+
+  // Check for base#digits notation (e.g. 16#1009ED = 0x1009ED)
+  if (not IsAtEnd) and (CurrentChar = '#') then
+  begin
+    // Parse the base from what we read so far
+    s := Copy(FSource, startPos, FPos - startPos);
+    s := StringReplace(s, '_', '', [rfReplaceAll]);
+    numValue := StrToInt64Def(s, 16); // default to hex if invalid
+    Advance; // consume '#'
+    // Parse hex digits after #
+    numValue := 0;
+    while not IsAtEnd do
+    begin
+      if CurrentChar in ['0'..'9'] then
+        numValue := numValue * 16 + (Ord(CurrentChar) - Ord('0'))
+      else if CurrentChar in ['A'..'F'] then
+        numValue := numValue * 16 + (Ord(CurrentChar) - Ord('A') + 10)
+      else if CurrentChar in ['a'..'f'] then
+        numValue := numValue * 16 + (Ord(CurrentChar) - Ord('a') + 10)
+      else if CurrentChar = '_' then
+        begin Advance; Continue; end
+      else Break;
+      Advance;
+    end;
+    currentLen := FPos - startPos;
+    Exit(MakeToken(tkIntLit, IntToStr(numValue), FLine, startCol, currentLen));
   end;
 
   // Check for decimal point for Float-Literale
@@ -740,7 +771,15 @@ begin
     'extern':  Result := tkExtern;
     'case':    Result := tkCase;
     'switch':  Result := tkSwitch;
-    'break':   Result := tkBreak;
+    'not':      Result := tkNot;
+    'and':      Result := tkAnd;  // alias for &&
+    'or':       Result := tkOr;   // alias for ||
+    'xor':      Result := tkBitXor;  // alias for ^
+    'shr':      Result := tkShiftRight;  // alias for >>
+    'shl':      Result := tkShiftLeft;   // alias for <<
+    'const':    Result := tkCon; // alias for con
+    'break':    Result := tkBreak;
+    'continue': Result := tkContinue;
     'default': Result := tkDefault;
     'match':   Result := tkMatch;
     'unit':    Result := tkUnit;
@@ -751,6 +790,7 @@ begin
     'type':    Result := tkType;
     'enum':    Result := tkEnum;
     'struct':  Result := tkStruct;
+    'record':  Result := tkStruct;  // alias for struct (bootstrap compat)
     'array':   Result := tkArray;
     'static':  Result := tkStatic;
     'for':     Result := tkFor;
@@ -784,7 +824,8 @@ begin
     'check':      Result := tkCheck;
     // Constraint Keywords
     'where':      Result := tkWhere;
-    'value':      Result := tkValue;
+    // 'value': not a keyword - used as identifier in bootstrap sources
+    // 'value':   Result := tkValue;
     // Map/Set/Array Keywords
     'Map':        Result := tkMap;
     'Set':        Result := tkSet;
@@ -943,6 +984,11 @@ begin
       begin
         Advance;
         Result := MakeToken(tkMinusMinus, '--', startLine, startCol, 2);
+      end
+      else if (not IsAtEnd) and (CurrentChar = '>') then
+      begin
+        Advance;
+        Result := MakeToken(tkArrow, '->', startLine, startCol, 2);
       end
       else
         Result := MakeToken(tkMinus, '-', startLine, startCol, 1);

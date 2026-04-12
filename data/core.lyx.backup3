@@ -1,0 +1,3756 @@
+// Lyx Data Library - Core Module
+// Pandas-like data analysis structures for Lyx
+//
+// This module provides:
+// - Series: 1D typed array with optional labels
+// - DataFrame: 2D table with named columns
+// - Index: Row/column label management
+// - Core operations: Select, Filter, Slice, AddColumn, DropColumn, GroupBy
+//
+// Design:
+// - Data is stored as int64 arrays (numbers) or pchar arrays (strings)
+// - Column names are pchar pointers
+// - Row indices are int64 or pchar
+// - Missing values: 0 for numbers, NULL for strings
+//
+// Usage:
+//   import data.core;
+//   var df: DataFrame := DataFrameNew();
+//   DataFrameAddColumn(df, "name", COL_STRING);
+//   DataFrameAddColumn(df, "age", COL_INT64);
+//   DataFrameAppendRow(df);
+//   DataFrameSetInt(df, "age", 0, 25);
+//   var filtered: DataFrame := DataFrameFilter(df, "age", OP_GT, 20);
+
+unit data.core;
+
+// ============================================================================
+// Type Constants
+// ============================================================================
+
+pub con COL_INT64: int64 := 1;
+pub con COL_FLOAT: int64 := 2;
+pub con COL_STRING: int64 := 3;
+pub con COL_BOOL: int64 := 4;
+
+// Comparison operators
+pub con OP_EQ: int64 := 1;   // ==
+pub con OP_NE: int64 := 2;   // !=
+pub con OP_LT: int64 := 3;   // <
+pub con OP_LE: int64 := 4;   // <=
+pub con OP_GT: int64 := 5;   // >
+pub con OP_GE: int64 := 6;   // >=
+
+// Join types
+pub con JOIN_INNER: int64 := 1;
+pub con JOIN_LEFT: int64 := 2;
+pub con JOIN_RIGHT: int64 := 3;
+pub con JOIN_OUTER: int64 := 4;
+
+// Memory alignment for SIMD (64-byte cache lines)
+pub con MEM_ALIGN: int64 := 64;
+
+// Ownership flags for memory management
+pub con MEM_OWNED: int64 := 1;   // We own the memory buffers (must munmap)
+pub con MEM_BORROWED: int64 := 0; // Memory is borrowed from elsewhere (do not munmap)
+
+// ============================================================================
+// Series - 1D typed array with optional labels
+// ============================================================================
+
+// Series structure (fat pointer to heap data)
+pub type Series = struct {
+  data: int64;          // Pointer to data array (int64*)
+  labels: int64;        // Pointer to label array (pchar*), 0 if none
+  length: int64;        // Number of elements
+  colType: int64;       // COL_INT64, COL_FLOAT, COL_STRING, COL_BOOL
+  name: int64;          // Pointer to column name (pchar)
+};
+
+// Create new int64 series
+pub fn SeriesNewInt64(name: int64, capacity: int64): Series {
+  var s: Series;
+  s.data := mmap(0, capacity * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  s.labels := 0;
+  s.length := 0;
+  s.colType := COL_INT64;
+  s.name := name;
+  return s;
+}
+
+// Create new string series
+pub fn SeriesNewString(name: int64, capacity: int64): Series {
+  var s: Series;
+  s.data := mmap(0, capacity * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  s.labels := 0;
+  s.length := 0;
+  s.colType := COL_STRING;
+  s.name := name;
+  return s;
+}
+
+// Get int value at index
+pub fn SeriesGetInt(s: Series, idx: int64): int64 {
+  if (idx < 0 || idx >= s.length) {
+    return 0;
+  }
+  return peek8(s.data + idx * 8);
+}
+
+// Set int value at index
+pub fn SeriesSetInt(s: Series, idx: int64, value: int64) {
+  if (idx >= 0 && idx < s.length) {
+    poke8(s.data + idx * 8, value);
+  }
+}
+
+// Get string value at index
+pub fn SeriesGetString(s: Series, idx: int64): int64 {
+  if (idx < 0 || idx >= s.length) {
+    return 0;
+  }
+  return peek8(s.data + idx * 8);
+}
+
+// Set string value at index
+pub fn SeriesSetString(s: Series, idx: int64, value: int64) {
+  if (idx >= 0 && idx < s.length) {
+    poke8(s.data + idx * 8, value);
+  }
+}
+
+// Get label at index
+pub fn SeriesGetLabel(s: Series, idx: int64): int64 {
+  if (s.labels == 0 || idx < 0 || idx >= s.length) {
+    return 0;
+  }
+  return peek8(s.labels + idx * 8);
+}
+
+// Set label at index
+pub fn SeriesSetLabel(s: Series, idx: int64, label: int64) {
+  if (s.labels != 0 && idx >= 0 && idx < s.length) {
+    poke8(s.labels + idx * 8, label);
+  }
+}
+
+// Append value to series (resize if needed)
+pub fn SeriesAppendInt(s: Series, value: int64) {
+  SeriesSetInt(s, s.length, value);
+  s.length := s.length + 1;
+}
+
+// Append string to series
+pub fn SeriesAppendString(s: Series, value: int64) {
+  SeriesSetString(s, s.length, value);
+  s.length := s.length + 1;
+}
+
+// ============================================================================
+// DataFrame - 2D table with named columns
+// ============================================================================
+
+// Column descriptor
+pub type Column = struct {
+  name: int64;          // Column name (pchar)
+  series: Series;       // Series data
+};
+
+// DataFrame structure
+pub type DataFrame = struct {
+  columns: int64;       // Pointer to Column array (each 16 bytes)
+  colCount: int64;      // Number of columns
+  rowCount: int64;      // Number of rows
+  colCapacity: int64;   // Column capacity
+  rowCapacity: int64;   // Row capacity
+  index: int64;         // Pointer to index labels (pchar*), 0 if none
+  indexName: int64;     // Pointer to index name (pchar)
+  hasIndex: int64;      // 1 if index is set
+};
+
+// Create new empty DataFrame
+pub fn DataFrameNew(): DataFrame {
+  var df: DataFrame;
+  df.columns := mmap(0, 16 * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  df.colCount := 0;
+  df.rowCount := 0;
+  df.colCapacity := 16;
+  df.rowCapacity := 1024;
+  df.index := 0;
+  df.indexName := 0;
+  df.hasIndex := 0;
+  return df;
+}
+
+// Get column index by name (-1 if not found)
+pub fn DataFrameColIndex(df: DataFrame, name: int64): int64 {
+  var i: int64 := 0;
+  var colName: int64;
+  
+  while (i < df.colCount) {
+    colName := peek8(df.columns + i * 16);  // Column name at offset 0
+    if (colName != 0 && name != 0) {
+      // Compare strings
+      var j: int64 := 0;
+      var match: int64 := 1;
+      while (j < 256) {
+        var c1: int64 := peek8(colName + j);
+        var c2: int64 := peek8(name + j);
+        if (c1 != c2) { match := 0; break; }
+        if (c1 == 0) { break; }
+        j := j + 1;
+      }
+      if (match == 1) {
+        return i;
+      }
+    }
+    i := i + 1;
+  }
+  
+  return -1;
+}
+
+// Get Series for column name
+pub fn DataFrameGetSeries(df: DataFrame, name: int64): Series {
+  var s: Series;
+  var colIdx: int64;
+  
+  s.data := 0;
+  s.labels := 0;
+  s.length := 0;
+  s.colType := 0;
+  s.name := 0;
+  
+  colIdx := DataFrameColIndex(df, name);
+  if (colIdx < 0) {
+    return s;
+  }
+  
+  // Series pointer at column[colIdx].series
+  return peek8(df.columns + colIdx * 16 + 8);
+}
+
+// Add column to DataFrame
+pub fn DataFrameAddColumn(df: DataFrame, name: int64, colType: int64) {
+  var s: Series;
+  
+  if (df.colCount >= df.colCapacity) {
+    return;  // Capacity exceeded
+  }
+  
+  // Create series
+  if (colType == COL_STRING) {
+    s := SeriesNewString(name, df.rowCapacity);
+  } else {
+    s := SeriesNewInt64(name, df.colCapacity);
+  }
+  
+  // Set existing rows to 0/NULL
+  s.length := df.rowCount;
+  
+  // Store column
+  poke8(df.columns + df.colCount * 16, name);     // Column name
+  poke8(df.columns + df.colCount * 16 + 8, s);     // Series
+  
+  df.colCount := df.colCount + 1;
+}
+
+// Add row to DataFrame
+pub fn DataFrameAppendRow(df: DataFrame) {
+  var i: int64 := 0;
+  var s: Series;
+  
+  while (i < df.colCount) {
+    s := peek8(df.columns + i * 16 + 8);
+    if (s.colType == COL_STRING) {
+      SeriesAppendString(s, 0);  // NULL
+    } else {
+      SeriesAppendInt(s, 0);     // 0
+    }
+    i := i + 1;
+  }
+  
+  df.rowCount := df.rowCount + 1;
+}
+
+// Get int value from DataFrame
+pub fn DataFrameGetInt(df: DataFrame, colName: int64, row: int64): int64 {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data == 0) {
+    return 0;
+  }
+  return SeriesGetInt(s, row);
+}
+
+// Set int value in DataFrame
+pub fn DataFrameSetInt(df: DataFrame, colName: int64, row: int64, value: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data != 0) {
+    SeriesSetInt(s, row, value);
+  }
+}
+
+// Get string value from DataFrame
+pub fn DataFrameGetString(df: DataFrame, colName: int64, row: int64): int64 {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data == 0) {
+    return 0;
+  }
+  return SeriesGetString(s, row);
+}
+
+// Set string value in DataFrame
+pub fn DataFrameSetString(df: DataFrame, colName: int64, row: int64, value: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data != 0) {
+    SeriesSetString(s, row, value);
+  }
+}
+
+// Get column type
+pub fn DataFrameGetColumnType(df: DataFrame, colName: int64): int64 {
+  var s: Series := DataFrameGetSeries(df, colName);
+  return s.colType;
+}
+
+// ============================================================================
+// Selection and Filtering
+// ============================================================================
+
+// Compare int value
+pub fn CompareInt(value: int64, op: int64, target: int64): int64 {
+  if (op == OP_EQ) { return value == target; }
+  if (op == OP_NE) { return value != target; }
+  if (op == OP_LT) { return value < target; }
+  if (op == OP_LE) { return value <= target; }
+  if (op == OP_GT) { return value > target; }
+  if (op == OP_GE) { return value >= target; }
+  return 0;
+}
+
+// Filter DataFrame by column value
+// Returns new DataFrame with rows where colName op value
+pub fn DataFrameFilter(df: DataFrame, colName: int64, op: int64, value: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var colIdx: int64;
+  var srcSeries: Series;
+  var val: int64;
+  
+  // Add all columns to result
+  while (j < df.colCount) {
+    var name: int64 := peek8(df.columns + j * 16);
+    var srcS: Series := peek8(df.columns + j * 16 + 8);
+    DataFrameAddColumn(result, name, srcS.colType);
+    j := j + 1;
+  }
+  
+  // Find filter column
+  colIdx := DataFrameColIndex(df, colName);
+  if (colIdx < 0) {
+  return result;
+}
+
+// ============================================================================
+// String Operations
+// ============================================================================
+
+// String length helper
+pub fn StrLen(s: int64): int64 {
+  var len: int64 := 0;
+  if (s == 0) { return 0; }
+  while (peek8(s + len) != 0) { len := len + 1; }
+  return len;
+}
+
+// String to uppercase (returns new string)
+pub fn StrToUpper(s: int64): int64 {
+  var len: int64 := StrLen(s);
+  var buf: int64 := mmap(0, len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(s + i);
+    if (c >= 97 && c <= 122) { c := c - 32; }
+    poke8(buf + i, c);
+    i := i + 1;
+  end;
+  poke8(buf + len, 0);
+  return buf;
+}
+
+// String to lowercase (returns new string)
+pub fn StrToLower(s: int64): int64 {
+  var len: int64 := StrLen(s);
+  var buf: int64 := mmap(0, len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(s + i);
+    if (c >= 65 && c <= 90) { c := c + 32; }
+    poke8(buf + i, c);
+    i := i + 1;
+  end;
+  poke8(buf + len, 0);
+  return buf;
+}
+
+// String trim left (remove leading spaces)
+pub fn StrTrimLeft(s: int64): int64 {
+  var start: int64 := 0;
+  while (peek8(s + start) == 32) { start := start + 1; }
+  var len: int64 := StrLen(s) - start;
+  var buf: int64 := mmap(0, len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(buf + i, peek8(s + start + i));
+    i := i + 1;
+  end;
+  poke8(buf + len, 0);
+  return buf;
+}
+
+// String trim right (remove trailing spaces)
+pub fn StrTrimRight(s: int64): int64 {
+  var len: int64 := StrLen(s);
+  while (len > 0 && peek8(s + len - 1) == 32) {
+    len := len - 1;
+  end;
+  var buf: int64 := mmap(0, len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(buf + i, peek8(s + i));
+    i := i + 1;
+  end;
+  poke8(buf + len, 0);
+  return buf;
+}
+
+// String trim both
+pub fn StrTrim(s: int64): int64 {
+  var tmp: int64 := StrTrimLeft(s);
+  var result: int64 := StrTrimRight(tmp);
+  munmap(tmp, StrLen(tmp) + 1);
+  return result;
+}
+
+// Split string by delimiter
+// Returns array of pchar pointers (first element is count at offset -8)
+pub fn StrSplit(s: int64, delim: int64): int64 {
+  var maxParts: int64 := 256;
+  var parts: int64 := mmap(0, maxParts * 8 + 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var count: int64 := 0;
+  var start: int64 := 0;
+  var i: int64 := 0;
+  var len: int64 := StrLen(s);
+  
+  while (i <= len) {
+    if (peek8(s + i) == delim || peek8(s + i) == 0) {
+      var partLen: int64 := i - start;
+      var part: int64 := mmap(0, partLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var j: int64 := 0;
+      while (j < partLen) {
+        poke8(part + j, peek8(s + start + j));
+        j := j + 1;
+      end;
+      poke8(part + partLen, 0);
+      poke8(parts + count * 8, part);
+      count := count + 1;
+      start := i + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  // Store count at the end
+  // Return parts pointer (count can be accessed as needed)
+  return parts;
+}
+
+// Join array of strings with delimiter
+pub fn StrJoin(parts: int64, count: int64, delim: int64): int64 {
+  var totalLen: int64 := 0;
+  var i: int64 := 0;
+  var lengths: int64 := mmap(0, count * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // Calculate total length
+  while (i < count) {
+    var part: int64 := peek8(parts + i * 8);
+    var partLen: int64 := StrLen(part);
+    poke8(lengths + i * 8, partLen);
+    totalLen := totalLen + partLen;
+    if (i < count - 1) { totalLen := totalLen + 1; }  // delimiter
+    i := i + 1;
+  end;
+  
+  var buf: int64 := mmap(0, totalLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var pos: int64 := 0;
+  i := 0;
+  while (i < count) {
+    var part: int64 := peek8(parts + i * 8);
+    var partLen: int64 := peek8(lengths + i * 8);
+    var j: int64 := 0;
+    while (j < partLen) {
+      poke8(buf + pos, peek8(part + j));
+      pos := pos + 1;
+      j := j + 1;
+    end;
+    if (i < count - 1) {
+      poke8(buf + pos, delim);
+      pos := pos + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  poke8(buf + pos, 0);
+  munmap(lengths, count * 8);
+  return buf;
+}
+
+// String contains
+pub fn StrContains(s: int64, needle: int64): int64 {
+  var sLen: int64 := StrLen(s);
+  var nLen: int64 := StrLen(needle);
+  var i: int64 := 0;
+  while (i <= sLen - nLen) {
+    var j: int64 := 0;
+    var match: int64 := 1;
+    while (j < nLen) {
+      if (peek8(s + i + j) != peek8(needle + j)) {
+        match := 0;
+        break;
+      end;
+      j := j + 1;
+    end;
+    if (match == 1) { return 1; }
+    i := i + 1;
+  end;
+  return 0;
+}
+
+// String starts with
+pub fn StrStartsWith(s: int64, prefix: int64): int64 {
+  var pLen: int64 := StrLen(prefix);
+  var i: int64 := 0;
+  while (i < pLen) {
+    if (peek8(s + i) != peek8(prefix + i)) { return 0; }
+    i := i + 1;
+  end;
+  return 1;
+}
+
+// String ends with
+pub fn StrEndsWith(s: int64, suffix: int64): int64 {
+  var sLen: int64 := StrLen(s);
+  var sufLen: int64 := StrLen(suffix);
+  if (sLen < sufLen) { return 0; }
+  var i: int64 := 0;
+  while (i < sufLen) {
+    if (peek8(s + sLen - sufLen + i) != peek8(suffix + i)) { return 0; }
+    i := i + 1;
+  end;
+  return 1;
+}
+
+// String replace (first occurrence)
+pub fn StrReplace(s: int64, old: int64, newStr: int64): int64 {
+  var sLen: int64 := StrLen(s);
+  var oLen: int64 := StrLen(old);
+  var nLen: int64 := StrLen(newStr);
+  var i: int64 := 0;
+  
+  while (i <= sLen - oLen) {
+    var j: int64 := 0;
+    var match: int64 := 1;
+    while (j < oLen) {
+      if (peek8(s + i + j) != peek8(old + j)) { match := 0; break; }
+      j := j + 1;
+    end;
+    if (match == 1) {
+      var newLen: int64 := sLen - oLen + nLen;
+      var buf: int64 := mmap(0, newLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var pos: int64 := 0;
+      j := 0;
+      while (j < i) { poke8(buf + pos, peek8(s + j)); pos := pos + 1; j := j + 1; end;
+      j := 0;
+      while (j < nLen) { poke8(buf + pos, peek8(newStr + j)); pos := pos + 1; j := j + 1; end;
+      j := i + oLen;
+      while (j < sLen) { poke8(buf + pos, peek8(s + j)); pos := pos + 1; j := j + 1; end;
+      poke8(buf + pos, 0);
+      return buf;
+    end;
+    i := i + 1;
+  end;
+  // No match found, return copy
+  var buf: int64 := mmap(0, sLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  i := 0;
+  while (i < sLen) { poke8(buf + i, peek8(s + i)); i := i + 1; end;
+  poke8(buf + sLen, 0);
+  return buf;
+}
+
+// ============================================================================
+// CorrMatrix
+// ============================================================================
+
+// Pairwise correlation matrix for multiple columns
+pub fn DataFrameCorrMatrix(df: DataFrame): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var s1: Series;
+  var s2: Series;
+  
+  // Add index column (column names)
+  DataFrameAddColumn(result, "column", COL_STRING);
+  
+  // Add one column per DataFrame column
+  i := 0;
+  while (i < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + i * 16), COL_INT64);
+    i := i + 1;
+  end;
+  
+  // Compute correlations
+  i := 0;
+  while (i < df.colCount) {
+    DataFrameAppendRow(result);
+    DataFrameSetString(result, "column", i, peek8(df.columns + i * 16));
+    s1 := peek8(df.columns + i * 16 + 8);
+    
+    j := 0;
+    while (j < df.colCount) {
+      s2 := peek8(df.columns + j * 16 + 8);
+      var corr: int64 := SeriesCorr(s1, s2);
+      DataFrameSetInt(result, peek8(result.columns + (j + 1) * 16), i, corr);
+      j := j + 1;
+    end;
+    
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// GetDummies (One-Hot Encoding)
+// ============================================================================
+
+// Convert column values to binary columns
+pub fn DataFrameGetDummies(df: DataFrame, colName: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(df, colName);
+  var uniqueVals: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var uniqueCount: int64 := 0;
+  var i: int64;
+  var j: int64;
+  var val: int64;
+  var found: int64;
+  
+  // Find unique values
+  i := 0;
+  while (i < s.length) {
+    val := SeriesGetInt(s, i);
+    found := 0;
+    j := 0;
+    while (j < uniqueCount) {
+      if (peek8(uniqueVals + j * 8) == val) { found := 1; break; }
+      j := j + 1;
+    end;
+    if (found == 0) {
+      poke8(uniqueVals + uniqueCount * 8, val);
+      uniqueCount := uniqueCount + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  // Create dummy columns
+  j := 0;
+  while (j < uniqueCount) {
+    // Create column name: colName + "_" + value
+    var colNameStr: int64 := mmap(0, 64, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var pos: int64 := 0;
+    var nameLen: int64 := StrLen(colName);
+    i := 0;
+    while (i < nameLen) { poke8(colNameStr + pos, peek8(colName + i)); pos := pos + 1; i := i + 1; end;
+    poke8(colNameStr + pos, 95); pos := pos + 1;  // '_'
+    // Convert value to string
+    var num: int64 := peek8(uniqueVals + j * 8);
+    var tmp: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var tmpPos: int64 := 0;
+    if (num == 0) { poke8(tmp, 48); tmpPos := 1; }
+    else {
+      while (num > 0) { poke8(tmp + tmpPos, 48 + (num - (num / 10) * 10)); tmpPos := tmpPos + 1; num := num / 10; end;
+    end;
+    while (tmpPos > 0) { tmpPos := tmpPos - 1; poke8(colNameStr + pos, peek8(tmp + tmpPos)); pos := pos + 1; end;
+    poke8(colNameStr + pos, 0);
+    munmap(tmp, 16);
+    
+    DataFrameAddColumn(result, colNameStr, COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Fill dummy values
+  i := 0;
+  while (i < df.rowCount) {
+    DataFrameAppendRow(result);
+    val := SeriesGetInt(s, i);
+    j := 0;
+    while (j < uniqueCount) {
+      var dummyVal: int64 := 0;
+      if (peek8(uniqueVals + j * 8) == val) { dummyVal := 1; }
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, dummyVal);
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  munmap(uniqueVals, 1024 * 8);
+  return result;
+}
+
+// ============================================================================
+// Right/Outer Join
+// ============================================================================
+
+// Right join: all rows from right, matching rows from left
+pub fn DataFrameJoinRight(left: DataFrame, leftKey: int64, right: DataFrame, rightKey: int64): DataFrame {
+  // Swap and use left join
+  return DataFrameJoinLeft(right, rightKey, left, leftKey);
+}
+
+// Outer join: all rows from both DataFrames
+pub fn DataFrameJoinOuter(left: DataFrame, leftKey: int64, right: DataFrame, rightKey: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var leftS: Series := DataFrameGetSeries(left, leftKey);
+  var rightS: Series := DataFrameGetSeries(right, rightKey);
+  var i: int64;
+  var j: int64;
+  var found: int64;
+  
+  // Add all columns from left
+  i := 0;
+  while (i < left.colCount) {
+    DataFrameAddColumn(result, peek8(left.columns + i * 16), COL_INT64);
+    i := i + 1;
+  end;
+  // Add columns from right (skip key)
+  i := 0;
+  while (i < right.colCount) {
+    var name: int64 := peek8(right.columns + i * 16);
+    if (name != rightKey) { DataFrameAddColumn(result, name, COL_INT64); }
+    i := i + 1;
+  end;
+  
+  // All rows from left
+  i := 0;
+  while (i < left.rowCount) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    j := 0;
+    while (j < left.colCount) {
+      var s: Series := peek8(left.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(s, i));
+      j := j + 1;
+    end;
+    // Try to find match in right
+    var leftVal: int64 := SeriesGetInt(leftS, i);
+    found := 0;
+    j := 0;
+    while (j < right.rowCount) {
+      if (SeriesGetInt(rightS, j) == leftVal) {
+        var col: int64 := 0;
+        while (col < right.colCount) {
+          var rName: int64 := peek8(right.columns + col * 16);
+          if (rName != rightKey) {
+            var s2: Series := peek8(right.columns + col * 16 + 8);
+            DataFrameSetInt(result, rName, newRow, SeriesGetInt(s2, j));
+          end;
+          col := col + 1;
+        end;
+        found := 1;
+        break;
+      end;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  // Add unmatched rows from right
+  i := 0;
+  while (i < right.rowCount) {
+    var rightVal: int64 := SeriesGetInt(rightS, i);
+    found := 0;
+    j := 0;
+    while (j < left.rowCount) {
+      if (SeriesGetInt(leftS, j) == rightVal) { found := 1; break; }
+      j := j + 1;
+    end;
+    if (found == 0) {
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      // Copy right columns
+      j := 0;
+      while (j < right.colCount) {
+        var rName: int64 := peek8(right.columns + j * 16);
+        var s: Series := peek8(right.columns + j * 16 + 8);
+        DataFrameSetInt(result, rName, newRow, SeriesGetInt(s, i));
+        j := j + 1;
+      end;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Normalize
+// ============================================================================
+
+// Min-Max normalization (0-1000 scale)
+pub fn SeriesNormalizeMinMax(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var mn: int64 := SeriesMin(s);
+  var mx: int64 := SeriesMax(s);
+  var range: int64 := mx - mn;
+  if (range == 0) { range := 1; }
+  result.length := s.length;
+  var i: int64 := 0;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    SeriesSetInt(result, i, ((val - mn) * 1000) / range);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Z-Score normalization (mean=0, std=1 approximation)
+pub fn SeriesNormalizeZScore(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var mean: int64 := SeriesMean(s);
+  var variance: int64 := 0;
+  var i: int64 := 0;
+  result.length := s.length;
+  
+  // Calculate variance
+  while (i < s.length) {
+    var diff: int64 := SeriesGetInt(s, i) - mean;
+    variance := variance + (diff * diff);
+    i := i + 1;
+  end;
+  if (s.length > 0) { variance := variance / s.length; }
+  
+  // Integer sqrt
+  var std: int64 := variance;
+  if (std > 0) {
+    var tmp: int64 := (std + 1) / 2;
+    while (tmp < std) { std := tmp; tmp := (std + variance / std) / 2; }
+  end;
+  if (std == 0) { std := 1; }
+  
+  // Normalize
+  i := 0;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    SeriesSetInt(result, i, ((val - mean) * 100) / std);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// ============================================================================
+// DatetimeIndex
+// ============================================================================
+
+// Unix timestamp to components
+pub type DateTime = struct {
+  year: int64;
+  month: int64;
+  day: int64;
+  hour: int64;
+  minute: int64;
+  second: int64;
+};
+
+// Convert Unix timestamp to DateTime
+pub fn UnixToDateTime(unix: int64): DateTime {
+  var dt: DateTime;
+  var days: int64 := unix / 86400;
+  var secs: int64 := unix - days * 86400;
+  
+  dt.hour := secs / 3600;
+  dt.minute := (secs - dt.hour * 3600) / 60;
+  dt.second := secs - dt.hour * 3600 - dt.minute * 60;
+  
+  // Simplified year/month/day
+  dt.year := 1970 + (days / 365);
+  var daysInYear: int64 := days - (dt.year - 1970) * 365;
+  daysInYear := daysInYear - ((dt.year - 1968) / 4);
+  
+  if (daysInYear < 31) { dt.month := 1; dt.day := daysInYear + 1; }
+  else if (daysInYear < 59) { dt.month := 2; dt.day := daysInYear - 30; }
+  else if (daysInYear < 90) { dt.month := 3; dt.day := daysInYear - 58; }
+  else if (daysInYear < 120) { dt.month := 4; dt.day := daysInYear - 89; }
+  else if (daysInYear < 151) { dt.month := 5; dt.day := daysInYear - 119; }
+  else if (daysInYear < 181) { dt.month := 6; dt.day := daysInYear - 150; }
+  else if (daysInYear < 212) { dt.month := 7; dt.day := daysInYear - 180; }
+  else if (daysInYear < 243) { dt.month := 8; dt.day := daysInYear - 211; }
+  else if (daysInYear < 273) { dt.month := 9; dt.day := daysInYear - 242; }
+  else if (daysInYear < 304) { dt.month := 10; dt.day := daysInYear - 272; }
+  else if (daysInYear < 334) { dt.month := 11; dt.day := daysInYear - 303; }
+  else { dt.month := 12; dt.day := daysInYear - 333; }
+  
+  return dt;
+}
+
+// Get year from timestamp
+pub fn UnixGetYear(ts: int64): int64 {
+  return UnixToDateTime(ts).year;
+}
+
+// Get month from timestamp
+pub fn UnixGetMonth(ts: int64): int64 {
+  return UnixToDateTime(ts).month;
+}
+
+// Get day from timestamp
+pub fn UnixGetDay(ts: int64): int64 {
+  return UnixToDateTime(ts).day;
+}
+
+// Get hour from timestamp
+pub fn UnixGetHour(ts: int64): int64 {
+  return UnixToDateTime(ts).hour;
+}
+
+// ============================================================================
+// Resample (simplified)
+// ============================================================================
+
+// Resample by counting occurrences in time windows
+// windowSec: window size in seconds
+pub fn SeriesResampleCount(s: Series, windowSec: int64): Series {
+  // Simple binning
+  if (s.length == 0) { return SeriesNewInt64(s.name, 0); }
+  var mn: int64 := SeriesMin(s);
+  var mx: int64 := SeriesMax(s);
+  var bins: int64 := ((mx - mn) / windowSec) + 1;
+  var result: Series := SeriesNewInt64(s.name, bins);
+  var i: int64 := 0;
+  result.length := bins;
+  while (i < bins) { SeriesSetInt(result, i, 0); i := i + 1; end;
+  i := 0;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    var bin: int64 := (val - mn) / windowSec;
+    if (bin >= 0 && bin < bins) {
+      SeriesSetInt(result, bin, SeriesGetInt(result, bin) + 1);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// ============================================================================
+// Explode
+// ============================================================================
+
+// Explode: expand a column (simplified: duplicate row for each value)
+pub fn DataFrameExplode(df: DataFrame, colName: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64;
+  var j: int64;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows (each row once - full explode would need array columns)
+  i := 0;
+  while (i < df.rowCount) {
+    DataFrameAppendRow(result);
+    j := 0;
+    while (j < df.colCount) {
+      var srcS: Series := peek8(df.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Query (simplified)
+// ============================================================================
+
+// Query: filter by expression (simplified: only equality check)
+// Query format: "col == value" or "col != value" or "col > value" etc.
+pub fn DataFrameQuery(df: DataFrame, colName: int64, op: int64, value: int64): DataFrame {
+  return DataFrameFilter(df, colName, op, value);
+}
+
+// ============================================================================
+// Interpolate
+// ============================================================================
+
+// Interpolate missing values (linear)
+pub fn SeriesInterpolate(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var lastValid: int64 := 0;
+  var lastValidIdx: int64 := -1;
+  var nextValid: int64 := 0;
+  var nextValidIdx: int64 := -1;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val != 0) {
+      SeriesSetInt(result, i, val);
+      lastValid := val;
+      lastValidIdx := i;
+    end else {
+      // Find next valid value
+      if (nextValidIdx <= i) {
+        var j: int64 := i + 1;
+        nextValidIdx := -1;
+        while (j < s.length) {
+          if (SeriesGetInt(s, j) != 0) {
+            nextValid := SeriesGetInt(s, j);
+            nextValidIdx := j;
+            break;
+          end;
+          j := j + 1;
+        end;
+      }
+      // Interpolate
+      if (lastValidIdx >= 0 && nextValidIdx > 0) {
+        var gap: int64 := nextValidIdx - lastValidIdx;
+        var pos: int64 := i - lastValidIdx;
+        var interpolated: int64 := lastValid + ((nextValid - lastValid) * pos) / gap;
+        SeriesSetInt(result, i, interpolated);
+      end else if (lastValidIdx >= 0) {
+        SeriesSetInt(result, i, lastValid);  // Forward fill
+      end;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Sample
+// ============================================================================
+
+// Random sample of rows (simplified: take every Nth row)
+pub fn DataFrameSample(df: DataFrame, fraction: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var step: int64;
+  
+  if (fraction <= 0 || fraction > 100) { fraction := 10; }
+  step := 100 / fraction;
+  if (step < 1) { step := 1; }
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Sample rows
+  i := 0;
+  while (i < df.rowCount) {
+    var rowMod: int64 := i - (i / step) * step;
+    if (rowMod == 0) {
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      j := 0;
+      while (j < df.colCount) {
+        var srcS: Series := peek8(df.columns + j * 16 + 8);
+        DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+        j := j + 1;
+      end;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Cut / QCut (Binning)
+// ============================================================================
+
+// Cut: assign values to bins
+pub fn SeriesCut(s: Series, bins: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var mn: int64 := SeriesMin(s);
+  var mx: int64 := SeriesMax(s);
+  var range: int64 := mx - mn;
+  if (range == 0) { range := 1; }
+  var binSize: int64 := range / bins;
+  if (binSize == 0) { binSize := 1; }
+  
+  result.length := s.length;
+  var i: int64 := 0;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    var bin: int64 := (val - mn) / binSize;
+    if (bin >= bins) { bin := bins - 1; }
+    SeriesSetInt(result, i, bin);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// QCut: assign values to quantile-based bins
+pub fn SeriesQCut(s: Series, quantiles: int64): Series {
+  // Simple implementation: sort and divide
+  var sorted: DataFrame := DataFrameNew();
+  DataFrameAddColumn(sorted, "val", COL_INT64);
+  var i: int64 := 0;
+  while (i < s.length) {
+    DataFrameAppendRow(sorted);
+    DataFrameSetInt(sorted, "val", i, SeriesGetInt(s, i));
+    i := i + 1;
+  end;
+  
+  // Sort
+  var sortedS: Series := DataFrameGetSeries(sorted, "val");
+  i := 1;
+  while (i < sortedS.length) {
+    var key: int64 := SeriesGetInt(sortedS, i);
+    var j: int64 := i - 1;
+    while (j >= 0 && SeriesGetInt(sortedS, j) > key) {
+      SeriesSetInt(sortedS, j + 1, SeriesGetInt(sortedS, j));
+      j := j - 1;
+    end;
+    SeriesSetInt(sortedS, j + 1, key);
+    i := i + 1;
+  end;
+  
+  // Assign quantiles
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  result.length := s.length;
+  var bucketSize: int64 := s.length / quantiles;
+  if (bucketSize == 0) { bucketSize := 1; }
+  i := 0;
+  while (i < s.length) {
+    var bin: int64 := i / bucketSize;
+    if (bin >= quantiles) { bin := quantiles - 1; }
+    SeriesSetInt(result, i, bin);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// MultiIndex (simplified)
+// ============================================================================
+
+// Multi-index: combine two columns as index
+pub fn DataFrameSetMultiIndex(df: DataFrame, col1: int64, col2: int64) {
+  var s1: Series := DataFrameGetSeries(df, col1);
+  var s2: Series := DataFrameGetSeries(df, col2);
+  var i: int64 := 0;
+  
+  df.index := mmap(0, df.rowCount * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (df.index == 0) { return; }
+  
+  // Create composite labels (concatenate values)
+  while (i < df.rowCount) {
+    var label: int64 := mmap(0, 64, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var pos: int64 := 0;
+    var v1: int64 := SeriesGetInt(s1, i);
+    var v2: int64 := SeriesGetInt(s2, i);
+    
+    // Convert v1 to string
+    var tmp: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var tmpPos: int64 := 0;
+    if (v1 == 0) { poke8(tmp, 48); tmpPos := 1; }
+    else { var n: int64 := v1; while (n > 0) { poke8(tmp + tmpPos, 48 + (n - (n / 10) * 10)); tmpPos := tmpPos + 1; n := n / 10; } end;
+    while (tmpPos > 0) { tmpPos := tmpPos - 1; poke8(label + pos, peek8(tmp + tmpPos)); pos := pos + 1; end;
+    munmap(tmp, 16);
+    
+    // Add separator
+    poke8(label + pos, 95); pos := pos + 1;  // '_'
+    
+    // Convert v2 to string
+    tmp := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    tmpPos := 0;
+    if (v2 == 0) { poke8(tmp, 48); tmpPos := 1; }
+    else { var n: int64 := v2; while (n > 0) { poke8(tmp + tmpPos, 48 + (n - (n / 10) * 10)); tmpPos := tmpPos + 1; n := n / 10; } end;
+    while (tmpPos > 0) { tmpPos := tmpPos - 1; poke8(label + pos, peek8(tmp + tmpPos)); pos := pos + 1; end;
+    munmap(tmp, 16);
+    
+    poke8(label + pos, 0);
+    poke8(df.index + i * 8, label);
+    i := i + 1;
+  end;
+  
+  df.indexName := col1;
+  df.hasIndex := 1;
+}
+
+// Float sum (using f64 arithmetic)
+pub fn SeriesSumF64(s: Series): f64 {
+  var sum: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < s.length) {
+    sum := sum + peekf64(s.data + i * 8);
+    i := i + 1;
+  end;
+  return sum;
+}
+
+// Float mean
+pub fn SeriesMeanF64(s: Series): f64 {
+  if (s.length == 0) { return 0.0; }
+  return SeriesSumF64(s) / (s.length as f64);
+}
+
+// Float min
+pub fn SeriesMinF64(s: Series): f64 {
+  var i: int64 := 1;
+  var mn: f64;
+  if (s.length == 0) { return 0.0; }
+  mn := peekf64(s.data);
+  while (i < s.length) {
+    var val: f64 := peekf64(s.data + i * 8);
+    if (val < mn) { mn := val; }
+    i := i + 1;
+  end;
+  return mn;
+}
+
+// Float max
+pub fn SeriesMaxF64(s: Series): f64 {
+  var i: int64 := 1;
+  var mx: f64;
+  if (s.length == 0) { return 0.0; }
+  mx := peekf64(s.data);
+  while (i < s.length) {
+    var val: f64 := peekf64(s.data + i * 8);
+    if (val > mx) { mx := val; }
+    i := i + 1;
+  end;
+  return mx;
+}
+
+// Float variance
+pub fn SeriesVarianceF64(s: Series): f64 {
+  var n: f64 := s.length as f64;
+  if (n == 0.0) { return 0.0; }
+  var mean: f64 := SeriesMeanF64(s);
+  var sumSq: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < s.length) {
+    var diff: f64 := peekf64(s.data + i * 8) - mean;
+    sumSq := sumSq + (diff * diff);
+    i := i + 1;
+  end;
+  return sumSq / n;
+}
+
+// Float std deviation
+pub fn SeriesStdDevF64(s: Series): f64 {
+  var variance: f64 := SeriesVarianceF64(s);
+  // Newton's method sqrt
+  var x: f64 := variance;
+  if (x <= 0.0) { return 0.0; }
+  var y: f64 := (x + 1.0) / 2.0;
+  while (y < x) {
+    x := y;
+    y := (x + variance / x) / 2.0;
+  end;
+  return x;
+}
+
+// Float cumulative sum
+pub fn SeriesCumSumF64(s: Series): Series {
+  var result: Series := SeriesNewFloat64(s.name, s.length);
+  var i: int64 := 0;
+  var sum: f64 := 0.0;
+  result.length := s.length;
+  while (i < s.length) {
+    sum := sum + peekf64(s.data + i * 8);
+    pokef64(result.data + i * 8, sum);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Float filter by threshold
+pub fn SeriesFilterGtF64(s: Series, threshold: f64): Series {
+  var result: Series := SeriesNewFloat64(s.name, s.length);
+  var i: int64 := 0;
+  while (i < s.length) {
+    var val: f64 := peekf64(s.data + i * 8);
+    if (val > threshold) {
+      pokef64(result.data + result.length * 8, val);
+      result.length := result.length + 1;
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Float filter less than
+pub fn SeriesFilterLtF64(s: Series, threshold: f64): Series {
+  var result: Series := SeriesNewFloat64(s.name, s.length);
+  var i: int64 := 0;
+  while (i < s.length) {
+    var val: f64 := peekf64(s.data + i * 8);
+    if (val < threshold) {
+      pokef64(result.data + result.length * 8, val);
+      result.length := result.length + 1;
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Add float column to DataFrame
+pub fn DataFrameAddColumnFloat64(df: DataFrame, name: int64) {
+  if (df.colCount >= df.colCapacity) { return; }
+  var s: Series := SeriesNewFloat64(name, df.rowCapacity);
+  s.length := df.rowCount;
+  poke8(df.columns + df.colCount * 16, name);
+  poke8(df.columns + df.colCount * 16 + 8, s);
+  df.colCount := df.colCount + 1;
+}
+
+// Set float value
+pub fn DataFrameSetFloat64(df: DataFrame, colName: int64, row: int64, value: f64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data != 0 && row >= 0 && row < s.length) {
+    pokef64(s.data + row * 8, value);
+  end;
+}
+
+// Get float value
+pub fn DataFrameGetFloat64(df: DataFrame, colName: int64, row: int64): f64 {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data == 0 || row < 0 || row >= s.length) {
+    return 0.0;
+  end;
+  return peekf64(s.data + row * 8);
+}
+
+// ============================================================================
+// Rolling Window
+// ============================================================================
+
+// Rolling mean (int64)
+pub fn SeriesRollingMean(s: Series, window: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  
+  while (i < s.length) {
+    if (i < window - 1) {
+      SeriesSetInt(result, i, 0);  // Not enough data
+    end else {
+      var sum: int64 := 0;
+      var j: int64 := i - window + 1;
+      while (j <= i) {
+        sum := sum + SeriesGetInt(s, j);
+        j := j + 1;
+      end;
+      SeriesSetInt(result, i, sum / window);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Rolling sum
+pub fn SeriesRollingSum(s: Series, window: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  
+  while (i < s.length) {
+    if (i < window - 1) {
+      SeriesSetInt(result, i, 0);
+    end else {
+      var sum: int64 := 0;
+      var j: int64 := i - window + 1;
+      while (j <= i) {
+        sum := sum + SeriesGetInt(s, j);
+        j := j + 1;
+      end;
+      SeriesSetInt(result, i, sum);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Rolling min
+pub fn SeriesRollingMin(s: Series, window: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  
+  while (i < s.length) {
+    if (i < window - 1) {
+      SeriesSetInt(result, i, 0);
+    end else {
+      var mn: int64 := SeriesGetInt(s, i - window + 1);
+      var j: int64 := i - window + 2;
+      while (j <= i) {
+        var val: int64 := SeriesGetInt(s, j);
+        if (val < mn) { mn := val; }
+        j := j + 1;
+      end;
+      SeriesSetInt(result, i, mn);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Rolling max
+pub fn SeriesRollingMax(s: Series, window: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  
+  while (i < s.length) {
+    if (i < window - 1) {
+      SeriesSetInt(result, i, 0);
+    end else {
+      var mx: int64 := SeriesGetInt(s, i - window + 1);
+      var j: int64 := i - window + 2;
+      while (j <= i) {
+        var val: int64 := SeriesGetInt(s, j);
+        if (val > mx) { mx := val; }
+        j := j + 1;
+      end;
+      SeriesSetInt(result, i, mx);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// ============================================================================
+// agg() / transform()
+// ============================================================================
+
+// Aggregate functions enum
+pub con AGG_SUM: int64 := 1;
+pub con AGG_MEAN: int64 := 2;
+pub con AGG_MIN: int64 := 3;
+pub con AGG_MAX: int64 := 4;
+pub con AGG_COUNT: int64 := 5;
+pub con AGG_STD: int64 := 6;
+
+// Apply aggregation to single column
+pub fn SeriesAgg(s: Series, aggType: int64): int64 {
+  if (aggType == AGG_SUM) { return SeriesSum(s); }
+  if (aggType == AGG_MEAN) { return SeriesMean(s); }
+  if (aggType == AGG_MIN) { return SeriesMin(s); }
+  if (aggType == AGG_MAX) { return SeriesMax(s); }
+  if (aggType == AGG_COUNT) { return SeriesCount(s); }
+  return 0;
+}
+
+// DataFrame agg: apply aggregation to all columns
+pub fn DataFrameAgg(df: DataFrame, aggType: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64 := 0;
+  var s: Series;
+  var name: int64;
+  
+  while (i < df.colCount) {
+    name := peek8(df.columns + i * 16);
+    s := peek8(df.columns + i * 16 + 8);
+    
+    DataFrameAddColumn(result, name, COL_INT64);
+    DataFrameAppendRow(result);
+    
+    var val: int64 := SeriesAgg(s, aggType);
+    DataFrameSetInt(result, name, 0, val);
+    
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// Aggregation result for GroupBy with multiple aggregations
+pub type AggResult = struct {
+  sum: int64;
+  mean: int64;
+  min: int64;
+  max: int64;
+  count: int64;
+};
+
+// Multi-aggregation on Series
+pub fn SeriesAggMulti(s: Series): AggResult {
+  var r: AggResult;
+  r.sum := SeriesSum(s);
+  r.count := SeriesCount(s);
+  if (r.count > 0) {
+    r.mean := r.sum / r.count;
+  end else {
+    r.mean := 0;
+  end;
+  r.min := SeriesMin(s);
+  r.max := SeriesMax(s);
+  return r;
+}
+
+// GroupBy + Multi-Agg
+pub fn GroupByAgg(gb: GroupByResult, aggCol: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var aggS: Series := DataFrameGetSeries(gb.df, aggCol);
+  var keyS: Series := DataFrameGetSeries(gb.df, gb.keyCol);
+  var i: int64 := 0;
+  var j: int64;
+  var rows: int64;
+  var count: int64;
+  var sum: int64;
+  var mn: int64;
+  var mx: int64;
+  
+  DataFrameAddColumn(result, gb.keyCol, COL_INT64);
+  DataFrameAddColumn(result, "count", COL_INT64);
+  DataFrameAddColumn(result, "sum", COL_INT64);
+  DataFrameAddColumn(result, "mean", COL_INT64);
+  DataFrameAddColumn(result, "min", COL_INT64);
+  DataFrameAddColumn(result, "max", COL_INT64);
+  
+  while (i < gb.groupCount) {
+    DataFrameAppendRow(result);
+    rows := peek8(gb.groupRows + i * 8);
+    count := peek8(rows - 8);
+    
+    DataFrameSetInt(result, gb.keyCol, i, SeriesGetInt(keyS, peek8(rows)));
+    
+    sum := 0; mn := SeriesGetInt(aggS, peek8(rows)); mx := mn;
+    j := 0;
+    while (j < count) {
+      var val: int64 := SeriesGetInt(aggS, peek8(rows + j * 8));
+      sum := sum + val;
+      if (val < mn) { mn := val; }
+      if (val > mx) { mx := val; }
+      j := j + 1;
+    end;
+    
+    DataFrameSetInt(result, "count", i, count);
+    DataFrameSetInt(result, "sum", i, sum);
+    DataFrameSetInt(result, "mean", i, sum / count);
+    DataFrameSetInt(result, "min", i, mn);
+    DataFrameSetInt(result, "max", i, mx);
+    
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// Transform: multiply all values in column by factor
+pub fn SeriesTransformMul(s: Series, factor: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  while (i < s.length) {
+    SeriesSetInt(result, i, SeriesGetInt(s, i) * factor);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Transform: add constant to all values
+pub fn SeriesTransformAdd(s: Series, offset: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  while (i < s.length) {
+    SeriesSetInt(result, i, SeriesGetInt(s, i) + offset);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Transform: normalize to 0-1 range
+pub fn SeriesTransformNormalize(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var mn: int64 := SeriesMin(s);
+  var mx: int64 := SeriesMax(s);
+  var range: int64 := mx - mn;
+  var i: int64 := 0;
+  result.length := s.length;
+  if (range == 0) { range := 1; }
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    SeriesSetInt(result, i, ((val - mn) * 1000) / range);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// ============================================================================
+// Apply (simplified - operations on columns)
+// ============================================================================
+
+// Apply: transform column by adding constant
+pub fn DataFrameApplyAdd(df: DataFrame, colName: int64, offset: int64): Series {
+  var s: Series := DataFrameGetSeries(df, colName);
+  return SeriesTransformAdd(s, offset);
+}
+
+// Apply: transform column by multiplying
+pub fn DataFrameApplyMul(df: DataFrame, colName: int64, factor: int64): Series {
+  var s: Series := DataFrameGetSeries(df, colName);
+  return SeriesTransformMul(s, factor);
+}
+
+// Apply: transform column by normalizing
+pub fn DataFrameApplyNormalize(df: DataFrame, colName: int64): Series {
+  var s: Series := DataFrameGetSeries(df, colName);
+  return SeriesTransformNormalize(s);
+}
+
+// Apply: compute absolute values
+pub fn SeriesApplyAbs(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val < 0) { val := -val; }
+    SeriesSetInt(result, i, val);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Apply: square all values
+pub fn SeriesApplySquare(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    SeriesSetInt(result, i, val * val);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Apply: compute sqrt (integer approximation)
+pub fn SeriesApplySqrt(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  result.length := s.length;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val < 0) { val := 0; }
+    // Integer sqrt
+    var x: int64 := val;
+    if (x > 0) {
+      var y: int64 := (x + 1) / 2;
+      while (y < x) {
+        x := y;
+        y := (x + val / x) / 2;
+      end;
+    end;
+    SeriesSetInt(result, i, x);
+    i := i + 1;
+  end;
+  return result;
+}
+
+// ============================================================================
+// Boolean Indexing
+// ============================================================================
+
+// Boolean Series result
+pub type BoolSeries = struct {
+  data: int64;          // Pointer to bool array (int64, 0/1)
+  length: int64;
+  name: int64;
+};
+
+// Create boolean series from comparison
+pub fn SeriesGreaterThan(s: Series, value: int64): BoolSeries {
+  var bs: BoolSeries;
+  bs.data := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  bs.length := s.length;
+  bs.name := s.name;
+  var i: int64 := 0;
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) > value) {
+      poke8(bs.data + i * 8, 1);
+    end else {
+      poke8(bs.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return bs;
+}
+
+// Less than
+pub fn SeriesLessThan(s: Series, value: int64): BoolSeries {
+  var bs: BoolSeries;
+  bs.data := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  bs.length := s.length;
+  bs.name := s.name;
+  var i: int64 := 0;
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) < value) {
+      poke8(bs.data + i * 8, 1);
+    end else {
+      poke8(bs.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return bs;
+}
+
+// Equal
+pub fn SeriesEqual(s: Series, value: int64): BoolSeries {
+  var bs: BoolSeries;
+  bs.data := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  bs.length := s.length;
+  bs.name := s.name;
+  var i: int64 := 0;
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) == value) {
+      poke8(bs.data + i * 8, 1);
+    end else {
+      poke8(bs.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return bs;
+}
+
+// Not equal
+pub fn SeriesNotEqual(s: Series, value: int64): BoolSeries {
+  var bs: BoolSeries;
+  bs.data := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  bs.length := s.length;
+  bs.name := s.name;
+  var i: int64 := 0;
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) != value) {
+      poke8(bs.data + i * 8, 1);
+    end else {
+      poke8(bs.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return bs;
+}
+
+// In range [min, max]
+pub fn SeriesInRange(s: Series, min: int64, max: int64): BoolSeries {
+  var bs: BoolSeries;
+  bs.data := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  bs.length := s.length;
+  bs.name := s.name;
+  var i: int64 := 0;
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val >= min && val <= max) {
+      poke8(bs.data + i * 8, 1);
+    end else {
+      poke8(bs.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return bs;
+}
+
+// AND two boolean series
+pub fn BoolSeriesAnd(bs1: BoolSeries, bs2: BoolSeries): BoolSeries {
+  var result: BoolSeries;
+  result.data := mmap(0, bs1.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  result.length := bs1.length;
+  result.name := bs1.name;
+  var i: int64 := 0;
+  while (i < bs1.length) {
+    var a: int64 := peek8(bs1.data + i * 8);
+    var b: int64 := peek8(bs2.data + i * 8);
+    if (a == 1 && b == 1) {
+      poke8(result.data + i * 8, 1);
+    end else {
+      poke8(result.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// OR two boolean series
+pub fn BoolSeriesOr(bs1: BoolSeries, bs2: BoolSeries): BoolSeries {
+  var result: BoolSeries;
+  result.data := mmap(0, bs1.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  result.length := bs1.length;
+  result.name := bs1.name;
+  var i: int64 := 0;
+  while (i < bs1.length) {
+    var a: int64 := peek8(bs1.data + i * 8);
+    var b: int64 := peek8(bs2.data + i * 8);
+    if (a == 1 || b == 1) {
+      poke8(result.data + i * 8, 1);
+    end else {
+      poke8(result.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// NOT boolean series
+pub fn BoolSeriesNot(bs: BoolSeries): BoolSeries {
+  var result: BoolSeries;
+  result.data := mmap(0, bs.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  result.length := bs.length;
+  result.name := bs.name;
+  var i: int64 := 0;
+  while (i < bs.length) {
+    if (peek8(bs.data + i * 8) == 0) {
+      poke8(result.data + i * 8, 1);
+    end else {
+      poke8(result.data + i * 8, 0);
+    end;
+    i := i + 1;
+  end;
+  return result;
+}
+
+// Boolean indexing: filter DataFrame by boolean series
+pub fn DataFrameFilterByMask(df: DataFrame, mask: BoolSeries): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var srcS: Series;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows where mask is 1
+  i := 0;
+  while (i < df.rowCount) {
+    if (peek8(mask.data + i * 8) == 1) {
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      j := 0;
+      while (j < df.colCount) {
+        srcS := peek8(df.columns + j * 16 + 8);
+        DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+        j := j + 1;
+      end;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// Count true values in boolean series
+pub fn BoolSeriesCount(bs: BoolSeries): int64 {
+  var count: int64 := 0;
+  var i: int64 := 0;
+  while (i < bs.length) {
+    if (peek8(bs.data + i * 8) == 1) {
+      count := count + 1;
+    end;
+    i := i + 1;
+  end;
+  return count;
+}
+
+// Check if any value is true
+pub fn BoolSeriesAny(bs: BoolSeries): int64 {
+  var i: int64 := 0;
+  while (i < bs.length) {
+    if (peek8(bs.data + i * 8) == 1) { return 1; }
+    i := i + 1;
+  end;
+  return 0;
+}
+
+// Check if all values are true
+pub fn BoolSeriesAll(bs: BoolSeries): int64 {
+  var i: int64 := 0;
+  while (i < bs.length) {
+    if (peek8(bs.data + i * 8) == 0) { return 0; }
+    i := i + 1;
+  end;
+  return 1;
+}
+
+// Get string label at index
+pub fn SeriesGetLabelString(s: Series, idx: int64): int64 {
+  if (s.labels == 0 || idx < 0 || idx >= s.length) {
+    return 0;
+  }
+  return peek8(s.labels + idx * 8);
+}
+
+// Set index labels for DataFrame
+// labels: array of pchar pointers
+// name: index name
+pub fn DataFrameSetIndex(df: DataFrame, labels: int64, name: int64) {
+  df.index := labels;
+  df.indexName := name;
+  df.hasIndex := 1;
+}
+
+// Set index from column values (set_index)
+// colName: column whose values become the index
+// The column is NOT removed from the DataFrame
+pub fn DataFrameSetIndexFromColumn(df: DataFrame, colName: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  if (s.data == 0) {
+    return;
+  }
+  
+  // Allocate index labels array
+  df.index := mmap(0, df.rowCount * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (df.index == 0) {
+    return;
+  }
+  
+  // Copy column values as index labels
+  if (s.colType == COL_STRING) {
+    // Copy string pointers
+    while (i < df.rowCount) {
+      poke8(df.index + i * 8, SeriesGetString(s, i));
+      i := i + 1;
+    end;
+  } else {
+    // Convert int values to string labels
+    while (i < df.rowCount) {
+      var val: int64 := SeriesGetInt(s, i);
+      var label: int64 := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var pos: int64 := 0;
+      var num: int64 := val;
+      var isNeg: int64 := 0;
+      
+      if (num < 0) {
+        isNeg := 1;
+        num := -num;
+      }
+      
+      if (num == 0) {
+        poke8(label, 48);
+        pos := 1;
+      } else {
+        var tmp: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+        var tmpPos: int64 := 0;
+        while (num > 0) {
+          poke8(tmp + tmpPos, 48 + (num - (num / 10) * 10));
+          tmpPos := tmpPos + 1;
+          num := num / 10;
+        end;
+        while (tmpPos > 0) {
+          tmpPos := tmpPos - 1;
+          poke8(label + pos, peek8(tmp + tmpPos));
+          pos := pos + 1;
+        end;
+        munmap(tmp, 16);
+      end;
+      
+      poke8(label + pos, 0);
+      poke8(df.index + i * 8, label);
+      i := i + 1;
+    end;
+  }
+  
+  df.indexName := colName;
+  df.hasIndex := 1;
+}
+
+// Reset index to numeric (0, 1, 2, ...)
+pub fn DataFrameResetIndex(df: DataFrame) {
+  var i: int64 := 0;
+  
+  // Free old index labels
+  if (df.index != 0) {
+    munmap(df.index, df.rowCount * 8);
+    df.index := 0;
+  end;
+  
+  df.indexName := 0;
+  df.hasIndex := 0;
+}
+
+// Get index label at row
+pub fn DataFrameGetIndexLabel(df: DataFrame, row: int64): int64 {
+  if (df.hasIndex == 0 || df.index == 0 || row < 0 || row >= df.rowCount) {
+    return 0;
+  }
+  return peek8(df.index + row * 8);
+}
+
+// Set index label at row
+pub fn DataFrameSetIndexLabel(df: DataFrame, row: int64, label: int64) {
+  if (df.hasIndex == 1 && df.index != 0 && row >= 0 && row < df.rowCount) {
+    poke8(df.index + row * 8, label);
+  }
+}
+
+// Get index name
+pub fn DataFrameGetIndexName(df: DataFrame): int64 {
+  return df.indexName;
+}
+
+// Has index?
+pub fn DataFrameHasIndex(df: DataFrame): int64 {
+  return df.hasIndex;
+}
+
+// Find row by index label
+pub fn DataFrameIndexLookup(df: DataFrame, label: int64): int64 {
+  if (df.hasIndex == 0 || df.index == 0) {
+    return -1;
+  }
+  
+  var i: int64 := 0;
+  while (i < df.rowCount) {
+    var idx: int64 := peek8(df.index + i * 8);
+    // Compare strings
+    var match: int64 := 1;
+    var j: int64 := 0;
+    while (j < 256) {
+      var c1: int64 := peek8(idx + j);
+      var c2: int64 := peek8(label + j);
+      if (c1 != c2) {
+        match := 0;
+        break;
+      end;
+      if (c1 == 0) { break; }
+      j := j + 1;
+    end;
+    if (match == 1) {
+      return i;
+    end;
+    i := i + 1;
+  end;
+  
+  return -1;
+}
+
+// Get value by index label
+pub fn DataFrameGetIntByLabel(df: DataFrame, colName: int64, label: int64): int64 {
+  var row: int64 := DataFrameIndexLookup(df, label);
+  if (row < 0) {
+    return 0;
+  end;
+  return DataFrameGetInt(df, colName, row);
+}
+
+// Set value by index label
+pub fn DataFrameSetIntByLabel(df: DataFrame, colName: int64, label: int64, value: int64) {
+  var row: int64 := DataFrameIndexLookup(df, label);
+  if (row >= 0) {
+    DataFrameSetInt(df, colName, row, value);
+  end;
+}
+  
+  // Create index array [0, 1, 2, ...]
+  indices := mmap(0, df.rowCount * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  i := 0;
+  while (i < df.rowCount) {
+    poke8(indices + i * 8, i);
+    i := i + 1;
+  }
+  
+  // Insertion sort on indices
+  i := 1;
+  while (i < df.rowCount) {
+    key := SeriesGetInt(s, peek8(indices + i * 8));
+    keyIdx := peek8(indices + i * 8);
+    j := i - 1;
+    while (j >= 0 && SeriesGetInt(s, peek8(indices + j * 8)) > key) {
+      poke8(indices + (j + 1) * 8, peek8(indices + j * 8));
+      j := j - 1;
+    end;
+    poke8(indices + (j + 1) * 8, keyIdx);
+    i := i + 1;
+  end;
+  
+  // Copy rows in sorted order
+  i := 0;
+  while (i < df.rowCount) {
+    DataFrameAppendRow(result);
+    var srcIdx: int64 := peek8(indices + i * 8);
+    j := 0;
+    while (j < df.colCount) {
+      srcS := peek8(df.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, SeriesGetInt(srcS, srcIdx));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  munmap(indices, df.rowCount * 8);
+  return result;
+}
+
+// Sort descending
+pub fn DataFrameSortByDesc(df: DataFrame, colName: int64): DataFrame {
+  var sorted: DataFrame := DataFrameSortBy(df, colName);
+  return DataFrameReverse(sorted);
+}
+
+// ============================================================================
+// Head / Tail / Shape
+// ============================================================================
+
+// Head: first N rows
+pub fn DataFrameHead(df: DataFrame, n: int64): DataFrame {
+  if (n > df.rowCount) { n := df.rowCount; }
+  return DataFrameSlice(df, 0, n);
+}
+
+// Tail: last N rows
+pub fn DataFrameTail(df: DataFrame, n: int64): DataFrame {
+  var start: int64 := df.rowCount - n;
+  if (start < 0) { start := 0; }
+  return DataFrameSlice(df, start, df.rowCount);
+}
+
+// Shape: return (rows, cols) - prints to stdout
+pub fn DataFrameShape(df: DataFrame) {
+  PrintStr("(");
+  PrintInt(df.rowCount);
+  PrintStr(", ");
+  PrintInt(df.colCount);
+  PrintStr(")");
+}
+
+// Info: print DataFrame summary
+pub fn DataFrameInfo(df: DataFrame) {
+  var i: int64 := 0;
+  var s: Series;
+  
+  PrintStr("DataFrame: ");
+  DataFrameShape(df);
+  PrintStr("\n\n");
+  
+  PrintStr("Columns:\n");
+  while (i < df.colCount) {
+    var name: int64 := peek8(df.columns + i * 16);
+    s := peek8(df.columns + i * 16 + 8);
+    PrintStr("  ");
+    if (name != 0) { PrintStr(name); }
+    PrintStr(" (");
+    if (s.colType == COL_INT64) { PrintStr("int64"); }
+    else if (s.colType == COL_FLOAT) { PrintStr("float64"); }
+    else if (s.colType == COL_STRING) { PrintStr("string"); }
+    else if (s.colType == COL_BOOL) { PrintStr("bool"); }
+    PrintStr(")\n");
+    i := i + 1;
+  end;
+}
+
+// ============================================================================
+// Concat (Append DataFrames)
+// ============================================================================
+
+// Concat: append rows from right to left
+// Columns must match
+pub fn DataFrameConcat(left: DataFrame, right: DataFrame): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var srcS: Series;
+  var srcName: int64;
+  
+  // Add all columns from left
+  j := 0;
+  while (j < left.colCount) {
+    DataFrameAddColumn(result, peek8(left.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows from left
+  i := 0;
+  while (i < left.rowCount) {
+    DataFrameAppendRow(result);
+    j := 0;
+    while (j < left.colCount) {
+      srcS := peek8(left.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), i, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  // Append rows from right
+  i := 0;
+  while (i < right.rowCount) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    j := 0;
+    while (j < right.colCount) {
+      srcS := peek8(right.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Replace / Map / Clip
+// ============================================================================
+
+// Replace value in column
+pub fn DataFrameReplace(df: DataFrame, colName: int64, oldVal: int64, newVal: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) == oldVal) {
+      SeriesSetInt(s, i, newVal);
+    }
+    i := i + 1;
+  end;
+}
+
+// Replace value in all columns
+pub fn DataFrameReplaceAll(df: DataFrame, oldVal: int64, newVal: int64) {
+  var j: int64 := 0;
+  while (j < df.colCount) {
+    var s: Series := peek8(df.columns + j * 16 + 8);
+    var i: int64 := 0;
+    while (i < s.length) {
+      if (SeriesGetInt(s, i) == oldVal) {
+        SeriesSetInt(s, i, newVal);
+      end;
+      i := i + 1;
+    end;
+    j := j + 1;
+  end;
+}
+
+// Map: apply function to column (simplified: multiply by factor)
+pub fn DataFrameMapMul(df: DataFrame, colName: int64, factor: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    SeriesSetInt(s, i, SeriesGetInt(s, i) * factor);
+    i := i + 1;
+  end;
+}
+
+// Map: add constant to column
+pub fn DataFrameMapAdd(df: DataFrame, colName: int64, offset: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  while (i < s.length) {
+    SeriesSetInt(s, i, SeriesGetInt(s, i) + offset);
+    i := i + 1;
+  end;
+}
+
+// Clip: clamp values to [min, max]
+pub fn DataFrameClip(df: DataFrame, colName: int64, minValue: int64, maxValue: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  var val: int64;
+  
+  while (i < s.length) {
+    val := SeriesGetInt(s, i);
+    if (val < minValue) {
+      SeriesSetInt(s, i, minValue);
+    } else if (val > maxValue) {
+      SeriesSetInt(s, i, maxValue);
+    end;
+    i := i + 1;
+  end;
+}
+
+// ============================================================================
+// Duplicated / DropDuplicates
+// ============================================================================
+
+// Check if row is duplicated (based on all columns)
+// Returns 1 if same row exists before this index
+pub fn SeriesIsDuplicated(s: Series, idx: int64): int64 {
+  var i: int64 := 0;
+  var val: int64 := SeriesGetInt(s, idx);
+  
+  while (i < idx) {
+    if (SeriesGetInt(s, i) == val) {
+      return 1;
+    }
+    i := i + 1;
+  end;
+  
+  return 0;
+}
+
+// Drop duplicates (keep first occurrence)
+pub fn DataFrameDropDuplicates(df: DataFrame, colName: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(df, colName);
+  var seen: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var seenCount: int64 := 0;
+  var i: int64;
+  var j: int64;
+  var val: int64;
+  var found: int64;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy unique rows
+  i := 0;
+  while (i < df.rowCount) {
+    val := SeriesGetInt(s, i);
+    found := 0;
+    j := 0;
+    while (j < seenCount) {
+      if (peek8(seen + j * 8) == val) {
+        found := 1;
+        break;
+      end;
+      j := j + 1;
+    end;
+    
+    if (found == 0) {
+      // Keep this row
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      j := 0;
+      while (j < df.colCount) {
+        var srcS: Series := peek8(df.columns + j * 16 + 8);
+        DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+        j := j + 1;
+      end;
+      
+      poke8(seen + seenCount * 8, val);
+      seenCount := seenCount + 1;
+    end;
+    
+    i := i + 1;
+  end;
+  
+  munmap(seen, 1024 * 8);
+  return result;
+}
+
+// ============================================================================
+// Shift / Diff / CumSum / CumProd
+// ============================================================================
+
+// Shift: shift values by N positions (positive = down, negative = up)
+// Returns new Series
+pub fn SeriesShift(s: Series, n: int64): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    var srcIdx: int64 := i - n;
+    if (srcIdx >= 0 && srcIdx < s.length) {
+      SeriesSetInt(result, i, SeriesGetInt(s, srcIdx));
+    end else {
+      SeriesSetInt(result, i, 0);  // NA
+    }
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// Diff: difference between consecutive elements
+pub fn SeriesDiff(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 1;
+  
+  result.length := s.length;
+  SeriesSetInt(result, 0, 0);  // First is NA
+  
+  while (i < s.length) {
+    SeriesSetInt(result, i, SeriesGetInt(s, i) - SeriesGetInt(s, i - 1));
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumSum: cumulative sum
+pub fn SeriesCumSum(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var sum: int64 := 0;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    sum := sum + SeriesGetInt(s, i);
+    SeriesSetInt(result, i, sum);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumProd: cumulative product
+pub fn SeriesCumProd(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var prod: int64 := 1;
+  
+  result.length := s.length;
+  
+  while (i < s.length) {
+    prod := prod * SeriesGetInt(s, i);
+    SeriesSetInt(result, i, prod);
+    i := i + 1;
+  end;
+  
+  return result;
+}
+
+// CumMax: cumulative maximum
+pub fn SeriesCumMax(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var mx: int64;
+  
+  result.length := s.length;
+  
+  if (s.length > 0) {
+    mx := SeriesGetInt(s, 0);
+    SeriesSetInt(result, 0, mx);
+    i := 1;
+    while (i < s.length) {
+      var val: int64 := SeriesGetInt(s, i);
+      if (val > mx) {
+        mx := val;
+      end;
+      SeriesSetInt(result, i, mx);
+      i := i + 1;
+    end;
+  end;
+  
+  return result;
+}
+
+// CumMin: cumulative minimum
+pub fn SeriesCumMin(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var i: int64 := 0;
+  var mn: int64;
+  
+  result.length := s.length;
+  
+  if (s.length > 0) {
+    mn := SeriesGetInt(s, 0);
+    SeriesSetInt(result, 0, mn);
+    i := 1;
+    while (i < s.length) {
+      var val: int64 := SeriesGetInt(s, i);
+      if (val < mn) {
+        mn := val;
+      end;
+      SeriesSetInt(result, i, mn);
+      i := i + 1;
+    end;
+  end;
+  
+  return result;
+}
+
+// ============================================================================
+// Rank
+// ============================================================================
+
+// Rank: assign ranks to values (ascending)
+// Returns new Series with rank of each element
+pub fn SeriesRank(s: Series): Series {
+  var result: Series := SeriesNewInt64(s.name, s.length);
+  var sorted: int64 := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var indices: int64 := mmap(0, s.length * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64;
+  var j: int64;
+  var key: int64;
+  var keyIdx: int64;
+  
+  result.length := s.length;
+  
+  // Copy values
+  i := 0;
+  while (i < s.length) {
+    poke8(sorted + i * 8, SeriesGetInt(s, i));
+    poke8(indices + i * 8, i);
+    i := i + 1;
+  end;
+  
+  // Sort indices by value
+  i := 1;
+  while (i < s.length) {
+    key := peek8(sorted + i * 8);
+    keyIdx := peek8(indices + i * 8);
+    j := i - 1;
+    while (j >= 0 && peek8(sorted + j * 8) > key) {
+      poke8(sorted + (j + 1) * 8, peek8(sorted + j * 8));
+      poke8(indices + (j + 1) * 8, peek8(indices + j * 8));
+      j := j - 1;
+    end;
+    poke8(sorted + (j + 1) * 8, key);
+    poke8(indices + (j + 1) * 8, keyIdx);
+    i := i + 1;
+  end;
+  
+  // Assign ranks
+  i := 0;
+  while (i < s.length) {
+    var idx: int64 := peek8(indices + i * 8);
+    SeriesSetInt(result, idx, i + 1);
+    i := i + 1;
+  end;
+  
+  munmap(sorted, s.length * 8);
+  munmap(indices, s.length * 8);
+  
+  return result;
+}
+
+// ============================================================================
+// Median (enhanced)
+// ============================================================================
+
+// Median for sorted array
+pub fn SeriesMedian(s: Series): int64 {
+  var sorted: DataFrame := DataFrameNew();
+  DataFrameAddColumn(sorted, "val", COL_INT64);
+  var i: int64 := 0;
+  while (i < s.length) {
+    DataFrameAppendRow(sorted);
+    DataFrameSetInt(sorted, "val", i, SeriesGetInt(s, i));
+    i := i + 1;
+  end;
+  
+  var sortedS: Series := DataFrameGetSeries(sorted, "val");
+  // Sort in-place
+  i := 1;
+  while (i < sortedS.length) {
+    var key: int64 := SeriesGetInt(sortedS, i);
+    var j: int64 := i - 1;
+    while (j >= 0 && SeriesGetInt(sortedS, j) > key) {
+      SeriesSetInt(sortedS, j + 1, SeriesGetInt(sortedS, j));
+      j := j - 1;
+    end;
+    SeriesSetInt(sortedS, j + 1, key);
+    i := i + 1;
+  end;
+  
+  var mid: int64 := s.length / 2;
+  var result: int64 := SeriesGetInt(sortedS, mid);
+  
+  return result;
+}
+
+// ============================================================================
+// DataFrame Reverse
+// ============================================================================
+
+// Reverse row order
+pub fn DataFrameReverse(df: DataFrame): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var srcS: Series;
+  
+  // Add all columns
+  j := 0;
+  while (j < df.colCount) {
+    DataFrameAddColumn(result, peek8(df.columns + j * 16), COL_INT64);
+    j := j + 1;
+  end;
+  
+  // Copy rows in reverse
+  i := df.rowCount - 1;
+  while (i >= 0) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    j := 0;
+    while (j < df.colCount) {
+      srcS := peek8(df.columns + j * 16 + 8);
+      DataFrameSetInt(result, peek8(result.columns + j * 16), newRow, SeriesGetInt(srcS, i));
+      j := j + 1;
+    end;
+    i := i - 1;
+  end;
+  
+  return result;
+}
+
+  
+  srcSeries := peek8(df.columns + colIdx * 16 + 8);
+  
+  // Copy matching rows
+  while (i < df.rowCount) {
+    val := SeriesGetInt(srcSeries, i);
+    if (CompareInt(val, op, value) == 1) {
+      // Copy all columns for this row
+      DataFrameAppendRow(result);
+      j := 0;
+      while (j < df.colCount) {
+        var dstS: Series := peek8(result.columns + j * 16 + 8);
+        var srcS2: Series := peek8(df.columns + j * 16 + 8);
+        if (srcS2.colType == COL_STRING) {
+          SeriesSetString(dstS, result.rowCount - 1, SeriesGetString(srcS2, i));
+        } else {
+          SeriesSetInt(dstS, result.rowCount - 1, SeriesGetInt(srcS2, i));
+        }
+        j := j + 1;
+      }
+    }
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// Slice DataFrame by row range [start, end)
+pub fn DataFrameSlice(df: DataFrame, start: int64, endRow: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64 := start;
+  var j: int64 := 0;
+  
+  if (endRow > df.rowCount) {
+    endRow := df.rowCount;
+  }
+  
+  // Add all columns
+  while (j < df.colCount) {
+    var name: int64 := peek8(df.columns + j * 16);
+    var srcS: Series := peek8(df.columns + j * 16 + 8);
+    DataFrameAddColumn(result, name, srcS.colType);
+    j := j + 1;
+  }
+  
+  // Copy rows
+  while (i < endRow) {
+    DataFrameAppendRow(result);
+    j := 0;
+    while (j < df.colCount) {
+      var dstS: Series := peek8(result.columns + j * 16 + 8);
+      var srcS2: Series := peek8(df.columns + j * 16 + 8);
+      if (srcS2.colType == COL_STRING) {
+        SeriesSetString(dstS, result.rowCount - 1, SeriesGetString(srcS2, i));
+      } else {
+        SeriesSetInt(dstS, result.rowCount - 1, SeriesGetInt(srcS2, i));
+      }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// ============================================================================
+// Column Operations
+// ============================================================================
+
+// Drop column by name
+pub fn DataFrameDropColumn(df: DataFrame, name: int64) {
+  var colIdx: int64 := DataFrameColIndex(df, name);
+  var i: int64;
+  var srcSeries: Series;
+  
+  if (colIdx < 0) {
+    return;
+  }
+  
+  // Free series
+  srcSeries := peek8(df.columns + colIdx * 16 + 8);
+  if (srcSeries.data != 0) {
+    munmap(srcSeries.data, srcSeries.length * 8);
+  }
+  
+  // Shift columns left
+  i := colIdx;
+  while (i < df.colCount - 1) {
+    poke8(df.columns + i * 16, peek8(df.columns + (i + 1) * 16));
+    poke8(df.columns + i * 16 + 8, peek8(df.columns + (i + 1) * 16 + 8));
+    i := i + 1;
+  }
+  
+  df.colCount := df.colCount - 1;
+}
+
+// Rename column
+pub fn DataFrameRenameColumn(df: DataFrame, oldName: int64, newName: int64) {
+  var colIdx: int64 := DataFrameColIndex(df, oldName);
+  if (colIdx >= 0) {
+    poke8(df.columns + colIdx * 16, newName);
+  }
+}
+
+// ============================================================================
+// GroupBy
+// ============================================================================
+
+// GroupBy result
+pub type GroupByResult = struct {
+  df: DataFrame;        // Original DataFrame
+  keyCol: int64;        // Pointer to key column name
+  groups: int64;        // Pointer to group values (int64 array)
+  groupRows: int64;     // Pointer to row indices per group (array of arrays)
+  groupCount: int64;    // Number of groups
+};
+
+// GroupBy: group rows by column value
+pub fn DataFrameGroupBy(df: DataFrame, keyCol: int64): GroupByResult {
+  var gb: GroupByResult;
+  var s: Series := DataFrameGetSeries(df, keyCol);
+  var i: int64 := 0;
+  var val: int64;
+  var groupIdx: int64;
+  var found: int64;
+  
+  gb.df := df;
+  gb.keyCol := keyCol;
+  gb.groups := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  gb.groupRows := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  gb.groupCount := 0;
+  
+  // Find unique values
+  while (i < df.rowCount) {
+    val := SeriesGetInt(s, i);
+    found := 0;
+    groupIdx := 0;
+    while (groupIdx < gb.groupCount) {
+      if (peek8(gb.groups + groupIdx * 8) == val) {
+        found := 1;
+        break;
+      }
+      groupIdx := groupIdx + 1;
+    }
+    
+    if (found == 0) {
+      poke8(gb.groups + gb.groupCount * 8, val);
+      // Create row index array for this group
+      var rows: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      poke8(rows, i);  // First row
+      poke8(gb.groupRows + gb.groupCount * 8, rows);
+      poke8(rows - 8, 1);  // Row count at offset -8
+      gb.groupCount := gb.groupCount + 1;
+    } else {
+      // Add row to existing group
+      var rows: int64 := peek8(gb.groupRows + groupIdx * 8);
+      var count: int64 := peek8(rows - 8);
+      poke8(rows + count * 8, i);
+      poke8(rows - 8, count + 1);
+    }
+    
+    i := i + 1;
+  }
+  
+  return gb;
+}
+
+// GroupBy aggregation: sum
+pub fn GroupBySum(gb: GroupByResult, aggCol: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var s: Series := DataFrameGetSeries(gb.df, aggCol);
+  var keyS: Series := DataFrameGetSeries(gb.df, gb.keyCol);
+  var i: int64 := 0;
+  var j: int64;
+  var rows: int64;
+  var count: int64;
+  var sum: int64;
+  var val: int64;
+  
+  DataFrameAddColumn(result, gb.keyCol, keyS.colType);
+  DataFrameAddColumn(result, aggCol, COL_INT64);
+  
+  while (i < gb.groupCount) {
+    DataFrameAppendRow(result);
+    
+    // Set key value
+    rows := peek8(gb.groupRows + i * 8);
+    val := SeriesGetInt(keyS, peek8(rows));
+    DataFrameSetInt(result, gb.keyCol, i, val);
+    
+    // Sum aggregation
+    count := peek8(rows - 8);
+    sum := 0;
+    j := 0;
+    while (j < count) {
+      sum := sum + SeriesGetInt(s, peek8(rows + j * 8));
+      j := j + 1;
+    }
+    DataFrameSetInt(result, aggCol, i, sum);
+    
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// GroupBy aggregation: count
+pub fn GroupByCount(gb: GroupByResult): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var keyS: Series := DataFrameGetSeries(gb.df, gb.keyCol);
+  var i: int64 := 0;
+  var rows: int64;
+  var count: int64;
+  var val: int64;
+  
+  DataFrameAddColumn(result, gb.keyCol, keyS.colType);
+  DataFrameAddColumn(result, "count", COL_INT64);
+  
+  while (i < gb.groupCount) {
+    DataFrameAppendRow(result);
+    rows := peek8(gb.groupRows + i * 8);
+    count := peek8(rows - 8);
+    
+    val := SeriesGetInt(keyS, peek8(rows));
+    DataFrameSetInt(result, gb.keyCol, i, val);
+    DataFrameSetInt(result, "count", i, count);
+    
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// ============================================================================
+// Missing Values
+// ============================================================================
+
+// Check if value is NA (0 for int, NULL for string)
+pub fn IsNA(value: int64, colType: int64): bool {
+  if (colType == COL_STRING) {
+    return value == 0;
+  }
+  return value == 0;
+}
+
+// Fill NA values with default
+pub fn DataFrameFillNA(df: DataFrame, colName: int64, defaultValue: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  var i: int64 := 0;
+  
+  if (s.data == 0) {
+    return;
+  }
+  
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) == 0) {
+      SeriesSetInt(s, i, defaultValue);
+    }
+    i := i + 1;
+  }
+}
+
+// Drop rows with NA in specific column
+pub fn DataFrameDropNA(df: DataFrame, colName: int64): DataFrame {
+  return DataFrameFilter(df, colName, OP_NE, 0);
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+// Sum of column
+pub fn SeriesSum(s: Series): int64 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  while (i < s.length) {
+    sum := sum + SeriesGetInt(s, i);
+    i := i + 1;
+  }
+  return sum;
+}
+
+// Mean of column
+pub fn SeriesMean(s: Series): int64 {
+  if (s.length == 0) {
+    return 0;
+  }
+  return SeriesSum(s) / s.length;
+}
+
+// Min of column
+pub fn SeriesMin(s: Series): int64 {
+  var i: int64 := 1;
+  var mn: int64;
+  
+  if (s.length == 0) {
+    return 0;
+  }
+  
+  mn := SeriesGetInt(s, 0);
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val < mn) {
+      mn := val;
+    }
+    i := i + 1;
+  }
+  return mn;
+}
+
+// Max of column
+pub fn SeriesMax(s: Series): int64 {
+  var i: int64 := 1;
+  var mx: int64;
+  
+  if (s.length == 0) {
+    return 0;
+  }
+  
+  mx := SeriesGetInt(s, 0);
+  while (i < s.length) {
+    var val: int64 := SeriesGetInt(s, i);
+    if (val > mx) {
+      mx := val;
+    }
+    i := i + 1;
+  }
+  return mx;
+}
+
+// Count non-zero values
+pub fn SeriesCount(s: Series): int64 {
+  var count: int64 := 0;
+  var i: int64 := 0;
+  while (i < s.length) {
+    if (SeriesGetInt(s, i) != 0) {
+      count := count + 1;
+    }
+    i := i + 1;
+  }
+  return count;
+}
+
+// Value counts (frequency of each value)
+pub fn SeriesValueCounts(s: Series): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var values: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var counts: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var uniqueCount: int64 := 0;
+  var i: int64 := 0;
+  var j: int64;
+  var val: int64;
+  var found: int64;
+  
+  // Count occurrences
+  while (i < s.length) {
+    val := SeriesGetInt(s, i);
+    found := 0;
+    j := 0;
+    while (j < uniqueCount) {
+      if (peek8(values + j * 8) == val) {
+        var c: int64 := peek8(counts + j * 8);
+        poke8(counts + j * 8, c + 1);
+        found := 1;
+        break;
+      }
+      j := j + 1;
+    }
+    if (found == 0) {
+      poke8(values + uniqueCount * 8, val);
+      poke8(counts + uniqueCount * 8, 1);
+      uniqueCount := uniqueCount + 1;
+    }
+    i := i + 1;
+  }
+  
+  // Build result DataFrame
+  DataFrameAddColumn(result, "value", COL_INT64);
+  DataFrameAddColumn(result, "count", COL_INT64);
+  
+  i := 0;
+  while (i < uniqueCount) {
+    DataFrameAppendRow(result);
+    DataFrameSetInt(result, "value", i, peek8(values + i * 8));
+    DataFrameSetInt(result, "count", i, peek8(counts + i * 8));
+    i := i + 1;
+  }
+  
+  munmap(values, 1024 * 8);
+  munmap(counts, 1024 * 8);
+  
+  return result;
+}
+
+// ============================================================================
+// Print/Display
+// ============================================================================
+
+// Print DataFrame to stdout
+pub fn DataFramePrint(df: DataFrame) {
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var s: Series;
+  var val: int64;
+  
+  // Print column names
+  PrintStr("| ");
+  j := 0;
+  while (j < df.colCount) {
+    var name: int64 := peek8(df.columns + j * 16);
+    if (name != 0) {
+      PrintStr(name);
+    } else {
+      PrintStr("(unnamed)");
+    }
+    PrintStr(" | ");
+    j := j + 1;
+  }
+  PrintStr("\n");
+  
+  // Print separator
+  PrintStr("|");
+  j := 0;
+  while (j < df.colCount) {
+    PrintStr("--------|");
+    j := j + 1;
+  }
+  PrintStr("\n");
+  
+  // Print rows
+  i := 0;
+  while (i < df.rowCount) {
+    PrintStr("| ");
+    j := 0;
+    while (j < df.colCount) {
+      s := peek8(df.columns + j * 16 + 8);
+      if (s.colType == COL_STRING) {
+        var str: int64 := SeriesGetString(s, i);
+        if (str != 0) {
+          PrintStr(str);
+        } else {
+          PrintStr("NULL");
+        }
+      } else {
+        val := SeriesGetInt(s, i);
+        PrintInt(val);
+      }
+      PrintStr(" | ");
+      j := j + 1;
+    }
+    PrintStr("\n");
+    i := i + 1;
+  }
+  
+  PrintStr("\n[");
+  PrintInt(df.rowCount);
+  PrintStr(" rows x ");
+  PrintInt(df.colCount);
+  PrintStr(" columns]\n");
+}
+
+// ============================================================================
+// Float Support (f64 columns)
+// ============================================================================
+
+// Float data stored as int64 bit pattern (reinterpretation)
+// f64 value stored as int64 bits in the series
+
+// Set float value (stored as int64 bits)
+pub fn DataFrameSetFloat(df: DataFrame, colName: int64, row: int64, value: int64) {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data != 0) {
+    SeriesSetInt(s, row, value);
+  }
+}
+
+// Get float value (as int64 bits)
+pub fn DataFrameGetFloat(df: DataFrame, colName: int64, row: int64): int64 {
+  var s: Series := DataFrameGetSeries(df, colName);
+  if (s.data == 0) {
+    return 0;
+  }
+  return SeriesGetInt(s, row);
+}
+
+// Float series sum (using int64 representation)
+// Note: This is approximate for small values
+pub fn SeriesSumFloat(s: Series): int64 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  while (i < s.length) {
+    sum := sum + SeriesGetInt(s, i);
+    i := i + 1;
+  }
+  return sum;
+}
+
+// Float series mean
+pub fn SeriesMeanFloat(s: Series): int64 {
+  if (s.length == 0) {
+    return 0;
+  }
+  return SeriesSumFloat(s) / s.length;
+}
+
+// ============================================================================
+// Join/Merge
+// ============================================================================
+
+// Inner join two DataFrames on key columns
+// Returns rows where key values match in both DataFrames
+pub fn DataFrameJoinInner(left: DataFrame, leftKey: int64, right: DataFrame, rightKey: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var leftS: Series := DataFrameGetSeries(left, leftKey);
+  var rightS: Series := DataFrameGetSeries(right, rightKey);
+  var i: int64;
+  var j: int64;
+  var leftVal: int64;
+  var rightVal: int64;
+  var col: int64;
+  var s: Series;
+  var prefix: int64;
+  
+  // Add all columns from left with "left_" prefix
+  i := 0;
+  while (i < left.colCount) {
+    var name: int64 := peek8(left.columns + i * 16);
+    DataFrameAddColumn(result, name, COL_INT64);
+    i := i + 1;
+  }
+  
+  // Add all columns from right with "right_" prefix (skip key column)
+  i := 0;
+  while (i < right.colCount) {
+    var name: int64 := peek8(right.columns + i * 16);
+    if (name != rightKey) {
+      DataFrameAddColumn(result, name, COL_INT64);
+    }
+    i := i + 1;
+  }
+  
+  // Find matching rows
+  i := 0;
+  while (i < left.rowCount) {
+    leftVal := SeriesGetInt(leftS, i);
+    
+    j := 0;
+    while (j < right.rowCount) {
+      rightVal := SeriesGetInt(rightS, j);
+      
+      if (leftVal == rightVal) {
+        // Match found - add row
+        DataFrameAppendRow(result);
+        var newRow: int64 := result.rowCount - 1;
+        
+        // Copy left columns
+        col := 0;
+        while (col < left.colCount) {
+          s := peek8(left.columns + col * 16 + 8);
+          DataFrameSetInt(result, peek8(left.columns + col * 16), newRow, SeriesGetInt(s, i));
+          col := col + 1;
+        }
+        
+        // Copy right columns (skip key)
+        col := 0;
+        while (col < right.colCount) {
+          var name: int64 := peek8(right.columns + col * 16);
+          if (name != rightKey) {
+            s := peek8(right.columns + col * 16 + 8);
+            DataFrameSetInt(result, name, newRow, SeriesGetInt(s, j));
+          }
+          col := col + 1;
+        }
+      }
+      
+      j := j + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// Left join: all rows from left, matching rows from right
+pub fn DataFrameJoinLeft(left: DataFrame, leftKey: int64, right: DataFrame, rightKey: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var leftS: Series := DataFrameGetSeries(left, leftKey);
+  var rightS: Series := DataFrameGetSeries(right, rightKey);
+  var i: int64;
+  var j: int64;
+  var leftVal: int64;
+  var rightVal: int64;
+  var col: int64;
+  var s: Series;
+  var found: int64;
+  
+  // Add all columns from left
+  i := 0;
+  while (i < left.colCount) {
+    DataFrameAddColumn(result, peek8(left.columns + i * 16), COL_INT64);
+    i := i + 1;
+  }
+  
+  // Add all columns from right (skip key)
+  i := 0;
+  while (i < right.colCount) {
+    var name: int64 := peek8(right.columns + i * 16);
+    if (name != rightKey) {
+      DataFrameAddColumn(result, name, COL_INT64);
+    }
+    i := i + 1;
+  }
+  
+  // All rows from left
+  i := 0;
+  while (i < left.rowCount) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    
+    // Copy left columns
+    col := 0;
+    while (col < left.colCount) {
+      s := peek8(left.columns + col * 16 + 8);
+      DataFrameSetInt(result, peek8(left.columns + col * 16), newRow, SeriesGetInt(s, i));
+      col := col + 1;
+    }
+    
+    // Try to find matching row in right
+    leftVal := SeriesGetInt(leftS, i);
+    found := 0;
+    j := 0;
+    while (j < right.rowCount) {
+      rightVal := SeriesGetInt(rightS, j);
+      if (leftVal == rightVal) {
+        // Copy right columns
+        col := 0;
+        while (col < right.colCount) {
+          var name: int64 := peek8(right.columns + col * 16);
+          if (name != rightKey) {
+            s := peek8(right.columns + col * 16 + 8);
+            DataFrameSetInt(result, name, newRow, SeriesGetInt(s, j));
+          }
+          col := col + 1;
+        end;
+        found := 1;
+        break;
+      }
+      j := j + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// ============================================================================
+// Pivot / Melt
+// ============================================================================
+
+// Pivot: convert long format to wide format
+// df: DataFrame in long format
+// indexCol: column to use as row index
+// pivotCol: column whose values become new column names
+// valueCol: column whose values fill the pivot table
+// Returns pivoted DataFrame
+pub fn DataFramePivot(df: DataFrame, indexCol: int64, pivotCol: int64, valueCol: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var indexS: Series := DataFrameGetSeries(df, indexCol);
+  var pivotS: Series := DataFrameGetSeries(df, pivotCol);
+  var valueS: Series := DataFrameGetSeries(df, valueCol);
+  
+  var uniqueIndices: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var uniquePivots: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var indexCount: int64 := 0;
+  var pivotCount: int64 := 0;
+  var i: int64;
+  var j: int64;
+  var found: int64;
+  
+  // Find unique index values
+  i := 0;
+  while (i < df.rowCount) {
+    var val: int64 := SeriesGetInt(indexS, i);
+    found := 0;
+    j := 0;
+    while (j < indexCount) {
+      if (peek8(uniqueIndices + j * 8) == val) {
+        found := 1;
+        break;
+      }
+      j := j + 1;
+    end;
+    if (found == 0) {
+      poke8(uniqueIndices + indexCount * 8, val);
+      indexCount := indexCount + 1;
+    }
+    i := i + 1;
+  }
+  
+  // Find unique pivot values
+  i := 0;
+  while (i < df.rowCount) {
+    var val: int64 := SeriesGetInt(pivotS, i);
+    found := 0;
+    j := 0;
+    while (j < pivotCount) {
+      if (peek8(uniquePivots + j * 8) == val) {
+        found := 1;
+        break;
+      }
+      j := j + 1;
+    end;
+    if (found == 0) {
+      poke8(uniquePivots + pivotCount * 8, val);
+      pivotCount := pivotCount + 1;
+    }
+    i := i + 1;
+  }
+  
+  // Add index column
+  DataFrameAddColumn(result, indexCol, COL_INT64);
+  
+  // Add pivot columns
+  j := 0;
+  while (j < pivotCount) {
+    // Create column name from pivot value
+    var colName: int64 := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var pivotVal: int64 := peek8(uniquePivots + j * 8);
+    var pos: int64 := 0;
+    var num: int64 := pivotVal;
+    if (num < 0) { num := -num; }
+    // Convert to string
+    var tmp: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var tmpPos: int64 := 0;
+    if (num == 0) {
+      poke8(tmp, 48);
+      tmpPos := 1;
+    } else {
+      while (num > 0) {
+        poke8(tmp + tmpPos, 48 + (num - (num / 10) * 10));
+        tmpPos := tmpPos + 1;
+        num := num / 10;
+      }
+    }
+    // Reverse
+    while (tmpPos > 0) {
+      tmpPos := tmpPos - 1;
+      poke8(colName + pos, peek8(tmp + tmpPos));
+      pos := pos + 1;
+    }
+    poke8(colName + pos, 0);
+    munmap(tmp, 16);
+    
+    DataFrameAddColumn(result, colName, COL_INT64);
+    j := j + 1;
+  }
+  
+  // Fill pivoted data
+  i := 0;
+  while (i < indexCount) {
+    DataFrameAppendRow(result);
+    DataFrameSetInt(result, indexCol, i, peek8(uniqueIndices + i * 8));
+    i := i + 1;
+  }
+  
+  // Fill values
+  var row: int64 := 0;
+  while (row < df.rowCount) {
+    var idxVal: int64 := SeriesGetInt(indexS, row);
+    var pivVal: int64 := SeriesGetInt(pivotS, row);
+    var valVal: int64 := SeriesGetInt(valueS, row);
+    
+    // Find row index
+    i := 0;
+    while (i < indexCount) {
+      if (peek8(uniqueIndices + i * 8) == idxVal) {
+        break;
+      }
+      i := i + 1;
+    }
+    
+    // Find column index
+    j := 0;
+    while (j < pivotCount) {
+      if (peek8(uniquePivots + j * 8) == pivVal) {
+        break;
+      }
+      j := j + 1;
+    end;
+    
+    // Set value (column 1 + j)
+    DataFrameSetInt(result, peek8(result.columns + (1 + j) * 16), i, valVal);
+    
+    row := row + 1;
+  }
+  
+  munmap(uniqueIndices, 1024 * 8);
+  munmap(uniquePivots, 1024 * 8);
+  
+  return result;
+}
+
+// Melt: convert wide format to long format (unpivot)
+// df: DataFrame in wide format
+// idCols: column(s) to keep as identifiers
+// valueCols: columns to melt into rows
+// Returns melted DataFrame with columns: idCols + "variable" + "value"
+pub fn DataFrameMelt(df: DataFrame, idCol: int64, valueColStart: int64, valueColEnd: int64): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64;
+  var j: int64;
+  var col: int64;
+  var idS: Series := DataFrameGetSeries(df, idCol);
+  var s: Series;
+  
+  // Add id column
+  DataFrameAddColumn(result, idCol, COL_INT64);
+  DataFrameAddColumn(result, "variable", COL_INT64);
+  DataFrameAddColumn(result, "value", COL_INT64);
+  
+  // For each row and each value column, create a row in result
+  i := 0;
+  while (i < df.rowCount) {
+    col := valueColStart;
+    while (col <= valueColEnd) {
+      DataFrameAppendRow(result);
+      var newRow: int64 := result.rowCount - 1;
+      
+      // Copy id value
+      DataFrameSetInt(result, idCol, newRow, SeriesGetInt(idS, i));
+      
+      // Set variable name (column index as int)
+      DataFrameSetInt(result, "variable", newRow, col);
+      
+      // Copy value
+      s := peek8(df.columns + col * 16 + 8);
+      DataFrameSetInt(result, "value", newRow, SeriesGetInt(s, i));
+      
+      col := col + 1;
+    end;
+    i := i + 1;
+  }
+  
+  return result;
+}
+
+// ============================================================================
+// Correlation / Covariance
+// ============================================================================
+
+// Pearson correlation between two series
+// Returns correlation coefficient * 1000 (for integer precision)
+pub fn SeriesCorr(s1: Series, s2: Series): int64 {
+  var n: int64 := s1.length;
+  var i: int64 := 0;
+  var sumX: int64 := 0;
+  var sumY: int64 := 0;
+  var sumXY: int64 := 0;
+  var sumX2: int64 := 0;
+  var sumY2: int64 := 0;
+  var x: int64;
+  var y: int64;
+  var num: int64;
+  var denX: int64;
+  var denY: int64;
+  var den: int64;
+  
+  if (n == 0 || s2.length != n) {
+    return 0;
+  }
+  
+  // Calculate sums
+  while (i < n) {
+    x := SeriesGetInt(s1, i);
+    y := SeriesGetInt(s2, i);
+    sumX := sumX + x;
+    sumY := sumY + y;
+    sumXY := sumXY + (x * y);
+    sumX2 := sumX2 + (x * x);
+    sumY2 := sumY2 + (y * y);
+    i := i + 1;
+  }
+  
+  // Pearson correlation: r = (n*Σxy - Σx*Σy) / sqrt((n*Σx² - (Σx)²) * (n*Σy² - (Σy)²))
+  num := n * sumXY - sumX * sumY;
+  denX := n * sumX2 - sumX * sumX;
+  denY := n * sumY2 - sumY * sumY;
+  
+  if (denX <= 0 || denY <= 0) {
+    return 0;
+  }
+  
+  // Integer square root approximation
+  var sqrtX: int64 := denX;
+  var sqrtY: int64 := denY;
+  var tmp: int64;
+  
+  // Newton's method for sqrt(denX)
+  tmp := (sqrtX + 1) / 2;
+  while (tmp < sqrtX) {
+    sqrtX := tmp;
+    tmp := (sqrtX + denX / sqrtX) / 2;
+  }
+  
+  // Newton's method for sqrt(denY)
+  tmp := (sqrtY + 1) / 2;
+  while (tmp < sqrtY) {
+    sqrtY := tmp;
+    tmp := (sqrtY + denY / sqrtY) / 2;
+  }
+  
+  den := sqrtX * sqrtY;
+  if (den == 0) {
+    return 0;
+  }
+  
+  // Return correlation * 1000
+  return (num * 1000) / den;
+}
+
+// Covariance between two series
+pub fn SeriesCov(s1: Series, s2: Series): int64 {
+  var n: int64 := s1.length;
+  var i: int64 := 0;
+  var meanX: int64 := SeriesMean(s1);
+  var meanY: int64 := SeriesMean(s2);
+  var sum: int64 := 0;
+  
+  if (n == 0 || s2.length != n) {
+    return 0;
+  }
+  
+  while (i < n) {
+    sum := sum + (SeriesGetInt(s1, i) - meanX) * (SeriesGetInt(s2, i) - meanY);
+    i := i + 1;
+  }
+  
+  return sum / n;
+}
+
+// Describe: summary statistics for a series
+// Returns DataFrame with: count, mean, std, min, max
+pub fn SeriesDescribe(s: Series): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var n: int64 := s.length;
+  var mean: int64 := SeriesMean(s);
+  var variance: int64;
+  var i: int64;
+  var diff: int64;
+  var sumSq: int64;
+  
+  DataFrameAddColumn(result, "stat", COL_STRING);
+  DataFrameAddColumn(result, "value", COL_INT64);
+  
+  // Count
+  DataFrameAppendRow(result);
+  DataFrameSetString(result, "stat", 0, "count");
+  DataFrameSetInt(result, "value", 0, n);
+  
+  // Mean
+  DataFrameAppendRow(result);
+  DataFrameSetString(result, "stat", 1, "mean");
+  DataFrameSetInt(result, "value", 1, mean);
+  
+  // Variance
+  sumSq := 0;
+  i := 0;
+  while (i < n) {
+    diff := SeriesGetInt(s, i) - mean;
+    sumSq := sumSq + (diff * diff);
+    i := i + 1;
+  end;
+  if (n > 0) {
+    variance := sumSq / n;
+  }
+  
+  // Std (approximate sqrt)
+  var std: int64 := variance;
+  if (std > 0) {
+    var tmp: int64 := (std + 1) / 2;
+    while (tmp < std) {
+      std := tmp;
+      tmp := (std + variance / std) / 2;
+    }
+  }
+  
+  DataFrameAppendRow(result);
+  DataFrameSetString(result, "stat", 2, "std");
+  DataFrameSetInt(result, "value", 2, std);
+  
+  // Min
+  DataFrameAppendRow(result);
+  DataFrameSetString(result, "stat", 3, "min");
+  DataFrameSetInt(result, "value", 3, SeriesMin(s));
+  
+  // Max
+  DataFrameAppendRow(result);
+  DataFrameSetString(result, "stat", 4, "max");
+  DataFrameSetInt(result, "value", 4, SeriesMax(s));
+  
+  return result;
+}
+
+// ============================================================================
+// Multi-Column GroupBy
+// ============================================================================
+
+// Multi-column GroupBy result
+pub type MultiGroupByResult = struct {
+  df: DataFrame;
+  keyCols: int64;       // Pointer to array of column name pointers
+  keyColCount: int64;
+  groups: int64;        // Pointer to group key values (2D array)
+  groupRows: int64;
+  groupCount: int64;
+};
+
+// GroupBy on multiple columns
+pub fn DataFrameGroupByMulti(df: DataFrame, keyCols: int64, keyColCount: int64): MultiGroupByResult {
+  var gb: MultiGroupByResult;
+  var i: int64 := 0;
+  var j: int64;
+  var k: int64;
+  var keyValues: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);  // Temp array for current row keys
+  var found: int64;
+  var match: int64;
+  
+  gb.df := df;
+  gb.keyCols := keyCols;
+  gb.keyColCount := keyColCount;
+  gb.groups := mmap(0, 1024 * keyColCount * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  gb.groupRows := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  gb.groupCount := 0;
+  
+  // For each row, check if key combination exists
+  while (i < df.rowCount) {
+    // Get key values for this row
+    j := 0;
+    while (j < keyColCount) {
+      var colName: int64 := peek8(keyCols + j * 8);
+      var s: Series := DataFrameGetSeries(df, colName);
+      // Store in temporary location
+      j := j + 1;
+    end;
+    
+    // Check if this key combination exists
+    found := 0;
+    j := 0;
+    while (j < gb.groupCount) {
+      match := 1;
+      k := 0;
+      while (k < keyColCount) {
+        var colName: int64 := peek8(keyCols + k * 8);
+        var s: Series := DataFrameGetSeries(df, colName);
+        var val: int64 := SeriesGetInt(s, i);
+        var groupVal: int64 := peek8(gb.groups + (j * keyColCount + k) * 8);
+        if (val != groupVal) {
+          match := 0;
+          break;
+        }
+        k := k + 1;
+      end;
+      if (match == 1) {
+        found := 1;
+        break;
+      }
+      j := j + 1;
+    end;
+    
+    if (found == 0) {
+      // New group
+      k := 0;
+      while (k < keyColCount) {
+        var colName: int64 := peek8(keyCols + k * 8);
+        var s: Series := DataFrameGetSeries(df, colName);
+        poke8(gb.groups + (gb.groupCount * keyColCount + k) * 8, SeriesGetInt(s, i));
+        k := k + 1;
+      end;
+      
+      var rows: int64 := mmap(0, 1024 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      poke8(rows, i);
+      poke8(rows - 8, 1);
+      poke8(gb.groupRows + gb.groupCount * 8, rows);
+      gb.groupCount := gb.groupCount + 1;
+    } else {
+      var rows: int64 := peek8(gb.groupRows + j * 8);
+      var count: int64 := peek8(rows - 8);
+      poke8(rows + count * 8, i);
+      poke8(rows - 8, count + 1);
+    end;
+    
+    i := i + 1;
+  }
+  
+  return gb;
+}
+
+// Multi-column GroupBy aggregation: count
+pub fn GroupByMultiCount(gb: MultiGroupByResult): DataFrame {
+  var result: DataFrame := DataFrameNew();
+  var i: int64 := 0;
+  var j: int64;
+  var rows: int64;
+  var count: int64;
+  
+  // Add key columns
+  j := 0;
+  while (j < gb.keyColCount) {
+    DataFrameAddColumn(result, peek8(gb.keyCols + j * 8), COL_INT64);
+    j := j + 1;
+  end;
+  DataFrameAddColumn(result, "count", COL_INT64);
+  
+  while (i < gb.groupCount) {
+    DataFrameAppendRow(result);
+    var newRow: int64 := result.rowCount - 1;
+    
+    // Set key values
+    j := 0;
+    while (j < gb.keyColCount) {
+      var val: int64 := peek8(gb.groups + (i * gb.keyColCount + j) * 8);
+      DataFrameSetInt(result, peek8(gb.keyCols + j * 8), newRow, val);
+      j := j + 1;
+    end;
+    
+    rows := peek8(gb.groupRows + i * 8);
+    count := peek8(rows - 8);
+    DataFrameSetInt(result, "count", newRow, count);
+    
+    i := i + 1;
+  end;
+  
+  return result;
+}

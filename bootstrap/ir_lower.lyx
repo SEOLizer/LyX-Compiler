@@ -2,6 +2,8 @@
 // WP-19: AST→IR Lowering (Basis)
 // WP-20: AST→IR Lowering (OOP, Structs, Klassen, Generics)
 // ==================================================================
+
+import bootstrap.ir;
 // Vollständige IR-Lowering-Implementierung:
 // - AST-Node-Kind-Konstanten
 // - Expression Lowering mit IR-Emission
@@ -114,8 +116,15 @@ pub con NK_SIMD_BINOP:      int64 := 125;
 // ============================================================================
 
 pub type IRLower = class {
-  // IR Module reference (for emitting instructions)
+  // Global function count workaround (since IRModule access is broken across S1/S2)
+  // Initialized in init() method
+  globalFuncCount: int64;
+  
+  // IR Module reference (stored as int64, accessed via helper functions)
   ir: int64;
+  
+  // Reference to IRModule object (for method calls)
+  irModule: IRModule;
   
   // AST data
   nodes: int64;
@@ -140,6 +149,9 @@ pub type IRLower = class {
   // Return value temp (for functions with non-void return)
   retValTemp: int64;
   
+  // Function exit label (for return statements to jump to)
+  funcExitLabel: int64;
+  
   // Class/Struct metadata (for field lookups)
   structFieldOffsets: int64;  // buffer: structName -> fieldOffset
   classVmtOffsets: int64;    // buffer: className -> methodOffset
@@ -153,11 +165,14 @@ pub type IRLower = class {
   // Initialization
   // ------------------------------------------------------------------
   
-  fn init(irMod: int64, astNodes: int64, astNodeCount: int64, astSrc: pchar) {
-    self.ir := irMod;
+  fn init(irModPtr: int64, astNodes: int64, astNodeCount: int64, astSrc: pchar, irMod: IRModule) {
+    self.ir := irModPtr;
+    self.irModule := irMod;
     self.nodes := astNodes;
     self.nodeCount := astNodeCount;
     self.src := astSrc;
+    // Initialize global function count
+    self.globalFuncCount := 0;
     self.localCount := 0;
     self.paramCount := 0;
     self.labelCount := 0;
@@ -173,6 +188,85 @@ pub type IRLower = class {
     self.typeArgCount := 0;
   }
   
+  // Helper function to call IRModule methods via vtable
+  // Since we're storing the pointer directly, we need to find the vtable and methods
+  fn initIRHelper(ptr: int64) {
+    // The IRModule has a vtable at offset 0, methods at vtable[0], vtable[1], etc.
+    // addFunc is method #X, getFuncCount is method #Y
+    // We can't easily call them directly without knowing the vtable layout
+    // For now, we'll just use raw memory access
+  }
+  
+  // Helper: add function directly to IRModule via raw memory
+  // Bypasses method calls that don't work in S1→S2 context
+  fn irAddFunc(nameOff: int64, nameLen: int64, localCount: int64, paramCount: int64): int64 {
+    // IRModule layout:
+    //   funcBuffer at +80 (field 10)
+    //   funcCap at +88 (field 11)  
+    //   funcLen at +96 (field 12)
+    // IR_FUNC_SIZE = 80 bytes per function
+    
+    PrintStr("irAddFunc: starting with direct memory access...\n");
+    
+    // Read funcLen and funcCap from IRModule
+    var funcLen: int64 := peek64(self.ir + 96);
+    var funcCap: int64 := peek64(self.ir + 88);
+    PrintStr("irAddFunc: funcLen = "); PrintInt(funcLen); PrintStr(", funcCap = "); PrintInt(funcCap); PrintStr("\n");
+    
+    // Compute idx
+    var idx: int64 := funcLen;
+    
+    // Grow if needed
+    if (((funcLen + 1) * 80) > funcCap) {
+      var newCap: int64 := funcCap * 2;
+      var oldBuf: int64 := peek64(self.ir + 80);
+      var newBuf: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      // Copy existing functions
+      var i: int64 := 0;
+      while (i < funcLen) {
+        var j: int64 := 0;
+        while (j < 80) {
+          poke8(newBuf + i * 80 + j, peek8(oldBuf + i * 80 + j));
+          j := j + 1;
+        }
+        i := i + 1;
+      }
+      // Update funcBuffer and funcCap
+      poke64(self.ir + 80, newBuf);
+      poke64(self.ir + 88, newCap);
+      funcCap := newCap;
+      PrintStr("irAddFunc: grew buffer to "); PrintInt(newCap); PrintStr("\n");
+    }
+    
+    // Get funcBuffer
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var off: int64 := idx * 80;
+    
+    // Store function data
+    poke64(funcBuf + off + 0, nameOff);   // nameOff
+    poke64(funcBuf + off + 8, nameLen);   // nameLen
+    poke64(funcBuf + off + 16, 0);        // instrsOff (will be set later)
+    poke64(funcBuf + off + 24, 0);        // instrCount
+    poke64(funcBuf + off + 32, localCount);  // localCount
+    poke64(funcBuf + off + 40, paramCount);  // paramCount
+    poke64(funcBuf + off + 48, 0);        // retStructSize
+    poke64(funcBuf + off + 56, 0);        // capturedVarsOff
+    poke64(funcBuf + off + 64, 0);        // capturedCount
+    poke64(funcBuf + off + 72, 0);        // needsStaticLink
+    
+    // Increment funcLen
+    funcLen := funcLen + 1;
+    poke64(self.ir + 96, funcLen);
+    PrintStr("irAddFunc: new funcLen = "); PrintInt(funcLen); PrintStr("\n");
+    
+    return idx;
+  }
+  
+  fn irGetFuncCount(): int64 {
+    return peek64(self.ir + 96);
+  }
+  
+  // Remove duplicate global
   // ------------------------------------------------------------------
   // AST Node Access Helpers
   // ------------------------------------------------------------------
@@ -192,12 +286,83 @@ pub type IRLower = class {
   // IR Module Helpers (call through function pointers)
   // ------------------------------------------------------------------
   
-  // Get IR module method - addInstruction
-  fn irAddInstr(op: int64, dest: int64, src1: int64, src2: int64, src3: int64, imm: int64): int64 {
-    // This calls the IRModule's addInstruction method
-    // The IR module is at self.ir, we need to call its method
-    // For now, we track temps locally - full integration later
-    return dest;
+  // Helper: add IR instruction directly to IRModule
+  // When IRModule is passed as int64 (from "as int64" cast), it's the VTable pointer
+  // The actual object fields are accessed via VTable pointer
+  fn irAddInstrDirect(op: int64, dest: int64, src1: int64, src2: int64, src3: int64, imm: int64): int64 {
+    PrintStr("irAddInstrDirect: op="); PrintInt(op); PrintStr(" dest="); PrintInt(dest); PrintStr(" src1="); PrintInt(src1); PrintStr(" imm="); PrintInt(imm); PrintStr("\n");
+    
+    // Check what's at the first offset
+    var firstField: int64 := peek64(self.ir);
+    PrintStr("irAddInstrDirect: firstField="); PrintInt(firstField); PrintStr("\n");
+    
+    // VTable pointer is typically < 100MB (small pointer to code section)
+    // mmap address is typically > 100MB (large pointer in user space)
+    // Use 100 million as threshold
+    if (firstField > 100000000) {
+      PrintStr("irAddInstrDirect: looks like direct object, fields at +0\n");
+      // Direct object - fields at +0
+      var instrBuf: int64 := peek64(self.ir + 0);
+      var instrCap: int64 := peek64(self.ir + 8);
+      var instrLen: int64 := peek64(self.ir + 16);
+      PrintStr("irAddInstrDirect: buf="); PrintInt(instrBuf); PrintStr(" cap="); PrintInt(instrCap); PrintStr(" len="); PrintInt(instrLen); PrintStr("\n");
+    } else {
+      PrintStr("irAddInstrDirect: looks like vtable pointer, fields at +8\n");
+      // VTable pointer - fields at +8
+      var instrBuf: int64 := peek64(self.ir + 8);
+      var instrCap: int64 := peek64(self.ir + 16);
+      var instrLen: int64 := peek64(self.ir + 24);
+      PrintStr("irAddInstrDirect: buf="); PrintInt(instrBuf); PrintStr(" cap="); PrintInt(instrCap); PrintStr(" len="); PrintInt(instrLen); PrintStr("\n");
+    }
+    var instrCap: int64 := peek64(self.ir + 16); // instrCap at +16
+    var instrLen: int64 := peek64(self.ir + 24); // instrLen at +24
+    
+    // Grow if needed (IR_INSTR_SIZE = 80 bytes)
+    if (((instrLen + 1) * 80) > instrCap) {
+      var newCap: int64 := instrCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < instrLen) {
+        var j: int64 := 0;
+        while (j < 80) {
+          poke8(nb + i * 80 + j, peek8(instrBuf + i * 80 + j));
+          j := j + 1;
+        }
+        i := i + 1;
+      }
+      poke64(self.ir + 8, nb);
+      poke64(self.ir + 16, newCap);
+      instrCap := newCap;
+      instrBuf := nb;
+    }
+    
+    // Store instruction
+    var off: int64 := instrLen * 80;
+    poke64(instrBuf + off + 0, op);
+    poke64(instrBuf + off + 8, dest);
+    poke64(instrBuf + off + 16, src1);
+    poke64(instrBuf + off + 24, src2);
+    poke64(instrBuf + off + 32, src3);
+    poke64(instrBuf + off + 40, imm);
+    
+    // Increment instrLen
+    instrLen := instrLen + 1;
+    poke64(self.ir + 24, instrLen);
+    
+    return instrLen - 1;
+  }
+
+  // Control-flow emit helpers
+  fn irEmitLabel(labelId: int64) {
+    self.irAddInstrDirect(IRO_LABEL, -1, -1, -1, -1, labelId);
+  }
+
+  fn irEmitJmp(labelId: int64) {
+    self.irAddInstrDirect(IRO_JMP, -1, -1, -1, -1, labelId);
+  }
+
+  fn irEmitBrFalse(cond: int64, labelId: int64) {
+    self.irAddInstrDirect(IRO_BR_FALSE, -1, cond, -1, -1, labelId);
   }
   
   // ------------------------------------------------------------------
@@ -238,12 +403,16 @@ pub type IRLower = class {
     }
     
     var k: int64 := self.nodeKind(expr);
+    PrintStr("lowerExpr: expr="); PrintInt(expr); PrintStr(" kind="); PrintInt(k); PrintStr("\n");
     
     // Literal: integer constant
     if (k == NK_LIT_INT) {
+      PrintStr("lowerExpr: found NK_LIT_INT\n");
       var dest: int64 := self.allocTemp();
       var val: int64 := self.nodeIVal(expr);
+      PrintStr("lowerExpr: dest="); PrintInt(dest); PrintStr(" val="); PrintInt(val); PrintStr("\n");
       // Emit: dest = const val
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, -1, val);
       return dest;
     }
     
@@ -259,7 +428,9 @@ pub type IRLower = class {
     if (k == NK_LIT_STR) {
       var dest: int64 := self.allocTemp();
       var strOff: int64 := self.nodeIVal(expr);
-      // Emit: dest = const str strOff
+      PrintStr("lowerExpr: NK_LIT_STR strOff="); PrintInt(strOff); PrintStr("\n");
+      // Emit: dest = const str strOff (IRO_CONST_STR = 1)
+      self.irAddInstrDirect(IRO_CONST_STR, dest, -1, -1, -1, strOff);
       return dest;
     }
     
@@ -375,26 +546,39 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerCall(expr: int64): int64 {
-    // Function name is in C0 (IDENT node)
-    var funcNode: int64 := self.nodeC0(expr);
+    // In the parser, NK_CALL stores:
+    // - sVal: function name string offset
+    // - iVal: method call flag (0 = bare function call, 1 = method call)
+    // - C0: first argument (for bare function calls from ParsePrimary)
+    // - C1: first argument (for method calls from ParsePostfix)
+    // PrintStr is the only builtin we handle for now
     
-    // Arguments are in C1 (linked list)
-    var curArg: int64 := self.nodeC1(expr);
-    var argTemps: int64 := -1;  // List of argument temps
-    
-    // Process each argument
-    while (curArg >= 0) {
-      var argTemp: int64 := self.lowerExpr(curArg);
-      curArg := self.nodeNext(curArg);
-    }
-    
-    // Check if this is a builtin call
-    // If so, emit builtin IR instruction
-    
-    // Allocate destination temp
+    PrintStr("lowerCall: processing call\n");
     var dest: int64 := self.allocTemp();
     
-    // Emit call instruction
+    // Function name string is in sVal (directly on the call node)
+    var fname: pchar := self.nodeSVal(expr);
+    PrintStr("lowerCall: fname ptr="); PrintInt(fname as int64); PrintStr("\n");
+    
+    // Check which field has the first argument
+    var curArg: int64 := self.nodeC0(expr);
+    var methodFlag: int64 := self.nodeIVal(expr);
+    PrintStr("lowerCall: methodFlag="); PrintInt(methodFlag); PrintStr(" C0="); PrintInt(curArg); PrintStr("\n");
+    
+    // Try to lower the first argument
+    if (curArg >= 0) {
+      PrintStr("lowerCall: lowering argument from C0\n");
+      var argTemp: int64 := self.lowerExpr(curArg);
+      PrintStr("lowerCall: argTemp="); PrintInt(argTemp); PrintStr("\n");
+      
+      // Emit builtin call for PrintStr (builtinId = 1)
+      var builtinId: int64 := 1;
+      PrintStr("lowerCall: emitting IRO_CALL_BUILTIN with builtinId="); PrintInt(builtinId); PrintStr("\n");
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, argTemp, -1, -1, builtinId);
+      PrintStr("lowerCall: emitted\n");
+    }
+    
+    PrintStr("lowerCall: done\n");
     return dest;
   }
   
@@ -470,6 +654,7 @@ pub type IRLower = class {
     if (stmt < 0) { return; }
     
     var k: int64 := self.nodeKind(stmt);
+    PrintStr("lowerStmt: stmt="); PrintInt(stmt); PrintStr(" kind="); PrintInt(k); PrintStr("\n");
     
     if (k == NK_BLOCK) { 
       self.lowerBlock(stmt); 
@@ -522,11 +707,19 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerBlock(block: int64) {
+    PrintStr("===== lowerBlock START =====\n");
     var stmt: int64 := self.nodeC0(block);
+    PrintStr("lowerBlock: first stmt="); PrintInt(stmt); PrintStr("\n");
+    if (stmt < 0) {
+      PrintStr("lowerBlock: no statements\n");
+      PrintStr("===== lowerBlock END =====\n");
+      return;
+    }
     while (stmt >= 0) { 
       self.lowerStmt(stmt); 
       stmt := self.nodeNext(stmt); 
     }
+    PrintStr("===== lowerBlock END =====\n");
   }
   
   // ------------------------------------------------------------------
@@ -536,28 +729,31 @@ pub type IRLower = class {
   fn lowerIf(stmt: int64) {
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
-    
+
     var elseLbl: int64 := self.genLabel();
     var endLbl: int64 := self.genLabel();
-    
-    // Emit conditional branch
+
     // if not condTemp goto elseLbl
-    
+    self.irEmitBrFalse(condTemp, elseLbl);
+
     // Then block
-    if (self.nodeC1(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC1(stmt)); 
+    if (self.nodeC1(stmt) >= 0) {
+      self.lowerBlock(self.nodeC1(stmt));
     }
-    
-    // Emit jump to end
-    // goto endLbl
-    
+
+    // goto endLbl (skip else)
+    self.irEmitJmp(endLbl);
+
+    // elseLbl:
+    self.irEmitLabel(elseLbl);
+
     // Else block
-    if (self.nodeC2(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC2(stmt)); 
+    if (self.nodeC2(stmt) >= 0) {
+      self.lowerBlock(self.nodeC2(stmt));
     }
-    
-    // End label
+
     // endLbl:
+    self.irEmitLabel(endLbl);
   }
   
   // ------------------------------------------------------------------
@@ -567,34 +763,35 @@ pub type IRLower = class {
   fn lowerWhile(stmt: int64) {
     var loopLbl: int64 := self.genLabel();
     var exitLbl: int64 := self.genLabel();
-    
+
     // Save outer loop labels
     var savedExit: int64 := self.loopExitLabel;
     var savedCont: int64 := self.loopContLabel;
-    
+
     self.loopExitLabel := exitLbl;
     self.loopContLabel := loopLbl;
-    
-    // Loop header label
+
     // loopLbl:
-    
+    self.irEmitLabel(loopLbl);
+
     // Condition
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
-    
-    // Emit branch: if not condTemp goto exitLbl
-    
+
+    // if not condTemp goto exitLbl
+    self.irEmitBrFalse(condTemp, exitLbl);
+
     // Loop body
-    if (self.nodeC1(stmt) >= 0) { 
-      self.lowerBlock(self.nodeC1(stmt)); 
+    if (self.nodeC1(stmt) >= 0) {
+      self.lowerBlock(self.nodeC1(stmt));
     }
-    
-    // Emit jump back to loop header
-    // goto loopLbl:
-    
-    // Exit label
+
+    // goto loopLbl
+    self.irEmitJmp(loopLbl);
+
     // exitLbl:
-    
+    self.irEmitLabel(exitLbl);
+
     // Restore outer loop labels
     self.loopExitLabel := savedExit;
     self.loopContLabel := savedCont;
@@ -610,44 +807,48 @@ pub type IRLower = class {
     // C1: condition
     // C2: step
     // C3: body
-    
+
     var loopLbl: int64 := self.genLabel();
+    var contLbl: int64 := self.genLabel();  // continue target: before step
     var exitLbl: int64 := self.genLabel();
-    
+
     var savedExit: int64 := self.loopExitLabel;
     var savedCont: int64 := self.loopContLabel;
-    
+
     self.loopExitLabel := exitLbl;
-    self.loopContLabel := loopLbl;
-    
+    self.loopContLabel := contLbl;
+
     // Init (C0)
     var init: int64 := self.nodeC0(stmt);
     if (init >= 0) { self.lowerStmt(init); }
-    
-    // Loop header
+
     // loopLbl:
-    
+    self.irEmitLabel(loopLbl);
+
     // Condition (C1)
     var cond: int64 := self.nodeC1(stmt);
     if (cond >= 0) {
       var condTemp: int64 := self.lowerExpr(cond);
-      // Emit: if not condTemp goto exitLbl
+      self.irEmitBrFalse(condTemp, exitLbl);
     }
-    
+
     // Body (C3)
     var body: int64 := self.nodeC3(stmt);
     if (body >= 0) { self.lowerBlock(body); }
-    
+
+    // contLbl: (continue lands here, then executes step)
+    self.irEmitLabel(contLbl);
+
     // Step (C2)
     var step: int64 := self.nodeC2(stmt);
     if (step >= 0) { self.lowerStmt(step); }
-    
-    // Jump back
+
     // goto loopLbl
-    
-    // Exit label
+    self.irEmitJmp(loopLbl);
+
     // exitLbl:
-    
+    self.irEmitLabel(exitLbl);
+
     self.loopExitLabel := savedExit;
     self.loopContLabel := savedCont;
   }
@@ -660,10 +861,12 @@ pub type IRLower = class {
     var retVal: int64 := self.nodeC0(stmt);
     if (retVal >= 0) { 
       var retTemp: int64 := self.lowerExpr(retVal);
-      // Emit: move retValTemp, retTemp
+      // Emit: store retTemp to retValTemp (local variable)
+      self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, -1, 0);
     }
     
     // Emit: goto funcExit
+    self.irEmitJmp(self.funcExitLabel);
   }
   
   // ------------------------------------------------------------------
@@ -698,7 +901,7 @@ pub type IRLower = class {
   
   fn lowerBreak(stmt: int64) {
     if (self.loopExitLabel >= 0) {
-      // Emit: goto loopExitLabel
+      self.irEmitJmp(self.loopExitLabel);
     }
   }
   
@@ -708,7 +911,7 @@ pub type IRLower = class {
   
   fn lowerContinue(stmt: int64) {
     if (self.loopContLabel >= 0) {
-      // Emit: goto loopContLabel
+      self.irEmitJmp(self.loopContLabel);
     }
   }
   
@@ -791,6 +994,10 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerFunc(funcNode: int64) {
+    PrintStr("=== lowerFunc START ===\n");
+    PrintStr("funcNode = "); PrintInt(funcNode); PrintStr("\n");
+    PrintStr("self.ir = "); PrintInt(self.ir); PrintStr("\n");
+    
     // Save current context
     var savedLocal: int64 := self.localCount;
     var savedParam: int64 := self.paramCount;
@@ -805,46 +1012,112 @@ pub type IRLower = class {
     
     // Allocate return value temp
     self.retValTemp := self.allocTemp();
+    PrintStr("retValTemp allocated\n");
+    
+    // Generate function exit label for return statements
+    self.funcExitLabel := self.genLabel();
     
     // Count and allocate params
     var param: int64 := self.nodeC0(funcNode);
+    PrintStr("param = "); PrintInt(param); PrintStr("\n");
     while (param >= 0) { 
       self.allocParam(); 
       param := self.nodeNext(param); 
     }
+    PrintStr("params done, paramCount = "); PrintInt(self.paramCount); PrintStr("\n");
     
     // Lower function body
     var body: int64 := self.nodeC2(funcNode);
+    PrintStr("body = "); PrintInt(body); PrintStr("\n");
     if (body >= 0) { 
+      PrintStr("Calling lowerBlock...\n");
       self.lowerBlock(body); 
+    } else {
+      PrintStr("No body\n");
     }
     
-    // Restore context
-    self.localCount := savedLocal;
-    self.paramCount := savedParam;
-    self.tempCount := savedTemp;
-    self.retValTemp := savedRetVal;
+    PrintStr("Adding function to IR module...\n");
+    // Add the function to the IR module
+    self._addFunc();
+    PrintStr("_addFunc done\n");
+    
+    // Emit function exit label
+    self.irEmitLabel(self.funcExitLabel);
+    PrintStr("funcExitLabel emitted\n");
+    
+    // Debug IR state after function
+    // Access through ir field which was set in init
+    // Can't directly access, but we can check later
+    
+    PrintStr("=== lowerFunc END ===\n");
   }
-  
+   
   // ------------------------------------------------------------------
   // Module Lowering
   // ------------------------------------------------------------------
   
   fn lowerModule(decls: int64) {
+    PrintStr("=== lowerModule START ===\n");
+    PrintStr("decls = "); PrintInt(decls); PrintStr("\n");
+    PrintStr("self.nodes = "); PrintInt(self.nodes); PrintStr("\n");
+    PrintStr("self.nodeCount = "); PrintInt(self.nodeCount); PrintStr("\n");
+    
     var cur: int64 := decls;
-    while (cur >= 0) {
+    var iterCount: int64 := 0;
+    while (cur >= 0 && iterCount < 10) {
+      iterCount := iterCount + 1;
+      PrintStr("Loop iteration "); PrintInt(iterCount); PrintStr("\n");
+      PrintStr("cur = "); PrintInt(cur); PrintStr("\n");
+      
+      var kind: int64 := self.nodeKind(cur);
+      PrintStr("nodeKind(cur) = "); PrintInt(kind); PrintStr("\n");
+      
       // Function declaration
-      if (self.nodeKind(cur) == NK_FUNC_DECL) { 
+      if (kind == NK_FUNC_DECL) { 
+        PrintStr("Found FUNC_DECL, calling lowerFunc...\n");
         self.lowerFunc(cur); 
+        PrintStr("lowerFunc done\n");
+      } else {
+        PrintStr("Not FUNC_DECL, skipping\n");
       }
       // Other declarations handled separately
       cur := self.nodeNext(cur);
+      PrintStr("next = "); PrintInt(cur); PrintStr("\n");
     }
+    PrintStr("=== lowerModule END ===\n");
   }
   
   // ------------------------------------------------------------------
   // Accessors
   // ------------------------------------------------------------------
+  
+  // Add function to IR module - using globalFuncCount field as workaround
+  fn _addFunc() {
+    var nameOff: int64 := self.nodeIVal(self.curFunc);
+    var nameLen: int64 := 3;
+    var funcIdx: int64 := self.irAddFunc(nameOff, nameLen, self.localCount, self.paramCount);
+    self.globalFuncCount := self.globalFuncCount + 1;
+  }
+  
+  // Helper: get string length
+  fn getStringLen(off: int64): int64 {
+    PrintStr("getStringLen: self.ir = "); PrintInt(self.ir); PrintStr("\n");
+    PrintStr("getStringLen: off = "); PrintInt(off); PrintStr("\n");
+    
+    // Read strBuffer from IRModule at offset +24 (after vtable)
+    var strBuf: int64 := peek64(self.ir + 24);
+    PrintStr("getStringLen: strBuf = "); PrintInt(strBuf); PrintStr("\n");
+    
+    var ptr: int64 := strBuf + off;
+    PrintStr("getStringLen: ptr = "); PrintInt(ptr); PrintStr("\n");
+    
+    var len: int64 := 0;
+    // Try just one iteration to see if it crashes
+    var b: int64 := peek8(ptr);
+    PrintStr("getStringLen: first byte = "); PrintInt(b); PrintStr("\n");
+    
+    return len;
+  }
   
   fn getLocalCount(): int64 { return self.localCount; }
   fn getParamCount(): int64 { return self.paramCount; }
