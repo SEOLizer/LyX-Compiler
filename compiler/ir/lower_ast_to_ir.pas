@@ -35,6 +35,7 @@ type
     FConstMap: TStringList; // name -> TConstValue (compile-time constants)
     FLocalConst: array of TConstValue; // per-function local constant values (or nil)
     FBreakStack: TStringList; // stack of break labels
+    FContinueStack: TStringList; // stack of continue labels (loop start)
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
     FClassTypes: TStringList; // class name -> TAstClassDecl (as object)
     FRangeTypes: TStringList; // range type name -> TAstTypeDecl (aerospace-todo P1 #7)
@@ -129,6 +130,8 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FConstMap.Sorted := False;
     FBreakStack := TStringList.Create;
     FBreakStack.Sorted := False;
+    FContinueStack := TStringList.Create;
+    FContinueStack.Sorted := False;
     FStructTypes := TStringList.Create;
     FStructTypes.Sorted := False;
     FClassTypes := TStringList.Create;
@@ -173,6 +176,7 @@ begin
   SetLength(FLocalIsStruct, 0);
   SetLength(FLocalTypeNames, 0);
   FBreakStack.Free;
+  FContinueStack.Free;
   // Don't free objects in FStructTypes/FClassTypes/FGlobalVars - they belong to the AST
   FStructTypes.Free;
   FClassTypes.Free;
@@ -495,6 +499,9 @@ begin
          FGenericFuncs.AddObject(TAstFuncDecl(node).Name, System.TObject(node));
          Continue;
        end;
+       // Remove any imported function with the same name (main prog wins)
+       if FModule.FindFunction(TAstFuncDecl(node).Name) <> nil then
+         FModule.RemoveFunction(TAstFuncDecl(node).Name);
        fn := FModule.AddFunction(TAstFuncDecl(node).Name);
        // Lower function body
        FCurrentFunc := fn;
@@ -1761,6 +1768,38 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
       begin
         call := TAstCall(expr);
         argCount := Length(call.Args);
+
+        // Bootstrap compat: sizeof(TypeName) is a compile-time constant.
+        // Handle before argument evaluation since the arg is a type name, not a variable.
+        if call.Name = 'sizeof' then
+        begin
+          if (argCount = 1) and (call.Args[0] is TAstIdent) then
+          begin
+            vmtClassName := TAstIdent(call.Args[0]).Name;
+            classIdx := FClassTypes.IndexOf(vmtClassName);
+            if classIdx >= 0 then
+            begin
+              cd := TAstClassDecl(FClassTypes.Objects[classIdx]);
+              EnsureClassLayout(cd);
+              t0 := NewTemp;
+              instr.Op := irConstInt;
+              instr.Dest := t0;
+              instr.ImmInt := cd.Size;
+              Emit(instr);
+              Result := t0;
+              Exit;
+            end;
+          end;
+          // Unknown type — emit 8 as conservative default
+          t0 := NewTemp;
+          instr.Op := irConstInt;
+          instr.Dest := t0;
+          instr.ImmInt := 8;
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
+
         SetLength(argTemps, argCount);
         for i := 0 to High(call.Args) do
           argTemps[i] := LowerExpr(call.Args[i]);
@@ -2051,6 +2090,56 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               instr.ArgTemps[i] := argTemps[i];
             if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
             if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Bootstrap compat: syscall_sys_open(path, len, flags, mode) -> fd
+          // Map to open(path, flags, mode) ignoring the length argument
+          else if call.Name = 'syscall_sys_open' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'open';
+            // Pass 3 args: path (arg0), flags (arg2), mode (arg3), skip len (arg1)
+            SetLength(instr.ArgTemps, 3);
+            if argCount >= 1 then instr.ArgTemps[0] := argTemps[0] else instr.ArgTemps[0] := -1;  // path
+            if argCount >= 3 then instr.ArgTemps[1] := argTemps[2] else instr.ArgTemps[1] := -1;  // flags
+            if argCount >= 4 then instr.ArgTemps[2] := argTemps[3] else instr.ArgTemps[2] := -1;  // mode
+            instr.ImmInt := 3;
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 3 then instr.Src2 := argTemps[2] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Bootstrap compat: syscall_sys_write(fd, buf, len) -> bytes written
+          else if call.Name = 'syscall_sys_write' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'write';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Bootstrap compat: syscall_sys_close(fd)
+          else if call.Name = 'syscall_sys_close' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'close';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
             Emit(instr);
             Result := t0;
           end
@@ -2368,19 +2457,94 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             Emit(instr);
             Result := t0;
           end
-          // === mmap/munmap for memory allocation ===
-          else if call.Name = 'mmap' then
+          // Bootstrap compat: alloc(size) = mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+          else if call.Name = 'alloc' then
           begin
-            // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
             t0 := NewTemp;
             instr.Op := irCallBuiltin;
             instr.Dest := t0;
-            instr.ImmStr := 'mmap';
+            instr.ImmStr := 'alloc';
             instr.ImmInt := argCount;
             SetLength(instr.ArgTemps, argCount);
             for i := 0 to argCount - 1 do
               instr.ArgTemps[i] := argTemps[i];
             if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // Bootstrap compat: ArgvGet(argv, i) = *(argv + i*8)
+          else if call.Name = 'ArgvGet' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'ArgvGet';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // === mmap/munmap for memory allocation ===
+          else if call.Name = 'mmap' then
+          begin
+            // mmap(addr, length, prot, flags, fd, offset) -> int64 (pointer)
+            // Bootstrap compat: mmap(size, prot) mit 2 Argumenten
+            // - mmap(size, prot) -> mmap(0, size, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'mmap';
+            instr.ImmInt := argCount;
+            // Expand to 6 arguments for the backend
+            SetLength(instr.ArgTemps, 6);
+            
+            if argCount = 2 then
+            begin
+              // Bootstrap 2-arg mode: mmap(size, prot)
+              // Der Bootstrap verwendet: mmap(size, prot)
+              // Map to full 6-arg: mmap(0, size, prot, 34, -1, 0)
+              // WICHTIG: argTemps[0] = erstes Argument (size), argTemps[1] = zweites Argument (prot)
+              // WIR MÜSSEN SIE TAUSCHEN: size ist length, prot ist prot
+              instr.ArgTemps[0] := 0;                       // addr = NULL
+              instr.ArgTemps[1] := argTemps[0];             // length = size (erstes Argument)
+              instr.ArgTemps[2] := argTemps[1];             // prot (zweites Argument)
+              instr.ArgTemps[3] := 34;                      // flags = MAP_PRIVATE | MAP_ANONYMOUS
+              instr.ArgTemps[4] := -1;                      // fd = -1
+              instr.ArgTemps[5] := 0;                       // offset = 0
+            end
+            else if argCount >= 3 then
+            begin
+              // Full 3+ arg mode - use provided values
+              // arg[0]=addr, arg[1]=length, arg[2]=prot, arg[3]=flags, arg[4]=fd, arg[5]=offset
+              for i := 0 to argCount - 1 do
+              begin
+                if i < 6 then instr.ArgTemps[i] := argTemps[i];
+              end;
+              // Fill remaining with defaults
+              for i := argCount to 5 do
+                instr.ArgTemps[i] := 0;
+            end
+            else if argCount = 1 then
+            begin
+              // mmap(size) -> mmap(0, size, 3, 34, -1, 0)
+              instr.ArgTemps[0] := 0;                      // addr
+              instr.ArgTemps[1] := argTemps[0];            // length = size
+              instr.ArgTemps[2] := 3;                     // prot = READ|WRITE
+              instr.ArgTemps[3] := 34;                     // flags
+              instr.ArgTemps[4] := -1;                     // fd
+              instr.ArgTemps[5] := 0;                      // offset
+            end
+            else
+            begin
+              // No arguments - all zeros
+              for i := 0 to 5 do
+                instr.ArgTemps[i] := 0;
+            end;
+            if Length(instr.ArgTemps) >= 1 then instr.Src1 := instr.ArgTemps[0] else instr.Src1 := -1;
             Emit(instr);
             Result := t0;
           end
@@ -3033,15 +3197,15 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             instr.SelfSlot := -1;
            
             // Check if this is a method call (mangled name starts with _L_ or _METHOD_)
-            if (Length(call.Name) > 3) and ((Copy(call.Name, 1, 3) = '_L_') or (Copy(call.Name, 1, 9) = '_METHOD_')) then
+            if (Length(call.Name) > 3) and ((Copy(call.Name, 1, 3) = '_L_') or (Copy(call.Name, 1, 8) = '_METHOD_')) then
             begin
               // For _METHOD_<methodname>: extract method name and look up class from first argument's type
               // For _L_<ClassName>_<MethodName>: extract class name and method name from mangled name
-              if Copy(call.Name, 1, 9) = '_METHOD_' then
+              if Copy(call.Name, 1, 8) = '_METHOD_' then
               begin
                 // Format: _METHOD_<methodname>
                 // Need to look up class from receiver type (call.Args[0])
-                vmtMethodName := Copy(call.Name, 10, MaxInt);
+                vmtMethodName := Copy(call.Name, 9, MaxInt);
                 vmtClassName := '';
                 
                 // Get receiver's type from semantic analysis
@@ -3134,6 +3298,11 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               end;
             end;
           
+          // Bootstrap compat: for _METHOD_ calls that are NOT virtual, translate the call
+          // name to _L_ClassName_MethodName so the jump patcher can resolve it.
+          if (Copy(call.Name, 1, 8) = '_METHOD_') and (not instr.IsVirtualCall) and (vmtClassName <> '') then
+            instr.ImmStr := '_L_' + vmtClassName + '_' + vmtMethodName;
+
           // Determine call mode based on function origin
           // cmExternal has highest priority, then cmImported (must check before
           // FModule.FindFunction because imported functions get added to FModule
@@ -3423,16 +3592,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         // Check for class cast (target is a class name)
         if (castTypeName <> '') and (FClassTypes.IndexOf(castTypeName) >= 0) then
         begin
-          // Class cast: emit is-type check first
-          // If false, we should panic or return null
-          // For now, we just emit a simple copy (the check is done at runtime via is)
-          
-          // TODO: Add runtime check for class cast
-          // For now, just copy the pointer
-          instr.Op := irLoadLocal;
-          instr.Dest := t0;
-          instr.Src1 := t1;
-          Emit(instr);
+          // Class cast is a no-op in IR (just a type annotation / pointer reinterpret).
+          // Return the source temp directly — do NOT emit irLoadLocal here, because
+          // irLoadLocal treats Src1 as a LOCAL slot index (no fn.LocalCount offset),
+          // so passing a temp index would read the wrong stack slot.
+          Result := t1;
+          Exit;
         end
         // Check for int64 -> float conversion
         else if (ltype = atInt64) and (rType = atF64) then
@@ -3984,13 +4149,31 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           for k := 0 to argCount do
             instr.ArgTemps[k] := argTemps[k];
           Emit(instr);
+          // Bootstrap compat: if constructor is 'Create', it handles its own allocation
+          // and returns the properly initialized object. Use the constructor return value
+          // instead of the pre-allocated t0 (which will be leaked but that's acceptable).
+          if TAstNewExpr(expr).ConstructorName = 'Create' then
+            t0 := t1;
         end
         else
         begin
-          // No arguments, but check if there's a constructor with 0 params
-          // For now, we don't auto-call it - user must call constructor explicitly if needed
+          // No arguments: call 0-arg Create constructor if name is 'Create'
+          if TAstNewExpr(expr).ConstructorName = 'Create' then
+          begin
+            t1 := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op := irCall;
+            instr.Dest := t1;
+            instr.ImmStr := '_L_' + TAstNewExpr(expr).ClassName + '_Create';
+            instr.ImmInt := 1; // +1 for self (dummy t0)
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, 1);
+            instr.ArgTemps[0] := t0; // pass pre-allocated ptr as dummy self
+            Emit(instr);
+            t0 := t1; // use constructor return value
+          end;
         end;
-        
+
         Result := t0;
       end;
 
@@ -5077,6 +5260,17 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
        // Store type name so range checks can be emitted at assignment sites
        if (vd.DeclTypeName <> '') and (loc < Length(FLocalTypeNames)) then
          FLocalTypeNames[loc] := vd.DeclTypeName;
+       // Bootstrap compat: if initializer is a cast to a class (e.g. var cfg: int64 := obj as CompilerConfig),
+       // record the cast target class name so method calls can be resolved via _L_ClassName_MethodName.
+       if Assigned(vd.InitExpr) and (vd.InitExpr is TAstCast) then
+       begin
+         if (TAstCast(vd.InitExpr).CastTypeName <> '') and
+            (FClassTypes.IndexOf(TAstCast(vd.InitExpr).CastTypeName) >= 0) then
+         begin
+           if loc >= Length(FLocalTypeNames) then SetLength(FLocalTypeNames, loc + 1);
+           FLocalTypeNames[loc] := TAstCast(vd.InitExpr).CastTypeName;
+         end;
+       end;
        // If initializer is constant integer and the local has narrower signed width, constant fold
        if (vd.InitExpr is TAstIntLit) then
        begin
@@ -5604,14 +5798,16 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       instr.LabelName := exitLabel;
       Emit(instr);
 
-      // push break label for break statements
+      // push break/continue labels
       FBreakStack.AddObject(exitLabel, nil);
+      FContinueStack.AddObject(startLabel, nil);
 
       // body
       LowerStmt(TAstWhile(stmt).Body);
 
-      // pop break label
+      // pop break/continue labels
       FBreakStack.Delete(FBreakStack.Count - 1);
+      FContinueStack.Delete(FContinueStack.Count - 1);
 
       // jump back to start
       instr := Default(TIRInstr);
@@ -5736,6 +5932,21 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       instr := Default(TIRInstr);
       instr.Op := irJmp;
       instr.LabelName := FBreakStack[FBreakStack.Count - 1];
+      Emit(instr);
+      Exit(True);
+    end;
+
+    // continue;
+    if stmt is TAstContinue then
+    begin
+      if FContinueStack.Count = 0 then
+      begin
+        FDiag.Error('continue statement outside of loop', stmt.Span);
+        Exit(False);
+      end;
+      instr := Default(TIRInstr);
+      instr.Op := irJmp;
+      instr.LabelName := FContinueStack[FContinueStack.Count - 1];
       Emit(instr);
       Exit(True);
     end;

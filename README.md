@@ -151,7 +151,7 @@ lyx-lang/                        # Repo-Root
 │       └── exceptions/          #   try/catch/throw
 │
 ├── scripts/                     # Build- und Bootstrap-Skripte
-├── examples/                    # Lyx-Beispielprogramme
+├── examples/                    # Lyx-Beispielprogramme (siehe unten)
 │
 ├── Makefile                     # Root-Wrapper (delegiert an compiler/Makefile)
 ├── README.md                    # Diese Datei
@@ -159,6 +159,114 @@ lyx-lang/                        # Repo-Root
 ├── selfhosted.md                # Selfhosting-Roadmap (WP-01..WP-09)
 └── ebnf.md / DATATYPES.md       # Sprachspezifikation
 ```
+
+### Examples (`examples/`)
+
+Das `examples/`-Verzeichnis enthält kuratierte Beispielprogramme, die verschiedene Lyx-Sprachfeatures und -Bibliotheken demonstrieren. Die Examples sind nach Kategorien organisiert:
+
+```
+examples/
+├── basics/              # Grundlegende Sprachfeatures
+│   ├── hello.lyx                    # Hello World
+│   ├── simple_return.lyx           # Einfache Rückgabe
+│   ├── variables.lyx               # var, let, const, Rechnen
+│   ├── control_flow.lyx            # if-else, while-Schleifen
+│   ├── arrays.lyx                  # Statische Arrays
+│   ├── functions.lyx               # Funktionen, Rekursion
+│   └── strings.lyx                 # String-Grundlagen
+│
+├── algorithms/          # Sortier- und Suchalgorithmen
+│   ├── quick_sort.lyx               # Quick Sort Algorithmus
+│   ├── binary_search.lyx            # Binäre Suche
+│   ├── fibonacci_dp.lyx             # Fibonacci (iterativ)
+│   └── eratosthenes.lyx             # Sieb des Eratosthenes
+│
+├── bitwise/             # Bit-Operationen
+│   ├── bitwise_operators.lyx        # AND, OR, XOR, NOT, Shifts
+│   └── bit_flags.lyx                # Flags setzen/löschen/maskieren
+│
+├── math/                # Mathematik
+│   └── matrix.lyx                    # 2D-Matrizen, Operationen
+│
+├── crypto/              # Kryptographie (Konzepte)
+│   ├── base64.lyx                    # Base64 Encoding/Decoding
+│   └── xor_cipher.lyx               # XOR-Verschlüsselung
+│
+├── memory/              # Speicherverwaltung
+│   ├── pointer_basics.lyx           # Pointer-Konzepte, Adressen
+│   ├── memory_management.lyx        # mmap, Allocation
+│   └── malloc_free.lyx              # Dynamische Allokation
+│
+├── time/                # Zeit und Datum
+│   ├── date_time.lyx                # Unix Epoch, Timestamps
+│   ├── sleep_timer.lyx              # Warte-Funktionen, Timer
+│   └── stopwatch.lyx               # Stoppuhr, Rundenzeiten
+│
+├── io/                  # Ein- und Ausgabe
+│   ├── fs/                            # Dateisystem
+│   │   ├── file_operations.lyx       # open, read, write, close
+│   │   ├── file_read.lyx            # Datei lesen
+│   │   ├── file_write.lyx           # Datei schreiben
+│   │   └── file_lines.lyx           # Zeilenweises Lesen
+│   ├── mmap/                         # Memory-mapped I/O
+│   ├── ioctl/                        # ioctl-Operationen
+│   └── net/                          # Netzwerk-Beispiele (TCP, UDP, DNS, etc.)
+│
+├── units/               # Modul-System (Units)
+│   ├── math_utils.lyx               # Beispiel-Unit mit Funktionen
+│   ├── string_utils.lyx             # String-Utility-Unit
+│   ├── use_math_utils.lyx           # Import und Nutzung von Units
+│   ├── myunit.lyx
+│   ├── main_with_unit.lyx
+│   └── test/                        # Unit-Tests
+│
+├── hardware/            # Hardware-spezifisch
+│   ├── esp32_hello.lyx              # ESP32 Hello World
+│   └── raspberry/                    # Raspberry Pi GPIO
+│       ├── gpio_led.lyx             # LED ein-/ausschalten
+│       ├── gpio_input.lyx           # Taster auslesen
+│       ├── gpio_button_led.lyx      # Button + LED
+│       ├── gpio_pwm.lyx             # PWM (Helligkeit)
+│       ├── hc_sr04.lyx              # Ultraschall-Sensor
+│       ├── i2c_sensor.lyx           # I2C-Sensoren
+│       ├── spi_device.lyx           # SPI-Geräte
+│       └── onewire_sensor.lyx       # 1-Wire (DS18B20)
+│
+├── games/               # Spiele
+│   └── game1/
+│
+└── lyxvision/           # Lyxvision GUI-Demos
+```
+
+#### Examples kompilieren und ausführen
+
+```bash
+# Einzelnes Example kompilieren
+./lyxc examples/basics/hello.lyx -o hello
+./hello
+
+# Alle Basics testen
+./lyxc examples/basics/variables.lyx -o /tmp/vars && /tmp/vars
+
+# Raspberry Pi GPIO Demo
+./lyxc examples/hardware/raspberry/gpio_led.lyx -o /tmp/gpio_led && /tmp/gpio_led
+```
+
+#### Kategorien im Überblick
+
+| Kategorie | Beschreibung | Example-Dateien |
+|-----------|--------------|-----------------|
+| **basics** | Grundlegende Syntax: Variablen, Schleifen, Funktionen | `hello.lyx`, `variables.lyx`, `functions.lyx` |
+| **algorithms** | Sortier- und Suchalgorithmen | `quick_sort.lyx`, `binary_search.lyx` |
+| **bitwise** | Bit-Operationen und Maskierung | `bitwise_operators.lyx`, `bit_flags.lyx` |
+| **math** | Mathematische Konzepte | `matrix.lyx` |
+| **crypto** | Encoding und einfache Verschlüsselung | `base64.lyx`, `xor_cipher.lyx` |
+| **memory** | Pointer und Speicherverwaltung | `pointer_basics.lyx`, `memory_management.lyx` |
+| **time** | Zeitberechnungen und Timer | `date_time.lyx`, `stopwatch.lyx` |
+| **io/fs** | Dateisystem-Operationen | `file_operations.lyx`, `file_read.lyx` |
+| **io/net** | Netzwerk-Programmierung | TCP/UDP/DNS Beispiele |
+| **hardware** | Hardware-Zugriff | GPIO, I2C, SPI, 1-Wire |
+| **units** | Modul-System | Import/Export, Bibliotheken |
 
 ### Bauen
 

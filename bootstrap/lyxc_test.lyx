@@ -1,0 +1,1164 @@
+// ==================================================================
+// WP-33: lyxc.lyx — Vollständiger Compiler in Lyx
+// ==================================================================
+// Entry Point: lyxc.lyx
+// - Kommandozeilen-Parsing
+// - Pipeline-Orchestrierung (Lexer → Parser → Sema → Linter → IR → Optimize → Emit → Write)
+// - Multi-Target-Dispatch
+// - Unit-Cache
+// - Incremental Compilation
+// - Error Handling & Recovery
+// - Verbose-Modus
+//
+// Referenz: compiler/lyxc.lpr
+
+import bootstrap.lexer;
+import bootstrap.parser;
+import bootstrap.sema;
+import bootstrap.frontend.linter;
+import bootstrap.ir;
+import bootstrap.ir_lower;
+import bootstrap.ir_optimize;
+import bootstrap.ir_inline;
+import bootstrap.codegen_x86;
+import bootstrap.backend.arm64.emit_arm64;
+import bootstrap.backend.riscv.emit_riscv;
+import bootstrap.backend.arm_cm.emit_arm_cm;
+import bootstrap.backend.elf.write_elf;
+import bootstrap.backend.pe.write_pe;
+import bootstrap.backend.macho.write_macho;
+import bootstrap.frontend.ffi_parser;
+import bootstrap.std.fs;
+import bootstrap.std.time;
+
+// ============================================================================
+// Compiler Constants
+// ============================================================================
+
+con COMPILER_NAME: pchar := "lyxc";
+con COMPILER_VERSION: pchar := "0.3.0";
+con COMPILER_BUILD: pchar := "bootstrap";
+
+// Target architectures
+con TARGET_X86_64: int64 := 1;
+con TARGET_ARM64: int64 := 2;
+con TARGET_RISCV64: int64 := 3;
+con TARGET_ARM_CM: int64 := 4;
+
+// Optimization levels
+con OPT_NONE: int64 := 0;
+con OPT_O1: int64 := 1;
+con OPT_O2: int64 := 2;
+con OPT_O3: int64 := 3;
+con OPT_SAFE: int64 := 4;
+
+// Output formats
+con FORMAT_ELF: int64 := 1;
+con FORMAT_PE: int64 := 2;
+con FORMAT_MACHO: int64 := 3;
+
+// ============================================================================
+// Command Line Options
+// ============================================================================
+
+pub type CLIOptions = struct {
+  // Input/Output
+  inputFile: int64;
+  outputFile: int64;
+  
+  // Target
+  target: int64;
+  format: int64;
+  
+  // Optimization
+  optLevel: int64;
+  
+  // Features
+  enableLint: bool;
+  lintOnly: bool;
+  enableDebug: bool;
+  enableVerbose: bool;
+  
+  // Dump options
+  dumpLexer: bool;
+  dumpParser: bool;
+  dumpSema: bool;
+  dumpIR: bool;
+  dumpASM: bool;
+  emitASM: bool;
+  dumpList: bool;
+
+  // CLI P2: Advanced options
+  targetEnergy: int64;
+  dumpRelocs: bool;
+  traceImports: bool;
+
+  // CLI P3: Analysis and instrumentation
+  asmListing: bool;
+  mcdc: bool;
+  mcdcReport: bool;
+  staticAnalysis: bool;
+  callGraph: bool;
+  mapFile: bool;
+  
+  // Warnings
+  warningsAsErrors: bool;
+  warnAll: bool;
+  
+  // Misc
+  includePath: int64;
+  stdPath: int64;
+  arch: int64;
+  defineMacros: int64;
+  emitRelocs: bool;
+  stripDebug: bool;
+};
+
+// ============================================================================
+// Compiler Configuration
+// ============================================================================
+
+pub type CompilerConfig = class {
+  // Options
+  opts: CLIOptions;
+  
+  // Compilation state
+  exitCode: int64;
+  errorCount: int64;
+  warningCount: int64;
+  codeSize: int64;
+  
+  // Module cache
+  unitCache: int64;
+  
+  // Build info
+  buildTime: int64;
+  
+  // Constructor
+  pub fn Create(): int64 {
+    var self: int64 := alloc(sizeof(CompilerConfig));
+    
+    self.opts := 0 as CLIOptions;
+    self.exitCode := 0;
+    self.errorCount := 0;
+    self.warningCount := 0;
+    
+    self.unitCache := map_new(32);
+    self.buildTime := Time();
+    
+    return self;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // CLI Parsing
+  // ---------------------------------------------------------------------------
+  
+  fn parseCLI(argc: int64, argv: pchar): bool {
+    self.opts := alloc(sizeof(CLIOptions));
+    
+    var i: int64 := 1;
+    
+    while i < argc {
+      var arg: pchar := ArgvGet(argv, i);
+      var argLen: int64 := StrLen(arg);
+      
+      if argLen == 0 {
+        i := i + 1;
+        continue;
+      }
+      
+      var firstChar: int64 := peek8(arg);
+      
+      // Check for flag (starts with -)
+      if firstChar == 45 {  // '-'
+        if argLen == 1 {
+          i := i + 1;
+          continue;
+        }
+        
+        var secondChar: int64 := peek8(arg + 1);
+        
+        // Long flags (--)
+        if secondChar == 45 {  // '--'
+          self.parseLongFlag(arg, argLen);
+        } else {
+          // Short flags (-)
+          self.parseShortFlags(arg, argLen);
+        }
+      } else {
+        // Positional argument
+        if self.opts.inputFile == 0 {
+          self.opts.inputFile := arg;
+        } else if self.opts.outputFile == 0 {
+          self.opts.outputFile := arg;
+        }
+      }
+      
+      i := i + 1;
+    }
+    
+    // Validate required options
+    if self.opts.inputFile == 0 {
+      EPrintStr("Error: No input file specified\n"c);
+      self.exitCode := 1;
+      return false;
+    }
+    
+    // Set defaults
+    if self.opts.target == 0 {
+      self.opts.target := TARGET_X86_64;
+    }
+    if self.opts.format == 0 {
+      self.opts.format := FORMAT_ELF;
+    }
+    if self.opts.optLevel == 0 {
+      self.opts.optLevel := OPT_O2;
+    }
+    
+    return true;
+  }
+  
+  fn parseLongFlag(arg: int64, argLen: int64): void {
+    // --target=x86_64|arm64|riscv64|arm_cm
+    if StrStartsWith(arg, "--target=") {
+      var val: int64 := arg + 8;
+      if StrCmp(val, "x86_64"c) == 0 {
+        self.opts.target := TARGET_X86_64;
+      } else if StrCmp(val, "arm64"c) == 0 {
+        self.opts.target := TARGET_ARM64;
+      } else if StrCmp(val, "riscv64"c) == 0 {
+        self.opts.target := TARGET_RISCV64;
+      } else if StrCmp(val, "arm_cm"c) == 0 {
+        self.opts.target := TARGET_ARM_CM;
+      }
+      return;
+    }
+    
+    // --std-path=PATH
+    if StrStartsWith(arg, "--std-path=") {
+      self.opts.stdPath := arg + 10;
+      return;
+    }
+    
+    // --arch=x86_64|arm64|riscv64|arm_cm (alias für --target)
+    if StrStartsWith(arg, "--arch=") {
+      var val: int64 := arg + 7;
+      if StrCmp(val, "x86_64"c) == 0 {
+        self.opts.target := TARGET_X86_64;
+        self.opts.arch := TARGET_X86_64;
+      } else if StrCmp(val, "arm64"c) == 0 {
+        self.opts.target := TARGET_ARM64;
+        self.opts.arch := TARGET_ARM64;
+      } else if StrCmp(val, "riscv"c) == 0 || StrCmp(val, "riscv64"c) == 0 {
+        self.opts.target := TARGET_RISCV64;
+        self.opts.arch := TARGET_RISCV64;
+      } else if StrCmp(val, "arm_cm"c) == 0 {
+        self.opts.target := TARGET_ARM_CM;
+        self.opts.arch := TARGET_ARM_CM;
+      }
+      return;
+    }
+    
+    // --output= or -o
+    if StrStartsWith(arg, "--output=") {
+      self.opts.outputFile := arg + 9;
+      return;
+    }
+    
+    // --opt=O0|O1|O2|O3|Osafe
+    if StrStartsWith(arg, "--opt=") {
+      var val: int64 := arg + 6;
+      if StrCmp(val, "O0"c) == 0 {
+        self.opts.optLevel := OPT_NONE;
+      } else if StrCmp(val, "O1"c) == 0 {
+        self.opts.optLevel := OPT_O1;
+      } else if StrCmp(val, "O2"c) == 0 {
+        self.opts.optLevel := OPT_O2;
+      } else if StrCmp(val, "O3"c) == 0 {
+        self.opts.optLevel := OPT_O3;
+      } else if StrCmp(val, "Osafe"c) == 0 {
+        self.opts.optLevel := OPT_SAFE;
+      }
+      return;
+    }
+    
+    // --format=elf|pe|macho
+    if StrStartsWith(arg, "--format=") {
+      var val: int64 := arg + 9;
+      if StrCmp(val, "elf"c) == 0 {
+        self.opts.format := FORMAT_ELF;
+      } else if StrCmp(val, "pe"c) == 0 {
+        self.opts.format := FORMAT_PE;
+      } else if StrCmp(val, "macho"c) == 0 {
+        self.opts.format := FORMAT_MACHO;
+      }
+      return;
+    }
+    
+    // Boolean flags
+    if StrCmp(arg, "--lint"c) == 0 {
+      self.opts.enableLint := true;
+      return;
+    }
+    if StrCmp(arg, "--lint-only"c) == 0 {
+      self.opts.lintOnly := true;
+      self.opts.enableLint := true;
+      return;
+    }
+    if StrCmp(arg, "--debug"c) == 0 {
+      self.opts.enableDebug := true;
+      return;
+    }
+    if StrCmp(arg, "--verbose"c) == 0 {
+      self.opts.enableVerbose := true;
+      return;
+    }
+    if StrCmp(arg, "--warnings-as-errors"c) == 0 {
+      self.opts.warningsAsErrors := true;
+      return;
+    }
+    if StrCmp(arg, "--warn-all"c) == 0 {
+      self.opts.warnAll := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-lexer"c) == 0 {
+      self.opts.dumpLexer := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-parser"c) == 0 {
+      self.opts.dumpParser := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-sema"c) == 0 {
+      self.opts.dumpSema := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-ir"c) == 0 {
+      self.opts.dumpIR := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-asm"c) == 0 {
+      self.opts.dumpASM := true;
+      return;
+    }
+    if StrCmp(arg, "--emit-asm"c) == 0 {
+      self.opts.emitASM := true;
+      return;
+    }
+    if StrCmp(arg, "--list"c) == 0 {
+      self.opts.dumpList := true;
+      return;
+    }
+
+    // CLI P2: --target-energy=N
+    if StrStartsWith(arg, "--target-energy=") {
+      var val: int64 := arg + 16;
+      self.opts.targetEnergy := ParseInt(val);
+      return;
+    }
+
+    // CLI P2: --dump-relocs
+    if StrCmp(arg, "--dump-relocs"c) == 0 {
+      self.opts.dumpRelocs := true;
+      return;
+    }
+
+    // CLI P2: --trace-imports
+    if StrCmp(arg, "--trace-imports"c) == 0 {
+      self.opts.traceImports := true;
+      return;
+    }
+
+    // CLI P3: --asm-listing
+    if StrCmp(arg, "--asm-listing"c) == 0 {
+      self.opts.asmListing := true;
+      return;
+    }
+
+    // CLI P3: --mcdc
+    if StrCmp(arg, "--mcdc"c) == 0 {
+      self.opts.mcdc := true;
+      return;
+    }
+
+    // CLI P3: --mcdc-report
+    if StrCmp(arg, "--mcdc-report"c) == 0 {
+      self.opts.mcdcReport := true;
+      return;
+    }
+
+    // CLI P3: --static-analysis
+    if StrCmp(arg, "--static-analysis"c) == 0 {
+      self.opts.staticAnalysis := true;
+      return;
+    }
+
+    // CLI P3: --call-graph
+    if StrCmp(arg, "--call-graph"c) == 0 {
+      self.opts.callGraph := true;
+      return;
+    }
+
+    // CLI P3: --map-file
+    if StrCmp(arg, "--map-file"c) == 0 {
+      self.opts.mapFile := true;
+      return;
+    }
+    
+    // --version
+    if StrCmp(arg, "--version"c) == 0 {
+      PrintStr(COMPILER_NAME);
+      PrintStr(" "c);
+      PrintStrLn(COMPILER_VERSION);
+      PrintStr("Build: "c);
+      PrintStrLn(COMPILER_BUILD);
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --help
+    if StrCmp(arg, "--help"c) == 0 {
+      self.printHelp();
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --build-info
+    if StrCmp(arg, "--build-info"c) == 0 {
+      PrintStrLn("Compiler Build Information:");
+      PrintStr("  Name: "c);
+      PrintStrLn(COMPILER_NAME);
+      PrintStr("  Version: "c);
+      PrintStrLn(COMPILER_VERSION);
+      PrintStr("  Build: "c);
+      PrintStrLn(COMPILER_BUILD);
+      PrintStr("  Target: "c);
+      PrintStrLn("x86_64-linux-elf");
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --config
+    if StrCmp(arg, "--config"c) == 0 {
+      PrintStrLn("Compiler Configuration:");
+      PrintStr("  Targets: x86_64, arm64, riscv64, arm_cm"c);
+      PrintStrLn("");
+      PrintStr("  Formats: elf, pe, macho"c);
+      PrintStrLn("");
+      PrintStr("  Optimization: O0, O1, O2, O3, Osafe"c);
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --no-opt (disable optimizations)
+    if StrCmp(arg, "--no-opt"c) == 0 {
+      self.opts.optLevel := OPT_NONE;
+      return;
+    }
+    
+    // --no-lint (disable linter)
+    if StrCmp(arg, "--no-lint"c) == 0 {
+      self.opts.enableLint := false;
+      return;
+    }
+  }
+  
+  fn parseShortFlags(arg: int64, argLen: int64): void {
+    var i: int64 := 1;
+    while i < argLen {
+      var c: int64 := peek8(arg + i);
+      
+      if c == 111 {  // 'o'
+        // -o next arg is output
+        if i + 1 < argLen {
+          self.opts.outputFile := arg + i + 1;
+        }
+      } else if c == 79 {  // 'O'
+        // -Olevel
+        var level: int64 := peek8(arg + i + 1);
+        if level == 48 {  // '0'
+          self.opts.optLevel := OPT_NONE;
+        } else if level == 49 {  // '1'
+          self.opts.optLevel := OPT_O1;
+        } else if level == 50 {  // '2'
+          self.opts.optLevel := OPT_O2;
+        } else if level == 51 {  // '3'
+          self.opts.optLevel := OPT_O3;
+        }
+      } else if c == 118 {  // 'v'
+        self.opts.enableVerbose := true;
+      } else if c == 100 {  // 'd'
+        self.opts.enableDebug := true;
+      } else if c == 108 {  // 'l'
+        self.opts.enableLint := true;
+      } else if c == 71 {  // 'g'
+        self.opts.enableDebug := true;
+      } else if c == 119 {  // 'W'
+        if i + 1 < argLen {
+          var next: int64 := peek8(arg + i + 1);
+          if next == 101 {  // 'e'
+            self.opts.warningsAsErrors := true;
+          } else if next == 97 {  // 'a'
+            self.opts.warnAll := true;
+          }
+        }
+      }
+      
+      i := i + 1;
+    }
+  }
+  
+  fn printHelp(): void {
+    PrintStrLn("Usage: lyxc [options] <input> [-o <output>]");
+    PrintStrLn("");
+    PrintStrLn("Options:");
+    PrintStrLn("  --std-path=PATH    Stdlib path override");
+    PrintStrLn("  --arch=ARCH        Architecture: x86_64, arm64, riscv");
+    PrintStrLn("  --target=<arch>     Target architecture: x86_64, arm64, riscv64, arm_cm");
+    PrintStrLn("  --format=<fmt>     Output format: elf, pe, macho");
+    PrintStrLn("  --opt=<level>      Optimization: O0, O1, O2, O3, Osafe");
+    PrintStrLn("  --no-opt           Disable IR optimizations");
+    PrintStrLn("  --no-lint          Disable linter");
+    PrintStrLn("  -o <file>          Output file");
+    PrintStrLn("  --lint             Enable linter");
+    PrintStrLn("  --lint-only        Lint only, skip compilation");
+    PrintStrLn("  --debug            Include debug info");
+    PrintStrLn("  --verbose          Verbose output");
+    PrintStrLn("  --dump-lexer       Dump lexer tokens");
+    PrintStrLn("  --dump-parser      Dump AST");
+    PrintStrLn("  --dump-sema        Dump semantic info");
+    PrintStrLn("  --dump-ir          Dump IR");
+    PrintStrLn("  --dump-asm        Dump assembly");
+    PrintStrLn("  --emit-asm        Emit IR as pseudo-assembler (no binary)");
+    PrintStrLn("  --list             Generate listing");
+    PrintStrLn("  --target-energy=N  Set target energy level (1-5)");
+    PrintStrLn("  --dump-relocs      Dump relocation table");
+    PrintStrLn("  --trace-imports    Trace import resolution");
+    PrintStrLn("  --asm-listing      Generate annotated assembly listing");
+    PrintStrLn("  --mcdc             Instrument for MC/DC coverage");
+    PrintStrLn("  --mcdc-report      Print MC/DC coverage report");
+    PrintStrLn("  --static-analysis  Run static analysis passes");
+    PrintStrLn("  --call-graph       Print call graph");
+    PrintStrLn("  --map-file         Generate memory map file");
+    PrintStrLn("  --version         Show version");
+    PrintStrLn("  --help             Show this help");
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Pipeline Orchestration
+  // ---------------------------------------------------------------------------
+  
+  pub fn Compile(inputFile: pchar): int64 {
+    if self.opts.enableVerbose {
+      PrintStr("Compiling: "c);
+      PrintStrLn(inputFile);
+    }
+    
+    // Stage 1: Lexer
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 1: Lexing...");
+    }
+    
+    var source: pchar := FileReadAll(inputFile);
+    if source == 0 as pchar {
+      EPrintStr("Error: Cannot read input file: "c);
+      EPrintStrLn(inputFile);
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    
+    var lexer: int64 := TLexer.Create(source, StrLen(source));
+    lexer.Init();
+    
+    if self.opts.dumpLexer {
+      self.dumpTokens(lexer);
+    }
+    
+    // Stage 2: Parser
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 2: Parsing...");
+    }
+    
+    var parser: int64 := TParser.Create();
+    parser.Init(lexer);
+    var astRoot: int64 := parser.Parse();
+    
+    if parser.HasErrors() {
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    
+    if self.opts.dumpParser {
+      self.dumpAST(astRoot);
+    }
+    
+    // Stage 3: Semantic Analysis
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 3: Semantic Analysis...");
+    }
+    
+    var sema: int64 := TSema.Create();
+    sema.Init();
+    var semaResult: int64 := sema.Analyze(astRoot);
+    
+    if semaResult != 0 {
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    
+    if self.opts.dumpSema {
+      self.dumpSemaInfo(sema);
+    }
+    
+    // Stage 4: Linter (optional)
+    if self.opts.enableLint {
+      if self.opts.enableVerbose {
+        PrintStrLn("Stage 4: Linting...");
+      }
+      
+      var linter: int64 := TLinter.Create();
+      var lintResult: int64 := linter.Lint(astRoot);
+      
+      if lintResult != 0 {
+        self.warningCount := self.warningCount + lintResult;
+        
+        if self.opts.warningsAsErrors {
+          self.exitCode := 1;
+          return self.exitCode;
+        }
+      }
+    }
+    
+    // Stage 5: Early exit for lint-only mode
+    if self.opts.lintOnly {
+      if self.opts.enableVerbose {
+        PrintStrLn("Lint-only mode: skipping compilation");
+      }
+      return self.exitCode;
+    }
+    
+    // Stage 5: IR Generation
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 5: IR Generation...");
+    }
+
+    // Create IR module and lower AST → IR
+    var irMod: IRModule := new IRModule();
+    irMod.init();
+
+    var lower: IRLower := new IRLower();
+    lower.init(irMod as int64, astRoot, 0, 0 as pchar);
+    lower.lowerModule(astRoot);
+
+    if self.opts.dumpIR {
+      self.dumpIR(irMod as int64);
+    }
+
+    // Stage 6: Optimization
+    if self.opts.optLevel > OPT_NONE {
+      if self.opts.enableVerbose {
+        PrintStrLn("Stage 6: Optimizing...");
+      }
+
+      var optimizer: IROptimize := new IROptimize();
+      optimizer.init(irMod);
+      optimizer.optimize();
+
+      if self.opts.enableVerbose {
+        PrintStr("Optimization passes: "c);
+        PrintInt(optimizer.passCount);
+        PrintStrLn(" iterations"c);
+      }
+    }
+
+    // Stage 7: Inlining (if enabled)
+    // TODO: Wire up ir_inline when ready
+
+    // Stage 7: Code Generation
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 7: Code Generation...");
+    }
+
+    var codeBuffer: int64 := 0;
+
+    if self.opts.target == TARGET_X86_64 {
+      codeBuffer := self.emitX86_64(irMod as int64);
+    } else if self.opts.target == TARGET_ARM64 {
+      codeBuffer := self.emitARM64(irMod as int64);
+    } else if self.opts.target == TARGET_RISCV64 {
+      codeBuffer := self.emitRISCV(irMod as int64);
+    } else if self.opts.target == TARGET_ARM_CM {
+      codeBuffer := self.emitARMCm(irMod as int64);
+    }
+
+    if codeBuffer == 0 {
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
+    // CLI P2: Dump relocations if requested
+    if self.opts.dumpRelocs {
+      self.dumpRelocs();
+    }
+
+    // CLI P3: Analysis and instrumentation after codegen
+    if self.opts.asmListing {
+      self.dumpASMListing(codeBuffer, self.codeSize);
+    }
+    if self.opts.callGraph {
+      self.dumpCallGraph(irMod as int64);
+    }
+    if self.opts.mapFile {
+      self.writeMapFile(outputFile, codeBuffer, self.codeSize);
+    }
+    if self.opts.staticAnalysis {
+      self.runStaticAnalysis(irMod as int64);
+    }
+    if self.opts.mcdc {
+      self.instrumentMCDC(codeBuffer, self.codeSize);
+    }
+    if self.opts.mcdcReport {
+      self.printMCDCReport();
+    }
+
+    if self.opts.dumpASM {
+      self.dumpASM(codeBuffer, self.codeSize);
+    }
+    
+    // Stage 8: Binary Writing
+    if self.opts.enableVerbose {
+      PrintStrLn("Stage 8: Writing Binary...");
+    }
+    
+    // Emit ASM mode: skip binary writing
+    if self.opts.emitASM {
+      if self.opts.enableVerbose {
+        PrintStrLn("Emit-ASM mode: skipping binary write");
+      }
+      // Output assembly instead
+      self.emitASMFile(outputFile, codeBuffer, self.codeSize);
+      return self.exitCode;
+    }
+    
+    var outputFile: pchar := self.opts.outputFile;
+    if outputFile == 0 as pchar {
+      // Default output name
+      outputFile := "a.out"c;
+    }
+    
+    var writeResult: bool := self.writeBinary(outputFile, codeBuffer, self.codeSize);
+    
+    if not writeResult {
+      EPrintStrLn("Error: Cannot write output file");
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    
+    if self.opts.enableVerbose {
+      PrintStr("Wrote: "c);
+      PrintStrLn(outputFile);
+    }
+    
+    return self.exitCode;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Code Emission
+  // ---------------------------------------------------------------------------
+
+  fn emitX86_64(irMod: int64): int64 {
+    var emitter: Emitx86 := new Emitx86();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+
+  fn emitARM64(irMod: int64): int64 {
+    var emitter: EmitARM64 := new EmitARM64();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+
+  fn emitRISCV(irMod: int64): int64 {
+    var emitter: RISCVEmitter := new RISCVEmitter();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+
+  fn emitARMCm(irMod: int64): int64 {
+    var emitter: ARMCMEmitter := new ARMCMEmitter();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Binary Writing
+  // ---------------------------------------------------------------------------
+  
+  fn writeBinary(path: pchar, code: int64, size: int64): bool {
+    if self.opts.format == FORMAT_ELF {
+      return self.writeELF(path, code, size);
+    } else if self.opts.format == FORMAT_PE {
+      return self.writePE(path, code, size);
+    } else if self.opts.format == FORMAT_MACHO {
+      return self.writeMachO(path, code, size);
+    }
+    return false;
+  }
+  
+  fn writeELF(path: pchar, code: int64, size: int64): bool {
+    var writer: int64 := ELF64Writer.Create();
+    writer.SetEntry(0x401000);
+    writer.SetTextSection(code, size, 0x401000);
+    
+    var output: int64 := writer.Write();
+    var outputSize: int64 := writer.GetSize();
+    
+    var result: bool := FileWriteAll(path, output as pchar, outputSize);
+    
+    writer.Free();
+    
+    return result;
+  }
+  
+  fn writePE(path: pchar, code: int64, size: int64): bool {
+    var writer: int64 := PE64Writer.Create();
+    writer.SetEntry(0x401000);
+    writer.SetTextSection(code, size, 0x401000);
+    
+    var output: int64 := writer.Write();
+    var outputSize: int64 := writer.GetSize();
+    
+    var result: bool := FileWriteAll(path, output as pchar, outputSize);
+    
+    writer.Free();
+    
+    return result;
+  }
+  
+  fn writeMachO(path: pchar, code: int64, size: int64): bool {
+    var writer: int64 := MachO64Writer.Create();
+    writer.SetEntry(0x1000);
+    writer.SetTextSection(code, size, 0x1000);
+    
+    var output: int64 := writer.Write();
+    var outputSize: int64 := writer.GetSize();
+    
+    var result: bool := FileWriteAll(path, output as pchar, outputSize);
+    
+    writer.Free();
+    
+    return result;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Dump Functions
+  // ---------------------------------------------------------------------------
+  
+  fn dumpTokens(lexer: int64): void {
+    var l: int64 := lexer as TLexer;
+    PrintStrLn("=== LEXER TOKENS ===");
+    
+    var tok: int64 := l.Next();
+    while tok != 0 {
+      var kind: int64 := l.TokKind(tok);
+      PrintStr("Token "c);
+      PrintInt(kind);
+      PrintStr(": "c);
+      var text: pchar := l.TokText(tok);
+      if text != 0 as pchar {
+        PrintStrLn(text);
+      } else {
+        PrintStrLn("(null)");
+      }
+      tok := l.Next();
+    }
+  }
+  
+  fn dumpAST(astRoot: int64): void {
+    PrintStrLn("=== PARSER AST ===");
+    // Would dump AST nodes
+  }
+  
+  fn dumpSemaInfo(sema: int64): void {
+    PrintStrLn("=== SEMANTIC INFO ===");
+    // Would dump symbol table
+  }
+  
+  fn dumpIR(irMod: int64): void {
+    PrintStrLn("=== IR DUMP ===");
+    // Would dump IR
+  }
+  
+  fn dumpASM(code: int64, size: int64): void {
+    PrintStrLn("=== ASSEMBLY ===");
+    // Would dump disassembly
+  }
+  
+  fn emitASMFile(path: pchar, code: int64, size: int64): void {
+    // Write assembly to file instead of binary
+    // For now, dump to stdout
+    PrintStrLn("=== EMITTED ASSEMBLY ===");
+    PrintStr("Output written to: "c);
+    PrintStrLn(path);
+  }
+
+  fn dumpRelocs(): void {
+    PrintStrLn("=== RELOCATION TABLE ===");
+    // Relocations are generated during codegen patching
+    // For now, print placeholder
+    PrintStrLn("No relocations to dump (static binary)");
+  }
+
+  fn traceImportStart(): void {
+    if self.opts.traceImports {
+      PrintStrLn("[import] Starting import resolution");
+    }
+  }
+
+  fn traceImportDone(): void {
+    if self.opts.traceImports {
+      PrintStrLn("[import] Import resolution complete");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // CLI P3: Analysis and Instrumentation
+  // ---------------------------------------------------------------------------
+
+  fn dumpASMListing(code: int64, size: int64): void {
+    PrintStrLn("=== ANNOTATED ASSEMBLY LISTING ===");
+    var i: int64 := 0;
+    while (i < size) {
+      var b0: int64 := peek8(code + i);
+      var b1: int64 := peek8(code + i + 1);
+      var b2: int64 := peek8(code + i + 2);
+      var b3: int64 := peek8(code + i + 3);
+      PrintStr("  "c);
+      PrintHex(i);
+      PrintStr(": "c);
+      PrintHexByte(b0);
+      PrintStr(" "c);
+      PrintHexByte(b1);
+      PrintStr(" "c);
+      PrintHexByte(b2);
+      PrintStr(" "c);
+      PrintHexByte(b3);
+      PrintStrLn(""c);
+      i := i + 4;
+    }
+  }
+
+  fn dumpCallGraph(irMod: int64): void {
+    PrintStrLn("=== CALL GRAPH ===");
+    // Walk IR module functions and their call instructions
+    // For now, print placeholder
+    PrintStrLn("Call graph analysis requires IR traversal");
+  }
+
+  fn writeMapFile(outputPath: pchar, code: int64, size: int64): void {
+    PrintStrLn("=== MEMORY MAP ===");
+    PrintStr("Code section: 0x"c);
+    PrintHex(code);
+    PrintStr(" - 0x"c);
+    PrintHex(code + size);
+    PrintStr(" (size: "c);
+    PrintInt(size);
+    PrintStrLn(" bytes)");
+  }
+
+  fn runStaticAnalysis(irMod: int64): void {
+    PrintStrLn("=== STATIC ANALYSIS ===");
+    // Run data-flow, null-pointer, array-bounds analysis
+    // For now, print placeholder
+    PrintStrLn("Static analysis passes require IR traversal");
+  }
+
+  fn instrumentMCDC(code: int64, size: int64): void {
+    PrintStrLn("[MC/DC] Instrumenting code for coverage tracking");
+    // Insert coverage counters at decision points
+    // For now, print placeholder
+  }
+
+  fn printMCDCReport(): void {
+    PrintStrLn("=== MC/DC COVERAGE REPORT ===");
+    PrintStrLn("Total decisions: 0");
+    PrintStrLn("Fully covered: 0");
+    PrintStrLn("With gaps: 0");
+    PrintStrLn("MC/DC coverage: N/A (no instrumentation)");
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Multi-Target Dispatch
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetTargetName(): pchar {
+    if self.opts.target == TARGET_X86_64 {
+      return "x86_64"c;
+    }
+    if self.opts.target == TARGET_ARM64 {
+      return "arm64"c;
+    }
+    if self.opts.target == TARGET_RISCV64 {
+      return "riscv64"c;
+    }
+    if self.opts.target == TARGET_ARM_CM {
+      return "arm_cm"c;
+    }
+    return "unknown"c;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Unit Cache
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetCachedUnit(path: pchar): int64 {
+    return map_get(self.unitCache, path, StrLen(path));
+  }
+  
+  pub fn CacheUnit(path: pchar, unitData: int64): void {
+    map_set(self.unitCache, path, StrLen(path), unitData);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Incremental Compilation
+  // ---------------------------------------------------------------------------
+  
+  fn shouldRebuild(inputFile: pchar, outputFile: pchar): bool {
+    if not FileExists(outputFile) {
+      return true;
+    }
+    
+    var inputTime: int64 := FileModTime(inputFile);
+    var outputTime: int64 := FileModTime(outputFile);
+    
+    return inputTime > outputTime;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Error Handling
+  // ---------------------------------------------------------------------------
+  
+  pub fn ReportError(msg: pchar, line: int64, column: int64): void {
+    EPrintStr("Error");
+    if line > 0 {
+      EPrintStr(": "c);
+      EPrintInt(line);
+      if column > 0 {
+        EPrintStr(":"c);
+        EPrintInt(column);
+      }
+    }
+    EPrintStr(": "c);
+    EPrintStrLn(msg);
+    
+    self.errorCount := self.errorCount + 1;
+  }
+  
+  pub fn ReportWarning(msg: pchar, line: int64, column: int64): void {
+    EPrintStr("Warning");
+    if line > 0 {
+      EPrintStr(": "c);
+      EPrintInt(line);
+      if column > 0 {
+        EPrintStr(":"c);
+        EPrintInt(column);
+      }
+    }
+    EPrintStr(": "c);
+    EPrintStrLn(msg);
+    
+    self.warningCount := self.warningCount + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Statistics
+  // ---------------------------------------------------------------------------
+  
+  pub fn PrintStats(): void {
+    if self.opts.enableVerbose {
+      PrintStrLn("=== COMPILATION STATS ===");
+      PrintStr("Errors: "c);
+      PrintIntLn(self.errorCount);
+      PrintStr("Warnings: "c);
+      PrintIntLn(self.warningCount);
+      PrintStr("Time: "c);
+      PrintInt(Time() - self.buildTime);
+      PrintStrLn("ms");
+    }
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.unitCache != 0 {
+      map_free(self.unitCache);
+    }
+    if self.opts != 0 {
+      free(self.opts as int64);
+    }
+    free(self);
+  }
+};
+
+// ============================================================================
+// Global Compiler Instance
+// ============================================================================
+
+var globalCompiler: int64 := 0;
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  // Initialize compiler
+  globalCompiler := CompilerConfig.Create();
+  var cfg: int64 := globalCompiler as CompilerConfig;
+  
+  // Parse CLI
+  var cliOk: bool := cfg.parseCLI(argc, argv);
+  if not cliOk {
+    return cfg.exitCode;
+  }
+  
+  // Get input file
+  var inputFile: pchar := cfg.opts.inputFile;
+  if inputFile == 0 as pchar {
+    EPrintStrLn("Error: No input file specified");
+    EPrintStrLn("Run with --help for usage");
+    cfg.exitCode := 1;
+    return cfg.exitCode;
+  }
+  
+  // Check if we need to rebuild
+  var outputFile: pchar := cfg.opts.outputFile;
+  if outputFile == 0 as pchar {
+    outputFile := "a.out"c;
+  }
+  
+  if cfg.shouldRebuild(inputFile, outputFile) {
+    // Compile
+    cfg.Compile(inputFile);
+  } else {
+    if cfg.opts.enableVerbose {
+      PrintStr("Skipping "c);
+      PrintStr(inputFile);
+      PrintStrLn(" (already up to date)");
+    }
+  }
+  
+  // Print statistics
+  cfg.PrintStats();
+  
+  // Cleanup
+  var exitCode: int64 := cfg.exitCode;
+  cfg.Free();
+  
+  return exitCode;
+}

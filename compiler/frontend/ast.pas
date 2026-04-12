@@ -62,7 +62,7 @@ type
      // Statements
      nkVarDecl, nkAssign, nkFieldAssign, nkIndexAssign,
      nkIf, nkWhile, nkFor, nkRepeatUntil, nkPool,
-     nkReturn, nkBreak, nkSwitch,
+     nkReturn, nkBreak, nkContinue, nkSwitch,
       nkBlock, nkExprStmt, nkDispose, nkAssert, nkCheck,  // OOP statement + assert (check is expression)
      nkTry, nkThrow,                             // Exception handling
      nkTupleVarDecl,                             // var a, b := tupleExpr
@@ -586,6 +586,11 @@ type
 
   { Break-Statement: break; }
   TAstBreak = class(TAstStmt)
+  public
+    constructor Create(aSpan: TSourceSpan);
+  end;
+
+  TAstContinue = class(TAstStmt)
   public
     constructor Create(aSpan: TSourceSpan);
   end;
@@ -1319,6 +1324,7 @@ begin
     nkPool:        Result := 'Pool';
     nkReturn:      Result := 'Return';
     nkBreak:       Result := 'Break';
+    nkContinue:    Result := 'Continue';
     nkSwitch:      Result := 'Switch';
     nkBlock:       Result := 'Block';
     nkExprStmt:    Result := 'ExprStmt';
@@ -1782,6 +1788,12 @@ end;
 constructor TAstBreak.Create(aSpan: TSourceSpan);
 begin
   inherited Create(nkBreak, aSpan);
+end;
+
+{ TAstContinue }
+constructor TAstContinue.Create(aSpan: TSourceSpan);
+begin
+  inherited Create(nkContinue, aSpan);
 end;
 
 { TAstSwitch }

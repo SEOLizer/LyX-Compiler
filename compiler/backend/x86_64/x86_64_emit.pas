@@ -2375,6 +2375,56 @@ begin
                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                end;
               end
+               // Bootstrap compat: alloc(size) = mmap(0, size, 3, 34, -1, 0)
+               else if instr.ImmStr = 'alloc' then
+               begin
+                 WriteMovRegImm64(FCode, RDI, 0);   // addr = 0
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // size
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                 WriteMovRegImm64(FCode, RDX, 3);            // PROT_READ|PROT_WRITE
+                 WriteMovRegImm64(FCode, R10, 34);           // MAP_PRIVATE|MAP_ANONYMOUS
+                 WriteMovRegImm64(FCode, R8, UInt64(-1));    // fd = -1
+                 WriteMovRegImm64(FCode, R9, 0);             // offset = 0
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+                 WriteSyscall(FCode);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+               // Bootstrap compat: ArgvGet(argv, i) = *(argv + i*8)
+               else if instr.ImmStr = 'ArgvGet' then
+               begin
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));  // argv
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                 if Length(instr.ArgTemps) >= 2 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // i
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RSI, 0);
+                 // lea rax, [rdi + rsi*8]
+                 EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $04); EmitU8(FCode, $F7);
+                 // mov rax, [rax]
+                 EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
                else if instr.ImmStr = 'munmap' then
                begin
                  // munmap(addr, length)
@@ -2960,6 +3010,56 @@ begin
                   WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
                   WriteSyscall(FCode);
                   
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
+                // Bootstrap compat: alloc(size) = mmap(0, size, 3, 34, -1, 0)
+                else if instr.ImmStr = 'alloc' then
+                begin
+                  WriteMovRegImm64(FCode, RDI, 0);
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RSI, 0);
+                  WriteMovRegImm64(FCode, RDX, 3);
+                  WriteMovRegImm64(FCode, R10, 34);
+                  WriteMovRegImm64(FCode, R8, UInt64(-1));
+                  WriteMovRegImm64(FCode, R9, 0);
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
+                  WriteSyscall(FCode);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
+                // Bootstrap compat: ArgvGet(argv, i) = *(argv + i*8)
+                else if instr.ImmStr = 'ArgvGet' then
+                begin
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                  if Length(instr.ArgTemps) >= 2 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                    WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RSI, 0);
+                  // lea rax, [rdi + rsi*8]
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $04); EmitU8(FCode, $F7);
+                  // mov rax, [rax]
+                  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
                   if instr.Dest >= 0 then
                   begin
                     slotIdx := fn.LocalCount + instr.Dest;
@@ -7184,9 +7284,12 @@ begin
       // Korrekt.
       offset := FLabelPositions[labelIdx].Pos - (FJumpPatches[i].Pos + 4);
       FCode.PatchU32LE(FJumpPatches[i].Pos, Cardinal(offset));
+    end
+    else
+    begin
+      // Debug: print unresolved label name
+      WriteLn(StdErr, '[DEBUG] Unresolved jump patch: label="', FJumpPatches[i].LabelName, '"');
     end;
-    // Note: If labelIdx < 0, the function was not found. This should not happen
-    // if all imported functions (including private ones) are properly loaded.
   end;
   
   // FBranchPatches auflösen (für irJmp, irBrTrue, irBrFalse)
