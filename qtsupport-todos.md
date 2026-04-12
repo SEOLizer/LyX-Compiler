@@ -1,120 +1,153 @@
-# Qt Support for Lyx - Implementation Plan
+# Qt Support for Lyx - Implementation Plan (REVISED)
 
-## Status: Research Phase Complete
+## ⚠️ WICHTIG: Qt-Bindings in Lyx, nicht Pascal!
 
-## Research Findings (2026-04-12)
+Der FFI-Mechanismus in Lyx funktioniert wie in `std/net/tls.lyx`:
+```lyx
+extern fn SSL_new(ctx: int64): int64 link "libssl.so.3";
+```
 
-### Available Qt Bindings for FreePascal
+Qt hat aber das Problem: Viele Widgets sind C++ (keine C-FFI möglich).
 
-| Binding | Status | Notes |
-|---------|--------|-------|
-| **libqt5pas** | ✅ Stable | Most widely available, mature |
-| **libqt6pas** | ⚠️ Emerging | Less mature, fewer packages |
-| Lazarus LCL Qt5 | ✅ Stable | Full widget set support |
-| Lazarus LCL Qt6 | ⚠️ Beta | In development |
+---
 
-### Key Observations
+## Architektur-Ansatz
 
-1. **Qt5 is recommended** for production use
-   - `libqt5pas` available in most Linux distros
-   - Full widget set (QWidget, QMainWindow, QDialog)
-   - Mature OpenGL integration via QOpenGLWidget
+### Option A: OpenGL-only (einfach, C-FFI reicht)
 
-2. **Qt6 is emerging** but less mature
-   - `qt6pas` is the corresponding binding
-   - Wayland native support (no XWayland needed)
-   - Fewer packages in distros
+Qt OpenGL hat C-kompatible Funktionen:
+- `QOpenGLContext` (C++ Wrapper nötig)
+- `gl*` Funktionen (Standard OpenGL - C-FFI direkt!)
+- `EGL` / `GLX` (C-FFI direkt)
 
-3. **OpenGL in Qt**:
-   - QGLWidget (Qt5) / QGLWidget (Qt6) - obsolete
-   - QOpenGLWidget - recommended replacement
-   - Requires proper EGL/GLX setup on Wayland
+→ **Qt OpenGL ist via Lyx FFI machbar!**
 
-4. **Wayland considerations**:
-   - Qt5 on Wayland requires XWayland for OpenGL
-   - Qt6 has native Wayland support
+### Option B: C++ Wrapper für Widgets
+
+Für QWidget, QLabel, QPushButton brauchen wir einen C-Wrapper:
+```c
+// qt_wrapper.h
+void* lyx_qwidget_create(void* parent, int x, int y, int w, int h);
+void  lyx_qwidget_show(void* widget);
+void  lyx_qpushbutton_set_text(void* btn, const char* text);
+```
 
 ---
 
 ## Implementation Work Packages
 
-### WP1: Dependency Management
-- [ ] Add `libqt5pas` package detection to Lyx build system
-- [ ] Document required system packages (Debian: `libqt5pas`, Arch: `qt5-base` with pascal bindings)
-- [ ] Create optional dependency flag for Qt support
+### WP1: Qt Core via Lyx FFI (Phase 1 - OpenGL)
+- [ ] `std/qt5_core.lyx` - Qt Core C-kompatible Funktionen
+  - `QCoreApplication::exec()` - via C-Wrapper
+  - `QTimer` - via C-Wrapper
+  - `QString::toUtf8()` - via QByteArray C-API
+- [ ] `std/qt5_gl.lyx` - OpenGL Bindings
+  - `glClear`, `glDrawArrays`, `glVertexAttribPointer` etc.
+  - `glCreateShader`, `glShaderSource`, `glCompileShader`
+  - `glCreateProgram`, `glAttachShader`, `glLinkProgram`
+- [ ] Test: Minimal OpenGL-Fenster mit Lyx
 
-### WP2: Basic Qt Integration (Phase 1)
-- [ ] Create `std/qt5.lyx` wrapper unit
-  - Initialize/QFinalize Qt application
-  - Basic QApplication singleton
-  - Event loop integration with Lyx runtime
-- [ ] Test minimal Qt5 app from Lyx
+### WP2: EGL/GLX Surface (Phase 2)
+- [ ] `std/qt5_egl.lyx` - EGL für Wayland/X11
+  - `eglGetDisplay`, `eglInitialize`, `eglCreateWindowSurface`
+  - `eglBindAPI`, `eglSwapBuffers`
+- [ ] `std/qt5_glx.lyx` - GLX (X11 Fallback)
+  - `glXChooseVisual`, `glXCreateContext`, `glXMakeCurrent`
 
-### WP3: Widget System (Phase 2)
-- [ ] Implement QWidget wrappers
-  - QLabel, QPushButton, QLineEdit, QTextEdit
-  - QMainWindow, QDialog
-- [ ] Create signal/slot mechanism for Lyx
-- [ ] Layout system (QVBoxLayout, QHBoxLayout, QGridLayout)
+### WP3: C++ Wrapper für Qt Widgets (Phase 3)
+- [ ] Erstelle `qt_wrapper.cpp` mit:
+  ```cpp
+  extern "C" {
+    void* QApplication_create();
+    void* QWidget_create(void* parent, int x, int y, int w, int h);
+    void QWidget_show(void*);
+    void QWidget_setTitle(void*, const char* title);
+    void* QPushButton_create(void* parent, const char* label);
+    void QPushButton_setText(void*, const char* text);
+    void* QLabel_create(void* parent, const char* text);
+    void QLabel_setText(void*, const char* text);
+  }
+  ```
+- [ ] Kompiliere als `libqtlyx.so`
+- [ ] `std/qt5_widgets.lyx` - Lyx FFI Bindings
 
-### WP4: Graphics & OpenGL (Phase 3)
-- [ ] QPainter support for 2D graphics
-- [ ] QOpenGLWidget integration
-- [ ] Shader program helpers
-- [ ] Texture management utilities
+### WP4: Erweiterte Widgets (Phase 4)
+- [ ] QLineEdit, QTextEdit
+- [ ] QMainWindow, QDialog
+- [ ] Layouts: QVBoxLayout, QHBoxLayout
+- [ ] Signal/Slot Callback-Registry
 
-### WP5: Advanced Widgets (Phase 4)
-- [ ] QTableWidget, QTreeWidget
-- [ ] QMenuBar, QToolBar, QStatusBar
-- [ ] QDockWidget
-- [ ] QTabWidget, QSplitter
+### WP5: Application & Event Loop (Phase 5)
+- [ ] `QApplication` Singleton
+- [ ] Lyx main() → QApplication.exec()
+- [ ] Exit-Handler für sauberes Shutdown
 
 ---
 
 ## Open Questions
 
-1. **Integration approach**: Should Qt be a std unit or a separate library?
-   - Pro std: auto-import, familiar usage
-   - Pro separate: lighter binaries when not needed
+1. **OpenGL-only starten?** 
+   - Problem: Keine UI-Elemente (Buttons, Labels)
+   - Pro: Simpler, schnell umsetzbar
+   - Contra: Nicht vollständig
 
-2. **Event loop**: How to integrate Qt event loop with Lyx runtime?
-   - Option A: Qt owns main loop, Lyx registers callbacks
-   - Option B: Lyx owns loop, Qt uses processEvents()
+2. **QML/Qt Quick statt Widgets?**
+   - QML hat bessere C-API (QQmlEngine, QQmlComponent)
+   - Aber: QML ist eigenständige Sprache, nicht Lyx
+   - Bleibt bei Widgets
 
-3. **Memory management**: Qt uses parent-child ownership model
-   - Lyx has no classes yet - should we add class support first?
-   - Or use manual delete with RAII pattern
-
-4. **String handling**: Qt uses QString, Lyx uses pchar
-   - Need conversion layer ( QString → pchar for display strings)
+3. **Qt Version?**
+   - Qt5: Stabil, Libs verfügbar
+   - Qt6: Weniger Libs in Distros
 
 ---
 
-## Dependencies to Install (for testing)
+## Referenz: Lyx FFI Pattern
+
+Aus `std/net/tls.lyx`:
+```lyx
+// OpenSSL Funktionen
+extern fn SSL_new(ctx: int64): int64 link "libssl.so.3";
+
+// Opaque Pointer Wrapper
+pub type TLSContext = struct {
+  ctx: int64;           // SSL_CTX* pointer
+  initialized: int64;  // 1 if successfully initialized
+};
+
+// High-level API
+pub fn TLSInit(): TLSContext { ... }
+```
+
+→ Qt-Bindings folgen demselben Pattern!
+
+---
+
+## Build Dependencies
 
 ```bash
-# Debian/Ubuntu
-sudo apt install libqt5pas libqt5xmlpatterns
+# Für C++ Wrapper (WP3)
+sudo apt install qtbase5-dev
 
-# Arch Linux
-sudo pacman -S qt5-base
-
-# Fedora
-sudo dnf install qt5-qtbase qt5-qtbase-common
+# Kompilieren des Wrappers
+g++ -shared -fPIC -I/usr/include/qt5/QtCore \
+    -I/usr/include/qt5/QtWidgets \
+    qt_wrapper.cpp -o libqtlyx.so \
+    -lQt5Core -lQt5Widgets -lQt5Gui
 ```
 
 ---
 
 ## Next Steps
 
-1. **Decision needed**: Qt5 or Qt6 for initial implementation?
-2. **Architecture decision**: Event loop integration approach
-3. **Priority**: Is Qt support high priority vs other std units?
+1. **Entscheidung**: Mit OpenGL-only starten oder direkt C++ Wrapper?
+2. **Design**: Welche Qt-Funktionen zuerst?
+3. **Prototyp**: Minimaler Test mit bestehendem Lyx-FFI
 
 ---
 
-## References
+## Referenzen
 
-- Lazarus Qt5: https://wiki.lazarus.freepascal.org/Qt5
-- libqt5pas: https://github.com/davidbannon/libqt5pas
-- Qt6 pascal: https://github.com/davidbannon/qt6pas
+- Lyx FFI: `std/net/tls.lyx`, `std/net/ssh.lyx`
+- Qt Docs: https://doc.qt.io/qt-5/
+- Qt C++ → C Wrapper: https://wiki.lazarus.freepascal.org/Qt5_Interface
