@@ -9,6 +9,7 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 |------|--------------|
 | `std/math` | Integer-Mathematik, Fixed-Point, Trigonometrie |
 | `std/vector` | Vec2 2D-Vektor, Rotation, Normalisierung |
+| `std/vector_batch` | Batch-Verarbeitung für Vec2-Arrays |
 | `std/rect` | Rect Bounding Box, Flächenberechnung |
 | `std/circle` | Circle/Range für Umkreissuchen |
 | `std/color` | RGBA Farben, HSL, Hex-Konvertierung |
@@ -20,7 +21,9 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/io` | Print/Printf, Formatierung |
 | `std/env` | Command-Line Argumente |
 | `std/time` | Datum/Zeit, Kalenderfunktionen |
+| `std/datetime` | Erweiterte Datum/Zeit-Operationen |
 | `std/geo` | Geolocation, Koordinaten, Distanzen |
+| `std/country` | Ländercodes (ISO 3166-1), Ländernamen |
 | `std/crt` | ANSI Terminal-Steuerung |
 | `std/crt_raw` | Raw-Mode Input (experimentell) |
 | `std/pack` | Binary Serialisierung |
@@ -29,8 +32,23 @@ Dieses Verzeichnis enthält standardisierte Units, die als umfassende Bibliothek
 | `std/process` | Prozess-Management (fork/exec/wait) |
 | `std/json` | JSON Parser und Serializer |
 | `std/alloc` | Explizite Speicherverwaltung (malloc/free, Pool) |
-| `std/hash` | Hash-Funktionen (FNV, CRC32, SHA-256) |
 | `std/sort` | Effiziente Sortieralgorithmen (QuickSort) |
+| `std/base64` | Base64 Encoding und Decoding |
+| `std/buffer` | Buffer-Utilities (Hex, Base64 Helpers) |
+| `std/url` | URL Parser und Builder |
+| `std/uuid` | UUID Generation (v4, v7) und Parsing |
+| `std/html` | HTML Escaping, Unescaping, Tag-Utilities |
+| `std/xml` | XML Parser und Generator |
+| `std/yaml` | YAML Parser und Generator |
+| `std/ini` | INI-Datei Parser und Writer |
+| `std/os` | OS-Level Funktionen, System-Calls |
+| `std/system` | System-Informationen |
+| `std/log` | Logging-Framework |
+| `std/stats` | Statistische Funktionen |
+| `std/stats_batch` | Batch-Verarbeitung für Statistiken |
+| `std/math_batch` | Batch-Verarbeitung für Mathematik |
+| `std/qbool` | Quotient Boolean (ternäre Logik) |
+| `std/error` | Error-Code Verwaltung |
 
 ---
 
@@ -1077,6 +1095,327 @@ stringify(json, "Status|200|OK");
 
 ---
 
+## std/base64.lyx
+
+Base64 Encoding und Decoding für Datenübertragung und Speicherung.
+
+### Encoding
+- `Encode(input, output: pchar): int64` - Kodiert Input zu Base64
+- `EncodeBytes(input, len: int64, output: pchar): int64` - Kodiert Byte-Array
+
+### Decoding
+- `Decode(input, output: pchar): int64` - Dekodiert Base64 zu Raw-Bytes
+- `DecodeToString(input, output: pchar): int64` - Dekodiert zu String
+
+### Utilities
+- `EncodeLength(input_len: int64): int64` - Berechnet Output-Länge
+- `DecodeLength(input_len: int64): int64` - Berechnet Output-Länge
+- `IsValidBase64(s: pchar): bool` - Prüft gültige Base64-Zeichen
+
+---
+
+## std/buffer.lyx
+
+Buffer-Utilities für effiziente Byte-Verarbeitung.
+
+### Buffer-Operationen
+- `HexEncode(input, output: pchar): int64` - Hex-Encoding
+- `HexDecode(input, output: pchar): int64` - Hex-Decoding
+- `Base64Helper(input, output: pchar): int64` - Base64-Hilfsfunktionen
+
+### Vergleiche
+- `BufferEquals(a, b: pchar): bool` - Byte-für-Byte Vergleich
+- `BufferCompare(a, b: pchar): int64` - Lexikografisch (-1, 0, 1)
+
+---
+
+## std/url.lyx
+
+URL Parser und Builder für Web-Anwendungen.
+
+### Parsing
+- `Parse(url: pchar): int64` - URL parsen (gibt Handle zurück)
+- `GetScheme(url: pchar): pchar` - Protokoll (http, https, etc.)
+- `GetHost(url: pchar): pchar` - Domain
+- `GetPort(url: pchar): int64` - Portnummer
+- `GetPath(url: pchar): pchar` - Pfad
+- `GetQuery(url: pchar): pchar` - Query-String
+- `GetFragment(url: pchar): pchar` - Fragment (#anchor)
+
+### Bauen
+- `Build(scheme, host, port, path, query, fragment: pchar): pchar` - URL zusammensetzen
+- `BuildWithDefaults(scheme, host, path: pchar): pchar` - Mit Standardwerten
+
+### Manipulation
+- `SetScheme(url, scheme: pchar): bool` - Scheme ändern
+- `SetHost(url, host: pchar): bool` - Host ändern
+- `SetPort(url, port: int64): bool` - Port ändern
+- `AddQueryParam(url, key, value: pchar): bool` - Query-Parameter hinzufügen
+
+---
+
+## std/uuid.lyx
+
+UUID Generation und Parsing (RFC 4122).
+
+### UUID-Typen
+- `UUID_VERSION_4` - Random UUID
+- `UUID_VERSION_7` - Unix-Timestamp-basiert
+
+### Generation
+- `GenerateV4(output: pchar): bool` - UUID v4 (random) generieren
+- `GenerateV7(output: pchar): bool` - UUID v7 (timestamp) generieren
+- `GenerateV4String(output: pchar): bool` - UUID v4 als String
+- `GenerateV7String(output: pchar): bool` - UUID v7 als String
+
+### Konvertierung
+- `ToString(uuid, output: pchar): bool` - UUID zu String (8-4-4-4-12)
+- `FromString(str, output: pchar): bool` - String zu UUID parsen
+
+### Vergleich
+- `Compare(uuidA, uuidB: pchar): int64` - Vergleichen (-1, 0, 1)
+- `IsNil(uuid: pchar): bool` - Prüfen ob Nil-UUID
+- `IsValid(str: pchar): bool` - String-Format validieren
+- `GetVersion(uuid: pchar): int64` - UUID-Version (1, 4, 7)
+- `GetVariant(uuid: pchar): int64` - UUID-Variant
+
+---
+
+## std/html.lyx
+
+HTML Utilities für Web-Anwendungen.
+
+### Escaping
+- `Escape(input, output: pchar): int64` - HTML-Sonderzeichen escapen
+- `Unescape(input, output: pchar): int64` - HTML-Entities zurückwandeln
+
+### Tag-Utilities
+- `GetTagName(html, output: pchar): int64` - Tag-Name extrahieren
+- `IsClosingTag(html: pchar): bool` - Prüfen ob </tag>
+- `IsSelfClosing(html: pchar): bool` - Prüfen ob <tag/>
+
+### Validierung
+- `HasTags(s: pchar): bool` - Enthält HTML-Tags?
+- `NeedsEscape(s: pchar): bool` - Muss escapet werden?
+- `ValidateBalance(html: pchar): int64` - Tags ausgewogen?
+
+### Manipulation
+- `StripTags(input, output: pchar): int64` - Tags entfernen, Text behalten
+- `EncodeSpaces(input, output: pchar): int64` - Space zu +
+- `DecodeSpaces(input, output: pchar): int64` - + zu Space
+
+---
+
+## std/xml.lyx
+
+XML Parser und Generator mit voller Bidirektionalität.
+
+### Typen
+- `XML_NODE_ELEMENT`, `XML_NODE_TEXT`, `XML_NODE_CDATA`, `XML_NODE_COMMENT`
+
+### Parsing
+- `ParseString(input, output: pchar): int64` - XML parsen
+- `XMLToArray(xml, output: pchar): int64` - XML zu Array konvertieren
+
+### Generierung
+- `WriteDeclaration(output, version, encoding: pchar): int64` - XML-Declaration
+- `WriteElement(output, tagName, attrs, attrCount, text, indent: pchar): int64` - Element schreiben
+- `WriteDocument(output, rootName, rootText, version, encoding: pchar): int64` - Vollständiges Dokument
+
+### Escaping
+- `EscapeText(input, output: pchar): int64` - Text escapen
+- `EscapeAttribute(input, output: pchar): int64` - Attribut-Wert escapen
+
+### Array <-> XML
+- `ArrayToXML(arr, output: pchar): int64` - Array zu XML
+- `CreateArrayEntry(name, text, output: pchar): int64` - Array-Eintrag erstellen
+- `GetArrayEntryName(arr, output: pchar): int64` - Name aus Eintrag
+- `GetArrayEntryText(arr, output: pchar): int64` - Text aus Eintrag
+
+### Validierung
+- `IsValid(xml: pchar): bool` - Gültiges XML?
+- `CountElements(xml: pchar): int64` - Element-Anzahl
+- `PrettyPrint(input, output: pchar, indentSize: int64): int64` - Formatiert ausgeben
+
+---
+
+## std/yaml.lyx
+
+YAML Parser und Generator für Konfigurationsdateien.
+
+### Typen
+- `YAML_NULL`, `YAML_BOOL`, `YAML_INT`, `YAML_FLOAT`, `YAML_STRING`, `YAML_SEQ`, `YAML_MAP`
+
+### Parsing
+- `ParseString(input: pchar): int64` - YAML parsen
+
+### Getter
+- `GetString(doc, path, default: pchar): pchar` - String-Wert
+- `GetInt(doc, path: pchar, default: int64): int64` - Integer-Wert
+- `GetFloat(doc, path: pchar, default: f64): f64` - Float-Wert
+- `GetBool(doc, path: pchar, default: bool): bool` - Boolean-Wert
+
+### Setter
+- `SetString(doc, path, value: pchar): void` - String setzen
+- `SetInt(doc, path: pchar, value: int64): void` - Integer setzen
+
+### Serialisierung
+- `WriteString(doc, output: pchar, max_len: int64): int64` - YAML schreiben
+- `EscapeString(input, output: pchar): int64` - String escapen
+- `UnescapeString(input, output: pchar): int64` - String unescapen
+
+### Validierung
+- `IsValidKey(s: pchar): bool` - Gültiger Key?
+- `NeedsQuoting(s: pchar): bool` - Muss quoted werden?
+
+---
+
+## std/ini.lyx
+
+INI-Datei Parser und Writer für Konfigurationsdateien.
+
+### Konstanten
+- `MAX_SECTIONS`, `MAX_ENTRIES_PER_SECTION`, `MAX_KEY_LENGTH`, `MAX_VALUE_LENGTH`
+
+### Parsing
+- `ParseString(input: pchar): int64` - INI parsen
+
+### Getter
+- `GetString(doc, section, key, default: pchar): pchar` - String-Wert
+- `GetInt(doc, section, key: pchar, default: int64): int64` - Integer-Wert
+- `GetBool(doc, section, key: pchar, default: bool): bool` - Boolean-Wert
+- `GetFloat(doc, section, key: pchar, default: f64): f64` - Float-Wert
+
+### Setter
+- `SetString(doc, section, key, value: pchar): void` - String setzen
+- `SetInt(doc, section, key: pchar, value: int64): void` - Integer setzen
+
+### Schreiben
+- `WriteString(doc, output: pchar, max_len: int64): int64` - INI schreiben
+
+### Löschen
+- `DeleteKey(doc, section, key: pchar): bool` - Key löschen
+- `DeleteSection(doc, section: pchar): bool` - Section löschen
+
+### Validierung
+- `IsValidSectionName(name: pchar): bool` - Gültiger Section-Name?
+- `IsValidKeyName(name: pchar): bool` - Gültiger Key-Name?
+
+---
+
+## std/os.lyx
+
+OS-Level Funktionen und System-Calls.
+
+### Prozess
+- `GetPid(): int64` - Eigene PID
+- `GetUid(): int64` - User-ID
+- `GetGid(): int64` - Group-ID
+
+### System
+- `GetHostname(output: pchar): int64` - Hostname
+- `GetEnv(name: pchar): pchar` - Environment-Variable
+- `SetEnv(name, value: pchar): int64` - Environment setzen
+
+### Zeit
+- `GetTimestamp(): int64` - Nanoseconds seit Epoch
+- `GetClockTime(): int64` - Clock-Time
+
+---
+
+## std/system.lyx
+
+System-Informationen und -Konfiguration.
+
+### CPU-Info
+- `GetCpuCount(): int64` - Anzahl CPU-Kerne
+- `GetCpuType(): int64` - CPU-Typ
+- `GetCpuFeatures(): int64` - CPU-Features (Flags)
+
+### Speicher
+- `GetTotalMemory(): int64` - Gesamt-RAM
+- `GetFreeMemory(): int64` - Freier RAM
+
+### OS-Info
+- `GetOSName(): pchar` - OS-Name
+- `GetOSVersion(): pchar` - OS-Version
+- `GetArch(): pchar` - Architektur
+
+---
+
+## std/log.lyx
+
+Logging-Framework für Anwendungslogging.
+
+### Log-Level
+- `LOG_DEBUG`, `LOG_INFO`, `LOG_WARN`, `LOG_ERROR`, `LOG_FATAL`
+
+### Logging
+- `Log(level, message: pchar): void` - Log-Nachricht
+- `LogDebug(msg: pchar): void` - Debug-Level
+- `LogInfo(msg: pchar): void` - Info-Level
+- `LogWarn(msg: pchar): void` - Warn-Level
+- `LogError(msg: pchar): void` - Error-Level
+
+### Konfiguration
+- `SetLogLevel(level: int64): void` - Log-Level setzen
+- `SetLogOutput(output: pchar): void` - Output-Ziel
+
+---
+
+## std/stats.lyx
+
+Statistische Funktionen für Datenanalyse.
+
+### Deskriptive Statistik
+- `Mean(data: pchar): f64` - Arithmetisches Mittel
+- `Median(data: pchar): f64` - Median
+- `StdDev(data: pchar): f64` - Standardabweichung
+- `Variance(data: pchar): f64` - Varianz
+- `Min(data: pchar): f64` - Minimum
+- `Max(data: pchar): f64` - Maximum
+
+### Berechnungen
+- `Sum(data: pchar): f64` - Summe
+- `Count(data: pchar): int64` - Anzahl Elemente
+- `Range(data: pchar): f64` - Spannweite (Max - Min)
+
+---
+
+## std/qbool.lyx
+
+Quotient Boolean (ternäre Logik).
+
+### Typen
+- `Q_TRUE` - True
+- `Q_FALSE` - False
+- `Q_NULL` - Undefined/Unknown
+
+### Operationen
+- `QAnd(a, b: int64): int64` - Logisches UND
+- `QOr(a, b: int64): int64` - Logisches ODER
+- `QNot(a: int64): int64` - Logisches NICHT
+
+### Vergleiche
+- `QEquals(a, b: int64): bool` - Gleichheit
+
+---
+
+## std/error.lyx
+
+Error-Code Verwaltung und -Behandlung.
+
+### Error-Typen
+- `ERR_NONE`, `ERR_UNKNOWN`, `ERR_INVALID_INPUT`, `ERR_OUT_OF_MEMORY`, etc.
+
+### Fehlerbehandlung
+- `GetErrorCode(): int64` - Letzten Error-Code holen
+- `SetErrorCode(code: int64): void` - Error-Code setzen
+- `ClearError(): void` - Error zurücksetzen
+- `ErrorToString(code: int64): pchar` - Error-Code zu String
+
+---
+
 ## Verwendung
 
 ### Basis-Import
@@ -1172,37 +1511,6 @@ var ptr: Ptr := pool_alloc(pool, 256);
 // Alles freigeben
 pool_release(pool);
 ```
-
----
-
-## std/hash.lyx
-
-Hash-Funktionen für Datenstrukturen, Integritätsprüfungen und Passwort-Hashing.
-
-### FNV-1a (Fast Non-Cryptographic)
-- `HashFNV1a32(data: pchar): int64` - FNV-1a 32-bit Hash
-- `HashFNV1a32Bytes(data: pchar, len: int64): int64` - Mit Länge
-- `HashFNV1a64(data: pchar): int64` - FNV-1a 64-bit Hash
-- `HashFNV1a64Bytes(data: pchar, len: int64): int64` - Mit Länge
-
-### CRC32 (Checksum)
-- `HashCRC32(data: pchar): int64` - CRC32 Checksum
-- `HashCRC32Bytes(data: pchar, len: int64): int64` - Mit Länge
-
-### SHA-256 (Cryptographic)
-- `SHA256(data: pchar): int64` - SHA-256 Hash (erste 8 Bytes)
-- `SHA256Bytes(data: pchar, len: int64): int64` - Mit Länge
-
-### MD5 (Legacy)
-- `HashMD5(data: pchar): int64` - MD5 Hash
-- `HashMD5Bytes(data: pchar, len: int64): int64` - Mit Länge
-- `HashMD5File(path: pchar, chunk_size: int64): int64` - Datei-Hashing
-
-### Passwort-Hashing
-- `Argon2(password: pchar, salt: pchar): int64` - Argon2
-- `Bcrypt(password: pchar, salt: pchar): int64` - Bcrypt
-- `PBKDF2(password: pchar, salt: pchar, iterations: int64): int64` - PBKDF2
-- `Scrypt(password: pchar, salt: pchar): int64` - Scrypt
 
 ---
 
