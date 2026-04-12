@@ -34,21 +34,46 @@
 - `glXMakeCurrent`, `glXSwapBuffers`
 - `glXSwapIntervalEXT`, `glXSwapIntervalMESA`
 
+### std/x11.lyx
+- X11 Display functions: XOpenDisplay, XCloseDisplay
+- X11 Window functions: XCreateWindow, XCreateSimpleWindow
+- X11 Screen functions: XDefaultScreen, XRootWindow
+
 ---
 
-## 🔄 WP2: Test mit OpenGL Window (NEXT)
+## 🔄 WP2: Test mit OpenGL Window (PARTIAL - ISSUE FOUND)
 
-### Schritte:
-1. **X11 Display öffnen** - braucht std.x11 (oder via libc Xlib)
-2. **GLX Context erstellen** - via std.qt5_glx
-3. **OpenGL Rendering testen** - via std.qt5_gl
-4. **Swap Buffers** - via glXSwapBuffers
+### Tests durchgeführt
 
-### Alternativ (Wayland):
-1. **EGL Display** - via std.qt5_egl
-2. **Wayland Window** - braucht std.wayland
-3. **OpenGL Rendering** - via std.qt5_gl
-4. **eglSwapBuffers** - present frame
+| Test | Status | Ergebnis |
+|------|--------|----------|
+| X11 (XOpenDisplay, etc.) | ✅ FUNKTIONIERT | Display opened, Screen: 0 |
+| GLX (glXChooseVisual, etc.) | ❌ CRASH | Memory access violation |
+| X11 + GLX combined | ❌ CRASH | Memory access violation |
+
+### Erkanntes Problem
+
+**GLX-Funktionen (libGL.so.1) funktionieren nicht aus Lyx heraus:**
+- Alle GLX-Aufrufe (glXChooseVisual, glXCreateContext, etc.) führen zu Segfault
+- Auch最简单的 Aufruf `glXChooseVisual(dpy, screen, 0)` crasht
+- Selbst ohne Fenster/Erstellung - nur der Funktionsaufruf reicht zum Crash
+
+**Funktioniert:**
+```lyx
+extern fn XOpenDisplay(name: int64): int64 link "libX11.so.6";  // ✅
+extern fn glXChooseVisual(...) link "libGL.so.1";                // ❌ Crash
+```
+
+### Mögliche Ursachen
+1. GLX könnte andere calling convention haben
+2. libGL.so.1 könnte spezielle Initialisierung brauchen
+3. Lyx könnte Probleme mit某些 GL-Funktionssignaturen haben
+
+### Workaround
+Bis das Problem gelöst ist:
+- X11 FFI funktioniert vollständig
+- OpenGL/GLX FFI muss noch untersucht werden
+- EGL könnte funktionieren (testen)
 
 ---
 
@@ -65,58 +90,10 @@ qt_wrapper.cpp:
 → `libqtlyx.so` kompilieren
 → Lyx FFI Bindings in `std/qt5_widgets.lyx`
 
-### WP4: Erweiterte Widgets
-- QLineEdit, QTextEdit
-- QMainWindow, QDialog
-- Layouts: QVBoxLayout, QHBoxLayout
-- Signal/Slot Callback-Registry
-
-### WP5: Application & Event Loop
-- QApplication Singleton
-- Lyx main() → QApplication.exec()
-- Exit-Handler
-
----
-
-## ⚠️ Wichtig
-
-| Komponente | FFI-Typ | Status |
-|------------|---------|--------|
-| OpenGL (gl*) | C-FFI | ✅ |
-| EGL | C-FFI | ✅ |
-| GLX | C-FFI | ✅ |
-| Qt Core (qVersion, env) | C-FFI | ✅ |
-| QTimer (timerfd) | C-FFI | ✅ |
-| Qt Widgets (QWidget) | C++ Wrapper | ❌ Braucht |
-| QApplication | C++ Wrapper | ❌ Braucht |
-| QString | C++ Wrapper | ❌ Braucht |
-
----
-
-## Build Dependencies
-
-```bash
-# OpenGL/EGL
-sudo apt install libgl1-mesa-dev libegl1-mesa-dev
-
-# Für C++ Wrapper (WP3)
-sudo apt install qtbase5-dev
-
-# Kompilieren des Wrappers (später)
-g++ -shared -fPIC -I/usr/include/qt5/QtCore \
-    -I/usr/include/qt5/QtWidgets \
-    qt_wrapper.cpp -o libqtlyx.so \
-    -lQt5Core -lQt5Widgets -lQt5Gui
-```
-
----
-
-## Referenzen
-
-- Lyx FFI: `std/net/tls.lyx`, `std/net/ssh.lyx`
-- Qt Docs: https://doc.qt.io/qt-5/
-- Qt C++ → C Wrapper: https://wiki.lazarus.freepascal.org/Qt5_Interface
-- Linux timerfd: `man timerfd_create`
+### WP4: OpenGL Issue untersuchen
+- Warum funktioniert GLX aus Lyx nicht?
+- C-Test funktioniert - also kein systemisches Problem
+-可能是 Lyx FFI-Handling für libGL.so.1
 
 ---
 
@@ -124,7 +101,18 @@ g++ -shared -fPIC -I/usr/include/qt5/QtCore \
 
 ```
 feat(std): add Qt5/OpenGL/EGL/GLX FFI binding units          (1a1be86)
-feat(std): expand qt5_core.lyx - implement C-FFI functions    (5450171)
+feat(std): expand qt5_core.lyx - implement C-FFI functions      (5450171)
 refactor(std): improve qt5_core documentation                 (7e8de6c)
-docs(qt): revise Qt plan - Lyx FFI approach                  (620f542)
+docs(qt): revise Qt plan - Lyx FFI approach                    (620f542)
+docs(qt): update implementation plan - WP1 completed          (c45fd4c)
+fix(std): resolve reserved keyword conflicts                   (1170736)
+test(graphics): add working X11 test with direct extern       (4ccd57b)
 ```
+
+---
+
+## Nächste Schritte
+
+1. **OpenGL/GLX Issue analysieren** - Warum crash GLX-Aufrufe?
+2. **EGL testen** - Vielleicht funktioniert EGL besser als GLX
+3. **C++ Wrapper für Qt Widgets** - Falls GLX nicht funktioniert
