@@ -15,6 +15,59 @@ pub con Z_BEST_COMPRESSION: int64 := 9;
 pub con DEFLATE_WINDOW_SIZE: int64 := 32768;
 pub con DEFLATE_WINDOW_MASK: int64 := 32767;
 
+// Hash table size for LZ77 (power of 2)
+pub con HASH_SIZE: int64 := 4096;
+pub con HASH_MASK: int64 := 4095;
+
+// Min match length for LZ77
+pub con MIN_MATCH: int64 := 3;
+pub con MAX_MATCH: int64 := 258;
+
+// Max distance
+pub con MAX_DISTANCE: int64 := 32768;
+
+// ============================================================================
+// Bit Writer for DEFLATE output
+// ============================================================================
+
+// Write a single bit
+pub fn BitWriteBit(output: pchar, pos: int64, bit: int64): int64 {
+    var byte_pos: int64 := pos / 8;
+    var bit_pos: int64 := pos & 7;
+    var b: int64 := StrCharAt(output, byte_pos);
+    if (bit == 1) {
+        b := b | (1 << bit_pos);
+    }
+    StrSetChar(output, byte_pos, b);
+    return pos + 1;
+}
+
+// Write multiple bits (LSB first)
+pub fn BitWriteBits(output: pchar, pos: int64, value: int64, num_bits: int64): int64 {
+    var i: int64 := 0;
+    while (i < num_bits) {
+        var bit: int64 := (value >> i) & 1;
+        pos := BitWriteBit(output, pos, bit);
+        i := i + 1;
+    }
+    return pos;
+}
+
+// Flush to byte boundary
+pub fn BitFlush(output: pchar, pos: int64): int64 {
+    if ((pos & 7) != 0) {
+        var pad: int64 := 8 - (pos & 7);
+        pos := BitWriteBits(output, pos, 0, pad);
+    }
+    return pos;
+}
+
+// Write byte-aligned
+pub fn BitWriteByte(output: pchar, pos: int64, byte: int64): int64 {
+    StrSetChar(output, pos / 8, byte);
+    return pos + 8;
+}
+
 // ============================================================================
 // Adler-32 Checksum
 // ============================================================================
@@ -85,103 +138,272 @@ pub fn CRC32(data: pchar, len: int64): int64 {
 }
 
 // ============================================================================
-// Bit Writing Functions (for DEFLATE output)
+// Huffman Codes for DEFLATE - Fixed Huffman Tables
 // ============================================================================
 
-// Write bits to output buffer (caller manages buffer)
-// Returns new position
-pub fn ZlibWriteBits(output: pchar, pos: int64, value: int64, bits: int64): int64 {
-    // This is a simplified bit writer - writes byte-aligned for now
-    // Full implementation would handle bit-level writes
-    var i: int64 := 0;
-    while (i < bits) {
-        var bit: int64 := (value >> i) & 1;
-        StrSetChar(output, pos + i, bit);
-        i := i + 1;
+// Fixed literal/length codes (0-255 = literals, 256 = end block, 257-285 = length)
+pub con LITLEN_EOF: int64 := 256;
+
+// Get fixed Huffman code for literal/length
+// Returns (code * 256) + bits
+pub fn GetFixedLiteralCode(code: int64): int64 {
+    var result: int64 := 0;
+    if (code <= 143) {
+        result := code + 48;
+        result := result * 256;
+        result := result + 8;
+    } else if (code <= 255) {
+        result := code - 256;
+        result := result + 400;
+        result := result * 256;
+        result := result + 9;
+    } else if (code <= 279) {
+        result := code - 280;
+        result := result * 2;
+        result := result * 256;
+        result := result + 7;
+    } else {
+        result := code - 280;
+        result := result + 144;
+        result := result * 256;
+        result := result + 8;
     }
-    return pos + bits;
+    return result;
 }
 
-// Flush remaining bits (no-op for byte-aligned)
-pub fn ZlibFlushBits(output: pchar, pos: int64): int64 {
-    return pos;
-}
-
-// ============================================================================
-// Huffman Codes for DEFLATE - Helper Functions
-// ============================================================================
-
-// Get fixed literal code bit length
-pub fn GetFixedLiteralCodeLen(code: int64): int64 {
-    if (code <= 143) { return 8; }
-    if (code <= 255) { return 9; }
-    if (code <= 279) { return 7; }
-    return 8;
+// Get fixed Huffman code for distance
+// Distance codes 0-31 are bit-complemented
+pub fn GetFixedDistCode(dist: int64): int64 {
+    if (dist == 0) { return 0; }
+    var d: int64 := dist;
+    var bits: int64 := 0;
+    while (d > 1) {
+        d := d / 2;
+        bits := bits + 1;
+    }
+    return dist * 256 + bits;
 }
 
 // ============================================================================
-// LZ77 Match Finding
+// DEFLATE Compress with LZ77 (Fixed Huffman)
 // ============================================================================
 
-// Find longest match in window
-// Returns match length (0 = no match)
-pub fn FindLZ77Match(data: pchar, pos: int64, window_start: int64, max_length: int64): int64 {
-    var best_len: int64 := 0;
+// Encode a literal/length symbol with fixed Huffman
+fn EncodeLitLen(output: pchar, bit_pos: int64, symbol: int64): int64 {
+    var code: int64 := 0;
+    var bits: int64 := 0;
     
-    var search_start: int64 := window_start;
-    if (pos - search_start > 32768) {
-        search_start := pos - 32768;
+    if (symbol <= 143) {
+        code := symbol + 48;
+        bits := 8;
+    } else if (symbol <= 255) {
+        code := symbol - 256 + 400;
+        bits := 9;
+    } else if (symbol <= 279) {
+        code := (symbol - 280) * 2;
+        bits := 7;
+    } else {
+        code := symbol - 280 + 144;
+        bits := 8;
     }
     
-    var i: int64 := search_start;
-    while (i < pos) {
-        var match_len: int64 := 0;
-        while (match_len < max_length && match_len < 8192) {
-            if (StrCharAt(data, i + match_len) != StrCharAt(data, pos + match_len)) {
-                break;
+    return BitWriteBits(output, bit_pos, code, bits);
+}
+
+// Encode a distance code
+fn EncodeDist(output: pchar, bit_pos: int64, dist: int64): int64 {
+    var code: int64 := 0;
+    var bits: int64 := 0;
+    
+    if (dist == 1) { code := 0; bits := 1; }
+    else if (dist == 2) { code := 1; bits := 1; }
+    else if (dist == 3) { code := 2; bits := 2; }
+    else if (dist == 4) { code := 3; bits := 2; }
+    else if (dist <= 6) { code := dist + 2; bits := 3; }
+    else if (dist <= 8) { code := dist + 4; bits := 3; }
+    else if (dist <= 12) { code := dist + 6; bits := 4; }
+    else if (dist <= 16) { code := dist + 10; bits := 4; }
+    else if (dist <= 24) { code := dist + 14; bits := 5; }
+    else if (dist <= 32) { code := dist + 20; bits := 5; }
+    else if (dist <= 48) { code := dist + 28; bits := 6; }
+    else if (dist <= 64) { code := dist + 36; bits := 6; }
+    else if (dist <= 96) { code := dist + 52; bits := 7; }
+    else if (dist <= 128) { code := dist + 68; bits := 7; }
+    else if (dist <= 192) { code := dist + 100; bits := 8; }
+    else if (dist <= 256) { code := dist + 132; bits := 8; }
+    else if (dist <= 384) { code := dist + 164; bits := 9; }
+    else if (dist <= 512) { code := dist + 196; bits := 9; }
+    else if (dist <= 768) { code := dist + 260; bits := 10; }
+    else if (dist <= 1024) { code := dist + 324; bits := 10; }
+    else if (dist <= 1536) { code := dist + 388; bits := 11; }
+    else if (dist <= 2048) { code := dist + 452; bits := 11; }
+    else if (dist <= 3072) { code := dist + 516; bits := 12; }
+    else if (dist <= 4096) { code := dist + 580; bits := 12; }
+    else if (dist <= 6144) { code := dist + 644; bits := 13; }
+    else if (dist <= 8192) { code := dist + 708; bits := 13; }
+    else if (dist <= 12288) { code := dist + 772; bits := 14; }
+    else if (dist <= 16384) { code := dist + 836; bits := 14; }
+    else if (dist <= 24576) { code := dist + 900; bits := 15; }
+    else { code := dist - 32768 + 964; bits := 15; }
+    
+    return BitWriteBits(output, bit_pos, code, bits);
+}
+
+// Get length code for LZ77 length
+fn GetLengthCode(len: int64): int64 {
+    if (len == 3) { return 257; }
+    if (len == 4) { return 258; }
+    if (len == 5) { return 259; }
+    if (len == 6) { return 260; }
+    if (len == 7) { return 261; }
+    if (len == 8) { return 262; }
+    if (len == 9) { return 263; }
+    if (len == 10) { return 264; }
+    // For longer lengths, use extra bits
+    if (len <= 11) { return 265; }
+    if (len <= 13) { return 266; }
+    if (len <= 15) { return 267; }
+    if (len <= 17) { return 268; }
+    if (len <= 19) { return 269; }
+    if (len <= 23) { return 270; }
+    if (len <= 27) { return 271; }
+    if (len <= 31) { return 272; }
+    if (len <= 35) { return 273; }
+    if (len <= 43) { return 274; }
+    if (len <= 51) { return 275; }
+    if (len <= 59) { return 276; }
+    if (len <= 67) { return 277; }
+    if (len <= 83) { return 278; }
+    if (len <= 99) { return 279; }
+    if (len <= 115) { return 280; }
+    if (len <= 131) { return 281; }
+    if (len <= 163) { return 282; }
+    if (len <= 195) { return 283; }
+    if (len <= 227) { return 284; }
+    return 285;  // 258
+}
+
+// Compress using LZ77 with fixed Huffman
+pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64 {
+    if (input_len <= 0) { return 0; }
+    
+    var bit_pos: int64 := 0;
+    var pos: int64 := 0;
+    var is_final: int64 := 1;
+    
+    while (pos < input_len) {
+        // Check if this is the last block
+        var remaining: int64 := input_len - pos;
+        if (remaining <= 32768) {
+            is_final := 1;
+        } else {
+            is_final := 0;
+        }
+        
+        // Write block header: BFINAL + BTYPE=01 (fixed Huffman)
+        bit_pos := BitWriteBit(output, bit_pos, is_final);
+        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE bit 0
+        bit_pos := BitWriteBit(output, bit_pos, 1);  // BTYPE bit 1
+        
+        var block_end: int64 := pos + 32768;
+        if (block_end > input_len) { block_end := input_len; }
+        
+        // Process block with LZ77
+        while (pos < block_end) {
+            // Find longest match
+            var match_len: int64 := 0;
+            var match_dist: int64 := 0;
+            
+            // Search in window
+            var search_start: int64 := 0;
+            if (pos > MAX_DISTANCE) { search_start := pos - MAX_DISTANCE; }
+            
+            var max_look: int64 := 258;
+            if (block_end - pos < max_look) { max_look := block_end - pos; }
+            
+            if (max_look >= MIN_MATCH) {
+                var i: int64 := search_start;
+                while (i < pos) {
+                    var m: int64 := 0;
+                    while (m < max_look && m < MAX_MATCH) {
+                        if (StrCharAt(input, i + m) != StrCharAt(input, pos + m)) {
+                            break;
+                        }
+                        m := m + 1;
+                    }
+                    
+                    if (m >= MIN_MATCH && m > match_len) {
+                        match_len := m;
+                        match_dist := pos - i;
+                    }
+                    
+                    i := i + 1;
+                }
             }
-            match_len := match_len + 1;
-        }
-        
-        if (match_len > best_len) {
-            best_len := match_len;
-        }
-        
-        i := i + 1;
-    }
-    
-    // Only return if match is at least 3 bytes
-    if (best_len >= 3) { return best_len; }
-    return 0;
-}
-
-// Get match distance
-pub fn GetMatchDistance(data: pchar, pos: int64, match_len: int64): int64 {
-    var search_start: int64 := 0;
-    if (pos > 32768) { search_start := pos - 32768; }
-    
-    var best_dist: int64 := 0;
-    var best_len: int64 := 0;
-    
-    var i: int64 := search_start;
-    while (i < pos) {
-        var m: int64 := 0;
-        while (m < match_len && (pos + m) < 8192) {
-            if (StrCharAt(data, i + m) != StrCharAt(data, pos + m)) {
-                break;
+            
+            if (match_len >= MIN_MATCH) {
+                // Write length-distance pair
+                var len_code: int64 := GetLengthCode(match_len);
+                bit_pos := EncodeLitLen(output, bit_pos, len_code);
+                
+                // Write extra length bits if needed
+                if (len_code >= 265) {
+                    var extra_bits: int64 := 0;
+                    var extra_len: int64 := 0;
+                    if (len_code <= 269) { extra_bits := 0; extra_len := 11; }
+                    else if (len_code <= 277) { extra_bits := 1; extra_len := 19; }
+                    else if (len_code <= 285) { extra_bits := 2; extra_len := 35; }
+                    
+                    if (extra_bits > 0) {
+                        var ebits: int64 := match_len - extra_len;
+                        bit_pos := BitWriteBits(output, bit_pos, ebits, extra_bits);
+                    }
+                }
+                
+                // Write distance
+                bit_pos := EncodeDist(output, bit_pos, match_dist);
+                
+                // Write extra distance bits
+                var dbits: int64 := 0;
+                var dextra: int64 := 0;
+                if (match_dist <= 4) { dbits := 0; }
+                else if (match_dist <= 8) { dbits := 0; }
+                else if (match_dist <= 16) { dbits := 1; dextra := 4; }
+                else if (match_dist <= 32) { dbits := 1; dextra := 4; }
+                else if (match_dist <= 64) { dbits := 2; dextra := 8; }
+                else if (match_dist <= 128) { dbits := 2; dextra := 8; }
+                else if (match_dist <= 256) { dbits := 3; dextra := 16; }
+                else if (match_dist <= 512) { dbits := 3; dextra := 16; }
+                else if (match_dist <= 1024) { dbits := 4; dextra := 32; }
+                else if (match_dist <= 2048) { dbits := 4; dextra := 32; }
+                else if (match_dist <= 4096) { dbits := 5; dextra := 64; }
+                else { dbits := 5; dextra := 64; }
+                
+                if (dbits > 0) {
+                    var ebits: int64 := match_dist - dextra;
+                    bit_pos := BitWriteBits(output, bit_pos, ebits, dbits);
+                }
+                
+                pos := pos + match_len;
+            } else {
+                // Write literal
+                var literal: int64 := StrCharAt(input, pos);
+                bit_pos := EncodeLitLen(output, bit_pos, literal);
+                pos := pos + 1;
             }
-            m := m + 1;
         }
-        
-        if (m > best_len) {
-            best_len := m;
-            best_dist := pos - i;
-        }
-        
-        i := i + 1;
     }
     
-    return best_dist;
+    // Write EOF symbol
+    bit_pos := EncodeLitLen(output, bit_pos, 256);
+    
+    // Flush bits
+    bit_pos := BitFlush(output, bit_pos);
+    
+    // Convert bit position to byte position (rounded up)
+    var result: int64 := bit_pos + 7;
+    result := result / 8;
+    return result;
 }
 
 // ============================================================================
@@ -236,7 +458,7 @@ pub fn DeflateCompress(input: pchar, input_len: int64, output: pchar): int64 {
 }
 
 // ============================================================================
-// Zlib Compress (with header)
+// Zlib Compress with LZ77 (with header)
 // ============================================================================
 
 pub fn ZlibCompress(input: pchar, input_len: int64, output: pchar, level: int64): int64 {
@@ -264,44 +486,9 @@ pub fn ZlibCompress(input: pchar, input_len: int64, output: pchar, level: int64)
     StrSetChar(output, pos, flg);
     pos := pos + 1;
     
-    // Compress data (stored blocks for simplicity)
-    var data_pos: int64 := 0;
-    
-    while (data_pos < input_len) {
-        var remaining: int64 := input_len - data_pos;
-        var block_size: int64 := 65535;
-        if (remaining < block_size) { block_size := remaining; }
-        
-        // Write block header
-        var is_final: int64 := 1;
-        if (data_pos + block_size < input_len) { is_final := 0; }
-        
-        // BFINAL + BTYPE=00 (stored)
-        StrSetChar(output, pos, is_final);
-        pos := pos + 1;
-        
-        // LEN (little-endian)
-        var len: int64 := block_size;
-        StrSetChar(output, pos, len & 255);
-        StrSetChar(output, pos + 1, (len / 256) & 255);
-        pos := pos + 2;
-        
-        // NLEN (ones complement)
-        var nlen: int64 := (~len) & 65535;
-        StrSetChar(output, pos, nlen & 255);
-        StrSetChar(output, pos + 1, (nlen / 256) & 255);
-        pos := pos + 2;
-        
-        // Raw data
-        var i: int64 := 0;
-        while (i < block_size) {
-            StrSetChar(output, pos + i, StrCharAt(input, data_pos + i));
-            i := i + 1;
-        }
-        pos := pos + block_size;
-        
-        data_pos := data_pos + block_size;
-    }
+    // Compress data using LZ77
+    var compressed: int64 := DeflateCompressLZ77(input, input_len, output);
+    pos := pos + compressed;
     
     // Adler-32 checksum
     var adler: int64 := Adler32(input, input_len);
