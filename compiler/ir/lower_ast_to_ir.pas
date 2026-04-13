@@ -1124,7 +1124,17 @@ begin
             if FImportedFuncs.IndexOf(TAstFuncDecl(node).Name) >= 0 then
               Continue;
 
-            // Track as imported function for CallMode resolution
+            // Track as imported function for CallMode resolution.
+            // Extern fn from imported units must go into FExternFuncs (not FImportedFuncs)
+            // so that callers inside the same unit get cmExternal, generating PLT stubs.
+            if TAstFuncDecl(node).IsExtern then
+            begin
+              FExternFuncs.Add(TAstFuncDecl(node).Name);
+              if TAstFuncDecl(node).LibraryName <> '' then
+                FModule.RegisterExternLibrary(TAstFuncDecl(node).Name,
+                  TAstFuncDecl(node).LibraryName);
+              Continue;  // No body to lower for extern fn
+            end;
             FImportedFuncs.Add(TAstFuncDecl(node).Name);
             // Check if function already exists (avoid duplicates)
             fn := FModule.FindFunction(TAstFuncDecl(node).Name);

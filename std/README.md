@@ -50,6 +50,12 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/qbool` | Quotient Boolean (ternary logic) |
 | `std/error` | Error code management |
 
+| `std/qt5_core` | Qt5 Core types, constants, application wrapper |
+| `std/qt5_gl` | OpenGL 2.1 FFI bindings (gl*, shaders, textures) |
+| `std/qt5_egl` | EGL 1.4 FFI bindings (Wayland/DRM OpenGL context) |
+| `std/qt5_glx` | GLX 1.4 FFI bindings (X11 OpenGL context) |
+| `std/x11` | X11 Window system FFI bindings (display, window, events) |
+
 ---
 
 ## Namespace Convention
