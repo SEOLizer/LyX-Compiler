@@ -186,22 +186,116 @@ pub fn RedisClose(conn: RedisConn): void {
 // Command Sending
 // ============================================================================
 
-// Send simple command and get reply
+// Helper: append integer to buffer as string
+fn appendInt(buf: pchar, pos: int64, n: int64): int64 {
+    // Handle negative
+    if (n < 0) {
+        StrSetChar(buf, pos, 45); pos := pos + 1;  // -
+        n := -n;
+    }
+    
+    // Convert to digits (reversed)
+    var digits: array[32]int64;
+    var count: int64 := 0;
+    
+    if (n == 0) {
+        digits[0] := 48;  // 0
+        count := 1;
+    } else {
+        while (n > 0) {
+            digits[count] := 48 + (n % 10);
+            count := count + 1;
+            n := n / 10;
+        }
+    }
+    
+    // Write in reverse order
+    var i: int64 := count - 1;
+    while (i >= 0) {
+        StrSetChar(buf, pos, digits[i]); pos := pos + 1;
+        i := i - 1;
+    }
+    
+    return pos;
+}
+
+// Send generic command with variable args
+// Returns reply from server
+fn sendCommand(conn: RedisConn, cmd: pchar, argc: int64, args: pchar): RedisReply {
+    // RESP format: *argc\r\n$len1\r\narg1\r\n$len2\r\narg2\r\n...
+    // Buffer: * (1) + digits + \r\n + $ + digits + \r\n + arg + ...
+    // Max buffer: * (1) + 10 + 2 + 1 + 10 + 2 + arglen ~= 200 bytes
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    
+    // Array header: *argc
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
+    pos := appendInt(req_buf, pos, argc);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    
+    // Command name as first argument
+    var cmd_len: int64 := StrLen(cmd);
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    pos := appendInt(req_buf, pos, cmd_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    
+    // Copy command
+    var i: int64 := 0;
+    while (i < cmd_len) {
+        StrSetChar(req_buf, pos, StrCharAt(cmd, i)); pos := pos + 1;
+        i := i + 1;
+    }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    
+    // Additional arguments (key, value, etc.)
+    var arg_idx: int64 := 0;
+    while (arg_idx < argc) {
+        // Get arg pointer from args array - simplified: just use args directly
+        // In real impl, we'd have an array of strings
+        var arg_len: int64 := StrLen(args);
+        
+        StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+        pos := appendInt(req_buf, pos, arg_len);
+        StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+        StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+        
+        i := 0;
+        while (i < arg_len) {
+            StrSetChar(req_buf, pos, StrCharAt(args, i)); pos := pos + 1;
+            i := i + 1;
+        }
+        StrSetChar(req_buf, pos, 13); pos := pos + 1;
+        StrSetChar(req_buf, pos, 10); pos := pos + 1;
+        
+        arg_idx := arg_idx + 1;
+    }
+    
+    // Send command
+    sys_write(conn.fd, req_buf, pos);
+    
+    // Parse reply
+    return parseReplyFD(conn.fd);
+}
+
+// Send simple 1-arg command (like PING)
 fn sendSimpleCommand(conn: RedisConn, cmd: pchar): RedisReply {
+    // Simplified for PING: *1\r\n$4\r\nPING\r\n
     var req_buf: pchar := "                        ";
     var pos: int64 := 0;
     
     StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
     StrSetChar(req_buf, pos, 49); pos := pos + 1;  // 1
-    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
-    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
     
     StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
     StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
-    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
-    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
     
-    // Copy "PING"
     StrSetChar(req_buf, pos, 80); pos := pos + 1;  // P
     StrSetChar(req_buf, pos, 73); pos := pos + 1;  // I
     StrSetChar(req_buf, pos, 78); pos := pos + 1;  // N
@@ -210,9 +304,7 @@ fn sendSimpleCommand(conn: RedisConn, cmd: pchar): RedisReply {
     StrSetChar(req_buf, pos, 13); pos := pos + 1;
     StrSetChar(req_buf, pos, 10); pos := pos + 1;
     
-    // Write
     sys_write(conn.fd, req_buf, pos);
-    
     return parseReplyFD(conn.fd);
 }
 
@@ -226,136 +318,847 @@ pub fn RedisPing(conn: RedisConn): bool {
     return (reply.kind == REDIS_REPLY_STATUS);
 }
 
-// Get value by key (stub)
+// Get value by key
 pub fn RedisGet(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: GET key
+    // RESP: *2\r\n$3\r\nGET\r\n$keylen\r\nkey\r\n
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    // Array: *2
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;  // 2
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // GET
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 71); pos := pos + 1;  // G
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    var i: int64 := 0;
+    while (i < key_len) {
+        StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1;
+        i := i + 1;
+    }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Send
+    sys_write(conn.fd, req_buf, pos);
+    
+    // Parse reply - simple version for now
+    return parseReplyFD(conn.fd);
 }
 
-// Set key-value pair (stub)
+// Set key-value pair
 pub fn RedisSet(conn: RedisConn, key: pchar, value: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: SET key value
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var val_len: int64 := StrLen(value);
+    
+    // Array: *3
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // SET
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    var i: int64 := 0;
+    while (i < key_len) {
+        StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1;
+        i := i + 1;
+    }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Value
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    pos := appendInt(req_buf, pos, val_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    i := 0;
+    while (i < val_len) {
+        StrSetChar(req_buf, pos, StrCharAt(value, i)); pos := pos + 1;
+        i := i + 1;
+    }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Send
+    sys_write(conn.fd, req_buf, pos);
+    
+    // Parse reply
+    return parseReplyFD(conn.fd);
 }
 
-// Set with expiration (stub)
+// Set with expiration (SETEX)
 pub fn RedisSetEX(conn: RedisConn, key: pchar, value: pchar, ttl_sec: int64): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: SETEX key ttl value
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var val_len: int64 := StrLen(value);
+    
+    // Array: *4
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // SETEX
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 53); pos := pos + 1;  // 5
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 88); pos := pos + 1;  // X
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // TTL
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, ttl_sec);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Value
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, val_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < val_len) { StrSetChar(req_buf, pos, StrCharAt(value, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Delete key (stub)
+// Delete key
 pub fn RedisDel(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: DEL key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;  // 2
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // DEL
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 68); pos := pos + 1;  // D
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;  // L
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Check if key exists (stub)
+// Check if key exists
 pub fn RedisExists(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: EXISTS key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // EXISTS
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 54); pos := pos + 1;  // 6
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 88); pos := pos + 1;  // X
+    StrSetChar(req_buf, pos, 73); pos := pos + 1;  // I
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Set expiration (stub)
+// Set expiration
 pub fn RedisExpire(conn: RedisConn, key: pchar, seconds: int64): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: EXPIRE key seconds
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // EXPIRE
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 55); pos := pos + 1;  // 7
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 88); pos := pos + 1;
+    StrSetChar(req_buf, pos, 73); pos := pos + 1;
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 73); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Seconds
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, seconds);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Get TTL (stub)
+// Get TTL
 pub fn RedisTTL(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    reply.str_val := "Not implemented";
-    return reply;
+    // Send: TTL key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;  // 2
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // TTL
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;  // L
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Hash commands (stubs)
+// Hash commands
 pub fn RedisHGet(conn: RedisConn, key: pchar, field: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: HGET key field
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var field_len: int64 := StrLen(field);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // HGET
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 72); pos := pos + 1;  // H
+    StrSetChar(req_buf, pos, 71); pos := pos + 1;  // G
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Field
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, field_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < field_len) { StrSetChar(req_buf, pos, StrCharAt(field, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisHSet(conn: RedisConn, key: pchar, field: pchar, value: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: HSET key field value
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var field_len: int64 := StrLen(field);
+    var val_len: int64 := StrLen(value);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // HSET
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 72); pos := pos + 1;  // H
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;  // E
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;  // T
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Field
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, field_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < field_len) { StrSetChar(req_buf, pos, StrCharAt(field, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Value
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, val_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < val_len) { StrSetChar(req_buf, pos, StrCharAt(value, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisHGetAll(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: HGETALL key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;  // 2
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // HGETALL
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 55); pos := pos + 1;  // 7
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 72); pos := pos + 1;
+    StrSetChar(req_buf, pos, 71); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 84); pos := pos + 1;
+    StrSetChar(req_buf, pos, 65); pos := pos + 1;
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// List commands (stubs)
+// List commands
 pub fn RedisLPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: LPUSH key value
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var val_len: int64 := StrLen(value);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // LPUSH
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 53); pos := pos + 1;  // 5
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;  // L
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;  // P
+    StrSetChar(req_buf, pos, 85); pos := pos + 1;  // U
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;  // S
+    StrSetChar(req_buf, pos, 72); pos := pos + 1;  // H
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Value
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, val_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < val_len) { StrSetChar(req_buf, pos, StrCharAt(value, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisRPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: RPUSH key value
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var val_len: int64 := StrLen(value);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;  // 3
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // RPUSH
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 53); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;  // R
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 85); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;
+    StrSetChar(req_buf, pos, 72); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Value
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, val_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < val_len) { StrSetChar(req_buf, pos, StrCharAt(value, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisLPop(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: LPOP key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;  // 2
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // LPOP
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 76); pos := pos + 1;
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 79); pos := pos + 1;
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisRPop(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: RPOP key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // RPOP
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 79); pos := pos + 1;
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Set commands (stubs)
+// Set commands
 pub fn RedisSAdd(conn: RedisConn, key: pchar, member: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: SADD key member
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var mem_len: int64 := StrLen(member);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // SADD
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;
+    StrSetChar(req_buf, pos, 65); pos := pos + 1;
+    StrSetChar(req_buf, pos, 68); pos := pos + 1;
+    StrSetChar(req_buf, pos, 68); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Member
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, mem_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < mem_len) { StrSetChar(req_buf, pos, StrCharAt(member, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisSRem(conn: RedisConn, key: pchar, member: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: SREM key member
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    var mem_len: int64 := StrLen(member);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 51); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // SREM
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 77); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Member
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, mem_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    i := 0;
+    while (i < mem_len) { StrSetChar(req_buf, pos, StrCharAt(member, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 pub fn RedisSMembers(conn: RedisConn, key: pchar): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: SMEMBERS key
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 50); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // SMEMBERS
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 56); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;
+    StrSetChar(req_buf, pos, 77); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 77); pos := pos + 1;
+    StrSetChar(req_buf, pos, 66); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;
+    StrSetChar(req_buf, pos, 83); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
-// Sorted set commands (stubs)
+// Sorted set commands
 pub fn RedisZAdd(conn: RedisConn, key: pchar, score: f64, member: pchar): RedisReply {
+    // ZADD key score member - simplified (score as string for now)
     var reply: RedisReply;
     reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "ZADD: float not implemented";
     return reply;
 }
 
 pub fn RedisZRange(conn: RedisConn, key: pchar, start: int64, stop: int64): RedisReply {
-    var reply: RedisReply;
-    reply.kind := REDIS_REPLY_ERROR;
-    return reply;
+    // Send: ZRANGE key start stop
+    var req_buf: pchar := "                                                                                                                                ";
+    var pos: int64 := 0;
+    var key_len: int64 := StrLen(key);
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // ZRANGE
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    StrSetChar(req_buf, pos, 54); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    StrSetChar(req_buf, pos, 90); pos := pos + 1;
+    StrSetChar(req_buf, pos, 82); pos := pos + 1;
+    StrSetChar(req_buf, pos, 65); pos := pos + 1;
+    StrSetChar(req_buf, pos, 78); pos := pos + 1;
+    StrSetChar(req_buf, pos, 71); pos := pos + 1;
+    StrSetChar(req_buf, pos, 69); pos := pos + 1;
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Key
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, key_len);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    var i: int64 := 0;
+    while (i < key_len) { StrSetChar(req_buf, pos, StrCharAt(key, i)); pos := pos + 1; i := i + 1; }
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Start
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, start);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Stop
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;
+    pos := appendInt(req_buf, pos, stop);
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    sys_write(conn.fd, req_buf, pos);
+    return parseReplyFD(conn.fd);
 }
 
 // ============================================================================
