@@ -11,62 +11,29 @@
 
 ---
 
-## WP2: GLX/EGL Issue - ROOT CAUSE FOUND 🔍
+## ✅ WP2: PLT Dynamic Linking Fixed (COMPLETED)
 
-### Problem Statement
-Direct `extern fn ... link "libGL.so.1"` causes crash, but:
-- `extern fn ... link "libX11.so.6"` WORKS
-- `dlopen/dlsym("libGL.so.1")` WORKS
+### Root Causes Found and Fixed
 
-### Root Cause
-Some libraries (libGL, libEGL, libdl) crash when called via **compile-time PLT** (the `link` mechanism), but work via **runtime dynamic loading** (dlopen/dlsym).
+**Bug 1: Stack misalignment (x86-64 ABI violation)**
+- x86-64 ABI requires RSP = 0 mod 16 before any CALL instruction
+- After `push rbp`, RSP = 8 mod 16, so frame size N must be 8 mod 16
+- The compiler was using frame sizes where totalSlots was even (N = 0 mod 16)
+- This caused `movdqa` to crash inside glibc's `_dl_map_object_from_fd`
+- **Fix**: if `totalSlots` is even, increment it (ensures N = 8 mod 16)
 
-This is a Lyx compiler/backend issue with how PLT entries are resolved for certain shared libraries.
+**Bug 2: RWX code segment caused dlopen rejection**
+- `_lyx_argv_base` (stores initial RSP) was embedded in the code section
+- Required PF_W on the code segment for dynamic ELF
+- glibc's dlopen rejects/crashes on RWX code segments
+- **Fix**: moved `_lyx_argv_base` to FData (always RW); code segment stays PF_R|PF_X
 
-### Working Workaround
-Use dlopen/dlsym instead of direct extern declarations:
-
-```lyx
-// WORKS (workaround):
-extern fn dlopen(filename: pchar, flags: int64): int64 link "libdl.so.2";
-extern fn dlsym(handle: int64, symbol: pchar): int64 link "libdl.so.2";
-var handle: int64 := dlopen("libGL.so.1", 1);
-var glXChooseVisual: int64 := dlsym(handle, "glXChooseVisual");
-
-// CRASHES (direct extern):
-extern fn glXChooseVisual(dpy, screen, attrib): int64 link "libGL.so.1";
-```
-
-### Affected Libraries (crash via direct extern)
-- libGL.so.1
-- libEGL.so.1  
-- libdl.so.2
-
-### Working Libraries
-- libX11.so.6
-- libc.so.6
-- libm.so.6
-- libpthread.so.0
-- libnsl.so.1
-- libresolv.so.2
-
----
-
-## Next Steps
-
-### Option A: Workaround via dlsym (recommended)
-Create wrapper functions that use dlopen/dlsym for problematic libraries:
-```lyx
-pub fn glXChooseVisual(dpy, screen, attrib): int64 {
-  // Load libGL.so.1 if not already loaded
-  // Use dlsym to get function pointer
-  // Call via function pointer
-}
-```
-
-### Option B: Fix in Lyx compiler
-Investigate why PLT resolution works for some libs but not others.
-This is likely in the dynamic linking code generation.
+### Result
+All shared libraries now work via compile-time PLT:
+- libGL.so.1 ✅ (glXQueryVersion, glXChooseVisual, etc.)
+- libX11.so.6 ✅
+- libdl.so.2 ✅ (dlopen, dlclose)
+- libEGL.so.1 (not tested yet)
 
 ---
 
