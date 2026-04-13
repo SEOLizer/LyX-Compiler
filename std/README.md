@@ -35,6 +35,7 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/sort` | Efficient sorting algorithms (QuickSort) |
 | `std/base64` | Base64 encoding and decoding |
 | `std/buffer` | Buffer utilities (Hex, Base64 helpers) |
+| `std/zlib` | DEFLATE/zlib compression (stored blocks, Adler-32) |
 | `std/url` | URL parser and builder |
 | `std/uuid` | UUID generation (v4, v7) and parsing |
 | `std/html` | HTML escaping, unescaping, tag utilities |
