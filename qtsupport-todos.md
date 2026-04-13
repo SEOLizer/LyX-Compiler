@@ -44,13 +44,41 @@ All shared libraries now work via compile-time PLT:
 
 ---
 
+---
+
+## ✅ WP3: Qt5 Window Support (COMPLETED)
+
+### Files Created
+- `qt_wrapper/qt_wrapper.cpp` — C++ Qt5 Widgets wrapper with C ABI (functions named `_qt_xxx`)
+- `qt_wrapper/Makefile` — builds `libqtlyx.so`
+- `std/qt5_app.lyx` — unit with `extern fn _qt_xxx` + `pub fn qt_xxx` wrapper pattern
+- `examples/graphics/hello_qt.lyx` — Qt5 hello world: window, label, status bar
+
+### 3 Additional Bugs Fixed
+
+**Bug 1: `extern fn` in imported units not generating PLT stubs**
+- `LowerImportedUnits` added extern fn to `FImportedFuncs` instead of `FExternFuncs`
+- Fix: detect `IsExtern` in phase 2, route to `FExternFuncs` + `RegisterExternLibrary`
+
+**Bug 2: `_start` `push rbp` breaks x86-64 ABI alignment**
+- `_start` did `push rbp; call main` → main entered with RSP = 0 mod 16 (wrong)
+- ABI requires RSP = 8 mod 16 at function entry
+- Fix: remove `push rbp` from `_start` — it's not a function, no frame needed
+
+**Bug 3: `totalSlots` parity inverted (masked by Bug 2)**
+- Previous fix forced odd totalSlots to compensate Bug 2's off-by-8
+- Now that `_start` is correct, totalSlots must be EVEN (N*8 = 0 mod 16)
+- Fix: change parity check from `(= 0)` to `(= 1)`
+
+### Result
+- `LD_LIBRARY_PATH=qt_wrapper ./hello_qt` opens a 640×480 Qt5 window ✅
+- All existing programs (return42, dlopen, x11_direct) still work ✅
+
 ## Commit Log
 ```
+7c12e09 feat(qt): Qt5 window support - 3 bugs fixed, hello_qt works
+b151ed9 docs(qt): mark WP2 PLT fixes complete
+e46b9dc fix(plt): fix two ELF dynamic linking bugs enabling libGL/libEGL via PLT
 6320b52 feat(std): Qt/OpenGL/EGL/GLX/X11 FFI units - X11 works, GLX/EGL issue found
 4ccd57b test(graphics): add working X11 test with direct extern declarations
-1170736 fix(std): resolve reserved keyword conflicts
-c45fd4c docs(qt): update implementation plan - WP1 completed
-7e8de6c refactor(std): improve qt5_core documentation
-5450171 feat(std): expand qt5_core.lyx - implement C-FFI functions
-1a1be86 feat(std): add Qt5/OpenGL/EGL/GLX FFI binding units
 ```
