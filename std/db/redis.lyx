@@ -1,0 +1,363 @@
+// std/db/redis.lyx - Redis Client using RESP protocol
+// Native implementation using std.net.socket
+
+unit std.db.redis;
+
+import std.net.socket;
+import std.net.types;
+import std.net.dns;
+import std.net.syscalls;
+import std.string;
+
+// ============================================================================
+// Redis Connection
+// ============================================================================
+
+pub type RedisConn = struct {
+    fd: int64;
+    host: pchar;
+    port: int64;
+    timeout_ms: int64;
+};
+
+// Redis reply kinds (as constants)
+pub con REDIS_REPLY_NIL: int64 := 0;
+pub con REDIS_REPLY_ERROR: int64 := 1;
+pub con REDIS_REPLY_STATUS: int64 := 2;
+pub con REDIS_REPLY_INTEGER: int64 := 3;
+pub con REDIS_REPLY_BULK: int64 := 4;
+pub con REDIS_REPLY_ARRAY: int64 := 5;
+
+pub type RedisReply = struct {
+    kind: int64;
+    int_val: int64;
+    str_val: pchar;
+    str_len: int64;
+};
+
+// ============================================================================
+// RESP Protocol Helpers
+// ============================================================================
+
+// Parse integer from string
+fn parseInt(s: pchar): int64 {
+    var result: int64 := 0;
+    var neg: bool := false;
+    var i: int64 := 0;
+    
+    if (StrCharAt(s, 0) == 45) {  // -
+        neg := true;
+        i := 1;
+    }
+    
+    while (i < StrLen(s)) {
+        var c: int64 := StrCharAt(s, i);
+        if (c < 48 || c > 57) { break; }
+        result := result * 10 + (c - 48);
+        i := i + 1;
+    }
+    
+    if (neg) { result := -result; }
+    return result;
+}
+
+// Read one line from socket using syscalls
+fn readLineFD(fd: int64, buffer: pchar, max_len: int64): int64 {
+    var pos: int64 := 0;
+    var tmp: pchar := " ";
+    
+    while (pos < max_len - 1) {
+        var n: int64 := sys_read(fd, tmp, 1);
+        if (n <= 0) { break; }
+        
+        var ch: int64 := StrCharAt(tmp, 0);
+        
+        if (ch == 13) {  // \r - could be \r\n
+            // Try to read the next byte
+            var n2: int64 := sys_read(fd, tmp, 1);
+            if (n2 > 0) {
+                var ch2: int64 := StrCharAt(tmp, 0);
+                if (ch2 == 10) {  // \n
+                    break;
+                }
+            }
+        }
+        
+        StrSetChar(buffer, pos, ch);
+        pos := pos + 1;
+    }
+    
+    StrSetChar(buffer, pos, 0);
+    return pos;
+}
+
+// Parse RESP reply
+fn parseReplyFD(fd: int64): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    
+    // Peek first byte
+    var tmp: pchar := " ";
+    var n: int64 := sys_read(fd, tmp, 1);
+    if (n <= 0) { return reply; }
+    
+    var first: int64 := StrCharAt(tmp, 0);
+    
+    if (first == 43) {  // + (status reply)
+        reply.kind := REDIS_REPLY_STATUS;
+        var line: pchar := "                                        ";
+        readLineFD(fd, line, 40);
+        reply.str_val := line;
+    } else if (first == 45) {  // - (error reply)
+        reply.kind := REDIS_REPLY_ERROR;
+        var line: pchar := "                                        ";
+        readLineFD(fd, line, 40);
+        reply.str_val := line;
+    } else if (first == 58) {  // : (integer reply)
+        reply.kind := REDIS_REPLY_INTEGER;
+        var line: pchar := "                                        ";
+        readLineFD(fd, line, 40);
+        reply.int_val := parseInt(line);
+    } else if (first == 36) {  // $ (bulk string)
+        reply.kind := REDIS_REPLY_BULK;
+    } else if (first == 42) {  // * (array)
+        reply.kind := REDIS_REPLY_ARRAY;
+    }
+    
+    return reply;
+}
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+// Create a new Redis connection
+pub fn RedisConnect(host: pchar, port: int64): RedisConn {
+    var conn: RedisConn;
+    conn.host := host;
+    conn.port := port;
+    conn.timeout_ms := 5000;
+    conn.fd := -1;
+    
+    // Resolve hostname to IP
+    var ip: int64 := 0;
+    var dns_result: DNSResult;
+    
+    if (DNSResolve(host, StrLen(host), 0, dns_result)) {
+        ip := dns_result.addr;
+    }
+    
+    if (ip == 0) {
+        ip := 0x0100007F;  // 127.0.0.1
+    }
+    
+    // Create socket
+    conn.fd := sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (conn.fd < 0) {
+        return conn;
+    }
+    
+    // Connect
+    var addr: SockAddrIn;
+    addr.sin_family := AF_INET;
+    addr.sin_port := port as int64;
+    addr.sin_addr := ip;
+    
+    var result: int64 := sys_connect(conn.fd, addr, 16);
+    if (result < 0) {
+        sys_close(conn.fd);
+        conn.fd := -1;
+    }
+    
+    return conn;
+}
+
+// Close Redis connection
+pub fn RedisClose(conn: RedisConn): void {
+    if (conn.fd >= 0) {
+        sys_close(conn.fd);
+    }
+}
+
+// ============================================================================
+// Command Sending
+// ============================================================================
+
+// Send simple command and get reply
+fn sendSimpleCommand(conn: RedisConn, cmd: pchar): RedisReply {
+    var req_buf: pchar := "                        ";
+    var pos: int64 := 0;
+    
+    StrSetChar(req_buf, pos, 42); pos := pos + 1;  // *
+    StrSetChar(req_buf, pos, 49); pos := pos + 1;  // 1
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    
+    StrSetChar(req_buf, pos, 36); pos := pos + 1;  // $
+    StrSetChar(req_buf, pos, 52); pos := pos + 1;  // 4
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;  // \r
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;  // \n
+    
+    // Copy "PING"
+    StrSetChar(req_buf, pos, 80); pos := pos + 1;  // P
+    StrSetChar(req_buf, pos, 73); pos := pos + 1;  // I
+    StrSetChar(req_buf, pos, 78); pos := pos + 1;  // N
+    StrSetChar(req_buf, pos, 71); pos := pos + 1;  // G
+    
+    StrSetChar(req_buf, pos, 13); pos := pos + 1;
+    StrSetChar(req_buf, pos, 10); pos := pos + 1;
+    
+    // Write
+    sys_write(conn.fd, req_buf, pos);
+    
+    return parseReplyFD(conn.fd);
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+// Ping Redis server
+pub fn RedisPing(conn: RedisConn): bool {
+    var reply: RedisReply := sendSimpleCommand(conn, "PING");
+    return (reply.kind == REDIS_REPLY_STATUS);
+}
+
+// Get value by key (stub)
+pub fn RedisGet(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Set key-value pair (stub)
+pub fn RedisSet(conn: RedisConn, key: pchar, value: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Set with expiration (stub)
+pub fn RedisSetEX(conn: RedisConn, key: pchar, value: pchar, ttl_sec: int64): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Delete key (stub)
+pub fn RedisDel(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Check if key exists (stub)
+pub fn RedisExists(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Set expiration (stub)
+pub fn RedisExpire(conn: RedisConn, key: pchar, seconds: int64): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Get TTL (stub)
+pub fn RedisTTL(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    reply.str_val := "Not implemented";
+    return reply;
+}
+
+// Hash commands (stubs)
+pub fn RedisHGet(conn: RedisConn, key: pchar, field: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisHSet(conn: RedisConn, key: pchar, field: pchar, value: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisHGetAll(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+// List commands (stubs)
+pub fn RedisLPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisRPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisLPop(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisRPop(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+// Set commands (stubs)
+pub fn RedisSAdd(conn: RedisConn, key: pchar, member: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisSRem(conn: RedisConn, key: pchar, member: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisSMembers(conn: RedisConn, key: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+// Sorted set commands (stubs)
+pub fn RedisZAdd(conn: RedisConn, key: pchar, score: f64, member: pchar): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+pub fn RedisZRange(conn: RedisConn, key: pchar, start: int64, stop: int64): RedisReply {
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_ERROR;
+    return reply;
+}
+
+// ============================================================================
+// End
+// ============================================================================
