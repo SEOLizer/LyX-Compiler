@@ -550,17 +550,93 @@ fn ReadBits(data: pchar, pos: int64, len: int64, bit_pos: int64, num_bits: int64
     return result;
 }
 
-// Inflate DEFLATE (stored blocks only for simplicity)
+// Decode length from LZ77 length code
+fn DecodeLengthValue(code: int64): int64 {
+    if (code == 257) { return 3; }
+    if (code == 258) { return 4; }
+    if (code == 259) { return 5; }
+    if (code == 260) { return 6; }
+    if (code == 261) { return 7; }
+    if (code == 262) { return 8; }
+    if (code == 263) { return 9; }
+    if (code == 264) { return 10; }
+    if (code == 265) { return 11; }
+    if (code == 266) { return 13; }
+    if (code == 267) { return 15; }
+    if (code == 268) { return 17; }
+    if (code == 269) { return 19; }
+    if (code == 270) { return 23; }
+    if (code == 271) { return 27; }
+    if (code == 272) { return 31; }
+    if (code == 273) { return 35; }
+    if (code == 274) { return 43; }
+    if (code == 275) { return 51; }
+    if (code == 276) { return 59; }
+    if (code == 277) { return 67; }
+    if (code == 278) { return 83; }
+    if (code == 279) { return 99; }
+    if (code == 280) { return 115; }
+    if (code == 281) { return 131; }
+    if (code == 282) { return 163; }
+    if (code == 283) { return 195; }
+    if (code == 284) { return 227; }
+    return 258;
+}
+
+// Decode distance
+fn DecodeDistanceValue(extra_bits: int64, extra: int64): int64 {
+    // Distance base values for each code
+    if (extra_bits == 0) {
+        return 1 + extra;
+    }
+    if (extra_bits == 1) {
+        return 1 + 2 + extra;
+    }
+    if (extra_bits == 2) {
+        return 1 + 4 + extra;
+    }
+    if (extra_bits == 3) {
+        return 1 + 8 + extra;
+    }
+    if (extra_bits == 4) {
+        return 1 + 16 + extra;
+    }
+    if (extra_bits == 5) {
+        return 1 + 32 + extra;
+    }
+    return 1 + extra;
+}
+
+// Decode fixed Huffman symbol (simplified)
+fn DecodeHuffmanSymbol(data: pchar, len: int64, bit_pos: int64): int64 {
+    var bits: int64 := ReadBits(data, 0, len, bit_pos, 7);
+    if (bits < 96) {
+        return bits + 48;  // 0-143
+    }
+    if (bits >= 128 && bits < 160) {
+        return bits - 128 + 144;  // 144-175
+    }
+    if (bits >= 160 && bits < 192) {
+        return bits - 160 + 256;  // 256-287 (but 257+ for lengths)
+    }
+    // Try 8 bits
+    var bits8: int64 := ReadBits(data, 0, len, bit_pos, 8);
+    if (bits8 < 256) {
+        return bits8;
+    }
+    return bits8 - 256;
+}
+
+// Inflate DEFLATE (supports stored blocks and fixed Huffman)
 pub fn InflateDEFLATE(input: pchar, input_len: int64, output: pchar): int64 {
-    var pos: int64 := 0;
     var bit_pos: int64 := 0;
     var out_pos: int64 := 0;
     var done: bool := false;
     
     while (!done) {
-        var bfinal: int64 := ReadBits(input, pos, input_len, bit_pos, 1);
-        var btype0: int64 := ReadBits(input, pos, input_len, bit_pos + 1, 1);
-        var btype1: int64 := ReadBits(input, pos, input_len, bit_pos + 2, 1);
+        var bfinal: int64 := ReadBits(input, 0, input_len, bit_pos, 1);
+        var btype0: int64 := ReadBits(input, 0, input_len, bit_pos + 1, 1);
+        var btype1: int64 := ReadBits(input, 0, input_len, bit_pos + 2, 1);
         
         bit_pos := bit_pos + 3;
         
@@ -568,37 +644,122 @@ pub fn InflateDEFLATE(input: pchar, input_len: int64, output: pchar): int64 {
         
         var btype: int64 := btype0 + btype1 * 2;
         
-        // Only support stored blocks (BTYPE=00)
-        if (btype != 0) {
-            return -1;  // Huffman not supported in inflate
-        }
-        
-        // Skip to byte boundary
-        var pad: int64 := (8 - (bit_pos & 7)) & 7;
-        bit_pos := bit_pos + pad;
-        
-        // Read LEN (little-endian)
-        var byte_pos: int64 := bit_pos / 8;
-        var len: int64 := StrCharAt(input, byte_pos);
-        len := len + StrCharAt(input, byte_pos + 1) * 256;
-        
-        var nlen: int64 := StrCharAt(input, byte_pos + 2);
-        nlen := nlen + StrCharAt(input, byte_pos + 3) * 256;
-        
-        if ((nlen & 65535) != ((~len) & 65535)) {
+        if (btype == 0) {
+            // Stored block
+            var pad: int64 := (8 - (bit_pos & 7)) & 7;
+            bit_pos := bit_pos + pad;
+            
+            var byte_pos: int64 := bit_pos / 8;
+            var len: int64 := StrCharAt(input, byte_pos);
+            len := len + StrCharAt(input, byte_pos + 1) * 256;
+            
+            var nlen: int64 := StrCharAt(input, byte_pos + 2);
+            nlen := nlen + StrCharAt(input, byte_pos + 3) * 256;
+            
+            if ((nlen & 65535) != ((~len) & 65535)) {
+                return -1;
+            }
+            
+            bit_pos := bit_pos + 16;
+            
+            var i: int64 := 0;
+            while (i < len) {
+                var src: int64 := bit_pos / 8;
+                StrSetChar(output, out_pos, StrCharAt(input, src));
+                out_pos := out_pos + 1;
+                bit_pos := bit_pos + 8;
+                i := i + 1;
+            }
+        } else if (btype == 1) {
+            // Fixed Huffman - decode LZ77
+            while (true) {
+                // Read next bits to determine symbol
+                var symbol: int64 := -1;
+                var bits7: int64 := ReadBits(input, 0, input_len, bit_pos, 7);
+                
+                if (bits7 < 160) {
+                    if (bits7 < 96) {
+                        symbol := bits7 + 48;
+                    } else {
+                        symbol := bits7 - 96 + 144;
+                    }
+                    bit_pos := bit_pos + 7;
+                } else {
+                    var bits8: int64 := ReadBits(input, 0, input_len, bit_pos, 8);
+                    if (bits8 < 256) {
+                        symbol := bits8;
+                    } else {
+                        symbol := bits8 - 256 + 256;
+                    }
+                    bit_pos := bit_pos + 8;
+                }
+                
+                if (symbol < 0) { break; }
+                
+                if (symbol < 256) {
+                    StrSetChar(output, out_pos, symbol);
+                    out_pos := out_pos + 1;
+                } else if (symbol == 256) {
+                    done := true;
+                    break;
+                } else {
+                    // Length code (257-285)
+                    var length: int64 := DecodeLengthValue(symbol);
+                    
+                    // Read distance
+                    var dbits: int64 := ReadBits(input, 0, input_len, bit_pos, 5);
+                    bit_pos := bit_pos + 5;
+                    
+                    var dist: int64 := 0;
+                    // Map distance code to actual distance
+                    if (dbits == 0) { dist := 1; }
+                    else if (dbits == 1) { dist := 2; }
+                    else if (dbits == 2) { dist := 3; }
+                    else if (dbits == 3) { dist := 4; }
+                    else if (dbits == 4) { dist := 5; }
+                    else if (dbits == 5) { dist := 6; }
+                    else if (dbits == 6) { dist := 7; }
+                    else if (dbits == 7) { dist := 8; }
+                    else if (dbits == 8) { dist := 9; }
+                    else if (dbits == 9) { dist := 10; }
+                    else if (dbits == 10) { dist := 12; }
+                    else if (dbits == 11) { dist := 14; }
+                    else if (dbits == 12) { dist := 16; }
+                    else if (dbits == 13) { dist := 20; }
+                    else if (dbits == 14) { dist := 24; }
+                    else if (dbits == 15) { dist := 28; }
+                    else if (dbits == 16) { dist := 32; }
+                    else if (dbits == 17) { dist := 40; }
+                    else if (dbits == 18) { dist := 48; }
+                    else if (dbits == 19) { dist := 56; }
+                    else if (dbits == 20) { dist := 64; }
+                    else if (dbits == 21) { dist := 80; }
+                    else if (dbits == 22) { dist := 96; }
+                    else if (dbits == 23) { dist := 112; }
+                    else if (dbits == 24) { dist := 128; }
+                    else if (dbits == 25) { dist := 160; }
+                    else if (dbits == 26) { dist := 192; }
+                    else if (dbits == 27) { dist := 224; }
+                    else if (dbits == 28) { dist := 256; }
+                    else { dist := 512; }
+                    
+                    if (dist < 1 || dist > out_pos) {
+                        return -1;
+                    }
+                    
+                    // Copy from history
+                    var j: int64 := 0;
+                    while (j < length) {
+                        var src: int64 := out_pos - dist;
+                        var b: int64 := StrCharAt(output, src);
+                        StrSetChar(output, out_pos, b);
+                        out_pos := out_pos + 1;
+                        j := j + 1;
+                    }
+                }
+            }
+        } else {
             return -1;
-        }
-        
-        bit_pos := bit_pos + 16;
-        
-        // Copy literal bytes
-        var i: int64 := 0;
-        while (i < len) {
-            var src: int64 := bit_pos / 8;
-            StrSetChar(output, out_pos, StrCharAt(input, src));
-            out_pos := out_pos + 1;
-            bit_pos := bit_pos + 8;
-            i := i + 1;
         }
         
         if (bfinal == 1) { done := true; }
