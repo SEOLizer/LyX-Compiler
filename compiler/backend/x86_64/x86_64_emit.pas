@@ -860,11 +860,14 @@ begin
   // lea rsi, [rsp+8]  (48 8D 74 24 08)
   EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $74); EmitU8(FCode, $24); EmitU8(FCode, $08);
 
-  EmitU8(FCode, $55);  // push rbp
-  EmitRex(FCode, 1, 0, 0, 0);
-  EmitU8(FCode, $89);
-  EmitU8(FCode, $E5);  // mov rbp, rsp
-  
+  // _start is NOT a function — no frame setup here.
+  // RSP is already 0 mod 16 at this point (OS guarantee at process entry).
+  // The CALL instruction below pushes the return address (8 bytes), so main()
+  // is entered with RSP = -8 mod 16 = 8 mod 16, satisfying the x86-64 ABI.
+  // Adding 'push rbp' here would shift RSP to 8 mod 16 BEFORE the call,
+  // causing main() to be entered with RSP = 0 mod 16 (wrong!) and propagating
+  // misalignment through all subsequent frames — causing movaps faults in Qt etc.
+
   if mainFnIdx >= 0 then
   begin
     // call main (wird später gepatcht)
@@ -930,13 +933,14 @@ begin
     if fn.ReturnStructSize > 16 then
       Inc(totalSlots);
 
-    // x86-64 ABI: RSP must be 16-byte aligned before any CALL instruction.
-    // After 'push rbp' (in prologue), RSP = entry_RSP - 8 = 8 mod 16.
-    // After 'sub rsp, N', RSP = 8 mod 16 - N.
-    // For RSP = 0 mod 16 before calls: N must satisfy (8 - N) mod 16 = 0, i.e., N = 8 mod 16.
-    // N = totalSlots * 8, so totalSlots must be odd.
-    // If totalSlots is even (including 0), add one padding slot.
-    if (totalSlots mod 2) = 0 then
+    // x86-64 ABI: RSP must be 16-byte aligned (0 mod 16) before any CALL instruction.
+    // At function entry (after the CALL from the caller): RSP = 8 mod 16.
+    // After 'push rbp': RSP = 0 mod 16.
+    // After 'sub rsp, N': RSP = (0 - N) mod 16 = (-N) mod 16.
+    // For RSP = 0 mod 16 before internal calls: N must be 0 mod 16.
+    // N = totalSlots * 8, so totalSlots must be even.
+    // If totalSlots is odd, add one padding slot.
+    if (totalSlots mod 2) = 1 then
       Inc(totalSlots);
 
     // Stack-Frame für lokale Variablen und Temporaries
