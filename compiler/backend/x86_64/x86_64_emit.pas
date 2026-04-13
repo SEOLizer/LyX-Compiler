@@ -754,6 +754,7 @@ var
   FGlobalVarLeaPositions: array of record
     VarIndex: Integer;
     CodePos: Integer;
+    IsDataBased: Boolean;  // True if variable is in FData (not embedded in FCode)
   end;
   // Exception globals tracking (varIdx in globalVarNames, -1 = not registered)
   excValueIdx, excDepthIdx, excJmpbufsIdx: Integer;
@@ -761,6 +762,7 @@ var
   argvBaseIdx: Integer;
   // TMR Hash Store patch variables (aerospace-todo P0 #46)
   dataAddrPos: Integer;
+  codeToDataGap: Integer;
   jne1Pos, jne2Pos, jne3Pos: Integer;
   match1Pos, match2Pos, match3Pos: Integer;
   jgeOkPatchPos, jmpEndPatchPos: Integer;
@@ -809,16 +811,21 @@ begin
   //   syscall
   
   // Save initial RSP (= pointer to argc/argv) to _lyx_argv_base BEFORE touching the stack
+  // _lyx_argv_base lives in FData (always RW) so the code segment can remain PF_R|PF_X
   argvBaseIdx := globalVarNames.Count;
   globalVarNames.Add('_lyx_argv_base');
   SetLength(globalVarOffsets, argvBaseIdx + 1);
-  globalVarOffsets[argvBaseIdx] := 0;
+  globalVarOffsets[argvBaseIdx] := FData.Size;  // FData offset (currently 0)
+  FData.WriteU64LE(0);  // Reserve 8 bytes in FData for the stored initial RSP
+  // Advance totalDataOffset so irLoadGlobal/irStoreGlobal vars don't overlap
+  totalDataOffset := FData.Size;
   // lea r10, [rip + _lyx_argv_base]  (4D 8D 15 <disp32>)
   leaPos := FCode.Size;
   EmitU8(FCode, $4D); EmitU8(FCode, $8D); EmitU8(FCode, $15); EmitU32(FCode, 0);
   SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := argvBaseIdx;
   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
   // mov [r10], rsp  (49 89 22)
   EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $22);
 
@@ -923,10 +930,18 @@ begin
     if fn.ReturnStructSize > 16 then
       Inc(totalSlots);
 
+    // x86-64 ABI: RSP must be 16-byte aligned before any CALL instruction.
+    // After 'push rbp' (in prologue), RSP = entry_RSP - 8 = 8 mod 16.
+    // After 'sub rsp, N', RSP = 8 mod 16 - N.
+    // For RSP = 0 mod 16 before calls: N must satisfy (8 - N) mod 16 = 0, i.e., N = 8 mod 16.
+    // N = totalSlots * 8, so totalSlots must be odd.
+    // If totalSlots is even (including 0), add one padding slot.
+    if (totalSlots mod 2) = 0 then
+      Inc(totalSlots);
+
     // Stack-Frame für lokale Variablen und Temporaries
-    if totalSlots > 0 then
     begin
-      // sub rsp, n*8
+      // sub rsp, n*8  (always emitted; at least 1 slot for alignment)
       EmitRex(FCode, 1, 0, 0, 0);
       EmitU8(FCode, $81);
       EmitU8(FCode, $EC);
@@ -5309,6 +5324,7 @@ begin
                 SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
                 FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := argvBaseIdx;
                 FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+                FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
                 // mov r10, [r10]  (4D 8B 12)
                 EmitU8(FCode, $4D); EmitU8(FCode, $8B); EmitU8(FCode, $12);
                 // mov rax, [r10]  (49 8B 02)
@@ -5332,6 +5348,7 @@ begin
                   SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
                   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := argvBaseIdx;
                   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
                   // mov r10, [r10]  (4D 8B 12)
                   EmitU8(FCode, $4D); EmitU8(FCode, $8B); EmitU8(FCode, $12);
                   // rax = argv[idx] = [r10 + 8 + idx*8]
@@ -7391,6 +7408,9 @@ begin
   // Global variables are stored after strings in the code section (embedded like strings)
   if Length(FGlobalVarLeaPositions) > 0 then
   begin
+    // Note: _lyx_argv_base is stored in FData (not FCode) — see setup in _start code above.
+    // Its offset in globalVarOffsets[argvBaseIdx] is already the FData offset (0).
+
     // Write exception globals to end of code buffer if they were registered
     if excDepthIdx >= 0 then
     begin
@@ -7441,6 +7461,21 @@ begin
         // RIP-relative: disp32 = funcOffset - (CodePos + 7)
         // Both offsets are relative to start of code buffer
         offset := funcOffset - (FGlobalVarLeaPositions[i].CodePos + 7);
+        FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
+      end
+      else if FGlobalVarLeaPositions[i].IsDataBased then
+      begin
+        // Variable lives in FData (e.g. _lyx_argv_base).
+        // Code-to-data distance depends on ELF type:
+        //   dynamic ELF: data section is page-aligned after code -> AlignUp(FCode.Size, 4096)
+        //   static ELF:  data immediately follows code           -> FCode.Size
+        // Use presence of external symbols as proxy for dynamic ELF.
+        if Length(FExternalSymbols) > 0 then
+          codeToDataGap := (FCode.Size + 4095) and (not 4095)  // page-align for dynamic ELF
+        else
+          codeToDataGap := FCode.Size;  // data follows code directly in static ELF
+        offset := codeToDataGap + globalVarOffsets[varIdx]
+                  - (FGlobalVarLeaPositions[i].CodePos + 7);
         FCode.PatchU32LE(FGlobalVarLeaPositions[i].CodePos + 3, Cardinal(offset));
       end
       else if varIdx >= 0 then
