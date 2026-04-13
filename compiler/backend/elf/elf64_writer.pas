@@ -1203,13 +1203,16 @@ begin
        shdrsBuf.WriteBuffer(shdr, SizeOf(shdr));
       if Length(pltPatches) > 0 then
       begin
-        plt0VA := baseVA + codeOffset;
+        // PLT0 is NOT at the start of the code buffer — it's appended after all user code.
+        // plt0StartInBuffer = offset of PLT0 within the code buffer.
+        plt0StartInBuffer := pltPatches[0].Pos - 16;
+        plt0VA := baseVA + codeOffset + UInt64(plt0StartInBuffer);  // correct PLT0 virtual address
 
-        // PLT0 displacements: pushq [rip+disp32] / jmpq [rip+disp32]
+        // PLT0 displacements: pushq [rip+disp32] = GOT[1], jmpq [rip+disp32] = GOT[2]
+        // RIP at each instruction = plt0VA + bytes-so-far
         pushOffset := Int64(baseVA + gotOff + 8) - Int64(plt0VA + 6);
         jmpOffset := Int64(baseVA + gotOff + 16) - Int64(plt0VA + 12);
 
-        plt0StartInBuffer := pltPatches[0].Pos - 16;
         codeBuf.PatchU32LE(plt0StartInBuffer + 2, Cardinal(pushOffset));
         codeBuf.PatchU32LE(plt0StartInBuffer + 8, Cardinal(jmpOffset));
 
@@ -1227,14 +1230,13 @@ begin
           codeBuf.PatchU32LE(pltPatches[i].Pos + 12, Cardinal(jmpOffset));
         end;
 
-        // Initialize GOT[3+symIdx] to PLT0 (first instruction) for lazy binding
-        // When the external function is called for the first time, the dynamic linker
-        // will be invoked via PLT0 to resolve the symbol
+        // Initialize GOT[3+i] to PLTi+6 (the "push imm32" instruction) for lazy binding.
+        // On first call, PLTi jumps to GOT[3+i] = push_imm32, which pushes the reloc index,
+        // then jumps to PLT0 which calls _dl_runtime_resolve.
+        // With DT_BIND_NOW the dynamic linker overwrites these before execution anyway.
         for i := 0 to High(pltPatches) do
         begin
-          // Point GOT entry to PLT0, not to PLTn+6
-          // PLT0 is at codeOffset (relative to baseVA)
-          pltStubVA := baseVA + codeOffset;  // PLT0 address
+          pltStubVA := baseVA + codeOffset + UInt64(pltPatches[i].Pos) + 6; // PLTi+6 = push instruction
           gotBufOffset := (3 + pltPatches[i].SymbolIndex) * 8;
           gotTable.PatchU64LE(gotBufOffset, QWord(pltStubVA));
         end;
@@ -1293,7 +1295,7 @@ begin
       phdrInterp.p_memsz := interpSize;
       phdrInterp.p_align := 1;
 
-      // PT_LOAD for RX (covers ELF header + PHDRs + interp + code)
+      // PT_LOAD for code (read+execute only; writable globals live in the RW data segment)
       phdrRX.p_type := 1; // PT_LOAD
       phdrRX.p_flags := 5; // PF_R | PF_X
       phdrRX.p_offset := 0;
