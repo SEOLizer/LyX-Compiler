@@ -2430,8 +2430,9 @@ begin
         irPoolAlloc:
           begin
             // Pool allocation: Dest = pool_alloc(ImmInt bytes)
-            // Use VirtualAlloc like irAlloc for now
-            // TODO: Implement real pool with pre-allocated arena
+            // Currently uses VirtualAlloc directly.
+            // Future optimization: pre-allocated arena with bump-pointer allocation
+            // for faster small allocations (commonly used in Lyx for string buffers)
             
             // RCX = lpAddress = NULL (0)
             WriteMovRegImm64(FCode, RCX, 0);
