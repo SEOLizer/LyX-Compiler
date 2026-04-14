@@ -4802,9 +4802,9 @@ begin
         irFree:
           begin
             // Heap deallocation: free(Src1)
-            // munmap(addr, length) - but we don't track sizes, so skip for now
-            // TODO: Track allocation sizes for proper munmap
-            // This causes a memory leak but prevents crashes
+            // Currently skipped - requires tracking allocation sizes
+            // Future: store size alongside pointer or use metadata table
+            // This causes a minor memory leak but prevents crashes
           end;
           
         irFuncExit:
