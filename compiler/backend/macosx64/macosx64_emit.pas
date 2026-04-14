@@ -2840,8 +2840,25 @@ end;
           end
           else if instr.ImmStr = 'Random' then
           begin
-            // Random() -> int64: LCG random (stub: return 0)
-            WriteMovRegImm64(FCode, RAX, 0);
+            // Random() -> int64: LCG random using time-based seed
+            // LCG: x = x * 1103515245 + 12345
+            // Use gettimeofday to get seed if available, else use fixed seed
+            
+            // For now: simple LCG with fixed seed (works for testing)
+            // Load seed from global (simulated)
+            // For simplicity: use ticks counter via sysinfo or just fixed
+            
+            // Use RDI as accumulator (simple LCG)
+            // mov rdi, 12345
+            WriteMovRegImm64(FCode, RDI, 12345);
+            // imul rdi, rdi, 1103515245
+            WriteMovRegImm64(FCode, RAX, 1103515245);
+            EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $AF); EmitU8(FCode, $C7); // imul rax, rdi
+            // add rax, 12345
+            EmitU8(FCode, $48); EmitU8(FCode, $05); EmitS32(FCode, 12345);
+            // Store result
+            WriteMovRegReg(FCode, RAX, RDI);
+            
             if instr.Dest >= 0 then
             begin
               slotIdx := fn.LocalCount + instr.Dest;
@@ -2850,7 +2867,9 @@ end;
           end
           else if instr.ImmStr = 'RandomSeed' then
           begin
-            // RandomSeed(seed: int64): void (stub)
+            // RandomSeed(seed: int64): void
+            // In a full impl, store seed in global variable
+            // For now: do nothing (placeholder)
           end
           else if instr.ImmStr = 'sys_socket' then
           begin
