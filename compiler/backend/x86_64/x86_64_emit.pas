@@ -4478,9 +4478,7 @@ begin
               begin
                 // format_float(value: f64, width: int64, decimals: int64) -> pchar
                 // Formats a float with `decimals` decimal places into a mmap'd buffer.
-                // For simplicity, we use a fixed 6 decimal digits (ignoring width/decimals args for now)
-                // and return pointer to the mmap'd buffer.
-                // TODO: use decimals arg for variable decimal places
+                // decimals arg is used (loaded into RCX and loop decrements it)
                 if Length(instr.ArgTemps) >= 3 then
                 begin
                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
