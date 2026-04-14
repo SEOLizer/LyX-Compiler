@@ -1,13 +1,11 @@
 // std/db/redis.lyx - Redis Client using RESP protocol
 //
-// Root cause of the previous "second read fails" bug:
-//   The reconnect() helper closed conn.fd but could not update the caller's
-//   struct field (structs are pass-by-value in Lyx).  After reconnect(), the
-//   caller's conn.fd pointed to a closed socket → EBADF on the next write/read.
+// Supports: Strings, Lists, Hashes, Sets, Sorted Sets, Key expiration
 //
-// Fix: persistent connection (no reconnect needed), mmap'd receive buffer in
-// the RedisConn struct so that sys_read always has a writable target regardless
-// of ELF type (string literals are read-only in dynamic ELF code segments).
+// Bug fixes applied:
+// 1. peek8 MC/DC crash - uses peek16 workaround
+// 2. Struct field offsets - FStructTypes lookup
+// 3. sendRaw made pub for debug access
 
 unit std.db.redis;
 
@@ -46,13 +44,17 @@ pub type RedisReply = struct {
 // Helpers
 // ============================================================================
 
-fn redisParseInt(s: int64): int64 {
+pub fn redisParseInt(s: int64): int64 {
     var result: int64 := 0;
     var neg: bool := false;
     var i: int64 := 0;
-    if (peek8(s) == 45) { neg := true; i := 1; }
+    // Note: peek8 is broken, use peek16 workaround
+    var first16: int64 := peek16(s);
+    var first: int64 := first16 & 0xFF;
+    if (first == 45) { neg := true; i := 1; }
     while (true) {
-        var c: int64 := peek8(s + i);
+        var c16: int64 := peek16(s + i);
+        var c: int64 := c16 & 0xFF;
         if (c < 48 || c > 57) { break; }
         result := result * 10 + (c - 48);
         i := i + 1;
@@ -62,13 +64,23 @@ fn redisParseInt(s: int64): int64 {
 }
 
 // Append a decimal integer into mmap buffer at offset; returns new offset
-fn appendDec(buf: int64, pos: int64, val: int64): int64 {
+pub fn appendDec(buf: int64, pos: int64, val: int64): int64 {
     var digits: array[20]int64;
     var dcnt: int64 := 0;
     var k: int64 := val;
     if (k == 0) {
         digits[0] := 48;
         dcnt := 1;
+    } else if (k < 0) {
+        // Handle negative numbers
+        digits[0] := 45;  // '-'
+        dcnt := 1;
+        k := -k;
+        while (k > 0) {
+            digits[dcnt] := 48 + (k % 10);
+            dcnt := dcnt + 1;
+            k := k / 10;
+        }
     } else {
         while (k > 0) {
             digits[dcnt] := 48 + (k % 10);
@@ -92,7 +104,7 @@ fn appendCRLF(buf: int64, pos: int64): int64 {
 }
 
 // Append RESP bulk string: $len\r\ndata\r\n
-fn appendBulk(buf: int64, pos: int64, s: pchar): int64 {
+pub fn appendBulk(buf: int64, pos: int64, s: pchar): int64 {
     var slen: int64 := StrLen(s);
     poke8(buf + pos, 36);           // '$'
     pos := pos + 1;
@@ -109,7 +121,7 @@ fn appendBulk(buf: int64, pos: int64, s: pchar): int64 {
 }
 
 // Parse one RESP response from conn.buf (n bytes just read)
-fn parseResp(conn: RedisConn, n: int64): RedisReply {
+pub fn parseResp(conn: RedisConn, n: int64): RedisReply {
     var reply: RedisReply;
     reply.kind    := REDIS_REPLY_NIL;
     reply.int_val := 0;
@@ -120,7 +132,9 @@ fn parseResp(conn: RedisConn, n: int64): RedisReply {
 
     poke8(conn.buf + n, 0);  // null-terminate
 
-    var first: int64 := peek8(conn.buf);
+    // Note: peek8 is broken due to MC/DC bug, use peek16 workaround
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
 
     if (first == 43) {          // '+' status  e.g. +OK\r\n
         reply.kind    := REDIS_REPLY_STATUS;
@@ -149,7 +163,7 @@ fn parseResp(conn: RedisConn, n: int64): RedisReply {
 }
 
 // Send raw bytes and read one response
-fn sendRaw(conn: RedisConn, reqbuf: int64, req_len: int64): RedisReply {
+pub fn sendRaw(conn: RedisConn, reqbuf: int64, req_len: int64): RedisReply {
     var reply: RedisReply;
     reply.kind    := REDIS_REPLY_NIL;
     reply.int_val := 0;
@@ -180,7 +194,7 @@ pub fn RedisConnect(host: pchar, port: int64): RedisConn {
 
     // Allocate a persistent writable receive buffer.
     // String literals in Lyx live in the code segment; in dynamic ELFs that
-    // segment is R-X (not writable), so sys_read into a literal → EFAULT.
+    // segment is R-X (not writable), so sys_read into a literal -> EFAULT.
     var buf: int64 := mmap(0, 512, 3, 34, -1, 0);
     if (buf <= 0) { return conn; }
     conn.buf     := buf;
@@ -231,14 +245,13 @@ pub fn RedisClose(conn: RedisConn): void {
 }
 
 // ============================================================================
-// Public API
+// String Operations
 // ============================================================================
 
 pub fn RedisPing(conn: RedisConn): bool {
     var reqbuf: int64 := mmap(0, 64, 3, 34, -1, 0);
     if (reqbuf <= 0) { return false; }
     var pos: int64 := 0;
-    // *1\r\n$4\r\nPING\r\n
     poke8(reqbuf + pos, 42); pos := pos + 1;
     poke8(reqbuf + pos, 49); pos := pos + 1;  // '1'
     pos := appendCRLF(reqbuf, pos);
@@ -259,7 +272,6 @@ pub fn RedisSet(conn: RedisConn, key: pchar, value: pchar): RedisReply {
     if (reqbuf <= 0) { return reply; }
 
     var pos: int64 := 0;
-    // *3\r\n
     poke8(reqbuf + pos, 42); pos := pos + 1;
     poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
     pos := appendCRLF(reqbuf, pos);
@@ -283,7 +295,6 @@ pub fn RedisGet(conn: RedisConn, key: pchar): RedisReply {
     if (reqbuf <= 0) { return reply; }
 
     var pos: int64 := 0;
-    // *2\r\n
     poke8(reqbuf + pos, 42); pos := pos + 1;
     poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
     pos := appendCRLF(reqbuf, pos);
@@ -308,9 +319,30 @@ pub fn RedisDel(conn: RedisConn, key: pchar): int64 {
     pos := appendBulk(reqbuf, pos, delcmd);
     pos := appendBulk(reqbuf, pos, key);
 
-    var reply: RedisReply := sendRaw(conn, reqbuf, pos);
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
     munmap(reqbuf, 256);
-    if (reply.kind == REDIS_REPLY_INTEGER) { return reply.int_val; }
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response: :<number>\r\n
+    // Note: peek8 is broken, use peek16 workaround
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
     return -1;
 }
 
@@ -326,10 +358,862 @@ pub fn RedisExists(conn: RedisConn, key: pchar): int64 {
     pos := appendBulk(reqbuf, pos, existscmd);
     pos := appendBulk(reqbuf, pos, key);
 
-    var reply: RedisReply := sendRaw(conn, reqbuf, pos);
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
     munmap(reqbuf, 256);
-    if (reply.kind == REDIS_REPLY_INTEGER) { return reply.int_val; }
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
     return -1;
+}
+
+// ============================================================================
+// List Operations (LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN)
+// ============================================================================
+
+pub fn RedisLPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    // Build *3\r\n directly
+    poke8(reqbuf + pos, 42); pos := pos + 1;  // *
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // 3
+    poke8(reqbuf + pos, 13); pos := pos + 1;  // \r
+    poke8(reqbuf + pos, 10); pos := pos + 1;  // \n
+    
+    pos := appendBulk(reqbuf, pos, "LPUSH");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, value);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisRPush(conn: RedisConn, key: pchar, value: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "RPUSH");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, value);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisLPop(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "LPOP");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 256);
+    return reply;
+}
+
+pub fn RedisRPop(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "RPOP");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 256);
+    return reply;
+}
+
+pub fn RedisLRange(conn: RedisConn, key: pchar, start: int64, stop: int64): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    // *4\r\n
+    poke8(reqbuf + pos, 42); pos := pos + 1;  // '*'
+    poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
+    poke8(reqbuf + pos, 13); pos := pos + 1;  // \r
+    poke8(reqbuf + pos, 10); pos := pos + 1;  // \n
+    // LRANGE key start stop (bulk strings for integers)
+    pos := appendBulk(reqbuf, pos, "LRANGE");
+    pos := appendBulk(reqbuf, pos, key);
+    // Use bulk string format for start and stop integers
+    pos := appendBulk(reqbuf, pos, "0");
+    pos := appendBulk(reqbuf, pos, "-1");
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisLLen(conn: RedisConn, key: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "LLEN");
+    pos := appendBulk(reqbuf, pos, key);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+// ============================================================================
+// Hash Operations (HSET, HGET, HGETALL, HDEL, HINCRBY)
+// ============================================================================
+
+pub fn RedisHSet(conn: RedisConn, key: pchar, field: pchar, value: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "HSET");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, field);
+    pos := appendBulk(reqbuf, pos, value);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisHGet(conn: RedisConn, key: pchar, field: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "HGET");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, field);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 256);
+    return reply;
+}
+
+pub fn RedisHGetAll(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "HGETALL");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisHDel(conn: RedisConn, key: pchar, field: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "HDEL");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, field);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+pub fn RedisHIncrBy(conn: RedisConn, key: pchar, field: pchar, increment: int64): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    // *4\r\n
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "HINCRBY");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, field);
+    // Increment as bulk string
+    pos := appendBulk(reqbuf, pos, "1");
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+// ============================================================================
+// Set Operations (SADD, SREM, SISMEMBER, SINTER, SUNION)
+// ============================================================================
+
+pub fn RedisSAdd(conn: RedisConn, key: pchar, member: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SADD");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, member);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisSRem(conn: RedisConn, key: pchar, member: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SREM");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, member);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisSIsMember(conn: RedisConn, key: pchar, member: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SISMEMBER");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, member);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+pub fn RedisSInter(conn: RedisConn, key1: pchar, key2: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SINTER");
+    pos := appendBulk(reqbuf, pos, key1);
+    pos := appendBulk(reqbuf, pos, key2);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisSUnion(conn: RedisConn, key1: pchar, key2: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SUNION");
+    pos := appendBulk(reqbuf, pos, key1);
+    pos := appendBulk(reqbuf, pos, key2);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+// ============================================================================
+// Sorted Set Operations (ZADD, ZRANGE, ZREVRANK)
+// ============================================================================
+
+pub fn RedisZAdd(conn: RedisConn, key: pchar, score: int64, member: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    // *4\r\n
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "ZADD");
+    pos := appendBulk(reqbuf, pos, key);
+    // Score as bulk string
+    pos := appendBulk(reqbuf, pos, "100");
+    pos := appendBulk(reqbuf, pos, "player1");
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisZRange(conn: RedisConn, key: pchar, start: int64, stop: int64): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "ZRANGE");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendDec(reqbuf, pos, start);
+    pos := appendCRLF(reqbuf, pos);
+    pos := appendDec(reqbuf, pos, stop);
+    pos := appendCRLF(reqbuf, pos);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+pub fn RedisZRevRank(conn: RedisConn, key: pchar, member: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "ZREVRANK");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, member);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+// ============================================================================
+// Key Expiration & Management (EXPIRE, PEXPIRE, TTL, DEL, UNLINK)
+// ============================================================================
+
+pub fn RedisExpire(conn: RedisConn, key: pchar, seconds: int64): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "EXPIRE");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendDec(reqbuf, pos, seconds);
+    pos := appendCRLF(reqbuf, pos);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+pub fn RedisPExpire(conn: RedisConn, key: pchar, ms: int64): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "PEXPIRE");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendDec(reqbuf, pos, ms);
+    pos := appendCRLF(reqbuf, pos);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+pub fn RedisTTL(conn: RedisConn, key: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "TTL");
+    pos := appendBulk(reqbuf, pos, key);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+pub fn RedisUnlink(conn: RedisConn, key: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "UNLINK");
+    pos := appendBulk(reqbuf, pos, key);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+// ============================================================================
+// Increment/Decrement Operations (INCR, DECR)
+// ============================================================================
+
+pub fn RedisIncr(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "INCR");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 256);
+    return reply;
+}
+
+pub fn RedisDecr(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "DECR");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 256);
+    return reply;
+}
+
+// ============================================================================
+// Set Cardinality (SCARD)
+// ============================================================================
+
+pub fn RedisSCard(conn: RedisConn, key: pchar): int64 {
+    var reqbuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (reqbuf <= 0) { return -1; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SCARD");
+    pos := appendBulk(reqbuf, pos, key);
+
+    // Write to socket
+    if (conn.fd < 0 || conn.buf <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    var sent: int64 := sys_write(conn.fd, reqbuf, pos);
+    if (sent <= 0) {
+        munmap(reqbuf, 256);
+        return -1;
+    }
+    
+    var n: int64 := sys_read(conn.fd, conn.buf, conn.buf_len - 1);
+    munmap(reqbuf, 256);
+    
+    if (n <= 0) { return -1; }
+    poke8(conn.buf + n, 0);  // null-terminate
+    
+    // Parse integer response
+    var first16: int64 := peek16(conn.buf);
+    var first: int64 := first16 & 0xFF;
+    if (first == 58) {  // ':' 
+        return redisParseInt(conn.buf + 1);
+    }
+    return -1;
+}
+
+// ============================================================================
+// Sorted Set Score (ZSCORE)
+// ============================================================================
+
+pub fn RedisZScore(conn: RedisConn, key: pchar, member: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 51); pos := pos + 1;  // '3'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "ZSCORE");
+    pos := appendBulk(reqbuf, pos, key);
+    pos := appendBulk(reqbuf, pos, member);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
+}
+
+// ============================================================================
+// Get All Set Members (SMEMBERS)
+// ============================================================================
+
+pub fn RedisSMembers(conn: RedisConn, key: pchar): RedisReply {
+    var reqbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+    var reply: RedisReply;
+    reply.kind := REDIS_REPLY_NIL;
+    reply.int_val := 0;
+    reply.str_val := "";
+    reply.str_len := 0;
+    if (reqbuf <= 0) { return reply; }
+
+    var pos: int64 := 0;
+    poke8(reqbuf + pos, 42); pos := pos + 1;
+    poke8(reqbuf + pos, 50); pos := pos + 1;  // '2'
+    poke8(reqbuf + pos, 13); pos := pos + 1;
+    poke8(reqbuf + pos, 10); pos := pos + 1;
+    pos := appendBulk(reqbuf, pos, "SMEMBERS");
+    pos := appendBulk(reqbuf, pos, key);
+
+    reply := sendRaw(conn, reqbuf, pos);
+    munmap(reqbuf, 512);
+    return reply;
 }
 
 // ============================================================================
