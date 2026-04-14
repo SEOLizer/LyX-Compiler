@@ -62,7 +62,7 @@ Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `S
 
 **Fehlt ❌ – Vollständige Implementierungen:**
 - [ ] `printf` – Format-String Parsing via wsprintfA
-- [ ] `StrSub` / `StrConcat` / `StrCopy` – Vollständige String-Operationen mit memcpy
+- [ ] `StrSub` / `StrConcat` / `StrCopy` – mit memcpy (Stubs - allocate ohne copy)
 - [ ] `Inspect` (Debug-Visualizer)
 
 **Hinweis:** Windows ARM64 nutzt den Microsoft ABI (x0–x7 Parameter, keine Syscalls – alles über Win32 API).
@@ -73,16 +73,10 @@ Imports müssen als IAT-Einträge in den PE-Header eingetragen werden (kein PLT,
 
 ### Xtensa / ESP32 (`compiler/backend/xtensa/xtensa_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr (via sys_write)
+**Implementiert ✅:** exit, PrintStr, PrintInt (Stub: "INT"), PrintFloat (Stub), open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, getpid, sleep_ms, now_unix, now_unix_ms, Random, RandomSeed, mmap, munmap, peek8/16/32/64, poke8/16/32/64, StrLen, StrCharAt, StrSetChar, StrNew, StrFree, StrAppend, StrFromInt, StrFindChar, StrSub, StrConcat, StrCopy, FileGetSize, StrStartsWith, StrEndsWith, StrEquals, GetArgC, GetArg, PrintLn, printf, Socket builtins (stubs), ESP32 builtins (watchdog, brownout, flash, mpu, cache, etc.)
 
-**Fehlt ❌ – Builtins:**
-- [ ] `PrintInt` – itoa-Loop + write
-- [ ] `PrintFloat` – nicht sinnvoll ohne FPU; niedrige Priorität
-- [ ] `StrLen` / `StrCharAt` / `StrSetChar` / `StrNew` / `StrFree` / `StrAppend` / `StrFromInt`
-- [ ] `S1–S7` komplett (StrFindChar, StrSub, StrConcat, IntToStr, Hash*, GetArgC/GetArg, StrEquals etc.)
-- [ ] `Random` / `RandomSeed`
-- [ ] `peek8/16/32` / `poke8/16/32` (für Memory-Mapped I/O – besonders wichtig auf ESP32)
-- [ ] `open` / `read` / `write` / `close` (SPIFFS/LittleFS Dateisystem)
+**Fehlt ❌ – Niedrige Priorität:**
+- [ ] PrintInt – echte itoa-Implementierung (aktuell Stub)
 
 **Hinweis:** Xtensa hat kein Linux-Syscall-Interface. Alle I/O-Builtins müssen gegen die ESP-IDF-API (`uart_write_bytes`, `esp_vfs_*`) oder direkt gegen UART-Register implementiert werden.
 `mmap`/`munmap` sind auf ESP32 nicht sinnvoll — `StrNew`/`StrFree` müssen auf `heap_caps_malloc`/`heap_caps_free` gemappt werden.
