@@ -2510,8 +2510,12 @@ end;
           end
           else if instr.ImmStr = 'GetArgC' then
           begin
-            // GetArgC: stub - return 0
-            WriteMovRegImm64(FCode, RAX, 0);
+            // GetArgC(): int64 — return argc from main
+            // In macOS, argc is passed on stack at [rsp+8] on entry
+            // We'll need to access it from the function prologue
+            // For now: try to load from [rbp+something] - not reliable
+            // Fallback: return 1 (minimum for program name)
+            WriteMovRegImm64(FCode, RAX, 1);
             if instr.Dest >= 0 then
             begin
               slotIdx := fn.LocalCount + instr.Dest;
@@ -2520,7 +2524,9 @@ end;
           end
           else if instr.ImmStr = 'GetArg' then
           begin
-            // GetArg: stub - return NULL
+            // GetArg(n: int64): pchar — return argv[n]
+            // argv[0] = program name, stored at [rsp] on entry
+            // For now: return NULL
             WriteMovRegImm64(FCode, RAX, 0);
             if instr.Dest >= 0 then
             begin
