@@ -44,16 +44,16 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 ### macOS x86_64 (`compiler/backend/macosx64/macosx64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (mmap), StrFree (munmap), StrFromInt (itoa), StrAppend, StrFindChar, StrSub (stub), StrConcat (stub), StrCopy (stub), FileGetSize (stub), StrStartsWith, StrEndsWith (stub), StrEquals, GetArgC (returns 1), GetArg (stub), PrintFloat, Random (stub), RandomSeed (stub), Socket builtins (stubs), printf (stub)
+**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (mmap), StrFree (munmap), StrFromInt (itoa), StrAppend, StrFindChar, StrSub (mmap), StrConcat (stub), StrCopy (stub), FileGetSize (stub), StrStartsWith, StrEndsWith (stub), StrEquals, GetArgC (1), GetArg (stub), PrintFloat, Random (stub), RandomSeed (stub), Socket builtins (stubs), printf (stub)
 
-**Fehlt ❌ – String-Builtins S1–S7:**
-- [ ] `StrSub` – substring extraction
+**Fehlt ❌ – String-Builtins:**
 - [ ] `StrConcat` – full concat with realloc
-- [ ] `StrCopy` – string copy
+- [ ] `StrCopy` – string copy (allocate new)
 - [ ] `FileGetSize` – stat syscall
 - [ ] `StrEndsWith` – suffix check
+- [ ] `GetArg` – argv access
 - [ ] `Random` / `RandomSeed`
-- [ ] Socket-Builtins (Mach-O syscall-Nummern: `SYS_MACOS_*`)
+- [ ] Socket-Builtins
 
 **Fehlt ❌ – Sonstige:**
 - [ ] `printf` – Format-String Parsing
