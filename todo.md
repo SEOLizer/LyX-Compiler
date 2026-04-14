@@ -44,22 +44,19 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 ### macOS x86_64 (`compiler/backend/macosx64/macosx64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (mmap), StrFree (munmap), StrFromInt (itoa), StrAppend (stub), StrFindChar (stub), StrSub (stub), StrConcat (stub), StrCopy (stub), FileGetSize (stub), StrStartsWith (stub), StrEndsWith (stub), StrEquals (stub), GetArgC (stub), GetArg (stub), PrintFloat, Random (stub), RandomSeed (stub), Socket builtins (stubs), printf (stub), StrNew/StrFree implementiert
+**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (mmap), StrFree (munmap), StrFromInt (itoa), StrAppend, StrFindChar, StrSub (stub), StrConcat (stub), StrCopy (stub), FileGetSize (stub), StrStartsWith, StrEndsWith (stub), StrEquals, GetArgC (returns 1), GetArg (stub), PrintFloat, Random (stub), RandomSeed (stub), Socket builtins (stubs), printf (stub)
 
-**Fehlt ❌ – IO-Builtins:**
-- [ ] `printf`
-- [ ] `rmdir` / `chmod` / `rename`
-
-**Fehlt ❌ – String-Builtins (alle):**
-- [ ] `str_concat`, `StrLen`, `StrCharAt`, `StrSetChar`, `StrNew`, `StrFree`, `StrAppend`, `StrFromInt`
-- [ ] S1–S7 komplett (StrFindChar, StrSub, StrAppendStr, StrConcat, StrCopy, IntToStr, FileGetSize, Hash*, GetArgC, GetArg, StrStartsWith, StrEndsWith, StrEquals)
+**Fehlt ❌ – String-Builtins S1–S7:**
+- [ ] `StrSub` – substring extraction
+- [ ] `StrConcat` – full concat with realloc
+- [ ] `StrCopy` – string copy
+- [ ] `FileGetSize` – stat syscall
+- [ ] `StrEndsWith` – suffix check
+- [ ] `Random` / `RandomSeed`
+- [ ] Socket-Builtins (Mach-O syscall-Nummern: `SYS_MACOS_*`)
 
 **Fehlt ❌ – Sonstige:**
-- [ ] `Random` / `RandomSeed`
-- [ ] `peek*` / `poke*` / `buf_get_byte` / `buf_put_byte`
-- [ ] `format_float`
-- [ ] `Inspect`
-- [ ] Socket-Builtins (Mach-O syscall-Nummern: `SYS_MACOS_*`)
+- [ ] `printf` – Format-String Parsing
 - [ ] VMT / DynArray / Closures
 
 **Hinweis:** macOS verwendet andere Syscall-Nummern (0x2000000-Präfix) und die System-V ABI.
