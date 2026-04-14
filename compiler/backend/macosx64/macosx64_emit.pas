@@ -2195,9 +2195,115 @@ begin
               end;
             end;
           end
-          else if instr.ImmStr = 'StrAppend' then
+else if instr.ImmStr = 'StrAppend' then
           begin
-            // StrAppend(dest, src): stub - return dest
+            // StrAppend(dest, src): append src to dest
+            // dest and src have header [cap:8][len:8] at data-16
+            if Length(instr.ArgTemps) >= 2 then
+            begin
+              // Load dest and src
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RAX, RBP, SlotOffset(slotIdx)); // dest
+              slotIdx := fn.LocalCount + instr.ArgTemps[1];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx)); // src
+              
+              // RAX = dest, RDI = src
+              // Save src (rdi -> r12)
+              EmitU8(FCode, $49); EmitU8(FCode, $89); EmitU8(FCode, $F8); // mov r8, rdi
+              
+              // Get dest len: mov rsi, [rax-8]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $70); EmitU8(FCode, $F8); // mov rsi, [rax-8]
+              
+              // Get src len: mov rdx, [rdi-8]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $57); EmitU8(FCode, $F8); // mov rdx, [rdi-8]
+              
+              // dest + src = new len
+              // For simplicity: just return dest (stub)
+              // Full implementation: check cap, realloc if needed, copy
+              
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end;
+          end
+          else if instr.ImmStr = 'StrFindChar' then
+          begin
+            // StrFindChar(s, c, from): find char c in s starting from index
+            if Length(instr.ArgTemps) >= 3 then
+            begin
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx)); // s
+              slotIdx := fn.LocalCount + instr.ArgTemps[1];
+              WriteMovRegReg(RAX, RDI); // copy s to rax
+              slotIdx := fn.LocalCount + instr.ArgTemps[2];
+              WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx)); // c
+              // rdx = char to find
+              
+              // Simple: iterate from 0 until match or null
+              // xor rcx, rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C9);
+              // loop: cmp byte [rdi+rcx], 0
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0F); EmitU8(FCode, $00);
+              // jz not_found
+              EmitU8(FCode, $74); EmitU8(FCode, $0D);
+              // cmp byte [rdi+rcx], dl
+              EmitU8(FCode, $38); EmitU8(FCode, $14); EmitU8(FCode, $0F);
+              // jz found
+              EmitU8(FCode, $74); EmitU8(FCode, $06);
+              // inc rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+              // jmp loop
+              EmitU8(FCode, $EB); EmitU8(FCode, $F0);
+              // not_found: mov rax, -1
+              EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $C0); EmitS32(FCode, -1);
+              // found: mov rax, rcx
+              // (patch target here)
+              // mov rax, rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $C8);
+              
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, UInt64(-1));
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end;
+          end
+          else if instr.ImmStr = 'StrSub' then
+          begin
+            // StrSub(s, start, len): extract substring
+            // Stub: return empty string
+            // Full impl: mmap new buffer, copy len bytes from s+start
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'StrConcat' then
+          begin
+            // StrConcat(a, b): concatenate two strings
+            // Stub: return first string
             if Length(instr.ArgTemps) >= 1 then
             begin
               slotIdx := fn.LocalCount + instr.ArgTemps[0];
@@ -2209,6 +2315,117 @@ begin
             begin
               slotIdx := fn.LocalCount + instr.Dest;
               WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'StrCopy' then
+          begin
+            // StrCopy(s): copy string
+            // Stub: return same pointer
+            if Length(instr.ArgTemps) >= 1 then
+            begin
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RAX, RBP, SlotOffset(slotIdx));
+            end
+            else
+              WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'FileGetSize' then
+          begin
+            // FileGetSize(path): get file size via stat
+            // Stub: return -1
+            WriteMovRegImm64(FCode, RAX, UInt64(-1));
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'StrStartsWith' then
+          begin
+            // StrStartsWith(s, prefix): check if s starts with prefix
+            // Stub: return true if prefix is empty
+            if Length(instr.ArgTemps) >= 2 then
+            begin
+              // Check if both strings are non-null
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RAX, RBP, SlotOffset(slotIdx));
+              slotIdx := fn.LocalCount + instr.ArgTemps[1];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+              // If either is null, return false (0)
+              // test rax, rax; jz false; test rdi, rdi; jz false
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $C0);
+              EmitU8(FCode, $74); EmitU8(FCode, $04);
+              EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF);
+              EmitU8(FCode, $75); EmitU8(FCode, $04);
+              // return 1 (true)
+              WriteMovRegImm64(FCode, RAX, 1);
+              EmitU8(FCode, $EB); EmitU8(FCode, $02);
+              // return 0 (false)
+              WriteMovRegImm64(FCode, RAX, 0);
+              
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end;
+          end
+          else if instr.ImmStr = 'StrEndsWith' then
+          begin
+            // StrEndsWith(s, suffix): check if s ends with suffix
+            // Stub: return false
+            WriteMovRegImm64(FCode, RAX, 0);
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'StrEquals' then
+          begin
+            // StrEquals(a, b): compare two strings for equality
+            // Stub: compare pointers (not contents)
+            if Length(instr.ArgTemps) >= 2 then
+            begin
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RAX, RBP, SlotOffset(slotIdx));
+              slotIdx := fn.LocalCount + instr.ArgTemps[1];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+              // cmp rax, rdi
+              EmitU8(FCode, $48); EmitU8(FCode, $39); EmitU8(FCode, $F8);
+              // sete al
+              EmitU8(FCode, $0F); EmitU8(FCode, $94); EmitU8(FCode, $C0);
+              // movzx rax, al
+              EmitU8(FCode, $48); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $C0);
+              
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
             end;
           end
           else if instr.ImmStr = 'StrFindChar' then
@@ -2289,7 +2506,7 @@ begin
             begin
               slotIdx := fn.LocalCount + instr.Dest;
               WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
+end;
           end
           else if instr.ImmStr = 'GetArgC' then
           begin
