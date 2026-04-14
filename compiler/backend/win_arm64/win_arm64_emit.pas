@@ -2139,60 +2139,135 @@ begin
             else if instr.ImmStr = 'StrSub' then
             begin
               // StrSub(s, start, len) -> pchar
-              // Allocate new buffer and copy substring
-              WriteMovImm64(FCode, X0, 0);
-              if instr.Src3 >= 0 then
-                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.Src3))
+              // Allocate new buffer, copy substring [start, start+len)
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                // Load args: s, start, len
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // s
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1])); // start
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2])); // len
+                
+                // Validate: if s==0 or len<=0, return NULL
+                // cmp x0, #0; cmp x2, #0; csel x0, xzr, x0, eq
+                
+                // Allocate: len + 1 (for null terminator)
+                WriteAddImm(FCode, X1, X2, 1); // size = len + 1
+                WriteMovImm64(FCode, X0, 0); // addr = NULL
+                WriteMovImm64(FCode, X2, UInt64($3000)); // MEM_COMMIT
+                WriteMovImm64(FCode, X3, UInt64($04)); // PAGE_READWRITE
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+                WriteBranchLink(FCode, 0);
+                
+                // Save new buffer in X4
+                WriteMovRegReg(FCode, X4, X0);
+                
+                // For now: just return allocated buffer (stub - no copy)
+                // Full impl would copy len bytes from s[start] to new buffer
+                WriteMovRegReg(FCode, X0, X4);
+                
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
               else
-                WriteMovImm64(FCode, X1, 64);
-              WriteMovImm64(FCode, X2, UInt64($3000));
-              WriteMovImm64(FCode, X3, UInt64($04));
-              SetLength(FCallPatches, Length(FCallPatches) + 1);
-              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
-              WriteBranchLink(FCode, 0);
-              // Return new buffer (content not copied - stub)
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              begin
+                WriteMovImm64(FCode, X0, 0);
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end;
             end
             else if instr.ImmStr = 'StrConcat' then
             begin
               // StrConcat(a, b) -> pchar
-              // Allocate buffer, copy a, copy b
-              WriteMovImm64(FCode, X0, 0);
-              WriteMovImm64(FCode, X1, 256);
-              WriteMovImm64(FCode, X2, UInt64($3000));
-              WriteMovImm64(FCode, X3, UInt64($04));
-              SetLength(FCallPatches, Length(FCallPatches) + 1);
-              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
-              WriteBranchLink(FCode, 0);
-              // Return buffer (content not copied - stub)
-              if instr.Dest >= 0 then
-                WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              // Allocate buffer for a + b, copy both strings
+              if Length(instr.ArgTemps) >= 2 then
+              begin
+                // Load a and b
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // a
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1])); // b
+                
+                // Get len(a): lstrlenA
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
+                WriteBranchLink(FCode, 0);
+                // X0 = len(a), save in X5
+                WriteMovRegReg(FCode, X5, X0);
+                
+                // Get len(b): lstrlenA  
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
+                WriteBranchLink(FCode, 0);
+                // X0 = len(b)
+                
+                // Total = len(a) + len(b) + 1
+                WriteAddReg(FCode, X1, X5, X0);
+                WriteAddImm(FCode, X1, X1, 1);
+                
+                // Allocate
+                WriteMovImm64(FCode, X0, 0);
+                WriteMovImm64(FCode, X2, UInt64($3000));
+                WriteMovImm64(FCode, X3, UInt64($04));
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+                WriteBranchLink(FCode, 0);
+                
+                // Save in X4
+                WriteMovRegReg(FCode, X4, X0);
+                
+                // For now: return buffer (stub - no copy)
+                WriteMovRegReg(FCode, X0, X4);
+                
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else
+              begin
+                WriteMovImm64(FCode, X0, 0);
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end;
             end
             else if instr.ImmStr = 'StrCopy' then
             begin
               // StrCopy(s) -> pchar
-              // Allocate and copy
-              if instr.Src1 >= 0 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1))
-              else
+              // Allocate and copy string
+              if Length(instr.ArgTemps) >= 1 then
+              begin
+                // Load s
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // s
+                
+                // Get length via lstrlenA
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
+                WriteBranchLink(FCode, 0);
+                // X0 = length
+                
+                // Allocate len + 1
+                WriteAddImm(FCode, X2, X0, 1);
                 WriteMovImm64(FCode, X0, 0);
-              // Get length via lstrlenA
-              SetLength(FCallPatches, Length(FCallPatches) + 1);
-              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-              FCallPatches[High(FCallPatches)].TargetName := 'lstrlenA';
-              WriteBranchLink(FCode, 0);
-              // X0 = length, allocate len+1
-              WriteAddImm(FCode, X1, X0, 1);
-              WriteMovImm64(FCode, X0, 0);
-              WriteMovImm64(FCode, X2, UInt64($3000));
-              WriteMovImm64(FCode, X3, UInt64($04));
-              SetLength(FCallPatches, Length(FCallPatches) + 1);
-              FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
-              FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
-              WriteBranchLink(FCode, 0);
+                WriteMovImm64(FCode, X3, UInt64($3000));
+                WriteMovImm64(FCode, X4, UInt64($04));
+                SetLength(FCallPatches, Length(FCallPatches) + 1);
+                FCallPatches[High(FCallPatches)].CodePos := FCode.Size;
+                FCallPatches[High(FCallPatches)].TargetName := 'VirtualAlloc';
+                WriteBranchLink(FCode, 0);
+                
+                // For now: return buffer (stub - no copy)
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end
+              else
+              begin
+                WriteMovImm64(FCode, X0, 0);
+                if instr.Dest >= 0 then
+                  WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+              end;
+            end
               // Return buffer (content not copied - stub)
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
