@@ -7215,10 +7215,15 @@ begin
             WriteMovRegImm64(FCode, R9, 3);
             WriteSyscall(FCode);
             // Copy old data if exists
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // src = old ptr
             EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF); // test rdi, rdi
             EmitU8(FCode, $74); EmitU8(FCode, $00); // jz +0 (skip copy)
-            // TODO: memcpy
+            // memcpy: RDI=dest, RSI=src, RCX=len
+            WriteMovRegReg(FCode, RSI, RDI); // RSI = src (old ptr)
+            WriteMovRegReg(FCode, RDI, RAX); // RDI = dest (new mmap'd ptr)
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1)); // len
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03); // rcx *= 8 (element size)
+            EmitU8(FCode, $F3); EmitU8(FCode, $A4); // rep movsb
             // Update ptr, cap
             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1), RAX);
             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 2), RDX);
