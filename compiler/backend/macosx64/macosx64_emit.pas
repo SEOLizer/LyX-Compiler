@@ -3021,7 +3021,48 @@ end;
           end
           else if instr.ImmStr = 'printf' then
           begin
-            // printf: stub - just ignore
+            // printf(fmt: pchar, ...): int64
+            // Simplified implementation: just print the format string (no arg substitution)
+            // Full impl would parse format string and handle %s, %d, %f
+            // For now: write the format string to stdout
+            
+            if Length(instr.ArgTemps) >= 1 then
+            begin
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx)); // fmt
+              
+              // strlen to get length
+              // xor rcx, rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $31); EmitU8(FCode, $C9);
+              // loop: cmp byte [rdi+rcx], 0
+              EmitU8(FCode, $80); EmitU8(FCode, $3C); EmitU8(FCode, $0F); EmitU8(FCode, $00);
+              // jz done
+              EmitU8(FCode, $74); EmitU8(FCode, $06);
+              // inc rcx
+              EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C1);
+              // jmp loop
+              EmitU8(FCode, $EB); EmitU8(FCode, $F4);
+              
+              // write(1, fmt, rcx)
+              WriteMovRegImm64(FCode, RSI, 1); // stdout
+              WriteMovRegReg(FCode, RDX, RCX); // len
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_WRITE);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              
+              // Return chars printed
+              WriteMovRegReg(FCode, RAX, RCX);
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, 0);
+            end;
+            
+            if instr.Dest >= 0 then
+            begin
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
           end
           else if instr.ImmStr = 'Println' then
           begin
