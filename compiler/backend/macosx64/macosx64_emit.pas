@@ -2799,13 +2799,61 @@ end;
           else if instr.ImmStr = 'GetArg' then
           begin
             // GetArg(n: int64): pchar — return argv[n]
-            // argv[0] = program name, stored at [rsp] on entry
-            // For now: return NULL
+            // Note: Requires access to argc/argv from main function entry
+            // For now: return NULL (not accessible without explicit main integration)
+            // Full impl would need: mov rax, [rbp+24]; add rax, n*8; mov rax, [rax]
             WriteMovRegImm64(FCode, RAX, 0);
             if instr.Dest >= 0 then
             begin
               slotIdx := fn.LocalCount + instr.Dest;
               WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+            end;
+          end
+          else if instr.ImmStr = 'FileGetSize' then
+          begin
+            // FileGetSize(path: pchar): int64 — get file size via stat
+            // macOS stat syscall: SYS_MACOS_STAT = 0x20000E4 (228)
+            if Length(instr.ArgTemps) >= 1 then
+            begin
+              slotIdx := fn.LocalCount + instr.ArgTemps[0];
+              WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx)); // path
+              
+              // Allocate stat buffer on stack (144 bytes for stat64)
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $83); EmitU8(FCode, $EC); EmitU8(FCode, 144); // sub rsp, 144
+              
+              // mov rsi, rsp (stat buffer)
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $8D); EmitU8(FCode, $34); EmitU8(FCode, $24); // lea rsi, [rsp]
+              
+              // syscall stat
+              WriteMovRegImm64(FCode, RAX, UInt64($20000E4)); // SYS_MACOS_STAT
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              
+              // If success (rax=0), st_size is at [rsp+96] (stat64.st_size)
+              // mov rax, [rsp+96]
+              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $44); EmitU8(FCode, $24); EmitU8(FCode, 96);
+              // If error (rax<0), return -1
+              
+              // Restore stack
+              EmitRex(FCode, 1, 0, 0, 0);
+              EmitU8(FCode, $83); EmitU8(FCode, $C4); EmitU8(FCode, 144); // add rsp, 144
+              
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else
+            begin
+              WriteMovRegImm64(FCode, RAX, UInt64(-1));
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
             end;
           end
           else if instr.ImmStr = 'PrintFloat' then
