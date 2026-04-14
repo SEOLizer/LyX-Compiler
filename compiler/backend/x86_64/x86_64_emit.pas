@@ -178,6 +178,8 @@ const
   SYS_LINUX_GETSOCKOPT = 55;  // sys_getsockopt
   SYS_LINUX_FCNTL   = 72;   // sys_fcntl
   SYS_LINUX_SHUTDOWN = 48;  // sys_shutdown
+  SYS_LINUX_SELECT  = 23;  // sys_select
+  SYS_LINUX_POLL    = 7;   // sys_poll
 
 { Hilfsfunktionen für x86_64 Encoding }
 
@@ -722,8 +724,6 @@ var
   offset: Integer;
   negOffset: Integer;
   baseOffset: Integer;
-  mcdcDecisionID, mcdcCondIdx, mcdcCondResult, mcdcDecResult: Integer;
-  mcdcCounterIdx, mcdcCounterOffset: UInt64;
   slotCount: Integer;
   argCount: Integer;
   argTemps: array of Integer;
@@ -2040,41 +2040,68 @@ begin
             end;
 
           irCallBuiltin:
-           begin
-              // Builtin-Calls behandeln
-              if instr.ImmStr = 'exit' then
-              begin
-                // Exit-Syscall: Argument ist in Src1 (temp index)
-                slotIdx := fn.LocalCount + instr.Src1;
-                WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
-                WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
-                WriteSyscall(FCode);
-              end
-              else if instr.ImmStr = '__mcdc_record' then
-              begin
-                // MC/DC Coverage Recording (DO-178C DAL A)
-                // ImmInt encodes: decisionID (bits 0-15), condIdx (bits 16-23), 
-                //                 condResult (bit 24), decisionResult (bit 25)
-                mcdcDecisionID := instr.ImmInt and $FFFF;
-                mcdcCondIdx := (instr.ImmInt shr 16) and $FF;
-                mcdcCondResult := (instr.ImmInt shr 24) and 1;
-                mcdcDecResult := (instr.ImmInt shr 25) and 1;
-                
-                // Counter index in data section:
-                // Per decision: 2 (decision T/F) + 2*condCount (condition T/F)
-                // For 1-condition decisions: 4 counters per decision
-                if mcdcDecResult = 0 then mcdcCounterIdx := mcdcDecisionID * 4 + 1 else mcdcCounterIdx := mcdcDecisionID * 4;
-                mcdcCounterIdx := mcdcCounterIdx + 2 + mcdcCondIdx * 2;
-                if mcdcCondResult = 0 then mcdcCounterIdx := mcdcCounterIdx + 1;
-                mcdcCounterOffset := mcdcCounterIdx * 8;  // 8 bytes per int64 counter
-                
-                // lock inc qword [rip + data_section_offset + counterOffset]
-                EmitU8(FCode, $F0);  // LOCK prefix
-                EmitU8(FCode, $48);  // REX.W
-                EmitU8(FCode, $FF);  // INC r/m64
-                EmitU8(FCode, $05);  // mod=00, reg=000, rm=101 (RIP-relative)
-                FCode.WriteU32LE(mcdcCounterOffset);  // placeholder - will be patched
-              end
+            begin
+               // Builtin-Calls behandeln
+               if instr.ImmStr = 'exit' then
+               begin
+                 // Exit-Syscall: Argument ist in Src1 (temp index)
+                 slotIdx := fn.LocalCount + instr.Src1;
+                 WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+                 WriteSyscall(FCode);
+               end
+               else if instr.ImmStr = 'close' then
+               begin
+                 // close(fd) -> int64
+                 // sys_close(fd)
+                 if Length(instr.ArgTemps) >= 1 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else if instr.Src1 >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Src1;
+                   WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                 end
+                 else
+                   WriteMovRegImm64(FCode, RDI, 0);
+                 
+                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_CLOSE, SYS_MACOS_CLOSE)));
+                 WriteSyscall(FCode);
+                 
+                 if instr.Dest >= 0 then
+                 begin
+                   slotIdx := fn.LocalCount + instr.Dest;
+                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                 end;
+               end
+                else if instr.ImmStr = 'peek8' then
+                begin
+                  // peek8(addr: int64) -> int64 - read one byte from memory
+                  // Get addr into RDI
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+
+                  // xor rax, rax; movzx eax, byte [rdi]
+                  FCode.WriteU8($48);  // REX.W
+                  FCode.WriteU8($31);  // XOR r/m64, r64
+                  FCode.WriteU8($C0);  // ModRM: RAX, RAX
+                  FCode.WriteU8($0F);  // two-byte opcode
+                  FCode.WriteU8($B6);  // MOVZX r32, r/m8
+                  FCode.WriteU8($07);  // ModRM: [RDI], EAX
+
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
               else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
               begin
                 // PrintStr(s: pchar) -> void
@@ -2959,13 +2986,101 @@ begin
                  else
                    WriteMovRegImm64(FCode, RSI, 0);
                    
-                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SHUTDOWN, SYS_MACOS_SHUTDOWN)));
-                 WriteSyscall(FCode);
-                 if instr.Dest >= 0 then
-                 begin
-                   slotIdx := fn.LocalCount + instr.Dest;
-                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
-                 end;
+                  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_SHUTDOWN, SYS_MACOS_SHUTDOWN)));
+                  WriteSyscall(FCode);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
+                else if instr.ImmStr = 'sys_select' then
+                begin
+                  // sys_select(nfds: int64, readfds: Pointer, writefds: Pointer, exceptfds: Pointer, timeout: Pointer) -> int64
+                  // RDI=nfds, RSI=readfds, RDX=writefds, R10=exceptfds, R8=timeout
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                    
+                  if Length(instr.ArgTemps) >= 2 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                    WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RSI, 0);
+                    
+                  if Length(instr.ArgTemps) >= 3 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                    WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDX, 0);
+                    
+                  if Length(instr.ArgTemps) >= 4 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                    WriteMovRegMem(FCode, R10, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, R10, 0);
+                    
+                  if Length(instr.ArgTemps) >= 5 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                    WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, R8, 0);
+                    
+                  WriteMovRegImm64(FCode, RAX, UInt64(SYS_LINUX_SELECT));
+                  WriteSyscall(FCode);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
+                else if instr.ImmStr = 'sys_poll' then
+                begin
+                  // sys_poll(fds: Pointer, nfds: int64, timeout: int64) -> int64
+                  // RDI=fds, RSI=nfds, RDX=timeout
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                    
+                  if Length(instr.ArgTemps) >= 2 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                    WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RSI, 0);
+                    
+                  if Length(instr.ArgTemps) >= 3 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                    WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDX, 0);
+                    
+                  WriteMovRegImm64(FCode, RAX, UInt64(SYS_LINUX_POLL));
+                  WriteSyscall(FCode);
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
                 end
                 else if instr.ImmStr = 'mmap' then
                 begin
