@@ -6442,26 +6442,21 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
   end;
 
 
-{ TODO: Indirect Call Support (irVarCall)
+{ DONE: Indirect Call Support (irVarCall)
   =========================================
   
-  Wenn Lyx Funktionszeiger unterstützt, muss diese Funktion erweitert werden.
+  Indirect calls via function pointers are already supported.
+  Implementation at line ~3257:
+    - TAstCall.IsIndirectCall is checked
+    - Function pointer is loaded via irLoadLocal/irLoadGlobal
+    - Indirect call is emitted via irVarCall
   
-  Beispiel-AST-Knoten (hypothetisch):
-    TAstCall mit CallKind = ckIndirect
-    - Das erste Argument wäre der Funktionszeiger
-    - Die restlichen Argumente sind die Aufrufargumente
-  
-  IR-Generierung für indirekte Aufrufe:
-    instr.Op := irVarCall;
-    instr.Src1 := <temp index holding function pointer>;
-    instr.Dest := <temp index für Rückgabewert>;
-    instr.ArgTemps := [arg0, arg1, ...];
-  
-  Backend-Unterstützung (x86_64_emit.pas):
-    - Lade Funktionsadresse aus Src1 nach RAX
-    - call rax  (indirekter Aufruf)
-    - Rückgabewert in RAX speichern
+  Backend support exists in:
+    - x86_64_emit.pas (line 5857): indirect call via 'call rax'
+    - x86_64_win64.pas (line 2828)
+    - arm64_emit.pas (line 2533)
+    - macosx64_emit.pas (line 1196)
+    - win_arm64_emit.pas (line 1502)
 }
 
 
