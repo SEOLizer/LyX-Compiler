@@ -870,6 +870,8 @@ var
   vals: array of Int64;
   phase: Integer;
   instr: TIRInstr;
+  structIdx: Integer;
+  sd: TAstStructDecl;
 begin
   if not Assigned(um) then Exit;
 
@@ -1172,6 +1174,18 @@ begin
                   FLocalTypeNames[k] := '';
               end;
 
+              // Calculate ReturnStructSize so the backend generates correct sret prologue
+              fn.ReturnStructSize := 0;
+              if TAstFuncDecl(node).ReturnTypeName <> '' then
+              begin
+                structIdx := FStructTypes.IndexOf(TAstFuncDecl(node).ReturnTypeName);
+                if structIdx >= 0 then
+                begin
+                  sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+                  fn.ReturnStructSize := sd.Size;
+                end;
+              end;
+
               // Lower statements
               if Assigned(TAstFuncDecl(node).Body) then
                 for k := 0 to High(TAstFuncDecl(node).Body.Stmts) do
@@ -1426,6 +1440,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     // Generic call monomorphization
     mangledName: string;
     idx: Integer;
+    // Struct field resolution in imported function bodies
+    structIdx: Integer;
+    sd: TAstStructDecl;
+    fi: Integer;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -3877,6 +3895,31 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                   cd := TAstClassDecl(FClassTypes.Objects[idx]);
               end;
             end;
+            // Also try struct types (for struct parameters/locals passed by pointer
+            // in imported function bodies where sema doesn't annotate FieldOffset)
+            if (cd = nil) and (baseExpr is TAstIdent) then
+            begin
+              i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
+              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
+                 (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+              begin
+                structIdx := FStructTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+                if structIdx >= 0 then
+                begin
+                  sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+                  if Length(sd.FieldOffsets) = Length(sd.Fields) then
+                    for fi := 0 to High(sd.Fields) do
+                    begin
+                      if sd.Fields[fi].Name = TAstFieldAccess(expr).Field then
+                      begin
+                        fldOffset := sd.FieldOffsets[fi];
+                        fldType := sd.Fields[fi].FieldType;
+                        Break;
+                      end;
+                    end;
+                end;
+              end;
+            end;
             if (cd = nil) and Assigned(FCurrentClassDecl) then
               cd := FCurrentClassDecl;
             if Assigned(cd) then
@@ -3910,7 +3953,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             end;
             if fldOffset >= 0 then
             begin
-              // Emit heap access for the class field
+              // Emit heap access for the class field (or struct param passed by pointer)
               instr.Op := irLoadFieldHeap;
               instr.Dest := t0;
               instr.Src1 := t1;
@@ -5152,7 +5195,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         
         // Allocate stack slots for the struct
         loc := AllocLocalMany(vd.Name, vd.DeclType, structSlots, True);
-        
+        // Record the struct type name so field assignments can resolve offsets
+        // for imported function bodies where sema hasn't annotated FieldOffset.
+        if loc < Length(FLocalTypeNames) then
+          FLocalTypeNames[loc] := vd.DeclTypeName;
+
         // Initialize with struct literal if present
         if vd.InitExpr is TAstStructLit then
         begin
@@ -5468,6 +5515,35 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         FLocalConst[loc].Free;
         FLocalConst[loc] := nil;
       end;
+      // Special case: assigning a struct-returning function call to a struct local
+      // Must use irCallStruct (sret ABI) instead of irCall (scalar RAX return)
+      if (TAstAssign(stmt).Value is TAstCall) and
+         (loc < Length(FLocalIsStruct)) and FLocalIsStruct[loc] and
+         (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+      begin
+        structIdx := FStructTypes.IndexOf(FLocalTypeNames[loc]);
+        if structIdx >= 0 then
+        begin
+          sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+          call := TAstCall(TAstAssign(stmt).Value);
+          argCount := Length(call.Args);
+          SetLength(argTemps, argCount);
+          for i := 0 to High(call.Args) do
+            argTemps[i] := LowerExpr(call.Args[i]);
+          instr := Default(TIRInstr);
+          instr.Op := irCallStruct;
+          instr.Dest := loc;
+          instr.ImmStr := call.Name;
+          instr.ImmInt := argCount;
+          instr.StructSize := sd.Size;
+          instr.CallMode := cmInternal;
+          SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do
+            instr.ArgTemps[i] := argTemps[i];
+          Emit(instr);
+          Exit(True);
+        end;
+      end;
       tmp := LowerExpr(TAstAssign(stmt).Value);
       // truncate if local has narrower integer width
       ltype := GetLocalType(loc);
@@ -5532,43 +5608,72 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       // named local → FLocalTypeNames lookup.
       if fldOffset < 0 then
       begin
-        cd := nil;
-        if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
+        // First: try struct type lookup via FStructTypes (for imported function bodies
+        // where sema hasn't annotated FieldOffset on the AST node).
+        if (baseExpr is TAstIdent) then
         begin
           i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
           if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
              (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
           begin
-            j := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
-            if j >= 0 then
-              cd := TAstClassDecl(FClassTypes.Objects[j]);
-          end;
-        end;
-        if (cd = nil) and Assigned(FCurrentClassDecl) then
-          cd := FCurrentClassDecl;
-        if Assigned(cd) then
-        begin
-          ownerName := cd.Name;
-        end;
-        while Assigned(cd) do
-        begin
-          for fi := 0 to High(cd.Fields) do
-          begin
-            if cd.Fields[fi].Name = fa.Target.Field then
+            structIdx := FStructTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+            if structIdx >= 0 then
             begin
-              fldOffset := cd.FieldOffsets[fi];
-              fldType := cd.Fields[fi].FieldType;
-              Break;
+              sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+              ownerName := sd.Name;
+              if Length(sd.FieldOffsets) = Length(sd.Fields) then
+                for fi := 0 to High(sd.Fields) do
+                begin
+                  if sd.Fields[fi].Name = fa.Target.Field then
+                  begin
+                    fldOffset := sd.FieldOffsets[fi];
+                    fldType := sd.Fields[fi].FieldType;
+                    Break;
+                  end;
+                end;
             end;
           end;
-          if fldOffset >= 0 then Break;
-          if cd.BaseClassName <> '' then
+        end;
+
+        // Second: try class type lookup (for class method bodies)
+        if fldOffset < 0 then
+        begin
+          cd := nil;
+          if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
           begin
-            i := FClassTypes.IndexOf(cd.BaseClassName);
-            if i >= 0 then cd := TAstClassDecl(FClassTypes.Objects[i])
+            i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
+            if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
+               (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+            begin
+              j := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+              if j >= 0 then
+                cd := TAstClassDecl(FClassTypes.Objects[j]);
+            end;
+          end;
+          if (cd = nil) and Assigned(FCurrentClassDecl) then
+            cd := FCurrentClassDecl;
+          if Assigned(cd) then
+            ownerName := cd.Name;
+          while Assigned(cd) do
+          begin
+            for fi := 0 to High(cd.Fields) do
+            begin
+              if cd.Fields[fi].Name = fa.Target.Field then
+              begin
+                fldOffset := cd.FieldOffsets[fi];
+                fldType := cd.Fields[fi].FieldType;
+                Break;
+              end;
+            end;
+            if fldOffset >= 0 then Break;
+            if cd.BaseClassName <> '' then
+            begin
+              i := FClassTypes.IndexOf(cd.BaseClassName);
+              if i >= 0 then cd := TAstClassDecl(FClassTypes.Objects[i])
+              else cd := nil;
+            end
             else cd := nil;
-          end
-          else cd := nil;
+          end;
         end;
       end;
       if (ownerName <> '') and (FClassTypes.IndexOf(ownerName) >= 0) then
@@ -5969,6 +6074,43 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           instr.StructSize := 16;
           Emit(instr);
           Exit(True);
+        end;
+
+        // Check if returning a struct from a function call (return someFunc(args...))
+        // Without this, the call would be lowered via irCall (scalar return) instead of
+        // irCallStruct (sret ABI), corrupting registers and memory.
+        if (TAstReturn(stmt).Value is TAstCall) and (FCurrentFunc.ReturnStructSize > 16) then
+        begin
+          sd := GetReturnStructDecl;
+          if Assigned(sd) then
+          begin
+            call := TAstCall(TAstReturn(stmt).Value);
+            argCount := Length(call.Args);
+            SetLength(argTemps, argCount);
+            for i := 0 to argCount - 1 do
+              argTemps[i] := LowerExpr(call.Args[i]);
+            structSlots := (sd.Size + 7) div 8;
+            if structSlots < 1 then structSlots := 1;
+            loc := AllocLocalMany('_retcall_' + IntToStr(FLabelCounter), atUnresolved, structSlots, True);
+            Inc(FLabelCounter);
+            instr := Default(TIRInstr);
+            instr.Op := irCallStruct;
+            instr.Dest := loc;
+            instr.ImmStr := call.Name;
+            instr.ImmInt := argCount;
+            instr.StructSize := sd.Size;
+            instr.CallMode := cmInternal;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            Emit(instr);
+            instr := Default(TIRInstr);
+            instr.Op := irReturnStruct;
+            instr.Src1 := loc;
+            instr.StructSize := sd.Size;
+            Emit(instr);
+            Exit(True);
+          end;
         end;
 
         // Check if returning a struct literal (e.g. return Pair { a: x, b: y })
