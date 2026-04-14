@@ -2078,31 +2078,59 @@ begin
                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                  end;
                end
-               else if instr.ImmStr = 'peek8' then
-              begin
-                // MC/DC Coverage Recording (DO-178C DAL A)
-                // ImmInt encodes: decisionID (bits 0-15), condIdx (bits 16-23), 
-                //                 condResult (bit 24), decisionResult (bit 25)
-                mcdcDecisionID := instr.ImmInt and $FFFF;
-                mcdcCondIdx := (instr.ImmInt shr 16) and $FF;
-                mcdcCondResult := (instr.ImmInt shr 24) and 1;
-                mcdcDecResult := (instr.ImmInt shr 25) and 1;
-                
-                // Counter index in data section:
-                // Per decision: 2 (decision T/F) + 2*condCount (condition T/F)
-                // For 1-condition decisions: 4 counters per decision
-                if mcdcDecResult = 0 then mcdcCounterIdx := mcdcDecisionID * 4 + 1 else mcdcCounterIdx := mcdcDecisionID * 4;
-                mcdcCounterIdx := mcdcCounterIdx + 2 + mcdcCondIdx * 2;
-                if mcdcCondResult = 0 then mcdcCounterIdx := mcdcCounterIdx + 1;
-                mcdcCounterOffset := mcdcCounterIdx * 8;  // 8 bytes per int64 counter
-                
-                // lock inc qword [rip + data_section_offset + counterOffset]
-                EmitU8(FCode, $F0);  // LOCK prefix
-                EmitU8(FCode, $48);  // REX.W
-                EmitU8(FCode, $FF);  // INC r/m64
-                EmitU8(FCode, $05);  // mod=00, reg=000, rm=101 (RIP-relative)
-                FCode.WriteU32LE(mcdcCounterOffset);  // placeholder - will be patched
-              end
+                else if instr.ImmStr = 'peek8' then
+                begin
+                  // MC/DC Coverage Recording (DO-178C DAL A)
+                  // ImmInt encodes: decisionID (bits 0-15), condIdx (bits 16-23), 
+                  //                 condResult (bit 24), decisionResult (bit 25)
+                  mcdcDecisionID := instr.ImmInt and $FFFF;
+                  mcdcCondIdx := (instr.ImmInt shr 16) and $FF;
+                  mcdcCondResult := (instr.ImmInt shr 24) and 1;
+                  mcdcDecResult := (instr.ImmInt shr 25) and 1;
+                  
+                  // Counter index in data section:
+                  // Per decision: 2 (decision T/F) + 2*condCount (condition T/F)
+                  // For 1-condition decisions: 4 counters per decision
+                  if mcdcDecResult = 0 then mcdcCounterIdx := mcdcDecisionID * 4 + 1 else mcdcCounterIdx := mcdcDecisionID * 4;
+                  mcdcCounterIdx := mcdcCounterIdx + 2 + mcdcCondIdx * 2;
+                  if mcdcCondResult = 0 then mcdcCounterIdx := mcdcCounterIdx + 1;
+                  mcdcCounterOffset := mcdcCounterIdx * 8;  // 8 bytes per int64 counter
+                  
+                  // lock inc qword [rip + data_section_offset + counterOffset]
+                  EmitU8(FCode, $F0);  // LOCK prefix
+                  EmitU8(FCode, $48);  // REX.W
+                  EmitU8(FCode, $FF);  // INC r/m64
+                  EmitU8(FCode, $05);  // mod=00, reg=000, rm=101 (RIP-relative)
+                  FCode.WriteU32LE(mcdcCounterOffset);  // placeholder - will be patched
+                  
+                  // peek8(addr) -> int64 - read byte from memory
+                  // xor rax, rax; mov al, [addr]
+                  
+                  // Get addr into RDI
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                  
+                  // xor rax, rax - clear RAX
+                  FCode.WriteU8($48);  // REX.W
+                  FCode.WriteU8($31);  // XOR r/m64, r64
+                  FCode.WriteU8($C0);  // ModRM: RAX, RAX
+                  
+                  // movzx eax, byte [rdi] - read byte and zero-extend
+                  FCode.WriteU8($0F);  // two-byte opcode
+                  FCode.WriteU8($B6);  // MOVZX r32, r/m8
+                  FCode.WriteU8($07);  // ModRM: [RDI], EAX
+                  
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
               else if (instr.ImmStr = 'PrintStr') or (instr.ImmStr = 'Println') then
               begin
                 // PrintStr(s: pchar) -> void
