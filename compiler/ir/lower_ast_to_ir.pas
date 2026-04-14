@@ -3784,9 +3784,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           instr.ImmInt := 8;  // Truncate to 8 bits
           Emit(instr);
-          // TODO: Sign extension after truncation
+          // Sign-extend from 8 bits to 64 bits (t0 = sign-extended result)
+          instr.Op := irSExt;
+          instr.Dest := t0;  // Reuse t0 for sign-extended result
+          instr.Src1 := t0;  // Sign-extend the truncated value
+          instr.ImmInt := 64;  // Extend to full 64-bit
+          Emit(instr);
         end
-        // Check for int64 -> int16 (truncate to 16 bits)
+        // Check for int64 -> int16 (truncate to 16 bits with sign extension)
         else if (ltype = atInt64) and (rType = atInt16) then
         begin
           instr.Op := irTrunc;
@@ -3794,14 +3799,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := t1;
           instr.ImmInt := 16;  // Truncate to 16 bits
           Emit(instr);
+          // Sign-extend from 16 bits to 64 bits
+          instr.Op := irSExt;
+          instr.Dest := t0;
+          instr.Src1 := t0;
+          instr.ImmInt := 64;
+          Emit(instr);
         end
-        // Check for int64 -> int32 (truncate to 32 bits)
+        // Check for int64 -> int32 (truncate to 32 bits with sign extension)
         else if (ltype = atInt64) and (rType = atInt32) then
         begin
           instr.Op := irTrunc;
           instr.Dest := t0;
           instr.Src1 := t1;
           instr.ImmInt := 32;  // Truncate to 32 bits
+          Emit(instr);
+          // Sign-extend from 32 bits to 64 bits
+          instr.Op := irSExt;
+          instr.Dest := t0;
+          instr.Src1 := t0;
+          instr.ImmInt := 64;
           Emit(instr);
         end
         // Check for unsigned -> int64 (no conversion needed, just zero-extend conceptually)
