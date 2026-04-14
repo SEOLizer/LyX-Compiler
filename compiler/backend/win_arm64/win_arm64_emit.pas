@@ -3398,7 +3398,8 @@ begin
 
         irMapRemove, irSetRemove, irMapFree, irSetFree:
           begin
-            // TODO: implement
+            // Stub: Map/Set operations not fully implemented on Windows ARM64
+            // For now, skip to prevent crashes; full impl needs Windows API calls
           end;
         
         else
