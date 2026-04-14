@@ -1111,7 +1111,7 @@ begin
        shdr.sh_addr := baseVA + dynSymOff;
        shdr.sh_offset := dynSymOff;
        shdr.sh_size := dynSymTable.Size;
-       shdr.sh_link := 2; // sh_link to .dynstr (index 2 for us, assuming .dynsym is index 1)
+        shdr.sh_link := 6; // sh_link to .dynstr (section index 6)
        shdr.sh_info := 1; // Index of first non-local symbol
        shdr.sh_addralign := 8;
        shdr.sh_entsize := SizeOf(TElf64Sym);
