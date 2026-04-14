@@ -26,6 +26,8 @@ type
     IsVarArgs: Boolean; // true for variadic functions like printf
     IsExtern: Boolean;  // true for extern fn declarations (libc etc.)
     IsImported: Boolean; // true for functions imported from another unit
+    // for function pointers
+    FnPtrReturnType: TAurumType; // return type for function pointer variables
     // for global variables
     IsGlobal: Boolean; // true if this is a global variable
     // Generic function type parameters, e.g., ['T'] for fn max[T](...)
@@ -3244,9 +3246,13 @@ begin
             // This is a function pointer call - mark as indirect
             call.IsIndirectCall := True;
             
-            // For now, function pointer calls return int64 as placeholder
-            // TODO: Extract actual return type from function pointer type
-            Result := atInt64;
+            // Extract return type from function pointer symbol
+            // Note: FnPtrReturnType field is available, but full type inference
+            // requires additional integration with parser/IR. For now, fallback to int64.
+            if Assigned(s.FnPtrReturnType) then
+              Result := s.FnPtrReturnType
+            else
+              Result := atInt64;
             
             // We still need to check arguments - use param info from the function pointer type
             // For now, just check that args are valid expressions
