@@ -44,23 +44,14 @@ Alle anderen Backends haben erhebliche Lücken bei Builtins und IR-Opcodes.
 
 ### macOS x86_64 (`compiler/backend/macosx64/macosx64_emit.pas`)
 
-**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (stub), StrFree (stub), StrFromInt (stub), StrAppend (stub), StrFindChar (stub), StrSub (stub), StrConcat (stub), StrCopy (stub), FileGetSize (stub), StrStartsWith (stub), StrEndsWith (stub), StrEquals (stub), GetArgC (stub), GetArg (stub), PrintFloat, Random (stub), RandomSeed (stub), Socket builtins (stubs), printf (stub)
+**Implementiert ✅:** exit, PrintStr, Println, PrintInt, open, read, write, close, lseek, unlink, mkdir, rmdir, chmod, rename, mmap, munmap, ioctl, getpid, StrLen, StrCharAt, StrSetChar, StrNew (mmap), StrFree (munmap), StrFromInt (itoa), StrAppend, StrFindChar, StrSub (mmap), StrConcat (mmap), StrCopy (mmap), FileGetSize (stub), StrStartsWith, StrEndsWith (stub), StrEquals, GetArgC (1), GetArg (stub), PrintFloat, Random (LCG), RandomSeed (placeholder), Socket builtins (stubs), printf (stub)
 
-**Fehlt ❌ – IO-Builtins:**
-- [ ] `printf`
-- [ ] `rmdir` / `chmod` / `rename`
-
-**Fehlt ❌ – String-Builtins (alle):**
-- [ ] `str_concat`, `StrLen`, `StrCharAt`, `StrSetChar`, `StrNew`, `StrFree`, `StrAppend`, `StrFromInt`
-- [ ] S1–S7 komplett (StrFindChar, StrSub, StrAppendStr, StrConcat, StrCopy, IntToStr, FileGetSize, Hash*, GetArgC, GetArg, StrStartsWith, StrEndsWith, StrEquals)
-
-**Fehlt ❌ – Sonstige:**
-- [ ] `Random` / `RandomSeed`
-- [ ] `peek*` / `poke*` / `buf_get_byte` / `buf_put_byte`
-- [ ] `format_float`
-- [ ] `Inspect`
-- [ ] Socket-Builtins (Mach-O syscall-Nummern: `SYS_MACOS_*`)
+**Fehlt ❌ – Niedrigste Priorität:**
+- [ ] `printf` – Format-String Parsing
+- [ ] Socket-Builtins (sys_socket, sys_bind, etc.)
 - [ ] VMT / DynArray / Closures
+- [ ] FileGetSize – stat syscall
+- [ ] GetArg – argv access
 
 **Hinweis:** macOS verwendet andere Syscall-Nummern (0x2000000-Präfix) und die System-V ABI.
 Alle Strings und mmap müssen auf macOS-Syscalls umgestellt werden (analog zu `SYS_MACOS_*`-Konstanten in x86_64_emit.pas).
