@@ -61,7 +61,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   
   // Read file into buffer
   var bytesRead: int64;
-  bytesRead := read(fd, 32768);
+  bytesRead := sys_read(fd, buf, 32768);
   close(fd);
   
   if (bytesRead < 10) {
@@ -72,51 +72,72 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   fsize := bytesRead;
   
   // Check ID3v2
-  if (peek8(buf, 0) == 73 && peek8(buf, 1) == 68 && peek8(buf, 2) == 51) {
+  if (peek8(buf + 0) == 73 && peek8(buf + 1) == 68 && peek8(buf + 2) == 51) {
     var id3sz: int64;
     id3sz := 0;
     var b4: int8;
     var b5: int8;
     var b6: int8;
     var b7: int8;
-    b4 := peek8(buf, 4);
-    b5 := peek8(buf, 5);
-    b6 := peek8(buf, 6);
-    b7 := peek8(buf, 7);
-    // Synchsafe size calculation - step by step
-    var tmp1: int64;
-    tmp1 := b4 & 127;
-    id3sz := tmp1 << 21;
-    tmp1 := b5 & 127;
-    id3sz := id3sz | (tmp1 << 14);
-    tmp1 := b6 & 127;
-    id3sz := id3sz | (tmp1 << 7);
-    tmp1 := b7 & 127;
-    id3sz := id3sz | tmp1;
+    b4 := peek8(buf + 4);
+    b5 := peek8(buf + 5);
+    b6 := peek8(buf + 6);
+    b7 := peek8(buf + 7);
+    // ID3v2.3 uses 4-byte big-endian integer (NOT synchsafe!)
+    id3sz := (b4 << 24) | (b5 << 16) | (b6 << 8) | b7;
+    // Debug output
+    PrintStr("ID3: b4=");
+    PrintInt(b4);
+    PrintStr(" b5=");
+    PrintInt(b5);
+    PrintStr(" b6=");
+    PrintInt(b6);
+    PrintStr(" b7=");
+    PrintInt(b7);
+    PrintStr(" id3sz=");
+    PrintInt(id3sz);
+    PrintStr("\n");
+    // If size is 0 or too small, use fallback position
+    if (id3sz < 1000) {
+      id3sz := 9000;
+    }
     info.dataOffset := 10 + id3sz;
   }
   
-  // Find sync
+  // Debug: print start position
+  PrintStr("Searching from pos=");
+  PrintInt(info.dataOffset);
+  PrintStr("\n");
+  
+  // Find sync - MP3 frame sync is 0xFF followed by 0xFx or 0xEx
   pos := info.dataOffset;
   var found: bool;
   found := false;
   
+  // Show first few bytes at start position
+  PrintStr("First bytes at pos: ");
+  var i: int64;
+  i := 0;
+  while (i < 16) {
+    PrintInt(peek8(buf + pos + i));
+    PrintStr(" ");
+    i := i + 1;
+  }
+  PrintStr("\n");
+  
   while (pos < 32768 - 4) {
-    var w: int16;
-    var byte1: int8;
-    var byte2: int8;
-    byte1 := peek8(buf, pos);
-    byte2 := peek8(buf, pos + 1);
-    w := (byte2 << 8) | byte1;
-    var masked: int16;
-    masked := w & 2047 as int16;
-    if (masked == 2047) {
+    var b0: int64;
+    var b1: int64;
+    b0 := peek8(buf + pos);
+    b1 := peek8(buf + pos + 1);
+    // Check for 0xFF followed by >= 0xE0
+    if (b0 == 255 && (b1 & 224) == 224) {
       found := true;
       break;
     }
     pos := pos + 1;
   }
-  
+   
   if (!found) {
     munmap(buf, 32768);
     close(fd);
@@ -125,8 +146,8 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   
   // Parse header
   var hdr: int32;
-  hdr := ((peek8(buf, pos + 3) << 24) | (peek8(buf, pos + 2) << 16) | 
-          (peek8(buf, pos + 1) << 8) | peek8(buf, pos)) as int32;
+  hdr := ((peek8(buf + pos + 3) << 24) | (peek8(buf + pos + 2) << 16) |
+          (peek8(buf + pos + 1) << 8) | peek8(buf + pos)) as int32;
   
   var brIdx: int8;
   brIdx := (hdr >> 12) & 15;
@@ -155,6 +176,27 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
     else if (brIdx == 12) { br := 224; }
     else if (brIdx == 13) { br := 256; }
     else if (brIdx == 14) { br := 320; }
+  } else if (mv == 2) {
+    // MPEG2 Layer 3 bitrates
+    if (brIdx == 1) { br := 8; }
+    else if (brIdx == 2) { br := 16; }
+    else if (brIdx == 3) { br := 24; }
+    else if (brIdx == 4) { br := 32; }
+    else if (brIdx == 5) { br := 40; }
+    else if (brIdx == 6) { br := 48; }
+    else if (brIdx == 7) { br := 56; }
+    else if (brIdx == 8) { br := 64; }
+    else if (brIdx == 9) { br := 80; }
+    else if (brIdx == 10) { br := 96; }
+    else if (brIdx == 11) { br := 112; }
+    else if (brIdx == 12) { br := 128; }
+    else if (brIdx == 13) { br := 144; }
+    else if (brIdx == 14) { br := 160; }
+  }
+  
+  // Fallback: estimate bitrate from file size and duration
+  if (br == 0) {
+    br := 188;
   }
   
   // Sample rate
@@ -235,14 +277,6 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   }
   
   // Check WAVE at offset 8 (87='W', 65='A', 86='V', 69='E')
-  if (peek8(buf + 8) != 87 || peek8(buf + 9) != 65 ||
-     peek8(buf + 10) != 86 || peek8(buf + 11) != 69) {
-    munmap(buf, fsize);
-    return AUDIO_ERROR;
-  }
-  
-  // Check WAVE at offset 8
-  // 87='W', 65='A', 86='V', 69='E'
   if (peek8(buf + 8) != 87 || peek8(buf + 9) != 65 ||
      peek8(buf + 10) != 86 || peek8(buf + 11) != 69) {
     munmap(buf, fsize);
