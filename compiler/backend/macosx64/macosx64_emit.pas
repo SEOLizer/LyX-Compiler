@@ -2542,14 +2542,6 @@ end
               end;
             end;
           end
-            else
-              WriteMovRegImm64(FCode, RAX, 0);
-            if instr.Dest >= 0 then
-            begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
           else if instr.ImmStr = 'StrCopy' then
           begin
             // StrCopy(s): create a copy of string
