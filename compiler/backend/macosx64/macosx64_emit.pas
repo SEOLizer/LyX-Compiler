@@ -129,6 +129,21 @@ begin
   b.WriteU32LE(v);
 end;
 
+procedure EmitU16(b: TByteBuffer; v: Word);
+begin
+  b.WriteU16LE(v);
+end;
+
+procedure EmitS32(b: TByteBuffer; v: Int32);
+begin
+  b.WriteU32LE(Cardinal(v));
+end;
+
+procedure EmitS64(b: TByteBuffer; v: Int64);
+begin
+  b.WriteU64LE(UInt64(v));
+end;
+
 procedure EmitU64(b: TByteBuffer; v: UInt64);
 begin
   b.WriteU64LE(v);
@@ -2245,7 +2260,7 @@ else if instr.ImmStr = 'StrAppend' then
               slotIdx := fn.LocalCount + instr.ArgTemps[0];
               WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx)); // s
               slotIdx := fn.LocalCount + instr.ArgTemps[1];
-              WriteMovRegReg(RAX, RDI); // copy s to rax
+              WriteMovRegReg(FCode, RAX, RDI); // copy s to rax
               slotIdx := fn.LocalCount + instr.ArgTemps[2];
               WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx)); // c
               // rdx = char to find
@@ -2699,7 +2714,8 @@ end
               begin
                 slotIdx := fn.LocalCount + instr.Dest;
                 WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-end;
+              end;
+            end;
           end
           else if instr.ImmStr = 'GetArgC' then
           begin
