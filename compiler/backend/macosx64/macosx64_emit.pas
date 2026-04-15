@@ -117,6 +117,18 @@ const
   SYS_MACOS_GETPID = $2000014;  // sys_getpid (20)
   SYS_MACOS_IOCTL  = $2000036;  // sys_ioctl (54)
 
+  // Networking syscalls (BSD layer)
+  SYS_MACOS_SOCKET    = $2000061;  // sys_socket (97)
+  SYS_MACOS_BIND    = $2000062;  // sys_bind (98)
+  SYS_MACOS_LISTEN   = $2000063;  // sys_listen (99)
+  SYS_MACOS_ACCEPT  = $2000064;  // sys_accept (100)
+  SYS_MACOS_CONNECT = $2000065;  // sys_connect (101)
+  SYS_MACOS_RECVFROM = $2000066; // sys_recvfrom (102)
+  SYS_MACOS_SENDTO  = $2000067;  // sys_sendto (103)
+  SYS_MACOS_SETSOCKOPT = $2000068; // sys_setsockopt (104)
+  SYS_MACOS_GETSOCKOPT = $2000069; // sys_getsockopt (105)
+  SYS_MACOS_SHUTDOWN = $200006A; // sys_shutdown (106)
+
 { ---- Free functions (standalone helpers, take TByteBuffer as parameter) ---- }
 
 procedure EmitU8(b: TByteBuffer; v: Byte);
