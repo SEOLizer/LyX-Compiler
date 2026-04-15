@@ -2858,106 +2858,300 @@ end
             // In a full impl, store seed in global variable
             // For now: do nothing (placeholder)
           end
-          else if instr.ImmStr = 'sys_socket' then
-          begin
-            // sys_socket: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+else if instr.ImmStr = 'sys_socket' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_bind' then
-          begin
-            // sys_bind: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_socket(domain, type, protocol) -> fd
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_SOCKET);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+else if instr.ImmStr = 'sys_bind' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_listen' then
-          begin
-            // sys_listen: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_bind(fd, addr, addrlen) -> result
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_BIND);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+else if instr.ImmStr = 'sys_listen' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_accept' then
-          begin
-            // sys_accept: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_listen(fd, backlog) -> result
+              if Length(instr.ArgTemps) >= 2 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_LISTEN);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_accept' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_connect' then
-          begin
-            // sys_connect: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_accept(fd, addr, addrlen) -> clientfd
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_ACCEPT);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_connect' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_recvfrom' then
-          begin
-            // sys_recvfrom: stub - return 0
-            WriteMovRegImm64(FCode, RAX, 0);
-            if instr.Dest >= 0 then
+              // sys_connect(fd, addr, addrlen) -> result
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_CONNECT);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_recvfrom' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_sendto' then
-          begin
-            // sys_sendto: stub - return 0
-            WriteMovRegImm64(FCode, RAX, 0);
-            if instr.Dest >= 0 then
+              // sys_recvfrom(fd, buf, len, flags, addr, addrlen) -> bytes
+              if Length(instr.ArgTemps) >= 6 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                WriteMovRegMem(RCX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                WriteMovRegMem(R8, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[5];
+                WriteMovRegMem(R9, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, RCX, 0);
+                WriteMovRegImm64(FCode, R8, 0);
+                WriteMovRegImm64(FCode, R9, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_RECVFROM);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_sendto' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_setsockopt' then
-          begin
-            // sys_setsockopt: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_sendto(fd, buf, len, flags, addr, addrlen) -> bytes
+              if Length(instr.ArgTemps) >= 6 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                WriteMovRegMem(RCX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                WriteMovRegMem(R8, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[5];
+                WriteMovRegMem(R9, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, RCX, 0);
+                WriteMovRegImm64(FCode, R8, 0);
+                WriteMovRegImm64(FCode, R9, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_SENDTO);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_setsockopt' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_getsockopt' then
-          begin
-            // sys_getsockopt: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_setsockopt(fd, level, optname, optval, optlen) -> result
+              if Length(instr.ArgTemps) >= 5 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                WriteMovRegMem(RCX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                WriteMovRegMem(R8, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, RCX, 0);
+                WriteMovRegImm64(FCode, R8, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_SETSOCKOPT);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_getsockopt' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
-          else if instr.ImmStr = 'sys_shutdown' then
-          begin
-            // sys_shutdown: stub - return -1
-            WriteMovRegImm64(FCode, RAX, UInt64(-1));
-            if instr.Dest >= 0 then
+              // sys_getsockopt(fd, level, optname, optval, optlen) -> result
+              if Length(instr.ArgTemps) >= 5 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                WriteMovRegMem(RDX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[3];
+                WriteMovRegMem(RCX, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[4];
+                WriteMovRegMem(R8, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+                WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, RCX, 0);
+                WriteMovRegImm64(FCode, R8, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_GETSOCKOPT);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
+            else if instr.ImmStr = 'sys_shutdown' then
             begin
-              slotIdx := fn.LocalCount + instr.Dest;
-              WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
-            end;
-          end
+              // sys_shutdown(fd, how) -> result
+              if Length(instr.ArgTemps) >= 2 then
+              begin
+                slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                WriteMovRegMem(RDI, RBP, SlotOffset(slotIdx));
+                slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                WriteMovRegMem(RSI, RBP, SlotOffset(slotIdx));
+              end
+              else
+              begin
+                WriteMovRegImm64(FCode, RDI, 0);
+                WriteMovRegImm64(FCode, RSI, 0);
+              end;
+              WriteMovRegImm64(FCode, RAX, SYS_MACOS_SHUTDOWN);
+              WriteSyscall(FCode);
+              TrackEnergy(eokSyscall);
+              if instr.Dest >= 0 then
+              begin
+                slotIdx := fn.LocalCount + instr.Dest;
+                WriteMovMemReg(RBP, SlotOffset(slotIdx), RAX);
+              end;
+            end
           else if instr.ImmStr = 'printf' then
           begin
             // printf(fmt: pchar, ...): int64
