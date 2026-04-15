@@ -4910,7 +4910,8 @@ begin
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
-        if not fn.IsPublic then
+        // Import public functions AND extern functions (extern fn need to be accessible)
+        if not fn.IsPublic and not fn.IsExtern then
           Continue;
 
         // Prüfe auf Konflikte (silently skip duplicate imports for bootstrap compat)
@@ -4922,6 +4923,7 @@ begin
         sym.DeclType := fn.ReturnType;
         sym.ReturnTypeName := fn.ReturnTypeName;
         sym.IsImported := True;
+        sym.IsExtern := fn.IsExtern;  // Must propagate IsExtern for IR lowering
         sym.ParamCount := Length(fn.Params);
         SetLength(sym.ParamTypes, sym.ParamCount);
         for j := 0 to sym.ParamCount - 1 do
