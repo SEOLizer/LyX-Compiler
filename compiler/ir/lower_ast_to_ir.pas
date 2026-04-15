@@ -529,14 +529,24 @@ begin
            fn.ReturnStructSize := sd.Size;
          end;
        end;
-       SetLength(FLocalTypes, fn.LocalCount);
-       SetLength(FLocalConst, fn.LocalCount);
-       for j := 0 to fn.ParamCount - 1 do
-       begin
-         FLocalMap.AddObject(TAstFuncDecl(node).Params[j].Name, IntToObj(j));
-         FLocalTypes[j] := TAstFuncDecl(node).Params[j].ParamType;
-         FLocalConst[j] := nil;
-       end;
+        SetLength(FLocalTypes, fn.LocalCount);
+        SetLength(FLocalConst, fn.LocalCount);
+        SetLength(FLocalIsStruct, fn.LocalCount);
+        SetLength(FLocalElemSize, fn.LocalCount);
+        SetLength(FLocalTypeNames, fn.LocalCount);
+        for j := 0 to fn.ParamCount - 1 do
+        begin
+          FLocalMap.AddObject(TAstFuncDecl(node).Params[j].Name, IntToObj(j));
+          FLocalTypes[j] := TAstFuncDecl(node).Params[j].ParamType;
+          FLocalConst[j] := nil;
+          FLocalIsStruct[j] := False;
+          FLocalElemSize[j] := 0;
+          // Record type name for struct parameter field resolution
+          if TAstFuncDecl(node).Params[j].TypeName <> '' then
+            FLocalTypeNames[j] := TAstFuncDecl(node).Params[j].TypeName
+          else
+            FLocalTypeNames[j] := '';
+        end;
 
        // lower statements sequentially
        for j := 0 to High(TAstFuncDecl(node).Body.Stmts) do
@@ -5596,7 +5606,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     end;
 
     // field assignment: obj.field := value
-      if stmt is TAstFieldAssign then
+    if stmt is TAstFieldAssign then
     begin
       fa := TAstFieldAssign(stmt);
       // target is a TAstFieldAccess node
