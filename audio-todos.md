@@ -131,8 +131,8 @@ fn AudioStop(): AudioError;
 | WP | Status |
 |----|-------|
 | WP1 | ✅ Abgeschlossen (std/audio.lyx) |
-| WP2 | ⏳ Offen |
-| WP3 | ⏳ Offen |
+| WP2 | ✅ Abgeschlossen (WAV Parser) |
+| WP3 | ✅ Abgeschlossen (WAV Decoder) |
 | WP4 | ⏳ Offen |
 | WP5 | ⏳ Offen |
 | WP6 | ⏳ Offen |
