@@ -53,7 +53,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   }
   
   // Allocate buffer
-  buf := mmap(0, 32768, PROT_RW, MAP_ANON, FD_NONE, 0);
+  buf := mmap(0, 32768, 3, 34, -1, 0);
   if (buf == 0) {
     close(fd);
     return AUDIO_ERROR;
@@ -192,94 +192,97 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   var fd: int64;
   var fsize: int64;
   var buf: int64;
+  var bytesRead: int64;
   var dpos: int64;
   var dsz: int64;
   var pos: int64;
-  
+
   fd := open(path, O_RDONLY, 0);
   if (fd < 0) {
     return AUDIO_ERROR;
   }
   
-  fsize := lseek(fd, 0, SEEK_END);
-  lseek(fd, 0, SEEK_SET);
+  // Get file size
+  fsize := lseek(fd, 0, 2);
+  lseek(fd, 0, 0);
   
   if (fsize < 44) {
     close(fd);
     return AUDIO_ERROR;
   }
   
-  // Read header
-  var bytesRead: int64;
-  bytesRead := read(fd, 44);
-  close(fd);
-  
-  if (bytesRead < 44) {
-    munmap(buf, 44);
-    return AUDIO_ERROR;
-  }
-  
-  buf := mmap(0, 44, PROT_RW, MAP_ANON, FD_NONE, 0);
+  // Allocate buffer
+  buf := mmap(0, fsize, 3, 34, -1, 0);
   if (buf == 0) {
     close(fd);
     return AUDIO_ERROR;
   }
   
-  var bytesRead: int64;
-  bytesRead := read(fd, 44);
+  // Read directly
+  bytesRead := sys_read(fd, buf, fsize);
   close(fd);
   
   if (bytesRead < 44) {
-    munmap(buf, 44);
+    munmap(buf, fsize);
     return AUDIO_ERROR;
   }
   
-  // RIFF+WAVE check
-  if (peek8(buf, 0) != 82 || peek8(buf, 8) != 87 ||
-      peek8(buf, 1) != 73 || peek8(buf, 9) != 65 ||
-      peek8(buf, 2) != 70 || peek8(buf, 10) != 86 ||
-      peek8(buf, 3) != 70 || peek8(buf, 11) != 69) {
-    munmap(buf, 44);
-    close(fd);
+// Check RIFF at offset 0 (82='R', 73='I', 70='F', 70='F')
+  if (peek8(buf + 0) != 82 || peek8(buf + 1) != 73 ||
+     peek8(buf + 2) != 70 || peek8(buf + 3) != 70) {
+    munmap(buf, fsize);
     return AUDIO_ERROR;
   }
   
-  // Format
+  // Check WAVE at offset 8 (87='W', 65='A', 86='V', 69='E')
+  if (peek8(buf + 8) != 87 || peek8(buf + 9) != 65 ||
+     peek8(buf + 10) != 86 || peek8(buf + 11) != 69) {
+    munmap(buf, fsize);
+    return AUDIO_ERROR;
+  }
+  
+  // Check WAVE at offset 8
+  // 87='W', 65='A', 86='V', 69='E'
+  if (peek8(buf + 8) != 87 || peek8(buf + 9) != 65 ||
+     peek8(buf + 10) != 86 || peek8(buf + 11) != 69) {
+    munmap(buf, fsize);
+    return AUDIO_ERROR;
+  }
+  
+  // Format at offset 20
   var fmt: int16;
-  fmt := (peek8(buf, 21) << 8) | peek8(buf, 20) as int16;
+  fmt := (peek8(buf + 21) << 8) | peek8(buf + 20) as int16;
   if (fmt != 1) {
-    munmap(buf, 44);
-    close(fd);
+    munmap(buf, fsize);
     return AUDIO_NOT_SUPPORTED;
   }
   
-  info.channels := ((peek8(buf, 23) << 8) | peek8(buf, 22)) as int64;
-  info.sampleRate := ((peek8(buf, 27) << 24) | (peek8(buf, 26) << 16) | 
-                   (peek8(buf, 25) << 8) | peek8(buf, 24)) as int64;
-  info.bitsPerSample := ((peek8(buf, 35) << 8) | peek8(buf, 34)) as int64;
+  info.channels := ((peek8(buf + 23) << 8) | peek8(buf + 22)) as int64;
+  info.sampleRate := ((peek8(buf + 27) << 24) | (peek8(buf + 26) << 16) | 
+                    (peek8(buf + 25) << 8) | peek8(buf + 24)) as int64;
+  info.bitsPerSample := ((peek8(buf + 35) << 8) | peek8(buf + 34)) as int64;
   
   if (info.bitsPerSample == 8) { info.format := AF_PCM8; }
   else if (info.bitsPerSample == 16) { info.format := AF_PCM16; }
   else { info.format := 0; }
   
-  // Find data chunk
+  // Find data chunk at offset 36+
   dpos := 0;
   dsz := 0;
   pos := 36;
   while (pos < fsize - 8) {
-    if (peek8(buf, pos) == 100 && peek8(buf, pos + 1) == 97 && 
-        peek8(buf, pos + 2) == 116 && peek8(buf, pos + 3) == 97) {
+    if (peek8(buf + pos) == 100 && peek8(buf + pos + 1) == 97 && 
+        peek8(buf + pos + 2) == 116 && peek8(buf + pos + 3) == 97) {
       dpos := pos + 8;
-      dsz := ((peek8(buf, pos + 7) << 24) | (peek8(buf, pos + 6) << 16) | 
-             (peek8(buf, pos + 5) << 8) | peek8(buf, pos + 4)) as int64;
+      dsz := ((peek8(buf + pos + 7) << 24) | (peek8(buf + pos + 6) << 16) | 
+             (peek8(buf + pos + 5) << 8) | peek8(buf + pos + 4)) as int64;
       break;
     }
     pos := pos + 1;
   }
   
   if (dpos == 0 || dsz == 0) {
-    munmap(buf, 44);
-    close(fd);
+    munmap(buf, fsize);
     return AUDIO_ERROR;
   }
   
@@ -290,10 +293,29 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   bps := info.sampleRate * info.channels * (info.bitsPerSample / 8);
   if (bps > 0) { info.durationMs := (dsz * 1000) / bps; }
   
-  munmap(buf, 44);
-  close(fd);
+  munmap(buf, fsize);
   return AUDIO_OK;
 }
+
+// Seek constants
+pub con SEEK_SET: int64 := 0;
+pub con SEEK_CUR: int64 := 1;
+pub con SEEK_END: int64 := 2;
+
+// mmap constants
+pub con PROT_READ: int64 := 1;
+pub con PROT_WRITE: int64 := 2;
+pub con PROT_RW: int64 := 3;
+pub con MAP_ANON: int64 := 32;
+pub con MAP_PRIVATE: int64 := 2;
+
+// file constants  
+pub con O_RDONLY: int64 := 0;
+pub con O_WRONLY: int64 := 1;
+pub con O_RDWR: int64 := 2;
+pub con O_CREAT: int64 := 64;
+pub con O_TRUNC: int64 := 512;
+pub con FD_NONE: int64 := -1;
 
 // Error string
 pub fn AudioErrorString(code: int64): pchar {
