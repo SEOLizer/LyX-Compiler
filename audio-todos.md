@@ -49,7 +49,7 @@ Das Ziel ist eine **Audio Unit für Lyx**, die Audio-Dateien abspielen kann (WAV
 | Aufgabe | Beschreibung |
 |---------|--------------|
 | **libmpg123 FFI** | Binding zu libmpg123 (FFI-Wrapper) |
-| **ODecode** | mpg123_decode → PCM-Daten |
+| **Decode** | mpg123_decode → PCM-Daten |
 | **Fallback** | Stub wenn keine externe Library verfügbar |
 | **Hinweis** | MP3-Dekodierung in reinem Lyx ist sehr komplex → FFI bevorzugt |
 
@@ -133,8 +133,8 @@ fn AudioStop(): AudioError;
 | WP1 | ✅ Abgeschlossen (std/audio.lyx) |
 | WP2 | ✅ Abgeschlossen (WAV Parser) |
 | WP3 | ✅ Abgeschlossen (WAV Decoder) |
-| WP4 | ⏳ Offen |
-| WP5 | ⏳ Offen |
+| WP4 | ✅ Abgeschlossen (MP3 Parser) |
+| WP5 | ⚠️ FFI Binding OK, Decoder Problem |
 | WP6 | ⏳ Offen |
 | WP7 | ⏳ Offen |
 | WP8 | ⏳ Offen |
