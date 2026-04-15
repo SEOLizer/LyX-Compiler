@@ -131,6 +131,28 @@ _(keine offenen Aufgaben)_
 |-----------|------|--------------|
 | Mittel | **Windows VMT Tests** | Virtual Calls auf echter Windows-Hardware testen |
 
+### Audio Unit
+
+| Priorität | Task | Beschreibung |
+|----------|------|--------------|
+| Mittel | **WAV Support** | Einfachstes Audio-Format dekodieren (PCM, 8/16-bit, mono/stereo) |
+| Mittel | **MP3 Support** | ID3-Metadaten und MPEG Audio Layer 3 Dekodierung |
+| Niedrig | **Audio Playback** | ALSA/PipeWire Syscalls für Sound-Ausgabe |
+| Niedrig | **Audio Unit Tests** | Test-Programme für alle Formate |
+
+#### Roadmap: Audio Unit – Teilaufgaben
+
+| # | Aufgabe | Beschreibung |
+|---|---------|--------------|
+| 1 | **API Design** | audio.lyx Schnittstelle definieren (AudioOpen, AudioPlay, AudioClose) |
+| 2 | **WAV Parser** | RIFF-WAVE Format parsen (fmt chunk, data chunk) |
+| 3 | **WAV Decoder** | PCM-Dekodierung (8-bit unsigned, 16-bit signed, mono/stereo) |
+| 4 | **MP3 Parser** | ID3v2 Tag-Parsing, Frame-Header Dekodierung |
+| 5 | **MP3 Decoder Stub** | Minimaler MP3-Frame-Extraktor (oder FFI zu libmpg123) |
+| 6 | **ALSA Syscalls** | snd_pcm_open, snd_pcm_write, snd_pcm_close via FFI |
+| 7 | **PipeWire Support** | pw_stream_connect, pw_stream_write via FFI (moderne Alternative) |
+| 8 | **Test-Programm** | music_test.mp3 abspielen via Audio Unit |
+
 ### Sprache / Frontend
 
 _(keine offenen Aufgaben)_
