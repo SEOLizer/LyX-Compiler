@@ -3249,7 +3249,7 @@ begin
             // Extract return type from function pointer symbol
             // Note: FnPtrReturnType field is available, but full type inference
             // requires additional integration with parser/IR. For now, fallback to int64.
-            if Assigned(s.FnPtrReturnType) then
+            if s.FnPtrReturnType <> atUnresolved then
               Result := s.FnPtrReturnType
             else
               Result := atInt64;
