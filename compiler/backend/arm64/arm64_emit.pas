@@ -4529,40 +4529,130 @@ begin
             else if instr.ImmStr = 'HashSet' then
             begin
               // HashSet(map: pchar, key: pchar, val: int64): void
-              // Simple implementation: just set in map (stub)
-              // X0 = map, X1 = key, X2 = val
-              if Length(instr.ArgTemps) >= 1 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
-              else
-                WriteMovImm64(FCode, X0, 0);
-              // Just return (do nothing for now - stub)
-              WriteMovImm64(FCode, X0, 0);
+              // Uses linear search (reuses existing map logic from irMapSet)
+              if Length(instr.ArgTemps) >= 3 then
+              begin
+                // Load arguments
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // map
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1])); // key
+                WriteLdrImm(FCode, X2, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[2])); // value
+                // Linear search: X3=len, X4=counter, X5=entry
+                WriteLdrImm(FCode, X3, X0, 0);
+                WriteMovImm64(FCode, X4, 0);
+                WriteAddImm(FCode, X5, X0, 16);
+                loopStartPos := FCode.Size;
+                WriteCmpReg(FCode, X4, X3);
+                WriteBCond(FCode, COND_GE, 0);
+                jgePos := FCode.Size;
+                WriteLdrImm(FCode, X6, X5, 0);
+                WriteCmpReg(FCode, X6, X1);
+                WriteBCond(FCode, COND_NE, 0);
+                jneLoopPos := FCode.Size;
+                // Found: update value
+                WriteStrImm(FCode, X2, X5, 8);
+                WriteB(FCode, 0);
+                jmpDonePos := FCode.Size;
+                nextLabelPos := FCode.Size;
+                WriteAddImm(FCode, X5, X5, 24);
+                WriteAddImm(FCode, X4, X4, 1);
+                WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+                notFoundPos := FCode.Size;
+                // insert new at end
+                WriteLslImm(FCode, X6, X3, 3);
+                WriteAddRegReg(FCode, X7, X0, X6);
+                WriteStrImm(FCode, X1, X7, 0);
+                WriteStrImm(FCode, X2, X7, 8);
+                WriteLdrImm(FCode, X6, X0, 0);
+                WriteAddImm(FCode, X6, X6, 1);
+                WriteStrImm(FCode, X6, X0, 0);
+                doneLabelPos := FCode.Size;
+                // Patch branches
+                FCode.PatchU32LE(jgePos, $54000000 or (UInt32((notFoundPos - jgePos) div 4) shl 5) or $0A);
+                FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+                FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+              end;
+              // Return void
             end
             else if instr.ImmStr = 'HashGet' then
             begin
               // HashGet(map: pchar, key: pchar): int64
-              // Returns value or 0 if not found (stub)
-              if Length(instr.ArgTemps) >= 1 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
-              else
+              // Returns value or 0 if not found
+              if Length(instr.ArgTemps) >= 2 then
+              begin
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // map
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1])); // key
+                WriteLdrImm(FCode, X3, X0, 0);
+                WriteMovImm64(FCode, X4, 0);
+                WriteAddImm(FCode, X5, X0, 16);
+                loopStartPos := FCode.Size;
+                WriteCmpReg(FCode, X4, X3);
+                WriteBCond(FCode, COND_GE, 0);
+                jgePos := FCode.Size;
+                WriteLdrImm(FCode, X6, X5, 0);
+                WriteCmpReg(FCode, X6, X1);
+                WriteBCond(FCode, COND_NE, 0);
+                jneLoopPos := FCode.Size;
+                // Found
+                WriteLdrImm(FCode, X0, X5, 8);
+                WriteB(FCode, 0);
+                jmpDonePos := FCode.Size;
+                nextLabelPos := FCode.Size;
+                WriteAddImm(FCode, X5, X5, 24);
+                WriteAddImm(FCode, X4, X4, 1);
+                WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+                notFoundPos := FCode.Size;
                 WriteMovImm64(FCode, X0, 0);
-              // Return 0 (stub)
-              WriteMovImm64(FCode, X0, 0);
-              
+                doneLabelPos := FCode.Size;
+                FCode.PatchU32LE(jgePos, $54000000 or (UInt32((notFoundPos - jgePos) div 4) shl 5) or $0A);
+                FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+                FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+              end
+              else
+              begin
+                WriteMovImm64(FCode, X0, 0);
+              end;
+
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
             else if instr.ImmStr = 'HashHas' then
             begin
-              // HashHas(map: pchar, key: pchar): bool
-              // Returns 0 or 1 (stub)
-              if Length(instr.ArgTemps) >= 1 then
-                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0]))
-              else
+              // HashHas(map: pchar, key: pchar): bool (0 or 1)
+              if Length(instr.ArgTemps) >= 2 then
+              begin
+                WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[0])); // map
+                WriteLdrImm(FCode, X1, X29, frameSize + SlotOffset(localCnt + instr.ArgTemps[1])); // key
+                WriteLdrImm(FCode, X3, X0, 0);
+                WriteMovImm64(FCode, X4, 0);
+                WriteAddImm(FCode, X5, X0, 16);
+                loopStartPos := FCode.Size;
+                WriteCmpReg(FCode, X4, X3);
+                WriteBCond(FCode, COND_GE, 0);
+                jgePos := FCode.Size;
+                WriteLdrImm(FCode, X6, X5, 0);
+                WriteCmpReg(FCode, X6, X1);
+                WriteBCond(FCode, COND_NE, 0);
+                jneLoopPos := FCode.Size;
+                // Found: return 1
+                WriteMovImm64(FCode, X0, 1);
+                WriteB(FCode, 0);
+                jmpDonePos := FCode.Size;
+                nextLabelPos := FCode.Size;
+                WriteAddImm(FCode, X5, X5, 24);
+                WriteAddImm(FCode, X4, X4, 1);
+                WriteBranch(FCode, (loopStartPos - FCode.Size) div 4);
+                notFoundPos := FCode.Size;
                 WriteMovImm64(FCode, X0, 0);
-              // Return 0 (stub - key not found)
-              WriteMovImm64(FCode, X0, 0);
-              
+                doneLabelPos := FCode.Size;
+                FCode.PatchU32LE(jgePos, $54000000 or (UInt32((notFoundPos - jgePos) div 4) shl 5) or $0A);
+                FCode.PatchU32LE(jneLoopPos, $54000000 or (UInt32((nextLabelPos - jneLoopPos) div 4) shl 5) or $01);
+                FCode.PatchU32LE(jmpDonePos, $14000000 or UInt32((doneLabelPos - jmpDonePos) div 4));
+              end
+              else
+              begin
+                WriteMovImm64(FCode, X0, 0);
+              end;
+
               if instr.Dest >= 0 then
                 WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
             end
