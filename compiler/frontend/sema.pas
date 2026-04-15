@@ -3249,7 +3249,7 @@ begin
             // Extract return type from function pointer symbol
             // Note: FnPtrReturnType field is available, but full type inference
             // requires additional integration with parser/IR. For now, fallback to int64.
-            if Assigned(s.FnPtrReturnType) then
+            if s.FnPtrReturnType <> atUnresolved then
               Result := s.FnPtrReturnType
             else
               Result := atInt64;
@@ -5491,9 +5491,182 @@ begin
   end
   else if qualifier = 'String' then
   begin
-    // String.* functions (placeholder for future)
-    FDiag.Error('String module not yet implemented', span);
-    Exit;
+    // === C-type string functions ===
+    if name = 'StrLen' then
+    begin
+      // strlen(s: pchar): int64
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrCmp' then
+    begin
+      // strcmp(a: pchar, b: pchar): int64 (returns 0 if equal, <0 if a<b, >0 if a>b)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrCpy' then
+    begin
+      // strcpy(dest: pchar, src: pchar): pchar
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrCat' then
+    begin
+      // strcat(dest: pchar, src: pchar): pchar
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrDup' then
+    begin
+      // strdup(s: pchar): pchar (allocates new string, caller must free)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 1;
+      SetLength(Result.ParamTypes, 1);
+      Result.ParamTypes[0] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrNCpy' then
+    begin
+      // strncpy(dest: pchar, src: pchar, n: int64): pchar
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrNCat' then
+    begin
+      // strncat(dest: pchar, src: pchar, n: int64): pchar
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrNCmp' then
+    begin
+      // strncmp(a: pchar, b: pchar, n: int64): int64
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 3;
+      SetLength(Result.ParamTypes, 3);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      Result.ParamTypes[2] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrChr' then
+    begin
+      // strchr(s: pchar, c: int64): pchar (returns pointer to first occurrence or nil)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrRChr' then
+    begin
+      // strrchr(s: pchar, c: int64): pchar (returns pointer to last occurrence or nil)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atInt64;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrStr' then
+    begin
+      // strstr(haystack: pchar, needle: pchar): pchar (returns pointer to first occurrence or nil)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrCaseCmp' then
+    begin
+      // strcasecmp(a: pchar, b: pchar): int64 (case-insensitive compare)
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atInt64;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else if name = 'StrDupCat' then
+    begin
+      // strdupcat(a: pchar, b: pchar): pchar (alloc+concat, like strdup(strcat(a,b)))
+      Result := TSymbol.Create(name);
+      Result.Kind := symFunc;
+      Result.DeclType := atPChar;
+      Result.ParamCount := 2;
+      SetLength(Result.ParamTypes, 2);
+      Result.ParamTypes[0] := atPChar;
+      Result.ParamTypes[1] := atPChar;
+      AddSymbolToCurrent(Result, span);
+      Exit;
+    end
+    else
+    begin
+      FDiag.Error('unknown function in String module: ' + name, span);
+      Exit;
+    end;
   end;
   
   // === Imported Units ===
