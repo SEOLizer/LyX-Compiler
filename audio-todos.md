@@ -130,7 +130,7 @@ fn AudioStop(): AudioError;
 
 | WP | Status |
 |----|-------|
-| WP1 | ⏳ Offen |
+| WP1 | ✅ Abgeschlossen (std/audio.lyx) |
 | WP2 | ⏳ Offen |
 | WP3 | ⏳ Offen |
 | WP4 | ⏳ Offen |
