@@ -1178,4 +1178,9 @@ begin
   
   // Cleanup
   includePaths.Free;
+  
+  // Workaround: Skip finalization to avoid EAccessViolation crash after Dynamic ELF
+  // The crash occurs during FPC unit finalization when external libraries are linked.
+  // This does not affect the generated binary - it is correctly written.
+  Halt(0);
 end.
