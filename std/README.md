@@ -48,6 +48,10 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/stats` | Statistical functions |
 | `std/stats_batch` | Batch processing for statistics |
 | `std/math_batch` | Batch processing for math |
+| `std/audio` | Audio playback and MP3/WAV processing |
+| `std/audio.mpg123` | MP3 decoding via libmpg123 |
+| `std/audio.alsa` | ALSA audio playback (Linux) |
+| `std/audio.playback` | High-level audio playback interface |
 | `std/qbool` | Quotient Boolean (ternary logic) |
 | `std/error` | Error code management |
 
@@ -75,6 +79,82 @@ var y: int64 := Min64(1, 2);
 1. **Mind the order** - Sort imports by priority
 2. **Direct import** - Import only needed functions (if supported)
 3. **Avoid** - Don't mix multiple units with the same function names
+
+## std/audio.lyx
+
+### Audio Units Overview
+
+The `std.audio` module provides complete audio playback and processing capabilities:
+
+| Unit | Description |
+|------|-------------|
+| `std.audio` | Main audio module with WAV file handling |
+| `std.audio.mpg123` | MP3 decoding via libmpg123 |
+| `std.audio.alsa` | ALSA audio playback (Linux) |
+| `std.audio.playback` | High-level audio playback interface |
+
+### Features
+
+- **MP3 Decoding**: Read and decode MP3 files using libmpg123
+- **WAV Processing**: Parse and create WAV audio files
+- **ALSA Playback**: Play audio directly via Linux ALSA (Advanced Linux Sound Architecture)
+- **Format Support**: 48000 Hz, stereo, 16-bit PCM
+
+### Usage Example
+
+```lyx
+import std.audio;
+import std.audio.mpg123;
+import std.audio.alsa;
+
+// Decode MP3
+mpg123_init();
+var handle := mpg123_new(0, 0);
+mpg123_open(handle, "music.mp3");
+
+// Get format (48000 Hz, stereo)
+var ratePtr := mmap(0, 8, 3, 34, -1, 0);
+var chanPtr := mmap(0, 8, 3, 34, -1, 0);
+mpg123_getformat(handle, ratePtr, chanPtr, 0);
+
+// Decode audio data
+var buf := mmap(0, 10000000, 3, 34, -1, 0);
+var donePtr := mmap(0, 8, 3, 34, -1, 0);
+mpg123_read(handle, buf, 262144, donePtr);
+
+// Play via ALSA
+var hp := mmap(0, 8, 3, 34, -1, 0);
+snd_pcm_open(hp, "hw:0", 0, 0);
+// ... set params and play
+```
+
+### ALSA Functions
+
+- `snd_pcm_open(handlePtr, device, stream, mode): int64` - Open PCM device
+- `snd_pcm_close(handle): int64` - Close PCM device
+- `snd_pcm_hw_params_malloc(paramsPtr): int64` - Allocate params
+- `snd_pcm_hw_params_set_format(handle, params, format): int64` - Set format (S16_LE)
+- `snd_pcm_hw_params_set_rate_near(handle, params, rate, dir): int64` - Set sample rate
+- `snd_pcm_hw_params_set_channels(handle, params, channels): int64` - Set channels
+- `snd_pcm_hw_params(handle, params): int64` - Apply params
+- `snd_pcm_writei(handle, buffer, frames): int64` - Write interleaved audio
+- `snd_pcm_drain(handle): int64` - Drain playback
+
+### MP3 Functions
+
+- `mpg123_init(): int64` - Initialize library
+- `mpg123_exit(): void` - Exit library
+- `mpg123_new(decoder, err): int64` - Create handle
+- `mpg123_delete(handle): void` - Delete handle
+- `mpg123_open(handle, path): int64` - Open MP3 file
+- `mpg123_close(handle): int64` - Close MP3 file
+- `mpg123_getformat(handle, rate, channels, encoding): int64` - Get audio format
+- `mpg123_read(handle, buffer, bufSize, done): int64` - Decode audio
+
+### WAV Functions
+
+- `WAVSaveFile(path, buffer, dataSize, sampleRate, channels, bitsPerSample): int64` - Save as WAV
+- `WAVParseHeader(path): AudioInfo` - Parse WAV file header
 
 ## std/math.lyx
 
