@@ -178,6 +178,9 @@ const
   SYS_LINUX_SHUTDOWN = 48;  // sys_shutdown
   SYS_LINUX_SELECT  = 23;  // sys_select
   SYS_LINUX_POLL    = 7;   // sys_poll
+  SYS_LINUX_FORK    = 57;  // sys_fork
+  SYS_LINUX_EXECVE  = 59;  // sys_execve
+  SYS_LINUX_WAIT4   = 61;  // sys_wait4
 
 { Hilfsfunktionen für x86_64 Encoding }
 
@@ -3699,6 +3702,63 @@ begin
                   WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
                 end else WriteMovRegImm64(FCode, RSI, 0);
                 WriteMovRegImm64(FCode, RAX, UInt64(SysNum(82, SYS_MACOS_RENAME)));
+                WriteSyscall(FCode);
+                if instr.Dest >= 0 then begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end
+              else if instr.ImmStr = 'fork' then
+              begin
+                // fork() -> int64 (0=child, pid=parent, -1=error)
+                WriteMovRegImm64(FCode, RAX, UInt64(SYS_LINUX_FORK));
+                WriteSyscall(FCode);
+                if instr.Dest >= 0 then begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end
+              else if instr.ImmStr = 'execve' then
+              begin
+                // execve(path: pchar, argv: int64, envp: int64) -> int64
+                // RDI=path, RSI=argv, RDX=envp
+                if Length(instr.ArgTemps) >= 1 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RDI, 0);
+                if Length(instr.ArgTemps) >= 2 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RSI, 0);
+                if Length(instr.ArgTemps) >= 3 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                  WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, RAX, UInt64(SYS_LINUX_EXECVE));
+                WriteSyscall(FCode);
+                if instr.Dest >= 0 then begin
+                  slotIdx := fn.LocalCount + instr.Dest;
+                  WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                end;
+              end
+              else if instr.ImmStr = 'wait4' then
+              begin
+                // wait4(pid: int64, status: int64, options: int64, rusage: int64) -> int64
+                // RDI=pid, RSI=status_ptr, RDX=options, R10=rusage
+                if Length(instr.ArgTemps) >= 1 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RDI, 0);
+                if Length(instr.ArgTemps) >= 2 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RSI, 0);
+                if Length(instr.ArgTemps) >= 3 then begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[2];
+                  WriteMovRegMem(FCode, RDX, RBP, SlotOffset(slotIdx));
+                end else WriteMovRegImm64(FCode, RDX, 0);
+                WriteMovRegImm64(FCode, R10, 0);  // rusage = NULL
+                WriteMovRegImm64(FCode, RAX, UInt64(SYS_LINUX_WAIT4));
                 WriteSyscall(FCode);
                 if instr.Dest >= 0 then begin
                   slotIdx := fn.LocalCount + instr.Dest;

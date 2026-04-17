@@ -2240,6 +2240,36 @@ begin
   s.ParamCount := 0;
   AddSymbolToCurrent(s, NullSpan);
 
+  // sys_fork() -> int64 (0=child, pid=parent, -1=error)
+  s := TSymbol.Create('sys_fork');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 0;
+  SetLength(s.ParamTypes, 0);
+  AddSymbolToCurrent(s, NullSpan);
+
+  // sys_execve(path: pchar, argv: int64, envp: int64) -> int64
+  s := TSymbol.Create('sys_execve');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atPChar;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // sys_wait4(pid: int64, status: int64, options: int64) -> int64
+  s := TSymbol.Create('sys_wait4');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 3;
+  SetLength(s.ParamTypes, 3);
+  s.ParamTypes[0] := atInt64;
+  s.ParamTypes[1] := atInt64;
+  s.ParamTypes[2] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
 end;
 
 procedure TSema.RegisterTObject;
@@ -4910,7 +4940,8 @@ begin
       if decl is TAstFuncDecl then
       begin
         fn := TAstFuncDecl(decl);
-        if not fn.IsPublic then
+        // Import public functions AND extern functions (extern fn need to be accessible)
+        if not fn.IsPublic and not fn.IsExtern then
           Continue;
 
         // Prüfe auf Konflikte (silently skip duplicate imports for bootstrap compat)
@@ -4922,6 +4953,7 @@ begin
         sym.DeclType := fn.ReturnType;
         sym.ReturnTypeName := fn.ReturnTypeName;
         sym.IsImported := True;
+        sym.IsExtern := fn.IsExtern;  // Must propagate IsExtern for IR lowering
         sym.ParamCount := Length(fn.Params);
         SetLength(sym.ParamTypes, sym.ParamCount);
         for j := 0 to sym.ParamCount - 1 do

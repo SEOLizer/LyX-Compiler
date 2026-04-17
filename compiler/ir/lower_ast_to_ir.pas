@@ -2228,6 +2228,50 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             Emit(instr);
             Result := t0;
           end
+          // sys_fork() -> int64
+          else if call.Name = 'sys_fork' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'fork';
+            instr.ImmInt := 0;
+            SetLength(instr.ArgTemps, 0);
+            Emit(instr);
+            Result := t0;
+          end
+          // sys_execve(path: pchar, argv: int64, envp: int64) -> int64
+          else if call.Name = 'sys_execve' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'execve';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          // sys_wait4(pid: int64, status: int64, options: int64) -> int64
+          else if call.Name = 'sys_wait4' then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'wait4';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do
+              instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := t0;
+          end
           // sys_select/nfds: int64, readfds: Pointer, writefds: Pointer, exceptfds: Pointer, timeout: Pointer) -> int64 (direct syscall)
           else if call.Name = 'sys_select' then
           begin
