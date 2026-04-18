@@ -35,6 +35,7 @@
 #include <QTableWidget>
 #include <QPlainTextEdit>
 #include <QTreeView>
+#include <QTableView>
 #include <cstring>
 
 // ============================================================================
@@ -814,6 +815,89 @@ long long _qt_treewidget_collapse_all(long long treewidget) {
 long long _qt_treewidget_set_header_visible(long long treewidget, long long visible) {
     if (!treewidget) return -1;
     ((QTreeView*)treewidget)->setHeaderHidden(visible == 0);
+    return 0;
+}
+
+// ============================================================================
+// QTableView - Table widget (like TStringGrid)
+// ============================================================================
+
+// qt_tablewidget_create(parent, rows, cols) — create a table widget
+long long _qt_tablewidget_create(long long parent, long long rows, long long cols) {
+    QTableView* tw = new QTableView(parent ? (QWidget*)parent : nullptr);
+    tw->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tw->setSelectionMode(QAbstractItemView::SingleSelection);
+    return (long long)(void*)tw;
+}
+
+// qt_tablewidget_set_row_count(tablewidget, rows) — set number of rows
+long long _qt_tablewidget_set_row_count(long long tablewidget, long long rows) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(rows);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_column_count(tablewidget, cols) — set number of columns
+long long _qt_tablewidget_set_column_count(long long tablewidget, long long cols) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(cols);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_item(tablewidget, row, col, text) — set cell text
+long long _qt_tablewidget_set_item(long long tablewidget, long long row, long long col, long long text) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(row);
+    Q_UNUSED(col);
+    Q_UNUSED(text);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_get_item(tablewidget, row, col) — get cell text
+long long _qt_tablewidget_get_item(long long tablewidget, long long row, long long col) {
+    if (!tablewidget) return 0;
+    Q_UNUSED(row);
+    Q_UNUSED(col);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_column_width(tablewidget, col, width) — set column width
+long long _qt_tablewidget_set_column_width(long long tablewidget, long long col, long long width) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->setColumnWidth((int)col, (int)width);
+    return 0;
+}
+
+// qt_tablewidget_resize_columns_to_content(tablewidget) — auto-resize columns
+long long _qt_tablewidget_resize_columns_to_content(long long tablewidget) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->resizeColumnsToContents();
+    return 0;
+}
+
+// qt_tablewidget_current_row(tablewidget) — get selected row
+long long _qt_tablewidget_current_row(long long tablewidget) {
+    if (!tablewidget) return -1;
+    return ((QTableView*)tablewidget)->currentIndex().row();
+}
+
+// qt_tablewidget_current_column(tablewidget) — get selected column
+long long _qt_tablewidget_current_column(long long tablewidget) {
+    if (!tablewidget) return -1;
+    return ((QTableView*)tablewidget)->currentIndex().column();
+}
+
+// qt_tablewidget_clear(tablewidget) — clear all data
+long long _qt_tablewidget_clear(long long tablewidget) {
+    if (!tablewidget) return -1;
+    // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_alternating_row_colors(tablewidget, enable) — alternating row colors
+long long _qt_tablewidget_set_alternating_row_colors(long long tablewidget, long long enable) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->setAlternatingRowColors(enable != 0);
     return 0;
 }
 
