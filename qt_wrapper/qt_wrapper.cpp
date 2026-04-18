@@ -247,6 +247,102 @@ long long _qt_action_was_triggered(long long action) {
 }
 
 // ============================================================================
+// CheckBox Signals (WP6)
+// ============================================================================
+
+// qt_checkbox_on_toggled(checkbox, callback_id) — connect checkbox toggled to event marker
+extern "C"
+long long _qt_checkbox_on_toggled(long long checkbox, long long callback_id) {
+    if (!checkbox) return -1;
+    QCheckBox* cb = (QCheckBox*)checkbox;
+    cb->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(cb, &QCheckBox::toggled, [cb]() {
+        g_last_toggled_checkbox = (long long)(void*)cb;
+    });
+    return 0;
+}
+
+// qt_checkbox_was_toggled(checkbox) — poll and reset checkbox toggled state
+extern "C"
+long long _qt_checkbox_was_toggled(long long checkbox) {
+    if (!checkbox) return 0;
+    if (g_last_toggled_checkbox == checkbox) {
+        g_last_toggled_checkbox = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// qt_checkbox_state(checkbox) — get current checkbox state (0=unchecked, 1=checked)
+extern "C"
+long long _qt_checkbox_state(long long checkbox) {
+    if (!checkbox) return 0;
+    return ((QCheckBox*)checkbox)->isChecked() ? 1 : 0;
+}
+
+// ============================================================================
+// Slider Signals (WP6)
+// ============================================================================
+
+// qt_slider_on_valuechanged(slider, callback_id) — connect slider valueChanged to event marker
+extern "C"
+long long _qt_slider_on_valuechanged(long long slider, long long callback_id) {
+    if (!slider) return -1;
+    QSlider* sl = (QSlider*)slider;
+    sl->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(sl, &QSlider::valueChanged, [sl](int value) {
+        Q_UNUSED(value);
+        g_last_slider_value = (long long)(void*)sl;
+    });
+    return 0;
+}
+
+// qt_slider_was_changed(slider) — poll and reset slider changed state
+extern "C"
+long long _qt_slider_was_changed(long long slider) {
+    if (!slider) return 0;
+    if (g_last_slider_value == slider) {
+        g_last_slider_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// LineEdit Signals (WP6)
+// ============================================================================
+
+// Global für LineEdit Textänderungen
+static long long g_last_edited_lineedit = 0;
+static QString g_lineedit_text_buffer;
+
+// qt_lineedit_on_text_changed(lineedit, callback_id) — connect textChanged to event marker
+extern "C"
+long long _qt_lineedit_on_text_changed(long long lineedit, long long callback_id) {
+    if (!lineedit) return -1;
+    QLineEdit* le = (QLineEdit*)lineedit;
+    le->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(le, &QLineEdit::textChanged, [le]() {
+        g_last_edited_lineedit = (long long)(void*)le;
+    });
+    return 0;
+}
+
+// qt_lineedit_was_changed(lineedit) — poll and reset lineedit changed state
+extern "C"
+long long _qt_lineedit_was_changed(long long lineedit) {
+    if (!lineedit) return 0;
+    if (g_last_edited_lineedit == lineedit) {
+        g_last_edited_lineedit = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
 // QTimer (WP7)
 // ============================================================================
 
