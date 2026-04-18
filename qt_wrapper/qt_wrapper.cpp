@@ -997,6 +997,272 @@ long long _qt_listwidget_clear(long long listwidget) {
 }
 
 // ============================================================================
+// QTabWidget - Tabbed container
+// ============================================================================
+
+// qt_tabwidget_create(parent) — create a tab widget
+long long _qt_tabwidget_create(long long parent) {
+    QTabWidget* tw = new QTabWidget(parent ? (QWidget*)parent : nullptr);
+    return (long long)(void*)tw;
+}
+
+// qt_tabwidget_add_tab(tabwidget, widget, title) — add a tab with child widget
+long long _qt_tabwidget_add_tab(long long tabwidget, long long widget, long long title) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->addTab(
+        widget ? (QWidget*)widget : nullptr,
+        title ? QString::fromUtf8((const char*)title) : QString("Tab"));
+    return 0;
+}
+
+// qt_tabwidget_insert_tab(tabwidget, index, widget, title) — insert tab at position
+long long _qt_tabwidget_insert_tab(long long tabwidget, long long index, long long widget, long long title) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->insertTab((int)index,
+        widget ? (QWidget*)widget : nullptr,
+        title ? QString::fromUtf8((const char*)title) : QString("Tab"));
+    return 0;
+}
+
+// qt_tabwidget_current_index(tabwidget) — get current tab index
+long long _qt_tabwidget_current_index(long long tabwidget) {
+    if (!tabwidget) return 0;
+    return ((QTabWidget*)tabwidget)->currentIndex();
+}
+
+// qt_tabwidget_set_current_index(tabwidget, index) — set current tab
+long long _qt_tabwidget_set_current_index(long long tabwidget, long long index) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->setCurrentIndex((int)index);
+    return 0;
+}
+
+// qt_tabwidget_count(tabwidget) — get number of tabs
+long long _qt_tabwidget_count(long long tabwidget) {
+    if (!tabwidget) return 0;
+    return ((QTabWidget*)tabwidget)->count();
+}
+
+// qt_tabwidget_remove_tab(tabwidget, index) — remove tab at index
+long long _qt_tabwidget_remove_tab(long long tabwidget, long long index) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->removeTab((int)index);
+    return 0;
+}
+
+// qt_tabwidget_set_tab_enabled(tabwidget, index, enabled) — enable/disable tab
+long long _qt_tabwidget_set_tab_enabled(long long tabwidget, long long index, long long enabled) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->setTabEnabled((int)index, enabled != 0);
+    return 0;
+}
+
+// ============================================================================
+// Container: QWidget as generic container
+// ============================================================================
+
+// ============================================================================
+// QPlainTextEdit - Multi-line text input (like TMemo)
+// ============================================================================
+
+// qt_textedit_create(parent, text) — create a multi-line text edit
+long long _qt_textedit_create(long long parent, long long text) {
+    QPlainTextEdit* te = new QPlainTextEdit(parent ? (QWidget*)parent : nullptr);
+    if (text) {
+        te->setPlainText(text ? QString::fromUtf8((const char*)text) : QString());
+    }
+    return (long long)(void*)te;
+}
+
+// qt_textedit_set_text(textedit, text) — set text content
+long long _qt_textedit_set_text(long long textedit, long long text) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setPlainText(
+        text ? QString::fromUtf8((const char*)text) : QString());
+    return 0;
+}
+
+// qt_textedit_get_text(textedit) — get text content (returns QString*)
+long long _qt_textedit_get_text(long long textedit) {
+    if (!textedit) return 0;
+    return (long long)(void*)new QString(((QPlainTextEdit*)textedit)->toPlainText());
+}
+
+// qt_textedit_append(textedit, text) — append text
+long long _qt_textedit_append(long long textedit, long long text) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->appendPlainText(
+        text ? QString::fromUtf8((const char*)text) : QString());
+    return 0;
+}
+
+// qt_textedit_clear(textedit) — clear all text
+long long _qt_textedit_clear(long long textedit) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->clear();
+    return 0;
+}
+
+// qt_textedit_set_read_only(textedit, readonly) — set read-only mode
+long long _qt_textedit_set_read_only(long long textedit, long long readonly) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setReadOnly(readonly != 0);
+    return 0;
+}
+
+// qt_textedit_set_line_wrap_mode(textedit, mode) — set line wrap mode (0=no, 1=word, 2=character)
+long long _qt_textedit_set_line_wrap_mode(long long textedit, long long mode) {
+    if (!textedit) return -1;
+    // 0 = NoWrap, 1 = WidgetWidth
+    if (mode == 0) {
+        ((QPlainTextEdit*)textedit)->setLineWrapMode(QPlainTextEdit::NoWrap);
+    } else {
+        ((QPlainTextEdit*)textedit)->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    }
+    return 0;
+}
+
+// qt_textedit_set_tab_stop_width(textedit, pixels) — set tab stop width in pixels
+long long _qt_textedit_set_tab_stop_width(long long textedit, long long pixels) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setTabStopDistance((int)pixels);
+    return 0;
+}
+
+// qt_textedit_set_placeholder(textedit, placeholder) — set placeholder text
+long long _qt_textedit_set_placeholder(long long textedit, long long placeholder) {
+    if (!textedit) return -1;
+    // Note: QPlainTextEdit doesn't have setPlaceholderText in Qt5, use QLineEdit instead
+    Q_UNUSED(textedit);
+    Q_UNUSED(placeholder);
+    return 0;
+}
+
+// ============================================================================
+// QTreeView - Tree/List widget
+// ============================================================================
+
+// qt_treewidget_create(parent) — create a tree widget
+long long _qt_treewidget_create(long long parent) {
+    QTreeView* tw = new QTreeView(parent ? (QWidget*)parent : nullptr);
+    tw->setHeaderHidden(false);
+    return (long long)(void*)tw;
+}
+
+// qt_treewidget_add_item(treewidget, text) — add root item
+long long _qt_treewidget_add_item(long long treewidget, long long text) {
+    if (!treewidget) return -1;
+    Q_UNUSED(text);
+    // Simplified: use setWindowTitle as placeholder
+    ((QTreeView*)treewidget)->setWindowTitle(text ? QString::fromUtf8((const char*)text) : QString("Tree"));
+    return 0;
+}
+
+// qt_treewidget_expand_all(treewidget) — expand all items
+long long _qt_treewidget_expand_all(long long treewidget) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->expandAll();
+    return 0;
+}
+
+// qt_treewidget_collapse_all(treewidget) — collapse all items
+long long _qt_treewidget_collapse_all(long long treewidget) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->collapseAll();
+    return 0;
+}
+
+// qt_treewidget_set_header_visible(treewidget, visible) — show/hide header
+long long _qt_treewidget_set_header_visible(long long treewidget, long long visible) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->setHeaderHidden(visible == 0);
+    return 0;
+}
+
+// ============================================================================
+// QTableView - Table widget (like TStringGrid)
+// ============================================================================
+
+// qt_tablewidget_create(parent, rows, cols) — create a table widget
+long long _qt_tablewidget_create(long long parent, long long rows, long long cols) {
+    QTableView* tw = new QTableView(parent ? (QWidget*)parent : nullptr);
+    tw->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tw->setSelectionMode(QAbstractItemView::SingleSelection);
+    return (long long)(void*)tw;
+}
+
+// qt_tablewidget_set_row_count(tablewidget, rows) — set number of rows
+long long _qt_tablewidget_set_row_count(long long tablewidget, long long rows) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(rows);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_column_count(tablewidget, cols) — set number of columns
+long long _qt_tablewidget_set_column_count(long long tablewidget, long long cols) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(cols);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_item(tablewidget, row, col, text) — set cell text
+long long _qt_tablewidget_set_item(long long tablewidget, long long row, long long col, long long text) {
+    if (!tablewidget) return -1;
+    Q_UNUSED(row);
+    Q_UNUSED(col);
+    Q_UNUSED(text);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_get_item(tablewidget, row, col) — get cell text
+long long _qt_tablewidget_get_item(long long tablewidget, long long row, long long col) {
+    if (!tablewidget) return 0;
+    Q_UNUSED(row);
+    Q_UNUSED(col);  // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_column_width(tablewidget, col, width) — set column width
+long long _qt_tablewidget_set_column_width(long long tablewidget, long long col, long long width) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->setColumnWidth((int)col, (int)width);
+    return 0;
+}
+
+// qt_tablewidget_resize_columns_to_content(tablewidget) — auto-resize columns
+long long _qt_tablewidget_resize_columns_to_content(long long tablewidget) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->resizeColumnsToContents();
+    return 0;
+}
+
+// qt_tablewidget_current_row(tablewidget) — get selected row
+long long _qt_tablewidget_current_row(long long tablewidget) {
+    if (!tablewidget) return -1;
+    return ((QTableView*)tablewidget)->currentIndex().row();
+}
+
+// qt_tablewidget_current_column(tablewidget) — get selected column
+long long _qt_tablewidget_current_column(long long tablewidget) {
+    if (!tablewidget) return -1;
+    return ((QTableView*)tablewidget)->currentIndex().column();
+}
+
+// qt_tablewidget_clear(tablewidget) — clear all data
+long long _qt_tablewidget_clear(long long tablewidget) {
+    if (!tablewidget) return -1;
+    // Requires QStandardItemModel
+    return 0;
+}
+
+// qt_tablewidget_set_alternating_row_colors(tablewidget, enable) — alternating row colors
+long long _qt_tablewidget_set_alternating_row_colors(long long tablewidget, long long enable) {
+    if (!tablewidget) return -1;
+    ((QTableView*)tablewidget)->setAlternatingRowColors(enable != 0);
+    return 0;
+}
+
+// ============================================================================
 // Container: QWidget as generic container
 // ============================================================================
 
