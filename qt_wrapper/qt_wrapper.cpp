@@ -31,6 +31,9 @@
 #include <QComboBox>
 #include <QProgressBar>
 #include <QListWidget>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QPlainTextEdit>
 #include <cstring>
 
 // ============================================================================
@@ -627,6 +630,148 @@ long long _qt_listwidget_count(long long listwidget) {
 long long _qt_listwidget_clear(long long listwidget) {
     if (!listwidget) return -1;
     ((QListWidget*)listwidget)->clear();
+    return 0;
+}
+
+// ============================================================================
+// QTabWidget - Tabbed container
+// ============================================================================
+
+// qt_tabwidget_create(parent) — create a tab widget
+long long _qt_tabwidget_create(long long parent) {
+    QTabWidget* tw = new QTabWidget(parent ? (QWidget*)parent : nullptr);
+    return (long long)(void*)tw;
+}
+
+// qt_tabwidget_add_tab(tabwidget, widget, title) — add a tab with child widget
+long long _qt_tabwidget_add_tab(long long tabwidget, long long widget, long long title) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->addTab(
+        widget ? (QWidget*)widget : nullptr,
+        title ? QString::fromUtf8((const char*)title) : QString("Tab"));
+    return 0;
+}
+
+// qt_tabwidget_insert_tab(tabwidget, index, widget, title) — insert tab at position
+long long _qt_tabwidget_insert_tab(long long tabwidget, long long index, long long widget, long long title) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->insertTab((int)index,
+        widget ? (QWidget*)widget : nullptr,
+        title ? QString::fromUtf8((const char*)title) : QString("Tab"));
+    return 0;
+}
+
+// qt_tabwidget_current_index(tabwidget) — get current tab index
+long long _qt_tabwidget_current_index(long long tabwidget) {
+    if (!tabwidget) return 0;
+    return ((QTabWidget*)tabwidget)->currentIndex();
+}
+
+// qt_tabwidget_set_current_index(tabwidget, index) — set current tab
+long long _qt_tabwidget_set_current_index(long long tabwidget, long long index) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->setCurrentIndex((int)index);
+    return 0;
+}
+
+// qt_tabwidget_count(tabwidget) — get number of tabs
+long long _qt_tabwidget_count(long long tabwidget) {
+    if (!tabwidget) return 0;
+    return ((QTabWidget*)tabwidget)->count();
+}
+
+// qt_tabwidget_remove_tab(tabwidget, index) — remove tab at index
+long long _qt_tabwidget_remove_tab(long long tabwidget, long long index) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->removeTab((int)index);
+    return 0;
+}
+
+// qt_tabwidget_set_tab_enabled(tabwidget, index, enabled) — enable/disable tab
+long long _qt_tabwidget_set_tab_enabled(long long tabwidget, long long index, long long enabled) {
+    if (!tabwidget) return -1;
+    ((QTabWidget*)tabwidget)->setTabEnabled((int)index, enabled != 0);
+    return 0;
+}
+
+// ============================================================================
+// Container: QWidget as generic container
+// ============================================================================
+
+// ============================================================================
+// QPlainTextEdit - Multi-line text input (like TMemo)
+// ============================================================================
+
+// qt_textedit_create(parent, text) — create a multi-line text edit
+long long _qt_textedit_create(long long parent, long long text) {
+    QPlainTextEdit* te = new QPlainTextEdit(parent ? (QWidget*)parent : nullptr);
+    if (text) {
+        te->setPlainText(text ? QString::fromUtf8((const char*)text) : QString());
+    }
+    return (long long)(void*)te;
+}
+
+// qt_textedit_set_text(textedit, text) — set text content
+long long _qt_textedit_set_text(long long textedit, long long text) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setPlainText(
+        text ? QString::fromUtf8((const char*)text) : QString());
+    return 0;
+}
+
+// qt_textedit_get_text(textedit) — get text content (returns QString*)
+long long _qt_textedit_get_text(long long textedit) {
+    if (!textedit) return 0;
+    return (long long)(void*)new QString(((QPlainTextEdit*)textedit)->toPlainText());
+}
+
+// qt_textedit_append(textedit, text) — append text
+long long _qt_textedit_append(long long textedit, long long text) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->appendPlainText(
+        text ? QString::fromUtf8((const char*)text) : QString());
+    return 0;
+}
+
+// qt_textedit_clear(textedit) — clear all text
+long long _qt_textedit_clear(long long textedit) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->clear();
+    return 0;
+}
+
+// qt_textedit_set_read_only(textedit, readonly) — set read-only mode
+long long _qt_textedit_set_read_only(long long textedit, long long readonly) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setReadOnly(readonly != 0);
+    return 0;
+}
+
+// qt_textedit_set_line_wrap_mode(textedit, mode) — set line wrap mode (0=no, 1=word, 2=character)
+long long _qt_textedit_set_line_wrap_mode(long long textedit, long long mode) {
+    if (!textedit) return -1;
+    // 0 = NoWrap, 1 = WidgetWidth
+    if (mode == 0) {
+        ((QPlainTextEdit*)textedit)->setLineWrapMode(QPlainTextEdit::NoWrap);
+    } else {
+        ((QPlainTextEdit*)textedit)->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    }
+    return 0;
+}
+
+// qt_textedit_set_tab_stop_width(textedit, pixels) — set tab stop width in pixels
+long long _qt_textedit_set_tab_stop_width(long long textedit, long long pixels) {
+    if (!textedit) return -1;
+    ((QPlainTextEdit*)textedit)->setTabStopDistance((int)pixels);
+    return 0;
+}
+
+// qt_textedit_set_placeholder(textedit, placeholder) — set placeholder text
+long long _qt_textedit_set_placeholder(long long textedit, long long placeholder) {
+    if (!textedit) return -1;
+    // Note: QPlainTextEdit doesn't have setPlaceholderText in Qt5, use QLineEdit instead
+    Q_UNUSED(textedit);
+    Q_UNUSED(placeholder);
     return 0;
 }
 
