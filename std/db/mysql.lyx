@@ -1,0 +1,748 @@
+// std/db/mysql.lyx - MySQL/MariaDB Client using MySQL Wire Protocol
+//
+// Supports: MySQL 5.7+, MariaDB 10.x
+
+unit std.db.mysql;
+
+import std.net.types;
+import std.net.syscalls;
+import std.string;
+
+// ============================================================================
+// Constants - Capability Flags
+// ============================================================================
+
+pub con CLIENT_LONG_PASSWORD: int64 := 1;
+pub con CLIENT_FOUND_ROWS: int64 := 2;
+pub con CLIENT_LONG_FLAG: int64 := 4;
+pub con CLIENT_CONNECT_WITH_DB: int64 := 8;
+pub con CLIENT_PROTOCOL_41: int64 := 512;
+pub con CLIENT_TRANSACTIONS: int64 := 8192;
+pub con CLIENT_SECURE_CONNECTION: int64 := 32768;
+pub con CLIENT_MULTI_STATEMENTS: int64 := 65536;
+pub con CLIENT_MULTI_RESULTS: int64 := 131072;
+pub con CLIENT_PLUGIN_AUTH: int64 := 524288;
+
+pub con DEFAULT_CAP_FLAGS: int64 := 589823;
+
+// ============================================================================
+// Constants - Server Status
+// ============================================================================
+
+pub con SERVER_STATUS_IN_TRANSACTION: int64 := 1;
+pub con SERVER_STATUS_AUTOCOMMIT: int64 := 2;
+
+// ============================================================================
+// Constants - Field Types
+// ============================================================================
+
+pub con MYSQL_TYPE_DECIMAL: int64 := 0;
+pub con MYSQL_TYPE_TINY: int64 := 1;
+pub con MYSQL_TYPE_SHORT: int64 := 2;
+pub con MYSQL_TYPE_LONG: int64 := 3;
+pub con MYSQL_TYPE_FLOAT: int64 := 4;
+pub con MYSQL_TYPE_DOUBLE: int64 := 5;
+pub con MYSQL_TYPE_NULL: int64 := 6;
+pub con MYSQL_TYPE_TIMESTAMP: int64 := 7;
+pub con MYSQL_TYPE_LONGLONG: int64 := 8;
+pub con MYSQL_TYPE_INT24: int64 := 9;
+pub con MYSQL_TYPE_DATE: int64 := 10;
+pub con MYSQL_TYPE_TIME: int64 := 11;
+pub con MYSQL_TYPE_DATETIME: int64 := 12;
+pub con MYSQL_TYPE_YEAR: int64 := 13;
+pub con MYSQL_TYPE_VARCHAR: int64 := 15;
+pub con MYSQL_TYPE_BIT: int64 := 16;
+pub con MYSQL_TYPE_NEWDECIMAL: int64 := 246;
+pub con MYSQL_TYPE_BLOB: int64 := 252;
+pub con MYSQL_TYPE_VARSTRING: int64 := 253;
+pub con MYSQL_TYPE_STRING: int64 := 254;
+pub con MYSQL_TYPE_GEOMETRY: int64 := 255;
+
+// ============================================================================
+// Constants - Commands
+// ============================================================================
+
+pub con COM_QUIT: int64 := 1;
+pub con COM_INIT_DB: int64 := 2;
+pub con COM_QUERY: int64 := 3;
+pub con COM_PING: int64 := 14;
+pub con COM_STMT_PREPARE: int64 := 22;
+pub con COM_STMT_EXECUTE: int64 := 23;
+pub con COM_STMT_CLOSE: int64 := 25;
+
+// ============================================================================
+// Constants - Misc
+// ============================================================================
+
+pub con MAX_PACKET_SIZE: int64 := 16777215;
+pub con MYSQL_ERRMSG_SIZE: int64 := 256;
+pub con MYSQL_NAME_SIZE: int64 := 64;
+pub con SCRAMBLE_LENGTH: int64 := 20;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+pub type MySQLConn = struct {
+    fd: int64;
+    host: pchar;
+    port: int64;
+    user: pchar;
+    password: pchar;
+    database: pchar;
+    packet_num: int64;
+    server_ver: int64;
+    cap_flags: int64;
+    charset: int64;
+    status: int64;
+    server_scramble: int64;
+    last_error: int64;
+    errmsg: pchar;
+    error_num: int64;
+    affected_rows: int64;
+    insert_id: int64;
+    field_count: int64;
+};
+
+pub type MySQLResult = struct {
+    field_count: int64;
+    affected_rows: int64;
+    insert_id: int64;
+    server_status: int64;
+    warning_count: int64;
+    message: pchar;
+    fields: int64;
+    field_alloc: int64;
+    current_field: int64;
+    row_count: int64;
+    rows: int64;
+    row_alloc: int64;
+    current_row: int64;
+};
+
+pub type MySQLField = struct {
+    catalog: pchar;
+    db: pchar;
+    table: pchar;
+    org_table: pchar;
+    name: pchar;
+    org_name: pchar;
+    charset: int64;
+    length: int64;
+    ft: int64;
+    flags: int64;
+    decimals: int64;
+    def: pchar;
+};
+
+pub type MySQLRow = struct {
+    values: int64;
+    lengths: int64;
+    count: int64;
+};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn newMySQLConn(): MySQLConn {
+    var conn: MySQLConn;
+    conn.fd := -1;
+    conn.packet_num := 0;
+    conn.status := 0;
+    conn.server_ver := mmap(0, 64, 3, 34, -1, 0);
+    conn.server_scramble := mmap(0, 20, 3, 34, -1, 0);
+    conn.last_error := mmap(0, 256, 3, 34, -1, 0);
+    conn.errmsg := "";
+    conn.error_num := 0;
+    conn.affected_rows := 0;
+    conn.insert_id := 0;
+    conn.field_count := 0;
+    return conn;
+}
+
+fn freeMySQLConn(conn: MySQLConn): void {
+    if (conn.server_ver > 0) { munmap(conn.server_ver, 64); }
+    if (conn.server_scramble > 0) { munmap(conn.server_scramble, 20); }
+    if (conn.last_error > 0) { munmap(conn.last_error, 256); }
+}
+
+fn newMySQLResult(): MySQLResult {
+    var res: MySQLResult;
+    res.field_count := 0;
+    res.affected_rows := 0;
+    res.insert_id := 0;
+    res.server_status := 0;
+    res.warning_count := 0;
+    res.message := "";
+    res.fields := 0;
+    res.field_alloc := 0;
+    res.current_field := 0;
+    res.row_count := 0;
+    res.rows := 0;
+    res.row_alloc := 0;
+    res.current_row := 0;
+    return res;
+}
+
+fn freeMySQLResult(res: MySQLResult): void {
+    if (res.fields > 0) { munmap(res.fields, res.field_alloc * 112); }
+    if (res.rows > 0) { munmap(res.rows, res.row_alloc * 32); }
+    res.fields := 0;
+    res.rows := 0;
+}
+
+// ============================================================================
+// Packet-Handling
+// ============================================================================
+
+fn writeInt3(buf: int64, val: int64): void {
+    poke8(buf, val & 0xFF);
+    poke8(buf + 1, (val >> 8) & 0xFF);
+    poke8(buf + 2, (val >> 16) & 0xFF);
+}
+
+fn readInt3(buf: int64): int64 {
+    return peek8(buf) | (peek8(buf + 1) << 8) | (peek8(buf + 2) << 16);
+}
+
+pub fn MySQLSendPacket(conn: MySQLConn, data: int64, len: int64): bool {
+    if (conn.fd < 0) { return false; }
+    
+    var bufLen: int64 := len + 4;
+    var packetBuf: int64 := mmap(0, bufLen, 3, 34, -1, 0);
+    if (packetBuf <= 0) { return false; }
+    
+    writeInt3(packetBuf, len);
+    poke8(packetBuf + 3, conn.packet_num);
+    
+    var i: int64 := 0;
+    while (i < len) {
+        poke8(packetBuf + 4 + i, peek8(data + i));
+        i := i + 1;
+    }
+    
+    var sent: int64 := sys_write(conn.fd, packetBuf, bufLen);
+    munmap(packetBuf, bufLen);
+    
+    if (sent <= 0) { return false; }
+    
+    conn.packet_num := conn.packet_num + 1;
+    return true;
+}
+
+pub fn MySQLReadPacket(conn: MySQLConn): int64 {
+    if (conn.fd < 0) { return 0; }
+    
+    var header: int64 := mmap(0, 4, 3, 34, -1, 0);
+    if (header <= 0) { return 0; }
+    
+    var n: int64 := sys_read(conn.fd, header, 4);
+    if (n <= 0) {
+        munmap(header, 4);
+        return 0;
+    }
+    
+    var phLen: int64 := readInt3(header);
+    var seq: int64 := peek8(header + 3);
+    munmap(header, 4);
+    
+    var payLen: int64 := phLen + 1;
+    var payload: int64 := mmap(0, payLen, 3, 34, -1, 0);
+    if (payload <= 0) { return 0; }
+    
+    poke8(payload + phLen, 0);
+    
+    n := sys_read(conn.fd, payload, phLen);
+    if (n <= 0) {
+        munmap(payload, payLen);
+        return 0;
+    }
+    
+    conn.packet_num := seq;
+    return payload;
+}
+
+pub fn MySQLGetPacketLength(packet: int64): int64 {
+    if (packet <= 0) { return 0; }
+    var i: int64 := 0;
+    while (i < MAX_PACKET_SIZE && peek8(packet + i) != 0) {
+        i := i + 1;
+    }
+    return i;
+}
+
+// ============================================================================
+// Connection & Handshake
+// ============================================================================
+
+pub con MYSQL_STATUS_NOT_CONNECTED: int64 := 0;
+pub con MYSQL_STATUS_CONNECTED: int64 := 1;
+
+fn parseHandshakeV10(conn: MySQLConn, payload: int64, payloadLen: int64): bool {
+    var pos: int64 := 0;
+    
+    var protoVer: int64 := peek8(payload);
+    if (protoVer != 10) {
+        conn.error_num := 2000;
+        return false;
+    }
+    pos := pos + 1;
+    
+    var verEnd: int64 := pos;
+    while (verEnd < payloadLen) {
+        if (peek8(payload + verEnd) == 0) { break; }
+        verEnd := verEnd + 1;
+    }
+    
+    var i: int64 := 0;
+    while (i < 63 && pos < verEnd) {
+        poke8(conn.server_ver + i, peek8(payload + pos));
+        pos := pos + 1;
+        i := i + 1;
+    }
+    poke8(conn.server_ver + i, 0);
+    pos := verEnd + 1;
+    
+    i := 0;
+    while (i < 8 && pos < payloadLen) {
+        poke8(conn.server_scramble + i, peek8(payload + pos));
+        pos := pos + 1;
+        i := i + 1;
+    }
+    
+    if (pos >= payloadLen) {
+        conn.error_num := 2000;
+        return false;
+    }
+    pos := pos + 1;
+    
+    if (pos + 2 >= payloadLen) {
+        conn.error_num := 2000;
+        return false;
+    }
+    var capLow: int64 := peek8(payload + pos) | (peek8(payload + pos + 1) << 8);
+    conn.cap_flags := capLow;
+    pos := pos + 2;
+    
+    if (pos >= payloadLen) {
+        conn.error_num := 2000;
+        return false;
+    }
+    conn.charset := peek8(payload + pos);
+    pos := pos + 1;
+    
+    if (pos + 2 >= payloadLen) {
+        conn.error_num := 2000;
+        return false;
+    }
+    conn.status := peek8(payload + pos) | (peek8(payload + pos + 1) << 8);
+    pos := pos + 2;
+    
+    if (pos + 2 >= payloadLen) {
+        conn.error_num := 2000;
+        return false;
+    }
+    var capHigh: int64 := peek8(payload + pos) | (peek8(payload + pos + 1) << 8);
+    conn.cap_flags := conn.cap_flags | (capHigh << 16);
+    
+    return true;
+}
+
+fn buildHandshakeResp41(conn: MySQLConn): int64 {
+    var buf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    if (buf <= 0) { return 0; }
+    
+    var pos: int64 := 0;
+    
+    poke8(buf, DEFAULT_CAP_FLAGS & 0xFF);
+    poke8(buf + 1, (DEFAULT_CAP_FLAGS >> 8) & 0xFF);
+    poke8(buf + 2, (DEFAULT_CAP_FLAGS >> 16) & 0xFF);
+    poke8(buf + 3, (DEFAULT_CAP_FLAGS >> 24) & 0xFF);
+    pos := 4;
+    
+    poke8(buf + pos, MAX_PACKET_SIZE & 0xFF);
+    poke8(buf + 1 + pos, (MAX_PACKET_SIZE >> 8) & 0xFF);
+    poke8(buf + 2 + pos, (MAX_PACKET_SIZE >> 16) & 0xFF);
+    poke8(buf + 3 + pos, (MAX_PACKET_SIZE >> 24) & 0xFF);
+    pos := pos + 4;
+    
+    poke8(buf + pos, 0xFF);
+    pos := pos + 1;
+    
+    var j: int64 := 0;
+    while (j < 23) {
+        poke8(buf + pos + j, 0);
+        j := j + 1;
+    }
+    pos := pos + 23;
+    
+    var user: pchar := conn.user;
+    if (user != "") {
+        j := 0;
+        while (j < 256) {
+            var c: int64 := peek8(user + j);
+            if (c == 0) { break; }
+            poke8(buf + pos + j, c);
+            j := j + 1;
+        }
+        pos := pos + j + 1;
+    } else {
+        poke8(buf + pos, 0);
+        pos := pos + 1;
+    }
+    
+    poke8(buf + pos, 0);
+    pos := pos + 1;
+    
+    var db: pchar := conn.database;
+    if (db != "") {
+        j := 0;
+        while (j < 256) {
+            var c: int64 := peek8(db + j);
+            if (c == 0) { break; }
+            poke8(buf + pos + j, c);
+            j := j + 1;
+        }
+        pos := pos + j + 1;
+    } else {
+        poke8(buf + pos, 0);
+        pos := pos + 1;
+    }
+    
+    return pos;
+}
+
+pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pchar): MySQLConn {
+    var conn: MySQLConn := newMySQLConn();
+    
+    conn.host := host;
+    conn.port := port;
+    conn.user := user;
+    conn.password := pass;
+    conn.database := db;
+    conn.fd := -1;
+    conn.error_num := 0;
+    
+    var fd: int64 := sys_socket(2, 1, 0);
+    if (fd < 0) {
+        conn.error_num := 2001;
+        return conn;
+    }
+    conn.fd := fd;
+    
+    var addr: int64 := mmap(0, 16, 3, 34, -1, 0);
+    if (addr <= 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2002;
+        return conn;
+    }
+    
+    poke8(addr, 2);
+    poke8(addr + 1, 0);
+    
+    poke8(addr + 2, (port >> 8) & 0xFF);
+    poke8(addr + 3, port & 0xFF);
+    
+    poke8(addr + 4, 127);
+    poke8(addr + 5, 0);
+    poke8(addr + 6, 0);
+    poke8(addr + 7, 1);
+    
+    var k: int64 := 0;
+    while (k < 8) {
+        poke8(addr + 8 + k, 0);
+        k := k + 1;
+    }
+    
+    var result: int64 := sys_connect(fd, addr, 16);
+    munmap(addr, 16);
+    
+    if (result < 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2003;
+        return conn;
+    }
+    
+    var handshake: int64 := MySQLReadPacket(conn);
+    
+    if (handshake <= 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2004;
+        return conn;
+    }
+    
+    var payLen: int64 := MySQLGetPacketLength(handshake);
+    if (!parseHandshakeV10(conn, handshake, payLen)) {
+        munmap(handshake, payLen + 1);
+        sys_close(fd);
+        conn.fd := -1;
+        return conn;
+    }
+    
+    munmap(handshake, payLen + 1);
+    
+    var respLen: int64 := buildHandshakeResp41(conn);
+    
+    if (respLen <= 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2005;
+        return conn;
+    }
+    
+    var respBuf: int64 := mmap(0, respLen, 3, 34, -1, 0);
+    if (respBuf <= 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2005;
+        return conn;
+    }
+    
+    k := 0;
+    while (k < respLen) {
+        var c: int64 := peek8(respLen + k);
+        if (c == 0) { break; }
+        poke8(respBuf + k, c);
+        k := k + 1;
+    }
+    respLen := k;  // actual length
+    
+    if (!MySQLSendPacket(conn, respBuf, respLen)) {
+        munmap(respBuf, 256);
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2006;
+        return conn;
+    }
+    
+    munmap(respBuf, 256);
+    
+    var authPacket: int64 := MySQLReadPacket(conn);
+    
+    if (authPacket <= 0) {
+        sys_close(fd);
+        conn.fd := -1;
+        conn.error_num := 2007;
+        return conn;
+    }
+    
+    var firstByte: int64 := peek8(authPacket);
+    
+    if (firstByte == 0x00) {
+        return conn;
+    }
+    
+    if (firstByte == 0xFF) {
+        conn.error_num := peek8(authPacket + 1) | (peek8(authPacket + 2) << 8);
+        k := 0;
+        while (k < 255) {
+            var c: int64 := peek8(authPacket + 3 + k);
+            if (c == 0) { break; }
+            poke8(conn.last_error + k, c);
+            k := k + 1;
+        }
+        poke8(conn.last_error + k, 0);
+        munmap(authPacket, 8);
+        sys_close(fd);
+        conn.fd := -1;
+        return conn;
+    }
+    
+    return conn;
+}
+
+pub fn MySQLClose(conn: MySQLConn): void {
+    if (conn.fd >= 0) {
+        sys_close(conn.fd);
+    }
+    conn.fd := -1;
+    freeMySQLConn(conn);
+}
+
+// ============================================================================
+// Query Execution
+// ============================================================================
+
+fn mysqlSendCommand(conn: MySQLConn, cmd: int64, data: int64, len: int64): bool {
+    var bufLen: int64 := len + 1;
+    var cmdBuf: int64 := mmap(0, bufLen, 3, 34, -1, 0);
+    if (cmdBuf <= 0) { return false; }
+    
+    poke8(cmdBuf, cmd);
+    
+    var i: int64 := 0;
+    while (i < len) {
+        poke8(cmdBuf + 1 + i, peek8(data + i));
+        i := i + 1;
+    }
+    
+    var res: bool := MySQLSendPacket(conn, cmdBuf, bufLen);
+    munmap(cmdBuf, bufLen);
+    return res;
+}
+
+fn parseOKPacket(conn: MySQLConn, payload: int64, payloadLen: int64): bool {
+    if (payloadLen < 7) { return false; }
+    
+    conn.affected_rows := peek8(payload + 1);
+    if (payloadLen > 1) {
+        conn.insert_id := peek8(payload + 2);
+    }
+    
+    if (payloadLen >= 4) {
+        conn.status := peek8(payload + 3) | (peek8(payload + 4) << 8);
+    }
+    
+    return true;
+}
+
+fn parseErrorPacket(conn: MySQLConn, payload: int64, payloadLen: int64): bool {
+    if (payloadLen < 3) { return false; }
+    
+    conn.error_num := peek8(payload + 1) | (peek8(payload + 2) << 8);
+    
+    var i: int64 := 0;
+    while (i < 255 && i + 3 < payloadLen) {
+        poke8(conn.last_error + i, peek8(payload + 3 + i));
+        i := i + 1;
+    }
+    poke8(conn.last_error + i, 0);
+    
+    return true;
+}
+
+pub fn MySQLQuery(conn: MySQLConn, sql: pchar): MySQLResult {
+    var res: MySQLResult := newMySQLResult();
+    
+    if (conn.fd < 0) {
+        conn.error_num := 2010;
+        return res;
+    }
+    
+    var sqlLen: int64 := StrLen(sql);
+    if (!mysqlSendCommand(conn, COM_QUERY, sql, sqlLen)) {
+        conn.error_num := 2011;
+        return res;
+    }
+    
+    var response: int64 := MySQLReadPacket(conn);
+    
+    if (response <= 0) {
+        conn.error_num := 2012;
+        return res;
+    }
+    
+    var respLen: int64 := MySQLGetPacketLength(response);
+    var first: int64 := peek8(response);
+    
+    if (first == 0x00) {
+        parseOKPacket(conn, response, respLen);
+        munmap(response, respLen + 1);
+        return res;
+    }
+    
+    if (first == 0xFF) {
+        parseErrorPacket(conn, response, respLen);
+        munmap(response, respLen + 1);
+        return res;
+    }
+    
+    var fieldCnt: int64 := peek8(response);
+    res.field_count := fieldCnt;
+    conn.field_count := fieldCnt;
+    
+    munmap(response, respLen + 1);
+    
+    res.field_alloc := fieldCnt;
+    res.fields := mmap(0, 112 * fieldCnt, 3, 34, -1, 0);
+    
+    var i: int64 := 0;
+    while (i < fieldCnt) {
+        var colPkt: int64 := MySQLReadPacket(conn);
+        if (colPkt <= 0) { break; }
+        var colLen: int64 := MySQLGetPacketLength(colPkt);
+        munmap(colPkt, colLen + 1);
+        i := i + 1;
+    }
+    
+    if (i > 0) {
+        var eofPkt: int64 := MySQLReadPacket(conn);
+        if (eofPkt > 0) { 
+            var eofLen: int64 := MySQLGetPacketLength(eofPkt);
+            munmap(eofPkt, eofLen + 1); 
+        }
+    }
+    
+    var rowCount: int64 := 0;
+    res.row_alloc := 256;
+    res.rows := mmap(0, 32 * 256, 3, 34, -1, 0);
+    
+    var done: bool := false;
+    while (!done) {
+        var rowPkt: int64 := MySQLReadPacket(conn);
+        
+        if (rowPkt <= 0) { 
+            done := true;
+            break;
+        }
+        
+        var rowLen: int64 := MySQLGetPacketLength(rowPkt);
+        var rowFirst: int64 := peek8(rowPkt);
+        
+        if (rowFirst == 0xFE) {
+            munmap(rowPkt, rowLen + 1);
+            done := true;
+            break;
+        }
+        
+        if (rowFirst == 0xFF) {
+            parseErrorPacket(conn, rowPkt, rowLen);
+            munmap(rowPkt, rowLen + 1);
+            done := true;
+            break;
+        }
+        
+        rowCount := rowCount + 1;
+        munmap(rowPkt, rowLen + 1);
+    }
+    
+    res.row_count := rowCount;
+    
+    return res;
+}
+
+pub fn MySQLError(conn: MySQLConn): pchar {
+    return conn.last_error;
+}
+
+pub fn MySQLErrno(conn: MySQLConn): int64 {
+    return conn.error_num;
+}
+
+pub fn MySQLAffectedRows(conn: MySQLConn): int64 {
+    return conn.affected_rows;
+}
+
+pub fn MySQLInsertId(conn: MySQLConn): int64 {
+    return conn.insert_id;
+}
+
+pub fn MySQLNumFields(res: MySQLResult): int64 {
+    return res.field_count;
+}
+
+pub fn MySQLNumRows(res: MySQLResult): int64 {
+    return res.row_count;
+}
+
+pub fn MySQLFreeResult(res: MySQLResult): void {
+    freeMySQLResult(res);
+}
+
+// ============================================================================
+// End
+// ============================================================================
