@@ -1,0 +1,217 @@
+// Test: MP3 decode + WAV save + ALSA playback (48000 Hz)
+import std.audio;
+import std.audio.mpg123;
+import std.audio.alsa;
+
+pub fn main(): int64 {
+  PrintStr("=== MP3 to WAV to ALSA Playback ===\n");
+  
+  var mp3Path: pchar := "/home/andreas/PhpstormProjects/aurum/music_test.mp3";
+  var wavPath: pchar := "/tmp/playback_48k_test.wav";
+  
+  // Step 1: Initialize MP3 decoder
+  PrintStr("1. Initializing MP3 decoder...\n");
+  mpg123_init();
+  var handle: int64;
+  handle := mpg123_new(0, 0);
+  
+  // Open MP3 without fixed format
+  var res: int64;
+  res := mpg123_open(handle, mp3Path);
+  
+  if (res != MPG123_OK) {
+    PrintStr("ERROR: Cannot open MP3\n");
+    mpg123_exit();
+    return 1;
+  }
+  
+  // Query actual format
+  var ratePtr: int64;
+  var chanPtr: int64;
+  var encPtr: int64;
+  ratePtr := mmap(0, 8, 3, 34, -1, 0);
+  chanPtr := mmap(0, 8, 3, 34, -1, 0);
+  encPtr := mmap(0, 8, 3, 34, -1, 0);
+  
+  res := mpg123_getformat(handle, ratePtr, chanPtr, encPtr);
+  
+  var sampleRate: int64;
+  sampleRate := peek64(ratePtr);
+  var channels: int64;
+  channels := peek64(chanPtr);
+  var encoding: int64;
+  encoding := peek64(encPtr);
+  
+  PrintStr("MP3 Format:\n");
+  PrintStr("  Sample Rate: "); PrintInt(sampleRate); PrintStr(" Hz\n");
+  PrintStr("  Channels: "); PrintInt(channels); PrintStr("\n");
+  PrintStr("  Encoding: "); PrintInt(encoding); PrintStr("\n");
+  
+  munmap(ratePtr, 8);
+  munmap(chanPtr, 8);
+  munmap(encPtr, 8);
+  
+  // Step 2: Re-open with fixed format to decode
+  PrintStr("2. Decoding MP3...\n");
+  mpg123_close(handle);
+  res := mpg123_open_fixed(handle, mp3Path, channels, MPG123_ENC_SIGNED_16);
+  
+  if (res != MPG123_OK) {
+    PrintStr("ERROR: Cannot open with fixed format\n");
+    mpg123_delete(handle);
+    mpg123_exit();
+    return 1;
+  }
+  
+  // Allocate buffer and decode
+  var buf: int64;
+  buf := mmap(0, 10485760, 3, 34, -1, 0);
+  var done: int64;
+  done := mmap(0, 8, 3, 34, -1, 0);
+  
+  var total: int64;
+  total := 0;
+  
+  while (total < 10485760) {
+    res := mpg123_read(handle, buf + total, 16384, done);
+    
+    if (res == MPG123_DONE) {
+      break;
+    }
+    if (res < 0 and res != MPG123_NEW_FORMAT) {
+      PrintStr("Decode error: "); PrintInt(res); PrintStr("\n");
+      munmap(buf, 10485760);
+      munmap(done, 8);
+      mpg123_close(handle);
+      mpg123_delete(handle);
+      mpg123_exit();
+      return 1;
+    }
+    
+    var bytesRead: int64;
+    bytesRead := peek64(done);
+    if (bytesRead > 0) {
+      total := total + bytesRead;
+    }
+  }
+  
+  PrintStr("Decoded "); PrintInt(total); PrintStr(" bytes\n");
+  
+  // Step 3: Save as WAV with CORRECT sample rate
+  PrintStr("3. Saving WAV...\n");
+  var bitsPerSample: int64;
+  bitsPerSample := 16;
+  
+  res := WAVSaveFile(wavPath, buf, total, sampleRate, channels, bitsPerSample);
+  
+  if (res != 0) {
+    PrintStr("ERROR: Cannot save WAV\n");
+    munmap(buf, 10485760);
+    munmap(done, 8);
+    mpg123_close(handle);
+    mpg123_delete(handle);
+    mpg123_exit();
+    return 1;
+  }
+  
+  PrintStr("WAV saved: "); PrintStr(wavPath); PrintStr("\n");
+  
+  // Step 4: Play via ALSA
+  PrintStr("4. Playing via ALSA...\n");
+  
+  // Read WAV data (skip header)
+  var playBuf: int64;
+  playBuf := mmap(0, total, 3, 34, -1, 0);
+  var fd: int64;
+  fd := open(wavPath, 0, 0);
+  lseek(fd, 44, SEEK_SET);  // Skip WAV header
+  var readBytes: int64;
+  readBytes := sys_read(fd, playBuf, total);
+  close(fd);
+  
+  PrintStr("Read for playback: "); PrintInt(readBytes); PrintStr(" bytes\n");
+  
+  // Open ALSA
+  var hp: int64;
+  hp := mmap(0, 8, 3, 34, -1, 0);
+  res := snd_pcm_open(hp, "hw:0", 0, 0);
+  
+  if (res != 0) {
+    PrintStr("ERROR: Cannot open ALSA\n");
+    munmap(playBuf, total);
+    munmap(buf, 10485760);
+    munmap(done, 8);
+    mpg123_close(handle);
+    mpg123_delete(handle);
+    mpg123_exit();
+    return 1;
+  }
+  
+  var alsaHandle: int64;
+  alsaHandle := peek64(hp);
+  munmap(hp, 8);
+  
+  // Set params with CORRECT sample rate
+  var pp: int64;
+  pp := mmap(0, 8, 3, 34, -1, 0);
+  snd_pcm_hw_params_malloc(pp);
+  var params: int64;
+  params := peek64(pp);
+  
+  snd_pcm_hw_params_any(alsaHandle, params);
+  snd_pcm_hw_params_set_access(alsaHandle, params, 3);        // RW_INTERLEAVED
+  snd_pcm_hw_params_set_format(alsaHandle, params, 2);        // S16_LE
+  
+  // Use the actual sample rate from MP3 (48000 Hz)
+  var ratePtr2: int64;
+  ratePtr2 := mmap(0, 8, 3, 34, -1, 0);
+  poke64(ratePtr2, sampleRate);
+  snd_pcm_hw_params_set_rate_near(alsaHandle, params, ratePtr2, 0);
+  var actualRate: int64;
+  actualRate := peek64(ratePtr2);
+  munmap(ratePtr2, 8);
+  
+  PrintStr("ALSA sample rate: "); PrintInt(actualRate); PrintStr(" Hz\n");
+  
+  snd_pcm_hw_params_set_channels(alsaHandle, params, channels);
+  res := snd_pcm_hw_params(alsaHandle, params);
+  
+  if (res != 0) {
+    PrintStr("ERROR: Cannot set ALSA params\n");
+    snd_pcm_close(alsaHandle);
+    snd_pcm_hw_params_free(params);
+    munmap(pp, 8);
+    munmap(playBuf, total);
+    munmap(buf, 10485760);
+    munmap(done, 8);
+    mpg123_close(handle);
+    mpg123_delete(handle);
+    mpg123_exit();
+    return 1;
+  }
+  
+  snd_pcm_hw_params_free(params);
+  munmap(pp, 8);
+  
+  // Play
+  var frames: int64;
+  frames := readBytes / (channels * 2);
+  PrintStr("Playing "); PrintInt(frames); PrintStr(" frames...\n");
+  
+  res := snd_pcm_writei(alsaHandle, playBuf, frames);
+  PrintStr("Written: "); PrintInt(res); PrintStr(" frames\n");
+  
+  snd_pcm_drain(alsaHandle);
+  snd_pcm_close(alsaHandle);
+  
+  // Cleanup
+  munmap(playBuf, total);
+  munmap(buf, 10485760);
+  munmap(done, 8);
+  mpg123_close(handle);
+  mpg123_delete(handle);
+  mpg123_exit();
+  
+  PrintStr("=== Done ===\n");
+  return 0;
+}
