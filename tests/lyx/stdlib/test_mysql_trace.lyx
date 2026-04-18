@@ -1,0 +1,141 @@
+import std.db.mysql;
+import std.io;
+
+pub fn main(): int64 {
+    PrintStr("MySQL Debug Trace Test\n");
+    
+    var conn: MySQLConn := MySQLConnect("127.0.0.1", 3306, "lyx2", "", "lyx");
+    
+    if (conn.fd < 0) {
+        PrintStr("Connect failed: ");
+        PrintInt(conn.error_num);
+        PrintStr("\n");
+        return 1;
+    }
+    
+    PrintStr("Connected! fd=");
+    PrintInt(conn.fd);
+    PrintStr(" packet_num=");
+    PrintInt(conn.packet_num);
+    PrintStr("\n");
+    
+    // Reset for command
+    conn.packet_num := 0;
+    
+    // Build COM_QUERY packet directly: [1 byte cmd][string query]
+    var q: pchar := "SELECT 1";
+    var qlen: int64 := 0;
+    while (qlen < 256) {
+        if (peek8(q + qlen) == 0) { break; }
+        qlen := qlen + 1;
+    }
+    
+    // Total: 1 + qlen + 4header bytes
+    var totlen: int64 := qlen + 4;
+    var pkt: int64 := mmap(0, totlen, 3, 34, -1, 0);
+    if (pkt <= 0) {
+        PrintStr("mmap failed\n");
+        MySQLClose(conn);
+        return 1;
+    }
+    
+    // Write header: [3 bytes length][1 byte seq]
+    poke8(pkt, qlen & 0xFF);
+    poke8(pkt + 1, (qlen >> 8) & 0xFF);
+    poke8(pkt + 2, (qlen >> 16) & 0xFF);
+    poke8(pkt + 3, 0);  // seq 0
+    
+    // Write command byte
+    poke8(pkt + 4, 3);  // COM_QUERY
+    
+    // Write query string
+    var i: int64 := 0;
+    while (i < qlen) {
+        poke8(pkt + 5 + i, peek8(q + i));
+        i := i + 1;
+    }
+    
+    PrintStr("Sending raw packet (len=");
+    PrintInt(totlen);
+    PrintStr("): ");
+    i := 0;
+    while (i < totlen) {
+        var b: int64 := peek8(pkt + i);
+        PrintInt(b);
+        PrintStr(" ");
+        i := i + 1;
+    }
+    PrintStr("\n");
+    
+    var written: int64 := sys_write(conn.fd, pkt, totlen);
+    munmap(pkt, totlen);
+    
+    PrintStr("Written: ");
+    PrintInt(written);
+    PrintStr("\n");
+    
+    // Now try to read response
+    PrintStr("Reading response header...\n");
+    
+    var hdr: int64 := mmap(0, 4, 3, 34, -1, 0);
+    var nr: int64 := sys_read(conn.fd, hdr, 4);
+    
+    if (nr <= 0) {
+        PrintStr("No header read, nr=");
+        PrintInt(nr);
+        PrintStr("\n");
+        munmap(hdr, 4);
+        MySQLClose(conn);
+        return 1;
+    }
+    
+    var plen: int64 := peek8(hdr) | (peek8(hdr + 1) << 8) | (peek8(hdr + 2) << 16);
+    var seq: int64 := peek8(hdr + 3);
+    munmap(hdr, 4);
+    
+    PrintStr("Header: payload_len=");
+    PrintInt(plen);
+    PrintStr(" seq=");
+    PrintInt(seq);
+    PrintStr("\n");
+    
+    if (plen > 0 && plen < 65536) {
+        var pay: int64 := mmap(0, plen + 1, 3, 34, -1, 0);
+        nr := sys_read(conn.fd, pay, plen);
+        
+        if (nr > 0) {
+            var fb: int64 := peek8(pay);
+            PrintStr("Payload first byte: ");
+            PrintInt(fb);
+            PrintStr(" (hex: ");
+            
+            // Print hex
+            var hex1: int64 := (fb >> 4) & 0x0F;
+            var hex2: int64 := fb & 0x0F;
+            if (hex1 < 10) { PrintInt(hex1 + 48); } else { PrintInt(hex1 + 87); }
+            if (hex2 < 10) { PrintInt(hex2 + 48); } else { PrintInt(hex2 + 87); }
+            PrintStr(")\n");
+            
+            if (fb == 0x00) {
+                PrintStr("OK packet received\n");
+            } else {
+                if (fb == 0xFF) {
+                    var e1: int64 := peek8(pay + 1);
+                    var e2: int64 := peek8(pay + 2);
+                    var err: int64 := e1 | (e2 << 8);
+                    PrintStr("Error packet, errno=");
+                    PrintInt(err);
+                    PrintStr("\n");
+                } else {
+                    PrintStr("Unknown response type\n");
+                }
+            }
+        }
+        munmap(pay, plen + 1);
+    }
+    
+    MySQLClose(conn);
+    PrintStr("Done\n");
+    
+    return 0;
+}

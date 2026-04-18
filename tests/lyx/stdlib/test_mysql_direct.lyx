@@ -1,0 +1,126 @@
+import std.db.mysql;
+import std.io;
+
+pub fn main(): int64 {
+    PrintStr("MySQL Direct Test\n");
+    
+    var conn: MySQLConn := MySQLConnect("127.0.0.1", 3306, "lyx2", "", "lyx");
+    
+    if (conn.fd < 0) {
+        PrintStr("Connect failed: ");
+        PrintInt(conn.error_num);
+        PrintStr("\n");
+        return 1;
+    }
+    
+    PrintStr("Connected! packet_num after auth: ");
+    PrintInt(conn.packet_num);
+    PrintStr("\n");
+    
+    // Try to read any leftover packets first
+    PrintStr("Draining...\n");
+    var drain: int64 := MySQLReadPacket(conn);
+    if (drain > 0) {
+        var dLen: int64 := conn.last_payload_len;
+        var dFirst: int64 := peek8(drain);
+        PrintStr("Drained packet: first=");
+        PrintInt(dFirst);
+        PrintStr(" len=");
+        PrintInt(dLen);
+        PrintStr("\n");
+        munmap(drain, dLen + 1);
+    } else {
+        PrintStr("Nothing to drain\n");
+    }
+    
+    PrintStr("packet_num after drain: ");
+    PrintInt(conn.packet_num);
+    PrintStr("\n");
+    
+    // Reset packet_num to 0 for command
+    conn.packet_num := 0;
+    PrintStr("Reset packet_num to 0\n");
+    
+    // Manually send COM_PING = 0x0E
+    var cmd: int64 := mmap(0, 5, 3, 34, -1, 0);
+    poke8(cmd, 0);        // length low byte
+    poke8(cmd + 1, 0);  // length mid byte
+    poke8(cmd + 2, 0);   // length high byte (0 means 16MB, but we're sending 1 byte)
+    // Actually for 1 byte payload: length = 1 = 0x000001
+    poke8(cmd, 1);        // length low byte
+    poke8(cmd + 1, 0);  // length mid byte
+    poke8(cmd + 2, 0);   // length high byte
+    poke8(cmd + 3, 0);   // sequence number
+    poke8(cmd + 4, 14); // COM_PING command
+    
+    PrintStr("Sending raw packet: ");
+    var i: int64 := 0;
+    while (i < 5) {
+        var b: int64 := peek8(cmd + i);
+        PrintInt(b);
+        PrintStr(" ");
+        i := i + 1;
+    }
+    PrintStr("\n");
+    
+    var written: int64 := sys_write(conn.fd, cmd, 5);
+    munmap(cmd, 5);
+    
+    PrintStr("Written: ");
+    PrintInt(written);
+    PrintStr("\n");
+    
+    // Read response
+    PrintStr("Reading response...\n");
+    var hdr: int64 := mmap(0, 4, 3, 34, -1, 0);
+    var nr: int64 := sys_read(conn.fd, hdr, 4);
+    
+    if (nr <= 0) {
+        PrintInt(nr);
+        PrintStr("\n");
+        MySQLClose(conn);
+        return 1;
+    }
+    
+    var pl: int64 := peek8(hdr) | (peek8(hdr + 1) << 8) | (peek8(hdr + 2) << 16);
+    var seq: int64 := peek8(hdr + 3);
+    munmap(hdr, 4);
+    
+    PrintStr("Header: payload_len=");
+    PrintInt(pl);
+    PrintStr(" seq=");
+    PrintInt(seq);
+    PrintStr("\n");
+    
+    if (pl > 0 && pl < 65536) {
+        var pay: int64 := mmap(0, pl + 1, 3, 34, -1, 0);
+        nr := sys_read(conn.fd, pay, pl);
+        
+        if (nr > 0) {
+            var fb: int64 := peek8(pay);
+            PrintStr("Payload first byte: ");
+            PrintInt(fb);
+            PrintStr("\n");
+            
+            if (fb == 0x00) {
+                PrintStr("OK packet received\n");
+            } else {
+                if (fb == 0xFF) {
+                    var e1: int64 := peek8(pay + 1);
+                    var e2: int64 := peek8(pay + 2);
+                    PrintStr("Error packet: ");
+                    PrintInt(e1);
+                    PrintStr(" ");
+                    PrintInt(e2);
+                    PrintStr("\n");
+                }
+            }
+        }
+        munmap(pay, pl + 1);
+    }
+    
+    MySQLClose(conn);
+    PrintStr("Done\n");
+    
+    return 0;
+}
