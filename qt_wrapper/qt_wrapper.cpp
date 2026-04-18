@@ -715,6 +715,10 @@ long long _qt_container_create_vbox(long long parent) {
     QVBoxLayout* layout = new QVBoxLayout(container);
     layout->setContentsMargins(10, 10, 10, 10);
     layout->setSpacing(5);
+    // Make container expand to fill available space
+    container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    // Set minimum size to ensure visibility
+    container->setMinimumSize(200, 100);
     container->setLayout(layout);
     return (long long)(void*)container;
 }
