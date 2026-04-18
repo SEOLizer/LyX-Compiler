@@ -41,6 +41,9 @@
 #include <QFileDialog>
 #include <QInputDialog>
 #include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QTreeView>
+#include <QTableView>
 #include <map>
 #include <functional>
 #include <cstring>
