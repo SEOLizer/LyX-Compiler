@@ -32,6 +32,7 @@
 #include <QProgressBar>
 #include <QListWidget>
 #include <QSplitter>
+#include <QTimer>
 #include <map>
 #include <functional>
 #include <cstring>
@@ -247,6 +248,78 @@ long long _qt_slider_on_valuechanged(long long slider, long long callback) {
 long long _qt_button_clicked(long long button) {
     (void)button;
     return 0;
+}
+
+// ============================================================================
+// QTimer (WP7)
+// ============================================================================
+
+// Global QTimer registry
+static std::map<void*, QTimer*> g_timers;
+static std::map<void*, std::function<void()>> g_timer_callbacks;
+
+// qt_timer_create(interval_ms) — create a timer with interval in milliseconds
+long long _qt_timer_create(long long interval_ms) {
+    QTimer* timer = new QTimer();
+    timer->setInterval((int)interval_ms);
+    g_timers[(void*)timer] = timer;
+    return (long long)(void*)timer;
+}
+
+// qt_timer_start(timer) — start the timer
+long long _qt_timer_start(long long timer) {
+    if (!timer) return -1;
+    QTimer* t = (QTimer*)timer;
+    if (!t->isActive()) {
+        t->start();
+    }
+    return 0;
+}
+
+// qt_timer_stop(timer) — stop the timer
+long long _qt_timer_stop(long long timer) {
+    if (!timer) return -1;
+    QTimer* t = (QTimer*)timer;
+    if (t->isActive()) {
+        t->stop();
+    }
+    return 0;
+}
+
+// qt_timer_delete(timer) — delete the timer
+long long _qt_timer_delete(long long timer) {
+    if (!timer) return -1;
+    QTimer* t = (QTimer*)timer;
+    t->stop();
+    g_timers.erase((void*)timer);
+    g_timer_callbacks.erase((void*)timer);
+    delete t;
+    return 0;
+}
+
+// qt_timer_on_timeout(timer, callback) — connect timeout signal to callback
+long long _qt_timer_on_timeout(long long timer, long long callback) {
+    if (!timer || !callback) return -1;
+    QTimer* t = (QTimer*)timer;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    g_timer_callbacks[(void*)timer] = cb;
+    QObject::connect(t, &QTimer::timeout, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_timer_set_interval(timer, interval_ms) — set timer interval
+long long _qt_timer_set_interval(long long timer, long long interval_ms) {
+    if (!timer) return -1;
+    ((QTimer*)timer)->setInterval((int)interval_ms);
+    return 0;
+}
+
+// qt_timer_is_active(timer) — check if timer is running
+long long _qt_timer_is_active(long long timer) {
+    if (!timer) return 0;
+    return ((QTimer*)timer)->isActive() ? 1 : 0;
 }
 
 // ============================================================================
