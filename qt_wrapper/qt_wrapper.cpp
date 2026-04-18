@@ -34,6 +34,7 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QPlainTextEdit>
+#include <QTreeView>
 #include <cstring>
 
 // ============================================================================
@@ -772,6 +773,47 @@ long long _qt_textedit_set_placeholder(long long textedit, long long placeholder
     // Note: QPlainTextEdit doesn't have setPlaceholderText in Qt5, use QLineEdit instead
     Q_UNUSED(textedit);
     Q_UNUSED(placeholder);
+    return 0;
+}
+
+// ============================================================================
+// QTreeView - Tree/List widget
+// ============================================================================
+
+// qt_treewidget_create(parent) — create a tree widget
+long long _qt_treewidget_create(long long parent) {
+    QTreeView* tw = new QTreeView(parent ? (QWidget*)parent : nullptr);
+    tw->setHeaderHidden(false);
+    return (long long)(void*)tw;
+}
+
+// qt_treewidget_add_item(treewidget, text) — add root item
+long long _qt_treewidget_add_item(long long treewidget, long long text) {
+    if (!treewidget) return -1;
+    Q_UNUSED(text);
+    // Simplified: use setWindowTitle as placeholder
+    ((QTreeView*)treewidget)->setWindowTitle(text ? QString::fromUtf8((const char*)text) : QString("Tree"));
+    return 0;
+}
+
+// qt_treewidget_expand_all(treewidget) — expand all items
+long long _qt_treewidget_expand_all(long long treewidget) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->expandAll();
+    return 0;
+}
+
+// qt_treewidget_collapse_all(treewidget) — collapse all items
+long long _qt_treewidget_collapse_all(long long treewidget) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->collapseAll();
+    return 0;
+}
+
+// qt_treewidget_set_header_visible(treewidget, visible) — show/hide header
+long long _qt_treewidget_set_header_visible(long long treewidget, long long visible) {
+    if (!treewidget) return -1;
+    ((QTreeView*)treewidget)->setHeaderHidden(visible == 0);
     return 0;
 }
 
