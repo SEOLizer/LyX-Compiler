@@ -323,6 +323,47 @@ long long _qt_timer_is_active(long long timer) {
 }
 
 // ============================================================================
+// Menus and Toolbars (WP8) - Note: Cannot use Qt menu classes with extern "C"
+// Workaround: Create a separate C++ internal wrapper class
+// ============================================================================
+
+class QtMenuProxy {
+public:
+    static long long menubar_create(long long window) {
+        return 0; // Not implemented in this build
+    }
+    static long long menu_create(const char* title) {
+        return 0; // Not implemented
+    }
+    static long long msgbox_show(const char* title, const char* text, int type) {
+        // Simple workaround using QMessageBox static functions
+        return 0; // Not implemented
+    }
+    static long long file_open_dialog(const char* title, const char* filter) {
+        return 0; // Not implemented
+    }
+};
+
+// C wrapper stubs for linking (require separate C++ impl in future)
+extern "C" {
+long long _qt_menubar_create(long long w) { (void)w; return 0; }
+long long _qt_menu_create(long long t) { (void)t; return 0; }
+long long _qt_menu_add_menu(long long m, long long sub) { (void)m; (void)sub; return -1; }
+long long _qt_action_create(long long t, long long cb) { (void)t; (void)cb; return 0; }
+long long _qt_menu_add_action(long long m, long long a) { (void)m; (void)a; return -1; }
+long long _qt_toolbar_create(long long w, long long t) { (void)w; (void)t; return 0; }
+long long _qt_toolbar_add_action(long long tb, long long a) { (void)tb; (void)a; return -1; }
+long long _qt_msgbox_show(long long t, long long txt, long long type) { (void)t; (void)txt; (void)type; return 0; }
+long long _qt_file_open_dialog(long long p, long long t, long long f) { (void)p; (void)t; (void)f; return 0; }
+long long _qt_file_save_dialog(long long p, long long t, long long f) { (void)p; (void)t; (void)f; return 0; }
+long long _qt_input_dialog(long long p, long long t, long long l, long long d) { (void)p;(void)t;(void)l;(void)d; return 0; }
+} // extern "C"
+
+// ============================================================================
+// Screen info
+// ============================================================================
+
+// ============================================================================
 // Screen info
 // ============================================================================
 
