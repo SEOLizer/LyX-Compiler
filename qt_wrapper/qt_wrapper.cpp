@@ -187,74 +187,158 @@ long long _qt_add_button(long long window, long long text) {
 }
 
 // ============================================================================
-// Signals & Slots API (WP6)
+// Signals & Slots API (WP6) - Event-Marker System
 // ============================================================================
 
-// Global callback registry
-static std::map<void*, std::function<void()>> g_callback_registry;
+// Event-Marker: Qt setzt Marker für Events, Lyx pollt und resettet
+// Dies ist der Kern für Cross-Language-Callbacks ohne function<>
 
-// qt_signal_connect(source, signal_name, callback) — generic signal connection
-long long _qt_signal_connect(long long source, long long signal_name, long long callback) {
-    if (!source || !callback) return -1;
-    // Store callback in registry (simplified - not connected to Qt signal yet)
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    g_callback_registry[(void*)source] = cb;
-    return 0;
+static long long g_last_clicked_widget = 0;
+static long long g_last_triggered_action = 0;
+static long long g_last_toggled_checkbox = 0;
+static long long g_last_slider_value = 0;
+
+/// qt_action_create_with_callback — erstelle Action mit Callback-ID
+extern "C" 
+long long _qt_action_create_with_callback(const char* title, long long callback_id) {
+    QAction* act = new QAction(title ? QString::fromUtf8(title) : QString(), nullptr);
+    act->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(act, &QAction::triggered, [act]() {
+        g_last_triggered_action = (long long)(void*)act;
+    });
+    
+return (long long)(void*)act;
 }
 
-// qt_button_on_clicked(button, callback) — connect button clicked to callback
-long long _qt_button_on_clicked(long long button, long long callback) {
-    if (!button || !callback) return -1;
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    QObject::connect((QPushButton*)button, &QPushButton::clicked, [cb]() {
-        cb();
+// qt_button_on_clicked(button, callback_id) — connect button to event marker (WP6)
+extern "C"
+long long _qt_button_on_clicked(long long button, long long callback_id) {
+    if (!button) return -1;
+    QPushButton* btn = (QPushButton*)button;
+    btn->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(btn, &QPushButton::clicked, [btn]() {
+        g_last_clicked_widget = (long long)(void*)btn;
     });
     return 0;
 }
 
-// qt_lineedit_on_textchanged(lineedit, callback) — connect text changed to callback
-long long _qt_lineedit_on_textchanged(long long lineedit, long long callback) {
-    if (!lineedit || !callback) return -1;
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    QObject::connect((QLineEdit*)lineedit, &QLineEdit::textChanged, [cb]() {
-        cb();
+// qt_button_was_clicked(button) — poll and reset button clicked state (WP6)
+extern "C"
+long long _qt_button_was_clicked(long long button) {
+    if (!button) return 0;
+    if (g_last_clicked_widget == button) {
+        g_last_clicked_widget = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// qt_action_was_triggered(action) — poll and reset action triggered state (WP6)
+extern "C"
+long long _qt_action_was_triggered(long long action) {
+    if (!action) return 0;
+    if (g_last_triggered_action == action) {
+        g_last_triggered_action = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// CheckBox Signals (WP6)
+// ============================================================================
+
+// qt_checkbox_on_toggled(checkbox, callback_id) — connect checkbox toggled to event marker
+extern "C"
+long long _qt_checkbox_on_toggled(long long checkbox, long long callback_id) {
+    if (!checkbox) return -1;
+    QCheckBox* cb = (QCheckBox*)checkbox;
+    cb->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(cb, &QCheckBox::toggled, [cb]() {
+        g_last_toggled_checkbox = (long long)(void*)cb;
     });
     return 0;
 }
 
-// qt_lineedit_on_returnpressed(lineedit, callback) — connect return pressed to callback
-long long _qt_lineedit_on_returnpressed(long long lineedit, long long callback) {
-    if (!lineedit || !callback) return -1;
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    QObject::connect((QLineEdit*)lineedit, &QLineEdit::returnPressed, [cb]() {
-        cb();
+// qt_checkbox_was_toggled(checkbox) — poll and reset checkbox toggled state
+extern "C"
+long long _qt_checkbox_was_toggled(long long checkbox) {
+    if (!checkbox) return 0;
+    if (g_last_toggled_checkbox == checkbox) {
+        g_last_toggled_checkbox = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// qt_checkbox_state(checkbox) — get current checkbox state (0=unchecked, 1=checked)
+extern "C"
+long long _qt_checkbox_state(long long checkbox) {
+    if (!checkbox) return 0;
+    return ((QCheckBox*)checkbox)->isChecked() ? 1 : 0;
+}
+
+// ============================================================================
+// Slider Signals (WP6)
+// ============================================================================
+
+// qt_slider_on_valuechanged(slider, callback_id) — connect slider valueChanged to event marker
+extern "C"
+long long _qt_slider_on_valuechanged(long long slider, long long callback_id) {
+    if (!slider) return -1;
+    QSlider* sl = (QSlider*)slider;
+    sl->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(sl, &QSlider::valueChanged, [sl](int value) {
+        Q_UNUSED(value);
+        g_last_slider_value = (long long)(void*)sl;
     });
     return 0;
 }
 
-// qt_checkbox_on_toggled(checkbox, callback) — connect toggled to callback
-long long _qt_checkbox_on_toggled(long long checkbox, long long callback) {
-    if (!checkbox || !callback) return -1;
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    QObject::connect((QCheckBox*)checkbox, &QCheckBox::toggled, [cb]() {
-        cb();
+// qt_slider_was_changed(slider) — poll and reset slider changed state
+extern "C"
+long long _qt_slider_was_changed(long long slider) {
+    if (!slider) return 0;
+    if (g_last_slider_value == slider) {
+        g_last_slider_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// LineEdit Signals (WP6)
+// ============================================================================
+
+// Global für LineEdit Textänderungen
+static long long g_last_edited_lineedit = 0;
+static QString g_lineedit_text_buffer;
+
+// qt_lineedit_on_text_changed(lineedit, callback_id) — connect textChanged to event marker
+extern "C"
+long long _qt_lineedit_on_text_changed(long long lineedit, long long callback_id) {
+    if (!lineedit) return -1;
+    QLineEdit* le = (QLineEdit*)lineedit;
+    le->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(le, &QLineEdit::textChanged, [le]() {
+        g_last_edited_lineedit = (long long)(void*)le;
     });
     return 0;
 }
 
-// qt_slider_on_valuechanged(slider, callback) — connect value changed to callback
-long long _qt_slider_on_valuechanged(long long slider, long long callback) {
-    if (!slider || !callback) return -1;
-    std::function<void()> cb = *(std::function<void()>*)&callback;
-    QObject::connect((QSlider*)slider, &QSlider::valueChanged, [cb]() {
-        cb();
-    });
-    return 0;
-}
-
-// qt_button_clicked(button) — legacy polling (deprecated, use qt_button_on_clicked)
-long long _qt_button_clicked(long long button) {
-    (void)button;
+// qt_lineedit_was_changed(lineedit) — poll and reset lineedit changed state
+extern "C"
+long long _qt_lineedit_was_changed(long long lineedit) {
+    if (!lineedit) return 0;
+    if (g_last_edited_lineedit == lineedit) {
+        g_last_edited_lineedit = 0;
+        return 1;
+    }
     return 0;
 }
 
