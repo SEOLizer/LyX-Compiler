@@ -32,6 +32,8 @@
 #include <QProgressBar>
 #include <QListWidget>
 #include <QSplitter>
+#include <map>
+#include <functional>
 #include <cstring>
 
 // ============================================================================
@@ -175,13 +177,74 @@ long long _qt_add_button(long long window, long long text) {
     return (long long)(void*)btn;
 }
 
-// qt_button_clicked(button) — check if button was clicked (non-blocking poll).
-// Note: requires event processing (qt_process_events) to fire signals.
-// Returns: 1 if clicked since last check, 0 otherwise.
-// (Simple polling approach — no signals/slots needed from Lyx side.)
+// ============================================================================
+// Signals & Slots API (WP6)
+// ============================================================================
+
+// Global callback registry
+static std::map<void*, std::function<void()>> g_callback_registry;
+
+// qt_signal_connect(source, signal_name, callback) — generic signal connection
+long long _qt_signal_connect(long long source, long long signal_name, long long callback) {
+    if (!source || !callback) return -1;
+    // Store callback in registry (simplified - not connected to Qt signal yet)
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    g_callback_registry[(void*)source] = cb;
+    return 0;
+}
+
+// qt_button_on_clicked(button, callback) — connect button clicked to callback
+long long _qt_button_on_clicked(long long button, long long callback) {
+    if (!button || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QPushButton*)button, &QPushButton::clicked, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_lineedit_on_textchanged(lineedit, callback) — connect text changed to callback
+long long _qt_lineedit_on_textchanged(long long lineedit, long long callback) {
+    if (!lineedit || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QLineEdit*)lineedit, &QLineEdit::textChanged, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_lineedit_on_returnpressed(lineedit, callback) — connect return pressed to callback
+long long _qt_lineedit_on_returnpressed(long long lineedit, long long callback) {
+    if (!lineedit || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QLineEdit*)lineedit, &QLineEdit::returnPressed, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_checkbox_on_toggled(checkbox, callback) — connect toggled to callback
+long long _qt_checkbox_on_toggled(long long checkbox, long long callback) {
+    if (!checkbox || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QCheckBox*)checkbox, &QCheckBox::toggled, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_slider_on_valuechanged(slider, callback) — connect value changed to callback
+long long _qt_slider_on_valuechanged(long long slider, long long callback) {
+    if (!slider || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QSlider*)slider, &QSlider::valueChanged, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_button_clicked(button) — legacy polling (deprecated, use qt_button_on_clicked)
 long long _qt_button_clicked(long long button) {
-    // For full click detection, connect clicked() signal to a C callback.
-    // This stub requires qt_process_events() to be called in a loop.
     (void)button;
     return 0;
 }
