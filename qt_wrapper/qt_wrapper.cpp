@@ -339,7 +339,10 @@ class QtMenuHelper {
 public:
     static long long create_menubar(long long window) {
         if (!window) return 0;
-        QMenuBar* mb = new QMenuBar((QWidget*)window);
+        QMainWindow* win = (QMainWindow*)window;
+        // Create a NEW menu bar and set it on the window
+        QMenuBar* mb = new QMenuBar(win);
+        win->setMenuBar(mb); // IMPORTANT: This makes it visible!
         return (long long)(void*)mb;
     }
     
@@ -350,16 +353,22 @@ public:
     
     static long long add_menu_to_menubar(long long menubar, long long menu) {
         if (!menubar || !menu) return -1;
-        ((QMenuBar*)menubar)->addMenu((QMenu*)menu);
+        QMenuBar* mb = (QMenuBar*)menubar;
+        QMenu* m = (QMenu*)menu;
+        mb->addMenu(m);  // Add menu to menu bar
         return 0;
     }
     
     static long long create_action(const char* title, long long callback) {
         QAction* act = new QAction(title ? QString::fromUtf8(title) : QString());
-        if (callback) {
-            std::function<void()> cb = *(std::function<void()>*)&callback;
-            QObject::connect(act, &QAction::triggered, [cb]() { cb(); });
-        }
+        // Only try to connect if callback is non-zero and looks valid
+        // (this is a heuristic - real fix needs proper callback trampoline)
+        // if (callback && callback != 0x1) {
+        //     std::function<void()> cb = *(std::function<void()>*)&callback;
+        //     QObject::connect(act, &QAction::triggered, [cb]() { cb(); });
+        // }
+        // For now, don't try to connect any callbacks - just create the action
+        Q_UNUSED(callback);  // Silence unused warning
         return (long long)(void*)act;
     }
     
@@ -371,7 +380,14 @@ public:
     
     static long long create_toolbar(long long window, const char* title) {
         if (!window) return 0;
-        QToolBar* tb = new QToolBar(title ? QString::fromUtf8(title) : QString(), (QWidget*)window);
+        QMainWindow* win = (QMainWindow*)window;
+        // Create toolbar with window as parent - critical for proper lifetime
+        QToolBar* tb = new QToolBar(
+            title ? QString::fromUtf8(title) : QString("Toolbar"), win);
+        // Add toolbar to window - this makes it visible and properly manages lifetime
+        win->addToolBar(tb);
+        // Set toolbar to be movable (optional - can remove if preferred)
+        tb->setMovable(true);
         return (long long)(void*)tb;
     }
     
@@ -411,6 +427,16 @@ public:
         if (result.isEmpty()) return nullptr;
         return new QString(result);
     }
+    
+    static QString* input_dialog(const char* title, const char* label, const char* default_text) {
+        QString result = QInputDialog::getText(nullptr,
+            title ? QString::fromUtf8(title) : QString("Input"),
+            label ? QString::fromUtf8(label) : QString("Enter value:"),
+            QLineEdit::Normal,
+            default_text ? QString::fromUtf8(default_text) : QString());
+        if (result.isEmpty()) return nullptr;
+        return new QString(result);
+    }
 };
 
 // C wrapper - ruft die C++ Klasse auf
@@ -431,7 +457,10 @@ long long _qt_file_save_dialog(long long p, long long t, long long f) {
     QString* s = QtMenuHelper::file_save_dialog((char*)t, (char*)f);
     return (long long)(void*)s;
 }
-long long _qt_input_dialog(long long p, long long t, long long l, long long d) { (void)p;(void)t;(void)l;(void)d; return 0; }
+long long _qt_input_dialog(long long p, long long t, long long l, long long d) { 
+    QString* s = QtMenuHelper::input_dialog((char*)t, (char*)l, (char*)d);
+    return (long long)(void*)s;
+}
 } // extern "C"
 
 // ============================================================================
