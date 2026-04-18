@@ -1,0 +1,223 @@
+// Test: Convert MP3 to WAV and play 30 seconds
+import std.audio;
+import std.audio.mpg123;
+import std.audio.alsa;
+
+pub fn main(): int64 {
+  PrintStr("=== MP3 to WAV to Playback (30 seconds) ===\n");
+
+  var mp3Path: pchar := "/home/andreas/PhpstormProjects/aurum/music_test.mp3";
+  var wavPath: pchar := "/tmp/playback_30s.wav";
+
+  // Step 1: Get MP3 format
+  PrintStr("1. Getting MP3 format...\n");
+
+  mpg123_init();
+  var handle: int64;
+  handle := mpg123_new(0, 0);
+
+  var res: int64;
+  res := mpg123_open(handle, mp3Path);
+
+  var ratePtr: int64;
+  var chanPtr: int64;
+  var encPtr: int64;
+  ratePtr := mmap(0, 8, 3, 34, -1, 0);
+  chanPtr := mmap(0, 8, 3, 34, -1, 0);
+  encPtr  := mmap(0, 8, 3, 34, -1, 0);
+
+  res := mpg123_getformat(handle, ratePtr, chanPtr, encPtr);
+
+  var sampleRate: int64;
+  sampleRate := peek64(ratePtr);
+  var channels: int64;
+  channels := peek64(chanPtr);
+
+  PrintStr("   Sample Rate: ");
+  PrintInt(sampleRate);
+  PrintStr(" Hz\n");
+  PrintStr("   Channels: ");
+  PrintInt(channels);
+  PrintStr("\n");
+
+  munmap(ratePtr, 8);
+  munmap(chanPtr, 8);
+  munmap(encPtr, 8);
+
+  // Close and re-open with fixed S16 format
+  mpg123_close(handle);
+
+  // Step 2: Decode MP3 (up to 10 MB)
+  PrintStr("2. Decoding MP3...\n");
+
+  res := mpg123_open_fixed(handle, mp3Path, channels, MPG123_ENC_SIGNED_16);
+
+  var buf: int64;
+  buf := mmap(0, 10485760, 3, 34, -1, 0);
+  var done: int64;
+  done := mmap(0, 8, 3, 34, -1, 0);
+
+  var total: int64;
+  total := 0;
+
+  while (total < 10485760) {
+    res := mpg123_read(handle, buf + total, 16384, done);
+
+    if (res == MPG123_DONE) {
+      break;
+    }
+    if (res < 0 and res != MPG123_NEW_FORMAT) {
+      PrintStr("   Decode error: ");
+      PrintInt(res);
+      PrintStr("\n");
+      munmap(buf, 10485760);
+      munmap(done, 8);
+      mpg123_close(handle);
+      mpg123_delete(handle);
+      mpg123_exit();
+      return 1;
+    }
+
+    var bytesRead: int64;
+    bytesRead := peek64(done);
+    if (bytesRead > 0) {
+      total := total + bytesRead;
+    }
+  }
+
+  PrintStr("   Decoded: ");
+  PrintInt(total);
+  PrintStr(" bytes\n");
+
+  // Step 3: Limit to 30 seconds
+  // 30s * sampleRate * channels * 2 bytes/sample
+  var maxBytes: int64;
+  maxBytes := 30 * sampleRate * channels * 2;
+
+  var saveBytes: int64;
+  if (total > maxBytes) {
+    saveBytes := maxBytes;
+  } else {
+    saveBytes := total;
+  }
+
+  PrintStr("   Saving ");
+  PrintInt(saveBytes / (sampleRate * channels * 2));
+  PrintStr(" sec (");
+  PrintInt(saveBytes);
+  PrintStr(" bytes)...\n");
+
+  // Step 4: Save WAV
+  PrintStr("3. Saving WAV...\n");
+
+  res := WAVSaveFile(wavPath, buf, saveBytes, sampleRate, channels, 16);
+
+  munmap(buf, 10485760);
+  munmap(done, 8);
+  mpg123_close(handle);
+  mpg123_delete(handle);
+  mpg123_exit();
+
+  if (res != 0) {
+    PrintStr("   ERROR: Cannot save WAV\n");
+    return 1;
+  }
+
+  PrintStr("   Saved: ");
+  PrintStr(wavPath);
+  PrintStr("\n");
+
+  // Step 5: Play via ALSA
+  PrintStr("4. Playing...\n");
+
+  var fd: int64;
+  fd := open(wavPath, 0, 0);
+  lseek(fd, 44, SEEK_SET);  // Skip WAV header
+
+  var playBuf: int64;
+  playBuf := mmap(0, saveBytes, 3, 34, -1, 0);
+
+  var bytesRead2: int64;
+  bytesRead2 := sys_read(fd, playBuf, saveBytes);
+  close(fd);
+
+  PrintStr("   Read: ");
+  PrintInt(bytesRead2);
+  PrintStr(" bytes = ");
+  PrintInt(bytesRead2 / (sampleRate * channels * 2));
+  PrintStr(" sec\n");
+
+  // Open ALSA
+  var hp: int64;
+  hp := mmap(0, 8, 3, 34, -1, 0);
+  res := snd_pcm_open(hp, "hw:0", 0, 0);
+
+  if (res != 0) {
+    PrintStr("   ERROR: Cannot open ALSA\n");
+    munmap(playBuf, saveBytes);
+    return 1;
+  }
+
+  var alsaHandle: int64;
+  alsaHandle := peek64(hp);
+  munmap(hp, 8);
+
+  // Set ALSA params
+  var pp: int64;
+  pp := mmap(0, 8, 3, 34, -1, 0);
+  snd_pcm_hw_params_malloc(pp);
+  var params: int64;
+  params := peek64(pp);
+
+  snd_pcm_hw_params_any(alsaHandle, params);
+  snd_pcm_hw_params_set_access(alsaHandle, params, 3);
+  snd_pcm_hw_params_set_format(alsaHandle, params, 2);  // S16_LE
+
+  // snd_pcm_hw_params_set_rate_near expects unsigned int* — pass pointer, not value
+  var ratePtr2: int64;
+  ratePtr2 := mmap(0, 8, 3, 34, -1, 0);
+  poke32(ratePtr2, sampleRate);
+  snd_pcm_hw_params_set_rate_near(alsaHandle, params, ratePtr2, 0);
+  var alsaRate: int64;
+  alsaRate := peek32(ratePtr2);
+  munmap(ratePtr2, 8);
+  PrintStr("   ALSA rate set to: ");
+  PrintInt(alsaRate);
+  PrintStr(" Hz\n");
+
+  snd_pcm_hw_params_set_channels(alsaHandle, params, channels);
+  res := snd_pcm_hw_params(alsaHandle, params);
+
+  if (res != 0) {
+    PrintStr("   ERROR: Cannot set ALSA params\n");
+    snd_pcm_close(alsaHandle);
+    snd_pcm_hw_params_free(params);
+    munmap(pp, 8);
+    munmap(playBuf, saveBytes);
+    return 1;
+  }
+
+  snd_pcm_hw_params_free(params);
+  munmap(pp, 8);
+
+  // Play frames (frame = channels * 2 bytes)
+  var frames: int64;
+  frames := bytesRead2 / (channels * 2);
+
+  PrintStr("   Frames: ");
+  PrintInt(frames);
+  PrintStr("\n");
+
+  res := snd_pcm_writei(alsaHandle, playBuf, frames);
+
+  PrintStr("   Written: ");
+  PrintInt(res);
+  PrintStr(" frames\n");
+
+  snd_pcm_drain(alsaHandle);
+  snd_pcm_close(alsaHandle);
+  munmap(playBuf, saveBytes);
+
+  PrintStr("=== Done ===\n");
+  return 0;
+}
