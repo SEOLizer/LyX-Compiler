@@ -683,4 +683,68 @@ long long _qt_widget_set_max_size(long long widget, long long width, long long h
     return 0;
 }
 
+// ============================================================================
+// Container: Add widget to parent
+// ============================================================================
+
+// qt_widget_add_to(widget, parent) — add a widget as child of parent.
+// parent: QWidget* or QMainWindow* (for main window, use setCentralWidget)
+long long _qt_widget_add_to(long long widget, long long parent) {
+    if (!widget || !parent) return -1;
+    // Try to cast to QMainWindow, otherwise use QWidget
+    QMainWindow* mainWin = qobject_cast<QMainWindow*>((QWidget*)parent);
+    if (mainWin) {
+        mainWin->setCentralWidget((QWidget*)widget);
+    } else {
+        ((QWidget*)widget)->setParent((QWidget*)parent);
+    }
+    return 0;
+}
+
+// qt_widget_set_layout(widget, layout) — set layout on a widget.
+// layout: QLayout* (from qt_vbox_create, etc. - not yet implemented)
+long long _qt_widget_set_layout(long long widget, long long layout) {
+    if (!widget) return -1;
+    // Not yet implemented - requires layout functions from WP5
+    (void)layout;
+    return -1;
+}
+
+// ============================================================================
+// Quick layout: add widgets to a simple vertical container
+// ============================================================================
+
+// qt_container_create_vbox(parent) — create a QWidget with vertical layout.
+// This is a quick workaround before full WP5 layout support.
+// Returns: QWidget* with QVBoxLayout set, as int64
+long long _qt_container_create_vbox(long long parent) {
+    QWidget* p = parent ? (QWidget*)parent : nullptr;
+    QWidget* container = new QWidget(p);
+    QVBoxLayout* layout = new QVBoxLayout(container);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(5);
+    container->setLayout(layout);
+    return (long long)(void*)container;
+}
+
+// qt_container_vbox_add_widget(container, widget) — add widget to vbox container.
+long long _qt_container_vbox_add_widget(long long container, long long widget) {
+    if (!container || !widget) return -1;
+    QLayout* layout = ((QWidget*)container)->layout();
+    if (layout) {
+        layout->addWidget((QWidget*)widget);
+    }
+    return 0;
+}
+
+// qt_container_vbox_add_spacer(container, height) — add a spacer.
+long long _qt_container_vbox_add_spacer(long long container, long long height) {
+    if (!container) return -1;
+    QLayout* layout = ((QWidget*)container)->layout();
+    if (layout) {
+        layout->addItem(new QSpacerItem(100, (int)height, QSizePolicy::Minimum, QSizePolicy::Expanding));
+    }
+    return 0;
+}
+
 } // extern "C"
