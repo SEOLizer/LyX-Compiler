@@ -102,7 +102,7 @@ begin
   
   RunCommandAndGetOutput('./lyxc --version', output, exitCode);
   AssertTrue('TOR-001: Exit code 0', exitCode = 0);
-  AssertContains('TOR-001: Version number present', output, '0.6.0');
+  AssertContains('TOR-001: Version number present', output, '0.8.1');
   AssertContains('TOR-001: SemVer format', output, '.');
 end;
 
@@ -119,7 +119,7 @@ begin
   
   RunCommandAndGetOutput('./lyxc --build-info', output, exitCode);
   AssertTrue('TOR-002: Exit code 0', exitCode = 0);
-  AssertContains('TOR-002: Version present', output, '0.6.0');
+  AssertContains('TOR-002: Version present', output, '0.8.1');
   AssertContains('TOR-002: TQL level present', output, 'TQL-5');
   AssertContains('TOR-002: Build OS present', output, 'Linux');
   AssertContains('TOR-002: Deterministic flag', output, 'Deterministic');

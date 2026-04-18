@@ -782,6 +782,21 @@ begin
   for i := 0 to High(module.GlobalVars) do
     globalVarNames.Add(module.GlobalVars[i].Name);
   totalDataOffset := 0;
+  // Pre-allocate user-declared globals in FData (writable section).
+  // This fixes dynamic ELF: code segment is R+X (read-only), data segment is RW.
+  for i := 0 to High(module.GlobalVars) do
+  begin
+    globalVarOffsets[i] := FData.Size;
+    if module.GlobalVars[i].IsArray then
+    begin
+      for k := 0 to module.GlobalVars[i].ArrayLen - 1 do
+        FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[k]));
+    end
+    else if module.GlobalVars[i].HasInitValue then
+      FData.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
+    else
+      FData.WriteU64LE(0);
+  end;
   excValueIdx := -1;
   excDepthIdx := -1;
   excJmpbufsIdx := -1;
@@ -1187,6 +1202,7 @@ begin
              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+             FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
              // mov rax, [rax]
              EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $00);
              // Store into temp slot
@@ -1217,6 +1233,7 @@ begin
              SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
              FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+             FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
              // mov [rcx], rax
              EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
            end;
@@ -1301,6 +1318,7 @@ begin
                   SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
                   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := varIdx;
                   FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+                  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
                   // Store the ADDRESS into temp slot
                   slotIdx := fn.LocalCount + instr.Dest;
                   WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
@@ -7607,26 +7625,10 @@ begin
       for k := 0 to 127 do FCode.WriteU64LE(0);
     end;
 
-    // Write global variables to end of code buffer
-    for i := 0 to High(module.GlobalVars) do
-    begin
-      globalVarOffsets[i] := FCode.Size;
-      if module.GlobalVars[i].IsArray then
-      begin
-        // Write array values
-        for k := 0 to module.GlobalVars[i].ArrayLen - 1 do
-          FCode.WriteU64LE(UInt64(module.GlobalVars[i].InitValues[k]));
-      end
-      else
-      begin
-        // Write scalar value
-        if module.GlobalVars[i].HasInitValue then
-          FCode.WriteU64LE(UInt64(module.GlobalVars[i].InitValue))
-        else
-          FCode.WriteU64LE(0);
-      end;
-    end;
-    
+    // Global variables are now pre-allocated in FData (writable section) during
+    // initialization — see pre-allocation loop after module.GlobalVars setup.
+    // globalVarOffsets[i] already holds the correct FData offsets.
+
     // Now patch all global variable LEA instructions
     for i := 0 to High(FGlobalVarLeaPositions) do
     begin
