@@ -241,6 +241,11 @@ pub type Codegen = class {
   capturedCount:     int64;
   capturedCap:       int64;
 
+  // Global variable table: {namePtr:8, nameLen:8, dataOff:8} = 24 bytes per entry
+  globalVars:     int64;
+  globalVarCount: int64;
+  globalVarCap:   int64;
+
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
   // ------------------------------------------------------------------
@@ -403,6 +408,55 @@ pub type Codegen = class {
       i := i - 1;
     }
     return -1;
+  }
+
+  // Global variable table helpers
+  fn cg_addGlobal(name: pchar, nlen: int64): int64 {
+    if (self.globalVarCount >= self.globalVarCap) {
+      var nc: int64 := self.globalVarCap * 2;
+      var nb: int64 := mmap(0, nc * 24, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.globalVarCount * 24) { poke8(nb + i, peek8(self.globalVars + i)); i := i + 1; }
+      self.globalVars := nb; self.globalVarCap := nc;
+    }
+    var doff: int64 := self.dataLen;
+    // Reserve 8 zero bytes in data section (mmap is zero-initialized)
+    var j: int64 := 0;
+    while (j < 8) { self.cg_edata(0); j := j + 1; }
+    var base: int64 := self.globalVars + self.globalVarCount * 24;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nlen);
+    poke64(base + 16, doff);
+    self.globalVarCount := self.globalVarCount + 1;
+    return doff;
+  }
+
+  fn cg_findGlobal(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.globalVarCount) {
+      var base: int64 := self.globalVars + i * 24;
+      var gname: pchar := peek64(base) as pchar;
+      var glen:  int64 := peek64(base + 8);
+      if (self.cg_seq(gname, glen, name, nlen)) { return peek64(base + 16); }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // mov rax, [rip+disp32]
+  fn cg_loadRaxGlobal(dataOff: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
+  }
+
+  // mov [rip+disp32], rax
+  fn cg_storeRaxGlobal(dataOff: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
   }
 
   // Returns 1 if the CGN_IDENT node ni refers to an array-typed local
@@ -1615,20 +1669,30 @@ pub type Codegen = class {
               self.cg_e32(capturedOff);
             }
           } else {
-            // Not local and not captured - check for constant
+            // Not local and not captured - check global, then constant
+            var goff1: int64 := self.cg_findGlobal(name, nlen);
+            if (goff1 >= 0) {
+              self.cg_loadRaxGlobal(goff1);
+            } else {
+              var conVal: int64 := self.cg_findConVal(name, nlen);
+              if (conVal != -1) {
+                self.cg_movRaxImm(conVal);
+              } else {
+                self.cg_zeroRax();
+              }
+            }
+          }
+        } else {
+          var goff2: int64 := self.cg_findGlobal(name, nlen);
+          if (goff2 >= 0) {
+            self.cg_loadRaxGlobal(goff2);
+          } else {
             var conVal: int64 := self.cg_findConVal(name, nlen);
             if (conVal != -1) {
               self.cg_movRaxImm(conVal);
             } else {
               self.cg_zeroRax();
             }
-          }
-        } else {
-          var conVal: int64 := self.cg_findConVal(name, nlen);
-          if (conVal != -1) {
-            self.cg_movRaxImm(conVal);
-          } else {
-            self.cg_zeroRax();
           }
         }
       }
@@ -2154,7 +2218,12 @@ pub type Codegen = class {
         var name: pchar := self.cg_nsval(lhs);
         var nlen: int64 := self.cg_nslen(lhs);
         var off: int64 := self.cg_findLocal(name, nlen);
-        if (off != 0) { self.cg_storeRax(off); }
+        if (off != 0) {
+          self.cg_storeRax(off);
+        } else {
+          var goff: int64 := self.cg_findGlobal(name, nlen);
+          if (goff >= 0) { self.cg_storeRaxGlobal(goff); }
+        }
       } else if (self.cg_nkind(lhs) == CGN_FIELD) {
         // obj.field := rhs
         self.cg_genExpr(rhs);
@@ -3482,6 +3551,9 @@ pub type Codegen = class {
       } else if (k == CGN_ENUM_DECL) {
         // BUG-08: Enum declaration: register variant layout for match analysis
         self.cg_buildEnumLayout(cur);
+      } else if (k == CGN_VAR_DECL) {
+        // Global variable: allocate 8 bytes in data section, register in global table
+        self.cg_addGlobal(self.cg_nsval(cur), self.cg_nslen(cur));
       } else if (k == CGN_CON_DECL) {
         // Populate constant table for use inside method bodies
         var initNode: int64 := self.cg_nc1(cur);
@@ -3594,6 +3666,11 @@ pub type Codegen = class {
     self.capturedCap   := 64;
     self.capturedVars  := mmap(0, self.capturedCap * 40, 3, 34, -1, 0);
     self.capturedCount := 0;
+
+    // Global variable table
+    self.globalVarCap   := 64;
+    self.globalVars     := mmap(0, self.globalVarCap * 24, 3, 34, -1, 0);
+    self.globalVarCount := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
