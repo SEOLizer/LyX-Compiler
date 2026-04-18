@@ -31,6 +31,9 @@
 #include <QComboBox>
 #include <QProgressBar>
 #include <QListWidget>
+#include <QSplitter>
+#include <map>
+#include <functional>
 #include <cstring>
 
 // ============================================================================
@@ -174,13 +177,74 @@ long long _qt_add_button(long long window, long long text) {
     return (long long)(void*)btn;
 }
 
-// qt_button_clicked(button) — check if button was clicked (non-blocking poll).
-// Note: requires event processing (qt_process_events) to fire signals.
-// Returns: 1 if clicked since last check, 0 otherwise.
-// (Simple polling approach — no signals/slots needed from Lyx side.)
+// ============================================================================
+// Signals & Slots API (WP6)
+// ============================================================================
+
+// Global callback registry
+static std::map<void*, std::function<void()>> g_callback_registry;
+
+// qt_signal_connect(source, signal_name, callback) — generic signal connection
+long long _qt_signal_connect(long long source, long long signal_name, long long callback) {
+    if (!source || !callback) return -1;
+    // Store callback in registry (simplified - not connected to Qt signal yet)
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    g_callback_registry[(void*)source] = cb;
+    return 0;
+}
+
+// qt_button_on_clicked(button, callback) — connect button clicked to callback
+long long _qt_button_on_clicked(long long button, long long callback) {
+    if (!button || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QPushButton*)button, &QPushButton::clicked, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_lineedit_on_textchanged(lineedit, callback) — connect text changed to callback
+long long _qt_lineedit_on_textchanged(long long lineedit, long long callback) {
+    if (!lineedit || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QLineEdit*)lineedit, &QLineEdit::textChanged, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_lineedit_on_returnpressed(lineedit, callback) — connect return pressed to callback
+long long _qt_lineedit_on_returnpressed(long long lineedit, long long callback) {
+    if (!lineedit || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QLineEdit*)lineedit, &QLineEdit::returnPressed, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_checkbox_on_toggled(checkbox, callback) — connect toggled to callback
+long long _qt_checkbox_on_toggled(long long checkbox, long long callback) {
+    if (!checkbox || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QCheckBox*)checkbox, &QCheckBox::toggled, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_slider_on_valuechanged(slider, callback) — connect value changed to callback
+long long _qt_slider_on_valuechanged(long long slider, long long callback) {
+    if (!slider || !callback) return -1;
+    std::function<void()> cb = *(std::function<void()>*)&callback;
+    QObject::connect((QSlider*)slider, &QSlider::valueChanged, [cb]() {
+        cb();
+    });
+    return 0;
+}
+
+// qt_button_clicked(button) — legacy polling (deprecated, use qt_button_on_clicked)
 long long _qt_button_clicked(long long button) {
-    // For full click detection, connect clicked() signal to a C callback.
-    // This stub requires qt_process_events() to be called in a loop.
     (void)button;
     return 0;
 }
@@ -701,15 +765,6 @@ long long _qt_widget_add_to(long long widget, long long parent) {
     return 0;
 }
 
-// qt_widget_set_layout(widget, layout) — set layout on a widget.
-// layout: QLayout* (from qt_vbox_create, etc. - not yet implemented)
-long long _qt_widget_set_layout(long long widget, long long layout) {
-    if (!widget) return -1;
-    // Not yet implemented - requires layout functions from WP5
-    (void)layout;
-    return -1;
-}
-
 // ============================================================================
 // Quick layout: add widgets to a simple vertical container
 // ============================================================================
@@ -723,6 +778,10 @@ long long _qt_container_create_vbox(long long parent) {
     QVBoxLayout* layout = new QVBoxLayout(container);
     layout->setContentsMargins(10, 10, 10, 10);
     layout->setSpacing(5);
+    // Make container expand to fill available space
+    container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    // Set minimum size to ensure visibility
+    container->setMinimumSize(200, 100);
     container->setLayout(layout);
     return (long long)(void*)container;
 }
@@ -744,6 +803,212 @@ long long _qt_container_vbox_add_spacer(long long container, long long height) {
     if (layout) {
         layout->addItem(new QSpacerItem(100, (int)height, QSizePolicy::Minimum, QSizePolicy::Expanding));
     }
+    return 0;
+}
+
+// ============================================================================
+// Layout Managers (WP5)
+// ============================================================================
+
+// --- QHBoxLayout ---
+
+// qt_hbox_create() — create a standalone horizontal layout.
+// Returns: QHBoxLayout* as int64
+long long _qt_hbox_create(void) {
+    QHBoxLayout* layout = new QHBoxLayout();
+    return (long long)(void*)layout;
+}
+
+// qt_hbox_add_widget(layout, widget) — add widget to hbox layout.
+long long _qt_hbox_add_widget(long long layout, long long widget) {
+    if (!layout || !widget) return -1;
+    ((QHBoxLayout*)layout)->addWidget((QWidget*)widget);
+    return 0;
+}
+
+// qt_hbox_add_layout(layout, child) — add nested layout to hbox.
+long long _qt_hbox_add_layout(long long layout, long long child) {
+    if (!layout || !child) return -1;
+    ((QHBoxLayout*)layout)->addLayout((QLayout*)child);
+    return 0;
+}
+
+// qt_hbox_add_spacer(layout, width, height, h_expand, v_expand) — add spacer.
+long long _qt_hbox_add_spacer(long long layout, long long width, long long height, long long h_expand, long long v_expand) {
+    if (!layout) return -1;
+    QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+    QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+    ((QHBoxLayout*)layout)->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    return 0;
+}
+
+// qt_hbox_set_spacing(layout, spacing) — set spacing between widgets.
+long long _qt_hbox_set_spacing(long long layout, long long spacing) {
+    if (!layout) return -1;
+    ((QHBoxLayout*)layout)->setSpacing((int)spacing);
+    return 0;
+}
+
+// qt_hbox_set_margins(layout, left, top, right, bottom) — set contents margins.
+long long _qt_hbox_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
+    if (!layout) return -1;
+    ((QHBoxLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    return 0;
+}
+
+// --- QGridLayout ---
+
+// qt_grid_create() — create a grid layout.
+// Returns: QGridLayout* as int64
+long long _qt_grid_create(void) {
+    QGridLayout* layout = new QGridLayout();
+    return (long long)(void*)layout;
+}
+
+// qt_grid_add_widget(layout, widget, row, col, rowspan, colspan, alignment) — add widget to grid.
+long long _qt_grid_add_widget(long long layout, long long widget, long long row, long long col, long long rowspan, long long colspan, long long alignment) {
+    if (!layout || !widget) return -1;
+    ((QGridLayout*)layout)->addWidget((QWidget*)widget, (int)row, (int)col, (int)rowspan, (int)colspan, (Qt::AlignmentFlag)(int)alignment);
+    return 0;
+}
+
+// qt_grid_add_layout(layout, child, row, col, rowspan, colspan, alignment) — add nested layout.
+long long _qt_grid_add_layout(long long layout, long long child, long long row, long long col, long long rowspan, long long colspan, long long alignment) {
+    if (!layout || !child) return -1;
+    ((QGridLayout*)layout)->addLayout((QLayout*)child, (int)row, (int)col, (int)rowspan, (int)colspan, (Qt::AlignmentFlag)(int)alignment);
+    return 0;
+}
+
+// qt_grid_set_row_stretch(layout, row, stretch) — set row stretch factor.
+long long _qt_grid_set_row_stretch(long long layout, long long row, long long stretch) {
+    if (!layout) return -1;
+    ((QGridLayout*)layout)->setRowStretch((int)row, (int)stretch);
+    return 0;
+}
+
+// qt_grid_set_column_stretch(layout, col, stretch) — set column stretch factor.
+long long _qt_grid_set_column_stretch(long long layout, long long col, long long stretch) {
+    if (!layout) return -1;
+    ((QGridLayout*)layout)->setColumnStretch((int)col, (int)stretch);
+    return 0;
+}
+
+// qt_grid_set_spacing(layout, spacing) — set horizontal and vertical spacing.
+long long _qt_grid_set_spacing(long long layout, long long spacing) {
+    if (!layout) return -1;
+    ((QGridLayout*)layout)->setSpacing((int)spacing);
+    return 0;
+}
+
+// qt_grid_set_margins(layout, left, top, right, bottom) — set contents margins.
+long long _qt_grid_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
+    if (!layout) return -1;
+    ((QGridLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    return 0;
+}
+
+// --- QVBoxLayout (standalone) ---
+
+// qt_vbox_create() — create a standalone vertical layout.
+// Returns: QVBoxLayout* as int64
+long long _qt_vbox_create(void) {
+    QVBoxLayout* layout = new QVBoxLayout();
+    return (long long)(void*)layout;
+}
+
+// qt_vbox_add_widget(layout, widget) — add widget to vbox layout.
+long long _qt_vbox_add_widget(long long layout, long long widget) {
+    if (!layout || !widget) return -1;
+    ((QVBoxLayout*)layout)->addWidget((QWidget*)widget);
+    return 0;
+}
+
+// qt_vbox_add_layout(layout, child) — add nested layout to vbox.
+long long _qt_vbox_add_layout(long long layout, long long child) {
+    if (!layout || !child) return -1;
+    ((QVBoxLayout*)layout)->addLayout((QLayout*)child);
+    return 0;
+}
+
+// qt_vbox_add_spacer(layout, width, height, h_expand, v_expand) — add spacer.
+long long _qt_vbox_add_spacer(long long layout, long long width, long long height, long long h_expand, long long v_expand) {
+    if (!layout) return -1;
+    QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+    QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+    ((QVBoxLayout*)layout)->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    return 0;
+}
+
+// qt_vbox_set_spacing(layout, spacing) — set spacing between widgets.
+long long _qt_vbox_set_spacing(long long layout, long long spacing) {
+    if (!layout) return -1;
+    ((QVBoxLayout*)layout)->setSpacing((int)spacing);
+    return 0;
+}
+
+// qt_vbox_set_margins(layout, left, top, right, bottom) — set contents margins.
+long long _qt_vbox_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
+    if (!layout) return -1;
+    ((QVBoxLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    return 0;
+}
+
+// --- Set layout on widget ---
+
+// qt_widget_set_layout(widget, layout) — set layout on a QWidget.
+long long _qt_widget_set_layout(long long widget, long long layout) {
+    if (!widget || !layout) return -1;
+    ((QWidget*)widget)->setLayout((QLayout*)layout);
+    return 0;
+}
+
+// ============================================================================
+// QSplitter
+// ============================================================================
+// QSplitter
+// ============================================================================
+
+// qt_splitter_create(parent, orientation) — create a splitter widget.
+// orientation: 0 = Horizontal, 1 = Vertical
+// Returns: QSplitter* as int64
+long long _qt_splitter_create(long long parent, long long orientation) {
+    QWidget* p = parent ? (QWidget*)parent : nullptr;
+    Qt::Orientation o = orientation ? Qt::Vertical : Qt::Horizontal;
+    QSplitter* splitter = new QSplitter(o, p);
+    return (long long)(void*)splitter;
+}
+
+// qt_splitter_add_widget(splitter, widget) — add widget to splitter.
+long long _qt_splitter_add_widget(long long splitter, long long widget) {
+    if (!splitter || !widget) return -1;
+    ((QSplitter*)splitter)->addWidget((QWidget*)widget);
+    return 0;
+}
+
+// qt_splitter_set_stretch(splitter, index, stretch) — set stretch factor.
+long long _qt_splitter_set_stretch(long long splitter, long long index, long long stretch) {
+    if (!splitter) return -1;
+    ((QSplitter*)splitter)->setStretchFactor((int)index, (int)stretch);
+    return 0;
+}
+
+// qt_splitter_set_sizes(splitter, sizes, count) — set sizes of all widgets.
+// sizes: array of int64 values
+long long _qt_splitter_set_sizes(long long splitter, long long sizes, long long count) {
+    if (!splitter || !sizes) return -1;
+    QList<int> list;
+    long long* arr = (long long*)sizes;
+    for (int i = 0; i < (int)count; i++) {
+        list.append((int)arr[i]);
+    }
+    ((QSplitter*)splitter)->setSizes(list);
+    return 0;
+}
+
+// qt_splitter_set_collapsed(splitter, index, collapsed) — collapse or expand a widget.
+long long _qt_splitter_set_collapsed(long long splitter, long long index, long long collapsed) {
+    if (!splitter) return -1;
+    ((QSplitter*)splitter)->setCollapsible((int)index, collapsed != 0);
     return 0;
 }
 
