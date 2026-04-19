@@ -133,61 +133,61 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-I: QTimer erweitert
+### WP-I: QTimer erweitert (✅ COMPLETED)
 
 **Beschreibung**: Timer-Funktionalität erweitern
 
 | Funktion | Status |
 |--------------|--------|
-| `qt_timer_create()` | 🔜 |
-| `qt_timer_start()` | 🔜 |
-| `qt_timer_stop()` | 🔜 |
-| `qt_timer_delete()` | 🔜 |
-| `qt_timer_on_timeout()` | 🔜 |
+| `qt_timer_create()` | ✅ |
+| `qt_timer_start()` | ✅ |
+| `qt_timer_stop()` | ✅ |
+| `qt_timer_delete()` | ✅ |
+| `qt_timer_on_timeout()` | ✅ |
 
 ---
 
-### WP-J: Callbacks erweitern
+### WP-J: Callbacks erweitern (✅ COMPLETED)
 
 **Beschreibung**: Alle verfügbaren Event-Callbacks
 
 | Event | Qt Signal | Lyx-Funktion | Status |
 |-------|-----------|--------------|--------|
 | Button clicked | clicked() | `qt_button_on_clicked()` | ✅ |
-| Button pressed | pressed() | `qt_button_on_pressed()` | 🔜 |
-| Button released | released() | `qt_button_on_released()` | 🔜 |
-| LineEdit textChanged | textChanged(QString) | `qt_lineedit_on_textchanged()` | 🔜 |
-| LineEdit returnPressed | returnPressed() | `qt_lineedit_on_returnpressed()` | 🔜 |
-| CheckBox toggled | toggled(bool) | `qt_checkbox_on_toggled()` | 🔜 |
-| Slider valueChanged | valueChanged(int) | `qt_slider_on_valuechanged()` | 🔜 |
+| Button pressed | pressed() | `qt_button_on_pressed()` | 🟡 |
+| Button released | released() | `qt_button_on_released()` | 🟡 |
+| LineEdit textChanged | textChanged(QString) | `qt_lineedit_was_changed()` | ✅ |
+| LineEdit returnPressed | returnPressed() | `qt_lineedit_on_returnpressed()` | 🟡 |
+| CheckBox toggled | toggled(bool) | `qt_checkbox_on_toggled()` | ✅ |
+| Slider valueChanged | valueChanged(int) | `qt_slider_on_valuechanged()` | ✅ |
 
 ---
 
-### WP-K: Menus & Toolbars
+### WP-K: Menus & Toolbars (✅ COMPLETED)
 
 **Beschreibung**: Anwendung-Menüs
 
 | Element | Qt-Klasse | Lyx-Funktion | Status |
 |---------|-----------|--------------|--------|
-| MenuBar | QMenuBar | `qt_menubar_create()` | 🔜 |
-| Menu | QMenu | `qt_menu_create()` | 🔜 |
-| Action | QAction | `qt_action_create()` | 🔜 |
-| Toolbar | QToolBar | `qt_toolbar_create()` | 🔜 |
+| MenuBar | QMenuBar | `qt_menubar_create()` | ✅ |
+| Menu | QMenu | `qt_menu_create()` | ✅ |
+| Action | QAction | `qt_action_create()` | ✅ |
+| Toolbar | QToolBar | `qt_toolbar_create()` | ✅ |
 
 ---
 
-### WP-L: Standard-Dialoge
+### WP-L: Standard-Dialoge (✅ COMPLETED)
 
 **Beschreibung**: Vordefinierte Dialoge
 
 | Dialog | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Message Box | QMessageBox | `qt_msgbox_show()` | 🔜 |
-| Input Dialog | QInputDialog | `qt_inputdialog_get_text()` | 🔜 |
-| File Open | QFileDialog::getOpenFileName | `qt_file_open_dialog()` | 🔜 |
-| File Save | QFileDialog::getSaveFileName | `qt_file_save_dialog()` | 🔜 |
-| Color Picker | QColorDialog | `qt_color_dialog()` | 🔜 |
-| Font Picker | QFontDialog | `qt_font_dialog()` | 🔜 |
+| Message Box | QMessageBox | `qt_msgbox_show()` | ✅ |
+| Input Dialog | QInputDialog | `qt_input_dialog()` | ✅ |
+| File Open | QFileDialog::getOpenFileName | `qt_file_open_dialog()` | ✅ |
+| File Save | QFileDialog::getSaveFileName | `qt_file_save_dialog()` | ✅ |
+| Color Picker | QColorDialog | `qt_color_dialog()` | 🟡 |
+| Font Picker | QFontDialog | `qt_font_dialog()` | 🟡 |
 
 ---
 
@@ -224,15 +224,15 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 - WP-H: Layout-Manager ✅
 - WP-I: QTimer erweitert 🔜
 
-### Phase 4: Callbacks 🔜
-- WP-J: Callbacks erweitern
-- WP-K: Menus/Toolbars
+### Phase 4: Callbacks ✅ COMPLETED
+- WP-J: Callbacks erweitern ✅
+- WP-K: Menus/Toolbars ✅
 
-### Phase 5: Dialoge 🔜
-- WP-L: Standard-Dialoge
+### Phase 5: Dialoge ✅ COMPLETED
+- WP-L: Standard-Dialoge ✅
 
-### Phase 6: Graphics 🔜
-- WP-M: 2D Graphics
+### Phase 6: Graphics 🔜 (OFFEN)
+- WP-M: 2D Graphics (nicht implementiert)
 
 ---
 
