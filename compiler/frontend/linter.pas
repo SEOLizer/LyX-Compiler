@@ -31,7 +31,8 @@ type
     lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
     lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
     lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
-    lrGlobalMutable     // W021: var auf Modulebene (Race Conditions)
+    lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
+    lrTodoComment       // W022: "// TODO" Kommentare finden
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -59,7 +60,8 @@ const
     lrFunctionTooLong,
     lrComplexFunction,
     lrDeadLoop,
-    lrGlobalMutable
+    lrGlobalMutable,
+    lrTodoComment
   ];
 
   { Human-readable Namen für die Regeln }
@@ -84,7 +86,8 @@ const
     'function-too-long',
     'complex-function',
     'dead-loop',
-    'global-mutable'
+    'global-mutable',
+    'todo-comment'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
@@ -92,7 +95,7 @@ const
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
     'W016', 'W017', 'W018', 'W019', 'W020',
-    'W021'
+    'W021', 'W022'
   );
 
 type
@@ -168,6 +171,7 @@ type
     procedure CheckCyclomaticComplexity(fn: TAstFuncDecl);
     procedure CheckDeadLoop(loop: TAstWhile);
     procedure CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
+    procedure CheckTodoComment(prog: TAstProgram);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -1120,6 +1124,15 @@ begin
         'mutable state at module level may cause race conditions; consider using let or co',
         decl.Span);
   end;
+end;
+
+{ --- W022: TODO Comment Detection (STUB) --- }
+procedure TLinter.CheckTodoComment(prog: TAstProgram);
+begin
+  // TODO: Implement comment scanning
+  // Comments are currently not stored in AST
+  // Future: scan source text for "// TODO" or "/* TODO */" patterns
+  // This would require lexer modifications to preserve comments
 end;
 
 { --- MISRA #19: Max Function Length (60 lines) --- }
