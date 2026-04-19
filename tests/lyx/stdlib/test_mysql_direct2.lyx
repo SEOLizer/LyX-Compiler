@@ -1,0 +1,196 @@
+// MySQL Direct Connect Test - Schritt-für-Schritt Debug
+import std.io;
+import std.net.syscalls;
+import std.string;
+
+pub fn main(): int64 {
+    PrintStr("=== MySQL Direct Connect Test ===\n");
+    
+    var host: pchar := "127.0.0.1";
+    var port: int64 := 3306;
+    var user: pchar := "lyx";
+    var pass: pchar := "test12345";
+    var db: pchar := "lyx";
+    
+    // Schritt 1: Socket
+    PrintStr("1. Create socket... ");
+    var fd: int64 := sys_socket(2, 1, 0);
+    if (fd < 0) { PrintStr("FAILED\n"); return 1; }
+    PrintInt(fd);
+    PrintStr(" OK\n");
+    
+    // Schritt 2: Address
+    PrintStr("2. Create address... ");
+    var addrSize: int64 := 16;
+    var addr: int64 := mmap(0, addrSize, 3, 34, -1, 0);
+    poke8(addr, 2);
+    poke8(addr + 1, 0);
+    poke8(addr + 2, (port >> 8) & 0xFF);
+    poke8(addr + 3, port & 0xFF);
+    poke8(addr + 4, 127);
+    poke8(addr + 5, 0);
+    poke8(addr + 6, 0);
+    poke8(addr + 7, 1);
+    var k: int64 := 0;
+    while (k < 8) { poke8(addr + 8 + k, 0); k := k + 1; }
+    PrintStr("OK\n");
+    
+    // Schritt 3: Connect
+    PrintStr("3. Connect... ");
+    var res: int64 := sys_connect(fd, addr, 16);
+    if (res < 0) { PrintStr("FAILED\n"); return 1; }
+    PrintStr("OK\n");
+    
+    // Schritt 4: Read Handshake
+    PrintStr("4. Read handshake... ");
+    var header: int64 := mmap(0, 4, 3, 34, -1, 0);
+    var n: int64 := sys_read(fd, header, 4);
+    if (n < 4) { PrintStr("FAILED\n"); return 1; }
+    var payLen: int64 := peek8(header) | (peek8(header + 1) << 8) | (peek8(header + 2) << 16);
+    PrintStr("len=");
+    PrintInt(payLen);
+    PrintStr("... ");
+    
+    var payloadSize: int64 := payLen + 1;
+    var payload: int64 := mmap(0, payloadSize, 3, 34, -1, 0);
+    n := sys_read(fd, payload, payLen);
+    if (n <= 0) { PrintStr("READ FAILED\n"); return 1; }
+    
+    var proto: int64 := peek8(payload);
+    if (proto != 10) { PrintStr("BAD PROTO="); PrintInt(proto); PrintStr("\n"); return 1; }
+    PrintStr("OK (proto=10)\n");
+    munmap(header, 4);
+    
+    // Schritt 5: Capabilities
+    PrintStr("5. Build handshake response...\n");
+    
+    // Setze scramble (20 bytes from payload after version string)
+    var serverVer: int64 := payload + 1;
+    var scramblePos: int64 := payload + 1;
+    // Skip version string to find scramble
+    while (peek8(scramblePos) != 0) { scramblePos := scramblePos + 1; }
+    scramblePos := scramblePos + 1; // skip null
+    // NULL filler before scramble
+    while (peek8(scramblePos) != 0 and scramblePos < payload + payLen) { scramblePos := scramblePos + 1; }
+    
+    var respBuf: int64 := mmap(0, 256, 3, 34, -1, 0);
+    var pos: int64 := 0;
+    
+    //Capabilities (4 bytes)
+    poke8(respBuf, 0xFF);
+    poke8(respBuf + 1, 0xA3);
+    poke8(respBuf + 2, 0x0B);
+    poke8(respBuf + 3, 0x00);
+    pos := 4;
+    
+    // Max packet size (4 bytes)
+    poke8(respBuf + pos, 0xFF); pos := pos + 1;
+    poke8(respBuf + pos, 0xFF); pos := pos + 1;
+    poke8(respBuf + pos, 0xFF); pos := pos + 1;
+    poke8(respBuf + pos, 0xFF); pos := pos + 1;
+    
+    // Charset (1 byte)
+    poke8(respBuf + pos, 33); pos := pos + 1;
+    
+    // Fill zeros (23 bytes)
+    k := 0;
+    while (k < 23) { poke8(respBuf + pos + k, 0); k := k + 1; }
+    pos := pos + 23;
+    
+    // Username
+    k := 0;
+    while (k < 256) {
+        var c: int64 := peek8(user + k);
+        if (c == 0) { break; }
+        poke8(respBuf + pos + k, c);
+        k := k + 1;
+    }
+    poke8(respBuf + pos + k, 0);
+    pos := pos + k + 1;
+    
+    // Password hash would go here - for now, empty
+    poke8(respBuf + pos, 0);
+    pos := pos + 1;
+    
+    // Database (optional)
+    k := 0;
+    while (k < 256) {
+        var c: int64 := peek8(db + k);
+        if (c == 0) { break; }
+        poke8(respBuf + pos + k, c);
+        k := k + 1;
+    }
+    poke8(respBuf + pos + k, 0);
+    pos := pos + k + 1;
+    
+    PrintStr("   Response size: ");
+    PrintInt(pos);
+    PrintStr("\n");
+    
+    // Schritt 6: Send response
+    PrintStr("6. Send handshake response... ");
+    
+    // Packet header (3 bytes length + 1 byte packet number)
+    var packetSize: int64 := pos + 4;
+    var packet: int64 := mmap(0, packetSize, 3, 34, -1, 0);
+    poke8(packet, pos & 0xFF);
+    poke8(packet + 1, (pos >> 8) & 0xFF);
+    poke8(packet + 2, (pos >> 16) & 0xFF);
+    poke8(packet + 3, 0); // packet num
+    
+    k := 0;
+    while (k < pos) {
+        poke8(packet + 4 + k, peek8(respBuf + k));
+        k := k + 1;
+    }
+    
+    n := sys_write(fd, packet, pos + 4);
+    munmap(packet, pos + 4);
+    munmap(respBuf, 256);
+    munmap(payload, payLen + 1);
+    munmap(addr, 16);
+    
+    if (n <= 0) { PrintStr("FAILED\n"); return 1; }
+    PrintStr("OK\n");
+    
+    // Schritt 7: Read response
+    PrintStr("7. Read response... ");
+    header := mmap(0, 4, 3, 34, -1, 0);
+    n := sys_read(fd, header, 4);
+    if (n < 4) { 
+        PrintStr("FAILED (n=");
+        PrintInt(n);
+        PrintStr(")\n");
+        return 1;
+    }
+    
+    var first: int64 := peek8(header);
+    PrintStr("first byte=");
+    PrintInt(first);
+    PrintStr("... ");
+    
+    payLen := peek8(header) | (peek8(header + 1) << 8) | (peek8(header + 2) << 16);
+    var payloadSize2: int64 := payLen + 1;
+    payload := mmap(0, payloadSize2, 3, 34, -1, 0);
+    n := sys_read(fd, payload, payLen);
+    
+    if (first == 0x00) {
+        PrintStr("OK! Connected!\n");
+    } else if (first == 0xFF) {
+        var err: int64 := peek8(payload + 1) | (peek8(payload + 2) << 8);
+        PrintStr("ERROR #");
+        PrintInt(err);
+        PrintStr("\n");
+    } else if (first == 0xFE) {
+        PrintStr("Need old password auth\n");
+    } else {
+        PrintStr("Unknown response\n");
+    }
+    
+    munmap(header, 4);
+    if (payload > 0) { munmap(payload, payLen + 1); }
+    sys_close(fd);
+    
+    PrintStr("=== Test Complete ===\n");
+    return 0;
+}
