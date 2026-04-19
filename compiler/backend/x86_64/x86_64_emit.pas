@@ -1362,21 +1362,34 @@ begin
               //
               // For positive field offsets to work: base = SlotOffset(slotIdx + slotCount - 1)
               slotIdx := instr.Src1;
-              slotCount := (instr.StructSize + 7) div 8; // round up to slot count
+              slotCount := (instr.StructSize + 7) div 8;
               if slotCount < 1 then slotCount := 1;
-              // Calculate base address (lowest address = last slot)
-              baseOffset := SlotOffset(slotIdx + slotCount - 1);
-              // lea rax, [rbp + baseOffset]
-              if (baseOffset >= -128) and (baseOffset <= 127) then
+              
+              // FIX: Prüfen ob dies ein Parameter ist (>16 Bytes)
+              // Wenn ja → Slot enthält Pointer → MOV
+              // Wenn nein → Slot enthält Daten → LEA
+              
+              if (fn.ParamCount > 0) and (slotIdx >= 0) and (slotIdx < fn.ParamCount) and (instr.StructSize > 16) then
               begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $45); 
-                EmitU8(FCode, Byte(baseOffset));
+                // Parameter >16 Bytes: Slot enthält Pointer → MOV
+                WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + slotIdx));
               end
               else
               begin
-                EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $85);
-                EmitU32(FCode, Cardinal(baseOffset));
+                // Lokal oder kleiner Struct: LEA für Adresse
+                baseOffset := SlotOffset(slotIdx + slotCount - 1);
+                if (baseOffset >= -128) and (baseOffset <= 127) then
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $45); 
+                  EmitU8(FCode, Byte(baseOffset));
+                end
+                else
+                begin
+                  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $85);
+                  EmitU32(FCode, Cardinal(baseOffset));
+                end;
               end;
+              
               // Store address into temp slot
               slotIdx := fn.LocalCount + instr.Dest;
               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);

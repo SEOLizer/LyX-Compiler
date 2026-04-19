@@ -1,0 +1,477 @@
+// std/lyxvision/drivers.lyx
+// LyxVision - Terminal-Treiber
+// Low-Level Funktionen für Bildschirm und Eingabe
+
+unit std.lyxvision.drivers;
+
+import std.lyxvision.types;
+import std.lyxvision.consts;
+
+// Externe Funktionen
+extern fn read(fd: int64, buf: pchar, count: int64): int64;
+
+// ============================================================================
+// Terminal-Konfiguration
+// ============================================================================
+// HINWEIS: Globale Variablen mit Initialisierungswerten funktionieren derzeit
+// nicht korrekt im Compiler (werden mit 0 initialisiert). Die Werte werden
+// daher in InitDriver() explizit gesetzt.
+
+pub var screenWidth: int64;
+pub var screenHeight: int64;
+pub var cursorX: int64;
+pub var cursorY: int64;
+pub var currentFg: int64;
+pub var currentBg: int64;
+pub var rawModeActive: int64;
+
+// Termios-Konstanten (Linux x86_64)
+con TCGETS: int64 := 0x5401;
+con TCSETS: int64 := 0x5402;
+
+// mmap-Konstanten
+con PROT_READ: int64 := 1;
+con PROT_WRITE: int64 := 2;
+con MAP_PRIVATE: int64 := 2;
+con MAP_ANONYMOUS: int64 := 32;
+
+// Termios-Puffer als int64 (Pointer-Adresse)
+// HINWEIS: Werden mit 0 initialisiert (Compiler-Bug bei var := Wert)
+pub var termiosBufPtr: int64;
+pub var origTermiosPtr: int64;
+pub var keyInputBufPtr: int64;  // Buffer für Tastatureingabe (mmap'd)
+
+// ============================================================================
+// Raw-Modus Funktionen
+// ============================================================================
+
+// Alloziert Speicher für termios-Strukturen via mmap
+fn AllocTermiosBuffers(): int64 {
+  if (termiosBufPtr != 0) {
+    return 0;
+  }
+  termiosBufPtr := IO.mmap(0, 256, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0);
+  if (termiosBufPtr < 0) {
+    return -1;
+  }
+  origTermiosPtr := termiosBufPtr + 128;
+  return 0;
+}
+
+// Schreibt einen 32-bit Wert in den Puffer via buf_put_byte (little-endian)
+fn WriteU32ToPtr(ptr: int64, offset: int64, val: int64) {
+  buf_put_byte(ptr, offset, val & 0xFF);
+  buf_put_byte(ptr, offset + 1, (val >> 8) & 0xFF);
+  buf_put_byte(ptr, offset + 2, (val >> 16) & 0xFF);
+  buf_put_byte(ptr, offset + 3, (val >> 24) & 0xFF);
+}
+
+pub fn SetRawMode(enabled: bool): int64 {
+  var ret: int64 := 0;
+  
+  // Speicher für termios allozieren falls nötig
+  if (termiosBufPtr == 0) {
+    ret := AllocTermiosBuffers();
+    if (ret < 0) {
+      // Kein Speicher - trotzdem weitermachen ohne Raw-Mode
+      rawModeActive := 0;
+      return 0;
+    }
+  }
+  
+  if (enabled) {
+    // Aktuelle Terminal-Einstellungen sichern
+    ret := IO.ioctl(0, TCGETS, origTermiosPtr);
+    if (ret < 0) {
+      // Kein TTY (z.B. Pipe oder nicht-interaktives Terminal)
+      // Trotzdem rawModeActive setzen für Event-Polling
+      rawModeActive := 1;
+      return 0;
+    }
+    
+    // Kopiere Original nach Arbeitspuffer
+    var i: int64 := 0;
+    while (i < 60) {
+      var b: int64 := buf_get_byte(origTermiosPtr, i);
+      buf_put_byte(termiosBufPtr, i, b);
+      i := i + 1;
+    }
+    
+    // Modifiziere für Raw-Mode:
+    // c_lflag (offset 12) - ICANON (bit 1) und ECHO (bit 3) ausschalten
+    var lflag: int64 := buf_get_byte(termiosBufPtr, 12);
+    lflag := lflag + buf_get_byte(termiosBufPtr, 13) * 256;
+    lflag := lflag + buf_get_byte(termiosBufPtr, 14) * 65536;
+    lflag := lflag + buf_get_byte(termiosBufPtr, 15) * 16777216;
+    
+    // Clear ICANON (0x02) and ECHO (0x08) -> ~0x0A = ~10
+    lflag := lflag & (~10);
+    
+    WriteU32ToPtr(termiosBufPtr, 12, lflag);
+    
+    // c_cc[VMIN] = 1, c_cc[VTIME] = 0 (offsets 23, 24 auf Linux)
+    buf_put_byte(termiosBufPtr, 23, 1);
+    buf_put_byte(termiosBufPtr, 24, 0);
+    
+    // Neue Einstellungen setzen
+    ret := IO.ioctl(0, TCSETS, termiosBufPtr);
+    // Ignoriere Fehler - auf manchen Terminals funktioniert es nicht
+    
+    rawModeActive := 1;
+  } else {
+    // Ursprüngliche Einstellungen wiederherstellen
+    if (origTermiosPtr != 0) {
+      ret := IO.ioctl(0, TCSETS, origTermiosPtr);
+      // Ignoriere Fehler
+    }
+    rawModeActive := 0;
+  }
+  
+  return 0;
+}
+
+// ============================================================================
+// Terminal-Initialisierung
+// ============================================================================
+
+pub fn InitDriver() {
+  // Initialisiere globale Variablen explizit (Compiler-Bug Workaround)
+  screenWidth := 80;
+  screenHeight := 25;
+  cursorX := 1;
+  cursorY := 1;
+  currentFg := 7;
+  currentBg := 0;
+  rawModeActive := 0;
+  
+  HideCursor();
+  ClearScreen();
+  SetRawMode(true);
+}
+
+pub fn DoneDriver() {
+  SetRawMode(false);
+  ShowCursor();
+  ResetColors();
+  ClearScreen();
+}
+
+// ============================================================================
+// Bildschirm-Steuerung
+// ============================================================================
+
+pub fn ClearScreen() {
+  PrintStr("\e[2J");
+  PrintStr("\e[H");
+}
+
+pub fn ClearToEol() {
+  PrintStr("\e[K");
+}
+
+// ============================================================================
+// Cursor-Steuerung
+// ============================================================================
+
+pub fn MoveCursor(x: int64, y: int64) {
+  cursorX := x;
+  cursorY := y;
+  PrintStr("\e[");
+  PrintInt(y);
+  PrintStr(";");
+  PrintInt(x);
+  PrintStr("H");
+}
+
+pub fn HideCursor() {
+  PrintStr("\e[?25l");
+}
+
+pub fn ShowCursor() {
+  PrintStr("\e[?25h");
+}
+
+pub fn SaveCursor() {
+  PrintStr("\e[s");
+}
+
+pub fn RestoreCursor() {
+  PrintStr("\e[u");
+}
+
+// ============================================================================
+// Farb-Steuerung
+// ============================================================================
+
+// CGA zu ANSI Farbumrechnung
+// CGA: 0=Black, 1=Blue, 2=Green, 3=Cyan, 4=Red, 5=Magenta, 6=Brown, 7=LightGray
+//      8=DarkGray, 9=LightBlue, 10=LightGreen, 11=LightCyan, 12=LightRed, 13=LightMagenta, 14=Yellow, 15=White
+// ANSI: 0=Black, 1=Red, 2=Green, 3=Yellow, 4=Blue, 5=Magenta, 6=Cyan, 7=White
+fn CgaToAnsi(cga: int64): int64 {
+  // Grundfarben (0-7)
+  if (cga == 0) { return 0; }  // Black -> Black
+  if (cga == 1) { return 4; }  // Blue -> Blue
+  if (cga == 2) { return 2; }  // Green -> Green
+  if (cga == 3) { return 6; }  // Cyan -> Cyan
+  if (cga == 4) { return 1; }  // Red -> Red
+  if (cga == 5) { return 5; }  // Magenta -> Magenta
+  if (cga == 6) { return 3; }  // Brown -> Yellow (approx)
+  if (cga == 7) { return 7; }  // LightGray -> White
+  // Helle Farben (8-15) - gleiche Zuordnung, Helligkeit über ANSI 90-97/100-107
+  if (cga == 8) { return 0; }   // DarkGray -> Black (bright)
+  if (cga == 9) { return 4; }   // LightBlue -> Blue (bright)
+  if (cga == 10) { return 2; }  // LightGreen -> Green (bright)
+  if (cga == 11) { return 6; }  // LightCyan -> Cyan (bright)
+  if (cga == 12) { return 1; }  // LightRed -> Red (bright)
+  if (cga == 13) { return 5; }  // LightMagenta -> Magenta (bright)
+  if (cga == 14) { return 3; }  // Yellow -> Yellow (bright)
+  if (cga == 15) { return 7; }  // White -> White (bright)
+  return cga;
+}
+
+pub fn SetForeground(color: int64) {
+  var ansiColor: int64 := CgaToAnsi(color);
+  if (color < 8) {
+    PrintStr("\e[");
+    PrintInt(30 + ansiColor);
+    PrintStr("m");
+  } else {
+    PrintStr("\e[");
+    PrintInt(90 + ansiColor);
+    PrintStr("m");
+  }
+}
+
+pub fn SetBackground(color: int64) {
+  var ansiColor: int64 := CgaToAnsi(color);
+  if (color < 8) {
+    PrintStr("\e[");
+    PrintInt(40 + ansiColor);
+    PrintStr("m");
+  } else {
+    PrintStr("\e[");
+    PrintInt(100 + ansiColor);
+    PrintStr("m");
+  }
+}
+
+pub fn SetColors(fg: int64, bg: int64) {
+  SetForeground(fg);
+  SetBackground(bg);
+}
+
+pub fn ResetColors() {
+  PrintStr("\e[0m");
+}
+
+// ============================================================================
+// Text-Attribute
+// ============================================================================
+
+pub fn SetBold(enable: int64) {
+  if (enable != 0) {
+    PrintStr("\e[1m");
+  } else {
+    PrintStr("\e[22m");
+  }
+}
+
+pub fn SetReverse(enable: int64) {
+  if (enable != 0) {
+    PrintStr("\e[7m");
+  } else {
+    PrintStr("\e[27m");
+  }
+}
+
+// ============================================================================
+// Bildschirmgröße
+// ============================================================================
+
+pub fn GetScreenWidth(): int64 {
+  return screenWidth;
+}
+
+pub fn GetScreenHeight(): int64 {
+  return screenHeight;
+}
+
+pub fn SetScreenSize(w: int64, h: int64) {
+  screenWidth := w;
+  screenHeight := h;
+}
+
+// ============================================================================
+// Zeichenausgabe
+// ============================================================================
+
+pub fn WriteStr(x: int64, y: int64, s: pchar) {
+  MoveCursor(x, y);
+  PrintStr(s);
+}
+
+pub fn WriteStrAttr(x: int64, y: int64, s: pchar, fg: int64, bg: int64) {
+  SetColors(fg, bg);
+  MoveCursor(x, y);
+  PrintStr(s);
+}
+
+pub fn FillRect(x1: int64, y1: int64, x2: int64, y2: int64) {
+  var y: int64 := y1;
+  while (y <= y2) {
+    MoveCursor(x1, y);
+    var x: int64 := x1;
+    while (x <= x2) {
+      PrintStr(" ");
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+}
+
+// ============================================================================
+// Box-Zeichnung (ASCII)
+// ============================================================================
+
+pub fn DrawBox(x1: int64, y1: int64, x2: int64, y2: int64) {
+  // Obere Zeile
+  MoveCursor(x1, y1);
+  PrintStr("+");
+  var x: int64 := x1 + 1;
+  while (x < x2) {
+    PrintStr("-");
+    x := x + 1;
+  }
+  PrintStr("+");
+  
+  // Seiten
+  var y: int64 := y1 + 1;
+  while (y < y2) {
+    MoveCursor(x1, y);
+    PrintStr("|");
+    MoveCursor(x2, y);
+    PrintStr("|");
+    y := y + 1;
+  }
+  
+  // Untere Zeile
+  MoveCursor(x1, y2);
+  PrintStr("+");
+  x := x1 + 1;
+  while (x < x2) {
+    PrintStr("-");
+    x := x + 1;
+  }
+  PrintStr("+");
+}
+
+pub fn DrawDoubleBox(x1: int64, y1: int64, x2: int64, y2: int64) {
+  // Obere Zeile (Unicode)
+  MoveCursor(x1, y1);
+  PrintStr("#");
+  var x: int64 := x1 + 1;
+  while (x < x2) {
+    PrintStr("=");
+    x := x + 1;
+  }
+  PrintStr("#");
+  
+  // Seiten
+  var y: int64 := y1 + 1;
+  while (y < y2) {
+    MoveCursor(x1, y);
+    PrintStr("#");
+    MoveCursor(x2, y);
+    PrintStr("#");
+    y := y + 1;
+  }
+  
+  // Untere Zeile
+  MoveCursor(x1, y2);
+  PrintStr("#");
+  x := x1 + 1;
+  while (x < x2) {
+    PrintStr("=");
+    x := x + 1;
+  }
+  PrintStr("#");
+}
+
+// ============================================================================
+// Event-Eingabe
+// ============================================================================
+
+pub fn ReadKeyRaw(): int64 {
+  // Liest ein einzelnes Zeichen
+  // Im Raw-Modus wird sofort nach einem Tastendruck zurückgekehrt
+  
+  // Alloziere Key-Input-Buffer falls nötig (mmap für write-Zugriff)
+  if (keyInputBufPtr == 0) {
+    keyInputBufPtr := IO.mmap(0, 64, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0);
+    if (keyInputBufPtr < 0) {
+      keyInputBufPtr := 0;
+      return -1;
+    }
+  }
+  
+  // Lese mit read_raw in den mmap-Buffer
+  var r: int64 := read_raw(0, keyInputBufPtr, 1);
+  if (r <= 0) {
+    return -1;
+  }
+  
+  // Lese das Byte aus dem Buffer
+  return buf_get_byte(keyInputBufPtr, 0);
+}
+
+// Prüft, ob eine Taste gedrückt wurde, ohne zu blockieren
+
+
+pub fn GetKeyEvent(): TEvent {
+  var e: TEvent := EventEmpty();
+  
+  // Lese ein Zeichen
+  var ch: int64 := ReadKeyRaw();
+  
+  // Wenn kein Zeichen verfügbar, gebe leeres Event zurück
+  if (ch < 0) {
+    return e;
+  }
+  
+  // Event-Typ setzen
+  e.what := evKeyDown;
+  e.keyCode := ch;
+  e.charCode := ch;
+  
+  // Prüfe auf Beenden-Tasten: ESC (27) oder 'q' (113)
+  if (ch == 27) {
+    // Sende cmQuit Kommando
+    e.what := evCommand;
+    e.command := cmQuit;
+  }
+  if (ch == 113) {
+    // Sende cmQuit Kommando
+    e.what := evCommand;
+    e.command := cmQuit;
+  }
+  
+  return e;
+}
+
+// ============================================================================
+// Maus-Unterstützung
+// ============================================================================
+
+pub fn EnableMouse() {
+  PrintStr("\e[?1000h");
+  PrintStr("\e[?1002h");
+  PrintStr("\e[?1006h");
+}
+
+pub fn DisableMouse() {
+  PrintStr("\e[?1006l");
+  PrintStr("\e[?1002l");
+  PrintStr("\e[?1000l");
+}
+
+// End of std/lyxvision_drivers.lyx
