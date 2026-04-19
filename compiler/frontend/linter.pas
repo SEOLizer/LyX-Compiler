@@ -33,7 +33,8 @@ type
     lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
     lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
     lrTodoComment,       // W022: "// TODO" Kommentare finden
-    lrMagicNumber        // W023: hartecodierte Zahlen (magic numbers)
+    lrMagicNumber,        // W023: hartecodierte Zahlen (magic numbers)
+    lrUnboundedLoop     // W024: While ohne limit() (WCET)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -63,7 +64,8 @@ const
     lrDeadLoop,
     lrGlobalMutable,
     lrTodoComment,
-    lrMagicNumber
+    lrMagicNumber,
+    lrUnboundedLoop
   ];
 
   { Human-readable Namen für die Regeln }
@@ -90,7 +92,8 @@ const
     'dead-loop',
     'global-mutable',
     'todo-comment',
-    'magic-number'
+    'magic-number',
+    'unbounded-loop'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
@@ -98,7 +101,7 @@ const
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
     'W016', 'W017', 'W018', 'W019', 'W020',
-    'W021', 'W022', 'W023'
+    'W021', 'W022', 'W023', 'W024'
   );
 
 type
@@ -176,6 +179,7 @@ type
     procedure CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
     procedure CheckTodoComment(prog: TAstProgram);
     procedure CheckMagicNumber(expr: TAstExpr);
+    procedure CheckUnboundedLoop(loop: TAstWhile);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -608,6 +612,8 @@ begin
       LintExpr(TAstWhile(stmt).Cond);
       if lrDeadLoop in FActiveRules then
         CheckDeadLoop(TAstWhile(stmt));
+      if lrUnboundedLoop in FActiveRules then
+        CheckUnboundedLoop(TAstWhile(stmt));
       PushScope;
       LintStmt(TAstWhile(stmt).Body);
       PopScope;
@@ -1256,6 +1262,66 @@ begin
       Format('magic number %d should be a named constant for better maintainability',
         [value]),
       expr.Span);
+end;
+
+{ --- W024: Unbounded Loop Detection --- }
+procedure TLinter.CheckUnboundedLoop(loop: TAstWhile);
+var
+  hasLimitCall: Boolean;
+
+  { Recursively check if there's any limit() call in the loop body }
+  function ContainsLimitCall(stmt: TAstStmt): Boolean;
+  var
+    j: Integer;
+  begin
+    Result := False;
+    if stmt = nil then Exit;
+
+    case stmt.Kind of
+      nkCall:
+        begin
+          { Check if this call looks like limit() - simplify for now }
+          { This is a heuristic - would need AST access to check exact name }
+        end;
+      nkBlock:
+        begin
+          for j := 0 to High(TAstBlock(stmt).Stmts) do
+            if ContainsLimitCall(TAstBlock(stmt).Stmts[j]) then
+            begin
+              Result := True;
+              Exit;
+            end;
+        end;
+      nkIf:
+        Result := ContainsLimitCall(TAstIf(stmt).ThenBranch) or
+          (Assigned(TAstIf(stmt).ElseBranch) and
+           ContainsLimitCall(TAstIf(stmt).ElseBranch));
+      nkWhile, nkFor:
+        ; { Nested loops have their own termination }
+    end;
+  end;
+
+begin
+  if loop = nil then Exit;
+  if not (lrUnboundedLoop in FActiveRules) then Exit;
+  if not Assigned(loop.Body) then Exit;
+
+  { Skip if it's an infinite loop (W016 already handles that) }
+  { Just warn for all while loops that aren't provably bounded }
+
+  { Heuristic: warn about any while loop without explicit bound check }
+  { For loops are OK because they have explicit bounds }
+  { This is a best-effort check }
+  hasLimitCall := ContainsLimitCall(loop.Body);
+
+  if not hasLimitCall and Assigned(loop.Cond) then
+  begin
+    { Only warn if condition is not obviously bounded }
+    { E.g., while i < n - bounded by n, but we can't prove it easily }
+    Warn(lrUnboundedLoop,
+      'while loop may not terminate; add limit() for WCET predictability',
+      loop.Span);
+  end;
 end;
 
 { --- MISRA #19: Max Function Length (60 lines) --- }
