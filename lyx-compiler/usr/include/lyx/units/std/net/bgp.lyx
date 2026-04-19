@@ -1,0 +1,862 @@
+// Lyx BGP Client - RFC 4271 compliant
+// Border Gateway Protocol v4 speaker
+//
+// BGP uses TCP port 179 for peering sessions
+// The protocol has a finite state machine (FSM) with:
+// Idle -> Connect -> Active -> OpenSent -> OpenConfirm -> Established
+//
+// Message types:
+// - OPEN (1): Session initialization
+// - UPDATE (2): Route advertisement/withdrawal
+// - NOTIFICATION (3): Error reporting
+// - KEEPALIVE (4): Session maintenance
+//
+// Usage:
+//   import std.net.bgp;
+//   var peer: BGPPeer := BGPConnect("192.168.1.1", 65001, 65000);
+//   BGPWaitEstablished(peer);
+//   // Peer is now established, can send/receive routes
+//   BGPWithdrawRoute(peer, "10.0.0.0", 24);
+//   BGPDisconnect(peer);
+
+unit std.net.bgp;
+
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+
+// BGP port
+pub con BGP_PORT: int64 := 179;
+
+// BGP marker (16 bytes of 0xFF)
+pub con BGP_MARKER_SIZE: int64 := 16;
+
+// BGP message types
+pub con BGP_MSG_OPEN: int64 := 1;
+pub con BGP_MSG_UPDATE: int64 := 2;
+pub con BGP_MSG_NOTIFICATION: int64 := 3;
+pub con BGP_MSG_KEEPALIVE: int64 := 4;
+pub con BGP_MSG_ROUTE_REFRESH: int64 := 5;
+
+// BGP FSM states
+pub con BGP_STATE_IDLE: int64 := 0;
+pub con BGP_STATE_CONNECT: int64 := 1;
+pub con BGP_STATE_ACTIVE: int64 := 2;
+pub con BGP_STATE_OPENSENT: int64 := 3;
+pub con BGP_STATE_OPENCONFIRM: int64 := 4;
+pub con BGP_STATE_ESTABLISHED: int64 := 5;
+
+// BGP error codes
+pub con BGP_ERR_MSG_HDR: int64 := 1;
+pub con BGP_ERR_OPEN: int64 := 2;
+pub con BGP_ERR_UPDATE: int64 := 3;
+pub con BGP_ERR_HOLD_TIMER: int64 := 4;
+pub con BGP_ERR_FSM: int64 := 5;
+pub con BGP_ERR_CEASE: int64 := 6;
+
+// BGP path attribute types
+pub con BGP_ATTR_ORIGIN: int64 := 1;
+pub con BGP_ATTR_AS_PATH: int64 := 2;
+pub con BGP_ATTR_NEXT_HOP: int64 := 3;
+pub con BGP_ATTR_MULTI_EXIT_DISC: int64 := 4;
+pub con BGP_ATTR_LOCAL_PREF: int64 := 5;
+pub con BGP_ATTR_ATOMIC_AGGREGATE: int64 := 6;
+pub con BGP_ATTR_AGGREGATOR: int64 := 7;
+pub con BGP_ATTR_COMMUNITY: int64 := 8;
+pub con BGP_ATTR_MP_REACH_NLRI: int64 := 14;
+pub con BGP_ATTR_MP_UNREACH_NLRI: int64 := 15;
+pub con BGP_ATTR_EXTENDED_COMMUNITY: int64 := 16;
+
+// BGP origin values
+pub con BGP_ORIGIN_IGP: int64 := 0;
+pub con BGP_ORIGIN_EGP: int64 := 1;
+pub con BGP_ORIGIN_INCOMPLETE: int64 := 2;
+
+// BGP peer
+pub type BGPPeer = struct {
+  conn: TCPConn;         // TCP connection
+  state: int64;          // FSM state
+  localAS: int64;        // Local AS number
+  remoteAS: int64;       // Remote AS number
+  holdTime: int64;       // Hold timer (seconds)
+  localId: int64;        // Local BGP Identifier (IPv4 as int64)
+  remoteId: int64;       // Remote BGP Identifier
+  connIp: int64;         // Peer IP address
+  keepaliveTimer: int64; // Keepalive interval
+};
+
+// BGP route
+pub type BGPRoute = struct {
+  prefix: int64;         // Network prefix (IPv4 as int64)
+  prefixLen: int64;      // Prefix length (0-32)
+  nextHop: int64;        // Next hop (IPv4 as int64)
+  asPath: int64;         // Pointer to AS path
+  asPathLen: int64;      // AS path length (number of ASes)
+  origin: int64;         // Origin (IGP/EGP/Incomplete)
+  localPref: int64;      // Local preference
+  med: int64;            // Multi-Exit Discriminator
+};
+
+// BGP update
+pub type BGPUpdate = struct {
+  withdrawnRoutes: int64;  // Pointer to withdrawn routes
+  withdrawnCount: int64;   // Number of withdrawn routes
+  pathAttrs: int64;        // Pointer to path attributes
+  pathAttrsLen: int64;     // Path attributes length
+  nlri: int64;             // Pointer to NLRI
+  nlriCount: int64;        // Number of NLRI prefixes
+};
+
+// Build BGP message header
+// Returns pointer to header (caller must free)
+pub fn BGPBuildHeader(msgType: int64, length: int64): int64 {
+  var buf: int64;
+  var i: int64;
+  
+  buf := mmap(0, 19, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // Marker: 16 bytes of 0xFF
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + i, 255);
+    i := i + 1;
+  }
+  
+  // Length (2 bytes, big-endian)
+  poke8(buf + 16, (length / 256) - ((length / 65536) * 256));
+  poke8(buf + 17, length - ((length / 256) * 256));
+  
+  // Type
+  poke8(buf + 18, msgType);
+  
+  return buf;
+}
+
+// Build BGP OPEN message
+// version: BGP version (4 for BGP-4)
+// asNum: AS number
+// holdTime: Hold timer
+// bgpId: BGP Identifier (IPv4 as int64)
+// Returns pointer to complete OPEN message (caller must free)
+pub fn BGPBuildOpen(version: int64, asNum: int64, holdTime: int64, bgpId: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var openLen: int64;
+  var i: int64;
+  
+  // OPEN content: Version(1) + MyAS(2) + HoldTime(2) + BGP-ID(4) + OptParmLen(1) = 10 bytes
+  openLen := 10;
+  
+  buf := mmap(0, 29 + openLen, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // Marker
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + pos + i, 255);
+    i := i + 1;
+  }
+  pos := pos + BGP_MARKER_SIZE;
+  
+  // Length (19 + 10 = 29)
+  var totalLen: int64 := 19 + openLen;
+  poke8(buf + pos, (totalLen / 256) - ((totalLen / 65536) * 256));
+  poke8(buf + pos + 1, totalLen - ((totalLen / 256) * 256));
+  pos := pos + 2;
+  
+  // Type (OPEN = 1)
+  poke8(buf + pos, BGP_MSG_OPEN);
+  pos := pos + 1;
+  
+  // Version
+  poke8(buf + pos, version);
+  pos := pos + 1;
+  
+  // My AS (2 bytes, big-endian)
+  poke8(buf + pos, (asNum / 256) - ((asNum / 65536) * 256));
+  poke8(buf + pos + 1, asNum - ((asNum / 256) * 256));
+  pos := pos + 2;
+  
+  // Hold Time (2 bytes, big-endian)
+  poke8(buf + pos, (holdTime / 256) - ((holdTime / 65536) * 256));
+  poke8(buf + pos + 1, holdTime - ((holdTime / 256) * 256));
+  pos := pos + 2;
+  
+  // BGP Identifier (4 bytes, IPv4)
+  var a: int64 := (bgpId / 16777216) - ((bgpId / 4294967296) * 256);
+  var b: int64 := (bgpId / 65536) - ((bgpId / 16777216) * 256);
+  var c: int64 := (bgpId / 256) - ((bgpId / 65536) * 256);
+  var d: int64 := bgpId - ((bgpId / 256) * 256);
+  poke8(buf + pos, a);
+  poke8(buf + pos + 1, b);
+  poke8(buf + pos + 2, c);
+  poke8(buf + pos + 3, d);
+  pos := pos + 4;
+  
+  // Optional Parameters Length (0 for now)
+  poke8(buf + pos, 0);
+  pos := pos + 1;
+  
+  return buf;
+}
+
+// Build BGP KEEPALIVE message
+// Returns pointer to KEEPALIVE message (caller must free)
+pub fn BGPBuildKeepalive(): int64 {
+  var buf: int64;
+  var i: int64;
+  var pos: int64;
+  
+  buf := mmap(0, 19, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // Marker
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + pos + i, 255);
+    i := i + 1;
+  }
+  pos := pos + BGP_MARKER_SIZE;
+  
+  // Length (19 = minimum BGP message)
+  poke8(buf + pos, 0);
+  poke8(buf + pos + 1, 19);
+  pos := pos + 2;
+  
+  // Type (KEEPALIVE = 4)
+  poke8(buf + pos, BGP_MSG_KEEPALIVE);
+  
+  return buf;
+}
+
+// Build BGP NOTIFICATION message
+// errCode: error code
+// errSubcode: error subcode
+// Returns pointer to NOTIFICATION message (caller must free)
+pub fn BGPBuildNotification(errCode: int64, errSubcode: int64): int64 {
+  var buf: int64;
+  var i: int64;
+  var pos: int64;
+  
+  buf := mmap(0, 21, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // Marker
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + pos + i, 255);
+    i := i + 1;
+  }
+  pos := pos + BGP_MARKER_SIZE;
+  
+  // Length (21 = 19 header + 1 error code + 1 error subcode)
+  poke8(buf + pos, 0);
+  poke8(buf + pos + 1, 21);
+  pos := pos + 2;
+  
+  // Type (NOTIFICATION = 3)
+  poke8(buf + pos, BGP_MSG_NOTIFICATION);
+  pos := pos + 1;
+  
+  // Error code
+  poke8(buf + pos, errCode);
+  pos := pos + 1;
+  
+  // Error subcode
+  poke8(buf + pos, errSubcode);
+  
+  return buf;
+}
+
+// Build BGP UPDATE message with NLRI
+// prefix: network prefix (IPv4 as int64)
+// prefixLen: prefix length (0-32)
+// nextHop: next hop (IPv4 as int64)
+// origin: origin type (IGP/EGP/Incomplete)
+// Returns pointer to UPDATE message (caller must free)
+pub fn BGPBuildUpdate(prefix: int64, prefixLen: int64, nextHop: int64, origin: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var updateLen: int64;
+  var nlriBytes: int64;
+  var pathAttrLen: int64;
+  
+  // Calculate NLRI bytes (1 byte prefix len + prefix bytes)
+  nlriBytes := 1 + ((prefixLen + 7) / 8);
+  
+  // Calculate path attributes length
+  // Origin (3 + 1 = 4 bytes)
+  // AS_PATH (empty = 3 bytes)
+  // NEXT_HOP (3 + 4 = 7 bytes)
+  pathAttrLen := 4 + 3 + 7;
+  
+  // Total UPDATE content: withdrawn(2) + path_attrs(2 + pathAttrLen) + nlri(nlriBytes)
+  updateLen := 2 + 2 + pathAttrLen + nlriBytes;
+  
+  buf := mmap(0, 19 + updateLen, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // Marker
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + pos + i, 255);
+    i := i + 1;
+  }
+  pos := pos + BGP_MARKER_SIZE;
+  
+  // Length
+  var totalLen: int64 := 19 + updateLen;
+  poke8(buf + pos, (totalLen / 256) - ((totalLen / 65536) * 256));
+  poke8(buf + pos + 1, totalLen - ((totalLen / 256) * 256));
+  pos := pos + 2;
+  
+  // Type (UPDATE = 2)
+  poke8(buf + pos, BGP_MSG_UPDATE);
+  pos := pos + 1;
+  
+  // Withdrawn Routes Length (0)
+  poke8(buf + pos, 0);
+  poke8(buf + pos + 1, 0);
+  pos := pos + 2;
+  
+  // Total Path Attribute Length
+  poke8(buf + pos, (pathAttrLen / 256) - ((pathAttrLen / 65536) * 256));
+  poke8(buf + pos + 1, pathAttrLen - ((pathAttrLen / 256) * 256));
+  pos := pos + 2;
+  
+  // Path Attribute: Origin
+  // Flags(1) + Type(1) + Length(1) + Value(1) = 4 bytes
+  poke8(buf + pos, $40);      // Flags: Optional=0, Transitive=1, Partial=0, Extended=0
+  poke8(buf + pos + 1, BGP_ATTR_ORIGIN);
+  poke8(buf + pos + 2, 1);    // Length
+  poke8(buf + pos + 3, origin);
+  pos := pos + 4;
+  
+  // Path Attribute: AS_PATH (empty)
+  poke8(buf + pos, $40);      // Flags
+  poke8(buf + pos + 1, BGP_ATTR_AS_PATH);
+  poke8(buf + pos + 2, 0);    // Length (0 = empty AS path)
+  pos := pos + 3;
+  
+  // Path Attribute: NEXT_HOP
+  poke8(buf + pos, $40);      // Flags
+  poke8(buf + pos + 1, BGP_ATTR_NEXT_HOP);
+  poke8(buf + pos + 2, 4);    // Length
+  var nh: int64 := nextHop;
+  poke8(buf + pos + 3, (nh / 16777216) - ((nh / 4294967296) * 256));
+  poke8(buf + pos + 4, (nh / 65536) - ((nh / 16777216) * 256));
+  poke8(buf + pos + 5, (nh / 256) - ((nh / 65536) * 256));
+  poke8(buf + pos + 6, nh - ((nh / 256) * 256));
+  pos := pos + 7;
+  
+  // NLRI
+  // Prefix length
+  poke8(buf + pos, prefixLen);
+  pos := pos + 1;
+  
+  // Prefix bytes
+  var pfxBytes: int64 := (prefixLen + 7) / 8;
+  var pfx: int64 := prefix;
+  i := 0;
+  while (i < pfxBytes) {
+    poke8(buf + pos + i, (pfx / 16777216) - ((pfx / 4294967296) * 256));
+    pfx := pfx - ((pfx / 16777216) * 16777216);
+    pfx := pfx * 256;
+    i := i + 1;
+  }
+  pos := pos + pfxBytes;
+  
+  return buf;
+}
+
+// Parse BGP message type from raw message
+pub fn BGPGetMessageType(msg: int64): int64 {
+  if (msg == 0) {
+    return 0;
+  }
+  return peek8(msg + 18);
+}
+
+// Parse BGP message length from raw message
+pub fn BGPGetMessageLength(msg: int64): int64 {
+  if (msg == 0) {
+    return 0;
+  }
+  return (peek8(msg + 16) * 256) + peek8(msg + 17);
+}
+
+// Parse BGP OPEN message
+// Returns remote AS number, or -1 on error
+pub fn BGPParseOpen(msg: int64, len: int64): int64 {
+  var pos: int64;
+  var remoteAS: int64;
+  
+  if (msg == 0 || len < 29) {
+    return -1;
+  }
+  
+  // Skip header (19 bytes)
+  pos := 19;
+  
+  // Version (skip)
+  pos := pos + 1;
+  
+  // Remote AS (2 bytes, big-endian)
+  remoteAS := (peek8(msg + pos) * 256) + peek8(msg + pos + 1);
+  
+  return remoteAS;
+}
+
+// Parse BGP OPEN message and extract all fields
+pub fn BGPParseOpenFull(msg: int64, len: int64, remoteAS: int64, holdTime: int64, bgpId: int64): int64 {
+  var pos: int64;
+  
+  if (msg == 0 || len < 29) {
+    return -1;
+  }
+  
+  pos := 19;
+  
+  // Version
+  pos := pos + 1;
+  
+  // Remote AS
+  remoteAS := (peek8(msg + pos) * 256) + peek8(msg + pos + 1);
+  pos := pos + 2;
+  
+  // Hold Time
+  holdTime := (peek8(msg + pos) * 256) + peek8(msg + pos + 1);
+  pos := pos + 2;
+  
+  // BGP Identifier
+  bgpId := (peek8(msg + pos) * 16777216) + (peek8(msg + pos + 1) * 65536) +
+           (peek8(msg + pos + 2) * 256) + peek8(msg + pos + 3);
+  
+  return 0;
+}
+
+// Connect to BGP peer
+// peerIp: peer IP address (as int64)
+// localAS: local AS number
+// remoteAS: remote AS number (0 for dynamic)
+// Returns BGPPeer
+pub fn BGPConnect(peerIp: int64, localAS: int64, remoteAS: int64): BGPPeer {
+  var peer: BGPPeer;
+  var conn: TCPConn;
+  
+  peer.conn.fd := -1;
+  peer.state := BGP_STATE_IDLE;
+  peer.localAS := localAS;
+  peer.remoteAS := remoteAS;
+  peer.holdTime := 180;  // Default 180 seconds
+  peer.localId := 0;
+  peer.remoteId := 0;
+  peer.connIp := peerIp;
+  peer.keepaliveTimer := 60;  // 60 seconds (1/3 of hold time)
+  
+  // Connect TCP
+  conn := TCPConnect(peerIp, BGP_PORT);
+  if (conn.fd < 0) {
+    return peer;
+  }
+  
+  TCPConnSetNodelay(conn, 1);
+  TCPConnSetKeepAlive(conn, 1);
+  
+  peer.conn := conn;
+  peer.state := BGP_STATE_CONNECT;
+  
+  return peer;
+}
+
+// Send BGP OPEN message
+// Returns 0 on success, -1 on error
+pub fn BGPSendOpen(peer: BGPPeer): int64 {
+  var msg: int64;
+  var n: int64;
+  
+  if (peer.conn.fd < 0) {
+    return -1;
+  }
+  
+  msg := BGPBuildOpen(4, peer.localAS, peer.holdTime, peer.localId);
+  if (msg == 0) {
+    return -1;
+  }
+  
+  n := TCPConnWrite(peer.conn, msg, 29);
+  munmap(msg, 29);
+  
+  if (n < 0) {
+    return -1;
+  }
+  
+  peer.state := BGP_STATE_OPENSENT;
+  return 0;
+}
+
+// Send BGP KEEPALIVE message
+// Returns 0 on success, -1 on error
+pub fn BGPSendKeepalive(peer: BGPPeer): int64 {
+  var msg: int64;
+  var n: int64;
+  
+  if (peer.conn.fd < 0) {
+    return -1;
+  }
+  
+  msg := BGPBuildKeepalive();
+  if (msg == 0) {
+    return -1;
+  }
+  
+  n := TCPConnWrite(peer.conn, msg, 19);
+  munmap(msg, 19);
+  
+  return n;
+}
+
+// Send BGP NOTIFICATION message
+// Returns 0 on success, -1 on error
+pub fn BGPSendNotification(peer: BGPPeer, errCode: int64, errSubcode: int64): int64 {
+  var msg: int64;
+  var n: int64;
+  
+  if (peer.conn.fd < 0) {
+    return -1;
+  }
+  
+  msg := BGPBuildNotification(errCode, errSubcode);
+  if (msg == 0) {
+    return -1;
+  }
+  
+  n := TCPConnWrite(peer.conn, msg, 21);
+  munmap(msg, 21);
+  
+  return n;
+}
+
+// Send BGP UPDATE message (advertise route)
+// prefix: network prefix (IPv4 as int64)
+// prefixLen: prefix length (0-32)
+// nextHop: next hop (IPv4 as int64)
+// Returns 0 on success, -1 on error
+pub fn BGPAdvertiseRoute(peer: BGPPeer, prefix: int64, prefixLen: int64, nextHop: int64): int64 {
+  var msg: int64;
+  var n: int64;
+  
+  if (peer.conn.fd < 0 || peer.state != BGP_STATE_ESTABLISHED) {
+    return -1;
+  }
+  
+  msg := BGPBuildUpdate(prefix, prefixLen, nextHop, BGP_ORIGIN_IGP);
+  if (msg == 0) {
+    return -1;
+  }
+  
+  n := TCPConnWrite(peer.conn, msg, BGPGetMessageLength(msg));
+  munmap(msg, BGPGetMessageLength(msg));
+  
+  return n;
+}
+
+// Send BGP UPDATE message (withdraw route)
+// prefix: network prefix (IPv4 as int64)
+// prefixLen: prefix length (0-32)
+// Returns 0 on success, -1 on error
+pub fn BGPWithdrawRoute(peer: BGPPeer, prefix: int64, prefixLen: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var nlriBytes: int64;
+  var updateLen: int64;
+  var n: int64;
+  
+  if (peer.conn.fd < 0 || peer.state != BGP_STATE_ESTABLISHED) {
+    return -1;
+  }
+  
+  nlriBytes := 1 + ((prefixLen + 7) / 8);
+  updateLen := 2 + nlriBytes + 2;  // withdrawn(2) + nlri + path_attrs(2)
+  
+  buf := mmap(0, 19 + updateLen, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return -1;
+  }
+  
+  pos := 0;
+  
+  // Marker
+  i := 0;
+  while (i < BGP_MARKER_SIZE) {
+    poke8(buf + pos + i, 255);
+    i := i + 1;
+  }
+  pos := pos + BGP_MARKER_SIZE;
+  
+  // Length
+  var totalLen: int64 := 19 + updateLen;
+  poke8(buf + pos, (totalLen / 256) - ((totalLen / 65536) * 256));
+  poke8(buf + pos + 1, totalLen - ((totalLen / 256) * 256));
+  pos := pos + 2;
+  
+  // Type (UPDATE = 2)
+  poke8(buf + pos, BGP_MSG_UPDATE);
+  pos := pos + 1;
+  
+  // Withdrawn Routes Length
+  poke8(buf + pos, (nlriBytes / 256) - ((nlriBytes / 65536) * 256));
+  poke8(buf + pos + 1, nlriBytes - ((nlriBytes / 256) * 256));
+  pos := pos + 2;
+  
+  // Withdrawn route (NLRI)
+  poke8(buf + pos, prefixLen);
+  pos := pos + 1;
+  
+  var pfxBytes: int64 := (prefixLen + 7) / 8;
+  var pfx: int64 := prefix;
+  i := 0;
+  while (i < pfxBytes) {
+    poke8(buf + pos + i, (pfx / 16777216) - ((pfx / 4294967296) * 256));
+    pfx := pfx - ((pfx / 16777216) * 16777216);
+    pfx := pfx * 256;
+    i := i + 1;
+  }
+  pos := pos + pfxBytes;
+  
+  // Path Attributes Length (0 = no attributes for withdrawal)
+  poke8(buf + pos, 0);
+  poke8(buf + pos + 1, 0);
+  pos := pos + 2;
+  
+  n := TCPConnWrite(peer.conn, buf, totalLen);
+  munmap(buf, 19 + updateLen);
+  
+  return n;
+}
+
+// Receive BGP message
+// Returns pointer to message buffer (caller must free), or 0 on error
+pub fn BGPRecvMessage(peer: BGPPeer): int64 {
+  var buf: int64;
+  var nread: int64;
+  var msgLen: int64;
+  
+  if (peer.conn.fd < 0) {
+    return 0;
+  }
+  
+  // Read header first (19 bytes)
+  buf := mmap(0, 65536, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  // Read header
+  nread := TCPConnRead(peer.conn, buf, 19);
+  if (nread < 19) {
+    munmap(buf, 65536);
+    return 0;
+  }
+  
+  // Get message length
+  msgLen := (peek8(buf + 16) * 256) + peek8(buf + 17);
+  
+  // Read rest of message if larger than header
+  if (msgLen > 19) {
+    nread := TCPConnRead(peer.conn, buf + 19, msgLen - 19);
+    if (nread < msgLen - 19) {
+      munmap(buf, 65536);
+      return 0;
+    }
+  }
+  
+  return buf;
+}
+
+// Perform BGP OPEN exchange (send OPEN, receive OPEN, send KEEPALIVE)
+// Returns 0 on success, -1 on error
+pub fn BGPPerformOpenExchange(peer: BGPPeer): int64 {
+  var resp: int64;
+  var msgType: int64;
+  var remoteAS: int64;
+  
+  // Send OPEN
+  if (BGPSendOpen(peer) < 0) {
+    return -1;
+  }
+  
+  // Receive response
+  resp := BGPRecvMessage(peer);
+  if (resp == 0) {
+    return -1;
+  }
+  
+  msgType := BGPGetMessageType(resp);
+  
+  if (msgType == BGP_MSG_OPEN) {
+    // Parse remote OPEN
+    remoteAS := BGPParseOpen(resp, BGPGetMessageLength(resp));
+    if (remoteAS > 0) {
+      peer.remoteAS := remoteAS;
+    }
+    munmap(resp, 65536);
+    
+    // Send KEEPALIVE
+    BGPSendKeepalive(peer);
+    peer.state := BGP_STATE_OPENCONFIRM;
+    
+    return 0;
+  }
+  else if (msgType == BGP_MSG_NOTIFICATION) {
+    // Peer rejected us
+    munmap(resp, 65536);
+    return -1;
+  }
+  
+  munmap(resp, 65536);
+  return -1;
+}
+
+// Wait for peer to become established
+// Sends KEEPALIVE periodically
+// Returns 0 when established, -1 on error
+pub fn BGPWaitEstablished(peer: BGPPeer): int64 {
+  var resp: int64;
+  var msgType: int64;
+  
+  // Perform OPEN exchange
+  if (BGPPerformOpenExchange(peer) < 0) {
+    return -1;
+  }
+  
+  // Wait for KEEPALIVE from peer
+  resp := BGPRecvMessage(peer);
+  if (resp == 0) {
+    return -1;
+  }
+  
+  msgType := BGPGetMessageType(resp);
+  munmap(resp, 65536);
+  
+  if (msgType == BGP_MSG_KEEPALIVE) {
+    peer.state := BGP_STATE_ESTABLISHED;
+    return 0;
+  }
+  
+  return -1;
+}
+
+// Convert IPv4 address to int64
+// a.b.c.d -> (a * 16777216) + (b * 65536) + (c * 256) + d
+pub fn BGPIPv4(a: int64, b: int64, c: int64, d: int64): int64 {
+  return (a * 16777216) + (b * 65536) + (c * 256) + d;
+}
+
+// Format IPv4 address as string
+// Returns pointer to null-terminated string (caller must free)
+pub fn BGPFormatIPv4(ip: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var octet: int64;
+  
+  buf := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // First octet
+  octet := ip / 16777216;
+  if (octet >= 100) {
+    poke8(buf + pos, 48 + (octet / 100));
+    pos := pos + 1;
+  }
+  if (octet >= 10) {
+    poke8(buf + pos, 48 + ((octet / 10) - (octet / 100) * 10));
+    pos := pos + 1;
+  }
+  poke8(buf + pos, 48 + (octet - (octet / 10) * 10));
+  pos := pos + 1;
+  poke8(buf + pos, 46);  // .
+  pos := pos + 1;
+  
+  // Second octet
+  octet := (ip / 65536) - ((ip / 16777216) * 256);
+  if (octet >= 100) {
+    poke8(buf + pos, 48 + (octet / 100));
+    pos := pos + 1;
+  }
+  if (octet >= 10) {
+    poke8(buf + pos, 48 + ((octet / 10) - (octet / 100) * 10));
+    pos := pos + 1;
+  }
+  poke8(buf + pos, 48 + (octet - (octet / 10) * 10));
+  pos := pos + 1;
+  poke8(buf + pos, 46);  // .
+  pos := pos + 1;
+  
+  // Third octet
+  octet := (ip / 256) - ((ip / 65536) * 256);
+  if (octet >= 100) {
+    poke8(buf + pos, 48 + (octet / 100));
+    pos := pos + 1;
+  }
+  if (octet >= 10) {
+    poke8(buf + pos, 48 + ((octet / 10) - (octet / 100) * 10));
+    pos := pos + 1;
+  }
+  poke8(buf + pos, 48 + (octet - (octet / 10) * 10));
+  pos := pos + 1;
+  poke8(buf + pos, 46);  // .
+  pos := pos + 1;
+  
+  // Fourth octet
+  octet := ip - ((ip / 256) * 256);
+  if (octet >= 100) {
+    poke8(buf + pos, 48 + (octet / 100));
+    pos := pos + 1;
+  }
+  if (octet >= 10) {
+    poke8(buf + pos, 48 + ((octet / 10) - (octet / 100) * 10));
+    pos := pos + 1;
+  }
+  poke8(buf + pos, 48 + (octet - (octet / 10) * 10));
+  pos := pos + 1;
+  
+  poke8(buf + pos, 0);
+  return buf;
+}
+
+// Disconnect from BGP peer
+pub fn BGPDisconnect(peer: BGPPeer) {
+  if (peer.state == BGP_STATE_ESTABLISHED) {
+    BGPSendNotification(peer, BGP_ERR_CEASE, 0);
+  }
+  if (peer.conn.fd >= 0) {
+    TCPConnClose(peer.conn);
+  }
+  peer.state := BGP_STATE_IDLE;
+}
