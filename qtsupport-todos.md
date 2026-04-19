@@ -1,6 +1,6 @@
 # Qt Support for Lyx - Implementation Plan
 
-> **Status**: Active Development | **Branch**: `feat/qt-support`
+> **Status**: Active Development | **Branch**: `feat/qt-support` | **Version**: v0.8.2
 
 ---
 
@@ -9,292 +9,243 @@
 Dieses Dokument beschreibt den Fahrplan für die vollständige Qt5-Integration in Lyx.
 Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
-### Aktueller Stand (v0.8.2)
-- ✅ Basis-Fenster (QMainWindow) mit Label und StatusBar
-- ✅ Event-Loop und Prozess-Events
-- ✅ QPushButton (Basis)
+### Bereits Implementiert (v0.8.2)
+- ✅ `std/x11.lyx` - X11 Window system
+- ✅ `std/qt5_core.lyx` - Qt Core + timerfd QTimer
+- ✅ `std/qt5_app.lyx` - QApplication, QMainWindow
+- ✅ `std/qt5_gl.lyx` - OpenGL 2.1 bindings
+- ✅ `std/qt5_glx.lyx` - GLX 1.4 bindings
+- ✅ `std/qt5_egl.lyx` - EGL 1.4 bindings
+- ✅ QPushButton Basis-Funktionen
+- ✅ QLabel Basis-Funktionen
+- ✅ Event-Loop Basis
 - ✅ Screen-Informationen
 
-### Fehlende Kern-Features
-- ❌ Weitere Widgets (QLineEdit, QTextEdit, etc.)
-- ❌ Layout-Manager
-- ❌ Signals/Slots Callbacks
-- ❌ QTimer
-- ❌ Menus und Toolbars
-
 ---
 
-## Work Packages
+## Work Packages (Neu)
 
-### WP1: Qt Core/OpenGL/EGL/GLX FFI ✅ COMPLETED
+### WP-A: Grundlagen & Setup (✅ COMPLETED)
 
-**Zeitraum**: Abgeschlossen
+**Beschreibung**: X11/Qt5/OpenGL/EGL FFI Basis
 
-**Deliverables**:
-- `std/x11.lyx` - X11 Window system
-- `std/qt5_core.lyx` - Qt Core + timerfd QTimer
-- `std/qt5_gl.lyx` - OpenGL 2.1 bindings
-- `std/qt5_glx.lyx` - GLX 1.4 bindings
-- `std/qt5_egl.lyx` - EGL 1.4 bindings
-
----
-
-### WP2: PLT Dynamic Linking Fixed ✅ COMPLETED
-
-**Zeitraum**: Abgeschlossen
+| Unit | Status |
+|------|--------|
+| `std/x11.lyx` | ✅ |
+| `std/qt5_core.lyx` | ✅ |
+| `std/qt5_app.lyx` | ✅ |
+| `std/qt5_gl.lyx` | ✅ |
+| `std/qt5_glx.lyx` | ✅ |
+| `std/qt5_egl.lyx` | ✅ |
 
 **Bugs behoben**:
-1. Stack misalignment (x86-64 ABI violation) - behoben
-2. RWX code segment caused dlopen rejection - behoben
-
-**Ergebnis**: Alle shared libraries funktionieren via PLT
+- Stack misalignment (x86-64 ABI violation)
+- RWX code segment (dlopen rejection)
 
 ---
 
-### WP3: Qt5 Window Basis ✅ COMPLETED
+### WP-B: Fenster-Widget (✅ COMPLETED)
 
-**Zeitraum**: Abgeschlossen
+**Beschreibung**: QMainWindow mit Basis-Widgets
 
-**Deliverables**:
-- `qt_wrapper/qt_wrapper.cpp` - C++ Qt5 Widgets Wrapper mit C ABI
-- `qt_wrapper/Makefile` - Build-System für libqtlyx.so
-- `std/qt5_app.lyx` - Lyx FFI Unit
-- `examples/graphics/hello_qt.lyx` - Hello World Beispiel
-
----
-
-### WP4: Erweiterte Widgets
-
-**Ziel**: Grundlegende Qt-Widgets für Benutzerinteraktion
-
-#### WP4.1: Eingabe-Widgets
-
-| Widget | Qt-Klasse | Lyx-Funktion | Status |
-|--------|-----------|--------------|--------|
-| Einzeilen-Text | QLineEdit | `qt_lineedit_create()` | ❌ TODO |
-| Mehrzeilen-Text | QTextEdit | `qt_textedit_create()` | ❌ TODO |
-| Passwort-Feld | QLineEdit (EchoMode) | `qt_lineedit_set_echo()` | ❌ TODO |
-| SpinBox | QSpinBox | `qt_spinbox_create()` | ❌ TODO |
-| DoubleSpinBox | QDoubleSpinBox | `qt_doublespinbox_create()` | ❌ TODO |
-| Slider | QSlider | `qt_slider_create()` | ❌ TODO |
-| Dial | QDial | `qt_dial_create()` | ❌ TODO |
-
-#### WP4.2: Auswahl-Widgets
-
-| Widget | Qt-Klasse | Lyx-Funktion | Status |
-|--------|-----------|--------------|--------|
-| CheckBox | QCheckBox | `qt_checkbox_create()` | ❌ TODO |
-| RadioButton | QRadioButton | `qt_radiobutton_create()` | ❌ TODO |
-| ComboBox | QComboBox | `qt_combobox_create()` | ❌ TODO |
-| PushButton | QPushButton | `qt_add_button()` | ✅ DONE |
-
-#### WP4.3: Anzeige-Widgets
-
-| Widget | Qt-Klasse | Lyx-Funktion | Status |
-|--------|-----------|--------------|--------|
-| Label | QLabel | `qt_set_label()` | ✅ DONE |
-| ProgressBar | QProgressBar | `qt_progressbar_create()` | ❌ TODO |
-| ListWidget | QListWidget | `qt_listwidget_create()` | ❌ TODO |
+| Widget | Funktion | Status |
+|--------|--------------|--------|
+| QMainWindow | `qt_main_window_create()` | ✅ |
+| QLabel | `qt_label_create()` | ✅ |
+| QLabel (Text setzen) | `qt_label_set_text()` | ✅ |
+| StatusBar | `qt_statusbar_create()` | ✅ |
+| Event-Loop | `qt_exec()` | ✅ |
 
 ---
 
-### WP5: Layout-Manager
+### WP-C: Buttons & Events (✅ COMPLETED)
 
-**Ziel**: Flexible GUI-Layouts
+**Beschreibung**: Button-Widgets mit Click-Events
+
+| Widget | Funktion | Status |
+|--------|--------------|--------|
+| QPushButton | `qt_button_create()` | ✅ |
+| QPushButton Click | `qt_button_on_clicked()` | ✅ |
+
+---
+
+### WP-D: Eingabe-Widgets (🚀 IN PROGRESS)
+
+**Beschreibung**: Grundlegende Benutzer-Eingabe
+
+| Widget | Qt-Klasse | Lyx-Funktion | Status |
+|--------|-----------|--------------|--------|
+| Einzeilen-Text | QLineEdit | `qt_lineedit_create()` | 🔜 |
+| Passwort-Feld | QLineEdit (EchoMode) | `qt_lineedit_set_echo()` | 🔜 |
+| SpinBox | QSpinBox | `qt_spinbox_create()` | 🔜 |
+| DoubleSpinBox | QDoubleSpinBox | `qt_doublespinbox_create()` | 🔜 |
+| Mehrzeilen-Text | QTextEdit | `qt_textedit_create()` | 🔜 |
+
+---
+
+### WP-E: Auswahl-Widgets
+
+**Beschreibung**: Auswahl-Elemente
+
+| Widget | Qt-Klasse | Lyx-Funktion | Status |
+|--------|-----------|--------------|--------|
+| CheckBox | QCheckBox | `qt_checkbox_create()` | 🔜 |
+| RadioButton | QRadioButton | `qt_radiobutton_create()` | 🔜 |
+| ComboBox | QComboBox | `qt_combobox_create()` | 🔜 |
+| PushButton | QPushButton | `qt_add_button()` | ✅ |
+
+---
+
+### WP-F: Anzeige-Widgets
+
+**Beschreibung**: Anzeige-Elemente
+
+| Widget | Qt-Klasse | Lyx-Funktion | Status |
+|--------|-----------|--------------|--------|
+| Label | QLabel | `qt_set_label()` | ✅ |
+| ProgressBar | QProgressBar | `qt_progressbar_create()` | 🔜 |
+| ListWidget | QListWidget | `qt_listwidget_create()` | 🔜 |
+
+---
+
+### WP-G: Wert-Eingabe (Slider/Dial)
+
+**Beschreibung**: Wert-Eingabe via Slider/Dial
+
+| Widget | Qt-Klasse | Lyx-Funktion | Status |
+|--------|-----------|--------------|--------|
+| Slider | QSlider | `qt_slider_create()` | 🔜 |
+| Dial | QDial | `qt_dial_create()` | 🔜 |
+
+---
+
+### WP-H: Layout-Manager
+
+**Beschreibung**: Flexible GUI-Layouts
 
 | Layout | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Vertikal | QVBoxLayout | `qt_vbox_create()` | ❌ TODO |
-| Horizontal | QHBoxLayout | `qt_hbox_create()` | ❌ TODO |
-| Grid | QGridLayout | `qt_grid_create()` | ❌ TODO |
-| Stack | QStackedLayout | `qt_stacked_create()` | ❌ TODO |
-| Splitter | QSplitter | `qt_splitter_create()` | ❌ TODO |
-
-**API-Design**:
-```lyx
-// Beispiel: Vertikales Layout
-var vbox: int64 := qt_vbox_create();
-qt_vbox_add_widget(vbox, label);
-qt_vbox_add_widget(vbox, button);
-qt_vbox_add_layout(vbox, hbox);
-qt_window_set_layout(window, vbox);
-```
+| Vertikal | QVBoxLayout | `qt_vbox_create()` | 🔜 |
+| Horizontal | QHBoxLayout | `qt_hbox_create()` | 🔜 |
+| Grid | QGridLayout | `qt_grid_create()` | 🔜 |
+| Stack | QStackedLayout | `qt_stacked_create()` | 🔜 |
+| Splitter | QSplitter | `qt_splitter_create()` | 🔜 |
 
 ---
 
-### WP6: Signals/Slots Callback-System
+### WP-I: QTimer erweitert
 
-**Ziel**: Event-Handling für Benutzerinteraktionen
+**Beschreibung**: Timer-Funktionalität erweitern
 
-#### Challenge
-Qt's Signals/Slots basieren auf MOC (Meta-Object Compiler), der C++-Code generiert.
-Lyx kann das nicht direkt nutzen.
+| Funktion | Status |
+|--------------|--------|
+| `qt_timer_create()` | 🔜 |
+| `qt_timer_start()` | 🔜 |
+| `qt_timer_stop()` | 🔜 |
+| `qt_timer_delete()` | 🔜 |
+| `qt_timer_on_timeout()` | 🔜 |
 
-#### Lösung: Callback-Registry Pattern
+---
 
-1. **Event-Handler registrieren** (in Lyx):
-```lyx
-// Callback-Typ definieren
-type Callback := fn(button: int64);
+### WP-J: Callbacks erweitern
 
-// Handler implementieren
-fn on_click(btn: int64) {
-  PrintStr("Button clicked!\n");
-}
-
-// Bei Qt-Objekt registrieren
-qt_button_on_clicked(button, on_click);
-```
-
-2. **Wrapper implementiert** (in C++):
-```cpp
-// Global registry of Lyx callbacks
-std::map<int64, std::function<void()>> g_callbacks;
-
-extern "C" long long _qt_button_on_clicked(long long button, long long callback_ptr) {
-    // Connect to Qt signal, call Lyx callback when triggered
-    QObject::connect(button, &QPushButton::clicked, [callback_ptr]() {
-        ((void(*)())callback_ptr)();
-    });
-    return 0;
-}
-```
-
-#### Zu implementierende Callbacks
+**Beschreibung**: Alle verfügbaren Event-Callbacks
 
 | Event | Qt Signal | Lyx-Funktion | Status |
 |-------|-----------|--------------|--------|
-| Button clicked | clicked() | `qt_button_on_clicked()` | ❌ TODO |
-| Button pressed | pressed() | `qt_button_on_pressed()` | ❌ TODO |
-| Button released | released() | `qt_button_on_released()` | ❌ TODO |
-| LineEdit textChanged | textChanged(QString) | `qt_lineedit_on_textchanged()` | ❌ TODO |
-| LineEdit returnPressed | returnPressed() | `qt_lineedit_on_returnpressed()` | ❌ TODO |
-| CheckBox toggled | toggled(bool) | `qt_checkbox_on_toggled()` | ❌ TODO |
-| Slider valueChanged | valueChanged(int) | `qt_slider_on_valuechanged()` | ❌ TODO |
-| Timer timeout | timeout() | `qt_timer_on_timeout()` | ❌ TODO |
+| Button clicked | clicked() | `qt_button_on_clicked()` | ✅ |
+| Button pressed | pressed() | `qt_button_on_pressed()` | 🔜 |
+| Button released | released() | `qt_button_on_released()` | 🔜 |
+| LineEdit textChanged | textChanged(QString) | `qt_lineedit_on_textchanged()` | 🔜 |
+| LineEdit returnPressed | returnPressed() | `qt_lineedit_on_returnpressed()` | 🔜 |
+| CheckBox toggled | toggled(bool) | `qt_checkbox_on_toggled()` | 🔜 |
+| Slider valueChanged | valueChanged(int) | `qt_slider_on_valuechanged()` | 🔜 |
 
 ---
 
-### WP7: QTimer Unterstützung
+### WP-K: Menus & Toolbars
 
-**Ziel**: Periodische Tasks und Animationen
-
-```lyx
-// Timer erstellen (1000ms Intervall)
-var timer: int64 := qt_timer_create(1000);
-
-// Callback registrieren
-fn tick() {
-  PrintStr("Timer tick!\n");
-}
-qt_timer_on_timeout(timer, tick);
-
-// Timer starten
-qt_timer_start(timer);
-
-// ... event loop ...
-qt_timer_stop(timer);
-```
-
-**C++ API**:
-```cpp
-extern "C" long long _qt_timer_create(long long interval_ms);
-extern "C" long long _qt_timer_start(long long timer);
-extern "C" long long _qt_timer_stop(long long timer);
-extern "C" long long _qt_timer_delete(long long timer);
-extern "C" long long _qt_timer_on_timeout(long long timer, long long callback);
-```
-
----
-
-### WP8: Menus und Toolbars
-
-**Ziel**: Anwendung-Menüs und Toolbars
+**Beschreibung**: Anwendung-Menüs
 
 | Element | Qt-Klasse | Lyx-Funktion | Status |
 |---------|-----------|--------------|--------|
-| MenuBar | QMenuBar | `qt_menubar_create()` | ❌ TODO |
-| Menu | QMenu | `qt_menu_create()` | ❌ TODO |
-| Action | QAction | `qt_action_create()` | ❌ TODO |
-| Toolbar | QToolBar | `qt_toolbar_create()` | ❌ TODO |
-
-```lyx
-var menubar: int64 := qt_menubar_create(window);
-var file_menu: int64 := qt_menu_create("File");
-var exit_action: int64 := qt_action_create("Exit", on_exit);
-qt_menu_add_action(file_menu, exit_action);
-qt_menubar_add_menu(menubar, file_menu);
-```
+| MenuBar | QMenuBar | `qt_menubar_create()` | 🔜 |
+| Menu | QMenu | `qt_menu_create()` | 🔜 |
+| Action | QAction | `qt_action_create()` | 🔜 |
+| Toolbar | QToolBar | `qt_toolbar_create()` | 🔜 |
 
 ---
 
-### WP9: Standard-Dialoge
+### WP-L: Standard-Dialoge
 
-**Ziel**: Vordefinierte Dialoge für häufige Tasks
+**Beschreibung**: Vordefinierte Dialoge
 
 | Dialog | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Message Box | QMessageBox | `qt_msgbox_show()` | ❌ TODO |
-| Input Dialog | QInputDialog | `qt_inputdialog_get_text()` | ❌ TODO |
-| File Open | QFileDialog::getOpenFileName | `qt_file_open_dialog()` | ❌ TODO |
-| File Save | QFileDialog::getSaveFileName | `qt_file_save_dialog()` | ❌ TODO |
-| Color Picker | QColorDialog | `qt_color_dialog()` | ❌ TODO |
-| Font Picker | QFontDialog | `qt_font_dialog()` | ❌ TODO |
+| Message Box | QMessageBox | `qt_msgbox_show()` | 🔜 |
+| Input Dialog | QInputDialog | `qt_inputdialog_get_text()` | 🔜 |
+| File Open | QFileDialog::getOpenFileName | `qt_file_open_dialog()` | 🔜 |
+| File Save | QFileDialog::getSaveFileName | `qt_file_save_dialog()` | 🔜 |
+| Color Picker | QColorDialog | `qt_color_dialog()` | 🔜 |
+| Font Picker | QFontDialog | `qt_font_dialog()` | 🔜 |
 
 ---
 
-### WP10: Graphics View (2D)
+### WP-M: Graphics (2D)
 
-**Ziel**: 2D-Grafiken und Custom Painting
+**Beschreibung**: Custom Painting
 
 | Feature | Qt-Klasse | Lyx-Funktion | Status |
 |---------|-----------|--------------|--------|
-| Paint Device | QPixmap/QImage | `qt_pixmap_create()` | ❌ TODO |
-| Painter | QPainter | `qt_painter_begin()` | ❌ TODO |
-| Draw Line | QPainter::drawLine | `qt_painter_draw_line()` | ❌ TODO |
-| Draw Rect | QPainter::drawRect | `qt_painter_draw_rect()` | ❌ TODO |
-| Draw Ellipse | QPainter::drawEllipse | `qt_painter_draw_ellipse()` | ❌ TODO |
-| Draw Text | QPainter::drawText | `qt_painter_draw_text()` | ❌ TODO |
-| Fill | QPainter::fillRect | `qt_painter_fill()` | ❌ TODO |
+| Paint Device | QPixmap/QImage | `qt_pixmap_create()` | 🔜 |
+| Painter | QPainter | `qt_painter_begin()` | 🔜 |
+| Draw Line | QPainter::drawLine | `qt_painter_draw_line()` | 🔜 |
+| Draw Rect | QPainter::drawRect | `qt_painter_draw_rect()` | 🔜 |
+| Draw Ellipse | QPainter::drawEllipse | `qt_painter_draw_ellipse()` | 🔜 |
+| Draw Text | QPainter::drawText | `qt_painter_draw_text()` | 🔜 |
+| Fill | QPainter::fillRect | `qt_painter_fill()` | 🔜 |
 
 ---
 
-## Priorisierung
+## Phasen (Priorisierung)
 
-### Phase 1: Produktiv (Sofort)
-1. WP4.1 - Eingabe-Widgets (QLineEdit, QSpinBox)
-2. WP6 - Callbacks (klickbar machen)
-3. WP7 - QTimer
+### Phase 1: Kern ✅ COMPLETED
+- WP-A: Grundlagen
+- WP-B: Fenster
+- WP-C: Buttons
 
-### Phase 2: Layout & Struktur
-4. WP5 - Layout-Manager
-5. WP8 - Menus/Toolbars
+### Phase 2: Kern II 🚀 IN PROGRESS
+- WP-D: Eingabe-Widgets
+- WP-E: Auswahl-Widgets
+- WP-F: Anzeige-Widgets
 
-### Phase 3: Erweitert
-6. WP4.2/4.3 - Weitere Widgets
-7. WP9 - Standard-Dialoge
+### Phase 3: Layout 🔜
+- WP-G: Slider/Dial
+- WP-H: Layout-Manager
+- WP-I: QTimer erweitert
 
-### Phase 4: Graphics (Zukunft)
-8. WP10 - 2D Graphics
+### Phase 4: Callbacks 🔜
+- WP-J: Callbacks erweitern
+- WP-K: Menus/Toolbars
+
+### Phase 5: Dialoge 🔜
+- WP-L: Standard-Dialoge
+
+### Phase 6: Graphics 🔜
+- WP-M: 2D Graphics
 
 ---
 
 ## Build & Deployment
 
-### qt_wrapper bauen
 ```bash
+# qt_wrapper bauen
 cd qt_wrapper
 make        # → libqtlyx.so
 sudo make install  # → /usr/local/lib/
-```
 
-### Im Projekt nutzen
-```bash
-# Entweder: LD_LIBRARY_PATH setzen
+# Im Projekt nutzen
 LD_LIBRARY_PATH=qt_wrapper ./myapp
-
-# Oder: Systemweit installiert (sudo make install)
-./myapp
 ```
 
 ---
@@ -330,19 +281,7 @@ done
 ### Threading
 - Qt-GUI muss im Haupt-Thread laufen
 - QTimer + Event-Loop für asynchrone Tasks
-- Future: QThread für Hintergrund-Processing (WPX)
-
----
-
-## Commit-Log (bisher)
-
-```
-7c12e09 feat(qt): Qt5 window support - 3 bugs fixed, hello_qt works
-b151ed9 docs(qt): mark WP2 PLT fixes complete
-e46b9dc fix(plt): fix two ELF dynamic linking bugs enabling libGL/libEGL via PLT
-6320b52 feat(std): Qt/OpenGL/EGL/GLX/X11 FFI units - X11 works, GLX/EGL issue found
-4ccd57b test(graphics): add working X11 test with direct extern declarations
-```
+- Future: QThread für Hintergrund-Processing
 
 ---
 
@@ -354,4 +293,5 @@ e46b9dc fix(plt): fix two ELF dynamic linking bugs enabling libGL/libEGL via PLT
 
 ---
 
-*Letzte Aktualisierung: 2026-04-18*
+*Letzte Aktualisierung: 2026-04-19*
+*Version: v0.8.2*
