@@ -108,28 +108,28 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-G: Wert-Eingabe (Slider/Dial)
+### WP-G: Wert-Eingabe (Slider/Dial) (✅ COMPLETED)
 
 **Beschreibung**: Wert-Eingabe via Slider/Dial
 
 | Widget | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Slider | QSlider | `qt_slider_create()` | 🔜 |
-| Dial | QDial | `qt_dial_create()` | 🔜 |
+| Slider | QSlider | `qt_slider_create()` | ✅ |
+| Dial | QDial | `qt_dial_create()` | ✅ | |
 
 ---
 
-### WP-H: Layout-Manager
+### WP-H: Layout-Manager (✅ COMPLETED)
 
 **Beschreibung**: Flexible GUI-Layouts
 
 | Layout | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Vertikal | QVBoxLayout | `qt_vbox_create()` | 🔜 |
-| Horizontal | QHBoxLayout | `qt_hbox_create()` | 🔜 |
-| Grid | QGridLayout | `qt_grid_create()` | 🔜 |
-| Stack | QStackedLayout | `qt_stacked_create()` | 🔜 |
-| Splitter | QSplitter | `qt_splitter_create()` | 🔜 |
+| Vertikal | QVBoxLayout | `qt_vbox_create()` | ✅ |
+| Horizontal | QHBoxLayout | `qt_hbox_create()` | ✅ |
+| Grid | QGridLayout | `qt_grid_create()` | ✅ |
+| Stack | QStackedLayout | `qt_stacked_create()` | 🟡 |
+| Splitter | QSplitter | `qt_splitter_create()` | ✅ |
 
 ---
 
@@ -219,10 +219,10 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 - WP-E: Auswahl-Widgets ✅
 - WP-F: Anzeige-Widgets ✅
 
-### Phase 3: Layout 🔜
-- WP-G: Slider/Dial
-- WP-H: Layout-Manager
-- WP-I: QTimer erweitert
+### Phase 3: Layout ✅ COMPLETED
+- WP-G: Slider/Dial ✅
+- WP-H: Layout-Manager ✅
+- WP-I: QTimer erweitert 🔜
 
 ### Phase 4: Callbacks 🔜
 - WP-J: Callbacks erweitern
