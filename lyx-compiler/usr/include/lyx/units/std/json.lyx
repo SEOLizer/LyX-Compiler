@@ -1,0 +1,479 @@
+// std/json.lyx
+// JSON Parser und Serializer für Lyx
+// Unterstützt: Arrays, Strings, Zahlen, Booleans, null
+
+unit std.json;
+
+// ============================================================================
+// Typen
+// ============================================================================
+
+// JSON Value Typen
+con JSON_NULL: int64 := 0;
+con JSON_BOOL: int64 := 1;
+con JSON_NUMBER: int64 := 2;
+con JSON_STRING: int64 := 3;
+con JSON_ARRAY: int64 := 4;
+con JSON_OBJECT: int64 := 5;
+
+// JSON Value (vereinfacht - speichert Typ und String-Repräsentation)
+pub type JSON: int64;
+
+// ============================================================================
+// Fehler-Codes
+// ============================================================================
+
+pub con ERR_JSON_OK: int64 := 0;
+pub con ERR_JSON_INVALID: int64 := 1;
+pub con ERR_JSON_EXPECTED: int64 := 2;
+pub con ERR_JSON_EOF: int64 := 3;
+pub con ERR_JSON_ESCAPE: int64 := 4;
+
+// ============================================================================
+// Interne Hilfsfunktionen
+// ============================================================================
+
+fn is_digit(c: int64): bool {
+  return c >= 48 && c <= 57;
+}
+
+fn is_alpha(c: int64): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+fn is_whitespace_json(c: int64): bool {
+  return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// ============================================================================
+// String-Escaping (wichtig für gültiges JSON!)
+// ============================================================================
+
+// String zu JSON-String konvertieren (mit Escaping)
+pub fn JSONEscape(dest: pchar, src: pchar): pchar {
+  var src_len: int64 := StrLength(src);
+  var j: int64 := 0;
+  var i: int64 := 0;
+  
+  StrSetChar(dest, j, 34);  // '"'
+  j := j + 1;
+  
+  while (i < src_len) {
+    var c: int64 := StrCharAt(src, i);
+    
+    // Escape-Sequenzen
+    if (c == 34) {  // '"'
+      StrSetChar(dest, j, 92); j := j + 1;  // '\'
+      StrSetChar(dest, j, 34); j := j + 1;  // '"'
+    }
+    else if (c == 92) {  // '\\'
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 92); j := j + 1;
+    }
+    else if (c == 10) {  // newline
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 110); j := j + 1;  // 'n'
+    }
+    else if (c == 13) {  // carriage return
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 114); j := j + 1;  // 'r'
+    }
+    else if (c == 9) {  // tab
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 116); j := j + 1;  // 't'
+    }
+    else {
+      StrSetChar(dest, j, c); j := j + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  StrSetChar(dest, j, 34);  // '"'
+  j := j + 1;
+  StrSetChar(dest, j, 0);
+  
+  return dest;
+}
+
+// JSON-String zuplain String (unescape)
+fn JSONUnescape(dest: pchar, src: pchar): pchar {
+  var src_len: int64 := StrLength(src);
+  var j: int64 := 0;
+  var i: int64 := 0;
+  
+  // Überspringe führende "
+  if (src_len > 0 && StrCharAt(src, 0) == 34) {
+    i := i + 1;
+  }
+  
+  while (i < src_len) {
+    var c: int64 := StrCharAt(src, i);
+    
+    if (c == 92 && i + 1 < src_len) {  // '\\'
+      i := i + 1;
+      c := StrCharAt(src, i);
+      
+      if (c == 34) { StrSetChar(dest, j, 34); }  // '"'
+      else if (c == 92) { StrSetChar(dest, j, 92); }  // '\\'
+      else if (c == 110) { StrSetChar(dest, j, 10); }  // 'n'
+      else if (c == 114) { StrSetChar(dest, j, 13); }  // 'r'
+      else if (c == 116) { StrSetChar(dest, j, 9); }  // 't'
+      else { StrSetChar(dest, j, c); }
+    }
+    else if (c == 34) {
+      // Ende
+      break;
+    }
+    else {
+      StrSetChar(dest, j, c);
+    }
+    
+    i := i + 1;
+    j := j + 1;
+  }
+  
+  StrSetChar(dest, j, 0);
+  return dest;
+}
+
+// ============================================================================
+// JSON Parser (intern)
+// ============================================================================
+
+// Findet Matching-Klammer
+fn find_matching(s: pchar, start: int64, open: int64, close: int64): int64 {
+  var depth: int64 := 0;
+  var i: int64 := start;
+  var len: int64 := StrLength(s);
+  var in_string: bool := false;
+  
+  while (i < len) {
+    var c: int64 := StrCharAt(s, i);
+    
+    if (c == 34 && (i == 0 || StrCharAt(s, i - 1) != 92)) {  // '"'
+      in_string := not in_string;
+    }
+    else if (not in_string) {
+      if (c == open) { depth := depth + 1; }
+      else if (c == close) { 
+        depth := depth - 1;
+        if (depth == 0) { return i; }
+      }
+    }
+    
+    i := i + 1;
+  }
+  
+  return -1;  // Nicht gefunden
+}
+
+// Zählt Elemente in JSON-Array
+fn count_array_elements(s: pchar, start: int64, end: int64): int64 {
+  var count: int64 := 0;
+  var i: int64 := start;
+  var in_string: bool := false;
+  var depth: int64 := 0;
+  
+  while (i < end) {
+    var c: int64 := StrCharAt(s, i);
+    
+    if (c == 34 && (i == 0 || StrCharAt(s, i - 1) != 92)) {
+      in_string := not in_string;
+    }
+    else if (not in_string) {
+      if (c == 91) { depth := depth + 1; }  // '['
+      else if (c == 93) { depth := depth - 1; }  // ']'
+      else if (c == 123) { depth := depth + 1; }  // '{'
+      else if (c == 125) { depth := depth - 1; }  // '}'
+      else if (depth == 0 && c == 44) {  // ','
+        count := count + 1;
+      }
+    }
+    
+    i := i + 1;
+  }
+  
+  return count + 1;
+}
+
+// ============================================================================
+// Öffentliche API
+// ============================================================================
+
+// Validiert JSON-String
+pub fn isValidJSON(s: pchar): bool {
+  var len: int64 := StrLength(s);
+  if (len == 0) { return false; }
+  
+  var c: int64 := StrCharAt(s, 0);
+  
+  // Array
+  if (c == 91) {  // '['
+    var end: int64 := find_matching(s, 1, 91, 93);
+    return end > 1;
+  }
+  
+  // Object
+  if (c == 123) {  // '{'
+    var end: int64 := find_matching(s, 1, 123, 125);
+    return end > 1;
+  }
+  
+  // String
+  if (c == 34) {  // '"'
+    var end: int64 := len - 1;
+    while (end > 0) {
+      if (StrCharAt(s, end) == 34 && StrCharAt(s, end - 1) != 92) {
+        return true;
+      }
+      end := end - 1;
+    }
+    return false;
+  }
+  
+  // Number, bool, null
+  return true;
+}
+
+// Einfaches JSON-Array parsen
+// Gibt String mit Elementen zurück (pipe-getrennt: "elem1|elem2|elem3")
+// BUFFER muss mindestens 4096 Zeichen fassen
+pub fn parseArray(dest: pchar, src: pchar): int64 {
+  var len: int64 := StrLength(src);
+  if (len == 0) { 
+    StrSetChar(dest, 0, 0);
+    return ERR_JSON_INVALID;
+  }
+  
+  // Prüfe ob Array mit [ beginnt
+  if (StrCharAt(src, 0) != 91) {  // '['
+    StrSetChar(dest, 0, 0);
+    return ERR_JSON_EXPECTED;
+  }
+  
+  // Finde schließende ]
+  var end: int64 := find_matching(src, 1, 91, 93);
+  if (end < 0) {
+    StrSetChar(dest, 0, 0);
+    return ERR_JSON_EOF;
+  }
+  
+  // Zähle Elemente
+  var count: int64 := count_array_elements(src, 1, end);
+  
+  // Parser: extrahiere Elemente
+  var i: int64 := 1;
+  var elem_idx: int64 := 0;
+  var elem_start: int64 := 1;
+  var in_string: bool := false;
+  var depth: int64 := 0;
+  var result_len: int64 := 0;
+  
+  while (i <= end) {
+    var c: int64 := 0;
+    if (i < len) { c := StrCharAt(src, i); }
+    
+    if (i < len && c == 34 && (i == 0 || StrCharAt(src, i - 1) != 92)) {
+      in_string := not in_string;
+    }
+    else if (not in_string) {
+      if (c == 91 || c == 123) { depth := depth + 1; }
+      else if (c == 93 || c == 125) { depth := depth - 1; }
+    }
+    
+    // Element-Trenner gefunden
+    if (i == end || (depth == 0 && not in_string && c == 44)) {
+      var elem_len: int64 := i - elem_start;
+      if (elem_len > 0) {
+        // Element kopieren (ohne führende/folgende Leerzeichen)
+        while (elem_len > 0 && is_whitespace_json(StrCharAt(src, elem_start))) {
+          elem_start := elem_start + 1;
+          elem_len := elem_len - 1;
+        }
+        while (elem_len > 0 && is_whitespace_json(StrCharAt(src, elem_start + elem_len - 1))) {
+          elem_len := elem_len - 1;
+        }
+        
+        // Kopiere Element nach dest
+        var j: int64 := 0;
+        while (j < elem_len) {
+          StrSetChar(dest, result_len, StrCharAt(src, elem_start + j));
+          result_len := result_len + 1;
+          j := j + 1;
+        }
+        
+        // Pipe-Trenner (außer beim letzten Element)
+        if (i < end) {
+          StrSetChar(dest, result_len, 124);  // '|'
+          result_len := result_len + 1;
+        }
+      }
+      
+      elem_start := i + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  StrSetChar(dest, result_len, 0);
+  return ERR_JSON_OK;
+}
+
+// JSON-Array aus Pipe-getrennten String erstellen
+// Input: "elem1|elem2|elem3"
+// Output: ["elem1","elem2","elem3"]
+pub fn serializeArray(dest: pchar, src: pchar): pchar {
+  var src_len: int64 := StrLength(src);
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var elem_start: int64 := 0;
+  
+  StrSetChar(dest, j, 91);  // '['
+  j := j + 1;
+  
+  while (i <= src_len) {
+    var c: int64 := 0;
+    if (i < src_len) { c := StrCharAt(src, i); }
+    
+    // Pipe-Trenner oder Ende
+    if (i == src_len || c == 124) {
+      var elem_len: int64 := i - elem_start;
+      
+      // Element umwandeln
+      var elem_buf: pchar := "                                                                                ";
+      var k: int64 := 0;
+      while (k < elem_len) {
+        StrSetChar(elem_buf, k, StrCharAt(src, elem_start + k));
+        k := k + 1;
+      }
+      StrSetChar(elem_buf, elem_len, 0);
+      
+      // JSON-escapen und einfügen
+      var escaped: pchar := "                                                                                ";
+      JSONEscape(escaped, elem_buf);
+      
+      // Kopiere escaped Element
+      k := 0;
+      while (StrCharAt(escaped, k) != 0) {
+        StrSetChar(dest, j, StrCharAt(escaped, k));
+        j := j + 1;
+        k := k + 1;
+      }
+      
+      if (i < src_len) {
+        StrSetChar(dest, j, 44);  // ','
+        j := j + 1;
+      }
+      
+      elem_start := i + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  // Ersetze letztes Komma durch ]
+  if (j > 1 && StrCharAt(dest, j - 1) == 44) {
+    j := j - 1;
+  }
+  
+  StrSetChar(dest, j, 93);  // ']'
+  j := j + 1;
+  StrSetChar(dest, j, 0);
+  
+  return dest;
+}
+
+// Einzelnes Element parsen (liefert Typ + Wert)
+pub fn parseValue(dest: pchar, src: pchar): int64 {
+  var len: int64 := StrLength(src);
+  if (len == 0) { return JSON_NULL; }
+  
+  var c: int64 := StrCharAt(src, 0);
+  
+  // String
+  if (c == 34) {
+    JSONUnescape(dest, src);
+    return JSON_STRING;
+  }
+  
+  // Array
+  if (c == 91) {
+    parseArray(dest, src);
+    return JSON_ARRAY;
+  }
+  
+  // Object
+  if (c == 123) {
+    return JSON_OBJECT;
+  }
+  
+  // null
+  if (len >= 4 && StrCharAt(src, 0) == 110 && StrCharAt(src, 1) == 117 &&
+      StrCharAt(src, 2) == 108 && StrCharAt(src, 3) == 108) {
+    StrSetChar(dest, 0, 110); StrSetChar(dest, 1, 117); StrSetChar(dest, 2, 108); 
+    StrSetChar(dest, 3, 108); StrSetChar(dest, 4, 0);
+    return JSON_NULL;
+  }
+  
+  // true
+  if (len >= 4 && StrCharAt(src, 0) == 116 && StrCharAt(src, 1) == 114 &&
+      StrCharAt(src, 2) == 117 && StrCharAt(src, 3) == 101) {
+    StrSetChar(dest, 0, 116); StrSetChar(dest, 1, 114); StrSetChar(dest, 2, 117); 
+    StrSetChar(dest, 3, 101); StrSetChar(dest, 4, 0);
+    return JSON_BOOL;
+  }
+  
+  // false
+  if (len >= 5 && StrCharAt(src, 0) == 102 && StrCharAt(src, 1) == 97 &&
+      StrCharAt(src, 2) == 108 && StrCharAt(src, 3) == 115 && StrCharAt(src, 4) == 101) {
+    StrSetChar(dest, 0, 102); StrSetChar(dest, 1, 97); StrSetChar(dest, 2, 108); 
+    StrSetChar(dest, 3, 115); StrSetChar(dest, 4, 101); StrSetChar(dest, 5, 0);
+    return JSON_BOOL;
+  }
+  
+  // Number oder anderes
+  var i: int64 := 0;
+  while (i < len) {
+    StrSetChar(dest, i, StrCharAt(src, i));
+    i := i + 1;
+  }
+  StrSetChar(dest, len, 0);
+  
+  return JSON_NUMBER;
+}
+
+// Element zu JSON-String serialisieren
+pub fn serializeValue(dest: pchar, value: pchar, json_type: int64): pchar {
+  if (json_type == JSON_STRING) {
+    return JSONEscape(dest, value);
+  }
+  
+  // Andere Typen: direkt kopieren
+  var i: int64 := 0;
+  while (StrCharAt(value, i) != 0) {
+    StrSetChar(dest, i, StrCharAt(value, i));
+    i := i + 1;
+  }
+  StrSetChar(dest, i, 0);
+  
+  return dest;
+}
+
+// Wrapper: String zu JSON-Array (API für Benutzer)
+pub fn toArray(dest: pchar, json_str: pchar): pchar {
+  var result: int64 := parseArray(dest, json_str);
+  if (result != ERR_JSON_OK) {
+    StrSetChar(dest, 0, 0);
+  }
+  return dest;
+}
+
+// Wrapper: Array zu JSON-String
+pub fn stringify(dest: pchar, pipe_str: pchar): pchar {
+  return serializeArray(dest, pipe_str);
+}
+
+// ============================================================================
+// Ende std/json.lyx
+// ============================================================================
