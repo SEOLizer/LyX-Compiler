@@ -191,19 +191,21 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-M: Graphics (2D)
+### WP-M: Graphics (2D) (✅ COMPLETED)
 
 **Beschreibung**: Custom Painting
 
 | Feature | Qt-Klasse | Lyx-Funktion | Status |
 |---------|-----------|--------------|--------|
-| Paint Device | QPixmap/QImage | `qt_pixmap_create()` | 🔜 |
-| Painter | QPainter | `qt_painter_begin()` | 🔜 |
-| Draw Line | QPainter::drawLine | `qt_painter_draw_line()` | 🔜 |
-| Draw Rect | QPainter::drawRect | `qt_painter_draw_rect()` | 🔜 |
-| Draw Ellipse | QPainter::drawEllipse | `qt_painter_draw_ellipse()` | 🔜 |
-| Draw Text | QPainter::drawText | `qt_painter_draw_text()` | 🔜 |
-| Fill | QPainter::fillRect | `qt_painter_fill()` | 🔜 |
+| Paint Device | QPixmap | `qt_pixmap_create()` | ✅ |
+| Painter | QPainter | `qt_painter_begin()` | ✅ |
+| Draw Line | QPainter::drawLine | `qt_painter_draw_line()` | ✅ |
+| Draw Rect | QPainter::drawRect | `qt_painter_draw_rect()` | ✅ |
+| Draw Ellipse | QPainter::drawEllipse | `qt_painter_draw_ellipse()` | ✅ |
+| Draw Text | QPainter::drawText | `qt_painter_draw_text()` | ✅ |
+| Fill | QPainter::fillRect | `qt_painter_fill_rect()` | ✅ |
+| Color Picker | QColorDialog | `qt_color_dialog()` | 🟡 |
+| Font Picker | QFontDialog | `qt_font_dialog()` | 🟡 |
 
 ---
 
@@ -231,8 +233,8 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 ### Phase 5: Dialoge ✅ COMPLETED
 - WP-L: Standard-Dialoge ✅
 
-### Phase 6: Graphics 🔜 (OFFEN)
-- WP-M: 2D Graphics (nicht implementiert)
+### Phase 6: Graphics ✅ COMPLETED
+- WP-M: 2D Graphics ✅ (Color/Font Picker 🟡)
 
 ---
 
