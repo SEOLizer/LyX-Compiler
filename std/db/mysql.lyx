@@ -364,12 +364,24 @@ fn buildHandshakeResp41(conn: MySQLConn, buf: int64, authHash: int64): int64 {
             poke8(buf + pos + j, c);
             j := j + 1;
         }
-        poke8(buf + pos + j, 0); // Null-terminieren
+        poke8(buf + pos + j, 0);
         pos := pos + j + 1;
     } else {
         poke8(buf + pos, 0);
         pos := pos + 1;
     }
+
+    // Auth plugin name (required when CLIENT_PLUGIN_AUTH is set)
+    var pluginName: pchar := "mysql_native_password";
+    j := 0;
+    while (j < 32) {
+        var pc: int64 := peek8(pluginName + j);
+        if (pc == 0) { break; }
+        poke8(buf + pos + j, pc);
+        j := j + 1;
+    }
+    poke8(buf + pos + j, 0);
+    pos := pos + j + 1;
 
     return pos;
 }
@@ -479,6 +491,35 @@ pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pcha
         return conn;
     }
 
+    // Parse scramble from MySQL 4.1 handshake packet:
+    // proto(1) | server_ver(\0) | conn_id(4) | scramble_part1(8) | filler(1) |
+    // cap_low(2) | charset(1) | status(2) | cap_high(2) | plugin_data_len(1) | reserved(10) | scramble_part2(12+)
+    var hsPos: int64 := 1;
+    while (hsPos < handshakeLen && peek8(handshake + hsPos) != 0) { hsPos := hsPos + 1; }
+    hsPos := hsPos + 1; // skip null terminator of server version string
+    hsPos := hsPos + 4; // skip connection ID (4 bytes)
+
+    var si: int64 := 0;
+    while (si < 8) {
+        poke8(conn.server_scramble + si, peek8(handshake + hsPos + si));
+        si := si + 1;
+    }
+    hsPos := hsPos + 8;
+    hsPos := hsPos + 1; // skip filler
+    hsPos := hsPos + 2; // skip capability flags lower 2 bytes
+    hsPos := hsPos + 1; // skip charset
+    hsPos := hsPos + 2; // skip status flags
+    hsPos := hsPos + 2; // skip capability flags upper 2 bytes
+    hsPos := hsPos + 1; // skip auth_plugin_data_len
+    hsPos := hsPos + 10; // skip reserved
+
+    // Copy auth-plugin-data-part-2 (bytes 8..19 of 20-byte scramble)
+    si := 0;
+    while (si < 12) {
+        poke8(conn.server_scramble + 8 + si, peek8(handshake + hsPos + si));
+        si := si + 1;
+    }
+
     conn.cap_flags := DEFAULT_CAP_FLAGS;
     conn.charset := 33; // UTF8_GENERAL_CI
     conn.status := 2;  // SERVER_STATUS_AUTOCOMMIT
@@ -492,7 +533,7 @@ pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pcha
         if (authHash > 0) {
             var passLen: int64 := 0;
             while (peek8(conn.password + passLen) != 0) { passLen := passLen + 1; }
-            SHA1MySQLNativePassword(conn.password, passLen, conn.server_scramble, authHash);
+            SHA1MySQLNativePassword(conn.password as int64, passLen, conn.server_scramble, authHash);
         }
     }
 
@@ -539,19 +580,42 @@ pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pcha
     var firstByte: int64 := peek8(authPacket);
 
     if (firstByte == 0xFE) {
-        if (conn.password != "") {
-            conn.error_num := 2008;
-            munmap(authPacket, authLen + 1);
-            sys_close(fd);
-            conn.fd := -1;
-            return conn;
-        }
+        // Auth-switch request: 0xFE | plugin_name\0 | new_scramble\0
+        // Extract new scramble from switch packet and re-hash
+        var swPos: int64 := 1;
+        while (swPos < authLen && peek8(authPacket + swPos) != 0) { swPos := swPos + 1; }
+        swPos := swPos + 1; // skip plugin name null terminator
 
-        var emptyBuf: int64 := mmap(0, 1, 3, 34, -1, 0);
-        if (emptyBuf > 0) {
-            poke8(emptyBuf, 0);
-            MySQLSendPacket(conn, emptyBuf, 1);
-            munmap(emptyBuf, 1);
+        // Overwrite server_scramble with the new scramble from the switch request
+        si := 0;
+        while (si < 20 && swPos + si < authLen) {
+            var swByte: int64 := peek8(authPacket + swPos + si);
+            if (swByte == 0) { break; }
+            poke8(conn.server_scramble + si, swByte);
+            si := si + 1;
+        }
+        while (si < 20) {
+            poke8(conn.server_scramble + si, 0);
+            si := si + 1;
+        }
+        munmap(authPacket, authLen + 1);
+
+        if (conn.password != "") {
+            var switchHash: int64 := mmap(0, SCRAMBLE_LENGTH, 3, 34, -1, 0);
+            if (switchHash > 0) {
+                var passLen2: int64 := 0;
+                while (peek8(conn.password + passLen2) != 0) { passLen2 := passLen2 + 1; }
+                SHA1MySQLNativePassword(conn.password as int64, passLen2, conn.server_scramble, switchHash);
+                MySQLSendPacket(conn, switchHash, SCRAMBLE_LENGTH);
+                munmap(switchHash, SCRAMBLE_LENGTH);
+            }
+        } else {
+            var emptyBuf: int64 := mmap(0, 1, 3, 34, -1, 0);
+            if (emptyBuf > 0) {
+                poke8(emptyBuf, 0);
+                MySQLSendPacket(conn, emptyBuf, 0);
+                munmap(emptyBuf, 1);
+            }
         }
 
         var finalPacket: int64 := MySQLReadPacket(conn);
@@ -559,7 +623,6 @@ pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pcha
 
         if (finalPacket <= 0) {
             conn.error_num := 2009;
-            munmap(authPacket, authLen + 1);
             sys_close(fd);
             conn.fd := -1;
             return conn;
@@ -572,14 +635,12 @@ pub fn MySQLConnect(host: pchar, port: int64, user: pchar, pass: pchar, db: pcha
             var f2: int64 := peek8(finalPacket + 2);
             conn.error_num := f1 | (f2 << 8);
             munmap(finalPacket, finalLen + 1);
-            munmap(authPacket, authLen + 1);
             sys_close(fd);
             conn.fd := -1;
             return conn;
         }
 
         munmap(finalPacket, finalLen + 1);
-        munmap(authPacket, authLen + 1);
         return conn;
     }
 
