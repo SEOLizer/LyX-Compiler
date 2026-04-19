@@ -30,7 +30,8 @@ type
     lrIncompleteSwitch,    // W018: Switch ohne default oder ohne alle Enum-Werte (MISRA 5.2)
     lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
     lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
-    lrDeadLoop            // W016: Endlosschleife ohne exit condition / break
+    lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
+    lrGlobalMutable     // W021: var auf Modulebene (Race Conditions)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -57,7 +58,8 @@ const
     lrIncompleteSwitch,
     lrFunctionTooLong,
     lrComplexFunction,
-    lrDeadLoop
+    lrDeadLoop,
+    lrGlobalMutable
   ];
 
   { Human-readable Namen für die Regeln }
@@ -81,14 +83,16 @@ const
     'incomplete-switch',
     'function-too-long',
     'complex-function',
-    'dead-loop'
+    'dead-loop',
+    'global-mutable'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
-    'W016', 'W017', 'W018', 'W019', 'W020'
+    'W016', 'W017', 'W018', 'W019', 'W020',
+    'W021'
   );
 
 type
@@ -163,6 +167,7 @@ type
     function CalculateCyclomaticComplexity(fn: TAstFuncDecl): Integer;
     procedure CheckCyclomaticComplexity(fn: TAstFuncDecl);
     procedure CheckDeadLoop(loop: TAstWhile);
+    procedure CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -536,6 +541,10 @@ begin
       { Naming-Prüfung }
       if TAstVarDecl(stmt).Storage in [skVar, skLet, skCo] then
         CheckVariableNaming(TAstVarDecl(stmt).Name, stmt.Span);
+
+      { W021: Check for global mutable }
+      if (lrGlobalMutable in FActiveRules) and (FScopeCount <= 1) then
+        CheckGlobalMutable(TAstVarDecl(stmt), FScopeCount);
 
       { Variable im Scope registrieren }
       DeclareVar(TAstVarDecl(stmt).Name, TAstVarDecl(stmt).Storage,
@@ -1092,6 +1101,25 @@ begin
     Warn(lrDeadLoop,
       'infinite loop without break; add limit() or break for WCET predictability',
       loop.Span);
+end;
+
+{ --- W021: Global Mutable Variable Detection --- }
+procedure TLinter.CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
+begin
+  // Warn about mutated globals at module scope
+  // These can cause race conditions in concurrent code
+  if decl = nil then Exit;
+  if not (lrGlobalMutable in FActiveRules) then Exit;
+
+  // Only warn about module-level var/let (not const/immutable)
+  if decl.Storage in [skVar, skLet] then
+  begin
+    // Allow only if marked as co (compile-time constant)
+    if decl.Storage <> skCo then
+      Warn(lrGlobalMutable,
+        'mutable state at module level may cause race conditions; consider using let or co',
+        decl.Span);
+  end;
 end;
 
 { --- MISRA #19: Max Function Length (60 lines) --- }
