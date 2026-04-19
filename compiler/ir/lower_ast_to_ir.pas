@@ -126,6 +126,7 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FLabelCounter := 0;
     FLocalMap := TStringList.Create;
     FLocalMap.Sorted := False;
+    FLocalMap.CaseSensitive := True;
     FConstMap := TStringList.Create;
     FConstMap.Sorted := False;
     FBreakStack := TStringList.Create;
