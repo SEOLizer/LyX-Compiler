@@ -1,0 +1,1445 @@
+// Lyx Network Library - Socket API
+// Blocking and non-blocking socket operations
+
+unit std.net.socket;
+
+import std.net.types;
+import std.net.syscalls;
+
+// ============================================================================
+// Memory Buffer Allocation
+// ============================================================================
+
+// Allocate a memory buffer using mmap
+// Returns pointer to buffer, or 0 on failure
+pub fn BufferAlloc(size: int64): int64 {
+  // mmap(addr=0, length=size, prot=RW, flags=MAP_ANONYMOUS|MAP_PRIVATE, fd=-1, offset=0)
+  return mmap(0, size, PROT_RW, MAP_ANON, FD_NONE, 0);
+}
+
+// Free a memory buffer allocated with BufferAlloc
+pub fn BufferFree(buf: int64, size: int64): int64 {
+  return munmap(buf, size);
+}
+
+// ============================================================================
+// TCP Listener
+// ============================================================================
+
+pub type TCPListener = struct {
+  fd: int64;
+};
+
+// Create a new TCP listener
+pub fn TCPListenerNew(): TCPListener {
+  var listener: TCPListener;
+  var fd: int64;
+
+  // Create socket
+  fd := sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) {
+    listener.fd := -1;
+    return listener;
+  }
+
+  listener.fd := fd;
+  return listener;
+}
+
+// Set SO_REUSEADDR option (call before bind)
+pub fn TCPListenerSetReuseAddr(listener: TCPListener): int64 {
+  var optval: int64 := 1;
+  // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval))
+  return sys_setsockopt(listener.fd, SOL_SOCKET, SO_REUSEADDR, optval, 4);
+}
+
+// Set SO_REUSEPORT option (call before bind)
+// Allows multiple sockets to bind to the same port
+pub fn TCPListenerSetReusePort(listener: TCPListener): int64 {
+  var optval: int64 := 1;
+  return sys_setsockopt(listener.fd, SOL_SOCKET, SO_REUSEPORT, optval, 4);
+}
+
+// Set listen backlog queue size
+pub fn TCPListenerSetBacklog(listener: TCPListener, backlog: int64): int64 {
+  return sys_listen(listener.fd, backlog);
+}
+
+// Bind to address and port
+// addr: pointer to sockaddr_in structure (16 bytes)
+pub fn TCPListenerBind(listener: TCPListener, addr: int64): int64 {
+  return sys_bind(listener.fd, addr, 16);
+}
+
+// Bind to IP and port (convenience function)
+// ip: packed IP address (use IPPack)
+// port: port number in host byte order
+pub fn TCPListenerBindTo(listener: TCPListener, ip: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+  
+  // Allocate sockaddr_in on stack (use mmap for now)
+  addr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+  
+  // Fill sockaddr_in structure using helper
+  SockAddrInCreate(addr, ip, port);
+  
+  ret := sys_bind(listener.fd, addr, 16);
+  munmap(addr, 16);
+  return ret;
+}
+
+// Start listening
+pub fn TCPListenerListen(listener: TCPListener, backlog: int64): int64 {
+  return sys_listen(listener.fd, backlog);
+}
+
+// Accept a connection (simplified - no client address)
+pub fn TCPListenerAccept(listener: TCPListener): TCPConn {
+  var conn: TCPConn;
+  var clientFd: int64;
+  
+  // Accept with null pointers (0) for address
+  clientFd := sys_accept(listener.fd, 0, 0);
+  if (clientFd < 0) {
+    conn.fd := -1;
+    return conn;
+  }
+
+  conn.fd := clientFd;
+  return conn;
+}
+
+// Close listener
+pub fn TCPListenerClose(listener: TCPListener) {
+  if (listener.fd >= 0) {
+    sys_close(listener.fd);
+  }
+}
+
+// ============================================================================
+// TCP Connection
+// ============================================================================
+
+pub type TCPConn = struct {
+  fd: int64;
+};
+
+// Read from connection
+pub fn TCPConnRead(conn: TCPConn, buf: int64, n: int64): int64 {
+  return sys_read(conn.fd, buf, n);
+}
+
+// Write to connection
+pub fn TCPConnWrite(conn: TCPConn, buf: int64, n: int64): int64 {
+  return sys_write(conn.fd, buf, n);
+}
+
+// Close connection
+pub fn TCPConnClose(conn: TCPConn) {
+  if (conn.fd >= 0) {
+    sys_close(conn.fd);
+  }
+}
+
+// ============================================================================
+// TCP Options
+// ============================================================================
+
+// Set TCP_NODELAY (disable Nagle's algorithm)
+// Returns 0 on success, -1 on error
+pub fn TCPConnSetNodelay(conn: TCPConn, enable: bool): int64 {
+  var optval: int64;
+  if (enable) {
+    optval := 1;
+  } else {
+    optval := 0;
+  }
+  return sys_setsockopt(conn.fd, IPPROTO_TCP, TCP_NODELAY, optval, 4);
+}
+
+// Set SO_KEEPALIVE (enable TCP keep-alive probes)
+// Returns 0 on success, -1 on error
+pub fn TCPConnSetKeepAlive(conn: TCPConn, enable: bool): int64 {
+  var optval: int64;
+  if (enable) {
+    optval := 1;
+  } else {
+    optval := 0;
+  }
+  return sys_setsockopt(conn.fd, SOL_SOCKET, SO_KEEPALIVE, optval, 4);
+}
+
+// Get socket error status (SO_ERROR)
+// Returns 0 if no error, or errno value
+pub fn TCPConnGetError(conn: TCPConn): int64 {
+  var optval: int64 := 0;
+  var result: int64;
+  // getsockopt returns 0 on success, -1 on error
+  result := sys_getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, optval, 4);
+  if (result < 0) {
+    return result;
+  }
+  return optval;
+}
+
+// Set socket receive buffer size (SO_RCVBUF)
+// Returns 0 on success, -1 on error
+pub fn TCPConnSetRecvBuf(conn: TCPConn, size: int64): int64 {
+  return sys_setsockopt(conn.fd, SOL_SOCKET, SO_RCVBUF, size, 4);
+}
+
+// Set socket send buffer size (SO_SNDBUF)
+// Returns 0 on success, -1 on error
+pub fn TCPConnSetSendBuf(conn: TCPConn, size: int64): int64 {
+  return sys_setsockopt(conn.fd, SOL_SOCKET, SO_SNDBUF, size, 4);
+}
+
+// Set SO_REUSEADDR on connection socket
+// Returns 0 on success, -1 on error
+pub fn TCPConnSetReuseAddr(conn: TCPConn, enable: bool): int64 {
+  var optval: int64;
+  if (enable) {
+    optval := 1;
+  } else {
+    optval := 0;
+  }
+  return sys_setsockopt(conn.fd, SOL_SOCKET, SO_REUSEADDR, optval, 4);
+}
+
+// Connect to a remote server
+// Returns TCPConn with fd >= 0 on success, fd < 0 on error
+// Note: ip must be in network byte order (big endian), e.g., 127.0.0.1 = 0x7F000001
+// Use IPAddr(a,b,c,d) or IPPack() to create properly formatted IP
+pub fn TCPConnect(ip: int64, port: int64): TCPConn {
+  var conn: TCPConn;
+  var fd: int64;
+  var addr: int64;
+  var ret: int64;
+  
+  // Create socket
+  fd := sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) {
+    conn.fd := fd;
+    return conn;
+  }
+  
+  // Allocate sockaddr_in
+  addr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    sys_close(fd);
+    conn.fd := -1;
+    return conn;
+  }
+  
+  // Fill sockaddr_in structure using helper
+  SockAddrInCreate(addr, ip, port);
+  
+  // Connect
+  ret := sys_connect(fd, addr, 16);
+  munmap(addr, 16);
+  
+  if (ret < 0) {
+    sys_close(fd);
+    conn.fd := ret;
+    return conn;
+  }
+  
+  conn.fd := fd;
+  return conn;
+}
+
+// Connect using IPAddr struct (convenience)
+pub fn TCPConnectAddr(ipAddr: IPAddr): TCPConn {
+  var ip: int64;
+  ip := IPPack(ipAddr.a, ipAddr.b, ipAddr.c, ipAddr.d);
+  return TCPConnect(ip, ipAddr.port as int64);
+}
+
+// ============================================================================
+// UDP Socket
+// ============================================================================
+
+pub type UDPSocket = struct {
+  fd: int64;
+};
+
+// Create a new UDP socket
+pub fn UDPSocketNew(): UDPSocket {
+  var sock: UDPSocket;
+  var fd: int64;
+
+  // Create UDP socket
+  fd := sys_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (fd < 0) {
+    sock.fd := -1;
+    return sock;
+  }
+
+  sock.fd := fd;
+  return sock;
+}
+
+// Bind UDP socket to address (raw sockaddr_in pointer)
+pub fn UDPSocketBind(sock: UDPSocket, addr: int64): int64 {
+  return sys_bind(sock.fd, addr, 16);
+}
+
+// Bind UDP socket to IP and port (convenience)
+pub fn UDPSocketBindTo(sock: UDPSocket, ip: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+  
+  addr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+  
+  // Fill sockaddr_in using helper
+  SockAddrInCreate(addr, ip, port);
+  
+  ret := sys_bind(sock.fd, addr, 16);
+  munmap(addr, 16);
+  return ret;
+}
+
+// Send data to address (raw sockaddr_in pointer)
+pub fn UDPSocketSendTo(sock: UDPSocket, buf: int64, n: int64, dest: int64): int64 {
+  return sys_sendto(sock.fd, buf, n, 0, dest, 16);
+}
+
+// Send data to IP and port (convenience)
+pub fn UDPSocketSendToAddr(sock: UDPSocket, buf: int64, n: int64, ip: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+  
+  addr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+  
+  // Fill sockaddr_in using helper
+  SockAddrInCreate(addr, ip, port);
+  
+  ret := sys_sendto(sock.fd, buf, n, 0, addr, 16);
+  munmap(addr, 16);
+  return ret;
+}
+
+// Receive data and sender address (raw)
+pub fn UDPSocketRecvFrom(sock: UDPSocket, buf: int64, n: int64, src: int64, addrlen: int64): int64 {
+  return sys_recvfrom(sock.fd, buf, n, 0, src, addrlen);
+}
+
+// Receive data with sender info (convenience)
+// Returns bytes read, fills senderIP and senderPort
+pub fn UDPSocketRecv(sock: UDPSocket, buf: int64, n: int64, senderIP: int64, senderPort: int64): int64 {
+  var addr: int64;
+  var addrlen: int64;
+  var ret: int64;
+  
+  addr := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+  
+  // addrlen at offset 16 (store as int64)
+  addrlen := addr + 16;
+  poke8(addrlen, 16);  // sizeof(sockaddr_in)
+  poke8(addrlen + 1, 0);
+  poke8(addrlen + 2, 0);
+  poke8(addrlen + 3, 0);
+  poke8(addrlen + 4, 0);
+  poke8(addrlen + 5, 0);
+  poke8(addrlen + 6, 0);
+  poke8(addrlen + 7, 0);
+  
+  ret := sys_recvfrom(sock.fd, buf, n, 0, addr, addrlen);
+  
+  if (ret >= 0) {
+    // Extract sender IP (bytes 4-7, network order)
+    var ip: int64 := (peek8(addr + 4) << 24) | (peek8(addr + 5) << 16) | 
+                     (peek8(addr + 6) << 8) | peek8(addr + 7);
+    // Extract sender port (bytes 2-3, big-endian)
+    var port: int64 := (peek8(addr + 2) << 8) | peek8(addr + 3);
+    
+    // Store results (if pointers provided)
+    if (senderIP != 0) {
+      poke8(senderIP, ip & 0xFF);
+      poke8(senderIP + 1, (ip >> 8) & 0xFF);
+      poke8(senderIP + 2, (ip >> 16) & 0xFF);
+      poke8(senderIP + 3, (ip >> 24) & 0xFF);
+      poke8(senderIP + 4, 0);
+      poke8(senderIP + 5, 0);
+      poke8(senderIP + 6, 0);
+      poke8(senderIP + 7, 0);
+    }
+    if (senderPort != 0) {
+      poke8(senderPort, port & 0xFF);
+      poke8(senderPort + 1, (port >> 8) & 0xFF);
+      poke8(senderPort + 2, 0);
+      poke8(senderPort + 3, 0);
+      poke8(senderPort + 4, 0);
+      poke8(senderPort + 5, 0);
+      poke8(senderPort + 6, 0);
+      poke8(senderPort + 7, 0);
+    }
+  }
+  
+  munmap(addr, 32);
+  return ret;
+}
+
+// Close UDP socket
+pub fn UDPSocketClose(sock: UDPSocket) {
+  if (sock.fd >= 0) {
+    sys_close(sock.fd);
+  }
+}
+
+// ============================================================================
+// UDP Socket Options
+// ============================================================================
+
+// Set SO_REUSEADDR on UDP socket
+pub fn UDPSocketSetReuseAddr(sock: UDPSocket): int64 {
+  var optval: int64 := 1;
+  return sys_setsockopt(sock.fd, SOL_SOCKET, SO_REUSEADDR, optval, 4);
+}
+
+// Set socket receive buffer size
+pub fn UDPSocketSetRecvBuf(sock: UDPSocket, size: int64): int64 {
+  return sys_setsockopt(sock.fd, SOL_SOCKET, SO_RCVBUF, size, 4);
+}
+
+// Set socket send buffer size
+pub fn UDPSocketSetSendBuf(sock: UDPSocket, size: int64): int64 {
+  return sys_setsockopt(sock.fd, SOL_SOCKET, SO_SNDBUF, size, 4);
+}
+
+// Get socket error status
+pub fn UDPSocketGetError(sock: UDPSocket): int64 {
+  var optval: int64 := 0;
+  var result: int64;
+  result := sys_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, optval, 4);
+  if (result < 0) {
+    return result;
+  }
+  return optval;
+}
+
+// ============================================================================
+// Raw Socket (for ICMP, etc.)
+// ============================================================================
+
+pub type RawSocket = struct {
+  fd: int64;
+};
+
+// Create a raw socket (requires root or CAP_NET_RAW)
+pub fn RawSocketNew(protocol: int64): RawSocket {
+  var sock: RawSocket;
+  var fd: int64;
+
+  // Create raw socket
+  fd := sys_socket(AF_INET, SOCK_RAW, protocol);
+  if (fd < 0) {
+    sock.fd := -1;
+    return sock;
+  }
+
+  sock.fd := fd;
+  return sock;
+}
+
+// Send raw packet
+pub fn RawSocketSendTo(sock: RawSocket, buf: int64, n: int64, destAddr: int64): int64 {
+  return sys_sendto(sock.fd, buf, n, 0, destAddr, 16);
+}
+
+// Receive raw packet
+pub fn RawSocketRecvFrom(sock: RawSocket, buf: int64, n: int64, srcAddr: int64, addrlen: int64): int64 {
+  return sys_recvfrom(sock.fd, buf, n, 0, srcAddr, addrlen);
+}
+
+// Close raw socket
+pub fn RawSocketClose(sock: RawSocket) {
+  if (sock.fd >= 0) {
+    sys_close(sock.fd);
+  }
+}
+
+// ============================================================================
+// ICMP (Ping)
+// ============================================================================
+
+// ICMP Echo Request/Reply Header (8 bytes)
+// +--------+--------+--------+--------+--------+--------+--------+--------+
+// |  Type  |  Code  |          Checksum           |       ID        |  Seq  |
+// +--------+--------+--------+--------+--------+--------+--------+--------+
+pub type ICMPHeader = struct {
+  icmp_type: uint8;
+  icmp_code: uint8;
+  icmp_cksum: uint16;
+  icmp_id: uint16;
+  icmp_seq: uint16;
+};
+
+// Create an ICMP echo request packet
+pub fn ICMPMakeEchoRequest(id: uint16, seq: uint16): ICMPHeader {
+  var hdr: ICMPHeader;
+  hdr.icmp_type := ICMP_ECHO as uint8;
+  hdr.icmp_code := 0;
+  hdr.icmp_cksum := 0;
+  hdr.icmp_id := id;
+  hdr.icmp_seq := seq;
+  return hdr;
+}
+
+// Calculate ICMP checksum (simple 16-bit sum)
+pub fn ICMPChecksum(data: int64, len: int64): uint16 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  
+  // Sum all 16-bit words
+  while (i < len) {
+    if ((i + 1) < len) {
+      sum := sum + (peek8(data + i + 1) << 8) + peek8(data + i);
+    } else {
+      sum := sum + peek8(data + i);
+    }
+    i := i + 2;
+  }
+  
+  // Add carries
+  while ((sum >> 16) > 0) {
+    sum := (sum & 0xFFFF) + (sum >> 16);
+  }
+  
+  return ((~sum) & 0xFFFF) as uint16;
+}
+
+// Send ICMP echo request (ping)
+pub fn ICMPPing(destIP: int64, id: uint16, seq: uint16, timeoutSecs: int64): int64 {
+  var sock: RawSocket;
+  var buf: int64;
+  var replyBuf: int64;
+  var destAddr: int64;
+  var hdr: ICMPHeader;
+  var n: int64;
+  
+  // Create raw socket for ICMP
+  sock := RawSocketNew(IPPROTO_ICMP);
+  if (sock.fd < 0) {
+    return -1;
+  }
+  
+  // Allocate buffer for packet
+  buf := BufferAlloc(1024);
+  if (buf == 0) {
+    RawSocketClose(sock);
+    return -1;
+  }
+  
+  replyBuf := BufferAlloc(1024);
+  if (replyBuf == 0) {
+    BufferFree(buf, 1024);
+    RawSocketClose(sock);
+    return -1;
+  }
+  
+  // Build ICMP header
+  hdr := ICMPMakeEchoRequest(id, seq);
+  
+  // Write header to buffer using poke8 (little-endian)
+  poke8(buf + 0, hdr.icmp_type as int64);
+  poke8(buf + 1, hdr.icmp_code as int64);
+  // checksum placeholder (bytes 2-3) - set to 0 for now
+  poke8(buf + 2, 0);
+  poke8(buf + 3, 0);
+  // ID and sequence (little-endian)
+  poke8(buf + 4, (id & 0xFF) as int64);
+  poke8(buf + 5, ((id >> 8) & 0xFF) as int64);
+  poke8(buf + 6, (seq & 0xFF) as int64);
+  poke8(buf + 7, ((seq >> 8) & 0xFF) as int64);
+  
+  // Calculate and write checksum
+  var cksum: uint16 := ICMPChecksum(buf, 8);
+  poke8(buf + 2, (cksum & 0xFF) as int64);
+  poke8(buf + 3, ((cksum >> 8) & 0xFF) as int64);
+  
+  // Set destination address (as int64 - packed sockaddr_in)
+  destAddr := 0;
+  // family = AF_INET (2) in little-endian at offset 0
+  poke8(destAddr + 0, 2);
+  poke8(destAddr + 1, 0);
+  // port = 0 at offset 2
+  poke8(destAddr + 2, 0);
+  poke8(destAddr + 3, 0);
+  // IP address at offset 4 (already in network order in destIP)
+  // zero padding at offset 8
+  
+  // Send ICMP packet
+  n := RawSocketSendTo(sock, buf, 8, destAddr);
+  
+  // Wait for reply (simplified - just check once)
+  // In a real implementation, you'd loop with timeout
+  
+  // Cleanup
+  BufferFree(buf, 1024);
+  BufferFree(replyBuf, 1024);
+  RawSocketClose(sock);
+  
+  return n;
+}
+
+// ============================================================================
+// ARP (Address Resolution Protocol)
+// ============================================================================
+
+// Create an Ethernet header for ARP
+pub fn EthernetHeaderCreate(dstMac: MacAddr, srcMac: MacAddr, ethertype: int64): EthernetHeader {
+  var hdr: EthernetHeader;
+  hdr.dst := dstMac;
+  hdr.src := srcMac;
+  hdr.ethertype := ethertype as uint16;
+  return hdr;
+}
+
+// Create an ARP request packet
+pub fn ARPMakeRequest(senderMac: MacAddr, senderIP: int64, targetIP: int64): ARPPacket {
+  var pkt: ARPPacket;
+  
+  // Hardware type: Ethernet
+  pkt.ar_hrd := ARPHRD_ETHER as uint16;
+  
+  // Protocol: IPv4
+  pkt.ar_pro := ETH_P_IP as uint16;
+  
+  // Address lengths
+  pkt.ar_hln := 6;
+  pkt.ar_pln := 4;
+  
+  // Operation: Request
+  pkt.ar_op := ARPOP_REQUEST as uint16;
+  
+  // Sender addresses
+  pkt.ar_sha := senderMac;
+  pkt.ar_sip := senderIP;
+  
+  // Target addresses (unknown for request - broadcast)
+  pkt.ar_tha.a := 0;
+  pkt.ar_tha.b := 0;
+  pkt.ar_tha.c := 0;
+  pkt.ar_tha.d := 0;
+  pkt.ar_tha.e := 0;
+  pkt.ar_tha.f := 0;
+  pkt.ar_tip := targetIP;
+  
+  return pkt;
+}
+
+// Create an ARP reply packet
+pub fn ARPMakeReply(senderMac: MacAddr, senderIP: int64, targetMac: MacAddr, targetIP: int64): ARPPacket {
+  var pkt: ARPPacket;
+  
+  pkt.ar_hrd := ARPHRD_ETHER as uint16;
+  pkt.ar_pro := ETH_P_IP as uint16;
+  pkt.ar_hln := 6;
+  pkt.ar_pln := 4;
+  pkt.ar_op := ARPOP_REPLY as uint16;
+  
+  pkt.ar_sha := senderMac;
+  pkt.ar_sip := senderIP;
+  pkt.ar_tha := targetMac;
+  pkt.ar_tip := targetIP;
+  
+  return pkt;
+}
+
+// Serialize Ethernet + ARP packet to buffer
+// Returns total packet length
+pub fn ARPSerializePacket(eth: EthernetHeader, arp: ARPPacket, buf: int64): int64 {
+  var offset: int64 := 0;
+  
+  // Ethernet header (14 bytes)
+  poke8(buf + offset, eth.dst.a as int64); offset := offset + 1;
+  poke8(buf + offset, eth.dst.b as int64); offset := offset + 1;
+  poke8(buf + offset, eth.dst.c as int64); offset := offset + 1;
+  poke8(buf + offset, eth.dst.d as int64); offset := offset + 1;
+  poke8(buf + offset, eth.dst.e as int64); offset := offset + 1;
+  poke8(buf + offset, eth.dst.f as int64); offset := offset + 1;
+  
+  poke8(buf + offset, eth.src.a as int64); offset := offset + 1;
+  poke8(buf + offset, eth.src.b as int64); offset := offset + 1;
+  poke8(buf + offset, eth.src.c as int64); offset := offset + 1;
+  poke8(buf + offset, eth.src.d as int64); offset := offset + 1;
+  poke8(buf + offset, eth.src.e as int64); offset := offset + 1;
+  poke8(buf + offset, eth.src.f as int64); offset := offset + 1;
+  
+  // EtherType (big-endian)
+  poke8(buf + offset, ((eth.ethertype >> 8) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, (eth.ethertype & 0xFF) as int64); offset := offset + 1;
+  
+  // ARP packet (28 bytes)
+  // Hardware type (little-endian)
+  poke8(buf + offset, (arp.ar_hrd & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_hrd >> 8) & 0xFF) as int64); offset := offset + 1;
+  
+  // Protocol type (big-endian)
+  poke8(buf + offset, ((arp.ar_pro >> 8) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, (arp.ar_pro & 0xFF) as int64); offset := offset + 1;
+  
+  // Hlen and Pln
+  poke8(buf + offset, arp.ar_hln as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_pln as int64); offset := offset + 1;
+  
+  // Operation (little-endian)
+  poke8(buf + offset, (arp.ar_op & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_op >> 8) & 0xFF) as int64); offset := offset + 1;
+  
+  // Sender MAC
+  poke8(buf + offset, arp.ar_sha.a as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_sha.b as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_sha.c as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_sha.d as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_sha.e as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_sha.f as int64); offset := offset + 1;
+  
+  // Sender IP (4 bytes, network byte order)
+  poke8(buf + offset, ((arp.ar_sip >> 24) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_sip >> 16) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_sip >> 8) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, (arp.ar_sip & 0xFF) as int64); offset := offset + 1;
+  
+  // Target MAC
+  poke8(buf + offset, arp.ar_tha.a as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_tha.b as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_tha.c as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_tha.d as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_tha.e as int64); offset := offset + 1;
+  poke8(buf + offset, arp.ar_tha.f as int64); offset := offset + 1;
+  
+  // Target IP (4 bytes, network byte order)
+  poke8(buf + offset, ((arp.ar_tip >> 24) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_tip >> 16) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, ((arp.ar_tip >> 8) & 0xFF) as int64); offset := offset + 1;
+  poke8(buf + offset, (arp.ar_tip & 0xFF) as int64); offset := offset + 1;
+  
+  // Total: 14 + 28 = 42 bytes
+  return offset;
+}
+
+// Create a broadcast MAC address (ff:ff:ff:ff:ff:ff)
+pub fn MacBroadcast(): MacAddr {
+  var mac: MacAddr;
+  mac.a := 0xFF;
+  mac.b := 0xFF;
+  mac.c := 0xFF;
+  mac.d := 0xFF;
+  mac.e := 0xFF;
+  mac.f := 0xFF;
+  return mac;
+}
+
+// Convert IP address to packed format (network byte order)
+pub fn IPPack(a: uint8, b: uint8, c: uint8, d: uint8): int64 {
+  return ((a as int64) << 24) | ((b as int64) << 16) | ((c as int64) << 8) | (d as int64);
+}
+
+// Convert packed IP to string representation (simple)
+pub fn IPUnpack(ip: int64): IPAddr {
+  var addr: IPAddr;
+  addr.a := ((ip >> 24) & 0xFF) as uint8;
+  addr.b := ((ip >> 16) & 0xFF) as uint8;
+  addr.c := ((ip >> 8) & 0xFF) as uint8;
+  addr.d := (ip & 0xFF) as uint8;
+  addr.family := AF_INET;
+  return addr;
+}
+
+// ============================================================================
+// Non-blocking I/O Support
+// ============================================================================
+
+// Fcntl constants for non-blocking
+con F_GETFL: int64 := 3;
+con F_SETFL: int64 := 4;
+con O_NONBLOCK: int64 := 2048;
+
+// Error codes
+con EAGAIN: int64 := 11;
+con EINPROGRESS: int64 := 115;
+con EWOULDBLOCK: int64 := 11;
+
+// Set socket to non-blocking mode
+// Returns 0 on success, -1 on error
+pub fn SocketSetNonBlocking(fd: int64): int64 {
+  var flags: int64;
+  
+  // Get current flags
+  flags := sys_fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+  
+  // Set O_NONBLOCK flag
+  flags := flags | O_NONBLOCK;
+  
+  // Set new flags
+  return sys_fcntl(fd, F_SETFL, flags);
+}
+
+// Set socket to blocking mode
+// Returns 0 on success, -1 on error
+pub fn SocketSetBlocking(fd: int64): int64 {
+  var flags: int64;
+  
+  // Get current flags
+  flags := sys_fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+  
+  // Clear O_NONBLOCK flag
+  flags := flags & (~O_NONBLOCK);
+  
+  // Set new flags
+  return sys_fcntl(fd, F_SETFL, flags);
+}
+
+// Check if socket is non-blocking
+// Returns true if non-blocking, false if blocking
+pub fn SocketIsNonBlocking(fd: int64): bool {
+  var flags: int64;
+  
+  flags := sys_fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return false;
+  }
+  
+  return (flags & O_NONBLOCK) != 0;
+}
+
+// ============================================================================
+// poll() support
+// ============================================================================
+
+// pollfd structure (16 bytes)
+// Offset 0: fd (int64)
+// Offset 8: events (int16)
+// Offset 10: revents (int16)
+pub type PollFD = struct {
+  fd: int64;
+  events: int16;
+  revents: int16;
+};
+
+// Poll events
+con POLLIN: int16 := 1;     // Data available to read
+con POLLOUT: int16 := 4;    // Can write without blocking
+con POLLERR: int16 := 8;    // Error condition
+con POLLHUP: int16 := 16;   // Hangup
+con POLLNVAL: int32 := 32;  // Invalid file descriptor
+
+// Wait for events on file descriptors
+// fds: pointer to array of PollFD
+// nfds: number of entries
+// timeout: milliseconds (-1 = infinite, 0 = immediate)
+// Returns: number of ready fds, 0 = timeout, -1 = error
+pub fn SocketPoll(fds: int64, nfds: int64, timeout: int64): int64 {
+  return sys_poll(fds, nfds, timeout);
+}
+
+// Check if POLLIN is set in revents
+pub fn PollFDReadable(fds: int64, index: int64): bool {
+  var offset: int64 := index * 16 + 10;  // revents at offset 10
+  var revents: int16 := peek8(fds + offset) as int16;
+  return (revents & POLLIN) != 0;
+}
+
+// Check if POLLOUT is set in revents
+pub fn PollFDWritable(fds: int64, index: int64): bool {
+  var offset: int64 := index * 16 + 10;  // revents at offset 10
+  var revents: int16 := peek8(fds + offset) as int16;
+  return (revents & POLLOUT) != 0;
+}
+
+// Check if POLLERR is set in revents
+pub fn PollFDError(fds: int64, index: int64): bool {
+  var offset: int64 := index * 16 + 10;  // revents at offset 10
+  var revents: int16 := peek8(fds + offset) as int16;
+  return (revents & POLLERR) != 0;
+}
+
+// ============================================================================
+// select() support
+// ============================================================================
+
+// fd_set management for select()
+// Each fd_set holds up to 1024 file descriptors (Linux limit)
+
+// Initialize fd_set (clear all bits)
+pub fn FDSetZero(fdSet: int64) {
+  var i: int64 := 0;
+  while (i < 128) {  // 1024 bits = 128 bytes
+    poke8(fdSet + i, 0);
+    i := i + 1;
+  }
+}
+
+// Set a file descriptor in fd_set
+pub fn FDSet(fd: int64, fdSet: int64) {
+  var byteIndex: int64 := fd >> 3;      // fd / 8
+  var bitIndex: int64 := fd & 7;        // fd % 8
+  var mask: int64 := 1 << bitIndex;
+  
+  var current: int64 := peek8(fdSet + byteIndex);
+  current := current | mask;
+  poke8(fdSet + byteIndex, current);
+}
+
+// Clear a file descriptor in fd_set
+pub fn FDClr(fd: int64, fdSet: int64) {
+  var byteIndex: int64 := fd >> 3;
+  var bitIndex: int64 := fd & 7;
+  var mask: int64 := 1 << bitIndex;
+  
+  var current: int64 := peek8(fdSet + byteIndex);
+  current := current & (~mask);
+  poke8(fdSet + byteIndex, current);
+}
+
+// Check if a file descriptor is set in fd_set
+pub fn FDIsSet(fd: int64, fdSet: int64): bool {
+  var byteIndex: int64 := fd >> 3;
+  var bitIndex: int64 := fd & 7;
+  var mask: int64 := 1 << bitIndex;
+  
+  var current: int64 := peek8(fdSet + byteIndex);
+  return (current & mask) != 0;
+}
+
+// ============================================================================
+// Non-blocking Connect
+// ============================================================================
+
+// Non-blocking connect result
+pub type ConnectResult = struct {
+  success: bool;
+  error: int64;  // 0 = no error, positive = errno
+};
+
+// Connect with timeout using poll()
+// Returns ConnectResult with success=true if connected, or error code
+pub fn TCPConnectNonBlocking(ip: int64, port: int64, timeoutMs: int64): ConnectResult {
+  var result: ConnectResult;
+  var conn: TCPConn;
+  var fd: int64;
+  var addr: int64;
+  var ret: int64;
+  var pollFd: int64;
+  var pollResult: int64;
+  
+  result.success := false;
+  result.error := 0;
+  
+  // Create socket
+  fd := sys_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) {
+    result.error := -1;
+    return result;
+  }
+  
+  // Set non-blocking
+  ret := SocketSetNonBlocking(fd);
+  if (ret < 0) {
+    sys_close(fd);
+    result.error := -2;
+    return result;
+  }
+  
+  // Allocate sockaddr_in
+  addr := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    sys_close(fd);
+    result.error := -3;
+    return result;
+  }
+  
+  // Fill sockaddr_in using helper
+  SockAddrInCreate(addr, ip, port);
+  
+  // Attempt non-blocking connect
+  ret := sys_connect(fd, addr, 16);
+  munmap(addr, 16);
+  
+  if (ret == 0) {
+    // Immediate success
+    result.success := true;
+    result.error := 0;
+    return result;
+  }
+  
+  if (ret != EINPROGRESS) {
+    // Immediate error (not EINPROGRESS)
+    sys_close(fd);
+    result.error := ret;
+    return result;
+  }
+  
+  // Connection is in progress - wait for it with poll()
+  pollFd := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (pollFd <= 0) {
+    sys_close(fd);
+    result.error := -4;
+    return result;
+  }
+  
+  // Set up pollfd
+  // fd at offset 0
+  poke8(pollFd + 0, fd & 0xFF);
+  poke8(pollFd + 1, (fd >> 8) & 0xFF);
+  poke8(pollFd + 2, (fd >> 16) & 0xFF);
+  poke8(pollFd + 3, (fd >> 24) & 0xFF);
+  poke8(pollFd + 4, (fd >> 32) & 0xFF);
+  poke8(pollFd + 5, (fd >> 40) & 0xFF);
+  poke8(pollFd + 6, (fd >> 48) & 0xFF);
+  poke8(pollFd + 7, (fd >> 56) & 0xFF);
+  
+  // events = POLLOUT at offset 8 (int16)
+  poke8(pollFd + 8, POLLOUT & 0xFF);
+  poke8(pollFd + 9, (POLLOUT >> 8) & 0xFF);
+  
+  // revents at offset 10 (int16) - initialize to 0
+  poke8(pollFd + 10, 0);
+  poke8(pollFd + 11, 0);
+  
+  // Wait for connection
+  pollResult := sys_poll(pollFd, 1, timeoutMs);
+  
+  if (pollResult < 0) {
+    // Poll error
+    munmap(pollFd, 16);
+    sys_close(fd);
+    result.error := pollResult;
+    return result;
+  }
+  
+  if (pollResult == 0) {
+    // Timeout
+    munmap(pollFd, 16);
+    sys_close(fd);
+    result.error := EAGAIN;  // Timeout
+    return result;
+  }
+  
+  // Check revents for POLLOUT (connected) or POLLERR (error)
+  var revents: int16 := peek8(pollFd + 10) as int16;
+  munmap(pollFd, 16);
+  
+  if ((revents & POLLOUT) != 0) {
+    // Connection succeeded - check for socket error
+    var sockErr: int64 := 0;
+    var sockErrResult: int64 := sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, sockErr, 4);
+    
+    if (sockErrResult < 0) {
+      sys_close(fd);
+      result.error := sockErrResult;
+      return result;
+    }
+    
+    if (sockErr != 0) {
+      sys_close(fd);
+      result.error := sockErr;
+      return result;
+    }
+    
+    result.success := true;
+    result.error := 0;
+    return result;
+  }
+  
+  if ((revents & POLLERR) != 0) {
+    // Error - get socket error
+    var sockErr: int64 := 0;
+    sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, sockErr, 4);
+    sys_close(fd);
+    result.error := sockErr;
+    return result;
+  }
+  
+  // Unexpected state
+  sys_close(fd);
+  result.error := -5;
+  return result;
+}
+
+// ============================================================================
+// Socket Ready Check (using select for single socket)
+// ============================================================================
+
+// Check if socket is ready for reading
+// Returns: 1 = ready, 0 = not ready (timeout), -1 = error
+pub fn SocketCanRead(fd: int64, timeoutMs: int64): int64 {
+  var fdSet: int64;
+  var result: int64;
+  
+  fdSet := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (fdSet <= 0) {
+    return -1;
+  }
+  
+  FDSetZero(fdSet);
+  FDSet(fd, fdSet);
+  
+  // Use select with timeout - create timeval structure
+  var timeval: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (timeval <= 0) {
+    munmap(fdSet, 128);
+    return -1;
+  }
+  
+  // Set timeout using helper
+  TimeValCreate(timeval, timeoutMs);
+  
+  result := sys_select(fd + 1, fdSet, 0, 0, timeval);
+  
+  munmap(timeval, 16);
+  munmap(fdSet, 128);
+  
+  if (result < 0) {
+    return -1;
+  }
+  
+  if (result == 0) {
+    return 0;
+  }
+  
+  if (FDIsSet(fd, fdSet)) {
+    return 1;
+  }
+  
+  return 0;
+}
+
+// Check if socket is ready for writing
+// Returns: 1 = ready, 0 = not ready (timeout), -1 = error
+pub fn SocketCanWrite(fd: int64, timeoutMs: int64): int64 {
+  var fdSet: int64;
+  var result: int64;
+  
+  fdSet := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (fdSet <= 0) {
+    return -1;
+  }
+  
+  FDSetZero(fdSet);
+  FDSet(fd, fdSet);
+  
+  // Use select with timeout
+  var timeval: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (timeval <= 0) {
+    munmap(fdSet, 128);
+    return -1;
+  }
+  
+  // Set timeout using helper
+  TimeValCreate(timeval, timeoutMs);
+  
+  result := sys_select(fd + 1, 0, fdSet, 0, timeval);
+  
+  munmap(timeval, 16);
+  munmap(fdSet, 128);
+  
+  if (result < 0) {
+    return -1;
+  }
+  
+  if (result == 0) {
+    return 0;
+  }
+  
+  if (FDIsSet(fd, fdSet)) {
+    return 1;
+  }
+  
+  return 0;
+}
+
+// ============================================================================
+// Unix Domain Sockets
+// ============================================================================
+
+// Import AF_UNIX constant
+con AF_UNIX: int64 := 1;
+
+// Unix socket address (for local communication)
+pub type UnixConn = struct {
+  fd: int64;
+};
+
+// Create a new Unix domain socket
+// Returns UnixConn with fd >= 0 on success, fd < 0 on error
+pub fn UnixSocketNew(): UnixConn {
+  var conn: UnixConn;
+  var fd: int64;
+  
+  // Create Unix domain socket (SOCK_STREAM for stream, SOCK_DGRAM for datagram)
+  fd := sys_socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    conn.fd := -1;
+    return conn;
+  }
+  
+  conn.fd := fd;
+  return conn;
+}
+
+// Bind Unix socket to a file path
+// path: null-terminated string with socket path
+// Returns 0 on success, -1 on error
+pub fn UnixSocketBind(sock: UnixConn, path: int64): int64 {
+  var addr: int64;
+  var addrlen: int64;
+  
+  // Allocate sockaddr_un (minimum 110 bytes)
+  addr := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+  
+  // Create sockaddr_un structure
+  addrlen := SockAddrUnCreate(addr, path);
+  
+  // Bind
+  var result: int64 := sys_bind(sock.fd, addr, addrlen);
+  munmap(addr, 128);
+  
+  return result;
+}
+
+// Start listening for connections
+// backlog: maximum queue length for pending connections
+// Returns 0 on success, -1 on error
+pub fn UnixSocketListen(sock: UnixConn, backlog: int64): int64 {
+  return sys_listen(sock.fd, backlog);
+}
+
+// Accept a Unix socket connection
+// Returns UnixConn with fd >= 0 on success, fd < 0 on error
+pub fn UnixSocketAccept(sock: UnixConn): UnixConn {
+  var conn: UnixConn;
+  var clientFd: int64;
+  
+  // Accept with null address (we don't need peer credentials)
+  clientFd := sys_accept(sock.fd, 0, 0);
+  if (clientFd < 0) {
+    conn.fd := -1;
+    return conn;
+  }
+  
+  conn.fd := clientFd;
+  return conn;
+}
+
+// Connect to a Unix domain socket at given path
+// Returns UnixConn with fd >= 0 on success, fd < 0 on error
+pub fn UnixSocketConnect(path: int64): UnixConn {
+  var conn: UnixConn;
+  var fd: int64;
+  var addr: int64;
+  var addrlen: int64;
+  
+  // Create socket
+  fd := sys_socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    conn.fd := fd;
+    return conn;
+  }
+  
+  // Allocate sockaddr_un
+  addr := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    sys_close(fd);
+    conn.fd := -1;
+    return conn;
+  }
+  
+  // Create address
+  addrlen := SockAddrUnCreate(addr, path);
+  
+  // Connect
+  var result: int64 := sys_connect(fd, addr, addrlen);
+  munmap(addr, 128);
+  
+  if (result < 0) {
+    sys_close(fd);
+    conn.fd := result;
+    return conn;
+  }
+  
+  conn.fd := fd;
+  return conn;
+}
+
+// Read from Unix socket
+// Returns number of bytes read, 0 on EOF, -1 on error
+pub fn UnixSocketRead(conn: UnixConn, buf: int64, n: int64): int64 {
+  return sys_read(conn.fd, buf, n);
+}
+
+// Write to Unix socket
+// Returns number of bytes written, -1 on error
+pub fn UnixSocketWrite(conn: UnixConn, buf: int64, n: int64): int64 {
+  return sys_write(conn.fd, buf, n);
+}
+
+// Close Unix socket
+pub fn UnixSocketClose(conn: UnixConn) {
+  if (conn.fd >= 0) {
+    sys_close(conn.fd);
+  }
+}
+
+// Get socket peer credentials (requires Linux 3.5+)
+// Returns 0 on success, -1 on error
+// Note: This is optional and may not work on all systems
+pub fn UnixSocketGetPeerCred(conn: UnixConn, pid: int64, uid: int64, gid: int64): int64 {
+  // SO_PEERCRED returns struct ucred: pid_t, uid_t, gid_t
+  // This is a placeholder - actual implementation depends on OS support
+  // For Linux: use getsockopt with SO_PEERCRED
+  return -1;
+}
+
+// ============================================================================
+// IPv6 TCP
+// ============================================================================
+
+// Connect to a remote IPv6 server via TCP.
+// ip6Hi / ip6Lo: IPv6 address packed as high/low 64-bit halves (use IPv6Hi/IPv6Lo)
+// port: port number in host byte order
+// Returns TCPConn with fd >= 0 on success, fd < 0 on error
+pub fn TCPConnectIPv6(ip6Hi: int64, ip6Lo: int64, port: int64): TCPConn {
+  var conn: TCPConn;
+  var fd: int64;
+  var addr: int64;
+  var ret: int64;
+
+  fd := sys_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) {
+    conn.fd := fd;
+    return conn;
+  }
+
+  // Allocate 28-byte sockaddr_in6
+  addr := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    sys_close(fd);
+    conn.fd := -1;
+    return conn;
+  }
+
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+
+  ret := sys_connect(fd, addr, 28);
+  munmap(addr, 28);
+
+  if (ret < 0) {
+    sys_close(fd);
+    conn.fd := ret;
+    return conn;
+  }
+
+  conn.fd := fd;
+  return conn;
+}
+
+// Bind an IPv6 TCP listener to a specific address and port.
+// Pass IPv6Hi(IPv6Any()) and 0 for ip6Hi/ip6Lo to bind to all interfaces.
+pub fn TCPListenerBindIPv6(listener: TCPListener, ip6Hi: int64, ip6Lo: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+
+  addr := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+  ret := sys_bind(listener.fd, addr, 28);
+  munmap(addr, 28);
+  return ret;
+}
+
+// Create a new IPv6 TCP listener socket
+pub fn TCPListenerNewIPv6(): TCPListener {
+  var listener: TCPListener;
+  var fd: int64;
+
+  fd := sys_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) {
+    listener.fd := -1;
+    return listener;
+  }
+
+  listener.fd := fd;
+  return listener;
+}
+
+// ============================================================================
+// IPv6 UDP
+// ============================================================================
+
+// Create a new IPv6 UDP socket
+pub fn UDPSocketNewIPv6(): UDPSocket {
+  var sock: UDPSocket;
+  var fd: int64;
+
+  fd := sys_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+  if (fd < 0) {
+    sock.fd := -1;
+    return sock;
+  }
+
+  sock.fd := fd;
+  return sock;
+}
+
+// Send a UDP datagram to an IPv6 address.
+// ip6Hi / ip6Lo: destination IPv6 address (use IPv6Hi/IPv6Lo)
+// port: destination port in host byte order
+pub fn UDPSocketSendToIPv6(sock: UDPSocket, buf: int64, n: int64,
+                            ip6Hi: int64, ip6Lo: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+
+  addr := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+  ret := sys_sendto(sock.fd, buf, n, 0, addr, 28);
+  munmap(addr, 28);
+  return ret;
+}
+
+// Bind an IPv6 UDP socket to a port (for receiving)
+pub fn UDPSocketBindIPv6(sock: UDPSocket, ip6Hi: int64, ip6Lo: int64, port: int64): int64 {
+  var addr: int64;
+  var ret: int64;
+
+  addr := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) {
+    return -1;
+  }
+
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+  ret := sys_bind(sock.fd, addr, 28);
+  munmap(addr, 28);
+  return ret;
+}

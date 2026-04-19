@@ -1,0 +1,841 @@
+// std/crypto/aes.lyx - AES Encryption/Decryption
+// Implements AES-128-CBC and AES-256-CBC with proper S-Box and Key Schedule
+
+unit std.crypto.aes;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub con AES_BLOCK_SIZE: int64 := 16;
+pub con AES_128_KEY_SIZE: int64 := 16;
+pub con AES_256_KEY_SIZE: int64 := 32;
+pub con AES_128_ROUNDS: int64 := 10;
+pub con AES_256_ROUNDS: int64 := 14;
+pub con AES_128_ROUND_KEYS: int64 := 11;
+pub con AES_256_ROUND_KEYS: int64 := 15;
+
+// ============================================================================
+// GF(2^8) Multiplication
+// ============================================================================
+
+pub fn GF_mul(a: int64, b: int64): int64 {
+    var result: int64 := 0;
+    var i: int64 := 0;
+    while (i < 8) {
+        if ((b & 1) != 0) { result := result ^ a; }
+        var hi_bit: int64 := (a & 0x80) != 0;
+        a := (a * 2) & 255;
+        if (hi_bit != 0) { a := a ^ 0x1b; }
+        b := b / 2;
+        i := i + 1;
+    }
+    return result;
+}
+
+// ============================================================================
+// AES S-Box (computed at runtime using GF inverse + affine transform)
+// ============================================================================
+
+fn GF_inv(x: int64): int64 {
+    // Extended Euclidean algorithm for GF(2^8) inverse
+    if (x == 0) { return 0; }
+    
+    // Use multiplication in GF(2^8) with irreducible polynomial x^8 + x^4 + x^3 + x + 1 (0x11b)
+    // Using exponent/log tables for faster computation
+    
+    // Compute inverse using repeated squaring
+    var result: int64 := 1;
+    var exp: int64 := 253; // Since x^254 * x = x^255 = 1 in GF(2^8), x^-1 = x^253
+    
+    var base: int64 := x;
+    while (exp > 0) {
+        if ((exp & 1) != 0) {
+            result := GF_mul(result, base);
+        }
+        base := GF_mul(base, base);
+        exp := exp / 2;
+    }
+    
+    return result;
+}
+
+// Simplified GF inverse using brute force (256 values only)
+pub fn GF_inv_simple(x: int64): int64 {
+    if (x == 0) { return 0; }
+    var i: int64 := 1;
+    while (i < 256) {
+        if (GF_mul(i, x) == 1) { return i; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+// Compute the AES S-Box at initialization
+// Returns the inverse S-Box value for a given forward S-Box value
+pub fn InvSubByteFromForward(sbox_val: int64): int64 {
+    // We need to find x such that SubByte(x) = sbox_val
+    // This means: affine(GF_inv(x)) = sbox_val
+    // So: inverse_affine(sbox_val) = GF_inv(x)
+    // And: GF_inv(inverse_affine(sbox_val)) = x
+    
+    // First apply inverse affine transform
+    var y: int64 := sbox_val;
+    var result: int64 := 0;
+    var i: int64 := 0;
+    while (i < 8) {
+        var bit: int64 := 0;
+        // The inverse affine transform matrix
+        bit := bit ^ ((y >> 0) & 1);
+        bit := bit ^ ((y >> 2) & 1);
+        bit := bit ^ ((y >> 3) & 1);
+        bit := bit ^ ((y >> 5) & 1);
+        bit := bit ^ ((y >> 6) & 1);
+        bit := bit ^ ((y >> 7) & 1);
+        
+        if (bit != 0) { result := result | (1 << i); }
+        i := i + 1;
+    }
+    
+    // Then apply GF inverse to get the original value
+    return GF_inv_simple(result);
+}
+
+pub fn SubByte(x: int64): int64 {
+    var inv: int64 := GF_inv_simple(x);
+    
+    // Affine transformation: y = inv ^ (inv << 1) ^ (inv << 2) ^ (inv << 3) ^ (inv << 4) ^ 0x63
+    var result: int64 := inv;
+    result := result ^ ((inv << 1) & 255);
+    result := result ^ ((inv << 2) & 255);
+    result := result ^ ((inv << 3) & 255);
+    result := result ^ ((inv << 4) & 255);
+    result := result ^ 0x63;
+    
+    return result;
+}
+
+pub fn InvSubByte(x: int64): int64 {
+    // Use brute force: find y such that SubByte(y) = x
+    // This is only 256 values, so it's fast
+    var i: int64 := 0;
+    while (i < 256) {
+        if (SubByte(i) == x) { return i; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+fn xtime(x: int64): int64 {
+    var result: int64 := (x * 2) & 255;
+    if ((x & 0x80) != 0) { result := result ^ 0x1b; }
+    return result;
+}
+
+fn times3(x: int64): int64 { return xtime(x) ^ x; }
+
+// ============================================================================
+// AES Core Operations
+// ============================================================================
+
+fn SubBytes(state: pchar): pchar {
+    var i: int64 := 0;
+    while (i < 16) {
+        var b: int64 := StrCharAt(state, i);
+        StrSetChar(state, i, SubByte(b));
+        i := i + 1;
+    }
+    return state;
+}
+
+fn InvSubBytes(state: pchar): pchar {
+    var i: int64 := 0;
+    while (i < 16) {
+        var b: int64 := StrCharAt(state, i);
+        StrSetChar(state, i, InvSubByte(b));
+        i := i + 1;
+    }
+    return state;
+}
+
+fn ShiftRows(state: pchar): pchar {
+    var t1: int64 := StrCharAt(state, 1);
+    StrSetChar(state, 1, StrCharAt(state, 5));
+    StrSetChar(state, 5, StrCharAt(state, 9));
+    StrSetChar(state, 9, StrCharAt(state, 13));
+    StrSetChar(state, 13, t1);
+    
+    var t2a: int64 := StrCharAt(state, 2);
+    var t2b: int64 := StrCharAt(state, 6);
+    StrSetChar(state, 2, StrCharAt(state, 10));
+    StrSetChar(state, 6, StrCharAt(state, 14));
+    StrSetChar(state, 10, t2a);
+    StrSetChar(state, 14, t2b);
+    
+    var t3: int64 := StrCharAt(state, 15);
+    StrSetChar(state, 15, StrCharAt(state, 11));
+    StrSetChar(state, 11, StrCharAt(state, 7));
+    StrSetChar(state, 7, StrCharAt(state, 3));
+    StrSetChar(state, 3, t3);
+    
+    return state;
+}
+
+fn InvShiftRows(state: pchar): pchar {
+    var t1: int64 := StrCharAt(state, 1);
+    StrSetChar(state, 1, StrCharAt(state, 13));
+    StrSetChar(state, 13, StrCharAt(state, 9));
+    StrSetChar(state, 9, StrCharAt(state, 5));
+    StrSetChar(state, 5, t1);
+    
+    var t2a: int64 := StrCharAt(state, 2);
+    var t2b: int64 := StrCharAt(state, 6);
+    StrSetChar(state, 2, StrCharAt(state, 14));
+    StrSetChar(state, 6, StrCharAt(state, 10));
+    StrSetChar(state, 10, t2a);
+    StrSetChar(state, 14, t2b);
+    
+    var t3: int64 := StrCharAt(state, 3);
+    StrSetChar(state, 3, StrCharAt(state, 7));
+    StrSetChar(state, 7, StrCharAt(state, 11));
+    StrSetChar(state, 11, StrCharAt(state, 15));
+    StrSetChar(state, 15, t3);
+    
+    return state;
+}
+
+fn MixColumns(state: pchar): pchar {
+    var i: int64 := 0;
+    while (i < 4) {
+        var idx: int64 := i * 4;
+        var s0: int64 := StrCharAt(state, idx);
+        var s1: int64 := StrCharAt(state, idx + 1);
+        var s2: int64 := StrCharAt(state, idx + 2);
+        var s3: int64 := StrCharAt(state, idx + 3);
+        
+        StrSetChar(state, idx, xtime(s0) ^ times3(s1) ^ s2 ^ s3);
+        StrSetChar(state, idx + 1, s0 ^ xtime(s1) ^ times3(s2) ^ s3);
+        StrSetChar(state, idx + 2, s0 ^ s1 ^ xtime(s2) ^ times3(s3));
+        StrSetChar(state, idx + 3, times3(s0) ^ s1 ^ s2 ^ xtime(s3));
+        
+        i := i + 1;
+    }
+    return state;
+}
+
+fn InvMixColumns(state: pchar): pchar {
+    var i: int64 := 0;
+    while (i < 4) {
+        var idx: int64 := i * 4;
+        var s0: int64 := StrCharAt(state, idx);
+        var s1: int64 := StrCharAt(state, idx + 1);
+        var s2: int64 := StrCharAt(state, idx + 2);
+        var s3: int64 := StrCharAt(state, idx + 3);
+        
+        StrSetChar(state, idx, GF_mul(0x0e, s0) ^ GF_mul(0x0b, s1) ^ GF_mul(0x0d, s2) ^ GF_mul(0x09, s3));
+        StrSetChar(state, idx + 1, GF_mul(0x09, s0) ^ GF_mul(0x0e, s1) ^ GF_mul(0x0b, s2) ^ GF_mul(0x0d, s3));
+        StrSetChar(state, idx + 2, GF_mul(0x0d, s0) ^ GF_mul(0x09, s1) ^ GF_mul(0x0e, s2) ^ GF_mul(0x0b, s3));
+        StrSetChar(state, idx + 3, GF_mul(0x0b, s0) ^ GF_mul(0x0d, s1) ^ GF_mul(0x09, s2) ^ GF_mul(0x0e, s3));
+        
+        i := i + 1;
+    }
+    return state;
+}
+
+// ============================================================================
+// AES Key Schedule
+// ============================================================================
+
+// Rcon table for key schedule (first 15 values)
+fn Rcon(i: int64): int64 {
+    if (i == 1) { return 0x01; }
+    if (i == 2) { return 0x02; }
+    if (i == 3) { return 0x04; }
+    if (i == 4) { return 0x08; }
+    if (i == 5) { return 0x10; }
+    if (i == 6) { return 0x20; }
+    if (i == 7) { return 0x40; }
+    if (i == 8) { return 0x80; }
+    if (i == 9) { return 0x1b; }
+    if (i == 10) { return 0x36; }
+    return 0;
+}
+
+// Rotate word: [a0,a1,a2,a3] -> [a1,a2,a3,a0]
+fn RotWord(w: int64): int64 {
+    var a0: int64 := (w >> 24) & 255;
+    var a1: int64 := (w >> 16) & 255;
+    var a2: int64 := (w >> 8) & 255;
+    var a3: int64 := w & 255;
+    return ((a1 << 24) | (a2 << 16) | (a3 << 8) | a0) & 0xFFFFFFFF;
+}
+
+// Convert 4-byte key to word
+fn BytesToWord(b0: int64, b1: int64, b2: int64, b3: int64): int64 {
+    return ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0xFFFFFFFF;
+}
+
+// Extract byte from word
+fn WordByte(w: int64, idx: int64): int64 {
+    if (idx == 0) { return (w >> 24) & 255; }
+    if (idx == 1) { return (w >> 16) & 255; }
+    if (idx == 2) { return (w >> 8) & 255; }
+    return w & 255;
+}
+
+// Set byte in word
+fn SetWordByte(w: int64, idx: int64, b: int64): int64 {
+    if (idx == 0) { return (w & 0x00FFFFFF) | (b << 24); }
+    if (idx == 1) { return (w & 0xFF00FFFF) | (b << 16); }
+    if (idx == 2) { return (w & 0xFFFF00FF) | (b << 8); }
+    return (w & 0xFFFFFF00) | b;
+}
+
+// AES-128 Key Expansion: 16 bytes -> 176 bytes (11 round keys)
+// Output: 11 * 16 = 176 bytes
+pub fn AES128KeyExpand(key: pchar, expanded_key: pchar): int64 {
+    var i: int64 := 0;
+    
+    // First 4 words (16 bytes) are the same as the key
+    while (i < 4) {
+        var b0: int64 := StrCharAt(key, i * 4);
+        var b1: int64 := StrCharAt(key, i * 4 + 1);
+        var b2: int64 := StrCharAt(key, i * 4 + 2);
+        var b3: int64 := StrCharAt(key, i * 4 + 3);
+        
+        StrSetChar(expanded_key, i * 4, b0);
+        StrSetChar(expanded_key, i * 4 + 1, b1);
+        StrSetChar(expanded_key, i * 4 + 2, b2);
+        StrSetChar(expanded_key, i * 4 + 3, b3);
+        i := i + 1;
+    }
+    
+    // Generate remaining 40 words (10 * 4 = 40 words)
+    var j: int64 := 4;
+    var round: int64 := 1;
+    
+    while (j < 44) {
+        // Get previous word
+        var prev0: int64 := StrCharAt(expanded_key, (j - 1) * 4);
+        var prev1: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 1);
+        var prev2: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 2);
+        var prev3: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 3);
+        
+        // Get word 4 positions back
+        var w3_0: int64 := StrCharAt(expanded_key, (j - 4) * 4);
+        var w3_1: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 1);
+        var w3_2: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 2);
+        var w3_3: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 3);
+        
+        // For first word of each block: RotWord + SubWord + Rcon
+        if ((j mod 4) == 0) {
+            // RotWord
+            var t: int64 := prev3;
+            prev3 := prev2;
+            prev2 := prev1;
+            prev1 := prev0;
+            prev0 := t;
+            
+            // SubWord (apply S-Box to each byte)
+            prev0 := SubByte(prev0);
+            prev1 := SubByte(prev1);
+            prev2 := SubByte(prev2);
+            prev3 := SubByte(prev3);
+            
+            // XOR with Rcon
+            prev0 := prev0 ^ Rcon(round);
+            
+            round := round + 1;
+        }
+        
+        // XOR with word 4 positions back
+        w3_0 := w3_0 ^ prev0;
+        w3_1 := w3_1 ^ prev1;
+        w3_2 := w3_2 ^ prev2;
+        w3_3 := w3_3 ^ prev3;
+        
+        // Store
+        StrSetChar(expanded_key, j * 4, w3_0);
+        StrSetChar(expanded_key, j * 4 + 1, w3_1);
+        StrSetChar(expanded_key, j * 4 + 2, w3_2);
+        StrSetChar(expanded_key, j * 4 + 3, w3_3);
+        
+        j := j + 1;
+    }
+    
+    return 176;
+}
+
+// AES-256 Key Expansion: 32 bytes -> 240 bytes (15 round keys)
+pub fn AES256KeyExpand(key: pchar, expanded_key: pchar): int64 {
+    var i: int64 := 0;
+    
+    // First 8 words (32 bytes) are the same as the key
+    while (i < 8) {
+        var b0: int64 := StrCharAt(key, i * 4);
+        var b1: int64 := StrCharAt(key, i * 4 + 1);
+        var b2: int64 := StrCharAt(key, i * 4 + 2);
+        var b3: int64 := StrCharAt(key, i * 4 + 3);
+        
+        StrSetChar(expanded_key, i * 4, b0);
+        StrSetChar(expanded_key, i * 4 + 1, b1);
+        StrSetChar(expanded_key, i * 4 + 2, b2);
+        StrSetChar(expanded_key, i * 4 + 3, b3);
+        i := i + 1;
+    }
+    
+    // Generate remaining words
+    var j: int64 := 8;
+    var round: int64 := 1;
+    
+    while (j < 60) {
+        // Get previous word
+        var prev0: int64 := StrCharAt(expanded_key, (j - 1) * 4);
+        var prev1: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 1);
+        var prev2: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 2);
+        var prev3: int64 := StrCharAt(expanded_key, (j - 1) * 4 + 3);
+        
+        // Get word 4 positions back
+        var w4_0: int64 := StrCharAt(expanded_key, (j - 4) * 4);
+        var w4_1: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 1);
+        var w4_2: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 2);
+        var w4_3: int64 := StrCharAt(expanded_key, (j - 4) * 4 + 3);
+        
+        // For AES-256: every 8th word (word 0 and 4 of each 8-word block)
+        if ((j mod 8) == 0) {
+            // RotWord
+            var t: int64 := prev3;
+            prev3 := prev2;
+            prev2 := prev1;
+            prev1 := prev0;
+            prev0 := t;
+            
+            // SubWord
+            prev0 := SubByte(prev0);
+            prev1 := SubByte(prev1);
+            prev2 := SubByte(prev2);
+            prev3 := SubByte(prev3);
+            
+            // XOR with Rcon
+            prev0 := prev0 ^ Rcon(round);
+            round := round + 1;
+        } else {
+            // For AES-256, there's also a SubWord at position 4 of each block
+            if ((j mod 8) == 4) {
+                prev0 := SubByte(prev0);
+                prev1 := SubByte(prev1);
+                prev2 := SubByte(prev2);
+                prev3 := SubByte(prev3);
+            }
+        }
+        
+        // XOR with word 4 positions back
+        w4_0 := w4_0 ^ prev0;
+        w4_1 := w4_1 ^ prev1;
+        w4_2 := w4_2 ^ prev2;
+        w4_3 := w4_3 ^ prev3;
+        
+        // Store
+        StrSetChar(expanded_key, j * 4, w4_0);
+        StrSetChar(expanded_key, j * 4 + 1, w4_1);
+        StrSetChar(expanded_key, j * 4 + 2, w4_2);
+        StrSetChar(expanded_key, j * 4 + 3, w4_3);
+        
+        j := j + 1;
+    }
+    
+    return 240;
+}
+
+// ============================================================================
+// AddRoundKey using expanded key
+// ============================================================================
+
+fn AddRoundKey(state: pchar, expanded_key: pchar, round: int64): pchar {
+    var i: int64 := 0;
+    while (i < 16) {
+        var b: int64 := StrCharAt(state, i);
+        var k: int64 := StrCharAt(expanded_key, round * 16 + i);
+        StrSetChar(state, i, b ^ k);
+        i := i + 1;
+    }
+    return state;
+}
+
+// ============================================================================
+// AES Block Encrypt/Decrypt (Full rounds)
+// ============================================================================
+
+pub fn AESEncryptBlockWithKey(block: pchar, expanded_key: pchar, rounds: int64): pchar {
+    var state: pchar := block;
+    
+    // Initial round
+    state := AddRoundKey(state, expanded_key, 0);
+    
+    // Main rounds
+    var r: int64 := 1;
+    while (r < rounds) {
+        state := SubBytes(state);
+        state := ShiftRows(state);
+        state := MixColumns(state);
+        state := AddRoundKey(state, expanded_key, r);
+        r := r + 1;
+    }
+    
+    // Final round (no MixColumns)
+    state := SubBytes(state);
+    state := ShiftRows(state);
+    state := AddRoundKey(state, expanded_key, rounds);
+    
+    return block;
+}
+
+pub fn AESDecryptBlockWithKey(block: pchar, expanded_key: pchar, rounds: int64): pchar {
+    var state: pchar := block;
+    
+    // Initial round (reverse)
+    state := AddRoundKey(state, expanded_key, rounds);
+    state := InvShiftRows(state);
+    state := InvSubBytes(state);
+    
+    // Main rounds
+    var r: int64 := rounds - 1;
+    while (r >= 1) {
+        state := AddRoundKey(state, expanded_key, r);
+        state := InvMixColumns(state);
+        state := InvShiftRows(state);
+        state := InvSubBytes(state);
+        r := r - 1;
+    }
+    
+    // Final round
+    state := AddRoundKey(state, expanded_key, 0);
+    
+    return block;
+}
+
+// ============================================================================
+// XOR Blocks
+// ============================================================================
+
+fn XORBlocks(block1: pchar, block2: pchar, dest: pchar): pchar {
+    var i: int64 := 0;
+    while (i < 16) {
+        var b: int64 := StrCharAt(block1, i) ^ StrCharAt(block2, i);
+        StrSetChar(dest, i, b);
+        i := i + 1;
+    }
+    return dest;
+}
+
+// ============================================================================
+// Public API: AES-CBC
+// ============================================================================
+
+pub fn AES128CBCEncrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, output: pchar): int64 {
+    if (input_len <= 0) { return 0; }
+    
+    // Expand key
+    var expanded_key: pchar := "                                                                ";
+    AES128KeyExpand(key, expanded_key);
+    
+    // Pad input
+    var padded_len: int64 := input_len;
+    if ((input_len mod 16) != 0) {
+        padded_len := ((input_len / 16) + 1) * 16;
+    } else {
+        padded_len := input_len + 16;
+    }
+    
+    var prev_block: pchar := "                ";
+    var work: pchar := "                ";
+    var cipher_block: pchar := "                ";
+    
+    // Copy IV
+    var i: int64 := 0;
+    while (i < 16) {
+        StrSetChar(prev_block, i, StrCharAt(iv, i));
+        i := i + 1;
+    }
+    
+    var out_pos: int64 := 0;
+    var block_num: int64 := 0;
+    
+    while (block_num * 16 < padded_len) {
+        // Create plaintext block with padding
+        i := 0;
+        while (i < 16) {
+            var src_pos: int64 := block_num * 16 + i;
+            if (src_pos < input_len) {
+                StrSetChar(work, i, StrCharAt(input, src_pos));
+            } else {
+                StrSetChar(work, i, padded_len - input_len);
+            }
+            i := i + 1;
+        }
+        
+        // XOR with previous ciphertext/IV
+        XORBlocks(work, prev_block, work);
+        
+        // Encrypt
+        i := 0;
+        while (i < 16) {
+            StrSetChar(cipher_block, i, StrCharAt(work, i));
+            i := i + 1;
+        }
+        AESEncryptBlockWithKey(cipher_block, expanded_key, 10);
+        
+        // Copy to output
+        i := 0;
+        while (i < 16) {
+            StrSetChar(output, out_pos + i, StrCharAt(cipher_block, i));
+            i := i + 1;
+        }
+        
+        // Save as previous block
+        i := 0;
+        while (i < 16) {
+            StrSetChar(prev_block, i, StrCharAt(output, out_pos + i));
+            i := i + 1;
+        }
+        
+        out_pos := out_pos + 16;
+        block_num := block_num + 1;
+    }
+    
+    return padded_len;
+}
+
+pub fn AES128CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, output: pchar): int64 {
+    if (input_len <= 0 || (input_len mod 16) != 0) { return -1; }
+    
+    // Expand key
+    var expanded_key: pchar := "                                                                ";
+    AES128KeyExpand(key, expanded_key);
+    
+    var prev_block: pchar := "                ";
+    var work: pchar := "                ";
+    var plain_block: pchar := "                ";
+    
+    // Copy IV
+    var i: int64 := 0;
+    while (i < 16) {
+        StrSetChar(prev_block, i, StrCharAt(iv, i));
+        i := i + 1;
+    }
+    
+    var out_pos: int64 := 0;
+    var num_blocks: int64 := input_len / 16;
+    var block_num: int64 := 0;
+    
+    while (block_num < num_blocks) {
+        // Copy cipher block
+        i := 0;
+        while (i < 16) {
+            StrSetChar(work, i, StrCharAt(input, block_num * 16 + i));
+            i := i + 1;
+        }
+        
+        // Decrypt
+        i := 0;
+        while (i < 16) {
+            StrSetChar(plain_block, i, StrCharAt(work, i));
+            i := i + 1;
+        }
+        AESDecryptBlockWithKey(plain_block, expanded_key, 10);
+        
+        // XOR with previous cipher block
+        XORBlocks(plain_block, prev_block, plain_block);
+        
+        // Copy to output
+        i := 0;
+        while (i < 16) {
+            StrSetChar(output, out_pos + i, StrCharAt(plain_block, i));
+            i := i + 1;
+        }
+        
+        // Save current cipher block as previous
+        i := 0;
+        while (i < 16) {
+            StrSetChar(prev_block, i, StrCharAt(input, block_num * 16 + i));
+            i := i + 1;
+        }
+        
+        out_pos := out_pos + 16;
+        block_num := block_num + 1;
+    }
+    
+    // Remove padding
+    var padding_len: int64 := StrCharAt(output, input_len - 1);
+    if (padding_len > 0 && padding_len <= 16) {
+        var valid: bool := true;
+        i := input_len - padding_len;
+        while (i < input_len) {
+            if (StrCharAt(output, i) != padding_len) {
+                valid := false;
+            }
+            i := i + 1;
+        }
+        if (valid) {
+            out_pos := out_pos - padding_len;
+        }
+    }
+    
+    return out_pos;
+}
+
+// AES-256
+pub fn AES256CBCEncrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, output: pchar): int64 {
+    if (input_len <= 0) { return 0; }
+    
+    // Expand key
+    var expanded_key: pchar := "                                                                ";
+    AES256KeyExpand(key, expanded_key);
+    
+    var padded_len: int64 := input_len;
+    if ((input_len mod 16) != 0) {
+        padded_len := ((input_len / 16) + 1) * 16;
+    } else {
+        padded_len := input_len + 16;
+    }
+    
+    var prev_block: pchar := "                ";
+    var work: pchar := "                ";
+    var cipher_block: pchar := "                ";
+    
+    var i: int64 := 0;
+    while (i < 16) {
+        StrSetChar(prev_block, i, StrCharAt(iv, i));
+        i := i + 1;
+    }
+    
+    var out_pos: int64 := 0;
+    var block_num: int64 := 0;
+    
+    while (block_num * 16 < padded_len) {
+        i := 0;
+        while (i < 16) {
+            var src_pos: int64 := block_num * 16 + i;
+            if (src_pos < input_len) {
+                StrSetChar(work, i, StrCharAt(input, src_pos));
+            } else {
+                StrSetChar(work, i, padded_len - input_len);
+            }
+            i := i + 1;
+        }
+        
+        XORBlocks(work, prev_block, work);
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(cipher_block, i, StrCharAt(work, i));
+            i := i + 1;
+        }
+        AESEncryptBlockWithKey(cipher_block, expanded_key, 14);
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(output, out_pos + i, StrCharAt(cipher_block, i));
+            i := i + 1;
+        }
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(prev_block, i, StrCharAt(output, out_pos + i));
+            i := i + 1;
+        }
+        
+        out_pos := out_pos + 16;
+        block_num := block_num + 1;
+    }
+    
+    return padded_len;
+}
+
+pub fn AES256CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, output: pchar): int64 {
+    if (input_len <= 0 || (input_len mod 16) != 0) { return -1; }
+    
+    // Expand key
+    var expanded_key: pchar := "                                                                ";
+    AES256KeyExpand(key, expanded_key);
+    
+    var prev_block: pchar := "                ";
+    var work: pchar := "                ";
+    var plain_block: pchar := "                ";
+    
+    var i: int64 := 0;
+    while (i < 16) {
+        StrSetChar(prev_block, i, StrCharAt(iv, i));
+        i := i + 1;
+    }
+    
+    var out_pos: int64 := 0;
+    var num_blocks: int64 := input_len / 16;
+    var block_num: int64 := 0;
+    
+    while (block_num < num_blocks) {
+        i := 0;
+        while (i < 16) {
+            StrSetChar(work, i, StrCharAt(input, block_num * 16 + i));
+            i := i + 1;
+        }
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(plain_block, i, StrCharAt(work, i));
+            i := i + 1;
+        }
+        AESDecryptBlockWithKey(plain_block, expanded_key, 14);
+        
+        XORBlocks(plain_block, prev_block, plain_block);
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(output, out_pos + i, StrCharAt(plain_block, i));
+            i := i + 1;
+        }
+        
+        i := 0;
+        while (i < 16) {
+            StrSetChar(prev_block, i, StrCharAt(input, block_num * 16 + i));
+            i := i + 1;
+        }
+        
+        out_pos := out_pos + 16;
+        block_num := block_num + 1;
+    }
+    
+    var padding_len: int64 := StrCharAt(output, input_len - 1);
+    if (padding_len > 0 && padding_len <= 16) {
+        var valid: bool := true;
+        i := input_len - padding_len;
+        while (i < input_len) {
+            if (StrCharAt(output, i) != padding_len) {
+                valid := false;
+            }
+            i := i + 1;
+        }
+        if (valid) {
+            out_pos := out_pos - padding_len;
+        }
+    }
+    
+    return out_pos;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+pub fn AESEncryptOutputSize(input_len: int64): int64 {
+    if ((input_len mod 16) == 0) { return input_len + 16; }
+    return ((input_len / 16) + 1) * 16;
+}
+
+pub fn AESDecryptOutputSize(input_len: int64): int64 {
+    return input_len;
+}
+
+// ============================================================================
+// End
+// ============================================================================
