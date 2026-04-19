@@ -32,7 +32,8 @@ type
     lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
     lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
     lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
-    lrTodoComment       // W022: "// TODO" Kommentare finden
+    lrTodoComment,       // W022: "// TODO" Kommentare finden
+    lrMagicNumber        // W023: hartecodierte Zahlen (magic numbers)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -61,7 +62,8 @@ const
     lrComplexFunction,
     lrDeadLoop,
     lrGlobalMutable,
-    lrTodoComment
+    lrTodoComment,
+    lrMagicNumber
   ];
 
   { Human-readable Namen für die Regeln }
@@ -87,7 +89,8 @@ const
     'complex-function',
     'dead-loop',
     'global-mutable',
-    'todo-comment'
+    'todo-comment',
+    'magic-number'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
@@ -95,7 +98,7 @@ const
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
     'W016', 'W017', 'W018', 'W019', 'W020',
-    'W021', 'W022'
+    'W021', 'W022', 'W023'
   );
 
 type
@@ -172,6 +175,7 @@ type
     procedure CheckDeadLoop(loop: TAstWhile);
     procedure CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
     procedure CheckTodoComment(prog: TAstProgram);
+    procedure CheckMagicNumber(expr: TAstExpr);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -525,7 +529,10 @@ begin
 
     { Literale benötigen keine weitere Prüfung }
     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit:
-      ; // nichts zu tun
+      begin
+        if expr.Kind = nkIntLit then
+          CheckMagicNumber(expr);
+      end;
   end;
 end;
 
@@ -1133,6 +1140,59 @@ begin
   // Comments are currently not stored in AST
   // Future: scan source text for "// TODO" or "/* TODO */" patterns
   // This would require lexer modifications to preserve comments
+end;
+
+{ --- W023: Magic Number Detection --- }
+procedure TLinter.CheckMagicNumber(expr: TAstExpr);
+var
+  value: Int64;
+  isSuspicious: Boolean;
+begin
+  if expr = nil then Exit;
+  if not (lrMagicNumber in FActiveRules) then Exit;
+  if expr.Kind <> nkIntLit then Exit;
+
+  value := TAstIntLit(expr).Value;
+
+  { Check for suspicious magic numbers (not common small values) }
+  isSuspicious := False;
+
+  { Warn about suspicious values: }
+  { - Buffer sizes: 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 }
+  { - Network ports: 80, 443, 8080, 3000, 5000 }
+  { - Permissions: 0644, 0755, 0777 }
+  { - Time: 1000, 60000 (ms), 3600 (seconds) }
+  { - Negative offsets, large arbitrary numbers }
+
+  { Skip common safe values: }
+  if (value >= 0) and (value <= 10) then Exit;
+  if value = -1 then Exit;  // common sentinel
+
+  { Check for power-of-2 suspicious values (often should be named constants) }
+  if (value = 64) or (value = 128) or (value = 256) or (value = 512) or
+     (value = 1024) or (value = 2048) or (value = 4096) or (value = 8192) or
+     (value = 16384) or (value = 32768) or (value = 65536) then
+    isSuspicious := True;
+
+  { Check for network ports }
+  if (value = 80) or (value = 443) or (value = 8080) or
+     (value = 3000) or (value = 5000) or (value = 8000) then
+    isSuspicious := True;
+
+  { Check for Unix permissions (octal-ish) }
+  if (value = 420) or (value = 493) or (value = 509) or (value = 511) then
+    isSuspicious := True;
+
+  { Large suspicious values }
+  if (value > 10000) and (value < 1000000) and
+     not ((value mod 1024) = 0) then
+    isSuspicious := True;
+
+  if isSuspicious then
+    Warn(lrMagicNumber,
+      Format('magic number %d should be a named constant for better maintainability',
+        [value]),
+      expr.Span);
 end;
 
 { --- MISRA #19: Max Function Length (60 lines) --- }
