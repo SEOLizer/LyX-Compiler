@@ -214,7 +214,7 @@ fn set_target_altitude(alt: int64): int64 {
 }
 ```
 
-### Bounded While Loops (aerospace-todo P1 #47)
+### Bounded While Loops (v0.8.2 ✅ ABGESCHLOSSEN – aerospace-todo P1 #47)
 
 Für deterministische Echtzeit-Ausführung können While-Schleifen mit einem `limit` versehen werden:
 
