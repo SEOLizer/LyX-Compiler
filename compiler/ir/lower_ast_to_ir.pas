@@ -1141,6 +1141,28 @@ begin
             // so that callers inside the same unit get cmExternal, generating PLT stubs.
             if TAstFuncDecl(node).IsExtern then
             begin
+              // Known Linux syscall wrappers must NOT go into FExternFuncs — they are
+              // dispatched as irCallBuiltin by name in the call-lowering chain below.
+              // Adding them here would route callers to a PLT stub that does not exist.
+              if (TAstFuncDecl(node).Name = 'sys_socket')    or
+                 (TAstFuncDecl(node).Name = 'sys_bind')      or
+                 (TAstFuncDecl(node).Name = 'sys_listen')    or
+                 (TAstFuncDecl(node).Name = 'sys_accept')    or
+                 (TAstFuncDecl(node).Name = 'sys_connect')   or
+                 (TAstFuncDecl(node).Name = 'sys_recvfrom')  or
+                 (TAstFuncDecl(node).Name = 'sys_sendto')    or
+                 (TAstFuncDecl(node).Name = 'sys_setsockopt') or
+                 (TAstFuncDecl(node).Name = 'sys_getsockopt') or
+                 (TAstFuncDecl(node).Name = 'sys_fcntl')     or
+                 (TAstFuncDecl(node).Name = 'sys_shutdown')  or
+                 (TAstFuncDecl(node).Name = 'sys_close')     or
+                 (TAstFuncDecl(node).Name = 'sys_read')      or
+                 (TAstFuncDecl(node).Name = 'sys_write')     or
+                 (TAstFuncDecl(node).Name = 'sys_select')    or
+                 (TAstFuncDecl(node).Name = 'sys_poll')      then
+              begin
+                Continue;  // Handled as irCallBuiltin by the call-lowering name dispatch
+              end;
               FExternFuncs.Add(TAstFuncDecl(node).Name);
               if TAstFuncDecl(node).LibraryName <> '' then
                 FModule.RegisterExternLibrary(TAstFuncDecl(node).Name,
