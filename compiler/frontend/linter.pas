@@ -34,7 +34,8 @@ type
     lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
     lrTodoComment,       // W022: "// TODO" Kommentare finden
     lrMagicNumber,        // W023: hartecodierte Zahlen (magic numbers)
-    lrUnboundedLoop     // W024: While ohne limit() (WCET)
+    lrUnboundedLoop,     // W024: While ohne limit() (WCET)
+    lrResourceLeak       // W025: mmap ohne munmap (Resource Leak)
   );
 
   TLintRuleIdSet = set of TLintRuleId;
