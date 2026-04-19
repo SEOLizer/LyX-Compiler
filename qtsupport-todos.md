@@ -9,7 +9,7 @@
 Dieses Dokument beschreibt den Fahrplan für die vollständige Qt5-Integration in Lyx.
 Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
-### Aktueller Stand (v0.8.1)
+### Aktueller Stand (v0.8.2)
 - ✅ Basis-Fenster (QMainWindow) mit Label und StatusBar
 - ✅ Event-Loop und Prozess-Events
 - ✅ QPushButton (Basis)

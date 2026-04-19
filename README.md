@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.1-aerospace
+Lyx Compiler v0.8.2-aerospace
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
