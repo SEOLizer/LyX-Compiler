@@ -50,6 +50,17 @@ Quelltext (.lyx)
 
 ---
 
+## ⚠️ VERALTET: Offene TODOs
+
+> **Hinweis:** Diese Sektion ist veraltet. Alle Features sind bereits implementiert:
+> - `--arch`: ✅ Vollständig (README.md Zeile 16)
+> - `--target`: ✅ Vollständig (README.md Zeile 17)
+> - `--asm-listing`: ✅ Vollständig (README.md Zeile 49)
+> - `--mcdc`: ✅ Vollständig (README.md Zeile 48)
+> - `--static-analysis`: ✅ Vollständig (README.md Zeile 50)
+> - `--call-graph`: ✅ Vollständig
+> - `--map-file`: ✅ Vollständig
+
 ## 📋 Offene TODOs
 
 Nachfolgende Features sind noch nicht im Bootstrap-Compiler implementiert:
