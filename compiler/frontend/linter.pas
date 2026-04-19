@@ -29,7 +29,8 @@ type
     lrPointerArithmetic,    // W017: Pointer-Arithmetik (MISRA 5.2)
     lrIncompleteSwitch,    // W018: Switch ohne default oder ohne alle Enum-Werte (MISRA 5.2)
     lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
-    lrComplexFunction      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
+    lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
+    lrDeadLoop            // W016: Endlosschleife ohne exit condition / break
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -55,7 +56,8 @@ const
     lrPointerArithmetic,
     lrIncompleteSwitch,
     lrFunctionTooLong,
-    lrComplexFunction
+    lrComplexFunction,
+    lrDeadLoop
   ];
 
   { Human-readable Namen für die Regeln }
@@ -78,14 +80,15 @@ const
     'pointer-arithmetic',
     'incomplete-switch',
     'function-too-long',
-    'complex-function'
+    'complex-function',
+    'dead-loop'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
-    'W017', 'W018', 'W019', 'W020'
+    'W016', 'W017', 'W018', 'W019', 'W020'
   );
 
 type
@@ -159,6 +162,7 @@ type
     procedure CheckFunctionLength(fn: TAstFuncDecl);
     function CalculateCyclomaticComplexity(fn: TAstFuncDecl): Integer;
     procedure CheckCyclomaticComplexity(fn: TAstFuncDecl);
+    procedure CheckDeadLoop(loop: TAstWhile);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -582,6 +586,8 @@ begin
     nkWhile:
     begin
       LintExpr(TAstWhile(stmt).Cond);
+      if lrDeadLoop in FActiveRules then
+        CheckDeadLoop(TAstWhile(stmt));
       PushScope;
       LintStmt(TAstWhile(stmt).Body);
       PopScope;
@@ -1021,6 +1027,71 @@ begin
         sw.Span);
     end;
   end;
+end;
+
+{ --- W016: Dead Loop Detection --- }
+procedure TLinter.CheckDeadLoop(loop: TAstWhile);
+var
+  hasBreak: Boolean;
+  i: Integer;
+
+  function ContainsBreak(stmt: TAstStmt): Boolean;
+  var
+    j: Integer;
+  begin
+    Result := False;
+    if stmt = nil then Exit;
+    case stmt.Kind of
+      nkBreak:
+        Result := True;
+      nkBlock:
+        begin
+          for j := 0 to High(TAstBlock(stmt).Stmts) do
+            if ContainsBreak(TAstBlock(stmt).Stmts[j]) then
+            begin
+              Result := True;
+              Exit;
+            end;
+        end;
+      nkIf:
+        begin
+          Result := ContainsBreak(TAstIf(stmt).ThenBranch) or
+            (Assigned(TAstIf(stmt).ElseBranch) and ContainsBreak(TAstIf(stmt).ElseBranch));
+        end;
+      nkWhile, nkFor:
+        ; // nested loops are their own exit points
+    end;
+  end;
+
+  function IsTrueLiteral(expr: TAstExpr): Boolean;
+  var
+    unop: TAstUnaryOp;
+  begin
+    Result := False;
+    if expr = nil then Exit;
+    case expr.Kind of
+      nkBoolLit:
+        Result := TAstBoolLit(expr).Value = True;
+      nkIntLit:
+        Result := TAstIntLit(expr).Value <> 0;
+      nkUnaryOp:
+        begin
+          unop := TAstUnaryOp(expr);
+          if unop.Op = tkNot then
+            Result := IsTrueLiteral(unop.Operand);
+        end;
+    end;
+  end;
+
+begin
+  // Only check if condition is always-true
+  if not IsTrueLiteral(loop.Cond) then Exit;
+  // Check if there's any break condition
+  hasBreak := ContainsBreak(loop.Body);
+  if not hasBreak then
+    Warn(lrDeadLoop,
+      'infinite loop without break; add limit() or break for WCET predictability',
+      loop.Span);
 end;
 
 { --- MISRA #19: Max Function Length (60 lines) --- }
