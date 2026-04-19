@@ -83,15 +83,15 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-E: Auswahl-Widgets
+### WP-E: Auswahl-Widgets (✅ COMPLETED)
 
 **Beschreibung**: Auswahl-Elemente
 
 | Widget | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| CheckBox | QCheckBox | `qt_checkbox_create()` | 🔜 |
-| RadioButton | QRadioButton | `qt_radiobutton_create()` | 🔜 |
-| ComboBox | QComboBox | `qt_combobox_create()` | 🔜 |
+| CheckBox | QCheckBox | `qt_checkbox_create()` | ✅ |
+| RadioButton | QRadioButton | `qt_radiobutton_create()` | ✅ |
+| ComboBox | QComboBox | `qt_combobox_create()` | ✅ |
 | PushButton | QPushButton | `qt_add_button()` | ✅ |
 
 ---
@@ -216,7 +216,7 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ### Phase 2: Kern II ✅ COMPLETED
 - WP-D: Eingabe-Widgets ✅
-- WP-E: Auswahl-Widgets
+- WP-E: Auswahl-Widgets ✅
 - WP-F: Anzeige-Widgets
 
 ### Phase 3: Layout 🔜
