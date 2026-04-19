@@ -69,17 +69,17 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-D: Eingabe-Widgets (🚀 IN PROGRESS)
+### WP-D: Eingabe-Widgets (✅ COMPLETED)
 
 **Beschreibung**: Grundlegende Benutzer-Eingabe
 
 | Widget | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
-| Einzeilen-Text | QLineEdit | `qt_lineedit_create()` | 🔜 |
-| Passwort-Feld | QLineEdit (EchoMode) | `qt_lineedit_set_echo()` | 🔜 |
-| SpinBox | QSpinBox | `qt_spinbox_create()` | 🔜 |
-| DoubleSpinBox | QDoubleSpinBox | `qt_doublespinbox_create()` | 🔜 |
-| Mehrzeilen-Text | QTextEdit | `qt_textedit_create()` | 🔜 |
+| Einzeilen-Text | QLineEdit | `qt_lineedit_create()` | ✅ |
+| Passwort-Feld | QLineEdit (EchoMode) | `qt_lineedit_set_echo()` | ✅ |
+| SpinBox | QSpinBox | `qt_spinbox_create()` | ✅ |
+| DoubleSpinBox | QDoubleSpinBox | `qt_doublespinbox_create()` | ✅ |
+| Mehrzeilen-Text | QTextEdit | `qt_textedit_create()` | ✅ |
 
 ---
 
@@ -214,8 +214,8 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 - WP-B: Fenster
 - WP-C: Buttons
 
-### Phase 2: Kern II 🚀 IN PROGRESS
-- WP-D: Eingabe-Widgets
+### Phase 2: Kern II ✅ COMPLETED
+- WP-D: Eingabe-Widgets ✅
 - WP-E: Auswahl-Widgets
 - WP-F: Anzeige-Widgets
 
