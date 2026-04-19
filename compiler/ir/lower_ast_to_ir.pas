@@ -3776,9 +3776,6 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         if (castTypeName <> '') and (FClassTypes.IndexOf(castTypeName) >= 0) then
         begin
           // Class cast is a no-op in IR (just a type annotation / pointer reinterpret).
-          // Return the source temp directly — do NOT emit irLoadLocal here, because
-          // irLoadLocal treats Src1 as a LOCAL slot index (no fn.LocalCount offset),
-          // so passing a temp index would read the wrong stack slot.
           Result := t1;
           Exit;
         end
