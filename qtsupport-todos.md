@@ -96,15 +96,15 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ---
 
-### WP-F: Anzeige-Widgets
+### WP-F: Anzeige-Widgets (✅ COMPLETED)
 
 **Beschreibung**: Anzeige-Elemente
 
 | Widget | Qt-Klasse | Lyx-Funktion | Status |
 |--------|-----------|--------------|--------|
 | Label | QLabel | `qt_set_label()` | ✅ |
-| ProgressBar | QProgressBar | `qt_progressbar_create()` | 🔜 |
-| ListWidget | QListWidget | `qt_listwidget_create()` | 🔜 |
+| ProgressBar | QProgressBar | `qt_progressbar_create()` | ✅ |
+| ListWidget | QListWidget | `qt_listwidget_create()` | ✅ |
 
 ---
 
@@ -217,7 +217,7 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 ### Phase 2: Kern II ✅ COMPLETED
 - WP-D: Eingabe-Widgets ✅
 - WP-E: Auswahl-Widgets ✅
-- WP-F: Anzeige-Widgets
+- WP-F: Anzeige-Widgets ✅
 
 ### Phase 3: Layout 🔜
 - WP-G: Slider/Dial
