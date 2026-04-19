@@ -990,6 +990,9 @@ begin
     end;
   end;
 
+  { W022: Check for TODO in names }
+  CheckTodoComment(prog);
+
   { Globalen Scope schließen — hier werden globale unused-Warnungen erzeugt }
   PopScope;
 end;
@@ -1133,13 +1136,73 @@ begin
   end;
 end;
 
-{ --- W022: TODO Comment Detection (STUB) --- }
+{ --- W022: TODO in Names Detection --- }
 procedure TLinter.CheckTodoComment(prog: TAstProgram);
+var
+  i: Integer;
+  node: TAstNode;
+  name: string;
+  nameSpan: TSourceSpan;
+
+  procedure CheckNodeForTODO(nodeKind: TNodeKind; nodeName: string; nodeSpan: TSourceSpan);
+  var
+    upperName: string;
+  begin
+    if nodeName = '' then Exit;
+    if not (lrTodoComment in FActiveRules) then Exit;
+
+    upperName := UpperCase(nodeName);
+    if (Pos('TODO', upperName) > 0) or (Pos('FIXME', upperName) > 0) or
+       (Pos('XXX', upperName) > 0) or (Pos('BUG', upperName) > 0) then
+    begin
+      Warn(lrTodoComment,
+        'name contains TODO/FIXME marker: ''' + nodeName + '''',
+        nodeSpan);
+    end;
+  end;
+
 begin
-  // TODO: Implement comment scanning
-  // Comments are currently not stored in AST
-  // Future: scan source text for "// TODO" or "/* TODO */" patterns
-  // This would require lexer modifications to preserve comments
+  if prog = nil then Exit;
+  if not (lrTodoComment in FActiveRules) then Exit;
+
+  // Check all declarations for TODO in names
+  for i := 0 to High(prog.Decls) do
+  begin
+    node := prog.Decls[i];
+    if node = nil then Continue;
+
+    case node.Kind of
+      nkFuncDecl:
+        begin
+          name := TAstFuncDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkVarDecl:
+        begin
+          name := TAstVarDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkConDecl:
+        begin
+          name := TAstConDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkStructDecl:
+        begin
+          name := TAstStructDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkClassDecl:
+        begin
+          name := TAstClassDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      else
+        Continue;
+    end;
+
+    CheckNodeForTODO(node.Kind, name, nameSpan);
+  end;
 end;
 
 { --- W023: Magic Number Detection --- }
