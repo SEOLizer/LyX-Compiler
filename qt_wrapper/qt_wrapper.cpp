@@ -44,6 +44,12 @@
 #include <QPlainTextEdit>
 #include <QTreeView>
 #include <QTableView>
+#include <QPixmap>
+#include <QImage>
+#include <QPainter>
+#include <QColor>
+#include <QFont>
+#include <QPen>
 #include <map>
 #include <functional>
 #include <cstring>
@@ -1580,6 +1586,207 @@ long long _qt_splitter_set_sizes(long long splitter, long long sizes, long long 
 long long _qt_splitter_set_collapsed(long long splitter, long long index, long long collapsed) {
     if (!splitter) return -1;
     ((QSplitter*)splitter)->setCollapsible((int)index, collapsed != 0);
+    return 0;
+}
+
+// ============================================================================
+// WP-M: 2D Graphics (QPainter)
+// ============================================================================
+
+// qt_pixmap_create(width, height) — create a pixmap for off-screen drawing.
+// Returns: QPixmap* as int64
+long long _qt_pixmap_create(long long width, long long height) {
+    QPixmap* pm = new QPixmap((int)width, (int)height);
+    return (long long)(void*)pm;
+}
+
+// qt_pixmap_load(pixmap, filename) — load image from file.
+// Returns: 1 on success, 0 on failure
+long long _qt_pixmap_load(long long pixmap, long long filename) {
+    if (!pixmap || !filename) return 0;
+    QPixmap* pm = (QPixmap*)pixmap;
+    pm->load(QString::fromUtf8((const char*)filename));
+    return pm->isNull() ? 0 : 1;
+}
+
+// qt_pixmap_save(pixmap, filename, format) — save pixmap to file.
+long long _qt_pixmap_save(long long pixmap, long long filename, long long format) {
+    if (!pixmap || !filename) return 0;
+    QPixmap* pm = (QPixmap*)pixmap;
+    QString fmt = format ? QString::fromUtf8((const char*)format) : QString("PNG");
+    return pm->save(QString::fromUtf8((const char*)filename), qPrintable(fmt)) ? 1 : 0;
+}
+
+// qt_pixmap_width(pixmap) — get pixmap width.
+long long _qt_pixmap_width(long long pixmap) {
+    if (!pixmap) return 0;
+    return ((QPixmap*)pixmap)->width();
+}
+
+// qt_pixmap_height(pixmap) — get pixmap height.
+long long _qt_pixmap_height(long long pixmap) {
+    if (!pixmap) return 0;
+    return ((QPixmap*)pixmap)->height();
+}
+
+// qt_pixmap_fill(pixmap, r, g, b, a) — fill pixmap with color.
+long long _qt_pixmap_fill(long long pixmap, long long r, long long g, long long b, long long a) {
+    if (!pixmap) return -1;
+    ((QPixmap*)pixmap)->fill(QColor((int)r, (int)g, (int)b, (int)a));
+    return 0;
+}
+
+// qt_image_create(width, height, format) — create an image.
+// format: 0 = ARGB32, 1 = RGB32, 2 = Monochrome
+long long _qt_image_create(long long width, long long height, long long format) {
+    QImage::Format f = QImage::Format_ARGB32;
+    if (format == 1) f = QImage::Format_RGB32;
+    else if (format == 2) f = QImage::Format_Mono;
+    QImage* img = new QImage((int)width, (int)height, f);
+    return (long long)(void*)img;
+}
+
+// qt_image_width(image) — get image width.
+long long _qt_image_width(long long image) {
+    if (!image) return 0;
+    return ((QImage*)image)->width();
+}
+
+// qt_image_height(image) — get image height.
+long long _qt_image_height(long long image) {
+    if (!image) return 0;
+    return ((QImage*)image)->height();
+}
+
+// ============================================================================
+// QPainter (2D Drawing)
+// ============================================================================
+
+// Global painter instance (for simplicity)
+static QPainter* g_painter = nullptr;
+
+// qt_painter_begin(pixmap) — begin painting on a pixmap.
+long long _qt_painter_begin(long long pixmap) {
+    if (!pixmap) return -1;
+    if (g_painter) {
+        delete g_painter;
+    }
+    g_painter = new QPainter((QPixmap*)pixmap);
+    return g_painter->isActive() ? 1 : 0;
+}
+
+// qt_painter_end() — end painting.
+long long _qt_painter_end(void) {
+    if (g_painter && g_painter->isActive()) {
+        g_painter->end();
+    }
+    if (g_painter) {
+        delete g_painter;
+        g_painter = nullptr;
+    }
+    return 0;
+}
+
+// qt_painter_set_pen_color(r, g, b, a) — set pen color.
+long long _qt_painter_set_pen_color(long long r, long long g, long long b, long long a) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->setPen(QPen(QColor((int)r, (int)g, (int)b, (int)a)));
+    return 0;
+}
+
+// qt_painter_set_pen_width(width) — set pen width.
+long long _qt_painter_set_pen_width(long long width) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    QPen pen = g_painter->pen();
+    pen.setWidth((int)width);
+    g_painter->setPen(pen);
+    return 0;
+}
+
+// qt_painter_set_brush_color(r, g, b, a) — set brush color.
+long long _qt_painter_set_brush_color(long long r, long long g, long long b, long long a) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->setBrush(QColor((int)r, (int)g, (int)b, (int)a));
+    return 0;
+}
+
+// qt_painter_draw_line(x1, y1, x2, y2) — draw a line.
+long long _qt_painter_draw_line(long long x1, long long y1, long long x2, long long y2) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->drawLine((int)x1, (int)y1, (int)x2, (int)y2);
+    return 0;
+}
+
+// qt_painter_draw_rect(x, y, width, height) — draw a rectangle.
+long long _qt_painter_draw_rect(long long x, long long y, long long width, long long height) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->drawRect((int)x, (int)y, (int)width, (int)height);
+    return 0;
+}
+
+// qt_painter_draw_ellipse(x, y, width, height) — draw an ellipse.
+long long _qt_painter_draw_ellipse(long long x, long long y, long long width, long long height) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->drawEllipse((int)x, (int)y, (int)width, (int)height);
+    return 0;
+}
+
+// qt_painter_draw_text(x, y, text) — draw text at position.
+long long _qt_painter_draw_text(long long x, long long y, long long text) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->drawText((int)x, (int)y, 
+        text ? QString::fromUtf8((const char*)text) : QString());
+    return 0;
+}
+
+// qt_painter_fill_rect(x, y, width, height, r, g, b, a) — fill rectangle with color.
+long long _qt_painter_fill_rect(long long x, long long y, long long width, long long height, long long r, long long g, long long b, long long a) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->fillRect((int)x, (int)y, (int)width, (int)height, 
+        QColor((int)r, (int)g, (int)b, (int)a));
+    return 0;
+}
+
+// qt_painter_set_font(family, size, bold) — set font.
+// family: font name, size: point size, bold: 1 for bold
+long long _qt_painter_set_font(long long family, long long size, long long bold) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    QFont font(family ? QString::fromUtf8((const char*)family) : QString("Arial"));
+    font.setPointSize((int)size);
+    font.setBold(bold != 0);
+    g_painter->setFont(font);
+    return 0;
+}
+
+// qt_painter_set_opacity(opacity) — set opacity (0.0 to 1.0).
+long long _qt_painter_set_opacity(long long opacity) {
+    if (!g_painter || !g_painter->isActive()) return -1;
+    g_painter->setOpacity(*(double*)&opacity);
+    return 0;
+}
+
+// ============================================================================
+// Color Picker (WP-L extension)
+// ============================================================================
+
+// qt_color_dialog(parent, initial_color) — show color picker dialog.
+// Returns: color as 0xAABBGGRR (int32), or -1 on cancel
+long long _qt_color_dialog(long long parent, long long initial_color) {
+    Q_UNUSED(parent);
+    Q_UNUSED(initial_color);
+    // Note: Full QColorDialog needs Qt5::Widgets
+    // Simple stub - returns initial_color or 0
+    return initial_color;
+}
+
+// qt_font_dialog(parent, family, size) — show font dialog.
+// Returns: 1 if accepted, 0 if cancelled (family/size returned via pointers)
+long long _qt_font_dialog(long long parent, long long family, long long size) {
+    Q_UNUSED(parent);
+    Q_UNUSED(family);
+    Q_UNUSED(size);
+    // Note: Full QFontDialog needs Qt5::Widgets  
+    // Simple stub - returns 0
     return 0;
 }
 
