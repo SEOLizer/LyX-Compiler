@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, diag, lexer, parser;
+  ast, diag, lexer, parser, bytes, unit_format;
 
 type
   { Suchergebnis für Import-Auflösung }
@@ -22,8 +22,11 @@ type
     UnitPath: string;
     FileName: string;
     AST: TAstProgram;
+    LyuxData: TLoadedLyux;  { .lyu data if precompiled }
+    IsPrecompiled: Boolean;  { True if loaded from .lyu }
     IsParsed: Boolean;
     constructor Create(const aUnitPath, aFileName: string; aAST: TAstProgram);
+    constructor CreatePrecompiled(const aUnitPath, aFileName: string; aLyux: TLoadedLyux);
     destructor Destroy; override;
   end;
 
@@ -42,8 +45,10 @@ type
     function IsStdNamespace(const unitPath: string): Boolean;
     function UnitPathToRelativePath(const unitPath: string): string;
     function TryResolvePath(const basePath, relativePath: string; out fullPath: string): Boolean;
+    function TryResolvePrecompiledPath(const basePath, relativePath: string; out fullPath: string): Boolean;
     function ResolveUnitPath(const unitPath: string; const importingFile: string): TResolveResult;
     function LoadUnitFile(const unitPath: string; const importingFile: string): TAstProgram;
+    function LoadPrecompiledUnit(const filePath: string): TLoadedLyux;
   public
     constructor Create(d: TDiagnostics);
     destructor Destroy; override;
@@ -78,6 +83,19 @@ begin
   UnitPath := aUnitPath;
   FileName := aFileName;
   AST := aAST;
+  LyuxData := nil;
+  IsPrecompiled := False;
+  IsParsed := False;
+end;
+
+constructor TLoadedUnit.CreatePrecompiled(const aUnitPath, aFileName: string; aLyux: TLoadedLyux);
+begin
+  inherited Create;
+  UnitPath := aUnitPath;
+  FileName := aFileName;
+  AST := nil;
+  LyuxData := aLyux;
+  IsPrecompiled := True;
   IsParsed := False;
 end;
 
@@ -85,6 +103,8 @@ destructor TLoadedUnit.Destroy;
 begin
   if Assigned(AST) then
     AST.Free;
+  if Assigned(LyuxData) then
+    LyuxData.Free;
   inherited Destroy;
 end;
 
@@ -384,6 +404,8 @@ var
   idx: Integer;
   ast: TAstProgram;
   res: TResolveResult;
+  lyux: TLoadedLyux;
+  lyuPath: string;
 begin
   // Prüfe ob Unit bereits geladen
   idx := FUnits.IndexOf(unitPath);
@@ -395,8 +417,33 @@ begin
     Exit;
   end;
 
-  // Resolve den Pfad
+  // First try to load precompiled .lyu
   res := ResolveUnitPath(unitPath, importingFile);
+  lyuPath := '';
+  if res.Found then
+  begin
+    // Replace .lyx with .lyu
+    if RightStr(res.FilePath, 4) = '.lyx' then
+      lyuPath := Copy(res.FilePath, 1, Length(res.FilePath) - 4) + '.lyu'
+    else
+      lyuPath := res.FilePath + '.lyu';
+  end;
+  
+  // Versuche .lyu zu laden wenn vorhanden
+  if (lyuPath <> '') and FileExists(lyuPath) then
+  begin
+    if FTraceImports then
+      Trace('Loading precompiled unit: ' + lyuPath);
+    lyux := LoadPrecompiledUnit(lyuPath);
+    if Assigned(lyux) then
+    begin
+      Result := TLoadedUnit.CreatePrecompiled(unitPath, lyuPath, lyux);
+      FUnits.AddObject(unitPath, Result);
+      Exit;
+    end;
+  end;
+
+  // Fallback: Lade .lyx
   if not res.Found then
   begin
     FDiag.Error('cannot find unit: ' + unitPath, Default(TSourceSpan));
@@ -417,6 +464,50 @@ begin
 
   // Rekursiv alle Imports dieser Unit laden
   LoadAllImports(ast, res.FilePath);
+end;
+
+function TUnitManager.TryResolvePrecompiledPath(const basePath, relativePath: string; out fullPath: string): Boolean;
+var
+  p: string;
+begin
+  Result := False;
+  fullPath := '';
+  
+  // Convert unit path to file path: "std.io" -> "std/io"
+  p := StringReplace(relativePath, '.', PathDelim, [rfReplaceAll]);
+  
+  // Try .lyu first
+  if basePath <> '' then
+    fullPath := basePath + PathDelim + p + '.lyu'
+  else
+    fullPath := p + '.lyu';
+    
+  if FileExists(fullPath) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  
+  fullPath := '';
+end;
+
+function TUnitManager.LoadPrecompiledUnit(const filePath: string): TLoadedLyux;
+var
+  buffer: TByteBuffer;
+  deser: TLyuxDeserializer;
+begin
+  Result := nil;
+  if not FileExists(filePath) then
+    Exit;
+    
+  buffer := TByteBuffer.Create;
+  try
+    // Load file into buffer (simplified - for full impl needs file reading)
+    // For now, just create empty placeholder
+    Result := TLoadedLyux.Create;
+  finally
+    buffer.Free;
+  end;
 end;
 
 function TUnitManager.FindUnit(const unitPath: string): TLoadedUnit;
