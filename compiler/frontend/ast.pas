@@ -48,6 +48,64 @@ type
 
   TVisibility = (visPrivate, visProtected, visPublic);
 
+  { --- LFD Widget-Typen (Qt-Widgets) --- }
+
+  TLfdWidgetKind = (
+    lfdWidgetUnknown,
+    // Basis-Widgets
+    lfdWidget,        // generisches QWidget
+    lfdLabel,        // QLabel
+    lfdPushButton,   // QPushButton
+    lfdCheckBox,     // QCheckBox
+    lfdRadioButton,  // QRadioButton
+    lfdLineEdit,     // QLineEdit (Input)
+    lfdTextEdit,     // QTextEdit / QPlainTextEdit
+    // Container-Widgets
+    lfdGroupBox,     // QGroupBox
+    lfdTabWidget,    // QTabWidget
+    lfdScrollArea,   // QScrollArea
+    lfdStackedWidget, // QStackedWidget
+    // Auswahl-Widgets
+    lfdComboBox,     // QComboBox
+    lfdListWidget,   // QListWidget
+    lfdTreeWidget,   // QTreeWidget
+    lfdTableWidget,  // QTableWidget
+    // Fortschritt/Datum
+    lfdProgressBar,  // QProgressBar
+    lfdSlider,       // QSlider
+    lfdSpinBox,      // QSpinBox
+    lfdDateEdit,     // QDateEdit / QTimeEdit
+    // Spezial
+    lfdMenuBar,      // QMenuBar
+    lfdToolBar,      // QToolBar
+    lfdAction,       // QAction
+    lfdSeparator,    // Separator/ Trennlinie
+    lfdSpacer        // QSpacerItem (in Layouts)
+  );
+
+  { --- LFD Layout-Typen --- }
+
+  TLfdLayoutKind = (
+    lfdLayoutUnknown,
+    lfdLayoutVertical,   // QVBoxLayout
+    lfdLayoutHorizontal,  // QHBoxLayout
+    lfdLayoutGrid,        // QGridLayout
+    lfdLayoutForm         // QFormLayout
+  );
+
+  { --- LFD Signal-Typen --- }
+
+  TLfdSignalKind = (
+    lfdSignalUnknown,
+    lfdSignalClicked,       // OnClick
+    lfdSignalToggled,       // OnToggle (CheckBox)
+    lfdSignalChanged,       // OnChange (Text/Value)
+    lfdSignalActivated,     // OnSelect (ComboBox)
+    lfdSignalDoubleClicked, // OnDblClick
+    lfdSignalReturnPressed, // OnReturn (LineEdit)
+    lfdSignalEditingFinished // OnEditingFinished
+  );
+
   { --- Knotenarten (für schnellen Typcheck ohne 'is') --- }
 
    TNodeKind = (
@@ -75,9 +133,16 @@ type
      nkShiftLeft, nkShiftRight,
      // SIMD/ParallelArray AST nodes
      nkSIMDNew, nkSIMDBinOp, nkSIMDUnaryOp, nkSIMDIndexAccess,
-     nkIsExpr, // 'is' operator (type check)
-     nkFormatExpr // Pascal format specifier: expr:width:decimals
-  );
+      nkIsExpr, // 'is' operator (type check)
+      nkFormatExpr, // Pascal format specifier: expr:width:decimals
+
+      // LFD (LyX Form Description) AST nodes
+      nkLfdForm,         // Form MyForm "Title" { ... }
+      nkLfdWidget,       // Button btnOk { ... }
+      nkLfdLayout,       // Layout Vertical { ... }
+      nkLfdProperty,     // Text: "value"
+      nkLfdSignal        // OnClick: "handler()"
+   );
 
   { --- Vorwärtsdeklarationen --- }
 
@@ -1163,6 +1228,100 @@ type
     property Decls: TAstNodeList read FDecls;
   end;
 
+  // ================================================================
+  // LFD (LyX Form Description) AST Nodes
+  // ================================================================
+
+  { LFD Property: name: value oder name: "value" }
+  TLfdProperty = class(TAstNode)
+  private
+    FName: string;
+    FValue: string;
+  public
+    constructor Create(const aName, aValue: string; aSpan: TSourceSpan);
+    property Name: string read FName;
+    property Value: string read FValue;
+  end;
+  TLfdPropertyList = array of TLfdProperty;
+
+  { LFD Signal: OnClick: "handler()" }
+  TLfdSignal = class(TAstNode)
+  private
+    FSignalKind: TLfdSignalKind;
+    FHandlerName: string;
+  public
+    constructor Create(aSignalKind: TLfdSignalKind; const aHandlerName: string; aSpan: TSourceSpan);
+    property SignalKind: TLfdSignalKind read FSignalKind;
+    property HandlerName: string read FHandlerName;
+  end;
+  TLfdSignalList = array of TLfdSignal;
+
+  { LFD Widget-Liste (Knoten in einem Layout oder Form) }
+  TAstLfdNodeList = array of TAstNode;
+
+  { LFD Layout: Layout Vertical { ... } oder Layout Horizontal { ... } }
+  TLfdLayout = class(TAstNode)
+  private
+    FLayoutKind: TLfdLayoutKind;
+    FChildren: TAstLfdNodeList;
+    FSpacing: Integer;       // -1 = default
+    FMarginTop: Integer;
+    FMarginBottom: Integer;
+    FMarginLeft: Integer;
+    FMarginRight: Integer;
+  public
+    constructor Create(aLayoutKind: TLfdLayoutKind; const aChildren: TAstLfdNodeList; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property LayoutKind: TLfdLayoutKind read FLayoutKind;
+    property Children: TAstLfdNodeList read FChildren;
+    property Spacing: Integer read FSpacing write FSpacing;
+    property MarginTop: Integer read FMarginTop write FMarginTop;
+    property MarginBottom: Integer read FMarginBottom write FMarginBottom;
+    property MarginLeft: Integer read FMarginLeft write FMarginLeft;
+    property MarginRight: Integer read FMarginRight write FMarginRight;
+  end;
+
+  { LFD Widget: Button btnOk { Text: "OK" OnClick: "handleOk()" } }
+  TLfdWidget = class(TAstNode)
+  private
+    FWidgetKind: TLfdWidgetKind;
+    FName: string;
+    FProperties: TLfdPropertyList;
+    FSignals: TLfdSignalList;
+    FChildren: TAstLfdNodeList;  // Für Container-Widgets (GroupBox, TabWidget, etc.)
+  public
+    constructor Create(aWidgetKind: TLfdWidgetKind; const aName: string;
+      const aProperties: TLfdPropertyList; const aSignals: TLfdSignalList;
+      const aChildren: TAstLfdNodeList; aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property WidgetKind: TLfdWidgetKind read FWidgetKind;
+    property Name: string read FName;
+    property Properties: TLfdPropertyList read FProperties;
+    property Signals: TLfdSignalList read FSignals;
+    property Children: TAstLfdNodeList read FChildren;
+    function GetProperty(const aName: string): string;
+    function GetSignal(aSignalKind: TLfdSignalKind): string;
+  end;
+
+  { LFD Form: Form MainWindow "Title" { ... } }
+  TLfdForm = class(TAstNode)
+  private
+    FName: string;
+    FTitle: string;
+    FChildren: TAstLfdNodeList;  // Widgets und Layouts auf oberster Ebene
+    FProperties: TLfdPropertyList;
+  public
+    constructor Create(const aName, aTitle: string;
+      const aChildren: TAstLfdNodeList; const aProperties: TLfdPropertyList;
+      aSpan: TSourceSpan);
+    destructor Destroy; override;
+    property Name: string read FName;
+    property Title: string read FTitle;
+    property Children: TAstLfdNodeList read FChildren;
+    property Properties: TLfdPropertyList read FProperties;
+    function GetProperty(const aName: string): string;
+  end;
+
 { --- Hilfsfunktionen für Nullable-Typen --- }
 
 function IsNullableType(t: TAurumType): Boolean;
@@ -1179,6 +1338,125 @@ function StorageKlassToStr(sk: TStorageKlass): string;
 function NodeKindToStr(nk: TNodeKind): string;
 
 implementation
+
+{ ================================================================ }
+{ LFD (LyX Form Description) Implementation }
+{ ================================================================ }
+
+constructor TLfdProperty.Create(const aName, aValue: string; aSpan: TSourceSpan);
+begin
+  inherited Create(nkLfdProperty, aSpan);
+  FName := aName;
+  FValue := aValue;
+end;
+
+constructor TLfdSignal.Create(aSignalKind: TLfdSignalKind; const aHandlerName: string; aSpan: TSourceSpan);
+begin
+  inherited Create(nkLfdSignal, aSpan);
+  FSignalKind := aSignalKind;
+  FHandlerName := aHandlerName;
+end;
+
+constructor TLfdLayout.Create(aLayoutKind: TLfdLayoutKind; const aChildren: TAstLfdNodeList; aSpan: TSourceSpan);
+begin
+  inherited Create(nkLfdLayout, aSpan);
+  FLayoutKind := aLayoutKind;
+  FChildren := aChildren;
+  FSpacing := -1;
+  FMarginTop := -1;
+  FMarginBottom := -1;
+  FMarginLeft := -1;
+  FMarginRight := -1;
+end;
+
+destructor TLfdLayout.Destroy;
+var i: Integer;
+begin
+  for i := 0 to High(FChildren) do
+    FChildren[i].Free;
+  inherited Destroy;
+end;
+
+constructor TLfdWidget.Create(aWidgetKind: TLfdWidgetKind; const aName: string;
+  const aProperties: TLfdPropertyList; const aSignals: TLfdSignalList;
+  const aChildren: TAstLfdNodeList; aSpan: TSourceSpan);
+begin
+  inherited Create(nkLfdWidget, aSpan);
+  FWidgetKind := aWidgetKind;
+  FName := aName;
+  FProperties := aProperties;
+  FSignals := aSignals;
+  FChildren := aChildren;
+end;
+
+destructor TLfdWidget.Destroy;
+var i: Integer;
+begin
+  for i := 0 to High(FProperties) do
+    FProperties[i].Free;
+  for i := 0 to High(FSignals) do
+    FSignals[i].Free;
+  for i := 0 to High(FChildren) do
+    FChildren[i].Free;
+  inherited Destroy;
+end;
+
+function TLfdWidget.GetProperty(const aName: string): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(FProperties) do
+    if FProperties[i].Name = aName then
+    begin
+      Result := FProperties[i].Value;
+      Exit;
+    end;
+end;
+
+function TLfdWidget.GetSignal(aSignalKind: TLfdSignalKind): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(FSignals) do
+    if FSignals[i].SignalKind = aSignalKind then
+    begin
+      Result := FSignals[i].HandlerName;
+      Exit;
+    end;
+end;
+
+constructor TLfdForm.Create(const aName, aTitle: string;
+  const aChildren: TAstLfdNodeList; const aProperties: TLfdPropertyList;
+  aSpan: TSourceSpan);
+begin
+  inherited Create(nkLfdForm, aSpan);
+  FName := aName;
+  FTitle := aTitle;
+  FChildren := aChildren;
+  FProperties := aProperties;
+end;
+
+destructor TLfdForm.Destroy;
+var i: Integer;
+begin
+  for i := 0 to High(FChildren) do
+    FChildren[i].Free;
+  for i := 0 to High(FProperties) do
+    FProperties[i].Free;
+  inherited Destroy;
+end;
+
+function TLfdForm.GetProperty(const aName: string): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(FProperties) do
+    if FProperties[i].Name = aName then
+    begin
+      Result := FProperties[i].Value;
+      Exit;
+    end;
+end;
 
 { --- Hilfsfunktionen für Nullable-Typen --- }
 
