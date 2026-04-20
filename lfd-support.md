@@ -1,22 +1,25 @@
-# Roadmap: LyX Form Description (LFD) Support
+# Roadmap: LFD (LyX Form Description) Support
 
-> **Status**: Proposed | **Version**: 0.1.0 | **Branch**: `feat/lfd-support`
+> **Status**: In Progress | **Version**: 0.2.0 | **Branch**: `feat/lfd-support`
 
 ---
 
 ## Projektziel
 
-**LFD (LyX Form Description)** ist ein deklaratives, textbasiertes UI-Definitionsformat für LyX, das von Delphis DFM inspiriert ist, aber moderne Qt-Layout-Konzepte verwendet.
+**LFD (LyX Form Description)** ist ein deklaratives, textbasiertes UI-Definitionsformat für den **FreePascal Lyx-Compiler**, das von Delphis DFM inspiriert ist und Qt-Widgets beschreibt.
+
+Anders als die alte Konzeption (LyX Editor Integration) ist LFD nun ein **Code-Generator**: LFD → FreePascal Parser → AST → **C++ Qt-Code**.
 
 ### Kernmerkmale:
-- **Deklarativ**: UI wird als strukturierter Text definiert, nicht interaktiv aufgebaut
+- **Deklarativ**: UI wird als strukturierter Text definiert
 - **Textbasiert**: Speicherbar in .lyx Dateien, versionierbar
-- **Qt-fokussiert**: Übersetzt LFD in QWidget-Hierarchien
-- **Layout-basiert**: Nutzt QVBoxLayout/QHBoxLayout statt absoluter Koordinaten
+- **Code-Generierung**: Übersetzt LFD in C++/Qt-Quellcode
+- **Layout-basiert**: Nutzt QVBoxLayout/QHBoxLayout statt absolute Koordinaten
 
-### Beispiel (angedacht):
+### Beispiel:
 
-```
+```lyx
+// LFD-Source (in .lyx Datei)
 Form MainWindow "Hauptfenster" {
   Layout Vertical {
     Label lblTitle {
@@ -24,14 +27,41 @@ Form MainWindow "Hauptfenster" {
     }
     Button btnOk {
       Text: "OK"
-      OnClick: "commit"
-    }
-    Button btnCancel {
-      Text: "Abbrechen"
-      OnClick: "cancel"
+      OnClick: "handleOk()"
     }
   }
 }
+```
+
+Wird zu C++/Qt-Code generiert:
+
+```cpp
+// Generiertes C++/Qt
+#include <QApplication>
+#include <QWidget>
+#include <QVBoxLayout>
+#include <QLabel>
+#include <QPushButton>
+
+class MainWindow : public QWidget {
+public:
+    MainWindow(QWidget* parent = nullptr) : QWidget(parent) {
+        setWindowTitle("Hauptfenster");
+        auto* layout = new QVBoxLayout(this);
+        
+        auto* lblTitle = new QLabel("Mein Formular", this);
+        layout->addWidget(lblTitle);
+        
+        auto* btnOk = new QPushButton("OK", this);
+        connect(btnOk, &QPushButton::clicked, this, &MainWindow::handleOk);
+        layout->addWidget(btnOk);
+        
+        setLayout(layout);
+    }
+    
+private slots:
+    void handleOk() { /* ... */ }
+};
 ```
 
 ---
@@ -42,176 +72,255 @@ Form MainWindow "Hauptfenster" {
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      LFD Text (.lyx)                          │
+│                    LFD Text (.lyx)                             │
 └─────────────────────┬───────────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    LFDParser                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐   │
-│  │   Lexer    │→ │   Parser   │→ │  AST (Object Tree)      │   │
-│  └─────────────┘  └──────────────┘  └────────────────────────┘   │
+│               LFDParser (FreePascal)                            │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐│
+│  │   Lexer    │→ │   Parser   │→ │  AST (UI Tree)          ││
+│  └─────────────┘  └──────────────┘  └────────────────────────┘│
 └─────────────────────┬───────────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                LFDWidgetFactory                                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ QPushButton│  │  QLabel      │  │  Custom Widgets        │   │
-│  └─────────────┘  └──────────────┘  └────────────────────────┘   │
+│              LFDCodeGen (FreePascal)                            │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐│
+│  │ C++ Header  │  │ C++ Source   │  │  Signal/Slot Code       ││
+│  └─────────────┘  └──────────────┘  └────────────────────────┘│
 └─────────────────────┬───────────────────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│               QWidget Hierarchie                                │
-│         (wird in LyX als Inset gerendert)                        │
+│               C++/Qt Source Code                                │
+│           (Kompiliert mit Qt-Framework)                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Datenfluss:
 
-1. **Parsing**: LFD-Text → AST (Abstract Syntax Tree)
-2. **Factory**: AST → QWidget-Instanzen
-3. **Layout**: Automatisches QLayout-Management
-4. **Rendering**: QWidget in LyX-Inset einbetten
-5. **Interaktion**: Signals → Lfun-Mapping
+1. **Parsing**: LFD-Text → AST (UI Object Tree)
+2. **Validierung**: AST-Checks (Typen, Properties, Zyklen)
+3. **Code-Generierung**: AST → C++ Header + Source
+4. **Kompilierung**: C++ → Qt-Widget-Binary
 
 ---
 
 ## Arbeitspakete (WPs)
 
-### WP 1: Kern-Spezifikation & Parser
+### WP 1: Parser & AST (bereits implementiert)
 
-> **Ziel**: Grammatik und Parser für LFD definieren und implementieren
+> **Ziel**: Grammatik und Parser für LFD definieren
 
 - [x] **Syntax-Definition**: Formale EBNF für das LFD-Format
-  - [x] Objekt-Blöcke (Form, Widget-Definitionen)
-  - [x] Properties (Text, Align, Style, etc.)
-  - [x] Layout-Direktiven (Vertical, Horizontal, Grid)
-  - [x] Verschachtelung von Widgets
+- [x] Objekt-Blöcke (Form, Widget-Definitionen)
+- [x] Properties (Text, Align, Style, etc.)
+- [x] Layout-Direktiven (Vertical, Horizontal, Grid)
+- [x] Verschachtelung von Widgets
 
-- [x] **Lexer/Parser**: Implementierung eines LFD-Parsers
-  - [x] Token-Erkennung (OBJ, PROPERTY, LAYOUT, etc.)
-  - [x] Hierarchie-Parsing ( nesting )
-  - [x] Fehlerbehandlung bei ungültiger Syntax
+- [x] **Lexer/Parser**: FreePascal Parser
+- [x] Token-Erkennung (OBJ, PROPERTY, LAYOUT, etc.)
+- [x] Hierarchie-Parsing (nesting)
+- [x] Fehlerbehandlung bei ungültiger Syntax
 
-- [x] **Factory-Pattern**: Mapping von String-Namen auf Qt-Klassen
-  - [x] Registry für Widget-Typen (QPushButton → QAbstractButton)
-  - [x] Property-Mapping (Text → setText, Enabled → setEnabled)
-  - [x] Builder-Methode für jeden Widget-Typ
-
-**Deliverable**: `std/lfd_parser.lyx` (oder C++ Parser in lyxkernel)
+**Status**: ✓ Abgeschlossen
 
 ---
 
-### WP 2: LyX-Inset Entwicklung
+### WP 2: AST-Erweiterung für UI-Elemente
 
-> **Ziel**: Integration von LFD in LyX als Inset
+> **Ziel**: AST-Knoten für Qt-Widgets erweitern
 
-- [ ] **InsetLFD Klasse**: C++ Klasse in LyX-Kernel
-  - [ ] Erbt von `Inset`
-  - [ ] Überschreibt `draw()`, `edit()`, `validate()`
-  - [ ] `getLfdCode()` und `setLfdCode()` Methoden
+- [x] **Widget-AST-Knoten**: Neue Knotentypen für Qt-Widgets
+  - [x] `TLfdForm` (Hauptfenster/Dialog)
+  - [x] `TLfdWidget` (Basis für alle Widgets)
+  - [x] `TLfdWidgetKind` Enum (Button, Label, Input, Combo, Checkbox, etc.)
+  - [x] 20+ Qt-Widget-Typen definiert
 
-- [ ] **Serialisierung**: LFD in .lyx Dateien speichern/laden
-  - [ ] LFD-Text als Buffer im Inset speichern
-  - [ ] `\begin_inset LFD ... \end_inset` Syntax
-  - [ ] Encoding-Handling (UTF-8)
+- [x] **Layout-AST-Knoten**: Layout-Container
+  - [x] `TLfdLayout`
+  - [x] `TLfdLayoutKind` Enum (Vertical, Horizontal, Grid, Form)
 
-- [ ] **UI-Dialog**: Einfacher Editor-Dialog
-  - [ ] Text-Editor für LFD-Code
-  - [ ] "Validate" Button (Syntax-Check)
-  - [ ] "Preview" Button (Live-Rendering)
+- [x] **Property-AST-Knoten**: Erweiterte Properties
+  - [x] `TLfdProperty` (Text, Enabled, Placeholder, etc.)
+  - [x] `TLfdSignal` (OnClick, OnChanged, OnActivated, etc.)
+  - [x] `TLfdSignalKind` Enum
 
-**Deliverable**: `InsetLFD.{cpp,h}` in lyxkernel
+- [ ] **Validation**: AST-Validierung
+  - [ ] Zyklische Referenzen erkennen
+  - [ ] Ungültige Widget-Kombinationen
+  - [ ] Fehlende Pflicht-Properties
 
----
+**Status**: ✓ Größtenteils abgeschlossen (nur Validierung fehlt)
 
-### WP 3: Visuelle Engine (Modernisierter DFM-Ansatz)
-
-> **Ziel**: Rendering der LFD-UI in LyX
-
-- [ ] **Layout-Auto-Generator**
-  - [ ] `QVBoxLayout` generieren aus "Vertical" Block
-  - [ ] `QHBoxLayout` generieren aus "Horizontal" Block  
-  - [ ] `QGridLayout` generieren aus "Grid" Block
-  - [ ] Verschachtelte Layouts
-
-- [ ] **High-DPI Support**
-  - [ ] Relative Einheiten (em, %)
-  - [ ] Skalierung für Retina/HiDPI
-  - [ ] DPI-aware Größenberechnung
-
-- [ ] **Live-Vorschau**
-  - [ ] QWidget in LyX-Arbeitsbereich einbetten
-  - [ ] Update bei LFD-Änderungen
-  - [ ] Maus-Event-Forwarding an Inset
-
-**Deliverable**: `LfdRenderer` Komponente
+**Deliverable**: `compiler/frontend/ast.pas` (erweitert)
 
 ---
 
-### WP 4: Interaktion & Logik
+### WP 3: C++ Qt Code-Generator
 
-> **Ziel**: Verbindung von UI-Events mit LyX-Funktionen
+> **Ziel**: AST → C++/Qt Quellcode generieren
 
-- [ ] **Signal-Mapping**: Syntax für Click/Toggle/Change Events
-  - [ ] `OnClick: "insert-graphics"` (Lfun-Aufruf)
-  - [ ] `OnChange: "buffer-toggle-read-only"` 
-  - [ ] Multi-Handler support
+- [ ] **Header-Generator**: Klassendefinitionen
+  - [ ] Form-Klasse (erbt von QWidget)
+  - [ ] Widget-Member-Variablen
+  - [ ] Slot-Deklarationen für Signal-Handler
+  - `Q_OBJECT` Makro
 
-- [ ] **Lfun-Binding**
-  - [ ] Mapping von Signal-Namen zu Lfun-Strings
-  - [ ] Argument-Übergabe (`OnClick: "custom arg"`)
-  - [ ] Async-Handling (buffer-... commands)
+- [ ] **Source-Generator**: Implementierung
+  - [ ] Konstruktor mit Layout-Aufbau
+  - [ ] Widget-Instanziierung
+  - [ ] Layout-Setup (addWidget, addLayout)
+  - [ ] Signal-Slot-Verbindungen (connect)
 
-- [ ] **Data Binding** (Optional)
-  - [ ] Dokument-Variablen lesen/schreiben
-  - [ ] `Bind: "variable=meineVariable"`
+- [ ] **Includes-Management**
+  - [ ] `#include <QWidget>` etc.
+  - [ ] `#include "ui_formname.h"`
+  - [ ] Forward Declarations
 
-**Deliverable**: `LfdSignals` Modul
+- [ ] **Naming-Convention**
+  - [ ] `FormName` → `class FormName : public QWidget`
+  - `btnOk` → `QPushButton* btnOk`
+  - `lblTitle` → `QLabel* lblTitle`
 
----
-
-### WP 5: Styling & Themes
-
-> **Ziel**: Qt Style Sheets Integration in LFD
-
-- [ ] **QSS Support**
-  - [ ] `Style { ... }` Block in LFD
-  - [ ] CSS-ähnliche Syntax
-  - [ ] Inline-Styles pro Widget
-
-- [ ] **Theme-Management**
-  - [ ] Vordefinierte Themes (Dark/Light)
-  - [ ] Theme-Wechsel zur Laufzeit
-
-- [ ] **Custom Properties**
-  - [ ] `[custom]` Section für erweiterte Qt-Properties
-  - [ ] ToolTips, Icons, Shortcuts
-
-**Deliverable**: `LfdStyler` Komponente
+**Deliverable**: `ir/lfd_codegen.pas`
 
 ---
 
-### WP 6: Dokumentation & Testing
+### WP 4: Widget-Support
+
+> **Ziel**: Unterstützung für Qt-Standard-Widgets
+
+- [ ] **Basis-Widgets**
+  - [ ] `QWidget` (generisches Widget)
+  - [ ] `QLabel` (Text/Links/Bild)
+  - [ ] `QPushButton`
+  - [ ] `QCheckBox`
+  - [ ] `QRadioButton`
+  - [ ] `QLineEdit` (Input)
+  - [ ] `QTextEdit` / `QPlainTextEdit`
+
+- [ ] **Container-Widgets**
+  - [ ] `QGroupBox`
+  - [ ] `QTabWidget` (Tabs)
+  - [ ] `QScrollArea`
+  - [ ] `QStackedWidget`
+
+- [ ] **Auswahl-Widgets**
+  - [ ] `QComboBox`
+  - [ ] `QListWidget`
+  - [ ] `QTreeWidget`
+  - [ ] `QTableWidget`
+
+- [ ] **Fortschritt/Datum**
+  - [ ] `QProgressBar`
+  - [ ] `QSlider`
+  - [ ] `QSpinBox`
+  - [ ] `QDateEdit` / `QTimeEdit`
+
+**Deliverable**: `std/lfd_widgets.pas` (Widget-Registry)
+
+---
+
+### WP 5: Layout-Generator
+
+> **Ziel**: Qt-Layouts aus LFD-Layout-Blöcken generieren
+
+- [ ] **QVBoxLayout**
+  - [ ] Vertikale Anordnung
+  - [ ] `addWidget()` für Widgets
+  - [ ] `addStretch()` für Leerräume
+
+- [ ] **QHBoxLayout**
+  - [ ] Horizontale Anordnung
+  - [ ] `addWidget()` für Widgets
+  - [ ] `addStretch()` für Leerräume
+
+- [ ] **QGridLayout**
+  - [ ] Zeilen/Spalten-Positionierung
+  - [ ] `addWidget(widget, row, col, rowSpan, colSpan)`
+  - [ ] `setColumnStretch()`
+
+- [ ] **QFormLayout**
+  - [ ] Label-Field-Paare
+  - [ ] Automatische Beschriftung
+
+- [ ] **Nested Layouts**
+  - [ ] Layouts in Layouts
+  - [ ] Beliebige Verschachtelungstiefe
+
+- [ ] **Layout-Properties**
+  - [ ] `setSpacing(int)`
+  - [ ] `setContentsMargins(int,int,int,int)`
+  - [ ] `setStretch(int, int)`
+
+**Deliverable**: `ir/lfd_layout.pas`
+
+---
+
+### WP 6: Signal & Event Handling
+
+> **Ziel**: Interaktion zwischen Widgets und Code
+
+- [ ] **Signal-Syntax**: LFD-Signale definieren
+  - [ ] `OnClick: "methodName()"`
+  - [ ] `OnChanged: "handleChanged()"`
+  - [ ] `OnActivated: "handleSelect()"`
+
+- [ ] **Signal-Generierung**: C++ connect() Calls
+  - [ ] `connect(btn, &QPushButton::clicked, this, &Form::handler)`
+  - [ ] Legacy: `connect(btn, SIGNAL(clicked()), SLOT(handler()))`
+
+- [ ] **Handler-Signaturen**
+  - [ ] `void handler()` (no params)
+  - [ ] `void handler(bool)` (toggle)
+  - [ ] `void handler(const QString&)` (text change)
+
+- [ ] **Custom Slots**
+  - [ ] User-defined slot Methoden generieren
+  - [ ] Leere Methoden-Stubs für User-Implementierung
+
+**Deliverable**: `ir/lfd_signals.pas`
+
+---
+
+### WP 7: Styling & Themes
+
+> **Goal**: Qt Style Sheets Integration
+
+- [ ] **Inline Styles**
+  - [ ] `Style: "color: red; background: white"`
+  - [ ] Generierung von `setStyleSheet()`
+
+- [ ] **Stylesheet-Variablen**
+  - [ ] `@primaryColor`, `@fontSize`, etc.
+  - [ ] Theme-Dateien (.qss)
+
+- [ ] **Object-Namen**
+  - [ ] `setObjectName("btnOk")` für CSS-Selektoren
+
+**Deliverable**: `ir/lfd_styling.pas`
+
+---
+
+### WP 8: Testing & Dokumentation
 
 > **Ziel**: Produktionsreife sicherstellen
 
-- [ ] **Referenz-Guide**: Vollständige Widget-Dokumentation
-  - [ ] Alle unterstützten Qt-Widgets
-  - [ ] Property-Referenz
-  - [ ] Beispiele
-
 - [ ] **Unit-Tests**
   - [ ] Parser-Tests (gültige/ungültige Syntax)
-  - [ ] Widget-Factory Tests
-  - [ ] Rendering-Tests
-  - [ ] Signal-Handling Tests
+  - [ ] Code-Generator Tests (Output-Verifikation)
+  - [ ] Widget-Mapping Tests
 
-- [ ] **Performance-Tests**
-  - [ ] Parse-Geschwindigkeit (< 10ms für typische Forms)
-  - [ ] Rendering-Latenz
+- [ ] **Integration-Tests**
+  - [ ] LFD → C++ → Kompilierung → Qt-App
+  - [ ] Kompilierte Qt-Apps ausführen
+
+- [ ] **Dokumentation**
+  - [ ] Widget-Referenz
+  - [ ] Property-Referenz
+  - [ ] Beispiele
 
 **Deliverable**: Test-Suite + Dokumentation
 
@@ -219,80 +328,96 @@ Form MainWindow "Hauptfenster" {
 
 ## Definition of Done
 
-Das Projekt gilt als **stabil** wenn folgende Kriterien erfüllt sind:
+### Must-Have (WP 1-6):
+- [x] Parser erkennt gültige LFD-Syntax
+- [x] Parser zeigt klare Fehlermeldungen bei ungültiger Syntax
+- [ ] C++/Qt-Code wird generiert (Header + Source)
+- [ ] Mindestens 5 Qt-Widgets (Button, Label, Input, Combo, Checkbox)
+- [ ] Layouts (Vertical, Horizontal) funktionieren
+- [ ] Signal-Handler werden generiert
 
-### Must-Have (WP 1-4):
-- [ ] Parser erkennt gültige LFD-Syntax
-- [ ] Parser zeigt klare Fehlermeldungen bei ungültiger Syntax
-- [ ] Mindestens 5 Qt-Widgets (Button, Label, Input, Combo, Checkbox) funktionieren
-- [ ] LFD-Inset wird in .lyx Dateien gespeichert und geladen
-- [ ] Einfache Live-Vorschau (statisch) funktioniert
-- [ ] Mindestens ein Signal (OnClick) kann eine Lfun auslösen
-
-### Should-Have (WP 5-6):
+### Should-Have (WP 7-8):
 - [ ] QSS-Styling funktioniert
 - [ ] Alle 15+ Qt-Standard-Widgets unterstützt
+- [ ] GridLayout funktioniert
 - [ ] Dokumentation ist vollständig
-- [ ] 80%+ Test-Abdeckung
 
 ### Nice-to-Have:
-- [ ] Data Binding
-- [ ] Live-Rendering bei Tastatureingaben
-- [ ] Theme-Wechsel
+- [ ] Live-Preview (Qt-Designer-ähnlich)
+- [ ] FormLayout
+- [ ] TabWidget, GroupBox Support
 
 ---
 
 ## Technische Notes
 
-### Qt-Version:
-- Target: Qt 5.15+ (oder Qt 6.x mit Compatibility Layer)
-- Benötigt: QtWidgets, QtCore
+### Zielplattform:
+- **Linux x86_64** mit Qt 5.15+
+- **Windows** mit Qt 5.15+ / Qt 6.x
+- **macOS** mit Qt (optional)
 
 ### Abhängigkeiten:
-- `libqtlyx.so` (bereits vorhanden)
-- Keine neuen externen Libraries
+- FreePascal 3.2.2+ (für Parser/Code-Gen)
+- Qt 5.15+ (für generierten C++-Code)
+- C++ Compiler (g++/clang++)
 
 ### Performance-Ziele:
 - Parse-Zeit: < 5ms für typische Form (100 Zeilen)
-- Render-Zeit: < 20ms für einfache Forms
-- Memory-Footprint: < 1MB pro Form-Instanz
+- Code-Generierung: < 10ms für typische Form
+- Generierter Code: Kompiliert in < 1s
 
 ### Sicherheit:
 - Kein `eval()` von externem Code
-- Sandboxed Qt-Rendering (QScrollArea)
-- Input-Validierung vor Widget-Erstellung
+- Input-Validierung vor Code-Generierung
+- Keine Shell-Exec im generierten Code
 
 ---
 
 ## Offene Fragen
 
-1. **Widget-Library**: Sollen wir QtWidgets oder QtQml verwenden?
-   - *Empfehlung*: QtWidgets für einfache Integration mit bestehendem Code
+1. **Output-Format**: Nur C++ oder auch andere Sprachen?
+   - *Empfehlung*: C++ für Qt, später Python für PyQt
 
-2. **Versionierung**: Wie gehen wir mit LFD-Schema-Änderungen um?
-   - *Vorschlag*: Version-Header in jeder LFD-Datei (`Format: "LFD v1.0"`)
+2. **User-Code Integration**: Wo implementiert der User seine Handler?
+   - *Vorschlag*: Separate .cpp Datei, LFD-Header inkludiert
 
-3. **Custom-Widgets**: Sollen Dritte eigene Widgets registrieren können?
-   - *Vorschlag*: Ja, via `.lyxrc` Registry
+3. **Form-Namen**: Vollständiger Klassenname oder nur Basis?
+   - *Vorschlag*: `Form MeinDialog` → `class MeinDialog : public QWidget`
 
 ---
 
 ## Quick Start (nach Implementierung)
 
-```lyx
-\begin_inset LFD
-Form MeinDialog {
-  Layout Vertical {
-    Label nameLabel { Text: "Name:" }
-    Input nameField { Placeholder: "Eingabe..." }
-    Button ok { Text: "OK" OnClick: "commit" }
-    Button cancel { Text: "Abbrechen" OnClick: "cancel" }
-  }
-}
-\end_inset
+```bash
+# LFD-Datei (.lyx) kompilieren
+./lyxc myform.lyx -o myform
+
+# Generierten C++-Code ansehen
+cat myform.h
+cat myform.cpp
+
+# Mit Qt kompilieren
+g++ -fPIC myform.cpp -o myform \
+    -I/usr/include/qt5 -I/usr/include/qt5/QtWidgets \
+    -lQt5Widgets -lQt5Core -lQt5Gui
+
+# Starten
+./myform
 ```
+
+---
+
+## Existierende Implementierung
+
+Der Parser für WP1 befindet sich in:
+- `compiler/frontend/` - Lexer/Parser (existierend)
+
+**Zu erweiternde Dateien:**
+- `frontend/ast.pas` - Neue AST-Knoten für UI
+- `ir/` - Neue IR-Pässe für Code-Gen
 
 ---
 
 *Erstellt: 2026-04-20*
 *Letzte Aktualisierung: 2026-04-20*
+*Version: 0.2.0 - Complete Overhaul*
