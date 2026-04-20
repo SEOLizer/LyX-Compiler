@@ -59,8 +59,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.7)
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
-✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
-✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.1)
+✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.2)
+✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.2)
 ✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.9.0)
 ✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.9.0)
 ✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.9.0)
@@ -593,7 +593,7 @@ fn sensor_read(): int64 { return 42; }
 `@dal(A)` without `@critical` → warning (DAL A implies critical).
 Safety pragmas are stored in IR (`TIRFunction.SafetyPragmas`) for future WCET/stack-verification passes.
 
-### Range Types (v0.8.1)
+### Range Types (v0.8.2)
 
 Integer types with inclusive value bounds for DO-178C bounds-correctness requirements:
 
