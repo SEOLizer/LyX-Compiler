@@ -5,7 +5,7 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, diag, lexer, parser;
+  ast, diag, lexer, parser, bytes, unit_format;
 
 type
   { Suchergebnis für Import-Auflösung }
@@ -22,8 +22,11 @@ type
     UnitPath: string;
     FileName: string;
     AST: TAstProgram;
+    LyuxData: TLoadedLyux;  { .lyu data if precompiled }
+    IsPrecompiled: Boolean;  { True if loaded from .lyu }
     IsParsed: Boolean;
     constructor Create(const aUnitPath, aFileName: string; aAST: TAstProgram);
+    constructor CreatePrecompiled(const aUnitPath, aFileName: string; aLyux: TLoadedLyux);
     destructor Destroy; override;
   end;
 
@@ -42,8 +45,10 @@ type
     function IsStdNamespace(const unitPath: string): Boolean;
     function UnitPathToRelativePath(const unitPath: string): string;
     function TryResolvePath(const basePath, relativePath: string; out fullPath: string): Boolean;
+    function TryResolvePrecompiledPath(const basePath, relativePath: string; out fullPath: string): Boolean;
     function ResolveUnitPath(const unitPath: string; const importingFile: string): TResolveResult;
     function LoadUnitFile(const unitPath: string; const importingFile: string): TAstProgram;
+    function LoadPrecompiledUnit(const filePath: string): TLoadedLyux;
   public
     constructor Create(d: TDiagnostics);
     destructor Destroy; override;
@@ -78,6 +83,19 @@ begin
   UnitPath := aUnitPath;
   FileName := aFileName;
   AST := aAST;
+  LyuxData := nil;
+  IsPrecompiled := False;
+  IsParsed := False;
+end;
+
+constructor TLoadedUnit.CreatePrecompiled(const aUnitPath, aFileName: string; aLyux: TLoadedLyux);
+begin
+  inherited Create;
+  UnitPath := aUnitPath;
+  FileName := aFileName;
+  AST := nil;
+  LyuxData := aLyux;
+  IsPrecompiled := True;
   IsParsed := False;
 end;
 
@@ -85,6 +103,8 @@ destructor TLoadedUnit.Destroy;
 begin
   if Assigned(AST) then
     AST.Free;
+  if Assigned(LyuxData) then
+    LyuxData.Free;
   inherited Destroy;
 end;
 
@@ -180,6 +200,8 @@ var
   importingDir: string;
   fullPath: string;
   i: Integer;
+  lastPart: string;
+  dotPos: Integer;
 begin
   Result.Found := False;
   Result.FilePath := '';
@@ -231,11 +253,30 @@ begin
   // ============================================================
   // STANDARD SUCHREIHENFOLGE (für nicht-std Imports)
   // ============================================================
-  // 1. Relativ zur importierenden Datei
-  // 2. Projekt-Root
-  // 3. -I Include-Pfade
-  // 4. Standardbibliothek (für nicht-std Module wie 'math')
+  // 1. Direkt als Dateipfad (wenn unitPath bereits ein Pfad ist)
+  // 2. Relativ zur importierenden Datei
+  // 3. Projekt-Root
+  // 4. -I Include-Pfade
+  // 5. Standardbibliothek (für nicht-std Module wie 'math')
   // ============================================================
+
+  // 0. Direkt als Dateipfad versuchen (z.B. "tests/lyx/foo" statt "foo")
+  if (Pos('/', unitPath) > 0) or (Pos('\', unitPath) > 0) then
+  begin
+    // Wandle '/' in Pfadtrennzeichen um
+    fullPath := StringReplace(unitPath, '.', DirectorySeparator, [rfReplaceAll]);
+    // Versuche mit .lyx Erweiterung
+    if RightStr(fullPath, 4) <> '.lyx' then
+      fullPath := fullPath + '.lyx';
+    fullPath := ExpandFileName(fullPath);
+    if FileExists(fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := ExtractFilePath(fullPath);
+      Exit;
+    end;
+  end;
 
   // 1. Relativ zur importierenden Datei
   if importingFile <> '' then
@@ -250,7 +291,22 @@ begin
     end;
   end;
 
-  // 2. Projekt-Root (Working Directory)
+  // 2. Projekt-Root (Working Directory) - mit nur dem Dateinamen, nicht dem vollen Pfad
+  // Extrahiere nur den letzten Teil: "tests.lyx.precompiled.myunit" -> "myunit"
+  dotPos := LastDelimiter('.', unitPath);
+  if dotPos > 0 then
+    lastPart := Copy(unitPath, dotPos + 1, MaxInt)
+  else
+    lastPart := unitPath;
+  if TryResolvePath(FProjectRoot, lastPart + '.lyx', fullPath) then
+  begin
+    Result.Found := True;
+    Result.FilePath := fullPath;
+    Result.SearchPath := FProjectRoot;
+    Exit;
+  end;
+
+  // 3. Projekt-Root (voller relativer Pfad, für verschachtelte Module)
   if TryResolvePath(FProjectRoot, relativePath, fullPath) then
   begin
     Result.Found := True;
@@ -259,7 +315,7 @@ begin
     Exit;
   end;
 
-  // 3. -I Include-Pfade (in der Reihenfolge wie angegeben)
+  // 4. -I Include-Pfade (in der Reihenfolge wie angegeben)
   for i := 0 to FIncludePaths.Count - 1 do
   begin
     if TryResolvePath(FIncludePaths[i], relativePath, fullPath) then
@@ -271,7 +327,7 @@ begin
     end;
   end;
 
-  // 4. Standardbibliothek (für Module ohne std. Präfix)
+  // 5. Standardbibliothek (für Module ohne std. Präfix)
   if TryResolvePath(FStdLibPath, relativePath, fullPath) then
   begin
     Result.Found := True;
@@ -384,6 +440,10 @@ var
   idx: Integer;
   ast: TAstProgram;
   res: TResolveResult;
+  lyux: TLoadedLyux;
+  lyuPath: string;
+  dotPos: Integer;
+  lyuRelPart: string;
 begin
   // Prüfe ob Unit bereits geladen
   idx := FUnits.IndexOf(unitPath);
@@ -395,7 +455,46 @@ begin
     Exit;
   end;
 
-  // Resolve den Pfad
+  // Priority 1: search for .lyu directly (same search paths as .lyx)
+  lyuPath := '';
+  if importingFile <> '' then
+  begin
+    // Relative to importing file: use only the last name component
+    dotPos := LastDelimiter('.', unitPath);
+    if dotPos > 0 then
+      lyuRelPart := Copy(unitPath, dotPos + 1, MaxInt)
+    else
+      lyuRelPart := unitPath;
+    TryResolvePrecompiledPath(
+      ExtractFilePath(ExpandFileName(importingFile)), lyuRelPart, lyuPath);
+  end;
+  if lyuPath = '' then
+    TryResolvePrecompiledPath(FProjectRoot, unitPath, lyuPath);
+  if lyuPath = '' then
+    for idx := 0 to FIncludePaths.Count - 1 do
+      if TryResolvePrecompiledPath(FIncludePaths[idx], unitPath, lyuPath) then
+        Break;
+
+  if (lyuPath <> '') and FileExists(lyuPath) then
+  begin
+    if FTraceImports then
+      Trace('Loading precompiled unit (priority): ' + lyuPath);
+    try
+      lyux := LoadPrecompiledUnit(lyuPath);
+      if Assigned(lyux) then
+      begin
+        Result := TLoadedUnit.CreatePrecompiled(unitPath, lyuPath, lyux);
+        FUnits.AddObject(unitPath, Result);
+        Exit;
+      end;
+    except
+      on E: Exception do
+        if FTraceImports then
+          Trace('Failed to load .lyu: ' + E.Message + ' - falling back to .lyx');
+    end;
+  end;
+
+  // Priority 2: fall back to .lyx source
   res := ResolveUnitPath(unitPath, importingFile);
   if not res.Found then
   begin
@@ -417,6 +516,66 @@ begin
 
   // Rekursiv alle Imports dieser Unit laden
   LoadAllImports(ast, res.FilePath);
+end;
+
+function TUnitManager.TryResolvePrecompiledPath(const basePath, relativePath: string; out fullPath: string): Boolean;
+var
+  p: string;
+begin
+  Result := False;
+  fullPath := '';
+  
+  // Convert unit path to file path: "std.io" -> "std/io"
+  p := StringReplace(relativePath, '.', PathDelim, [rfReplaceAll]);
+  
+  // Try .lyu first
+  if basePath <> '' then
+    fullPath := basePath + PathDelim + p + '.lyu'
+  else
+    fullPath := p + '.lyu';
+    
+  if FileExists(fullPath) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  
+  fullPath := '';
+end;
+
+function TUnitManager.LoadPrecompiledUnit(const filePath: string): TLoadedLyux;
+var
+  buffer: TByteBuffer;
+  deser: TLyuxDeserializer;
+  f: TFileStream;
+  data: array of Byte;
+  size: Integer;
+begin
+  Result := nil;
+  if not FileExists(filePath) then
+    Exit;
+    
+  f := TFileStream.Create(filePath, fmOpenRead or fmShareDenyNone);
+  try
+    size := f.Size;
+    SetLength(data, size);
+    f.Read(data[0], size);
+  finally
+    f.Free;
+  end;
+  
+  buffer := TByteBuffer.Create;
+  try
+    buffer.WriteBytes(data);
+    deser := TLyuxDeserializer.Create(FDiag);
+    try
+      deser.Deserialize(buffer, Result);
+    finally
+      deser.Free;
+    end;
+  finally
+    buffer.Free;
+  end;
 end;
 
 function TUnitManager.FindUnit(const unitPath: string): TLoadedUnit;

@@ -159,7 +159,7 @@ fn sensor_read(): int64 {
   zukünftige WCET-Analyse, Stack-Verifizierung und Assembly-Listing-Annotierung zur Verfügung.
 - **DAL-A ohne `@critical`**: Warning (kein Fehler) – starke Empfehlung zur Markierung.
 
-## Range-Typen (v0.8.1 ✅ ABGESCHLOSSEN – aerospace-todo P1 #7)
+## Range-Typen (v0.8.2 ✅ ABGESCHLOSSEN – aerospace-todo P1 #7)
 
 Integer-Typen mit eingeschlossenen Wertebereichen für DO-178C-Compliance.
 Compile-Time-Checks für Literale, Runtime-Checks für nicht-konstante Werte.
@@ -568,7 +568,7 @@ var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
 
 ### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
 
-### check() Builtin (v0.8.1 ✅ ABGESCHLOSSEN)
+### check() Builtin (v0.8.2 ✅ ABGESCHLOSSEN)
 
 ```ebnf
 CheckExpr := 'check' '(' Expr ')' ;

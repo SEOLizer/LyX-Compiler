@@ -59,8 +59,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ String Comparison Builtins: StrStartsWith/StrEndsWith/StrEquals (v0.5.7)
 ✅ String Library (std.string): StringBuilder class, StrTrim, StrSplit (v0.5.7)
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
-✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.1)
-✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.1)
+✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.2)
+✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.2)
 ✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.9.0)
 ✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.9.0)
 ✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.9.0)
@@ -593,7 +593,7 @@ fn sensor_read(): int64 { return 42; }
 `@dal(A)` without `@critical` → warning (DAL A implies critical).
 Safety pragmas are stored in IR (`TIRFunction.SafetyPragmas`) for future WCET/stack-verification passes.
 
-### Range Types (v0.8.1)
+### Range Types (v0.8.2)
 
 Integer types with inclusive value bounds for DO-178C bounds-correctness requirements:
 
@@ -983,19 +983,30 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
 
 Optionen:
-  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)
-  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)
-  --std-path=PATH  Pfad zur Standardbibliothek überschreiben
-  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)
-  --arch=ARCH      Architektur (x86_64, arm64, xtensa)
+  -o <datei>          Ausgabedatei (Standard: a.out bzw. a.exe)
+  -I <pfad>         Include-Pfad für Module hinzufügen (mehrfach verwendbar)
+  --std-path=PATH     Pfad zur Standardbibliothek überschreiben
+  --target=TARGET    Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32, riscv)
+  --arch=ARCH       Architektur (x86_64, arm64, xtensa, riscv)
   --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
-  --emit-asm       IR als Pseudo-Assembler ausgeben
+  --emit-asm        IR als Pseudo-Assembler ausgeben
+  --asm-listing    Assembly-Listing mit Source-Zeilen (DO-178C 6.1)
   --dump-relocs    Relocations und externe Symbole anzeigen
-  --trace-imports  Import-Auflösung debuggen
-  --lint           Linter-Warnungen aktivieren
-  --lint-only      Nur linten, nicht kompilieren
-  --no-lint        Linter-Warnungen deaktivieren
-  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)
+  --trace-imports Import-Auflösung debuggen
+  --lint              Linter-Warnungen aktivieren
+  --lint-only         Nur linten, nicht kompilieren
+  --no-lint          Linter-Warnungen deaktivieren
+  --no-opt           IR-Optimierungen deaktivieren (Standard: aktiv)
+  --mcdc            MC/DC-Instrumentierung für DO-178C Coverage
+  --mcdc-report     MC/DC-Coverage-Bericht nach Kompilierung
+  --static-analysis   Statische Analyse (Data-Flow, Live-Vars, Stack, Null-Ptr)
+  --call-graph     Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)
+  --map-file       Speicherlayout-Datei (.map) für Debug/Audit
+
+TOR-Optionen (DO-178C Tool Qualification):
+  --version        Versionsnummer ausgeben (TOR-001)
+  --build-info     Build-Identifikation ausgeben (TOR-002)
+  --config        Aktive Konfiguration ausgeben (TOR-003)
 ```
 
 **Linter Rules (13 total):**
@@ -1286,22 +1297,152 @@ Override with `--std-path`:
 ./lyxc main.lyx --std-path=/custom/path/to/std
 ```
 
-**Available Standard Library:**
-- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`, etc.)
-- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-conversion)
-- `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, `StrToUpper`, `StrConcat`, `StrReplace`, etc.)
-- `std.env`: Environment API (`ArgCount`, `Arg`, `init`)
-- `std.time`: Date and time functions (numerical calculations, timezone support)
-- `std.geo`: Geolocation parser for Decimal Degrees, GeoPoint, Distance calculations, BoundingBox, DMS parsing
-- `std.fs`: Filesystem operations (open, read, write, close, file existence)
-- `std.crt`: ANSI Terminal Utilities (colors, cursor control)
-- `std.pack`: Binary serialization (VarInt, int/float/string packing)
+### Precompiled Units (`.lyu`)
+
+Lyx unterstützt vorkompilierte Units (`.lyu`) für schnellere Kompilierung:
+
+```bash
+# Eine .lyx Datei zu .lyu kompilieren
+./lyxc mymodule.lyx --compile-unit -o mymodule.lyu
+
+# Kompilieren mit .lyu (wird autom. bevorzugt wenn vorhanden)
+./lyxc main.lyx -o main --target=x86_64
+```
+
+Die `.lyu` Datei enthält:
+- Exportierte `pub fn` Symbole mit Typ-Informationen
+- Target-Architektur (x86_64, arm64)
+- Versionsinformation
+
+Falls die `.lyu` defekt ist, wird automatisch auf die `.lyx` Quelle zurückgegriffen.
+
+```bash
+./lyxc main.lyx --std-path=/custom/path/to/std
+```
+
+**Available Standard Library (52 units):**
+
+Core:
+- `std.system`: Builtins, Start/Exit, Panic
+- `std.env`: Environment API (`ArgCount`, `Arg`)
+- `std.os`: OS-level syscalls (`exit`, `sleep`, get/set environment variables)
+- `std.process`: Process management (fork, exec, wait)
+
+I/O:
+- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `exit(code)`)
+- `std.fs`: Filesystem operations (open, read, write, close, exists, stat)
+- `std.crt`: ANSI Terminal (colors, cursor control)
+- `std.crt_raw`: Raw terminal mode
+
+Math & Numerics:
+- `std.math`: Math functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sin64`, `Cos64`, `Hypot64`, etc.)
+- `std.vector`: 2D Vector (`Vec2`)
+- `std.vector_batch`: SIMD vector operations
+- `std.math_batch`: SIMD math operations
+- `std.stats`: Statistics (mean, variance, stddev)
+- `std.stats_batch`: Batch statistics
+- `std.geo`: Geolocation (Decimal Degrees, GeoPoint, Distance, BoundingBox)
+- `std.conv`: Type conversion (int/float to string)
+- `std.rect`: Rectangle utilities
+- `std.circle`: Circle utilities
+- `std.sort`: Sorting algorithms
+
+Strings & Text:
+- `std.string`: String manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrConcat`, etc.)
 - `std.regex`: Regex matching
-- `std.qbool`: Probabilistic Boolean Type (`QBool`, `Maybe()`, `Observe()`, `QBoolAnd`, `QBoolOr`, `QBoolNot`, Entanglement)
-- `std.vector`: 2D Vector library (`Vec2`)
+- `std.base64`: Base64 encoding/decoding
+- `std.url`: URL parsing/encoding
+- `std.html`: HTML utilities
+- `std.xml`: XML parsing
+- `std.yaml`: YAML parsing
+- `std.json`: JSON parsing
+- `std.uuid`: UUID generation
+- `std.ini`: INI file parsing
+
+Data Structures:
 - `std.list`: Collections (`StaticList8`, `StackInt64`, `QueueInt64`, `RingBufferVec2`)
-- `std.rect`: Rectangle utilities (`Rect`)
+- `std.hash`: Hash map implementation
+- `std.pack`: Binary serialization (VarInt, int/float/string packing)
+- `std.buffer`: Binary buffer operations
+- `std.alloc`: Custom memory allocator
+
+Time & Date:
+- `std.time`: Date/time functions
+- `std.datetime`: DateTime with timezone
+
+Networking:
+- (future: `std.net`, `std.http`)
+
+GUI & Graphics:
 - `std.color`: RGBA Color utilities
+- `std.x11`: X11 windowing
+- `std.qt5_core`: Qt5 Core
+- `std.qt5_gl`: Qt5 OpenGL
+- `std.qt5_glx`: Qt5 GLX
+- `std.qt5_egl`: Qt5 EGL
+- `std.qt5_app`: Qt5 Application
+- `std.lfd_parser`: LFD parser
+- `std.lfd_factory`: LFD factory
+
+Audio:
+- `std.audio`: Audio I/O
+
+Compression:
+- `std.zlib`: zlib compression
+
+Utilities:
+- `std.log`: Logging
+- `std.regex`: Regex
+- `std.country`: Country codes
+- `std.qbool`: Probabilistic Boolean (`QBool`, `Maybe()`, `Observe()`)
+- `std.error`: Error handling
+- `std.result`: Result/Either monad
+
+Database (std.db):
+- `std.db.mysql`: MySQL database client
+- `std.db.redis`: Redis client
+- `std.db.redis_simple`: Simplified Redis client
+
+Crypto:
+- `std.crypto.aes`: AES encryption
+- `std.crypto.sha1`: SHA-1 hashing
+
+Math:
+- `std.math.constants`: Mathematical constants (PI, E, etc.)
+
+Audio:
+- `std.audio.alsa`: ALSA audio
+- `std.audio.playback`: Audio playback
+- `std.audio.mpg123`: MP3 playback
+
+Networking:
+- `std.net.socket`: BSD socket API
+- `std.net.http`: HTTP client/server
+- `std.net.https`: HTTPS (TLS)
+- `std.net.tls`: TLS/SSL
+- `std.net.dns`: DNS
+- `std.net.ntp`: NTP client
+- `std.net.ssh`: SSH client
+- `std.net.smtp`: Email sending
+- `std.net.imap`: Email receiving
+- `std.net.mqtt`: MQTT (IoT messaging)
+- `std.net.quic`: QUIC/HTTP3
+- `std.net.bgp`: BGP routing
+- `std.net.sip`: VoIP/SIP
+- `std.net.whois`: WHOIS queries
+- `std.net.ldap`: LDAP client
+- `std.net.snmp`: SNMP monitoring
+- `std.net.asn1`: ASN.1 parsing
+
+Validation:
+- `std.validate.vat`: VAT ID validation
+- `std.validate.luhn`: Luhn checksum (credit cards)
+- `std.validate.isbn`: ISBN validation
+- `std.validate.iban`: IBAN validation
+- `std.validate.ean`: EAN barcode validation
+
+Other:
+- `std.unit_ioctl`: Device I/O control
 
 ### Types
 
