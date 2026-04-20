@@ -1403,6 +1403,47 @@ Database (std.db):
 - `std.db.redis`: Redis client
 - `std.db.redis_simple`: Simplified Redis client
 
+Crypto:
+- `std.crypto.aes`: AES encryption
+- `std.crypto.sha1`: SHA-1 hashing
+
+Math:
+- `std.math.constants`: Mathematical constants (PI, E, etc.)
+
+Audio:
+- `std.audio.alsa`: ALSA audio
+- `std.audio.playback`: Audio playback
+- `std.audio.mpg123`: MP3 playback
+
+Networking:
+- `std.net.socket`: BSD socket API
+- `std.net.http`: HTTP client/server
+- `std.net.https`: HTTPS (TLS)
+- `std.net.tls`: TLS/SSL
+- `std.net.dns`: DNS
+- `std.net.ntp`: NTP client
+- `std.net.ssh`: SSH client
+- `std.net.smtp`: Email sending
+- `std.net.imap`: Email receiving
+- `std.net.mqtt`: MQTT (IoT messaging)
+- `std.net.quic`: QUIC/HTTP3
+- `std.net.bgp`: BGP routing
+- `std.net.sip`: VoIP/SIP
+- `std.net.whois`: WHOIS queries
+- `std.net.ldap`: LDAP client
+- `std.net.snmp`: SNMP monitoring
+- `std.net.asn1`: ASN.1 parsing
+
+Validation:
+- `std.validate.vat`: VAT ID validation
+- `std.validate.luhn`: Luhn checksum (credit cards)
+- `std.validate.isbn`: ISBN validation
+- `std.validate.iban`: IBAN validation
+- `std.validate.ean`: EAN barcode validation
+
+Other:
+- `std.unit_ioctl`: Device I/O control
+
 ### Types
 
 | Type       | Description                          |
