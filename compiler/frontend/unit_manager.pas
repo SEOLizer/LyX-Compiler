@@ -495,16 +495,32 @@ function TUnitManager.LoadPrecompiledUnit(const filePath: string): TLoadedLyux;
 var
   buffer: TByteBuffer;
   deser: TLyuxDeserializer;
+  f: TFileStream;
+  data: array of Byte;
+  size: Integer;
 begin
   Result := nil;
   if not FileExists(filePath) then
     Exit;
     
+  f := TFileStream.Create(filePath, fmOpenRead or fmShareDenyNone);
+  try
+    size := f.Size;
+    SetLength(data, size);
+    f.Read(data[0], size);
+  finally
+    f.Free;
+  end;
+  
   buffer := TByteBuffer.Create;
   try
-    // Load file into buffer (simplified - for full impl needs file reading)
-    // For now, just create empty placeholder
-    Result := TLoadedLyux.Create;
+    buffer.WriteBytes(data);
+    deser := TLyuxDeserializer.Create(FDiag);
+    try
+      deser.Deserialize(buffer, Result);
+    finally
+      deser.Free;
+    end;
   finally
     buffer.Free;
   end;
