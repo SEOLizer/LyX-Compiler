@@ -1398,6 +1398,11 @@ Utilities:
 - `std.error`: Error handling
 - `std.result`: Result/Either monad
 
+Database (std.db):
+- `std.db.mysql`: MySQL database client
+- `std.db.redis`: Redis client
+- `std.db.redis_simple`: Simplified Redis client
+
 ### Types
 
 | Type       | Description                          |
