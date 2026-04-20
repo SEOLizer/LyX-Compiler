@@ -200,6 +200,8 @@ var
   importingDir: string;
   fullPath: string;
   i: Integer;
+  lastPart: string;
+  dotPos: Integer;
 begin
   Result.Found := False;
   Result.FilePath := '';
@@ -251,11 +253,30 @@ begin
   // ============================================================
   // STANDARD SUCHREIHENFOLGE (für nicht-std Imports)
   // ============================================================
-  // 1. Relativ zur importierenden Datei
-  // 2. Projekt-Root
-  // 3. -I Include-Pfade
-  // 4. Standardbibliothek (für nicht-std Module wie 'math')
+  // 1. Direkt als Dateipfad (wenn unitPath bereits ein Pfad ist)
+  // 2. Relativ zur importierenden Datei
+  // 3. Projekt-Root
+  // 4. -I Include-Pfade
+  // 5. Standardbibliothek (für nicht-std Module wie 'math')
   // ============================================================
+
+  // 0. Direkt als Dateipfad versuchen (z.B. "tests/lyx/foo" statt "foo")
+  if (Pos('/', unitPath) > 0) or (Pos('\', unitPath) > 0) then
+  begin
+    // Wandle '/' in Pfadtrennzeichen um
+    fullPath := StringReplace(unitPath, '.', DirectorySeparator, [rfReplaceAll]);
+    // Versuche mit .lyx Erweiterung
+    if RightStr(fullPath, 4) <> '.lyx' then
+      fullPath := fullPath + '.lyx';
+    fullPath := ExpandFileName(fullPath);
+    if FileExists(fullPath) then
+    begin
+      Result.Found := True;
+      Result.FilePath := fullPath;
+      Result.SearchPath := ExtractFilePath(fullPath);
+      Exit;
+    end;
+  end;
 
   // 1. Relativ zur importierenden Datei
   if importingFile <> '' then
@@ -270,7 +291,22 @@ begin
     end;
   end;
 
-  // 2. Projekt-Root (Working Directory)
+  // 2. Projekt-Root (Working Directory) - mit nur dem Dateinamen, nicht dem vollen Pfad
+  // Extrahiere nur den letzten Teil: "tests.lyx.precompiled.myunit" -> "myunit"
+  dotPos := LastDelimiter('.', unitPath);
+  if dotPos > 0 then
+    lastPart := Copy(unitPath, dotPos + 1, MaxInt)
+  else
+    lastPart := unitPath;
+  if TryResolvePath(FProjectRoot, lastPart + '.lyx', fullPath) then
+  begin
+    Result.Found := True;
+    Result.FilePath := fullPath;
+    Result.SearchPath := FProjectRoot;
+    Exit;
+  end;
+
+  // 3. Projekt-Root (voller relativer Pfad, für verschachtelte Module)
   if TryResolvePath(FProjectRoot, relativePath, fullPath) then
   begin
     Result.Found := True;
@@ -279,7 +315,7 @@ begin
     Exit;
   end;
 
-  // 3. -I Include-Pfade (in der Reihenfolge wie angegeben)
+  // 4. -I Include-Pfade (in der Reihenfolge wie angegeben)
   for i := 0 to FIncludePaths.Count - 1 do
   begin
     if TryResolvePath(FIncludePaths[i], relativePath, fullPath) then
@@ -291,7 +327,7 @@ begin
     end;
   end;
 
-  // 4. Standardbibliothek (für Module ohne std. Präfix)
+  // 5. Standardbibliothek (für Module ohne std. Präfix)
   if TryResolvePath(FStdLibPath, relativePath, fullPath) then
   begin
     Result.Found := True;
@@ -434,12 +470,21 @@ begin
   begin
     if FTraceImports then
       Trace('Loading precompiled unit: ' + lyuPath);
-    lyux := LoadPrecompiledUnit(lyuPath);
-    if Assigned(lyux) then
-    begin
-      Result := TLoadedUnit.CreatePrecompiled(unitPath, lyuPath, lyux);
-      FUnits.AddObject(unitPath, Result);
-      Exit;
+    try
+      lyux := LoadPrecompiledUnit(lyuPath);
+      if Assigned(lyux) then
+      begin
+        Result := TLoadedUnit.CreatePrecompiled(unitPath, lyuPath, lyux);
+        FUnits.AddObject(unitPath, Result);
+        Exit;
+      end;
+    except
+      on E: Exception do
+      begin
+        if FTraceImports then
+          Trace('Failed to load precompiled unit: ' + E.Message + ' - falling back to .lyx');
+        { Fallback to .lyx }
+      end;
     end;
   end;
 

@@ -107,6 +107,7 @@ type
     FStrings: TStringList;  { String pool for this file }
 
     function ReadString: string;
+    function ReadU32LEAdv: UInt32;
 
   public
     constructor Create(d: TDiagnostics);
@@ -210,7 +211,7 @@ begin
   FBuffer.WriteU32LE(0);  { IRCodeOffset }
   FBuffer.WriteU32LE(0);  { DebugOffset }
   FBuffer.WriteU32LE(0);  { Reserved }
-  FBuffer.WriteU16LE(32);  { HeaderSize }
+  { HeaderSize removed - not read by deserializer }
 
   { Symbol-Tabelle }
   for i := 0 to High(symbols) do
@@ -263,11 +264,20 @@ var
   i: Integer;
 begin
   len := FBuffer.ReadU16LE(FPos);
+  Inc(FPos, 2);  { Advance past length field }
   SetLength(b, len);
   for i := 0 to len - 1 do
-    b[i] := FBuffer.ReadU8(FPos + i);
+  begin
+    b[i] := FBuffer.ReadU8(FPos);
+    Inc(FPos);
+  end;
   Result := TEncoding.UTF8.GetString(b);
-  Inc(FPos, len);
+end;
+
+function TLyuxDeserializer.ReadU32LEAdv: UInt32;
+begin
+  Result := FBuffer.ReadU32LE(FPos);
+  Inc(FPos, 4);
 end;
 
 procedure TLyuxDeserializer.Deserialize(buffer: TByteBuffer; out loaded: TLoadedLyux);
@@ -290,26 +300,39 @@ begin
     raise ELyuInvalid.Create('Invalid .lyu file: bad magic');
 
   loaded.Header.Version := FBuffer.ReadU16LE(FPos);
+  Inc(FPos, 2);
   if loaded.Header.Version <> LYU_VERSION then
     raise ELyuVersion.CreateFmt('Incompatible .lyu version: %d (expected %d)',
       [loaded.Header.Version, LYU_VERSION]);
 
   loaded.Header.TargetArch := TLyuxArch(FBuffer.ReadU8(FPos));
+  Inc(FPos);
   loaded.Header.Flags := FBuffer.ReadU8(FPos);
-
+  Inc(FPos);
   loaded.Header.UnitName := ReadString;
-  loaded.Header.SymbolCount := FBuffer.ReadU32LE(FPos);
-  loaded.Header.TypeInfoOffset := FBuffer.ReadU32LE(FPos);
-  loaded.Header.IRCodeOffset := FBuffer.ReadU32LE(FPos);
-  loaded.Header.DebugOffset := FBuffer.ReadU32LE(FPos);
-  Inc(FPos, 4 + 2);
+  loaded.Header.SymbolCount := ReadU32LEAdv;
+  loaded.Header.TypeInfoOffset := ReadU32LEAdv;
+  loaded.Header.IRCodeOffset := ReadU32LEAdv;
+  loaded.Header.DebugOffset := ReadU32LEAdv;
+  Inc(FPos, 4);  { Reserved (4 Bytes) }
+
+  { Bounds check: don't try to read beyond buffer }
+  if loaded.Header.SymbolCount > 1000 then
+    raise ELyuInvalid.CreateFmt('Invalid .lyu file: suspicious symbol count %d',
+      [loaded.Header.SymbolCount]);
 
   SetLength(loaded.Symbols, loaded.Header.SymbolCount);
   for i := 0 to loaded.Header.SymbolCount - 1 do
   begin
+    { Check bounds before reading each symbol }
+    if FPos >= FBuffer.Size then
+      Break;  { Reached end of buffer - incomplete file, stop reading }
     loaded.Symbols[i].Name := ReadString;
+    if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].Kind := TLyuxSymbolKind(FBuffer.ReadU8(FPos));
+    if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].TypeHash := FBuffer.ReadU32LE(FPos);
+    if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].TypeInfo := ReadString;
   end;
 end;
@@ -380,9 +403,9 @@ begin
     Inc(FPos, 32);  { Skip header }
     
     { Skip symbols in this simplified version }
-    { Read strings first }
+    { Read strings first - use count from file }
     FBuffer.ReadU32LE(FPos);  { string count - ignore }
-    while FPos < FBuffer.Size - 10 do
+    while (FPos < FBuffer.Size - 10) and (FPos < 10000) do
     begin
       IRModule.InternString(ReadString);
     end;
