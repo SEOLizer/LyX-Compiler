@@ -124,11 +124,48 @@ begin
   end;
 end;
 
-{ Helper to merge IR from precompiled units - DISABLED for now }
 procedure MergePrecompiledIR(um: TUnitManager; module: TIRModule);
+{ Copy IR functions from precompiled .lyu units into the main module }
+var
+  i, j: Integer;
+  loadedUnit: TLoadedUnit;
+  srcFn: TIRFunction;
+  dstFn: TIRFunction;
+  srcStr: string;
+  strIdxMap: array of Integer;
 begin
-  // Disabled - needs debugging
-  // The IR merging from .lyu files is not yet fully functional
+  if not Assigned(um) or not Assigned(module) then Exit;
+  for i := 0 to um.Units.Count - 1 do
+  begin
+    loadedUnit := TLoadedUnit(um.Units.Objects[i]);
+    if not Assigned(loadedUnit) or not loadedUnit.IsPrecompiled then
+      Continue;
+    if not Assigned(loadedUnit.LyuxData) or not Assigned(loadedUnit.LyuxData.IRModule) then
+      Continue;
+
+    { Copy all functions from precompiled unit's IR into main module }
+    for j := 0 to High(loadedUnit.LyuxData.IRModule.Functions) do
+    begin
+      srcFn := loadedUnit.LyuxData.IRModule.Functions[j];
+      { Skip if already present (avoid duplicates) }
+      if module.FindFunction(srcFn.Name) <> nil then
+        Continue;
+      { Build a string index remap from source to dest module }
+      SetLength(strIdxMap, loadedUnit.LyuxData.IRModule.Strings.Count);
+      for symIdx := 0 to loadedUnit.LyuxData.IRModule.Strings.Count - 1 do
+      begin
+        srcStr := loadedUnit.LyuxData.IRModule.Strings[symIdx];
+        strIdxMap[symIdx] := module.InternString(srcStr);
+      end;
+      { Add function to main module }
+      module.AddFunction(srcFn.Name);
+      dstFn := module.Functions[High(module.Functions)];
+      dstFn.ParamCount := srcFn.ParamCount;
+      dstFn.LocalCount := srcFn.LocalCount;
+      dstFn.EnergyLevel := srcFn.EnergyLevel;
+      dstFn.Instructions := Copy(srcFn.Instructions);
+    end;
+  end;
 end;
 
 procedure PrintEnergyStats(const stats: TEnergyStats);
@@ -756,10 +793,19 @@ begin
               symIdx := High(lyuSymbols);
               lyuSymbols[symIdx].Name := fn.Name;
               lyuSymbols[symIdx].Kind := lskFn;
-              // TypeHash: simple hash of return type
               lyuSymbols[symIdx].TypeHash := UInt32(Ord(fn.ReturnType));
-              // TypeInfo: return type as string
+              // TypeInfo: "retType" or "retType:param1,param2,..." for import reconstruction
               lyuSymbols[symIdx].TypeInfo := FormatType(fn.ReturnType);
+              if Length(fn.Params) > 0 then
+              begin
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':';
+                for j := 0 to High(fn.Params) do
+                begin
+                  if j > 0 then
+                    lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ',';
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(fn.Params[j].ParamType);
+                end;
+              end;
               WriteLn('  Exportiere: pub fn ', fn.Name, ' -> ', lyuSymbols[symIdx].TypeInfo);
             end;
           end;
@@ -768,14 +814,43 @@ begin
       
       WriteLn;
       WriteLn('Gefundene Symbole: ', Length(lyuSymbols));
-      
+
+      // Phase 3: Sema (needed for IR lowering)
+      s := TSema.Create(d);
+      um := TUnitManager.Create(d);
+      module := nil;
+      try
+        um.SetSourceFile(inputFile);
+        um.SetProjectRoot(GetCurrentDir);
+        um.LoadAllImports(prog, inputFile);
+        s.AnalyzeWithUnits(prog, um);
+        if d.HasErrors then
+        begin
+          d.PrintAll;
+          Halt(1);
+        end;
+
+        // Phase 4: Lower to IR
+        module := TIRModule.Create;
+        lower := TIRLowering.Create(module, d);
+        try
+          lower.LowerImportedUnits(um);
+          lower.Lower(prog);
+        finally
+          lower.Free;
+        end;
+      finally
+        s.Free;
+        um.Free;
+      end;
+
     finally
       d.Free;
       src.Free;
       if Assigned(prog) then prog.Free;
     end;
-    
-    // Phase 3: Serialize to .lyu
+
+    // Phase 5: Serialize to .lyu (symbols + IR)
     buffer := TByteBuffer.Create;
     ser := TLyuxSerializer.Create(nil, unitTargetArch, flagDebugSymbols);
     try
@@ -783,6 +858,10 @@ begin
       if RightStr(unitName, 4) = '.lyx' then
         unitName := Copy(unitName, 1, Length(unitName) - 4);
       ser.Serialize(unitName, lyuSymbols, Length(lyuSymbols), buffer);
+      if Assigned(module) then
+        ser.AppendIRSection(module, buffer);
+      if Assigned(module) then
+        module.Free;
       try
         buffer.SaveToFile(unitOutputFile);
       finally
@@ -791,7 +870,7 @@ begin
     finally
       ser.Free;
     end;
-    
+
     WriteLn;
     WriteLn('Erfolgreich kompiliert: ', unitOutputFile);
     WriteLn('Symbol-Count: ', Length(lyuSymbols));

@@ -71,6 +71,7 @@ type
   public
     Header: TLyuxHeader;
     Symbols: TLyuxSymbolArray;
+    IRModule: TIRModule;  { Deserialized IR, nil if not present in file }
     constructor Create;
     destructor Destroy; override;
   end;
@@ -86,6 +87,7 @@ type
 
     procedure WriteString(const s: string);
     function GetStringIdx(const s: string): Integer;
+    procedure WriteIRSection(IRModule: TIRModule);
 
   public
     constructor Create(d: TDiagnostics; arch: TLyuxArch; includeDebug: Boolean);
@@ -93,8 +95,10 @@ type
     { Simple serializer (for v1 placeholder) }
     procedure Serialize(AUnitName: string; symbols: TLyuxSymbolArray;
       funcCount: Integer; out buffer: TByteBuffer);
+    { Append IR section to existing buffer (call after Serialize) }
+    procedure AppendIRSection(IRModule: TIRModule; var buffer: TByteBuffer);
     { Full serializer with IR module }
-    procedure SerializeModule(IRModule: TIRModule; AUnitName: string; 
+    procedure SerializeModule(IRModule: TIRModule; AUnitName: string;
       symbols: TLyuxSymbolArray; out buffer: TByteBuffer);
   end;
 
@@ -108,6 +112,7 @@ type
 
     function ReadString: string;
     function ReadU32LEAdv: UInt32;
+    function ReadIRSection: TIRModule;
 
   public
     constructor Create(d: TDiagnostics);
@@ -134,10 +139,13 @@ const
 constructor TLoadedLyux.Create;
 begin
   inherited Create;
+  IRModule := nil;
 end;
 
 destructor TLoadedLyux.Destroy;
 begin
+  if Assigned(IRModule) then
+    IRModule.Free;
   inherited Destroy;
 end;
 
@@ -182,6 +190,96 @@ begin
     FStrings.Add(s);
     Result := FStrings.Count - 1;
   end;
+end;
+
+procedure TLyuxSerializer.WriteIRSection(IRModule: TIRModule);
+{ Write strings + functions + globals sections (assumes FBuffer and FStrings populated) }
+var
+  i, j: Integer;
+  fn: TIRFunction;
+  strIdx: Cardinal;
+begin
+  FStrings.Clear;
+  { Pre-populate string pool from IR }
+  for i := 0 to IRModule.Strings.Count - 1 do
+    GetStringIdx(IRModule.Strings[i]);
+  for i := 0 to High(IRModule.Functions) do
+  begin
+    fn := IRModule.Functions[i];
+    GetStringIdx(fn.Name);
+    for j := 0 to High(fn.Instructions) do
+    begin
+      if fn.Instructions[j].ImmStr <> '' then GetStringIdx(fn.Instructions[j].ImmStr);
+      if fn.Instructions[j].LabelName <> '' then GetStringIdx(fn.Instructions[j].LabelName);
+    end;
+  end;
+
+  { Strings section }
+  FBuffer.WriteU32LE(FStrings.Count);
+  for i := 0 to FStrings.Count - 1 do
+    WriteString(FStrings[i]);
+
+  { Functions section }
+  FBuffer.WriteU32LE(Length(IRModule.Functions));
+  for i := 0 to High(IRModule.Functions) do
+  begin
+    fn := IRModule.Functions[i];
+    WriteString(fn.Name);
+    FBuffer.WriteU16LE(fn.ParamCount);
+    FBuffer.WriteU16LE(fn.LocalCount);
+    FBuffer.WriteU8(Ord(fn.EnergyLevel));
+    FBuffer.WriteU32LE(Length(fn.Instructions));
+    for j := 0 to High(fn.Instructions) do
+    begin
+      FBuffer.WriteU16LE(Ord(fn.Instructions[j].Op));
+      FBuffer.WriteU32LE(fn.Instructions[j].Dest);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src1);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src2);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src3);
+      FBuffer.WriteU64LE(fn.Instructions[j].ImmInt);
+      if fn.Instructions[j].ImmStr <> '' then
+        strIdx := GetStringIdx(fn.Instructions[j].ImmStr)
+      else
+        strIdx := $FFFFFFFF;
+      FBuffer.WriteU32LE(strIdx);
+      if fn.Instructions[j].LabelName <> '' then
+        strIdx := GetStringIdx(fn.Instructions[j].LabelName)
+      else
+        strIdx := $FFFFFFFF;
+      FBuffer.WriteU32LE(strIdx);
+      FBuffer.WriteU8(Ord(fn.Instructions[j].CallMode));
+    end;
+  end;
+
+  { Globals section }
+  FBuffer.WriteU32LE(Length(IRModule.GlobalVars));
+  for i := 0 to High(IRModule.GlobalVars) do
+  begin
+    WriteString(IRModule.GlobalVars[i].Name);
+    FBuffer.WriteU64LE(IRModule.GlobalVars[i].InitValue);
+    FBuffer.WriteU8(Ord(IRModule.GlobalVars[i].HasInitValue));
+    FBuffer.WriteU8(Ord(IRModule.GlobalVars[i].IsArray));
+    if IRModule.GlobalVars[i].IsArray then
+      FBuffer.WriteU32LE(IRModule.GlobalVars[i].ArrayLen);
+  end;
+end;
+
+procedure TLyuxSerializer.AppendIRSection(IRModule: TIRModule; var buffer: TByteBuffer);
+{ Append IR data to an existing Serialize-format buffer }
+const
+  LYIR_MAGIC: array[0..3] of Byte = ($4C, $59, $49, $52);  { "LYIR" }
+var
+  i: Integer;
+begin
+  if not Assigned(IRModule) then Exit;
+  FBuffer := buffer;
+  FStrings.Clear;
+  { Write LYIR magic }
+  for i := 0 to 3 do
+    FBuffer.WriteU8(LYIR_MAGIC[i]);
+  WriteIRSection(IRModule);
+  buffer := FBuffer;
+  FBuffer := nil;
 end;
 
 procedure TLyuxSerializer.Serialize(AUnitName: string;
@@ -330,10 +428,129 @@ begin
     loaded.Symbols[i].Name := ReadString;
     if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].Kind := TLyuxSymbolKind(FBuffer.ReadU8(FPos));
+    Inc(FPos);
     if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].TypeHash := FBuffer.ReadU32LE(FPos);
+    Inc(FPos, 4);
     if FPos >= FBuffer.Size then Break;
     loaded.Symbols[i].TypeInfo := ReadString;
+  end;
+
+  { After symbol table: skip section placeholders (3 U32s from Serialize format) }
+  { then check for LYIR magic indicating embedded IR section }
+  if FPos + 12 <= FBuffer.Size then
+  begin
+    Inc(FPos, 12);  { Skip strings(0) + funcCount + globals(0) placeholders }
+    { Optional debug section placeholder }
+    if (loaded.Header.Flags and 1) <> 0 then
+      if FPos + 4 <= FBuffer.Size then
+        Inc(FPos, 4);
+    { Check for LYIR magic }
+    if (FPos + 4 <= FBuffer.Size) and
+       (FBuffer.ReadU8(FPos)   = Ord('L')) and
+       (FBuffer.ReadU8(FPos+1) = Ord('Y')) and
+       (FBuffer.ReadU8(FPos+2) = Ord('I')) and
+       (FBuffer.ReadU8(FPos+3) = Ord('R')) then
+    begin
+      Inc(FPos, 4);
+      loaded.IRModule := ReadIRSection;
+    end;
+  end;
+end;
+
+function TLyuxDeserializer.ReadIRSection: TIRModule;
+var
+  i, j, strCount, funcCount, globCount, instrCount: Integer;
+  strIdx: Cardinal;
+  fn: TIRFunction;
+  fnName: string;
+  pc, lc: Word;
+  el: Byte;
+  gName: string;
+  initVal: UInt64;
+  hasInit, isArr: Byte;
+  arrLen: Cardinal;
+begin
+  Result := TIRModule.Create;
+  FStrings.Clear;
+  try
+    { Strings section }
+    if FPos + 4 > FBuffer.Size then Exit;
+    strCount := ReadU32LEAdv;
+    for i := 0 to strCount - 1 do
+    begin
+      if FPos >= FBuffer.Size then Break;
+      FStrings.Add(ReadString);
+      Result.InternString(FStrings[FStrings.Count - 1]);
+    end;
+
+    { Functions section }
+    if FPos + 4 > FBuffer.Size then Exit;
+    funcCount := ReadU32LEAdv;
+    for i := 0 to funcCount - 1 do
+    begin
+      if FPos >= FBuffer.Size then Break;
+      fnName := ReadString;
+      if FPos + 5 > FBuffer.Size then Break;
+      pc := FBuffer.ReadU16LE(FPos); Inc(FPos, 2);
+      lc := FBuffer.ReadU16LE(FPos); Inc(FPos, 2);
+      el := FBuffer.ReadU8(FPos); Inc(FPos);
+      if FPos + 4 > FBuffer.Size then Break;
+      instrCount := ReadU32LEAdv;
+      Result.AddFunction(fnName);
+      fn := Result.Functions[High(Result.Functions)];
+      fn.ParamCount := pc;
+      fn.LocalCount := lc;
+      fn.EnergyLevel := TEnergyLevel(el);
+      SetLength(fn.Instructions, instrCount);
+      for j := 0 to instrCount - 1 do
+      begin
+        if FPos + 2 > FBuffer.Size then Break;
+        fn.Instructions[j].Op := TIROpKind(FBuffer.ReadU16LE(FPos)); Inc(FPos, 2);
+        fn.Instructions[j].Dest := ReadU32LEAdv;
+        fn.Instructions[j].Src1 := ReadU32LEAdv;
+        fn.Instructions[j].Src2 := ReadU32LEAdv;
+        fn.Instructions[j].Src3 := ReadU32LEAdv;
+        fn.Instructions[j].ImmInt := FBuffer.ReadU64LE(FPos); Inc(FPos, 8);
+        strIdx := ReadU32LEAdv;
+        if (strIdx <> $FFFFFFFF) and (Integer(strIdx) < FStrings.Count) then
+          fn.Instructions[j].ImmStr := FStrings[strIdx];
+        strIdx := ReadU32LEAdv;
+        if (strIdx <> $FFFFFFFF) and (Integer(strIdx) < FStrings.Count) then
+          fn.Instructions[j].LabelName := FStrings[strIdx];
+        fn.Instructions[j].CallMode := TIRCallMode(FBuffer.ReadU8(FPos)); Inc(FPos);
+      end;
+    end;
+
+    { Globals section }
+    if FPos + 4 > FBuffer.Size then Exit;
+    globCount := ReadU32LEAdv;
+    for i := 0 to globCount - 1 do
+    begin
+      if FPos >= FBuffer.Size then Break;
+      gName := ReadString;
+      if FPos + 10 > FBuffer.Size then Break;
+      initVal := FBuffer.ReadU64LE(FPos); Inc(FPos, 8);
+      hasInit := FBuffer.ReadU8(FPos); Inc(FPos);
+      isArr := FBuffer.ReadU8(FPos); Inc(FPos);
+      arrLen := 0;
+      if isArr <> 0 then
+      begin
+        if FPos + 4 > FBuffer.Size then Break;
+        arrLen := ReadU32LEAdv;
+      end;
+      SetLength(Result.GlobalVars, Length(Result.GlobalVars) + 1);
+      with Result.GlobalVars[High(Result.GlobalVars)] do
+      begin
+        Name := gName;
+        InitValue := initVal;
+        HasInitValue := Boolean(hasInit);
+        IsArray := Boolean(isArr);
+        if IsArray then ArrayLen := arrLen;
+      end;
+    end;
+  except
+    { If parsing fails, return whatever we have so far }
   end;
 end;
 
