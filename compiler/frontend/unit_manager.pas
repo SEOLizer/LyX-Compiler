@@ -455,51 +455,30 @@ begin
     Exit;
   end;
 
-  // First try to load precompiled .lyu
-  res := ResolveUnitPath(unitPath, importingFile);
+  // Priority 1: search for .lyu directly (same search paths as .lyx)
   lyuPath := '';
-  if res.Found then
+  if importingFile <> '' then
   begin
-    // Replace .lyx with .lyu
-    if RightStr(res.FilePath, 4) = '.lyx' then
-      lyuPath := Copy(res.FilePath, 1, Length(res.FilePath) - 4) + '.lyu'
+    // Relative to importing file: use only the last name component
+    dotPos := LastDelimiter('.', unitPath);
+    if dotPos > 0 then
+      lyuRelPart := Copy(unitPath, dotPos + 1, MaxInt)
     else
-      lyuPath := res.FilePath + '.lyu';
-  end
-  else
-  begin
-    // .lyx not found - try to find .lyu directly.
-    // TryResolvePrecompiledPath converts dots to slashes, so pass the raw unit path.
-    lyuPath := '';
-
-    // 1. Relative to importing file: use last component only to avoid doubled paths
-    if importingFile <> '' then
-    begin
-      dotPos := LastDelimiter('.', unitPath);
-      if dotPos > 0 then
-        lyuRelPart := Copy(unitPath, dotPos + 1, MaxInt)
-      else
-        lyuRelPart := unitPath;
-      TryResolvePrecompiledPath(
-        ExtractFilePath(ExpandFileName(importingFile)), lyuRelPart, lyuPath);
-    end;
-
-    // 2. Project root (full unit path → converts to nested dir structure)
-    if lyuPath = '' then
-      TryResolvePrecompiledPath(FProjectRoot, unitPath, lyuPath);
-
-    // 3. Include paths
-    if lyuPath = '' then
-      for idx := 0 to FIncludePaths.Count - 1 do
-        if TryResolvePrecompiledPath(FIncludePaths[idx], unitPath, lyuPath) then
-          Break;
+      lyuRelPart := unitPath;
+    TryResolvePrecompiledPath(
+      ExtractFilePath(ExpandFileName(importingFile)), lyuRelPart, lyuPath);
   end;
+  if lyuPath = '' then
+    TryResolvePrecompiledPath(FProjectRoot, unitPath, lyuPath);
+  if lyuPath = '' then
+    for idx := 0 to FIncludePaths.Count - 1 do
+      if TryResolvePrecompiledPath(FIncludePaths[idx], unitPath, lyuPath) then
+        Break;
 
-  // Versuche .lyu zu laden wenn vorhanden
   if (lyuPath <> '') and FileExists(lyuPath) then
   begin
     if FTraceImports then
-      Trace('Loading precompiled unit: ' + lyuPath);
+      Trace('Loading precompiled unit (priority): ' + lyuPath);
     try
       lyux := LoadPrecompiledUnit(lyuPath);
       if Assigned(lyux) then
@@ -510,15 +489,13 @@ begin
       end;
     except
       on E: Exception do
-      begin
         if FTraceImports then
-          Trace('Failed to load precompiled unit: ' + E.Message + ' - falling back to .lyx');
-        { Fallback to .lyx }
-      end;
+          Trace('Failed to load .lyu: ' + E.Message + ' - falling back to .lyx');
     end;
   end;
 
-  // Fallback: Lade .lyx
+  // Priority 2: fall back to .lyx source
+  res := ResolveUnitPath(unitPath, importingFile);
   if not res.Found then
   begin
     FDiag.Error('cannot find unit: ' + unitPath, Default(TSourceSpan));
