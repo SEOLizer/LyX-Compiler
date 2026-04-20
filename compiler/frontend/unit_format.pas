@@ -7,7 +7,7 @@ interface
 
 uses
   SysUtils, Classes, 
-  bytes, diag, ir;
+  bytes, diag, ir, backend_types;
 
 type
   { Target-Architektur für .lyu }
@@ -104,6 +104,7 @@ type
     FBuffer: TByteBuffer;
     FPos: Integer;
     FDiag: TDiagnostics;
+    FStrings: TStringList;  { String pool for this file }
 
     function ReadString: string;
 
@@ -111,6 +112,8 @@ type
     constructor Create(d: TDiagnostics);
     destructor Destroy; override;
     procedure Deserialize(buffer: TByteBuffer; out loaded: TLoadedLyux);
+    { Deserialize full IR module from buffer }
+    function DeserializeModule(buffer: TByteBuffer; out IRModule: TIRModule): Boolean;
   end;
 
   { Hilfsfunktionen }
@@ -243,10 +246,13 @@ constructor TLyuxDeserializer.Create(d: TDiagnostics);
 begin
   inherited Create;
   FDiag := d;
+  FStrings := TStringList.Create;
+  FStrings.Sorted := False;
 end;
 
 destructor TLyuxDeserializer.Destroy;
 begin
+  FStrings.Free;
   inherited Destroy;
 end;
 
@@ -354,6 +360,77 @@ end;
 function GetCurrentArchStr: string;
 begin
   Result := 'x86_64';
+end;
+
+function TLyuxDeserializer.DeserializeModule(buffer: TByteBuffer; out IRModule: TIRModule): Boolean;
+var
+  i, j, funcCount, instrCount: Integer;
+  strIdx: Cardinal;
+  fn: TIRFunction;
+begin
+  Result := False;
+  FBuffer := buffer;
+  FPos := 0;
+  FStrings.Clear;
+  
+  IRModule := TIRModule.Create;
+  
+  try
+    { Skip header (already validated) }
+    Inc(FPos, 32);  { Skip header }
+    
+    { Skip symbols in this simplified version }
+    { Read strings first }
+    FBuffer.ReadU32LE(FPos);  { string count - ignore }
+    while FPos < FBuffer.Size - 10 do
+    begin
+      IRModule.InternString(ReadString);
+    end;
+    
+    { Read functions }
+    funcCount := FBuffer.ReadU32LE(FPos);
+    for i := 0 to funcCount - 1 do
+    begin
+      fn := TIRFunction.Create(ReadString);
+      fn.ParamCount := FBuffer.ReadU16LE(FPos);
+      fn.LocalCount := FBuffer.ReadU16LE(FPos);
+      fn.EnergyLevel := TEnergyLevel(FBuffer.ReadU8(FPos));
+      
+      instrCount := FBuffer.ReadU32LE(FPos);
+      SetLength(fn.Instructions, instrCount);
+      for j := 0 to instrCount - 1 do
+      begin
+        fn.Instructions[j].Op := TIROpKind(FBuffer.ReadU16LE(FPos));
+        fn.Instructions[j].Dest := FBuffer.ReadU32LE(FPos);
+        fn.Instructions[j].Src1 := FBuffer.ReadU32LE(FPos);
+        fn.Instructions[j].Src2 := FBuffer.ReadU32LE(FPos);
+        fn.Instructions[j].Src3 := FBuffer.ReadU32LE(FPos);
+        fn.Instructions[j].ImmInt := FBuffer.ReadU64LE(FPos);
+        
+        strIdx := FBuffer.ReadU32LE(FPos);
+        if (strIdx <> $FFFFFFFF) and (strIdx < Cardinal(FStrings.Count)) then
+          fn.Instructions[j].ImmStr := FStrings[strIdx];
+        
+        strIdx := FBuffer.ReadU32LE(FPos);
+        if (strIdx <> $FFFFFFFF) and (strIdx < Cardinal(FStrings.Count)) then
+          fn.Instructions[j].LabelName := FStrings[strIdx];
+        
+        fn.Instructions[j].CallMode := TIRCallMode(FBuffer.ReadU8(FPos));
+      end;
+      
+      IRModule.AddFunction(fn.Name);
+      IRModule.Functions[High(IRModule.Functions)].Instructions := fn.Instructions;
+      fn.Instructions := nil;
+      fn.Free;
+    end;
+    
+    { Skip globals for now }
+    Result := True;
+    
+  except
+    IRModule.Free;
+    IRModule := nil;
+  end;
 end;
 
 { TLyuxSerializer - Full IR Serialization }
