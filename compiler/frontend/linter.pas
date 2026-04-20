@@ -35,7 +35,8 @@ type
     lrTodoComment,       // W022: "// TODO" Kommentare finden
     lrMagicNumber,        // W023: hartecodierte Zahlen (magic numbers)
     lrUnboundedLoop,     // W024: While ohne limit() (WCET)
-    lrResourceLeak       // W025: mmap ohne munmap (Resource Leak)
+    lrResourceLeak,       // W025: mmap ohne munmap (Resource Leak)
+    lrUncheckedError     // W026: ignorierte Fehlercodes
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -66,7 +67,8 @@ const
     lrGlobalMutable,
     lrTodoComment,
     lrMagicNumber,
-    lrUnboundedLoop
+    lrUnboundedLoop,
+    lrResourceLeak
   ];
 
   { Human-readable Namen für die Regeln }
@@ -94,7 +96,8 @@ const
     'global-mutable',
     'todo-comment',
     'magic-number',
-    'unbounded-loop'
+    'unbounded-loop',
+    'unchecked-error'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
@@ -102,7 +105,8 @@ const
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
     'W016', 'W017', 'W018', 'W019', 'W020',
-    'W021', 'W022', 'W023', 'W024'
+    'W021', 'W022', 'W023', 'W024', 'W025',
+    'W026'
   );
 
 type
