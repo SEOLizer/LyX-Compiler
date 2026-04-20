@@ -442,6 +442,8 @@ var
   res: TResolveResult;
   lyux: TLoadedLyux;
   lyuPath: string;
+  dotPos: Integer;
+  lyuRelPart: string;
 begin
   // Prüfe ob Unit bereits geladen
   idx := FUnits.IndexOf(unitPath);
@@ -463,8 +465,36 @@ begin
       lyuPath := Copy(res.FilePath, 1, Length(res.FilePath) - 4) + '.lyu'
     else
       lyuPath := res.FilePath + '.lyu';
+  end
+  else
+  begin
+    // .lyx not found - try to find .lyu directly.
+    // TryResolvePrecompiledPath converts dots to slashes, so pass the raw unit path.
+    lyuPath := '';
+
+    // 1. Relative to importing file: use last component only to avoid doubled paths
+    if importingFile <> '' then
+    begin
+      dotPos := LastDelimiter('.', unitPath);
+      if dotPos > 0 then
+        lyuRelPart := Copy(unitPath, dotPos + 1, MaxInt)
+      else
+        lyuRelPart := unitPath;
+      TryResolvePrecompiledPath(
+        ExtractFilePath(ExpandFileName(importingFile)), lyuRelPart, lyuPath);
+    end;
+
+    // 2. Project root (full unit path → converts to nested dir structure)
+    if lyuPath = '' then
+      TryResolvePrecompiledPath(FProjectRoot, unitPath, lyuPath);
+
+    // 3. Include paths
+    if lyuPath = '' then
+      for idx := 0 to FIncludePaths.Count - 1 do
+        if TryResolvePrecompiledPath(FIncludePaths[idx], unitPath, lyuPath) then
+          Break;
   end;
-  
+
   // Versuche .lyu zu laden wenn vorhanden
   if (lyuPath <> '') and FileExists(lyuPath) then
   begin
