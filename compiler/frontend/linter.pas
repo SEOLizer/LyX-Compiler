@@ -26,11 +26,11 @@ type
     lrRecursiveFunction,     // W014: Rekursive Funktion (für Stack-Vorhersagbarkeit — MISRA 5.2)
     lrImplicitTypeCast,      // W015: Implizite Typkonvertierung ohne 'as' (MISRA 5.2)
     // MISRA Regeln (aerospace-todo P2 #17-20)
+    lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
     lrPointerArithmetic,    // W017: Pointer-Arithmetik (MISRA 5.2)
     lrIncompleteSwitch,    // W018: Switch ohne default oder ohne alle Enum-Werte (MISRA 5.2)
     lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
     lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
-    lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
     lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
     lrTodoComment,       // W022: "// TODO" Kommentare finden
     lrMagicNumber,        // W023: hartecodierte Zahlen (magic numbers)
@@ -88,15 +88,16 @@ const
     'print-float-int-arg',
     'recursive-function',
     'implicit-type-cast',
+    'dead-loop',
     'pointer-arithmetic',
     'incomplete-switch',
     'function-too-long',
     'complex-function',
-    'dead-loop',
     'global-mutable',
     'todo-comment',
     'magic-number',
     'unbounded-loop',
+    'resource-leak',
     'unchecked-error'
   );
 
