@@ -340,21 +340,25 @@ private slots:
 
 > **Ziel**: Produktionsreife sicherstellen
 
-- [ ] **Unit-Tests**
-  - [ ] Parser-Tests (gültige/ungültige Syntax)
-  - [ ] Code-Generator Tests (Output-Verifikation)
-  - [ ] Widget-Mapping Tests
+- [x] **Unit-Tests erstellt**
+  - [x] Widget-Mapping Tests (lfd_codegen_test.lpr)
+  - [x] Layout-Tests
+  - [x] Signal-Mapping Tests
+  - [x] Property-Generierung Tests
+  - [x] Header/Source-Generierung Tests
 
 - [ ] **Integration-Tests**
   - [ ] LFD → C++ → Kompilierung → Qt-App
   - [ ] Kompilierte Qt-Apps ausführen
 
-- [ ] **Dokumentation**
-  - [ ] Widget-Referenz
-  - [ ] Property-Referenz
+- [x] **Dokumentation**
+  - [x] Property-Referenz (in lfd_codegen.pas)
+  - [x] Widget-Referenz (in lfd_codegen.pas)
   - [ ] Beispiele
 
-**Deliverable**: Test-Suite + Dokumentation
+**Status**: Größtenteils abgeschlossen (Integration-Tests fehlen)
+
+**Deliverable**: `compiler/ir/lfd_codegen.pas`, Test-Dateien
 
 ---
 
