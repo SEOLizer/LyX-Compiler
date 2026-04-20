@@ -4,7 +4,7 @@ program lyxc;
 uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types, energy_model,
-  diag, lexer, parser, ast, sema, unit_manager, linter,
+  diag, lexer, parser, ast, sema, unit_manager, linter, unit_format,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
   asm_listing, map_file,
   x86_64_emit, elf64_writer,
@@ -35,6 +35,11 @@ var
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
+  // Precompiled unit options
+  flagCompileUnit: Boolean;  // --compile-unit
+  flagDebugSymbols: Boolean;  // --debug-symbols
+  unitOutputFile: string;  // -o for unit output
+  unitTargetArch: TLyuxArch;  // -t for target arch
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -63,6 +68,9 @@ var
   pltPatches: TPLTGOTPatchArray;
   mainOff: Integer;
   i, j: Integer;
+  buffer: TByteBuffer;  { For .lyu serialization }
+  ser: TLyuxSerializer;  { For .lyu serialization }
+  lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
   x86Emit: TX86_64Emitter;
   hashCrc: UInt32;
@@ -355,6 +363,13 @@ begin
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
     WriteLn(StdErr);
+    WriteLn(StdErr, 'Unit-Kompilierung:');
+    WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
+    WriteLn(StdErr, '  -o <datei>      Ausgabedatei für .lyu');
+    WriteLn(StdErr, '  -t=<arch>     Ziel-Architektur (x86_64, arm64)');
+    WriteLn(StdErr, '  --debug-symbols Debug-Info in .lyu einbetten');
+    WriteLn(StdErr, '  --unit-info    Info über .lyu-Datei anzeigen');
+    WriteLn(StdErr);
     WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
     WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
     WriteLn(StdErr, '  --build-info     Build-Identifikation ausgeben (TOR-002)');
@@ -377,6 +392,12 @@ begin
   flagCallGraph := False;
   flagMapFile := False;
   includePaths := TStringList.Create;
+  
+  // Precompiled unit options
+  flagCompileUnit := False;
+  flagDebugSymbols := False;
+  unitOutputFile := '';
+  unitTargetArch := la_x86_64;
   stdLibPath := '';
 
   // Parse command line arguments
@@ -516,6 +537,23 @@ begin
       flagMapFile := True;
       Inc(i);
     end
+    else if param = '--compile-unit' then
+    begin
+      flagCompileUnit := True;
+      Inc(i);
+    end
+    else if param = '--debug-symbols' then
+    begin
+      flagDebugSymbols := True;
+      Inc(i);
+    end
+    else if Copy(param, 1, 3) = '-t=' then
+    begin
+      // -t=x86_64 for unit target arch
+      param := Copy(param, 4, MaxInt);
+      unitTargetArch := StrToArch(param);
+      Inc(i);
+    end
     else if param = '--trace-imports' then
     begin
       flagTraceImports := True;
@@ -617,6 +655,46 @@ begin
   basePath := ExtractFilePath(inputFile);
   if basePath = '' then
     basePath := '.';
+
+  { ====== PRECOMPILED UNIT MODE ====== }
+  if flagCompileUnit then
+  begin
+    WriteLn;
+    WriteLn('--- Unit-Kompilierungs-Modus ---');
+    
+    // Determine output file
+    if unitOutputFile = '' then
+      unitOutputFile := inputFile + '.lyu';
+    if unitOutputFile = inputFile then
+      unitOutputFile := inputFile + '.lyu';
+
+    WriteLn('Ausgabe: ', unitOutputFile);
+    WriteLn('Ziel:   ', ArchToStr(unitTargetArch));
+    if flagDebugSymbols then
+      WriteLn('Debug-Symbole: aktiviert');
+    WriteLn;
+    
+    { Placeholder: Create empty .lyu file for now }
+    buffer := TByteBuffer.Create;
+    ser := TLyuxSerializer.Create(nil, unitTargetArch, flagDebugSymbols);
+    try
+      SetLength(lyuSymbols, 0);
+      ser.Serialize(ExtractFileName(inputFile), lyuSymbols, 0, buffer);
+      try
+        buffer.SaveToFile(unitOutputFile);
+      finally
+        buffer.Free;
+      end;
+    finally
+      ser.Free;
+    end;
+    
+    WriteLn;
+    WriteLn('Erfolgreich kompiliert: ', unitOutputFile);
+    Halt(0);
+  end;
+
+  { ====== NORMAL COMPILATION MODE ====== }
 
   src := TStringList.Create;
   try
