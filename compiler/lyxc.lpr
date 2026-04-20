@@ -4,7 +4,7 @@ program lyxc;
 uses
   SysUtils, Classes, BaseUnix,
   bytes, backend_types, energy_model,
-  diag, lexer, parser, ast, sema, unit_manager, linter,
+  diag, lexer, parser, ast, sema, unit_manager, linter, unit_format,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
   asm_listing, map_file,
   x86_64_emit, elf64_writer,
@@ -35,6 +35,11 @@ var
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
+  // Precompiled unit options
+  flagCompileUnit: Boolean;  // --compile-unit
+  flagDebugSymbols: Boolean;  // --debug-symbols
+  unitOutputFile: string;  // -o for unit output
+  unitTargetArch: TLyuxArch;  // -t for target arch
   includePaths: TStringList;  // -I Pfade
   stdLibPath: string;  // --std-path
   lint: TLinter;
@@ -63,6 +68,12 @@ var
   pltPatches: TPLTGOTPatchArray;
   mainOff: Integer;
   i, j: Integer;
+  buffer: TByteBuffer;  { For .lyu serialization }
+  ser: TLyuxSerializer;  { For .lyu serialization }
+  lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
+  fn: TAstFuncDecl;  { For unit compilation }
+  symIdx: Integer;  { For unit compilation }
+  unitName: string;  { For unit compilation }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
   x86Emit: TX86_64Emitter;
   hashCrc: UInt32;
@@ -81,6 +92,81 @@ var
 
 type
   TStringArray = array of string;
+
+{ Helper to convert TAurumType to string }
+function FormatType(t: TAurumType): string;
+begin
+  case t of
+    atInt8:    Result := 'int8';
+    atInt16:   Result := 'int16';
+    atInt32:   Result := 'int32';
+    atInt64:  Result := 'int64';
+    atUInt8:   Result := 'uint8';
+    atUInt16:  Result := 'uint16';
+    atUInt32:  Result := 'uint32';
+    atUInt64:  Result := 'uint64';
+    atISize:   Result := 'int';
+    atUSize:   Result := 'uint';
+    atF32:     Result := 'f32';
+    atF64:     Result := 'f64';
+    atBool:    Result := 'bool';
+    atChar:    Result := 'char';
+    atVoid:    Result := 'void';
+    atPChar:   Result := 'pchar';
+    atPCharNullable: Result := 'pchar?';
+    atDynArray: Result := 'array';
+    atArray:   Result := 'array';
+    atMap:     Result := 'Map';
+    atSet:     Result := 'Set';
+    atParallelArray: Result := 'parallel Array';
+    atFnPtr:   Result := 'fnptr';
+    else      Result := 'unknown';
+  end;
+end;
+
+procedure MergePrecompiledIR(um: TUnitManager; module: TIRModule);
+{ Copy IR functions from precompiled .lyu units into the main module }
+var
+  i, j: Integer;
+  loadedUnit: TLoadedUnit;
+  srcFn: TIRFunction;
+  dstFn: TIRFunction;
+  srcStr: string;
+  strIdxMap: array of Integer;
+begin
+  if not Assigned(um) or not Assigned(module) then Exit;
+  for i := 0 to um.Units.Count - 1 do
+  begin
+    loadedUnit := TLoadedUnit(um.Units.Objects[i]);
+    if not Assigned(loadedUnit) or not loadedUnit.IsPrecompiled then
+      Continue;
+    if not Assigned(loadedUnit.LyuxData) or not Assigned(loadedUnit.LyuxData.IRModule) then
+      Continue;
+
+    { Copy all functions from precompiled unit's IR into main module }
+    for j := 0 to High(loadedUnit.LyuxData.IRModule.Functions) do
+    begin
+      srcFn := loadedUnit.LyuxData.IRModule.Functions[j];
+      { Skip if already present (avoid duplicates) }
+      if module.FindFunction(srcFn.Name) <> nil then
+        Continue;
+      { Build a string index remap from source to dest module }
+      SetLength(strIdxMap, loadedUnit.LyuxData.IRModule.Strings.Count);
+      for symIdx := 0 to loadedUnit.LyuxData.IRModule.Strings.Count - 1 do
+      begin
+        srcStr := loadedUnit.LyuxData.IRModule.Strings[symIdx];
+        strIdxMap[symIdx] := module.InternString(srcStr);
+      end;
+      { Add function to main module }
+      module.AddFunction(srcFn.Name);
+      dstFn := module.Functions[High(module.Functions)];
+      dstFn.ParamCount := srcFn.ParamCount;
+      dstFn.LocalCount := srcFn.LocalCount;
+      dstFn.EnergyLevel := srcFn.EnergyLevel;
+      dstFn.Instructions := Copy(srcFn.Instructions);
+    end;
+  end;
+end;
 
 procedure PrintEnergyStats(const stats: TEnergyStats);
 var
@@ -275,7 +361,7 @@ begin
     // TOR-001: Handle --version
   if (ParamCount = 1) and (ParamStr(1) = '--version') then
   begin
-    WriteLn('lyxc 0.8.1-aerospace');
+    WriteLn('lyxc 0.8.2-aerospace');
     WriteLn('DO-178C TQL-5 Qualified Compiler');
     WriteLn('Target Platforms: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, macOS ARM64, ESP32');
     Halt(0);
@@ -286,7 +372,7 @@ begin
   begin
     WriteLn('Lyx Compiler Build Information');
     WriteLn('================================');
-    WriteLn('Version:         0.8.1-aerospace');
+    WriteLn('Version:         0.8.2-aerospace');
     WriteLn('TQL Level:       TQL-5 (DO-178C Section 12.2)');
     WriteLn('Build Host:      ', GetEnvironmentVariable('HOSTNAME'));
     WriteLn('Build OS:        ', {$IFDEF LINUX}'Linux'{$ELSE}{$IFDEF WINDOWS}'Windows'{$ELSE}'Unknown'{$ENDIF}{$ENDIF});
@@ -329,7 +415,7 @@ begin
 
   if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.8.1-aerospace');
+    WriteLn(StdErr, 'Lyx Compiler v0.8.2-aerospace');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -355,6 +441,13 @@ begin
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
     WriteLn(StdErr);
+    WriteLn(StdErr, 'Unit-Kompilierung:');
+    WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
+    WriteLn(StdErr, '  -o <datei>      Ausgabedatei für .lyu');
+    WriteLn(StdErr, '  -t=<arch>     Ziel-Architektur (x86_64, arm64)');
+    WriteLn(StdErr, '  --debug-symbols Debug-Info in .lyu einbetten');
+    WriteLn(StdErr, '  --unit-info    Info über .lyu-Datei anzeigen');
+    WriteLn(StdErr);
     WriteLn(StdErr, 'TOR-Optionen (DO-178C Tool Qualification):');
     WriteLn(StdErr, '  --version        Versionsnummer ausgeben (TOR-001)');
     WriteLn(StdErr, '  --build-info     Build-Identifikation ausgeben (TOR-002)');
@@ -377,6 +470,12 @@ begin
   flagCallGraph := False;
   flagMapFile := False;
   includePaths := TStringList.Create;
+  
+  // Precompiled unit options
+  flagCompileUnit := False;
+  flagDebugSymbols := False;
+  unitOutputFile := '';
+  unitTargetArch := la_x86_64;
   stdLibPath := '';
 
   // Parse command line arguments
@@ -516,6 +615,23 @@ begin
       flagMapFile := True;
       Inc(i);
     end
+    else if param = '--compile-unit' then
+    begin
+      flagCompileUnit := True;
+      Inc(i);
+    end
+    else if param = '--debug-symbols' then
+    begin
+      flagDebugSymbols := True;
+      Inc(i);
+    end
+    else if Copy(param, 1, 3) = '-t=' then
+    begin
+      // -t=x86_64 for unit target arch
+      param := Copy(param, 4, MaxInt);
+      unitTargetArch := StrToArch(param);
+      Inc(i);
+    end
     else if param = '--trace-imports' then
     begin
       flagTraceImports := True;
@@ -572,7 +688,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.8.1-aerospace');
+  WriteLn('Lyx Compiler v0.8.2-aerospace');
   WriteLn('DO-178C TQL-5 Qualified');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
@@ -617,6 +733,151 @@ begin
   basePath := ExtractFilePath(inputFile);
   if basePath = '' then
     basePath := '.';
+
+{ ====== PRECOMPILED UNIT MODE ====== }
+  if flagCompileUnit then
+  begin
+    WriteLn;
+    WriteLn('--- Unit-Kompilierungs-Modus ---');
+    
+    // Determine output file
+    if unitOutputFile = '' then
+    begin
+      // Remove .lyx extension if present, add .lyu
+      if RightStr(inputFile, 4) = '.lyx' then
+        unitOutputFile := Copy(inputFile, 1, Length(inputFile) - 4) + '.lyu'
+      else
+        unitOutputFile := inputFile + '.lyu';
+    end;
+    
+    WriteLn('Ausgabe: ', unitOutputFile);
+    WriteLn('Ziel:   ', ArchToStr(unitTargetArch));
+    if flagDebugSymbols then
+      WriteLn('Debug-Symbole: aktiviert');
+    WriteLn;
+    
+    // Phase 1: Parse die .lyx Datei
+    src := TStringList.Create;
+    d := TDiagnostics.Create;
+    try
+      src.LoadFromFile(inputFile);
+      lx := TLexer.Create(src.Text, inputFile, d);
+      try
+        p := TParser.Create(lx, d);
+        try
+          prog := p.ParseProgram;
+        finally
+          p.Free;
+        end;
+      finally
+        lx.Free;
+      end;
+      
+      if d.HasErrors then
+      begin
+        d.PrintAll;
+        Halt(1);
+      end;
+      
+      // Phase 2: Extrahiere alle pub fn Symbole
+      if Assigned(prog) and Assigned(prog.Decls) then
+      begin
+        for i := 0 to High(prog.Decls) do
+        begin
+          if prog.Decls[i] is TAstFuncDecl then
+          begin
+            fn := TAstFuncDecl(prog.Decls[i]);
+            if fn.IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := fn.Name;
+              lyuSymbols[symIdx].Kind := lskFn;
+              lyuSymbols[symIdx].TypeHash := UInt32(Ord(fn.ReturnType));
+              // TypeInfo: "retType" or "retType:param1,param2,..." for import reconstruction
+              lyuSymbols[symIdx].TypeInfo := FormatType(fn.ReturnType);
+              if Length(fn.Params) > 0 then
+              begin
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':';
+                for j := 0 to High(fn.Params) do
+                begin
+                  if j > 0 then
+                    lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ',';
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(fn.Params[j].ParamType);
+                end;
+              end;
+              WriteLn('  Exportiere: pub fn ', fn.Name, ' -> ', lyuSymbols[symIdx].TypeInfo);
+            end;
+          end;
+        end;
+      end;
+      
+      WriteLn;
+      WriteLn('Gefundene Symbole: ', Length(lyuSymbols));
+
+      // Phase 3: Sema (needed for IR lowering)
+      s := TSema.Create(d);
+      um := TUnitManager.Create(d);
+      module := nil;
+      try
+        um.SetSourceFile(inputFile);
+        um.SetProjectRoot(GetCurrentDir);
+        um.LoadAllImports(prog, inputFile);
+        s.AnalyzeWithUnits(prog, um);
+        if d.HasErrors then
+        begin
+          d.PrintAll;
+          Halt(1);
+        end;
+
+        // Phase 4: Lower to IR
+        module := TIRModule.Create;
+        lower := TIRLowering.Create(module, d);
+        try
+          lower.LowerImportedUnits(um);
+          lower.Lower(prog);
+        finally
+          lower.Free;
+        end;
+      finally
+        s.Free;
+        um.Free;
+      end;
+
+    finally
+      d.Free;
+      src.Free;
+      if Assigned(prog) then prog.Free;
+    end;
+
+    // Phase 5: Serialize to .lyu (symbols + IR)
+    buffer := TByteBuffer.Create;
+    ser := TLyuxSerializer.Create(nil, unitTargetArch, flagDebugSymbols);
+    try
+      unitName := ExtractFileName(inputFile);
+      if RightStr(unitName, 4) = '.lyx' then
+        unitName := Copy(unitName, 1, Length(unitName) - 4);
+      ser.Serialize(unitName, lyuSymbols, Length(lyuSymbols), buffer);
+      if Assigned(module) then
+        ser.AppendIRSection(module, buffer);
+      if Assigned(module) then
+        module.Free;
+      try
+        buffer.SaveToFile(unitOutputFile);
+      finally
+        buffer.Free;
+      end;
+    finally
+      ser.Free;
+    end;
+
+    WriteLn;
+    WriteLn('Erfolgreich kompiliert: ', unitOutputFile);
+    WriteLn('Symbol-Count: ', Length(lyuSymbols));
+    Halt(0);
+  end;
+
+  { ====== NORMAL COMPILATION MODE ====== }
 
   src := TStringList.Create;
   try
@@ -726,6 +987,8 @@ begin
         try
           // First, register constants from imported units so they're available during lowering
           lower.LowerImportedUnits(um);
+          // Merge IR from precompiled units (.lyu) - simple version
+          MergePrecompiledIR(um, module);
           // Then lower the main program
           lower.Lower(prog);
 

@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, bytes, tobject, backend_types;
+  SysUtils, Classes, ast, diag, lexer, unit_manager, unit_format, bytes, tobject, backend_types;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -4891,6 +4891,55 @@ begin
   // Nichts zu tun - Methodenauflösung erfolgt dynamisch
 end;
 
+type
+  TDynAurumTypeArr = array of TAurumType;
+
+procedure ParseLyuxTypeInfo(const typeInfo: string; out retType: TAurumType; out paramTypes: TDynAurumTypeArr; out paramCount: Integer);
+{ Parse "retType" or "retType:p1,p2,..." -> fills retType, paramTypes, paramCount }
+var
+  colonPos, commaPos, cur: Integer;
+  retStr, paramStr, tok: string;
+  parts: TStringList;
+  n, idx: Integer;
+begin
+  colonPos := Pos(':', typeInfo);
+  if colonPos = 0 then
+  begin
+    retStr := typeInfo;
+    paramStr := '';
+  end
+  else
+  begin
+    retStr := Copy(typeInfo, 1, colonPos - 1);
+    paramStr := Copy(typeInfo, colonPos + 1, MaxInt);
+  end;
+  retType := StrToAurumType(retStr);
+  paramCount := 0;
+  SetLength(paramTypes, 0);
+  if paramStr = '' then
+    Exit;
+  parts := TStringList.Create;
+  try
+    cur := 1;
+    while cur <= Length(paramStr) do
+    begin
+      commaPos := Pos(',', paramStr, cur);
+      if commaPos = 0 then
+        commaPos := Length(paramStr) + 1;
+      tok := Copy(paramStr, cur, commaPos - cur);
+      parts.Add(tok);
+      cur := commaPos + 1;
+    end;
+    n := parts.Count;
+    SetLength(paramTypes, n);
+    for idx := 0 to n - 1 do
+      paramTypes[idx] := StrToAurumType(parts[idx]);
+    paramCount := n;
+  finally
+    parts.Free;
+  end;
+end;
+
 procedure TSema.ImportUnit(imp: TAstImportDecl);
 { Importiert eine Unit und registriert ihre Symbole }
 var
@@ -4904,6 +4953,10 @@ var
   con: TAstConDecl;
   vd: TAstVarDecl;
   sym: TSymbol;
+  lyuSym: TLyuxSymbol;
+  retType: TAurumType;
+  paramTypes: TDynAurumTypeArr;
+  paramCount: Integer;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -5070,6 +5123,51 @@ begin
           for k := 0 to High(m.Params) do
             sym.ParamTypes[k+1] := m.Params[k].ParamType;
           AddSymbolToCurrent(sym, m.Span);
+        end;
+      end;
+    end;
+  end
+  else if loadedUnit.IsPrecompiled and Assigned(loadedUnit.LyuxData) then
+  begin
+    for i := 0 to High(loadedUnit.LyuxData.Symbols) do
+    begin
+      lyuSym := loadedUnit.LyuxData.Symbols[i];
+      if lyuSym.Name = '' then
+        Continue;
+      if ResolveSymbol(lyuSym.Name) <> nil then
+        Continue;
+
+      case lyuSym.Kind of
+        lskFn, lskExternFn:
+        begin
+          ParseLyuxTypeInfo(lyuSym.TypeInfo, retType, paramTypes, paramCount);
+          sym := TSymbol.Create(lyuSym.Name);
+          sym.Kind := symFunc;
+          sym.DeclType := retType;
+          sym.IsImported := True;
+          sym.IsExtern := (lyuSym.Kind = lskExternFn);
+          sym.ParamCount := paramCount;
+          SetLength(sym.ParamTypes, paramCount);
+          for j := 0 to paramCount - 1 do
+            sym.ParamTypes[j] := paramTypes[j];
+          AddSymbolToCurrent(sym, Default(TSourceSpan));
+        end;
+        lskCon:
+        begin
+          sym := TSymbol.Create(lyuSym.Name);
+          sym.Kind := symCon;
+          sym.DeclType := StrToAurumType(lyuSym.TypeInfo);
+          sym.IsImported := True;
+          AddSymbolToCurrent(sym, Default(TSourceSpan));
+        end;
+        lskVar, lskLet:
+        begin
+          sym := TSymbol.Create(lyuSym.Name);
+          sym.Kind := symVar;
+          sym.DeclType := StrToAurumType(lyuSym.TypeInfo);
+          sym.IsImported := True;
+          sym.IsGlobal := True;
+          AddSymbolToCurrent(sym, Default(TSourceSpan));
         end;
       end;
     end;
