@@ -276,6 +276,48 @@ begin
   begin
     if wk in [lfdSlider, lfdSpinBox] then
       Result := Format('    %s->setValue(%s);', [VarName, PropValue]);
+  end
+  else if PropName = 'ToolTip' then
+    Result := Format('    %s->setToolTip("%s");', [VarName, PropValue])
+  else if PropName = 'FontSize' then
+    Result := Format('    { QFont f = %s->font(); f.setPointSize(%s); %s->setFont(f); }', [VarName, PropValue, VarName])
+  else if PropName = 'FontFamily' then
+    Result := Format('    { QFont f = %s->font(); f.setFamily("%s"); %s->setFont(f); }', [VarName, PropValue, VarName])
+  else if PropName = 'Alignment' then
+    Result := Format('    %s->setAlignment(Qt::AlignmentFlag::%s);', [VarName, PropValue])
+  else if PropName = 'ReadOnly' then
+    Result := Format('    %s->setReadOnly(%s);', [VarName, PropValue])
+  else if PropName = 'MaxLength' then
+    Result := Format('    %s->setMaxLength(%s);', [VarName, PropValue])
+  else if PropName = 'Placeholder' then
+  begin
+    if wk = lfdLineEdit then
+      Result := Format('    %s->setPlaceholderText("%s");', [VarName, PropValue]);
+  end
+  else if PropName = 'RowCount' then
+  begin
+    if wk in [lfdTableWidget, lfdListWidget] then
+      Result := Format('    %s->setRowCount(%s);', [VarName, PropValue]);
+  end
+  else if PropName = 'ColumnCount' then
+  begin
+    if wk = lfdTableWidget then
+      Result := Format('    %s->setColumnCount(%s);', [VarName, PropValue]);
+  end
+  else if PropName = 'Orientation' then
+  begin
+    if wk in [lfdSlider] then
+      Result := Format('    %s->setOrientation(Qt::Orientation::%s);', [VarName, PropValue]);
+  end
+  else if PropName = 'TickPosition' then
+  begin
+    if wk = lfdSlider then
+      Result := Format('    %s->setTickPosition(QSlider::TickPosition::%s);', [VarName, PropValue]);
+  end
+  else if PropName = 'Format' then
+  begin
+    if wk = lfdProgressBar then
+      Result := Format('    %s->setFormat("%s");', [VarName, PropValue]);
   end;
 end;
 
@@ -319,6 +361,7 @@ begin
   
   Result := Result + '#include <QWidget>' + LineEnding;
   Result := Result + '#include <QLayout>' + LineEnding;
+  Result := Result + '#include <QFont>' + LineEnding;
   for i := 0 to High(UniqueKinds) do
     Result := Result + WidgetKindToInclude(UniqueKinds[i]) + LineEnding;
   Result := Result + LineEnding;
