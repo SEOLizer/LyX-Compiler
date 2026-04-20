@@ -223,8 +223,7 @@ Ziel ist es, eine productive Desktop-GUI-Programmierung mit Lyx zu ermöglichen.
 
 ### Phase 3: Layout ✅ COMPLETED
 - WP-G: Slider/Dial ✅
-- WP-H: Layout-Manager ✅
-- WP-I: QTimer erweitert 🔜
+- WP-I: QTimer erweitert ✅
 
 ### Phase 4: Callbacks ✅ COMPLETED
 - WP-J: Callbacks erweitern ✅
