@@ -7,7 +7,7 @@ interface
 
 uses
   SysUtils, Classes, 
-  bytes, diag;
+  bytes, diag, ir;
 
 type
   { Target-Architektur für .lyu }
@@ -90,8 +90,12 @@ type
   public
     constructor Create(d: TDiagnostics; arch: TLyuxArch; includeDebug: Boolean);
     destructor Destroy; override;
+    { Simple serializer (for v1 placeholder) }
     procedure Serialize(AUnitName: string; symbols: TLyuxSymbolArray;
       funcCount: Integer; out buffer: TByteBuffer);
+    { Full serializer with IR module }
+    procedure SerializeModule(IRModule: TIRModule; AUnitName: string; 
+      symbols: TLyuxSymbolArray; out buffer: TByteBuffer);
   end;
 
   { Deserializer für .lyu }
@@ -350,6 +354,112 @@ end;
 function GetCurrentArchStr: string;
 begin
   Result := 'x86_64';
+end;
+
+{ TLyuxSerializer - Full IR Serialization }
+
+procedure TLyuxSerializer.SerializeModule(IRModule: TIRModule; AUnitName: string;
+  symbols: TLyuxSymbolArray; out buffer: TByteBuffer);
+var
+  i, j: Integer;
+  nameBytes: TBytes;
+  fn: TIRFunction;
+begin
+  FStrings.Clear;
+
+  { Header }
+  for i := 0 to 3 do
+    FBuffer.WriteU8(Ord(LYU_MAGIC[i]));
+  FBuffer.WriteU16LE(LYU_VERSION);
+  FBuffer.WriteU8(Ord(FArch));
+  FBuffer.WriteU8(Byte(FIncludeDebug));
+
+  nameBytes := TEncoding.UTF8.GetBytes(AUnitName);
+  FBuffer.WriteU16LE(Length(nameBytes));
+  for i := 0 to High(nameBytes) do
+    FBuffer.WriteU8(nameBytes[i]);
+
+  FBuffer.WriteU32LE(Length(symbols));
+
+  { Placeholder für Offsets }
+  FBuffer.WriteU32LE(32);   { TypeInfoOffset - simplified: right after header }
+  FBuffer.WriteU32LE(0);   { IRCodeOffset }
+  FBuffer.WriteU32LE(0);   { DebugOffset }
+  FBuffer.WriteU32LE(0);   { Reserved }
+  FBuffer.WriteU16LE(32);  { HeaderSize }
+
+  { Symbol-Tabelle }
+  for i := 0 to High(symbols) do
+  begin
+    WriteString(symbols[i].Name);
+    FBuffer.WriteU8(Ord(symbols[i].Kind));
+    FBuffer.WriteU32LE(symbols[i].TypeHash);
+    WriteString(symbols[i].TypeInfo);
+  end;
+
+  { Type-Info Section - count only for now }
+  FBuffer.WriteU32LE(0);
+
+  { Strings Section - from IR module }
+  FBuffer.WriteU32LE(IRModule.Strings.Count);
+  for i := 0 to IRModule.Strings.Count - 1 do
+    WriteString(IRModule.Strings[i]);
+
+  { Functions Section - from IR module }
+  FBuffer.WriteU32LE(Length(IRModule.Functions));
+  for i := 0 to High(IRModule.Functions) do
+  begin
+    fn := IRModule.Functions[i];
+    WriteString(fn.Name);
+    FBuffer.WriteU16LE(fn.ParamCount);
+    FBuffer.WriteU16LE(fn.LocalCount);
+    FBuffer.WriteU8(Ord(fn.EnergyLevel));
+    
+    { Instructions }
+    FBuffer.WriteU32LE(Length(fn.Instructions));
+    for j := 0 to High(fn.Instructions) do
+    begin
+      FBuffer.WriteU16LE(Ord(fn.Instructions[j].Op));
+      FBuffer.WriteU32LE(fn.Instructions[j].Dest);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src1);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src2);
+      FBuffer.WriteU32LE(fn.Instructions[j].Src3);
+      FBuffer.WriteU64LE(fn.Instructions[j].ImmInt);
+      
+      { ImmStr as index }
+      if fn.Instructions[j].ImmStr <> '' then
+        FBuffer.WriteU32LE(GetStringIdx(fn.Instructions[j].ImmStr))
+      else
+        FBuffer.WriteU32LE($FFFFFFFF);
+        
+      { LabelName as index }
+      if fn.Instructions[j].LabelName <> '' then
+        FBuffer.WriteU32LE(GetStringIdx(fn.Instructions[j].LabelName))
+      else
+        FBuffer.WriteU32LE($FFFFFFFF);
+        
+      FBuffer.WriteU8(Ord(fn.Instructions[j].CallMode));
+    end;
+  end;
+
+  { Globals Section }
+  FBuffer.WriteU32LE(Length(IRModule.GlobalVars));
+  for i := 0 to High(IRModule.GlobalVars) do
+  begin
+    WriteString(IRModule.GlobalVars[i].Name);
+    FBuffer.WriteU64LE(IRModule.GlobalVars[i].InitValue);
+    FBuffer.WriteU8(Ord(IRModule.GlobalVars[i].HasInitValue));
+    FBuffer.WriteU8(Ord(IRModule.GlobalVars[i].IsArray));
+    if IRModule.GlobalVars[i].IsArray then
+      FBuffer.WriteU32LE(IRModule.GlobalVars[i].ArrayLen);
+  end;
+
+  { Debug Section - empty for now }
+  if FIncludeDebug then
+    FBuffer.WriteU32LE(0);
+
+  buffer := FBuffer;
+  FBuffer := nil;
 end;
 
 end.
