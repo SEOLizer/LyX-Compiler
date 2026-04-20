@@ -1320,22 +1320,83 @@ Falls die `.lyu` defekt ist, wird automatisch auf die `.lyx` Quelle zurückgegri
 ./lyxc main.lyx --std-path=/custom/path/to/std
 ```
 
-**Available Standard Library:**
-- `std.math`: Mathematical functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sign64`, `Lerp64`, `Map64`, `Sin64`, `Cos64`, `Hypot64`, `IsEven`, `IsOdd`, `NextPowerOfTwo`, etc.)
-- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `ExitProc`, `Printf` with auto-conversion)
-- `std.string`: Comprehensive string manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrToLower`, `StrToUpper`, `StrConcat`, `StrReplace`, etc.)
-- `std.env`: Environment API (`ArgCount`, `Arg`, `init`)
-- `std.time`: Date and time functions (numerical calculations, timezone support)
-- `std.geo`: Geolocation parser for Decimal Degrees, GeoPoint, Distance calculations, BoundingBox, DMS parsing
-- `std.fs`: Filesystem operations (open, read, write, close, file existence)
-- `std.crt`: ANSI Terminal Utilities (colors, cursor control)
-- `std.pack`: Binary serialization (VarInt, int/float/string packing)
+**Available Standard Library (52 units):**
+
+Core:
+- `std.system`: Builtins, Start/Exit, Panic
+- `std.env`: Environment API (`ArgCount`, `Arg`)
+- `std.os`: OS-level syscalls (`exit`, `sleep`, get/set environment variables)
+- `std.process`: Process management (fork, exec, wait)
+
+I/O:
+- `std.io`: I/O functions (`print`, `PrintLn`, `PrintIntLn`, `exit(code)`)
+- `std.fs`: Filesystem operations (open, read, write, close, exists, stat)
+- `std.crt`: ANSI Terminal (colors, cursor control)
+- `std.crt_raw`: Raw terminal mode
+
+Math & Numerics:
+- `std.math`: Math functions (`Abs64`, `Min64`, `Max64`, `Sqrt64`, `Clamp64`, `Sin64`, `Cos64`, `Hypot64`, etc.)
+- `std.vector`: 2D Vector (`Vec2`)
+- `std.vector_batch`: SIMD vector operations
+- `std.math_batch`: SIMD math operations
+- `std.stats`: Statistics (mean, variance, stddev)
+- `std.stats_batch`: Batch statistics
+- `std.geo`: Geolocation (Decimal Degrees, GeoPoint, Distance, BoundingBox)
+- `std.conv`: Type conversion (int/float to string)
+- `std.rect`: Rectangle utilities
+- `std.circle`: Circle utilities
+- `std.sort`: Sorting algorithms
+
+Strings & Text:
+- `std.string`: String manipulation (`StrLength`, `StrCharAt`, `StrFind`, `StrConcat`, etc.)
 - `std.regex`: Regex matching
-- `std.qbool`: Probabilistic Boolean Type (`QBool`, `Maybe()`, `Observe()`, `QBoolAnd`, `QBoolOr`, `QBoolNot`, Entanglement)
-- `std.vector`: 2D Vector library (`Vec2`)
+- `std.base64`: Base64 encoding/decoding
+- `std.url`: URL parsing/encoding
+- `std.html`: HTML utilities
+- `std.xml`: XML parsing
+- `std.yaml`: YAML parsing
+- `std.json`: JSON parsing
+- `std.uuid`: UUID generation
+- `std.ini`: INI file parsing
+
+Data Structures:
 - `std.list`: Collections (`StaticList8`, `StackInt64`, `QueueInt64`, `RingBufferVec2`)
-- `std.rect`: Rectangle utilities (`Rect`)
+- `std.hash`: Hash map implementation
+- `std.pack`: Binary serialization (VarInt, int/float/string packing)
+- `std.buffer`: Binary buffer operations
+- `std.alloc`: Custom memory allocator
+
+Time & Date:
+- `std.time`: Date/time functions
+- `std.datetime`: DateTime with timezone
+
+Networking:
+- (future: `std.net`, `std.http`)
+
+GUI & Graphics:
 - `std.color`: RGBA Color utilities
+- `std.x11`: X11 windowing
+- `std.qt5_core`: Qt5 Core
+- `std.qt5_gl`: Qt5 OpenGL
+- `std.qt5_glx`: Qt5 GLX
+- `std.qt5_egl`: Qt5 EGL
+- `std.qt5_app`: Qt5 Application
+- `std.lfd_parser`: LFD parser
+- `std.lfd_factory`: LFD factory
+
+Audio:
+- `std.audio`: Audio I/O
+
+Compression:
+- `std.zlib`: zlib compression
+
+Utilities:
+- `std.log`: Logging
+- `std.regex`: Regex
+- `std.country`: Country codes
+- `std.qbool`: Probabilistic Boolean (`QBool`, `Maybe()`, `Observe()`)
+- `std.error`: Error handling
+- `std.result`: Result/Either monad
 
 ### Types
 
