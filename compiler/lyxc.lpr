@@ -71,6 +71,9 @@ var
   buffer: TByteBuffer;  { For .lyu serialization }
   ser: TLyuxSerializer;  { For .lyu serialization }
   lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
+  fn: TAstFuncDecl;  { For unit compilation }
+  symIdx: Integer;  { For unit compilation }
+  unitName: string;  { For unit compilation }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
   x86Emit: TX86_64Emitter;
   hashCrc: UInt32;
@@ -89,6 +92,44 @@ var
 
 type
   TStringArray = array of string;
+
+{ Helper to convert TAurumType to string }
+function FormatType(t: TAurumType): string;
+begin
+  case t of
+    atInt8:    Result := 'int8';
+    atInt16:   Result := 'int16';
+    atInt32:   Result := 'int32';
+    atInt64:  Result := 'int64';
+    atUInt8:   Result := 'uint8';
+    atUInt16:  Result := 'uint16';
+    atUInt32:  Result := 'uint32';
+    atUInt64:  Result := 'uint64';
+    atISize:   Result := 'int';
+    atUSize:   Result := 'uint';
+    atF32:     Result := 'f32';
+    atF64:     Result := 'f64';
+    atBool:    Result := 'bool';
+    atChar:    Result := 'char';
+    atVoid:    Result := 'void';
+    atPChar:   Result := 'pchar';
+    atPCharNullable: Result := 'pchar?';
+    atDynArray: Result := 'array';
+    atArray:   Result := 'array';
+    atMap:     Result := 'Map';
+    atSet:     Result := 'Set';
+    atParallelArray: Result := 'parallel Array';
+    atFnPtr:   Result := 'fnptr';
+    else      Result := 'unknown';
+  end;
+end;
+
+{ Helper to merge IR from precompiled units - DISABLED for now }
+procedure MergePrecompiledIR(um: TUnitManager; module: TIRModule);
+begin
+  // Disabled - needs debugging
+  // The IR merging from .lyu files is not yet fully functional
+end;
 
 procedure PrintEnergyStats(const stats: TEnergyStats);
 var
@@ -656,7 +697,7 @@ begin
   if basePath = '' then
     basePath := '.';
 
-  { ====== PRECOMPILED UNIT MODE ====== }
+{ ====== PRECOMPILED UNIT MODE ====== }
   if flagCompileUnit then
   begin
     WriteLn;
@@ -671,19 +712,77 @@ begin
       else
         unitOutputFile := inputFile + '.lyu';
     end;
-
+    
     WriteLn('Ausgabe: ', unitOutputFile);
     WriteLn('Ziel:   ', ArchToStr(unitTargetArch));
     if flagDebugSymbols then
       WriteLn('Debug-Symbole: aktiviert');
     WriteLn;
     
-    { Placeholder: Create empty .lyu file for now }
+    // Phase 1: Parse die .lyx Datei
+    src := TStringList.Create;
+    d := TDiagnostics.Create;
+    try
+      src.LoadFromFile(inputFile);
+      lx := TLexer.Create(src.Text, inputFile, d);
+      try
+        p := TParser.Create(lx, d);
+        try
+          prog := p.ParseProgram;
+        finally
+          p.Free;
+        end;
+      finally
+        lx.Free;
+      end;
+      
+      if d.HasErrors then
+      begin
+        d.PrintAll;
+        Halt(1);
+      end;
+      
+      // Phase 2: Extrahiere alle pub fn Symbole
+      if Assigned(prog) and Assigned(prog.Decls) then
+      begin
+        for i := 0 to High(prog.Decls) do
+        begin
+          if prog.Decls[i] is TAstFuncDecl then
+          begin
+            fn := TAstFuncDecl(prog.Decls[i]);
+            if fn.IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := fn.Name;
+              lyuSymbols[symIdx].Kind := lskFn;
+              // TypeHash: simple hash of return type
+              lyuSymbols[symIdx].TypeHash := UInt32(Ord(fn.ReturnType));
+              // TypeInfo: return type as string
+              lyuSymbols[symIdx].TypeInfo := FormatType(fn.ReturnType);
+              WriteLn('  Exportiere: pub fn ', fn.Name, ' -> ', lyuSymbols[symIdx].TypeInfo);
+            end;
+          end;
+        end;
+      end;
+      
+      WriteLn;
+      WriteLn('Gefundene Symbole: ', Length(lyuSymbols));
+      
+    finally
+      d.Free;
+      src.Free;
+      if Assigned(prog) then prog.Free;
+    end;
+    
+    // Phase 3: Serialize to .lyu
     buffer := TByteBuffer.Create;
     ser := TLyuxSerializer.Create(nil, unitTargetArch, flagDebugSymbols);
     try
-      SetLength(lyuSymbols, 0);
-      ser.Serialize(ExtractFileName(inputFile), lyuSymbols, 0, buffer);
+      unitName := ExtractFileName(inputFile);
+      if RightStr(unitName, 4) = '.lyx' then
+        unitName := Copy(unitName, 1, Length(unitName) - 4);
+      ser.Serialize(unitName, lyuSymbols, Length(lyuSymbols), buffer);
       try
         buffer.SaveToFile(unitOutputFile);
       finally
@@ -695,6 +794,7 @@ begin
     
     WriteLn;
     WriteLn('Erfolgreich kompiliert: ', unitOutputFile);
+    WriteLn('Symbol-Count: ', Length(lyuSymbols));
     Halt(0);
   end;
 
@@ -808,6 +908,8 @@ begin
         try
           // First, register constants from imported units so they're available during lowering
           lower.LowerImportedUnits(um);
+          // Merge IR from precompiled units (.lyu) - simple version
+          MergePrecompiledIR(um, module);
           // Then lower the main program
           lower.Lower(prog);
 
