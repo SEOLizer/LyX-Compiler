@@ -162,29 +162,38 @@ private slots:
 
 > **Ziel**: AST → C++/Qt Quellcode generieren
 
-- [ ] **Header-Generator**: Klassendefinitionen
-  - [ ] Form-Klasse (erbt von QWidget)
-  - [ ] Widget-Member-Variablen
-  - [ ] Slot-Deklarationen für Signal-Handler
-  - `Q_OBJECT` Makro
+- [x] **Header-Generator**: Klassendefinitionen
+  - [x] Form-Klasse (erbt von QWidget)
+  - [x] Widget-Member-Variablen
+  - [x] Slot-Deklarationen für Signal-Handler
+  - [x] `Q_OBJECT` Makro
 
-- [ ] **Source-Generator**: Implementierung
-  - [ ] Konstruktor mit Layout-Aufbau
-  - [ ] Widget-Instanziierung
-  - [ ] Layout-Setup (addWidget, addLayout)
-  - [ ] Signal-Slot-Verbindungen (connect)
+- [x] **Source-Generator**: Implementierung
+  - [x] Konstruktor mit Layout-Aufbau
+  - [x] Widget-Instanziierung
+  - [x] Layout-Setup (addWidget, addLayout)
+  - [x] Signal-Slot-Verbindungen (connect)
 
-- [ ] **Includes-Management**
-  - [ ] `#include <QWidget>` etc.
-  - [ ] `#include "ui_formname.h"`
-  - [ ] Forward Declarations
+- [x] **Includes-Management**
+  - [x] `#include <QWidget>` etc.
+  - [x] `#include "ui_formname.h"`
+  - [x] Automatische Include-Deduplizierung
 
-- [ ] **Naming-Convention**
-  - [ ] `FormName` → `class FormName : public QWidget`
-  - `btnOk` → `QPushButton* btnOk`
-  - `lblTitle` → `QLabel* lblTitle`
+- [x] **Naming-Convention**
+  - [x] `FormName` → `class FormName : public QWidget`
+  - [x] `btnOk` → `QPushButton* btnOk`
+  - [x] `lblTitle` → `QLabel* lblTitle`
 
-**Deliverable**: `ir/lfd_codegen.pas`
+- [x] **Property-Support**
+  - [x] Text, Placeholder, Enabled, Visible
+  - [x] Checked (CheckBox, RadioButton)
+  - [x] Title (GroupBox)
+  - [x] ObjectName, Style
+  - [x] Minimum, Maximum, Value (Slider, SpinBox)
+
+**Status**: ✓ Abgeschlossen
+
+**Deliverable**: `compiler/ir/lfd_codegen.pas`
 
 ---
 
