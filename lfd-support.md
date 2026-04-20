@@ -84,21 +84,21 @@ Form MainWindow "Hauptfenster" {
 
 > **Ziel**: Grammatik und Parser für LFD definieren und implementieren
 
-- [ ] **Syntax-Definition**: Formale EBNF für das LFD-Format
-  - [ ] Objekt-Blöcke (Form, Widget-Definitionen)
-  - [ ] Properties (Text, Align, Style, etc.)
-  - [ ] Layout-Direktiven (Vertical, Horizontal, Grid)
-  - [ ] Verschachtelung von Widgets
+- [x] **Syntax-Definition**: Formale EBNF für das LFD-Format
+  - [x] Objekt-Blöcke (Form, Widget-Definitionen)
+  - [x] Properties (Text, Align, Style, etc.)
+  - [x] Layout-Direktiven (Vertical, Horizontal, Grid)
+  - [x] Verschachtelung von Widgets
 
-- [ ] **Lexer/Parser**: Implementierung eines LFD-Parsers
-  - [ ] Token-Erkennung (OBJ, PROPERTY, LAYOUT, etc.)
-  - [ ] Hierarchie-Parsing ( nesting )
-  - [ ] Fehlerbehandlung bei ungültiger Syntax
+- [x] **Lexer/Parser**: Implementierung eines LFD-Parsers
+  - [x] Token-Erkennung (OBJ, PROPERTY, LAYOUT, etc.)
+  - [x] Hierarchie-Parsing ( nesting )
+  - [x] Fehlerbehandlung bei ungültiger Syntax
 
-- [ ] **Factory-Pattern**: Mapping von String-Namen auf Qt-Klassen
-  - [ ] Registry für Widget-Typen (QPushButton → QAbstractButton)
-  - [ ] Property-Mapping (Text → setText, Enabled → setEnabled)
-  - [ ] Builder-Methode für jeden Widget-Typ
+- [x] **Factory-Pattern**: Mapping von String-Namen auf Qt-Klassen
+  - [x] Registry für Widget-Typen (QPushButton → QAbstractButton)
+  - [x] Property-Mapping (Text → setText, Enabled → setEnabled)
+  - [x] Builder-Methode für jeden Widget-Typ
 
 **Deliverable**: `std/lfd_parser.lyx` (oder C++ Parser in lyxkernel)
 
