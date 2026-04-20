@@ -1,0 +1,452 @@
+// std.lfd_parser - LFD Parser
+//
+// Parses LFD (LyX Form Description) format into an AST.
+// Based on: lfd-ebnf.md
+
+unit std.lfd_parser;
+
+import std;
+import std.io;
+
+// ============================================================================
+// Token Types
+// ============================================================================
+
+pub type LFDTokenKind = (
+    tkForm,
+    tkLayout,
+    tkVertical,
+    tkHorizontal,
+    tkGrid,
+    tkStack,
+    tkButton,
+    tkLabel,
+    tkInput,
+    tkCheckbox,
+    tkRadioButton,
+    tkComboBox,
+    tkSpinBox,
+    tkSlider,
+    tkListBox,
+    tkTextEdit,
+    tkProgressBar,
+    tkGroupBox,
+    tkTabWidget,
+    tkSplitter,
+    tkImage,
+    tkCustom,
+    // Properties
+    tkText,
+    tkToolTip,
+    tkEnabled,
+    tkVisible,
+    tkWidth,
+    tkHeight,
+    tkMinWidth,
+    tkMinHeight,
+    tkMaxWidth,
+    tkMaxHeight,
+    tkAlign,
+    tkStyle,
+    tkPlaceholder,
+    tkMaxLength,
+    tkEchoMode,
+    tkMin,
+    tkMax,
+    tkValue,
+    tkStep,
+    tkItems,
+    tkEditable,
+    tkDefault,
+    tkFlat,
+    tkIcon,
+    // Events
+    tkOnClick,
+    tkOnChange,
+    tkOnSelect,
+    tkOnDoubleClick,
+    tkOnFocusIn,
+    tkOnFocusOut,
+    tkOnHover,
+    // Values
+    tkTrue,
+    tkFalse,
+    tkIdentifier,
+    tkString,
+    tkNumber,
+    tkLBrace,
+    tkRBrace,
+    tkColon,
+    tkNewline,
+    tkEOF,
+    tkInvalid
+);
+
+// ============================================================================
+// AST Nodes
+// ============================================================================
+
+pub type LFDNodeKind = (
+    lfdRoot,
+    lfdForm,
+    lfdLayout,
+    lfdWidget,
+    lfdProperty,
+    lfdEvent
+);
+
+pub type LFDNode = struct {
+    kind: LFDNodeKind;
+    name: pchar;
+    value: pchar;
+    intValue: int64;
+    children: int64;  // Pointer to child nodes array
+    childCount: int64;
+    line: int64;
+    col: int64;
+};
+
+pub type LFDForm = struct {
+    name: pchar;
+    title: pchar;
+    body: int64;  // Pointer to layout node
+};
+
+pub type LFDLayout = struct {
+    layoutType: pchar;  // "Vertical", "Horizontal", "Grid"
+    widgets: int64;    // Pointer to widget array
+    widgetCount: int64;
+};
+
+pub type LFDWidget = struct {
+    widgetType: pchar;  // "Button", "Label", etc.
+    instanceName: pchar;
+    properties: int64; // Pointer to property array
+    propCount: int64;
+    children: int64;   // For nested widgets
+    childCount: int64;
+};
+
+pub type LFDProperty = struct {
+    name: pchar;
+    value: pchar;
+    intValue: int64;
+    boolValue: bool;
+};
+
+// ============================================================================
+// Parser State
+// ============================================================================
+
+pub type LFDParser = struct {
+    source: pchar;
+    sourceLen: int64;
+    pos: int64;
+    line: int64;
+    col: int64;
+    errorCount: int64;
+    errorMsg: pchar;
+    nodes: int64;      // allocated AST nodes
+    nodeCount: int64;
+    nodeCapacity: int64;
+};
+
+// ============================================================================
+// Lexer Functions
+// ============================================================================
+
+fn isAlpha(c: int64): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+fn isDigit(c: int64): bool {
+    return c >= '0' && c <= '9';
+}
+
+fn isAlphaNum(c: int64): bool {
+    return isAlpha(c) || isDigit(c);
+}
+
+fn isWhitespace(c: int64): bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+fn consumeWhitespace(parser: int64): void {
+    var c: int64 := 0;
+    while (true) {
+        c := peek8(parser + 12 + parser:pos);
+        if (!isWhitespace(c)) { break; }
+        if (c == '\n') {
+            // newline - increment line count
+        }
+        parser:pos := parser:pos + 1;
+        if (parser:pos >= parser:sourceLen) { break; }
+    }
+}
+
+fn readIdentifier(parser: int64): pchar {
+    var startPos: int64 := parser:pos;
+    var c: int64 := 0;
+    
+    // First char must be alpha
+    c := peek8(parser + 12 + startPos);
+    if (!isAlpha(c)) { return ""; }
+    
+    // Read alpha-numeric sequence
+    var pos: int64 := startPos + 1;
+    while (pos < parser:sourceLen) {
+        c := peek8(parser + 12 + pos);
+        if (!isAlphaNum(c)) { break; }
+        pos := pos + 1;
+    }
+    
+    // Extract the identifier
+    var len: int64 := pos - startPos;
+    if (len == 0) { return ""; }
+    
+    var result: pchar := "";
+    var i: int64 := 0;
+    while (i < len) {
+        result := result + chr(peek8(parser + 12 + startPos + i));
+        i := i + 1;
+    }
+    
+    parser:pos := pos;
+    return result;
+}
+
+fn readString(parser: int64): pchar {
+    // Assumes opening quote already consumed
+    var startPos: int64 := parser:pos;
+    var c: int64 := 0;
+    var result: pchar := "";
+    
+    while (parser:pos < parser:sourceLen) {
+        c := peek8(parser + 12 + parser:pos);
+        parser:pos := parser:pos + 1;
+        
+        if (c == '"') { break; }
+        if (c == '\\') {
+            // Handle escape sequences
+            var next: int64 := peek8(parser + 12 + parser:pos);
+            if (next == 'n') {
+                result := result + chr(10);
+                parser:pos := parser:pos + 1;
+            } else if (next == 't') {
+                result := result + chr(9);
+                parser:pos := parser:pos + 1;
+            } else if (next == '"') {
+                result := result + '"';
+                parser:pos := parser:pos + 1;
+            }
+        } else {
+            result := result + chr(c);
+        }
+    }
+    
+    return result;
+}
+
+fn readNumber(parser: int64): int64 {
+    var c: int64 := 0;
+    var result: int64 := 0;
+    var hasDecimal: bool := false;
+    
+    while (parser:pos < parser:sourceLen) {
+        c := peek8(parser + 12 + parser:pos);
+        if (c >= '0' && c <= '9') {
+            result := result * 10 + (c - '0');
+            parser:pos := parser:pos + 1;
+        } else if (c == '.' && !hasDecimal) {
+            hasDecimal := true;
+            parser:pos := parser:pos + 1;
+        } else {
+            break;
+        }
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// Token Lookup
+// ============================================================================
+
+fn keywordToToken(keyword: pchar): LFDTokenKind {
+    if (keyword == "Form") { return tkForm; }
+    if (keyword == "Layout") { return tkLayout; }
+    if (keyword == "Vertical") { return tkVertical; }
+    if (keyword == "Horizontal") { return tkHorizontal; }
+    if (keyword == "Grid") { return tkGrid; }
+    if (keyword == "Stack") { return tkStack; }
+    
+    if (keyword == "Button") { return tkButton; }
+    if (keyword == "Label") { return tkLabel; }
+    if (keyword == "Input") { return tkInput; }
+    if (keyword == "Checkbox") { return tkCheckbox; }
+    if (keyword == "RadioButton") { return tkRadioButton; }
+    if (keyword == "ComboBox") { return tkComboBox; }
+    if (keyword == "SpinBox") { return tkSpinBox; }
+    if (keyword == "Slider") { return tkSlider; }
+    if (keyword == "ListBox") { return tkListBox; }
+    if (keyword == "TextEdit") { return tkTextEdit; }
+    if (keyword == "ProgressBar") { return tkProgressBar; }
+    if (keyword == "GroupBox") { return tkGroupBox; }
+    if (keyword == "TabWidget") { return tkTabWidget; }
+    if (keyword == "Splitter") { return tkSplitter; }
+    if (keyword == "Image") { return tkImage; }
+    if (keyword == "Custom") { return tkCustom; }
+    
+    if (keyword == "Text") { return tkText; }
+    if (keyword == "ToolTip") { return tkToolTip; }
+    if (keyword == "Enabled") { return tkEnabled; }
+    if (keyword == "Visible") { return tkVisible; }
+    if (keyword == "OnClick") { return tkOnClick; }
+    if (keyword == "OnChange") { return tkOnChange; }
+    
+    if (keyword == "true") { return tkTrue; }
+    if (keyword == "false") { return tkFalse; }
+    
+    return tkIdentifier;
+}
+
+// ============================================================================
+// Parser Functions
+// ============================================================================
+
+fn newLFDParser(sourceText: pchar): LFDParser {
+    var parser: LFDParser;
+    parser.source := sourceText;
+    
+    var len: int64 := 0;
+    if (sourceText != 0) {
+        while (peek8(sourceText + len) != 0) { len := len + 1; }
+    }
+    parser.sourceLen := len;
+    parser.pos := 0;
+    parser.line := 1;
+    parser.col := 1;
+    parser.errorCount := 0;
+    parser.errorMsg := "";
+    parser.nodeCount := 0;
+    parser.nodeCapacity := 256;
+    
+    // Allocate initial node pool
+    if (parser.nodeCapacity > 0) {
+        parser.nodes := mmap(0, parser.nodeCapacity * 144, 3, 34, -1, 0);
+    }
+    
+    return parser;
+}
+
+fn parseLFD(parser: int64): LFDNode {
+    // Root node will hold the form
+    var ast: LFDNode;
+    ast.kind := lfdRoot;
+    ast.line := 1;
+    
+    // Skip whitespace
+    consumeWhitespace(parser);
+    
+    // Check for Format header
+    var formatTok: pchar := readIdentifier(parser);
+    if (formatTok == "Format") {
+        // Consume the colon and string
+        var c: int64 := peek8(parser + 12 + parser:pos);
+        if (c == ':') {
+            parser:pos := parser:pos + 1;
+            consumeWhitespace(parser);
+            var version: pchar := readString(parser);
+            // Version string - can be ignored for now
+        }
+        consumeWhitespace(parser);
+    }
+    
+    // Expect "Form" keyword
+    var formTok: pchar := readIdentifier(parser);
+    if (formTok != "Form") {
+        parser:errorMsg := "Expected 'Form' keyword";
+        parser:errorCount := parser:errorCount + 1;
+        return ast;
+    }
+    
+    // Read form name
+    consumeWhitespace(parser);
+    var formName: pchar := readIdentifier(parser);
+    if (formName == "") {
+        parser:errorMsg := "Invalid form name";
+        parser:errorCount := parser:errorCount + 1;
+        return ast;
+    }
+    
+    // Read title string
+    consumeWhitespace(parser);
+    var title: pchar := readString(parser);
+    
+    // Expect opening brace
+    c := peek8(parser + 12 + parser:pos);
+    if (c != '{') {
+        parser:errorMsg := "Expected '{' after Form declaration";
+        parser:errorCount := parser:errorCount + 1;
+        return ast;
+    }
+    parser:pos := parser:pos + 1;
+    
+    // Create form node
+    ast.kind := lfdForm;
+    ast.name := formName;
+    ast.value := title;
+    ast.children := parser:pos;  // Store current pos as reference
+    
+    // Parse the layout block (placeholder - simplified)
+    var layoutNode: LFDNode;
+    layoutNode.kind := lfdLayout;
+    layoutNode.name := "root";
+    layoutNode.value := "Vertical";
+    ast.children := 0;  // Will point to layout
+    
+    return ast;
+}
+
+fn validateLFD(parser: int64): bool {
+    parseLFD(parser);
+    return parser:errorCount == 0;
+}
+
+fn getLastError(parser: int64): pchar {
+    return parser:errorMsg;
+}
+
+fn getErrorCount(parser: int64): int64 {
+    return parser:errorCount;
+}
+
+// ============================================================================
+// Example Usage
+// ============================================================================
+
+pub fn main(): int64 {
+    var source: pchar := 
+`Form ConfigDialog "Konfiguration" {
+    Layout Vertical {
+        Label lblTitle {
+            Text: "Einstellungen"
+        }
+        Button btnOk {
+            Text: "OK"
+            OnClick: "save-config"
+        }
+    }
+}`;
+    
+    var parser: LFDParser := newLFDParser(source);
+    
+    if (validateLFD(parser)) {
+        PrintStr("LFD parsing successful!");
+    } else {
+        PrintStr("Error: ");
+        PrintStr(getLastError(parser));
+    }
+    
+    return getErrorCount(parser);
+}
