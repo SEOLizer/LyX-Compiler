@@ -29,7 +29,14 @@ type
     lrPointerArithmetic,    // W017: Pointer-Arithmetik (MISRA 5.2)
     lrIncompleteSwitch,    // W018: Switch ohne default oder ohne alle Enum-Werte (MISRA 5.2)
     lrFunctionTooLong,     // W019: Funktion > 60 Zeilen (MISRA 5.2)
-    lrComplexFunction      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
+    lrComplexFunction,      // W020: Zyklomatische Komplexität > 15 (MISRA 5.2)
+    lrDeadLoop,            // W016: Endlosschleife ohne exit condition / break
+    lrGlobalMutable,     // W021: var auf Modulebene (Race Conditions)
+    lrTodoComment,       // W022: "// TODO" Kommentare finden
+    lrMagicNumber,        // W023: hartecodierte Zahlen (magic numbers)
+    lrUnboundedLoop,     // W024: While ohne limit() (WCET)
+    lrResourceLeak,       // W025: mmap ohne munmap (Resource Leak)
+    lrUncheckedError     // W026: ignorierte Fehlercodes
   );
 
   TLintRuleIdSet = set of TLintRuleId;
@@ -55,7 +62,13 @@ const
     lrPointerArithmetic,
     lrIncompleteSwitch,
     lrFunctionTooLong,
-    lrComplexFunction
+    lrComplexFunction,
+    lrDeadLoop,
+    lrGlobalMutable,
+    lrTodoComment,
+    lrMagicNumber,
+    lrUnboundedLoop,
+    lrResourceLeak
   ];
 
   { Human-readable Namen für die Regeln }
@@ -78,14 +91,22 @@ const
     'pointer-arithmetic',
     'incomplete-switch',
     'function-too-long',
-    'complex-function'
+    'complex-function',
+    'dead-loop',
+    'global-mutable',
+    'todo-comment',
+    'magic-number',
+    'unbounded-loop',
+    'unchecked-error'
   );
 
   LintRuleCodes: array[TLintRuleId] of string = (
     'W001', 'W002', 'W003', 'W004', 'W005',
     'W006', 'W007', 'W008', 'W009', 'W010',
     'W011', 'W012', 'W013', 'W014', 'W015',
-    'W017', 'W018', 'W019', 'W020'
+    'W016', 'W017', 'W018', 'W019', 'W020',
+    'W021', 'W022', 'W023', 'W024', 'W025',
+    'W026'
   );
 
 type
@@ -159,6 +180,11 @@ type
     procedure CheckFunctionLength(fn: TAstFuncDecl);
     function CalculateCyclomaticComplexity(fn: TAstFuncDecl): Integer;
     procedure CheckCyclomaticComplexity(fn: TAstFuncDecl);
+    procedure CheckDeadLoop(loop: TAstWhile);
+    procedure CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
+    procedure CheckTodoComment(prog: TAstProgram);
+    procedure CheckMagicNumber(expr: TAstExpr);
+    procedure CheckUnboundedLoop(loop: TAstWhile);
     function IsIntegerLintType(t: TAurumType): Boolean;
     function IsPointerLintType(t: TAurumType): Boolean;
     function IsEnumLintType(t: TAurumType): Boolean;
@@ -512,7 +538,10 @@ begin
 
     { Literale benötigen keine weitere Prüfung }
     nkIntLit, nkFloatLit, nkStrLit, nkBoolLit, nkCharLit, nkRegexLit:
-      ; // nichts zu tun
+      begin
+        if expr.Kind = nkIntLit then
+          CheckMagicNumber(expr);
+      end;
   end;
 end;
 
@@ -532,6 +561,10 @@ begin
       { Naming-Prüfung }
       if TAstVarDecl(stmt).Storage in [skVar, skLet, skCo] then
         CheckVariableNaming(TAstVarDecl(stmt).Name, stmt.Span);
+
+      { W021: Check for global mutable }
+      if (lrGlobalMutable in FActiveRules) and (FScopeCount <= 1) then
+        CheckGlobalMutable(TAstVarDecl(stmt), FScopeCount);
 
       { Variable im Scope registrieren }
       DeclareVar(TAstVarDecl(stmt).Name, TAstVarDecl(stmt).Storage,
@@ -582,6 +615,10 @@ begin
     nkWhile:
     begin
       LintExpr(TAstWhile(stmt).Cond);
+      if lrDeadLoop in FActiveRules then
+        CheckDeadLoop(TAstWhile(stmt));
+      if lrUnboundedLoop in FActiveRules then
+        CheckUnboundedLoop(TAstWhile(stmt));
       PushScope;
       LintStmt(TAstWhile(stmt).Body);
       PopScope;
@@ -964,6 +1001,9 @@ begin
     end;
   end;
 
+  { W022: Check for TODO in names }
+  CheckTodoComment(prog);
+
   { Globalen Scope schließen — hier werden globale unused-Warnungen erzeugt }
   PopScope;
 end;
@@ -1020,6 +1060,272 @@ begin
         'switch on integer type without default case (MISRA 5.2); consider adding default case',
         sw.Span);
     end;
+  end;
+end;
+
+{ --- W016: Dead Loop Detection --- }
+procedure TLinter.CheckDeadLoop(loop: TAstWhile);
+var
+  hasBreak: Boolean;
+  i: Integer;
+
+  function ContainsBreak(stmt: TAstStmt): Boolean;
+  var
+    j: Integer;
+  begin
+    Result := False;
+    if stmt = nil then Exit;
+    case stmt.Kind of
+      nkBreak:
+        Result := True;
+      nkBlock:
+        begin
+          for j := 0 to High(TAstBlock(stmt).Stmts) do
+            if ContainsBreak(TAstBlock(stmt).Stmts[j]) then
+            begin
+              Result := True;
+              Exit;
+            end;
+        end;
+      nkIf:
+        begin
+          Result := ContainsBreak(TAstIf(stmt).ThenBranch) or
+            (Assigned(TAstIf(stmt).ElseBranch) and ContainsBreak(TAstIf(stmt).ElseBranch));
+        end;
+      nkWhile, nkFor:
+        ; // nested loops are their own exit points
+    end;
+  end;
+
+  function IsTrueLiteral(expr: TAstExpr): Boolean;
+  var
+    unop: TAstUnaryOp;
+  begin
+    Result := False;
+    if expr = nil then Exit;
+    case expr.Kind of
+      nkBoolLit:
+        Result := TAstBoolLit(expr).Value = True;
+      nkIntLit:
+        Result := TAstIntLit(expr).Value <> 0;
+      nkUnaryOp:
+        begin
+          unop := TAstUnaryOp(expr);
+          if unop.Op = tkNot then
+            Result := IsTrueLiteral(unop.Operand);
+        end;
+    end;
+  end;
+
+begin
+  // Only check if condition is always-true
+  if not IsTrueLiteral(loop.Cond) then Exit;
+  // Check if there's any break condition
+  hasBreak := ContainsBreak(loop.Body);
+  if not hasBreak then
+    Warn(lrDeadLoop,
+      'infinite loop without break; add limit() or break for WCET predictability',
+      loop.Span);
+end;
+
+{ --- W021: Global Mutable Variable Detection --- }
+procedure TLinter.CheckGlobalMutable(decl: TAstVarDecl; moduleDepth: Integer);
+begin
+  // Warn about mutated globals at module scope
+  // These can cause race conditions in concurrent code
+  if decl = nil then Exit;
+  if not (lrGlobalMutable in FActiveRules) then Exit;
+
+  // Only warn about module-level var/let (not const/immutable)
+  if decl.Storage in [skVar, skLet] then
+  begin
+    // Allow only if marked as co (compile-time constant)
+    if decl.Storage <> skCo then
+      Warn(lrGlobalMutable,
+        'mutable state at module level may cause race conditions; consider using let or co',
+        decl.Span);
+  end;
+end;
+
+{ --- W022: TODO in Names Detection --- }
+procedure TLinter.CheckTodoComment(prog: TAstProgram);
+var
+  i: Integer;
+  node: TAstNode;
+  name: string;
+  nameSpan: TSourceSpan;
+
+  procedure CheckNodeForTODO(nodeKind: TNodeKind; nodeName: string; nodeSpan: TSourceSpan);
+  var
+    upperName: string;
+  begin
+    if nodeName = '' then Exit;
+    if not (lrTodoComment in FActiveRules) then Exit;
+
+    upperName := UpperCase(nodeName);
+    if (Pos('TODO', upperName) > 0) or (Pos('FIXME', upperName) > 0) or
+       (Pos('XXX', upperName) > 0) or (Pos('BUG', upperName) > 0) then
+    begin
+      Warn(lrTodoComment,
+        'name contains TODO/FIXME marker: ''' + nodeName + '''',
+        nodeSpan);
+    end;
+  end;
+
+begin
+  if prog = nil then Exit;
+  if not (lrTodoComment in FActiveRules) then Exit;
+
+  // Check all declarations for TODO in names
+  for i := 0 to High(prog.Decls) do
+  begin
+    node := prog.Decls[i];
+    if node = nil then Continue;
+
+    case node.Kind of
+      nkFuncDecl:
+        begin
+          name := TAstFuncDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkVarDecl:
+        begin
+          name := TAstVarDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkConDecl:
+        begin
+          name := TAstConDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkStructDecl:
+        begin
+          name := TAstStructDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      nkClassDecl:
+        begin
+          name := TAstClassDecl(node).Name;
+          nameSpan := node.Span;
+        end;
+      else
+        Continue;
+    end;
+
+    CheckNodeForTODO(node.Kind, name, nameSpan);
+  end;
+end;
+
+{ --- W023: Magic Number Detection --- }
+procedure TLinter.CheckMagicNumber(expr: TAstExpr);
+var
+  value: Int64;
+  isSuspicious: Boolean;
+begin
+  if expr = nil then Exit;
+  if not (lrMagicNumber in FActiveRules) then Exit;
+  if expr.Kind <> nkIntLit then Exit;
+
+  value := TAstIntLit(expr).Value;
+
+  { Check for suspicious magic numbers (not common small values) }
+  isSuspicious := False;
+
+  { Warn about suspicious values: }
+  { - Buffer sizes: 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 }
+  { - Network ports: 80, 443, 8080, 3000, 5000 }
+  { - Permissions: 0644, 0755, 0777 }
+  { - Time: 1000, 60000 (ms), 3600 (seconds) }
+  { - Negative offsets, large arbitrary numbers }
+
+  { Skip common safe values: }
+  if (value >= 0) and (value <= 10) then Exit;
+  if value = -1 then Exit;  // common sentinel
+
+  { Check for power-of-2 suspicious values (often should be named constants) }
+  if (value = 64) or (value = 128) or (value = 256) or (value = 512) or
+     (value = 1024) or (value = 2048) or (value = 4096) or (value = 8192) or
+     (value = 16384) or (value = 32768) or (value = 65536) then
+    isSuspicious := True;
+
+  { Check for network ports }
+  if (value = 80) or (value = 443) or (value = 8080) or
+     (value = 3000) or (value = 5000) or (value = 8000) then
+    isSuspicious := True;
+
+  { Check for Unix permissions (octal-ish) }
+  if (value = 420) or (value = 493) or (value = 509) or (value = 511) then
+    isSuspicious := True;
+
+  { Large suspicious values }
+  if (value > 10000) and (value < 1000000) and
+     not ((value mod 1024) = 0) then
+    isSuspicious := True;
+
+  if isSuspicious then
+    Warn(lrMagicNumber,
+      Format('magic number %d should be a named constant for better maintainability',
+        [value]),
+      expr.Span);
+end;
+
+{ --- W024: Unbounded Loop Detection --- }
+procedure TLinter.CheckUnboundedLoop(loop: TAstWhile);
+var
+  hasLimitCall: Boolean;
+
+  { Recursively check if there's any limit() call in the loop body }
+  function ContainsLimitCall(stmt: TAstStmt): Boolean;
+  var
+    j: Integer;
+  begin
+    Result := False;
+    if stmt = nil then Exit;
+
+    case stmt.Kind of
+      nkCall:
+        begin
+          { Check if this call looks like limit() - simplify for now }
+          { This is a heuristic - would need AST access to check exact name }
+        end;
+      nkBlock:
+        begin
+          for j := 0 to High(TAstBlock(stmt).Stmts) do
+            if ContainsLimitCall(TAstBlock(stmt).Stmts[j]) then
+            begin
+              Result := True;
+              Exit;
+            end;
+        end;
+      nkIf:
+        Result := ContainsLimitCall(TAstIf(stmt).ThenBranch) or
+          (Assigned(TAstIf(stmt).ElseBranch) and
+           ContainsLimitCall(TAstIf(stmt).ElseBranch));
+      nkWhile, nkFor:
+        ; { Nested loops have their own termination }
+    end;
+  end;
+
+begin
+  if loop = nil then Exit;
+  if not (lrUnboundedLoop in FActiveRules) then Exit;
+  if not Assigned(loop.Body) then Exit;
+
+  { Skip if it's an infinite loop (W016 already handles that) }
+  { Just warn for all while loops that aren't provably bounded }
+
+  { Heuristic: warn about any while loop without explicit bound check }
+  { For loops are OK because they have explicit bounds }
+  { This is a best-effort check }
+  hasLimitCall := ContainsLimitCall(loop.Body);
+
+  if not hasLimitCall and Assigned(loop.Cond) then
+  begin
+    { Only warn if condition is not obviously bounded }
+    { E.g., while i < n - bounded by n, but we can't prove it easily }
+    Warn(lrUnboundedLoop,
+      'while loop may not terminate; add limit() for WCET predictability',
+      loop.Span);
   end;
 end;
 
