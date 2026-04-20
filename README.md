@@ -983,19 +983,30 @@ Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.
 Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
 
 Optionen:
-  -o <datei>       Ausgabedatei (Standard: a.out bzw. a.exe)
-  -I <pfad>        Include-Pfad für Module hinzufügen (mehrfach verwendbar)
-  --std-path=PATH  Pfad zur Standardbibliothek überschreiben
-  --target=TARGET  Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32)
-  --arch=ARCH      Architektur (x86_64, arm64, xtensa)
+  -o <datei>          Ausgabedatei (Standard: a.out bzw. a.exe)
+  -I <pfad>         Include-Pfad für Module hinzufügen (mehrfach verwendbar)
+  --std-path=PATH     Pfad zur Standardbibliothek überschreiben
+  --target=TARGET    Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32, riscv)
+  --arch=ARCH       Architektur (x86_64, arm64, xtensa, riscv)
   --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
-  --emit-asm       IR als Pseudo-Assembler ausgeben
+  --emit-asm        IR als Pseudo-Assembler ausgeben
+  --asm-listing    Assembly-Listing mit Source-Zeilen (DO-178C 6.1)
   --dump-relocs    Relocations und externe Symbole anzeigen
-  --trace-imports  Import-Auflösung debuggen
-  --lint           Linter-Warnungen aktivieren
-  --lint-only      Nur linten, nicht kompilieren
-  --no-lint        Linter-Warnungen deaktivieren
-  --no-opt         IR-Optimierungen deaktivieren (Standard: aktiv)
+  --trace-imports Import-Auflösung debuggen
+  --lint              Linter-Warnungen aktivieren
+  --lint-only         Nur linten, nicht kompilieren
+  --no-lint          Linter-Warnungen deaktivieren
+  --no-opt           IR-Optimierungen deaktivieren (Standard: aktiv)
+  --mcdc            MC/DC-Instrumentierung für DO-178C Coverage
+  --mcdc-report     MC/DC-Coverage-Bericht nach Kompilierung
+  --static-analysis   Statische Analyse (Data-Flow, Live-Vars, Stack, Null-Ptr)
+  --call-graph     Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)
+  --map-file       Speicherlayout-Datei (.map) für Debug/Audit
+
+TOR-Optionen (DO-178C Tool Qualification):
+  --version        Versionsnummer ausgeben (TOR-001)
+  --build-info     Build-Identifikation ausgeben (TOR-002)
+  --config        Aktive Konfiguration ausgeben (TOR-003)
 ```
 
 **Linter Rules (13 total):**
@@ -1281,6 +1292,29 @@ The compiler searches for the standard library in this order:
 4. Fallback: `./std/`
 
 Override with `--std-path`:
+
+```bash
+./lyxc main.lyx --std-path=/custom/path/to/std
+```
+
+### Precompiled Units (`.lyu`)
+
+Lyx unterstützt vorkompilierte Units (`.lyu`) für schnellere Kompilierung:
+
+```bash
+# Eine .lyx Datei zu .lyu kompilieren
+./lyxc mymodule.lyx --compile-unit -o mymodule.lyu
+
+# Kompilieren mit .lyu (wird autom. bevorzugt wenn vorhanden)
+./lyxc main.lyx -o main --target=x86_64
+```
+
+Die `.lyu` Datei enthält:
+- Exportierte `pub fn` Symbole mit Typ-Informationen
+- Target-Architektur (x86_64, arm64)
+- Versionsinformation
+
+Falls die `.lyu` defekt ist, wird automatisch auf die `.lyx` Quelle zurückgegriffen.
 
 ```bash
 ./lyxc main.lyx --std-path=/custom/path/to/std
