@@ -664,9 +664,13 @@ begin
     
     // Determine output file
     if unitOutputFile = '' then
-      unitOutputFile := inputFile + '.lyu';
-    if unitOutputFile = inputFile then
-      unitOutputFile := inputFile + '.lyu';
+    begin
+      // Remove .lyx extension if present, add .lyu
+      if RightStr(inputFile, 4) = '.lyx' then
+        unitOutputFile := Copy(inputFile, 1, Length(inputFile) - 4) + '.lyu'
+      else
+        unitOutputFile := inputFile + '.lyu';
+    end;
 
     WriteLn('Ausgabe: ', unitOutputFile);
     WriteLn('Ziel:   ', ArchToStr(unitTargetArch));
