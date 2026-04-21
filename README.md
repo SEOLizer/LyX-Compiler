@@ -1047,6 +1047,7 @@ Optionen:
   --trace-passes Transformation Tracing: Pass-by-Pass mit Zeitmessung (WP-C)
   --ir-source-map IR Source Mapping: Zeilennummern in IR-Dump (WP-D)
   --type-reasoning Type-Checker Reasoning: detailliertes Typ-Logging (WP-E)
+  --constraint-log Constraint-Log ausgeben: Typ-Constraints (WP-G)
   -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):
