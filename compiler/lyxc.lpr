@@ -39,6 +39,7 @@ var
   flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
   flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
   flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
+  flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -203,6 +204,148 @@ begin
   WriteLn('Estimated energy units: ', stats.EstimatedEnergyUnits);
   WriteLn('Code size:              ', stats.CodeSizeBytes, ' bytes');
   WriteLn('L1 cache footprint:     ', stats.L1CacheFootprint, ' bytes');
+end;
+
+{ WP-A: AST Visualization - Helper to get node kind as string }
+function GetNodeKindName(kind: TNodeKind): string;
+begin
+  case kind of
+    nkIntLit: Result := 'IntLit';
+    nkFloatLit: Result := 'FloatLit';
+    nkStrLit: Result := 'StrLit';
+    nkBoolLit: Result := 'BoolLit';
+    nkCharLit: Result := 'CharLit';
+    nkRegexLit: Result := 'RegexLit';
+    nkIdent: Result := 'Ident';
+    nkConstrainedTypeDecl: Result := 'ConstrainedTypeDecl';
+    nkBinOp: Result := 'BinOp';
+    nkUnaryOp: Result := 'UnaryOp';
+    nkCall: Result := 'Call';
+    nkArrayLit: Result := 'ArrayLit';
+    nkStructLit: Result := 'StructLit';
+    nkTupleLit: Result := 'TupleLit';
+    nkFieldAccess: Result := 'FieldAccess';
+    nkIndexAccess: Result := 'IndexAccess';
+    nkCast: Result := 'Cast';
+    nkNewExpr: Result := 'NewExpr';
+    nkSuperCall: Result := 'SuperCall';
+    nkPanic: Result := 'Panic';
+    nkMapLit: Result := 'MapLit';
+    nkSetLit: Result := 'SetLit';
+    nkInExpr: Result := 'InExpr';
+    nkInspect: Result := 'Inspect';
+    nkVarDecl: Result := 'VarDecl';
+    nkAssign: Result := 'Assign';
+    nkFieldAssign: Result := 'FieldAssign';
+    nkIndexAssign: Result := 'IndexAssign';
+    nkIf: Result := 'If';
+    nkWhile: Result := 'While';
+    nkFor: Result := 'For';
+    nkRepeatUntil: Result := 'RepeatUntil';
+    nkPool: Result := 'Pool';
+    nkReturn: Result := 'Return';
+    nkBreak: Result := 'Break';
+    nkContinue: Result := 'Continue';
+    nkSwitch: Result := 'Switch';
+    nkBlock: Result := 'Block';
+    nkExprStmt: Result := 'ExprStmt';
+    nkDispose: Result := 'Dispose';
+    nkAssert: Result := 'Assert';
+    nkCheck: Result := 'Check';
+    nkTry: Result := 'Try';
+    nkThrow: Result := 'Throw';
+    nkTupleVarDecl: Result := 'TupleVarDecl';
+    nkFuncDecl: Result := 'FuncDecl';
+    nkConDecl: Result := 'ConDecl';
+    nkTypeDecl: Result := 'TypeDecl';
+    nkStructDecl: Result := 'StructDecl';
+    nkEnumDecl: Result := 'EnumDecl';
+    nkClassDecl: Result := 'ClassDecl';
+    nkInterfaceDecl: Result := 'InterfaceDecl';
+    nkUnitDecl: Result := 'UnitDecl';
+    nkImportDecl: Result := 'ImportDecl';
+    nkProgram: Result := 'Program';
+    nkBitAnd: Result := 'BitAnd';
+    nkBitOr: Result := 'BitOr';
+    nkBitXor: Result := 'BitXor';
+    nkBitNot: Result := 'BitNot';
+    nkShiftLeft: Result := 'ShiftLeft';
+    nkShiftRight: Result := 'ShiftRight';
+    nkSIMDNew: Result := 'SIMDNew';
+    nkSIMDBinOp: Result := 'SIMDBinOp';
+    nkSIMDUnaryOp: Result := 'SIMDUnaryOp';
+    nkSIMDIndexAccess: Result := 'SIMDIndexAccess';
+    nkIsExpr: Result := 'IsExpr';
+    nkFormatExpr: Result := 'FormatExpr';
+    nkLfdForm: Result := 'LfdForm';
+    nkLfdWidget: Result := 'LfdWidget';
+    nkLfdLayout: Result := 'LfdLayout';
+    nkLfdProperty: Result := 'LfdProperty';
+    nkLfdSignal: Result := 'LfdSignal';
+    else Result := 'NodeKind_' + IntToStr(Ord(kind));
+  end;
+end;
+
+{ WP-A: Recursive AST node dump }
+procedure DumpASTNode(node: TAstNode; indent: Integer);
+var
+  prefix: string;
+begin
+  if not Assigned(node) then
+  begin
+    WriteLn('  ', StringOfChar(' ', indent), '<null>');
+    Exit;
+  end;
+
+  prefix := StringOfChar(' ', indent);
+  Write(prefix, '+ Node(ID=', node.ID, ' kind=', GetNodeKindName(node.Kind));
+
+  if node is TAstIntLit then
+    WriteLn(' value=', TAstIntLit(node).Value, ')')
+  else if node is TAstFloatLit then
+    WriteLn(' value=', TAstFloatLit(node).Value:0:6, ')')
+  else if node is TAstStrLit then
+    WriteLn(' value="', TAstStrLit(node).Value, '")')
+  else if node is TAstBoolLit then
+    WriteLn(' value=', TAstBoolLit(node).Value, ')')
+  else if node is TAstIdent then
+    WriteLn(' name=', TAstIdent(node).Name, ')')
+  else if node is TAstCall then
+    WriteLn(' func=', TAstCall(node).Name, ')')
+  else if node is TAstVarDecl then
+    WriteLn(' name=', TAstVarDecl(node).Name, ')')
+  else if node is TAstFuncDecl then
+    WriteLn(' name=', TAstFuncDecl(node).Name, ')')
+  else if node is TAstStructDecl then
+    WriteLn(' name=', TAstStructDecl(node).Name, ')')
+  else if node is TAstClassDecl then
+    WriteLn(' name=', TAstClassDecl(node).Name, ')')
+  else if node is TAstBlock then
+    WriteLn(' stmts=', Length(TAstBlock(node).Stmts), ')')
+  else
+    WriteLn(')');
+end;
+
+{ WP-A: Dump the full AST tree }
+procedure DumpASTTree(prog: TAstProgram);
+var
+  i: Integer;
+begin
+  WriteLn;
+  WriteLn('=== AST Tree (WP-A) ===');
+  WriteLn;
+  WriteLn('AST Program with ', Length(prog.Decls), ' declarations');
+  WriteLn('Source: ', prog.Span.Filename);
+  WriteLn;
+  for i := 0 to High(prog.Decls) do
+  begin
+    if Assigned(prog.Decls[i]) then
+    begin
+      WriteLn('[Declaration ', i, ']');
+      DumpASTNode(prog.Decls[i], 2);
+      WriteLn;
+    end;
+  end;
 end;
 
 procedure DumpIRAsAsm(m: TIRModule);
@@ -454,6 +597,7 @@ begin
   WriteLn(StdErr, '  --profile      Profiler: instrument function calls (WP-3)');
   WriteLn(StdErr, '  --trace        Trace builtin: debug output (WP-4)');
   WriteLn(StdErr, '  --provenance   Provenance Tracking: IR→AST→Source mapping (WP-F)');
+  WriteLn(StdErr, '  --ast-dump    AST Visualisierung: Text-Baum (WP-A)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -487,6 +631,7 @@ begin
   flagProfile := False;
   flagTrace := False;
   flagProvenance := False;
+  flagAstdump := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -652,6 +797,11 @@ begin
     else if param = '--provenance' then
     begin
       flagProvenance := True;
+      Inc(i);
+    end
+    else if param = '--ast-dump' then
+    begin
+      flagAstdump := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -829,6 +979,10 @@ begin
       finally
         lx.Free;
       end;
+
+      // WP-A: AST Visualization
+      if flagAstdump and Assigned(prog) then
+        DumpASTTree(prog);
       
       if d.HasErrors then
       begin
@@ -1044,6 +1198,10 @@ begin
       finally
         lx.Free;
       end;
+
+      // WP-A: AST Visualization
+      if flagAstdump and Assigned(prog) then
+        DumpASTTree(prog);
 
       if d.HasErrors then
       begin
