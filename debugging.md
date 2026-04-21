@@ -892,7 +892,7 @@ Error: segmentation_fault
 
 ---
 
-### WP-2: DWARF Debug Info (P1 - Tools-Integration) 🚧 IN PROGRESS
+### WP-2: DWARF Debug Info (P1 - Tools-Integration) ✅ Implementiert
 
 **Motivation:** Integration mit externen Debuggern (gdb, lldb, VS Code).
 **Status:** Implementierung begonnen (2026-04-21)
@@ -985,7 +985,7 @@ gdb ./test
 
 ---
 
-### WP-3: Einfacher Profiler (P2 - Performance) 🚧 IN PROGRESS
+### WP-3: Einfacher Profiler (P2 - Performance) ✅ Implementiert
 
 **Motivation:** Performance-Analyse ohne externe Tools.
 
@@ -1019,7 +1019,7 @@ multiply       500      0.04    33
 
 ---
 
-### WP-4: Trace-Builtin (P3 - Logging) 🚧 IN PROGRESS
+### WP-4: Trace-Builtin (P3 - Logging) ✅ Implementiert
 
 **Motivation:** Einfaches Debug-Output ohne println.
 
@@ -1076,9 +1076,9 @@ multiply       500      0.04    33
 | WP | Feature | Abhängigkeit | Geschätzte Zeit | Status |
 |----|---------|-------------|---------------|-------|-------|
 | WP-1 | Runtime Assertions | IR, Optimizer | 2 Wochen | ✅ IR-Ops + x86_64 |
-| WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen | - |
-| WP-3 | Einfacher Profiler | - | 1 Woche | - |
-| WP-4 | Trace-Builtin | Builtins | 1 Woche | - |
+| WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen | ✅ DWARF 4 sections |
+| WP-3 | Einfacher Profiler | - | 1 Woche | ✅ profile_* builtins |
+| WP-4 | Trace-Builtin | Builtins | 1 Woche | ✅ trace builtins |
 | WP-5 | Breakpoint-Support | IR | 1 Woche | - |
 
 ### Priorität C: Erweiterte KI-Debugging (zukünftig)
@@ -1126,6 +1126,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.4.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI <br> +WP-2: DWARF Debug Info (.debug_info, .debug_line, .debug_frame, .debug_abbrev, .debug_str) + -g CLI <br> +WP-3: Simple Profiler (profile_enter, profile_leave, profile_report) + --profile CLI <br> +WP-4: Trace Builtins (trace, trace_int, trace_str) + --trace CLI |
 | 1.3.0 | 2026-04-21 | +WP-F: Provenance Tracking (Herkunftsnachweis: Token→AST→IR→MachineCode) <br> +WP-G: Constraint-Log-Dumps (Typsystem-Debugging) <br> +WP-H: VFS Snapshots (Makro/Import-Auflösung) <br> +WP-I: Memory Ownership & Lifetime Visualisierung (DAG für Besitzverhältnisse) <br> +WP-J: Compiler-Zustands-Serialisierung ("Brain Dump" + Korrelations-Analyse) |
 | 1.2.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI |
 | 1.1.0 | 2026-04-21 | +KI-Debugging-Features: AST, SymTab, Tracing, IR-Mapping, Type-Reasoning |
