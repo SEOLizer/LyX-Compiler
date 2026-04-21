@@ -109,6 +109,9 @@ initialization
   AddBuiltin('', 'trace_int', 'trace_int', atVoid, [atInt64]);
   AddBuiltin('', 'trace_str', 'trace_str', atVoid, [atPChar, atPChar]);
 
+  // Breakpoint (WP-5) - triggers debugger breakpoint
+  AddBuiltin('', 'breakpoint', 'breakpoint', atVoid, []);
+
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
   AddBuiltin('', 'StrLen',    'StrLen',    atInt64,  [atPChar]);
