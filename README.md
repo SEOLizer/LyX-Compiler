@@ -47,6 +47,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.7)
 ✅ MC/DC Instrumentation: DO-178C DAL A coverage (--mcdc, --mcdc-report) (v0.7.0)
 ✅ Assembly Listing: Source-annotated assembly output with hex bytes (--asm-listing) (v0.7.0)
+✅ Runtime Assertions: Bounds, Null, Zero, Boolean checks at runtime (--runtime-checks) (v0.9.0)
+✅ DWARF Debug Info: DWARF 4 sections for gdb/lldb/VS Code (-g) (v0.9.0)
 ✅ Static Analysis: Data-Flow, Live-Vars, Const-Prop, Null-Ptr, Array-Bounds, Termination, Stack (--static-analysis) (v0.7.0)
 ✅ Test Generation: Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution (v0.7.0)
 ✅ ESP32 Safety: Watchdog, Brownout, Flash-Verify, MPU, Stack-Canary (v0.7.0)
@@ -906,6 +908,38 @@ Lyx can generate a detailed assembly listing with source line annotations for au
 
 **Purpose:** Required for DO-178C DAL A/B/C certification — provides traceability from source code to generated machine code.
 
+### DWARF Debug Info
+
+Lyx can generate **DWARF 4 debug information** for integration with external debuggers (gdb, lldb, Visual Studio Code):
+
+```bash
+# Compile with DWARF debug info
+./lyxc program.lyx -o program -g
+```
+
+**Generated Sections:**
+```
+  [ 2] .debug_str        STRTAB
+  [ 3] .debug_abbrev     PROGBITS
+  [ 4] .debug_info       PROGBITS
+  [ 5] .debug_line       PROGBITS
+  [ 6] .debug_frame      PROGBITS
+```
+
+**Debugging:**
+```bash
+# Inspect debug info
+readelf -w program | head -50
+
+# Debug with gdb
+gdb ./program
+(gdb) break test.lyx:5
+(gdb) run
+(gdb) print variable_name
+```
+
+**Purpose:** Source-level debugging in IDEs and debuggers, DO-178C traceability.
+
 ---
 
 ### Cross-Compilation
@@ -1002,6 +1036,8 @@ Optionen:
   --static-analysis   Statische Analyse (Data-Flow, Live-Vars, Stack, Null-Ptr)
   --call-graph     Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)
   --map-file       Speicherlayout-Datei (.map) für Debug/Audit
+  --runtime-checks  Runtime-Assertions (bounds, null, zero, boolean) für DO-178C
+  -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):
   --version        Versionsnummer ausgeben (TOR-001)
