@@ -43,6 +43,7 @@ var
   flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
   flagTracepasses: Boolean;  // --trace-passes (WP-C: Transformation Tracing)
   flagIRSourceMap: Boolean;  // --ir-source-map (WP-D: IR mit Source-Mapping)
+  flagTypereasoning: Boolean;  // --type-reasoning (WP-E: Type-Checker Reasoning)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -651,6 +652,7 @@ begin
   WriteLn(StdErr, '  --symtab-dump Symbol-Tabelle ausgeben (WP-B)');
   WriteLn(StdErr, '  --trace-passes Transformation Tracing (WP-C)');
   WriteLn(StdErr, '  --ir-source-map IR Source Mapping anzeigen (WP-D)');
+  WriteLn(StdErr, '  --type-reasoning Type-Checker Reasoning anzeigen (WP-E)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -688,6 +690,7 @@ begin
   flagSymtabdump := False;
   flagTracepasses := False;
   flagIRSourceMap := False;
+  flagTypereasoning := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -873,6 +876,11 @@ begin
     else if param = '--ir-source-map' then
     begin
       flagIRSourceMap := True;
+      Inc(i);
+    end
+    else if param = '--type-reasoning' then
+    begin
+      flagTypereasoning := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -1316,6 +1324,12 @@ begin
         EnterPass('Semantic Analysis', 'AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
         s := TSema.Create(d);
         try
+          // WP-E: Enable type reasoning if flag is set
+          if flagTypereasoning then
+          begin
+            s.VerboseReasoning := True;
+            WriteLn('[Type-Check] Type Checker Reasoning ENABLED');
+          end;
           s.AnalyzeWithUnits(prog, um);
           if d.HasErrors then
           begin

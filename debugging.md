@@ -452,7 +452,7 @@ main:  ; params=0 locals=1
 
 ---
 
-### WP-E: Type-Checker Reasoning
+### WP-E: Type-Checker Reasoning ✅ Implementiert
 
 **Problem:** „Typen passen nicht" ist zu wenig. Die KI braucht das „Warum".
 
@@ -466,43 +466,24 @@ main:  ; params=0 locals=1
 
 **Output:**
 ```
-Error: type_mismatch
-  Expression: a + b
-  Expected:  int64
-  Found:     pchar
-  Reason:   Operator '+' is not defined for '(pchar, pchar)'
-
-  Search history:
-    1. Looking for +(pchar, pchar) -> int64 in operator table
-    2. Looking for +(pchar, any) -> int64
-    3. Looking for +(int64, pchar) -> int64
-    4. No match found
-
-  Suggestion: Use explicit cast: int64(b) or str_to_int(b)
-```
-
-**Output (komplexer):**
-```
-Error: type_mismatch
-  Expression: user.name + "Hello"
-  Expected:  pchar
-  Found:     pchar
-
-  Analysis:
-    - user.name has type Option<pchar?>
-    - Option<T> is not implicitly unwrapable to T
-    - Rule #4: No implicit unwrap of Optional<T>
-
-  Alternative:
-    - Use user.name? and provide default: user.name ?? "default"
-    - Use user.name! (explicit unwrap, may panic)
-    - Pattern match on Option
+[Type-Check] Type Checker Reasoning ENABLED
+[Type-Check] Checking: IntLit 10 (int64)
+[Type-Check] Checking: BinOp > (unknown)
+[Type-Check] Checking: Ident "x" (unknown)
+[Type-Check] Checking: IntLit 5 (int64)
+[Type-Check] Checking: Call PrintStr() (unknown)
+[Type-Check] Checking: StrLit "greater" (pchar)
+[Type-Check] Checking: BinOp && (unknown)
+...
 ```
 
 **Implementierung:**
-1. `TSemaError.WithReason(error, reasoning)`
-2. Reasoning enthält: gesuchte Signaturen, gefundene Alternativen
+1. `TSema.FVerboseReasoning` Property zum Aktivieren
+2. `TSema.LogTypeCheck()` und `LogTypeCheckExpr()` für Logging
 3. CLI-Option `--type-reasoning`
+4. Zeigt alle Ausdrücke während der Typprüfung
+
+**Implementiert in:** `sema.pas` (LogTypeCheck/LogTypeCheckExpr), `lyxc.lpr` (--type-reasoning)
 
 ---
 
@@ -1117,7 +1098,7 @@ multiply       500      0.04    33
 | WP-B | Symbol-Table Snapshots | Sema | 1 Woche | ✅ --symtab-dump |
 | WP-C | Transformation Tracing | alle Phasen | 1 Woche | ✅ --trace-passes |
 | WP-D | IR mit Source-Mapping | Lowering | 1 Woche | ✅ --ir-source-map |
-| WP-E | Type-Checker Reasoning | Sema | 2 Wochen |
+| WP-E | Type-Checker Reasoning | Sema | 2 Wochen | ✅ --type-reasoning |
 | WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
 | WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
 | WP-H | VFS Snapshots | Import-Resolver | 1 Woche |
@@ -1179,6 +1160,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.8.0 | 2026-04-21 | +WP-E: Type-Checker Reasoning (--type-reasoning) + TSema.FVerboseReasoning <br> +Logging aller Ausdrücke während der Typprüfung |
 | 1.7.0 | 2026-04-21 | +WP-D: IR mit Source-Mapping (--ir-source-map) + TIRInstr.SourceLine/SourceFile <br> +IR-Dump zeigt Quellcode-Zuordnung als Kommentare |
 | 1.6.0 | 2026-04-21 | +WP-C: Transformation Tracing (--trace-passes) + EnterPass/LeavePass Prozeduren <br> +Pass-by-Pass Logging: Lexer → Parser → Sema → IR → Code Gen mit Zeitmessung |
 | 1.5.0 | 2026-04-21 | +WP-A: AST Visualisierung (--ast-dump) + DumpASTTree() <br> +WP-B: Symbol-Table Snapshots (--symtab-dump) + TSymbol.DefSpan + DumpSymbolTable() |

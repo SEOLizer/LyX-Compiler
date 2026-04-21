@@ -53,6 +53,8 @@ type
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
     FCurrentNestedFunc: TAstFuncDecl; // nested function currently being analyzed
+    // WP-E: Type Checker Reasoning
+    FVerboseReasoning: Boolean; // enable verbose type reasoning output
     procedure PushScope;
     procedure PopScope;
     procedure AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
@@ -90,6 +92,10 @@ type
     procedure RewriteAST(prog: TAstProgram);
     // WP-B: Symbol table visualization
     procedure DumpSymbolTable;
+    // WP-E: Type Checker Reasoning
+    property VerboseReasoning: Boolean read FVerboseReasoning write FVerboseReasoning;
+    procedure LogTypeCheck(const msg: string);
+    procedure LogTypeCheckExpr(expr: TAstExpr; const context: string);
   end;
 
 implementation
@@ -2414,6 +2420,11 @@ begin
     Result := atUnresolved;
     Exit;
   end;
+
+  // WP-E: Log type checking
+  if FVerboseReasoning then
+    LogTypeCheckExpr(expr, 'Checking');
+
   case expr.Kind of
     nkIntLit: Result := atInt64;
     nkFloatLit: Result := atF64;
@@ -4266,6 +4277,7 @@ begin
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
+  FVerboseReasoning := False;  // WP-E: disabled by default
   SetLength(FScopes, 0);
   // create global scope
   PushScope;
@@ -6291,6 +6303,37 @@ begin
   end;
 end;
 
+function GetOpKindName(op: TTokenKind): string;
+begin
+  case op of
+    tkPlus: Result := '+';
+    tkMinus: Result := '-';
+    tkStar: Result := '*';
+    tkSlash: Result := '/';
+    tkPercent: Result := '%';
+    tkPlusPlus: Result := '++';
+    tkMinusMinus: Result := '--';
+    tkBitAnd: Result := '&';
+    tkBitOr: Result := '|';
+    tkBitXor: Result := '^';
+    tkBitNot: Result := '~';
+    tkEq: Result := '==';
+    tkNeq: Result := '!=';
+    tkLt: Result := '<';
+    tkLe: Result := '<=';
+    tkGt: Result := '>';
+    tkGe: Result := '>=';
+    tkAnd: Result := '&&';
+    tkOr: Result := '||';
+    tkNot: Result := '!';
+    tkShiftLeft: Result := '<<';
+    tkShiftRight: Result := '>>';
+    tkNullCoalesce: Result := '??';
+    tkSafeCall: Result := '?.';
+    else Result := 'op(' + IntToStr(Ord(op)) + ')';
+  end;
+end;
+
 function GetTypeName(t: TAurumType): string;
 begin
   case t of
@@ -6435,9 +6478,40 @@ begin
     WriteLn('  ', StringOfChar('-', 60));
     for i := 0 to FClassTypes.Count - 1 do
     begin
-      WriteLn('  ', FClassTypes[i]);
+WriteLn('  ', FClassTypes[i]);
     end;
     WriteLn;
+  end;
+end;
+
+{ WP-E: Type Checker Reasoning }
+procedure TSema.LogTypeCheck(const msg: string);
+begin
+  if FVerboseReasoning then
+  begin
+    WriteLn('[Type-Check] ', msg);
+  end;
+end;
+
+procedure TSema.LogTypeCheckExpr(expr: TAstExpr; const context: string);
+begin
+  if FVerboseReasoning and Assigned(expr) then
+  begin
+    Write('[Type-Check] ', context, ': ');
+    if expr is TAstIdent then
+      WriteLn('Ident "', TAstIdent(expr).Name, '" (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstIntLit then
+      WriteLn('IntLit ', TAstIntLit(expr).Value, ' (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstStrLit then
+      WriteLn('StrLit "', TAstStrLit(expr).Value, '" (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstCall then
+      WriteLn('Call ', TAstCall(expr).Name, '() (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstBinOp then
+      WriteLn('BinOp ', GetOpKindName(TAstBinOp(expr).Op), ' (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstFieldAccess then
+      WriteLn('FieldAccess .', TAstFieldAccess(expr).Field, ' (', GetTypeName(expr.ResolvedType), ')')
+    else
+      WriteLn('NodeKind_', Ord(expr.Kind), ' (', GetTypeName(expr.ResolvedType), ')');
   end;
 end;
 
