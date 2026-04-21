@@ -416,7 +416,7 @@ Done:   97ms
 
 ---
 
-### WP-D: IR mit Source-Mapping
+### WP-D: IR mit Source-Mapping ✅ Implementiert
 
 **Problem:** IR ohne Quellcode-Zuordnung ist für KI schwer zu analysieren.
 
@@ -430,32 +430,25 @@ Done:   97ms
 
 **Output:**
 ```
-add:
-  ; Function entry (line 5)
-  ; t0 = a (param, -16(rbp)) <- line 5
-  mov rax, rdi
-  ; t1 = b (param, -8(rbp)) <- line 5  
-  mov rdx, rsi
-  ; t2 = t0 + t1 <- line 7
-  add rax, rdx
-  ; return t2 <- line 7
-  ret
-```
-
-**IR mit Metadata:**
-```
-IR Block: add::entry (params=2, locals=2)
-  [0] irConstInt t0, 0           ; line: 7
-  [1] irLoadLocal t1, a           ; src: -16(rbp), line: 5
-  [2] irLoadLocal t2, b          ; src: -8(rbp), line: 5
-  [3] irAdd t3, t1, t2         ; line: 7
-  [4] irReturn t3               ; line: 7
+main:  ; params=0 locals=1
+  irConstInt t0, 10
+  ; line: 2, file: tests/lyx/basic/if_test.lyx
+  irStoreLocal [local0], t0
+  ; line: 2, file: tests/lyx/basic/if_test.lyx
+  irLoadLocal t1, [local0]
+  ; line: 4, file: tests/lyx/basic/if_test.lyx
+  irCmpGt t3, t1, t2
+  ; line: 4, file: tests/lyx/basic/if_test.lyx
+  irBrFalse t3, Lendif_0
+  ...
 ```
 
 **Implementierung:**
-1. Jede IR-Instruktion speichert `SourceLine`, `SourceFile`
+1. Jede IR-Instruktion speichert `SourceLine`, `SourceFile` (bereits vorhanden)
 2. CLI-Option `--ir-source-map`
-3. Assembly-Output zeigt Source-Zuordnung
+3. `--emit-asm` zeigt Source-Zuordnung als Kommentare
+
+**Implementiert in:** `ir.pas` (TIRInstr.SourceLine/SourceFile), `lyxc.lpr` (--ir-source-map)
 
 ---
 
@@ -1123,7 +1116,7 @@ multiply       500      0.04    33
 | WP-A | AST Visualisierung | Parser | 1 Woche | ✅ --ast-dump |
 | WP-B | Symbol-Table Snapshots | Sema | 1 Woche | ✅ --symtab-dump |
 | WP-C | Transformation Tracing | alle Phasen | 1 Woche | ✅ --trace-passes |
-| WP-D | IR mit Source-Mapping | Lowering | 1 Woche |
+| WP-D | IR mit Source-Mapping | Lowering | 1 Woche | ✅ --ir-source-map |
 | WP-E | Type-Checker Reasoning | Sema | 2 Wochen |
 | WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
 | WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
@@ -1186,6 +1179,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.7.0 | 2026-04-21 | +WP-D: IR mit Source-Mapping (--ir-source-map) + TIRInstr.SourceLine/SourceFile <br> +IR-Dump zeigt Quellcode-Zuordnung als Kommentare |
 | 1.6.0 | 2026-04-21 | +WP-C: Transformation Tracing (--trace-passes) + EnterPass/LeavePass Prozeduren <br> +Pass-by-Pass Logging: Lexer → Parser → Sema → IR → Code Gen mit Zeitmessung |
 | 1.5.0 | 2026-04-21 | +WP-A: AST Visualisierung (--ast-dump) + DumpASTTree() <br> +WP-B: Symbol-Table Snapshots (--symtab-dump) + TSymbol.DefSpan + DumpSymbolTable() |
 | 1.4.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI <br> +WP-2: DWARF Debug Info (.debug_info, .debug_line, .debug_frame, .debug_abbrev, .debug_str) + -g CLI <br> +WP-3: Simple Profiler (profile_enter, profile_leave, profile_report) + --profile CLI <br> +WP-4: Trace Builtins (trace, trace_int, trace_str) + --trace CLI |

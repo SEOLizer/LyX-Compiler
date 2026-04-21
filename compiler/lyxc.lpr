@@ -42,6 +42,7 @@ var
   flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
   flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
   flagTracepasses: Boolean;  // --trace-passes (WP-C: Transformation Tracing)
+  flagIRSourceMap: Boolean;  // --ir-source-map (WP-D: IR mit Source-Mapping)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -358,8 +359,11 @@ var
   opName: string;
   argStr: string;
   ai: Integer;
+  srcComment: string;
 begin
   WriteLn('; === Lyx IR Pseudo-Assembly ===');
+  if flagIRSourceMap then
+    WriteLn('; Source Mapping: ENABLED (WP-D)');
   WriteLn('; Strings: ', m.Strings.Count);
   for fi := 0 to m.Strings.Count - 1 do
     WriteLn(';   .str', fi, ': "', m.Strings[fi], '"');
@@ -447,6 +451,15 @@ begin
       else
         WriteLn(' d=', ins.Dest, ' s1=', ins.Src1, ' s2=', ins.Src2,
                 ' imm=', ins.ImmInt, ' str=', ins.ImmStr, ' lbl=', ins.LabelName);
+      end;
+
+      // WP-D: Source Mapping
+      if flagIRSourceMap and (ins.SourceLine > 0) then
+      begin
+        srcComment := '  ; line: ' + IntToStr(ins.SourceLine);
+        if ins.SourceFile <> '' then
+          srcComment := srcComment + ', file: ' + ins.SourceFile;
+        WriteLn(srcComment);
       end;
     end;
     WriteLn;
@@ -637,6 +650,7 @@ begin
   WriteLn(StdErr, '  --ast-dump    AST Visualisierung: Text-Baum (WP-A)');
   WriteLn(StdErr, '  --symtab-dump Symbol-Tabelle ausgeben (WP-B)');
   WriteLn(StdErr, '  --trace-passes Transformation Tracing (WP-C)');
+  WriteLn(StdErr, '  --ir-source-map IR Source Mapping anzeigen (WP-D)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -673,6 +687,7 @@ begin
   flagAstdump := False;
   flagSymtabdump := False;
   flagTracepasses := False;
+  flagIRSourceMap := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -853,6 +868,11 @@ begin
     else if param = '--trace-passes' then
     begin
       flagTracepasses := True;
+      Inc(i);
+    end
+    else if param = '--ir-source-map' then
+    begin
+      flagIRSourceMap := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
