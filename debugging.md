@@ -178,16 +178,23 @@ Debuggt die Import-Auflösung.
 | Variablen-Location | ❌ Nicht implementiert | Mittel |
 | Breakpoint-Tabellen | ❌ Nicht implementiert | Mittel |
 
-### Gap 3: Kein Runtime-Assertions
+### Gap 3: Runtime Assertions (teilweise implementiert)
 
-**Problem:** Keine eingebauten Runtime-Checks für:
+**Problem:** Eingebaute Runtime-Checks fehlen teilweise:
 
 | Feature | Status | Priorität |
 |--------|--------|----------|
-| Bounds-Checks | ❌ Nicht implementiert | Mittel |
-| Null-Checks | ❌ Nicht implementiert | Mittel |
+| Bounds-Checks | ✅ Implementiert (irAssertBounds) | Mittel |
+| Null-Checks | ✅ Implementiert (irAssertNotNull) | Mittel |
+| Zero-Checks | ✅ Implementiert (irAssertNotZero) | Mittel |
+| Boolean-Checks | ✅ Implementiert (irAssertTrue) | Mittel |
 | Overflow-Checks | ❌ Nicht implementiert | Niedrig |
 | NaN/Infinity-Checks | ❌ Nicht implementiert | Niedrig |
+
+**Nutzung:**
+```bash
+./lyxc test.lyx -o test --runtime-checks
+```
 
 ### Gap 4: Kein Profiling
 
@@ -471,25 +478,26 @@ Error: type_mismatch
 
 ## Neue Feature-Vorschläge ( nach Priorität geordnet)
 
-### WP-1: Runtime Assertions (P0 - Für DO-178C)
+### WP-1: Runtime Assertions (P0 - Für DO-178C) ✅ Implementiert
 
 **Motivation:** DO-178C erfordert Bounds-Checks für Level A Software.
 
-**Features:**
-- `fn assert_bounds(idx: int64, len: int64)` - Array-Bounds-Check
-- `fn assert_not_null(ptr: pchar?)` - Null-Check
-- `fn assert_defined(val: int64)` - Wert-definiert-Check
+**Implementierte IR-Ops:**
+- `irAssertBounds` - assert(Src1 >= 0 && Src1 < ImmInt)
+- `irAssertNotNull` - assert(Src1 != 0) für Pointer
+- `irAssertNotZero` - assert(Src1 != 0) für Werte
+- `irAssertTrue` - assert(Src1 != 0) für Boolean
 
 **Compiler-Flag:**
 ```bash
 ./lyxc test.lyx -o test --runtime-checks
-# Enables: bounds, null, overflow checks at runtime
+# Enables: bounds, null, zero, boolean checks at runtime
 ```
 
 **Implementierung:**
-1. Neue IR-Ops: `irAssertBounds`, `irAssertNotNull`
-2. Option `--runtime-checks` im CLI
-3. Code-Generation fügt Checks ein
+- IR-Ops in `ir.pas` definiert
+- CLI-Option `--runtime-checks` in `lyxc.lpr`
+- Code-Generation in `x86_64_emit.pas`
 
 ---
 
@@ -586,13 +594,13 @@ multiply       500      0.04    33
 
 ### Priorität B: Runtime/Debugging (mittelfristig)
 
-| WP | Feature | Abhängigkeit | Geschätzte Zeit |
-|----|---------|-------------|---------------|
-| WP-1 | Runtime Assertions | IR, Optimizer | 2 Wochen |
-| WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen |
-| WP-3 | Einfacher Profiler | - | 1 Woche |
-| WP-4 | Trace-Builtin | Builtins | 1 Woche |
-| WP-5 | Breakpoint-Support | IR | 1 Woche |
+| WP | Feature | Abhängigkeit | Geschätzte Zeit | Status |
+|----|---------|-------------|---------------|-------|
+| WP-1 | Runtime Assertions | IR, Optimizer | 2 Wochen | ✅ IR-Ops + x86_64 |
+| WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen | - |
+| WP-3 | Einfacher Profiler | - | 1 Woche | - |
+| WP-4 | Trace-Builtin | Builtins | 1 Woche | - |
+| WP-5 | Breakpoint-Support | IR | 1 Woche | - |
 
 ---
 
@@ -629,5 +637,6 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |---------|-------|---------|
+| 1.2.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI |
 | 1.1.0 | 2026-04-21 | +KI-Debugging-Features: AST, SymTab, Tracing, IR-Mapping, Type-Reasoning |
 | 1.0.0 | 2026-04-21 | Initiales Debugging-Konzept |

@@ -79,6 +79,11 @@ type
     irThrow,        // perform throw: Src1 = exception temp
     // panic / abort
     irPanic,
+    // Runtime assertions (DO-178C for Level A)
+    irAssertBounds,    // bounds check: assert(Src1 >= 0 && Src1 < ImmInt) - panics if fail
+    irAssertNotNull,   // null check: assert(Src1 != 0) - panics if null
+    irAssertNotZero,  // zero check: assert(Src1 != 0) - panics if zero
+    irAssertTrue,    // boolean check: assert(Src1 != 0) - panics if false
     // SIMD operations (ParallelArray)
     irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
     irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,
@@ -442,6 +447,9 @@ begin
       Result := 1;
     irPanic:
       Result := 5000;
+    // Runtime assertions (geringe Kosten - compare + je nach Ausführung)
+    irAssertBounds, irAssertNotNull, irAssertNotZero, irAssertTrue:
+      Result := 2;
     // SIMD operations (mittlere bis hohe Kosten - vectorized ops)
     irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
     irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,

@@ -35,6 +35,7 @@ var
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
+  flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -443,6 +444,7 @@ begin
     WriteLn(StdErr, '  --static-analysis Statische Analyse (Data-Flow, Live-Vars, Stack, ...)');
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
+    WriteLn(StdErr, '  --runtime-checks  Runtime-Assertions (bounds, null, zero) für DO-178C');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -472,6 +474,7 @@ begin
   flagAsmListing := False;
   flagCallGraph := False;
   flagMapFile := False;
+  flagRuntimeChecks := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -617,6 +620,11 @@ begin
     else if param = '--map-file' then
     begin
       flagMapFile := True;
+      Inc(i);
+    end
+    else if param = '--runtime-checks' then
+    begin
+      flagRuntimeChecks := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
