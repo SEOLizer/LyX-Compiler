@@ -37,6 +37,7 @@ var
   flagMapFile: Boolean;  // --map-file
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
+  flagUnitInfo: Boolean;  // --unit-info
   flagDebugSymbols: Boolean;  // --debug-symbols
   unitOutputFile: string;  // -o for unit output
   unitTargetArch: TLyuxArch;  // -t for target arch
@@ -70,6 +71,8 @@ var
   i, j: Integer;
   buffer: TByteBuffer;  { For .lyu serialization }
   ser: TLyuxSerializer;  { For .lyu serialization }
+  deser: TLyuxDeserializer;  { For .lyu deserialization }
+  loadedUnit: TLoadedLyux;  { For .lyu loading }
   lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
   fn: TAstFuncDecl;  { For unit compilation }
   symIdx: Integer;  { For unit compilation }
@@ -473,6 +476,7 @@ begin
   
   // Precompiled unit options
   flagCompileUnit := False;
+  flagUnitInfo := False;
   flagDebugSymbols := False;
   unitOutputFile := '';
   unitTargetArch := la_x86_64;
@@ -620,6 +624,11 @@ begin
       flagCompileUnit := True;
       Inc(i);
     end
+    else if param = '--unit-info' then
+    begin
+      flagUnitInfo := True;
+      Inc(i);
+    end
     else if param = '--debug-symbols' then
     begin
       flagDebugSymbols := True;
@@ -693,7 +702,13 @@ begin
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
-  WriteLn('Ausgabe:  ', outputFile);
+  if flagCompileUnit then
+    WriteLn('Modus:    Unit-Kompilierung')
+  else if flagUnitInfo then
+    WriteLn('Modus:    Unit-Info')
+  else
+  begin
+    WriteLn('Ausgabe:  ', outputFile);
     if target = targetWindows then
       WriteLn('Ziel:     Windows x64 (PE32+)')
     else if target = targetLinux then
@@ -706,9 +721,10 @@ begin
       WriteLn('Ziel:     macOS ARM64 (Mach-O)')
     else if target = targetESP32 then
       WriteLn('Ziel:     ESP32 (Xtensa, ELF32)');
+  end;
 
   // Energy-Konfiguration setzen (vor der Statusausgabe)
-  if flagEnergyLevel > 0 then
+  if (flagEnergyLevel > 0) and not flagUnitInfo and not flagCompileUnit then
   begin
     case target of
       targetLinux: SetEnergyLevel(TEnergyLevel(flagEnergyLevel), cfX86_64);
@@ -717,7 +733,7 @@ begin
     end;
   end;
 
-  if flagEnergyLevel > 0 then
+  if (flagEnergyLevel > 0) and not flagUnitInfo and not flagCompileUnit then
   begin
     WriteLn('Energy-Level: ', flagEnergyLevel);
     case flagEnergyLevel of
@@ -874,6 +890,97 @@ begin
     WriteLn;
     WriteLn('Erfolgreich kompiliert: ', unitOutputFile);
     WriteLn('Symbol-Count: ', Length(lyuSymbols));
+    Halt(0);
+  end;
+
+  { ====== UNIT INFO MODE ====== }
+  if flagUnitInfo then
+  begin
+    WriteLn;
+    WriteLn('--- Unit-Info-Modus ---');
+    
+    // Prüfe ob die Datei existiert
+    if not FileExists(inputFile) then
+    begin
+      WriteLn(StdErr, 'Fehler: Datei nicht gefunden: ', inputFile);
+      Halt(1);
+    end;
+    
+    // Lade die .lyu als Binärdatei
+    buffer := TByteBuffer.Create;
+    d := TDiagnostics.Create;
+    ser := TLyuxSerializer.Create(nil, la_x86_64, False);
+    try
+      buffer.LoadFromFile(inputFile);
+      
+      // Deserialisiere die .lyu
+      loadedUnit := TLoadedLyux.Create;
+      try
+        deser := TLyuxDeserializer.Create(d);
+        try
+          deser.Deserialize(buffer, loadedUnit);
+        except
+          on E: Exception do
+          begin
+            WriteLn(StdErr, 'Fehler beim Lesen der .lyu: ', E.Message);
+            Halt(1);
+          end;
+        end;
+        
+        // Ausgabe der Informationen
+        WriteLn;
+        WriteLn('Unit: ', loadedUnit.Header.UnitName);
+        WriteLn('Version: ', loadedUnit.Header.Version);
+        WriteLn('Target: ', ArchToStr(loadedUnit.Header.TargetArch));
+        if (loadedUnit.Header.Flags and 1) <> 0 then
+          WriteLn('Debug-Symbole: vorhanden')
+        else
+          WriteLn('Debug-Symbole: nicht vorhanden');
+        WriteLn;
+        WriteLn('Exportierte Symbole: ', loadedUnit.Header.SymbolCount);
+        
+        // Zeige alle Symbole
+        for i := 0 to loadedUnit.Header.SymbolCount - 1 do
+        begin
+          case loadedUnit.Symbols[i].Kind of
+            lskFn:     Write('  pub fn ');
+            lskVar:    Write('  pub var ');
+            lskLet:    Write('  pub let ');
+            lskCon:    Write('  pub con ');
+            lskStruct: Write('  pub struct ');
+            lskClass:  Write('  pub class ');
+            lskEnum:   Write('  pub enum ');
+            lskExternFn: Write('  pub extern fn ');
+          else
+            Write('  pub ??? ');
+          end;
+          Write(loadedUnit.Symbols[i].Name);
+          if loadedUnit.Symbols[i].TypeInfo <> '' then
+            Write('(', loadedUnit.Symbols[i].TypeInfo, ')');
+          WriteLn;
+        end;
+        
+        // Zeige IR-Informationen falls vorhanden
+        if Assigned(loadedUnit.IRModule) then
+        begin
+          WriteLn;
+          WriteLn('IR-Code: ', Length(loadedUnit.IRModule.Functions), ' Funktion(en)');
+          for i := 0 to High(loadedUnit.IRModule.Functions) do
+            WriteLn('  fn ', loadedUnit.IRModule.Functions[i].Name, 
+                    ' (params=', loadedUnit.IRModule.Functions[i].ParamCount,
+                    ', locals=', loadedUnit.IRModule.Functions[i].LocalCount, ')');
+        end;
+        
+      finally
+        loadedUnit.Free;
+        deser.Free;
+      end;
+    finally
+      buffer.Free;
+      d.Free;
+      ser.Free;
+    end;
+    
     Halt(0);
   end;
 
