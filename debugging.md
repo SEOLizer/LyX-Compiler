@@ -103,7 +103,39 @@ Gibt den IR-Code als Pseudo-Assembler aus.
 
 ---
 
-### 7. Relocation-Dump (`--dump-relocs`)
+### 7. AST Visualisierung (`--ast-dump`)
+
+Zeigt den AST-Baum nach dem Parsen. Nützlich für das Verständnis der AST-Struktur und für Debugging des Parsers.
+
+```bash
+./lyxc test.lyx -o test --ast-dump
+```
+
+Ausgabe:
+```
+=== AST Tree (WP-A) ===
+
+AST Program with N declarations
+Source: test.lyx
+
+[Declaration 0]
+  + Node(ID=0 kind=ImportDecl)
+[Declaration 1]
+  + Node(ID=7 kind=FuncDecl name=main)
+    + Node(ID=8 kind=Block stmts=3)
+      + Node(ID=9 kind=VarDecl name=x)
+      + Node(ID=10 kind=Assign)
+      + Node(ID=11 kind=If)
+```
+
+- **ID**: Eindeutige AST-Knoten-ID (WP-F Provenance Tracking)
+- **Kind**: Knotentyp (z.B. `FuncDecl`, `Block`, `If`, `VarDecl`, `BinOp`, etc.)
+
+**Implementiert in:** `lyxc.lpr` (DumpASTTree und DumpASTNode Prozeduren)
+
+---
+
+### 8. Relocation-Dump (`--dump-relocs`)
 
 ```bash
 ./lyxc test.lyx -o test --dump-relocs
@@ -113,7 +145,7 @@ Zeigt externe Symbole und PLT/GOT-Patches.
 
 ---
 
-### 8. Unit-Info (`--unit-info`)
+### 9. Unit-Info (`--unit-info`)
 
 Zeigt Informationen über vorkompilierte Units (.lyu).
 
@@ -133,7 +165,7 @@ IR-Code: M Funktionen
 
 ---
 
-### 9. Trace-Imports (`--trace-imports`)
+### 10. Trace-Imports (`--trace-imports`)
 
 Debuggt die Import-Auflösung.
 
