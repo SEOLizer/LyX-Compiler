@@ -1045,7 +1045,7 @@ TOR-Optionen (DO-178C Tool Qualification):
   --config        Aktive Konfiguration ausgeben (TOR-003)
 ```
 
-**Linter Rules (13 total):**
+**Linter Rules (26 total):**
 
 | Code | Rule | Description |
 |------|------|-------------|
@@ -1062,6 +1062,19 @@ TOR-Optionen (DO-178C Tool Qualification):
 | W011 | `format-zero-decimals` | `:width:0` format specifier — use `PrintInt()` instead |
 | W012 | `string-concat-literals` | `"a" + "b"` can be a single literal at compile time |
 | W013 | `print-float-int-arg` | `PrintFloat(intLit as f64)` — use `PrintInt()` instead |
+| W014 | `recursive-function` | Recursive function (for stack predictability — MISRA 5.2) |
+| W015 | `implicit-type-cast` | Implicit type conversion without `as` (MISRA 5.2) |
+| W016 | `dead-loop` | Infinite loop without exit condition / break |
+| W017 | `pointer-arithmetic` | Pointer arithmetic (MISRA 5.2) |
+| W018 | `incomplete-switch` | Switch without default or missing enum values (MISRA 5.2) |
+| W019 | `function-too-long` | Function > 60 lines (MISRA 5.2) |
+| W020 | `complex-function` | Cyclomatic complexity > 15 (MISRA 5.2) |
+| W021 | `global-mutable` | `var` at module level (race conditions) |
+| W022 | `todo-comment` | Find `// TODO` comments |
+| W023 | `magic-number` | Hardcoded numbers (magic numbers) |
+| W024 | `unbounded-loop` | While without limit() (WCET) |
+| W025 | `resource-leak` | mmap without munmap (resource leak) |
+| W026 | `unchecked-error` | Ignored error codes |
 
 **Testing ARM64 binaries (on x86_64):**
 ```bash
