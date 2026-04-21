@@ -49,6 +49,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Assembly Listing: Source-annotated assembly output with hex bytes (--asm-listing) (v0.7.0)
 ✅ Runtime Assertions: Bounds, Null, Zero, Boolean checks at runtime (--runtime-checks) (v0.9.0)
 ✅ DWARF Debug Info: DWARF 4 sections for gdb/lldb/VS Code (-g) (v0.9.0)
+✅ Simple Profiler: Function call timing via profile_enter/profile_leave/profile_report (--profile) (v0.9.0)
 ✅ Static Analysis: Data-Flow, Live-Vars, Const-Prop, Null-Ptr, Array-Bounds, Termination, Stack (--static-analysis) (v0.7.0)
 ✅ Test Generation: Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution (v0.7.0)
 ✅ ESP32 Safety: Watchdog, Brownout, Flash-Verify, MPU, Stack-Canary (v0.7.0)
@@ -1037,6 +1038,7 @@ Optionen:
   --call-graph     Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)
   --map-file       Speicherlayout-Datei (.map) für Debug/Audit
   --runtime-checks  Runtime-Assertions (bounds, null, zero, boolean) für DO-178C
+  --profile       Profiler: instrument function calls (WP-3)
   -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):
