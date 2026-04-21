@@ -50,6 +50,8 @@ type
     // Source location tracking for assembly listing (aerospace-todo 6.1)
     FCurrentSourceLine: Integer;
     FCurrentSourceFile: string;
+    // Provenance Tracking (WP-F): current AST node being lowered
+    FCurrentASTNode: TAstNode;  // current AST node for provenance
 
     function NewTemp: Integer;
     function IsGlobalVar(const name: string): Boolean;
@@ -370,6 +372,17 @@ begin
   // Attach source location to IR instruction (aerospace-todo 6.1)
   instr.SourceLine := FCurrentSourceLine;
   instr.SourceFile := FCurrentSourceFile;
+  // Provenance Tracking (WP-F): attach AST node reference
+  if Assigned(FCurrentASTNode) then
+  begin
+    instr.SourceASTID := FCurrentASTNode.ID;
+    instr.SourceASTKind := Ord(FCurrentASTNode.Kind);
+  end
+  else
+  begin
+    instr.SourceASTID := -1;
+    instr.SourceASTKind := -1;
+  end;
   FCurrentFunc.Emit(instr);
 end;
 
@@ -1481,6 +1494,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
   Result := -1;
   if not Assigned(expr) then
     Exit;
+
+  // Provenance Tracking (WP-F): set current AST node for IR provenance
+  FCurrentASTNode := expr;
 
   // Initialize instruction
   instr := Default(TIRInstr);
@@ -5167,6 +5183,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
   begin
     FCurrentSourceLine := stmt.Span.Line;
     FCurrentSourceFile := stmt.Span.FileName;
+    // Provenance Tracking (WP-F): set current AST node for IR provenance
+    FCurrentASTNode := stmt;
   end;
   instr := Default(TIRInstr);
   Result := True;

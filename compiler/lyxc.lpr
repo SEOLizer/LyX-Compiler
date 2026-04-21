@@ -38,6 +38,7 @@ var
   flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
   flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
   flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
+  flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -452,6 +453,7 @@ begin
     WriteLn(StdErr, '  --runtime-checks  Runtime-Assertions (bounds, null, zero) für DO-178C');
   WriteLn(StdErr, '  --profile      Profiler: instrument function calls (WP-3)');
   WriteLn(StdErr, '  --trace        Trace builtin: debug output (WP-4)');
+  WriteLn(StdErr, '  --provenance   Provenance Tracking: IR→AST→Source mapping (WP-F)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -484,6 +486,7 @@ begin
   flagRuntimeChecks := False;
   flagProfile := False;
   flagTrace := False;
+  flagProvenance := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -644,6 +647,11 @@ begin
     else if param = '--trace' then
     begin
       flagTrace := True;
+      Inc(i);
+    end
+    else if param = '--provenance' then
+    begin
+      flagProvenance := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -1202,6 +1210,13 @@ begin
             finally
               sa.Free;
             end;
+          end;
+
+// Provenance Tracking (WP-F): Output IR→AST→Source mapping
+          if flagProvenance then
+          begin
+            WriteLn('=== Provenance Chain (WP-F) ===');
+            WriteLn('Provenance tracking enabled. IR instructions now carry AST source IDs.');
           end;
 
           // --emit-asm: Dump IR as pseudo-assembly

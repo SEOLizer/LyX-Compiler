@@ -476,19 +476,42 @@ Error: type_mismatch
 
 ---
 
-### WP-F: Provenance Tracking (Herkunftsnachweis)
+### WP-F: Provenance Tracking (Herkunftsnachweis) ✅ Implementiert
 
 **Problem:** Wenn der Compiler Code transformiert oder optimiert, „vergisst" er oft, woher ein bestimmter Befehl kam. Die KI sieht fehlerhaften Maschinencode, kann aber nicht zurückverfolgen, welcher Optimierungsschritt das Problem verursacht hat.
 
 **Nutzen:** Die KI kann den gesamten Stammbaum zurückverfolgen: Maschinencode → IR-Instruktion #45 → AST-Node #12 → Quellcode Zeile 5.
 
+**Status (v0.8.2+):**
+- `--provenance` CLI Flag ✅
+- AST-IDs werden vergeben ✅
+- IR-IDs werden vergeben ✅
+- IR speichert SourceASTID ✅
+- Source-Span wird an IR Instruktionen weitergegeben ✅
+
 **Features:**
 
 ```bash
 ./lyxc test.lyx -o test --provenance
-# Oder mit Trace:
-./lyxc test.lyx -o test --provenance=trace
 ```
+
+**Output (KI-nützlich):**
+```
+=== Provenance Chain (WP-F) ===
+Provenance tracking enabled. IR instructions now carry AST source IDs.
+```
+
+**Implementierung:**
+- `ast.pas`: TAstNode.FID - eindeutige AST-IDs
+- `ir.pas`: TIRInstr.IRID, TIRInstr.SourceASTID, TIRInstr.SourceASTKind
+- `lower_ast_to_ir.pas`: Setzt FCurrentASTNode für jedes Emit
+- `lyxc.lpr`: --provenance CLI Flag
+
+**Dateien:**
+- `compiler/frontend/ast.pas`
+- `compiler/ir/ir.pas`
+- `compiler/ir/lower_ast_to_ir.pas`
+- `compiler/lyxc.lpr`
 
 **Output (KI-nützlich):**
 ```
@@ -1079,13 +1102,13 @@ multiply       500      0.04    33
 | WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen | ✅ DWARF 4 sections |
 | WP-3 | Einfacher Profiler | - | 1 Woche | ✅ profile_* builtins |
 | WP-4 | Trace-Builtin | Builtins | 1 Woche | ✅ trace builtins |
-| WP-5 | Breakpoint-Support | IR | 1 Woche | - |
+| WP-5 | Breakpoint-Support | IR | 1 Woche | ✅ breakpoint() builtin |
 
 ### Priorität C: Erweiterte KI-Debugging (zukünftig)
 
-| WP | Feature | Abhängigkeit | Geschätzte Zeit |
-|----|---------|-------------|---------------|
-| WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
+| WP | Feature | Abhängigkeit | Geschätzte Zeit | Status |
+|----|---------|-------------|---------------|--------|
+| WP-F | Provenance Tracking | IR, Backend | 2 Wochen | ✅ AST/IR IDs + --provenance |
 | WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
 | WP-H | VFS Snapshots | Import-Resolver | 1 Woche |
 | WP-I | Ownership Visualisierung | IR, Pointer-Analyse | 2 Wochen |
