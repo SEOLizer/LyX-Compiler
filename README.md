@@ -1041,6 +1041,12 @@ Optionen:
   --runtime-checks  Runtime-Assertions (bounds, null, zero, boolean) für DO-178C
   --profile       Profiler: instrument function calls (WP-3)
   --trace        Trace builtin: debug output (WP-4)
+  --provenance   Provenance Tracking: Token→AST→IR→MachineCode (WP-F)
+  --ast-dump     AST Visualisierung: Text-Baum der AST-Struktur (WP-A)
+  --symtab-dump  Symbol-Tabelle: alle Scopes und Symbole (WP-B)
+  --trace-passes Transformation Tracing: Pass-by-Pass mit Zeitmessung (WP-C)
+  --ir-source-map IR Source Mapping: Zeilennummern in IR-Dump (WP-D)
+  --type-reasoning Type-Checker Reasoning: detailliertes Typ-Logging (WP-E)
   -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):
