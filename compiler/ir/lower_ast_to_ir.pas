@@ -3108,6 +3108,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
           Emit(instr); Result := -1;
         end
+        // breakpoint() - Debugger breakpoint (WP-5)
+        else if (call.Name = 'breakpoint') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'breakpoint';
+          instr.ImmInt := 0; SetLength(instr.ArgTemps, 0);
+          instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
         else if ((call.Name = 'VerifyIntegrity') or
                  ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
         begin
