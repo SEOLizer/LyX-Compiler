@@ -476,6 +476,397 @@ Error: type_mismatch
 
 ---
 
+### WP-F: Provenance Tracking (Herkunftsnachweis)
+
+**Problem:** Wenn der Compiler Code transformiert oder optimiert, „vergisst" er oft, woher ein bestimmter Befehl kam. Die KI sieht fehlerhaften Maschinencode, kann aber nicht zurückverfolgen, welcher Optimierungsschritt das Problem verursacht hat.
+
+**Nutzen:** Die KI kann den gesamten Stammbaum zurückverfolgen: Maschinencode → IR-Instruktion #45 → AST-Node #12 → Quellcode Zeile 5.
+
+**Features:**
+
+```bash
+./lyxc test.lyx -o test --provenance
+# Oder mit Trace:
+./lyxc test.lyx -o test --provenance=trace
+```
+
+**Output (KI-nützlich):**
+```
+=== Provenance Chain ===
+MachineCode:0x1004  [REX,W: add rax, rdx]
+  └── IR: irAdd t3, t1, t2          ; IR#45, func=add
+      └── AST: BinOp(+)               ; AST#12, line 7, col 5
+          ├── LHS: LocalRef a       ; line 5
+          └── RHS: IntLit 2
+      └── Source: test.lyx:7:5
+```
+
+**Unique IDs pro Ebene:**
+```
+ 每个 Objekt erhält eine eindeutige ID:
+  - Token-ID: tk0001, tk0002, ...
+  - AST-ID: n0001, n0002, ... (nk-Präfix aus ast.pas)
+  - IR-ID: ir0001, ir0002, ...
+  - MachineCode-ID: mc0001, mc0002, ...
+```
+
+**Parent-Tracking:**
+```
+IR Instruktion speichert:
+  - ParentFunction: add (F-ID: f0001)
+  - SourceAST: n0012 (AST-ID)
+  - SourceSpan: (7, 5) - (7, 15)
+  - OriginalToken: tk0042
+```
+
+**Reverse-Mapping (für Debugging):**
+```
+Suche rückwärts von Maschinencode zu Quelle:
+  $ ./lyxc --provenance-lookup 0x1004
+  0x1004 -> IR#45 -> AST#12 -> test.lyx:7:5
+```
+
+**Implementierung:**
+1. Jede Schicht vergibt eindeutige IDs (Token, AST, IR, Maschinencode)
+2. `TProvenanceChain` speichert Parent-Verweise (1:1 und 1:N)
+3. `TObject.WithParent(child, parent)` - verknüpft Objekte
+4. CLI `--provenance` und `--provenance-lookup <addr>`
+
+**Dateien:**
+- `frontend/lexer.pas` vergibt Token-IDs
+- `frontend/parser.pas` vergibt AST-IDs
+- `ir/ir.pas` vergibt IR-IDs
+- `backend/x86_64_emit.pas` vergibt MC-IDs und verknüpft mit IR
+
+---
+
+### WP-G: Constraint-Log-Dumps
+
+**Problem:** Falls die Sprache ein modernes Typsystem nutzt, arbeitet der Compiler intern mit einem Constraint Solver. „Type Mismatch" ist zu wenig – die KI braucht die gelösten und widersprüchlichen Constraints.
+
+**Nutzen:** Die KI sieht genau, an welcher Stelle ein widersprüchlicher Constraint eingeführt wurde.
+
+**Features:**
+
+```bash
+./lyxc test.lyx -o test --constraint-log
+```
+
+**Output (einfach):**
+```
+=== Constraint Solving ===
+Constraint: T1 == T2       ; line 3
+  Given: T1 = int64
+  Result: T2 = int64     ✓ SOLVED
+
+Constraint: T3 < T4        ; line 5
+  Given: T3 = int64
+  Result: T4 = unknown   ⏳ PENDING
+```
+
+**Output (komplex – widersprüchlich):**
+```
+Error: type_mismatch at line 12
+  Expression: foo(a, b)
+  
+=== Constraint Solving ===
+[1] T_result == fn(int64, T2) -> T3    ; line 3, from: decl foo
+[2] T2 == pchar                   ; line 5, from: param b
+[3] T_result == int64             ; line 12, from: expected
+  
+  Trying to unify:
+    [1] + [2]: fn(int64, pchar) -> T3
+    [3]: Requires T_result == int64
+    → CONFLICT: fn(int64, pchar) -> int64 vs fn(int64, pchar) -> unknown
+  
+  Search history:
+    1. Try: T3 = int64              ← FAILED (line 3 constraint)
+    2. Try: T3 = pchar            ← FAILED (line 5 constraint)
+    3. Try: T3 = Unknown         ← PENDING
+  
+  Suggestion: Add explicit return type to foo or cast b to int64
+```
+
+**Constraint-Typen:**
+```
+| Typ | Struktur | Beispiel |
+|----|----------|----------|
+| Equality | T1 == T2 | int64 == int64 |
+| Subtype | T1 <: T2 | Array<int> <: Sequence<int> |
+| Trait | T1 implements T2 | Foo implements Printable |
+| Width | T1 |>= T2 | int >= int32 (width subtyping) |
+```
+
+**Implementierung:**
+1. `TConstraint` Record: (Left, Right, SourceSpan, Status)
+2. `TConstraintSolver` sammelt alle Constraints
+3. `Solve()` gibt verbose Log aus bei `--constraint-log`
+4. `TSemaError` zeigt „Search history" mit Failed/Pending-Slots
+
+**Dateien:**
+- `frontend/sema.pas` erstellt Constraints
+- Neue Datei: `ir/constraint_solver.pas`
+
+---
+
+### WP-H: Virtual File System (VFS) Snapshots
+
+**Problem:** Compiler-Fehler entstehen durch komplexe Import-Strukturen oder Makros, die Dateien im Speicher verändern. Die KI sieht den Code anders als der Compiler.
+
+**Nutzen:** Die KI sieht den Code exakt so, wie der Compiler ihn gesehen hat – inklusive aller aufgelösten Makros und Header.
+
+**Features:**
+
+```bash
+./lyxc main.lyx -o main --vfs-snapshot
+# Oder bei Fehler automatisch:
+./lyxc main.lyx -o main  # Auto-Dump bei dkError
+```
+
+**Output:**
+```
+=== Virtual File System ===
+Files: 3
+  [0] main.lyx          (real)   42 lines   1242 bytes
+  [1] utils.lyx         (real)   89 lines   2840 bytes
+  [2] _macro_expand_0   (virtual) 12 lines   320 bytes  ← from: macro join()
+
+=== VFS: _macro_expand_0 ===
+1: // Expanded from: utils.lyx::join(a, b)
+2: fn join(a: pchar, b: pchar) -> pchar {
+3:   let len_a = strlen(a);
+4:   let len_b = strlen(b);
+5:   let result = malloc(len_a + len_b + 1);
+6:   memcpy(result, a, len_a);
+7:   memcpy(result + len_a, b, len_b);
+8:   return result;
+9: }
+```
+
+**VFS mit Import-Tracking:**
+```
+=== Import Graph ===
+main.lyx
+  └─import utils            ; line 2
+      └─import stdio       ; line 1 (utils.lyx)
+          └─ (stdlib loaded)
+```
+
+**Makro-Auflösung:**
+```
+=== Macro Expansion ===
+join(a, b) → _macro_0
+  Parameter mapping:
+    a → $1 (pchar)
+    b → $2 (pchar)
+  
+  Body after expansion:
+    let result = malloc(strlen($1) + strlen($2) + 1);
+    memcpy(result, $1, strlen($1));
+    memcpy(result + strlen($1), $2, strlen($2));
+    return result;
+```
+
+**Implementierung:**
+1. `TVirtualFile` – speichert Original + Modifikationen
+2. `TVFS` – verwaltet alle geladenen Dateien
+3. Bei `--vfs-snapshot`: Export als JSON oder text
+4. Bei Sema-Fehler: Auto-Dump in `/tmp/lyx_vfs_<pid>.log`
+
+**Dateien:**
+- Neue Datei: `frontend/vfs.pas`
+- Integration in `import_resolver.pas`
+
+---
+
+### WP-I: Memory Ownership & Lifetime Visualisierung
+
+**Problem:** Bei System-Programmiersprachen ist es für KIs schwer, den Überblick über Pointer-Besitzverhältnisse zu behalten. „Dangling Pointer" oder „Use-after-free" sind im Code unsichtbar.
+
+**Nutzen:** Die KI erkennt strukturell Besitzverletzungen.
+
+**Features:**
+
+```bash
+./lyxc test.lyx -o test --ownership-dump
+# Oder als Graphviz:
+./lyxc test.lyx -o test --ownership-dump=dot
+```
+
+**Output (DAG):**
+```
+=== Ownership Graph ===
+Node: buffer (var pchar, main:5)
+  Owner: main
+  Lifespan: [main:5, main:12]
+  Children:
+    └─ malloc(1024) → [main:5]
+
+Node: fd (var int, main:20)
+  Owner: file_open()
+  Lifespan: [file_open, file_close]
+  Borrowed by: main:25 (immutable)
+```
+
+**Use-After-Free Erkennung:**
+```
+Warning: potential_use_after_free
+  Pointer: buffer (line 5)
+  Owner: main
+  Lifespan: [5, 12]
+  Freed: line 12
+  Used: line 15 ← VIOLATION
+  
+  Path:
+    1. malloc -> line 5: buffer = malloc(1024)
+    2. free -> line 12: dispose(buffer)
+    3. use -> line 15: strlen(buffer) ← AFTER FREE
+```
+
+**Lifetime-Diagramm:**
+```
+main:     |=======buffer=======|
+              dispose          ← Error hier!
+main:           5----12------15
+```
+
+**Graphviz DOT:**
+```dot
+digraph Ownership {
+  node [shape=box];
+  "buffer" [label="buffer\npchar\nowned by main"];
+  "malloc" -> "buffer";
+  "dispose" -> "buffer" [style=dashed, color=red];
+  "strlen" -> "buffer" [style=dashed, color=red];
+}
+```
+
+**Implementierung:**
+1. `TOwnerGraph` – DAG für Besitzverhältnisse
+2. `TLifetime` – (StartLine, EndLine) pro Allokation
+3. `CheckUseAfterFree()` – statische Analyse
+4. `CheckDoubleFree()` –Detektion
+5. CLI `--ownership-dump[=text|dot]`
+
+**Dateien:**
+- Neue Datei: `ir/ownership_analysis.pas`
+- Integration in `ir_static_analysis.pas`
+
+---
+
+### WP-J: Compiler-Zustands-Serialisierung (The "Brain Dump")
+
+**Problem:** Der Fehler liegt selten im Code des Nutzers, sondern in einer ungünstigen Kombination von Compiler-Flags. Die KI braucht den kompletten internen Zustand.
+
+**Nutzen:** Die KI kann Korrelationen finden: „Der Fehler tritt nur auf, wenn -O3 und --target-simd gleichzeitig aktiv sind."
+
+**Features:**
+
+```bash
+# Bei Fehler automatisch:
+./lyxc test.lyx -o test  
+# Erzeugt: /tmp/lyx_crash_<pid>.json
+
+# Oder manuell:
+./lyxc --brain-dump
+```
+
+**Output (JSON):**
+```json
+{
+  "lyx_version": "0.2.0",
+  "build_timestamp": "2026-04-21T10:30:00Z",
+  "target": {
+    "arch": "x86_64",
+    "os": "linux",
+    "abi": "sysv"
+  },
+  "active_flags": [
+    "-O3",
+    "--target-simd",
+    "--static-analysis"
+  ],
+  "configuration": {
+    "optimization": {
+      "level": 3,
+      "inline_threshold": 32,
+      "simd_enabled": true,
+      "loop_unrolling": "full"
+    },
+    "code_gen": {
+      "pic": true,
+      "relocations": "dynamic",
+      "stack_alignment": 16
+    },
+    "analysis": {
+      "bounds_check": true,
+      "null_check": true
+    }
+  },
+  "statistics": {
+    "tokens_processed": 1242,
+    "ast_nodes": 342,
+    "ir_instructions": 892,
+    "functions_compiled": 12,
+    "compilation_time_ms": 45
+  },
+  "loaded_units": [
+    "stdlib@0.1.0",
+    "utils@0.2.1"
+  ],
+  "active_passes": [
+    "lexer",
+    "parser", 
+    "sema",
+    "lower_ast_to_ir",
+    "ir_optimize",
+    "codegen"
+  ],
+  " heuristics": {
+    "inline_decision": {
+      "hotness_threshold": 1000,
+      "size_threshold": 32,
+      "depth_limit": 5
+    }
+  }
+}
+```
+
+**Korrelations-Analyse:**
+```
+=== Flag Correlations ===
+Error: segmentation_fault
+  Occurs with: [-O3, --target-simd]     ← 100% correlation
+  Also seen with: [-O2, --target-simd]  ← 60% correlation
+  Never seen with: [-O0]                   ← 0%
+  
+  Hypothesis: SIMD + O3 causes register pressure
+```
+
+**Crash-Dump bei Signal:**
+```
+=== Signal: SIGSEGV ===
+  Address: 0x0000000000000010
+  Faulting Code:
+    mov rax, [rax]    ; Null pointer dereference
+  Backtrace:
+    #0 main (test.lyx:5)
+    #1 _start
+  Compiler State: saved to /tmp/lyx_crash_12345.json
+```
+
+**Implementierung:**
+1. `TCompilerState` – Singleton für globalen Zustand
+2. `SerializeToJSON()` – vollständiger Dump
+3. Bei Signal (SIGSEGV etc.): Auto-Dump
+4. `--brain-dump` und `--brain-dump-on-crash`
+
+**Dateien:**
+- Neue Datei: `util/compiler_state.pas`
+- Signal-Handler in `lyxc.lpr`
+
+---
+
 ## Neue Feature-Vorschläge ( nach Priorität geordnet)
 
 ### WP-1: Runtime Assertions (P0 - Für DO-178C) ✅ Implementiert
@@ -501,9 +892,10 @@ Error: type_mismatch
 
 ---
 
-### WP-2: DWARF Debug Info (P1 - Tools-Integration)
+### WP-2: DWARF Debug Info (P1 - Tools-Integration) 🚧 IN PROGRESS
 
 **Motivation:** Integration mit externen Debuggern (gdb, lldb, VS Code).
+**Status:** Implementierung begonnen (2026-04-21)
 
 **Features:**
 - DWARF 4 Sektionen generieren
@@ -517,10 +909,79 @@ Error: type_mismatch
 # Erzeugt ELF mit DWARF-Debug-Sektionen
 ```
 
+**IR-Unterstützung (bereits vorhanden):**
+- `TIRInstr.SourceLine: Integer` - Quellcode-Zeilennummer
+- `TIRInstr.SourceFile: string` - Quelldatei-Name
+
+**Architektur:**
+```
+Code-Generation Pipeline:
+  IR Module ──(x86_64_emit)──> codeBuf, dataBuf ──(elf64_writer)──> ELF
+                              │
+                              └── IR Module ──(dwarf_gen)──────> .debug_* Sektionen
+                                                            │
+                                                            └── kombiniert ──> final ELF
+```
+
 **Implementierung:**
-1. DWARF-Tabellen in `elf64_writer.pas`
-2. Source-Line-Mapping speichern
-3. Lokal/Param-Offset für Variablen
+
+1. **Neue Unit: `ir/dwarf_gen.pas`**
+   - `TDwarfGenerator` Klasse
+   - Erzeugt DWARF 4 Sektionen aus IR
+
+2. **DWARF Sektionen:**
+   ```
+   | Sektion | Inhalt | Format |
+   |--------|-------|--------|
+   | .debug_abbrev | Abbreviation-Tabellen | <0x00><len><CU>... |
+   | .debug_info | Compile-Unit, Funktionen, Variablen | <entry><die>... |
+   | .debug_line | Zeilennummern-Mapping | <header><stmt Program> |
+   | .debug_frame | Call-Frame-Information | FDEs für Stack-Unwind |
+   ```
+
+3. **CLI-Integration in `lyxc.lpr`:**
+   ```pascal
+   if CmdLine.HasFlag('-g') then
+     dwarfGen := TDwarfGenerator.Create(module);
+     DebugSections := dwarfGen.Generate;
+     WriteElf64WithDebug(..., DebugSections);
+   ```
+
+4. **Signatur-Änderung (breaking):**
+   ```pascal
+   // Alt:
+   procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; entryVA: UInt64);
+   
+   // Neu:
+   procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; 
+     entryVA: UInt64; const dwarfBuf: TByteBuffer = nil);
+   ```
+
+**Aufgaben:**
+- [x] IR speichert SourceLine/SourceFile (bereits vorhanden)
+- [ ] TDwarfGenerator Klasse implementieren
+- [ ] WriteElf64 Signatur erweitern
+- [ ] .debug_abbrev Sektion generieren
+- [ ] .debug_info Sektion generieren (CU, Subprograms, Variables)
+- [ ] .debug_line Sektion generieren
+- [ ] .debug_frame Sektion generieren
+- [ ] ELF-Layout anpassen (neue Sektionen einfügen)
+- [ ] CLI -g Flag hinzufügen
+- [ ] Test mit readelf -w
+
+**Test:**
+```bash
+# Kompilieren mit -g
+./lyxc test.lyx -o test -g
+
+# Debug-Sektionen prüfen
+readelf -w test | head -50
+
+# Mit gdb debuggen
+gdb ./test
+(gdb) break test.lyx:5
+(gdb) run
+```
 
 ---
 
@@ -591,16 +1052,31 @@ multiply       500      0.04    33
 | WP-C | Transformation Tracing | alle Phasen | 1 Woche |
 | WP-D | IR mit Source-Mapping | Lowering | 1 Woche |
 | WP-E | Type-Checker Reasoning | Sema | 2 Wochen |
+| WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
+| WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
+| WP-H | VFS Snapshots | Import-Resolver | 1 Woche |
+| WP-I | Ownership Visualisierung | IR, Pointer-Analyse | 2 Wochen |
+| WP-J | Compiler-Zustands-Serialisierung | alle Phasen | 1 Woche |
 
 ### Priorität B: Runtime/Debugging (mittelfristig)
 
 | WP | Feature | Abhängigkeit | Geschätzte Zeit | Status |
-|----|---------|-------------|---------------|-------|
+|----|---------|-------------|---------------|-------|-------|
 | WP-1 | Runtime Assertions | IR, Optimizer | 2 Wochen | ✅ IR-Ops + x86_64 |
 | WP-2 | DWARF Debug Info | ELF Writer | 3 Wochen | - |
 | WP-3 | Einfacher Profiler | - | 1 Woche | - |
 | WP-4 | Trace-Builtin | Builtins | 1 Woche | - |
 | WP-5 | Breakpoint-Support | IR | 1 Woche | - |
+
+### Priorität C: Erweiterte KI-Debugging (zukünftig)
+
+| WP | Feature | Abhängigkeit | Geschätzte Zeit |
+|----|---------|-------------|---------------|
+| WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
+| WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
+| WP-H | VFS Snapshots | Import-Resolver | 1 Woche |
+| WP-I | Ownership Visualisierung | IR, Pointer-Analyse | 2 Wochen |
+| WP-J | Compiler-Zustands-Serialisierung | alle Phasen | 1 Woche |
 
 ---
 
@@ -636,7 +1112,8 @@ cd compiler && ./tests/test_generation     # Fuzzing
 ## Changelog
 
 | Version | Datum | Änderung |
-|---------|-------|---------|
+|--------|-------|---------|
+| 1.3.0 | 2026-04-21 | +WP-F: Provenance Tracking (Herkunftsnachweis: Token→AST→IR→MachineCode) <br> +WP-G: Constraint-Log-Dumps (Typsystem-Debugging) <br> +WP-H: VFS Snapshots (Makro/Import-Auflösung) <br> +WP-I: Memory Ownership & Lifetime Visualisierung (DAG für Besitzverhältnisse) <br> +WP-J: Compiler-Zustands-Serialisierung ("Brain Dump" + Korrelations-Analyse) |
 | 1.2.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI |
 | 1.1.0 | 2026-04-21 | +KI-Debugging-Features: AST, SymTab, Tracing, IR-Mapping, Type-Reasoning |
 | 1.0.0 | 2026-04-21 | Initiales Debugging-Konzept |
