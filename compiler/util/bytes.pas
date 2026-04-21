@@ -37,6 +37,7 @@ type
     function Size: Integer;
     function GetBuffer: PByte;
     procedure SaveToFile(const fileName: string);
+    procedure LoadFromFile(const fileName: string);
     procedure Clear;
   end;
 
@@ -236,6 +237,24 @@ begin
   try
     if FSize > 0 then
       fs.WriteBuffer(FData[0], FSize);
+  finally
+    fs.Free;
+  end;
+end;
+
+procedure TByteBuffer.LoadFromFile(const fileName: string);
+var
+  fs: TFileStream;
+begin
+  Clear;
+  if not FileExists(fileName) then
+    raise Exception.Create('File not found: ' + fileName);
+  fs := TFileStream.Create(fileName, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(FData, fs.Size);
+    FSize := fs.Size;
+    if FSize > 0 then
+      fs.ReadBuffer(FData[0], FSize);
   finally
     fs.Free;
   end;
