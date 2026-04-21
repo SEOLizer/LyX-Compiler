@@ -55,6 +55,8 @@ type
     FCurrentNestedFunc: TAstFuncDecl; // nested function currently being analyzed
     // WP-E: Type Checker Reasoning
     FVerboseReasoning: Boolean; // enable verbose type reasoning output
+    // WP-G: Constraint Log Dumps
+    FConstraintLog: Boolean; // enable constraint solving logging
     procedure PushScope;
     procedure PopScope;
     procedure AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
@@ -96,6 +98,10 @@ type
     property VerboseReasoning: Boolean read FVerboseReasoning write FVerboseReasoning;
     procedure LogTypeCheck(const msg: string);
     procedure LogTypeCheckExpr(expr: TAstExpr; const context: string);
+    // WP-G: Constraint Log Dumps
+    property ConstraintLog: Boolean read FConstraintLog write FConstraintLog;
+    procedure LogConstraint(const constraintType, leftType, rightType: string; span: TSourceSpan; status: string);
+    procedure LogTypeEquality(const type1, type2: string; span: TSourceSpan; solved: Boolean);
   end;
 
 implementation
@@ -2922,17 +2928,21 @@ begin
                  // Float arithmetic
                  Result := atF64;
                end
-               else if not IsIntegerType(lt) or not IsIntegerType(rt) then
-               begin
-                 FDiag.Error('type error: arithmetic requires numeric (integer or float) operands', bin.Span);
-                 Result := atInt64;
-               end
-               else
-               begin
-                 // Integer arithmetic
-                 // promote to 64-bit for now
-                 Result := atInt64;
-               end;
+else if not IsIntegerType(lt) or not IsIntegerType(rt) then
+                begin
+                  // WP-G: Log constraint failure
+                  LogConstraint('TypeCheck', AurumTypeToStr(lt), AurumTypeToStr(rt), bin.Span, 'FAILED');
+                  FDiag.Error('type error: arithmetic requires numeric (integer or float) operands', bin.Span);
+                  Result := atInt64;
+                end
+                else
+                begin
+                  // Integer arithmetic
+                  // promote to 64-bit for now
+                  Result := atInt64;
+                  // WP-G: Log successful constraint
+                  LogConstraint('Arithmetic', AurumTypeToStr(lt), AurumTypeToStr(rt), bin.Span, 'OK');
+                end;
              end;
             tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
               begin
@@ -3924,7 +3934,16 @@ begin
         end;
         vtype := CheckExpr(asg.Value);
         if not TypeEqual(vtype, s.DeclType) then
+        begin
+          // WP-G: Log constraint failure
+          LogConstraint('Assignment', AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype), stmt.Span, 'FAILED');
           FDiag.Error(Format('assignment type mismatch: %s := %s', [AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype)]), stmt.Span);
+        end
+        else
+        begin
+          // WP-G: Log successful constraint
+          LogConstraint('Assignment', AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype), stmt.Span, 'OK');
+        end;
       end;
     nkFieldAssign:
       begin
@@ -4278,6 +4297,7 @@ begin
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
   FVerboseReasoning := False;  // WP-E: disabled by default
+  FConstraintLog := False;  // WP-G: disabled by default
   SetLength(FScopes, 0);
   // create global scope
   PushScope;
@@ -6512,6 +6532,33 @@ begin
       WriteLn('FieldAccess .', TAstFieldAccess(expr).Field, ' (', GetTypeName(expr.ResolvedType), ')')
     else
       WriteLn('NodeKind_', Ord(expr.Kind), ' (', GetTypeName(expr.ResolvedType), ')');
+  end;
+end;
+
+{ WP-G: Constraint Log Dumps }
+procedure TSema.LogConstraint(const constraintType, leftType, rightType: string; span: TSourceSpan; status: string);
+begin
+  if FConstraintLog then
+  begin
+    Write('[Constraint] ', constraintType, ': ');
+    Write(leftType);
+    if rightType <> '' then
+      Write(' == ', rightType);
+    Write('  ; line ', span.Line);
+    if status <> '' then
+      Write(' [', status, ']');
+    WriteLn;
+  end;
+end;
+
+procedure TSema.LogTypeEquality(const type1, type2: string; span: TSourceSpan; solved: Boolean);
+begin
+  if FConstraintLog then
+  begin
+    if solved then
+      WriteLn('  ✓ SOLVED: ', type1, ' == ', type2, ' (line ', span.Line, ')')
+    else
+      WriteLn('  ⏳ PENDING: ', type1, ' == ', type2, ' (line ', span.Line, ')');
   end;
 end;
 

@@ -44,6 +44,7 @@ var
   flagTracepasses: Boolean;  // --trace-passes (WP-C: Transformation Tracing)
   flagIRSourceMap: Boolean;  // --ir-source-map (WP-D: IR mit Source-Mapping)
   flagTypereasoning: Boolean;  // --type-reasoning (WP-E: Type-Checker Reasoning)
+  flagConstraintLog: Boolean;  // --constraint-log (WP-G: Constraint-Log-Dumps)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -653,6 +654,7 @@ begin
   WriteLn(StdErr, '  --trace-passes Transformation Tracing (WP-C)');
   WriteLn(StdErr, '  --ir-source-map IR Source Mapping anzeigen (WP-D)');
   WriteLn(StdErr, '  --type-reasoning Type-Checker Reasoning anzeigen (WP-E)');
+  WriteLn(StdErr, '  --constraint-log Constraint-Log ausgeben (WP-G)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -691,6 +693,7 @@ begin
   flagTracepasses := False;
   flagIRSourceMap := False;
   flagTypereasoning := False;
+  flagConstraintLog := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -881,6 +884,11 @@ begin
     else if param = '--type-reasoning' then
     begin
       flagTypereasoning := True;
+      Inc(i);
+    end
+    else if param = '--constraint-log' then
+    begin
+      flagConstraintLog := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -1329,6 +1337,12 @@ begin
           begin
             s.VerboseReasoning := True;
             WriteLn('[Type-Check] Type Checker Reasoning ENABLED');
+          end;
+          // WP-G: Enable constraint logging if flag is set
+          if flagConstraintLog then
+          begin
+            s.ConstraintLog := True;
+            WriteLn('[Constraint] Constraint Log Dumps ENABLED');
           end;
           s.AnalyzeWithUnits(prog, um);
           if d.HasErrors then
