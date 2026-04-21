@@ -20,6 +20,8 @@ type
     ReturnTypeName: string; // for functions: name of return type if struct
     ReturnStructDecl: TAstStructDecl; // for functions: struct decl if returns struct
     ArrayLen: Integer; // 0 = not array, >0 = static length, -1 = dynamic
+    // WP-B: Source location where symbol was defined
+    DefSpan: TSourceSpan;
     // for functions
     ParamTypes: array of TAurumType;
     ParamCount: Integer;
@@ -86,6 +88,8 @@ type
     function RewriteExpr(expr: TAstExpr): TAstExpr;
     function RewriteStmt(stmt: TAstStmt): TAstStmt;
     procedure RewriteAST(prog: TAstProgram);
+    // WP-B: Symbol table visualization
+    procedure DumpSymbolTable;
   end;
 
 implementation
@@ -218,7 +222,10 @@ begin
   ParamCount := 0;
   IsVarArgs := False;
   IsGlobal := False;
+  IsExtern := False;
+  IsImported := False;
   SetLength(ParamTypes, 0);
+  DefSpan := NullSpan; // WP-B: Initialize with NullSpan
 end;
 
 destructor TSymbol.Destroy;
@@ -1126,6 +1133,8 @@ begin
     sym.Free;
     Exit;
   end;
+  // WP-B: Store the definition span in the symbol
+  sym.DefSpan := span;
   cur.AddObject(sym.Name, System.TObject(sym));
 end;
 
@@ -6267,6 +6276,168 @@ begin
           fn.Body.Stmts[j] := RewriteStmt(fn.Body.Stmts[j]);
       end;
     end;
+  end;
+end;
+
+{ WP-B: Symbol Table Visualization }
+function GetSymbolKindName(kind: TSymbolKind): string;
+begin
+  case kind of
+    symVar: Result := 'var';
+    symLet: Result := 'let';
+    symCon: Result := 'con';
+    symFunc: Result := 'fn';
+    else Result := 'unknown';
+  end;
+end;
+
+function GetTypeName(t: TAurumType): string;
+begin
+  case t of
+    atInt8: Result := 'int8';
+    atInt16: Result := 'int16';
+    atInt32: Result := 'int32';
+    atInt64: Result := 'int64';
+    atUInt8: Result := 'uint8';
+    atUInt16: Result := 'uint16';
+    atUInt32: Result := 'uint32';
+    atUInt64: Result := 'uint64';
+    atISize: Result := 'int';
+    atUSize: Result := 'uint';
+    atF32: Result := 'f32';
+    atF64: Result := 'f64';
+    atBool: Result := 'bool';
+    atChar: Result := 'char';
+    atVoid: Result := 'void';
+    atPChar: Result := 'pchar';
+    atPCharNullable: Result := 'pchar?';
+    atDynArray: Result := 'array';
+    atArray: Result := 'array';
+    atMap: Result := 'Map';
+    atSet: Result := 'Set';
+    atParallelArray: Result := 'parallel Array';
+    atFnPtr: Result := 'fnptr';
+    atTuple: Result := 'tuple';
+    else Result := 'unknown';
+  end;
+end;
+
+procedure TSema.DumpSymbolTable;
+var
+  i, j, k: Integer;
+  sl: TStringList;
+  sym: TSymbol;
+  scopeKind: string;
+begin
+  WriteLn;
+  WriteLn('=== Symbol Table (WP-B) ===');
+  WriteLn;
+
+  if Length(FScopes) = 0 then
+  begin
+    WriteLn('No scopes found.');
+    Exit;
+  end;
+
+  // Dump each scope
+  for i := 0 to High(FScopes) do
+  begin
+    sl := FScopes[i];
+
+    // Determine scope kind
+    if i = 0 then
+      scopeKind := 'Global'
+    else
+      scopeKind := 'Local (depth=' + IntToStr(i) + ')';
+
+    WriteLn('Scope ', i, ': ', scopeKind);
+    WriteLn('  ', StringOfChar('-', 60));
+
+    if sl.Count = 0 then
+    begin
+      WriteLn('  (empty)');
+    end
+    else
+    begin
+      for j := 0 to sl.Count - 1 do
+      begin
+        sym := TSymbol(sl.Objects[j]);
+
+        // Write basic symbol info
+        Write('  ', sym.Name:20, ' ', GetSymbolKindName(sym.Kind):4);
+
+        // Write type info
+        if sym.Kind = symFunc then
+        begin
+          Write(' ', GetTypeName(sym.DeclType));
+          if sym.ParamCount > 0 then
+          begin
+            Write('(');
+            if Length(sym.ParamTypes) > 0 then
+            begin
+              Write(GetTypeName(sym.ParamTypes[0]));
+              for k := 1 to High(sym.ParamTypes) do
+                Write(', ', GetTypeName(sym.ParamTypes[k]));
+            end;
+            Write(')');
+          end;
+          if sym.IsExtern then
+            Write(' [extern]');
+          if sym.IsImported then
+            Write(' [imported]');
+        end
+        else
+        begin
+          // Variable/let/const
+          Write(' ', GetTypeName(sym.DeclType));
+          if sym.TypeName <> '' then
+            Write(' ', sym.TypeName);
+          if sym.ArrayLen > 0 then
+            Write('[', sym.ArrayLen, ']')
+          else if sym.ArrayLen < 0 then
+            Write('[]');
+          if sym.IsGlobal then
+            Write(' [global]');
+        end;
+
+        WriteLn;
+
+        // Write definition location if available
+        if (sym.DefSpan.Line > 0) or (sym.DefSpan.Filename <> '') then
+        begin
+          Write('    defined at: ');
+          if sym.DefSpan.Filename <> '' then
+            Write(sym.DefSpan.Filename, ':');
+          WriteLn(sym.DefSpan.Line, ':', sym.DefSpan.Col);
+        end;
+      end;
+    end;
+
+    WriteLn;
+  end;
+
+  // Dump struct types
+  if FStructTypes.Count > 0 then
+  begin
+    WriteLn('Struct Types:');
+    WriteLn('  ', StringOfChar('-', 60));
+    for i := 0 to FStructTypes.Count - 1 do
+    begin
+      WriteLn('  ', FStructTypes[i]);
+    end;
+    WriteLn;
+  end;
+
+  // Dump class types
+  if FClassTypes.Count > 0 then
+  begin
+    WriteLn('Class Types:');
+    WriteLn('  ', StringOfChar('-', 60));
+    for i := 0 to FClassTypes.Count - 1 do
+    begin
+      WriteLn('  ', FClassTypes[i]);
+    end;
+    WriteLn;
   end;
 end;
 
