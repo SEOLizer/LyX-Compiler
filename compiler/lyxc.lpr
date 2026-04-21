@@ -702,7 +702,13 @@ begin
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
   WriteLn('Eingabe:  ', inputFile);
-  WriteLn('Ausgabe:  ', outputFile);
+  if flagCompileUnit then
+    WriteLn('Modus:    Unit-Kompilierung')
+  else if flagUnitInfo then
+    WriteLn('Modus:    Unit-Info')
+  else
+  begin
+    WriteLn('Ausgabe:  ', outputFile);
     if target = targetWindows then
       WriteLn('Ziel:     Windows x64 (PE32+)')
     else if target = targetLinux then
@@ -715,9 +721,10 @@ begin
       WriteLn('Ziel:     macOS ARM64 (Mach-O)')
     else if target = targetESP32 then
       WriteLn('Ziel:     ESP32 (Xtensa, ELF32)');
+  end;
 
   // Energy-Konfiguration setzen (vor der Statusausgabe)
-  if flagEnergyLevel > 0 then
+  if (flagEnergyLevel > 0) and not flagUnitInfo and not flagCompileUnit then
   begin
     case target of
       targetLinux: SetEnergyLevel(TEnergyLevel(flagEnergyLevel), cfX86_64);
@@ -726,7 +733,7 @@ begin
     end;
   end;
 
-  if flagEnergyLevel > 0 then
+  if (flagEnergyLevel > 0) and not flagUnitInfo and not flagCompileUnit then
   begin
     WriteLn('Energy-Level: ', flagEnergyLevel);
     case flagEnergyLevel of
