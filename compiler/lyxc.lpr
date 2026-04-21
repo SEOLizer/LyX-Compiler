@@ -6,7 +6,7 @@ uses
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter, unit_format,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
-  asm_listing, map_file,
+  dwarf_gen, asm_listing, map_file,
   x86_64_emit, elf64_writer,
   x86_64_win64{$IFDEF LINUX}, pe64_writer{$ENDIF},
   arm64_emit, elf64_arm64_writer,
@@ -84,6 +84,9 @@ var
   codeSize, dataSize, alignedCodeSize, hashDataOffset: Integer;
   codeStartVA, dataVA: UInt64;
   dataAddrPos: Integer;
+  // DWARF debug info
+  dwarfGen: TDwarfGenerator;
+  debugAbbrev, debugInfo, debugLine, debugFrame, debugStr: TByteBuffer;
   mcdc: TMCDCInstrumenter;
   mcdcCount: Integer;
   sa: TStaticAnalyzer;
@@ -639,6 +642,12 @@ begin
     end
     else if param = '--debug-symbols' then
     begin
+      flagDebugSymbols := True;
+      Inc(i);
+    end
+    else if param = '-g' then
+    begin
+      // DWARF debug info (same as -g in gcc/clang)
       flagDebugSymbols := True;
       Inc(i);
     end
@@ -1284,20 +1293,36 @@ begin
                  WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
                  WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
                end
-               else
-               begin
-                 entryVA := $400000 + 4096;
-                 if module.UnitIntegrity.Mode <> imNone then
-                 begin
-                   WriteLn('Generating static ELF with .meta_safe section');
-                   WriteElf64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
-                 end
-                 else
-                 begin
-                   WriteLn('Generating static ELF (no external symbols)');
-                   WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
-                 end;
-               end;
+else
+                begin
+                  entryVA := $400000 + 4096;
+                  if module.UnitIntegrity.Mode <> imNone then
+                  begin
+                    WriteLn('Generating static ELF with .meta_safe section');
+                    WriteElf64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
+                  end
+                  else
+                  begin
+                    if flagDebugSymbols then
+                    begin
+                      // Generate DWARF debug info
+                      WriteLn('Generating static ELF with DWARF debug info');
+                      dwarfGen := TDwarfGenerator.Create(module, ExtractFilePath(inputFile));
+                      try
+                        dwarfGen.Generate(debugAbbrev, debugInfo, debugLine, debugFrame, debugStr);
+                        WriteElf64WithDebug(outputFile, codeBuf, dataBuf, debugAbbrev, debugInfo,
+                          debugLine, debugFrame, debugStr, entryVA);
+                      finally
+                        dwarfGen.Free;
+                      end;
+                    end
+else
+                    begin
+                      WriteLn('Generating static ELF (no external symbols)');
+                      WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+                    end;
+                  end;
+                end;
  
                 // Energy statistics output
                 if flagEnergyLevel > 0 then

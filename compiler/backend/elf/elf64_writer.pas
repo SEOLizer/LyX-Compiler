@@ -7,6 +7,8 @@ uses
   SysUtils, Classes, bytes, backend_types;
 
 procedure WriteElf64(const filename: string; const codeBuf, dataBuf: TByteBuffer; entryVA: UInt64);
+procedure WriteElf64WithDebug(const filename: string; const codeBuf, dataBuf, debugAbbrev, debugInfo,
+  debugLine, debugFrame, debugStr: TByteBuffer; entryVA: UInt64);
 procedure WriteElf64WithMetaSafe(const filename: string; const codeBuf, dataBuf: TByteBuffer;
   entryVA: UInt64; const integrity: TIntegrityAttr);
 procedure WriteElf64WithBuildId(const filename: string; const codeBuf, dataBuf: TByteBuffer;
@@ -310,6 +312,289 @@ begin
          // Pad to shstrtab offset
         while fileBuf.Position < Int64(shStrTabOff) do fileBuf.WriteByte(0);
         fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
+        // Pad to section headers offset
+        while fileBuf.Position < Int64(shdrsOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shdrs.GetBuffer^, shdrs.Size);
+      finally
+        fileBuf.Free;
+      end;
+    finally
+      phdr.Free;
+      elfHeader.Free;
+    end;
+    finally
+      shdrs.Free;
+      shStrTab.Free;
+    end;
+ end;
+
+// ============================================================
+// Static ELF writer with DWARF debug info
+// ============================================================
+procedure WriteElf64WithDebug(const filename: string; const codeBuf, dataBuf, debugAbbrev, debugInfo,
+  debugLine, debugFrame, debugStr: TByteBuffer; entryVA: UInt64);
+var
+  pageSize: UInt64 = 4096;
+  codeOffset: UInt64;
+  codeSize: UInt64;
+  dataBufSize: UInt64;
+  debugAbbrevSize, debugInfoSize, debugLineSize, debugFrameSize, debugStrSize: UInt64;
+  debugAbbrevOff, debugInfoOff, debugLineOff, debugFrameOff, debugStrOff: UInt64;
+  fileBuf: TFileStream;
+  elfHeader: TByteBuffer;
+  phdr: TByteBuffer;
+  filesz, memsz: UInt64;
+  baseVA: UInt64;
+  shStrTab: TByteBuffer;
+  shdrs: TByteBuffer;
+  shStrTabOff, shdrsOff: UInt64;
+  shStrTabSize: UInt64;
+  numShdrs: Integer;
+  shdrSize: UInt64 = 64;
+begin
+  baseVA := $400000;
+  codeSize := codeBuf.Size;
+  codeOffset := pageSize;
+
+  if Assigned(dataBuf) then
+    dataBufSize := dataBuf.Size
+  else
+    dataBufSize := 0;
+
+  // DWARF section sizes
+  if Assigned(debugAbbrev) then debugAbbrevSize := debugAbbrev.Size else debugAbbrevSize := 0;
+  if Assigned(debugInfo) then debugInfoSize := debugInfo.Size else debugInfoSize := 0;
+  if Assigned(debugLine) then debugLineSize := debugLine.Size else debugLineSize := 0;
+  if Assigned(debugFrame) then debugFrameSize := debugFrame.Size else debugFrameSize := 0;
+  if Assigned(debugStr) then debugStrSize := debugStr.Size else debugStrSize := 0;
+
+  shStrTab := TByteBuffer.Create;
+  shdrs := TByteBuffer.Create;
+  try
+    shStrTab.WriteU8(0); // empty string at offset 0
+
+    // Section names for static ELF with DWARF
+    // .text = 1
+    shStrTab.WriteBytes([Ord('.'), Ord('t'), Ord('e'), Ord('x'), Ord('t'), 0]);
+    // .shstrtab = 7
+    shStrTab.WriteBytes([Ord('.'), Ord('s'), Ord('h'), Ord('s'), Ord('t'),
+      Ord('r'), Ord('t'), Ord('a'), Ord('b'), 0]);
+    // .debug_abbrev = 17
+    shStrTab.WriteBytes([Ord('.'), Ord('d'), Ord('e'), Ord('b'), Ord('u'),
+      Ord('g'), Ord('_'), Ord('a'), Ord('b'), Ord('b'), Ord('r'), Ord('e'), Ord('v'), 0]);
+    // .debug_info = 31
+    shStrTab.WriteBytes([Ord('.'), Ord('d'), Ord('e'), Ord('b'), Ord('u'),
+      Ord('g'), Ord('_'), Ord('i'), Ord('n'), Ord('f'), Ord('o'), 0]);
+    // .debug_line = 43
+    shStrTab.WriteBytes([Ord('.'), Ord('d'), Ord('e'), Ord('b'), Ord('u'),
+      Ord('g'), Ord('_'), Ord('l'), Ord('i'), Ord('n'), Ord('e'), 0]);
+    // .debug_frame = 55
+    shStrTab.WriteBytes([Ord('.'), Ord('d'), Ord('e'), Ord('b'), Ord('u'),
+      Ord('g'), Ord('_'), Ord('f'), Ord('r'), Ord('a'), Ord('m'), Ord('e'), 0]);
+    // .debug_str = 68
+    shStrTab.WriteBytes([Ord('.'), Ord('d'), Ord('e'), Ord('b'), Ord('u'),
+      Ord('g'), Ord('_'), Ord('s'), Ord('t'), Ord('r'), 0]);
+
+    shStrTabSize := shStrTab.Size;
+
+    // Calculate offsets
+    // Layout: ELF header + phdr + padding + code + data + debug_str + debug sections + shstrtab + section headers
+    debugStrOff := codeOffset + codeSize + dataBufSize;
+    debugStrOff := AlignUp(debugStrOff, 8);
+
+    debugAbbrevOff := debugStrOff + debugStrSize;
+    debugAbbrevOff := AlignUp(debugAbbrevOff, 8);
+
+    debugInfoOff := debugAbbrevOff + debugAbbrevSize;
+    debugInfoOff := AlignUp(debugInfoOff, 8);
+
+    debugLineOff := debugInfoOff + debugInfoSize;
+    debugLineOff := AlignUp(debugLineOff, 8);
+
+    debugFrameOff := debugLineOff + debugLineSize;
+    debugFrameOff := AlignUp(debugFrameOff, 8);
+
+    shStrTabOff := debugFrameOff + debugFrameSize;
+    shStrTabOff := AlignUp(shStrTabOff, 8);
+
+    shdrsOff := shStrTabOff + shStrTabSize;
+    shdrsOff := AlignUp(shdrsOff, 8);
+
+    // 8 sections: NULL + .text + .debug_str + .debug_abbrev + .debug_info + .debug_line + .debug_frame + .shstrtab
+    numShdrs := 8;
+
+    // Section Header 0: NULL
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 1: .text
+    shdrs.WriteU32LE(1); // sh_name = ".text"
+    shdrs.WriteU32LE(1); // SHT_PROGBITS
+    shdrs.WriteU64LE(6); // SHF_ALLOC | SHF_EXECINSTR
+    shdrs.WriteU64LE(baseVA + codeOffset);
+    shdrs.WriteU64LE(codeOffset);
+    shdrs.WriteU64LE(codeSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(16);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 2: .debug_str
+    shdrs.WriteU32LE(68); // sh_name = ".debug_str"
+    shdrs.WriteU32LE(3); // SHT_PROGBITS
+    shdrs.WriteU64LE(0); // no flags
+    shdrs.WriteU64LE(0); // no address
+    shdrs.WriteU64LE(debugStrOff);
+    shdrs.WriteU64LE(debugStrSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 3: .debug_abbrev
+    shdrs.WriteU32LE(17); // sh_name = ".debug_abbrev"
+    shdrs.WriteU32LE(3); // SHT_PROGBITS
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(debugAbbrevOff);
+    shdrs.WriteU64LE(debugAbbrevSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 4: .debug_info
+    shdrs.WriteU32LE(31); // sh_name = ".debug_info"
+    shdrs.WriteU32LE(3); // SHT_PROGBITS
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(debugInfoOff);
+    shdrs.WriteU64LE(debugInfoSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 5: .debug_line
+    shdrs.WriteU32LE(43); // sh_name = ".debug_line"
+    shdrs.WriteU32LE(3); // SHT_PROGBITS
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(debugLineOff);
+    shdrs.WriteU64LE(debugLineSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 6: .debug_frame
+    shdrs.WriteU32LE(55); // sh_name = ".debug_frame"
+    shdrs.WriteU32LE(3); // SHT_PROGBITS
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(debugFrameOff);
+    shdrs.WriteU64LE(debugFrameSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(8);
+    shdrs.WriteU64LE(0);
+
+    // Section Header 7: .shstrtab
+    shdrs.WriteU32LE(7); // sh_name = ".shstrtab"
+    shdrs.WriteU32LE(3); // SHT_STRTAB
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(0);
+    shdrs.WriteU64LE(shStrTabOff);
+    shdrs.WriteU64LE(shStrTabSize);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU32LE(0);
+    shdrs.WriteU64LE(1);
+    shdrs.WriteU64LE(0);
+
+    elfHeader := TByteBuffer.Create;
+    phdr := TByteBuffer.Create;
+    try
+      // e_ident
+      elfHeader.WriteBytes([$7F, Ord('E'), Ord('L'), Ord('F')]);
+      elfHeader.WriteU8(2); // ELFCLASS64
+      elfHeader.WriteU8(1); // ELFDATA2LSB
+      elfHeader.WriteU8(1); // EV_CURRENT
+      elfHeader.WriteU8(0); // OSABI
+      elfHeader.WriteU8(0); // ABI version
+      elfHeader.WriteBytesFill(7, 0);
+
+      elfHeader.WriteU16LE(2); // ET_EXEC
+      elfHeader.WriteU16LE(62); // EM_X86_64
+      elfHeader.WriteU32LE(1); // e_version
+      elfHeader.WriteU64LE(entryVA); // e_entry
+      elfHeader.WriteU64LE(64); // e_phoff
+      elfHeader.WriteU64LE(shdrsOff); // e_shoff
+      elfHeader.WriteU32LE(0); // e_flags
+      elfHeader.WriteU16LE(64); // e_ehsize
+      elfHeader.WriteU16LE(56); // e_phentsize
+      elfHeader.WriteU16LE(1); // e_phnum
+      elfHeader.WriteU16LE(shdrSize); // e_shentsize
+      elfHeader.WriteU16LE(numShdrs); // e_shnum
+      elfHeader.WriteU16LE(7); // e_shstrndx
+
+      phdr.WriteU32LE(1); // PT_LOAD
+      phdr.WriteU32LE(4 or 2 or 1); // PF_R|PF_W|PF_X
+      phdr.WriteU64LE(codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+      phdr.WriteU64LE(baseVA + codeOffset);
+      filesz := shdrsOff - codeOffset + UInt64(shdrs.Size);
+      memsz := filesz;
+      phdr.WriteU64LE(filesz);
+      phdr.WriteU64LE(memsz);
+      phdr.WriteU64LE(pageSize);
+
+      fileBuf := TFileStream.Create(filename, fmCreate);
+      try
+        fileBuf.WriteBuffer(elfHeader.GetBuffer^, elfHeader.Size);
+        fileBuf.WriteBuffer(phdr.GetBuffer^, phdr.Size);
+        while fileBuf.Position < Int64(codeOffset) do fileBuf.WriteByte(0);
+        if codeSize > 0 then
+          fileBuf.WriteBuffer(codeBuf.GetBuffer^, codeSize);
+        if dataBufSize > 0 then
+          fileBuf.WriteBuffer(dataBuf.GetBuffer^, dataBufSize);
+
+        // Pad to debug_str offset
+        while fileBuf.Position < Int64(debugStrOff) do fileBuf.WriteByte(0);
+        if debugStrSize > 0 then
+          fileBuf.WriteBuffer(debugStr.GetBuffer^, debugStrSize);
+
+        // Pad to debug_abbrev offset
+        while fileBuf.Position < Int64(debugAbbrevOff) do fileBuf.WriteByte(0);
+        if debugAbbrevSize > 0 then
+          fileBuf.WriteBuffer(debugAbbrev.GetBuffer^, debugAbbrevSize);
+
+        // Pad to debug_info offset
+        while fileBuf.Position < Int64(debugInfoOff) do fileBuf.WriteByte(0);
+        if debugInfoSize > 0 then
+          fileBuf.WriteBuffer(debugInfo.GetBuffer^, debugInfoSize);
+
+        // Pad to debug_line offset
+        while fileBuf.Position < Int64(debugLineOff) do fileBuf.WriteByte(0);
+        if debugLineSize > 0 then
+          fileBuf.WriteBuffer(debugLine.GetBuffer^, debugLineSize);
+
+        // Pad to debug_frame offset
+        while fileBuf.Position < Int64(debugFrameOff) do fileBuf.WriteByte(0);
+        if debugFrameSize > 0 then
+          fileBuf.WriteBuffer(debugFrame.GetBuffer^, debugFrameSize);
+
+        // Pad to shstrtab offset
+        while fileBuf.Position < Int64(shStrTabOff) do fileBuf.WriteByte(0);
+        fileBuf.WriteBuffer(shStrTab.GetBuffer^, shStrTabSize);
+
         // Pad to section headers offset
         while fileBuf.Position < Int64(shdrsOff) do fileBuf.WriteByte(0);
         fileBuf.WriteBuffer(shdrs.GetBuffer^, shdrs.Size);
