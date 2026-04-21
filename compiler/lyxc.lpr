@@ -41,6 +41,7 @@ var
   flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
   flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
   flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
+  flagTracepasses: Boolean;  // --trace-passes (WP-C: Transformation Tracing)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -478,6 +479,41 @@ begin
     WriteLn('; -> Dynamic ELF (', Length(syms), ' external symbols)');
 end;
 
+{ WP-C: Transformation Tracing (Pass-by-Pass) }
+var
+  FPassStartTime: QWord;
+
+procedure EnterPass(const PassName: string; const InputInfo: string);
+begin
+  if flagTracepasses then
+  begin
+    WriteLn;
+    WriteLn('=== Pass: ', PassName, ' ===');
+    if InputInfo <> '' then
+      WriteLn('Input:  ', InputInfo);
+    FPassStartTime := GetTickCount64;
+  end;
+end;
+
+procedure LeavePass(const PassName: string; const OutputInfo: string);
+var
+  elapsed: QWord;
+begin
+  if flagTracepasses then
+  begin
+    if OutputInfo <> '' then
+      WriteLn('Output: ', OutputInfo);
+    elapsed := GetTickCount64 - FPassStartTime;
+    WriteLn('Done:   ', elapsed, 'ms');
+    WriteLn;
+  end;
+end;
+
+procedure LeavePassSimple(const PassName, OutputInfo: string);
+begin
+  LeavePass(PassName, OutputInfo);
+end;
+
 function CollectLibraries(const symbols: TExternalSymbolArray): TStringArray;
 var
   libList: TStringList;
@@ -600,6 +636,7 @@ begin
   WriteLn(StdErr, '  --provenance   Provenance Tracking: IR→AST→Source mapping (WP-F)');
   WriteLn(StdErr, '  --ast-dump    AST Visualisierung: Text-Baum (WP-A)');
   WriteLn(StdErr, '  --symtab-dump Symbol-Tabelle ausgeben (WP-B)');
+  WriteLn(StdErr, '  --trace-passes Transformation Tracing (WP-C)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -635,6 +672,7 @@ begin
   flagProvenance := False;
   flagAstdump := False;
   flagSymtabdump := False;
+  flagTracepasses := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -810,6 +848,11 @@ begin
     else if param = '--symtab-dump' then
     begin
       flagSymtabdump := True;
+      Inc(i);
+    end
+    else if param = '--trace-passes' then
+    begin
+      flagTracepasses := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -1195,6 +1238,7 @@ begin
     d := TDiagnostics.Create;
     try
       // Phase 1: Parse Hauptdatei
+      EnterPass('Lexer', inputFile + ' (' + IntToStr(src.Text.Length) + ' bytes)');
       lx := TLexer.Create(src.Text, inputFile, d);
       try
         p := TParser.Create(lx, d);
@@ -1206,6 +1250,13 @@ begin
       finally
         lx.Free;
       end;
+      LeavePass('Lexer', '(lexer complete)');
+
+      EnterPass('Parser', '(tokens ready)');
+      if Assigned(prog) and Assigned(prog.Decls) then
+        LeavePass('Parser', 'AST: ' + IntToStr(Length(prog.Decls)) + ' declarations')
+      else
+        LeavePass('Parser', 'AST: (empty)');
 
       // WP-A: AST Visualization
       if flagAstdump and Assigned(prog) then
@@ -1242,6 +1293,7 @@ begin
         end;
 
         // Phase 3: Semantische Analyse (mit Unit-Integration)
+        EnterPass('Semantic Analysis', 'AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
         s := TSema.Create(d);
         try
           s.AnalyzeWithUnits(prog, um);
@@ -1260,6 +1312,7 @@ begin
         finally
           s.Free;
         end;
+        LeavePass('Semantic Analysis', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
 
         // Call Graph Analysis (DO-178C Section 6.1 - WCET-Analyse)
         if flagCallGraph then
@@ -1304,13 +1357,16 @@ begin
         lower := TIRLowering.Create(module, d);
         try
           // First, register constants from imported units so they're available during lowering
+          EnterPass('IR Lowering', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
           lower.LowerImportedUnits(um);
           // Merge IR from precompiled units (.lyu) - simple version
           MergePrecompiledIR(um, module);
           // Then lower the main program
           lower.Lower(prog);
+          LeavePass('IR Lowering', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
           // IR-Level Inlining Optimization
+          EnterPass('IR Inlining', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
           WriteLn('[IR] Running inlining optimization...');
           inliner := TIRInlining.Create(module);
           try
@@ -1318,6 +1374,7 @@ begin
           finally
             inliner.Free;
           end;
+          LeavePass('IR Inlining', 'Inlined functions: 0');
 
           // --emit-asm: Dump IR BEFORE optimization
           if flagEmitAsm then
@@ -1329,6 +1386,7 @@ begin
           // IR-Level Optimizations (Constant Folding, CSE, DCE, etc.)
           if flagOptimize then
           begin
+            EnterPass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
             WriteLn('[IR] Running IR optimizations...');
             optimizer := TIROptimizer.Create(module);
             try
@@ -1338,9 +1396,13 @@ begin
             finally
               optimizer.Free;
             end;
+            LeavePass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions (optimized)');
           end
           else
+          begin
             WriteLn('[IR] IR optimizations disabled');
+            LeavePass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions (no optimization)');
+          end;
 
           // Map File Generation (DO-178C Section 6.1 - Memory Layout)
           if flagMapFile then
@@ -1395,6 +1457,8 @@ begin
 
           // --asm-listing: Assembly listing with source lines (DO-178C 6.1)
           // This is done per-target after code generation
+
+          EnterPass('Code Generation', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
            if target = targetWindows then
            begin
@@ -1546,13 +1610,14 @@ else
                   finally
                     al.Free;
                   end;
-                end;
-  
+end;
+   
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile);
               finally
                 emit.Free;
               end;
+              LeavePass('Code Generation', 'x86_64: ' + IntToStr(codeBuf.Size) + ' bytes code, ' + IntToStr(dataBuf.Size) + ' bytes data');
             end
             else if target = targetLinuxARM64 then
            begin

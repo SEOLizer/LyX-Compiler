@@ -356,7 +356,7 @@ Class Types:
 
 ---
 
-### WP-C: Transformation Tracing (Pass-by-Pass)
+### WP-C: Transformation Tracing (Pass-by-Pass) ✅ Implementiert
 
 **Problem:** Wenn der Fehler im Backend auftritt, ist der Ursprung schwer zu finden.
 
@@ -371,42 +371,48 @@ Class Types:
 **Output:**
 ```
 === Pass: Lexer ===
-Input:  test.lyx (42 bytes)
-Output: 52 tokens
-  [tkIdent, tkParen, ...]
+Input:  test.lyx (286 bytes)
+Output: (lexer complete)
+Done:   7ms
 
 === Pass: Parser ===
-Input:  52 tokens
-Output:  AST (Program)
-  - 3 declarations, 2 statements
+Input:  (tokens ready)
+Output: AST: 2 declarations
+Done:   0ms
 
 === Pass: Semantic Analysis ===
-Input:  AST
-Output:  Typed AST
-  - user_id: int32 (line 3)
-  - add: fn(int64, int64) -> int64 (line 5)
+Input:  AST: 2 declarations
+Output: Typed AST: 2 declarations
+Done:   3ms
 
 === Pass: IR Lowering ===
-Input:  Typed AST
-Output:  IR Module (3 functions)
-  - add: 12 instructions
-  - main: 8 instructions
+Input:  Typed AST: 2 declarations
+Output: IR Module: 1 functions
+Done:   5ms
+
+=== Pass: IR Inlining ===
+Input:  IR Module: 1 functions
+Output: Inlined functions: 0
+Done:   0ms
 
 === Pass: IR Optimization ===
-Input:  IR Module (3 functions, 20 instructions)
-Output:  IR Module (3 functions, 18 instructions)
-  - Folded constant: add -> 42 (line 7)
-  - DCE: removed dead code (line 12)
+Input:  IR Module: 1 functions
+Output: IR Module: 1 functions (optimized)
+Done:   1ms
 
 === Pass: Code Generation ===
-Input:  IR Module
-Output:  x86_64 (892 bytes code)
+Input:  IR Module: 1 functions
+Output: x86_64: 850 bytes code, 8 bytes data
+Done:   97ms
 ```
 
 **Implementierung:**
-1. Pro Pass: `EnterPass(name)`, `LeavePass(name, summary)`
-2. Logging mit Zeitmessung
-3. CLI-Option `--trace-passes`
+1. `EnterPass(name, inputInfo)` - Startet Pass mit Zeitmessung
+2. `LeavePass(name, outputInfo)` - Beendet Pass und zeigt Zusammenfassung
+3. Logging mit Zeitmessung in Millisekunden
+4. CLI-Option `--trace-passes`
+
+**Implementiert in:** `lyxc.lpr` (EnterPass/LeavePass Prozeduren)
 
 ---
 
@@ -1116,7 +1122,7 @@ multiply       500      0.04    33
 |----|---------|-------------|---------------|
 | WP-A | AST Visualisierung | Parser | 1 Woche | ✅ --ast-dump |
 | WP-B | Symbol-Table Snapshots | Sema | 1 Woche | ✅ --symtab-dump |
-| WP-C | Transformation Tracing | alle Phasen | 1 Woche |
+| WP-C | Transformation Tracing | alle Phasen | 1 Woche | ✅ --trace-passes |
 | WP-D | IR mit Source-Mapping | Lowering | 1 Woche |
 | WP-E | Type-Checker Reasoning | Sema | 2 Wochen |
 | WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
@@ -1180,6 +1186,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.6.0 | 2026-04-21 | +WP-C: Transformation Tracing (--trace-passes) + EnterPass/LeavePass Prozeduren <br> +Pass-by-Pass Logging: Lexer → Parser → Sema → IR → Code Gen mit Zeitmessung |
 | 1.5.0 | 2026-04-21 | +WP-A: AST Visualisierung (--ast-dump) + DumpASTTree() <br> +WP-B: Symbol-Table Snapshots (--symtab-dump) + TSymbol.DefSpan + DumpSymbolTable() |
 | 1.4.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI <br> +WP-2: DWARF Debug Info (.debug_info, .debug_line, .debug_frame, .debug_abbrev, .debug_str) + -g CLI <br> +WP-3: Simple Profiler (profile_enter, profile_leave, profile_report) + --profile CLI <br> +WP-4: Trace Builtins (trace, trace_int, trace_str) + --trace CLI |
 | 1.3.0 | 2026-04-21 | +WP-F: Provenance Tracking (Herkunftsnachweis: Token→AST→IR→MachineCode) <br> +WP-G: Constraint-Log-Dumps (Typsystem-Debugging) <br> +WP-H: VFS Snapshots (Makro/Import-Auflösung) <br> +WP-I: Memory Ownership & Lifetime Visualisierung (DAG für Besitzverhältnisse) <br> +WP-J: Compiler-Zustands-Serialisierung ("Brain Dump" + Korrelations-Analyse) |
