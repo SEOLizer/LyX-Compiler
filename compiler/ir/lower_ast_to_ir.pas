@@ -3081,6 +3081,33 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.ImmInt := 0;
           Emit(instr); Result := -1;
         end
+        // trace(msg: pchar) - Trace output (WP-4)
+        else if (call.Name = 'trace') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // trace_int(val: int64) - Trace integer (WP-4)
+        else if (call.Name = 'trace_int') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace_int';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // trace_str(label: pchar, val: pchar) - Trace string (WP-4)
+        else if (call.Name = 'trace_str') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace_str';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
         else if ((call.Name = 'VerifyIntegrity') or
                  ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
         begin

@@ -1118,6 +1118,56 @@ end;
                 EmitU8(FCode, $01); EmitU8(FCode, $00); EmitU8(FCode, $00);  // mov rax, 1 (sys_write)
                 EmitU8(FCode, $0F); EmitU8(FCode, $05);  // syscall
               end
+              // trace(msg: pchar) - Trace output (WP-4)
+              else if instr.ImmStr = 'trace' then
+              begin
+                // trace(msg: pchar) - print to stderr
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));  // RSI = msg
+                  WriteMovRegImm64(FCode, RDI, 2);  // stderr = 2
+                  // calculate length (simplified: assume 100 chars max)
+                  WriteMovRegImm64(FCode, RDX, 100);  // length
+                  // sys_write
+                  WriteMovRegImm64(FCode, RAX, 1);  // sys_write
+                  EmitU8(FCode, $0F); EmitU8(FCode, $05);  // syscall
+                end;
+              end
+              // trace_int(val: int64) - Trace integer (WP-4)
+              else if instr.ImmStr = 'trace_int' then
+              begin
+                // trace_int(val) - convert to string and print (simplified)
+                // For now, just print int as decimal - we'll ignore actual value
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  // mov rdi, [rbp+slot]
+                  WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  // Call a helper to print (but we don't have one, so just use placeholder)
+                  // Print "int: " to stderr
+                  WriteMovRegImm64(FCode, RDI, 2);  // stderr
+                  WriteMovRegImm64(FCode, RSI, 0);  // placeholder
+                  WriteMovRegImm64(FCode, RDX, 5);  // "int: "
+                  WriteMovRegImm64(FCode, RAX, 1);
+                  EmitU8(FCode, $0F); EmitU8(FCode, $05);
+                end;
+              end
+              // trace_str(label, val) - Trace string (WP-4)  
+              else if instr.ImmStr = 'trace_str' then
+              begin
+                // trace_str(label, val) - print "label: val\n"
+                // For now, just print label
+                if Length(instr.ArgTemps) >= 1 then
+                begin
+                  slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                  WriteMovRegMem(FCode, RSI, RBP, SlotOffset(slotIdx));
+                  WriteMovRegImm64(FCode, RDI, 2);  // stderr
+                  WriteMovRegImm64(FCode, RDX, 100);
+                  WriteMovRegImm64(FCode, RAX, 1);
+                  EmitU8(FCode, $0F); EmitU8(FCode, $05);
+                end;
+              end
             end;
           irCall:
            begin

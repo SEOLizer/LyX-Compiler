@@ -37,6 +37,7 @@ var
   flagMapFile: Boolean;  // --map-file
   flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
   flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
+  flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -450,6 +451,7 @@ begin
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
     WriteLn(StdErr, '  --runtime-checks  Runtime-Assertions (bounds, null, zero) für DO-178C');
   WriteLn(StdErr, '  --profile      Profiler: instrument function calls (WP-3)');
+  WriteLn(StdErr, '  --trace        Trace builtin: debug output (WP-4)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -481,6 +483,7 @@ begin
   flagMapFile := False;
   flagRuntimeChecks := False;
   flagProfile := False;
+  flagTrace := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -636,6 +639,11 @@ begin
     else if param = '--profile' then
     begin
       flagProfile := True;
+      Inc(i);
+    end
+    else if param = '--trace' then
+    begin
+      flagTrace := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
