@@ -574,7 +574,7 @@ Suche rückwärts von Maschinencode zu Quelle:
 
 ---
 
-### WP-G: Constraint-Log-Dumps
+### WP-G: Constraint-Log-Dumps ✅ Implementiert
 
 **Problem:** Falls die Sprache ein modernes Typsystem nutzt, arbeitet der Compiler intern mit einem Constraint Solver. „Type Mismatch" ist zu wenig – die KI braucht die gelösten und widersprüchlichen Constraints.
 
@@ -586,53 +586,24 @@ Suche rückwärts von Maschinencode zu Quelle:
 ./lyxc test.lyx -o test --constraint-log
 ```
 
-**Output (einfach):**
+**Output:**
 ```
-=== Constraint Solving ===
-Constraint: T1 == T2       ; line 3
-  Given: T1 = int64
-  Result: T2 = int64     ✓ SOLVED
-
-Constraint: T3 < T4        ; line 5
-  Given: T3 = int64
-  Result: T4 = unknown   ⏳ PENDING
-```
-
-**Output (komplex – widersprüchlich):**
-```
-Error: type_mismatch at line 12
-  Expression: foo(a, b)
-  
-=== Constraint Solving ===
-[1] T_result == fn(int64, T2) -> T3    ; line 3, from: decl foo
-[2] T2 == pchar                   ; line 5, from: param b
-[3] T_result == int64             ; line 12, from: expected
-  
-  Trying to unify:
-    [1] + [2]: fn(int64, pchar) -> T3
-    [3]: Requires T_result == int64
-    → CONFLICT: fn(int64, pchar) -> int64 vs fn(int64, pchar) -> unknown
-  
-  Search history:
-    1. Try: T3 = int64              ← FAILED (line 3 constraint)
-    2. Try: T3 = pchar            ← FAILED (line 5 constraint)
-    3. Try: T3 = Unknown         ← PENDING
-  
-  Suggestion: Add explicit return type to foo or cast b to int64
-```
-
-**Constraint-Typen:**
-```
-| Typ | Struktur | Beispiel |
-|----|----------|----------|
-| Equality | T1 == T2 | int64 == int64 |
-| Subtype | T1 <: T2 | Array<int> <: Sequence<int> |
-| Trait | T1 implements T2 | Foo implements Printable |
-| Width | T1 |>= T2 | int >= int32 (width subtyping) |
+[Constraint] Constraint Log Dumps ENABLED
+[Constraint] TypeCheck: int64 == pchar  ; line 12 [FAILED]
+[Constraint] Assignment: int64 == pchar  ; line 15 [FAILED]
+[Constraint] Arithmetic: int64 == int64  ; line 8 [OK]
 ```
 
 **Implementierung:**
-1. `TConstraint` Record: (Left, Right, SourceSpan, Status)
+1. `TSema.FConstraintLog` Property zum Aktivieren
+2. `LogConstraint()` für allgemeine Constraints
+3. `LogTypeEquality()` für Typ-Gleichheits-Constraints
+4. CLI-Option `--constraint-log`
+5. Logging bei: arithmetischen Operanden, Zuweisungen
+
+**Implementiert in:** `sema.pas` (LogConstraint/LogTypeEquality), `lyxc.lpr` (--constraint-log)
+
+---
 2. `TConstraintSolver` sammelt alle Constraints
 3. `Solve()` gibt verbose Log aus bei `--constraint-log`
 4. `TSemaError` zeigt „Search history" mit Failed/Pending-Slots
@@ -1099,6 +1070,7 @@ multiply       500      0.04    33
 | WP-C | Transformation Tracing | alle Phasen | 1 Woche | ✅ --trace-passes |
 | WP-D | IR mit Source-Mapping | Lowering | 1 Woche | ✅ --ir-source-map |
 | WP-E | Type-Checker Reasoning | Sema | 2 Wochen | ✅ --type-reasoning |
+| WP-G | Constraint-Log-Dumps | Sema | 1 Woche | ✅ --constraint-log |
 | WP-F | Provenance Tracking | IR, Backend | 2 Wochen |
 | WP-G | Constraint-Log-Dumps | Sema | 1 Woche |
 | WP-H | VFS Snapshots | Import-Resolver | 1 Woche |
@@ -1160,6 +1132,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.9.0 | 2026-04-21 | +WP-G: Constraint-Log-Dumps (--constraint-log) + TSema.FConstraintLog <br> +Logging bei arithmetischen Operanden und Zuweisungen |
 | 1.8.0 | 2026-04-21 | +WP-E: Type-Checker Reasoning (--type-reasoning) + TSema.FVerboseReasoning <br> +Logging aller Ausdrücke während der Typprüfung |
 | 1.7.0 | 2026-04-21 | +WP-D: IR mit Source-Mapping (--ir-source-map) + TIRInstr.SourceLine/SourceFile <br> +IR-Dump zeigt Quellcode-Zuordnung als Kommentare |
 | 1.6.0 | 2026-04-21 | +WP-C: Transformation Tracing (--trace-passes) + EnterPass/LeavePass Prozeduren <br> +Pass-by-Pass Logging: Lexer → Parser → Sema → IR → Code Gen mit Zeitmessung |
