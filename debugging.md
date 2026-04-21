@@ -313,7 +313,7 @@ digraph AST {
 
 ---
 
-### WP-B: Symbol-Table Snapshots
+### WP-B: Symbol-Table Snapshots ✅ Implementiert
 
 **Problem:** Die KI muss wissen, welche Variablen/Typen zu jedem Zeitpunkt im Scope bekannt waren.
 
@@ -327,33 +327,32 @@ digraph AST {
 
 **Output:**
 ```
-=== Symbol Table: main ===
-Scope: Global
-  user_id    int32    Global      0x00F0
-  buffer    pchar    Global     0x00F8
-  MAX_BUF   con      Global     0x00
+=== Symbol Table (WP-B) ===
 
-=== Symbol Table: add ===
-Scope: Local (add)
-  a         int64    Local      -16(rbp)
-  b         int64    Local      -8(rbp)
-  result    int64    Local      0(rbp)
-```
+Scope 0: Global
+  ------------------------------------------------------------
+              PrintStr   fn void(pchar)
+               PrintLn   fn void(pchar)
+              PrintInt   fn void(int64)
+            ...
+                  main   fn int64
 
-**Mit Type-Info:**
-```
-=== Symbol Table: add ===
-Scope: Local (add)
-  a         int64    Param      -16(rbp)    [type: int64]
-  b         int64    Param      -8(rbp)     [type: int64]
-  result    int64    Local      0(rbp)      [type: int64]
-    ^- defined at line 5, used at line 6,7
+Struct Types:
+  ------------------------------------------------------------
+  TObject
+
+Class Types:
+  ------------------------------------------------------------
+  TObject
 ```
 
 **Implementierung:**
-1. `TScope.DumpTable()` - Alle Symbole im Scope
-2. Für jedes Symbol: Name, Typ, Scope, Speicherort, Line-Info
+1. `TSymbol.DefSpan` - Source-Span wo Symbol definiert wurde
+2. `TSema.DumpSymbolTable()` - Alle Scopes und Symbole ausgeben
 3. CLI-Option `--symtab-dump`
+4. Zeigt: Name, Kind (var/let/con/fn), Type, Parameter-Typen, Definition-Ort
+
+**Implementiert in:** `sema.pas` (DumpSymbolTable), `lyxc.lpr` (--symtab-dump)
 
 ---
 
@@ -1115,8 +1114,8 @@ multiply       500      0.04    33
 
 | WP | Feature | Abhängigkeit | Geschätzte Zeit |
 |----|---------|-------------|---------------|
-| WP-A | AST Visualisierung | Parser | 1 Woche |
-| WP-B | Symbol-Table Snapshots | Sema | 1 Woche |
+| WP-A | AST Visualisierung | Parser | 1 Woche | ✅ --ast-dump |
+| WP-B | Symbol-Table Snapshots | Sema | 1 Woche | ✅ --symtab-dump |
 | WP-C | Transformation Tracing | alle Phasen | 1 Woche |
 | WP-D | IR mit Source-Mapping | Lowering | 1 Woche |
 | WP-E | Type-Checker Reasoning | Sema | 2 Wochen |
@@ -1181,6 +1180,7 @@ cd compiler && ./tests/test_generation     # Fuzzing
 
 | Version | Datum | Änderung |
 |--------|-------|---------|
+| 1.5.0 | 2026-04-21 | +WP-A: AST Visualisierung (--ast-dump) + DumpASTTree() <br> +WP-B: Symbol-Table Snapshots (--symtab-dump) + TSymbol.DefSpan + DumpSymbolTable() |
 | 1.4.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI <br> +WP-2: DWARF Debug Info (.debug_info, .debug_line, .debug_frame, .debug_abbrev, .debug_str) + -g CLI <br> +WP-3: Simple Profiler (profile_enter, profile_leave, profile_report) + --profile CLI <br> +WP-4: Trace Builtins (trace, trace_int, trace_str) + --trace CLI |
 | 1.3.0 | 2026-04-21 | +WP-F: Provenance Tracking (Herkunftsnachweis: Token→AST→IR→MachineCode) <br> +WP-G: Constraint-Log-Dumps (Typsystem-Debugging) <br> +WP-H: VFS Snapshots (Makro/Import-Auflösung) <br> +WP-I: Memory Ownership & Lifetime Visualisierung (DAG für Besitzverhältnisse) <br> +WP-J: Compiler-Zustands-Serialisierung ("Brain Dump" + Korrelations-Analyse) |
 | 1.2.0 | 2026-04-21 | +WP-1: Runtime Assertions (irAssertBounds, irAssertNotNull, irAssertTrue) + --runtime-checks CLI |

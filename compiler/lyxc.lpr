@@ -40,6 +40,7 @@ var
   flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
   flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
   flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
+  flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -598,6 +599,7 @@ begin
   WriteLn(StdErr, '  --trace        Trace builtin: debug output (WP-4)');
   WriteLn(StdErr, '  --provenance   Provenance Tracking: IR→AST→Source mapping (WP-F)');
   WriteLn(StdErr, '  --ast-dump    AST Visualisierung: Text-Baum (WP-A)');
+  WriteLn(StdErr, '  --symtab-dump Symbol-Tabelle ausgeben (WP-B)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -632,6 +634,7 @@ begin
   flagTrace := False;
   flagProvenance := False;
   flagAstdump := False;
+  flagSymtabdump := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -802,6 +805,11 @@ begin
     else if param = '--ast-dump' then
     begin
       flagAstdump := True;
+      Inc(i);
+    end
+    else if param = '--symtab-dump' then
+    begin
+      flagSymtabdump := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
@@ -1245,6 +1253,10 @@ begin
           // Print any warnings (e.g. safety-pragma warnings) even on success
           if d.WarningCount > 0 then
             d.PrintAll;
+
+          // WP-B: Symbol Table Dump
+          if flagSymtabdump then
+            s.DumpSymbolTable;
         finally
           s.Free;
         end;
