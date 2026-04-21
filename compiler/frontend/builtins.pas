@@ -104,6 +104,11 @@ initialization
   AddBuiltin('', 'profile_leave', 'profile_leave', atVoid, [atPChar]);
   AddBuiltin('', 'profile_report', 'profile_report', atVoid, []);
 
+  // Trace (WP-4)
+  AddBuiltin('', 'trace', 'trace', atVoid, [atPChar]);
+  AddBuiltin('', 'trace_int', 'trace_int', atVoid, [atInt64]);
+  AddBuiltin('', 'trace_str', 'trace_str', atVoid, [atPChar, atPChar]);
+
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
   AddBuiltin('', 'StrLen',    'StrLen',    atInt64,  [atPChar]);

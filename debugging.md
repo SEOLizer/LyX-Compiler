@@ -1019,7 +1019,7 @@ multiply       500      0.04    33
 
 ---
 
-### WP-4: Trace-Builtin (P3 - Logging)
+### WP-4: Trace-Builtin (P3 - Logging) 🚧 IN PROGRESS
 
 **Motivation:** Einfaches Debug-Output ohne println.
 
@@ -1034,6 +1034,12 @@ multiply       500      0.04    33
 # Aktiviert alle trace() Aufrufe
 # Ohne Flag: trace() ist leer (No-Op)
 ```
+
+**Status:**
+- Builtins in `builtins.pas` ✅
+- IR-Lowering in `lower_ast_to_ir.pas` ✅
+- x86_64 Emitter (stub) in `x86_64_emit.pas` ✅
+- CLI `--trace` Flag ✅
 
 ---
 
