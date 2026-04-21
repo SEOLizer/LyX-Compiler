@@ -985,13 +985,13 @@ gdb ./test
 
 ---
 
-### WP-3: Einfacher Profiler (P2 - Performance)
+### WP-3: Einfacher Profiler (P2 - Performance) 🚧 IN PROGRESS
 
 **Motivation:** Performance-Analyse ohne externe Tools.
 
 **Features:**
 - `fn profile_enter(fnName: pchar)` - Funktions-Eintritt messen
-- `fn profile_leave(fnName: pchar)` - Funktions-Austritt messen
+- `fn profile_leave(fnName: pchar)` - Funktions-Austritt messen  
 - `fn profile_report()` - Report ausgeben
 
 **Compiler-Flag:**
@@ -999,6 +999,13 @@ gdb ./test
 ./lyxc test.lyx -o test --profile
 # Instrumentiert alle Funktionsaufrufe
 ```
+
+**Status:** 
+- Builtins in `builtins.pas` ✅
+- IR-Lowering in `lower_ast_to_ir.pas` ✅ 
+- x86_64 Emitter (stub) in `x86_64_emit.pas` ✅
+- CLI `--profile` Flag ✅
+- Sema integration: TODO (functions not yet recognized in parser)
 
 **Output-Beispiel:**
 ```
