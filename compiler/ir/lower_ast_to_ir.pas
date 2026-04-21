@@ -3052,6 +3052,35 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
           Emit(instr); Result := t0;
         end
+        // profile_enter(fn_name) - Profiler function entry (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'enter')) or
+              (call.Name = 'profile_enter') then
+        begin
+          // If using global name, handle same as Profile.enter
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_enter';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // profile_leave(fn_name) - Profiler function leave (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'leave')) or
+              (call.Name = 'profile_leave') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_leave';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // profile_report() - Print profile report (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'report')) or
+              (call.Name = 'profile_report') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_report';
+          instr.ImmInt := 0;
+          Emit(instr); Result := -1;
+        end
         else if ((call.Name = 'VerifyIntegrity') or
                  ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
         begin

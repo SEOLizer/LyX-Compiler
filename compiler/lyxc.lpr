@@ -36,6 +36,7 @@ var
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
   flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
+  flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -448,6 +449,7 @@ begin
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
     WriteLn(StdErr, '  --runtime-checks  Runtime-Assertions (bounds, null, zero) für DO-178C');
+  WriteLn(StdErr, '  --profile      Profiler: instrument function calls (WP-3)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -478,6 +480,7 @@ begin
   flagCallGraph := False;
   flagMapFile := False;
   flagRuntimeChecks := False;
+  flagProfile := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -628,6 +631,11 @@ begin
     else if param = '--runtime-checks' then
     begin
       flagRuntimeChecks := True;
+      Inc(i);
+    end
+    else if param = '--profile' then
+    begin
+      flagProfile := True;
       Inc(i);
     end
     else if param = '--compile-unit' then
