@@ -632,3 +632,547 @@ pub fn LDAPClose(conn: LDAPConn) {
     TCPConnClose(conn.conn);
   }
 }
+
+// ============================================================================
+// WP2: Basisfunktionen - Filter Encoding
+// ============================================================================
+
+// LDAP filter types
+pub con LDAP_FILTER_EQUALITY: int64 := $A3;
+pub con LDAP_FILTER_SUBSTRING: int64 := $A4;
+pub con LDAP_FILTER_PRESENT: int64 := $87;
+pub con LDAP_FILTER_AND: int64 := $A0;
+pub con LDAP_FILTER_OR: int64 := $A1;
+pub con LDAP_FILTER_NOT: int64 := $A2;
+
+// Build equality filter: (attribute=value)
+pub fn LDAPBuildFilterEqual(attr: int64, value: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var attrLen: int64;
+  var valueLen: int64;
+  var filterLen: int64;
+  
+  buf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  attrLen := LDAPStrLen(attr);
+  valueLen := LDAPStrLen(value);
+  
+  // Filter: SEQUENCE { type, value }
+  filterLen := 2 + attrLen + 2 + valueLen;
+  
+  pos := 0;
+  // Filter [APPLICATION 3] = equalityMatch
+  poke8(buf + pos, LDAP_FILTER_EQUALITY);
+  pos := pos + 1;
+  pos := pos + ASN1WriteLength(buf + pos, 0, filterLen);
+  
+  // AttributeType (OctetString)
+  pos := pos + ASN1EncodeOctetString(buf + pos, attr, attrLen);
+  
+  // AttributeValue
+  pos := pos + ASN1EncodeOctetString(buf + pos, value, valueLen);
+  
+  return buf;
+}
+
+// Build present filter: (attribute=*)
+pub fn LDAPBuildFilterPresent(attr: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var attrLen: int64;
+  
+  buf := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  attrLen := LDAPStrLen(attr);
+  
+  pos := 0;
+  // Filter [APPLICATION 7] = present
+  poke8(buf + pos, LDAP_FILTER_PRESENT);
+  pos := pos + 1;
+  pos := pos + ASN1WriteLength(buf + pos, 0, attrLen);
+  
+  // AttributeType (OctetString)
+  pos := pos + ASN1EncodeOctetString(buf + pos, attr, attrLen);
+  
+  return buf;
+}
+
+// Escape special characters in LDAP filter value
+// Returns pointer to escaped string (caller must free)
+pub fn LDAPStrEscapeFilter(input: int64): int64 {
+  var inLen: int64;
+  var outBuf: int64;
+  var outPos: int64;
+  var i: int64;
+  var c: int64;
+  
+  inLen := LDAPStrLen(input);
+  
+  // Worst case: every char needs escaping (*2 + null)
+  outBuf := mmap(0, inLen * 2 + 4, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (outBuf == 0) {
+    return 0;
+  }
+  
+  outPos := 0;
+  i := 0;
+  while (i < inLen) {
+    c := peek8(input + i);
+    
+    // Escape these characters: * ( ) \ NUL
+    if (c == 42 || c == 40 || c == 41 || c == 92 || c == 0) {
+      // Escape with backslash
+      poke8(outBuf + outPos, 92);  // backslash
+      outPos := outPos + 1;
+      // Convert to two hex digits
+      var hexHi: int64 := (c / 16);
+      var hexLo: int64 := c - (hexHi * 16);
+      if (hexHi < 10) { hexHi := hexHi + 48; } else { hexHi := hexHi + 55; }
+      if (hexLo < 10) { hexLo := hexLo + 48; } else { hexLo := hexLo + 55; }
+      poke8(outBuf + outPos, hexHi);
+      outPos := outPos + 1;
+      poke8(outBuf + outPos, hexLo);
+      outPos := outPos + 1;
+    }
+    else {
+      poke8(outBuf + outPos, c);
+      outPos := outPos + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  // Null terminator
+  poke8(outBuf + outPos, 0);
+  
+  return outBuf;
+}
+
+// Escape special characters in DN value
+pub fn LDAPStrEscapeDN(input: int64): int64 {
+  var inLen: int64;
+  var outBuf: int64;
+  var outPos: int64;
+  var i: int64;
+  var c: int64;
+  
+  inLen := LDAPStrLen(input);
+  
+  // Worst case: every char needs escaping (*2 + null)
+  outBuf := mmap(0, inLen * 2 + 4, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (outBuf == 0) {
+    return 0;
+  }
+  
+  outPos := 0;
+  i := 0;
+  while (i < inLen) {
+    c := peek8(input + i);
+    
+    // DN special chars: , = + < > ; " \ # 
+    // Also escape leading/trailing space and comma for values
+    if (c == 44 || c == 61 || c == 43 || c == 60 || c == 62 || c == 59 || 
+        c == 34 || c == 39 || c == 92 || c == 35) {
+      // Escape with backslash
+      poke8(outBuf + outPos, 92);
+      outPos := outPos + 1;
+      // Convert to two hex digits
+      var hexHi: int64 := (c / 16);
+      var hexLo: int64 := c - (hexHi * 16);
+      if (hexHi < 10) { hexHi := hexHi + 48; } else { hexHi := hexHi + 55; }
+      if (hexLo < 10) { hexLo := hexLo + 48; } else { hexLo := hexLo + 55; }
+      poke8(outBuf + outPos, hexHi);
+      outPos := outPos + 1;
+      poke8(outBuf + outPos, hexLo);
+      outPos := outPos + 1;
+    }
+    else {
+      poke8(outBuf + outPos, c);
+      outPos := outPos + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  poke8(outBuf + outPos, 0);
+  
+  return outBuf;
+}
+
+// ============================================================================
+// WP2: Search Result Parsing
+// ============================================================================
+
+// Parse SearchResultEntry
+// Returns pointer to parsed entry with DN and attributes
+// Format: [dn, attr1, val1, attr2, val2, ...]
+pub fn LDAPParseSearchEntry(buf: int64, bufSize: int64): LDAPSearchResult {
+  var entry: LDAPSearchResult;
+  var pos: int64;
+  var tag: int64;
+  var len: int64;
+  
+  entry.dn := 0;
+  entry.dnLen := 0;
+  entry.attrs := 0;
+  entry.attrsLen := 0;
+  
+  if (buf == 0 || bufSize < 10) {
+    return entry;
+  }
+  
+  pos := 0;
+  
+  // Skip outer SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // SearchResultEntry [APPLICATION 4]
+  tag := peek8(buf + pos);
+  if (tag != $64) {  // LDAP_SEARCH_RESULT_ENTRY
+    return entry;
+  }
+  pos := pos + 1;
+  
+  // Skip length
+  len := ASN1ReadLength(buf, pos);
+  pos := pos + ASN1LengthSize(len);
+  
+  // Parse DN (OctetString)
+  tag := peek8(buf + pos);
+  if (tag == ASN1_OCTET_STRING) {
+    var dnLen: int64 := ASN1ReadLength(buf, pos);
+    pos := pos + ASN1LengthSize(dnLen);
+    entry.dn := buf + pos;
+    entry.dnLen := dnLen;
+    pos := pos + dnLen;
+  }
+  
+  // Skip attributes SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    var attrSeqLen: int64 := ASN1ReadLength(buf, pos);
+    pos := pos + ASN1LengthSize(attrSeqLen);
+    entry.attrs := buf + pos;
+    entry.attrsLen := attrSeqLen;
+  }
+  
+  return entry;
+}
+
+// Extract a specific attribute value from parsed entry
+// Returns pointer to value, 0 if not found
+pub fn LDAPGetEntryAttr(entry: LDAPSearchResult, attr: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var len: int64;
+  var attrName: int64;
+  var attrNameLen: int64;
+  var attrValue: int64;
+  var attrValueLen: int64;
+  var i: int64;
+  var j: int64;
+  var match: bool;
+  
+  if (entry.attrs == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  attrNameLen := LDAPStrLen(attr);
+  
+  // Walk through attributes SEQUENCE
+  while (pos < entry.attrsLen - 4) {
+    var attrStart: int64 := entry.attrs + pos;
+    
+    // SEQUENCE { type, values }
+    tag := peek8(attrStart);
+    if (tag != ASN1_SEQUENCE) {
+      return 0;
+    }
+    var attrSetLen: int64 := ASN1ReadLength(attrStart, 0);
+    pos := pos + 1 + ASN1LengthSize(attrSetLen);
+    
+    // AttributeType
+    tag := peek8(entry.attrs + pos);
+    if (tag == ASN1_OCTET_STRING) {
+      var nameLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+      pos := pos + ASN1LengthSize(nameLen);
+      attrName := entry.attrs + pos;
+      pos := pos + nameLen;
+      
+      // Check if this is the attribute we're looking for
+      match := true;
+      if (attrNameLen == nameLen) {
+        i := 0;
+        while (i < nameLen) {
+          if (peek8(attrName + i) != peek8(attr + i)) {
+            match := false;
+            break;
+          }
+          i := i + 1;
+        }
+      }
+      else {
+        match := false;
+      }
+      
+      if (match) {
+        // Found - get first value
+        tag := peek8(entry.attrs + pos);
+        if (tag == ASN1_OCTET_STRING) {
+          var valLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+          pos := pos + ASN1LengthSize(valLen);
+          attrValue := entry.attrs + pos;
+          // Return copy of value (caller must free)
+          var valueBuf: int64 := mmap(0, valLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+          if (valueBuf != 0) {
+            i := 0;
+            while (i < valLen) {
+              poke8(valueBuf + i, peek8(attrValue + i));
+              i := i + 1;
+            }
+            poke8(valueBuf + valLen, 0);
+            return valueBuf;
+          }
+          return 0;
+        }
+      }
+      
+      // Skip to next attribute
+      // Read until next SEQUENCE or end
+      while (pos < entry.attrsLen) {
+        tag := peek8(entry.attrs + pos);
+        if (tag == ASN1_SEQUENCE) {
+          var skipLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+          pos := pos + 1 + ASN1LengthSize(skipLen) + skipLen;
+          break;
+        }
+        pos := pos + 1;
+      }
+    }
+    else {
+      break;
+    }
+  }
+  
+  return 0;
+}
+
+// ============================================================================
+// WP2: Fehlercode zu Text
+// ============================================================================
+
+// Convert LDAP result code to error message
+pub fn LDAPErrorToStr(code: int64): int64 {
+  if (code == 0) { return "Success"; }
+  else if (code == 1) { return "Operations Error"; }
+  else if (code == 2) { return "Protocol Error"; }
+  else if (code == 3) { return "Time Limit Exceeded"; }
+  else if (code == 4) { return "Size Limit Exceeded"; }
+  else if (code == 5) { return "Compare False"; }
+  else if (code == 6) { return "Compare True"; }
+  else if (code == 7) { return "Auth Method Not Supported"; }
+  else if (code == 8) { return "Strong Auth Required"; }
+  else if (code == 10) { return "Referral"; }
+  else if (code == 11) { return "Admin Limit Exceeded"; }
+  else if (code == 12) { return "Unavailable Critical Extension"; }
+  else if (code == 13) { return "Confidentiality Required"; }
+  else if (code == 14) { return "SASL Bind In Progress"; }
+  else if (code == 16) { return "No Such Attribute"; }
+  else if (code == 17) { return "Undefined Attribute Type"; }
+  else if (code == 18) { return "Inappropriate Matching"; }
+  else if (code == 19) { return "Constraint Violation"; }
+  else if (code == 20) { return "Attribute Or Value Exists"; }
+  else if (code == 21) { return "Invalid Attribute Syntax"; }
+  else if (code == 32) { return "No Such Object"; }
+  else if (code == 33) { return "Alias Problem"; }
+  else if (code == 34) { return "Invalid DN Syntax"; }
+  else if (code == 36) { return "Alias Dereferencing Problem"; }
+  else if (code == 48) { return "Inappropriate Authentication"; }
+  else if (code == 49) { return "Invalid Credentials"; }
+  else if (code == 50) { return "Insufficient Access Rights"; }
+  else if (code == 51) { return "Busy"; }
+  else if (code == 52) { return "Unavailable"; }
+  else if (code == 53) { return "Unwilling To Perform"; }
+  else if (code == 54) { return "Loop Detect"; }
+  else if (code == 64) { return "Naming Violation"; }
+  else if (code == 65) { return "Object Class Violation"; }
+  else if (code == 66) { return "Not Allowed On Non-Leaf"; }
+  else if (code == 67) { return "Not Allowed On RDN"; }
+  else if (code == 68) { return "Entry Already Exists"; }
+  else if (code == 69) { return "Object Class Mods Prohibited"; }
+  else if (code == 71) { return "Affects Multiple DSAs"; }
+  else if (code == 80) { return "Other"; }
+  else if (code == -1) { return "Parse Error"; }
+  else if (code == -2) { return "Connection Error"; }
+  else if (code == -3) { return "Timeout"; }
+  return "Unknown Error";
+}
+
+// ============================================================================
+// WP2: DN-Parsing (einfach)
+// ============================================================================
+
+// Count RDN components in a DN
+// Example: "cn=admin,dc=example,dc=com" has 3 RDNs
+pub fn LDAPCountRDNs(dn: int64): int64 {
+  var count: int64 := 1;
+  var i: int64;
+  var c: int64;
+  var len: int64;
+  
+  if (dn == 0) {
+    return 0;
+  }
+  
+  len := LDAPStrLen(dn);
+  i := 0;
+  while (i < len) {
+    c := peek8(dn + i);
+    if (c == 44) {  // comma
+      count := count + 1;
+    }
+    i := i + 1;
+  }
+  
+  return count;
+}
+
+// Get RDN at index (0-based)
+// Returns pointer to copy of RDN (caller must free)
+pub fn LDAPGetRDNAt(dn: int64, index: int64): int64 {
+  var len: int64;
+  var i: int64;
+  var j: int64;
+  var start: int64;
+  var commaCount: int64;
+  var rdnStart: int64;
+  var rdnEnd: int64;
+  var rdnLen: int64;
+  var rdnBuf: int64;
+  
+  if (dn == 0) {
+    return 0;
+  }
+  
+  len := LDAPStrLen(dn);
+  commaCount := 0;
+  start := 0;
+  
+  // Find start of requested RDN
+  i := 0;
+  while (i < len) {
+    if (peek8(dn + i) == 44) {  // comma
+      if (commaCount == index) {
+        start := i + 1;
+        break;
+      }
+      commaCount := commaCount + 1;
+    }
+    i := i + 1;
+  }
+  
+  if (index > commaCount) {
+    return 0;
+  }
+  
+  // Find end of RDN
+  rdnStart := start;
+  i := start;
+  while (i < len) {
+    if (peek8(dn + i) == 44 || i == len - 1) {
+      rdnEnd := i;
+      break;
+    }
+    i := i + 1;
+  }
+  
+  rdnLen := rdnEnd - rdnStart;
+  if (i == len - 1) {
+    rdnLen := rdnLen + 1;
+  }
+  
+  // Copy RDN
+  rdnBuf := mmap(0, rdnLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (rdnBuf == 0) {
+    return 0;
+  }
+  
+  i := 0;
+  while (i < rdnLen) {
+    poke8(rdnBuf + i, peek8(dn + rdnStart + i));
+    i := i + 1;
+  }
+  poke8(rdnBuf + rdnLen, 0);
+  
+  return rdnBuf;
+}
+
+// Get result code from any LDAP response
+pub fn LDAPGetResultCode(buf: int64, bufSize: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var b: int64;
+  
+  if (buf == 0 || bufSize < 10) {
+    return -2;
+  }
+  
+  pos := 0;
+  
+  // Skip outer SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // Skip to result code (ENUMERATED in various response types)
+  pos := pos + 1;  // Skip response tag
+  
+  // Skip length
+  b := peek8(buf + pos);
+  if (b < 128) {
+    pos := pos + 1;
+  }
+  else {
+    pos := pos + 1 + (b - 128);
+  }
+  
+  // Now at result code
+  tag := peek8(buf + pos);
+  if (tag == $0A) {  // ENUMERATED
+    pos := pos + 1;
+    b := peek8(buf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+    return peek8(buf + pos);
+  }
+  
+  return -1;
+}
