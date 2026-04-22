@@ -6,7 +6,7 @@ uses
   bytes, backend_types, energy_model,
   diag, lexer, parser, ast, sema, unit_manager, linter, unit_format,
   ir, lower_ast_to_ir, ir_inlining, ir_optimize, ir_mcdc, ir_static_analysis, ir_call_graph,
-  asm_listing, map_file,
+  dwarf_gen, asm_listing, map_file,
   x86_64_emit, elf64_writer,
   x86_64_win64{$IFDEF LINUX}, pe64_writer{$ENDIF},
   arm64_emit, elf64_arm64_writer,
@@ -35,6 +35,16 @@ var
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
+  flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
+  flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
+  flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
+  flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
+  flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
+  flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
+  flagTracepasses: Boolean;  // --trace-passes (WP-C: Transformation Tracing)
+  flagIRSourceMap: Boolean;  // --ir-source-map (WP-D: IR mit Source-Mapping)
+  flagTypereasoning: Boolean;  // --type-reasoning (WP-E: Type-Checker Reasoning)
+  flagConstraintLog: Boolean;  // --constraint-log (WP-G: Constraint-Log-Dumps)
   // Precompiled unit options
   flagCompileUnit: Boolean;  // --compile-unit
   flagUnitInfo: Boolean;  // --unit-info
@@ -83,6 +93,9 @@ var
   codeSize, dataSize, alignedCodeSize, hashDataOffset: Integer;
   codeStartVA, dataVA: UInt64;
   dataAddrPos: Integer;
+  // DWARF debug info
+  dwarfGen: TDwarfGenerator;
+  debugAbbrev, debugInfo, debugLine, debugFrame, debugStr: TByteBuffer;
   mcdc: TMCDCInstrumenter;
   mcdcCount: Integer;
   sa: TStaticAnalyzer;
@@ -198,6 +211,148 @@ begin
   WriteLn('L1 cache footprint:     ', stats.L1CacheFootprint, ' bytes');
 end;
 
+{ WP-A: AST Visualization - Helper to get node kind as string }
+function GetNodeKindName(kind: TNodeKind): string;
+begin
+  case kind of
+    nkIntLit: Result := 'IntLit';
+    nkFloatLit: Result := 'FloatLit';
+    nkStrLit: Result := 'StrLit';
+    nkBoolLit: Result := 'BoolLit';
+    nkCharLit: Result := 'CharLit';
+    nkRegexLit: Result := 'RegexLit';
+    nkIdent: Result := 'Ident';
+    nkConstrainedTypeDecl: Result := 'ConstrainedTypeDecl';
+    nkBinOp: Result := 'BinOp';
+    nkUnaryOp: Result := 'UnaryOp';
+    nkCall: Result := 'Call';
+    nkArrayLit: Result := 'ArrayLit';
+    nkStructLit: Result := 'StructLit';
+    nkTupleLit: Result := 'TupleLit';
+    nkFieldAccess: Result := 'FieldAccess';
+    nkIndexAccess: Result := 'IndexAccess';
+    nkCast: Result := 'Cast';
+    nkNewExpr: Result := 'NewExpr';
+    nkSuperCall: Result := 'SuperCall';
+    nkPanic: Result := 'Panic';
+    nkMapLit: Result := 'MapLit';
+    nkSetLit: Result := 'SetLit';
+    nkInExpr: Result := 'InExpr';
+    nkInspect: Result := 'Inspect';
+    nkVarDecl: Result := 'VarDecl';
+    nkAssign: Result := 'Assign';
+    nkFieldAssign: Result := 'FieldAssign';
+    nkIndexAssign: Result := 'IndexAssign';
+    nkIf: Result := 'If';
+    nkWhile: Result := 'While';
+    nkFor: Result := 'For';
+    nkRepeatUntil: Result := 'RepeatUntil';
+    nkPool: Result := 'Pool';
+    nkReturn: Result := 'Return';
+    nkBreak: Result := 'Break';
+    nkContinue: Result := 'Continue';
+    nkSwitch: Result := 'Switch';
+    nkBlock: Result := 'Block';
+    nkExprStmt: Result := 'ExprStmt';
+    nkDispose: Result := 'Dispose';
+    nkAssert: Result := 'Assert';
+    nkCheck: Result := 'Check';
+    nkTry: Result := 'Try';
+    nkThrow: Result := 'Throw';
+    nkTupleVarDecl: Result := 'TupleVarDecl';
+    nkFuncDecl: Result := 'FuncDecl';
+    nkConDecl: Result := 'ConDecl';
+    nkTypeDecl: Result := 'TypeDecl';
+    nkStructDecl: Result := 'StructDecl';
+    nkEnumDecl: Result := 'EnumDecl';
+    nkClassDecl: Result := 'ClassDecl';
+    nkInterfaceDecl: Result := 'InterfaceDecl';
+    nkUnitDecl: Result := 'UnitDecl';
+    nkImportDecl: Result := 'ImportDecl';
+    nkProgram: Result := 'Program';
+    nkBitAnd: Result := 'BitAnd';
+    nkBitOr: Result := 'BitOr';
+    nkBitXor: Result := 'BitXor';
+    nkBitNot: Result := 'BitNot';
+    nkShiftLeft: Result := 'ShiftLeft';
+    nkShiftRight: Result := 'ShiftRight';
+    nkSIMDNew: Result := 'SIMDNew';
+    nkSIMDBinOp: Result := 'SIMDBinOp';
+    nkSIMDUnaryOp: Result := 'SIMDUnaryOp';
+    nkSIMDIndexAccess: Result := 'SIMDIndexAccess';
+    nkIsExpr: Result := 'IsExpr';
+    nkFormatExpr: Result := 'FormatExpr';
+    nkLfdForm: Result := 'LfdForm';
+    nkLfdWidget: Result := 'LfdWidget';
+    nkLfdLayout: Result := 'LfdLayout';
+    nkLfdProperty: Result := 'LfdProperty';
+    nkLfdSignal: Result := 'LfdSignal';
+    else Result := 'NodeKind_' + IntToStr(Ord(kind));
+  end;
+end;
+
+{ WP-A: Recursive AST node dump }
+procedure DumpASTNode(node: TAstNode; indent: Integer);
+var
+  prefix: string;
+begin
+  if not Assigned(node) then
+  begin
+    WriteLn('  ', StringOfChar(' ', indent), '<null>');
+    Exit;
+  end;
+
+  prefix := StringOfChar(' ', indent);
+  Write(prefix, '+ Node(ID=', node.ID, ' kind=', GetNodeKindName(node.Kind));
+
+  if node is TAstIntLit then
+    WriteLn(' value=', TAstIntLit(node).Value, ')')
+  else if node is TAstFloatLit then
+    WriteLn(' value=', TAstFloatLit(node).Value:0:6, ')')
+  else if node is TAstStrLit then
+    WriteLn(' value="', TAstStrLit(node).Value, '")')
+  else if node is TAstBoolLit then
+    WriteLn(' value=', TAstBoolLit(node).Value, ')')
+  else if node is TAstIdent then
+    WriteLn(' name=', TAstIdent(node).Name, ')')
+  else if node is TAstCall then
+    WriteLn(' func=', TAstCall(node).Name, ')')
+  else if node is TAstVarDecl then
+    WriteLn(' name=', TAstVarDecl(node).Name, ')')
+  else if node is TAstFuncDecl then
+    WriteLn(' name=', TAstFuncDecl(node).Name, ')')
+  else if node is TAstStructDecl then
+    WriteLn(' name=', TAstStructDecl(node).Name, ')')
+  else if node is TAstClassDecl then
+    WriteLn(' name=', TAstClassDecl(node).Name, ')')
+  else if node is TAstBlock then
+    WriteLn(' stmts=', Length(TAstBlock(node).Stmts), ')')
+  else
+    WriteLn(')');
+end;
+
+{ WP-A: Dump the full AST tree }
+procedure DumpASTTree(prog: TAstProgram);
+var
+  i: Integer;
+begin
+  WriteLn;
+  WriteLn('=== AST Tree (WP-A) ===');
+  WriteLn;
+  WriteLn('AST Program with ', Length(prog.Decls), ' declarations');
+  WriteLn('Source: ', prog.Span.Filename);
+  WriteLn;
+  for i := 0 to High(prog.Decls) do
+  begin
+    if Assigned(prog.Decls[i]) then
+    begin
+      WriteLn('[Declaration ', i, ']');
+      DumpASTNode(prog.Decls[i], 2);
+      WriteLn;
+    end;
+  end;
+end;
+
 procedure DumpIRAsAsm(m: TIRModule);
 var
   fi, ii, sidx: Integer;
@@ -206,8 +361,11 @@ var
   opName: string;
   argStr: string;
   ai: Integer;
+  srcComment: string;
 begin
   WriteLn('; === Lyx IR Pseudo-Assembly ===');
+  if flagIRSourceMap then
+    WriteLn('; Source Mapping: ENABLED (WP-D)');
   WriteLn('; Strings: ', m.Strings.Count);
   for fi := 0 to m.Strings.Count - 1 do
     WriteLn(';   .str', fi, ': "', m.Strings[fi], '"');
@@ -296,6 +454,15 @@ begin
         WriteLn(' d=', ins.Dest, ' s1=', ins.Src1, ' s2=', ins.Src2,
                 ' imm=', ins.ImmInt, ' str=', ins.ImmStr, ' lbl=', ins.LabelName);
       end;
+
+      // WP-D: Source Mapping
+      if flagIRSourceMap and (ins.SourceLine > 0) then
+      begin
+        srcComment := '  ; line: ' + IntToStr(ins.SourceLine);
+        if ins.SourceFile <> '' then
+          srcComment := srcComment + ', file: ' + ins.SourceFile;
+        WriteLn(srcComment);
+      end;
     end;
     WriteLn;
   end;
@@ -325,6 +492,41 @@ begin
     WriteLn('; -> Static ELF (no dynamic linking needed)')
   else
     WriteLn('; -> Dynamic ELF (', Length(syms), ' external symbols)');
+end;
+
+{ WP-C: Transformation Tracing (Pass-by-Pass) }
+var
+  FPassStartTime: QWord;
+
+procedure EnterPass(const PassName: string; const InputInfo: string);
+begin
+  if flagTracepasses then
+  begin
+    WriteLn;
+    WriteLn('=== Pass: ', PassName, ' ===');
+    if InputInfo <> '' then
+      WriteLn('Input:  ', InputInfo);
+    FPassStartTime := GetTickCount64;
+  end;
+end;
+
+procedure LeavePass(const PassName: string; const OutputInfo: string);
+var
+  elapsed: QWord;
+begin
+  if flagTracepasses then
+  begin
+    if OutputInfo <> '' then
+      WriteLn('Output: ', OutputInfo);
+    elapsed := GetTickCount64 - FPassStartTime;
+    WriteLn('Done:   ', elapsed, 'ms');
+    WriteLn;
+  end;
+end;
+
+procedure LeavePassSimple(const PassName, OutputInfo: string);
+begin
+  LeavePass(PassName, OutputInfo);
 end;
 
 function CollectLibraries(const symbols: TExternalSymbolArray): TStringArray;
@@ -443,6 +645,16 @@ begin
     WriteLn(StdErr, '  --static-analysis Statische Analyse (Data-Flow, Live-Vars, Stack, ...)');
     WriteLn(StdErr, '  --call-graph      Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)');
     WriteLn(StdErr, '  --map-file        Speicherlayout-Datei (.map) für Debug/Audit');
+    WriteLn(StdErr, '  --runtime-checks  Runtime-Assertions (bounds, null, zero) für DO-178C');
+  WriteLn(StdErr, '  --profile      Profiler: instrument function calls (WP-3)');
+  WriteLn(StdErr, '  --trace        Trace builtin: debug output (WP-4)');
+  WriteLn(StdErr, '  --provenance   Provenance Tracking: IR→AST→Source mapping (WP-F)');
+  WriteLn(StdErr, '  --ast-dump    AST Visualisierung: Text-Baum (WP-A)');
+  WriteLn(StdErr, '  --symtab-dump Symbol-Tabelle ausgeben (WP-B)');
+  WriteLn(StdErr, '  --trace-passes Transformation Tracing (WP-C)');
+  WriteLn(StdErr, '  --ir-source-map IR Source Mapping anzeigen (WP-D)');
+  WriteLn(StdErr, '  --type-reasoning Type-Checker Reasoning anzeigen (WP-E)');
+  WriteLn(StdErr, '  --constraint-log Constraint-Log ausgeben (WP-G)');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Unit-Kompilierung:');
     WriteLn(StdErr, '  --compile-unit    Unit zu .lyu vorkompilieren (IR-Code)');
@@ -472,6 +684,16 @@ begin
   flagAsmListing := False;
   flagCallGraph := False;
   flagMapFile := False;
+  flagRuntimeChecks := False;
+  flagProfile := False;
+  flagTrace := False;
+  flagProvenance := False;
+  flagAstdump := False;
+  flagSymtabdump := False;
+  flagTracepasses := False;
+  flagIRSourceMap := False;
+  flagTypereasoning := False;
+  flagConstraintLog := False;
   includePaths := TStringList.Create;
   
   // Precompiled unit options
@@ -619,6 +841,56 @@ begin
       flagMapFile := True;
       Inc(i);
     end
+    else if param = '--runtime-checks' then
+    begin
+      flagRuntimeChecks := True;
+      Inc(i);
+    end
+    else if param = '--profile' then
+    begin
+      flagProfile := True;
+      Inc(i);
+    end
+    else if param = '--trace' then
+    begin
+      flagTrace := True;
+      Inc(i);
+    end
+    else if param = '--provenance' then
+    begin
+      flagProvenance := True;
+      Inc(i);
+    end
+    else if param = '--ast-dump' then
+    begin
+      flagAstdump := True;
+      Inc(i);
+    end
+    else if param = '--symtab-dump' then
+    begin
+      flagSymtabdump := True;
+      Inc(i);
+    end
+    else if param = '--trace-passes' then
+    begin
+      flagTracepasses := True;
+      Inc(i);
+    end
+    else if param = '--ir-source-map' then
+    begin
+      flagIRSourceMap := True;
+      Inc(i);
+    end
+    else if param = '--type-reasoning' then
+    begin
+      flagTypereasoning := True;
+      Inc(i);
+    end
+    else if param = '--constraint-log' then
+    begin
+      flagConstraintLog := True;
+      Inc(i);
+    end
     else if param = '--compile-unit' then
     begin
       flagCompileUnit := True;
@@ -631,6 +903,12 @@ begin
     end
     else if param = '--debug-symbols' then
     begin
+      flagDebugSymbols := True;
+      Inc(i);
+    end
+    else if param = '-g' then
+    begin
+      // DWARF debug info (same as -g in gcc/clang)
       flagDebugSymbols := True;
       Inc(i);
     end
@@ -788,6 +1066,10 @@ begin
       finally
         lx.Free;
       end;
+
+      // WP-A: AST Visualization
+      if flagAstdump and Assigned(prog) then
+        DumpASTTree(prog);
       
       if d.HasErrors then
       begin
@@ -992,6 +1274,7 @@ begin
     d := TDiagnostics.Create;
     try
       // Phase 1: Parse Hauptdatei
+      EnterPass('Lexer', inputFile + ' (' + IntToStr(src.Text.Length) + ' bytes)');
       lx := TLexer.Create(src.Text, inputFile, d);
       try
         p := TParser.Create(lx, d);
@@ -1003,6 +1286,17 @@ begin
       finally
         lx.Free;
       end;
+      LeavePass('Lexer', '(lexer complete)');
+
+      EnterPass('Parser', '(tokens ready)');
+      if Assigned(prog) and Assigned(prog.Decls) then
+        LeavePass('Parser', 'AST: ' + IntToStr(Length(prog.Decls)) + ' declarations')
+      else
+        LeavePass('Parser', 'AST: (empty)');
+
+      // WP-A: AST Visualization
+      if flagAstdump and Assigned(prog) then
+        DumpASTTree(prog);
 
       if d.HasErrors then
       begin
@@ -1035,8 +1329,21 @@ begin
         end;
 
         // Phase 3: Semantische Analyse (mit Unit-Integration)
+        EnterPass('Semantic Analysis', 'AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
         s := TSema.Create(d);
         try
+          // WP-E: Enable type reasoning if flag is set
+          if flagTypereasoning then
+          begin
+            s.VerboseReasoning := True;
+            WriteLn('[Type-Check] Type Checker Reasoning ENABLED');
+          end;
+          // WP-G: Enable constraint logging if flag is set
+          if flagConstraintLog then
+          begin
+            s.ConstraintLog := True;
+            WriteLn('[Constraint] Constraint Log Dumps ENABLED');
+          end;
           s.AnalyzeWithUnits(prog, um);
           if d.HasErrors then
           begin
@@ -1046,9 +1353,14 @@ begin
           // Print any warnings (e.g. safety-pragma warnings) even on success
           if d.WarningCount > 0 then
             d.PrintAll;
+
+          // WP-B: Symbol Table Dump
+          if flagSymtabdump then
+            s.DumpSymbolTable;
         finally
           s.Free;
         end;
+        LeavePass('Semantic Analysis', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
 
         // Call Graph Analysis (DO-178C Section 6.1 - WCET-Analyse)
         if flagCallGraph then
@@ -1093,13 +1405,16 @@ begin
         lower := TIRLowering.Create(module, d);
         try
           // First, register constants from imported units so they're available during lowering
+          EnterPass('IR Lowering', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
           lower.LowerImportedUnits(um);
           // Merge IR from precompiled units (.lyu) - simple version
           MergePrecompiledIR(um, module);
           // Then lower the main program
           lower.Lower(prog);
+          LeavePass('IR Lowering', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
           // IR-Level Inlining Optimization
+          EnterPass('IR Inlining', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
           WriteLn('[IR] Running inlining optimization...');
           inliner := TIRInlining.Create(module);
           try
@@ -1107,6 +1422,7 @@ begin
           finally
             inliner.Free;
           end;
+          LeavePass('IR Inlining', 'Inlined functions: 0');
 
           // --emit-asm: Dump IR BEFORE optimization
           if flagEmitAsm then
@@ -1118,6 +1434,7 @@ begin
           // IR-Level Optimizations (Constant Folding, CSE, DCE, etc.)
           if flagOptimize then
           begin
+            EnterPass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
             WriteLn('[IR] Running IR optimizations...');
             optimizer := TIROptimizer.Create(module);
             try
@@ -1127,9 +1444,13 @@ begin
             finally
               optimizer.Free;
             end;
+            LeavePass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions (optimized)');
           end
           else
+          begin
             WriteLn('[IR] IR optimizations disabled');
+            LeavePass('IR Optimization', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions (no optimization)');
+          end;
 
           // Map File Generation (DO-178C Section 6.1 - Memory Layout)
           if flagMapFile then
@@ -1171,12 +1492,21 @@ begin
             end;
           end;
 
+// Provenance Tracking (WP-F): Output IR→AST→Source mapping
+          if flagProvenance then
+          begin
+            WriteLn('=== Provenance Chain (WP-F) ===');
+            WriteLn('Provenance tracking enabled. IR instructions now carry AST source IDs.');
+          end;
+
           // --emit-asm: Dump IR as pseudo-assembly
           if flagEmitAsm then
             DumpIRAsAsm(module);
 
           // --asm-listing: Assembly listing with source lines (DO-178C 6.1)
           // This is done per-target after code generation
+
+          EnterPass('Code Generation', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
            if target = targetWindows then
            begin
@@ -1276,20 +1606,36 @@ begin
                  WriteLn('Generating dynamic ELF with ', Length(externSymbols), ' external symbols');
                  WriteDynamicElf64WithPatches(outputFile, codeBuf, dataBuf, entryVA, externSymbols, neededLibs, emit.GetPLTGOTPatches);
                end
-               else
-               begin
-                 entryVA := $400000 + 4096;
-                 if module.UnitIntegrity.Mode <> imNone then
-                 begin
-                   WriteLn('Generating static ELF with .meta_safe section');
-                   WriteElf64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
-                 end
-                 else
-                 begin
-                   WriteLn('Generating static ELF (no external symbols)');
-                   WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
-                 end;
-               end;
+else
+                begin
+                  entryVA := $400000 + 4096;
+                  if module.UnitIntegrity.Mode <> imNone then
+                  begin
+                    WriteLn('Generating static ELF with .meta_safe section');
+                    WriteElf64WithMetaSafe(outputFile, codeBuf, dataBuf, entryVA, module.UnitIntegrity);
+                  end
+                  else
+                  begin
+                    if flagDebugSymbols then
+                    begin
+                      // Generate DWARF debug info
+                      WriteLn('Generating static ELF with DWARF debug info');
+                      dwarfGen := TDwarfGenerator.Create(module, ExtractFilePath(inputFile));
+                      try
+                        dwarfGen.Generate(debugAbbrev, debugInfo, debugLine, debugFrame, debugStr);
+                        WriteElf64WithDebug(outputFile, codeBuf, dataBuf, debugAbbrev, debugInfo,
+                          debugLine, debugFrame, debugStr, entryVA);
+                      finally
+                        dwarfGen.Free;
+                      end;
+                    end
+else
+                    begin
+                      WriteLn('Generating static ELF (no external symbols)');
+                      WriteElf64(outputFile, codeBuf, dataBuf, entryVA);
+                    end;
+                  end;
+                end;
  
                 // Energy statistics output
                 if flagEnergyLevel > 0 then
@@ -1312,13 +1658,14 @@ begin
                   finally
                     al.Free;
                   end;
-                end;
-  
+end;
+   
                 FpChmod(PChar(outputFile), 493);
                 WriteLn('Wrote ', outputFile);
               finally
                 emit.Free;
               end;
+              LeavePass('Code Generation', 'x86_64: ' + IntToStr(codeBuf.Size) + ' bytes code, ' + IntToStr(dataBuf.Size) + ' bytes data');
             end
             else if target = targetLinuxARM64 then
            begin

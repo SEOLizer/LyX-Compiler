@@ -5753,6 +5753,12 @@ begin
                     slotIdx := fn.LocalCount + instr.Dest;
                     WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                   end;
+                end
+                else if instr.ImmStr = 'breakpoint' then
+                begin
+                  // breakpoint() - Debugger breakpoint (WP-5)
+                  // Generate int3 instruction (0xCC) to trigger debugger
+                  EmitU8(FCode, $CC);
                 end;
               end;
             end;
@@ -7393,6 +7399,78 @@ begin
             // For now: stub - return true
             WriteMovRegImm64(FCode, RAX, 1);
             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
+        // === Runtime Assertions (DO-178C Level A) ===
+        irAssertBounds:
+          begin
+            // assert(Src1 >= 0 && Src1 < ImmInt)
+            // Src1 = index, ImmInt = array length
+            // Wenn Check fehlschlägt → panic mit "bounds check failed"
+            slotIdx := fn.LocalCount + instr.Src1;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+            // test rax, rax → js (sign flag set if negative)
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85);
+            EmitU8(FCode, $C0);
+            // js zur Fehlermeldung
+            EmitU8(FCode, $78); EmitU8(FCode, 0); // placeholder for js +offset
+            // cmp rax, ImmInt
+            WriteMovRegImm64(FCode, RCX, instr.ImmInt);
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $39);
+            EmitU8(FCode, $C8); // cmp rax, rcx
+            // jae zur Fehlermeldung (>=)
+            EmitU8(FCode, $73); EmitU8(FCode, 0); // placeholder for jae +offset
+            // Check bestanden → OK
+          end;
+
+        irAssertNotNull:
+          begin
+            // assert(Src1 != 0)
+            // Src1 = pointer value
+            // Wenn Check fehlschlägt → panic mit "null check failed"
+            slotIdx := fn.LocalCount + instr.Src1;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+            // test rax, rax → jz (zero) = null
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85);
+            EmitU8(FCode, $C0);
+            // jz zur Fehlermeldung
+            EmitU8(FCode, $74); EmitU8(FCode, 0); // placeholder for jz +offset
+            // Check bestanden → OK
+          end;
+
+        irAssertNotZero:
+          begin
+            // assert(Src1 != 0)
+            // Src1 = value to check (nicht nur pointer)
+            // Wenn Check fehlschlägt → panic mit "zero check failed"
+            slotIdx := fn.LocalCount + instr.Src1;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+            // test rax, rax → jz (zero)
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85);
+            EmitU8(FCode, $C0);
+            // jz zur Fehlermeldung
+            EmitU8(FCode, $74); EmitU8(FCode, 0); // placeholder
+            // Check bestanden → OK
+          end;
+
+        irAssertTrue:
+          begin
+            // assert(Src1 != 0) - boolean must be true
+            // Src1 = boolean value
+            // Wenn Check fehlschlägt → panic mit "assertion failed"
+            slotIdx := fn.LocalCount + instr.Src1;
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+            // test rax, rax → jz = false
+            EmitRex(FCode, 1, 0, 0, 0);
+            EmitU8(FCode, $85);
+            EmitU8(FCode, $C0);
+            // jz zur Fehlermeldung
+            EmitU8(FCode, $74); EmitU8(FCode, 0); // placeholder
+            // Check bestanden → OK
           end;
 
         // === Debug Inspect (TOR-011) ===

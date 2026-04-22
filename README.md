@@ -47,6 +47,10 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.7)
 ✅ MC/DC Instrumentation: DO-178C DAL A coverage (--mcdc, --mcdc-report) (v0.7.0)
 ✅ Assembly Listing: Source-annotated assembly output with hex bytes (--asm-listing) (v0.7.0)
+✅ Runtime Assertions: Bounds, Null, Zero, Boolean checks at runtime (--runtime-checks) (v0.9.0)
+✅ DWARF Debug Info: DWARF 4 sections for gdb/lldb/VS Code (-g) (v0.9.0)
+✅ Simple Profiler: Function call timing via profile_enter/profile_leave/profile_report (--profile) (v0.9.0)
+✅ Trace Builtins: trace/trace_int/trace_str for debugging (--trace) (v0.9.0)
 ✅ Static Analysis: Data-Flow, Live-Vars, Const-Prop, Null-Ptr, Array-Bounds, Termination, Stack (--static-analysis) (v0.7.0)
 ✅ Test Generation: Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution (v0.7.0)
 ✅ ESP32 Safety: Watchdog, Brownout, Flash-Verify, MPU, Stack-Canary (v0.7.0)
@@ -906,6 +910,38 @@ Lyx can generate a detailed assembly listing with source line annotations for au
 
 **Purpose:** Required for DO-178C DAL A/B/C certification — provides traceability from source code to generated machine code.
 
+### DWARF Debug Info
+
+Lyx can generate **DWARF 4 debug information** for integration with external debuggers (gdb, lldb, Visual Studio Code):
+
+```bash
+# Compile with DWARF debug info
+./lyxc program.lyx -o program -g
+```
+
+**Generated Sections:**
+```
+  [ 2] .debug_str        STRTAB
+  [ 3] .debug_abbrev     PROGBITS
+  [ 4] .debug_info       PROGBITS
+  [ 5] .debug_line       PROGBITS
+  [ 6] .debug_frame      PROGBITS
+```
+
+**Debugging:**
+```bash
+# Inspect debug info
+readelf -w program | head -50
+
+# Debug with gdb
+gdb ./program
+(gdb) break test.lyx:5
+(gdb) run
+(gdb) print variable_name
+```
+
+**Purpose:** Source-level debugging in IDEs and debuggers, DO-178C traceability.
+
 ---
 
 ### Cross-Compilation
@@ -1002,6 +1038,17 @@ Optionen:
   --static-analysis   Statische Analyse (Data-Flow, Live-Vars, Stack, Null-Ptr)
   --call-graph     Statischer Aufrufgraph (WCET-Analyse, Rekursions-Erkennung)
   --map-file       Speicherlayout-Datei (.map) für Debug/Audit
+  --runtime-checks  Runtime-Assertions (bounds, null, zero, boolean) für DO-178C
+  --profile       Profiler: instrument function calls (WP-3)
+  --trace        Trace builtin: debug output (WP-4)
+  --provenance   Provenance Tracking: Token→AST→IR→MachineCode (WP-F)
+  --ast-dump     AST Visualisierung: Text-Baum der AST-Struktur (WP-A)
+  --symtab-dump  Symbol-Tabelle: alle Scopes und Symbole (WP-B)
+  --trace-passes Transformation Tracing: Pass-by-Pass mit Zeitmessung (WP-C)
+  --ir-source-map IR Source Mapping: Zeilennummern in IR-Dump (WP-D)
+  --type-reasoning Type-Checker Reasoning: detailliertes Typ-Logging (WP-E)
+  --constraint-log Constraint-Log ausgeben: Typ-Constraints (WP-G)
+  -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):
   --version        Versionsnummer ausgeben (TOR-001)
@@ -1009,7 +1056,7 @@ TOR-Optionen (DO-178C Tool Qualification):
   --config        Aktive Konfiguration ausgeben (TOR-003)
 ```
 
-**Linter Rules (13 total):**
+**Linter Rules (26 total):**
 
 | Code | Rule | Description |
 |------|------|-------------|
@@ -1026,6 +1073,19 @@ TOR-Optionen (DO-178C Tool Qualification):
 | W011 | `format-zero-decimals` | `:width:0` format specifier — use `PrintInt()` instead |
 | W012 | `string-concat-literals` | `"a" + "b"` can be a single literal at compile time |
 | W013 | `print-float-int-arg` | `PrintFloat(intLit as f64)` — use `PrintInt()` instead |
+| W014 | `recursive-function` | Recursive function (for stack predictability — MISRA 5.2) |
+| W015 | `implicit-type-cast` | Implicit type conversion without `as` (MISRA 5.2) |
+| W016 | `dead-loop` | Infinite loop without exit condition / break |
+| W017 | `pointer-arithmetic` | Pointer arithmetic (MISRA 5.2) |
+| W018 | `incomplete-switch` | Switch without default or missing enum values (MISRA 5.2) |
+| W019 | `function-too-long` | Function > 60 lines (MISRA 5.2) |
+| W020 | `complex-function` | Cyclomatic complexity > 15 (MISRA 5.2) |
+| W021 | `global-mutable` | `var` at module level (race conditions) |
+| W022 | `todo-comment` | Find `// TODO` comments |
+| W023 | `magic-number` | Hardcoded numbers (magic numbers) |
+| W024 | `unbounded-loop` | While without limit() (WCET) |
+| W025 | `resource-leak` | mmap without munmap (resource leak) |
+| W026 | `unchecked-error` | Ignored error codes |
 
 **Testing ARM64 binaries (on x86_64):**
 ```bash

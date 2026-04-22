@@ -79,6 +79,11 @@ type
     irThrow,        // perform throw: Src1 = exception temp
     // panic / abort
     irPanic,
+    // Runtime assertions (DO-178C for Level A)
+    irAssertBounds,    // bounds check: assert(Src1 >= 0 && Src1 < ImmInt) - panics if fail
+    irAssertNotNull,   // null check: assert(Src1 != 0) - panics if null
+    irAssertNotZero,  // zero check: assert(Src1 != 0) - panics if zero
+    irAssertTrue,    // boolean check: assert(Src1 != 0) - panics if false
     // SIMD operations (ParallelArray)
     irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
     irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,
@@ -108,6 +113,17 @@ type
 
   TIRInstr = record
     Op: TIROpKind;
+    // Provenance Tracking (WP-F): unique ID for this IR instruction
+    IRID: Integer;  // Unique sequential ID (0, 1, 2, ...) - set automatically by Emit
+    // Provenance: source AST reference
+    SourceASTID: Integer;  // AST node ID this instruction came from
+    SourceASTKind: Integer; // AST node kind (from TAstNodeKind)
+    SourceSpan: record
+      Line: Integer;
+      Col: Integer;
+      Len: Integer;
+      FileName: string;
+    end;
     Dest: Integer; // destination temp / local index
     Src1: Integer;
     Src2: Integer;
@@ -163,9 +179,12 @@ type
       OuterSlot: Integer; // slot in parent function
       InnerSlot: Integer; // slot in this function
     end;
+    // Provenance Tracking (WP-F): counter for unique IR instruction IDs
+    NextIRID: Integer; // auto-incremented ID counter
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
+    function GetProvenanceInfo(irIdx: Integer): string; // returns formatted provenance for IR#irIdx
   end;
 
   TGlobalVar = record
@@ -231,6 +250,7 @@ begin
   SafetyPragmas.Integrity.Mode     := imNone;
   SafetyPragmas.Integrity.Interval := 0;
   SafetyPragmas.FPDeterministic    := False;  // FIX: initialize to avoid uninitialized garbage
+  NextIRID := 0; // Provenance Tracking: reset IR ID counter
 end;
 
 destructor TIRFunction.Destroy;
@@ -241,9 +261,37 @@ begin
 end;
 
 procedure TIRFunction.Emit(const instr: TIRInstr);
+var
+  newInstr: TIRInstr;
 begin
+  newInstr := instr;
+  // Provenance Tracking (WP-F): auto-assign unique IR ID
+  newInstr.IRID := NextIRID;
+  Inc(NextIRID);
+  
   SetLength(Instructions, Length(Instructions) + 1);
-  Instructions[High(Instructions)] := instr;
+  Instructions[High(Instructions)] := newInstr;
+end;
+
+function TIRFunction.GetProvenanceInfo(irIdx: Integer): string;
+begin
+  Result := '';
+  if (irIdx < 0) or (irIdx >= Length(Instructions)) then Exit;
+  
+  Result := Format('IR#%d [IRID=%d]', [irIdx, Instructions[irIdx].IRID]);
+  
+  if Instructions[irIdx].SourceSpan.FileName <> '' then
+  begin
+    Result := Result + Format(' at %s:%d:%d', 
+      [Instructions[irIdx].SourceSpan.FileName,
+       Instructions[irIdx].SourceSpan.Line,
+       Instructions[irIdx].SourceSpan.Col]);
+  end;
+  
+  if Instructions[irIdx].SourceASTID > 0 then
+  begin
+    Result := Result + Format(' from AST#%d', [Instructions[irIdx].SourceASTID]);
+  end;
 end;
 
 { TIRModule }
@@ -442,6 +490,9 @@ begin
       Result := 1;
     irPanic:
       Result := 5000;
+    // Runtime assertions (geringe Kosten - compare + je nach Ausführung)
+    irAssertBounds, irAssertNotNull, irAssertNotZero, irAssertTrue:
+      Result := 2;
     // SIMD operations (mittlere bis hohe Kosten - vectorized ops)
     irSIMDAdd, irSIMDSub, irSIMDMul, irSIMDDiv,
     irSIMDAnd, irSIMDOr, irSIMDXor, irSIMDNeg,

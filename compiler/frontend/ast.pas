@@ -153,7 +153,7 @@ type
   TAstClassDecl = class;
   TAstInterfaceDecl = class;
   TAstFuncDecl = class;
-
+  
   { --- Knotenlisten --- }
 
   TAstNodeList = array of TAstNode;
@@ -184,11 +184,14 @@ type
   private
     FKind: TNodeKind;
     FSpan: TSourceSpan;
+    // Provenance Tracking (WP-F): unique ID for this AST node
+    FID: Integer;
   public
     constructor Create(aKind: TNodeKind; aSpan: TSourceSpan);
     destructor Destroy; override;
     property Kind: TNodeKind read FKind;
     property Span: TSourceSpan read FSpan write FSpan;
+    property ID: Integer read FID write FID;
   end;
 
   // ================================================================
@@ -1625,6 +1628,18 @@ end;
 
 // ================================================================
 
+// Provenance Tracking (WP-F): global AST ID counter
+var
+  GAstIDCounter: Integer = 0;
+
+function GetNextAstID: Integer;
+begin
+  Result := GAstIDCounter;
+  Inc(GAstIDCounter);
+end;
+
+// ================================================================
+
 // TAstNode
 // ================================================================
 
@@ -1633,6 +1648,8 @@ begin
   inherited Create;
   FKind := aKind;
   FSpan := aSpan;
+  // Provenance Tracking (WP-F): assign unique AST ID
+  FID := GetNextAstID;
 end;
 
 destructor TAstNode.Destroy;
