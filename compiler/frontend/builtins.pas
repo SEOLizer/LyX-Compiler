@@ -99,6 +99,19 @@ initialization
   AddBuiltin('Math', 'Random', 'Random', atInt64, []);
   AddBuiltin('Math', 'RandomSeed', 'RandomSeed', atVoid, [atInt64]);
 
+  // Profiler (WP-3) - global builtins (no namespace)
+  AddBuiltin('', 'profile_enter', 'profile_enter', atVoid, [atPChar]);
+  AddBuiltin('', 'profile_leave', 'profile_leave', atVoid, [atPChar]);
+  AddBuiltin('', 'profile_report', 'profile_report', atVoid, []);
+
+  // Trace (WP-4)
+  AddBuiltin('', 'trace', 'trace', atVoid, [atPChar]);
+  AddBuiltin('', 'trace_int', 'trace_int', atVoid, [atInt64]);
+  AddBuiltin('', 'trace_str', 'trace_str', atVoid, [atPChar, atPChar]);
+
+  // Breakpoint (WP-5) - triggers debugger breakpoint
+  AddBuiltin('', 'breakpoint', 'breakpoint', atVoid, []);
+
   // String operations
   AddBuiltin('', 'str_concat', 'str_concat', atPChar, [atPChar, atPChar]);
   AddBuiltin('', 'StrLen',    'StrLen',    atInt64,  [atPChar]);

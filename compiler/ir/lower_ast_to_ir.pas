@@ -50,6 +50,8 @@ type
     // Source location tracking for assembly listing (aerospace-todo 6.1)
     FCurrentSourceLine: Integer;
     FCurrentSourceFile: string;
+    // Provenance Tracking (WP-F): current AST node being lowered
+    FCurrentASTNode: TAstNode;  // current AST node for provenance
 
     function NewTemp: Integer;
     function IsGlobalVar(const name: string): Boolean;
@@ -370,6 +372,17 @@ begin
   // Attach source location to IR instruction (aerospace-todo 6.1)
   instr.SourceLine := FCurrentSourceLine;
   instr.SourceFile := FCurrentSourceFile;
+  // Provenance Tracking (WP-F): attach AST node reference
+  if Assigned(FCurrentASTNode) then
+  begin
+    instr.SourceASTID := FCurrentASTNode.ID;
+    instr.SourceASTKind := Ord(FCurrentASTNode.Kind);
+  end
+  else
+  begin
+    instr.SourceASTID := -1;
+    instr.SourceASTKind := -1;
+  end;
   FCurrentFunc.Emit(instr);
 end;
 
@@ -1481,6 +1494,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
   Result := -1;
   if not Assigned(expr) then
     Exit;
+
+  // Provenance Tracking (WP-F): set current AST node for IR provenance
+  FCurrentASTNode := expr;
 
   // Initialize instruction
   instr := Default(TIRInstr);
@@ -3051,6 +3067,70 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
           if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
           Emit(instr); Result := t0;
+        end
+        // profile_enter(fn_name) - Profiler function entry (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'enter')) or
+              (call.Name = 'profile_enter') then
+        begin
+          // If using global name, handle same as Profile.enter
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_enter';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // profile_leave(fn_name) - Profiler function leave (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'leave')) or
+              (call.Name = 'profile_leave') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_leave';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // profile_report() - Print profile report (WP-3)
+        else if ((call.Namespace = 'Profile') and (call.Name = 'report')) or
+              (call.Name = 'profile_report') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'profile_report';
+          instr.ImmInt := 0;
+          Emit(instr); Result := -1;
+        end
+        // trace(msg: pchar) - Trace output (WP-4)
+        else if (call.Name = 'trace') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // trace_int(val: int64) - Trace integer (WP-4)
+        else if (call.Name = 'trace_int') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace_int';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // trace_str(label: pchar, val: pchar) - Trace string (WP-4)
+        else if (call.Name = 'trace_str') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'trace_str';
+          instr.ImmInt := argCount; SetLength(instr.ArgTemps, argCount);
+          for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+          if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+          Emit(instr); Result := -1;
+        end
+        // breakpoint() - Debugger breakpoint (WP-5)
+        else if (call.Name = 'breakpoint') then
+        begin
+          instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'breakpoint';
+          instr.ImmInt := 0; SetLength(instr.ArgTemps, 0);
+          instr.Src1 := -1;
+          Emit(instr); Result := -1;
         end
         else if ((call.Name = 'VerifyIntegrity') or
                  ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
@@ -5103,6 +5183,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
   begin
     FCurrentSourceLine := stmt.Span.Line;
     FCurrentSourceFile := stmt.Span.FileName;
+    // Provenance Tracking (WP-F): set current AST node for IR provenance
+    FCurrentASTNode := stmt;
   end;
   instr := Default(TIRInstr);
   Result := True;

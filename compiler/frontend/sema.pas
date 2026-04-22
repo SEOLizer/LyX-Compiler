@@ -20,6 +20,8 @@ type
     ReturnTypeName: string; // for functions: name of return type if struct
     ReturnStructDecl: TAstStructDecl; // for functions: struct decl if returns struct
     ArrayLen: Integer; // 0 = not array, >0 = static length, -1 = dynamic
+    // WP-B: Source location where symbol was defined
+    DefSpan: TSourceSpan;
     // for functions
     ParamTypes: array of TAurumType;
     ParamCount: Integer;
@@ -51,6 +53,10 @@ type
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
     FCurrentNestedFunc: TAstFuncDecl; // nested function currently being analyzed
+    // WP-E: Type Checker Reasoning
+    FVerboseReasoning: Boolean; // enable verbose type reasoning output
+    // WP-G: Constraint Log Dumps
+    FConstraintLog: Boolean; // enable constraint solving logging
     procedure PushScope;
     procedure PopScope;
     procedure AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
@@ -86,6 +92,16 @@ type
     function RewriteExpr(expr: TAstExpr): TAstExpr;
     function RewriteStmt(stmt: TAstStmt): TAstStmt;
     procedure RewriteAST(prog: TAstProgram);
+    // WP-B: Symbol table visualization
+    procedure DumpSymbolTable;
+    // WP-E: Type Checker Reasoning
+    property VerboseReasoning: Boolean read FVerboseReasoning write FVerboseReasoning;
+    procedure LogTypeCheck(const msg: string);
+    procedure LogTypeCheckExpr(expr: TAstExpr; const context: string);
+    // WP-G: Constraint Log Dumps
+    property ConstraintLog: Boolean read FConstraintLog write FConstraintLog;
+    procedure LogConstraint(const constraintType, leftType, rightType: string; span: TSourceSpan; status: string);
+    procedure LogTypeEquality(const type1, type2: string; span: TSourceSpan; solved: Boolean);
   end;
 
 implementation
@@ -218,7 +234,10 @@ begin
   ParamCount := 0;
   IsVarArgs := False;
   IsGlobal := False;
+  IsExtern := False;
+  IsImported := False;
   SetLength(ParamTypes, 0);
+  DefSpan := NullSpan; // WP-B: Initialize with NullSpan
 end;
 
 destructor TSymbol.Destroy;
@@ -1126,6 +1145,8 @@ begin
     sym.Free;
     Exit;
   end;
+  // WP-B: Store the definition span in the symbol
+  sym.DefSpan := span;
   cur.AddObject(sym.Name, System.TObject(sym));
 end;
 
@@ -2405,6 +2426,11 @@ begin
     Result := atUnresolved;
     Exit;
   end;
+
+  // WP-E: Log type checking
+  if FVerboseReasoning then
+    LogTypeCheckExpr(expr, 'Checking');
+
   case expr.Kind of
     nkIntLit: Result := atInt64;
     nkFloatLit: Result := atF64;
@@ -2902,17 +2928,21 @@ begin
                  // Float arithmetic
                  Result := atF64;
                end
-               else if not IsIntegerType(lt) or not IsIntegerType(rt) then
-               begin
-                 FDiag.Error('type error: arithmetic requires numeric (integer or float) operands', bin.Span);
-                 Result := atInt64;
-               end
-               else
-               begin
-                 // Integer arithmetic
-                 // promote to 64-bit for now
-                 Result := atInt64;
-               end;
+else if not IsIntegerType(lt) or not IsIntegerType(rt) then
+                begin
+                  // WP-G: Log constraint failure
+                  LogConstraint('TypeCheck', AurumTypeToStr(lt), AurumTypeToStr(rt), bin.Span, 'FAILED');
+                  FDiag.Error('type error: arithmetic requires numeric (integer or float) operands', bin.Span);
+                  Result := atInt64;
+                end
+                else
+                begin
+                  // Integer arithmetic
+                  // promote to 64-bit for now
+                  Result := atInt64;
+                  // WP-G: Log successful constraint
+                  LogConstraint('Arithmetic', AurumTypeToStr(lt), AurumTypeToStr(rt), bin.Span, 'OK');
+                end;
              end;
             tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
               begin
@@ -3904,7 +3934,16 @@ begin
         end;
         vtype := CheckExpr(asg.Value);
         if not TypeEqual(vtype, s.DeclType) then
+        begin
+          // WP-G: Log constraint failure
+          LogConstraint('Assignment', AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype), stmt.Span, 'FAILED');
           FDiag.Error(Format('assignment type mismatch: %s := %s', [AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype)]), stmt.Span);
+        end
+        else
+        begin
+          // WP-G: Log successful constraint
+          LogConstraint('Assignment', AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype), stmt.Span, 'OK');
+        end;
       end;
     nkFieldAssign:
       begin
@@ -4257,6 +4296,8 @@ begin
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
+  FVerboseReasoning := False;  // WP-E: disabled by default
+  FConstraintLog := False;  // WP-G: disabled by default
   SetLength(FScopes, 0);
   // create global scope
   PushScope;
@@ -6267,6 +6308,257 @@ begin
           fn.Body.Stmts[j] := RewriteStmt(fn.Body.Stmts[j]);
       end;
     end;
+  end;
+end;
+
+{ WP-B: Symbol Table Visualization }
+function GetSymbolKindName(kind: TSymbolKind): string;
+begin
+  case kind of
+    symVar: Result := 'var';
+    symLet: Result := 'let';
+    symCon: Result := 'con';
+    symFunc: Result := 'fn';
+    else Result := 'unknown';
+  end;
+end;
+
+function GetOpKindName(op: TTokenKind): string;
+begin
+  case op of
+    tkPlus: Result := '+';
+    tkMinus: Result := '-';
+    tkStar: Result := '*';
+    tkSlash: Result := '/';
+    tkPercent: Result := '%';
+    tkPlusPlus: Result := '++';
+    tkMinusMinus: Result := '--';
+    tkBitAnd: Result := '&';
+    tkBitOr: Result := '|';
+    tkBitXor: Result := '^';
+    tkBitNot: Result := '~';
+    tkEq: Result := '==';
+    tkNeq: Result := '!=';
+    tkLt: Result := '<';
+    tkLe: Result := '<=';
+    tkGt: Result := '>';
+    tkGe: Result := '>=';
+    tkAnd: Result := '&&';
+    tkOr: Result := '||';
+    tkNot: Result := '!';
+    tkShiftLeft: Result := '<<';
+    tkShiftRight: Result := '>>';
+    tkNullCoalesce: Result := '??';
+    tkSafeCall: Result := '?.';
+    else Result := 'op(' + IntToStr(Ord(op)) + ')';
+  end;
+end;
+
+function GetTypeName(t: TAurumType): string;
+begin
+  case t of
+    atInt8: Result := 'int8';
+    atInt16: Result := 'int16';
+    atInt32: Result := 'int32';
+    atInt64: Result := 'int64';
+    atUInt8: Result := 'uint8';
+    atUInt16: Result := 'uint16';
+    atUInt32: Result := 'uint32';
+    atUInt64: Result := 'uint64';
+    atISize: Result := 'int';
+    atUSize: Result := 'uint';
+    atF32: Result := 'f32';
+    atF64: Result := 'f64';
+    atBool: Result := 'bool';
+    atChar: Result := 'char';
+    atVoid: Result := 'void';
+    atPChar: Result := 'pchar';
+    atPCharNullable: Result := 'pchar?';
+    atDynArray: Result := 'array';
+    atArray: Result := 'array';
+    atMap: Result := 'Map';
+    atSet: Result := 'Set';
+    atParallelArray: Result := 'parallel Array';
+    atFnPtr: Result := 'fnptr';
+    atTuple: Result := 'tuple';
+    else Result := 'unknown';
+  end;
+end;
+
+procedure TSema.DumpSymbolTable;
+var
+  i, j, k: Integer;
+  sl: TStringList;
+  sym: TSymbol;
+  scopeKind: string;
+begin
+  WriteLn;
+  WriteLn('=== Symbol Table (WP-B) ===');
+  WriteLn;
+
+  if Length(FScopes) = 0 then
+  begin
+    WriteLn('No scopes found.');
+    Exit;
+  end;
+
+  // Dump each scope
+  for i := 0 to High(FScopes) do
+  begin
+    sl := FScopes[i];
+
+    // Determine scope kind
+    if i = 0 then
+      scopeKind := 'Global'
+    else
+      scopeKind := 'Local (depth=' + IntToStr(i) + ')';
+
+    WriteLn('Scope ', i, ': ', scopeKind);
+    WriteLn('  ', StringOfChar('-', 60));
+
+    if sl.Count = 0 then
+    begin
+      WriteLn('  (empty)');
+    end
+    else
+    begin
+      for j := 0 to sl.Count - 1 do
+      begin
+        sym := TSymbol(sl.Objects[j]);
+
+        // Write basic symbol info
+        Write('  ', sym.Name:20, ' ', GetSymbolKindName(sym.Kind):4);
+
+        // Write type info
+        if sym.Kind = symFunc then
+        begin
+          Write(' ', GetTypeName(sym.DeclType));
+          if sym.ParamCount > 0 then
+          begin
+            Write('(');
+            if Length(sym.ParamTypes) > 0 then
+            begin
+              Write(GetTypeName(sym.ParamTypes[0]));
+              for k := 1 to High(sym.ParamTypes) do
+                Write(', ', GetTypeName(sym.ParamTypes[k]));
+            end;
+            Write(')');
+          end;
+          if sym.IsExtern then
+            Write(' [extern]');
+          if sym.IsImported then
+            Write(' [imported]');
+        end
+        else
+        begin
+          // Variable/let/const
+          Write(' ', GetTypeName(sym.DeclType));
+          if sym.TypeName <> '' then
+            Write(' ', sym.TypeName);
+          if sym.ArrayLen > 0 then
+            Write('[', sym.ArrayLen, ']')
+          else if sym.ArrayLen < 0 then
+            Write('[]');
+          if sym.IsGlobal then
+            Write(' [global]');
+        end;
+
+        WriteLn;
+
+        // Write definition location if available
+        if (sym.DefSpan.Line > 0) or (sym.DefSpan.Filename <> '') then
+        begin
+          Write('    defined at: ');
+          if sym.DefSpan.Filename <> '' then
+            Write(sym.DefSpan.Filename, ':');
+          WriteLn(sym.DefSpan.Line, ':', sym.DefSpan.Col);
+        end;
+      end;
+    end;
+
+    WriteLn;
+  end;
+
+  // Dump struct types
+  if FStructTypes.Count > 0 then
+  begin
+    WriteLn('Struct Types:');
+    WriteLn('  ', StringOfChar('-', 60));
+    for i := 0 to FStructTypes.Count - 1 do
+    begin
+      WriteLn('  ', FStructTypes[i]);
+    end;
+    WriteLn;
+  end;
+
+  // Dump class types
+  if FClassTypes.Count > 0 then
+  begin
+    WriteLn('Class Types:');
+    WriteLn('  ', StringOfChar('-', 60));
+    for i := 0 to FClassTypes.Count - 1 do
+    begin
+WriteLn('  ', FClassTypes[i]);
+    end;
+    WriteLn;
+  end;
+end;
+
+{ WP-E: Type Checker Reasoning }
+procedure TSema.LogTypeCheck(const msg: string);
+begin
+  if FVerboseReasoning then
+  begin
+    WriteLn('[Type-Check] ', msg);
+  end;
+end;
+
+procedure TSema.LogTypeCheckExpr(expr: TAstExpr; const context: string);
+begin
+  if FVerboseReasoning and Assigned(expr) then
+  begin
+    Write('[Type-Check] ', context, ': ');
+    if expr is TAstIdent then
+      WriteLn('Ident "', TAstIdent(expr).Name, '" (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstIntLit then
+      WriteLn('IntLit ', TAstIntLit(expr).Value, ' (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstStrLit then
+      WriteLn('StrLit "', TAstStrLit(expr).Value, '" (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstCall then
+      WriteLn('Call ', TAstCall(expr).Name, '() (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstBinOp then
+      WriteLn('BinOp ', GetOpKindName(TAstBinOp(expr).Op), ' (', GetTypeName(expr.ResolvedType), ')')
+    else if expr is TAstFieldAccess then
+      WriteLn('FieldAccess .', TAstFieldAccess(expr).Field, ' (', GetTypeName(expr.ResolvedType), ')')
+    else
+      WriteLn('NodeKind_', Ord(expr.Kind), ' (', GetTypeName(expr.ResolvedType), ')');
+  end;
+end;
+
+{ WP-G: Constraint Log Dumps }
+procedure TSema.LogConstraint(const constraintType, leftType, rightType: string; span: TSourceSpan; status: string);
+begin
+  if FConstraintLog then
+  begin
+    Write('[Constraint] ', constraintType, ': ');
+    Write(leftType);
+    if rightType <> '' then
+      Write(' == ', rightType);
+    Write('  ; line ', span.Line);
+    if status <> '' then
+      Write(' [', status, ']');
+    WriteLn;
+  end;
+end;
+
+procedure TSema.LogTypeEquality(const type1, type2: string; span: TSourceSpan; solved: Boolean);
+begin
+  if FConstraintLog then
+  begin
+    if solved then
+      WriteLn('  ✓ SOLVED: ', type1, ' == ', type2, ' (line ', span.Line, ')')
+    else
+      WriteLn('  ⏳ PENDING: ', type1, ' == ', type2, ' (line ', span.Line, ')');
   end;
 end;
 
