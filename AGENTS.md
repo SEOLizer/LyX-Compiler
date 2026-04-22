@@ -87,6 +87,86 @@ Format: `offset  hex_bytes  ir_mnemonic  ; source_file:line`
 
 **Bei neuen IR→Backend-Mappings:** Listing prüfen, dass jede IR-Op korrekt übersetzt wird.
 
+### 4. AST Visualisierung (`--ast-dump`)
+
+Zeigt den Abstract Syntax Tree nach dem Parsen. Nützlich für das Verständnis der AST-Struktur und für Debugging des Parsers:
+
+```bash
+./lyxc test.lyx -o test --ast-dump
+```
+
+Ausgabe zeigt die AST-Struktur mit Knoten-IDs und Typen.
+
+### 5. Symbol-Table Snapshots (`--symtab-dump`)
+
+Zeigt alle Scopes und Symbole während der semantischen Analyse:
+
+```bash
+./lyxc test.lyx -o test --symtab-dump
+```
+
+Listet alle deklarierten Variablen, Funktionen und Typen mit ihren Scopes auf.
+
+### 6. Transformation Tracing (`--trace-passes`)
+
+Zeigt timing und Output für jeden Compiler-Pass:
+
+```bash
+./lyxc test.lyx -o test --trace-passes
+```
+
+zeigt Lexer → Parser → Sema → IR → Code Gen mit Zeitmessung.
+
+### 7. IR mit Source-Mapping (`--ir-source-map`)
+
+Fügt Zeilennummern-Kommentare zu IR-Dumps hinzu:
+
+```bash
+./lyxc test.lyx -o test --emit-asm --ir-source-map
+```
+
+zeigt Source-Datei:Zeile für jede IR-Instruktion.
+
+### 8. Type-Checker Reasoning (`--type-reasoning`)
+
+Ausführliches Logging während der Typprüfung:
+
+```bash
+./lyxc test.lyx -o test --type-reasoning
+```
+
+zeigt alle Ausdrücke während der Typprüfung mit deren abgeleiteten Typen.
+
+### 9. Provenance Tracking (`--provenance`)
+
+Verfolgt die Herkunft von Maschinencode zurück zum Quellcode:
+
+```bash
+./lyxc test.lyx -o test --provenance
+```
+
+aktiviert IDs für Token→AST→IR→MachineCode Rückverfolgung.
+
+### 10. Constraint-Log-Dumps (`--constraint-log`)
+
+Loggt Typ-Constraints während der Typprüfung:
+
+```bash
+./lyxc test.lyx -o test --constraint-log
+```
+
+zeigt gelöste und widersprüchliche Typ-Constraints.
+
+### 11. IR-Coverage-Test
+
+Prüft 100% IR-Abdeckung in allen Backends:
+
+```bash
+cd compiler && ./tests/test_ir_coverage
+```
+
+**Nach jeder neuen IR-Operation:** Test muss in ALLEN Backends grün sein (x86_64, x86_64_win64, arm64, macosx64, xtensa, win_arm64, riscv).
+
 ### 4. IR-Coverage-Test
 
 Prüft 100% IR-Abdeckung in allen Backends:
