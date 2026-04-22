@@ -21,7 +21,8 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ PLT/GOT Dynamic Linking for External Libraries
 ✅ ARM64 Dynamic Linking fully functional (PLT/GOT, Hash Table, Relocations)
 ✅ Standard Library (std.math, std.io, std.string, std.geo, std.time, std.fs, ...)
-✅ Network Library (std.net): 17 Protocols with RFC Compliance
+✅ Network Library (std.net): 17+ Protocols with RFC Compliance
+✅ Threading Library (std.thread) with pthread, mutex, cond, TLS, atomic
 ✅ IR-Level Inlining Optimization (v0.4.3)
 ✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
 ✅ PascalCase Naming Conventions (v0.4.3)
