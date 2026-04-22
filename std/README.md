@@ -48,6 +48,9 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/stats` | Statistical functions |
 | `std/stats_batch` | Batch processing for statistics |
 | `std/math_batch` | Batch processing for math |
+| `std/thread` | Multi-threading (pthread, mutex, cond, TLS, atomic) |
+| `std/net.ldap` | LDAP client (RFC 4511) |
+| `std/net.mongo` | MongoDB client |
 | `std/audio` | Audio playback and MP3/WAV processing |
 | `std/audio.mpg123` | MP3 decoding via libmpg123 |
 | `std/audio.alsa` | ALSA audio playback (Linux) |
