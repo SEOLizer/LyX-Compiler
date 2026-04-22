@@ -103,6 +103,8 @@ pub type LDAPConn = struct {
   connected: int64;    // 1 if connected
   msgId: int64;        // Current message ID
   tls: int64;          // 1 if TLS connection (LDAPS)
+  lastActivity: int64;  // Last activity timestamp (for pooling)
+  poolIdx: int64;      // Pool index (-1 if not pooled)
 };
 
 // LDAP search result
@@ -1732,10 +1734,125 @@ pub fn LDAPSASLTokenLen(cred: int64): int64 {
   var i: int64 := 0;
   while (i < 65536) {
     if (peek8(cred + i) == 0) {
-      return i;
-    }
-    i := i + 1;
+return i;
   }
+  return 0;
+}
+
+// ============================================================================
+// WP7: Connection Pooling & Timeouts
+// ============================================================================
+
+// LDAP connection pool
+pub type LDAPPool = struct {
+  host: int64;
+  port: int64;
+  connections: int64;  // Pointer to array of LDAPConn
+  count: int64;      // Number of connections in pool
+  maxSize: int64;     // Maximum pool size
+  timeout: int64;    // Connection timeout (seconds)
+};
+
+// Create connection pool
+pub fn LDAPPoolCreate(host: int64, port: int64, maxSize: int64, timeout: int64): LDAPPool {
+  var pool: LDAPPool;
+  
+  // Allocate connection array
+  pool.connections := mmap(0, maxSize * 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (pool.connections == 0) {
+    return pool;
+  }
+  
+  pool.host := host;
+  pool.port := port;
+  pool.maxSize := maxSize;
+  pool.timeout := timeout;
+  pool.count := 0;
+  
+  return pool;
+}
+
+// Get connection from pool
+pub fn LDAPPoolGetConnection(pool: LDAPPool): LDAPConn {
+  if (pool.connections == 0 || pool.count == 0) {
+    // Create new connection
+    return LDAPConnect(pool.host, pool.port);
+  }
+  
+  // Return first available connection and decrement count
+  // Simplified: just return first and move others
+  var conn: LDAPConn;
+  var pos: int64 := pool.connections;
+  conn.fd := peek8(pos);
+  conn.connected := peek8(pos + 8);
+  conn.msgId := peek8(pos + 16);
+  
+  pool.count := pool.count - 1;
+  
+  return conn;
+}
+
+// Return connection to pool
+pub fn LDAPPoolReturnConnection(pool: LDAPPool, conn: LDAPConn): int64 {
+  if (pool.connections == 0) {
+    return -1;
+  }
+  
+  // Store at next position if there's room
+  if (pool.count < pool.maxSize) {
+    var pos: int64 := pool.connections + (pool.count * 24);
+    poke8(pos, conn.fd);
+    poke8(pos + 8, conn.connected);
+    poke8(pos + 16, conn.msgId);
+    pool.count := pool.count + 1;
+    return 0;
+  }
+  
+  // Pool full - close connection
+  LDAPClose(conn);
+  return -1;
+}
+
+// Close pool and all connections
+pub fn LDAPPoolClose(pool: LDAPPool): int64 {
+  if (pool.connections != 0) {
+    var i: int64 := 0;
+    while (i < pool.count) {
+      var pos: int64 := pool.connections + (i * 24);
+      var conn: LDAPConn;
+      conn.fd := peek8(pos);
+      conn.connected := peek8(pos + 8);
+      LDAPClose(conn);
+      i := i + 1;
+    }
+    munmap(pool.connections, pool.maxSize * 24);
+    pool.connections := 0;
+  }
+  pool.count := 0;
+  return 0;
+}
+
+// Update last activity timestamp
+pub fn LDAPUpdateActivity(conn: LDAPConn): void {
+  conn.lastActivity := time(0);
+}
+
+// Check if connection is still valid (not timed out)
+pub fn LDAPIsStillValid(conn: LDAPConn, timeout: int64): bool {
+  if (conn.connected == 0) {
+    return false;
+  }
+  
+  var now: int64 := time(0);
+  var age: int64 := now - conn.lastActivity;
+  
+  // If no timeout set or not yet timed out
+  if (timeout <= 0 || age < timeout) {
+    return true;
+  }
+  
+  return false;
+}
   return 0;
 }
   
