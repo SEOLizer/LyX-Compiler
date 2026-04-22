@@ -434,6 +434,113 @@ make build
 ./lyxc examples/hello.lyx --dump-relocs   # Show relocations and symbols
 ./lyxc examples/hello.lyx --no-opt         # Disable IR optimizations
 
+# Debugging Features
+Lyx includes comprehensive debugging features to aid development and troubleshooting:
+
+## Compiler Debug Flags
+
+### AST Visualization (`--ast-dump`)
+Shows the Abstract Syntax Tree structure after parsing:
+```bash
+./lyxc test.lyx -o test --ast-dump
+```
+
+### Symbol Table Dump (`--symtab-dump`)
+Displays all scopes and symbols during semantic analysis:
+```bash
+./lyxc test.lyx -o test --symtab-dump
+```
+
+### Transformation Tracing (`--trace-passes`)
+Shows timing and output for each compiler pass:
+```bash
+./lyxc test.lyx -o test --trace-passes
+```
+
+### IR Source Mapping (`--ir-source-map`)
+Adds source line comments to IR dumps:
+```bash
+./lyxc test.lyx -o test --emit-asm --ir-source-map
+```
+
+### Type Checker Reasoning (`--type-reasoning`)
+Verbose logging of type checking decisions:
+```bash
+./lyxc test.lyx -o test --type-reasoning
+```
+
+### Constraint Logging (`--constraint-log`)
+Logs type constraints during checking:
+```bash
+./lyxc test.lyx -o test --constraint-log
+```
+
+### Provenance Tracking (`--provenance`)
+Enables tracking from machine code back to source:
+```bash
+./lyxc test.lyx -o test --provenance
+```
+
+### Import Tracing (`--trace-imports`)
+Debugs module resolution process:
+```bash
+./lyxc test.lyx -o test --trace-imports
+```
+
+## Runtime Debugging
+
+### Runtime Assertions (`--runtime-checks`)
+Enables bounds, null, zero, and boolean checks at runtime:
+```bash
+./lyxc test.lyx -o test --runtime-checks
+```
+
+### Profiling (`--profile`)
+Instruments function calls for performance analysis:
+```bash
+./lyxc test.lyx -o test --profile
+```
+
+### Trace Builtins (`--trace`)
+Enables `trace()`, `trace_int()`, `trace_str()` builtins:
+```bash
+./lyxc test.lyx -o test --trace
+```
+
+### Breakpoint Builtin
+Generates `int3` for debugger breakpoints:
+```lyx
+breakpoint();  // Triggers debugger breakpoint when run under gdb/lldb
+```
+
+## Debug Information
+
+### DWARF Debug Info (`-g`)
+Generates DWARF 4 sections for source-level debugging:
+```bash
+./lyxc test.lyx -o test -g
+```
+
+### Assembly Listing (`--asm-listing`)
+Source-annotated assembly with hex bytes:
+```bash
+./lyxc test.lyx -o test --asm-listing
+# Creates: test.lst
+```
+
+### Map File (`--map-file`)
+Memory layout documentation:
+```bash
+./lyxc test.lyx -o test --map-file
+# Creates: test.map
+```
+
+### Call Graph (`--call-graph`)
+Static call graph analysis:
+```bash
+./lyxc test.lyx -o test --call-graph
+```
+
 # DO-178C Tool Qualification
 ./lyxc --version        # TOR-001: Version info
 ./lyxc --build-info     # TOR-002: Build identification
