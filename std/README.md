@@ -44,6 +44,7 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/ini` | INI file parser and writer |
 | `std/os` | OS-level functions, system calls |
 | `std/system` | System information |
+| `std/systeminfo` | System information (CPU, memory, load, uptime, process stats) |
 | `std/log` | Logging framework |
 | `std/stats` | Statistical functions |
 | `std/stats_batch` | Batch processing for statistics |
@@ -1430,6 +1431,63 @@ System information and configuration.
 - `GetOSName(): pchar` - OS name
 - `GetOSVersion(): pchar` - OS version
 - `GetArch(): pchar` - Architecture
+
+---
+
+## std/systeminfo.lyx
+
+System information via `/proc` filesystem (Linux).
+
+### CPU Information
+- `GetLogicalCores(): int64` - Number of logical CPU cores
+- `GetPhysicalCores(): int64` - Number of physical CPU cores
+- `GetSMTWidth(): int64` - SMT/Hyperthreading width
+
+### Memory Information
+- `GetTotalMemory(): int64` - Total RAM in KB
+- `GetAvailableMemory(): int64` - Available RAM in KB
+- `GetFreeMemory(): int64` - Free RAM in KB
+
+### Load Average
+- `GetLoadAverage1(): int64` - 1-minute load average (format: XX.XX)
+- `GetLoadAverage5(): int64` - 5-minute load average
+- `GetLoadAverage15(): int64` - 15-minute load average
+
+### System
+- `GetOS(): int64` - OS type (0 = Linux)
+- `GetUptime(): int64` - System uptime in seconds
+
+### Process Information
+- `GetProcessId(): int64` - Current process ID
+- `GetParentProcessId(): int64` - Parent PID
+- `GetUserTime(): int64` - User CPU time (ticks)
+- `GetSystemTime(): int64` - System CPU time (ticks)
+- `GetNumThreads(): int64` - Number of threads
+
+### CPU Statistics
+- `GetCpuUserTime(): int64` - Total CPU user time (jiffies)
+- `GetCpuSystemTime(): int64` - Total CPU system time
+- `GetCpuIdleTime(): int64` - Total CPU idle time
+- `GetRunningProcesses(): int64` - Number of runnable processes
+
+### Usage Example
+```lyx
+import std.systeminfo;
+import std.io;
+
+fn main(): int64 {
+  PrintStr("Logical Cores: ");
+  PrintIntLn(GetLogicalCores());
+  
+  PrintStr("Total Memory: ");
+  PrintIntLn(GetTotalMemory() / 1024);
+  
+  PrintStr("Load 1min: ");
+  PrintIntLn(GetLoadAverage1());
+  
+  return 0;
+}
+```
 
 ---
 
