@@ -204,7 +204,8 @@ begin
   WriteLn;
   WriteLn('=== TOR-012: Fehlermeldungen mit Source-Position ===');
   
-  WriteTestFile('/tmp/tor_test_err.lyx', 'fn main(): int64 { return "hello"; }');
+  // Use a file with a clear error: unknown function
+  WriteTestFile('/tmp/tor_test_err.lyx', 'fn main(): int64 { return UnknownFunc(); }');
   
   RunCommandAndGetOutput('./lyxc /tmp/tor_test_err.lyx -o /tmp/tor_err.out 2>&1', output, exitCode);
   // Compiler may exit 0 or non-zero for semantic errors - check for error output
