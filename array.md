@@ -66,7 +66,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP4 — Sema: Struct-Literal-Typprüfung für Collection-Felder (sema.pas)
+## ✅ WP4 — Sema: Struct-Literal-Typprüfung für Collection-Felder (sema.pas) `7b5ad4d`
 
 **Ziel:** Typcheck bei Struct-Literals mit Array/Map/Set-Feldern.
 
