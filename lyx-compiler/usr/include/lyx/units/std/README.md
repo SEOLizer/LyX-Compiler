@@ -44,10 +44,14 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/ini` | INI file parser and writer |
 | `std/os` | OS-level functions, system calls |
 | `std/system` | System information |
+| `std/systeminfo` | System information (CPU, memory, load, uptime, process stats) |
 | `std/log` | Logging framework |
 | `std/stats` | Statistical functions |
 | `std/stats_batch` | Batch processing for statistics |
 | `std/math_batch` | Batch processing for math |
+| `std/thread` | Multi-threading (pthread, mutex, cond, TLS, atomic) |
+| `std/net.ldap` | LDAP client (RFC 4511) |
+| `std/net.mongo` | MongoDB client |
 | `std/audio` | Audio playback and MP3/WAV processing |
 | `std/audio.mpg123` | MP3 decoding via libmpg123 |
 | `std/audio.alsa` | ALSA audio playback (Linux) |
@@ -1430,6 +1434,63 @@ System information and configuration.
 
 ---
 
+## std/systeminfo.lyx
+
+System information via `/proc` filesystem (Linux).
+
+### CPU Information
+- `GetLogicalCores(): int64` - Number of logical CPU cores
+- `GetPhysicalCores(): int64` - Number of physical CPU cores
+- `GetSMTWidth(): int64` - SMT/Hyperthreading width
+
+### Memory Information
+- `GetTotalMemory(): int64` - Total RAM in KB
+- `GetAvailableMemory(): int64` - Available RAM in KB
+- `GetFreeMemory(): int64` - Free RAM in KB
+
+### Load Average
+- `GetLoadAverage1(): int64` - 1-minute load average (format: XX.XX)
+- `GetLoadAverage5(): int64` - 5-minute load average
+- `GetLoadAverage15(): int64` - 15-minute load average
+
+### System
+- `GetOS(): int64` - OS type (0 = Linux)
+- `GetUptime(): int64` - System uptime in seconds
+
+### Process Information
+- `GetProcessId(): int64` - Current process ID
+- `GetParentProcessId(): int64` - Parent PID
+- `GetUserTime(): int64` - User CPU time (ticks)
+- `GetSystemTime(): int64` - System CPU time (ticks)
+- `GetNumThreads(): int64` - Number of threads
+
+### CPU Statistics
+- `GetCpuUserTime(): int64` - Total CPU user time (jiffies)
+- `GetCpuSystemTime(): int64` - Total CPU system time
+- `GetCpuIdleTime(): int64` - Total CPU idle time
+- `GetRunningProcesses(): int64` - Number of runnable processes
+
+### Usage Example
+```lyx
+import std.systeminfo;
+import std.io;
+
+fn main(): int64 {
+  PrintStr("Logical Cores: ");
+  PrintIntLn(GetLogicalCores());
+  
+  PrintStr("Total Memory: ");
+  PrintIntLn(GetTotalMemory() / 1024);
+  
+  PrintStr("Load 1min: ");
+  PrintIntLn(GetLoadAverage1());
+  
+  return 0;
+}
+```
+
+---
+
 ## std/log.lyx
 
 Logging framework for application logging.
@@ -1739,6 +1800,128 @@ fn main(): int64 {
   SortInt64(arr, 5);  // arr is now [1, 3, 5, 8, 9]
   
   return 0;
+}
+```
+
+---
+
+## std/qt5_app.lyx
+
+Qt5 Application wrapper for Lyx (FFI around libqtlyx.so).
+
+### Setup
+```bash
+# Build libqtlyx.so
+cd qt_wrapper && make
+
+# Set library path when running
+export LD_LIBRARY_PATH=$PWD/qt_wrapper:$LD_LIBRARY_PATH
+```
+
+### Application
+- `qt_init(): int64` - Initialize QApplication
+- `qt_exec(): int64` - Run event loop (blocks)
+- `qt_quit(): int64` - Request quit
+- `qt_create_window(title, width, height): int64` - Create window
+
+### Widgets
+
+**Input Widgets:**
+- `qt_lineedit_create(parent, text): int64`
+- `qt_spinbox_create(parent): int64`
+- `qt_doublespinbox_create(parent): int64`
+- `qt_slider_create(parent, orientation): int64`
+- `qt_dial_create(parent): int64`
+
+**Selection:**
+- `qt_checkbox_create(parent, text): int64`
+- `qt_radiobutton_create(parent, text): int64`
+- `qt_combobox_create(parent): int64`
+
+**Display:**
+- `qt_progressbar_create(parent): int64`
+- `qt_listwidget_create(parent): int64`
+- `qt_treewidget_create(parent): int64`
+- `qt_tablewidget_create(parent, rows, cols): int64`
+- `qt_textedit_create(parent, text): int64`
+- `qt_tabwidget_create(parent): int64`
+
+**Layouts:**
+- `qt_hbox_create(): int64` - Horizontal layout
+- `qt_vbox_create(): int64` - Vertical layout
+- `qt_grid_create(): int64` - Grid layout
+- `qt_splitter_create(parent, orientation): int64`
+
+### Graphics (2D)
+- `qt_pixmap_create(width, height): int64`
+- `qt_pixmap_load(pixmap, filename): int64`
+- `qt_pixmap_save(pixmap, filename, format): int64`
+- `qt_pixmap_width(pixmap): int64`
+- `qt_pixmap_height(pixmap): int64`
+- `qt_pixmap_fill(pixmap, r, g, b, a): int64`
+- `qt_image_create(width, height, format): int64`
+
+**QPainter:**
+- `qt_painter_begin(pixmap): int64`
+- `qt_painter_end(): int64`
+- `qt_painter_set_pen_color(r, g, b, a): int64`
+- `qt_painter_set_pen_width(width): int64`
+- `qt_painter_set_brush_color(r, g, b, a): int64`
+- `qt_painter_draw_line(x1, y1, x2, y2): int64`
+- `qt_painter_draw_rect(x, y, w, h): int64`
+- `qt_painter_draw_ellipse(x, y, w, h): int64`
+- `qt_painter_draw_text(x, y, text): int64`
+- `qt_painter_draw_text(x, y, text): int64`
+- `qt_painter_fill_rect(x, y, w, h, r, g, b, a): int64`
+- `qt_painter_set_font(family, size, bold): int64`
+- `qt_painter_set_opacity(opacity): int64`
+
+### Callbacks (Event-Marker System)
+
+Widgets use an **event marker** pattern: connect a callback ID, then poll in your event loop.
+
+| Widget | `on_*` Callback | `was_*` Poller |
+|--------|-----------------|----------------|
+| Button | `qt_button_on_clicked` | `qt_button_was_clicked` |
+| CheckBox | `qt_checkbox_on_toggled` | `qt_checkbox_was_toggled` |
+| Slider | `qt_slider_on_valuechanged` | `qt_slider_was_changed` |
+| Dial | `qt_dial_on_value_changed` | `qt_dial_was_changed` |
+| SpinBox | `qt_spinbox_on_value_changed` | `qt_spinbox_was_changed` |
+| DoubleSpinBox | `qt_doublespinbox_on_value_changed` | - |
+| LineEdit | `qt_lineedit_on_text_changed` | `qt_lineedit_was_changed` |
+| TextEdit | `qt_textedit_on_text_changed` | `qt_textedit_was_changed` |
+| ComboBox | `qt_combobox_on_current_index_changed` | `qt_combobox_was_changed` |
+| ListWidget | `qt_listwidget_on_current_row_changed` | `qt_listwidget_was_changed` |
+| TabWidget | `qt_tabwidget_on_current_changed` | `qt_tabwidget_was_changed` |
+| Action | `qt_action_create_with_callback` | `qt_action_was_triggered` |
+| Timer | `qt_timer_on_timeout` | - |
+
+### Usage Example
+```lyx
+import std.qt5_app;
+
+pub fn main(): int64 {
+    qt_init();
+    
+    var win: int64 := qt_create_window("My App", 400, 300);
+    var btn: int64 := qt_button_create(win, "Click Me");
+    
+    // Register callback
+    qt_button_on_clicked(btn, 1);
+    
+    qt_show(win);
+    
+    // Event loop
+    while true {
+        qt_process_events();
+        
+        // Poll for button click
+        if qt_button_was_clicked(btn) == 1 {
+            // Handle click
+        }
+    }
+    
+    return qt_exec();
 }
 ```
 
