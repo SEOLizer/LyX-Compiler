@@ -140,7 +140,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## ✅ WP8 — Codegen: Fat-Pointer & Heap-Collection-Felder (codegen_x86_64.pas)
+## ✅ WP8 — Codegen: Fat-Pointer & Heap-Collection-Felder (codegen_x86_64.pas) `4882e89`
 
 **Ziel:** x86-64 Codegen für `[]T`, `Map`, `Set` als Struct-Felder.
 
