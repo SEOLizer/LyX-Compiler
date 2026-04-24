@@ -100,7 +100,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP6 — IR-Lowering: Feldzugriff & Element-Operationen (lower_ast_to_ir.pas)
+## ✅ WP6 — IR-Lowering: Feldzugriff & Element-Operationen (lower_ast_to_ir.pas) `be0d051`
 
 **Ziel:** `obj.field[i]`, `obj.map.get(k)`, `obj.set.contains(x)` etc. lowern.
 
