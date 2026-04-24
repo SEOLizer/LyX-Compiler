@@ -6419,35 +6419,32 @@ begin
               // Load index into RCX
               WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
               
-              if instr.ImmInt = 1 then
-              begin
-                // Byte access (pchar): RAX = RAX + RCX, then load byte
-                // add rax, rcx
-                EmitRex(FCode, 1, 0, 0, 0);
-                EmitU8(FCode, $01);
-                EmitU8(FCode, $C8);  // add rax, rcx
-                // movzx rax, byte [rax]
-                EmitRex(FCode, 1, 0, 0, 0);
-                EmitU8(FCode, $0F);
-                EmitU8(FCode, $B6);
-                EmitU8(FCode, $00);  // movzx rax, byte [rax]
-              end
+              case instr.ImmInt of
+                1:
+                begin
+                  // Byte access: add rax, rcx  →  movzx rax, byte [rax]
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $01); EmitU8(FCode, $C8);  // add rax, rcx
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $0F); EmitU8(FCode, $B6); EmitU8(FCode, $00);  // movzx rax, byte [rax]
+                end;
+                2:
+                begin
+                  // 2-byte access: shl rcx, 1  →  add rax, rcx  →  movzx rax, word [rax]
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $01);  // shl rcx, 1
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $01); EmitU8(FCode, $C8);  // add rax, rcx
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $0F); EmitU8(FCode, $B7); EmitU8(FCode, $00);  // movzx rax, word [rax]
+                end;
+                4:
+                begin
+                  // 4-byte access: shl rcx, 2  →  add rax, rcx  →  mov eax, [rax] (zero-extends)
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $02);  // shl rcx, 2
+                  EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $01); EmitU8(FCode, $C8);  // add rax, rcx
+                  EmitU8(FCode, $8B); EmitU8(FCode, $00);  // mov eax, [rax] (no REX.W — implicit 64-bit zero-extend)
+                end;
               else
-              begin
-                // 8-byte access (int64): RAX = RAX + RCX * 8, then load qword
-                // shl rcx, 3  (multiply index by 8)
-                EmitRex(FCode, 1, 0, 0, 0);
-                EmitU8(FCode, $C1);
-                EmitU8(FCode, $E1);
-                EmitU8(FCode, $03);  // shl rcx, 3
-                // add rax, rcx
-                EmitRex(FCode, 1, 0, 0, 0);
-                EmitU8(FCode, $01);
-                EmitU8(FCode, $C8);  // add rax, rcx
-                // mov rax, [rax]
-                EmitRex(FCode, 1, 0, 0, 0);
-                EmitU8(FCode, $8B);
-                EmitU8(FCode, $00);  // mov rax, [rax]
+                // 8-byte access (default): shl rcx, 3  →  add rax, rcx  →  mov rax, [rax]
+                EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03);  // shl rcx, 3
+                EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $01); EmitU8(FCode, $C8);  // add rax, rcx
+                EmitRex(FCode, 1, 0, 0, 0); EmitU8(FCode, $8B); EmitU8(FCode, $00);  // mov rax, [rax]
               end;
               
               // Store result in destination temp slot
@@ -7090,14 +7087,15 @@ begin
         irMapNew, irSetNew:
           begin
             // Allocate map/set on heap via sys_mmap
-            // For simplicity: allocate 144 bytes (16 header + 8*16 entries)
+            // Linux x86-64 mmap syscall args: (rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=offset)
+            // MAP_PRIVATE=0x02, MAP_ANONYMOUS=0x20 → flags=0x22=34
             WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
-            WriteMovRegImm64(FCode, RDI, 0);  // addr = NULL
-            WriteMovRegImm64(FCode, RSI, 144); // length
-            WriteMovRegImm64(FCode, RDX, 3);   // MAP_PRIVATE | MAP_ANONYMOUS
-            WriteMovRegImm64(FCode, R10, -1);  // fd = -1
-            WriteMovRegImm64(FCode, R8, 0);    // offset
-            WriteMovRegImm64(FCode, R9, 3);    // PROT_READ | PROT_WRITE
+            WriteMovRegImm64(FCode, RDI, 0);   // addr = NULL
+            WriteMovRegImm64(FCode, RSI, 144); // length = 144 bytes (header + 8 entries)
+            WriteMovRegImm64(FCode, RDX, 3);   // prot = PROT_READ|PROT_WRITE
+            WriteMovRegImm64(FCode, R10, 34);  // flags = MAP_PRIVATE|MAP_ANONYMOUS (0x22)
+            WriteMovRegImm64(FCode, R8, UInt64(-1));  // fd = -1 (anonymous)
+            WriteMovRegImm64(FCode, R9, 0);    // offset = 0
             WriteSyscall(FCode);
             // Initialize len=0, cap=8
             EmitU8(FCode, $48); EmitU8(FCode, $C7); EmitU8(FCode, $00);

@@ -982,6 +982,13 @@ type
     ArrayLen: Integer; // 0 = scalar, >0 static, -1 dynamic
     Visibility: TVisibility; // for class fields (default: visPublic)
     BitOffset: Integer;  // -1 = auto (normal), >=0 = explicit bit position (aerospace-todo P2 #50)
+    // parameterized-type metadata (atDynArray/atArray/atSet: ElemType; atMap: KeyType+ValType)
+    ElemType:     TAurumType; // element type for []T, [N]T, Set<T>
+    ElemTypeName: string;     // named element type (struct/class)
+    KeyType:      TAurumType; // key type for Map<K,V>
+    KeyTypeName:  string;     // named key type
+    ValType:      TAurumType; // value type for Map<K,V>
+    ValTypeName:  string;     // named value type
   end;
   TStructFieldList = array of TStructField;
   TMethodList = array of TAstFuncDecl;

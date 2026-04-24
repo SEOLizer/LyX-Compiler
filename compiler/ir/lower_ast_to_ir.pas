@@ -71,6 +71,7 @@ type
     { Emits IR range-check for value in temp tVal against [rMin..rMax] (aerospace-todo P1 #7) }
     procedure EmitRangeCheck(tVal: Integer; rMin, rMax: Int64; const typeName: string; span: TSourceSpan);
 
+    procedure EmitScopeDrops; // WP9: emit nil-guarded frees for Map/Set locals and struct fields
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
     function LowerStructLit(sl: TAstStructLit): Integer; // returns temp with struct address
@@ -572,12 +573,13 @@ begin
        if (Length(FCurrentFunc.Instructions) = 0) or
           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
        begin
+         EmitScopeDrops; // WP9
          instr := Default(TIRInstr);
          instr.Op := irFuncExit;
          instr.Src1 := -1;
          Emit(instr);
        end;
-       
+
        FCurrentFunc := nil;
        FCurrentFuncDecl := nil;
     end
@@ -652,15 +654,16 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or 
+        if (Length(FCurrentFunc.Instructions) = 0) or
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
-        
+
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -744,15 +747,16 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or 
+        if (Length(FCurrentFunc.Instructions) = 0) or
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
-        
+
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -1081,6 +1085,7 @@ begin
                 if (Length(FCurrentFunc.Instructions) = 0) or
                    (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
                 begin
+                  EmitScopeDrops; // WP9
                   instr := Default(TIRInstr);
                   instr.Op := irFuncExit;
                   instr.Src1 := -1;
@@ -1241,6 +1246,7 @@ begin
               if (Length(FCurrentFunc.Instructions) = 0) or
                  (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
               begin
+                EmitScopeDrops; // WP9
                 // Initialize instr locally for this scope
                 instr := Default(TIRInstr);
                 instr.Op := irFuncExit;
@@ -1381,6 +1387,7 @@ begin
     if (Length(FCurrentFunc.Instructions) = 0) or
        (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
     begin
+      EmitScopeDrops; // WP9
       instr := Default(TIRInstr);
       instr.Op := irFuncExit;
       instr.Src1 := -1;
@@ -1490,6 +1497,15 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     structIdx: Integer;
     sd: TAstStructDecl;
     fi: Integer;
+    // WP6: struct collection field indexed access
+    fAccess: TAstFieldAccess;
+    fldArrLen: Integer;
+    fldElemType: TAurumType;
+    isHeap: Boolean;
+    addrBase, tOffset, ptrTemp, mapTemp: Integer;
+    // WP8: Map/Set method dispatch
+    recvTemp: Integer;
+    recvType2: TAurumType;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -3350,6 +3366,73 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 Result := t0;
                 Exit;
               end;
+              // WP8: local Map/Set variable method calls (myMap.insert(k,v) etc.)
+              recvType2 := GetLocalType(loc);
+              if recvType2 = atMap then
+              begin
+                t1 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
+                if call.Name = 'get' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'insert' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapSet; instr.Src1 := t1; instr.Src2 := argTemps[0]; instr.Src3 := argTemps[1]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'remove' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapRemove; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'contains' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapContains; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'len' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapLen; instr.Dest := t0; instr.Src1 := t1; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'free' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := t1; Emit(instr);
+                  Result := -1;
+                end;
+                Exit;
+              end
+              else if recvType2 = atSet then
+              begin
+                t1 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
+                if call.Name = 'add' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetAdd; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'remove' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetRemove; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'contains' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetContains; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'len' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetLen; instr.Dest := t0; instr.Src1 := t1; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'free' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := t1; Emit(instr);
+                  Result := -1;
+                end;
+                Exit;
+              end;
             end;
           end;
 
@@ -3471,7 +3554,77 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 // Need to look up class from receiver type (call.Args[0])
                 vmtMethodName := Copy(call.Name, 9, MaxInt);
                 vmtClassName := '';
-                
+
+                // WP8: Map/Set method call on any receiver (local var or struct field)
+                // argTemps[0] = receiver pointer, argTemps[1..n] = actual args
+                if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) and
+                   (call.Args[0].ResolvedType in [atMap, atSet]) then
+                begin
+                  recvTemp := argTemps[0];
+                  if call.Args[0].ResolvedType = atMap then
+                  begin
+                    if vmtMethodName = 'get' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'insert' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapSet; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; instr.Src3 := argTemps[2]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'remove' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapRemove; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'contains' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapContains; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'len' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapLen; instr.Dest := t0; instr.Src1 := recvTemp; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'free' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := recvTemp; Emit(instr);
+                      Result := -1;
+                    end;
+                  end
+                  else // atSet
+                  begin
+                    if vmtMethodName = 'add' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetAdd; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'remove' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetRemove; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'contains' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetContains; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'len' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetLen; instr.Dest := t0; instr.Src1 := recvTemp; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'free' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := recvTemp; Emit(instr);
+                      Result := -1;
+                    end;
+                  end;
+                  Exit;
+                end;
+
                 // Get receiver's type from semantic analysis
                 if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) then
                 begin
@@ -3602,6 +3755,122 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkIndexAccess:
       begin
+        // --- WP6: struct collection field indexed access ---
+        if TAstIndexAccess(expr).Obj is TAstFieldAccess then
+        begin
+          fAccess    := TAstFieldAccess(TAstIndexAccess(expr).Obj);
+          fldArrLen  := 0;
+          fldElemType := atUnresolved;
+          fldType    := fAccess.FieldType;
+          fldOffset  := fAccess.FieldOffset;
+
+          // Look up full field metadata from struct declaration
+          if fAccess.OwnerName <> '' then
+          begin
+            structIdx := FStructTypes.IndexOf(fAccess.OwnerName);
+            if structIdx >= 0 then
+            begin
+              sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+              for fi := 0 to High(sd.Fields) do
+                if sd.Fields[fi].Name = fAccess.Field then
+                begin
+                  fldArrLen   := sd.Fields[fi].ArrayLen;
+                  fldElemType := sd.Fields[fi].ElemType;
+                  fldType     := sd.Fields[fi].FieldType;
+                  Break;
+                end;
+            end;
+          end;
+
+          isHeap := (fAccess.OwnerName <> '') and
+                    (FClassTypes.IndexOf(fAccess.OwnerName) >= 0);
+
+          // static [N]T field: addrBase = struct_base ∓ fldOffset, then irLoadElem
+          if fldArrLen > 0 then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            if fldElemType <> atUnresolved then
+              elemSize := TypeSizeBytes(fldElemType)
+            else
+              elemSize := TypeSizeBytes(fldType);
+            if elemSize < 1 then elemSize := 8;
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            // bounds check: index >= N → out of bounds
+            tLen    := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := fldArrLen; Emit(instr);
+            tOk     := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpGe; instr.Dest := tOk; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+            errLbl  := NewLabel('Larr_oob');
+            instr := Default(TIRInstr); instr.Op := irBrTrue; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+            // addrBase = base - fldOffset (stack) or base + fldOffset (heap)
+            tOffset  := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tOffset; instr.ImmInt := fldOffset; Emit(instr);
+            addrBase := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irAdd else instr.Op := irSub;
+            instr.Dest := addrBase; instr.Src1 := t1; instr.Src2 := tOffset; Emit(instr);
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadElem; instr.Dest := t0; instr.Src1 := addrBase; instr.Src2 := t2; instr.ImmInt := elemSize; Emit(instr);
+            Result := t0;
+            skipLbl := NewLabel('Larr_ok');
+            instr := Default(TIRInstr); instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+            Exit;
+          end
+          // dynamic []T field: fat-pointer (ptr @ fldOffset, len @ fldOffset+8)
+          else if (fldArrLen < 0) or (fldType = atDynArray) then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            ptrTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := ptrTemp; instr.Src1 := t1; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+            lenTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := lenTemp; instr.Src1 := t1; instr.ImmInt := fldOffset + 8; instr.FieldSize := 8; Emit(instr);
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            tZero   := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+            tGe0    := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+            tLtLen  := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := lenTemp; Emit(instr);
+            tOk     := NewTemp; instr := Default(TIRInstr); instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+            errLbl  := NewLabel('Larr_oob');
+            instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+            if fldElemType <> atUnresolved then
+              elemSize := TypeSizeBytes(fldElemType)
+            else
+              elemSize := 8;
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadElem; instr.Dest := t0; instr.Src1 := ptrTemp; instr.Src2 := t2; instr.ImmInt := elemSize; Emit(instr);
+            Result := t0;
+            skipLbl := NewLabel('Larr_ok');
+            instr := Default(TIRInstr); instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+            Exit;
+          end
+          // Map<K,V> field: load map ptr, then irMapGet
+          else if fldType = atMap then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            mapTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := mapTemp; instr.Src1 := t1; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := mapTemp; instr.Src2 := t2; Emit(instr);
+            Result := t0;
+            Exit;
+          end;
+          // fall through for non-collection fields (scalar etc.)
+        end;
+
         // Check if this is a Map access (map[key])
         if TAstIndexAccess(expr).Obj.ResolvedType = atMap then
         begin
@@ -4822,7 +5091,10 @@ var
   instr: TIRInstr;
   sd: TAstStructDecl;
   baseLoc, slotsNeeded: Integer;
-  i, fi, fldOffset, valTemp, addrTemp: Integer;
+  i, fi, j, fldOffset, valTemp, addrTemp: Integer;
+  elemSize, ptrTemp, lenTemp, elemTemp: Integer;
+  fld: TStructField;
+  arrLit: TAstArrayLit;
   fieldName: string;
   fieldFound: Boolean;
 begin
@@ -4883,27 +5155,164 @@ begin
       begin
         fieldFound := True;
         fldOffset := sd.FieldOffsets[fi];
-        
-        // Lower the value expression
-        valTemp := LowerExpr(sl.Fields[i].Value);
-        if valTemp < 0 then Continue;
-        
-        // Store value at field offset
-        instr.Op := irStoreField;
-        instr.Src1 := addrTemp;  // base address
-        instr.Src2 := valTemp;   // value
-        instr.ImmInt := fldOffset;
-        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
-        Emit(instr);
-        
+        fld       := sd.Fields[fi];
+
+        // --- static inline array [N]T: store each element individually ---
+        if fld.ArrayLen > 0 then
+        begin
+          if fld.ElemType <> atUnresolved then
+            elemSize := TypeSizeBytes(fld.ElemType)
+          else
+            elemSize := TypeSizeBytes(fld.FieldType);
+          if elemSize < 1 then elemSize := 8;
+
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            for j := 0 to High(arrLit.Items) do
+            begin
+              elemTemp := LowerExpr(arrLit.Items[j]);
+              if elemTemp < 0 then Continue;
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := elemTemp;
+              instr.ImmInt    := fldOffset + j * elemSize;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end;
+        end
+
+        // --- dynamic array []T: store fat-pointer (ptr, len) ---
+        else if (fld.ArrayLen < 0) or (fld.FieldType = atDynArray) then
+        begin
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            if Length(arrLit.Items) > 0 then
+            begin
+              baseLoc := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
+                                        Length(arrLit.Items));
+              SetLength(FLocalArrayLen, baseLoc + Length(arrLit.Items));
+              for j := 0 to High(arrLit.Items) do
+              begin
+                FLocalArrayLen[baseLoc + j] := Length(arrLit.Items);
+                elemTemp := LowerExpr(arrLit.Items[j]);
+                if elemTemp >= 0 then
+                begin
+                  instr := Default(TIRInstr);
+                  instr.Op   := irStoreLocal;
+                  instr.Dest := baseLoc + (Length(arrLit.Items) - 1 - j);
+                  instr.Src1 := elemTemp;
+                  Emit(instr);
+                end;
+              end;
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op   := irLoadLocalAddr;
+              instr.Dest := ptrTemp;
+              instr.Src1 := baseLoc;
+              Emit(instr);
+            end
+            else
+            begin
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op     := irConstInt;
+              instr.Dest   := ptrTemp;
+              instr.ImmInt := 0;
+              Emit(instr);
+            end;
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := ptrTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op     := irConstInt;
+            instr.Dest   := lenTemp;
+            instr.ImmInt := Length(arrLit.Items);
+            Emit(instr);
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := lenTemp;
+            instr.ImmInt    := fldOffset + 8;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := 8;
+              Emit(instr);
+            end;
+          end;
+        end
+
+        // --- Map<K,V> and Set<T>: lower → pointer, store 8 bytes ---
+        else if fld.FieldType in [atMap, atSet] then
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp >= 0 then
+          begin
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := valTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end;
+        end
+
+        // --- scalar / named-type: single store ---
+        else
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp < 0 then Continue;
+          instr := Default(TIRInstr);
+          instr.Op        := irStoreField;
+          instr.Src1      := addrTemp;
+          instr.Src2      := valTemp;
+          instr.ImmInt    := fldOffset;
+          instr.FieldSize := TypeSizeBytes(fld.FieldType);
+          Emit(instr);
+        end;
+
         Break;
       end;
     end;
-    
+
     if not fieldFound then
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
   end;
-  
+
   // Return the address temp (LowerStructLit)
   Result := addrTemp;
 end;
@@ -5064,7 +5473,10 @@ end;
 procedure TIRLowering.LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
 var
   instr: TIRInstr;
-  i, fi, fldOffset, valTemp, addrTemp: Integer;
+  i, fi, j, fldOffset, valTemp, addrTemp: Integer;
+  elemSize, ptrTemp, lenTemp, elemTemp, dynBase: Integer;
+  fld: TStructField;
+  arrLit: TAstArrayLit;
   fieldName: string;
   fieldFound: Boolean;
 begin
@@ -5093,25 +5505,252 @@ begin
       begin
         fieldFound := True;
         fldOffset := sd.FieldOffsets[fi];
-        
-        // Lower the value expression
-        valTemp := LowerExpr(sl.Fields[i].Value);
-        if valTemp < 0 then Continue;
-        
-        // Store value at field offset
-        instr.Op := irStoreField;
-        instr.Src1 := addrTemp;  // base address
-        instr.Src2 := valTemp;   // value
-        instr.ImmInt := fldOffset;
-        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
-        Emit(instr);
-        
+        fld       := sd.Fields[fi];
+
+        if fld.ArrayLen > 0 then
+        begin
+          if fld.ElemType <> atUnresolved then
+            elemSize := TypeSizeBytes(fld.ElemType)
+          else
+            elemSize := TypeSizeBytes(fld.FieldType);
+          if elemSize < 1 then elemSize := 8;
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            for j := 0 to High(arrLit.Items) do
+            begin
+              elemTemp := LowerExpr(arrLit.Items[j]);
+              if elemTemp < 0 then Continue;
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := elemTemp;
+              instr.ImmInt    := fldOffset + j * elemSize;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end;
+        end
+        else if (fld.ArrayLen < 0) or (fld.FieldType = atDynArray) then
+        begin
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            if Length(arrLit.Items) > 0 then
+            begin
+              dynBase := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
+                                        Length(arrLit.Items));
+              SetLength(FLocalArrayLen, dynBase + Length(arrLit.Items));
+              for j := 0 to High(arrLit.Items) do
+              begin
+                FLocalArrayLen[dynBase + j] := Length(arrLit.Items);
+                elemTemp := LowerExpr(arrLit.Items[j]);
+                if elemTemp >= 0 then
+                begin
+                  instr := Default(TIRInstr);
+                  instr.Op   := irStoreLocal;
+                  instr.Dest := dynBase + (Length(arrLit.Items) - 1 - j);
+                  instr.Src1 := elemTemp;
+                  Emit(instr);
+                end;
+              end;
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op   := irLoadLocalAddr;
+              instr.Dest := ptrTemp;
+              instr.Src1 := dynBase;
+              Emit(instr);
+            end
+            else
+            begin
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op     := irConstInt;
+              instr.Dest   := ptrTemp;
+              instr.ImmInt := 0;
+              Emit(instr);
+            end;
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := ptrTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op     := irConstInt;
+            instr.Dest   := lenTemp;
+            instr.ImmInt := Length(arrLit.Items);
+            Emit(instr);
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := lenTemp;
+            instr.ImmInt    := fldOffset + 8;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := 8;
+              Emit(instr);
+            end;
+          end;
+        end
+        else if fld.FieldType in [atMap, atSet] then
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp >= 0 then
+          begin
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := valTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp < 0 then Continue;
+          instr := Default(TIRInstr);
+          instr.Op        := irStoreField;
+          instr.Src1      := addrTemp;
+          instr.Src2      := valTemp;
+          instr.ImmInt    := fldOffset;
+          instr.FieldSize := TypeSizeBytes(fld.FieldType);
+          Emit(instr);
+        end;
+
         Break;
       end;
     end;
-    
+
     if not fieldFound then
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
+  end;
+end;
+
+procedure TIRLowering.EmitScopeDrops;
+var
+  i, fi, loc: Integer;
+  ltype: TAurumType;
+  typeName: string;
+  structIdx: Integer;
+  sd: TAstStructDecl;
+  slotCnt: Integer;
+  addrTemp, ptrTemp, nilTemp: Integer;
+  instr: TIRInstr;
+  skipLbl: string;
+  fldOffset: Integer;
+begin
+  for i := 0 to FLocalMap.Count - 1 do
+  begin
+    loc := ObjToInt(FLocalMap.Objects[i]);
+    if loc < 0 then Continue;
+    if loc >= Length(FLocalTypes) then Continue;
+    ltype := FLocalTypes[loc];
+    typeName := '';
+    if loc < Length(FLocalTypeNames) then
+      typeName := FLocalTypeNames[loc];
+
+    // Case 1: local Map variable — nil-guarded irMapFree + zero-out
+    if ltype = atMap then
+    begin
+      skipLbl := NewLabel('Ldrop_map');
+      ptrTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := ptrTemp; instr.Src1 := loc; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := ptrTemp; Emit(instr);
+      nilTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := nilTemp; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+    end
+
+    // Case 2: local Set variable — nil-guarded irSetFree + zero-out
+    else if ltype = atSet then
+    begin
+      skipLbl := NewLabel('Ldrop_set');
+      ptrTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := ptrTemp; instr.Src1 := loc; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := ptrTemp; Emit(instr);
+      nilTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := nilTemp; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+    end
+
+    // Case 3: struct local with Map/Set fields — load struct, load field ptr, nil-guard free
+    else if (ltype = atUnresolved) and (typeName <> '') and
+            (FStructTypes.IndexOf(typeName) >= 0) then
+    begin
+      structIdx := FStructTypes.IndexOf(typeName);
+      sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+      if Length(sd.FieldOffsets) < Length(sd.Fields) then Continue;
+      slotCnt := 0;
+      if loc < Length(FLocalSlotCount) then slotCnt := FLocalSlotCount[loc];
+      if slotCnt < 1 then slotCnt := (sd.Size + 7) div 8;
+      if slotCnt < 1 then slotCnt := 1;
+      addrTemp := -1;
+      for fi := 0 to High(sd.Fields) do
+      begin
+        if not (sd.Fields[fi].FieldType in [atMap, atSet]) then Continue;
+        fldOffset := sd.FieldOffsets[fi];
+        // Load struct base address once (or each time — cheap temp)
+        addrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadStructAddr; instr.Dest := addrTemp;
+        instr.Src1 := loc; instr.StructSize := slotCnt * 8; Emit(instr);
+        // Load field pointer (8 bytes)
+        ptrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadField; instr.Dest := ptrTemp;
+        instr.Src1 := addrTemp; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+        // Nil guard
+        skipLbl := NewLabel('Ldrop_fld');
+        instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+        // Free
+        if sd.Fields[fi].FieldType = atMap then
+          begin instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := ptrTemp; Emit(instr); end
+        else
+          begin instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := ptrTemp; Emit(instr); end;
+        // Zero field to prevent double-free
+        nilTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+        // Reload addrTemp (was clobbered by previous iteration)
+        addrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadStructAddr; instr.Dest := addrTemp;
+        instr.Src1 := loc; instr.StructSize := slotCnt * 8; Emit(instr);
+        instr := Default(TIRInstr); instr.Op := irStoreField; instr.Src1 := addrTemp; instr.Src2 := nilTemp;
+        instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+        instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+      end;
+    end;
   end;
 end;
 
@@ -6310,6 +6949,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         // Normal return (non-struct or expression)
         tmp := LowerExpr(TAstReturn(stmt).Value);
         if tmp < 0 then Exit(False);
+        EmitScopeDrops; // WP9: free Map/Set locals and struct collection fields
         instr := Default(TIRInstr);
         instr.Op := irFuncExit;
         instr.Src1 := tmp;
@@ -6317,6 +6957,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else
       begin
+        EmitScopeDrops; // WP9: free Map/Set locals and struct collection fields
         instr := Default(TIRInstr);
         instr.Op := irFuncExit;
         instr.Src1 := -1; // void return

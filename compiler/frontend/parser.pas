@@ -17,6 +17,13 @@ type
     FLastParamListVarArgs: Boolean;
     FCurrentTypeParams: TStringArray; // type params of current generic function
     FNoStructLit: Boolean; // when True, suppress struct literal parsing (used for match expr)
+    // Parameterized-type metadata populated by ParseTypeExFull; read by struct/class field parser
+    FLastElemType:     TAurumType;
+    FLastElemTypeName: string;
+    FLastKeyType:      TAurumType;
+    FLastKeyTypeName:  string;
+    FLastValType:      TAurumType;
+    FLastValTypeName:  string;
     // @integrity pre-parsed at top of file before fn or unit (aerospace-todo P0 #43)
     FPendingIntegrity: TIntegrityAttr;
     FHasPendingIntegrity: Boolean;
@@ -894,9 +901,15 @@ begin
         // field: name : Type ;
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
-        fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
+        fld.FieldType     := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
-        fld.Visibility := curVisibility;
+        fld.ElemType      := FLastElemType;
+        fld.ElemTypeName  := FLastElemTypeName;
+        fld.KeyType       := FLastKeyType;
+        fld.KeyTypeName   := FLastKeyTypeName;
+        fld.ValType       := FLastValType;
+        fld.ValTypeName   := FLastValTypeName;
+        fld.Visibility    := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
         fields[High(fields)] := fld;
@@ -949,10 +962,16 @@ begin
       begin
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
-        fld.FieldType := ParseTypeEx(fld.ArrayLen, fldTypeName);
+        fld.FieldType     := ParseTypeEx(fld.ArrayLen, fldTypeName);
         fld.FieldTypeName := fldTypeName;
-        fld.Visibility := curVisibility;
-        fld.BitOffset := -1; // default: auto layout
+        fld.ElemType      := FLastElemType;
+        fld.ElemTypeName  := FLastElemTypeName;
+        fld.KeyType       := FLastKeyType;
+        fld.KeyTypeName   := FLastKeyTypeName;
+        fld.ValType       := FLastValType;
+        fld.ValTypeName   := FLastValTypeName;
+        fld.Visibility    := curVisibility;
+        fld.BitOffset     := -1; // default: auto layout
         // Parse optional bit-level mapping: at(N) (aerospace-todo P2 #50)
         if Check(tkIdent) and (FCurTok.Value = 'at') then
         begin
@@ -2793,6 +2812,12 @@ begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
+  FLastElemType     := atUnresolved;
+  FLastElemTypeName := '';
+  FLastKeyType      := atUnresolved;
+  FLastKeyTypeName  := '';
+  FLastValType      := atUnresolved;
+  FLastValTypeName  := '';
 
   // Check for array type syntax: Type[N] or []Type or Array<T> or Map<K,V> or Set<T>
   // Also check for function pointer type: fn(params) -> returnType
@@ -2980,6 +3005,8 @@ begin
         Exit;
       end;
       Expect(tkGt);
+      FLastKeyType := keyType;
+      FLastValType := valueType;
       Result := atMap;
       Exit;
     end;
@@ -2997,6 +3024,7 @@ begin
         Exit;
       end;
       Expect(tkGt);
+      FLastElemType := elementType;
       Result := atSet;
       Exit;
     end;
@@ -3058,6 +3086,7 @@ begin
         end;
         Expect(tkGt);
         // Mark as generic array (-3 indicates generic array)
+        FLastElemType := innerType;
         arrayLen := -3;
         Result := atDynArray;
         Exit;
@@ -3110,6 +3139,9 @@ begin
     // Check for array suffix: type[N] or type[]
     if Accept(tkLBracket) then
     begin
+      // Capture current type as element type for type[] / type[N] suffix
+      FLastElemType     := Result;
+      FLastElemTypeName := typeName;
       // Array type: type[N] or type[]
       if Check(tkIntLit) then
       begin
@@ -3129,10 +3161,14 @@ begin
           begin
             // Keep as typeName for struct types
             typeName := innerTypeName;
+            FLastElemType     := atUnresolved;
+            FLastElemTypeName := innerTypeName;
           end
           else
           begin
             Result := atArray;  // This is a static array
+            FLastElemType     := innerType;
+            FLastElemTypeName := '';
           end;
         end;
       end
@@ -3175,6 +3211,8 @@ begin
     typeName := innerTypeName;
     isNullable := innerNullable;
     Result := baseType;
+    FLastElemType     := baseType;
+    FLastElemTypeName := innerTypeName;
   end
   else
   begin
