@@ -4822,7 +4822,10 @@ var
   instr: TIRInstr;
   sd: TAstStructDecl;
   baseLoc, slotsNeeded: Integer;
-  i, fi, fldOffset, valTemp, addrTemp: Integer;
+  i, fi, j, fldOffset, valTemp, addrTemp: Integer;
+  elemSize, ptrTemp, lenTemp, elemTemp: Integer;
+  fld: TStructField;
+  arrLit: TAstArrayLit;
   fieldName: string;
   fieldFound: Boolean;
 begin
@@ -4883,27 +4886,164 @@ begin
       begin
         fieldFound := True;
         fldOffset := sd.FieldOffsets[fi];
-        
-        // Lower the value expression
-        valTemp := LowerExpr(sl.Fields[i].Value);
-        if valTemp < 0 then Continue;
-        
-        // Store value at field offset
-        instr.Op := irStoreField;
-        instr.Src1 := addrTemp;  // base address
-        instr.Src2 := valTemp;   // value
-        instr.ImmInt := fldOffset;
-        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
-        Emit(instr);
-        
+        fld       := sd.Fields[fi];
+
+        // --- static inline array [N]T: store each element individually ---
+        if fld.ArrayLen > 0 then
+        begin
+          if fld.ElemType <> atUnresolved then
+            elemSize := TypeSizeBytes(fld.ElemType)
+          else
+            elemSize := TypeSizeBytes(fld.FieldType);
+          if elemSize < 1 then elemSize := 8;
+
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            for j := 0 to High(arrLit.Items) do
+            begin
+              elemTemp := LowerExpr(arrLit.Items[j]);
+              if elemTemp < 0 then Continue;
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := elemTemp;
+              instr.ImmInt    := fldOffset + j * elemSize;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end;
+        end
+
+        // --- dynamic array []T: store fat-pointer (ptr, len) ---
+        else if (fld.ArrayLen < 0) or (fld.FieldType = atDynArray) then
+        begin
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            if Length(arrLit.Items) > 0 then
+            begin
+              baseLoc := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
+                                        Length(arrLit.Items));
+              SetLength(FLocalArrayLen, baseLoc + Length(arrLit.Items));
+              for j := 0 to High(arrLit.Items) do
+              begin
+                FLocalArrayLen[baseLoc + j] := Length(arrLit.Items);
+                elemTemp := LowerExpr(arrLit.Items[j]);
+                if elemTemp >= 0 then
+                begin
+                  instr := Default(TIRInstr);
+                  instr.Op   := irStoreLocal;
+                  instr.Dest := baseLoc + (Length(arrLit.Items) - 1 - j);
+                  instr.Src1 := elemTemp;
+                  Emit(instr);
+                end;
+              end;
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op   := irLoadLocalAddr;
+              instr.Dest := ptrTemp;
+              instr.Src1 := baseLoc;
+              Emit(instr);
+            end
+            else
+            begin
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op     := irConstInt;
+              instr.Dest   := ptrTemp;
+              instr.ImmInt := 0;
+              Emit(instr);
+            end;
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := ptrTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op     := irConstInt;
+            instr.Dest   := lenTemp;
+            instr.ImmInt := Length(arrLit.Items);
+            Emit(instr);
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := lenTemp;
+            instr.ImmInt    := fldOffset + 8;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := 8;
+              Emit(instr);
+            end;
+          end;
+        end
+
+        // --- Map<K,V> and Set<T>: lower → pointer, store 8 bytes ---
+        else if fld.FieldType in [atMap, atSet] then
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp >= 0 then
+          begin
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := valTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end;
+        end
+
+        // --- scalar / named-type: single store ---
+        else
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp < 0 then Continue;
+          instr := Default(TIRInstr);
+          instr.Op        := irStoreField;
+          instr.Src1      := addrTemp;
+          instr.Src2      := valTemp;
+          instr.ImmInt    := fldOffset;
+          instr.FieldSize := TypeSizeBytes(fld.FieldType);
+          Emit(instr);
+        end;
+
         Break;
       end;
     end;
-    
+
     if not fieldFound then
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
   end;
-  
+
   // Return the address temp (LowerStructLit)
   Result := addrTemp;
 end;
@@ -5064,7 +5204,10 @@ end;
 procedure TIRLowering.LowerStructLitIntoLocal(sl: TAstStructLit; baseLoc: Integer; sd: TAstStructDecl);
 var
   instr: TIRInstr;
-  i, fi, fldOffset, valTemp, addrTemp: Integer;
+  i, fi, j, fldOffset, valTemp, addrTemp: Integer;
+  elemSize, ptrTemp, lenTemp, elemTemp, dynBase: Integer;
+  fld: TStructField;
+  arrLit: TAstArrayLit;
   fieldName: string;
   fieldFound: Boolean;
 begin
@@ -5093,23 +5236,152 @@ begin
       begin
         fieldFound := True;
         fldOffset := sd.FieldOffsets[fi];
-        
-        // Lower the value expression
-        valTemp := LowerExpr(sl.Fields[i].Value);
-        if valTemp < 0 then Continue;
-        
-        // Store value at field offset
-        instr.Op := irStoreField;
-        instr.Src1 := addrTemp;  // base address
-        instr.Src2 := valTemp;   // value
-        instr.ImmInt := fldOffset;
-        instr.FieldSize := TypeSizeBytes(sd.Fields[fi].FieldType);
-        Emit(instr);
-        
+        fld       := sd.Fields[fi];
+
+        if fld.ArrayLen > 0 then
+        begin
+          if fld.ElemType <> atUnresolved then
+            elemSize := TypeSizeBytes(fld.ElemType)
+          else
+            elemSize := TypeSizeBytes(fld.FieldType);
+          if elemSize < 1 then elemSize := 8;
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            for j := 0 to High(arrLit.Items) do
+            begin
+              elemTemp := LowerExpr(arrLit.Items[j]);
+              if elemTemp < 0 then Continue;
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := elemTemp;
+              instr.ImmInt    := fldOffset + j * elemSize;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := elemSize;
+              Emit(instr);
+            end;
+          end;
+        end
+        else if (fld.ArrayLen < 0) or (fld.FieldType = atDynArray) then
+        begin
+          if sl.Fields[i].Value is TAstArrayLit then
+          begin
+            arrLit := TAstArrayLit(sl.Fields[i].Value);
+            if Length(arrLit.Items) > 0 then
+            begin
+              dynBase := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
+                                        Length(arrLit.Items));
+              SetLength(FLocalArrayLen, dynBase + Length(arrLit.Items));
+              for j := 0 to High(arrLit.Items) do
+              begin
+                FLocalArrayLen[dynBase + j] := Length(arrLit.Items);
+                elemTemp := LowerExpr(arrLit.Items[j]);
+                if elemTemp >= 0 then
+                begin
+                  instr := Default(TIRInstr);
+                  instr.Op   := irStoreLocal;
+                  instr.Dest := dynBase + (Length(arrLit.Items) - 1 - j);
+                  instr.Src1 := elemTemp;
+                  Emit(instr);
+                end;
+              end;
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op   := irLoadLocalAddr;
+              instr.Dest := ptrTemp;
+              instr.Src1 := dynBase;
+              Emit(instr);
+            end
+            else
+            begin
+              ptrTemp := NewTemp;
+              instr := Default(TIRInstr);
+              instr.Op     := irConstInt;
+              instr.Dest   := ptrTemp;
+              instr.ImmInt := 0;
+              Emit(instr);
+            end;
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := ptrTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+            lenTemp := NewTemp;
+            instr := Default(TIRInstr);
+            instr.Op     := irConstInt;
+            instr.Dest   := lenTemp;
+            instr.ImmInt := Length(arrLit.Items);
+            Emit(instr);
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := lenTemp;
+            instr.ImmInt    := fldOffset + 8;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end
+          else
+          begin
+            valTemp := LowerExpr(sl.Fields[i].Value);
+            if valTemp >= 0 then
+            begin
+              instr := Default(TIRInstr);
+              instr.Op        := irStoreField;
+              instr.Src1      := addrTemp;
+              instr.Src2      := valTemp;
+              instr.ImmInt    := fldOffset;
+              instr.FieldSize := 8;
+              Emit(instr);
+            end;
+          end;
+        end
+        else if fld.FieldType in [atMap, atSet] then
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp >= 0 then
+          begin
+            instr := Default(TIRInstr);
+            instr.Op        := irStoreField;
+            instr.Src1      := addrTemp;
+            instr.Src2      := valTemp;
+            instr.ImmInt    := fldOffset;
+            instr.FieldSize := 8;
+            Emit(instr);
+          end;
+        end
+        else
+        begin
+          valTemp := LowerExpr(sl.Fields[i].Value);
+          if valTemp < 0 then Continue;
+          instr := Default(TIRInstr);
+          instr.Op        := irStoreField;
+          instr.Src1      := addrTemp;
+          instr.Src2      := valTemp;
+          instr.ImmInt    := fldOffset;
+          instr.FieldSize := TypeSizeBytes(fld.FieldType);
+          Emit(instr);
+        end;
+
         Break;
       end;
     end;
-    
+
     if not fieldFound then
       FDiag.Error('unknown field in struct literal: ' + fieldName, sl.Span);
   end;
