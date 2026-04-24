@@ -3688,6 +3688,8 @@ var
   fieldName: string;
   fieldFound: Boolean;
   fieldType, valType: TAurumType;
+  litElemType, litKeyType, litValType: TAurumType;
+  fld: TStructField;
   usedFields: array of Boolean;
 begin
   Result := atUnresolved;
@@ -3736,12 +3738,86 @@ begin
         usedFields[fi] := True;
         
         // Check value type
-        fieldType := sd.Fields[fi].FieldType;
-        valType := CheckExpr(sl.Fields[i].Value);
-        
-        if (fieldType <> atUnresolved) and (not TypeEqual(valType, fieldType)) then
-          FDiag.Error(Format('field %s: expected %s but got %s',
-            [fieldName, AurumTypeToStr(fieldType), AurumTypeToStr(valType)]), sl.Fields[i].Value.Span);
+        fld      := sd.Fields[fi];
+        fieldType := fld.FieldType;
+        valType   := CheckExpr(sl.Fields[i].Value);
+
+        if (fld.ArrayLen < 0) or (fld.FieldType = atDynArray) then
+        begin
+          // dynamic array field: accept array / dynarray literal
+          if not (valType in [atArray, atDynArray]) then
+            FDiag.Error(Format('field ''%s'': expected dynamic array initializer, got %s',
+              [fieldName, AurumTypeToStr(valType)]), sl.Fields[i].Value.Span)
+          else if (fld.ElemType <> atUnresolved) and (sl.Fields[i].Value is TAstArrayLit) then
+          begin
+            litElemType := TAstArrayLit(sl.Fields[i].Value).ElemType;
+            if (litElemType <> atUnresolved) and not TypeEqual(litElemType, fld.ElemType) then
+              FDiag.Error(Format('field ''%s'': element type mismatch: expected %s, got %s',
+                [fieldName, AurumTypeToStr(fld.ElemType), AurumTypeToStr(litElemType)]),
+                sl.Fields[i].Value.Span);
+          end;
+        end
+        else if fld.ArrayLen > 0 then
+        begin
+          // static array field: accept array literal
+          if not (valType in [atArray]) then
+            FDiag.Error(Format('field ''%s'': expected static array initializer, got %s',
+              [fieldName, AurumTypeToStr(valType)]), sl.Fields[i].Value.Span)
+          else if (fld.ElemType <> atUnresolved) and (sl.Fields[i].Value is TAstArrayLit) then
+          begin
+            litElemType := TAstArrayLit(sl.Fields[i].Value).ElemType;
+            if (litElemType <> atUnresolved) and not TypeEqual(litElemType, fld.ElemType) then
+              FDiag.Error(Format('field ''%s'': element type mismatch: expected %s, got %s',
+                [fieldName, AurumTypeToStr(fld.ElemType), AurumTypeToStr(litElemType)]),
+                sl.Fields[i].Value.Span);
+          end;
+        end
+        else if fld.FieldType = atMap then
+        begin
+          // Map<K,V> field
+          if valType <> atMap then
+            FDiag.Error(Format('field ''%s'': expected Map literal, got %s',
+              [fieldName, AurumTypeToStr(valType)]), sl.Fields[i].Value.Span)
+          else if sl.Fields[i].Value is TAstMapLit then
+          begin
+            litKeyType := TAstMapLit(sl.Fields[i].Value).KeyType;
+            litValType := TAstMapLit(sl.Fields[i].Value).ValueType;
+            if (fld.KeyType <> atUnresolved) and (litKeyType <> atUnresolved)
+               and not TypeEqual(litKeyType, fld.KeyType) then
+              FDiag.Error(Format('field ''%s'': Map key type mismatch: expected %s, got %s',
+                [fieldName, AurumTypeToStr(fld.KeyType), AurumTypeToStr(litKeyType)]),
+                sl.Fields[i].Value.Span);
+            if (fld.ValType <> atUnresolved) and (litValType <> atUnresolved)
+               and not TypeEqual(litValType, fld.ValType) then
+              FDiag.Error(Format('field ''%s'': Map value type mismatch: expected %s, got %s',
+                [fieldName, AurumTypeToStr(fld.ValType), AurumTypeToStr(litValType)]),
+                sl.Fields[i].Value.Span);
+          end;
+        end
+        else if fld.FieldType = atSet then
+        begin
+          // Set<T> field
+          if valType <> atSet then
+            FDiag.Error(Format('field ''%s'': expected Set literal, got %s',
+              [fieldName, AurumTypeToStr(valType)]), sl.Fields[i].Value.Span)
+          else if sl.Fields[i].Value is TAstSetLit then
+          begin
+            litElemType := TAstSetLit(sl.Fields[i].Value).ElemType;
+            if (fld.ElemType <> atUnresolved) and (litElemType <> atUnresolved)
+               and not TypeEqual(litElemType, fld.ElemType) then
+              FDiag.Error(Format('field ''%s'': Set element type mismatch: expected %s, got %s',
+                [fieldName, AurumTypeToStr(fld.ElemType), AurumTypeToStr(litElemType)]),
+                sl.Fields[i].Value.Span);
+          end;
+        end
+        else
+        begin
+          // scalar / named-type field: existing check
+          if (fieldType <> atUnresolved) and (not TypeEqual(valType, fieldType)) then
+            FDiag.Error(Format('field %s: expected %s but got %s',
+              [fieldName, AurumTypeToStr(fieldType), AurumTypeToStr(valType)]),
+              sl.Fields[i].Value.Span);
+        end;
         
         Break;
       end;
