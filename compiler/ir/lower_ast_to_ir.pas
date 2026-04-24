@@ -1490,6 +1490,12 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     structIdx: Integer;
     sd: TAstStructDecl;
     fi: Integer;
+    // WP6: struct collection field indexed access
+    fAccess: TAstFieldAccess;
+    fldArrLen: Integer;
+    fldElemType: TAurumType;
+    isHeap: Boolean;
+    addrBase, tOffset, ptrTemp, mapTemp: Integer;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -3602,6 +3608,122 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
     nkIndexAccess:
       begin
+        // --- WP6: struct collection field indexed access ---
+        if TAstIndexAccess(expr).Obj is TAstFieldAccess then
+        begin
+          fAccess    := TAstFieldAccess(TAstIndexAccess(expr).Obj);
+          fldArrLen  := 0;
+          fldElemType := atUnresolved;
+          fldType    := fAccess.FieldType;
+          fldOffset  := fAccess.FieldOffset;
+
+          // Look up full field metadata from struct declaration
+          if fAccess.OwnerName <> '' then
+          begin
+            structIdx := FStructTypes.IndexOf(fAccess.OwnerName);
+            if structIdx >= 0 then
+            begin
+              sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+              for fi := 0 to High(sd.Fields) do
+                if sd.Fields[fi].Name = fAccess.Field then
+                begin
+                  fldArrLen   := sd.Fields[fi].ArrayLen;
+                  fldElemType := sd.Fields[fi].ElemType;
+                  fldType     := sd.Fields[fi].FieldType;
+                  Break;
+                end;
+            end;
+          end;
+
+          isHeap := (fAccess.OwnerName <> '') and
+                    (FClassTypes.IndexOf(fAccess.OwnerName) >= 0);
+
+          // static [N]T field: addrBase = struct_base ∓ fldOffset, then irLoadElem
+          if fldArrLen > 0 then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            if fldElemType <> atUnresolved then
+              elemSize := TypeSizeBytes(fldElemType)
+            else
+              elemSize := TypeSizeBytes(fldType);
+            if elemSize < 1 then elemSize := 8;
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            // bounds check: index >= N → out of bounds
+            tLen    := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := fldArrLen; Emit(instr);
+            tOk     := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpGe; instr.Dest := tOk; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+            errLbl  := NewLabel('Larr_oob');
+            instr := Default(TIRInstr); instr.Op := irBrTrue; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+            // addrBase = base - fldOffset (stack) or base + fldOffset (heap)
+            tOffset  := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tOffset; instr.ImmInt := fldOffset; Emit(instr);
+            addrBase := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irAdd else instr.Op := irSub;
+            instr.Dest := addrBase; instr.Src1 := t1; instr.Src2 := tOffset; Emit(instr);
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadElem; instr.Dest := t0; instr.Src1 := addrBase; instr.Src2 := t2; instr.ImmInt := elemSize; Emit(instr);
+            Result := t0;
+            skipLbl := NewLabel('Larr_ok');
+            instr := Default(TIRInstr); instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+            Exit;
+          end
+          // dynamic []T field: fat-pointer (ptr @ fldOffset, len @ fldOffset+8)
+          else if (fldArrLen < 0) or (fldType = atDynArray) then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            ptrTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := ptrTemp; instr.Src1 := t1; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+            lenTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := lenTemp; instr.Src1 := t1; instr.ImmInt := fldOffset + 8; instr.FieldSize := 8; Emit(instr);
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            tZero   := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+            tGe0    := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpGe; instr.Dest := tGe0; instr.Src1 := t2; instr.Src2 := tZero; Emit(instr);
+            tLtLen  := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpLt; instr.Dest := tLtLen; instr.Src1 := t2; instr.Src2 := lenTemp; Emit(instr);
+            tOk     := NewTemp; instr := Default(TIRInstr); instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGe0; instr.Src2 := tLtLen; Emit(instr);
+            errLbl  := NewLabel('Larr_oob');
+            instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+            if fldElemType <> atUnresolved then
+              elemSize := TypeSizeBytes(fldElemType)
+            else
+              elemSize := 8;
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadElem; instr.Dest := t0; instr.Src1 := ptrTemp; instr.Src2 := t2; instr.ImmInt := elemSize; Emit(instr);
+            Result := t0;
+            skipLbl := NewLabel('Larr_ok');
+            instr := Default(TIRInstr); instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+            msgTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstStr; instr.Dest := msgTmp; instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+            codeTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit'; instr.ImmInt := 1; SetLength(instr.ArgTemps,1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+            instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+            Exit;
+          end
+          // Map<K,V> field: load map ptr, then irMapGet
+          else if fldType = atMap then
+          begin
+            t1 := LowerExpr(fAccess.Obj);
+            if t1 < 0 then Exit;
+            mapTemp := NewTemp; instr := Default(TIRInstr);
+            if isHeap then instr.Op := irLoadFieldHeap else instr.Op := irLoadField;
+            instr.Dest := mapTemp; instr.Src1 := t1; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+            t2 := LowerExpr(TAstIndexAccess(expr).Index);
+            if t2 < 0 then Exit;
+            t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := mapTemp; instr.Src2 := t2; Emit(instr);
+            Result := t0;
+            Exit;
+          end;
+          // fall through for non-collection fields (scalar etc.)
+        end;
+
         // Check if this is a Map access (map[key])
         if TAstIndexAccess(expr).Obj.ResolvedType = atMap then
         begin
