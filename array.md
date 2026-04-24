@@ -81,7 +81,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP5 — IR-Lowering: Struct-Literal Initialisierung (lower_ast_to_ir.pas)
+## ✅ WP5 — IR-Lowering: Struct-Literal Initialisierung (lower_ast_to_ir.pas) `58daaf1`
 
 **Ziel:** IR-Code für Struct-Literals mit Collection-Feldern generieren.
 
