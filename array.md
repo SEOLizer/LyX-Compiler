@@ -11,7 +11,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP1 — TStructField: Parameterisierte Typ-Metadaten (ast.pas)
+## ✅ WP1 — TStructField: Parameterisierte Typ-Metadaten (ast.pas) `879381c`
 
 **Ziel:** `TStructField` um Elementtyp-Info für Arrays, Maps, Sets erweitern.
 
@@ -31,7 +31,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP2 — Parser: Feldtyp-Syntax für Collections (parser.pas)
+## ✅ WP2 — Parser: Feldtyp-Syntax für Collections (parser.pas) `852612b`
 
 **Ziel:** Felder wie `items: []i32`, `data: [16]u8`, `cache: Map<string, i64>`, `tags: Set<string>` korrekt parsen.
 
@@ -45,7 +45,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP3 — Sema: Typauflösung & Struct-Layout für Collection-Felder (sema.pas)
+## ✅ WP3 — Sema: Typauflösung & Struct-Layout für Collection-Felder (sema.pas) `15960ab`
 
 **Ziel:** Semantische Auflösung der Elementtypen; korrekte Bytegrößen im Layout.
 
