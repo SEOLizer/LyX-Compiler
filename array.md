@@ -124,7 +124,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP7 — Codegen: Statische Array-Felder inline (codegen_x86_64.pas)
+## ✅ WP7 — Codegen: Statische Array-Felder inline (codegen_x86_64.pas) `5ec4688`
 
 **Ziel:** x86-64 Codegen für inline-Array-Felder in Stack- und Heap-Structs.
 
