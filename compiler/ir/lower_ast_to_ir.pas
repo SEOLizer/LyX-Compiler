@@ -1496,6 +1496,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
     fldElemType: TAurumType;
     isHeap: Boolean;
     addrBase, tOffset, ptrTemp, mapTemp: Integer;
+    // WP8: Map/Set method dispatch
+    recvTemp: Integer;
+    recvType2: TAurumType;
   begin
   Result := -1;
   if not Assigned(expr) then
@@ -3356,6 +3359,73 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 Result := t0;
                 Exit;
               end;
+              // WP8: local Map/Set variable method calls (myMap.insert(k,v) etc.)
+              recvType2 := GetLocalType(loc);
+              if recvType2 = atMap then
+              begin
+                t1 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
+                if call.Name = 'get' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'insert' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapSet; instr.Src1 := t1; instr.Src2 := argTemps[0]; instr.Src3 := argTemps[1]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'remove' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapRemove; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'contains' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapContains; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'len' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapLen; instr.Dest := t0; instr.Src1 := t1; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'free' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := t1; Emit(instr);
+                  Result := -1;
+                end;
+                Exit;
+              end
+              else if recvType2 = atSet then
+              begin
+                t1 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := t1; instr.Src1 := loc; Emit(instr);
+                if call.Name = 'add' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetAdd; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'remove' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetRemove; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := -1;
+                end
+                else if call.Name = 'contains' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetContains; instr.Dest := t0; instr.Src1 := t1; instr.Src2 := argTemps[0]; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'len' then
+                begin
+                  t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetLen; instr.Dest := t0; instr.Src1 := t1; Emit(instr);
+                  Result := t0;
+                end
+                else if call.Name = 'free' then
+                begin
+                  instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := t1; Emit(instr);
+                  Result := -1;
+                end;
+                Exit;
+              end;
             end;
           end;
 
@@ -3477,7 +3547,77 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                 // Need to look up class from receiver type (call.Args[0])
                 vmtMethodName := Copy(call.Name, 9, MaxInt);
                 vmtClassName := '';
-                
+
+                // WP8: Map/Set method call on any receiver (local var or struct field)
+                // argTemps[0] = receiver pointer, argTemps[1..n] = actual args
+                if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) and
+                   (call.Args[0].ResolvedType in [atMap, atSet]) then
+                begin
+                  recvTemp := argTemps[0];
+                  if call.Args[0].ResolvedType = atMap then
+                  begin
+                    if vmtMethodName = 'get' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapGet; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'insert' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapSet; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; instr.Src3 := argTemps[2]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'remove' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapRemove; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'contains' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapContains; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'len' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irMapLen; instr.Dest := t0; instr.Src1 := recvTemp; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'free' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := recvTemp; Emit(instr);
+                      Result := -1;
+                    end;
+                  end
+                  else // atSet
+                  begin
+                    if vmtMethodName = 'add' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetAdd; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'remove' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetRemove; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := -1;
+                    end
+                    else if vmtMethodName = 'contains' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetContains; instr.Dest := t0; instr.Src1 := recvTemp; instr.Src2 := argTemps[1]; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'len' then
+                    begin
+                      t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irSetLen; instr.Dest := t0; instr.Src1 := recvTemp; Emit(instr);
+                      Result := t0;
+                    end
+                    else if vmtMethodName = 'free' then
+                    begin
+                      instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := recvTemp; Emit(instr);
+                      Result := -1;
+                    end;
+                  end;
+                  Exit;
+                end;
+
                 // Get receiver's type from semantic analysis
                 if (argCount >= 1) and Assigned(call.Args) and Assigned(call.Args[0]) then
                 begin
