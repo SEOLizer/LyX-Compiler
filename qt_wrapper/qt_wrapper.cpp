@@ -206,18 +206,28 @@ static long long g_last_clicked_widget = 0;
 static long long g_last_triggered_action = 0;
 static long long g_last_toggled_checkbox = 0;
 static long long g_last_slider_value = 0;
+static long long g_last_combobox_index = 0;
+static long long g_last_listwidget_row = 0;
+static long long g_last_spinbox_value = 0;
+static long long g_last_textedit_changed = 0;
+static long long g_last_tabwidget_index = 0;
+static long long g_last_dial_value = 0;
+
+// Registry für Action-Callbacks (Event-Marker-System)
+static std::map<void*, qlonglong> g_action_callbacks;
 
 /// qt_action_create_with_callback — erstelle Action mit Callback-ID
 extern "C" 
 long long _qt_action_create_with_callback(const char* title, long long callback_id) {
     QAction* act = new QAction(title ? QString::fromUtf8(title) : QString(), nullptr);
     act->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    g_action_callbacks[(void*)act] = callback_id;
     
     QObject::connect(act, &QAction::triggered, [act]() {
         g_last_triggered_action = (long long)(void*)act;
     });
     
-return (long long)(void*)act;
+    return (long long)(void*)act;
 }
 
 // qt_button_on_clicked(button, callback_id) — connect button to event marker (WP6)
@@ -454,14 +464,17 @@ public:
     
     static long long create_action(const char* title, long long callback) {
         QAction* act = new QAction(title ? QString::fromUtf8(title) : QString());
-        // Only try to connect if callback is non-zero and looks valid
-        // (this is a heuristic - real fix needs proper callback trampoline)
-        // if (callback && callback != 0x1) {
-        //     std::function<void()> cb = *(std::function<void()>*)&callback;
-        //     QObject::connect(act, &QAction::triggered, [cb]() { cb(); });
-        // }
-        // For now, don't try to connect any callbacks - just create the action
-        Q_UNUSED(callback);  // Silence unused warning
+        // Speichere Callback-ID für Event-Marker-System
+        if (callback > 0) {
+            act->setProperty("lyxCallbackId", (qlonglong)callback);
+            g_action_callbacks[(void*)act] = callback;
+        }
+        
+        // Verbinde Action mit Event-Marker
+        QObject::connect(act, &QAction::triggered, [act]() {
+            g_last_triggered_action = (long long)(void*)act;
+        });
+        
         return (long long)(void*)act;
     }
     
@@ -910,6 +923,31 @@ long long _qt_combobox_clear(long long combo) {
     return 0;
 }
 
+// qt_combobox_on_current_index_changed(combo, callback) — connect currentIndexChanged signal to event marker
+extern "C"
+long long _qt_combobox_on_current_index_changed(long long combo, long long callback_id) {
+    if (!combo) return -1;
+    QComboBox* cb = (QComboBox*)combo;
+    cb->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), [cb](int index) {
+        Q_UNUSED(index);
+        g_last_combobox_index = (long long)(void*)cb;
+    });
+    return 0;
+}
+
+// qt_combobox_was_changed(combo) — poll and reset combobox changed state
+extern "C"
+long long _qt_combobox_was_changed(long long combo) {
+    if (!combo) return 0;
+    if (g_last_combobox_index == combo) {
+        g_last_combobox_index = 0;
+        return 1;
+    }
+    return 0;
+}
+
 // ============================================================================
 // Display Widgets: QProgressBar
 // ============================================================================
@@ -1002,6 +1040,187 @@ long long _qt_listwidget_count(long long listwidget) {
 long long _qt_listwidget_clear(long long listwidget) {
     if (!listwidget) return -1;
     ((QListWidget*)listwidget)->clear();
+    return 0;
+}
+
+// qt_listwidget_on_current_row_changed(listwidget, callback) — connect currentRowChanged signal to event marker
+extern "C"
+long long _qt_listwidget_on_current_row_changed(long long listwidget, long long callback_id) {
+    if (!listwidget) return -1;
+    QListWidget* lw = (QListWidget*)listwidget;
+    lw->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(lw, &QListWidget::currentRowChanged, [lw](int row) {
+        Q_UNUSED(row);
+        g_last_listwidget_row = (long long)(void*)lw;
+    });
+    return 0;
+}
+
+// qt_listwidget_was_changed(listwidget) — poll and reset listwidget changed state
+extern "C"
+long long _qt_listwidget_was_changed(long long listwidget) {
+    if (!listwidget) return 0;
+    if (g_last_listwidget_row == listwidget) {
+        g_last_listwidget_row = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Input Widgets: QSpinBox Callbacks
+// ============================================================================
+
+// qt_spinbox_on_value_changed(spinbox, callback) — connect valueChanged signal to event marker
+extern "C"
+long long _qt_spinbox_on_value_changed(long long spinbox, long long callback_id) {
+    if (!spinbox) return -1;
+    QSpinBox* sb = (QSpinBox*)spinbox;
+    sb->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(sb, QOverload<int>::of(&QSpinBox::valueChanged), [sb](int value) {
+        Q_UNUSED(value);
+        g_last_spinbox_value = (long long)(void*)sb;
+    });
+    return 0;
+}
+
+// qt_spinbox_was_changed(spinbox) — poll and reset spinbox changed state
+extern "C"
+long long _qt_spinbox_was_changed(long long spinbox) {
+    if (!spinbox) return 0;
+    if (g_last_spinbox_value == spinbox) {
+        g_last_spinbox_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Input Widgets: QDoubleSpinBox Callbacks
+// ============================================================================
+
+// qt_doublespinbox_on_value_changed(spinbox, callback) — connect valueChanged signal to event marker
+extern "C"
+long long _qt_doublespinbox_on_value_changed(long long spinbox, long long callback_id) {
+    if (!spinbox) return -1;
+    QDoubleSpinBox* sb = (QDoubleSpinBox*)spinbox;
+    sb->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(sb, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [sb](double value) {
+        Q_UNUSED(value);
+        g_last_spinbox_value = (long long)(void*)sb;
+    });
+    return 0;
+}
+
+// ============================================================================
+// Input Widgets: QDial Callbacks
+// ============================================================================
+
+// qt_dial_on_value_changed(dial, callback) — connect valueChanged signal to event marker
+extern "C"
+long long _qt_dial_on_value_changed(long long dial, long long callback_id) {
+    if (!dial) return -1;
+    QDial* d = (QDial*)dial;
+    d->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(d, &QDial::valueChanged, [d](int value) {
+        Q_UNUSED(value);
+        g_last_dial_value = (long long)(void*)d;
+    });
+    return 0;
+}
+
+// qt_dial_was_changed(dial) — poll and reset dial changed state
+extern "C"
+long long _qt_dial_was_changed(long long dial) {
+    if (!dial) return 0;
+    if (g_last_dial_value == dial) {
+        g_last_dial_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// QPlainTextEdit Callbacks
+// ============================================================================
+
+// qt_textedit_on_text_changed(textedit, callback) — connect textChanged signal to event marker
+extern "C"
+long long _qt_textedit_on_text_changed(long long textedit, long long callback_id) {
+    if (!textedit) return -1;
+    QPlainTextEdit* te = (QPlainTextEdit*)textedit;
+    te->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(te, &QPlainTextEdit::textChanged, [te]() {
+        g_last_textedit_changed = (long long)(void*)te;
+    });
+    return 0;
+}
+
+// qt_textedit_was_changed(textedit) — poll and reset textedit changed state
+extern "C"
+long long _qt_textedit_was_changed(long long textedit) {
+    if (!textedit) return 0;
+    if (g_last_textedit_changed == textedit) {
+        g_last_textedit_changed = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// QTabWidget Callbacks
+// ============================================================================
+
+// qt_tabwidget_on_current_changed(tabwidget, callback) — connect currentChanged signal to event marker
+extern "C"
+long long _qt_tabwidget_on_current_changed(long long tabwidget, long long callback_id) {
+    if (!tabwidget) return -1;
+    QTabWidget* tw = (QTabWidget*)tabwidget;
+    tw->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    
+    QObject::connect(tw, &QTabWidget::currentChanged, [tw](int index) {
+        Q_UNUSED(index);
+        g_last_tabwidget_index = (long long)(void*)tw;
+    });
+    return 0;
+}
+
+// qt_tabwidget_was_changed(tabwidget) — poll and reset tabwidget changed state
+extern "C"
+long long _qt_tabwidget_was_changed(long long tabwidget) {
+    if (!tabwidget) return 0;
+    if (g_last_tabwidget_index == tabwidget) {
+        g_last_tabwidget_index = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// QTableWidget Callbacks
+// ============================================================================
+
+// qt_tablewidget_on_cell_changed(tablewidget, callback) — connect cellChanged signal to event marker
+extern "C"
+long long _qt_tablewidget_on_cell_changed(long long tablewidget, long long callback_id) {
+    if (!tablewidget) return -1;
+    QTableView* tv = (QTableView*)tablewidget;
+    tv->setProperty("lyxCallbackId", (qlonglong)callback_id);
+    // Note: QTableView hat kein cellChanged, QTableWidget schon
+    // Für QTableView nutzen wir den Selection-Model
+    if (tv->selectionModel()) {
+        QObject::connect(tv->selectionModel(), &QItemSelectionModel::currentChanged,
+            [tv](const QModelIndex& current, const QModelIndex& previous) {
+                Q_UNUSED(current);
+                Q_UNUSED(previous);
+                g_last_clicked_widget = (long long)(void*)tv;
+            });
+    }
     return 0;
 }
 
@@ -1388,145 +1607,185 @@ long long _qt_container_vbox_add_spacer(long long container, long long height) {
 // ============================================================================
 
 // --- QHBoxLayout ---
-
-// qt_hbox_create() — create a standalone horizontal layout.
-// Returns: QHBoxLayout* as int64
+// Erstellt ein QWidget mit einem QHBoxLayout (wie qt_container_create_vbox)
 long long _qt_hbox_create(void) {
-    QHBoxLayout* layout = new QHBoxLayout();
-    return (long long)(void*)layout;
+    QWidget* container = new QWidget();
+    QHBoxLayout* layout = new QHBoxLayout(container);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(5);
+    container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    container->setMinimumSize(100, 50);
+    return (long long)(void*)container;
 }
 
 // qt_hbox_add_widget(layout, widget) — add widget to hbox layout.
 long long _qt_hbox_add_widget(long long layout, long long widget) {
     if (!layout || !widget) return -1;
-    ((QHBoxLayout*)layout)->addWidget((QWidget*)widget);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) {
+        l->addWidget((QWidget*)widget);
+    }
     return 0;
 }
 
 // qt_hbox_add_layout(layout, child) — add nested layout to hbox.
 long long _qt_hbox_add_layout(long long layout, long long child) {
     if (!layout || !child) return -1;
-    ((QHBoxLayout*)layout)->addLayout((QLayout*)child);
+    QHBoxLayout* l = qobject_cast<QHBoxLayout*>(((QWidget*)layout)->layout());
+    if (l) {
+        l->addLayout((QLayout*)child);
+    }
     return 0;
 }
 
 // qt_hbox_add_spacer(layout, width, height, h_expand, v_expand) — add spacer.
 long long _qt_hbox_add_spacer(long long layout, long long width, long long height, long long h_expand, long long v_expand) {
     if (!layout) return -1;
-    QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
-    QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
-    ((QHBoxLayout*)layout)->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) {
+        QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+        QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+        l->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    }
     return 0;
 }
 
 // qt_hbox_set_spacing(layout, spacing) — set spacing between widgets.
 long long _qt_hbox_set_spacing(long long layout, long long spacing) {
     if (!layout) return -1;
-    ((QHBoxLayout*)layout)->setSpacing((int)spacing);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setSpacing((int)spacing);
     return 0;
 }
 
 // qt_hbox_set_margins(layout, left, top, right, bottom) — set contents margins.
 long long _qt_hbox_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
     if (!layout) return -1;
-    ((QHBoxLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
     return 0;
 }
 
 // --- QGridLayout ---
-
-// qt_grid_create() — create a grid layout.
-// Returns: QGridLayout* as int64
+// Erstellt ein QWidget mit einem QGridLayout
 long long _qt_grid_create(void) {
-    QGridLayout* layout = new QGridLayout();
-    return (long long)(void*)layout;
+    QWidget* container = new QWidget();
+    QGridLayout* layout = new QGridLayout(container);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(5);
+    container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    return (long long)(void*)container;
 }
 
 // qt_grid_add_widget(layout, widget, row, col, rowspan, colspan, alignment) — add widget to grid.
 long long _qt_grid_add_widget(long long layout, long long widget, long long row, long long col, long long rowspan, long long colspan, long long alignment) {
     if (!layout || !widget) return -1;
-    ((QGridLayout*)layout)->addWidget((QWidget*)widget, (int)row, (int)col, (int)rowspan, (int)colspan, (Qt::AlignmentFlag)(int)alignment);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) {
+        l->addWidget((QWidget*)widget);
+    }
     return 0;
 }
 
 // qt_grid_add_layout(layout, child, row, col, rowspan, colspan, alignment) — add nested layout.
 long long _qt_grid_add_layout(long long layout, long long child, long long row, long long col, long long rowspan, long long colspan, long long alignment) {
     if (!layout || !child) return -1;
-    ((QGridLayout*)layout)->addLayout((QLayout*)child, (int)row, (int)col, (int)rowspan, (int)colspan, (Qt::AlignmentFlag)(int)alignment);
+    QGridLayout* l = qobject_cast<QGridLayout*>(((QWidget*)layout)->layout());
+    if (l) {
+        l->addLayout((QLayout*)child, (int)row, (int)col, (int)rowspan, (int)colspan, (Qt::AlignmentFlag)(int)alignment);
+    }
     return 0;
 }
 
 // qt_grid_set_row_stretch(layout, row, stretch) — set row stretch factor.
 long long _qt_grid_set_row_stretch(long long layout, long long row, long long stretch) {
     if (!layout) return -1;
-    ((QGridLayout*)layout)->setRowStretch((int)row, (int)stretch);
+    QGridLayout* l = qobject_cast<QGridLayout*>(((QWidget*)layout)->layout());
+    if (l) l->setRowStretch((int)row, (int)stretch);
     return 0;
 }
 
 // qt_grid_set_column_stretch(layout, col, stretch) — set column stretch factor.
 long long _qt_grid_set_column_stretch(long long layout, long long col, long long stretch) {
     if (!layout) return -1;
-    ((QGridLayout*)layout)->setColumnStretch((int)col, (int)stretch);
+    QGridLayout* l = qobject_cast<QGridLayout*>(((QWidget*)layout)->layout());
+    if (l) l->setColumnStretch((int)col, (int)stretch);
     return 0;
 }
 
 // qt_grid_set_spacing(layout, spacing) — set horizontal and vertical spacing.
 long long _qt_grid_set_spacing(long long layout, long long spacing) {
     if (!layout) return -1;
-    ((QGridLayout*)layout)->setSpacing((int)spacing);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setSpacing((int)spacing);
     return 0;
 }
 
 // qt_grid_set_margins(layout, left, top, right, bottom) — set contents margins.
 long long _qt_grid_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
     if (!layout) return -1;
-    ((QGridLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
     return 0;
 }
 
 // --- QVBoxLayout (standalone) ---
-
-// qt_vbox_create() — create a standalone vertical layout.
-// Returns: QVBoxLayout* as int64
+// Erstellt ein QWidget mit einem QVBoxLayout (wie qt_container_create_vbox)
 long long _qt_vbox_create(void) {
-    QVBoxLayout* layout = new QVBoxLayout();
-    return (long long)(void*)layout;
+    QWidget* container = new QWidget();
+    QVBoxLayout* layout = new QVBoxLayout(container);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(5);
+    container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    container->setMinimumSize(100, 50);
+    return (long long)(void*)container;
 }
 
 // qt_vbox_add_widget(layout, widget) — add widget to vbox layout.
 long long _qt_vbox_add_widget(long long layout, long long widget) {
     if (!layout || !widget) return -1;
-    ((QVBoxLayout*)layout)->addWidget((QWidget*)widget);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) {
+        l->addWidget((QWidget*)widget);
+    }
     return 0;
 }
 
 // qt_vbox_add_layout(layout, child) — add nested layout to vbox.
 long long _qt_vbox_add_layout(long long layout, long long child) {
     if (!layout || !child) return -1;
-    ((QVBoxLayout*)layout)->addLayout((QLayout*)child);
+    QVBoxLayout* l = qobject_cast<QVBoxLayout*>(((QWidget*)layout)->layout());
+    if (l) {
+        l->addLayout((QLayout*)child);
+    }
     return 0;
 }
 
 // qt_vbox_add_spacer(layout, width, height, h_expand, v_expand) — add spacer.
 long long _qt_vbox_add_spacer(long long layout, long long width, long long height, long long h_expand, long long v_expand) {
     if (!layout) return -1;
-    QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
-    QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
-    ((QVBoxLayout*)layout)->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) {
+        QSizePolicy::Policy he = h_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+        QSizePolicy::Policy ve = v_expand ? QSizePolicy::Expanding : QSizePolicy::Minimum;
+        l->addItem(new QSpacerItem((int)width, (int)height, he, ve));
+    }
     return 0;
 }
 
 // qt_vbox_set_spacing(layout, spacing) — set spacing between widgets.
 long long _qt_vbox_set_spacing(long long layout, long long spacing) {
     if (!layout) return -1;
-    ((QVBoxLayout*)layout)->setSpacing((int)spacing);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setSpacing((int)spacing);
     return 0;
 }
 
 // qt_vbox_set_margins(layout, left, top, right, bottom) — set contents margins.
 long long _qt_vbox_set_margins(long long layout, long long left, long long top, long long right, long long bottom) {
     if (!layout) return -1;
-    ((QVBoxLayout*)layout)->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
+    QLayout* l = ((QWidget*)layout)->layout();
+    if (l) l->setContentsMargins((int)left, (int)top, (int)right, (int)bottom);
     return 0;
 }
 
