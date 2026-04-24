@@ -4354,6 +4354,7 @@ var
   i, pass, changed, fldIdx: Integer;
   sd: TAstStructDecl;
   totalSize, maxAlign, off, fsize, falign: Integer;
+  elemSz, elemAlign: Integer;
   f: TStructField;
   ok: Boolean;
   idx: Integer;
@@ -4367,7 +4368,12 @@ var
       atInt8, atUInt8, atChar, atBool: asz := 1;
       atInt16, atUInt16: asz := 2;
       atInt32, atUInt32, atF32: asz := 4;
-      atInt64, atUInt64, atISize, atUSize, atF64, atPChar: asz := 8;
+      atInt64, atUInt64, atISize, atUSize, atF64,
+      atPChar, atPCharNullable, atFnPtr: asz := 8;
+      // fat pointer (ptr + len): dynamic arrays are always 16 bytes
+      atDynArray: begin asz := 16; aalign := 8; Result := True; Exit; end;
+      // heap pointer: Map and Set are always 8 bytes
+      atMap, atSet: begin asz := 8; aalign := 8; Result := True; Exit; end;
       else
         begin
           asz := 0;
@@ -4411,7 +4417,70 @@ begin
             FDiag.Error('bit-level mapping at(' + IntToStr(f.BitOffset) + ') requires @packed struct: ' + f.Name, sd.Span);
         end;
         // determine field size/alignment
-        if f.FieldType <> atUnresolved then
+        // --- WP3: dynamic array fat-pointer (16 bytes) ---
+        if (f.ArrayLen < 0) or (f.FieldType = atDynArray) then
+        begin
+          fsize := 16; falign := 8;
+        end
+        // --- WP3: static inline array (N * sizeof(ElemType)) ---
+        else if f.ArrayLen > 0 then
+        begin
+          if f.ArrayLen = 0 then begin ok := False; Break; end; // guard (unreachable)
+          elemSz := 0; elemAlign := 0;
+          if f.ElemType <> atUnresolved then
+          begin
+            if not TypeSizeAndAlign(f.ElemType, elemSz, elemAlign) then
+            begin
+              FDiag.Error('unsupported element type in static array field ''' + f.Name + '''', sd.Span);
+              ok := False; Break;
+            end;
+          end
+          else if f.ElemTypeName <> '' then
+          begin
+            idx := FStructTypes.IndexOf(f.ElemTypeName);
+            if idx >= 0 then
+            begin
+              other := TAstStructDecl(FStructTypes.Objects[idx]);
+              if other.Size = 0 then begin ok := False; Break; end;
+              elemSz := other.Size; elemAlign := other.Align;
+            end
+            else begin ok := False; Break; end;
+          end
+          else if f.FieldType <> atUnresolved then
+          begin
+            // fallback: FieldType IS the element type for [N]T prefix syntax
+            if not TypeSizeAndAlign(f.FieldType, elemSz, elemAlign) then
+            begin ok := False; Break; end;
+          end
+          else begin ok := False; Break; end;
+          if elemSz = 0 then begin ok := False; Break; end;
+          fsize  := f.ArrayLen * elemSz;
+          falign := elemAlign;
+        end
+        // --- WP3: Map<K,V> and Set<T> (heap pointer: 8 bytes) ---
+        else if f.FieldType in [atMap, atSet] then
+        begin
+          fsize := 8; falign := 8;
+          // validate key/element type hashability
+          if f.FieldType = atMap then
+          begin
+            if (f.KeyType <> atUnresolved) and
+               not (f.KeyType in [atInt8, atInt16, atInt32, atInt64,
+                                   atUInt8, atUInt16, atUInt32, atUInt64,
+                                   atPChar, atBool]) then
+              FDiag.Error('Map field ''' + f.Name + ''': key type must be hashable (integer, pchar, or bool)', sd.Span);
+          end
+          else // atSet
+          begin
+            if (f.ElemType <> atUnresolved) and
+               not (f.ElemType in [atInt8, atInt16, atInt32, atInt64,
+                                    atUInt8, atUInt16, atUInt32, atUInt64,
+                                    atPChar, atBool]) then
+              FDiag.Error('Set field ''' + f.Name + ''': element type must be hashable (integer, pchar, or bool)', sd.Span);
+          end;
+        end
+        // --- scalar / named-type (existing logic) ---
+        else if f.FieldType <> atUnresolved then
         begin
           if not TypeSizeAndAlign(f.FieldType, fsize, falign) then begin ok := False; Break; end;
         end
