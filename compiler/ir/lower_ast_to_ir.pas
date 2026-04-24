@@ -71,6 +71,7 @@ type
     { Emits IR range-check for value in temp tVal against [rMin..rMax] (aerospace-todo P1 #7) }
     procedure EmitRangeCheck(tVal: Integer; rMin, rMax: Int64; const typeName: string; span: TSourceSpan);
 
+    procedure EmitScopeDrops; // WP9: emit nil-guarded frees for Map/Set locals and struct fields
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
     function LowerStructLit(sl: TAstStructLit): Integer; // returns temp with struct address
@@ -572,12 +573,13 @@ begin
        if (Length(FCurrentFunc.Instructions) = 0) or
           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
        begin
+         EmitScopeDrops; // WP9
          instr := Default(TIRInstr);
          instr.Op := irFuncExit;
          instr.Src1 := -1;
          Emit(instr);
        end;
-       
+
        FCurrentFunc := nil;
        FCurrentFuncDecl := nil;
     end
@@ -652,15 +654,16 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or 
+        if (Length(FCurrentFunc.Instructions) = 0) or
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
-        
+
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -744,15 +747,16 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or 
+        if (Length(FCurrentFunc.Instructions) = 0) or
            (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
         begin
+          EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
           instr.Op := irFuncExit;
           instr.Src1 := -1;
           Emit(instr);
         end;
-        
+
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -1081,6 +1085,7 @@ begin
                 if (Length(FCurrentFunc.Instructions) = 0) or
                    (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
                 begin
+                  EmitScopeDrops; // WP9
                   instr := Default(TIRInstr);
                   instr.Op := irFuncExit;
                   instr.Src1 := -1;
@@ -1241,6 +1246,7 @@ begin
               if (Length(FCurrentFunc.Instructions) = 0) or
                  (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
               begin
+                EmitScopeDrops; // WP9
                 // Initialize instr locally for this scope
                 instr := Default(TIRInstr);
                 instr.Op := irFuncExit;
@@ -1381,6 +1387,7 @@ begin
     if (Length(FCurrentFunc.Instructions) = 0) or
        (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
     begin
+      EmitScopeDrops; // WP9
       instr := Default(TIRInstr);
       instr.Op := irFuncExit;
       instr.Src1 := -1;
@@ -5649,6 +5656,104 @@ begin
   end;
 end;
 
+procedure TIRLowering.EmitScopeDrops;
+var
+  i, fi, loc: Integer;
+  ltype: TAurumType;
+  typeName: string;
+  structIdx: Integer;
+  sd: TAstStructDecl;
+  slotCnt: Integer;
+  addrTemp, ptrTemp, nilTemp: Integer;
+  instr: TIRInstr;
+  skipLbl: string;
+  fldOffset: Integer;
+begin
+  for i := 0 to FLocalMap.Count - 1 do
+  begin
+    loc := ObjToInt(FLocalMap.Objects[i]);
+    if loc < 0 then Continue;
+    if loc >= Length(FLocalTypes) then Continue;
+    ltype := FLocalTypes[loc];
+    typeName := '';
+    if loc < Length(FLocalTypeNames) then
+      typeName := FLocalTypeNames[loc];
+
+    // Case 1: local Map variable — nil-guarded irMapFree + zero-out
+    if ltype = atMap then
+    begin
+      skipLbl := NewLabel('Ldrop_map');
+      ptrTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := ptrTemp; instr.Src1 := loc; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := ptrTemp; Emit(instr);
+      nilTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := nilTemp; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+    end
+
+    // Case 2: local Set variable — nil-guarded irSetFree + zero-out
+    else if ltype = atSet then
+    begin
+      skipLbl := NewLabel('Ldrop_set');
+      ptrTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irLoadLocal; instr.Dest := ptrTemp; instr.Src1 := loc; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := ptrTemp; Emit(instr);
+      nilTemp := NewTemp;
+      instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irStoreLocal; instr.Dest := loc; instr.Src1 := nilTemp; Emit(instr);
+      instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+    end
+
+    // Case 3: struct local with Map/Set fields — load struct, load field ptr, nil-guard free
+    else if (ltype = atUnresolved) and (typeName <> '') and
+            (FStructTypes.IndexOf(typeName) >= 0) then
+    begin
+      structIdx := FStructTypes.IndexOf(typeName);
+      sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+      if Length(sd.FieldOffsets) < Length(sd.Fields) then Continue;
+      slotCnt := 0;
+      if loc < Length(FLocalSlotCount) then slotCnt := FLocalSlotCount[loc];
+      if slotCnt < 1 then slotCnt := (sd.Size + 7) div 8;
+      if slotCnt < 1 then slotCnt := 1;
+      addrTemp := -1;
+      for fi := 0 to High(sd.Fields) do
+      begin
+        if not (sd.Fields[fi].FieldType in [atMap, atSet]) then Continue;
+        fldOffset := sd.FieldOffsets[fi];
+        // Load struct base address once (or each time — cheap temp)
+        addrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadStructAddr; instr.Dest := addrTemp;
+        instr.Src1 := loc; instr.StructSize := slotCnt * 8; Emit(instr);
+        // Load field pointer (8 bytes)
+        ptrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadField; instr.Dest := ptrTemp;
+        instr.Src1 := addrTemp; instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+        // Nil guard
+        skipLbl := NewLabel('Ldrop_fld');
+        instr := Default(TIRInstr); instr.Op := irBrFalse; instr.Src1 := ptrTemp; instr.LabelName := skipLbl; Emit(instr);
+        // Free
+        if sd.Fields[fi].FieldType = atMap then
+          begin instr := Default(TIRInstr); instr.Op := irMapFree; instr.Src1 := ptrTemp; Emit(instr); end
+        else
+          begin instr := Default(TIRInstr); instr.Op := irSetFree; instr.Src1 := ptrTemp; Emit(instr); end;
+        // Zero field to prevent double-free
+        nilTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := nilTemp; instr.ImmInt := 0; Emit(instr);
+        // Reload addrTemp (was clobbered by previous iteration)
+        addrTemp := NewTemp;
+        instr := Default(TIRInstr); instr.Op := irLoadStructAddr; instr.Dest := addrTemp;
+        instr.Src1 := loc; instr.StructSize := slotCnt * 8; Emit(instr);
+        instr := Default(TIRInstr); instr.Op := irStoreField; instr.Src1 := addrTemp; instr.Src2 := nilTemp;
+        instr.ImmInt := fldOffset; instr.FieldSize := 8; Emit(instr);
+        instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+      end;
+    end;
+  end;
+end;
+
 function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
   var
     instr: TIRInstr;
@@ -6844,6 +6949,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         // Normal return (non-struct or expression)
         tmp := LowerExpr(TAstReturn(stmt).Value);
         if tmp < 0 then Exit(False);
+        EmitScopeDrops; // WP9: free Map/Set locals and struct collection fields
         instr := Default(TIRInstr);
         instr.Op := irFuncExit;
         instr.Src1 := tmp;
@@ -6851,6 +6957,7 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       end
       else
       begin
+        EmitScopeDrops; // WP9: free Map/Set locals and struct collection fields
         instr := Default(TIRInstr);
         instr.Op := irFuncExit;
         instr.Src1 := -1; // void return

@@ -156,7 +156,7 @@ Struct-Literals und Layout-Berechnung kennen diese Typen als Felder noch nicht.
 
 ---
 
-## WP9 — Memory Management: Structs mit Collection-Feldern (sema.pas, lower_ast_to_ir.pas)
+## ✅ WP9 — Memory Management: Structs mit Collection-Feldern (sema.pas, lower_ast_to_ir.pas)
 
 **Ziel:** Heap-Speicher von Collection-Feldern korrekt freigeben.
 
