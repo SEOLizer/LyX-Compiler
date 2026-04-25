@@ -20,16 +20,15 @@
 
 ### std.ml_full.lyx (Full)
 - Lineare Regression (8 Punkte)
-- Lineare Regression mit **Arrays** (beliebig viele)
+- Lineare Regression mit **Arrays** (beliebig viele) - LinearRegressionFitArrays()
 - Logistische Regression (8 Punkte)
-- Logistische Regression mit **Arrays** (beliebig viele)  
-- DataFrame-basierte Regression (data.core)
-- k-NN mit Arrays
-- k-Means mit Arrays
-- Decision Tree
-- Naive Bayes
-- Silhouette Score
-- Cross-Validation
+- Logistische Regression mit **Arrays** (beliebig viele) - LogisticRegressionFitArrays()
+- **k-NN** (beliebig viele): KNNFit(), KNNPredict(), KNNCrossValidation()
+- **k-Means**: KMeansFit(), KMeansSilhouette(), KMeansElbow(), MiniBatch
+- **Decision Tree**: DecisionTreeFit(), DecisionTreePredict(), Gini/Entropy
+- **Naive Bayes**: Bernoulli & Multinomial
+- **Cross-Validation**: KNNCrossValidation()
+- **DataFrame**: LinearRegressionFitDataFrame(), LogisticRegressionFitDataFrame()
 
 ### Für große Datasets: data.core
 Das `data.core` Modul bietet Pandas-ähnliche DataFrames mit beliebig vielen Zeilen.
@@ -406,3 +405,128 @@ Das Basis-Modul `std.ml` unterstützt 2 Punkte für einfache Demos und Tests. F�
 - `data.core` - Pandas-ähnliches DataFrame Modul
 - `std.stats` - Statistics Funktionen
 - `test_ml_*.lyx` - Beispiele im Repository
+---
+
+## 13. Erweiterte ML-Algorithmen (ml_full.lyx)
+
+Die vollständige Version `std/ml_full.lyx` enthält alle ML-Algorithmen:
+
+### 13.1 k-NN (beliebig viele Datenpunkte)
+
+```lyx
+import std.io;
+import std.ml_full;
+
+pub fn main(): int64 {
+  // Allocate arrays for training data
+  var n: int64 := 100;
+  var features: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var labels: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // Fill data: x < 50 -> label 0, x >= 50 -> label 1
+  var i: int64 := 0;
+  while (i < n) {
+    pokef64(features + i * 8, i as f64);
+    var label: int64 := 0;
+    if (i >= 50) { label := 1; }
+    pokef64(labels + i * 8, label);
+    i := i + 1;
+  }
+  
+  // Fit k-NN
+  KNNInit(3);  // k=3 neighbors
+  KNNFit(features, labels, n, 1);
+  
+  // Cross-Validation
+  var cvScore: f64 := KNNCrossValidation(features, labels, n, 1, 3, 5);
+  PrintStr("CV Score: ");
+  PrintFloat(cvScore * 100.0);
+  PrintStr("%\n");
+  
+  return 0;
+}
+```
+
+### 13.2 k-Means Clustering (beliebig viele Punkte)
+
+```lyx
+// k-Means with silhouette score
+KMeansInit(3);  // 3 clusters
+KMeansFit(features, n, nFeatures, 3);
+
+// Get silhouette score
+var silh: f64 := KMeansSilhouette(features, n, nFeatures);
+PrintStr("Silhouette: ");
+PrintFloat(silh);
+
+// Find optimal k with elbow method
+var bestK: int64 := KMeansElbow(features, n, nFeatures, 10);
+PrintStr("Best K: ");
+PrintInt(bestK);
+```
+
+### 13.3 Decision Tree
+
+```lyx
+// Decision Tree with Gini or Entropy
+DecisionTreeInit(5, 0);  // maxDepth=5, criterion=0 (Gini)
+// criterion: 0=Gini, 1=Entropy, 2=MSE
+
+DecisionTreeFit(features, labels, n, nFeatures);
+
+var pred: int64 := DecisionTreePredict(sample);
+var prob: int64 := DecisionTreePredictProba(sample, 2);  // 2 classes
+
+var acc: f64 := DecisionTreeScore(features, labels, n);
+PrintStr("Accuracy: ");
+PrintFloat(acc * 100.0);
+```
+
+### 13.4 Naive Bayes
+
+```lyx
+// Multinomial Naive Bayes
+NaiveBayesInit(2, 1000);  // 2 classes, 1000 vocab
+NaiveBayesFit(documents, docLengths, labels, n);
+
+var pred: int64 := NaiveBayesPredict(docWords, docLen);
+var score: f64 := NaiveBayesScore(documents, docLengths, labels, n);
+
+// Bernoulli variant
+NaiveBayesBernoulliInit(2, 1000);
+NaiveBayesBernoulliFit(documents, docLengths, labels, n);
+```
+
+---
+
+## 14. Feature-Übersicht (Alle Funktionen)
+
+| Funktion | Version | Beschreibung |
+|----------|---------|--------------|
+| LinearRegressionFit2 | Basic | 2 Punkte |
+| LinearRegressionFit | Basic+Full | 8 Punkte |
+| LinearRegressionFitArrays | Full | Beliebig viele |
+| LinearRegressionFitDataFrame | Full | DataFrame |
+| LogisticRegressionFit2 | Basic | 2 Punkte |
+| LogisticRegressionFit | Basic+Full | 8 Punkte |
+| LogisticRegressionFitArrays | Full | Beliebig viele |
+| KNNPredict | Basic | 2 Punkte |
+| KNNFit | Full | Beliebig + CV |
+| KMeansFit2 | Basic | 2 Punkte |
+| KMeansFit | Full | Silhouette + Elbow |
+| DecisionTreeFit | Full | Gini/Entropy |
+| NaiveBayesFit | Full | Multinomial/Bernoulli |
+| TrainTestSplit | Basic | 50/50 split |
+| KNNCrossValidation | Full | k-fold CV |
+| KMeansSilhouette | Full | Cluster quality |
+| KMeansElbow | Full | Optimal k |
+
+---
+
+## 15. Limitierungen
+
+- **PCA**: Nicht implementiert (kommt später)
+- **One-Hot Encoding**: Nicht implementiert (kommt später)
+- **Array-Parameter**: Nur via Raw-Pointer (mmap)
+
+Für Production: Verwende `data.core` für DataFrames.
