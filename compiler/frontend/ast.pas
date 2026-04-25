@@ -582,6 +582,7 @@ type
     FIsGlobal: Boolean;    // true if declared at top-level
     FIsPublic: Boolean;    // true if declared with 'pub'
     FIsRedundant: Boolean; // true if @redundant annotated (aerospace-todo P2 #51)
+    FElemType: TAurumType; // element type for array[N]T declarations
   public
     constructor Create(aStorage: TStorageKlass; const aName: string;
       aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
@@ -598,6 +599,7 @@ type
     property IsGlobal: Boolean read FIsGlobal;
     property IsPublic: Boolean read FIsPublic;
     property IsRedundant: Boolean read FIsRedundant write FIsRedundant; // aerospace-todo P2 #51
+    property ElemType: TAurumType read FElemType write FElemType;
   end;
 
   { Zuweisung: x := expr; }
@@ -2032,6 +2034,7 @@ begin
   FIsNullable := aIsNullable;
   FIsGlobal := False;
   FIsPublic := False;
+  FElemType := atUnresolved;
 end;
 
 procedure TAstVarDecl.SetGlobal(aIsGlobal, aIsPublic: Boolean);
