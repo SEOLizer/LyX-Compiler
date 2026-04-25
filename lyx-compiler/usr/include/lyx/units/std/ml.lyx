@@ -1744,4 +1744,472 @@ pub fn NaiveBayesBernoulliPredict(docWords: int64, docLen: int64): int64 {
   
   return bestClass;
 }
+
+// ============================================================================
+// Decision Tree Classifier
+// ============================================================================
+
+// Decision Tree Node (recursive class structure)
+pub type DecisionTreeNode = class {
+  featureIdx: int64;      // Feature to split on (-1 for leaf)
+  threshold: f64;        // Threshold for split
+  left: DecisionTreeNode;   // Left child (<= threshold)
+  right: DecisionTreeNode;  // Right child (> threshold)
+  classLabel: int64;       // Class at this node (for leaf)
+  nSamples: int64;       // Number of samples at this node
+  impurity: f64;         // Impurity at this node
+  featureImportance: f64; // Contribution to overall importance
+};
+
+// Decision Tree state
+var dt_root: DecisionTreeNode;         // Root node
+var dt_maxDepth: int64;           // Maximum tree depth
+var dt_minSamplesSplit: int64;  // Min samples to split
+var dt_nClasses: int64;         // Number of classes
+var dt_nFeatures: int64;       // Number of features
+var dt_criterion: int64;        // Split criterion: 0=Gini, 1=Entropy, 2=MSE
+var dt_featureImp: int64;       // Feature importance array
+
+// Split criteria constants
+pub con DT_GINI: int64 := 0;
+pub con DT_ENTROPY: int64 := 1;
+pub con DT_MSE: int64 := 2;
+
+// Initialize Decision Tree
+pub fn DecisionTreeInit(maxDepth: int64, criterion: int64): void {
+  dt_root := DecisionTreeNode{};
+  dt_maxDepth := maxDepth;
+  if (dt_maxDepth < 1) { dt_maxDepth := 10; }
+  dt_minSamplesSplit := 2;
+  dt_nClasses := 0;
+  dt_nFeatures := 0;
+  dt_criterion := criterion;
+  if (dt_criterion < 0 || dt_criterion > 2) { dt_criterion := DT_GINI; }
+}
+
+// Calculate Gini impurity
+pub fn DTGiniImpurity(labels: int64, n: int64): f64 {
+  if (n == 0) { return 0.0; }
+  
+  // Count samples per class
+  var classCounts: int64 := mmap(0, dt_nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < n) {
+    var label: int64 := peek8(labels + i * 8);
+    if (label >= 0 && label < dt_nClasses) {
+      var count: int64 := peek8(classCounts + label * 8);
+      count := count + 1;
+      poke8(classCounts + label * 8, count);
+    }
+    i := i + 1;
+  }
+  
+  // Gini = 1 - sum(p_i^2)
+  var gini: f64 := 1.0;
+  i := 0;
+  while (i < dt_nClasses) {
+    var count: int64 := peek8(classCounts + i * 8);
+    var p: f64 := count as f64 / (n as f64);
+    gini := gini - (p * p);
+    i := i + 1;
+  }
+  
+  munmap(classCounts, dt_nClasses * 8);
+  return gini;
+}
+
+// Calculate Entropy impurity
+pub fn DTEntropyImpurity(labels: int64, n: int64): f64 {
+  if (n == 0) { return 0.0; }
+  
+  var classCounts: int64 := mmap(0, dt_nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < n) {
+    var label: int64 := peek8(labels + i * 8);
+    if (label >= 0 && label < dt_nClasses) {
+      var count: int64 := peek8(classCounts + label * 8);
+      count := count + 1;
+      poke8(classCounts + label * 8, count);
+    }
+    i := i + 1;
+  }
+  
+  // Entropy = -sum(p * log2(p))
+  var entropy: f64 := 0.0;
+  i := 0;
+  while (i < dt_nClasses) {
+    var count: int64 := peek8(classCounts + i * 8);
+    if (count > 0) {
+      var p: f64 := count as f64 / (n as f64);
+      if (p > 0.0) {
+        entropy := entropy + (p * NBLog(p) * -1.442695);  // log2 = log * 1/ln(2)
+      }
+    }
+    i := i + 1;
+  }
+  
+  munmap(classCounts, dt_nClasses * 8);
+  return entropy;
+}
+
+// Calculate MSE impurity (for regression)
+pub fn DTMSEImpurity(values: int64, n: int64): f64 {
+  if (n == 0) { return 0.0; }
+  
+  // MSE = variance = E[(y - mean)^2]
+  var sum: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    sum := sum + peekf64(values + i * 8);
+    i := i + 1;
+  }
+  var mean: f64 := sum / (n as f64);
+  
+  var mse: f64 := 0.0;
+  i := 0;
+  while (i < n) {
+    var diff: f64 := peekf64(values + i * 8) - mean;
+    mse := mse + (diff * diff);
+    i := i + 1;
+  }
+  
+  return mse / (n as f64);
+}
+
+// Find best split for a feature
+pub fn DTFindBestSplit(
+  features: int64,
+  featureIdx: int64,
+  labels: int64,
+  n: int64
+): DecisionTreeNode {
+  var node: DecisionTreeNode := DecisionTreeNode{};
+  
+  if (n < dt_minSamplesSplit) {
+    node.featureIdx := -1;  // Leaf
+    node.classLabel := 0;
+    node.nSamples := n;
+    return node;
+  }
+  
+  // Calculate impurity for full set
+  var bestImpurity: f64 := 999999.0;
+  var bestThreshold: f64 := 0.0;
+  var bestFeature: int64 := -1;
+  
+  // Try different thresholds
+  var i: int64 := 0;
+  while (i < n - 1) {
+    var thresh: f64 := (peekf64(features + i * 8) + peekf64(features + (i + 1) * 8)) * 0.5;
+    
+    // Split into left/right
+    var leftN: int64 := 0;
+    var rightN: int64 := 0;
+    var leftLabels: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var rightLabels: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    
+    var j: int64 := 0;
+    while (j < n) {
+      var val: f64 := peekf64(features + j * 8);
+      if (val <= thresh) {
+        var idx: int64 := leftN;
+        leftN := leftN + 1;
+        poke8(leftLabels + idx * 8, peek8(labels + j * 8));
+      } else {
+        var idx: int64 := rightN;
+        rightN := rightN + 1;
+        poke8(rightLabels + idx * 8, peek8(labels + j * 8));
+      }
+      j := j + 1;
+    }
+    
+    // Weighted impurity
+    var impLeft: f64 := 0.0;
+    var impRight: f64 := 0.0;
+    
+    if (dt_criterion == DT_GINI) {
+      impLeft := DTGiniImpurity(leftLabels, leftN);
+      impRight := DTGiniImpurity(rightLabels, rightN);
+    } else if (dt_criterion == DT_ENTROPY) {
+      impLeft := DTEntropyImpurity(leftLabels, leftN);
+      impRight := DTEntropyImpurity(rightLabels, rightN);
+    }
+    
+    var weighted: f64 := (impLeft * leftN + impRight * rightN) / (n as f64);
+    
+    if (weighted < bestImpurity) {
+      bestImpurity := weighted;
+      bestThreshold := thresh;
+      bestFeature := featureIdx;
+    }
+    
+    munmap(leftLabels, n * 8);
+    munmap(rightLabels, n * 8);
+    
+    i := i + 1;
+  }
+  
+  node.threshold := bestThreshold;
+  node.featureIdx := bestFeature;
+  node.nSamples := n;
+  node.impurity := bestImpurity;
+  
+  return node;
+}
+
+// Build tree recursively
+pub fn DTBuildTree(
+  features: int64,
+  labels: int64,
+  n: int64,
+  nFeatures: int64,
+  depth: int64
+): DecisionTreeNode {
+  var node: DecisionTreeNode := DecisionTreeNode{};
+  
+  // Base cases
+  if (n < dt_minSamplesSplit || depth >= dt_maxDepth) {
+    node.featureIdx := -1;  // Leaf
+    node.nSamples := n;
+    
+    // Majority class
+    var classCounts: int64 := mmap(0, dt_nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var i: int64 := 0;
+    while (i < n) {
+      var label: int64 := peek8(labels + i * 8);
+      var count: int64 := peek8(classCounts + label * 8);
+      count := count + 1;
+      poke8(classCounts + label * 8, count);
+      i := i + 1;
+    }
+    
+    var maxCount: int64 := 0;
+    var majorityClass: int64 := 0;
+    i := 0;
+    while (i < dt_nClasses) {
+      var count: int64 := peek8(classCounts + i * 8);
+      if (count > maxCount) {
+        maxCount := count;
+        majorityClass := i;
+      }
+      i := i + 1;
+    }
+    node.classLabel := majorityClass;
+    munmap(classCounts, dt_nClasses * 8);
+    
+    return node;
+  }
+  
+  // Find best split across all features
+  var bestFeature: int64 := -1;
+  var bestThreshold: f64 := 0.0;
+  var bestImpurity: f64 := 999999.0;
+  var f: int64 := 0;
+  
+  while (f < nFeatures) {
+    var fFeatures: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var i: int64 := 0;
+    while (i < n) {
+      var val: f64 := peekf64(features + i * nFeatures * 8 + f * 8);
+      pokef64(fFeatures + i * 8, val);
+      i := i + 1;
+    }
+    
+    var nodeN: DecisionTreeNode := DTFindBestSplit(fFeatures, f, labels, n);
+    
+    if (nodeN.featureIdx >= 0 && nodeN.impurity < bestImpurity) {
+      bestImpurity := nodeN.impurity;
+      bestFeature := f;
+      bestThreshold := nodeN.threshold;
+    }
+    
+    munmap(fFeatures, n * 8);
+    f := f + 1;
+  }
+  
+  // If no good split found, make leaf
+  if (bestFeature < 0) {
+    node.featureIdx := -1;
+    node.nSamples := n;
+    
+    var classCounts: int64 := mmap(0, dt_nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var i: int64 := 0;
+    while (i < n) {
+      var label: int64 := peek8(labels + i * 8);
+      var count: int64 := peek8(classCounts + label * 8);
+      count := count + 1;
+      poke8(classCounts + label * 8, count);
+      i := i + 1;
+    }
+    
+    var maxCount: int64 := 0;
+    var majorityClass: int64 := 0;
+    i := 0;
+    while (i < dt_nClasses) {
+      var count: int64 := peek8(classCounts + i * 8);
+      if (count > maxCount) {
+        maxCount := count;
+        majorityClass := i;
+      }
+      i := i + 1;
+    }
+    node.classLabel := majorityClass;
+    node.impurity := bestImpurity;
+    munmap(classCounts, dt_nClasses * 8);
+    
+    return node;
+  }
+  
+  // Split data
+  var leftIndices: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var rightIndices: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var leftN: int64 := 0;
+  var rightN: int64 := 0;
+  
+  var i: int64 := 0;
+  while (i < n) {
+    var val: f64 := peekf64(features + i * nFeatures * 8 + bestFeature * 8);
+    if (val <= bestThreshold) {
+      poke8(leftIndices + leftN * 8, i);
+      leftN := leftN + 1;
+    } else {
+      poke8(rightIndices + rightN * 8, i);
+      rightN := rightN + 1;
+    }
+    i := i + 1;
+  }
+  
+  // Build children recursively
+  if (leftN > 0 && rightN > 0 && depth < dt_maxDepth) {
+    var leftFeatures: int64 := mmap(0, leftN * nFeatures * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var leftLabels: int64 := mmap(0, leftN * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    i := 0;
+    while (i < leftN) {
+      var origIdx: int64 := peek8(leftIndices + i * 8);
+      var j: int64 := 0;
+      while (j < nFeatures) {
+        var val: f64 := peekf64(features + origIdx * nFeatures * 8 + j * 8);
+        pokef64(leftFeatures + i * nFeatures * 8 + j * 8, val);
+        j := j + 1;
+      }
+      poke8(leftLabels + i * 8, peek8(labels + origIdx * 8));
+      i := i + 1;
+    }
+    
+    node.left := DTBuildTree(leftFeatures, leftLabels, leftN, nFeatures, depth + 1);
+    node.right := DTBuildTree(leftFeatures, leftLabels, rightN, nFeatures, depth + 1);
+    
+    munmap(leftFeatures, leftN * nFeatures * 8);
+    munmap(leftLabels, leftN * 8);
+  }
+  
+  node.featureIdx := bestFeature;
+  node.threshold := bestThreshold;
+  node.nSamples := n;
+  node.impurity := bestImpurity;
+  
+  return node;
+}
+
+// Fit Decision Tree
+pub fn DecisionTreeFit(
+  features: int64,
+  labels: int64,
+  n: int64,
+  nFeatures: int64,
+  nClasses: int64
+): void {
+  if (features == 0 || labels == 0 || n == 0) { return; }
+  
+  dt_nFeatures := nFeatures;
+  dt_nClasses := nClasses;
+  if (dt_nClasses < 2) { dt_nClasses := 2; }
+  
+  // Build tree recursively
+  dt_root := DTBuildTree(features, labels, n, nFeatures, 0);
+}
+
+// Predict using Decision Tree
+pub fn DecisionTreePredict(featureVector: int64): int64 {
+  var node: DecisionTreeNode := dt_root;
+  var depth: int64 := 0;
+  
+  while (node.featureIdx >= 0 && depth < dt_maxDepth) {
+    var val: f64 := peekf64(featureVector + node.featureIdx * 8);
+    
+    if (val <= node.threshold) {
+      node := node.left;
+    } else {
+      node := node.right;
+    }
+    
+    if (node == 0) { break; }
+    depth := depth + 1;
+  }
+  
+  return node.classLabel;
+}
+
+// Predict probabilities
+pub fn DecisionTreePredictProba(featureVector: int64, nClasses: int64): int64 {
+  // Trace path to leaf
+  var node: DecisionTreeNode := dt_root;
+  var depth: int64 := 0;
+  
+  while (node.featureIdx >= 0 && depth < dt_maxDepth) {
+    var val: f64 := peekf64(featureVector + node.featureIdx * 8);
+    if (val <= node.threshold) {
+      node := node.left;
+    } else {
+      node := node.right;
+    }
+    if (node == 0) { break; }
+    depth := depth + 1;
+  }
+  
+  // Return probabilities based on node distribution
+  var proba: int64 := mmap(0, nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // All probability to predicted class
+  var predClass: int64 := node.classLabel;
+  var i: int64 := 0;
+  while (i < nClasses) {
+    var prob: f64 := 0.0;
+    if (i == predClass) { prob := 1.0; }
+    pokef64(proba + i * 8, prob);
+    i := i + 1;
+  }
+  
+  return proba;
+}
+
+// Score Decision Tree
+pub fn DecisionTreeScore(features: int64, labels: int64, n: int64): f64 {
+  if (features == 0 || dt_root == 0) { return 0.0; }
+  
+  var correct: int64 := 0;
+  var i: int64 := 0;
+  
+  while (i < n) {
+    var pred: int64 := DecisionTreePredict(features + i * dt_nFeatures * 8);
+    var trueLabel: int64 := peek8(labels + i * 8);
+    
+    if (pred == trueLabel) { correct := correct + 1; }
+    i := i + 1;
+  }
+  
+  return correct as f64 / (n as f64);
+}
+
+// Get tree depth
+pub fn DecisionTreeGetDepth(): int64 {
+  // Simplified: return stored depth
+  return dt_maxDepth;
+}
+
+// Get number of leaf nodes (approximation)
+pub fn DecisionTreeGetNLeafs(): int64 {
+  // Would need recursive traversal
+  return 1;
+}
 //
