@@ -18,9 +18,12 @@
 - Statistische Metriken
 - Normalisierung
 
-### std/ml_full.lyx (Full)
-- Lineare Regression (8 Punkte + DataFrame)
-- Logistische Regression (8 Punkte + DataFrame)  
+### std.ml_full.lyx (Full)
+- Lineare Regression (8 Punkte)
+- Lineare Regression mit **Arrays** (beliebig viele)
+- Logistische Regression (8 Punkte)
+- Logistische Regression mit **Arrays** (beliebig viele)  
+- DataFrame-basierte Regression (data.core)
 - k-NN mit Arrays
 - k-Means mit Arrays
 - Decision Tree
@@ -93,6 +96,43 @@ pub fn main(): int64 {
   
   return 0;
 }
+```
+
+### 3.3 Lineare Regression mit Arrays (beliebig viele Datenpunkte)
+
+Für größere Datasets verwende `FitArrays`:
+
+```lyx
+import std.io;
+import std.ml;
+
+pub fn main(): int64 {
+  // Allocate arrays (8 bytes per f64)
+  var xData: int64 := mmap(0, 100 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var yData: int64 := mmap(0, 100 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // Fill arrays: y = 2x + 1
+  var i: int64 := 0;
+  while (i < 100) {
+    var x: f64 := i as f64;
+    pokef64(xData + i * 8, x);
+    pokef64(yData + i * 8, 2.0 * x + 1.0);
+    i := i + 1;
+  }
+  
+  // Train with 100 data points
+  LinearRegressionInit();
+  LinearRegressionFitArrays(xData, yData, 100);
+  
+  // Predict
+  var pred: f64 := LinearRegressionPredict(50.0);
+  PrintFloat(pred);  // ~101
+  
+  return 0;
+}
+```
+
+Hinweis: Die Arrays werden als Raw-Pointer übergeben (`mmap` für Speicherallokation).
 ```
 
 ---
