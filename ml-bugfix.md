@@ -163,6 +163,31 @@ end;
 
 ---
 
+### WP-5: Cross-Module Label Resolution (Architektur-Fix)
+
+**Beschreibung:** Die Label-Positionen müssen zwischen allen importierten Units geteilt werden. Aktuell wird jede Unit separat kompiliert und die Labels werden nicht zwischen Modulen aufgelöst.
+
+**Location:** `compiler/backend/x86_64/x86_64_emit.pas`, `EmitModule`
+
+**Lösungsansätze:**
+
+1. **Zentrale Label-Registry**: Alle Labels aller Units in einer zentralen Map speichern
+2. **ELF-Section-Merging**: Die .text-Sections aller Units beim Linken zusammenführen
+3. **PLT-basierte Auflösung**: Externe Funktionen immer über PLT (Procedure Linkage Table) aufrufen
+
+**Aufwand:** Geschätzt 24-40 Stunden  
+**Risiko:** Hoch - Änderungen an der Architektur
+
+---
+
+### WP-6: Interim Workaround (Sofort)
+
+**Beschreibung:** Bis der vollständige Fix implementiert ist, können Tests mit inline-Funktionen durchgeführt werden.
+
+**Siehe Section 5: Workaround (Sofort)**
+
+---
+
 ## 5 Workaround (Sofort)
 
 ### 5.1 Für ML-Tests
@@ -257,14 +282,46 @@ Nach jedem Fix müssen diese Tests bestehen:
 | 2026-04-25 | Bug entdeckt bei ML-Tests |
 | 2026-04-25 | Workaround dokumentiert |
 | 2026-04-25 | Investigation begonnen (dieses Dokument) |
-| TBD | WP-1 Implementierung |
-| TBD | WP-2 Evaluierung |
+| 2026-04-25 | WP1 Versuch: IR-Lowering + Backend -NICHT ERFOLGREICH |
+| TBD | WP-5: Cross-Module Label Resolution (Architektur-Änderung) |
 | TBD | Regression Tests |
 | TBD | Release mit Fix |
 
 ---
 
-## 9 Autor
+## 9 WP1 Versuch (Fehlgeschlagen)
+
+### Analyse
+
+Der erste Fix-Versuch (WP1) war nicht erfolgreich. Die Ursache:
+
+1. **IR-Lowering**: Fügt `_L_` Prefix zu Funktionsaufrufen hinzu ✅
+2. **Backend**: Schreibt Labels mit `_L_` Prefix in FLabelPositions ✅
+3. **Problem**: Die Labels für importierte Funktionen werden **nicht in module.Functions eingetragen**!
+
+### Root Cause
+
+Importierte Units (std.io, std.ml) werden als **separate IR-Module** generiert. Die Labels werden nur für Funktionen in `module.Functions` registriert. Die Labels aus importierten Units existieren nicht in der aktuellen FLabelPositions Map.
+
+### Evidence
+
+```
+[DEBUG] Unresolved jump patch: label="_L_StrLength"
+[DEBUG] Unresolved jump patch: label="_L__PrintfCore"
+```
+
+Die Labels mit `_L_` Prefix werden generiert aber nicht gefunden.
+
+### Nächste Schritte
+
+**WP-5:** Cross-Module Label Resolution implementieren:
+- Die FLabelPositions müssen zwischen allen importierten Units geteilt werden
+- ODER: Ein zentrales Label-Register für alle Funktionen
+- ODER: Statische ELF-Auflösung anders implementieren
+
+---
+
+## 10 Autor
 
 Andreas Röne  
 Senior Compiler Engineer, Lyx ML-Unit  
