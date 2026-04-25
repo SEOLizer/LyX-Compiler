@@ -83,7 +83,7 @@ begin
   fn.Emit(instr);
 
   // Add return
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 end;
@@ -186,7 +186,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := 0;
   fn.Emit(instr);
 
@@ -235,7 +235,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
@@ -293,7 +293,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
@@ -326,7 +326,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := 0;
   fn.Emit(instr);
 
@@ -366,7 +366,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
@@ -408,7 +408,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := 0;
   fn.Emit(instr);
 
@@ -433,7 +433,7 @@ begin
   targetFn.LocalCount := 0;
   targetFn.ParamCount := 0;
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   targetFn.Emit(instr);
 
@@ -452,7 +452,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
@@ -513,7 +513,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
@@ -545,7 +545,7 @@ begin
   fn.Emit(instr);
 
   instr := Default(TIRInstr);
-  instr.Op := irRet;
+  instr.Op := irFuncExit;
   instr.Src1 := -1;
   fn.Emit(instr);
 
