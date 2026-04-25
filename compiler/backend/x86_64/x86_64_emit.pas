@@ -418,6 +418,13 @@ begin
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
+// sqrtsd xmm0, xmm1 (scalar square root)
+procedure WriteSqrtsd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $F2); EmitU8(buf, $0F); EmitU8(buf, $51);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
 // xorpd xmm, xmm
 procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
 begin
