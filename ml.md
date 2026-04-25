@@ -2,15 +2,34 @@
 
 ## 1. Übersicht
 
-`std.ml` bietet Machine Learning Grundfunktionen für Lyx. Die Bibliothek unterstützt:
-- Lineare Regression (Vorhersage kontinuierlicher Werte) - **1 oder 2 Datenpunkte**
-- Logistische Regression (Binäre Klassifikation) - **1 oder 2 Datenpunkte**
-- k-Nearest Neighbors (k-NN)
-- k-Means Clustering
+`std.ml` bietet Machine Learning Grundfunktionen für Lyx. Es gibt **zwei Versionen:**
+
+| Version | Datei | Datenpunkte | Features |
+|---------|--------|----------|---------|
+| Basic | `std/ml.lyx` | 1-2 | Einfache Demos |
+| Full | `std/ml_full.lyx` | 8+ bis ∞ | Alle ML-Algorithmen |
+
+## Versionen im Detail
+
+### std/ml.lyx (Basic - diese Seite)
+- Lineare Regression (1-2 Punkte)
+- Logistische Regression (1-2 Punkte)
+- k-NN, k-Means
 - Statistische Metriken
 - Normalisierung
 
-**Für fortgeschrittene ML mit großen Datasets:** Siehe `data.core` Modul (Pandas-ähnlich)
+### std/ml_full.lyx (Full)
+- Lineare Regression (8 Punkte + DataFrame)
+- Logistische Regression (8 Punkte + DataFrame)  
+- k-NN mit Arrays
+- k-Means mit Arrays
+- Decision Tree
+- Naive Bayes
+- Silhouette Score
+- Cross-Validation
+
+### Für große Datasets: data.core
+Das `data.core` Modul bietet Pandas-ähnliche DataFrames mit beliebig vielen Zeilen.
 
 ---
 
