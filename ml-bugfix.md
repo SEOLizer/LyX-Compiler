@@ -4,8 +4,8 @@
 
 **Bug ID:** ML-001  
 **Severity:** High  
-**Status:** Open - Workaround Available  
-**Affected Components:** `std.ml` import system, ELF64 code generation
+**Status:** FIXED (2026-04-25)  
+**Affected Components:** `std.ml` import system, IR Lowering (`lower_ast_to_ir.pas`)
 
 ### Summary
 
@@ -282,10 +282,11 @@ Nach jedem Fix müssen diese Tests bestehen:
 | 2026-04-25 | Bug entdeckt bei ML-Tests |
 | 2026-04-25 | Workaround dokumentiert |
 | 2026-04-25 | Investigation begonnen (dieses Dokument) |
-| 2026-04-25 | WP1 Versuch: IR-Lowering + Backend -NICHT ERFOLGREICH |
-| TBD | WP-5: Cross-Module Label Resolution (Architektur-Änderung) |
-| TBD | Regression Tests |
-| TBD | Release mit Fix |
+| 2026-04-25 | WP1 Versuch: IR-Lowering + Backend - NICHT ERFOLGREICH |
+| 2026-04-25 | ROOT CAUSE gefunden: `irMul` statt `irFMul` für f64 in importierten Units |
+| 2026-04-25 | FIX: `InferExprType()` + `nkBinOp` Fallback-Typinferenz in `lower_ast_to_ir.pas` |
+| 2026-04-25 | WP1 Revert: `_L_` Prefix-Addition entfernt (falscher Fix) |
+| 2026-04-25 | Regression Tests T-001, T-002, T-004, T-005: ALLE BESTANDEN ✅ |
 
 ---
 
