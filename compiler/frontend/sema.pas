@@ -1265,6 +1265,15 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // sqrt(f64) -> f64 - square root
+  s := TSymbol.Create('sqrt');
+  s.Kind := symFunc;
+  s.DeclType := atF64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atF64;
+  AddSymbolToCurrent(s, NullSpan);
+
   // === std.io: fd-basierte I/O via libc wrappers (v0.3.0) ===
   // open(path: pchar, flags: int32, mode: int32) -> int64 (fd or -1)
   s := TSymbol.Create('open');
