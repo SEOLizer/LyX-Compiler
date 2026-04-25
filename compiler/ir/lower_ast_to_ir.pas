@@ -60,6 +60,7 @@ type
     function AllocLocal(const name: string; aType: TAurumType): Integer;
     function AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
     function GetLocalType(idx: Integer): TAurumType;
+    function InferExprType(expr: TAstExpr): TAurumType;
     function GetLocalArrayLen(idx: Integer): Integer;
     function ResolveLocal(const name: string): Integer;
     procedure Emit(instr: TIRInstr);
@@ -356,6 +357,41 @@ begin
     Result := FLocalTypes[idx]
   else
     Result := atUnresolved;
+end;
+
+// Infers the expression type when ResolvedType is atUnresolved.
+// Used for imported unit function bodies where sema did not run on the body,
+// so AST identifier nodes carry atUnresolved instead of their actual type.
+function TIRLowering.InferExprType(expr: TAstExpr): TAurumType;
+var
+  loc: Integer;
+  lType, rType: TAurumType;
+begin
+  if expr = nil then Exit(atUnresolved);
+  Result := expr.ResolvedType;
+  if Result <> atUnresolved then Exit;
+
+  if expr is TAstIdent then
+  begin
+    loc := ResolveLocal(TAstIdent(expr).Name);
+    if loc >= 0 then
+      Result := GetLocalType(loc);
+  end
+  else if expr is TAstFloatLit then
+    Result := atF64
+  else if expr is TAstBinOp then
+  begin
+    lType := InferExprType(TAstBinOp(expr).Left);
+    rType := InferExprType(TAstBinOp(expr).Right);
+    if (lType = atF64) or (rType = atF64) then
+      Result := atF64
+    else if lType <> atUnresolved then
+      Result := lType
+    else
+      Result := rType;
+  end
+  else if expr is TAstUnaryOp then
+    Result := InferExprType(TAstUnaryOp(expr).Operand);
 end;
 
 function TIRLowering.GetLocalArrayLen(idx: Integer): Integer;
@@ -1746,12 +1782,19 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Exit;
 
         // Determine result type based on operand types
-        // Get types from AST
+        // Get types from AST; fall back to local-type inference when sema has not
+        // set ResolvedType (e.g. bodies of imported units are not analyzed by sema).
         lType := TAstBinOp(expr).Left.ResolvedType;
+        if lType = atUnresolved then lType := InferExprType(TAstBinOp(expr).Left);
         rType := TAstBinOp(expr).Right.ResolvedType;
+        if rType = atUnresolved then rType := InferExprType(TAstBinOp(expr).Right);
 
-        // Check if both operands are float
-        isFloatArith := (lType = atF64) and (rType = atF64);
+        // Check if both operands are float. Also handle the mixed case where one
+        // side is known f64 and the other remains unresolved (Lyx forbids mixing,
+        // so if one is f64 the other must be too).
+        isFloatArith := (lType = atF64) and (rType = atF64)
+                     or ((lType = atF64) and (rType = atUnresolved))
+                     or ((rType = atF64) and (lType = atUnresolved));
         isFloatCmp := isFloatArith and (TAstBinOp(expr).Op in [tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe]);
 
         // Check for string concatenation (pchar + pchar)
@@ -3536,15 +3579,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             // Regular direct function call
             instr.Op := irCall;
             instr.Dest := t0;
-            // FIX: For cross-module calls, add _L_ prefix if not already present
-            // std.io funcs already have underscore prefix like "_L_" or "__"
-            // We avoid doubling the underscore
-            if (Pos('_L_', call.Name) = 1) or (Pos('__', call.Name) = 1) then
-              instr.ImmStr := call.Name  // Already has prefix
-            else
-              instr.ImmStr := '_L_' + call.Name;
+            instr.ImmStr := call.Name;
             instr.ImmInt := argCount;
-            callName := instr.ImmStr;
+            callName := call.Name;
             instr.IsVirtualCall := False;
             instr.VMTIndex := -1;
             instr.SelfSlot := -1;
@@ -6270,10 +6307,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
          end;
        end;
         tmp := LowerExpr(vd.InitExpr);
-        // If local has narrower integer width, truncate before store
-        // Skip truncation for pointer-like types (Map, Set, DynArray)
+        // If local has narrower integer width, truncate before store.
+        // Skip truncation for pointer-like types, float types, and unresolved.
         ltype := GetLocalType(loc);
         if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64)
+           and (ltype <> atF64) and (ltype <> atF32)
            and (ltype <> atPChar) and (ltype <> atPCharNullable)
            and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray)
            and (ltype <> atParallelArray) then
@@ -6363,9 +6401,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         end;
       end;
       tmp := LowerExpr(TAstAssign(stmt).Value);
-      // truncate if local has narrower integer width
+      // truncate if local has narrower integer width; skip for float and pointer types
       ltype := GetLocalType(loc);
-      if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64) 
+      if (ltype <> atUnresolved) and (ltype <> atInt64) and (ltype <> atUInt64)
+         and (ltype <> atF64) and (ltype <> atF32)
          and (ltype <> atPChar) and (ltype <> atPCharNullable)
          and (ltype <> atMap) and (ltype <> atSet) and (ltype <> atDynArray) then
       begin
