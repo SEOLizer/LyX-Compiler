@@ -108,7 +108,7 @@ begin
     irAnd, irOr, irXor, irNor,
     irShl, irShr,
     irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
-    irFAdd, irFSub, irFMul, irFDiv, irFNeg,
+    irFAdd, irFSub, irFMul, irFDiv, irFNeg, irFSqrt,
     irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
       Result := (instr.Src1 >= 0) and (instr.Src2 >= 0);
   end;
