@@ -3,8 +3,8 @@
 ## 1. Übersicht
 
 `std.ml` bietet Machine Learning Grundfunktionen für Lyx. Die Bibliothek unterstützt:
-- Lineare Regression (Vorhersage kontinuierlicher Werte)
-- Logistische Regression (Binäre Klassifikation)
+- Lineare Regression (Vorhersage kontinuierlicher Werte) - **1 oder 2 Datenpunkte**
+- Logistische Regression (Binäre Klassifikation) - **1 oder 2 Datenpunkte**
 - k-Nearest Neighbors (k-NN)
 - k-Means Clustering
 - Statistische Metriken
