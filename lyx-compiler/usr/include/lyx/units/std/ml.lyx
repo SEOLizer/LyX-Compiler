@@ -666,4 +666,283 @@ pub fn LogisticRegressionFitArrays(xData: int64, yData: int64, n: int64, learnin
     e := e + 1;
   }
 }
+
+// ============================================================================
+// k-Nearest Neighbors (k-NN)
+// Classification without training - uses distance-based voting
+// ============================================================================
+
+// k-NN model state
+var knn_k: int64;                      // Number of neighbors to use
+var knn_n: int64;                    // Number of training samples
+var knn_features: int64;              // Pointer to feature matrix (n x f64)
+var knn_labels: int64;                // Pointer to labels array (n x int64)
+var knn_nFeatures: int64;              // Number of features per sample
+
+// Initialize k-NN model
+// k: number of neighbors (usually odd: 1, 3, 5, 7...)
+pub fn KNNInit(k: int64): void {
+  knn_k := k;
+  knn_n := 0;
+  knn_features := 0;
+  knn_labels := 0;
+  knn_nFeatures := 0;
+}
+
+// Get k value
+pub fn KNNGetK(): int64 {
+  return knn_k;
+}
+
+// Get number of training samples
+pub fn KNNGetNSamples(): int64 {
+  return knn_n;
+}
+
+// Train k-NN (actually just stores the data - lazy evaluation)
+// features: pointer to feature matrix (n samples x m features)
+// labels: pointer to labels array (n labels)
+// n: number of training samples
+// nFeatures: number of features per sample
+pub fn KNNFit(features: int64, labels: int64, n: int64, nFeatures: int64): void {
+  knn_features := features;
+  knn_labels := labels;
+  knn_n := n;
+  knn_nFeatures := nFeatures;
+}
+
+// Euclidean distance between two feature vectors
+pub fn KNNDistance(a: int64, b: int64, n: int64): f64 {
+  var sumSq: f64 := 0.0;
+  var i: int64 := 0;
+  
+  while (i < n) {
+    var diff: f64 := peekf64(a + i * 8) - peekf64(b + i * 8);
+    sumSq := sumSq + (diff * diff);
+    i := i + 1;
+  }
+  // Square root (Newton)
+  var x: f64 := sumSq;
+  if (x <= 0.0) { return 0.0; }
+  var y: f64 := (x + 1.0) / 2.0;
+  while (y < x) {
+    x := y;
+    y := (x + sumSq / x) / 2.0;
+  }
+  return x;
+}
+
+// Manhattan distance (L1)
+pub fn KNNManhattanDistance(a: int64, b: int64, n: int64): f64 {
+  var sum: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    var diff: f64 := peekf64(a + i * 8) - peekf64(b + i * 8);
+    if (diff < 0.0) { diff := 0.0 - diff; }
+    sum := sum + diff;
+    i := i + 1;
+  }
+  return sum;
+}
+
+// Find k nearest neighbors (indices array)
+pub fn KNNFindNeighbors(query: int64, k: int64): int64 {
+  if (knn_n == 0 || knn_features == 0) { return 0; }
+  if (k > knn_n) { k := knn_n; }
+  
+  // Calculate all distances
+  var distArr: int64 := mmap(0, knn_n * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < knn_n) {
+    var dist: int64 := knn_features + i * knn_nFeatures * 8;
+    var d: f64 := KNNDistance(query, dist, knn_nFeatures);
+    pokef64(distArr + i * 16, d);
+    poke8(distArr + i * 16 + 8, i);
+    i := i + 1;
+  }
+  // Sort by distance (bubble for small n)
+  var j: int64 := 0;
+  while (j < knn_n - 1) {
+    var d1: f64 := peekf64(distArr + j * 16);
+    var d2: f64 := peekf64(distArr + (j + 1) * 16);
+    if (d2 < d1) {
+      pokef64(distArr + j * 16, d2);
+      var idx1: int64 := peek8(distArr + j * 16 + 8);
+      var idx2: int64 := peek8(distArr + (j + 1) * 16 + 8);
+      poke8(distArr + j * 16 + 8, idx2);
+      poke8(distArr + (j + 1) * 16 + 8, idx1);
+      if (j > 0) { j := j - 1; }
+    } else {
+      j := j + 1;
+    }
+  }
+  // Return top k indices
+  var result: int64 := mmap(0, k * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  i := 0;
+  while (i < k) {
+    var idx: int64 := peek8(distArr + i * 16 + 8);
+    poke8(result + i * 8, idx);
+    i := i + 1;
+  }
+  munmap(distArr, knn_n * 16);
+  return result;
+}
+
+// Majority vote
+pub fn KNNMajorityVote(neighborIndices: int64, k: int64): int64 {
+  if (knn_labels == 0 || neighborIndices == 0) { return 0; }
+  var votes: int64 := mmap(0, 10 * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  var maxVote: int64 := 0;
+  var maxLabel: int64 := 0;
+  while (i < k) {
+    var idx: int64 := peek8(neighborIndices + i * 8);
+    var label: int64 := peek8(knn_labels + idx * 8);
+    var count: int64 := peek8(votes + label * 8);
+    count := count + 1;
+    poke8(votes + label * 8, count);
+    if (count > maxVote) {
+      maxVote := count;
+      maxLabel := label;
+    }
+    i := i + 1;
+  }
+  munmap(votes, 10 * 8);
+  return maxLabel;
+}
+
+// Weighted majority vote
+pub fn KNNWeightedVote(neighborIndices: int64, query: int64, k: int64): int64 {
+  if (knn_labels == 0 || neighborIndices == 0) { return 0; }
+  var votes: int64 := mmap(0, 10 * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var maxVote: f64 := 0.0;
+  var maxLabel: int64 := 0;
+  var i: int64 := 0;
+  while (i < k) {
+    var idx: int64 := peek8(neighborIndices + i * 8);
+    var label: int64 := peek8(knn_labels + idx * 8);
+    var trainPt: int64 := knn_features + idx * knn_nFeatures * 8;
+    var dist: f64 := KNNDistance(query, trainPt, knn_nFeatures);
+    var weight: f64 := 1.0;
+    if (dist > 0.0001) { weight := 1.0 / dist; }
+    var current: f64 := peekf64(votes + label * 16);
+    current := current + weight;
+    pokef64(votes + label * 16, current);
+    if (current > maxVote) {
+      maxVote := current;
+      maxLabel := label;
+    }
+    i := i + 1;
+  }
+  munmap(votes, 10 * 16);
+  return maxLabel;
+}
+
+// Predict class
+pub fn KNNPredict(query: int64): int64 {
+  if (knn_n == 0 || knn_features == 0) { return 0; }
+  var neighbors: int64 := KNNFindNeighbors(query, knn_k);
+  if (neighbors == 0) { return 0; }
+  var prediction: int64 := KNNMajorityVote(neighbors, knn_k);
+  munmap(neighbors, knn_k * 8);
+  return prediction;
+}
+
+// Predict probabilities
+pub fn KNNPredictProba(query: int64, nClasses: int64): int64 {
+  if (knn_n == 0 || knn_features == 0) { return 0; }
+  var neighbors: int64 := KNNFindNeighbors(query, knn_k);
+  if (neighbors == 0) { return 0; }
+  var classVotes: int64 := mmap(0, nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var i: int64 := 0;
+  while (i < knn_k) {
+    var idx: int64 := peek8(neighbors + i * 8);
+    var label: int64 := peek8(knn_labels + idx * 8);
+    if (label >= 0 && label < nClasses) {
+      var count: int64 := peek8(classVotes + label * 8);
+      count := count + 1;
+      poke8(classVotes + label * 8, count);
+    }
+    i := i + 1;
+  }
+  var proba: int64 := mmap(0, nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var kf: f64 := knn_k as f64;
+  i := 0;
+  while (i < nClasses) {
+    var count: int64 := peek8(classVotes + i * 8);
+    var prob: f64 := count as f64 / kf;
+    pokef64(proba + i * 8, prob);
+    i := i + 1;
+  }
+  munmap(classVotes, nClasses * 8);
+  munmap(neighbors, knn_k * 8);
+  return proba;
+}
+
+// Cross-validation
+pub fn KNNCrossValidation(features: int64, labels: int64, n: int64, nFeatures: int64, k: int64, folds: int64): f64 {
+  if (n < folds || folds < 2) { return 0.0; }
+  var foldSize: int64 := n / folds;
+  var correct: int64 := 0;
+  var total: int64 := 0;
+  var fold: int64 := 0;
+  while (fold < folds) {
+    var testStart: int64 := fold * foldSize;
+    var testEnd: int64 := testStart + foldSize;
+    if (fold == folds - 1) { testEnd := n; }
+    // Build training set
+    var trainN: int64 := n - foldSize;
+    var trainFeatures: int64 := mmap(0, trainN * nFeatures * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var trainLabels: int64 := mmap(0, trainN * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var trainIdx: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+      if (i >= testStart && i < testEnd) {
+        // skip test
+      } else {
+        var j: int64 := 0;
+        while (j < nFeatures) {
+          var val: f64 := peekf64(features + i * nFeatures * 8 + j * 8);
+          pokef64(trainFeatures + trainIdx * nFeatures * 8 + j * 8, val);
+          j := j + 1;
+        }
+        var label: int64 := peek8(labels + i * 8);
+        poke8(trainLabels + trainIdx * 8, label);
+        trainIdx := trainIdx + 1;
+      }
+      i := i + 1;
+    }
+    KNNFit(trainFeatures, trainLabels, trainN, nFeatures);
+    // Test
+    i := testStart;
+    while (i < testEnd) {
+      var query: int64 := features + i * nFeatures * 8;
+      var pred: int64 := KNNPredict(query);
+      var trueLabel: int64 := peek8(labels + i * 8);
+      if (pred == trueLabel) { correct := correct + 1; }
+      total := total + 1;
+      i := i + 1;
+    }
+    munmap(trainFeatures, trainN * nFeatures * 8);
+    munmap(trainLabels, trainN * 8);
+    fold := fold + 1;
+  }
+  if (total == 0) { return 0.0; }
+  return correct as f64 / total as f64;
+}
+
+// Score on training set
+pub fn KNNScore(features: int64, labels: int64, n: int64): f64 {
+  if (knn_n == 0 || knn_features == 0) { return 0.0; }
+  var correct: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var query: int64 := features + i * knn_nFeatures * 8;
+    var pred: int64 := KNNPredict(query);
+    var trueLabel: int64 := peek8(labels + i * 8);
+    if (pred == trueLabel) { correct := correct + 1; }
+    i := i + 1;
+  }
+  return correct as f64 / n as f64;
+}
 //
