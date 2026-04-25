@@ -1398,4 +1398,350 @@ pub fn KMeansMiniBatchFit(features: int64, n: int64, nFeatures: int64, k: int64)
     i := i + 1;
   }
 }
+
+// ============================================================================
+// Naive Bayes Classifier (Multinomial)
+// ============================================================================
+
+// Naive Bayes state
+var nb_vocabSize: int64;            // Vocabulary size
+var nb_nClasses: int64;           // Number of classes
+var nb_wordCounts: int64;           // Word counts per class (nClasses x vocabSize)
+var nb_classCounts: int64;         // Total counts per class
+var nb_classPriors: f64;           // Class priors (log probabilities)
+var nb_alpha: f64;              // Laplace smoothing parameter
+var nb_nDocs: int64;             // Number of training documents
+
+// Initialize Naive Bayes
+pub fn NaiveBayesInit(nClasses: int64, vocabSize: int64): void {
+  nb_nClasses := nClasses;
+  nb_vocabSize := vocabSize;
+  nb_alpha := 1.0;  // Laplace smoothing
+  nb_nDocs := 0;
+  
+  // Allocate word counts matrix: nClasses x vocabSize
+  nb_wordCounts := mmap(0, nClasses * vocabSize * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // Allocate class counts
+  nb_classCounts := mmap(0, nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // Class priors (log)
+  nb_classPriors := mmap(0, nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+}
+
+// Train Naive Bayes
+// documents: array of word indices (each doc is a list of word indices)
+// docLengths: lengths of each document
+// labels: class label for each document
+// n: number of documents
+pub fn NaiveBayesFit(documents: int64, docLengths: int64, labels: int64, n: int64): void {
+  if (documents == 0 || labels == 0 || n == 0) { return; }
+  
+  nb_nDocs := n;
+  
+  // Count words per class
+  var i: int64 := 0;
+  while (i < n) {
+    var label: int64 := peek8(labels + i * 8);
+    var docStart: int64 := peek8(documents + i * 8);  // Pointer to word list
+    var docLen: int64 := peek8(docLengths + i * 8);
+    
+    // Increment class count
+    var classCount: int64 := peek8(nb_classCounts + label * 8);
+    classCount := classCount + 1;
+    poke8(nb_classCounts + label * 8, classCount);
+    
+    // Count each word in document
+    var j: int64 := 0;
+    while (j < docLen) {
+      var wordIdx: int64 := peek8(docStart + j * 8);
+      
+      if (wordIdx >= 0 && wordIdx < nb_vocabSize) {
+        var idx: int64 := label * nb_vocabSize + wordIdx;
+        var count: f64 := peekf64(nb_wordCounts + idx * 8);
+        count := count + 1.0;
+        pokef64(nb_wordCounts + idx * 8, count);
+      }
+      
+      j := j + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  // Calculate class priors (log probability)
+  var total: f64 := n as f64;
+  i := 0;
+  while (i < nb_nClasses) {
+    var count: int64 := peek8(nb_classCounts + i * 8);
+    var prior: f64 := (count as f64 + nb_alpha) / (total + nb_alpha * (nb_nClasses as f64));
+    // Log for numerical stability
+    pokef64(nb_classPriors + i * 8, NBLog(prior));
+    i := i + 1;
+  }
+}
+
+// Log function approximation
+pub fn NBLog(x: f64): f64 {
+  if (x <= 0.0) { return -100.0; }
+  // Simple approximation
+  if (x >= 1.0) { return 0.0; }
+  if (x >= 0.5) { return -0.693 + (x - 0.5) * 1.0; }
+  if (x >= 0.25) { return -1.386 + (x - 0.25) * 2.0; }
+  if (x >= 0.125) { return -2.079 + (x - 0.125) * 4.0; }
+  if (x >= 0.0625) { return -2.772 + (x - 0.0625) * 8.0; }
+  if (x >= 0.03125) { return -3.465 + (x - 0.03125) * 16.0; }
+  return -5.0 + (x * 10.0);
+}
+
+// Predict class for a document
+pub fn NaiveBayesPredict(docWords: int64, docLen: int64): int64 {
+  if (nb_wordCounts == 0 || docWords == 0) { return 0; }
+  
+  var bestClass: int64 := 0;
+  var bestScore: f64 := -999999999.0;
+  
+  var c: int64 := 0;
+  while (c < nb_nClasses) {
+    // Start with log prior
+    var score: f64 := peekf64(nb_classPriors + c * 8);
+    
+    // Add log likelihood of each word
+    var i: int64 := 0;
+    while (i < docLen) {
+      var wordIdx: int64 := peek8(docWords + i * 8);
+      
+      if (wordIdx >= 0 && wordIdx < nb_vocabSize) {
+        // Word count in this class + alpha
+        var wc: f64 := peekf64(nb_wordCounts + c * nb_vocabSize * 8 + wordIdx * 8);
+        wc := wc + nb_alpha;
+        
+        // Total words in class + alpha * vocabSize
+        var totalWords: f64 := 0.0;
+        var j: int64 := 0;
+        while (j < nb_vocabSize) {
+          totalWords := totalWords + peekf64(nb_wordCounts + c * nb_vocabSize * 8 + j * 8);
+          j := j + 1;
+        }
+        totalWords := totalWords + nb_alpha * (nb_vocabSize as f64);
+        
+        // P(word|class) = (count + alpha) / (total + alpha * V)
+        var prob: f64 := wc / totalWords;
+        
+        // Log probability
+        score := score + NBLog(prob);
+      }
+      
+      i := i + 1;
+    }
+    
+    // Update best
+    if (score > bestScore) {
+      bestScore := score;
+      bestClass := c;
+    }
+    
+    c := c + 1;
+  }
+  
+  return bestClass;
+}
+
+// Predict probabilities for all classes
+pub fn NaiveBayesPredictProba(docWords: int64, docLen: int64): int64 {
+  if (nb_wordCounts == 0) { return 0; }
+  
+  var scores: int64 := mmap(0, nb_nClasses * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var c: int64 := 0;
+  
+  while (c < nb_nClasses) {
+    var score: f64 := peekf64(nb_classPriors + c * 8);
+    var i: int64 := 0;
+    while (i < docLen) {
+      var wordIdx: int64 := peek8(docWords + i * 8);
+      if (wordIdx >= 0 && wordIdx < nb_vocabSize) {
+        var wc: f64 := peekf64(nb_wordCounts + c * nb_vocabSize * 8 + wordIdx * 8);
+        wc := wc + nb_alpha;
+        var totalWords: f64 := 0.0;
+        var j: int64 := 0;
+        while (j < nb_vocabSize) {
+          totalWords := totalWords + peekf64(nb_wordCounts + c * nb_vocabSize * 8 + j * 8);
+          j := j + 1;
+        }
+        totalWords := totalWords + nb_alpha * (nb_vocabSize as f64);
+        var prob: f64 := wc / totalWords;
+        score := score + NBLog(prob);
+      }
+      i := i + 1;
+    }
+    pokef64(scores + c * 8, score);
+    c := c + 1;
+  }
+  
+  return scores;
+}
+
+// Get word count for class
+pub fn NaiveBayesGetWordCount(classIdx: int64, wordIdx: int64): f64 {
+  if (nb_wordCounts == 0) { return 0.0; }
+  if (classIdx < 0 || classIdx >= nb_nClasses) { return 0.0; }
+  if (wordIdx < 0 || wordIdx >= nb_vocabSize) { return 0.0; }
+  return peekf64(nb_wordCounts + classIdx * nb_vocabSize * 8 + wordIdx * 8);
+}
+
+// Get class count
+pub fn NaiveBayesGetClassCount(classIdx: int64): int64 {
+  if (nb_classCounts == 0) { return 0; }
+  return peek8(nb_classCounts + classIdx * 8);
+}
+
+// Score on training data
+pub fn NaiveBayesScore(documents: int64, docLengths: int64, labels: int64, n: int64): f64 {
+  if (documents == 0) { return 0.0; }
+  
+  var correct: int64 := 0;
+  var i: int64 := 0;
+  
+  while (i < n) {
+    var docWords: int64 := peek8(documents + i * 8);
+    var docLen: int64 := peek8(docLengths + i * 8);
+    var trueLabel: int64 := peek8(labels + i * 8);
+    var pred: int64 := NaiveBayesPredict(docWords, docLen);
+    
+    if (pred == trueLabel) { correct := correct + 1; }
+    i := i + 1;
+  }
+  
+  return correct as f64 / (n as f64);
+}
+
+// ============================================================================
+// Naive Bayes for Binary Features (Bernoulli NB)
+// ============================================================================
+
+// Bernoulli NB: works with binary feature presence/absence
+var nb_bernoulli: int64;  // 1 if Bernoulli model
+
+// Initialize Bernoulli Naive Bayes
+pub fn NaiveBayesBernoulliInit(nClasses: int64, vocabSize: int64): void {
+  NaiveBayesInit(nClasses, vocabSize);
+  nb_bernoulli := 1;
+}
+
+// Bernoulli NB training
+pub fn NaiveBayesBernoulliFit(documents: int64, docLengths: int64, labels: int64, n: int64): void {
+  if (documents == 0 || labels == 0 || n == 0) { return; }
+  
+  nb_nDocs := n;
+  nb_bernoulli := 1;
+  
+  // Count documents per class
+  var i: int64 := 0;
+  while (i < n) {
+    var label: int64 := peek8(labels + i * 8);
+    var classCount: int64 := peek8(nb_classCounts + label * 8);
+    classCount := classCount + 1;
+    poke8(nb_classCounts + label * 8, classCount);
+    i := i + 1;
+  }
+  
+  // Count documents containing each word per class (binary)
+  i := 0;
+  while (i < n) {
+    var label: int64 := peek8(labels + i * 8);
+    var docStart: int64 := peek8(documents + i * 8);
+    var docLen: int64 := peek8(docLengths + i * 8);
+    
+    // Use set of words (avoid duplicates)
+    var j: int64 := 0;
+    while (j < docLen) {
+      var wordIdx: int64 := peek8(docStart + j * 8);
+      if (wordIdx >= 0 && wordIdx < nb_vocabSize) {
+        // Only count once per document
+        var idx: int64 := label * nb_vocabSize + wordIdx;
+        var count: f64 := peekf64(nb_wordCounts + idx * 8);
+        if (count == 0.0) {  // Not yet counted for this doc
+          count := count + 1.0;
+          pokef64(nb_wordCounts + idx * 8, count);
+        }
+      }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  
+  // Calculate priors
+  var total: f64 := n as f64;
+  i := 0;
+  while (i < nb_nClasses) {
+    var count: int64 := peek8(nb_classCounts + i * 8);
+    var prior: f64 := (count as f64) / total;
+    pokef64(nb_classPriors + i * 8, NBLog(prior));
+    i := i + 1;
+  }
+}
+
+// Bernoulli NB prediction (with complement)
+pub fn NaiveBayesBernoulliPredict(docWords: int64, docLen: int64): int64 {
+  if (nb_wordCounts == 0) { return 0; }
+  
+  var bestClass: int64 := 0;
+  var bestScore: f64 := -999999999.0;
+  var c: int64 := 0;
+  
+  while (c < nb_nClasses) {
+    var score: f64 := peekf64(nb_classPriors + c * 8);
+    var nDocsInClass: int64 := peek8(nb_classCounts + c * 8);
+    var nDocsNotInClass: int64 := nb_nDocs - nDocsInClass;
+    
+    // Words present
+    var i: int64 := 0;
+    while (i < docLen) {
+      var wordIdx: int64 := peek8(docWords + i * 8);
+      if (wordIdx >= 0 && wordIdx < nb_vocabSize) {
+        var wc: f64 := peekf64(nb_wordCounts + c * nb_vocabSize * 8 + wordIdx * 8);
+        
+        // P(x=1|c) = (count + alpha) / (n_class + 2*alpha)
+        var pPresent: f64 := (wc + nb_alpha) / (nDocsInClass as f64 + 2.0 * nb_alpha);
+        
+        // P(x=0|c) = 1 - P(x=1|c)
+        var pAbsent: f64 := 1.0 - pPresent;
+        
+        // For Bernoulli: include both present and absent features
+        // Here we only add for present words
+        if (pPresent > 0.0) { score := score + NBLog(pPresent); }
+      }
+      i := i + 1;
+    }
+    
+    // Complement: words NOT in document reduce probability
+    var w: int64 := 0;
+    while (w < nb_vocabSize) {
+      // Check if word w is NOT in document
+      var inDoc: int64 := 0;
+      i := 0;
+      while (i < docLen) {
+        if (peek8(docWords + i * 8) == w) { inDoc := 1; break; }
+        i := i + 1;
+      }
+      
+      if (inDoc == 0) {
+        var wc: f64 := peekf64(nb_wordCounts + c * nb_vocabSize * 8 + w * 8);
+        var pAbsent: f64 := (wc + nb_alpha) / (nDocsInClass as f64 + 2.0 * nb_alpha);
+        if (pAbsent > 0.0 && pAbsent < 1.0) {
+          score := score + NBLog(1.0 - pAbsent);
+        }
+      }
+      w := w + 1;
+    }
+    
+    if (score > bestScore) {
+      bestScore := score;
+      bestClass := c;
+    }
+    c := c + 1;
+  }
+  
+  return bestClass;
+}
 //
