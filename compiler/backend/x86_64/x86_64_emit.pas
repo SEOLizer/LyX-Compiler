@@ -1582,6 +1582,14 @@ begin
               EmitU8(FCode, $F8); EmitU8(FCode, 63); // btc rax, 63
               WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
             end;
+          irFSqrt:
+            begin
+              // FSqrt: sqrtsd dest, src
+              slotIdx := fn.LocalCount + instr.Dest;
+              WriteMovsdLoad(FCode, XMM0, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+              WriteSqrtsd(FCode, XMM0, XMM0);  // sqrt(xmm0, xmm0)
+              WriteMovsdStore(FCode, RBP, SlotOffset(slotIdx), XMM0);
+            end;
 
           // === SSE2 Float-Vergleiche ===
           irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:

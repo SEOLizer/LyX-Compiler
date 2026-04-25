@@ -21,7 +21,7 @@ type
     irConstFloat,  // new: float constant
     irAdd, irSub, irMul, irDiv, irMod, irNeg,
     // float arithmetic
-    irFAdd, irFSub, irFMul, irFDiv, irFNeg,
+    irFAdd, irFSub, irFMul, irFDiv, irFNeg, irFSqrt,
     irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
     // float comparisons
     irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
