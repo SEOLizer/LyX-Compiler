@@ -20,6 +20,7 @@ type
     ReturnTypeName: string; // for functions: name of return type if struct
     ReturnStructDecl: TAstStructDecl; // for functions: struct decl if returns struct
     ArrayLen: Integer; // 0 = not array, >0 = static length, -1 = dynamic
+    ElemType: TAurumType; // element type for array[N]T symbols (atUnresolved if unknown)
     // WP-B: Source location where symbol was defined
     DefSpan: TSourceSpan;
     // for functions
@@ -231,6 +232,7 @@ begin
   ReturnTypeName := '';
   ReturnStructDecl := nil;
   ArrayLen := 0;
+  ElemType := atUnresolved;
   ParamCount := 0;
   IsVarArgs := False;
   IsGlobal := False;
@@ -1651,6 +1653,25 @@ begin
     s.ParamTypes[0] := atInt64;  // addr
     AddSymbolToCurrent(s, NullSpan);
 
+    // pokef64(addr, value) - write 64-bit float to memory (bit pattern in integer register)
+    s := TSymbol.Create('pokef64');
+    s.Kind := symFunc;
+    s.DeclType := atVoid;
+    s.ParamCount := 2;
+    SetLength(s.ParamTypes, 2);
+    s.ParamTypes[0] := atInt64;  // addr
+    s.ParamTypes[1] := atF64;    // value (f64 bit pattern)
+    AddSymbolToCurrent(s, NullSpan);
+
+    // peekf64(addr) -> f64 - read 64-bit float from memory (bit pattern as f64)
+    s := TSymbol.Create('peekf64');
+    s.Kind := symFunc;
+    s.DeclType := atF64;
+    s.ParamCount := 1;
+    SetLength(s.ParamTypes, 1);
+    s.ParamTypes[0] := atInt64;  // addr
+    AddSymbolToCurrent(s, NullSpan);
+
     // write_raw(fd, buf, len) -> int64 - write with int64 buffer address
    s := TSymbol.Create('write_raw');
    s.Kind := symFunc;
@@ -2734,7 +2755,14 @@ begin
             if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
               Result := atInt64
             else if s.DeclType = atArray then
-              Result := atInt64  // For static arrays, return int64 as element type
+            begin
+              if s.ElemType <> atUnresolved then
+                Result := s.ElemType
+              else
+                Result := atInt64;
+            end
+            else if s.ElemType <> atUnresolved then
+              Result := s.ElemType
             else
               Result := s.DeclType;
             expr.ResolvedType := Result;
@@ -3914,10 +3942,12 @@ begin
           vtype := atInt64;
         end
         // Special case: treat fn(...) types as int64 internally (opaque function pointer)
-        // Also handle the case where DeclType is unresolved but DeclTypeName is set (type alias)
+        // Only if the DeclTypeName is NOT a known class or struct type
         else if (vd.DeclType = atFnPtr) or
            ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
-            Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent)) then
+            Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) and
+            not (Assigned(FClassTypes) and (FClassTypes.IndexOf(vd.DeclTypeName) >= 0)) and
+            not (Assigned(FStructTypes) and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0))) then
         begin
           // Function pointer - keep as fn pointer type for proper resolution
           // Allow int64 as well for compatibility
@@ -4002,6 +4032,7 @@ begin
           sym.ArrayLen := Length(TAstArrayLit(vd.InitExpr).Items)
         else
           sym.ArrayLen := vd.ArrayLen;
+        sym.ElemType := vd.ElemType;
         AddSymbolToCurrent(sym, vd.Span);
       end;
     nkAssign:
@@ -4060,7 +4091,14 @@ begin
             if (s.ArrayLen = -1) or (s.DeclType = atDynArray) then
               otype := atInt64  // dynamic array: element type is int64
             else if s.DeclType = atArray then
-              otype := atInt64  // static array: element type is int64 for now
+            begin
+              if s.ElemType <> atUnresolved then
+                otype := s.ElemType
+              else
+                otype := atInt64;
+            end
+            else if s.ElemType <> atUnresolved then
+              otype := s.ElemType
             else
               otype := s.DeclType;
             if not TypeEqual(vtype, otype) then
@@ -5266,6 +5304,7 @@ begin
         sym.DeclType := vd.DeclType;
         sym.TypeName := vd.DeclTypeName;
         sym.ArrayLen := vd.ArrayLen;
+        sym.ElemType := vd.ElemType;
         sym.IsImported := True;
         sym.IsGlobal := True;
         AddSymbolToCurrent(sym, vd.Span);
@@ -6189,6 +6228,7 @@ begin
           sym.ArrayLen := Length(TAstArrayLit(TAstVarDecl(node).InitExpr).Items)
         else
           sym.ArrayLen := TAstVarDecl(node).ArrayLen;
+        sym.ElemType := TAstVarDecl(node).ElemType;
         sym.IsGlobal := True;
         AddSymbolToCurrent(sym, node.Span);
       end;
