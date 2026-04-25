@@ -3536,9 +3536,15 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             // Regular direct function call
             instr.Op := irCall;
             instr.Dest := t0;
-            instr.ImmStr := call.Name;
+            // FIX: For cross-module calls, add _L_ prefix if not already present
+            // std.io funcs already have underscore prefix like "_L_" or "__"
+            // We avoid doubling the underscore
+            if (Pos('_L_', call.Name) = 1) or (Pos('__', call.Name) = 1) then
+              instr.ImmStr := call.Name  // Already has prefix
+            else
+              instr.ImmStr := '_L_' + call.Name;
             instr.ImmInt := argCount;
-            callName := call.Name; // for call mode determination
+            callName := instr.ImmStr;
             instr.IsVirtualCall := False;
             instr.VMTIndex := -1;
             instr.SelfSlot := -1;
