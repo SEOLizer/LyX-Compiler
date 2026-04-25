@@ -3191,6 +3191,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           instr.Src1 := -1;
           Emit(instr); Result := -1;
         end
+        // sqrt(x: f64) - Square root
+        else if (call.Name = 'sqrt') then
+        begin
+          t0 := NewTemp;
+          instr.Op := irFSqrt;
+          instr.Dest := t0;
+          instr.Src1 := argTemps[0];
+          instr.Src2 := -1;
+          Emit(instr);
+          Result := t0;
+        end
         else if ((call.Name = 'VerifyIntegrity') or
                  ((call.Namespace = 'Integrity') and (call.Name = 'VerifyIntegrity'))) then
         begin
