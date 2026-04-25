@@ -425,6 +425,141 @@ begin
   EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
 end;
 
+// ============================================================================
+// Packed SIMD (SSE2/SSE)
+// ============================================================================
+
+// addpd xmm0, xmm1 (packed 2x f64 addition)
+procedure WriteAddpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $58);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// subpd xmm0, xmm1 (packed 2x f64 subtraction)
+procedure WriteSubpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $5C);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// mulpd xmm0, xmm1 (packed 2x f64 multiplication)
+procedure WriteMulpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $59);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// divpd xmm0, xmm1 (packed 2x f64 division)
+procedure WriteDivpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $5E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// sqrtpd xmm0, xmm1 (packed square root)
+procedure WriteSqrtpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $51);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// maxpd xmm0, xmm1 (packed maximum)
+procedure WriteMaxpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $5F);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// minpd xmm0, xmm1 (packed minimum)
+procedure WriteMinpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $5D);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// cmppd xmm0, xmm1, imm8 (packed compare)
+procedure WriteCmppd(buf: TByteBuffer; dst, src: Byte; imm: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $C2);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+  EmitU8(buf, imm);
+end;
+
+// andpd xmm0, xmm1 (logical AND packed)
+procedure WriteAndpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $54);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// orpd xmm0, xmm1 (logical OR packed)
+procedure WriteOrpd(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $66); EmitU8(buf, $0F); EmitU8(buf, $56);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// ============================================================================
+// SSE1/SSE2 für 32-bit Floats (f32)
+// ============================================================================
+
+// addps xmm0, xmm1 (packed 4x f32 addition)
+procedure WriteAddps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $58);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// mulps xmm0, xmm1 (packed 4x f32 multiplication)
+procedure WriteMulps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $59);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// divps xmm0, xmm1 (packed 4x f32 division)
+procedure WriteDivps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $5E);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// sqrtps xmm0, xmm1 (packed square root 4x f32)
+procedure WriteSqrtps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $51);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// maxps xmm0, xmm1 (packed maximum 4x f32)
+procedure WriteMaxps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $5F);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// minps xmm0, xmm1 (packed minimum 4x f32)
+procedure WriteMinps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $5D);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// andps xmm0, xmm1 (logical AND packed f32)
+procedure WriteAndps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $54);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
+// orps xmm0, xmm1 (logical OR packed f32)
+procedure WriteOrps(buf: TByteBuffer; dst, src: Byte);
+begin
+  EmitU8(buf, $00); EmitU8(buf, $0F); EmitU8(buf, $56);
+  EmitU8(buf, $C0 or ((dst and 7) shl 3) or (src and 7));
+end;
+
 // xorpd xmm, xmm
 procedure WriteXorpd(buf: TByteBuffer; dst, src: Byte);
 begin
