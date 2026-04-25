@@ -945,4 +945,457 @@ pub fn KNNScore(features: int64, labels: int64, n: int64): f64 {
   }
   return correct as f64 / n as f64;
 }
+
+// ============================================================================
+// k-Means Clustering (Unsupervised Learning)
+// ============================================================================
+
+// k-Means state
+var km_k: int64;                      // Number of clusters
+var km_n: int64;                   // Number of data points
+var km_features: int64;            // Pointer to feature matrix (n x f64)
+var km_centroids: int64;           // Pointer to centroids (k x f64)
+var km_assignments: int64;          // Pointer to cluster assignments (n x int64)
+var km_nFeatures: int64;            // Features per sample
+var km_maxIter: int64;             // Max iterations
+var km_tolerance: f64;             // Convergence tolerance
+var km_iter: int64;                // Current iteration
+var km_inertia: f64;               // Sum of squared distances
+
+// Cluster centroid vector
+// Note: stored as contiguous f64 array at km_centroids
+
+// Initialize k-Means
+pub fn KMeansInit(k: int64): void {
+  km_k := k;
+  km_n := 0;
+  km_features := 0;
+  km_centroids := 0;
+  km_assignments := 0;
+  km_nFeatures := 0;
+  km_maxIter := 100;
+  km_tolerance := 0.001;
+  km_iter := 0;
+  km_inertia := 0.0;
+}
+
+// Get number of clusters
+pub fn KMeansGetK(): int64 {
+  return km_k;
+}
+
+// Get current iteration
+pub fn KMeansGetIter(): int64 {
+  return km_iter;
+}
+
+// Get inertia (sum of squared distances)
+pub fn KMeansGetInertia(): f64 {
+  return km_inertia;
+}
+
+// Initialize centroids using k-means++ algorithm
+pub fn KMeansInitCentroids(features: int64, n: int64, nFeatures: int64, k: int64): void {
+  if (n < k || features == 0) { return; }
+  
+  // Allocate centroids
+  km_centroids := mmap(0, k * nFeatures * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  km_assignments := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  
+  // k-means++ initialization
+  // 1. Choose first centroid randomly
+  var randIdx: int64 := n / 2;  // Simplified: use middle point
+  var i: int64 := 0;
+  while (i < nFeatures) {
+    var val: f64 := peekf64(features + randIdx * nFeatures * 8 + i * 8);
+    pokef64(km_centroids + i * 8, val);
+    i := i + 1;
+  }
+  
+  // 2. Choose remaining centroids with probability proportional to distance²
+  var c: int64 := 1;
+  while (c < k) {
+    // Calculate distances to nearest centroid for each point
+    var dists: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var totalDist: f64 := 0.0;
+    var j: int64 := 0;
+    
+    while (j < n) {
+      // Find nearest centroid
+      var minDist: f64 := 999999999.0;
+      var ci: int64 := 0;
+      while (ci < c) {
+        var centroid: int64 := km_centroids + ci * nFeatures * 8;
+        var point: int64 := features + j * nFeatures * 8;
+        var d: f64 := KNNDistance(centroid, point, nFeatures);
+        if (d < minDist) { minDist := d; }
+        ci := ci + 1;
+      end;
+      pokef64(dists + j * 8, minDist * minDist);
+      totalDist := totalDist + (minDist * minDist);
+      j := j + 1;
+    end
+    
+    // Choose next centroid with weighted probability
+    // Simplified: use weighted random selection
+    var r: f64 := totalDist * 0.5;
+    var cumDist: f64 := 0.0;
+    j := 0;
+    while (j < n) {
+      cumDist := cumDist + peekf64(dists + j * 8);
+      if (cumDist >= r) {
+        // Copy this point as next centroid
+        var fIdx: int64 := 0;
+        while (fIdx < nFeatures) {
+          var val: f64 := peekf64(features + j * nFeatures * 8 + fIdx * 8);
+          pokef64(km_centroids + c * nFeatures * 8 + fIdx * 8, val);
+          fIdx := fIdx + 1;
+        }
+        break;
+      }
+      j := j + 1;
+    }
+    
+    munmap(dists, n * 8);
+    c := c + 1;
+  }
+}
+
+// Fit k-Means to data (main training function)
+// features: pointer to feature matrix (n x f64)
+// n: number of samples
+// nFeatures: number of features
+// k: number of clusters
+pub fn KMeansFit(features: int64, n: int64, nFeatures: int64, k: int64): void {
+  if (n == 0 || features == 0 || k == 0) { return; }
+  
+  km_features := features;
+  km_n := n;
+  km_nFeatures := nFeatures;
+  km_k := k;
+  km_iter := 0;
+  
+  // Initialize centroids
+  KMeansInitCentroids(features, n, nFeatures, k);
+  
+  // Main loop: assign points -> update centroids -> check convergence
+  var converged: int64 := 0;
+  
+  while (converged == 0 && km_iter < km_maxIter) {
+    km_iter := km_iter + 1;
+    
+    // Step 1: Assign each point to nearest centroid
+    var changed: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+      var point: int64 := features + i * nFeatures * 8;
+      var minDist: f64 := 999999999.0;
+      var minCluster: int64 := 0;
+      var c: int64 := 0;
+      
+      while (c < k) {
+        var centroid: int64 := km_centroids + c * nFeatures * 8;
+        var d: f64 := KNNDistance(point, centroid, nFeatures);
+        if (d < minDist) {
+          minDist := d;
+          minCluster := c;
+        }
+        c := c + 1;
+      end;
+      
+      // Check if assignment changed
+      var oldAss: int64 := peek8(km_assignments + i * 8);
+      if (oldAss != minCluster) { changed := 1; }
+      poke8(km_assignments + i * 8, minCluster);
+      
+      i := i + 1;
+    }
+    
+    // Step 2: Update centroids
+    var j: int64 := 0;
+    while (j < k) {
+      // Calculate mean of all points in cluster j
+      var count: int64 := 0;
+      var sum: int64 := mmap(0, nFeatures * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      
+      i := 0;
+      while (i < n) {
+        if (peek8(km_assignments + i * 8) == j) {
+          count := count + 1;
+          var f: int64 := 0;
+          while (f < nFeatures) {
+            var val: f64 := peekf64(features + i * nFeatures * 8 + f * 8);
+            var cur: f64 := peekf64(sum + f * 8);
+            pokef64(sum + f * 8, cur + val);
+            f := f + 1;
+          }
+        }
+        i := i + 1;
+      }
+      
+      // Update centroid
+      if (count > 0) {
+        var f: int64 := 0;
+        while (f < nFeatures) {
+          var mean: f64 := peekf64(sum + f * 8) / (count as f64);
+          pokef64(km_centroids + j * nFeatures * 8 + f * 8, mean);
+          f := f + 1;
+        }
+      }
+      
+      munmap(sum, nFeatures * 8);
+      j := j + 1;
+    }
+    
+    // Step 3: Check convergence
+    if (changed == 0) {
+      converged := 1;
+    }
+    
+    // Also stop if max iterations reached
+    if (km_iter >= km_maxIter) {
+      converged := 1;
+    }
+  }
+  
+  // Calculate final inertia
+  km_inertia := 0.0;
+  var pt: int64 := 0;
+  while (pt < n) {
+    var point: int64 := features + pt * nFeatures * 8;
+    var cluster: int64 := peek8(km_assignments + pt * 8);
+    var centroid: int64 := km_centroids + cluster * nFeatures * 8;
+    var d: f64 := KNNDistance(point, centroid, nFeatures);
+    km_inertia := km_inertia + (d * d);
+    pt := pt + 1;
+  }
+}
+
+// Get cluster assignment for a point
+pub fn KMeansPredictCluster(point: int64): int64 {
+  if (km_centroids == 0 || km_k == 0) { return -1; }
+  
+  var minDist: f64 := 999999999.0;
+  var minCluster: int64 := 0;
+  var c: int64 := 0;
+  
+  while (c < km_k) {
+    var centroid: int64 := km_centroids + c * km_nFeatures * 8;
+    var d: f64 := KNNDistance(point, centroid, km_nFeatures);
+    if (d < minDist) {
+      minDist := d;
+      minCluster := c;
+    }
+    c := c + 1;
+  }
+  
+  return minCluster;
+}
+
+// Get all cluster assignments
+pub fn KMeansGetAssignments(): int64 {
+  return km_assignments;
+}
+
+// Get cluster centroids
+pub fn KMeansGetCentroids(): int64 {
+  return km_centroids;
+}
+
+// Get cluster size
+pub fn KMeansGetClusterSize(clusterIdx: int64): int64 {
+  if (km_assignments == 0) { return 0; }
+  
+  var count: int64 := 0;
+  var i: int64 := 0;
+  while (i < km_n) {
+    if (peek8(km_assignments + i * 8) == clusterIdx) {
+      count := count + 1;
+    }
+    i := i + 1;
+  }
+  return count;
+}
+
+// Get centroids as array (for visualization)
+pub fn KMeansGetCentroid(idx: int64, featureIdx: int64): f64 {
+  if (km_centroids == 0) { return 0.0; }
+  return peekf64(km_centroids + idx * km_nFeatures * 8 + featureIdx * 8);
+}
+
+// Calculate silhouette score (quality metric)
+pub fn KMeansSilhouette(features: int64, n: int64, nFeatures: int64): f64 {
+  if (km_n == 0 || km_assignments == 0) { return 0.0; }
+  
+  var totalScore: f64 := 0.0;
+  var i: int64 := 0;
+  
+  while (i < n) {
+    var point: int64 := features + i * nFeatures * 8;
+    var myCluster: int64 := peek8(km_assignments + i * 8);
+    
+    // a(i): mean distance to points in same cluster
+    var aDist: f64 := 0.0;
+    var aCount: int64 := 0;
+    var j: int64 := 0;
+    while (j < n) {
+      if (peek8(km_assignments + j * 8) == myCluster) {
+        var other: int64 := features + j * nFeatures * 8;
+        aDist := aDist + KNNDistance(point, other, nFeatures);
+        aCount := aCount + 1;
+      }
+      j := j + 1;
+    }
+    if (aCount > 1) { aDist := aDist / (aCount - 1); }
+    if (aDist == 0.0) { aDist := 0.0001; }
+    
+    // b(i): min mean distance to points in other clusters
+    var bDist: f64 := 999999999.0;
+    var c: int64 := 0;
+    while (c < km_k) {
+      if (c != myCluster) {
+        var otherDist: f64 := 0.0;
+        var oCount: int64 := 0;
+        j := 0;
+        while (j < n) {
+          if (peek8(km_assignments + j * 8) == c) {
+            var other: int64 := features + j * nFeatures * 8;
+            otherDist := otherDist + KNNDistance(point, other, nFeatures);
+            oCount := oCount + 1;
+          }
+          j := j + 1;
+        }
+        if (oCount > 0) {
+          otherDist := otherDist / oCount;
+          if (otherDist < bDist) { bDist := otherDist; }
+        }
+      }
+      c := c + 1;
+    }
+    if (bDist == 999999999.0) { bDist := 0.0; }
+    
+    // Silhouette: (b - a) / max(a, b)
+    var s: f64 := 0.0;
+    if (aDist > 0.0 || bDist > 0.0) {
+      var mx: f64 := aDist;
+      if (bDist > mx) { mx := bDist; }
+      s := (bDist - aDist) / mx;
+    }
+    totalScore := totalScore + s;
+    
+    i := i + 1;
+  }
+  
+  return totalScore / (n as f64);
+}
+
+// Elbow method: calculate inertia for different k values
+pub fn KMeansElbow(features: int64, n: int64, nFeatures: int64, maxK: int64): int64 {
+  // Returns pointer to array of inertia values for k=1 to maxK
+  var result: int64 := mmap(0, maxK * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var k: int64 := 1;
+  
+  while (k <= maxK) {
+    // Fit with k clusters
+    KMeansFit(features, n, nFeatures, k);
+    
+    // Store inertia
+    pokef64(result + (k - 1) * 8, km_inertia);
+    
+    k := k + 1;
+  }
+  
+  return result;
+}
+
+// ============================================================================
+// k-Means Mini-Batch (faster for large datasets)
+// ============================================================================
+
+var kmb_batchSize: int64;
+
+// Initialize mini-batch k-means
+pub fn KMeansMiniBatchInit(k: int64, batchSize: int64): void {
+  KMeansInit(k);
+  kmb_batchSize := batchSize;
+  if (kmb_batchSize < 10) { kmb_batchSize := 10; }
+}
+
+// Fit mini-batch k-means (faster approximation)
+pub fn KMeansMiniBatchFit(features: int64, n: int64, nFeatures: int64, k: int64): void {
+  if (n == 0 || features == 0 || k == 0) { return; }
+  
+  km_features := features;
+  km_n := n;
+  km_nFeatures := nFeatures;
+  km_k := k;
+  
+  // Initialize centroids (k-means++)
+  KMeansInitCentroids(features, n, nFeatures, k);
+  
+  // Main loop with batches
+  var iter: int64 := 0;
+  var converged: int64 := 0;
+  
+  while (converged == 0 && iter < km_maxIter) {
+    iter := iter + 1;
+    
+    // Random batch sampling (simplified: use first batchSize points)
+    var changed: int64 := 0;
+    var startIdx: int64 := (iter * kmb_batchSize) % n;
+    var batchEnd: int64 := startIdx + kmb_batchSize;
+    if (batchEnd > n) { batchEnd := n; }
+    
+    // Update centroids based on batch
+    var i: int64 := startIdx;
+    while (i < batchEnd) {
+      var point: int64 := features + i * nFeatures * 8;
+      var cluster: int64 := KMeansPredictCluster(point);
+      var oldAss: int64 := peek8(km_assignments + i * 8);
+      if (oldAss != cluster) { changed := 1; }
+      poke8(km_assignments + i * 8, cluster);
+      i := i + 1;
+    }
+    
+    // Update centroids incrementally (learning rate)
+    i := startIdx;
+    while (i < batchEnd) {
+      var point: int64 := features + i * nFeatures * 8;
+      var cluster: int64 := peek8(km_assignments + i * 8);
+      var lr: f64 := 0.1;
+      
+      var f: int64 := 0;
+      while (f < nFeatures) {
+        var cur: f64 := peekf64(km_centroids + cluster * nFeatures * 8 + f * 8);
+        var pt: f64 := peekf64(point + f * 8);
+        pokef64(km_centroids + cluster * nFeatures * 8 + f * 8, cur + (pt - cur) * lr);
+        f := f + 1;
+      }
+      i := i + 1;
+    }
+    
+    if (changed == 0 || iter >= km_maxIter) { converged := 1; }
+  }
+  
+  // Final full assignment pass
+  i := 0;
+  while (i < n) {
+    var point: int64 := features + i * nFeatures * 8;
+    var cluster: int64 := KMeansPredictCluster(point);
+    poke8(km_assignments + i * 8, cluster);
+    i := i + 1;
+  }
+  
+  // Calculate inertia
+  km_inertia := 0.0;
+  i := 0;
+  while (i < n) {
+    var point: int64 := features + i * nFeatures * 8;
+    var cluster: int64 := peek8(km_assignments + i * 8);
+    var centroid: int64 := km_centroids + cluster * nFeatures * 8;
+    var d: f64 := KNNDistance(point, centroid, nFeatures);
+    km_inertia := km_inertia + (d * d);
+    i := i + 1;
+  }
+}
 //
