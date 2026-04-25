@@ -6,6 +6,10 @@ RELEASE_FLAGS = -O2
 # Debug-Flags (Range/Overflow/Stack-Checks, Heaptrace)
 DEBUG_FLAGS   = -g -gl -Ci -Cr -Co -gh
 
+# Build test executables from .pas files in the parent tests directory
+$(TESTS): %: ../tests/%.pas
+	$(FPC) $(FPCFLAGS) $(DEBUG_FLAGS) $< -o $@
+
 # Test roots (relative to repo root, one level up)
 TESTS_REGRESSION   = ../tests/regression
 TESTS_FEATURES     = ../tests/feature_checks
@@ -13,9 +17,12 @@ TESTS_FEATURES     = ../tests/feature_checks
 # Alle Test-Units (nur existierende .pas Dateien)
 # Ausgeschlossene Tests: test_printf und test_std_examples (Import-Konflikte durch Funktionsüberladung)
 TEST_SOURCES = $(filter-out ../tests/test_printf.pas ../tests/test_std_examples.pas,$(wildcard ../tests/test_*.pas))
-TESTS        = $(TEST_SOURCES:.pas=)
+TESTS        = $(notdir $(TEST_SOURCES:.pas=))
 
-.PHONY: build debug test clean e2e
+.PHONY: build debug test clean e2e print-TESTS
+
+print-TESTS:
+	@echo "TESTS: $(TESTS)"
 
 build:
 	@mkdir -p lib

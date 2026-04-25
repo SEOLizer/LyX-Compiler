@@ -1684,7 +1684,7 @@ begin
                 16: WriteMovRegImm64(FCode, RCX, $FFFF);
                 32: WriteMovRegImm64(FCode, RCX, $FFFFFFFF);
               else
-                WriteMovRegImm64(FCode, RCX, $FFFFFFFFFFFFFFFF);
+                WriteMovRegImm64(FCode, RCX, QWord($FFFFFFFFFFFFFFFF));
               end;
               // AND RAX, RCX
               EmitRex(FCode, 1, 0, 0, 0);
@@ -2585,7 +2585,7 @@ begin
                  WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
                end
                else
-                 WriteMovRegImm64(FCode, R8, -1);
+                 WriteMovRegImm64(FCode, R8, QWord(-1));
                if Length(instr.ArgTemps) >= 6 then
                begin
                  slotIdx := fn.LocalCount + instr.ArgTemps[5];
@@ -3310,7 +3310,7 @@ begin
                     WriteMovRegMem(FCode, R8, RBP, SlotOffset(slotIdx));
                   end
                   else
-                    WriteMovRegImm64(FCode, R8, -1);
+WriteMovRegImm64(FCode, R8, QWord(-1));
                   
                   // arg5: offset
                   if Length(instr.ArgTemps) >= 6 then
@@ -7491,7 +7491,7 @@ begin
             WriteMovRegReg(FCode, RSI, RDX);
             EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03); // *8
             WriteMovRegImm64(FCode, RDX, 3);
-            WriteMovRegImm64(FCode, R10, -1);
+            WriteMovRegImm64(FCode, R10, QWord(-1));
             WriteMovRegImm64(FCode, R8, 0);
             WriteMovRegImm64(FCode, R9, 3);
             WriteSyscall(FCode);
@@ -7564,7 +7564,7 @@ begin
               WriteMovRegImm64(FCode, RDI, 0);
               WriteMovRegImm64(FCode, RSI, instr.ImmInt);
               WriteMovRegImm64(FCode, RDX, 3);
-              WriteMovRegImm64(FCode, R10, -1);
+WriteMovRegImm64(FCode, R10, QWord(-1));
               WriteMovRegImm64(FCode, R8, 0);
               WriteMovRegImm64(FCode, R9, 3);
               WriteSyscall(FCode);
@@ -7860,7 +7860,7 @@ begin
         // Method has no body (e.g., TObject's built-in methods) - use a dummy address
         // We'll patch this later with a "not implemented" function or leave as 0
         // For now, write a marker that we'll fix in the patching phase
-        FCode.WriteU64LE($FFFFFFFFFFFFFFFF);  // Marker for unimplemented method
+        FCode.WriteU64LE(QWord($FFFFFFFFFFFFFFFF));  // Marker for unimplemented method
       end;
       
       // Record patch position with VMT and method index
