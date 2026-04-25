@@ -2510,6 +2510,32 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             Emit(instr);
             Result := -1;
           end
+          else if (call.Name = 'peekf64') then
+          begin
+            t0 := NewTemp;
+            instr.Op := irCallBuiltin;
+            instr.Dest := t0;
+            instr.ImmStr := 'peekf64';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            Emit(instr);
+            Result := t0;
+          end
+          else if (call.Name = 'pokef64') then
+          begin
+            instr.Op := irCallBuiltin;
+            instr.Dest := -1;
+            instr.ImmStr := 'pokef64';
+            instr.ImmInt := argCount;
+            SetLength(instr.ArgTemps, argCount);
+            for i := 0 to argCount - 1 do instr.ArgTemps[i] := argTemps[i];
+            if argCount >= 1 then instr.Src1 := argTemps[0] else instr.Src1 := -1;
+            if argCount >= 2 then instr.Src2 := argTemps[1] else instr.Src2 := -1;
+            Emit(instr);
+            Result := -1;
+          end
         else if (call.Name = 'mkdir') or
                 ((call.Namespace = 'IO') and (call.Name = 'mkdir')) then
         begin
