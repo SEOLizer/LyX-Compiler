@@ -905,6 +905,8 @@ var
   excValueIdx, excDepthIdx, excJmpbufsIdx: Integer;
   // argv base global tracking (-1 = not registered)
   argvBaseIdx: Integer;
+  // Random seed global tracking (-1 = not registered)
+  randomSeedIdx: Integer;
   // TMR Hash Store patch variables (aerospace-todo P0 #46)
   dataAddrPos: Integer;
   codeToDataGap: Integer;
@@ -943,6 +945,7 @@ begin
   excDepthIdx := -1;
   excJmpbufsIdx := -1;
   argvBaseIdx := -1;
+  randomSeedIdx := -1;
   
   // _start Label registrieren (Einstiegspunkt)
   SetLength(FLabelPositions, Length(FLabelPositions) + 1);
@@ -977,6 +980,12 @@ begin
   SetLength(globalVarOffsets, argvBaseIdx + 1);
   globalVarOffsets[argvBaseIdx] := FData.Size;  // FData offset (currently 0)
   FData.WriteU64LE(0);  // Reserve 8 bytes in FData for the stored initial RSP
+  // Allocate 8 bytes in FData for the Random LCG seed
+  randomSeedIdx := globalVarNames.Count;
+  globalVarNames.Add('_lyx_random_seed');
+  SetLength(globalVarOffsets, randomSeedIdx + 1);
+  globalVarOffsets[randomSeedIdx] := FData.Size;
+  FData.WriteU64LE(123456789);  // Initial seed
   // Advance totalDataOffset so irLoadGlobal/irStoreGlobal vars don't overlap
   totalDataOffset := FData.Size;
   // lea r10, [rip + _lyx_argv_base]  (4D 8D 15 <disp32>)
@@ -3620,6 +3629,48 @@ begin
                     slotIdx := fn.LocalCount + instr.Dest;
                     WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
                   end;
+                end
+                else if instr.ImmStr = 'peekf64' then
+                begin
+                  // peekf64(addr) -> f64 - read 64-bit float bit pattern from memory
+                  // Identical to peek64 but semantically f64
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                  EmitRex(FCode, 1, 0, 0, 0);
+                  FCode.WriteU8($8B);  // MOV r64, r/m64
+                  FCode.WriteU8($07);  // ModRM: RAX, [RDI]
+                  if instr.Dest >= 0 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.Dest;
+                    WriteMovMemReg(FCode, RBP, SlotOffset(slotIdx), RAX);
+                  end;
+                end
+                else if instr.ImmStr = 'pokef64' then
+                begin
+                  // pokef64(addr, value) - write 64-bit float bit pattern to memory
+                  // Identical to poke64 but value is f64 bit pattern
+                  if Length(instr.ArgTemps) >= 1 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[0];
+                    WriteMovRegMem(FCode, RDI, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RDI, 0);
+                  if Length(instr.ArgTemps) >= 2 then
+                  begin
+                    slotIdx := fn.LocalCount + instr.ArgTemps[1];
+                    WriteMovRegMem(FCode, RAX, RBP, SlotOffset(slotIdx));
+                  end
+                  else
+                    WriteMovRegImm64(FCode, RAX, 0);
+                  EmitRex(FCode, 1, 0, 0, 0);
+                  FCode.WriteU8($89);  // MOV r/m64, r64
+                  FCode.WriteU8($07);  // ModRM: [RDI], RAX
                 end
                 else if instr.ImmStr = 'write_raw' then
                 begin
@@ -7648,6 +7699,37 @@ begin
     end;
   end;
   
+  // ================================================================
+  // Random LCG Stub
+  // ================================================================
+  // Register 'Random' label so jump patches resolve
+  SetLength(FLabelPositions, Length(FLabelPositions) + 1);
+  FLabelPositions[High(FLabelPositions)].Name := 'Random';
+  FLabelPositions[High(FLabelPositions)].Pos := FCode.Size;
+  // push rbp / mov rbp, rsp
+  EmitU8(FCode, $55);  // push rbp
+  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $E5);
+  // lea rcx, [rip + seed]  (48 8D 0D <disp32>)
+  leaPos := FCode.Size;
+  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $0D); EmitU32(FCode, 0);
+  SetLength(FGlobalVarLeaPositions, Length(FGlobalVarLeaPositions) + 1);
+  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].VarIndex := randomSeedIdx;
+  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].CodePos := leaPos;
+  FGlobalVarLeaPositions[High(FGlobalVarLeaPositions)].IsDataBased := True;
+  // mov rax, [rcx]
+  EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $01);
+  // imul rax, rax, 1103515245
+  EmitU8(FCode, $48); EmitU8(FCode, $69); EmitU8(FCode, $C0); EmitU32(FCode, 1103515245);
+  // add rax, 12345
+  EmitU8(FCode, $48); EmitU8(FCode, $05); EmitU32(FCode, 12345);
+  // and rax, 0x7FFFFFFF
+  EmitU8(FCode, $48); EmitU8(FCode, $25); EmitU32(FCode, $7FFFFFFF);
+  // mov [rcx], rax
+  EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $01);
+  // pop rbp / ret
+  EmitU8(FCode, $5D);  // pop rbp
+  EmitU8(FCode, $C3);  // ret
+
   // ================================================================
   // PLT-Stubs für externe Symbole generieren (VOR dem Patching!)
   // ================================================================

@@ -1607,6 +1607,7 @@ begin
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span)
   else
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
+  TAstVarDecl(Result).ElemType := FLastElemType;
 end;
 
 function TParser.ParseTupleVarDecl(const firstName: string; aSpan: TSourceSpan): TAstTupleVarDecl;
@@ -1669,6 +1670,7 @@ begin
   Expect(tkSemicolon);
 
   Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
+  Result.ElemType := FLastElemType;
   Result.SetGlobal(True, isPub);
   Result.IsRedundant := isRedundant; // aerospace-todo P2 #51
 end;
