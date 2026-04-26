@@ -16,6 +16,17 @@ type
     StrVal: string;
   end;
 
+  TLocalVar = record
+    VarType:    TAurumType;   // declared type of this local slot
+    ElemSize:   Integer;      // element size in bytes for dyn-array locals (0 otherwise)
+    IsStruct:   Boolean;      // true if this slot holds a struct (needs address, not value)
+    SlotCount:  Integer;      // number of consecutive slots this variable occupies
+    ArrayLen:   Integer;      // static array length (0 if not a static array)
+    IsDynArray: Boolean;      // true if this local is a dynamic-array fat-pointer
+    TypeName:   string;       // type name for class/struct locals (destructor/method lookup)
+    ConstVal:   TConstValue;  // compile-time constant value, or nil
+  end;
+
   TIRLowering = class
   private
     FModule: TIRModule;
@@ -26,15 +37,8 @@ type
     FTempCounter: Integer;
     FLabelCounter: Integer;
     FLocalMap: TStringList; // name -> local index (as object integer)
-    FLocalTypes: array of TAurumType; // index -> declared local type
-    FLocalElemSize: array of Integer; // index -> element size in bytes for dynamic array locals (0 if not array)
-    FLocalIsStruct: array of Boolean; // index -> true if this local is a struct (need address, not value)
-    FLocalSlotCount: array of Integer; // index -> number of slots this variable occupies (for structs)
-    FLocalArrayLen: array of Integer; // index -> array length (0 if not a static array)
-    FLocalIsDynArray: array of Boolean; // index -> true if this local is a dynamic array (fat-pointer)
-    FLocalTypeNames: array of string; // index -> type name for classes (for destructor lookup)
+    FLocals: array of TLocalVar; // per-slot metadata (type, size, flags, const value, ...)
     FConstMap: TStringList; // name -> TConstValue (compile-time constants)
-    FLocalConst: array of TConstValue; // per-function local constant values (or nil)
     FBreakStack: TStringList; // stack of break labels
     FContinueStack: TStringList; // stack of continue labels (loop start)
     FStructTypes: TStringList; // struct name -> TAstStructDecl (as object)
@@ -155,12 +159,7 @@ constructor TIRLowering.Create(modul: TIRModule; diag: TDiagnostics);
     FGenericSpecializations.Duplicates := dupIgnore;
     SetLength(FTypeSubstParams, 0);
     SetLength(FTypeSubstTypes, 0);
-    SetLength(FLocalTypes, 0);
-    SetLength(FLocalElemSize, 0);
-    SetLength(FLocalIsStruct, 0);
-    SetLength(FLocalSlotCount, 0);
-    SetLength(FLocalConst, 0);
-    SetLength(FLocalTypeNames, 0);
+    SetLength(FLocals, 0);
   end;
 
 
@@ -172,11 +171,9 @@ begin
   for i := 0 to FConstMap.Count - 1 do
     System.TObject(FConstMap.Objects[i]).Free;
   FConstMap.Free;
-  for i := 0 to Length(FLocalConst)-1 do
-    if Assigned(FLocalConst[i]) then FLocalConst[i].Free;
-  SetLength(FLocalConst, 0);
-  SetLength(FLocalIsStruct, 0);
-  SetLength(FLocalTypeNames, 0);
+  for i := 0 to Length(FLocals)-1 do
+    if Assigned(FLocals[i].ConstVal) then FLocals[i].ConstVal.Free;
+  SetLength(FLocals, 0);
   FBreakStack.Free;
   FContinueStack.Free;
   // Don't free objects in FStructTypes/FClassTypes/FGlobalVars - they belong to the AST
@@ -238,18 +235,11 @@ begin
   Result := FCurrentFunc.LocalCount;
   FCurrentFunc.LocalCount := FCurrentFunc.LocalCount + 1;
   FLocalMap.AddObject(name, IntToObj(Result));
-  // ensure FLocalTypes has same length
-  SetLength(FLocalTypes, FCurrentFunc.LocalCount);
-  FLocalTypes[Result] := aType;
-  // ensure FLocalElemSize has same length and initialize to 0
-  SetLength(FLocalElemSize, FCurrentFunc.LocalCount);
-  FLocalElemSize[Result] := 0;
-  // ensure FLocalIsStruct has same length and initialize to false
-  SetLength(FLocalIsStruct, FCurrentFunc.LocalCount);
-  FLocalIsStruct[Result] := False;
-  // ensure FLocalTypeNames has same length and initialize to empty
-  SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
-  FLocalTypeNames[Result] := '';
+  SetLength(FLocals, FCurrentFunc.LocalCount);
+  FLocals[Result].VarType  := aType;
+  FLocals[Result].ElemSize := 0;
+  FLocals[Result].IsStruct := False;
+  FLocals[Result].TypeName := '';
 end;
 
 function TIRLowering.AllocLocalMany(const name: string; aType: TAurumType; count: Integer; isStruct: Boolean = False): Integer;
@@ -267,46 +257,28 @@ begin
   base := FCurrentFunc.LocalCount;
   FCurrentFunc.LocalCount := FCurrentFunc.LocalCount + count;
   FLocalMap.AddObject(name, IntToObj(base));
-  // ensure FLocalTypes has same length
-  SetLength(FLocalTypes, FCurrentFunc.LocalCount);
+  SetLength(FLocals, FCurrentFunc.LocalCount);
   for i := 0 to count - 1 do
-    FLocalTypes[base + i] := aType;
-  // ensure FLocalElemSize has same length and initialize entries to 0
-  SetLength(FLocalElemSize, FCurrentFunc.LocalCount);
-  for i := 0 to count - 1 do
-    FLocalElemSize[base + i] := 0;
-  // ensure FLocalIsStruct has same length
-  SetLength(FLocalIsStruct, FCurrentFunc.LocalCount);
-  for i := 0 to count - 1 do
-    FLocalIsStruct[base + i] := isStruct and (i = 0); // only mark first slot as struct
-  // ensure FLocalSlotCount has same length
-  SetLength(FLocalSlotCount, FCurrentFunc.LocalCount);
-  FLocalSlotCount[base] := count; // store slot count on first slot
-  for i := 1 to count - 1 do
-    FLocalSlotCount[base + i] := 0; // other slots don't need count
-  // ensure FLocalTypeNames has same length
-  SetLength(FLocalTypeNames, FCurrentFunc.LocalCount);
-  for i := 0 to count - 1 do
-    FLocalTypeNames[base + i] := '';
-  // ensure FLocalArrayLen has same length - store array length on first slot
-  SetLength(FLocalArrayLen, FCurrentFunc.LocalCount);
+  begin
+    FLocals[base + i].VarType    := aType;
+    FLocals[base + i].ElemSize   := 0;
+    FLocals[base + i].IsStruct   := isStruct and (i = 0);
+    FLocals[base + i].SlotCount  := 0;
+    FLocals[base + i].ArrayLen   := 0;
+    FLocals[base + i].IsDynArray := False;
+    FLocals[base + i].TypeName   := '';
+    FLocals[base + i].ConstVal   := nil;
+  end;
+  FLocals[base].SlotCount := count;
   if (not isStruct) and (count > 1) then
-    FLocalArrayLen[base] := count  // this is an array
-  else
-    FLocalArrayLen[base] := 0;     // not an array
-  for i := 1 to count - 1 do
-    FLocalArrayLen[base + i] := 0;
-  // ensure FLocalIsDynArray has same length - initialize to false
-  SetLength(FLocalIsDynArray, FCurrentFunc.LocalCount);
-  for i := 0 to count - 1 do
-    FLocalIsDynArray[base + i] := False;
+    FLocals[base].ArrayLen := count;
   Result := base;
 end;
 
 function TIRLowering.GetLocalType(idx: Integer): TAurumType;
 begin
-  if (idx >= 0) and (idx < Length(FLocalTypes)) then
-    Result := FLocalTypes[idx]
+  if (idx >= 0) and (idx < Length(FLocals)) then
+    Result := FLocals[idx].VarType
   else
     Result := atUnresolved;
 end;
@@ -348,8 +320,8 @@ end;
 
 function TIRLowering.GetLocalArrayLen(idx: Integer): Integer;
 begin
-  if (idx >= 0) and (idx < Length(FLocalArrayLen)) then
-    Result := FLocalArrayLen[idx]
+  if (idx >= 0) and (idx < Length(FLocals)) then
+    Result := FLocals[idx].ArrayLen
   else
     Result := 0;
 end;
@@ -511,10 +483,10 @@ begin
        FCurrentFuncDecl := TAstFuncDecl(node);
         FLocalMap.Clear;
         // Free old FLocalConst entries before resetting
-        for j := 0 to Length(FLocalConst) - 1 do
-          if Assigned(FLocalConst[j]) then
-            FLocalConst[j].Free;
-        SetLength(FLocalConst, 0);
+        for j := 0 to Length(FLocals) - 1 do
+          if Assigned(FLocals[j].ConstVal) then
+            FLocals[j].ConstVal.Free;
+        SetLength(FLocals, 0);
         FTempCounter := 0;
        fn.ParamCount := Length(TAstFuncDecl(node).Params);
        fn.LocalCount := fn.ParamCount;
@@ -532,23 +504,18 @@ begin
            fn.ReturnStructSize := sd.Size;
          end;
        end;
-        SetLength(FLocalTypes, fn.LocalCount);
-        SetLength(FLocalConst, fn.LocalCount);
-        SetLength(FLocalIsStruct, fn.LocalCount);
-        SetLength(FLocalElemSize, fn.LocalCount);
-        SetLength(FLocalTypeNames, fn.LocalCount);
+        SetLength(FLocals, fn.LocalCount);
         for j := 0 to fn.ParamCount - 1 do
         begin
           FLocalMap.AddObject(TAstFuncDecl(node).Params[j].Name, IntToObj(j));
-          FLocalTypes[j] := TAstFuncDecl(node).Params[j].ParamType;
-          FLocalConst[j] := nil;
-          FLocalIsStruct[j] := False;
-          FLocalElemSize[j] := 0;
-          // Record type name for struct parameter field resolution
+          FLocals[j].VarType  := TAstFuncDecl(node).Params[j].ParamType;
+          FLocals[j].ConstVal := nil;
+          FLocals[j].IsStruct := False;
+          FLocals[j].ElemSize := 0;
           if TAstFuncDecl(node).Params[j].TypeName <> '' then
-            FLocalTypeNames[j] := TAstFuncDecl(node).Params[j].TypeName
+            FLocals[j].TypeName := TAstFuncDecl(node).Params[j].TypeName
           else
-            FLocalTypeNames[j] := '';
+            FLocals[j].TypeName := '';
         end;
 
        // lower statements sequentially
@@ -584,10 +551,10 @@ begin
         FCurrentFuncDecl := m;  // set current func decl for return type info
         FLocalMap.Clear;
         // Free old FLocalConst entries before resetting
-        for k := 0 to Length(FLocalConst) - 1 do
-          if Assigned(FLocalConst[k]) then
-            FLocalConst[k].Free;
-        SetLength(FLocalConst, 0);
+        for k := 0 to Length(FLocals) - 1 do
+          if Assigned(FLocals[k].ConstVal) then
+            FLocals[k].ConstVal.Free;
+        SetLength(FLocals, 0);
         FTempCounter := 0;
         
         if m.IsStatic then
@@ -595,18 +562,15 @@ begin
           // Static method: no implicit self parameter
           fn.ParamCount := Length(m.Params);
           fn.LocalCount := fn.ParamCount;
-          SetLength(FLocalTypes, fn.LocalCount);
-          SetLength(FLocalConst, fn.LocalCount);
-          SetLength(FLocalIsStruct, fn.LocalCount);
-          SetLength(FLocalElemSize, fn.LocalCount);
+          SetLength(FLocals, fn.LocalCount);
           // method parameters (no self)
           for k := 0 to High(m.Params) do
           begin
             FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
-            FLocalTypes[k] := m.Params[k].ParamType;
-            FLocalConst[k] := nil;
-            FLocalIsStruct[k] := False;
-            FLocalElemSize[k] := 0;
+            FLocals[k].VarType := m.Params[k].ParamType;
+            FLocals[k].ConstVal := nil;
+            FLocals[k].IsStruct := False;
+            FLocals[k].ElemSize := 0;
           end;
         end
         else
@@ -614,26 +578,23 @@ begin
           // Instance method: first param = self
           fn.ParamCount := Length(m.Params) + 1;
           fn.LocalCount := fn.ParamCount;
-          SetLength(FLocalTypes, fn.LocalCount);
-          SetLength(FLocalConst, fn.LocalCount);
-          SetLength(FLocalIsStruct, fn.LocalCount);
-          SetLength(FLocalElemSize, fn.LocalCount);
+          SetLength(FLocals, fn.LocalCount);
           // implicit self param at index 0
           // Note: self is a pointer to struct passed by caller, NOT a struct on stack
           // So we should NOT mark it as FLocalIsStruct - it's already an address
           FLocalMap.AddObject('self', IntToObj(0));
-          FLocalTypes[0] := atUnresolved;
-          FLocalConst[0] := nil;
-          FLocalIsStruct[0] := False; // self holds address, don't use LEA
-          FLocalElemSize[0] := 0;
+          FLocals[0].VarType := atUnresolved;
+          FLocals[0].ConstVal := nil;
+          FLocals[0].IsStruct := False; // self holds address, don't use LEA
+          FLocals[0].ElemSize := 0;
           // method parameters follow
           for k := 0 to High(m.Params) do
           begin
             FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
-            FLocalTypes[k+1] := m.Params[k].ParamType;
-            FLocalConst[k+1] := nil;
-            FLocalIsStruct[k+1] := False;
-            FLocalElemSize[k+1] := 0;
+            FLocals[k+1].VarType := m.Params[k].ParamType;
+            FLocals[k+1].ConstVal := nil;
+            FLocals[k+1].IsStruct := False;
+            FLocals[k+1].ElemSize := 0;
           end;
         end;
         
@@ -670,10 +631,10 @@ begin
         FCurrentFuncDecl := m;  // set current func decl for return type info
         FLocalMap.Clear;
         // Free old FLocalConst entries before resetting
-        for k := 0 to Length(FLocalConst) - 1 do
-          if Assigned(FLocalConst[k]) then
-            FLocalConst[k].Free;
-        SetLength(FLocalConst, 0);
+        for k := 0 to Length(FLocals) - 1 do
+          if Assigned(FLocals[k].ConstVal) then
+            FLocals[k].ConstVal.Free;
+        SetLength(FLocals, 0);
         FTempCounter := 0;
         
         if m.IsStatic then
@@ -681,18 +642,15 @@ begin
           // Static method: no implicit self parameter
           fn.ParamCount := Length(m.Params);
           fn.LocalCount := fn.ParamCount;
-          SetLength(FLocalTypes, fn.LocalCount);
-          SetLength(FLocalConst, fn.LocalCount);
-          SetLength(FLocalIsStruct, fn.LocalCount);
-          SetLength(FLocalElemSize, fn.LocalCount);
+          SetLength(FLocals, fn.LocalCount);
           // method parameters (no self)
           for k := 0 to High(m.Params) do
           begin
             FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
-            FLocalTypes[k] := m.Params[k].ParamType;
-            FLocalConst[k] := nil;
-            FLocalIsStruct[k] := False;
-            FLocalElemSize[k] := 0;
+            FLocals[k].VarType := m.Params[k].ParamType;
+            FLocals[k].ConstVal := nil;
+            FLocals[k].IsStruct := False;
+            FLocals[k].ElemSize := 0;
           end;
         end
         else
@@ -700,25 +658,22 @@ begin
           // Instance method: first param = self (pointer to class instance)
           fn.ParamCount := Length(m.Params) + 1;
           fn.LocalCount := fn.ParamCount;
-          SetLength(FLocalTypes, fn.LocalCount);
-          SetLength(FLocalConst, fn.LocalCount);
-          SetLength(FLocalIsStruct, fn.LocalCount);
-          SetLength(FLocalElemSize, fn.LocalCount);
+          SetLength(FLocals, fn.LocalCount);
           // implicit self param at index 0
           // For classes, self is a pointer (8 bytes), not a struct on stack
           FLocalMap.AddObject('self', IntToObj(0));
-          FLocalTypes[0] := atUnresolved;
-          FLocalConst[0] := nil;
-          FLocalIsStruct[0] := False; // self holds pointer address
-          FLocalElemSize[0] := 0;
+          FLocals[0].VarType := atUnresolved;
+          FLocals[0].ConstVal := nil;
+          FLocals[0].IsStruct := False; // self holds pointer address
+          FLocals[0].ElemSize := 0;
           // method parameters follow
           for k := 0 to High(m.Params) do
           begin
             FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
-            FLocalTypes[k+1] := m.Params[k].ParamType;
-            FLocalConst[k+1] := nil;
-            FLocalIsStruct[k+1] := False;
-            FLocalElemSize[k+1] := 0;
+            FLocals[k+1].VarType := m.Params[k].ParamType;
+            FLocals[k+1].ConstVal := nil;
+            FLocals[k+1].IsStruct := False;
+            FLocals[k+1].ElemSize := 0;
           end;
         end;
 
@@ -1007,59 +962,51 @@ begin
                 FCurrentFunc := fn;
                 FCurrentFuncDecl := m;
                 FLocalMap.Clear;
-                for k := 0 to Length(FLocalConst) - 1 do
-                  if Assigned(FLocalConst[k]) then
-                    FLocalConst[k].Free;
-                SetLength(FLocalConst, 0);
+                for k := 0 to Length(FLocals) - 1 do
+                  if Assigned(FLocals[k].ConstVal) then
+                    FLocals[k].ConstVal.Free;
+                SetLength(FLocals, 0);
                 FTempCounter := 0;
                 if m.IsStatic then
                 begin
                   fn.ParamCount := Length(m.Params);
                   fn.LocalCount := fn.ParamCount;
-                  SetLength(FLocalTypes, fn.LocalCount);
-                  SetLength(FLocalConst, fn.LocalCount);
-                  SetLength(FLocalIsStruct, fn.LocalCount);
-                  SetLength(FLocalElemSize, fn.LocalCount);
-                  SetLength(FLocalTypeNames, fn.LocalCount);
+                  SetLength(FLocals, fn.LocalCount);
                   for k := 0 to High(m.Params) do
                   begin
                     FLocalMap.AddObject(m.Params[k].Name, IntToObj(k));
-                    FLocalTypes[k] := m.Params[k].ParamType;
-                    FLocalConst[k] := nil;
-                    FLocalIsStruct[k] := False;
-                    FLocalElemSize[k] := 0;
+                    FLocals[k].VarType := m.Params[k].ParamType;
+                    FLocals[k].ConstVal := nil;
+                    FLocals[k].IsStruct := False;
+                    FLocals[k].ElemSize := 0;
                     if m.Params[k].TypeName <> '' then
-                      FLocalTypeNames[k] := m.Params[k].TypeName
+                      FLocals[k].TypeName := m.Params[k].TypeName
                     else
-                      FLocalTypeNames[k] := '';
+                      FLocals[k].TypeName := '';
                   end;
                 end
                 else
                 begin
                   fn.ParamCount := Length(m.Params) + 1;
                   fn.LocalCount := fn.ParamCount;
-                  SetLength(FLocalTypes, fn.LocalCount);
-                  SetLength(FLocalConst, fn.LocalCount);
-                  SetLength(FLocalIsStruct, fn.LocalCount);
-                  SetLength(FLocalElemSize, fn.LocalCount);
-                  SetLength(FLocalTypeNames, fn.LocalCount);
+                  SetLength(FLocals, fn.LocalCount);
                   FLocalMap.AddObject('self', IntToObj(0));
-                  FLocalTypes[0] := atUnresolved;
-                  FLocalConst[0] := nil;
-                  FLocalIsStruct[0] := False;
-                  FLocalElemSize[0] := 0;
-                  FLocalTypeNames[0] := TAstClassDecl(node).Name;  // 'self' = current class
+                  FLocals[0].VarType := atUnresolved;
+                  FLocals[0].ConstVal := nil;
+                  FLocals[0].IsStruct := False;
+                  FLocals[0].ElemSize := 0;
+                  FLocals[0].TypeName := TAstClassDecl(node).Name;  // 'self' = current class
                   for k := 0 to High(m.Params) do
                   begin
                     FLocalMap.AddObject(m.Params[k].Name, IntToObj(k+1));
-                    FLocalTypes[k+1] := m.Params[k].ParamType;
-                    FLocalConst[k+1] := nil;
-                    FLocalIsStruct[k+1] := False;
-                    FLocalElemSize[k+1] := 0;
+                    FLocals[k+1].VarType := m.Params[k].ParamType;
+                    FLocals[k+1].ConstVal := nil;
+                    FLocals[k+1].IsStruct := False;
+                    FLocals[k+1].ElemSize := 0;
                     if m.Params[k].TypeName <> '' then
-                      FLocalTypeNames[k+1] := m.Params[k].TypeName
+                      FLocals[k+1].TypeName := m.Params[k].TypeName
                     else
-                      FLocalTypeNames[k+1] := '';
+                      FLocals[k+1].TypeName := '';
                   end;
                 end;
                 if m.IsAbstract then
@@ -1187,31 +1134,27 @@ begin
               FCurrentFuncDecl := TAstFuncDecl(node);
               FLocalMap.Clear;
               // Free old FLocalConst entries before resetting
-              for k := 0 to Length(FLocalConst) - 1 do
-                if Assigned(FLocalConst[k]) then
-                  FLocalConst[k].Free;
-              SetLength(FLocalConst, 0);
+              for k := 0 to Length(FLocals) - 1 do
+                if Assigned(FLocals[k].ConstVal) then
+                  FLocals[k].ConstVal.Free;
+              SetLength(FLocals, 0);
               FTempCounter := 0;
               fn.ParamCount := Length(TAstFuncDecl(node).Params);
               fn.LocalCount := fn.ParamCount;
-              SetLength(FLocalTypes, fn.LocalCount);
-              SetLength(FLocalConst, fn.LocalCount);
-              SetLength(FLocalIsStruct, fn.LocalCount);
-              SetLength(FLocalElemSize, fn.LocalCount);
-              SetLength(FLocalTypeNames, fn.LocalCount);
+              SetLength(FLocals, fn.LocalCount);
 
               for k := 0 to fn.ParamCount - 1 do
               begin
                 FLocalMap.AddObject(TAstFuncDecl(node).Params[k].Name, IntToObj(k));
-                FLocalTypes[k] := TAstFuncDecl(node).Params[k].ParamType;
-                FLocalConst[k] := nil;
-                FLocalIsStruct[k] := False;
-                FLocalElemSize[k] := 0;
+                FLocals[k].VarType := TAstFuncDecl(node).Params[k].ParamType;
+                FLocals[k].ConstVal := nil;
+                FLocals[k].IsStruct := False;
+                FLocals[k].ElemSize := 0;
                 // Record class type name for method-call resolution on class-typed params
                 if TAstFuncDecl(node).Params[k].TypeName <> '' then
-                  FLocalTypeNames[k] := TAstFuncDecl(node).Params[k].TypeName
+                  FLocals[k].TypeName := TAstFuncDecl(node).Params[k].TypeName
                 else
-                  FLocalTypeNames[k] := '';
+                  FLocals[k].TypeName := '';
               end;
 
               // Calculate ReturnStructSize so the backend generates correct sret prologue
@@ -1421,10 +1364,10 @@ begin
             begin
               baseLoc := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
                                         Length(arrLit.Items));
-              SetLength(FLocalArrayLen, baseLoc + Length(arrLit.Items));
+              SetLength(FLocals, baseLoc + Length(arrLit.Items));
               for j := 0 to High(arrLit.Items) do
               begin
-                FLocalArrayLen[baseLoc + j] := Length(arrLit.Items);
+                FLocals[baseLoc + j].ArrayLen := Length(arrLit.Items);
                 elemTemp := LowerExpr(arrLit.Items[j]);
                 if elemTemp >= 0 then
                 begin
@@ -1550,10 +1493,10 @@ begin
   baseLoc := AllocLocalMany('_arraylit_' + IntToStr(FTempCounter), atUnresolved, arrLen);
 
   // Record array length for bounds checking
-  if baseLoc + arrLen > Length(FLocalArrayLen) then
-    SetLength(FLocalArrayLen, baseLoc + arrLen);
+  if baseLoc + arrLen > Length(FLocals) then
+    SetLength(FLocals, baseLoc + arrLen);
   for i := 0 to arrLen - 1 do
-    FLocalArrayLen[baseLoc + i] := arrLen;
+    FLocals[baseLoc + i].ArrayLen := arrLen;
 
   // Store elements in REVERSE order: arr[0] at highest slot (baseLoc + arrLen - 1 - i)
   for i := 0 to High(items) do
@@ -1602,10 +1545,10 @@ begin
     FCurrentFunc := fn;
     FCurrentFuncDecl := funcDecl;
     FLocalMap.Clear;
-    for j := 0 to Length(FLocalConst) - 1 do
-      if Assigned(FLocalConst[j]) then
-        FLocalConst[j].Free;
-    SetLength(FLocalConst, 0);
+    for j := 0 to Length(FLocals) - 1 do
+      if Assigned(FLocals[j].ConstVal) then
+        FLocals[j].ConstVal.Free;
+    SetLength(FLocals, 0);
     FTempCounter := 0;
 
     // Copy closure info from AST to IR
@@ -1617,28 +1560,26 @@ begin
     begin
       fn.ParamCount := Length(funcDecl.Params) + 1; // +1 for static link
       fn.LocalCount := fn.ParamCount;
-      SetLength(FLocalTypes, fn.LocalCount);
-      SetLength(FLocalConst, fn.LocalCount);
+      SetLength(FLocals, fn.LocalCount);
       // Slot 0 = static link pointer (parent RBP)
       // Slots 1..N = regular params
       FLocalMap.AddObject('__static_link__', IntToObj(0));
-      FLocalTypes[0] := atInt64;
-      FLocalConst[0] := nil;
+      FLocals[0].VarType := atInt64;
+      FLocals[0].ConstVal := nil;
       for j := 0 to High(funcDecl.Params) do
       begin
         FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j + 1));
-        FLocalTypes[j + 1] := funcDecl.Params[j].ParamType;
-        FLocalConst[j + 1] := nil;
+        FLocals[j + 1].VarType := funcDecl.Params[j].ParamType;
+        FLocals[j + 1].ConstVal := nil;
       end;
       // Register captured vars by name — they will be loaded via irLoadCaptured
       for j := 0 to High(funcDecl.CapturedVars) do
       begin
         captureSlot := fn.LocalCount;
         Inc(fn.LocalCount);
-        SetLength(FLocalTypes, fn.LocalCount);
-        SetLength(FLocalConst, fn.LocalCount);
-        FLocalTypes[captureSlot] := funcDecl.CapturedVars[j].VarType;
-        FLocalConst[captureSlot] := nil;
+        SetLength(FLocals, fn.LocalCount);
+        FLocals[captureSlot].VarType := funcDecl.CapturedVars[j].VarType;
+        FLocals[captureSlot].ConstVal := nil;
         // Register: name -> special marker slot (captured vars use irLoadCaptured)
         FLocalMap.AddObject(funcDecl.CapturedVars[j].Name, IntToObj(-100 - j));
       end;
@@ -1650,8 +1591,8 @@ begin
       for j := 0 to fn.ParamCount - 1 do
       begin
         FLocalMap.AddObject(funcDecl.Params[j].Name, IntToObj(j));
-        FLocalTypes[j] := funcDecl.Params[j].ParamType;
-        FLocalConst[j] := nil;
+        FLocals[j].VarType := funcDecl.Params[j].ParamType;
+        FLocals[j].ConstVal := nil;
       end;
     end;
 
@@ -1767,10 +1708,10 @@ begin
             begin
               dynBase := AllocLocalMany('_dynfld_' + IntToStr(FTempCounter), atUnresolved,
                                         Length(arrLit.Items));
-              SetLength(FLocalArrayLen, dynBase + Length(arrLit.Items));
+              SetLength(FLocals, dynBase + Length(arrLit.Items));
               for j := 0 to High(arrLit.Items) do
               begin
-                FLocalArrayLen[dynBase + j] := Length(arrLit.Items);
+                FLocals[dynBase + j].ArrayLen := Length(arrLit.Items);
                 elemTemp := LowerExpr(arrLit.Items[j]);
                 if elemTemp >= 0 then
                 begin
@@ -1886,11 +1827,11 @@ begin
   begin
     loc := ObjToInt(FLocalMap.Objects[i]);
     if loc < 0 then Continue;
-    if loc >= Length(FLocalTypes) then Continue;
-    ltype := FLocalTypes[loc];
+    if loc >= Length(FLocals) then Continue;
+    ltype := FLocals[loc].VarType;
     typeName := '';
-    if loc < Length(FLocalTypeNames) then
-      typeName := FLocalTypeNames[loc];
+    if loc < Length(FLocals) then
+      typeName := FLocals[loc].TypeName;
 
     // Case 1: local Map variable — nil-guarded irMapFree + zero-out
     if ltype = atMap then
@@ -1928,7 +1869,7 @@ begin
       sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
       if Length(sd.FieldOffsets) < Length(sd.Fields) then Continue;
       slotCnt := 0;
-      if loc < Length(FLocalSlotCount) then slotCnt := FLocalSlotCount[loc];
+      if loc < Length(FLocals) then slotCnt := FLocals[loc].SlotCount;
       if slotCnt < 1 then slotCnt := (sd.Size + 7) div 8;
       if slotCnt < 1 then slotCnt := 1;
       addrTemp := -1;
@@ -2079,9 +2020,9 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           // Mark as NOT dynamic array - elements are stored inline.
           loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
           // Record array length for bounds checking
-          SetLength(FLocalArrayLen, loc + arrLen);
+          SetLength(FLocals, loc + arrLen);
           for i := 0 to arrLen - 1 do
-            FLocalArrayLen[loc + i] := arrLen;
+            FLocals[loc + i].ArrayLen := arrLen;
            if vd.InitExpr is TAstArrayLit then
           begin
             items := TAstArrayLit(vd.InitExpr).Items;
@@ -2111,8 +2052,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         // dynamic array: fat-pointer with 3 slots (ptr, len, cap)
         loc := AllocLocalMany(vd.Name, atPChar, 3);
         // mark base slot as dynamic array
-        if loc >= Length(FLocalIsDynArray) then SetLength(FLocalIsDynArray, loc + 3);
-        FLocalIsDynArray[loc] := True;
+        if loc >= Length(FLocals) then SetLength(FLocals, loc + 3);
+        FLocals[loc].IsDynArray := True;
         // record element size for this local slot (needed by backend for element addressing)
           begin
             elemSize := 8; // default
@@ -2126,8 +2067,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             else
               elemSize := 8; // conservative default
             end;
-            if loc >= Length(FLocalElemSize) then SetLength(FLocalElemSize, loc+1);
-            FLocalElemSize[loc] := elemSize;
+            if loc >= Length(FLocals) then SetLength(FLocals, loc+1);
+            FLocals[loc].ElemSize := elemSize;
           end;
 
         // initializer: if empty array literal -> set nil (0)
@@ -2173,8 +2114,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
             atInt64, atUInt64, atF64: elemSize := 8;
           end;
         end;
-        if loc >= Length(FLocalElemSize) then SetLength(FLocalElemSize, loc + 1);
-        FLocalElemSize[loc] := elemSize;
+        if loc >= Length(FLocals) then SetLength(FLocals, loc + 1);
+        FLocals[loc].ElemSize := elemSize;
         Exit(True);
       end
       else if (vd.DeclTypeName <> '') and
@@ -2186,8 +2127,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         loc := AllocLocal(vd.Name, vd.DeclType);
         
         // Record the class name for VMT lookup
-        if loc < Length(FLocalTypeNames) then
-          FLocalTypeNames[loc] := vd.DeclTypeName;
+        if loc < Length(FLocals) then
+          FLocals[loc].TypeName := vd.DeclTypeName;
         
         // Initialize with new expression if present
         if Assigned(vd.InitExpr) then
@@ -2229,8 +2170,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         loc := AllocLocalMany(vd.Name, vd.DeclType, structSlots, True);
         // Record the struct type name so field assignments can resolve offsets
         // for imported function bodies where sema hasn't annotated FieldOffset.
-        if loc < Length(FLocalTypeNames) then
-          FLocalTypeNames[loc] := vd.DeclTypeName;
+        if loc < Length(FLocals) then
+          FLocals[loc].TypeName := vd.DeclTypeName;
 
         // Initialize with struct literal if present
         if vd.InitExpr is TAstStructLit then
@@ -2291,9 +2232,9 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         begin
           loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
           // Record array length for this local
-          SetLength(FLocalArrayLen, loc + arrLen);
+          SetLength(FLocals, loc + arrLen);
           for i := 0 to arrLen - 1 do
-            FLocalArrayLen[loc + i] := arrLen;
+            FLocals[loc + i].ArrayLen := arrLen;
           // Initialize with initializer if present
           if vd.InitExpr is TAstArrayLit then
           begin
@@ -2335,9 +2276,9 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         if arrLen > 0 then
         begin
           loc := AllocLocalMany(vd.Name, vd.DeclType, arrLen);
-          SetLength(FLocalArrayLen, loc + arrLen);
+          SetLength(FLocals, loc + arrLen);
           for i := 0 to arrLen - 1 do
-            FLocalArrayLen[loc + i] := arrLen;
+            FLocals[loc + i].ArrayLen := arrLen;
           if vd.InitExpr is TAstArrayLit then
           begin
             items := TAstArrayLit(vd.InitExpr).Items;
@@ -2426,8 +2367,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         // scalar local
        loc := AllocLocal(vd.Name, SubstType(vd.DeclType, vd.DeclTypeName));
        // Store type name so range checks can be emitted at assignment sites
-       if (vd.DeclTypeName <> '') and (loc < Length(FLocalTypeNames)) then
-         FLocalTypeNames[loc] := vd.DeclTypeName;
+       if (vd.DeclTypeName <> '') and (loc < Length(FLocals)) then
+         FLocals[loc].TypeName := vd.DeclTypeName;
        // Bootstrap compat: if initializer is a cast to a class (e.g. var cfg: int64 := obj as CompilerConfig),
        // record the cast target class name so method calls can be resolved via _L_ClassName_MethodName.
        if Assigned(vd.InitExpr) and (vd.InitExpr is TAstCast) then
@@ -2435,8 +2376,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
          if (TAstCast(vd.InitExpr).CastTypeName <> '') and
             (FClassTypes.IndexOf(TAstCast(vd.InitExpr).CastTypeName) >= 0) then
          begin
-           if loc >= Length(FLocalTypeNames) then SetLength(FLocalTypeNames, loc + 1);
-           FLocalTypeNames[loc] := TAstCast(vd.InitExpr).CastTypeName;
+           if loc >= Length(FLocals) then SetLength(FLocals, loc + 1);
+           FLocals[loc].TypeName := TAstCast(vd.InitExpr).CastTypeName;
          end;
        end;
        // If initializer is constant integer and the local has narrower signed width, constant fold
@@ -2468,8 +2409,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
              cvLocal := TConstValue.Create;
              cvLocal.IsStr := False;
              cvLocal.IntVal := signedVal;
-             if loc >= Length(FLocalConst) then SetLength(FLocalConst, loc+1);
-             FLocalConst[loc] := cvLocal;
+             if loc >= Length(FLocals) then SetLength(FLocals, loc+1);
+             FLocals[loc].ConstVal := cvLocal;
            end
            else
            begin
@@ -2477,8 +2418,8 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
              cvLocal := TConstValue.Create;
              cvLocal.IsStr := False;
              cvLocal.IntVal := Int64(truncated);
-             if loc >= Length(FLocalConst) then SetLength(FLocalConst, loc+1);
-             FLocalConst[loc] := cvLocal;
+             if loc >= Length(FLocals) then SetLength(FLocals, loc+1);
+             FLocals[loc].ConstVal := cvLocal;
            end;
            Exit(True);
          end;
@@ -2548,18 +2489,18 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         Exit(False);
       end;
       // invalidate any const-folded value for this local
-      if (loc < Length(FLocalConst)) and Assigned(FLocalConst[loc]) then
+      if (loc < Length(FLocals)) and Assigned(FLocals[loc].ConstVal) then
       begin
-        FLocalConst[loc].Free;
-        FLocalConst[loc] := nil;
+        FLocals[loc].ConstVal.Free;
+        FLocals[loc].ConstVal := nil;
       end;
       // Special case: assigning a struct-returning function call to a struct local
       // Must use irCallStruct (sret ABI) instead of irCall (scalar RAX return)
       if (TAstAssign(stmt).Value is TAstCall) and
-         (loc < Length(FLocalIsStruct)) and FLocalIsStruct[loc] and
-         (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+         (loc < Length(FLocals)) and FLocals[loc].IsStruct and
+         (loc < Length(FLocals)) and (FLocals[loc].TypeName <> '') then
       begin
-        structIdx := FStructTypes.IndexOf(FLocalTypeNames[loc]);
+        structIdx := FStructTypes.IndexOf(FLocals[loc].TypeName);
         if structIdx >= 0 then
         begin
           sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
@@ -2601,13 +2542,13 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         tmp := instr.Dest;
       end;
       // Emit runtime range check for range-typed local (aerospace-todo P1 #7)
-      if Assigned(FRangeTypes) and (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
+      if Assigned(FRangeTypes) and (loc < Length(FLocals)) and (FLocals[loc].TypeName <> '') then
       begin
-        rtIdx2 := FRangeTypes.IndexOf(FLocalTypeNames[loc]);
+        rtIdx2 := FRangeTypes.IndexOf(FLocals[loc].TypeName);
         if rtIdx2 >= 0 then
         begin
           rtDecl2 := TAstTypeDecl(FRangeTypes.Objects[rtIdx2]);
-          EmitRangeCheck(tmp, rtDecl2.RangeMin, rtDecl2.RangeMax, FLocalTypeNames[loc], stmt.Span);
+          EmitRangeCheck(tmp, rtDecl2.RangeMin, rtDecl2.RangeMax, FLocals[loc].TypeName, stmt.Span);
         end;
       end;
       // Utype range enforcement on assignment
@@ -2659,10 +2600,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         if (baseExpr is TAstIdent) then
         begin
           i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
-          if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
-             (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+          if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocals)) and
+             (FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName <> '') then
           begin
-            structIdx := FStructTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+            structIdx := FStructTypes.IndexOf(FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName);
             if structIdx >= 0 then
             begin
               sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
@@ -2688,10 +2629,10 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           if (baseExpr is TAstIdent) and (TAstIdent(baseExpr).Name <> 'self') then
           begin
             i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
-            if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
-               (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+            if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocals)) and
+               (FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName <> '') then
             begin
-              j := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+              j := FClassTypes.IndexOf(FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName);
               if j >= 0 then
                 cd := TAstClassDecl(FClassTypes.Objects[j]);
             end;
@@ -3153,12 +3094,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
         if (TAstReturn(stmt).Value is TAstIdent) then
         begin
           loc := ResolveLocal(TAstIdent(TAstReturn(stmt).Value).Name);
-          if (loc >= 0) and (loc < Length(FLocalIsStruct)) and FLocalIsStruct[loc] then
+          if (loc >= 0) and (loc < Length(FLocals)) and FLocals[loc].IsStruct then
           begin
             // Get struct slot count
             slotCount := 1;
-            if loc < Length(FLocalSlotCount) then
-              slotCount := FLocalSlotCount[loc];
+            if loc < Length(FLocals) then
+              slotCount := FLocals[loc].SlotCount;
             if slotCount < 1 then slotCount := 1;
 
             // Struct return: use irReturnStruct with base local slot

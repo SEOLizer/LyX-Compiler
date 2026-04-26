@@ -258,9 +258,9 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         else
         begin
           // Check for const-folded local
-          if (loc < Length(FLocalConst)) and Assigned(FLocalConst[loc]) then
+          if (loc < Length(FLocals)) and Assigned(FLocals[loc].ConstVal) then
           begin
-            cv := FLocalConst[loc];
+            cv := FLocals[loc].ConstVal;
             t0 := NewTemp;
             instr.Op := irConstInt;
             instr.Dest := t0;
@@ -271,13 +271,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           else
           begin
             // Check if this local is a struct - if so, load address instead of value
-            if (loc < Length(FLocalIsStruct)) and FLocalIsStruct[loc] then
+            if (loc < Length(FLocals)) and FLocals[loc].IsStruct then
             begin
               // Struct local: load base address for field access
               // Need to know struct size to calculate correct base address
               slotCount := 1;
-              if loc < Length(FLocalSlotCount) then
-                slotCount := FLocalSlotCount[loc];
+              if loc < Length(FLocals) then
+                slotCount := FLocals[loc].SlotCount;
               if slotCount < 1 then slotCount := 1;
               
               t0 := NewTemp;
@@ -1992,8 +1992,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
               mangled := '';
               if (call.Namespace = 'self') and Assigned(FCurrentClassDecl) then
                 mangled := '_L_' + FCurrentClassDecl.Name + '_' + call.Name
-              else if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
-                mangled := '_L_' + FLocalTypeNames[loc] + '_' + call.Name;
+              else if (loc < Length(FLocals)) and (FLocals[loc].TypeName <> '') then
+                mangled := '_L_' + FLocals[loc].TypeName + '_' + call.Name;
               if mangled <> '' then
               begin
                 // Load receiver
@@ -2304,8 +2304,8 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
                     if loc >= 0 then
                     begin
                       // Check FLocalTypeNames for class types
-                      if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
-                        vmtClassName := FLocalTypeNames[loc];
+                      if (loc < Length(FLocals)) and (FLocals[loc].TypeName <> '') then
+                        vmtClassName := FLocals[loc].TypeName;
                     end;
                   end;
                 end;
@@ -2632,7 +2632,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             begin
               // Check if this is a dynamic array (fat-pointer)
               arrLen := GetLocalArrayLen(loc);
-              if (loc < Length(FLocalIsDynArray)) and FLocalIsDynArray[loc] then
+              if (loc < Length(FLocals)) and FLocals[loc].IsDynArray then
               begin
                 // Dynamic array: ptr is stored in slot loc, load it as base address
                 t1 := NewTemp;
@@ -3013,10 +3013,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             begin
               // Named local variable: look up its class type
               i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
-              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
-                 (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocals)) and
+                 (FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName <> '') then
               begin
-                idx := FClassTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+                idx := FClassTypes.IndexOf(FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName);
                 if idx >= 0 then
                   cd := TAstClassDecl(FClassTypes.Objects[idx]);
               end;
@@ -3026,10 +3026,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             if (cd = nil) and (baseExpr is TAstIdent) then
             begin
               i := FLocalMap.IndexOf(TAstIdent(baseExpr).Name);
-              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocalTypeNames)) and
-                 (FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])] <> '') then
+              if (i >= 0) and (ObjToInt(FLocalMap.Objects[i]) < Length(FLocals)) and
+                 (FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName <> '') then
               begin
-                structIdx := FStructTypes.IndexOf(FLocalTypeNames[ObjToInt(FLocalMap.Objects[i])]);
+                structIdx := FStructTypes.IndexOf(FLocals[ObjToInt(FLocalMap.Objects[i])].TypeName);
                 if structIdx >= 0 then
                 begin
                   sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
