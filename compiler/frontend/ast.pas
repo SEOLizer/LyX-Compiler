@@ -510,6 +510,8 @@ type
     FCastType: TAurumType;
     FCastTypeName: string;  // Type name for resolution in sema
     FIsFunctionToPointer: Boolean;  // True if casting function to pointer (returns address)
+    FIsUnitConversion: Boolean;     // True if this is a same-dimension unit conversion (e.g. km as m)
+    FUnitConvFactor: Double;        // Conversion factor: source.factor / target.factor
   public
     constructor Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
     destructor Destroy; override;
@@ -517,6 +519,8 @@ type
     property CastType: TAurumType read FCastType write FCastType;
     property CastTypeName: string read FCastTypeName write FCastTypeName;
     property IsFunctionToPointer: Boolean read FIsFunctionToPointer write FIsFunctionToPointer;
+    property IsUnitConversion: Boolean read FIsUnitConversion write FIsUnitConversion;
+    property UnitConvFactor: Double read FUnitConvFactor write FUnitConvFactor;
   end;
 
   { Function Pointer Type: fn(param1, param2) -> returnType }

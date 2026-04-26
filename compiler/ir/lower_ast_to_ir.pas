@@ -4200,6 +4200,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         rType := TAstCast(expr).CastType;
         castTypeName := TAstCast(expr).CastTypeName;
 
+        // Unit type conversion: value * (srcFactor / tgtFactor)
+        if TAstCast(expr).IsUnitConversion then
+        begin
+          t0 := NewTemp;
+          t2 := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op       := irConstFloat;
+          instr.Dest     := t2;
+          instr.ImmFloat := TAstCast(expr).UnitConvFactor;
+          Emit(instr);
+          instr := Default(TIRInstr);
+          instr.Op   := irFMul;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.Src2 := t2;
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
+
         t0 := NewTemp;
 
         // Check for class cast (target is a class name)

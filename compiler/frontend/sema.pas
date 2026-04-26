@@ -2564,6 +2564,10 @@ var
   newExpr: TAstNewExpr;
   castTypeName: string;
   targetClassName: string;
+  srcUnitTag, srcDim, tgtDim: string;
+  srcUd, tgtUd: TAstUtypeDecl;
+  utypeIdx: Integer;
+  srcFactor, tgtFactor: Double;
   compiledRegex: string;
   captureSlots: Integer;
   typeName: string;
@@ -2909,7 +2913,49 @@ begin
 
         // Resolve the target type from the type name
         castTypeName := TAstCast(expr).CastTypeName;
-        
+
+        // Unit type conversion: e.g. dist as m  (same dimension only)
+        if Assigned(FUnitTypes) and (FUnitTypes.IndexOf(castTypeName) >= 0) then
+        begin
+          srcUnitTag := TAstCast(expr).Expr.UnitTag;
+          srcDim     := GetDimForUnitTag(srcUnitTag);
+          tgtDim     := GetDimForUnitTag(castTypeName);
+          if (srcDim = '') or (tgtDim = '') then
+            FDiag.Error(Format('unit conversion requires a dimensioned operand; got "%s"',
+              [srcUnitTag]), expr.Span)
+          else if srcDim <> tgtDim then
+            FDiag.Error(Format('cannot convert "%s" (%s) to "%s" (%s): incompatible dimensions',
+              [srcUnitTag, srcDim, castTypeName, tgtDim]), expr.Span)
+          else
+          begin
+            // Look up source factor
+            srcFactor := 1.0;
+            utypeIdx := FUnitTypes.IndexOf(srcUnitTag);
+            if utypeIdx >= 0 then
+            begin
+              srcUd := TAstUtypeDecl(FUnitTypes.Objects[utypeIdx]);
+              if Assigned(srcUd) then
+                srcFactor := srcUd.Factor;
+            end;
+            // Look up target factor
+            tgtFactor := 1.0;
+            utypeIdx := FUnitTypes.IndexOf(castTypeName);
+            if utypeIdx >= 0 then
+            begin
+              tgtUd := TAstUtypeDecl(FUnitTypes.Objects[utypeIdx]);
+              if Assigned(tgtUd) then
+                tgtFactor := tgtUd.Factor;
+            end;
+            TAstCast(expr).CastType          := atF64;
+            TAstCast(expr).IsUnitConversion  := True;
+            TAstCast(expr).UnitConvFactor    := srcFactor / tgtFactor;
+            expr.UnitTag                     := castTypeName;
+            Result                           := atF64;
+            expr.ResolvedType                := Result;
+            Exit;
+          end;
+        end;
+
         // Special case: function to int64 cast (for function pointers)
         // This returns the function address, not the return value
         if (srcType = atFnPtr) and (castTypeName = 'int64') then
@@ -4510,6 +4556,12 @@ begin
             s := TSymbol.Create(fn.Params[i].Name);
             s.Kind := symVar;
             s.DeclType := fn.Params[i].ParamType;
+            if Assigned(FUnitTypes) and (fn.Params[i].TypeName <> '') and
+               (FUnitTypes.IndexOf(fn.Params[i].TypeName) >= 0) then
+            begin
+              s.DeclType := atF64;
+              s.UnitTag  := fn.Params[i].TypeName;
+            end;
             AddSymbolToCurrent(s, fn.Params[i].Span);
           end;
           // Analyze body (triggers capture detection in CheckExpr)
@@ -6560,7 +6612,13 @@ begin
             sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx])
           // If it's an enum type, resolve to int64
           else if Assigned(FEnumTypes) and (FEnumTypes.IndexOf(sym.TypeName) >= 0) then
-            sym.DeclType := atInt64;
+            sym.DeclType := atInt64
+          // If it's a utype, resolve to f64 and set unit tag
+          else if Assigned(FUnitTypes) and (FUnitTypes.IndexOf(sym.TypeName) >= 0) then
+          begin
+            sym.DeclType := atF64;
+            sym.UnitTag  := sym.TypeName;
+          end;
         end;
         AddSymbolToCurrent(sym, fn.Params[j].Span);
       end;
