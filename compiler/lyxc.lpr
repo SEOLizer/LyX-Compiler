@@ -566,7 +566,7 @@ begin
     // TOR-001: Handle --version
   if (ParamCount = 1) and (ParamStr(1) = '--version') then
   begin
-    WriteLn('lyxc 0.8.3-aerospace');
+    WriteLn('lyxc 0.8.4-aerospace');
     WriteLn('DO-178C TQL-5 Qualified Compiler');
     WriteLn('Target Platforms: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, macOS ARM64, ESP32');
     Halt(0);
@@ -577,7 +577,7 @@ begin
   begin
     WriteLn('Lyx Compiler Build Information');
     WriteLn('================================');
-    WriteLn('Version:         0.8.3-aerospace');
+    WriteLn('Version:         0.8.4-aerospace');
     WriteLn('TQL Level:       TQL-5 (DO-178C Section 12.2)');
     WriteLn('Build Host:      ', GetEnvironmentVariable('HOSTNAME'));
     WriteLn('Build OS:        ', {$IFDEF LINUX}'Linux'{$ELSE}{$IFDEF WINDOWS}'Windows'{$ELSE}'Unknown'{$ENDIF}{$ENDIF});
@@ -620,7 +620,7 @@ begin
 
   if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.8.3-aerospace');
+    WriteLn(StdErr, 'Lyx Compiler v0.8.4-aerospace');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -975,7 +975,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.8.3-aerospace');
+  WriteLn('Lyx Compiler v0.8.4-aerospace');
   WriteLn('DO-178C TQL-5 Qualified');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
