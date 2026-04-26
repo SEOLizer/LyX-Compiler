@@ -570,33 +570,62 @@ end;
 
 function TIROptimizer.EliminateCommonSubexpr(func: TIRFunction): Boolean;
 var
-  i: Integer;
+  i, j, k: Integer;
   instr: TIRInstr;
   sig: string;
   redundantIdx: Integer;
+  prevDest, curDest: Integer;
+  newLen: Integer;
 begin
   Result := False;
   if not Assigned(func) or not Assigned(func.Instructions) then Exit;
-  
+
   for i := 0 to High(func.Instructions) do
   begin
     instr := func.Instructions[i];
     sig := GetInstructionSignature(instr);
-    
+
     if sig <> '' then
     begin
       redundantIdx := FindRedundantInstruction(func, sig, i);
       if redundantIdx >= 0 then
       begin
-        // Replace with move from redundant instruction's dest
-        func.Instructions[i].Op := irAdd;  // Will be replaced
-        func.Instructions[i].Src2 := -1;   // Mark as copy
-        // Use the result from redundant instruction
-        func.Instructions[i].Src1 := func.Instructions[redundantIdx].Dest;
+        prevDest := func.Instructions[redundantIdx].Dest;
+        curDest  := func.Instructions[i].Dest;
+
+        // Rewrite all forward uses of curDest to prevDest in-place
+        for j := i + 1 to High(func.Instructions) do
+        begin
+          if func.Instructions[j].Src1 = curDest then
+            func.Instructions[j].Src1 := prevDest;
+          if func.Instructions[j].Src2 = curDest then
+            func.Instructions[j].Src2 := prevDest;
+          if func.Instructions[j].Src3 = curDest then
+            func.Instructions[j].Src3 := prevDest;
+          for k := 0 to High(func.Instructions[j].ArgTemps) do
+            if func.Instructions[j].ArgTemps[k] = curDest then
+              func.Instructions[j].ArgTemps[k] := prevDest;
+        end;
+
+        // NOP the now-redundant instruction; DCE will compact
+        func.Instructions[i].Op := irInvalid;
         Result := True;
         SetChanged;
       end;
     end;
+  end;
+
+  // Compact: remove all irInvalid instructions produced above
+  if Result then
+  begin
+    newLen := 0;
+    for i := 0 to High(func.Instructions) do
+      if func.Instructions[i].Op <> irInvalid then
+      begin
+        func.Instructions[newLen] := func.Instructions[i];
+        Inc(newLen);
+      end;
+    SetLength(func.Instructions, newLen);
   end;
 end;
 
@@ -636,24 +665,11 @@ begin
   begin
     instr := func.Instructions[i];
     
-    // Erkenne Kopien: add dest, src1, 0 (oder ähnlich)
-    if (instr.Op = irAdd) and (instr.Src2 < 0) then
+    // Alle Definitionen brechen die Kopiekette für dieses Dest
+    if instr.Dest >= 0 then
     begin
-      // src2 ist -1, also ist das eine Kopie: dest := src1
-      if (instr.Src1 >= 0) and (instr.Dest >= 0) then
-      begin
-        if instr.Dest < Length(copySrc) then
-          copySrc[instr.Dest] := instr.Src1;
-      end;
-    end
-    else
-    begin
-      // Andere Operationen brechen die Kopiekette
-      if instr.Dest >= 0 then
-      begin
-        if instr.Dest < Length(copySrc) then
-          copySrc[instr.Dest] := -1;
-      end;
+      if instr.Dest < Length(copySrc) then
+        copySrc[instr.Dest] := -1;
     end;
     
     // Propagiere Kopien in nachfolgenden Instruktionen
