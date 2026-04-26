@@ -1,4 +1,4 @@
-# Lyx v0.8.3 – Sprachspezifikation
+# Lyx v0.8.4 – Sprachspezifikation
 
 Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
 
@@ -31,7 +31,9 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for do repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract`
+`fn var let co con if else while for do repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype`
+
+> `wraps` und `range` sind **Soft-Keywords**: Sie werden nur in `utype`-Deklarationen nach dem Konversionsfaktor erkannt und dürfen als normale Bezeichner verwendet werden.
 
 > `const` ist ein Alias für `con` (legacy-Kompatibilität).  
 > `pub` ist ein Alias für das interne `public`-Token.
@@ -98,6 +100,8 @@ TopDecl      = ConDecl
              | EnumDecl
              | ExternFnDecl
              | ImportDecl
+             | DimDecl
+             | UtypeDecl
              ;
 
 ImportDecl   = "import" DotPath ";" ;
@@ -289,6 +293,133 @@ type Altitude = int64 range -1000..60000;
 @dal(A) @critical @wcet(50)
 fn set_target_altitude(alt: int64): int64 {
   return 0;
+}
+```
+
+## Dimensionale Analyse / Unit-Typen (v0.8.4 ✅ ABGESCHLOSSEN)
+
+Compile-Zeit Einheitensicherheit für physikalische Größen: Dimensionsfehler (z. B. `km + s`) werden zur Compile-Zeit erkannt. Unit-Typen kompilieren zu `f64` ohne Laufzeit-Overhead.
+
+### EBNF
+
+```ebnf
+(* Dimensionsdeklaration *)
+DimDecl      = [ "pub" ] "dim" Ident [ "=" DimExpr ] ";" ;
+DimExpr      = Ident { ( "*" | "/" ) Ident } ;
+
+(* Unit-Typ-Deklaration *)
+UtypeDecl    = [ "pub" ] "utype" Ident ":" Ident "=" NumericFactor
+               [ RangeModifier ] ";" ;
+NumericFactor = FloatLit | IntLit ;
+RangeModifier = ( "wraps" | "range" ) NumericFactor ".." NumericFactor ;
+```
+
+### Dimensionen
+
+Basisdimensionen haben keinen Ausdruck; abgeleitete Dimensionen werden aus anderen Dimensionen kombiniert:
+
+```lyx
+pub dim Length;                      // Basisdimension
+pub dim Time;
+pub dim Speed = Length / Time;       // abgeleitete Dimension
+pub dim Area  = Length * Length;
+```
+
+### Unit-Typen
+
+Unit-Typen binden einen numerischen Typ an eine Dimension und einen SI-Konversionsfaktor:
+
+```lyx
+pub utype m:   Length = 1.0;         // SI-Basiseinheit
+pub utype km:  Length = 1000.0;      // 1 km = 1000 m
+pub utype h:   Time   = 3600.0;      // 1 h = 3600 s
+pub utype kmh: Speed  = 0.277778;    // 1 km/h = 0.277778 m/s
+```
+
+### Dimensionsprüfung
+
+Der Compiler prüft zur Compile-Zeit, dass Operanden kompatibler Dimension sind:
+
+```lyx
+var dist: km := 100.0;
+var t:    h  := 2.0;
+var spd:  kmh := dist / t;   // OK: Length/Time → Speed
+var bad:  km  := dist + t;   // Compile-Fehler: Dimension mismatch (Length ≠ Time)
+```
+
+### Unit-Konvertierung mit `as`
+
+Werte können zwischen kompatiblen Einheiten konvertiert werden. Der Compiler prüft Dimensionskompatibilität und emittiert `fmul` mit dem Faktor `src.factor / target.factor`:
+
+```lyx
+var d_km: km := 1.0;
+var d_m:  m  := d_km as m;    // 1 km → 1000.0 m  (fmul mit 1000.0)
+
+var mass: kg  := 0.5;
+var mg:   g   := mass as g;   // 0.5 kg → 500.0 g  (fmul mit 1000.0)
+
+var bad: s := d_km as s;      // Fehler: cannot convert "km" (Length) to "s" (Time)
+```
+
+Konvertierungen mit Literalen werden durch den IR-Optimierer constant-gefaltet.
+
+### Range-Modifier für Unit-Typen
+
+Unit-Typen können optional mit Bereichsgrenzen versehen werden:
+
+| Modifier | Syntax | Verhalten |
+|----------|--------|-----------|
+| `range` | `range MIN..MAX` | Compile-Fehler bei Konstanten außerhalb `[MIN, MAX)`; Runtime-Panic bei dynamischen Werten |
+| `wraps` | `wraps MIN..MAX` | Zyklischer Umlauf: Werte werden modulo `[MIN, MAX)` gefaltet — kein Fehler |
+
+```lyx
+// Geprüfter Bereich: Überlauf ist ein Fehler
+pub utype alt: Length = 1.0 range 0.0..12000.0;
+
+var a: alt := 15000.0;         // Compile-Fehler: value 15000 is out of range [0..12000)
+a := a + climb;                // Runtime-Panic wenn Ergebnis außerhalb [0, 12000)
+
+// Zyklischer Umlauf: Überlauf ist gewollt
+pub utype hdg: Heading = 1.0 wraps 0.0..360.0;
+
+var h: hdg := 350.0;
+h := h + 20.0;                 // → 10.0  (370 mod 360)
+var h2: hdg := 720.0;          // → 0.0   (720 mod 360)
+```
+
+**Wrap-Formel** (branchless):
+```
+norm   = value − min
+rem    = norm − trunc(norm / range) × range
+result = rem + range × (rem < 0.0) + min
+```
+
+### Precompiled Units (`.lyu`)
+
+`dim`- und `utype`-Deklarationen werden in `.lyu`-Dateien exportiert und beim Import automatisch wiederhergestellt. Das TypeInfo-Format für `utype` ist:
+
+```
+"DimName|Factor"                  // ohne Range
+"DimName|Factor|W:min:max"        // wraps
+"DimName|Factor|R:min:max"        // range
+```
+
+### Beispiel: Navigationssystem
+
+```lyx
+unit nav.types;
+
+import std.units;   // m, km, h, kmh, s, ...
+
+pub dim Heading;
+pub utype hdg: Heading = 1.0 wraps 0.0..360.0;   // Kompasskurs, zyklisch
+
+pub fn ground_speed(dist: km, t: h): kmh {
+  return dist / t;
+}
+
+pub fn bearing_add(base: hdg, delta: hdg): hdg {
+  return base + delta;   // wraps automatisch
 }
 ```
 
@@ -925,6 +1056,7 @@ player.health--;     // player.health := player.health - 1
   * `int64 as f64`: Integer zu Float (SSE2 cvtsi2sd)
   * `f64 as int64`: Float zu Integer mit Truncation (SSE2 cvttsd2si)
   * Identity Casts: `int64 as int64`, `f64 as f64` (No-Op)
+  * **Unit-Konvertierung**: `dist as m` — wandelt einen Wert zwischen kompatiblen Unit-Typen um; emittiert `fmul` mit `srcFactor / targetFactor`; Dimensionskompatibilität wird zur Compile-Zeit geprüft
 * Cast-Kompatibilität wird zur Compile-Zeit geprüft
 * Ungültige Casts erzeugen Compile-Fehler
 

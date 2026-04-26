@@ -40,6 +40,14 @@ type
 
   TStorageKlass = (skVar, skLet, skCo, skCon);
 
+  { --- Bereichs-Verhalten für utype --- }
+
+  TUtypeRangeKind = (
+    urkNone,   // kein Range-Check (Standard)
+    urkRange,  // geprüfte Bereichsgrenzen → Compile-Fehler bei Konstanten, Exception zur Laufzeit
+    urkWraps   // zyklischer Umlauf → Wert wird modulo [min,max) gefaltet
+  );
+
   { --- SIMD Element-Typen --- }
 
   TSIMDKind = (simdI8, simdI16, simdI32, simdI64, simdF32, simdF64);
@@ -141,7 +149,10 @@ type
       nkLfdWidget,       // Button btnOk { ... }
       nkLfdLayout,       // Layout Vertical { ... }
       nkLfdProperty,     // Text: "value"
-      nkLfdSignal        // OnClick: "handler()"
+      nkLfdSignal,       // OnClick: "handler()"
+      // Unit Types / Dimensional Analysis
+      nkDimDecl,         // dim Length;  /  dim Speed = Length / Time;
+      nkUtypeDecl        // utype km: Length = 1000.0;
    );
 
   { --- Vorwärtsdeklarationen --- }
@@ -201,9 +212,11 @@ type
   TAstExpr = class(TAstNode)
   private
     FResolvedType: TAurumType;
+    FUnitTag: string;  // unit type name for dimensioned values (e.g. "km", "h")
   public
     constructor Create(aKind: TNodeKind; aSpan: TSourceSpan);
     property ResolvedType: TAurumType read FResolvedType write FResolvedType;
+    property UnitTag: string read FUnitTag write FUnitTag;
   end;
 
   { Ganzzahl-Literal: 42 }
@@ -505,6 +518,8 @@ type
     FCastType: TAurumType;
     FCastTypeName: string;  // Type name for resolution in sema
     FIsFunctionToPointer: Boolean;  // True if casting function to pointer (returns address)
+    FIsUnitConversion: Boolean;     // True if this is a same-dimension unit conversion (e.g. km as m)
+    FUnitConvFactor: Double;        // Conversion factor: source.factor / target.factor
   public
     constructor Create(aExpr: TAstExpr; aCastType: TAurumType; aSpan: TSourceSpan);
     destructor Destroy; override;
@@ -512,6 +527,8 @@ type
     property CastType: TAurumType read FCastType write FCastType;
     property CastTypeName: string read FCastTypeName write FCastTypeName;
     property IsFunctionToPointer: Boolean read FIsFunctionToPointer write FIsFunctionToPointer;
+    property IsUnitConversion: Boolean read FIsUnitConversion write FIsUnitConversion;
+    property UnitConvFactor: Double read FUnitConvFactor write FUnitConvFactor;
   end;
 
   { Function Pointer Type: fn(param1, param2) -> returnType }
@@ -576,16 +593,20 @@ type
     FName: string;
     FDeclType: TAurumType; // element type for arrays (primitive) or atUnresolved for named types
     FDeclTypeName: string; // if named type (struct), store the name here
-    FArrayLen: Integer;    // 0 = not array, >0 = static length, -1 = dynamic array ([]) 
+    FArrayLen: Integer;    // 0 = not array, >0 = static length, -1 = dynamic array ([])
     FInitExpr: TAstExpr;
     FIsNullable: Boolean;  // true if type ends with ? (null-safety)
     FIsGlobal: Boolean;    // true if declared at top-level
     FIsPublic: Boolean;    // true if declared with 'pub'
     FIsRedundant: Boolean; // true if @redundant annotated (aerospace-todo P2 #51)
     FElemType: TAurumType; // element type for array[N]T declarations
+    // utype range enforcement (set by sema)
+    FRangeKind: TUtypeRangeKind;
+    FRangeMin: Double;
+    FRangeMax: Double;
   public
     constructor Create(aStorage: TStorageKlass; const aName: string;
-      aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer; 
+      aDeclType: TAurumType; const aDeclTypeName: string; aArrayLen: Integer;
       aInitExpr: TAstExpr; aIsNullable: Boolean; aSpan: TSourceSpan);
     destructor Destroy; override;
     procedure SetGlobal(aIsGlobal, aIsPublic: Boolean);
@@ -600,6 +621,9 @@ type
     property IsPublic: Boolean read FIsPublic;
     property IsRedundant: Boolean read FIsRedundant write FIsRedundant; // aerospace-todo P2 #51
     property ElemType: TAurumType read FElemType write FElemType;
+    property RangeKind: TUtypeRangeKind read FRangeKind write FRangeKind;
+    property RangeMin: Double read FRangeMin write FRangeMin;
+    property RangeMax: Double read FRangeMax write FRangeMax;
   end;
 
   { Zuweisung: x := expr; }
@@ -607,12 +631,19 @@ type
   private
     FName: string;
     FValue: TAstExpr;
+    // utype range enforcement (set by sema)
+    FRangeKind: TUtypeRangeKind;
+    FRangeMin: Double;
+    FRangeMax: Double;
   public
     constructor Create(const aName: string; aValue: TAstExpr;
       aSpan: TSourceSpan);
     destructor Destroy; override;
     property Name: string read FName;
     property Value: TAstExpr read FValue;
+    property RangeKind: TUtypeRangeKind read FRangeKind write FRangeKind;
+    property RangeMin: Double read FRangeMin write FRangeMin;
+    property RangeMax: Double read FRangeMax write FRangeMax;
   end;
 
   { Feld-Zuweisung: obj.field := value }
@@ -1334,6 +1365,42 @@ type
     function GetProperty(const aName: string): string;
   end;
 
+{ Dimension-Deklaration: dim Length;  oder  dim Speed = Length / Time; }
+  TAstDimDecl = class(TAstNode)
+  private
+    FName: string;
+    FDimExpr: string;   // empty for base dimension; "Length / Time" for derived
+    FIsPublic: Boolean;
+  public
+    constructor Create(const aName, aDimExpr: string; aIsPublic: Boolean; aSpan: TSourceSpan);
+    property Name: string read FName;
+    property DimExpr: string read FDimExpr;
+    property IsPublic: Boolean read FIsPublic;
+  end;
+
+{ Unit-Type-Deklaration: utype km: Length = 1000.0;
+  Optional: utype deg: Angle = 0.017453 wraps 0.0..360.0;
+            utype alt: Length = 1.0 range 0.0..12000.0; }
+  TAstUtypeDecl = class(TAstNode)
+  private
+    FName: string;
+    FDimName: string;       // dimension name (e.g. "Length")
+    FFactor: Double;        // conversion factor to SI base unit
+    FIsPublic: Boolean;
+    FRangeKind: TUtypeRangeKind;
+    FRangeMin: Double;
+    FRangeMax: Double;
+  public
+    constructor Create(const aName, aDimName: string; aFactor: Double; aIsPublic: Boolean; aSpan: TSourceSpan);
+    property Name: string read FName;
+    property DimName: string read FDimName;
+    property Factor: Double read FFactor;
+    property IsPublic: Boolean read FIsPublic;
+    property RangeKind: TUtypeRangeKind read FRangeKind write FRangeKind;
+    property RangeMin: Double read FRangeMin write FRangeMin;
+    property RangeMax: Double read FRangeMax write FRangeMax;
+  end;
+
 { --- Hilfsfunktionen für Nullable-Typen --- }
 
 function IsNullableType(t: TAurumType): Boolean;
@@ -1630,6 +1697,8 @@ begin
     nkImportDecl:  Result := 'ImportDecl';
     nkProgram:     Result := 'Program';
     nkInspect:     Result := 'Inspect';
+    nkDimDecl:     Result := 'DimDecl';
+    nkUtypeDecl:   Result := 'UtypeDecl';
   else
     Result := '<unknown>';
   end;
@@ -3046,6 +3115,31 @@ begin
   SetLength(FFieldTypes, Length(aTypes));
   for i := 0 to High(aTypes) do
     FFieldTypes[i] := aTypes[i];
+end;
+
+// ================================================================
+// TAstDimDecl - Dimension Declaration
+// ================================================================
+
+constructor TAstDimDecl.Create(const aName, aDimExpr: string; aIsPublic: Boolean; aSpan: TSourceSpan);
+begin
+  inherited Create(nkDimDecl, aSpan);
+  FName := aName;
+  FDimExpr := aDimExpr;
+  FIsPublic := aIsPublic;
+end;
+
+// ================================================================
+// TAstUtypeDecl - Unit Type Declaration
+// ================================================================
+
+constructor TAstUtypeDecl.Create(const aName, aDimName: string; aFactor: Double; aIsPublic: Boolean; aSpan: TSourceSpan);
+begin
+  inherited Create(nkUtypeDecl, aSpan);
+  FName := aName;
+  FDimName := aDimName;
+  FFactor := aFactor;
+  FIsPublic := aIsPublic;
 end;
 
 end.

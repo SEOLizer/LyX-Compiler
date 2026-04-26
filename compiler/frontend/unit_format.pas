@@ -31,7 +31,9 @@ type
     lskStruct,
     lskClass,
     lskEnum,
-    lskExternFn
+    lskExternFn,
+    lskDim,    // dimension declaration: TypeInfo = normalized dim expr (empty for base)
+    lskUtype   // unit type declaration: TypeInfo = "DimName|Factor"
   );
 
   { Fehlercodes für .lyu-Operationen }
