@@ -89,6 +89,7 @@ var
   cd: TAstClassDecl;  { For class export }
   symIdx: Integer;  { For unit compilation }
   unitName: string;  { For unit compilation }
+  unitDescription, unitAuthor, unitCopyright: string;  { Unit metadata }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
   x86Emit: TX86_64Emitter;
   hashCrc: UInt32;
@@ -1079,7 +1080,21 @@ begin
         Halt(1);
       end;
       
-      // Phase 2: Extrahiere alle pub fn Symbole
+      // Phase 2: Extrahiere Unit-Metadaten und alle pub-Symbole
+      unitDescription := '';
+      unitAuthor      := '';
+      unitCopyright   := '';
+      if Assigned(prog) and Assigned(prog.Decls) then
+      begin
+        for i := 0 to High(prog.Decls) do
+          if prog.Decls[i] is TAstUnitDecl then
+          begin
+            unitDescription := TAstUnitDecl(prog.Decls[i]).Description;
+            unitAuthor      := TAstUnitDecl(prog.Decls[i]).Author;
+            unitCopyright   := TAstUnitDecl(prog.Decls[i]).Copyright;
+            Break;
+          end;
+      end;
       if Assigned(prog) and Assigned(prog.Decls) then
       begin
         for i := 0 to High(prog.Decls) do
@@ -1262,7 +1277,8 @@ begin
       unitName := ExtractFileName(inputFile);
       if RightStr(unitName, 4) = '.lyx' then
         unitName := Copy(unitName, 1, Length(unitName) - 4);
-      ser.Serialize(unitName, lyuSymbols, Length(lyuSymbols), buffer);
+      ser.Serialize(unitName, lyuSymbols, Length(lyuSymbols), buffer,
+        unitDescription, unitAuthor, unitCopyright);
       if Assigned(module) then
         ser.AppendIRSection(module, buffer);
       if Assigned(module) then
@@ -1318,9 +1334,15 @@ begin
         
         // Ausgabe der Informationen
         WriteLn;
-        WriteLn('Unit: ', loadedUnit.Header.UnitName);
-        WriteLn('Version: ', loadedUnit.Header.Version);
-        WriteLn('Target: ', ArchToStr(loadedUnit.Header.TargetArch));
+        WriteLn('Unit:        ', loadedUnit.Header.UnitName);
+        if loadedUnit.Header.Description <> '' then
+          WriteLn('Description: ', loadedUnit.Header.Description);
+        if loadedUnit.Header.Author <> '' then
+          WriteLn('Author:      ', loadedUnit.Header.Author);
+        if loadedUnit.Header.Copyright <> '' then
+          WriteLn('Copyright:   ', loadedUnit.Header.Copyright);
+        WriteLn('Version:     ', loadedUnit.Header.Version);
+        WriteLn('Target:      ', ArchToStr(loadedUnit.Header.TargetArch));
         if (loadedUnit.Header.Flags and 1) <> 0 then
           WriteLn('Debug-Symbole: vorhanden')
         else
