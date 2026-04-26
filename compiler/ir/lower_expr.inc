@@ -531,29 +531,16 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         if (call.Name = 'Inspect') or 
            ((call.Namespace = 'Debug') and (call.Name = 'Inspect')) then
         begin
-          // irInspect: Src1=value temp, ImmStr=varname, InspectType=type
+          // irInspect: Src1=value temp, ImmStr=varname, ImmInt=argCount
           instr.Op := irInspect;
           instr.Dest := -1; // void return
           if argCount >= 1 then
           begin
             instr.Src1 := argTemps[0];
-            // Versuche den Variablennamen zu extrahieren
             if (call.Args[0] is TAstIdent) then
               instr.ImmStr := TAstIdent(call.Args[0]).Name
             else
               instr.ImmStr := '<expr>';
-            // Typinfo aus dem AST-Knoten
-            instr.InspectType := call.Args[0].ResolvedType;
-            // Für Structs: Name und Felder extrahieren
-            if call.Args[0] is TAstIdent then
-            begin
-              loc := ResolveLocal(TAstIdent(call.Args[0]).Name);
-              if loc >= 0 then
-              begin
-                if (loc < Length(FLocalTypeNames)) and (FLocalTypeNames[loc] <> '') then
-                  instr.InspectStructName := FLocalTypeNames[loc];
-              end;
-            end;
           end
           else
             instr.Src1 := -1;
