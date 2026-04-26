@@ -193,6 +193,7 @@ type
   TIRModule = class
   public
     Functions: array of TIRFunction;
+    FuncIndex: TStringList; // sorted name→TIRFunction for O(log n) FindFunction
     Strings: TStringList; // deduplicated strings
     GlobalVars: TGlobalVarArray; // global variables with init values
     // VMT: class declarations for VMT table emission
@@ -412,6 +413,10 @@ constructor TIRModule.Create;
 begin
   inherited Create;
   Functions := nil;
+  FuncIndex := TStringList.Create;
+  FuncIndex.Sorted := True;
+  FuncIndex.CaseSensitive := True;
+  FuncIndex.Duplicates := dupIgnore; // AddFunction updates Objects on collision
   Strings := TStringList.Create;
   Strings.Sorted := False;
   Strings.CaseSensitive := True;
@@ -427,28 +432,38 @@ destructor TIRModule.Destroy;
 var
   i: Integer;
 begin
-  // free owned functions
   for i := 0 to High(Functions) do
     if Assigned(Functions[i]) then
       Functions[i].Free;
   SetLength(Functions, 0);
+  FuncIndex.Free; // does NOT own TIRFunction objects — Functions[] does
   Strings.Free;
   ExternLibraries.Free;
-  // ClassDecls array - don't free, they belong to AST
   SetLength(ClassDecls, 0);
   inherited Destroy;
 end;
 
 function TIRModule.AddFunction(const name: string): TIRFunction;
+var
+  newFunc: TIRFunction;
+  idx: Integer;
 begin
+  newFunc := TIRFunction.Create(name);
   SetLength(Functions, Length(Functions) + 1);
-  Functions[High(Functions)] := TIRFunction.Create(name);
-  Result := Functions[High(Functions)];
+  Functions[High(Functions)] := newFunc;
+  // Keep index in sync; if name was already present (stale from a prior
+  // RemoveFunction that missed the index), update the pointer in place.
+  idx := FuncIndex.IndexOf(name);
+  if idx >= 0 then
+    FuncIndex.Objects[idx] := TObject(newFunc)
+  else
+    FuncIndex.AddObject(name, TObject(newFunc));
+  Result := newFunc;
 end;
 
 procedure TIRModule.RemoveFunction(const name: string);
 var
-  i, j: Integer;
+  i, j, idx: Integer;
 begin
   for i := 0 to High(Functions) do
     if Functions[i].Name = name then
@@ -457,18 +472,22 @@ begin
       for j := i to High(Functions) - 1 do
         Functions[j] := Functions[j+1];
       SetLength(Functions, Length(Functions) - 1);
+      idx := FuncIndex.IndexOf(name);
+      if idx >= 0 then FuncIndex.Delete(idx);
       Exit;
     end;
 end;
 
+{ O(log n) lookup via sorted FuncIndex. }
 function TIRModule.FindFunction(const name: string): TIRFunction;
 var
-  i: Integer;
+  idx: Integer;
 begin
-  for i := 0 to High(Functions) do
-    if Functions[i].Name = name then
-      Exit(Functions[i]);
-  Result := nil;
+  idx := FuncIndex.IndexOf(name);
+  if idx >= 0 then
+    Result := TIRFunction(FuncIndex.Objects[idx])
+  else
+    Result := nil;
 end;
 
 function TIRModule.InternString(const s: string): Integer;
