@@ -171,9 +171,11 @@ type
       OuterSlot: Integer; // slot in parent function
       InnerSlot: Integer; // slot in this function
     end;
+    InstrLen: Integer; // logical instruction count; Length(Instructions) may be larger (capacity)
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
+    procedure TrimInstructions; // collapse Instructions to InstrLen after lowering is complete
     procedure BuildCFG; // splits Instructions into BasicBlocks with successor/predecessor links
     function GetProvenanceInfo(irIdx: Integer): string; // returns formatted provenance for IR#irIdx
   end;
@@ -250,9 +252,23 @@ begin
 end;
 
 procedure TIRFunction.Emit(const instr: TIRInstr);
+var
+  cap: Integer;
 begin
-  SetLength(Instructions, Length(Instructions) + 1);
-  Instructions[High(Instructions)] := instr;
+  cap := Length(Instructions);
+  if InstrLen >= cap then
+  begin
+    if cap = 0 then cap := 64
+    else cap := cap * 2;
+    SetLength(Instructions, cap);
+  end;
+  Instructions[InstrLen] := instr;
+  Inc(InstrLen);
+end;
+
+procedure TIRFunction.TrimInstructions;
+begin
+  SetLength(Instructions, InstrLen);
 end;
 
 function TIRFunction.GetProvenanceInfo(irIdx: Integer): string;
