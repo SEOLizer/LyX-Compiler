@@ -607,7 +607,7 @@ begin
               func.Instructions[j].ArgTemps[k] := prevDest;
         end;
 
-        // NOP the now-redundant instruction; compact below
+        // NOP the now-redundant instruction; DCE will compact
         func.Instructions[i].Op := irInvalid;
         Result := True;
         SetChanged;
