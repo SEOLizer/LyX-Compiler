@@ -35,6 +35,11 @@ type
     function Accept(kind: TTokenKind): Boolean;
     procedure Expect(kind: TTokenKind);
 
+    { Error recovery }
+    function TooManyErrors: Boolean; // True after MAX_PARSER_ERRORS errors
+    procedure SyncToStmt;   // advance to next statement boundary (consumes ;)
+    procedure SyncToDecl;   // advance to next top-level declaration keyword
+
     function ParseVisibility: TVisibility;
 
     // Parsing-Methoden
@@ -125,8 +130,64 @@ procedure TParser.Expect(kind: TTokenKind);
 begin
   if not Accept(kind) then
   begin
-    FDiag.Error(Format('expected token %s but got %s', [TokenKindToStr(kind), TokenKindToStr(FCurTok.Kind)]), FCurTok.Span);
-    // try to continue: advance once
+    if not TooManyErrors then
+      FDiag.Error(Format('expected %s but got %s',
+        [TokenKindToStr(kind), TokenKindToStr(FCurTok.Kind)]), FCurTok.Span);
+    // For missing semicolons, skip forward to the next statement start so
+    // that a single missing ';' does not cascade into many follow-up errors.
+    if kind = tkSemicolon then
+      SyncToStmt
+    else if not Check(tkEOF) then
+      Advance;
+  end;
+end;
+
+const
+  MAX_PARSER_ERRORS = 10;
+
+function TParser.TooManyErrors: Boolean;
+begin
+  Result := FDiag.ErrorCount >= MAX_PARSER_ERRORS;
+end;
+
+procedure TParser.SyncToStmt;
+begin
+  // Advance until a natural statement boundary:
+  //   - semicolon → consume it and stop (boundary reached)
+  //   - keyword that starts a new statement → stop before it (don't consume)
+  //   - closing brace or EOF → stop (let the caller handle it)
+  while not Check(tkEOF) and not Check(tkRBrace) do
+  begin
+    if Check(tkSemicolon) then
+    begin
+      Advance;
+      Exit;
+    end;
+    if FCurTok.Kind in [tkVar, tkLet, tkCo, tkCon, tkFn,
+                         tkIf, tkWhile, tkFor, tkRepeat,
+                         tkReturn, tkBreak, tkContinue,
+                         tkSwitch, tkMatch, tkTry, tkThrow,
+                         tkPanic, tkAssert, tkPool, tkCheck] then
+      Exit;
+    Advance;
+  end;
+end;
+
+procedure TParser.SyncToDecl;
+begin
+  // Advance until a token that can start a top-level declaration, or EOF.
+  // Semicolons are consumed (treated as statement terminators between decls).
+  while not Check(tkEOF) do
+  begin
+    if Check(tkSemicolon) then
+    begin
+      Advance;
+      Exit;
+    end;
+    if FCurTok.Kind in [tkFn, tkVar, tkLet, tkType, tkEnum, tkClass,
+                         tkStruct, tkUnit, tkImport, tkPublic, tkExtern,
+                         tkCon, tkDim, tkUtype, tkAt] then
+      Exit;
     Advance;
   end;
 end;
@@ -347,6 +408,12 @@ begin
       Continue;
     end;
 
+    if TooManyErrors then
+    begin
+      FDiag.Note('too many errors — aborting parse', FCurTok.Span);
+      Break;
+    end;
+
     d := ParseTopDecl;
     if d <> nil then
     begin
@@ -354,8 +421,7 @@ begin
       decls[High(decls)] := d;
     end
     else
-      // Skip token to avoid infinite loop
-      Advance;
+      SyncToDecl; // skip to next declaration instead of a single token advance
   end;
   Result := TAstProgram.Create(decls, MakeSpan(1,1,0,''));
 end;
@@ -926,8 +992,9 @@ begin
       end
       else
       begin
-        FDiag.Error('unexpected token in class body', FCurTok.Span);
-        Advance;
+        if not TooManyErrors then
+          FDiag.Error('unexpected token in class body', FCurTok.Span);
+        SyncToStmt;
       end;
     end;
     Expect(tkRBrace);
@@ -1212,6 +1279,7 @@ begin
   stmts := nil;
   while not Check(tkRBrace) and not Check(tkEOF) do
   begin
+    if TooManyErrors then Break;
     s := ParseStmt;
     if s <> nil then
     begin
@@ -1219,7 +1287,7 @@ begin
       stmts[High(stmts)] := s;
     end
     else
-      Advance;
+      SyncToStmt; // skip to next statement boundary instead of a single token advance
   end;
   Expect(tkRBrace);
   Result := TAstBlock.Create(stmts, FCurTok.Span);
@@ -1330,8 +1398,9 @@ begin
       else
       begin
         // unexpected token inside switch
-        FDiag.Error('unexpected token in switch', FCurTok.Span);
-        Advance;
+        if not TooManyErrors then
+          FDiag.Error('unexpected token in switch', FCurTok.Span);
+        SyncToStmt;
       end;
     end;
     Expect(tkRBrace);
@@ -1486,8 +1555,9 @@ begin
     end
     else
     begin
-      FDiag.Error('unexpected token in match', FCurTok.Span);
-      Advance;
+      if not TooManyErrors then
+        FDiag.Error('unexpected token in match', FCurTok.Span);
+      SyncToStmt;
     end;
   end;
   Expect(tkRBrace);
@@ -2635,11 +2705,11 @@ begin
     Exit(ParsePostfix(e));
   end;
 
-  // unexpected primary
-  FDiag.Error('unexpected token in expression: ' + TokenKindToStr(FCurTok.Kind), FCurTok.Span);
-  // create dummy literal
+  // unexpected primary — emit at most one error then return a dummy 0
+  if not TooManyErrors then
+    FDiag.Error('unexpected token in expression: ' + TokenKindToStr(FCurTok.Kind), FCurTok.Span);
   dummy := TAstIntLit.Create(0, FCurTok.Span);
-  Advance;
+  if not Check(tkEOF) then Advance;
   Result := dummy;
 end;
 
