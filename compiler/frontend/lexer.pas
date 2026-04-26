@@ -43,6 +43,8 @@ type
     tkPacked,
     // Redundant Variable Annotation (aerospace-todo P2 #51)
     tkRedundant,
+    // Unit Types / Dimensional Analysis keywords
+    tkDim, tkUtype,
     // Operatoren
     tkPlus, tkMinus, tkStar, tkSlash, tkPercent,
     tkPlusPlus, tkMinusMinus,  // Inkrement/Dekrement
@@ -192,6 +194,8 @@ begin
     tkFlat:       Result := 'flat';
     tkPacked:     Result := 'packed';
     tkRedundant:  Result := 'redundant';
+    tkDim:        Result := 'dim';
+    tkUtype:      Result := 'utype';
     tkPlus:       Result := '+';
     tkMinus:      Result := '-';
     tkPlusPlus:   Result := '++';
@@ -840,6 +844,8 @@ begin
     'flat':         Result := tkFlat;
     'packed':       Result := tkPacked;
     'redundant':    Result := tkRedundant;
+    'dim':          Result := tkDim;
+    'utype':        Result := tkUtype;
     'is':         Result := tkIs;
   else
     Result := tkIdent;
