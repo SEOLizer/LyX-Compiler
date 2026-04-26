@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.3-aerospace
+Lyx Compiler v0.8.4-aerospace
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -74,6 +74,9 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Bit-Level Memory Mapping: `packed struct` with `at(N)` bit-position fields for hardware register mapping (v0.9.0)
 ✅ @redundant: Triple Modular Redundancy for global variables — 3 RAM copies with majority-vote reads (v0.9.0)
 ✅ @flight_crit: Strict FP determinism — MXCSR round-to-zero, disabled FP constant folding (v0.9.0)
+✅ Dimensional Analysis: dim/utype keywords — compile-time unit safety (km+s → error), zero-cost f64 (v0.8.4)
+✅ Unit Conversion: expr as TargetUnit — same-dimension cast with compile-time dimension check, fmul factor (v0.8.4)
+✅ Unit Range Modifiers: range MIN..MAX (checked) and wraps MIN..MAX (cyclic overflow) on utype declarations (v0.8.4)
 ```
 
 ---
