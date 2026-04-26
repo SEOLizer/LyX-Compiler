@@ -558,8 +558,8 @@ begin
        end;
        
        // Emit implicit return for void functions if last statement wasn't a return
-       if (Length(FCurrentFunc.Instructions) = 0) or
-          (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
+       if (FCurrentFunc.InstrLen = 0) or
+          (FCurrentFunc.Instructions[FCurrentFunc.InstrLen - 1].Op <> irFuncExit) then
        begin
          EmitScopeDrops; // WP9
          instr := Default(TIRInstr);
@@ -567,7 +567,7 @@ begin
          instr.Src1 := -1;
          Emit(instr);
        end;
-
+       FCurrentFunc.TrimInstructions;
        FCurrentFunc := nil;
        FCurrentFuncDecl := nil;
     end
@@ -642,8 +642,8 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or
-           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
+        if (FCurrentFunc.InstrLen = 0) or
+           (FCurrentFunc.Instructions[FCurrentFunc.InstrLen - 1].Op <> irFuncExit) then
         begin
           EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
@@ -651,7 +651,7 @@ begin
           instr.Src1 := -1;
           Emit(instr);
         end;
-
+        FCurrentFunc.TrimInstructions;
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -735,8 +735,8 @@ begin
           LowerStmt(m.Body.Stmts[k]);
         
         // Emit implicit return for void methods if last statement wasn't a return
-        if (Length(FCurrentFunc.Instructions) = 0) or
-           (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
+        if (FCurrentFunc.InstrLen = 0) or
+           (FCurrentFunc.Instructions[FCurrentFunc.InstrLen - 1].Op <> irFuncExit) then
         begin
           EmitScopeDrops; // WP9
           instr := Default(TIRInstr);
@@ -744,7 +744,7 @@ begin
           instr.Src1 := -1;
           Emit(instr);
         end;
-
+        FCurrentFunc.TrimInstructions;
         FCurrentFunc := nil;
         FCurrentFuncDecl := nil;
       end;
@@ -1070,8 +1070,8 @@ begin
                 end;
                 for k := 0 to High(m.Body.Stmts) do
                   LowerStmt(m.Body.Stmts[k]);
-                if (Length(FCurrentFunc.Instructions) = 0) or
-                   (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
+                if (FCurrentFunc.InstrLen = 0) or
+                   (FCurrentFunc.Instructions[FCurrentFunc.InstrLen - 1].Op <> irFuncExit) then
                 begin
                   EmitScopeDrops; // WP9
                   instr := Default(TIRInstr);
@@ -1079,6 +1079,7 @@ begin
                   instr.Src1 := -1;
                   Emit(instr);
                 end;
+                FCurrentFunc.TrimInstructions;
                 FCurrentFunc := nil;
                 FCurrentFuncDecl := nil;
               end;
@@ -1231,8 +1232,8 @@ begin
                   LowerStmt(TAstFuncDecl(node).Body.Stmts[k]);
 
               // Emit implicit return for void functions if last statement wasn't a return
-              if (Length(FCurrentFunc.Instructions) = 0) or
-                 (FCurrentFunc.Instructions[High(FCurrentFunc.Instructions)].Op <> irFuncExit) then
+              if (FCurrentFunc.InstrLen = 0) or
+                 (FCurrentFunc.Instructions[FCurrentFunc.InstrLen - 1].Op <> irFuncExit) then
               begin
                 EmitScopeDrops; // WP9
                 // Initialize instr locally for this scope
@@ -1242,6 +1243,7 @@ begin
                 Emit(instr);
               end;
 
+              FCurrentFunc.TrimInstructions;
               FCurrentFunc := nil;
               FCurrentFuncDecl := nil;
             end;
