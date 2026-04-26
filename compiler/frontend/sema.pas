@@ -4,7 +4,8 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, unit_format, bytes, tobject, backend_types;
+  SysUtils, Classes, ast, diag, lexer, unit_manager, unit_format, bytes, tobject, backend_types,
+  type_utils;
 
 type
   TSymbolKind = (symVar, symLet, symCon, symFunc);
@@ -2423,38 +2424,8 @@ begin
   end;
 end;
 
-function IsIntegerType(t: TAurumType): Boolean;
-begin
-  case t of
-    atInt8, atInt16, atInt32, atInt64,
-    atUInt8, atUInt16, atUInt32, atUInt64,
-    atISize, atUSize: Result := True;
-  else
-    Result := False;
-  end;
-end;
-
-function IsBoolType(t: TAurumType): Boolean;
-begin
-  Result := (t = atBool);
-end;
-
-function IsStringType(t: TAurumType): Boolean;
-begin
-  Result := (t = atPChar);
-end;
-
-function IsStructType(t: TAurumType): Boolean;
-begin
-  // Struct types are represented differently - check for user-defined types
-  // For now, allow any non-primitive type (except void/bool)
-  Result := (t = atTuple) or (t = atDynArray) or (t = atMap) or (t = atSet);
-end;
-
-function IsNumericType(t: TAurumType): Boolean;
-begin
-  Result := IsIntegerType(t) or (t in [atF32, atF64]);
-end;
+{ IsIntegerType, IsBoolType, IsStringType, IsStructType, IsNumericType, IsFloatType
+  are now provided by type_utils (used directly via the uses clause above). }
 
 { Returns the dimension name for a unit tag, or '' if not a known utype. }
 function TSema.GetDimForUnitTag(const tag: string): string;
@@ -4949,28 +4920,17 @@ var
   other: TAstStructDecl;
   nestedIdx: Integer;
   nestedField: TStructField;
-  // helper
+  // TypeSizeAndAlign: delegates to type_utils.TypeStorageBytes
   function TypeSizeAndAlign(t: TAurumType; out asz, aalign: Integer): Boolean;
   begin
-    case t of
-      atInt8, atUInt8, atChar, atBool: asz := 1;
-      atInt16, atUInt16: asz := 2;
-      atInt32, atUInt32, atF32: asz := 4;
-      atInt64, atUInt64, atISize, atUSize, atF64,
-      atPChar, atPCharNullable, atFnPtr: asz := 8;
-      // fat pointer (ptr + len): dynamic arrays are always 16 bytes
-      atDynArray: begin asz := 16; aalign := 8; Result := True; Exit; end;
-      // heap pointer: Map and Set are always 8 bytes
-      atMap, atSet: begin asz := 8; aalign := 8; Result := True; Exit; end;
-      else
-        begin
-          asz := 0;
-          aalign := 0;
-          Exit(False);
-        end;
+    Result := TypeStorageBytes(t, aalign);
+    if Result then
+      asz := TypeSizeBytes(t)
+    else begin
+      asz := 0; aalign := 0;
     end;
-    aalign := asz;
-    Result := True;
+    // dynarray fat-pointer is 16 bytes in struct storage (ptr + len)
+    if t = atDynArray then asz := 16;
   end;
 begin
   if not Assigned(FStructTypes) then Exit;
@@ -5226,23 +5186,16 @@ var
   other: TAstStructDecl;
   f: TStructField;
   ok: Boolean;
-  // helper function
+  // TypeSizeAndAlign: delegates to type_utils.TypeStorageBytes
   function TypeSizeAndAlign(t: TAurumType; out asz, aalign: Integer): Boolean;
   begin
-    case t of
-      atInt8, atUInt8, atChar, atBool: asz := 1;
-      atInt16, atUInt16: asz := 2;
-      atInt32, atUInt32, atF32: asz := 4;
-      atInt64, atUInt64, atISize, atUSize, atF64, atPChar: asz := 8;
-    else
-      begin
-        asz := 0;
-        aalign := 0;
-        Exit(False);
-      end;
+    Result := TypeStorageBytes(t, aalign);
+    if Result then
+      asz := TypeSizeBytes(t)
+    else begin
+      asz := 0; aalign := 0;
     end;
-    aalign := asz;
-    Result := True;
+    if t = atDynArray then asz := 16;
   end;
 begin
   if not Assigned(FClassTypes) then Exit;
@@ -7320,33 +7273,7 @@ end;
 
 function GetTypeName(t: TAurumType): string;
 begin
-  case t of
-    atInt8: Result := 'int8';
-    atInt16: Result := 'int16';
-    atInt32: Result := 'int32';
-    atInt64: Result := 'int64';
-    atUInt8: Result := 'uint8';
-    atUInt16: Result := 'uint16';
-    atUInt32: Result := 'uint32';
-    atUInt64: Result := 'uint64';
-    atISize: Result := 'int';
-    atUSize: Result := 'uint';
-    atF32: Result := 'f32';
-    atF64: Result := 'f64';
-    atBool: Result := 'bool';
-    atChar: Result := 'char';
-    atVoid: Result := 'void';
-    atPChar: Result := 'pchar';
-    atPCharNullable: Result := 'pchar?';
-    atDynArray: Result := 'array';
-    atArray: Result := 'array';
-    atMap: Result := 'Map';
-    atSet: Result := 'Set';
-    atParallelArray: Result := 'parallel Array';
-    atFnPtr: Result := 'fnptr';
-    atTuple: Result := 'tuple';
-    else Result := 'unknown';
-  end;
+  Result := AurumTypeToStr(t); // delegates to ast.pas — single source of truth
 end;
 
 procedure TSema.DumpSymbolTable;

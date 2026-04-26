@@ -5,7 +5,8 @@ interface
 
 uses
   SysUtils, Classes,
-  ast, ir, diag, lexer, unit_manager, tobject, backend_types;
+  ast, ir, diag, lexer, unit_manager, tobject, backend_types,
+  type_utils;
 
 type
   TConstValue = class
@@ -111,19 +112,7 @@ begin
   Result := Integer(Pointer(o));
 end;
 
-// Returns the size in bytes for a given type (for field access width)
-function TypeSizeBytes(t: TAurumType): Integer;
-begin
-  case t of
-    atInt8, atUInt8, atBool, atChar: Result := 1;
-    atInt16, atUInt16: Result := 2;
-    atInt32, atUInt32, atF32: Result := 4;
-    atInt64, atUInt64, atISize, atUSize, atF64, atPChar, atPCharNullable,
-    atDynArray, atArray, atMap, atSet, atParallelArray: Result := 8;
-  else
-    Result := 8; // Default to 8 bytes (full register width) - includes atUnresolved, atVoid
-  end;
-end;
+{ TypeSizeBytes is now provided by type_utils (via the uses clause above). }
 
 { TIRLowering }
 
