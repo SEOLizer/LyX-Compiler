@@ -745,7 +745,8 @@ Type = BaseIntType | FloatType | "bool" | "void"
      | "pchar" | "pchar?"
      | "array" | "Map" "<" Type "," Type ">"
      | "Set" "<" Type ">"
-     | Ident            (* benannter Typ / Struct / Klasse *)
+     | "[" IntLiteral "]" Type   (* Statisches Array (inline) *)
+     | Ident            (* benannter Typ / Struct / Klasse / Class-Referenz *)
      | "fn" "(" [ ParamList ] ")" [ ":" Type ]   (* Funktionszeiger *)
      ;
 
@@ -756,6 +757,8 @@ BaseIntType = "int8"  | "int16"  | "int32"  | "int64"
             ;
 FloatType   = "f32" | "f64" ;
 ```
+
+**Statische Arrays** `[N]T` werden inline im Struct-Layout oder im Stack-Frame gespeichert (`N × sizeof(T)` Bytes). `N` muss ein Integer-Literal sein.
 
 | Typ | Größe | Beschreibung |
 |-----|-------|--------------|
@@ -1281,6 +1284,106 @@ type Dog = class extends Animal {
     _vmt_TDerived:
       dq _L_TDerived_GetValue  ; überschreibt TBase.GetValue
 ```
+
+### Klassen als Feldtypen – Class Embedding (v0.8.4 ✅ ABGESCHLOSSEN)
+
+Klassen können als Feld-Typen in Structs, anderen Klassen und in statischen Arrays verwendet werden. In allen Fällen wird die Klasse als **8-Byte-Heap-Pointer** gespeichert – es findet keine Inline-Einbettung statt.
+
+#### Grammatik
+
+```ebnf
+(* Keine syntaktischen Erweiterungen nötig — bereits durch Ident in Type abgedeckt *)
+StructField = Ident ":" Type ";" ;          (* Type darf Klassenname oder [N]Klassenname sein *)
+ClassField  = Ident ":" Type ";" ;          (* desgleichen *)
+```
+
+**Zulässige Kombinationen:**
+
+| Kombination | Syntax | Speichermodell |
+|---|---|---|
+| Class-in-Struct | `struct { node: MyClass; }` | 8 Bytes (Pointer) im Struct |
+| Class-in-Struct-Array | `struct { items: [4]MyClass; }` | 4 × 8 = 32 Bytes (Pointer-Array) |
+| Class-in-Class | `class { left: MyClass; }` | 8 Bytes (Pointer) im Heap-Objekt |
+| Self-Referenz | `class { next: Self; }` | 8 Bytes (Pointer) – erzeugt verkettete Liste |
+
+#### Beispiele
+
+**class in struct:**
+```lyx
+type Node = class {
+  value: int64;
+};
+
+type Container = struct {
+  id:   int64;
+  node: Node;    // 8-Byte-Pointer auf heap-allokiertes Node-Objekt
+};
+
+fn main(): int64 {
+  var n: Node      := new Node;
+  n.value          := 42;
+  var c: Container := Container {};
+  c.id   := 1;
+  c.node := n;
+
+  var ref: Node := c.node;   // Pointer laden
+  PrintInt(ref.value);        // 42
+  return 0;
+}
+```
+
+**class in statischem Array (als Struct-Feld):**
+```lyx
+type Pool = struct {
+  count: int64;
+  items: [4]Node;   // 4 Pointer-Slots = 32 Bytes
+};
+
+fn main(): int64 {
+  var n: Node   := new Node;
+  n.value       := 77;
+  var p: Pool   := Pool {};
+  p.count       := 1;
+  p.items[0]    := n;
+
+  var ref: Node := p.items[0];
+  PrintInt(ref.value);  // 77
+  return 0;
+}
+```
+
+**class in class (selbstreferenziell):**
+```lyx
+type Node = class {
+  value: int64;
+  next:  Node;    // Pointer auf nächstes Node-Objekt (kann null sein)
+};
+
+type Tree = class {
+  val:  int64;
+  left: Node;
+  right: Node;
+};
+```
+
+#### Einschränkungen
+
+- **Verkettete Feldzugriffe** wie `container.node.field` erzeugen noch keinen korrekten Code für den Fall, dass das Zwischenfeld eine Klassenreferenz in einem Struct ist. Workaround: Zwischenvariable verwenden:
+  ```lyx
+  var ref: Node := container.node;
+  var v:   int64 := ref.value;   // korrekt
+  ```
+- **Dispose**: Wird die Klasse innerhalb einer Struct nicht explizit per `dispose` freigegeben, bleibt der Heap-Speicher bestehen (kein GC).
+- **Flat Structs**: `flat struct` darf keine Klassenfelder enthalten (Pointer-Regel).
+
+#### Compiler-Implementierung
+
+- **Sema `ComputeStructLayouts`**: `ElemTypeName` wird in `FClassTypes` nachgeschlagen → 8 Bytes pro Element.
+- **Sema `ComputeClassLayouts`**: Statische Array-Felder werden vollständig unterstützt (analog zu Structs).
+- **IR `LowerExpr` (WP6 Read)**: `addrBase = struct_base + fieldOffset` (früher fehlerhaft als `irSub`).
+- **IR `LowerStmt` (WP6 Write)**: Neuer Handler für `p.items[i] := v` bei Struct-Feld-Static-Arrays.
+
+---
 
 ### Random
 

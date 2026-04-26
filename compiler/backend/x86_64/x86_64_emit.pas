@@ -7470,85 +7470,88 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
         // Fat pointer: [ptr:8][len:8][cap:8] stored in 3 consecutive local slots
         irDynArrayPush:
           begin
-            // push element: Src1 = base local (ptr slot), Src2 = value temp
-            // Load ptr, len, cap from slots
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1));      // ptr
-            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1));  // len
-            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 2));  // cap
-            // if len >= cap, realloc
+            // push element: Src1 = LOCAL slot of fat-pointer base, Src2 = value temp
+            // Fat-pointer lives in local slots: ptr@Src1, len@Src1+1, cap@Src1+2
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(instr.Src1));      // ptr
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(instr.Src1 + 1));  // len
+            WriteMovRegMem(FCode, RDX, RBP, SlotOffset(instr.Src1 + 2));  // cap
+            // if len < cap, skip realloc (there is space)
             EmitU8(FCode, $48); EmitU8(FCode, $39); EmitU8(FCode, $D6); // cmp rsi, rdx
             jgePos := FCode.Size;
-            EmitU8(FCode, $7D); EmitU8(FCode, $00);
+            EmitU8(FCode, $7C); EmitU8(FCode, $00);  // jl +0 (patched to reallocDonePos)
             // Realloc: double cap or init to 4
+            // jnz skips movabs(10) + jmp(2) = 12 bytes to reach "shl rdx, 1"
+            // jmp skips shl(3) = 3 bytes to reach mmap setup
             EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $D2); // test rdx, rdx
-            EmitU8(FCode, $75); EmitU8(FCode, $07); // jnz +7
-            WriteMovRegImm64(FCode, RDX, 4);
-            EmitU8(FCode, $EB); EmitU8(FCode, $05);
+            EmitU8(FCode, $75); EmitU8(FCode, $0C); // jnz +12 (to shl rdx,1)
+            WriteMovRegImm64(FCode, RDX, 4);        // cap = 4 (10 bytes)
+            EmitU8(FCode, $EB); EmitU8(FCode, $03); // jmp +3 (skip shl rdx,1)
             EmitU8(FCode, $48); EmitU8(FCode, $D1); EmitU8(FCode, $E2); // shl rdx, 1
             // mmap new buffer
             WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
             WriteMovRegImm64(FCode, RDI, 0);
             WriteMovRegReg(FCode, RSI, RDX);
-            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03); // *8
-            WriteMovRegImm64(FCode, RDX, 3);
-            WriteMovRegImm64(FCode, R10, QWord(-1));
-            WriteMovRegImm64(FCode, R8, 0);
-            WriteMovRegImm64(FCode, R9, 3);
+            EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03); // shl rsi, 3 -> cap * 8 bytes
+            WriteMovRegImm64(FCode, RDX, 3);             // prot = PROT_READ | PROT_WRITE
+            WriteMovRegImm64(FCode, R10, $22);           // flags = MAP_PRIVATE | MAP_ANONYMOUS
+            WriteMovRegImm64(FCode, R8, UInt64(-1));     // fd = -1 (anonymous)
+            WriteMovRegImm64(FCode, R9, 0);              // offset = 0
             WriteSyscall(FCode);
             // Copy old data if exists
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // src = old ptr
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(instr.Src1)); // src = old ptr
             EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF); // test rdi, rdi
             EmitU8(FCode, $74); EmitU8(FCode, $00); // jz +0 (skip copy)
             // memcpy: RDI=dest, RSI=src, RCX=len
             WriteMovRegReg(FCode, RSI, RDI); // RSI = src (old ptr)
             WriteMovRegReg(FCode, RDI, RAX); // RDI = dest (new mmap'd ptr)
-            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1)); // len
+            WriteMovRegMem(FCode, RCX, RBP, SlotOffset(instr.Src1 + 1)); // len
             EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E1); EmitU8(FCode, $03); // rcx *= 8 (element size)
             EmitU8(FCode, $F3); EmitU8(FCode, $A4); // rep movsb
             // Update ptr, cap
-            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1), RAX);
-            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 2), RDX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1), RAX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1 + 2), RDX);
             reallocDonePos := FCode.Size;
             FCode.PatchU8(jgePos + 1, reallocDonePos - (jgePos + 2));
             // Store value at ptr[len*8]
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1));
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(instr.Src1));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(instr.Src1 + 1));
             EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03);
             // RDI = RDI + RSI
             EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $F7);
-            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src2));  // value (temp)
             EmitU8(FCode, $48); EmitU8(FCode, $89); EmitU8(FCode, $37);
             // len++
-            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1));
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1 + 1));
             EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C0);
-            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1), RAX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1 + 1), RAX);
           end;
 
         irDynArrayPop:
           begin
-            // pop: len--, return element at len-1
-            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1)); // len
+            // pop: Src1 = LOCAL slot of fat-pointer base; Dest = result temp
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1 + 1)); // len
             EmitU8(FCode, $48); EmitU8(FCode, $FF); EmitU8(FCode, $C8); // dec rax
-            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1), RAX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(instr.Src1 + 1), RAX);
             // Load element at ptr[(len-1)*8]
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1)); // ptr
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(instr.Src1)); // ptr
             EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E0); EmitU8(FCode, $03);
             EmitU8(FCode, $48); EmitU8(FCode, $01); EmitU8(FCode, $C7); // add rdi, rax
             EmitU8(FCode, $48); EmitU8(FCode, $8B); EmitU8(FCode, $07);
-            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+            WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);  // dest = temp
           end;
 
         irDynArrayLen:
           begin
-            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 1));
+            // Src1 = LOCAL slot of fat-pointer base; Dest = result temp
+            WriteMovRegMem(FCode, RAX, RBP, SlotOffset(instr.Src1 + 1));
             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
           end;
 
         irDynArrayFree:
           begin
-            // munmap(ptr, cap*8)
-            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(fn.LocalCount + instr.Src1));
-            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(fn.LocalCount + instr.Src1 + 2));
+            // Src1 = LOCAL slot of fat-pointer base
+            WriteMovRegMem(FCode, RDI, RBP, SlotOffset(instr.Src1));
+            WriteMovRegMem(FCode, RSI, RBP, SlotOffset(instr.Src1 + 2));
             EmitU8(FCode, $48); EmitU8(FCode, $C1); EmitU8(FCode, $E6); EmitU8(FCode, $03);
             WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MUNMAP, SYS_MACOS_MUNMAP)));
             WriteSyscall(FCode);
@@ -7563,10 +7566,10 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
               WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_MMAP, SYS_MACOS_MMAP)));
               WriteMovRegImm64(FCode, RDI, 0);
               WriteMovRegImm64(FCode, RSI, instr.ImmInt);
-              WriteMovRegImm64(FCode, RDX, 3);
-WriteMovRegImm64(FCode, R10, QWord(-1));
-              WriteMovRegImm64(FCode, R8, 0);
-              WriteMovRegImm64(FCode, R9, 3);
+              WriteMovRegImm64(FCode, RDX, 3);             // prot = PROT_READ | PROT_WRITE
+              WriteMovRegImm64(FCode, R10, $22);           // flags = MAP_PRIVATE | MAP_ANONYMOUS
+              WriteMovRegImm64(FCode, R8, UInt64(-1));     // fd = -1 (anonymous)
+              WriteMovRegImm64(FCode, R9, 0);              // offset = 0
               WriteSyscall(FCode);
               WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
             end
