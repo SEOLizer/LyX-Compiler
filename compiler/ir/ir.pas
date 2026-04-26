@@ -162,10 +162,19 @@ type
 
    TIRInstructionList = array of TIRInstr;
 
+  TBasicBlock = record
+    StartIdx: Integer;             // first instruction index (inclusive)
+    EndIdx: Integer;               // last instruction index (inclusive)
+    Successors: array of Integer;  // block indices that follow this block
+    Predecessors: array of Integer;// block indices that precede this block
+  end;
+  TBasicBlockList = array of TBasicBlock;
+
   TIRFunction = class
   public
     Name: string;
     Instructions: TIRInstructionList;
+    BasicBlocks: TBasicBlockList;  // CFG metadata; rebuilt by BuildCFG
     LocalCount: Integer; // number of local slots
     ParamCount: Integer;
     EnergyLevel: TEnergyLevel; // Energy-Aware-Compiling level (0 = use global)
@@ -184,6 +193,7 @@ type
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
+    procedure BuildCFG; // splits Instructions into BasicBlocks with successor/predecessor links
     function GetProvenanceInfo(irIdx: Integer): string; // returns formatted provenance for IR#irIdx
   end;
 
@@ -291,6 +301,146 @@ begin
   if Instructions[irIdx].SourceASTID > 0 then
   begin
     Result := Result + Format(' from AST#%d', [Instructions[irIdx].SourceASTID]);
+  end;
+end;
+
+procedure TIRFunction.BuildCFG;
+var
+  n, i, j, bb, bbCount, targetBB, idx: Integer;
+  isLeader: array of Boolean;
+  instrBlock: array of Integer;
+  labelNames: TStringList;
+  instr: TIRInstr;
+
+  procedure AddPred(block, pred: Integer);
+  var
+    k: Integer;
+  begin
+    for k := 0 to High(BasicBlocks[block].Predecessors) do
+      if BasicBlocks[block].Predecessors[k] = pred then Exit;
+    SetLength(BasicBlocks[block].Predecessors, Length(BasicBlocks[block].Predecessors) + 1);
+    BasicBlocks[block].Predecessors[High(BasicBlocks[block].Predecessors)] := pred;
+  end;
+
+  procedure AddSucc(block, succ: Integer);
+  var
+    k: Integer;
+  begin
+    for k := 0 to High(BasicBlocks[block].Successors) do
+      if BasicBlocks[block].Successors[k] = succ then Exit;
+    SetLength(BasicBlocks[block].Successors, Length(BasicBlocks[block].Successors) + 1);
+    BasicBlocks[block].Successors[High(BasicBlocks[block].Successors)] := succ;
+  end;
+
+  function LabelToBlock(const lbl: string): Integer;
+  var
+    k: Integer;
+  begin
+    k := labelNames.IndexOf(lbl);
+    if k >= 0 then
+      Result := PtrInt(labelNames.Objects[k])
+    else
+      Result := -1;
+  end;
+
+begin
+  BasicBlocks := nil;
+  n := Length(Instructions);
+  if n = 0 then Exit;
+
+  // Step 1: identify leaders — first instructions of every basic block
+  SetLength(isLeader, n);
+  for i := 0 to n-1 do isLeader[i] := False;
+  isLeader[0] := True;
+
+  for i := 0 to n-1 do
+  begin
+    case Instructions[i].Op of
+      irJmp, irBrTrue, irBrFalse, irFuncExit:
+        if i+1 < n then isLeader[i+1] := True;
+    end;
+    if Instructions[i].Op = irLabel then
+      isLeader[i] := True;
+  end;
+
+  // Step 2: create basic blocks and map each instruction to its block
+  bbCount := 0;
+  for i := 0 to n-1 do
+    if isLeader[i] then Inc(bbCount);
+
+  SetLength(BasicBlocks, bbCount);
+  SetLength(instrBlock, n);
+
+  bb := -1;
+  for i := 0 to n-1 do
+  begin
+    if isLeader[i] then
+    begin
+      Inc(bb);
+      BasicBlocks[bb].StartIdx := i;
+      BasicBlocks[bb].EndIdx   := i;
+      BasicBlocks[bb].Successors   := nil;
+      BasicBlocks[bb].Predecessors := nil;
+    end;
+    instrBlock[i] := bb;
+    BasicBlocks[bb].EndIdx := i;
+  end;
+
+  // Step 3: map label names to block indices
+  labelNames := TStringList.Create;
+  labelNames.Sorted := False;
+  try
+    for i := 0 to bbCount-1 do
+    begin
+      j := BasicBlocks[i].StartIdx;
+      if Instructions[j].Op = irLabel then
+        labelNames.AddObject(Instructions[j].LabelName, TObject(PtrInt(i)));
+    end;
+
+    // Step 4: wire up successors and predecessors from block terminators
+    for i := 0 to bbCount-1 do
+    begin
+      j := BasicBlocks[i].EndIdx;
+      instr := Instructions[j];
+      case instr.Op of
+        irJmp:
+        begin
+          targetBB := LabelToBlock(instr.LabelName);
+          if targetBB >= 0 then
+          begin
+            AddSucc(i, targetBB);
+            AddPred(targetBB, i);
+          end;
+        end;
+        irBrTrue, irBrFalse:
+        begin
+          // branch target
+          targetBB := LabelToBlock(instr.LabelName);
+          if targetBB >= 0 then
+          begin
+            AddSucc(i, targetBB);
+            AddPred(targetBB, i);
+          end;
+          // fall-through to next block
+          if i+1 < bbCount then
+          begin
+            AddSucc(i, i+1);
+            AddPred(i+1, i);
+          end;
+        end;
+        irFuncExit:
+          ; // no successors — function exit
+      else
+        // non-terminator: falls through to next block
+        if i+1 < bbCount then
+        begin
+          AddSucc(i, i+1);
+          AddPred(i+1, i);
+        end;
+      end;
+    end;
+  finally
+    labelNames.Free;
   end;
 end;
 
