@@ -35,6 +35,8 @@ type
     IsGlobal: Boolean; // true if this is a global variable
     // Generic function type parameters, e.g., ['T'] for fn max[T](...)
     GenericTypeParams: TStringArray;
+    // Unit type tag (for dimensional analysis)
+    UnitTag: string;  // utype name, e.g. "km"; empty means no unit tag
     constructor Create(const AName: string);
     destructor Destroy; override;
   end;
@@ -50,6 +52,9 @@ type
     FClassTypes: TStringList;  // name -> TAstClassDecl as object
     FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
     FRangeTypes: TStringList;  // name -> TAstTypeDecl (range types, aerospace-todo P1 #7)
+    FDimensions: TStringList;  // dim names (unit types P1)
+    FDimExprs: TStringList;    // parallel: normalized dim expression for FDimensions[i]
+    FUnitTypes: TStringList;   // utype name -> TAstUtypeDecl (unit types P1)
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -70,6 +75,10 @@ type
     procedure ProcessImports(prog: TAstProgram);
     procedure ImportUnit(imp: TAstImportDecl);
     function TypeEqual(a, b: TAurumType): Boolean;
+    function GetDimForUnitTag(const tag: string): string;
+    function GetDimNameForExpr(const normExpr: string): string;
+    function FindUtypeForDim(const dimName: string): string;
+    function ComputeResultUnitTag(const leftTag, rightTag: string; op: TTokenKind; span: TSourceSpan): string;
     function CompileRegex(const pattern: string; span: TSourceSpan;
       out compiled: string; out captureSlots: Integer): Boolean;
     function CheckExpr(expr: TAstExpr): TAurumType;
@@ -238,6 +247,7 @@ begin
   IsGlobal := False;
   IsExtern := False;
   IsImported := False;
+  UnitTag := '';
   SetLength(ParamTypes, 0);
   DefSpan := NullSpan; // WP-B: Initialize with NullSpan
 end;
@@ -2405,6 +2415,117 @@ begin
   Result := IsIntegerType(t) or (t in [atF32, atF64]);
 end;
 
+{ Returns the dimension name for a unit tag, or '' if not a known utype. }
+function TSema.GetDimForUnitTag(const tag: string): string;
+var
+  idx: Integer;
+  ud: TAstUtypeDecl;
+begin
+  Result := '';
+  if (tag = '') or not Assigned(FUnitTypes) then Exit;
+  idx := FUnitTypes.IndexOf(tag);
+  if idx < 0 then Exit;
+  ud := TAstUtypeDecl(FUnitTypes.Objects[idx]);
+  if Assigned(ud) then
+    Result := ud.DimName;
+end;
+
+{ Returns the dimension NAME for a normalized dimension expression, e.g. "Length/Time" → "Speed". }
+function TSema.GetDimNameForExpr(const normExpr: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  if not Assigned(FDimExprs) then Exit;
+  for i := 0 to FDimExprs.Count - 1 do
+    if FDimExprs[i] = normExpr then
+    begin
+      Result := FDimensions[i];
+      Exit;
+    end;
+end;
+
+{ Returns the first registered utype name for a given dimension name, or '' if none. }
+function TSema.FindUtypeForDim(const dimName: string): string;
+var
+  i: Integer;
+  ud: TAstUtypeDecl;
+begin
+  Result := '';
+  if not Assigned(FUnitTypes) then Exit;
+  for i := 0 to FUnitTypes.Count - 1 do
+  begin
+    ud := TAstUtypeDecl(FUnitTypes.Objects[i]);
+    if Assigned(ud) and (ud.DimName = dimName) then
+    begin
+      Result := ud.Name;
+      Exit;
+    end;
+  end;
+end;
+
+{ Computes a unit tag for the result of op(leftTag, rightTag).
+  For +/-, tags must have same dim (or one is empty) → result = leftTag.
+  For *, result dim = leftDim*rightDim → find first utype with derived dim matching.
+  For /, result dim = leftDim/rightDim → find first utype with derived dim matching.
+  Returns '' if the result has no unit type or the combination is invalid. }
+function TSema.ComputeResultUnitTag(const leftTag, rightTag: string; op: TTokenKind; span: TSourceSpan): string;
+var
+  leftDim, rightDim: string;
+  resultDimExpr: string;
+  resultDimName: string;
+begin
+  Result := '';
+  leftDim := GetDimForUnitTag(leftTag);
+  rightDim := GetDimForUnitTag(rightTag);
+
+  case op of
+    tkPlus, tkMinus:
+      begin
+        if (leftTag = '') or (rightTag = '') then
+        begin
+          if leftTag <> '' then Result := leftTag else Result := rightTag;
+          Exit;
+        end;
+        if leftDim <> rightDim then
+        begin
+          FDiag.Error(Format('dimension mismatch: cannot add/subtract "%s" (%s) and "%s" (%s)',
+            [leftTag, leftDim, rightTag, rightDim]), span);
+          Result := '';
+          Exit;
+        end;
+        Result := leftTag;
+      end;
+
+    tkStar:
+      begin
+        if leftTag = '' then begin Result := rightTag; Exit; end;
+        if rightTag = '' then begin Result := leftTag; Exit; end;
+        // product: normalize as sorted A*B
+        if leftDim <= rightDim then
+          resultDimExpr := leftDim + '*' + rightDim
+        else
+          resultDimExpr := rightDim + '*' + leftDim;
+        resultDimName := GetDimNameForExpr(resultDimExpr);
+        if resultDimName <> '' then
+          Result := FindUtypeForDim(resultDimName);
+      end;
+
+    tkSlash:
+      begin
+        if rightTag = '' then begin Result := leftTag; Exit; end;
+        if leftTag = '' then begin Result := ''; Exit; end;
+        if leftTag = rightTag then begin Result := ''; Exit; end;  // same unit → dimensionless
+        resultDimExpr := leftDim + '/' + rightDim;
+        resultDimName := GetDimNameForExpr(resultDimExpr);
+        if resultDimName <> '' then
+          Result := FindUtypeForDim(resultDimName);
+      end;
+  else
+    Result := '';
+  end;
+end;
+
 function TSema.TypeEqual(a, b: TAurumType): Boolean;
 begin
   // exact match
@@ -2892,6 +3013,9 @@ begin
         else
         begin
           Result := s.DeclType;
+          // Propagate unit tag from symbol to expression
+          if s.UnitTag <> '' then
+            expr.UnitTag := s.UnitTag;
           // Closure capture detection: if we're in a nested function and
           // the symbol comes from an outer scope, mark it as captured
           if Assigned(FCurrentNestedFunc) and (s.Kind in [symVar, symLet, symCon]) then
@@ -2959,11 +3083,12 @@ begin
                begin
                  Result := atPChar;
                end
-               // Check for float operands
+               // Check for float operands (including unit-typed values)
                else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
                begin
-                 // Float arithmetic
+                 // Float arithmetic — propagate unit tags with dimensional checking
                  Result := atF64;
+                 expr.UnitTag := ComputeResultUnitTag(bin.Left.UnitTag, bin.Right.UnitTag, bin.Op, bin.Span);
                end
 else if not IsIntegerType(lt) or not IsIntegerType(rt) then
                 begin
@@ -2998,7 +3123,17 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
                 end
                 else if TypeEqual(lt, atF64) and TypeEqual(rt, atF64) then
                 begin
-                  // Float comparison
+                  // Float comparison — check dimensional compatibility for unit types
+                  if (bin.Left.UnitTag <> '') or (bin.Right.UnitTag <> '') then
+                  begin
+                    if (bin.Left.UnitTag <> '') and (bin.Right.UnitTag <> '') then
+                    begin
+                      if GetDimForUnitTag(bin.Left.UnitTag) <> GetDimForUnitTag(bin.Right.UnitTag) then
+                        FDiag.Error(Format('dimension mismatch: cannot compare "%s" (%s) with "%s" (%s)',
+                          [bin.Left.UnitTag, GetDimForUnitTag(bin.Left.UnitTag),
+                           bin.Right.UnitTag, GetDimForUnitTag(bin.Right.UnitTag)]), bin.Span);
+                    end;
+                  end;
                   Result := atBool;
                 end
                 else if (TypeEqual(lt, atPChar) and TypeEqual(rt, atPChar)) then
@@ -3940,8 +4075,24 @@ begin
             vtype := atInt64;
           end;
         end;
-        // Resolve enum type names: var x: TokenKind := ... → treat as int64
+        // Resolve unit type names: var d: km := ... → treat as f64 with unit tag
         if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
+           Assigned(FUnitTypes) and (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
+        begin
+          if not (vtype in [atF64, atF32, atInt64, atInt32, atUnresolved]) then
+            FDiag.Error(Format('type mismatch in declaration of %s: expected numeric value for unit type %s, got %s',
+              [vd.Name, vd.DeclTypeName, AurumTypeToStr(vtype)]), vd.Span);
+          // Check dimensional compatibility: if RHS has a unit tag, its dim must match
+          if Assigned(vd.InitExpr) and (vd.InitExpr.UnitTag <> '') and
+             (GetDimForUnitTag(vd.DeclTypeName) <> '') and
+             (GetDimForUnitTag(vd.InitExpr.UnitTag) <> GetDimForUnitTag(vd.DeclTypeName)) then
+            FDiag.Error(Format('dimension mismatch in declaration of %s: declared as "%s" (%s) but assigned value of "%s" (%s)',
+              [vd.Name, vd.DeclTypeName, GetDimForUnitTag(vd.DeclTypeName),
+               vd.InitExpr.UnitTag, GetDimForUnitTag(vd.InitExpr.UnitTag)]), vd.Span);
+          vtype := atF64;
+        end
+        // Resolve enum type names: var x: TokenKind := ... → treat as int64
+        else if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
            Assigned(FEnumTypes) and (FEnumTypes.IndexOf(vd.DeclTypeName) >= 0) then
         begin
           // Enum type: accept int64 values (enum values are int64 constants)
@@ -4042,6 +4193,10 @@ begin
         else
           sym.ArrayLen := vd.ArrayLen;
         sym.ElemType := vd.ElemType;
+        // Unit type tag: if declared type name is a known utype, tag the symbol
+        if (vd.DeclTypeName <> '') and Assigned(FUnitTypes) and
+           (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
+          sym.UnitTag := vd.DeclTypeName;
         AddSymbolToCurrent(sym, vd.Span);
       end;
     nkAssign:
@@ -4425,6 +4580,15 @@ begin
   FEnumTypes.Sorted := False;
   FRangeTypes := TStringList.Create;
   FRangeTypes.Sorted := False;
+  FDimensions := TStringList.Create;
+  FDimensions.Sorted := False;
+  FDimensions.CaseSensitive := True;
+  FDimExprs := TStringList.Create;
+  FDimExprs.Sorted := False;
+  FDimExprs.CaseSensitive := True;
+  FUnitTypes := TStringList.Create;
+  FUnitTypes.Sorted := False;
+  FUnitTypes.CaseSensitive := True;
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
@@ -4457,6 +4621,12 @@ begin
     FEnumTypes.Free;
   if Assigned(FRangeTypes) then
     FRangeTypes.Free;
+  if Assigned(FDimensions) then
+    FDimensions.Free;
+  if Assigned(FDimExprs) then
+    FDimExprs.Free;
+  if Assigned(FUnitTypes) then
+    FUnitTypes.Free;
 
   // Freigabe aller verbleibenden Scopes (insbesondere globaler Scope)
   while Length(FScopes) > 0 do
@@ -5199,6 +5369,10 @@ var
   retType: TAurumType;
   paramTypes: TDynAurumTypeArr;
   paramCount: Integer;
+  synNode: TAstUtypeDecl;
+  pipePos: Integer;
+  dimName, factorStr: string;
+  factor: Double;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -5333,6 +5507,25 @@ begin
           FStructTypes.AddObject(TAstStructDecl(decl).Name, System.TObject(decl));
         end;
       end
+      // Import public dimension declarations
+      else if decl is TAstDimDecl then
+      begin
+        if not TAstDimDecl(decl).IsPublic then
+          Continue;
+        if FDimensions.IndexOf(TAstDimDecl(decl).Name) < 0 then
+        begin
+          FDimensions.Add(TAstDimDecl(decl).Name);
+          FDimExprs.Add(StringReplace(TAstDimDecl(decl).DimExpr, ' ', '', [rfReplaceAll]));
+        end;
+      end
+      // Import public unit type declarations
+      else if decl is TAstUtypeDecl then
+      begin
+        if not TAstUtypeDecl(decl).IsPublic then
+          Continue;
+        if FUnitTypes.IndexOf(TAstUtypeDecl(decl).Name) < 0 then
+          FUnitTypes.AddObject(TAstUtypeDecl(decl).Name, System.TObject(decl));
+      end
       // Also import public class types
       else if decl is TAstClassDecl then
       begin
@@ -5411,6 +5604,36 @@ begin
           sym.IsImported := True;
           sym.IsGlobal := True;
           AddSymbolToCurrent(sym, Default(TSourceSpan));
+        end;
+        lskDim:
+        begin
+          // Register dimension from precompiled unit
+          if FDimensions.IndexOf(lyuSym.Name) < 0 then
+          begin
+            FDimensions.Add(lyuSym.Name);
+            FDimExprs.Add(lyuSym.TypeInfo);  // normalized dim expression
+          end;
+        end;
+        lskUtype:
+        begin
+          // Register unit type from precompiled unit
+          if FUnitTypes.IndexOf(lyuSym.Name) < 0 then
+          begin
+            pipePos := Pos('|', lyuSym.TypeInfo);
+            if pipePos > 0 then
+            begin
+              dimName := Copy(lyuSym.TypeInfo, 1, pipePos - 1);
+              factorStr := Copy(lyuSym.TypeInfo, pipePos + 1, MaxInt);
+              factor := StrToFloatDef(factorStr, 1.0);
+            end
+            else
+            begin
+              dimName := lyuSym.TypeInfo;
+              factor := 1.0;
+            end;
+            synNode := TAstUtypeDecl.Create(lyuSym.Name, dimName, factor, True, Default(TSourceSpan));
+            FUnitTypes.AddObject(lyuSym.Name, System.TObject(synNode));
+          end;
         end;
       end;
     end;
@@ -5970,6 +6193,7 @@ var
   s: TSymbol;
   sym: TSymbol;
   itype: TAurumType;
+  dimExprNorm: string;
 begin
   // Phase 0: Verarbeite Imports
   ProcessImports(prog);
@@ -6185,6 +6409,26 @@ begin
         sym.DeclType := atInt64;
         AddSymbolToCurrent(sym, node.Span);
       end;
+    end
+    else if node is TAstDimDecl then
+    begin
+      // Register dimension (unit types P1)
+      if FDimensions.IndexOf(TAstDimDecl(node).Name) >= 0 then
+        FDiag.Error('redeclaration of dimension: ' + TAstDimDecl(node).Name, node.Span)
+      else
+      begin
+        dimExprNorm := StringReplace(TAstDimDecl(node).DimExpr, ' ', '', [rfReplaceAll]);
+        FDimensions.Add(TAstDimDecl(node).Name);
+        FDimExprs.Add(dimExprNorm);
+      end;
+    end
+    else if node is TAstUtypeDecl then
+    begin
+      // Register unit type (unit types P1)
+      if FUnitTypes.IndexOf(TAstUtypeDecl(node).Name) >= 0 then
+        FDiag.Error('redeclaration of unit type: ' + TAstUtypeDecl(node).Name, node.Span)
+      else
+        FUnitTypes.AddObject(TAstUtypeDecl(node).Name, System.TObject(node));
     end
     else if node is TAstVarDecl then
     begin

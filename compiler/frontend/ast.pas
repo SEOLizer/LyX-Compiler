@@ -141,7 +141,10 @@ type
       nkLfdWidget,       // Button btnOk { ... }
       nkLfdLayout,       // Layout Vertical { ... }
       nkLfdProperty,     // Text: "value"
-      nkLfdSignal        // OnClick: "handler()"
+      nkLfdSignal,       // OnClick: "handler()"
+      // Unit Types / Dimensional Analysis
+      nkDimDecl,         // dim Length;  /  dim Speed = Length / Time;
+      nkUtypeDecl        // utype km: Length = 1000.0;
    );
 
   { --- Vorwärtsdeklarationen --- }
@@ -201,9 +204,11 @@ type
   TAstExpr = class(TAstNode)
   private
     FResolvedType: TAurumType;
+    FUnitTag: string;  // unit type name for dimensioned values (e.g. "km", "h")
   public
     constructor Create(aKind: TNodeKind; aSpan: TSourceSpan);
     property ResolvedType: TAurumType read FResolvedType write FResolvedType;
+    property UnitTag: string read FUnitTag write FUnitTag;
   end;
 
   { Ganzzahl-Literal: 42 }
@@ -1334,6 +1339,34 @@ type
     function GetProperty(const aName: string): string;
   end;
 
+{ Dimension-Deklaration: dim Length;  oder  dim Speed = Length / Time; }
+  TAstDimDecl = class(TAstNode)
+  private
+    FName: string;
+    FDimExpr: string;   // empty for base dimension; "Length / Time" for derived
+    FIsPublic: Boolean;
+  public
+    constructor Create(const aName, aDimExpr: string; aIsPublic: Boolean; aSpan: TSourceSpan);
+    property Name: string read FName;
+    property DimExpr: string read FDimExpr;
+    property IsPublic: Boolean read FIsPublic;
+  end;
+
+{ Unit-Type-Deklaration: utype km: Length = 1000.0; }
+  TAstUtypeDecl = class(TAstNode)
+  private
+    FName: string;
+    FDimName: string;   // dimension name (e.g. "Length")
+    FFactor: Double;    // conversion factor to SI base unit
+    FIsPublic: Boolean;
+  public
+    constructor Create(const aName, aDimName: string; aFactor: Double; aIsPublic: Boolean; aSpan: TSourceSpan);
+    property Name: string read FName;
+    property DimName: string read FDimName;
+    property Factor: Double read FFactor;
+    property IsPublic: Boolean read FIsPublic;
+  end;
+
 { --- Hilfsfunktionen für Nullable-Typen --- }
 
 function IsNullableType(t: TAurumType): Boolean;
@@ -1630,6 +1663,8 @@ begin
     nkImportDecl:  Result := 'ImportDecl';
     nkProgram:     Result := 'Program';
     nkInspect:     Result := 'Inspect';
+    nkDimDecl:     Result := 'DimDecl';
+    nkUtypeDecl:   Result := 'UtypeDecl';
   else
     Result := '<unknown>';
   end;
@@ -3046,6 +3081,31 @@ begin
   SetLength(FFieldTypes, Length(aTypes));
   for i := 0 to High(aTypes) do
     FFieldTypes[i] := aTypes[i];
+end;
+
+// ================================================================
+// TAstDimDecl - Dimension Declaration
+// ================================================================
+
+constructor TAstDimDecl.Create(const aName, aDimExpr: string; aIsPublic: Boolean; aSpan: TSourceSpan);
+begin
+  inherited Create(nkDimDecl, aSpan);
+  FName := aName;
+  FDimExpr := aDimExpr;
+  FIsPublic := aIsPublic;
+end;
+
+// ================================================================
+// TAstUtypeDecl - Unit Type Declaration
+// ================================================================
+
+constructor TAstUtypeDecl.Create(const aName, aDimName: string; aFactor: Double; aIsPublic: Boolean; aSpan: TSourceSpan);
+begin
+  inherited Create(nkUtypeDecl, aSpan);
+  FName := aName;
+  FDimName := aDimName;
+  FFactor := aFactor;
+  FIsPublic := aIsPublic;
 end;
 
 end.

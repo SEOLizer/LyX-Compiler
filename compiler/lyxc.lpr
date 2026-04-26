@@ -1106,10 +1106,39 @@ begin
               end;
               WriteLn('  Exportiere: pub fn ', fn.Name, ' -> ', lyuSymbols[symIdx].TypeInfo);
             end;
+          end
+          // Export pub dim declarations
+          else if prog.Decls[i] is TAstDimDecl then
+          begin
+            if TAstDimDecl(prog.Decls[i]).IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := TAstDimDecl(prog.Decls[i]).Name;
+              lyuSymbols[symIdx].Kind := lskDim;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := StringReplace(TAstDimDecl(prog.Decls[i]).DimExpr, ' ', '', [rfReplaceAll]);
+              WriteLn('  Exportiere: pub dim ', lyuSymbols[symIdx].Name, ' = "', lyuSymbols[symIdx].TypeInfo, '"');
+            end;
+          end
+          // Export pub utype declarations
+          else if prog.Decls[i] is TAstUtypeDecl then
+          begin
+            if TAstUtypeDecl(prog.Decls[i]).IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := TAstUtypeDecl(prog.Decls[i]).Name;
+              lyuSymbols[symIdx].Kind := lskUtype;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := TAstUtypeDecl(prog.Decls[i]).DimName
+                + '|' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).Factor);
+              WriteLn('  Exportiere: pub utype ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
+            end;
           end;
         end;
       end;
-      
+
       WriteLn;
       WriteLn('Gefundene Symbole: ', Length(lyuSymbols));
 
