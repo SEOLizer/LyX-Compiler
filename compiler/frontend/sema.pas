@@ -1252,6 +1252,42 @@ begin
   s.ParamTypes[0] := atInt64;
   AddSymbolToCurrent(s, NullSpan);
 
+  // abs(int64) -> int64 (absolute value)
+  s := TSymbol.Create('abs');
+  s.Kind := symFunc;
+  s.DeclType := atInt64;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // print_str(pchar) -> void (lowercase alias for PrintStr)
+  s := TSymbol.Create('print_str');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atPChar;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // print_int(int64) -> void (lowercase alias for PrintInt)
+  s := TSymbol.Create('print_int');
+  s.Kind := symFunc;
+  s.DeclType := atVoid;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
+  // odd(int64) -> bool (returns true if value is odd)
+  s := TSymbol.Create('odd');
+  s.Kind := symFunc;
+  s.DeclType := atBool;
+  s.ParamCount := 1;
+  SetLength(s.ParamTypes, 1);
+  s.ParamTypes[0] := atInt64;
+  AddSymbolToCurrent(s, NullSpan);
+
   // PrintFloat(f64) -> void
   s := TSymbol.Create('PrintFloat');
   s.Kind := symFunc;
