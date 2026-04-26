@@ -57,23 +57,22 @@ begin
     FCurrentFunc := fn;
     FCurrentFuncDecl := decl;
     FLocalMap.Clear;
-    for j := 0 to Length(FLocalConst) - 1 do
-      if Assigned(FLocalConst[j]) then
-        FLocalConst[j].Free;
-    SetLength(FLocalConst, 0);
+    for j := 0 to Length(FLocals) - 1 do
+      if Assigned(FLocals[j].ConstVal) then
+        FLocals[j].ConstVal.Free;
+    SetLength(FLocals, 0);
     FTempCounter := 0;
 
     // Set up parameters with type substitution applied
     fn.ParamCount := Length(decl.Params);
     fn.LocalCount := fn.ParamCount;
-    SetLength(FLocalTypes, fn.LocalCount);
-    SetLength(FLocalConst, fn.LocalCount);
+    SetLength(FLocals, fn.LocalCount);
     for j := 0 to fn.ParamCount - 1 do
     begin
       FLocalMap.AddObject(decl.Params[j].Name, IntToObj(j));
       paramType := SubstType(decl.Params[j].ParamType, decl.Params[j].TypeName);
-      FLocalTypes[j] := paramType;
-      FLocalConst[j] := nil;
+      FLocals[j].VarType := paramType;
+      FLocals[j].ConstVal := nil;
     end;
 
     // Lower the function body
