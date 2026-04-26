@@ -2113,7 +2113,41 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Result := -1;
         end
         // Builtin calls
-        else if (call.Name = 'PrintStr') or ((call.Namespace = 'IO') and (call.Name = 'PrintStr')) then
+        else if call.Name = 'abs' then
+        begin
+          // abs(n): if n < 0 then -n else n
+          tZero := NewTemp;
+          tGe0 := NewTemp;
+          t0 := NewTemp;
+          tResult := NewTemp;
+          instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 0; Emit(instr);
+          instr.Op := irCmpLt; instr.Dest := tGe0; instr.Src1 := argTemps[0]; instr.Src2 := tZero; Emit(instr);
+          instr.Op := irNeg; instr.Dest := t0; instr.Src1 := argTemps[0]; Emit(instr);
+          errLbl := NewLabel('Labs_pos');
+          skipLbl := NewLabel('Labs_done');
+          instr.Op := irBrFalse; instr.Src1 := tGe0; instr.LabelName := errLbl; Emit(instr);
+          // negative: result = -n (use irAdd tResult = t0 + 0 as copy)
+          instr.Op := irAdd; instr.Dest := tResult; instr.Src1 := t0; instr.Src2 := tZero; Emit(instr);
+          instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+          // non-negative: result = n
+          instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+          instr.Op := irAdd; instr.Dest := tResult; instr.Src1 := argTemps[0]; instr.Src2 := tZero; Emit(instr);
+          instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+          Result := tResult;
+        end
+        else if call.Name = 'odd' then
+        begin
+          // odd(n): returns (n and 1) != 0
+          t0 := NewTemp;
+          tZero := NewTemp;
+          tGe0 := NewTemp;
+          instr.Op := irConstInt; instr.Dest := tZero; instr.ImmInt := 1; Emit(instr);
+          instr.Op := irBitAnd; instr.Dest := t0; instr.Src1 := argTemps[0]; instr.Src2 := tZero; Emit(instr);
+          instr.Op := irConstInt; instr.Dest := tGe0; instr.ImmInt := 0; Emit(instr);
+          instr.Op := irCmpNeq; instr.Dest := NewTemp; instr.Src1 := t0; instr.Src2 := tGe0; Emit(instr);
+          Result := instr.Dest;
+        end
+        else if (call.Name = 'PrintStr') or (call.Name = 'print_str') or ((call.Namespace = 'IO') and (call.Name = 'PrintStr')) then
         begin
           instr.Op := irCallBuiltin;
           instr.Dest := -1; // no return value
@@ -2147,7 +2181,7 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           Emit(instr);
           Result := -1;
         end
-        else if (call.Name = 'PrintInt') or
+        else if (call.Name = 'PrintInt') or (call.Name = 'print_int') or
                 ((call.Namespace = 'IO') and (call.Name = 'PrintInt')) then
         begin
           instr.Op := irCallBuiltin;
@@ -3622,14 +3656,17 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
 
           // === Dynamic Array Operations (push, len, pop, free) ===
           // These must come BEFORE the regular function call handling
-          if call.Name = 'push' then
+          if (call.Name = 'push') or (call.Name = 'append') then
           begin
             // push(array, value) - adds element to dynamic array
-            // argTemps[0] = array local slot, argTemps[1] = value
+            // Src1 = LOCAL slot index of the fat-pointer (NOT a temp)
             instr := Default(TIRInstr);
             instr.Op := irDynArrayPush;
-            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
-            instr.Src2 := argTemps[1];  // value to push
+            if (argCount >= 1) and (call.Args[0] is TAstIdent) then
+              instr.Src1 := ResolveLocal(TAstIdent(call.Args[0]).Name)
+            else
+              instr.Src1 := argTemps[0];
+            instr.Src2 := argTemps[1];  // value to push (temp)
             instr.Dest := -1;
             Emit(instr);
             Result := -1;
@@ -3638,11 +3675,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           else if call.Name = 'len' then
           begin
             // len(array) - returns length of dynamic array
-            // argTemps[0] = array local slot
+            // Src1 = LOCAL slot index of the fat-pointer (NOT a temp)
             t0 := NewTemp;
             instr := Default(TIRInstr);
             instr.Op := irDynArrayLen;
-            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            if (argCount >= 1) and (call.Args[0] is TAstIdent) then
+              instr.Src1 := ResolveLocal(TAstIdent(call.Args[0]).Name)
+            else
+              instr.Src1 := argTemps[0];
             instr.Dest := t0;
             Emit(instr);
             Result := t0;
@@ -3651,11 +3691,14 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           else if call.Name = 'pop' then
           begin
             // pop(array) - removes and returns last element
-            // argTemps[0] = array local slot
+            // Src1 = LOCAL slot index of the fat-pointer (NOT a temp)
             t0 := NewTemp;
             instr := Default(TIRInstr);
             instr.Op := irDynArrayPop;
-            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            if (argCount >= 1) and (call.Args[0] is TAstIdent) then
+              instr.Src1 := ResolveLocal(TAstIdent(call.Args[0]).Name)
+            else
+              instr.Src1 := argTemps[0];
             instr.Dest := t0;
             Emit(instr);
             Result := t0;
@@ -3664,10 +3707,13 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
           else if call.Name = 'free' then
           begin
             // free(array) - frees the dynamic array memory
-            // argTemps[0] = array local slot
+            // Src1 = LOCAL slot index of the fat-pointer (NOT a temp)
             instr := Default(TIRInstr);
             instr.Op := irDynArrayFree;
-            instr.Src1 := argTemps[0];  // array local slot (fat pointer)
+            if (argCount >= 1) and (call.Args[0] is TAstIdent) then
+              instr.Src1 := ResolveLocal(TAstIdent(call.Args[0]).Name)
+            else
+              instr.Src1 := argTemps[0];
             instr.Dest := -1;
             Emit(instr);
             Result := -1;
@@ -6060,10 +6106,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       arrLen := vd.ArrayLen;
       if (vd.InitExpr is TAstArrayLit) then
         arrLen := Length(TAstArrayLit(vd.InitExpr).Items);
-      // Handle dynamic arrays: ArrayLen = -1 or DeclType = atDynArray
-      if (arrLen = -1) or (vd.DeclType = atDynArray) then
+      // Handle static array literals with known elements: store inline (no fat-pointer).
+      // Dynamic arrays (ArrayLen=-1) or empty/no-literal cases use the fat-pointer branch below.
+      if (arrLen > 0) and (vd.DeclType = atDynArray) then
       begin
-          // Local array literal: allocate slots for elements only (no fat-pointer).
+          // Non-empty dynamic array literal: allocate slots inline for elements.
           // Store elements in REVERSE order so that arr[0] is at highest address.
           // This way, baseSlot + index*8 correctly addresses all elements.
           // Mark as NOT dynamic array - elements are stored inline.
