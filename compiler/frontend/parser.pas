@@ -8,22 +8,24 @@ uses
   diag, lexer, ast, backend_types, c_header_parser;
 
 type
+  { Parameterized-type metadata returned by ParseTypeExFull. }
+  TTypeParseResult = record
+    ElemType:     TAurumType;
+    ElemTypeName: string;
+    KeyType:      TAurumType;
+    KeyTypeName:  string;
+    ValType:      TAurumType;
+    ValTypeName:  string;
+  end;
+
   TParser = class
   private
     FLexer: TLexer;
     FDiag: TDiagnostics;
     FCurTok: TToken;
     FHasCur: Boolean;
-    FLastParamListVarArgs: Boolean;
     FCurrentTypeParams: TStringArray; // type params of current generic function
     FNoStructLit: Boolean; // when True, suppress struct literal parsing (used for match expr)
-    // Parameterized-type metadata populated by ParseTypeExFull; read by struct/class field parser
-    FLastElemType:     TAurumType;
-    FLastElemTypeName: string;
-    FLastKeyType:      TAurumType;
-    FLastKeyTypeName:  string;
-    FLastValType:      TAurumType;
-    FLastValTypeName:  string;
     // @integrity pre-parsed at top of file before fn or unit (aerospace-todo P0 #43)
     FPendingIntegrity: TIntegrityAttr;
     FHasPendingIntegrity: Boolean;
@@ -86,9 +88,9 @@ type
     function IsKnownTypeIdent(const s: string): Boolean;
 
     function ParseTypeEx(out arrayLen: Integer; out typeName: string): TAurumType;
-    function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
+    function ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean; out typeInfo: TTypeParseResult): TAurumType;
     function ParseType: TAurumType;
-    function ParseParamList: TAstParamList;
+    function ParseParamList(out isVarArgs: Boolean): TAstParamList;
     { Parses all @ attributes before 'fn' and returns energy level + safety pragmas }
     procedure ParseFuncAttrs(out energyLevel: TEnergyLevel; out safetyPragmas: TSafetyPragmas);
     { Parses optional signed integer literal for range bounds }
@@ -434,6 +436,7 @@ var
   retType: TAurumType;
   linkName: string;
   tmpPragmas: TSafetyPragmas;
+  externVarArgs: Boolean;
 begin
   isExtern := False;
   if Check(tkPublic) then
@@ -482,8 +485,9 @@ begin
         name := '<anon>'; FDiag.Error('expected function name', FCurTok.Span);
       end;
       Expect(tkLParen);
+      externVarArgs := False;
       if not Check(tkRParen) then
-        params := ParseParamList
+        params := ParseParamList(externVarArgs)
       else
         params := nil;
       Expect(tkRParen);
@@ -506,9 +510,8 @@ begin
       end;
       Expect(tkSemicolon);
       Result := TAstFuncDecl.Create(name, params, retType, nil, FCurTok.Span, False);
-      // mark extern and varargs if parser recorded them
       TAstFuncDecl(Result).IsExtern := True;
-      TAstFuncDecl(Result).IsVarArgs := FLastParamListVarArgs;
+      TAstFuncDecl(Result).IsVarArgs := externVarArgs;
       TAstFuncDecl(Result).LibraryName := linkName;
       // Inject pending @integrity if pre-parsed at file start (aerospace-todo P0 #43)
       if FHasPendingIntegrity then
@@ -570,6 +573,8 @@ var
   dummyLen: Integer;
   dummyName: string;
   dummyNull: Boolean;
+  dummyInfo: TTypeParseResult;
+  dummyVarArgs: Boolean;
   savedTypeParams: TStringArray;
   typeParams: TStringArray;
 begin
@@ -611,8 +616,9 @@ begin
 
   // (
   Expect(tkLParen);
+  dummyVarArgs := False;
   if not Check(tkRParen) then
-    params := ParseParamList
+    params := ParseParamList(dummyVarArgs)
   else
     params := nil;
   Expect(tkRParen);
@@ -628,7 +634,7 @@ begin
       Advance; // consume '('
       retType := atTuple;
       repeat
-        tupleElem := ParseTypeExFull(dummyLen, dummyName, dummyNull);
+        tupleElem := ParseTypeExFull(dummyLen, dummyName, dummyNull, dummyInfo);
         SetLength(tupleTypes, Length(tupleTypes) + 1);
         tupleTypes[High(tupleTypes)] := tupleElem;
       until not Accept(tkComma);
@@ -772,6 +778,9 @@ var
   structEndian: TEndianType; // aerospace-todo P2 #52
   isFlatStruct: Boolean;     // aerospace-todo P2 #57
   isPackedStruct: Boolean;   // aerospace-todo P2 #50
+  fldTypeInfo: TTypeParseResult;
+  dummyNull: Boolean;
+  mVarArgs: Boolean;
 begin
   Expect(tkType);
   // Allow keywords as type names (e.g. 'Map', 'Set' used as class names in bootstrap sources)
@@ -830,9 +839,10 @@ begin
           FDiag.Error('expected method name', FCurTok.Span);
         end;
         Expect(tkLParen);
+        mVarArgs := False;
         mParams := nil;
         if not Check(tkRParen) then
-          mParams := ParseParamList
+          mParams := ParseParamList(mVarArgs)
         else
           mParams := nil;
         Expect(tkRParen);
@@ -935,8 +945,9 @@ begin
           FDiag.Error('expected method name', FCurTok.Span);
         end;
         Expect(tkLParen);
+        mVarArgs := False;
         if not Check(tkRParen) then
-          mParams := ParseParamList
+          mParams := ParseParamList(mVarArgs)
         else
           mParams := nil;
         Expect(tkRParen);
@@ -977,14 +988,14 @@ begin
         // field: name : Type ;
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
-        fld.FieldType     := ParseTypeEx(fld.ArrayLen, fldTypeName);
+        fld.FieldType     := ParseTypeExFull(fld.ArrayLen, fldTypeName, dummyNull, fldTypeInfo);
         fld.FieldTypeName := fldTypeName;
-        fld.ElemType      := FLastElemType;
-        fld.ElemTypeName  := FLastElemTypeName;
-        fld.KeyType       := FLastKeyType;
-        fld.KeyTypeName   := FLastKeyTypeName;
-        fld.ValType       := FLastValType;
-        fld.ValTypeName   := FLastValTypeName;
+        fld.ElemType      := fldTypeInfo.ElemType;
+        fld.ElemTypeName  := fldTypeInfo.ElemTypeName;
+        fld.KeyType       := fldTypeInfo.KeyType;
+        fld.KeyTypeName   := fldTypeInfo.KeyTypeName;
+        fld.ValType       := fldTypeInfo.ValType;
+        fld.ValTypeName   := fldTypeInfo.ValTypeName;
         fld.Visibility    := curVisibility;
         Expect(tkSemicolon);
         SetLength(fields, Length(fields) + 1);
@@ -1039,14 +1050,14 @@ begin
       begin
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
-        fld.FieldType     := ParseTypeEx(fld.ArrayLen, fldTypeName);
+        fld.FieldType     := ParseTypeExFull(fld.ArrayLen, fldTypeName, dummyNull, fldTypeInfo);
         fld.FieldTypeName := fldTypeName;
-        fld.ElemType      := FLastElemType;
-        fld.ElemTypeName  := FLastElemTypeName;
-        fld.KeyType       := FLastKeyType;
-        fld.KeyTypeName   := FLastKeyTypeName;
-        fld.ValType       := FLastValType;
-        fld.ValTypeName   := FLastValTypeName;
+        fld.ElemType      := fldTypeInfo.ElemType;
+        fld.ElemTypeName  := fldTypeInfo.ElemTypeName;
+        fld.KeyType       := fldTypeInfo.KeyType;
+        fld.KeyTypeName   := fldTypeInfo.KeyTypeName;
+        fld.ValType       := fldTypeInfo.ValType;
+        fld.ValTypeName   := fldTypeInfo.ValTypeName;
         fld.Visibility    := curVisibility;
         fld.BitOffset     := -1; // default: auto layout
         // Parse optional bit-level mapping: at(N) (aerospace-todo P2 #50)
@@ -1633,6 +1644,7 @@ var
   isNullable: Boolean;
   span: TSourceSpan;
   tupleNames: TStringArray;
+  localTypeInfo: TTypeParseResult;
 begin
   span := FCurTok.Span;
   if Accept(tkVar) then storage := skVar
@@ -1674,7 +1686,7 @@ begin
   end;
 
   Expect(tkColon);
-  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
+  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable, localTypeInfo);
 
   // Optional initializer for const/var (accept both := and = for compatibility)
   if Accept(tkAssign) or Accept(tkSingleEq) then
@@ -1687,7 +1699,7 @@ begin
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, initExpr.Span)
   else
     Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
-  TAstVarDecl(Result).ElemType := FLastElemType;
+  TAstVarDecl(Result).ElemType := localTypeInfo.ElemType;
 end;
 
 function TParser.ParseTupleVarDecl(const firstName: string; aSpan: TSourceSpan): TAstTupleVarDecl;
@@ -1707,6 +1719,7 @@ var
   isNullable: Boolean;
   span: TSourceSpan;
   isRedundant: Boolean;
+  globalTypeInfo: TTypeParseResult;
 begin
   span := FCurTok.Span;
   
@@ -1740,7 +1753,7 @@ begin
   end;
 
   Expect(tkColon);
-  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable);
+  declType := ParseTypeExFull(arrayLen, declTypeName, isNullable, globalTypeInfo);
 
   // Optional initializer: var x: int64 := value or just var x: int64
   if Accept(tkAssign) then
@@ -1750,7 +1763,7 @@ begin
   Expect(tkSemicolon);
 
   Result := TAstVarDecl.Create(storage, name, declType, declTypeName, arrayLen, initExpr, isNullable, span);
-  Result.ElemType := FLastElemType;
+  Result.ElemType := globalTypeInfo.ElemType;
   Result.SetGlobal(True, isPub);
   Result.IsRedundant := isRedundant; // aerospace-todo P2 #51
 end;
@@ -1942,6 +1955,7 @@ var
   dummyLen:   Integer;
   dummyName:  string;
   dummyNull:  Boolean;
+  dummyInfo:  TTypeParseResult;
 begin
   span := FCurTok.Span;
   Expect(tkTry);
@@ -1961,7 +1975,7 @@ begin
   end;
   // type annotation (: int64) — consume but ignore
   if Accept(tkColon) then
-    ParseTypeExFull(dummyLen, dummyName, dummyNull);
+    ParseTypeExFull(dummyLen, dummyName, dummyNull, dummyInfo);
   Expect(tkRParen);
   catchBody := ParseBlock;
   Result := TAstTry.Create(tryBody, catchVar, catchBody, span);
@@ -2746,6 +2760,7 @@ var
   dummyLen: Integer;
   dummyName: string;
   dummyNull: Boolean;
+  dummyInfo: TTypeParseResult;
   ta: TAurumType;
   callExpr: TAstCall;
   peeked: TToken;
@@ -2833,7 +2848,7 @@ begin
       Advance; // consume '['
       repeat
         dummyLen := 0; dummyName := ''; dummyNull := False;
-        ta := ParseTypeExFull(dummyLen, dummyName, dummyNull);
+        ta := ParseTypeExFull(dummyLen, dummyName, dummyNull, dummyInfo);
         SetLength(typeArgs, Length(typeArgs) + 1);
         typeArgs[High(typeArgs)] := ta;
       until not Accept(tkComma);
@@ -3002,13 +3017,14 @@ begin
 end;
 
 function TParser.ParseTypeEx(out arrayLen: Integer; out typeName: string): TAurumType;
-var 
+var
   isNullable: Boolean;
+  dummyInfo: TTypeParseResult;
 begin
-  Result := ParseTypeExFull(arrayLen, typeName, isNullable);
+  Result := ParseTypeExFull(arrayLen, typeName, isNullable, dummyInfo);
 end;
 
-function TParser.ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean): TAurumType;
+function TParser.ParseTypeExFull(out arrayLen: Integer; out typeName: string; out isNullable: Boolean; out typeInfo: TTypeParseResult): TAurumType;
 var
   s: string;
   baseType: TAurumType;
@@ -3023,12 +3039,12 @@ begin
   arrayLen := 0;
   typeName := '';
   isNullable := False;
-  FLastElemType     := atUnresolved;
-  FLastElemTypeName := '';
-  FLastKeyType      := atUnresolved;
-  FLastKeyTypeName  := '';
-  FLastValType      := atUnresolved;
-  FLastValTypeName  := '';
+  typeInfo.ElemType     := atUnresolved;
+  typeInfo.ElemTypeName := '';
+  typeInfo.KeyType      := atUnresolved;
+  typeInfo.KeyTypeName  := '';
+  typeInfo.ValType      := atUnresolved;
+  typeInfo.ValTypeName  := '';
 
   // Check for array type syntax: Type[N] or []Type or Array<T> or Map<K,V> or Set<T>
   // Also check for function pointer type: fn(params) -> returnType
@@ -3216,8 +3232,8 @@ begin
         Exit;
       end;
       Expect(tkGt);
-      FLastKeyType := keyType;
-      FLastValType := valueType;
+      typeInfo.KeyType := keyType;
+      typeInfo.ValType := valueType;
       Result := atMap;
       Exit;
     end;
@@ -3235,7 +3251,7 @@ begin
         Exit;
       end;
       Expect(tkGt);
-      FLastElemType := elementType;
+      typeInfo.ElemType := elementType;
       Result := atSet;
       Exit;
     end;
@@ -3297,7 +3313,7 @@ begin
         end;
         Expect(tkGt);
         // Mark as generic array (-3 indicates generic array)
-        FLastElemType := innerType;
+        typeInfo.ElemType := innerType;
         arrayLen := -3;
         Result := atDynArray;
         Exit;
@@ -3351,8 +3367,8 @@ begin
     if Accept(tkLBracket) then
     begin
       // Capture current type as element type for type[] / type[N] suffix
-      FLastElemType     := Result;
-      FLastElemTypeName := typeName;
+      typeInfo.ElemType     := Result;
+      typeInfo.ElemTypeName := typeName;
       // Array type: type[N] or type[]
       if Check(tkIntLit) then
       begin
@@ -3372,14 +3388,14 @@ begin
           begin
             // Keep as typeName for struct types
             typeName := innerTypeName;
-            FLastElemType     := atUnresolved;
-            FLastElemTypeName := innerTypeName;
+            typeInfo.ElemType     := atUnresolved;
+            typeInfo.ElemTypeName := innerTypeName;
           end
           else
           begin
             Result := atArray;  // This is a static array
-            FLastElemType     := innerType;
-            FLastElemTypeName := '';
+            typeInfo.ElemType     := innerType;
+            typeInfo.ElemTypeName := '';
           end;
         end;
       end
@@ -3417,13 +3433,13 @@ begin
     end;
     
     // Recursively parse the base type of the array
-    baseType := ParseTypeExFull(innerArrayLen, innerTypeName, innerNullable);
+    baseType := ParseTypeExFull(innerArrayLen, innerTypeName, innerNullable, typeInfo);
     arrayLen := parsedLen;
     typeName := innerTypeName;
     isNullable := innerNullable;
     Result := baseType;
-    FLastElemType     := baseType;
-    FLastElemTypeName := innerTypeName;
+    typeInfo.ElemType     := baseType;
+    typeInfo.ElemTypeName := innerTypeName;
   end
   else
   begin
@@ -3446,7 +3462,7 @@ begin
   Result := ParseTypeEx(dummy, dummyName);
 end;
 
-function TParser.ParseParamList: TAstParamList;
+function TParser.ParseParamList(out isVarArgs: Boolean): TAstParamList;
 var
   params: TAstParamList;
   name: string;
@@ -3456,14 +3472,14 @@ var
   arrLen: Integer;
 begin
   params := nil;
-  FLastParamListVarArgs := False;
+  isVarArgs := False;
   while not Check(tkRParen) and not Check(tkEOF) do
   begin
     if Check(tkEllipsis) then
     begin
       // varargs marker
       Accept(tkEllipsis);
-      FLastParamListVarArgs := True;
+      isVarArgs := True;
       Break;
     end;
     if Check(tkIdent) then
