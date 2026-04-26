@@ -26,20 +26,25 @@ VERSION   := 0.8.3-aerospace
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
+DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
 
 STD_LYXFILES  := $(shell find std  -name "*.lyx" | sort)
 DATA_LYXFILES := $(shell find data -name "*.lyx" | sort)
 
 STD_LYUFILES  := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(STD_LYXFILES))
-DATA_LYUFILES := $(patsubst data/%.lyx, $(UNITS_DST)/%.lyu, $(DATA_LYXFILES))
+DATA_LYUFILES := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_LYXFILES))
 
 package: precompile-units install-bin
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
 
-precompile-units: $(STD_LYUFILES) $(DATA_LYUFILES)
+precompile-units:
+	@echo "Pass 1: Kompiliere Units (Dependencies aufbauen)..."
+	@$(MAKE) --no-print-directory -k $(STD_LYUFILES) $(DATA_LYUFILES) 2>/dev/null; true
+	@echo "Pass 2: Kompiliere abhängige Units..."
+	$(MAKE) --no-print-directory $(STD_LYUFILES) $(DATA_LYUFILES)
 	@echo "$(words $(STD_LYUFILES) $(DATA_LYUFILES)) Units vorkompiliert."
 
 install-bin:
@@ -52,7 +57,7 @@ $(UNITS_DST)/%.lyu: std/%.lyx
 	@echo "  precompile $<"
 	./lyxc --compile-unit $< -o $@
 
-$(UNITS_DST)/%.lyu: data/%.lyx
+$(DATA_DST)/%.lyu: data/%.lyx
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
 	./lyxc --compile-unit $< -o $@
