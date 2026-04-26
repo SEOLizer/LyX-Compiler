@@ -1234,10 +1234,16 @@ type
   private
     FUnitPath: string;
     FIntegrityAttr: TIntegrityAttr; // @integrity(mode:..., interval:N) before unit decl
+    FDescription: string;
+    FAuthor: string;
+    FCopyright: string;
   public
     constructor Create(const aPath: string; aSpan: TSourceSpan);
     property UnitPath: string read FUnitPath;
     property IntegrityAttr: TIntegrityAttr read FIntegrityAttr write FIntegrityAttr;
+    property Description: string read FDescription write FDescription;
+    property Author: string read FAuthor write FAuthor;
+    property Copyright: string read FCopyright write FCopyright;
   end;
 
   { Import-Item }
