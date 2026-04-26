@@ -84,6 +84,8 @@ type
     procedure GetUtypeRangeInfo(const tag: string; out kind: TUtypeRangeKind; out rMin, rMax: Double);
     function CompileRegex(const pattern: string; span: TSourceSpan;
       out compiled: string; out captureSlots: Integer): Boolean;
+    function IsKnownTypeName(const name: string): Boolean;
+    procedure ValidateTypeNames(prog: TAstProgram);
     function CheckExpr(expr: TAstExpr): TAurumType;
     function CheckStructLit(sl: TAstStructLit): TAurumType;
     procedure CheckStmt(stmt: TAstStmt);
@@ -2604,6 +2606,117 @@ begin
     idx := FTypeAliases.IndexOf(typeName);
     if idx >= 0 then
       Result := TAstTypeDecl(FTypeAliases.Objects[idx]).DeclType;
+  end;
+end;
+
+function TSema.IsKnownTypeName(const name: string): Boolean;
+begin
+  if name = '' then Exit(True);
+  // Primitive type names (int64, bool, f64, pchar, void, ...)
+  if StrToAurumType(name) <> atUnresolved then Exit(True);
+  // Special names used in method contexts
+  if (name = 'Self') or (name = 'self') or (name = 'TObject') then Exit(True);
+  // Qualified imported names (e.g. 'net.IPAddr') — validated at use site by import resolver
+  if Pos('.', name) > 0 then Exit(True);
+  // Registered named types
+  if Assigned(FStructTypes) and (FStructTypes.IndexOf(name) >= 0) then Exit(True);
+  if Assigned(FClassTypes)  and (FClassTypes.IndexOf(name) >= 0)  then Exit(True);
+  if Assigned(FEnumTypes)   and (FEnumTypes.IndexOf(name) >= 0)   then Exit(True);
+  if Assigned(FTypeAliases) and (FTypeAliases.IndexOf(name) >= 0) then Exit(True);
+  if Assigned(FRangeTypes)  and (FRangeTypes.IndexOf(name) >= 0)  then Exit(True);
+  if Assigned(FUnitTypes)   and (FUnitTypes.IndexOf(name) >= 0)   then Exit(True);
+  Result := False;
+end;
+
+procedure TSema.ValidateTypeNames(prog: TAstProgram);
+var
+  i, j, k: Integer;
+  node: TAstNode;
+  fn: TAstFuncDecl;
+  sd: TAstStructDecl;
+  cd: TAstClassDecl;
+  vd: TAstVarDecl;
+  genericParams: TStringArray;
+
+  function IsGenericParam(const name: string): Boolean;
+  var g: Integer;
+  begin
+    Result := False;
+    for g := 0 to High(genericParams) do
+      if genericParams[g] = name then Exit(True);
+  end;
+
+  procedure CheckTypeName(const name: string; span: TSourceSpan);
+  begin
+    if (name = '') or IsGenericParam(name) then Exit;
+    if not IsKnownTypeName(name) then
+      FDiag.Error('unknown type: ''' + name + '''', span);
+  end;
+
+  procedure CheckField(const fld: TStructField; span: TSourceSpan);
+  begin
+    CheckTypeName(fld.FieldTypeName, span);
+    CheckTypeName(fld.ElemTypeName,  span);
+    CheckTypeName(fld.KeyTypeName,   span);
+    CheckTypeName(fld.ValTypeName,   span);
+  end;
+
+  procedure CheckMethod(fn: TAstFuncDecl);
+  var p: Integer;
+  begin
+    if fn.ReturnTypeName <> '' then
+      CheckTypeName(fn.ReturnTypeName, fn.Span);
+    for p := 0 to High(fn.Params) do
+      CheckTypeName(fn.Params[p].TypeName, fn.Params[p].Span);
+  end;
+
+begin
+  genericParams := nil;
+  for i := 0 to High(prog.Decls) do
+  begin
+    node := prog.Decls[i];
+
+    if node is TAstFuncDecl then
+    begin
+      fn := TAstFuncDecl(node);
+      genericParams := fn.TypeParams;
+      CheckMethod(fn);
+      genericParams := nil;
+    end
+
+    else if node is TAstStructDecl then
+    begin
+      sd := TAstStructDecl(node);
+      for j := 0 to High(sd.Fields) do
+        CheckField(sd.Fields[j], sd.Span);
+      for k := 0 to High(sd.Methods) do
+      begin
+        genericParams := sd.Methods[k].TypeParams;
+        CheckMethod(sd.Methods[k]);
+        genericParams := nil;
+      end;
+    end
+
+    else if node is TAstClassDecl then
+    begin
+      cd := TAstClassDecl(node);
+      if (cd.BaseClassName <> '') and (cd.BaseClassName <> 'TObject') then
+        CheckTypeName(cd.BaseClassName, cd.Span);
+      for j := 0 to High(cd.Fields) do
+        CheckField(cd.Fields[j], cd.Span);
+      for k := 0 to High(cd.Methods) do
+      begin
+        genericParams := cd.Methods[k].TypeParams;
+        CheckMethod(cd.Methods[k]);
+        genericParams := nil;
+      end;
+    end
+
+    else if node is TAstVarDecl then
+    begin
+      vd := TAstVarDecl(node);
+      CheckTypeName(vd.DeclTypeName, vd.Span);
+    end;
   end;
 end;
 
@@ -6927,6 +7040,9 @@ begin
           ''' has no interval set; scrubbing requires a check interval (ms)', fn.Span);
     end;
   end;
+
+  // Type-name validation: catch unknown type names before body-checking
+  ValidateTypeNames(prog);
 
   // Second pass: check function bodies
   for i := 0 to High(prog.Decls) do
