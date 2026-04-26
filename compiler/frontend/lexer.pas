@@ -1027,7 +1027,9 @@ begin
     end;
     '@': begin
       Advance;
-      // Check for @big_endian or @little_endian (aerospace-todo P2 #52)
+      // Check for special @keyword tokens (aerospace-todo P2 #52)
+      // Only consume the identifier if it's a recognized @-keyword;
+      // otherwise rewind so the identifier is available as the next token.
       if (FPos <= Length(FSource)) and (FSource[FPos] in ['a'..'z', 'A'..'Z']) then
       begin
         identStart := FPos;
@@ -1044,6 +1046,8 @@ begin
           Result := MakeToken(tkLittleEndian, '@little_endian', startLine, startCol, FPos - startCol + 1);
           Exit;
         end;
+        // Unknown @ident — rewind so the identifier is the next token
+        FPos := identStart;
       end;
       Result := MakeToken(tkAt, '@', startLine, startCol, 1);
     end;

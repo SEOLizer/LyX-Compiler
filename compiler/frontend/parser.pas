@@ -29,6 +29,10 @@ type
     // @integrity pre-parsed at top of file before fn or unit (aerospace-todo P0 #43)
     FPendingIntegrity: TIntegrityAttr;
     FHasPendingIntegrity: Boolean;
+    // Unit metadata attributes pre-parsed before unit declaration
+    FPendingDescription: string;
+    FPendingAuthor: string;
+    FPendingCopyright: string;
     // Endianness annotation pending for next struct (aerospace-todo P2 #52)
     FPendingEndian: TEndianType;
 
@@ -216,6 +220,9 @@ begin
   FHasPendingIntegrity := False;
   FPendingIntegrity.Mode     := imNone;
   FPendingIntegrity.Interval := 0;
+  FPendingDescription := '';
+  FPendingAuthor      := '';
+  FPendingCopyright   := '';
   FPendingEndian := enNative; // aerospace-todo P2 #52
   Advance; // load first token
 end;
@@ -245,16 +252,60 @@ var
   integrityInterval: Int64;
 begin
   decls := nil;
-  // Pre-parse optional @integrity(...) at the very start of the file.
-  // Stored in FPendingIntegrity and consumed by either ParseUnitDecl (unit-level)
-  // or ParseFuncAttrs (function-level). (aerospace-todo P0 #43)
-  if Check(tkAt) then
+  // Pre-parse unit-level attributes at the very start of the file:
+  //   @description("..."), @author("..."), @copyright("...")
+  //   @integrity(mode:..., interval:N)  (aerospace-todo P0 #43)
+  // All are stored as pending fields and consumed by ParseUnitDecl.
+  while Check(tkAt) do
   begin
     peekTok := FLexer.PeekToken;
-    if (peekTok.Kind = tkIdent) and (peekTok.Value = 'integrity') then
+    if peekTok.Kind <> tkIdent then Break;
+    if peekTok.Value = 'description' then
     begin
-      Advance; // consume '@'
-      Advance; // consume 'integrity'
+      Advance; // '@'
+      Advance; // 'description'
+      Expect(tkLParen);
+      if Check(tkStrLit) then
+      begin
+        FPendingDescription := FCurTok.Value;
+        Advance;
+      end
+      else
+        FDiag.Error('expected string literal in @description(...)', FCurTok.Span);
+      Expect(tkRParen);
+    end
+    else if peekTok.Value = 'author' then
+    begin
+      Advance; // '@'
+      Advance; // 'author'
+      Expect(tkLParen);
+      if Check(tkStrLit) then
+      begin
+        FPendingAuthor := FCurTok.Value;
+        Advance;
+      end
+      else
+        FDiag.Error('expected string literal in @author(...)', FCurTok.Span);
+      Expect(tkRParen);
+    end
+    else if peekTok.Value = 'copyright' then
+    begin
+      Advance; // '@'
+      Advance; // 'copyright'
+      Expect(tkLParen);
+      if Check(tkStrLit) then
+      begin
+        FPendingCopyright := FCurTok.Value;
+        Advance;
+      end
+      else
+        FDiag.Error('expected string literal in @copyright(...)', FCurTok.Span);
+      Expect(tkRParen);
+    end
+    else if peekTok.Value = 'integrity' then
+    begin
+      Advance; // '@'
+      Advance; // 'integrity'
       Expect(tkLParen);
       if Check(tkIdent) and (FCurTok.Value = 'mode') then
       begin
@@ -306,7 +357,9 @@ begin
       end;
       Expect(tkRParen);
       FHasPendingIntegrity := (FPendingIntegrity.Mode <> imNone);
-    end;
+    end
+    else
+      Break; // unknown @attr — leave for ParseTopDecl
   end;
   // optional unit declaration
   if Check(tkUnit) then
@@ -1197,7 +1250,10 @@ begin
   end;
   Expect(tkSemicolon);
   Result := TAstUnitDecl.Create(path, FCurTok.Span);
-  // Apply any @integrity pre-parsed at the top of the file
+  // Apply unit metadata attributes pre-parsed at the top of the file
+  if FPendingDescription <> '' then begin Result.Description := FPendingDescription; FPendingDescription := ''; end;
+  if FPendingAuthor      <> '' then begin Result.Author      := FPendingAuthor;      FPendingAuthor      := ''; end;
+  if FPendingCopyright   <> '' then begin Result.Copyright   := FPendingCopyright;   FPendingCopyright   := ''; end;
   if FHasPendingIntegrity then
   begin
     Result.IntegrityAttr := FPendingIntegrity;
