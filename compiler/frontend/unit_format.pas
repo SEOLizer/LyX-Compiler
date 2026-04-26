@@ -52,6 +52,9 @@ type
     Flags: Byte;
     UnitNameLen: Word;
     UnitName: string;
+    Description: string;  { @description("...") from source }
+    Author: string;       { @author("...") from source }
+    Copyright: string;    { @copyright("...") from source }
     SymbolCount: Cardinal;
     TypeInfoOffset: Cardinal;
     IRCodeOffset: Cardinal;
@@ -94,14 +97,18 @@ type
   public
     constructor Create(d: TDiagnostics; arch: TLyuxArch; includeDebug: Boolean);
     destructor Destroy; override;
-    { Simple serializer (for v1 placeholder) }
+    { Simple serializer (for placeholder / non-IR units) }
     procedure Serialize(AUnitName: string; symbols: TLyuxSymbolArray;
-      funcCount: Integer; out buffer: TByteBuffer);
+      funcCount: Integer; out buffer: TByteBuffer;
+      const ADescription: string = ''; const AAuthor: string = '';
+      const ACopyright: string = '');
     { Append IR section to existing buffer (call after Serialize) }
     procedure AppendIRSection(IRModule: TIRModule; var buffer: TByteBuffer);
     { Full serializer with IR module }
     procedure SerializeModule(IRModule: TIRModule; AUnitName: string;
-      symbols: TLyuxSymbolArray; out buffer: TByteBuffer);
+      symbols: TLyuxSymbolArray; out buffer: TByteBuffer;
+      const ADescription: string = ''; const AAuthor: string = '';
+      const ACopyright: string = '');
   end;
 
   { Deserializer für .lyu }
@@ -134,7 +141,7 @@ implementation
 
 const
   LYU_MAGIC: array[0..3] of Char = ('L', 'Y', 'U', #0);
-  LYU_VERSION = 1;
+  LYU_VERSION = 2;
 
 { TLoadedLyux }
 
@@ -285,7 +292,8 @@ begin
 end;
 
 procedure TLyuxSerializer.Serialize(AUnitName: string;
-  symbols: TLyuxSymbolArray; funcCount: Integer; out buffer: TByteBuffer);
+  symbols: TLyuxSymbolArray; funcCount: Integer; out buffer: TByteBuffer;
+  const ADescription: string; const AAuthor: string; const ACopyright: string);
 var
   i: Integer;
   nameBytes: TBytes;
@@ -303,6 +311,11 @@ begin
   FBuffer.WriteU16LE(Length(nameBytes));
   for i := 0 to High(nameBytes) do
     FBuffer.WriteU8(nameBytes[i]);
+
+  { Unit metadata (v2) }
+  WriteString(ADescription);
+  WriteString(AAuthor);
+  WriteString(ACopyright);
 
   FBuffer.WriteU32LE(Length(symbols));
 
@@ -401,8 +414,8 @@ begin
 
   loaded.Header.Version := FBuffer.ReadU16LE(FPos);
   Inc(FPos, 2);
-  if loaded.Header.Version <> LYU_VERSION then
-    raise ELyuVersion.CreateFmt('Incompatible .lyu version: %d (expected %d)',
+  if loaded.Header.Version > LYU_VERSION then
+    raise ELyuVersion.CreateFmt('Incompatible .lyu version: %d (max supported: %d)',
       [loaded.Header.Version, LYU_VERSION]);
 
   loaded.Header.TargetArch := TLyuxArch(FBuffer.ReadU8(FPos));
@@ -410,6 +423,21 @@ begin
   loaded.Header.Flags := FBuffer.ReadU8(FPos);
   Inc(FPos);
   loaded.Header.UnitName := ReadString;
+
+  { v2: unit metadata strings }
+  if loaded.Header.Version >= 2 then
+  begin
+    loaded.Header.Description := ReadString;
+    loaded.Header.Author      := ReadString;
+    loaded.Header.Copyright   := ReadString;
+  end
+  else
+  begin
+    loaded.Header.Description := '';
+    loaded.Header.Author      := '';
+    loaded.Header.Copyright   := '';
+  end;
+
   loaded.Header.SymbolCount := ReadU32LEAdv;
   loaded.Header.TypeInfoOffset := ReadU32LEAdv;
   loaded.Header.IRCodeOffset := ReadU32LEAdv;
@@ -678,7 +706,8 @@ end;
 { TLyuxSerializer - Full IR Serialization }
 
 procedure TLyuxSerializer.SerializeModule(IRModule: TIRModule; AUnitName: string;
-  symbols: TLyuxSymbolArray; out buffer: TByteBuffer);
+  symbols: TLyuxSymbolArray; out buffer: TByteBuffer;
+  const ADescription: string; const AAuthor: string; const ACopyright: string);
 var
   i, j: Integer;
   nameBytes: TBytes;
@@ -697,6 +726,11 @@ begin
   FBuffer.WriteU16LE(Length(nameBytes));
   for i := 0 to High(nameBytes) do
     FBuffer.WriteU8(nameBytes[i]);
+
+  { Unit metadata (v2) }
+  WriteString(ADescription);
+  WriteString(AAuthor);
+  WriteString(ACopyright);
 
   FBuffer.WriteU32LE(Length(symbols));
 
