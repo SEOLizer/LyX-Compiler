@@ -34,7 +34,6 @@ type
     { Common Subexpression Elimination }
     function EliminateCommonSubexpr(func: TIRFunction): Boolean;
     function GetInstructionSignature(instr: TIRInstr): string;
-    function FindRedundantInstruction(func: TIRFunction; sig: string; startIdx: Integer): Integer;
     
     { Copy Propagation }
     function PropagateCopies(func: TIRFunction): Boolean;
@@ -660,99 +659,121 @@ end;
 
 { ===== COMMON SUBEXPRESSION ELIMINATION ===== }
 
+{ Returns a canonical string key for pure, side-effect-free computations.
+  Keys encode the operation and its *value operands* so that two instructions
+  computing the same value yield identical keys.  Empty string = not CSE-able.
+
+  NOTE: irLoadLocal/irLoadGlobal are intentionally excluded — the underlying
+  memory location may change between loads (e.g. dynarray push rewrites ptr),
+  so deduplication across stores would be unsound. }
 function TIROptimizer.GetInstructionSignature(instr: TIRInstr): string;
+var
+  op: Integer;
+  a, b: Integer; // operands, normalised for commutative ops
 begin
   Result := '';
+  op := Ord(instr.Op);
   case instr.Op of
-    irAdd, irSub, irMul, irDiv, irMod,
-    irAnd, irOr, irXor, irNor,
-    irShl, irShr,
-    irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
-    irFAdd, irFSub, irFMul, irFDiv,
-    irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
-      Result := Format('%d:%d:%d', [Ord(instr.Op), instr.Src1, instr.Src2]);
-    // NOTE: irLoadLocal and irLoadGlobal are NOT included for CSE because
-    // the underlying memory location can change between loads (e.g., dynamic
-    // arrays have their ptr modified by push operations). Eliminating
-    // redundant loads would be incorrect if a store or side-effect occurs
-    // between them.
-  else
-    Result := '';
-  end;
-end;
-
-function TIROptimizer.FindRedundantInstruction(func: TIRFunction; sig: string; startIdx: Integer): Integer;
-var
-  i: Integer;
-  instr: TIRInstr;
-begin
-  Result := -1;
-  for i := startIdx - 1 downto 0 do
-  begin
-    instr := func.Instructions[i];
-    if GetInstructionSignature(instr) = sig then
+    // ── Binary arithmetic (some commutative: normalise operand order) ──────
+    irAdd, irMul, irAnd, irOr, irXor, irNor,
+    irBitAnd, irBitOr, irBitXor,
+    irCmpEq, irCmpNeq,
+    irFAdd, irFMul,
+    irFCmpEq, irFCmpNeq:
     begin
-      // Found a redundant instruction
-      Result := i;
-      Exit;
+      // Commutative: put smaller operand first so (t2+t3) == (t3+t2)
+      if instr.Src1 <= instr.Src2 then begin a := instr.Src1; b := instr.Src2; end
+      else                              begin a := instr.Src2; b := instr.Src1; end;
+      Result := Format('%d:%d:%d', [op, a, b]);
     end;
-    
-    // Stop at control flow boundaries
-    case instr.Op of
-      irLabel, irJmp, irBrTrue, irBrFalse, irFuncExit:
-        Break;
-    end;
+    // Non-commutative binary
+    irSub, irDiv, irMod, irShl, irShr,
+    irCmpLt, irCmpLe, irCmpGt, irCmpGe,
+    irFSub, irFDiv,
+    irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe:
+      Result := Format('%d:%d:%d', [op, instr.Src1, instr.Src2]);
+    // ── Unary ops ──────────────────────────────────────────────────────────
+    irNeg, irFNeg, irNot, irBitNot, irFSqrt, irFToI, irIToF:
+      Result := Format('%d:%d', [op, instr.Src1]);
+    // Width-changing ops (op + source + target width)
+    irSExt, irZExt, irTrunc:
+      Result := Format('%d:%d:%d', [op, instr.Src1, instr.ImmInt]);
+    // ── Constant values ────────────────────────────────────────────────────
+    irConstInt:
+      Result := Format('%d::%d', [op, instr.ImmInt]);
+    irConstFloat:
+      Result := Format('%d::f%s', [op, FloatToStr(instr.ImmFloat)]);
+    irConstStr:
+      Result := Format('%d::s%s', [op, instr.ImmStr]);
   end;
 end;
 
+{ Block-local CSE using a per-block hash table (O(n log n) overall).
+  The table maps expression signature → first-occurrence Dest temp.
+  It is cleared at every irLabel (basic-block entry), so we never
+  reuse a value that may not dominate the current point. }
 function TIROptimizer.EliminateCommonSubexpr(func: TIRFunction): Boolean;
 var
   i, j, k: Integer;
   instr: TIRInstr;
   sig: string;
-  redundantIdx: Integer;
+  seen: TStringList;
+  idx: Integer;
   prevDest, curDest: Integer;
   newLen: Integer;
 begin
   Result := False;
-  if not Assigned(func) or not Assigned(func.Instructions) then Exit;
+  if not Assigned(func) or (Length(func.Instructions) = 0) then Exit;
 
-  for i := 0 to High(func.Instructions) do
-  begin
-    instr := func.Instructions[i];
-    sig := GetInstructionSignature(instr);
-
-    if sig <> '' then
+  seen := TStringList.Create;
+  seen.Sorted := True;
+  seen.Duplicates := dupIgnore; // first occurrence wins
+  try
+    for i := 0 to High(func.Instructions) do
     begin
-      redundantIdx := FindRedundantInstruction(func, sig, i);
-      if redundantIdx >= 0 then
-      begin
-        prevDest := func.Instructions[redundantIdx].Dest;
-        curDest  := func.Instructions[i].Dest;
+      instr := func.Instructions[i];
 
-        // Rewrite all forward uses of curDest to prevDest in-place
+      // Block boundary: values from a predecessor block may not be available
+      // here (no dominator analysis), so start fresh.
+      if instr.Op = irLabel then
+      begin
+        seen.Clear;
+        Continue;
+      end;
+
+      sig := GetInstructionSignature(instr);
+      if sig = '' then Continue;
+
+      idx := seen.IndexOf(sig);
+      if idx >= 0 then
+      begin
+        // Already computed in this block — reuse the earlier result
+        prevDest := PtrInt(seen.Objects[idx]);
+        curDest  := instr.Dest;
+
+        // Rewrite all forward uses of curDest → prevDest
         for j := i + 1 to High(func.Instructions) do
         begin
-          if func.Instructions[j].Src1 = curDest then
-            func.Instructions[j].Src1 := prevDest;
-          if func.Instructions[j].Src2 = curDest then
-            func.Instructions[j].Src2 := prevDest;
-          if func.Instructions[j].Src3 = curDest then
-            func.Instructions[j].Src3 := prevDest;
+          if func.Instructions[j].Src1 = curDest then func.Instructions[j].Src1 := prevDest;
+          if func.Instructions[j].Src2 = curDest then func.Instructions[j].Src2 := prevDest;
+          if func.Instructions[j].Src3 = curDest then func.Instructions[j].Src3 := prevDest;
           for k := 0 to High(func.Instructions[j].ArgTemps) do
             if func.Instructions[j].ArgTemps[k] = curDest then
               func.Instructions[j].ArgTemps[k] := prevDest;
         end;
 
-        // NOP the now-redundant instruction; DCE will compact
-        func.Instructions[i].Op := irInvalid;
+        func.Instructions[i].Op := irInvalid; // DCE will compact
         Result := True;
         SetChanged;
-      end;
+      end
+      else
+        seen.AddObject(sig, TObject(PtrInt(instr.Dest)));
     end;
+  finally
+    seen.Free;
   end;
 
-  // Compact: remove all irInvalid instructions produced above
+  // Compact: remove irInvalid slots produced above
   if Result then
   begin
     newLen := 0;
