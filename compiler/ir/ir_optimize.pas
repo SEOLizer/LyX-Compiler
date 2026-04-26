@@ -45,19 +45,22 @@ type
     { Helper }
     function NewTemp: Integer;
     procedure SetChanged;
+    function IsPureOp(op: TIROpKind): Boolean;
+    function EliminateUnreachableBlocks(func: TIRFunction): Boolean;
   public
     constructor Create(module: TIRModule);
     destructor Destroy; override;
-    
+
     { Führt alle Optimierungspässe aus }
     procedure Optimize;
-    
+
     { Einzelne Pässe }
     procedure FoldConstants;
     procedure EliminateDead;
     procedure EliminateCSE;
     procedure PropagateCopies;
     procedure ReduceStrengths;
+    procedure EliminateUnreachable;
     
     { Statistik }
     property Changed: Boolean read FChanged;
@@ -394,6 +397,142 @@ begin
   WriteLn('[IR-Optimize] Constant Folding abgeschlossen.');
 end;
 
+{ ===== CFG / UNREACHABLE BLOCK ELIMINATION ===== }
+
+function TIROptimizer.IsPureOp(op: TIROpKind): Boolean;
+begin
+  case op of
+    // Constants
+    irConstInt, irConstFloat, irConstStr,
+    // Integer arithmetic
+    irAdd, irSub, irMul, irDiv, irMod, irNeg,
+    // Float arithmetic
+    irFAdd, irFSub, irFMul, irFDiv, irFNeg, irFSqrt,
+    // Integer comparisons
+    irCmpEq, irCmpNeq, irCmpLt, irCmpLe, irCmpGt, irCmpGe,
+    // Float comparisons
+    irFCmpEq, irFCmpNeq, irFCmpLt, irFCmpLe, irFCmpGt, irFCmpGe,
+    // Logical / bitwise
+    irNot, irAnd, irOr, irNor, irXor,
+    irBitAnd, irBitOr, irBitXor, irBitNot,
+    irShl, irShr,
+    // Width / sign helpers
+    irSExt, irZExt, irTrunc,
+    // Float conversion
+    irFToI, irIToF,
+    // Type cast (value-only, no side effect)
+    irCast,
+    // Local/global loads (read-only)
+    irLoadLocal, irLoadLocalAddr, irLoadStructAddr,
+    irLoadGlobal, irLoadGlobalAddr,
+    // Array element load (read-only)
+    irLoadElem,
+    // Dynamic array length query
+    irDynArrayLen,
+    // Struct field loads
+    irLoadField, irLoadFieldHeap,
+    // Closure variable load
+    irLoadCaptured,
+    // SIMD element load
+    irSIMDLoadElem,
+    // Map / set read-only queries
+    irMapGet, irMapContains, irMapLen,
+    irSetContains, irSetLen,
+    // Type check
+    irIsType,
+    // Integrity check (pure query — no mutation)
+    irVerifyIntegrity:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function TIROptimizer.EliminateUnreachableBlocks(func: TIRFunction): Boolean;
+var
+  i, j, bb, succ: Integer;
+  reachable: array of Boolean;
+  queue: array of Integer;
+  qHead, qTail: Integer;
+begin
+  Result := False;
+  if not Assigned(func) then Exit;
+
+  func.BuildCFG;
+
+  if Length(func.BasicBlocks) = 0 then Exit;
+
+  // BFS from block 0 to find all reachable blocks
+  SetLength(reachable, Length(func.BasicBlocks));
+  for i := 0 to High(reachable) do reachable[i] := False;
+
+  SetLength(queue, Length(func.BasicBlocks));
+  qHead := 0; qTail := 0;
+  reachable[0] := True;
+  queue[qTail] := 0;
+  Inc(qTail);
+
+  while qHead < qTail do
+  begin
+    bb := queue[qHead];
+    Inc(qHead);
+    for j := 0 to High(func.BasicBlocks[bb].Successors) do
+    begin
+      succ := func.BasicBlocks[bb].Successors[j];
+      if not reachable[succ] then
+      begin
+        reachable[succ] := True;
+        queue[qTail] := succ;
+        Inc(qTail);
+      end;
+    end;
+  end;
+
+  // NOP all instructions belonging to unreachable blocks
+  for i := 0 to High(func.BasicBlocks) do
+  begin
+    if not reachable[i] then
+    begin
+      for j := func.BasicBlocks[i].StartIdx to func.BasicBlocks[i].EndIdx do
+      begin
+        func.Instructions[j].Op := irInvalid;
+        Result := True;
+      end;
+    end;
+  end;
+
+  // Compact irInvalid instructions out of the list
+  if Result then
+  begin
+    for i := High(func.Instructions) downto 0 do
+    begin
+      if func.Instructions[i].Op = irInvalid then
+      begin
+        if i < Length(func.Instructions) - 1 then
+          System.Move(func.Instructions[i+1], func.Instructions[i],
+                      (Length(func.Instructions) - i - 1) * SizeOf(TIRInstr));
+        SetLength(func.Instructions, Length(func.Instructions) - 1);
+      end;
+    end;
+    SetChanged;
+  end;
+end;
+
+procedure TIROptimizer.EliminateUnreachable;
+var
+  i: Integer;
+  func: TIRFunction;
+begin
+  if not Assigned(FModule) then Exit;
+  for i := 0 to High(FModule.Functions) do
+  begin
+    func := FModule.Functions[i];
+    if Assigned(func) then
+      EliminateUnreachableBlocks(func);
+  end;
+  WriteLn('[IR-Optimize] Unreachable block elimination abgeschlossen.');
+end;
+
 { ===== DEAD CODE ELIMINATION ===== }
 
 function TIROptimizer.ComputeLiveness(func: TIRFunction; out liveDest: TBoolArray): Boolean;
@@ -473,16 +612,14 @@ begin
       end;
     end;
 
-    // Other operations that write to unused temps
-    if (instr.Dest >= 0) and (instr.Op <> irLabel) and
-       (instr.Op <> irJmp) and (instr.Op <> irBrTrue) and
-       (instr.Op <> irBrFalse) and (instr.Op <> irFuncExit) then
+    // Pure operations whose result is never read can be dropped safely
+    if IsPureOp(instr.Op) and (instr.Dest >= 0) then
     begin
       if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
       begin
-        // DON'T remove constants - they might be needed for correct code generation
-        // even if liveness analysis doesn't detect it (e.g., branch conditions)
-        // This is a conservative fix to ensure correctness
+        func.Instructions[i].Op := irInvalid;
+        Result := True;
+        SetChanged;
       end;
     end;
   end;
@@ -1156,17 +1293,20 @@ begin
     
     // 1. Constant Folding
     FoldConstants;
-    
+
     // 2. Copy Propagation
     PropagateCopies;
-    
+
     // 3. Strength Reduction
     ReduceStrengths;
-    
+
     // 4. Common Subexpression Elimination
     EliminateCSE;
-    
-    // 5. Dead Code Elimination
+
+    // 5. Unreachable block elimination (requires CFG)
+    EliminateUnreachable;
+
+    // 6. Dead Code Elimination
     EliminateDead;
     
   until (not FChanged) or (FPassCount >= FMaxPasses);
