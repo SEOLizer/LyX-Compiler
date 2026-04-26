@@ -85,6 +85,7 @@ var
   loadedUnit: TLoadedLyux;  { For .lyu loading }
   lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
   fn: TAstFuncDecl;  { For unit compilation }
+  sd: TAstStructDecl;  { For struct export }
   symIdx: Integer;  { For unit compilation }
   unitName: string;  { For unit compilation }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
@@ -1142,6 +1143,30 @@ begin
                   + ':' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMax);
               end;
               WriteLn('  Exportiere: pub utype ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
+            end;
+          end
+          // Export pub struct declarations
+          else if prog.Decls[i] is TAstStructDecl then
+          begin
+            sd := TAstStructDecl(prog.Decls[i]);
+            if sd.IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := sd.Name;
+              lyuSymbols[symIdx].Kind := lskStruct;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := '';
+              for j := 0 to High(sd.Fields) do
+              begin
+                if j > 0 then lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ';';
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + sd.Fields[j].Name + '=';
+                if sd.Fields[j].FieldType <> atUnresolved then
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(sd.Fields[j].FieldType)
+                else
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + sd.Fields[j].FieldTypeName;
+              end;
+              WriteLn('  Exportiere: pub struct ', sd.Name, '(', lyuSymbols[symIdx].TypeInfo, ')');
             end;
           end;
         end;
