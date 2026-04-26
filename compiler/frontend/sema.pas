@@ -4883,6 +4883,11 @@ begin
               if other.Size = 0 then begin ok := False; Break; end;
               elemSz := other.Size; elemAlign := other.Align;
             end
+            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.ElemTypeName) >= 0) then
+            begin
+              // Class-typed array element stored as heap pointer
+              elemSz := 8; elemAlign := 8;
+            end
             else begin ok := False; Break; end;
           end
           else if f.FieldType <> atUnresolved then
@@ -5068,6 +5073,8 @@ var
   baseCd: TAstClassDecl;
   baseIdx: Integer;
   totalSize, maxAlign, off, fsize, falign, baseSize: Integer;
+  elemSz, elemAlign: Integer;
+  other: TAstStructDecl;
   f: TStructField;
   ok: Boolean;
   // helper function
@@ -5132,7 +5139,49 @@ begin
       begin
         f := cd.Fields[fldIdx];
         // Determine field size/alignment
-        if f.FieldType <> atUnresolved then
+        // --- dynamic array fat-pointer ---
+        if (f.ArrayLen < 0) or (f.FieldType = atDynArray) then
+        begin
+          fsize := 16; falign := 8;
+        end
+        // --- static inline array (N * sizeof(ElemType)) ---
+        else if f.ArrayLen > 0 then
+        begin
+          elemSz := 0; elemAlign := 0;
+          if f.ElemType <> atUnresolved then
+          begin
+            if not TypeSizeAndAlign(f.ElemType, elemSz, elemAlign) then
+            begin
+              ok := False; Break;
+            end;
+          end
+          else if f.ElemTypeName <> '' then
+          begin
+            baseIdx := FStructTypes.IndexOf(f.ElemTypeName);
+            if baseIdx >= 0 then
+            begin
+              other := TAstStructDecl(FStructTypes.Objects[baseIdx]);
+              if other.Size = 0 then begin ok := False; Break; end;
+              elemSz := other.Size; elemAlign := other.Align;
+            end
+            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.ElemTypeName) >= 0) then
+            begin
+              // Class-typed array element stored as heap pointer
+              elemSz := 8; elemAlign := 8;
+            end
+            else begin ok := False; Break; end;
+          end
+          else if f.FieldType <> atUnresolved then
+          begin
+            if not TypeSizeAndAlign(f.FieldType, elemSz, elemAlign) then
+            begin ok := False; Break; end;
+          end
+          else begin ok := False; Break; end;
+          if elemSz = 0 then begin ok := False; Break; end;
+          fsize  := f.ArrayLen * elemSz;
+          falign := elemAlign;
+        end
+        else if f.FieldType <> atUnresolved then
         begin
           if not TypeSizeAndAlign(f.FieldType, fsize, falign) then
           begin

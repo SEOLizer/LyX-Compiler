@@ -3986,10 +3986,10 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
             tOk     := NewTemp; instr := Default(TIRInstr); instr.Op := irCmpGe; instr.Dest := tOk; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
             errLbl  := NewLabel('Larr_oob');
             instr := Default(TIRInstr); instr.Op := irBrTrue; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
-            // addrBase = base - fldOffset (stack) or base + fldOffset (heap)
+            // addrBase = struct_base + fldOffset (both heap and stack use actual address + offset)
             tOffset  := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := tOffset; instr.ImmInt := fldOffset; Emit(instr);
             addrBase := NewTemp; instr := Default(TIRInstr);
-            if isHeap then instr.Op := irAdd else instr.Op := irSub;
+            instr.Op := irAdd;
             instr.Dest := addrBase; instr.Src1 := t1; instr.Src2 := tOffset; Emit(instr);
             t0 := NewTemp; instr := Default(TIRInstr); instr.Op := irLoadElem; instr.Dest := t0; instr.Src1 := addrBase; instr.Src2 := t2; instr.ImmInt := elemSize; Emit(instr);
             Result := t0;
@@ -6017,6 +6017,12 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
     fi: Integer;
     fldOffset: Integer;
     fldType: TAurumType;
+    // struct/class field static array assignment helpers
+    fAccess2: TAstFieldAccess;
+    fldArrLen2: Integer;
+    fldElemType2: TAurumType;
+    isHeap2: Boolean;
+    addrBase2, tOffset2: Integer;
     // range type helpers (aerospace-todo P1 #7)
     rtIdx, rtIdx2: Integer;
     rtDecl, rtDecl2: TAstTypeDecl;
@@ -6770,6 +6776,86 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       begin
         FDiag.Error('sets are not indexable, cannot assign to set elements', stmt.Span);
         Exit(False);
+      end;
+
+      // Struct/class field static array assignment: p.items[i] := v
+      if TAstIndexAssign(stmt).Target.Obj is TAstFieldAccess then
+      begin
+        fAccess2 := TAstFieldAccess(TAstIndexAssign(stmt).Target.Obj);
+        fldArrLen2 := 0;
+        fldElemType2 := atUnresolved;
+
+        if fAccess2.OwnerName <> '' then
+        begin
+          structIdx := FStructTypes.IndexOf(fAccess2.OwnerName);
+          if structIdx >= 0 then
+          begin
+            sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
+            for fi := 0 to High(sd.Fields) do
+              if sd.Fields[fi].Name = fAccess2.Field then
+              begin
+                fldArrLen2   := sd.Fields[fi].ArrayLen;
+                fldElemType2 := sd.Fields[fi].ElemType;
+                fldType      := sd.Fields[fi].FieldType;
+                Break;
+              end;
+          end;
+        end;
+
+        isHeap2 := (fAccess2.OwnerName <> '') and
+                   (FClassTypes.IndexOf(fAccess2.OwnerName) >= 0);
+
+        if fldArrLen2 > 0 then
+        begin
+          // Get struct/class base address
+          t1 := LowerExpr(fAccess2.Obj);
+          if t1 < 0 then Exit(False);
+
+          if fldElemType2 <> atUnresolved then
+            elemSize := TypeSizeBytes(fldElemType2)
+          else
+            elemSize := TypeSizeBytes(fldType);
+          if elemSize < 1 then elemSize := 8;
+
+          t2 := LowerExpr(TAstIndexAssign(stmt).Target.Index);
+          if t2 < 0 then Exit(False);
+          t0 := LowerExpr(TAstIndexAssign(stmt).Value);
+          if t0 < 0 then Exit(False);
+
+          // Bounds check
+          tLen := NewTemp; instr := Default(TIRInstr);
+          instr.Op := irConstInt; instr.Dest := tLen; instr.ImmInt := fldArrLen2; Emit(instr);
+          tOk := NewTemp; instr := Default(TIRInstr);
+          instr.Op := irCmpGe; instr.Dest := tOk; instr.Src1 := t2; instr.Src2 := tLen; Emit(instr);
+          errLbl := NewLabel('Larr_oob');
+          instr := Default(TIRInstr); instr.Op := irBrTrue; instr.Src1 := tOk; instr.LabelName := errLbl; Emit(instr);
+
+          // addrBase = struct_base + fldOffset (same for heap and stack)
+          fldOffset := fAccess2.FieldOffset;
+          tOffset2 := NewTemp; instr := Default(TIRInstr);
+          instr.Op := irConstInt; instr.Dest := tOffset2; instr.ImmInt := fldOffset; Emit(instr);
+          addrBase2 := NewTemp; instr := Default(TIRInstr);
+          instr.Op := irAdd; instr.Dest := addrBase2; instr.Src1 := t1; instr.Src2 := tOffset2; Emit(instr);
+
+          // Store: [addrBase2 + t2 * elemSize] = t0
+          instr := Default(TIRInstr);
+          instr.Op := irStoreElemDyn; instr.Src1 := addrBase2; instr.Src2 := t2; instr.Src3 := t0; Emit(instr);
+
+          skipLbl := NewLabel('Larr_ok');
+          instr := Default(TIRInstr); instr.Op := irJmp; instr.LabelName := skipLbl; Emit(instr);
+          instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := errLbl; Emit(instr);
+          msgTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstStr; instr.Dest := msgTmp;
+          instr.ImmStr := IntToStr(FModule.InternString('Array index out of bounds')); Emit(instr);
+          instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'PrintStr';
+          instr.ImmInt := 1; SetLength(instr.ArgTemps, 1); instr.ArgTemps[0] := msgTmp; Emit(instr);
+          codeTmp := NewTemp; instr := Default(TIRInstr); instr.Op := irConstInt; instr.Dest := codeTmp; instr.ImmInt := 1; Emit(instr);
+          instr := Default(TIRInstr); instr.Op := irCallBuiltin; instr.Dest := -1; instr.ImmStr := 'exit';
+          instr.ImmInt := 1; SetLength(instr.ArgTemps, 1); instr.ArgTemps[0] := codeTmp; Emit(instr);
+          instr := Default(TIRInstr); instr.Op := irLabel; instr.LabelName := skipLbl; Emit(instr);
+
+          Exit(True);
+        end;
+        // Fall through for non-array struct field indexing (e.g., dynamic array or map)
       end;
 
       // Regular array assignment
