@@ -51,6 +51,7 @@ type
     FStructTypes: TStringList; // name -> TAstStructDecl as object
     FClassTypes: TStringList;  // name -> TAstClassDecl as object
     FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
+    FTypeAliases: TStringList; // name -> TAurumType value (simple type aliases, e.g. type fd = int64)
     FRangeTypes: TStringList;  // name -> TAstTypeDecl (range types, aerospace-todo P1 #7)
     FDimensions: TStringList;  // dim names (unit types P1)
     FDimExprs: TStringList;    // parallel: normalized dim expression for FDimensions[i]
@@ -75,6 +76,7 @@ type
     procedure ProcessImports(prog: TAstProgram);
     procedure ImportUnit(imp: TAstImportDecl);
     function TypeEqual(a, b: TAurumType): Boolean;
+    function ResolveTypeAlias(t: TAurumType; const typeName: string): TAurumType;
     function GetDimForUnitTag(const tag: string): string;
     function GetDimNameForExpr(const normExpr: string): string;
     function FindUtypeForDim(const dimName: string): string;
@@ -2557,6 +2559,18 @@ begin
   Result := False;
 end;
 
+function TSema.ResolveTypeAlias(t: TAurumType; const typeName: string): TAurumType;
+var idx: Integer;
+begin
+  Result := t;
+  if (t = atUnresolved) and (typeName <> '') and Assigned(FTypeAliases) then
+  begin
+    idx := FTypeAliases.IndexOf(typeName);
+    if idx >= 0 then
+      Result := TAstTypeDecl(FTypeAliases.Objects[idx]).DeclType;
+  end;
+end;
+
 function TSema.CheckExpr(expr: TAstExpr): TAurumType;
 var
   ident: TAstIdent;
@@ -3076,7 +3090,7 @@ begin
         end
         else
         begin
-          Result := s.DeclType;
+          Result := ResolveTypeAlias(s.DeclType, s.TypeName);
           // Propagate unit tag from symbol to expression
           if s.UnitTag <> '' then
             expr.UnitTag := s.UnitTag;
@@ -3172,7 +3186,12 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
              end;
             tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
               begin
-                if TypeEqual(lt, atBool) and TypeEqual(rt, atBool) then
+                if (lt = atUnresolved) or (rt = atUnresolved) then
+                begin
+                  // One side is unresolved (e.g. struct field or type alias) — skip bool guard
+                  Result := atBool;
+                end
+                else if TypeEqual(lt, atBool) and TypeEqual(rt, atBool) then
                 begin
                   Result := atBool;
                 end
@@ -4692,6 +4711,8 @@ begin
   FClassTypes.Sorted := False;
   FEnumTypes := TStringList.Create;
   FEnumTypes.Sorted := False;
+  FTypeAliases := TStringList.Create;
+  FTypeAliases.Sorted := False;
   FRangeTypes := TStringList.Create;
   FRangeTypes.Sorted := False;
   FDimensions := TStringList.Create;
@@ -4733,6 +4754,8 @@ begin
     FStructTypes.Free;
   if Assigned(FEnumTypes) then
     FEnumTypes.Free;
+  if Assigned(FTypeAliases) then
+    FTypeAliases.Free;
   if Assigned(FRangeTypes) then
     FRangeTypes.Free;
   if Assigned(FDimensions) then
@@ -6561,6 +6584,12 @@ begin
             FRangeTypes.AddObject(TAstTypeDecl(node).Name, System.TObject(node))
           else
             FDiag.Error('redeclaration of range type: ' + TAstTypeDecl(node).Name, node.Span);
+        end
+        // Register simple type aliases: pub type X = primitiveType
+        else if TAstTypeDecl(node).DeclType <> atUnresolved then
+        begin
+          if FTypeAliases.IndexOf(TAstTypeDecl(node).Name) < 0 then
+            FTypeAliases.AddObject(TAstTypeDecl(node).Name, System.TObject(node));
         end;
       end
       else if node is TAstConDecl then
