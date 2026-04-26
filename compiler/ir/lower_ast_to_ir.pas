@@ -72,6 +72,13 @@ type
     { Emits IR range-check for value in temp tVal against [rMin..rMax] (aerospace-todo P1 #7) }
     procedure EmitRangeCheck(tVal: Integer; rMin, rMax: Int64; const typeName: string; span: TSourceSpan);
 
+    { Emits runtime float range-check: panics if tVal not in [rMin, rMax) }
+    procedure EmitFloatRangeCheck(tVal: Integer; rMin, rMax: Double; const typeName: string; span: TSourceSpan);
+
+    { Emits cyclic wrap math: result = rMin + fmod(tVal - rMin, rMax - rMin), negative-safe.
+      Returns a new temp holding the wrapped value. }
+    function EmitFloatWrap(tVal: Integer; rMin, rMax: Double; span: TSourceSpan): Integer;
+
     procedure EmitScopeDrops; // WP9: emit nil-guarded frees for Map/Set locals and struct fields
     function LowerStmt(stmt: TAstStmt): Boolean;
     function LowerExpr(expr: TAstExpr): Integer; // returns temp index
@@ -259,6 +266,103 @@ begin
   instr.Op := irPanic; instr.Src1 := tMsg; instr.ImmInt := Length(msgStr); Emit(instr);
 
   instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
+end;
+
+{ Emits runtime float range-check: panics if tVal not in [rMin, rMax) }
+procedure TIRLowering.EmitFloatRangeCheck(tVal: Integer; rMin, rMax: Double;
+  const typeName: string; span: TSourceSpan);
+var
+  instr: TIRInstr;
+  tMin, tMax, tGeMin, tLtMax, tOk, tMsg: Integer;
+  failLbl, okLbl, msgStr: string;
+begin
+  instr := Default(TIRInstr);
+  instr.SourceLine := span.Line;
+  instr.SourceFile := span.FileName;
+
+  tMin := NewTemp;
+  instr.Op := irConstFloat; instr.Dest := tMin; instr.ImmFloat := rMin; Emit(instr);
+  tMax := NewTemp;
+  instr.Op := irConstFloat; instr.Dest := tMax; instr.ImmFloat := rMax; Emit(instr);
+
+  // tGeMin = (tVal >= rMin)
+  tGeMin := NewTemp;
+  instr.Op := irFCmpGe; instr.Dest := tGeMin; instr.Src1 := tVal; instr.Src2 := tMin; Emit(instr);
+  // tLtMax = (tVal < rMax)
+  tLtMax := NewTemp;
+  instr.Op := irFCmpLt; instr.Dest := tLtMax; instr.Src1 := tVal; instr.Src2 := tMax; Emit(instr);
+  // tOk = tGeMin and tLtMax
+  tOk := NewTemp;
+  instr.Op := irAnd; instr.Dest := tOk; instr.Src1 := tGeMin; instr.Src2 := tLtMax; Emit(instr);
+
+  failLbl := NewLabel('Lfrange_fail');
+  okLbl   := NewLabel('Lfrange_ok');
+  instr.Op := irBrFalse; instr.Src1 := tOk; instr.LabelName := failLbl; Emit(instr);
+  instr.Op := irJmp;     instr.LabelName := okLbl; Emit(instr);
+
+  instr.Op := irLabel; instr.LabelName := failLbl; Emit(instr);
+  msgStr := Format('value out of range [%g, %g) for type %s', [rMin, rMax, typeName]);
+  tMsg := NewTemp;
+  instr.Op := irConstStr; instr.Dest := tMsg;
+  instr.ImmStr := IntToStr(FModule.InternString(msgStr));
+  instr.ImmInt := Length(msgStr); Emit(instr);
+  instr.Op := irPanic; instr.Src1 := tMsg; instr.ImmInt := Length(msgStr); Emit(instr);
+
+  instr.Op := irLabel; instr.LabelName := okLbl; Emit(instr);
+end;
+
+{ Emits cyclic wrap (branchless): result = rMin + (norm - trunc(norm/range)*range) + range*(norm<0)
+  where norm = tVal - rMin, range = rMax - rMin. }
+function TIRLowering.EmitFloatWrap(tVal: Integer; rMin, rMax: Double; span: TSourceSpan): Integer;
+var
+  instr: TIRInstr;
+  tMin, tRange, tNorm, tDivRaw, tDivInt, tDivF, tFloorPart, tRem, tZero,
+  tNegFlag, tNegF, tCorrAmt, tRemFinal, tResult: Integer;
+begin
+  instr := Default(TIRInstr);
+  instr.SourceLine := span.Line;
+  instr.SourceFile := span.FileName;
+
+  tMin := NewTemp;
+  instr.Op := irConstFloat; instr.Dest := tMin; instr.ImmFloat := rMin; Emit(instr);
+  tRange := NewTemp;
+  instr.Op := irConstFloat; instr.Dest := tRange; instr.ImmFloat := rMax - rMin; Emit(instr);
+
+  // norm = tVal - min
+  tNorm := NewTemp;
+  instr.Op := irFSub; instr.Dest := tNorm; instr.Src1 := tVal; instr.Src2 := tMin; Emit(instr);
+
+  // trunc(norm / range) via FToI+IToF
+  tDivRaw := NewTemp;
+  instr.Op := irFDiv; instr.Dest := tDivRaw; instr.Src1 := tNorm; instr.Src2 := tRange; Emit(instr);
+  tDivInt := NewTemp;
+  instr.Op := irFToI; instr.Dest := tDivInt; instr.Src1 := tDivRaw; Emit(instr);
+  tDivF := NewTemp;
+  instr.Op := irIToF; instr.Dest := tDivF; instr.Src1 := tDivInt; Emit(instr);
+
+  // rem = norm - trunc(norm/range)*range
+  tFloorPart := NewTemp;
+  instr.Op := irFMul; instr.Dest := tFloorPart; instr.Src1 := tDivF; instr.Src2 := tRange; Emit(instr);
+  tRem := NewTemp;
+  instr.Op := irFSub; instr.Dest := tRem; instr.Src1 := tNorm; instr.Src2 := tFloorPart; Emit(instr);
+
+  // branchless negative correction: rem += range * (rem < 0.0)
+  // tNegFlag = int(rem < 0)  →  tNegF = float  →  correction = tNegF * range
+  tZero := NewTemp;
+  instr.Op := irConstFloat; instr.Dest := tZero; instr.ImmFloat := 0.0; Emit(instr);
+  tNegFlag := NewTemp;
+  instr.Op := irFCmpLt; instr.Dest := tNegFlag; instr.Src1 := tRem; instr.Src2 := tZero; Emit(instr);
+  tNegF := NewTemp;
+  instr.Op := irIToF; instr.Dest := tNegF; instr.Src1 := tNegFlag; Emit(instr);
+  tCorrAmt := NewTemp;
+  instr.Op := irFMul; instr.Dest := tCorrAmt; instr.Src1 := tNegF; instr.Src2 := tRange; Emit(instr);
+  tRemFinal := NewTemp;
+  instr.Op := irFAdd; instr.Dest := tRemFinal; instr.Src1 := tRem; instr.Src2 := tCorrAmt; Emit(instr);
+
+  // result = remFinal + min
+  tResult := NewTemp;
+  instr.Op := irFAdd; instr.Dest := tResult; instr.Src1 := tRemFinal; instr.Src2 := tMin; Emit(instr);
+  Result := tResult;
 end;
 
 function TIRLowering.NewTemp: Integer;
@@ -4200,6 +4304,26 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
         rType := TAstCast(expr).CastType;
         castTypeName := TAstCast(expr).CastTypeName;
 
+        // Unit type conversion: value * (srcFactor / tgtFactor)
+        if TAstCast(expr).IsUnitConversion then
+        begin
+          t0 := NewTemp;
+          t2 := NewTemp;
+          instr := Default(TIRInstr);
+          instr.Op       := irConstFloat;
+          instr.Dest     := t2;
+          instr.ImmFloat := TAstCast(expr).UnitConvFactor;
+          Emit(instr);
+          instr := Default(TIRInstr);
+          instr.Op   := irFMul;
+          instr.Dest := t0;
+          instr.Src1 := t1;
+          instr.Src2 := t2;
+          Emit(instr);
+          Result := t0;
+          Exit;
+        end;
+
         t0 := NewTemp;
 
         // Check for class cast (target is a class name)
@@ -6374,6 +6498,11 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
            EmitRangeCheck(tmp, rtDecl.RangeMin, rtDecl.RangeMax, vd.DeclTypeName, vd.Span);
          end;
        end;
+       // Utype range enforcement: checked range → runtime panic; wraps → cyclic fold
+       case vd.RangeKind of
+         urkRange: EmitFloatRangeCheck(tmp, vd.RangeMin, vd.RangeMax, vd.DeclTypeName, vd.Span);
+         urkWraps: tmp := EmitFloatWrap(tmp, vd.RangeMin, vd.RangeMax, vd.Span);
+       end;
        instr.Op := irStoreLocal;
        instr.Dest := loc;
        instr.Src1 := tmp;
@@ -6464,6 +6593,13 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
           rtDecl2 := TAstTypeDecl(FRangeTypes.Objects[rtIdx2]);
           EmitRangeCheck(tmp, rtDecl2.RangeMin, rtDecl2.RangeMax, FLocalTypeNames[loc], stmt.Span);
         end;
+      end;
+      // Utype range enforcement on assignment
+      case TAstAssign(stmt).RangeKind of
+        urkRange: EmitFloatRangeCheck(tmp, TAstAssign(stmt).RangeMin, TAstAssign(stmt).RangeMax,
+                    TAstAssign(stmt).Name, stmt.Span);
+        urkWraps: tmp := EmitFloatWrap(tmp, TAstAssign(stmt).RangeMin, TAstAssign(stmt).RangeMax,
+                    stmt.Span);
       end;
       instr.Op := irStoreLocal;
       instr.Dest := loc;

@@ -44,6 +44,8 @@ type
     function ParseEnumDecl(isPub: Boolean): TAstEnumDecl;
     function ParseTypeDecl(isPub: Boolean): TAstNode;
     function ParseGlobalVarDecl(isPub: Boolean): TAstVarDecl;
+    function ParseDimDecl(isPub: Boolean): TAstDimDecl;
+    function ParseUtypeDecl(isPub: Boolean): TAstUtypeDecl;
     function ParseUnitDecl: TAstUnitDecl;
     function ParseImportDecl: TAstImportDecl;
 
@@ -381,9 +383,13 @@ begin
       Exit(ParseEnumDecl(True))
     else if Check(tkVar) or Check(tkLet) or Check(tkRedundant) then
       Exit(ParseGlobalVarDecl(True))
+    else if Check(tkDim) then
+      Exit(ParseDimDecl(True))
+    else if Check(tkUtype) then
+      Exit(ParseUtypeDecl(True))
     else
     begin
-      FDiag.Error('expected fn, con, type, enum, var or let after pub', FCurTok.Span);
+      FDiag.Error('expected fn, con, type, enum, var, let, dim or utype after pub', FCurTok.Span);
       Exit(nil);
     end;
   end;
@@ -474,6 +480,10 @@ begin
   // Global variables: var/let at top-level
   if Check(tkVar) or Check(tkLet) then
     Exit(ParseGlobalVarDecl(False));
+  if Check(tkDim) then
+    Exit(ParseDimDecl(False));
+  if Check(tkUtype) then
+    Exit(ParseUtypeDecl(False));
   // unexpected top-level
   FDiag.Error('unexpected top-level declaration', FCurTok.Span);
   Result := nil;
@@ -1673,6 +1683,135 @@ begin
   Result.ElemType := FLastElemType;
   Result.SetGlobal(True, isPub);
   Result.IsRedundant := isRedundant; // aerospace-todo P2 #51
+end;
+
+{ Parse: dim Name;  or  dim Name = DimExpr;
+  DimExpr is stored as a raw string for sema to evaluate. }
+function TParser.ParseDimDecl(isPub: Boolean): TAstDimDecl;
+var
+  name: string;
+  dimExpr: string;
+  span: TSourceSpan;
+  tok: TToken;
+begin
+  span := FCurTok.Span;
+  Expect(tkDim);
+  if Check(tkIdent) then
+  begin
+    name := FCurTok.Value;
+    Advance;
+  end
+  else
+  begin
+    FDiag.Error('expected dimension name after dim', FCurTok.Span);
+    name := '<unknown>';
+  end;
+  dimExpr := '';
+  if Accept(tkSingleEq) then
+  begin
+    // Parse dimension expression as a sequence of ident / ident * ident ...
+    // Just collect tokens as a string until semicolon
+    while not Check(tkSemicolon) and not Check(tkEOF) do
+    begin
+      tok := FCurTok;
+      dimExpr := dimExpr + tok.Value;
+      Advance;
+      if Check(tkStar) or Check(tkSlash) then
+      begin
+        dimExpr := dimExpr + ' ';
+      end
+      else if not Check(tkSemicolon) then
+        dimExpr := dimExpr + ' ';
+    end;
+    dimExpr := Trim(dimExpr);
+  end;
+  Expect(tkSemicolon);
+  Result := TAstDimDecl.Create(name, dimExpr, isPub, span);
+end;
+
+{ Parse: utype name: DimName = factor; }
+function TParser.ParseUtypeDecl(isPub: Boolean): TAstUtypeDecl;
+var
+  name: string;
+  dimName: string;
+  factor: Double;
+  span: TSourceSpan;
+  rangeKind: TUtypeRangeKind;
+  rangeMin, rangeMax: Double;
+  negSign: Double;
+begin
+  span := FCurTok.Span;
+  Expect(tkUtype);
+  if Check(tkIdent) then
+  begin
+    name := FCurTok.Value;
+    Advance;
+  end
+  else
+  begin
+    FDiag.Error('expected unit type name after utype', FCurTok.Span);
+    name := '<unknown>';
+  end;
+  Expect(tkColon);
+  if Check(tkIdent) then
+  begin
+    dimName := FCurTok.Value;
+    Advance;
+  end
+  else
+  begin
+    FDiag.Error('expected dimension name after colon in utype declaration', FCurTok.Span);
+    dimName := '<unknown>';
+  end;
+  Expect(tkSingleEq);
+  factor := 1.0;
+  if Check(tkFloatLit) then
+  begin
+    factor := StrToFloat(FCurTok.Value);
+    Advance;
+  end
+  else if Check(tkIntLit) then
+  begin
+    factor := StrToFloat(FCurTok.Value);
+    Advance;
+  end
+  else
+    FDiag.Error('expected numeric factor after = in utype declaration', FCurTok.Span);
+
+  // Optional range modifier: wraps MIN..MAX  or  range MIN..MAX
+  rangeKind := urkNone;
+  rangeMin  := 0.0;
+  rangeMax  := 0.0;
+  if Check(tkIdent) and ((FCurTok.Value = 'wraps') or (FCurTok.Value = 'range')) then
+  begin
+    if FCurTok.Value = 'wraps' then rangeKind := urkWraps
+    else                            rangeKind := urkRange;
+    Advance;
+    // parse min (allow leading minus)
+    negSign := 1.0;
+    if Check(tkMinus) then begin negSign := -1.0; Advance; end;
+    if Check(tkFloatLit) then begin rangeMin := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else if Check(tkIntLit) then begin rangeMin := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else FDiag.Error('expected numeric min after wraps/range keyword', FCurTok.Span);
+    if not Check(tkDotDot) then
+      FDiag.Error('expected .. between range bounds', FCurTok.Span)
+    else
+      Advance;
+    // parse max (allow leading minus)
+    negSign := 1.0;
+    if Check(tkMinus) then begin negSign := -1.0; Advance; end;
+    if Check(tkFloatLit) then begin rangeMax := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else if Check(tkIntLit) then begin rangeMax := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else FDiag.Error('expected numeric max after ..', FCurTok.Span);
+    if rangeMin >= rangeMax then
+      FDiag.Error('range min must be less than max', span);
+  end;
+
+  Expect(tkSemicolon);
+  Result := TAstUtypeDecl.Create(name, dimName, factor, isPub, span);
+  Result.RangeKind := rangeKind;
+  Result.RangeMin  := rangeMin;
+  Result.RangeMax  := rangeMax;
 end;
 
 function TParser.ParseForStmt: TAstFor;

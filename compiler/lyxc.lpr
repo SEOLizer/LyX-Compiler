@@ -85,6 +85,8 @@ var
   loadedUnit: TLoadedLyux;  { For .lyu loading }
   lyuSymbols: TLyuxSymbolArray;  { Exported symbols from unit }
   fn: TAstFuncDecl;  { For unit compilation }
+  sd: TAstStructDecl;  { For struct export }
+  cd: TAstClassDecl;  { For class export }
   symIdx: Integer;  { For unit compilation }
   unitName: string;  { For unit compilation }
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
@@ -566,7 +568,7 @@ begin
     // TOR-001: Handle --version
   if (ParamCount = 1) and (ParamStr(1) = '--version') then
   begin
-    WriteLn('lyxc 0.8.3-aerospace');
+    WriteLn('lyxc 0.8.4-aerospace');
     WriteLn('DO-178C TQL-5 Qualified Compiler');
     WriteLn('Target Platforms: Linux x86_64, Linux ARM64, Windows x64, macOS x86_64, macOS ARM64, ESP32');
     Halt(0);
@@ -577,7 +579,7 @@ begin
   begin
     WriteLn('Lyx Compiler Build Information');
     WriteLn('================================');
-    WriteLn('Version:         0.8.3-aerospace');
+    WriteLn('Version:         0.8.4-aerospace');
     WriteLn('TQL Level:       TQL-5 (DO-178C Section 12.2)');
     WriteLn('Build Host:      ', GetEnvironmentVariable('HOSTNAME'));
     WriteLn('Build OS:        ', {$IFDEF LINUX}'Linux'{$ELSE}{$IFDEF WINDOWS}'Windows'{$ELSE}'Unknown'{$ENDIF}{$ENDIF});
@@ -620,7 +622,7 @@ begin
 
   if ParamCount < 1 then
   begin
-    WriteLn(StdErr, 'Lyx Compiler v0.8.3-aerospace');
+    WriteLn(StdErr, 'Lyx Compiler v0.8.4-aerospace');
     WriteLn(StdErr, 'Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
     WriteLn(StdErr);
     WriteLn(StdErr, 'Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]');
@@ -975,7 +977,7 @@ begin
       outputFile := 'a.out';
   end;
 
-  WriteLn('Lyx Compiler v0.8.3-aerospace');
+  WriteLn('Lyx Compiler v0.8.4-aerospace');
   WriteLn('DO-178C TQL-5 Qualified');
   WriteLn('Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.');
   WriteLn;
@@ -1106,10 +1108,85 @@ begin
               end;
               WriteLn('  Exportiere: pub fn ', fn.Name, ' -> ', lyuSymbols[symIdx].TypeInfo);
             end;
+          end
+          // Export pub con declarations
+          else if prog.Decls[i] is TAstConDecl then
+          begin
+            if TAstConDecl(prog.Decls[i]).IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := TAstConDecl(prog.Decls[i]).Name;
+              lyuSymbols[symIdx].Kind := lskCon;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := FormatType(TAstConDecl(prog.Decls[i]).DeclType);
+              WriteLn('  Exportiere: pub con ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
+            end;
+          end
+          // Export pub dim declarations
+          else if prog.Decls[i] is TAstDimDecl then
+          begin
+            if TAstDimDecl(prog.Decls[i]).IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := TAstDimDecl(prog.Decls[i]).Name;
+              lyuSymbols[symIdx].Kind := lskDim;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := StringReplace(TAstDimDecl(prog.Decls[i]).DimExpr, ' ', '', [rfReplaceAll]);
+              WriteLn('  Exportiere: pub dim ', lyuSymbols[symIdx].Name, ' = "', lyuSymbols[symIdx].TypeInfo, '"');
+            end;
+          end
+          // Export pub utype declarations
+          else if prog.Decls[i] is TAstUtypeDecl then
+          begin
+            if TAstUtypeDecl(prog.Decls[i]).IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := TAstUtypeDecl(prog.Decls[i]).Name;
+              lyuSymbols[symIdx].Kind := lskUtype;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := TAstUtypeDecl(prog.Decls[i]).DimName
+                + '|' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).Factor);
+              case TAstUtypeDecl(prog.Decls[i]).RangeKind of
+                urkWraps: lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo
+                  + '|W:' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMin)
+                  + ':' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMax);
+                urkRange: lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo
+                  + '|R:' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMin)
+                  + ':' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMax);
+              end;
+              WriteLn('  Exportiere: pub utype ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
+            end;
+          end
+          // Export pub struct declarations
+          else if prog.Decls[i] is TAstStructDecl then
+          begin
+            sd := TAstStructDecl(prog.Decls[i]);
+            if sd.IsPublic then
+            begin
+              SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+              symIdx := High(lyuSymbols);
+              lyuSymbols[symIdx].Name := sd.Name;
+              lyuSymbols[symIdx].Kind := lskStruct;
+              lyuSymbols[symIdx].TypeHash := 0;
+              lyuSymbols[symIdx].TypeInfo := '';
+              for j := 0 to High(sd.Fields) do
+              begin
+                if j > 0 then lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ';';
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + sd.Fields[j].Name + '=';
+                if sd.Fields[j].FieldType <> atUnresolved then
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(sd.Fields[j].FieldType)
+                else
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + sd.Fields[j].FieldTypeName;
+              end;
+              WriteLn('  Exportiere: pub struct ', sd.Name, '(', lyuSymbols[symIdx].TypeInfo, ')');
+            end;
           end;
         end;
       end;
-      
+
       WriteLn;
       WriteLn('Gefundene Symbole: ', Length(lyuSymbols));
 
@@ -1126,6 +1203,36 @@ begin
         begin
           d.PrintAll;
           Halt(1);
+        end;
+
+        // Phase 3.5: Export pub class declarations (post-sema, size is now known)
+        if Assigned(prog) and Assigned(prog.Decls) then
+        begin
+          for i := 0 to High(prog.Decls) do
+          begin
+            if not (prog.Decls[i] is TAstClassDecl) then Continue;
+            cd := TAstClassDecl(prog.Decls[i]);
+            if not cd.IsPublic then Continue;
+            SetLength(lyuSymbols, Length(lyuSymbols) + 1);
+            symIdx := High(lyuSymbols);
+            lyuSymbols[symIdx].Name := cd.Name;
+            lyuSymbols[symIdx].Kind := lskClass;
+            lyuSymbols[symIdx].TypeHash := 0;
+            // TypeInfo: "base|size|align|field1=type1;field2=type2;..."
+            lyuSymbols[symIdx].TypeInfo := cd.BaseClassName
+              + '|' + IntToStr(cd.Size)
+              + '|' + IntToStr(cd.Align) + '|';
+            for j := 0 to High(cd.Fields) do
+            begin
+              if j > 0 then lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ';';
+              lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + cd.Fields[j].Name + '=';
+              if cd.Fields[j].FieldType <> atUnresolved then
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(cd.Fields[j].FieldType)
+              else
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + cd.Fields[j].FieldTypeName;
+            end;
+            WriteLn('  Exportiere: pub class ', cd.Name, '(', lyuSymbols[symIdx].TypeInfo, ')');
+          end;
         end;
 
         // Phase 4: Lower to IR
