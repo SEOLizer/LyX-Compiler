@@ -79,6 +79,7 @@ type
     function GetDimNameForExpr(const normExpr: string): string;
     function FindUtypeForDim(const dimName: string): string;
     function ComputeResultUnitTag(const leftTag, rightTag: string; op: TTokenKind; span: TSourceSpan): string;
+    procedure GetUtypeRangeInfo(const tag: string; out kind: TUtypeRangeKind; out rMin, rMax: Double);
     function CompileRegex(const pattern: string; span: TSourceSpan;
       out compiled: string; out captureSlots: Integer): Boolean;
     function CheckExpr(expr: TAstExpr): TAurumType;
@@ -2464,6 +2465,23 @@ begin
   end;
 end;
 
+{ Returns range enforcement info for a utype tag. kind=urkNone if none or unknown. }
+procedure TSema.GetUtypeRangeInfo(const tag: string; out kind: TUtypeRangeKind; out rMin, rMax: Double);
+var
+  idx: Integer;
+  ud: TAstUtypeDecl;
+begin
+  kind := urkNone; rMin := 0.0; rMax := 0.0;
+  if (tag = '') or not Assigned(FUnitTypes) then Exit;
+  idx := FUnitTypes.IndexOf(tag);
+  if idx < 0 then Exit;
+  ud := TAstUtypeDecl(FUnitTypes.Objects[idx]);
+  if not Assigned(ud) then Exit;
+  kind := ud.RangeKind;
+  rMin := ud.RangeMin;
+  rMax := ud.RangeMax;
+end;
+
 { Computes a unit tag for the result of op(leftTag, rightTag).
   For +/-, tags must have same dim (or one is empty) → result = leftTag.
   For *, result dim = leftDim*rightDim → find first utype with derived dim matching.
@@ -4085,6 +4103,10 @@ var
   rtIdx: Integer;
   rtDecl: TAstTypeDecl;
   litVal: Int64;
+  // utype range/wraps helpers
+  urk: TUtypeRangeKind;
+  urMin, urMax: Double;
+  constVal: Double;
 begin
   if stmt = nil then Exit;
 
@@ -4136,6 +4158,35 @@ begin
               [vd.Name, vd.DeclTypeName, GetDimForUnitTag(vd.DeclTypeName),
                vd.InitExpr.UnitTag, GetDimForUnitTag(vd.InitExpr.UnitTag)]), vd.Span);
           vtype := atF64;
+          // Annotate with range/wraps info so IR lowering can emit check or wrap
+          GetUtypeRangeInfo(vd.DeclTypeName, urk, urMin, urMax);
+          if urk <> urkNone then
+          begin
+            vd.RangeKind := urk;
+            vd.RangeMin  := urMin;
+            vd.RangeMax  := urMax;
+            // Compile-time check for constant float literals
+            if Assigned(vd.InitExpr) then
+            begin
+              constVal := 0.0;
+              if vd.InitExpr is TAstFloatLit then
+                constVal := TAstFloatLit(vd.InitExpr).Value
+              else if vd.InitExpr is TAstIntLit then
+                constVal := TAstIntLit(vd.InitExpr).Value
+              else
+                constVal := 1e308; // not a constant → skip
+              if constVal < 1e307 then  // was a constant
+              begin
+                if urk = urkRange then
+                begin
+                  if (constVal < urMin) or (constVal >= urMax) then
+                    FDiag.Error(Format('value %g is out of range [%g..%g) for type %s',
+                      [constVal, urMin, urMax, vd.DeclTypeName]), vd.Span);
+                end;
+                // urkWraps: constant wrap is computed at IR level, no error here
+              end;
+            end;
+          end;
         end
         // Resolve enum type names: var x: TokenKind := ... → treat as int64
         else if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
@@ -4269,6 +4320,17 @@ begin
         begin
           // WP-G: Log successful constraint
           LogConstraint('Assignment', AurumTypeToStr(s.DeclType), AurumTypeToStr(vtype), stmt.Span, 'OK');
+        end;
+        // Annotate with range/wraps info from the target variable's utype
+        if s.UnitTag <> '' then
+        begin
+          GetUtypeRangeInfo(s.UnitTag, urk, urMin, urMax);
+          if urk <> urkNone then
+          begin
+            asg.RangeKind := urk;
+            asg.RangeMin  := urMin;
+            asg.RangeMax  := urMax;
+          end;
         end;
       end;
     nkFieldAssign:
@@ -5422,9 +5484,12 @@ var
   paramTypes: TDynAurumTypeArr;
   paramCount: Integer;
   synNode: TAstUtypeDecl;
-  pipePos: Integer;
-  dimName, factorStr: string;
+  pipePos, pipe2Pos: Integer;
+  dimName, factorStr, rangeStr: string;
   factor: Double;
+  importedRangeKind: TUtypeRangeKind;
+  importedRangeMin, importedRangeMax: Double;
+  colonPos1, colonPos2: Integer;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -5669,13 +5734,40 @@ begin
         lskUtype:
         begin
           // Register unit type from precompiled unit
+          // TypeInfo format: "DimName|Factor"  or  "DimName|Factor|W:min:max"  or  "DimName|Factor|R:min:max"
           if FUnitTypes.IndexOf(lyuSym.Name) < 0 then
           begin
+            importedRangeKind := urkNone;
+            importedRangeMin  := 0.0;
+            importedRangeMax  := 0.0;
             pipePos := Pos('|', lyuSym.TypeInfo);
             if pipePos > 0 then
             begin
               dimName := Copy(lyuSym.TypeInfo, 1, pipePos - 1);
               factorStr := Copy(lyuSym.TypeInfo, pipePos + 1, MaxInt);
+              // check for second pipe (range suffix)
+              pipe2Pos := Pos('|', factorStr);
+              if pipe2Pos > 0 then
+              begin
+                rangeStr  := Copy(factorStr, pipe2Pos + 1, MaxInt);
+                factorStr := Copy(factorStr, 1, pipe2Pos - 1);
+                // rangeStr = "W:min:max" or "R:min:max"
+                if (Length(rangeStr) > 2) and (rangeStr[2] = ':') then
+                begin
+                  if rangeStr[1] = 'W' then importedRangeKind := urkWraps
+                  else if rangeStr[1] = 'R' then importedRangeKind := urkRange;
+                  if importedRangeKind <> urkNone then
+                  begin
+                    rangeStr := Copy(rangeStr, 3, MaxInt);
+                    colonPos1 := Pos(':', rangeStr);
+                    if colonPos1 > 0 then
+                    begin
+                      importedRangeMin := StrToFloatDef(Copy(rangeStr, 1, colonPos1 - 1), 0.0);
+                      importedRangeMax := StrToFloatDef(Copy(rangeStr, colonPos1 + 1, MaxInt), 0.0);
+                    end;
+                  end;
+                end;
+              end;
               factor := StrToFloatDef(factorStr, 1.0);
             end
             else
@@ -5684,6 +5776,9 @@ begin
               factor := 1.0;
             end;
             synNode := TAstUtypeDecl.Create(lyuSym.Name, dimName, factor, True, Default(TSourceSpan));
+            synNode.RangeKind := importedRangeKind;
+            synNode.RangeMin  := importedRangeMin;
+            synNode.RangeMax  := importedRangeMax;
             FUnitTypes.AddObject(lyuSym.Name, System.TObject(synNode));
           end;
         end;

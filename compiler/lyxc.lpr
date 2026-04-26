@@ -1133,6 +1133,14 @@ begin
               lyuSymbols[symIdx].TypeHash := 0;
               lyuSymbols[symIdx].TypeInfo := TAstUtypeDecl(prog.Decls[i]).DimName
                 + '|' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).Factor);
+              case TAstUtypeDecl(prog.Decls[i]).RangeKind of
+                urkWraps: lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo
+                  + '|W:' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMin)
+                  + ':' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMax);
+                urkRange: lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo
+                  + '|R:' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMin)
+                  + ':' + FloatToStr(TAstUtypeDecl(prog.Decls[i]).RangeMax);
+              end;
               WriteLn('  Exportiere: pub utype ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
             end;
           end;

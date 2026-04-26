@@ -1736,6 +1736,9 @@ var
   dimName: string;
   factor: Double;
   span: TSourceSpan;
+  rangeKind: TUtypeRangeKind;
+  rangeMin, rangeMax: Double;
+  negSign: Double;
 begin
   span := FCurTok.Span;
   Expect(tkUtype);
@@ -1774,8 +1777,41 @@ begin
   end
   else
     FDiag.Error('expected numeric factor after = in utype declaration', FCurTok.Span);
+
+  // Optional range modifier: wraps MIN..MAX  or  range MIN..MAX
+  rangeKind := urkNone;
+  rangeMin  := 0.0;
+  rangeMax  := 0.0;
+  if Check(tkIdent) and ((FCurTok.Value = 'wraps') or (FCurTok.Value = 'range')) then
+  begin
+    if FCurTok.Value = 'wraps' then rangeKind := urkWraps
+    else                            rangeKind := urkRange;
+    Advance;
+    // parse min (allow leading minus)
+    negSign := 1.0;
+    if Check(tkMinus) then begin negSign := -1.0; Advance; end;
+    if Check(tkFloatLit) then begin rangeMin := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else if Check(tkIntLit) then begin rangeMin := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else FDiag.Error('expected numeric min after wraps/range keyword', FCurTok.Span);
+    if not Check(tkDotDot) then
+      FDiag.Error('expected .. between range bounds', FCurTok.Span)
+    else
+      Advance;
+    // parse max (allow leading minus)
+    negSign := 1.0;
+    if Check(tkMinus) then begin negSign := -1.0; Advance; end;
+    if Check(tkFloatLit) then begin rangeMax := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else if Check(tkIntLit) then begin rangeMax := negSign * StrToFloat(FCurTok.Value); Advance; end
+    else FDiag.Error('expected numeric max after ..', FCurTok.Span);
+    if rangeMin >= rangeMax then
+      FDiag.Error('range min must be less than max', span);
+  end;
+
   Expect(tkSemicolon);
   Result := TAstUtypeDecl.Create(name, dimName, factor, isPub, span);
+  Result.RangeKind := rangeKind;
+  Result.RangeMin  := rangeMin;
+  Result.RangeMax  := rangeMax;
 end;
 
 function TParser.ParseForStmt: TAstFor;
