@@ -5490,6 +5490,10 @@ var
   importedRangeKind: TUtypeRangeKind;
   importedRangeMin, importedRangeMax: Double;
   colonPos1, colonPos2: Integer;
+  synStruct: TAstStructDecl;
+  structFields: TStructFieldList;
+  typeInfoStr, fieldStr, fieldName, fieldTypeName: string;
+  sepPos, eqPos: Integer;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -5721,6 +5725,47 @@ begin
           sym.IsImported := True;
           sym.IsGlobal := True;
           AddSymbolToCurrent(sym, Default(TSourceSpan));
+        end;
+        lskStruct:
+        begin
+          // Reconstruct struct type from TypeInfo: "field1=type1;field2=type2;..."
+          if not Assigned(FStructTypes) then
+          begin
+            FStructTypes := TStringList.Create;
+            FStructTypes.Sorted := False;
+          end;
+          if FStructTypes.IndexOf(lyuSym.Name) < 0 then
+          begin
+            SetLength(structFields, 0);
+            typeInfoStr := lyuSym.TypeInfo;
+            while typeInfoStr <> '' do
+            begin
+              sepPos := Pos(';', typeInfoStr);
+              if sepPos > 0 then
+              begin
+                fieldStr := Copy(typeInfoStr, 1, sepPos - 1);
+                typeInfoStr := Copy(typeInfoStr, sepPos + 1, MaxInt);
+              end
+              else
+              begin
+                fieldStr := typeInfoStr;
+                typeInfoStr := '';
+              end;
+              if fieldStr = '' then Continue;
+              eqPos := Pos('=', fieldStr);
+              if eqPos <= 0 then Continue;
+              fieldName := Copy(fieldStr, 1, eqPos - 1);
+              fieldTypeName := Copy(fieldStr, eqPos + 1, MaxInt);
+              SetLength(structFields, Length(structFields) + 1);
+              structFields[High(structFields)].Name := fieldName;
+              structFields[High(structFields)].FieldType := StrToAurumType(fieldTypeName);
+              structFields[High(structFields)].FieldTypeName := fieldTypeName;
+              structFields[High(structFields)].ArrayLen := 0;
+              structFields[High(structFields)].BitOffset := -1;
+            end;
+            synStruct := TAstStructDecl.Create(lyuSym.Name, structFields, nil, True, Default(TSourceSpan));
+            FStructTypes.AddObject(lyuSym.Name, System.TObject(synStruct));
+          end;
         end;
         lskDim:
         begin
