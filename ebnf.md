@@ -31,7 +31,10 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for to downto do repeat until switch case break default return true false null extern unit import pub as array struct class extends new dispose super static self Self private protected panic assert where value virtual override abstract enum match try catch throw limit`
+`fn var let co con if else while for do repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract`
+
+> `const` ist ein Alias für `con` (legacy-Kompatibilität).  
+> `pub` ist ein Alias für das interne `public`-Token.
 
 ### Integer-Literale mit verschiedenen Basen
 
@@ -63,15 +66,90 @@ Alle Integer-Literale werden intern als `int64` behandelt.
 
 * Zuweisung: `:=`
 * Arithmetik: `+ - * / %`
-* **String-Verkettung**: `+` (bei pchar + pchar)
+* Inkrement/Dekrement (Statement): `++` `--`
+* **String-Verkettung**: `+` (bei `pchar + pchar`)
 * Vergleich: `== != < <= > >=`
-* Logik: `&& || !`
-* Bitweise: `& | ^ ~ << >>`
-* Null-Safety: `? ?? ?.`
-* Pipe: `|>`
+  * `bool == bool` erlaubt (z. B. `x == true`, `x == false`)
+  * `bool == <anderer Typ>` → Compile-Fehler
+* Logik: `&& || !` (Short-Circuit; Operanden müssen `bool` sein)
+* Bitweise: `& | ^ ~ << >> |~`
+  * `|~` = bitweises NOR
+* Null-Safety: `?` (nullable Typ), `??` (Null-Coalescing), `?.` (Safe-Call)
+* Pipe: `|>` (Funktions-Pipeline)
 * Fat Arrow: `=>` (Pattern-Matching-Zweig)
+* Range: `..` (z. B. `range 0..100`)
+* Ellipsis: `...` (Variadic)
 * Namespace: `::` (Enum-Zugriff: `Color::Red`)
 * Sonstiges: `(` `)` `{` `}` `[` `]` `:` `,` `;` `.` `@`
+
+---
+
+## 1b) Top-Level-Deklarationen (Grammatik-Übersicht)
+
+```ebnf
+Program      = [ UnitDecl ] { TopDecl } ;
+UnitDecl     = [ IntegrityAttr ] "unit" DotPath ";" ;
+DotPath      = Ident { "." Ident } ;
+
+TopDecl      = ConDecl
+             | VarDecl
+             | FnDecl
+             | TypeDecl
+             | EnumDecl
+             | ExternFnDecl
+             | ImportDecl
+             ;
+
+ImportDecl   = "import" DotPath ";" ;
+
+(* Konstanten *)
+ConDecl      = [ "pub" ] "con" Ident ":" Type ":=" ConstExpr ";" ;
+ConstExpr    = Literal | Ident | UnaryOp ConstExpr | ConstExpr BinOp ConstExpr ;
+
+(* Variablen / co-Variablen *)
+VarDecl      = [ "pub" ] [ "@redundant" ] ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
+
+(* Funktionen *)
+FnDecl       = { FuncAttr } [ "pub" ] "fn" Ident [ "[" TypeParamList "]" ]
+               "(" [ ParamList ] ")" [ ":" ReturnType ] Block ;
+ExternFnDecl = "extern" "fn" Ident "(" [ ParamList ] ")" [ ":" Type ]
+               "link" StringLit ";" ;
+
+ParamList    = Param { "," Param } ;
+Param        = Ident ":" Type ;
+ReturnType   = Type | "(" Type { "," Type } ")" ;   (* Tuple-Rückgabe *)
+
+(* Typen *)
+TypeDecl     = [ "pub" ] "type" Ident "=" TypeDef ";" ;
+TypeDef      = BaseIntType [ RangeClause ]          (* Range-Typ *)
+             | [ EndianAttr ] "struct" "{" { StructField } "}"
+             | "flat" "struct" "{" { StructField } "}"
+             | "packed" "struct" "{" { PackedField } "}"
+             | ClassDef
+             ;
+
+StructField  = Ident ":" Type ";" ;
+PackedField  = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
+
+(* Statements *)
+Statement    = VarDecl | ConDecl
+             | AssignStmt | IncDecStmt
+             | IfStmt | WhileStmt | ForStmt | RepeatStmt | SwitchStmt | MatchStmt
+             | ReturnStmt | BreakStmt | ContinueStmt
+             | ExprStmt | Block
+             | NestedFnDecl
+             ;
+
+AssignStmt   = LValue ":=" Expr ";" ;
+IncDecStmt   = LValue ( "++" | "--" ) ";" ;
+BreakStmt    = "break" ";" ;
+ContinueStmt = "continue" ";" ;
+ReturnStmt   = "return" [ Expr ] ";" ;
+ExprStmt     = Expr ";" ;
+
+LValue       = Ident { "." Ident | "[" Expr "]" } ;
+Block        = "{" { Statement } "}" ;
+```
 
 ---
 
@@ -531,18 +609,36 @@ fn high_performance(): int64 {
 
 ### Primitive Typen
 
-* `int64`  (signed 64-bit, bestehender Haupttyp)
-* `int8`, `int16`, `int32`, `int64`  (signed Integer-Familie, Kurzform: **int**)
-* `uint8`, `uint16`, `uint32`, `uint64`  (unsigned Integer-Familie, Kurzform: **uint**)
-* `f32`, `f64`  (Floating-Point Typen: 32-bit und 64-bit)
-* `bool`   (`true` / `false`)
-* `void`   (nur als Funktionsrückgabetyp)
-* `pchar`  (Pointer, 64-bit; non-nullable, Standard für Stringliterale)
-* `pchar?` (Nullable Pointer, kann `null` sein)
-* `array`  (Dynamic Array mit Fat-Pointer: ptr/len/cap, heap-allokiert)
-* `parallel Array<T>` (SIMD-optimiertes, heap-allokiertes Array mit Element-Typ T; ✅ v0.2.2)
-* `Map<K, V>` (Hash-Map mit Key-Typ K und Value-Typ V; v0.5.0)
-* `Set<T>` (Hash-Set mit Element-Typ T; v0.5.0)
+```ebnf
+Type = BaseIntType | FloatType | "bool" | "void"
+     | "pchar" | "pchar?"
+     | "array" | "Map" "<" Type "," Type ">"
+     | "Set" "<" Type ">"
+     | Ident            (* benannter Typ / Struct / Klasse *)
+     | "fn" "(" [ ParamList ] ")" [ ":" Type ]   (* Funktionszeiger *)
+     ;
+
+BaseIntType = "int8"  | "int16"  | "int32"  | "int64"
+            | "uint8" | "uint16" | "uint32" | "uint64"
+            | "int"                          (* Alias für int64 *)
+            | "isize" | "usize"
+            ;
+FloatType   = "f32" | "f64" ;
+```
+
+| Typ | Größe | Beschreibung |
+|-----|-------|--------------|
+| `int8` … `int64` | 1–8 Bytes | Signed Integer |
+| `uint8` … `uint64` | 1–8 Bytes | Unsigned Integer |
+| `f32`, `f64` | 4 / 8 Bytes | Floating-Point |
+| `bool` | 1 Byte | `true` / `false` |
+| `void` | — | Nur als Rückgabetyp |
+| `pchar` | 8 Bytes | Non-nullable Pointer (null-terminierte Strings) |
+| `pchar?` | 8 Bytes | Nullable Pointer |
+| `array` | 24 Bytes | Dynamic Array Fat-Pointer (ptr/len/cap) |
+| `Map<K,V>` | — | Hash-Map (heap-allokiert) |
+| `Set<T>` | — | Hash-Set (heap-allokiert) |
+| `parallel Array<T>` | — | SIMD-Array (v0.2.2) |
 
 ### SIMD / ParallelArray (v0.2.2 ✅ ABGESCHLOSSEN)
 
@@ -834,8 +930,13 @@ player.health--;     // player.health := player.health - 1
 
 ### Bool-Regeln
 
-* `if`/`while` verlangen `bool`
-* `&&`/`||` short-circuit (Codegen muss Sprünge setzen)
+* `if`/`while` verlangen `bool` als Bedingung
+* `&&`/`||` short-circuit; beide Operanden müssen `bool` sein
+* `!` negiert einen `bool`-Ausdruck
+* **Vergleich mit `==` / `!=`**:
+  * `bool == bool` → erlaubt, Ergebnis `bool` (ermöglicht `x == true`, `x == false`)
+  * `bool == <anderer Typ>` → Compile-Fehler: *"bool can only be compared with true or false"*
+  * `bool` direkt in Bedingungen verwenden (`if (x)`) ist bevorzugt gegenüber `if (x == true)`
 
 ### Builtin-Funktionen Regeln
 
