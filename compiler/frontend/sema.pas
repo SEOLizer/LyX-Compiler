@@ -5514,9 +5514,13 @@ var
   importedRangeMin, importedRangeMax: Double;
   colonPos1, colonPos2: Integer;
   synStruct: TAstStructDecl;
+  synClass: TAstClassDecl;
   structFields: TStructFieldList;
   typeInfoStr, fieldStr, fieldName, fieldTypeName: string;
   sepPos, eqPos: Integer;
+  classBase, classSizeStr, classAlignStr, classFieldsStr: string;
+  classSize, classAlign: Integer;
+  p1Pos, p2Pos: Integer;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -5785,9 +5789,94 @@ begin
               structFields[High(structFields)].FieldTypeName := fieldTypeName;
               structFields[High(structFields)].ArrayLen := 0;
               structFields[High(structFields)].BitOffset := -1;
+              structFields[High(structFields)].Visibility := visPublic;
             end;
             synStruct := TAstStructDecl.Create(lyuSym.Name, structFields, nil, True, Default(TSourceSpan));
             FStructTypes.AddObject(lyuSym.Name, System.TObject(synStruct));
+          end;
+        end;
+        lskClass:
+        begin
+          // Reconstruct class type from TypeInfo: "base|size|align|field1=type1;..."
+          if not Assigned(FClassTypes) then
+          begin
+            FClassTypes := TStringList.Create;
+            FClassTypes.Sorted := False;
+          end;
+          if FClassTypes.IndexOf(lyuSym.Name) < 0 then
+          begin
+            // Parse "base|size|align|fields"
+            p1Pos := Pos('|', lyuSym.TypeInfo);
+            if p1Pos > 0 then
+            begin
+              classBase := Copy(lyuSym.TypeInfo, 1, p1Pos - 1);
+              typeInfoStr := Copy(lyuSym.TypeInfo, p1Pos + 1, MaxInt);
+              p2Pos := Pos('|', typeInfoStr);
+              if p2Pos > 0 then
+              begin
+                classSizeStr  := Copy(typeInfoStr, 1, p2Pos - 1);
+                typeInfoStr   := Copy(typeInfoStr, p2Pos + 1, MaxInt);
+                p2Pos := Pos('|', typeInfoStr);
+                if p2Pos > 0 then
+                begin
+                  classAlignStr  := Copy(typeInfoStr, 1, p2Pos - 1);
+                  classFieldsStr := Copy(typeInfoStr, p2Pos + 1, MaxInt);
+                end
+                else
+                begin
+                  classAlignStr  := typeInfoStr;
+                  classFieldsStr := '';
+                end;
+              end
+              else
+              begin
+                classSizeStr  := typeInfoStr;
+                classAlignStr := '8';
+                classFieldsStr := '';
+              end;
+            end
+            else
+            begin
+              classBase := '';
+              classSizeStr := '8';
+              classAlignStr := '8';
+              classFieldsStr := lyuSym.TypeInfo;
+            end;
+            classSize  := StrToIntDef(classSizeStr, 8);
+            classAlign := StrToIntDef(classAlignStr, 8);
+            // Parse fields
+            SetLength(structFields, 0);
+            typeInfoStr := classFieldsStr;
+            while typeInfoStr <> '' do
+            begin
+              sepPos := Pos(';', typeInfoStr);
+              if sepPos > 0 then
+              begin
+                fieldStr := Copy(typeInfoStr, 1, sepPos - 1);
+                typeInfoStr := Copy(typeInfoStr, sepPos + 1, MaxInt);
+              end
+              else
+              begin
+                fieldStr := typeInfoStr;
+                typeInfoStr := '';
+              end;
+              if fieldStr = '' then Continue;
+              eqPos := Pos('=', fieldStr);
+              if eqPos <= 0 then Continue;
+              fieldName := Copy(fieldStr, 1, eqPos - 1);
+              fieldTypeName := Copy(fieldStr, eqPos + 1, MaxInt);
+              SetLength(structFields, Length(structFields) + 1);
+              structFields[High(structFields)].Name := fieldName;
+              structFields[High(structFields)].FieldType := StrToAurumType(fieldTypeName);
+              structFields[High(structFields)].FieldTypeName := fieldTypeName;
+              structFields[High(structFields)].ArrayLen := 0;
+              structFields[High(structFields)].BitOffset := -1;
+            end;
+            for j := 0 to High(structFields) do
+              structFields[j].Visibility := visPublic;
+            synClass := TAstClassDecl.Create(lyuSym.Name, classBase, structFields, nil, True, Default(TSourceSpan));
+            synClass.SetLayout(classSize, classAlign, 0);
+            FClassTypes.AddObject(lyuSym.Name, System.TObject(synClass));
           end;
         end;
         lskDim:
