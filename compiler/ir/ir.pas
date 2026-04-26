@@ -113,52 +113,35 @@ type
 
   TIRInstr = record
     Op: TIROpKind;
-    // Provenance Tracking (WP-F): unique ID for this IR instruction
-    IRID: Integer;  // Unique sequential ID (0, 1, 2, ...) - set automatically by Emit
-    // Provenance: source AST reference
-    SourceASTID: Integer;  // AST node ID this instruction came from
-    SourceASTKind: Integer; // AST node kind (from TAstNodeKind)
-    SourceSpan: record
-      Line: Integer;
-      Col: Integer;
-      Len: Integer;
-      FileName: string;
-    end;
+    // Core operands
     Dest: Integer; // destination temp / local index
     Src1: Integer;
     Src2: Integer;
     Src3: Integer; // for 3-operand instructions like irStoreElemDyn
     ImmInt: Int64; // usage depends on Op: e.g., const int or width bits for ext/trunc
-    ImmFloat: Double; // for irConstFloat - stores actual float value
+    ImmFloat: Double; // for irConstFloat
     ImmStr: string;
     LabelName: string;
-    // Energy-Tracking: geschätzter Energieverbrauch dieser Instruktion
-    EnergyCostHint: UInt64;
-    // Cast-specific fields
-    CastFromType: TAurumType;  // source type for cast operations
-    CastToType: TAurumType;    // target type for cast operations
-      // Call-specific fields
-    CallMode: TIRCallMode;   // mode for irCall/irVarCall
-    ArgTemps: array of Integer; // argument temp indices for calls (replaces CSV in LabelName)
-    // Virtual call fields
-    VMTIndex: Integer;        // index in VMT table for virtual calls
-    IsVirtualCall: Boolean;   // true if this is a virtual method call
-    SelfSlot: Integer;        // local slot index for self pointer (for virtual calls)
-    // Struct return fields (for irReturnStruct)
-    StructSize: Integer;   // size of struct in bytes (determines ABI: RAX, RAX+RDX, or hidden ptr)
-    StructAlign: Integer;  // alignment of struct
-    // Field access fields (for irStoreField/irLoadField)
-    FieldSize: Integer;    // size of field in bytes (1, 2, 4, or 8) for proper memory access width
-    // Inspect-specific fields (for irInspect - In-Situ Data Visualizer)
-    InspectType: TAurumType;          // type of the inspected value
-    InspectStructName: string;        // struct/class name if applicable
-    InspectFieldNames: array of string; // field names for struct visualization
-    InspectFieldTypes: array of TAurumType; // field types for struct visualization
-     InspectFieldOffsets: array of Integer;  // field offsets for struct visualization
-     // Source location for assembly listing (aerospace-todo 6.1)
-     SourceLine: Integer;       // source line number
-     SourceFile: string;        // source file name
-   end;
+    // Provenance (debug/listing only — lightweight: line + file)
+    SourceASTID:  Integer; // AST node ID this instruction came from
+    SourceASTKind: Integer; // AST node kind (from TAstNodeKind)
+    SourceLine: Integer;   // source line number
+    SourceFile: string;    // source file name
+    // Cast-specific (irCast only)
+    CastFromType: TAurumType;
+    CastToType: TAurumType;
+    // Call-specific (irCall / irVarCall / irCallStruct)
+    CallMode: TIRCallMode;
+    ArgTemps: array of Integer; // argument temp indices
+    VMTIndex: Integer;          // VMT slot for virtual calls
+    IsVirtualCall: Boolean;
+    SelfSlot: Integer;          // self pointer slot for virtual calls
+    // Struct return (irReturnStruct)
+    StructSize: Integer;
+    StructAlign: Integer;
+    // Field access (irLoadField / irStoreField / irLoadFieldHeap / irStoreFieldHeap)
+    FieldSize: Integer; // 1, 2, 4, or 8 bytes
+  end;
 
    TIRInstructionList = array of TIRInstr;
 
@@ -188,8 +171,6 @@ type
       OuterSlot: Integer; // slot in parent function
       InnerSlot: Integer; // slot in this function
     end;
-    // Provenance Tracking (WP-F): counter for unique IR instruction IDs
-    NextIRID: Integer; // auto-incremented ID counter
     constructor Create(const AName: string);
     destructor Destroy; override;
     procedure Emit(const instr: TIRInstr);
@@ -238,8 +219,6 @@ type
 
 { Berechnet die geschätzten Energiekosten für einen IR-OpCode }
 function GetIROpEnergyCost(op: TIROpKind): UInt64;
-{ Setzt die Energiekosten-Hinweis für eine IR-Instruktion basierend auf ihrem OpCode }
-procedure SetEnergyCostHint(var instr: TIRInstr);
 
 implementation
 
@@ -260,7 +239,6 @@ begin
   SafetyPragmas.Integrity.Mode     := imNone;
   SafetyPragmas.Integrity.Interval := 0;
   SafetyPragmas.FPDeterministic    := False;  // FIX: initialize to avoid uninitialized garbage
-  NextIRID := 0; // Provenance Tracking: reset IR ID counter
 end;
 
 destructor TIRFunction.Destroy;
@@ -271,37 +249,21 @@ begin
 end;
 
 procedure TIRFunction.Emit(const instr: TIRInstr);
-var
-  newInstr: TIRInstr;
 begin
-  newInstr := instr;
-  // Provenance Tracking (WP-F): auto-assign unique IR ID
-  newInstr.IRID := NextIRID;
-  Inc(NextIRID);
-  
   SetLength(Instructions, Length(Instructions) + 1);
-  Instructions[High(Instructions)] := newInstr;
+  Instructions[High(Instructions)] := instr;
 end;
 
 function TIRFunction.GetProvenanceInfo(irIdx: Integer): string;
 begin
   Result := '';
   if (irIdx < 0) or (irIdx >= Length(Instructions)) then Exit;
-  
-  Result := Format('IR#%d [IRID=%d]', [irIdx, Instructions[irIdx].IRID]);
-  
-  if Instructions[irIdx].SourceSpan.FileName <> '' then
-  begin
-    Result := Result + Format(' at %s:%d:%d', 
-      [Instructions[irIdx].SourceSpan.FileName,
-       Instructions[irIdx].SourceSpan.Line,
-       Instructions[irIdx].SourceSpan.Col]);
-  end;
-  
+  Result := Format('IR#%d', [irIdx]);
+  if Instructions[irIdx].SourceFile <> '' then
+    Result := Result + Format(' at %s:%d',
+      [Instructions[irIdx].SourceFile, Instructions[irIdx].SourceLine]);
   if Instructions[irIdx].SourceASTID > 0 then
-  begin
     Result := Result + Format(' from AST#%d', [Instructions[irIdx].SourceASTID]);
-  end;
 end;
 
 procedure TIRFunction.BuildCFG;
@@ -664,12 +626,6 @@ begin
   end;
 end;
 
-{ Setzt die Energiekosten-Hinweis für eine IR-Instruktion basierend auf ihrem OpCode }
-procedure SetEnergyCostHint(var instr: TIRInstr);
-begin
-  instr.EnergyCostHint := GetIROpEnergyCost(instr.Op);
-end;
-
 { Initialize a TIRInstr with safe default values }
 procedure InitInstr(out instr: TIRInstr);
 begin
@@ -682,7 +638,6 @@ begin
   instr.ImmFloat := 0.0;
   instr.ImmStr := '';
   instr.LabelName := '';
-  instr.EnergyCostHint := 0;
   instr.CastFromType := atVoid;
   instr.CastToType := atVoid;
   instr.CallMode := cmInternal;
