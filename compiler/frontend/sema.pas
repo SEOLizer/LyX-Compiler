@@ -2983,7 +2983,16 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
              end;
             tkEq, tkNeq, tkLt, tkLe, tkGt, tkGe:
               begin
-                if (IsIntegerType(lt) and IsIntegerType(rt)) then
+                if TypeEqual(lt, atBool) and TypeEqual(rt, atBool) then
+                begin
+                  Result := atBool;
+                end
+                else if TypeEqual(lt, atBool) or TypeEqual(rt, atBool) then
+                begin
+                  FDiag.Error('type error: bool can only be compared with true or false', bin.Span);
+                  Result := atUnresolved;
+                end
+                else if (IsIntegerType(lt) and IsIntegerType(rt)) then
                 begin
                   Result := atBool;
                 end
