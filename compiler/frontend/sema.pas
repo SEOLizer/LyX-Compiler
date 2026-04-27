@@ -69,6 +69,8 @@ type
     // Synthetic AST nodes created by sema (not owned by the parsed AST)
     FSynthStructOwned: array of TAstStructDecl;
     FSynthClassOwned:  array of TAstClassDecl;
+    // Pending monomorphized struct method entries for IR lowering
+    FMonoMethodList: TMonoStructMethodList;
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -131,6 +133,8 @@ type
     property ConstraintLog: Boolean read FConstraintLog write FConstraintLog;
     procedure LogConstraint(const constraintType, leftType, rightType: string; span: TSourceSpan; status: string);
     procedure LogTypeEquality(const type1, type2: string; span: TSourceSpan; solved: Boolean);
+    // Generic struct method instantiations produced during monomorphization
+    property MonoMethodList: TMonoStructMethodList read FMonoMethodList;
   end;
 
 implementation
@@ -2578,11 +2582,14 @@ end;
 
 function TSema.MonomorphizeStruct(const mangledName: string; span: TSourceSpan): TAstStructDecl;
 var
-  dpos, argCount, i, tmplIdx, concIdx: Integer;
+  dpos, argCount, i, k, fi, mIdx, tmplIdx, concIdx: Integer;
   baseName, rest: string;
   argNames: array of string;
   tmpl: TAstStructDecl;
   concreteFields: TStructFieldList;
+  m: TAstFuncDecl;
+  sym: TSymbol;
+  entry: TMonoStructMethodEntry;
 
   function SubstTypeName(const tn: string): string;
   var q: Integer;
@@ -2667,6 +2674,50 @@ begin
   FSynthStructOwned[High(FSynthStructOwned)] := Result;
   // Compute field layout immediately so IR lowering finds offsets
   ComputeStructLayouts;
+
+  // Register method symbols for the concrete struct and record them for IR lowering
+  for k := 0 to High(tmpl.Methods) do
+  begin
+    m := tmpl.Methods[k];
+    // Register sema symbol so method calls resolve to the concrete mangled name
+    sym := TSymbol.Create('_L_' + mangledName + '_' + m.Name);
+    sym.Kind := symFunc;
+    sym.DeclType := m.ReturnType;
+    sym.ReturnTypeName := SubstTypeName(m.ReturnTypeName);
+    if m.IsStatic then
+    begin
+      sym.ParamCount := Length(m.Params);
+      SetLength(sym.ParamTypes, sym.ParamCount);
+      for fi := 0 to High(m.Params) do
+        sym.ParamTypes[fi] := m.Params[fi].ParamType;
+    end
+    else
+    begin
+      sym.ParamCount := Length(m.Params) + 1;
+      SetLength(sym.ParamTypes, sym.ParamCount);
+      sym.ParamTypes[0] := atUnresolved; // implicit self
+      for fi := 0 to High(m.Params) do
+        sym.ParamTypes[fi + 1] := m.Params[fi].ParamType;
+    end;
+    // Set ReturnStructDecl if return type is the concrete struct itself
+    if (sym.ReturnTypeName = mangledName) or (sym.ReturnTypeName = 'Self') or
+       (sym.ReturnTypeName = 'self') then
+      sym.ReturnStructDecl := Result;
+    AddSymbolToCurrent(sym, span);
+
+    // Record for IR lowering so the method body gets compiled
+    mIdx := Length(FMonoMethodList);
+    SetLength(FMonoMethodList, mIdx + 1);
+    entry.MangledName       := '_L_' + mangledName + '_' + m.Name;
+    entry.ConcreteStructName := mangledName;
+    entry.ConcreteStructDecl := Result;
+    entry.TemplateMethod    := m;
+    entry.StructTypeParams  := tmpl.TypeParams;
+    SetLength(entry.ConcreteTypeArgs, argCount);
+    for fi := 0 to argCount - 1 do
+      entry.ConcreteTypeArgs[fi] := StrToAurumType(argNames[fi]);
+    FMonoMethodList[mIdx] := entry;
+  end;
 end;
 
 function TSema.IsKnownTypeName(const name: string): Boolean;
@@ -2752,14 +2803,11 @@ begin
     else if node is TAstStructDecl then
     begin
       sd := TAstStructDecl(node);
-      genericParams := sd.TypeParams; // allow type params (e.g. T) as field types
+      genericParams := sd.TypeParams; // struct type params visible in fields and methods
       for j := 0 to High(sd.Fields) do
         CheckField(sd.Fields[j], sd.Span);
       for k := 0 to High(sd.Methods) do
-      begin
-        genericParams := sd.Methods[k].TypeParams;
-        CheckMethod(sd.Methods[k]);
-      end;
+        CheckMethod(sd.Methods[k]); // struct type params remain in scope
       genericParams := nil;
     end
 

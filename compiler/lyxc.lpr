@@ -1255,7 +1255,9 @@ begin
         lower := TIRLowering.Create(module, d);
         try
           lower.LowerImportedUnits(um);
+          lower.PreRegisterConcreteStructs(s.MonoMethodList);
           lower.Lower(prog);
+          lower.LowerMonoStructMethods(s.MonoMethodList);
         finally
           lower.Free;
         end;
@@ -1487,7 +1489,7 @@ begin
           if flagSymtabdump then
             s.DumpSymbolTable;
         finally
-          s.Free;
+          { s.Free deferred — s.MonoMethodList needed by LowerMonoStructMethods in Phase 4 }
         end;
         LeavePass('Semantic Analysis', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
 
@@ -1536,10 +1538,15 @@ begin
           // First, register constants from imported units so they're available during lowering
           EnterPass('IR Lowering', 'Typed AST: ' + IntToStr(Length(prog.Decls)) + ' declarations');
           lower.LowerImportedUnits(um);
+          // Pre-register concrete generic struct types so var-decl lowering
+          // allocates the right number of slots (IsStruct=True, multi-slot).
+          lower.PreRegisterConcreteStructs(s.MonoMethodList);
           // Merge IR from precompiled units (.lyu) - simple version
           MergePrecompiledIR(um, module);
           // Then lower the main program
           lower.Lower(prog);
+          lower.LowerMonoStructMethods(s.MonoMethodList);
+          s.Free; s := nil; // MonoMethodList (and the synth structs it references) no longer needed
           LeavePass('IR Lowering', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
           // IR-Level Inlining Optimization
