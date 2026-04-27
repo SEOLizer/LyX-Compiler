@@ -834,6 +834,8 @@ var
   fldTypeInfo: TTypeParseResult;
   dummyNull: Boolean;
   mVarArgs: Boolean;
+  structTypeParams: TStringArray; // generic type params for this struct
+  savedTypeParams: TStringArray;
 begin
   Expect(tkType);
   // Allow keywords as type names (e.g. 'Map', 'Set' used as class names in bootstrap sources)
@@ -846,6 +848,20 @@ begin
   begin
     name := '<anon>';
     FDiag.Error('expected type name', FCurTok.Span);
+  end;
+  // Optional generic type params: type Name[T, U] = struct { ... }
+  SetLength(structTypeParams, 0);
+  if Check(tkLBracket) then
+  begin
+    Advance; // consume [
+    while Check(tkIdent) do
+    begin
+      SetLength(structTypeParams, Length(structTypeParams) + 1);
+      structTypeParams[High(structTypeParams)] := FCurTok.Value;
+      Advance;
+      if not Accept(tkComma) then Break;
+    end;
+    Expect(tkRBracket);
   end;
   // '=' or ':=' (both are valid for type declarations)
   if Check(tkSingleEq) or Check(tkAssign) then
@@ -1092,6 +1108,10 @@ begin
     end
     else
       Advance; // struct
+    // Install generic type params so field types like T resolve correctly
+    savedTypeParams := FCurrentTypeParams;
+    if Length(structTypeParams) > 0 then
+      FCurrentTypeParams := structTypeParams;
     Expect(tkLBrace);
     fields := nil;
     methods := nil;
@@ -1144,11 +1164,13 @@ begin
       end;
     end;
     Expect(tkRBrace);
+    FCurrentTypeParams := savedTypeParams; // restore after struct body
     Accept(tkSemicolon); // optional: bootstrap sources omit trailing ';' after struct }
     Result := TAstStructDecl.Create(name, fields, methods, isPub, FCurTok.Span);
     TAstStructDecl(Result).Endian := structEndian; // aerospace-todo P2 #52
     TAstStructDecl(Result).IsFlat := isFlatStruct;  // aerospace-todo P2 #57
     TAstStructDecl(Result).IsPacked := isPackedStruct; // aerospace-todo P2 #50
+    TAstStructDecl(Result).TypeParams := structTypeParams;
     Exit;
   end
   else
@@ -3091,6 +3113,7 @@ var
   innerType, keyType, valueType, elementType, paramType, returnType: TAurumType;
   rbCapacity: Int64; // for RingBuffer<T>(N) capacity (aerospace-todo P2 #56)
   paramTypes: array of TAurumType;
+  mangledTypeName, argTypeName: string;
 begin
   arrayLen := 0;
   typeName := '';
@@ -3420,8 +3443,36 @@ begin
     end;
 
     // Check for array suffix: type[N] or type[]
+    // or generic struct instantiation: Name[TypeArg1, TypeArg2]
     if Accept(tkLBracket) then
     begin
+      // Generic struct instantiation: Name[TypeArg] where content is a type name
+      // (not an integer literal and not empty) for unresolved identifier base types
+      if (Result = atUnresolved) and Check(tkIdent) then
+      begin
+        // Build mangled name: BaseName__T1__T2__...
+        mangledTypeName := typeName;
+        repeat
+          argTypeName := FCurTok.Value;
+          Advance;
+          // Handle qualified type names (e.g. std.net.Foo)
+          while Check(tkDot) do
+          begin
+            Advance;
+            if Check(tkIdent) then
+            begin
+              argTypeName := argTypeName + '.' + FCurTok.Value;
+              Advance;
+            end
+            else Break;
+          end;
+          mangledTypeName := mangledTypeName + '__' + argTypeName;
+        until not Accept(tkComma);
+        Expect(tkRBracket);
+        typeName := mangledTypeName;
+        // Result stays atUnresolved — sema will resolve the mangled name
+        Exit;
+      end;
       // Capture current type as element type for type[] / type[N] suffix
       typeInfo.ElemType     := Result;
       typeInfo.ElemTypeName := typeName;

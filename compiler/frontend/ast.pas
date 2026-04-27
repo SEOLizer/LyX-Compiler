@@ -1040,6 +1040,8 @@ type
     FSize: Integer; // total size in bytes
     FAlign: Integer; // alignment in bytes
   public
+    // Generic type parameters, e.g. ['T'] for type Pair[T] = struct {...}
+    TypeParams: TStringArray;
     constructor Create(const aName: string; const aFields: TStructFieldList;
       const aMethods: TMethodList; aPublic: Boolean; aSpan: TSourceSpan);
     destructor Destroy; override;
