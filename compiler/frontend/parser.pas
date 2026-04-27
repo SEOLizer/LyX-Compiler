@@ -1119,7 +1119,40 @@ begin
     begin
       // Allow visibility modifiers (pub, private, protected) in structs
       curVisibility := ParseVisibility;
-      if Check(tkIdent) then
+      if Check(tkFn) or Check(tkStatic) then
+      begin
+        // Method inside struct body: [static] fn name(params): retType { body }
+        isStatic := Accept(tkStatic);
+        Expect(tkFn);
+        if FCurTok.Kind <> tkEOF then
+        begin
+          mName := FCurTok.Value; Advance;
+        end
+        else
+        begin
+          mName := '<anon>';
+          FDiag.Error('expected method name', FCurTok.Span);
+        end;
+        Expect(tkLParen);
+        mVarArgs := False;
+        if not Check(tkRParen) then
+          mParams := ParseParamList(mVarArgs)
+        else
+          mParams := nil;
+        Expect(tkRParen);
+        mRetTypeName := '';
+        mRetType := atVoid;
+        if Accept(tkColon) then
+          mRetType := ParseTypeEx(dummy, mRetTypeName);
+        mBody := ParseBlock;
+        m := TAstFuncDecl.Create(mName, mParams, mRetType, mBody, FCurTok.Span, curVisibility = visPublic);
+        m.ReturnTypeName := mRetTypeName;
+        m.IsStatic := isStatic;
+        m.Visibility := curVisibility;
+        SetLength(methods, Length(methods) + 1);
+        methods[High(methods)] := m;
+      end
+      else if Check(tkIdent) then
       begin
         fld.Name := FCurTok.Value; Advance;
         Expect(tkColon);
@@ -1159,7 +1192,7 @@ begin
       end
       else
       begin
-        FDiag.Error('expected field name in struct', FCurTok.Span);
+        FDiag.Error('expected field name or fn in struct', FCurTok.Span);
         Advance;
       end;
     end;
