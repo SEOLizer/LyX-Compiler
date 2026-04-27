@@ -57,7 +57,8 @@ type
     FCurrentReturn: TAurumType;
     FUnitManager: TUnitManager;
     FImportedUnits: TImportMap;  // Alias -> TLoadedUnit
-    FStructTypes: TStructMap;  // name -> TAstStructDecl
+    FStructTypes: TStructMap;           // name -> TAstStructDecl (concrete)
+    FGenericStructs: TStructMap;        // name -> TAstStructDecl (generic templates)
     FClassTypes: TClassMap;    // name -> TAstClassDecl
     FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
     FTypeAliases: TTypeAliasMap; // name -> TAstTypeDecl (type aliases, e.g. type fd = int64)
@@ -94,6 +95,7 @@ type
     function CompileRegex(const pattern: string; span: TSourceSpan;
       out compiled: string; out captureSlots: Integer): Boolean;
     function IsKnownTypeName(const name: string): Boolean;
+    function MonomorphizeStruct(const mangledName: string; span: TSourceSpan): TAstStructDecl;
     procedure ValidateTypeNames(prog: TAstProgram);
     function CheckExpr(expr: TAstExpr): TAurumType;
     function CheckStructLit(sl: TAstStructLit): TAurumType;
@@ -2571,7 +2573,100 @@ begin
   end;
 end;
 
+function TSema.MonomorphizeStruct(const mangledName: string; span: TSourceSpan): TAstStructDecl;
+var
+  dpos, argCount, i, tmplIdx, concIdx: Integer;
+  baseName, rest: string;
+  argNames: array of string;
+  tmpl: TAstStructDecl;
+  concreteFields: TStructFieldList;
+
+  function SubstTypeName(const tn: string): string;
+  var q: Integer;
+  begin
+    Result := tn;
+    if Result = '' then Exit;
+    for q := 0 to argCount - 1 do
+      if (q < Length(tmpl.TypeParams)) and (tn = tmpl.TypeParams[q]) then
+      begin
+        Result := argNames[q];
+        Exit;
+      end;
+  end;
+
+begin
+  Result := nil;
+
+  // Return existing concrete instantiation if already done
+  concIdx := FStructTypes.IndexOf(mangledName);
+  if concIdx >= 0 then
+    Exit(FStructTypes.Data[concIdx]);
+
+  // Split at first '__': "Pair__int64" → base="Pair", rest="int64"
+  dpos := Pos('__', mangledName);
+  if dpos = 0 then Exit;
+  baseName := Copy(mangledName, 1, dpos - 1);
+  rest := Copy(mangledName, dpos + 2, MaxInt);
+
+  // Parse remaining args (split at '__')
+  argCount := 0;
+  SetLength(argNames, 0);
+  while rest <> '' do
+  begin
+    dpos := Pos('__', rest);
+    SetLength(argNames, argCount + 1);
+    if dpos = 0 then
+    begin
+      argNames[argCount] := rest;
+      rest := '';
+    end
+    else
+    begin
+      argNames[argCount] := Copy(rest, 1, dpos - 1);
+      rest := Copy(rest, dpos + 2, MaxInt);
+    end;
+    Inc(argCount);
+  end;
+
+  // Look up template
+  tmplIdx := FGenericStructs.IndexOf(baseName);
+  if tmplIdx < 0 then
+  begin
+    FDiag.Error('unknown generic type: ' + baseName, span);
+    Exit;
+  end;
+  tmpl := FGenericStructs.Data[tmplIdx];
+
+  if argCount <> Length(tmpl.TypeParams) then
+  begin
+    FDiag.Error(Format('generic type %s expects %d type argument(s), got %d',
+      [baseName, Length(tmpl.TypeParams), argCount]), span);
+    Exit;
+  end;
+
+  // Deep-copy fields with type param substitution
+  SetLength(concreteFields, Length(tmpl.Fields));
+  for i := 0 to High(tmpl.Fields) do
+  begin
+    concreteFields[i]               := tmpl.Fields[i];
+    concreteFields[i].FieldTypeName := SubstTypeName(tmpl.Fields[i].FieldTypeName);
+    concreteFields[i].ElemTypeName  := SubstTypeName(tmpl.Fields[i].ElemTypeName);
+    concreteFields[i].KeyTypeName   := SubstTypeName(tmpl.Fields[i].KeyTypeName);
+    concreteFields[i].ValTypeName   := SubstTypeName(tmpl.Fields[i].ValTypeName);
+    // Resolve FieldType for substituted primitive names
+    if concreteFields[i].FieldType = atUnresolved then
+      concreteFields[i].FieldType := StrToAurumType(concreteFields[i].FieldTypeName);
+  end;
+
+  // Create the concrete struct and register it
+  Result := TAstStructDecl.Create(mangledName, concreteFields, nil, tmpl.IsPublic, span);
+  FStructTypes.Add(mangledName, Result);
+  // Compute field layout immediately so IR lowering finds offsets
+  ComputeStructLayouts;
+end;
+
 function TSema.IsKnownTypeName(const name: string): Boolean;
+var dpos: Integer;
 begin
   if name = '' then Exit(True);
   // Primitive type names (int64, bool, f64, pchar, void, ...)
@@ -2587,6 +2682,10 @@ begin
   if FTypeAliases.IndexOf(name) >= 0 then Exit(True);
   if FRangeTypes.IndexOf(name) >= 0 then Exit(True);
   if FUnitTypes.IndexOf(name) >= 0 then Exit(True);
+  // Mangled generic instantiation (e.g. 'Pair__int64'): base must be a known template
+  dpos := Pos('__', name);
+  if dpos > 0 then
+    Exit(FGenericStructs.IndexOf(Copy(name, 1, dpos - 1)) >= 0);
   Result := False;
 end;
 
@@ -2649,14 +2748,15 @@ begin
     else if node is TAstStructDecl then
     begin
       sd := TAstStructDecl(node);
+      genericParams := sd.TypeParams; // allow type params (e.g. T) as field types
       for j := 0 to High(sd.Fields) do
         CheckField(sd.Fields[j], sd.Span);
       for k := 0 to High(sd.Methods) do
       begin
         genericParams := sd.Methods[k].TypeParams;
         CheckMethod(sd.Methods[k]);
-        genericParams := nil;
       end;
+      genericParams := nil;
     end
 
     else if node is TAstClassDecl then
@@ -4076,13 +4176,17 @@ begin
     Exit;
   end;
   
+  // For generic instantiations (e.g. Pair__int64), monomorphize on demand
+  if (FStructTypes.IndexOf(sl.TypeName) < 0) and (Pos('__', sl.TypeName) > 0) then
+    MonomorphizeStruct(sl.TypeName, sl.Span);
+
   idx := FStructTypes.IndexOf(sl.TypeName);
   if idx < 0 then
   begin
     FDiag.Error('unknown struct type: ' + sl.TypeName, sl.Span);
     Exit;
   end;
-  
+
   sd := FStructTypes.Data[idx];
   sl.SetStructDecl(sd);
   
@@ -4393,6 +4497,9 @@ begin
         sym.TypeName := vd.DeclTypeName;
         if (sym.TypeName <> '') then
         begin
+          // For generic instantiations (e.g. Pair__int64), monomorphize on demand
+          if (FStructTypes.IndexOf(sym.TypeName) < 0) and (Pos('__', sym.TypeName) > 0) then
+            MonomorphizeStruct(sym.TypeName, vd.Span);
           // Check for struct type
           i := FStructTypes.IndexOf(sym.TypeName);
           if i >= 0 then
@@ -4806,6 +4913,7 @@ begin
   FUnitManager := um;
   FImportedUnits := TImportMap.Create;
   FStructTypes := TStructMap.Create;
+  FGenericStructs := TStructMap.Create;
   FClassTypes := TClassMap.Create;
   FEnumTypes := TStringList.Create;
   FEnumTypes.Sorted := False;
@@ -4839,6 +4947,7 @@ begin
   // Maps do not own their values (AST nodes owned by AST, units by UnitManager)
   FImportedUnits.Free;
   FStructTypes.Free;
+  FGenericStructs.Free;
   FClassTypes.Free;
   FEnumTypes.Free;
   FTypeAliases.Free;
@@ -6633,6 +6742,17 @@ begin
      end
      else if node is TAstStructDecl then
      begin
+       // Generic struct template: store in FGenericStructs, not FStructTypes
+       if Length(TAstStructDecl(node).TypeParams) > 0 then
+       begin
+         if FGenericStructs.IndexOf(TAstStructDecl(node).Name) >= 0 then
+         begin
+           FDiag.Error('redeclaration of generic type: ' + TAstStructDecl(node).Name, node.Span);
+           Continue;
+         end;
+         FGenericStructs.Add(TAstStructDecl(node).Name, TAstStructDecl(node));
+         Continue; // methods of a generic template are registered at instantiation time
+       end;
        // register struct type and its methods as top-level functions (mangled)
        if FStructTypes.IndexOf(TAstStructDecl(node).Name) >= 0 then
        begin
