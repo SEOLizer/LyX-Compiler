@@ -4,7 +4,7 @@ unit sema;
 interface
 
 uses
-  SysUtils, Classes, ast, diag, lexer, unit_manager, unit_format, bytes, tobject, backend_types,
+  SysUtils, Classes, fgl, ast, diag, lexer, unit_manager, unit_format, bytes, tobject, backend_types,
   type_utils;
 
 type
@@ -42,21 +42,29 @@ type
     destructor Destroy; override;
   end;
 
+  TSymbolMap    = specialize TFPGMap<string, TSymbol>;
+  TStructMap    = specialize TFPGMap<string, TAstStructDecl>;
+  TClassMap     = specialize TFPGMap<string, TAstClassDecl>;
+  TTypeAliasMap = specialize TFPGMap<string, TAstTypeDecl>;
+  TRangeTypeMap = specialize TFPGMap<string, TAstTypeDecl>;
+  TUnitTypeMap  = specialize TFPGMap<string, TAstUtypeDecl>;
+  TImportMap    = specialize TFPGMap<string, TLoadedUnit>;
+
   TSema = class
   private
     FDiag: TDiagnostics;
-    FScopes: array of TStringList; // each contains name -> TSymbol as object
+    FScopes: array of TSymbolMap;  // each contains name -> TSymbol
     FCurrentReturn: TAurumType;
     FUnitManager: TUnitManager;
-    FImportedUnits: TStringList; // Alias -> UnitPath for resolving qualified names
-    FStructTypes: TStringList; // name -> TAstStructDecl as object
-    FClassTypes: TStringList;  // name -> TAstClassDecl as object
+    FImportedUnits: TImportMap;  // Alias -> TLoadedUnit
+    FStructTypes: TStructMap;  // name -> TAstStructDecl
+    FClassTypes: TClassMap;    // name -> TAstClassDecl
     FEnumTypes: TStringList;   // name -> nil (enum type names, backed by int64)
-    FTypeAliases: TStringList; // name -> TAurumType value (simple type aliases, e.g. type fd = int64)
-    FRangeTypes: TStringList;  // name -> TAstTypeDecl (range types, aerospace-todo P1 #7)
+    FTypeAliases: TTypeAliasMap; // name -> TAstTypeDecl (type aliases, e.g. type fd = int64)
+    FRangeTypes: TRangeTypeMap; // name -> TAstTypeDecl (range types)
     FDimensions: TStringList;  // dim names (unit types P1)
     FDimExprs: TStringList;    // parallel: normalized dim expression for FDimensions[i]
-    FUnitTypes: TStringList;   // utype name -> TAstUtypeDecl (unit types P1)
+    FUnitTypes: TUnitTypeMap;  // utype name -> TAstUtypeDecl
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -1125,31 +1133,30 @@ end;
 
 procedure TSema.PushScope;
 var
-  sl: TStringList;
+  sl: TSymbolMap;
 begin
-  sl := TStringList.Create;
-  sl.Sorted := False;
+  sl := TSymbolMap.Create;
   SetLength(FScopes, Length(FScopes) + 1);
   FScopes[High(FScopes)] := sl;
 end;
 
 procedure TSema.PopScope;
 var
-  sl: TStringList;
+  sl: TSymbolMap;
   i: Integer;
 begin
   if Length(FScopes) = 0 then Exit;
   sl := FScopes[High(FScopes)];
   // free symbols
   for i := 0 to sl.Count - 1 do
-    System.TObject(sl.Objects[i]).Free;
+    sl.Data[i].Free;
   sl.Free;
   SetLength(FScopes, Length(FScopes) - 1);
 end;
 
 procedure TSema.AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
 var
-  cur: TStringList;
+  cur: TSymbolMap;
 begin
   if Length(FScopes) = 0 then
   begin
@@ -1165,13 +1172,13 @@ begin
   end;
   // WP-B: Store the definition span in the symbol
   sym.DefSpan := span;
-  cur.AddObject(sym.Name, System.TObject(sym));
+  cur.Add(sym.Name, sym);
 end;
 
 procedure TSema.ReplaceSymbol(sym: TSymbol);
 var
   i: Integer;
-  cur: TStringList;
+  cur: TSymbolMap;
   old: TSymbol;
 begin
   // Replace a symbol in the OUTERMOST scope (global scope = FScopes[0])
@@ -1180,18 +1187,18 @@ begin
   i := cur.IndexOf(sym.Name);
   if i >= 0 then
   begin
-    old := TSymbol(cur.Objects[i]);
-    cur.Objects[i] := System.TObject(sym);
+    old := cur.Data[i];
+    cur.Data[i] := sym;
     old.Free;
   end
   else
-    cur.AddObject(sym.Name, System.TObject(sym));
+    cur.Add(sym.Name, sym);
 end;
 
 function TSema.ResolveSymbol(const name: string): TSymbol;
 var
   i, idx: Integer;
-  sl: TStringList;
+  sl: TSymbolMap;
 begin
   Result := nil;
   for i := High(FScopes) downto 0 do
@@ -1200,7 +1207,7 @@ begin
     idx := sl.IndexOf(name);
     if idx >= 0 then
     begin
-      Result := TSymbol(sl.Objects[idx]);
+      Result := sl.Data[idx];
       Exit;
     end;
   end;
@@ -1209,7 +1216,7 @@ end;
 function TSema.ResolveSymbolLevel(const name: string): Integer;
 var
   i, idx: Integer;
-  sl: TStringList;
+  sl: TSymbolMap;
 begin
   Result := -1;
   for i := High(FScopes) downto 0 do
@@ -2387,21 +2394,7 @@ begin
   // TObject aus tobject.pas erstellen
   tobj := CreateTObjectClassDecl();
   
-  // In FClassTypes registrieren
-  if not Assigned(FClassTypes) then
-  begin
-    FClassTypes := TStringList.Create;
-    FClassTypes.Sorted := False;
-  end;
-  FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(tobj));
-  
-  // Auch in FStructTypes registrieren (für einheitliche Lookup-Logik)
-  if not Assigned(FStructTypes) then
-  begin
-    FStructTypes := TStringList.Create;
-    FStructTypes.Sorted := False;
-  end;
-  FStructTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(tobj));
+  FClassTypes.Add(TOBJECT_CLASSNAME, tobj);
   
   // Methoden als Symbole registrieren (wie bei normalen Klassen)
   for j := 0 to High(tobj.Methods) do
@@ -2434,10 +2427,10 @@ var
   ud: TAstUtypeDecl;
 begin
   Result := '';
-  if (tag = '') or not Assigned(FUnitTypes) then Exit;
+  if tag = '' then Exit;
   idx := FUnitTypes.IndexOf(tag);
   if idx < 0 then Exit;
-  ud := TAstUtypeDecl(FUnitTypes.Objects[idx]);
+  ud := FUnitTypes.Data[idx];
   if Assigned(ud) then
     Result := ud.DimName;
 end;
@@ -2448,7 +2441,6 @@ var
   i: Integer;
 begin
   Result := '';
-  if not Assigned(FDimExprs) then Exit;
   for i := 0 to FDimExprs.Count - 1 do
     if FDimExprs[i] = normExpr then
     begin
@@ -2464,10 +2456,9 @@ var
   ud: TAstUtypeDecl;
 begin
   Result := '';
-  if not Assigned(FUnitTypes) then Exit;
   for i := 0 to FUnitTypes.Count - 1 do
   begin
-    ud := TAstUtypeDecl(FUnitTypes.Objects[i]);
+    ud := FUnitTypes.Data[i];
     if Assigned(ud) and (ud.DimName = dimName) then
     begin
       Result := ud.Name;
@@ -2483,10 +2474,10 @@ var
   ud: TAstUtypeDecl;
 begin
   kind := urkNone; rMin := 0.0; rMax := 0.0;
-  if (tag = '') or not Assigned(FUnitTypes) then Exit;
+  if tag = '' then Exit;
   idx := FUnitTypes.IndexOf(tag);
   if idx < 0 then Exit;
-  ud := TAstUtypeDecl(FUnitTypes.Objects[idx]);
+  ud := FUnitTypes.Data[idx];
   if not Assigned(ud) then Exit;
   kind := ud.RangeKind;
   rMin := ud.RangeMin;
@@ -2576,7 +2567,7 @@ begin
   begin
     idx := FTypeAliases.IndexOf(typeName);
     if idx >= 0 then
-      Result := TAstTypeDecl(FTypeAliases.Objects[idx]).DeclType;
+      Result := FTypeAliases.Data[idx].DeclType;
   end;
 end;
 
@@ -2590,12 +2581,12 @@ begin
   // Qualified imported names (e.g. 'net.IPAddr') — validated at use site by import resolver
   if Pos('.', name) > 0 then Exit(True);
   // Registered named types
-  if Assigned(FStructTypes) and (FStructTypes.IndexOf(name) >= 0) then Exit(True);
-  if Assigned(FClassTypes)  and (FClassTypes.IndexOf(name) >= 0)  then Exit(True);
-  if Assigned(FEnumTypes)   and (FEnumTypes.IndexOf(name) >= 0)   then Exit(True);
-  if Assigned(FTypeAliases) and (FTypeAliases.IndexOf(name) >= 0) then Exit(True);
-  if Assigned(FRangeTypes)  and (FRangeTypes.IndexOf(name) >= 0)  then Exit(True);
-  if Assigned(FUnitTypes)   and (FUnitTypes.IndexOf(name) >= 0)   then Exit(True);
+  if FStructTypes.IndexOf(name) >= 0 then Exit(True);
+  if FClassTypes.IndexOf(name) >= 0 then Exit(True);
+  if FEnumTypes.IndexOf(name) >= 0 then Exit(True);
+  if FTypeAliases.IndexOf(name) >= 0 then Exit(True);
+  if FRangeTypes.IndexOf(name) >= 0 then Exit(True);
+  if FUnitTypes.IndexOf(name) >= 0 then Exit(True);
   Result := False;
 end;
 
@@ -2842,7 +2833,7 @@ begin
                 begin
                   baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
                   if baseIdx >= 0 then
-                    cd := TAstClassDecl(FClassTypes.Objects[baseIdx])
+                    cd := FClassTypes.Data[baseIdx]
                   else
                     cd := nil;
                 end
@@ -2884,7 +2875,7 @@ begin
                   if idx >= 0 then
                   begin
                     // Found the struct - now look up the field
-                    sd := TAstStructDecl(FStructTypes.Objects[idx]);
+                    sd := FStructTypes.Data[idx];
                     fName := TAstFieldAccess(expr).Field;
                     found := False;
                     for fi := 0 to High(sd.Fields) do
@@ -2929,7 +2920,7 @@ begin
             idx := FStructTypes.IndexOf(TAstFieldAccess(recv).OwnerName);
             if idx >= 0 then
             begin
-              sd := TAstStructDecl(FStructTypes.Objects[idx]);
+              sd := FStructTypes.Data[idx];
               // Find the field that recv refers to
               for fi := 0 to High(sd.Fields) do
               begin
@@ -2942,7 +2933,7 @@ begin
                     nestedIdx := FStructTypes.IndexOf(sd.Fields[fi].FieldTypeName);
                     if nestedIdx >= 0 then
                     begin
-                      nestedSd := TAstStructDecl(FStructTypes.Objects[nestedIdx]);
+                      nestedSd := FStructTypes.Data[nestedIdx];
                       // Now look up our field in the nested struct
                       fName := TAstFieldAccess(expr).Field;
                       for fj := 0 to High(nestedSd.Fields) do
@@ -3067,7 +3058,7 @@ begin
         castTypeName := TAstCast(expr).CastTypeName;
 
         // Unit type conversion: e.g. dist as m  (same dimension only)
-        if Assigned(FUnitTypes) and (FUnitTypes.IndexOf(castTypeName) >= 0) then
+        if FUnitTypes.IndexOf(castTypeName) >= 0 then
         begin
           srcUnitTag := TAstCast(expr).Expr.UnitTag;
           srcDim     := GetDimForUnitTag(srcUnitTag);
@@ -3085,7 +3076,7 @@ begin
             utypeIdx := FUnitTypes.IndexOf(srcUnitTag);
             if utypeIdx >= 0 then
             begin
-              srcUd := TAstUtypeDecl(FUnitTypes.Objects[utypeIdx]);
+              srcUd := FUnitTypes.Data[utypeIdx];
               if Assigned(srcUd) then
                 srcFactor := srcUd.Factor;
             end;
@@ -3094,7 +3085,7 @@ begin
             utypeIdx := FUnitTypes.IndexOf(castTypeName);
             if utypeIdx >= 0 then
             begin
-              tgtUd := TAstUtypeDecl(FUnitTypes.Objects[utypeIdx]);
+              tgtUd := FUnitTypes.Data[utypeIdx];
               if Assigned(tgtUd) then
                 tgtFactor := tgtUd.Factor;
             end;
@@ -3170,7 +3161,7 @@ begin
             // The actual runtime check will be done in IR/Backend
             TAstCast(expr).CastType := atUnresolved; // Will be resolved later
           end
-          else if Assigned(FStructTypes) and (FStructTypes.IndexOf(castTypeName) >= 0) then
+          else if FStructTypes.IndexOf(castTypeName) >= 0 then
           begin
             // Struct cast - bootstrap uses struct pointers as int64
             TAstCast(expr).CastType := atInt64;
@@ -3198,8 +3189,8 @@ begin
         if s = nil then
         begin
           // Check if it's a struct or class type name used as expression (bootstrap compat)
-          if (Assigned(FStructTypes) and (FStructTypes.IndexOf(ident.Name) >= 0))
-             or (Assigned(FClassTypes) and (FClassTypes.IndexOf(ident.Name) >= 0)) then
+          if (FStructTypes.IndexOf(ident.Name) >= 0)
+             or (FClassTypes.IndexOf(ident.Name) >= 0) then
             Result := atInt64  // type names used as int64 pointers in bootstrap
           else
           begin
@@ -3555,7 +3546,7 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
               if cd.BaseClassName = '' then Break;
               baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
               if baseIdx < 0 then Break;
-              cd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+              cd := FClassTypes.Data[baseIdx];
             end;
             if s = nil then
             begin
@@ -3579,7 +3570,7 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
               if fi >= 0 then
               begin
                 // Search the class hierarchy for the method definition
-                cd := TAstClassDecl(FClassTypes.Objects[fi]);
+                cd := FClassTypes.Data[fi];
                 mangledName := '';
                 while Assigned(cd) do
                 begin
@@ -3590,7 +3581,7 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
                   if cd.BaseClassName = '' then Break;
                   baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
                   if baseIdx < 0 then Break;
-                  cd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+                  cd := FClassTypes.Data[baseIdx];
                 end;
                 if s <> nil then
                 begin
@@ -3805,7 +3796,7 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
           idx := FClassTypes.IndexOf(TAstNewExpr(expr).ClassName);
           if idx >= 0 then
           begin
-            cd := TAstClassDecl(FClassTypes.Objects[idx]);
+            cd := FClassTypes.Data[idx];
             if cd.IsAbstract then
             begin
               FDiag.Error('cannot instantiate abstract class: ' + TAstNewExpr(expr).ClassName, expr.Span);
@@ -4092,7 +4083,7 @@ begin
     Exit;
   end;
   
-  sd := TAstStructDecl(FStructTypes.Objects[idx]);
+  sd := FStructTypes.Data[idx];
   sl.SetStructDecl(sd);
   
   // Track which fields have been initialized
@@ -4266,7 +4257,7 @@ begin
           rtIdx := FRangeTypes.IndexOf(vd.DeclTypeName);
           if rtIdx >= 0 then
           begin
-            rtDecl := TAstTypeDecl(FRangeTypes.Objects[rtIdx]);
+            rtDecl := FRangeTypes.Data[rtIdx];
             // Accept the base integer type
             if not IsIntegerType(vtype) and (vtype <> atUnresolved) then
               FDiag.Error(Format('type mismatch in declaration of %s: expected integer (range %s), got %s',
@@ -4284,7 +4275,7 @@ begin
         end;
         // Resolve unit type names: var d: km := ... → treat as f64 with unit tag
         if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
-           Assigned(FUnitTypes) and (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
+           (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
         begin
           if not (vtype in [atF64, atF32, atInt64, atInt32, atUnresolved]) then
             FDiag.Error(Format('type mismatch in declaration of %s: expected numeric value for unit type %s, got %s',
@@ -4329,7 +4320,7 @@ begin
         end
         // Resolve enum type names: var x: TokenKind := ... → treat as int64
         else if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
-           Assigned(FEnumTypes) and (FEnumTypes.IndexOf(vd.DeclTypeName) >= 0) then
+           (FEnumTypes.IndexOf(vd.DeclTypeName) >= 0) then
         begin
           // Enum type: accept int64 values (enum values are int64 constants)
           if not (vtype in [atInt64, atUnresolved]) then
@@ -4342,8 +4333,8 @@ begin
         else if (vd.DeclType = atFnPtr) or
            ((vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
             Assigned(vd.InitExpr) and (vd.InitExpr is TAstIdent) and
-            not (Assigned(FClassTypes) and (FClassTypes.IndexOf(vd.DeclTypeName) >= 0)) and
-            not (Assigned(FStructTypes) and (FStructTypes.IndexOf(vd.DeclTypeName) >= 0))) then
+            not (FClassTypes.IndexOf(vd.DeclTypeName) >= 0) and
+            not (FStructTypes.IndexOf(vd.DeclTypeName) >= 0)) then
         begin
           // Function pointer - keep as fn pointer type for proper resolution
           // Allow int64 as well for compatibility
@@ -4403,24 +4394,15 @@ begin
         if (sym.TypeName <> '') then
         begin
           // Check for struct type
-          if Assigned(FStructTypes) then
-          begin
-            i := FStructTypes.IndexOf(sym.TypeName);
-            if i >= 0 then
-            begin
-              // Check if it's actually a class (stored in same map)
-              if FStructTypes.Objects[i] is TAstClassDecl then
-                sym.ClassDecl := TAstClassDecl(FStructTypes.Objects[i])
-              else
-                sym.StructDecl := TAstStructDecl(FStructTypes.Objects[i]);
-            end;
-          end;
-          // Also check FClassTypes directly
-          if (sym.ClassDecl = nil) and Assigned(FClassTypes) then
+          i := FStructTypes.IndexOf(sym.TypeName);
+          if i >= 0 then
+            sym.StructDecl := FStructTypes.Data[i];
+          // Check for class type
+          if sym.StructDecl = nil then
           begin
             i := FClassTypes.IndexOf(sym.TypeName);
             if i >= 0 then
-              sym.ClassDecl := TAstClassDecl(FClassTypes.Objects[i]);
+              sym.ClassDecl := FClassTypes.Data[i];
           end;
         end;
         // array length metadata - also check array literal initializer
@@ -4430,8 +4412,7 @@ begin
           sym.ArrayLen := vd.ArrayLen;
         sym.ElemType := vd.ElemType;
         // Unit type tag: if declared type name is a known utype, tag the symbol
-        if (vd.DeclTypeName <> '') and Assigned(FUnitTypes) and
-           (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
+        if (vd.DeclTypeName <> '') and (FUnitTypes.IndexOf(vd.DeclTypeName) >= 0) then
           sym.UnitTag := vd.DeclTypeName;
         AddSymbolToCurrent(sym, vd.Span);
       end;
@@ -4757,7 +4738,7 @@ begin
             s := TSymbol.Create(fn.Params[i].Name);
             s.Kind := symVar;
             s.DeclType := fn.Params[i].ParamType;
-            if Assigned(FUnitTypes) and (fn.Params[i].TypeName <> '') and
+            if (fn.Params[i].TypeName <> '') and
                (FUnitTypes.IndexOf(fn.Params[i].TypeName) >= 0) then
             begin
               s.DeclType := atF64;
@@ -4823,27 +4804,20 @@ begin
   inherited Create;
   FDiag := d;
   FUnitManager := um;
-  FImportedUnits := TStringList.Create;
-  FImportedUnits.Sorted := False;
-  FStructTypes := TStringList.Create;
-  FStructTypes.Sorted := False;
-  FClassTypes := TStringList.Create;
-  FClassTypes.Sorted := False;
+  FImportedUnits := TImportMap.Create;
+  FStructTypes := TStructMap.Create;
+  FClassTypes := TClassMap.Create;
   FEnumTypes := TStringList.Create;
   FEnumTypes.Sorted := False;
-  FTypeAliases := TStringList.Create;
-  FTypeAliases.Sorted := False;
-  FRangeTypes := TStringList.Create;
-  FRangeTypes.Sorted := False;
+  FTypeAliases := TTypeAliasMap.Create;
+  FRangeTypes := TRangeTypeMap.Create;
   FDimensions := TStringList.Create;
   FDimensions.Sorted := False;
   FDimensions.CaseSensitive := True;
   FDimExprs := TStringList.Create;
   FDimExprs.Sorted := False;
   FDimExprs.CaseSensitive := True;
-  FUnitTypes := TStringList.Create;
-  FUnitTypes.Sorted := False;
-  FUnitTypes.CaseSensitive := True;
+  FUnitTypes := TUnitTypeMap.Create;
   FCurrentClass := nil;
   FCurrentNestedFunc := nil;
   FFuncScopeDepth := 0;
@@ -4862,28 +4836,16 @@ destructor TSema.Destroy;
 var
   i: Integer;
 begin
-  // Nur das StringList freigeben, nicht die referenzierten Units
-  // (die gehören dem UnitManager)
-  if Assigned(FImportedUnits) then
-    FImportedUnits.Free;
-  
-  // FClassTypes, FStructTypes, FEnumTypes nicht freigeben (sie halten AST-Referenzen)
-  if Assigned(FClassTypes) then
-    FClassTypes.Free;
-  if Assigned(FStructTypes) then
-    FStructTypes.Free;
-  if Assigned(FEnumTypes) then
-    FEnumTypes.Free;
-  if Assigned(FTypeAliases) then
-    FTypeAliases.Free;
-  if Assigned(FRangeTypes) then
-    FRangeTypes.Free;
-  if Assigned(FDimensions) then
-    FDimensions.Free;
-  if Assigned(FDimExprs) then
-    FDimExprs.Free;
-  if Assigned(FUnitTypes) then
-    FUnitTypes.Free;
+  // Maps do not own their values (AST nodes owned by AST, units by UnitManager)
+  FImportedUnits.Free;
+  FStructTypes.Free;
+  FClassTypes.Free;
+  FEnumTypes.Free;
+  FTypeAliases.Free;
+  FRangeTypes.Free;
+  FDimensions.Free;
+  FDimExprs.Free;
+  FUnitTypes.Free;
 
   // Freigabe aller verbleibenden Scopes (insbesondere globaler Scope)
   while Length(FScopes) > 0 do
@@ -4941,7 +4903,7 @@ begin
     Inc(pass);
     for i := 0 to FStructTypes.Count - 1 do
     begin
-      sd := TAstStructDecl(FStructTypes.Objects[i]);
+      sd := FStructTypes.Data[i];
       // skip if already computed
       if sd.Size <> 0 then Continue;
       // attempt compute
@@ -4988,11 +4950,11 @@ begin
             idx := FStructTypes.IndexOf(f.ElemTypeName);
             if idx >= 0 then
             begin
-              other := TAstStructDecl(FStructTypes.Objects[idx]);
+              other := FStructTypes.Data[idx];
               if other.Size = 0 then begin ok := False; Break; end;
               elemSz := other.Size; elemAlign := other.Align;
             end
-            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.ElemTypeName) >= 0) then
+            else if FClassTypes.IndexOf(f.ElemTypeName) >= 0 then
             begin
               // Class-typed array element stored as heap pointer
               elemSz := 8; elemAlign := 8;
@@ -5042,7 +5004,7 @@ begin
             idx := FStructTypes.IndexOf(f.FieldTypeName);
             if idx >= 0 then
             begin
-              other := TAstStructDecl(FStructTypes.Objects[idx]);
+              other := FStructTypes.Data[idx];
               if other.Size = 0 then begin ok := False; Break; end;
               fsize := other.Size;
               falign := other.Align;
@@ -5062,7 +5024,7 @@ begin
                 end;
               end;
             end
-            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.FieldTypeName) >= 0) then
+            else if FClassTypes.IndexOf(f.FieldTypeName) >= 0 then
             begin
               // Class-typed field stored as pointer
               fsize  := 8;
@@ -5099,7 +5061,7 @@ begin
   // if after iterations some structs remain with Size=0, report error
   for i := 0 to FStructTypes.Count - 1 do
   begin
-    sd := TAstStructDecl(FStructTypes.Objects[i]);
+    sd := FStructTypes.Data[i];
     if sd.Size = 0 then
       FDiag.Error('cannot compute layout for struct: ' + sd.Name, sd.Span);
   end;
@@ -5152,7 +5114,7 @@ begin
       begin
         baseIdx := FClassTypes.IndexOf(baseClass.BaseClassName);
         if baseIdx >= 0 then
-          baseClass := TAstClassDecl(FClassTypes.Objects[baseIdx])
+          baseClass := FClassTypes.Data[baseIdx]
         else
           baseClass := nil;
       end
@@ -5198,7 +5160,6 @@ var
     if t = atDynArray then asz := 16;
   end;
 begin
-  if not Assigned(FClassTypes) then Exit;
   
   // Iterative fixed-point: compute layouts in dependency order
   pass := 0;
@@ -5207,7 +5168,7 @@ begin
     Inc(pass);
     for i := 0 to FClassTypes.Count - 1 do
     begin
-      cd := TAstClassDecl(FClassTypes.Objects[i]);
+      cd := FClassTypes.Data[i];
       // Skip if already computed
       if cd.Size <> 0 then Continue;
       
@@ -5222,7 +5183,7 @@ begin
           FDiag.Error('unknown base class: ' + cd.BaseClassName, cd.Span);
           Continue;
         end;
-        baseCd := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+        baseCd := FClassTypes.Data[baseIdx];
         if baseCd.Size = 0 then
         begin
           // Base class not yet computed, try again later
@@ -5262,11 +5223,11 @@ begin
             baseIdx := FStructTypes.IndexOf(f.ElemTypeName);
             if baseIdx >= 0 then
             begin
-              other := TAstStructDecl(FStructTypes.Objects[baseIdx]);
+              other := FStructTypes.Data[baseIdx];
               if other.Size = 0 then begin ok := False; Break; end;
               elemSz := other.Size; elemAlign := other.Align;
             end
-            else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.ElemTypeName) >= 0) then
+            else if FClassTypes.IndexOf(f.ElemTypeName) >= 0 then
             begin
               // Class-typed array element stored as heap pointer
               elemSz := 8; elemAlign := 8;
@@ -5297,10 +5258,10 @@ begin
           baseIdx := FStructTypes.IndexOf(f.FieldTypeName);
           if baseIdx >= 0 then
           begin
-            fsize := TAstStructDecl(FStructTypes.Objects[baseIdx]).Size;
-            falign := TAstStructDecl(FStructTypes.Objects[baseIdx]).Align;
+            fsize := FStructTypes.Data[baseIdx].Size;
+            falign := FStructTypes.Data[baseIdx].Align;
           end
-          else if Assigned(FClassTypes) and (FClassTypes.IndexOf(f.FieldTypeName) >= 0) then
+          else if FClassTypes.IndexOf(f.FieldTypeName) >= 0 then
           begin
             // Class-typed field: stored as pointer (8 bytes)
             fsize  := 8;
@@ -5349,7 +5310,7 @@ begin
   // Report errors for uncomputed classes (only if they have fields that couldn't be resolved)
   for i := 0 to FClassTypes.Count - 1 do
   begin
-    cd := TAstClassDecl(FClassTypes.Objects[i]);
+    cd := FClassTypes.Data[i];
     // Size = 0 only happens if field types couldn't be resolved
     // Empty classes now get Size = 8 above
     if (cd.Size = 0) and (Length(cd.Fields) > 0) then
@@ -5364,12 +5325,11 @@ var
   cd, baseCd: TAstClassDecl;
   method, baseMethod: TAstFuncDecl;
 begin
-  if not Assigned(FClassTypes) then Exit;
 
   // Process each class
   for i := 0 to FClassTypes.Count - 1 do
   begin
-    cd := TAstClassDecl(FClassTypes.Objects[i]);
+    cd := FClassTypes.Data[i];
 
     // Validate virtual/override usage
     for j := 0 to High(cd.Methods) do
@@ -5396,7 +5356,7 @@ begin
         idx := FClassTypes.IndexOf(cd.BaseClassName);
         if idx >= 0 then
         begin
-          baseCd := TAstClassDecl(FClassTypes.Objects[idx]);
+          baseCd := FClassTypes.Data[idx];
           baseMethod := nil;
           // Find matching method in base class
           for vmtIdx := 0 to High(baseCd.Methods) do
@@ -5499,7 +5459,7 @@ begin
       idx := FClassTypes.IndexOf(cd.BaseClassName);
       if idx >= 0 then
       begin
-        baseCd := TAstClassDecl(FClassTypes.Objects[idx]);
+        baseCd := FClassTypes.Data[idx];
         // Copy base VMT (inherited methods keep their indices)
         for vmtIdx := 0 to High(baseCd.VirtualMethods) do
         begin
@@ -5693,9 +5653,7 @@ begin
   // Registriere Alias für qualifizierte Zugriffe
   if alias = '' then
     alias := ExtractFileName(StringReplace(upath, '.', '/', [rfReplaceAll]));
-  if not Assigned(FImportedUnits) then
-    FImportedUnits := TStringList.Create;
-  FImportedUnits.AddObject(alias, System.TObject(loadedUnit));
+  FImportedUnits.Add(alias, loadedUnit);
   
   // Importiere öffentliche Symbole (pub) in den globalen Scope
   if Assigned(loadedUnit.AST) then
@@ -5796,14 +5754,9 @@ begin
       begin
         // Import struct type into FStructTypes for field resolution
         // But avoid duplicates - only import if not already present
-        if not Assigned(FStructTypes) then
-        begin
-          FStructTypes := TStringList.Create;
-          FStructTypes.Sorted := False;
-        end;
         if FStructTypes.IndexOf(TAstStructDecl(decl).Name) < 0 then
         begin
-          FStructTypes.AddObject(TAstStructDecl(decl).Name, System.TObject(decl));
+          FStructTypes.Add(TAstStructDecl(decl).Name, TAstStructDecl(decl));
         end;
       end
       // Import public dimension declarations
@@ -5823,20 +5776,15 @@ begin
         if not TAstUtypeDecl(decl).IsPublic then
           Continue;
         if FUnitTypes.IndexOf(TAstUtypeDecl(decl).Name) < 0 then
-          FUnitTypes.AddObject(TAstUtypeDecl(decl).Name, System.TObject(decl));
+          FUnitTypes.Add(TAstUtypeDecl(decl).Name, TAstUtypeDecl(decl));
       end
       // Also import public class types
       else if decl is TAstClassDecl then
       begin
         // Import class type into FClassTypes for field resolution
-        if not Assigned(FClassTypes) then
-        begin
-          FClassTypes := TStringList.Create;
-          FClassTypes.Sorted := False;
-        end;
         if FClassTypes.IndexOf(TAstClassDecl(decl).Name) < 0 then
         begin
-          FClassTypes.AddObject(TAstClassDecl(decl).Name, System.TObject(decl));
+          FClassTypes.Add(TAstClassDecl(decl).Name, TAstClassDecl(decl));
         end;
         // Also register mangled method symbols so calls like sb.Init() resolve
         for j := 0 to High(TAstClassDecl(decl).Methods) do
@@ -5907,11 +5855,6 @@ begin
         lskStruct:
         begin
           // Reconstruct struct type from TypeInfo: "field1=type1;field2=type2;..."
-          if not Assigned(FStructTypes) then
-          begin
-            FStructTypes := TStringList.Create;
-            FStructTypes.Sorted := False;
-          end;
           if FStructTypes.IndexOf(lyuSym.Name) < 0 then
           begin
             SetLength(structFields, 0);
@@ -5943,17 +5886,12 @@ begin
               structFields[High(structFields)].Visibility := visPublic;
             end;
             synStruct := TAstStructDecl.Create(lyuSym.Name, structFields, nil, True, Default(TSourceSpan));
-            FStructTypes.AddObject(lyuSym.Name, System.TObject(synStruct));
+            FStructTypes.Add(lyuSym.Name, synStruct);
           end;
         end;
         lskClass:
         begin
           // Reconstruct class type from TypeInfo: "base|size|align|field1=type1;..."
-          if not Assigned(FClassTypes) then
-          begin
-            FClassTypes := TStringList.Create;
-            FClassTypes.Sorted := False;
-          end;
           if FClassTypes.IndexOf(lyuSym.Name) < 0 then
           begin
             // Parse "base|size|align|fields"
@@ -6027,7 +5965,7 @@ begin
               structFields[j].Visibility := visPublic;
             synClass := TAstClassDecl.Create(lyuSym.Name, classBase, structFields, nil, True, Default(TSourceSpan));
             synClass.SetLayout(classSize, classAlign, 0);
-            FClassTypes.AddObject(lyuSym.Name, System.TObject(synClass));
+            FClassTypes.Add(lyuSym.Name, synClass);
           end;
         end;
         lskDim:
@@ -6087,7 +6025,7 @@ begin
             synNode.RangeKind := importedRangeKind;
             synNode.RangeMin  := importedRangeMin;
             synNode.RangeMax  := importedRangeMax;
-            FUnitTypes.AddObject(lyuSym.Name, System.TObject(synNode));
+            FUnitTypes.Add(lyuSym.Name, synNode);
           end;
         end;
       end;
@@ -6557,7 +6495,7 @@ begin
     Exit;
   end;
   
-  loadedUnit := TLoadedUnit(FImportedUnits.Objects[idx]);
+  loadedUnit := FImportedUnits.Data[idx];
   if not Assigned(loadedUnit.AST) then
   begin
     FDiag.Error('unit has no AST: ' + qualifier, span);
@@ -6682,7 +6620,7 @@ begin
        begin
          fi := FStructTypes.IndexOf(fn.ReturnTypeName);
          if fi >= 0 then
-           sym.ReturnStructDecl := TAstStructDecl(FStructTypes.Objects[fi]);
+           sym.ReturnStructDecl := FStructTypes.Data[fi];
        end;
        sym.ParamCount := Length(fn.Params);
        SetLength(sym.ParamTypes, sym.ParamCount);
@@ -6696,17 +6634,12 @@ begin
      else if node is TAstStructDecl then
      begin
        // register struct type and its methods as top-level functions (mangled)
-       if not Assigned(FStructTypes) then
-       begin
-         FStructTypes := TStringList.Create;
-         FStructTypes.Sorted := False;
-       end;
        if FStructTypes.IndexOf(TAstStructDecl(node).Name) >= 0 then
        begin
          FDiag.Error('redeclaration of type: ' + TAstStructDecl(node).Name, node.Span);
          Continue;
        end;
-       FStructTypes.AddObject(TAstStructDecl(node).Name, System.TObject(node));
+       FStructTypes.Add(TAstStructDecl(node).Name, TAstStructDecl(node));
        // register methods as functions with mangled names
        for j := 0 to High(TAstStructDecl(node).Methods) do
        begin
@@ -6726,7 +6659,7 @@ begin
           begin
             fi := FStructTypes.IndexOf(m.ReturnTypeName);
             if fi >= 0 then
-              sym.ReturnStructDecl := TAstStructDecl(FStructTypes.Objects[fi]);
+              sym.ReturnStructDecl := FStructTypes.Data[fi];
           end;
          
          if m.IsStatic then
@@ -6753,17 +6686,12 @@ begin
       else if node is TAstClassDecl then
       begin
         // Register class type and its methods as top-level functions (mangled)
-        if not Assigned(FClassTypes) then
-        begin
-          FClassTypes := TStringList.Create;
-          FClassTypes.Sorted := False;
-        end;
         if FClassTypes.IndexOf(TAstClassDecl(node).Name) >= 0 then
         begin
           FDiag.Error('redeclaration of class: ' + TAstClassDecl(node).Name, node.Span);
           Continue;
         end;
-        FClassTypes.AddObject(TAstClassDecl(node).Name, System.TObject(node));
+        FClassTypes.Add(TAstClassDecl(node).Name, TAstClassDecl(node));
         
         // Check if class has abstract methods - if so, mark class as abstract
         if not TAstClassDecl(node).IsAbstract then
@@ -6821,7 +6749,7 @@ begin
         if TAstTypeDecl(node).HasRange then
         begin
           if FRangeTypes.IndexOf(TAstTypeDecl(node).Name) < 0 then
-            FRangeTypes.AddObject(TAstTypeDecl(node).Name, System.TObject(node))
+            FRangeTypes.Add(TAstTypeDecl(node).Name, TAstTypeDecl(node))
           else
             FDiag.Error('redeclaration of range type: ' + TAstTypeDecl(node).Name, node.Span);
         end
@@ -6829,7 +6757,7 @@ begin
         else if TAstTypeDecl(node).DeclType <> atUnresolved then
         begin
           if FTypeAliases.IndexOf(TAstTypeDecl(node).Name) < 0 then
-            FTypeAliases.AddObject(TAstTypeDecl(node).Name, System.TObject(node));
+            FTypeAliases.Add(TAstTypeDecl(node).Name, TAstTypeDecl(node));
         end;
       end
       else if node is TAstConDecl then
@@ -6889,7 +6817,7 @@ begin
       if FUnitTypes.IndexOf(TAstUtypeDecl(node).Name) >= 0 then
         FDiag.Error('redeclaration of unit type: ' + TAstUtypeDecl(node).Name, node.Span)
       else
-        FUnitTypes.AddObject(TAstUtypeDecl(node).Name, System.TObject(node));
+        FUnitTypes.Add(TAstUtypeDecl(node).Name, TAstUtypeDecl(node));
     end
     else if node is TAstVarDecl then
     begin
@@ -7021,12 +6949,12 @@ begin
         begin
           structIdx := FStructTypes.IndexOf(sym.TypeName);
           if structIdx >= 0 then
-            sym.StructDecl := TAstStructDecl(FStructTypes.Objects[structIdx])
+            sym.StructDecl := FStructTypes.Data[structIdx]
           // If it's an enum type, resolve to int64
-          else if Assigned(FEnumTypes) and (FEnumTypes.IndexOf(sym.TypeName) >= 0) then
+          else if FEnumTypes.IndexOf(sym.TypeName) >= 0 then
             sym.DeclType := atInt64
           // If it's a utype, resolve to f64 and set unit tag
-          else if Assigned(FUnitTypes) and (FUnitTypes.IndexOf(sym.TypeName) >= 0) then
+          else if FUnitTypes.IndexOf(sym.TypeName) >= 0 then
           begin
             sym.DeclType := atF64;
             sym.UnitTag  := sym.TypeName;
@@ -7139,18 +7067,13 @@ begin
             begin
               fi := FClassTypes.IndexOf(p.TypeName);
               if fi >= 0 then
-                sym.ClassDecl := TAstClassDecl(FClassTypes.Objects[fi]);
+                sym.ClassDecl := FClassTypes.Data[fi];
             end;
-            if (sym.ClassDecl = nil) and Assigned(FStructTypes) then
+            if sym.ClassDecl = nil then
             begin
               fi := FStructTypes.IndexOf(p.TypeName);
               if fi >= 0 then
-              begin
-                if FStructTypes.Objects[fi] is TAstClassDecl then
-                  sym.ClassDecl := TAstClassDecl(FStructTypes.Objects[fi])
-                else
-                  sym.StructDecl := TAstStructDecl(FStructTypes.Objects[fi]);
-              end;
+                sym.StructDecl := FStructTypes.Data[fi];
             end;
           end;
           AddSymbolToCurrent(sym, p.Span);
@@ -7279,7 +7202,7 @@ end;
 procedure TSema.DumpSymbolTable;
 var
   i, j, k: Integer;
-  sl: TStringList;
+  sl: TSymbolMap;
   sym: TSymbol;
   scopeKind: string;
 begin
@@ -7315,7 +7238,7 @@ begin
     begin
       for j := 0 to sl.Count - 1 do
       begin
-        sym := TSymbol(sl.Objects[j]);
+        sym := sl.Data[j];
 
         // Write basic symbol info
         Write('  ', sym.Name:20, ' ', GetSymbolKindName(sym.Kind):4);
@@ -7377,7 +7300,7 @@ begin
     WriteLn('  ', StringOfChar('-', 60));
     for i := 0 to FStructTypes.Count - 1 do
     begin
-      WriteLn('  ', FStructTypes[i]);
+      WriteLn('  ', FStructTypes.Keys[i]);
     end;
     WriteLn;
   end;
@@ -7389,7 +7312,7 @@ begin
     WriteLn('  ', StringOfChar('-', 60));
     for i := 0 to FClassTypes.Count - 1 do
     begin
-WriteLn('  ', FClassTypes[i]);
+WriteLn('  ', FClassTypes.Keys[i]);
     end;
     WriteLn;
   end;
