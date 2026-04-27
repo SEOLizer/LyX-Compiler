@@ -1058,6 +1058,17 @@ type
     procedure SetLayout(aSize, aAlign: Integer);
   end;
 
+  { Record describing one pending monomorphized struct method for IR lowering }
+  TMonoStructMethodEntry = record
+    MangledName:       string;          // '_L_Pair__int64_getFirst'
+    ConcreteStructName: string;         // 'Pair__int64'
+    ConcreteStructDecl: TAstStructDecl; // concrete struct for field-offset lookup
+    TemplateMethod:    TAstFuncDecl;    // template method body (not owned)
+    StructTypeParams:  TStringArray;    // e.g. ['T']
+    ConcreteTypeArgs:  array of TAurumType; // e.g. [atInt64]
+  end;
+  TMonoStructMethodList = array of TMonoStructMethodEntry;
+
   { Interface-Deklaration }
   TAstInterfaceDecl = class(TAstNode)
   private
