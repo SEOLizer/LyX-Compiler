@@ -74,21 +74,25 @@ type
 implementation
 
 uses
-  Math;
+  Math, arch_common;
 
 const
-  // ARM64 General-Purpose Registers (64-bit)
-  X0 = 0; X1 = 1; X2 = 2; X3 = 3; X4 = 4; X5 = 5; X6 = 6; X7 = 7;
-  X8 = 8; X9 = 9; X10 = 10; X11 = 11; X12 = 12; X13 = 13; X14 = 14; X15 = 15;
-  X16 = 16; X17 = 17; X18 = 18; X19 = 19; X20 = 20; X21 = 21; X22 = 22; X23 = 23;
-  X24 = 24; X25 = 25; X26 = 26; X27 = 27; X28 = 28;
-  X29 = 29;
-  X30 = 30;
-  XZR = 31;
-  SP = 31;
-  RBP = 29;
+  // ARM64 General-Purpose Registers — local shorthands; authoritative in arch_common
+  X0  = ARM64_X0;  X1  = ARM64_X1;  X2  = ARM64_X2;  X3  = ARM64_X3;
+  X4  = ARM64_X4;  X5  = ARM64_X5;  X6  = ARM64_X6;  X7  = ARM64_X7;
+  X8  = ARM64_X8;  X9  = ARM64_X9;  X10 = ARM64_X10; X11 = ARM64_X11;
+  X12 = ARM64_X12; X13 = ARM64_X13; X14 = ARM64_X14; X15 = ARM64_X15;
+  X16 = ARM64_X16; X17 = ARM64_X17; X18 = ARM64_X18; X19 = ARM64_X19;
+  X20 = ARM64_X20; X21 = ARM64_X21; X22 = ARM64_X22; X23 = ARM64_X23;
+  X24 = ARM64_X24; X25 = ARM64_X25; X26 = ARM64_X26; X27 = ARM64_X27;
+  X28 = ARM64_X28;
+  X29 = ARM64_FP;  // Frame Pointer
+  X30 = ARM64_LR;  // Link Register
+  XZR = ARM64_XZR;
+  SP  = ARM64_SP;
+  RBP = ARM64_FP;  // Alias for X29
 
-  // Parameter registers (AAPCS64)
+  // AAPCS64 parameter registers — matches arch_common.ABI_AAPCS64_PARAM_REGS
   ParamRegs: array[0..7] of Byte = (X0, X1, X2, X3, X4, X5, X6, X7);
 
   // ARM64 FP/SIMD Registers
@@ -370,7 +374,7 @@ end;
 
 function SlotOffset(slot: Integer): Integer;
 begin
-  Result := -(slot + 1) * 8;
+  Result := FPBaseSlotOffset(slot); // see arch_common
 end;
 
 // ==========================================================================
@@ -985,9 +989,7 @@ begin
     end;
     
     totalSlots := localCnt + maxTemp + 1;
-    if totalSlots < 1 then totalSlots := 1;
-    
-    frameSize := ((totalSlots * 8) + 16 + 15) and not 15;
+    frameSize := CalcFrameSize64FPLR(totalSlots);
     
     // Function prologue
     WriteStpPreIndex(FCode, X29, X30, SP, -frameSize);
