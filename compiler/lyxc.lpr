@@ -35,9 +35,6 @@ var
   flagAsmListing: Boolean;  // --asm-listing Assembly listing output
   flagCallGraph: Boolean;  // --call-graph
   flagMapFile: Boolean;  // --map-file
-  flagRuntimeChecks: Boolean;  // --runtime-checks (DO-178C Level A)
-  flagProfile: Boolean;  // --profile (WP-3: Simple Profiler)
-  flagTrace: Boolean;  // --trace (WP-4: Trace builtin)
   flagProvenance: Boolean;  // --provenance (WP-F: Provenance Tracking)
   flagAstdump: Boolean;  // --ast-dump (WP-A: AST Visualisierung)
   flagSymtabdump: Boolean;  // --symtab-dump (WP-B: Symbol Table)
@@ -68,7 +65,6 @@ var
   emit: TX86_64Emitter;
   winEmit: TWin64Emitter;
   arm64Emit: TARM64Emitter;
-  macosx64Emit: TMacOSX64Emitter;
   esp32Emit: ICodeEmitter;
   riscvEmit: TRISCVCodeEmitter;
   codeBuf, dataBuf: TByteBuffer;
@@ -93,7 +89,7 @@ var
   // TMR Hash Store patching variables (aerospace-todo P0 #46)
   x86Emit: TX86_64Emitter;
   hashCrc: UInt32;
-  codeSize, dataSize, alignedCodeSize, hashDataOffset: Integer;
+  codeSize, hashDataOffset: Integer;
   codeStartVA, dataVA: UInt64;
   dataAddrPos: Integer;
   // DWARF debug info
@@ -687,9 +683,6 @@ begin
   flagAsmListing := False;
   flagCallGraph := False;
   flagMapFile := False;
-  flagRuntimeChecks := False;
-  flagProfile := False;
-  flagTrace := False;
   flagProvenance := False;
   flagAstdump := False;
   flagSymtabdump := False;
@@ -706,6 +699,7 @@ begin
   unitOutputFile := '';
   unitTargetArch := la_x86_64;
   stdLibPath := '';
+  lyuSymbols := nil;
 
   // Parse command line arguments
   i := 1;
@@ -845,20 +839,11 @@ begin
       Inc(i);
     end
     else if param = '--runtime-checks' then
-    begin
-      flagRuntimeChecks := True;
-      Inc(i);
-    end
+      Inc(i)  // reserved, not yet implemented
     else if param = '--profile' then
-    begin
-      flagProfile := True;
-      Inc(i);
-    end
+      Inc(i)  // reserved, not yet implemented
     else if param = '--trace' then
-    begin
-      flagTrace := True;
-      Inc(i);
-    end
+      Inc(i)  // reserved, not yet implemented
     else if param = '--provenance' then
     begin
       flagProvenance := True;
