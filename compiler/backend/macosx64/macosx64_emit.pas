@@ -91,10 +91,16 @@ type
 
 implementation
 
+uses
+  arch_common;
+
 const
-  // Register-Konstanten
-  RAX = 0; RCX = 1; RDX = 2; RBX = 3; RSP = 4; RBP = 5; RSI = 6; RDI = 7;
-  R8 = 8; R9 = 9; R10 = 10; R11 = 11; R12 = 12; R13 = 13; R14 = 14; R15 = 15;
+  // Register-Konstanten (local shorthands; authoritative values in arch_common)
+  RAX = X86_RAX; RCX = X86_RCX; RDX = X86_RDX; RBX = X86_RBX;
+  RSP = X86_RSP; RBP = X86_RBP; RSI = X86_RSI; RDI = X86_RDI;
+  R8  = X86_R8;  R9  = X86_R9;  R10 = X86_R10; R11 = X86_R11;
+  R12 = X86_R12; R13 = X86_R13; R14 = X86_R14; R15 = X86_R15;
+  // SysV AMD64 parameter registers — matches arch_common.ABI_SYSVAMD64_PARAM_REGS
   ParamRegs: array[0..5] of Byte = (RDI, RSI, RDX, RCX, R8, R9);
 
   // macOS Syscall-Nummern (BSD-Layer, 0x2000000 Prefix)
@@ -200,7 +206,7 @@ end;
 
 function SlotOffset(slot: Integer): Integer;
 begin
-  Result := -8 * (slot + 1);
+  Result := FPBaseSlotOffset(slot); // see arch_common
 end;
 
 { ---- Standalone memory move helpers (used in EmitFromIR before class is fully set up) ---- }
