@@ -66,6 +66,9 @@ type
     FDimensions: TStringList;  // dim names (unit types P1)
     FDimExprs: TStringList;    // parallel: normalized dim expression for FDimensions[i]
     FUnitTypes: TUnitTypeMap;  // utype name -> TAstUtypeDecl
+    // Synthetic AST nodes created by sema (not owned by the parsed AST)
+    FSynthStructOwned: array of TAstStructDecl;
+    FSynthClassOwned:  array of TAstClassDecl;
     FCurrentClass: TAstClassDecl; // current class being analyzed (for super resolution)
     // Closure support
     FFuncScopeDepth: Integer; // scope depth of current function boundary
@@ -2393,10 +2396,10 @@ var
   sym: TSymbol;
   j, k: Integer;
 begin
-  // TObject aus tobject.pas erstellen
   tobj := CreateTObjectClassDecl();
-  
   FClassTypes.Add(TOBJECT_CLASSNAME, tobj);
+  SetLength(FSynthClassOwned, Length(FSynthClassOwned) + 1);
+  FSynthClassOwned[High(FSynthClassOwned)] := tobj;
   
   // Methoden als Symbole registrieren (wie bei normalen Klassen)
   for j := 0 to High(tobj.Methods) do
@@ -2658,9 +2661,10 @@ begin
       concreteFields[i].FieldType := StrToAurumType(concreteFields[i].FieldTypeName);
   end;
 
-  // Create the concrete struct and register it
   Result := TAstStructDecl.Create(mangledName, concreteFields, nil, tmpl.IsPublic, span);
   FStructTypes.Add(mangledName, Result);
+  SetLength(FSynthStructOwned, Length(FSynthStructOwned) + 1);
+  FSynthStructOwned[High(FSynthStructOwned)] := Result;
   // Compute field layout immediately so IR lowering finds offsets
   ComputeStructLayouts;
 end;
@@ -4944,7 +4948,15 @@ destructor TSema.Destroy;
 var
   i: Integer;
 begin
-  // Maps do not own their values (AST nodes owned by AST, units by UnitManager)
+  // Free synthetic AST nodes created by sema (not owned by the parsed AST tree)
+  for i := 0 to High(FSynthStructOwned) do
+    FSynthStructOwned[i].Free;
+  FSynthStructOwned := nil;
+  for i := 0 to High(FSynthClassOwned) do
+    FSynthClassOwned[i].Free;
+  FSynthClassOwned := nil;
+
+  // Maps reference AST nodes (owned by AST or freed above); just free the maps
   FImportedUnits.Free;
   FStructTypes.Free;
   FGenericStructs.Free;
@@ -5996,6 +6008,8 @@ begin
             end;
             synStruct := TAstStructDecl.Create(lyuSym.Name, structFields, nil, True, Default(TSourceSpan));
             FStructTypes.Add(lyuSym.Name, synStruct);
+            SetLength(FSynthStructOwned, Length(FSynthStructOwned) + 1);
+            FSynthStructOwned[High(FSynthStructOwned)] := synStruct;
           end;
         end;
         lskClass:
@@ -6075,6 +6089,8 @@ begin
             synClass := TAstClassDecl.Create(lyuSym.Name, classBase, structFields, nil, True, Default(TSourceSpan));
             synClass.SetLayout(classSize, classAlign, 0);
             FClassTypes.Add(lyuSym.Name, synClass);
+            SetLength(FSynthClassOwned, Length(FSynthClassOwned) + 1);
+            FSynthClassOwned[High(FSynthClassOwned)] := synClass;
           end;
         end;
         lskDim:
