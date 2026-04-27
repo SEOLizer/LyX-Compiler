@@ -100,26 +100,30 @@ type
 implementation
 
 uses
-  Math;
+  Math, arch_common;
 
 const
-  // ARM64 General-Purpose Registers (64-bit)
-  X0 = 0; X1 = 1; X2 = 2; X3 = 3; X4 = 4; X5 = 5; X6 = 6; X7 = 7;
-  X8 = 8; X9 = 9; X10 = 10; X11 = 11; X12 = 12; X13 = 13; X14 = 14; X15 = 15;
-  X16 = 16; X17 = 17; X18 = 18; X19 = 19; X20 = 20; X21 = 21; X22 = 22; X23 = 23;
-  X24 = 24; X25 = 25; X26 = 26; X27 = 27; X28 = 28;
-  X29 = 29;  // Frame Pointer (FP)
-  X30 = 30;  // Link Register (LR)
-  XZR = 31;  // Zero Register (also SP in some contexts)
-  SP = 31;   // Stack Pointer
-  RBP = 29;  // Alias for X29 (for compatibility)
-  // 32-bit register aliases
+  // ARM64 General-Purpose Registers — local shorthands; authoritative in arch_common
+  X0  = ARM64_X0;  X1  = ARM64_X1;  X2  = ARM64_X2;  X3  = ARM64_X3;
+  X4  = ARM64_X4;  X5  = ARM64_X5;  X6  = ARM64_X6;  X7  = ARM64_X7;
+  X8  = ARM64_X8;  X9  = ARM64_X9;  X10 = ARM64_X10; X11 = ARM64_X11;
+  X12 = ARM64_X12; X13 = ARM64_X13; X14 = ARM64_X14; X15 = ARM64_X15;
+  X16 = ARM64_X16; X17 = ARM64_X17; X18 = ARM64_X18; X19 = ARM64_X19;
+  X20 = ARM64_X20; X21 = ARM64_X21; X22 = ARM64_X22; X23 = ARM64_X23;
+  X24 = ARM64_X24; X25 = ARM64_X25; X26 = ARM64_X26; X27 = ARM64_X27;
+  X28 = ARM64_X28;
+  X29 = ARM64_FP;  // Frame Pointer
+  X30 = ARM64_LR;  // Link Register
+  XZR = ARM64_XZR; // Zero Register
+  SP  = ARM64_SP;
+  RBP = ARM64_FP;  // Alias for X29 (compatibility)
+  // 32-bit aliases — same encoding as 64-bit counterparts
   W0 = 0; W1 = 1; W2 = 2; W3 = 3; W4 = 4; W5 = 5; W6 = 6; W7 = 7;
   W8 = 8; W9 = 9; W10 = 10; W11 = 11; W12 = 12; W13 = 13; W14 = 14; W15 = 15;
   W16 = 16; W17 = 17; W18 = 18; W19 = 19; W20 = 20; W21 = 21; W22 = 22; W23 = 23;
   W24 = 24; W25 = 25; W26 = 26; W27 = 27; W28 = 28; W29 = 29; W30 = 30; WZR = 31;
 
-  // Parameter registers (AAPCS64)
+  // AAPCS64 parameter registers — matches arch_common.ABI_AAPCS64_PARAM_REGS
   ParamRegs: array[0..7] of Byte = (X0, X1, X2, X3, X4, X5, X6, X7);
 
   // ARM64 FP/SIMD Registers (V0-V31, auch nutzbar als D0-D31 für 64-bit Double)
@@ -1310,11 +1314,10 @@ begin
     Result := -1;
 end;
 
-// Calculate stack slot offset from FP (X29)
-// Slot 0 is at [FP-8], slot 1 at [FP-16], etc.
+// Stack slot offset from FP (X29): slot 0 → [FP-8], slot 1 → [FP-16], ...
 function SlotOffset(slot: Integer): Integer;
 begin
-  Result := -(slot + 1) * 8;
+  Result := FPBaseSlotOffset(slot); // see arch_common
 end;
 
 procedure TARM64Emitter.EmitFromIR(module: TIRModule);
@@ -1873,10 +1876,8 @@ begin
     end;
     
     totalSlots := localCnt + maxTemp + 1;
-    if totalSlots < 1 then totalSlots := 1;
-    
-    // Frame size: slots * 8, plus 16 for saved FP/LR, aligned to 16
-    frameSize := ((totalSlots * 8) + 16 + 15) and not 15;
+    // Frame size: slots * 8, plus 16 for saved FP/LR pair, aligned to 16
+    frameSize := CalcFrameSize64FPLR(totalSlots); // see arch_common
     
     // Function prologue
     // Für kleine Frames (≤512): stp x29, x30, [sp, #-frameSize]!

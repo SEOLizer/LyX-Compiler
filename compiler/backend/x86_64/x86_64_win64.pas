@@ -4,7 +4,7 @@ unit x86_64_win64;
 interface
 
 uses
-  SysUtils, Classes, Math, bytes, ir, pe64_writer, ast;
+  SysUtils, Classes, Math, bytes, ir, pe64_writer, ast, arch_common;
 
 type
   // Emitter für Windows x64 Code Generation
@@ -116,14 +116,14 @@ procedure EmitU32(buf: TByteBuffer; v: Cardinal);
 procedure EmitU64(buf: TByteBuffer; v: UInt64);
 procedure EmitRex(buf: TByteBuffer; w, r, x, b: Integer);
 
-// Register constants
+// Register constants (aliases for arch_common X86_* names)
 const
-  RAX = 0; RCX = 1; RDX = 2; RBX = 3;
-  RSP = 4; RBP = 5; RSI = 6; RDI = 7;
-  R8 = 8; R9 = 9; R10 = 10; R11 = 11;
-  R12 = 12; R13 = 13; R14 = 14; R15 = 15;
+  RAX = X86_RAX; RCX = X86_RCX; RDX = X86_RDX; RBX = X86_RBX;
+  RSP = X86_RSP; RBP = X86_RBP; RSI = X86_RSI; RDI = X86_RDI;
+  R8  = X86_R8;  R9  = X86_R9;  R10 = X86_R10; R11 = X86_R11;
+  R12 = X86_R12; R13 = X86_R13; R14 = X86_R14; R15 = X86_R15;
 
-  // Windows x64 Parameter Registers (in order)
+  // Windows x64 Parameter Registers — matches ABI_WIN64_PARAM_REGS in arch_common
   Win64ParamRegs: array[0..3] of Byte = (RCX, RDX, R8, R9);
 
 implementation
@@ -639,10 +639,9 @@ begin
   EmitU8(buf, $C0 or ((gpr and 7) shl 3) or (xmm and 7));
 end;
 
-// Calculate stack slot offset
 function SlotOffset(slot: Integer): Integer;
 begin
-  Result := -8 * (slot + 1);
+  Result := FPBaseSlotOffset(slot);
 end;
 
 // ============================================================================
