@@ -73,6 +73,9 @@ type
     function SubstType(t: TAurumType; const n: string): TAurumType;
     procedure LowerGenericSpecialization(decl: TAstFuncDecl; const mangledName: string;
       const typeArgs: array of TAurumType);
+    procedure LowerStructMethodSpec(methodDecl: TAstFuncDecl;
+      const mangledName, concreteName: string; concStructDecl: TAstStructDecl;
+      const typeParams: TStringArray; const typeArgs: array of TAurumType);
 
     { Emits IR range-check for value in temp tVal against [rMin..rMax] (aerospace-todo P1 #7) }
     procedure EmitRangeCheck(tVal: Integer; rMin, rMax: Int64; const typeName: string; span: TSourceSpan);
@@ -100,6 +103,8 @@ type
 
     function Lower(prog: TAstProgram): TIRModule;
     procedure LowerImportedUnits(um: TUnitManager);
+    procedure PreRegisterConcreteStructs(const entries: TMonoStructMethodList);
+    procedure LowerMonoStructMethods(const entries: TMonoStructMethodList);
   end;
 
 implementation
