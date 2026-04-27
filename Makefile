@@ -22,7 +22,7 @@ clean:
 
 # ── Packaging ─────────────────────────────────────────────────────────────────
 
-VERSION   := 0.8.3-aerospace
+VERSION   := 0.8.4-aerospace
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
