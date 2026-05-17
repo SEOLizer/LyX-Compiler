@@ -146,12 +146,13 @@ end;
 procedure MergePrecompiledIR(um: TUnitManager; module: TIRModule);
 { Copy IR functions from precompiled .lyu units into the main module }
 var
-  i, j: Integer;
+  i, j, k, at: Integer;
   loadedUnit: TLoadedUnit;
   srcFn: TIRFunction;
   dstFn: TIRFunction;
   srcStr: string;
   strIdxMap: array of Integer;
+  oldIdx, newIdx: Integer;
 begin
   if not Assigned(um) or not Assigned(module) then Exit;
   for i := 0 to um.Units.Count - 1 do
@@ -162,6 +163,14 @@ begin
     if not Assigned(loadedUnit.LyuxData) or not Assigned(loadedUnit.LyuxData.IRModule) then
       Continue;
 
+    { Build a string index remap from source module to dest module }
+    SetLength(strIdxMap, loadedUnit.LyuxData.IRModule.Strings.Count);
+    for symIdx := 0 to loadedUnit.LyuxData.IRModule.Strings.Count - 1 do
+    begin
+      srcStr := loadedUnit.LyuxData.IRModule.Strings[symIdx];
+      strIdxMap[symIdx] := module.InternString(srcStr);
+    end;
+
     { Copy all functions from precompiled unit's IR into main module }
     for j := 0 to High(loadedUnit.LyuxData.IRModule.Functions) do
     begin
@@ -169,20 +178,37 @@ begin
       { Skip if already present (avoid duplicates) }
       if module.FindFunction(srcFn.Name) <> nil then
         Continue;
-      { Build a string index remap from source to dest module }
-      SetLength(strIdxMap, loadedUnit.LyuxData.IRModule.Strings.Count);
-      for symIdx := 0 to loadedUnit.LyuxData.IRModule.Strings.Count - 1 do
-      begin
-        srcStr := loadedUnit.LyuxData.IRModule.Strings[symIdx];
-        strIdxMap[symIdx] := module.InternString(srcStr);
-      end;
       { Add function to main module }
       module.AddFunction(srcFn.Name);
       dstFn := module.Functions[High(module.Functions)];
       dstFn.ParamCount := srcFn.ParamCount;
       dstFn.LocalCount := srcFn.LocalCount;
       dstFn.EnergyLevel := srcFn.EnergyLevel;
-      dstFn.Instructions := Copy(srcFn.Instructions);
+      dstFn.InstrLen := Length(srcFn.Instructions);
+      { Deep-copy instructions: TIRInstr records contain dynamic array fields (ArgTemps)
+        that must not be shared between source and destination to prevent refcount corruption
+        when the optimizer modifies or compacts instruction arrays. }
+      SetLength(dstFn.Instructions, Length(srcFn.Instructions));
+      for k := 0 to High(srcFn.Instructions) do
+      begin
+        dstFn.Instructions[k] := srcFn.Instructions[k];
+        SetLength(dstFn.Instructions[k].ArgTemps, Length(srcFn.Instructions[k].ArgTemps));
+        for at := 0 to High(srcFn.Instructions[k].ArgTemps) do
+          dstFn.Instructions[k].ArgTemps[at] := srcFn.Instructions[k].ArgTemps[at];
+      end;
+      { Remap irConstStr string indices from source unit to merged module }
+      for k := 0 to High(dstFn.Instructions) do
+      begin
+        if dstFn.Instructions[k].Op = irConstStr then
+        begin
+          oldIdx := StrToIntDef(dstFn.Instructions[k].ImmStr, -1);
+          if (oldIdx >= 0) and (oldIdx < Length(strIdxMap)) then
+          begin
+            newIdx := strIdxMap[oldIdx];
+            dstFn.Instructions[k].ImmStr := IntToStr(newIdx);
+          end;
+        end;
+      end;
     end;
   end;
 end;
@@ -1081,6 +1107,7 @@ begin
       end;
       
       // Phase 2: Extrahiere Unit-Metadaten und alle pub-Symbole
+      lyuSymbols      := nil;
       unitDescription := '';
       unitAuthor      := '';
       unitCopyright   := '';
@@ -1134,7 +1161,19 @@ begin
               lyuSymbols[symIdx].Name := TAstConDecl(prog.Decls[i]).Name;
               lyuSymbols[symIdx].Kind := lskCon;
               lyuSymbols[symIdx].TypeHash := 0;
+              // TypeInfo format: "type:value" so the IR lowerer can reconstruct FConstMap
               lyuSymbols[symIdx].TypeInfo := FormatType(TAstConDecl(prog.Decls[i]).DeclType);
+              if TAstConDecl(prog.Decls[i]).InitExpr is TAstIntLit then
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':' + IntToStr(TAstIntLit(TAstConDecl(prog.Decls[i]).InitExpr).Value)
+              else if TAstConDecl(prog.Decls[i]).InitExpr is TAstBoolLit then
+              begin
+                if TAstBoolLit(TAstConDecl(prog.Decls[i]).InitExpr).Value then
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':1'
+                else
+                  lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':0';
+              end
+              else if TAstConDecl(prog.Decls[i]).InitExpr is TAstStrLit then
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + ':' + TAstStrLit(TAstConDecl(prog.Decls[i]).InitExpr).Value;
               WriteLn('  Exportiere: pub con ', lyuSymbols[symIdx].Name, ': ', lyuSymbols[symIdx].TypeInfo);
             end;
           end
@@ -1245,6 +1284,15 @@ begin
                 lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + FormatType(cd.Fields[j].FieldType)
               else
                 lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo + cd.Fields[j].FieldTypeName;
+            end;
+            // Serialize own virtual methods (not overrides) for cross-unit override checking
+            for j := 0 to High(cd.Methods) do
+            begin
+              if cd.Methods[j].IsVirtual and not cd.Methods[j].IsOverride then
+                lyuSymbols[symIdx].TypeInfo := lyuSymbols[symIdx].TypeInfo
+                  + ';virt:' + cd.Methods[j].Name
+                  + ':' + IntToStr(Length(cd.Methods[j].Params))
+                  + ':' + FormatType(cd.Methods[j].ReturnType);
             end;
             WriteLn('  Exportiere: pub class ', cd.Name, '(', lyuSymbols[symIdx].TypeInfo, ')');
           end;

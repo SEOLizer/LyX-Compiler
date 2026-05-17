@@ -2870,6 +2870,8 @@ var
   sd: TAstStructDecl;
   nestedIdx, fj, nestedOffset: Integer;
   nestedSd: TAstStructDecl;
+  nestedClassIdx: Integer;
+  nestedCd: TAstClassDecl;
 begin
   if expr = nil then
   begin
@@ -3112,6 +3114,75 @@ begin
                     end;
                   end;
                   Break;
+                end;
+              end;
+            end
+            else
+            begin
+              // recv.OwnerName is a class (not struct): handle o.classField.subField
+              // e.g. g.lastChild.nextPtr where lastChild: TView (class reference)
+              nestedClassIdx := FClassTypes.IndexOf(TAstFieldAccess(recv).OwnerName);
+              if nestedClassIdx >= 0 then
+              begin
+                // Walk recv's owner class hierarchy to find the field type of recv.Field
+                cd := FClassTypes.Data[nestedClassIdx];
+                typeName := '';
+                while Assigned(cd) and (typeName = '') do
+                begin
+                  for fi := 0 to High(cd.Fields) do
+                    if cd.Fields[fi].Name = TAstFieldAccess(recv).Field then
+                    begin
+                      typeName := cd.Fields[fi].FieldTypeName;
+                      Break;
+                    end;
+                  if (typeName = '') and (cd.BaseClassName <> '') then
+                  begin
+                    baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
+                    if baseIdx >= 0 then cd := FClassTypes.Data[baseIdx]
+                    else cd := nil;
+                  end
+                  else
+                    cd := nil;
+                end;
+                // Now find expr.Field in the class named typeName
+                if typeName <> '' then
+                begin
+                  nestedClassIdx := FClassTypes.IndexOf(typeName);
+                  if nestedClassIdx >= 0 then
+                  begin
+                    nestedCd := FClassTypes.Data[nestedClassIdx];
+                    fName := TAstFieldAccess(expr).Field;
+                    found := False;
+                    cd := nestedCd;
+                    while Assigned(cd) and not found do
+                    begin
+                      for fi := 0 to High(cd.Fields) do
+                        if cd.Fields[fi].Name = fName then
+                        begin
+                          found := True;
+                          fldType := cd.Fields[fi].FieldType;
+                          fldOffset := cd.FieldOffsets[fi];
+                          Break;
+                        end;
+                      if not found and (cd.BaseClassName <> '') then
+                      begin
+                        baseIdx := FClassTypes.IndexOf(cd.BaseClassName);
+                        if baseIdx >= 0 then cd := FClassTypes.Data[baseIdx]
+                        else cd := nil;
+                      end
+                      else
+                        cd := nil;
+                    end;
+                    if found then
+                    begin
+                      Result := fldType;
+                      TAstFieldAccess(expr).SetFieldOffset(fldOffset);
+                      TAstFieldAccess(expr).SetOwnerName(nestedCd.Name);
+                      TAstFieldAccess(expr).SetFieldType(fldType);
+                      expr.ResolvedType := Result;
+                      Exit;
+                    end;
+                  end;
                 end;
               end;
             end;
@@ -4897,11 +4968,25 @@ begin
             s := TSymbol.Create(fn.Params[i].Name);
             s.Kind := symVar;
             s.DeclType := fn.Params[i].ParamType;
+            s.TypeName := fn.Params[i].TypeName;
             if (fn.Params[i].TypeName <> '') and
                (FUnitTypes.IndexOf(fn.Params[i].TypeName) >= 0) then
             begin
               s.DeclType := atF64;
               s.UnitTag  := fn.Params[i].TypeName;
+            end;
+            // Set ClassDecl/StructDecl so field accesses on class/struct params resolve
+            if (s.TypeName <> '') and (s.ClassDecl = nil) and (s.StructDecl = nil) then
+            begin
+              j := FClassTypes.IndexOf(s.TypeName);
+              if j >= 0 then
+                s.ClassDecl := FClassTypes.Data[j]
+              else
+              begin
+                j := FStructTypes.IndexOf(s.TypeName);
+                if j >= 0 then
+                  s.StructDecl := FStructTypes.Data[j];
+              end;
             end;
             AddSymbolToCurrent(s, fn.Params[i].Span);
           end;
@@ -5801,6 +5886,11 @@ var
   classBase, classSizeStr, classAlignStr, classFieldsStr: string;
   classSize, classAlign: Integer;
   p1Pos, p2Pos: Integer;
+  virtMethodList: TMethodList;
+  stubMethod: TAstFuncDecl;
+  virtStr, virtName, virtRetStr: string;
+  virtParamCount, colonPos3: Integer;
+  stubParams: TAstParamList;
 begin
   upath := imp.UnitPath;
   alias := imp.Alias;
@@ -6008,7 +6098,12 @@ begin
         begin
           sym := TSymbol.Create(lyuSym.Name);
           sym.Kind := symCon;
-          sym.DeclType := StrToAurumType(lyuSym.TypeInfo);
+          // TypeInfo format: "type:value" — strip the value part for type lookup
+          colonPos1 := Pos(':', lyuSym.TypeInfo);
+          if colonPos1 > 0 then
+            sym.DeclType := StrToAurumType(Copy(lyuSym.TypeInfo, 1, colonPos1 - 1))
+          else
+            sym.DeclType := StrToAurumType(lyuSym.TypeInfo);
           sym.IsImported := True;
           AddSymbolToCurrent(sym, Default(TSourceSpan));
         end;
@@ -6104,8 +6199,9 @@ begin
             end;
             classSize  := StrToIntDef(classSizeStr, 8);
             classAlign := StrToIntDef(classAlignStr, 8);
-            // Parse fields
+            // Parse fields and virtual method stubs
             SetLength(structFields, 0);
+            SetLength(virtMethodList, 0);
             typeInfoStr := classFieldsStr;
             while typeInfoStr <> '' do
             begin
@@ -6121,6 +6217,35 @@ begin
                 typeInfoStr := '';
               end;
               if fieldStr = '' then Continue;
+              // Virtual method marker: "virt:Name:ParamCount:RetType"
+              if Copy(fieldStr, 1, 5) = 'virt:' then
+              begin
+                virtStr := Copy(fieldStr, 6, MaxInt);
+                colonPos3 := Pos(':', virtStr);
+                if colonPos3 > 0 then
+                begin
+                  virtName := Copy(virtStr, 1, colonPos3 - 1);
+                  virtStr  := Copy(virtStr, colonPos3 + 1, MaxInt);
+                  colonPos3 := Pos(':', virtStr);
+                  if colonPos3 > 0 then
+                  begin
+                    virtParamCount := StrToIntDef(Copy(virtStr, 1, colonPos3 - 1), 0);
+                    virtRetStr := Copy(virtStr, colonPos3 + 1, MaxInt);
+                  end
+                  else
+                  begin
+                    virtParamCount := 0;
+                    virtRetStr := virtStr;
+                  end;
+                  SetLength(stubParams, virtParamCount);
+                  stubMethod := TAstFuncDecl.Create(virtName, stubParams, StrToAurumType(virtRetStr), nil, Default(TSourceSpan));
+                  stubMethod.IsVirtual := True;
+                  SetLength(virtMethodList, Length(virtMethodList) + 1);
+                  virtMethodList[High(virtMethodList)] := stubMethod;
+                end;
+                Continue;
+              end;
+              // Regular field: "Name=Type"
               eqPos := Pos('=', fieldStr);
               if eqPos <= 0 then Continue;
               fieldName := Copy(fieldStr, 1, eqPos - 1);
@@ -6134,8 +6259,11 @@ begin
             end;
             for j := 0 to High(structFields) do
               structFields[j].Visibility := visPublic;
-            synClass := TAstClassDecl.Create(lyuSym.Name, classBase, structFields, nil, True, Default(TSourceSpan));
-            synClass.SetLayout(classSize, classAlign, 0);
+            synClass := TAstClassDecl.Create(lyuSym.Name, classBase, structFields, virtMethodList, True, Default(TSourceSpan));
+            // Do NOT call SetLayout here: ComputeClassLayouts will compute correct
+            // field offsets (starting at base class size) and call SetLayout itself.
+            // Pre-setting Size != 0 would cause ComputeClassLayouts to skip this class
+            // and leave all FieldOffsets at -1.
             FClassTypes.Add(lyuSym.Name, synClass);
             SetLength(FSynthClassOwned, Length(FSynthClassOwned) + 1);
             FSynthClassOwned[High(FSynthClassOwned)] := synClass;
@@ -7134,6 +7262,11 @@ begin
           structIdx := FStructTypes.IndexOf(sym.TypeName);
           if structIdx >= 0 then
             sym.StructDecl := FStructTypes.Data[structIdx]
+          // If it's a class type, set ClassDecl so field accesses resolve
+          else if FClassTypes.IndexOf(sym.TypeName) >= 0 then
+          begin
+            sym.ClassDecl := FClassTypes.Data[FClassTypes.IndexOf(sym.TypeName)];
+          end
           // If it's an enum type, resolve to int64
           else if FEnumTypes.IndexOf(sym.TypeName) >= 0 then
             sym.DeclType := atInt64

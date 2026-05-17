@@ -2956,13 +2956,23 @@ function TIRLowering.LowerExpr(expr: TAstExpr): Integer;
          // and use the combined offset. The Sema has already calculated the
          // combined offset in FieldOffset.
          
-         // Walk up the chain of field accesses to find the root (non-field) expression
+         // For nested class field reads (e.g. g.lastChild.nextPtr), evaluate the
+         // direct predecessor as a heap load rather than walking to root.
+         // For struct-embedded fields, walk to root and use a combined offset.
+         ownerName := TAstFieldAccess(expr).OwnerName;
          baseExpr := TAstFieldAccess(expr).Obj;
-         while (baseExpr is TAstFieldAccess) do
-           baseExpr := TAstFieldAccess(baseExpr).Obj;
-         
-         // Now lower the root expression (e.g., 'o' in 'o.x.a')
-         t1 := LowerExpr(baseExpr);
+         if (baseExpr is TAstFieldAccess) and
+            (ownerName <> '') and
+            (FClassTypes.IndexOf(ownerName) >= 0) then
+         begin
+           t1 := LowerExpr(baseExpr);
+         end
+         else
+         begin
+           while (baseExpr is TAstFieldAccess) do
+             baseExpr := TAstFieldAccess(baseExpr).Obj;
+           t1 := LowerExpr(baseExpr);
+         end;
          if t1 < 0 then
            Exit;
 

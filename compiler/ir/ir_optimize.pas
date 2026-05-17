@@ -453,6 +453,7 @@ var
   reachable: array of Boolean;
   queue: array of Integer;
   qHead, qTail: Integer;
+  newLen: Integer;
 begin
   Result := False;
   if not Assigned(func) then Exit;
@@ -503,16 +504,14 @@ begin
   // Compact irInvalid instructions out of the list
   if Result then
   begin
-    for i := High(func.Instructions) downto 0 do
-    begin
-      if func.Instructions[i].Op = irInvalid then
+    newLen := 0;
+    for i := 0 to High(func.Instructions) do
+      if func.Instructions[i].Op <> irInvalid then
       begin
-        if i < Length(func.Instructions) - 1 then
-          System.Move(func.Instructions[i+1], func.Instructions[i],
-                      (Length(func.Instructions) - i - 1) * SizeOf(TIRInstr));
-        SetLength(func.Instructions, Length(func.Instructions) - 1);
+        func.Instructions[newLen] := func.Instructions[i];
+        Inc(newLen);
       end;
-    end;
+    SetLength(func.Instructions, newLen);
     SetChanged;
   end;
 end;
@@ -584,7 +583,7 @@ end;
 
 function TIROptimizer.EliminateDeadCode(func: TIRFunction): Boolean;
 var
-  i: Integer;
+  i, newLen: Integer;
   instr: TIRInstr;
   liveDest: TBoolArray;
 begin
@@ -626,17 +625,14 @@ begin
   // Clean up invalid instructions
   if Result then
   begin
-    for i := High(func.Instructions) downto 0 do
-    begin
-      if func.Instructions[i].Op = irInvalid then
+    newLen := 0;
+    for i := 0 to High(func.Instructions) do
+      if func.Instructions[i].Op <> irInvalid then
       begin
-        // Remove from array
-        if i < Length(func.Instructions) - 1 then
-          System.Move(func.Instructions[i+1], func.Instructions[i], 
-                      (Length(func.Instructions) - i - 1) * SizeOf(TIRInstr));
-        SetLength(func.Instructions, Length(func.Instructions) - 1);
+        func.Instructions[newLen] := func.Instructions[i];
+        Inc(newLen);
       end;
-    end;
+    SetLength(func.Instructions, newLen);
   end;
 end;
 
@@ -800,7 +796,7 @@ begin
     if Assigned(func) then
       EliminateCommonSubexpr(func);
   end;
-  
+
   WriteLn('[IR-Optimize] CSE abgeschlossen.');
 end;
 
