@@ -204,7 +204,7 @@ end;
 procedure TLyuxSerializer.WriteIRSection(IRModule: TIRModule);
 { Write strings + functions + globals sections (assumes FBuffer and FStrings populated) }
 var
-  i, j: Integer;
+  i, j, k: Integer;
   fn: TIRFunction;
   strIdx: Cardinal;
 begin
@@ -257,6 +257,9 @@ begin
         strIdx := $FFFFFFFF;
       FBuffer.WriteU32LE(strIdx);
       FBuffer.WriteU8(Ord(fn.Instructions[j].CallMode));
+      FBuffer.WriteU32LE(Length(fn.Instructions[j].ArgTemps));
+      for k := 0 to High(fn.Instructions[j].ArgTemps) do
+        FBuffer.WriteU32LE(fn.Instructions[j].ArgTemps[k]);
     end;
   end;
 
@@ -490,7 +493,8 @@ end;
 
 function TLyuxDeserializer.ReadIRSection: TIRModule;
 var
-  i, j, strCount, funcCount, globCount, instrCount: Integer;
+  i, j, k, strCount, funcCount, globCount, instrCount: Integer;
+  argTempsCount: Cardinal;
   strIdx: Cardinal;
   fn: TIRFunction;
   fnName: string;
@@ -549,6 +553,14 @@ begin
         if (strIdx <> $FFFFFFFF) and (Integer(strIdx) < FStrings.Count) then
           fn.Instructions[j].LabelName := FStrings[strIdx];
         fn.Instructions[j].CallMode := TIRCallMode(FBuffer.ReadU8(FPos)); Inc(FPos);
+        if FPos + 4 > FBuffer.Size then Break;
+        argTempsCount := ReadU32LEAdv;
+        if argTempsCount > 0 then
+        begin
+          SetLength(fn.Instructions[j].ArgTemps, argTempsCount);
+          for k := 0 to Integer(argTempsCount) - 1 do
+            fn.Instructions[j].ArgTemps[k] := Integer(ReadU32LEAdv);
+        end;
       end;
     end;
 
