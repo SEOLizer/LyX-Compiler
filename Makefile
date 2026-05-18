@@ -1,7 +1,7 @@
 # Root Makefile — delegates to compiler/Makefile
 # Build output: ./lyxc (at repo root)
 
-.PHONY: build debug test clean e2e package precompile-units install-bin
+.PHONY: build debug test clean e2e snapshot snapshot-update package precompile-units install-bin
 
 # ── Compiler ──────────────────────────────────────────────────────────────────
 
@@ -16,6 +16,12 @@ test:
 
 e2e:
 	$(MAKE) -C compiler e2e
+
+snapshot: build
+	@bash tests/run_snapshot_tests.sh
+
+snapshot-update: build
+	@bash tests/run_snapshot_tests.sh --update
 
 clean:
 	$(MAKE) -C compiler clean
