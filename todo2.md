@@ -195,7 +195,7 @@ x86\_64, ARM64, Xtensa, RISC-V implementieren Prologue/Epilogue, Calling Convent
 |---|-----------|---------|-------------|--------|
 | 1 | P0 | Sema | `atUnresolved` propagiert still, Typfehler erst im Codegen | ✅ `fix/sema-strict-type-check` |
 | 2 | P0 | Optimizer | CSE emittiert ungültiges IR (`Src2 = -1`) | ✅ `fix/ir-move-opcode` |
-| 3 | P0 | Features | ~25 aerospace-todo-Features nur halb implementiert | — |
+| 3 | P0 | Features | ~25 aerospace-todo-Features nur halb implementiert | ✅ `feat/aerospace-p0-3` |
 | 4 | P1 | IR | Kein CFG — Optimierungen arbeiten blind | ✅ `fix/cfg-ir` |
 | 5 | P1 | Lowering | 7.576-Zeilen-Monolith, alles vermischt | ✅ `fix/lower-split` |
 | 6 | P1 | Typsystem | Typ-Logik dreifach dupliziert (Parser/Sema/Lowering) | ✅ `fix/type-utils` |
