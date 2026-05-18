@@ -245,6 +245,7 @@ pub type Codegen = class {
   globalVars:     int64;
   globalVarCount: int64;
   globalVarCap:   int64;
+  globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -415,9 +416,12 @@ pub type Codegen = class {
     if (self.globalVarCount >= self.globalVarCap) {
       var nc: int64 := self.globalVarCap * 2;
       var nb: int64 := mmap(0, nc * 24, 3, 34, -1, 0);
+      var np: int64 := mmap(0, nc, 3, 34, -1, 0);
       var i: int64 := 0;
       while (i < self.globalVarCount * 24) { poke8(nb + i, peek8(self.globalVars + i)); i := i + 1; }
-      self.globalVars := nb; self.globalVarCap := nc;
+      i := 0;
+      while (i < self.globalVarCount) { poke8(np + i, peek8(self.globalIsPchar + i)); i := i + 1; }
+      self.globalVars := nb; self.globalVarCap := nc; self.globalIsPchar := np;
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -427,6 +431,7 @@ pub type Codegen = class {
     poke64(base,      name as int64);
     poke64(base + 8,  nlen);
     poke64(base + 16, doff);
+    poke8(self.globalIsPchar + self.globalVarCount, 0);
     self.globalVarCount := self.globalVarCount + 1;
     return doff;
   }
@@ -438,6 +443,18 @@ pub type Codegen = class {
       var gname: pchar := peek64(base) as pchar;
       var glen:  int64 := peek64(base + 8);
       if (self.cg_seq(gname, glen, name, nlen)) { return peek64(base + 16); }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  fn cg_findGlobalIdx(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.globalVarCount) {
+      var base: int64 := self.globalVars + i * 24;
+      var gname: pchar := peek64(base) as pchar;
+      var glen:  int64 := peek64(base + 8);
+      if (self.cg_seq(gname, glen, name, nlen)) { return i; }
       i := i + 1;
     }
     return -1;
@@ -1864,13 +1881,18 @@ pub type Codegen = class {
       var isPchar:  int64 := 0;
       var isArray:  int64 := 0;
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
-        var lidx: int64 := self.cg_findLocalIdx(self.cg_nsval(baseNode), self.cg_nslen(baseNode));
+        var bname: pchar := self.cg_nsval(baseNode);
+        var blen:  int64 := self.cg_nslen(baseNode);
+        var lidx: int64 := self.cg_findLocalIdx(bname, blen);
         if (lidx >= 0) {
           var tb: int64 := self.localTypes + lidx * 16;
           var tp: pchar := peek64(tb) as pchar;
           var tn: int64 := peek64(tb + 8);
           if (tn == 5 && self.cg_seq(tp, tn, "pchar", 5)) { isPchar := 1; }
           if (peek8(self.localIsArray + lidx) != 0) { isArray := 1; }
+        } else {
+          var gidx: int64 := self.cg_findGlobalIdx(bname, blen);
+          if (gidx >= 0 && peek8(self.globalIsPchar + gidx) != 0) { isPchar := 1; }
         }
       }
       if (isPchar == 1) {
@@ -3670,7 +3692,16 @@ pub type Codegen = class {
         self.cg_buildEnumLayout(cur);
       } else if (k == CGN_VAR_DECL) {
         // Global variable: allocate 8 bytes in data section, register in global table
+        var gIdx: int64 := self.globalVarCount;
         self.cg_addGlobal(self.cg_nsval(cur), self.cg_nslen(cur));
+        var gtNode: int64 := self.cg_nc0(cur);
+        if (gtNode >= 0 && self.cg_nkind(gtNode) == 60) {
+          var gtp: pchar := self.cg_nsval(gtNode);
+          var gtn: int64 := self.cg_nslen(gtNode);
+          if (gtn == 5 && self.cg_seq(gtp, gtn, "pchar", 5)) {
+            poke8(self.globalIsPchar + gIdx, 1);
+          }
+        }
       } else if (k == CGN_CON_DECL) {
         // Populate constant table for use inside method bodies
         var initNode: int64 := self.cg_nc1(cur);
@@ -3787,6 +3818,7 @@ pub type Codegen = class {
     // Global variable table
     self.globalVarCap   := 64;
     self.globalVars     := mmap(0, self.globalVarCap * 24, 3, 34, -1, 0);
+    self.globalIsPchar  := mmap(0, self.globalVarCap, 3, 34, -1, 0);
     self.globalVarCount := 0;
 
     // Emit fixed helper stubs first
