@@ -138,14 +138,18 @@ Vollständiger NFA-zu-Bytecode-Compiler mit 130+ Methoden (~1.000 Zeilen) mitten
 
 ---
 
-### 15. Parallele Arrays statt Record für Locals (`lower_ast_to_ir.pas:28–36`)
+### 15. ✅ Parallele Arrays statt Record für Locals (`lower_ast_to_ir.pas:28–36`)
+> **Erledigt** — `TLocalVar = record` (VarType, ElemSize, IsStruct, SlotCount, ArrayLen, IsDynArray, TypeName, ConstVal) + `FLocals: array of TLocalVar` bereits in lower_ast_to_ir.pas.
+
 10+ parallele Arrays pro Local-Variable (`FLocalTypes[]`, `FLocalElemSize[]`, `FLocalIsStruct[]`, `FLocalSlotCount[]`, `FLocalArrayLen[]`, `FLocalIsDynArray[]`, `FLocalTypeNames[]`, `FLocalConst[]`). Falsche Indexierung führt zu stillem Datenverlust. Jedes neue Property erfordert Änderungen in `AllocLocal()` und `AllocLocalMany()`.
 
 **Fix:** `TLocalVar = record` mit allen Feldern, `array of TLocalVar` statt 10 getrennter Arrays.
 
 ---
 
-### 16. TStringList mit Object-Pointern für Symboltabelle (`sema.pas:47–58`)
+### 16. ✅ TStringList mit Object-Pointern für Symboltabelle (`sema.pas:47–58`)
+> **Erledigt** — `TFPGMap<string, T>` bereits für alle Haupt-Maps: TStructMap, TClassMap, TTypeAliasMap, TRangeTypeMap, TUnitTypeMap, TImportMap. `FEnumTypes` nutzt TStringList nur noch als reines Name-Set ohne Object-Casts.
+
 `FStructTypes` und `FClassTypes` als `TStringList` mit unsicheren Object-Casts. `FTypeAliases` speichert `TAurumType`-Enums als `TObject` — ein offensichtlicher Cast-Missbrauch. Ownership ist unklar: manche Listen werden im Destruktor nicht freigegeben, Risiko von Double-Free oder Leak.
 
 **Fix:** `TFPGMap<string, T>` aus der FGL-Unit für typsichere Maps. Explizites Freigeben im Destruktor.
@@ -172,22 +176,22 @@ x86\_64, ARM64, Xtensa, RISC-V implementieren Prologue/Epilogue, Calling Convent
 
 | # | Priorität | Bereich | Kernproblem | Status |
 |---|-----------|---------|-------------|--------|
-| 1 | P0 | Sema | `atUnresolved` propagiert still, Typfehler erst im Codegen | — |
-| 2 | P0 | Optimizer | CSE emittiert ungültiges IR (`Src2 = -1`) | — |
+| 1 | P0 | Sema | `atUnresolved` propagiert still, Typfehler erst im Codegen | ✅ `fix/sema-strict-type-check` |
+| 2 | P0 | Optimizer | CSE emittiert ungültiges IR (`Src2 = -1`) | ✅ `fix/ir-move-opcode` |
 | 3 | P0 | Features | ~25 aerospace-todo-Features nur halb implementiert | — |
 | 4 | P1 | IR | Kein CFG — Optimierungen arbeiten blind | ✅ `fix/cfg-ir` |
 | 5 | P1 | Lowering | 7.576-Zeilen-Monolith, alles vermischt | ✅ `fix/lower-split` |
 | 6 | P1 | Typsystem | Typ-Logik dreifach dupliziert (Parser/Sema/Lowering) | ✅ `fix/type-utils` |
 | 7 | P1 | Parser | Keine Error Recovery → Fehlerkaskaden | ✅ `fix/parser-error-recovery` |
 | 8 | P1 | Parser | 53 Seitenkanal-Felder als implizites Aufruf-Protokoll | ✅ `fix/parser-sidechannels` |
-| 9 | P1 | Tests | Kein automatisierter Test-Runner | — |
+| 9 | P1 | Tests | Kein automatisierter Test-Runner | ✅ `feat/snapshot-tests` |
 | 10 | P2 | IR | `TIRInstr` Fat Record — ~80% der Felder pro Opcode unbenutzt | ✅ `fix/ir-lean-instr` |
 | 11 | P2 | Optimizer | CSE O(n²) + matcht nur Temps, nicht Werte | ✅ `fix/cse-hash` |
 | 12 | P2 | IR | `FindFunction` O(n) | ✅ O(log n) via sorted TStringList |
 | 13 | P2 | IR | `Emit()` O(n²) Array-Wachstum | ✅ Capacity-Doubling |
-| 14 | P2 | Sema | Regex-Engine (~1.000 Zeilen) direkt in Sema eingebettet | — |
-| 15 | P2 | Lowering | 10 parallele Arrays statt `TLocalVar`-Record | — |
-| 16 | P2 | Sema | `TStringList`-Symboltabelle mit unsicheren Object-Casts | — |
+| 14 | P2 | Sema | Regex-Engine (~1.000 Zeilen) direkt in Sema eingebettet | ✅ `refactor/regex-engine-extract` |
+| 15 | P2 | Lowering | 10 parallele Arrays statt `TLocalVar`-Record | ✅ `TLocalVar = record` bereits in lower_ast_to_ir.pas |
+| 16 | P2 | Sema | `TStringList`-Symboltabelle mit unsicheren Object-Casts | ✅ `TFPGMap<string, T>` bereits für alle Maps |
 | 17 | P2 | Typsystem | Parametrisierte Typen ohne zusammenhängendes Record | — |
 | 18 | P2 | Backend | 70+ Emitter duplizieren ABI-Logik unabhängig | — |
 
