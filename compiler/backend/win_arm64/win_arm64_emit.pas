@@ -1061,6 +1061,12 @@ begin
             WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(slotIdx));
           end;
         
+        irMove:
+          begin
+            WriteLdrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Src1));
+            WriteStrImm(FCode, X0, X29, frameSize + SlotOffset(localCnt + instr.Dest));
+          end;
+
         irAdd:
           begin
             slotIdx := localCnt + instr.Dest;

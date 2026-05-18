@@ -401,8 +401,8 @@ end;
 function TIROptimizer.IsPureOp(op: TIROpKind): Boolean;
 begin
   case op of
-    // Constants
-    irConstInt, irConstFloat, irConstStr,
+    // Constants and copies
+    irConstInt, irConstFloat, irConstStr, irMove,
     // Integer arithmetic
     irAdd, irSub, irMul, irDiv, irMod, irNeg,
     // Float arithmetic
@@ -825,7 +825,12 @@ begin
       if instr.Dest < Length(copySrc) then
         copySrc[instr.Dest] := -1;
     end;
-    
+
+    // Track irMove: dest is a copy of src1
+    if (instr.Op = irMove) and (instr.Dest >= 0) and (instr.Src1 >= 0)
+       and (instr.Dest < Length(copySrc)) then
+      copySrc[instr.Dest] := instr.Src1;
+
     // Propagiere Kopien in nachfolgenden Instruktionen
     if (instr.Src1 >= 0) and (instr.Src1 < Length(copySrc)) and (copySrc[instr.Src1] >= 0) then
     begin
@@ -943,8 +948,8 @@ begin
           // x * 1 -> x (identity)
           else if src2IsConst and (src2Val = 1) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy: dest := src1
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -953,9 +958,9 @@ begin
           // 1 * x -> x (identity)
           else if src1IsConst and (src1Val = 1) then
           begin
-            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Op := irMove;
             func.Instructions[i].Src1 := instr.Src2;
-            func.Instructions[i].Src2 := -1;  // Mark as copy: dest := src2
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1001,8 +1006,8 @@ begin
           // x / 1 -> x
           if src2IsConst and (src2Val = 1) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1023,7 +1028,8 @@ begin
           // x + 0 -> x
           if src2IsConst and (src2Val = 0) then
           begin
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1032,8 +1038,9 @@ begin
           // 0 + x -> x
           else if src1IsConst and (src1Val = 0) then
           begin
+            func.Instructions[i].Op := irMove;
             func.Instructions[i].Src1 := instr.Src2;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1051,8 +1058,8 @@ begin
           // x - 0 -> x
           if src2IsConst and (src2Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1085,8 +1092,8 @@ begin
           // x << 0 -> x, x >> 0 -> x
           if src2IsConst and (src2Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1134,8 +1141,8 @@ begin
           // x & x -> x (same temp)
           else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1153,8 +1160,8 @@ begin
           // x | 0 -> x
           if src2IsConst and (src2Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1163,9 +1170,9 @@ begin
           // 0 | x -> x
           else if src1IsConst and (src1Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Op := irMove;
             func.Instructions[i].Src1 := instr.Src2;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1174,8 +1181,8 @@ begin
           // x | x -> x (same temp)
           else if (instr.Src1 = instr.Src2) and (instr.Src1 >= 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1193,8 +1200,8 @@ begin
           // x ^ 0 -> x
           if src2IsConst and (src2Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Op := irMove;
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;
@@ -1203,9 +1210,9 @@ begin
           // 0 ^ x -> x
           else if src1IsConst and (src1Val = 0) then
           begin
-            func.Instructions[i].Op := irAdd;
+            func.Instructions[i].Op := irMove;
             func.Instructions[i].Src1 := instr.Src2;
-            func.Instructions[i].Src2 := -1;  // Mark as copy
+            func.Instructions[i].Src2 := -1;
             if (instr.Dest >= 0) and (instr.Dest < Length(tempIsConst)) then
               tempIsConst[instr.Dest] := False;
             Result := True;

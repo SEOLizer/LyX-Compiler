@@ -749,6 +749,12 @@ begin
               EmitS32I(xrA2, xrA1, instr.Dest);
             end;
           
+          irMove:
+            begin
+              EmitL32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitS32I(xrA2, xrA1, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
           irAdd:
             begin
               slotIdx := localCnt + instr.Dest;
