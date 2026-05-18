@@ -1594,7 +1594,8 @@ begin
           // Then lower the main program
           lower.Lower(prog);
           lower.LowerMonoStructMethods(s.MonoMethodList);
-          s.Free; s := nil; // MonoMethodList (and the synth structs it references) no longer needed
+          // s.Free deferred — synthetic class decls in FSynthClassOwned are still
+          // referenced by module.ClassDecls and accessed by the emitter's VMT loop.
           LeavePass('IR Lowering', 'IR Module: ' + IntToStr(Length(module.Functions)) + ' functions');
 
           // IR-Level Inlining Optimization
@@ -2060,6 +2061,7 @@ end;
                end;
              end;
           finally
+            s.Free; s := nil;  // safe here: emitter is done, module.ClassDecls no longer accessed
             lower.Free;
             module.Free;
           end;

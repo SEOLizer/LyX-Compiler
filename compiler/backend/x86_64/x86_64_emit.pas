@@ -8027,8 +8027,8 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
 
           if funcPos >= 0 then
           begin
-            // Patch the VMT entry with the function address
-            FCode.PatchU64LE(codePos, UInt64(funcPos));
+            // Patch the VMT entry with the absolute virtual address of the function
+            FCode.PatchU64LE(codePos, UInt64(ELF_BASE_VA + ELF_CODE_OFFSET) + UInt64(funcPos));
           end
           else
           begin
