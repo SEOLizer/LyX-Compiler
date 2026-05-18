@@ -722,6 +722,12 @@ begin
               EmitStrImm(0, 13, instr.Dest);
             end;
           
+          irMove:
+            begin
+              EmitLdrImm(0, 13, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitStrImm(0, 13, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
           irAdd:
             begin
               slotIdx := localCnt + instr.Dest;

@@ -805,6 +805,12 @@ begin
         // Core IR Operations (TOR-011: Complete IR coverage)
         // ========================================================================
 
+        irMove:
+          begin
+            WriteMovRegMem(RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+            WriteMovMemReg(RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+          end;
+
         irAdd:
           begin
             slotIdx := fn.LocalCount + instr.Dest;

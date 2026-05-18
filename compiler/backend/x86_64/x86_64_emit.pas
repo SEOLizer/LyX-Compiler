@@ -1794,6 +1794,12 @@ begin
                end;
             end;
            
+         irMove:
+           begin
+             WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
+             WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
+           end;
+
          irAdd:
            begin
              // dest = src1 + src2
