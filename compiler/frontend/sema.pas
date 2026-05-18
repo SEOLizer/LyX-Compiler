@@ -79,6 +79,10 @@ type
     FVerboseReasoning: Boolean; // enable verbose type reasoning output
     // WP-G: Constraint Log Dumps
     FConstraintLog: Boolean; // enable constraint solving logging
+    // Strict type checking: enabled after Pass 1 (all types registered).
+    // In strict mode, atUnresolved is only compatible with atUnresolved, and
+    // undeclared identifiers are errors rather than warnings.
+    FStrictTypeCheck: Boolean;
     procedure PushScope;
     procedure PopScope;
     procedure AddSymbolToCurrent(sym: TSymbol; span: TSourceSpan);
@@ -2563,8 +2567,18 @@ begin
   if IsIntegerType(a) and IsIntegerType(b) then Exit(True);
   // pchar and int64 are interchangeable in bootstrap (both are pointer-sized)
   if (a in [atPChar, atInt64]) and (b in [atPChar, atInt64]) then Exit(True);
-  // unresolved is compatible with everything (propagation)
-  if (a = atUnresolved) or (b = atUnresolved) then Exit(True);
+  // atUnresolved: in strict mode (body-checking after all types registered),
+  // it only matches another atUnresolved (named-type-ref vs named-type-ref).
+  // In non-strict mode (registration pass), it is universally compatible so
+  // forward references silently pass through.
+  if (a = atUnresolved) or (b = atUnresolved) then
+  begin
+    if FStrictTypeCheck then
+      Result := (a = atUnresolved) and (b = atUnresolved)
+    else
+      Result := True;
+    Exit;
+  end;
   Result := False;
 end;
 
@@ -3417,8 +3431,12 @@ begin
             Result := atInt64  // type names used as int64 pointers in bootstrap
           else
           begin
-            // Bootstrap compat: treat as warning to allow forward references
-            FDiag.Warning('use of undeclared identifier: ' + ident.Name, ident.Span);
+            // In strict mode (body-checking pass, all types registered): error.
+            // In non-strict mode (registration pass): warning to allow forward refs.
+            if FStrictTypeCheck then
+              FDiag.Error('use of undeclared identifier: ' + ident.Name, ident.Span)
+            else
+              FDiag.Warning('use of undeclared identifier: ' + ident.Name, ident.Span);
             Result := atUnresolved;
           end;
         end
@@ -7236,6 +7254,11 @@ begin
 
   // Type-name validation: catch unknown type names before body-checking
   ValidateTypeNames(prog);
+
+  // All types and symbols are now registered. Switch to strict mode:
+  // atUnresolved is no longer universally compatible, and undeclared
+  // identifiers become errors instead of warnings.
+  FStrictTypeCheck := True;
 
   // Second pass: check function bodies
   for i := 0 to High(prog.Decls) do
