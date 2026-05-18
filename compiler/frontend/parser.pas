@@ -2294,10 +2294,10 @@ function TParser.ParseAndExpr: TAstExpr;
 var
   rhs: TAstExpr;
 begin
-  Result := ParseBitOrExpr;
+  Result := ParseCmpExpr;
   while Accept(tkAnd) do
   begin
-    rhs := ParseBitOrExpr;
+    rhs := ParseCmpExpr;
     Result := TAstBinOp.Create(tkAnd, Result, rhs, Result.Span);
   end;
 end;
@@ -2330,10 +2330,10 @@ function TParser.ParseBitAndExpr: TAstExpr;
 var
   rhs: TAstExpr;
 begin
-  Result := ParseCmpExpr;
+  Result := ParseShiftExpr;
   while Accept(tkBitAnd) do
   begin
-    rhs := ParseCmpExpr;
+    rhs := ParseShiftExpr;
     Result := TAstBinOp.Create(tkBitAnd, Result, rhs, Result.Span);
   end;
 end;
@@ -2344,8 +2344,8 @@ var
   rhs: TAstExpr;
   targetClassName: string;
 begin
-  Result := ParseShiftExpr;
-  
+  Result := ParseBitOrExpr;
+
   if Result = nil then Exit(nil);
 
   // "is" Operator für Laufzeit-Typprüfung
@@ -2365,13 +2365,13 @@ begin
   else if Check(tkIn) then
   begin
     Advance;
-    rhs := ParseShiftExpr;
+    rhs := ParseBitOrExpr;
     Result := TAstInExpr.Create(Result, rhs, Result.Span);
   end
   else if Check(tkEq) or Check(tkNeq) or Check(tkLt) or Check(tkLe) or Check(tkGt) or Check(tkGe) then
   begin
     op := FCurTok.Kind; Advance;
-    rhs := ParseShiftExpr;
+    rhs := ParseBitOrExpr;
     Result := TAstBinOp.Create(op, Result, rhs, Result.Span);
   end;
 end;
