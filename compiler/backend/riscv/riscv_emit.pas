@@ -657,6 +657,12 @@ begin
               EmitIType($23, 3, X10, X2, instr.Dest);
             end;
           
+          irMove:
+            begin
+              EmitIType($03, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Src1));
+              EmitIType($23, 3, X10, X2, frameSize + SlotOffset(localCnt + instr.Dest));
+            end;
+
           irAdd:
             begin
               slotIdx := localCnt + instr.Dest;
