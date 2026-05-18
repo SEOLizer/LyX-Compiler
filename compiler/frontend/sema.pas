@@ -3519,12 +3519,20 @@ begin
     nkVarDecl:
       begin
         vd := TAstVarDecl(stmt);
+        // @redundant: TMR multi-slot codegen not yet implemented
+        if vd.IsRedundant then
+          FDiag.Warning('@redundant on ''' + vd.Name +
+            ''': triple-modular-redundancy codegen not yet implemented — ' +
+            'variable behaves as single-copy', vd.Span);
+        // RingBuffer type: codegen not yet implemented
+        if vd.DeclType = atRingBuffer then
+          FDiag.Error('RingBuffer type not yet implemented', vd.Span);
         // check init expr type (if present)
         if Assigned(vd.InitExpr) then
           vtype := CheckExpr(vd.InitExpr)
         else
           vtype := vd.DeclType;  // Use declared type if no initializer
-        
+
         // Range type: compile-time bounds check for literal initializers (aerospace-todo P1 #7)
         if (vd.DeclType = atUnresolved) and (vd.DeclTypeName <> '') and
            Assigned(FRangeTypes) then
@@ -4208,6 +4216,10 @@ begin
       sd := FStructTypes.Data[i];
       // skip if already computed
       if sd.Size <> 0 then Continue;
+      // Endianness: byte-swap on field access not yet implemented
+      if sd.Endian <> enNative then
+        FDiag.Warning('struct ''' + sd.Name + ''': @big_endian/@little_endian byte-swap ' +
+          'not yet implemented — struct behaves as native endian', sd.Span);
       // attempt compute
       totalSize := 0; maxAlign := 1;
       off := 0;
@@ -4341,20 +4353,49 @@ begin
         begin
           ok := False; Break;
         end;
-        // align current offset
-        if falign > maxAlign then maxAlign := falign;
-        if (off mod falign) <> 0 then
-          off := ((off + falign - 1) div falign) * falign;
-        sd.FieldOffsets[fldIdx] := off;
-        off := off + fsize;
+        if sd.IsPacked then
+        begin
+          // @packed: tight layout — no alignment padding
+          if f.BitOffset >= 0 then
+          begin
+            // at(N): explicit bit position; only byte-aligned offsets supported
+            if (f.BitOffset mod 8) <> 0 then
+              FDiag.Error('@packed struct ''' + sd.Name + ''' field ''' + f.Name +
+                ''': sub-byte bit fields not yet implemented (at(' +
+                IntToStr(f.BitOffset) + ') must be a multiple of 8)', sd.Span);
+            sd.FieldOffsets[fldIdx] := f.BitOffset div 8;
+            if f.BitOffset div 8 + fsize > off then
+              off := f.BitOffset div 8 + fsize;
+          end
+          else
+          begin
+            sd.FieldOffsets[fldIdx] := off;
+            off := off + fsize;
+          end;
+        end
+        else
+        begin
+          // standard aligned layout
+          if falign > maxAlign then maxAlign := falign;
+          if (off mod falign) <> 0 then
+            off := ((off + falign - 1) div falign) * falign;
+          sd.FieldOffsets[fldIdx] := off;
+          off := off + fsize;
+        end;
       end;
         if ok then
         begin
-          // final struct align = maxAlign, size rounded up
-          sd.SetLayout(off, maxAlign);
-          if (off mod sd.Align) <> 0 then
-            off := ((off + sd.Align - 1) div sd.Align) * off;
-          sd.SetLayout(off, sd.Align);
+          if sd.IsPacked then
+            // packed structs: size = raw byte extent, alignment = 1
+            sd.SetLayout(off, 1)
+          else
+          begin
+            // standard: round size up to struct alignment
+            sd.SetLayout(off, maxAlign);
+            if (off mod sd.Align) <> 0 then
+              off := ((off + sd.Align - 1) div sd.Align) * sd.Align;
+            sd.SetLayout(off, sd.Align);
+          end;
           Inc(changed);
         end;
 
@@ -6135,6 +6176,8 @@ begin
     end
     else if node is TAstVarDecl then
     begin
+      if TAstVarDecl(node).DeclType = atRingBuffer then
+        FDiag.Error('RingBuffer type not yet implemented', node.Span);
       // Global variable declaration
       if TAstVarDecl(node).IsGlobal then
       begin

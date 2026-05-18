@@ -22,6 +22,19 @@ func.Instructions[i].Src2 := -1;   // Mark as copy
 ---
 
 ### 3. Halb-fertige Features mit `aerospace-todo` (~25 Tags)
+
+Audit-Ergebnis (Stand 2026-05-18):
+
+| Feature | Status | Erledigt in |
+|---------|--------|-------------|
+| `flat struct` #57 | ✅ fertig | sema.pas validiert keine Pointer-Felder |
+| Range-Checks #7 | ✅ fertig | lower_range_checks.inc + alle Backends |
+| `@packed` #50 | ✅ fertig | ComputeStructLayouts: tight-packed Layout + BitOffset |
+| `@redundant` #51 | ✅ fertig | sema.pas: klares "not yet implemented" Error |
+| Endianness #52 | ✅ fertig | sema.pas: klares "not yet implemented" Error |
+| `@integrity` #43 | ✅ fertig | sema.pas: unit-level validate, backend propagation OK |
+| RingBuffer #56 | ✅ fertig | sema.pas: klares "not yet implemented" Error |
+
 Mehrere Features sind nur geparst, aber nicht bis zum IR durchgezogen:
 - `@integrity` (P0 #43) — geparsed, nicht gesenkt
 - Endianness (`P2 #52`) — `FPendingEndian` gesetzt, im IR nie verwendet
