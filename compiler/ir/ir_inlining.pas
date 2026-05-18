@@ -146,10 +146,10 @@ begin
   Result := True;
 end;
 
-procedure TIRInlining.CloneAndMapInstructions(srcFunc: TIRFunction; argTemps: array of Integer; 
+procedure TIRInlining.CloneAndMapInstructions(srcFunc: TIRFunction; argTemps: array of Integer;
                                               callDest: Integer; var newInstrs: TIRInstructionList);
 var
-  i, j: Integer;
+  i, j, k: Integer;
   instr, newInstr: TIRInstr;
   returnTemp: Integer;
   labelIdx: Integer;
@@ -157,12 +157,16 @@ var
 begin
   returnTemp := GetReturnTemp(srcFunc.Instructions);
   maxTemp := 0;
-  
+
   for i := 0 to High(srcFunc.Instructions) do
   begin
     instr := srcFunc.Instructions[i];
     newInstr := instr;
-    
+    // Deep-copy ArgTemps to avoid shared backing arrays between inlined and original
+    SetLength(newInstr.ArgTemps, Length(instr.ArgTemps));
+    for k := 0 to High(instr.ArgTemps) do
+      newInstr.ArgTemps[k] := instr.ArgTemps[k];
+
     if instr.Op = irLabel then
     begin
       newInstr.LabelName := instr.LabelName + '_inline_' + IntToStr(Length(newInstrs));
@@ -186,8 +190,12 @@ begin
         if instr.Src3 = j then newInstr.Src3 := argTemps[j];
         if instr.Dest = j then newInstr.Dest := argTemps[j];
       end;
+      // Remap ArgTemps values using the same parameter mapping
+      for k := 0 to High(newInstr.ArgTemps) do
+        if (newInstr.ArgTemps[k] >= 0) and (newInstr.ArgTemps[k] <= High(argTemps)) then
+          newInstr.ArgTemps[k] := argTemps[newInstr.ArgTemps[k]];
     end;
-    
+
     SetLength(newInstrs, Length(newInstrs) + 1);
     newInstrs[High(newInstrs)] := newInstr;
   end;
