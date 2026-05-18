@@ -598,17 +598,7 @@ begin
   begin
     instr := func.Instructions[i];
 
-    // Store instructions whose dest is never used
-    if (instr.Op = irStoreLocal) and (instr.Dest >= 0) then
-    begin
-      if (instr.Dest < Length(liveDest)) and (not liveDest[instr.Dest]) then
-      begin
-        // This store is dead
-        func.Instructions[i].Op := irInvalid;
-        Result := True;
-        SetChanged;
-      end;
-    end;
+    // irStoreLocal: Dest is a local slot index, NOT a temp — must not DCE via temp liveness
 
     // Pure operations whose result is never read can be dropped safely
     if IsPureOp(instr.Op) and (instr.Dest >= 0) then
@@ -748,9 +738,13 @@ begin
         curDest  := instr.Dest;
 
         // Rewrite all forward uses of curDest → prevDest
+        // irLoadLocal: Src1 is a local slot index, NOT a temp — skip substitution
         for j := i + 1 to High(func.Instructions) do
         begin
-          if func.Instructions[j].Src1 = curDest then func.Instructions[j].Src1 := prevDest;
+          if func.Instructions[j].Op <> irLoadLocal then
+          begin
+            if func.Instructions[j].Src1 = curDest then func.Instructions[j].Src1 := prevDest;
+          end;
           if func.Instructions[j].Src2 = curDest then func.Instructions[j].Src2 := prevDest;
           if func.Instructions[j].Src3 = curDest then func.Instructions[j].Src3 := prevDest;
           for k := 0 to High(func.Instructions[j].ArgTemps) do
@@ -832,7 +826,9 @@ begin
       copySrc[instr.Dest] := instr.Src1;
 
     // Propagiere Kopien in nachfolgenden Instruktionen
-    if (instr.Src1 >= 0) and (instr.Src1 < Length(copySrc)) and (copySrc[instr.Src1] >= 0) then
+    // irLoadLocal: Src1 is a local slot index, NOT a temp — skip copy propagation
+    if (instr.Op <> irLoadLocal) and
+       (instr.Src1 >= 0) and (instr.Src1 < Length(copySrc)) and (copySrc[instr.Src1] >= 0) then
     begin
       func.Instructions[i].Src1 := copySrc[instr.Src1];
       Result := True;
