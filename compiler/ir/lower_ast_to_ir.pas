@@ -6,7 +6,7 @@ interface
 uses
   SysUtils, Classes,
   ast, ir, diag, lexer, unit_manager, tobject, backend_types,
-  type_utils;
+  type_utils, unit_format;
 
 type
   TConstValue = class
@@ -498,12 +498,14 @@ begin
        // Copy safety pragmas from AST to IR
        fn.SafetyPragmas := TAstFuncDecl(node).SafetyPragmas;
 
-       // Calculate ReturnStructSize for struct-returning functions
+       // Calculate ReturnStructSize for struct-returning functions.
+       // Classes are reference types (returned as pointer in rax) — skip them.
        fn.ReturnStructSize := 0;
        if TAstFuncDecl(node).ReturnTypeName <> '' then
        begin
          structIdx := FStructTypes.IndexOf(TAstFuncDecl(node).ReturnTypeName);
-         if structIdx >= 0 then
+         if (structIdx >= 0) and
+            not (System.TObject(FStructTypes.Objects[structIdx]) is TAstClassDecl) then
          begin
            sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
            fn.ReturnStructSize := sd.Size;
@@ -848,8 +850,237 @@ var
   instr: TIRInstr;
   structIdx: Integer;
   sd: TAstStructDecl;
+  lyuSym: TLyuxSymbol;
+  colonPos: Integer;
+  typeStr, valStr: string;
+  // VMT reconstruction for precompiled class imports
+  synClass: TAstClassDecl;
+  virtStub: TAstFuncDecl;
+  emptyParams: TAstParamList;
+  emptyMethods: TMethodList;
+  classBase, classFieldsStr, classTypeInfoStr: string;
+  classSizeStr, classAlignStr: string;
+  classSize: Integer;
+  p1Pos, p2Pos, sepPos, eqPos, colonPos3: Integer;
+  fieldStr, virtStr, virtName, virtRetStr: string;
+  virtParamCount: Integer;
+  virtMethodList: TMethodList;
+  ownVirtuals: TMethodList;
+  baseClassDecl: TAstClassDecl;
+  baseIdx: Integer;
+  parsedFields: TStructFieldList;
+  fieldName, fieldTypeName: string;
 begin
   if not Assigned(um) then Exit;
+
+  // Ensure TObject is registered before processing any classes from precompiled units,
+  // since imported classes may inherit from TObject (explicitly or implicitly).
+  if FClassTypes.IndexOf(TOBJECT_CLASSNAME) < 0 then
+  begin
+    node := CreateTObjectClassDecl;
+    FStructTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FClassTypes.AddObject(TOBJECT_CLASSNAME, System.TObject(node));
+    FModule.AddClassDecl(TAstClassDecl(node));
+  end;
+
+  // Phase -0.5: Register classes from precompiled .lyu units so that:
+  //   (a) FStructTypes/FClassTypes contain them for field-access lowering, and
+  //   (b) FModule.ClassDecls contains them so the backend emits their VMT data.
+  // Process in forward order so base-class units (loaded first) are handled
+  // before derived-class units.
+  SetLength(emptyParams, 0);
+  SetLength(emptyMethods, 0);
+  for i := 0 to um.Units.Count - 1 do
+  begin
+    loadedUnit := TLoadedUnit(um.Units.Objects[i]);
+    if not Assigned(loadedUnit) or not loadedUnit.IsPrecompiled then Continue;
+    if not Assigned(loadedUnit.LyuxData) then Continue;
+    for j := 0 to High(loadedUnit.LyuxData.Symbols) do
+    begin
+      lyuSym := loadedUnit.LyuxData.Symbols[j];
+      if lyuSym.Kind <> lskClass then Continue;
+      if FClassTypes.IndexOf(lyuSym.Name) >= 0 then Continue;
+      // Parse TypeInfo: "base|size|align|field1=type1;...;virt:Name:ParamCount:RetType;..."
+      p1Pos := Pos('|', lyuSym.TypeInfo);
+      if p1Pos > 0 then
+      begin
+        classBase := Copy(lyuSym.TypeInfo, 1, p1Pos - 1);
+        classTypeInfoStr := Copy(lyuSym.TypeInfo, p1Pos + 1, MaxInt);
+        p2Pos := Pos('|', classTypeInfoStr);
+        if p2Pos > 0 then
+        begin
+          classSizeStr := Copy(classTypeInfoStr, 1, p2Pos - 1);
+          classTypeInfoStr := Copy(classTypeInfoStr, p2Pos + 1, MaxInt);
+          p2Pos := Pos('|', classTypeInfoStr);
+          if p2Pos > 0 then
+          begin
+            classAlignStr  := Copy(classTypeInfoStr, 1, p2Pos - 1);
+            classFieldsStr := Copy(classTypeInfoStr, p2Pos + 1, MaxInt);
+          end
+          else
+          begin
+            classAlignStr  := classTypeInfoStr;
+            classFieldsStr := '';
+          end;
+        end
+        else
+        begin
+          classSizeStr   := classTypeInfoStr;
+          classAlignStr  := '8';
+          classFieldsStr := '';
+        end;
+      end
+      else
+      begin
+        classBase      := '';
+        classSizeStr   := '8';
+        classAlignStr  := '8';
+        classFieldsStr := lyuSym.TypeInfo;
+      end;
+      classSize := StrToIntDef(classSizeStr, 8);
+      // Parse fields and OWN virtual method stubs from classFieldsStr.
+      // Own virtuals are those declared `virtual` in THIS class (not overrides).
+      SetLength(parsedFields, 0);
+      SetLength(ownVirtuals, 0);
+      classTypeInfoStr := classFieldsStr;
+      while classTypeInfoStr <> '' do
+      begin
+        sepPos := Pos(';', classTypeInfoStr);
+        if sepPos > 0 then
+        begin
+          fieldStr := Copy(classTypeInfoStr, 1, sepPos - 1);
+          classTypeInfoStr := Copy(classTypeInfoStr, sepPos + 1, MaxInt);
+        end
+        else
+        begin
+          fieldStr := classTypeInfoStr;
+          classTypeInfoStr := '';
+        end;
+        if fieldStr = '' then Continue;
+        if Copy(fieldStr, 1, 5) = 'virt:' then
+        begin
+          // "virt:Name:ParamCount:RetType" — own (non-override) virtual method
+          virtStr := Copy(fieldStr, 6, MaxInt);
+          colonPos3 := Pos(':', virtStr);
+          if colonPos3 > 0 then
+          begin
+            virtName := Copy(virtStr, 1, colonPos3 - 1);
+            virtStr  := Copy(virtStr, colonPos3 + 1, MaxInt);
+            colonPos3 := Pos(':', virtStr);
+            if colonPos3 > 0 then
+            begin
+              virtParamCount := StrToIntDef(Copy(virtStr, 1, colonPos3 - 1), 0);
+              virtRetStr := Copy(virtStr, colonPos3 + 1, MaxInt);
+            end
+            else
+            begin
+              virtParamCount := 0;
+              virtRetStr := virtStr;
+            end;
+          end
+          else
+          begin
+            virtName := virtStr;
+            virtParamCount := 0;
+            virtRetStr := '';
+          end;
+          virtStub := TAstFuncDecl.Create(virtName, emptyParams, atVoid, nil, NullSpan);
+          virtStub.IsVirtual := True;
+          SetLength(ownVirtuals, Length(ownVirtuals) + 1);
+          ownVirtuals[High(ownVirtuals)] := virtStub;
+          Continue;
+        end;
+        // Regular field: "Name=Type"
+        eqPos := Pos('=', fieldStr);
+        if eqPos <= 0 then Continue;
+        fieldName := Copy(fieldStr, 1, eqPos - 1);
+        fieldTypeName := Copy(fieldStr, eqPos + 1, MaxInt);
+        SetLength(parsedFields, Length(parsedFields) + 1);
+        parsedFields[High(parsedFields)].Name := fieldName;
+        parsedFields[High(parsedFields)].FieldType := StrToAurumType(fieldTypeName);
+        parsedFields[High(parsedFields)].FieldTypeName := fieldTypeName;
+        parsedFields[High(parsedFields)].ArrayLen := 0;
+        parsedFields[High(parsedFields)].BitOffset := -1;
+        parsedFields[High(parsedFields)].Visibility := visPublic;
+      end;
+      // Build full VirtualMethods in correct slot order:
+      //   [inherited base slots, ...] ++ [own new virtual slots, ...]
+      // Inherited slots use the base's method names so the backend can mangle them
+      // as _L_ThisClass_MethodName (the override implementation).
+      SetLength(virtMethodList, 0);
+      if classBase <> '' then
+      begin
+        baseIdx := FClassTypes.IndexOf(classBase);
+        if baseIdx >= 0 then
+        begin
+          baseClassDecl := TAstClassDecl(FClassTypes.Objects[baseIdx]);
+          for k := 0 to High(baseClassDecl.VirtualMethods) do
+          begin
+            if Assigned(baseClassDecl.VirtualMethods[k]) then
+            begin
+              virtStub := TAstFuncDecl.Create(
+                baseClassDecl.VirtualMethods[k].Name, emptyParams, atVoid, nil, NullSpan);
+              virtStub.IsVirtual := True;
+              SetLength(virtMethodList, Length(virtMethodList) + 1);
+              virtMethodList[High(virtMethodList)] := virtStub;
+            end
+            else
+            begin
+              SetLength(virtMethodList, Length(virtMethodList) + 1);
+              virtMethodList[High(virtMethodList)] := nil;
+            end;
+          end;
+        end;
+      end;
+      // Append own new virtual methods after inherited slots
+      for k := 0 to High(ownVirtuals) do
+      begin
+        SetLength(virtMethodList, Length(virtMethodList) + 1);
+        virtMethodList[High(virtMethodList)] := ownVirtuals[k];
+      end;
+      // Create the synthetic class declaration for this imported class
+      synClass := TAstClassDecl.Create(lyuSym.Name, classBase, parsedFields,
+        emptyMethods, True, NullSpan);
+      synClass.Size := classSize;
+      synClass.VirtualMethods := virtMethodList;
+      FStructTypes.AddObject(lyuSym.Name, System.TObject(synClass));
+      FClassTypes.AddObject(lyuSym.Name, System.TObject(synClass));
+      if Length(virtMethodList) > 0 then
+        FModule.AddClassDecl(synClass);
+    end;
+  end;
+
+  // Phase -1: Load constants from precompiled .lyu units into FConstMap.
+  // These units have no AST, so the main phase loop skips them.
+  // TypeInfo format: "type:value" (e.g. "int64:42", "bool:0", "string:hello").
+  for i := um.Units.Count - 1 downto 0 do
+  begin
+    loadedUnit := TLoadedUnit(um.Units.Objects[i]);
+    if not Assigned(loadedUnit) or not loadedUnit.IsPrecompiled then Continue;
+    if not Assigned(loadedUnit.LyuxData) then Continue;
+    for j := 0 to High(loadedUnit.LyuxData.Symbols) do
+    begin
+      lyuSym := loadedUnit.LyuxData.Symbols[j];
+      if lyuSym.Kind <> lskCon then Continue;
+      if FConstMap.IndexOf(lyuSym.Name) >= 0 then Continue;
+      colonPos := Pos(':', lyuSym.TypeInfo);
+      if colonPos = 0 then Continue; // no value encoded — old format, skip
+      typeStr := Copy(lyuSym.TypeInfo, 1, colonPos - 1);
+      valStr  := Copy(lyuSym.TypeInfo, colonPos + 1, MaxInt);
+      cv := TConstValue.Create;
+      if typeStr = 'string' then
+      begin
+        cv.IsStr  := True;
+        cv.StrVal := valStr;
+      end
+      else
+      begin
+        cv.IsStr  := False;
+        cv.IntVal := StrToInt64Def(valStr, 0);
+      end;
+      FConstMap.AddObject(lyuSym.Name, System.TObject(cv));
+    end;
+  end;
 
   { Three-phase approach:
     Phase 0: Pre-register ALL types (structs, classes) and constants/enums.
@@ -1162,12 +1393,14 @@ begin
                   FLocals[k].TypeName := '';
               end;
 
-              // Calculate ReturnStructSize so the backend generates correct sret prologue
+              // Calculate ReturnStructSize so the backend generates correct sret prologue.
+              // Classes are reference types (returned as pointer in rax) — skip them.
               fn.ReturnStructSize := 0;
               if TAstFuncDecl(node).ReturnTypeName <> '' then
               begin
                 structIdx := FStructTypes.IndexOf(TAstFuncDecl(node).ReturnTypeName);
-                if structIdx >= 0 then
+                if (structIdx >= 0) and
+                   not (System.TObject(FStructTypes.Objects[structIdx]) is TAstClassDecl) then
                 begin
                   sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
                   fn.ReturnStructSize := sd.Size;
@@ -1601,12 +1834,14 @@ begin
       end;
     end;
 
-    // Calculate ReturnStructSize
+    // Calculate ReturnStructSize.
+    // Classes are reference types (returned as pointer in rax) — skip them.
     fn.ReturnStructSize := 0;
     if funcDecl.ReturnTypeName <> '' then
     begin
       structIdx := FStructTypes.IndexOf(funcDecl.ReturnTypeName);
-      if structIdx >= 0 then
+      if (structIdx >= 0) and
+         not (System.TObject(FStructTypes.Objects[structIdx]) is TAstClassDecl) then
       begin
         sd := TAstStructDecl(FStructTypes.Objects[structIdx]);
         fn.ReturnStructSize := sd.Size;
@@ -2580,19 +2815,31 @@ function TIRLowering.LowerStmt(stmt: TAstStmt): Boolean;
       // and use the combined offset. The Sema has already calculated the
       // combined offset in fa.Target.FieldOffset.
       
-      // Walk up the chain of field accesses to find the root (non-field) expression
-      baseExpr := fa.Target.Obj;
-      while (baseExpr is TAstFieldAccess) do
-        baseExpr := TAstFieldAccess(baseExpr).Obj;
-      
-      // Now lower the root expression (e.g., 'o' in 'o.x.a')
-      t1 := LowerExpr(baseExpr);
+      // For nested class field access (e.g. g.lastChild.nextPtr := v), we must
+      // evaluate the intermediate class reference (g.lastChild) as a heap load
+      // and use its result as the base.  Only for struct-embedded fields can we
+      // walk all the way to the root and use a combined offset.
+      ownerName := fa.Target.OwnerName;
+      if (fa.Target.Obj is TAstFieldAccess) and
+         (ownerName <> '') and
+         (FClassTypes.IndexOf(ownerName) >= 0) then
+      begin
+        // Nested class field: evaluate the direct predecessor to get the heap ptr
+        t1 := LowerExpr(fa.Target.Obj);
+      end
+      else
+      begin
+        // Struct or simple: walk to root and use combined offset
+        baseExpr := fa.Target.Obj;
+        while (baseExpr is TAstFieldAccess) do
+          baseExpr := TAstFieldAccess(baseExpr).Obj;
+        t1 := LowerExpr(baseExpr);
+      end;
       if t1 < 0 then Exit(False);
       t2 := LowerExpr(fa.Value);
       if t2 < 0 then Exit(False);
       
-      // Check if target's owner is a class (heap) or struct (stack)
-      ownerName := fa.Target.OwnerName;
+      // ownerName already set above; read remaining annotations
       fldOffset := fa.Target.FieldOffset;
       fldType := fa.Target.FieldType;
       // If sema didn't annotate the field offset (imported class method bodies),
