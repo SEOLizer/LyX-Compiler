@@ -156,7 +156,9 @@ Vollständiger NFA-zu-Bytecode-Compiler mit 130+ Methoden (~1.000 Zeilen) mitten
 
 ---
 
-### 17. Typsystem-Struktur fehlt für parametrisierte Typen
+### 17. ✅ Typsystem-Struktur fehlt für parametrisierte Typen
+> **Erledigt** — `TTypeParseResult = record` (ElemType, ElemTypeName, KeyType, KeyTypeName, ValType, ValTypeName) in `parser.pas`; wird als expliziter `out typeInfo`-Parameter aus `ParseTypeExFull` zurückgegeben.
+
 `Array<T>`, `Map<K,V>`, `Set<T>` speichern Typ-Parameter in Seitenkanal-Feldern (`FLastElemType`, `FLastKeyType`, etc.) ohne zusammenhängendes Record. Konsumenten müssen diese manuell abfragen und können es vergessen.
 
 Symptom: `MyClass[5]` als Struct-Feld schlägt im Layout-Pass fehl, weil `sema.pas:4856` nur `FStructTypes` prüft, nicht `FClassTypes`. Class-Typen werden als Array-Element-Typ nicht erkannt.
@@ -165,7 +167,9 @@ Symptom: `MyClass[5]` als Struct-Feld schlägt im Layout-Pass fehl, weil `sema.p
 
 ---
 
-### 18. Code-Duplizierung im Backend (70+ Emitter-Dateien)
+### 18. ✅ Code-Duplizierung im Backend (70+ Emitter-Dateien)
+> **Erledigt** — `arch_common.pas` existiert mit Register-Konstanten (X86, ARM64), ABI-Parametertabellen (SysV AMD64, AAPCS64, Win64) und Frame-Size-Funktionen (`FPBaseSlotOffset`, `CalcFrameSize64`, `CalcFrameSize64FPLR`).
+
 x86\_64, ARM64, Xtensa, RISC-V implementieren Prologue/Epilogue, Calling Convention und Register-Allokation jeweils vollständig unabhängig. Ein ABI-Fix in x86\_64 erreicht ARM64 nicht.
 
 **Fix:** `arch_common.pas` für geteilte Schablonen (Prologue-Templates, Calling-Convention-Abstraktion, Register-State-Management).
@@ -192,7 +196,7 @@ x86\_64, ARM64, Xtensa, RISC-V implementieren Prologue/Epilogue, Calling Convent
 | 14 | P2 | Sema | Regex-Engine (~1.000 Zeilen) direkt in Sema eingebettet | ✅ `refactor/regex-engine-extract` |
 | 15 | P2 | Lowering | 10 parallele Arrays statt `TLocalVar`-Record | ✅ `TLocalVar = record` bereits in lower_ast_to_ir.pas |
 | 16 | P2 | Sema | `TStringList`-Symboltabelle mit unsicheren Object-Casts | ✅ `TFPGMap<string, T>` bereits für alle Maps |
-| 17 | P2 | Typsystem | Parametrisierte Typen ohne zusammenhängendes Record | — |
-| 18 | P2 | Backend | 70+ Emitter duplizieren ABI-Logik unabhängig | — |
+| 17 | P2 | Typsystem | Parametrisierte Typen ohne zusammenhängendes Record | ✅ `TTypeParseResult = record` in parser.pas |
+| 18 | P2 | Backend | 70+ Emitter duplizieren ABI-Logik unabhängig | ✅ `arch_common.pas` mit Reg-Konstanten + ABI-Tabellen |
 
 **Größter Hebel:** Zwei-Pass-Sema (#1) + CSE-Fix (#2) beheben aktive Correctness-Bugs. Danach: gemeinsame `type_utils.pas` (#6) + CFG-IR (#4) als Fundament für alle weiteren Optimierungen.
