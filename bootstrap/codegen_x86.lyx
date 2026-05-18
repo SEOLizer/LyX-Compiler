@@ -1560,12 +1560,16 @@ pub type Codegen = class {
     var fieldName: pchar := self.cg_nsval(ni);
     var fieldLen:  int64 := self.cg_nslen(ni);
     self.cg_genExpr(obj);
-    // Array .length: rax = ptr, load [rax+8] = len
+    // Array .length / .data field accessors
     if (self.cg_identIsArray(obj) != 0) {
-      var lenStr: pchar := "length";
+      var lenStr:  pchar := "length";
+      var dataStr: pchar := "data";
       if (self.cg_seq(fieldName, fieldLen, lenStr, 6)) {
-        // mov rax, [rax+8]
+        // mov rax, [rax+8]   (load len field)
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08);
+      } else if (self.cg_seq(fieldName, fieldLen, dataStr, 4)) {
+        // lea rax, [rax+16]  (pointer to first element, past {cap,len} header)
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x40); self.cg_e8(0x10);
       } else {
         self.cg_zeroRax();
       }
@@ -1837,9 +1841,13 @@ pub type Codegen = class {
       self.cg_pushRax();
       self.cg_genExpr(self.cg_nc0(ni));   // rax = array ptr
       self.cg_popRbx();                    // rbx = index
-      // Detect pchar base: if so, emit direct byte read (no header, stride=1)
+      // Three-way dispatch based on base type:
+      //  pchar         → byte read:            movzx rax, byte [rax+rbx]
+      //  array<T> local → header-skip 8-stride: lea rcx,[rax+16]; mov rax,[rcx+rbx*8]
+      //  plain ptr     → direct 8-stride:       mov rax, [rax+rbx*8]
       var baseNode: int64 := self.cg_nc0(ni);
-      var isPchar: int64 := 0;
+      var isPchar:  int64 := 0;
+      var isArray:  int64 := 0;
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
         var lidx: int64 := self.cg_findLocalIdx(self.cg_nsval(baseNode), self.cg_nslen(baseNode));
         if (lidx >= 0) {
@@ -1847,17 +1855,22 @@ pub type Codegen = class {
           var tp: pchar := peek64(tb) as pchar;
           var tn: int64 := peek64(tb + 8);
           if (tn == 5 && self.cg_seq(tp, tn, "pchar", 5)) { isPchar := 1; }
+          if (peek8(self.localIsArray + lidx) != 0) { isArray := 1; }
         }
       }
       if (isPchar == 1) {
         // movzx rax, byte [rax+rbx]
         self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
-      } else {
-        // array<T>: skip 16-byte {cap,len} header, 8-byte stride
-        // lea rcx, [rax+16]   (data start)
+      } else if (isArray == 1) {
+        // array<T> local: skip 16-byte {cap,len} header, then 8-byte stride
+        // lea rcx, [rax+16]
         self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
         // mov rax, [rcx+rbx*8]
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD9);
+      } else {
+        // plain int64 pointer: direct 8-byte stride, no header
+        // mov rax, [rax+rbx*8]
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD8);
       }
 
     } else if (k == CGN_LIT_FLOAT) {
@@ -2317,19 +2330,34 @@ pub type Codegen = class {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xB0); self.cg_e32(foff);
         }
       } else if (self.cg_nkind(lhs) == CGN_INDEX) {
-        // arr[i] := rhs
+        // arr[i] := rhs — three-way dispatch (same as CGN_INDEX read)
         self.cg_genExpr(rhs);              // rax = value
         self.cg_pushRax();
         self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
         self.cg_pushRax();
         self.cg_genExpr(self.cg_nc0(lhs)); // rax = array ptr
         self.cg_popRbx();                  // rbx = index
-        // lea rcx, [rax+16]   (data start)
-        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
-        // pop rsi              (value)
-        self.cg_e8(0x5E);
-        // mov [rcx+rbx*8], rsi
-        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);
+        var lhsBase: int64 := self.cg_nc0(lhs);
+        var lhsIsArray: int64 := 0;
+        if (self.cg_nkind(lhsBase) == CGN_IDENT) {
+          var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
+          if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
+        }
+        if (lhsIsArray == 1) {
+          // array<T> local: skip 16-byte header
+          // lea rcx, [rax+16]
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
+          // pop rsi (value)
+          self.cg_e8(0x5E);
+          // mov [rcx+rbx*8], rsi
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);
+        } else {
+          // plain ptr: direct 8-byte stride
+          // pop rsi (value)
+          self.cg_e8(0x5E);
+          // mov [rax+rbx*8], rsi
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8);
+        }
       }
 
     } else if (k == CGN_RETURN) {
