@@ -110,14 +110,18 @@ Jede Instruktion trägt alle Felder aller Opcodes: `ArgTemps`, `InspectFieldName
 
 ---
 
-### 12. `FindFunction` ist O(n) (`ir.pas:352`)
+### 12. ✅ `FindFunction` ist O(n) (`ir.pas:352`)
+> **Erledigt** — sortiertes `TStringList` mit `Sorted := True` ergibt O(log n) binäre Suche via `IndexOf`.
+
 Linearer Scan durch alle Funktionen im Modul bei jedem Aufruf. Für größere Programme mit vielen Funktionen und Calls wächst das quadratisch.
 
 **Fix:** `TStringList` → `TFPGMap<string, TIRFunction>` oder Hash-Dictionary.
 
 ---
 
-### 13. `Emit()` wächst das Instructions-Array um 1 pro Aufruf (`ir.pas:272`)
+### 13. ✅ `Emit()` wächst das Instructions-Array um 1 pro Aufruf (`ir.pas:272`)
+> **Erledigt** — Capacity-Doubling bereits implementiert (cap * 2 ab cap=64).
+
 ```pascal
 SetLength(Instructions, Length(Instructions) + 1);
 ```
@@ -179,8 +183,8 @@ x86\_64, ARM64, Xtensa, RISC-V implementieren Prologue/Epilogue, Calling Convent
 | 9 | P1 | Tests | Kein automatisierter Test-Runner | — |
 | 10 | P2 | IR | `TIRInstr` Fat Record — ~80% der Felder pro Opcode unbenutzt | ✅ `fix/ir-lean-instr` |
 | 11 | P2 | Optimizer | CSE O(n²) + matcht nur Temps, nicht Werte | ✅ `fix/cse-hash` |
-| 12 | P2 | IR | `FindFunction` O(n) | — |
-| 13 | P2 | IR | `Emit()` O(n²) Array-Wachstum | — |
+| 12 | P2 | IR | `FindFunction` O(n) | ✅ O(log n) via sorted TStringList |
+| 13 | P2 | IR | `Emit()` O(n²) Array-Wachstum | ✅ Capacity-Doubling |
 | 14 | P2 | Sema | Regex-Engine (~1.000 Zeilen) direkt in Sema eingebettet | — |
 | 15 | P2 | Lowering | 10 parallele Arrays statt `TLocalVar`-Record | — |
 | 16 | P2 | Sema | `TStringList`-Symboltabelle mit unsicheren Object-Casts | — |
