@@ -18,7 +18,8 @@ type
     irInvalid,
     irConstInt,
     irConstStr,
-    irConstFloat,  // new: float constant
+    irConstFloat,
+    irMove,        // copy: Dest := Src1  (produced by strength reduction)
     irAdd, irSub, irMul, irDiv, irMod, irNeg,
     // float arithmetic
     irFAdd, irFSub, irFMul, irFDiv, irFNeg, irFSqrt,
