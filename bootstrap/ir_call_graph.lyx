@@ -1,0 +1,301 @@
+// bootstrap/ir_call_graph.lyx
+// Static call-graph analysis (WP-BC-26).
+// Flat linear scan of all AST nodes: safe, no recursive traversal.
+// Detects direct/indirect recursion, computes reachability from main,
+// and reports unreachable functions.
+
+import bootstrap.parser;
+
+// Node table entry: {namePtr:8, nameLen:8, reachable:8, visited:8, inStack:8, isRecursive:8} = 48 bytes
+con CGRAPH_NODE_SZ: int64 := 48;
+
+// Edge table entry: {callerIdx:8, calleeIdx:8} = 16 bytes
+con CGRAPH_EDGE_SZ: int64 := 16;
+
+// AST node size (matches bootstrap.parser layout)
+con CGRAPH_AST_SZ: int64 := 88;
+
+// AST node kind constants (mirrors bootstrap.parser)
+con CGR_NK_FUNC_DECL:  int64 := 2;
+con CGR_NK_TYPE_DECL:  int64 := 10;
+con CGR_NK_CALL:       int64 := 49;
+
+pub type CallGraph = class {
+
+  // AST context
+  cgrNodes:     int64;   // parser nodes buffer
+  cgrNodeCount: int64;   // total node count (for safety checks)
+  cgrSrc:       pchar;   // source text
+
+  // Function node table
+  funcTable:  int64;
+  funcCount:  int64;
+  funcCap:    int64;
+
+  // Call edge table
+  edgeTable:  int64;
+  edgeCount:  int64;
+  edgeCap:    int64;
+
+  // ------------------------------------------------------------------
+  // AST node accessors (all bounds-checked via >= 0 at call sites)
+  // ------------------------------------------------------------------
+
+  fn cgr_noff(i: int64):  int64  { return self.cgrNodes + i * CGRAPH_AST_SZ; }
+  fn cgr_nkind(i: int64): int64  { return peek64(self.cgr_noff(i));           }
+  fn cgr_nsval(i: int64): pchar  { return (self.cgrSrc as int64 + peek64(self.cgr_noff(i) + 64)) as pchar; }
+  fn cgr_nslen(i: int64): int64  { return peek64(self.cgr_noff(i) + 72);      }
+
+  // ------------------------------------------------------------------
+  // String comparison
+  // ------------------------------------------------------------------
+
+  fn cgr_seq(a: pchar, al: int64, b: pchar, bl: int64): int64 {
+    if (al != bl) { return 0; }
+    var i: int64 := 0;
+    while (i < al) {
+      if (StrCharAt(a, i) != StrCharAt(b, i)) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Node / edge management
+  // ------------------------------------------------------------------
+
+  fn cgr_addFunc(name: pchar, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.funcCount) {
+      var base: int64 := self.funcTable + i * CGRAPH_NODE_SZ;
+      if (self.cgr_seq(peek64(base) as pchar, peek64(base+8), name, len) != 0) { return i; }
+      i := i + 1;
+    }
+    if (self.funcCount >= self.funcCap) {
+      var nc: int64 := self.funcCap * 2;
+      var nb: int64 := mmap(0, nc * CGRAPH_NODE_SZ, 3, 34, -1, 0);
+      var k: int64 := 0;
+      while (k < self.funcCount * CGRAPH_NODE_SZ) { poke8(nb+k, peek8(self.funcTable+k)); k:=k+1; }
+      self.funcTable := nb; self.funcCap := nc;
+    }
+    var base: int64 := self.funcTable + self.funcCount * CGRAPH_NODE_SZ;
+    poke64(base,    name as int64);
+    poke64(base+8,  len);
+    poke64(base+16, 0);  // reachable
+    poke64(base+24, 0);  // visited
+    poke64(base+32, 0);  // inStack
+    poke64(base+40, 0);  // isRecursive
+    var idx: int64 := self.funcCount;
+    self.funcCount := self.funcCount + 1;
+    return idx;
+  }
+
+  fn cgr_findFunc(name: pchar, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.funcCount) {
+      var base: int64 := self.funcTable + i * CGRAPH_NODE_SZ;
+      if (self.cgr_seq(peek64(base) as pchar, peek64(base+8), name, len) != 0) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  fn cgr_addEdge(callerIdx: int64, calleeIdx: int64) {
+    var i: int64 := 0;
+    while (i < self.edgeCount) {
+      var base: int64 := self.edgeTable + i * CGRAPH_EDGE_SZ;
+      if (peek64(base) == callerIdx && peek64(base+8) == calleeIdx) { return; }
+      i := i + 1;
+    }
+    if (self.edgeCount >= self.edgeCap) {
+      var nc: int64 := self.edgeCap * 2;
+      var nb: int64 := mmap(0, nc * CGRAPH_EDGE_SZ, 3, 34, -1, 0);
+      var k: int64 := 0;
+      while (k < self.edgeCount * CGRAPH_EDGE_SZ) { poke8(nb+k, peek8(self.edgeTable+k)); k:=k+1; }
+      self.edgeTable := nb; self.edgeCap := nc;
+    }
+    var base: int64 := self.edgeTable + self.edgeCount * CGRAPH_EDGE_SZ;
+    poke64(base,   callerIdx);
+    poke64(base+8, calleeIdx);
+    self.edgeCount := self.edgeCount + 1;
+  }
+
+  // ------------------------------------------------------------------
+  // DFS for recursion / cycle detection
+  // ------------------------------------------------------------------
+
+  fn cgr_dfsVisit(nodeIdx: int64) {
+    var nBase: int64 := self.funcTable + nodeIdx * CGRAPH_NODE_SZ;
+    poke64(nBase+24, 1);  // visited
+    poke64(nBase+32, 1);  // inStack
+    var i: int64 := 0;
+    while (i < self.edgeCount) {
+      var eBase: int64 := self.edgeTable + i * CGRAPH_EDGE_SZ;
+      if (peek64(eBase) == nodeIdx) {
+        var callee: int64 := peek64(eBase+8);
+        var cBase: int64 := self.funcTable + callee * CGRAPH_NODE_SZ;
+        if (peek64(cBase+32) != 0) {
+          // Back edge — both ends are in a cycle
+          poke64(nBase+40, 1);
+          poke64(cBase+40, 1);
+        } else if (peek64(cBase+24) == 0) {
+          self.cgr_dfsVisit(callee);
+          if (peek64(cBase+40) != 0) { poke64(nBase+40, 1); }
+        }
+      }
+      i := i + 1;
+    }
+    poke64(nBase+32, 0);  // leave stack
+  }
+
+  // ------------------------------------------------------------------
+  // BFS for reachability from main
+  // ------------------------------------------------------------------
+
+  fn cgr_bfsFrom(startIdx: int64) {
+    var queueCap: int64 := self.funcCap + 64;
+    var queue: int64 := mmap(0, queueCap * 8, 3, 34, -1, 0);
+    poke64(queue, startIdx);
+    var head: int64 := 0;
+    var tail: int64 := 1;
+    poke64(self.funcTable + startIdx * CGRAPH_NODE_SZ + 16, 1);
+    while (head < tail) {
+      var cur: int64 := peek64(queue + head * 8);
+      head := head + 1;
+      var ei: int64 := 0;
+      while (ei < self.edgeCount) {
+        var eBase: int64 := self.edgeTable + ei * CGRAPH_EDGE_SZ;
+        if (peek64(eBase) == cur) {
+          var callee: int64 := peek64(eBase+8);
+          var cBase: int64 := self.funcTable + callee * CGRAPH_NODE_SZ;
+          if (peek64(cBase+16) == 0) {
+            poke64(cBase+16, 1);
+            if (tail < queueCap) {
+              poke64(queue + tail * 8, callee);
+              tail := tail + 1;
+            }
+          }
+        }
+        ei := ei + 1;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Public interface
+  // ------------------------------------------------------------------
+
+  // Build the call graph using a flat linear scan of all AST nodes.
+  // nodeCount: total number of nodes in the 'nodes' buffer.
+  // Caller attribution: track the last seen NK_FUNC_DECL as current caller.
+  pub fn Build(head: int64, nodes: int64, src: pchar, nodeCount: int64) {
+    self.cgrNodes     := nodes;
+    self.cgrSrc       := src;
+    self.cgrNodeCount := nodeCount;
+
+    // Pass 1: register all function names (flat scan)
+    var ni: int64 := 0;
+    while (ni < nodeCount) {
+      if (self.cgr_nkind(ni) == CGR_NK_FUNC_DECL) {
+        var fname: pchar := self.cgr_nsval(ni);
+        var flen:  int64 := self.cgr_nslen(ni);
+        if (flen > 0) { self.cgr_addFunc(fname, flen); }
+      }
+      ni := ni + 1;
+    }
+
+    // Pass 2: flat scan for NK_CALL nodes; attribute each to the last
+    // preceding NK_FUNC_DECL in the node table (parser creates nodes
+    // in depth-first order, so this correctly identifies the enclosing fn).
+    var curCaller: int64 := -1;
+    ni := 0;
+    while (ni < nodeCount) {
+      var kind: int64 := self.cgr_nkind(ni);
+      if (kind == CGR_NK_FUNC_DECL) {
+        var fname: pchar := self.cgr_nsval(ni);
+        var flen:  int64 := self.cgr_nslen(ni);
+        if (flen > 0) { curCaller := self.cgr_findFunc(fname, flen); }
+      } else if (kind == CGR_NK_CALL && curCaller >= 0) {
+        var fname: pchar := self.cgr_nsval(ni);
+        var flen:  int64 := self.cgr_nslen(ni);
+        if (flen > 0) {
+          var calleeIdx: int64 := self.cgr_findFunc(fname, flen);
+          if (calleeIdx >= 0) { self.cgr_addEdge(curCaller, calleeIdx); }
+        }
+      }
+      ni := ni + 1;
+    }
+  }
+
+  pub fn AnalyzeRecursion() {
+    var i: int64 := 0;
+    while (i < self.funcCount) {
+      var nBase: int64 := self.funcTable + i * CGRAPH_NODE_SZ;
+      poke64(nBase+24, 0);
+      poke64(nBase+32, 0);
+      i := i + 1;
+    }
+    i := 0;
+    while (i < self.funcCount) {
+      var nBase: int64 := self.funcTable + i * CGRAPH_NODE_SZ;
+      if (peek64(nBase+24) == 0) { self.cgr_dfsVisit(i); }
+      i := i + 1;
+    }
+  }
+
+  pub fn AnalyzeReachability() {
+    var mainStr: pchar := "main"c;
+    var mainIdx: int64 := self.cgr_findFunc(mainStr, 4);
+    if (mainIdx >= 0) { self.cgr_bfsFrom(mainIdx); }
+  }
+
+  pub fn IsRecursive(name: pchar, len: int64): int64 {
+    var idx: int64 := self.cgr_findFunc(name, len);
+    if (idx < 0) { return 0; }
+    return peek64(self.funcTable + idx * CGRAPH_NODE_SZ + 40);
+  }
+
+  pub fn IsReachable(name: pchar, len: int64): int64 {
+    var idx: int64 := self.cgr_findFunc(name, len);
+    if (idx < 0) { return 0; }
+    return peek64(self.funcTable + idx * CGRAPH_NODE_SZ + 16);
+  }
+
+  pub fn GetFuncCount(): int64 { return self.funcCount; }
+  pub fn GetEdgeCount(): int64 { return self.edgeCount; }
+
+  // Print warnings for functions defined but not reachable from main
+  pub fn WarnUnused() {
+    var mainStr: pchar := "main"c;
+    var i: int64 := 0;
+    while (i < self.funcCount) {
+      var nBase: int64 := self.funcTable + i * CGRAPH_NODE_SZ;
+      var name: pchar := peek64(nBase) as pchar;
+      var len:  int64 := peek64(nBase+8);
+      var reachable: int64 := peek64(nBase+16);
+      if (reachable == 0 && self.cgr_seq(name, len, mainStr, 4) == 0) {
+        PrintStr("warning: function '");
+        var tmp: int64 := mmap(0, len+2, 3, 34, -1, 0);
+        var j: int64 := 0;
+        while (j < len) { poke8(tmp+j, StrCharAt(name, j)); j:=j+1; }
+        poke8(tmp+len, 0);
+        PrintStr(tmp as pchar);
+        PrintStr("' is never called\n");
+      }
+      i := i + 1;
+    }
+  }
+
+  pub fn Init() {
+    self.cgrNodes     := 0;
+    self.cgrNodeCount := 0;
+    self.cgrSrc       := 0 as pchar;
+    self.funcCap      := 256;
+    self.funcTable    := mmap(0, self.funcCap * CGRAPH_NODE_SZ, 3, 34, -1, 0);
+    self.funcCount    := 0;
+    self.edgeCap      := 2048;
+    self.edgeTable    := mmap(0, self.edgeCap * CGRAPH_EDGE_SZ, 3, 34, -1, 0);
+    self.edgeCount    := 0;
+  }
+
+};
