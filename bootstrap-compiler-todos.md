@@ -654,7 +654,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ## Phase 6 — Multi-Architektur-Backends
 
-### WP-BC-31: macOS x86_64 Backend
+### WP-BC-31: macOS x86_64 Backend ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-31-macos-x86-backend`, Singularität `f6d1f6fd…`.
 
 **Ziel:** Mach-O-Binaries für macOS (Intel) generieren.
 
