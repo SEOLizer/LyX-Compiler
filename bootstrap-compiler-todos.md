@@ -568,7 +568,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-27: Statische Analyse
+### WP-BC-27: Statische Analyse ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-27-static-analysis`, Singularität `16096865…`.
 
 **Ziel:** Datenfluss-, Null-Pointer-, Bounds- und Terminierungsanalyse.
 
