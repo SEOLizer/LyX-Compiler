@@ -37,6 +37,7 @@ pub con NK_CATCH:       int64 := 32;
 pub con NK_FINALLY:     int64 := 33;
 pub con NK_THROW:       int64 := 34;
 pub con NK_CONTINUE:    int64 := 35;
+pub con NK_ASSERT:      int64 := 36;  // WP-BC-07
 
 // Literals (40-45)
 pub con NK_LIT_INT:     int64 := 40;
@@ -281,7 +282,18 @@ pub type IRLower = class {
   fn nodeSVal(i: int64): pchar { return self.src + peek64(self.nodeOff(i) + 64); }
   fn nodeSLen(i: int64): int64 { return peek64(self.nodeOff(i) + 72); }
   fn nodeNext(i: int64): int64 { return peek64(self.nodeOff(i) + 40); }
-  
+
+  // WP-BC-01: length-aware string comparison (source tokens are not null-terminated)
+  fn seq(a: pchar, an: int64, b: pchar, bn: int64): bool {
+    if (an != bn) { return false; }
+    var i: int64 := 0;
+    while (i < an) {
+      if (StrCharAt(a, i) != StrCharAt(b, i)) { return false; }
+      i := i + 1;
+    }
+    return true;
+  }
+
   // ------------------------------------------------------------------
   // IR Module Helpers (call through function pointers)
   // ------------------------------------------------------------------
@@ -546,39 +558,66 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerCall(expr: int64): int64 {
-    // In the parser, NK_CALL stores:
-    // - sVal: function name string offset
-    // - iVal: method call flag (0 = bare function call, 1 = method call)
-    // - C0: first argument (for bare function calls from ParsePrimary)
-    // - C1: first argument (for method calls from ParsePostfix)
-    // PrintStr is the only builtin we handle for now
-    
-    PrintStr("lowerCall: processing call\n");
+    // NK_CALL: sVal = function name, C0 = first argument (linked via nodeNext)
     var dest: int64 := self.allocTemp();
-    
-    // Function name string is in sVal (directly on the call node)
     var fname: pchar := self.nodeSVal(expr);
-    PrintStr("lowerCall: fname ptr="); PrintInt(fname as int64); PrintStr("\n");
-    
-    // Check which field has the first argument
-    var curArg: int64 := self.nodeC0(expr);
-    var methodFlag: int64 := self.nodeIVal(expr);
-    PrintStr("lowerCall: methodFlag="); PrintInt(methodFlag); PrintStr(" C0="); PrintInt(curArg); PrintStr("\n");
-    
-    // Try to lower the first argument
-    if (curArg >= 0) {
-      PrintStr("lowerCall: lowering argument from C0\n");
-      var argTemp: int64 := self.lowerExpr(curArg);
-      PrintStr("lowerCall: argTemp="); PrintInt(argTemp); PrintStr("\n");
-      
-      // Emit builtin call for PrintStr (builtinId = 1)
-      var builtinId: int64 := 1;
-      PrintStr("lowerCall: emitting IRO_CALL_BUILTIN with builtinId="); PrintInt(builtinId); PrintStr("\n");
-      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, argTemp, -1, -1, builtinId);
-      PrintStr("lowerCall: emitted\n");
+    var fnlen: int64 := self.nodeSLen(expr);
+    var arg0: int64 := self.nodeC0(expr);
+
+    // WP-BC-01: sqrt(f64) → IRO_FSQRT (sqrtsd in codegen)
+    if (self.seq(fname, fnlen, "sqrt", 4)) {
+      var src: int64 := dest;
+      if (arg0 >= 0) { src := self.lowerExpr(arg0); }
+      self.irAddInstrDirect(IRO_FSQRT, dest, src, -1, -1, 0);
+      return dest;
     }
-    
-    PrintStr("lowerCall: done\n");
+
+    // WP-BC-01: assert(cond) / assertTrue(cond) → IRO_ASSERT_TRUE
+    if (self.seq(fname, fnlen, "assert", 6) || self.seq(fname, fnlen, "assertTrue", 10)) {
+      if (arg0 >= 0) {
+        var condSrc: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_ASSERT_TRUE, -1, condSrc, -1, -1, 0);
+      }
+      return dest;
+    }
+
+    // WP-BC-01: assertNotNull(ptr) → IRO_ASSERT_NOT_NULL
+    if (self.seq(fname, fnlen, "assertNotNull", 13)) {
+      if (arg0 >= 0) {
+        var ptrSrc: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_ASSERT_NOT_NULL, -1, ptrSrc, -1, -1, 0);
+      }
+      return dest;
+    }
+
+    // WP-BC-01: assertNotZero(val) → IRO_ASSERT_NOT_ZERO
+    if (self.seq(fname, fnlen, "assertNotZero", 13)) {
+      if (arg0 >= 0) {
+        var valSrc: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_ASSERT_NOT_ZERO, -1, valSrc, -1, -1, 0);
+      }
+      return dest;
+    }
+
+    // WP-BC-01: assertBounds(value, bound) → IRO_ASSERT_BOUNDS (ImmInt = bound temp)
+    if (self.seq(fname, fnlen, "assertBounds", 12)) {
+      var arg1: int64 := -1;
+      if (arg0 >= 0) { arg1 := self.nodeNext(arg0); }
+      if (arg0 >= 0) {
+        var valSrc:   int64 := self.lowerExpr(arg0);
+        var boundSrc: int64 := -1;
+        if (arg1 >= 0) { boundSrc := self.lowerExpr(arg1); }
+        self.irAddInstrDirect(IRO_ASSERT_BOUNDS, -1, valSrc, boundSrc, -1, 0);
+      }
+      return dest;
+    }
+
+    // General call: lower first argument and emit IRO_CALL_BUILTIN
+    if (arg0 >= 0) {
+      var argTemp: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, argTemp, -1, -1, 1);
+    }
+
     return dest;
   }
   
@@ -696,8 +735,16 @@ pub type IRLower = class {
     else if (k == NK_SWITCH) { 
       self.lowerSwitch(stmt); 
     }
-    else if (k == NK_DISPOSE) { 
-      self.lowerDispose(stmt); 
+    else if (k == NK_DISPOSE) {
+      self.lowerDispose(stmt);
+    }
+    // WP-BC-07: assert(cond) → IRO_ASSERT_TRUE
+    else if (k == NK_ASSERT) {
+      var condNode: int64 := self.nodeC0(stmt);
+      if (condNode >= 0) {
+        var condTemp: int64 := self.lowerExpr(condNode);
+        self.irAddInstrDirect(IRO_ASSERT_TRUE, -1, condTemp, -1, -1, 0);
+      }
     }
     // Try/Catch/Finally handled in lowering blocks
   }
