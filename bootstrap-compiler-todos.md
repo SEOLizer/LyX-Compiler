@@ -320,7 +320,9 @@ implementieren.
 
 ## Phase 3 — Typsystem-Erweiterungen
 
-### WP-BC-14: Nullable Pointer-Typ (`pchar?`)
+### WP-BC-14: Nullable Pointer-Typ (`pchar?`) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-14-nullable-pchar`, S2=S3 sha256 `07637c91…`.
 
 **Ziel:** `atPCharNullable` — optionaler Pointer-Typ für Null-Safety.
 
