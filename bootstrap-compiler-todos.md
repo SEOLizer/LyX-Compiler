@@ -458,7 +458,9 @@ VMT-Patching in `compiler/backend/x86_64/x86_64_emit.pas`
 
 ---
 
-### WP-BC-21: Interface-Vertragsprüfung
+### WP-BC-21: Interface-Vertragsprüfung ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-21-interface-contract`, Singularität bestätigt sha256 `a81c5adc…`.
 
 **Ziel:** Vollständige Prüfung ob Klasse alle Interface-Methoden implementiert.
 
