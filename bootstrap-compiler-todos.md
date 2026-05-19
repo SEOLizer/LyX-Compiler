@@ -15,7 +15,9 @@ genaue Dateinamen aus `bootstrap/` oder `compiler/` als Referenz.
 
 ## Phase 1 — IR & Codegen-Vervollständigung (kleine Lücken)
 
-### WP-BC-01: Fehlende IR-Opcodes implementieren
+### WP-BC-01: Fehlende IR-Opcodes implementieren ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-01-assert-sqrt-builtins`, Singularität bestätigt.
 
 **Ziel:** Die IR-Opcode-Tabelle von S2 (`bootstrap/ir.lyx`) auf vollständige
 S0-Parität bringen.
@@ -41,7 +43,9 @@ S0-Parität bringen.
 
 ---
 
-### WP-BC-02: Fehlende Built-in-Funktionen
+### WP-BC-02: Fehlende Built-in-Funktionen ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-02-missing-builtins`, S2=S3 sha256 `195a48f6…`.
 
 **Ziel:** Alle Built-ins aus `compiler/frontend/builtins.pas` in S2 verfügbar
 machen.
@@ -98,7 +102,9 @@ machen.
 
 ---
 
-### WP-BC-03: Optimizer — Unreachable-Block-Elimination
+### WP-BC-03: Optimizer — Unreachable-Block-Elimination ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-03-unreachable-blocks`, S2=S3 sha256 `ec849307…`.
 
 **Ziel:** `EliminateUnreachableBlocks` aus S0 (`compiler/ir/ir_optimize.pas:450`)
 in S2 implementieren.
@@ -118,7 +124,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ## Phase 2 — Sprachfeatures (mittlerer Aufwand)
 
-### WP-BC-04: `repeat..until`-Schleife
+### WP-BC-04: `repeat..until`-Schleife ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-04-repeat-until`, S2=S3 sha256 `6fae4c3a…`.
 
 **Ziel:** `repeat { body } until (cond)` parsen und codegenieren.
 
@@ -134,7 +142,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-05: Tupel-Typen und Tupel-VarDecl
+### WP-BC-05: Tupel-Typen und Tupel-VarDecl ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-05-tuple-vardecl`, S2=S3 sha256 `d7075675…`.
 
 **Ziel:** Multi-Return-Tupel `(T1, T2)` sowie `var a, b := fn()` unterstützen.
 
@@ -151,7 +161,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-06: Map/Set-Literale und `in`-Operator
+### WP-BC-06: Map/Set-Literale und `in`-Operator ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-06-map-set-in`, S2=S3 sha256 `74c86b27…`.
 
 **Ziel:** `{"key": val}` Map-Literale, `{1, 2, 3}` Set-Literale und
 `x in collection` Containment-Operator.
