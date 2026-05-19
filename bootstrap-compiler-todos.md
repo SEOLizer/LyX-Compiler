@@ -548,7 +548,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-26: Call-Graph-Analyse
+### WP-BC-26: Call-Graph-Analyse ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-26-call-graph`, Singularität `c42798d4…`.
 
 **Ziel:** Vollständiger statischer Call-Graph wie in S0.
 
