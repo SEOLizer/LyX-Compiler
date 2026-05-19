@@ -1,0 +1,376 @@
+// bootstrap/dwarf_gen.lyx
+// Minimal DWARF 4 debug info generator (WP-BC-25)
+// Produces .debug_abbrev, .debug_info, .debug_line, .debug_str sections.
+
+// DWARF 4 tag/attribute/form constants
+con DW_TAG_compile_unit:  int64 := 0x11;
+con DW_TAG_subprogram:    int64 := 0x2E;
+
+con DW_AT_producer:       int64 := 0x25;
+con DW_AT_language:       int64 := 0x13;
+con DW_AT_name:           int64 := 0x03;
+con DW_AT_comp_dir:       int64 := 0x1B;
+con DW_AT_low_pc:         int64 := 0x11;
+con DW_AT_high_pc:        int64 := 0x12;
+con DW_AT_external:       int64 := 0x3F;
+con DW_AT_decl_line:      int64 := 0x3A;
+
+con DW_FORM_addr:         int64 := 0x01;
+con DW_FORM_data1:        int64 := 0x0B;
+con DW_FORM_data2:        int64 := 0x05;
+con DW_FORM_data4:        int64 := 0x06;
+con DW_FORM_data8:        int64 := 0x07;
+con DW_FORM_strp:         int64 := 0x0E;
+con DW_FORM_flag_present: int64 := 0x19;
+
+con DW_LANG_C:            int64 := 0x0001;
+con DW_CHILDREN_yes:      int64 := 1;
+con DW_CHILDREN_no:       int64 := 0;
+
+// Function table entry size: namePtr(8) + nameLen(8) + codeStart(8) + codeEnd(8) = 32
+con DW_FUNC_SZ: int64 := 32;
+
+pub type DwarfGen = class {
+
+  // Output buffers
+  abbrevBuf: int64;
+  abbrevLen: int64;
+  abbrevCap: int64;
+
+  infoBuf: int64;
+  infoLen: int64;
+  infoCap: int64;
+
+  lineBuf: int64;
+  lineLen: int64;
+  lineCap: int64;
+
+  strBuf: int64;
+  strLen: int64;
+  strCap: int64;
+
+  // Function table
+  funcTable: int64;
+  funcCount: int64;
+  funcCap:   int64;
+
+  // ELF base address (filled in before building)
+  elfBase: int64;
+  codeOff: int64;  // offset of code in ELF file
+
+  fn dw_eAbbrev(b: int64) {
+    if (self.abbrevLen >= self.abbrevCap) {
+      var nc: int64 := self.abbrevCap * 2;
+      var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.abbrevLen) { poke8(nb + i, peek8(self.abbrevBuf + i)); i := i + 1; }
+      self.abbrevBuf := nb; self.abbrevCap := nc;
+    }
+    poke8(self.abbrevBuf + self.abbrevLen, b & 255);
+    self.abbrevLen := self.abbrevLen + 1;
+  }
+
+  fn dw_eInfo(b: int64) {
+    if (self.infoLen >= self.infoCap) {
+      var nc: int64 := self.infoCap * 2;
+      var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.infoLen) { poke8(nb + i, peek8(self.infoBuf + i)); i := i + 1; }
+      self.infoBuf := nb; self.infoCap := nc;
+    }
+    poke8(self.infoBuf + self.infoLen, b & 255);
+    self.infoLen := self.infoLen + 1;
+  }
+
+  fn dw_eLine(b: int64) {
+    if (self.lineLen >= self.lineCap) {
+      var nc: int64 := self.lineCap * 2;
+      var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.lineLen) { poke8(nb + i, peek8(self.lineBuf + i)); i := i + 1; }
+      self.lineBuf := nb; self.lineCap := nc;
+    }
+    poke8(self.lineBuf + self.lineLen, b & 255);
+    self.lineLen := self.lineLen + 1;
+  }
+
+  // Emit 4-byte little-endian word into info buffer
+  fn dw_eInfo32(v: int64) {
+    self.dw_eInfo(v); self.dw_eInfo(v >> 8);
+    self.dw_eInfo(v >> 16); self.dw_eInfo(v >> 24);
+  }
+
+  // Emit 8-byte little-endian into info buffer
+  fn dw_eInfo64(v: int64) {
+    self.dw_eInfo32(v); self.dw_eInfo32(v >> 32);
+  }
+
+  // Emit 4-byte LE into line buffer
+  fn dw_eLine32(v: int64) {
+    self.dw_eLine(v); self.dw_eLine(v >> 8);
+    self.dw_eLine(v >> 16); self.dw_eLine(v >> 24);
+  }
+
+  // Patch a 4-byte LE value in info buffer at given offset
+  fn dw_patchInfo32(off: int64, v: int64) {
+    poke8(self.infoBuf + off,     v & 255);
+    poke8(self.infoBuf + off + 1, (v >> 8) & 255);
+    poke8(self.infoBuf + off + 2, (v >> 16) & 255);
+    poke8(self.infoBuf + off + 3, (v >> 24) & 255);
+  }
+
+  fn dw_patchLine32(off: int64, v: int64) {
+    poke8(self.lineBuf + off,     v & 255);
+    poke8(self.lineBuf + off + 1, (v >> 8) & 255);
+    poke8(self.lineBuf + off + 2, (v >> 16) & 255);
+    poke8(self.lineBuf + off + 3, (v >> 24) & 255);
+  }
+
+  // Unsigned LEB128 into info buffer
+  fn dw_uleb128Info(v: int64) {
+    while (1 == 1) {
+      var b: int64 := v & 127;
+      v := v >> 7;
+      if (v != 0) { b := b | 128; }
+      self.dw_eInfo(b);
+      if (v == 0) { break; }
+    }
+  }
+
+  // Unsigned LEB128 into abbrev buffer
+  fn dw_uleb128Abbrev(v: int64) {
+    while (1 == 1) {
+      var b: int64 := v & 127;
+      v := v >> 7;
+      if (v != 0) { b := b | 128; }
+      self.dw_eAbbrev(b);
+      if (v == 0) { break; }
+    }
+  }
+
+  // Unsigned LEB128 into line buffer
+  fn dw_uleb128Line(v: int64) {
+    while (1 == 1) {
+      var b: int64 := v & 127;
+      v := v >> 7;
+      if (v != 0) { b := b | 128; }
+      self.dw_eLine(b);
+      if (v == 0) { break; }
+    }
+  }
+
+  // Signed LEB128 into line buffer
+  fn dw_sleb128Line(v: int64) {
+    var more: int64 := 1;
+    while (more != 0) {
+      var b: int64 := v & 127;
+      v := v >> 7;
+      if ((v == 0 && (b & 64) == 0) || (v == -1 && (b & 64) != 0)) { more := 0; }
+      else { b := b | 128; }
+      self.dw_eLine(b);
+    }
+  }
+
+  // Add string to .debug_str pool, return byte offset
+  fn dw_addStr(s: pchar, len: int64): int64 {
+    var off: int64 := self.strLen;
+    if (self.strLen + len + 1 >= self.strCap) {
+      var nc: int64 := self.strCap * 2;
+      if (nc < self.strLen + len + 2) { nc := self.strLen + len + 2; }
+      var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.strLen) { poke8(nb + i, peek8(self.strBuf + i)); i := i + 1; }
+      self.strBuf := nb; self.strCap := nc;
+    }
+    var i: int64 := 0;
+    while (i < len) { poke8(self.strBuf + self.strLen + i, StrCharAt(s, i)); i := i + 1; }
+    poke8(self.strBuf + self.strLen + len, 0);
+    self.strLen := self.strLen + len + 1;
+    return off;
+  }
+
+  // Register a function for debug emission
+  fn dw_addFunc(name: pchar, nameLen: int64, codeStart: int64, codeEnd: int64) {
+    if (self.funcCount >= self.funcCap) {
+      var nc: int64 := self.funcCap * 2;
+      var nb: int64 := mmap(0, nc * DW_FUNC_SZ, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.funcCount * DW_FUNC_SZ) { poke8(nb + i, peek8(self.funcTable + i)); i := i + 1; }
+      self.funcTable := nb; self.funcCap := nc;
+    }
+    var base: int64 := self.funcTable + self.funcCount * DW_FUNC_SZ;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, codeStart);
+    poke64(base + 24, codeEnd);
+    self.funcCount := self.funcCount + 1;
+  }
+
+  // Build .debug_abbrev section
+  fn dw_buildAbbrev() {
+    self.abbrevLen := 0;
+
+    // Abbreviation 1: DW_TAG_compile_unit, has children
+    self.dw_uleb128Abbrev(1);                  // abbrev code
+    self.dw_uleb128Abbrev(DW_TAG_compile_unit); // tag
+    self.dw_eAbbrev(DW_CHILDREN_yes);
+    self.dw_uleb128Abbrev(DW_AT_producer);  self.dw_uleb128Abbrev(DW_FORM_strp);
+    self.dw_uleb128Abbrev(DW_AT_language);  self.dw_uleb128Abbrev(DW_FORM_data2);
+    self.dw_uleb128Abbrev(DW_AT_name);      self.dw_uleb128Abbrev(DW_FORM_strp);
+    self.dw_uleb128Abbrev(DW_AT_comp_dir);  self.dw_uleb128Abbrev(DW_FORM_strp);
+    self.dw_uleb128Abbrev(DW_AT_low_pc);    self.dw_uleb128Abbrev(DW_FORM_addr);
+    self.dw_uleb128Abbrev(DW_AT_high_pc);   self.dw_uleb128Abbrev(DW_FORM_data8);
+    self.dw_eAbbrev(0); self.dw_eAbbrev(0); // end attrs
+
+    // Abbreviation 2: DW_TAG_subprogram, no children
+    self.dw_uleb128Abbrev(2);
+    self.dw_uleb128Abbrev(DW_TAG_subprogram);
+    self.dw_eAbbrev(DW_CHILDREN_no);
+    self.dw_uleb128Abbrev(DW_AT_name);      self.dw_uleb128Abbrev(DW_FORM_strp);
+    self.dw_uleb128Abbrev(DW_AT_low_pc);    self.dw_uleb128Abbrev(DW_FORM_addr);
+    self.dw_uleb128Abbrev(DW_AT_high_pc);   self.dw_uleb128Abbrev(DW_FORM_data8);
+    self.dw_uleb128Abbrev(DW_AT_external);  self.dw_uleb128Abbrev(DW_FORM_flag_present);
+    self.dw_eAbbrev(0); self.dw_eAbbrev(0); // end attrs
+
+    self.dw_eAbbrev(0); // end abbreviation table
+  }
+
+  // Build .debug_info section
+  fn dw_buildInfo(srcFile: pchar, srcFileLen: int64, totalCodeLen: int64) {
+    self.infoLen := 0;
+
+    var producer: pchar := "Lyx Bootstrap Compiler (WP-BC-25)";
+    var compDir:  pchar := ".";
+    var producerOff: int64 := self.dw_addStr(producer, StrLen(producer));
+    var nameOff:     int64 := self.dw_addStr(srcFile, srcFileLen);
+    var compDirOff:  int64 := self.dw_addStr(compDir, 1);
+
+    // Compilation unit header:
+    //   unit_length(4) + version(2) + debug_abbrev_offset(4) + address_size(1) = 11 bytes header
+    var lenPatch: int64 := self.infoLen;
+    self.dw_eInfo32(0);          // unit_length placeholder (patched later)
+    self.dw_eInfo(4); self.dw_eInfo(0); // version = 4
+    self.dw_eInfo32(0);          // debug_abbrev_offset = 0
+    self.dw_eInfo(8);            // address_size = 8
+
+    // DW_TAG_compile_unit (abbrev 1)
+    self.dw_uleb128Info(1);
+    self.dw_eInfo32(producerOff);  // DW_AT_producer
+    self.dw_eInfo(DW_LANG_C); self.dw_eInfo(0); // DW_AT_language = DW_LANG_C (data2)
+    self.dw_eInfo32(nameOff);      // DW_AT_name
+    self.dw_eInfo32(compDirOff);   // DW_AT_comp_dir
+    var baseVA: int64 := self.elfBase + self.codeOff;
+    self.dw_eInfo64(baseVA);       // DW_AT_low_pc (absolute VA of code start)
+    self.dw_eInfo64(totalCodeLen); // DW_AT_high_pc (relative to low_pc in DWARF 4)
+
+    // Emit DW_TAG_subprogram for each function
+    var fi: int64 := 0;
+    while (fi < self.funcCount) {
+      var fBase: int64 := self.funcTable + fi * DW_FUNC_SZ;
+      var fName: pchar := peek64(fBase) as pchar;
+      var fNameLen: int64 := peek64(fBase + 8);
+      var fStart: int64 := peek64(fBase + 16);
+      var fEnd:   int64 := peek64(fBase + 24);
+      var fNameOff: int64 := self.dw_addStr(fName, fNameLen);
+      self.dw_uleb128Info(2);
+      self.dw_eInfo32(fNameOff);               // DW_AT_name
+      self.dw_eInfo64(baseVA + fStart);        // DW_AT_low_pc
+      self.dw_eInfo64(fEnd - fStart);          // DW_AT_high_pc (size, relative)
+      // DW_AT_external: DW_FORM_flag_present emits nothing
+      fi := fi + 1;
+    }
+
+    // End of children (DW_TAG_compile_unit had children)
+    self.dw_eInfo(0);
+
+    // Patch unit_length = total - 4 (excludes the length field itself)
+    self.dw_patchInfo32(lenPatch, self.infoLen - 4);
+  }
+
+  // Build minimal .debug_line section (header + 1-file program + end sequence)
+  fn dw_buildLine(srcFile: pchar, srcFileLen: int64) {
+    self.lineLen := 0;
+
+    // Line number program header
+    var lenPatch: int64 := self.lineLen;
+    self.dw_eLine32(0);           // unit_length (patched)
+    self.dw_eLine(4); self.dw_eLine(0); // version = 4
+    var hdrLenPatch: int64 := self.lineLen;
+    self.dw_eLine32(0);           // header_length (patched)
+    self.dw_eLine(1);             // minimum_instruction_length = 1
+    self.dw_eLine(1);             // maximum_ops_per_instruction = 1
+    self.dw_eLine(1);             // default_is_stmt = 1
+    self.dw_eLine(0xFB);          // line_base = -5 (signed byte)
+    self.dw_eLine(14);            // line_range = 14
+    self.dw_eLine(13);            // opcode_base = 13 (standard opcodes 1-12)
+    // standard_opcode_lengths[1..12]
+    self.dw_eLine(0); self.dw_eLine(1); self.dw_eLine(1); self.dw_eLine(1);
+    self.dw_eLine(1); self.dw_eLine(0); self.dw_eLine(0); self.dw_eLine(0);
+    self.dw_eLine(1); self.dw_eLine(0); self.dw_eLine(0); self.dw_eLine(1);
+    // include_directories: empty (just a 0 terminator)
+    self.dw_eLine(0);
+    // file_names: one entry
+    var i: int64 := 0;
+    while (i < srcFileLen) { self.dw_eLine(StrCharAt(srcFile, i)); i := i + 1; }
+    self.dw_eLine(0);             // name null terminator
+    self.dw_uleb128Line(0);       // dir index = 0
+    self.dw_uleb128Line(0);       // last modified = 0
+    self.dw_uleb128Line(0);       // file size = 0
+    self.dw_eLine(0);             // end of file_names
+
+    // Patch header_length = bytes after header_length field to here
+    self.dw_patchLine32(hdrLenPatch, self.lineLen - hdrLenPatch - 4);
+
+    // DW_LNE_set_address (extended opcode 0x02)
+    self.dw_eLine(0);                            // extended opcode prefix
+    self.dw_uleb128Line(9);                      // length = 1 (opcode) + 8 (addr)
+    self.dw_eLine(2);                            // DW_LNE_set_address
+    var startVA: int64 := self.elfBase + self.codeOff;
+    // Emit 8-byte address
+    self.dw_eLine(startVA & 255);
+    self.dw_eLine((startVA >> 8) & 255);
+    self.dw_eLine((startVA >> 16) & 255);
+    self.dw_eLine((startVA >> 24) & 255);
+    self.dw_eLine((startVA >> 32) & 255);
+    self.dw_eLine((startVA >> 40) & 255);
+    self.dw_eLine((startVA >> 48) & 255);
+    self.dw_eLine((startVA >> 56) & 255);
+
+    // DW_LNS_copy (opcode 1)
+    self.dw_eLine(1);
+
+    // DW_LNE_end_sequence
+    self.dw_eLine(0);
+    self.dw_uleb128Line(1);
+    self.dw_eLine(1);  // DW_LNE_end_sequence
+
+    // Patch unit_length
+    self.dw_patchLine32(lenPatch, self.lineLen - 4);
+  }
+
+  fn Init() {
+    self.abbrevCap := 512;
+    self.abbrevBuf := mmap(0, self.abbrevCap, 3, 34, -1, 0);
+    self.abbrevLen := 0;
+
+    self.infoCap := 65536;
+    self.infoBuf := mmap(0, self.infoCap, 3, 34, -1, 0);
+    self.infoLen := 0;
+
+    self.lineCap := 4096;
+    self.lineBuf := mmap(0, self.lineCap, 3, 34, -1, 0);
+    self.lineLen := 0;
+
+    self.strCap := 16384;
+    self.strBuf := mmap(0, self.strCap, 3, 34, -1, 0);
+    self.strLen := 0;
+
+    self.funcCap   := 256;
+    self.funcTable := mmap(0, self.funcCap * DW_FUNC_SZ, 3, 34, -1, 0);
+    self.funcCount := 0;
+
+    self.elfBase := 4194304;  // CG_ELF_BASE = 0x400000
+    self.codeOff := 120;      // CG_CODE_OFF
+  }
+
+};

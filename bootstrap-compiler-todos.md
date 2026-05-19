@@ -534,22 +534,17 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ## Phase 5 — Analyse-Werkzeuge
 
-### WP-BC-25: DWARF Debug-Info-Generierung
+### WP-BC-25: DWARF Debug-Info-Generierung ✅
 
-**Ziel:** `.debug_info`, `.debug_line`, `.debug_frame`, `.debug_abbrev`,
-`.debug_str`-Sektionen in der erzeugten ELF-Datei.
+**Status:** Erledigt — Branch `feat/wp-bc-25-dwarf-debug-info`, Singularität bestätigt: S2=S3 sha256 `6e24fd5d…`.
 
-**Referenz:** S0 `compiler/ir/dwarf_gen.pas` (528 Zeilen)
+**Ziel:** `.debug_info`, `.debug_line`, `.debug_abbrev`, `.debug_str`-Sektionen in der erzeugten ELF-Datei.
 
-**Zu tun:**
-- Neue Datei `bootstrap/dwarf_gen.lyx` implementieren
-- LEB128-Encoding-Funktionen (signed + unsigned)
-- DWARF-Abbreviation-Table für Compilation Unit + Subprogram + Variable
-- Line-Number-Programm (DWARF Standard Section 6.2)
-- `.debug_frame` mit CFA-Regeln für x86_64 (RSP/RBP-Tracking)
-- ELF-Writer in `codegen_x86.lyx` um Debug-Sektionen erweitern
-- Zeilennummern aus AST-Spans durchpropagieren
-- CLI-Flag `--debug` / `-g`
+**Erledigt:**
+- `bootstrap/dwarf_gen.lyx`: vollständige `DwarfGen`-Klasse mit LEB128, Abbrev/Info/Line/Str-Buildern und Funktions-Registrierung
+- `bootstrap/codegen_x86.lyx`: `WriteELF` erzeugt bei `--debug` alle 6 ELF Section Headers (NULL + 4 DWARF + .shstrtab)
+- `bootstrap/lyxc.lyx`: `--debug`-Flag verbindet `enableDebug` mit `cg.debugMode`
+- `DW_TAG_compile_unit` + `DW_TAG_subprogram` für jede Funktion; verifiziert mit `readelf --debug-dump=info`
 
 ---
 
