@@ -606,7 +606,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-29: Vollständiger Linter
+### WP-BC-29: Vollständiger Linter ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-29-linter`, Singularität `3e98ca91…`.
 
 **Ziel:** Style-Checks und Warnungen wie in S0.
 
