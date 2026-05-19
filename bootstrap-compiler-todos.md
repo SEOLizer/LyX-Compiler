@@ -440,7 +440,9 @@ VMT-Patching in `compiler/backend/x86_64/x86_64_emit.pas`
 
 ---
 
-### WP-BC-20: Abstrakte Klassen und Methoden
+### WP-BC-20: Abstrakte Klassen und Methoden ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-20-abstract-classes`, Singularität bestätigt sha256 `2bc17547…`.
 
 **Ziel:** `abstract` Klassen und Methoden erzwingen Implementierungspflicht.
 
