@@ -634,7 +634,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-30: C-Header-Parser (FFI)
+### WP-BC-30: C-Header-Parser (FFI) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-30-c-header-parser`, Singularität `e2bde0b3…`.
 
 **Ziel:** `#include`-artige C-Header-Deklarationen für FFI.
 
