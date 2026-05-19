@@ -357,7 +357,9 @@ Null-Coalescing `??`-Operator (`TK_NULLCOALESCE`), `as?`-Cast
 
 ---
 
-### WP-BC-16: Dimensionsanalyse / Einheiten-Typsystem
+### WP-BC-16: Dimensionsanalyse / Einheiten-Typsystem ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-16-dim-utype`, S2=S3 sha256 `527f7c71…`.
 
 **Ziel:** `dim`, `utype` und Einheits-kompatible Typen (z.B. für Luft- und
 Raumfahrt-Code).
