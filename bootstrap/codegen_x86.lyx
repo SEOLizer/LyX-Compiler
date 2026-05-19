@@ -75,6 +75,7 @@ con CGN_PATTERN_WILD: int64 := 67; // wildcard pattern
 con CGN_PATTERN_BIND: int64 := 68; // binding pattern (x @ pattern)
 con CGN_PATTERN_ENUM:   int64 := 75; // enum payload pattern: Ok(v)
 con CGN_PATTERN_STRUCT: int64 := 76; // struct destructure pattern: Point { x, y }
+con CGN_PATTERN_OR:     int64 := 85; // WP-BC-11: or-pattern: p1 | p2
 con CGN_REPEAT_UNTIL:    int64 := 77; // WP-BC-04: repeat { body } until (cond)
 con CGN_TUPLE_VAR_DECL:  int64 := 78; // WP-BC-05: var a, b := fn()
 con CGN_MAP_LIT:         int64 := 79; // WP-BC-06: { key: val, ... }
@@ -221,6 +222,9 @@ pub type Codegen = class {
 
   // Continue support: linked list of pending jmp-rel32 placeholders for continue
   curContHead: int64;
+
+  // WP-BC-11: or-pattern body forward jump list (je body, linked list of rel32 positions)
+  orBodyHead: int64;
 
   // VMT address patch table (WP-10a): {codeOff:8, classNamePtr:8, classNameLen:8}
   // Each entry says: at code offset codeOff there is a mov-rcx-imm64 placeholder
@@ -3807,6 +3811,32 @@ pub type Codegen = class {
   }
 
   // WP-15: Generate match statement (like switch but for pattern matching)
+  // WP-BC-11: emit comparison for one or-pattern alternative; link je-body into self.orBodyHead
+  fn cg_emitOrAlt(matchOff: int64, altPat: int64) {
+    if (self.cg_nkind(altPat) == CGN_PATTERN_OR) {
+      self.cg_emitOrAlt(matchOff, self.cg_nc0(altPat));
+      self.cg_emitOrAlt(matchOff, self.cg_nc1(altPat));
+    } else {
+      self.cg_loadRax(matchOff);
+      self.cg_pushRax();
+      var patVal: int64 := self.cg_nival(altPat);
+      if (patVal != 0) {
+        self.cg_movRaxImm(patVal);
+      } else {
+        var pn: pchar := self.cg_nsval(altPat);
+        var pl: int64  := self.cg_nslen(altPat);
+        var po: int64  := self.cg_findLocal(pn, pl);
+        if (po != 0) { self.cg_loadRax(po); } else { self.cg_zeroRax(); }
+      }
+      self.cg_popRbx();
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);   // cmp rbx, rax
+      self.cg_e8(0x0F); self.cg_e8(0x84);                       // je rel32
+      var jePos: int64 := self.codeLen;
+      self.cg_e32(self.orBodyHead);
+      self.orBodyHead := jePos;
+    }
+  }
+
   fn cg_genMatch(ni: int64) {
     // c0 = discriminant expression, c1 = cases (next-linked)
     // Allocate a temp local to hold the subject value
@@ -3822,15 +3852,50 @@ pub type Codegen = class {
     var defaultCaseNode: int64 := -1;
     var caseCur: int64 := self.cg_nc1(ni);  // first match case
     while (caseCur != -1) {
-      // WP-15: Match case structure:
-      // c0 = pattern (NK_PATTERN_LIT or NK_PATTERN_WILD or NK_PATTERN_STRUCT)
-      // c1 = body expression
+      // c0 = pattern, c1 = body expression, c2 = guard (or -1)
       var patNode: int64 := self.cg_nc0(caseCur);
       var bodyNode: int64 := self.cg_nc1(caseCur);
+      var guardNode: int64 := self.cg_nc2(caseCur);
       var patKind: int64 := self.cg_nkind(patNode);
-      
+
+      // WP-BC-11: or-pattern — try each alternative; if any matches, jmp to body
+      if (patKind == CGN_PATTERN_OR) {
+        var savedOrBodyHead: int64 := self.orBodyHead;
+        self.orBodyHead := -1;
+        self.cg_emitOrAlt(matchOff, patNode);   // emit je-body for each alt
+        // No alternative matched → jmp next_case
+        self.cg_e8(0xE9);
+        var jmpNextCase: int64 := self.codeLen;
+        self.cg_e32(0);
+        // Patch all je-body jumps → current position (body entry)
+        var oh: int64 := self.orBodyHead;
+        while (oh != -1) {
+          var lnk: int64 := peek8(self.code + oh) + peek8(self.code + oh + 1) * 256 + peek8(self.code + oh + 2) * 65536 + peek8(self.code + oh + 3) * 16777216;
+          if (lnk >= 2147483648) { lnk := lnk - 4294967296; }
+          poke32(self.code + oh, self.codeLen - oh - 4);
+          oh := lnk;
+        }
+        self.orBodyHead := savedOrBodyHead;
+        // Guard check (if present)
+        var guardFailPos: int64 := -1;
+        if (guardNode >= 0) {
+          self.cg_genExpr(guardNode);
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+          self.cg_e8(0x0F); self.cg_e8(0x84);                      // jz guard_fail
+          guardFailPos := self.codeLen;
+          self.cg_e32(0);
+        }
+        self.cg_genExpr(bodyNode);
+        self.cg_e8(0xE9);
+        var bpOR: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bpOR;
+        // Patch next_case and guard_fail → here
+        poke32(self.code + jmpNextCase, self.codeLen - jmpNextCase - 4);
+        if (guardFailPos >= 0) { poke32(self.code + guardFailPos, self.codeLen - guardFailPos - 4); }
+
       // Wildcard pattern - treat as default
-      if (patKind == CGN_PATTERN_WILD) {
+      } else if (patKind == CGN_PATTERN_WILD) {
         defaultCaseNode := caseCur;
       } else if (patKind == CGN_PATTERN_STRUCT) {
         // WP-15: Struct destructure pattern: Point { x: patX, y: patY }
@@ -4017,6 +4082,15 @@ pub type Codegen = class {
         self.cg_e8(0x0F); self.cg_e8(0x85);
         var jnePos: int64 := self.codeLen;
         self.cg_e32(0);
+        // WP-BC-11: guard check (c2 of case node)
+        var guardFail2: int64 := -1;
+        if (guardNode >= 0) {
+          self.cg_genExpr(guardNode);
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+          self.cg_e8(0x0F); self.cg_e8(0x84);                      // jz guard_fail
+          guardFail2 := self.codeLen;
+          self.cg_e32(0);
+        }
         // Execute case body
         self.cg_genExpr(bodyNode);
         // Implicit jmp to match_end
@@ -4024,8 +4098,9 @@ pub type Codegen = class {
         var bp: int64 := self.codeLen;
         self.cg_e32(self.curBreakHead);
         self.curBreakHead := bp;
-        // Patch jne to next case
+        // Patch jne (and guard fail) to next case
         poke32(self.code + jnePos, self.codeLen - jnePos - 4);
+        if (guardFail2 >= 0) { poke32(self.code + guardFail2, self.codeLen - guardFail2 - 4); }
       }
       caseCur := self.cg_nnext(caseCur);
     }
@@ -4033,11 +4108,26 @@ pub type Codegen = class {
     // Default/wildcard case executes last if no other case matched
     if (defaultCaseNode != -1) {
       var bodyNode: int64 := self.cg_nc1(defaultCaseNode);
-      self.cg_genExpr(bodyNode);
-      self.cg_e8(0xE9);
-      var bpd: int64 := self.codeLen;
-      self.cg_e32(self.curBreakHead);
-      self.curBreakHead := bpd;
+      var defGuard: int64 := self.cg_nc2(defaultCaseNode);
+      if (defGuard >= 0) {
+        self.cg_genExpr(defGuard);
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+        self.cg_e8(0x74);                                         // jz short (skip default)
+        var defSkip: int64 := self.codeLen;
+        self.cg_e8(0);
+        self.cg_genExpr(bodyNode);
+        self.cg_e8(0xE9);
+        var bpDefG: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bpDefG;
+        poke8(self.code + defSkip, self.codeLen - defSkip - 1);
+      } else {
+        self.cg_genExpr(bodyNode);
+        self.cg_e8(0xE9);
+        var bpd: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bpd;
+      }
     }
 
     // match_end: patch all break/implicit jmps
