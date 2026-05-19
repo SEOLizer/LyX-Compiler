@@ -73,8 +73,9 @@ con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 con CGN_PATTERN_LIT:  int64 := 66;  // literal pattern
 con CGN_PATTERN_WILD: int64 := 67; // wildcard pattern
 con CGN_PATTERN_BIND: int64 := 68; // binding pattern (x @ pattern)
-con CGN_PATTERN_ENUM: int64 := 75; // enum payload pattern: Ok(v)
-con CGN_PATTERN_STRUCT:int64 := 76; // struct destructure pattern: Point { x, y }
+con CGN_PATTERN_ENUM:   int64 := 75; // enum payload pattern: Ok(v)
+con CGN_PATTERN_STRUCT: int64 := 76; // struct destructure pattern: Point { x, y }
+con CGN_REPEAT_UNTIL:   int64 := 77; // WP-BC-04: repeat { body } until (cond)
 
 // Token kinds for binary operators (mirror TK_xxx from bootstrap.lexer)
 con CGT_PLUS:    int64 := 70;
@@ -3103,6 +3104,9 @@ pub type Codegen = class {
     } else if (k == CGN_WHILE) {
       self.cg_genWhile(ni);
 
+    } else if (k == CGN_REPEAT_UNTIL) {
+      self.cg_genRepeatUntil(ni);
+
     } else if (k == CGN_FOR) {
       self.cg_genFor(ni);
 
@@ -3556,6 +3560,53 @@ pub type Codegen = class {
     // Restore outer loop's break/continue lists
     self.curBreakHead := savedBreakHead;
     self.curContHead := savedContHead;
+  }
+
+  // WP-BC-04: repeat { body } until (cond)
+  // body executes first; loop back while cond == 0 (false)
+  fn cg_genRepeatUntil(ni: int64) {
+    var loopTop: int64 := self.codeLen;
+    // Save outer break/continue lists
+    var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead:  int64 := self.curContHead;
+    self.curBreakHead := -1;
+    self.curContHead  := -1;
+    // Body
+    self.cg_genBlock(self.cg_nc0(ni));
+    // contPos: patch all continue jumps to here (before condition eval)
+    var contPos: int64 := self.codeLen;
+    var ch: int64 := self.curContHead;
+    while (ch != -1) {
+      var b0: int64 := peek8(self.code + ch) as int64;
+      var b1: int64 := peek8(self.code + ch + 1) as int64;
+      var b2: int64 := peek8(self.code + ch + 2) as int64;
+      var b3: int64 := peek8(self.code + ch + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + ch, contPos - ch - 4);
+      ch := nextLink;
+    }
+    // Condition → rax
+    self.cg_genExpr(self.cg_nc1(ni));
+    // test rax, rax; jz loopTop  (if cond false → loop back)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+    self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
+    self.cg_e32(loopTop - self.codeLen - 4);
+    // exitPos: patch all break jumps here
+    var bh: int64 := self.curBreakHead;
+    while (bh != -1) {
+      var b0: int64 := peek8(self.code + bh) as int64;
+      var b1: int64 := peek8(self.code + bh + 1) as int64;
+      var b2: int64 := peek8(self.code + bh + 2) as int64;
+      var b3: int64 := peek8(self.code + bh + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + bh, self.codeLen - bh - 4);
+      bh := nextLink;
+    }
+    // Restore outer loop lists
+    self.curBreakHead := savedBreakHead;
+    self.curContHead  := savedContHead;
   }
 
   fn cg_genFor(ni: int64) {
