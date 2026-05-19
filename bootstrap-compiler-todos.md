@@ -494,7 +494,9 @@ VMT-Patching in `compiler/backend/x86_64/x86_64_emit.pas`
 
 ---
 
-### WP-BC-23: Generics — Constraints und `where`-Klauseln
+### WP-BC-23: Generics — Constraints und `where`-Klauseln ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-23-generic-constraints`, Singularität bestätigt sha256 `4f754437…`.
 
 **Ziel:** Typ-Parameter-Bounds und `where T: Interface`-Constraints prüfen.
 
