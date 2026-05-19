@@ -340,7 +340,9 @@ Null-Coalescing `??`-Operator (`TK_NULLCOALESCE`), `as?`-Cast
 
 ---
 
-### WP-BC-15: Regex-Literale
+### WP-BC-15: Regex-Literale ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-15-regex-literals`, S2=S3 sha256 `50fef23a…`.
 
 **Ziel:** `r"pattern"` Regex-Literal als eigener Typ.
 
