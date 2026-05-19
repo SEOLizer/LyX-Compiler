@@ -5,6 +5,7 @@
 // WP-09 addition: import resolution (reads/parses/codegens imported .lyx files)
 
 import bootstrap.parser;
+import bootstrap.dwarf_gen;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -281,6 +282,11 @@ pub type Codegen = class {
   globalVarCount: int64;
   globalVarCap:   int64;
   globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
+
+  // WP-BC-25: DWARF debug info generation
+  debugMode:   int64;
+  srcFilePath: pchar;
+  srcFileLen:  int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -5012,6 +5018,11 @@ pub type Codegen = class {
     self.monoList  := mmap(0, self.monoCap * 32, 3, 34, -1, 0);
     self.monoCount := 0;
 
+    // WP-BC-25: DWARF debug info (off by default)
+    self.debugMode   := 0;
+    self.srcFilePath := 0 as pchar;
+    self.srcFileLen  := 0;
+
     // Per-local array flag (WP-10b)
     self.localIsArray := mmap(0, self.localCap, 3, 34, -1, 0);
 
@@ -5045,7 +5056,46 @@ pub type Codegen = class {
   fn WriteELF(path: pchar) {
     var totalCode: int64 := self.codeLen;
     var totalData: int64 := self.dataLen;
-    var fileSize:  int64 := CG_CODE_OFF + totalCode + totalData;
+    var baseSize:  int64 := CG_CODE_OFF + totalCode + totalData;
+
+    // WP-BC-25: allocate DwarfGen at function scope so it spans both debug blocks
+    var dg: DwarfGen := new DwarfGen();
+    dg.Init();
+
+    var abbrevSize: int64 := 0;
+    var infoSize:   int64 := 0;
+    var lineSize:   int64 := 0;
+    var strSize:    int64 := 0;
+    if (self.debugMode != 0) {
+      var li: int64 := 0;
+      while (li < self.labelCount) {
+        var lbase:  int64 := self.labels + li * CG_LABEL_SZ;
+        var lname:  pchar := peek64(lbase) as pchar;
+        var lnlen:  int64 := peek64(lbase + 8);
+        var lstart: int64 := peek64(lbase + 16);
+        var lend:   int64 := 0;
+        if (li + 1 < self.labelCount) {
+          lend := peek64(self.labels + (li + 1) * CG_LABEL_SZ + 16);
+        } else {
+          lend := totalCode;
+        }
+        dg.dw_addFunc(lname, lnlen, lstart, lend);
+        li := li + 1;
+      }
+      dg.dw_buildAbbrev();
+      dg.dw_buildInfo(self.srcFilePath, self.srcFileLen, totalCode);
+      dg.dw_buildLine(self.srcFilePath, self.srcFileLen);
+      abbrevSize := dg.abbrevLen;
+      infoSize   := dg.infoLen;
+      lineSize   := dg.lineLen;
+      strSize    := dg.strLen;
+    }
+
+    var shstrtabSize: int64 := 60;
+    var fileSize: int64 := baseSize;
+    if (self.debugMode != 0) {
+      fileSize := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize + 384;
+    }
 
     // Allocate ELF buffer
     var buf: int64 := mmap(0, fileSize, 3, 34, -1, 0);
@@ -5074,6 +5124,12 @@ pub type Codegen = class {
     poke16(buf + 58, 64);   // e_shentsize
     poke16(buf + 60, 0);    // e_shnum
     poke16(buf + 62, 0);    // e_shstrndx
+    if (self.debugMode != 0) {
+      var shoff: int64 := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize;
+      poke64(buf + 40, shoff);  // e_shoff
+      poke16(buf + 60, 6);      // e_shnum = 6
+      poke16(buf + 62, 5);      // e_shstrndx = 5
+    }
 
     // Program header (56 bytes at offset 64)
     var ph: int64 := buf + CG_PHDR_OFF;
@@ -5082,8 +5138,13 @@ pub type Codegen = class {
     poke64(ph + 8,  0);              // p_offset = 0 (map whole file)
     poke64(ph + 16, CG_ELF_BASE);   // p_vaddr
     poke64(ph + 24, CG_ELF_BASE);   // p_paddr
-    poke64(ph + 32, fileSize);       // p_filesz
-    poke64(ph + 40, fileSize);       // p_memsz
+    if (self.debugMode != 0) {
+      poke64(ph + 32, baseSize);     // p_filesz: load only code+data
+      poke64(ph + 40, baseSize);     // p_memsz
+    } else {
+      poke64(ph + 32, fileSize);     // p_filesz
+      poke64(ph + 40, fileSize);     // p_memsz
+    }
     poke64(ph + 48, 2097152);        // p_align = 0x200000
 
     // Copy code
@@ -5098,6 +5159,77 @@ pub type Codegen = class {
     while (i < totalData) {
       poke8(buf + CG_CODE_OFF + totalCode + i, peek8(self.data + i));
       i := i + 1;
+    }
+
+    // WP-BC-25: emit DWARF debug sections and section header table
+    if (self.debugMode != 0) {
+      var abbrevOff:   int64 := baseSize;
+      var infoOff:     int64 := abbrevOff + abbrevSize;
+      var lineOff:     int64 := infoOff   + infoSize;
+      var strOff:      int64 := lineOff   + lineSize;
+      var shstrtabOff: int64 := strOff    + strSize;
+
+      // Copy .debug_abbrev
+      i := 0;
+      while (i < abbrevSize) { poke8(buf+abbrevOff+i, peek8(dg.abbrevBuf+i)); i:=i+1; }
+      // Copy .debug_info
+      i := 0;
+      while (i < infoSize)   { poke8(buf+infoOff+i,   peek8(dg.infoBuf+i));   i:=i+1; }
+      // Copy .debug_line
+      i := 0;
+      while (i < lineSize)   { poke8(buf+lineOff+i,   peek8(dg.lineBuf+i));   i:=i+1; }
+      // Copy .debug_str
+      i := 0;
+      while (i < strSize)    { poke8(buf+strOff+i,    peek8(dg.strBuf+i));    i:=i+1; }
+
+      // Build .shstrtab (60 bytes)
+      // "\0.debug_abbrev\0.debug_info\0.debug_line\0.debug_str\0.shstrtab\0"
+      var ss: int64 := buf + shstrtabOff;
+      poke8(ss,0);
+      poke8(ss+1,46);poke8(ss+2,100);poke8(ss+3,101);poke8(ss+4,98);poke8(ss+5,117);
+      poke8(ss+6,103);poke8(ss+7,95);poke8(ss+8,97);poke8(ss+9,98);poke8(ss+10,98);
+      poke8(ss+11,114);poke8(ss+12,101);poke8(ss+13,118);poke8(ss+14,0);
+      poke8(ss+15,46);poke8(ss+16,100);poke8(ss+17,101);poke8(ss+18,98);poke8(ss+19,117);
+      poke8(ss+20,103);poke8(ss+21,95);poke8(ss+22,105);poke8(ss+23,110);poke8(ss+24,102);
+      poke8(ss+25,111);poke8(ss+26,0);
+      poke8(ss+27,46);poke8(ss+28,100);poke8(ss+29,101);poke8(ss+30,98);poke8(ss+31,117);
+      poke8(ss+32,103);poke8(ss+33,95);poke8(ss+34,108);poke8(ss+35,105);poke8(ss+36,110);
+      poke8(ss+37,101);poke8(ss+38,0);
+      poke8(ss+39,46);poke8(ss+40,100);poke8(ss+41,101);poke8(ss+42,98);poke8(ss+43,117);
+      poke8(ss+44,103);poke8(ss+45,95);poke8(ss+46,115);poke8(ss+47,116);poke8(ss+48,114);
+      poke8(ss+49,0);
+      poke8(ss+50,46);poke8(ss+51,115);poke8(ss+52,104);poke8(ss+53,115);poke8(ss+54,116);
+      poke8(ss+55,114);poke8(ss+56,116);poke8(ss+57,97);poke8(ss+58,98);poke8(ss+59,0);
+
+      // Section header table (6 × 64 bytes; [0]=NULL, already zero from mmap)
+      var sh0: int64 := buf + shstrtabOff + shstrtabSize;
+      var sh: int64 := 0;
+
+      // [1] .debug_abbrev: sh_name=1, SHT_PROGBITS
+      sh := sh0 + 64;
+      poke32(sh,1);  poke32(sh+4,1);
+      poke64(sh+24,abbrevOff); poke64(sh+32,abbrevSize); poke64(sh+48,1);
+
+      // [2] .debug_info: sh_name=15, SHT_PROGBITS
+      sh := sh0 + 128;
+      poke32(sh,15); poke32(sh+4,1);
+      poke64(sh+24,infoOff); poke64(sh+32,infoSize); poke64(sh+48,1);
+
+      // [3] .debug_line: sh_name=27, SHT_PROGBITS
+      sh := sh0 + 192;
+      poke32(sh,27); poke32(sh+4,1);
+      poke64(sh+24,lineOff); poke64(sh+32,lineSize); poke64(sh+48,1);
+
+      // [4] .debug_str: sh_name=39, SHT_PROGBITS, SHF_MERGE|SHF_STRINGS=0x30, entsize=1
+      sh := sh0 + 256;
+      poke32(sh,39); poke32(sh+4,1);
+      poke64(sh+8,48); poke64(sh+24,strOff); poke64(sh+32,strSize);
+      poke64(sh+48,1); poke64(sh+56,1);
+
+      // [5] .shstrtab: sh_name=50, SHT_STRTAB=3
+      sh := sh0 + 320;
+      poke32(sh,50); poke32(sh+4,3);
+      poke64(sh+24,shstrtabOff); poke64(sh+32,shstrtabSize); poke64(sh+48,1);
     }
 
     // Write ELF binary to file (O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0755 = 493)
