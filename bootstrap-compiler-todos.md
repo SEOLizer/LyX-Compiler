@@ -588,7 +588,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-28: MC/DC Coverage-Instrumentierung
+### WP-BC-28: MC/DC Coverage-Instrumentierung ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-28-mcdc-coverage`, Singularität `fa963e1b…`.
 
 **Ziel:** Modified Condition/Decision Coverage für Safety-kritischen Code.
 
