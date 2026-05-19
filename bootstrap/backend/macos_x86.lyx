@@ -1,0 +1,416 @@
+// bootstrap/backend/macos_x86.lyx
+// macOS x86_64 backend for the Lyx bootstrap compiler (WP-BC-31).
+// Generates Mach-O 64-bit executables for macOS x86_64 using BSD syscall numbers.
+// The ISA and ABI (System V AMD64) are identical to the Linux backend;
+// only the syscall numbers and binary output format (Mach-O vs ELF) differ.
+//
+// Strategy: after Codegen.Generate() produces a Linux x86_64 code buffer,
+// MacosX86Backend re-emits the helper stubs (offsets 0..286) with BSD syscall
+// numbers, then copies the user-function section unchanged (offsets 287+),
+// preserving all intra-buffer relative call addresses.
+
+// ============================================================================
+// BSD (macOS) Syscall Numbers  — all have the 0x2000000 kernel-call prefix
+// ============================================================================
+
+pub con MACOS_SYS_EXIT:   int64 := 0x2000001;
+pub con MACOS_SYS_READ:   int64 := 0x2000003;
+pub con MACOS_SYS_WRITE:  int64 := 0x2000004;
+pub con MACOS_SYS_OPEN:   int64 := 0x2000005;
+pub con MACOS_SYS_CLOSE:  int64 := 0x2000006;
+pub con MACOS_SYS_GETPID: int64 := 0x2000014;
+pub con MACOS_SYS_UNLINK: int64 := 0x200000A;
+pub con MACOS_SYS_RENAME: int64 := 0x2000080;
+pub con MACOS_SYS_MKDIR:  int64 := 0x2000088;
+pub con MACOS_SYS_RMDIR:  int64 := 0x2000089;
+pub con MACOS_SYS_MUNMAP: int64 := 0x2000049;
+pub con MACOS_SYS_MMAP:   int64 := 0x20000C5;
+pub con MACOS_SYS_LSEEK:  int64 := 0x20000C7;
+
+// ============================================================================
+// Mach-O 64 Format Constants
+// ============================================================================
+
+con MACOS_MH_MAGIC_64:         int64 := 0xFEEDFACF;
+con MACOS_CPU_TYPE_X86_64:     int64 := 0x01000007;
+con MACOS_CPU_SUBTYPE_X86_ALL: int64 := 3;
+con MACOS_MH_EXECUTE:          int64 := 2;
+con MACOS_MH_NOUNDEFS:         int64 := 1;
+con MACOS_MH_PIE:              int64 := 0x00200000;
+con MACOS_LC_SEGMENT_64:       int64 := 0x19;
+con MACOS_LC_MAIN:             int64 := 0x80000028;
+con MACOS_VM_PROT_NONE:        int64 := 0;
+con MACOS_VM_PROT_READ:        int64 := 1;
+con MACOS_VM_PROT_EXEC:        int64 := 4;
+con MACOS_S_ATTR_PURE_INSTR:   int64 := 0x80000000;
+con MACOS_TEXT_BASE:           int64 := 0x100000000;  // traditional macOS x86_64 base
+con MACOS_PAGE_SIZE:           int64 := 0x1000;       // 4 KB (x86_64)
+
+// Size of codegen_x86.lyx helper stubs — MUST match CG_H_USER in codegen_x86.lyx
+con MACOS_HELPERS_SZ: int64 := 287;
+
+// ============================================================================
+// MacosX86Backend
+// ============================================================================
+
+pub type MacosX86Backend = class {
+
+  // Patched code buffer (macOS helpers + copied user functions)
+  code:    int64;
+  codeLen: int64;
+  codeCap: int64;
+
+  // Output buffer for the final Mach-O binary
+  out:    int64;
+  outLen: int64;
+  outCap: int64;
+
+  // ------------------------------------------------------------------
+  // Code buffer helpers
+  // ------------------------------------------------------------------
+
+  fn mxb_cGrow(n: int64) {
+    if (self.codeCap >= self.codeLen + n) { return; }
+    var nc: int64 := self.codeCap * 2;
+    while (nc < self.codeLen + n) { nc := nc * 2; }
+    var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.codeLen) { poke8(nb + i, peek8(self.code + i)); i := i + 1; }
+    self.code    := nb;
+    self.codeCap := nc;
+  }
+
+  fn mxb_ce8(v: int64) {
+    self.mxb_cGrow(1);
+    poke8(self.code + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  fn mxb_ce32(v: int64) {
+    self.mxb_ce8(v & 0xFF);
+    self.mxb_ce8((v >> 8)  & 0xFF);
+    self.mxb_ce8((v >> 16) & 0xFF);
+    self.mxb_ce8((v >> 24) & 0xFF);
+  }
+
+  // ------------------------------------------------------------------
+  // Output buffer helpers
+  // ------------------------------------------------------------------
+
+  fn mxb_oGrow(n: int64) {
+    if (self.outCap >= self.outLen + n) { return; }
+    var nc: int64 := self.outCap * 2;
+    while (nc < self.outLen + n) { nc := nc * 2; }
+    var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.outLen) { poke8(nb + i, peek8(self.out + i)); i := i + 1; }
+    self.out    := nb;
+    self.outCap := nc;
+  }
+
+  fn mxb_oe8(v: int64) {
+    self.mxb_oGrow(1);
+    poke8(self.out + self.outLen, v & 0xFF);
+    self.outLen := self.outLen + 1;
+  }
+
+  fn mxb_oe32(v: int64) {
+    self.mxb_oe8(v & 0xFF);
+    self.mxb_oe8((v >> 8)  & 0xFF);
+    self.mxb_oe8((v >> 16) & 0xFF);
+    self.mxb_oe8((v >> 24) & 0xFF);
+  }
+
+  fn mxb_oe64(v: int64) {
+    self.mxb_oe32(v & 0xFFFFFFFF);
+    self.mxb_oe32((v >> 32) & 0xFFFFFFFF);
+  }
+
+  fn mxb_oZeros(n: int64) {
+    var i: int64 := 0;
+    while (i < n) { self.mxb_oe8(0); i := i + 1; }
+  }
+
+  // Write a NUL-padded 16-byte name field (segname / sectname in Mach-O)
+  fn mxb_oName16(s: pchar, sLen: int64) {
+    var i: int64 := 0;
+    while (i < 16) {
+      if (i < sLen) { self.mxb_oe8(StrCharAt(s, i)); } else { self.mxb_oe8(0); }
+      i := i + 1;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // macOS helper stubs
+  // All offsets and sizes must match CG_H_USER layout in codegen_x86.lyx.
+  // ------------------------------------------------------------------
+
+  // _start / entry (65 bytes, offset 0..64)
+  // LC_MAIN calls entry(argc, argv): argc already in rdi, argv in rsi.
+  // NOP-pad replaces the Linux prlimit64 block and the pop/mov setup.
+  fn mxb_emitStart(rel32: int64) {
+    var i: int64 := 0;
+    while (i < 48) { self.mxb_ce8(0x90); i := i + 1; }  // 48 NOPs
+    // offset 48: call main  E8 rel32
+    self.mxb_ce8(0xE8); self.mxb_ce32(rel32);
+    // offset 53: mov rdi, rax  (48 89 C7)
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xC7);
+    // offset 56: mov rax, MACOS_SYS_EXIT  (48 C7 C0 01 00 00 02)
+    self.mxb_ce8(0x48); self.mxb_ce8(0xC7); self.mxb_ce8(0xC0);
+    self.mxb_ce8(0x01); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02);
+    // offset 63: syscall  (0F 05)
+    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);
+    // 48+1+4+3+7+2 = 65 bytes
+  }
+
+  // _lyx_strlen (15 bytes, offset 65..79) — no syscalls, identical to Linux
+  fn mxb_emitStrlen() {
+    self.mxb_ce8(0x48); self.mxb_ce8(0x31); self.mxb_ce8(0xC0);        // xor rax, rax
+    self.mxb_ce8(0x80); self.mxb_ce8(0x3C); self.mxb_ce8(0x07); self.mxb_ce8(0x00); // cmp byte[rdi+rax], 0
+    self.mxb_ce8(0x74); self.mxb_ce8(0x05);                             // jz +5
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xC0);        // inc rax
+    self.mxb_ce8(0xEB); self.mxb_ce8(0xF5);                             // jmp -11
+    self.mxb_ce8(0xC3);                                                  // ret
+  }
+
+  // _lyx_print_str (26 bytes, offset 80..105) — MACOS_SYS_WRITE
+  fn mxb_emitPrintStr() {
+    self.mxb_ce8(0x57);                                                  // push rdi
+    self.mxb_ce8(0xE8); self.mxb_ce32(-21);                             // call strlen (next=86, target=65, rel=-21)
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xC2);        // mov rdx, rax
+    self.mxb_ce8(0x5F);                                                  // pop rdi
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xFE);        // mov rsi, rdi
+    self.mxb_ce8(0xBF); self.mxb_ce8(0x01); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov edi, 1
+    self.mxb_ce8(0xB8); self.mxb_ce8(0x04); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02); // mov eax, MACOS_SYS_WRITE
+    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);                             // syscall
+    self.mxb_ce8(0xC3);                                                  // ret
+  }
+
+  // _lyx_print_int (104 bytes, offset 106..209) — MACOS_SYS_WRITE
+  fn mxb_emitPrintInt() {
+    self.mxb_ce8(0x48); self.mxb_ce8(0x83); self.mxb_ce8(0xEC); self.mxb_ce8(0x18); // sub rsp, 24
+    self.mxb_ce8(0x48); self.mxb_ce8(0x8D); self.mxb_ce8(0x74); self.mxb_ce8(0x24); self.mxb_ce8(0x17); // lea rsi, [rsp+23]
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xF8);        // mov rax, rdi
+    self.mxb_ce8(0x48); self.mxb_ce8(0x85); self.mxb_ce8(0xC0);        // test rax, rax
+    self.mxb_ce8(0x75); self.mxb_ce8(0x08);                             // jnz +8
+    self.mxb_ce8(0xC6); self.mxb_ce8(0x06); self.mxb_ce8(0x30);        // mov byte[rsi], '0'
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xCE);        // dec rsi
+    self.mxb_ce8(0xEB); self.mxb_ce8(0x30);                             // jmp +48
+    self.mxb_ce8(0x48); self.mxb_ce8(0x85); self.mxb_ce8(0xC0);        // test rax, rax
+    self.mxb_ce8(0x7D); self.mxb_ce8(0x03);                             // jge +3
+    self.mxb_ce8(0x48); self.mxb_ce8(0xF7); self.mxb_ce8(0xD8);        // neg rax
+    self.mxb_ce8(0x48); self.mxb_ce8(0x85); self.mxb_ce8(0xC0);        // test rax, rax
+    self.mxb_ce8(0x74); self.mxb_ce8(0x18);                             // jz +24
+    self.mxb_ce8(0x48); self.mxb_ce8(0x31); self.mxb_ce8(0xD2);        // xor rdx, rdx
+    self.mxb_ce8(0x48); self.mxb_ce8(0xC7); self.mxb_ce8(0xC1); self.mxb_ce8(0x0A); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov rcx, 10
+    self.mxb_ce8(0x48); self.mxb_ce8(0xF7); self.mxb_ce8(0xF9);        // idiv rcx
+    self.mxb_ce8(0x48); self.mxb_ce8(0x83); self.mxb_ce8(0xC2); self.mxb_ce8(0x30); // add rdx, 48
+    self.mxb_ce8(0x88); self.mxb_ce8(0x16);                             // mov [rsi], dl
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xCE);        // dec rsi
+    self.mxb_ce8(0xEB); self.mxb_ce8(0xE3);                             // jmp -29
+    self.mxb_ce8(0x48); self.mxb_ce8(0x85); self.mxb_ce8(0xFF);        // test rdi, rdi
+    self.mxb_ce8(0x79); self.mxb_ce8(0x06);                             // jns +6
+    self.mxb_ce8(0xC6); self.mxb_ce8(0x06); self.mxb_ce8(0x2D);        // mov byte[rsi], '-'
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xCE);        // dec rsi
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xC6);        // inc rsi
+    self.mxb_ce8(0x48); self.mxb_ce8(0x8D); self.mxb_ce8(0x54); self.mxb_ce8(0x24); self.mxb_ce8(0x17); // lea rdx, [rsp+23]
+    self.mxb_ce8(0x48); self.mxb_ce8(0x29); self.mxb_ce8(0xF2);        // sub rdx, rsi
+    self.mxb_ce8(0x48); self.mxb_ce8(0xFF); self.mxb_ce8(0xC2);        // inc rdx
+    self.mxb_ce8(0xBF); self.mxb_ce8(0x01); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov edi, 1
+    self.mxb_ce8(0xB8); self.mxb_ce8(0x04); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02); // mov eax, MACOS_SYS_WRITE
+    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);                             // syscall
+    self.mxb_ce8(0x48); self.mxb_ce8(0x83); self.mxb_ce8(0xC4); self.mxb_ce8(0x18); // add rsp, 24
+    self.mxb_ce8(0xC3);                                                  // ret
+  }
+
+  // _lyx_strsub (71 bytes, offset 210..280) — MACOS_SYS_MMAP
+  fn mxb_emitStrSub() {
+    self.mxb_ce8(0x57);                                                  // push rdi
+    self.mxb_ce8(0x56);                                                  // push rsi
+    self.mxb_ce8(0x52);                                                  // push rdx
+    self.mxb_ce8(0x48); self.mxb_ce8(0xC7); self.mxb_ce8(0xC7); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov rdi, 0
+    self.mxb_ce8(0x48); self.mxb_ce8(0x8D); self.mxb_ce8(0x54); self.mxb_ce8(0x24); self.mxb_ce8(0x10); // lea rsi, [rsp+16]
+    self.mxb_ce8(0xBA); self.mxb_ce8(0x03); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov edx, 3
+    self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC2); self.mxb_ce8(0x22); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov r10, 34
+    self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC0); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); // mov r8, -1
+    self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC1); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov r9, 0
+    self.mxb_ce8(0xB8); self.mxb_ce8(0xC5); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02); // mov eax, MACOS_SYS_MMAP
+    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);                             // syscall
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0x44); self.mxb_ce8(0x24); self.mxb_ce8(0x18); // mov [rsp+24], rax
+    self.mxb_ce8(0x5A);                                                  // pop rcx
+    self.mxb_ce8(0x5E);                                                  // pop rsi
+    self.mxb_ce8(0x5F);                                                  // pop rdi
+    self.mxb_ce8(0x48); self.mxb_ce8(0x01); self.mxb_ce8(0xFE);        // add rsi, rdi
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xC7);        // mov rdi, rax
+    self.mxb_ce8(0xF3); self.mxb_ce8(0xA4);                             // rep movsb
+    self.mxb_ce8(0x48); self.mxb_ce8(0x01); self.mxb_ce8(0xC8);        // add rax, rcx
+    self.mxb_ce8(0xC6); self.mxb_ce8(0x00); self.mxb_ce8(0x00);        // mov byte[rax], 0
+    self.mxb_ce8(0xC3);                                                  // ret
+  }
+
+  // _lyx_strcharat (6 bytes, offset 281..286) — no syscalls, identical to Linux
+  fn mxb_emitStrCharAt() {
+    self.mxb_ce8(0x48); self.mxb_ce8(0x0F); self.mxb_ce8(0xB6); self.mxb_ce8(0x04); self.mxb_ce8(0x37); // movzx rax, byte[rdi+rsi]
+    self.mxb_ce8(0xC3);                                                  // ret
+  }
+
+  // ------------------------------------------------------------------
+  // Build the macOS code buffer from a Codegen-produced Linux buffer
+  // ------------------------------------------------------------------
+
+  fn mxb_buildCode(cgBuf: int64, cgLen: int64) {
+    // Extract call-main rel32 from Linux _start (patched at bytes 49..52)
+    var b0: int64 := peek8(cgBuf + 49);
+    var b1: int64 := peek8(cgBuf + 50);
+    var b2: int64 := peek8(cgBuf + 51);
+    var b3: int64 := peek8(cgBuf + 52);
+    var rel32: int64 := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+
+    // Emit macOS-patched helper stubs at identical offsets
+    self.mxb_emitStart(rel32);      // 0..64   (65 bytes)
+    self.mxb_emitStrlen();          // 65..79  (15 bytes)
+    self.mxb_emitPrintStr();        // 80..105 (26 bytes)
+    self.mxb_emitPrintInt();        // 106..209 (104 bytes)
+    self.mxb_emitStrSub();          // 210..280 (71 bytes)
+    self.mxb_emitStrCharAt();       // 281..286 (6 bytes)
+    // Total: 65+15+26+104+71+6 = 287 = MACOS_HELPERS_SZ ✓
+
+    // Copy user functions verbatim — all relative addresses remain valid
+    var i: int64 := MACOS_HELPERS_SZ;
+    while (i < cgLen) {
+      self.mxb_ce8(peek8(cgBuf + i));
+      i := i + 1;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Write Mach-O 64 binary to disk
+  // ------------------------------------------------------------------
+  // File layout:
+  //   [0 .. H-1]         Mach-O header + load commands    (H = 280 bytes)
+  //   [H .. P-1]         zero padding to page boundary    (P = 4096)
+  //   [P .. P+code-1]    code section                     (= self.codeLen)
+  //
+  // Virtual memory:
+  //   __PAGEZERO  [0x0 .. 0x100000000)          (4 GB, no file backing)
+  //   __TEXT      [0x100000000 .. +P+code)       (backed by file from offset 0)
+  //     __text    [0x100001000 .. +code)          (the actual instructions)
+  //
+  // LC_MAIN entryoff = P  (byte offset within file to _start at code[0])
+
+  fn mxb_writeMachO(path: pchar) {
+    var codeSize: int64 := self.codeLen;
+
+    // Load-command sizes
+    var segPZSize:   int64 := 72;          // LC_SEGMENT_64 __PAGEZERO (no sections)
+    var segTextSize: int64 := 152;         // LC_SEGMENT_64 __TEXT + 1 section (72+80)
+    var lcMainSize:  int64 := 24;          // LC_MAIN
+    var numCmds:     int64 := 3;
+    var totalCmdSz:  int64 := segPZSize + segTextSize + lcMainSize;  // 248
+    var H:           int64 := 32 + totalCmdSz;                       // 280
+
+    // Page-align to get code offset P
+    var P: int64 := (H + MACOS_PAGE_SIZE - 1) & ~(MACOS_PAGE_SIZE - 1);  // 4096
+
+    var textVMSz: int64 := P + codeSize;
+
+    // ---- Mach-O header (32 bytes) ----
+    self.mxb_oe32(MACOS_MH_MAGIC_64);
+    self.mxb_oe32(MACOS_CPU_TYPE_X86_64);
+    self.mxb_oe32(MACOS_CPU_SUBTYPE_X86_ALL);
+    self.mxb_oe32(MACOS_MH_EXECUTE);
+    self.mxb_oe32(numCmds);
+    self.mxb_oe32(totalCmdSz);
+    self.mxb_oe32(MACOS_MH_NOUNDEFS | MACOS_MH_PIE);
+    self.mxb_oe32(0);  // reserved
+
+    // ---- LC_SEGMENT_64 __PAGEZERO (72 bytes) ----
+    self.mxb_oe32(MACOS_LC_SEGMENT_64);
+    self.mxb_oe32(72);
+    self.mxb_oName16("__PAGEZERO"c, 10);
+    self.mxb_oe64(0);                  // vmaddr = 0
+    self.mxb_oe64(MACOS_TEXT_BASE);    // vmsize = 4 GB
+    self.mxb_oe64(0);                  // fileoff = 0
+    self.mxb_oe64(0);                  // filesize = 0 (not backed)
+    self.mxb_oe32(MACOS_VM_PROT_NONE);
+    self.mxb_oe32(MACOS_VM_PROT_NONE);
+    self.mxb_oe32(0);                  // nsects = 0
+    self.mxb_oe32(0);                  // flags
+
+    // ---- LC_SEGMENT_64 __TEXT (72 + 80 = 152 bytes) ----
+    self.mxb_oe32(MACOS_LC_SEGMENT_64);
+    self.mxb_oe32(152);
+    self.mxb_oName16("__TEXT"c, 6);
+    self.mxb_oe64(MACOS_TEXT_BASE);    // vmaddr = 0x100000000
+    self.mxb_oe64(textVMSz);           // vmsize = P + code
+    self.mxb_oe64(0);                  // fileoff = 0 (segment covers whole file)
+    self.mxb_oe64(textVMSz);           // filesize
+    self.mxb_oe32(MACOS_VM_PROT_READ | MACOS_VM_PROT_EXEC);
+    self.mxb_oe32(MACOS_VM_PROT_READ | MACOS_VM_PROT_EXEC);
+    self.mxb_oe32(1);                  // nsects = 1
+    self.mxb_oe32(0);                  // flags
+
+    // Section64 __text (80 bytes)
+    self.mxb_oName16("__text"c, 6);             // sectname
+    self.mxb_oName16("__TEXT"c, 6);             // segname
+    self.mxb_oe64(MACOS_TEXT_BASE + P);          // addr = base + P
+    self.mxb_oe64(codeSize);                     // size
+    self.mxb_oe32(P);                            // offset in file
+    self.mxb_oe32(4);                            // align = 2^4 = 16
+    self.mxb_oe32(0);                            // reloff
+    self.mxb_oe32(0);                            // nreloc
+    self.mxb_oe32(MACOS_S_ATTR_PURE_INSTR);      // flags
+    self.mxb_oe32(0); self.mxb_oe32(0); self.mxb_oe32(0);  // reserved1/2/3
+
+    // ---- LC_MAIN (24 bytes) ----
+    self.mxb_oe32(MACOS_LC_MAIN);
+    self.mxb_oe32(24);
+    self.mxb_oe64(P);    // entryoff = file offset of _start = P
+    self.mxb_oe64(0);    // stacksize = 0 (use default)
+
+    // ---- Pad header region to page boundary ----
+    var pad: int64 := P - self.outLen;
+    self.mxb_oZeros(pad);
+
+    // ---- Code section ----
+    var i: int64 := 0;
+    while (i < self.codeLen) {
+      self.mxb_oe8(peek8(self.code + i));
+      i := i + 1;
+    }
+
+    // ---- Write to file (O_WRONLY|O_CREAT|O_TRUNC=577, mode 0755=493) ----
+    var fd: int64 := open(path, 577, 493);
+    if (fd < 0) {
+      EPrintStr("error: cannot write output: "c);
+      EPrintStrLn(path);
+      return;
+    }
+    write(fd, self.out as pchar, self.outLen);
+    close(fd);
+  }
+
+  // ------------------------------------------------------------------
+  // Public API
+  // ------------------------------------------------------------------
+
+  pub fn Build(cgBuf: int64, cgLen: int64) {
+    self.mxb_buildCode(cgBuf, cgLen);
+  }
+
+  pub fn WriteMachO(path: pchar) {
+    self.mxb_writeMachO(path);
+  }
+
+  pub fn GetCodeSize(): int64 { return self.codeLen; }
+
+  pub fn Init() {
+    self.codeCap := 65536;
+    self.code    := mmap(0, self.codeCap, 3, 34, -1, 0);
+    self.codeLen := 0;
+    self.outCap  := 65536;
+    self.out     := mmap(0, self.outCap, 3, 34, -1, 0);
+    self.outLen  := 0;
+  }
+
+};
