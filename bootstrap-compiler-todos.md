@@ -182,7 +182,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-07: `assert` und `check`-Statements
+### WP-BC-07: `assert` und `check`-Statements ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-07-assert-sema`, Singularität bestätigt.
 
 **Ziel:** `assert(cond)` und `check(expr)` als Sprachkonstrukte.
 
@@ -198,7 +200,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-08: `dispose`-Statement
+### WP-BC-08: `dispose`-Statement ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-08-dispose`, Singularität bestätigt.
 
 **Ziel:** `dispose obj` für manuelle Klassen-Objekt-Freigabe.
 
@@ -214,7 +218,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-09: `pool`-Statement
+### WP-BC-09: `pool`-Statement ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-09-pool`, S2=S3 sha256 `9183bfdb…`.
 
 **Ziel:** `pool { ... }` für scoped Pool-Allokationen.
 
@@ -229,7 +235,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-10: `panic`-Ausdruck
+### WP-BC-10: `panic`-Ausdruck ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-10-panic`, S2=S3 sha256 `7cb895ec…`.
 
 **Ziel:** `panic("message")` als Expressions-Statement.
 
@@ -244,7 +252,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-11: `match`-Statement Verbesserungen
+### WP-BC-11: `match`-Statement Verbesserungen ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-11-match-improvements`, S2=S3 sha256 `5ed83bdc…`.
 
 **Ziel:** Vollständige Pattern-Matching-Semantik wie in S0.
 
@@ -268,7 +278,9 @@ merge-stores. Fehlend: das Entfernen von Code, der nach einem unbedingten
 
 ---
 
-### WP-BC-12: `for`-Schleife (Range-basiert)
+### WP-BC-12: `for`-Schleife (Range-basiert) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-12-for-range`, S2=S3 sha256 `48a6bbc5…`.
 
 **Ziel:** `for i := 0 to n { }` und `for i := n downto 0 { }` vollständig
 implementieren.
