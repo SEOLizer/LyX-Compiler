@@ -1,0 +1,550 @@
+// bootstrap/c_header_parser.lyx
+// C header file parser for FFI (WP-BC-30).
+// Reads a .h file, extracts function prototypes, and emits Lyx extern fn declarations.
+//
+// Handles:
+//   - C type → Lyx type mapping (int/long/char* → int64/pchar etc.)
+//   - Skips #preprocessor directives, block/line comments, typedefs, structs
+//   - Outputs: extern fn name(params): rettype;
+//
+// Usage: invoked via --include header.h flag in lyxc
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// Inline length-limited string match: does ctype start with literal of given length?
+fn chp_startsWith(ctype: pchar, lit: pchar, litLen: int64): int64 {
+  var i: int64 := 0;
+  while (i < litLen) {
+    if (StrCharAt(ctype, i) != StrCharAt(lit, i)) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// ============================================================================
+// C → Lyx type mapping
+// ============================================================================
+
+fn chp_mapType(ctype: pchar, ctypeLen: int64): pchar {
+  // void
+  if ctypeLen == 4 && chp_startsWith(ctype, "void"c, 4) != 0 { return "void"c; }
+  // char * → pchar
+  if ctypeLen == 5 && chp_startsWith(ctype, "char*"c, 5) != 0 { return "pchar"c; }
+  if ctypeLen == 6 && chp_startsWith(ctype, "char *"c, 6) != 0 { return "pchar"c; }
+  if ctypeLen == 11 && chp_startsWith(ctype, "const char*"c, 11) != 0 { return "pchar"c; }
+  if ctypeLen == 12 && chp_startsWith(ctype, "const char *"c, 12) != 0 { return "pchar"c; }
+  // void * → int64
+  if ctypeLen == 5 && chp_startsWith(ctype, "void*"c, 5) != 0 { return "int64"c; }
+  if ctypeLen == 6 && chp_startsWith(ctype, "void *"c, 6) != 0 { return "int64"c; }
+  // int variants → int64
+  if ctypeLen == 3 && chp_startsWith(ctype, "int"c, 3) != 0 { return "int64"c; }
+  if ctypeLen == 12 && chp_startsWith(ctype, "unsigned int"c, 12) != 0 { return "int64"c; }
+  if ctypeLen == 10 && chp_startsWith(ctype, "signed int"c, 10) != 0 { return "int64"c; }
+  if ctypeLen == 7 && chp_startsWith(ctype, "int32_t"c, 7) != 0 { return "int64"c; }
+  if ctypeLen == 8 && chp_startsWith(ctype, "uint32_t"c, 8) != 0 { return "int64"c; }
+  if ctypeLen == 7 && chp_startsWith(ctype, "int16_t"c, 7) != 0 { return "int64"c; }
+  if ctypeLen == 8 && chp_startsWith(ctype, "uint16_t"c, 8) != 0 { return "int64"c; }
+  if ctypeLen == 6 && chp_startsWith(ctype, "int8_t"c, 6) != 0 { return "int64"c; }
+  if ctypeLen == 7 && chp_startsWith(ctype, "uint8_t"c, 7) != 0 { return "int64"c; }
+  // long variants → int64
+  if ctypeLen == 4 && chp_startsWith(ctype, "long"c, 4) != 0 { return "int64"c; }
+  if ctypeLen == 8 && chp_startsWith(ctype, "long int"c, 8) != 0 { return "int64"c; }
+  if ctypeLen == 13 && chp_startsWith(ctype, "unsigned long"c, 13) != 0 { return "int64"c; }
+  if ctypeLen == 9 && chp_startsWith(ctype, "long long"c, 9) != 0 { return "int64"c; }
+  if ctypeLen == 7 && chp_startsWith(ctype, "int64_t"c, 7) != 0 { return "int64"c; }
+  if ctypeLen == 8 && chp_startsWith(ctype, "uint64_t"c, 8) != 0 { return "int64"c; }
+  if ctypeLen == 6 && chp_startsWith(ctype, "size_t"c, 6) != 0 { return "int64"c; }
+  if ctypeLen == 7 && chp_startsWith(ctype, "ssize_t"c, 7) != 0 { return "int64"c; }
+  if ctypeLen == 9 && chp_startsWith(ctype, "ptrdiff_t"c, 9) != 0 { return "int64"c; }
+  if ctypeLen == 8 && chp_startsWith(ctype, "intptr_t"c, 8) != 0 { return "int64"c; }
+  if ctypeLen == 9 && chp_startsWith(ctype, "uintptr_t"c, 9) != 0 { return "int64"c; }
+  // short → int64
+  if ctypeLen == 5 && chp_startsWith(ctype, "short"c, 5) != 0 { return "int64"c; }
+  if ctypeLen == 14 && chp_startsWith(ctype, "unsigned short"c, 14) != 0 { return "int64"c; }
+  // char (not pointer) → int64
+  if ctypeLen == 4 && chp_startsWith(ctype, "char"c, 4) != 0 { return "int64"c; }
+  if ctypeLen == 13 && chp_startsWith(ctype, "unsigned char"c, 13) != 0 { return "int64"c; }
+  if ctypeLen == 11 && chp_startsWith(ctype, "signed char"c, 11) != 0 { return "int64"c; }
+  // float/double → f64
+  if ctypeLen == 5 && chp_startsWith(ctype, "float"c, 5) != 0 { return "f64"c; }
+  if ctypeLen == 6 && chp_startsWith(ctype, "double"c, 6) != 0 { return "f64"c; }
+  // bool/_Bool → bool
+  if ctypeLen == 4 && chp_startsWith(ctype, "bool"c, 4) != 0 { return "bool"c; }
+  if ctypeLen == 5 && chp_startsWith(ctype, "_Bool"c, 5) != 0 { return "bool"c; }
+  // pointer to unknown → int64
+  if ctypeLen > 0 && peek8(ctype as int64 + ctypeLen - 1) == 42 { return "int64"c; }
+  return "int64"c;
+}
+
+// ============================================================================
+// CHeaderParser class
+// ============================================================================
+
+pub type CHeaderParser = class {
+
+  src:    pchar;  // full file content
+  srcLen: int64;
+  pos:    int64;  // current scan position
+  funcCount: int64;
+
+  // Scratch buffers (allocated in Init)
+  tokBuf:  int64;  // general token scratch: 256 bytes
+  typeBuf: int64;  // C type accumulation: 512 bytes
+
+  // ----------------------------------------------------------------
+  // Character helpers
+  // ----------------------------------------------------------------
+
+  fn chp_cur(): int64   { return peek8(self.src as int64 + self.pos); }
+  fn chp_at(i: int64): int64 { return peek8(self.src as int64 + i); }
+  fn chp_done(): int64  { if (self.pos >= self.srcLen) { return 1; } return 0; }
+
+  fn chp_isAlpha(c: int64): int64 {
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c == 95) { return 1; }  // underscore
+    return 0;
+  }
+
+  fn chp_isAlnum(c: int64): int64 {
+    if (self.chp_isAlpha(c) != 0) { return 1; }
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+  }
+
+  fn chp_isSpace(c: int64): int64 {
+    if (c == 32 || c == 9 || c == 13) { return 1; }
+    return 0;
+  }
+
+  // ----------------------------------------------------------------
+  // Skip helpers
+  // ----------------------------------------------------------------
+
+  fn chp_skipSpaces() {
+    while (self.chp_done() == 0 && self.chp_isSpace(self.chp_cur()) != 0) {
+      self.pos := self.pos + 1;
+    }
+  }
+
+  fn chp_skipLine() {
+    while (self.chp_done() == 0 && self.chp_cur() != 10) {
+      self.pos := self.pos + 1;
+    }
+    if (self.chp_done() == 0) { self.pos := self.pos + 1; }
+  }
+
+  fn chp_skipBlockComment() {
+    // We're past the opening '/*'
+    while (self.chp_done() == 0) {
+      if (self.chp_cur() == 42 && self.pos + 1 < self.srcLen && self.chp_at(self.pos+1) == 47) {
+        self.pos := self.pos + 2;
+        return;
+      }
+      self.pos := self.pos + 1;
+    }
+  }
+
+  fn chp_skipLineComment() {
+    self.chp_skipLine();
+  }
+
+  // ----------------------------------------------------------------
+  // Read an identifier/token into tokBuf; returns length
+  // ----------------------------------------------------------------
+
+  fn chp_readIdent(): int64 {
+    var start: int64 := self.pos;
+    while (self.chp_done() == 0 && self.chp_isAlnum(self.chp_cur()) != 0) {
+      self.pos := self.pos + 1;
+    }
+    var len: int64 := self.pos - start;
+    if (len > 255) { len := 255; }
+    var k: int64 := 0;
+    while (k < len) {
+      poke8(self.tokBuf + k, self.chp_at(start + k));
+      k := k + 1;
+    }
+    poke8(self.tokBuf + len, 0);
+    return len;
+  }
+
+  // ----------------------------------------------------------------
+  // Print a null-terminated pchar
+  // ----------------------------------------------------------------
+
+  fn chp_print(s: pchar) {
+    PrintStr(s);
+  }
+
+  fn chp_printN(p: pchar, n: int64) {
+    var tmp: int64 := mmap(0, n + 2, 3, 34, -1, 0);
+    var k: int64 := 0;
+    while (k < n) { poke8(tmp + k, StrCharAt(p, k)); k := k + 1; }
+    poke8(tmp + n, 0);
+    PrintStr(tmp as pchar);
+  }
+
+  // ----------------------------------------------------------------
+  // Parse one C function prototype starting at current pos.
+  // Returns 1 if successfully parsed and emitted, 0 if not a fn proto.
+  // Pre-condition: pos is at start of return type.
+  // ----------------------------------------------------------------
+
+  fn chp_tryParseFunc(retTypePtr: pchar, retTypeLen: int64): int64 {
+    // Skip spaces
+    self.chp_skipSpaces();
+    if (self.chp_done() != 0) { return 0; }
+
+    // Check for pointer modifier '*'
+    var retLyxType: pchar := chp_mapType(retTypePtr, retTypeLen);
+
+    // Read function name (or pointer indicator)
+    var c: int64 := self.chp_cur();
+
+    // Handle pointer return: `type * funcname(`
+    if (c == 42) {
+      // Return type is pointer — already handled by mapType seeing '*' suffix
+      self.pos := self.pos + 1;
+      self.chp_skipSpaces();
+      // Rebuild retType as "type*"
+      var ptmp: int64 := mmap(0, retTypeLen + 3, 3, 34, -1, 0);
+      var k: int64 := 0;
+      while (k < retTypeLen) { poke8(ptmp + k, StrCharAt(retTypePtr, k)); k := k + 1; }
+      poke8(ptmp + retTypeLen, 42);  // '*'
+      poke8(ptmp + retTypeLen + 1, 0);
+      retLyxType := chp_mapType(ptmp as pchar, retTypeLen + 1);
+    }
+
+    if (self.chp_isAlpha(self.chp_cur()) == 0) { return 0; }
+
+    var nameStart: int64 := self.pos;
+    var nameLen: int64   := self.chp_readIdent();
+    var namePtrTmp: int64 := self.tokBuf;
+
+    // Copy name to a stable buffer
+    var nameBuf: int64 := mmap(0, nameLen + 2, 3, 34, -1, 0);
+    var k: int64 := 0;
+    while (k < nameLen) { poke8(nameBuf + k, peek8(namePtrTmp + k)); k := k + 1; }
+    poke8(nameBuf + nameLen, 0);
+
+    self.chp_skipSpaces();
+    if (self.chp_done() != 0 || self.chp_cur() != 40) { return 0; }  // expect '('
+    self.pos := self.pos + 1;  // consume '('
+
+    // Parse parameter list
+    // Collect params as "name: type" pairs separated by ','
+    var paramBuf: int64 := mmap(0, 1024, 3, 34, -1, 0);
+    var paramLen: int64 := 0;
+    var paramCount: int64 := 0;
+
+    var done: int64 := 0;
+    while (done == 0 && self.chp_done() == 0) {
+      self.chp_skipSpaces();
+      var pc: int64 := self.chp_cur();
+
+      // End of params
+      if (pc == 41) { self.pos := self.pos + 1; done := 1; }
+
+      // Variadic '...'
+      else if (pc == 46 && self.pos+2 < self.srcLen &&
+               self.chp_at(self.pos+1) == 46 && self.chp_at(self.pos+2) == 46) {
+        // Skip variadic — emit nothing for now, just consume
+        self.pos := self.pos + 3;
+        self.chp_skipSpaces();
+        if (self.chp_done() == 0 && self.chp_cur() == 41) {
+          self.pos := self.pos + 1;
+        }
+        done := 1;
+
+      } else if (self.chp_isAlpha(pc) != 0) {
+        // Read C type tokens until we hit the param name or ',' or ')'
+        // Simple strategy: read tokens; last ident before ',' or ')' is the name,
+        // everything before it is the type.
+        var toks: int64  := mmap(0, 512, 3, 34, -1, 0);
+        var toksLen: int64 := 0;
+        var lastName: int64  := mmap(0, 128, 3, 34, -1, 0);
+        var lastNameLen: int64 := 0;
+
+        // Read until ',' or ')'
+        var pDone: int64 := 0;
+        while (pDone == 0 && self.chp_done() == 0) {
+          self.chp_skipSpaces();
+          var pcc: int64 := self.chp_cur();
+          if (pcc == 44 || pcc == 41) { pDone := 1; }
+          else if (pcc == 42) {
+            // pointer '*'
+            if (toksLen < 511) { poke8(toks + toksLen, 42); toksLen := toksLen + 1; }
+            self.pos := self.pos + 1;
+          } else if (self.chp_isAlpha(pcc) != 0) {
+            var tl: int64 := self.chp_readIdent();
+            // Save as last ident (potential param name)
+            var m: int64 := 0;
+            while (m < tl) { poke8(lastName + m, peek8(self.tokBuf + m)); m := m + 1; }
+            poke8(lastName + tl, 0);
+            lastNameLen := tl;
+            // Also append to type buffer
+            if (toksLen > 0) { poke8(toks + toksLen, 32); toksLen := toksLen + 1; }
+            m := 0;
+            while (m < tl && toksLen < 510) {
+              poke8(toks + toksLen, peek8(self.tokBuf + m));
+              toksLen := toksLen + 1;
+              m := m + 1;
+            }
+          } else {
+            self.pos := self.pos + 1;
+          }
+        }
+        poke8(toks + toksLen, 0);
+
+        // The last ident in toks is the param name; everything else is the type.
+        // Find the type: remove last ident from toks.
+        var ptype: pchar := 0 as pchar;
+        var ptypeLen: int64 := 0;
+        if (lastNameLen > 0 && toksLen > lastNameLen) {
+          // Type is toks minus trailing " lastIdent"
+          ptypeLen := toksLen - lastNameLen;
+          // Strip trailing space from type
+          while (ptypeLen > 0 && peek8(toks + ptypeLen - 1) == 32) { ptypeLen := ptypeLen - 1; }
+          ptype := toks as pchar;
+        } else {
+          // Only one token: it IS the type with an auto name
+          ptype := toks as pchar;
+          ptypeLen := toksLen;
+          // Use auto-generated name
+          poke8(lastName,   112);  // 'p'
+          poke8(lastName+1, 48 + paramCount);  // '0'-'9'
+          poke8(lastName+2, 0);
+          lastNameLen := 2;
+        }
+
+        var lyxPtype: pchar := chp_mapType(ptype, ptypeLen);
+
+        // Append to paramBuf: "name: type"
+        if (paramCount > 0 && paramLen < 1020) {
+          poke8(paramBuf + paramLen, 44); paramLen := paramLen + 1;
+          poke8(paramBuf + paramLen, 32); paramLen := paramLen + 1;
+        }
+        // write name
+        var m2: int64 := 0;
+        while (m2 < lastNameLen && paramLen < 1000) {
+          poke8(paramBuf + paramLen, peek8(lastName + m2));
+          paramLen := paramLen + 1;
+          m2 := m2 + 1;
+        }
+        // write ": type"
+        poke8(paramBuf + paramLen, 58);  paramLen := paramLen + 1;  // ':'
+        poke8(paramBuf + paramLen, 32);  paramLen := paramLen + 1;  // ' '
+        var lpt: pchar := lyxPtype;
+        var lptLen: int64 := StrLen(lpt);
+        var m3: int64 := 0;
+        while (m3 < lptLen && paramLen < 1010) {
+          poke8(paramBuf + paramLen, StrCharAt(lpt, m3));
+          paramLen := paramLen + 1;
+          m3 := m3 + 1;
+        }
+        paramCount := paramCount + 1;
+
+        // Consume ',' if present
+        self.chp_skipSpaces();
+        if (self.chp_done() == 0 && self.chp_cur() == 44) {
+          self.pos := self.pos + 1;
+        }
+        if (self.chp_done() == 0 && self.chp_cur() == 41) {
+          self.pos := self.pos + 1;
+          done := 1;
+        }
+      } else {
+        self.pos := self.pos + 1;
+      }
+    }
+    poke8(paramBuf + paramLen, 0);
+
+    // Skip to ';' or '{' — must find ';' for a prototype (not a definition)
+    self.chp_skipSpaces();
+    if (self.chp_done() != 0) { return 0; }
+    var sc: int64 := self.chp_cur();
+    if (sc == 59) {
+      // It's a prototype — emit!
+      self.pos := self.pos + 1;
+      PrintStr("extern fn "c);
+      PrintStr(nameBuf as pchar);
+      PrintStr("("c);
+      PrintStr(paramBuf as pchar);
+      PrintStr("): "c);
+      PrintStr(retLyxType);
+      PrintStr(";\n"c);
+      self.funcCount := self.funcCount + 1;
+      return 1;
+    }
+    // It's a definition ('{') — skip it
+    return 0;
+  }
+
+  // ----------------------------------------------------------------
+  // Main scan loop
+  // ----------------------------------------------------------------
+
+  pub fn Parse() {
+    self.funcCount := 0;
+    while (self.chp_done() == 0) {
+      self.chp_skipSpaces();
+      if (self.chp_done() != 0) { return; }
+
+      var c: int64 := self.chp_cur();
+
+      // Newline
+      if (c == 10) { self.pos := self.pos + 1; }
+
+      // Preprocessor directive: skip whole line
+      else if (c == 35) { self.chp_skipLine(); }
+
+      // Line comment
+      else if (c == 47 && self.pos+1 < self.srcLen && self.chp_at(self.pos+1) == 47) {
+        self.pos := self.pos + 2;
+        self.chp_skipLineComment();
+      }
+
+      // Block comment
+      else if (c == 47 && self.pos+1 < self.srcLen && self.chp_at(self.pos+1) == 42) {
+        self.pos := self.pos + 2;
+        self.chp_skipBlockComment();
+      }
+
+      // Identifier — could be a type keyword starting a function declaration
+      else if (self.chp_isAlpha(c) != 0) {
+        var mark: int64 := self.pos;
+        var tl: int64   := self.chp_readIdent();
+
+        // Skip known non-type keywords: typedef, struct, enum, union, extern, static,
+        // inline, __attribute__, __extension__
+        var kw: pchar := self.tokBuf as pchar;
+        var skip: int64 := 0;
+        if (tl == 7  && chp_startsWith(kw, "typedef"c, 7) != 0)      { skip := 1; }
+        if (tl == 6  && chp_startsWith(kw, "struct"c, 6) != 0)        { skip := 1; }
+        if (tl == 5  && chp_startsWith(kw, "union"c, 5) != 0)         { skip := 1; }
+        if (tl == 4  && chp_startsWith(kw, "enum"c, 4) != 0)          { skip := 1; }
+        if (tl == 6  && chp_startsWith(kw, "static"c, 6) != 0)        { skip := 1; }
+        if (tl == 6  && chp_startsWith(kw, "inline"c, 6) != 0)        { skip := 1; }
+        if (tl == 13 && chp_startsWith(kw, "__attribute__"c, 13) != 0){ skip := 1; }
+        if (tl == 13 && chp_startsWith(kw, "__extension__"c, 13) != 0){ skip := 1; }
+        if (tl == 10 && chp_startsWith(kw, "__inline__"c, 10) != 0)   { skip := 1; }
+        if (tl == 5  && chp_startsWith(kw, "const"c, 5) != 0)         { skip := 1; }
+
+        if (skip != 0) {
+          // Skip to end of statement (';') or end of block (matching '{...}')
+          var depth: int64 := 0;
+          var sdone: int64 := 0;
+          while (sdone == 0 && self.chp_done() == 0) {
+            var sc: int64 := self.chp_cur();
+            if (sc == 123) { depth := depth + 1; self.pos := self.pos + 1; }
+            else if (sc == 125) {
+              if (depth > 0) { depth := depth - 1; }
+              self.pos := self.pos + 1;
+              if (depth == 0) { sdone := 1; }
+            }
+            else if (sc == 59 && depth == 0) { self.pos := self.pos + 1; sdone := 1; }
+            else if (sc == 10 && depth == 0) { sdone := 1; }
+            else { self.pos := self.pos + 1; }
+          }
+        } else {
+          // This could be a return type — try to parse a function prototype
+          // The first ident is part of the return type; may continue with spaces or '*'
+          // Copy first token to typeBuf
+          var k: int64 := 0;
+          while (k < tl) { poke8(self.typeBuf + k, peek8(self.tokBuf + k)); k := k + 1; }
+          var typeLen: int64 := tl;
+
+          // Check for 'extern' prefix — skip it, continue with next ident
+          if (tl == 6 && chp_startsWith(self.typeBuf as pchar, "extern"c, 6) != 0) {
+            self.chp_skipSpaces();
+            typeLen := self.chp_readIdent();
+            k := 0;
+            while (k < typeLen) { poke8(self.typeBuf + k, peek8(self.tokBuf + k)); k := k + 1; }
+          }
+
+          // Consume optional spaces and '*'
+          self.chp_skipSpaces();
+          if (self.chp_done() == 0 && self.chp_cur() == 42) {
+            if (typeLen < 510) {
+              poke8(self.typeBuf + typeLen, 42);
+              typeLen := typeLen + 1;
+            }
+            self.pos := self.pos + 1;
+            self.chp_skipSpaces();
+          }
+
+          // Consume multi-word types: "unsigned int", "long long", "long int", etc.
+          if (self.chp_done() == 0 && self.chp_isAlpha(self.chp_cur()) != 0) {
+            var peekMark: int64 := self.pos;
+            var tl2: int64 := self.chp_readIdent();
+            var kw2: pchar := self.tokBuf as pchar;
+            // If next ident is also a type keyword, merge; else it might be the name
+            var isMod: int64 := 0;
+            if (tl2 == 3 && chp_startsWith(kw2, "int"c, 3) != 0)    { isMod := 1; }
+            if (tl2 == 4 && chp_startsWith(kw2, "long"c, 4) != 0)   { isMod := 1; }
+            if (tl2 == 4 && chp_startsWith(kw2, "char"c, 4) != 0)   { isMod := 1; }
+            if (tl2 == 5 && chp_startsWith(kw2, "short"c, 5) != 0)  { isMod := 1; }
+            if (tl2 == 6 && chp_startsWith(kw2, "double"c, 6) != 0) { isMod := 1; }
+
+            if (isMod != 0) {
+              if (typeLen < 509) {
+                poke8(self.typeBuf + typeLen, 32);
+                typeLen := typeLen + 1;
+                var m: int64 := 0;
+                while (m < tl2 && typeLen < 510) {
+                  poke8(self.typeBuf + typeLen, peek8(self.tokBuf + m));
+                  typeLen := typeLen + 1;
+                  m := m + 1;
+                }
+              }
+              // Check for '*' after multi-word type
+              self.chp_skipSpaces();
+              if (self.chp_done() == 0 && self.chp_cur() == 42) {
+                poke8(self.typeBuf + typeLen, 42); typeLen := typeLen + 1;
+                self.pos := self.pos + 1;
+                self.chp_skipSpaces();
+              }
+            } else {
+              // Not a type modifier — put back
+              self.pos := peekMark;
+            }
+          }
+          poke8(self.typeBuf + typeLen, 0);
+
+          self.chp_tryParseFunc(self.typeBuf as pchar, typeLen);
+        }
+      }
+
+      // '{' — skip block body
+      else if (c == 123) {
+        var depth: int64 := 1;
+        self.pos := self.pos + 1;
+        while (depth > 0 && self.chp_done() == 0) {
+          var bc: int64 := self.chp_cur();
+          if (bc == 123) { depth := depth + 1; }
+          if (bc == 125) { depth := depth - 1; }
+          self.pos := self.pos + 1;
+        }
+      }
+
+      else {
+        self.pos := self.pos + 1;
+      }
+    }
+  }
+
+  pub fn GetFuncCount(): int64 { return self.funcCount; }
+
+  pub fn Init(src: pchar, srcLen: int64) {
+    self.src    := src;
+    self.srcLen := srcLen;
+    self.pos    := 0;
+    self.funcCount := 0;
+    self.tokBuf  := mmap(0, 256, 3, 34, -1, 0);
+    self.typeBuf := mmap(0, 512, 3, 34, -1, 0);
+  }
+
+};
