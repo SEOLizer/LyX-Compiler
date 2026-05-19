@@ -534,7 +534,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ## Phase 5 — Analyse-Werkzeuge
 
-### WP-BC-25: DWARF Debug-Info-Generierung
+### WP-BC-25: DWARF Debug-Info-Generierung ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-25-dwarf-debug-info`, Singularität `6e24fd5d…`.
 
 **Ziel:** `.debug_info`, `.debug_line`, `.debug_frame`, `.debug_abbrev`,
 `.debug_str`-Sektionen in der erzeugten ELF-Datei.
@@ -553,7 +555,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-26: Call-Graph-Analyse
+### WP-BC-26: Call-Graph-Analyse ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-26-call-graph`, Singularität `c42798d4…`.
 
 **Ziel:** Vollständiger statischer Call-Graph wie in S0.
 
