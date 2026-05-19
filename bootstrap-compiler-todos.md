@@ -300,7 +300,9 @@ implementieren.
 
 ---
 
-### WP-BC-13: Format-Ausdruck (Pascal-Style)
+### WP-BC-13: Format-Ausdruck (Pascal-Style) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-13-format-expr`, S2=S3 sha256 `e4560edb…`.
 
 **Ziel:** `expr:width:decimals` für formatierte Ausgabe.
 
