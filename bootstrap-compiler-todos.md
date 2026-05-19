@@ -393,7 +393,9 @@ Raumfahrt-Code).
 
 ---
 
-### WP-BC-18: SIMD / Parallel-Array-Typ
+### WP-BC-18: SIMD / Parallel-Array-Typ ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-18-simd-parallel`, S2=S3 sha256 `0224ba54…`.
 
 **Ziel:** `atParallelArray` — SIMD-Vektor-Typ mit expliziter Hardware-Nutzung.
 
