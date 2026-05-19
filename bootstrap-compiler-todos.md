@@ -477,7 +477,9 @@ VMT-Patching in `compiler/backend/x86_64/x86_64_emit.pas`
 
 ---
 
-### WP-BC-22: Sichtbarkeits-Checks (private/protected/public)
+### WP-BC-22: Sichtbarkeits-Checks (private/protected/public) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-22-visibility-checks`, Singularität bestätigt sha256 `6f33da06…`.
 
 **Ziel:** `private`, `protected` und `pub` Zugriffsmodifikatoren erzwingen.
 
