@@ -40,6 +40,7 @@ con CGN_CASE:        int64 := 28;
 con CGN_BREAK:       int64 := 29;
 con CGN_DISPOSE:     int64 := 30;
 con CGN_CONTINUE:    int64 := 35;
+con CGN_ASSERT:      int64 := 36;  // WP-BC-07
 
 // WP-12: Exception handling nodes
 con CGN_TRY:       int64 := 31;
@@ -876,6 +877,14 @@ pub type Codegen = class {
     self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
   }
 
+  // WP-BC-01: lea rdi, [rip+disp32]  (48 8D 3D disp32)
+  fn cg_emitLeaRdiData(dataOff: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x3D);  // lea rdi, [rip+disp32]
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
+  }
+
   // WP-12: Emit longjmp code. rax must hold jmp_buf base pointer.
   // Restores rbx, rbp, r12..r15; sets rsp=rax; then jmp [rsp+56] (catch label).
   fn cg_genLongjmp() {
@@ -887,6 +896,35 @@ pub type Codegen = class {
     self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x78); self.cg_e8(0x28);  // mov r15, [rax+40]
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC4);                     // mov rsp, rax
     self.cg_e8(0xFF); self.cg_e8(0x64); self.cg_e8(0x24); self.cg_e8(0x38);  // jmp [rsp+56]
+  }
+
+  // WP-BC-01: Emit inline panic body — rdi must hold the message pointer.
+  // Writes message to stderr then exits(1) (or longjmps if handler is installed).
+  fn cg_emitPanicBody() {
+    self.cg_emitLeaRcxData(CG_EXN_VAL);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x39);                                                             // mov [rcx], rdi
+    self.cg_e8(0x57);                                                                                                   // push rdi
+    var ppSL: int64 := self.cg_emitCall();
+    poke32(self.code + ppSL, CG_H_STRLEN - ppSL - 4);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);                                                             // mov rdx, rax
+    self.cg_e8(0x5F);                                                                                                   // pop rdi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);                                                             // mov rsi, rdi
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);                       // mov edi, 2
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);                       // mov eax, 1
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                                                // syscall (write)
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);                                                             // mov rax, [rcx]
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);                                                             // test rax, rax
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var pNH: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_genLongjmp();
+    poke32(self.code + pNH, self.codeLen - pNH - 4);
+    self.cg_movRaxImm(1);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);                                                             // mov rdi, rax
+    self.cg_movRaxImm(60);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                                                // syscall (exit)
+    self.cg_zeroRax();
   }
 
   // WP-11: Parse float literal string src[off..off+len) to IEEE 754 double bits.
@@ -2272,6 +2310,104 @@ pub type Codegen = class {
       self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall (sys_exit)
       self.cg_zeroRax();
 
+    } else if (self.cg_seq(fname, fnlen, "sqrt", 4)) {
+      // WP-BC-01: sqrt(f64) -> f64
+      // Bootstrap stores f64 as raw IEEE754 bits in rax; move to xmm0, sqrtsd, move back
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0); // movq xmm0, rax
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x51); self.cg_e8(0xC0);                    // sqrtsd xmm0, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0); // movq rax, xmm0
+
+    } else if (self.cg_seq(fname, fnlen, "assert", 6)) {
+      // WP-BC-01: assert(cond: int64) — panic with "assertion failed\n" if cond == 0
+      // Condition is in rax after argument evaluation
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x75);                                         // jnz short +rel8 (skip panic)
+      var pSkip: int64 := self.codeLen;
+      self.cg_e8(0);                                            // placeholder for jnz offset
+      // Write "assertion failed\n\0" into data section
+      var msgOff: int64 := self.dataLen;
+      self.cg_edata(97);  self.cg_edata(115); self.cg_edata(115); // ass
+      self.cg_edata(101); self.cg_edata(114); self.cg_edata(116); // ert
+      self.cg_edata(105); self.cg_edata(111); self.cg_edata(110); // ion
+      self.cg_edata(32);  self.cg_edata(102); self.cg_edata(97);  //  fa
+      self.cg_edata(105); self.cg_edata(108); self.cg_edata(101); // ile
+      self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
+      self.cg_emitLeaRdiData(msgOff);
+      self.cg_emitPanicBody();
+      poke8(self.code + pSkip, self.codeLen - pSkip - 1);      // patch jnz offset
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "assertTrue", 10)) {
+      // WP-BC-01: assertTrue(cond) — same as assert; rax = cond (last evaluated)
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x75);                                         // jnz short +rel8 (skip panic)
+      var pSkipT: int64 := self.codeLen;
+      self.cg_e8(0);
+      var msgOffT: int64 := self.dataLen;
+      self.cg_edata(97);  self.cg_edata(115); self.cg_edata(115); // ass
+      self.cg_edata(101); self.cg_edata(114); self.cg_edata(116); // ert
+      self.cg_edata(105); self.cg_edata(111); self.cg_edata(110); // ion
+      self.cg_edata(32);  self.cg_edata(102); self.cg_edata(97);  //  fa
+      self.cg_edata(105); self.cg_edata(108); self.cg_edata(101); // ile
+      self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
+      self.cg_emitLeaRdiData(msgOffT);
+      self.cg_emitPanicBody();
+      poke8(self.code + pSkipT, self.codeLen - pSkipT - 1);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "assertNotNull", 13)) {
+      // WP-BC-01: assertNotNull(ptr) — panic "null pointer" if ptr == 0; rdi=ptr, rax=ptr
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x75);                                         // jnz short +rel8 (skip panic)
+      var pSkipNN: int64 := self.codeLen;
+      self.cg_e8(0);
+      var msgOffNN: int64 := self.dataLen;
+      self.cg_edata(110); self.cg_edata(117); self.cg_edata(108); // nul
+      self.cg_edata(108); self.cg_edata(32);  self.cg_edata(112); // l p
+      self.cg_edata(111); self.cg_edata(105); self.cg_edata(110); // oin
+      self.cg_edata(116); self.cg_edata(101); self.cg_edata(114); // ter
+      self.cg_edata(10);  self.cg_edata(0);                        // \n\0
+      self.cg_emitLeaRdiData(msgOffNN);
+      self.cg_emitPanicBody();
+      poke8(self.code + pSkipNN, self.codeLen - pSkipNN - 1);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "assertNotZero", 13)) {
+      // WP-BC-01: assertNotZero(val) — panic "zero value" if val == 0; rax=val
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x75);                                         // jnz short +rel8 (skip panic)
+      var pSkipNZ: int64 := self.codeLen;
+      self.cg_e8(0);
+      var msgOffNZ: int64 := self.dataLen;
+      self.cg_edata(122); self.cg_edata(101); self.cg_edata(114); // zer
+      self.cg_edata(111); self.cg_edata(32);  self.cg_edata(118); // o v
+      self.cg_edata(97);  self.cg_edata(108); self.cg_edata(117); // alu
+      self.cg_edata(101); self.cg_edata(10);  self.cg_edata(0);   // e\n\0
+      self.cg_emitLeaRdiData(msgOffNZ);
+      self.cg_emitPanicBody();
+      poke8(self.code + pSkipNZ, self.codeLen - pSkipNZ - 1);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "assertBounds", 12)) {
+      // WP-BC-01: assertBounds(value, bound) — panic "bounds check failed" if value < 0 or value >= bound
+      // After arg setup: rdi=value, rsi=bound; unsigned cmp handles both negative and >= bound cases
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF7);  // cmp rdi, rsi (sets CF if unsigned rdi < rsi)
+      self.cg_e8(0x72);                                         // jb short +rel8 (skip panic if value < bound, unsigned)
+      var pSkipB: int64 := self.codeLen;
+      self.cg_e8(0);
+      var msgOffB: int64 := self.dataLen;
+      self.cg_edata(98);  self.cg_edata(111); self.cg_edata(117); // bou
+      self.cg_edata(110); self.cg_edata(100); self.cg_edata(115); // nds
+      self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(104); //  ch
+      self.cg_edata(101); self.cg_edata(99);  self.cg_edata(107); // eck
+      self.cg_edata(32);  self.cg_edata(102); self.cg_edata(97);  //  fa
+      self.cg_edata(105); self.cg_edata(108); self.cg_edata(101); // ile
+      self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
+      self.cg_emitLeaRdiData(msgOffB);
+      self.cg_emitPanicBody();
+      poke8(self.code + pSkipB, self.codeLen - pSkipB - 1);
+      self.cg_zeroRax();
+
     } else {
       // User-defined function call: emit call + patch
       var pp: int64 := self.cg_emitCall();
@@ -2526,6 +2662,38 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
       self.cg_movRaxImm(60);
       self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall (sys_exit)
+
+    } else if (k == CGN_ASSERT) {
+      // WP-BC-07: assert(cond) — write "assertion failed\n" to stderr + exit(1) if cond == 0
+      var condNode: int64 := self.cg_nc0(ni);
+      if (condNode >= 0) {
+        self.cg_genExpr(condNode);  // result in rax
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+        self.cg_e8(0x75);                                         // jnz short (skip panic)
+        var pSkip: int64 := self.codeLen;
+        self.cg_e8(0);                                            // placeholder
+        // Inline panic: lea rsi, [rip+msgOff]; mov edx, 17; mov edi, 2; mov eax, 1; syscall; exit(1)
+        var msgOff: int64 := self.dataLen;
+        self.cg_edata(97);  self.cg_edata(115); self.cg_edata(115); // ass
+        self.cg_edata(101); self.cg_edata(114); self.cg_edata(116); // ert
+        self.cg_edata(105); self.cg_edata(111); self.cg_edata(110); // ion
+        self.cg_edata(32);  self.cg_edata(102); self.cg_edata(97);  //  fa
+        self.cg_edata(105); self.cg_edata(108); self.cg_edata(101); // ile
+        self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0 (17 chars + NUL)
+        // lea rsi, [rip+disp32]  (48 8D 35 disp32)
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+        var pData: int64 := self.codeLen;
+        self.cg_e32(0);
+        self.cg_addPatch(pData, msgOff, 0, CG_PATCH_STR);       // resolve RIP-relative offset
+        self.cg_e8(0xBA); self.cg_e8(17);  self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov edx, 17
+        self.cg_e8(0xBF); self.cg_e8(2);   self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov edi, 2 (stderr)
+        self.cg_e8(0xB8); self.cg_e8(1);   self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov eax, 1 (sys_write)
+        self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+        self.cg_e8(0xBF); self.cg_e8(1);   self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov edi, 1 (exit code)
+        self.cg_movRaxImm(60);                                                              // mov rax, 60 (sys_exit)
+        self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+        poke8(self.code + pSkip, self.codeLen - pSkip - 1);  // patch jnz offset
+      }
 
     } else if (k == CGN_BREAK) {
       // jmp rel32 to loop exit; placeholder stores previous break-list head
