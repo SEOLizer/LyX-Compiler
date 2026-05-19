@@ -514,7 +514,9 @@ Monomorphisierung (WP-14).
 
 ---
 
-### WP-BC-24: Vollständige Generic-Monomorphisierung mit Codegen
+### WP-BC-24: Vollständige Generic-Monomorphisierung mit Codegen ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-24-generic-monomorphization`, Singularität bestätigt sha256 `c834945d…`.
 
 **Ziel:** Für jede Generic-Instanziierung eigenen Maschinencode generieren.
 
