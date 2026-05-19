@@ -147,7 +147,8 @@ con CG_LABEL_SZ:   int64 := 24;   // name(8) + nameLen(8) + codeOff(8)
 con CG_PATCH_SZ:   int64 := 32;   // codeOff(8) + namePtr(8) + nameLen(8) + kind(8)
 con CGN_TYPE_DECL: int64 := 10;   // NK_TYPE_DECL from parser
 con CGN_FIELD_DECL:int64 := 7;    // NK_FIELD_DECL from parser
-con CG_CLASS_SZ:   int64 := 40;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)+vmtDataOff(8)
+con CG_CLASS_SZ:   int64 := 56;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)+vmtDataOff(8)+vmtSlotCount(8)+vmtMethodListPtr(8)
+con CG_VMT_METH_PATCH_SZ: int64 := 16;  // vmtDataSlotOff(8) + methodCodeStart(8)
 con CG_CFIELD_SZ:  int64 := 40;   // fieldName(8)+fieldLen(8)+fieldOffset(8)+typeNamePtr(8)+typeNameLen(8)
 con CG_VMT_PATCH_SZ: int64 := 24; // codeOff(8) + classNamePtr(8) + classNameLen(8)
 
@@ -241,6 +242,12 @@ pub type Codegen = class {
   vmtPatches:    int64;
   vmtPatchCount: int64;
   vmtPatchCap:   int64;
+
+  // WP-BC-19: VMT method patch table: {vmtDataSlotOff:8, methodCodeStart:8}
+  // After all code is generated, fill each VMT slot with the method's vaddr.
+  vmtMethodPatches:     int64;
+  vmtMethodPatchCount:  int64;
+  vmtMethodPatchCap:    int64;
 
   // WP-13: Closure support - static link for nested functions
   staticLinkOffset: int64;  // rbp offset of static link param (or -1 if not nested)
@@ -762,6 +769,17 @@ pub type Codegen = class {
         poke64(self.code + codeOff2, vmtBase + vmtDataOff);
       }
       j := j + 1;
+    }
+    // WP-BC-19: fill VMT method slots with method code virtual addresses
+    // Method code vaddr = CG_ELF_BASE + CG_CODE_OFF + methodCodeStart
+    var codeBase: int64 := CG_ELF_BASE + CG_CODE_OFF;
+    var mp: int64 := 0;
+    while (mp < self.vmtMethodPatchCount) {
+      var mpBase: int64 := self.vmtMethodPatches + mp * CG_VMT_METH_PATCH_SZ;
+      var slotDataOff:  int64 := peek64(mpBase);
+      var methCodeStart: int64 := peek64(mpBase + 8);
+      poke64(self.data + slotDataOff, codeBase + methCodeStart);
+      mp := mp + 1;
     }
   }
 
@@ -1306,10 +1324,81 @@ pub type Codegen = class {
       i := i + 1;
       tmp := self.cg_nnext(tmp);
     }
-    // WP-10a: emit 8-byte VMT table placeholder in data section
+    // WP-BC-19: resolve parent class VMT slots for inheritance
+    var parentNi: int64 := self.cg_nc2(ni);
+    var parentSlotCount: int64 := 0;
+    var parentMethodList: int64 := 0;
+    if (parentNi >= 0) {
+      var pName: pchar := self.cg_nsval(parentNi);
+      var pLen:  int64 := self.cg_nslen(parentNi);
+      var pIdx:  int64 := self.cg_findClass(pName, pLen);
+      if (pIdx >= 0) {
+        parentSlotCount  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + 40);
+        parentMethodList := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + 48);
+      }
+    }
+    // Count own virtual methods that are new (not overriding a parent slot)
+    var ownMethodCount: int64 := 0;
+    var mthTmp2: int64 := self.cg_nc1(ni);
+    while (mthTmp2 != -1) {
+      var isVirt2: int64 := (self.cg_nival(mthTmp2) >> 1) & 1;
+      if (isVirt2 != 0) {
+        var mname2: pchar := self.cg_nsval(mthTmp2);
+        var mlen2:  int64 := self.cg_nslen(mthTmp2);
+        var overrides: int64 := 0;
+        var si2: int64 := 0;
+        while (si2 < parentSlotCount) {
+          var sName2: pchar := peek64(parentMethodList + si2 * 16) as pchar;
+          var sLen2:  int64 := peek64(parentMethodList + si2 * 16 + 8);
+          if (self.cg_seq(sName2, sLen2, mname2, mlen2) != 0) { overrides := 1; break; }
+          si2 := si2 + 1;
+        }
+        if (overrides == 0) { ownMethodCount := ownMethodCount + 1; }
+      }
+      mthTmp2 := self.cg_nnext(mthTmp2);
+    }
+    var totalSlots: int64 := parentSlotCount + ownMethodCount;
+    // Allocate method name list: {namePtr:8, nameLen:8} per slot
+    var methodList: int64 := mmap(0, (totalSlots + 1) * 16, 3, 34, -1, 0);
+    // Copy parent slots first
+    var si3: int64 := 0;
+    while (si3 < parentSlotCount) {
+      poke64(methodList + si3 * 16,     peek64(parentMethodList + si3 * 16));
+      poke64(methodList + si3 * 16 + 8, peek64(parentMethodList + si3 * 16 + 8));
+      si3 := si3 + 1;
+    }
+    // Append own new virtual methods
+    var slotAppend: int64 := parentSlotCount;
+    var mthTmp3: int64 := self.cg_nc1(ni);
+    while (mthTmp3 != -1) {
+      var isVirt3: int64 := (self.cg_nival(mthTmp3) >> 1) & 1;
+      if (isVirt3 != 0) {
+        var mname3: pchar := self.cg_nsval(mthTmp3);
+        var mlen3:  int64 := self.cg_nslen(mthTmp3);
+        var overrides3: int64 := 0;
+        var si4: int64 := 0;
+        while (si4 < parentSlotCount) {
+          var sName4: pchar := peek64(parentMethodList + si4 * 16) as pchar;
+          var sLen4:  int64 := peek64(parentMethodList + si4 * 16 + 8);
+          if (self.cg_seq(sName4, sLen4, mname3, mlen3) != 0) { overrides3 := 1; break; }
+          si4 := si4 + 1;
+        }
+        if (overrides3 == 0) {
+          poke64(methodList + slotAppend * 16,     mname3 as int64);
+          poke64(methodList + slotAppend * 16 + 8, mlen3);
+          slotAppend := slotAppend + 1;
+        }
+      }
+      mthTmp3 := self.cg_nnext(mthTmp3);
+    }
+    // Emit VMT data: totalSlots * 8 bytes (each slot = one method pointer)
     var vmtDataOff: int64 := self.dataLen;
     var di: int64 := 0;
-    while (di < 8) { self.cg_edata(0); di := di + 1; }
+    while (di < totalSlots * 8) { self.cg_edata(0); di := di + 1; }
+    // Ensure at least 8 bytes (classes with no methods still need a VMT identity slot)
+    if (totalSlots == 0) {
+      var de: int64 := 0; while (de < 8) { self.cg_edata(0); de := de + 1; }
+    }
     // Grow class table if needed
     if (self.classCount >= self.classCap) {
       var nc: int64 := self.classCap * 2;
@@ -1328,11 +1417,14 @@ pub type Codegen = class {
     poke64(base + 16, flds);
     poke64(base + 24, cnt);
     poke64(base + 32, vmtDataOff);   // WP-10a: offset of VMT table in data section
+    poke64(base + 40, totalSlots);   // WP-BC-19: number of VMT method slots
+    poke64(base + 48, methodList);   // WP-BC-19: method name list pointer
     self.classCount := self.classCount + 1;
     // Track temporary field array for later cleanup (BUG-02)
     // The flds pointer is stored in classLayouts and used by cg_findField/cg_getFieldOffset
     // until cg_patchAll() completes. cg_freeAllTempBufs() will release it.
     self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
+    self.cg_trackTempBuf(methodList, (totalSlots + 1) * 16);
   }
 
   // Build struct field layout (WP-10d): like cg_buildClassLayout but fields at offset 0
@@ -1383,6 +1475,8 @@ pub type Codegen = class {
     poke64(base + 16, flds);
     poke64(base + 24, cnt);
     poke64(base + 32, -1);   // vmtDataOff = -1 signals "struct, no VMT"
+    poke64(base + 40, 0);    // vmtSlotCount = 0 (structs have no VMT)
+    poke64(base + 48, 0);    // vmtMethodListPtr = null
     self.classCount := self.classCount + 1;
     // Track temporary field array for later cleanup (BUG-02)
     self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
@@ -1504,6 +1598,24 @@ pub type Codegen = class {
     poke64(base + 8,  className as int64);
     poke64(base + 16, classLen);
     self.vmtPatchCount := self.vmtPatchCount + 1;
+  }
+
+  // WP-BC-19: Record VMT method slot patch: after all code is generated,
+  // write method vaddr into data[vmtDataSlotOff].
+  fn cg_addVmtMethodPatch(vmtDataSlotOff: int64, methodCodeStart: int64) {
+    if (self.vmtMethodPatchCount >= self.vmtMethodPatchCap) {
+      var nc: int64 := self.vmtMethodPatchCap * 2;
+      var nb: int64 := mmap(0, nc * CG_VMT_METH_PATCH_SZ, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.vmtMethodPatchCount * CG_VMT_METH_PATCH_SZ) {
+        poke8(nb + i, peek8(self.vmtMethodPatches + i)); i := i + 1;
+      }
+      self.vmtMethodPatches := nb; self.vmtMethodPatchCap := nc;
+    }
+    var base: int64 := self.vmtMethodPatches + self.vmtMethodPatchCount * CG_VMT_METH_PATCH_SZ;
+    poke64(base,     vmtDataSlotOff);
+    poke64(base + 8, methodCodeStart);
+    self.vmtMethodPatchCount := self.vmtMethodPatchCount + 1;
   }
 
   // Helper: get class index for object node (IDENT or FIELD chain)
@@ -1701,6 +1813,8 @@ pub type Codegen = class {
   fn cg_genMethodDecl(ni: int64, className: pchar, classNameLen: int64) {
     var mname: pchar := self.cg_nsval(ni);
     var mlen:  int64 := self.cg_nslen(ni);
+    // WP-BC-19: record code start for VMT method slot patching
+    var methodCodeStart: int64 := self.codeLen;
     // Build mangled name: className_methodName
     var mangLen: int64 := classNameLen + 1 + mlen;
     var mangBuf: int64 := mmap(0, mangLen + 1, 3, 34, -1, 0);
@@ -1760,6 +1874,24 @@ pub type Codegen = class {
     // Clear class context
     self.curClassName    := 0 as pchar;
     self.curClassNameLen := 0;
+    // WP-BC-19: register VMT method slot patch for virtual methods only
+    var isVirtM: int64 := (self.cg_nival(ni) >> 1) & 1;
+    var classIdx: int64 := self.cg_findClass(className, classNameLen);
+    if (isVirtM != 0 && classIdx >= 0) {
+      var slotCount: int64   := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + 40);
+      var methodList2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + 48);
+      var vmtDataOff2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + 32);
+      var si5: int64 := 0;
+      while (si5 < slotCount) {
+        var sName5: pchar := peek64(methodList2 + si5 * 16) as pchar;
+        var sLen5:  int64 := peek64(methodList2 + si5 * 16 + 8);
+        if (self.cg_seq(sName5, sLen5, mname, mlen) != 0) {
+          self.cg_addVmtMethodPatch(vmtDataOff2 + si5 * 8, methodCodeStart);
+          break;
+        }
+        si5 := si5 + 1;
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -4780,6 +4912,11 @@ pub type Codegen = class {
     self.vmtPatchCap   := 32;
     self.vmtPatches    := mmap(0, self.vmtPatchCap * 24, 3, 34, -1, 0);
     self.vmtPatchCount := 0;
+
+    // WP-BC-19: VMT method patch table
+    self.vmtMethodPatchCap   := 64;
+    self.vmtMethodPatches    := mmap(0, self.vmtMethodPatchCap * CG_VMT_METH_PATCH_SZ, 3, 34, -1, 0);
+    self.vmtMethodPatchCount := 0;
 
     // Per-local array flag (WP-10b)
     self.localIsArray := mmap(0, self.localCap, 3, 34, -1, 0);

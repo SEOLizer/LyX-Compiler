@@ -414,7 +414,9 @@ Raumfahrt-Code).
 
 ## Phase 4 — OOP & Generics vervollständigen
 
-### WP-BC-19: Vollständige VMT-Konstruktion
+### WP-BC-19: Vollständige VMT-Konstruktion ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-19-vmt-construction`, Singularität bestätigt sha256 `0f15b8c6…`.
 
 **Ziel:** Vollständige Virtual-Method-Table-Generierung wie in S0.
 
