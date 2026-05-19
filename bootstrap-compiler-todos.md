@@ -376,7 +376,9 @@ Raumfahrt-Code).
 
 ---
 
-### WP-BC-17: Ring-Buffer-Typ
+### WP-BC-17: Ring-Buffer-Typ ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-17-ringbuffer`, S2=S3 sha256 `3edc9255…`.
 
 **Ziel:** `atRingBuffer` — lock-freier Ring-Buffer als First-Class-Typ.
 
