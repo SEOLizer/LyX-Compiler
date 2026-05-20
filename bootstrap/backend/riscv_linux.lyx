@@ -1,0 +1,743 @@
+// bootstrap/backend/riscv_linux.lyx
+// RISC-V RV64GC Linux ELF64 backend (WP-BC-36)
+//
+// Strategy: EmitRISCV64 (IR → RV64 machine code) + 12-byte _start stub.
+// The stub calls main and passes a0 to exit(a7=93, ecall).
+//
+// ELF64 layout:
+//   file[0..4095]    ELF64 header + program header (1 page)
+//   file[4096..]     .text (_start at file:4096 = VA:0x401000)
+//   Load base 0x400000, .text VA 0x401000
+//
+// _start stub (12 bytes at .text offset 0):
+//   +0: JAL ra, 12      call main (12 bytes forward)
+//   +4: ADDI a7,x0,93   li a7, 93 (exit syscall number)
+//   +8: ECALL            exit(a0)
+//
+// RISC-V LP64 ABI:
+//   a0-a7 (x10-x17) args/return; a7 syscall number
+//   s0/fp (x8) frame pointer; ra (x1) return address
+//   sp (x2) stack pointer; t0 (x5), t1 (x6) scratch temps
+
+// ============================================================================
+// Register numbers
+// ============================================================================
+
+con RV_ZERO: int64 := 0;
+con RV_RA:   int64 := 1;
+con RV_SP:   int64 := 2;
+con RV_FP:   int64 := 8;    // s0/fp
+con RV_A0:   int64 := 10;
+con RV_A1:   int64 := 11;
+con RV_A2:   int64 := 12;
+con RV_A3:   int64 := 13;
+con RV_A4:   int64 := 14;
+con RV_A5:   int64 := 15;
+con RV_A6:   int64 := 16;
+con RV_A7:   int64 := 17;
+con RV_T0:   int64 := 5;
+con RV_T1:   int64 := 6;
+con RV_T2:   int64 := 7;
+
+// Linux RISC-V syscall numbers
+con RV_SYS_EXIT:   int64 := 93;
+con RV_SYS_WRITE:  int64 := 64;
+con RV_SYS_MMAP:   int64 := 222;
+con RV_SYS_MUNMAP: int64 := 215;
+con RV_SYS_OPEN:   int64 := 56;
+con RV_SYS_CLOSE:  int64 := 57;
+
+// Branch patch types
+con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
+con RV_PATCH_BL:  int64 := 1;   // JAL ra, funcId  (call)
+con RV_PATCH_BEQ: int64 := 2;   // BEQ t0, x0, label  (branch if == 0)
+con RV_PATCH_BNE: int64 := 3;   // BNE t0, x0, label  (branch if != 0)
+
+// ============================================================================
+// EmitRISCV64  —  IR → RV64GC machine code
+// ============================================================================
+
+pub type EmitRISCV64 = class {
+  codeBuf:    int64;
+  codeLen:    int64;
+  codeCap:    int64;
+  ir:         int64;
+  stackSize:  int64;
+  labelAddrs: int64;   // labelId → code offset  (1024 × 8 bytes)
+  labelCount: int64;
+  patchBuf:   int64;   // {codeOff,labelId,type,reg} × 1024  (1024 × 32 bytes)
+  patchCount: int64;
+  funcAddrs:  int64;   // funcId → start offset  (256 × 8 bytes)
+  funcCount:  int64;
+
+  // --------------------------------------------------------------------------
+  // Code emission primitives
+  // --------------------------------------------------------------------------
+
+  fn rv_e32(v: int64) {
+    poke8(self.codeBuf + self.codeLen,     v & 0xFF);
+    poke8(self.codeBuf + self.codeLen + 1, (v >> 8) & 0xFF);
+    poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
+    poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
+    self.codeLen := self.codeLen + 4;
+  }
+
+  fn rv_poke32at(off: int64, val: int64) {
+    poke8(self.codeBuf + off,     val & 0xFF);
+    poke8(self.codeBuf + off + 1, (val >> 8) & 0xFF);
+    poke8(self.codeBuf + off + 2, (val >> 16) & 0xFF);
+    poke8(self.codeBuf + off + 3, (val >> 24) & 0xFF);
+  }
+
+  // --------------------------------------------------------------------------
+  // RISC-V instruction encoders
+  // --------------------------------------------------------------------------
+
+  // LD rd, off(rs1)  — 64-bit load, I-type, funct3=3, opcode=3
+  fn rv_LD(rd: int64, rs1: int64, off: int64) {
+    self.rv_e32(0x3 | (rd<<7) | (3<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+
+  // SD rs2, off(rs1)  — 64-bit store, S-type, funct3=3, opcode=0x23
+  fn rv_SD(rs2: int64, rs1: int64, off: int64) {
+    var imm5: int64 := off & 0x1F;
+    var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (imm5<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (imm7<<25));
+  }
+
+  // ADDI rd, rs1, imm  — I-type, funct3=0, opcode=0x13
+  fn rv_ADDI(rd: int64, rs1: int64, imm: int64) {
+    self.rv_e32(0x13 | (rd<<7) | (0<<12) | (rs1<<15) | ((imm & 0xFFF)<<20));
+  }
+
+  // ADD rd, rs1, rs2  — R-type, funct3=0, funct7=0
+  fn rv_ADD(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // SUB rd, rs1, rs2  — R-type, funct3=0, funct7=0x20
+  fn rv_SUB(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (0x20<<25));
+  }
+
+  // MUL rd, rs1, rs2  — M-ext, funct3=0, funct7=1
+  fn rv_MUL(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
+  }
+
+  // DIV rd, rs1, rs2  — M-ext, funct3=4 (signed), funct7=1
+  fn rv_DIV(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (4<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
+  }
+
+  // REM rd, rs1, rs2  — M-ext, funct3=6 (signed), funct7=1
+  fn rv_REM(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (6<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
+  }
+
+  // AND rd, rs1, rs2  — funct3=7
+  fn rv_AND(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (7<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // OR rd, rs1, rs2  — funct3=6
+  fn rv_OR(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (6<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // XOR rd, rs1, rs2  — funct3=4
+  fn rv_XOR(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (4<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // SLL rd, rs1, rs2  — funct3=1
+  fn rv_SLL(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (1<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // SRL rd, rs1, rs2  — logical right shift, funct3=5, funct7=0
+  fn rv_SRL(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (5<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // SLT rd, rs1, rs2  — signed less-than, funct3=2
+  fn rv_SLT(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (2<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // SLTU rd, rs1, rs2  — unsigned less-than, funct3=3
+  fn rv_SLTU(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
+  }
+
+  // MV rd, rs  (pseudo: ADDI rd, rs, 0)
+  fn rv_MV(rd: int64, rs: int64) {
+    self.rv_ADDI(rd, rs, 0);
+  }
+
+  // LI rd, small_imm  (pseudo: ADDI rd, x0, imm)  — imm in [-2048..2047]
+  fn rv_LI(rd: int64, imm: int64) {
+    self.rv_ADDI(rd, RV_ZERO, imm);
+  }
+
+  // Load full immediate: LUI+ADDI for values outside [-2048..2047]
+  fn rv_LI64(rd: int64, imm: int64) {
+    if imm >= -2048 && imm <= 2047 {
+      self.rv_ADDI(rd, RV_ZERO, imm);
+    } else {
+      var lo12: int64 := imm & 0xFFF;
+      if (lo12 & 0x800) != 0 { lo12 := lo12 - 0x1000; }
+      var hi20: int64 := (imm - lo12) >> 12;
+      // LUI rd, hi20
+      self.rv_e32(0x37 | (rd<<7) | ((hi20 & 0xFFFFF)<<12));
+      if lo12 != 0 { self.rv_ADDI(rd, rd, lo12); }
+    }
+  }
+
+  // ECALL
+  fn rv_ECALL() { self.rv_e32(0x00000073); }
+
+  // RET = JALR x0, ra, 0
+  fn rv_RET() { self.rv_e32(0x00008067); }
+
+  // Build J-type JAL word: rd=0→jump, rd=1→call
+  fn rv_buildJAL(rd: int64, offset: int64): int64 {
+    var imm20:    int64 := (offset >> 20) & 1;
+    var imm10_1:  int64 := (offset >> 1) & 0x3FF;
+    var imm11:    int64 := (offset >> 11) & 1;
+    var imm19_12: int64 := (offset >> 12) & 0xFF;
+    return 0x6F | (rd<<7) | (imm19_12<<12) | (imm11<<20) | (imm10_1<<21) | (imm20<<31);
+  }
+
+  // Build B-type branch word (BEQ/BNE/BLT/BGE)
+  fn rv_buildBtype(funct3: int64, rs1: int64, rs2: int64, off: int64): int64 {
+    var imm12:   int64 := (off >> 12) & 1;
+    var imm11:   int64 := (off >> 11) & 1;
+    var imm10_5: int64 := (off >> 5) & 0x3F;
+    var imm4_1:  int64 := (off >> 1) & 0xF;
+    return 0x63 | (imm11<<7) | (imm4_1<<8) | (funct3<<12) | (rs1<<15) | (rs2<<20) | (imm10_5<<25) | (imm12<<31);
+  }
+
+  // --------------------------------------------------------------------------
+  // Stack slot helper: slot i → [s0, -(i+1)*8]
+  // --------------------------------------------------------------------------
+
+  fn slotOff(slot: int64): int64 { return -(slot + 1) * 8; }
+
+  fn rv_loadSlot(slot: int64) {
+    self.rv_LD(RV_T0, RV_FP, self.slotOff(slot));
+  }
+
+  fn rv_loadSlot2(slot: int64) {
+    self.rv_LD(RV_T1, RV_FP, self.slotOff(slot));
+  }
+
+  fn rv_storeSlot(slot: int64) {
+    self.rv_SD(RV_T0, RV_FP, self.slotOff(slot));
+  }
+
+  // --------------------------------------------------------------------------
+  // Stack frame
+  // --------------------------------------------------------------------------
+
+  fn calcStackFrame(funcId: int64) {
+    var locals: int64 := self.getFuncLocalCount(funcId);
+    var sz: int64 := locals * 8;
+    if (sz & 15) != 0 { sz := (sz + 16) & -16; }
+    if sz < 16 { sz := 16; }
+    self.stackSize := sz;
+  }
+
+  // Prologue layout (after execution):
+  //   [s0+0]  = saved old s0
+  //   [s0+8]  = saved ra
+  //   s0      = sp (frame pointer; saved regs above it)
+  //   sp      = s0 - stackSize  (locals area below s0)
+  // slotOff(i) = -(i+1)*8  → within [sp .. s0-1] ✓
+  fn emitPrologue() {
+    self.rv_ADDI(RV_SP, RV_SP, -16);  // alloc saved-regs area
+    self.rv_SD(RV_FP, RV_SP, 0);      // save old s0
+    self.rv_SD(RV_RA, RV_SP, 8);      // save ra
+    self.rv_MV(RV_FP, RV_SP);         // s0 = sp (frame pointer)
+    if self.stackSize > 0 {
+      self.rv_ADDI(RV_SP, RV_SP, -self.stackSize);  // alloc locals
+    }
+  }
+
+  // Epilogue: load retValTemp (slot 0) into a0, restore frame, return
+  fn emitEpilogue() {
+    self.rv_LD(RV_A0, RV_FP, self.slotOff(0));  // a0 = retValTemp
+    self.rv_MV(RV_SP, RV_FP);                    // restore sp = s0
+    self.rv_LD(RV_FP, RV_SP, 0);                 // restore old s0
+    self.rv_LD(RV_RA, RV_SP, 8);                 // restore ra
+    self.rv_ADDI(RV_SP, RV_SP, 16);              // pop saved area
+    self.rv_RET();                                // JALR x0, ra, 0
+  }
+
+  // --------------------------------------------------------------------------
+  // Patch management
+  // --------------------------------------------------------------------------
+
+  fn addPatch(codeOff: int64, labelId: int64, ptype: int64, reg: int64) {
+    if self.patchCount < 1024 {
+      var base: int64 := self.patchBuf + self.patchCount * 32;
+      poke64(base,      codeOff);
+      poke64(base + 8,  labelId);
+      poke64(base + 16, ptype);
+      poke64(base + 24, reg);
+      self.patchCount := self.patchCount + 1;
+    }
+  }
+
+  fn applyPatches() {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:    int64 := self.patchBuf + i * 32;
+      var codeOff: int64 := peek64(base);
+      var labelId: int64 := peek64(base + 8);
+      var ptype:   int64 := peek64(base + 16);
+      var target:  int64 := -1;
+      if ptype == RV_PATCH_BL {
+        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+      } else {
+        if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
+      }
+      if target >= 0 {
+        var delta: int64 := target - codeOff;
+        if ptype == RV_PATCH_J || ptype == RV_PATCH_BL {
+          // rd = ptype (0 = x0 for jump, 1 = ra for call)
+          self.rv_poke32at(codeOff, self.rv_buildJAL(ptype, delta));
+        } else if ptype == RV_PATCH_BEQ {
+          self.rv_poke32at(codeOff, self.rv_buildBtype(0, RV_T0, RV_ZERO, delta));
+        } else if ptype == RV_PATCH_BNE {
+          self.rv_poke32at(codeOff, self.rv_buildBtype(1, RV_T0, RV_ZERO, delta));
+        }
+      }
+      i := i + 1;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Instruction dispatch
+  // --------------------------------------------------------------------------
+
+  fn emitInstr(funcId: int64, idx: int64) {
+    var op:   int64 := self.getInstrOp(idx);
+    var dest: int64 := self.getInstrDest(idx);
+    var src1: int64 := self.getInstrSrc1(idx);
+    var src2: int64 := self.getInstrSrc2(idx);
+    var imm:  int64 := self.getInstrImmInt(idx);
+
+    // --- Constants ---
+    if op == IRO_CONST_INT || op == IRO_CONST_FLOAT {
+      self.rv_LI64(RV_T0, imm);
+      self.rv_storeSlot(dest);
+    }
+
+    // --- Integer arithmetic ---
+    if op == IRO_ADD {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_ADD(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_SUB {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SUB(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_MUL {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_MUL(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_DIV {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_DIV(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_MOD {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_REM(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_NEG {
+      self.rv_loadSlot(src1);
+      self.rv_SUB(RV_T0, RV_ZERO, RV_T0); self.rv_storeSlot(dest);
+    }
+
+    // --- Bitwise ---
+    if op == IRO_AND || op == IRO_BITAND {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_AND(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_OR || op == IRO_BITOR {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_OR(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_XOR || op == IRO_BITXOR {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_NOT || op == IRO_BITNOT {
+      self.rv_loadSlot(src1);
+      self.rv_LI(RV_T1, -1);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_SHL {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SLL(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_SHR {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SRL(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+
+    // --- Comparisons ---
+    if op == IRO_CMP_EQ {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1);
+      self.rv_LI(RV_T1, 1);
+      self.rv_SLTU(RV_T0, RV_T0, RV_T1);   // t0 = (t0 < 1) = (t0 == 0)
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_CMP_NEQ {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1);
+      self.rv_SLTU(RV_T0, RV_ZERO, RV_T0); // t0 = (0 < t0) = (t0 != 0)
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_CMP_LT {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SLT(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_CMP_GE {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SLT(RV_T0, RV_T0, RV_T1);
+      self.rv_LI(RV_T1, 1);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1);   // invert: !(src1 < src2) = src1 >= src2
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_CMP_GT {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SLT(RV_T0, RV_T1, RV_T0);   // src2 < src1
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_CMP_LE {
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SLT(RV_T0, RV_T1, RV_T0);   // src2 < src1
+      self.rv_LI(RV_T1, 1);
+      self.rv_XOR(RV_T0, RV_T0, RV_T1);   // !(src2 < src1) = src1 <= src2
+      self.rv_storeSlot(dest);
+    }
+
+    // --- Memory: locals and globals ---
+    if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
+      self.rv_loadSlot(src1); self.rv_storeSlot(dest);
+    }
+    if op == IRO_LOAD_GLOBAL {
+      self.rv_LI64(RV_T2, src1);
+      self.rv_LD(RV_T0, RV_T2, 0); self.rv_storeSlot(dest);
+    }
+    if op == IRO_STORE_GLOBAL {
+      self.rv_LI64(RV_T2, src2);
+      self.rv_loadSlot(src1);
+      self.rv_SD(RV_T0, RV_T2, 0);
+    }
+
+    // --- Struct field access ---
+    if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
+      self.rv_loadSlot(src1);
+      self.rv_LD(RV_T0, RV_T0, src2); self.rv_storeSlot(dest);
+    }
+    if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
+      self.rv_loadSlot(src2);            // t0 = base pointer
+      self.rv_MV(RV_T2, RV_T0);         // t2 = base
+      self.rv_loadSlot(src1);            // t0 = value
+      self.rv_SD(RV_T0, RV_T2, imm);
+    }
+
+    // --- Function calls ---
+    if op == IRO_CALL {
+      var argCount: int64 := imm;
+      var ai: int64 := 0;
+      while ai < argCount && ai < 8 {
+        self.rv_loadSlot(ai);
+        self.rv_MV(RV_A0 + ai, RV_T0);
+        ai := ai + 1;
+      }
+      var patchOff: int64 := self.codeLen;
+      self.rv_e32(0x000000EF);   // JAL ra, 0 placeholder (0x6F | 1<<7 = 0xEF)
+      self.addPatch(patchOff, src1, RV_PATCH_BL, 0);
+      self.rv_MV(RV_T0, RV_A0);
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_CALL_BUILTIN {
+      self.emitBuiltinCall(imm, dest);
+    }
+
+    // --- Control flow ---
+    if op == IRO_JMP {
+      var patchOff: int64 := self.codeLen;
+      self.rv_e32(0x0000006F);   // JAL x0, 0 placeholder
+      self.addPatch(patchOff, imm, RV_PATCH_J, 0);
+    }
+    if op == IRO_BR_TRUE {
+      self.rv_loadSlot(src1);
+      var patchOff: int64 := self.codeLen;
+      // BNE t0, x0, 0 placeholder: 0x63 | (1<<12) | (RV_T0<<15) = 0x00029063
+      self.rv_e32(0x00029063);
+      self.addPatch(patchOff, imm, RV_PATCH_BNE, 0);
+    }
+    if op == IRO_BR_FALSE {
+      self.rv_loadSlot(src1);
+      var patchOff: int64 := self.codeLen;
+      // BEQ t0, x0, 0 placeholder: 0x63 | (0<<12) | (RV_T0<<15) = 0x00028063
+      self.rv_e32(0x00028063);
+      self.addPatch(patchOff, imm, RV_PATCH_BEQ, 0);
+    }
+    if op == IRO_LABEL {
+      if imm < 1024 {
+        poke64(self.labelAddrs + imm * 8, self.codeLen);
+      }
+    }
+    if op == IRO_FUNC_EXIT {
+      self.emitEpilogue();
+    }
+
+    // --- Memory allocation ---
+    if op == IRO_ALLOC {
+      self.rv_LI(RV_A0, 0);
+      self.rv_loadSlot(src1); self.rv_MV(RV_A1, RV_T0);
+      self.rv_LI(RV_A2, 3);
+      self.rv_LI(RV_A3, 34);
+      self.rv_LI(RV_A4, -1);
+      self.rv_LI(RV_A5, 0);
+      self.rv_LI(RV_A7, RV_SYS_MMAP);
+      self.rv_ECALL();
+      self.rv_MV(RV_T0, RV_A0); self.rv_storeSlot(dest);
+    }
+    if op == IRO_FREE {
+      self.rv_loadSlot(src1); self.rv_MV(RV_A0, RV_T0);
+      self.rv_LI(RV_A1, 0);
+      self.rv_LI(RV_A7, RV_SYS_MUNMAP);
+      self.rv_ECALL();
+    }
+
+    // --- Type conversions: copy only (no FP support in this backend) ---
+    if op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+      self.rv_loadSlot(src1); self.rv_storeSlot(dest);
+    }
+  }
+
+  fn emitBuiltinCall(id: int64, dest: int64) {
+    if id == 1 {
+      // write(stdout, buf, len)
+      self.rv_LI(RV_A0, 1);
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(1));
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if id == 2 || id == 3 {
+      // exit(code)
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(0));
+      self.rv_LI(RV_A7, RV_SYS_EXIT);
+      self.rv_ECALL();
+    }
+    self.rv_MV(RV_T0, RV_A0);
+    self.rv_storeSlot(dest);
+  }
+
+  // --------------------------------------------------------------------------
+  // Function emitter
+  // --------------------------------------------------------------------------
+
+  fn emitFunc(funcId: int64) {
+    if funcId < 256 {
+      poke64(self.funcAddrs + funcId * 8, self.codeLen);
+      self.funcCount := self.funcCount + 1;
+    }
+    self.stackSize  := 0;
+    self.labelCount := 0;
+    self.patchCount := 0;
+    var li: int64 := 0;
+    while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
+    self.calcStackFrame(funcId);
+    self.emitPrologue();
+    var instrStart: int64 := self.getFuncInstrStart(funcId);
+    var instrCount: int64 := self.getFuncInstrCount(funcId);
+    var i: int64 := 0;
+    while i < instrCount { self.emitInstr(funcId, instrStart + i); i := i + 1; }
+    self.emitEpilogue();
+    self.applyPatches();
+  }
+
+  // --------------------------------------------------------------------------
+  // Public interface
+  // --------------------------------------------------------------------------
+
+  pub fn init(irMod: int64) {
+    self.ir         := irMod;
+    self.codeBuf    := mmap(0, 131072, 3, 34, -1, 0);
+    self.codeCap    := 131072;
+    self.codeLen    := 0;
+    self.stackSize  := 0;
+    self.labelAddrs := mmap(0, 1024 * 8, 3, 34, -1, 0);
+    self.labelCount := 0;
+    self.patchBuf   := mmap(0, 1024 * 32, 3, 34, -1, 0);
+    self.patchCount := 0;
+    self.funcAddrs  := mmap(0, 256 * 8, 3, 34, -1, 0);
+    self.funcCount  := 0;
+  }
+
+  pub fn emit(): int64 {
+    var n: int64 := self.getFuncCount();
+    var i: int64 := 0;
+    while i < n { self.emitFunc(i); i := i + 1; }
+    return self.codeLen;
+  }
+
+  pub fn getCodeBuf(): int64 { return self.codeBuf; }
+  pub fn getCodeLen(): int64 { return self.codeLen; }
+
+  // --------------------------------------------------------------------------
+  // IR accessors (same layout as EmitARM64)
+  // IR module at self.ir:
+  //   +8:  instrBuf ptr
+  //   +80: funcBuf ptr
+  //   +96: funcCount
+  // Func record (80 bytes): +16 instrStart, +24 instrCount, +32 localCount
+  // Instr record (80 bytes): +0 op, +8 dest, +16 src1, +24 src2, +40 imm
+  // --------------------------------------------------------------------------
+
+  fn getFuncCount(): int64 {
+    return peek64(self.ir + 96);
+  }
+
+  fn getFuncLocalCount(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 32);
+  }
+
+  fn getFuncInstrStart(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 16);
+  }
+
+  fn getFuncInstrCount(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 24);
+  }
+
+  fn getInstrField(absIdx: int64, fieldOff: int64): int64 {
+    var instrBuf: int64 := peek64(self.ir + 8);
+    return peek64(instrBuf + absIdx * 80 + fieldOff);
+  }
+
+  fn getInstrOp(absIdx: int64): int64    { return self.getInstrField(absIdx, 0); }
+  fn getInstrDest(absIdx: int64): int64  { return self.getInstrField(absIdx, 8); }
+  fn getInstrSrc1(absIdx: int64): int64  { return self.getInstrField(absIdx, 16); }
+  fn getInstrSrc2(absIdx: int64): int64  { return self.getInstrField(absIdx, 24); }
+  fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
+};
+
+// ============================================================================
+// RiscvLinuxBackend  —  _start stub + ELF64-RISCV writer
+// ============================================================================
+
+pub type RiscvLinuxBackend = class {
+  code:    int64;
+  codeLen: int64;
+  codeCap: int64;
+
+  fn rlb_ce8(v: int64) {
+    poke8(self.code + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  fn rlb_ce32(v: int64) {
+    self.rlb_ce8(v);
+    self.rlb_ce8(v >> 8);
+    self.rlb_ce8(v >> 16);
+    self.rlb_ce8(v >> 24);
+  }
+
+  // _start stub (12 bytes):
+  //   JAL ra, 12          = 0x00C000EF  (call main at offset 12)
+  //   ADDI a7, x0, 93     = 0x05D00893  (exit syscall)
+  //   ECALL               = 0x00000073
+  fn rlb_emitStart() {
+    self.rlb_ce32(0x00C000EF);  // JAL ra, 12
+    self.rlb_ce32(0x05D00893);  // ADDI a7, x0, 93
+    self.rlb_ce32(0x00000073);  // ECALL
+  }
+
+  pub fn Init() {
+    self.codeCap := 65536;
+    self.code    := mmap(0, self.codeCap, 3, 34, -1, 0);
+    self.codeLen := 0;
+  }
+
+  pub fn Build(irBuf: int64, irLen: int64) {
+    self.rlb_emitStart();
+    var i: int64 := 0;
+    while i < irLen { self.rlb_ce8(peek8(irBuf + i)); i := i + 1; }
+  }
+
+  pub fn GetCodeSize(): int64 { return self.codeLen; }
+
+  pub fn WriteELF64(path: pchar) {
+    var codeFileOffset: int64 := 4096;
+    var codeSize:       int64 := self.codeLen;
+    var elfSize:        int64 := codeFileOffset + codeSize;
+
+    var elfBuf: int64 := mmap(0, elfSize, 3, 34, -1, 0);
+    if elfBuf == -1 { return; }
+
+    var z: int64 := 0;
+    while z < elfSize { poke8(elfBuf + z, 0); z := z + 1; }
+
+    var ci: int64 := 0;
+    while ci < codeSize {
+      poke8(elfBuf + codeFileOffset + ci, peek8(self.code + ci));
+      ci := ci + 1;
+    }
+
+    // ELF64 header (64 bytes)
+    // e_ident (16 bytes)
+    poke8(elfBuf + 0, 127);  poke8(elfBuf + 1, 69);   // 0x7F 'E'
+    poke8(elfBuf + 2, 76);   poke8(elfBuf + 3, 70);   // 'L' 'F'
+    poke8(elfBuf + 4, 2);    poke8(elfBuf + 5, 1);    // 64-bit, little-endian
+    poke8(elfBuf + 6, 1);    poke8(elfBuf + 7, 0);    // ELF v1, SysV ABI
+    // remaining 8 bytes of e_ident = 0 (already zeroed)
+
+    poke16(elfBuf + 16, 2);          // e_type: ET_EXEC
+    poke16(elfBuf + 18, 0xF3);       // e_machine: EM_RISCV = 243
+    poke32(elfBuf + 20, 1);          // e_version: EV_CURRENT
+    poke64(elfBuf + 24, 0x401000);   // e_entry: _start VA
+    poke64(elfBuf + 32, 64);         // e_phoff: program header at byte 64
+    poke64(elfBuf + 40, 0);          // e_shoff: no section headers
+    poke32(elfBuf + 48, 0x05);       // e_flags: EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE
+    poke16(elfBuf + 52, 64);         // e_ehsize
+    poke16(elfBuf + 54, 56);         // e_phentsize
+    poke16(elfBuf + 56, 1);          // e_phnum
+    poke16(elfBuf + 58, 64);         // e_shentsize
+    poke16(elfBuf + 60, 0);          // e_shnum
+    poke16(elfBuf + 62, 0);          // e_shstrndx
+
+    // PT_LOAD segment header (56 bytes at offset 64)
+    poke32(elfBuf + 64, 1);              // p_type: PT_LOAD
+    poke32(elfBuf + 68, 5);             // p_flags: PF_R | PF_X
+    poke64(elfBuf + 72, 0);             // p_offset: 0 (load whole file)
+    poke64(elfBuf + 80, 0x400000);      // p_vaddr
+    poke64(elfBuf + 88, 0x400000);      // p_paddr
+    poke64(elfBuf + 96, elfSize);       // p_filesz
+    poke64(elfBuf + 104, elfSize);      // p_memsz
+    poke64(elfBuf + 112, 0x1000);       // p_align: 4096
+
+    var fd: int64 := open(path, 577, 493);
+    if fd < 0 {
+      EPrintStr("error: cannot write output: "c);
+      EPrintStrLn(path);
+      munmap(elfBuf, elfSize);
+      return;
+    }
+    write(fd, elfBuf as pchar, elfSize);
+    close(fd);
+    munmap(elfBuf, elfSize);
+  }
+};

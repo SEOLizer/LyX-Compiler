@@ -753,22 +753,17 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-36: RISC-V (RV64GC) Linux Backend
+### ✅ WP-BC-36: RISC-V (RV64GC) Linux Backend
 
-**Ziel:** ELF64-RISC-V-Binaries für RV64 Linux.
+**Status:** Erledigt — Branch `feat/wp-bc-36-riscv64-linux`.
 
-**Referenz:** S0 `compiler/backend/riscv/riscv_emit.pas` (1.601 Zeilen),
-`compiler/backend/elf/elf64_riscv_writer.pas`
-
-**Zu tun:**
-- Neue Datei `bootstrap/backend/riscv_linux.lyx`
-- RV64I Instruction Encoding: R/I/S/B/U/J-Format (32-bit)
-- Basis-Instruktionen: `LUI`/`AUIPC`, `ADD`/`SUB`/`MUL`/`DIV`, `LW`/`LD`/`SW`/`SD`,
-  `BEQ`/`BNE`/`BLT`/`BGE`, `JAL`/`JALR`, `ECALL`
-- RISC-V LP64 ABI: a0–a7 für Argumente, a7 für Syscall-Nummer
-- Linux RISC-V Syscall-Nummern: `write`=64, `exit`=93, `mmap`=222
-- ELF64-RISC-V-Header (e_machine = 0xF3 = EM_RISCV)
-- CLI-Flag `--target linux-riscv64`
+**Ergebnis:**
+- `bootstrap/backend/riscv_linux.lyx` — `EmitRISCV64` (IR → RV64GC) + `RiscvLinuxBackend` (ELF64 writer)
+- `EmitRISCV64`: vollständiges IR-Dispatch (Arithmetik, Bitwise, Vergleiche, Control Flow, Calls, Alloc), R/I/S/B/U/J-Format Encoding, branch backpatching, slot-based frame layout (slotOff(i) = -(i+1)*8)
+- `RiscvLinuxBackend`: 12-byte _start stub (JAL ra,12 / ADDI a7,x0,93 / ECALL), ELF64 writer mit e_machine=0xF3 (EM_RISCV), e_flags=0x05 (RVC | double-float ABI), load base 0x400000, entry 0x401000
+- `bootstrap/lyxc.lyx`: TARGET_LINUX_RISCV64=9, `--target=linux-riscv64` flag, `emitLinuxRISCV64()` wired in
+- Verifikation: `file hello_riscv` → `ELF 64-bit LSB executable, UCB RISC-V, RVC, double-float ABI, version 1 (SYSV), statically linked, no section header`
+- `readelf -h`: Machine=RISC-V, Flags=0x5 (RVC+double-float), Entry=0x401000, 1 PT_LOAD segment ✓
 
 ---
 
