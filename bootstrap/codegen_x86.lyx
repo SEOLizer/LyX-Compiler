@@ -284,6 +284,14 @@ pub type Codegen = class {
   globalVarCap:   int64;
   globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
 
+  // WP-BC-40: Compile-time profiling entry table (x86_64 only)
+  // Entry: {namePtr:8 (src ptr), nameLen:8, dataOff:8, nameDataOff:8} = 32 bytes
+  // dataOff → data section: tsc_start(8) + call_count(8) + total_cycles(8) = 24 bytes
+  // nameDataOff → data section: name string (for profile_report output)
+  profEntries:    int64;
+  profEntryCount: int64;
+  profEntryCap:   int64;
+
   // WP-BC-25: DWARF debug info generation
   debugMode:   int64;
   srcFilePath: pchar;
@@ -1040,6 +1048,98 @@ pub type Codegen = class {
     self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 1 (sys_write)
     self.cg_e8(0x0F); self.cg_e8(0x05);                                                         // syscall
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x20);                   // add rsp, 32
+  }
+
+  // WP-BC-40: Print int64 in rdi as decimal to stderr, NO newline.
+  // Same as cg_emitInspectPrintInt but omits the trailing '\n'.
+  fn cg_emitStderrInt() {
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x20);                    // sub rsp, 32
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x1E); // lea rsi, [rsp+30]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);                                      // mov rax, rdi
+    // test rax,rax; jnz .nonzero (+8)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);                                      // test rax, rax
+    self.cg_e8(0x75); self.cg_e8(0x08);                                                         // jnz +8
+    self.cg_e8(0xC6); self.cg_e8(0x06); self.cg_e8(0x30);                                      // mov byte [rsi], '0'
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);                                      // dec rsi
+    self.cg_e8(0xEB); self.cg_e8(0x30);                                                         // jmp .emit (+48)
+    // .nonzero: test rax,rax; jge .positive (+3)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);                                      // test rax, rax
+    self.cg_e8(0x7D); self.cg_e8(0x03);                                                         // jge +3
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xD8);                                      // neg rax
+    // .digitloop: test rax,rax; jz .sign (+24)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);                                      // test rax, rax
+    self.cg_e8(0x74); self.cg_e8(0x18);                                                         // jz +24
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);                                      // xor rdx, rdx
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x0A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);                   // mov rcx, 10
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);                                      // idiv rcx
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x30);                   // add rdx, '0'
+    self.cg_e8(0x88); self.cg_e8(0x16);                                                         // mov [rsi], dl
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);                                      // dec rsi
+    self.cg_e8(0xEB); self.cg_e8(0xE3);                                                         // jmp .digitloop (-29)
+    // .sign: test rdi,rdi; jns .emit (+6)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                                      // test rdi, rdi
+    self.cg_e8(0x79); self.cg_e8(0x06);                                                         // jns +6
+    self.cg_e8(0xC6); self.cg_e8(0x06); self.cg_e8(0x2D);                                      // mov byte [rsi], '-'
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);                                      // dec rsi
+    // .emit: inc rsi; lea rdx,[rsp+30]; sub rdx,rsi; inc rdx (no '\n')
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);                                      // inc rsi
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x1E); // lea rdx, [rsp+30]
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xF2);                                      // sub rdx, rsi
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC2);                                      // inc rdx
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edi, 2 (stderr)
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 1 (sys_write)
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                         // syscall
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x20);                   // add rsp, 32
+  }
+
+  // WP-BC-40: Look up or allocate a profiling entry for the given name.
+  // Returns the data section offset of {tsc_start(8), call_count(8), total_cycles(8)}.
+  // Also stores the name string in the data section (nameDataOff) for profile_report.
+  fn cg_findOrAllocProfEntry(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.profEntryCount) {
+      var eBase: int64 := self.profEntries + i * 32;
+      var eName: pchar := peek64(eBase) as pchar;
+      var eLen: int64 := peek64(eBase + 8);
+      if (eLen == nlen) {
+        var j: int64 := 0; var match: int64 := 1;
+        while (j < nlen) {
+          if (StrCharAt(eName, j) != StrCharAt(name, j)) { match := 0; }
+          j := j + 1;
+        }
+        if (match == 1) { return peek64(eBase + 16); }
+      }
+      i := i + 1;
+    }
+    if (self.profEntryCount >= self.profEntryCap) {
+      var nc: int64 := self.profEntryCap * 2;
+      var nb: int64 := mmap(0, nc * 32, 3, 34, -1, 0);
+      var j: int64 := 0;
+      while (j < self.profEntryCount * 32) { poke8(nb+j, peek8(self.profEntries+j)); j:=j+1; }
+      munmap(self.profEntries, self.profEntryCap * 32);
+      self.profEntries := nb;
+      self.profEntryCap := nc;
+    }
+    // Allocate runtime slots: tsc_start(8) + call_count(8) + total_cycles(8) = 24 bytes
+    var dOff: int64 := self.dataLen;
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // tsc_start
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // call_count
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // total_cycles
+    // Store name string in data section for profile_report output
+    var nDOff: int64 := self.dataLen;
+    var k: int64 := 0;
+    while (k < nlen) { self.cg_edata(StrCharAt(name, k)); k := k + 1; }
+    var eBase: int64 := self.profEntries + self.profEntryCount * 32;
+    poke64(eBase,      name as int64);
+    poke64(eBase + 8,  nlen);
+    poke64(eBase + 16, dOff);
+    poke64(eBase + 24, nDOff);
+    self.profEntryCount := self.profEntryCount + 1;
+    return dOff;
   }
 
   // WP-11: Parse float literal string src[off..off+len) to IEEE 754 double bits.
@@ -2750,6 +2850,205 @@ pub type Codegen = class {
       self.cg_e8(0x5F);  // pop rdi
       self.cg_emitInspectPrintInt();
       self.cg_zeroRax();  // Inspect returns void (0)
+
+    } else if (self.cg_seq(fname, fnlen, "profile_enter", 13)) {
+      // WP-BC-40: profile_enter("name"c) — save RDTSC to tsc_start
+      var peArgNd: int64 := self.cg_nc0(ni);
+      var peName: pchar := "?"c;
+      var peNLen: int64 := 1;
+      if (peArgNd >= 0 && self.cg_nkind(peArgNd) == CGN_LIT_STR) {
+        // Strip surrounding quotes and optional 'c' suffix
+        var peSoff: int64 := self.cg_nsoff(peArgNd);
+        var peSlen: int64 := self.cg_nslen(peArgNd);
+        var peEnd: int64 := peSoff + peSlen - 1;
+        if (StrCharAt(self.pSrc, peSoff + peSlen - 1) == 99) { peEnd := peEnd - 1; }
+        peName := self.pSrc + peSoff + 1;
+        peNLen := peEnd - (peSoff + 1);
+      } else if (peArgNd >= 0 && self.cg_nkind(peArgNd) == CGN_IDENT) {
+        peName := self.cg_nsval(peArgNd);
+        peNLen := self.cg_nslen(peArgNd);
+      }
+      var peDOff: int64 := self.cg_findOrAllocProfEntry(peName, peNLen);
+      // rdtsc → rax (full 64-bit TSC)
+      self.cg_e8(0x0F); self.cg_e8(0x31);                                      // rdtsc
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20); // shl rdx, 32
+      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                   // or rax, rdx
+      // mov [rip+rel32], rax → tsc_start at peDOff+0
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+      var pePP1: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(pePP1, peDOff, 0, CG_PATCH_STR);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "profile_leave", 13)) {
+      // WP-BC-40: profile_leave("name"c) — compute elapsed cycles, accumulate
+      var plArgNd: int64 := self.cg_nc0(ni);
+      var plName: pchar := "?"c;
+      var plNLen: int64 := 1;
+      if (plArgNd >= 0 && self.cg_nkind(plArgNd) == CGN_LIT_STR) {
+        var plSoff: int64 := self.cg_nsoff(plArgNd);
+        var plSlen: int64 := self.cg_nslen(plArgNd);
+        var plEnd: int64 := plSoff + plSlen - 1;
+        if (StrCharAt(self.pSrc, plSoff + plSlen - 1) == 99) { plEnd := plEnd - 1; }
+        plName := self.pSrc + plSoff + 1;
+        plNLen := plEnd - (plSoff + 1);
+      } else if (plArgNd >= 0 && self.cg_nkind(plArgNd) == CGN_IDENT) {
+        plName := self.cg_nsval(plArgNd);
+        plNLen := self.cg_nslen(plArgNd);
+      }
+      var plDOff: int64 := self.cg_findOrAllocProfEntry(plName, plNLen);
+      // rdtsc → rax (current TSC)
+      self.cg_e8(0x0F); self.cg_e8(0x31);
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);
+      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);
+      // mov rcx, [rip+rel32] → tsc_start at plDOff+0
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
+      var plPP1: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(plPP1, plDOff, 0, CG_PATCH_STR);
+      // delta = rax - rcx (elapsed cycles)
+      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC8);  // sub rax, rcx
+      // mov rdx, [rip+rel32] → total_cycles at plDOff+16
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15);
+      var plPP2: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(plPP2, plDOff + 16, 0, CG_PATCH_STR);
+      // add rdx, rax (total_cycles += delta)
+      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC2);  // add rdx, rax
+      // mov [rip+rel32], rdx → total_cycles at plDOff+16
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);
+      var plPP3: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(plPP3, plDOff + 16, 0, CG_PATCH_STR);
+      // mov rax, [rip+rel32] → call_count at plDOff+8
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+      var plPP4: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(plPP4, plDOff + 8, 0, CG_PATCH_STR);
+      // inc rax; store back
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+      // mov [rip+rel32], rax → call_count at plDOff+8
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+      var plPP5: int64 := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(plPP5, plDOff + 8, 0, CG_PATCH_STR);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "profile_report", 14)) {
+      // WP-BC-40: profile_report() — print stats for all registered profiling entries.
+      // Compile-time unroll: emit print code for each entry known at this point.
+      if (self.profEntryCount > 0) {
+        // Pre-allocate label strings in data section once
+        var prHdrOff: int64 := self.dataLen;
+        // "[PROFILE] " (10 bytes)
+        self.cg_edata(91);  self.cg_edata(80);  self.cg_edata(82);  // "[PR"
+        self.cg_edata(79);  self.cg_edata(70);  self.cg_edata(73);  // "OFI"
+        self.cg_edata(76);  self.cg_edata(69);  self.cg_edata(93);  // "LE]"
+        self.cg_edata(32);                                           // " "
+        var prColOff: int64 := self.dataLen;
+        // ": " (2 bytes)
+        self.cg_edata(58); self.cg_edata(32);
+        var prCallsOff: int64 := self.dataLen;
+        // " calls, " (8 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(97);  // " ca"
+        self.cg_edata(108); self.cg_edata(108); self.cg_edata(115); // "lls"
+        self.cg_edata(44);  self.cg_edata(32);                      // ", "
+        var prTotalOff: int64 := self.dataLen;
+        // " cycles total, " (15 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
+        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
+        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(116); // "s t"
+        self.cg_edata(111); self.cg_edata(116); self.cg_edata(97);  // "ota"
+        self.cg_edata(108); self.cg_edata(44);  self.cg_edata(32);  // "l, "
+        var prAvgOff: int64 := self.dataLen;
+        // " cycles avg\n" (12 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
+        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
+        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(97);  // "s a"
+        self.cg_edata(118); self.cg_edata(103); self.cg_edata(10);  // "vg\n"
+        var prIdx: int64 := 0;
+        while (prIdx < self.profEntryCount) {
+          var prEBase: int64 := self.profEntries + prIdx * 32;
+          var prNLen:  int64 := peek64(prEBase + 8);
+          var prDOff:  int64 := peek64(prEBase + 16);
+          var prNDOff: int64 := peek64(prEBase + 24);
+          // Write "[PROFILE] " to stderr
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPH: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPH, prHdrOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e32(10);                                                  // mov edx, 10
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Write name
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPN: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPN, prNDOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e32(prNLen);                                              // mov edx, nameLen
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Write ": "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPC: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPC, prColOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 2
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Load call_count → rdi; print decimal
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
+          var prPCnt: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCnt, prDOff + 8, 0, CG_PATCH_STR);
+          self.cg_emitStderrInt();
+          // Write " calls, "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPCa: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCa, prCallsOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(8); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 8
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Load total_cycles → rdi; print decimal
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
+          var prPTot: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTot, prDOff + 16, 0, CG_PATCH_STR);
+          self.cg_emitStderrInt();
+          // Write " cycles total, "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPTo: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTo, prTotalOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(15); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 15
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Compute avg = total_cycles / call_count (0 if count==0)
+          // Load total_cycles → rax
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+          var prPTA: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTA, prDOff + 16, 0, CG_PATCH_STR);
+          // Load call_count → rcx
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
+          var prPCA: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCA, prDOff + 8, 0, CG_PATCH_STR);
+          // test rcx,rcx; jnz +5 .do_div; xor rdi,rdi; jmp +9 .after_div; .do_div: xor rdx,rdx; idiv rcx; mov rdi,rax; .after_div:
+          // Layout: [0..2]=test [3..4]=jnz [5..7]=xor_rdi [8..9]=jmp [10..12]=xor_rdx [13..15]=idiv [16..18]=mov_rdi .after_div=[19]
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);  // test rcx, rcx
+          self.cg_e8(0x75); self.cg_e8(0x05);                     // jnz +5 (.do_div at [10])
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+          self.cg_e8(0xEB); self.cg_e8(0x09);                     // jmp +9 (.after_div at [19])
+          // .do_div: [10]
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor rdx, rdx
+          self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+          // .after_div: print avg
+          self.cg_emitStderrInt();
+          // Write " cycles avg\n"
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPAv: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPAv, prAvgOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(12); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 12
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          prIdx := prIdx + 1;
+        }
+      }
+      self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "exit", 4)) {
       // exit(code): syscall 60, rdi=code
@@ -5145,6 +5444,11 @@ pub type Codegen = class {
     self.globalVars     := mmap(0, self.globalVarCap * 24, 3, 34, -1, 0);
     self.globalIsPchar  := mmap(0, self.globalVarCap, 3, 34, -1, 0);
     self.globalVarCount := 0;
+
+    // WP-BC-40: Profiling entry table (initially empty)
+    self.profEntryCap   := 16;
+    self.profEntries    := mmap(0, self.profEntryCap * 32, 3, 34, -1, 0);
+    self.profEntryCount := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();

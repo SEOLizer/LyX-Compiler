@@ -820,22 +820,29 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-40: Profiling-Infrastruktur
+### WP-BC-40: Profiling-Infrastruktur ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-40-profiling`.
 
 **Ziel:** `profile_enter`/`profile_leave`/`profile_report` als funktionale
 Laufzeit-Profiling-Schicht.
 
-**Referenz:** S0 `builtins.pas:103–105`
+**Implementiert:**
+- `profile_enter("name"c)`: RDTSC (rdtsc; shl rdx,32; or rax,rdx) → speichert tsc_start in Data-Segment
+- `profile_leave("name"c)`: RDTSC, delta = now - tsc_start, akkumuliert total_cycles, inkrementiert call_count
+- `profile_report()`: compile-time-unrolled, gibt für jeden registrierten Eintrag nach stderr aus:
+  `[PROFILE] name: N calls, T cycles total, A cycles avg\n`
+- Compile-time-Eintragstabelle: `profEntries[]{namePtr,nameLen,dataOff,nameDataOff}` in Codegen-Klasse
+- Data-Segment-Layout pro Eintrag: `tsc_start(8) + call_count(8) + total_cycles(8)` = 24 Bytes
+- RIP-relativ Zugriff via `CG_PATCH_STR`-Patches (`mov [rip+rel32], rax` / `mov rax, [rip+rel32]`)
+- Dezimal-Ausgabe via `cg_emitStderrInt()` (Variante ohne Newline von `cg_emitInspectPrintInt()`)
+- IR-Stubs für Nicht-x86-Backends: `IRO_PROFILE_ENTER/LEAVE/REPORT` als NOPs
 
-**S2 hat:** `profile_enter` und `profile_leave` als Built-in-Namen registriert,
-aber keine Implementierung (aktuell: Stubs oder unimplementiert).
-
-**Zu tun:**
-- Codegen für `profile_enter(name)`: RDTSC lesen, Eintrag in Profil-Tabelle
-- Codegen für `profile_leave(name)`: RDTSC lesen, Delta akkumulieren
-- `profile_report()`: alle akkumulierten Daten nach stderr schreiben
-- Profil-Tabelle: mmap-basierter Hash-Map im Data-Segment
-- Format: `[PROFILE] funcname: N calls, X ns total, Y ns avg`
+**Getestet:**
+```
+[PROFILE] work: 5 calls, 1125437 cycles total, 225087 cycles avg
+[PROFILE] single: 1 calls, 2270 cycles total, 2270 cycles avg
+```
 
 ---
 
