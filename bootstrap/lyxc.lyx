@@ -52,6 +52,7 @@ con TARGET_RISCV64:      int64 := 3;
 con TARGET_ARM_CM:       int64 := 4;
 con TARGET_MACOS_X86_64:   int64 := 5;
 con TARGET_WINDOWS_X86_64: int64 := 6;
+con TARGET_MACOS_ARM64:    int64 := 7;
 
 // Optimization levels
 con OPT_NONE: int64 := 0;
@@ -338,6 +339,9 @@ pub type CompilerConfig = class {
         self.target := TARGET_MACOS_X86_64;
       } else if StrCmp(val, "windows-x86_64"c) == 0 {
         self.target := TARGET_WINDOWS_X86_64;
+      } else if StrCmp(val, "macos-arm64"c) == 0 {
+        self.target := TARGET_MACOS_ARM64;
+        self.format := FORMAT_MACHO;
       }
       return;
     }
@@ -623,7 +627,7 @@ pub type CompilerConfig = class {
     PrintStrLn("Options:");
     PrintStrLn("  --std-path=PATH    Stdlib path override");
     PrintStrLn("  --arch=ARCH        Architecture: x86_64, arm64, riscv");
-    PrintStrLn("  --target=<arch>     Target architecture: x86_64, arm64, riscv64, arm_cm, macos-x86_64, windows-x86_64");
+    PrintStrLn("  --target=<arch>     Target architecture: x86_64, arm64, riscv64, arm_cm, macos-x86_64, windows-x86_64, macos-arm64");
     PrintStrLn("  --format=<fmt>     Output format: elf, pe, macho");
     PrintStrLn("  --opt=<level>      Optimization: O0, O1, O2, O3, Osafe");
     PrintStrLn("  --no-opt           Disable IR optimizations");
@@ -886,6 +890,8 @@ pub type CompilerConfig = class {
       PrintStr("emitX86_64 returned: "); PrintInt(codeBuffer); PrintStr("\n");
     } else if self.target == TARGET_ARM64 {
       codeBuffer := self.emitARM64(irMod as int64);
+    } else if self.target == TARGET_MACOS_ARM64 {
+      codeBuffer := self.emitMacOSARM64(irMod as int64);
     } else if self.target == TARGET_RISCV64 {
       codeBuffer := self.emitRISCV(irMod as int64);
     } else if self.target == TARGET_ARM_CM {
@@ -1038,7 +1044,6 @@ pub type CompilerConfig = class {
     // If the IR module has functions, use the IR-based emitter.
     var funcCount: int64 := peek64(irMod + 96);
     if funcCount > 0 {
-      PrintStr("emitARM64: using IR emitter, funcCount="); PrintInt(funcCount); PrintStr("\n");
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
       emitter.emit();
@@ -1137,6 +1142,96 @@ pub type CompilerConfig = class {
     poke8(codeBuf + off,  0x03);   off := off + 1;
     poke8(codeBuf + off,  0x5F);   off := off + 1;
     poke8(codeBuf + off,  0xD6);   off := off + 1;
+
+    self.codeSize := off;
+    return codeBuf;
+  }
+
+  fn emitMacOSARM64(irMod: int64): int64 {
+    // macOS ARM64 (Apple Silicon): 16-byte _start stub + IR-emitted code.
+    // Syscall convention: number in x16, SVC #0x80; exit = 0x2000001.
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitARM64 := new EmitARM64();
+      emitter.init(irMod);
+      emitter.emit();
+      var irCodeLen: int64 := emitter.getCodeLen();
+      var irCodeBuf: int64 := emitter.getCodeBuf();
+      var totalLen: int64 := 16 + irCodeLen;
+      var newBuf: int64 := mmap(0, 131072, 3, 34, -1, 0);
+
+      // BL main — main at offset 16 (4 instructions forward) = 0x94000004
+      poke8(newBuf + 0,  4);     poke8(newBuf + 1,  0);
+      poke8(newBuf + 2,  0);     poke8(newBuf + 3,  0x94);
+      // MOVZ x16, #1 = 0xD2800030
+      poke8(newBuf + 4,  0x30);  poke8(newBuf + 5,  0x00);
+      poke8(newBuf + 6,  0x80);  poke8(newBuf + 7,  0xD2);
+      // MOVK x16, #0x200, LSL#16 = 0xF2A04010  (x16 becomes 0x2000001)
+      poke8(newBuf + 8,  0x10);  poke8(newBuf + 9,  0x40);
+      poke8(newBuf + 10, 0xA0);  poke8(newBuf + 11, 0xF2);
+      // SVC #0x80 = 0xD4001001
+      poke8(newBuf + 12, 0x01);  poke8(newBuf + 13, 0x10);
+      poke8(newBuf + 14, 0x00);  poke8(newBuf + 15, 0xD4);
+
+      var ci: int64 := 0;
+      while ci < irCodeLen {
+        poke8(newBuf + 16 + ci, peek8(irCodeBuf + ci));
+        ci := ci + 1;
+      }
+
+      self.codeSize := totalLen;
+      return newBuf;
+    }
+
+    // Fallback: minimal stub returning 42
+    var codeBuf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+    var off: int64 := 0;
+
+    // BL main (offset 16 → 4 instructions = 0x94000004)
+    poke8(codeBuf + off, 4);     off := off + 1;
+    poke8(codeBuf + off, 0);     off := off + 1;
+    poke8(codeBuf + off, 0);     off := off + 1;
+    poke8(codeBuf + off, 0x94);  off := off + 1;
+    // MOVZ x16, #1 = 0xD2800030
+    poke8(codeBuf + off, 0x30);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0x80);  off := off + 1;
+    poke8(codeBuf + off, 0xD2);  off := off + 1;
+    // MOVK x16, #0x200, LSL#16 = 0xF2A04010
+    poke8(codeBuf + off, 0x10);  off := off + 1;
+    poke8(codeBuf + off, 0x40);  off := off + 1;
+    poke8(codeBuf + off, 0xA0);  off := off + 1;
+    poke8(codeBuf + off, 0xF2);  off := off + 1;
+    // SVC #0x80 = 0xD4001001
+    poke8(codeBuf + off, 0x01);  off := off + 1;
+    poke8(codeBuf + off, 0x10);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0xD4);  off := off + 1;
+    // main: STP x29,x30,[sp,#-16]! = 0xA9BF7BFD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x7B);  off := off + 1;
+    poke8(codeBuf + off, 0xBF);  off := off + 1;
+    poke8(codeBuf + off, 0xA9);  off := off + 1;
+    // MOV x29, sp = 0x910003FD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x03);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0x91);  off := off + 1;
+    // MOVZ x0, #42 = 0xD2800540
+    poke8(codeBuf + off, 0x40);  off := off + 1;
+    poke8(codeBuf + off, 0x05);  off := off + 1;
+    poke8(codeBuf + off, 0x80);  off := off + 1;
+    poke8(codeBuf + off, 0xD2);  off := off + 1;
+    // LDP x29,x30,[sp],#16 = 0xA8C17BFD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x7B);  off := off + 1;
+    poke8(codeBuf + off, 0xC1);  off := off + 1;
+    poke8(codeBuf + off, 0xA8);  off := off + 1;
+    // RET = 0xD65F03C0
+    poke8(codeBuf + off, 0xC0);  off := off + 1;
+    poke8(codeBuf + off, 0x03);  off := off + 1;
+    poke8(codeBuf + off, 0x5F);  off := off + 1;
+    poke8(codeBuf + off, 0xD6);  off := off + 1;
 
     self.codeSize := off;
     return codeBuf;
@@ -1300,18 +1395,181 @@ pub type CompilerConfig = class {
   }
   
   fn writeMachO(path: pchar, code: int64, size: int64): bool {
-    var writer: int64 := MachO64Writer.Create();
-    writer.SetEntry(0x1000);
-    writer.SetTextSection(code, size, 0x1000);
-    
-    var output: int64 := writer.Write();
-    var outputSize: int64 := writer.GetSize();
-    
-    var result: bool := FileWriteAll(path, output as pchar, outputSize);
-    
-    writer.Free();
-    
-    return result;
+    // macOS ARM64 Mach-O binary layout (Apple Silicon, 16KB pages):
+    //   Mach-O header (32 bytes)
+    //   LC_SEGMENT_64 __PAGEZERO (72 bytes, 0 sections)
+    //   LC_SEGMENT_64 __TEXT     (72+80=152 bytes, 1 section)
+    //   LC_MAIN                  (24 bytes)
+    //   Zeros to page boundary P
+    //   Code section (size bytes)
+    //
+    // Page size: ARM64 macOS uses 0x4000 (16KB).
+
+    var pageSize: int64 := 0x4000;
+    var numCmds: int64 := 3;
+    var segPZSize: int64 := 72;
+    var segTextSize: int64 := 152;
+    var lcMainSize: int64 := 24;
+    var totalCmdSz: int64 := segPZSize + segTextSize + lcMainSize;  // 248
+    var H: int64 := 32 + totalCmdSz;   // 280
+    var P: int64 := pageSize;  // H=280 < 16KB so P = one page = 0x4000
+    var textBase: int64 := 0x100000000;
+    var textVMSz: int64 := P + size;
+
+    var outCap: int64 := P + size;
+    var outBuf: int64 := mmap(0, outCap, 3, 34, -1, 0);
+
+    // Zero buffer
+    var z: int64 := 0;
+    while z < outCap {
+      poke8(outBuf + z, 0);
+      z := z + 1;
+    }
+
+    var off: int64 := 0;
+
+    // --- Mach-O header (32 bytes) ---
+    poke32(outBuf + off, 0xFEEDFACF); off := off + 4;  // magic MH_MAGIC_64
+    if self.target == TARGET_MACOS_ARM64 {
+      poke32(outBuf + off, 0x0100000C); off := off + 4;  // CPU_TYPE_ARM64
+      poke32(outBuf + off, 0); off := off + 4;           // CPU_SUBTYPE_ARM64_ALL
+    } else {
+      poke32(outBuf + off, 0x01000007); off := off + 4;  // CPU_TYPE_X86_64
+      poke32(outBuf + off, 3); off := off + 4;           // CPU_SUBTYPE_X86_64_ALL
+    }
+    poke32(outBuf + off, 2); off := off + 4;           // MH_EXECUTE
+    poke32(outBuf + off, numCmds); off := off + 4;
+    poke32(outBuf + off, totalCmdSz); off := off + 4;
+    poke32(outBuf + off, 0x00200001); off := off + 4;  // MH_NOUNDEFS|MH_PIE
+    poke32(outBuf + off, 0); off := off + 4;           // reserved
+
+    // --- LC_SEGMENT_64 __PAGEZERO (72 bytes) ---
+    poke32(outBuf + off, 0x19); off := off + 4;   // LC_SEGMENT_64
+    poke32(outBuf + off, 72); off := off + 4;     // cmdsize
+    // segname "__PAGEZERO" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  80); off := off + 1;  // 'P'
+    poke8(outBuf + off,  65); off := off + 1;  // 'A'
+    poke8(outBuf + off,  71); off := off + 1;  // 'G'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  90); off := off + 1;  // 'Z'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  82); off := off + 1;  // 'R'
+    poke8(outBuf + off,  79); off := off + 1;  // 'O'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, 0); off := off + 8;          // vmaddr = 0
+    poke64(outBuf + off, textBase); off := off + 8;   // vmsize = 0x100000000
+    poke64(outBuf + off, 0); off := off + 8;          // fileoff = 0
+    poke64(outBuf + off, 0); off := off + 8;          // filesize = 0
+    poke32(outBuf + off, 0); off := off + 4;          // maxprot = NONE
+    poke32(outBuf + off, 0); off := off + 4;          // initprot = NONE
+    poke32(outBuf + off, 0); off := off + 4;          // nsects = 0
+    poke32(outBuf + off, 0); off := off + 4;          // flags = 0
+
+    // --- LC_SEGMENT_64 __TEXT (152 bytes) ---
+    poke32(outBuf + off, 0x19); off := off + 4;   // LC_SEGMENT_64
+    poke32(outBuf + off, 152); off := off + 4;    // cmdsize
+    // segname "__TEXT" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  88); off := off + 1;  // 'X'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, textBase); off := off + 8;   // vmaddr
+    poke64(outBuf + off, textVMSz); off := off + 8;   // vmsize
+    poke64(outBuf + off, 0); off := off + 8;          // fileoff = 0 (whole file)
+    poke64(outBuf + off, textVMSz); off := off + 8;   // filesize
+    poke32(outBuf + off, 5); off := off + 4;          // maxprot = R|X
+    poke32(outBuf + off, 5); off := off + 4;          // initprot = R|X
+    poke32(outBuf + off, 1); off := off + 4;          // nsects = 1
+    poke32(outBuf + off, 0); off := off + 4;          // flags = 0
+
+    // Section __text in __TEXT (80 bytes)
+    // sectname "__text" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off, 116); off := off + 1;  // 't'
+    poke8(outBuf + off, 101); off := off + 1;  // 'e'
+    poke8(outBuf + off, 120); off := off + 1;  // 'x'
+    poke8(outBuf + off, 116); off := off + 1;  // 't'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    // segname "__TEXT" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  88); off := off + 1;  // 'X'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, textBase + P); off := off + 8;  // addr
+    poke64(outBuf + off, size); off := off + 8;          // size
+    poke32(outBuf + off, P); off := off + 4;             // offset in file
+    poke32(outBuf + off, 4); off := off + 4;             // align = 2^4
+    poke32(outBuf + off, 0); off := off + 4;             // reloff
+    poke32(outBuf + off, 0); off := off + 4;             // nreloc
+    poke32(outBuf + off, 0x80000400); off := off + 4;    // flags = PURE|SOME_INSTR
+    poke32(outBuf + off, 0); off := off + 4;             // reserved1
+    poke32(outBuf + off, 0); off := off + 4;             // reserved2
+    poke32(outBuf + off, 0); off := off + 4;             // reserved3
+
+    // --- LC_MAIN (24 bytes) ---
+    poke32(outBuf + off, 0x80000028); off := off + 4;  // LC_MAIN
+    poke32(outBuf + off, 24); off := off + 4;          // cmdsize
+    poke64(outBuf + off, P); off := off + 8;           // entryoff (from __TEXT start)
+    poke64(outBuf + off, 0); off := off + 8;           // stacksize = 0
+
+    // Copy code at offset P (buffer already zeroed)
+    var ci: int64 := 0;
+    while ci < size {
+      poke8(outBuf + P + ci, peek8(code + ci));
+      ci := ci + 1;
+    }
+
+    // Write to file
+    var fd: int64 := open(path, 577, 493);
+    if fd < 0 {
+      munmap(outBuf, outCap);
+      return false;
+    }
+    write(fd, outBuf as pchar, outCap);
+    close(fd);
+    munmap(outBuf, outCap);
+    return true;
   }
   
   // ---------------------------------------------------------------------------
