@@ -189,6 +189,9 @@ pub type CompilerConfig = class {
   typeReasoning: bool;
   constraintLog: bool;
 
+  // WP-BC-47: IR provenance tracking
+  provenance: bool;
+
   // Compilation state
   exitCode: int64;
   errorCount: int64;
@@ -245,6 +248,7 @@ pub type CompilerConfig = class {
     self.symtabDump     := false;
     self.typeReasoning  := false;
     self.constraintLog  := false;
+    self.provenance     := false;
     self.exitCode := 0;
     self.errorCount := 0;
     self.warningCount := 0;
@@ -637,6 +641,12 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-BC-47: --provenance
+    if StrCmp(arg, "--provenance"c) == 0 {
+      self.provenance := true;
+      return;
+    }
+
     // --version
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr(COMPILER_NAME);
@@ -776,6 +786,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --symtab-dump      Print symbol table after sema (continues compilation)");
     PrintStrLn("  --type-reasoning   Log each type-inference decision during sema");
     PrintStrLn("  --constraint-log   Log each type constraint generated during sema");
+    PrintStrLn("  --provenance       Dump IR→AST→source provenance chain after IR gen");
     PrintStrLn("  --include <hdr.h>  Parse C header and emit extern fn declarations");
     PrintStrLn("  -I <path>          Add include search path for imports");
     PrintStrLn("  -I<path>           Same as -I <path> (inline form)");
@@ -847,7 +858,6 @@ pub type CompilerConfig = class {
     self.emitLfdForms(astRoot, parser.nodes, source, inputFile);
 
     // Stage 3: Semantic Analysis
-    PrintStrLn("=== Stage 3: Sema START ===");
     var _t3: int64 := self._passStart("sema"c);
     var sema: Sema := new Sema();
     sema.Init(source, StrLen(source), parser.nodes, parser.nodeCount, parser.toks);
@@ -855,8 +865,7 @@ pub type CompilerConfig = class {
     sema.stdPath        := self.stdPath;       // WP-BC-42: --std-path override
     sema.typeReasoning  := self.typeReasoning; // WP-BC-46
     sema.constraintLog  := self.constraintLog; // WP-BC-46
-    var semaResult: int64 := sema.Check(0);  // Use index 0 for Sema
-    PrintStrLn("Sema.Check done");
+    var semaResult: int64 := sema.Check(0);
     self._passEnd("sema"c, _t3);
 
     // WP-BC-45: --symtab-dump (non-destructive, continues compilation)
@@ -923,7 +932,8 @@ pub type CompilerConfig = class {
     }
 
     // Stage 5-8 (x86_64 fast path): use direct AST→ELF Codegen (proven, no IR needed)
-    if self.target == TARGET_X86_64 {
+    // WP-BC-47: skip fast path when --provenance is set (needs IR)
+    if self.target == TARGET_X86_64 && !self.provenance {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5x: int64 := self._passStart("codegen-x86_64"c);
@@ -973,66 +983,30 @@ pub type CompilerConfig = class {
     }
 
     // Stage 5: IR Generation (for non-x86_64 targets)
-    PrintStrLn("=== Stage 5: IR Generation START ===");
-    
     // Create IR module and lower AST → IR
-    PrintStrLn("Creating IRModule...");
     var irMod: IRModule := new IRModule();
-    PrintStrLn("IRModule created, calling init...");
     irMod.init();
     irMod.irSourceMap := self.irSourceMap;  // WP-BC-44
-    PrintStrLn("IRModule.init done");
+    irMod.provenance  := self.provenance;   // WP-BC-47
 
-    // Debug: check IRModule state
-    PrintStr("irMod funcLen after init = "); PrintInt(irMod.funcLen); PrintStr("\n");
-    PrintStr("irMod instrLen after init = "); PrintInt(irMod.instrLen); PrintStr("\n");
-    // Also check via getter methods
-    PrintStr("irMod.getFuncCount() = "); PrintInt(irMod.getFuncCount()); PrintStr("\n");
-    PrintStr("irMod.getInstrCount() = "); PrintInt(irMod.getInstrCount()); PrintStr("\n");
-    PrintStr("irMod.getFuncCap() = "); PrintInt(irMod.getFuncCap()); PrintStr("\n");
-    PrintStr("irMod.getFuncBuffer() = "); PrintInt(irMod.getFuncBuffer()); PrintStr("\n");
-
-    PrintStrLn("Creating IRLower...");
     var lower: IRLower := new IRLower();
-    PrintStrLn("IRLower created, calling init...");
-    // Pass IRModule as int64 pointer and as object reference
     var irPtr: int64 := irMod as int64;
-    PrintStr("lyxc: passing irPtr = "); PrintInt(irPtr); PrintStr("\n");
     lower.init(irPtr, parser.nodes, parser.nodeCount, source, irMod);
-    PrintStr("lyxc: after lower.init, irPtr = "); PrintInt(irPtr); PrintStr("\n");
-    PrintStrLn("IRLower.init done, calling lowerModule...");
     lower.lowerModule(astRoot);
-    PrintStrLn("lowerModule done");
 
     // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
     if self.dumpIR || self.irSourceMap {
       irMod.dump();
     }
 
-    // Debug: check global function count from lower
-    PrintStr("lyxc: lower.globalFuncCount = "); PrintInt(lower.globalFuncCount); PrintStr("\n");
+    // WP-BC-47: --provenance dump
+    if self.provenance {
+      self.dumpProvenance(irMod, parser.nodes, source, inputFile);
+    }
+    
+    // Stage 6: Optimization (skipped)
 
-    // Debug: check IRModule after lowering
-    PrintStr("irMod funcLen after lower = "); PrintInt(irMod.funcLen); PrintStr("\n");
-    PrintStr("irMod instrLen after lower = "); PrintInt(irMod.instrLen); PrintStr("\n");
-    PrintStr("irMod.getFuncCount() = "); PrintInt(irMod.getFuncCount()); PrintStr("\n");
-    PrintStr("irMod.getInstrCount() = "); PrintInt(irMod.getInstrCount()); PrintStr("\n");
-    PrintStr("irMod.getFuncCap() = "); PrintInt(irMod.getFuncCap()); PrintStr("\n");
-    PrintStr("irMod.getFuncBuffer() = "); PrintInt(irMod.getFuncBuffer()); PrintStr("\n");
-    
-    PrintStrLn("About to go to Stage 6...");
-    
-    PrintStr("optLevel = "); PrintInt(self.optLevel); PrintStr("\n");
-    PrintStr("OPT_NONE = "); PrintInt(OPT_NONE); PrintStr("\n");
-    
-    // Stage 6: Optimization
-    // Skip optimization for test
-    PrintStrLn("Stage 6: Optimization (skipped)");
-    
     // Stage 7: Code Generation
-    PrintStrLn("=== Stage 7 START ===");
-    PrintStr("target = "); PrintInt(self.target); PrintStr("\n");
-    PrintStr("TARGET_X86_64 = "); PrintInt(TARGET_X86_64); PrintStr("\n");
     if self.enableVerbose {
       PrintStrLn("Stage 7: Code Generation...");
     }
@@ -1040,9 +1014,7 @@ pub type CompilerConfig = class {
     var codeBuffer: int64 := 0;
 
     if self.target == TARGET_X86_64 {
-      PrintStrLn("Calling emitX86_64...");
       codeBuffer := self.emitX86_64(irMod as int64, lower);
-      PrintStr("emitX86_64 returned: "); PrintInt(codeBuffer); PrintStr("\n");
     } else if self.target == TARGET_ARM64 {
       codeBuffer := self.emitARM64(irMod as int64);
     } else if self.target == TARGET_MACOS_ARM64 {
@@ -1061,10 +1033,8 @@ pub type CompilerConfig = class {
       codeBuffer := self.emitARMCm(irMod as int64);
     }
 
-    PrintStr("Final codeBuffer = "); PrintInt(codeBuffer); PrintStr("\n");
-
     if codeBuffer == 0 {
-      PrintStrLn("ERROR: codeBuffer is 0 - codegen failed!");
+      EPrintStrLn("error: codegen failed");
       self.exitCode := 1;
       return self.exitCode;
     }
@@ -1078,23 +1048,16 @@ pub type CompilerConfig = class {
     // (self.codeSize was set by emitX86_64)
 
     // Stage 8: Binary Writing
-    PrintStrLn("=== Stage 8 START ===");
     if self.enableVerbose {
       PrintStrLn("Stage 8: Writing Binary...");
     }
 
-    // Use the stored outputFile field
     var outFile: pchar := self.outputFile;
     if outFile == 0 {
       outFile := "a.out"c;
     }
-    
-    PrintStr("outFile = "); PrintInt(outFile as int64); PrintStr("\n");
-    PrintStr("codeBuffer = "); PrintInt(codeBuffer); PrintStr("\n");
-    PrintStr("self.codeSize = "); PrintInt(self.codeSize); PrintStr("\n");
-    
+
     var writeResult: bool := self.writeBinary(outFile, codeBuffer, self.codeSize);
-    PrintStr("writeResult = "); PrintInt(writeResult as int64); PrintStr("\n");
     
     if not writeResult {
       EPrintStrLn("Error: Cannot write output file");
@@ -1606,22 +1569,13 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   fn writeBinary(path: pchar, code: int64, size: int64): bool {
-    PrintStrLn("=== writeBinary START ===");
-    PrintStr("path = "); PrintInt(path as int64); PrintStr("\n");
-    PrintStr("code = "); PrintInt(code); PrintStr("\n");
-    PrintStr("size = "); PrintInt(size); PrintStr("\n");
-    PrintStr("format = "); PrintInt(self.format); PrintStr("\n");
-    PrintStr("FORMAT_ELF = "); PrintInt(FORMAT_ELF); PrintStr("\n");
-    
     if self.format == FORMAT_ELF {
-      PrintStrLn("writeBinary: calling writeELF...");
       return self.writeELF(path, code, size);
     } else if self.format == FORMAT_PE {
       return self.writePE(path, code, size);
     } else if self.format == FORMAT_MACHO {
       return self.writeMachO(path, code, size);
     }
-    PrintStrLn("writeBinary: unknown format, returning false");
     return false;
   }
   
@@ -2052,7 +2006,60 @@ pub type CompilerConfig = class {
     PrintStrLn("=== SEMANTIC INFO ===");
     // Would dump symbol table
   }
-  
+
+  // WP-BC-47: count newlines up to offset to get 1-based line number
+  fn _lineFromSrcOff(src: pchar, sOff: int64): int64 {
+    var line: int64 := 1;
+    var i: int64 := 0;
+    while i < sOff {
+      if StrCharAt(src, i) == 10 { line := line + 1; }
+      i := i + 1;
+    }
+    return line;
+  }
+
+  // WP-BC-47: provenance dump — IR[N] op → AST[M] kind 'name' → src:file:line
+  fn dumpProvenance(irMod: IRModule, pNodes: int64, src: pchar, srcFile: pchar): void {
+    PrintStr("=== PROVENANCE ===\n"c);
+    var count: int64 := irMod.instrLen;
+    var i: int64 := 0;
+    while i < count {
+      var astNi: int64 := irMod.getAstNode(i);
+      PrintStr("IR["c);
+      PrintInt(i);
+      PrintStr("] "c);
+      PrintStr(irMod.dumpOp(irMod.getInstrOp(i)));
+      PrintStr("  ->  "c);
+      if astNi < 0 {
+        PrintStr("AST[-] ?\n"c);
+      } else {
+        var base: int64 := pNodes + astNi * 88;
+        var kind: int64 := peek64(base);
+        var sOff: int64 := peek64(base + 64);
+        var sLen: int64 := peek64(base + 72);
+        PrintStr("AST["c);
+        PrintInt(astNi);
+        PrintStr("] "c);
+        PrintStr(self._nkStr(kind));
+        if sLen > 0 && (src as int64) != 0 {
+          PrintStr(" '"c);
+          PrintStr(StrSub(src, sOff, sLen));
+          PrintStr("'"c);
+        }
+        PrintStr("  ->  src:"c);
+        if (srcFile as int64) != 0 { PrintStr(srcFile); } else { PrintStr("?"c); }
+        PrintStr(":"c);
+        if (src as int64) != 0 {
+          PrintInt(self._lineFromSrcOff(src, sOff));
+        } else {
+          PrintStr("?"c);
+        }
+        PrintStr("\n"c);
+      }
+      i := i + 1;
+    }
+  }
+
   fn dumpIR(irMod: int64): void {
     PrintStrLn("=== IR DUMP ===");
     // Would dump IR
