@@ -736,19 +736,20 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-35: Windows ARM64 Backend
+### ✅ WP-BC-35: Windows ARM64 Backend
+
+**Status:** Erledigt — Branch `feat/wp-bc-35-windows-arm64`
 
 **Ziel:** PE64-ARM64-Binaries (.exe) für Windows on ARM.
 
-**Referenz:** S0 `compiler/backend/win_arm64/win_arm64_emit.pas` (3.547 Zeilen),
-`compiler/backend/win_arm64/pe64_arm64_writer.pas`
-
-**Zu tun:**
-- Aufbauend auf WP-BC-32 (PE64) und WP-BC-33 (AArch64 Codegen)
-- Windows ARM64 ABI: x0–x7 für Args, Home Space (je 8 Bytes für x0–x3)
-- PE64-Maschinen-Typ: `IMAGE_FILE_MACHINE_ARM64` = 0xAA64
-- Import Table für `kernel32.dll` via ARM64-IAT-Stubs
-- CLI-Flag `--target windows-arm64`
+**Ergebnis:** `file` meldet `PE32+ executable (console) Aarch64, for MS Windows, 2 sections`.
+- Neue Datei `bootstrap/backend/win_arm64.lyx` — `WinARM64Backend`-Klasse
+- _start-Stub (28 Bytes): STP/MOV/BL main/ADRP+LDR+BLR ExitProcess/BRK
+- IAT-Patch: ADRP+LDR für ExitProcess aus `KERNEL32.DLL` zur WritePE64-Zeit berechnet
+- `IMAGE_FILE_MACHINE_ARM64 = 0xAA64`, Optional Header PE32+ (0x020B)
+- Import Directory + IAT für ExitProcess korrekt in .rdata-Sektion
+- `emitWindowsARM64()` in `lyxc.lyx` als self-contained Emitter
+- CLI-Flag `--target=windows-arm64`
 
 ---
 
