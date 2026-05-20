@@ -804,19 +804,19 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ## Phase 7 — Spezialfunktionen
 
-### WP-BC-39: `Inspect` In-Situ-Datenvisualisierer
+### WP-BC-39: `Inspect` In-Situ-Datenvisualisierer ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-39-inspect`.
 
 **Ziel:** `Inspect(expr)` für interaktives Runtime-Debugging.
 
-**Referenz:** S0 `nkInspect` in `compiler/frontend/ast.pas:127`;
-`IRO_INSPECT` bereits in `bootstrap/ir.lyx:153`
-
-**Zu tun:**
-- Sema: `Inspect(expr)` für beliebige Typen (Sonderbehandlung wie in S0)
-- IR-Lowering: `IRO_INSPECT` mit Typ-Info und Variablenname als ImmStr
-- Codegen: Serialisierung des Wertes als lesbaren String + `write`-Syscall
-- Für Struct-Typen: Felder mit Namen ausgeben
-- Format: `[Inspect:varname@line] value` auf stderr
+**Ergebnis:**
+- `sema.lyx`: "Inspect" als Builtin registriert (akzeptiert beliebige Typen)
+- `ir_lower.lyx`: `irAddString`/`irSetStrOff` Helpers; Inspect-Call → `IRO_INSPECT` mit Variablenname in String-Tabelle
+- `codegen_x86.lyx`: `cg_emitInspectPrintInt()` (int64→dezimal→stderr); `cg_seq("Inspect")` Zweig mit Inline-Write-Syscalls
+- Format: `[Inspect:varname] value\n` auf stderr (fd=2)
+- Variablenname wird aus Ident-AST-Node extrahiert; andere Ausdrücke → `?`
+- Verifiziert: `Inspect(x)` = `[Inspect:x] 42`; `Inspect(-999)` korrekt; stdout unbeeinflusst
 
 ---
 
