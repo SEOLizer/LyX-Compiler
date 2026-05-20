@@ -846,7 +846,7 @@ Laufzeit-Profiling-Schicht.
 
 ---
 
-### WP-BC-41: LFD Qt-UI-Builder
+### WP-BC-41: LFD Qt-UI-Builder ✅
 
 **Ziel:** `Form`/`Widget`/`Layout`/`Signal`-Syntax für deklarative Qt5-UIs.
 
