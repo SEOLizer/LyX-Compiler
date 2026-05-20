@@ -134,10 +134,11 @@ pub type EmitARM64 = class {
     self.calcStackFrame(funcId);
     self.emitPrologue();
 
-    var n: int64 := self.getFuncInstrCount(funcId);
+    var instrStart: int64 := self.getFuncInstrStart(funcId);
+    var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
-    while i < n {
-      self.emitInstr(funcId, i);
+    while i < instrCount {
+      self.emitInstr(funcId, instrStart + i);
       i := i + 1;
     }
 
@@ -187,8 +188,8 @@ pub type EmitARM64 = class {
   }
 
   fn emitEpilogue() {
-    // MOV sp, x29  (= ADD sp, x29, #0)
-    self.emit32(0x9100037F);
+    // MOV sp, x29  (= ADD sp, x29, #0)  — 0x91000000|(29<<5)|31 = 0x910003BF
+    self.emit32(0x910003BF);
     // LDP x29, x30, [sp], #16
     self.emit32(0xA8C17BFD);
     // RET
@@ -410,21 +411,13 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn emitLoadLocal(src: int64, dest: int64) {
-    // load pointer-sized value from slot src, store to slot dest
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // x0 is now the address; load 64-bit value from it
-    self.emit32(0xF9400000 | (ARM64_X0 << 5) | ARM64_X0);  // LDR x0, [x0]
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
   fn emitStoreLocal(src: int64, dest: int64) {
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(dest));
-    // STR x0, [x1]
-    self.emit32(0xF9000000 | (ARM64_X0 << 5) | ARM64_X1);  // STR x0, [x1] — needs fix?
-    // Actually STR Xt, [Xn]: 0xF9000000 | (Xn<<5) | Xt
-    // Rewrite: STR x0, [x1]
-    // 0xF9000020 = STR x0, [x1, #0]
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
   fn emitLoadSlot(src: int64, dest: int64) {
@@ -749,51 +742,55 @@ pub type EmitARM64 = class {
   fn getCodeLen(): int64 { return self.codeLen; }
 
   // -------------------------------------------------------------------------
-  // IR Module Helpers  (same layout as x86 emitter)
+  // IR Module Helpers
+  //
+  // IRModule memory layout (VMT at +0, then fields):
+  //   +8:  instrBuffer  — pointer to instruction array
+  //   +16: instrCap
+  //   +24: instrLen     — instruction COUNT (not bytes; each instr = 80 bytes)
+  //   +80: funcBuffer   — pointer to function record array
+  //   +88: funcCap
+  //   +96: funcLen      — function COUNT
+  //
+  // Function record (80 bytes each):
+  //   +0:  nameOff
+  //   +8:  nameLen
+  //   +16: instrsOff    — first instruction index for this function
+  //   +24: instrCount   — number of instructions for this function
+  //   +32: localCount
+  //   +40: paramCount
+  //
+  // Instruction record (80 bytes each):
+  //   +0:  op    +8: dest  +16: src1  +24: src2  +32: src3  +40: imm
   // -------------------------------------------------------------------------
 
   fn getFuncCount(): int64 {
-    return peek64(self.ir + 8);
-  }
-
-  fn getFuncId(idx: int64): int64 {
-    return idx;
+    return peek64(self.ir + 96);
   }
 
   fn getFuncLocalCount(funcId: int64): int64 {
-    var funcs: int64  := peek64(self.ir);
-    var fbuf:  int64  := peek64(funcs);
-    return peek64(fbuf + funcId * 80 + 32);
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 32);
+  }
+
+  fn getFuncInstrStart(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 16);
   }
 
   fn getFuncInstrCount(funcId: int64): int64 {
-    var funcs: int64 := peek64(self.ir);
-    var fbuf:  int64 := peek64(funcs);
-    return peek64(fbuf + funcId * 80 + 24);
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 24);
   }
 
-  fn getInstrOp(idx: int64): int64 {
-    var instrBuf: int64 := peek64(self.ir);
-    return peek64(instrBuf + idx * 80);
+  fn getInstrField(absIdx: int64, fieldOff: int64): int64 {
+    var instrBuf: int64 := peek64(self.ir + 8);
+    return peek64(instrBuf + absIdx * 80 + fieldOff);
   }
 
-  fn getInstrDest(idx: int64): int64 {
-    var instrBuf: int64 := peek64(self.ir);
-    return peek64(instrBuf + idx * 80 + 8);
-  }
-
-  fn getInstrSrc1(idx: int64): int64 {
-    var instrBuf: int64 := peek64(self.ir);
-    return peek64(instrBuf + idx * 80 + 16);
-  }
-
-  fn getInstrSrc2(idx: int64): int64 {
-    var instrBuf: int64 := peek64(self.ir);
-    return peek64(instrBuf + idx * 80 + 24);
-  }
-
-  fn getInstrImmInt(idx: int64): int64 {
-    var instrBuf: int64 := peek64(self.ir);
-    return peek64(instrBuf + idx * 80 + 40);
-  }
+  fn getInstrOp(absIdx: int64): int64   { return self.getInstrField(absIdx, 0); }
+  fn getInstrDest(absIdx: int64): int64  { return self.getInstrField(absIdx, 8); }
+  fn getInstrSrc1(absIdx: int64): int64  { return self.getInstrField(absIdx, 16); }
+  fn getInstrSrc2(absIdx: int64): int64  { return self.getInstrField(absIdx, 24); }
+  fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
 };

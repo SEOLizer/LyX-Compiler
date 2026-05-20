@@ -695,23 +695,26 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-33: ARM64/AArch64 Linux Backend
+### ✅ WP-BC-33: ARM64/AArch64 Linux Backend
 
 **Ziel:** ELF64-Binaries für ARM64 (AArch64) Linux.
 
 **Referenz:** S0 `compiler/backend/arm64/arm64_emit.pas` (5.429 Zeilen),
 `compiler/backend/elf/elf64_arm64_writer.pas`
 
-**Zu tun:**
-- Neue Datei `bootstrap/backend/arm64_linux.lyx`
-- AArch64 Instruction Encoding (32-bit fixed-width)
-- Basis-Instruktionen: `MOV`/`MOVZ`/`MOVK`, `ADD`/`SUB`/`MUL`, `LDR`/`STR`,
-  `B`/`BL`/`CBZ`/`CBNZ`, `SVC #0` für Syscalls
-- Linux AArch64 ABI: x0–x7 für Argumente, x8 für Syscall-Nummer
-- Linux ARM64 Syscall-Nummern: `write`=64, `exit`=93, `mmap`=222, etc.
+**Status:** ✅ Implementiert und getestet (QEMU exit code 42 ✓)
+
+**Erledigt:**
+- `bootstrap/backend/arm64/emit_arm64.lyx` — vollständiger IR→ARM64 Emitter
+- AArch64 Instruction Encoding (32-bit fixed-width), alle Basis-Instruktionen
+- LDUR/STUR (simm9), MOVZ/MOVK, ADD/SUB/MUL/SDIV, B/BL/CBZ/CBNZ, SVC
+- Linux AArch64 ABI: x0–x7 Argumente, x8 Syscall-Nummer, x29 FP, x30 LR
+- Linux ARM64 Syscall-Nummern: write=64, exit=93, mmap=222, munmap=215
 - ELF64-ARM64-Header (e_machine = 0xB7 = EM_AARCH64)
-- Stack-Frame: FP (x29) + LR (x30)
+- Stack-Frame mit FP (x29) + LR (x30), LDUR/STUR für Stack-Slots
 - CLI-Flag `--target linux-arm64`
+- `_start`-Wrapper (BL main + exit-Syscall) vor IR-emittiertem Code
+- Label-Backpatching für B/CBZ/CBNZ/BL
 
 ---
 
