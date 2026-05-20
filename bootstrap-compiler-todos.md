@@ -782,22 +782,23 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-38: Xtensa (ESP32) Backend
+### WP-BC-38: Xtensa (ESP32) Backend ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-38-xtensa-esp32`.
 
 **Ziel:** ELF32-Binaries für Xtensa LX6/LX7 (ESP32 / ESP32-S3).
 
-**Referenz:** S0 `compiler/backend/xtensa/xtensa_emit.pas` (2.200 Zeilen),
-`compiler/backend/esp32/elf32_writer.pas`
+**Ergebnis:**
+- `bootstrap/backend/xtensa.lyx` (~707 Zeilen): `EmitXtensa` + `XtensaBackend`
+- CALL0 ABI (non-windowed): a0=RA, a1=SP, a2-a5=args/retval, a8-a10=temps
+- 3-Byte-Instruktionen: RRR, RRI8, MOVI (RI12), BRI12, CALL/J; NOP={0x00,0x00,0x20}
+- 4-Byte-Alignment-Padding vor Funktionen und Sprungzielen
+- ELF32: e_machine=0x5E (EM_XTENSA), e_entry=0x40080000 (ESP32 IRAM base)
+- CLI-Flags `--target=esp32` und `--target=esp32s3` in `bootstrap/lyxc.lyx`
+- `readelf -h`: Maschine = "Tensilica Xtensa Processor", ELF32 LE, Einstieg 0x40080000 ✓
 
-**Zu tun:**
-- Neue Datei `bootstrap/backend/xtensa.lyx`
-- Xtensa Instruction Encoding (24-bit oder 16-bit narrow)
-- Basis-Instruktionen: `MOVI`/`MOV.N`, `ADD`/`SUB`/`MUL16S`, `L32I`/`S32I`,
-  `BEQZ`/`BNEZ`/`J`/`CALL0`/`RET`
-- ESP32 IDF Calling Convention: a2–a7 für Argumente, Windowed Registers
-- ELF32-Xtensa: e_machine = 0x5E = EM_XTENSA
-- `esp_idf_syscalls.lyx` für ESP-IDF API-Bindings
-- CLI-Flag `--target esp32` / `--target esp32s3`
+**Hinweis:** Pascal-Referenzcode (`xtensa_emit.pas`) enthält fehlerhafte Register-Encoding
+(`$02 or Byte(dest)` → Aliasing). Korrekte Encodings wurden aus der Xtensa ISA abgeleitet.
 
 ---
 

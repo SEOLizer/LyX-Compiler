@@ -1,0 +1,707 @@
+// bootstrap/backend/xtensa.lyx
+// Xtensa LX6/LX7 (ESP32/ESP32-S3) ELF32 backend (WP-BC-38)
+//
+// ELF32 layout (page-aligned):
+//   file[0..4095]    ELF32 header + PT_LOAD program header
+//   file[4096..]     .text: IR code (function 0 is the entry point)
+//   Entry VA: 0x40080000 (ESP32 IRAM base)
+//
+// Xtensa CALL0 ABI (non-windowed, no ENTRY instruction):
+//   a0  = return address      a1 = stack pointer
+//   a2-a5 = args 0-3          a2 = return value
+//   a8 = temp0 (XT_T0)        a9 = temp1 (XT_T1)     a10 = temp2 (XT_T2)
+//
+// Stack frame (CALL0):
+//   ADDI a1, a1, -framesize   (or MOVI a10,delta + ADD a1,a1,a10 for large frames)
+//   S32I a0, a1, 0             [a1+0]     = saved return address
+//   slot(i) = [a1 + (i+1)*4]  word-offset = i+1 (i in 0..localCount-1)
+//
+// Epilogue:
+//   L32I a2, a1, 1     return value = slot 0
+//   L32I a0, a1, 0     restore RA
+//   ADDI a1, a1, framesize
+//   JX a0              return (jump indirect via a0)
+//
+// Instruction encoding (LE 3-byte):
+//   RRR:   b0=(t<<4)|0,  b1=(r<<4)|s,          b2=(op2<<4)|op1
+//   RRI8:  b0=(t<<4)|2,  b1=((im&0xF)<<4)|s,   b2=(op1<<4)|(im>>4)
+//   MOVI:  b0=(r<<4)|6,  b1=im12&0xFF,          b2=0xA0|(im12>>8)&0xF
+//   BRI12: b0=(m<<4)|7,  b1=((im12&0xF)<<4)|s,  b2=(im12>>4)&0xFF
+//   CALL:  b0=((off18&3)<<6)|(n<<4)|op0, b1=(off18>>2)&0xFF, b2=(off18>>10)&0xFF
+//   JX a0: {0x00, 0x00, 0xD0}
+
+// ============================================================================
+// Register and constant definitions
+// ============================================================================
+
+con XT_A0: int64 := 0;    // return address in CALL0 ABI
+con XT_SP: int64 := 1;    // a1 = stack pointer
+con XT_RV: int64 := 2;    // a2 = return value / arg0
+con XT_A3: int64 := 3;
+con XT_A4: int64 := 4;
+con XT_A5: int64 := 5;
+con XT_T0: int64 := 8;    // a8 = primary scratch temp
+con XT_T1: int64 := 9;    // a9 = secondary scratch temp
+con XT_T2: int64 := 10;   // a10 = tertiary scratch temp
+
+// Patch types
+con XT_PATCH_CALL0: int64 := 0;
+con XT_PATCH_J:     int64 := 1;
+con XT_PATCH_BEQZ:  int64 := 2;
+con XT_PATCH_BNEZ:  int64 := 3;
+
+// ESP32 IRAM base address
+con XT_IRAM_BASE: int64 := 0x40080000;
+
+// ============================================================================
+// EmitXtensa  —  IR → Xtensa LX6 machine code
+// ============================================================================
+
+pub type EmitXtensa = class {
+  codeBuf:    int64;
+  codeLen:    int64;
+  codeCap:    int64;
+  ir:         int64;
+  stackSize:  int64;
+  labelAddrs: int64;
+  patchBuf:   int64;
+  patchCount: int64;
+  funcAddrs:  int64;
+  funcCount:  int64;
+
+  // --------------------------------------------------------------------------
+  // Raw code emission
+  // --------------------------------------------------------------------------
+
+  fn xt_e3(b0: int64, b1: int64, b2: int64) {
+    poke8(self.codeBuf + self.codeLen,     b0 & 0xFF);
+    poke8(self.codeBuf + self.codeLen + 1, b1 & 0xFF);
+    poke8(self.codeBuf + self.codeLen + 2, b2 & 0xFF);
+    self.codeLen := self.codeLen + 3;
+  }
+
+  fn xt_poke3(off: int64, b0: int64, b1: int64, b2: int64) {
+    poke8(self.codeBuf + off,     b0 & 0xFF);
+    poke8(self.codeBuf + off + 1, b1 & 0xFF);
+    poke8(self.codeBuf + off + 2, b2 & 0xFF);
+  }
+
+  // NOP = OR a0, a0, a0
+  fn xt_NOP() { self.xt_e3(0x00, 0x00, 0x20); }
+
+  // --------------------------------------------------------------------------
+  // RRR-format: b0=(t<<4), b1=(r<<4)|s, b2=(op2<<4)|op1
+  // --------------------------------------------------------------------------
+
+  fn xt_ADD(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x80);   // op2=8, op1=0
+  }
+  fn xt_SUB(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0xC0);   // op2=12, op1=0
+  }
+  fn xt_AND(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x10);   // op2=1, op1=0
+  }
+  fn xt_OR(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x20);   // op2=2, op1=0
+  }
+  fn xt_XOR(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x30);   // op2=3, op1=0
+  }
+  fn xt_NEG(ar: int64, at: int64) {
+    self.xt_e3(at << 4, ar << 4, 0x60);            // op2=6, op1=0, s=0
+  }
+  fn xt_MOV(ar: int64, as_: int64) {
+    self.xt_OR(ar, as_, as_);                       // OR ar, as, as
+  }
+  fn xt_MULL(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x88);   // op2=8, op1=8 (MUL32)
+  }
+
+  // Shift-amount setup: SSL as → SAR:=32-as (for SLL), SSR as → SAR:=as (for SRL)
+  fn xt_SSL(as_: int64) { self.xt_e3(0x00, as_, 0x03); }  // op2=0, op1=3
+  fn xt_SSR(as_: int64) { self.xt_e3(0x00, as_, 0x13); }  // op2=1, op1=3
+
+  // Shift using SAR register
+  fn xt_SLL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0xA1); }  // op2=0xA, op1=1
+  fn xt_SRL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0x91); }  // op2=9, op1=1
+
+  // --------------------------------------------------------------------------
+  // RRI8-format: b0=(t<<4)|2, b1=((im&0xF)<<4)|s, b2=(op1<<4)|(im>>4)
+  // --------------------------------------------------------------------------
+
+  fn xt_ADDI(ar: int64, as_: int64, imm: int64) {
+    var im: int64 := imm & 0xFF;
+    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xC0 | (im >> 4));
+  }
+  fn xt_ADDMI(ar: int64, as_: int64, imm: int64) {
+    var im: int64 := imm & 0xFF;
+    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xD0 | (im >> 4));
+  }
+
+  // L32I ar, as, woff  (woff = byte_offset/4, range 0..255)
+  fn xt_L32I(ar: int64, as_: int64, woff: int64) {
+    self.xt_e3((ar << 4) | 2, ((woff & 0xF) << 4) | as_, 0x20 | (woff >> 4));
+  }
+  // S32I at, as, woff
+  fn xt_S32I(at: int64, as_: int64, woff: int64) {
+    self.xt_e3((at << 4) | 2, ((woff & 0xF) << 4) | as_, 0x60 | (woff >> 4));
+  }
+
+  // --------------------------------------------------------------------------
+  // MOVI ar, simm12  (RI12 format, op0=6, op1=0xA)
+  // b0=(ar<<4)|6, b1=im12[7:0], b2=0xA0|(im12[11:8])
+  // --------------------------------------------------------------------------
+
+  fn xt_MOVI(ar: int64, imm: int64) {
+    var im12: int64 := imm & 0xFFF;
+    self.xt_e3((ar << 4) | 6, im12 & 0xFF, 0xA0 | ((im12 >> 8) & 0xF));
+  }
+
+  // Load any immediate: MOVI for 12-bit, MOVI+ADDMI for 20-bit, fallback to 0
+  fn xt_li(ar: int64, imm: int64) {
+    if imm >= -2048 && imm <= 2047 {
+      self.xt_MOVI(ar, imm);
+    } else {
+      var lo12: int64 := imm & 0xFFF;
+      var lo12s: int64 := lo12;
+      if (lo12 & 0x800) != 0 { lo12s := lo12 - 4096; }
+      var diff: int64 := imm - lo12s;
+      if (diff & 0xFF) == 0 {
+        var hi8: int64 := diff >> 8;
+        if hi8 >= -128 && hi8 <= 127 {
+          self.xt_MOVI(ar, lo12s);
+          self.xt_ADDMI(ar, ar, hi8);
+          return;
+        }
+      }
+      self.xt_MOVI(ar, 0);  // fallback for values out of 20-bit range
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // CALL format: b0=((off18&3)<<6)|(n<<4)|op0
+  // CALL0 (op0=5, n=0): off18 = (target - ((callPC+4)&~3)) / 4
+  // J     (op0=6):      same offset formula, 4-byte aligned target
+  // --------------------------------------------------------------------------
+
+  fn xt_CALL0(off18: int64) {
+    self.xt_e3(((off18 & 3) << 6) | 5, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
+  }
+  fn xt_J(off18: int64) {
+    self.xt_e3(((off18 & 3) << 6) | 6, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
+  }
+
+  // JX a0: return from CALL0 function (RRR, op2=0xD, s=a0, r=0, t=0, op0=0)
+  fn xt_JX_A0() { self.xt_e3(0x00, 0x00, 0xD0); }
+
+  // --------------------------------------------------------------------------
+  // BRI12 format: b0=(m<<4)|7, b1=((im12&0xF)<<4)|s, b2=(im12>>4)&0xFF
+  // target = PC + 3 + sign_extend(offset12)   (PC_next = PC+3 for 3-byte instr)
+  // BEQZ(m=1), BNEZ(m=5), BLTZ(m=9), BGEZ(m=13=0xD)
+  // --------------------------------------------------------------------------
+
+  fn xt_BRI12(m: int64, as_: int64, imm12: int64) {
+    var im12: int64 := imm12 & 0xFFF;
+    self.xt_e3((m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+  }
+  fn xt_BEQZ(as_: int64, imm12: int64) { self.xt_BRI12(1,  as_, imm12); }
+  fn xt_BNEZ(as_: int64, imm12: int64) { self.xt_BRI12(5,  as_, imm12); }
+  fn xt_BLTZ(as_: int64, imm12: int64) { self.xt_BRI12(9,  as_, imm12); }
+  fn xt_BGEZ(as_: int64, imm12: int64) { self.xt_BRI12(13, as_, imm12); }
+
+  // --------------------------------------------------------------------------
+  // Stack slot helpers: slot(i) = [a1 + (i+1)*4], word offset = i+1
+  // --------------------------------------------------------------------------
+
+  fn xt_loadSlot(i: int64) {
+    self.xt_L32I(XT_T0, XT_SP, i + 1);
+  }
+  fn xt_loadSlot2(i: int64) {
+    self.xt_L32I(XT_T1, XT_SP, i + 1);
+  }
+  fn xt_storeSlot(i: int64) {
+    self.xt_S32I(XT_T0, XT_SP, i + 1);
+  }
+
+  // --------------------------------------------------------------------------
+  // Stack frame management
+  // --------------------------------------------------------------------------
+
+  fn calcStackFrame(funcId: int64) {
+    var locals: int64 := self.getFuncLocalCount(funcId);
+    var sz: int64 := (locals + 1) * 4;   // +1 for saved RA at [SP+0]
+    if sz < 8 { sz := 8; }
+    self.stackSize := sz;
+  }
+
+  fn xt_adjustSP(delta: int64) {
+    if delta >= -124 && delta <= 124 {
+      self.xt_ADDI(XT_SP, XT_SP, delta);
+    } else {
+      self.xt_li(XT_T2, delta);
+      self.xt_ADD(XT_SP, XT_SP, XT_T2);
+    }
+  }
+
+  fn emitPrologue() {
+    self.xt_adjustSP(-self.stackSize);
+    self.xt_S32I(XT_A0, XT_SP, 0);   // [SP+0] = saved RA
+  }
+
+  fn emitEpilogue() {
+    self.xt_L32I(XT_RV, XT_SP, 1);   // a2 = [SP+4] = slot 0 = return value
+    self.xt_L32I(XT_A0, XT_SP, 0);   // a0 = [SP+0] = saved RA
+    self.xt_adjustSP(self.stackSize);
+    self.xt_JX_A0();
+  }
+
+  // --------------------------------------------------------------------------
+  // Patch management
+  // --------------------------------------------------------------------------
+
+  fn addPatch(codeOff: int64, labelId: int64, ptype: int64) {
+    if self.patchCount < 1024 {
+      var base: int64 := self.patchBuf + self.patchCount * 32;
+      poke64(base,      codeOff);
+      poke64(base + 8,  labelId);
+      poke64(base + 16, ptype);
+      self.patchCount := self.patchCount + 1;
+    }
+  }
+
+  fn applyPatches() {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:    int64 := self.patchBuf + i * 32;
+      var codeOff: int64 := peek64(base);
+      var labelId: int64 := peek64(base + 8);
+      var ptype:   int64 := peek64(base + 16);
+      var target:  int64 := -1;
+      if ptype == XT_PATCH_CALL0 {
+        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+      } else {
+        if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
+      }
+      if target >= 0 {
+        if ptype == XT_PATCH_CALL0 || ptype == XT_PATCH_J {
+          var op0: int64 := 5;
+          if ptype == XT_PATCH_J { op0 := 6; }
+          var aligned: int64 := (codeOff + 4) & -4;
+          var off18: int64 := (target - aligned) >> 2;
+          self.xt_poke3(codeOff, ((off18 & 3) << 6) | op0, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
+        } else {
+          // BRI12: extract original register from placeholder byte[1] lower nibble
+          var orig_b1: int64 := peek8(self.codeBuf + codeOff + 1);
+          var as_: int64 := orig_b1 & 0xF;
+          var im12: int64 := (target - (codeOff + 3)) & 0xFFF;
+          var m: int64 := 1;
+          if ptype == XT_PATCH_BNEZ { m := 5; }
+          self.xt_poke3(codeOff, (m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+        }
+      }
+      i := i + 1;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Instruction dispatch
+  // --------------------------------------------------------------------------
+
+  fn emitInstr(funcId: int64, idx: int64) {
+    var op:   int64 := self.getInstrOp(idx);
+    var dest: int64 := self.getInstrDest(idx);
+    var src1: int64 := self.getInstrSrc1(idx);
+    var src2: int64 := self.getInstrSrc2(idx);
+    var imm:  int64 := self.getInstrImmInt(idx);
+
+    // --- Constants ---
+    if op == IRO_CONST_INT || op == IRO_CONST_FLOAT {
+      self.xt_li(XT_T0, imm);
+      self.xt_storeSlot(dest);
+    }
+
+    // --- Integer arithmetic ---
+    if op == IRO_ADD {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_ADD(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_SUB {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_MUL {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_MULL(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_DIV {
+      // No hardware div in Xtensa base ISA — stub
+      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    }
+    if op == IRO_MOD {
+      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    }
+    if op == IRO_NEG {
+      self.xt_loadSlot(src1);
+      self.xt_NEG(XT_T0, XT_T0); self.xt_storeSlot(dest);
+    }
+
+    // --- Bitwise ---
+    if op == IRO_AND || op == IRO_BITAND {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_AND(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_OR || op == IRO_BITOR {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_OR(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_XOR || op == IRO_BITXOR {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_XOR(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_NOT || op == IRO_BITNOT {
+      self.xt_loadSlot(src1);
+      self.xt_MOVI(XT_T1, -1);            // T1 = 0xFFFFFFFF
+      self.xt_XOR(XT_T0, XT_T0, XT_T1);  // ~src1
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_SHL {
+      self.xt_loadSlot(src2);              // T0 = shift amount
+      self.xt_SSL(XT_T0);                  // SAR = 32 - shift_amount
+      self.xt_loadSlot(src1);              // T0 = value (SAR already set)
+      self.xt_SLL(XT_T0, XT_T0);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_SHR {
+      self.xt_loadSlot(src2);
+      self.xt_SSR(XT_T0);                  // SAR = shift_amount
+      self.xt_loadSlot(src1);
+      self.xt_SRL(XT_T0, XT_T0);
+      self.xt_storeSlot(dest);
+    }
+
+    // --- Comparisons ---
+    // Pattern: load src1→T0, src2→T1, SUB T2=T0-T1 (or reversed for GT/LE),
+    //          MOVI T0=0, B<skip>_cond +3, MOVI T0=1, store
+    if op == IRO_CMP_EQ {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T0, XT_T1);
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BNEZ(XT_T2, 3);   // not equal → skip MOVI T0=1
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CMP_NEQ {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T0, XT_T1);
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BEQZ(XT_T2, 3);   // equal → skip MOVI T0=1
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CMP_LT {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T0, XT_T1);  // T2 = src1-src2
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BGEZ(XT_T2, 3);   // src1>=src2 → skip
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CMP_GE {
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T0, XT_T1);
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BLTZ(XT_T2, 3);   // src1<src2 → skip
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CMP_GT {
+      // src1>src2 ↔ src2-src1 < 0
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T1, XT_T0);  // T2 = src2-src1
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BGEZ(XT_T2, 3);   // src2>=src1 (not GT) → skip
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CMP_LE {
+      // src1<=src2 ↔ src2-src1 >= 0
+      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
+      self.xt_SUB(XT_T2, XT_T1, XT_T0);  // T2 = src2-src1
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_BLTZ(XT_T2, 3);   // src2<src1 (not LE) → skip
+      self.xt_MOVI(XT_T0, 1);
+      self.xt_storeSlot(dest);
+    }
+
+    // --- Memory: locals / globals ---
+    if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
+      self.xt_loadSlot(src1); self.xt_storeSlot(dest);
+    }
+    if op == IRO_LOAD_GLOBAL {
+      // Stub: 32-bit absolute addressing not implemented
+      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    }
+    if op == IRO_STORE_GLOBAL { }  // no-op stub
+
+    // --- Struct field access ---
+    if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
+      self.xt_loadSlot(src1);
+      var woff: int64 := imm >> 2;
+      if woff >= 0 && woff <= 255 {
+        self.xt_L32I(XT_T0, XT_T0, woff);
+      } else {
+        self.xt_MOVI(XT_T0, 0);
+      }
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
+      self.xt_loadSlot2(src2);              // T1 = base pointer
+      self.xt_MOV(XT_T2, XT_T1);           // T2 = base (preserved across loadSlot)
+      self.xt_loadSlot(src1);               // T0 = value
+      var woff: int64 := imm >> 2;
+      if woff >= 0 && woff <= 255 {
+        self.xt_S32I(XT_T0, XT_T2, woff);
+      }
+    }
+
+    // --- Function calls (CALL0: a2-a5 for args 0-3) ---
+    if op == IRO_CALL {
+      var argCount: int64 := imm;
+      var ai: int64 := 0;
+      while ai < argCount && ai < 4 {
+        self.xt_loadSlot(ai);
+        self.xt_MOV(XT_RV + ai, XT_T0);   // move to a2..a5
+        ai := ai + 1;
+      }
+      var patchOff: int64 := self.codeLen;
+      self.xt_CALL0(0);   // placeholder
+      self.addPatch(patchOff, src1, XT_PATCH_CALL0);
+      self.xt_MOV(XT_T0, XT_RV);          // T0 = return value from a2
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_CALL_BUILTIN {
+      self.emitBuiltinCall(imm, dest);
+    }
+
+    // --- Control flow ---
+    if op == IRO_JMP {
+      // Pad to 4-byte align so J target can be 4-aligned
+      while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+      var patchOff: int64 := self.codeLen;
+      self.xt_J(0);   // placeholder (offset18=0)
+      self.addPatch(patchOff, imm, XT_PATCH_J);
+    }
+    if op == IRO_BR_TRUE {
+      self.xt_loadSlot(src1);
+      var patchOff: int64 := self.codeLen;
+      self.xt_BNEZ(XT_T0, 0);   // placeholder: branch if T0 != 0
+      self.addPatch(patchOff, imm, XT_PATCH_BNEZ);
+    }
+    if op == IRO_BR_FALSE {
+      self.xt_loadSlot(src1);
+      var patchOff: int64 := self.codeLen;
+      self.xt_BEQZ(XT_T0, 0);   // placeholder: branch if T0 == 0
+      self.addPatch(patchOff, imm, XT_PATCH_BEQZ);
+    }
+    if op == IRO_LABEL {
+      // Align to 4 bytes for J targets
+      while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+      if imm < 1024 {
+        poke64(self.labelAddrs + imm * 8, self.codeLen);
+      }
+    }
+    if op == IRO_FUNC_EXIT {
+      self.emitEpilogue();
+    }
+
+    // --- Alloc / free (bare-metal stubs) ---
+    if op == IRO_ALLOC {
+      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    }
+    if op == IRO_FREE { }
+
+    // --- Type conversions: pass-through (no FP hardware) ---
+    if op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+      self.xt_loadSlot(src1); self.xt_storeSlot(dest);
+    }
+  }
+
+  fn emitBuiltinCall(id: int64, dest: int64) {
+    // Bare-metal: stub all built-ins, return 0
+    self.xt_MOVI(XT_T0, 0);
+    self.xt_storeSlot(dest);
+  }
+
+  // --------------------------------------------------------------------------
+  // Function emitter
+  // --------------------------------------------------------------------------
+
+  fn emitFunc(funcId: int64) {
+    // Pad to 4-byte alignment (required for CALL0 target addressing)
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    if funcId < 256 {
+      poke64(self.funcAddrs + funcId * 8, self.codeLen);
+      self.funcCount := self.funcCount + 1;
+    }
+    self.stackSize  := 0;
+    self.patchCount := 0;
+    var li: int64 := 0;
+    while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
+    self.calcStackFrame(funcId);
+    self.emitPrologue();
+    var instrStart: int64 := self.getFuncInstrStart(funcId);
+    var instrCount: int64 := self.getFuncInstrCount(funcId);
+    var i: int64 := 0;
+    while i < instrCount { self.emitInstr(funcId, instrStart + i); i := i + 1; }
+    self.emitEpilogue();
+    self.applyPatches();
+  }
+
+  // --------------------------------------------------------------------------
+  // Public interface
+  // --------------------------------------------------------------------------
+
+  pub fn init(irMod: int64) {
+    self.ir         := irMod;
+    self.codeBuf    := mmap(0, 131072, 3, 34, -1, 0);
+    self.codeCap    := 131072;
+    self.codeLen    := 0;
+    self.stackSize  := 0;
+    self.labelAddrs := mmap(0, 1024 * 8, 3, 34, -1, 0);
+    self.patchBuf   := mmap(0, 1024 * 32, 3, 34, -1, 0);
+    self.patchCount := 0;
+    self.funcAddrs  := mmap(0, 256 * 8, 3, 34, -1, 0);
+    self.funcCount  := 0;
+  }
+
+  pub fn emit(): int64 {
+    var n: int64 := self.getFuncCount();
+    var i: int64 := 0;
+    while i < n { self.emitFunc(i); i := i + 1; }
+    return self.codeLen;
+  }
+
+  pub fn getCodeBuf(): int64 { return self.codeBuf; }
+  pub fn getCodeLen(): int64 { return self.codeLen; }
+
+  // --------------------------------------------------------------------------
+  // IR accessors (same layout as EmitARM64 / EmitRISCV64 / EmitARMCM)
+  // --------------------------------------------------------------------------
+
+  fn getFuncCount(): int64 {
+    return peek64(self.ir + 96);
+  }
+  fn getFuncLocalCount(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 32);
+  }
+  fn getFuncInstrStart(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 16);
+  }
+  fn getFuncInstrCount(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    return peek64(funcBuf + funcId * 80 + 24);
+  }
+  fn getInstrField(absIdx: int64, fieldOff: int64): int64 {
+    var instrBuf: int64 := peek64(self.ir + 8);
+    return peek64(instrBuf + absIdx * 80 + fieldOff);
+  }
+  fn getInstrOp(absIdx: int64): int64     { return self.getInstrField(absIdx, 0); }
+  fn getInstrDest(absIdx: int64): int64   { return self.getInstrField(absIdx, 8); }
+  fn getInstrSrc1(absIdx: int64): int64   { return self.getInstrField(absIdx, 16); }
+  fn getInstrSrc2(absIdx: int64): int64   { return self.getInstrField(absIdx, 24); }
+  fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
+};
+
+// ============================================================================
+// XtensaBackend  —  ELF32 writer for ESP32/ESP32-S3
+// ============================================================================
+
+pub type XtensaBackend = class {
+  code:    int64;
+  codeLen: int64;
+  codeCap: int64;
+
+  fn xb_e8(v: int64) {
+    poke8(self.code + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  pub fn Init() {
+    self.codeCap := 65536;
+    self.code    := mmap(0, self.codeCap, 3, 34, -1, 0);
+    self.codeLen := 0;
+  }
+
+  pub fn Build(irBuf: int64, irLen: int64) {
+    // Function 0 starts at offset 0 — it IS the entry point (e_entry = XT_IRAM_BASE)
+    var i: int64 := 0;
+    while i < irLen {
+      self.xb_e8(peek8(irBuf + i));
+      i := i + 1;
+    }
+  }
+
+  pub fn GetCodeSize(): int64 { return self.codeLen; }
+
+  pub fn WriteELF32(path: pchar) {
+    var codeFileOffset: int64 := 4096;
+    var codeSize:       int64 := self.codeLen;
+    var elfSize:        int64 := codeFileOffset + codeSize;
+
+    var elfBuf: int64 := mmap(0, elfSize, 3, 34, -1, 0);
+    if elfBuf == -1 { return; }
+
+    var z: int64 := 0;
+    while z < elfSize { poke8(elfBuf + z, 0); z := z + 1; }
+
+    var ci: int64 := 0;
+    while ci < codeSize {
+      poke8(elfBuf + codeFileOffset + ci, peek8(self.code + ci));
+      ci := ci + 1;
+    }
+
+    // ELF32 header (52 bytes)
+    poke8(elfBuf + 0, 127); poke8(elfBuf + 1, 69);
+    poke8(elfBuf + 2, 76);  poke8(elfBuf + 3, 70);
+    poke8(elfBuf + 4, 1);   poke8(elfBuf + 5, 1);    // 32-bit, little-endian
+    poke8(elfBuf + 6, 1);   poke8(elfBuf + 7, 0);    // ELF v1, SysV ABI
+
+    poke16(elfBuf + 16, 2);            // e_type: ET_EXEC
+    poke16(elfBuf + 18, 0x5E);         // e_machine: EM_XTENSA = 94
+    poke32(elfBuf + 20, 1);            // e_version
+    poke32(elfBuf + 24, 0x40080000);   // e_entry: IRAM base = VA of function 0
+    poke32(elfBuf + 28, 52);           // e_phoff: program headers follow ELF header
+    poke32(elfBuf + 32, 0);            // e_shoff: no section headers
+    poke32(elfBuf + 36, 0);            // e_flags
+    poke16(elfBuf + 40, 52);           // e_ehsize
+    poke16(elfBuf + 42, 32);           // e_phentsize (Elf32_Phdr = 32 bytes)
+    poke16(elfBuf + 44, 1);            // e_phnum
+    poke16(elfBuf + 46, 40);           // e_shentsize
+    poke16(elfBuf + 48, 0);            // e_shnum
+    poke16(elfBuf + 50, 0);            // e_shstrndx
+
+    // PT_LOAD segment (32 bytes at offset 52)
+    poke32(elfBuf + 52, 1);               // p_type: PT_LOAD
+    poke32(elfBuf + 56, 0);              // p_offset: from file start
+    poke32(elfBuf + 60, 0x40080000);     // p_vaddr: IRAM base
+    poke32(elfBuf + 64, 0x40080000);     // p_paddr
+    poke32(elfBuf + 68, elfSize);        // p_filesz
+    poke32(elfBuf + 72, elfSize);        // p_memsz
+    poke32(elfBuf + 76, 5);              // p_flags: PF_R | PF_X
+    poke32(elfBuf + 80, 0x1000);         // p_align: 4096
+
+    var fd: int64 := open(path, 577, 493);
+    if fd < 0 {
+      EPrintStr("error: cannot write output: "c);
+      EPrintStrLn(path);
+      munmap(elfBuf, elfSize);
+      return;
+    }
+    write(fd, elfBuf as pchar, elfSize);
+    close(fd);
+    munmap(elfBuf, elfSize);
+  }
+};
