@@ -674,7 +674,9 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-32: Windows x86_64 Backend (PE64)
+### WP-BC-32: Windows x86_64 Backend (PE64) ✅
+
+**Status:** Erledigt — Branch `feat/wp-bc-32-win-x86-pe64`, Singularität `66ae9eb`.
 
 **Ziel:** PE64-Binaries (.exe) für Windows 64-bit.
 
