@@ -177,6 +177,10 @@ pub type CompilerConfig = class {
   traceEnabled:   bool;
   profileEnabled: bool;
 
+  // WP-BC-44: diagnostic flags
+  tracePasses: bool;
+  irSourceMap:  bool;
+
   // Compilation state
   exitCode: int64;
   errorCount: int64;
@@ -227,6 +231,8 @@ pub type CompilerConfig = class {
     self.cHeaderFile := 0;
     self.traceEnabled   := false;
     self.profileEnabled := false;
+    self.tracePasses    := false;
+    self.irSourceMap    := false;
     self.exitCode := 0;
     self.errorCount := 0;
     self.warningCount := 0;
@@ -589,6 +595,16 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-BC-44: --trace-passes / --ir-source-map
+    if StrCmp(arg, "--trace-passes"c) == 0 {
+      self.tracePasses := true;
+      return;
+    }
+    if StrCmp(arg, "--ir-source-map"c) == 0 {
+      self.irSourceMap := true;
+      return;
+    }
+
     // --version
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr(COMPILER_NAME);
@@ -722,6 +738,8 @@ pub type CompilerConfig = class {
     PrintStrLn("  --map-file         Generate memory map file");
     PrintStrLn("  --trace            Enable trace() / trace_int() / trace_str() builtins");
     PrintStrLn("  --profile          Enable profile_enter() / profile_leave() / profile_report()");
+    PrintStrLn("  --trace-passes     Print timing for each compiler pass ([pass] name: done NNms)");
+    PrintStrLn("  --ir-source-map    Annotate IR dump with ; line:N source locations");
     PrintStrLn("  --include <hdr.h>  Parse C header and emit extern fn declarations");
     PrintStrLn("  -I <path>          Add include search path for imports");
     PrintStrLn("  -I<path>           Same as -I <path> (inline form)");
@@ -755,7 +773,7 @@ pub type CompilerConfig = class {
     if self.enableVerbose {
       PrintStrLn("Stage 1: Lexing...");
     }
-    
+    var _t1: int64 := self._passStart("lexer"c);
     var source: pchar := FileReadAll(inputFile);
     if source == 0 {
       EPrintStr("Error: Cannot read input file: "c);
@@ -763,20 +781,21 @@ pub type CompilerConfig = class {
       self.exitCode := 1;
       return self.exitCode;
     }
-    
     if self.dumpLexer {
       self.dumpTokens(source, StrLen(source));
     }
+    self._passEnd("lexer"c, _t1);
 
     // Stage 2: Parser
     if self.enableVerbose {
       PrintStrLn("Stage 2: Parsing...");
     }
-
+    var _t2: int64 := self._passStart("parser"c);
     var parser: Parser := new Parser();
     parser.Init(source, StrLen(source));
     var astRoot: int64 := parser.Parse();
-    
+    self._passEnd("parser"c, _t2);
+
     // Dump AST if requested and return early
     if self.dumpParser {
       self.dumpAST(astRoot);
@@ -793,19 +812,22 @@ pub type CompilerConfig = class {
 
     // Stage 3: Semantic Analysis
     PrintStrLn("=== Stage 3: Sema START ===");
+    var _t3: int64 := self._passStart("sema"c);
     var sema: Sema := new Sema();
     sema.Init(source, StrLen(source), parser.nodes, parser.nodeCount, parser.toks);
     sema.includePath := self.includePath;  // WP-BC-42: -I search path
     sema.stdPath     := self.stdPath;      // WP-BC-42: --std-path override
     var semaResult: int64 := sema.Check(0);  // Use index 0 for Sema
     PrintStrLn("Sema.Check done");
+    self._passEnd("sema"c, _t3);
 
     if semaResult != 0 {
       self.exitCode := 1;
       return self.exitCode;
     }
 
-    // Stage 4: Linter (optional, --lint flag)
+    // Stage 4: Linter + analysis passes
+    var _t4: int64 := self._passStart("analysis"c);
     var lintResult: int64 := 0;
     if self.enableLint {
       var linter: Linter := new Linter();
@@ -847,6 +869,7 @@ pub type CompilerConfig = class {
         mc.ReportSummary();
       }
     }
+    self._passEnd("analysis"c, _t4);
 
     // Stage 5: Early exit for lint-only mode
     if self.lintOnly {
@@ -860,6 +883,7 @@ pub type CompilerConfig = class {
     if self.target == TARGET_X86_64 {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
+      var _t5x: int64 := self._passStart("codegen-x86_64"c);
       var cg: Codegen := new Codegen();
       cg.Init(source, parser.nodes, parser.toks);
       if self.enableDebug {
@@ -869,6 +893,7 @@ pub type CompilerConfig = class {
       }
       cg.Generate(astRoot);
       cg.WriteELF(outPath);
+      self._passEnd("codegen-x86_64"c, _t5x);
       return self.exitCode;
     }
 
@@ -876,6 +901,7 @@ pub type CompilerConfig = class {
     if self.target == TARGET_MACOS_X86_64 {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
+      var _t5m: int64 := self._passStart("codegen-macos-x86_64"c);
       var cg: Codegen := new Codegen();
       cg.Init(source, parser.nodes, parser.toks);
       cg.Generate(astRoot);
@@ -883,6 +909,7 @@ pub type CompilerConfig = class {
       mxb.Init();
       mxb.Build(cg.code, cg.codeLen);
       mxb.WriteMachO(outPath);
+      self._passEnd("codegen-macos-x86_64"c, _t5m);
       return self.exitCode;
     }
 
@@ -890,6 +917,7 @@ pub type CompilerConfig = class {
     if self.target == TARGET_WINDOWS_X86_64 {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.exe"c; }
+      var _t5w: int64 := self._passStart("codegen-win-x86_64"c);
       var cg: Codegen := new Codegen();
       cg.Init(source, parser.nodes, parser.toks);
       cg.Generate(astRoot);
@@ -897,6 +925,7 @@ pub type CompilerConfig = class {
       wxb.Init();
       wxb.Build(cg.code, cg.codeLen);
       wxb.WritePE64(outPath);
+      self._passEnd("codegen-win-x86_64"c, _t5w);
       return self.exitCode;
     }
 
@@ -908,6 +937,7 @@ pub type CompilerConfig = class {
     var irMod: IRModule := new IRModule();
     PrintStrLn("IRModule created, calling init...");
     irMod.init();
+    irMod.irSourceMap := self.irSourceMap;  // WP-BC-44
     PrintStrLn("IRModule.init done");
 
     // Debug: check IRModule state
@@ -930,7 +960,12 @@ pub type CompilerConfig = class {
     PrintStrLn("IRLower.init done, calling lowerModule...");
     lower.lowerModule(astRoot);
     PrintStrLn("lowerModule done");
-    
+
+    // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
+    if self.dumpIR || self.irSourceMap {
+      irMod.dump();
+    }
+
     // Debug: check global function count from lower
     PrintStr("lyxc: lower.globalFuncCount = "); PrintInt(lower.globalFuncCount); PrintStr("\n");
 
@@ -1901,6 +1936,29 @@ pub type CompilerConfig = class {
     // Relocations are generated during codegen patching
     // For now, print placeholder
     PrintStrLn("No relocations to dump (static binary)");
+  }
+
+  // WP-BC-44: --trace-passes timing helpers
+  fn _passStart(name: pchar): int64 {
+    if !self.tracePasses { return 0; }
+    PrintStr("[pass] "c);
+    PrintStr(name);
+    PrintStr(": start\n"c);
+    return MonotonicTimeNano();
+  }
+
+  fn _passEnd(name: pchar, t0: int64): void {
+    if !self.tracePasses { return; }
+    var elapsed: int64 := MonotonicTimeNano() - t0;
+    var us: int64 := elapsed / 1000;
+    var ms: int64 := elapsed / 1000000;
+    PrintStr("[pass] "c);
+    PrintStr(name);
+    PrintStr(": done ("c);
+    PrintInt(ms);
+    PrintStr("ms / "c);
+    PrintInt(us);
+    PrintStr("µs)\n"c);
   }
 
   fn traceImportStart(): void {
