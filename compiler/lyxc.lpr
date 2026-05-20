@@ -1712,7 +1712,9 @@ begin
              try
                if flagEnergyLevel > 0 then
                  emit.SetEnergyLevel(TEnergyLevel(flagEnergyLevel));
- 
+               if flagRuntimeChecks then
+                 emit.SetRuntimeChecks(True);  // WP-BC-48
+
                  emit.EmitFromIR(module);
                  codeBuf := emit.GetCodeBuffer;
                  dataBuf := emit.GetDataBuffer;

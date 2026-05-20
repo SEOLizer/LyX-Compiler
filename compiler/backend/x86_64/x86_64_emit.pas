@@ -71,12 +71,17 @@ type
     FMemoryAccessCount: UInt64;
     FCurrentFunctionEnergy: UInt64;
     FTargetOS: TTargetOS;  // atLinux or atmacOS
+    FRuntimeChecks: Boolean;  // WP-BC-48: emit inline bounds/null/zero checks
 
     function SysNum(linuxN, macosN: Int64): Int64;
     procedure TrackEnergy(kind: TEnergyOpKind);
     procedure EmitDebugPrintString(const s: string);
     procedure EmitDebugPrintInt(valueReg: Integer);
     
+    // WP-BC-48: emit inline panic for runtime checks; testReg=register to test (0=none=always panic)
+    procedure EmitRuntimePanicIfZero(testReg: Integer; const msgBytes: array of Byte);
+    procedure EmitRuntimePanicIfNullRDI(const msgBytes: array of Byte);
+
     { Syscall-Helfer für macOS }
     procedure EmitSyscallWrite;   // sys_write = 0x2000004
     procedure EmitSyscallExit;    // sys_exit = 0x2000001
@@ -99,6 +104,7 @@ type
     function GetEnergyStats: TEnergyStats;
     procedure SetEnergyLevel(level: TEnergyLevel);
     procedure SetTargetOS(os: TTargetOS);
+    procedure SetRuntimeChecks(enabled: Boolean);  // WP-BC-48
     // TMR Hash Store accessors (aerospace-todo P0 #46)
     function HasVerifyIntegrityCall: Boolean;
     function GetTMRDataAddrPos: Integer;
@@ -649,6 +655,7 @@ begin
   SetLength(FPLTGOTPatches, 0);
   
   FTargetOS := atLinux;
+  FRuntimeChecks := False;
 
   // Energy-Modell initialisieren
   FCurrentCPU := GetCPUEnergyModel(cfX86_64);
@@ -775,6 +782,101 @@ end;
 procedure TX86_64Emitter.SetTargetOS(os: TTargetOS);
 begin
   FTargetOS := os;
+end;
+
+procedure TX86_64Emitter.SetRuntimeChecks(enabled: Boolean);
+begin
+  FRuntimeChecks := enabled;
+end;
+
+// WP-BC-48: emit "test rcx,rcx; jnz .ok; [msg]; lea rdi,[rip+msg]; write+exit; .ok:"
+// Used for div/mod zero check (divisor is in RCX at call site).
+procedure TX86_64Emitter.EmitRuntimePanicIfZero(testReg: Integer; const msgBytes: array of Byte);
+var
+  jnzPos, jmpMsgPos, msgPos, leaDisp32Pos, i: Integer;
+  disp: Int32;
+begin
+  // test rcx, rcx  (48 85 C9) — testReg is always RCX here
+  EmitRex(FCode, 1, 0, 0, 0);
+  FCode.WriteU8($85);
+  FCode.WriteU8(Byte($C0 or ((testReg and 7) shl 3) or (testReg and 7)));  // ModRM reg/rm
+  // jnz short .ok  (75 XX placeholder)
+  FCode.WriteU8($75);
+  jnzPos := FCode.Size;
+  FCode.WriteU8(0);
+  // jmp short .after_msg  (EB XX) — skip inline message data
+  FCode.WriteU8($EB);
+  jmpMsgPos := FCode.Size;
+  FCode.WriteU8(0);
+  // inline message bytes
+  msgPos := FCode.Size;
+  for i := 0 to High(msgBytes) do
+    FCode.WriteU8(msgBytes[i]);
+  FCode.PatchU8(jmpMsgPos, Byte(FCode.Size - jmpMsgPos - 1));
+  // lea rdi, [rip + disp32]  (48 8D 3D XX XX XX XX) — disp points back to message
+  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $3D);
+  leaDisp32Pos := FCode.Size;
+  FCode.WriteU32LE(0);
+  disp := msgPos - (leaDisp32Pos + 4);
+  FCode.PatchU32LE(leaDisp32Pos, Cardinal(disp));
+  // strlen(rdi) inline -> rcx
+  WriteMovRegImm64(FCode, RCX, 0);
+  FCode.WriteU8($80); FCode.WriteU8($3C); FCode.WriteU8($0F); FCode.WriteU8($00);  // cmp [rdi+rcx], 0
+  FCode.WriteU8($74); FCode.WriteU8($05);   // jz .done (+5)
+  EmitRex(FCode, 1, 0, 0, 0); FCode.WriteU8($FF); FCode.WriteU8($C1);  // inc rcx
+  FCode.WriteU8($EB); FCode.WriteU8($F5);   // jmp .loop (-11)
+  // write(2, rdi, rcx)
+  WriteMovRegReg(FCode, RDX, RCX);
+  WriteMovRegReg(FCode, RSI, RDI);
+  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+  WriteMovRegImm64(FCode, RDI, 2);
+  WriteSyscall(FCode);
+  // exit(1)
+  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+  WriteMovRegImm64(FCode, RDI, 1);
+  WriteSyscall(FCode);
+  // .ok:
+  FCode.PatchU8(jnzPos, Byte(FCode.Size - jnzPos - 1));
+end;
+
+// WP-BC-48: emit null-pointer check for RDI (address register for peek/poke).
+// Emits: test rdi,rdi; jnz .ok; panic("null pointer\n"); .ok:
+procedure TX86_64Emitter.EmitRuntimePanicIfNullRDI(const msgBytes: array of Byte);
+var
+  jnzPos, jmpMsgPos, msgPos, leaDisp32Pos, i: Integer;
+  disp: Int32;
+begin
+  // test rdi, rdi  (48 85 FF)
+  EmitU8(FCode, $48); EmitU8(FCode, $85); EmitU8(FCode, $FF);
+  FCode.WriteU8($75);
+  jnzPos := FCode.Size;
+  FCode.WriteU8(0);
+  FCode.WriteU8($EB);
+  jmpMsgPos := FCode.Size;
+  FCode.WriteU8(0);
+  msgPos := FCode.Size;
+  for i := 0 to High(msgBytes) do
+    FCode.WriteU8(msgBytes[i]);
+  FCode.PatchU8(jmpMsgPos, Byte(FCode.Size - jmpMsgPos - 1));
+  EmitU8(FCode, $48); EmitU8(FCode, $8D); EmitU8(FCode, $3D);
+  leaDisp32Pos := FCode.Size;
+  FCode.WriteU32LE(0);
+  disp := msgPos - (leaDisp32Pos + 4);
+  FCode.PatchU32LE(leaDisp32Pos, Cardinal(disp));
+  WriteMovRegImm64(FCode, RCX, 0);
+  FCode.WriteU8($80); FCode.WriteU8($3C); FCode.WriteU8($0F); FCode.WriteU8($00);
+  FCode.WriteU8($74); FCode.WriteU8($05);
+  EmitRex(FCode, 1, 0, 0, 0); FCode.WriteU8($FF); FCode.WriteU8($C1);
+  FCode.WriteU8($EB); FCode.WriteU8($F5);   // jmp .loop (-11)
+  WriteMovRegReg(FCode, RDX, RCX);
+  WriteMovRegReg(FCode, RSI, RDI);
+  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_WRITE, SYS_MACOS_WRITE)));
+  WriteMovRegImm64(FCode, RDI, 2);
+  WriteSyscall(FCode);
+  WriteMovRegImm64(FCode, RAX, UInt64(SysNum(SYS_LINUX_EXIT, SYS_MACOS_EXIT)));
+  WriteMovRegImm64(FCode, RDI, 1);
+  WriteSyscall(FCode);
+  FCode.PatchU8(jnzPos, Byte(FCode.Size - jnzPos - 1));
 end;
 
 function TX86_64Emitter.SysNum(linuxN, macosN: Int64): Int64;
@@ -1842,6 +1944,12 @@ begin
              // dest = src1 / src2 (signed)
              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+             // WP-BC-48: zero-check divisor (RCX) before idiv
+             if FRuntimeChecks then
+               EmitRuntimePanicIfZero(RCX, [
+                 100, 105, 118, 105, 115, 105, 111, 110, 32, // "division "
+                 98, 121, 32,                                  // "by "
+                 122, 101, 114, 111, 10, 0]);                  // "zero\n\0"
              // cqo (sign-extend rax to rdx:rax)
              EmitRex(FCode, 1, 0, 0, 0);
              EmitU8(FCode, $99);  // cqo
@@ -1851,12 +1959,18 @@ begin
              EmitU8(FCode, $F9);  // idiv rcx
              WriteMovMemReg(FCode, RBP, SlotOffset(fn.LocalCount + instr.Dest), RAX);
            end;
-           
+
          irMod:
            begin
              // dest = src1 % src2 (signed, result in RDX after idiv)
              WriteMovRegMem(FCode, RAX, RBP, SlotOffset(fn.LocalCount + instr.Src1));
              WriteMovRegMem(FCode, RCX, RBP, SlotOffset(fn.LocalCount + instr.Src2));
+             // WP-BC-48: zero-check divisor (RCX) before idiv
+             if FRuntimeChecks then
+               EmitRuntimePanicIfZero(RCX, [
+                 109, 111, 100, 117, 108, 111, 32,             // "modulo "
+                 98, 121, 32,                                   // "by "
+                 122, 101, 114, 111, 10, 0]);                   // "zero\n\0"
              // cqo
              EmitRex(FCode, 1, 0, 0, 0);
              EmitU8(FCode, $99);
@@ -3589,8 +3703,6 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
                 else if instr.ImmStr = 'poke64' then
                 begin
                   // poke64(addr, value) - write 64-bit qword to memory
-                  // mov rax, value; mov [addr], rax
-                  
                   // Get addr into RDI
                   if Length(instr.ArgTemps) >= 1 then
                   begin
@@ -3599,7 +3711,10 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
                   end
                   else
                     WriteMovRegImm64(FCode, RDI, 0);
-                  
+                  // WP-BC-48: null-pointer check
+                  if FRuntimeChecks then
+                    EmitRuntimePanicIfNullRDI([
+                      110, 117, 108, 108, 32, 112, 111, 105, 110, 116, 101, 114, 10, 0]);  // "null pointer\n\0"
                   // Get value into RAX
                   if Length(instr.ArgTemps) >= 2 then
                   begin
@@ -3608,8 +3723,7 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
                   end
                   else
                     WriteMovRegImm64(FCode, RAX, 0);
-                  
-                  // mov [rdi], rax - write qword (64-bit)
+                  // mov [rdi], rax
                   EmitRex(FCode, 1, 0, 0, 0);
                   FCode.WriteU8($89);  // MOV r/m64, r64
                   FCode.WriteU8($07);  // ModRM: [RDI], RAX
@@ -3617,8 +3731,6 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
                 else if instr.ImmStr = 'peek64' then
                 begin
                   // peek64(addr) -> int64 - read 64-bit qword from memory
-                  // mov rax, [addr]
-                  
                   // Get addr into RDI
                   if Length(instr.ArgTemps) >= 1 then
                   begin
@@ -3627,12 +3739,14 @@ WriteMovRegImm64(FCode, R8, QWord(-1));
                   end
                   else
                     WriteMovRegImm64(FCode, RDI, 0);
-                  
-                  // mov rax, [rdi] - read qword (64-bit)
+                  // WP-BC-48: null-pointer check
+                  if FRuntimeChecks then
+                    EmitRuntimePanicIfNullRDI([
+                      110, 117, 108, 108, 32, 112, 111, 105, 110, 116, 101, 114, 10, 0]);  // "null pointer\n\0"
+                  // mov rax, [rdi]
                   EmitRex(FCode, 1, 0, 0, 0);
                   FCode.WriteU8($8B);  // MOV r64, r/m64
                   FCode.WriteU8($07);  // ModRM: [RDI], RAX
-                  
                   if instr.Dest >= 0 then
                   begin
                     slotIdx := fn.LocalCount + instr.Dest;
