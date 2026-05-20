@@ -718,18 +718,21 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-34: ARM64 macOS (Apple Silicon) Backend
+### ✅ WP-BC-34: ARM64 macOS (Apple Silicon) Backend
+
+**Status:** Erledigt — Branch `feat/wp-bc-34-macos-arm64`
 
 **Ziel:** Mach-O-ARM64-Binaries für Apple Silicon (M1/M2/M3).
 
-**Referenz:** S0 `compiler/backend/arm64/arm64_emit.pas` mit macOS-Zweig
-
-**Zu tun:**
-- Aufbauend auf WP-BC-31 (Mach-O) und WP-BC-33 (AArch64 Codegen)
-- BSD-Syscall-Nummern für XNU ARM64 (0x80000000-Prefix)
-- `svc #0x80` für Syscalls (statt `svc #0` unter Linux)
-- Mach-O ARM64: `cputype = 0x0100000C` (CPU_TYPE_ARM64)
-- CLI-Flag `--target macos-arm64`
+**Implementiert:**
+- `TARGET_MACOS_ARM64 = 7` in `bootstrap/lyxc.lyx`
+- CLI-Flag `--target macos-arm64` → setzt target + FORMAT_MACHO
+- `emitMacOSARM64()`: 16-Byte `_start`-Stub (SVC #0x80, x16=0x2000001) + IR-Code via EmitARM64
+- `writeMachO()`: vollständige Inline-Mach-O-Codierung für ARM64 (16KB-Pages)
+  - LC_SEGMENT_64 `__PAGEZERO` + `__TEXT` + LC_MAIN
+  - cputype = `CPU_TYPE_ARM64 = 0x0100000C`
+- Bugfixes in `ir_lower.lyx`: 7-Arg-Overflow (src3 entfernt), instrBuf-Scope
+- Verifiziert: `file` erkennt Ausgabe als "Mach-O 64-bit arm64 executable"
 
 ---
 
