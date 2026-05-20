@@ -40,6 +40,7 @@ import bootstrap.backend.win_arm64;
 import bootstrap.backend.riscv_linux;
 import bootstrap.backend.arm_cm_backend;
 import bootstrap.backend.xtensa;
+import bootstrap.lfd_codegen;
 
 // ============================================================================
 // Compiler Constants
@@ -736,6 +737,9 @@ pub type CompilerConfig = class {
       astRoot := 0;  // Index 0 for IRLower
     }
 
+    // WP-BC-41: LFD Qt-UI-Builder — emit .h/.cpp for any NK_LFD_FORM nodes
+    self.emitLfdForms(astRoot, parser.nodes, source, inputFile);
+
     // Stage 3: Semantic Analysis
     PrintStrLn("=== Stage 3: Sema START ===");
     var sema: Sema := new Sema();
@@ -973,6 +977,112 @@ pub type CompilerConfig = class {
     }
     
     return self.exitCode;
+  }
+
+  // ---------------------------------------------------------------------------
+  // WP-BC-41: LFD Qt-UI-Builder — emit .h/.cpp for all NK_LFD_FORM nodes
+  // ---------------------------------------------------------------------------
+
+  fn emitLfdForms(astRoot: int64, nodes: int64, src: pchar, inputFile: pchar) {
+    // Walk the top-level declaration list looking for NK_LFD_FORM nodes.
+    // For each form, generate a .h and .cpp file next to the input file.
+    var nd: int64 := astRoot;
+    while (nd >= 0) {
+      if (peek64(nodes + nd * 88) == 95) {  // LFD_NK_FORM = 95
+        var nameOff: int64 := peek64(nodes + nd * 88 + 64);
+        var nameLen: int64 := peek64(nodes + nd * 88 + 72);
+
+        // Build base path: inputFile directory + formName
+        var inputLen: int64 := StrLen(inputFile);
+        // find last '/' to get directory prefix
+        var lastSlash: int64 := -1;
+        var pi: int64 := 0;
+        while (pi < inputLen) {
+          if (StrCharAt(inputFile, pi) == 47) { lastSlash := pi; }
+          pi := pi + 1;
+        }
+        var dirLen: int64 := lastSlash + 1;  // 0 if no slash
+
+        // basePath = dir + formName  (null-terminated)
+        var basePathSz: int64 := dirLen + nameLen + 8;
+        var basePathBuf: int64 := mmap(0, basePathSz, 3, 34, -1, 0);
+        var basePath: pchar := basePathBuf as pchar;
+        var bpi: int64 := 0;
+        pi := 0;
+        while (pi < dirLen) {
+          poke8(basePath as int64 + bpi, StrCharAt(inputFile, pi) & 255);
+          bpi := bpi + 1; pi := pi + 1;
+        }
+        pi := 0;
+        while (pi < nameLen) {
+          poke8(basePath as int64 + bpi, StrCharAt(src, nameOff + pi) & 255);
+          bpi := bpi + 1; pi := pi + 1;
+        }
+        poke8(basePath as int64 + bpi, 0);
+
+        // headerName = formName + ".h"  (for #include in .cpp)
+        var headerNameSz: int64 := nameLen + 4;
+        var headerNameBuf: int64 := mmap(0, headerNameSz, 3, 34, -1, 0);
+        var headerName: pchar := headerNameBuf as pchar;
+        pi := 0;
+        while (pi < nameLen) {
+          poke8(headerName as int64 + pi, StrCharAt(src, nameOff + pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(headerName as int64 + nameLen,     46);  // '.'
+        poke8(headerName as int64 + nameLen + 1, 104); // 'h'
+        poke8(headerName as int64 + nameLen + 2, 0);
+
+        // hPath = basePath + ".h"
+        var hPathLen: int64 := StrLen(basePath);
+        var hPathSz: int64 := hPathLen + 4;
+        var hPathBuf: int64 := mmap(0, hPathSz, 3, 34, -1, 0);
+        var hPath: pchar := hPathBuf as pchar;
+        pi := 0;
+        while (pi < hPathLen) {
+          poke8(hPath as int64 + pi, StrCharAt(basePath, pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(hPath as int64 + hPathLen,     46);  // '.'
+        poke8(hPath as int64 + hPathLen + 1, 104); // 'h'
+        poke8(hPath as int64 + hPathLen + 2, 0);
+
+        // cppPath = basePath + ".cpp"
+        var cppPathSz: int64 := hPathLen + 6;
+        var cppPathBuf: int64 := mmap(0, cppPathSz, 3, 34, -1, 0);
+        var cppPath: pchar := cppPathBuf as pchar;
+        pi := 0;
+        while (pi < hPathLen) {
+          poke8(cppPath as int64 + pi, StrCharAt(basePath, pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(cppPath as int64 + hPathLen,     46);  // '.'
+        poke8(cppPath as int64 + hPathLen + 1, 99);  // 'c'
+        poke8(cppPath as int64 + hPathLen + 2, 112); // 'p'
+        poke8(cppPath as int64 + hPathLen + 3, 112); // 'p'
+        poke8(cppPath as int64 + hPathLen + 4, 0);
+
+        var gen: LfdCodeGen := new LfdCodeGen();
+        gen.Init(src, nodes);
+
+        // Generate .h
+        gen.GenerateHeader(nd);
+        FileWriteAll(hPath, gen.GetOut(), gen.GetOutLen());
+        if self.enableVerbose {
+          PrintStr("LFD: wrote "c);
+          PrintStrLn(hPath);
+        }
+
+        // Generate .cpp
+        gen.GenerateSource(nd, headerName);
+        FileWriteAll(cppPath, gen.GetOut(), gen.GetOutLen());
+        if self.enableVerbose {
+          PrintStr("LFD: wrote "c);
+          PrintStrLn(cppPath);
+        }
+      }
+      nd := peek64(nodes + nd * 88 + 40);  // next
+    }
   }
 
   // ---------------------------------------------------------------------------
