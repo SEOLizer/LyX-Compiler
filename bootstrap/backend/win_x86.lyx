@@ -1,0 +1,817 @@
+// bootstrap/backend/win_x86.lyx
+// Windows x86_64 backend for the Lyx bootstrap compiler (WP-BC-32).
+// Generates PE64 executables (.exe) for Windows x64 via Windows API (no syscalls).
+//
+// Strategy: "preamble + trampoline" pattern.
+//   [0..WIN_PREAMBLE_SZ-1]              Windows API implementation code
+//   [WIN_PREAMBLE_SZ..WIN_PREAMBLE_SZ+286]  Trampolines at same relative offsets as Linux helpers
+//   [WIN_PREAMBLE_SZ+287..]             User code (copied verbatim from Linux cgBuf[287..])
+//
+// This preserves all user-code rel32 call offsets unchanged, because both helper
+// trampolines and user code are shifted by the same WIN_PREAMBLE_SZ bytes.
+//
+// Windows helpers use the PEB trick (gs:[0x60] chain) to get stdout handle without
+// calling GetStdHandle, so only WriteFile, ExitProcess, VirtualAlloc are imported.
+//
+// PE64 layout:
+//   file[0..511]         headers (DOS + PE + COFF + optional + sections), file-aligned
+//   file[512..512+T-1]   .text (padded to FILE_ALIGNMENT)
+//   file[512+T..]        .rdata (import tables, padded to FILE_ALIGNMENT)
+//   virtual: ImageBase=0x140000000, .text RVA=0x1000, .rdata RVA=dynamic
+
+// ============================================================================
+// Layout constants (must all be consistent)
+// ============================================================================
+
+// Preamble size: win_print_str_impl(68) + win_print_int_impl(143) + win_strsub_impl(58)
+con WIN_PREAMBLE_SZ:   int64 := 269;
+con WIN_HELPERS_SZ:    int64 := 287;   // same as Linux CG_H_USER
+con WIN_USER_OFF:      int64 := 556;   // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+
+// Preamble sub-function offsets within code buffer
+con WIN_PS_OFF:   int64 := 0;     // win_print_str_impl
+con WIN_PI_OFF:   int64 := 68;    // win_print_int_impl
+con WIN_SS_OFF:   int64 := 211;   // win_strsub_impl (68+143)
+
+// Trampoline positions within trampoline zone (relative to WIN_PREAMBLE_SZ)
+con WIN_TR_START:    int64 := 0;    // _start trampoline / impl (65 bytes)
+con WIN_TR_STRLEN:   int64 := 65;   // strlen (15 bytes, no trampoline needed)
+con WIN_TR_PRINTSTR: int64 := 80;   // JMP print_str (26 bytes)
+con WIN_TR_PRINTINT: int64 := 106;  // JMP print_int (104 bytes)
+con WIN_TR_STRSUB:   int64 := 210;  // JMP strsub (71 bytes)
+con WIN_TR_STRCHA:   int64 := 281;  // strcharat (6 bytes, no trampoline needed)
+
+// Absolute code offsets of IAT indirect call instructions (FF 15 rel32)
+// rel32 field is at offset+2 from instruction start
+con WIN_CALL_WF1:  int64 := 56;    // print_str's WriteFile call
+con WIN_CALL_WF2:  int64 := 196;   // print_int's WriteFile call
+con WIN_CALL_VA:   int64 := 237;   // strsub's VirtualAlloc call
+con WIN_CALL_EP:   int64 := 324;   // _start's ExitProcess call  (WIN_PREAMBLE_SZ + 55)
+
+// PE layout
+con WIN_IMAGE_BASE:   int64 := 0x140000000;
+con WIN_TEXT_RVA:     int64 := 0x1000;
+con WIN_ENTRY_OFF:    int64 := 269;   // = WIN_PREAMBLE_SZ, _start offset in .text
+con WIN_FILE_ALIGN:   int64 := 0x200;
+con WIN_SEC_ALIGN:    int64 := 0x1000;
+
+// .rdata layout relative offsets (rdataRVA computed dynamically)
+con WIN_RDATA_IDT_OFF:    int64 := 0;    // Import Directory Table (2 * 20 = 40 bytes)
+con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (4 * 8 = 32 bytes)
+con WIN_RDATA_IAT_OFF:    int64 := 72;   // Import Address Table (4 * 8 = 32 bytes)
+con WIN_RDATA_DLL_OFF:    int64 := 104;  // "KERNEL32.dll\0" (13 bytes)
+con WIN_RDATA_WF_NAME:    int64 := 117;  // hint(2) + "WriteFile\0" (12 bytes)
+con WIN_RDATA_EP_NAME:    int64 := 129;  // hint(2) + "ExitProcess\0" (14 bytes)
+con WIN_RDATA_VA_NAME:    int64 := 143;  // hint(2) + "VirtualAlloc\0" (15 bytes)
+con WIN_RDATA_SIZE:       int64 := 158;  // total used bytes in .rdata
+
+// IAT slot offsets within .rdata:
+// WriteFile    = IAT_OFF + 0  = 72
+// ExitProcess  = IAT_OFF + 8  = 80
+// VirtualAlloc = IAT_OFF + 16 = 88
+
+// ============================================================================
+// WinX86Backend
+// ============================================================================
+
+pub type WinX86Backend = class {
+
+  code:    int64;
+  codeLen: int64;
+  codeCap: int64;
+
+  out:    int64;
+  outLen: int64;
+  outCap: int64;
+
+  // ------------------------------------------------------------------
+  // Code buffer primitives
+  // ------------------------------------------------------------------
+
+  fn wxb_cGrow(n: int64) {
+    if (self.codeCap >= self.codeLen + n) { return; }
+    var nc: int64 := self.codeCap * 2;
+    while (nc < self.codeLen + n) { nc := nc * 2; }
+    var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.codeLen) { poke8(nb + i, peek8(self.code + i)); i := i + 1; }
+    self.code    := nb;
+    self.codeCap := nc;
+  }
+
+  fn wxb_ce8(v: int64) {
+    self.wxb_cGrow(1);
+    poke8(self.code + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  fn wxb_ce32(v: int64) {
+    self.wxb_ce8(v & 0xFF);
+    self.wxb_ce8((v >> 8)  & 0xFF);
+    self.wxb_ce8((v >> 16) & 0xFF);
+    self.wxb_ce8((v >> 24) & 0xFF);
+  }
+
+  fn wxb_patch32(off: int64, val: int64) {
+    poke8(self.code + off,     val & 0xFF);
+    poke8(self.code + off + 1, (val >> 8) & 0xFF);
+    poke8(self.code + off + 2, (val >> 16) & 0xFF);
+    poke8(self.code + off + 3, (val >> 24) & 0xFF);
+  }
+
+  // ------------------------------------------------------------------
+  // Output buffer primitives
+  // ------------------------------------------------------------------
+
+  fn wxb_oGrow(n: int64) {
+    if (self.outCap >= self.outLen + n) { return; }
+    var nc: int64 := self.outCap * 2;
+    while (nc < self.outLen + n) { nc := nc * 2; }
+    var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.outLen) { poke8(nb + i, peek8(self.out + i)); i := i + 1; }
+    self.out    := nb;
+    self.outCap := nc;
+  }
+
+  fn wxb_oe8(v: int64) {
+    self.wxb_oGrow(1);
+    poke8(self.out + self.outLen, v & 0xFF);
+    self.outLen := self.outLen + 1;
+  }
+
+  fn wxb_oe16(v: int64) {
+    self.wxb_oe8(v & 0xFF);
+    self.wxb_oe8((v >> 8) & 0xFF);
+  }
+
+  fn wxb_oe32(v: int64) {
+    self.wxb_oe8(v & 0xFF);
+    self.wxb_oe8((v >> 8)  & 0xFF);
+    self.wxb_oe8((v >> 16) & 0xFF);
+    self.wxb_oe8((v >> 24) & 0xFF);
+  }
+
+  fn wxb_oe64(v: int64) {
+    self.wxb_oe32(v & 0xFFFFFFFF);
+    self.wxb_oe32((v >> 32) & 0xFFFFFFFF);
+  }
+
+  fn wxb_oZeros(n: int64) {
+    var i: int64 := 0;
+    while (i < n) { self.wxb_oe8(0); i := i + 1; }
+  }
+
+  fn wxb_oName8(s: pchar, sLen: int64) {
+    var i: int64 := 0;
+    while (i < 8) {
+      if (i < sLen) { self.wxb_oe8(StrCharAt(s, i)); } else { self.wxb_oe8(0); }
+      i := i + 1;
+    }
+  }
+
+  fn wxb_oStr(s: pchar, n: int64) {
+    var i: int64 := 0;
+    while (i < n) { self.wxb_oe8(StrCharAt(s, i)); i := i + 1; }
+  }
+
+  // ------------------------------------------------------------------
+  // Preamble: win_print_str_impl (68 bytes, code offset 0)
+  // RDI = string ptr (SysV ABI from Lyx).
+  // Inlines strlen, gets stdout via PEB trick, calls WriteFile.
+  // rel32 for WriteFile IAT is patched in wxb_patchIAT.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitPrintStr() {
+    // push rdi                                      1 byte
+    self.wxb_ce8(0x57);
+    // Inline strlen: xor rax, rax                   3 bytes  [1..3]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xC0);
+    // cmp byte[rdi+rax], 0                          4 bytes  [4..7]
+    self.wxb_ce8(0x80); self.wxb_ce8(0x3C); self.wxb_ce8(0x07); self.wxb_ce8(0x00);
+    // jz +5 (to offset 15)                          2 bytes  [8..9]
+    self.wxb_ce8(0x74); self.wxb_ce8(0x05);
+    // inc rax                                        3 bytes  [10..12]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);
+    // jmp -11 (back to cmp at offset 4)              2 bytes  [13..14]
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xF5);
+    // rax = len (offset 15)
+    // mov r8, rax  (49 89 C0)                        3 bytes  [15..17]
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xC0);
+    // mov rdx, rdi  (48 89 FA)                       3 bytes  [18..20]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xFA);
+    // PEB trick: mov rax, gs:[0x60]                  9 bytes  [21..29]
+    self.wxb_ce8(0x65); self.wxb_ce8(0x48); self.wxb_ce8(0x8B);
+    self.wxb_ce8(0x04); self.wxb_ce8(0x25);
+    self.wxb_ce8(0x60); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // mov rax, [rax+0x20]  ProcessParameters          4 bytes  [30..33]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8B); self.wxb_ce8(0x40); self.wxb_ce8(0x20);
+    // mov rcx, [rax+0x28]  StandardOutput             4 bytes  [34..37]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8B); self.wxb_ce8(0x48); self.wxb_ce8(0x28);
+    // sub rsp, 48  (shadow32 + bytesWritten8 + lpOverlapped8) 4 bytes [38..41]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x30);
+    // mov qword[rsp+32], 0  lpOverlapped=NULL          9 bytes  [42..50]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x20);
+    self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // lea r9, [rsp+40]  &bytesWritten (4th arg)        5 bytes  [51..55]
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x4C);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x28);
+    // call [WriteFile_IAT]  FF 15 rel32               6 bytes  [56..61]
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.wxb_ce32(0);   // placeholder, patched in wxb_patchIAT
+    // add rsp, 48                                     4 bytes  [62..65]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x30);
+    // pop rdi                                         1 byte   [66]
+    self.wxb_ce8(0x5F);
+    // ret                                             1 byte   [67]
+    self.wxb_ce8(0xC3);
+    // Total: 68 bytes (WIN_PS_OFF=0..67) ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Preamble: win_print_int_impl (143 bytes, code offset 68)
+  // RDI = int64 value (SysV ABI). Converts to decimal, calls WriteFile.
+  // Digit conversion identical to Linux print_int bytes 0..86.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitPrintInt() {
+    // sub rsp, 24  (digit buffer)                    4 bytes  [0..3]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x18);
+    // lea rsi, [rsp+23]  end of buffer               5 bytes  [4..8]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8D); self.wxb_ce8(0x74);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x17);
+    // mov rax, rdi                                   3 bytes  [9..11]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF8);
+    // test rax, rax                                  3 bytes  [12..14]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x85); self.wxb_ce8(0xC0);
+    // jnz +8 (.nonzero at byte 25)                   2 bytes  [15..16]
+    self.wxb_ce8(0x75); self.wxb_ce8(0x08);
+    // mov byte[rsi], '0'                             3 bytes  [17..19]
+    self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x30);
+    // dec rsi                                        3 bytes  [20..22]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xCE);
+    // jmp .emit (+48, to byte 73)                    2 bytes  [23..24]
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x30);
+    // .nonzero: test rax, rax                        3 bytes  [25..27]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x85); self.wxb_ce8(0xC0);
+    // jge +3 (.digitloop at byte 33)                 2 bytes  [28..29]
+    self.wxb_ce8(0x7D); self.wxb_ce8(0x03);
+    // neg rax                                        3 bytes  [30..32]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xF7); self.wxb_ce8(0xD8);
+    // .digitloop: test rax, rax                      3 bytes  [33..35]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x85); self.wxb_ce8(0xC0);
+    // jz +24 (.sign at byte 62)                      2 bytes  [36..37]
+    self.wxb_ce8(0x74); self.wxb_ce8(0x18);
+    // xor rdx, rdx                                   3 bytes  [38..40]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xD2);
+    // mov rcx, 10                                    7 bytes  [41..47]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0xC1);
+    self.wxb_ce8(0x0A); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // idiv rcx                                       3 bytes  [48..50]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xF7); self.wxb_ce8(0xF9);
+    // add rdx, 48                                    4 bytes  [51..54]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC2); self.wxb_ce8(0x30);
+    // mov [rsi], dl                                  2 bytes  [55..56]
+    self.wxb_ce8(0x88); self.wxb_ce8(0x16);
+    // dec rsi                                        3 bytes  [57..59]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xCE);
+    // jmp .digitloop (-29)                           2 bytes  [60..61]
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xE3);
+    // .sign: test rdi, rdi                           3 bytes  [62..64]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x85); self.wxb_ce8(0xFF);
+    // jns +6 (.emit at byte 73)                      2 bytes  [65..66]
+    self.wxb_ce8(0x79); self.wxb_ce8(0x06);
+    // mov byte[rsi], '-'                             3 bytes  [67..69]
+    self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x2D);
+    // dec rsi                                        3 bytes  [70..72]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xCE);
+    // .emit: inc rsi  (rsi = string start)           3 bytes  [73..75]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);
+    // lea rdx, [rsp+23]                              5 bytes  [76..80]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8D); self.wxb_ce8(0x54);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x17);
+    // sub rdx, rsi  (rdx = len-1)                    3 bytes  [81..83]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x29); self.wxb_ce8(0xF2);
+    // inc rdx  (rdx = len)                           3 bytes  [84..86]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC2);
+    // Windows WriteFile sequence (rsi=str, rdx=len):
+    // mov r8, rdx  (49 89 D0)                        3 bytes  [87..89]
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xD0);
+    // mov rdx, rsi  (48 89 F2)                       3 bytes  [90..92]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2);
+    // PEB: mov rax, gs:[0x60]                        9 bytes  [93..101]
+    self.wxb_ce8(0x65); self.wxb_ce8(0x48); self.wxb_ce8(0x8B);
+    self.wxb_ce8(0x04); self.wxb_ce8(0x25);
+    self.wxb_ce8(0x60); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // mov rax, [rax+0x20]                            4 bytes  [102..105]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8B); self.wxb_ce8(0x40); self.wxb_ce8(0x20);
+    // mov rcx, [rax+0x28]  stdout                    4 bytes  [106..109]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8B); self.wxb_ce8(0x48); self.wxb_ce8(0x28);
+    // sub rsp, 48                                    4 bytes  [110..113]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x30);
+    // mov qword[rsp+32], 0                           9 bytes  [114..122]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x20);
+    self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // lea r9, [rsp+40]                               5 bytes  [123..127]
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x4C);
+    self.wxb_ce8(0x24); self.wxb_ce8(0x28);
+    // call [WriteFile_IAT]  FF 15 rel32              6 bytes  [128..133]
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.wxb_ce32(0);   // placeholder, patched in wxb_patchIAT
+    // add rsp, 48                                    4 bytes  [134..137]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x30);
+    // add rsp, 24  (restore digit buffer)            4 bytes  [138..141]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x18);
+    // ret                                            1 byte   [142]
+    self.wxb_ce8(0xC3);
+    // Total: 143 bytes (WIN_PI_OFF=68..210) ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Preamble: win_strsub_impl (58 bytes, code offset 211)
+  // RDI=str, RSI=start, RDX=len. Allocates len+1 bytes via VirtualAlloc,
+  // copies str[start..start+len-1], null-terminates, returns new buffer in RAX.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitStrSub() {
+    // push rbx  (callee-saved; used to hold new_buffer across pops) 1 byte [0]
+    self.wxb_ce8(0x53);
+    // push rdi  (save str)                           1 byte   [1]
+    self.wxb_ce8(0x57);
+    // push rsi  (save start)                         1 byte   [2]
+    self.wxb_ce8(0x56);
+    // push rdx  (save len)                           1 byte   [3]
+    self.wxb_ce8(0x52);
+    // xor ecx, ecx  (lpAddress = NULL)               2 bytes  [4..5]
+    self.wxb_ce8(0x31); self.wxb_ce8(0xC9);
+    // lea rdx, [rdx+1]  (dwSize = len+1)             4 bytes  [6..9]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8D); self.wxb_ce8(0x52); self.wxb_ce8(0x01);
+    // mov r8d, 0x3000  (MEM_COMMIT|MEM_RESERVE)      6 bytes  [10..15]
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8);
+    self.wxb_ce8(0x00); self.wxb_ce8(0x30); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // mov r9d, 4  (PAGE_READWRITE)                   6 bytes  [16..21]
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB9);
+    self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);
+    // sub rsp, 40  (shadow32 + align8)               4 bytes  [22..25]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x28);
+    // call [VirtualAlloc_IAT]  FF 15 rel32           6 bytes  [26..31]
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.wxb_ce32(0);   // placeholder, patched in wxb_patchIAT
+    // add rsp, 40                                    4 bytes  [32..35]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x28);
+    // mov rbx, rax  (save new_buffer)                3 bytes  [36..38]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC3);
+    // pop rcx  (len)                                 1 byte   [39]
+    self.wxb_ce8(0x5A);
+    // pop rsi  (start)                               1 byte   [40]
+    self.wxb_ce8(0x5E);
+    // pop rdi  (str)                                 1 byte   [41]
+    self.wxb_ce8(0x5F);
+    // add rsi, rdi  (rsi = str + start = src ptr)   3 bytes  [42..44]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x01); self.wxb_ce8(0xFE);
+    // mov rdi, rbx  (dest = new_buffer)              3 bytes  [45..47]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xDF);
+    // rep movsb  (copy rcx=len bytes)                2 bytes  [48..49]
+    self.wxb_ce8(0xF3); self.wxb_ce8(0xA4);
+    // mov byte[rdi], 0  (null-terminate at offset len) 3 bytes [50..52]
+    self.wxb_ce8(0xC6); self.wxb_ce8(0x07); self.wxb_ce8(0x00);
+    // mov rax, rbx  (return new_buffer)              3 bytes  [53..55]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xD8);
+    // pop rbx                                        1 byte   [56]
+    self.wxb_ce8(0x5B);
+    // ret                                            1 byte   [57]
+    self.wxb_ce8(0xC3);
+    // Total: 58 bytes (WIN_SS_OFF=211..268) ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: _start (65 bytes, at code WIN_PREAMBLE_SZ+0)
+  // Entry point. Sets up shadow space, calls main, calls ExitProcess.
+  // rel32 for call main copied from Linux cgBuf[49..52].
+  // rel32 for ExitProcess IAT patched in wxb_patchIAT.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitStart(relMain: int64) {
+    // sub rsp, 40  (shadow32 + align8; RSP was 16n-8 at entry) 4 bytes [0..3]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x28);
+    // 44 NOPs  [4..47]
+    var i: int64 := 0;
+    while (i < 44) { self.wxb_ce8(0x90); i := i + 1; }
+    // call main  E8 rel32  [48..52]
+    self.wxb_ce8(0xE8); self.wxb_ce32(relMain);
+    // mov ecx, eax  (exit code = main() return value)  2 bytes [53..54]
+    self.wxb_ce8(0x89); self.wxb_ce8(0xC1);
+    // call [ExitProcess_IAT]  FF 15 rel32              6 bytes [55..60]
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.wxb_ce32(0);   // placeholder, patched in wxb_patchIAT
+    // 4 NOPs  [61..64]
+    var j: int64 := 0;
+    while (j < 4) { self.wxb_ce8(0x90); j := j + 1; }
+    // Total: 65 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: strlen (15 bytes, at code WIN_PREAMBLE_SZ+65)
+  // Identical to Linux/macOS version, no syscalls needed.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitStrlen() {
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xC0);        // xor rax, rax
+    self.wxb_ce8(0x80); self.wxb_ce8(0x3C); self.wxb_ce8(0x07); self.wxb_ce8(0x00); // cmp byte[rdi+rax], 0
+    self.wxb_ce8(0x74); self.wxb_ce8(0x05);                             // jz +5
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);        // inc rax
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xF5);                             // jmp -11
+    self.wxb_ce8(0xC3);                                                  // ret
+    // 15 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: print_str JMP trampoline (26 bytes, at code WIN_PREAMBLE_SZ+80)
+  // Jumps backward to win_print_str_impl at code[0].
+  // rel32 = 0 - (WIN_PREAMBLE_SZ + 80 + 5) = -354
+  // ------------------------------------------------------------------
+
+  fn wxb_emitPrintStrJmp() {
+    self.wxb_ce8(0xE9); self.wxb_ce32(-354);  // JMP to WIN_PS_OFF = 0
+    var i: int64 := 0;
+    while (i < 21) { self.wxb_ce8(0x90); i := i + 1; }
+    // 26 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: print_int JMP trampoline (104 bytes, at code WIN_PREAMBLE_SZ+106)
+  // Jumps backward to win_print_int_impl at code[68].
+  // rel32 = 68 - (WIN_PREAMBLE_SZ + 106 + 5) = 68 - 380 = -312
+  // ------------------------------------------------------------------
+
+  fn wxb_emitPrintIntJmp() {
+    self.wxb_ce8(0xE9); self.wxb_ce32(-312);  // JMP to WIN_PI_OFF = 68
+    var i: int64 := 0;
+    while (i < 99) { self.wxb_ce8(0x90); i := i + 1; }
+    // 104 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: strsub JMP trampoline (71 bytes, at code WIN_PREAMBLE_SZ+210)
+  // Jumps backward to win_strsub_impl at code[211].
+  // rel32 = 211 - (WIN_PREAMBLE_SZ + 210 + 5) = 211 - 484 = -273
+  // ------------------------------------------------------------------
+
+  fn wxb_emitStrSubJmp() {
+    self.wxb_ce8(0xE9); self.wxb_ce32(-273);  // JMP to WIN_SS_OFF = 211
+    var i: int64 := 0;
+    while (i < 66) { self.wxb_ce8(0x90); i := i + 1; }
+    // 71 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Trampoline zone: strcharat (6 bytes, at code WIN_PREAMBLE_SZ+281)
+  // Identical to Linux version.
+  // ------------------------------------------------------------------
+
+  fn wxb_emitStrCharAt() {
+    self.wxb_ce8(0x48); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x04); self.wxb_ce8(0x37); // movzx rax, byte[rdi+rsi]
+    self.wxb_ce8(0xC3);  // ret
+    // 6 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
+  // Patch IAT rel32 fields after codeLen is known (so rdataRVA can be computed).
+  // Called from wxb_buildCode after all code is assembled.
+  // ------------------------------------------------------------------
+
+  fn wxb_patchIAT() {
+    var codeLen: int64 := self.codeLen;
+    // .rdata starts at next page boundary after .text
+    var rdataRVA: int64 := (WIN_TEXT_RVA + codeLen + WIN_SEC_ALIGN - 1) & ~(WIN_SEC_ALIGN - 1);
+
+    // IAT slot RVAs
+    var wfRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 0;   // WriteFile
+    var epRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 8;   // ExitProcess
+    var vaRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 16;  // VirtualAlloc
+
+    // Each call [X_IAT] at code offset K: rel32 = X_RVA - (TEXT_RVA + K + 6)
+    // rel32 field is at code[K+2]
+    var textBase: int64 := WIN_TEXT_RVA;
+
+    // win_print_str_impl WriteFile call at code[56], instruction end at 62
+    var r1: int64 := wfRVA - (textBase + WIN_CALL_WF1 + 6);
+    self.wxb_patch32(WIN_CALL_WF1 + 2, r1);
+
+    // win_print_int_impl WriteFile call at code[196], instruction end at 202
+    var r2: int64 := wfRVA - (textBase + WIN_CALL_WF2 + 6);
+    self.wxb_patch32(WIN_CALL_WF2 + 2, r2);
+
+    // win_strsub_impl VirtualAlloc call at code[237], instruction end at 243
+    var r3: int64 := vaRVA - (textBase + WIN_CALL_VA + 6);
+    self.wxb_patch32(WIN_CALL_VA + 2, r3);
+
+    // _start ExitProcess call at code[324], instruction end at 330
+    var r4: int64 := epRVA - (textBase + WIN_CALL_EP + 6);
+    self.wxb_patch32(WIN_CALL_EP + 2, r4);
+  }
+
+  // ------------------------------------------------------------------
+  // Build the Windows code buffer from a Linux cgBuf.
+  // Layout: preamble (269) + trampoline zone (287) + user code (cgLen-287).
+  // ------------------------------------------------------------------
+
+  fn wxb_buildCode(cgBuf: int64, cgLen: int64) {
+    // Extract call-main rel32 from Linux _start (patched at cgBuf[49..52])
+    var b0: int64 := peek8(cgBuf + 49);
+    var b1: int64 := peek8(cgBuf + 50);
+    var b2: int64 := peek8(cgBuf + 51);
+    var b3: int64 := peek8(cgBuf + 52);
+    var relMain: int64 := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    // Sign-extend from 32 to 64 bits
+    if ((relMain & 0x80000000) != 0) {
+      relMain := relMain | ((-1) & ~0xFFFFFFFF);
+    }
+
+    // Emit preamble (WIN_PREAMBLE_SZ = 269 bytes)
+    self.wxb_emitPrintStr();     // 68 bytes, offsets 0..67
+    self.wxb_emitPrintInt();     // 143 bytes, offsets 68..210
+    self.wxb_emitStrSub();       // 58 bytes, offsets 211..268
+
+    // Emit trampoline zone (WIN_HELPERS_SZ = 287 bytes)
+    self.wxb_emitStart(relMain); // 65 bytes, offsets 269..333
+    self.wxb_emitStrlen();       // 15 bytes, offsets 334..348
+    self.wxb_emitPrintStrJmp();  // 26 bytes, offsets 349..374
+    self.wxb_emitPrintIntJmp();  // 104 bytes, offsets 375..478
+    self.wxb_emitStrSubJmp();    // 71 bytes, offsets 479..549
+    self.wxb_emitStrCharAt();    // 6 bytes, offsets 550..555
+
+    // Copy user code verbatim (all rel32 values remain correct)
+    var i: int64 := WIN_HELPERS_SZ;
+    while (i < cgLen) {
+      self.wxb_ce8(peek8(cgBuf + i));
+      i := i + 1;
+    }
+
+    // Patch IAT indirect call rel32 fields now that codeLen is final
+    self.wxb_patchIAT();
+  }
+
+  // ------------------------------------------------------------------
+  // Write .rdata section content to out buffer.
+  // Must be called after wxb_buildCode so rdataRVA is deterministic.
+  // ------------------------------------------------------------------
+
+  fn wxb_writeRdata(rdataRVA: int64) {
+    // --- IDT Entry 0: kernel32.dll ---
+    self.wxb_oe32(rdataRVA + WIN_RDATA_INT_OFF);   // OriginalFirstThunk = INT RVA
+    self.wxb_oe32(0);                               // TimeDateStamp
+    self.wxb_oe32(0xFFFFFFFF);                      // ForwarderChain
+    self.wxb_oe32(rdataRVA + WIN_RDATA_DLL_OFF);   // Name RVA
+    self.wxb_oe32(rdataRVA + WIN_RDATA_IAT_OFF);   // FirstThunk = IAT RVA
+    // --- IDT Entry 1: null terminator ---
+    self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0);
+    // --- INT (Import Name Table): 3 entries + null ---
+    self.wxb_oe64(rdataRVA + WIN_RDATA_WF_NAME);   // WriteFile
+    self.wxb_oe64(rdataRVA + WIN_RDATA_EP_NAME);   // ExitProcess
+    self.wxb_oe64(rdataRVA + WIN_RDATA_VA_NAME);   // VirtualAlloc
+    self.wxb_oe64(0);                               // null terminator
+    // --- IAT (Import Address Table): same as INT initially ---
+    self.wxb_oe64(rdataRVA + WIN_RDATA_WF_NAME);
+    self.wxb_oe64(rdataRVA + WIN_RDATA_EP_NAME);
+    self.wxb_oe64(rdataRVA + WIN_RDATA_VA_NAME);
+    self.wxb_oe64(0);
+    // --- DLL name: "KERNEL32.dll\0" (13 bytes) ---
+    self.wxb_oe8(75);  // K
+    self.wxb_oe8(69);  // E
+    self.wxb_oe8(82);  // R
+    self.wxb_oe8(78);  // N
+    self.wxb_oe8(69);  // E
+    self.wxb_oe8(76);  // L
+    self.wxb_oe8(51);  // 3
+    self.wxb_oe8(50);  // 2
+    self.wxb_oe8(46);  // .
+    self.wxb_oe8(100); // d
+    self.wxb_oe8(108); // l
+    self.wxb_oe8(108); // l
+    self.wxb_oe8(0);   // NUL
+    // --- hint + "WriteFile\0" (12 bytes) ---
+    self.wxb_oe16(0);   // hint
+    self.wxb_oe8(87); self.wxb_oe8(114); self.wxb_oe8(105); self.wxb_oe8(116); // Writ
+    self.wxb_oe8(101); self.wxb_oe8(70); self.wxb_oe8(105); self.wxb_oe8(108); // eFil
+    self.wxb_oe8(101); self.wxb_oe8(0);  // e NUL
+    // --- hint + "ExitProcess\0" (14 bytes) ---
+    self.wxb_oe16(0);   // hint
+    self.wxb_oe8(69);  self.wxb_oe8(120); self.wxb_oe8(105); self.wxb_oe8(116); // Exit
+    self.wxb_oe8(80);  self.wxb_oe8(114); self.wxb_oe8(111); self.wxb_oe8(99);  // Proc
+    self.wxb_oe8(101); self.wxb_oe8(115); self.wxb_oe8(115); self.wxb_oe8(0);   // ess NUL
+    // --- hint + "VirtualAlloc\0" (15 bytes) ---
+    self.wxb_oe16(0);   // hint
+    self.wxb_oe8(86);  self.wxb_oe8(105); self.wxb_oe8(114); self.wxb_oe8(116); // Virt
+    self.wxb_oe8(117); self.wxb_oe8(97);  self.wxb_oe8(108); self.wxb_oe8(65);  // ualA
+    self.wxb_oe8(108); self.wxb_oe8(108); self.wxb_oe8(111); self.wxb_oe8(99);  // lloc
+    self.wxb_oe8(0);    // NUL
+    // Total .rdata used: 158 bytes. Pad to FILE_ALIGNMENT = 512.
+    self.wxb_oZeros(WIN_FILE_ALIGN - WIN_RDATA_SIZE);
+  }
+
+  // ------------------------------------------------------------------
+  // Write DOS header (64 bytes)
+  // ------------------------------------------------------------------
+
+  fn wxb_writeDosHeader(peOffset: int64) {
+    self.wxb_oe16(0x5A4D);  // e_magic "MZ"
+    self.wxb_oe16(0x0090);  // e_cblp
+    self.wxb_oe16(0x0003);  // e_cp
+    self.wxb_oe16(0x0000);  // e_crlc
+    self.wxb_oe16(0x0004);  // e_cparhdr
+    self.wxb_oe16(0x0000);  // e_minalloc
+    self.wxb_oe16(0xFFFF);  // e_maxalloc
+    self.wxb_oe16(0x0000);  // e_ss
+    self.wxb_oe16(0x00B8);  // e_sp
+    self.wxb_oe16(0x0000);  // e_csum
+    self.wxb_oe16(0x0000);  // e_ip
+    self.wxb_oe16(0x0000);  // e_cs
+    self.wxb_oe16(0x0040);  // e_lfarlc
+    self.wxb_oe16(0x0000);  // e_ovno
+    // e_res (4 words)
+    self.wxb_oe16(0); self.wxb_oe16(0); self.wxb_oe16(0); self.wxb_oe16(0);
+    self.wxb_oe16(0x0000);  // e_oemid
+    self.wxb_oe16(0x0000);  // e_oeminfo
+    // e_res2 (10 words)
+    var i: int64 := 0;
+    while (i < 10) { self.wxb_oe16(0); i := i + 1; }
+    self.wxb_oe32(peOffset);  // e_lfanew
+  }
+
+  // ------------------------------------------------------------------
+  // Write DOS stub (64 bytes): "This program cannot be run in DOS mode."
+  // ------------------------------------------------------------------
+
+  fn wxb_writeDosStub() {
+    // push cs; pop ds; mov dx,0x000e; mov ah,9; int 0x21; mov ax,0x4c01; int 0x21
+    self.wxb_oe8(0x0E); self.wxb_oe8(0x1F); self.wxb_oe8(0xBA); self.wxb_oe8(0x0E);
+    self.wxb_oe8(0x00); self.wxb_oe8(0xB4); self.wxb_oe8(0x09); self.wxb_oe8(0xCD);
+    self.wxb_oe8(0x21); self.wxb_oe8(0xB8); self.wxb_oe8(0x01); self.wxb_oe8(0x4C);
+    self.wxb_oe8(0xCD); self.wxb_oe8(0x21);
+    // "This program cannot be run in DOS mode.\r\n$"
+    self.wxb_oe8(84);  self.wxb_oe8(104); self.wxb_oe8(105); self.wxb_oe8(115);
+    self.wxb_oe8(32);  self.wxb_oe8(112); self.wxb_oe8(114); self.wxb_oe8(111);
+    self.wxb_oe8(103); self.wxb_oe8(114); self.wxb_oe8(97);  self.wxb_oe8(109);
+    self.wxb_oe8(32);  self.wxb_oe8(99);  self.wxb_oe8(97);  self.wxb_oe8(110);
+    self.wxb_oe8(110); self.wxb_oe8(111); self.wxb_oe8(116); self.wxb_oe8(32);
+    self.wxb_oe8(98);  self.wxb_oe8(101); self.wxb_oe8(32);  self.wxb_oe8(114);
+    self.wxb_oe8(117); self.wxb_oe8(110); self.wxb_oe8(32);  self.wxb_oe8(105);
+    self.wxb_oe8(110); self.wxb_oe8(32);  self.wxb_oe8(68);  self.wxb_oe8(79);
+    self.wxb_oe8(83);  self.wxb_oe8(32);  self.wxb_oe8(109); self.wxb_oe8(111);
+    self.wxb_oe8(100); self.wxb_oe8(101); self.wxb_oe8(46);  self.wxb_oe8(13);
+    self.wxb_oe8(10);  self.wxb_oe8(36);
+    // pad to 64 bytes: used 14+42=56, need 8 more
+    self.wxb_oe8(0); self.wxb_oe8(0); self.wxb_oe8(0); self.wxb_oe8(0);
+    self.wxb_oe8(0); self.wxb_oe8(0); self.wxb_oe8(0); self.wxb_oe8(0);
+  }
+
+  // ------------------------------------------------------------------
+  // Write PE64 binary to disk.
+  // ------------------------------------------------------------------
+
+  fn wxb_writePE64(path: pchar) {
+    var codeLen: int64 := self.codeLen;
+    var textRawSize: int64 := (codeLen + WIN_FILE_ALIGN - 1) & ~(WIN_FILE_ALIGN - 1);
+    var rdataRVA: int64 := (WIN_TEXT_RVA + codeLen + WIN_SEC_ALIGN - 1) & ~(WIN_SEC_ALIGN - 1);
+    var rdataFileOff: int64 := WIN_FILE_ALIGN + textRawSize;  // 512 header + text
+    var imageSize: int64 := rdataRVA + WIN_SEC_ALIGN;
+    var entryRVA: int64 := WIN_TEXT_RVA + WIN_ENTRY_OFF;
+
+    // ---- DOS Header (64 bytes) + DOS Stub (64 bytes) ----
+    self.wxb_writeDosHeader(128);  // PE signature at file offset 128
+    self.wxb_writeDosStub();
+
+    // ---- PE Signature "PE\0\0" ----
+    self.wxb_oe8(80); self.wxb_oe8(69); self.wxb_oe8(0); self.wxb_oe8(0);
+
+    // ---- COFF Header (20 bytes) ----
+    self.wxb_oe16(0x8664);    // Machine = AMD64
+    self.wxb_oe16(2);         // NumberOfSections
+    self.wxb_oe32(0);         // TimeDateStamp
+    self.wxb_oe32(0);         // PointerToSymbolTable
+    self.wxb_oe32(0);         // NumberOfSymbols
+    self.wxb_oe16(240);       // SizeOfOptionalHeader
+    self.wxb_oe16(0x0022);    // IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE
+
+    // ---- Optional Header PE32+ (240 bytes) ----
+    self.wxb_oe16(0x020B);    // Magic = PE32+
+    self.wxb_oe8(1);          // MajorLinkerVersion
+    self.wxb_oe8(0);          // MinorLinkerVersion
+    self.wxb_oe32(textRawSize);  // SizeOfCode
+    self.wxb_oe32(WIN_FILE_ALIGN);  // SizeOfInitializedData (rdata raw)
+    self.wxb_oe32(0);         // SizeOfUninitializedData
+    self.wxb_oe32(entryRVA);  // AddressOfEntryPoint
+    self.wxb_oe32(WIN_TEXT_RVA);  // BaseOfCode
+    self.wxb_oe64(WIN_IMAGE_BASE); // ImageBase
+    self.wxb_oe32(WIN_SEC_ALIGN);  // SectionAlignment = 4096
+    self.wxb_oe32(WIN_FILE_ALIGN); // FileAlignment = 512
+    self.wxb_oe16(6);  self.wxb_oe16(2);   // OS Version 6.2
+    self.wxb_oe16(0);  self.wxb_oe16(0);   // Image Version
+    self.wxb_oe16(6);  self.wxb_oe16(2);   // Subsystem Version 6.2
+    self.wxb_oe32(0);         // Win32VersionValue
+    self.wxb_oe32(imageSize); // SizeOfImage
+    self.wxb_oe32(WIN_FILE_ALIGN);  // SizeOfHeaders = 512
+    self.wxb_oe32(0);         // CheckSum
+    self.wxb_oe16(3);         // Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI
+    self.wxb_oe16(0x0100);    // DllCharacteristics = NX_COMPAT
+    self.wxb_oe64(0x100000);  // SizeOfStackReserve = 1 MB
+    self.wxb_oe64(0x1000);    // SizeOfStackCommit = 4 KB
+    self.wxb_oe64(0x100000);  // SizeOfHeapReserve = 1 MB
+    self.wxb_oe64(0x1000);    // SizeOfHeapCommit = 4 KB
+    self.wxb_oe32(0);         // LoaderFlags
+    self.wxb_oe32(16);        // NumberOfRvaAndSizes
+
+    // Data Directories (16 entries × 8 bytes = 128 bytes)
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [0] Export
+    self.wxb_oe32(rdataRVA); self.wxb_oe32(40);  // [1] Import (IDT)
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [2] Resource
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [3] Exception
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [4] Security
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [5] BaseReloc
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [6] Debug
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [7] Architecture
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [8] GlobalPtr
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [9] TLS
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [10] LoadConfig
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [11] BoundImport
+    self.wxb_oe32(rdataRVA + WIN_RDATA_IAT_OFF); self.wxb_oe32(32);  // [12] IAT
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [13] DelayImport
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [14] CLR
+    self.wxb_oe32(0); self.wxb_oe32(0);  // [15] Reserved
+
+    // ---- Section Header .text (40 bytes) ----
+    self.wxb_oName8(".text"c, 5);
+    self.wxb_oe32(codeLen);         // VirtualSize
+    self.wxb_oe32(WIN_TEXT_RVA);    // VirtualAddress
+    self.wxb_oe32(textRawSize);     // SizeOfRawData
+    self.wxb_oe32(WIN_FILE_ALIGN);  // PointerToRawData = 512
+    self.wxb_oe32(0);               // PointerToRelocations
+    self.wxb_oe32(0);               // PointerToLinenumbers
+    self.wxb_oe16(0);               // NumberOfRelocations
+    self.wxb_oe16(0);               // NumberOfLinenumbers
+    self.wxb_oe32(0x60000020);      // Characteristics: CODE|MEM_EXECUTE|MEM_READ
+
+    // ---- Section Header .rdata (40 bytes) ----
+    self.wxb_oName8(".rdata"c, 6);
+    self.wxb_oe32(WIN_RDATA_SIZE);  // VirtualSize = 158
+    self.wxb_oe32(rdataRVA);        // VirtualAddress
+    self.wxb_oe32(WIN_FILE_ALIGN);  // SizeOfRawData = 512
+    self.wxb_oe32(rdataFileOff);    // PointerToRawData
+    self.wxb_oe32(0);               // PointerToRelocations
+    self.wxb_oe32(0);               // PointerToLinenumbers
+    self.wxb_oe16(0);               // NumberOfRelocations
+    self.wxb_oe16(0);               // NumberOfLinenumbers
+    self.wxb_oe32(0x40000040);      // Characteristics: INITIALIZED_DATA|MEM_READ
+
+    // ---- Pad header to FILE_ALIGNMENT (512) ----
+    self.wxb_oZeros(WIN_FILE_ALIGN - self.outLen);
+
+    // ---- .text section ----
+    var i: int64 := 0;
+    while (i < codeLen) {
+      self.wxb_oe8(peek8(self.code + i));
+      i := i + 1;
+    }
+    self.wxb_oZeros(textRawSize - codeLen);
+
+    // ---- .rdata section ----
+    self.wxb_writeRdata(rdataRVA);
+
+    // ---- Write to file (O_WRONLY|O_CREAT|O_TRUNC=577, mode 0755=493) ----
+    var fd: int64 := open(path, 577, 493);
+    if (fd < 0) {
+      EPrintStr("error: cannot write output: "c);
+      EPrintStrLn(path);
+      return;
+    }
+    write(fd, self.out as pchar, self.outLen);
+    close(fd);
+  }
+
+  // ------------------------------------------------------------------
+  // Public API
+  // ------------------------------------------------------------------
+
+  pub fn Build(cgBuf: int64, cgLen: int64) {
+    self.wxb_buildCode(cgBuf, cgLen);
+  }
+
+  pub fn WritePE64(path: pchar) {
+    self.wxb_writePE64(path);
+  }
+
+  pub fn GetCodeSize(): int64 { return self.codeLen; }
+
+  pub fn Init() {
+    self.codeCap := 65536;
+    self.code    := mmap(0, self.codeCap, 3, 34, -1, 0);
+    self.codeLen := 0;
+    self.outCap  := 65536;
+    self.out     := mmap(0, self.outCap, 3, 34, -1, 0);
+    self.outLen  := 0;
+  }
+
+};
