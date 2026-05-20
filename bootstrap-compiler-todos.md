@@ -767,23 +767,18 @@ Codegen emittiert für jede Instanz eine eigene Funktion.
 
 ---
 
-### WP-BC-37: ARM Cortex-M (Bare Metal) Backend
+### ✅ WP-BC-37: ARM Cortex-M (Bare Metal) Backend
 
-**Ziel:** Thumb-2-ELF für ARM Cortex-M Mikrocontroller.
+**Status:** Erledigt — Branch `feat/wp-bc-37-arm-cortex-m`.
 
-**Referenz:** S0 `compiler/backend/arm_cm/arm_cm_emit.pas` (1.521 Zeilen),
-`compiler/backend/arm_cm/arm_cm_defs.pas`
-
-**Zu tun:**
-- Neue Datei `bootstrap/backend/arm_cm.lyx`
-- Thumb-2 Instruction Encoding (16-bit + 32-bit gemischt)
-- Basis-Instruktionen: `MOV`/`MOVW`/`MOVT`, `ADD`/`SUB`/`MUL`, `LDR`/`STR`,
-  `B`/`BL`/`CBZ`, `SVC` für RTOS-Calls oder Bare-Metal-Traps
-- ARM EABI: r0–r3 für Argumente, r14 = LR, r15 = PC
-- ELF32-ARM-Header (e_machine = 0x28 = EM_ARM)
-- Startup-Code: `.vectors`-Sektion mit Reset-Handler
-- kein `mmap` — manuelle Heap-Verwaltung via `sbrk`-Äquivalent
-- CLI-Flag `--target arm-cm4` / `--target arm-cm33`
+**Ergebnis:**
+- `bootstrap/backend/arm_cm_backend.lyx` — `EmitARMCM` (IR → Thumb-2) + `ARMCMBackend` (ELF32 writer)
+- `EmitARMCM`: vollständiges IR-Dispatch (Arithmetik, Bitwise, Vergleiche, Control Flow, Calls), 16-bit und 32-bit Thumb-2 Encoding, branch backpatching (B.W T4, BL T1, BEQ/BNE T3), slot-based frame layout (slotOff(i)=(i+1)*4 als Negativ-Offset von r7)
+- AAPCS: r0-r3 args/return, r7 Frame Pointer, PUSH {r7,lr} Prologue, POP {r7,pc} Epilogue
+- `ARMCMBackend`: Vektor-Tabelle (8 Bytes: SP=0x20002000 + Reset-Handler-VA=0x08000009), Reset-Handler BL main + B. (6 Bytes), ELF32 writer mit e_machine=0x28 (EM_ARM), e_flags=0x05000200 (EABI5+Thumb-interwork), Flash-Base 0x08000000
+- `bootstrap/lyxc.lyx`: TARGET_ARM_CM4=10, `--target=arm-cm4` / `--target=arm-cm33`, `emitARMCM4()` wired in
+- Verifikation: `file hello_cm4` → `ELF 32-bit LSB executable, ARM, EABI5 version 1 (SYSV), statically linked, no section header`
+- Hex-Verifikation: Vektortabelle, Reset-Handler (BL main = F000 F801), main() Prologue/Epilogue, B.W-Patch korrekt ✓
 
 ---
 
