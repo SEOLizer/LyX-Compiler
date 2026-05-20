@@ -181,6 +181,10 @@ pub type CompilerConfig = class {
   tracePasses: bool;
   irSourceMap:  bool;
 
+  // WP-BC-45: dump flags
+  astDump:     bool;
+  symtabDump:  bool;
+
   // Compilation state
   exitCode: int64;
   errorCount: int64;
@@ -233,6 +237,8 @@ pub type CompilerConfig = class {
     self.profileEnabled := false;
     self.tracePasses    := false;
     self.irSourceMap    := false;
+    self.astDump        := false;
+    self.symtabDump     := false;
     self.exitCode := 0;
     self.errorCount := 0;
     self.warningCount := 0;
@@ -605,6 +611,16 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-BC-45: --ast-dump / --symtab-dump
+    if StrCmp(arg, "--ast-dump"c) == 0 {
+      self.astDump := true;
+      return;
+    }
+    if StrCmp(arg, "--symtab-dump"c) == 0 {
+      self.symtabDump := true;
+      return;
+    }
+
     // --version
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr(COMPILER_NAME);
@@ -740,6 +756,8 @@ pub type CompilerConfig = class {
     PrintStrLn("  --profile          Enable profile_enter() / profile_leave() / profile_report()");
     PrintStrLn("  --trace-passes     Print timing for each compiler pass ([pass] name: done NNms)");
     PrintStrLn("  --ir-source-map    Annotate IR dump with ; line:N source locations");
+    PrintStrLn("  --ast-dump         Print indented AST after parsing, then exit");
+    PrintStrLn("  --symtab-dump      Print symbol table after sema (continues compilation)");
     PrintStrLn("  --include <hdr.h>  Parse C header and emit extern fn declarations");
     PrintStrLn("  -I <path>          Add include search path for imports");
     PrintStrLn("  -I<path>           Same as -I <path> (inline form)");
@@ -797,8 +815,8 @@ pub type CompilerConfig = class {
     self._passEnd("parser"c, _t2);
 
     // Dump AST if requested and return early
-    if self.dumpParser {
-      self.dumpAST(astRoot);
+    if self.dumpParser || self.astDump {
+      self.dumpAST(parser.nodes, parser.src, astRoot);
       return self.exitCode;
     }
     
@@ -820,6 +838,11 @@ pub type CompilerConfig = class {
     var semaResult: int64 := sema.Check(0);  // Use index 0 for Sema
     PrintStrLn("Sema.Check done");
     self._passEnd("sema"c, _t3);
+
+    // WP-BC-45: --symtab-dump (non-destructive, continues compilation)
+    if self.symtabDump {
+      sema.DumpSymbols();
+    }
 
     if semaResult != 0 {
       self.exitCode := 1;
@@ -1903,11 +1926,108 @@ pub type CompilerConfig = class {
     dispose lx;
   }
   
-  fn dumpAST(astRoot: int64): void {
-    PrintStrLn("=== PARSER AST ===");
-    // Would dump AST nodes
+  // WP-BC-45: NK_ constant → name string helper
+  fn _nkStr(k: int64): pchar {
+    if k == NK_INVALID     { return "INVALID"c; }
+    if k == NK_IMPORT      { return "IMPORT"c; }
+    if k == NK_FUNC_DECL   { return "FUNC_DECL"c; }
+    if k == NK_PARAM       { return "PARAM"c; }
+    if k == NK_VAR_DECL    { return "VAR_DECL"c; }
+    if k == NK_CON_DECL    { return "CON_DECL"c; }
+    if k == NK_STRUCT_DECL { return "STRUCT_DECL"c; }
+    if k == NK_FIELD_DECL  { return "FIELD_DECL"c; }
+    if k == NK_ENUM_DECL   { return "ENUM_DECL"c; }
+    if k == NK_ENUM_MEM    { return "ENUM_MEM"c; }
+    if k == NK_TYPE_DECL   { return "TYPE_DECL"c; }
+    if k == NK_BLOCK       { return "BLOCK"c; }
+    if k == NK_IF          { return "IF"c; }
+    if k == NK_WHILE       { return "WHILE"c; }
+    if k == NK_FOR         { return "FOR"c; }
+    if k == NK_SWITCH      { return "SWITCH"c; }
+    if k == NK_CASE        { return "CASE"c; }
+    if k == NK_BREAK       { return "BREAK"c; }
+    if k == NK_CONTINUE    { return "CONTINUE"c; }
+    if k == NK_RETURN      { return "RETURN"c; }
+    if k == NK_EXPR_STMT   { return "EXPR_STMT"c; }
+    if k == NK_ASSIGN      { return "ASSIGN"c; }
+    if k == NK_DISPOSE     { return "DISPOSE"c; }
+    if k == NK_ASSERT      { return "ASSERT"c; }
+    if k == NK_LIT_INT     { return "LIT_INT"c; }
+    if k == NK_LIT_FLOAT   { return "LIT_FLOAT"c; }
+    if k == NK_LIT_STR     { return "LIT_STR"c; }
+    if k == NK_LIT_CHAR    { return "LIT_CHAR"c; }
+    if k == NK_LIT_BOOL    { return "LIT_BOOL"c; }
+    if k == NK_LIT_NULL    { return "LIT_NULL"c; }
+    if k == NK_IDENT       { return "IDENT"c; }
+    if k == NK_BINOP       { return "BINOP"c; }
+    if k == NK_UNOP        { return "UNOP"c; }
+    if k == NK_CALL        { return "CALL"c; }
+    if k == NK_INDEX       { return "INDEX"c; }
+    if k == NK_FIELD       { return "FIELD"c; }
+    if k == NK_NEW         { return "NEW"c; }
+    if k == NK_CAST        { return "CAST"c; }
+    if k == NK_TYPE_NAME   { return "TYPE_NAME"c; }
+    if k == NK_TYPE_ARRAY  { return "TYPE_ARRAY"c; }
+    return "?"c;
   }
-  
+
+  // WP-BC-45: recursive AST node printer (walks sibling chain + recurses into children)
+  fn _dumpASTNode(nodes: int64, src: pchar, ni: int64, depth: int64): void {
+    var cur: int64 := ni;
+    while cur >= 0 {
+      var base: int64 := nodes + cur * 88;
+      var kind: int64 := peek64(base);
+      var nc0:  int64 := peek64(base + 8);
+      var nc1:  int64 := peek64(base + 16);
+      var nc2:  int64 := peek64(base + 24);
+      var nc3:  int64 := peek64(base + 32);
+      var nxt:  int64 := peek64(base + 40);
+      var iVal: int64 := peek64(base + 56);
+      var sOff: int64 := peek64(base + 64);
+      var sLen: int64 := peek64(base + 72);
+
+      var d: int64 := 0;
+      while d < depth {
+        PrintStr("  "c);
+        d := d + 1;
+      }
+
+      PrintStr("["c);
+      PrintInt(cur);
+      PrintStr("] "c);
+      PrintStr(self._nkStr(kind));
+
+      if sLen > 0 && (src as int64) != 0 {
+        PrintStr(" '"c);
+        PrintStr(StrSub(src, sOff, sLen));
+        PrintStr("'"c);
+      }
+
+      if kind == NK_LIT_INT || kind == NK_LIT_CHAR || kind == NK_LIT_BOOL {
+        PrintStr(" ="c);
+        PrintInt(iVal);
+      }
+
+      PrintStr("\n"c);
+
+      if nc0 >= 0 { self._dumpASTNode(nodes, src, nc0, depth + 1); }
+      if nc1 >= 0 { self._dumpASTNode(nodes, src, nc1, depth + 1); }
+      if nc2 >= 0 { self._dumpASTNode(nodes, src, nc2, depth + 1); }
+      if nc3 >= 0 { self._dumpASTNode(nodes, src, nc3, depth + 1); }
+
+      cur := nxt;
+    }
+  }
+
+  fn dumpAST(nodes: int64, src: pchar, astRoot: int64): void {
+    PrintStrLn("=== PARSER AST ===");
+    if astRoot < 0 {
+      PrintStrLn("(empty)");
+      return;
+    }
+    self._dumpASTNode(nodes, src, astRoot, 0);
+  }
+
   fn dumpSemaInfo(sema: int64): void {
     PrintStrLn("=== SEMANTIC INFO ===");
     // Would dump symbol table
