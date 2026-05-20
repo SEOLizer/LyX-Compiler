@@ -84,6 +84,17 @@ pub con NK_UTYPE_DECL:    int64 := 91;  // WP-BC-16: utype Name: Dim = Factor;
 pub con NK_TYPE_RINGBUF:  int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 pub con NK_TYPE_PARALLEL: int64 := 93;  // WP-BC-18: parallel Array<T> type node
 pub con NK_SIMD_NEW:      int64 := 94;  // WP-BC-18: parallel Array<T>(size) expression
+// WP-BC-41: LFD Qt-UI-Builder AST nodes
+// NK_LFD_FORM:     sOff/sLen=form_name, nc1=title_src_off, nc2=title_src_len, nc0=first_child
+// NK_LFD_WIDGET:   sOff/sLen=type_name, nc1=varname_src_off, nc2=varname_src_len, nc0=first_property
+// NK_LFD_LAYOUT:   iVal=layout_kind(1=V,2=H,3=Grid,4=Form), nc0=first_child
+// NK_LFD_PROPERTY: sOff/sLen=prop_name, nc1=value_src_off, nc2=value_src_len
+// NK_LFD_SIGNAL:   sOff/sLen=signal_name, nc1=handler_src_off, nc2=handler_src_len
+pub con NK_LFD_FORM:     int64 := 95;
+pub con NK_LFD_WIDGET:   int64 := 96;
+pub con NK_LFD_LAYOUT:   int64 := 97;
+pub con NK_LFD_PROPERTY: int64 := 98;
+pub con NK_LFD_SIGNAL:   int64 := 99;
 pub con NK_REPEAT_UNTIL:   int64 := 77;  // WP-BC-04: repeat { body } until (cond)
 pub con NK_TUPLE_VAR_DECL: int64 := 78;  // WP-BC-05: var a, b := fn()
 pub con NK_MAP_LIT:        int64 := 79;  // WP-BC-06: { key: val, ... }
@@ -1734,6 +1745,139 @@ pub type Parser = class {
   }
 
   // ==================================================================
+  // WP-BC-41: LFD Qt-UI-Builder form parsing
+  // Syntax: form FormName "Title" { widget/layout... }
+  // ==================================================================
+
+  fn _parseLfdPropBody(widgetNode: int64) {
+    // Parse property/signal list inside widget body: { PropName: value; ... }
+    // Linked list via _sn; attached to widgetNode via _sc0
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var isSignal: int64 := 0;
+      if (self.Match(TK_SIGNAL) != 0) { isSignal := 1; }
+      var nameTok: int64 := self.cur;
+      if (self.Check(TK_IDENT) == 0) {
+        // Property names can also be token keywords (e.g. OnClick). Accept any token.
+        self._err("expected property name");
+        self.Advance();
+      } else {
+        self.Advance();
+      }
+      self.Expect(TK_COLON);
+      // Parse value: string literal, identifier, or integer
+      var valOff: int64 := self._tokOff(self.cur);
+      var valLen: int64 := self._tokLen(self.cur);
+      self.Advance();  // consume the value token
+      var kind: int64 := NK_LFD_PROPERTY;
+      if (isSignal != 0) { kind := NK_LFD_SIGNAL; }
+      var pn: int64 := self._alloc(kind, nameTok);
+      self._ssv(pn, self._tokOff(nameTok), self._tokLen(nameTok));
+      self._sc1(pn, valOff);
+      self._sc2(pn, valLen);
+      self.Match(TK_SEMI);
+      if (head == -1) { head := pn; tail := pn; }
+      else { self._sn(tail, pn); tail := pn; }
+    }
+    self._sc0(widgetNode, head);
+  }
+
+  fn _parseLfdWidget(): int64 {
+    // widget TypeName varName { properties }
+    var ti: int64 := self.cur;
+    self.Advance();  // consume 'widget'
+    var typeTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    var wn: int64 := self._alloc(NK_LFD_WIDGET, ti);
+    self._ssv(wn, self._tokOff(typeTok), self._tokLen(typeTok));
+    self._sc1(wn, self._tokOff(nameTok));
+    self._sc2(wn, self._tokLen(nameTok));
+    self.Expect(TK_LBRACE);
+    self._parseLfdPropBody(wn);
+    self.Expect(TK_RBRACE);
+    return wn;
+  }
+
+  fn _parseLfdLayout(): int64 {
+    // layout KindName { widget/layout... }
+    var ti: int64 := self.cur;
+    self.Advance();  // consume 'layout'
+    var kindTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    // Determine layout kind integer: 1=Vertical, 2=Horizontal, 3=Grid, 4=Form
+    var kindName: pchar := self.src + self._tokOff(kindTok);
+    var kindLen: int64 := self._tokLen(kindTok);
+    var lkind: int64 := 1;  // default Vertical
+    if (kindLen == 10) {
+      // "Horizontal" → 2
+      if (StrCharAt(kindName, 0) == 72) { lkind := 2; }
+    } else if (kindLen == 4) {
+      // "Grid" → 3, "Form" → 4
+      if (StrCharAt(kindName, 0) == 71) { lkind := 3; }
+      if (StrCharAt(kindName, 0) == 70) { lkind := 4; }
+    }
+    var ln: int64 := self._alloc(NK_LFD_LAYOUT, ti);
+    self._siv(ln, lkind);
+    self.Expect(TK_LBRACE);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var child: int64 := -1;
+      if (self.Check(TK_WIDGET) != 0)      { child := self._parseLfdWidget(); }
+      else if (self.Check(TK_LAYOUT) != 0) { child := self._parseLfdLayout(); }
+      else {
+        self._err("expected 'widget' or 'layout' in layout body");
+        self.Advance();
+      }
+      if (child >= 0) {
+        if (head == -1) { head := child; tail := child; }
+        else { self._sn(tail, child); tail := child; }
+      }
+    }
+    self.Expect(TK_RBRACE);
+    self._sc0(ln, head);
+    return ln;
+  }
+
+  fn _parseLfdForm(): int64 {
+    // form FormName "Title" { widget/layout... }
+    var ti: int64 := self.cur;
+    self.Advance();  // consume 'form'
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    // title is a string literal (or identifier used as title)
+    var titleOff: int64 := self._tokOff(self.cur);
+    var titleLen: int64 := self._tokLen(self.cur);
+    self.Advance();  // consume title token (string or ident)
+    var fn2: int64 := self._alloc(NK_LFD_FORM, ti);
+    self._ssv(fn2, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._sc1(fn2, titleOff);
+    self._sc2(fn2, titleLen);
+    self.Expect(TK_LBRACE);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      var child: int64 := -1;
+      if (self.Check(TK_WIDGET) != 0)      { child := self._parseLfdWidget(); }
+      else if (self.Check(TK_LAYOUT) != 0) { child := self._parseLfdLayout(); }
+      else {
+        self._err("expected 'widget' or 'layout' in form body");
+        self.Advance();
+      }
+      if (child >= 0) {
+        if (head == -1) { head := child; tail := child; }
+        else { self._sn(tail, child); tail := child; }
+      }
+    }
+    self.Expect(TK_RBRACE);
+    self._sc0(fn2, head);
+    return fn2;
+  }
+
+  // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
 
@@ -1760,6 +1904,7 @@ pub type Parser = class {
       else if (k == TK_EXTERN) { decl := self._parseExternDecl(); }
       else if (k == TK_DIM)    { decl := self._parseDimDecl(isPub); }
       else if (k == TK_UTYPE)  { decl := self._parseUtypeDecl(isPub); }
+      else if (k == TK_FORM)   { decl := self._parseLfdForm(); }
       else {
         self._err("unexpected top-level token");
         self.Advance();
