@@ -95,6 +95,8 @@ pub con NK_LFD_WIDGET:   int64 := 96;
 pub con NK_LFD_LAYOUT:   int64 := 97;
 pub con NK_LFD_PROPERTY: int64 := 98;
 pub con NK_LFD_SIGNAL:   int64 := 99;
+pub con NK_ARRAY_LIT:    int64 := 100; // WP-BC-51: [e1, e2, ...] array literal
+pub con NK_TYPE_ARRAY_FIXED: int64 := 101; // WP-BC-51: T[N] fixed-size array type
 pub con NK_REPEAT_UNTIL:   int64 := 77;  // WP-BC-04: repeat { body } until (cond)
 pub con NK_TUPLE_VAR_DECL: int64 := 78;  // WP-BC-05: var a, b := fn()
 pub con NK_MAP_LIT:        int64 := 79;  // WP-BC-06: { key: val, ... }
@@ -375,6 +377,27 @@ pub type Parser = class {
   // Type parsing
   // ==================================================================
 
+  // WP-BC-51: apply T[] or T[N] array suffix to a base type node
+  fn _parseArrayTypeSuffix(n: int64, ti: int64): int64 {
+    if (self.Check(TK_LBRACK) != 0) {
+      self.Advance();
+      if (self.Check(TK_RBRACK) != 0) {
+        self.Advance();
+        var an: int64 := self._alloc(NK_TYPE_ARRAY, ti);
+        self._sc0(an, n);
+        return an;
+      } else {
+        var sizeExpr: int64 := self.ParseExpr();
+        self.Expect(TK_RBRACK);
+        var an: int64 := self._alloc(NK_TYPE_ARRAY_FIXED, ti);
+        self._sc0(an, n);
+        self._sc1(an, sizeExpr);
+        return an;
+      }
+    }
+    return n;
+  }
+
   fn ParseType(): int64 {
     var ti: int64 := self.cur;
     // WP-11: Handle extended type keywords (i8, i16, i32, u8, f32, char, etc.)
@@ -387,7 +410,7 @@ pub type Parser = class {
       var n: int64 := self._alloc(NK_TYPE_NAME, ti);
       self._ssv(n, self._tokOff(ti), self._tokLen(ti));
       self.Advance();
-      return n;
+      return self._parseArrayTypeSuffix(n, ti);
     }
     // NOTE: TK_FN handling removed - it's handled at statement level for function declarations
     if (self.Check(TK_ARRAY) != 0) {
@@ -451,7 +474,7 @@ pub type Parser = class {
         // Store type arguments in child1
         self._sc1(n, targs);
       }
-      return n;
+      return self._parseArrayTypeSuffix(n, ti);
     }
     var n: int64 := self._alloc(NK_TYPE_NAME, ti);
     self._ssv(n, self._tokOff(ti), self._tokLen(ti));
@@ -506,7 +529,24 @@ pub type Parser = class {
   // Expression parsing (precedence climbing)
   // ==================================================================
 
-  fn ParseExpr(): int64 { return self.ParseNullCoal(); }
+  fn ParseExpr(): int64 { return self.ParsePipe(); }
+
+  // WP-BC-51: pipe operator  expr |> fn  →  fn(expr)
+  fn ParsePipe(): int64 {
+    var lhs: int64 := self.ParseNullCoal();
+    while (self.Check(TK_PIPE) != 0) {
+      var ti: int64 := self.cur;
+      self.Advance();
+      var nameTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      var call: int64 := self._alloc(NK_CALL, nameTok);
+      self._ssv(call, self._tokOff(nameTok), self._tokLen(nameTok));
+      self._siv(call, 0);
+      self._sc0(call, lhs);
+      lhs := call;
+    }
+    return lhs;
+  }
 
   // WP-BC-14: null coalescing operator x ?? fallback
   fn ParseNullCoal(): int64 {
@@ -896,6 +936,26 @@ pub type Parser = class {
       }
     }
 
+    // WP-BC-51: [e1, e2, ...] array literal
+    if (k == TK_LBRACK) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_ARRAY_LIT, ti);
+      if (self.Check(TK_RBRACK) != 0) {
+        self.Advance();  // empty array []
+        return n;
+      }
+      var head: int64 := self.ParseExpr();
+      var tail: int64 := head;
+      while (self.Match(TK_COMMA) != 0) {
+        if (self.Check(TK_RBRACK) != 0) { break; }
+        var elem: int64 := self.ParseExpr();
+        self._sn(tail, elem); tail := elem;
+      }
+      self.Expect(TK_RBRACK);
+      self._sc0(n, head);
+      return n;
+    }
+
     self._err("expected expression");
     var dummy: int64 := self._alloc(NK_INVALID, ti);
     if (self.Peek() != 0) { self.Advance(); }  // TK_EOF=0
@@ -941,6 +1001,7 @@ pub type Parser = class {
     var k: int64 := self.Peek();
 
     if (k == TK_VAR)    { return self.ParseVarDecl(0); }
+    if (k == TK_LET)    { return self.ParseLetDecl(0); }
     if (k == TK_CON)    { return self.ParseConDecl(0); }
     if (k == TK_RETURN) {
       self.Advance();
@@ -1336,6 +1397,26 @@ pub type Parser = class {
     self._spub(n, isPub);
     if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
     if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  // let x: T = expr  or  let x: T := expr  (immutable binding, same AST as var)
+  fn ParseLetDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
+    if (self.Check(TK_COMMA) != 0) {
+      return self._parseTupleVarDecl(nameTok, ti);
+    }
+    var n: int64 := self._alloc(NK_VAR_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
     self.Match(TK_SEMI);
     return n;
   }
@@ -1881,6 +1962,7 @@ pub type Parser = class {
 
       if (k == TK_FN)          { decl := self.ParseFuncDecl(isPub); }
       else if (k == TK_VAR)    { decl := self.ParseVarDecl(isPub); }
+      else if (k == TK_LET)    { decl := self.ParseLetDecl(isPub); }
       else if (k == TK_CON)    { decl := self.ParseConDecl(isPub); }
       else if (k == TK_STRUCT) { decl := self.ParseStructDecl(isPub); }
       else if (k == TK_ENUM)   { decl := self.ParseEnumDecl(isPub); }
