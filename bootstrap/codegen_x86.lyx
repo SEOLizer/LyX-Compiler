@@ -145,7 +145,7 @@ con CG_PATCH_VMT_ADDR: int64 := 2;  // absolute 8-byte VMT address in code buffe
 
 // Table entry sizes (bytes)
 con CG_LOCAL_SZ:   int64 := 24;   // name(8) + nameLen(8) + rbpOff(8)
-con CG_LABEL_SZ:   int64 := 24;   // name(8) + nameLen(8) + codeOff(8)
+con CG_LABEL_SZ:   int64 := 32;   // name(8) + nameLen(8) + codeOff(8) + lineNum(8)
 con CG_PATCH_SZ:   int64 := 32;   // codeOff(8) + namePtr(8) + nameLen(8) + kind(8)
 con CGN_TYPE_DECL: int64 := 10;   // NK_TYPE_DECL from parser
 con CGN_FIELD_DECL:int64 := 7;    // NK_FIELD_DECL from parser
@@ -601,10 +601,23 @@ pub type Codegen = class {
   }
 
   // ------------------------------------------------------------------
-  // Label table  (name, nameLen, codeOff) × CG_LABEL_SZ bytes
+  // Label table  (name, nameLen, codeOff, lineNum) × CG_LABEL_SZ bytes
   // ------------------------------------------------------------------
 
-  fn cg_addLabel(name: pchar, nlen: int64) {
+  // WP-BC-49: compute source line of an AST node from its source offset
+  fn cg_lineOf(ni: int64): int64 {
+    var soff: int64 := self.cg_nsoff(ni);
+    if (soff <= 0) { return 1; }
+    var line: int64 := 1;
+    var i: int64 := 0;
+    while (i < soff) {
+      if (StrCharAt(self.pSrc, i) == 10) { line := line + 1; }
+      i := i + 1;
+    }
+    return line;
+  }
+
+  fn cg_addLabel(name: pchar, nlen: int64, lineNum: int64) {
     if (self.labelCount >= self.labelCap) {
       var nc: int64 := self.labelCap * 2;
       var nb: int64 := mmap(0, nc * CG_LABEL_SZ, 3, 34, -1, 0);
@@ -616,6 +629,7 @@ pub type Codegen = class {
     poke64(base,      name as int64);
     poke64(base + 8,  nlen);
     poke64(base + 16, self.codeLen);
+    poke64(base + 24, lineNum);
     self.labelCount := self.labelCount + 1;
   }
 
@@ -2016,7 +2030,7 @@ pub type Codegen = class {
     while (jj < mlen) { poke8(mangBuf + classNameLen + 1 + jj, StrCharAt(mname, jj)); jj := jj + 1; }
     poke8(mangBuf + mangLen, 0);
     // Register label with mangled name
-    self.cg_addLabel(mangBuf as pchar, mangLen);
+    self.cg_addLabel(mangBuf as pchar, mangLen, self.cg_lineOf(ni));
     // Track mangled name buffer for cleanup after patching (BUG-02)
     self.cg_trackTempBuf(mangBuf, mangLen + 1);
     // Reset locals
@@ -4147,7 +4161,7 @@ pub type Codegen = class {
 
     // Generate unique nested function name with parent suffix
     var nestedLabel: int64 := self._allocNestedLabel(fname, fnlen);
-    self.cg_addLabel(nestedLabel, 16);  // 16 = max label length
+    self.cg_addLabel(nestedLabel, 16, self.cg_lineOf(ni));
 
     // Reset locals but preserve outer function's captured variables
     self.localCount := 0;
@@ -4935,7 +4949,7 @@ pub type Codegen = class {
     // Register label for this function
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
-    self.cg_addLabel(fname, fnlen);
+    self.cg_addLabel(fname, fnlen, self.cg_lineOf(ni));
 
     // Save and set outer function context for nested function capture analysis
     var savedOuterName: pchar := self.outerFuncName;
@@ -5352,7 +5366,7 @@ pub type Codegen = class {
       if (k == CGN_FUNC_DECL) {
         var fname: pchar := self.cg_nsval(cur);
         var fnlen: int64 := self.cg_nslen(cur);
-        self.cg_addLabel(fname, fnlen);
+        self.cg_addLabel(fname, fnlen, 0);  // imported: no source line
       }
       cur := self.cg_nnext(cur);
     }
@@ -5498,7 +5512,7 @@ pub type Codegen = class {
       var origName: pchar := peek64(mBase + 16) as pchar;
       var origLen:  int64 := peek64(mBase + 24);
       // Emit label for mangled name, then JMP rel32 to the generic function
-      self.cg_addLabel(mangName, mangLen);
+      self.cg_addLabel(mangName, mangLen, 0);  // generic specialization: no direct line
       self.cg_e8(0xE9);
       self.cg_addPatch(self.codeLen, origName as int64, origLen, CG_PATCH_CALL);
       self.cg_e32(0);
@@ -5648,17 +5662,18 @@ pub type Codegen = class {
     if (self.debugMode != 0) {
       var li: int64 := 0;
       while (li < self.labelCount) {
-        var lbase:  int64 := self.labels + li * CG_LABEL_SZ;
-        var lname:  pchar := peek64(lbase) as pchar;
-        var lnlen:  int64 := peek64(lbase + 8);
-        var lstart: int64 := peek64(lbase + 16);
-        var lend:   int64 := 0;
+        var lbase:    int64 := self.labels + li * CG_LABEL_SZ;
+        var lname:    pchar := peek64(lbase) as pchar;
+        var lnlen:    int64 := peek64(lbase + 8);
+        var lstart:   int64 := peek64(lbase + 16);
+        var llineNum: int64 := peek64(lbase + 24);
+        var lend:     int64 := 0;
         if (li + 1 < self.labelCount) {
           lend := peek64(self.labels + (li + 1) * CG_LABEL_SZ + 16);
         } else {
           lend := totalCode;
         }
-        dg.dw_addFunc(lname, lnlen, lstart, lend);
+        dg.dw_addFunc(lname, lnlen, lstart, lend, llineNum);
         li := li + 1;
       }
       dg.dw_buildAbbrev();
