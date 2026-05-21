@@ -1,0 +1,157 @@
+// bootstrap/lyu_reader.lyx — WP-BC-50b
+// Reads and inspects .lyu pre-compiled unit files (--unit-info flag).
+// Parses header + symbol table from the binary format used by lyu_writer.lyx.
+
+// LYU magic bytes
+con LYU_R_M0: int64 := 76;  // 'L'
+con LYU_R_M1: int64 := 89;  // 'Y'
+con LYU_R_M2: int64 := 85;  // 'U'
+
+pub type LyuReader = class {
+  data:    int64;   // file data buffer (raw bytes, mmap'd by caller)
+  size:    int64;   // buffer size in bytes
+  pos:     int64;   // current read cursor
+
+  // Parsed header
+  pub version:     int64;
+  pub arch:        int64;
+  pub flags:       int64;
+  pub unitName:    pchar;
+  pub unitNameLen: int64;
+  pub symCount:    int64;
+  pub valid:       bool;
+
+  fn _u8(): int64 {
+    if (self.pos >= self.size) { return 0; }
+    var v: int64 := peek8(self.data + self.pos) & 255;
+    self.pos := self.pos + 1;
+    return v;
+  }
+
+  fn _u16le(): int64 {
+    var lo: int64 := self._u8();
+    return lo | (self._u8() << 8);
+  }
+
+  fn _u32le(): int64 {
+    var b0: int64 := self._u8();
+    var b1: int64 := self._u8();
+    var b2: int64 := self._u8();
+    var b3: int64 := self._u8();
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  }
+
+  // Skip a u16-length-prefixed string; returns pointer into data and length
+  fn _skipStr(outLen: int64): pchar {
+    var slen: int64 := self._u16le();
+    poke64(outLen, slen);
+    var p: pchar := (self.data + self.pos) as pchar;
+    self.pos := self.pos + slen;
+    return p;
+  }
+
+  // Parse header. Returns true if valid magic + supported version.
+  pub fn LyrInit(fileData: int64, fileSize: int64): bool {
+    self.data  := fileData;
+    self.size  := fileSize;
+    self.pos   := 0;
+    self.valid := false;
+
+    if (fileSize < 10) { return false; }
+
+    // Magic
+    if (self._u8() != LYU_R_M0) { return false; }
+    if (self._u8() != LYU_R_M1) { return false; }
+    if (self._u8() != LYU_R_M2) { return false; }
+    self._u8();  // NUL
+
+    self.version := self._u16le();
+    self.arch    := self._u8();
+    self.flags   := self._u8();
+
+    // Unit name
+    var ulen: int64 := self._u16le();
+    self.unitName    := (self.data + self.pos) as pchar;
+    self.unitNameLen := ulen;
+    self.pos := self.pos + ulen;
+
+    // v2 metadata: skip description, author, copyright
+    if (self.version >= 2) {
+      var dl: int64 := self._u16le(); self.pos := self.pos + dl;
+      var al: int64 := self._u16le(); self.pos := self.pos + al;
+      var cl: int64 := self._u16le(); self.pos := self.pos + cl;
+    }
+
+    self.symCount := self._u32le();
+    // Skip offset fields (TypeInfoOffset, IRCodeOffset, DebugOffset, Reserved)
+    self._u32le(); self._u32le(); self._u32le(); self._u32le();
+
+    self.valid := true;
+    return true;
+  }
+
+  fn _archStr(a: int64): pchar {
+    if a == 0 { return "x86_64"c; }
+    if a == 1 { return "arm64"c; }
+    if a == 2 { return "x86_64_win"c; }
+    if a == 3 { return "macosx64"c; }
+    if a == 4 { return "riscv64"c; }
+    if a == 5 { return "xtensa"c; }
+    if a == 6 { return "win_arm64"c; }
+    if a == 7 { return "arm_cm"c; }
+    return "unknown"c;
+  }
+
+  fn _lskStr(k: int64): pchar {
+    if k == 0 { return "fn"c; }
+    if k == 1 { return "var"c; }
+    if k == 2 { return "let"c; }
+    if k == 3 { return "con"c; }
+    if k == 4 { return "struct"c; }
+    if k == 5 { return "class"c; }
+    if k == 6 { return "enum"c; }
+    if k == 7 { return "extern fn"c; }
+    if k == 8 { return "dim"c; }
+    if k == 9 { return "utype"c; }
+    return "?"c;
+  }
+
+  // Print unit metadata and symbol list to stdout.
+  // Call site should print the file path before calling this.
+  pub fn PrintInfo() {
+    if (!self.valid) { return; }
+    PrintStr("  Version: "c); PrintInt(self.version); PrintStr("\n"c);
+    PrintStr("  Target:  "c); PrintStrLn(self._archStr(self.arch));
+    PrintStr("  Unit:    "c);
+    PrintStr(StrSub(self.unitName, 0, self.unitNameLen));
+    PrintStr("\n"c);
+    PrintStr("  Symbols: "c); PrintInt(self.symCount); PrintStr("\n"c);
+
+    var i: int64 := 0;
+    while (i < self.symCount && self.pos < self.size) {
+      // name (u16len + bytes)
+      var nameLen: int64 := self._u16le();
+      var namePt:  pchar := (self.data + self.pos) as pchar;
+      self.pos := self.pos + nameLen;
+      // kind (u8)
+      var lsk: int64 := self._u8();
+      // typeHash (u32, skip)
+      self._u32le();
+      // typeInfo (u16len + bytes)
+      var tiLen: int64 := self._u16le();
+      var tiPt:  pchar := (self.data + self.pos) as pchar;
+      self.pos := self.pos + tiLen;
+
+      PrintStr("  ["c); PrintInt(i); PrintStr("] "c);
+      PrintStr(self._lskStr(lsk));
+      PrintStr("\t"c);
+      PrintStr(StrSub(namePt, 0, nameLen));
+      PrintStr("\t"c);
+      PrintStr(StrSub(tiPt, 0, tiLen));
+      PrintStr("\n"c);
+
+      i := i + 1;
+    }
+  }
+
+};

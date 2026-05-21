@@ -1916,6 +1916,7 @@ var
   nestedSd: TAstStructDecl;
   nestedClassIdx: Integer;
   nestedCd: TAstClassDecl;
+  fa: TAstFieldAccess;
 begin
   if expr = nil then
   begin
@@ -2309,6 +2310,32 @@ begin
             Result := atInt64;
             expr.ResolvedType := Result;
             Exit;
+          end;
+        end;
+        // Handle struct_var.array_field[index]: resolve element type from struct field metadata
+        if TAstIndexAccess(expr).Obj is TAstFieldAccess then
+        begin
+          fa := TAstFieldAccess(TAstIndexAccess(expr).Obj);
+          if (fa.OwnerName <> '') and Assigned(FStructTypes) then
+          begin
+            idx := FStructTypes.IndexOf(fa.OwnerName);
+            if idx >= 0 then
+            begin
+              sd := FStructTypes.Data[idx];
+              fName := fa.Field;
+              for fi := 0 to High(sd.Fields) do
+              begin
+                if sd.Fields[fi].Name = fName then
+                begin
+                  if sd.Fields[fi].ElemType <> atUnresolved then
+                    Result := sd.Fields[fi].ElemType
+                  else
+                    Result := atInt64;
+                  expr.ResolvedType := Result;
+                  Exit;
+                end;
+              end;
+            end;
           end;
         end;
         // fallback: unresolved
@@ -3018,7 +3045,10 @@ else if not IsIntegerType(lt) or not IsIntegerType(rt) then
             else
             begin
               // Non-varargs: exact match required
-              if Length(call.Args) <> s.ParamCount then
+              // Skip arg-count check for _METHOD_* dispatch: multiple classes may have
+              // the same method name with different signatures (bootstrap compat).
+              if (Length(call.Args) <> s.ParamCount) and
+                 not ((Length(call.Name) > 8) and (Copy(call.Name, 1, 8) = '_METHOD_')) then
                 FDiag.Error(Format('wrong argument count for %s: expected %d, got %d', [call.Name, s.ParamCount, Length(call.Args)]), call.Span);
               for i := 0 to High(call.Args) do
               begin
@@ -6329,8 +6359,8 @@ begin
         end;
         AddSymbolToCurrent(sym, fn.Params[j].Span);
       end;
-      // set current return type
-      FCurrentReturn := fn.ReturnType;
+      // set current return type — resolve type alias (e.g. type ExitCode = int64)
+      FCurrentReturn := ResolveTypeAlias(fn.ReturnType, fn.ReturnTypeName);
       // check body
       CheckStmt(fn.Body);
       // leave function scope
@@ -6378,8 +6408,8 @@ begin
           sym.DeclType := p.ParamType;
           AddSymbolToCurrent(sym, p.Span);
         end;
-        // set return type
-        FCurrentReturn := m.ReturnType;
+        // set return type — resolve type alias (e.g. type ExitCode = int64)
+        FCurrentReturn := ResolveTypeAlias(m.ReturnType, m.ReturnTypeName);
         // check body
         CheckStmt(m.Body);
         PopScope;
@@ -6445,8 +6475,8 @@ begin
           end;
           AddSymbolToCurrent(sym, p.Span);
         end;
-        // set return type
-        FCurrentReturn := m.ReturnType;
+        // set return type — resolve type alias (e.g. type ExitCode = int64)
+        FCurrentReturn := ResolveTypeAlias(m.ReturnType, m.ReturnTypeName);
         // check body
         CheckStmt(m.Body);
         PopScope;
