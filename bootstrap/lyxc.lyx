@@ -41,6 +41,8 @@ import bootstrap.backend.riscv_linux;
 import bootstrap.backend.arm_cm_backend;
 import bootstrap.backend.xtensa;
 import bootstrap.lfd_codegen;
+import bootstrap.lyu_writer;
+import bootstrap.lyu_reader;
 
 // ============================================================================
 // Compiler Constants
@@ -198,6 +200,11 @@ pub type CompilerConfig = class {
   // WP-BC-49: DWARF debug symbol generation
   debugSymbols: bool;
 
+  // WP-BC-50: .lyu pre-compiled unit format
+  compileUnit:   bool;    // --compile-unit: write .lyu after sema
+  unitInfoFile:  int64;   // --unit-info: 0=unset, 1=sentinel, 2=set (path in unitInfoPath)
+  unitInfoPath:  int64;   // --unit-info <file> path (stored as int64, cast to pchar)
+
   // Compilation state
   exitCode: int64;
   errorCount: int64;
@@ -211,7 +218,7 @@ pub type CompilerConfig = class {
   buildTime: int64;
   
   // Constructor
-  pub fn Init(): void {
+  pub fn CfgInit(): void {
     self.inputFile := 0;
     self.outputFile := 0;
     self.target := 0;
@@ -257,6 +264,9 @@ pub type CompilerConfig = class {
     self.provenance     := false;
     self.runtimeChecks  := false;
     self.debugSymbols   := false;
+    self.compileUnit    := false;
+    self.unitInfoFile   := 0;
+    self.unitInfoPath   := 0;
     self.exitCode := 0;
     self.errorCount := 0;
     self.warningCount := 0;
@@ -346,18 +356,22 @@ pub type CompilerConfig = class {
         } else if self.cHeaderFile == 1 {
           // Argument following --include is the header path
           self.cHeaderFile := arg as int64;
+        } else if self.unitInfoFile == 1 {
+          // WP-BC-50: argument following --unit-info is the .lyu path
+          self.unitInfoFile := 2;
+          self.unitInfoPath := arg as int64;
         } else if self.inputFile == 0 {
           self.inputFile := arg as int64;
         } else if self.outputFile == 0 {
           self.outputFile := arg as int64;
         }
       }
-      
+
       i := i + 1;
     }
-    
+
     // Validate required options
-    if self.inputFile == 0 {
+    if self.inputFile == 0 && self.unitInfoFile <= 1 {
       EPrintStr("Error: No input file specified\n"c);
       self.exitCode := 1;
       return false;
@@ -667,6 +681,16 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-BC-50: --compile-unit / --unit-info
+    if StrCmp(arg, "--compile-unit"c) == 0 {
+      self.compileUnit := true;
+      return;
+    }
+    if StrCmp(arg, "--unit-info"c) == 0 {
+      self.unitInfoFile := 1;  // sentinel: next positional arg is the .lyu path
+      return;
+    }
+
     // --version
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr(COMPILER_NAME);
@@ -809,6 +833,8 @@ pub type CompilerConfig = class {
     PrintStrLn("  --provenance       Dump IR→AST→source provenance chain after IR gen");
     PrintStrLn("  --runtime-checks   Inject inline bounds/null/zero assertions");
     PrintStrLn("  --debug-symbols    Emit DWARF 4 debug sections (.debug_info/.debug_line)");
+    PrintStrLn("  --compile-unit     Compile to .lyu pre-compiled unit (symbol table only)");
+    PrintStrLn("  --unit-info <f>    Print metadata and symbol list from a .lyu file");
     PrintStrLn("  --include <hdr.h>  Parse C header and emit extern fn declarations");
     PrintStrLn("  -I <path>          Add include search path for imports");
     PrintStrLn("  -I<path>           Same as -I <path> (inline form)");
@@ -897,6 +923,30 @@ pub type CompilerConfig = class {
 
     if semaResult != 0 {
       self.exitCode := 1;
+      return self.exitCode;
+    }
+
+    // WP-BC-50: --compile-unit → serialise symbol table to .lyu and exit
+    if self.compileUnit {
+      var lyw: LyuWriter := new LyuWriter();
+      lyw.LywInit();
+      lyw.Serialize(inputFile, sema, LYU_ARCH_X86_64);
+      var lyuPath: pchar;
+      if outputFile != 0 as pchar {
+        lyuPath := outputFile;
+      } else {
+        lyuPath := self._lyuOutputPath(inputFile);
+      }
+      if lyw.WriteFile(lyuPath) {
+        if self.enableVerbose {
+          PrintStr("Wrote .lyu: "c);
+          PrintStrLn(lyuPath);
+        }
+      } else {
+        EPrintStr("error: cannot write .lyu: "c);
+        EPrintStrLn(lyuPath);
+        self.exitCode := 1;
+      }
       return self.exitCode;
     }
 
@@ -2111,6 +2161,19 @@ pub type CompilerConfig = class {
   }
 
   // WP-BC-44: --trace-passes timing helpers
+  // WP-BC-50: derive .lyu output path from source path by stripping .lyx and adding .lyu
+  fn _lyuOutputPath(srcPath: pchar): pchar {
+    var slen: int64 := StrLen(srcPath);
+    // strip .lyx if present (4 chars), then append .lyu
+    var base: pchar;
+    if slen > 4 {
+      base := StrSub(srcPath, 0, slen - 4);
+    } else {
+      base := srcPath;
+    }
+    return StrConcat(base, ".lyu"c);
+  }
+
   fn _passStart(name: pchar): int64 {
     if !self.tracePasses { return 0; }
     PrintStr("[pass] "c);
@@ -2323,12 +2386,40 @@ pub type CompilerConfig = class {
 pub fn main(argc: int64, argv: pchar): int64 {
   // Initialize compiler
   var cfg: CompilerConfig := new CompilerConfig();
-  cfg.Init();
+  cfg.CfgInit();
 
   // Parse CLI
   var cliOk: bool := cfg.parseCLI(argc, argv);
   if not cliOk {
     return cfg.exitCode;
+  }
+
+  // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
+  if cfg.unitInfoFile > 1 {
+    var uiFd: int64 := -1;
+    var uiBuf: int64 := 0;
+    var uiSz: int64 := 0;
+    var uiOk: bool := false;
+    uiFd := open(cfg.unitInfoPath as pchar, 0, 0);
+    if uiFd >= 0 {
+      uiBuf := mmap(0, 131072, 3, 34, -1, 0);
+      uiSz := read(uiFd, uiBuf as pchar, 131071);
+      poke8(uiBuf + uiSz, 0);
+      close(uiFd);
+      uiOk := true;
+    }
+    if not uiOk {
+      EPrintStr("error: cannot open .lyu file\n"c);
+      return 1;
+    }
+    var rdr: LyuReader := new LyuReader();
+    if rdr.LyrInit(uiBuf, uiSz) {
+      rdr.PrintInfo();
+    } else {
+      EPrintStr("error: invalid .lyu file"c);
+      return 1;
+    }
+    return 0;
   }
 
   // Get input file

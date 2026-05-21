@@ -1063,7 +1063,9 @@ begin
     WriteLn;
     WriteLn('--- Unit-Kompilierungs-Modus ---');
     
-    // Determine output file
+    // Determine output file: -o flag takes precedence over derived name
+    if (unitOutputFile = '') and (outputFile <> '') then
+      unitOutputFile := outputFile;
     if unitOutputFile = '' then
     begin
       // Remove .lyx extension if present, add .lyu
