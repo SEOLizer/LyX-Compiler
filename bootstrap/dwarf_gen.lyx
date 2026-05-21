@@ -1,5 +1,5 @@
 // bootstrap/dwarf_gen.lyx
-// Minimal DWARF 4 debug info generator (WP-BC-25)
+// Minimal DWARF 4 debug info generator (WP-BC-25/WP-BC-49)
 // Produces .debug_abbrev, .debug_info, .debug_line, .debug_str sections.
 
 // DWARF 4 tag/attribute/form constants
@@ -27,8 +27,8 @@ con DW_LANG_C:            int64 := 0x0001;
 con DW_CHILDREN_yes:      int64 := 1;
 con DW_CHILDREN_no:       int64 := 0;
 
-// Function table entry size: namePtr(8) + nameLen(8) + codeStart(8) + codeEnd(8) = 32
-con DW_FUNC_SZ: int64 := 32;
+// Function table entry: namePtr(8) + nameLen(8) + codeStart(8) + codeEnd(8) + lineNum(8) = 40
+con DW_FUNC_SZ: int64 := 40;
 
 pub type DwarfGen = class {
 
@@ -189,8 +189,8 @@ pub type DwarfGen = class {
     return off;
   }
 
-  // Register a function for debug emission
-  fn dw_addFunc(name: pchar, nameLen: int64, codeStart: int64, codeEnd: int64) {
+  // Register a function for debug emission (WP-BC-49: lineNum added)
+  fn dw_addFunc(name: pchar, nameLen: int64, codeStart: int64, codeEnd: int64, lineNum: int64) {
     if (self.funcCount >= self.funcCap) {
       var nc: int64 := self.funcCap * 2;
       var nb: int64 := mmap(0, nc * DW_FUNC_SZ, 3, 34, -1, 0);
@@ -203,6 +203,7 @@ pub type DwarfGen = class {
     poke64(base + 8,  nameLen);
     poke64(base + 16, codeStart);
     poke64(base + 24, codeEnd);
+    poke64(base + 32, lineNum);
     self.funcCount := self.funcCount + 1;
   }
 
@@ -239,7 +240,7 @@ pub type DwarfGen = class {
   fn dw_buildInfo(srcFile: pchar, srcFileLen: int64, totalCodeLen: int64) {
     self.infoLen := 0;
 
-    var producer: pchar := "Lyx Bootstrap Compiler (WP-BC-25)";
+    var producer: pchar := "Lyx Bootstrap Compiler (WP-BC-49)";
     var compDir:  pchar := ".";
     var producerOff: int64 := self.dw_addStr(producer, StrLen(producer));
     var nameOff:     int64 := self.dw_addStr(srcFile, srcFileLen);
@@ -288,61 +289,83 @@ pub type DwarfGen = class {
   }
 
   // Build minimal .debug_line section (header + 1-file program + end sequence)
+  // WP-BC-49: emit one DW_LNE_set_address + 8-byte VA into line buf
+  fn dw_emitSetAddress(va: int64) {
+    self.dw_eLine(0);               // extended opcode prefix
+    self.dw_uleb128Line(9);         // length = 1 opcode byte + 8 addr bytes
+    self.dw_eLine(2);               // DW_LNE_set_address
+    self.dw_eLine(va & 255);
+    self.dw_eLine((va >> 8) & 255);
+    self.dw_eLine((va >> 16) & 255);
+    self.dw_eLine((va >> 24) & 255);
+    self.dw_eLine((va >> 32) & 255);
+    self.dw_eLine((va >> 40) & 255);
+    self.dw_eLine((va >> 48) & 255);
+    self.dw_eLine((va >> 56) & 255);
+  }
+
+  // WP-BC-49: improved line table — one entry per registered function
   fn dw_buildLine(srcFile: pchar, srcFileLen: int64) {
     self.lineLen := 0;
 
-    // Line number program header
+    // ── header ────────────────────────────────────────────────────────────
     var lenPatch: int64 := self.lineLen;
-    self.dw_eLine32(0);           // unit_length (patched)
-    self.dw_eLine(4); self.dw_eLine(0); // version = 4
+    self.dw_eLine32(0);             // unit_length  (patched later)
+    self.dw_eLine(4); self.dw_eLine(0);  // version = 4
     var hdrLenPatch: int64 := self.lineLen;
-    self.dw_eLine32(0);           // header_length (patched)
-    self.dw_eLine(1);             // minimum_instruction_length = 1
-    self.dw_eLine(1);             // maximum_ops_per_instruction = 1
-    self.dw_eLine(1);             // default_is_stmt = 1
-    self.dw_eLine(0xFB);          // line_base = -5 (signed byte)
-    self.dw_eLine(14);            // line_range = 14
-    self.dw_eLine(13);            // opcode_base = 13 (standard opcodes 1-12)
+    self.dw_eLine32(0);             // header_length  (patched later)
+    self.dw_eLine(1);               // minimum_instruction_length = 1
+    self.dw_eLine(1);               // maximum_ops_per_instruction = 1
+    self.dw_eLine(1);               // default_is_stmt = 1
+    self.dw_eLine(0xFB);            // line_base = -5 (signed byte)
+    self.dw_eLine(14);              // line_range = 14
+    self.dw_eLine(13);              // opcode_base = 13
     // standard_opcode_lengths[1..12]
     self.dw_eLine(0); self.dw_eLine(1); self.dw_eLine(1); self.dw_eLine(1);
     self.dw_eLine(1); self.dw_eLine(0); self.dw_eLine(0); self.dw_eLine(0);
     self.dw_eLine(1); self.dw_eLine(0); self.dw_eLine(0); self.dw_eLine(1);
-    // include_directories: empty (just a 0 terminator)
-    self.dw_eLine(0);
-    // file_names: one entry
+    self.dw_eLine(0);               // include_directories: empty
+    // file_names: one entry (the source file)
     var i: int64 := 0;
     while (i < srcFileLen) { self.dw_eLine(StrCharAt(srcFile, i)); i := i + 1; }
-    self.dw_eLine(0);             // name null terminator
-    self.dw_uleb128Line(0);       // dir index = 0
-    self.dw_uleb128Line(0);       // last modified = 0
-    self.dw_uleb128Line(0);       // file size = 0
-    self.dw_eLine(0);             // end of file_names
-
-    // Patch header_length = bytes after header_length field to here
+    self.dw_eLine(0);               // name NUL
+    self.dw_uleb128Line(0);         // dir index = 0
+    self.dw_uleb128Line(0);         // mtime = 0
+    self.dw_uleb128Line(0);         // size = 0
+    self.dw_eLine(0);               // end of file_names
     self.dw_patchLine32(hdrLenPatch, self.lineLen - hdrLenPatch - 4);
 
-    // DW_LNE_set_address (extended opcode 0x02)
-    self.dw_eLine(0);                            // extended opcode prefix
-    self.dw_uleb128Line(9);                      // length = 1 (opcode) + 8 (addr)
-    self.dw_eLine(2);                            // DW_LNE_set_address
-    var startVA: int64 := self.elfBase + self.codeOff;
-    // Emit 8-byte address
-    self.dw_eLine(startVA & 255);
-    self.dw_eLine((startVA >> 8) & 255);
-    self.dw_eLine((startVA >> 16) & 255);
-    self.dw_eLine((startVA >> 24) & 255);
-    self.dw_eLine((startVA >> 32) & 255);
-    self.dw_eLine((startVA >> 40) & 255);
-    self.dw_eLine((startVA >> 48) & 255);
-    self.dw_eLine((startVA >> 56) & 255);
+    // ── line number program ───────────────────────────────────────────────
+    // State machine start: file=1, line=1, address=0
+    var prevLine: int64 := 1;
+    var fi:       int64 := 0;
+    while (fi < self.funcCount) {
+      var base:     int64 := self.funcTable + fi * DW_FUNC_SZ;
+      var fStart:   int64 := peek64(base + 16);
+      var fLineNum: int64 := peek64(base + 32);
+      if (fLineNum <= 0) { fLineNum := 1; }
 
-    // DW_LNS_copy (opcode 1)
-    self.dw_eLine(1);
+      var va: int64 := self.elfBase + self.codeOff + fStart;
 
-    // DW_LNE_end_sequence
-    self.dw_eLine(0);
-    self.dw_uleb128Line(1);
-    self.dw_eLine(1);  // DW_LNE_end_sequence
+      // DW_LNE_set_address to the function's entry VA
+      self.dw_emitSetAddress(va);
+
+      // DW_LNS_set_file (opcode 4): file index = 1
+      self.dw_eLine(4); self.dw_uleb128Line(1);
+
+      // DW_LNS_advance_line (opcode 3): delta from prevLine to fLineNum
+      var lineDelta: int64 := fLineNum - prevLine;
+      self.dw_eLine(3); self.dw_sleb128Line(lineDelta);
+      prevLine := fLineNum;
+
+      // DW_LNS_copy (opcode 1): emit a row
+      self.dw_eLine(1);
+
+      fi := fi + 1;
+    }
+
+    // End-of-sequence
+    self.dw_eLine(0); self.dw_uleb128Line(1); self.dw_eLine(1);
 
     // Patch unit_length
     self.dw_patchLine32(lenPatch, self.lineLen - 4);
