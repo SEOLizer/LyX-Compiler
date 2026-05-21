@@ -1,0 +1,218 @@
+// bootstrap/lyu_writer.lyx — WP-BC-50a
+// Serialises sema symbol table to .lyu pre-compiled unit format (version 2).
+// Format matches S0 unit_format.pas / TLyuxSerializer::Serialize.
+
+import src.sema;
+
+// Magic 'LYU\0'
+con LYU_W_M0: int64 := 76;
+con LYU_W_M1: int64 := 89;
+con LYU_W_M2: int64 := 85;
+con LYU_W_M3: int64 := 0;
+con LYU_W_VER: int64 := 2;
+
+// TLyuxArch codes (must match S0 unit_format.pas)
+pub con LYU_ARCH_X86_64:     int64 := 0;
+pub con LYU_ARCH_ARM64:      int64 := 1;
+pub con LYU_ARCH_X86_64_WIN: int64 := 2;
+pub con LYU_ARCH_MACOSX64:   int64 := 3;
+pub con LYU_ARCH_RISCV64:    int64 := 4;
+pub con LYU_ARCH_XTENSA:     int64 := 5;
+pub con LYU_ARCH_WIN_ARM64:  int64 := 6;
+pub con LYU_ARCH_ARM_CM:     int64 := 7;
+
+// TLyuxSymbolKind codes
+con LSK_FN:        int64 := 0;
+con LSK_VAR:       int64 := 1;
+con LSK_CON:       int64 := 3;
+con LSK_STRUCT:    int64 := 4;
+con LSK_ENUM:      int64 := 6;
+con LSK_UTYPE:     int64 := 9;
+
+pub type LyuWriter = class {
+  buf: int64;
+  len: int64;
+  cap: int64;
+
+  pub fn LywInit() {
+    self.cap := 4096;
+    self.buf := mmap(0, self.cap, 3, 34, -1, 0);
+    self.len := 0;
+  }
+
+  fn _grow() {
+    var nc: int64 := self.cap * 2;
+    var nb: int64 := mmap(0, nc, 3, 34, -1, 0);
+    var i: int64 := 0;
+    while (i < self.len) { poke8(nb + i, peek8(self.buf + i)); i := i + 1; }
+    self.buf := nb;
+    self.cap := nc;
+  }
+
+  fn _e8(v: int64) {
+    if (self.len >= self.cap) { self._grow(); }
+    poke8(self.buf + self.len, v & 255);
+    self.len := self.len + 1;
+  }
+
+  fn _e16le(v: int64) {
+    self._e8(v); self._e8(v >> 8);
+  }
+
+  fn _e32le(v: int64) {
+    self._e8(v); self._e8(v >> 8); self._e8(v >> 16); self._e8(v >> 24);
+  }
+
+  // u16-length-prefixed UTF-8 string (matches WriteString in S0)
+  fn _eStr(s: pchar, slen: int64) {
+    self._e16le(slen);
+    var i: int64 := 0;
+    while (i < slen) { self._e8(StrCharAt(s, i)); i := i + 1; }
+  }
+
+  // djb2 hash → u32 (typeHash field)
+  fn _typeHash(s: pchar, slen: int64): int64 {
+    var h: int64 := 5381;
+    var i: int64 := 0;
+    while (i < slen) {
+      h := ((h << 5) + h) + (StrCharAt(s, i) & 255);
+      i := i + 1;
+    }
+    return h & 0xFFFFFFFF;
+  }
+
+  // Map sema TY_xxx → type info string stored in the symbol
+  fn _tyInfoStr(typeId: int64): pchar {
+    if typeId == 1  { return "void"c; }
+    if typeId == 2  { return "bool"c; }
+    if typeId == 3  { return "int64"c; }
+    if typeId == 4  { return "pchar"c; }
+    if typeId == 5  { return "float64"c; }
+    if typeId == 6  { return "int32"c; }
+    if typeId == 7  { return "array"c; }
+    if typeId == 9  { return "int8"c; }
+    if typeId == 10 { return "int16"c; }
+    if typeId == 11 { return "uint8"c; }
+    if typeId == 12 { return "uint16"c; }
+    if typeId == 13 { return "uint32"c; }
+    if typeId == 14 { return "uint64"c; }
+    if typeId == 15 { return "float32"c; }
+    if typeId == 16 { return "char"c; }
+    if typeId == 19 { return "fn_ptr"c; }
+    if typeId == 20 { return "closure"c; }
+    return "user"c;
+  }
+
+  // Map sema SYM_xxx → LYU LSK_xxx
+  fn _symToLsk(semaKind: int64): int64 {
+    if semaKind == SYM_FUNC   { return LSK_FN; }
+    if semaKind == SYM_VAR    { return LSK_VAR; }
+    if semaKind == SYM_CON    { return LSK_CON; }
+    if semaKind == SYM_STRUCT { return LSK_STRUCT; }
+    if semaKind == SYM_ENUM   { return LSK_ENUM; }
+    if semaKind == SYM_TYPE   { return LSK_UTYPE; }
+    return LSK_VAR;
+  }
+
+  // Derive unit name: strip directory and .lyx extension from path.
+  // Uses StrSub builtin — no manual mmap needed.
+  fn _unitNameFromPath(srcPath: pchar): pchar {
+    var slen: int64 := StrLen(srcPath);
+    var lastSlash: int64 := -1;
+    var i: int64 := 0;
+    while (i < slen) {
+      if (StrCharAt(srcPath, i) == 47) { lastSlash := i; }
+      i := i + 1;
+    }
+    var lastDot: int64 := slen;
+    i := slen - 1;
+    while (i > lastSlash) {
+      if (StrCharAt(srcPath, i) == 46) { lastDot := i; break; }
+      i := i - 1;
+    }
+    var nameStart: int64 := lastSlash + 1;
+    var nameLen:   int64 := lastDot - nameStart;
+    if (nameLen <= 0) { return srcPath; }
+    return StrSub(srcPath, nameStart, nameLen);
+  }
+
+  // Serialize sema symbol table into the internal buffer.
+  // arch: one of LYU_ARCH_* constants.
+  pub fn Serialize(inputPath: pchar, sema: Sema, arch: int64) {
+    // Count exportable symbols (skip BUILTIN=0, PARAM=4, FIELD=7)
+    var symCount:  int64 := 0;
+    var funcCount: int64 := 0;
+    var total:     int64 := sema.SymCount();
+    var si: int64 := 0;
+    while (si < total) {
+      var kind: int64 := sema.SymKind(si);
+      if (kind != SYM_BUILTIN && kind != SYM_PARAM && kind != SYM_FIELD) {
+        symCount := symCount + 1;
+        if (kind == SYM_FUNC) { funcCount := funcCount + 1; }
+      }
+      si := si + 1;
+    }
+
+    // Unit name from source path
+    var unPtr:  pchar := self._unitNameFromPath(inputPath);
+    var unLenV: int64 := StrLen(unPtr);
+
+    // ── Header ──
+    self._e8(LYU_W_M0); self._e8(LYU_W_M1);
+    self._e8(LYU_W_M2); self._e8(LYU_W_M3);
+    self._e16le(LYU_W_VER);
+    self._e8(arch);
+    self._e8(0);  // flags (bit0 = includeDebug, always 0 for now)
+
+    // Unit name
+    self._eStr(unPtr, unLenV);
+
+    // v2 metadata (empty)
+    self._eStr(""c, 0);
+    self._eStr(""c, 0);
+    self._eStr(""c, 0);
+
+    // Symbol count + offset placeholders
+    self._e32le(symCount);
+    self._e32le(0);  // TypeInfoOffset
+    self._e32le(0);  // IRCodeOffset
+    self._e32le(0);  // DebugOffset
+    self._e32le(0);  // Reserved
+
+    // ── Symbol table ──
+    si := 0;
+    while (si < total) {
+      var kind: int64 := sema.SymKind(si);
+      if (kind != SYM_BUILTIN && kind != SYM_PARAM && kind != SYM_FIELD) {
+        var symName:    pchar := sema.SymName(si);
+        var symNameLen: int64 := sema.SymNameLen(si);
+        var typeId:     int64 := sema.SymTypeId(si);
+        var tiPtr:      pchar := self._tyInfoStr(typeId);
+        var tiLen:      int64 := StrLen(tiPtr);
+        var lsk:        int64 := self._symToLsk(kind);
+        var thash:      int64 := self._typeHash(tiPtr, tiLen);
+        self._eStr(symName, symNameLen);
+        self._e8(lsk);
+        self._e32le(thash);
+        self._eStr(tiPtr, tiLen);
+      }
+      si := si + 1;
+    }
+
+    // ── Placeholder sections (matches S0 Serialize) ──
+    self._e32le(0);          // strings count = 0
+    self._e32le(funcCount);  // function count
+    self._e32le(0);          // globals count = 0
+  }
+
+  // Write buffer to file. Returns true on success.
+  pub fn WriteFile(path: pchar): bool {
+    // O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512) = 577, mode 0644 = 420
+    var fd: int64 := open(path, 577, 420);
+    if (fd < 0) { return false; }
+    var written: int64 := write(fd, self.buf as pchar, self.len);
+    close(fd);
+    return written == self.len;
+  }
+
+};
