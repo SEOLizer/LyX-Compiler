@@ -8,7 +8,7 @@ Spezifikation: `SPEC.md` (Architektur, Roadmap) · `ebnf.md` (Grammatik, Typen, 
 ## Build-Befehle
 
 ```bash
-# Compiler aus Seed-Binary bauen (bootstrap/lyxc_bootstrap → bootstrap/lyxc.lyx → lyxc)
+# Compiler aus Seed-Binary bauen (src/lyxc_bootstrap → src/lyxc.lyx → lyxc)
 make build
 
 # Selbstkompilierung (lyxc kompiliert sich selbst)
@@ -21,7 +21,7 @@ make singularity
 Direkt mit dem Seed-Binary:
 
 ```bash
-bootstrap/lyxc_bootstrap bootstrap/lyxc.lyx -o lyxc
+src/lyxc_bootstrap src/lyxc.lyx -o lyxc
 ```
 
 ## Tests
@@ -37,10 +37,10 @@ echo $?
 
 ## Compiler-Quellstruktur
 
-Der gesamte Compiler ist in `bootstrap/` als Lyx-Quellcode vorhanden:
+Der gesamte Compiler ist in `src/` als Lyx-Quellcode vorhanden:
 
 ```
-bootstrap/
+src/
   lyxc.lyx              # Hauptprogramm (Entry Point, Pipeline)
   lexer.lyx             # Tokenizer
   parser.lyx            # Recursive-Descent Parser
@@ -150,14 +150,14 @@ Vollständige Spezifikation: `SPEC.md` und `ebnf.md`.
 3. **ELF64 ohne libc**: `_start` ruft `main()`, dann `sys_exit`
 4. **SysV ABI**: Parameter in RDI, RSI, RDX, RCX, R8, R9 · Return in RAX
 5. **VMT**: Jede Klasse mit virtual/override erzeugt eine VMT im `.data`-Segment
-6. **Bootstrap-Kompatibilität**: Kein Lyx-Syntax verwenden, den der Bootstrap-Parser nicht unterstützt
+6. **Compiler-Kompatibilität (self-hosting)**: Kein Lyx-Syntax verwenden, den der Bootstrap-Parser nicht unterstützt
    - `if (expr) != 0` ist OK (ParseExpr/ParsePrimary behandelt das korrekt)
    - `match` darf nicht als Variablenname verwendet werden (ist ein Keyword)
 
 ## Git-Konventionen
 
 ```
-feat(bootstrap): neue Compiler-Feature beschreiben
+feat(src): neue Compiler-Feature beschreiben
 fix(codegen): Off-by-one bei Stack-Alignment korrigieren
 refactor(ir): ConstNode von LiteralNode trennen
 test(parser): While-Statement-Tests ergänzen
@@ -165,14 +165,14 @@ docs: ebnf.md um neue Regeln erweitert
 ```
 
 - `lyxc` Binary ist in `.gitignore` — wird lokal gebaut
-- `bootstrap/lyxc_bootstrap` ist das Seed-Binary — ist in git versioniert
+- `src/lyxc_bootstrap` ist das Seed-Binary — ist in git versioniert
 - Nach Singularitätsverifikation (`make singularity`) kann das Seed-Binary aktualisiert werden
 
 ## Checkliste vor Code-Änderungen
 
 1. `ebnf.md` und `SPEC.md` lesen — Grammatik und Architektur verstehen
-2. Bootstrap-Kompatibilität beachten (keine Match-Variable, kein `(expr) op` als if-Bedingung ohne innere Parens)
-3. Änderungen an `bootstrap/` immer mit `make singularity` verifizieren
+2. Compiler-Kompatibilität (self-hosting) beachten (keine Match-Variable, kein `(expr) op` als if-Bedingung ohne innere Parens)
+3. Änderungen an `src/` immer mit `make singularity` verifizieren
 
 ## Checkliste nach Code-Änderungen
 

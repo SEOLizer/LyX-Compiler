@@ -1,11 +1,11 @@
 # Root Makefile — Lyx Bootstrap Compiler
 #
 # Der Lyx-Compiler ist vollständig selbstkompilierend (100% self-hosted).
-# Quelle:  bootstrap/lyxc.lyx
-# Seed:    bootstrap/lyxc_bootstrap  (singularitätsverifiziertes Binary)
+# Quelle:  src/lyxc.lyx
+# Seed:    src/lyxc_bootstrap  (singularitätsverifiziertes Binary)
 
-SEED := bootstrap/lyxc_bootstrap
-SRC  := bootstrap/lyxc.lyx
+SEED := src/lyxc_bootstrap
+SRC  := src/lyxc.lyx
 
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)

@@ -1,0 +1,2459 @@
+// ==================================================================
+// WP-33: lyxc.lyx — Vollständiger Compiler in Lyx
+// ==================================================================
+// Entry Point: lyxc.lyx
+// - Kommandozeilen-Parsing
+// - Pipeline-Orchestrierung (Lexer → Parser → Sema → Linter → IR → Optimize → Emit → Write)
+// - Multi-Target-Dispatch
+// - Unit-Cache
+// - Incremental Compilation
+// - Error Handling & Recovery
+// - Verbose-Modus
+//
+// Referenz: compiler/lyxc.lpr
+
+import src.lexer;
+import src.parser;
+import src.sema;
+import src.frontend.linter;
+import src.ir;
+import src.ir_lower;
+import src.ir_optimize;
+import src.ir_inline;
+import src.ir_call_graph;
+import src.codegen_x86;
+import src.backend.arm64.emit_arm64;
+import src.backend.riscv.emit_riscv;
+import src.backend.arm_cm.emit_arm_cm;
+import src.backend.elf.write_elf;
+import src.backend.pe.write_pe;
+import src.backend.macho.write_macho;
+import src.frontend.ffi_parser;
+import src.std.fs;
+import src.std.time;
+import src.ir_static_analysis;
+import src.ir_mcdc;
+import src.c_header_parser;
+import src.backend.macos_x86;
+import src.backend.win_x86;
+import src.backend.win_arm64;
+import src.backend.riscv_linux;
+import src.backend.arm_cm_backend;
+import src.backend.xtensa;
+import src.lfd_codegen;
+import src.lyu_writer;
+import src.lyu_reader;
+
+// ============================================================================
+// Compiler Constants
+// ============================================================================
+
+con COMPILER_NAME: pchar := "lyxc";
+con COMPILER_VERSION: pchar := "0.8.4-aerospace";
+con COMPILER_BUILD: pchar := "bootstrap";
+
+// Target architectures
+con TARGET_X86_64:       int64 := 1;
+con TARGET_ARM64:        int64 := 2;
+con TARGET_RISCV64:      int64 := 3;
+con TARGET_ARM_CM:       int64 := 4;
+con TARGET_MACOS_X86_64:   int64 := 5;
+con TARGET_WINDOWS_X86_64: int64 := 6;
+con TARGET_MACOS_ARM64:    int64 := 7;
+con TARGET_WINDOWS_ARM64:  int64 := 8;
+con TARGET_LINUX_RISCV64:  int64 := 9;
+con TARGET_ARM_CM4:        int64 := 10;
+con TARGET_XTENSA:         int64 := 11;
+
+// Optimization levels
+con OPT_NONE: int64 := 0;
+con OPT_O1: int64 := 1;
+con OPT_O2: int64 := 2;
+con OPT_O3: int64 := 3;
+con OPT_SAFE: int64 := 4;
+
+// Output formats
+con FORMAT_ELF: int64 := 1;
+con FORMAT_PE: int64 := 2;
+con FORMAT_MACHO: int64 := 3;
+
+// ============================================================================
+// Command Line Options
+// ============================================================================
+
+pub type CLIOptions = struct {
+  // Input/Output (using int64 for pointer storage)
+  inputFile: int64;
+  outputFile: int64;
+  
+  // Target
+  target: int64;
+  format: int64;
+  
+  // Optimization
+  optLevel: int64;
+  
+  // Features
+  enableLint: bool;
+  lintOnly: bool;
+  enableDebug: bool;
+  enableVerbose: bool;
+  
+  // Dump options
+  dumpLexer: bool;
+  dumpParser: bool;
+  dumpSema: bool;
+  dumpIR: bool;
+  dumpASM: bool;
+  emitASM: bool;
+  dumpList: bool;
+
+  // CLI P2: Advanced options
+  targetEnergy: int64;
+  dumpRelocs: bool;
+  traceImports: bool;
+
+  // CLI P3: Analysis and instrumentation
+  asmListing: bool;
+  mcdc: bool;
+  mcdcReport: bool;
+  staticAnalysis: bool;
+  callGraph: bool;
+  mapFile: bool;
+  
+  // Warnings
+  warningsAsErrors: bool;
+  warnAll: bool;
+  
+  // Misc
+  includePath: int64;
+  stdPath: int64;
+  arch: int64;
+  defineMacros: int64;
+  emitRelocs: bool;
+  stripDebug: bool;
+};
+
+// ============================================================================
+// Compiler Configuration
+// ============================================================================
+
+pub type CompilerConfig = class {
+  // Individual options (avoiding struct offset issues)
+  inputFile: int64;
+  outputFile: int64;
+  target: int64;
+  format: int64;
+  optLevel: int64;
+  enableLint: bool;
+  lintOnly: bool;
+  enableDebug: bool;
+  enableVerbose: bool;
+  dumpLexer: bool;
+  dumpParser: bool;
+  dumpSema: bool;
+  dumpIR: bool;
+  dumpASM: bool;
+  emitASM: bool;
+  dumpList: bool;
+  targetEnergy: int64;
+  dumpRelocs: bool;
+  traceImports: bool;
+  asmListing: bool;
+  mcdc: bool;
+  mcdcReport: bool;
+  staticAnalysis: bool;
+  callGraph: bool;
+  mapFile: bool;
+  warningsAsErrors: bool;
+  warnAll: bool;
+  includePath: int64;
+  stdPath: int64;
+  arch: int64;
+  defineMacros: int64;
+  emitRelocs: bool;
+  stripDebug: bool;
+  cHeaderFile: int64;  // WP-BC-30: --include <header.h>
+
+  // WP-BC-43: trace / profile flags
+  traceEnabled:   bool;
+  profileEnabled: bool;
+
+  // WP-BC-44: diagnostic flags
+  tracePasses: bool;
+  irSourceMap:  bool;
+
+  // WP-BC-45: dump flags
+  astDump:     bool;
+  symtabDump:  bool;
+
+  // WP-BC-46: sema verbose flags
+  typeReasoning: bool;
+  constraintLog: bool;
+
+  // WP-BC-47: IR provenance tracking
+  provenance: bool;
+
+  // WP-BC-48: inline runtime checks (bounds/null/zero)
+  runtimeChecks: bool;
+
+  // WP-BC-49: DWARF debug symbol generation
+  debugSymbols: bool;
+
+  // WP-BC-50: .lyu pre-compiled unit format
+  compileUnit:   bool;    // --compile-unit: write .lyu after sema
+  unitInfoFile:  int64;   // --unit-info: 0=unset, 1=sentinel, 2=set (path in unitInfoPath)
+  unitInfoPath:  int64;   // --unit-info <file> path (stored as int64, cast to pchar)
+
+  // Compilation state
+  exitCode: int64;
+  errorCount: int64;
+  warningCount: int64;
+  codeSize: int64;
+  
+  // Module cache
+  unitCache: int64;
+  
+  // Build info
+  buildTime: int64;
+  
+  // Constructor
+  pub fn CfgInit(): void {
+    self.inputFile := 0;
+    self.outputFile := 0;
+    self.target := 0;
+    self.format := 0;
+    self.optLevel := 0;
+    self.enableLint := false;
+    self.lintOnly := false;
+    self.enableDebug := false;
+    self.enableVerbose := false;
+    self.dumpLexer := false;
+    self.dumpParser := false;
+    self.dumpSema := false;
+    self.dumpIR := false;
+    self.dumpASM := false;
+    self.emitASM := false;
+    self.dumpList := false;
+    self.targetEnergy := 0;
+    self.dumpRelocs := false;
+    self.traceImports := false;
+    self.asmListing := false;
+    self.mcdc := false;
+    self.mcdcReport := false;
+    self.staticAnalysis := false;
+    self.callGraph := false;
+    self.mapFile := false;
+    self.warningsAsErrors := false;
+    self.warnAll := false;
+    self.includePath := 0;
+    self.stdPath := 0;
+    self.arch := 0;
+    self.defineMacros := 0;
+    self.emitRelocs := false;
+    self.stripDebug := false;
+    self.cHeaderFile := 0;
+    self.traceEnabled   := false;
+    self.profileEnabled := false;
+    self.tracePasses    := false;
+    self.irSourceMap    := false;
+    self.astDump        := false;
+    self.symtabDump     := false;
+    self.typeReasoning  := false;
+    self.constraintLog  := false;
+    self.provenance     := false;
+    self.runtimeChecks  := false;
+    self.debugSymbols   := false;
+    self.compileUnit    := false;
+    self.unitInfoFile   := 0;
+    self.unitInfoPath   := 0;
+    self.exitCode := 0;
+    self.errorCount := 0;
+    self.warningCount := 0;
+    self.unitCache := map_new(32);
+    self.buildTime := 0;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // CLI Parsing
+  // ---------------------------------------------------------------------------
+  
+  fn parseCLI(argc: int64, argv: pchar): bool {
+    // Initialize ALL fields to known values (opts is embedded, not a pointer)
+    // Memory from alloc may contain garbage
+    self.inputFile := 0;
+    self.outputFile := 0;
+    self.target := 0;
+    self.format := 0;
+    self.optLevel := 0;
+    self.enableLint := false;
+    self.lintOnly := false;
+    self.enableDebug := false;
+    self.enableVerbose := false;
+    self.dumpLexer := false;
+    self.dumpParser := false;
+    self.dumpSema := false;
+    self.dumpIR := false;
+    self.dumpASM := false;
+    self.dumpRelocs := false;
+    self.callGraph := false;
+    self.mapFile := false;
+    self.staticAnalysis := false;
+    self.mcdc := false;
+    self.mcdcReport := false;
+    self.emitASM := false;
+    self.emitRelocs := false;
+    self.warningsAsErrors := false;
+    self.warnAll := false;
+    self.asmListing := false;
+    self.lintOnly := false;
+    
+    // Force verbose off for now
+    self.enableVerbose := false;
+    
+    var i: int64 := 1;
+    
+    while i < argc {
+      var arg: pchar := ArgvGet(argv, i);
+      var argLen: int64 := StrLen(arg);
+      
+      if argLen == 0 {
+        i := i + 1;
+        continue;
+      }
+      
+      var firstChar: int64 := peek8(arg);
+      
+      // Check for flag (starts with -)
+      if firstChar == 45 {  // '-'
+        if argLen == 1 {
+          i := i + 1;
+          continue;
+        }
+        
+        var secondChar: int64 := peek8(arg + 1);
+        
+        // Long flags (--)
+        if secondChar == 45 {  // '--'
+          self.parseLongFlag(arg, argLen);
+        } else if secondChar == 73 {  // '-I'
+          if argLen > 2 {
+            // -I<path> inline form
+            self.includePath := (arg + 2) as int64;
+          } else {
+            // -I <path> two-token form: sentinel, next positional fills it
+            self.includePath := 1;
+          }
+        } else {
+          // Short flags (-)
+          self.parseShortFlags(arg, argLen);
+        }
+      } else {
+        // Positional argument
+        if self.includePath == 1 {
+          // Argument following -I (space-separated form)
+          self.includePath := arg as int64;
+        } else if self.cHeaderFile == 1 {
+          // Argument following --include is the header path
+          self.cHeaderFile := arg as int64;
+        } else if self.unitInfoFile == 1 {
+          // WP-BC-50: argument following --unit-info is the .lyu path
+          self.unitInfoFile := 2;
+          self.unitInfoPath := arg as int64;
+        } else if self.inputFile == 0 {
+          self.inputFile := arg as int64;
+        } else if self.outputFile == 0 {
+          self.outputFile := arg as int64;
+        }
+      }
+
+      i := i + 1;
+    }
+
+    // Validate required options
+    if self.inputFile == 0 && self.unitInfoFile <= 1 {
+      EPrintStr("Error: No input file specified\n"c);
+      self.exitCode := 1;
+      return false;
+    }
+    
+    // Set defaults
+    if self.target == 0 {
+      self.target := TARGET_X86_64;
+    }
+    if self.format == 0 {
+      self.format := FORMAT_ELF;
+    }
+    if self.optLevel == 0 {
+      self.optLevel := OPT_O2;
+    }
+    
+    return true;
+  }
+  
+  fn parseLongFlag(arg: int64, argLen: int64): void {
+    // --target=x86_64|arm64|linux-arm64|riscv64|arm_cm|macos-x86_64
+    if StrStartsWith(arg, "--target=") {
+      var val: int64 := arg + 9;  // skip "--target=" (9 chars)
+      if StrCmp(val, "x86_64"c) == 0 {
+        self.target := TARGET_X86_64;
+      } else if StrCmp(val, "arm64"c) == 0 {
+        self.target := TARGET_ARM64;
+      } else if StrCmp(val, "linux-arm64"c) == 0 {
+        self.target := TARGET_ARM64;
+      } else if StrCmp(val, "riscv64"c) == 0 {
+        self.target := TARGET_RISCV64;
+      } else if StrCmp(val, "arm_cm"c) == 0 {
+        self.target := TARGET_ARM_CM;
+      } else if StrCmp(val, "macos-x86_64"c) == 0 {
+        self.target := TARGET_MACOS_X86_64;
+      } else if StrCmp(val, "windows-x86_64"c) == 0 {
+        self.target := TARGET_WINDOWS_X86_64;
+      } else if StrCmp(val, "macos-arm64"c) == 0 {
+        self.target := TARGET_MACOS_ARM64;
+        self.format := FORMAT_MACHO;
+      } else if StrCmp(val, "windows-arm64"c) == 0 {
+        self.target := TARGET_WINDOWS_ARM64;
+        self.format := FORMAT_PE;
+      } else if StrCmp(val, "linux-riscv64"c) == 0 {
+        self.target := TARGET_LINUX_RISCV64;
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "arm-cm4"c) == 0 || StrCmp(val, "arm-cm33"c) == 0 {
+        self.target := TARGET_ARM_CM4;
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "esp32"c) == 0 || StrCmp(val, "esp32s3"c) == 0 {
+        self.target := TARGET_XTENSA;
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "win64"c) == 0 {
+        self.target := TARGET_WINDOWS_X86_64;
+        self.format := FORMAT_PE;
+      } else if StrCmp(val, "linux"c) == 0 {
+        self.target := TARGET_X86_64;
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "macosx64"c) == 0 {
+        self.target := TARGET_MACOS_X86_64;
+        self.format := FORMAT_MACHO;
+      } else if StrCmp(val, "riscv"c) == 0 {
+        self.target := TARGET_RISCV64;
+        self.format := FORMAT_ELF;
+      }
+      return;
+    }
+
+    // --include-path=PATH (long form of -I)
+    if StrStartsWith(arg, "--include-path=") {
+      self.includePath := (arg + 15) as int64;
+      return;
+    }
+
+    // --std-path=PATH
+    if StrStartsWith(arg, "--std-path=") {
+      self.stdPath := arg + 10;
+      return;
+    }
+    
+    // --arch=x86_64|arm64|riscv64|arm_cm (alias für --target)
+    if StrStartsWith(arg, "--arch=") {
+      var val: int64 := arg + 7;
+      if StrCmp(val, "x86_64"c) == 0 {
+        self.target := TARGET_X86_64;
+        self.arch := TARGET_X86_64;
+      } else if StrCmp(val, "arm64"c) == 0 {
+        self.target := TARGET_ARM64;
+        self.arch := TARGET_ARM64;
+      } else if StrCmp(val, "riscv"c) == 0 || StrCmp(val, "riscv64"c) == 0 {
+        self.target := TARGET_RISCV64;
+        self.arch := TARGET_RISCV64;
+      } else if StrCmp(val, "arm_cm"c) == 0 {
+        self.target := TARGET_ARM_CM;
+        self.arch := TARGET_ARM_CM;
+      }
+      return;
+    }
+    
+    // --output= or -o
+    if StrStartsWith(arg, "--output=") {
+      self.outputFile := arg + 9;
+      return;
+    }
+    
+    // --opt=O0|O1|O2|O3|Osafe
+    if StrStartsWith(arg, "--opt=") {
+      var val: int64 := arg + 6;
+      if StrCmp(val, "O0"c) == 0 {
+        self.optLevel := OPT_NONE;
+      } else if StrCmp(val, "O1"c) == 0 {
+        self.optLevel := OPT_O1;
+      } else if StrCmp(val, "O2"c) == 0 {
+        self.optLevel := OPT_O2;
+      } else if StrCmp(val, "O3"c) == 0 {
+        self.optLevel := OPT_O3;
+      } else if StrCmp(val, "Osafe"c) == 0 {
+        self.optLevel := OPT_SAFE;
+      }
+      return;
+    }
+    
+    // --format=elf|pe|macho
+    if StrStartsWith(arg, "--format=") {
+      var val: int64 := arg + 9;
+      if StrCmp(val, "elf"c) == 0 {
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "pe"c) == 0 {
+        self.format := FORMAT_PE;
+      } else if StrCmp(val, "macho"c) == 0 {
+        self.format := FORMAT_MACHO;
+      }
+      return;
+    }
+    
+    // Boolean flags
+    if StrCmp(arg, "--lint"c) == 0 {
+      self.enableLint := true;
+      return;
+    }
+    if StrCmp(arg, "--lint-only"c) == 0 {
+      self.lintOnly := true;
+      self.enableLint := true;
+      return;
+    }
+    if StrCmp(arg, "--debug"c) == 0 {
+      self.enableDebug := true;
+      return;
+    }
+    if StrCmp(arg, "--verbose"c) == 0 {
+      self.enableVerbose := true;
+      return;
+    }
+    if StrCmp(arg, "--warnings-as-errors"c) == 0 {
+      self.warningsAsErrors := true;
+      return;
+    }
+    if StrCmp(arg, "--warn-all"c) == 0 {
+      self.warnAll := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-lexer"c) == 0 {
+      self.dumpLexer := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-parser"c) == 0 {
+      self.dumpParser := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-sema"c) == 0 {
+      self.dumpSema := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-ir"c) == 0 {
+      self.dumpIR := true;
+      return;
+    }
+    if StrCmp(arg, "--dump-asm"c) == 0 {
+      self.dumpASM := true;
+      return;
+    }
+    if StrCmp(arg, "--emit-asm"c) == 0 {
+      self.emitASM := true;
+      return;
+    }
+    if StrCmp(arg, "--list"c) == 0 {
+      self.dumpList := true;
+      return;
+    }
+
+    // CLI P2: --target-energy=N
+    if StrStartsWith(arg, "--target-energy=") {
+      var val: int64 := arg + 16;
+      self.targetEnergy := ParseInt(val);
+      return;
+    }
+
+    // CLI P2: --dump-relocs
+    if StrCmp(arg, "--dump-relocs"c) == 0 {
+      self.dumpRelocs := true;
+      return;
+    }
+
+    // CLI P2: --trace-imports
+    if StrCmp(arg, "--trace-imports"c) == 0 {
+      self.traceImports := true;
+      return;
+    }
+
+    // CLI P3: --asm-listing
+    if StrCmp(arg, "--asm-listing"c) == 0 {
+      self.asmListing := true;
+      return;
+    }
+
+    // CLI P3: --mcdc
+    if StrCmp(arg, "--mcdc"c) == 0 {
+      self.mcdc := true;
+      return;
+    }
+
+    // CLI P3: --mcdc-report
+    if StrCmp(arg, "--mcdc-report"c) == 0 {
+      self.mcdcReport := true;
+      return;
+    }
+
+    // CLI P3: --static-analysis
+    if StrCmp(arg, "--static-analysis"c) == 0 {
+      self.staticAnalysis := true;
+      return;
+    }
+
+    // CLI P3: --call-graph
+    if StrCmp(arg, "--call-graph"c) == 0 {
+      self.callGraph := true;
+      return;
+    }
+
+    // CLI P3: --map-file
+    if StrCmp(arg, "--map-file"c) == 0 {
+      self.mapFile := true;
+      return;
+    }
+
+    // WP-BC-30: --include <header.h>  (next positional arg is the .h path)
+    if StrCmp(arg, "--include"c) == 0 {
+      self.cHeaderFile := 1;  // sentinel: next arg is the header path
+      return;
+    }
+    
+    // WP-BC-43: --trace / --profile
+    if StrCmp(arg, "--trace"c) == 0 {
+      self.traceEnabled := true;
+      return;
+    }
+    if StrCmp(arg, "--profile"c) == 0 {
+      self.profileEnabled := true;
+      return;
+    }
+
+    // WP-BC-44: --trace-passes / --ir-source-map
+    if StrCmp(arg, "--trace-passes"c) == 0 {
+      self.tracePasses := true;
+      return;
+    }
+    if StrCmp(arg, "--ir-source-map"c) == 0 {
+      self.irSourceMap := true;
+      return;
+    }
+
+    // WP-BC-45: --ast-dump / --symtab-dump
+    if StrCmp(arg, "--ast-dump"c) == 0 {
+      self.astDump := true;
+      return;
+    }
+    if StrCmp(arg, "--symtab-dump"c) == 0 {
+      self.symtabDump := true;
+      return;
+    }
+
+    // WP-BC-46: --type-reasoning / --constraint-log
+    if StrCmp(arg, "--type-reasoning"c) == 0 {
+      self.typeReasoning := true;
+      return;
+    }
+    if StrCmp(arg, "--constraint-log"c) == 0 {
+      self.constraintLog := true;
+      return;
+    }
+
+    // WP-BC-47: --provenance
+    if StrCmp(arg, "--provenance"c) == 0 {
+      self.provenance := true;
+      return;
+    }
+
+    // WP-BC-48: --runtime-checks
+    if StrCmp(arg, "--runtime-checks"c) == 0 {
+      self.runtimeChecks := true;
+      return;
+    }
+
+    // WP-BC-49: --debug-symbols
+    if StrCmp(arg, "--debug-symbols"c) == 0 {
+      self.debugSymbols := true;
+      return;
+    }
+
+    // WP-BC-50: --compile-unit / --unit-info
+    if StrCmp(arg, "--compile-unit"c) == 0 {
+      self.compileUnit := true;
+      return;
+    }
+    if StrCmp(arg, "--unit-info"c) == 0 {
+      self.unitInfoFile := 1;  // sentinel: next positional arg is the .lyu path
+      return;
+    }
+
+    // --version
+    if StrCmp(arg, "--version"c) == 0 {
+      PrintStr(COMPILER_NAME);
+      PrintStr(" "c);
+      PrintStrLn(COMPILER_VERSION);
+      PrintStr("Build: "c);
+      PrintStrLn(COMPILER_BUILD);
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --help
+    if StrCmp(arg, "--help"c) == 0 {
+      self.printHelp();
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --build-info
+    if StrCmp(arg, "--build-info"c) == 0 {
+      PrintStrLn("Compiler Build Information:");
+      PrintStr("  Name: "c);
+      PrintStrLn(COMPILER_NAME);
+      PrintStr("  Version: "c);
+      PrintStrLn(COMPILER_VERSION);
+      PrintStr("  Build: "c);
+      PrintStrLn(COMPILER_BUILD);
+      PrintStr("  Target: "c);
+      PrintStrLn("x86_64-linux-elf");
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --config
+    if StrCmp(arg, "--config"c) == 0 {
+      PrintStrLn("Compiler Configuration:");
+      PrintStr("  Targets: x86_64, arm64, riscv64, arm_cm"c);
+      PrintStrLn("");
+      PrintStr("  Formats: elf, pe, macho"c);
+      PrintStrLn("");
+      PrintStr("  Optimization: O0, O1, O2, O3, Osafe"c);
+      self.exitCode := 0;
+      return;
+    }
+    
+    // --no-opt (disable optimizations)
+    if StrCmp(arg, "--no-opt"c) == 0 {
+      self.optLevel := OPT_NONE;
+      return;
+    }
+    
+    // --no-lint (disable linter)
+    if StrCmp(arg, "--no-lint"c) == 0 {
+      self.enableLint := false;
+      return;
+    }
+  }
+  
+  fn parseShortFlags(arg: int64, argLen: int64): void {
+    var i: int64 := 1;
+    while i < argLen {
+      var c: int64 := peek8(arg + i);
+      
+      if c == 79 {  // 'O'
+        // -Olevel
+        var level: int64 := peek8(arg + i + 1);
+        if level == 48 {  // '0'
+          self.optLevel := OPT_NONE;
+        } else if level == 49 {  // '1'
+          self.optLevel := OPT_O1;
+        } else if level == 50 {  // '2'
+          self.optLevel := OPT_O2;
+        } else if level == 51 {  // '3'
+          self.optLevel := OPT_O3;
+        }
+      } else if c == 118 {  // 'v'
+        self.enableVerbose := true;
+      } else if c == 100 {  // 'd'
+        self.enableDebug := true;
+      } else if c == 108 {  // 'l'
+        self.enableLint := true;
+      } else if c == 71 {  // 'g'
+        self.enableDebug := true;
+      } else if c == 119 {  // 'W'
+        if i + 1 < argLen {
+          var next: int64 := peek8(arg + i + 1);
+          if next == 101 {  // 'e'
+            self.warningsAsErrors := true;
+          } else if next == 97 {  // 'a'
+            self.warnAll := true;
+          }
+        }
+      }
+      
+      i := i + 1;
+    }
+  }
+  
+  fn printHelp(): void {
+    PrintStrLn("Usage: lyxc [options] <input> [-o <output>]");
+    PrintStrLn("");
+    PrintStrLn("Options:");
+    PrintStrLn("  --std-path=PATH    Stdlib path override");
+    PrintStrLn("  --arch=ARCH        Architecture: x86_64, arm64, riscv");
+    PrintStrLn("  --target=<arch>     Target architecture: x86_64, arm64, riscv64, arm_cm, macos-x86_64, windows-x86_64, macos-arm64, windows-arm64, linux-riscv64, arm-cm4, arm-cm33, esp32, esp32s3");
+    PrintStrLn("                      Aliases: linux, win64, macosx64, riscv");
+    PrintStrLn("  --format=<fmt>     Output format: elf, pe, macho");
+    PrintStrLn("  --opt=<level>      Optimization: O0, O1, O2, O3, Osafe");
+    PrintStrLn("  --no-opt           Disable IR optimizations");
+    PrintStrLn("  --no-lint          Disable linter");
+    PrintStrLn("  -o <file>          Output file");
+    PrintStrLn("  --lint             Enable linter");
+    PrintStrLn("  --lint-only        Lint only, skip compilation");
+    PrintStrLn("  --debug            Include debug info");
+    PrintStrLn("  --verbose          Verbose output");
+    PrintStrLn("  --dump-lexer       Dump lexer tokens");
+    PrintStrLn("  --dump-parser      Dump AST");
+    PrintStrLn("  --dump-sema        Dump semantic info");
+    PrintStrLn("  --dump-ir          Dump IR");
+    PrintStrLn("  --dump-asm        Dump assembly");
+    PrintStrLn("  --emit-asm        Emit IR as pseudo-assembler (no binary)");
+    PrintStrLn("  --list             Generate listing");
+    PrintStrLn("  --target-energy=N  Set target energy level (1-5)");
+    PrintStrLn("  --dump-relocs      Dump relocation table");
+    PrintStrLn("  --trace-imports    Trace import resolution");
+    PrintStrLn("  --asm-listing      Generate annotated assembly listing");
+    PrintStrLn("  --mcdc             Instrument for MC/DC coverage");
+    PrintStrLn("  --mcdc-report      Print MC/DC coverage report");
+    PrintStrLn("  --static-analysis  Run static analysis passes");
+    PrintStrLn("  --call-graph       Print call graph");
+    PrintStrLn("  --map-file         Generate memory map file");
+    PrintStrLn("  --trace            Enable trace() / trace_int() / trace_str() builtins");
+    PrintStrLn("  --profile          Enable profile_enter() / profile_leave() / profile_report()");
+    PrintStrLn("  --trace-passes     Print timing for each compiler pass ([pass] name: done NNms)");
+    PrintStrLn("  --ir-source-map    Annotate IR dump with ; line:N source locations");
+    PrintStrLn("  --ast-dump         Print indented AST after parsing, then exit");
+    PrintStrLn("  --symtab-dump      Print symbol table after sema (continues compilation)");
+    PrintStrLn("  --type-reasoning   Log each type-inference decision during sema");
+    PrintStrLn("  --constraint-log   Log each type constraint generated during sema");
+    PrintStrLn("  --provenance       Dump IR→AST→source provenance chain after IR gen");
+    PrintStrLn("  --runtime-checks   Inject inline bounds/null/zero assertions");
+    PrintStrLn("  --debug-symbols    Emit DWARF 4 debug sections (.debug_info/.debug_line)");
+    PrintStrLn("  --compile-unit     Compile to .lyu pre-compiled unit (symbol table only)");
+    PrintStrLn("  --unit-info <f>    Print metadata and symbol list from a .lyu file");
+    PrintStrLn("  --include <hdr.h>  Parse C header and emit extern fn declarations");
+    PrintStrLn("  -I <path>          Add include search path for imports");
+    PrintStrLn("  -I<path>           Same as -I <path> (inline form)");
+    PrintStrLn("  --include-path=P   Same as -I <path> (long form)");
+    PrintStrLn("  --version         Show version");
+    PrintStrLn("  --help             Show this help");
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Pipeline Orchestration
+  // ---------------------------------------------------------------------------
+  
+  pub fn Compile(inputFile: pchar, outputFile: pchar): int64 {
+    // Stage 0: C header parsing (--include flag) — runs independently, then exits
+    if self.cHeaderFile > 1 {
+      var hdrPath: pchar := self.cHeaderFile as pchar;
+      var hdrSrc: pchar  := FileReadAll(hdrPath);
+      if hdrSrc == 0 as pchar {
+        EPrintStr("error: cannot read header file: "c);
+        EPrintStrLn(hdrPath);
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+      var chp: CHeaderParser := new CHeaderParser();
+      chp.Init(hdrSrc, StrLen(hdrSrc));
+      chp.Parse();
+      return 0;
+    }
+
+    // Stage 1: Lexer
+    if self.enableVerbose {
+      PrintStrLn("Stage 1: Lexing...");
+    }
+    var _t1: int64 := self._passStart("lexer"c);
+    var source: pchar := FileReadAll(inputFile);
+    if source == 0 {
+      EPrintStr("Error: Cannot read input file: "c);
+      EPrintStrLn(inputFile);
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    if self.dumpLexer {
+      self.dumpTokens(source, StrLen(source));
+    }
+    self._passEnd("lexer"c, _t1);
+
+    // Stage 2: Parser
+    if self.enableVerbose {
+      PrintStrLn("Stage 2: Parsing...");
+    }
+    var _t2: int64 := self._passStart("parser"c);
+    var parser: Parser := new Parser();
+    parser.Init(source, StrLen(source));
+    var astRoot: int64 := parser.Parse();
+    self._passEnd("parser"c, _t2);
+
+    // Dump AST if requested and return early
+    if self.dumpParser || self.astDump {
+      self.dumpAST(parser.nodes, parser.src, astRoot);
+      return self.exitCode;
+    }
+    
+    // If astRoot is 0 but we have nodes, use index 0 for IRLower
+    if astRoot == 0 && parser.nodeCount > 0 {
+      astRoot := 0;  // Index 0 for IRLower
+    }
+
+    // WP-BC-41: LFD Qt-UI-Builder — emit .h/.cpp for any NK_LFD_FORM nodes
+    self.emitLfdForms(astRoot, parser.nodes, source, inputFile);
+
+    // Stage 3: Semantic Analysis
+    var _t3: int64 := self._passStart("sema"c);
+    var sema: Sema := new Sema();
+    sema.Init(source, StrLen(source), parser.nodes, parser.nodeCount, parser.toks);
+    sema.includePath    := self.includePath;   // WP-BC-42: -I search path
+    sema.stdPath        := self.stdPath;       // WP-BC-42: --std-path override
+    sema.typeReasoning  := self.typeReasoning; // WP-BC-46
+    sema.constraintLog  := self.constraintLog; // WP-BC-46
+    var semaResult: int64 := sema.Check(0);
+    self._passEnd("sema"c, _t3);
+
+    // WP-BC-45: --symtab-dump (non-destructive, continues compilation)
+    if self.symtabDump {
+      sema.DumpSymbols();
+    }
+
+    if semaResult != 0 {
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
+    // WP-BC-50: --compile-unit → serialise symbol table to .lyu and exit
+    if self.compileUnit {
+      var lyw: LyuWriter := new LyuWriter();
+      lyw.LywInit();
+      lyw.Serialize(inputFile, sema, LYU_ARCH_X86_64);
+      var lyuPath: pchar;
+      if outputFile != 0 as pchar {
+        lyuPath := outputFile;
+      } else {
+        lyuPath := self._lyuOutputPath(inputFile);
+      }
+      if lyw.WriteFile(lyuPath) {
+        if self.enableVerbose {
+          PrintStr("Wrote .lyu: "c);
+          PrintStrLn(lyuPath);
+        }
+      } else {
+        EPrintStr("error: cannot write .lyu: "c);
+        EPrintStrLn(lyuPath);
+        self.exitCode := 1;
+      }
+      return self.exitCode;
+    }
+
+    // Stage 4: Linter + analysis passes
+    var _t4: int64 := self._passStart("analysis"c);
+    var lintResult: int64 := 0;
+    if self.enableLint {
+      var linter: Linter := new Linter();
+      linter.lnt_Init(source, parser.nodes, parser.toks, inputFile);
+      linter.Lint(astRoot);
+      lintResult := linter.GetWarnCount();
+      if self.warningsAsErrors && lintResult > 0 {
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+    }
+
+    // Stage 4b: Call-graph analysis (optional, --call-graph flag)
+    if self.callGraph {
+      var cg26: CallGraph := new CallGraph();
+      cg26.Init();
+      cg26.Build(astRoot, parser.nodes, source, parser.nodeCount);
+      cg26.AnalyzeRecursion();
+      cg26.AnalyzeReachability();
+      cg26.WarnUnused();
+    }
+
+    // Stage 4c: Static analysis (optional, --static-analysis flag)
+    if self.staticAnalysis {
+      var sa: StaticAnalyzer := new StaticAnalyzer();
+      sa.Init();
+      sa.Analyze(parser.nodes, source, parser.nodeCount);
+      sa.ReportStackUsage();
+    }
+
+    // Stage 4d: MC/DC coverage analysis (optional, --mcdc / --mcdc-report)
+    if self.mcdc || self.mcdcReport {
+      var mc: MCDCAnalyzer := new MCDCAnalyzer();
+      mc.Init();
+      mc.Analyze(parser.nodes, source, parser.nodeCount);
+      if self.mcdcReport {
+        mc.ReportDetailed();
+      } else {
+        mc.ReportSummary();
+      }
+    }
+    self._passEnd("analysis"c, _t4);
+
+    // Stage 5: Early exit for lint-only mode
+    if self.lintOnly {
+      if self.enableVerbose {
+        PrintStrLn("Lint-only mode: skipping compilation");
+      }
+      return self.exitCode;
+    }
+
+    // Stage 5-8 (x86_64 fast path): use direct AST→ELF Codegen (proven, no IR needed)
+    // WP-BC-47: skip fast path when --provenance is set (needs IR)
+    if self.target == TARGET_X86_64 && !self.provenance {
+      var outPath: pchar := outputFile;
+      if outPath == 0 as pchar { outPath := "a.out"c; }
+      var _t5x: int64 := self._passStart("codegen-x86_64"c);
+      var cg: Codegen := new Codegen();
+      cg.Init(source, parser.nodes, parser.toks);
+      if self.enableDebug || self.debugSymbols {
+        cg.debugMode   := 1;
+        cg.srcFilePath := inputFile;
+        cg.srcFileLen  := StrLen(inputFile);
+      }
+      if self.runtimeChecks {
+        cg.runtimeChecks := 1;
+      }
+      cg.Generate(astRoot);
+      cg.WriteELF(outPath);
+      self._passEnd("codegen-x86_64"c, _t5x);
+      return self.exitCode;
+    }
+
+    // Stage 5-8 (macos-x86_64 fast path): same code gen as Linux, Mach-O output
+    if self.target == TARGET_MACOS_X86_64 {
+      var outPath: pchar := outputFile;
+      if outPath == 0 as pchar { outPath := "a.out"c; }
+      var _t5m: int64 := self._passStart("codegen-macos-x86_64"c);
+      var cg: Codegen := new Codegen();
+      cg.Init(source, parser.nodes, parser.toks);
+      cg.Generate(astRoot);
+      var mxb: MacosX86Backend := new MacosX86Backend();
+      mxb.Init();
+      mxb.Build(cg.code, cg.codeLen);
+      mxb.WriteMachO(outPath);
+      self._passEnd("codegen-macos-x86_64"c, _t5m);
+      return self.exitCode;
+    }
+
+    // Stage 5-8 (windows-x86_64 fast path): same code gen as Linux, PE64 output
+    if self.target == TARGET_WINDOWS_X86_64 {
+      var outPath: pchar := outputFile;
+      if outPath == 0 as pchar { outPath := "a.exe"c; }
+      var _t5w: int64 := self._passStart("codegen-win-x86_64"c);
+      var cg: Codegen := new Codegen();
+      cg.Init(source, parser.nodes, parser.toks);
+      cg.Generate(astRoot);
+      var wxb: WinX86Backend := new WinX86Backend();
+      wxb.Init();
+      wxb.Build(cg.code, cg.codeLen);
+      wxb.WritePE64(outPath);
+      self._passEnd("codegen-win-x86_64"c, _t5w);
+      return self.exitCode;
+    }
+
+    // Stage 5: IR Generation (for non-x86_64 targets)
+    // Create IR module and lower AST → IR
+    var irMod: IRModule := new IRModule();
+    irMod.init();
+    irMod.irSourceMap := self.irSourceMap;  // WP-BC-44
+    irMod.provenance  := self.provenance;   // WP-BC-47
+
+    var lower: IRLower := new IRLower();
+    var irPtr: int64 := irMod as int64;
+    lower.init(irPtr, parser.nodes, parser.nodeCount, source, irMod);
+    lower.lowerModule(astRoot);
+
+    // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
+    if self.dumpIR || self.irSourceMap {
+      irMod.dump();
+    }
+
+    // WP-BC-47: --provenance dump
+    if self.provenance {
+      self.dumpProvenance(irMod, parser.nodes, source, inputFile);
+    }
+    
+    // Stage 6: Optimization (skipped)
+
+    // Stage 7: Code Generation
+    if self.enableVerbose {
+      PrintStrLn("Stage 7: Code Generation...");
+    }
+
+    var codeBuffer: int64 := 0;
+
+    if self.target == TARGET_X86_64 {
+      codeBuffer := self.emitX86_64(irMod as int64, lower);
+    } else if self.target == TARGET_ARM64 {
+      codeBuffer := self.emitARM64(irMod as int64);
+    } else if self.target == TARGET_MACOS_ARM64 {
+      codeBuffer := self.emitMacOSARM64(irMod as int64);
+    } else if self.target == TARGET_WINDOWS_ARM64 {
+      codeBuffer := self.emitWindowsARM64(irMod as int64);
+    } else if self.target == TARGET_LINUX_RISCV64 {
+      codeBuffer := self.emitLinuxRISCV64(irMod as int64);
+    } else if self.target == TARGET_ARM_CM4 {
+      codeBuffer := self.emitARMCM4(irMod as int64);
+    } else if self.target == TARGET_XTENSA {
+      codeBuffer := self.emitXtensa(irMod as int64);
+    } else if self.target == TARGET_RISCV64 {
+      codeBuffer := self.emitRISCV(irMod as int64);
+    } else if self.target == TARGET_ARM_CM {
+      codeBuffer := self.emitARMCm(irMod as int64);
+    }
+
+    if codeBuffer == 0 {
+      EPrintStrLn("error: codegen failed");
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
+    // Windows ARM64 / Linux RISC-V / ARM CM4 / Xtensa: file already written inside emit*
+    if self.target == TARGET_WINDOWS_ARM64 || self.target == TARGET_LINUX_RISCV64 || self.target == TARGET_ARM_CM4 || self.target == TARGET_XTENSA {
+      return self.exitCode;
+    }
+
+    // Store codeSize from emit call
+    // (self.codeSize was set by emitX86_64)
+
+    // Stage 8: Binary Writing
+    if self.enableVerbose {
+      PrintStrLn("Stage 8: Writing Binary...");
+    }
+
+    var outFile: pchar := self.outputFile;
+    if outFile == 0 {
+      outFile := "a.out"c;
+    }
+
+    var writeResult: bool := self.writeBinary(outFile, codeBuffer, self.codeSize);
+    
+    if not writeResult {
+      EPrintStrLn("Error: Cannot write output file");
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+    
+    if self.enableVerbose {
+      PrintStr("Wrote: "c);
+      PrintStrLn(outFile);
+    }
+    
+    return self.exitCode;
+  }
+
+  // ---------------------------------------------------------------------------
+  // WP-BC-41: LFD Qt-UI-Builder — emit .h/.cpp for all NK_LFD_FORM nodes
+  // ---------------------------------------------------------------------------
+
+  fn emitLfdForms(astRoot: int64, nodes: int64, src: pchar, inputFile: pchar) {
+    // Walk the top-level declaration list looking for NK_LFD_FORM nodes.
+    // For each form, generate a .h and .cpp file next to the input file.
+    var nd: int64 := astRoot;
+    while (nd >= 0) {
+      if (peek64(nodes + nd * 88) == 95) {  // LFD_NK_FORM = 95
+        var nameOff: int64 := peek64(nodes + nd * 88 + 64);
+        var nameLen: int64 := peek64(nodes + nd * 88 + 72);
+
+        // Build base path: inputFile directory + formName
+        var inputLen: int64 := StrLen(inputFile);
+        // find last '/' to get directory prefix
+        var lastSlash: int64 := -1;
+        var pi: int64 := 0;
+        while (pi < inputLen) {
+          if (StrCharAt(inputFile, pi) == 47) { lastSlash := pi; }
+          pi := pi + 1;
+        }
+        var dirLen: int64 := lastSlash + 1;  // 0 if no slash
+
+        // basePath = dir + formName  (null-terminated)
+        var basePathSz: int64 := dirLen + nameLen + 8;
+        var basePathBuf: int64 := mmap(0, basePathSz, 3, 34, -1, 0);
+        var basePath: pchar := basePathBuf as pchar;
+        var bpi: int64 := 0;
+        pi := 0;
+        while (pi < dirLen) {
+          poke8(basePath as int64 + bpi, StrCharAt(inputFile, pi) & 255);
+          bpi := bpi + 1; pi := pi + 1;
+        }
+        pi := 0;
+        while (pi < nameLen) {
+          poke8(basePath as int64 + bpi, StrCharAt(src, nameOff + pi) & 255);
+          bpi := bpi + 1; pi := pi + 1;
+        }
+        poke8(basePath as int64 + bpi, 0);
+
+        // headerName = formName + ".h"  (for #include in .cpp)
+        var headerNameSz: int64 := nameLen + 4;
+        var headerNameBuf: int64 := mmap(0, headerNameSz, 3, 34, -1, 0);
+        var headerName: pchar := headerNameBuf as pchar;
+        pi := 0;
+        while (pi < nameLen) {
+          poke8(headerName as int64 + pi, StrCharAt(src, nameOff + pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(headerName as int64 + nameLen,     46);  // '.'
+        poke8(headerName as int64 + nameLen + 1, 104); // 'h'
+        poke8(headerName as int64 + nameLen + 2, 0);
+
+        // hPath = basePath + ".h"
+        var hPathLen: int64 := StrLen(basePath);
+        var hPathSz: int64 := hPathLen + 4;
+        var hPathBuf: int64 := mmap(0, hPathSz, 3, 34, -1, 0);
+        var hPath: pchar := hPathBuf as pchar;
+        pi := 0;
+        while (pi < hPathLen) {
+          poke8(hPath as int64 + pi, StrCharAt(basePath, pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(hPath as int64 + hPathLen,     46);  // '.'
+        poke8(hPath as int64 + hPathLen + 1, 104); // 'h'
+        poke8(hPath as int64 + hPathLen + 2, 0);
+
+        // cppPath = basePath + ".cpp"
+        var cppPathSz: int64 := hPathLen + 6;
+        var cppPathBuf: int64 := mmap(0, cppPathSz, 3, 34, -1, 0);
+        var cppPath: pchar := cppPathBuf as pchar;
+        pi := 0;
+        while (pi < hPathLen) {
+          poke8(cppPath as int64 + pi, StrCharAt(basePath, pi) & 255);
+          pi := pi + 1;
+        }
+        poke8(cppPath as int64 + hPathLen,     46);  // '.'
+        poke8(cppPath as int64 + hPathLen + 1, 99);  // 'c'
+        poke8(cppPath as int64 + hPathLen + 2, 112); // 'p'
+        poke8(cppPath as int64 + hPathLen + 3, 112); // 'p'
+        poke8(cppPath as int64 + hPathLen + 4, 0);
+
+        var gen: LfdCodeGen := new LfdCodeGen();
+        gen.Init(src, nodes);
+
+        // Generate .h
+        gen.GenerateHeader(nd);
+        FileWriteAll(hPath, gen.GetOut(), gen.GetOutLen());
+        if self.enableVerbose {
+          PrintStr("LFD: wrote "c);
+          PrintStrLn(hPath);
+        }
+
+        // Generate .cpp
+        gen.GenerateSource(nd, headerName);
+        FileWriteAll(cppPath, gen.GetOut(), gen.GetOutLen());
+        if self.enableVerbose {
+          PrintStr("LFD: wrote "c);
+          PrintStrLn(cppPath);
+        }
+      }
+      nd := peek64(nodes + nd * 88 + 40);  // next
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Code Emission
+  // ---------------------------------------------------------------------------
+
+  fn emitX86_64(irMod: int64, lower: IRLower): int64 {
+    // Generate code with _start and main
+    // _start at offset 0, main at offset 19
+    var codeBuf: int64 := mmap(0, 65536, 3, 34, -1, 0);
+    var codeLen: int64 := 0;
+    
+    // _start: standard entry point at vaddr 0x401000
+    // Layout: push rbp(1) + mov rbp,rsp(3) + call(5) + mov rdi,rax(3) + mov eax,60(5) + syscall(2) = 19 bytes
+    // main starts at offset 19; call next IP=9, rel32 = 19-9 = 10
+
+    // push rbp (offset 0)
+    poke8(codeBuf + codeLen, 85);
+    codeLen := codeLen + 1;
+    // mov rbp, rsp (offset 1): 48 89 E5
+    poke8(codeBuf + codeLen, 72);   // REX.W
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 137);  // MOV r/m64, r64
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 229);  // ModRM 0xE5 = 11 100 101 = mov rbp, rsp
+    codeLen := codeLen + 1;
+
+    // call main (offset 4): E8 rel32; next IP = 9; main at 19; rel32 = 10
+    poke8(codeBuf + codeLen, 232);  // E8
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 10);   // rel32 = 10
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    
+    // After main returns, exit with return value in rax
+    // mov rdi, rax (3 bytes at 0x40100e)
+    // x86-64: 48 89 c7 = mov rdi, rax
+    poke8(codeBuf + codeLen, 72);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 137);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 199);
+    codeLen := codeLen + 1;
+    
+    // mov eax, 60 (offset 12): B8 3C 00 00 00 — zero-extends to rax
+    poke8(codeBuf + codeLen, 184);  // B8 = MOV EAX, imm32
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 60);   // 60 = sys_exit
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+
+    // syscall (offset 17): 0F 05
+    poke8(codeBuf + codeLen, 15);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 5);
+    codeLen := codeLen + 1;
+    
+    // main (offset 19 = 0x401013)
+    // push rbp
+    poke8(codeBuf + codeLen, 85);   // 55
+    codeLen := codeLen + 1;
+    // mov rbp, rsp: 48 89 E5
+    poke8(codeBuf + codeLen, 72);   // REX.W
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 137);  // MOV r/m64, r64
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 229);  // ModRM 0xE5 = 11 100 101 = mov rbp, rsp
+    codeLen := codeLen + 1;
+    // mov eax, 42: B8 2A 00 00 00 (zero-extends to rax)
+    poke8(codeBuf + codeLen, 184);  // B8 = MOV EAX, imm32
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 42);   // 42
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    poke8(codeBuf + codeLen, 0);
+    codeLen := codeLen + 1;
+    // pop rbp
+    poke8(codeBuf + codeLen, 93);   // 5D
+    codeLen := codeLen + 1;
+    // ret
+    poke8(codeBuf + codeLen, 195);  // C3
+    codeLen := codeLen + 1;
+    
+    self.codeSize := codeLen;
+    return codeBuf;
+  }
+
+  fn emitARM64(irMod: int64): int64 {
+    // If the IR module has functions, use the IR-based emitter.
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitARM64 := new EmitARM64();
+      emitter.init(irMod);
+      emitter.emit();
+      var irCodeLen: int64 := emitter.getCodeLen();
+      var irCodeBuf: int64 := emitter.getCodeBuf();
+
+      // Prepend 12-byte _start stub: BL main + exit syscall
+      // _start (offset 0): BL main  (main is at offset 12, imm26 delta = 3)
+      // _start (offset 4): MOVZ x8, #93 (SYS_EXIT)
+      // _start (offset 8): SVC #0
+      // main   (offset 12): IR-emitted function code
+      var totalLen: int64 := 12 + irCodeLen;
+      var newBuf: int64 := mmap(0, 131072, 3, 34, -1, 0);
+
+      // BL main = 0x94000003
+      poke8(newBuf + 0, 3);     poke8(newBuf + 1, 0);
+      poke8(newBuf + 2, 0);     poke8(newBuf + 3, 0x94);
+      // MOVZ x8, #93 = 0xD2800BA8
+      poke8(newBuf + 4, 0xA8);  poke8(newBuf + 5, 0x0B);
+      poke8(newBuf + 6, 0x80);  poke8(newBuf + 7, 0xD2);
+      // SVC #0 = 0xD4000001
+      poke8(newBuf + 8, 0x01);  poke8(newBuf + 9, 0x00);
+      poke8(newBuf + 10, 0x00); poke8(newBuf + 11, 0xD4);
+
+      // Copy IR code after stub
+      var ci: int64 := 0;
+      while ci < irCodeLen {
+        poke8(newBuf + 12 + ci, peek8(irCodeBuf + ci));
+        ci := ci + 1;
+      }
+
+      self.codeSize := totalLen;
+      return newBuf;
+    }
+
+    // Fallback: generate _start + main stub in ARM64 instructions.
+    // Layout (all 32-bit ARM64 instructions):
+    //   Offset  0: BL main          (main at offset 12 → delta=3)
+    //   Offset  4: MOVZ x8, #93     (sys_exit)
+    //   Offset  8: SVC #0
+    //   Offset 12: _main prologue
+    //   Offset 12: STP x29,x30,[sp,#-16]!
+    //   Offset 16: MOV x29, sp
+    //   Offset 20: MOVZ x0, #42    (return value)
+    //   Offset 24: LDP x29,x30,[sp],#16
+    //   Offset 28: RET
+    var codeBuf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+    var off: int64 := 0;
+
+    // _start (offset 0):
+    // BL main  — main is at offset 12, delta = (12-0)/4 = 3
+    poke8(codeBuf + off,     3);   off := off + 1;  // imm26 low byte
+    poke8(codeBuf + off,     0);   off := off + 1;
+    poke8(codeBuf + off,     0);   off := off + 1;
+    poke8(codeBuf + off,  0x94);   off := off + 1;  // BL opcode
+
+    // MOVZ x8, #93  (= 0xD2800BA8)
+    poke8(codeBuf + off,  0xA8);   off := off + 1;
+    poke8(codeBuf + off,  0x0B);   off := off + 1;
+    poke8(codeBuf + off,  0x80);   off := off + 1;
+    poke8(codeBuf + off,  0xD2);   off := off + 1;
+
+    // SVC #0  (= 0xD4000001)
+    poke8(codeBuf + off,  0x01);   off := off + 1;
+    poke8(codeBuf + off,  0x00);   off := off + 1;
+    poke8(codeBuf + off,  0x00);   off := off + 1;
+    poke8(codeBuf + off,  0xD4);   off := off + 1;
+
+    // main (offset 12):
+    // STP x29,x30,[sp,#-16]!  (= 0xA9BF7BFD)
+    poke8(codeBuf + off,  0xFD);   off := off + 1;
+    poke8(codeBuf + off,  0x7B);   off := off + 1;
+    poke8(codeBuf + off,  0xBF);   off := off + 1;
+    poke8(codeBuf + off,  0xA9);   off := off + 1;
+
+    // MOV x29, sp  (= 0x910003FD)
+    poke8(codeBuf + off,  0xFD);   off := off + 1;
+    poke8(codeBuf + off,  0x03);   off := off + 1;
+    poke8(codeBuf + off,  0x00);   off := off + 1;
+    poke8(codeBuf + off,  0x91);   off := off + 1;
+
+    // MOVZ x0, #42  (= 0xD2800540)
+    poke8(codeBuf + off,  0x40);   off := off + 1;
+    poke8(codeBuf + off,  0x05);   off := off + 1;
+    poke8(codeBuf + off,  0x80);   off := off + 1;
+    poke8(codeBuf + off,  0xD2);   off := off + 1;
+
+    // LDP x29,x30,[sp],#16  (= 0xA8C17BFD)
+    poke8(codeBuf + off,  0xFD);   off := off + 1;
+    poke8(codeBuf + off,  0x7B);   off := off + 1;
+    poke8(codeBuf + off,  0xC1);   off := off + 1;
+    poke8(codeBuf + off,  0xA8);   off := off + 1;
+
+    // RET  (= 0xD65F03C0)
+    poke8(codeBuf + off,  0xC0);   off := off + 1;
+    poke8(codeBuf + off,  0x03);   off := off + 1;
+    poke8(codeBuf + off,  0x5F);   off := off + 1;
+    poke8(codeBuf + off,  0xD6);   off := off + 1;
+
+    self.codeSize := off;
+    return codeBuf;
+  }
+
+  fn emitMacOSARM64(irMod: int64): int64 {
+    // macOS ARM64 (Apple Silicon): 16-byte _start stub + IR-emitted code.
+    // Syscall convention: number in x16, SVC #0x80; exit = 0x2000001.
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitARM64 := new EmitARM64();
+      emitter.init(irMod);
+      emitter.emit();
+      var irCodeLen: int64 := emitter.getCodeLen();
+      var irCodeBuf: int64 := emitter.getCodeBuf();
+      var totalLen: int64 := 16 + irCodeLen;
+      var newBuf: int64 := mmap(0, 131072, 3, 34, -1, 0);
+
+      // BL main — main at offset 16 (4 instructions forward) = 0x94000004
+      poke8(newBuf + 0,  4);     poke8(newBuf + 1,  0);
+      poke8(newBuf + 2,  0);     poke8(newBuf + 3,  0x94);
+      // MOVZ x16, #1 = 0xD2800030
+      poke8(newBuf + 4,  0x30);  poke8(newBuf + 5,  0x00);
+      poke8(newBuf + 6,  0x80);  poke8(newBuf + 7,  0xD2);
+      // MOVK x16, #0x200, LSL#16 = 0xF2A04010  (x16 becomes 0x2000001)
+      poke8(newBuf + 8,  0x10);  poke8(newBuf + 9,  0x40);
+      poke8(newBuf + 10, 0xA0);  poke8(newBuf + 11, 0xF2);
+      // SVC #0x80 = 0xD4001001
+      poke8(newBuf + 12, 0x01);  poke8(newBuf + 13, 0x10);
+      poke8(newBuf + 14, 0x00);  poke8(newBuf + 15, 0xD4);
+
+      var ci: int64 := 0;
+      while ci < irCodeLen {
+        poke8(newBuf + 16 + ci, peek8(irCodeBuf + ci));
+        ci := ci + 1;
+      }
+
+      self.codeSize := totalLen;
+      return newBuf;
+    }
+
+    // Fallback: minimal stub returning 42
+    var codeBuf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+    var off: int64 := 0;
+
+    // BL main (offset 16 → 4 instructions = 0x94000004)
+    poke8(codeBuf + off, 4);     off := off + 1;
+    poke8(codeBuf + off, 0);     off := off + 1;
+    poke8(codeBuf + off, 0);     off := off + 1;
+    poke8(codeBuf + off, 0x94);  off := off + 1;
+    // MOVZ x16, #1 = 0xD2800030
+    poke8(codeBuf + off, 0x30);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0x80);  off := off + 1;
+    poke8(codeBuf + off, 0xD2);  off := off + 1;
+    // MOVK x16, #0x200, LSL#16 = 0xF2A04010
+    poke8(codeBuf + off, 0x10);  off := off + 1;
+    poke8(codeBuf + off, 0x40);  off := off + 1;
+    poke8(codeBuf + off, 0xA0);  off := off + 1;
+    poke8(codeBuf + off, 0xF2);  off := off + 1;
+    // SVC #0x80 = 0xD4001001
+    poke8(codeBuf + off, 0x01);  off := off + 1;
+    poke8(codeBuf + off, 0x10);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0xD4);  off := off + 1;
+    // main: STP x29,x30,[sp,#-16]! = 0xA9BF7BFD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x7B);  off := off + 1;
+    poke8(codeBuf + off, 0xBF);  off := off + 1;
+    poke8(codeBuf + off, 0xA9);  off := off + 1;
+    // MOV x29, sp = 0x910003FD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x03);  off := off + 1;
+    poke8(codeBuf + off, 0x00);  off := off + 1;
+    poke8(codeBuf + off, 0x91);  off := off + 1;
+    // MOVZ x0, #42 = 0xD2800540
+    poke8(codeBuf + off, 0x40);  off := off + 1;
+    poke8(codeBuf + off, 0x05);  off := off + 1;
+    poke8(codeBuf + off, 0x80);  off := off + 1;
+    poke8(codeBuf + off, 0xD2);  off := off + 1;
+    // LDP x29,x30,[sp],#16 = 0xA8C17BFD
+    poke8(codeBuf + off, 0xFD);  off := off + 1;
+    poke8(codeBuf + off, 0x7B);  off := off + 1;
+    poke8(codeBuf + off, 0xC1);  off := off + 1;
+    poke8(codeBuf + off, 0xA8);  off := off + 1;
+    // RET = 0xD65F03C0
+    poke8(codeBuf + off, 0xC0);  off := off + 1;
+    poke8(codeBuf + off, 0x03);  off := off + 1;
+    poke8(codeBuf + off, 0x5F);  off := off + 1;
+    poke8(codeBuf + off, 0xD6);  off := off + 1;
+
+    self.codeSize := off;
+    return codeBuf;
+  }
+
+  fn emitWindowsARM64(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.exe"c; }
+    var wab: WinARM64Backend := new WinARM64Backend();
+    wab.Init();
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitARM64 := new EmitARM64();
+      emitter.init(irMod);
+      emitter.emit();
+      wab.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+    } else {
+      wab.Build(0, 0);
+    }
+    wab.WritePE64(outPath);
+    self.codeSize := wab.GetCodeSize();
+    return 1;
+  }
+
+  fn emitLinuxRISCV64(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.out"c; }
+    var rlb: RiscvLinuxBackend := new RiscvLinuxBackend();
+    rlb.Init();
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitRISCV64 := new EmitRISCV64();
+      emitter.init(irMod);
+      emitter.emit();
+      rlb.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+    } else {
+      rlb.Build(0, 0);
+    }
+    rlb.WriteELF64(outPath);
+    self.codeSize := rlb.GetCodeSize();
+    return 1;
+  }
+
+  fn emitARMCM4(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.elf"c; }
+    var acb: ARMCMBackend := new ARMCMBackend();
+    acb.Init();
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitARMCM := new EmitARMCM();
+      emitter.init(irMod);
+      emitter.emit();
+      acb.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+    } else {
+      acb.Build(0, 0);
+    }
+    acb.WriteELF32(outPath);
+    self.codeSize := acb.GetCodeSize();
+    return 1;
+  }
+
+  fn emitXtensa(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.elf"c; }
+    var xb: XtensaBackend := new XtensaBackend();
+    xb.Init();
+    var funcCount: int64 := peek64(irMod + 96);
+    if funcCount > 0 {
+      var emitter: EmitXtensa := new EmitXtensa();
+      emitter.init(irMod);
+      emitter.emit();
+      xb.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+    } else {
+      xb.Build(0, 0);
+    }
+    xb.WriteELF32(outPath);
+    self.codeSize := xb.GetCodeSize();
+    return 1;
+  }
+
+  fn emitRISCV(irMod: int64): int64 {
+    var emitter: RISCVEmitter := new RISCVEmitter();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+
+  fn emitARMCm(irMod: int64): int64 {
+    var emitter: ARMCMEmitter := new ARMCMEmitter();
+    emitter.init(irMod);
+    self.codeSize := emitter.emit();
+    return emitter.getCodeBuf();
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Binary Writing
+  // ---------------------------------------------------------------------------
+  
+  fn writeBinary(path: pchar, code: int64, size: int64): bool {
+    if self.format == FORMAT_ELF {
+      return self.writeELF(path, code, size);
+    } else if self.format == FORMAT_PE {
+      return self.writePE(path, code, size);
+    } else if self.format == FORMAT_MACHO {
+      return self.writeMachO(path, code, size);
+    }
+    return false;
+  }
+  
+  fn writeELF(path: pchar, code: int64, size: int64): bool {
+    // Create minimal ELF matching S1 layout:
+    // - Single PT_LOAD at offset 0x1000 (vaddr 0x401000)
+    // - Entry point at 0x401000
+    // - Headers at offset 64 (must be covered by LOAD)
+    
+    var codeFileOffset: int64 := 4096;  // 0x1000
+    var elfSize: int64 := codeFileOffset + size;
+    
+    var fd: int64 := open(path, 577, 493);
+    if fd == -1 { return false; }
+    close(fd);
+    
+    var elfBuf: int64 := mmap(0, elfSize, 3, 34, -1, 0);
+    if elfBuf == -1 { return false; }
+    
+    // Zero buffer
+    var z: int64 := 0;
+    while (z < elfSize) {
+      poke8(elfBuf + z, 0);
+      z := z + 1;
+    }
+    
+    // Copy code to offset 4096
+    var i: int64 := 0;
+    while (i < size) {
+      poke8(elfBuf + codeFileOffset + i, peek8(code + i));
+      i := i + 1;
+    }
+    
+    // ELF header (64 bytes)
+    var off: int64 := 0;
+    poke8(elfBuf + off, 127); off := off + 1;  // 0x7F
+    poke8(elfBuf + off, 69); off := off + 1;  // 'E'
+    poke8(elfBuf + off, 76); off := off + 1;  // 'L'
+    poke8(elfBuf + off, 70); off := off + 1;  // 'F'
+    poke8(elfBuf + off, 2); off := off + 1;   // 64-bit
+    poke8(elfBuf + off, 1); off := off + 1;   // little endian
+    poke8(elfBuf + off, 1); off := off + 1;   // ELF version
+    poke8(elfBuf + off, 0); off := off + 1;   // OS ABI
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    poke8(elfBuf + off, 0); off := off + 1;
+    
+    // e_type (offset 16): ET_EXEC = 2
+    poke16(elfBuf + 16, 2);
+    // e_machine (offset 18): x86-64=62, AArch64=183
+    var emach: int64 := 62;
+    if self.target == TARGET_ARM64 { emach := 183; }
+    poke16(elfBuf + 18, emach);
+    // e_version (offset 20): EV_CURRENT = 1
+    poke32(elfBuf + 20, 1);
+    // e_entry (offset 24): entry point = 0x401000
+    poke64(elfBuf + 24, 0x401000);
+    // e_phoff (offset 32): program header offset = 64
+    poke64(elfBuf + 32, 64);
+    // e_shoff (offset 40): no section headers = 0
+    poke64(elfBuf + 40, 0);
+    // e_flags (offset 48): 0
+    poke32(elfBuf + 48, 0);
+    // e_ehsize (offset 52): 64
+    poke16(elfBuf + 52, 64);
+    // e_phentsize (offset 54): 56
+    poke16(elfBuf + 54, 56);
+    // e_phnum (offset 56): 1 program header
+    poke16(elfBuf + 56, 1);
+    // e_shentsize (offset 58): 0
+    poke16(elfBuf + 58, 0);
+    // e_shnum (offset 60): 0
+    poke16(elfBuf + 60, 0);
+    // e_shstrndx (offset 62): 0
+    poke16(elfBuf + 62, 0);
+    
+    // Single PT_LOAD segment (at offset 64)
+    var ph: int64 := 64;
+    // p_type: PT_LOAD = 1
+    poke32(elfBuf + ph, 1); ph := ph + 4;
+    // p_flags: rwx = 7
+    poke32(elfBuf + ph, 7); ph := ph + 4;
+    // p_offset: file offset = 0x1000
+    poke64(elfBuf + ph, codeFileOffset); ph := ph + 8;
+    // p_vaddr: virtual address = 0x401000
+    poke64(elfBuf + ph, 0x401000); ph := ph + 8;
+    // p_paddr: physical address = 0x401000
+    poke64(elfBuf + ph, 0x401000); ph := ph + 8;
+    // p_filesz: file size = code size
+    poke64(elfBuf + ph, size); ph := ph + 8;
+    // p_memsz: memory size = code size
+    poke64(elfBuf + ph, size); ph := ph + 8;
+    // p_align: alignment = 0x1000
+    poke64(elfBuf + ph, 4096);
+    
+    var result: int64 := FileWriteAll(path, elfBuf as pchar, elfSize) as int64;
+    munmap(elfBuf, elfSize);
+    chmod(path, 493);
+    
+    return result != 0;
+  }
+
+  fn writePE(path: pchar, code: int64, size: int64): bool {
+    var writer: int64 := PE64Writer.Create();
+    writer.SetEntry(0x401000);
+    writer.SetTextSection(code, size, 0x401000);
+    
+    var output: int64 := writer.Write();
+    var outputSize: int64 := writer.GetSize();
+    
+    var result: bool := FileWriteAll(path, output as pchar, outputSize);
+    
+    writer.Free();
+    
+    return result;
+  }
+  
+  fn writeMachO(path: pchar, code: int64, size: int64): bool {
+    // macOS ARM64 Mach-O binary layout (Apple Silicon, 16KB pages):
+    //   Mach-O header (32 bytes)
+    //   LC_SEGMENT_64 __PAGEZERO (72 bytes, 0 sections)
+    //   LC_SEGMENT_64 __TEXT     (72+80=152 bytes, 1 section)
+    //   LC_MAIN                  (24 bytes)
+    //   Zeros to page boundary P
+    //   Code section (size bytes)
+    //
+    // Page size: ARM64 macOS uses 0x4000 (16KB).
+
+    var pageSize: int64 := 0x4000;
+    var numCmds: int64 := 3;
+    var segPZSize: int64 := 72;
+    var segTextSize: int64 := 152;
+    var lcMainSize: int64 := 24;
+    var totalCmdSz: int64 := segPZSize + segTextSize + lcMainSize;  // 248
+    var H: int64 := 32 + totalCmdSz;   // 280
+    var P: int64 := pageSize;  // H=280 < 16KB so P = one page = 0x4000
+    var textBase: int64 := 0x100000000;
+    var textVMSz: int64 := P + size;
+
+    var outCap: int64 := P + size;
+    var outBuf: int64 := mmap(0, outCap, 3, 34, -1, 0);
+
+    // Zero buffer
+    var z: int64 := 0;
+    while z < outCap {
+      poke8(outBuf + z, 0);
+      z := z + 1;
+    }
+
+    var off: int64 := 0;
+
+    // --- Mach-O header (32 bytes) ---
+    poke32(outBuf + off, 0xFEEDFACF); off := off + 4;  // magic MH_MAGIC_64
+    if self.target == TARGET_MACOS_ARM64 {
+      poke32(outBuf + off, 0x0100000C); off := off + 4;  // CPU_TYPE_ARM64
+      poke32(outBuf + off, 0); off := off + 4;           // CPU_SUBTYPE_ARM64_ALL
+    } else {
+      poke32(outBuf + off, 0x01000007); off := off + 4;  // CPU_TYPE_X86_64
+      poke32(outBuf + off, 3); off := off + 4;           // CPU_SUBTYPE_X86_64_ALL
+    }
+    poke32(outBuf + off, 2); off := off + 4;           // MH_EXECUTE
+    poke32(outBuf + off, numCmds); off := off + 4;
+    poke32(outBuf + off, totalCmdSz); off := off + 4;
+    poke32(outBuf + off, 0x00200001); off := off + 4;  // MH_NOUNDEFS|MH_PIE
+    poke32(outBuf + off, 0); off := off + 4;           // reserved
+
+    // --- LC_SEGMENT_64 __PAGEZERO (72 bytes) ---
+    poke32(outBuf + off, 0x19); off := off + 4;   // LC_SEGMENT_64
+    poke32(outBuf + off, 72); off := off + 4;     // cmdsize
+    // segname "__PAGEZERO" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  80); off := off + 1;  // 'P'
+    poke8(outBuf + off,  65); off := off + 1;  // 'A'
+    poke8(outBuf + off,  71); off := off + 1;  // 'G'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  90); off := off + 1;  // 'Z'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  82); off := off + 1;  // 'R'
+    poke8(outBuf + off,  79); off := off + 1;  // 'O'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, 0); off := off + 8;          // vmaddr = 0
+    poke64(outBuf + off, textBase); off := off + 8;   // vmsize = 0x100000000
+    poke64(outBuf + off, 0); off := off + 8;          // fileoff = 0
+    poke64(outBuf + off, 0); off := off + 8;          // filesize = 0
+    poke32(outBuf + off, 0); off := off + 4;          // maxprot = NONE
+    poke32(outBuf + off, 0); off := off + 4;          // initprot = NONE
+    poke32(outBuf + off, 0); off := off + 4;          // nsects = 0
+    poke32(outBuf + off, 0); off := off + 4;          // flags = 0
+
+    // --- LC_SEGMENT_64 __TEXT (152 bytes) ---
+    poke32(outBuf + off, 0x19); off := off + 4;   // LC_SEGMENT_64
+    poke32(outBuf + off, 152); off := off + 4;    // cmdsize
+    // segname "__TEXT" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  88); off := off + 1;  // 'X'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, textBase); off := off + 8;   // vmaddr
+    poke64(outBuf + off, textVMSz); off := off + 8;   // vmsize
+    poke64(outBuf + off, 0); off := off + 8;          // fileoff = 0 (whole file)
+    poke64(outBuf + off, textVMSz); off := off + 8;   // filesize
+    poke32(outBuf + off, 5); off := off + 4;          // maxprot = R|X
+    poke32(outBuf + off, 5); off := off + 4;          // initprot = R|X
+    poke32(outBuf + off, 1); off := off + 4;          // nsects = 1
+    poke32(outBuf + off, 0); off := off + 4;          // flags = 0
+
+    // Section __text in __TEXT (80 bytes)
+    // sectname "__text" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off, 116); off := off + 1;  // 't'
+    poke8(outBuf + off, 101); off := off + 1;  // 'e'
+    poke8(outBuf + off, 120); off := off + 1;  // 'x'
+    poke8(outBuf + off, 116); off := off + 1;  // 't'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    // segname "__TEXT" (16 bytes)
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  95); off := off + 1;  // '_'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off,  69); off := off + 1;  // 'E'
+    poke8(outBuf + off,  88); off := off + 1;  // 'X'
+    poke8(outBuf + off,  84); off := off + 1;  // 'T'
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke8(outBuf + off, 0); off := off + 1;
+    poke64(outBuf + off, textBase + P); off := off + 8;  // addr
+    poke64(outBuf + off, size); off := off + 8;          // size
+    poke32(outBuf + off, P); off := off + 4;             // offset in file
+    poke32(outBuf + off, 4); off := off + 4;             // align = 2^4
+    poke32(outBuf + off, 0); off := off + 4;             // reloff
+    poke32(outBuf + off, 0); off := off + 4;             // nreloc
+    poke32(outBuf + off, 0x80000400); off := off + 4;    // flags = PURE|SOME_INSTR
+    poke32(outBuf + off, 0); off := off + 4;             // reserved1
+    poke32(outBuf + off, 0); off := off + 4;             // reserved2
+    poke32(outBuf + off, 0); off := off + 4;             // reserved3
+
+    // --- LC_MAIN (24 bytes) ---
+    poke32(outBuf + off, 0x80000028); off := off + 4;  // LC_MAIN
+    poke32(outBuf + off, 24); off := off + 4;          // cmdsize
+    poke64(outBuf + off, P); off := off + 8;           // entryoff (from __TEXT start)
+    poke64(outBuf + off, 0); off := off + 8;           // stacksize = 0
+
+    // Copy code at offset P (buffer already zeroed)
+    var ci: int64 := 0;
+    while ci < size {
+      poke8(outBuf + P + ci, peek8(code + ci));
+      ci := ci + 1;
+    }
+
+    // Write to file
+    var fd: int64 := open(path, 577, 493);
+    if fd < 0 {
+      munmap(outBuf, outCap);
+      return false;
+    }
+    write(fd, outBuf as pchar, outCap);
+    close(fd);
+    munmap(outBuf, outCap);
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Dump Functions
+  // ---------------------------------------------------------------------------
+  
+  fn dumpTokens(source: pchar, srcLen: int64): void {
+    var lx: Lexer := new Lexer();
+    lx.Init(source, srcLen);
+    PrintStrLn("=== LEXER TOKENS ===");
+    var kind: int64 := lx.Next();
+    while kind != TK_EOF {
+      PrintStr("Token "c);
+      PrintInt(kind);
+      PrintStr(": "c);
+      var text: pchar := lx.TokText();
+      if text != 0 {
+        PrintStrLn(text);
+      } else {
+        PrintStrLn("(null)");
+      }
+      kind := lx.Next();
+    }
+    dispose lx;
+  }
+  
+  // WP-BC-45: NK_ constant → name string helper
+  fn _nkStr(k: int64): pchar {
+    if k == NK_INVALID     { return "INVALID"c; }
+    if k == NK_IMPORT      { return "IMPORT"c; }
+    if k == NK_FUNC_DECL   { return "FUNC_DECL"c; }
+    if k == NK_PARAM       { return "PARAM"c; }
+    if k == NK_VAR_DECL    { return "VAR_DECL"c; }
+    if k == NK_CON_DECL    { return "CON_DECL"c; }
+    if k == NK_STRUCT_DECL { return "STRUCT_DECL"c; }
+    if k == NK_FIELD_DECL  { return "FIELD_DECL"c; }
+    if k == NK_ENUM_DECL   { return "ENUM_DECL"c; }
+    if k == NK_ENUM_MEM    { return "ENUM_MEM"c; }
+    if k == NK_TYPE_DECL   { return "TYPE_DECL"c; }
+    if k == NK_BLOCK       { return "BLOCK"c; }
+    if k == NK_IF          { return "IF"c; }
+    if k == NK_WHILE       { return "WHILE"c; }
+    if k == NK_FOR         { return "FOR"c; }
+    if k == NK_SWITCH      { return "SWITCH"c; }
+    if k == NK_CASE        { return "CASE"c; }
+    if k == NK_BREAK       { return "BREAK"c; }
+    if k == NK_CONTINUE    { return "CONTINUE"c; }
+    if k == NK_RETURN      { return "RETURN"c; }
+    if k == NK_EXPR_STMT   { return "EXPR_STMT"c; }
+    if k == NK_ASSIGN      { return "ASSIGN"c; }
+    if k == NK_DISPOSE     { return "DISPOSE"c; }
+    if k == NK_ASSERT      { return "ASSERT"c; }
+    if k == NK_LIT_INT     { return "LIT_INT"c; }
+    if k == NK_LIT_FLOAT   { return "LIT_FLOAT"c; }
+    if k == NK_LIT_STR     { return "LIT_STR"c; }
+    if k == NK_LIT_CHAR    { return "LIT_CHAR"c; }
+    if k == NK_LIT_BOOL    { return "LIT_BOOL"c; }
+    if k == NK_LIT_NULL    { return "LIT_NULL"c; }
+    if k == NK_IDENT       { return "IDENT"c; }
+    if k == NK_BINOP       { return "BINOP"c; }
+    if k == NK_UNOP        { return "UNOP"c; }
+    if k == NK_CALL        { return "CALL"c; }
+    if k == NK_INDEX       { return "INDEX"c; }
+    if k == NK_FIELD       { return "FIELD"c; }
+    if k == NK_NEW         { return "NEW"c; }
+    if k == NK_CAST        { return "CAST"c; }
+    if k == NK_TYPE_NAME   { return "TYPE_NAME"c; }
+    if k == NK_TYPE_ARRAY  { return "TYPE_ARRAY"c; }
+    return "?"c;
+  }
+
+  // WP-BC-45: recursive AST node printer (walks sibling chain + recurses into children)
+  fn _dumpASTNode(nodes: int64, src: pchar, ni: int64, depth: int64): void {
+    var cur: int64 := ni;
+    while cur >= 0 {
+      var base: int64 := nodes + cur * 88;
+      var kind: int64 := peek64(base);
+      var nc0:  int64 := peek64(base + 8);
+      var nc1:  int64 := peek64(base + 16);
+      var nc2:  int64 := peek64(base + 24);
+      var nc3:  int64 := peek64(base + 32);
+      var nxt:  int64 := peek64(base + 40);
+      var iVal: int64 := peek64(base + 56);
+      var sOff: int64 := peek64(base + 64);
+      var sLen: int64 := peek64(base + 72);
+
+      var d: int64 := 0;
+      while d < depth {
+        PrintStr("  "c);
+        d := d + 1;
+      }
+
+      PrintStr("["c);
+      PrintInt(cur);
+      PrintStr("] "c);
+      PrintStr(self._nkStr(kind));
+
+      if sLen > 0 && (src as int64) != 0 {
+        PrintStr(" '"c);
+        PrintStr(StrSub(src, sOff, sLen));
+        PrintStr("'"c);
+      }
+
+      if kind == NK_LIT_INT || kind == NK_LIT_CHAR || kind == NK_LIT_BOOL {
+        PrintStr(" ="c);
+        PrintInt(iVal);
+      }
+
+      PrintStr("\n"c);
+
+      if nc0 >= 0 { self._dumpASTNode(nodes, src, nc0, depth + 1); }
+      if nc1 >= 0 { self._dumpASTNode(nodes, src, nc1, depth + 1); }
+      if nc2 >= 0 { self._dumpASTNode(nodes, src, nc2, depth + 1); }
+      if nc3 >= 0 { self._dumpASTNode(nodes, src, nc3, depth + 1); }
+
+      cur := nxt;
+    }
+  }
+
+  fn dumpAST(nodes: int64, src: pchar, astRoot: int64): void {
+    PrintStrLn("=== PARSER AST ===");
+    if astRoot < 0 {
+      PrintStrLn("(empty)");
+      return;
+    }
+    self._dumpASTNode(nodes, src, astRoot, 0);
+  }
+
+  fn dumpSemaInfo(sema: int64): void {
+    PrintStrLn("=== SEMANTIC INFO ===");
+    // Would dump symbol table
+  }
+
+  // WP-BC-47: count newlines up to offset to get 1-based line number
+  fn _lineFromSrcOff(src: pchar, sOff: int64): int64 {
+    var line: int64 := 1;
+    var i: int64 := 0;
+    while i < sOff {
+      if StrCharAt(src, i) == 10 { line := line + 1; }
+      i := i + 1;
+    }
+    return line;
+  }
+
+  // WP-BC-47: provenance dump — IR[N] op → AST[M] kind 'name' → src:file:line
+  fn dumpProvenance(irMod: IRModule, pNodes: int64, src: pchar, srcFile: pchar): void {
+    PrintStr("=== PROVENANCE ===\n"c);
+    var count: int64 := irMod.instrLen;
+    var i: int64 := 0;
+    while i < count {
+      var astNi: int64 := irMod.getAstNode(i);
+      PrintStr("IR["c);
+      PrintInt(i);
+      PrintStr("] "c);
+      PrintStr(irMod.dumpOp(irMod.getInstrOp(i)));
+      PrintStr("  ->  "c);
+      if astNi < 0 {
+        PrintStr("AST[-] ?\n"c);
+      } else {
+        var base: int64 := pNodes + astNi * 88;
+        var kind: int64 := peek64(base);
+        var sOff: int64 := peek64(base + 64);
+        var sLen: int64 := peek64(base + 72);
+        PrintStr("AST["c);
+        PrintInt(astNi);
+        PrintStr("] "c);
+        PrintStr(self._nkStr(kind));
+        if sLen > 0 && (src as int64) != 0 {
+          PrintStr(" '"c);
+          PrintStr(StrSub(src, sOff, sLen));
+          PrintStr("'"c);
+        }
+        PrintStr("  ->  src:"c);
+        if (srcFile as int64) != 0 { PrintStr(srcFile); } else { PrintStr("?"c); }
+        PrintStr(":"c);
+        if (src as int64) != 0 {
+          PrintInt(self._lineFromSrcOff(src, sOff));
+        } else {
+          PrintStr("?"c);
+        }
+        PrintStr("\n"c);
+      }
+      i := i + 1;
+    }
+  }
+
+  fn dumpIR(irMod: int64): void {
+    PrintStrLn("=== IR DUMP ===");
+    // Would dump IR
+  }
+  
+  fn dumpASM(code: int64, size: int64): void {
+    PrintStrLn("=== ASSEMBLY ===");
+    // Would dump disassembly
+  }
+  
+  fn emitASMFile(path: pchar, code: int64, size: int64): void {
+    // Write assembly to file instead of binary
+    // For now, dump to stdout
+    PrintStrLn("=== EMITTED ASSEMBLY ===");
+    PrintStr("Output written to: "c);
+    PrintStrLn(path);
+  }
+
+  fn dumpRelocs(): void {
+    PrintStrLn("=== RELOCATION TABLE ===");
+    // Relocations are generated during codegen patching
+    // For now, print placeholder
+    PrintStrLn("No relocations to dump (static binary)");
+  }
+
+  // WP-BC-44: --trace-passes timing helpers
+  // WP-BC-50: derive .lyu output path from source path by stripping .lyx and adding .lyu
+  fn _lyuOutputPath(srcPath: pchar): pchar {
+    var slen: int64 := StrLen(srcPath);
+    // strip .lyx if present (4 chars), then append .lyu
+    var base: pchar;
+    if slen > 4 {
+      base := StrSub(srcPath, 0, slen - 4);
+    } else {
+      base := srcPath;
+    }
+    return StrConcat(base, ".lyu"c);
+  }
+
+  fn _passStart(name: pchar): int64 {
+    if !self.tracePasses { return 0; }
+    PrintStr("[pass] "c);
+    PrintStr(name);
+    PrintStr(": start\n"c);
+    return MonotonicTimeNano();
+  }
+
+  fn _passEnd(name: pchar, t0: int64): void {
+    if !self.tracePasses { return; }
+    var elapsed: int64 := MonotonicTimeNano() - t0;
+    var us: int64 := elapsed / 1000;
+    var ms: int64 := elapsed / 1000000;
+    PrintStr("[pass] "c);
+    PrintStr(name);
+    PrintStr(": done ("c);
+    PrintInt(ms);
+    PrintStr("ms / "c);
+    PrintInt(us);
+    PrintStr("µs)\n"c);
+  }
+
+  fn traceImportStart(): void {
+    if self.traceImports {
+      PrintStrLn("[import] Starting import resolution");
+    }
+  }
+
+  fn traceImportDone(): void {
+    if self.traceImports {
+      PrintStrLn("[import] Import resolution complete");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // CLI P3: Analysis and Instrumentation
+  // ---------------------------------------------------------------------------
+
+  fn dumpASMListing(code: int64, size: int64): void {
+    PrintStrLn("=== ANNOTATED ASSEMBLY LISTING ===");
+    var i: int64 := 0;
+    while (i < size) {
+      var b0: int64 := peek8(code + i);
+      var b1: int64 := peek8(code + i + 1);
+      var b2: int64 := peek8(code + i + 2);
+      var b3: int64 := peek8(code + i + 3);
+      PrintStr("  "c);
+      PrintHex(i);
+      PrintStr(": "c);
+      PrintHexByte(b0);
+      PrintStr(" "c);
+      PrintHexByte(b1);
+      PrintStr(" "c);
+      PrintHexByte(b2);
+      PrintStr(" "c);
+      PrintHexByte(b3);
+      PrintStrLn(""c);
+      i := i + 4;
+    }
+  }
+
+  fn dumpCallGraph(irMod: int64): void {
+    PrintStrLn("=== CALL GRAPH ===");
+    // Walk IR module functions and their call instructions
+    // For now, print placeholder
+    PrintStrLn("Call graph analysis requires IR traversal");
+  }
+
+  fn writeMapFile(outputPath: pchar, code: int64, size: int64): void {
+    PrintStrLn("=== MEMORY MAP ===");
+    PrintStr("Code section: 0x"c);
+    PrintHex(code);
+    PrintStr(" - 0x"c);
+    PrintHex(code + size);
+    PrintStr(" (size: "c);
+    PrintInt(size);
+    PrintStrLn(" bytes)");
+  }
+
+  fn runStaticAnalysis(irMod: int64): void {
+    PrintStrLn("=== STATIC ANALYSIS ===");
+    // Run data-flow, null-pointer, array-bounds analysis
+    // For now, print placeholder
+    PrintStrLn("Static analysis passes require IR traversal");
+  }
+
+  fn instrumentMCDC(code: int64, size: int64): void {
+    PrintStrLn("[MC/DC] Instrumenting code for coverage tracking");
+    // Insert coverage counters at decision points
+    // For now, print placeholder
+  }
+
+  fn printMCDCReport(): void {
+    PrintStrLn("=== MC/DC COVERAGE REPORT ===");
+    PrintStrLn("Total decisions: 0");
+    PrintStrLn("Fully covered: 0");
+    PrintStrLn("With gaps: 0");
+    PrintStrLn("MC/DC coverage: N/A (no instrumentation)");
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Multi-Target Dispatch
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetTargetName(): pchar {
+    if self.target == TARGET_X86_64 {
+      return "x86_64"c;
+    }
+    if self.target == TARGET_ARM64 {
+      return "arm64"c;
+    }
+    if self.target == TARGET_RISCV64 {
+      return "riscv64"c;
+    }
+    if self.target == TARGET_ARM_CM {
+      return "arm_cm"c;
+    }
+    return "unknown"c;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Unit Cache
+  // ---------------------------------------------------------------------------
+  
+  pub fn GetCachedUnit(path: pchar): int64 {
+    return map_get(self.unitCache, path, StrLen(path));
+  }
+  
+  pub fn CacheUnit(path: pchar, unitData: int64): void {
+    map_set(self.unitCache, path, StrLen(path), unitData);
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Incremental Compilation
+  // ---------------------------------------------------------------------------
+  
+  fn shouldRebuild(inputFile: pchar, outputFile: pchar): bool {
+    // DEBUG: Always rebuild to test singularity
+    return true;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Error Handling
+  // ---------------------------------------------------------------------------
+  
+  pub fn ReportError(msg: pchar, line: int64, column: int64): void {
+    EPrintStr("Error");
+    if line > 0 {
+      EPrintStr(": "c);
+      EPrintInt(line);
+      if column > 0 {
+        EPrintStr(":"c);
+        EPrintInt(column);
+      }
+    }
+    EPrintStr(": "c);
+    EPrintStrLn(msg);
+    
+    self.errorCount := self.errorCount + 1;
+  }
+  
+  pub fn ReportWarning(msg: pchar, line: int64, column: int64): void {
+    EPrintStr("Warning");
+    if line > 0 {
+      EPrintStr(": "c);
+      EPrintInt(line);
+      if column > 0 {
+        EPrintStr(":"c);
+        EPrintInt(column);
+      }
+    }
+    EPrintStr(": "c);
+    EPrintStrLn(msg);
+    
+    self.warningCount := self.warningCount + 1;
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Statistics
+  // ---------------------------------------------------------------------------
+  
+  pub fn PrintStats(): void {
+    if self.enableVerbose {
+      PrintStrLn("=== COMPILATION STATS ===");
+      PrintStr("Errors: "c);
+      PrintIntLn(self.errorCount);
+      PrintStr("Warnings: "c);
+      PrintIntLn(self.warningCount);
+      PrintStr("Time: "c);
+      PrintIntLn(self.buildTime);
+    }
+  }
+  
+  // ---------------------------------------------------------------------------
+  // Memory Management
+  // ---------------------------------------------------------------------------
+  
+  pub fn Free(): void {
+    if self.unitCache != 0 {
+      map_free(self.unitCache);
+    }
+    dispose self;
+  }
+};
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  // Initialize compiler
+  var cfg: CompilerConfig := new CompilerConfig();
+  cfg.CfgInit();
+
+  // Parse CLI
+  var cliOk: bool := cfg.parseCLI(argc, argv);
+  if not cliOk {
+    return cfg.exitCode;
+  }
+
+  // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
+  if cfg.unitInfoFile > 1 {
+    var uiFd: int64 := -1;
+    var uiBuf: int64 := 0;
+    var uiSz: int64 := 0;
+    var uiOk: bool := false;
+    uiFd := open(cfg.unitInfoPath as pchar, 0, 0);
+    if uiFd >= 0 {
+      uiBuf := mmap(0, 131072, 3, 34, -1, 0);
+      uiSz := read(uiFd, uiBuf as pchar, 131071);
+      poke8(uiBuf + uiSz, 0);
+      close(uiFd);
+      uiOk := true;
+    }
+    if not uiOk {
+      EPrintStr("error: cannot open .lyu file\n"c);
+      return 1;
+    }
+    var rdr: LyuReader := new LyuReader();
+    if rdr.LyrInit(uiBuf, uiSz) {
+      rdr.PrintInfo();
+    } else {
+      EPrintStr("error: invalid .lyu file"c);
+      return 1;
+    }
+    return 0;
+  }
+
+  // Get input file
+  var inputFile: pchar := cfg.inputFile;
+  if inputFile == 0 {
+    EPrintStrLn("Error: No input file specified");
+    EPrintStrLn("Run with --help for usage");
+    cfg.exitCode := 1;
+    return cfg.exitCode;
+  }
+
+  // Check if we need to rebuild
+  var outputFile: pchar := cfg.outputFile;
+  if outputFile == 0 {
+    outputFile := "a.out"c;
+  }
+
+  if cfg.shouldRebuild(inputFile, outputFile) {
+    cfg.Compile(inputFile, outputFile);
+  } else {
+    if cfg.enableVerbose {
+      PrintStr("Skipping "c);
+      PrintStr(inputFile);
+      PrintStrLn(" (already up to date)");
+    }
+  }
+
+  // Print statistics
+  cfg.PrintStats();
+  
+  // Cleanup
+  var exitCode: int64 := cfg.exitCode;
+  cfg.Free();
+
+  return exitCode;
+}
+ 

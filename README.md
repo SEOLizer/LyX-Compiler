@@ -90,9 +90,9 @@ On **March 30, 2026**, Lyx reached **Singularity** — the Lyx compiler fully co
 A compiler is *self-hosted* when it can translate its own source code and produce a binary-identical result. This is proven through a multi-stage bootstrap chain:
 
 ```
-Stage 1  lyxc (FPC-compiled)  →  compiles bootstrap/*.lyx  →  Stage 2
-Stage 2  (Lyx-compiled)        →  compiles bootstrap/*.lyx  →  Stage 3
-Stage 3  (Lyx-compiled)        →  compiles bootstrap/*.lyx  →  Stage 4
+Stage 1  lyxc (FPC-compiled)  →  compiles src/*.lyx  →  Stage 2
+Stage 2  (Lyx-compiled)        →  compiles src/*.lyx  →  Stage 3
+Stage 3  (Lyx-compiled)        →  compiles src/*.lyx  →  Stage 4
 ```
 
 Once **MD5(Stage 3) = MD5(Stage 4)**, the compiler has reached a stable fixed point: it reproduces itself bit for bit. That is Singularity.
@@ -108,7 +108,7 @@ MD5  9100b4d4b170c38474ee7a5594023790
 This hash applies to Stage 3, Stage 4, and all subsequent stages — the compiler is stably self-hosting.
 
 Details on the bootstrap roadmap: [`selfhosted.md`](selfhosted.md)
-Implementation: [`bootstrap/`](bootstrap/)
+Implementation: [`src/`](src/)
 
 ---
 
@@ -133,7 +133,7 @@ lyx-lang/                        # Repo-Root
 │   ├── ir/                      # IR-Definitionen, Lowering, Optimierung
 │   └── util/                    # Hilfsfunktionen (bytes, diag)
 │
-├── bootstrap/                   # Lyx-in-Lyx (WP-05..WP-09, in Arbeit)
+├── src/                   # Lyx-in-Lyx (WP-05..WP-09, in Arbeit)
 │   ├── lexer.lyx                # Tokenizer in Lyx
 │   ├── parser.lyx               # Parser in Lyx
 │   ├── codegen.lyx              # Code-Generator in Lyx
