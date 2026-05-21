@@ -270,12 +270,13 @@ pub type Sema = class {
   // Symbol table helpers
   // ------------------------------------------------------------------
 
-  fn _soff(i: int64): int64      { return self.syms + i * SEMA_SYM_SIZE; }
-  fn SymName(i: int64): pchar    { return peek64(self._soff(i)) as pchar; }
-  fn SymNameLen(i: int64): int64 { return peek64(self._soff(i) + 8); }
-  fn SymKind(i: int64): int64    { return peek64(self._soff(i) + 16); }
-  fn SymTypeId(i: int64): int64  { return peek64(self._soff(i) + 24); }
-  fn SymNodeIdx(i: int64): int64 { return peek64(self._soff(i) + 32); }
+  fn _soff(i: int64): int64          { return self.syms + i * SEMA_SYM_SIZE; }
+  pub fn SymName(i: int64): pchar    { return peek64(self._soff(i)) as pchar; }
+  pub fn SymNameLen(i: int64): int64 { return peek64(self._soff(i) + 8); }
+  pub fn SymKind(i: int64): int64    { return peek64(self._soff(i) + 16); }
+  pub fn SymTypeId(i: int64): int64  { return peek64(self._soff(i) + 24); }
+  pub fn SymNodeIdx(i: int64): int64 { return peek64(self._soff(i) + 32); }
+  pub fn SymCount(): int64           { return self.symCount; }
 
   fn _growSyms() {
     var newCap: int64 := self.symCap * 2;
@@ -490,6 +491,70 @@ pub type Sema = class {
     return buf as pchar;
   }
 
+  // WP-BC-50b: inline .lyu binary parser — injects symbols without parsing source
+  fn _sema_parseLyuSyms(data: pchar, size: int64) {
+    if (size < 10) { return; }
+    // Validate magic 'LYU'
+    if ((StrCharAt(data, 0) & 255) != 76) { return; }
+    if ((StrCharAt(data, 1) & 255) != 89) { return; }
+    if ((StrCharAt(data, 2) & 255) != 85) { return; }
+    var pos: int64 := 4;  // skip magic (4 bytes)
+    var version: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+    pos := pos + 2;  // version
+    pos := pos + 1;  // arch
+    pos := pos + 1;  // flags
+    // unit name
+    var ulen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+    pos := pos + 2 + ulen;
+    // v2 metadata: description, author, copyright
+    if (version >= 2) {
+      var dl: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      pos := pos + 2 + dl;
+      var al: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      pos := pos + 2 + al;
+      var cl: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      pos := pos + 2 + cl;
+    }
+    var symCount: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8) | ((StrCharAt(data, pos+2) & 255) << 16) | ((StrCharAt(data, pos+3) & 255) << 24);
+    pos := pos + 4;
+    pos := pos + 16;  // skip 4 × u32 offset placeholders
+    // Inject each exported symbol into the current sema scope
+    var si: int64 := 0;
+    while (si < symCount && pos < size) {
+      var nameLen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      pos := pos + 2;
+      var namePtr: pchar := (data as int64 + pos) as pchar;
+      pos := pos + nameLen;
+      var lsk: int64 := StrCharAt(data, pos) & 255;
+      pos := pos + 1;
+      pos := pos + 4;  // skip typeHash (u32)
+      var tiLen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      pos := pos + 2;
+      var tiPtr: pchar := (data as int64 + pos) as pchar;
+      pos := pos + tiLen;
+      // Map LSK kind → SYM kind
+      var symKind: int64 := SYM_VAR;
+      if (lsk == 0 || lsk == 7) { symKind := SYM_FUNC; }   // fn / extern fn
+      if (lsk == 3)             { symKind := SYM_CON; }    // con
+      if (lsk == 4 || lsk == 5) { symKind := SYM_STRUCT; } // struct / class
+      if (lsk == 6)             { symKind := SYM_ENUM; }   // enum
+      if (lsk == 8 || lsk == 9) { symKind := SYM_TYPE; }   // dim / utype
+      // Map typeInfo string → TY_xxx by prefix matching on known names
+      var typeId: int64 := TY_UNKNOWN;
+      if (tiLen >= 4 && (StrCharAt(tiPtr, 0) & 255) == 118) { typeId := TY_VOID; }    // "void"
+      if (tiLen == 4 && (StrCharAt(tiPtr, 0) & 255) == 98)  { typeId := TY_BOOL; }    // "bool"
+      if (tiLen == 5 && (StrCharAt(tiPtr, 0) & 255) == 105 && (StrCharAt(tiPtr, 1) & 255) == 110 && (StrCharAt(tiPtr, 4) & 255) == 52) { typeId := TY_INT32; }  // "int32"
+      if (tiLen == 5 && (StrCharAt(tiPtr, 0) & 255) == 105 && (StrCharAt(tiPtr, 4) & 255) == 56) { typeId := TY_INT8; }   // "int8x" → too broad, check exactly
+      if (tiLen == 5 && (StrCharAt(tiPtr, 1) & 255) == 110 && (StrCharAt(tiPtr, 2) & 255) == 116 && (StrCharAt(tiPtr, 3) & 255) == 54 && (StrCharAt(tiPtr, 4) & 255) == 52) { typeId := TY_INT64; }  // "int64"
+      if (tiLen == 5 && (StrCharAt(tiPtr, 0) & 255) == 112) { typeId := TY_PCHAR; }  // "pchar"
+      if (tiLen == 7 && (StrCharAt(tiPtr, 0) & 255) == 102 && (StrCharAt(tiPtr, 1) & 255) == 108 && (StrCharAt(tiPtr, 5) & 255) == 54) { typeId := TY_FLOAT64; }  // "float64"
+      if (tiLen == 4 && (StrCharAt(tiPtr, 0) & 255) == 99)  { typeId := TY_CHAR; }   // "char"
+      if (typeId == TY_UNKNOWN) { typeId := TY_USER; }
+      self._pushSym(namePtr, nameLen, symKind, typeId, -2);
+      si := si + 1;
+    }
+  }
+
   fn _sema_processImport(modName: pchar, modLen: int64) {
     if (self._sema_hasImported(modName, modLen) != 0) { return; }
     self._sema_markImported(modName, modLen);
@@ -511,7 +576,17 @@ pub type Sema = class {
 
     var path: pchar := pathBuf as pchar;
     var src: pchar  := self._sema_readFile(path);
-    if (src == 0 as pchar) { return; }
+    if (src == 0 as pchar) {
+      // WP-BC-50b: .lyx not found — try .lyu fallback (pre-compiled unit)
+      poke8(pathBuf + modLen + 3, 117);  // 'u' → ".lyu"
+      var lyuPath: pchar := pathBuf as pchar;
+      var lyuSrc: pchar := self._sema_readFile(lyuPath);
+      if (lyuSrc != 0 as pchar) {
+        var lyuSize: int64 := StrLen(lyuSrc);
+        self._sema_parseLyuSyms(lyuSrc, lyuSize);
+      }
+      return;
+    }
 
     var p: Parser := new Parser();
     p.Init(src, StrLen(src));
