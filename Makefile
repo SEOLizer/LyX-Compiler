@@ -48,7 +48,7 @@ singularity:
 
 test: lyxc
 	@echo "=== Integrationstest ==="
-	./lyxc examples/hello.lyx -o /tmp/lyxc_hello_test
+	./lyxc examples/basics/hello.lyx -o /tmp/lyxc_hello_test
 	@/tmp/lyxc_hello_test
 	@rm -f /tmp/lyxc_hello_test
 	@echo "OK"
