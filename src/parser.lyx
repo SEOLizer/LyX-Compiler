@@ -423,6 +423,31 @@ pub type Parser = class {
       }
       return n;
     }
+    // WP-BC-56: Map<K,V> and Set<T> type syntax
+    if (self.Check(TK_MAP) != 0) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_TYPE_NAME, ti);
+      self._ssv(n, self._tokOff(ti), self._tokLen(ti));  // store "Map"
+      if (self.Match(TK_LT) != 0) {
+        var kt: int64 := self.ParseType();
+        self.Match(TK_COMMA);
+        var vt: int64 := self.ParseType();
+        self.Expect(TK_GT);
+        self._sc0(n, kt);
+        self._sc1(n, vt);
+      }
+      return n;
+    }
+    if (self.Check(TK_SET) != 0) {
+      self.Advance();
+      var n: int64 := self._alloc(NK_TYPE_NAME, ti);
+      self._ssv(n, self._tokOff(ti), self._tokLen(ti));  // store "Set"
+      if (self.Match(TK_LT) != 0) {
+        self._sc0(n, self.ParseType());
+        self.Expect(TK_GT);
+      }
+      return n;
+    }
     // WP-BC-17: RingBuffer<T> type syntax
     if (self.Check(TK_RINGBUF) != 0) {
       self.Advance();
@@ -433,14 +458,29 @@ pub type Parser = class {
       }
       return n;
     }
-    // WP-BC-18: parallel Array<T> type syntax
+    // WP-BC-18: parallel Array<T> type syntax (accepts both "array" keyword and "Array" ident)
     if (self.Check(TK_PARALLEL) != 0) {
       self.Advance();
       var n: int64 := self._alloc(NK_TYPE_PARALLEL, ti);
-      if (self.Match(TK_ARRAY) != 0) {
+      // consume lowercase "array" keyword or uppercase "Array" identifier
+      var gotArray: int64 := self.Match(TK_ARRAY);
+      if (gotArray == 0 && self.Check(TK_IDENT) != 0) {
+        var p: pchar := self.src + self._tokOff(self.cur);
+        var l: int64 := self._tokLen(self.cur);
+        if (l == 5 && StrCharAt(p,0)==65 && StrCharAt(p,1)==114 && StrCharAt(p,2)==114 && StrCharAt(p,3)==97 && StrCharAt(p,4)==121) {
+          self.Advance();  // "Array"
+          gotArray := 1;
+        }
+      }
+      if (gotArray != 0) {
         if (self.Match(TK_LT) != 0) {
           self._sc0(n, self.ParseType());
           self.Expect(TK_GT);
+        }
+        // optionally consume "(size)" in type position: parallel Array<T>(N)
+        if (self.Match(TK_LPAREN) != 0) {
+          self._sc1(n, self.ParseExpr());
+          self.Expect(TK_RPAREN);
         }
       }
       return n;
@@ -813,11 +853,19 @@ pub type Parser = class {
     if (k == 57) {  // TK_PARALLEL=57: parallel Array<T>(size)
       self.Advance();
       var n: int64 := self._alloc(NK_SIMD_NEW, ti);
-      if (self.Match(TK_ARRAY) != 0) {
-        if (self.Match(TK_LT) != 0) {
-          self._sc0(n, self.ParseType());
-          self.Expect(TK_GT);
+      // accept both "array" keyword and "Array" identifier
+      var gotArr: int64 := self.Match(TK_ARRAY);
+      if (gotArr == 0 && self.Check(TK_IDENT) != 0) {
+        var ap: pchar := self.src + self._tokOff(self.cur);
+        var al: int64 := self._tokLen(self.cur);
+        if (al == 5 && StrCharAt(ap,0)==65 && StrCharAt(ap,1)==114 && StrCharAt(ap,2)==114 && StrCharAt(ap,3)==97 && StrCharAt(ap,4)==121) {
+          self.Advance();
+          gotArr := 1;
         }
+      }
+      if (gotArr != 0 && self.Match(TK_LT) != 0) {
+        self._sc0(n, self.ParseType());
+        self.Expect(TK_GT);
       }
       self.Expect(TK_LPAREN);
       self._sc1(n, self.ParseExpr());
@@ -1003,6 +1051,7 @@ pub type Parser = class {
     if (k == TK_VAR)    { return self.ParseVarDecl(0); }
     if (k == TK_LET)    { return self.ParseLetDecl(0); }
     if (k == TK_CON)    { return self.ParseConDecl(0); }
+    if (k == TK_STATIC) { return self.ParseStaticDecl(0); }  // WP-BC-60
     if (k == TK_RETURN) {
       self.Advance();
       var n: int64 := self._alloc(NK_RETURN, ti);
@@ -1073,11 +1122,37 @@ pub type Parser = class {
     if (k == TK_LBRACE) { return self.ParseBlock(); }
 
     var expr: int64 := self.ParseExpr();
-    if (self.Match(TK_ASSIGN) != 0) {
+    // WP-BC-52: := and = are both valid assignment operators in statement position
+    var isAssign: int64 := self.Match(TK_ASSIGN);
+    if (isAssign == 0) { isAssign := self.Match(TK_EQ1); }
+    if (isAssign != 0) {
       var rhs: int64 := self.ParseExpr();
       self.Match(TK_SEMI);
       var n: int64 := self._alloc(NK_ASSIGN, ti);
       self._sc0(n, expr); self._sc1(n, rhs);
+      return n;
+    }
+    // WP-BC-53: i++ and i-- desugar to i := i + 1 / i := i - 1
+    if (self.Match(TK_PLUSPLUS) != 0) {
+      self.Match(TK_SEMI);
+      var one: int64 := self._alloc(NK_LIT_INT, ti);
+      self._siv(one, 1);
+      var add: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(add, TK_PLUS);
+      self._sc0(add, expr); self._sc1(add, one);
+      var n: int64 := self._alloc(NK_ASSIGN, ti);
+      self._sc0(n, expr); self._sc1(n, add);
+      return n;
+    }
+    if (self.Match(TK_MINMIN) != 0) {
+      self.Match(TK_SEMI);
+      var one: int64 := self._alloc(NK_LIT_INT, ti);
+      self._siv(one, 1);
+      var sub: int64 := self._alloc(NK_BINOP, ti);
+      self._siv(sub, TK_MINUS);
+      self._sc0(sub, expr); self._sc1(sub, one);
+      var n: int64 := self._alloc(NK_ASSIGN, ti);
+      self._sc0(n, expr); self._sc1(n, sub);
       return n;
     }
     self.Match(TK_SEMI);
@@ -1392,6 +1467,22 @@ pub type Parser = class {
     if (self.Check(TK_COMMA) != 0) {
       return self._parseTupleVarDecl(nameTok, ti);
     }
+    var n: int64 := self._alloc(NK_VAR_DECL, ti);
+    self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+    self._spub(n, isPub);
+    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
+    self.Match(TK_SEMI);
+    return n;
+  }
+
+  // WP-BC-60: static x: T = expr — treated as a global/local variable (same AST as var)
+  fn ParseStaticDecl(isPub: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();  // consume 'static'
+    var nameTok: int64 := self.cur;
+    self.Expect(TK_IDENT);
     var n: int64 := self._alloc(NK_VAR_DECL, ti);
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
@@ -1957,6 +2048,20 @@ pub type Parser = class {
       var isPub: int64 := 0;
       if (self.Match(TK_PUB) != 0) { isPub := 1; }
 
+      // WP-BC-54: skip @attribute(...) before declarations
+      while (self.Check(TK_AT) != 0) {
+        self.Advance();  // consume @
+        if (self.Check(TK_IDENT) != 0) { self.Advance(); }  // consume name
+        if (self.Match(TK_LPAREN) != 0) {
+          var depth: int64 := 1;
+          while (depth > 0 && self.Peek() != TK_EOF) {
+            if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+            else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+            self.Advance();
+          }
+        }
+      }
+
       var k: int64 := self.Peek();
       var decl: int64 := -1;
 
@@ -1972,6 +2077,14 @@ pub type Parser = class {
       else if (k == TK_DIM)    { decl := self._parseDimDecl(isPub); }
       else if (k == TK_UTYPE)  { decl := self._parseUtypeDecl(isPub); }
       else if (k == TK_FORM)   { decl := self._parseLfdForm(); }
+      // WP-BC-60: static global variable declaration
+      else if (k == TK_STATIC) { decl := self.ParseStaticDecl(isPub); }
+      // WP-BC-56: skip "unit Name;" module declaration
+      else if (k == TK_UNIT) {
+        self.Advance();  // consume 'unit'
+        while (self.Peek() != TK_SEMI && self.Peek() != TK_EOF) { self.Advance(); }
+        self.Match(TK_SEMI);
+      }
       else {
         self._err("unexpected top-level token");
         self.Advance();
