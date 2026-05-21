@@ -684,6 +684,42 @@ pub type Codegen = class {
     return -1;
   }
 
+  // Returns 1 if constant exists, 0 if not (avoids -1 sentinel confusion with FD_NONE=-1)
+  fn cg_hasConVal(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.conCount) {
+      var base: int64 := self.conTable + i * 24;
+      var ename: pchar := peek64(base) as pchar;
+      var elen:  int64 := peek64(base + 8);
+      if (self.cg_seq(ename, elen, name, nlen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  fn cg_addBuiltinCons() {
+    // mmap/file descriptor constants (Linux x86-64)
+    self.cg_addCon("PROT_READ"c,    9,  1);
+    self.cg_addCon("PROT_WRITE"c,   10, 2);
+    self.cg_addCon("PROT_RW"c,      7,  3);
+    self.cg_addCon("PROT_NONE"c,    9,  0);
+    self.cg_addCon("MAP_SHARED"c,   10, 1);
+    self.cg_addCon("MAP_PRIVATE"c,  11, 2);
+    self.cg_addCon("MAP_ANONYMOUS"c,12, 32);
+    self.cg_addCon("MAP_ANON"c,     8,  34);  // MAP_PRIVATE|MAP_ANONYMOUS
+    self.cg_addCon("FD_NONE"c,      7,  -1);
+    // O_* flags (file open modes)
+    self.cg_addCon("O_RDONLY"c,  7, 0);
+    self.cg_addCon("O_WRONLY"c,  7, 1);
+    self.cg_addCon("O_RDWR"c,    6, 2);
+    self.cg_addCon("O_CREAT"c,   7, 64);
+    self.cg_addCon("O_TRUNC"c,   7, 512);
+    self.cg_addCon("O_APPEND"c,  8, 1024);
+    // Boolean
+    self.cg_addCon("true"c,  4, 1);
+    self.cg_addCon("false"c, 5, 0);
+  }
+
   // ------------------------------------------------------------------
   // WP-10g: Constant Folding + Peephole CSE helpers
   // ------------------------------------------------------------------
@@ -2207,26 +2243,20 @@ pub type Codegen = class {
             var goff1: int64 := self.cg_findGlobal(name, nlen);
             if (goff1 >= 0) {
               self.cg_loadRaxGlobal(goff1);
+            } else if (self.cg_hasConVal(name, nlen) != 0) {
+              self.cg_movRaxImm(self.cg_findConVal(name, nlen));
             } else {
-              var conVal: int64 := self.cg_findConVal(name, nlen);
-              if (conVal != -1) {
-                self.cg_movRaxImm(conVal);
-              } else {
-                self.cg_zeroRax();
-              }
+              self.cg_zeroRax();
             }
           }
         } else {
           var goff2: int64 := self.cg_findGlobal(name, nlen);
           if (goff2 >= 0) {
             self.cg_loadRaxGlobal(goff2);
+          } else if (self.cg_hasConVal(name, nlen) != 0) {
+            self.cg_movRaxImm(self.cg_findConVal(name, nlen));
           } else {
-            var conVal: int64 := self.cg_findConVal(name, nlen);
-            if (conVal != -1) {
-              self.cg_movRaxImm(conVal);
-            } else {
-              self.cg_zeroRax();
-            }
+            self.cg_zeroRax();
           }
         }
       }
@@ -2265,7 +2295,22 @@ pub type Codegen = class {
     } else if (k == CGN_UNOP) {
       var op: int64 := self.cg_nival(ni);
       // WP-10g: fold constant unary expressions
-      if (self.cg_tryFold(ni) != 0) {
+      if (op == 111) {
+        // @ident — address-of: lea rax, [rbp+off]
+        var inner0: int64 := self.cg_nc0(ni);
+        if (inner0 >= 0 && self.cg_nkind(inner0) == CGN_IDENT) {
+          var iname0: pchar := self.cg_nsval(inner0);
+          var ilen0:  int64 := self.cg_nslen(inner0);
+          var ioff0:  int64 := self.cg_findLocal(iname0, ilen0);
+          if (ioff0 != 0) {
+            if (ioff0 >= -128 && ioff0 <= -1) {
+              self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x45); self.cg_e8(ioff0);
+            } else {
+              self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(ioff0);
+            }
+          } else { self.cg_zeroRax(); }
+        } else { self.cg_zeroRax(); }
+      } else if (self.cg_tryFold(ni) != 0) {
         self.cg_movRaxImm(self.foldBuf);
       } else {
       self.cg_genExpr(self.cg_nc0(ni));
@@ -2360,8 +2405,14 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD9);
       } else {
         // plain int64 pointer: direct 8-byte stride, no header
-        // mov rax, [rax+rbx*8]
+        // Guard null: test rax,rax; jnz .ok; xor rax,rax; jmp .done; .ok: mov rax,[rax+rbx*8]; .done:
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+        self.cg_e8(0x75); self.cg_e8(7);                        // jnz +7 (to ok)
+        self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor rax, rax
+        self.cg_e8(0xEB); self.cg_e8(4);                        // jmp +4 (to done)
+        // ok: mov rax, [rax+rbx*8]
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD8);
+        // done:
       }
 
     } else if (k == CGN_LIT_FLOAT) {
@@ -2548,6 +2599,23 @@ pub type Codegen = class {
           return;
         } else if (self.cg_seq(fname, fnlen, popStr, 3)) {
           self.cg_genArrayPop(arrObj);
+          return;
+        }
+      }
+    }
+    // Intercept push(arr, val) / pop(arr) free-function forms before arg evaluation
+    if (isMethod == 0) {
+      if (self.cg_seq(fname, fnlen, "push", 4)) {
+        var pushArr: int64 := argNode;
+        var pushVal: int64 := self.cg_nnext(argNode);
+        if (pushArr >= 0 && pushVal >= 0) {
+          self.cg_genArrayPush(pushArr, pushVal);
+          return;
+        }
+      }
+      if (self.cg_seq(fname, fnlen, "pop", 3)) {
+        if (argNode >= 0) {
+          self.cg_genArrayPop(argNode);
           return;
         }
       }
@@ -2808,20 +2876,24 @@ pub type Codegen = class {
       self.cg_movRaxImm(2);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
-    } else if (self.cg_seq(fname, fnlen, "read", 4)) {
-      // read(fd, buf, count): int64 -- sys_read = 0
+    } else if (self.cg_seq(fname, fnlen, "read", 4) ||
+               self.cg_seq(fname, fnlen, "sys_read", 8)) {
+      // read/sys_read(fd, buf, count): int64 -- sys_read = 0
       // rdi=fd, rsi=buf, rdx=count
       self.cg_movRaxImm(0);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
-    } else if (self.cg_seq(fname, fnlen, "write", 5)) {
-      // write(fd, buf, count): int64 -- sys_write = 1
+    } else if (self.cg_seq(fname, fnlen, "write", 5) ||
+               self.cg_seq(fname, fnlen, "write_raw", 9) ||
+               self.cg_seq(fname, fnlen, "sys_write", 9)) {
+      // write/write_raw/sys_write(fd, buf, count): int64 -- sys_write = 1
       // rdi=fd, rsi=buf, rdx=count
       self.cg_movRaxImm(1);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
-    } else if (self.cg_seq(fname, fnlen, "close", 5)) {
-      // close(fd): int64 -- sys_close = 3
+    } else if (self.cg_seq(fname, fnlen, "close", 5) ||
+               self.cg_seq(fname, fnlen, "sys_close", 9)) {
+      // close/sys_close(fd): int64 -- sys_close = 3
       // rdi=fd
       self.cg_movRaxImm(3);
       self.cg_e8(0x0F); self.cg_e8(0x05);
@@ -2831,6 +2903,36 @@ pub type Codegen = class {
       // rdi=fd, rsi=offset, rdx=whence
       self.cg_movRaxImm(8);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_socket", 10)) {
+      // socket(domain, type, protocol): int64 -- sys_socket = 41
+      self.cg_movRaxImm(41); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_connect", 11)) {
+      // connect(sockfd, addr, addrlen): int64 -- sys_connect = 42
+      self.cg_movRaxImm(42); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_accept", 10)) {
+      // accept(sockfd, addr, addrlen): int64 -- sys_accept = 43
+      self.cg_movRaxImm(43); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_bind", 8)) {
+      // bind(sockfd, addr, addrlen): int64 -- sys_bind = 49
+      self.cg_movRaxImm(49); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_listen", 10)) {
+      // listen(sockfd, backlog): int64 -- sys_listen = 50
+      self.cg_movRaxImm(50); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_setsockopt", 14)) {
+      // setsockopt(sockfd,level,optname,optval,optlen): int64 -- sys_setsockopt = 54
+      self.cg_movRaxImm(54); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_sendto", 10) ||
+               self.cg_seq(fname, fnlen, "sys_send", 8)) {
+      // sendto/send: sys_sendto = 44
+      self.cg_movRaxImm(44); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_recvfrom", 12) ||
+               self.cg_seq(fname, fnlen, "sys_recv", 8)) {
+      // recvfrom/recv: sys_recvfrom = 45
+      self.cg_movRaxImm(45); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_shutdown", 12)) {
+      // shutdown(sockfd, how): int64 -- sys_shutdown = 48
+      self.cg_movRaxImm(48); self.cg_e8(0x0F); self.cg_e8(0x05);
 
     } else if (self.cg_seq(fname, fnlen, "clock_gettime", 13)) {
       // WP-BC-44: clock_gettime(clockid: int64, ts: int64): int64 -- sys_clock_gettime = 228
@@ -3894,6 +3996,21 @@ pub type Codegen = class {
       if (init >= 0) {
         self.cg_genExpr(init);
       } else {
+        // Fixed-size array (int64[N]): heap-allocate N*8 bytes
+        var fixedSz: int64 := peek64(self.localArraySize + localIdx * 8);
+        if (typeNode >= 0 && self.cg_nkind(typeNode) == 101 && fixedSz > 0) {
+          // mmap(0, fixedSz*8, PROT_RW, MAP_ANON, -1, 0)
+          self.cg_zeroRax();    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,0
+          self.cg_movRaxImm(fixedSz * 8); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,sz
+          self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,3
+          self.cg_movRaxImm(34);
+          self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
+          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8, r8
+          self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec r8 → r8=-1
+          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
+          self.cg_movRaxImm(9);
+          self.cg_e8(0x0F); self.cg_e8(0x05);
+        } else {
         // WP-10d: auto-allocate struct locals (NK_TYPE_NAME=60, vmtDataOff==-1)
         var sdoStruct: int64 := 0;
         if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
@@ -3917,6 +4034,7 @@ pub type Codegen = class {
           self.cg_e8(0x0F); self.cg_e8(0x05);
         } else {
           self.cg_zeroRax();
+        }
         }
       }
       self.cg_storeRax(off);
@@ -5739,6 +5857,8 @@ pub type Codegen = class {
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
+    // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
+    self.cg_addBuiltinCons();
   }
 
   fn Generate(head: int64) {
