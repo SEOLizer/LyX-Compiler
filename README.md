@@ -1,6 +1,6 @@
 # Lyx
 
-**Lyx** is a native compiler for the homonymous programming language, written in FreePascal.
+**Lyx** is a native compiler for the homonymous programming language, written in **Lyx itself** (100% self-hosted, singularity-verified).
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```

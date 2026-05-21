@@ -1,69 +1,94 @@
-# Root Makefile — delegates to compiler/Makefile
-# Build output: ./lyxc (at repo root)
+# Root Makefile — Lyx Bootstrap Compiler
+#
+# Der Lyx-Compiler ist vollständig selbstkompilierend (100% self-hosted).
+# Quelle:  bootstrap/lyxc.lyx
+# Seed:    bootstrap/lyxc_bootstrap  (singularitätsverifiziertes Binary)
 
-.PHONY: build debug test clean e2e snapshot snapshot-update package precompile-units install-bin
+SEED := bootstrap/lyxc_bootstrap
+SRC  := bootstrap/lyxc.lyx
 
-# ── Compiler ──────────────────────────────────────────────────────────────────
+UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
+DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-build:
-	$(MAKE) -C compiler build
-
-debug:
-	$(MAKE) -C compiler debug
-
-test:
-	$(MAKE) -C compiler test
-
-e2e:
-	$(MAKE) -C compiler e2e
-
-snapshot: build
-	@bash tests/run_snapshot_tests.sh
-
-snapshot-update: build
-	@bash tests/run_snapshot_tests.sh --update
-
-clean:
-	$(MAKE) -C compiler clean
-
-# ── Packaging ─────────────────────────────────────────────────────────────────
-
-VERSION   := 0.8.4-aerospace
+VERSION   := 0.9.0
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
 DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
 
-STD_LYXFILES  := $(shell find std  -name "*.lyx" | sort)
-DATA_LYXFILES := $(shell find data -name "*.lyx" | sort)
+UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
+DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-STD_LYUFILES  := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(STD_LYXFILES))
-DATA_LYUFILES := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_LYXFILES))
+.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin
+
+# ── Compiler bauen ────────────────────────────────────────────────────────────
+
+# Aus Seed-Binary kompilieren (erster Bootstrap-Schritt)
+build:
+	$(SEED) $(SRC) -o lyxc
+
+# Selbstkompilierung: lyxc kompiliert sich selbst (erfordert vorhandenes lyxc)
+bootstrap: lyxc
+	./lyxc $(SRC) -o lyxc.new
+	mv lyxc.new lyxc
+
+# Singularitätsprüfung: S3 (Seed→Quelle) == S4 (S3→Quelle)
+singularity:
+	@echo "=== Singularitätsprüfung ==="
+	$(SEED) $(SRC) -o /tmp/lyxc_s3
+	/tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4
+	@sha256sum /tmp/lyxc_s3 /tmp/lyxc_s4
+	@diff /tmp/lyxc_s3 /tmp/lyxc_s4 \
+		&& echo "SINGULAR: S3 == S4" \
+		|| (echo "NICHT SINGULAR: S3 != S4" && exit 1)
+	@rm -f /tmp/lyxc_s3 /tmp/lyxc_s4
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+test: lyxc
+	@echo "=== Integrationstest ==="
+	./lyxc examples/hello.lyx -o /tmp/lyxc_hello_test
+	@/tmp/lyxc_hello_test
+	@rm -f /tmp/lyxc_hello_test
+	@echo "OK"
+
+snapshot: lyxc
+	@bash tests/run_snapshot_tests.sh
+
+snapshot-update: lyxc
+	@bash tests/run_snapshot_tests.sh --update
+
+# ── Paketierung ───────────────────────────────────────────────────────────────
 
 package: precompile-units install-bin
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
 
-precompile-units:
-	@echo "Pass 1: Kompiliere Units (Dependencies aufbauen)..."
-	@$(MAKE) --no-print-directory -k $(STD_LYUFILES) $(DATA_LYUFILES) 2>/dev/null; true
+precompile-units: lyxc
+	@echo "Pass 1: Kompiliere Units..."
+	@$(MAKE) --no-print-directory -k $(UNITS_LYU) $(DATA_LYU) 2>/dev/null; true
 	@echo "Pass 2: Kompiliere abhängige Units..."
-	$(MAKE) --no-print-directory $(STD_LYUFILES) $(DATA_LYUFILES)
-	@echo "$(words $(STD_LYUFILES) $(DATA_LYUFILES)) Units vorkompiliert."
+	$(MAKE) --no-print-directory $(UNITS_LYU) $(DATA_LYU)
+	@echo "$(words $(UNITS_LYU) $(DATA_LYU)) Units vorkompiliert."
 
-install-bin:
-	@echo "Installiere lyxc -> $(BIN_DST)/ ..."
+install-bin: lyxc
+	@echo "Installiere lyxc -> $(BIN_DST)/"
 	cp lyxc $(BIN_DST)/lyxc
 	chmod 755 $(BIN_DST)/lyxc
 
-$(UNITS_DST)/%.lyu: std/%.lyx
+$(UNITS_DST)/%.lyu: std/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
 	./lyxc --compile-unit $< -o $@
 
-$(DATA_DST)/%.lyu: data/%.lyx
+$(DATA_DST)/%.lyu: data/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
 	./lyxc --compile-unit $< -o $@
+
+# ── Aufräumen ─────────────────────────────────────────────────────────────────
+
+clean:
+	rm -f lyxc lyxc.new
