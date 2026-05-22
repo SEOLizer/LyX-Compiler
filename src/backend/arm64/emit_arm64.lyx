@@ -95,6 +95,15 @@ pub type EmitARM64 = class {
   relocCount:      int64;
   relocCap:        int64;
 
+  // WP-AND-upstream-fix v5: separate tracking for IRO_LOAD_GLOBAL slots.
+  // Records are 16 bytes: {slotCodeOff:i64, globalIdx:i64}. writeELFSharedLib
+  // patches each slot to the global's .data address and emits the matching
+  // R_AARCH64_RELATIVE entry. Kept apart from relocBuf so global slots
+  // don't collide with non-global PIC relocations.
+  globalRelocBuf:    int64;
+  globalRelocCount:  int64;
+  globalRelocCap:    int64;
+
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
@@ -119,7 +128,15 @@ pub type EmitARM64 = class {
     self.relocCap    := 32;
     self.relocBuf    := mmap(0, self.relocCap * 24, 3, 34, -1, 0);
     self.relocCount  := 0;
+
+    // WP-AND-upstream-fix v5: global-load slot tracking (16 bytes/entry).
+    self.globalRelocCap   := 32;
+    self.globalRelocBuf   := mmap(0, self.globalRelocCap * 16, 3, 34, -1, 0);
+    self.globalRelocCount := 0;
   }
+
+  fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
+  fn getGlobalRelocCount(): int64 { return self.globalRelocCount; }
 
   fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
 
@@ -499,7 +516,34 @@ pub type EmitARM64 = class {
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
     if self.isSharedLib != 0 {
-      self._emitLoadGlobalPIC(addr, dest);
+      // WP-AND-upstream-fix v5: in shared-lib mode IRO_LOAD_GLOBAL now
+      // carries a globalIdx, not an absolute VA. Emit the literal-pool
+      // sequence with a placeholder slot value and record the slot's
+      // code-buffer offset + globalIdx into globalRelocBuf — writeELFSharedLib
+      // patches the slot to (dataOff + globalIdx*8) at link time and adds
+      // the matching R_AARCH64_RELATIVE entry.
+      var slotOff: int64 := self.codeLen + 8;
+      self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
+      self.emit32(0x14000003);         // B +12
+      self.emit64(0);                   // placeholder slot
+      self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+
+      if (self.globalRelocCount >= self.globalRelocCap) {
+        var newCap: int64 := self.globalRelocCap * 2;
+        var nb: int64 := mmap(0, newCap * 16, 3, 34, -1, 0);
+        var i: int64 := 0;
+        while i < self.globalRelocCount * 16 {
+          poke8(nb + i, peek8(self.globalRelocBuf + i));
+          i := i + 1;
+        }
+        self.globalRelocBuf := nb;
+        self.globalRelocCap := newCap;
+      }
+      var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
+      poke64(rec + 0, slotOff);
+      poke64(rec + 8, addr);   // addr field carries globalIdx in this path
+      self.globalRelocCount := self.globalRelocCount + 1;
       return;
     }
     // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR

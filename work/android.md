@@ -192,14 +192,30 @@ readelf -D --syms /tmp/libexport.so
 - [x] PT_LOAD #2 wächst automatisch um die neuen Bytes (`seg2Size = fileSize - dataOff`)
 - [x] Singularität verifiziert (S3 == S4)
 
-**Bekannte Limitierung (Upstream-Blocker):**
-`ir.lyx:730 irLoadGlobal` setzt `src1=-1` und wird im aktuellen Frontend
-**nirgends aufgerufen**. Die ARM64-Reloc-Codegenerierung ist deshalb
-strukturell korrekt, aber für reale Lyx-Programme unerreichbar. Sobald die
-IR-zu-Emit-Brücke für Globals repariert ist, emittiert die Pipeline
-automatisch korrekte `R_AARCH64_RELATIVE`-Records. Test-Verifikation in
-`readelf -r` zeigt "no relocations" für aktuelle Testfälle — erwartetes
-Verhalten, kein Bug.
+**Bekannte Limitierung (Upstream-Blocker): ✅ Geschlossen in v5**
+`ir.lyx:730 irLoadGlobal` setzte `src1=-1` und wurde nirgends aufgerufen.
+**Inzwischen vollständig behoben:** top-level `var` Decls werden in der
+`lowerModule`-Pre-Pass als Globals registriert (Name in IR-Stringtabelle,
+init-Wert in IR `globalBuffer`); `NK_IDENT` resolved Globals; emit_arm64
+emittiert die `_emitLoadGlobalPIC`-Literal-Pool-Sequenz und trackt jeden
+Slot in `globalRelocBuf`; `writeELFSharedLib` schreibt eine echte
+`.data`-Section mit Init-Werten und emittiert pro Slot eine
+`R_AARCH64_RELATIVE` Relocation, deren `r_addend` auf die `.data`-Adresse
+zeigt. **Verifiziert:**
+
+```
+var g_counter: int64 := 42;
+@export fn ReadGlobal(): int64 { return g_counter; }
+
+→ readelf -r --use-dynamic:
+  0x1014  R_AARCH64_RELATIVE  addend=0x21b0
+→ hexdump @ 0x21b0: 2a 00 00 00 00 00 00 00  (= 42)
+```
+
+Bei `dlopen` patcht der Loader den Slot auf `load_base + 0x21b0`,
+LDR `[x9]` liest dann 42. Cross-Module funktioniert auch — Names
+werden in der IR-Stringtabelle gespeichert, überleben `src`-Swaps
+während Import-Lowering.
 
 **Offen für eine spätere Session:**
 - [ ] `IRO_LOAD_GLOBAL` / `IRO_STORE_GLOBAL` upstream im ir_lower-Pfad aktivieren

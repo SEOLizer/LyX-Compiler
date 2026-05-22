@@ -165,10 +165,10 @@ pub type IRLower = class {
   localNameCnt: int64;
   localNameCap: int64;
 
-  // WP-AND-upstream-fix v4: module-scope mapping for top-level NK_VAR_DECLs.
-  // Same record layout as localNameBuf; populated once in the lowerModule
-  // pre-pass and never cleared. Used by NK_IDENT lookups as the final
-  // fallback (after locals + params).
+  // WP-AND-upstream-fix v4/v5: module-scope mapping for top-level NK_VAR_DECLs.
+  // Records are 32 bytes: {srcNameOff:i64, nameLen:i64, globalIdx:i64, initValue:i64}.
+  // Populated once in the lowerModule pre-pass and never cleared. Used by
+  // NK_IDENT lookups as the final fallback (after locals + params).
   globalNameBuf: int64;
   globalNameCnt: int64;
   globalNameCap: int64;
@@ -219,7 +219,7 @@ pub type IRLower = class {
     self.localNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
     self.localNameCnt := 0;
     self.globalNameCap := 32;
-    self.globalNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
+    self.globalNameBuf := mmap(0, 32 * 32, 3, 34, -1, 0);
     self.globalNameCnt := 0;
     self.loopExitLabel := -1;
     self.loopContLabel := -1;
@@ -616,13 +616,15 @@ pub type IRLower = class {
         // buffer. Acceptable initial limitation: cross-module globals not
         // supported yet.)
         var gnI: int64 := 0;
+        // WP-AND-upstream-fix v5/cross-module: names live in IR strBuffer.
+        var gnStrBuf: int64 := peek64(self.ir + 32);
         while gnI < self.globalNameCnt {
-          var gnRec:     int64 := self.globalNameBuf + gnI * 24;
+          var gnRec:     int64 := self.globalNameBuf + gnI * 32;
           var gnNameOff: int64 := peek64(gnRec + 0);
           var gnLen:     int64 := peek64(gnRec + 8);
           var gnIdx:     int64 := peek64(gnRec + 16);
           if gnLen == idLen {
-            var gnPtr: int64 := (self.src as int64) + gnNameOff;
+            var gnPtr: int64 := gnStrBuf + gnNameOff;
             var gnMatch: int64 := 1;
             var gnJ: int64 := 0;
             while gnJ < idLen {
@@ -1526,19 +1528,58 @@ pub type IRLower = class {
       if self.nodeKind(ggCur) == NK_VAR_DECL {
         if self.globalNameCnt >= self.globalNameCap {
           var ggNewCap: int64 := self.globalNameCap * 2;
-          var ggNb: int64 := mmap(0, ggNewCap * 24, 3, 34, -1, 0);
+          var ggNb: int64 := mmap(0, ggNewCap * 32, 3, 34, -1, 0);
           var ggI: int64 := 0;
-          while ggI < self.globalNameCnt * 24 {
+          while ggI < self.globalNameCnt * 32 {
             poke8(ggNb + ggI, peek8(self.globalNameBuf + ggI));
             ggI := ggI + 1;
           }
           self.globalNameBuf := ggNb;
           self.globalNameCap := ggNewCap;
         }
-        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 24;
-        poke64(ggRec +  0, peek64(self.nodeOff(ggCur) + 64));   // src nameOff
-        poke64(ggRec +  8, self.nodeSLen(ggCur));
-        poke64(ggRec + 16, self.globalNameCnt);                 // globalIdx
+        // Extract init value if it's a simple int literal; everything else
+        // defaults to 0 (runtime init via constructors etc. is future work).
+        var ggInit: int64 := 0;
+        var ggInitNode: int64 := self.nodeC1(ggCur);
+        if ggInitNode >= 0 {
+          if self.nodeKind(ggInitNode) == NK_LIT_INT {
+            ggInit := self.nodeIVal(ggInitNode);
+          }
+        }
+        // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
+        // string table so subsequent NK_IDENT lookups don't depend on
+        // self.src (which gets swapped while lowering imports). The stored
+        // offset is into ir.strBuffer, not into any parser's src.
+        var ggNamePtr: pchar := self.nodeSVal(ggCur);
+        var ggNameLen: int64 := self.nodeSLen(ggCur);
+        var ggStrOff:  int64 := self.irAddString(ggNamePtr, ggNameLen);
+        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+        poke64(ggRec +  0, ggStrOff);                            // IR strBuf offset
+        poke64(ggRec +  8, ggNameLen);
+        poke64(ggRec + 16, self.globalNameCnt);                  // globalIdx
+        poke64(ggRec + 24, ggInit);                              // init value
+        // Also mirror into IR module's globalBuffer (8 bytes per global, init
+        // value at globalIdx*8). writeELFSharedLib reads from here to emit
+        // the .data section. IR module layout: globalBuffer @ +104,
+        // globalCap @ +112, globalLen @ +120 (offsets follow the class field
+        // order in ir.lyx).
+        var ggBuf: int64 := peek64(self.ir + 104);
+        var ggCap: int64 := peek64(self.ir + 112);
+        if self.globalNameCnt * 8 + 8 > ggCap {
+          var ggNewCap2: int64 := ggCap * 2;
+          if ggNewCap2 < self.globalNameCnt * 8 + 8 { ggNewCap2 := self.globalNameCnt * 8 + 64; }
+          var ggNb2: int64 := mmap(0, ggNewCap2, 3, 34, -1, 0);
+          var ggI2: int64 := 0;
+          while ggI2 < self.globalNameCnt * 8 {
+            poke8(ggNb2 + ggI2, peek8(ggBuf + ggI2));
+            ggI2 := ggI2 + 1;
+          }
+          ggBuf := ggNb2;
+          poke64(self.ir + 104, ggBuf);
+          poke64(self.ir + 112, ggNewCap2);
+        }
+        poke64(ggBuf + self.globalNameCnt * 8, ggInit);
+        poke64(self.ir + 120, self.globalNameCnt + 1);   // globalLen
         self.globalNameCnt := self.globalNameCnt + 1;
       }
       ggCur := self.nodeNext(ggCur);

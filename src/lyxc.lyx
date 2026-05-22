@@ -237,6 +237,16 @@ pub type CompilerConfig = class {
   relocBuf:         int64;
   relocCount:       int64;
 
+  // WP-AND-upstream-fix v5: global-load slot tracking. globalRelocBuf records
+  // (slotCodeOff, globalIdx) pairs (16 bytes each) so writeELFSharedLib can
+  // build the .data section, patch each slot with the global's resolved
+  // address, and emit a matching R_AARCH64_RELATIVE entry per slot.
+  // irModulePtr exposes the IR module so the writer can read globalBuffer
+  // (which ir_lower populates with init values).
+  globalRelocBuf:   int64;
+  globalRelocCount: int64;
+  irModulePtr:      int64;
+
   // WP-AND-03: target Android API level (--android-api=N). Used by the .note.android.ident
   // section and reserved for future API-conditional codegen choices.
   androidApiLevel:  int64;
@@ -316,6 +326,9 @@ pub type CompilerConfig = class {
     self.codeFuncTotal    := 0;
     self.relocBuf         := 0;
     self.relocCount       := 0;
+    self.globalRelocBuf   := 0;
+    self.globalRelocCount := 0;
+    self.irModulePtr      := 0;
     self.androidApiLevel  := ANDROID_API_DEFAULT;
     self.exitCode := 0;
     self.earlyExit := false;
@@ -1490,6 +1503,10 @@ pub type CompilerConfig = class {
       // WP-AND-02 Phase C: harvest dynamic-reloc records.
       self.relocBuf   := emitter.getRelocBuf();
       self.relocCount := emitter.getRelocCount();
+      // WP-AND-upstream-fix v5: harvest global-load slot table + IR module ptr.
+      self.globalRelocBuf   := emitter.getGlobalRelocBuf();
+      self.globalRelocCount := emitter.getGlobalRelocCount();
+      self.irModulePtr      := irMod;
       // WP-AND-03: harvest prologue-length table + function count for DWARF CFI.
       self.codeFuncPrologueLen := emitter.getFuncPrologueLen();
       self.codeFuncTotal       := emitter.funcCount;
@@ -2056,7 +2073,14 @@ pub type CompilerConfig = class {
     }
 
     // ---- Dynamic relocation sizing (Phase C) ----
-    var relCount: int64 := self.relocCount;
+    // WP-AND-upstream-fix v5: also account for one R_AARCH64_RELATIVE per
+    // global-load slot before any layout depends on relaSize.
+    var globalCountEarly: int64 := 0;
+    if self.irModulePtr != 0 {
+      globalCountEarly := peek64(self.irModulePtr + 120);
+    }
+    var extraGlobalRelocs: int64 := self.globalRelocCount;
+    var relCount: int64 := self.relocCount + extraGlobalRelocs;
     var relBuf:   int64 := self.relocBuf;
     var hasRelocs: int64 := 0;
     if relCount > 0 { hasRelocs := 1; }
@@ -2120,9 +2144,23 @@ pub type CompilerConfig = class {
     var ehFrameOffRaw:  int64 := ehFrameHdrOff + ehFrameHdrSize;
     var ehFrameOff:     int64 := ((ehFrameOffRaw + 7) / 8) * 8;
     var ehFrameSize:    int64 := 24 + 28 * funcN + 4;
-    var fileSize:       int64 := ehFrameOff + ehFrameSize;
-    if hasEhFrame == 0 { fileSize := afterReloc; }
+    var afterEh:        int64 := ehFrameOff + ehFrameSize;
+    if hasEhFrame == 0 { afterEh := afterReloc; }
     if hasEhFrame != 0 { phNum := 5; }
+
+    // WP-AND-upstream-fix v5: .data section for globals (after .eh_frame).
+    // Sized to globalLen*8 (read from the IR module). The slot-patching
+    // pass below rewrites every globalRelocBuf entry to point at this
+    // region and emits the matching R_AARCH64_RELATIVE entries (those
+    // slots were already accounted for via extraGlobalRelocs above, so
+    // relaSize and the layout above are correctly sized).
+    var globalCount: int64 := globalCountEarly;
+    var hasGlobals:  int64 := 0;
+    if globalCount > 0 { hasGlobals := 1; }
+    var globalsOff:  int64 := ((afterEh + 7) / 8) * 8;
+    var globalsSize: int64 := globalCount * 8;
+    var fileSize:    int64 := globalsOff + globalsSize;
+    if hasGlobals == 0 { fileSize := afterEh; }
 
     // ---- Allocate + zero buffer ----
     var fd: int64 := open(path, 577, 493);
@@ -2333,7 +2371,8 @@ pub type CompilerConfig = class {
     // onto vaddrs starting at vaddr 0 (so the slot's vaddr == its file offset).
     if hasRelocs != 0 {
       var ri: int64 := 0;
-      while ri < relCount {
+      // Original relocs from emit_arm64.relocBuf.
+      while ri < self.relocCount {
         var src: int64 := relBuf + ri * 24;
         var rOffCode: int64 := peek64(src +  0);
         var rInfo:    int64 := peek64(src +  8);
@@ -2343,6 +2382,43 @@ pub type CompilerConfig = class {
         poke64(buf + dst +  8, rInfo);
         poke64(buf + dst + 16, rAddend);
         ri := ri + 1;
+      }
+      // WP-AND-upstream-fix v5: append per-global R_AARCH64_RELATIVE entries.
+      // Each globalRelocBuf record holds (slotCodeOff, globalIdx). The slot
+      // (a .quad inside the literal pool emitted by emitLoadGlobal) goes at
+      // r_offset = codeOff + slotCodeOff, with r_addend pointing at the
+      // global's .data home (globalsOff + globalIdx*8). We also write the
+      // initial value directly into the slot in the code buffer so the
+      // .so is self-consistent even without the runtime relocation pass.
+      if hasGlobals != 0 {
+        var gi: int64 := 0;
+        while gi < self.globalRelocCount {
+          var gsrc: int64 := self.globalRelocBuf + gi * 16;
+          var slotCodeOff: int64 := peek64(gsrc + 0);
+          var gIdx:        int64 := peek64(gsrc + 8);
+          var gAddend:     int64 := globalsOff + gIdx * 8;
+          // Bake the resolved address into the literal-pool slot.
+          poke64(buf + codeOff + slotCodeOff, gAddend);
+          // Emit the matching R_AARCH64_RELATIVE entry.
+          var gdst: int64 := relaOff + (self.relocCount + gi) * 24;
+          poke64(buf + gdst +  0, codeOff + slotCodeOff);
+          poke64(buf + gdst +  8, 1027);       // R_AARCH64_RELATIVE
+          poke64(buf + gdst + 16, gAddend);
+          gi := gi + 1;
+        }
+      }
+    }
+
+    // ---- .data (WP-AND-upstream-fix v5) ----
+    // Write each global's init value (8 bytes) at its slot in .data.
+    // Sourced from the IR module's globalBuffer, which ir_lower populated
+    // during the lowerModule pre-pass.
+    if hasGlobals != 0 {
+      var gbuf: int64 := peek64(self.irModulePtr + 104);
+      var dgi: int64 := 0;
+      while dgi < globalCount {
+        poke64(buf + globalsOff + dgi * 8, peek64(gbuf + dgi * 8));
+        dgi := dgi + 1;
       }
     }
 
