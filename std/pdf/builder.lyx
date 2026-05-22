@@ -45,6 +45,15 @@ pub con PDF_DOC_IMAGEDATABUFS:  int64 := 2296;   // int64* compressed data ptrs
 pub con PDF_DOC_IMAGEDATALENS:  int64 := 2304;   // int64* compressed data sizes
 pub con PDF_DOC_PAGEIMAGEMASKS: int64 := 2312;   // int64* per-page image bitmask
 
+// Metadata strings stored inline in the 4096-byte doc block (offsets 2320..3599)
+// Automatically NUL-terminated and zeroed by PdfNew → no extra allocation needed.
+pub con PDF_DOC_META_TITLE:    int64 := 2320;   // char[256]
+pub con PDF_DOC_META_AUTHOR:   int64 := 2576;   // char[256]
+pub con PDF_DOC_META_SUBJECT:  int64 := 2832;   // char[256]
+pub con PDF_DOC_META_KEYWORDS: int64 := 3088;   // char[256]
+pub con PDF_DOC_META_CREATOR:  int64 := 3344;   // char[128]
+pub con PDF_DOC_META_PRODUCER: int64 := 3472;   // char[128]
+
 pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
 pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
 
@@ -338,6 +347,25 @@ pub fn PdfContentAppendBytes(doc: int64, pageIdx: int64, data: int64, len: int64
   return len;
 }
 
+// Emit one /Info field: " /Key (escaped-value)" to the output buffer.
+// src is the raw address of the NUL-terminated string in the doc block.
+// Returns new pos; no-ops (returns pos unchanged) if the field is empty.
+fn _pdfMetaField(out: int64, pos: int64, key: pchar, src: int64, maxLen: int64): int64 {
+  if (peek8(src) == 0) { return pos; }
+  pos := pdfStr(out, pos, key);
+  poke8(out + pos, 40); pos := pos + 1;   // '('
+  var i: int64 := 0;
+  while (i < maxLen) {
+    var c: int64 := peek8(src + i);
+    if (c == 0) { break; }
+    if (c == 40 || c == 41 || c == 92) { poke8(out + pos, 92); pos := pos + 1; }
+    poke8(out + pos, c); pos := pos + 1;
+    i := i + 1;
+  }
+  poke8(out + pos, 41); pos := pos + 1;   // ')'
+  return pos;
+}
+
 // ============================================================================
 // PdfSave — serialize document to a PDF file
 // Returns: 0 on success, negative on error
@@ -359,8 +387,17 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var out: int64 := mmapAlloc(PDF_OUT_BUF_SIZE);
   if (out == 0) { return -2; }
 
-  // Allocate XRef offset table (indexed by object ID, 1-based)
-  var xrefSize: int64 := nextId * 8;
+  // Determine whether to write a /Info dict (metadata present?)
+  var hasInfo: int64 := 0;
+  if (peek8(doc + PDF_DOC_META_TITLE)    != 0 || peek8(doc + PDF_DOC_META_AUTHOR)   != 0 ||
+      peek8(doc + PDF_DOC_META_SUBJECT)  != 0 || peek8(doc + PDF_DOC_META_KEYWORDS) != 0 ||
+      peek8(doc + PDF_DOC_META_CREATOR)  != 0 || peek8(doc + PDF_DOC_META_PRODUCER) != 0) {
+    hasInfo := 1;
+  }
+  var infoId: int64 := nextId;  // object ID for /Info dict (only when hasInfo != 0)
+
+  // Allocate XRef offset table — one extra slot when /Info dict is present
+  var xrefSize: int64 := (nextId + hasInfo) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -540,19 +577,35 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     i := i + 1;
   }
 
+  // --- Info dictionary (optional) ---
+  if (hasInfo != 0) {
+    poke64(xrefs + infoId * 8, pos);
+    pos := pdfObjHdr(out, pos, infoId);
+    pos := pdfStr(out, pos, "<<");
+    pos := _pdfMetaField(out, pos, " /Title ",    doc + PDF_DOC_META_TITLE,    256);
+    pos := _pdfMetaField(out, pos, " /Author ",   doc + PDF_DOC_META_AUTHOR,   256);
+    pos := _pdfMetaField(out, pos, " /Subject ",  doc + PDF_DOC_META_SUBJECT,  256);
+    pos := _pdfMetaField(out, pos, " /Keywords ", doc + PDF_DOC_META_KEYWORDS, 256);
+    pos := _pdfMetaField(out, pos, " /Creator ",  doc + PDF_DOC_META_CREATOR,  128);
+    pos := _pdfMetaField(out, pos, " /Producer ", doc + PDF_DOC_META_PRODUCER, 128);
+    pos := pdfStr(out, pos, " >>");
+    pos := pdfObjFtr(out, pos);
+  }
+
   // --- XRef section ---
   var xrefStart: int64 := pos;
+  var xrefCount: int64 := nextId + hasInfo;
 
   pos := pdfStr(out, pos, "xref\n0 ");
-  pos := pdfInt(out, pos, nextId);
+  pos := pdfInt(out, pos, xrefCount);
   poke8(out + pos, 10); pos := pos + 1;
 
   // Free entry for object 0
   pos := pdfXrefEntry(out, pos, 0, 65535, true);
 
-  // In-use entries for objects 1..nextId-1
+  // In-use entries for objects 1..xrefCount-1
   var id: int64 := 1;
-  while (id < nextId) {
+  while (id < xrefCount) {
     var off: int64 := peek64(xrefs + id * 8);
     pos := pdfXrefEntry(out, pos, off, 0, false);
     id := id + 1;
@@ -560,8 +613,13 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
 
   // --- Trailer ---
   pos := pdfStr(out, pos, "trailer\n<< /Size ");
-  pos := pdfInt(out, pos, nextId);
-  pos := pdfStr(out, pos, " /Root 1 0 R >>\nstartxref\n");
+  pos := pdfInt(out, pos, xrefCount);
+  pos := pdfStr(out, pos, " /Root 1 0 R");
+  if (hasInfo != 0) {
+    pos := pdfStr(out, pos, " /Info ");
+    pos := pdfRef(out, pos, infoId);
+  }
+  pos := pdfStr(out, pos, " >>\nstartxref\n");
   pos := pdfInt(out, pos, xrefStart);
   pos := pdfStr(out, pos, "\n%%EOF\n");
 
