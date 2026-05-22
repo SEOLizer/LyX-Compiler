@@ -211,15 +211,19 @@ pub type CompilerConfig = class {
   // WP-AND-02: shared library output (--output-type=shared-lib / --shared)
   outputType:    int64;   // OUTPUT_TYPE_EXECUTABLE (default) | OUTPUT_TYPE_SHARED_LIB
 
-  // WP-AND-02 Phase B: export table populated by codegen, consumed by writeELFSharedLib.
-  // Layout: 24-byte records [nameOff:i64, nameLen:i64, stValue:i64].
-  exportBuf:     int64;
-  exportCount:   int64;
-  exportSrc:     int64;   // pchar to parser.src for resolving nameOff
+  // WP-AND-02 Phase B/B2: export table populated by codegen, consumed by writeELFSharedLib.
+  // Records are 24 bytes: [namePtr:i64 (absolute pchar), nameLen:i64, stValue:i64].
+  // namePtr may point into parser.src (for @export) or into mangledNamesBuf (for @jni).
+  exportBuf:        int64;
+  exportCount:      int64;
+  // Backing store for Java_*-mangled names produced by @jni (Phase B2). Grows as needed.
+  mangledNamesBuf:  int64;
+  mangledNamesLen:  int64;
+  mangledNamesCap:  int64;
   // Stub bytes prepended to .text by emitARM64 (12 for _start; 0 for shared-lib mode).
-  codeStubOff:   int64;
+  codeStubOff:      int64;
   // funcAddrs pointer from EmitARM64 (funcId -> offset_in_irCodeBuf), used to look up export offsets.
-  codeFuncAddrs: int64;
+  codeFuncAddrs:    int64;
 
   // Compilation state
   exitCode: int64;
@@ -284,12 +288,14 @@ pub type CompilerConfig = class {
     self.compileUnit    := false;
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
-    self.outputType     := OUTPUT_TYPE_EXECUTABLE;
-    self.exportBuf      := 0;
-    self.exportCount    := 0;
-    self.exportSrc      := 0;
-    self.codeStubOff    := 0;
-    self.codeFuncAddrs  := 0;
+    self.outputType       := OUTPUT_TYPE_EXECUTABLE;
+    self.exportBuf        := 0;
+    self.exportCount      := 0;
+    self.mangledNamesBuf  := 0;
+    self.mangledNamesLen  := 0;
+    self.mangledNamesCap  := 0;
+    self.codeStubOff      := 0;
+    self.codeFuncAddrs    := 0;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -1729,12 +1735,65 @@ pub type CompilerConfig = class {
   // Binary Writing
   // ---------------------------------------------------------------------------
   
-  // WP-AND-02 Phase B: collect @export-annotated top-level functions into
-  // self.exportBuf (24-byte records: [nameOff:i64, nameLen:i64, stValue:i64]).
+  // WP-AND-02 Phase B/B2: append a Java_<class>_<method> mangled name into
+  // self.mangledNamesBuf. Replaces '.' with '_' in the class part. Returns
+  // an absolute pchar to the NUL-terminated mangled string. Length is the
+  // pre-mangling sum: 5 ("Java_") + classLen + 1 ("_") + methodLen.
+  // (Phase B2 keeps mangling minimal — no _1/_0XXXX escapes; revisit if a
+  // class or method name contains a literal underscore.)
+  fn _mangleJniName(classPtr: int64, classLen: int64, methodPtr: int64, methodLen: int64): int64 {
+    var outLen: int64 := 5 + classLen + 1 + methodLen;
+    var need:   int64 := self.mangledNamesLen + outLen + 1;
+    if need > self.mangledNamesCap {
+      var newCap: int64 := self.mangledNamesCap * 2;
+      if newCap < need { newCap := need + 64; }
+      if newCap < 256  { newCap := 256; }
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.mangledNamesLen {
+        poke8(nb + i, peek8(self.mangledNamesBuf + i));
+        i := i + 1;
+      }
+      self.mangledNamesBuf := nb;
+      self.mangledNamesCap := newCap;
+    }
+    var dst: int64 := self.mangledNamesBuf + self.mangledNamesLen;
+    poke8(dst + 0,  74);   // 'J'
+    poke8(dst + 1,  97);   // 'a'
+    poke8(dst + 2, 118);   // 'v'
+    poke8(dst + 3,  97);   // 'a'
+    poke8(dst + 4,  95);   // '_'
+    var wi: int64 := 5;
+    var ci: int64 := 0;
+    while ci < classLen {
+      var ch: int64 := peek8(classPtr + ci);
+      if ch == 46 { ch := 95; }    // '.' -> '_'
+      poke8(dst + wi, ch);
+      wi := wi + 1;
+      ci := ci + 1;
+    }
+    poke8(dst + wi, 95);            // separator '_'
+    wi := wi + 1;
+    var mi: int64 := 0;
+    while mi < methodLen {
+      poke8(dst + wi, peek8(methodPtr + mi));
+      wi := wi + 1;
+      mi := mi + 1;
+    }
+    poke8(dst + wi, 0);             // NUL terminator
+    self.mangledNamesLen := self.mangledNamesLen + outLen + 1;
+    return dst;
+  }
+
+  // WP-AND-02 Phase B/B2: collect @export- and @jni-annotated top-level
+  // functions into self.exportBuf (24-byte records: [namePtr, nameLen, stValue]).
+  // For @export the namePtr is parser.src + nameOff; for @jni it points into
+  // self.mangledNamesBuf (Java_<class>_<method>).
   // Relies on the invariant that ir_lower's lowerModule processes top-level
-  // NK_FUNC_DECL nodes in source order, so funcId N == N-th @export-eligible
-  // function in the AST.
+  // NK_FUNC_DECL nodes in source order, so funcId N == N-th NK_FUNC_DECL.
   fn buildExportList(parser: Parser, astRoot: int64): void {
+    var EXPORT_MASK: int64 := ANNO_EXPORT | ANNO_JNI;
+
     // Pass 1: count.
     var count: int64 := 0;
     var cur: int64 := astRoot;
@@ -1743,13 +1802,12 @@ pub type CompilerConfig = class {
       var kind: int64 := peek64(off + 0);
       if kind == NK_FUNC_DECL {
         var anno: int64 := peek64(off + 56);
-        if (anno & ANNO_EXPORT) != 0 { count := count + 1; }
+        if (anno & EXPORT_MASK) != 0 { count := count + 1; }
       }
-      cur := peek64(off + 40);   // .next
+      cur := peek64(off + 40);
     }
 
     self.exportCount := count;
-    self.exportSrc   := parser.src as int64;
     if count == 0 { self.exportBuf := 0; return; }
     if self.codeFuncAddrs == 0 { self.exportBuf := 0; self.exportCount := 0; return; }
 
@@ -1763,12 +1821,32 @@ pub type CompilerConfig = class {
       var kind2: int64 := peek64(off2 + 0);
       if kind2 == NK_FUNC_DECL {
         var anno2: int64 := peek64(off2 + 56);
-        if (anno2 & ANNO_EXPORT) != 0 {
-          var nameOff: int64 := peek64(off2 + 64);
-          var nameLen: int64 := peek64(off2 + 72);
-          var addr:    int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
-          var rec:     int64 := self.exportBuf + idx * 24;
-          poke64(rec +  0, nameOff);
+        if (anno2 & EXPORT_MASK) != 0 {
+          var addr: int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
+          var namePtr: int64 := 0;
+          var nameLen: int64 := 0;
+          if (anno2 & ANNO_JNI) != 0 {
+            var jniRec: int64 := parser.FindJniEntry(cur);
+            if jniRec != 0 {
+              var cOff: int64 := peek64(jniRec +  8);
+              var cLen: int64 := peek64(jniRec + 16);
+              var mOff: int64 := peek64(jniRec + 24);
+              var mLen: int64 := peek64(jniRec + 32);
+              var beforeLen: int64 := self.mangledNamesLen;
+              namePtr := self._mangleJniName((parser.src as int64) + cOff, cLen,
+                                             (parser.src as int64) + mOff, mLen);
+              nameLen := self.mangledNamesLen - beforeLen - 1;  // exclude NUL
+            } else {
+              // @jni without args parsed — fall back to the raw function name.
+              namePtr := (parser.src as int64) + peek64(off2 + 64);
+              nameLen := peek64(off2 + 72);
+            }
+          } else {
+            namePtr := (parser.src as int64) + peek64(off2 + 64);
+            nameLen := peek64(off2 + 72);
+          }
+          var rec: int64 := self.exportBuf + idx * 24;
+          poke64(rec +  0, namePtr);
           poke64(rec +  8, nameLen);
           poke64(rec + 16, addr);
           idx := idx + 1;
@@ -1914,10 +1992,10 @@ pub type CompilerConfig = class {
     }
     var soNameLen: int64 := pathLen - baseStart;
 
-    // ---- Export-table sizing (Phase B) ----
+    // ---- Export-table sizing (Phase B/B2) ----
+    // Records: [namePtr:i64 (absolute), nameLen:i64, stValue:i64].
     var expCount: int64 := self.exportCount;
     var expBuf:   int64 := self.exportBuf;
-    var expSrc:   int64 := self.exportSrc;
 
     // Sum of all export name lengths (each followed by a NUL in .dynstr).
     var expNamesBytes: int64 := 0;
@@ -2062,16 +2140,16 @@ pub type CompilerConfig = class {
     var ej: int64 := 0;
     while ej < expCount {
       var rec: int64 := expBuf + ej * 24;
-      var nOff: int64 := peek64(rec + 0);          // offset into parser source
+      var nPtr: int64 := peek64(rec + 0);          // absolute name pointer
       var nLen: int64 := peek64(rec + 8);
       var nameStart: int64 := nextStr;             // record where this name lands
       var ci: int64 := 0;
       while ci < nLen {
-        poke8(buf + dynstrOff + nextStr + ci, peek8(expSrc + nOff + ci));
+        poke8(buf + dynstrOff + nextStr + ci, peek8(nPtr + ci));
         ci := ci + 1;
       }
       nextStr := nextStr + nLen + 1;               // +1 for NUL
-      // Stash the dynstr-relative offset back into the record's nameOff slot
+      // Stash the dynstr-relative offset back into the record's namePtr slot
       // so the .dynsym writer below can reuse it without recomputing.
       poke64(rec + 0, nameStart);
       ej := ej + 1;

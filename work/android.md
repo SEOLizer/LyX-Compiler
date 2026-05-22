@@ -119,9 +119,39 @@ die von Android-Apps per `System.loadLibrary()` geladen werden.
 - [x] `.dynstr` enthält alle Export-Namen NUL-getrennt
 - [x] SysV `.hash` mit `nbucket = 1`, `nchain = 1 + count` und linearer Chain
 - [x] Singularität verifiziert (S3 == S4)
+- [x] `@jni(class="…", method="…")` Annotation + `Java_<class>_<method>`-Mangling (Phase B2)
+- [x] JNI-Side-Table am Parser (40-Byte-Records, gewachsen on demand)
+- [x] `_parseJniArgs` parsed `class="..."` und `method="..."` — Args werden per
+      Text-Match erkannt (TK_CLASS-Keyword-Konflikt umgangen)
+- [x] `_mangleJniName` produziert `Java_<class>_<method>` mit `.`→`_` Substitution
+- [x] Export-Records auf absolute name-Pointer umgestellt
+      (statt nameOff in parser.src — nötig für Java_*-Strings im Mangle-Buffer)
 - [ ] PIC-Code-Generierung (GOT/PLT) — auf Phase C verschoben
-- [ ] `@jni(class="…", method="…")` Annotation + `Java_<class>_<method>`-Mangling — Phase B2
 - [ ] `DT_NEEDED` für externe Abhängigkeiten — Phase C
+- [ ] Erweiterte JNI-Escape-Regeln (`_`→`_1`, Sonderzeichen `_0XXXX`) — bei Bedarf
+
+**Verifikation Phase B2:**
+```bash
+cat > /tmp/jnitest.lyx <<'LYX'
+@jni(class="com.example.MyClass", method="nativeAdd")
+fn nativeAdd(a: int64, b: int64): int64 { return a + b; }
+
+@jni(class="com.example.MyClass", method="nativeMul")
+fn nativeMul(a: int64, b: int64): int64 { return a * b; }
+
+@export
+fn helperRaw(x: int64): int64 { return x + 1; }
+
+fn unexported(x: int64): int64 { return x; }
+fn main(): int64 { return 0; }
+LYX
+
+./lyxc --target=android-arm64 --shared /tmp/jnitest.lyx -o /tmp/libjni.so
+readelf -D --syms -W /tmp/libjni.so
+#   1: 0x0    FUNC GLOBAL Java_com_example_MyClass_nativeAdd
+#   2: 0x24   FUNC GLOBAL Java_com_example_MyClass_nativeMul
+#   3: 0x48   FUNC GLOBAL helperRaw       (raw name, kein @jni)
+```
 
 **Verifikation Phase B:**
 ```bash
