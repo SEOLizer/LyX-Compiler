@@ -156,6 +156,14 @@ pub type IRLower = class {
   // Local variable tracking
   localCount: int64;
   paramCount: int64;
+
+  // WP-AND-upstream-fix v4: per-function name->slot mapping for declared
+  // locals (NK_VAR_DECL inside a body). Records are 24 bytes:
+  // {srcNameOff:i64, nameLen:i64, slotIdx:i64}. Resized geometrically.
+  // Cleared at the start of each lowerFunc.
+  localNameBuf: int64;
+  localNameCnt: int64;
+  localNameCap: int64;
   
   // Label and temp counters
   labelCount: int64;
@@ -199,6 +207,9 @@ pub type IRLower = class {
     self.paramCount := 0;
     self.labelCount := 0;
     self.tempCount := 0;
+    self.localNameCap := 32;
+    self.localNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
+    self.localNameCnt := 0;
     self.loopExitLabel := -1;
     self.loopContLabel := -1;
     self.curFunc := -1;
@@ -536,6 +547,31 @@ pub type IRLower = class {
       if self.curFunc >= 0 {
         var idName: pchar := self.nodeSVal(expr);
         var idLen:  int64 := self.nodeSLen(expr);
+        var idPtrL: int64 := (idName) as int64;
+        // WP-AND-upstream-fix v4: locals declared via NK_VAR_DECL come first.
+        var lnI: int64 := self.localNameCnt - 1;   // shadowing: latest wins
+        while lnI >= 0 {
+          var lnRec:    int64 := self.localNameBuf + lnI * 24;
+          var lnNameOff:int64 := peek64(lnRec + 0);
+          var lnLen:    int64 := peek64(lnRec + 8);
+          var lnSlot:   int64 := peek64(lnRec + 16);
+          if lnLen == idLen {
+            var lnPtr: int64 := (self.src as int64) + lnNameOff;
+            var lnMatch: int64 := 1;
+            var lnJ: int64 := 0;
+            while lnJ < idLen {
+              if lnMatch != 0 {
+                if peek8(lnPtr + lnJ) != peek8(idPtrL + lnJ) { lnMatch := 0; }
+              }
+              lnJ := lnJ + 1;
+            }
+            if lnMatch != 0 {
+              self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, lnSlot, -1, 0);
+              return dest;
+            }
+          }
+          lnI := lnI - 1;
+        }
         var pnode:  int64 := self.nodeC0(self.curFunc);
         var pidx:   int64 := 0;
         while pnode >= 0 {
@@ -1011,6 +1047,35 @@ pub type IRLower = class {
     else if (k == NK_PANIC) {
       self.lowerPanic(stmt);
     }
+    // WP-AND-upstream-fix v4: `var x: T := expr;` inside a function body.
+    // Allocate a slot, lower the init expression, store into the slot, and
+    // record name->slot in localNameBuf so subsequent NK_IDENT lookups can
+    // find it. Inline (no helper method) for vtable stability.
+    else if (k == NK_VAR_DECL) {
+      var vdSlot: int64 := self.allocTemp();
+      var vdInit: int64 := self.nodeC1(stmt);
+      if vdInit >= 0 {
+        var vdTemp: int64 := self.lowerExpr(vdInit);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
+      }
+      // Register name -> slot. Grow the buffer geometrically if full.
+      if self.localNameCnt >= self.localNameCap {
+        var vdNewCap: int64 := self.localNameCap * 2;
+        var vdNb: int64 := mmap(0, vdNewCap * 24, 3, 34, -1, 0);
+        var vdI: int64 := 0;
+        while vdI < self.localNameCnt * 24 {
+          poke8(vdNb + vdI, peek8(self.localNameBuf + vdI));
+          vdI := vdI + 1;
+        }
+        self.localNameBuf := vdNb;
+        self.localNameCap := vdNewCap;
+      }
+      var vdRec: int64 := self.localNameBuf + self.localNameCnt * 24;
+      poke64(vdRec +  0, peek64(self.nodeOff(stmt) + 64));  // src nameOff
+      poke64(vdRec +  8, self.nodeSLen(stmt));
+      poke64(vdRec + 16, vdSlot);
+      self.localNameCnt := self.localNameCnt + 1;
+    }
     // Try/Catch/Finally handled in lowering blocks
   }
   
@@ -1386,6 +1451,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.localNameCnt := 0;
     self.curFunc := funcNode;
 
     self.retValTemp := self.allocTemp();
