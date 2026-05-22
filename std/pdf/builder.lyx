@@ -54,6 +54,26 @@ pub con PDF_DOC_META_KEYWORDS: int64 := 3088;   // char[256]
 pub con PDF_DOC_META_CREATOR:  int64 := 3344;   // char[128]
 pub con PDF_DOC_META_PRODUCER: int64 := 3472;   // char[128]
 
+// Annotation list (offsets 3600..3623, within the 4096-byte doc block)
+pub con PDF_DOC_ANNOTCOUNT:     int64 := 3600;   // int64 total annotation count
+pub con PDF_DOC_ANNOTCAP:       int64 := 3608;   // int64 capacity of annotBuf
+pub con PDF_DOC_ANNOTBUF:       int64 := 3616;   // int64* annotation record buffer
+
+// Annotation record layout (96 bytes each, stored in annotBuf)
+pub con PDF_ANNOT_TYPE:      int64 := 0;   // 1=link_uri 2=text_note 3=link_goto
+pub con PDF_ANNOT_PAGE:      int64 := 8;   // page index (int64)
+pub con PDF_ANNOT_X1_100:    int64 := 16;  // rect x1 × 100
+pub con PDF_ANNOT_Y1_100:    int64 := 24;  // rect y1 × 100
+pub con PDF_ANNOT_X2_100:    int64 := 32;  // rect x2 × 100
+pub con PDF_ANNOT_Y2_100:    int64 := 40;  // rect y2 × 100
+pub con PDF_ANNOT_DATA1:     int64 := 48;  // int64* URL (link) or content text (note)
+pub con PDF_ANNOT_DATA1LEN:  int64 := 56;  // allocation length of data1
+pub con PDF_ANNOT_DATA2:     int64 := 64;  // int64* title (note only)
+pub con PDF_ANNOT_DATA2LEN:  int64 := 72;  // allocation length of data2
+pub con PDF_ANNOT_EXTRA:     int64 := 80;  // dest page index (link_goto)
+pub con PDF_ANNOT_RECSIZE:   int64 := 96;
+pub con PDF_ANNOT_INITIAL_CAP: int64 := 16;
+
 pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
 pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
 
@@ -190,6 +210,31 @@ pub fn PdfNew(): int64 {
   poke64(doc + PDF_DOC_IMAGEDATALENS,  imageDataLens);
   poke64(doc + PDF_DOC_PAGEIMAGEMASKS, pageImgMasks);
 
+  // Annotation buffer
+  var annotBuf: int64 := mmapAlloc(PDF_ANNOT_INITIAL_CAP * PDF_ANNOT_RECSIZE);
+  if (annotBuf == 0) {
+    munmap(imageIds,      imgArrSz);
+    munmap(imageWidths,   imgArrSz);
+    munmap(imageHeights,  imgArrSz);
+    munmap(imageChannels, imgArrSz);
+    munmap(imageDataBufs, imgArrSz);
+    munmap(imageDataLens, imgArrSz);
+    munmap(pageImgMasks,  pageCap * 8);
+    munmap(pageIds,     arrSize);
+    munmap(contentIds,  arrSize);
+    munmap(widths100,   arrSize);
+    munmap(heights100,  arrSize);
+    munmap(contentBufs, arrSize);
+    munmap(contentLens, arrSize);
+    munmap(contentCaps, arrSize);
+    munmap(doc, PDF_DOC_SIZE);
+    return 0;
+  }
+  zeroMem(annotBuf, PDF_ANNOT_INITIAL_CAP * PDF_ANNOT_RECSIZE);
+  poke64(doc + PDF_DOC_ANNOTCOUNT, 0);
+  poke64(doc + PDF_DOC_ANNOTCAP,   PDF_ANNOT_INITIAL_CAP);
+  poke64(doc + PDF_DOC_ANNOTBUF,   annotBuf);
+
   return doc;
 }
 
@@ -254,6 +299,25 @@ pub fn PdfFree(doc: int64): void {
   if (imgDBufs  != 0) { munmap(imgDBufs,  imgArrSz); }
   if (imgDLens  != 0) { munmap(imgDLens,  imgArrSz); }
   if (pgImgPtr  != 0) { munmap(pgImgPtr,  pageCap * 8); }
+
+  // Free annotation string data and buffer
+  var annotCount2: int64 := peek64(doc + PDF_DOC_ANNOTCOUNT);
+  var annotCap2:   int64 := peek64(doc + PDF_DOC_ANNOTCAP);
+  var annotBuf2:   int64 := peek64(doc + PDF_DOC_ANNOTBUF);
+  if (annotBuf2 != 0) {
+    var ai2: int64 := 0;
+    while (ai2 < annotCount2) {
+      var arec2: int64 := annotBuf2 + ai2 * PDF_ANNOT_RECSIZE;
+      var d1:    int64 := peek64(arec2 + PDF_ANNOT_DATA1);
+      var d1l:   int64 := peek64(arec2 + PDF_ANNOT_DATA1LEN);
+      var d2:    int64 := peek64(arec2 + PDF_ANNOT_DATA2);
+      var d2l:   int64 := peek64(arec2 + PDF_ANNOT_DATA2LEN);
+      if (d1 != 0 && d1l > 0) { munmap(d1, d1l); }
+      if (d2 != 0 && d2l > 0) { munmap(d2, d2l); }
+      ai2 := ai2 + 1;
+    }
+    munmap(annotBuf2, annotCap2 * PDF_ANNOT_RECSIZE);
+  }
 
   munmap(doc, PDF_DOC_SIZE);
 }
@@ -366,6 +430,21 @@ fn _pdfMetaField(out: int64, pos: int64, key: pchar, src: int64, maxLen: int64):
   return pos;
 }
 
+// Write (escaped PDF literal string) from a NUL-terminated raw buffer.
+fn _pdfEscStr(out: int64, pos: int64, src: int64): int64 {
+  poke8(out + pos, 40); pos := pos + 1;
+  var i: int64 := 0;
+  while (1 == 1) {
+    var c: int64 := peek8(src + i);
+    if (c == 0) { break; }
+    if (c == 40 || c == 41 || c == 92) { poke8(out + pos, 92); pos := pos + 1; }
+    poke8(out + pos, c); pos := pos + 1;
+    i := i + 1;
+  }
+  poke8(out + pos, 41); pos := pos + 1;
+  return pos;
+}
+
 // ============================================================================
 // PdfSave — serialize document to a PDF file
 // Returns: 0 on success, negative on error
@@ -396,8 +475,12 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   }
   var infoId: int64 := nextId;  // object ID for /Info dict (only when hasInfo != 0)
 
-  // Allocate XRef offset table — one extra slot when /Info dict is present
-  var xrefSize: int64 := (nextId + hasInfo) * 8;
+  var annotCount: int64 := peek64(doc + PDF_DOC_ANNOTCOUNT);
+  var annotBuf:   int64 := peek64(doc + PDF_DOC_ANNOTBUF);
+  var firstAnnotId: int64 := nextId + hasInfo;  // first annotation object ID
+
+  // Allocate XRef offset table — extra slots for /Info and annotation objects
+  var xrefSize: int64 := (nextId + hasInfo + annotCount) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -539,6 +622,28 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     }
     pos := pdfStr(out, pos, " >> /Contents ");
     pos := pdfRef(out, pos, contentId);
+    // /Annots array for annotations on this page
+    var hasAnnotsOnPage: int64 := 0;
+    var ak0: int64 := 0;
+    while (ak0 < annotCount) {
+      if (peek64(annotBuf + ak0 * PDF_ANNOT_RECSIZE + PDF_ANNOT_PAGE) == i) {
+        hasAnnotsOnPage := 1;
+        break;
+      }
+      ak0 := ak0 + 1;
+    }
+    if (hasAnnotsOnPage != 0) {
+      pos := pdfStr(out, pos, " /Annots [");
+      var ak1: int64 := 0;
+      while (ak1 < annotCount) {
+        if (peek64(annotBuf + ak1 * PDF_ANNOT_RECSIZE + PDF_ANNOT_PAGE) == i) {
+          pos := pdfRef(out, pos, firstAnnotId + ak1);
+          poke8(out + pos, 32); pos := pos + 1;
+        }
+        ak1 := ak1 + 1;
+      }
+      pos := pdfStr(out, pos, "]");
+    }
     pos := pdfStr(out, pos, " >>");
     pos := pdfObjFtr(out, pos);
 
@@ -592,9 +697,80 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     pos := pdfObjFtr(out, pos);
   }
 
+  // --- Annotation objects ---
+  var ann: int64 := 0;
+  while (ann < annotCount) {
+    var arec:   int64 := annotBuf + ann * PDF_ANNOT_RECSIZE;
+    var atype:  int64 := peek64(arec + PDF_ANNOT_TYPE);
+    var ax1:    int64 := peek64(arec + PDF_ANNOT_X1_100);
+    var ay1:    int64 := peek64(arec + PDF_ANNOT_Y1_100);
+    var ax2:    int64 := peek64(arec + PDF_ANNOT_X2_100);
+    var ay2:    int64 := peek64(arec + PDF_ANNOT_Y2_100);
+    var adata1: int64 := peek64(arec + PDF_ANNOT_DATA1);
+    var adata2: int64 := peek64(arec + PDF_ANNOT_DATA2);
+    var aextra: int64 := peek64(arec + PDF_ANNOT_EXTRA);
+    var annotId: int64 := firstAnnotId + ann;
+
+    poke64(xrefs + annotId * 8, pos);
+    pos := pdfObjHdr(out, pos, annotId);
+    pos := pdfStr(out, pos, "<< /Type /Annot");
+
+    if (atype == 1) {
+      pos := pdfStr(out, pos, " /Subtype /Link /Rect [");
+      pos := pdfReal100(out, pos, ax1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ax2);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay2);
+      pos := pdfStr(out, pos, "] /Border [0 0 0] /A << /S /URI /URI ");
+      if (adata1 != 0) {
+        pos := _pdfEscStr(out, pos, adata1);
+      } else {
+        pos := pdfStr(out, pos, "()");
+      }
+      pos := pdfStr(out, pos, " >>");
+    } else if (atype == 2) {
+      pos := pdfStr(out, pos, " /Subtype /Text /Rect [");
+      pos := pdfReal100(out, pos, ax1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ax2);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay2);
+      pos := pdfStr(out, pos, "] /Open false");
+      if (adata2 != 0) {
+        pos := pdfStr(out, pos, " /T ");
+        pos := _pdfEscStr(out, pos, adata2);
+      }
+      if (adata1 != 0) {
+        pos := pdfStr(out, pos, " /Contents ");
+        pos := _pdfEscStr(out, pos, adata1);
+      }
+    } else if (atype == 3) {
+      pos := pdfStr(out, pos, " /Subtype /Link /Rect [");
+      pos := pdfReal100(out, pos, ax1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay1);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ax2);
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, ay2);
+      pos := pdfStr(out, pos, "] /Border [0 0 0] /Dest [");
+      pos := pdfRef(out, pos, arrGet(pageIds, aextra));
+      pos := pdfStr(out, pos, " /XYZ null null null]");
+    }
+
+    pos := pdfStr(out, pos, " >>");
+    pos := pdfObjFtr(out, pos);
+    ann := ann + 1;
+  }
+
   // --- XRef section ---
   var xrefStart: int64 := pos;
-  var xrefCount: int64 := nextId + hasInfo;
+  var xrefCount: int64 := nextId + hasInfo + annotCount;
 
   pos := pdfStr(out, pos, "xref\n0 ");
   pos := pdfInt(out, pos, xrefCount);
