@@ -74,6 +74,19 @@ pub con PDF_ANNOT_EXTRA:     int64 := 80;  // dest page index (link_goto)
 pub con PDF_ANNOT_RECSIZE:   int64 := 96;
 pub con PDF_ANNOT_INITIAL_CAP: int64 := 16;
 
+// Outline (bookmarks) list (offsets 3624..3647, within 4096-byte doc block)
+pub con PDF_DOC_OUTLINECOUNT:    int64 := 3624;  // int64 item count
+pub con PDF_DOC_OUTLINECAP:      int64 := 3632;  // int64 capacity
+pub con PDF_DOC_OUTLINEBUF:      int64 := 3640;  // int64* record buffer
+
+// Outline record layout (32 bytes each, stored in outlineBuf)
+pub con PDF_OUTLINE_PARENT:      int64 := 0;   // int64 parent index (-1 = root)
+pub con PDF_OUTLINE_DESTPAGE:    int64 := 8;   // int64 destination page index
+pub con PDF_OUTLINE_TITLEBUF:    int64 := 16;  // int64* title string (mmap'd, NUL-term)
+pub con PDF_OUTLINE_TITLELEN:    int64 := 24;  // int64 title allocation length
+pub con PDF_OUTLINE_RECSIZE:     int64 := 32;
+pub con PDF_OUTLINE_INITIAL_CAP: int64 := 8;
+
 pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
 pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
 
@@ -235,6 +248,32 @@ pub fn PdfNew(): int64 {
   poke64(doc + PDF_DOC_ANNOTCAP,   PDF_ANNOT_INITIAL_CAP);
   poke64(doc + PDF_DOC_ANNOTBUF,   annotBuf);
 
+  // Outline buffer
+  var outlineBuf: int64 := mmapAlloc(PDF_OUTLINE_INITIAL_CAP * PDF_OUTLINE_RECSIZE);
+  if (outlineBuf == 0) {
+    munmap(annotBuf,     PDF_ANNOT_INITIAL_CAP * PDF_ANNOT_RECSIZE);
+    munmap(imageIds,      imgArrSz);
+    munmap(imageWidths,   imgArrSz);
+    munmap(imageHeights,  imgArrSz);
+    munmap(imageChannels, imgArrSz);
+    munmap(imageDataBufs, imgArrSz);
+    munmap(imageDataLens, imgArrSz);
+    munmap(pageImgMasks,  pageCap * 8);
+    munmap(pageIds,     arrSize);
+    munmap(contentIds,  arrSize);
+    munmap(widths100,   arrSize);
+    munmap(heights100,  arrSize);
+    munmap(contentBufs, arrSize);
+    munmap(contentLens, arrSize);
+    munmap(contentCaps, arrSize);
+    munmap(doc, PDF_DOC_SIZE);
+    return 0;
+  }
+  zeroMem(outlineBuf, PDF_OUTLINE_INITIAL_CAP * PDF_OUTLINE_RECSIZE);
+  poke64(doc + PDF_DOC_OUTLINECOUNT, 0);
+  poke64(doc + PDF_DOC_OUTLINECAP,   PDF_OUTLINE_INITIAL_CAP);
+  poke64(doc + PDF_DOC_OUTLINEBUF,   outlineBuf);
+
   return doc;
 }
 
@@ -319,7 +358,121 @@ pub fn PdfFree(doc: int64): void {
     munmap(annotBuf2, annotCap2 * PDF_ANNOT_RECSIZE);
   }
 
+  // Free outline title strings and buffer
+  var outlineCount3: int64 := peek64(doc + PDF_DOC_OUTLINECOUNT);
+  var outlineCap3:   int64 := peek64(doc + PDF_DOC_OUTLINECAP);
+  var outlineBuf3:   int64 := peek64(doc + PDF_DOC_OUTLINEBUF);
+  if (outlineBuf3 != 0) {
+    var oi3: int64 := 0;
+    while (oi3 < outlineCount3) {
+      var orec3:   int64 := outlineBuf3 + oi3 * PDF_OUTLINE_RECSIZE;
+      var titBuf3: int64 := peek64(orec3 + PDF_OUTLINE_TITLEBUF);
+      var titLen3: int64 := peek64(orec3 + PDF_OUTLINE_TITLELEN);
+      if (titBuf3 != 0 && titLen3 > 0) { munmap(titBuf3, titLen3); }
+      oi3 := oi3 + 1;
+    }
+    munmap(outlineBuf3, outlineCap3 * PDF_OUTLINE_RECSIZE);
+  }
+
   munmap(doc, PDF_DOC_SIZE);
+}
+
+// ============================================================================
+// Outline tree helpers (WP-PDF-10)
+// ============================================================================
+
+fn _outlineCountChildren(buf: int64, count: int64, parent: int64): int64 {
+  var n: int64 := 0;
+  var j: int64 := 0;
+  while (j < count) {
+    if (peek64(buf + j * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT) == parent) { n := n + 1; }
+    j := j + 1;
+  }
+  return n;
+}
+
+fn _outlineFirstChild(buf: int64, count: int64, parent: int64): int64 {
+  var j: int64 := 0;
+  while (j < count) {
+    if (peek64(buf + j * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT) == parent) { return j; }
+    j := j + 1;
+  }
+  return -1;
+}
+
+fn _outlineLastChild(buf: int64, count: int64, parent: int64): int64 {
+  var last: int64 := -1;
+  var j: int64 := 0;
+  while (j < count) {
+    if (peek64(buf + j * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT) == parent) { last := j; }
+    j := j + 1;
+  }
+  return last;
+}
+
+fn _outlineNextSibling(buf: int64, count: int64, i: int64): int64 {
+  var pi: int64 := peek64(buf + i * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT);
+  var j: int64 := i + 1;
+  while (j < count) {
+    if (peek64(buf + j * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT) == pi) { return j; }
+    j := j + 1;
+  }
+  return -1;
+}
+
+fn _outlinePrevSibling(buf: int64, count: int64, i: int64): int64 {
+  var pi: int64 := peek64(buf + i * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT);
+  var j: int64 := i - 1;
+  while (j >= 0) {
+    if (peek64(buf + j * PDF_OUTLINE_RECSIZE + PDF_OUTLINE_PARENT) == pi) { return j; }
+    j := j - 1;
+  }
+  return -1;
+}
+
+// Write /Count, /First, /Last, /Next, /Prev for outline item oi. Returns new pos.
+fn _pdfWriteOutlineLinks(out: int64, pos: int64, buf: int64, count: int64, oi: int64, rootId: int64): int64 {
+  var nch: int64 := _outlineCountChildren(buf, count, oi);
+  pos := pdfStr(out, pos, " /Count ");
+  pos := pdfInt(out, pos, nch);
+  if (nch > 0) {
+    var fc: int64 := _outlineFirstChild(buf, count, oi);
+    pos := pdfStr(out, pos, " /First ");
+    pos := pdfRef(out, pos, rootId + 1 + fc);
+    var lc: int64 := _outlineLastChild(buf, count, oi);
+    pos := pdfStr(out, pos, " /Last ");
+    pos := pdfRef(out, pos, rootId + 1 + lc);
+  }
+  var ns: int64 := _outlineNextSibling(buf, count, oi);
+  if (ns >= 0) {
+    pos := pdfStr(out, pos, " /Next ");
+    pos := pdfRef(out, pos, rootId + 1 + ns);
+  }
+  var ps: int64 := _outlinePrevSibling(buf, count, oi);
+  if (ps >= 0) {
+    pos := pdfStr(out, pos, " /Prev ");
+    pos := pdfRef(out, pos, rootId + 1 + ps);
+  }
+  return pos;
+}
+
+// Write the /Outlines root object. Returns new pos.
+fn _pdfWriteOutlineRoot(out: int64, pos: int64, xrefs: int64, buf: int64, count: int64, rootId: int64): int64 {
+  poke64(xrefs + rootId * 8, pos);
+  pos := pdfObjHdr(out, pos, rootId);
+  pos := pdfStr(out, pos, "<< /Type /Outlines /Count ");
+  pos := pdfInt(out, pos, _outlineCountChildren(buf, count, -1));
+  var fc: int64 := _outlineFirstChild(buf, count, -1);
+  if (fc >= 0) {
+    pos := pdfStr(out, pos, " /First ");
+    pos := pdfRef(out, pos, rootId + 1 + fc);
+    var lc: int64 := _outlineLastChild(buf, count, -1);
+    pos := pdfStr(out, pos, " /Last ");
+    pos := pdfRef(out, pos, rootId + 1 + lc);
+  }
+  pos := pdfStr(out, pos, " >>");
+  pos := pdfObjFtr(out, pos);
+  return pos;
 }
 
 // ============================================================================
@@ -479,8 +632,14 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var annotBuf:   int64 := peek64(doc + PDF_DOC_ANNOTBUF);
   var firstAnnotId: int64 := nextId + hasInfo;  // first annotation object ID
 
-  // Allocate XRef offset table — extra slots for /Info and annotation objects
-  var xrefSize: int64 := (nextId + hasInfo + annotCount) * 8;
+  var outlineCount:    int64 := peek64(doc + PDF_DOC_OUTLINECOUNT);
+  var outlineBuf:      int64 := peek64(doc + PDF_DOC_OUTLINEBUF);
+  var outlineObjCount: int64 := 0;
+  if (outlineCount > 0) { outlineObjCount := outlineCount + 1; }
+  var outlineRootId:   int64 := nextId + hasInfo + annotCount;
+
+  // Allocate XRef offset table
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -501,7 +660,12 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
 
   // --- Object 1: Catalog ---
   poke64(xrefs + 1 * 8, pos);
-  pos := pdfStr(out, pos, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+  pos := pdfStr(out, pos, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R");
+  if (outlineCount > 0) {
+    pos := pdfStr(out, pos, " /Outlines ");
+    pos := pdfRef(out, pos, outlineRootId);
+  }
+  pos := pdfStr(out, pos, " >>\nendobj\n");
 
   // --- Object 2: Pages ---
   poke64(xrefs + 2 * 8, pos);
@@ -768,9 +932,35 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     ann := ann + 1;
   }
 
+  // --- Outline objects ---
+  if (outlineCount > 0) {
+    pos := _pdfWriteOutlineRoot(out, pos, xrefs, outlineBuf, outlineCount, outlineRootId);
+    var oi: int64 := 0;
+    while (oi < outlineCount) {
+      var orec: int64 := outlineBuf + oi * PDF_OUTLINE_RECSIZE;
+      poke64(xrefs + (outlineRootId + 1 + oi) * 8, pos);
+      pos := pdfObjHdr(out, pos, outlineRootId + 1 + oi);
+      pos := pdfStr(out, pos, "<< /Title ");
+      pos := _pdfEscStr(out, pos, peek64(orec + PDF_OUTLINE_TITLEBUF));
+      pos := pdfStr(out, pos, " /Parent ");
+      if (peek64(orec + PDF_OUTLINE_PARENT) < 0) {
+        pos := pdfRef(out, pos, outlineRootId);
+      } else {
+        pos := pdfRef(out, pos, outlineRootId + 1 + peek64(orec + PDF_OUTLINE_PARENT));
+      }
+      pos := pdfStr(out, pos, " /Dest [");
+      pos := pdfRef(out, pos, arrGet(pageIds, peek64(orec + PDF_OUTLINE_DESTPAGE)));
+      pos := pdfStr(out, pos, " /XYZ null null null]");
+      pos := _pdfWriteOutlineLinks(out, pos, outlineBuf, outlineCount, oi, outlineRootId);
+      pos := pdfStr(out, pos, " >>");
+      pos := pdfObjFtr(out, pos);
+      oi := oi + 1;
+    }
+  }
+
   // --- XRef section ---
   var xrefStart: int64 := pos;
-  var xrefCount: int64 := nextId + hasInfo + annotCount;
+  var xrefCount: int64 := nextId + hasInfo + annotCount + outlineObjCount;
 
   pos := pdfStr(out, pos, "xref\n0 ");
   pos := pdfInt(out, pos, xrefCount);
