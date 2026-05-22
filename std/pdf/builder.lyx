@@ -33,6 +33,18 @@ pub con PDF_DOC_CURTEXTCOLOR:     int64 := 1736;  // int64[64]: current text col
 //   color encoding: bits 63..48 = r100, bits 47..32 = g100, bits 31..16 = b100
 pub con PDF_DOC_SIZE:             int64 := 4096;
 
+// Image fields (offsets 2248..2319, within the 4096-byte doc block)
+pub con PDF_INITIAL_IMAGE_CAP:  int64 := 16;
+pub con PDF_DOC_IMAGECOUNT:     int64 := 2248;
+pub con PDF_DOC_IMAGECAP:       int64 := 2256;
+pub con PDF_DOC_IMAGEIDS:       int64 := 2264;   // int64* object IDs
+pub con PDF_DOC_IMAGEWIDTHS:    int64 := 2272;   // int64* pixel widths
+pub con PDF_DOC_IMAGEHEIGHTS:   int64 := 2280;   // int64* pixel heights
+pub con PDF_DOC_IMAGECHANNELS:  int64 := 2288;   // int64* 1=gray 3=RGB
+pub con PDF_DOC_IMAGEDATABUFS:  int64 := 2296;   // int64* compressed data ptrs
+pub con PDF_DOC_IMAGEDATALENS:  int64 := 2304;   // int64* compressed data sizes
+pub con PDF_DOC_PAGEIMAGEMASKS: int64 := 2312;   // int64* per-page image bitmask
+
 pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
 pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
 
@@ -119,6 +131,56 @@ pub fn PdfNew(): int64 {
   poke64(doc + PDF_DOC_CONTENTLENS, contentLens);
   poke64(doc + PDF_DOC_CONTENTCAPS, contentCaps);
 
+  // Image arrays
+  var imgCap:   int64 := PDF_INITIAL_IMAGE_CAP;
+  var imgArrSz: int64 := imgCap * 8;
+
+  var imageIds:      int64 := mmapAlloc(imgArrSz);
+  var imageWidths:   int64 := mmapAlloc(imgArrSz);
+  var imageHeights:  int64 := mmapAlloc(imgArrSz);
+  var imageChannels: int64 := mmapAlloc(imgArrSz);
+  var imageDataBufs: int64 := mmapAlloc(imgArrSz);
+  var imageDataLens: int64 := mmapAlloc(imgArrSz);
+  var pageImgMasks:  int64 := mmapAlloc(pageCap * 8);
+
+  if (imageIds == 0 || imageWidths == 0 || imageHeights == 0 || imageChannels == 0 ||
+      imageDataBufs == 0 || imageDataLens == 0 || pageImgMasks == 0) {
+    if (imageIds != 0)      { munmap(imageIds,      imgArrSz); }
+    if (imageWidths != 0)   { munmap(imageWidths,   imgArrSz); }
+    if (imageHeights != 0)  { munmap(imageHeights,  imgArrSz); }
+    if (imageChannels != 0) { munmap(imageChannels, imgArrSz); }
+    if (imageDataBufs != 0) { munmap(imageDataBufs, imgArrSz); }
+    if (imageDataLens != 0) { munmap(imageDataLens, imgArrSz); }
+    if (pageImgMasks != 0)  { munmap(pageImgMasks,  pageCap * 8); }
+    munmap(pageIds,     arrSize);
+    munmap(contentIds,  arrSize);
+    munmap(widths100,   arrSize);
+    munmap(heights100,  arrSize);
+    munmap(contentBufs, arrSize);
+    munmap(contentLens, arrSize);
+    munmap(contentCaps, arrSize);
+    munmap(doc, PDF_DOC_SIZE);
+    return 0;
+  }
+
+  zeroMem(imageIds,      imgArrSz);
+  zeroMem(imageWidths,   imgArrSz);
+  zeroMem(imageHeights,  imgArrSz);
+  zeroMem(imageChannels, imgArrSz);
+  zeroMem(imageDataBufs, imgArrSz);
+  zeroMem(imageDataLens, imgArrSz);
+  zeroMem(pageImgMasks,  pageCap * 8);
+
+  poke64(doc + PDF_DOC_IMAGECOUNT,     0);
+  poke64(doc + PDF_DOC_IMAGECAP,       imgCap);
+  poke64(doc + PDF_DOC_IMAGEIDS,       imageIds);
+  poke64(doc + PDF_DOC_IMAGEWIDTHS,    imageWidths);
+  poke64(doc + PDF_DOC_IMAGEHEIGHTS,   imageHeights);
+  poke64(doc + PDF_DOC_IMAGECHANNELS,  imageChannels);
+  poke64(doc + PDF_DOC_IMAGEDATABUFS,  imageDataBufs);
+  poke64(doc + PDF_DOC_IMAGEDATALENS,  imageDataLens);
+  poke64(doc + PDF_DOC_PAGEIMAGEMASKS, pageImgMasks);
+
   return doc;
 }
 
@@ -152,6 +214,38 @@ pub fn PdfFree(doc: int64): void {
   munmap(peek64(doc + PDF_DOC_CONTENTBUFS), arrSize);
   munmap(peek64(doc + PDF_DOC_CONTENTLENS), arrSize);
   munmap(peek64(doc + PDF_DOC_CONTENTCAPS), arrSize);
+
+  // Free compressed image data, then image metadata arrays
+  var imgCap:   int64 := peek64(doc + PDF_DOC_IMAGECAP);
+  var imgArrSz: int64 := imgCap * 8;
+  var imgCount: int64 := peek64(doc + PDF_DOC_IMAGECOUNT);
+  var imgDBufs: int64 := peek64(doc + PDF_DOC_IMAGEDATABUFS);
+  var imgDLens: int64 := peek64(doc + PDF_DOC_IMAGEDATALENS);
+
+  if (imgDBufs != 0) {
+    var ii: int64 := 0;
+    while (ii < imgCount) {
+      var ibuf: int64 := arrGet(imgDBufs, ii);
+      var ilen: int64 := arrGet(imgDLens, ii);
+      if (ibuf != 0 && ilen > 0) { munmap(ibuf, ilen); }
+      ii := ii + 1;
+    }
+  }
+
+  var imgIdsPtr: int64 := peek64(doc + PDF_DOC_IMAGEIDS);
+  var imgWPtr:   int64 := peek64(doc + PDF_DOC_IMAGEWIDTHS);
+  var imgHPtr:   int64 := peek64(doc + PDF_DOC_IMAGEHEIGHTS);
+  var imgCPtr:   int64 := peek64(doc + PDF_DOC_IMAGECHANNELS);
+  var pgImgPtr:  int64 := peek64(doc + PDF_DOC_PAGEIMAGEMASKS);
+
+  if (imgIdsPtr != 0) { munmap(imgIdsPtr, imgArrSz); }
+  if (imgWPtr   != 0) { munmap(imgWPtr,   imgArrSz); }
+  if (imgHPtr   != 0) { munmap(imgHPtr,   imgArrSz); }
+  if (imgCPtr   != 0) { munmap(imgCPtr,   imgArrSz); }
+  if (imgDBufs  != 0) { munmap(imgDBufs,  imgArrSz); }
+  if (imgDLens  != 0) { munmap(imgDLens,  imgArrSz); }
+  if (pgImgPtr  != 0) { munmap(pgImgPtr,  pageCap * 8); }
+
   munmap(doc, PDF_DOC_SIZE);
 }
 
@@ -318,6 +412,45 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     fi := fi + 1;
   }
 
+  // --- Image XObject objects ---
+  var imageCount:    int64 := peek64(doc + PDF_DOC_IMAGECOUNT);
+  var imageIds:      int64 := peek64(doc + PDF_DOC_IMAGEIDS);
+  var imageWidths:   int64 := peek64(doc + PDF_DOC_IMAGEWIDTHS);
+  var imageHeights:  int64 := peek64(doc + PDF_DOC_IMAGEHEIGHTS);
+  var imageChannels: int64 := peek64(doc + PDF_DOC_IMAGECHANNELS);
+  var imageDataBufs: int64 := peek64(doc + PDF_DOC_IMAGEDATABUFS);
+  var imageDataLens: int64 := peek64(doc + PDF_DOC_IMAGEDATALENS);
+
+  var imgIdx: int64 := 0;
+  while (imgIdx < imageCount) {
+    var imgId:  int64 := arrGet(imageIds,      imgIdx);
+    var imgW:   int64 := arrGet(imageWidths,   imgIdx);
+    var imgH:   int64 := arrGet(imageHeights,  imgIdx);
+    var imgC:   int64 := arrGet(imageChannels, imgIdx);
+    var imgBuf: int64 := arrGet(imageDataBufs, imgIdx);
+    var imgLen: int64 := arrGet(imageDataLens, imgIdx);
+
+    poke64(xrefs + imgId * 8, pos);
+    pos := pdfObjHdr(out, pos, imgId);
+    pos := pdfStr(out, pos, "<< /Type /XObject /Subtype /Image /Width ");
+    pos := pdfInt(out, pos, imgW);
+    pos := pdfStr(out, pos, " /Height ");
+    pos := pdfInt(out, pos, imgH);
+    if (imgC == 1) {
+      pos := pdfStr(out, pos, " /ColorSpace /DeviceGray");
+    } else {
+      pos := pdfStr(out, pos, " /ColorSpace /DeviceRGB");
+    }
+    pos := pdfStr(out, pos, " /BitsPerComponent 8 /Filter /FlateDecode /Length ");
+    pos := pdfInt(out, pos, imgLen);
+    pos := pdfStr(out, pos, " >>\nstream\n");
+    pos := pdfBytes(out, pos, imgBuf, imgLen);
+    pos := pdfStr(out, pos, "\nendstream");
+    pos := pdfObjFtr(out, pos);
+
+    imgIdx := imgIdx + 1;
+  }
+
   // --- Per-page objects ---
   var compression: int64 := peek64(doc + PDF_DOC_COMPRESSION);
   i := 0;
@@ -350,7 +483,24 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
       }
       fj := fj + 1;
     }
-    pos := pdfStr(out, pos, " >> >> /Contents ");
+    pos := pdfStr(out, pos, " >>");
+    // /XObject resource: one entry per image used on this page
+    var imgMask: int64 := arrGet(peek64(doc + PDF_DOC_PAGEIMAGEMASKS), i);
+    if (imgMask != 0) {
+      pos := pdfStr(out, pos, " /XObject <<");
+      var ij: int64 := 0;
+      while (ij < imageCount) {
+        if ((imgMask >> ij) & 1 != 0) {
+          pos := pdfStr(out, pos, " /Im");
+          pos := pdfInt(out, pos, ij);
+          poke8(out + pos, 32); pos := pos + 1;
+          pos := pdfRef(out, pos, arrGet(imageIds, ij));
+        }
+        ij := ij + 1;
+      }
+      pos := pdfStr(out, pos, " >>");
+    }
+    pos := pdfStr(out, pos, " >> /Contents ");
     pos := pdfRef(out, pos, contentId);
     pos := pdfStr(out, pos, " >>");
     pos := pdfObjFtr(out, pos);
