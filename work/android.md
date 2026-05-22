@@ -564,33 +564,100 @@ make singularity   # S3 == S4
 
 ---
 
-### WP-AND-08: APK-Packaging-Integration
+### WP-AND-08: APK-Packaging — ZIP + APK-Builder voll, AXML/Dex/Signing extern
 
 **Ziel:** `lyxc --target=android-arm64 --package=apk` erzeugt eine installierbare
 `.apk`-Datei direkt.
 
-**Aufwand:** 16h
+**Aufwand:** 16h (tatsächlich ~2h für lieferbaren Scope; Phase B AXML+Dex+Signing
+würde ~10-12h zusätzlich brauchen)
 
-**APK-Struktur:**
-```
-MyApp.apk
-├── AndroidManifest.xml    (kompiliertes AXML)
-├── classes.dex            (Stub-Java, nur für NativeActivity)
-├── lib/arm64-v8a/
-│   └── libmain.so         (Lyx-kompilierte Bibliothek)
-├── res/                   (Ressourcen, optional)
-└── META-INF/
-    ├── CERT.RSA           (Debug-Signatur)
-    └── MANIFEST.MF
+**Geliefert (2 neue Units + Demo):**
+
+| Modul | Status |
+|---|---|
+| `std/android/zip_writer.lyx` | **voll funktional**: `ZipWriter` Class mit `AddFileStored(name, data, len)` + `Finalize()` + `GetBuf()/GetLen()`. Schreibt LFH+Daten inline, akkumuliert Central Directory, finalisiert mit CD+EOCD. CRC-32 (IEEE 802.3) inline. Stored-only (Android verlangt das für `.so` sowieso). |
+| `std/android/apk_builder.lyx` | **voll funktional**: `ApkBuilder` Class wraps `ZipWriter` mit `AddAxmlManifest`, `AddDexStub`, `AddSharedLib(arch, name, …)`, `AddResource`. Kanonische Pfade (`lib/arm64-v8a/libfoo.so`, etc.). |
+| `examples/android/build_apk_demo.lyx` | End-to-end Demo: synthetische AXML/DEX/SO-Buffer → assemblierte `.apk` |
+
+**Tasks-Status:**
+- [x] ZIP-Writer in Lyx (pure Lyx, kein externer `zip`)
+- [x] APK-Layout-Helper (kanonische Pfade für `lib/<arch>/`, `AndroidManifest.xml`,
+      `classes.dex`)
+- [ ] AXML-Encoder — **extern** via `aapt2 compile` + `aapt2 link`
+- [ ] `classes.dex` Stub-Generator — **extern** via `d8` (Stub-Java + d8)
+- [ ] Debug-Keystore-Signierung — **extern** via `apksigner sign`
+- [ ] `adb install` Wrapper — pure Lyx via `exec("adb", [...])` möglich, nicht implementiert
+- [ ] End-to-End-Install-Test — out-of-scope ohne Android-Device
+
+**Warum extern statt pure Lyx?**
+| Komponente | Pure-Lyx-Aufwand |
+|---|---|
+| AXML-Encoder | ~6h (String-Pool, Namespace-Handling, Attribut-Typing, Bin-XML-Format) |
+| classes.dex Gen | ~5h (Dex-Header, String-/Type-/Method-IDs, ClassDef, AccessFlags) |
+| v1 JAR-Signing | ~3h (SHA-1 + RSA-PKCS#7 — RSA blockt teilweise upstream) |
+| v2/v3 Signing | ~5h (SHA-256 + ECDSA, "APK Signature Scheme v2 Block") |
+
+→ Insgesamt 19h+ Crypto/Format-Arbeit für was, was aapt2/d8/apksigner in
+einem Build-Schritt erledigen. Pragmatik gewinnt: pure Lyx liefert die
+**Komposition** (ZIP), externe Tools die **Format-Encoding-Spezialisten**.
+
+**Verifikation:**
+```bash
+./lyxc --compile-unit std/android/zip_writer.lyx -o /tmp/x.lyu   # OK
+./lyxc --compile-unit std/android/apk_builder.lyx -o /tmp/x.lyu  # OK
+
+./lyxc examples/android/build_apk_demo.lyx -o /tmp/build_apk_demo
+/tmp/build_apk_demo   # schreibt /tmp/demo.unsigned.apk (segfault auf Exit
+                      # ist preexistent in Lyx runtime cleanup, APK schon
+                      # vorher fertig geschrieben)
+
+unzip -l /tmp/demo.unsigned.apk
+#   Length      Date    Time    Name
+#        128  1980-01-01 00:00  AndroidManifest.xml
+#        256  1980-01-01 00:00  classes.dex
+#        512  1980-01-01 00:00  lib/arm64-v8a/libdemo.so
+unzip -p /tmp/demo.unsigned.apk lib/arm64-v8a/libdemo.so | head -c 16
+#   SSSSSSSSSSSSSSSS  (synthetische Fill-Bytes; im Real-Build ist es echte .so)
+
+make singularity   # S3 == S4
 ```
 
-**Tasks:**
-- [ ] ZIP-Writer in Lyx (oder Aufruf von `zip` als externem Tool)
-- [ ] AXML-Encoder für `AndroidManifest.xml`
-- [ ] `classes.dex` Stub-Generator (minimales Dex für NativeActivity)
-- [ ] Debug-Keystore-Signierung (via `apksigner` oder eigene Implementierung)
-- [ ] `adb install` Wrapper: `lyxc --install` deployt direkt aufs Gerät
-- [ ] Test: `adb install MyApp.apk` funktioniert, App startet
+**Komplette Build-Pipeline (Phase A funktional):**
+```bash
+# 1. .so kompilieren
+./lyxc --target=android-arm64 --shared --android-api=26 myapp.lyx -o libmyapp.so
+
+# 2. AndroidManifest.xml als Text generieren (via std.android.manifest_gen)
+./lyxc -o gen_manifest examples/android/manifest_demo.lyx
+./gen_manifest > AndroidManifest.xml
+
+# 3. AXML kompilieren (extern)
+aapt2 compile -o build/res.zip res/
+aapt2 link -o myapp.unsigned.apk --manifest AndroidManifest.xml \
+  -I $ANDROID_SDK/platforms/android-34/android.jar
+# (aapt2 link schreibt die AXML in die unsigned APK; wir extrahieren sie
+#  oder lassen aapt2 die ganze APK bauen — letzteres ist üblicher)
+
+# 4. classes.dex (extern)
+echo 'public class Stub {}' > Stub.java && javac --release 21 Stub.java
+d8 --min-api 21 --output classes/ Stub.class
+
+# 5. Mit Lyx assemblieren (anstelle von aapt2 link, falls man Volle Kontrolle will)
+# → ApkBuilder.AddAxmlManifest / AddDexStub / AddSharedLib / Finalize
+
+# 6. Signieren (extern)
+apksigner sign --ks debug.keystore --ks-pass pass:android \
+  --out myapp.apk myapp.unsigned.apk
+
+# 7. Installieren (extern)
+adb install -r myapp.apk
+```
+
+**Phase B (offen)** würde Schritte 3, 4, 6 durch pure-Lyx-Implementierungen
+ersetzen (`std.android.axml_encoder`, `std.android.dex_gen`,
+`std.android.apk_sign`). Schritte 5 und 7 sind bereits Lyx-seitig
+abdeckbar (Builder existiert, adb-wrapper trivial).
 
 ---
 
