@@ -44,23 +44,37 @@ Phase 5: APK-Packaging + Build-Pipeline            ← Distribution
 
 ## 4. Work Packages
 
-### WP-AND-01: Android-Zielplattform registrieren
+### WP-AND-01: Android-Zielplattform registrieren ✅ (erledigt, Branch `feat/android-backend`)
 
 **Ziel:** `--target=android-arm64` und `--target=android-x86_64` als gültige
 Ziele im Compiler.
 
-**Aufwand:** 2h
+**Aufwand:** 2h (tatsächlich: ~30 min)
 
-**Betroffene Dateien:**
-- `compiler/backend/backend_types.pas` — neues `btAndroidArm64`, `btAndroidX86`
-- `compiler/lyxc.lpr` — CLI-Argument-Parsing `--target=android-arm64`
-- `bootstrap/codegen.lyx` — entsprechende Bootstrap-Erweiterung
+**Betroffene Dateien (aktualisiert nach Singularität):**
+- `src/lyxc.lyx` — alle CLI/Target/Dispatch-Änderungen liegen jetzt zentral hier
+  (FPC-Bootstrap `compiler/`/`bootstrap/` existiert seit 2026-03-30 nicht mehr).
 
 **Tasks:**
-- [ ] `TBackendTarget` Enum um `btAndroidArm64`, `btAndroidX86_64` erweitern
-- [ ] Target-String-Mapping: `"android-arm64"` → `btAndroidArm64`
-- [ ] Default-Architektur-Auswahl: Android → ARM64
-- [ ] Version-Header anpassen: Dokumentation der neuen Targets
+- [x] Target-Konstanten `TARGET_ANDROID_ARM64 = 12`, `TARGET_ANDROID_X86_64 = 13` ergänzt
+- [x] Target-String-Mapping: `android-arm64`, `android-x86_64`, `android` (Alias → ARM64)
+- [x] Default-Architektur-Auswahl: `--target=android` → ARM64 (Android 5.0+ Pflicht)
+- [x] Codegen-Dispatch: Android-ARM64 → `emitARM64`, Android-X86_64 → `emitX86_64`
+      (Bionic-ABI-Anpassungen verschoben auf WP-AND-03)
+- [x] ELF `e_machine = 183` (EM_AARCH64) für Android-ARM64
+- [x] Help-Text + `--config` Targets-Liste ergänzt
+- [x] `GetTargetName()` liefert `android-arm64` / `android-x86_64`
+- [x] Singularität verifiziert (S3 == S4 bit-identisch)
+
+**Verifikation:**
+```bash
+./lyxc --target=android-arm64   examples/basics/hello.lyx -o /tmp/and_arm
+./lyxc --target=android-x86_64  examples/basics/hello.lyx -o /tmp/and_x86
+./lyxc --target=android         examples/basics/hello.lyx -o /tmp/and_def
+file /tmp/and_arm   # ELF 64-bit LSB executable, ARM aarch64
+file /tmp/and_x86   # ELF 64-bit LSB executable, x86-64
+file /tmp/and_def   # ELF 64-bit LSB executable, ARM aarch64  (Android default = ARM64)
+```
 
 ---
 
@@ -311,7 +325,11 @@ adb shell /data/local/tmp/libhello
 ## 10. Siehe auch
 
 - `backend-upgrade.md` — Bestehende Backend-Upgrade-Roadmap
-- `compiler/backend/arm64/` — ARM64-Backend (Basis für Android)
-- `compiler/backend/elf/` — ELF-Writer (Basis für .so-Ausgabe)
+- `src/backend/arm64/emit_arm64.lyx` — ARM64-Backend (Basis für Android)
+- `src/backend/elf/` — ELF-Writer (Basis für .so-Ausgabe)
+- `src/lyxc.lyx` — zentraler ELF-Header-Writer (z.B. `e_machine`-Dispatch)
 - `std/net/internal/syscalls_linux.lyu` — Linux-Syscall-Referenz
-- `bootstrap/backend/arm64/` — Bootstrap ARM64-Backend
+
+> **Hinweis:** Seit Singularität (2026-03-30) ist der FPC-Bootstrap (`compiler/`,
+> `bootstrap/`) Geschichte. Sämtlicher Compilercode liegt in `src/` als Lyx-Quellen
+> und wird von `src/lyxc_bootstrap` (singularitätsverifiziertes Seed-Binary) kompiliert.
