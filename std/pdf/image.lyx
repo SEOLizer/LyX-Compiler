@@ -1,0 +1,107 @@
+// std/pdf/image.lyx
+// PDF raster image support: embed and draw pixel buffers (WP-PDF-06)
+// Supported formats: 8-bit grayscale (channels=1) or 8-bit RGB (channels=3).
+// Pixel data layout: row-major, bottom-row first (PDF coordinate origin is bottom-left).
+
+@description("PDF raster images: PdfAddImage, PdfDrawImage")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.image;
+
+import std.pdf.builder;
+import std.pdf.objects;
+import std.pdf.compress;
+
+// Register a raster image with the document.
+// data:     pointer to raw pixel bytes (row-major, bottom-row first for PDF coords)
+// pw, ph:   pixel width and height
+// channels: 1 = grayscale (DeviceGray), 3 = RGB (DeviceRGB)
+// Returns the image index (0-based) to pass to PdfDrawImage, or -1 on error.
+// Up to PDF_INITIAL_IMAGE_CAP (16) images per document.
+pub fn PdfAddImage(doc: int64, data: int64, pw: int64, ph: int64, channels: int64): int64 {
+  if (doc == 0 || data == 0 || pw <= 0 || ph <= 0) { return -1; }
+  if (channels != 1 && channels != 3) { return -1; }
+
+  var imgCount: int64 := peek64(doc + PDF_DOC_IMAGECOUNT);
+  if (imgCount >= peek64(doc + PDF_DOC_IMAGECAP)) { return -1; }
+
+  // Compress raw pixels into a temporary oversized buffer, then trim
+  var rawLen: int64 := pw * ph * channels;
+  var maxOut: int64 := zlibMaxOutputSize(rawLen);
+  var tmpbuf: int64 := mmap(0, maxOut, 3, 34, -1, 0);
+  if (tmpbuf == 0) { return -1; }
+
+  var czlen: int64 := zlibCompress(data, rawLen, tmpbuf);
+  if (czlen <= 0) {
+    munmap(tmpbuf, maxOut);
+    return -1;
+  }
+
+  // Trim to exact compressed size: munmap(buf, len) in PdfFree uses czlen
+  var czbuf: int64 := mmap(0, czlen, 3, 34, -1, 0);
+  if (czbuf == 0) {
+    munmap(tmpbuf, maxOut);
+    return -1;
+  }
+  var ci: int64 := 0;
+  while (ci < czlen) {
+    poke8(czbuf + ci, peek8(tmpbuf + ci));
+    ci := ci + 1;
+  }
+  munmap(tmpbuf, maxOut);
+
+  // Assign a new PDF object ID for this image XObject
+  var nextId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, nextId + 1);
+
+  var imgIdsPtr:  int64 := peek64(doc + PDF_DOC_IMAGEIDS);
+  var imgWPtr:    int64 := peek64(doc + PDF_DOC_IMAGEWIDTHS);
+  var imgHPtr:    int64 := peek64(doc + PDF_DOC_IMAGEHEIGHTS);
+  var imgCPtr:    int64 := peek64(doc + PDF_DOC_IMAGECHANNELS);
+  var imgBufsPtr: int64 := peek64(doc + PDF_DOC_IMAGEDATABUFS);
+  var imgLensPtr: int64 := peek64(doc + PDF_DOC_IMAGEDATALENS);
+
+  poke64(imgIdsPtr  + imgCount * 8, nextId);
+  poke64(imgWPtr    + imgCount * 8, pw);
+  poke64(imgHPtr    + imgCount * 8, ph);
+  poke64(imgCPtr    + imgCount * 8, channels);
+  poke64(imgBufsPtr + imgCount * 8, czbuf);
+  poke64(imgLensPtr + imgCount * 8, czlen);
+
+  poke64(doc + PDF_DOC_IMAGECOUNT, imgCount + 1);
+  return imgCount;
+}
+
+// Place image imgIdx on the given page.
+// (x, y) is the bottom-left corner in PDF points (origin = bottom-left of page).
+// (wPts, hPts) is the rendered size in points (may differ from pixel dimensions).
+pub fn PdfDrawImage(doc: int64, page: int64, imgIdx: int64, x: f64, y: f64, wPts: f64, hPts: f64): void {
+  if (doc == 0) { return; }
+  if (imgIdx < 0 || imgIdx >= peek64(doc + PDF_DOC_IMAGECOUNT)) { return; }
+
+  // Mark image as used on this page
+  var pgImgMasks: int64 := peek64(doc + PDF_DOC_PAGEIMAGEMASKS);
+  var mask: int64 := peek64(pgImgMasks + page * 8);
+  poke64(pgImgMasks + page * 8, mask | (1 << imgIdx));
+
+  if (PdfContentEnsure(doc, page, 128) == 0) { return; }
+
+  var buf: int64 := arrGet(peek64(doc + PDF_DOC_CONTENTBUFS), page);
+  var pos: int64 := arrGet(peek64(doc + PDF_DOC_CONTENTLENS), page);
+
+  // q
+  // <wPts> 0 0 <hPts> <x> <y> cm   — place+scale image
+  // /Im<n> Do
+  // Q
+  pos := pdfStr(buf, pos, "q\n");
+  pos := pdfReal(buf, pos, wPts); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfStr(buf, pos, "0 0 ");
+  pos := pdfReal(buf, pos, hPts); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal(buf, pos, x);    poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal(buf, pos, y);
+  pos := pdfStr(buf, pos, " cm\n/Im");
+  pos := pdfInt(buf, pos, imgIdx);
+  pos := pdfStr(buf, pos, " Do\nQ\n");
+
+  arrSet(peek64(doc + PDF_DOC_CONTENTLENS), page, pos);
+}
