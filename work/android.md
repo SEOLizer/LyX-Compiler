@@ -83,19 +83,48 @@ file /tmp/and_def   # ELF 64-bit LSB executable, ARM aarch64  (Android default =
 **Ziel:** Lyx kann neben statischen Executables auch `libfoo.so`-Dateien erzeugen,
 die von Android-Apps per `System.loadLibrary()` geladen werden.
 
-**Aufwand:** 8h
+**Aufwand:** 8h (Phase A erledigt: ~2h)
 
 **Betroffene Dateien:**
-- `compiler/backend/elf/` — ELF-Writer erweitern
-- Neues Flag: `--output-type=shared-lib`
+- `src/lyxc.lyx` — neue Funktion `writeELFSharedLib`; `--output-type` CLI; Dispatch
 
-**Tasks:**
-- [ ] ELF-Header: `ET_DYN` statt `ET_EXEC` für Shared Libraries
+**Phasen-Split:**
+
+**Phase A — Strukturell valides ET_DYN ✅ (Branch `feat/android-backend`)**
+- [x] CLI: `--output-type=executable|shared-lib`, `--shared` Alias
+- [x] ELF-Header: `ET_DYN` (3) statt `ET_EXEC` (2)
+- [x] `e_entry = 0` (kein Entry-Point für Shared Lib)
+- [x] 3 Program-Header: PT_LOAD R-X (Code), PT_LOAD RW (Daten), PT_DYNAMIC
+- [x] `.dynamic`-Sektion mit `DT_HASH`, `DT_STRTAB`, `DT_SYMTAB`, `DT_STRSZ`,
+      `DT_SYMENT`, `DT_SONAME`, `DT_NULL`
+- [x] `.dynsym` (1 UNDEF-Eintrag), `.dynstr` (NUL + soname), `.hash` (SysV-Klassik)
+- [x] `DT_SONAME` aus Basename des Output-Pfads abgeleitet
+- [x] x86_64 Fast-Path-Bypass bei `--output-type=shared-lib`
+- [x] Singularität verifiziert (S3 == S4)
+
+**Phase B — Symbol-Export (offen)**
 - [ ] PIC-Code-Generierung: Position-Independent Code aktivieren (GOT/PLT)
-- [ ] Symbol-Export: `@export` Annotation für JNI-Symbole (`Java_*`-Namensschema)
-- [ ] `.dynamic`-Sektion mit `DT_SONAME`, `DT_NEEDED`
-- [ ] Relocations: `R_AARCH64_*` für ARM64 PIC
-- [ ] Test: `aarch64-linux-android-readelf -d libtest.so` zeigt korrekte Struktur
+- [ ] `@export` Annotation im Parser/Sema
+- [ ] `@jni(class="…", method="…")` Annotation für JNI-Symbole
+- [ ] `Java_<class>_<method>`-Mangling
+- [ ] `.dynsym/.dynstr/.hash` mit echten Exporteinträgen statt UNDEF-Sentinel
+- [ ] `DT_NEEDED` für externe Abhängigkeiten
+
+**Phase C — Relocations + Real-World-Test (offen)**
+- [ ] Relocations: `R_AARCH64_GLOB_DAT`, `R_AARCH64_JUMP_SLOT`, `R_AARCH64_RELATIVE`
+- [ ] `.rela.dyn` / `.rela.plt` Sektionen
+- [ ] Test: `aarch64-linux-android-readelf -d libtest.so` (NDK)
+- [ ] Test: Lade `.so` in minimaler Android-App ohne Crash
+
+**Verifikation Phase A:**
+```bash
+./lyxc --target=android-arm64  --shared      examples/basics/hello.lyx -o /tmp/libhello.so
+./lyxc --target=android-x86_64 --output-type=shared-lib examples/basics/hello.lyx -o /tmp/libhello-x86.so
+file     /tmp/libhello.so       # ELF 64-bit LSB shared object, ARM aarch64, dynamically linked
+readelf -h /tmp/libhello.so     # Type: DYN (Shared object file)
+readelf -l /tmp/libhello.so     # 3 program headers: LOAD R-E, LOAD RW, DYNAMIC
+readelf -d /tmp/libhello.so     # HASH, STRTAB, SYMTAB, STRSZ, SYMENT, SONAME, NULL
+```
 
 ---
 

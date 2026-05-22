@@ -76,6 +76,10 @@ con FORMAT_ELF: int64 := 1;
 con FORMAT_PE: int64 := 2;
 con FORMAT_MACHO: int64 := 3;
 
+// Output types (WP-AND-02)
+con OUTPUT_TYPE_EXECUTABLE: int64 := 0;
+con OUTPUT_TYPE_SHARED_LIB: int64 := 1;
+
 // ============================================================================
 // Command Line Options
 // ============================================================================
@@ -204,6 +208,9 @@ pub type CompilerConfig = class {
   unitInfoFile:  int64;   // --unit-info: 0=unset, 1=sentinel, 2=set (path in unitInfoPath)
   unitInfoPath:  int64;   // --unit-info <file> path (stored as int64, cast to pchar)
 
+  // WP-AND-02: shared library output (--output-type=shared-lib / --shared)
+  outputType:    int64;   // OUTPUT_TYPE_EXECUTABLE (default) | OUTPUT_TYPE_SHARED_LIB
+
   // Compilation state
   exitCode: int64;
   earlyExit: bool;
@@ -267,6 +274,7 @@ pub type CompilerConfig = class {
     self.compileUnit    := false;
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
+    self.outputType     := OUTPUT_TYPE_EXECUTABLE;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -308,7 +316,8 @@ pub type CompilerConfig = class {
     self.warnAll := false;
     self.asmListing := false;
     self.lintOnly := false;
-    
+    self.outputType := OUTPUT_TYPE_EXECUTABLE;
+
     // Force verbose off for now
     self.enableVerbose := false;
     
@@ -485,6 +494,23 @@ pub type CompilerConfig = class {
     // --output= or -o
     if StrStartsWith(arg, "--output=") {
       self.outputFile := arg + 9;
+      return;
+    }
+
+    // --output-type=executable|shared-lib (WP-AND-02)
+    if StrStartsWith(arg, "--output-type=") {
+      var val: int64 := arg + 14;
+      if StrCmp(val, "executable"c) == 0 || StrCmp(val, "exe"c) == 0 {
+        self.outputType := OUTPUT_TYPE_EXECUTABLE;
+      } else if StrCmp(val, "shared-lib"c) == 0 || StrCmp(val, "so"c) == 0 || StrCmp(val, "shared"c) == 0 {
+        self.outputType := OUTPUT_TYPE_SHARED_LIB;
+      }
+      return;
+    }
+
+    // --shared (alias for --output-type=shared-lib, WP-AND-02)
+    if StrCmp(arg, "--shared"c) == 0 {
+      self.outputType := OUTPUT_TYPE_SHARED_LIB;
       return;
     }
     
@@ -817,6 +843,8 @@ pub type CompilerConfig = class {
     PrintStrLn("                          android-arm64, android-x86_64)");
     PrintStrLn("  --arch=ARCH            Architektur (x86_64, arm64, xtensa, riscv)");
     PrintStrLn("  --format=<fmt>         Ausgabeformat (elf, pe, macho)");
+    PrintStrLn("  --output-type=<typ>    Ausgabe-Typ (executable [Standard], shared-lib)");
+    PrintStrLn("  --shared               Kurzform fuer --output-type=shared-lib (ELF .so)");
     PrintStrLn("  --target-energy=<1-5>  Energy-Ziel (1=Minimal, 5=Extreme)");
     PrintStrLn("  --emit-asm             IR als Pseudo-Assembler ausgeben");
     PrintStrLn("  --asm-listing          Assembly-Listing mit Source-Zeilen (DO-178C 6.1)");
@@ -1023,7 +1051,8 @@ pub type CompilerConfig = class {
 
     // Stage 5-8 (x86_64 fast path): use direct AST→ELF Codegen (proven, no IR needed)
     // WP-BC-47: skip fast path when --provenance is set (needs IR)
-    if self.target == TARGET_X86_64 && !self.provenance {
+    // WP-AND-02: skip fast path for shared-lib output (needs ET_DYN writer via writeBinary)
+    if self.target == TARGET_X86_64 && !self.provenance && self.outputType != OUTPUT_TYPE_SHARED_LIB {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5x: int64 := self._passStart("codegen-x86_64"c);
@@ -1670,6 +1699,9 @@ pub type CompilerConfig = class {
   
   fn writeBinary(path: pchar, code: int64, size: int64): bool {
     if self.format == FORMAT_ELF {
+      if self.outputType == OUTPUT_TYPE_SHARED_LIB {
+        return self.writeELFSharedLib(path, code, size);
+      }
       return self.writeELF(path, code, size);
     } else if self.format == FORMAT_PE {
       return self.writePE(path, code, size);
@@ -1780,7 +1812,161 @@ pub type CompilerConfig = class {
     var result: int64 := FileWriteAll(path, elfBuf as pchar, elfSize) as int64;
     munmap(elfBuf, elfSize);
     chmod(path, 493);
-    
+
+    return result != 0;
+  }
+
+  // WP-AND-02: ELF Shared Library writer (ET_DYN).
+  // Produces a minimum-viable .so with .dynamic, .dynsym, .dynstr, .hash.
+  // No symbol exports yet (Phase B), no R_AARCH64_* relocations (Phase C).
+  fn writeELFSharedLib(path: pchar, code: int64, size: int64): bool {
+    // Derive SONAME basename from output path (after the last '/').
+    var pathLen: int64 := StrLen(path);
+    var baseStart: int64 := 0;
+    var k: int64 := 0;
+    while k < pathLen {
+      if peek8(path + k) == 47 { baseStart := k + 1; }  // '/'
+      k := k + 1;
+    }
+    var soNameLen: int64 := pathLen - baseStart;
+
+    // ---- File layout planning ----
+    var ehSize:     int64 := 64;
+    var phSize:     int64 := 56;
+    var phNum:      int64 := 3;     // PT_LOAD R-X, PT_LOAD RW, PT_DYNAMIC
+    var pageSize:   int64 := 4096;
+
+    var codeOff:    int64 := pageSize;          // .text starts at 0x1000
+    var codeEnd:    int64 := codeOff + size;
+
+    var dataOff:    int64 := ((codeEnd + pageSize - 1) / pageSize) * pageSize;
+
+    var dynNum:     int64 := 7;     // HASH, STRTAB, SYMTAB, STRSZ, SYMENT, SONAME, NULL
+    var dynOff:     int64 := dataOff;
+    var dynSize:    int64 := dynNum * 16;
+    var dynsymOff:  int64 := dynOff + dynSize;
+    var dynsymSize: int64 := 24;    // 1 UNDEF entry
+    var dynstrOff:  int64 := dynsymOff + dynsymSize;
+    var dynstrSize: int64 := 1 + soNameLen + 1; // \0 + soname + \0
+    var hashOffRaw: int64 := dynstrOff + dynstrSize;
+    var hashOff:    int64 := ((hashOffRaw + 7) / 8) * 8;
+    var hashSize:   int64 := 16;
+    var fileSize:   int64 := hashOff + hashSize;
+
+    // ---- Allocate + zero buffer ----
+    var fd: int64 := open(path, 577, 493);
+    if fd == -1 { return false; }
+    close(fd);
+
+    var buf: int64 := mmap(0, fileSize, 3, 34, -1, 0);
+    if buf == -1 { return false; }
+    var z: int64 := 0;
+    while z < fileSize { poke8(buf + z, 0); z := z + 1; }
+
+    // ---- Copy code into .text ----
+    var i: int64 := 0;
+    while i < size { poke8(buf + codeOff + i, peek8(code + i)); i := i + 1; }
+
+    // ---- ELF header ----
+    poke8(buf + 0, 127);                            // 0x7F
+    poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);  // 'E' 'L' 'F'
+    poke8(buf + 4, 2);                              // ELFCLASS64
+    poke8(buf + 5, 1);                              // ELFDATA2LSB
+    poke8(buf + 6, 1);                              // EV_CURRENT
+    poke8(buf + 7, 0);                              // ELFOSABI_SYSV
+    // e_ident[8..15] already zero
+
+    poke16(buf + 16, 3);                            // e_type = ET_DYN
+    var emach: int64 := 62;                         // EM_X86_64
+    if self.target == TARGET_ARM64 { emach := 183; }
+    if self.target == TARGET_ANDROID_ARM64 { emach := 183; }
+    poke16(buf + 18, emach);                        // e_machine
+    poke32(buf + 20, 1);                            // e_version
+    poke64(buf + 24, 0);                            // e_entry = 0 (shared lib)
+    poke64(buf + 32, 64);                           // e_phoff
+    poke64(buf + 40, 0);                            // e_shoff = 0 (no section headers)
+    poke32(buf + 48, 0);                            // e_flags
+    poke16(buf + 52, 64);                           // e_ehsize
+    poke16(buf + 54, 56);                           // e_phentsize
+    poke16(buf + 56, 3);                            // e_phnum
+    poke16(buf + 58, 0);                            // e_shentsize
+    poke16(buf + 60, 0);                            // e_shnum
+    poke16(buf + 62, 0);                            // e_shstrndx
+
+    // ---- Program headers (3 × 56 bytes) ----
+    var ph: int64 := 64;
+    // PT_LOAD #1: R-X, covers ELF header + program headers + .text
+    poke32(buf + ph,  1);          ph := ph + 4;    // p_type = PT_LOAD
+    poke32(buf + ph,  5);          ph := ph + 4;    // p_flags = PF_R|PF_X
+    poke64(buf + ph,  0);          ph := ph + 8;    // p_offset
+    poke64(buf + ph,  0);          ph := ph + 8;    // p_vaddr
+    poke64(buf + ph,  0);          ph := ph + 8;    // p_paddr
+    poke64(buf + ph,  codeEnd);    ph := ph + 8;    // p_filesz
+    poke64(buf + ph,  codeEnd);    ph := ph + 8;    // p_memsz
+    poke64(buf + ph,  pageSize);   ph := ph + 8;    // p_align
+
+    // PT_LOAD #2: RW, covers .dynamic + .dynsym + .dynstr + .hash
+    var seg2Size: int64 := fileSize - dataOff;
+    poke32(buf + ph,  1);          ph := ph + 4;    // p_type = PT_LOAD
+    poke32(buf + ph,  6);          ph := ph + 4;    // p_flags = PF_R|PF_W
+    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_offset
+    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_vaddr
+    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_paddr
+    poke64(buf + ph,  seg2Size);   ph := ph + 8;    // p_filesz
+    poke64(buf + ph,  seg2Size);   ph := ph + 8;    // p_memsz
+    poke64(buf + ph,  pageSize);   ph := ph + 8;    // p_align
+
+    // PT_DYNAMIC: points to .dynamic section
+    poke32(buf + ph,  2);          ph := ph + 4;    // p_type = PT_DYNAMIC
+    poke32(buf + ph,  6);          ph := ph + 4;    // p_flags = PF_R|PF_W
+    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_offset
+    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_vaddr
+    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_paddr
+    poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_filesz
+    poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_memsz
+    poke64(buf + ph,  8);                           // p_align
+
+    // ---- .dynamic ----
+    // Tag values via Elf64_Dyn (d_tag: i64, d_un: u64).
+    var d: int64 := dynOff;
+    // DT_HASH = 4
+    poke64(buf + d, 4);         poke64(buf + d + 8, hashOff);    d := d + 16;
+    // DT_STRTAB = 5
+    poke64(buf + d, 5);         poke64(buf + d + 8, dynstrOff);  d := d + 16;
+    // DT_SYMTAB = 6
+    poke64(buf + d, 6);         poke64(buf + d + 8, dynsymOff);  d := d + 16;
+    // DT_STRSZ = 10
+    poke64(buf + d, 10);        poke64(buf + d + 8, dynstrSize); d := d + 16;
+    // DT_SYMENT = 11
+    poke64(buf + d, 11);        poke64(buf + d + 8, 24);         d := d + 16;
+    // DT_SONAME = 14 (string at offset 1 into .dynstr)
+    poke64(buf + d, 14);        poke64(buf + d + 8, 1);          d := d + 16;
+    // DT_NULL = 0 (terminator)
+    poke64(buf + d, 0);         poke64(buf + d + 8, 0);
+
+    // ---- .dynsym: single UNDEF entry (all zeros) ----
+    // Bytes already zero from the initial fill — nothing to do.
+
+    // ---- .dynstr ----
+    // Byte 0: NUL (already zero)
+    // Bytes 1..1+soNameLen: SONAME basename
+    var si: int64 := 0;
+    while si < soNameLen {
+      poke8(buf + dynstrOff + 1 + si, peek8(path + baseStart + si));
+      si := si + 1;
+    }
+    // Trailing NUL is already zero.
+
+    // ---- .hash (DT_HASH classic SYSV format) ----
+    poke32(buf + hashOff + 0,  1);   // nbucket
+    poke32(buf + hashOff + 4,  1);   // nchain
+    poke32(buf + hashOff + 8,  0);   // bucket[0] = 0 (-> UNDEF symbol)
+    poke32(buf + hashOff + 12, 0);   // chain[0]  = 0 (end of chain)
+
+    // ---- Write + cleanup ----
+    var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;
+    munmap(buf, fileSize);
+    chmod(path, 493);
     return result != 0;
   }
 
