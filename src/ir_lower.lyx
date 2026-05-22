@@ -649,6 +649,39 @@ pub type IRLower = class {
     var fnlen: int64 := self.nodeSLen(expr);
     var arg0: int64 := self.nodeC0(expr);
 
+    // WP-AND-upstream-fix: _indirect_call_N(fnPtr, ...args) — N in 0..4.
+    // First user-syntax argument is the function pointer; remaining N are
+    // the call args. We lower the fn pointer to a temp, lower each user arg
+    // to a temp, copy those into slots 0..N-1 (the AArch64 emitter loads
+    // those slots into x0..x7 right before BLR), and emit IRO_CALL_INDIRECT
+    // with imm = N. NOTE: this clobbers the function's own slots 0..N-1 —
+    // callers (typically thin JNI / libandroid wrappers with no live locals
+    // other than the args they want to forward) should be written with that
+    // in mind. Once a full callee-saved-spill pass lands, this restriction
+    // disappears.
+    var indN: int64 := -1;
+    if (self.seq(fname, fnlen, "_indirect_call_0", 16)) { indN := 0; }
+    else if (self.seq(fname, fnlen, "_indirect_call_1", 16)) { indN := 1; }
+    else if (self.seq(fname, fnlen, "_indirect_call_2", 16)) { indN := 2; }
+    else if (self.seq(fname, fnlen, "_indirect_call_3", 16)) { indN := 3; }
+    else if (self.seq(fname, fnlen, "_indirect_call_4", 16)) { indN := 4; }
+    if (indN >= 0) {
+      if (arg0 < 0) { return dest; }
+      var fnTemp: int64 := self.lowerExpr(arg0);
+      var argNode: int64 := self.nodeNext(arg0);
+      var i: int64 := 0;
+      while (i < indN && argNode >= 0) {
+        var aTemp: int64 := self.lowerExpr(argNode);
+        // Store argTemp into slot `i` so the AArch64 emitter loads it into x{i}.
+        self.irAddInstrDirect(IRO_STORE_LOCAL, i, aTemp, -1, 0);
+        argNode := self.nodeNext(argNode);
+        i := i + 1;
+      }
+      // src1 = slot index of fn pointer, imm = arg count.
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, -1, indN);
+      return dest;
+    }
+
     // WP-BC-01: sqrt(f64) → IRO_FSQRT (sqrtsd in codegen)
     if (self.seq(fname, fnlen, "sqrt", 4)) {
       var src: int64 := dest;
@@ -1305,7 +1338,7 @@ pub type IRLower = class {
     poke64(funcBuf + off + 16, self.funcInstrStart);              // instrsOff
     poke64(funcBuf + off + 24, instrLen - self.funcInstrStart);   // instrCount
   }
-  
+
   fn getStringLen(off: int64): int64 {
     var strBuf: int64 := peek64(self.ir + 32);  // strBuffer at +32 (after VMT)
     var ptr: int64 := strBuf + off;

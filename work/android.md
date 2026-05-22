@@ -209,6 +209,60 @@ Verhalten, kein Bug.
 - [ ] NDK-Echttest: `aarch64-linux-android-readelf -d/-r libtest.so`
 - [ ] Emulator-Loadtest: `adb push` + Java-App ruft `Java_com_example_*` auf
 
+---
+
+## Upstream-Fix: `_indirect_call_N` Builtins (ARM64)
+
+Eine kleine Lücke war doch lieferbar — Frontend für Function-Pointer-Casts ist
+weiterhin offen, aber das **AArch64-Backend hat `emitCallIndirect` schon**
+fertig, und durch Builtin-Erkennung in `ir_lower.lowerCall` erreichen wir den
+Pfad ohne Parser-Eingriff.
+
+**Geliefert:**
+- `_indirect_call_0(fn)` bis `_indirect_call_4(fn, a, b, c, d)`
+- `ir_lower.lowerCall` erkennt diese Namen, lowert die User-Args in Slots 0..N-1,
+  emittiert `IRO_CALL_INDIRECT` mit `src1=fnSlot`, `imm=N`
+- `emit_arm64.emitCallIndirect(ptrSlot, argCount, dest)` lädt x0..x7 aus den
+  Slots wie `emitCall`, dann `BLR x9` (Disassembly: `20 01 3f d6` an der erwarteten
+  Position bestätigt)
+- Sema-Registrierung der 5 Builtin-Namen
+- Singularity nach Codegen-Eingriff verifiziert (Hash `394983f9...`)
+
+**JNI-Wrapper in `std/android/jni.lyx`:**
+17 neue Helper-Funktionen (`JNI_GetVersion`, `JNI_FindClass`, `JNI_GetMethodID`,
+`JNI_NewStringUTF`, `JNI_GetStringUTFChars/ReleaseStringUTFChars`,
+`JNI_NewByteArray`, `JNI_Get/ReleaseByteArrayElements`, `JNI_GetArrayLength`,
+`JNI_ExceptionCheck/Clear`, `JNI_DeleteLocalRef`, `JNI_NewGlobalRef/Delete`,
+`JNI_GetJavaVM`, …). Jeder ein dreizeiliger Wrapper über `_indirect_call_N`.
+
+**Vollständig nutzbar?** Nicht ganz — die Wrapper kompilieren korrekt, aber
+**Aufrufe von User-Funktionen aus User-Funktionen** sind im aktuellen
+`ir_lower.lowerCall` nicht implementiert (fällt auf den kaputten
+`IRO_CALL_BUILTIN id=1` = `write(1, …)`-Syscall zurück). Bis der User-Function-
+Call-Pfad in `ir_lower` landet, müssen JNI-Callbacks **inline** geschrieben
+werden — Beispiel: `examples/android/jni_callback_inline.lyx` zeigt das Muster
+ohne Wrapper-Indirektion.
+
+**Verifikation:**
+```bash
+./lyxc --target=android-arm64 --shared --android-api=26 \
+       examples/android/jni_callback_inline.lyx -o /tmp/libjniinline.so
+
+readelf -D --syms -W /tmp/libjniinline.so
+#   1: 0x0   FUNC GLOBAL Java_com_example_MyClass_nativeJNIVersion
+#   2: 0x6C  FUNC GLOBAL Java_com_example_MyClass_nativeGreet
+
+hexdump -C /tmp/libjniinline.so | grep "20 01 3f d6"
+# (BLR x9 instruction — confirms the indirect call is in the code)
+```
+
+**Versuch und Rückzug bei User-Function-Call-Lowering:**
+Der parallele Fix (in `_addFunc` die echte `nameLen` aus dem AST lesen statt
+hardcoded `3`, plus `_findFuncByName` + Lookup-Pfad in `lowerCall`) ließ den
+Bootstrap-Build mehrere Minuten hängen — vermutlich `irAddString` mit einem
+`peek64`-gelesenen `nameLen` aus einer Stelle, die im Seed-Compiler ein
+anderes AST-Layout hat. Rückgängig gemacht, separater Fix-WP nötig.
+
 **Verifikation Phase C:**
 ```bash
 ./lyxc --target=android-arm64 --shared /tmp/minimal_export.lyx -o /tmp/libmin.so
