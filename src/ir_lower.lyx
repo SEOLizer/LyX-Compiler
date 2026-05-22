@@ -1621,6 +1621,26 @@ pub type IRLower = class {
       ggCur := self.nodeNext(ggCur);
     }
 
+    // WP-AND-upstream-fix v9: forward-reference pre-pass.
+    // Register every top-level NK_FUNC_DECL name in funcBuffer with a
+    // placeholder body before any function body is lowered. _addFunc
+    // detects the existing entry on the second pass and updates it
+    // (rather than allocating a new one). Imports aren't pre-passed
+    // here; the body-pass below recurses into lowerModule for each
+    // import, which performs its own pre-pass. Convention: imports
+    // appear before function bodies in source order, so the chain
+    // resolves correctly.
+    var pfCur: int64 := decls;
+    while pfCur >= 0 {
+      if self.nodeKind(pfCur) == NK_FUNC_DECL {
+        var pfNamePtr: pchar := self.nodeSVal(pfCur);
+        var pfNameLen: int64 := self.nodeSLen(pfCur);
+        var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
+        self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+      }
+      pfCur := self.nodeNext(pfCur);
+    }
+
     var cur: int64 := decls;
     while (cur >= 0) {
       var kind: int64 := self.nodeKind(cur);
@@ -1680,24 +1700,55 @@ pub type IRLower = class {
   // Accessors
   // ------------------------------------------------------------------
   
-  // Add function to IR module. WP-AND-upstream-fix v2: read the real name
-  // via the same nodeSVal/nodeSLen helpers the rest of ir_lower already
-  // uses. The earlier v1 attempt that called peek64(nodeOff(curFunc)+64)
-  // manually hung the bootstrap build — switching to the high-level
-  // helpers sidesteps whatever the seed's expression-folding was doing.
+  // Add function to IR module. WP-AND-upstream-fix v9: support forward
+  // references by detecting a pre-registered entry (same name) and
+  // updating it instead of allocating a new one. The lookup uses early-
+  // termination via a sentinel flag rather than mutating the loop bound
+  // — earlier attempts to break by setting `fi := funcLen` hung the
+  // seed compiler while it processed this source.
   fn _addFunc() {
     var fnNamePtr: pchar := self.nodeSVal(self.curFunc);
     var fnNameLen: int64 := self.nodeSLen(self.curFunc);
-    var nameOff:   int64 := self.irAddString(fnNamePtr, fnNameLen);
-    var funcIdx: int64 := self.irAddFunc(nameOff, fnNameLen, self.localCount, self.paramCount);
-    self.globalFuncCount := self.globalFuncCount + 1;
 
-    // Patch instrsOff and instrCount now that we know the instruction range
+    var funcBuf2: int64 := peek64(self.ir + 80);
+    var strBuf2:  int64 := peek64(self.ir + 32);
+    var funcLen2: int64 := peek64(self.ir + 96);
+    var funcIdx:  int64 := -1;
+    var fi2: int64 := 0;
+    while fi2 < funcLen2 {
+      if funcIdx < 0 {
+        var nOff2: int64 := peek64(funcBuf2 + fi2 * 80 + 0);
+        var nLen2: int64 := peek64(funcBuf2 + fi2 * 80 + 8);
+        if nLen2 == fnNameLen {
+          var match2: int64 := 1;
+          var j2: int64 := 0;
+          while j2 < nLen2 {
+            if match2 != 0 {
+              if peek8(strBuf2 + nOff2 + j2) != peek8((fnNamePtr as int64) + j2) { match2 := 0; }
+            }
+            j2 := j2 + 1;
+          }
+          if match2 != 0 { funcIdx := fi2; }
+        }
+      }
+      fi2 := fi2 + 1;
+    }
+
+    if funcIdx < 0 {
+      var nameOff: int64 := self.irAddString(fnNamePtr, fnNameLen);
+      funcIdx := self.irAddFunc(nameOff, fnNameLen, self.localCount, self.paramCount);
+      self.globalFuncCount := self.globalFuncCount + 1;
+    } else {
+      // Pre-registered: fill in real locals/params.
+      poke64(funcBuf2 + funcIdx * 80 + 32, self.localCount);
+      poke64(funcBuf2 + funcIdx * 80 + 40, self.paramCount);
+    }
+
+    // Patch instrsOff and instrCount.
     var instrLen: int64 := peek64(self.ir + 24);
-    var funcBuf: int64 := peek64(self.ir + 80);
     var off: int64 := funcIdx * 80;
-    poke64(funcBuf + off + 16, self.funcInstrStart);              // instrsOff
-    poke64(funcBuf + off + 24, instrLen - self.funcInstrStart);   // instrCount
+    poke64(funcBuf2 + off + 16, self.funcInstrStart);
+    poke64(funcBuf2 + off + 24, instrLen - self.funcInstrStart);
   }
 
   fn getStringLen(off: int64): int64 {

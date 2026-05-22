@@ -182,6 +182,10 @@ pub type EmitARM64 = class {
       self.emitFunc(i);
       i := i + 1;
     }
+    // WP-AND-upstream-fix v9: final patch pass for forward references.
+    // funcAddrs is now fully populated, so any BL patch that was skipped
+    // earlier (callee not yet emitted) resolves here.
+    self.applyPatches();
     return self.codeLen;
   }
 
@@ -194,7 +198,11 @@ pub type EmitARM64 = class {
 
     self.stackSize   := 0;
     self.labelCount  := 0;
-    self.patchCount  := 0;
+    // WP-AND-upstream-fix v9: do NOT reset patchCount here. Inter-function
+    // BL patches must survive across emitFunc calls so forward references
+    // (caller emitted before callee) can be resolved by the final
+    // applyPatches pass in emit() once every funcAddrs entry is known.
+    // applyPatches marks already-resolved entries by setting labelId = -2.
 
     // Zero out label table
     var li: int64 := 0;
@@ -745,36 +753,49 @@ pub type EmitARM64 = class {
     var i: int64 := 0;
     while i < self.patchCount {
       var base:    int64 := self.patchBuf + i * 32;
-      var codeOff: int64 := peek64(base);
       var labelId: int64 := peek64(base + 8);
-      var ptype:   int64 := peek64(base + 16);
-      var reg:     int64 := peek64(base + 24);
+      // WP-AND-upstream-fix v9: -2 = already patched, skip.
+      if labelId != -2 {
+        var codeOff: int64 := peek64(base);
+        var ptype:   int64 := peek64(base + 16);
+        var reg:     int64 := peek64(base + 24);
 
-      var target: int64 := -1;
-      if ptype == PATCH_BL {
-        // funcId → funcAddrs
-        if labelId < 256 {
-          target := peek64(self.funcAddrs + labelId * 8);
+        // Use -1 sentinel for "unset" because funcAddrs / labelAddrs are
+        // mmap-zero so entry 0 is a legitimate address. Resolution depends
+        // on the pre-init pass in calcStackFrame for labelAddrs and on the
+        // funcAddrs writes in emitFunc.
+        var target: int64 := -1;
+        if ptype == PATCH_BL {
+          if labelId < 256 {
+            target := peek64(self.funcAddrs + labelId * 8);
+            // A funcAddrs[i] of 0 is valid only for the FIRST emitted
+            // function (labelId 0). Any other 0 means "not yet emitted".
+            if target == 0 {
+              if labelId != 0 { target := -1; }
+            }
+          }
+        } else {
+          if labelId < 1024 {
+            target := peek64(self.labelAddrs + labelId * 8);
+          }
         }
-      } else {
-        if labelId < 1024 {
-          target := peek64(self.labelAddrs + labelId * 8);
-        }
-      }
 
-      if target >= 0 {
-        var delta: int64 := (target - codeOff) >> 2;
-        if ptype == PATCH_B || ptype == PATCH_BL {
-          var opc: int64 := 0x14000000;
-          if ptype == PATCH_BL { opc := 0x94000000; }
-          var enc: int64 := opc | (delta & 0x3FFFFFF);
-          self.poke32at(codeOff, enc);
-        } else if ptype == PATCH_CBZ {
-          var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
-          self.poke32at(codeOff, enc);
-        } else if ptype == PATCH_CBNZ {
-          var enc: int64 := 0xB5000000 | ((delta & 0x7FFFF) << 5) | reg;
-          self.poke32at(codeOff, enc);
+        if target >= 0 {
+          var delta: int64 := (target - codeOff) >> 2;
+          if ptype == PATCH_B || ptype == PATCH_BL {
+            var opc: int64 := 0x14000000;
+            if ptype == PATCH_BL { opc := 0x94000000; }
+            var enc: int64 := opc | (delta & 0x3FFFFFF);
+            self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_CBZ {
+            var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
+            self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_CBNZ {
+            var enc: int64 := 0xB5000000 | ((delta & 0x7FFFF) << 5) | reg;
+            self.poke32at(codeOff, enc);
+          }
+          // Mark as resolved so a later applyPatches call skips it.
+          poke64(base + 8, -2);
         }
       }
       i := i + 1;
