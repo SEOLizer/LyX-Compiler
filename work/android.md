@@ -350,29 +350,74 @@ vs. `_X86_64`).
 
 ---
 
-### WP-AND-05: JNI-Brücke (Code-Generator)
+### WP-AND-05: JNI-Brücke (Code-Generator) — Phase A erledigt, Phase B blockiert
 
 **Ziel:** Lyx-Funktionen können als JNI-Methoden exportiert werden, die von
 Kotlin/Java aus aufgerufen werden.
 
-**Aufwand:** 12h
+**Aufwand:** 12h (Phase A tatsächlich ~1h; Phase B durch Upstream-Frontend blockiert)
 
-**Neue Syntax (Vorschlag):**
+**Tasks-Status:**
+- [x] `@jni` Annotation im Parser erfassen — erledigt in **WP-AND-02 Phase B2**
+- [x] JNI-Symbol-Mangling `Java_<class>_<method>` — erledigt in **WP-AND-02 Phase B2**
+- [x] JNI-Typ-Aliase: `jboolean`, `jbyte`, `jchar`, `jshort`, `jint`, `jlong`,
+      `jfloat`, `jdouble`, `jsize`, `jobject`, `jclass`, `jstring`, `jthrowable`,
+      `j{boolean,byte,char,short,int,long,float,double,object}Array`,
+      `jmethodID`, `jfieldID`, `jweak` — alle `pub type X = int64`
+- [x] `JNIEnv` / `JavaVM` als opake `int64`-Aliase
+- [x] JNI-Konstanten: `JNI_FALSE/TRUE`, `JNI_OK`, `JNI_ERR`, `JNI_EDETACHED`,
+      `JNI_EVERSION`, `JNI_ENOMEM`, `JNI_EEXIST`, `JNI_EINVAL`, `JNI_COMMIT`,
+      `JNI_ABORT`, `JNI_VERSION_1_1..1_8`
+- [x] `JNI_SLOT_*`-Konstanten (60+ Slot-Offsets der `JNINativeInterface` VTable)
+      — GetVersion, FindClass, GetMethodID, NewStringUTF, GetStringUTFChars,
+      NewByteArray, RegisterNatives, ExceptionCheck, GetJavaVM, etc.
+- [x] Neue Stdlib: `std/android/jni.lyx` (kompiliert clean via `--compile-unit`)
+- [x] End-to-End-Beispiel: `examples/android/jni_native_add.lyx` produziert
+      eine `.so` mit `Java_com_example_MyClass_nativeAdd` / `_nativeMul` /
+      `_nativeDouble` in der `.dynsym`
+- [ ] `JNIEnv`-Hilfsfunktionen `NewStringUTF` / `GetStringUTFChars` /
+      `NewByteArray` — **upstream blockiert**, siehe Stolperstein
+- [ ] Test: Kotlin-App ruft `nativeAdd` auf — out-of-scope ohne Android-SDK
+
+**Stolperstein (Upstream-Blocker, Frontend):**
+Helper-Wrapper für `JNIEnv`-VTable-Calls würden so aussehen:
 ```lyx
-@jni(class="com.example.MyClass", method="nativeAdd")
-fn nativeAdd(env: ^JNIEnv, obj: jobject, a: int64, b: int64): int64 {
-    return a + b
+fn JNI_GetVersion(env: JNIEnv): jint {
+  var vtable: int64 := peek64(env);
+  var fnPtr:  int64 := peek64(vtable + JNI_SLOT_GetVersion * 8);
+  var fn:     fn(JNIEnv): jint := fnPtr as fn(JNIEnv): jint;  // <-- Parse error
+  return fn(env);
 }
 ```
+Aktuelle Frontend-Lücken:
+1. **Parser** akzeptiert keine `var x: fn(T): R` Variable-Decl (nur als Typ-
+   Annotation in einigen Kontexten). Reproduziert: `var f: fn(int64): int64 := 0;`
+   → `Parse error at line N: expected expression`.
+2. **`as fn(...): ...` Cast-Syntax** ist nicht in `ParseUnary` verdrahtet.
+3. **`ir_lower`** emittiert `IRO_CALL_INDIRECT` **nirgends** — der Backend-
+   Codegen (`emitCallIndirect` in `emit_arm64.lyx` / `codegen_x86.lyx`) ist
+   da, wird aber nie getriggert.
 
-**Tasks:**
-- [ ] `@jni` Annotation im Parser erfassen
-- [ ] JNI-Typ-Mapping: `int64 ↔ jlong`, `pchar ↔ jstring`, `bool ↔ jboolean`
-- [ ] JNI-Symbol-Mangling: `Java_com_example_MyClass_nativeAdd` erzeugen
-- [ ] `JNIEnv`-Struct als Built-in-Typ definieren (Funktionszeiger-Tabelle)
-- [ ] `JNIEnv`-Hilfsfunktionen: `NewStringUTF`, `GetStringUTFChars`, `NewByteArray`
-- [ ] Neue Stdlib: `std/android/jni.lyu` mit JNI-Typ-Definitionen
-- [ ] Test: Kotlin-App ruft `nativeAdd` auf, erhält korrektes Ergebnis
+Fix-Aufwand grob: 4-6h durchgängiger Frontend-Eingriff (Parser-Production für
+Function-Pointer-Variables und `as fn(...)`-Casts, plus Sema-Type-Inferenz,
+plus `ir_lower`-Pfad für `NK_CALL` mit dynamischem Callee).
+
+**Verifikation Phase A:**
+```bash
+./lyxc --compile-unit std/android/jni.lyx -o /tmp/jni.lyu     # exit 0
+./lyxc --target=android-arm64 --shared --android-api=26 \
+       examples/android/jni_native_add.lyx -o /tmp/libnative_add.so
+readelf -D --syms -W /tmp/libnative_add.so
+#   1: 0x0    FUNC GLOBAL Java_com_example_MyClass_nativeAdd
+#   2: 0x24   FUNC GLOBAL Java_com_example_MyClass_nativeMul
+#   3: 0xA8   FUNC GLOBAL Java_com_example_MyClass_nativeDouble
+make singularity   # S3 == S4 (Hash unverändert: nur Userland-Code)
+```
+
+**Was Phase A bereitstellt:** Reine Compute-`@jni`-Funktionen (Argumente
+rein, Werte raus) lassen sich heute kompilieren und exportieren. Funktionen,
+die zurück nach Java rufen (Strings erzeugen, Methoden aufrufen, Arrays
+allozieren), brauchen Phase B + Frontend-Reparatur.
 
 ---
 
