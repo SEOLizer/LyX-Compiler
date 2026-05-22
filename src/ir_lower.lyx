@@ -760,6 +760,51 @@ pub type IRLower = class {
       return dest;
     }
 
+    // WP-AND-upstream-fix v2: user-function call. Inline name lookup against
+    // the IR funcBuffer (no helper method — adding one shifted the IRLower
+    // vtable in a way that broke self-host singularity). Forward references
+    // not supported: caller defined before callee in source order hits this
+    // path; callee defined LATER falls through to the IRO_CALL_BUILTIN
+    // legacy fallback below.
+    var fbUserBuf: int64 := peek64(self.ir + 80);
+    var fbUserStr: int64 := peek64(self.ir + 32);
+    var fbUserCnt: int64 := peek64(self.ir + 96);
+    var fbUserIdx: int64 := -1;
+    var fbI: int64 := 0;
+    while fbI < fbUserCnt {
+      var fbNOff: int64 := peek64(fbUserBuf + fbI * 80);
+      var fbNLen: int64 := peek64(fbUserBuf + fbI * 80 + 8);
+      if fbNLen == fnlen {
+        var fbMatch: int64 := 1;
+        var fbJ: int64 := 0;
+        while fbJ < fbNLen {
+          if fbMatch != 0 {
+            if peek8(fbUserStr + fbNOff + fbJ) != peek8((fname as int64) + fbJ) {
+              fbMatch := 0;
+            }
+          }
+          fbJ := fbJ + 1;
+        }
+        if fbMatch != 0 {
+          fbUserIdx := fbI;
+          fbI := fbUserCnt;     // break
+        }
+      }
+      fbI := fbI + 1;
+    }
+    if fbUserIdx >= 0 {
+      var fbArgCnt: int64 := 0;
+      var fbArg: int64 := arg0;
+      while fbArg >= 0 {
+        var fbATemp: int64 := self.lowerExpr(fbArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgCnt, fbATemp, -1, 0);
+        fbArgCnt := fbArgCnt + 1;
+        fbArg := self.nodeNext(fbArg);
+      }
+      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, -1, fbArgCnt);
+      return dest;
+    }
+
     // General call: lower first argument and emit IRO_CALL_BUILTIN
     if (arg0 >= 0) {
       var argTemp: int64 := self.lowerExpr(arg0);
@@ -1324,11 +1369,16 @@ pub type IRLower = class {
   // Accessors
   // ------------------------------------------------------------------
   
-  // Add function to IR module - using globalFuncCount field as workaround
+  // Add function to IR module. WP-AND-upstream-fix v2: read the real name
+  // via the same nodeSVal/nodeSLen helpers the rest of ir_lower already
+  // uses. The earlier v1 attempt that called peek64(nodeOff(curFunc)+64)
+  // manually hung the bootstrap build — switching to the high-level
+  // helpers sidesteps whatever the seed's expression-folding was doing.
   fn _addFunc() {
-    var nameOff: int64 := self.nodeIVal(self.curFunc);
-    var nameLen: int64 := 3;
-    var funcIdx: int64 := self.irAddFunc(nameOff, nameLen, self.localCount, self.paramCount);
+    var fnNamePtr: pchar := self.nodeSVal(self.curFunc);
+    var fnNameLen: int64 := self.nodeSLen(self.curFunc);
+    var nameOff:   int64 := self.irAddString(fnNamePtr, fnNameLen);
+    var funcIdx: int64 := self.irAddFunc(nameOff, fnNameLen, self.localCount, self.paramCount);
     self.globalFuncCount := self.globalFuncCount + 1;
 
     // Patch instrsOff and instrCount now that we know the instruction range

@@ -256,12 +256,45 @@ hexdump -C /tmp/libjniinline.so | grep "20 01 3f d6"
 # (BLR x9 instruction — confirms the indirect call is in the code)
 ```
 
-**Versuch und Rückzug bei User-Function-Call-Lowering:**
-Der parallele Fix (in `_addFunc` die echte `nameLen` aus dem AST lesen statt
-hardcoded `3`, plus `_findFuncByName` + Lookup-Pfad in `lowerCall`) ließ den
-Bootstrap-Build mehrere Minuten hängen — vermutlich `irAddString` mit einem
-`peek64`-gelesenen `nameLen` aus einer Stelle, die im Seed-Compiler ein
-anderes AST-Layout hat. Rückgängig gemacht, separater Fix-WP nötig.
+**User-Function-Call-Lowering (v2 — Erfolg):**
+Zweiter Anlauf am gleichen Tag, mit zwei Erkenntnissen aus dem v1-Hang:
+1. Statt direktem `peek64(nodeOff(curFunc)+64)` die etablierten
+   `nodeSVal`/`nodeSLen`-Helper nutzen → keine Layout-Mismatch-Risiken.
+2. Den Name-Lookup **inline** in `lowerCall` schreiben, nicht als
+   separate `_findFuncByName`-Methode → vermeidet Klassen-VTable-Shift,
+   der den Seed-Compiler über Singularität hinaus betraf.
+
+**Geliefert:**
+- `_addFunc` liest jetzt den echten Funktionsnamen aus dem Parser-AST
+  über `nodeSVal`/`nodeSLen` (war: hardcoded `nameLen := 3`)
+- Names werden via `irAddString` in die IR-Stringtabelle kopiert
+- Inline-Lookup in `lowerCall`: scant `funcBuffer` für matching name,
+  bei Treffer lowert Args in Slots 0..N-1 und emittiert `IRO_CALL`
+  mit `src1=funcIdx`, `imm=N`
+- Verifiziert: `BL` mit korrektem PC-relativen Offset zur Callee-Funktion
+- `make singularity` hält (Hash `0d38c179...`)
+
+**Was jetzt funktioniert:**
+- User-Funktionen können andere User-Funktionen aus dem **selben File**
+  aufrufen. ARM64 Shared-Lib-Modus emittiert echtes `BL` statt der
+  früheren broken `IRO_CALL_BUILTIN id=1 = write()`-Syscall.
+- Local-Helper-Pattern für JNI-Callbacks: Wrapper im selben File definieren,
+  von @jni-Funktionen darüber aufrufen. Beispiel:
+  `examples/android/jni_callback_local.lyx`.
+
+**Was NOCH offen ist (Folge-Fix):**
+- Imports werden nicht ins selbe IR-Modul gelowert. `import std.android.jni;`
+  registriert die JNI-Wrapper bei Sema, aber `ir_lower.lowerModule` walkt
+  nur Top-Level `NK_FUNC_DECL` des Main-Files — nicht die Decls importierter
+  Module. Daher schlägt die Suche nach `JNI_NewStringUTF` fehl und fällt
+  auf die alte `IRO_CALL_BUILTIN`-Fallback zurück.
+- Forward-Referenzen: Caller VOR Callee deklariert geht nicht (Callee
+  noch nicht in `funcBuffer`). Workaround: Helper an den Anfang des Files.
+
+**Drei nutzbare JNI-Callback-Patterns (in `examples/android/`):**
+1. `jni_native_add.lyx` — Pure-Compute, kein JNIEnv-Zugriff
+2. `jni_callback_inline.lyx` — Inline-Vtable-Peek pro @jni-Funktion
+3. `jni_callback_local.lyx` — Local Wrapper im selben File, dann darüber rufen
 
 **Verifikation Phase C:**
 ```bash
