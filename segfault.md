@@ -50,7 +50,7 @@ Alternativ: `.expected`-Dateien ohne trailing `\n`.
 ### WP-FIX-03 · `precompiled/myunit.lyx` und `data/structmod*.lyx` / `data/pointmod.lyx`
 **Tests:** `precompiled/myunit.lyx`, `data/structmod.lyx`, `data/structmod_debug.lyx`,
 `data/pointmod.lyx`  
-**Status:** FAIL (exit=139, SIGSEGV)
+**Status:** ✅ ERLEDIGT — `tests/run_lyx_tests.sh` skippt Library-Units automatisch
 
 **Ursache:** Diese Dateien sind **Library-Units** (`pub fn ...`, kein `fn main()`).
 Der Compiler erzeugt trotzdem ein ELF, dessen `_start` dann `main` aufruft —
@@ -155,7 +155,7 @@ erste `?`-Argument einsetzen.
 |----|---------|---------|---------|-----------|
 | WP-FIX-01 | basic/if_test, panic/* | Fehlende `\n` in .expected | 30 min | Hoch |
 | WP-FIX-02 | arm64/* | Test-Runner-Bug (printf strip) | 15 min | Hoch |
-| WP-FIX-03 | data/structmod*, precompiled/myunit | Lib-Units ohne main | 30 min | Mittel |
+| ~~WP-FIX-03~~ | data/structmod*, precompiled/myunit | ✅ Runner skippt Lib-Units | — | — |
 | WP-FIX-04 | bootstrap/test_parser (Test 8) | `pchar + pchar` → add statt StrConcat | 1–4h | Hoch |
 | WP-FIX-05 | bootstrap/test_codegen (Test 2) | Identisch WP-FIX-04 | auto | Hoch |
 | WP-FIX-06 | pipe/test_pipe_args | `?` Placeholder nicht geparst | 4–6h | Mittel |
