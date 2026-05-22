@@ -298,26 +298,55 @@ readelf -l       /tmp/libeh.so  # 5 program headers incl. PT_NOTE + GNU_EH_FRAME
 
 ---
 
-### WP-AND-04: Android-Syscall-Tabelle
+### WP-AND-04: Android-Syscall-Tabelle ✅ (Branch `feat/android-backend`)
 
 **Ziel:** Vollständige Syscall-Tabelle für Android (API 21+, ARM64 und x86_64).
 
-**Aufwand:** 3h
+**Aufwand:** 3h (tatsächlich ~1h — Wrapper über vorhandene Linux-Syscalls)
 
-**Betroffene Dateien:**
-- Neue Datei: `std/net/internal/syscalls_android_arm64.lyu`
-- Neue Datei: `std/net/internal/syscalls_android_x86.lyu`
+**Hintergrund:** Android-ARM64-Syscall-Nummern sind identisch mit Linux ARM64,
+für x86_64 ebenfalls. Der praktische Unterschied liegt in **SELinux/seccomp-
+Filtern**, die bestimmte Syscalls für App-Prozesse blocken — nicht im
+Kernel-ABI. WP-AND-04 liefert deshalb **Wrapper + Dokumentation**, kein
+neues Codegen.
 
-**Hinweis:** Android-ARM64-Syscall-Nummern sind identisch mit Linux ARM64.
-Für x86_64 ebenfalls. Der Unterschied liegt in einigen fehlenden Syscalls
-(z. B. `fork` ist auf Android eingeschränkt) und Android-spezifischen
-`ioctl`-Konstanten.
+**Geliefert (4 neue Units):**
+
+| Datei | Inhalt |
+|---|---|
+| `std/net/internal/syscalls_android.lyx` | `sca_*` Network-Wrapper (re-export von Linux) + `sca_*_unsupported`-Stubs für fork/vfork/ptrace/personality/reboot, die direkt -1 returnen |
+| `std/android/restrictions.lyx` | Katalog der gesperrten/restringierten Syscall-Nummern (`SYS_AND_FORK_*`, `SYS_AND_PTRACE`, etc.) + API-Level-Konstanten (`ANDROID_API_GETRANDOM=23`, `…_MEMFD_CREATE=26`, `…_PIDFD_OPEN=30`) |
+| `std/android/random.lyx` | `AndroidRandomBytes(buf, len)` und `AndroidRandomInt64()` via `/dev/urandom` — funktioniert seit Android 5.0; getrandom(2)-Pfad dokumentiert als Future-Improvement (braucht sys_getrandom-Builtin in lyxc) |
+| `std/android/ioctl.lyx` | ioctl-Request-Nummern für ASHMEM (Android shared memory), ALSA PCM (Audio), V4L2 (Kamera), IIO (Sensoren). User-Code wired die direkt in den `ioctl()`-Builtin |
 
 **Tasks:**
-- [ ] Android-eingeschränkte Syscalls dokumentieren und absichern (`fork`, `ptrace`)
-- [ ] `binder`-Syscalls für Android IPC (optional, Phase 4)
-- [ ] Android-spezifische `ioctl`-Konstanten für Kamera, Audio, Sensor
-- [ ] `getrandom` (API 28+) vs. `/dev/urandom` Fallback
+- [x] Android-eingeschränkte Syscalls dokumentieren und absichern (`fork`, `ptrace`, …)
+- [x] Android-spezifische `ioctl`-Konstanten für Kamera (V4L2), Audio (ALSA), Sensor (IIO), ASHMEM
+- [x] `/dev/urandom`-Fallback in `AndroidRandomBytes` (funktioniert ab API 21)
+- [ ] `getrandom(2)` als nativer Syscall — verschoben (braucht `sys_getrandom`-Builtin in `src/codegen_x86.lyx` und `src/backend/arm64/emit_arm64.lyx`, eigener Codegen-Eingriff)
+- [ ] `binder`-Syscalls für Android IPC — bewusst nicht in dieser WP (Komplexität, eigener Modul-Scope; siehe WP-AND-06 Phase 4)
+
+**Verifikation:**
+```bash
+for f in std/net/internal/syscalls_android.lyx \
+         std/android/restrictions.lyx \
+         std/android/random.lyx \
+         std/android/ioctl.lyx; do
+  ./lyxc --compile-unit "$f" -o /tmp/check.lyu && echo "OK: $f"
+done
+# Alle 4 Units kompilieren clean (exit=0; sema-Warnings für sys_fcntl sind
+# preexistent, betreffen auch syscalls_linux.lyx).
+make singularity   # S3 == S4 (Hash unverändert: std-Units sind ohne
+                   # Wirkung auf das lyxc-Binary, nur Userland-Code).
+```
+
+**Hinweis zum Naming:** Doc hatte `syscalls_android_arm64.lyu` /
+`syscalls_android_x86.lyu` als zwei getrennte Dateien vorgesehen. Da die
+Syscall-Nummern auf beiden Architekturen identisch sind und der einzige
+Unterschied im SELinux-Filter liegt, wurde eine gemeinsame
+`syscalls_android.lyx`-Datei gewählt; architekturspezifische Nummern in
+`restrictions.lyx` getrennt aufgeführt (z.B. `SYS_AND_GETRANDOM_ARM64`
+vs. `_X86_64`).
 
 ---
 
