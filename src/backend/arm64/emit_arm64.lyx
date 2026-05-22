@@ -81,6 +81,16 @@ pub type EmitARM64 = class {
   funcAddrs:       int64;
   funcCount:       int64;
 
+  // WP-AND-02 Phase C: shared-library mode toggle and dynamic-relocation buffer.
+  // When isSharedLib != 0, emitLoadGlobal / emitStoreGlobal use PC-relative
+  // literal-pool loads instead of MOVZ/MOVK chains, and each pool slot is
+  // recorded as an R_AARCH64_RELATIVE entry for runtime fix-up by the loader.
+  // relocBuf holds Elf64_Rela records (24 bytes each).
+  isSharedLib:     int64;
+  relocBuf:        int64;
+  relocCount:      int64;
+  relocCap:        int64;
+
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
@@ -97,6 +107,43 @@ pub type EmitARM64 = class {
     self.patchCount  := 0;
     self.funcAddrs   := mmap(0, 256 * 8, 3, 34, -1, 0);
     self.funcCount   := 0;
+
+    // WP-AND-02 Phase C: dynamic-reloc state. Buffer grows on demand.
+    self.isSharedLib := 0;
+    self.relocCap    := 32;
+    self.relocBuf    := mmap(0, self.relocCap * 24, 3, 34, -1, 0);
+    self.relocCount  := 0;
+  }
+
+  // WP-AND-02 Phase C: opt into PIC code emission. Caller flips this BEFORE
+  // calling emit(); takes effect for emitLoadGlobal / emitStoreGlobal.
+  pub fn setSharedLib(flag: int64) {
+    self.isSharedLib := flag;
+  }
+
+  fn getRelocBuf(): int64   { return self.relocBuf; }
+  fn getRelocCount(): int64 { return self.relocCount; }
+
+  // WP-AND-02 Phase C: append an Elf64_Rela record. r_info packs (sym_idx<<32)|type.
+  // For R_AARCH64_RELATIVE (1027) the symbol index is 0 and addend = base-relative
+  // address that the loader writes back into *(load_base + r_offset).
+  fn _recordRelocation(offset: int64, info: int64, addend: int64) {
+    if (self.relocCount >= self.relocCap) {
+      var newCap: int64 := self.relocCap * 2;
+      var nb: int64 := mmap(0, newCap * 24, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.relocCount * 24 {
+        poke8(nb + i, peek8(self.relocBuf + i));
+        i := i + 1;
+      }
+      self.relocBuf := nb;
+      self.relocCap := newCap;
+    }
+    var off: int64 := self.relocBuf + self.relocCount * 24;
+    poke64(off +  0, offset);
+    poke64(off +  8, info);
+    poke64(off + 16, addend);
+    self.relocCount := self.relocCount + 1;
   }
 
   // -------------------------------------------------------------------------
@@ -426,6 +473,10 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
+    if self.isSharedLib != 0 {
+      self._emitLoadGlobalPIC(addr, dest);
+      return;
+    }
     // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR
     self.emitMovImmReg(ARM64_X9, addr);
     // LDR x0, [x9]
@@ -434,10 +485,48 @@ pub type EmitARM64 = class {
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
+    if self.isSharedLib != 0 {
+      self._emitStoreGlobalPIC(src, addr);
+      return;
+    }
     self.emitMovImmReg(ARM64_X9, addr);
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
     // STR x0, [x9]
     self.emit32(0xF9000120);  // STR x0, [x9]
+  }
+
+  // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
+  // Layout (24 bytes total, identical size to the MOVZ/MOVK variant):
+  //   +0  LDR x9, [pc + 8]   ; loads the 8-byte slot at +8
+  //   +4  B  +12             ; jump past the slot
+  //   +8  .quad <addr>       ; slot, patched by R_AARCH64_RELATIVE at load time
+  //  +16  LDR x0, [x9]       ; dereference
+  //  +20  STUR x0, [fp, -slot]
+  fn _emitLoadGlobalPIC(addr: int64, dest: int64) {
+    var slotOff: int64 := self.codeLen + 8;   // slot's offset within codeBuf
+    // LDR x9 (=9), literal at +8: imm19 = 2 → 2<<5 = 0x40
+    self.emit32(0x58000040 | 9);
+    // B +12 (3 instructions ahead): imm26 = 3
+    self.emit32(0x14000003);
+    // 8-byte slot for the resolved address. The dynamic loader rewrites this
+    // to (load_base + addend) via R_AARCH64_RELATIVE; we store `addr` as the
+    // addend AND as the initial slot value (the loader overwrites anyway).
+    self.emit64(addr);
+    self._recordRelocation(slotOff, 1027, addr);  // 1027 = R_AARCH64_RELATIVE
+    // LDR x0, [x9]
+    self.emit32(0xF9400120 | ARM64_X0);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  fn _emitStoreGlobalPIC(src: int64, addr: int64) {
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
+    self.emit32(0x14000003);        // B +12
+    self.emit64(addr);
+    self._recordRelocation(slotOff, 1027, addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
+    // STR x0, [x9]
+    self.emit32(0xF9000120);
   }
 
   fn emitLoadField(base: int64, fieldOff: int64, dest: int64) {
@@ -729,6 +818,12 @@ pub type EmitARM64 = class {
     poke8(self.codeBuf + self.codeLen + 2, (val >> 16) & 0xFF);
     poke8(self.codeBuf + self.codeLen + 3, (val >> 24) & 0xFF);
     self.codeLen := self.codeLen + 4;
+  }
+
+  // WP-AND-02 Phase C: 8-byte little-endian emit; used for inline literal pool slots.
+  fn emit64(val: int64) {
+    self.emit32(val & 0xFFFFFFFF);
+    self.emit32((val >> 32) & 0xFFFFFFFF);
   }
 
   fn poke32at(off: int64, val: int64) {

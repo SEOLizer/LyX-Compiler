@@ -224,6 +224,9 @@ pub type CompilerConfig = class {
   codeStubOff:      int64;
   // funcAddrs pointer from EmitARM64 (funcId -> offset_in_irCodeBuf), used to look up export offsets.
   codeFuncAddrs:    int64;
+  // WP-AND-02 Phase C: dynamic relocations harvested from EmitARM64 (Elf64_Rela records).
+  relocBuf:         int64;
+  relocCount:       int64;
 
   // Compilation state
   exitCode: int64;
@@ -296,6 +299,8 @@ pub type CompilerConfig = class {
     self.mangledNamesCap  := 0;
     self.codeStubOff      := 0;
     self.codeFuncAddrs    := 0;
+    self.relocBuf         := 0;
+    self.relocCount       := 0;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -1438,11 +1443,18 @@ pub type CompilerConfig = class {
     if funcCount > 0 {
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
+      // WP-AND-02 Phase C: enable PIC global access + relocation recording.
+      if self.outputType == OUTPUT_TYPE_SHARED_LIB {
+        emitter.setSharedLib(1);
+      }
       emitter.emit();
       var irCodeLen: int64 := emitter.getCodeLen();
       var irCodeBuf: int64 := emitter.getCodeBuf();
       // WP-AND-02 Phase B: expose funcAddrs for export-table building.
       self.codeFuncAddrs := emitter.getFuncAddrs();
+      // WP-AND-02 Phase C: harvest dynamic-reloc records.
+      self.relocBuf   := emitter.getRelocBuf();
+      self.relocCount := emitter.getRelocCount();
 
       // WP-AND-02 Phase B: for shared libraries skip the executable _start stub.
       // The Android loader never invokes a .so's e_entry; the stub would be dead
@@ -2005,6 +2017,12 @@ pub type CompilerConfig = class {
       ei := ei + 1;
     }
 
+    // ---- Dynamic relocation sizing (Phase C) ----
+    var relCount: int64 := self.relocCount;
+    var relBuf:   int64 := self.relocBuf;
+    var hasRelocs: int64 := 0;
+    if relCount > 0 { hasRelocs := 1; }
+
     // ---- File layout planning ----
     var ehSize:     int64 := 64;
     var phSize:     int64 := 56;
@@ -2016,7 +2034,10 @@ pub type CompilerConfig = class {
 
     var dataOff:    int64 := ((codeEnd + pageSize - 1) / pageSize) * pageSize;
 
-    var dynNum:     int64 := 7;     // HASH, STRTAB, SYMTAB, STRSZ, SYMENT, SONAME, NULL
+    // .dynamic entry count: 7 baseline + 3 if relocations present (DT_RELA,
+    // DT_RELASZ, DT_RELAENT).
+    var dynNum:     int64 := 7;
+    if hasRelocs != 0 { dynNum := 10; }
     var dynOff:     int64 := dataOff;
     var dynSize:    int64 := dynNum * 16;
     var dynsymOff:  int64 := dynOff + dynSize;
@@ -2031,7 +2052,12 @@ pub type CompilerConfig = class {
     var hashNbucket: int64 := 1;
     var hashNchain:  int64 := 1 + expCount;
     var hashSize:    int64 := 8 + 4 * hashNbucket + 4 * hashNchain;
-    var fileSize:   int64 := hashOff + hashSize;
+    // .rela.dyn (Phase C): 24-byte Elf64_Rela records, 8-byte aligned.
+    var relaOffRaw: int64 := hashOff + hashSize;
+    var relaOff:    int64 := ((relaOffRaw + 7) / 8) * 8;
+    var relaSize:   int64 := relCount * 24;
+    var fileSize:   int64 := relaOff + relaSize;
+    if hasRelocs == 0 { fileSize := hashOff + hashSize; }
 
     // ---- Allocate + zero buffer ----
     var fd: int64 := open(path, 577, 493);
@@ -2121,6 +2147,12 @@ pub type CompilerConfig = class {
     poke64(buf + d, 11);        poke64(buf + d + 8, 24);         d := d + 16;
     // DT_SONAME = 14 (string at offset 1 into .dynstr)
     poke64(buf + d, 14);        poke64(buf + d + 8, 1);          d := d + 16;
+    // Phase C: DT_RELA / DT_RELASZ / DT_RELAENT if any relocations present.
+    if hasRelocs != 0 {
+      poke64(buf + d, 7);       poke64(buf + d + 8, relaOff);    d := d + 16;  // DT_RELA
+      poke64(buf + d, 8);       poke64(buf + d + 8, relaSize);   d := d + 16;  // DT_RELASZ
+      poke64(buf + d, 9);       poke64(buf + d + 8, 24);         d := d + 16;  // DT_RELAENT
+    }
     // DT_NULL = 0 (terminator)
     poke64(buf + d, 0);         poke64(buf + d + 8, 0);
 
@@ -2191,6 +2223,25 @@ pub type CompilerConfig = class {
     }
     if expCount > 0 {
       poke32(buf + hashOff + 12 + expCount * 4, 0); // terminator
+    }
+
+    // ---- .rela.dyn (Phase C) ----
+    // Each emit_arm64 record holds (codeBuf-relative offset, info, addend).
+    // For r_offset we add codeOff because PT_LOAD #1 maps file offsets 1:1
+    // onto vaddrs starting at vaddr 0 (so the slot's vaddr == its file offset).
+    if hasRelocs != 0 {
+      var ri: int64 := 0;
+      while ri < relCount {
+        var src: int64 := relBuf + ri * 24;
+        var rOffCode: int64 := peek64(src +  0);
+        var rInfo:    int64 := peek64(src +  8);
+        var rAddend:  int64 := peek64(src + 16);
+        var dst: int64 := relaOff + ri * 24;
+        poke64(buf + dst +  0, codeOff + rOffCode);
+        poke64(buf + dst +  8, rInfo);
+        poke64(buf + dst + 16, rAddend);
+        ri := ri + 1;
+      }
     }
 
     // ---- Write + cleanup ----

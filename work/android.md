@@ -178,11 +178,45 @@ readelf -D --syms /tmp/libexport.so
 # (HelperPrivate erscheint korrekt NICHT in der .dynsym.)
 ```
 
-**Phase C — Relocations + Real-World-Test (offen)**
-- [ ] Relocations: `R_AARCH64_GLOB_DAT`, `R_AARCH64_JUMP_SLOT`, `R_AARCH64_RELATIVE`
-- [ ] `.rela.dyn` / `.rela.plt` Sektionen
-- [ ] Test: `aarch64-linux-android-readelf -d libtest.so` (NDK)
-- [ ] Test: Lade `.so` in minimaler Android-App ohne Crash
+**Phase C — Relocations (Infrastruktur erledigt, End-to-End-Test offen)**
+- [x] `EmitARM64.relocBuf`: 24-Byte Elf64_Rela-Records mit dynamischem Wachstum
+- [x] `setSharedLib(1)` aktiviert PIC-Pfad; `getRelocBuf` / `getRelocCount` exponieren
+- [x] PIC-Variante von `emitLoadGlobal` / `emitStoreGlobal`: Inline-Literal-Pool
+      mit `LDR x9, [pc+8]` / `B +12` / `.quad addr`-Slot — 24 Bytes, identisch zur
+      MOVZ/MOVK-Variante in Größe
+- [x] Jeder Slot bekommt einen `R_AARCH64_RELATIVE` (Type 1027) Eintrag;
+      `r_offset = codeOff + slotPosInCodeBuf`, `r_addend = base-relative Adresse`
+- [x] `.rela.dyn`-Sektion in der `.so` (8-byte aligned nach `.hash`), nur emittiert
+      wenn `relocCount > 0`
+- [x] `DT_RELA` / `DT_RELASZ` / `DT_RELAENT` in `.dynamic` (dynNum 7 → 10)
+- [x] PT_LOAD #2 wächst automatisch um die neuen Bytes (`seg2Size = fileSize - dataOff`)
+- [x] Singularität verifiziert (S3 == S4)
+
+**Bekannte Limitierung (Upstream-Blocker):**
+`ir.lyx:730 irLoadGlobal` setzt `src1=-1` und wird im aktuellen Frontend
+**nirgends aufgerufen**. Die ARM64-Reloc-Codegenerierung ist deshalb
+strukturell korrekt, aber für reale Lyx-Programme unerreichbar. Sobald die
+IR-zu-Emit-Brücke für Globals repariert ist, emittiert die Pipeline
+automatisch korrekte `R_AARCH64_RELATIVE`-Records. Test-Verifikation in
+`readelf -r` zeigt "no relocations" für aktuelle Testfälle — erwartetes
+Verhalten, kein Bug.
+
+**Offen für eine spätere Session:**
+- [ ] `IRO_LOAD_GLOBAL` / `IRO_STORE_GLOBAL` upstream im ir_lower-Pfad aktivieren
+- [ ] `R_AARCH64_GLOB_DAT` / `R_AARCH64_JUMP_SLOT` für externe Symbole (`@extern`)
+- [ ] `.rela.plt` Sektion + GOT-Tabelle für PLT-Calls
+- [ ] `DT_NEEDED` Einträge für externe `.so`-Abhängigkeiten
+- [ ] NDK-Echttest: `aarch64-linux-android-readelf -d/-r libtest.so`
+- [ ] Emulator-Loadtest: `adb push` + Java-App ruft `Java_com_example_*` auf
+
+**Verifikation Phase C:**
+```bash
+./lyxc --target=android-arm64 --shared /tmp/minimal_export.lyx -o /tmp/libmin.so
+readelf -d /tmp/libmin.so | grep -E "RELA|HASH|STRTAB"
+# 7 .dynamic-Einträge (keine RELA) — minimal_export.lyx hat keine Globals
+readelf -r /tmp/libmin.so
+# "There are no relocations in this file."  (erwartet)
+```
 
 **Verifikation Phase A:**
 ```bash
