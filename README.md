@@ -40,6 +40,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ✅ String Concatenation: pchar + pchar via mmap'd buffers (v0.5.5)
+✅ Pipe Operator with ? Placeholder: expr |> fn(?, arg) — explicit argument position in pipe chains (v0.9.1)
 ✅ Float Formatting: PrintFloat(f64) and :width:decimals format specifier (v0.5.5)
 ✅ Enum Types: enum keyword with :: member access (v0.5.7)
 ✅ Exception Handling: try/catch/throw with nested scopes (v0.5.7)
@@ -99,15 +100,14 @@ Once **MD5(Stage 3) = MD5(Stage 4)**, the compiler has reached a stable fixed po
 
 Stage 2 may differ from Stage 3 — the optimizing compiler generates better code for itself on the first pass. From Stage 3 onward, the fixed point is reached.
 
-### Verified Hash (2026-03-30)
+### Verified Hash (2026-05-22)
 
 ```
-MD5  9100b4d4b170c38474ee7a5594023790
+MD5  b183150e9a49af07646e27e5f80419df
 ```
 
 This hash applies to Stage 3, Stage 4, and all subsequent stages — the compiler is stably self-hosting.
 
-Details on the bootstrap roadmap: [`selfhosted.md`](selfhosted.md)
 Implementation: [`src/`](src/)
 
 ---
@@ -161,9 +161,15 @@ lyx-lang/                        # Repo-Root
 ├── scripts/                     # Build- und Bootstrap-Skripte
 ├── examples/                    # Lyx-Beispielprogramme (siehe unten)
 │
+├── data/                        # Lyx Data-Library (pandas-ähnlich)
+│   ├── core.lyx                 #   DataFrame, Typen, Operationen (~3800 Zeilen)
+│   ├── io.lyx                   #   CSV-Import/Export
+│   └── stats_batch.lyx          #   Batch-Statistik (Sum, Min, Max, Avg, Variance, StdDev)
+│
 ├── Makefile                     # Root-Wrapper (delegiert an compiler/Makefile)
 ├── README.md                    # Diese Datei
 ├── CHANGELOG.md                 # Versionshistorie
+├── data.md                      # API-Dokumentation der data/-Bibliothek
 ├── selfhosted.md                # Selfhosting-Roadmap (WP-01..WP-09)
 └── ebnf.md / DATATYPES.md       # Sprachspezifikation
 ```
@@ -2129,7 +2135,7 @@ fn main(): int64 {
 
 | Priority | Operators           | Description              |
 |:--------:|---------------------|-------------------------|
-| 1 (low) | `\|>`            | Pipe (function chaining) |
+| 1 (low) | `\|>`            | Pipe (function chaining); `?` marks insertion position |
 | 2         | `\|\|`            | Logical Or              |
 | 3         | `&&`               | Logical And             |
 | 4         | `==` `!=` `<` `<=` `>` `>=` | Comparison (returns `bool`) |
@@ -2175,8 +2181,8 @@ fn addOne(x: int64): int64 { return x + 1; }
 fn main(): int64 {
   var x: int64 := 5;
   
-  // New: Pipe operator (readable left to right)
-  var result: int64 := x |> double() |> addOne();
+  // Pipe operator (readable left to right)
+  var result: int64 := x |> double |> addOne;
   
   // Equivalent to classic notation:
   // var result: int64 := addOne(double(x));
@@ -2186,18 +2192,35 @@ fn main(): int64 {
 }
 ```
 
-**With additional arguments:**
+**With additional arguments — `?` placeholder:**
+
+When the piped value should go to a specific argument position (not just first), use `?` as a placeholder:
 
 ```lyx
 fn add(a: int64, b: int64): int64 { return a + b; }
 
 fn main(): int64 {
-  var x: int64 := 10;
-  
-  // x is inserted as the first argument
-  var result: int64 := x |> add(5);  // equivalent to add(x, 5)
-  
-  PrintInt(result);  // 15
+  let result: int64 = 5 |> add(?, 3);  // equivalent to add(5, 3)
+  PrintInt(result);  // 8
+  return 0;
+}
+```
+
+`?` marks exactly where the left-hand value is inserted. Multiple `?` in one call list are resolved left to right.
+
+**Chaining:**
+
+```lyx
+fn clamp(v: int64, lo: int64, hi: int64): int64 {
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+fn main(): int64 {
+  var x: int64 := 42;
+  var y: int64 := x |> clamp(?, 0, 100) |> double;
+  PrintInt(y);  // 84
   return 0;
 }
 ```
@@ -2205,7 +2228,7 @@ fn main(): int64 {
 **Benefits:**
 - Better readability: code reads like data flow
 - Avoids deep nesting
-- Simpler debugging through clear order
+- `?` makes argument position explicit
 
 ### Type-Casting with `as`
 
