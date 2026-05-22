@@ -150,6 +150,15 @@ pub con PARSER_TOK_SIZE:  int64 := 40;
 pub con PARSER_NODE_SIZE: int64 := 88;
 
 // ============================================================================
+// Annotation flags (WP-AND-02 Phase B)
+// Stored as a bitfield in the iVal slot of NK_FUNC_DECL nodes.
+// iVal is otherwise unused for FUNC_DECL, so this is non-invasive.
+// ============================================================================
+pub con ANNO_EXPORT:    int64 := 1;   // @export — export from shared library
+pub con ANNO_JNI:       int64 := 2;   // @jni    — JNI mangling (reserved, Phase B2)
+// Bits 2..63 reserved for future annotations (@dal, @critical, @wcet, ...).
+
+// ============================================================================
 // Parser Class
 // (No Lexer field -- Lexer is created locally in Init() and disposed after
 //  tokenization, avoiding class-typed field layout issues.)
@@ -174,6 +183,18 @@ pub type Parser = class {
 
   // Error state
   hadError: int64;
+
+  // WP-AND-02 Phase B2: side table for @jni(class="...", method="...") args.
+  // Records are 40 bytes: [funcNodeId:i64, classOff:i64, classLen:i64, methodOff:i64, methodLen:i64].
+  // Offsets are into self.src. Populated by ParseJniArgs, queried by lyxc.lyx.
+  jniBuf:   int64;
+  jniCap:   int64;
+  jniCount: int64;
+  // Scratch values held between @jni parsing and attach to the next FUNC_DECL.
+  _pendingJniClassOff:  int64;
+  _pendingJniClassLen:  int64;
+  _pendingJniMethodOff: int64;
+  _pendingJniMethodLen: int64;
 
   // ------------------------------------------------------------------
   // Token array helpers
@@ -226,6 +247,13 @@ pub type Parser = class {
   fn NSVal(i: int64): pchar   { return self.src + peek64(self._noff(i) + 64); }
   fn NSLen(i: int64): int64   { return peek64(self._noff(i) + 72); }
   fn NIsPub(i: int64): int64  { return peek64(self._noff(i) + 80); }
+
+  // WP-AND-02 Phase B: query annotation flags on a node (iVal slot).
+  pub fn NAnnoFlags(i: int64): int64 { return peek64(self._noff(i) + 56); }
+  pub fn NHasAnno(i: int64, flag: int64): int64 {
+    if (peek64(self._noff(i) + 56) & flag) != 0 { return 1; }
+    return 0;
+  }
 
   fn _sc0(i: int64, v: int64) { poke64(self._noff(i) + 8,  v); }
   fn _sc1(i: int64, v: int64) { poke64(self._noff(i) + 16, v); }
@@ -351,6 +379,70 @@ pub type Parser = class {
   fn _tokOff(i: int64): int64 { return self.TokStart(i); }
   fn _tokLen(i: int64): int64 { return self.TokLen(i); }
 
+  // WP-AND-02 Phase B: compare token text against a c-string. Returns 1 on match.
+  fn _tokTextEq(i: int64, s: pchar): int64 {
+    var off: int64 := self._tokOff(i);
+    var len: int64 := self._tokLen(i);
+    var j: int64 := 0;
+    while j < len {
+      if peek8(self.src + off + j) != peek8(s + j) { return 0; }
+      j := j + 1;
+    }
+    if peek8(s + len) != 0 { return 0; }
+    return 1;
+  }
+
+  // WP-AND-02 Phase B: map an annotation identifier (after '@') to its flag bit.
+  // Unknown annotations return 0 (effectively ignored, preserves WP-BC-54 leniency).
+  fn _annoNameToFlag(tokIdx: int64): int64 {
+    if self._tokTextEq(tokIdx, "export"c) != 0 { return ANNO_EXPORT; }
+    if self._tokTextEq(tokIdx, "jni"c)    != 0 { return ANNO_JNI; }
+    return 0;
+  }
+
+  // WP-AND-02 Phase B2: parse @jni(class="...", method="...") arguments.
+  // Records found values into the parser's _pendingJni* scratch fields.
+  // Tolerant to unrecognized keys (skipped) and to missing args (no-op).
+  fn _parseJniArgs() {
+    if (self.Match(TK_LPAREN) == 0) { return; }
+    // Note: we match key tokens by TEXT, not by kind, because "class" and
+    // "method" are reserved keywords in Lyx (TK_CLASS / not-an-ident), but
+    // inside an annotation arg list we want them to act as plain names.
+    while (self.Check(TK_RPAREN) == 0 && self.Peek() != TK_EOF) {
+      var keyTok:   int64 := self.cur;
+      var isClass:  int64 := self._tokTextEq(keyTok, "class"c);
+      var isMethod: int64 := self._tokTextEq(keyTok, "method"c);
+      if isClass != 0 || isMethod != 0 {
+        self.Advance();
+        if self.Match(TK_EQ1) != 0 {
+          if self.Check(TK_STRING) != 0 {
+            var strTok: int64 := self.cur;
+            self.Advance();
+            // Strip surrounding quotes (and an optional trailing 'c' pchar suffix).
+            var rawOff: int64 := self._tokOff(strTok);
+            var rawLen: int64 := self._tokLen(strTok);
+            var trim:   int64 := 2;
+            if peek8(self.src + rawOff + rawLen - 1) == 99 { trim := 3; }
+            var sOff: int64 := rawOff + 1;
+            var sLen: int64 := rawLen - trim;
+            if isClass != 0 {
+              self._pendingJniClassOff := sOff;
+              self._pendingJniClassLen := sLen;
+            } else {
+              self._pendingJniMethodOff := sOff;
+              self._pendingJniMethodLen := sLen;
+            }
+          }
+        }
+      } else {
+        // Unknown key; skip a single token to make progress.
+        self.Advance();
+      }
+      self.Match(TK_COMMA);
+    }
+    self.Match(TK_RPAREN);
+  }
+
   // ------------------------------------------------------------------
   // Init / Free
   // ------------------------------------------------------------------
@@ -370,7 +462,49 @@ pub type Parser = class {
     self.cur      := 0;
     self.hadError := 0;
 
+    // WP-AND-02 Phase B2: JNI side-table init (initially small).
+    self.jniCap   := 16;
+    self.jniBuf   := mmap(0, self.jniCap * 40, 3, 34, -1, 0);
+    self.jniCount := 0;
+    self._pendingJniClassOff  := 0;
+    self._pendingJniClassLen  := 0;
+    self._pendingJniMethodOff := 0;
+    self._pendingJniMethodLen := 0;
+
     self._tokenize();
+  }
+
+  // WP-AND-02 Phase B2: append a record to the JNI side-table.
+  fn _pushJniEntry(funcNodeId: int64, classOff: int64, classLen: int64, methodOff: int64, methodLen: int64) {
+    if (self.jniCount >= self.jniCap) {
+      var newCap: int64 := self.jniCap * 2;
+      var nb: int64 := mmap(0, newCap * 40, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.jniCount * 40) {
+        poke8(nb + i, peek8(self.jniBuf + i));
+        i := i + 1;
+      }
+      self.jniBuf := nb;
+      self.jniCap := newCap;
+    }
+    var off: int64 := self.jniBuf + self.jniCount * 40;
+    poke64(off +  0, funcNodeId);
+    poke64(off +  8, classOff);
+    poke64(off + 16, classLen);
+    poke64(off + 24, methodOff);
+    poke64(off + 32, methodLen);
+    self.jniCount := self.jniCount + 1;
+  }
+
+  // WP-AND-02 Phase B2: linear lookup. Returns record pointer, or 0 if absent.
+  pub fn FindJniEntry(funcNodeId: int64): int64 {
+    var i: int64 := 0;
+    while i < self.jniCount {
+      var off: int64 := self.jniBuf + i * 40;
+      if peek64(off) == funcNodeId { return off; }
+      i := i + 1;
+    }
+    return 0;
   }
 
   // ==================================================================
@@ -2085,19 +2219,61 @@ pub type Parser = class {
     while (self.Peek() != TK_EOF) {
       if (self.hadError != 0) { return head; }
 
+      // WP-AND-02 Phase B/B2: capture annotations (was: WP-BC-54 skip).
+      // Annotations may appear before OR after the `pub` keyword.
+      // For @jni, the class/method args are parsed into _pendingJni* fields.
+      // Other annotations fall back to generic depth-skip of their args.
+      var annoFlags: int64 := 0;
+      self._pendingJniClassOff  := 0;
+      self._pendingJniClassLen  := 0;
+      self._pendingJniMethodOff := 0;
+      self._pendingJniMethodLen := 0;
+      while (self.Check(TK_AT) != 0) {
+        self.Advance();  // consume @
+        var flag: int64 := 0;
+        if (self.Check(TK_IDENT) != 0) {
+          flag := self._annoNameToFlag(self.cur);
+          annoFlags := annoFlags | flag;
+          self.Advance();
+        }
+        if (self.Check(TK_LPAREN) != 0) {
+          if (flag == ANNO_JNI) {
+            self._parseJniArgs();
+          } else {
+            self.Advance();  // consume (
+            var depth: int64 := 1;
+            while (depth > 0 && self.Peek() != TK_EOF) {
+              if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+              else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+              self.Advance();
+            }
+          }
+        }
+      }
+
       var isPub: int64 := 0;
       if (self.Match(TK_PUB) != 0) { isPub := 1; }
 
-      // WP-BC-54: skip @attribute(...) before declarations
+      // Allow annotations after `pub` as well (e.g. `pub @export fn ...`).
       while (self.Check(TK_AT) != 0) {
-        self.Advance();  // consume @
-        if (self.Check(TK_IDENT) != 0) { self.Advance(); }  // consume name
-        if (self.Match(TK_LPAREN) != 0) {
-          var depth: int64 := 1;
-          while (depth > 0 && self.Peek() != TK_EOF) {
-            if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
-            else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+        self.Advance();
+        var flag2: int64 := 0;
+        if (self.Check(TK_IDENT) != 0) {
+          flag2 := self._annoNameToFlag(self.cur);
+          annoFlags := annoFlags | flag2;
+          self.Advance();
+        }
+        if (self.Check(TK_LPAREN) != 0) {
+          if (flag2 == ANNO_JNI) {
+            self._parseJniArgs();
+          } else {
             self.Advance();
+            var depth: int64 := 1;
+            while (depth > 0 && self.Peek() != TK_EOF) {
+              if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+              else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+              self.Advance();
+            }
           }
         }
       }
@@ -2105,7 +2281,20 @@ pub type Parser = class {
       var k: int64 := self.Peek();
       var decl: int64 := -1;
 
-      if (k == TK_FN)          { decl := self.ParseFuncDecl(isPub); }
+      if (k == TK_FN) {
+        decl := self.ParseFuncDecl(isPub);
+        if decl != -1 {
+          self._siv(decl, annoFlags);
+          // Attach pending @jni args (if any) to this FUNC_DECL.
+          if (annoFlags & ANNO_JNI) != 0 {
+            if self._pendingJniClassLen > 0 && self._pendingJniMethodLen > 0 {
+              self._pushJniEntry(decl,
+                                 self._pendingJniClassOff,  self._pendingJniClassLen,
+                                 self._pendingJniMethodOff, self._pendingJniMethodLen);
+            }
+          }
+        }
+      }
       else if (k == TK_VAR)    { decl := self.ParseVarDecl(isPub); }
       else if (k == TK_LET)    { decl := self.ParseLetDecl(isPub); }
       else if (k == TK_CON)    { decl := self.ParseConDecl(isPub); }

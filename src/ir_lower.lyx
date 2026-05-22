@@ -156,6 +156,22 @@ pub type IRLower = class {
   // Local variable tracking
   localCount: int64;
   paramCount: int64;
+
+  // WP-AND-upstream-fix v4: per-function name->slot mapping for declared
+  // locals (NK_VAR_DECL inside a body). Records are 24 bytes:
+  // {srcNameOff:i64, nameLen:i64, slotIdx:i64}. Resized geometrically.
+  // Cleared at the start of each lowerFunc.
+  localNameBuf: int64;
+  localNameCnt: int64;
+  localNameCap: int64;
+
+  // WP-AND-upstream-fix v4/v5: module-scope mapping for top-level NK_VAR_DECLs.
+  // Records are 32 bytes: {srcNameOff:i64, nameLen:i64, globalIdx:i64, initValue:i64}.
+  // Populated once in the lowerModule pre-pass and never cleared. Used by
+  // NK_IDENT lookups as the final fallback (after locals + params).
+  globalNameBuf: int64;
+  globalNameCnt: int64;
+  globalNameCap: int64;
   
   // Label and temp counters
   labelCount: int64;
@@ -199,6 +215,12 @@ pub type IRLower = class {
     self.paramCount := 0;
     self.labelCount := 0;
     self.tempCount := 0;
+    self.localNameCap := 32;
+    self.localNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
+    self.localNameCnt := 0;
+    self.globalNameCap := 32;
+    self.globalNameBuf := mmap(0, 32 * 32, 3, 34, -1, 0);
+    self.globalNameCnt := 0;
     self.loopExitLabel := -1;
     self.loopContLabel := -1;
     self.curFunc := -1;
@@ -456,8 +478,17 @@ pub type IRLower = class {
     return t;
   }
   
+  // WP-AND-upstream-fix v8: allocParam now bumps the same counter as
+  // allocTemp. Previously paramCount and tempCount were independent which
+  // meant a function with two params and one explicit retValTemp had
+  // *three* values all claiming slot 0..2 by overlap. With the shared
+  // counter, params occupy 0..paramCount-1 cleanly, and the subsequent
+  // allocTemp for retValTemp returns paramCount (a fresh slot). NK_IDENT's
+  // pidx-based loads still match because params keep their 0-based order.
   fn allocParam(): int64 {
-    var p: int64 := self.paramCount;
+    var p: int64 := self.tempCount;
+    self.tempCount := self.tempCount + 1;
+    if (p >= self.localCount) { self.localCount := p + 1; }
     self.paramCount := self.paramCount + 1;
     return p;
   }
@@ -523,10 +554,102 @@ pub type IRLower = class {
       return dest;
     }
     
-    // Identifier (variable reference)
+    // Identifier (variable reference). WP-AND-upstream-fix v4: previously a
+    // pure stub — allocate temp, return without emitting any load. As a
+    // result every `a + b` style expression was reading whatever the
+    // zeroed temp slot happened to contain. We now walk the current
+    // function's parameter list (NK_PARAM chain in curFunc.nodeC0) and,
+    // on a name match, emit IRO_LOAD_LOCAL with src = position-in-chain.
+    // Locals declared via NK_VAR_DECL still unhandled — separate step.
+    // Globals also unhandled — see work/android.md for the open list.
     if (k == NK_IDENT) {
       var dest: int64 := self.allocTemp();
-      // Load from local or global based on context
+      if self.curFunc >= 0 {
+        var idName: pchar := self.nodeSVal(expr);
+        var idLen:  int64 := self.nodeSLen(expr);
+        var idPtrL: int64 := (idName) as int64;
+        // WP-AND-upstream-fix v4: locals declared via NK_VAR_DECL come first.
+        var lnI: int64 := self.localNameCnt - 1;   // shadowing: latest wins
+        while lnI >= 0 {
+          var lnRec:    int64 := self.localNameBuf + lnI * 24;
+          var lnNameOff:int64 := peek64(lnRec + 0);
+          var lnLen:    int64 := peek64(lnRec + 8);
+          var lnSlot:   int64 := peek64(lnRec + 16);
+          if lnLen == idLen {
+            var lnPtr: int64 := (self.src as int64) + lnNameOff;
+            var lnMatch: int64 := 1;
+            var lnJ: int64 := 0;
+            while lnJ < idLen {
+              if lnMatch != 0 {
+                if peek8(lnPtr + lnJ) != peek8(idPtrL + lnJ) { lnMatch := 0; }
+              }
+              lnJ := lnJ + 1;
+            }
+            if lnMatch != 0 {
+              self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, lnSlot, -1, 0);
+              return dest;
+            }
+          }
+          lnI := lnI - 1;
+        }
+        var pnode:  int64 := self.nodeC0(self.curFunc);
+        var pidx:   int64 := 0;
+        while pnode >= 0 {
+          if self.nodeKind(pnode) == NK_PARAM {
+            var pnLen: int64 := self.nodeSLen(pnode);
+            if pnLen == idLen {
+              var pnPtr: int64 := (self.nodeSVal(pnode)) as int64;
+              var idPtr: int64 := (idName) as int64;
+              var pmatch: int64 := 1;
+              var pj: int64 := 0;
+              while pj < idLen {
+                if pmatch != 0 {
+                  if peek8(pnPtr + pj) != peek8(idPtr + pj) { pmatch := 0; }
+                }
+                pj := pj + 1;
+              }
+              if pmatch != 0 {
+                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx, -1, 0);
+                return dest;
+              }
+            }
+            pidx := pidx + 1;
+          }
+          pnode := self.nodeNext(pnode);
+        }
+        // WP-AND-upstream-fix v4: globals fallback. The src nameOff stored
+        // in globalNameBuf points into the main file's src — which is what
+        // self.src is set to during a top-level lowerModule pass. (Imported
+        // bodies temporarily swap self.src; if they reference a global from
+        // the main file, that lookup will compare bytes against the wrong
+        // buffer. Acceptable initial limitation: cross-module globals not
+        // supported yet.)
+        var gnI: int64 := 0;
+        // WP-AND-upstream-fix v5/cross-module: names live in IR strBuffer.
+        var gnStrBuf: int64 := peek64(self.ir + 32);
+        while gnI < self.globalNameCnt {
+          var gnRec:     int64 := self.globalNameBuf + gnI * 32;
+          var gnNameOff: int64 := peek64(gnRec + 0);
+          var gnLen:     int64 := peek64(gnRec + 8);
+          var gnIdx:     int64 := peek64(gnRec + 16);
+          if gnLen == idLen {
+            var gnPtr: int64 := gnStrBuf + gnNameOff;
+            var gnMatch: int64 := 1;
+            var gnJ: int64 := 0;
+            while gnJ < idLen {
+              if gnMatch != 0 {
+                if peek8(gnPtr + gnJ) != peek8(idPtrL + gnJ) { gnMatch := 0; }
+              }
+              gnJ := gnJ + 1;
+            }
+            if gnMatch != 0 {
+              self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
+              return dest;
+            }
+          }
+          gnI := gnI + 1;
+        }
+      }
       return dest;
     }
     
@@ -615,13 +738,32 @@ pub type IRLower = class {
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var t2: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
-    
-    // Arithmetic ops: +, -, *, /, %
-    // Comparison ops: ==, !=, <, <=, >, >=
-    // Bitwise ops: &, |, ^, <<, >>
-    // Logical ops: &&, ||
-    
-    // Emit appropriate IR instruction based on op
+    // WP-AND-upstream-fix v4: previously the helper just allocated a temp
+    // and returned it -- every binop in IR mode was silently dropping its
+    // operation. Map the parser's TK_* opcode (stored in iVal by the
+    // parser) to the corresponding IRO_* and emit the 3-address instruction.
+    var iro: int64 := -1;
+    if op == 70  { iro := IRO_ADD; }    // TK_PLUS
+    else if op == 71  { iro := IRO_SUB; }   // TK_MINUS
+    else if op == 72  { iro := IRO_MUL; }   // TK_STAR
+    else if op == 73  { iro := IRO_DIV; }   // TK_SLASH
+    else if op == 74  { iro := IRO_MOD; }   // TK_PERCENT
+    else if op == 79  { iro := IRO_CMP_EQ; }  // TK_EQ2 (==)
+    else if op == 80  { iro := IRO_CMP_NEQ; } // TK_NEQ
+    else if op == 81  { iro := IRO_CMP_LT; }  // TK_LT
+    else if op == 82  { iro := IRO_CMP_LE; }  // TK_LE
+    else if op == 83  { iro := IRO_CMP_GT; }  // TK_GT
+    else if op == 84  { iro := IRO_CMP_GE; }  // TK_GE
+    else if op == 90  { iro := IRO_AND; }   // TK_BITAND
+    else if op == 91  { iro := IRO_OR;  }   // TK_BITOR
+    else if op == 89  { iro := IRO_XOR; }   // TK_BITXOR
+    else if op == 93  { iro := IRO_SHL; }   // TK_SHL
+    else if op == 94  { iro := IRO_SHR; }   // TK_SHR
+    else if op == 85  { iro := IRO_AND; }   // TK_AND (&&; treat as bitwise for now)
+    else if op == 86  { iro := IRO_OR;  }   // TK_OR (||)
+    if iro >= 0 {
+      self.irAddInstrDirect(iro, dest, t1, t2, 0);
+    }
     return dest;
   }
   
@@ -633,8 +775,22 @@ pub type IRLower = class {
     var op: int64 := self.nodeIVal(expr);
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var dest: int64 := self.allocTemp();
-    
-    // Unary ops: -, !, ~, &
+    // WP-AND-upstream-fix v6: emit actual ops. Map the parser's TK_*
+    // operator to the corresponding IRO_*.
+    //   TK_MINUS  (-x)   -> IRO_NEG
+    //   TK_NOT    (!x)   -> IRO_NOT     (logical negation)
+    //   TK_BITNOT (~x)   -> IRO_BITNOT  (bitwise complement)
+    //   TK_BITAND (&x)   -> address-of: needs IRO_LOAD_LOCAL_ADDR-style
+    //     emission; current ir_lower has no address-of pathway, so we
+    //     fall through and return the loaded value (a known compromise;
+    //     real address-taking should arrive with NK_FIELD's & operator).
+    var iro: int64 := -1;
+    if op == 71 { iro := IRO_NEG;    }   // TK_MINUS
+    else if op == 87 { iro := IRO_NOT;    }   // TK_NOT
+    else if op == 92 { iro := IRO_BITNOT; }   // TK_BITNOT
+    if iro >= 0 {
+      self.irAddInstrDirect(iro, dest, t1, -1, 0);
+    }
     return dest;
   }
   
@@ -648,6 +804,39 @@ pub type IRLower = class {
     var fname: pchar := self.nodeSVal(expr);
     var fnlen: int64 := self.nodeSLen(expr);
     var arg0: int64 := self.nodeC0(expr);
+
+    // WP-AND-upstream-fix: _indirect_call_N(fnPtr, ...args) — N in 0..4.
+    // First user-syntax argument is the function pointer; remaining N are
+    // the call args. We lower the fn pointer to a temp, lower each user arg
+    // to a temp, copy those into slots 0..N-1 (the AArch64 emitter loads
+    // those slots into x0..x7 right before BLR), and emit IRO_CALL_INDIRECT
+    // with imm = N. NOTE: this clobbers the function's own slots 0..N-1 —
+    // callers (typically thin JNI / libandroid wrappers with no live locals
+    // other than the args they want to forward) should be written with that
+    // in mind. Once a full callee-saved-spill pass lands, this restriction
+    // disappears.
+    var indN: int64 := -1;
+    if (self.seq(fname, fnlen, "_indirect_call_0", 16)) { indN := 0; }
+    else if (self.seq(fname, fnlen, "_indirect_call_1", 16)) { indN := 1; }
+    else if (self.seq(fname, fnlen, "_indirect_call_2", 16)) { indN := 2; }
+    else if (self.seq(fname, fnlen, "_indirect_call_3", 16)) { indN := 3; }
+    else if (self.seq(fname, fnlen, "_indirect_call_4", 16)) { indN := 4; }
+    if (indN >= 0) {
+      if (arg0 < 0) { return dest; }
+      var fnTemp: int64 := self.lowerExpr(arg0);
+      var argNode: int64 := self.nodeNext(arg0);
+      var i: int64 := 0;
+      while (i < indN && argNode >= 0) {
+        var aTemp: int64 := self.lowerExpr(argNode);
+        // Store argTemp into slot `i` so the AArch64 emitter loads it into x{i}.
+        self.irAddInstrDirect(IRO_STORE_LOCAL, i, aTemp, -1, 0);
+        argNode := self.nodeNext(argNode);
+        i := i + 1;
+      }
+      // src1 = slot index of fn pointer, imm = arg count.
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, -1, indN);
+      return dest;
+    }
 
     // WP-BC-01: sqrt(f64) → IRO_FSQRT (sqrtsd in codegen)
     if (self.seq(fname, fnlen, "sqrt", 4)) {
@@ -724,6 +913,51 @@ pub type IRLower = class {
         var instrIdx: int64 := self.irAddInstrDirect(IRO_INSPECT, -1, valSrc, -1, 0);
         self.irSetStrOff(instrIdx, nameOff);
       }
+      return dest;
+    }
+
+    // WP-AND-upstream-fix v2: user-function call. Inline name lookup against
+    // the IR funcBuffer (no helper method — adding one shifted the IRLower
+    // vtable in a way that broke self-host singularity). Forward references
+    // not supported: caller defined before callee in source order hits this
+    // path; callee defined LATER falls through to the IRO_CALL_BUILTIN
+    // legacy fallback below.
+    var fbUserBuf: int64 := peek64(self.ir + 80);
+    var fbUserStr: int64 := peek64(self.ir + 32);
+    var fbUserCnt: int64 := peek64(self.ir + 96);
+    var fbUserIdx: int64 := -1;
+    var fbI: int64 := 0;
+    while fbI < fbUserCnt {
+      var fbNOff: int64 := peek64(fbUserBuf + fbI * 80);
+      var fbNLen: int64 := peek64(fbUserBuf + fbI * 80 + 8);
+      if fbNLen == fnlen {
+        var fbMatch: int64 := 1;
+        var fbJ: int64 := 0;
+        while fbJ < fbNLen {
+          if fbMatch != 0 {
+            if peek8(fbUserStr + fbNOff + fbJ) != peek8((fname as int64) + fbJ) {
+              fbMatch := 0;
+            }
+          }
+          fbJ := fbJ + 1;
+        }
+        if fbMatch != 0 {
+          fbUserIdx := fbI;
+          fbI := fbUserCnt;     // break
+        }
+      }
+      fbI := fbI + 1;
+    }
+    if fbUserIdx >= 0 {
+      var fbArgCnt: int64 := 0;
+      var fbArg: int64 := arg0;
+      while fbArg >= 0 {
+        var fbATemp: int64 := self.lowerExpr(fbArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgCnt, fbATemp, -1, 0);
+        fbArgCnt := fbArgCnt + 1;
+        fbArg := self.nodeNext(fbArg);
+      }
+      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, -1, fbArgCnt);
       return dest;
     }
 
@@ -878,6 +1112,35 @@ pub type IRLower = class {
     // WP-BC-10: panic(msg) → IRO_PANIC
     else if (k == NK_PANIC) {
       self.lowerPanic(stmt);
+    }
+    // WP-AND-upstream-fix v4: `var x: T := expr;` inside a function body.
+    // Allocate a slot, lower the init expression, store into the slot, and
+    // record name->slot in localNameBuf so subsequent NK_IDENT lookups can
+    // find it. Inline (no helper method) for vtable stability.
+    else if (k == NK_VAR_DECL) {
+      var vdSlot: int64 := self.allocTemp();
+      var vdInit: int64 := self.nodeC1(stmt);
+      if vdInit >= 0 {
+        var vdTemp: int64 := self.lowerExpr(vdInit);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
+      }
+      // Register name -> slot. Grow the buffer geometrically if full.
+      if self.localNameCnt >= self.localNameCap {
+        var vdNewCap: int64 := self.localNameCap * 2;
+        var vdNb: int64 := mmap(0, vdNewCap * 24, 3, 34, -1, 0);
+        var vdI: int64 := 0;
+        while vdI < self.localNameCnt * 24 {
+          poke8(vdNb + vdI, peek8(self.localNameBuf + vdI));
+          vdI := vdI + 1;
+        }
+        self.localNameBuf := vdNb;
+        self.localNameCap := vdNewCap;
+      }
+      var vdRec: int64 := self.localNameBuf + self.localNameCnt * 24;
+      poke64(vdRec +  0, peek64(self.nodeOff(stmt) + 64));  // src nameOff
+      poke64(vdRec +  8, self.nodeSLen(stmt));
+      poke64(vdRec + 16, vdSlot);
+      self.localNameCnt := self.localNameCnt + 1;
     }
     // Try/Catch/Finally handled in lowering blocks
   }
@@ -1254,16 +1517,21 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.localNameCnt := 0;
     self.curFunc := funcNode;
 
-    self.retValTemp := self.allocTemp();
-    self.funcExitLabel := self.genLabel();
-
+    // WP-AND-upstream-fix v8: allocate params FIRST (slots 0..paramCount-1)
+    // so they line up with the AAPCS64 spill the prologue performs and with
+    // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
+    // doesn't share a slot with the first spilled parameter.
     var param: int64 := self.nodeC0(funcNode);
     while (param >= 0) {
       self.allocParam();
       param := self.nodeNext(param);
     }
+
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
 
     self.funcInstrStart := peek64(self.ir + 24);
 
@@ -1271,6 +1539,15 @@ pub type IRLower = class {
     if (body >= 0) { self.lowerBlock(body); }
 
     self.irEmitLabel(self.funcExitLabel);
+    // WP-AND-upstream-fix v7: load the return-value slot into x0 right
+    // before the epilogue. emitLoadLocal's first action is `LDUR x0,
+    // [fp + slotOff(src)]`, and x0 survives the epilogue's MOV-sp /
+    // LDP / RET sequence, so this satisfies AAPCS64's return-register
+    // convention. Dest is harmless — STUR to slot 0 just writes
+    // (the same) value back to itself.
+    if self.retValTemp >= 0 {
+      self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    }
     self._addFunc();
   }
    
@@ -1279,10 +1556,142 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerModule(decls: int64) {
+    // WP-AND-upstream-fix v4: pre-pass — register every top-level NK_VAR_DECL
+    // as a global. NK_IDENT lookups in expressions later in this lowerModule
+    // (and in nested lowerModule calls for imports) can then resolve them.
+    var ggCur: int64 := decls;
+    while ggCur >= 0 {
+      if self.nodeKind(ggCur) == NK_VAR_DECL {
+        if self.globalNameCnt >= self.globalNameCap {
+          var ggNewCap: int64 := self.globalNameCap * 2;
+          var ggNb: int64 := mmap(0, ggNewCap * 32, 3, 34, -1, 0);
+          var ggI: int64 := 0;
+          while ggI < self.globalNameCnt * 32 {
+            poke8(ggNb + ggI, peek8(self.globalNameBuf + ggI));
+            ggI := ggI + 1;
+          }
+          self.globalNameBuf := ggNb;
+          self.globalNameCap := ggNewCap;
+        }
+        // Extract init value if it's a simple int literal; everything else
+        // defaults to 0 (runtime init via constructors etc. is future work).
+        var ggInit: int64 := 0;
+        var ggInitNode: int64 := self.nodeC1(ggCur);
+        if ggInitNode >= 0 {
+          if self.nodeKind(ggInitNode) == NK_LIT_INT {
+            ggInit := self.nodeIVal(ggInitNode);
+          }
+        }
+        // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
+        // string table so subsequent NK_IDENT lookups don't depend on
+        // self.src (which gets swapped while lowering imports). The stored
+        // offset is into ir.strBuffer, not into any parser's src.
+        var ggNamePtr: pchar := self.nodeSVal(ggCur);
+        var ggNameLen: int64 := self.nodeSLen(ggCur);
+        var ggStrOff:  int64 := self.irAddString(ggNamePtr, ggNameLen);
+        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+        poke64(ggRec +  0, ggStrOff);                            // IR strBuf offset
+        poke64(ggRec +  8, ggNameLen);
+        poke64(ggRec + 16, self.globalNameCnt);                  // globalIdx
+        poke64(ggRec + 24, ggInit);                              // init value
+        // Also mirror into IR module's globalBuffer (8 bytes per global, init
+        // value at globalIdx*8). writeELFSharedLib reads from here to emit
+        // the .data section. IR module layout: globalBuffer @ +104,
+        // globalCap @ +112, globalLen @ +120 (offsets follow the class field
+        // order in ir.lyx).
+        var ggBuf: int64 := peek64(self.ir + 104);
+        var ggCap: int64 := peek64(self.ir + 112);
+        if self.globalNameCnt * 8 + 8 > ggCap {
+          var ggNewCap2: int64 := ggCap * 2;
+          if ggNewCap2 < self.globalNameCnt * 8 + 8 { ggNewCap2 := self.globalNameCnt * 8 + 64; }
+          var ggNb2: int64 := mmap(0, ggNewCap2, 3, 34, -1, 0);
+          var ggI2: int64 := 0;
+          while ggI2 < self.globalNameCnt * 8 {
+            poke8(ggNb2 + ggI2, peek8(ggBuf + ggI2));
+            ggI2 := ggI2 + 1;
+          }
+          ggBuf := ggNb2;
+          poke64(self.ir + 104, ggBuf);
+          poke64(self.ir + 112, ggNewCap2);
+        }
+        poke64(ggBuf + self.globalNameCnt * 8, ggInit);
+        poke64(self.ir + 120, self.globalNameCnt + 1);   // globalLen
+        self.globalNameCnt := self.globalNameCnt + 1;
+      }
+      ggCur := self.nodeNext(ggCur);
+    }
+
+    // WP-AND-upstream-fix v9: forward-reference pre-pass.
+    // Register every top-level NK_FUNC_DECL name in funcBuffer with a
+    // placeholder body before any function body is lowered. _addFunc
+    // detects the existing entry on the second pass and updates it
+    // (rather than allocating a new one). Imports aren't pre-passed
+    // here; the body-pass below recurses into lowerModule for each
+    // import, which performs its own pre-pass. Convention: imports
+    // appear before function bodies in source order, so the chain
+    // resolves correctly.
+    var pfCur: int64 := decls;
+    while pfCur >= 0 {
+      if self.nodeKind(pfCur) == NK_FUNC_DECL {
+        var pfNamePtr: pchar := self.nodeSVal(pfCur);
+        var pfNameLen: int64 := self.nodeSLen(pfCur);
+        var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
+        self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+      }
+      pfCur := self.nodeNext(pfCur);
+    }
+
     var cur: int64 := decls;
     while (cur >= 0) {
       var kind: int64 := self.nodeKind(cur);
-      if (kind == NK_FUNC_DECL) { self.lowerFunc(cur); }
+      if (kind == NK_FUNC_DECL) {
+        self.lowerFunc(cur);
+      } else if (kind == NK_IMPORT) {
+        // WP-AND-upstream-fix v3: actually lower imported function bodies.
+        // Sema's _sema_processImport reads + parses imports but disposes the
+        // AST after Pass1, so ir_lower can't see imported decls. We re-read +
+        // re-parse here. Logic is inlined rather than factored into a helper
+        // method — earlier attempts at the v2 fix found that adding methods
+        // to IRLower shifts its vtable in ways the seed compiler stumbles on.
+        //
+        // Path resolution: same convention as sema (`a.b.c` -> `a/b/c.lyx`).
+        // No includePath / stdPath fallback yet; relative paths work for
+        // tests run from the project root.
+        var impModName: pchar := self.nodeSVal(cur);
+        var impModLen:  int64 := self.nodeSLen(cur);
+        var impPathBuf: int64 := mmap(0, impModLen + 8, 3, 34, -1, 0);
+        var impI: int64 := 0;
+        while impI < impModLen {
+          var impC: int64 := peek8((impModName as int64) + impI);
+          if impC == 46 { impC := 47; }   // '.' -> '/'
+          poke8(impPathBuf + impI, impC);
+          impI := impI + 1;
+        }
+        poke8(impPathBuf + impModLen + 0,  46);   // '.'
+        poke8(impPathBuf + impModLen + 1, 108);   // 'l'
+        poke8(impPathBuf + impModLen + 2, 121);   // 'y'
+        poke8(impPathBuf + impModLen + 3, 120);   // 'x'
+        poke8(impPathBuf + impModLen + 4,   0);
+
+        var impSrc: pchar := FileReadAll(impPathBuf as pchar);
+        if (impSrc as int64) != 0 {
+          var impP: Parser := new Parser();
+          impP.Init(impSrc, StrLen(impSrc));
+          var impHead: int64 := impP.Parse();
+          if impP.hadError == 0 {
+            var impSavedSrc:    pchar := self.src;
+            var impSavedNodes:  int64 := self.nodes;
+            var impSavedCount:  int64 := self.nodeCount;
+            self.src       := impP.src;
+            self.nodes     := impP.nodes;
+            self.nodeCount := impP.nodeCount;
+            self.lowerModule(impHead);
+            self.src       := impSavedSrc;
+            self.nodes     := impSavedNodes;
+            self.nodeCount := impSavedCount;
+          }
+        }
+      }
       cur := self.nodeNext(cur);
     }
   }
@@ -1291,21 +1700,57 @@ pub type IRLower = class {
   // Accessors
   // ------------------------------------------------------------------
   
-  // Add function to IR module - using globalFuncCount field as workaround
+  // Add function to IR module. WP-AND-upstream-fix v9: support forward
+  // references by detecting a pre-registered entry (same name) and
+  // updating it instead of allocating a new one. The lookup uses early-
+  // termination via a sentinel flag rather than mutating the loop bound
+  // — earlier attempts to break by setting `fi := funcLen` hung the
+  // seed compiler while it processed this source.
   fn _addFunc() {
-    var nameOff: int64 := self.nodeIVal(self.curFunc);
-    var nameLen: int64 := 3;
-    var funcIdx: int64 := self.irAddFunc(nameOff, nameLen, self.localCount, self.paramCount);
-    self.globalFuncCount := self.globalFuncCount + 1;
+    var fnNamePtr: pchar := self.nodeSVal(self.curFunc);
+    var fnNameLen: int64 := self.nodeSLen(self.curFunc);
 
-    // Patch instrsOff and instrCount now that we know the instruction range
+    var funcBuf2: int64 := peek64(self.ir + 80);
+    var strBuf2:  int64 := peek64(self.ir + 32);
+    var funcLen2: int64 := peek64(self.ir + 96);
+    var funcIdx:  int64 := -1;
+    var fi2: int64 := 0;
+    while fi2 < funcLen2 {
+      if funcIdx < 0 {
+        var nOff2: int64 := peek64(funcBuf2 + fi2 * 80 + 0);
+        var nLen2: int64 := peek64(funcBuf2 + fi2 * 80 + 8);
+        if nLen2 == fnNameLen {
+          var match2: int64 := 1;
+          var j2: int64 := 0;
+          while j2 < nLen2 {
+            if match2 != 0 {
+              if peek8(strBuf2 + nOff2 + j2) != peek8((fnNamePtr as int64) + j2) { match2 := 0; }
+            }
+            j2 := j2 + 1;
+          }
+          if match2 != 0 { funcIdx := fi2; }
+        }
+      }
+      fi2 := fi2 + 1;
+    }
+
+    if funcIdx < 0 {
+      var nameOff: int64 := self.irAddString(fnNamePtr, fnNameLen);
+      funcIdx := self.irAddFunc(nameOff, fnNameLen, self.localCount, self.paramCount);
+      self.globalFuncCount := self.globalFuncCount + 1;
+    } else {
+      // Pre-registered: fill in real locals/params.
+      poke64(funcBuf2 + funcIdx * 80 + 32, self.localCount);
+      poke64(funcBuf2 + funcIdx * 80 + 40, self.paramCount);
+    }
+
+    // Patch instrsOff and instrCount.
     var instrLen: int64 := peek64(self.ir + 24);
-    var funcBuf: int64 := peek64(self.ir + 80);
     var off: int64 := funcIdx * 80;
-    poke64(funcBuf + off + 16, self.funcInstrStart);              // instrsOff
-    poke64(funcBuf + off + 24, instrLen - self.funcInstrStart);   // instrCount
+    poke64(funcBuf2 + off + 16, self.funcInstrStart);
+    poke64(funcBuf2 + off + 24, instrLen - self.funcInstrStart);
   }
-  
+
   fn getStringLen(off: int64): int64 {
     var strBuf: int64 := peek64(self.ir + 32);  // strBuffer at +32 (after VMT)
     var ptr: int64 := strBuf + off;

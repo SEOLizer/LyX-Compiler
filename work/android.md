@@ -1,280 +1,222 @@
-# Android Backend — Fahrplan
+# Android Backend — Status & Fahrplan
 
 ## 1. Übersicht
 
-Android basiert auf dem Linux-Kernel mit ARM64 (und x86_64 für Emulatoren).
-Da Lyx bereits ein Linux-ARM64-Backend und einen ELF-Writer hat, ist der Abstand
-zum lauffähigen Android-Backend deutlich kleiner als bei iOS. Der Hauptunterschied
-liegt in der **Bionic-ABI**, der **JNI-Brücke** für App-Integration und dem
-**APK-Packaging**.
+Android läuft auf dem Linux-Kernel — ARM64 als Primärziel, x86_64 für
+Emulatoren. Lyx hatte schon ein Linux-ARM64-Backend und einen ELF-Writer; die
+Lücken zur lauffähigen `.so` waren **Bionic-ABI**, die **JNI-Brücke**, das
+**APK-Packaging** und ein Reihe halbfertiger IR-Pipeline-Stubs, die
+WP-AND-Verifikation aufdeckte.
 
 ```
 Ziel-Architektur:  ARM64 (aarch64-linux-android)  ← Primär
-                   x86_64 (x86_64-linux-android)   ← Emulator/Testing
+                   x86_64 (x86_64-linux-android)  ← Emulator/Testing
+Branch:            feat/android-backend           (22 commits, S3==S4)
 ```
 
 ---
 
 ## 2. Aktueller Stand
 
-| Komponente | Status | Lücke |
+| Komponente | Status |
+|---|---|
+| `--target=android-arm64` / `android-x86_64` | ✅ |
+| ET_DYN `.so` Output (`--shared`) | ✅ strukturell vollständig |
+| Symbol-Export `@export` + JNI-Mangling `@jni(class=…, method=…)` | ✅ |
+| Bionic-ABI-Compliance (Stack-Alignment, no x18, no TPIDR_EL0) | ✅ |
+| `.note.android.ident` + `.eh_frame` + `.eh_frame_hdr` + PT_GNU_EH_FRAME | ✅ |
+| `.rela.dyn` mit `R_AARCH64_RELATIVE` Relocations | ✅ |
+| `.data`-Section mit globalen Variablen + Init-Werten | ✅ |
+| `@export`-Funktionen aus `import std.android.jni` direkt aufrufbar | ✅ (User-Function-Call + Import-Body-Lowering) |
+| `_indirect_call_N(fnPtr, …)` für JNIEnv-VTable-Calls | ✅ |
+| Forward-References zwischen Top-Level-Funktionen | ✅ |
+| Korrekte Codegen für `return a + b` (Param-Spill + retVal→x0) | ✅ |
+| Android-Stdlib: `std/android/{log, jni, asset, sensor, input, native_window, looper, native_activity, app_glue, gles2, manifest_gen, random, restrictions, ioctl, zip_writer, apk_builder}` | ✅ |
+| AndroidManifest.xml-Generator + Pure-Lyx ZIP-Writer + APK-Builder | ✅ |
+| `make singularity` (S3 == S4 bit-identisch) | ✅ über alle 22 Commits |
+| Externe Library-Calls via PLT (libandroid, libGLESv2, libEGL, …) | ❌ |
+| String-Literals in `.rodata` der `.so` | ❌ |
+| NDK / Emulator End-to-End-Loadtest | ❌ (Tooling nicht lokal) |
+
+---
+
+## 3. Branch-Inhalt
+
+### Erledigte Work-Packages (WP-AND-01..08)
+
+| Commit | Was |
+|---|---|
+| `fbaea30` | **WP-AND-01** Android-Targets registriert (`--target=android-arm64`/`-x86_64`/`-android`) |
+| `5163b27` | **WP-AND-02 Phase A** ET_DYN `.so` mit `.dynamic`/`.dynsym`/`.dynstr`/`.hash`, SONAME, 3 PT_LOAD/PT_DYNAMIC headers |
+| `14bb5ff` | **WP-AND-02 Phase B** `@export`-Annotation → echte `STB_GLOBAL\|STT_FUNC` Symbol-Tabelle |
+| `74ed6f0` | **WP-AND-02 Phase B2** `@jni(class=…, method=…)` Annotation + `Java_<class>_<method>` Mangling |
+| `2598046` | **WP-AND-02 Phase C** `R_AARCH64_RELATIVE` Infrastruktur, `_emitLoadGlobalPIC` Literal-Pool |
+| `c1bf62e` | **WP-AND-03** Bionic-ABI-Audit + `.note.android.ident` + DWARF CFI in `.eh_frame` + `.eh_frame_hdr` + PT_GNU_EH_FRAME |
+| `a68f11c` | **WP-AND-04** `std/net/internal/syscalls_android` + `std/android/restrictions` + `random` + `ioctl` Konstanten |
+| `e9c8b37` | **WP-AND-05 Phase A** `std/android/jni.lyx`: 40+ Type-Aliases, JNIEnv-VTable-Slot-Katalog |
+| `6f1b908` | **WP-AND-06** `std/android/log` (voll funktional via stderr) + asset/sensor/input/native_window (Konstanten + Struct-Layouts) |
+| `d2d5362` | **WP-AND-07** NativeActivity-Scaffolding: looper/native_activity/app_glue + GLES2-Konstanten + Manifest-Generator |
+| `60ce79b` | **WP-AND-08** Pure-Lyx `std/android/zip_writer` + `apk_builder` + End-to-End-Demo |
+
+### Upstream-Pipeline-Fixes (entdeckt + behoben während WP-AND-Arbeit)
+
+| Commit | Was |
+|---|---|
+| `e30cfa8` | `_indirect_call_0..4` Builtin-Familie + JNI-Wrapper in `std/android/jni.lyx` (`JNI_GetVersion`, `JNI_NewStringUTF`, 17 weitere) |
+| `a291f05` | User-Function-Call Lowering: `lowerCall` Inline-Lookup im `funcBuffer` + `_addFunc` mit echter Namens-Speicherung |
+| `ba23ac2` | `lowerModule` walkt `NK_IMPORT`-Knoten, lädt+parsed Datei, swappt `src/nodes`, rekursiert |
+| `b82acb0` | `NK_IDENT` (Parameter-Lookup über `curFunc`-Param-Chain) + `NK_BINOP` (echte `IRO_ADD`/`SUB`/`MUL`/`CMP_*`/…) |
+| `43028bf` | `NK_VAR_DECL` allokiert Slot + `IRO_STORE_LOCAL` mit Init + per-function `localNameBuf` |
+| `1060c98` | Top-Level `NK_VAR_DECL` → `globalNameBuf`; `NK_IDENT` Fallback auf Globals |
+| `f43b519` | `IRO_LOAD_GLOBAL` end-to-end: `emit_arm64` emittiert PIC Literal-Pool mit `globalRelocBuf`-Tracking, `writeELFSharedLib` schreibt `.data`-Section + R_AARCH64_RELATIVE pro Slot, Cross-Module-Globals via IR-Stringtabelle |
+| `eb19e5a` | `NK_UNOP`: `IRO_NEG`/`IRO_NOT`/`IRO_BITNOT` werden emittiert |
+| `76de413` | Param-Spill im Prolog (x0..x7 → Slot 0..N-1) + `retValTemp` → x0 vor Epilog |
+| `65128ad` | Slot-Allocator-Reordering: Params bekommen 0..N-1 sauber, retValTemp danach (war Slot-0 Kollision) |
+| `13f6bb3` | Forward-References: `lowerModule`-Pre-Pass registriert alle Funcs vor Body-Pass, `emit_arm64.applyPatches` mit `labelId=-2` Marker + finalem Pass am Ende von `emit()` |
+
+---
+
+## 4. Offene Work-Packages
+
+### 🔴 Echte Blocker für "läuft auf Android-Gerät"
+
+#### WP-AND-09: PLT-Infrastruktur für externes Library-Linking
+
+**Aufwand:** 8–15h. **Blockiert:** alle libandroid/libGLESv2/libEGL/liblog-Calls.
+
+- ARM64-Codegen für `R_AARCH64_GLOB_DAT` (GOT-Einträge für externe Globals)
+- ARM64-Codegen für `R_AARCH64_JUMP_SLOT` (PLT-Einträge für externe Funktionen)
+- `.rela.plt` Sektion + GOT-Tabelle im `writeELFSharedLib`
+- `.dynamic` Erweiterung: `DT_PLTREL`, `DT_JMPREL`, `DT_PLTGOT`, `DT_PLTRELSZ`
+- `DT_NEEDED` Einträge pro extern verlinktes Lib
+- Frontend: `@extern fn` Annotation oder Schlüsselwort, die das Frontend triggert,
+  ein Symbol als unresolved zu markieren statt es zu lowern
+- `_indirect_call_N` als Fallback bleibt; PLT ist nur die transparente Lösung
+
+Mit PLT würden die TODO-Function-Wrapper in `std/android/asset.lyx`,
+`std/android/sensor.lyx`, `std/android/input.lyx` und
+`std/android/native_window.lyx` aktiviert werden — alle Konstanten + Struct-
+Layouts dafür sind schon da.
+
+#### WP-AND-10: String-Literals landen tatsächlich in der `.so`
+
+**Aufwand:** 2–3h. **Blockiert:** `LogI("tag", "msg")`, `PrintStrLn("…")`,
+jeden String-Output.
+
+`PrintStrLn("Hello from Lyx")` produziert aktuell keine `Hello`-Bytes in der
+`.so` (im IR-Modus). `NK_LIT_STR` emittiert zwar `IRO_CONST_STR` mit strOff
+ins IR-String-Buffer, aber `emit_arm64` materialisiert daraus keine `.rodata`-
+Section, und kein Codepfad gibt dem `IRO_CONST_STR` einen runtime-erreichbaren
+Pointer.
+
+- `writeELFSharedLib` schreibt eine `.rodata`-Section mit allen IR-strings
+- `emit_arm64.emitConstStr` (neu) emittiert Literal-Pool-Sequenz analog zu
+  `_emitLoadGlobalPIC`, slot = strOff + .rodata base, mit R_AARCH64_RELATIVE
+- Wahrscheinlich auch Codegen-Eingriff: aktuell scheint NK_LIT_STR-Lowering
+  unvollständig (nodeIVal(expr) für `strOff` ist möglicherweise nicht gesetzt
+  weil Parser/Sema-Pipeline String-Pool-Konstruktion nicht vollständig macht)
+
+#### WP-AND-11: NDK/Emulator End-to-End-Test
+
+**Aufwand:** 1–2h (Setup) + Iteration. **Out-of-scope** für reine Compiler-Arbeit
+ohne installierte Tooling — der Test-Loop selbst braucht Android-SDK/NDK auf
+dem Build-Host.
+
+- Android-NDK r25+ Toolchain installieren
+- `lyxc --target=android-arm64 --shared` Output via
+  `aarch64-linux-android-readelf` validieren (nicht nur system readelf)
+- Emulator (`emulator -avd Pixel_API_34`) starten
+- Minimal-Kotlin-App mit JNI-Bindings bauen, `.so` einbetten via APK-Build
+- `adb install` + Logcat-Inspektion
+- Bestätigt: `Java_com_example_MyClass_nativeAdd(3, 4) == 7`
+
+### 🟡 Substantielle TODOs (jeder isoliert lieferbar)
+
+#### WP-AND-12: `&x` Address-Of in `NK_UNOP`
+
+**Aufwand:** 1–2h. Aktuell `&x` fällt durch zum `loaded value`-Stub.
+Braucht `IRO_LOAD_LOCAL_ADDR`-Pfad in `ir_lower` + entsprechende
+`emit_arm64`-Dispatch.
+
+#### WP-AND-13: Non-literal Initializer für globale Variablen
+
+**Aufwand:** 1–2h. `var x: int64 := compute()` defaultet aktuell auf 0,
+weil die Pre-Pass-Init-Extraktion nur `NK_LIT_INT` erkennt. Optionen:
+- Constructor-Code im `_init`-Block bei Loader-Time (braucht `DT_INIT`)
+- Compile-Time-Constant-Evaluation für mehr Ausdrücke (Addition zweier Literals etc.)
+
+#### WP-AND-14: `sys_getrandom` nativer Syscall
+
+**Aufwand:** 1h. Aktuell macht `std/android/random.AndroidRandomBytes`
+`/dev/urandom`-Fallback. Mit `sys_getrandom` (ARM64: 278, x86_64: 318)
+als Builtin spart das einen FD-Roundtrip.
+
+- `sys_getrandom` als Builtin-Name in `codegen_x86.lyx` und
+  `src/backend/arm64/emit_arm64.lyx` erkennen, entsprechender Syscall emittieren
+- Sema registriert den Namen
+- `random.lyx` AndroidRandomBytes ruft `sys_getrandom` mit Fallback-Pfad
+
+#### WP-AND-15: Section-Headers in `.so`
+
+**Aufwand:** 2h. `readelf --debug-dump=frames` braucht Section-Headers um
+`.eh_frame` zu finden. Aktuell `.so` hat `e_shnum=0`. Mit Section-Headers
+funktionieren Standard-Debug-Tools direkt (GNU `addr2line`, `objdump -W`).
+
+#### WP-AND-16: Pure-Lyx AXML-Encoder
+
+**Aufwand:** 6h. Ersetzt `aapt2 compile && aapt2 link` für `.so`-only Apps.
+Binary-AXML-Format: String-Pool + Resource-Map + XML-Tree mit Namespace-
+Handling. Eigenes Modul `std/android/axml_encoder.lyx` parsed
+`AndroidManifest.xml`-Text und produziert die Binärform.
+
+#### WP-AND-17: Pure-Lyx classes.dex Stub-Generator
+
+**Aufwand:** 5h. Ersetzt `javac + d8`. Minimal-Dex mit einer leeren
+Stub-Klasse, mit korrektem Dex-Header (magic, checksum, sha1, sizes),
+String-Pool, Type-IDs, Method-IDs, Class-Defs. Modul `std/android/dex_gen.lyx`.
+
+#### WP-AND-18: Pure-Lyx APK-Signing
+
+**Aufwand:** 3–5h. v1 JAR Signing oder v2 (APK Signature Scheme v2).
+- v1: SHA-1 jeder Entry, MANIFEST.MF + CERT.SF + CERT.RSA (PKCS#7)
+- v2: SHA-256 + Signing-Block zwischen ZIP-Entries und Central Directory
+- Crypto: SHA-1/SHA-256 sind in `std/crypto/` schon vorhanden; RSA-Signing
+  braucht neue Module (asn.1 encoding für PKCS#7)
+
+#### WP-AND-19: `adb install` Wrapper + CLI-Integration
+
+**Aufwand:** 1–2h. Pure-Lyx, nur `exec("adb", ["install", "-r", path])`.
+- `std/android/adb.lyx` mit `AdbInstall(path)`, `AdbUninstall(pkg)`,
+  `AdbLogcat(filter)`, `AdbShell(cmd)`
+- `lyxc --install` Flag der die fertige APK direkt aufs Gerät schiebt
+
+#### WP-AND-20: Binder IPC
+
+**Aufwand:** 5–8h. Android-spezifisches Protokoll für Service-Calls.
+- `/dev/binder` Open + `ioctl` für BINDER_WRITE_READ
+- Parcel-Format für Method-Arguments
+- Service-Manager-Lookup (via Binder-Handle 0)
+- `std/android/binder.lyx` Modul; zusätzliche `BINDER_*` Konstanten in
+  `std/android/ioctl.lyx` schon vorbereitet
+
+#### WP-AND-21: Vulkan-Bindings
+
+**Aufwand:** 5h. Hunderte Konstanten + Struct-Layouts.
+Wartet auf WP-AND-09 (PLT) damit `libvulkan.so` callbar wird.
+
+### 🟢 Polishing
+
+| WP | Beschreibung | Aufwand |
 |---|---|---|
-| Linux ARM64 Backend | ✅ Vorhanden | Bionic-Abweichungen |
-| ELF Writer | ✅ Vorhanden | Shared Library (.so) Ausgabe |
-| Syscall-Tabelle | ✅ Linux ARM64 | Android-spezifische Syscalls |
-| Calling Convention | ✅ AAPCS64 | Entspricht Android ABI |
-| JNI-Unterstützung | ❌ Fehlt | Komplett neu |
-| APK-Packaging | ❌ Fehlt | Komplett neu |
-| Android-Stdlib | ❌ Fehlt | Komplett neu |
-| Cross-Kompilierung | ⚠️ Teilweise | NDK-Toolchain-Integration |
+| WP-AND-22 | `IRO_FUNC_EXIT` als bewusste IR-Op statt impliziter Epilogue | 30 min |
+| WP-AND-23 | Import-Deduplizierung in `ir_lower.lowerModule` | 30 min |
+| WP-AND-24 | Forward-Refs im nested-scope (nicht nur top-level) | 1–2h |
+| WP-AND-25 | `IRO_LOAD_GLOBAL` für **executable**-Mode (aktuell nur Shared-Lib funktional) | 1h |
+| WP-AND-26 | DT_INIT/DT_FINI in `.dynamic` für Modul-Init-Hooks | 1–2h |
 
 ---
 
-## 3. Phasen-Übersicht
-
-```
-Phase 1: Native Binaries (adb push + run)          ← Schnellster Mehrwert
-Phase 2: Shared Libraries (.so) + JNI              ← App-Integration
-Phase 3: Android-Stdlib (Log, Asset, Sensor)       ← Developer UX
-Phase 4: Vollständiger App-Rahmen                  ← Produktionsreif
-Phase 5: APK-Packaging + Build-Pipeline            ← Distribution
-```
-
----
-
-## 4. Work Packages
-
-### WP-AND-01: Android-Zielplattform registrieren
-
-**Ziel:** `--target=android-arm64` und `--target=android-x86_64` als gültige
-Ziele im Compiler.
-
-**Aufwand:** 2h
-
-**Betroffene Dateien:**
-- `compiler/backend/backend_types.pas` — neues `btAndroidArm64`, `btAndroidX86`
-- `compiler/lyxc.lpr` — CLI-Argument-Parsing `--target=android-arm64`
-- `bootstrap/codegen.lyx` — entsprechende Bootstrap-Erweiterung
-
-**Tasks:**
-- [ ] `TBackendTarget` Enum um `btAndroidArm64`, `btAndroidX86_64` erweitern
-- [ ] Target-String-Mapping: `"android-arm64"` → `btAndroidArm64`
-- [ ] Default-Architektur-Auswahl: Android → ARM64
-- [ ] Version-Header anpassen: Dokumentation der neuen Targets
-
----
-
-### WP-AND-02: ELF Shared Library Ausgabe (.so)
-
-**Ziel:** Lyx kann neben statischen Executables auch `libfoo.so`-Dateien erzeugen,
-die von Android-Apps per `System.loadLibrary()` geladen werden.
-
-**Aufwand:** 8h
-
-**Betroffene Dateien:**
-- `compiler/backend/elf/` — ELF-Writer erweitern
-- Neues Flag: `--output-type=shared-lib`
-
-**Tasks:**
-- [ ] ELF-Header: `ET_DYN` statt `ET_EXEC` für Shared Libraries
-- [ ] PIC-Code-Generierung: Position-Independent Code aktivieren (GOT/PLT)
-- [ ] Symbol-Export: `@export` Annotation für JNI-Symbole (`Java_*`-Namensschema)
-- [ ] `.dynamic`-Sektion mit `DT_SONAME`, `DT_NEEDED`
-- [ ] Relocations: `R_AARCH64_*` für ARM64 PIC
-- [ ] Test: `aarch64-linux-android-readelf -d libtest.so` zeigt korrekte Struktur
-
----
-
-### WP-AND-03: Bionic-ABI-Kompatibilität
-
-**Ziel:** Vom Lyx-Compiler erzeugte Binaries und .so-Dateien sind zur Bionic-
-Laufzeitbibliothek kompatibel (kein Absturz durch ABI-Unterschiede).
-
-**Aufwand:** 4h
-
-**Hintergrund:** Lyx nutzt reine Syscalls und braucht Bionic nicht als Libc.
-Dennoch muss der Stack-Alignment, TLS-Zugriff und Exception-Frame (`.eh_frame`)
-korrekt sein, damit das Android-Linker-Framework `.so`-Dateien lädt.
-
-**Tasks:**
-- [ ] Stack-Alignment prüfen: Android erfordert 16-Byte-Alignment beim Funktionsaufruf
-- [ ] TLS-Register (TPIDR_EL0) nicht clobber
-- [ ] `.eh_frame` / `.ARM.exidx` korrekte Ausgabe für Stack-Unwinding
-- [ ] `__android_api__` Mindestversion als Compile-Zeit-Konstante definieren (API 21+)
-- [ ] Test: Lade `.so` in minimaler Android-App ohne Crash
-
----
-
-### WP-AND-04: Android-Syscall-Tabelle
-
-**Ziel:** Vollständige Syscall-Tabelle für Android (API 21+, ARM64 und x86_64).
-
-**Aufwand:** 3h
-
-**Betroffene Dateien:**
-- Neue Datei: `std/net/internal/syscalls_android_arm64.lyu`
-- Neue Datei: `std/net/internal/syscalls_android_x86.lyu`
-
-**Hinweis:** Android-ARM64-Syscall-Nummern sind identisch mit Linux ARM64.
-Für x86_64 ebenfalls. Der Unterschied liegt in einigen fehlenden Syscalls
-(z. B. `fork` ist auf Android eingeschränkt) und Android-spezifischen
-`ioctl`-Konstanten.
-
-**Tasks:**
-- [ ] Android-eingeschränkte Syscalls dokumentieren und absichern (`fork`, `ptrace`)
-- [ ] `binder`-Syscalls für Android IPC (optional, Phase 4)
-- [ ] Android-spezifische `ioctl`-Konstanten für Kamera, Audio, Sensor
-- [ ] `getrandom` (API 28+) vs. `/dev/urandom` Fallback
-
----
-
-### WP-AND-05: JNI-Brücke (Code-Generator)
-
-**Ziel:** Lyx-Funktionen können als JNI-Methoden exportiert werden, die von
-Kotlin/Java aus aufgerufen werden.
-
-**Aufwand:** 12h
-
-**Neue Syntax (Vorschlag):**
-```lyx
-@jni(class="com.example.MyClass", method="nativeAdd")
-fn nativeAdd(env: ^JNIEnv, obj: jobject, a: int64, b: int64): int64 {
-    return a + b
-}
-```
-
-**Tasks:**
-- [ ] `@jni` Annotation im Parser erfassen
-- [ ] JNI-Typ-Mapping: `int64 ↔ jlong`, `pchar ↔ jstring`, `bool ↔ jboolean`
-- [ ] JNI-Symbol-Mangling: `Java_com_example_MyClass_nativeAdd` erzeugen
-- [ ] `JNIEnv`-Struct als Built-in-Typ definieren (Funktionszeiger-Tabelle)
-- [ ] `JNIEnv`-Hilfsfunktionen: `NewStringUTF`, `GetStringUTFChars`, `NewByteArray`
-- [ ] Neue Stdlib: `std/android/jni.lyu` mit JNI-Typ-Definitionen
-- [ ] Test: Kotlin-App ruft `nativeAdd` auf, erhält korrektes Ergebnis
-
----
-
-### WP-AND-06: Android-Stdlib (Basis)
-
-**Ziel:** Grundlegende Android-API-Bindungen als Lyx-Stdlib-Module.
-
-**Aufwand:** 16h
-
-**Neue Module:**
-
-| Modul | Beschreibung | API |
-|---|---|---|
-| `std/android/log.lyu` | `__android_log_print` / Logcat | Log-API |
-| `std/android/asset.lyu` | AAssetManager — App-Assets lesen | Asset-API |
-| `std/android/sensor.lyu` | ASensorManager — Gyro, Accel, GPS | Sensor-API |
-| `std/android/input.lyu` | AInputQueue — Touch/Key-Events | Input-API |
-| `std/android/native_window.lyu` | ANativeWindow — Direkt-Rendering | Window-API |
-
-**Tasks:**
-- [ ] `std/android/log.lyu`: `logD/logI/logW/logE(tag, msg)` als JNI-Calls
-- [ ] `std/android/asset.lyu`: `assetOpen`, `assetRead`, `assetClose`
-- [ ] `std/android/native_window.lyu`: `ANativeWindow_fromSurface`, `lock`, `unlockAndPost`
-- [ ] `std/android/sensor.lyu`: Grundlegende Sensor-Enumeration und Daten-Polling
-
----
-
-### WP-AND-07: Android Activity + NativeActivity
-
-**Ziel:** Vollständige Lyx-App als `NativeActivity` ohne Java/Kotlin-Wrapper.
-
-**Aufwand:** 20h
-
-**Konzept:** Android `NativeActivity` ermöglicht eine reine C/C++ (hier: Lyx) App
-über die `ANativeActivity`-Callbacks ohne Java-Code.
-
-**Tasks:**
-- [ ] `android_native_app_glue`-Äquivalent in Lyx implementieren
-- [ ] `ANativeActivity` Struct + Callback-Funktionszeiger definieren
-- [ ] Event-Loop: `ALooper_pollAll` für App-Events und Input
-- [ ] `AndroidManifest.xml` Generator (minimal für NativeActivity)
-- [ ] OpenGL ES 2.0 Bindungen: `std/android/gles.lyu`
-- [ ] Vulkan Bindungen (optional): `std/android/vulkan.lyu`
-- [ ] Test: Lyx-App rendert ein farbiges Dreieck auf Android
-
----
-
-### WP-AND-08: APK-Packaging-Integration
-
-**Ziel:** `lyxc --target=android-arm64 --package=apk` erzeugt eine installierbare
-`.apk`-Datei direkt.
-
-**Aufwand:** 16h
-
-**APK-Struktur:**
-```
-MyApp.apk
-├── AndroidManifest.xml    (kompiliertes AXML)
-├── classes.dex            (Stub-Java, nur für NativeActivity)
-├── lib/arm64-v8a/
-│   └── libmain.so         (Lyx-kompilierte Bibliothek)
-├── res/                   (Ressourcen, optional)
-└── META-INF/
-    ├── CERT.RSA           (Debug-Signatur)
-    └── MANIFEST.MF
-```
-
-**Tasks:**
-- [ ] ZIP-Writer in Lyx (oder Aufruf von `zip` als externem Tool)
-- [ ] AXML-Encoder für `AndroidManifest.xml`
-- [ ] `classes.dex` Stub-Generator (minimales Dex für NativeActivity)
-- [ ] Debug-Keystore-Signierung (via `apksigner` oder eigene Implementierung)
-- [ ] `adb install` Wrapper: `lyxc --install` deployt direkt aufs Gerät
-- [ ] Test: `adb install MyApp.apk` funktioniert, App startet
-
----
-
-## 5. Abhängigkeiten
-
-```
-WP-AND-01 (Target registrieren)
-    ↓
-WP-AND-02 (ELF Shared Lib)  ←─── WP-AND-03 (Bionic ABI)
-    ↓
-WP-AND-04 (Syscall-Tabelle)
-    ↓
-WP-AND-05 (JNI-Brücke)
-    ↓
-WP-AND-06 (Android-Stdlib)
-    ↓
-WP-AND-07 (NativeActivity)
-    ↓
-WP-AND-08 (APK-Packaging)
-```
-
----
-
-## 6. Zeitschätzung
-
-| Phase | WPs | Aufwand |
-|---|---|---|
-| Phase 1: Grundlagen | WP-AND-01..04 | ~17h |
-| Phase 2: JNI + Stdlib | WP-AND-05..06 | ~28h |
-| Phase 3: App-Rahmen | WP-AND-07 | ~20h |
-| Phase 4: Distribution | WP-AND-08 | ~16h |
-| **Gesamt** | **8 WPs** | **~81h** |
-
----
-
-## 7. Prioritäten
-
-### Schnellster Mehrwert (Phase 1)
-Lyx-Binary per `adb push` auf Gerät kopieren und direkt ausführen (Shell-Tool,
-kein App-Store nötig). Benötigt nur WP-AND-01 + WP-AND-03 + WP-AND-04.
-
-### App-Integration (Phase 2)
-JNI `.so` in bestehende Kotlin/Java-App einbinden. Benötigt WP-AND-02 + WP-AND-05.
-
-### Vollständige App (Phase 3+4)
-Reines Lyx ohne Java/Kotlin. Langfristiges Ziel.
-
----
-
-## 8. Cross-Kompilierungs-Toolchain
+## 5. Cross-Kompilierungs-Toolchain
 
 Für native Tests auf dem Entwicklungsrechner (nicht auf Gerät):
 
@@ -284,34 +226,51 @@ export ANDROID_NDK=~/Android/Sdk/ndk/25.2.9519653
 export TOOLCHAIN=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64
 
 # Lyx kompiliert für Android ARM64
-./lyxc hello.lyx --target=android-arm64 -o libhello.so --output-type=shared-lib
+./lyxc hello.lyx --target=android-arm64 --shared --android-api=26 -o libhello.so
 
-# Prüfen mit NDK-readelf
+# Prüfen mit NDK-readelf (bisher unsererseits noch nicht getestet)
 $TOOLCHAIN/bin/llvm-readelf -d libhello.so
+$TOOLCHAIN/bin/llvm-readelf -r --use-dynamic libhello.so
+$TOOLCHAIN/bin/llvm-readelf -W --syms libhello.so
 
-# Direkt auf Gerät testen
-adb push libhello /data/local/tmp/
-adb shell chmod +x /data/local/tmp/libhello
-adb shell /data/local/tmp/libhello
+# Komplette APK-Pipeline (Phase A funktional)
+./lyxc --target=android-arm64 --shared --android-api=26 myapp.lyx -o libmyapp.so
+./lyxc -o gen_manifest examples/android/manifest_demo.lyx
+./gen_manifest > AndroidManifest.xml
+aapt2 link -o myapp.unsigned.apk --manifest AndroidManifest.xml \
+  -I $ANDROID_SDK/platforms/android-34/android.jar
+# WP-AND-08 ApkBuilder kann die APK auch direkt zusammenstellen
+apksigner sign --ks debug.keystore --ks-pass pass:android \
+  --out myapp.apk myapp.unsigned.apk
+adb install -r myapp.apk
 ```
 
 ---
 
-## 9. Mindestversionsstrategie
+## 6. Mindestversionsstrategie
 
 | API-Level | Android-Version | Grund |
 |---|---|---|
 | API 21 | Android 5.0 | 64-Bit ARM64 Pflicht |
-| API 23 | Android 6.0 | Runtime Permissions |
-| API 28 | Android 9.0 | `getrandom` Syscall |
-| **API 26** | **Android 8.0** | **Empfohlenes Minimum** |
+| API 23 | Android 6.0 | `getrandom` Syscall verfügbar |
+| API 26 | **Android 8.0** | **Empfohlenes Minimum**, Default für `--android-api` |
+| API 28 | Android 9.0 | `memfd_create` verfügbar |
+| API 30 | Android 11 | `pidfd_open` verfügbar |
+| API 34 | Android 14 | Target-SDK in `manifest_gen` Default |
 
 ---
 
-## 10. Siehe auch
+## 7. Siehe auch
 
-- `backend-upgrade.md` — Bestehende Backend-Upgrade-Roadmap
-- `compiler/backend/arm64/` — ARM64-Backend (Basis für Android)
-- `compiler/backend/elf/` — ELF-Writer (Basis für .so-Ausgabe)
-- `std/net/internal/syscalls_linux.lyu` — Linux-Syscall-Referenz
-- `bootstrap/backend/arm64/` — Bootstrap ARM64-Backend
+- `src/lyxc.lyx` — zentraler ELF-Header-Writer + `writeELFSharedLib`
+- `src/backend/arm64/emit_arm64.lyx` — ARM64-Codegen mit Bionic-ABI-Audit-Kommentaren
+- `src/ir_lower.lyx` — IR-Pipeline (NK_IDENT/BINOP/UNOP/VAR_DECL/CALL/LOAD_GLOBAL nach den Upstream-Fixes funktional)
+- `std/android/` — 16 Lyx-Module: JNI-Typen, Logger, Asset/Sensor/Input/Window-Konstanten, NativeActivity-Scaffolding, Looper, GLES2, Manifest-Generator, ZIP/APK-Writer
+- `std/net/internal/syscalls_android.lyx` — Android-Netzwerk-Syscall-Wrapper + Restriction-Stubs
+- `examples/android/` — `jni_native_add.lyx`, `jni_callback_inline.lyx`,
+  `jni_callback_local.lyx`, `manifest_demo.lyx`, `build_apk_demo.lyx`
+
+> **Hinweis:** Seit Singularität (2026-03-30) ist der FPC-Bootstrap
+> (`compiler/`, `bootstrap/`) Geschichte. Sämtlicher Compilercode liegt in
+> `src/` als Lyx-Quellen; gebaut wird durch `src/lyxc_bootstrap` (das
+> singularitäts-verifizierte Seed-Binary).
