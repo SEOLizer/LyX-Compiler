@@ -230,23 +230,71 @@ readelf -d /tmp/libhello.so     # HASH, STRTAB, SYMTAB, STRSZ, SYMENT, SONAME, N
 
 ---
 
-### WP-AND-03: Bionic-ABI-Kompatibilität
+### WP-AND-03: Bionic-ABI-Kompatibilität ✅ (Branch `feat/android-backend`)
 
 **Ziel:** Vom Lyx-Compiler erzeugte Binaries und .so-Dateien sind zur Bionic-
 Laufzeitbibliothek kompatibel (kein Absturz durch ABI-Unterschiede).
 
-**Aufwand:** 4h
+**Aufwand:** 4h (tatsächlich ~3.5h)
 
 **Hintergrund:** Lyx nutzt reine Syscalls und braucht Bionic nicht als Libc.
-Dennoch muss der Stack-Alignment, TLS-Zugriff und Exception-Frame (`.eh_frame`)
+Dennoch muss Stack-Alignment, TLS-Zugriff und Exception-Frame (`.eh_frame`)
 korrekt sein, damit das Android-Linker-Framework `.so`-Dateien lädt.
 
-**Tasks:**
-- [ ] Stack-Alignment prüfen: Android erfordert 16-Byte-Alignment beim Funktionsaufruf
-- [ ] TLS-Register (TPIDR_EL0) nicht clobber
-- [ ] `.eh_frame` / `.ARM.exidx` korrekte Ausgabe für Stack-Unwinding
-- [ ] `__android_api__` Mindestversion als Compile-Zeit-Konstante definieren (API 21+)
-- [ ] Test: Lade `.so` in minimaler Android-App ohne Crash
+**Audit-Ergebnis (in Code-Kommentaren in `src/backend/arm64/emit_arm64.lyx`):**
+- [x] 16-Byte-Stack-Alignment: schon korrekt — `STP x29, x30, [sp, #-16]!` mit
+      pre-decrement um 16, `calcStackFrame` rundet auf 16, durch Funktionskörper
+      kein SP-Touch (Locals über fp adressiert)
+- [x] x18 (Android Platform Reg / Bionic TLS / Shadow Call Stack): nie angefasst —
+      `ARM64_X*` Konstanten gehen nur bis x10
+- [x] TPIDR_EL0 (TLS-System-Register): nie angefasst — keine MRS/MSR-Instruktionen
+- [x] Callee-saved Regs x19..x28: nicht verwendet, keine Save-Restore nötig
+
+**Implementierte Tasks:**
+- [x] `--android-api=N` CLI-Flag (Default 26, validiert ≥ 21);
+      Konstanten `ANDROID_API_MIN = 21`, `ANDROID_API_DEFAULT = 26`
+- [x] `.note.android.ident` ELF-Note-Sektion (24 Bytes: header+name+desc)
+      mit API-Level im descriptor; `PT_NOTE` Program-Header (phNum 3 → 4)
+- [x] `.eh_frame` mit DWARF-CFI:
+  - Eine gemeinsame CIE: version 1, augmentation "zR", code_align 1,
+    data_align -8, return_reg 30 (LR), FDE-encoding 0x1B (PC-rel sdata4),
+    initial CFI `DW_CFA_def_cfa(31, 0)` (CFA = sp am Funktionseingang)
+  - Eine FDE pro Funktion: PC-relative pc_begin, pc_range, CFI-Sequenz
+    `advance_loc(prologueLen)` + `def_cfa(29, 16)` + `offset(29, 2)` +
+    `offset(30, 1)` → beschreibt CFA = fp+16 nach Prolog, x29 bei -16, x30 bei -8
+- [x] `.eh_frame_hdr` mit Binary-Search-Tabelle (sortierte function→FDE pairs,
+      datarel sdata4 encoding)
+- [x] `PT_GNU_EH_FRAME` Program-Header (phNum 4 → 5) verweist auf `.eh_frame_hdr`,
+      damit der Runtime-Unwinder die Tabelle findet (sonst läge sie tot herum,
+      weil wir keine Section-Headers haben)
+- [x] `EmitARM64.funcPrologueLen[]` Tabelle (parallel zu `funcAddrs[]`),
+      gefüllt am Ende von `emitPrologue` für den FDE-`advance_loc`
+- [x] `EmitARM64.funcCount` und `getFuncPrologueLen()` exponiert
+- [x] Singularität verifiziert (S3 == S4 bit-identisch)
+- [x] Manuelle Byte-Verifikation der CIE+FDE+hdr-Bytes (PC-relative Offsets,
+      LEB128-Konstanten, NOP-Padding korrekt)
+
+**Stolperstein (festgehalten):** `ParseInt(arg + 14)` als Direkt-Expression
+crashte unter dem aktuellen Bootstrap-Seed. Workaround: digits inline parsen
+mit `peek8`-Schleife (`while peek8(p) >= 48 && peek8(p) <= 57`).
+
+**Verifikation Phase WP-AND-03:**
+```bash
+./lyxc --target=android-arm64 --shared --android-api=26 \
+       /tmp/minimal_export.lyx -o /tmp/libeh.so
+readelf --notes  /tmp/libeh.so  # Owner=Android, NT_VERSION, desc=0x1a (=26)
+readelf -l       /tmp/libeh.so  # 5 program headers incl. PT_NOTE + GNU_EH_FRAME
+# .eh_frame CIE+FDE+hdr bytes manually decoded; tools without section
+# headers cannot pretty-print them, but the byte layout is verified.
+```
+
+**Offen (kein Blocker für die `.so`-Korrektheit):**
+- [ ] Test: Lade `.so` in minimaler Android-App auf Emulator ohne Crash —
+      benötigt Android SDK / NDK / Emulator, out-of-scope dieser Session
+- [ ] `.ARM.exidx` (Cortex-A32 Unwind-Sections, nur 32-bit ARM relevant —
+      auf ARM64 ist `.eh_frame` die Standardlösung, das ist erledigt)
+- [ ] Section-Headers emittieren (würden GNU debuggern + readelf direktes
+      Pretty-Printing von .eh_frame via `--debug-dump=frames` ermöglichen)
 
 ---
 

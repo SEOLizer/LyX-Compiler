@@ -81,6 +81,10 @@ pub type EmitARM64 = class {
   funcAddrs:       int64;
   funcCount:       int64;
 
+  // WP-AND-03: per-function prologue length in bytes. The DWARF CFI generator
+  // uses this to advance_loc over the prologue before declaring CFA = fp+16.
+  funcPrologueLen: int64;
+
   // WP-AND-02 Phase C: shared-library mode toggle and dynamic-relocation buffer.
   // When isSharedLib != 0, emitLoadGlobal / emitStoreGlobal use PC-relative
   // literal-pool loads instead of MOVZ/MOVK chains, and each pool slot is
@@ -107,6 +111,8 @@ pub type EmitARM64 = class {
     self.patchCount  := 0;
     self.funcAddrs   := mmap(0, 256 * 8, 3, 34, -1, 0);
     self.funcCount   := 0;
+    // WP-AND-03: 256 slots, parallel to funcAddrs.
+    self.funcPrologueLen := mmap(0, 256 * 8, 3, 34, -1, 0);
 
     // WP-AND-02 Phase C: dynamic-reloc state. Buffer grows on demand.
     self.isSharedLib := 0;
@@ -114,6 +120,8 @@ pub type EmitARM64 = class {
     self.relocBuf    := mmap(0, self.relocCap * 24, 3, 34, -1, 0);
     self.relocCount  := 0;
   }
+
+  fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
 
   // WP-AND-02 Phase C: opt into PIC code emission. Caller flips this BEFORE
   // calling emit(); takes effect for emitLoadGlobal / emitStoreGlobal.
@@ -179,7 +187,12 @@ pub type EmitARM64 = class {
     }
 
     self.calcStackFrame(funcId);
+    var prologueStart: int64 := self.codeLen;
     self.emitPrologue();
+    // WP-AND-03: stash prologue length for DWARF CFI advance_loc.
+    if funcId < 256 {
+      poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
+    }
 
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
@@ -214,6 +227,18 @@ pub type EmitARM64 = class {
 
   // -------------------------------------------------------------------------
   // Prologue / Epilogue
+  //
+  // WP-AND-03 Bionic-ABI audit:
+  //  - 16-byte SP alignment is preserved across the prologue: STP pre-decrements
+  //    SP by 16, calcStackFrame rounds stackSize up to 16; SP stays 16-aligned
+  //    through the function body. ARM64 ABI requirement: met.
+  //  - This emitter only uses x0..x10, x29, x30. Android-reserved x18 (Bionic
+  //    TLS / shadow call stack) is never touched.
+  //  - No MRS/MSR system-register access; TPIDR_EL0 and other system regs are
+  //    untouched.
+  //  - Callee-saved regs (x19..x28) are not used, so we do not need to save them.
+  //  - DWARF CFI for stack unwinding is emitted by writeELFSharedLib via the
+  //    .eh_frame section using funcAddrs + funcPrologueLen records.
   // -------------------------------------------------------------------------
 
   fn emitPrologue() {

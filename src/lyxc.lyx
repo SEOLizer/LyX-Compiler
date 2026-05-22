@@ -80,6 +80,10 @@ con FORMAT_MACHO: int64 := 3;
 con OUTPUT_TYPE_EXECUTABLE: int64 := 0;
 con OUTPUT_TYPE_SHARED_LIB: int64 := 1;
 
+// Android API levels (WP-AND-03)
+con ANDROID_API_MIN:     int64 := 21;   // Android 5.0 — first 64-bit ARM
+con ANDROID_API_DEFAULT: int64 := 26;   // Android 8.0 — current target baseline
+
 // ============================================================================
 // Command Line Options
 // ============================================================================
@@ -224,9 +228,18 @@ pub type CompilerConfig = class {
   codeStubOff:      int64;
   // funcAddrs pointer from EmitARM64 (funcId -> offset_in_irCodeBuf), used to look up export offsets.
   codeFuncAddrs:    int64;
+  // WP-AND-03: per-function prologue length (parallel array, funcId -> byte length).
+  // Used by the DWARF CFI emitter in writeELFSharedLib to advance_loc.
+  codeFuncPrologueLen: int64;
+  // Total number of IR functions emitted (= EmitARM64.funcCount); used to walk both tables.
+  codeFuncTotal:    int64;
   // WP-AND-02 Phase C: dynamic relocations harvested from EmitARM64 (Elf64_Rela records).
   relocBuf:         int64;
   relocCount:       int64;
+
+  // WP-AND-03: target Android API level (--android-api=N). Used by the .note.android.ident
+  // section and reserved for future API-conditional codegen choices.
+  androidApiLevel:  int64;
 
   // Compilation state
   exitCode: int64;
@@ -299,8 +312,11 @@ pub type CompilerConfig = class {
     self.mangledNamesCap  := 0;
     self.codeStubOff      := 0;
     self.codeFuncAddrs    := 0;
+    self.codeFuncPrologueLen := 0;
+    self.codeFuncTotal    := 0;
     self.relocBuf         := 0;
     self.relocCount       := 0;
+    self.androidApiLevel  := ANDROID_API_DEFAULT;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -537,6 +553,24 @@ pub type CompilerConfig = class {
     // --shared (alias for --output-type=shared-lib, WP-AND-02)
     if StrCmp(arg, "--shared"c) == 0 {
       self.outputType := OUTPUT_TYPE_SHARED_LIB;
+      return;
+    }
+
+    // --android-api=N (WP-AND-03): target Android API level for .so/.note.android.ident.
+    // Accepts 21+ (64-bit ARM minimum); lower values default back to ANDROID_API_DEFAULT.
+    if StrStartsWith(arg, "--android-api=") {
+      // Parse digits manually (avoid ParseInt clobber bug under the seed bootstrap).
+      var p: int64 := arg + 14;
+      var apiVal: int64 := 0;
+      while peek8(p) >= 48 && peek8(p) <= 57 {
+        apiVal := apiVal * 10 + peek8(p) - 48;
+        p := p + 1;
+      }
+      if apiVal >= ANDROID_API_MIN {
+        self.androidApiLevel := apiVal;
+      } else {
+        EPrintStrLn("warning: --android-api < 21 ignored (64-bit ARM requires API 21+)");
+      }
       return;
     }
     
@@ -871,6 +905,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --format=<fmt>         Ausgabeformat (elf, pe, macho)");
     PrintStrLn("  --output-type=<typ>    Ausgabe-Typ (executable [Standard], shared-lib)");
     PrintStrLn("  --shared               Kurzform fuer --output-type=shared-lib (ELF .so)");
+    PrintStrLn("  --android-api=N        Android API-Level (21..34+, Default 26)");
     PrintStrLn("  --target-energy=<1-5>  Energy-Ziel (1=Minimal, 5=Extreme)");
     PrintStrLn("  --emit-asm             IR als Pseudo-Assembler ausgeben");
     PrintStrLn("  --asm-listing          Assembly-Listing mit Source-Zeilen (DO-178C 6.1)");
@@ -1455,6 +1490,9 @@ pub type CompilerConfig = class {
       // WP-AND-02 Phase C: harvest dynamic-reloc records.
       self.relocBuf   := emitter.getRelocBuf();
       self.relocCount := emitter.getRelocCount();
+      // WP-AND-03: harvest prologue-length table + function count for DWARF CFI.
+      self.codeFuncPrologueLen := emitter.getFuncPrologueLen();
+      self.codeFuncTotal       := emitter.funcCount;
 
       // WP-AND-02 Phase B: for shared libraries skip the executable _start stub.
       // The Android loader never invokes a .so's e_entry; the stub would be dead
@@ -2026,7 +2064,8 @@ pub type CompilerConfig = class {
     // ---- File layout planning ----
     var ehSize:     int64 := 64;
     var phSize:     int64 := 56;
-    var phNum:      int64 := 3;     // PT_LOAD R-X, PT_LOAD RW, PT_DYNAMIC
+    var phNum:      int64 := 4;     // PT_LOAD R-X, PT_LOAD RW, PT_DYNAMIC, PT_NOTE
+    // phNum bumped to 5 below if we emit .eh_frame_hdr (PT_GNU_EH_FRAME).
     var pageSize:   int64 := 4096;
 
     var codeOff:    int64 := pageSize;          // .text starts at 0x1000
@@ -2034,11 +2073,20 @@ pub type CompilerConfig = class {
 
     var dataOff:    int64 := ((codeEnd + pageSize - 1) / pageSize) * pageSize;
 
+    // WP-AND-03: .note.android.ident section sits at the very front of PT_LOAD #2
+    // so it gets a stable address near the top of the data segment. Layout:
+    //   namesz (4) | descsz (4) | type (4)  = 12 bytes header
+    //   "Android\0"                          =  8 bytes name (4-aligned)
+    //   apiLevel (4)                         =  4 bytes desc (4-aligned)
+    // Total: 24 bytes; happens to be 8-aligned so .dynamic follows immediately.
+    var noteOff:    int64 := dataOff;
+    var noteSize:   int64 := 24;
+    var dynOff:     int64 := noteOff + noteSize;
+
     // .dynamic entry count: 7 baseline + 3 if relocations present (DT_RELA,
     // DT_RELASZ, DT_RELAENT).
     var dynNum:     int64 := 7;
     if hasRelocs != 0 { dynNum := 10; }
-    var dynOff:     int64 := dataOff;
     var dynSize:    int64 := dynNum * 16;
     var dynsymOff:  int64 := dynOff + dynSize;
     // 1 UNDEF entry + 1 entry per exported function.
@@ -2056,8 +2104,25 @@ pub type CompilerConfig = class {
     var relaOffRaw: int64 := hashOff + hashSize;
     var relaOff:    int64 := ((relaOffRaw + 7) / 8) * 8;
     var relaSize:   int64 := relCount * 24;
-    var fileSize:   int64 := relaOff + relaSize;
-    if hasRelocs == 0 { fileSize := hashOff + hashSize; }
+    var afterReloc: int64 := relaOff + relaSize;
+    if hasRelocs == 0 { afterReloc := hashOff + hashSize; }
+
+    // WP-AND-03 DWARF CFI: .eh_frame_hdr (12 byte header + 8 byte table entry
+    // per function) and .eh_frame (24-byte CIE + 28-byte FDE per function +
+    // 4-byte terminator). PT_GNU_EH_FRAME program header references the hdr,
+    // so the runtime unwinder can find FDEs via binary search.
+    var funcN:        int64 := self.codeFuncTotal;
+    var hasEhFrame:   int64 := 0;
+    if funcN > 0 { hasEhFrame := 1; }
+
+    var ehFrameHdrOff:  int64 := ((afterReloc + 3) / 4) * 4;
+    var ehFrameHdrSize: int64 := 12 + 8 * funcN;
+    var ehFrameOffRaw:  int64 := ehFrameHdrOff + ehFrameHdrSize;
+    var ehFrameOff:     int64 := ((ehFrameOffRaw + 7) / 8) * 8;
+    var ehFrameSize:    int64 := 24 + 28 * funcN + 4;
+    var fileSize:       int64 := ehFrameOff + ehFrameSize;
+    if hasEhFrame == 0 { fileSize := afterReloc; }
+    if hasEhFrame != 0 { phNum := 5; }
 
     // ---- Allocate + zero buffer ----
     var fd: int64 := open(path, 577, 493);
@@ -2094,7 +2159,7 @@ pub type CompilerConfig = class {
     poke32(buf + 48, 0);                            // e_flags
     poke16(buf + 52, 64);                           // e_ehsize
     poke16(buf + 54, 56);                           // e_phentsize
-    poke16(buf + 56, 3);                            // e_phnum
+    poke16(buf + 56, phNum);                        // e_phnum (4 or 5: +PT_NOTE +PT_GNU_EH_FRAME)
     poke16(buf + 58, 0);                            // e_shentsize
     poke16(buf + 60, 0);                            // e_shnum
     poke16(buf + 62, 0);                            // e_shstrndx
@@ -2130,7 +2195,44 @@ pub type CompilerConfig = class {
     poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_paddr
     poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_filesz
     poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_memsz
-    poke64(buf + ph,  8);                           // p_align
+    poke64(buf + ph,  8);          ph := ph + 8;    // p_align
+
+    // WP-AND-03 PT_NOTE: covers the .note.android.ident section.
+    poke32(buf + ph,  4);          ph := ph + 4;    // p_type = PT_NOTE
+    poke32(buf + ph,  4);          ph := ph + 4;    // p_flags = PF_R
+    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_offset
+    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_vaddr
+    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_paddr
+    poke64(buf + ph,  noteSize);   ph := ph + 8;    // p_filesz
+    poke64(buf + ph,  noteSize);   ph := ph + 8;    // p_memsz
+    poke64(buf + ph,  4);          ph := ph + 8;    // p_align
+
+    // WP-AND-03 PT_GNU_EH_FRAME: points to .eh_frame_hdr for fast unwinding.
+    if hasEhFrame != 0 {
+      poke32(buf + ph,  0x6474E550); ph := ph + 4;  // p_type = PT_GNU_EH_FRAME
+      poke32(buf + ph,  4);          ph := ph + 4;  // p_flags = PF_R
+      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_offset
+      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_vaddr
+      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_paddr
+      poke64(buf + ph,  ehFrameHdrSize); ph := ph + 8;  // p_filesz
+      poke64(buf + ph,  ehFrameHdrSize); ph := ph + 8;  // p_memsz
+      poke64(buf + ph,  4);                              // p_align
+    }
+
+    // ---- .note.android.ident ----
+    // ELF note header (12 bytes) + name (8) + desc (4) = 24 bytes total.
+    poke32(buf + noteOff +  0, 8);                  // namesz: strlen("Android")+1
+    poke32(buf + noteOff +  4, 4);                  // descsz: one uint32
+    poke32(buf + noteOff +  8, 1);                  // type = NT_VERSION (Android-conventional)
+    poke8(buf + noteOff + 12,  65);  // 'A'
+    poke8(buf + noteOff + 13, 110);  // 'n'
+    poke8(buf + noteOff + 14, 100);  // 'd'
+    poke8(buf + noteOff + 15, 114);  // 'r'
+    poke8(buf + noteOff + 16, 111);  // 'o'
+    poke8(buf + noteOff + 17, 105);  // 'i'
+    poke8(buf + noteOff + 18, 100);  // 'd'
+    poke8(buf + noteOff + 19,   0);  // NUL
+    poke32(buf + noteOff + 20, self.androidApiLevel);
 
     // ---- .dynamic ----
     // Tag values via Elf64_Dyn (d_tag: i64, d_un: u64).
@@ -2241,6 +2343,122 @@ pub type CompilerConfig = class {
         poke64(buf + dst +  8, rInfo);
         poke64(buf + dst + 16, rAddend);
         ri := ri + 1;
+      }
+    }
+
+    // ---- .eh_frame (WP-AND-03) ----
+    // Single CIE describing ARM64 conventions, followed by one FDE per function,
+    // terminated by a zero-length record. Layout sizes are hard-coded; all
+    // LEB128 values used here fit in single bytes so no general LEB128 encoder
+    // is needed.
+    if hasEhFrame != 0 {
+      // ----- CIE @ ehFrameOff -----
+      //   length        = 20  (body bytes, length field excluded)
+      //   CIE_id        = 0
+      //   version       = 1
+      //   augmentation  = "zR\0"
+      //   code_align    = 1
+      //   data_align    = -8  (sleb128 single byte 0x78)
+      //   ret_addr_reg  = 30  (LR for ARM64)
+      //   aug_data_len  = 1
+      //   aug_data      = 0x1B (DW_EH_PE_pcrel | DW_EH_PE_sdata4)
+      //   initial CFI:    DW_CFA_def_cfa(31, 0)   -> at entry: CFA = sp + 0
+      //   3 NOPs to 4-byte-align the total (length + body) to 24.
+      poke32(buf + ehFrameOff +  0, 20);             // length
+      poke32(buf + ehFrameOff +  4, 0);              // CIE_id
+      poke8(buf + ehFrameOff +  8,  1);              // version
+      poke8(buf + ehFrameOff +  9,  0x7A);           // 'z'
+      poke8(buf + ehFrameOff + 10,  0x52);           // 'R'
+      poke8(buf + ehFrameOff + 11,  0);              // \0
+      poke8(buf + ehFrameOff + 12,  0x01);           // code_align
+      poke8(buf + ehFrameOff + 13,  0x78);           // data_align = -8 (sleb128)
+      poke8(buf + ehFrameOff + 14,  0x1E);           // ret_addr_reg = 30
+      poke8(buf + ehFrameOff + 15,  0x01);           // aug_data_len
+      poke8(buf + ehFrameOff + 16,  0x1B);           // FDE encoding
+      poke8(buf + ehFrameOff + 17,  0x0C);           // DW_CFA_def_cfa
+      poke8(buf + ehFrameOff + 18,  0x1F);           // reg 31 (sp)
+      poke8(buf + ehFrameOff + 19,  0x00);           // offset 0
+      // Bytes 20..23 are already zero (DW_CFA_nop) from the initial fill.
+
+      // ----- FDEs @ ehFrameOff + 24, then every 28 bytes -----
+      var fi: int64 := 0;
+      while fi < funcN {
+        var fdeRel: int64 := 24 + fi * 28;
+        var fdeOff: int64 := ehFrameOff + fdeRel;
+
+        // Function range: vaddr and size. PT_LOAD #1 maps vaddr=fileOffset.
+        var fStart: int64 := peek64(self.codeFuncAddrs + fi * 8);   // offset in irCodeBuf
+        var fEnd:   int64 := self.codeSize;
+        if fi + 1 < funcN {
+          fEnd := peek64(self.codeFuncAddrs + (fi + 1) * 8);
+        }
+        var fLen:   int64 := fEnd - fStart;
+        var fVaddr: int64 := codeOff + fStart;          // codeStubOff is 0 in shared-lib mode
+
+        // pc_begin field's vaddr (it lives at fdeOff + 8 in the file).
+        var pcField: int64 := fdeOff + 8;
+        var pcRel:   int64 := fVaddr - pcField;          // signed sdata4
+
+        // CIE_pointer: offset from THIS FDE back to the CIE start.
+        var ciePtr:  int64 := fdeRel;                    // CIE is at relative 0
+
+        poke32(buf + fdeOff +  0, 24);                   // length (body bytes)
+        poke32(buf + fdeOff +  4, ciePtr);               // CIE_pointer
+        poke32(buf + fdeOff +  8, pcRel & 0xFFFFFFFF);   // pc_begin (sdata4)
+        poke32(buf + fdeOff + 12, fLen);                 // pc_range
+
+        poke8(buf + fdeOff + 16, 0);                     // aug_data_len = 0
+
+        // DW_CFA_advance_loc(prologueLen): small form (0x40 | delta) for <=63 bytes.
+        var prologueLen: int64 := peek64(self.codeFuncPrologueLen + fi * 8);
+        poke8(buf + fdeOff + 17, 0x40 | (prologueLen & 0x3F));
+
+        // DW_CFA_def_cfa(29, 16): CFA = x29 + 16.
+        poke8(buf + fdeOff + 18, 0x0C);
+        poke8(buf + fdeOff + 19, 0x1D);                  // reg 29 (fp)
+        poke8(buf + fdeOff + 20, 0x10);                  // offset 16
+
+        // DW_CFA_offset(29, 2): x29 saved at CFA + 2*(-8) = CFA - 16.
+        poke8(buf + fdeOff + 21, 0x9D);                  // 0x80 | 29
+        poke8(buf + fdeOff + 22, 0x02);
+
+        // DW_CFA_offset(30, 1): x30 saved at CFA - 8.
+        poke8(buf + fdeOff + 23, 0x9E);
+        poke8(buf + fdeOff + 24, 0x01);
+
+        // Bytes 25..27 are NOP padding (zero from initial fill).
+        fi := fi + 1;
+      }
+
+      // ----- Terminator (length = 0) -----
+      // Already zero from initial fill; nothing more to do.
+
+      // ----- .eh_frame_hdr -----
+      //   version=1, eh_frame_ptr_enc=0x1B (PC-rel sdata4),
+      //   fde_count_enc=0x03 (udata4), table_enc=0x3B (datarel sdata4)
+      //   eh_frame_ptr: offset from this field to start of .eh_frame
+      //   fde_count: number of FDEs
+      //   table[]: (initial_loc, fde_addr) pairs, datarel to .eh_frame_hdr start
+      poke8(buf + ehFrameHdrOff +  0, 1);
+      poke8(buf + ehFrameHdrOff +  1, 0x1B);
+      poke8(buf + ehFrameHdrOff +  2, 0x03);
+      poke8(buf + ehFrameHdrOff +  3, 0x3B);
+      var ehFrameRel: int64 := ehFrameOff - (ehFrameHdrOff + 4);
+      poke32(buf + ehFrameHdrOff +  4, ehFrameRel & 0xFFFFFFFF);
+      poke32(buf + ehFrameHdrOff +  8, funcN);
+      // Binary search table: entries sorted by initial_location.
+      // For our linear codegen, funcAddrs is already monotonically increasing.
+      var hi: int64 := 0;
+      while hi < funcN {
+        var fStart2: int64 := peek64(self.codeFuncAddrs + hi * 8);
+        var fVaddr2: int64 := codeOff + fStart2;
+        var fdeAbs2: int64 := ehFrameOff + 24 + hi * 28;
+        // datarel: offsets relative to ehFrameHdrOff (per encoding 0x3B).
+        var initLoc: int64 := fVaddr2 - ehFrameHdrOff;
+        var fdeRel2: int64 := fdeAbs2 - ehFrameHdrOff;
+        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 0, initLoc & 0xFFFFFFFF);
+        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 4, fdeRel2 & 0xFFFFFFFF);
+        hi := hi + 1;
       }
     }
 
