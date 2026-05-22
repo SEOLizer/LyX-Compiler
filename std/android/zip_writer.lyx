@@ -1,0 +1,254 @@
+// Lyx Android Stdlib - ZIP file writer
+// WP-AND-08
+//
+// Pure-Lyx writer for the PKZIP / APPNOTE.TXT file format. Supports
+// uncompressed (stored) entries only, which is what Android requires
+// anyway for *.so files inside an APK (the loader needs to mmap them
+// directly — compressed .so files would fault at load time).
+//
+// Output layout:
+//   [LFH][file data] * N
+//   [Central Directory Entry] * N
+//   [End of Central Directory record]
+//
+// CRC-32 (IEEE 802.3 polynomial 0xEDB88320) is computed inline; no
+// dependency on std/crypto.
+
+unit std.android.zip_writer;
+
+// ---------------------------------------------------------------------------
+// CRC-32 (table-less, byte-by-byte). Good enough for the few-MB APKs that
+// Lyx targets initially; if throughput matters, swap in a table-based
+// implementation later.
+// ---------------------------------------------------------------------------
+
+fn _crc32(buf: int64, len: int64): int64 {
+  var crc: int64 := 0xFFFFFFFF;
+  var i: int64 := 0;
+  while i < len {
+    crc := crc ^ peek8(buf + i);
+    var k: int64 := 0;
+    while k < 8 {
+      var mask: int64 := 0 - (crc & 1);          // 0 or 0xFFFFFFFF
+      crc := (crc >> 1) ^ (0xEDB88320 & mask);
+      k := k + 1;
+    }
+    i := i + 1;
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ---------------------------------------------------------------------------
+// Little-endian writers into a growable mmap buffer.
+// ---------------------------------------------------------------------------
+
+fn _put8(buf: int64, off: int64, val: int64): void {
+  poke8(buf + off, val & 0xFF);
+}
+fn _put16(buf: int64, off: int64, val: int64): void {
+  poke8(buf + off,     val & 0xFF);
+  poke8(buf + off + 1, (val >> 8) & 0xFF);
+}
+fn _put32(buf: int64, off: int64, val: int64): void {
+  poke8(buf + off,     val & 0xFF);
+  poke8(buf + off + 1, (val >> 8)  & 0xFF);
+  poke8(buf + off + 2, (val >> 16) & 0xFF);
+  poke8(buf + off + 3, (val >> 24) & 0xFF);
+}
+
+// ---------------------------------------------------------------------------
+// Central-directory entry record (stored in memory until Finalize).
+// Layout per-entry (40 bytes): nameOff, nameLen, lfhOff, dataLen, crc.
+// Strings are copied into a name pool so the caller can free their copies.
+// ---------------------------------------------------------------------------
+
+pub type ZipWriter = class {
+  // Output buffer
+  buf:     int64;
+  bufCap:  int64;
+  bufLen:  int64;
+
+  // Central-directory entries (fixed-size records, grown geometrically)
+  cdEntries:    int64;   // 40 bytes each
+  cdEntryCap:   int64;
+  cdEntryCount: int64;
+
+  // Name pool: copies of every entry's name, NUL-separated.
+  namePool:     int64;
+  namePoolCap:  int64;
+  namePoolLen:  int64;
+
+  fn Init() {
+    self.bufCap := 65536;
+    self.buf    := mmap(0, self.bufCap, 3, 34, -1, 0);
+    self.bufLen := 0;
+
+    self.cdEntryCap   := 32;
+    self.cdEntries    := mmap(0, self.cdEntryCap * 40, 3, 34, -1, 0);
+    self.cdEntryCount := 0;
+
+    self.namePoolCap := 4096;
+    self.namePool    := mmap(0, self.namePoolCap, 3, 34, -1, 0);
+    self.namePoolLen := 0;
+  }
+
+  fn _ensureBuf(more: int64) {
+    while self.bufLen + more > self.bufCap {
+      var newCap: int64 := self.bufCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.bufLen {
+        poke8(nb + i, peek8(self.buf + i));
+        i := i + 1;
+      }
+      self.buf := nb;
+      self.bufCap := newCap;
+    }
+  }
+
+  fn _ensureCD(): void {
+    if self.cdEntryCount >= self.cdEntryCap {
+      var newCap: int64 := self.cdEntryCap * 2;
+      var nb: int64 := mmap(0, newCap * 40, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.cdEntryCount * 40 {
+        poke8(nb + i, peek8(self.cdEntries + i));
+        i := i + 1;
+      }
+      self.cdEntries := nb;
+      self.cdEntryCap := newCap;
+    }
+  }
+
+  fn _stashName(name: pchar): int64 {
+    var nameLen: int64 := StrLen(name);
+    while self.namePoolLen + nameLen + 1 > self.namePoolCap {
+      var newCap: int64 := self.namePoolCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.namePoolLen {
+        poke8(nb + i, peek8(self.namePool + i));
+        i := i + 1;
+      }
+      self.namePool := nb;
+      self.namePoolCap := newCap;
+    }
+    var nameOff: int64 := self.namePoolLen;
+    var j: int64 := 0;
+    while j < nameLen {
+      poke8(self.namePool + nameOff + j, peek8(name + j));
+      j := j + 1;
+    }
+    poke8(self.namePool + nameOff + nameLen, 0);
+    self.namePoolLen := self.namePoolLen + nameLen + 1;
+    return nameOff;
+  }
+
+  // Append a single stored (uncompressed) entry. `name` is the in-archive
+  // path (forward-slash separated, no leading slash); `data`/`len` is the
+  // file content. Returns 0 on success.
+  pub fn AddFileStored(name: pchar, data: int64, len: int64): int64 {
+    var nameLen: int64 := StrLen(name);
+    var lfhOff:  int64 := self.bufLen;
+    var crc:     int64 := _crc32(data, len);
+
+    // --- Local File Header (30 bytes) ---
+    self._ensureBuf(30 + nameLen + len);
+    _put32(self.buf, lfhOff +  0, 0x04034B50);   // signature
+    _put16(self.buf, lfhOff +  4, 20);           // version needed
+    _put16(self.buf, lfhOff +  6, 0);            // gp bit flag
+    _put16(self.buf, lfhOff +  8, 0);            // compression = stored
+    _put16(self.buf, lfhOff + 10, 0);            // mod time
+    _put16(self.buf, lfhOff + 12, 0x21);         // mod date = 1980-01-01
+    _put32(self.buf, lfhOff + 14, crc);          // CRC-32
+    _put32(self.buf, lfhOff + 18, len);          // compressed size
+    _put32(self.buf, lfhOff + 22, len);          // uncompressed size
+    _put16(self.buf, lfhOff + 26, nameLen);      // name length
+    _put16(self.buf, lfhOff + 28, 0);            // extra length
+    var ni: int64 := 0;
+    while ni < nameLen {
+      poke8(self.buf + lfhOff + 30 + ni, peek8(name + ni));
+      ni := ni + 1;
+    }
+    // file data
+    var di: int64 := 0;
+    while di < len {
+      poke8(self.buf + lfhOff + 30 + nameLen + di, peek8(data + di));
+      di := di + 1;
+    }
+    self.bufLen := lfhOff + 30 + nameLen + len;
+
+    // --- Stash CD entry ---
+    self._ensureCD();
+    var nameOff: int64 := self._stashName(name);
+    var rec: int64 := self.cdEntries + self.cdEntryCount * 40;
+    poke64(rec +  0, nameOff);
+    poke64(rec +  8, nameLen);
+    poke64(rec + 16, lfhOff);
+    poke64(rec + 24, len);
+    poke64(rec + 32, crc);
+    self.cdEntryCount := self.cdEntryCount + 1;
+    return 0;
+  }
+
+  // Emit central directory + EOCD. After Finalize, GetBuf()/GetLen() expose
+  // the complete ZIP archive bytes.
+  pub fn Finalize(): void {
+    var cdStart: int64 := self.bufLen;
+
+    var i: int64 := 0;
+    while i < self.cdEntryCount {
+      var rec: int64 := self.cdEntries + i * 40;
+      var nameOff: int64 := peek64(rec +  0);
+      var nameLen: int64 := peek64(rec +  8);
+      var lfhOff:  int64 := peek64(rec + 16);
+      var dataLen: int64 := peek64(rec + 24);
+      var crc:     int64 := peek64(rec + 32);
+
+      self._ensureBuf(46 + nameLen);
+      var off: int64 := self.bufLen;
+      _put32(self.buf, off +  0, 0x02014B50);    // signature
+      _put16(self.buf, off +  4, 20);            // version made by (2.0 / DOS)
+      _put16(self.buf, off +  6, 20);            // version needed to extract
+      _put16(self.buf, off +  8, 0);             // gp flag
+      _put16(self.buf, off + 10, 0);             // compression = stored
+      _put16(self.buf, off + 12, 0);             // mod time
+      _put16(self.buf, off + 14, 0x21);          // mod date
+      _put32(self.buf, off + 16, crc);
+      _put32(self.buf, off + 20, dataLen);
+      _put32(self.buf, off + 24, dataLen);
+      _put16(self.buf, off + 28, nameLen);
+      _put16(self.buf, off + 30, 0);             // extra
+      _put16(self.buf, off + 32, 0);             // comment
+      _put16(self.buf, off + 34, 0);             // disk number
+      _put16(self.buf, off + 36, 0);             // internal attrs
+      _put32(self.buf, off + 38, 0);             // external attrs
+      _put32(self.buf, off + 42, lfhOff);        // local header offset
+      var ni: int64 := 0;
+      while ni < nameLen {
+        poke8(self.buf + off + 46 + ni, peek8(self.namePool + nameOff + ni));
+        ni := ni + 1;
+      }
+      self.bufLen := off + 46 + nameLen;
+      i := i + 1;
+    }
+    var cdEnd: int64 := self.bufLen;
+    var cdSize: int64 := cdEnd - cdStart;
+
+    // --- End of Central Directory (22 bytes) ---
+    self._ensureBuf(22);
+    var eocd: int64 := self.bufLen;
+    _put32(self.buf, eocd +  0, 0x06054B50);
+    _put16(self.buf, eocd +  4, 0);              // this disk
+    _put16(self.buf, eocd +  6, 0);              // disk with CD
+    _put16(self.buf, eocd +  8, self.cdEntryCount);
+    _put16(self.buf, eocd + 10, self.cdEntryCount);
+    _put32(self.buf, eocd + 12, cdSize);
+    _put32(self.buf, eocd + 16, cdStart);
+    _put16(self.buf, eocd + 20, 0);              // comment length
+    self.bufLen := eocd + 22;
+  }
+
+  pub fn GetBuf(): int64 { return self.buf; }
+  pub fn GetLen(): int64 { return self.bufLen; }
+};

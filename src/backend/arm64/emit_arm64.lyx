@@ -81,6 +81,29 @@ pub type EmitARM64 = class {
   funcAddrs:       int64;
   funcCount:       int64;
 
+  // WP-AND-03: per-function prologue length in bytes. The DWARF CFI generator
+  // uses this to advance_loc over the prologue before declaring CFA = fp+16.
+  funcPrologueLen: int64;
+
+  // WP-AND-02 Phase C: shared-library mode toggle and dynamic-relocation buffer.
+  // When isSharedLib != 0, emitLoadGlobal / emitStoreGlobal use PC-relative
+  // literal-pool loads instead of MOVZ/MOVK chains, and each pool slot is
+  // recorded as an R_AARCH64_RELATIVE entry for runtime fix-up by the loader.
+  // relocBuf holds Elf64_Rela records (24 bytes each).
+  isSharedLib:     int64;
+  relocBuf:        int64;
+  relocCount:      int64;
+  relocCap:        int64;
+
+  // WP-AND-upstream-fix v5: separate tracking for IRO_LOAD_GLOBAL slots.
+  // Records are 16 bytes: {slotCodeOff:i64, globalIdx:i64}. writeELFSharedLib
+  // patches each slot to the global's .data address and emits the matching
+  // R_AARCH64_RELATIVE entry. Kept apart from relocBuf so global slots
+  // don't collide with non-global PIC relocations.
+  globalRelocBuf:    int64;
+  globalRelocCount:  int64;
+  globalRelocCap:    int64;
+
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
@@ -97,6 +120,55 @@ pub type EmitARM64 = class {
     self.patchCount  := 0;
     self.funcAddrs   := mmap(0, 256 * 8, 3, 34, -1, 0);
     self.funcCount   := 0;
+    // WP-AND-03: 256 slots, parallel to funcAddrs.
+    self.funcPrologueLen := mmap(0, 256 * 8, 3, 34, -1, 0);
+
+    // WP-AND-02 Phase C: dynamic-reloc state. Buffer grows on demand.
+    self.isSharedLib := 0;
+    self.relocCap    := 32;
+    self.relocBuf    := mmap(0, self.relocCap * 24, 3, 34, -1, 0);
+    self.relocCount  := 0;
+
+    // WP-AND-upstream-fix v5: global-load slot tracking (16 bytes/entry).
+    self.globalRelocCap   := 32;
+    self.globalRelocBuf   := mmap(0, self.globalRelocCap * 16, 3, 34, -1, 0);
+    self.globalRelocCount := 0;
+  }
+
+  fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
+  fn getGlobalRelocCount(): int64 { return self.globalRelocCount; }
+
+  fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
+
+  // WP-AND-02 Phase C: opt into PIC code emission. Caller flips this BEFORE
+  // calling emit(); takes effect for emitLoadGlobal / emitStoreGlobal.
+  pub fn setSharedLib(flag: int64) {
+    self.isSharedLib := flag;
+  }
+
+  fn getRelocBuf(): int64   { return self.relocBuf; }
+  fn getRelocCount(): int64 { return self.relocCount; }
+
+  // WP-AND-02 Phase C: append an Elf64_Rela record. r_info packs (sym_idx<<32)|type.
+  // For R_AARCH64_RELATIVE (1027) the symbol index is 0 and addend = base-relative
+  // address that the loader writes back into *(load_base + r_offset).
+  fn _recordRelocation(offset: int64, info: int64, addend: int64) {
+    if (self.relocCount >= self.relocCap) {
+      var newCap: int64 := self.relocCap * 2;
+      var nb: int64 := mmap(0, newCap * 24, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.relocCount * 24 {
+        poke8(nb + i, peek8(self.relocBuf + i));
+        i := i + 1;
+      }
+      self.relocBuf := nb;
+      self.relocCap := newCap;
+    }
+    var off: int64 := self.relocBuf + self.relocCount * 24;
+    poke64(off +  0, offset);
+    poke64(off +  8, info);
+    poke64(off + 16, addend);
+    self.relocCount := self.relocCount + 1;
   }
 
   // -------------------------------------------------------------------------
@@ -110,6 +182,10 @@ pub type EmitARM64 = class {
       self.emitFunc(i);
       i := i + 1;
     }
+    // WP-AND-upstream-fix v9: final patch pass for forward references.
+    // funcAddrs is now fully populated, so any BL patch that was skipped
+    // earlier (callee not yet emitted) resolves here.
+    self.applyPatches();
     return self.codeLen;
   }
 
@@ -122,7 +198,11 @@ pub type EmitARM64 = class {
 
     self.stackSize   := 0;
     self.labelCount  := 0;
-    self.patchCount  := 0;
+    // WP-AND-upstream-fix v9: do NOT reset patchCount here. Inter-function
+    // BL patches must survive across emitFunc calls so forward references
+    // (caller emitted before callee) can be resolved by the final
+    // applyPatches pass in emit() once every funcAddrs entry is known.
+    // applyPatches marks already-resolved entries by setting labelId = -2.
 
     // Zero out label table
     var li: int64 := 0;
@@ -132,7 +212,25 @@ pub type EmitARM64 = class {
     }
 
     self.calcStackFrame(funcId);
+    var prologueStart: int64 := self.codeLen;
     self.emitPrologue();
+    // WP-AND-upstream-fix v7: spill incoming register args (x0..x7 per
+    // AAPCS64) into stack slots 0..paramCount-1 so subsequent
+    // IRO_LOAD_LOCAL of a parameter actually reads its value. Without
+    // this every NK_IDENT lookup that hit the params chain returned
+    // whatever was at fp - (i+1)*8, i.e. uninitialised stack.
+    var pSpillCount: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pSpillI: int64 := 0;
+    while pSpillI < pSpillCount {
+      if pSpillI < 8 {
+        self.emitStur(pSpillI, ARM64_X29, self.slotOff(pSpillI));
+      }
+      pSpillI := pSpillI + 1;
+    }
+    // WP-AND-03: stash prologue length for DWARF CFI advance_loc.
+    if funcId < 256 {
+      poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
+    }
 
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
@@ -167,6 +265,18 @@ pub type EmitARM64 = class {
 
   // -------------------------------------------------------------------------
   // Prologue / Epilogue
+  //
+  // WP-AND-03 Bionic-ABI audit:
+  //  - 16-byte SP alignment is preserved across the prologue: STP pre-decrements
+  //    SP by 16, calcStackFrame rounds stackSize up to 16; SP stays 16-aligned
+  //    through the function body. ARM64 ABI requirement: met.
+  //  - This emitter only uses x0..x10, x29, x30. Android-reserved x18 (Bionic
+  //    TLS / shadow call stack) is never touched.
+  //  - No MRS/MSR system-register access; TPIDR_EL0 and other system regs are
+  //    untouched.
+  //  - Callee-saved regs (x19..x28) are not used, so we do not need to save them.
+  //  - DWARF CFI for stack unwinding is emitted by writeELFSharedLib via the
+  //    .eh_frame section using funcAddrs + funcPrologueLen records.
   // -------------------------------------------------------------------------
 
   fn emitPrologue() {
@@ -266,7 +376,7 @@ pub type EmitARM64 = class {
     // --- Calls ---
     if op == IRO_CALL         { self.emitCall(src1, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
-    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, dest); }
+    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
 
     // --- Control flow ---
     if op == IRO_JMP      { self.emitBranch(imm); }
@@ -426,6 +536,37 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
+    if self.isSharedLib != 0 {
+      // WP-AND-upstream-fix v5: in shared-lib mode IRO_LOAD_GLOBAL now
+      // carries a globalIdx, not an absolute VA. Emit the literal-pool
+      // sequence with a placeholder slot value and record the slot's
+      // code-buffer offset + globalIdx into globalRelocBuf — writeELFSharedLib
+      // patches the slot to (dataOff + globalIdx*8) at link time and adds
+      // the matching R_AARCH64_RELATIVE entry.
+      var slotOff: int64 := self.codeLen + 8;
+      self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
+      self.emit32(0x14000003);         // B +12
+      self.emit64(0);                   // placeholder slot
+      self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+
+      if (self.globalRelocCount >= self.globalRelocCap) {
+        var newCap: int64 := self.globalRelocCap * 2;
+        var nb: int64 := mmap(0, newCap * 16, 3, 34, -1, 0);
+        var i: int64 := 0;
+        while i < self.globalRelocCount * 16 {
+          poke8(nb + i, peek8(self.globalRelocBuf + i));
+          i := i + 1;
+        }
+        self.globalRelocBuf := nb;
+        self.globalRelocCap := newCap;
+      }
+      var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
+      poke64(rec + 0, slotOff);
+      poke64(rec + 8, addr);   // addr field carries globalIdx in this path
+      self.globalRelocCount := self.globalRelocCount + 1;
+      return;
+    }
     // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR
     self.emitMovImmReg(ARM64_X9, addr);
     // LDR x0, [x9]
@@ -434,10 +575,48 @@ pub type EmitARM64 = class {
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
+    if self.isSharedLib != 0 {
+      self._emitStoreGlobalPIC(src, addr);
+      return;
+    }
     self.emitMovImmReg(ARM64_X9, addr);
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
     // STR x0, [x9]
     self.emit32(0xF9000120);  // STR x0, [x9]
+  }
+
+  // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
+  // Layout (24 bytes total, identical size to the MOVZ/MOVK variant):
+  //   +0  LDR x9, [pc + 8]   ; loads the 8-byte slot at +8
+  //   +4  B  +12             ; jump past the slot
+  //   +8  .quad <addr>       ; slot, patched by R_AARCH64_RELATIVE at load time
+  //  +16  LDR x0, [x9]       ; dereference
+  //  +20  STUR x0, [fp, -slot]
+  fn _emitLoadGlobalPIC(addr: int64, dest: int64) {
+    var slotOff: int64 := self.codeLen + 8;   // slot's offset within codeBuf
+    // LDR x9 (=9), literal at +8: imm19 = 2 → 2<<5 = 0x40
+    self.emit32(0x58000040 | 9);
+    // B +12 (3 instructions ahead): imm26 = 3
+    self.emit32(0x14000003);
+    // 8-byte slot for the resolved address. The dynamic loader rewrites this
+    // to (load_base + addend) via R_AARCH64_RELATIVE; we store `addr` as the
+    // addend AND as the initial slot value (the loader overwrites anyway).
+    self.emit64(addr);
+    self._recordRelocation(slotOff, 1027, addr);  // 1027 = R_AARCH64_RELATIVE
+    // LDR x0, [x9]
+    self.emit32(0xF9400120 | ARM64_X0);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  fn _emitStoreGlobalPIC(src: int64, addr: int64) {
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
+    self.emit32(0x14000003);        // B +12
+    self.emit64(addr);
+    self._recordRelocation(slotOff, 1027, addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
+    // STR x0, [x9]
+    self.emit32(0xF9000120);
   }
 
   fn emitLoadField(base: int64, fieldOff: int64, dest: int64) {
@@ -491,10 +670,18 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitCallIndirect(ptrSlot: int64, dest: int64) {
+  // Indirect call. Args follow the same convention as emitCall: caller stores
+  // args 0..argCount-1 in stack slots 0..argCount-1, this routine loads them
+  // into x0..x7 per AAPCS64 before branching through x9.
+  fn emitCallIndirect(ptrSlot: int64, argCount: int64, dest: int64) {
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
+      ai := ai + 1;
+    }
     self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(ptrSlot));
     // BLR x9
-    self.emit32(0xD63F0120);  // BLR x9
+    self.emit32(0xD63F0120);
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
@@ -566,36 +753,49 @@ pub type EmitARM64 = class {
     var i: int64 := 0;
     while i < self.patchCount {
       var base:    int64 := self.patchBuf + i * 32;
-      var codeOff: int64 := peek64(base);
       var labelId: int64 := peek64(base + 8);
-      var ptype:   int64 := peek64(base + 16);
-      var reg:     int64 := peek64(base + 24);
+      // WP-AND-upstream-fix v9: -2 = already patched, skip.
+      if labelId != -2 {
+        var codeOff: int64 := peek64(base);
+        var ptype:   int64 := peek64(base + 16);
+        var reg:     int64 := peek64(base + 24);
 
-      var target: int64 := -1;
-      if ptype == PATCH_BL {
-        // funcId → funcAddrs
-        if labelId < 256 {
-          target := peek64(self.funcAddrs + labelId * 8);
+        // Use -1 sentinel for "unset" because funcAddrs / labelAddrs are
+        // mmap-zero so entry 0 is a legitimate address. Resolution depends
+        // on the pre-init pass in calcStackFrame for labelAddrs and on the
+        // funcAddrs writes in emitFunc.
+        var target: int64 := -1;
+        if ptype == PATCH_BL {
+          if labelId < 256 {
+            target := peek64(self.funcAddrs + labelId * 8);
+            // A funcAddrs[i] of 0 is valid only for the FIRST emitted
+            // function (labelId 0). Any other 0 means "not yet emitted".
+            if target == 0 {
+              if labelId != 0 { target := -1; }
+            }
+          }
+        } else {
+          if labelId < 1024 {
+            target := peek64(self.labelAddrs + labelId * 8);
+          }
         }
-      } else {
-        if labelId < 1024 {
-          target := peek64(self.labelAddrs + labelId * 8);
-        }
-      }
 
-      if target >= 0 {
-        var delta: int64 := (target - codeOff) >> 2;
-        if ptype == PATCH_B || ptype == PATCH_BL {
-          var opc: int64 := 0x14000000;
-          if ptype == PATCH_BL { opc := 0x94000000; }
-          var enc: int64 := opc | (delta & 0x3FFFFFF);
-          self.poke32at(codeOff, enc);
-        } else if ptype == PATCH_CBZ {
-          var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
-          self.poke32at(codeOff, enc);
-        } else if ptype == PATCH_CBNZ {
-          var enc: int64 := 0xB5000000 | ((delta & 0x7FFFF) << 5) | reg;
-          self.poke32at(codeOff, enc);
+        if target >= 0 {
+          var delta: int64 := (target - codeOff) >> 2;
+          if ptype == PATCH_B || ptype == PATCH_BL {
+            var opc: int64 := 0x14000000;
+            if ptype == PATCH_BL { opc := 0x94000000; }
+            var enc: int64 := opc | (delta & 0x3FFFFFF);
+            self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_CBZ {
+            var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
+            self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_CBNZ {
+            var enc: int64 := 0xB5000000 | ((delta & 0x7FFFF) << 5) | reg;
+            self.poke32at(codeOff, enc);
+          }
+          // Mark as resolved so a later applyPatches call skips it.
+          poke64(base + 8, -2);
         }
       }
       i := i + 1;
@@ -731,6 +931,12 @@ pub type EmitARM64 = class {
     self.codeLen := self.codeLen + 4;
   }
 
+  // WP-AND-02 Phase C: 8-byte little-endian emit; used for inline literal pool slots.
+  fn emit64(val: int64) {
+    self.emit32(val & 0xFFFFFFFF);
+    self.emit32((val >> 32) & 0xFFFFFFFF);
+  }
+
   fn poke32at(off: int64, val: int64) {
     poke8(self.codeBuf + off,     val & 0xFF);
     poke8(self.codeBuf + off + 1, (val >> 8) & 0xFF);
@@ -740,6 +946,7 @@ pub type EmitARM64 = class {
 
   fn getCodeBuf(): int64 { return self.codeBuf; }
   fn getCodeLen(): int64 { return self.codeLen; }
+  fn getFuncAddrs(): int64 { return self.funcAddrs; }   // WP-AND-02 Phase B: expose for export-table
 
   // -------------------------------------------------------------------------
   // IR Module Helpers
