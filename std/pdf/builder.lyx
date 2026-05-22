@@ -87,6 +87,28 @@ pub con PDF_OUTLINE_TITLELEN:    int64 := 24;  // int64 title allocation length
 pub con PDF_OUTLINE_RECSIZE:     int64 := 32;
 pub con PDF_OUTLINE_INITIAL_CAP: int64 := 8;
 
+// Page label ranges (offsets 3648..3671, within 4096-byte doc block)
+pub con PDF_DOC_LABELCOUNT:      int64 := 3648;  // int64 range count
+pub con PDF_DOC_LABELCAP:        int64 := 3656;  // int64 capacity
+pub con PDF_DOC_LABELBUF:        int64 := 3664;  // int64* record buffer
+
+// Page label record layout (40 bytes each, stored in labelBuf)
+pub con PDF_LABEL_FIRSTPAGE:     int64 := 0;   // int64 first page index (0-based)
+pub con PDF_LABEL_STYLE:         int64 := 8;   // int64 style constant
+pub con PDF_LABEL_STARTNUM:      int64 := 16;  // int64 starting page number (1 = default)
+pub con PDF_LABEL_PREFIXBUF:     int64 := 24;  // int64* prefix string (mmap'd) or 0
+pub con PDF_LABEL_PREFIXLEN:     int64 := 32;  // int64 prefix allocation length
+pub con PDF_LABEL_RECSIZE:       int64 := 40;
+pub con PDF_LABEL_INITIAL_CAP:   int64 := 4;
+
+// Page label style constants
+pub con PDF_LABEL_DECIMAL:       int64 := 1;   // 1, 2, 3 …
+pub con PDF_LABEL_ROMAN_L:       int64 := 2;   // i, ii, iii …
+pub con PDF_LABEL_ROMAN_U:       int64 := 3;   // I, II, III …
+pub con PDF_LABEL_ALPHA_L:       int64 := 4;   // a, b, c …
+pub con PDF_LABEL_ALPHA_U:       int64 := 5;   // A, B, C …
+pub con PDF_LABEL_NONE:          int64 := 6;   // prefix only, no numeric part
+
 pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
 pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
 
@@ -274,6 +296,33 @@ pub fn PdfNew(): int64 {
   poke64(doc + PDF_DOC_OUTLINECAP,   PDF_OUTLINE_INITIAL_CAP);
   poke64(doc + PDF_DOC_OUTLINEBUF,   outlineBuf);
 
+  // Page label buffer
+  var labelBuf: int64 := mmapAlloc(PDF_LABEL_INITIAL_CAP * PDF_LABEL_RECSIZE);
+  if (labelBuf == 0) {
+    munmap(outlineBuf,   PDF_OUTLINE_INITIAL_CAP * PDF_OUTLINE_RECSIZE);
+    munmap(annotBuf,     PDF_ANNOT_INITIAL_CAP * PDF_ANNOT_RECSIZE);
+    munmap(imageIds,      imgArrSz);
+    munmap(imageWidths,   imgArrSz);
+    munmap(imageHeights,  imgArrSz);
+    munmap(imageChannels, imgArrSz);
+    munmap(imageDataBufs, imgArrSz);
+    munmap(imageDataLens, imgArrSz);
+    munmap(pageImgMasks,  pageCap * 8);
+    munmap(pageIds,     arrSize);
+    munmap(contentIds,  arrSize);
+    munmap(widths100,   arrSize);
+    munmap(heights100,  arrSize);
+    munmap(contentBufs, arrSize);
+    munmap(contentLens, arrSize);
+    munmap(contentCaps, arrSize);
+    munmap(doc, PDF_DOC_SIZE);
+    return 0;
+  }
+  zeroMem(labelBuf, PDF_LABEL_INITIAL_CAP * PDF_LABEL_RECSIZE);
+  poke64(doc + PDF_DOC_LABELCOUNT, 0);
+  poke64(doc + PDF_DOC_LABELCAP,   PDF_LABEL_INITIAL_CAP);
+  poke64(doc + PDF_DOC_LABELBUF,   labelBuf);
+
   return doc;
 }
 
@@ -374,6 +423,22 @@ pub fn PdfFree(doc: int64): void {
     munmap(outlineBuf3, outlineCap3 * PDF_OUTLINE_RECSIZE);
   }
 
+  // Free page label prefix strings and buffer
+  var labelCount3: int64 := peek64(doc + PDF_DOC_LABELCOUNT);
+  var labelCap3:   int64 := peek64(doc + PDF_DOC_LABELCAP);
+  var labelBuf3:   int64 := peek64(doc + PDF_DOC_LABELBUF);
+  if (labelBuf3 != 0) {
+    var li3: int64 := 0;
+    while (li3 < labelCount3) {
+      var lrec3:   int64 := labelBuf3 + li3 * PDF_LABEL_RECSIZE;
+      var pfxBuf3: int64 := peek64(lrec3 + PDF_LABEL_PREFIXBUF);
+      var pfxLen3: int64 := peek64(lrec3 + PDF_LABEL_PREFIXLEN);
+      if (pfxBuf3 != 0 && pfxLen3 > 0) { munmap(pfxBuf3, pfxLen3); }
+      li3 := li3 + 1;
+    }
+    munmap(labelBuf3, labelCap3 * PDF_LABEL_RECSIZE);
+  }
+
   munmap(doc, PDF_DOC_SIZE);
 }
 
@@ -472,6 +537,35 @@ fn _pdfWriteOutlineRoot(out: int64, pos: int64, xrefs: int64, buf: int64, count:
   }
   pos := pdfStr(out, pos, " >>");
   pos := pdfObjFtr(out, pos);
+  return pos;
+}
+
+// Write "/PageLabels << /Nums [...] >>" inline into the Catalog dict.
+fn _pdfWritePageLabels(out: int64, pos: int64, buf: int64, count: int64): int64 {
+  pos := pdfStr(out, pos, " /PageLabels << /Nums [");
+  var li: int64 := 0;
+  while (li < count) {
+    var lrec: int64 := buf + li * PDF_LABEL_RECSIZE;
+    if (li > 0) { poke8(out + pos, 32); pos := pos + 1; }
+    pos := pdfInt(out, pos, peek64(lrec + PDF_LABEL_FIRSTPAGE));
+    pos := pdfStr(out, pos, " <<");
+    if (peek64(lrec + PDF_LABEL_STYLE) == PDF_LABEL_DECIMAL) { pos := pdfStr(out, pos, " /S /D"); }
+    if (peek64(lrec + PDF_LABEL_STYLE) == PDF_LABEL_ROMAN_L) { pos := pdfStr(out, pos, " /S /r"); }
+    if (peek64(lrec + PDF_LABEL_STYLE) == PDF_LABEL_ROMAN_U) { pos := pdfStr(out, pos, " /S /R"); }
+    if (peek64(lrec + PDF_LABEL_STYLE) == PDF_LABEL_ALPHA_L) { pos := pdfStr(out, pos, " /S /a"); }
+    if (peek64(lrec + PDF_LABEL_STYLE) == PDF_LABEL_ALPHA_U) { pos := pdfStr(out, pos, " /S /A"); }
+    if (peek64(lrec + PDF_LABEL_STARTNUM) != 1) {
+      pos := pdfStr(out, pos, " /St ");
+      pos := pdfInt(out, pos, peek64(lrec + PDF_LABEL_STARTNUM));
+    }
+    if (peek64(lrec + PDF_LABEL_PREFIXBUF) != 0) {
+      pos := pdfStr(out, pos, " /P ");
+      pos := _pdfEscStr(out, pos, peek64(lrec + PDF_LABEL_PREFIXBUF));
+    }
+    pos := pdfStr(out, pos, " >>");
+    li := li + 1;
+  }
+  pos := pdfStr(out, pos, "] >>");
   return pos;
 }
 
@@ -638,6 +732,9 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   if (outlineCount > 0) { outlineObjCount := outlineCount + 1; }
   var outlineRootId:   int64 := nextId + hasInfo + annotCount;
 
+  var labelCount: int64 := peek64(doc + PDF_DOC_LABELCOUNT);
+  var labelBuf:   int64 := peek64(doc + PDF_DOC_LABELBUF);
+
   // Allocate XRef offset table
   var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
@@ -664,6 +761,9 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   if (outlineCount > 0) {
     pos := pdfStr(out, pos, " /Outlines ");
     pos := pdfRef(out, pos, outlineRootId);
+  }
+  if (labelCount > 0) {
+    pos := _pdfWritePageLabels(out, pos, labelBuf, labelCount);
   }
   pos := pdfStr(out, pos, " >>\nendobj\n");
 
