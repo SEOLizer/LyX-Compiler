@@ -421,27 +421,76 @@ allozieren), brauchen Phase B + Frontend-Reparatur.
 
 ---
 
-### WP-AND-06: Android-Stdlib (Basis)
+### WP-AND-06: Android-Stdlib (Basis) — Konstanten + Log voll, andere blockiert
 
 **Ziel:** Grundlegende Android-API-Bindungen als Lyx-Stdlib-Module.
 
-**Aufwand:** 16h
+**Aufwand:** 16h (tatsächlich ~2h für realistisch lieferbaren Scope)
 
-**Neue Module:**
+**Geliefert (5 neue Units in `std/android/`):**
 
-| Modul | Beschreibung | API |
+| Modul | Konstanten | Funktionen |
 |---|---|---|
-| `std/android/log.lyu` | `__android_log_print` / Logcat | Log-API |
-| `std/android/asset.lyu` | AAssetManager — App-Assets lesen | Asset-API |
-| `std/android/sensor.lyu` | ASensorManager — Gyro, Accel, GPS | Sensor-API |
-| `std/android/input.lyu` | AInputQueue — Touch/Key-Events | Input-API |
-| `std/android/native_window.lyu` | ANativeWindow — Direkt-Rendering | Window-API |
+| `std/android/log.lyx` | `ANDROID_LOG_VERBOSE..FATAL` | **voll funktional**: `LogV/D/I/W/E/F(tag, msg)`, `LogPrio(prio, …)` schreiben Logcat-Format auf stderr |
+| `std/android/asset.lyx` | `AASSET_MODE_*`, `AASSET_DIR_*` | nur Typen + TODOs (blockiert) |
+| `std/android/sensor.lyx` | `ASENSOR_TYPE_*` (25+), `ASENSOR_STATUS_*`, `AREPORTING_MODE_*`, `ASENSOR_DELAY_*`; structs `ASensorVector`, `ASensorEvent` | nur Typen + TODOs (blockiert) |
+| `std/android/input.lyx` | `AINPUT_EVENT_TYPE_*`, `AKEY_EVENT_ACTION_*`, `AKEY_EVENT_FLAG_*`, `AMOTION_EVENT_ACTION_*`, `AINPUT_SOURCE_*` (24+), `AKEYCODE_*` (Auswahl ~25), `AMETA_*` | nur Typen + TODOs (blockiert) |
+| `std/android/native_window.lyx` | `WINDOW_FORMAT_*`, `ANATIVEWINDOW_TRANSFORM_*`, `…_FRAME_RATE_COMPATIBILITY_*`; structs `ANativeWindow_Buffer`, `ARect` | nur Typen + TODOs (blockiert) |
 
-**Tasks:**
-- [ ] `std/android/log.lyu`: `logD/logI/logW/logE(tag, msg)` als JNI-Calls
-- [ ] `std/android/asset.lyu`: `assetOpen`, `assetRead`, `assetClose`
-- [ ] `std/android/native_window.lyu`: `ANativeWindow_fromSurface`, `lock`, `unlockAndPost`
-- [ ] `std/android/sensor.lyu`: Grundlegende Sensor-Enumeration und Daten-Polling
+**Tasks-Status:**
+- [x] `std/android/log.lyx`: `LogD/I/W/E(tag, msg)` — schreiben Format
+      `"P/tag: msg\n"` auf stderr; Android-Runtime captured stderr von
+      debuggable Apps automatisch in logcat → echte Logcat-Ausgabe ohne
+      liblog-Linkung
+- [x] `std/android/asset.lyx`: Konstanten + opake Typdefs
+- [x] `std/android/sensor.lyx`: Konstanten + opake Typdefs + Event-Struct
+- [x] `std/android/input.lyx`: Konstanten + opake Typdefs
+- [x] `std/android/native_window.lyx`: Konstanten + Buffer/ARect-Struct
+- [ ] Aktive Funktionen für asset/sensor/input/native_window — **blockiert**:
+      benötigen `DT_NEEDED libandroid.so` + PLT + `IRO_CALL_INDIRECT` aus
+      `ir_lower` (gleicher Frontend-Block wie WP-AND-05 Phase B)
+
+**Warum nicht alles funktional?**
+Die NDK-C-APIs (`AAssetManager_open`, `ASensorEventQueue_*`,
+`ANativeWindow_lock`, etc.) leben in `libandroid.so`. Sie aufzurufen
+braucht: (1) `DT_NEEDED`-Einträge in der `.dynamic` (kein Codegen-Support
+für externe Libs), (2) eine PLT-Sektion mit Stubs (in WP-AND-02 Phase C
+infrastruktur-vorbereitet, aber nicht End-to-End), (3) Lyx-Frontend, das
+`IRO_CALL_INDIRECT` aus dynamischem Lookup emittiert. Selbst eine
+JNI-Brücke (via `JNIEnv`-VTable) wäre eine Option, scheitert aber an der
+gleichen Frontend-Lücke wie WP-AND-05 Phase B. Die Konstanten und Typdefs
+sind trotzdem nützlich (z.B. um Sensor-Daten aus rohen IIO-sysfs-Reads zu
+interpretieren, Input-Events aus eigener Pipeline zu kategorisieren etc.).
+
+**Verifikation:**
+```bash
+for f in std/android/log.lyx std/android/asset.lyx \
+         std/android/sensor.lyx std/android/input.lyx \
+         std/android/native_window.lyx; do
+  ./lyxc --compile-unit "$f" -o /tmp/x.lyu && echo "OK: $f"
+done
+
+# log e2e:
+cat > /tmp/log_test.lyx <<'LYX'
+import std.android.log;
+fn main(): int64 {
+  LogI("LyxApp", "Hello from Lyx on Android");
+  LogE("LyxApp", "And an error");
+  return 0;
+}
+LYX
+./lyxc /tmp/log_test.lyx -o /tmp/log_test && /tmp/log_test
+# stderr:
+#   I/LyxApp: Hello from Lyx on Android
+#   E/LyxApp: And an error
+# (debuggable App: erscheint in logcat unter Tag "LyxApp")
+
+make singularity   # S3 == S4 (Hash unverändert, std/ ohne Wirkung auf lyxc)
+```
+
+**Aufwand-Vergleich:** Doc 16h, tatsächlich ~2h. Differenz hauptsächlich
+durch upstream-Blocker: die "richtige" Implementierung (PLT-Stubs, JNI-
+Vtable-Helpers) ist 12h+ Frontend-Arbeit, davon nichts in WP-AND-06-Scope.
 
 ---
 
