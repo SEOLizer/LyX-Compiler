@@ -1,0 +1,412 @@
+// std/pdf/builder.lyx
+// PDF document builder: object pool, XRef table, serialization
+
+@description("PDF document builder: PdfNew, PdfSave, PdfFree, content stream management")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.builder;
+
+import std.pdf.objects;
+
+// ============================================================================
+// Document struct field offsets (mmap'd block, PDF_DOC_SIZE bytes)
+// ============================================================================
+
+pub con PDF_DOC_PAGECOUNT:   int64 := 0;
+pub con PDF_DOC_PAGECAP:     int64 := 8;
+pub con PDF_DOC_NEXTID:      int64 := 16;
+pub con PDF_DOC_COMPRESSION: int64 := 24;
+pub con PDF_DOC_PAGEIDS:     int64 := 32;
+pub con PDF_DOC_CONTENTIDS:  int64 := 40;
+pub con PDF_DOC_WIDTHS100:   int64 := 48;
+pub con PDF_DOC_HEIGHTS100:  int64 := 56;
+pub con PDF_DOC_CONTENTBUFS: int64 := 64;
+pub con PDF_DOC_CONTENTLENS: int64 := 72;
+pub con PDF_DOC_CONTENTCAPS:      int64 := 80;
+// Font-related fields packed into the 4096-byte doc block at offsets 88–1735
+pub con PDF_DOC_FONTIDS:          int64 := 88;    // int64[14]: per-font obj IDs (0 = unused)
+pub con PDF_DOC_PAGEFONTMASK:     int64 := 200;   // int64[64]: per-page used-font bitmask
+pub con PDF_DOC_CURFONTIDX:       int64 := 712;   // int64[64]: current font index per page
+pub con PDF_DOC_CURFONTSIZE100:   int64 := 1224;  // int64[64]: current font size ×100 per page
+pub con PDF_DOC_CURTEXTCOLOR:     int64 := 1736;  // int64[64]: current text color per page
+//   color encoding: bits 63..48 = r100, bits 47..32 = g100, bits 31..16 = b100
+pub con PDF_DOC_SIZE:             int64 := 4096;
+
+pub con PDF_INITIAL_PAGE_CAP: int64 := 64;
+pub con PDF_OUT_BUF_SIZE:     int64 := 4194304;
+
+// mmap flags: PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANONYMOUS=34
+con MMAP_PROT: int64 := 3;
+con MMAP_FLAGS: int64 := 34;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn arrGet(arr: int64, idx: int64): int64 {
+  return peek64(arr + idx * 8);
+}
+
+fn arrSet(arr: int64, idx: int64, val: int64): void {
+  poke64(arr + idx * 8, val);
+}
+
+fn zeroMem(ptr: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    poke8(ptr + i, 0);
+    i := i + 1;
+  }
+}
+
+fn mmapAlloc(size: int64): int64 {
+  return mmap(0, size, MMAP_PROT, MMAP_FLAGS, -1, 0);
+}
+
+// ============================================================================
+// PdfNew — create a new empty document
+// Returns: doc handle (int64 pointer), or 0 on failure
+// ============================================================================
+
+pub fn PdfNew(): int64 {
+  var doc: int64 := mmapAlloc(PDF_DOC_SIZE);
+  if (doc == 0) { return 0; }
+  zeroMem(doc, PDF_DOC_SIZE);
+
+  var pageCap: int64 := PDF_INITIAL_PAGE_CAP;
+  var arrSize: int64 := pageCap * 8;
+
+  poke64(doc + PDF_DOC_PAGECOUNT,   0);
+  poke64(doc + PDF_DOC_PAGECAP,     pageCap);
+  poke64(doc + PDF_DOC_NEXTID,      3);
+  poke64(doc + PDF_DOC_COMPRESSION, 0);
+
+  var pageIds:     int64 := mmapAlloc(arrSize);
+  var contentIds:  int64 := mmapAlloc(arrSize);
+  var widths100:   int64 := mmapAlloc(arrSize);
+  var heights100:  int64 := mmapAlloc(arrSize);
+  var contentBufs: int64 := mmapAlloc(arrSize);
+  var contentLens: int64 := mmapAlloc(arrSize);
+  var contentCaps: int64 := mmapAlloc(arrSize);
+
+  if (pageIds == 0 || contentIds == 0 || widths100 == 0 || heights100 == 0 ||
+      contentBufs == 0 || contentLens == 0 || contentCaps == 0) {
+    if (pageIds != 0)     { munmap(pageIds,     arrSize); }
+    if (contentIds != 0)  { munmap(contentIds,  arrSize); }
+    if (widths100 != 0)   { munmap(widths100,   arrSize); }
+    if (heights100 != 0)  { munmap(heights100,  arrSize); }
+    if (contentBufs != 0) { munmap(contentBufs, arrSize); }
+    if (contentLens != 0) { munmap(contentLens, arrSize); }
+    if (contentCaps != 0) { munmap(contentCaps, arrSize); }
+    munmap(doc, PDF_DOC_SIZE);
+    return 0;
+  }
+
+  zeroMem(pageIds,     arrSize);
+  zeroMem(contentIds,  arrSize);
+  zeroMem(widths100,   arrSize);
+  zeroMem(heights100,  arrSize);
+  zeroMem(contentBufs, arrSize);
+  zeroMem(contentLens, arrSize);
+  zeroMem(contentCaps, arrSize);
+
+  poke64(doc + PDF_DOC_PAGEIDS,     pageIds);
+  poke64(doc + PDF_DOC_CONTENTIDS,  contentIds);
+  poke64(doc + PDF_DOC_WIDTHS100,   widths100);
+  poke64(doc + PDF_DOC_HEIGHTS100,  heights100);
+  poke64(doc + PDF_DOC_CONTENTBUFS, contentBufs);
+  poke64(doc + PDF_DOC_CONTENTLENS, contentLens);
+  poke64(doc + PDF_DOC_CONTENTCAPS, contentCaps);
+
+  return doc;
+}
+
+// ============================================================================
+// PdfFree — release all document memory
+// ============================================================================
+
+pub fn PdfFree(doc: int64): void {
+  if (doc == 0) { return; }
+
+  var pageCap:     int64 := peek64(doc + PDF_DOC_PAGECAP);
+  var pageCount:   int64 := peek64(doc + PDF_DOC_PAGECOUNT);
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentCaps: int64 := peek64(doc + PDF_DOC_CONTENTCAPS);
+  var arrSize:     int64 := pageCap * 8;
+
+  var i: int64 := 0;
+  while (i < pageCount) {
+    var cbuf: int64 := arrGet(contentBufs, i);
+    var ccap: int64 := arrGet(contentCaps, i);
+    if (cbuf != 0 && ccap > 0) {
+      munmap(cbuf, ccap);
+    }
+    i := i + 1;
+  }
+
+  munmap(peek64(doc + PDF_DOC_PAGEIDS),     arrSize);
+  munmap(peek64(doc + PDF_DOC_CONTENTIDS),  arrSize);
+  munmap(peek64(doc + PDF_DOC_WIDTHS100),   arrSize);
+  munmap(peek64(doc + PDF_DOC_HEIGHTS100),  arrSize);
+  munmap(peek64(doc + PDF_DOC_CONTENTBUFS), arrSize);
+  munmap(peek64(doc + PDF_DOC_CONTENTLENS), arrSize);
+  munmap(peek64(doc + PDF_DOC_CONTENTCAPS), arrSize);
+  munmap(doc, PDF_DOC_SIZE);
+}
+
+// ============================================================================
+// PdfSetCompression, PdfPageCount
+// ============================================================================
+
+pub fn PdfSetCompression(doc: int64, level: int64): void {
+  if (doc == 0) { return; }
+  poke64(doc + PDF_DOC_COMPRESSION, level);
+}
+
+pub fn PdfPageCount(doc: int64): int64 {
+  if (doc == 0) { return 0; }
+  return peek64(doc + PDF_DOC_PAGECOUNT);
+}
+
+// ============================================================================
+// Content stream management (used by WP-PDF-03+)
+// ============================================================================
+
+pub fn PdfContentEnsure(doc: int64, pageIdx: int64, needed: int64): int64 {
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentLens: int64 := peek64(doc + PDF_DOC_CONTENTLENS);
+  var contentCaps: int64 := peek64(doc + PDF_DOC_CONTENTCAPS);
+
+  var buf: int64 := arrGet(contentBufs, pageIdx);
+  var len: int64 := arrGet(contentLens, pageIdx);
+  var cap: int64 := arrGet(contentCaps, pageIdx);
+
+  if (len + needed <= cap) { return 1; }
+
+  var newCap: int64 := cap * 2;
+  if (newCap < len + needed) { newCap := len + needed; }
+  if (newCap < 4096) { newCap := 4096; }
+
+  var newBuf: int64 := mmapAlloc(newCap);
+  if (newBuf == 0) { return 0; }
+  zeroMem(newBuf, newCap);
+
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(newBuf + i, peek8(buf + i));
+    i := i + 1;
+  }
+
+  if (buf != 0 && cap > 0) { munmap(buf, cap); }
+
+  arrSet(contentBufs, pageIdx, newBuf);
+  arrSet(contentCaps, pageIdx, newCap);
+  return 1;
+}
+
+pub fn PdfContentAppendStr(doc: int64, pageIdx: int64, s: pchar): int64 {
+  var slen: int64 := StrLen(s);
+  if (slen == 0) { return 0; }
+  if (PdfContentEnsure(doc, pageIdx, slen) == 0) { return 0; }
+
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentLens: int64 := peek64(doc + PDF_DOC_CONTENTLENS);
+  var buf: int64 := arrGet(contentBufs, pageIdx);
+  var pos: int64 := arrGet(contentLens, pageIdx);
+
+  var i: int64 := 0;
+  while (i < slen) {
+    poke8(buf + pos + i, StrCharAt(s, i));
+    i := i + 1;
+  }
+
+  arrSet(contentLens, pageIdx, pos + slen);
+  return slen;
+}
+
+pub fn PdfContentAppendBytes(doc: int64, pageIdx: int64, data: int64, len: int64): int64 {
+  if (len == 0) { return 0; }
+  if (PdfContentEnsure(doc, pageIdx, len) == 0) { return 0; }
+
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentLens: int64 := peek64(doc + PDF_DOC_CONTENTLENS);
+  var buf: int64 := arrGet(contentBufs, pageIdx);
+  var pos: int64 := arrGet(contentLens, pageIdx);
+
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(buf + pos + i, peek8(data + i));
+    i := i + 1;
+  }
+
+  arrSet(contentLens, pageIdx, pos + len);
+  return len;
+}
+
+// ============================================================================
+// PdfSave — serialize document to a PDF file
+// Returns: 0 on success, negative on error
+// ============================================================================
+
+pub fn PdfSave(doc: int64, path: pchar): int64 {
+  if (doc == 0) { return -1; }
+
+  var pageCount:   int64 := peek64(doc + PDF_DOC_PAGECOUNT);
+  var nextId:      int64 := peek64(doc + PDF_DOC_NEXTID);
+  var pageIds:     int64 := peek64(doc + PDF_DOC_PAGEIDS);
+  var contentIds:  int64 := peek64(doc + PDF_DOC_CONTENTIDS);
+  var widths100:   int64 := peek64(doc + PDF_DOC_WIDTHS100);
+  var heights100:  int64 := peek64(doc + PDF_DOC_HEIGHTS100);
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentLens: int64 := peek64(doc + PDF_DOC_CONTENTLENS);
+
+  // Allocate output buffer (4 MB)
+  var out: int64 := mmapAlloc(PDF_OUT_BUF_SIZE);
+  if (out == 0) { return -2; }
+
+  // Allocate XRef offset table (indexed by object ID, 1-based)
+  var xrefSize: int64 := nextId * 8;
+  var xrefs: int64 := mmapAlloc(xrefSize);
+  if (xrefs == 0) {
+    munmap(out, PDF_OUT_BUF_SIZE);
+    return -3;
+  }
+  zeroMem(xrefs, xrefSize);
+
+  var pos: int64 := 0;
+
+  // --- PDF header ---
+  pos := pdfStr(out, pos, "%PDF-1.4\n");
+  poke8(out + pos, 37);   pos := pos + 1;
+  poke8(out + pos, 0xE2); pos := pos + 1;
+  poke8(out + pos, 0xE3); pos := pos + 1;
+  poke8(out + pos, 0xCF); pos := pos + 1;
+  poke8(out + pos, 0xD3); pos := pos + 1;
+  poke8(out + pos, 10);   pos := pos + 1;
+
+  // --- Object 1: Catalog ---
+  poke64(xrefs + 1 * 8, pos);
+  pos := pdfStr(out, pos, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+  // --- Object 2: Pages ---
+  poke64(xrefs + 2 * 8, pos);
+  pos := pdfStr(out, pos, "2 0 obj\n<< /Type /Pages /Kids [");
+  var i: int64 := 0;
+  while (i < pageCount) {
+    if (i > 0) { poke8(out + pos, 32); pos := pos + 1; }
+    pos := pdfRef(out, pos, arrGet(pageIds, i));
+    i := i + 1;
+  }
+  pos := pdfStr(out, pos, "] /Count ");
+  pos := pdfInt(out, pos, pageCount);
+  pos := pdfStr(out, pos, " >>\nendobj\n");
+
+  // --- Font objects (Standard-14, one per registered font) ---
+  var fontIdBase: int64 := doc + PDF_DOC_FONTIDS;
+  var fi: int64 := 0;
+  while (fi < 14) {
+    var foid: int64 := peek64(fontIdBase + fi * 8);
+    if (foid != 0) {
+      poke64(xrefs + foid * 8, pos);
+      pos := pdfObjHdr(out, pos, foid);
+      pos := pdfStr(out, pos, "<< /Type /Font /Subtype /Type1 /BaseFont /");
+      pos := pdfStr(out, pos, pdfFontName(fi));
+      pos := pdfStr(out, pos, " >>");
+      pos := pdfObjFtr(out, pos);
+    }
+    fi := fi + 1;
+  }
+
+  // --- Per-page objects ---
+  i := 0;
+  while (i < pageCount) {
+    var pageId:    int64 := arrGet(pageIds,    i);
+    var contentId: int64 := arrGet(contentIds, i);
+    var w100:      int64 := arrGet(widths100,  i);
+    var h100:      int64 := arrGet(heights100, i);
+    var cbuf:      int64 := arrGet(contentBufs, i);
+    var clen:      int64 := arrGet(contentLens, i);
+    var fontMask:  int64 := peek64(doc + PDF_DOC_PAGEFONTMASK + i * 8);
+
+    // Page dictionary
+    poke64(xrefs + pageId * 8, pos);
+    pos := pdfObjHdr(out, pos, pageId);
+    pos := pdfStr(out, pos, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ");
+    pos := pdfReal100(out, pos, w100);
+    poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, h100);
+    pos := pdfStr(out, pos, "] /Resources << /Font <<");
+    // Emit font resource entries for fonts used on this page
+    var fj: int64 := 0;
+    while (fj < 14) {
+      if ((fontMask >> fj) & 1 != 0) {
+        var foid2: int64 := peek64(fontIdBase + fj * 8);
+        pos := pdfStr(out, pos, " /F");
+        pos := pdfInt(out, pos, fj);
+        poke8(out + pos, 32); pos := pos + 1;
+        pos := pdfRef(out, pos, foid2);
+      }
+      fj := fj + 1;
+    }
+    pos := pdfStr(out, pos, " >> >> /Contents ");
+    pos := pdfRef(out, pos, contentId);
+    pos := pdfStr(out, pos, " >>");
+    pos := pdfObjFtr(out, pos);
+
+    // Content stream
+    poke64(xrefs + contentId * 8, pos);
+    pos := pdfObjHdr(out, pos, contentId);
+    pos := pdfStr(out, pos, "<< /Length ");
+    pos := pdfInt(out, pos, clen);
+    pos := pdfStr(out, pos, " >>\nstream\n");
+    if (clen > 0) {
+      pos := pdfBytes(out, pos, cbuf, clen);
+    }
+    pos := pdfStr(out, pos, "endstream");
+    pos := pdfObjFtr(out, pos);
+
+    i := i + 1;
+  }
+
+  // --- XRef section ---
+  var xrefStart: int64 := pos;
+
+  pos := pdfStr(out, pos, "xref\n0 ");
+  pos := pdfInt(out, pos, nextId);
+  poke8(out + pos, 10); pos := pos + 1;
+
+  // Free entry for object 0
+  pos := pdfXrefEntry(out, pos, 0, 65535, true);
+
+  // In-use entries for objects 1..nextId-1
+  var id: int64 := 1;
+  while (id < nextId) {
+    var off: int64 := peek64(xrefs + id * 8);
+    pos := pdfXrefEntry(out, pos, off, 0, false);
+    id := id + 1;
+  }
+
+  // --- Trailer ---
+  pos := pdfStr(out, pos, "trailer\n<< /Size ");
+  pos := pdfInt(out, pos, nextId);
+  pos := pdfStr(out, pos, " /Root 1 0 R >>\nstartxref\n");
+  pos := pdfInt(out, pos, xrefStart);
+  pos := pdfStr(out, pos, "\n%%EOF\n");
+
+  // --- Write to file ---
+  var fd: int64 := open(path, 577, 420);
+  if (fd < 0) {
+    munmap(xrefs, xrefSize);
+    munmap(out, PDF_OUT_BUF_SIZE);
+    return -4;
+  }
+
+  var written: int64 := write(fd, out, pos);
+  close(fd);
+
+  munmap(xrefs, xrefSize);
+  munmap(out, PDF_OUT_BUF_SIZE);
+
+  if (written != pos) { return -5; }
+  return 0;
+}

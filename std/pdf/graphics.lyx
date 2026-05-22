@@ -1,0 +1,180 @@
+// std/pdf/graphics.lyx
+// Content-stream operations: fonts, text placement, color
+
+@description("PDF content-stream: PdfSetFont, PdfTextAt, PdfSetTextColor, PdfTextBlock")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.graphics;
+
+import std.pdf.builder;
+import std.pdf.objects;
+import std.pdf.fonts;
+
+// ============================================================================
+// PdfSetFont — register font on page and set as current font for text ops
+// ============================================================================
+
+pub fn PdfSetFont(doc: int64, page: int64, fontId: int64, size: f64): void {
+  if (doc == 0) { return; }
+  if (fontId < 0 || fontId >= 14) { return; }
+
+  var fbase: int64 := doc + PDF_DOC_FONTIDS;
+  if (peek64(fbase + fontId * 8) == 0) {
+    var nextId: int64 := peek64(doc + PDF_DOC_NEXTID);
+    poke64(fbase + fontId * 8, nextId);
+    poke64(doc + PDF_DOC_NEXTID, nextId + 1);
+  }
+
+  var mask: int64 := peek64(doc + PDF_DOC_PAGEFONTMASK + page * 8);
+  poke64(doc + PDF_DOC_PAGEFONTMASK + page * 8, mask | (1 << fontId));
+  poke64(doc + PDF_DOC_CURFONTIDX     + page * 8, fontId);
+  poke64(doc + PDF_DOC_CURFONTSIZE100 + page * 8, f64ToInt100(size));
+}
+
+// ============================================================================
+// PdfSetTextColor — set RGB non-stroking color for subsequent text operations
+// r, g, b in [0.0, 1.0]; packed as r100<<48 | g100<<32 | b100<<16
+// ============================================================================
+
+pub fn PdfSetTextColor(doc: int64, page: int64, r: f64, g: f64, b: f64): void {
+  if (doc == 0) { return; }
+  var packed: int64 := (f64ToInt100(r) << 48) | (f64ToInt100(g) << 32) | (f64ToInt100(b) << 16);
+  poke64(doc + PDF_DOC_CURTEXTCOLOR + page * 8, packed);
+}
+
+// ============================================================================
+// PdfSetLineSpacing — set leading (line height) for PdfTextBlock
+// Stored in PDF_DOC_CURTEXTCOLOR bits 15..0 as leading×100
+// (reuses the field upper bits for color, lower bits for leading)
+// ============================================================================
+
+pub fn PdfSetLineSpacing(doc: int64, page: int64, leading: f64): void {
+  if (doc == 0) { return; }
+  var cur:      int64 := peek64(doc + PDF_DOC_CURTEXTCOLOR + page * 8);
+  var lead100:  int64 := f64ToInt100(leading);
+  cur := (cur & 0xFFFFFFFFFFFF0000) | (lead100 & 0xFFFF);
+  poke64(doc + PDF_DOC_CURTEXTCOLOR + page * 8, cur);
+}
+
+// ============================================================================
+// Internal: append text BT block to content stream
+// ============================================================================
+
+fn _textBT(doc: int64, page: int64, x100: int64, y100: int64,
+            text: pchar, tlen: int64): void {
+  var contentBufs: int64 := peek64(doc + PDF_DOC_CONTENTBUFS);
+  var contentLens: int64 := peek64(doc + PDF_DOC_CONTENTLENS);
+  var buf: int64 := arrGet(contentBufs, page);
+  var pos: int64 := arrGet(contentLens, page);
+
+  var fontIdx: int64 := peek64(doc + PDF_DOC_CURFONTIDX     + page * 8);
+  var size100: int64 := peek64(doc + PDF_DOC_CURFONTSIZE100 + page * 8);
+  var color:   int64 := peek64(doc + PDF_DOC_CURTEXTCOLOR   + page * 8);
+
+  pos := pdfStr(buf, pos, "BT\n");
+
+  if ((color & 0xFFFFFFFFFFFF0000) != 0) {
+    var r100: int64 := (color >> 48) & 0xFFFF;
+    var g100: int64 := (color >> 32) & 0xFFFF;
+    var b100: int64 := (color >> 16) & 0xFFFF;
+    pos := pdfReal100(buf, pos, r100); poke8(buf + pos, 32); pos := pos + 1;
+    pos := pdfReal100(buf, pos, g100); poke8(buf + pos, 32); pos := pos + 1;
+    pos := pdfReal100(buf, pos, b100);
+    pos := pdfStr(buf, pos, " rg\n");
+  }
+
+  pos := pdfStr(buf, pos, "/F");
+  pos := pdfInt(buf, pos, fontIdx);
+  poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal100(buf, pos, size100);
+  pos := pdfStr(buf, pos, " Tf\n");
+  pos := pdfReal100(buf, pos, x100); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal100(buf, pos, y100);
+  pos := pdfStr(buf, pos, " Td\n(");
+
+  var i: int64 := 0;
+  while (i < tlen) {
+    var c: int64 := StrCharAt(text, i);
+    if (c == 40 || c == 41 || c == 92) { poke8(buf + pos, 92); pos := pos + 1; }
+    poke8(buf + pos, c); pos := pos + 1;
+    i := i + 1;
+  }
+  pos := pdfStr(buf, pos, ") Tj\nET\n");
+  arrSet(contentLens, page, pos);
+}
+
+// ============================================================================
+// PdfTextAt — place a string at absolute position (x, y) in points
+// ============================================================================
+
+pub fn PdfTextAt(doc: int64, page: int64, x: f64, y: f64, text: pchar): void {
+  if (doc == 0) { return; }
+  var tlen: int64 := StrLen(text);
+  if (PdfContentEnsure(doc, page, tlen * 2 + 128) == 0) { return; }
+  _textBT(doc, page, f64ToInt100(x), f64ToInt100(y), text, tlen);
+}
+
+// ============================================================================
+// PdfTextBlock — word-wrapped text in a box of given width
+// Lines break at space when the accumulated width exceeds width.
+// Line height = current font size (no leading override — use PdfSetLineSpacing).
+// ============================================================================
+
+pub fn PdfTextBlock(doc: int64, page: int64, x: f64, y: f64, width: f64, text: pchar): void {
+  if (doc == 0) { return; }
+  var fontIdx:  int64 := peek64(doc + PDF_DOC_CURFONTIDX     + page * 8);
+  var size100:  int64 := peek64(doc + PDF_DOC_CURFONTSIZE100 + page * 8);
+  var leadEnc:  int64 := peek64(doc + PDF_DOC_CURTEXTCOLOR   + page * 8) & 0xFFFF;
+  var lead100:  int64 := leadEnc;
+  if (lead100 == 0) { lead100 := size100; }  // default: line height = font size
+
+  var tlen:     int64 := StrLen(text);
+  var width100: int64 := f64ToInt100(width);
+  var x100:     int64 := f64ToInt100(x);
+  var y100:     int64 := f64ToInt100(y);
+
+  var lineStart: int64 := 0;
+  var lastSpace: int64 := -1;
+  var lineW100:  int64 := 0;
+  var i: int64 := 0;
+
+  while (i <= tlen) {
+    var c: int64 := 0;
+    if (i < tlen) { c := StrCharAt(text, i); }
+
+    var cw: int64 := PdfCharWidth(fontIdx, c) * size100 / 1000;
+
+    if (c == 32) {
+      lastSpace := i;
+    }
+
+    if ((lineW100 + cw > width100 && lastSpace >= 0) || c == 0) {
+      var end: int64 := i;
+      if (lineW100 + cw > width100 && lastSpace >= 0) { end := lastSpace; }
+      var segLen: int64 := end - lineStart;
+      if (segLen > 0) {
+        if (PdfContentEnsure(doc, page, segLen * 2 + 128) != 0) {
+          _textBT(doc, page, x100, y100, StrSub(text, lineStart, segLen), segLen);
+        }
+      }
+      y100 := y100 - lead100;
+      if (c == 0) { lineStart := tlen; break; }
+      lineStart := end + 1;  // skip the space
+      lastSpace := -1;
+      lineW100  := 0;
+      i := lineStart;
+      continue;
+    }
+
+    lineW100 := lineW100 + cw;
+    i := i + 1;
+  }
+
+  // Emit any remaining text
+  var remaining: int64 := tlen - lineStart;
+  if (remaining > 0) {
+    if (PdfContentEnsure(doc, page, remaining * 2 + 128) != 0) {
+      _textBT(doc, page, x100, y100, StrSub(text, lineStart, remaining), remaining);
+    }
+  }
+}
