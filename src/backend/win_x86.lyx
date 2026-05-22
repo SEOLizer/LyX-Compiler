@@ -24,14 +24,16 @@
 // ============================================================================
 
 // Preamble size: win_print_str_impl(68) + win_print_int_impl(143) + win_strsub_impl(58)
-con WIN_PREAMBLE_SZ:   int64 := 269;
+//               + win_argv_setup(237)
+con WIN_PREAMBLE_SZ:   int64 := 506;
 con WIN_HELPERS_SZ:    int64 := 287;   // same as Linux CG_H_USER
-con WIN_USER_OFF:      int64 := 556;   // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+con WIN_USER_OFF:      int64 := 793;   // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
 
 // Preamble sub-function offsets within code buffer
 con WIN_PS_OFF:   int64 := 0;     // win_print_str_impl
 con WIN_PI_OFF:   int64 := 68;    // win_print_int_impl
 con WIN_SS_OFF:   int64 := 211;   // win_strsub_impl (68+143)
+con WIN_AS_OFF:   int64 := 269;   // win_argv_setup  (68+143+58)
 
 // Trampoline positions within trampoline zone (relative to WIN_PREAMBLE_SZ)
 con WIN_TR_START:    int64 := 0;    // _start trampoline / impl (65 bytes)
@@ -46,29 +48,33 @@ con WIN_TR_STRCHA:   int64 := 281;  // strcharat (6 bytes, no trampoline needed)
 con WIN_CALL_WF1:  int64 := 56;    // print_str's WriteFile call
 con WIN_CALL_WF2:  int64 := 196;   // print_int's WriteFile call
 con WIN_CALL_VA:   int64 := 237;   // strsub's VirtualAlloc call
-con WIN_CALL_EP:   int64 := 324;   // _start's ExitProcess call  (WIN_PREAMBLE_SZ + 55)
+con WIN_CALL_GCL:  int64 := 284;   // win_argv_setup's GetCommandLineA call (WIN_AS_OFF+15)
+con WIN_CALL_VA2:  int64 := 370;   // win_argv_setup's VirtualAlloc call (WIN_AS_OFF+101)
+con WIN_CALL_EP:   int64 := 561;   // _start's ExitProcess call  (WIN_PREAMBLE_SZ + 55)
 
 // PE layout
 con WIN_IMAGE_BASE:   int64 := 0x140000000;
 con WIN_TEXT_RVA:     int64 := 0x1000;
-con WIN_ENTRY_OFF:    int64 := 269;   // = WIN_PREAMBLE_SZ, _start offset in .text
+con WIN_ENTRY_OFF:    int64 := 506;   // = WIN_PREAMBLE_SZ, _start offset in .text
 con WIN_FILE_ALIGN:   int64 := 0x200;
 con WIN_SEC_ALIGN:    int64 := 0x1000;
 
 // .rdata layout relative offsets (rdataRVA computed dynamically)
 con WIN_RDATA_IDT_OFF:    int64 := 0;    // Import Directory Table (2 * 20 = 40 bytes)
-con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (4 * 8 = 32 bytes)
-con WIN_RDATA_IAT_OFF:    int64 := 72;   // Import Address Table (4 * 8 = 32 bytes)
-con WIN_RDATA_DLL_OFF:    int64 := 104;  // "KERNEL32.dll\0" (13 bytes)
-con WIN_RDATA_WF_NAME:    int64 := 117;  // hint(2) + "WriteFile\0" (12 bytes)
-con WIN_RDATA_EP_NAME:    int64 := 129;  // hint(2) + "ExitProcess\0" (14 bytes)
-con WIN_RDATA_VA_NAME:    int64 := 143;  // hint(2) + "VirtualAlloc\0" (15 bytes)
-con WIN_RDATA_SIZE:       int64 := 158;  // total used bytes in .rdata
+con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (5 * 8 = 40 bytes)
+con WIN_RDATA_IAT_OFF:    int64 := 80;   // Import Address Table (5 * 8 = 40 bytes)
+con WIN_RDATA_DLL_OFF:    int64 := 120;  // "KERNEL32.dll\0" (13 bytes)
+con WIN_RDATA_WF_NAME:    int64 := 133;  // hint(2) + "WriteFile\0" (12 bytes)
+con WIN_RDATA_EP_NAME:    int64 := 145;  // hint(2) + "ExitProcess\0" (14 bytes)
+con WIN_RDATA_VA_NAME:    int64 := 159;  // hint(2) + "VirtualAlloc\0" (15 bytes)
+con WIN_RDATA_GCL_NAME:   int64 := 174;  // hint(2) + "GetCommandLineA\0" (18 bytes)
+con WIN_RDATA_SIZE:       int64 := 192;  // total used bytes in .rdata
 
 // IAT slot offsets within .rdata:
-// WriteFile    = IAT_OFF + 0  = 72
-// ExitProcess  = IAT_OFF + 8  = 80
-// VirtualAlloc = IAT_OFF + 16 = 88
+// WriteFile       = IAT_OFF + 0  = 80
+// ExitProcess     = IAT_OFF + 8  = 88
+// VirtualAlloc    = IAT_OFF + 16 = 96
+// GetCommandLineA = IAT_OFF + 24 = 104
 
 // ============================================================================
 // WinX86Backend
@@ -387,18 +393,170 @@ pub type WinX86Backend = class {
   }
 
   // ------------------------------------------------------------------
+  // Preamble: win_argv_setup (237 bytes, at WIN_AS_OFF=269)
+  // Calls GetCommandLineA() to get the ASCII command line, splits on spaces
+  // into an argv[] array allocated via VirtualAlloc.
+  // Returns: rax = argc (int64), rdx = argv base pointer (pchar*).
+  // Called from _start with a backwards E8 call.
+  //
+  // Byte layout (verified offsets within this function):
+  //   [0..14]   prologue: push r12-r15,rbx,rdi,rsi; sub rsp,0x20
+  //   [15..23]  call [GetCommandLineA_IAT] (WIN_CALL_GCL); mov r13,rax
+  //   [24..31]  phase1 init: xor r12d, xor ebx, xor r14d
+  //   [32..66]  phase1 count-argc loop (NUL-terminated, ASCII)
+  //   [67..109] phase2 alloc: compute size (argc*8+8+strlen+1), VirtualAlloc
+  //   [101..106] call [VirtualAlloc_IAT] (WIN_CALL_VA2 = WIN_AS_OFF+101)
+  //   [107..122] save argv base (rdi), compute string area ptr (rsi)
+  //   [124..131] phase3 init: xor r14d, xor ebx, xor r8d
+  //   [132..185] phase3 fill-argv loop
+  //   [186..196] terminate last token + argv sentinel
+  //   [197..218] return: mov eax,r12d; mov rdx,rdi; restore; ret
+  //   [219..236] 18 NOPs (padding to 237 bytes)
+  // ------------------------------------------------------------------
+
+  fn wxb_emitArgvSetup() {
+    // -- Prologue [0..14] --
+    self.wxb_ce8(0x41); self.wxb_ce8(0x54);  // push r12
+    self.wxb_ce8(0x41); self.wxb_ce8(0x55);  // push r13
+    self.wxb_ce8(0x41); self.wxb_ce8(0x56);  // push r14
+    self.wxb_ce8(0x41); self.wxb_ce8(0x57);  // push r15
+    self.wxb_ce8(0x53);                       // push rbx
+    self.wxb_ce8(0x57);                       // push rdi
+    self.wxb_ce8(0x56);                       // push rsi
+    // sub rsp, 0x20 (32 bytes shadow space; also aligns stack for Windows ABI calls)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20);
+
+    // -- Call GetCommandLineA [15..23] --
+    // Shadow space already allocated above; rsp is 16-aligned here.
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // call [GetCommandLineA_IAT], patched by wxb_patchIAT
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8B); self.wxb_ce8(0xE8);  // mov r13, rax  (ASCII cmdline ptr)
+
+    // -- Phase 1 init [24..31] --
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xE4);  // xor r12d, r12d  (argc=0)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (in_token=0)
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xF6);  // xor r14d, r14d  (i=0)
+
+    // -- Phase 1: count argc [32..66] (NUL-terminated ASCII) --
+    // .cnt_loop: (offset 32)
+    // movzx eax, byte[r13+r14*1+0]  (REX=43: X=r14,B=r13; SIB=35: scale=1,idx=r14,base=r13)
+    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00);
+    self.wxb_ce8(0x84); self.wxb_ce8(0xC0);                       // test al, al  (NUL?)
+    self.wxb_ce8(0x74); self.wxb_ce8(0x19);                       // jz +25 → .cnt_done (offset 67)
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20 (space/ctrl)
+    self.wxb_ce8(0x7E); self.wxb_ce8(0x0E);                       // jle +14 → .cnt_sep (offset 60)
+    self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
+    self.wxb_ce8(0x75); self.wxb_ce8(0x05);                       // jnz +5 → .cnt_next (offset 55)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC4);  // inc r12d  (argc++)
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx   (in_token=1)
+    // .cnt_next: (offset 55)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d  (i++)
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xE4);                       // jmp -28 → .cnt_loop (offset 32)
+    // .cnt_sep: (offset 60)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx  (in_token=0)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xDD);                       // jmp -35 → .cnt_loop (offset 32)
+    // .cnt_done: (offset 67)  r14 = strlen(cmdline)
+
+    // -- Phase 2: VirtualAlloc [67..109] --
+    // size = argc*8 + 8 + strlen + 1
+    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE0);  // mov eax, r12d  (argc)
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC1); self.wxb_ce8(0xE0); self.wxb_ce8(0x03); // shl rax, 3
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC0); self.wxb_ce8(0x08); // add rax, 8
+    self.wxb_ce8(0x49); self.wxb_ce8(0x03); self.wxb_ce8(0xC6);  // add rax, r14  (+ strlen)
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc rax       (+ 1 for null)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xC9);                       // xor ecx, ecx  (lpAddress=0)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC2);  // mov rdx, rax  (dwSize)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x00); self.wxb_ce8(0x30); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r8d, 0x3000
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB9); self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r9d, 4
+    // call [VirtualAlloc_IAT] at offset 101 = WIN_CALL_VA2 - WIN_AS_OFF
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // patched by wxb_patchIAT
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);  // mov rdi, rax  (argv array base)
+
+    // -- Compute string area ptr rsi = rdi + argc*8 + 8 [110..122] --
+    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE6);  // mov esi, r12d  (argc)
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC1); self.wxb_ce8(0xE6); self.wxb_ce8(0x03); // shl rsi, 3
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC6); self.wxb_ce8(0x08); // add rsi, 8
+    self.wxb_ce8(0x48); self.wxb_ce8(0x01); self.wxb_ce8(0xFE);  // add rsi, rdi
+
+    // -- Phase 3 init [124..131] --
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xF6);  // xor r14d, r14d  (i=0)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (in_token=0)
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xC0);  // xor r8d, r8d    (argv_idx=0)
+
+    // -- Phase 3: fill argv [132..185] --
+    // .fill_loop: (offset 132)
+    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00); // movzx eax, byte[r13+r14]
+    self.wxb_ce8(0x84); self.wxb_ce8(0xC0);                       // test al, al
+    self.wxb_ce8(0x74); self.wxb_ce8(0x2C);                       // jz +44 → .fill_done (offset 186)
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20
+    self.wxb_ce8(0x7E); self.wxb_ce8(0x17);                       // jle +23 → .fill_sep (offset 169)
+    self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
+    self.wxb_ce8(0x75); self.wxb_ce8(0x09);                       // jnz +9 → .fill_notnew (offset 159)
+    self.wxb_ce8(0x4A); self.wxb_ce8(0x89); self.wxb_ce8(0x34); self.wxb_ce8(0xC7); // mov [rdi+r8*8], rsi
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc r8d
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx
+    // .fill_notnew: (offset 159)
+    self.wxb_ce8(0x88); self.wxb_ce8(0x06);                       // mov [rsi], al
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc rsi
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xDB);                       // jmp -37 → .fill_loop (offset 132)
+    // .fill_sep: (offset 169)
+    self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
+    self.wxb_ce8(0x74); self.wxb_ce8(0x08);                       // jz +8 → .fill_nosep (offset 181)
+    self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x00);  // mov byte[rsi], 0
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc rsi
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx
+    // .fill_nosep: (offset 181)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
+    self.wxb_ce8(0xEB); self.wxb_ce8(0xCA);                       // jmp -54 → .fill_loop (offset 132)
+    // .fill_done: (offset 186)
+
+    // -- Terminate last token and argv sentinel [186..196] --
+    self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x00);  // mov byte[rsi], 0
+    self.wxb_ce8(0x4A); self.wxb_ce8(0xC7); self.wxb_ce8(0x04); self.wxb_ce8(0xC7);
+    self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov qword[rdi+r8*8], 0
+
+    // -- Return: rax=argc, rdx=argv [197..218] --
+    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE0);  // mov eax, r12d
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xFA);  // mov rdx, rdi
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x20); // add rsp, 0x20
+    self.wxb_ce8(0x5E);                       // pop rsi
+    self.wxb_ce8(0x5F);                       // pop rdi
+    self.wxb_ce8(0x5B);                       // pop rbx
+    self.wxb_ce8(0x41); self.wxb_ce8(0x5F);  // pop r15
+    self.wxb_ce8(0x41); self.wxb_ce8(0x5E);  // pop r14
+    self.wxb_ce8(0x41); self.wxb_ce8(0x5D);  // pop r13
+    self.wxb_ce8(0x41); self.wxb_ce8(0x5C);  // pop r12
+    self.wxb_ce8(0xC3);                       // ret
+
+    // -- Padding [219..236]: 18 NOPs to reach exactly 237 bytes --
+    var p: int64 := 0;
+    while (p < 18) { self.wxb_ce8(0x90); p := p + 1; }
+    // Total: 237 bytes ✓
+  }
+
+  // ------------------------------------------------------------------
   // Trampoline zone: _start (65 bytes, at code WIN_PREAMBLE_SZ+0)
-  // Entry point. Sets up shadow space, calls main, calls ExitProcess.
+  // Entry point. Sets up shadow space, calls win_argv_setup (backwards E8
+  // call into preamble), moves argc→rdi, argv→rsi, then calls main.
   // rel32 for call main copied from Linux cgBuf[49..52].
   // rel32 for ExitProcess IAT patched in wxb_patchIAT.
   // ------------------------------------------------------------------
 
   fn wxb_emitStart(relMain: int64) {
-    // sub rsp, 40  (shadow32 + align8; RSP was 16n-8 at entry) 4 bytes [0..3]
+    // sub rsp, 40  [0..3]
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x28);
-    // 44 NOPs  [4..47]
+    // call win_argv_setup  E8 rel32  [4..8]
+    // _start is at WIN_PREAMBLE_SZ=506; call at 506+4=510; end=515; target=WIN_AS_OFF=269
+    // rel32 = 269-515 = -246 = 0xFFFFFF0A
+    self.wxb_ce8(0xE8); self.wxb_ce32(-246);
+    // mov rdi, rax  (argc → first SysV arg)  [9..11]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);
+    // mov rsi, rdx  (argv → second SysV arg) [12..14]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xD6);
+    // 33 NOPs  [15..47]
     var i: int64 := 0;
-    while (i < 44) { self.wxb_ce8(0x90); i := i + 1; }
+    while (i < 33) { self.wxb_ce8(0x90); i := i + 1; }
     // call main  E8 rel32  [48..52]
     self.wxb_ce8(0xE8); self.wxb_ce32(relMain);
     // mov ecx, eax  (exit code = main() return value)  2 bytes [53..54]
@@ -430,11 +588,11 @@ pub type WinX86Backend = class {
   // ------------------------------------------------------------------
   // Trampoline zone: print_str JMP trampoline (26 bytes, at code WIN_PREAMBLE_SZ+80)
   // Jumps backward to win_print_str_impl at code[0].
-  // rel32 = 0 - (WIN_PREAMBLE_SZ + 80 + 5) = -354
+  // rel32 = 0 - (WIN_PREAMBLE_SZ + 80 + 5) = 0 - 591 = -591
   // ------------------------------------------------------------------
 
   fn wxb_emitPrintStrJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(-354);  // JMP to WIN_PS_OFF = 0
+    self.wxb_ce8(0xE9); self.wxb_ce32(-591);  // JMP to WIN_PS_OFF = 0
     var i: int64 := 0;
     while (i < 21) { self.wxb_ce8(0x90); i := i + 1; }
     // 26 bytes ✓
@@ -443,11 +601,11 @@ pub type WinX86Backend = class {
   // ------------------------------------------------------------------
   // Trampoline zone: print_int JMP trampoline (104 bytes, at code WIN_PREAMBLE_SZ+106)
   // Jumps backward to win_print_int_impl at code[68].
-  // rel32 = 68 - (WIN_PREAMBLE_SZ + 106 + 5) = 68 - 380 = -312
+  // rel32 = 68 - (WIN_PREAMBLE_SZ + 106 + 5) = 68 - 617 = -549
   // ------------------------------------------------------------------
 
   fn wxb_emitPrintIntJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(-312);  // JMP to WIN_PI_OFF = 68
+    self.wxb_ce8(0xE9); self.wxb_ce32(-549);  // JMP to WIN_PI_OFF = 68
     var i: int64 := 0;
     while (i < 99) { self.wxb_ce8(0x90); i := i + 1; }
     // 104 bytes ✓
@@ -456,11 +614,11 @@ pub type WinX86Backend = class {
   // ------------------------------------------------------------------
   // Trampoline zone: strsub JMP trampoline (71 bytes, at code WIN_PREAMBLE_SZ+210)
   // Jumps backward to win_strsub_impl at code[211].
-  // rel32 = 211 - (WIN_PREAMBLE_SZ + 210 + 5) = 211 - 484 = -273
+  // rel32 = 211 - (WIN_PREAMBLE_SZ + 210 + 5) = 211 - 721 = -510
   // ------------------------------------------------------------------
 
   fn wxb_emitStrSubJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(-273);  // JMP to WIN_SS_OFF = 211
+    self.wxb_ce8(0xE9); self.wxb_ce32(-510);  // JMP to WIN_SS_OFF = 211
     var i: int64 := 0;
     while (i < 66) { self.wxb_ce8(0x90); i := i + 1; }
     // 71 bytes ✓
@@ -487,10 +645,11 @@ pub type WinX86Backend = class {
     // .rdata starts at next page boundary after .text
     var rdataRVA: int64 := (WIN_TEXT_RVA + codeLen + WIN_SEC_ALIGN - 1) & ~(WIN_SEC_ALIGN - 1);
 
-    // IAT slot RVAs
+    // IAT slot RVAs (IAT_OFF=80; each slot is 8 bytes)
     var wfRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 0;   // WriteFile
     var epRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 8;   // ExitProcess
     var vaRVA:  int64 := rdataRVA + WIN_RDATA_IAT_OFF + 16;  // VirtualAlloc
+    var gclRVA: int64 := rdataRVA + WIN_RDATA_IAT_OFF + 24;  // GetCommandLineA
 
     // Each call [X_IAT] at code offset K: rel32 = X_RVA - (TEXT_RVA + K + 6)
     // rel32 field is at code[K+2]
@@ -508,17 +667,27 @@ pub type WinX86Backend = class {
     var r3: int64 := vaRVA - (textBase + WIN_CALL_VA + 6);
     self.wxb_patch32(WIN_CALL_VA + 2, r3);
 
-    // _start ExitProcess call at code[324], instruction end at 330
+    // win_argv_setup GetCommandLineA call at code[284], instruction end at 290
+    var r5: int64 := gclRVA - (textBase + WIN_CALL_GCL + 6);
+    self.wxb_patch32(WIN_CALL_GCL + 2, r5);
+
+    // win_argv_setup VirtualAlloc call at code[370], instruction end at 376
+    var r6: int64 := vaRVA - (textBase + WIN_CALL_VA2 + 6);
+    self.wxb_patch32(WIN_CALL_VA2 + 2, r6);
+
+    // _start ExitProcess call at code[561], instruction end at 567
     var r4: int64 := epRVA - (textBase + WIN_CALL_EP + 6);
     self.wxb_patch32(WIN_CALL_EP + 2, r4);
   }
 
   // ------------------------------------------------------------------
   // Build the Windows code buffer from a Linux cgBuf.
-  // Layout: preamble (269) + trampoline zone (287) + user code (cgLen-287).
+  // Layout: preamble (506) + trampoline zone (287) + user code (cgLen-287) + data.
+  // The data buffer is appended directly after the code so that RIP-relative
+  // disp32 values computed by cg_patchAll() remain valid in the PE .text section.
   // ------------------------------------------------------------------
 
-  fn wxb_buildCode(cgBuf: int64, cgLen: int64) {
+  fn wxb_buildCode(cgBuf: int64, cgLen: int64, cgData: int64, cgDataLen: int64) {
     // Extract call-main rel32 from Linux _start (patched at cgBuf[49..52])
     var b0: int64 := peek8(cgBuf + 49);
     var b1: int64 := peek8(cgBuf + 50);
@@ -530,24 +699,34 @@ pub type WinX86Backend = class {
       relMain := relMain | ((-1) & ~0xFFFFFFFF);
     }
 
-    // Emit preamble (WIN_PREAMBLE_SZ = 269 bytes)
+    // Emit preamble (WIN_PREAMBLE_SZ = 506 bytes)
     self.wxb_emitPrintStr();     // 68 bytes, offsets 0..67
     self.wxb_emitPrintInt();     // 143 bytes, offsets 68..210
     self.wxb_emitStrSub();       // 58 bytes, offsets 211..268
+    self.wxb_emitArgvSetup();    // 237 bytes, offsets 269..505
 
     // Emit trampoline zone (WIN_HELPERS_SZ = 287 bytes)
-    self.wxb_emitStart(relMain); // 65 bytes, offsets 269..333
-    self.wxb_emitStrlen();       // 15 bytes, offsets 334..348
-    self.wxb_emitPrintStrJmp();  // 26 bytes, offsets 349..374
-    self.wxb_emitPrintIntJmp();  // 104 bytes, offsets 375..478
-    self.wxb_emitStrSubJmp();    // 71 bytes, offsets 479..549
-    self.wxb_emitStrCharAt();    // 6 bytes, offsets 550..555
+    self.wxb_emitStart(relMain); // 65 bytes, offsets 506..570
+    self.wxb_emitStrlen();       // 15 bytes, offsets 571..585
+    self.wxb_emitPrintStrJmp();  // 26 bytes, offsets 586..611
+    self.wxb_emitPrintIntJmp();  // 104 bytes, offsets 612..715
+    self.wxb_emitStrSubJmp();    // 71 bytes, offsets 716..786
+    self.wxb_emitStrCharAt();    // 6 bytes, offsets 787..792
 
     // Copy user code verbatim (all rel32 values remain correct)
     var i: int64 := WIN_HELPERS_SZ;
     while (i < cgLen) {
       self.wxb_ce8(peek8(cgBuf + i));
       i := i + 1;
+    }
+
+    // Append data buffer so that RIP-relative LEA disp32 values are correct.
+    // cg_patchAll computed disp32 = codeLen - codeOff - 4 + dataOff, which
+    // assumes data follows code at exactly offset WIN_PREAMBLE_SZ + cgLen.
+    var j: int64 := 0;
+    while (j < cgDataLen) {
+      self.wxb_ce8(peek8(cgData + j));
+      j := j + 1;
     }
 
     // Patch IAT indirect call rel32 fields now that codeLen is final
@@ -568,15 +747,17 @@ pub type WinX86Backend = class {
     self.wxb_oe32(rdataRVA + WIN_RDATA_IAT_OFF);   // FirstThunk = IAT RVA
     // --- IDT Entry 1: null terminator ---
     self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0); self.wxb_oe32(0);
-    // --- INT (Import Name Table): 3 entries + null ---
+    // --- INT (Import Name Table): 4 entries + null ---
     self.wxb_oe64(rdataRVA + WIN_RDATA_WF_NAME);   // WriteFile
     self.wxb_oe64(rdataRVA + WIN_RDATA_EP_NAME);   // ExitProcess
     self.wxb_oe64(rdataRVA + WIN_RDATA_VA_NAME);   // VirtualAlloc
+    self.wxb_oe64(rdataRVA + WIN_RDATA_GCL_NAME);  // GetCommandLineA
     self.wxb_oe64(0);                               // null terminator
     // --- IAT (Import Address Table): same as INT initially ---
     self.wxb_oe64(rdataRVA + WIN_RDATA_WF_NAME);
     self.wxb_oe64(rdataRVA + WIN_RDATA_EP_NAME);
     self.wxb_oe64(rdataRVA + WIN_RDATA_VA_NAME);
+    self.wxb_oe64(rdataRVA + WIN_RDATA_GCL_NAME);
     self.wxb_oe64(0);
     // --- DLL name: "KERNEL32.dll\0" (13 bytes) ---
     self.wxb_oe8(75);  // K
@@ -608,7 +789,13 @@ pub type WinX86Backend = class {
     self.wxb_oe8(117); self.wxb_oe8(97);  self.wxb_oe8(108); self.wxb_oe8(65);  // ualA
     self.wxb_oe8(108); self.wxb_oe8(108); self.wxb_oe8(111); self.wxb_oe8(99);  // lloc
     self.wxb_oe8(0);    // NUL
-    // Total .rdata used: 158 bytes. Pad to FILE_ALIGNMENT = 512.
+    // --- hint + "GetCommandLineA\0" (18 bytes) ---
+    self.wxb_oe16(0);   // hint
+    self.wxb_oe8(71);  self.wxb_oe8(101); self.wxb_oe8(116); self.wxb_oe8(67);  // GetC
+    self.wxb_oe8(111); self.wxb_oe8(109); self.wxb_oe8(109); self.wxb_oe8(97);  // omma
+    self.wxb_oe8(110); self.wxb_oe8(100); self.wxb_oe8(76);  self.wxb_oe8(105); // ndLi
+    self.wxb_oe8(110); self.wxb_oe8(101); self.wxb_oe8(65);  self.wxb_oe8(0);   // neA NUL
+    // Total .rdata used: 192 bytes. Pad to FILE_ALIGNMENT = 512.
     self.wxb_oZeros(WIN_FILE_ALIGN - WIN_RDATA_SIZE);
   }
 
@@ -737,7 +924,7 @@ pub type WinX86Backend = class {
     self.wxb_oe32(0); self.wxb_oe32(0);  // [9] TLS
     self.wxb_oe32(0); self.wxb_oe32(0);  // [10] LoadConfig
     self.wxb_oe32(0); self.wxb_oe32(0);  // [11] BoundImport
-    self.wxb_oe32(rdataRVA + WIN_RDATA_IAT_OFF); self.wxb_oe32(32);  // [12] IAT
+    self.wxb_oe32(rdataRVA + WIN_RDATA_IAT_OFF); self.wxb_oe32(40);  // [12] IAT
     self.wxb_oe32(0); self.wxb_oe32(0);  // [13] DelayImport
     self.wxb_oe32(0); self.wxb_oe32(0);  // [14] CLR
     self.wxb_oe32(0); self.wxb_oe32(0);  // [15] Reserved
@@ -795,8 +982,8 @@ pub type WinX86Backend = class {
   // Public API
   // ------------------------------------------------------------------
 
-  pub fn Build(cgBuf: int64, cgLen: int64) {
-    self.wxb_buildCode(cgBuf, cgLen);
+  pub fn Build(cgBuf: int64, cgLen: int64, cgData: int64, cgDataLen: int64) {
+    self.wxb_buildCode(cgBuf, cgLen, cgData, cgDataLen);
   }
 
   pub fn WritePE64(path: pchar) {
