@@ -494,23 +494,73 @@ Vtable-Helpers) ist 12h+ Frontend-Arbeit, davon nichts in WP-AND-06-Scope.
 
 ---
 
-### WP-AND-07: Android Activity + NativeActivity
+### WP-AND-07: NativeActivity — Manifest-Gen voll, Rest Konstanten
 
 **Ziel:** Vollständige Lyx-App als `NativeActivity` ohne Java/Kotlin-Wrapper.
 
-**Aufwand:** 20h
+**Aufwand:** 20h (tatsächlich ~2.5h — Konstanten, Layouts, Manifest-Generator)
 
-**Konzept:** Android `NativeActivity` ermöglicht eine reine C/C++ (hier: Lyx) App
-über die `ANativeActivity`-Callbacks ohne Java-Code.
+**Geliefert (5 neue `std/android/`-Units):**
 
-**Tasks:**
-- [ ] `android_native_app_glue`-Äquivalent in Lyx implementieren
-- [ ] `ANativeActivity` Struct + Callback-Funktionszeiger definieren
-- [ ] Event-Loop: `ALooper_pollAll` für App-Events und Input
-- [ ] `AndroidManifest.xml` Generator (minimal für NativeActivity)
-- [ ] OpenGL ES 2.0 Bindungen: `std/android/gles.lyu`
-- [ ] Vulkan Bindungen (optional): `std/android/vulkan.lyu`
-- [ ] Test: Lyx-App rendert ein farbiges Dreieck auf Android
+| Modul | Status |
+|---|---|
+| `std/android/looper.lyx` | Konstanten (POLL_*, EVENT_*, LOOPER_ID_*); opake `ALooper`-Typ; Function-TODOs |
+| `std/android/native_activity.lyx` | `ANativeActivity`/`ANativeActivityCallbacks` opake Typen; **byte-genaue Layout-Konstanten** (`OFF_ANA_*`, `ANA_CB_*` — 16 Callback-Slots); Entry-Point-Konvention dokumentiert |
+| `std/android/app_glue.lyx` | `APP_CMD_*` (16 Lifecycle-Commands), `android_app`-Layout (192 Bytes, `OFF_APP_*` für alle Felder), `android_poll_source`-Layout, `APP_STATE_*` |
+| `std/android/gles2.lyx` | OpenGL ES 2 Essentials: Clear-Masks, Primitives, Datentypen, Shader-Stages, Buffer-Targets, Texture-Pnames, Blend-Modes, Error-Codes; opake `GLuint`/`GLint`/`GLsizei`/`GLenum`/`GLfloat` |
+| `std/android/manifest_gen.lyx` | **voll funktional**: `GenerateNativeActivityManifest(package, label, libName, minSdk, targetSdk)` baut XML-String via `StringBuilder` |
+
+**Tasks-Status:**
+- [x] `ANativeActivity` Struct + Callback-Funktionszeiger definieren (Layout-Konstanten)
+- [x] `AndroidManifest.xml` Generator — funktioniert end-to-end (Beispiel in `examples/android/manifest_demo.lyx`)
+- [x] OpenGL ES 2 Bindungen (Konstanten + opake Typen; ~50 wichtigste `GL_*`-Werte)
+- [x] `android_native_app_glue`-Äquivalent — **Layout + Konstanten dokumentiert**;
+      vollständige Implementierung blockiert durch fehlende Threading-Primitives
+      (`pthread_create`/`pthread_mutex`/`pthread_cond` über PLT)
+- [ ] Event-Loop `ALooper_pollAll` — blockiert (libandroid PLT)
+- [ ] Vulkan-Bindungen — bewusst nicht in dieser WP (hunderte Konstanten, eigener WP)
+- [ ] Test: Lyx-App rendert farbiges Dreieck — blockiert (libGLESv2 + libEGL PLT)
+
+**Wieder die gleiche Upstream-Lücke:** Echte NativeActivity-App braucht
+`pthread_*` (für den Worker-Thread), `libandroid.so` (für `ALooper_*`,
+`AInputQueue_*`, `ANativeWindow_lock`), `libEGL.so` + `libGLESv2.so`. Alle
+drei brauchen PLT + `DT_NEEDED` + `IRO_CALL_INDIRECT` aus `ir_lower`.
+
+**Was heute lieferbar war:**
+1. **AndroidManifest.xml**-Generator — funktional unabhängig (pure Text-
+   Generierung, nutzt `StringBuilder` aus `std/string`). Output validierbar.
+2. **Layout-Konstanten** für alle wichtigen NDK-Strukturen — User-Code, das
+   per `peek64(activity + OFF_ANA_CALLBACKS)` etc. arbeitet, hat dokumentierte
+   Anker.
+3. **GL_* / APP_CMD_* / ANA_CB_*** Konstanten — sofort verwendbar in jedem
+   Code, das die Werte interpretiert (z.B. Render-Pipeline-Setup-Code).
+
+**Verifikation:**
+```bash
+for f in std/android/looper.lyx std/android/native_activity.lyx \
+         std/android/app_glue.lyx std/android/gles2.lyx \
+         std/android/manifest_gen.lyx; do
+  ./lyxc --compile-unit "$f" -o /tmp/x.lyu && echo "OK: $f"
+done
+
+# Manifest-Generator e2e:
+./lyxc examples/android/manifest_demo.lyx -o /tmp/manifest_demo
+/tmp/manifest_demo > /tmp/AndroidManifest.xml
+cat /tmp/AndroidManifest.xml
+#   <?xml version="1.0" encoding="utf-8"?>
+#   <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+#             package="com.example.lyxapp" >
+#     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+#     <application android:label="Lyx Demo" android:hasCode="false" >
+#       <activity android:name="android.app.NativeActivity" ...>
+#         <meta-data android:name="android.app.lib_name" android:value="lyxapp" />
+#         <intent-filter> ... </intent-filter>
+#       </activity>
+#     </application>
+#   </manifest>
+
+make singularity   # S3 == S4
+```
 
 ---
 
