@@ -282,19 +282,37 @@ Zweiter Anlauf am gleichen Tag, mit zwei Erkenntnissen aus dem v1-Hang:
   von @jni-Funktionen darüber aufrufen. Beispiel:
   `examples/android/jni_callback_local.lyx`.
 
-**Was NOCH offen ist (Folge-Fix):**
-- Imports werden nicht ins selbe IR-Modul gelowert. `import std.android.jni;`
-  registriert die JNI-Wrapper bei Sema, aber `ir_lower.lowerModule` walkt
-  nur Top-Level `NK_FUNC_DECL` des Main-Files — nicht die Decls importierter
-  Module. Daher schlägt die Suche nach `JNI_NewStringUTF` fehl und fällt
-  auf die alte `IRO_CALL_BUILTIN`-Fallback zurück.
-- Forward-Referenzen: Caller VOR Callee deklariert geht nicht (Callee
-  noch nicht in `funcBuffer`). Workaround: Helper an den Anfang des Files.
+**v3 — Import-Lowering nachgereicht:**
+`lowerModule` walkt jetzt `NK_IMPORT`-Knoten und lädt+parsed die Datei
+inline, swappt `self.src/nodes/nodeCount` und rekursiert. Dadurch landen
+die Funktionsbodies importierter Module im selben IR-Modul wie der
+Caller, und `lowerCall`'s Name-Lookup findet sie.
 
-**Drei nutzbare JNI-Callback-Patterns (in `examples/android/`):**
+**Verifiziert:** `jni_callback_test.lyx` (das `import std.android.jni`
+nutzt und `JNI_NewStringUTF(env, "...")` aufruft) kompiliert nun mit
+**20 BLR x9 + 20 BL** im finalen `.so`. Die 17 JNI-Wrapper aus
+`std/android/jni.lyx` (`JNI_GetVersion`, `JNI_NewStringUTF`, etc.) sind
+damit aus User-Code direkt aufrufbar — kein Local-Wrapper-Pattern mehr
+nötig.
+
+Singularity hält (Hash `e7e04690...`).
+
+**Bleibt offen (kleinere Lücken):**
+- Forward-Referenzen im selben File (Caller VOR Callee) brauchen einen
+  Pre-Pass in lowerModule. Source-Order-Workaround heute.
+- Import-Pfad-Resolution nutzt CWD-relativ; sema's `includePath`/`stdPath`-
+  Fallback ist nicht dupliziert. Reicht für Tests aus dem Projekt-Root,
+  könnte bei kompliziertem Build-Layout später hinzukommen.
+- Import-Deduplizierung fehlt: wenn `std.io` von 5 Files importiert wird,
+  parsed ir_lower es 5x. Funktional ok, nur Perf-Cost.
+
+**Nutzbare JNI-Callback-Patterns (in `examples/android/`):**
 1. `jni_native_add.lyx` — Pure-Compute, kein JNIEnv-Zugriff
 2. `jni_callback_inline.lyx` — Inline-Vtable-Peek pro @jni-Funktion
-3. `jni_callback_local.lyx` — Local Wrapper im selben File, dann darüber rufen
+3. `jni_callback_local.lyx` — Local Wrapper im selben File
+4. **Direkt** — `import std.android.jni;` + `JNI_NewStringUTF(env, "…")`
+   funktioniert jetzt (siehe `/tmp/jni_callback_test.lyx`-Snippet im
+   Verifikations-Block oben)
 
 **Verifikation Phase C:**
 ```bash
