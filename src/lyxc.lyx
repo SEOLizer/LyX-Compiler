@@ -211,6 +211,16 @@ pub type CompilerConfig = class {
   // WP-AND-02: shared library output (--output-type=shared-lib / --shared)
   outputType:    int64;   // OUTPUT_TYPE_EXECUTABLE (default) | OUTPUT_TYPE_SHARED_LIB
 
+  // WP-AND-02 Phase B: export table populated by codegen, consumed by writeELFSharedLib.
+  // Layout: 24-byte records [nameOff:i64, nameLen:i64, stValue:i64].
+  exportBuf:     int64;
+  exportCount:   int64;
+  exportSrc:     int64;   // pchar to parser.src for resolving nameOff
+  // Stub bytes prepended to .text by emitARM64 (12 for _start; 0 for shared-lib mode).
+  codeStubOff:   int64;
+  // funcAddrs pointer from EmitARM64 (funcId -> offset_in_irCodeBuf), used to look up export offsets.
+  codeFuncAddrs: int64;
+
   // Compilation state
   exitCode: int64;
   earlyExit: bool;
@@ -275,6 +285,11 @@ pub type CompilerConfig = class {
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
     self.outputType     := OUTPUT_TYPE_EXECUTABLE;
+    self.exportBuf      := 0;
+    self.exportCount    := 0;
+    self.exportSrc      := 0;
+    self.codeStubOff    := 0;
+    self.codeFuncAddrs  := 0;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -1186,6 +1201,11 @@ pub type CompilerConfig = class {
       outFile := "a.out"c;
     }
 
+    // WP-AND-02 Phase B: collect @export functions for shared-library symbol table.
+    if self.outputType == OUTPUT_TYPE_SHARED_LIB {
+      self.buildExportList(parser, astRoot);
+    }
+
     var writeResult: bool := self.writeBinary(outFile, codeBuffer, self.codeSize);
     
     if not writeResult {
@@ -1415,12 +1435,24 @@ pub type CompilerConfig = class {
       emitter.emit();
       var irCodeLen: int64 := emitter.getCodeLen();
       var irCodeBuf: int64 := emitter.getCodeBuf();
+      // WP-AND-02 Phase B: expose funcAddrs for export-table building.
+      self.codeFuncAddrs := emitter.getFuncAddrs();
+
+      // WP-AND-02 Phase B: for shared libraries skip the executable _start stub.
+      // The Android loader never invokes a .so's e_entry; the stub would be dead
+      // code that pushes exported function offsets by 12 bytes.
+      if self.outputType == OUTPUT_TYPE_SHARED_LIB {
+        self.codeStubOff := 0;
+        self.codeSize := irCodeLen;
+        return irCodeBuf;
+      }
 
       // Prepend 12-byte _start stub: BL main + exit syscall
       // _start (offset 0): BL main  (main is at offset 12, imm26 delta = 3)
       // _start (offset 4): MOVZ x8, #93 (SYS_EXIT)
       // _start (offset 8): SVC #0
       // main   (offset 12): IR-emitted function code
+      self.codeStubOff := 12;
       var totalLen: int64 := 12 + irCodeLen;
       var newBuf: int64 := mmap(0, 131072, 3, 34, -1, 0);
 
@@ -1697,6 +1729,56 @@ pub type CompilerConfig = class {
   // Binary Writing
   // ---------------------------------------------------------------------------
   
+  // WP-AND-02 Phase B: collect @export-annotated top-level functions into
+  // self.exportBuf (24-byte records: [nameOff:i64, nameLen:i64, stValue:i64]).
+  // Relies on the invariant that ir_lower's lowerModule processes top-level
+  // NK_FUNC_DECL nodes in source order, so funcId N == N-th @export-eligible
+  // function in the AST.
+  fn buildExportList(parser: Parser, astRoot: int64): void {
+    // Pass 1: count.
+    var count: int64 := 0;
+    var cur: int64 := astRoot;
+    while cur >= 0 {
+      var off: int64 := parser.nodes + cur * PARSER_NODE_SIZE;
+      var kind: int64 := peek64(off + 0);
+      if kind == NK_FUNC_DECL {
+        var anno: int64 := peek64(off + 56);
+        if (anno & ANNO_EXPORT) != 0 { count := count + 1; }
+      }
+      cur := peek64(off + 40);   // .next
+    }
+
+    self.exportCount := count;
+    self.exportSrc   := parser.src as int64;
+    if count == 0 { self.exportBuf := 0; return; }
+    if self.codeFuncAddrs == 0 { self.exportBuf := 0; self.exportCount := 0; return; }
+
+    // Pass 2: fill records.
+    self.exportBuf := mmap(0, count * 24, 3, 34, -1, 0);
+    var idx:    int64 := 0;
+    var funcId: int64 := 0;
+    cur := astRoot;
+    while cur >= 0 {
+      var off2:  int64 := parser.nodes + cur * PARSER_NODE_SIZE;
+      var kind2: int64 := peek64(off2 + 0);
+      if kind2 == NK_FUNC_DECL {
+        var anno2: int64 := peek64(off2 + 56);
+        if (anno2 & ANNO_EXPORT) != 0 {
+          var nameOff: int64 := peek64(off2 + 64);
+          var nameLen: int64 := peek64(off2 + 72);
+          var addr:    int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
+          var rec:     int64 := self.exportBuf + idx * 24;
+          poke64(rec +  0, nameOff);
+          poke64(rec +  8, nameLen);
+          poke64(rec + 16, addr);
+          idx := idx + 1;
+        }
+        funcId := funcId + 1;
+      }
+      cur := peek64(off2 + 40);
+    }
+  }
+
   fn writeBinary(path: pchar, code: int64, size: int64): bool {
     if self.format == FORMAT_ELF {
       if self.outputType == OUTPUT_TYPE_SHARED_LIB {
@@ -1817,8 +1899,10 @@ pub type CompilerConfig = class {
   }
 
   // WP-AND-02: ELF Shared Library writer (ET_DYN).
-  // Produces a minimum-viable .so with .dynamic, .dynsym, .dynstr, .hash.
-  // No symbol exports yet (Phase B), no R_AARCH64_* relocations (Phase C).
+  // Produces a .so with .dynamic, .dynsym, .dynstr, .hash. WP-AND-02 Phase B
+  // adds real symbol exports collected by buildExportList; .dynsym entry 0
+  // remains an UNDEF sentinel, and entries 1..N are STB_GLOBAL|STT_FUNC.
+  // R_AARCH64_* relocations are still deferred to Phase C.
   fn writeELFSharedLib(path: pchar, code: int64, size: int64): bool {
     // Derive SONAME basename from output path (after the last '/').
     var pathLen: int64 := StrLen(path);
@@ -1829,6 +1913,19 @@ pub type CompilerConfig = class {
       k := k + 1;
     }
     var soNameLen: int64 := pathLen - baseStart;
+
+    // ---- Export-table sizing (Phase B) ----
+    var expCount: int64 := self.exportCount;
+    var expBuf:   int64 := self.exportBuf;
+    var expSrc:   int64 := self.exportSrc;
+
+    // Sum of all export name lengths (each followed by a NUL in .dynstr).
+    var expNamesBytes: int64 := 0;
+    var ei: int64 := 0;
+    while ei < expCount {
+      expNamesBytes := expNamesBytes + peek64(expBuf + ei * 24 + 8) + 1;
+      ei := ei + 1;
+    }
 
     // ---- File layout planning ----
     var ehSize:     int64 := 64;
@@ -1845,12 +1942,17 @@ pub type CompilerConfig = class {
     var dynOff:     int64 := dataOff;
     var dynSize:    int64 := dynNum * 16;
     var dynsymOff:  int64 := dynOff + dynSize;
-    var dynsymSize: int64 := 24;    // 1 UNDEF entry
+    // 1 UNDEF entry + 1 entry per exported function.
+    var dynsymSize: int64 := (1 + expCount) * 24;
     var dynstrOff:  int64 := dynsymOff + dynsymSize;
-    var dynstrSize: int64 := 1 + soNameLen + 1; // \0 + soname + \0
+    // \0 + soname + \0 + (export-names + \0)*
+    var dynstrSize: int64 := 1 + soNameLen + 1 + expNamesBytes;
     var hashOffRaw: int64 := dynstrOff + dynstrSize;
     var hashOff:    int64 := ((hashOffRaw + 7) / 8) * 8;
-    var hashSize:   int64 := 16;
+    // SYSV hash: 8-byte header + 4*nbucket + 4*nchain; we use a single bucket.
+    var hashNbucket: int64 := 1;
+    var hashNchain:  int64 := 1 + expCount;
+    var hashSize:    int64 := 8 + 4 * hashNbucket + 4 * hashNchain;
     var fileSize:   int64 := hashOff + hashSize;
 
     // ---- Allocate + zero buffer ----
@@ -1944,9 +2046,6 @@ pub type CompilerConfig = class {
     // DT_NULL = 0 (terminator)
     poke64(buf + d, 0);         poke64(buf + d + 8, 0);
 
-    // ---- .dynsym: single UNDEF entry (all zeros) ----
-    // Bytes already zero from the initial fill — nothing to do.
-
     // ---- .dynstr ----
     // Byte 0: NUL (already zero)
     // Bytes 1..1+soNameLen: SONAME basename
@@ -1955,13 +2054,66 @@ pub type CompilerConfig = class {
       poke8(buf + dynstrOff + 1 + si, peek8(path + baseStart + si));
       si := si + 1;
     }
-    // Trailing NUL is already zero.
+    // Trailing NUL after soname is already zero from the initial fill.
+
+    // Append exported function names; record each one's offset into .dynstr
+    // so the matching .dynsym entry can reference it via st_name.
+    var nextStr: int64 := 1 + soNameLen + 1;       // .dynstr cursor (relative)
+    var ej: int64 := 0;
+    while ej < expCount {
+      var rec: int64 := expBuf + ej * 24;
+      var nOff: int64 := peek64(rec + 0);          // offset into parser source
+      var nLen: int64 := peek64(rec + 8);
+      var nameStart: int64 := nextStr;             // record where this name lands
+      var ci: int64 := 0;
+      while ci < nLen {
+        poke8(buf + dynstrOff + nextStr + ci, peek8(expSrc + nOff + ci));
+        ci := ci + 1;
+      }
+      nextStr := nextStr + nLen + 1;               // +1 for NUL
+      // Stash the dynstr-relative offset back into the record's nameOff slot
+      // so the .dynsym writer below can reuse it without recomputing.
+      poke64(rec + 0, nameStart);
+      ej := ej + 1;
+    }
+
+    // ---- .dynsym ----
+    // Entry 0 is UNDEF (all zeros from the initial fill).
+    // Entries 1..1+expCount: STB_GLOBAL | STT_FUNC, st_shndx = 1 (placeholder).
+    var ek: int64 := 0;
+    while ek < expCount {
+      var rec2:  int64 := expBuf + ek * 24;
+      var dnOff: int64 := peek64(rec2 + 0);        // offset into .dynstr (set above)
+      var addr:  int64 := peek64(rec2 + 16);       // st_value
+      var symOff: int64 := dynsymOff + (1 + ek) * 24;
+      poke32(buf + symOff + 0,  dnOff);            // st_name
+      poke8(buf + symOff + 4,   0x12);             // st_info = (STB_GLOBAL<<4)|STT_FUNC
+      poke8(buf + symOff + 5,   0);                // st_other
+      poke16(buf + symOff + 6,  1);                // st_shndx (placeholder, any non-zero)
+      poke64(buf + symOff + 8,  addr);             // st_value
+      poke64(buf + symOff + 16, 0);                // st_size (unknown)
+      ek := ek + 1;
+    }
 
     // ---- .hash (DT_HASH classic SYSV format) ----
-    poke32(buf + hashOff + 0,  1);   // nbucket
-    poke32(buf + hashOff + 4,  1);   // nchain
-    poke32(buf + hashOff + 8,  0);   // bucket[0] = 0 (-> UNDEF symbol)
-    poke32(buf + hashOff + 12, 0);   // chain[0]  = 0 (end of chain)
+    // Single bucket; all symbols chained linearly from there. With nbucket=1
+    // every dlsym is O(n) but for small Phase-B exports that's acceptable.
+    poke32(buf + hashOff + 0, hashNbucket);
+    poke32(buf + hashOff + 4, hashNchain);
+    // bucket[0]: index of first non-UNDEF symbol, or 0 if no exports.
+    if expCount > 0 { poke32(buf + hashOff + 8, 1); }
+    else            { poke32(buf + hashOff + 8, 0); }
+    // chain[]: chain[0] = 0 (UNDEF terminator).
+    // chain[i] for i in 1..expCount-1 → i+1; chain[expCount] → 0.
+    poke32(buf + hashOff + 12, 0);                 // chain[0]
+    var ci2: int64 := 1;
+    while ci2 < expCount {
+      poke32(buf + hashOff + 12 + ci2 * 4, ci2 + 1);
+      ci2 := ci2 + 1;
+    }
+    if expCount > 0 {
+      poke32(buf + hashOff + 12 + expCount * 4, 0); // terminator
+    }
 
     // ---- Write + cleanup ----
     var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;

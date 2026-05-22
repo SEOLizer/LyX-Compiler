@@ -102,13 +102,51 @@ die von Android-Apps per `System.loadLibrary()` geladen werden.
 - [x] x86_64 Fast-Path-Bypass bei `--output-type=shared-lib`
 - [x] Singularität verifiziert (S3 == S4)
 
-**Phase B — Symbol-Export (offen)**
-- [ ] PIC-Code-Generierung: Position-Independent Code aktivieren (GOT/PLT)
-- [ ] `@export` Annotation im Parser/Sema
-- [ ] `@jni(class="…", method="…")` Annotation für JNI-Symbole
-- [ ] `Java_<class>_<method>`-Mangling
-- [ ] `.dynsym/.dynstr/.hash` mit echten Exporteinträgen statt UNDEF-Sentinel
-- [ ] `DT_NEEDED` für externe Abhängigkeiten
+**Phase B — Symbol-Export ✅ (Branch `feat/android-backend`)**
+- [x] Annotation-Infrastruktur: Parser konsumiert `@<name>(...)` nicht mehr
+      stillschweigend, sondern speichert Flags im `iVal`-Slot der `NK_FUNC_DECL`
+- [x] Konstanten `ANNO_EXPORT = 1`, `ANNO_JNI = 2` (Bitfeld, weitere Bits reserviert)
+- [x] Annotation kann *vor* oder *nach* `pub` stehen (z.B. `pub @export fn` und
+      `@export pub fn` beide gültig)
+- [x] Helfer `_tokTextEq`, `_annoNameToFlag`, `NAnnoFlags`, `NHasAnno`
+- [x] `buildExportList` in lyxc.lyx: läuft AST-Top-Level durch, sammelt
+      24-Byte-Records {nameOff, nameLen, st_value}; funcId-Order entspricht
+      der IR-Lower-Reihenfolge (top-level `NK_FUNC_DECL`)
+- [x] `emitARM64` überspringt den 12-Byte `_start`-Stub bei `--shared`
+      (sonst hätten alle Export-Adressen +12 Offset)
+- [x] `writeELFSharedLib` erweitert: echte `.dynsym`-Einträge mit
+      `STB_GLOBAL | STT_FUNC`, `st_shndx = 1`, korrekte `st_value`-Adressen
+- [x] `.dynstr` enthält alle Export-Namen NUL-getrennt
+- [x] SysV `.hash` mit `nbucket = 1`, `nchain = 1 + count` und linearer Chain
+- [x] Singularität verifiziert (S3 == S4)
+- [ ] PIC-Code-Generierung (GOT/PLT) — auf Phase C verschoben
+- [ ] `@jni(class="…", method="…")` Annotation + `Java_<class>_<method>`-Mangling — Phase B2
+- [ ] `DT_NEEDED` für externe Abhängigkeiten — Phase C
+
+**Verifikation Phase B:**
+```bash
+cat > /tmp/exporttest.lyx <<'LYX'
+@export
+fn AddInts(a: int64, b: int64): int64 { return a + b; }
+
+fn HelperPrivate(x: int64): int64 { return x * 2; }
+
+@export
+fn MulInts(a: int64, b: int64): int64 {
+  return HelperPrivate(a) + HelperPrivate(b);
+}
+fn main(): int64 { return 0; }
+LYX
+
+./lyxc --target=android-arm64 --shared /tmp/exporttest.lyx -o /tmp/libexport.so
+readelf -D --syms /tmp/libexport.so
+# Symbol table for image contains 3 entries:
+#    Num:    Value          Size Type    Bind   Vis      Ndx Name
+#      0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+#      1: 0000000000000000     0 FUNC    GLOBAL DEFAULT    1 AddInts
+#      2: 0000000000000084     0 FUNC    GLOBAL DEFAULT    1 MulInts
+# (HelperPrivate erscheint korrekt NICHT in der .dynsym.)
+```
 
 **Phase C — Relocations + Real-World-Test (offen)**
 - [ ] Relocations: `R_AARCH64_GLOB_DAT`, `R_AARCH64_JUMP_SLOT`, `R_AARCH64_RELATIVE`
