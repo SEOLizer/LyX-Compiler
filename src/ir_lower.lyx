@@ -164,6 +164,14 @@ pub type IRLower = class {
   localNameBuf: int64;
   localNameCnt: int64;
   localNameCap: int64;
+
+  // WP-AND-upstream-fix v4: module-scope mapping for top-level NK_VAR_DECLs.
+  // Same record layout as localNameBuf; populated once in the lowerModule
+  // pre-pass and never cleared. Used by NK_IDENT lookups as the final
+  // fallback (after locals + params).
+  globalNameBuf: int64;
+  globalNameCnt: int64;
+  globalNameCap: int64;
   
   // Label and temp counters
   labelCount: int64;
@@ -210,6 +218,9 @@ pub type IRLower = class {
     self.localNameCap := 32;
     self.localNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
     self.localNameCnt := 0;
+    self.globalNameCap := 32;
+    self.globalNameBuf := mmap(0, 32 * 24, 3, 34, -1, 0);
+    self.globalNameCnt := 0;
     self.loopExitLabel := -1;
     self.loopContLabel := -1;
     self.curFunc := -1;
@@ -596,6 +607,36 @@ pub type IRLower = class {
             pidx := pidx + 1;
           }
           pnode := self.nodeNext(pnode);
+        }
+        // WP-AND-upstream-fix v4: globals fallback. The src nameOff stored
+        // in globalNameBuf points into the main file's src — which is what
+        // self.src is set to during a top-level lowerModule pass. (Imported
+        // bodies temporarily swap self.src; if they reference a global from
+        // the main file, that lookup will compare bytes against the wrong
+        // buffer. Acceptable initial limitation: cross-module globals not
+        // supported yet.)
+        var gnI: int64 := 0;
+        while gnI < self.globalNameCnt {
+          var gnRec:     int64 := self.globalNameBuf + gnI * 24;
+          var gnNameOff: int64 := peek64(gnRec + 0);
+          var gnLen:     int64 := peek64(gnRec + 8);
+          var gnIdx:     int64 := peek64(gnRec + 16);
+          if gnLen == idLen {
+            var gnPtr: int64 := (self.src as int64) + gnNameOff;
+            var gnMatch: int64 := 1;
+            var gnJ: int64 := 0;
+            while gnJ < idLen {
+              if gnMatch != 0 {
+                if peek8(gnPtr + gnJ) != peek8(idPtrL + gnJ) { gnMatch := 0; }
+              }
+              gnJ := gnJ + 1;
+            }
+            if gnMatch != 0 {
+              self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
+              return dest;
+            }
+          }
+          gnI := gnI + 1;
         }
       }
       return dest;
@@ -1477,6 +1518,32 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerModule(decls: int64) {
+    // WP-AND-upstream-fix v4: pre-pass — register every top-level NK_VAR_DECL
+    // as a global. NK_IDENT lookups in expressions later in this lowerModule
+    // (and in nested lowerModule calls for imports) can then resolve them.
+    var ggCur: int64 := decls;
+    while ggCur >= 0 {
+      if self.nodeKind(ggCur) == NK_VAR_DECL {
+        if self.globalNameCnt >= self.globalNameCap {
+          var ggNewCap: int64 := self.globalNameCap * 2;
+          var ggNb: int64 := mmap(0, ggNewCap * 24, 3, 34, -1, 0);
+          var ggI: int64 := 0;
+          while ggI < self.globalNameCnt * 24 {
+            poke8(ggNb + ggI, peek8(self.globalNameBuf + ggI));
+            ggI := ggI + 1;
+          }
+          self.globalNameBuf := ggNb;
+          self.globalNameCap := ggNewCap;
+        }
+        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 24;
+        poke64(ggRec +  0, peek64(self.nodeOff(ggCur) + 64));   // src nameOff
+        poke64(ggRec +  8, self.nodeSLen(ggCur));
+        poke64(ggRec + 16, self.globalNameCnt);                 // globalIdx
+        self.globalNameCnt := self.globalNameCnt + 1;
+      }
+      ggCur := self.nodeNext(ggCur);
+    }
+
     var cur: int64 := decls;
     while (cur >= 0) {
       var kind: int64 := self.nodeKind(cur);
