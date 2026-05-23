@@ -61,7 +61,7 @@ erfordert zusätzliche IR-Felder für Typmarkierungen.
 
 ---
 
-### WP-OUT-01: Sema-Expansion für `Print` und `PrintLn` ⬜
+### WP-OUT-01: Sema-Expansion für `Print` und `PrintLn` ✅
 
 **Datei:** `src/sema.lyx`
 
