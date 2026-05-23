@@ -20,7 +20,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ✅ |
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ✅ |
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ✅ |
-| WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ⬜ |
+| WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ✅ |
 | WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ⬜ |
 | WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ⬜ |
 | WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ⬜ |
@@ -233,7 +233,7 @@ Rückgabetyp und -format mit bestehendem Aufrufkontext abstimmen.
 
 ---
 
-### WP-STB-06: `ini.lyx` + `yaml.lyx` — File I/O ⬜
+### WP-STB-06: `ini.lyx` + `yaml.lyx` — File I/O ✅
 
 **Branch:** `feat/std-stubs-06`
 **Dateien:** `std/ini.lyx` (Zeilen 354, 361, 411), `std/yaml.lyx` (Zeilen 245, 251)
@@ -549,3 +549,4 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 |---|---|
 | 2026-05-23 | Initiale Erstellung — 13 WPs aus Stub-Audit |
 | 2026-05-23 | WP-STB-01 ✅ — datetime.lyx vollständig. Zwei Bugs entdeckt: Off-by-one Jan/Feb (Hinnant-Algorithmus), negative Division in Lyx unsigned behandelt |
+| 2026-05-23 | WP-STB-06 ✅ — ini.lyx + yaml.lyx: doc-Handle als Raw-Text-Buffer (mmap). _iniFindSection/_iniFindKeyValue Scanner. LoadFile/SaveFile über open/read/write/close Builtins. GetString/HasSection/HasKey/GetSectionCount real implementiert. |
