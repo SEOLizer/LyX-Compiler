@@ -95,25 +95,46 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     return response;
   }
   
-  // Receive response
-  buf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
+  // Receive the full response. The request sends "Connection: close", so the
+  // server ends the TLS stream when done; we read into a growable buffer until
+  // TLSRead reports the close (<= 0). This handles responses far larger than a
+  // single TLS record — e.g. multi-MB package archives.
+  var cap: int64 := 65536;
+  buf := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (buf == 0) {
     TLSClose(conn);
     sys_close(tcpConn.fd);
     TLSFree(ctx);
     return response;
   }
-  
-  n := TLSRead(conn, buf, 8192);
+  var total: int64 := 0;
+  while (true) {
+    // Grow before each read so there is always room for a full chunk.
+    if (total + 16384 > cap) {
+      var newCap: int64 := cap * 2;
+      var nb: int64 := mmap(0, newCap, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (nb == 0) { break; }
+      var k: int64 := 0;
+      while (k < total) { poke8(nb + k, peek8(buf + k)); k := k + 1; }
+      munmap(buf, cap);
+      buf := nb;
+      cap := newCap;
+    }
+    var r: int64 := TLSRead(conn, buf + total, 16384);
+    if (r <= 0) { break; }
+    total := total + r;
+    if (total >= 67108864) { break; }   // 64 MiB safety cap
+  }
   TLSClose(conn);
   sys_close(tcpConn.fd);
   TLSFree(ctx);
-  
-  if (n <= 0) {
-    munmap(buf, 8192);
+
+  if (total <= 0) {
+    munmap(buf, cap);
     return response;
   }
-  
+  n := total;   // the parsing below scans the full accumulated response
+
   // Parse status line
   i := 0;
   while (i < n - 13) {
@@ -182,8 +203,8 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
       }
     }
   }
-  
-  munmap(buf, 8192);
+
+  munmap(buf, cap);
   return response;
 }
 
