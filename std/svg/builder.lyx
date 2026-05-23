@@ -1,0 +1,162 @@
+// std/svg/builder.lyx
+// SVG document lifecycle: SvgNew, SvgSave, SvgFree, SvgToString
+
+@description("SVG document builder: SvgNew, SvgSave, SvgFree, SvgToString, SvgSetViewBox")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.svg.builder;
+
+import std.svg.xml;
+
+// Assemble final SVG into a contiguous mmap'd buffer
+// Caller must munmap the returned pointer when done
+fn _svgBuildOutput(doc: int64): int64 {
+  if (doc == 0) { return 0; }
+  var mainLen: int64 := peek64(doc + SVG_BUF_LEN);
+  var defsLen: int64 := peek64(doc + SVG_DEFS_LEN);
+  var total: int64 := 400 + defsLen + mainLen + 100;
+  var out: int64 := mmap(0, total, 3, 34, -1, 0);
+  if (out == 0) { return 0; }
+  var pos: int64 := 0;
+  pos := svgBufStr(out, pos, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+  poke8(out + pos, 10); pos := pos + 1;
+  pos := svgBufStr(out, pos, "<svg xmlns=\"http://www.w3.org/2000/svg\"");
+  pos := svgBufStr(out, pos, " width=\"");
+  pos := _svgCopyInline(out, pos, doc, SVG_DOC_W);
+  poke8(out + pos, 34); pos := pos + 1;
+  pos := svgBufStr(out, pos, " height=\"");
+  pos := _svgCopyInline(out, pos, doc, SVG_DOC_H);
+  poke8(out + pos, 34); pos := pos + 1;
+  if (peek64(doc + SVG_VB_SET) != 0) {
+    pos := svgBufStr(out, pos, " viewBox=\"");
+    pos := _svgCopyInline(out, pos, doc, SVG_VIEWBOX);
+    poke8(out + pos, 34); pos := pos + 1;
+  }
+  poke8(out + pos, 62); pos := pos + 1;  // '>'
+  poke8(out + pos, 10); pos := pos + 1;
+  if (defsLen > 0) {
+    pos := svgBufStr(out, pos, "  <defs>");
+    poke8(out + pos, 10); pos := pos + 1;
+    var db: int64 := peek64(doc + SVG_DEFS_PTR);
+    var i: int64 := 0;
+    while (i < defsLen) {
+      poke8(out + pos, peek8(db + i));
+      pos := pos + 1; i := i + 1;
+    }
+    pos := svgBufStr(out, pos, "  </defs>");
+    poke8(out + pos, 10); pos := pos + 1;
+  }
+  var mb: int64 := peek64(doc + SVG_BUF_PTR);
+  var j: int64 := 0;
+  while (j < mainLen) {
+    poke8(out + pos, peek8(mb + j));
+    pos := pos + 1; j := j + 1;
+  }
+  pos := svgBufStr(out, pos, "</svg>");
+  poke8(out + pos, 10); pos := pos + 1;
+  poke8(out + pos, 0);
+  return out;
+}
+
+fn _svgLenStr(s: int64): int64 {
+  var i: int64 := 0;
+  while (peek8(s + i) != 0) { i := i + 1; }
+  return i;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn SvgNew(width: f64, height: f64): int64 {
+  var doc: int64 := mmap(0, SVG_DOC_SIZE, 3, 34, -1, 0);
+  if (doc == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < SVG_DOC_SIZE) { poke8(doc + i, 0); i := i + 1; }
+  var buf: int64 := mmap(0, 65536, 3, 34, -1, 0);
+  if (buf == 0) { munmap(doc, SVG_DOC_SIZE); return 0; }
+  poke64(doc + SVG_BUF_PTR, buf);
+  poke64(doc + SVG_BUF_LEN, 0);
+  poke64(doc + SVG_BUF_CAP, 65536);
+  var dbuf: int64 := mmap(0, 32768, 3, 34, -1, 0);
+  if (dbuf == 0) { munmap(buf, 65536); munmap(doc, SVG_DOC_SIZE); return 0; }
+  poke64(doc + SVG_DEFS_PTR, dbuf);
+  poke64(doc + SVG_DEFS_LEN, 0);
+  poke64(doc + SVG_DEFS_CAP, 32768);
+  var pbuf: int64 := mmap(0, 16384, 3, 34, -1, 0);
+  if (pbuf == 0) {
+    munmap(dbuf, 32768); munmap(buf, 65536); munmap(doc, SVG_DOC_SIZE); return 0;
+  }
+  poke64(doc + SVG_PATH_PTR, pbuf);
+  poke64(doc + SVG_PATH_LEN, 0);
+  poke64(doc + SVG_PATH_CAP, 16384);
+  poke64(doc + SVG_PRETTY, 1);
+  poke64(doc + SVG_DEPTH, 1);
+  var tmp: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (tmp != 0) {
+    var pos: int64 := svgBufF64(tmp, 0, width);
+    poke8(tmp + pos, 0);
+    _svgSetInline(doc, SVG_DOC_W, tmp);
+    pos := svgBufF64(tmp, 0, height);
+    poke8(tmp + pos, 0);
+    _svgSetInline(doc, SVG_DOC_H, tmp);
+    munmap(tmp, 32);
+  }
+  return doc;
+}
+
+pub fn SvgSetViewBox(doc: int64, x: f64, y: f64, w: f64, h: f64): void {
+  if (doc == 0) { return; }
+  var tmp: int64 := mmap(0, 64, 3, 34, -1, 0);
+  if (tmp == 0) { return; }
+  var pos: int64 := svgBufF64(tmp, 0, x);
+  poke8(tmp + pos, 32); pos := pos + 1;
+  pos := svgBufF64(tmp, pos, y);
+  poke8(tmp + pos, 32); pos := pos + 1;
+  pos := svgBufF64(tmp, pos, w);
+  poke8(tmp + pos, 32); pos := pos + 1;
+  pos := svgBufF64(tmp, pos, h);
+  poke8(tmp + pos, 0);
+  _svgSetInline(doc, SVG_VIEWBOX, tmp);
+  poke64(doc + SVG_VB_SET, 1);
+  munmap(tmp, 64);
+}
+
+pub fn SvgSetPrettyPrint(doc: int64, enabled: int64): void {
+  if (doc == 0) { return; }
+  poke64(doc + SVG_PRETTY, enabled);
+}
+
+pub fn SvgToString(doc: int64): pchar {
+  if (doc == 0) { return ""; }
+  return _svgBuildOutput(doc);
+}
+
+pub fn SvgSave(doc: int64, path: pchar): int64 {
+  if (doc == 0) { return -1; }
+  var out: int64 := _svgBuildOutput(doc);
+  if (out == 0) { return -1; }
+  var len: int64 := _svgLenStr(out);
+  var fd: int64 := open(path, 577, 420);
+  if (fd < 0) { munmap(out, len + 1); return -1; }
+  var written: int64 := write(fd, out, len);
+  close(fd);
+  munmap(out, len + 1);
+  if (written != len) { return -1; }
+  return 0;
+}
+
+pub fn SvgFree(doc: int64): void {
+  if (doc == 0) { return; }
+  var buf: int64 := peek64(doc + SVG_BUF_PTR);
+  if (buf != 0) { munmap(buf, peek64(doc + SVG_BUF_CAP)); }
+  var dbuf: int64 := peek64(doc + SVG_DEFS_PTR);
+  if (dbuf != 0) { munmap(dbuf, peek64(doc + SVG_DEFS_CAP)); }
+  var pbuf: int64 := peek64(doc + SVG_PATH_PTR);
+  if (pbuf != 0) { munmap(pbuf, peek64(doc + SVG_PATH_CAP)); }
+  var kt: int64 := peek64(doc + SVG_KF_TPTR);
+  if (kt != 0) { munmap(kt, 4096); }
+  var kv: int64 := peek64(doc + SVG_KF_VPTR);
+  if (kv != 0) { munmap(kv, 4096); }
+  munmap(doc, SVG_DOC_SIZE);
+}

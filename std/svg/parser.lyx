@@ -1,0 +1,590 @@
+// std/svg/parser.lyx
+// SVG XML reader: tokenizer, DOM tree builder, element/attribute traversal
+
+@description("SVG parser: SvgOpen, DOM traversal, SvgAttrStr/F64, SvgFindId")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.svg.parser;
+
+import std.svg.xml;
+
+// ============================================================================
+// Parser document layout (4096-byte header block)
+// ============================================================================
+
+con PSVG_NODES_PTR: int64 := 0;    // int64: ptr to node pool
+con PSVG_NODES_CAP: int64 := 8;    // int64: max nodes (capacity)
+con PSVG_NODES_LEN: int64 := 16;   // int64: current node count
+con PSVG_ATTRS_PTR: int64 := 24;   // int64: ptr to attr pool
+con PSVG_ATTRS_CAP: int64 := 32;   // int64: max attrs
+con PSVG_ATTRS_LEN: int64 := 40;   // int64: current attr count
+con PSVG_ROOT_IDX:  int64 := 48;   // int64: root node index (1-based, 0=none)
+con PSVG_ERROR:     int64 := 56;   // 64 bytes: error message
+con PSVG_WIDTH:     int64 := 120;  // 24 bytes: width attribute string
+con PSVG_HEIGHT:    int64 := 144;  // 24 bytes: height attribute string
+con PSVG_VIEWBOX:   int64 := 168;  // 64 bytes: viewBox attribute string
+con PSVG_MARKER:    int64 := 232;  // int64: 0xBEEF1234 = parser doc marker
+
+// Node structure: 128 bytes each
+// Offsets within a node:
+con PNODE_PARENT:     int64 := 0;   // int64 parent index (0=none)
+con PNODE_FIRSTCHILD: int64 := 8;   // int64 first child index
+con PNODE_NEXTSIBLING:int64 := 16;  // int64 next sibling index
+con PNODE_ATTROFF:    int64 := 24;  // int64 attr pool start index
+con PNODE_ATTRCOUNT:  int64 := 32;  // int64 attribute count
+con PNODE_LASTCHILD:  int64 := 40;  // int64 last child index (for fast append)
+con PNODE_DEPTH:      int64 := 48;  // int64 nesting depth
+con PNODE_TAG:        int64 := 56;  // 32 bytes: tag name
+con PNODE_ID:         int64 := 88;  // 32 bytes: id attribute value
+con PNODE_HDR:        int64 := 120; // int64: back-pointer to parser doc header
+con PNODE_SIZE:       int64 := 128; // total node size
+
+// Attribute structure: 96 bytes each
+con PATTR_NAME: int64 := 0;   // 32 bytes: attribute name
+con PATTR_VAL:  int64 := 32;  // 64 bytes: attribute value
+con PATTR_SIZE: int64 := 96;  // total attr size
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn _psvgNodePtr(hdr: int64, idx: int64): int64 {
+  return peek64(hdr + PSVG_NODES_PTR) + (idx - 1) * PNODE_SIZE;
+}
+
+fn _psvgAttrPtr(hdr: int64, idx: int64): int64 {
+  return peek64(hdr + PSVG_ATTRS_PTR) + idx * PATTR_SIZE;
+}
+
+fn _psvgSetError(hdr: int64, msg: pchar): void {
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := StrCharAt(msg, i);
+    poke8(hdr + PSVG_ERROR + i, c);
+    if (c == 0) { break; }
+    if (i < 62) { i := i + 1; }
+    else { poke8(hdr + PSVG_ERROR + i + 1, 0); break; }
+  }
+}
+
+fn _psvgCopyStr(dst: int64, maxLen: int64, src: int64, srcLen: int64): void {
+  var n: int64 := srcLen;
+  if (n > maxLen - 1) { n := maxLen - 1; }
+  var i: int64 := 0;
+  while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+  poke8(dst + n, 0);
+}
+
+fn _psvgStrEq(a: pchar, bPtr: int64, bLen: int64): int64 {
+  var i: int64 := 0;
+  while (true) {
+    var ca: int64 := StrCharAt(a, i);
+    var cb: int64 := 0;
+    if (i < bLen) { cb := peek8(bPtr + i); }
+    if (ca != cb) { return 0; }
+    if (ca == 0) { return 1; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+fn _psvgAllocNode(hdr: int64): int64 {
+  var len: int64 := peek64(hdr + PSVG_NODES_LEN);
+  var cap: int64 := peek64(hdr + PSVG_NODES_CAP);
+  if (len >= cap) {
+    // Grow nodes pool
+    var oldPtr: int64 := peek64(hdr + PSVG_NODES_PTR);
+    var newCap: int64 := cap + cap;
+    var newPtr: int64 := mmap(0, newCap * PNODE_SIZE, 3, 34, -1, 0);
+    if (newPtr == 0) { return 0; }
+    var k: int64 := 0;
+    while (k < len * PNODE_SIZE) { poke8(newPtr + k, peek8(oldPtr + k)); k := k + 1; }
+    munmap(oldPtr, cap * PNODE_SIZE);
+    poke64(hdr + PSVG_NODES_PTR, newPtr);
+    poke64(hdr + PSVG_NODES_CAP, newCap);
+  }
+  var idx: int64 := len + 1;  // 1-based
+  poke64(hdr + PSVG_NODES_LEN, len + 1);
+  // Zero out new node and store hdr back-pointer
+  var np: int64 := _psvgNodePtr(hdr, idx);
+  var ki: int64 := 0;
+  while (ki < PNODE_SIZE) { poke8(np + ki, 0); ki := ki + 1; }
+  poke64(np + PNODE_HDR, hdr);
+  return idx;
+}
+
+fn _psvgAllocAttr(hdr: int64): int64 {
+  var len: int64 := peek64(hdr + PSVG_ATTRS_LEN);
+  var cap: int64 := peek64(hdr + PSVG_ATTRS_CAP);
+  if (len >= cap) {
+    var oldPtr: int64 := peek64(hdr + PSVG_ATTRS_PTR);
+    var newCap: int64 := cap + cap;
+    var newPtr: int64 := mmap(0, newCap * PATTR_SIZE, 3, 34, -1, 0);
+    if (newPtr == 0) { return -1; }
+    var k: int64 := 0;
+    while (k < len * PATTR_SIZE) { poke8(newPtr + k, peek8(oldPtr + k)); k := k + 1; }
+    munmap(oldPtr, cap * PATTR_SIZE);
+    poke64(hdr + PSVG_ATTRS_PTR, newPtr);
+    poke64(hdr + PSVG_ATTRS_CAP, newCap);
+  }
+  var idx: int64 := len;
+  poke64(hdr + PSVG_ATTRS_LEN, len + 1);
+  return idx;
+}
+
+// ============================================================================
+// XML tokenizer + tree builder
+// ============================================================================
+
+fn _psvgSkipWS(data: int64, pos: int64, len: int64): int64 {
+  while (pos < len) {
+    var c: int64 := peek8(data + pos);
+    if ((c != 32) && (c != 9) && (c != 10) && (c != 13)) { break; }
+    pos := pos + 1;
+  }
+  return pos;
+}
+
+fn _psvgScanTo(data: int64, pos: int64, len: int64, stop: int64): int64 {
+  while (pos < len) {
+    if (peek8(data + pos) == stop) { break; }
+    pos := pos + 1;
+  }
+  return pos;
+}
+
+// Parse one attribute: name="value" or name='value'. Returns new pos.
+fn _psvgParseAttr(hdr: int64, nodeIdx: int64, data: int64, pos: int64, len: int64): int64 {
+  pos := _psvgSkipWS(data, pos, len);
+  if (pos >= len) { return pos; }
+  // Read name
+  var nameStart: int64 := pos;
+  while (pos < len) {
+    var c: int64 := peek8(data + pos);
+    if ((c == 61) || (c == 32) || (c == 9) || (c == 10) || (c == 62) || (c == 47)) { break; }
+    pos := pos + 1;
+  }
+  var nameLen: int64 := pos - nameStart;
+  if (nameLen == 0) { return pos; }
+  pos := _psvgSkipWS(data, pos, len);
+  if (pos >= len) { return pos; }
+  if (peek8(data + pos) != 61) { return pos; }  // expect '='
+  pos := pos + 1;
+  pos := _psvgSkipWS(data, pos, len);
+  if (pos >= len) { return pos; }
+  var quote: int64 := peek8(data + pos);
+  if ((quote != 34) && (quote != 39)) { return pos; }  // expect " or '
+  pos := pos + 1;
+  var valStart: int64 := pos;
+  while (pos < len) {
+    if (peek8(data + pos) == quote) { break; }
+    pos := pos + 1;
+  }
+  var valLen: int64 := pos - valStart;
+  if (pos < len) { pos := pos + 1; }  // skip closing quote
+
+  // Store attribute
+  var aidx: int64 := _psvgAllocAttr(hdr);
+  if (aidx < 0) { return pos; }
+  var ap: int64 := _psvgAttrPtr(hdr, aidx);
+  _psvgCopyStr(ap + PATTR_NAME, 32, data + nameStart, nameLen);
+  _psvgCopyStr(ap + PATTR_VAL, 64, data + valStart, valLen);
+
+  var np: int64 := _psvgNodePtr(hdr, nodeIdx);
+  var ac: int64 := peek64(np + PNODE_ATTRCOUNT);
+  if (ac == 0) { poke64(np + PNODE_ATTROFF, aidx); }
+  poke64(np + PNODE_ATTRCOUNT, ac + 1);
+
+  // Copy id attribute to node's id field for fast lookup
+  if (_psvgStrEq("id", data + nameStart, nameLen) == 1) {
+    _psvgCopyStr(np + PNODE_ID, 32, data + valStart, valLen);
+  }
+  return pos;
+}
+
+// Parse the XML data and build DOM tree in hdr.
+fn _psvgBuild(hdr: int64, data: int64, len: int64): void {
+  var pos: int64 := 0;
+  var curParent: int64 := 0;  // 0 = no parent yet
+  var depth: int64 := 0;
+
+  while (pos < len) {
+    pos := _psvgSkipWS(data, pos, len);
+    if (pos >= len) { break; }
+    if (peek8(data + pos) != 60) { pos := pos + 1; continue; }  // not '<'
+    pos := pos + 1;
+    if (pos >= len) { break; }
+
+    // Comment or PI: <!-- or <?
+    if (peek8(data + pos) == 33) {
+      // <!-- comment --> or <!DOCTYPE ...>
+      pos := pos + 1;
+      if ((pos + 1 < len) && (peek8(data + pos) == 45) && (peek8(data + pos + 1) == 45)) {
+        // Skip comment until -->
+        pos := pos + 2;
+        var done: int64 := 0;
+        while ((pos + 2 < len) && (done == 0)) {
+          if ((peek8(data + pos) == 45) && (peek8(data + pos + 1) == 45) && (peek8(data + pos + 2) == 62)) {
+            pos := pos + 3; done := 1;
+          } else { pos := pos + 1; }
+        }
+      } else {
+        // Skip to '>'
+        pos := _psvgScanTo(data, pos, len, 62);
+        if (pos < len) { pos := pos + 1; }
+      }
+      continue;
+    }
+    if (peek8(data + pos) == 63) {
+      // <?...?> processing instruction, skip
+      pos := _psvgScanTo(data, pos, len, 62);
+      if (pos < len) { pos := pos + 1; }
+      continue;
+    }
+
+    // End tag: </tagname>
+    if (peek8(data + pos) == 47) {
+      pos := pos + 1;
+      pos := _psvgScanTo(data, pos, len, 62);
+      if (pos < len) { pos := pos + 1; }
+      // Pop parent
+      if (curParent != 0) {
+        var pnp: int64 := _psvgNodePtr(hdr, curParent);
+        curParent := peek64(pnp + PNODE_PARENT);
+      }
+      depth := depth - 1;
+      if (depth < 0) { depth := 0; }
+      continue;
+    }
+
+    // Start tag: <tagname ...> or <tagname .../>
+    var tagStart: int64 := pos;
+    while (pos < len) {
+      var c: int64 := peek8(data + pos);
+      if ((c == 32) || (c == 9) || (c == 10) || (c == 13) || (c == 62) || (c == 47)) { break; }
+      pos := pos + 1;
+    }
+    var tagLen: int64 := pos - tagStart;
+    if (tagLen == 0) {
+      pos := _psvgScanTo(data, pos, len, 62);
+      if (pos < len) { pos := pos + 1; }
+      continue;
+    }
+
+    // Allocate node
+    var nodeIdx: int64 := _psvgAllocNode(hdr);
+    if (nodeIdx == 0) { _psvgSetError(hdr, "out of memory"); return; }
+    var np: int64 := _psvgNodePtr(hdr, nodeIdx);
+    _psvgCopyStr(np + PNODE_TAG, 32, data + tagStart, tagLen);
+    poke64(np + PNODE_DEPTH, depth);
+
+    // Link to parent
+    if (curParent == 0) {
+      if (peek64(hdr + PSVG_ROOT_IDX) == 0) { poke64(hdr + PSVG_ROOT_IDX, nodeIdx); }
+    } else {
+      poke64(np + PNODE_PARENT, curParent);
+      var pnp: int64 := _psvgNodePtr(hdr, curParent);
+      var lc: int64 := peek64(pnp + PNODE_LASTCHILD);
+      if (lc == 0) {
+        poke64(pnp + PNODE_FIRSTCHILD, nodeIdx);
+      } else {
+        var lcnp: int64 := _psvgNodePtr(hdr, lc);
+        poke64(lcnp + PNODE_NEXTSIBLING, nodeIdx);
+      }
+      poke64(pnp + PNODE_LASTCHILD, nodeIdx);
+    }
+
+    // Copy root element attributes (width/height/viewBox) to header
+    if (nodeIdx == peek64(hdr + PSVG_ROOT_IDX)) {
+      // Will be populated when attributes are parsed below
+    }
+
+    // Parse attributes
+    var selfClose: int64 := 0;
+    while (1 == 1) {
+      pos := _psvgSkipWS(data, pos, len);
+      if (pos >= len) { break; }
+      var c: int64 := peek8(data + pos);
+      if (c == 62) { pos := pos + 1; break; }
+      if (c == 47) {
+        selfClose := 1;
+        pos := pos + 1;
+        pos := _psvgSkipWS(data, pos, len);
+        if (pos < len) { pos := pos + 1; }  // skip '>'
+        break;
+      }
+      pos := _psvgParseAttr(hdr, nodeIdx, data, pos, len);
+    }
+
+    // Copy root-level SVG attributes to header
+    if (nodeIdx == peek64(hdr + PSVG_ROOT_IDX)) {
+      var ac: int64 := peek64(np + PNODE_ATTRCOUNT);
+      var ao: int64 := peek64(np + PNODE_ATTROFF);
+      var ai: int64 := 0;
+      while (ai < ac) {
+        var ap: int64 := _psvgAttrPtr(hdr, ao + ai);
+        var aname: int64 := ap + PATTR_NAME;
+        var aval: int64 := ap + PATTR_VAL;
+        var n0: int64 := peek8(aname);
+        var n1: int64 := peek8(aname + 1);
+        var n2: int64 := peek8(aname + 2);
+        if ((n0 == 119) && (n1 == 105) && (n2 == 100)) {  // "wid..." = width
+          _psvgCopyStr(hdr + PSVG_WIDTH, 24, aval, 24);
+        }
+        if ((n0 == 104) && (n1 == 101) && (n2 == 105)) {  // "hei..." = height
+          _psvgCopyStr(hdr + PSVG_HEIGHT, 24, aval, 24);
+        }
+        if ((n0 == 118) && (n1 == 105) && (n2 == 101)) {  // "vie..." = viewBox
+          _psvgCopyStr(hdr + PSVG_VIEWBOX, 64, aval, 64);
+        }
+        ai := ai + 1;
+      }
+    }
+
+    if (selfClose == 0) {
+      curParent := nodeIdx;
+      depth := depth + 1;
+    }
+  }
+}
+
+// ============================================================================
+// String → f64 conversion for SvgAttrF64
+// ============================================================================
+
+fn _psvgParseF64(s: pchar): f64 {
+  var neg: int64 := 0;
+  var i: int64 := 0;
+  var c: int64 := StrCharAt(s, 0);
+  if (c == 45) { neg := 1; i := 1; }  // '-'
+  // Parse integer part
+  var intPart: int64 := 0;
+  while (true) {
+    c := StrCharAt(s, i);
+    if ((c < 48) || (c > 57)) { break; }
+    intPart := intPart * 10 + (c - 48);
+    i := i + 1;
+  }
+  // Parse fractional part
+  var fracPart: int64 := 0;
+  var fracDiv: int64 := 1;
+  if (StrCharAt(s, i) == 46) {  // '.'
+    i := i + 1;
+    var digits: int64 := 0;
+    while (digits < 2) {
+      c := StrCharAt(s, i);
+      if ((c < 48) || (c > 57)) { break; }
+      fracPart := fracPart * 10 + (c - 48);
+      fracDiv := fracDiv * 10;
+      i := i + 1; digits := digits + 1;
+    }
+    // Normalize fracPart to 2 decimal places (×100)
+    if (fracDiv == 10)  { fracPart := fracPart * 10; }
+    // fracDiv == 100: already 2dp
+    if (fracDiv == 1)   { fracPart := 0; }
+  }
+  var v100: int64 := intPart * 100 + fracPart;
+  if (neg == 1) { v100 := 0 - v100; }
+  return svgInt100ToF64(v100);
+}
+
+// ============================================================================
+// File reader (same as image.lyx but duplicated to avoid cross-unit deps)
+// ============================================================================
+
+fn _psvgReadFile(path: pchar, outLen: int64): int64 {
+  var fd: int64 := open(path, 0, 0);
+  if (fd < 0) { poke64(outLen, 0); return 0; }
+  var cap: int64 := 65536;
+  var tbuf: int64 := mmap(0, cap, 3, 34, -1, 0);
+  if (tbuf == 0) { close(fd); poke64(outLen, 0); return 0; }
+  var total: int64 := 0;
+  var more: int64 := 1;
+  while (more == 1) {
+    if (total + 4096 > cap) {
+      var newcap: int64 := cap + cap;
+      var nbuf: int64 := mmap(0, newcap, 3, 34, -1, 0);
+      if (nbuf == 0) { more := 0; }
+      else {
+        var k: int64 := 0;
+        while (k < total) { poke8(nbuf + k, peek8(tbuf + k)); k := k + 1; }
+        munmap(tbuf, cap);
+        tbuf := nbuf; cap := newcap;
+        var n: int64 := read(fd, tbuf + total, 4096);
+        if (n <= 0) { more := 0; } else { total := total + n; }
+      }
+    } else {
+      var n: int64 := read(fd, tbuf + total, 4096);
+      if (n <= 0) { more := 0; } else { total := total + n; }
+    }
+  }
+  close(fd);
+  poke64(outLen, total);
+  return tbuf;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn SvgOpen(path: pchar): int64 {
+  var hdr: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  if (hdr == 0) { return 0; }
+  poke64(hdr + PSVG_MARKER, 0xBEEF1234);
+
+  // Allocate node and attr pools
+  var initNodes: int64 := 1024;
+  var nodePool: int64 := mmap(0, initNodes * PNODE_SIZE, 3, 34, -1, 0);
+  if (nodePool == 0) { munmap(hdr, 4096); return 0; }
+  poke64(hdr + PSVG_NODES_PTR, nodePool);
+  poke64(hdr + PSVG_NODES_CAP, initNodes);
+  poke64(hdr + PSVG_NODES_LEN, 0);
+
+  var initAttrs: int64 := 4096;
+  var attrPool: int64 := mmap(0, initAttrs * PATTR_SIZE, 3, 34, -1, 0);
+  if (attrPool == 0) { munmap(nodePool, initNodes * PNODE_SIZE); munmap(hdr, 4096); return 0; }
+  poke64(hdr + PSVG_ATTRS_PTR, attrPool);
+  poke64(hdr + PSVG_ATTRS_CAP, initAttrs);
+  poke64(hdr + PSVG_ATTRS_LEN, 0);
+
+  // Read file
+  var lenBuf: int64 := mmap(0, 8, 3, 34, -1, 0);
+  if (lenBuf == 0) { munmap(attrPool, initAttrs * PATTR_SIZE); munmap(nodePool, initNodes * PNODE_SIZE); munmap(hdr, 4096); return 0; }
+  var data: int64 := _psvgReadFile(path, lenBuf);
+  var dataLen: int64 := peek64(lenBuf);
+  munmap(lenBuf, 8);
+  if (data == 0) {
+    _psvgSetError(hdr, "cannot open file");
+    return hdr;
+  }
+
+  // Build DOM
+  _psvgBuild(hdr, data, dataLen);
+  munmap(data, dataLen);
+  return hdr;
+}
+
+pub fn SvgReadWidth(doc: int64): f64 {
+  if (doc == 0) { return 0 as f64; }
+  return _psvgParseF64(doc + PSVG_WIDTH);
+}
+
+pub fn SvgReadHeight(doc: int64): f64 {
+  if (doc == 0) { return 0 as f64; }
+  return _psvgParseF64(doc + PSVG_HEIGHT);
+}
+
+pub fn SvgReadViewBox(doc: int64): pchar {
+  if (doc == 0) { return 0; }
+  return doc + PSVG_VIEWBOX;
+}
+
+pub fn SvgRootElement(doc: int64): int64 {
+  if (doc == 0) { return 0; }
+  var idx: int64 := peek64(doc + PSVG_ROOT_IDX);
+  if (idx == 0) { return 0; }
+  return _psvgNodePtr(doc, idx);
+}
+
+pub fn SvgFirstChild(elem: int64): int64 {
+  if (elem == 0) { return 0; }
+  var idx: int64 := peek64(elem + PNODE_FIRSTCHILD);
+  if (idx == 0) { return 0; }
+  var hdr: int64 := peek64(elem + PNODE_HDR);
+  if (hdr == 0) { return 0; }
+  return _psvgNodePtr(hdr, idx);
+}
+
+pub fn SvgNextSibling(elem: int64): int64 {
+  if (elem == 0) { return 0; }
+  var idx: int64 := peek64(elem + PNODE_NEXTSIBLING);
+  if (idx == 0) { return 0; }
+  var hdr: int64 := peek64(elem + PNODE_HDR);
+  if (hdr == 0) { return 0; }
+  return _psvgNodePtr(hdr, idx);
+}
+
+pub fn SvgElementTag(elem: int64): pchar {
+  if (elem == 0) { return 0; }
+  return elem + PNODE_TAG;
+}
+
+pub fn SvgElementId(elem: int64): pchar {
+  if (elem == 0) { return 0; }
+  return elem + PNODE_ID;
+}
+
+pub fn SvgAttrStr(elem: int64, name: pchar): pchar {
+  if (elem == 0) { return 0; }
+  var ac: int64 := peek64(elem + PNODE_ATTRCOUNT);
+  if (ac == 0) { return 0; }
+  var hdr: int64 := peek64(elem + PNODE_HDR);
+  if (hdr == 0) { return 0; }
+  var ao: int64 := peek64(elem + PNODE_ATTROFF);
+  var i: int64 := 0;
+  while (i < ac) {
+    var ap: int64 := _psvgAttrPtr(hdr, ao + i);
+    if (_psvgStrEq(name, ap + PATTR_NAME, 32) == 1) {
+      return ap + PATTR_VAL;
+    }
+    i := i + 1;
+  }
+  return 0;
+}
+
+pub fn SvgAttrF64(elem: int64, name: pchar, defaultVal: f64): f64 {
+  var s: pchar := SvgAttrStr(elem, name);
+  if (s == 0) { return defaultVal; }
+  var c: int64 := StrCharAt(s, 0);
+  if (c == 0) { return defaultVal; }
+  return _psvgParseF64(s);
+}
+
+pub fn SvgPathData(elem: int64): pchar {
+  return SvgAttrStr(elem, "d");
+}
+
+pub fn SvgGetError(doc: int64): pchar {
+  if (doc == 0) { return 0; }
+  return doc + PSVG_ERROR;
+}
+
+// Scan all nodes for id match; returns node pointer or 0
+pub fn SvgFindId(doc: int64, id: pchar): int64 {
+  if (doc == 0) { return 0; }
+  var nlen: int64 := peek64(doc + PSVG_NODES_LEN);
+  var i: int64 := 1;
+  while (i <= nlen) {
+    var np: int64 := _psvgNodePtr(doc, i);
+    if (_psvgStrEq(id, np + PNODE_ID, 32) == 1) { return np; }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// Count elements with a given tag name
+pub fn SvgCountByTag(doc: int64, tag: pchar): int64 {
+  if (doc == 0) { return 0; }
+  var nlen: int64 := peek64(doc + PSVG_NODES_LEN);
+  var count: int64 := 0;
+  var i: int64 := 1;
+  while (i <= nlen) {
+    var np: int64 := _psvgNodePtr(doc, i);
+    if (_psvgStrEq(tag, np + PNODE_TAG, 32) == 1) { count := count + 1; }
+    i := i + 1;
+  }
+  return count;
+}
+
+// Free parser doc (different from writer doc)
+pub fn SvgParserFree(doc: int64): void {
+  if (doc == 0) { return; }
+  if (peek64(doc + PSVG_MARKER) != 0xBEEF1234) { return; }
+  var nptr: int64 := peek64(doc + PSVG_NODES_PTR);
+  var ncap: int64 := peek64(doc + PSVG_NODES_CAP);
+  var aptr: int64 := peek64(doc + PSVG_ATTRS_PTR);
+  var acap: int64 := peek64(doc + PSVG_ATTRS_CAP);
+  if (nptr != 0) { munmap(nptr, ncap * PNODE_SIZE); }
+  if (aptr != 0) { munmap(aptr, acap * PATTR_SIZE); }
+  munmap(doc, 4096);
+}
