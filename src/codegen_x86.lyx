@@ -2564,6 +2564,85 @@ pub type Codegen = class {
     }
   }
 
+  // Infer the print dispatch type for a single argument node.
+  // Returns: 0=int64/PrintInt  1=pchar/PrintStr  2=f64/PrintFloat  3=bool/PrintBool
+  fn cg_inferPrintType(argNi: int64): int64 {
+    var k: int64 := self.cg_nkind(argNi);
+    if (k == CGN_LIT_STR)  { return 1; }
+    if (k == CGN_LIT_FLOAT) { return 2; }
+    if (k == CGN_LIT_BOOL)  { return 3; }
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(argNi);
+      var nl: int64  := self.cg_nslen(argNi);
+      var lidx: int64 := self.cg_findLocalIdx(nm, nl);
+      if (lidx >= 0) {
+        var tb: int64  := self.localTypes + lidx * 16;
+        var tp: pchar  := peek64(tb) as pchar;
+        var tn: int64  := peek64(tb + 8);
+        if (self.cg_seq(tp, tn, "f64",   3)) { return 2; }
+        if (self.cg_seq(tp, tn, "pchar", 5)) { return 1; }
+        if (self.cg_seq(tp, tn, "bool",  4)) { return 3; }
+      } else {
+        var gidx: int64 := self.cg_findGlobalIdx(nm, nl);
+        if (gidx >= 0 && peek8(self.globalIsPchar + gidx) != 0) { return 1; }
+      }
+    }
+    return 0;
+  }
+
+  // Emit individual print calls for each argument in argNode list.
+  // Type is inferred per argument; addNewline=1 appends a final "\n".
+  fn cg_genPrintMulti(argNode: int64, addNewline: int64) {
+    var cur: int64 := argNode;
+    while (cur >= 0) {
+      var pt: int64 := self.cg_inferPrintType(cur);
+      self.cg_genExpr(cur);
+      // mov rdi, rax
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+      if (pt == 1) {
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, CG_H_PRINTSTR - pp - 4);
+      } else if (pt == 2) {
+        // f64 stub: emit "0.0\0" constant and print it
+        var pfOff: int64 := self.dataLen;
+        self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(0);
+        self.cg_emitLeaRdiData(pfOff);
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, CG_H_PRINTSTR - pp - 4);
+      } else if (pt == 3) {
+        var pbTOff: int64 := self.dataLen;
+        self.cg_edata(116); self.cg_edata(114); self.cg_edata(117); self.cg_edata(101); self.cg_edata(0);
+        var pbFOff: int64 := self.dataLen;
+        self.cg_edata(102); self.cg_edata(97); self.cg_edata(108); self.cg_edata(115); self.cg_edata(101); self.cg_edata(0);
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);  // test rdi, rdi
+        self.cg_e8(0x74);                                        // jz .pbFalse
+        var pbFJ: int64 := self.codeLen; self.cg_e8(0);
+        self.cg_emitLeaRdiData(pbTOff);
+        var ppbT: int64 := self.cg_emitCall();
+        poke32(self.code + ppbT, CG_H_PRINTSTR - ppbT - 4);
+        self.cg_e8(0xEB);                                        // jmp .pbEnd
+        var pbEJ: int64 := self.codeLen; self.cg_e8(0);
+        poke8(self.code + pbFJ, self.codeLen - pbFJ - 1);
+        self.cg_emitLeaRdiData(pbFOff);
+        var ppbF: int64 := self.cg_emitCall();
+        poke32(self.code + ppbF, CG_H_PRINTSTR - ppbF - 4);
+        poke8(self.code + pbEJ, self.codeLen - pbEJ - 1);
+      } else {
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, CG_H_PRINTINT - pp - 4);
+      }
+      cur := self.cg_nnext(cur);
+    }
+    if (addNewline == 1) {
+      var nlOff: int64 := self.dataLen;
+      self.cg_edata(10); self.cg_edata(0);
+      self.cg_emitLeaRdiData(nlOff);
+      var ppNL: int64 := self.cg_emitCall();
+      poke32(self.code + ppNL, CG_H_PRINTSTR - ppNL - 4);
+    }
+    self.cg_zeroRax();
+  }
+
   // Generate a function call (NK_CALL node)
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
@@ -2618,6 +2697,16 @@ pub type Codegen = class {
           self.cg_genArrayPop(argNode);
           return;
         }
+      }
+      // Print / PrintLn multi-arg compile-time type dispatch (WP-OUT-01)
+      if (self.cg_seq(fname, fnlen, "Print", 5) ||
+          self.cg_seq(fname, fnlen, "PrintLn", 7) ||
+          self.cg_seq(fname, fnlen, "Println", 7)) {
+        var addNl: int64 := 0;
+        if (self.cg_seq(fname, fnlen, "PrintLn", 7) ||
+            self.cg_seq(fname, fnlen, "Println", 7)) { addNl := 1; }
+        self.cg_genPrintMulti(argNode, addNl);
+        return;
       }
     }
 
