@@ -1476,14 +1476,9 @@ import std.systeminfo;
 import std.io;
 
 fn main(): int64 {
-  PrintStr("Logical Cores: ");
-  PrintIntLn(GetLogicalCores());
-  
-  PrintStr("Total Memory: ");
-  PrintIntLn(GetTotalMemory() / 1024);
-  
-  PrintStr("Load 1min: ");
-  PrintIntLn(GetLoadAverage1());
+  PrintLn("Logical Cores: ", GetLogicalCores());
+  PrintLn("Total Memory: ", GetTotalMemory() / 1024);
+  PrintLn("Load 1min: ", GetLoadAverage1());
   
   return 0;
 }

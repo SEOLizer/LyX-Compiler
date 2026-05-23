@@ -98,7 +98,7 @@ fn add(a: int64, b: int64): int64 {
 }
 
 fn greet() {
-  PrintStr("Hello!\n");
+  PrintLn("Hello!");
 }
 ```
 
@@ -107,11 +107,11 @@ fn greet() {
 ```lyx
 type Animal = class {
   name: pchar;
-  virtual fn speak() { PrintStr("sound\n"); }
+  virtual fn speak() { PrintLn("sound"); }
 };
 
 type Dog = class extends Animal {
-  override fn speak() { PrintStr("woof\n"); }
+  override fn speak() { PrintLn("woof"); }
 };
 ```
 
@@ -128,9 +128,9 @@ fn max[T](a: T, b: T): T {
 
 ```lyx
 match (x) {
-  case 0 => PrintStr("zero\n");
-  case 1 | 2 => PrintStr("small\n");
-  default => PrintStr("other\n");
+  case 0 => PrintLn("zero");
+  case 1 | 2 => PrintLn("small");
+  default => PrintLn("other");
 }
 ```
 
@@ -140,7 +140,7 @@ match (x) {
 try {
   risky_operation();
 } catch {
-  PrintStr("error occurred\n");
+  PrintLn("error occurred");
 }
 ```
 
@@ -205,10 +205,13 @@ try {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
+| `Print(a, ...)` | `any… → void` | Output 1–6 args of any type (compile-time type dispatch) |
+| `PrintLn(a, ...)` | `any… → void` | Like `Print`, appends `\n` |
+| `EPrint(a, ...)` | `any… → void` | Like `Print`, writes to stderr |
+| `EPrintLn(a, ...)` | `any… → void` | Like `PrintLn`, writes to stderr |
 | `PrintStr(s)` | `pchar → void` | Output string until null terminator |
 | `PrintInt(x)` | `int64 → void` | Output integer as decimal |
 | `PrintFloat(x)` | `f64 → void` | Output float (sign + integer + 6 decimals) |
-| `Println(s)` | `pchar → void` | Output string + newline |
 | `exit(code)` | `int64 → void` | Terminate with exit code |
 
 ### 4.2 Debugging
