@@ -104,6 +104,17 @@ pub type EmitARM64 = class {
   globalRelocCount:  int64;
   globalRelocCap:    int64;
 
+  // FFI (extern fn ... link). Per distinct extern symbol referenced by a call
+  // we emit an inline GOT slot resolved by the loader via R_AARCH64_GLOB_DAT.
+  // externBuf dedups the symbols — 32-byte entries {nameStrOff, nameLen,
+  // libStrOff, libLen}, all offsets into the IR string table — so writeELF can
+  // build .dynsym/.dynstr/DT_NEEDED. The dynsym index of entry i is i+1
+  // (index 0 is the reserved null symbol).
+  externBuf:   int64;
+  externCount: int64;
+  externCap:   int64;
+
+
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
@@ -133,10 +144,16 @@ pub type EmitARM64 = class {
     self.globalRelocCap   := 32;
     self.globalRelocBuf   := mmap(0, self.globalRelocCap * 16, 3, 34, -1, 0);
     self.globalRelocCount := 0;
+
+    self.externCap   := 64;
+    self.externBuf   := mmap(0, self.externCap * 32, 3, 34, -1, 0);
+    self.externCount := 0;
   }
 
   fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
   fn getGlobalRelocCount(): int64 { return self.globalRelocCount; }
+  fn getExternBuf(): int64        { return self.externBuf; }
+  fn getExternCount(): int64      { return self.externCount; }
 
   fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
 
@@ -377,6 +394,8 @@ pub type EmitARM64 = class {
     if op == IRO_CALL         { self.emitCall(src1, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
+    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
+    if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
     // --- Control flow ---
     if op == IRO_JMP      { self.emitBranch(imm); }
@@ -685,6 +704,91 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
+  // FFI call (IRO_CALL_EXTERN). Args 0..argCount-1 → x0..x7, then load the
+  // resolved function address from an inline GOT slot the loader fills via
+  // R_AARCH64_GLOB_DAT, and BLR. nameStrOff/libStrOff index the IR string
+  // table; the symbol is deduped into externBuf (dynsym index = idx+1).
+  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64) {
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
+      ai := ai + 1;
+    }
+    var strBuf: int64 := peek64(self.ir + 32);
+    var namePtr: int64 := strBuf + nameStrOff;
+    var nameLen: int64 := StrLen(namePtr as pchar);
+    // Dedup by name.
+    var externIdx: int64 := -1;
+    var ei: int64 := 0;
+    while ei < self.externCount {
+      var eb: int64 := self.externBuf + ei * 32;
+      if peek64(eb + 8) == nameLen {
+        var em: int64 := 1;
+        var ej: int64 := 0;
+        while ej < nameLen {
+          if em != 0 {
+            if peek8(strBuf + peek64(eb) + ej) != peek8(namePtr + ej) { em := 0; }
+          }
+          ej := ej + 1;
+        }
+        if em != 0 { externIdx := ei; ei := self.externCount; }
+      }
+      ei := ei + 1;
+    }
+    if externIdx < 0 {
+      var libPtr: int64 := strBuf + libStrOff;
+      var libLen: int64 := StrLen(libPtr as pchar);
+      if self.externCount >= self.externCap {
+        var nc: int64 := self.externCap * 2;
+        var nb: int64 := mmap(0, nc * 32, 3, 34, -1, 0);
+        var ci: int64 := 0;
+        while ci < self.externCount * 32 { poke8(nb + ci, peek8(self.externBuf + ci)); ci := ci + 1; }
+        self.externBuf := nb; self.externCap := nc;
+      }
+      var nbase: int64 := self.externBuf + self.externCount * 32;
+      poke64(nbase,      nameStrOff);
+      poke64(nbase + 8,  nameLen);
+      poke64(nbase + 16, libStrOff);
+      poke64(nbase + 24, libLen);
+      externIdx := self.externCount;
+      self.externCount := self.externCount + 1;
+    }
+    // Inline GOT slot: LDR x9,[pc+8]; B +12; .quad 0; BLR x9
+    // ld.so writes the resolved symbol address into the .quad (GLOB_DAT).
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
+    self.emit32(0x14000003);        // B +12
+    self.emit64(0);                  // GOT slot (filled by loader)
+    self._recordRelocation(slotOff, ((externIdx + 1) << 32) | 1025, 0);  // R_AARCH64_GLOB_DAT
+    self.emit32(0xD63F0120);        // BLR x9
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // IRO_CONST_STR: load the runtime address of a string literal into `dest`.
+  // The string bytes are embedded inline in the code stream (jumped over by a
+  // B) and addressed PC-relatively with ADR — no data section, relocation or
+  // patching needed, which keeps this self-contained and works in the static
+  // ELF. `strOff` indexes the IR string table (null-terminated).
+  fn emitConstStr(strOff: int64, dest: int64) {
+    var strBuf: int64 := peek64(self.ir + 32);
+    var sp: int64 := strBuf + strOff;
+    var len: int64 := StrLen(sp as pchar);
+    var total: int64 := len + 1;                 // include NUL
+    var pad: int64 := (4 - (total & 3)) & 3;     // pad to 4-byte boundary
+    var padded: int64 := total + pad;
+    // ADR x0, #8  — the string begins 8 bytes (ADR + B) after this ADR.
+    self.emit32(0x10000040);
+    // B over the inline string: (4 + padded) bytes ahead of this B.
+    self.emit32(0x14000000 | ((4 + padded) >> 2));
+    // inline string bytes + NUL + padding
+    var i: int64 := 0;
+    while i < len { self.emit8(peek8(sp + i)); i := i + 1; }
+    self.emit8(0);
+    var p: int64 := 0;
+    while p < pad { self.emit8(0); p := p + 1; }
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
   fn emitBuiltinCall(id: int64, dest: int64) {
     // Builtin id dispatch — emit inline syscall or helper sequence
     if id == 1 {
@@ -936,6 +1040,21 @@ pub type EmitARM64 = class {
     self.emit32(val & 0xFFFFFFFF);
     self.emit32((val >> 32) & 0xFFFFFFFF);
   }
+
+  // Single byte (used to embed inline string-literal data in the code stream).
+  fn emit8(val: int64) {
+    if self.codeLen + 1 > self.codeCap {
+      var newCap: int64 := self.codeCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.codeLen { poke8(nb + i, peek8(self.codeBuf + i)); i := i + 1; }
+      self.codeBuf := nb;
+      self.codeCap := newCap;
+    }
+    poke8(self.codeBuf + self.codeLen, val & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
 
   fn poke32at(off: int64, val: int64) {
     poke8(self.codeBuf + off,     val & 0xFF);

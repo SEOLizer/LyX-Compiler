@@ -95,25 +95,46 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     return response;
   }
   
-  // Receive response
-  buf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
+  // Receive the full response. The request sends "Connection: close", so the
+  // server ends the TLS stream when done; we read into a growable buffer until
+  // TLSRead reports the close (<= 0). This handles responses far larger than a
+  // single TLS record — e.g. multi-MB package archives.
+  var cap: int64 := 65536;
+  buf := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (buf == 0) {
     TLSClose(conn);
     sys_close(tcpConn.fd);
     TLSFree(ctx);
     return response;
   }
-  
-  n := TLSRead(conn, buf, 8192);
+  var total: int64 := 0;
+  while (true) {
+    // Grow before each read so there is always room for a full chunk.
+    if (total + 16384 > cap) {
+      var newCap: int64 := cap * 2;
+      var nb: int64 := mmap(0, newCap, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (nb == 0) { break; }
+      var k: int64 := 0;
+      while (k < total) { poke8(nb + k, peek8(buf + k)); k := k + 1; }
+      munmap(buf, cap);
+      buf := nb;
+      cap := newCap;
+    }
+    var r: int64 := TLSRead(conn, buf + total, 16384);
+    if (r <= 0) { break; }
+    total := total + r;
+    if (total >= 67108864) { break; }   // 64 MiB safety cap
+  }
   TLSClose(conn);
   sys_close(tcpConn.fd);
   TLSFree(ctx);
-  
-  if (n <= 0) {
-    munmap(buf, 8192);
+
+  if (total <= 0) {
+    munmap(buf, cap);
     return response;
   }
-  
+  n := total;   // the parsing below scans the full accumulated response
+
   // Parse status line
   i := 0;
   while (i < n - 13) {
@@ -130,17 +151,23 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     i := i + 1;
   }
   
-  // Find Content-Length
+  // Find Content-Length. HTTP header names are case-insensitive, and CDNs
+  // (Cloudflare) send them lowercased — match on (byte | 0x20) so "content-
+  // length" and "Content-Length" both hit. ('-' is unaffected by | 0x20.)
   i := 0;
   while (i < n - 16) {
-    if (peek8(buf + i) == 67 && peek8(buf + i + 1) == 111 &&
-        peek8(buf + i + 2) == 110 && peek8(buf + i + 3) == 116 &&
-        peek8(buf + i + 4) == 101 && peek8(buf + i + 5) == 110 &&
-        peek8(buf + i + 6) == 116 && peek8(buf + i + 7) == 45 &&
-        peek8(buf + i + 8) == 76 && peek8(buf + i + 9) == 101 &&
-        peek8(buf + i + 10) == 110 && peek8(buf + i + 11) == 103 &&
-        peek8(buf + i + 12) == 116 && peek8(buf + i + 13) == 104) {
+    if ((peek8(buf + i) | 32) == 99 && (peek8(buf + i + 1) | 32) == 111 &&
+        (peek8(buf + i + 2) | 32) == 110 && (peek8(buf + i + 3) | 32) == 116 &&
+        (peek8(buf + i + 4) | 32) == 101 && (peek8(buf + i + 5) | 32) == 110 &&
+        (peek8(buf + i + 6) | 32) == 116 && (peek8(buf + i + 7) | 32) == 45 &&
+        (peek8(buf + i + 8) | 32) == 108 && (peek8(buf + i + 9) | 32) == 101 &&
+        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
+        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
       i := i + 14;
+      // Skip the ":" and any spaces between the header name and its value.
+      while (i < n && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) {
+        i := i + 1;
+      }
       response.contentLength := 0;
       while (i < n) {
         var c: int64 := peek8(buf + i);
@@ -182,8 +209,8 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
       }
     }
   }
-  
-  munmap(buf, 8192);
+
+  munmap(buf, cap);
   return response;
 }
 
