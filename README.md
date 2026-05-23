@@ -333,7 +333,7 @@ Lyx includes a comprehensive network library with **17 protocol implementations*
 // HTTP GET
 import std.net.http;
 var resp: HTTPResponse := HTTPGet("example.com", "/");
-PrintStr(resp.bodyPtr);
+Print(resp.bodyPtr);
 HTTPResponseFree(resp);
 
 // HTTPS (OpenSSL)
@@ -360,13 +360,13 @@ import std.net.imap;
 var imap: IMAPConn := IMAPConnect("imap.example.com", 143);
 IMAPLogin(imap, "user", "pass");
 var mbox: IMAPMailbox := IMAPSelect(imap, "INBOX");
-PrintInt(mbox.exists);
+PrintLn(mbox.exists);
 IMAPLogout(imap);
 
 // NTP Time
 import std.net.ntp;
 var time: NTPTime := NTPGetTime("pool.ntp.org");
-PrintInt(time.unixTime);
+PrintLn(time.unixTime);
 
 // MQTT Pub/Sub
 import std.net.mqtt;
@@ -409,7 +409,7 @@ SIPRegister(sip, "alice", "secret", "example.com");
 // Whois Domain Lookup
 import std.net.whois;
 var info: pchar := WhoisLookup("example.com");
-PrintStr(info);
+Print(info);
 ```
 
 ### Dependencies
@@ -806,10 +806,10 @@ unit;
 
 fn main(): int64 {
   if (VerifyIntegrity()) {
-    PrintStr("Integrity OK\n");
+    PrintLn("Integrity OK");
     return 0;
   } else {
-    PrintStr("Integrity FAIL\n");
+    PrintLn("Integrity FAIL");
     return 1;
   }
 }
@@ -1266,7 +1266,7 @@ readelf -h esp32_hello.elf
 macOS ARM64 (`examples/hello_macos_arm64.lyx`):
 ```lyx
 fn main(): int64 {
-  PrintStr("Hello from macOS ARM64 (Apple Silicon)!\n");
+  PrintLn("Hello from macOS ARM64 (Apple Silicon)!");
   return 0;
 }
 ```
@@ -1274,7 +1274,7 @@ fn main(): int64 {
 ESP32 (`examples/esp32_hello.lyx`):
 ```lyx
 fn main(): int64 {
-  PrintStr("Hello from ESP32!\n");
+  PrintLn("Hello from ESP32!");
   return 0;
 }
 ```
@@ -1291,7 +1291,7 @@ Lyx is **procedural** and **statically typed** — inspired by C and Rust, with 
 
 ```lyx
 fn main(): int64 {
-  PrintStr("Hello Lyx\n");
+  PrintLn("Hello Lyx");
   return 0;
 }
 ```
@@ -1309,8 +1309,7 @@ fn main(): int64 {
   x := x + 1;               // allowed: var is mutable
   // y := 0;                 // forbidden: let is immutable
 
-  PrintInt(x + y + z);
-  PrintStr("\n");
+  PrintLn(x + y + z);
   return 0;
 }
 ```
@@ -1335,10 +1334,10 @@ fn increment() {
 }
 
 fn main(): int64 {
-  PrintInt(globalCounter);  // 0
+  PrintLn(globalCounter);  // 0
   increment();
   increment();
-  PrintInt(globalCounter);  // 2
+  PrintLn(globalCounter);  // 2
   return 0;
 }
 ```
@@ -1355,12 +1354,12 @@ Global variables:
 
 ```lyx
 con LIMIT: int64 := 5;
-con MSG: pchar := "Loop\n";
+con MSG: pchar := "Loop";
 
 fn main(): int64 {
   var i: int64 := 0;
   while (i < LIMIT) {
-    PrintStr(MSG);
+    PrintLn(MSG);
     i := i + 1;
   }
   return 0;
@@ -1399,7 +1398,7 @@ import std.math;
 
 fn main(): int64 {
   let result: int64 := Abs64(-42);
-  PrintInt(TimesTwo(result));  // Output: 84
+  PrintLn(TimesTwo(result));  // Output: 84
   return 0;
 }
 ```
@@ -1667,20 +1666,16 @@ fn main(): int64 {
   // Dynamic array literal (heap-allocated)
   var dyn_arr: array := [10, 20, 30]; // ptr, len=3, cap=3
 
-  PrintInt(len(dyn_arr)); // Output: 3
-  PrintStr("\n");
+  PrintLn(len(dyn_arr)); // Output: 3
 
   // Add and remove elements
   push(dyn_arr, 40);      // dyn_arr is now [10, 20, 30, 40]
   push(dyn_arr, 50);      // dyn_arr is now [10, 20, 30, 40, 50]
   var last: int64 := pop(dyn_arr); // last = 50, dyn_arr is [10, 20, 30, 40]
 
-  PrintInt(len(dyn_arr)); // Output: 4
-  PrintStr("\n");
-  PrintInt(dyn_arr[0]);   // Output: 10
-  PrintStr("\n");
-  PrintInt(dyn_arr[3]);   // Output: 40
-  PrintStr("\n");
+  PrintLn(len(dyn_arr)); // Output: 4
+  PrintLn(dyn_arr[0]);   // Output: 10
+  PrintLn(dyn_arr[3]);   // Output: 40
 
   // Assign element
   dyn_arr[0] := 100;
@@ -1782,8 +1777,7 @@ fn main(): int64 {
   
   // Index access (get value by key)
   var score: int64 := scores[1];   // 100
-  PrintInt(score);
-  PrintStr("\n");
+  PrintLn(score);
   
   // Index assignment (insert or update)
   scores[4] := 400;                // Insert new key
@@ -1791,11 +1785,11 @@ fn main(): int64 {
   
   // Check if key exists
   if (1 in scores) {
-    PrintStr("Key 1 exists\n");
+    PrintLn("Key 1 exists");
   }
   
   // Get length
-  PrintInt(len(scores));           // 4
+  PrintLn(len(scores));           // 4
   
   return 0;
 }
@@ -1812,11 +1806,11 @@ fn main(): int64 {
   
   // Check membership
   if (20 in ids) {
-    PrintStr("20 is in the set\n");
+    PrintLn("20 is in the set");
   }
   
   // Get length
-  PrintInt(len(ids));              // 3
+  PrintLn(len(ids));              // 3
   
   return 0;
 }
@@ -1878,7 +1872,7 @@ import std.os;
 fn main(): int64 {
   // Process information
   var pid: int64 := get_pid();
-  PrintInt(pid);
+  PrintLn(pid);
   
   // Environment variables
   var home: pchar := env_get("HOME");
@@ -1939,12 +1933,12 @@ fn main(): int64 {
   var p: Point := Point { x: 10, y: 20 };
 
   // Field access with dot notation
-  PrintInt(p.x);        // 10
-  PrintInt(p.y);        // 20
+  PrintLn(p.x);        // 10
+  PrintLn(p.y);        // 20
 
   // Field assignment
   p.x := 42;
-  PrintInt(p.x);        // 42
+  PrintLn(p.x);        // 42
 
   // Structs in expressions
   var sum: int64 := p.x + p.y;  // 62
@@ -2046,7 +2040,7 @@ type Animal = class {
   name: pchar;
   
   fn speak() {
-    PrintStr("Some sound\n");
+    PrintLn("Some sound");
   }
 };
 
@@ -2054,7 +2048,7 @@ type Dog = class extends Animal {
   breed: pchar;
   
   fn speak() {
-    PrintStr("Woof!\n");
+    PrintLn("Woof!");
   }
   
   fn Create(n: pchar, b: pchar) {
@@ -2063,7 +2057,7 @@ type Dog = class extends Animal {
   }
   
   fn Destroy() {
-    PrintStr("Dog destroyed\n");
+    PrintLn("Dog destroyed");
   }
 };
 
@@ -2107,13 +2101,8 @@ fn main(): int64 {
   derived.extra := 30;
   
   // Polymorphic call via VMT
-  PrintStr("Base.GetValue(): ");
-  PrintInt(base.GetValue());    // Calls TBase.GetValue() -> 10
-  PrintStr("\n");
-  
-  PrintStr("Derived.GetValue(): ");
-  PrintInt(derived.GetValue()); // Calls TDerived.GetValue() -> 50
-  PrintStr("\n");
+  PrintLn("Base.GetValue(): ", base.GetValue());       // -> 10
+  PrintLn("Derived.GetValue(): ", derived.GetValue()); // -> 50
   
   dispose base;
   dispose derived;
@@ -2158,7 +2147,7 @@ fn main(): int64 {
   counter++;        // counter := counter + 1
   counter--;        // counter := counter - 1
   
-  PrintInt(counter);  // 1
+  PrintLn(counter);  // 1
   return 0;
 }
 ```
@@ -2187,7 +2176,7 @@ fn main(): int64 {
   // Equivalent to classic notation:
   // var result: int64 := addOne(double(x));
   
-  PrintInt(result);  // 11
+  PrintLn(result);  // 11
   return 0;
 }
 ```
@@ -2201,7 +2190,7 @@ fn add(a: int64, b: int64): int64 { return a + b; }
 
 fn main(): int64 {
   let result: int64 = 5 |> add(?, 3);  // equivalent to add(5, 3)
-  PrintInt(result);  // 8
+  PrintLn(result);  // 8
   return 0;
 }
 ```
@@ -2220,7 +2209,7 @@ fn clamp(v: int64, lo: int64, hi: int64): int64 {
 fn main(): int64 {
   var x: int64 := 42;
   var y: int64 := x |> clamp(?, 0, 100) |> double;
-  PrintInt(y);  // 84
+  PrintLn(y);  // 84
   return 0;
 }
 ```
@@ -2244,7 +2233,7 @@ fn main(): int64 {
   var s: pchar := IntToStr(x);
   var parsed: int64 := str_to_int(s);
   
-  PrintInt(parsed);  // 42
+  PrintLn(parsed);  // 42
   return 0;
 }
 ```
@@ -2263,9 +2252,9 @@ fn main(): int64 {
 fn main(): int64 {
   var x: int64 := 42;
   if (x > 10) {
-    PrintStr("greater\n");
+    PrintLn("greater");
   } else {
-    PrintStr("smaller\n");
+    PrintLn("smaller");
   }
   return 0;
 }
@@ -2277,8 +2266,7 @@ fn main(): int64 {
 fn main(): int64 {
   var i: int64 := 0;
   while (i < 5) {
-    PrintInt(i);
-    PrintStr("\n");
+    PrintLn(i);
     i := i + 1;
   }
   return 0;
@@ -2299,7 +2287,7 @@ fn main(): int64 {
 fn main(): int64 {
   var active: bool := true;
   if (active)
-    PrintStr("active\n");
+    PrintLn("active");
   return 0;
 }
 ```
@@ -2314,15 +2302,15 @@ Example (block bodies):
 fn classify(x: int64): int64 {
   switch (x % 3) {
     case 0: {
-      PrintStr("divisible by 3\n");
+      PrintLn("divisible by 3");
       return 0;
     }
     case 1: {
-      PrintStr("remainder 1\n");
+      PrintLn("remainder 1");
       return 1;
     }
     default: {
-      PrintStr("other\n");
+      PrintLn("other");
       return 2;
     }
   }
@@ -2333,9 +2321,9 @@ Example (single-statement bodies):
 
 ```lyx
 switch (n) {
-  case 0: PrintStr("zero\n");
-  case 1: PrintStr("one\n");
-  default: PrintStr("many\n");
+  case 0: PrintLn("zero");
+  case 1: PrintLn("one");
+  default: PrintLn("many");
 }
 ```
 
@@ -2352,8 +2340,7 @@ fn add(a: int64, b: int64): int64 {
 
 fn main(): int64 {
   var x: int64 := add(2, 3);
-  PrintInt(x);
-  PrintStr("\n");
+  PrintLn(x);
   return 0;
 }
 ```
@@ -2366,7 +2353,7 @@ Functions without return type are implicitly `void`:
 
 ```lyx
 fn greet() {
-  PrintStr("Hello!\n");
+  PrintLn("Hello!");
 }
 
 fn main(): int64 {
@@ -2380,12 +2367,16 @@ fn main(): int64 {
 Over 30 built-in functions are available without import:
 
 #### Basic I/O Builtins
-| Function          | Signature               | Description                        |
-|-------------------|------------------------|-------------------------------------|
-| `PrintStr(s)`    | `pchar -> void`        | Outputs string until `\0`           |
-| `PrintInt(x)`    | `int64 -> void`        | Outputs integer as decimal          |
-| `PrintFloat(x)`  | `f64 -> void`          | Outputs float with sign, integer part, and 6 decimal digits |
-| `exit(code)`      | `int64 -> void`        | Terminates program with exit code   |
+| Function           | Signature               | Description                        |
+|--------------------|------------------------|-------------------------------------|
+| `Print(a, ...)`   | `any… -> void`         | Output 1–6 args of any type (compile-time dispatch) |
+| `PrintLn(a, ...)` | `any… -> void`         | Like `Print`, appends `\n`          |
+| `EPrint(a, ...)`  | `any… -> void`         | Like `Print`, writes to stderr      |
+| `EPrintLn(a, ...)` | `any… -> void`        | Like `PrintLn`, writes to stderr    |
+| `PrintStr(s)`     | `pchar -> void`        | Output string until `\0` (single-arg) |
+| `PrintInt(x)`     | `int64 -> void`        | Output integer as decimal (single-arg) |
+| `PrintFloat(x)`   | `f64 -> void`          | Output float with sign + 6 decimals (single-arg) |
+| `exit(code)`      | `int64 -> void`        | Terminate program with exit code    |
 
 #### Debugging: In-Situ Data Visualizer
 
@@ -2445,9 +2436,8 @@ fn main(): int64 {
   var r1: int64 := Random();  // Random number
   var r2: int64 := Random();  // Another random number
   
-  PrintInt(r1);
-  PrintStr("\n");
-  PrintInt(r2);
+  PrintLn(r1);
+  PrintLn(r2);
   return 0;
 }
 ```
@@ -2484,8 +2474,7 @@ fn main(): int64 {
 ```lyx
 fn main(): int64 {
   var s: pchar := "Hello" + ", " + "World!";
-  PrintStr(s);  // Hello, World!
-  PrintStr("\n");
+  PrintLn(s);  // Hello, World!
   return 0;
 }
 ```
@@ -2500,7 +2489,7 @@ Import `std.string` for higher-level string utilities built on top of the builti
 import std.string;
 
 var t: pchar := StrTrim("  hello  ");
-PrintStr(t);   // hello
+Print(t);   // hello
 StrFree(t);
 ```
 
@@ -2533,14 +2522,13 @@ fn main(): int64 {
   sb.AppendInt(42);
 
   var result: pchar := sb.ToString();
-  PrintStr(result);    // Hello, World!42
-  PrintStr("\n");
+  PrintLn(result);    // Hello, World!42
   StrFree(result);
 
   sb.Clear();
   sb.Append("After clear");
   var r2: pchar := sb.ToString();
-  PrintStr(r2);        // After clear
+  Print(r2);          // After clear
   StrFree(r2);
 
   sb.FreeBuffer();
@@ -2570,10 +2558,8 @@ fn main(): int64 {
   var pi: f64 := 3.14159265358979;
   var vol: f64 := 12.5;
 
-  PrintStr(pi:0:2);    // 3.14
-  PrintStr("\n");
-  PrintStr(vol:0:4);   // 12.5000
-  PrintStr("\n");
+  PrintLn(pi:0:2);    // 3.14
+  PrintLn(vol:0:4);   // 12.5000
 
   return 0;
 }
@@ -2740,8 +2726,7 @@ fn main(): int64 {
   var starts: bool := StrStartsWith(text, "Hello"); // true
   var pos: int64 := StrFind(text, "World");          // 6
   
-  PrintInt(len);    // 11
-  PrintStr("\n");
+  PrintLn(len);    // 11
   return 0;
 }
 ```
@@ -2754,9 +2739,9 @@ fn main(): int64 {
   var y: f64 := 16.0;
   
   // Native Integer Math (no imports needed)
-  PrintInt(abs(x));         // 42
-  PrintInt(hi(x));          // High 32 bits
-  PrintInt(lo(x));          // Low 32 bits
+  PrintLn(abs(x));         // 42
+  PrintLn(hi(x));          // High 32 bits
+  PrintLn(lo(x));          // Low 32 bits
   
   // Native Float Math  
   var root: f64 := sqrt(y);  // 4.0
@@ -2778,9 +2763,8 @@ import std.env; // optional
 
 fn main(argc: int64, argv: pchar): int64 {
   // Automatic argc/argv initialization (no manual init() needed)
-  PrintIntLn(ArgCount());
-  PrintStr(Arg(0));
-  PrintStr("\n");
+  PrintLn(ArgCount());
+  PrintLn(Arg(0));
   
   // Combined usage of different libraries
   var result: int64 := Abs64(-123);
@@ -2797,12 +2781,9 @@ fn main(argc: int64, argv: pchar): int64 {
 
 ```lyx
 fn main(): int64 {
-  PrintInt(0);
-  PrintStr("\n");
-  PrintInt(12345);
-  PrintStr("\n");
-  PrintInt(-42);
-  PrintStr("\n");
+  PrintLn(0);
+  PrintLn(12345);
+  PrintLn(-42);
   return 0;
 }
 ```
@@ -2868,12 +2849,12 @@ fn main(): int64 {
   let buffer: pchar := malloc(256);
   
   // Use buffer (simplified)
-  PrintStr("Buffer allocated at: ");
+  Print("Buffer allocated at: ");
   
   // Free memory again
   free(buffer);
   
-  PrintStr("Memory freed\n");
+  PrintLn("Memory freed");
   return 0;
 }
 ```
@@ -2954,18 +2935,17 @@ fn main(): int64 {
     var div5: bool := (i % 5) == 0;
     
     if (div3 && div5) {
-      PrintStr("FizzBuzz\n");
+      PrintLn("FizzBuzz");
     } else {
       if (div3) {
-        PrintStr("Fizz\n");
+        PrintLn("Fizz");
       } else {
         if (div5) {
-          PrintStr("Buzz\n");
+          PrintLn("Buzz");
         } else {
           // Native string conversion
           var str: pchar := IntToStr(i);
-          PrintStr(str);
-          PrintStr("\n");
+          PrintLn(str);
         }
       }
     }
@@ -2981,37 +2961,27 @@ fn main(): int64 {
 import std.string;
 
 fn analyze_number(x: int64): void {
-  PrintStr("Analyzing: ");
-  PrintInt(x);
-  PrintStr("\n");
+  PrintLn("Analyzing: ", x);
   
   // Native Math Builtins
-  PrintStr("Absolute: ");
-  PrintInt(abs(x));
-  PrintStr("\n");
+  PrintLn("Absolute: ", abs(x));
   
   if (odd(x)) {
-    PrintStr("Number is odd\n");
+    PrintLn("Number is odd");
   } else {
-    PrintStr("Number is even\n");  
+    PrintLn("Number is even");
   }
   
   // String conversion and manipulation
   var str_val: pchar := IntToStr(abs(x));
   var len: int64 := StrLength(str_val);
   
-  PrintStr("String representation: '");
-  PrintStr(str_val);
-  PrintStr("' (length: ");
-  PrintInt(len);
-  PrintStr(")\n");
+  PrintLn("String representation: '", str_val, "' (length: ", len, ")");
   
   // Float casting and math
   var float_val: f64 := (abs(x) as f64);
   var sqrt_val: f64 := sqrt(float_val);
-  PrintStr("Square root: ");
-  PrintFloat(sqrt_val);
-  PrintStr("\n\n");
+  PrintLn("Square root: ", sqrt_val);
 }
 
 fn main(): int64 {

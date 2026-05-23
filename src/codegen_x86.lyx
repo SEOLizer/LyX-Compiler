@@ -123,20 +123,24 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:        offset 0   (65 bytes)
-//   _lyx_strlen:   offset 65  (15 bytes)
-//   _lyx_print_str:offset 80  (26 bytes)
-//   _lyx_print_int:offset 106 (104 bytes)
-//   _lyx_strsub:   offset 210 (71 bytes)
-//   _lyx_strcharat:offset 281 (6 bytes)
-//   user code:     offset 287
-con CG_H_START:     int64 := 0;
-con CG_H_STRLEN:    int64 := 65;
-con CG_H_PRINTSTR:  int64 := 80;
-con CG_H_PRINTINT:  int64 := 106;
-con CG_H_STRSUB:    int64 := 210;
-con CG_H_STRCHARAT: int64 := 281;
-con CG_H_USER:      int64 := 287;
+//   _start:          offset 0   (65 bytes)
+//   _lyx_strlen:     offset 65  (15 bytes)
+//   _lyx_print_str:  offset 80  (26 bytes)
+//   _lyx_print_int:  offset 106 (104 bytes)
+//   _lyx_strsub:     offset 210 (71 bytes)
+//   _lyx_strcharat:  offset 281 (6 bytes)
+//   _lyx_eprint_str: offset 287 (26 bytes)  — stderr variant
+//   _lyx_eprint_int: offset 313 (104 bytes) — stderr variant
+//   user code:       offset 417
+con CG_H_START:      int64 := 0;
+con CG_H_STRLEN:     int64 := 65;
+con CG_H_PRINTSTR:   int64 := 80;
+con CG_H_PRINTINT:   int64 := 106;
+con CG_H_STRSUB:     int64 := 210;
+con CG_H_STRCHARAT:  int64 := 281;
+con CG_H_EPRINTSTR:  int64 := 287;
+con CG_H_EPRINTINT:  int64 := 313;
+con CG_H_USER:       int64 := 417;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -2643,6 +2647,88 @@ pub type Codegen = class {
     }
   }
 
+  // Infer the print dispatch type for a single argument node.
+  // Returns: 0=int64/PrintInt  1=pchar/PrintStr  2=f64/PrintFloat  3=bool/PrintBool
+  fn cg_inferPrintType(argNi: int64): int64 {
+    var k: int64 := self.cg_nkind(argNi);
+    if (k == CGN_LIT_STR)  { return 1; }
+    if (k == CGN_LIT_FLOAT) { return 2; }
+    if (k == CGN_LIT_BOOL)  { return 3; }
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(argNi);
+      var nl: int64  := self.cg_nslen(argNi);
+      var lidx: int64 := self.cg_findLocalIdx(nm, nl);
+      if (lidx >= 0) {
+        var tb: int64  := self.localTypes + lidx * 16;
+        var tp: pchar  := peek64(tb) as pchar;
+        var tn: int64  := peek64(tb + 8);
+        if (self.cg_seq(tp, tn, "f64",   3)) { return 2; }
+        if (self.cg_seq(tp, tn, "pchar", 5)) { return 1; }
+        if (self.cg_seq(tp, tn, "bool",  4)) { return 3; }
+      } else {
+        var gidx: int64 := self.cg_findGlobalIdx(nm, nl);
+        if (gidx >= 0 && peek8(self.globalIsPchar + gidx) != 0) { return 1; }
+      }
+    }
+    return 0;
+  }
+
+  // Emit individual print calls for each argument in argNode list.
+  // Type is inferred per argument; addNewline=1 appends "\n"; isStderr=1 uses fd=2.
+  fn cg_genPrintMulti(argNode: int64, addNewline: int64, isStderr: int64) {
+    var hStr: int64 := CG_H_PRINTSTR;
+    var hInt: int64 := CG_H_PRINTINT;
+    if (isStderr == 1) { hStr := CG_H_EPRINTSTR; hInt := CG_H_EPRINTINT; }
+    var cur: int64 := argNode;
+    while (cur >= 0) {
+      var pt: int64 := self.cg_inferPrintType(cur);
+      self.cg_genExpr(cur);
+      // mov rdi, rax
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+      if (pt == 1) {
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, hStr - pp - 4);
+      } else if (pt == 2) {
+        // f64 stub: emit "0.0\0" constant and print it
+        var pfOff: int64 := self.dataLen;
+        self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(0);
+        self.cg_emitLeaRdiData(pfOff);
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, hStr - pp - 4);
+      } else if (pt == 3) {
+        var pbTOff: int64 := self.dataLen;
+        self.cg_edata(116); self.cg_edata(114); self.cg_edata(117); self.cg_edata(101); self.cg_edata(0);
+        var pbFOff: int64 := self.dataLen;
+        self.cg_edata(102); self.cg_edata(97); self.cg_edata(108); self.cg_edata(115); self.cg_edata(101); self.cg_edata(0);
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);  // test rdi, rdi
+        self.cg_e8(0x74);                                        // jz .pbFalse
+        var pbFJ: int64 := self.codeLen; self.cg_e8(0);
+        self.cg_emitLeaRdiData(pbTOff);
+        var ppbT: int64 := self.cg_emitCall();
+        poke32(self.code + ppbT, hStr - ppbT - 4);
+        self.cg_e8(0xEB);                                        // jmp .pbEnd
+        var pbEJ: int64 := self.codeLen; self.cg_e8(0);
+        poke8(self.code + pbFJ, self.codeLen - pbFJ - 1);
+        self.cg_emitLeaRdiData(pbFOff);
+        var ppbF: int64 := self.cg_emitCall();
+        poke32(self.code + ppbF, hStr - ppbF - 4);
+        poke8(self.code + pbEJ, self.codeLen - pbEJ - 1);
+      } else {
+        var pp: int64 := self.cg_emitCall();
+        poke32(self.code + pp, hInt - pp - 4);
+      }
+      cur := self.cg_nnext(cur);
+    }
+    if (addNewline == 1) {
+      var nlOff: int64 := self.dataLen;
+      self.cg_edata(10); self.cg_edata(0);
+      self.cg_emitLeaRdiData(nlOff);
+      var ppNL: int64 := self.cg_emitCall();
+      poke32(self.code + ppNL, hStr - ppNL - 4);
+    }
+    self.cg_zeroRax();
+  }
+
   // Generate a function call (NK_CALL node)
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
@@ -2697,6 +2783,24 @@ pub type Codegen = class {
           self.cg_genArrayPop(argNode);
           return;
         }
+      }
+      // Print / PrintLn multi-arg compile-time type dispatch (WP-OUT-01)
+      if (self.cg_seq(fname, fnlen, "Print", 5) ||
+          self.cg_seq(fname, fnlen, "PrintLn", 7) ||
+          self.cg_seq(fname, fnlen, "Println", 7)) {
+        var addNl: int64 := 0;
+        if (self.cg_seq(fname, fnlen, "PrintLn", 7) ||
+            self.cg_seq(fname, fnlen, "Println", 7)) { addNl := 1; }
+        self.cg_genPrintMulti(argNode, addNl, 0);
+        return;
+      }
+      // EPrint / EPrintLn multi-arg to stderr (WP-OUT-02)
+      if (self.cg_seq(fname, fnlen, "EPrint", 6) ||
+          self.cg_seq(fname, fnlen, "EPrintLn", 8)) {
+        var addNl: int64 := 0;
+        if (self.cg_seq(fname, fnlen, "EPrintLn", 8)) { addNl := 1; }
+        self.cg_genPrintMulti(argNode, addNl, 1);
+        return;
       }
     }
 
@@ -2781,15 +2885,59 @@ pub type Codegen = class {
 
     if (self.cg_seq(fname, fnlen, pstr, 8)) {
       // call _lyx_print_str  (rdi already has the arg)
-      // rel32 = target_offset - (operand_pos + 4) = CG_H_XXX - pp - 4
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_PRINTSTR - pp - 4;
-      poke32(self.code + pp, rel32);
+      poke32(self.code + pp, CG_H_PRINTSTR - pp - 4);
 
     } else if (self.cg_seq(fname, fnlen, pint, 8)) {
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_PRINTINT - pp - 4;
-      poke32(self.code + pp, rel32);
+      poke32(self.code + pp, CG_H_PRINTINT - pp - 4);
+
+    } else if (self.cg_seq(fname, fnlen, "EPrintStr", 9)) {
+      var pp: int64 := self.cg_emitCall();
+      poke32(self.code + pp, CG_H_EPRINTSTR - pp - 4);
+
+    } else if (self.cg_seq(fname, fnlen, "EPrintInt", 9)) {
+      var pp: int64 := self.cg_emitCall();
+      poke32(self.code + pp, CG_H_EPRINTINT - pp - 4);
+
+    } else if (self.cg_seq(fname, fnlen, "EPrintStrLn", 11)) {
+      // EPrintStrLn(s): EPrintStr(s) then "\n" to stderr
+      var pp: int64 := self.cg_emitCall();
+      poke32(self.code + pp, CG_H_EPRINTSTR - pp - 4);
+      var enlOff: int64 := self.dataLen;
+      self.cg_edata(10); self.cg_edata(0);
+      self.cg_emitLeaRdiData(enlOff);
+      var ppNL: int64 := self.cg_emitCall();
+      poke32(self.code + ppNL, CG_H_EPRINTSTR - ppNL - 4);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "EPrintFloat", 11)) {
+      // EPrintFloat(f): stub — print "0.0" to stderr
+      var epfOff: int64 := self.dataLen;
+      self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(0);
+      self.cg_emitLeaRdiData(epfOff);
+      var pp: int64 := self.cg_emitCall();
+      poke32(self.code + pp, CG_H_EPRINTSTR - pp - 4);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "EPrintBool", 10)) {
+      // EPrintBool(b): print "true" or "false" to stderr
+      var epbTOff: int64 := self.dataLen;
+      self.cg_edata(116); self.cg_edata(114); self.cg_edata(117); self.cg_edata(101); self.cg_edata(0);
+      var epbFOff: int64 := self.dataLen;
+      self.cg_edata(102); self.cg_edata(97); self.cg_edata(108); self.cg_edata(115); self.cg_edata(101); self.cg_edata(0);
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);  // test rdi, rdi
+      self.cg_e8(0x74); var epbFJ: int64 := self.codeLen; self.cg_e8(0);
+      self.cg_emitLeaRdiData(epbTOff);
+      var ppepbT: int64 := self.cg_emitCall();
+      poke32(self.code + ppepbT, CG_H_EPRINTSTR - ppepbT - 4);
+      self.cg_e8(0xEB); var epbEJ: int64 := self.codeLen; self.cg_e8(0);
+      poke8(self.code + epbFJ, self.codeLen - epbFJ - 1);
+      self.cg_emitLeaRdiData(epbFOff);
+      var ppepbF: int64 := self.cg_emitCall();
+      poke32(self.code + ppepbF, CG_H_EPRINTSTR - ppepbF - 4);
+      poke8(self.code + epbEJ, self.codeLen - epbEJ - 1);
+      self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, slen, 6)) {
       var pp: int64 := self.cg_emitCall();
@@ -3012,6 +3160,26 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "sys_shutdown", 12)) {
       // shutdown(sockfd, how): int64 -- sys_shutdown = 48
       self.cg_movRaxImm(48); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_fork", 8)) {
+      // fork(): int64 -- syscall 57; child returns 0, parent returns child PID
+      self.cg_movRaxImm(57); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_clone", 9)) {
+      // clone(flags, stack, parent_tid, child_tid, tls): int64 -- syscall 56
+      // Linux ABI: r10 = child_tid (4th arg), not rcx
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10, rcx
+      self.cg_movRaxImm(56); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_futex", 9)) {
+      // futex(addr, op, val, timeout, addr2, val3): int64 -- syscall 202
+      // Linux ABI: r10 = timeout (4th arg), not rcx
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10, rcx
+      self.cg_movRaxImm(202); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_gettid", 10)) {
+      // gettid(): int64 -- syscall 186
+      self.cg_movRaxImm(186); self.cg_e8(0x0F); self.cg_e8(0x05);
 
     } else if (self.cg_seq(fname, fnlen, "clock_gettime", 13)) {
       // WP-BC-44: clock_gettime(clockid: int64, ts: int64): int64 -- sys_clock_gettime = 228
@@ -5560,7 +5728,99 @@ pub type Codegen = class {
     // ret                  C3
     self.cg_e8(0xC3);
     // strcharat is 6 bytes  ✓
-    // Total helpers: 65+15+26+104+71+6 = 287 = CG_H_USER  ✓
+
+    // ---- _lyx_eprint_str (26 bytes, starts at offset 287) ---- stderr variant
+    // push rdi
+    self.cg_e8(0x57);
+    // call _lyx_strlen  (rel32 = 65 - (287+1+4+1) = 65 - 293 = -228)
+    self.cg_e8(0xE8); self.cg_e32(-228);
+    // mov rdx, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);
+    // pop rdi
+    self.cg_e8(0x5F);
+    // mov rsi, rdi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);
+    // mov edi, 2  (stderr)
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov eax, 1  (sys_write)
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // ret
+    self.cg_e8(0xC3);
+    // eprint_str is 26 bytes  ✓
+
+    // ---- _lyx_eprint_int (104 bytes, starts at offset 313) ---- stderr variant
+    // Identical to _lyx_print_int but writes to fd=2 instead of fd=1.
+    // sub rsp, 24          48 83 EC 18
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x18);
+    // lea rsi, [rsp+23]    48 8D 74 24 17
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x17);
+    // mov rax, rdi         48 89 F8
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);
+    // test rax, rax        48 85 C0
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    // jnz +8 (to .nonzero) 75 08
+    self.cg_e8(0x75); self.cg_e8(0x08);
+    // mov byte [rsi], '0'  C6 06 30
+    self.cg_e8(0xC6); self.cg_e8(0x06); self.cg_e8(0x30);
+    // dec rsi              48 FF CE
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);
+    // jmp .emit (+48)      EB 30
+    self.cg_e8(0xEB); self.cg_e8(0x30);
+    // .nonzero: test rax, rax  48 85 C0
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    // jge +3 (.digitloop, skip neg)  7D 03
+    self.cg_e8(0x7D); self.cg_e8(0x03);
+    // neg rax              48 F7 D8
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xD8);
+    // .digitloop: test rax, rax  48 85 C0
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    // jz +24 (.sign)       74 18
+    self.cg_e8(0x74); self.cg_e8(0x18);
+    // xor rdx, rdx         48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // mov rcx, 10          48 C7 C1 0A 00 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x0A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // idiv rcx             48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // add rdx, 48          48 83 C2 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x30);
+    // mov [rsi], dl        88 16
+    self.cg_e8(0x88); self.cg_e8(0x16);
+    // dec rsi              48 FF CE
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);
+    // jmp .digitloop (-29) EB E3
+    self.cg_e8(0xEB); self.cg_e8(0xE3);
+    // .sign: test rdi, rdi 48 85 FF
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);
+    // jns +6               79 06
+    self.cg_e8(0x79); self.cg_e8(0x06);
+    // mov byte [rsi], '-'  C6 06 2D
+    self.cg_e8(0xC6); self.cg_e8(0x06); self.cg_e8(0x2D);
+    // dec rsi              48 FF CE
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);
+    // .emit: inc rsi       48 FF C6
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);
+    // lea rdx, [rsp+23]    48 8D 54 24 17
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x17);
+    // sub rdx, rsi         48 29 F2
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xF2);
+    // inc rdx              48 FF C2
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC2);
+    // mov edi, 2           (stderr — only difference from print_int)  BF 02 00 00 00
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov eax, 1  (sys_write)  B8 01 00 00 00
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall              0F 05
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // add rsp, 24          48 83 C4 18
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x18);
+    // ret                  C3
+    self.cg_e8(0xC3);
+    // eprint_int is 104 bytes  ✓
+    // Total helpers: 65+15+26+104+71+6+26+104 = 417 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -5846,6 +6106,9 @@ pub type Codegen = class {
         var initNode: int64 := self.cg_nc1(cur);
         if (initNode >= 0 && self.cg_nkind(initNode) == CGN_LIT_INT) {
           self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), self.cg_nival(initNode));
+        } else if (initNode >= 0 && self.cg_nkind(initNode) == CGN_LIT_FLOAT) {
+          var floatBits: int64 := self.cg_parseFloat(self.pSrc, self.cg_nsoff(initNode), self.cg_nslen(initNode));
+          self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), floatBits);
         }
       } else if (k == CGN_ENUM_DECL) {
         // WP-10f: register each enum member as an int64 constant
