@@ -194,12 +194,18 @@ pub type Codegen = class {
   patchCount: int64;
   patchCap:   int64;
 
-  // FFI imports: each distinct `extern fn ... link "lib.so"` referenced by a
-  // call. Drives the GOT slots, .dynsym/.rela.dyn entries and DT_NEEDED list
-  // emitted by cg_writeELFDynamic. Entry = CG_EXTERN_SZ bytes.
-  externSyms:  int64;
-  externCount: int64;
-  externCap:   int64;
+  // FFI imports. externDecls holds every declared `extern fn ... link "lib"`
+  // (name + library) for lookup. externSyms holds only the ones actually
+  // CALLED — those get a GOT slot, .dynsym/.rela.dyn entry and DT_NEEDED. This
+  // lazy registration matters under DT_BIND_NOW: a declared-but-unused extern
+  // (or a stale/mis-named one) must not force the loader to resolve it.
+  // Both use CG_EXTERN_SZ-byte entries: namePtr,nameLen,libPtr,libLen.
+  externDecls:     int64;
+  externDeclCount: int64;
+  externDeclCap:   int64;
+  externSyms:      int64;
+  externCount:     int64;
+  externCap:       int64;
 
   // Parser output (set by Init)
   pSrc:   pchar;
@@ -817,6 +823,34 @@ pub type Codegen = class {
     poke64(base + 16, nlen);
     poke64(base + 24, kind);
     self.patchCount := self.patchCount + 1;
+  }
+
+  // Record a declared extern (lookup only — no GOT slot until it is called).
+  fn cg_addExternDecl(namePtr: pchar, nlen: int64, libPtr: int64, liblen: int64) {
+    if (self.externDeclCount >= self.externDeclCap) {
+      var nc: int64 := self.externDeclCap * 2;
+      var nb: int64 := mmap(0, nc * CG_EXTERN_SZ, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.externDeclCount * CG_EXTERN_SZ) { poke8(nb + i, peek8(self.externDecls + i)); i := i + 1; }
+      self.externDecls := nb; self.externDeclCap := nc;
+    }
+    var base: int64 := self.externDecls + self.externDeclCount * CG_EXTERN_SZ;
+    poke64(base,      namePtr as int64);
+    poke64(base + 8,  nlen);
+    poke64(base + 16, libPtr);
+    poke64(base + 24, liblen);
+    self.externDeclCount := self.externDeclCount + 1;
+  }
+
+  // Find a declared extern by name; returns its index in externDecls or -1.
+  fn cg_findExternDecl(namePtr: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.externDeclCount) {
+      var b: int64 := self.externDecls + i * CG_EXTERN_SZ;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), namePtr, nlen)) { return i; }
+      i := i + 1;
+    }
+    return -1;
   }
 
   // FFI import table: find an extern symbol by name, or register it.
@@ -4016,14 +4050,18 @@ pub type Codegen = class {
       self.cg_e8(0x58);  // pop rax (bytes_written)
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x18);  // add rsp, 24 (fd, data, len)
 
-    } else if (self.cg_findExtern(fname, fnlen) >= 0) {
-      // FFI call: indirect call through this symbol's GOT slot. The SysV ABI
-      // requires %rsp to be 16-byte aligned at the call, or libc/OpenSSL crash
-      // on aligned SSE moves (movaps). Lyx's own calls don't need this, so we
-      // align locally only for FFI: save rsp, align down, then restore after.
+    } else if (self.cg_findExternDecl(fname, fnlen) >= 0) {
+      // FFI call: register this declared extern's GOT slot now (lazy — only
+      // called externs get slots/relocations) and call indirectly through it.
+      // The SysV ABI requires %rsp 16-byte aligned at the call, or libc/OpenSSL
+      // crash on aligned SSE moves (movaps). Lyx's own calls don't need this,
+      // so we align locally only for FFI: save rsp, align down, restore after.
       // Args are already in rdi/rsi/rdx/rcx/r8/r9; aligning rsp doesn't touch
       // them. disp32 is patched in cg_writeELFDynamic once the GOT VA is known.
-      var exIdx: int64 := self.cg_findExtern(fname, fnlen);
+      var exd: int64 := self.cg_findExternDecl(fname, fnlen);
+      var edb: int64 := self.externDecls + exd * CG_EXTERN_SZ;
+      var exIdx: int64 := self.cg_addExtern(peek64(edb) as pchar, peek64(edb + 8),
+                                            peek64(edb + 16), peek64(edb + 24));
       self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xE3);            // mov r11, rsp
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
       self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
@@ -5735,8 +5773,8 @@ pub type Codegen = class {
           var libOff: int64 := libPacked & 0xFFFFFFFF;
           var libLen: int64 := (libPacked >> 32) & 0xFFFFFFFF;
           if (libLen > 0) {
-            self.cg_addExtern(self.cg_nsval(cur), self.cg_nslen(cur),
-                              (self.pSrc as int64) + libOff, libLen);
+            self.cg_addExternDecl(self.cg_nsval(cur), self.cg_nslen(cur),
+                                  (self.pSrc as int64) + libOff, libLen);
           }
         } else {
           self.cg_genFuncDecl(cur);
@@ -5877,6 +5915,9 @@ pub type Codegen = class {
     self.patches   := mmap(0, self.patchCap * CG_PATCH_SZ, 3, 34, -1, 0);
     self.patchCount := 0;
 
+    self.externDeclCap   := 128;
+    self.externDecls     := mmap(0, self.externDeclCap * CG_EXTERN_SZ, 3, 34, -1, 0);
+    self.externDeclCount := 0;
     self.externCap   := 64;
     self.externSyms  := mmap(0, self.externCap * CG_EXTERN_SZ, 3, 34, -1, 0);
     self.externCount := 0;
