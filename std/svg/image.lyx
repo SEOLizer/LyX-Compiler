@@ -1,0 +1,411 @@
+// std/svg/image.lyx
+// SVG image embedding: base64 encoder, JPEG/PNG parsing, <image> element
+
+@description("SVG images: base64 JPEG/PNG embedding, raw RGB→PNG, SvgDrawImage")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.svg.image;
+
+import std.svg.xml;
+
+// ============================================================================
+// Internal: next image ID
+// ============================================================================
+
+fn _svgNextImgId(doc: int64): int64 {
+  var id: int64 := peek64(doc + SVG_IMG_CNT);
+  poke64(doc + SVG_IMG_CNT, id + 1);
+  return id;
+}
+
+// ============================================================================
+// Base64 encoding (RFC 4648, no line breaks)
+// ============================================================================
+
+fn _b64Char(idx: int64): int64 {
+  if (idx < 26) { return 65 + idx; }
+  if (idx < 52) { return 97 + (idx - 26); }
+  if (idx < 62) { return 48 + (idx - 52); }
+  if (idx == 62) { return 43; }
+  return 47;
+}
+
+fn _b64EncodeToDefs(doc: int64, src: int64, srcLen: int64): void {
+  var tmp: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  if (tmp == 0) { return; }
+  var i: int64 := 0;
+  var pos: int64 := 0;
+  while (i < srcLen) {
+    var b0: int64 := peek8(src + i); i := i + 1;
+    var b1: int64 := 0;
+    var b2: int64 := 0;
+    var have2: int64 := 0;
+    var have3: int64 := 0;
+    if (i < srcLen) { b1 := peek8(src + i); i := i + 1; have2 := 1; }
+    if (i < srcLen) { b2 := peek8(src + i); i := i + 1; have3 := 1; }
+    poke8(tmp + pos, _b64Char((b0 >> 2) & 0x3F)); pos := pos + 1;
+    poke8(tmp + pos, _b64Char(((b0 & 3) << 4) | ((b1 >> 4) & 0xF))); pos := pos + 1;
+    if (have2 == 1) { poke8(tmp + pos, _b64Char(((b1 & 0xF) << 2) | ((b2 >> 6) & 3))); }
+    else            { poke8(tmp + pos, 61); }
+    pos := pos + 1;
+    if (have3 == 1) { poke8(tmp + pos, _b64Char(b2 & 0x3F)); }
+    else            { poke8(tmp + pos, 61); }
+    pos := pos + 1;
+    if (pos >= 4092) { _svgDbytes(doc, tmp, pos); pos := 0; }
+  }
+  if (pos > 0) { _svgDbytes(doc, tmp, pos); }
+  munmap(tmp, 4096);
+}
+
+fn _b64EncodeToMain(doc: int64, src: int64, srcLen: int64): void {
+  var tmp: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  if (tmp == 0) { return; }
+  var i: int64 := 0;
+  var pos: int64 := 0;
+  while (i < srcLen) {
+    var b0: int64 := peek8(src + i); i := i + 1;
+    var b1: int64 := 0;
+    var b2: int64 := 0;
+    var have2: int64 := 0;
+    var have3: int64 := 0;
+    if (i < srcLen) { b1 := peek8(src + i); i := i + 1; have2 := 1; }
+    if (i < srcLen) { b2 := peek8(src + i); i := i + 1; have3 := 1; }
+    poke8(tmp + pos, _b64Char((b0 >> 2) & 0x3F)); pos := pos + 1;
+    poke8(tmp + pos, _b64Char(((b0 & 3) << 4) | ((b1 >> 4) & 0xF))); pos := pos + 1;
+    if (have2 == 1) { poke8(tmp + pos, _b64Char(((b1 & 0xF) << 2) | ((b2 >> 6) & 3))); }
+    else            { poke8(tmp + pos, 61); }
+    pos := pos + 1;
+    if (have3 == 1) { poke8(tmp + pos, _b64Char(b2 & 0x3F)); }
+    else            { poke8(tmp + pos, 61); }
+    pos := pos + 1;
+    if (pos >= 4092) { _svgWbytes(doc, tmp, pos); pos := 0; }
+  }
+  if (pos > 0) { _svgWbytes(doc, tmp, pos); }
+  munmap(tmp, 4096);
+}
+
+// ============================================================================
+// File reader: returns mmap'd ptr, stores exact size in SVG_PARAM_A
+// ============================================================================
+
+fn _imgReadFile(doc: int64, path: pchar): int64 {
+  var fd: int64 := open(path, 0, 0);
+  if (fd < 0) { poke64(doc + SVG_PARAM_A, 0); return 0; }
+  var cap: int64 := 65536;
+  var tbuf: int64 := mmap(0, cap, 3, 34, -1, 0);
+  if (tbuf == 0) { close(fd); poke64(doc + SVG_PARAM_A, 0); return 0; }
+  var total: int64 := 0;
+  var more: int64 := 1;
+  while (more == 1) {
+    if (total + 4096 > cap) {
+      var newcap: int64 := cap + cap;
+      var newbuf: int64 := mmap(0, newcap, 3, 34, -1, 0);
+      if (newbuf == 0) { more := 0; }
+      else {
+        var k: int64 := 0;
+        while (k < total) { poke8(newbuf + k, peek8(tbuf + k)); k := k + 1; }
+        munmap(tbuf, cap);
+        tbuf := newbuf; cap := newcap;
+        var n: int64 := read(fd, tbuf + total, 4096);
+        if (n <= 0) { more := 0; } else { total := total + n; }
+      }
+    } else {
+      var n: int64 := read(fd, tbuf + total, 4096);
+      if (n <= 0) { more := 0; } else { total := total + n; }
+    }
+  }
+  close(fd);
+  if (total == 0) { munmap(tbuf, cap); poke64(doc + SVG_PARAM_A, 0); return 0; }
+  // Copy to exact-sized buffer so munmap(buf, SVG_PARAM_A) is safe
+  var finbuf: int64 := mmap(0, total, 3, 34, -1, 0);
+  if (finbuf == 0) { munmap(tbuf, cap); poke64(doc + SVG_PARAM_A, 0); return 0; }
+  var j: int64 := 0;
+  while (j < total) { poke8(finbuf + j, peek8(tbuf + j)); j := j + 1; }
+  munmap(tbuf, cap);
+  poke64(doc + SVG_PARAM_A, total);
+  return finbuf;
+}
+
+// ============================================================================
+// JPEG dimension parser (reads SOF marker: FF C0/C1/C2)
+// Results stored in SVG_PARAM_B (width), SVG_PARAM_C (height)
+// ============================================================================
+
+fn _imgJpegDims(doc: int64, data: int64, len: int64): void {
+  poke64(doc + SVG_PARAM_B, 0);
+  poke64(doc + SVG_PARAM_C, 0);
+  if (len < 4) { return; }
+  if (peek8(data) != 0xFF) { return; }
+  if (peek8(data + 1) != 0xD8) { return; }
+  var i: int64 := 2;
+  var found: int64 := 0;
+  while ((i < len - 8) && (found == 0)) {
+    if (peek8(data + i) == 0xFF) {
+      var m: int64 := peek8(data + i + 1);
+      // SOF markers: C0-CF except C4 (DHT), C8 (JPEG), CC (DAC)
+      if ((m >= 0xC0) && (m <= 0xCF) && (m != 0xC4) && (m != 0xC8) && (m != 0xCC)) {
+        if (i + 8 < len) {
+          poke64(doc + SVG_PARAM_B, (peek8(data + i + 7) << 8) | peek8(data + i + 8));
+          poke64(doc + SVG_PARAM_C, (peek8(data + i + 5) << 8) | peek8(data + i + 6));
+        }
+        found := 1;
+      } else {
+        if (i + 3 < len) {
+          var segLen: int64 := (peek8(data + i + 2) << 8) | peek8(data + i + 3);
+          i := i + 2 + segLen;
+        } else { i := i + 2; }
+      }
+    } else { i := i + 1; }
+  }
+}
+
+// ============================================================================
+// PNG dimension parser (reads IHDR chunk at fixed offset)
+// Results stored in SVG_PARAM_B (width), SVG_PARAM_C (height)
+// ============================================================================
+
+fn _imgPngDims(doc: int64, data: int64, len: int64): void {
+  poke64(doc + SVG_PARAM_B, 0);
+  poke64(doc + SVG_PARAM_C, 0);
+  if (len < 24) { return; }
+  if (peek8(data) != 0x89) { return; }
+  if (peek8(data + 1) != 0x50) { return; }  // 'P'
+  // IHDR width at offset 16, height at offset 20
+  var w: int64 := (peek8(data + 16) << 24) | (peek8(data + 17) << 16) | (peek8(data + 18) << 8) | peek8(data + 19);
+  var h: int64 := (peek8(data + 20) << 24) | (peek8(data + 21) << 16) | (peek8(data + 22) << 8) | peek8(data + 23);
+  poke64(doc + SVG_PARAM_B, w);
+  poke64(doc + SVG_PARAM_C, h);
+}
+
+// ============================================================================
+// CRC-32 (PNG, DEFLATE polynomial 0xEDB88320)
+// ============================================================================
+
+fn _crc32Step(crc: int64, b: int64): int64 {
+  crc := crc ^ (b & 0xFF);
+  var j: int64 := 0;
+  while (j < 8) {
+    if ((crc & 1) != 0) { crc := ((crc >> 1) & 0x7FFFFFFFFFFFFFFF) ^ 0xEDB88320; }
+    else                { crc := (crc >> 1) & 0x7FFFFFFFFFFFFFFF; }
+    j := j + 1;
+  }
+  return crc & 0xFFFFFFFF;
+}
+
+fn _crc32Buf(data: int64, len: int64): int64 {
+  var crc: int64 := 0xFFFFFFFF;
+  var i: int64 := 0;
+  while (i < len) { crc := _crc32Step(crc, peek8(data + i)); i := i + 1; }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// ============================================================================
+// PNG binary write helpers
+// ============================================================================
+
+fn _pngBE4(buf: int64, pos: int64, v: int64): int64 {
+  poke8(buf + pos,     (v >> 24) & 0xFF);
+  poke8(buf + pos + 1, (v >> 16) & 0xFF);
+  poke8(buf + pos + 2, (v >> 8)  & 0xFF);
+  poke8(buf + pos + 3,  v        & 0xFF);
+  return pos + 4;
+}
+
+// ============================================================================
+// Raw RGB → uncompressed PNG (zlib level 0 / stored blocks)
+// Returns mmap'd PNG data ptr; stores exact size in SVG_PARAM_A.
+// ============================================================================
+
+fn _svgRGBtoPNG(doc: int64, pixels: int64, w: int64, h: int64): int64 {
+  var rowBytes: int64 := w * 3;
+  var rawLen: int64 := h * (1 + rowBytes);
+  var nBlocks: int64 := (rawLen + 65534) / 65535;
+  var idatDataLen: int64 := 2 + nBlocks * 5 + rawLen + 4;
+  var pngSize: int64 := 8 + 25 + 4 + 4 + idatDataLen + 4 + 12;
+
+  var buf: int64 := mmap(0, pngSize, 3, 34, -1, 0);
+  if (buf == 0) { poke64(doc + SVG_PARAM_A, 0); return 0; }
+
+  var pos: int64 := 0;
+
+  // PNG signature
+  poke8(buf, 0x89); poke8(buf+1, 0x50); poke8(buf+2, 0x4E); poke8(buf+3, 0x47);
+  poke8(buf+4, 0x0D); poke8(buf+5, 0x0A); poke8(buf+6, 0x1A); poke8(buf+7, 0x0A);
+  pos := 8;
+
+  // IHDR chunk
+  pos := _pngBE4(buf, pos, 13);
+  var ihdrStart: int64 := pos;
+  poke8(buf+pos, 73); poke8(buf+pos+1, 72); poke8(buf+pos+2, 68); poke8(buf+pos+3, 82);  // "IHDR"
+  pos := pos + 4;
+  pos := _pngBE4(buf, pos, w);
+  pos := _pngBE4(buf, pos, h);
+  poke8(buf+pos, 8);  pos := pos + 1;  // bit depth
+  poke8(buf+pos, 2);  pos := pos + 1;  // color type: RGB
+  poke8(buf+pos, 0);  pos := pos + 1;  // compression
+  poke8(buf+pos, 0);  pos := pos + 1;  // filter method
+  poke8(buf+pos, 0);  pos := pos + 1;  // interlace
+  pos := _pngBE4(buf, pos, _crc32Buf(buf + ihdrStart, 17));
+
+  // IDAT chunk header
+  pos := _pngBE4(buf, pos, idatDataLen);
+  var idatStart: int64 := pos;
+  poke8(buf+pos, 73); poke8(buf+pos+1, 68); poke8(buf+pos+2, 65); poke8(buf+pos+3, 84);  // "IDAT"
+  pos := pos + 4;
+
+  // zlib header: CMF=0x78 FLG=0x01 (stored, no dict)
+  poke8(buf+pos, 0x78); pos := pos + 1;
+  poke8(buf+pos, 0x01); pos := pos + 1;
+
+  // DEFLATE stored blocks + Adler32
+  var adlerS1: int64 := 1;
+  var adlerS2: int64 := 0;
+  var remaining: int64 := rawLen;
+  var curRow: int64 := 0;
+  var curCol: int64 := 0;  // 0 = filter byte, 1..rowBytes = pixel bytes
+
+  while (remaining > 0) {
+    var blkLen: int64 := remaining;
+    if (blkLen > 65535) { blkLen := 65535; }
+    var bfinal: int64 := 0;
+    if (blkLen == remaining) { bfinal := 1; }
+    poke8(buf+pos, bfinal); pos := pos + 1;
+    poke8(buf+pos, blkLen & 0xFF);         pos := pos + 1;
+    poke8(buf+pos, (blkLen >> 8) & 0xFF);  pos := pos + 1;
+    var nlen: int64 := (blkLen ^ 0xFFFF) & 0xFFFF;
+    poke8(buf+pos, nlen & 0xFF);           pos := pos + 1;
+    poke8(buf+pos, (nlen >> 8) & 0xFF);    pos := pos + 1;
+
+    var written: int64 := 0;
+    while (written < blkLen) {
+      var b: int64 := 0;
+      if (curCol == 0) { b := 0; }
+      else { b := peek8(pixels + curRow * rowBytes + (curCol - 1)); }
+      poke8(buf+pos, b); pos := pos + 1;
+      adlerS1 := (adlerS1 + b) % 65521;
+      adlerS2 := (adlerS2 + adlerS1) % 65521;
+      curCol := curCol + 1;
+      if (curCol > rowBytes) { curCol := 0; curRow := curRow + 1; }
+      written := written + 1;
+    }
+    remaining := remaining - blkLen;
+  }
+
+  // Adler32 (big-endian)
+  pos := _pngBE4(buf, pos, (adlerS2 << 16) | adlerS1);
+  // IDAT CRC: over type(4) + data(idatDataLen) bytes
+  pos := _pngBE4(buf, pos, _crc32Buf(buf + idatStart, 4 + idatDataLen));
+
+  // IEND chunk
+  pos := _pngBE4(buf, pos, 0);
+  poke8(buf+pos, 73); poke8(buf+pos+1, 69); poke8(buf+pos+2, 78); poke8(buf+pos+3, 68);  // "IEND"
+  pos := pos + 4;
+  pos := _pngBE4(buf, pos, 0xAE426082);
+
+  poke64(doc + SVG_PARAM_A, pngSize);
+  return buf;
+}
+
+// ============================================================================
+// Internal: write <image id="imgN" href="data:TYPE;base64,..."> to defs
+// ============================================================================
+
+fn _svgWriteImgDef(doc: int64, imgId: int64, mime: pchar, buf: int64, len: int64, w: int64, h: int64): void {
+  _defsIndent(doc);
+  _svgD(doc, "<image id=\"img"); _svgDi(doc, imgId);
+  _svgD(doc, "\" href=\"data:"); _svgD(doc, mime); _svgD(doc, ";base64,");
+  _b64EncodeToDefs(doc, buf, len);
+  _svgDc(doc, 34);
+  if (w > 0) { _svgD(doc, " width=\"");  _svgDi(doc, w); _svgDc(doc, 34); }
+  if (h > 0) { _svgD(doc, " height=\""); _svgDi(doc, h); _svgDc(doc, 34); }
+  _svgD(doc, " preserveAspectRatio=\"xMidYMid meet\"/>");
+  _defsNL(doc);
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn SvgAddImageJpeg(doc: int64, path: pchar): int64 {
+  if (doc == 0) { return -1; }
+  var buf: int64 := _imgReadFile(doc, path);
+  if (buf == 0) { return -1; }
+  var len: int64 := peek64(doc + SVG_PARAM_A);
+  _imgJpegDims(doc, buf, len);
+  var w: int64 := peek64(doc + SVG_PARAM_B);
+  var h: int64 := peek64(doc + SVG_PARAM_C);
+  var imgId: int64 := _svgNextImgId(doc);
+  _svgWriteImgDef(doc, imgId, "image/jpeg", buf, len, w, h);
+  munmap(buf, len);
+  return imgId;
+}
+
+pub fn SvgAddImagePng(doc: int64, path: pchar): int64 {
+  if (doc == 0) { return -1; }
+  var buf: int64 := _imgReadFile(doc, path);
+  if (buf == 0) { return -1; }
+  var len: int64 := peek64(doc + SVG_PARAM_A);
+  _imgPngDims(doc, buf, len);
+  var w: int64 := peek64(doc + SVG_PARAM_B);
+  var h: int64 := peek64(doc + SVG_PARAM_C);
+  var imgId: int64 := _svgNextImgId(doc);
+  _svgWriteImgDef(doc, imgId, "image/png", buf, len, w, h);
+  munmap(buf, len);
+  return imgId;
+}
+
+pub fn SvgAddImageRGB(doc: int64, ptr: int64, w: int64, h: int64): int64 {
+  if (doc == 0) { return -1; }
+  var png: int64 := _svgRGBtoPNG(doc, ptr, w, h);
+  if (png == 0) { return -1; }
+  var pngLen: int64 := peek64(doc + SVG_PARAM_A);
+  var imgId: int64 := _svgNextImgId(doc);
+  _svgWriteImgDef(doc, imgId, "image/png", png, pngLen, w, h);
+  munmap(png, pngLen);
+  return imgId;
+}
+
+pub fn SvgDrawImage(doc: int64, imgId: int64, x: f64, y: f64, w: f64, h: f64): void {
+  if (doc == 0) { return; }
+  _svgFlushPendingGroup(doc);
+  _svgIndent(doc);
+  _svgW(doc, "<use href=\"#img"); _svgWi(doc, imgId); _svgWc(doc, 34);
+  _svgW(doc, " x=\""); _svgWf(doc, x); _svgWc(doc, 34);
+  _svgW(doc, " y=\""); _svgWf(doc, y); _svgWc(doc, 34);
+  _svgW(doc, " width=\"");  _svgWf(doc, w); _svgWc(doc, 34);
+  _svgW(doc, " height=\""); _svgWf(doc, h); _svgWc(doc, 34);
+  _svgW(doc, "/>"); _svgNL(doc);
+}
+
+pub fn SvgDrawImageFit(doc: int64, imgId: int64, x: f64, y: f64, mw: f64, mh: f64): void {
+  if (doc == 0) { return; }
+  _svgFlushPendingGroup(doc);
+  _svgIndent(doc);
+  _svgW(doc, "<use href=\"#img"); _svgWi(doc, imgId); _svgWc(doc, 34);
+  _svgW(doc, " x=\""); _svgWf(doc, x); _svgWc(doc, 34);
+  _svgW(doc, " y=\""); _svgWf(doc, y); _svgWc(doc, 34);
+  _svgW(doc, " width=\"");  _svgWf(doc, mw); _svgWc(doc, 34);
+  _svgW(doc, " height=\""); _svgWf(doc, mh); _svgWc(doc, 34);
+  _svgW(doc, "/>"); _svgNL(doc);
+}
+
+pub fn SvgImageFile(doc: int64, path: pchar, x: f64, y: f64, w: f64, h: f64): void {
+  if (doc == 0) { return; }
+  var buf: int64 := _imgReadFile(doc, path);
+  if (buf == 0) { return; }
+  var len: int64 := peek64(doc + SVG_PARAM_A);
+  // Detect type from magic bytes
+  var mime: pchar := "image/jpeg";
+  if (peek8(buf) == 0x89) { mime := "image/png"; }
+  _svgFlushPendingGroup(doc);
+  _svgIndent(doc);
+  _svgW(doc, "<image href=\"data:"); _svgW(doc, mime); _svgW(doc, ";base64,");
+  _b64EncodeToMain(doc, buf, len);
+  _svgWc(doc, 34);
+  _svgW(doc, " x=\""); _svgWf(doc, x); _svgWc(doc, 34);
+  _svgW(doc, " y=\""); _svgWf(doc, y); _svgWc(doc, 34);
+  _svgW(doc, " width=\"");  _svgWf(doc, w); _svgWc(doc, 34);
+  _svgW(doc, " height=\""); _svgWf(doc, h); _svgWc(doc, 34);
+  _svgW(doc, "/>"); _svgNL(doc);
+  munmap(buf, len);
+}
