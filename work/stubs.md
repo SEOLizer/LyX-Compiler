@@ -15,7 +15,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 
 | WP | Datei(en) | Inhalt | Aufwand | Status |
 |---|---|---|---|---|
-| WP-STB-01 | `std/datetime.lyx` | 22 leere Funktionen: Format, Parse, Arithmetik, Timezone | L | ⬜ |
+| WP-STB-01 | `std/datetime.lyx` | 22 leere Funktionen: Format, Parse, Arithmetik, Timezone | L | ✅ |
 | WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ⬜ |
 | WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ⬜ |
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ⬜ |
@@ -37,7 +37,7 @@ Aufwand-Schätzung: XS < 1h · S = 1–2h · M = 3–6h · L = 1–2 Tage · XL 
 
 ---
 
-### WP-STB-01: `datetime.lyx` — Format / Parse / Arithmetik / Timezone ⬜
+### WP-STB-01: `datetime.lyx` — Format / Parse / Arithmetik / Timezone ✅
 
 **Branch:** `feat/std-stubs-01`
 **Datei:** `std/datetime.lyx`
@@ -548,3 +548,4 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 | Datum | Änderung |
 |---|---|
 | 2026-05-23 | Initiale Erstellung — 13 WPs aus Stub-Audit |
+| 2026-05-23 | WP-STB-01 ✅ — datetime.lyx vollständig. Zwei Bugs entdeckt: Off-by-one Jan/Feb (Hinnant-Algorithmus), negative Division in Lyx unsigned behandelt |
