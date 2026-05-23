@@ -9,7 +9,7 @@
 // Condition var:    futex on a sequence counter at cond.ptr (mmap'd).
 // Atomics:          best-effort (no lock cmpxchg builtin yet; race window tiny
 //                   on x86-64 due to naturally atomic aligned 64-bit stores).
-// TLS:              not implemented (requires FS/GS segment register access).
+// TLS:              global mmap table, tid → slot → key values (Option A).
 
 @description("Thread creation and synchronization via clone(2) + futex(2)")
 @author("Andreas Röne")
@@ -32,6 +32,20 @@ con CLONE_CHILD_CLEARTID: int64 := 2097152;
 con THREAD_FLAGS: int64 := 19205888;
 
 con THREAD_STACK_SIZE: int64 := 2097152;  // 2 MB per thread
+
+// ============================================================================
+// TLS constants
+// ============================================================================
+con MAX_TLS_THREADS: int64 := 64;   // max concurrent threads tracked
+con MAX_TLS_KEYS:    int64 := 32;   // max TLS keys per thread
+// slot layout: 8 bytes tid + 32*8 bytes values = 264 bytes
+con TLS_SLOT_SIZE:   int64 := 264;
+con TLS_TABLE_SIZE:  int64 := 16896; // 64 * 264
+
+// Global TLS table (mmap pointer, 0 = not yet initialised).
+// Initialised lazily by TLSKeyCreate(); must be called before TLSSetValue/Get.
+var g_tls_table:     int64 := 0;
+var g_tls_key_count: int64 := 0;
 
 // ============================================================================
 // futex(2) operations
@@ -64,7 +78,7 @@ pub type Cond = struct {
   ptr: int64;
 };
 
-// Thread-local storage key (stub — requires FS/GS segment access)
+// Thread-local storage key (index into the per-thread slot, ≥ 1)
 pub type TLSKey = int64;
 
 // Shared memory buffer accessible by all threads.
@@ -295,9 +309,70 @@ pub fn CAS(a: Atomic, expected: int64, newVal: int64): int64 {
 }
 
 // ============================================================================
-// Thread-local storage (stub — requires FS/GS segment register access)
+// Thread-local storage
+//
+// Implementation: a process-global mmap'd table, indexed by thread slot.
+// Each slot holds the TID of the owning thread plus MAX_TLS_KEYS int64 values.
+// Slot lookup is O(MAX_TLS_THREADS) linear scan; allocation is first-fit.
+//
+// Note: TLSKeyCreate() initialises the table and must be called (from any
+// thread) before TLSSetValue/GetValue. Key allocation is not thread-safe —
+// call TLSKeyCreate() during single-threaded startup only.
 // ============================================================================
 
-pub fn TLSKeyCreate(): TLSKey { return 0; }
-pub fn TLSSetValue(key: TLSKey, value: int64): int64 { return 0; }
-pub fn TLSGetValue(key: TLSKey): int64 { return 0; }
+// Internal: initialise the TLS table on first call.
+fn _tlsInit(): void {
+    if (g_tls_table != 0) { return; }
+    // MAP_ANONYMOUS pages are zero-initialised, so tid fields start at 0 (unused).
+    g_tls_table     := mmap(0, TLS_TABLE_SIZE, 3, 34, -1, 0);
+    g_tls_key_count := 1;  // key 0 reserved; valid keys start at 1
+}
+
+// Internal: find (or allocate) the TLS slot for `tid`.
+// Returns slot base address, or 0 if the table is full.
+fn _tlsFindSlot(tid: int64): int64 {
+    if (g_tls_table == 0) { return 0; }
+    var i: int64 := 0;
+    var firstEmpty: int64 := -1;
+    while (i < MAX_TLS_THREADS) {
+        var slotBase: int64 := g_tls_table + i * TLS_SLOT_SIZE;
+        var slotTid: int64 := peek64(slotBase);
+        if (slotTid == tid) { return slotBase; }
+        if (slotTid == 0 && firstEmpty < 0) { firstEmpty := i; }
+        i := i + 1;
+    }
+    if (firstEmpty < 0) { return 0; }  // table full
+    var newBase: int64 := g_tls_table + firstEmpty * TLS_SLOT_SIZE;
+    poke64(newBase, tid);  // claim slot
+    return newBase;
+}
+
+// TLSKeyCreate: allocate a new TLS key. Returns the key (≥ 1), or 0 on error.
+pub fn TLSKeyCreate(): TLSKey {
+    _tlsInit();
+    if (g_tls_key_count >= MAX_TLS_KEYS) { return 0; }
+    var key: int64 := g_tls_key_count;
+    g_tls_key_count := g_tls_key_count + 1;
+    return key;
+}
+
+// TLSSetValue: store `value` under `key` for the calling thread.
+// Returns 0 on success, -1 on error.
+pub fn TLSSetValue(key: TLSKey, value: int64): int64 {
+    if (g_tls_table == 0 || key <= 0 || key >= MAX_TLS_KEYS) { return -1; }
+    var tid: int64 := sys_gettid();
+    var slot: int64 := _tlsFindSlot(tid);
+    if (slot == 0) { return -1; }
+    poke64(slot + 8 + key * 8, value);
+    return 0;
+}
+
+// TLSGetValue: retrieve the value stored under `key` for the calling thread.
+// Returns 0 if the key is unset or invalid.
+pub fn TLSGetValue(key: TLSKey): int64 {
+    if (g_tls_table == 0 || key <= 0 || key >= MAX_TLS_KEYS) { return 0; }
+    var tid: int64 := sys_gettid();
+    var slot: int64 := _tlsFindSlot(tid);
+    if (slot == 0) { return 0; }
+    return peek64(slot + 8 + key * 8);
+}
