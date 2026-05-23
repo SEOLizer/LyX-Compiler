@@ -16,7 +16,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP | Datei(en) | Inhalt | Aufwand | Status |
 |---|---|---|---|---|
 | WP-STB-01 | `std/datetime.lyx` | 22 leere Funktionen: Format, Parse, Arithmetik, Timezone | L | ✅ |
-| WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ⬜ |
+| WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ✅ |
 | WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ⬜ |
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ⬜ |
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ⬜ |
@@ -104,7 +104,7 @@ dann Wochentag des 1. Januars bestimmen, ISO-Wochen-Arithmetik anwenden.
 
 ---
 
-### WP-STB-02: `hash.lyx` — Echte BLAKE3-Implementierung ⬜
+### WP-STB-02: `hash.lyx` — Echte BLAKE3-Implementierung ✅
 
 **Branch:** `feat/std-stubs-02`
 **Datei:** `std/hash.lyx` (ab Zeile 584)
