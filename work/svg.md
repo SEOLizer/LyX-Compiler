@@ -159,7 +159,7 @@ primär Inline-Attribute für maximale Kompatibilität, mit optionalem CSS-Modus
 
 ---
 
-### WP-SVG-01: XML-Writer & Dokumentgerüst ⬜
+### WP-SVG-01: XML-Writer & Dokumentgerüst ✅
 
 **Ziel:** Einen robusten XML-Writer implementieren und damit ein minimales,
 valides SVG-Dokument erzeugen können — inklusive korrektem Namespace, Encoding
@@ -195,7 +195,7 @@ und optionaler Pretty-Print-Formatierung.
 
 ---
 
-### WP-SVG-02: Geometrische Primitive ⬜
+### WP-SVG-02: Geometrische Primitive ✅
 
 **Ziel:** Die fünf Grundformen von SVG als API zur Verfügung stellen:
 Rechteck, Kreis, Ellipse, Linie, Polyline und Polygon.
@@ -261,7 +261,7 @@ Nicht gesetzte Attribute werden weggelassen (SVG-Default gilt).
 
 ---
 
-### WP-SVG-03: Pfad-API (`<path>`) ⬜
+### WP-SVG-03: Pfad-API (`<path>`) ✅
 
 **Ziel:** Das mächtigste SVG-Element — `<path>` — mit einer komfortablen
 Lyx-API für alle Pfad-Befehle zugänglich machen.
@@ -323,7 +323,7 @@ SvgPathArrow(doc, x1, y1, x2, y2, headLen, headAngle: f64) // Pfeil
 
 ---
 
-### WP-SVG-04: Linienstil, Dash-Pattern & Transformationen ⬜
+### WP-SVG-04: Linienstil, Dash-Pattern & Transformationen ✅
 
 **Ziel:** Erweiterte Stileigenschaften für Linien und Konturen, sowie
 Element-lokale Transformationen.
@@ -371,7 +371,7 @@ SvgApply(doc)  // → transform="translate(100 50) rotate(45)"
 
 ---
 
-### WP-SVG-05: Gruppen & Ebenen (`<g>`) ⬜
+### WP-SVG-05: Gruppen & Ebenen (`<g>`) ✅
 
 **Ziel:** Elemente in Gruppen zusammenfassen, gemeinsame Styles und
 Transformationen auf ganze Gruppen anwenden, Ebenen-basiertes Zeichnen ermöglichen.
@@ -427,7 +427,7 @@ SvgSetClass(doc, g, "highlight")
 
 ---
 
-### WP-SVG-06: Text & Typografie ⬜
+### WP-SVG-06: Text & Typografie ✅
 
 **Ziel:** Text auf SVG-Zeichenflächen platzieren, Schriftarten, Ausrichtung,
 Zeilenabstand und Dekorationen steuern; Text entlang eines Pfades führen.
@@ -496,7 +496,7 @@ SVG_DECO_UNDERLINE = 1
 
 ---
 
-### WP-SVG-07: Gradienten & Muster ⬜
+### WP-SVG-07: Gradienten & Muster ✅
 
 **Ziel:** Lineare und radiale Farbverläufe sowie Kachelmuster als
 wiederverwendbare Definitionen in `<defs>` anlegen und Elementen zuweisen.
@@ -555,7 +555,7 @@ SvgGradientRotate(doc, g, 45.0)
 
 ---
 
-### WP-SVG-08: Symbole, Marker & Wiederverwendung ⬜
+### WP-SVG-08: Symbole, Marker & Wiederverwendung ✅
 
 **Ziel:** Wiederverwendbare Symbole und Pfeilspitzen/Marker definieren, die
 an mehreren Stellen referenziert werden können.
@@ -626,7 +626,7 @@ SvgGroupEnd(doc)
 
 ---
 
-### WP-SVG-09: Bildeinbettung ⬜
+### WP-SVG-09: Bildeinbettung ✅
 
 **Ziel:** Rasterbilder (JPEG, PNG, rohe Pixel) als Base64-kodierte Data-URIs
 direkt in das SVG einbetten — keine externe Dateiabhängigkeit des SVGs.
@@ -674,7 +674,7 @@ SvgImageFile(doc, "foto.jpg", x, y, w, h: f64)  // kombiniert AddImage + DrawIma
 
 ---
 
-### WP-SVG-10: Filter & Masken ⬜
+### WP-SVG-10: Filter & Masken ✅
 
 **Ziel:** SVG-Filtereffekte (Unschärfe, Schatten, Farbkorrektur) und
 Alpha-Masken für nicht-rechteckiges Compositing.
@@ -742,7 +742,7 @@ SvgGroupEnd(doc)
 
 ---
 
-### WP-SVG-11: Animation (SMIL) ⬜
+### WP-SVG-11: Animation (SMIL) ✅
 
 **Ziel:** SVG-Animationen via SMIL (Synchronized Multimedia Integration Language)
 einbetten — ohne JavaScript, nativ im SVG-Format, browserkompatibel.
@@ -817,7 +817,7 @@ SVG_AT_SKEWY     = 4
 
 ---
 
-### WP-SVG-12: SVG-Parser (Lesen) ⬜
+### WP-SVG-12: SVG-Parser (Lesen) ✅
 
 **Ziel:** Bestehende SVG-Dateien einlesen, die Element-Struktur traversieren
 und Attributwerte auslesen — Grundlage für SVG-Bearbeitung und -Konvertierung.
