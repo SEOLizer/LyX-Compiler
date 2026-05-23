@@ -186,6 +186,14 @@ _(keine offenen Aufgaben)_
 
 ## Abgeschlossene Aufgaben
 
+### Print/PrintLn Multi-Arg Output (Mai 2026)
+
+- [x] **WP-OUT-01** - `Print`/`PrintLn` compile-time multi-arg type dispatch (bis zu 6 Args, gemischte Typen)
+- [x] **WP-OUT-02** - `EPrint`/`EPrintLn` (stderr); `_lyx_eprint_int` Infinite-Loop-Bug gefixt
+- [x] **WP-OUT-03** - std-Units auf `Print`/`PrintLn` migriert; FIX-10 (Debug-Prints in `os.lyx`) entfernt
+- [x] **WP-OUT-04** - `Print`/`PrintLn` als primärer Output-Stil etabliert
+- [x] **Dok:** `work/print-output.md`
+
 ### Telnet Client (März 2026)
 
 - [x] **std/net/telnet.lyx** - RFC 854 Telnet Client (TelnetConnect, TelnetRead, TelnetWrite)
