@@ -104,6 +104,16 @@ pub type EmitARM64 = class {
   globalRelocCount:  int64;
   globalRelocCap:    int64;
 
+  // FFI (extern fn ... link). Per distinct extern symbol referenced by a call
+  // we emit an inline GOT slot resolved by the loader via R_AARCH64_GLOB_DAT.
+  // externBuf dedups the symbols — 32-byte entries {nameStrOff, nameLen,
+  // libStrOff, libLen}, all offsets into the IR string table — so writeELF can
+  // build .dynsym/.dynstr/DT_NEEDED. The dynsym index of entry i is i+1
+  // (index 0 is the reserved null symbol).
+  externBuf:   int64;
+  externCount: int64;
+  externCap:   int64;
+
   // -------------------------------------------------------------------------
   // Init
   // -------------------------------------------------------------------------
@@ -133,10 +143,16 @@ pub type EmitARM64 = class {
     self.globalRelocCap   := 32;
     self.globalRelocBuf   := mmap(0, self.globalRelocCap * 16, 3, 34, -1, 0);
     self.globalRelocCount := 0;
+
+    self.externCap   := 64;
+    self.externBuf   := mmap(0, self.externCap * 32, 3, 34, -1, 0);
+    self.externCount := 0;
   }
 
   fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
   fn getGlobalRelocCount(): int64 { return self.globalRelocCount; }
+  fn getExternBuf(): int64        { return self.externBuf; }
+  fn getExternCount(): int64      { return self.externCount; }
 
   fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
 
@@ -377,6 +393,7 @@ pub type EmitARM64 = class {
     if op == IRO_CALL         { self.emitCall(src1, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
+    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
 
     // --- Control flow ---
     if op == IRO_JMP      { self.emitBranch(imm); }
@@ -682,6 +699,66 @@ pub type EmitARM64 = class {
     self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(ptrSlot));
     // BLR x9
     self.emit32(0xD63F0120);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // FFI call (IRO_CALL_EXTERN). Args 0..argCount-1 → x0..x7, then load the
+  // resolved function address from an inline GOT slot the loader fills via
+  // R_AARCH64_GLOB_DAT, and BLR. nameStrOff/libStrOff index the IR string
+  // table; the symbol is deduped into externBuf (dynsym index = idx+1).
+  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64) {
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
+      ai := ai + 1;
+    }
+    var strBuf: int64 := peek64(self.ir + 32);
+    var namePtr: int64 := strBuf + nameStrOff;
+    var nameLen: int64 := StrLen(namePtr as pchar);
+    // Dedup by name.
+    var externIdx: int64 := -1;
+    var ei: int64 := 0;
+    while ei < self.externCount {
+      var eb: int64 := self.externBuf + ei * 32;
+      if peek64(eb + 8) == nameLen {
+        var em: int64 := 1;
+        var ej: int64 := 0;
+        while ej < nameLen {
+          if em != 0 {
+            if peek8(strBuf + peek64(eb) + ej) != peek8(namePtr + ej) { em := 0; }
+          }
+          ej := ej + 1;
+        }
+        if em != 0 { externIdx := ei; ei := self.externCount; }
+      }
+      ei := ei + 1;
+    }
+    if externIdx < 0 {
+      var libPtr: int64 := strBuf + libStrOff;
+      var libLen: int64 := StrLen(libPtr as pchar);
+      if self.externCount >= self.externCap {
+        var nc: int64 := self.externCap * 2;
+        var nb: int64 := mmap(0, nc * 32, 3, 34, -1, 0);
+        var ci: int64 := 0;
+        while ci < self.externCount * 32 { poke8(nb + ci, peek8(self.externBuf + ci)); ci := ci + 1; }
+        self.externBuf := nb; self.externCap := nc;
+      }
+      var nbase: int64 := self.externBuf + self.externCount * 32;
+      poke64(nbase,      nameStrOff);
+      poke64(nbase + 8,  nameLen);
+      poke64(nbase + 16, libStrOff);
+      poke64(nbase + 24, libLen);
+      externIdx := self.externCount;
+      self.externCount := self.externCount + 1;
+    }
+    // Inline GOT slot: LDR x9,[pc+8]; B +12; .quad 0; BLR x9
+    // ld.so writes the resolved symbol address into the .quad (GLOB_DAT).
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
+    self.emit32(0x14000003);        // B +12
+    self.emit64(0);                  // GOT slot (filled by loader)
+    self._recordRelocation(slotOff, ((externIdx + 1) << 32) | 1025, 0);  // R_AARCH64_GLOB_DAT
+    self.emit32(0xD63F0120);        // BLR x9
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
