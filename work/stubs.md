@@ -18,7 +18,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-01 | `std/datetime.lyx` | 22 leere Funktionen: Format, Parse, Arithmetik, Timezone | L | ✅ |
 | WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ✅ |
 | WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ✅ |
-| WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ⬜ |
+| WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ✅ |
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ⬜ |
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ⬜ |
 | WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ⬜ |
@@ -161,7 +161,7 @@ Varianten mit unterschiedlichen rate/capacity Werten ablegen.
 
 ---
 
-### WP-STB-04: `url.lyx` — `GetQueryParam()` Substring-Extraktion ⬜
+### WP-STB-04: `url.lyx` — `GetQueryParam()` Substring-Extraktion ✅
 
 **Branch:** `feat/std-stubs-04`
 **Datei:** `std/url.lyx` (Zeile 871)
