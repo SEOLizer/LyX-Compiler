@@ -21,7 +21,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ✅ |
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ✅ |
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ✅ |
-| WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ⬜ |
+| WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ✅ |
 | WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ⬜ |
 | WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ⬜ |
 | WP-STB-10 | `std/qt5_core.lyx` | 5 C++-Wrapper-Stubs (brauchen `libqtlyx.so`-Ergänzung) | M | ⬜ |
@@ -270,7 +270,7 @@ beim Parsen überspringen (gängige INI-Semantik) oder in einem separaten
 
 ---
 
-### WP-STB-07: `thread.lyx` — Thread-Local Storage (TLS) ⬜
+### WP-STB-07: `thread.lyx` — Thread-Local Storage (TLS) ✅
 
 **Branch:** `feat/std-stubs-07`
 **Datei:** `std/thread.lyx` (Zeilen 67, 298–300)
@@ -550,3 +550,4 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 | 2026-05-23 | Initiale Erstellung — 13 WPs aus Stub-Audit |
 | 2026-05-23 | WP-STB-01 ✅ — datetime.lyx vollständig. Zwei Bugs entdeckt: Off-by-one Jan/Feb (Hinnant-Algorithmus), negative Division in Lyx unsigned behandelt |
 | 2026-05-23 | WP-STB-06 ✅ — ini.lyx + yaml.lyx: doc-Handle als Raw-Text-Buffer (mmap). _iniFindSection/_iniFindKeyValue Scanner. LoadFile/SaveFile über open/read/write/close Builtins. GetString/HasSection/HasKey/GetSectionCount real implementiert. |
+| 2026-05-23 | WP-STB-07 ✅ — thread.lyx TLS: globale mmap-Tabelle (64 Slots × 32 Keys × 264 Bytes). _tlsInit/_tlsFindSlot. TLSKeyCreate/TLSSetValue/TLSGetValue via sys_gettid() + Slot-Lookup. |
