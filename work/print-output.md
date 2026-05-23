@@ -157,7 +157,7 @@ aus `exec()` in os.lyx entfernen).
 
 ---
 
-### WP-OUT-04: Print als primärer Stil in Code-Generierung (Claude) ⬜
+### WP-OUT-04: Print als primärer Stil in Code-Generierung (Claude) ✅
 
 **Beschreibung:**
 Nach Umsetzung von WP-OUT-01 ist `Print`/`PrintLn` der bevorzugte Output-Stil
@@ -182,9 +182,9 @@ PrintInt(errno);    // ein einziger Wert ohne Text
 
 | Meilenstein | WPs | Ergebnis |
 |-------------|-----|---------|
-| M1: Kern-Feature | WP-OUT-01 | `Print`/`PrintLn` kompilierbar |
-| M2: Stderr | WP-OUT-02 | `EPrint`/`EPrintLn` |
-| M3: Migration | WP-OUT-03+04 | Alle std-Units aktualisiert |
+| M1: Kern-Feature | WP-OUT-01 ✅ | `Print`/`PrintLn` kompilierbar |
+| M2: Stderr | WP-OUT-02 ✅ | `EPrint`/`EPrintLn` |
+| M3: Migration | WP-OUT-03+04 ✅ | Alle std-Units aktualisiert |
 
 ---
 
@@ -237,3 +237,7 @@ passenden Typ (`int64` bzw. `f64`) und werden entsprechend expandiert.
 | Datum | Änderung |
 |-------|---------|
 | 2026-05-23 | Initiale Spezifikation |
+| 2026-05-23 | WP-OUT-01 ✅ Print/PrintLn multi-arg compile-time dispatch implementiert |
+| 2026-05-23 | WP-OUT-02 ✅ EPrint/EPrintLn (stderr) — _lyx_eprint_int Infinite-Loop-Bug gefixt |
+| 2026-05-23 | WP-OUT-03 ✅ std-Units migriert; FIX-10 (Debug-Prints in os.lyx) erledigt |
+| 2026-05-23 | WP-OUT-04 ✅ Print/PrintLn als primärer Stil etabliert |
