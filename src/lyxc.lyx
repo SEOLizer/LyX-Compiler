@@ -237,6 +237,12 @@ pub type CompilerConfig = class {
   relocBuf:         int64;
   relocCount:       int64;
 
+  // ARM64 FFI: extern-symbol table harvested from EmitARM64 (32-byte entries
+  // {nameStrOff, nameLen, libStrOff, libLen} into the IR string table). Drives
+  // .dynsym/.dynstr/DT_NEEDED in the dynamic ET_EXEC writer.
+  armExternBuf:     int64;
+  armExternCount:   int64;
+
   // WP-AND-upstream-fix v5: global-load slot tracking. globalRelocBuf records
   // (slotCodeOff, globalIdx) pairs (16 bytes each) so writeELFSharedLib can
   // build the .data section, patch each slot with the global's resolved
@@ -1506,6 +1512,8 @@ pub type CompilerConfig = class {
       // WP-AND-upstream-fix v5: harvest global-load slot table + IR module ptr.
       self.globalRelocBuf   := emitter.getGlobalRelocBuf();
       self.globalRelocCount := emitter.getGlobalRelocCount();
+      self.armExternBuf     := emitter.getExternBuf();
+      self.armExternCount   := emitter.getExternCount();
       self.irModulePtr      := irMod;
       // WP-AND-03: harvest prologue-length table + function count for DWARF CFI.
       self.codeFuncPrologueLen := emitter.getFuncPrologueLen();
@@ -1938,12 +1946,192 @@ pub type CompilerConfig = class {
     return false;
   }
   
+  // Dynamically-linked AArch64 ET_EXEC for FFI programs. Mirrors the x86_64
+  // cg_writeELFDynamic: base 0x400000, code at file 0x1000 (VA 0x401000 =
+  // e_entry), /lib/ld-linux-aarch64.so.1, one inline GOT slot per extern call
+  // resolved by the loader via R_AARCH64_GLOB_DAT (relocs harvested from the
+  // emitter). One RWX PT_LOAD maps the whole file so the ELF header, .interp
+  // and .dynamic are all in memory and the GOT slots are writable.
+  fn writeELFExecDynamic(path: pchar, code: int64, size: int64): bool {
+    var baseVA: int64 := 0x400000;
+    var codeFileOff: int64 := 4096;
+    var interpOff: int64 := 232;     // after ELF hdr (64) + 3 phdrs (3*56)
+    var interpStr: pchar := "/lib/ld-linux-aarch64.so.1";
+    var interpLen: int64 := StrLen(interpStr) + 1;
+    var nExt: int64 := self.armExternCount;
+    var strBuf: int64 := peek64(self.irModulePtr + 32);   // IR string table
+
+    // ---- .dynstr: \0 + distinct lib names + symbol names ----
+    var dynstr: int64 := mmap(0, 65536, 3, 34, -1, 0);
+    var dsLen: int64 := 0;
+    poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+    var uniqLibOff: int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+    var uniqLibStr: int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+    var uniqCount: int64 := 0;
+    var symStr: int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+
+    var ei: int64 := 0;
+    while ei < nExt {
+      var eb: int64 := self.armExternBuf + ei * 32;
+      var libOff: int64 := peek64(eb + 16);
+      var libLen: int64 := peek64(eb + 24);
+      var u: int64 := 0;
+      var found: int64 := -1;
+      while u < uniqCount {
+        var pl: int64 := peek64(uniqLibOff + u * 8);
+        var sameLib: int64 := 1;
+        var k: int64 := 0;
+        while k <= libLen {
+          if sameLib != 0 { if peek8(strBuf + pl + k) != peek8(strBuf + libOff + k) { sameLib := 0; } }
+          k := k + 1;
+        }
+        if sameLib != 0 { found := u; u := uniqCount; }
+        u := u + 1;
+      }
+      if found < 0 {
+        var off: int64 := dsLen;
+        var j: int64 := 0;
+        while j < libLen { poke8(dynstr + dsLen, peek8(strBuf + libOff + j)); dsLen := dsLen + 1; j := j + 1; }
+        poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+        poke64(uniqLibOff + uniqCount * 8, libOff);
+        poke64(uniqLibStr + uniqCount * 8, off);
+        uniqCount := uniqCount + 1;
+      }
+      ei := ei + 1;
+    }
+    ei := 0;
+    while ei < nExt {
+      var eb2: int64 := self.armExternBuf + ei * 32;
+      var nmOff: int64 := peek64(eb2);
+      var nmLen: int64 := peek64(eb2 + 8);
+      var soff: int64 := dsLen;
+      var j2: int64 := 0;
+      while j2 < nmLen { poke8(dynstr + dsLen, peek8(strBuf + nmOff + j2)); dsLen := dsLen + 1; j2 := j2 + 1; }
+      poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      poke64(symStr + ei * 8, soff);
+      ei := ei + 1;
+    }
+    var dynstrSize: int64 := dsLen;
+
+    // ---- section offsets (8-aligned) ----
+    var dynstrOff: int64 := ((codeFileOff + size + 7) >> 3) << 3;
+    var dynsymOff: int64 := ((dynstrOff + dynstrSize + 7) >> 3) << 3;
+    var dynsymSize: int64 := (nExt + 1) * 24;
+    var hashOff: int64 := dynsymOff + dynsymSize;
+    var nchain: int64 := nExt + 1;
+    var hashSize: int64 := (3 + nchain) * 4;
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := self.relocCount * 24;
+    var dynOff: int64 := relaOff + relaSize;
+    var dynCount: int64 := uniqCount + 11;
+    var dynSize: int64 := dynCount * 16;
+    var fileSize: int64 := dynOff + dynSize;
+
+    var buf: int64 := mmap(0, fileSize, 3, 34, -1, 0);
+
+    // ELF header
+    poke8(buf, 0x7F); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2); poke8(buf + 5, 1); poke8(buf + 6, 1); poke8(buf + 7, 0);
+    poke16(buf + 16, 2);             // ET_EXEC
+    poke16(buf + 18, 183);           // EM_AARCH64
+    poke32(buf + 20, 1);
+    poke64(buf + 24, 0x401000);      // e_entry
+    poke64(buf + 32, 64);            // e_phoff
+    poke64(buf + 40, 0);             // e_shoff
+    poke32(buf + 48, 0);
+    poke16(buf + 52, 64);
+    poke16(buf + 54, 56);
+    poke16(buf + 56, 3);             // e_phnum
+    poke16(buf + 58, 0); poke16(buf + 60, 0); poke16(buf + 62, 0);
+
+    // program headers
+    var ph: int64 := buf + 64;
+    poke32(ph, 1); poke32(ph + 4, 7);                                   // PT_LOAD, RWX
+    poke64(ph + 8, 0); poke64(ph + 16, baseVA); poke64(ph + 24, baseVA);
+    poke64(ph + 32, fileSize); poke64(ph + 40, fileSize); poke64(ph + 48, 0x10000);
+    var ph2: int64 := buf + 120;
+    poke32(ph2, 3); poke32(ph2 + 4, 4);                                 // PT_INTERP, R
+    poke64(ph2 + 8, interpOff); poke64(ph2 + 16, baseVA + interpOff); poke64(ph2 + 24, baseVA + interpOff);
+    poke64(ph2 + 32, interpLen); poke64(ph2 + 40, interpLen); poke64(ph2 + 48, 1);
+    var ph3: int64 := buf + 176;
+    poke32(ph3, 2); poke32(ph3 + 4, 6);                                 // PT_DYNAMIC, RW
+    poke64(ph3 + 8, dynOff); poke64(ph3 + 16, baseVA + dynOff); poke64(ph3 + 24, baseVA + dynOff);
+    poke64(ph3 + 32, dynSize); poke64(ph3 + 40, dynSize); poke64(ph3 + 48, 8);
+
+    // .interp
+    var ii: int64 := 0;
+    while ii < interpLen { poke8(buf + interpOff + ii, peek8((interpStr as int64) + ii)); ii := ii + 1; }
+
+    // code (inline GOT slots stay 0; the loader fills them via GLOB_DAT)
+    var ci: int64 := 0;
+    while ci < size { poke8(buf + codeFileOff + ci, peek8(code + ci)); ci := ci + 1; }
+
+    // .dynstr
+    var si: int64 := 0;
+    while si < dynstrSize { poke8(buf + dynstrOff + si, peek8(dynstr + si)); si := si + 1; }
+
+    // .dynsym — [0] null, [i+1] UNDEF GLOBAL FUNC
+    ei := 0;
+    while ei < nExt {
+      var sy: int64 := buf + dynsymOff + (ei + 1) * 24;
+      poke32(sy, peek64(symStr + ei * 8));   // st_name
+      poke8(sy + 4, 0x12);                    // STB_GLOBAL|STT_FUNC
+      poke8(sy + 5, 0);
+      poke16(sy + 6, 0);                       // SHN_UNDEF
+      ei := ei + 1;
+    }
+
+    // .hash — minimal SysV (nbucket=1, empty)
+    poke32(buf + hashOff, 1);
+    poke32(buf + hashOff + 4, nchain);
+
+    // .rela.dyn — GLOB_DAT relocs harvested from the emitter; r_offset = slot VA
+    var ri: int64 := 0;
+    while ri < self.relocCount {
+      var src: int64 := self.relocBuf + ri * 24;
+      var ra: int64 := buf + relaOff + ri * 24;
+      poke64(ra, 0x401000 + self.codeStubOff + peek64(src));   // r_offset (slot VA)
+      poke64(ra + 8, peek64(src + 8));                          // r_info (sym<<32|GLOB_DAT)
+      poke64(ra + 16, peek64(src + 16));                        // r_addend
+      ri := ri + 1;
+    }
+
+    // .dynamic
+    var dp: int64 := buf + dynOff;
+    var u2: int64 := 0;
+    while u2 < uniqCount {
+      poke64(dp, 1); poke64(dp + 8, peek64(uniqLibStr + u2 * 8)); dp := dp + 16;  // DT_NEEDED
+      u2 := u2 + 1;
+    }
+    poke64(dp, 4);  poke64(dp + 8, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, baseVA + dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dynstrSize);         dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);                 dp := dp + 16;   // DT_SYMENT
+    poke64(dp, 7);  poke64(dp + 8, baseVA + relaOff);   dp := dp + 16;   // DT_RELA
+    poke64(dp, 8);  poke64(dp + 8, relaSize);           dp := dp + 16;   // DT_RELASZ
+    poke64(dp, 9);  poke64(dp + 8, 24);                 dp := dp + 16;   // DT_RELAENT
+    poke64(dp, 30); poke64(dp + 8, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                                    // DT_NULL
+
+    var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;
+    munmap(buf, fileSize);
+    chmod(path, 493);
+    return result != 0;
+  }
+
   fn writeELF(path: pchar, code: int64, size: int64): bool {
+    // FFI programs (extern fn ... link) need a dynamically-linked ET_EXEC.
+    // Programs without externs keep the static layout below.
+    if self.armExternCount > 0 {
+      return self.writeELFExecDynamic(path, code, size);
+    }
+
     // Create minimal ELF matching S1 layout:
     // - Single PT_LOAD at offset 0x1000 (vaddr 0x401000)
     // - Entry point at 0x401000
     // - Headers at offset 64 (must be covered by LOAD)
-    
+
     var codeFileOffset: int64 := 4096;  // 0x1000
     var elfSize: int64 := codeFileOffset + size;
     
