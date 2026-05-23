@@ -917,7 +917,7 @@ fn main(): int64 {
   try {
     var r: int64 := risky(-5);
   } catch (e: int64) {
-    PrintStr("caught\n");
+    PrintLn("caught");
   }
   return 0;
 }
@@ -1011,10 +1011,10 @@ fn main(): int64 {
   push(a, 20);
   push(a, 30);
   
-  PrintInt(len(a));  // 3
+  PrintLn(len(a));  // 3
   
   var x: int64 := pop(a);  // x = 30
-  PrintInt(len(a));  // 2
+  PrintLn(len(a));  // 2
   
   free(a);
   return 0;
@@ -1109,8 +1109,10 @@ player.health--;     // player.health := player.health - 1
 
 ### Runtime-Snippets (eingebettet)
 
-* `PrintStr`: strlen-loop + write
-* `PrintInt`: itoa + write
+* `Print` / `PrintLn`: compile-time Multi-Arg-Dispatch → `PrintStr`/`PrintInt`/`PrintFloat`/`PrintBool` je nach Typ (bis zu 6 Args); `PrintLn` hängt `\n` an
+* `EPrint` / `EPrintLn`: wie `Print`/`PrintLn`, aber auf stderr (fd=2)
+* `PrintStr`: strlen-loop + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
+* `PrintInt`: itoa + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
 * `Random`: LCG-Implementierung (seed * 1103515245 + 12345) mod 2^31
 * `RandomSeed`: Setzt LCG-Seed im Data-Segment
 
@@ -1139,7 +1141,7 @@ player.health--;     // player.health := player.health - 1
 
 ```lyx
 fn main(): int64 {
-  PrintStr("Hello Lyx\n");
+  PrintLn("Hello Lyx");
   return 0;
 }
 ```
@@ -1154,10 +1156,10 @@ fn increment() {
 }
 
 fn main(): int64 {
-  PrintInt(counter);  // 0
+  PrintLn(counter);  // 0
   increment();
   increment();
-  PrintInt(counter);  // 2
+  PrintLn(counter);  // 2
   return 0;
 }
 ```
@@ -1169,7 +1171,7 @@ type Animal = class {
   name: pchar;
   
   fn speak() {
-    PrintStr("Some sound\n");
+    PrintLn("Some sound");
   }
 };
 
@@ -1177,7 +1179,7 @@ type Dog = class extends Animal {
   breed: pchar;
   
   fn speak() {
-    PrintStr("Woof!\n");
+    PrintLn("Woof!");
   }
   
   fn Create(n: pchar, b: pchar) {
@@ -1186,7 +1188,7 @@ type Dog = class extends Animal {
   }
   
   fn Destroy() {
-    PrintStr("Dog destroyed\n");
+    PrintLn("Dog destroyed");
   }
 };
 
@@ -1230,8 +1232,8 @@ fn main(): int64 {
   derived.extra := 30;
   
   // Polymorphic calls via VMT
-  PrintInt(base.GetValue());    // Calls TBase.GetValue() -> 10
-  PrintInt(derived.GetValue()); // Calls TDerived.GetValue() -> 50
+  PrintLn(base.GetValue());    // Calls TBase.GetValue() -> 10
+  PrintLn(derived.GetValue()); // Calls TDerived.GetValue() -> 50
   
   dispose base;
   dispose derived;
@@ -1327,7 +1329,7 @@ fn main(): int64 {
   c.node := n;
 
   var ref: Node := c.node;   // Pointer laden
-  PrintInt(ref.value);        // 42
+  PrintLn(ref.value);        // 42
   return 0;
 }
 ```
@@ -1347,7 +1349,7 @@ fn main(): int64 {
   p.items[0]    := n;
 
   var ref: Node := p.items[0];
-  PrintInt(ref.value);  // 77
+  PrintLn(ref.value);  // 77
   return 0;
 }
 ```
@@ -1394,9 +1396,8 @@ fn main(): int64 {
   var r1: int64 := Random();
   var r2: int64 := Random();
   
-  PrintInt(r1);
-  PrintStr("\n");
-  PrintInt(r2);
+  PrintLn(r1);
+  PrintLn(r2);
   return 0;
 }
 ```
@@ -1408,16 +1409,16 @@ fn main(): int64 {
   var a: int64 := 12;
   var b: int64 := 10;
 
-  PrintInt(a & b);    // AND:  8
-  PrintInt(a | b);    // OR:  14
-  PrintInt(a ^ b);    // XOR:  6
-  PrintInt(1 << 4);   // SHL: 16
-  PrintInt(256 >> 3); // SHR: 32
-  PrintInt(~0);       // NOT: -1
+  PrintLn(a & b);    // AND:  8
+  PrintLn(a | b);    // OR:  14
+  PrintLn(a ^ b);    // XOR:  6
+  PrintLn(1 << 4);   // SHL: 16
+  PrintLn(256 >> 3); // SHR: 32
+  PrintLn(~0);       // NOT: -1
 
   // Kombination: Mask-and-Shift
   var flags: int64 := (5 << 4) | 3;  // = 83
-  PrintInt(flags);
+  PrintLn(flags);
 
   return 0;
 }
@@ -1433,8 +1434,7 @@ con LIMIT: int64 := 5;
 fn main(): int64 {
   var i: int64 := 0;
   while (i < LIMIT) {
-    PrintInt(i);
-    PrintStr("\n");
+    PrintLn(i);
     
     // Type-Casting Beispiel
     var f: f64 := i as f64;
@@ -1443,9 +1443,7 @@ fn main(): int64 {
     
     // String-Konvertierung
     var str_val: pchar := int_to_str(i);
-    PrintStr("String: ");
-    PrintStr(str_val);
-    PrintStr("\n");
+    PrintLn("String: ", str_val);
     
     i := i + 1;
   }

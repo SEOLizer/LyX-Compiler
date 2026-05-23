@@ -45,7 +45,7 @@
 | `pchar` | Null-terminierter String (statisch, read-only) | ✅ Full | `"hello"` |
 | `string`| Dynamisch wachsender String (mmap-Heap, v0.5.7) | ✅ Full | via `StrNew` |
 
-**Dynamische Strings (v0.5.7):** `string`-Werte verwenden einen 16-Byte-Header vor dem Datenpuffer (`[capacity:8][length:8]`). Der zurückgegebene `pchar`-Zeiger zeigt auf die Nutzdaten und ist kompatibel mit `PrintStr`.
+**Dynamische Strings (v0.5.7):** `string`-Werte verwenden einen 16-Byte-Header vor dem Datenpuffer (`[capacity:8][length:8]`). Der zurückgegebene `pchar`-Zeiger zeigt auf die Nutzdaten und ist kompatibel mit `Print`.
 
 **String-Builtins (v0.5.7):**
 
@@ -63,7 +63,7 @@
 var s: string := StrNew(64);
 s := StrAppend(s, 72);   // 'H'
 s := StrAppend(s, 105);  // 'i'
-PrintStr(s);             // "Hi"
+Print(s);                // "Hi"
 StrFree(s);
 ```
 
@@ -93,7 +93,7 @@ enum Status { Ok = 0, Err = 1 }
 fn main(): int64 {
   var c: int64 := Color::Green;   // c = 1
   if (c == Color::Green) {
-    PrintStr("green\n");
+    PrintLn("green");
   }
   return 0;
 }
@@ -121,8 +121,8 @@ fn divmod(a: int64, b: int64): (int64, int64) {
 
 fn main(): int64 {
   var q, r := divmod(17, 5);
-  PrintInt(q);   // 3
-  PrintInt(r);   // 2
+  PrintLn(q);   // 3
+  PrintLn(r);   // 2
   return 0;
 }
 ```
@@ -204,7 +204,7 @@ Die aktuellen Änderungen haben folgende Lücken geschlossen und Features hinzug
 - Integer‑Primitiven (int8..int64, uint8..uint64)
 - Boolean (`bool`)
 - Char‑Literale und Escape‑Sequenzen
-- String‑Literale (`pchar`/`string`) in Kombination mit Builtins (z.B. PrintStr)
+- String‑Literale (`pchar`/`string`) in Kombination mit Builtins (z.B. Print, PrintLn)
 - Float‑Literals (f32, f64) — Parsing, Sema, Basiscodierung
 - Array‑Literal‑Parsing und elementare Load/Store im Backend
 

@@ -34,7 +34,7 @@ Create a file `hello.lyx`:
 
 ```lyx
 fn main(): int64 {
-  PrintStr("Hello, Lyx!\n");
+  PrintLn("Hello, Lyx!");
   return 0;
 }
 ```
@@ -104,14 +104,12 @@ fn add(a: int64, b: int64): int64 {
 }
 
 fn greet(name: pchar) {
-  PrintStr("Hello, ");
-  PrintStr(name);
-  PrintStr("!\n");
+  PrintLn("Hello, ", name, "!");
 }
 
 fn main(): int64 {
   var result: int64 := add(3, 4);
-  PrintInt(result);  // 7
+  PrintLn(result);  // 7
   greet("World");
   return 0;
 }
@@ -125,24 +123,23 @@ fn main(): int64 {
 
   // If/else
   if (x > 10) {
-    PrintStr("greater\n");
+    PrintLn("greater");
   } else {
-    PrintStr("smaller\n");
+    PrintLn("smaller");
   }
 
   // While loop
   var i: int64 := 0;
   while (i < 5) {
-    PrintInt(i);
-    PrintStr("\n");
+    PrintLn(i);
     i := i + 1;
   }
 
   // Switch
   switch (x % 3) {
-    case 0: PrintStr("divisible by 3\n");
-    case 1: PrintStr("remainder 1\n");
-    default: PrintStr("other\n");
+    case 0: PrintLn("divisible by 3");
+    case 1: PrintLn("remainder 1");
+    default: PrintLn("other");
   }
 
   return 0;
@@ -156,14 +153,14 @@ fn main(): int64 {
   // Dynamic array
   var arr: array := [10, 20, 30];
 
-  PrintInt(len(arr));   // 3
-  PrintInt(arr[0]);     // 10
+  PrintLn(len(arr));   // 3
+  PrintLn(arr[0]);     // 10
 
   push(arr, 40);
-  PrintInt(len(arr));   // 4
+  PrintLn(len(arr));   // 4
 
   var last: int64 := pop(arr);
-  PrintInt(last);       // 40
+  PrintLn(last);       // 40
 
   free(arr);
   return 0;
@@ -184,8 +181,8 @@ type Point = struct {
 
 fn main(): int64 {
   var p: Point := Point { x: 3, y: 4 };
-  PrintInt(p.x);      // 3
-  PrintInt(p.y);      // 4
+  PrintLn(p.x);      // 3
+  PrintLn(p.y);      // 4
   return 0;
 }
 ```
@@ -230,10 +227,10 @@ import std.os;
 
 fn main(): int64 {
   var abs_val: int64 := Abs64(-42);
-  PrintInt(abs_val);  // 42
+  PrintLn(abs_val);  // 42
 
   var pid: int64 := get_pid();
-  PrintInt(pid);
+  PrintLn(pid);
 
   return 0;
 }
@@ -262,7 +259,7 @@ import std.net.http;
 
 fn main(): int64 {
   var resp: HTTPResponse := HTTPGet("example.com", "/");
-  PrintStr(resp.bodyPtr);
+  Print(resp.bodyPtr);
   HTTPResponseFree(resp);
   return 0;
 }
@@ -308,7 +305,7 @@ fn main(): int64 {
 
   // Check stack canary
   if (stack_canary_check() != 0) {
-    PrintStr("Stack overflow detected!\n");
+    PrintLn("Stack overflow detected!");
     return 1;
   }
 
@@ -360,10 +357,10 @@ fn main(): int64 {
 ```lyx
 fn describe(n: int64): int64 {
   match (n) {
-    case 0 => { PrintStr("zero\n"); return 0; }
-    case 1 | 2 => { PrintStr("small\n"); return 1; }
-    case 3 | 4 | 5 => { PrintStr("medium\n"); return 2; }
-    default => { PrintStr("large\n"); return 3; }
+    case 0 => { PrintLn("zero"); return 0; }
+    case 1 | 2 => { PrintLn("small"); return 1; }
+    case 3 | 4 | 5 => { PrintLn("medium"); return 2; }
+    default => { PrintLn("large"); return 3; }
   }
 }
 ```
@@ -379,7 +376,7 @@ fn main(): int64 {
   try {
     risky();
   } catch {
-    PrintStr("Caught exception\n");
+    PrintLn("Caught exception");
   }
   return 0;
 }
@@ -393,7 +390,7 @@ fn addOne(x: int64): int64 { return x + 1; }
 
 fn main(): int64 {
   var result: int64 := 5 |> double() |> addOne();
-  PrintInt(result);  // 11
+  PrintLn(result);  // 11
   return 0;
 }
 ```

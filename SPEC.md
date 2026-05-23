@@ -33,7 +33,7 @@ Wichtig: Das IR ist *dein* Stabilitätsanker. Wenn du zu früh “AST direkt nac
 Lyx kann genau das:
 
 ```
-PrintInt(1 + 2*3);
+PrintLn(1 + 2*3);
 exit(0);
 ```
 
@@ -280,14 +280,14 @@ var globalCounter: int64 := 0;
 // Klasse mit Vererbung
 type Animal = class {
   name: pchar;
-  fn speak() { PrintStr("Some sound\n"); }
+  fn speak() { PrintLn("Some sound"); }
 };
 
 type Dog = class extends Animal {
   breed: pchar;
   
   fn speak() {
-    PrintStr("Woof!\n");
+    PrintLn("Woof!");
   }
   
   fn Create(n: pchar, b: pchar) {
@@ -296,7 +296,7 @@ type Dog = class extends Animal {
   }
   
   fn Destroy() {
-    PrintStr("Dog destroyed\n");
+    PrintLn("Dog destroyed");
   }
 };
 
@@ -306,7 +306,7 @@ fn main(): int64 {
   dispose d;
   
   RandomSeed(42);
-  PrintInt(Random());     // Pseudo-Zufallszahl
+  PrintLn(Random());     // Pseudo-Zufallszahl
   return 0;
 }
 ```
@@ -328,7 +328,7 @@ fn addOne(x: int64): int64 { return x + 1; }
 fn main(): int64 {
   var result: int64 := 5 |> double() |> addOne();
   // Äquivalent zu: addOne(double(5)) = 11
-  PrintInt(result);
+  PrintLn(result);
   return 0;
 }
 ```
@@ -1174,14 +1174,14 @@ fn main(): int64 {
 
 ```
 con LIMIT: int64 := 5;
-con MSG: pchar := "Loop\n";
+con MSG: pchar := "Loop";
 
 fn main(): int64 {
   co start: int64 := 0;
   var i: int64 := start;
 
   while (i < LIMIT) {
-    PrintStr(MSG);
+    PrintLn(MSG);
     i := i + 1;
   }
 
@@ -1334,7 +1334,7 @@ L1 cache footprint:     846 bytes
 ```lyx
 fn main(): int64 {
   // Hello World für ESP32
-  PrintStr("Hello from ESP32!\n");
+  PrintLn("Hello from ESP32!");
   return 0;
 }
 ```
