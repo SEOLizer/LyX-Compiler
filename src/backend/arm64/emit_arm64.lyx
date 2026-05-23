@@ -394,6 +394,7 @@ pub type EmitARM64 = class {
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
     if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
+    if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
     // --- Control flow ---
     if op == IRO_JMP      { self.emitBranch(imm); }
@@ -762,6 +763,31 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
+  // IRO_CONST_STR: load the runtime address of a string literal into `dest`.
+  // The string bytes are embedded inline in the code stream (jumped over by a
+  // B) and addressed PC-relatively with ADR — no data section, relocation or
+  // patching needed, which keeps this self-contained and works in the static
+  // ELF. `strOff` indexes the IR string table (null-terminated).
+  fn emitConstStr(strOff: int64, dest: int64) {
+    var strBuf: int64 := peek64(self.ir + 32);
+    var sp: int64 := strBuf + strOff;
+    var len: int64 := StrLen(sp as pchar);
+    var total: int64 := len + 1;                 // include NUL
+    var pad: int64 := (4 - (total & 3)) & 3;     // pad to 4-byte boundary
+    var padded: int64 := total + pad;
+    // ADR x0, #8  — the string begins 8 bytes (ADR + B) after this ADR.
+    self.emit32(0x10000040);
+    // B over the inline string: (4 + padded) bytes ahead of this B.
+    self.emit32(0x14000000 | ((4 + padded) >> 2));
+    // inline string bytes + NUL + padding
+    var i: int64 := 0;
+    while i < len { self.emit8(peek8(sp + i)); i := i + 1; }
+    self.emit8(0);
+    var p: int64 := 0;
+    while p < pad { self.emit8(0); p := p + 1; }
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
   fn emitBuiltinCall(id: int64, dest: int64) {
     // Builtin id dispatch — emit inline syscall or helper sequence
     if id == 1 {
@@ -1012,6 +1038,20 @@ pub type EmitARM64 = class {
   fn emit64(val: int64) {
     self.emit32(val & 0xFFFFFFFF);
     self.emit32((val >> 32) & 0xFFFFFFFF);
+  }
+
+  // Single byte (used to embed inline string-literal data in the code stream).
+  fn emit8(val: int64) {
+    if self.codeLen + 1 > self.codeCap {
+      var newCap: int64 := self.codeCap * 2;
+      var nb: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while i < self.codeLen { poke8(nb + i, peek8(self.codeBuf + i)); i := i + 1; }
+      self.codeBuf := nb;
+      self.codeCap := newCap;
+    }
+    poke8(self.codeBuf + self.codeLen, val & 0xFF);
+    self.codeLen := self.codeLen + 1;
   }
 
   fn poke32at(off: int64, val: int64) {
