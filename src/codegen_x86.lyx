@@ -146,6 +146,10 @@ con CG_H_USER:       int64 := 417;
 con CG_PATCH_CALL:     int64 := 0;
 con CG_PATCH_STR:      int64 := 1;
 con CG_PATCH_VMT_ADDR: int64 := 2;  // absolute 8-byte VMT address in code buffer
+con CG_PATCH_EXTERN:   int64 := 3;  // FFI call: disp32 of `call *got(%rip)`, namePtr field = extern index
+
+// FFI imports (extern fn ... link "lib.so")
+con CG_EXTERN_SZ:      int64 := 32; // namePtr(8) + nameLen(8) + libPtr(8) + libLen(8)
 
 // Table entry sizes (bytes)
 con CG_LOCAL_SZ:   int64 := 24;   // name(8) + nameLen(8) + rbpOff(8)
@@ -193,6 +197,19 @@ pub type Codegen = class {
   patches:    int64;
   patchCount: int64;
   patchCap:   int64;
+
+  // FFI imports. externDecls holds every declared `extern fn ... link "lib"`
+  // (name + library) for lookup. externSyms holds only the ones actually
+  // CALLED — those get a GOT slot, .dynsym/.rela.dyn entry and DT_NEEDED. This
+  // lazy registration matters under DT_BIND_NOW: a declared-but-unused extern
+  // (or a stale/mis-named one) must not force the loader to resolve it.
+  // Both use CG_EXTERN_SZ-byte entries: namePtr,nameLen,libPtr,libLen.
+  externDecls:     int64;
+  externDeclCount: int64;
+  externDeclCap:   int64;
+  externSyms:      int64;
+  externCount:     int64;
+  externCap:       int64;
 
   // Parser output (set by Init)
   pSrc:   pchar;
@@ -812,6 +829,65 @@ pub type Codegen = class {
     self.patchCount := self.patchCount + 1;
   }
 
+  // Record a declared extern (lookup only — no GOT slot until it is called).
+  fn cg_addExternDecl(namePtr: pchar, nlen: int64, libPtr: int64, liblen: int64) {
+    if (self.externDeclCount >= self.externDeclCap) {
+      var nc: int64 := self.externDeclCap * 2;
+      var nb: int64 := mmap(0, nc * CG_EXTERN_SZ, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.externDeclCount * CG_EXTERN_SZ) { poke8(nb + i, peek8(self.externDecls + i)); i := i + 1; }
+      self.externDecls := nb; self.externDeclCap := nc;
+    }
+    var base: int64 := self.externDecls + self.externDeclCount * CG_EXTERN_SZ;
+    poke64(base,      namePtr as int64);
+    poke64(base + 8,  nlen);
+    poke64(base + 16, libPtr);
+    poke64(base + 24, liblen);
+    self.externDeclCount := self.externDeclCount + 1;
+  }
+
+  // Find a declared extern by name; returns its index in externDecls or -1.
+  fn cg_findExternDecl(namePtr: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.externDeclCount) {
+      var b: int64 := self.externDecls + i * CG_EXTERN_SZ;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), namePtr, nlen)) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // FFI import table: find an extern symbol by name, or register it.
+  fn cg_findExtern(namePtr: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.externCount) {
+      var b: int64 := self.externSyms + i * CG_EXTERN_SZ;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), namePtr, nlen)) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  fn cg_addExtern(namePtr: pchar, nlen: int64, libPtr: int64, liblen: int64): int64 {
+    var ex: int64 := self.cg_findExtern(namePtr, nlen);
+    if (ex >= 0) { return ex; }
+    if (self.externCount >= self.externCap) {
+      var nc: int64 := self.externCap * 2;
+      var nb: int64 := mmap(0, nc * CG_EXTERN_SZ, 3, 34, -1, 0);
+      var i: int64 := 0;
+      while (i < self.externCount * CG_EXTERN_SZ) { poke8(nb + i, peek8(self.externSyms + i)); i := i + 1; }
+      self.externSyms := nb; self.externCap := nc;
+    }
+    var base: int64 := self.externSyms + self.externCount * CG_EXTERN_SZ;
+    poke64(base,      namePtr as int64);
+    poke64(base + 8,  nlen);
+    poke64(base + 16, libPtr);
+    poke64(base + 24, liblen);
+    var idx: int64 := self.externCount;
+    self.externCount := self.externCount + 1;
+    return idx;
+  }
+
   fn cg_patchAll() {
     var i: int64 := 0;
     while (i < self.patchCount) {
@@ -830,6 +906,9 @@ pub type Codegen = class {
           // Write 0xCC (int3) to mark as unimplemented
           poke8(self.code + codeOff, 204);  // int3
         }
+      } else if (kind == CG_PATCH_EXTERN) {
+        // FFI call disp32 — resolved in cg_writeELFDynamic once the GOT
+        // virtual address is known. Nothing to do here.
       } else {
         // CG_PATCH_STR: namePtr encodes data offset
         var dataOff: int64 := namePtr;
@@ -4151,6 +4230,30 @@ pub type Codegen = class {
       self.cg_e8(0x58);  // pop rax (bytes_written)
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x18);  // add rsp, 24 (fd, data, len)
 
+    } else if (self.cg_findExternDecl(fname, fnlen) >= 0) {
+      // FFI call: register this declared extern's GOT slot now (lazy — only
+      // called externs get slots/relocations) and call indirectly through it.
+      // The SysV ABI requires %rsp 16-byte aligned at the call, or libc/OpenSSL
+      // crash on aligned SSE moves (movaps). Lyx's own calls don't need this,
+      // so we align locally only for FFI: save rsp, align down, restore after.
+      // Args are already in rdi/rsi/rdx/rcx/r8/r9; aligning rsp doesn't touch
+      // them. disp32 is patched in cg_writeELFDynamic once the GOT VA is known.
+      var exd: int64 := self.cg_findExternDecl(fname, fnlen);
+      var edb: int64 := self.externDecls + exd * CG_EXTERN_SZ;
+      var exIdx: int64 := self.cg_addExtern(peek64(edb) as pchar, peek64(edb + 8),
+                                            peek64(edb + 16), peek64(edb + 24));
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xE3);            // mov r11, rsp
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
+      self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
+      self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11 (keep 16-align)
+      self.cg_e8(0x31); self.cg_e8(0xC0);                              // xor eax, eax
+      self.cg_e8(0xFF); self.cg_e8(0x15);                              // call *disp32(%rip)
+      var ppx: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(ppx, exIdx, 0, CG_PATCH_EXTERN);
+      self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
+      self.cg_e8(0x5C);                                                 // pop rsp (restore)
+
     } else {
       // User-defined function call: emit call + patch
       var pp: int64 := self.cg_emitCall();
@@ -5932,7 +6035,22 @@ pub type Codegen = class {
     while (cur != -1) {
       var k: int64 := self.cg_nkind(cur);
       if (k == CGN_FUNC_DECL) {
-        self.cg_genFuncDecl(cur);
+        // extern fn NAME(...) link "lib.so": no body (c2 == -1) and a packed
+        // library span in c3 ((len<<32)|off). Register it as an FFI import
+        // instead of emitting a function body. The (body==-1 && c3!=-1) test
+        // distinguishes externs from @export functions, which share iVal==1
+        // but always carry a body.
+        var libPacked: int64 := self.cg_nc3(cur);
+        if (self.cg_nc2(cur) == -1 && libPacked != -1) {
+          var libOff: int64 := libPacked & 0xFFFFFFFF;
+          var libLen: int64 := (libPacked >> 32) & 0xFFFFFFFF;
+          if (libLen > 0) {
+            self.cg_addExternDecl(self.cg_nsval(cur), self.cg_nslen(cur),
+                                  (self.pSrc as int64) + libOff, libLen);
+          }
+        } else {
+          self.cg_genFuncDecl(cur);
+        }
       } else if (k == CGN_IMPORT) {
         // Process the imported module (WP-09: import resolution)
         var modName: pchar := self.cg_nsval(cur);
@@ -6072,6 +6190,13 @@ pub type Codegen = class {
     self.patches   := mmap(0, self.patchCap * CG_PATCH_SZ, 3, 34, -1, 0);
     self.patchCount := 0;
 
+    self.externDeclCap   := 128;
+    self.externDecls     := mmap(0, self.externDeclCap * CG_EXTERN_SZ, 3, 34, -1, 0);
+    self.externDeclCount := 0;
+    self.externCap   := 64;
+    self.externSyms  := mmap(0, self.externCap * CG_EXTERN_SZ, 3, 34, -1, 0);
+    self.externCount := 0;
+
     self.nextLblId := 0;
 
     // Import dedup (WP-09)
@@ -6172,6 +6297,14 @@ pub type Codegen = class {
   }
 
   fn WriteELF(path: pchar) {
+    // FFI programs need a dynamically-linked ELF (PT_INTERP + .dynamic + GOT
+    // relocations against the named shared libraries). Programs with no extern
+    // imports keep the byte-identical static path below — preserving the
+    // self-host singularity, since lyxc itself uses no FFI.
+    if (self.externCount > 0) {
+      self.cg_writeELFDynamic(path);
+      return;
+    }
     var totalCode: int64 := self.codeLen;
     var totalData: int64 := self.dataLen;
     var baseSize:  int64 := CG_CODE_OFF + totalCode + totalData;
@@ -6352,6 +6485,229 @@ pub type Codegen = class {
     }
 
     // Write ELF binary to file (O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0755 = 493)
+    var fd: int64 := open(path, 577, 493);
+    if (fd >= 0) {
+      write(fd, buf as pchar, fileSize);
+      close(fd);
+    } else {
+      PrintStr("codegen: failed to open output file: ");
+      PrintStr(path);
+      PrintStr("\n");
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Dynamically-linked ET_EXEC writer (FFI / extern fn ... link "...")
+  //
+  // Layout — code and data keep their static file offsets/VAs so that every
+  // absolute address baked in during codegen (VMT pointers, globals) stays
+  // valid; we only relocate the program-header table to the end of the file
+  // and append the dynamic-linking sections after .data:
+  //
+  //   [0,64)    ELF header (e_phoff -> phdrs at end, e_phnum = 3)
+  //   [64,..)   .interp = "/lib64/ld-linux-x86-64.so.2"  (fits the 56B gap)
+  //   [120,..)  code           (unchanged VA = base + 120)
+  //   [..]      data           (unchanged)
+  //   [..]      .dynstr .dynsym .hash .rela.dyn .got .dynamic
+  //   [..]      program headers: PT_LOAD, PT_INTERP, PT_DYNAMIC
+  //
+  // Each imported symbol gets a GOT slot resolved eagerly by ld.so via an
+  // R_X86_64_GLOB_DAT relocation (DT_FLAGS = DF_BIND_NOW), so no PLT/lazy
+  // resolver is needed: call sites are `call *slot(%rip)` (FF 15).
+  // ------------------------------------------------------------------
+  fn cg_writeELFDynamic(path: pchar) {
+    var totalCode: int64 := self.codeLen;
+    var totalData: int64 := self.dataLen;
+    var nExt: int64 := self.externCount;
+
+    var interpStr: pchar := "/lib64/ld-linux-x86-64.so.2";
+    var interpOff: int64 := 64;
+    var interpLen: int64 := StrLen(interpStr) + 1;   // include NUL terminator
+
+    var codeOff: int64 := CG_CODE_OFF;               // 120 — unchanged
+    var dataOff: int64 := codeOff + totalCode;
+
+    // --- build .dynstr (\0, then distinct lib names, then symbol names) ---
+    var dynstr: int64 := mmap(0, 65536, 3, 34, -1, 0);
+    var dsLen:  int64 := 0;
+    poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;    // index 0 = ""
+
+    var uniqPtr:    int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+    var uniqLen:    int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+    var uniqStrOff: int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+    var uniqCount:  int64 := 0;
+    var symStrOff:  int64 := mmap(0, (nExt + 1) * 8, 3, 34, -1, 0);
+
+    var ei: int64 := 0;
+    while (ei < nExt) {
+      var eb: int64 := self.externSyms + ei * CG_EXTERN_SZ;
+      var lp: int64 := peek64(eb + 16);
+      var ll: int64 := peek64(eb + 24);
+      var u: int64 := 0;
+      var found: int64 := -1;
+      while (u < uniqCount) {
+        if (peek64(uniqLen + u * 8) == ll &&
+            self.cg_seq(peek64(uniqPtr + u * 8) as pchar, ll, lp as pchar, ll)) {
+          found := u; u := uniqCount;
+        } else {
+          u := u + 1;
+        }
+      }
+      if (found < 0) {
+        var off: int64 := dsLen;
+        var j: int64 := 0;
+        while (j < ll) { poke8(dynstr + dsLen, peek8(lp + j)); dsLen := dsLen + 1; j := j + 1; }
+        poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+        poke64(uniqPtr + uniqCount * 8, lp);
+        poke64(uniqLen + uniqCount * 8, ll);
+        poke64(uniqStrOff + uniqCount * 8, off);
+        uniqCount := uniqCount + 1;
+      }
+      ei := ei + 1;
+    }
+    ei := 0;
+    while (ei < nExt) {
+      var eb2: int64 := self.externSyms + ei * CG_EXTERN_SZ;
+      var np: int64 := peek64(eb2);
+      var nl: int64 := peek64(eb2 + 8);
+      var off2: int64 := dsLen;
+      var j2: int64 := 0;
+      while (j2 < nl) { poke8(dynstr + dsLen, peek8(np + j2)); dsLen := dsLen + 1; j2 := j2 + 1; }
+      poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      poke64(symStrOff + ei * 8, off2);
+      ei := ei + 1;
+    }
+    var dynstrSize: int64 := dsLen;
+
+    // --- section offsets (8-byte aligned via ((x+7)>>3)<<3) ---
+    var dynstrOff: int64 := ((dataOff + totalData + 7) >> 3) << 3;
+    var dynsymOff: int64 := ((dynstrOff + dynstrSize + 7) >> 3) << 3;
+    var dynsymSize: int64 := (nExt + 1) * 24;
+    var hashOff: int64 := dynsymOff + dynsymSize;            // 24*k is 8-aligned
+    var nchain: int64 := nExt + 1;
+    var hashSize: int64 := (3 + nchain) * 4;                  // nbucket,nchain,bucket[1],chain[]
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := nExt * 24;
+    var gotOff: int64 := relaOff + relaSize;                  // 8-aligned
+    var gotSize: int64 := nExt * 8;
+    var dynOff: int64 := gotOff + gotSize;                    // 8-aligned
+    var dynCount: int64 := uniqCount + 11;                    // NEEDED*u + 11 fixed tags
+    var dynSize: int64 := dynCount * 16;
+    var phdrOff: int64 := ((dynOff + dynSize + 7) >> 3) << 3;
+    var phnum: int64 := 3;
+    var fileSize: int64 := phdrOff + phnum * 56;
+
+    // --- patch extern call sites: disp32 = gotSlotVA - ripVA ---
+    var pi: int64 := 0;
+    while (pi < self.patchCount) {
+      var pb: int64 := self.patches + pi * CG_PATCH_SZ;
+      if (peek64(pb + 24) == CG_PATCH_EXTERN) {
+        var cOff:   int64 := peek64(pb);
+        var exIdx:  int64 := peek64(pb + 8);
+        var gotVA:  int64 := CG_ELF_BASE + gotOff + exIdx * 8;
+        var ripVA:  int64 := CG_ELF_BASE + codeOff + cOff + 4;
+        poke32(self.code + cOff, gotVA - ripVA);
+      }
+      pi := pi + 1;
+    }
+
+    // --- assemble the file image ---
+    var buf: int64 := mmap(0, fileSize, 3, 34, -1, 0);
+
+    // ELF header
+    poke8(buf, 0x7F); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2); poke8(buf + 5, 1); poke8(buf + 6, 1); poke8(buf + 7, 0);
+    poke16(buf + 16, 2);              // e_type = ET_EXEC
+    poke16(buf + 18, 62);             // e_machine = EM_X86_64
+    poke32(buf + 20, 1);              // e_version
+    poke64(buf + 24, CG_ELF_BASE + codeOff);  // e_entry
+    poke64(buf + 32, phdrOff);        // e_phoff -> phdrs at end of file
+    poke64(buf + 40, 0);              // e_shoff
+    poke32(buf + 48, 0);              // e_flags
+    poke16(buf + 52, 64);             // e_ehsize
+    poke16(buf + 54, 56);             // e_phentsize
+    poke16(buf + 56, phnum);          // e_phnum
+    poke16(buf + 58, 64);             // e_shentsize
+    poke16(buf + 60, 0);              // e_shnum
+    poke16(buf + 62, 0);              // e_shstrndx
+
+    // .interp (in the 56-byte gap between phdr-area and code)
+    var ii: int64 := 0;
+    while (ii < interpLen) { poke8(buf + interpOff + ii, peek8((interpStr as int64) + ii)); ii := ii + 1; }
+
+    // code (extern disps now patched)
+    var ci: int64 := 0;
+    while (ci < totalCode) { poke8(buf + codeOff + ci, peek8(self.code + ci)); ci := ci + 1; }
+    // data
+    var di: int64 := 0;
+    while (di < totalData) { poke8(buf + dataOff + di, peek8(self.data + di)); di := di + 1; }
+
+    // .dynstr
+    var si: int64 := 0;
+    while (si < dynstrSize) { poke8(buf + dynstrOff + si, peek8(dynstr + si)); si := si + 1; }
+
+    // .dynsym — [0] = null symbol (zeroed); [i+1] = UNDEF GLOBAL FUNC import
+    ei := 0;
+    while (ei < nExt) {
+      var sy: int64 := buf + dynsymOff + (ei + 1) * 24;
+      poke32(sy, peek64(symStrOff + ei * 8));  // st_name
+      poke8(sy + 4, 0x12);                      // st_info = STB_GLOBAL|STT_FUNC
+      poke8(sy + 5, 0);                          // st_other
+      poke16(sy + 6, 0);                         // st_shndx = SHN_UNDEF
+      ei := ei + 1;
+    }
+
+    // .hash — minimal SysV: nbucket=1, nchain, empty bucket/chains
+    poke32(buf + hashOff, 1);          // nbucket
+    poke32(buf + hashOff + 4, nchain); // nchain (must equal dynsym count)
+
+    // .rela.dyn — one R_X86_64_GLOB_DAT per import into its GOT slot
+    ei := 0;
+    while (ei < nExt) {
+      var ra: int64 := buf + relaOff + ei * 24;
+      poke64(ra, CG_ELF_BASE + gotOff + ei * 8);          // r_offset = GOT slot VA
+      poke64(ra + 8, ((ei + 1) << 32) | 6);               // r_info = (sym<<32)|R_X86_64_GLOB_DAT
+      poke64(ra + 16, 0);                                  // r_addend
+      ei := ei + 1;
+    }
+
+    // .got — zero slots (filled by ld.so); already zeroed by mmap
+
+    // .dynamic
+    var dp: int64 := buf + dynOff;
+    var u2: int64 := 0;
+    while (u2 < uniqCount) {
+      poke64(dp, 1); poke64(dp + 8, peek64(uniqStrOff + u2 * 8)); dp := dp + 16;  // DT_NEEDED
+      u2 := u2 + 1;
+    }
+    poke64(dp, 4);  poke64(dp + 8, CG_ELF_BASE + hashOff);   dp := dp + 16;  // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, CG_ELF_BASE + dynstrOff); dp := dp + 16;  // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, CG_ELF_BASE + dynsymOff); dp := dp + 16;  // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dynstrSize);              dp := dp + 16;  // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);                      dp := dp + 16;  // DT_SYMENT
+    poke64(dp, 7);  poke64(dp + 8, CG_ELF_BASE + relaOff);   dp := dp + 16;  // DT_RELA
+    poke64(dp, 8);  poke64(dp + 8, relaSize);                dp := dp + 16;  // DT_RELASZ
+    poke64(dp, 9);  poke64(dp + 8, 24);                      dp := dp + 16;  // DT_RELAENT
+    poke64(dp, 30); poke64(dp + 8, 8);                       dp := dp + 16;  // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                       dp := dp + 16;  // DT_NULL
+
+    // program headers at end of file
+    var ph: int64 := buf + phdrOff;
+    // PT_LOAD — whole file at base, RWX
+    poke32(ph, 1); poke32(ph + 4, 7);
+    poke64(ph + 8, 0); poke64(ph + 16, CG_ELF_BASE); poke64(ph + 24, CG_ELF_BASE);
+    poke64(ph + 32, fileSize); poke64(ph + 40, fileSize); poke64(ph + 48, 4096);
+    // PT_INTERP
+    var ph2: int64 := ph + 56;
+    poke32(ph2, 3); poke32(ph2 + 4, 4);
+    poke64(ph2 + 8, interpOff); poke64(ph2 + 16, CG_ELF_BASE + interpOff); poke64(ph2 + 24, CG_ELF_BASE + interpOff);
+    poke64(ph2 + 32, interpLen); poke64(ph2 + 40, interpLen); poke64(ph2 + 48, 1);
+    // PT_DYNAMIC
+    var ph3: int64 := ph + 112;
+    poke32(ph3, 2); poke32(ph3 + 4, 6);
+    poke64(ph3 + 8, dynOff); poke64(ph3 + 16, CG_ELF_BASE + dynOff); poke64(ph3 + 24, CG_ELF_BASE + dynOff);
+    poke64(ph3 + 32, dynSize); poke64(ph3 + 40, dynSize); poke64(ph3 + 48, 8);
+
     var fd: int64 := open(path, 577, 493);
     if (fd >= 0) {
       write(fd, buf as pchar, fileSize);

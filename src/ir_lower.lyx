@@ -916,6 +916,45 @@ pub type IRLower = class {
       return dest;
     }
 
+    // PrintStr("literal"): the arm64/IR builtin path needs the string ADDRESS
+    // in slot 0 and its LENGTH in slot 1 (emitBuiltinCall id 1 does
+    // write(1, slot0, slot1)). Extract the literal, process escapes at compile
+    // time, intern it in the IR string table, and emit CONST_STR + CONST_INT.
+    // Inline (no IRLower helper method — that shifts the vtable, breaks seed).
+    if (self.seq(fname, fnlen, "PrintStr", 8) && arg0 >= 0 && self.nodeKind(arg0) == NK_LIT_STR) {
+      var psStart: int64 := (self.nodeSVal(arg0) as int64) + 1;   // skip opening quote
+      var psSrcLen: int64 := self.nodeSLen(arg0) - 2;             // drop both quotes
+      if (psSrcLen < 0) { psSrcLen := 0; }
+      var psBuf: int64 := mmap(0, psSrcLen + 8, 3, 34, -1, 0);
+      var psOut: int64 := 0;
+      var psI: int64 := 0;
+      while psI < psSrcLen {
+        var psC: int64 := peek8(psStart + psI);
+        if psC == 92 && psI + 1 < psSrcLen {       // backslash escape
+          var psN: int64 := peek8(psStart + psI + 1);
+          if psN == 110      { psC := 10; psI := psI + 1; }   // \n
+          else if psN == 116 { psC := 9;  psI := psI + 1; }   // \t
+          else if psN == 114 { psC := 13; psI := psI + 1; }   // \r
+          else if psN == 92  { psC := 92; psI := psI + 1; }   // \\
+          else if psN == 34  { psC := 34; psI := psI + 1; }   // \"
+          else if psN == 48  { psC := 0;  psI := psI + 1; }   // \0
+        }
+        poke8(psBuf + psOut, psC);
+        psOut := psOut + 1;
+        psI := psI + 1;
+      }
+      var psStrOff: int64 := self.irAddString(psBuf as pchar, psOut);
+      var psA: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_STR, psA, -1, -1, psStrOff);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, psA, -1, 0);
+      var psL: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, psL, -1, -1, psOut);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 1, psL, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
+      return dest;
+    }
+
+
     // WP-AND-upstream-fix v2: user-function call. Inline name lookup against
     // the IR funcBuffer (no helper method — adding one shifted the IRLower
     // vtable in a way that broke self-host singularity). Forward references
@@ -960,6 +999,50 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, -1, fbArgCnt);
       return dest;
     }
+
+    // FFI: is fname a declared `extern fn ... link "lib"`? Such a decl is a
+    // bodyless NK_FUNC_DECL (c2 == -1) carrying the packed library span in c3
+    // (set by the parser). Scan the node table for a name match. (Inline, no
+    // helper method — adding methods to IRLower shifts its vtable and breaks
+    // the seed compiler.) Imports are handled because lowerModule swaps
+    // self.src/self.nodes while lowering each import's bodies.
+    var exNi: int64 := -1;
+    var exScan: int64 := 0;
+    while exScan < self.nodeCount {
+      if self.nodeKind(exScan) == NK_FUNC_DECL && self.nodeC2(exScan) == -1 && self.nodeC3(exScan) != -1 {
+        if self.nodeSLen(exScan) == fnlen {
+          var exNamePtr: pchar := self.nodeSVal(exScan);
+          var exMatch: int64 := 1;
+          var exJ: int64 := 0;
+          while exJ < fnlen {
+            if exMatch != 0 {
+              if peek8((exNamePtr as int64) + exJ) != peek8((fname as int64) + exJ) { exMatch := 0; }
+            }
+            exJ := exJ + 1;
+          }
+          if exMatch != 0 { exNi := exScan; exScan := self.nodeCount; }
+        }
+      }
+      exScan := exScan + 1;
+    }
+    if exNi >= 0 {
+      var exLibPacked: int64 := self.nodeC3(exNi);
+      var exLibOff: int64 := exLibPacked & 0xFFFFFFFF;
+      var exLibLen: int64 := (exLibPacked >> 32) & 0xFFFFFFFF;
+      var exNameStrOff: int64 := self.irAddString(fname, fnlen);
+      var exLibStrOff: int64 := self.irAddString((self.src as int64 + exLibOff) as pchar, exLibLen);
+      var exArgCnt: int64 := 0;
+      var exArg: int64 := arg0;
+      while exArg >= 0 {
+        var exAT: int64 := self.lowerExpr(exArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, exArgCnt, exAT, -1, 0);
+        exArgCnt := exArgCnt + 1;
+        exArg := self.nodeNext(exArg);
+      }
+      self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
+      return dest;
+    }
+
 
     // General call: lower first argument and emit IRO_CALL_BUILTIN
     if (arg0 >= 0) {
@@ -1633,10 +1716,18 @@ pub type IRLower = class {
     var pfCur: int64 := decls;
     while pfCur >= 0 {
       if self.nodeKind(pfCur) == NK_FUNC_DECL {
-        var pfNamePtr: pchar := self.nodeSVal(pfCur);
-        var pfNameLen: int64 := self.nodeSLen(pfCur);
-        var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
-        self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+        // Skip `extern fn ... link` decls (bodyless NK_FUNC_DECL with the
+        // packed library span in c3): they are FFI imports, not internal
+        // functions. Registering them in funcBuffer would make lowerCall
+        // resolve them as user calls instead of emitting IRO_CALL_EXTERN.
+        var pfIsExtern: int64 := 0;
+        if self.nodeC2(pfCur) == -1 && self.nodeC3(pfCur) != -1 { pfIsExtern := 1; }
+        if pfIsExtern == 0 {
+          var pfNamePtr: pchar := self.nodeSVal(pfCur);
+          var pfNameLen: int64 := self.nodeSLen(pfCur);
+          var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
+          self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+        }
       }
       pfCur := self.nodeNext(pfCur);
     }
@@ -1645,7 +1736,12 @@ pub type IRLower = class {
     while (cur >= 0) {
       var kind: int64 := self.nodeKind(cur);
       if (kind == NK_FUNC_DECL) {
-        self.lowerFunc(cur);
+        // Skip extern (FFI) decls — no body to lower; calls become IRO_CALL_EXTERN.
+        var bodyIsExtern: int64 := 0;
+        if self.nodeC2(cur) == -1 && self.nodeC3(cur) != -1 { bodyIsExtern := 1; }
+        if bodyIsExtern == 0 {
+          self.lowerFunc(cur);
+        }
       } else if (kind == NK_IMPORT) {
         // WP-AND-upstream-fix v3: actually lower imported function bodies.
         // Sema's _sema_processImport reads + parses imports but disposes the
