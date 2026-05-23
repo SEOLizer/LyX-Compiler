@@ -17,7 +17,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 |---|---|---|---|---|
 | WP-STB-01 | `std/datetime.lyx` | 22 leere Funktionen: Format, Parse, Arithmetik, Timezone | L | ✅ |
 | WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ✅ |
-| WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ⬜ |
+| WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ✅ |
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ⬜ |
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ⬜ |
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ⬜ |
@@ -135,7 +135,7 @@ einem CV-Niveau ist ausreichend für die meisten use-cases.
 
 ---
 
-### WP-STB-03: `hash.lyx` — Echte SHA-3/Keccak-Sponge ⬜
+### WP-STB-03: `hash.lyx` — Echte SHA-3/Keccak-Sponge ✅
 
 **Branch:** `feat/std-stubs-03`
 **Datei:** `std/hash.lyx` (ab Zeile 621)
