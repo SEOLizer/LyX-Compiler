@@ -19,7 +19,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-02 | `std/hash.lyx` | Echte BLAKE3-Implementierung (statt FNV-Stub) | M | ✅ |
 | WP-STB-03 | `std/hash.lyx` | Echte SHA-3/Keccak-Sponge (statt FNV-Stub) | M | ✅ |
 | WP-STB-04 | `std/url.lyx` | `GetQueryParam()` gibt immer `""` zurück | S | ✅ |
-| WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ⬜ |
+| WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ✅ |
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ⬜ |
 | WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ⬜ |
 | WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ⬜ |
@@ -201,7 +201,7 @@ nutzen, falls vorhanden.
 
 ---
 
-### WP-STB-05: `net/socket.lyx` — `getPeerCredentials()` ⬜
+### WP-STB-05: `net/socket.lyx` — `getPeerCredentials()` ✅
 
 **Branch:** `feat/std-stubs-05`
 **Datei:** `std/net/socket.lyx` (Zeile 1316)
