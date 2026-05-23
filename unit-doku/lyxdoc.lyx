@@ -1,0 +1,736 @@
+// unit-doku/lyxdoc.lyx
+// Lyx Documentation Generator
+//
+// Parst eine Lyx-Unit-Quelldatei und erzeugt API-Dokumentation als DokuWiki.
+// Dokumentiert: Unit-Metadaten, Imports, Konstanten, Typen (struct/class),
+//               externe Funktionen und Funktionen.
+//
+// Verwendung: lyxdoc <unit.lyx>
+// Ausgabe:    <basename>.txt im aktuellen Verzeichnis
+
+// Keine std-Imports nötig: Wir nutzen ausschließlich Compiler-Builtins.
+// Builtins: StrLen, StrCharAt, StrSetChar, StrSub, StrNew, StrFree, StrConcat,
+//           StrStartsWith, StrEquals, PrintStr, PrintInt, IntToStr,
+//           GetArgC, GetArgV, ArgvGet, open, read, write, close
+
+// ============================================================================
+// Eigenimplementierungen (keine Lib-Abhängigkeiten)
+// ============================================================================
+
+// Substring-Suche: true wenn needle in s vorkommt (ersetzt StrContains)
+fn strHas(s: pchar, needle: pchar): bool {
+  var slen: int64 := StrLen(s);
+  var nlen: int64 := StrLen(needle);
+  if (nlen == 0) { return true; }
+  if (nlen > slen) { return false; }
+  var maxIdx: int64 := slen - nlen;
+  var i: int64 := 0;
+  while (i <= maxIdx) {
+    var j: int64 := 0;
+    var match: bool := true;
+    while (j < nlen && match) {
+      if (StrCharAt(s, i + j) != StrCharAt(needle, j)) { match := false; }
+      j := j + 1;
+    }
+    if (match) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Liest gesamten Dateiinhalt (max 512KB). Caller muss StrFree aufrufen.
+// Gibt 0 zurück bei Fehler.
+fn readFileContents(path: pchar): pchar {
+  // Liest bis zu 128KB (ausreichend für alle Lyx-Quelldateien)
+  var f: int64 := open(path, 0, 0);
+  if (f < 0) { return 0 as pchar; }
+  var buf: pchar := StrNew(131072);
+  var n: int64 := read(f, buf, 131071);
+  close(f);
+  if (n < 0) { n := 0; }
+  StrSetChar(buf, n, 0);
+  return buf;
+}
+
+// ============================================================================
+// Ausgabe-Hilfsfunktionen
+// (Implementiert als Write-Loop damit der Inliner sie nicht inline)
+// ============================================================================
+
+// Schreibt s vollständig in outFd (mit Retry bei Partial-Write)
+fn w(outFd: int64, s: pchar): void {
+  var len: int64 := StrLen(s);
+  var sent: int64 := 0;
+  while (sent < len) {
+    var r: int64 := write(outFd, s + sent, len - sent);
+    if (r <= 0) { break; }
+    sent := sent + r;
+  }
+}
+
+// Schreibt s in outFd und gibt s frei (für dynamisch allokierte Strings)
+fn wf(outFd: int64, s: pchar): void {
+  var len: int64 := StrLen(s);
+  var sent: int64 := 0;
+  while (sent < len) {
+    var r: int64 := write(outFd, s + sent, len - sent);
+    if (r <= 0) { break; }
+    sent := sent + r;
+  }
+  StrFree(s);
+}
+
+// ============================================================================
+// String-Hilfsfunktionen
+// ============================================================================
+
+// Entfernt Whitespace beidseitig (allokiert, Caller muss StrFree aufrufen)
+fn trimStr(s: pchar): pchar {
+  var i: int64 := 0;
+  var len: int64 := StrLen(s);
+  while (i < len) {
+    var c: int64 := StrCharAt(s, i);
+    if (c != 32 && c != 9) { break; }
+    i := i + 1;
+  }
+  var end2: int64 := len;
+  while (end2 > i) {
+    var c: int64 := StrCharAt(s, end2 - 1);
+    if (c != 32 && c != 9 && c != 13) { break; }
+    end2 := end2 - 1;
+  }
+  return StrSub(s, i, end2 - i);
+}
+
+// Liest eine Zeile aus content[pos..] in dest.
+// Gibt Anzahl gelesener Zeichen zurück (ohne Newline).
+fn readline(content: pchar, pos: int64, dest: pchar, maxLen: int64): int64 {
+  var total: int64 := StrLen(content);
+  var i: int64 := 0;
+  while (pos + i < total && i < maxLen - 1) {
+    var c: int64 := StrCharAt(content, pos + i);
+    if (c == 10) { break; }
+    StrSetChar(dest, i, c);
+    i := i + 1;
+  }
+  StrSetChar(dest, i, 0);
+  return i;
+}
+
+// Zählt '{' in line (ignoriert Strings und // Kommentare)
+fn countOpen(line: pchar): int64 {
+  var n: int64 := 0;
+  var len: int64 := StrLen(line);
+  var inStr: bool := false;
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := StrCharAt(line, i);
+    if (not inStr && c == 47 && i + 1 < len && StrCharAt(line, i + 1) == 47) { break; }
+    if (c == 34) { inStr := not inStr; }
+    if (not inStr && c == 123) { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
+
+// Zählt '}' in line (ignoriert Strings und // Kommentare)
+fn countClose(line: pchar): int64 {
+  var n: int64 := 0;
+  var len: int64 := StrLen(line);
+  var inStr: bool := false;
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := StrCharAt(line, i);
+    if (not inStr && c == 47 && i + 1 < len && StrCharAt(line, i + 1) == 47) { break; }
+    if (c == 34) { inStr := not inStr; }
+    if (not inStr && c == 125) { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
+
+// Extrahiert Text zwischen erstem Paar von Anführungszeichen in s.
+// "@description("Mein Text")" → "Mein Text" (allokiert, Caller frees)
+fn extractQuoted(s: pchar): pchar {
+  var len: int64 := StrLen(s);
+  var start: int64 := -1;
+  var end2: int64 := -1;
+  var i: int64 := 0;
+  while (i < len) {
+    if (StrCharAt(s, i) == 34) {
+      if (start == -1) { start := i + 1; }
+      else { end2 := i; break; }
+    }
+    i := i + 1;
+  }
+  if (start < 0 || end2 < 0 || end2 < start) { return StrSub(s, 0, 0); }
+  return StrSub(s, start, end2 - start);
+}
+
+// Extrahiert Unit-Name aus "unit foo.bar;" (allokiert, Caller frees)
+fn extractUnitName(line: pchar): pchar {
+  var len: int64 := StrLen(line);
+  if (len < 6) { return StrSub(line, 0, 0); }
+  var i: int64 := 5;
+  var end2: int64 := i;
+  while (end2 < len && StrCharAt(line, end2) != 59) { end2 := end2 + 1; }
+  var raw: pchar := StrSub(line, i, end2 - i);
+  var result: pchar := trimStr(raw);
+  StrFree(raw);
+  return result;
+}
+
+// Extrahiert Import-Name aus "import foo.bar;" (allokiert, Caller frees)
+fn extractImportName(line: pchar): pchar {
+  var len: int64 := StrLen(line);
+  if (len < 8) { return StrSub(line, 0, 0); }
+  var i: int64 := 7;
+  var end2: int64 := i;
+  while (end2 < len && StrCharAt(line, end2) != 59) { end2 := end2 + 1; }
+  var raw: pchar := StrSub(line, i, end2 - i);
+  var result: pchar := trimStr(raw);
+  StrFree(raw);
+  return result;
+}
+
+// Extrahiert Typnamen aus "pub type NAME = ..." oder "type NAME = ..."
+// (allokiert, Caller frees)
+fn extractTypeName(line: pchar, isPub: bool): pchar {
+  var skip: int64 := 5;
+  if (isPub) { skip := 9; }
+  var len: int64 := StrLen(line);
+  if (len < skip + 1) { return StrSub(line, 0, 0); }
+  var rest: pchar := StrSub(line, skip, len - skip);
+  var rlen: int64 := StrLen(rest);
+  var i: int64 := 0;
+  while (i < rlen) {
+    if (StrCharAt(rest, i) == 32) {
+      var name: pchar := StrSub(rest, 0, i);
+      StrFree(rest);
+      return name;
+    }
+    i := i + 1;
+  }
+  return rest;
+}
+
+// Extrahiert Alias-Wert aus "pub type NAME = Alias;" (allokiert, Caller frees)
+fn extractTypeAlias(line: pchar, isPub: bool): pchar {
+  var skip: int64 := 5;
+  if (isPub) { skip := 9; }
+  var len: int64 := StrLen(line);
+  if (len < skip + 3) { return StrSub(line, 0, 0); }
+  var rest: pchar := StrSub(line, skip, len - skip);
+  var rlen: int64 := StrLen(rest);
+  var eqPos: int64 := -1;
+  var i: int64 := 0;
+  while (i + 2 < rlen) {
+    if (StrCharAt(rest, i) == 32 && StrCharAt(rest, i+1) == 61 && StrCharAt(rest, i+2) == 32) {
+      eqPos := i;
+      break;
+    }
+    i := i + 1;
+  }
+  if (eqPos < 0) { StrFree(rest); return StrSub(line, 0, 0); }
+  var vs: int64 := eqPos + 3;
+  var semiPos: int64 := rlen;
+  i := vs;
+  while (i < rlen) {
+    if (StrCharAt(rest, i) == 59) { semiPos := i; break; }
+    i := i + 1;
+  }
+  var alias: pchar := StrSub(rest, vs, semiPos - vs);
+  StrFree(rest);
+  return alias;
+}
+
+// Entfernt abschließendes " {" oder "{" (allokiert, Caller frees)
+fn stripBrace(s: pchar): pchar {
+  var len: int64 := StrLen(s);
+  while (len > 0) {
+    var c: int64 := StrCharAt(s, len - 1);
+    if (c == 32 || c == 9 || c == 123) { len := len - 1; }
+    else { break; }
+  }
+  return StrSub(s, 0, len);
+}
+
+// Extrahiert Funktionssignatur aus "pub fn Name(params): ret {" oder "fn Name(...): ret {"
+// Ergebnis: "Name(params): ret" (allokiert, Caller frees)
+fn extractFnSig(line: pchar, isPub: bool): pchar {
+  var skip: int64 := 3;
+  if (isPub) {
+    if (StrStartsWith(line, "public ")) { skip := 10; }
+    else { skip := 7; }
+  }
+  var len: int64 := StrLen(line);
+  if (len < skip) { return StrSub(line, 0, 0); }
+  var sub: pchar := StrSub(line, skip, len - skip);
+  var result: pchar := stripBrace(sub);
+  StrFree(sub);
+  return result;
+}
+
+// Extrahiert extern-fn-Signatur aus "extern fn Name(params): ret;" oder "... link ...;"
+// (allokiert, Caller frees)
+fn extractExternSig(line: pchar): pchar {
+  var len: int64 := StrLen(line);
+  if (len < 10) { return StrSub(line, 0, 0); }
+  var rest: pchar := StrSub(line, 10, len - 10);
+  var rlen: int64 := StrLen(rest);
+  // Nachfolgendes ';' und Whitespace entfernen
+  while (rlen > 0) {
+    var c: int64 := StrCharAt(rest, rlen - 1);
+    if (c == 59 || c == 32 || c == 9) { rlen := rlen - 1; }
+    else { break; }
+  }
+  // " link ..." Klausel entfernen (ASCII: ' '=32 'l'=108 'i'=105 'n'=110 'k'=107)
+  var i: int64 := 0;
+  while (i + 5 < rlen) {
+    if (StrCharAt(rest, i) == 32 && StrCharAt(rest, i+1) == 108 &&
+        StrCharAt(rest, i+2) == 105 && StrCharAt(rest, i+3) == 110 &&
+        StrCharAt(rest, i+4) == 107 && StrCharAt(rest, i+5) == 32) {
+      rlen := i;
+      break;
+    }
+    i := i + 1;
+  }
+  var result: pchar := StrSub(rest, 0, rlen);
+  StrFree(rest);
+  return result;
+}
+
+// Prüft ob die getrimte Zeile eine Felddeklaration ist (name: type;)
+fn isFieldLine(line: pchar): bool {
+  var len: int64 := StrLen(line);
+  if (len == 0) { return false; }
+  if (StrStartsWith(line, "//")) { return false; }
+  if (StrStartsWith(line, "fn ")) { return false; }
+  if (StrStartsWith(line, "pub ")) { return false; }
+  if (StrStartsWith(line, "self.")) { return false; }
+  // Muss mit ';' enden
+  if (StrCharAt(line, len - 1) != 59) { return false; }
+  // Muss ':' enthalten (vor eventuellem ':=')
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := StrCharAt(line, i);
+    if (c == 58) {
+      if (i + 1 < len && StrCharAt(line, i + 1) == 61) { return false; }
+      return true;
+    }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Schreibt eine Feld-Tabellenzeile: "| ''name'' | ''type'' |\n"
+fn writeFieldRow(outFd: int64, line: pchar): void {
+  var len: int64 := StrLen(line);
+  var colonPos: int64 := -1;
+  var semiPos: int64 := len;
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := StrCharAt(line, i);
+    if (c == 58 && colonPos < 0) { colonPos := i; }
+    if (c == 59 && colonPos >= 0) { semiPos := i; break; }
+    i := i + 1;
+  }
+  if (colonPos < 0) { return; }
+  var rawName: pchar := StrSub(line, 0, colonPos);
+  var name: pchar := trimStr(rawName);
+  StrFree(rawName);
+  var rawTyp: pchar := StrSub(line, colonPos + 1, semiPos - colonPos - 1);
+  var typ: pchar := trimStr(rawTyp);
+  StrFree(rawTyp);
+  w(outFd, "| ''");
+  wf(outFd, name);
+  w(outFd, "'' | ''");
+  wf(outFd, typ);
+  w(outFd, "'' |\n");
+}
+
+// Schreibt eine Konstanten-Tabellenzeile
+// Aus: "pub con NAME: type := value;" oder "con NAME: type := value;"
+fn writeConstRow(outFd: int64, line: pchar, isPub: bool): void {
+  var skip: int64 := 4;
+  if (isPub) { skip := 8; }
+  var len: int64 := StrLen(line);
+  if (len < skip + 1) { return; }
+  var rest: pchar := StrSub(line, skip, len - skip);
+  var rlen: int64 := StrLen(rest);
+  var colonPos: int64 := -1;
+  var assignPos: int64 := -1;
+  var semiPos: int64 := rlen;
+  var i: int64 := 0;
+  while (i < rlen) {
+    var c: int64 := StrCharAt(rest, i);
+    if (c == 58) {
+      if (i + 1 < rlen && StrCharAt(rest, i + 1) == 61) {
+        if (assignPos < 0) { assignPos := i; }
+      } else {
+        if (colonPos < 0) { colonPos := i; }
+      }
+    }
+    if (c == 59) { semiPos := i; break; }
+    i := i + 1;
+  }
+  var name: pchar := StrSub(rest, 0, 0);
+  var typ: pchar := StrSub(rest, 0, 0);
+  var val: pchar := StrSub(rest, 0, 0);
+  if (colonPos >= 0) {
+    StrFree(name);
+    var rawN: pchar := StrSub(rest, 0, colonPos);
+    name := trimStr(rawN);
+    StrFree(rawN);
+  }
+  if (colonPos >= 0 && assignPos > colonPos + 1) {
+    StrFree(typ);
+    var rawT: pchar := StrSub(rest, colonPos + 1, assignPos - colonPos - 1);
+    typ := trimStr(rawT);
+    StrFree(rawT);
+  }
+  if (assignPos >= 0) {
+    var vs: int64 := assignPos + 2;
+    if (vs < rlen && StrCharAt(rest, vs) == 32) { vs := vs + 1; }
+    var valEnd: int64 := semiPos;
+    StrFree(val);
+    var rawV: pchar := StrSub(rest, vs, valEnd - vs);
+    val := trimStr(rawV);
+    StrFree(rawV);
+  }
+  var vis: pchar := "priv";
+  if (isPub) { vis := "pub"; }
+  w(outFd, "| ''");
+  wf(outFd, name);
+  w(outFd, "'' | ''");
+  wf(outFd, typ);
+  w(outFd, "'' | ''");
+  wf(outFd, val);
+  w(outFd, "'' | ");
+  w(outFd, vis);
+  w(outFd, " |\n");
+  StrFree(rest);
+}
+
+// Extrahiert Dateiname ohne Verzeichnis und ohne Extension (allokiert, Caller frees)
+fn extractBaseName(path: pchar): pchar {
+  var len: int64 := StrLen(path);
+  var lastSlash: int64 := -1;
+  var i: int64 := len - 1;
+  while (i >= 0) {
+    if (StrCharAt(path, i) == 47) { lastSlash := i; break; }
+    i := i - 1;
+  }
+  var nameStart: int64 := lastSlash + 1;
+  var lastDot: int64 := len;
+  i := len - 1;
+  while (i >= nameStart) {
+    if (StrCharAt(path, i) == 46) { lastDot := i; break; }
+    i := i - 1;
+  }
+  return StrSub(path, nameStart, lastDot - nameStart);
+}
+
+// ============================================================================
+// Hauptparser: Erzeugt DokuWiki-Dokumentation
+// ============================================================================
+//
+// State-Machine:
+//   mode 0 = Toplevel
+//   mode 1 = Innerhalb eines struct
+//   mode 2 = Innerhalb eines class-Body (Felder & Methoden)
+//   mode 3 = Innerhalb einer class-Methode (überspringen bis depth=1)
+//   mode 4 = Innerhalb einer top-level-Funktion (überspringen bis depth=0)
+//
+fn generateDoc(content: pchar, outFd: int64): void {
+  var total: int64 := StrLen(content);
+  var lineBuf: pchar := StrNew(4096);
+
+  // Parser-Zustand
+  var mode: int64 := 0;
+  var depth: int64 := 0;
+
+  // Abschnitt-Flags (für verzögertes Schreiben der Section-Header)
+  var importsStarted: bool := false;
+  var constsStarted: bool := false;
+  var typesStarted: bool := false;
+  var externStarted: bool := false;
+  var funcsSection: bool := false;
+  var funcsTable: bool := false;
+
+  // Class-Flags (resettet beim Betreten einer neuen class)
+  var classMethodsStarted: bool := false;
+
+  // Metadaten (erstes Pass)
+  var unitName: pchar := StrSub(content, 0, 0);
+  var unitDesc: pchar := StrSub(content, 0, 0);
+  var unitAuthor: pchar := StrSub(content, 0, 0);
+  var unitCopyright: pchar := StrSub(content, 0, 0);
+
+  // ── Pass 1: Metadaten aus Dateiende des Headers sammeln ─────────────────
+  var tempPos: int64 := 0;
+  while (tempPos < total) {
+    var ll: int64 := readline(content, tempPos, lineBuf, 4096);
+    tempPos := tempPos + ll;
+    if (tempPos < total && StrCharAt(content, tempPos) == 10) { tempPos := tempPos + 1; }
+    var line: pchar := trimStr(lineBuf);
+    if (StrStartsWith(line, "@description(")) {
+      StrFree(unitDesc);
+      unitDesc := extractQuoted(line);
+    } else if (StrStartsWith(line, "@author(")) {
+      StrFree(unitAuthor);
+      unitAuthor := extractQuoted(line);
+    } else if (StrStartsWith(line, "@copyright(")) {
+      StrFree(unitCopyright);
+      unitCopyright := extractQuoted(line);
+    } else if (StrStartsWith(line, "unit ")) {
+      StrFree(unitName);
+      unitName := extractUnitName(line);
+      StrFree(line);
+      break;
+    }
+    StrFree(line);
+  }
+
+  // ── DokuWiki-Header schreiben ────────────────────────────────────────────
+  w(outFd, "====== ");
+  w(outFd, unitName);
+  w(outFd, " ======\n\n");
+  if (StrLen(unitDesc) > 0) {
+    w(outFd, "> ");
+    w(outFd, unitDesc);
+    w(outFd, "\n\n");
+  }
+  if (StrLen(unitAuthor) > 0) {
+    w(outFd, "**Autor:** ");
+    w(outFd, unitAuthor);
+    w(outFd, "\\\\\n");
+  }
+  if (StrLen(unitCopyright) > 0) {
+    w(outFd, "**Copyright:** ");
+    w(outFd, unitCopyright);
+    w(outFd, "\n");
+  }
+  StrFree(unitName);
+  StrFree(unitDesc);
+  StrFree(unitAuthor);
+  StrFree(unitCopyright);
+
+  // ── Pass 2: Vollständiger Parse ──────────────────────────────────────────
+  var pos: int64 := 0;
+  while (pos < total) {
+    var ll2: int64 := readline(content, pos, lineBuf, 4096);
+    pos := pos + ll2;
+    if (pos < total && StrCharAt(content, pos) == 10) { pos := pos + 1; }
+
+    var trimmed: pchar := trimStr(lineBuf);
+    var opens: int64 := countOpen(trimmed);
+    var closes: int64 := countClose(trimmed);
+
+    if (mode == 0 && depth == 0) {
+      // ── Toplevel ─────────────────────────────────────────────────────────
+
+      if (StrStartsWith(trimmed, "import ")) {
+        if (not importsStarted) {
+          w(outFd, "\n----\n\n===== Imports =====\n\n");
+          importsStarted := true;
+        }
+        var imp: pchar := extractImportName(trimmed);
+        w(outFd, "  * ''");
+        wf(outFd, imp);
+        w(outFd, "''\n");
+
+      } else if (StrStartsWith(trimmed, "pub con ")) {
+        if (not constsStarted) {
+          w(outFd, "\n----\n\n===== Konstanten =====\n\n");
+          w(outFd, "^ Name ^ Typ ^ Wert ^ Sichtbarkeit ^\n");
+          constsStarted := true;
+        }
+        writeConstRow(outFd, trimmed, true);
+
+      } else if (StrStartsWith(trimmed, "con ")) {
+        if (not constsStarted) {
+          w(outFd, "\n----\n\n===== Konstanten =====\n\n");
+          w(outFd, "^ Name ^ Typ ^ Wert ^ Sichtbarkeit ^\n");
+          constsStarted := true;
+        }
+        writeConstRow(outFd, trimmed, false);
+
+      } else if (StrStartsWith(trimmed, "pub type ") || StrStartsWith(trimmed, "type ")) {
+        var isPubType: bool := StrStartsWith(trimmed, "pub ");
+        if (not typesStarted) {
+          w(outFd, "\n----\n\n===== Typen =====\n\n");
+          typesStarted := true;
+        }
+        var typName: pchar := extractTypeName(trimmed, isPubType);
+        if (strHas(trimmed, "= struct {")) {
+          w(outFd, "==== ");
+          wf(outFd, typName);
+          w(outFd, " (struct) ====\n\n");
+          w(outFd, "^ Feld ^ Typ ^\n");
+          mode := 1;
+        } else if (strHas(trimmed, "= class {")) {
+          w(outFd, "==== ");
+          wf(outFd, typName);
+          w(outFd, " (class) ====\n\n");
+          w(outFd, "**Felder:**\n\n^ Feld ^ Typ ^\n");
+          classMethodsStarted := false;
+          mode := 2;
+        } else if (StrLen(trimmed) > 0 && StrCharAt(trimmed, StrLen(trimmed) - 1) == 59) {
+          // Typ-Alias: "pub type X = Y;"
+          var alias: pchar := extractTypeAlias(trimmed, isPubType);
+          w(outFd, "==== ");
+          wf(outFd, typName);
+          w(outFd, " = ");
+          wf(outFd, alias);
+          w(outFd, " ====\n\n");
+        } else {
+          StrFree(typName);
+        }
+
+      } else if (StrStartsWith(trimmed, "extern fn ")) {
+        if (not externStarted) {
+          w(outFd, "\n----\n\n===== Externe Funktionen =====\n\n");
+          w(outFd, "^ Signatur ^\n");
+          externStarted := true;
+        }
+        var esig: pchar := extractExternSig(trimmed);
+        w(outFd, "| ''");
+        wf(outFd, esig);
+        w(outFd, "'' |\n");
+
+      } else if (StrStartsWith(trimmed, "pub fn ") || StrStartsWith(trimmed, "public fn ")) {
+        if (not funcsSection) {
+          w(outFd, "\n----\n\n===== Funktionen =====\n\n");
+          w(outFd, "^ Signatur ^ Sichtbarkeit ^\n");
+          funcsSection := true;
+          funcsTable := true;
+        } else if (not funcsTable) {
+          w(outFd, "\n^ Signatur ^ Sichtbarkeit ^\n");
+          funcsTable := true;
+        }
+        var fsig: pchar := extractFnSig(trimmed, true);
+        w(outFd, "| ''");
+        wf(outFd, fsig);
+        w(outFd, "'' | pub |\n");
+        if (opens > 0) { mode := 4; }
+
+      } else if (StrStartsWith(trimmed, "fn ")) {
+        if (not funcsSection) {
+          w(outFd, "\n----\n\n===== Funktionen =====\n\n");
+          w(outFd, "^ Signatur ^ Sichtbarkeit ^\n");
+          funcsSection := true;
+          funcsTable := true;
+        } else if (not funcsTable) {
+          w(outFd, "\n^ Signatur ^ Sichtbarkeit ^\n");
+          funcsTable := true;
+        }
+        var fsig2: pchar := extractFnSig(trimmed, false);
+        w(outFd, "| ''");
+        wf(outFd, fsig2);
+        w(outFd, "'' | priv |\n");
+        if (opens > 0) { mode := 4; }
+      }
+
+    } else if (mode == 1) {
+      // ── Innerhalb struct ─────────────────────────────────────────────────
+      if (isFieldLine(trimmed)) {
+        writeFieldRow(outFd, trimmed);
+      }
+
+    } else if (mode == 2 && depth == 1) {
+      // ── Innerhalb class-Body ─────────────────────────────────────────────
+      if (isFieldLine(trimmed)) {
+        writeFieldRow(outFd, trimmed);
+      } else if (StrStartsWith(trimmed, "fn ")) {
+        if (not classMethodsStarted) {
+          w(outFd, "\n**Methoden:**\n\n");
+          w(outFd, "^ Signatur ^ Sichtbarkeit ^\n");
+          classMethodsStarted := true;
+        }
+        var msig: pchar := extractFnSig(trimmed, false);
+        w(outFd, "| ''");
+        wf(outFd, msig);
+        w(outFd, "'' | priv |\n");
+        if (opens > 0) { mode := 3; }
+      }
+    }
+    // mode 3 (Methoden-Body) und mode 4 (Funktions-Body): Zeile überspringen
+
+    // Tiefe aktualisieren
+    depth := depth + opens;
+    depth := depth - closes;
+
+    // Zustandsübergänge nach Tiefen-Änderung
+    if (depth == 0) {
+      if (mode == 1) {
+        w(outFd, "\n");
+        mode := 0;
+        funcsTable := false;
+      } else if (mode == 2) {
+        w(outFd, "\n");
+        mode := 0;
+        funcsTable := false;
+      } else if (mode == 4) {
+        mode := 0;
+      }
+    } else if (depth == 1 && mode == 3) {
+      // Methoden-Ende: zurück zum class-Body
+      mode := 2;
+    }
+
+    StrFree(trimmed);
+  }
+
+  StrFree(lineBuf);
+}
+
+// ============================================================================
+// Einstiegspunkt
+// ============================================================================
+fn main(argc: int64, argv: pchar): int64 {
+  PrintStr("Lyx Doc v1.0\n");
+  PrintStr("Copyright (c) 2026 Andreas Röne. Alle Rechte vorbehalten.\n");
+  PrintStr("\n");
+  if (argc < 2) {
+    PrintStr("Verwendung: lyxdoc <unit.lyx>\n");
+    PrintStr("  Erstellt API-Dokumentation als <name>.txt\n");
+    return 1;
+  }
+
+  var inPath: pchar := ArgvGet(argv, 1);
+
+  var content: pchar := readFileContents(inPath);
+  if (content == 0 as pchar) {
+    PrintStr("Fehler: Datei nicht lesbar: ");
+    PrintStr(inPath);
+    PrintStr("\n");
+    return 1;
+  }
+
+  var baseName: pchar := extractBaseName(inPath);
+  var outPath: pchar := StrConcat(baseName, ".txt");
+  StrFree(baseName);
+
+  // O_WRONLY=1, O_CREAT=64, O_TRUNC=512 → 577; DEFAULT_MODE=420 (0644)
+  var outFd: int64 := open(outPath, 577, 420);
+  if (outFd < 0) {
+    PrintStr("Fehler: Ausgabedatei kann nicht erstellt werden: ");
+    PrintStr(outPath);
+    PrintStr("\n");
+    StrFree(content);
+    StrFree(outPath);
+    return 1;
+  }
+
+  generateDoc(content, outFd);
+
+  close(outFd);
+  PrintStr("Dokumentation erstellt: ");
+  PrintStr(outPath);
+  PrintStr("\n");
+
+  StrFree(content);
+  StrFree(outPath);
+  return 0;
+}
