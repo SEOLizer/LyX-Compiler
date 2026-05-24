@@ -112,7 +112,7 @@ Imports müssen als IAT-Einträge in den PE-Header eingetragen werden (kein PLT,
 
 | Priorität | Task | Beschreibung |
 |-----------|------|--------------|
-| Niedrig | **Map Aggregates** | MapSum, MapMin, MapMax, MapAvg (benötigt Iterator-Support) |
+| ~~Niedrig~~ | **Map Aggregates** | ✅ MapCount/Sum/Min/Max/Avg in std/stats.lyx + map_iter API in src/std/map.lyx |
 
 ### Dynamic Linking
 
