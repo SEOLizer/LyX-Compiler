@@ -23,7 +23,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ✅ |
 | WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ✅ |
 | WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ✅ |
-| WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ⬜ |
+| WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ✅ |
 | WP-STB-10 | `std/qt5_core.lyx` | 5 C++-Wrapper-Stubs (brauchen `libqtlyx.so`-Ergänzung) | M | ⬜ |
 | WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ⬜ |
 | WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | ⬜ |
@@ -343,7 +343,7 @@ Hashtabelle einpflegen, Frequenzen zählen, Seltenheiten mit `<UNK>` ersetzen.
 
 ---
 
-### WP-STB-09: `lfd_parser.lyx` — Vollständige Parser-Implementierung ⬜
+### WP-STB-09: `lfd_parser.lyx` — Vollständige Parser-Implementierung ✅
 
 **Branch:** `feat/std-stubs-09`
 **Datei:** `std/lfd_parser.lyx`
