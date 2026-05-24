@@ -14,7 +14,7 @@ Alle 115 `.lyx`-Dateien sind kompiliert (`.lyu` vorhanden). Die Fehler liegen im
 | FIX-03 | `std/ml.lyx` | Kritisch | ✅ Erledigt | #474 |
 | FIX-04 | `std/datetime.lyx` | Major | ✅ Erledigt | WP-STB-01 |
 | FIX-05 | `std/yaml.lyx` | Major | ✅ Erledigt | #475 |
-| FIX-06 | `std/net/quic.lyx` | Major | ⚠️ Teilweise | #462 (Length-Field); TLS/Write/Read offen |
+| FIX-06 | `std/net/quic.lyx` | Major | ✅ Erledigt | WP-STB-11 |
 | FIX-07 | `std/os.lyx` | Moderat | ✅ Erledigt | #473 |
 | FIX-08 | `std/fs.lyx` | Moderat | ✅ Erledigt | #472 |
 | FIX-09 | `std/process.lyx` | Minor | ✅ Erledigt | — |
@@ -88,20 +88,24 @@ Verbleibende Stubs (brauchen YAML-AST): `GetArray`, `GetObject`, `SetArray`, `Se
 
 ---
 
-### ⚠️ FIX-06 — `std/net/quic.lyx`: TLS-Handshake und Datentransfer sind Platzhalter
+### ✅ FIX-06 — `std/net/quic.lyx`: TLS-Handshake und Datentransfer implementiert
 
-**Teilweise erledigt in WP-STB-12** (Length-Field im QUIC-Paket korrekt back-filled).
+**Erledigt in WP-STB-11.**
 
-Noch offen:
+Vollständiger Crypto-Stack implementiert (kein libm, kein libc-Crypto, alle Funktionen ≤ 6 Argumente):
 
-| Funktion | Problem |
-|----------|---------|
-| `QUICConnect` | Kein echter TLS 1.3 Handshake |
-| `QUICWrite` | `return 0` — kein STREAM-Frame, keine Verschlüsselung |
-| `QUICRead` | `return 0` — kein UDP-Empfang, keine Entschlüsselung |
-| `QUICCloseStream` | Leerer Body — kein `RESET_STREAM` |
-
-**Hinweis:** Vollständige QUIC-Implementierung erfordert AEAD (AES-128-GCM / ChaCha20-Poly1305) und TLS 1.3. Erheblicher Aufwand.
+| Komponente | Implementierung |
+|------------|----------------|
+| SHA-256 | 64-Runden-Kompression, Big-Endian-Padding, 32-Bit-Maskierung |
+| HMAC-SHA256 | Inner/Outer-Hash per RFC 2104 |
+| HKDF | Extract + Expand-Label per RFC 5869 / TLS 1.3 |
+| AES-128 | Algorithmische S-Box aus GF(2⁸) exp/log-Tabellen; Key-Expand; Encrypt |
+| AES-128-GCM | CTR-Verschlüsselung + GHASH-Tag; GF(2¹²⁸)-Multiplikation bitweise |
+| QUIC Initial Keys | DCID → initial_secret → client_in → key/iv/hp (RFC 9001 §5.2) |
+| `QUICConnect` | Leitet Keys ab, sendet verschlüsseltes 1200-Byte Initial-Paket mit Header-Protection |
+| `QUICStreamWrite` | AEAD-Short-Header-Paket via UDP sendto |
+| `QUICStreamRead` | UDP-Empfang + CTR-Entschlüsselung + STREAM-Frame-Parse |
+| `QUICCloseStream` | Verschlüsselter RESET_STREAM-Frame |
 
 ---
 
