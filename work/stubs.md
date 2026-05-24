@@ -26,8 +26,10 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ✅ |
 | WP-STB-10 | `std/qt5_core.lyx` | 5 C++-Wrapper-Stubs (brauchen `libqtlyx.so`-Ergänzung) | M | ✅ |
 | WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ✅ |
-| WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | 🔄 |
-| WP-STB-13 | `std/svg/elements.lyx` | `_svgWinline` no-op Placeholder | XS | ⬜ |
+| WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | ✅ |
+| WP-STB-13 | `std/svg/elements.lyx` | `_svgWinline` no-op Placeholder | XS | 🔄 |
+| WP-STB-14 | `std/ini.lyx` | Set*/Delete*/GetSection* alle Stubs | M | ⬜ |
+| WP-STB-15 | `std/db/mysql.lyx` | `MySQLPoolCreate/Destroy` Stubs | S | ⬜ |
 
 Aufwand-Schätzung: XS < 1h · S = 1–2h · M = 3–6h · L = 1–2 Tage · XL = mehrere Tage
 
@@ -470,7 +472,7 @@ ergänzen, vor dem Move speichern, im Restore-Branch wiederherstellen.
 
 ---
 
-### WP-STB-12: `net/quic.lyx` — QUIC Payload-Länge bei Verschlüsselung 🔄
+### WP-STB-12: `net/quic.lyx` — QUIC Payload-Länge bei Verschlüsselung ✅
 
 **Branch:** `feat/std-stubs-12`
 **Datei:** `std/net/quic.lyx` (Zeile 320)
@@ -495,7 +497,7 @@ ob vorhanden).
 
 ---
 
-### WP-STB-13: `svg/elements.lyx` — `_svgWinline` no-op ⬜
+### WP-STB-13: `svg/elements.lyx` — `_svgWinline` no-op 🔄
 
 **Branch:** `feat/std-stubs-13`
 **Datei:** `std/svg/elements.lyx` (Zeile 459)
@@ -513,6 +515,87 @@ emittieren.
 
 ---
 
+---
+
+### WP-STB-14: `ini.lyx` — Set* / Delete* / GetSection* Funktionen ⬜
+
+**Branch:** `feat/std-stubs-14`
+**Datei:** `std/ini.lyx` (ab Zeile 382)
+
+**Problem:** 9 Funktionen sind leere Stubs mit `// Would ...`-Kommentaren:
+
+| Funktion | Stub-Kommentar |
+|---|---|
+| `SetString(doc, section, key, value)` | `// Would add/update in internal structure` |
+| `SetInt(doc, section, key, value)` | `// TODO: implement in-place text mutation` |
+| `SetBool(doc, section, key, value)` | `// Would set "true" or "false"` |
+| `SetFloat(doc, section, key, value)` | `// Would convert to string and set` |
+| `DeleteKey(doc, section, key)` | `// Would delete from internal structure` |
+| `DeleteSection(doc, section)` | `// Would delete section from internal structure` |
+| `GetSectionNames(doc, out)` | `// Would write section names to output` |
+| `GetSectionCount(doc)` | `// Would return count from internal structure` |
+| `GetKeyNames(doc, section, out)` | `// Would write key names to output` |
+
+**Implementierungshinweise:**
+Das ini-Dokument wird als Raw-Text-Buffer (mmap) gespeichert. `SetString` muss
+den Schlüssel im Buffer suchen (via `_iniFindKeyValue`) und entweder den Wert
+in-place ersetzen (wenn gleich lang) oder den Buffer neu aufbauen (wenn die
+Länge sich ändert). Einfachster Ansatz: Buffer-Rebuild — neuen mmap allozieren,
+Abschnitt für Abschnitt kopieren und den geänderten Wert einsetzen.
+
+`SetInt/SetBool/SetFloat`: Wert in pchar umwandeln (via IntToStr / "true"/"false" / float-Konvertierung) und dann `SetString` aufrufen.
+
+`DeleteKey` / `DeleteSection`: Buffer-Rebuild ohne die betreffende Zeile/Sektion.
+
+`GetSectionNames` / `GetKeyNames`: Linearer Scan durch den Buffer, Sektionsnamen (`[name]`) oder Schlüsselnamen in den `out`-Buffer schreiben.
+
+`GetSectionCount`: Linearer Scan, Anzahl `[`-Zeilen zählen.
+
+**Akzeptanzkriterien:**
+- `SetString(doc, "db", "host", "localhost")` → `GetString(doc, "db", "host")` == `"localhost"`
+- `SetInt(doc, "server", "port", 8080)` → `GetString(...)` == `"8080"`
+- `DeleteKey(doc, "db", "host")` → `HasKey(doc, "db", "host")` == false
+- `GetSectionCount(doc)` gibt korrekte Anzahl zurück
+
+---
+
+### WP-STB-15: `db/mysql.lyx` — Connection Pool ⬜
+
+**Branch:** `feat/std-stubs-15`
+**Datei:** `std/db/mysql.lyx` (ab Zeile 1786)
+
+**Problem:** `MySQLPoolCreate` gibt immer 0 zurück, `MySQLPoolDestroy` ist leer.
+
+**Implementierungshinweise:**
+Ein Connection Pool hält eine Liste vorverbundener MySQL-Handles.
+Minimale Implementierung:
+
+```
+// Pool-Layout im mmap-Block:
+//   [0..7]   maxConnections (int64)
+//   [8..15]  connCount (int64)
+//   [16..]   connHandle[0..max-1] (int64 each)
+MySQLPoolCreate(max):
+  buf := mmap(0, 16 + max * 8, ...)
+  poke64(buf, max)
+  poke64(buf + 8, 0)
+  return buf
+
+MySQLPoolDestroy(pool):
+  count := peek64(pool + 8)
+  i := 0; while i < count: MySQLClose(peek64(pool + 16 + i*8)); i++
+  munmap(pool, 16 + max * 8)
+```
+
+Zusätzlich `MySQLPoolAcquire(pool)` und `MySQLPoolRelease(pool, conn)` sinnvoll, falls noch nicht vorhanden.
+
+**Akzeptanzkriterien:**
+- `MySQLPoolCreate(5)` gibt gültigen Handle zurück (nicht 0)
+- `MySQLPoolDestroy(pool)` schließt alle Verbindungen und gibt Speicher frei
+- Kein `return 0` mehr als Stub
+
+---
+
 ## 3. Meilensteine
 
 | Meilenstein | WPs | Ergebnis |
@@ -523,6 +606,7 @@ emittieren.
 | M4: LFD-Parser | WP-STB-09 | lfd_parser vollständig |
 | M5: UI & Qt | WP-STB-10, WP-STB-11 | lyxvision TODOs + Qt5-Wrapper |
 | M6: Net & SVG | WP-STB-12, WP-STB-13 | QUIC-Länge + SVG inline |
+| M7: Mutating I/O & DB | WP-STB-14, WP-STB-15 | ini Set/Delete + MySQL Pool |
 
 ---
 
@@ -552,4 +636,6 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 | 2026-05-23 | WP-STB-06 ✅ — ini.lyx + yaml.lyx: doc-Handle als Raw-Text-Buffer (mmap). _iniFindSection/_iniFindKeyValue Scanner. LoadFile/SaveFile über open/read/write/close Builtins. GetString/HasSection/HasKey/GetSectionCount real implementiert. |
 | 2026-05-23 | WP-STB-07 ✅ — thread.lyx TLS: globale mmap-Tabelle (64 Slots × 32 Keys × 264 Bytes). _tlsInit/_tlsFindSlot. TLSKeyCreate/TLSSetValue/TLSGetValue via sys_gettid() + Slot-Lookup. |
 | 2026-05-24 | WP-STB-11 ✅ — lyxvision: TerminalWriteStr/WriteAnsi mit peek8, TerminalDraw mit FillRect, TWindow prevX/Y/W/H + WindowZoom Save/Restore, AppInsertWindow via GroupInsert, Tab-Focus in ProgramRun. Struct-Literal-Init auf var+Feldzuweisungen umgestellt. |
-| 2026-05-24 | WP-STB-12 🔄 — quic.lyx: Length-Feld in QUICBuildInitialPacket: 2-Byte-VarInt-Placeholder reserviert, nach Payload-Assembly rückwärts gefüllt (RFC 9000 §17.2). |
+| 2026-05-24 | WP-STB-12 ✅ — quic.lyx: Length-Feld in QUICBuildInitialPacket: 2-Byte-VarInt-Placeholder reserviert, nach Payload-Assembly rückwärts gefüllt (RFC 9000 §17.2). |
+| 2026-05-24 | WP-STB-13 🔄 — svg/elements.lyx: veraltetes _svgWinline-Relikt in SvgSetFillGradient entfernt. _svgWinline ist in xml.lyx vollständig implementiert; die Zeile war ein no-op aus einer früheren Halbimplementierung. |
+| 2026-05-24 | Stub-Audit erweitert: 2 neue WPs (STB-14, STB-15) aus zweitem Scan. LDAP-Placeholders als korrekt back-gefülltes Pattern identifiziert (kein Stub). |
