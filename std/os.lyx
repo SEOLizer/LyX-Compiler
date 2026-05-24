@@ -22,40 +22,52 @@ extern fn getppid(): int64;
 extern fn access(path: pchar, mode: int64): int64;
 extern fn raise(sig: int64): int64;
 extern fn time(tloc: int64): int64;
+extern fn nanosleep(req: int64, rem: int64): int64;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-con SC_CLK_TCK: int64 := 2;
-con SC_PAGESIZE: int64 := 47;
+con SC_CLK_TCK:          int64 := 2;
+con SC_PAGESIZE:         int64 := 47;
+con SC_NPROCESSORS_ONLN: int64 := 84;
 
 // ============================================================================
 // Sleep Functions
 // ============================================================================
 
 pub fn sleep(milliseconds: int64): void {
-  if (milliseconds <= 0) {
-    return;
-  }
-  var i: int64 := 0;
-  var spinCount: int64 := milliseconds * 10000;
-  while (i < spinCount) {
-    i := i + 1;
-  }
+  if (milliseconds <= 0) { return; }
+  var ts: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (ts == 0) { return; }
+  var secs: int64 := milliseconds / 1000;
+  var ns: int64 := (milliseconds - secs * 1000) * 1000000;
+  poke64(ts, secs);
+  poke64(ts + 8, ns);
+  nanosleep(ts, 0);
+  munmap(ts, 16);
 }
 
 pub fn sleep_seconds(seconds: int64): void {
-  sleep(seconds * 1000);
+  if (seconds <= 0) { return; }
+  var ts: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (ts == 0) { return; }
+  poke64(ts, seconds);
+  poke64(ts + 8, 0);
+  nanosleep(ts, 0);
+  munmap(ts, 16);
 }
 
 pub fn sleep_microseconds(microseconds: int64): void {
-  if (microseconds <= 0) {
-    return;
-  }
-  var us999: int64 := microseconds + 999;
-  var millis: int64 := us999 / 1000;
-  sleep(millis);
+  if (microseconds <= 0) { return; }
+  var ts: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (ts == 0) { return; }
+  var secs: int64 := microseconds / 1000000;
+  var ns: int64 := (microseconds - secs * 1000000) * 1000;
+  poke64(ts, secs);
+  poke64(ts + 8, ns);
+  nanosleep(ts, 0);
+  munmap(ts, 16);
 }
 
 // ============================================================================
@@ -116,7 +128,14 @@ pub fn env_has(key: pchar): bool {
 // ============================================================================
 
 pub fn get_cwd(): pchar {
-  return "";
+  var buf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  if (buf == 0) { return ""; }
+  var result: pchar := getcwd(buf as pchar, 4096);
+  if (result == 0) {
+    munmap(buf, 4096);
+    return "";
+  }
+  return result;
 }
 
 pub fn set_cwd(path: pchar): bool {
@@ -145,7 +164,7 @@ pub fn time_us(): int64 {
 // ============================================================================
 
 pub fn get_num_cores(): int64 {
-  var cores: int64 := sysconf(SC_CLK_TCK);
+  var cores: int64 := sysconf(SC_NPROCESSORS_ONLN);
   if (cores <= 0) {
     return 1;
   }
@@ -164,12 +183,65 @@ pub fn get_page_size(): int64 {
 // Memory Information
 // ============================================================================
 
+// Reads a numeric value (in kB) from /proc/meminfo for the given label.
+// label must include the trailing colon, e.g. "MemTotal:".
+fn _readMemInfoKB(label: pchar): int64 {
+  var buf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  if (buf == 0) { return 0; }
+  var f: int64 := open("/proc/meminfo", 0, 0);
+  if (f < 0) { munmap(buf, 4096); return 0; }
+  var n: int64 := read(f, buf as pchar, 4095);
+  close(f);
+  if (n <= 0) { munmap(buf, 4096); return 0; }
+  poke8(buf + n, 0);
+
+  var labelLen: int64 := StrLen(label);
+  var i: int64 := 0;
+  var pos: int64 := -1;
+  while (i + labelLen <= n && pos < 0) {
+    var j: int64 := 0;
+    var mismatch: bool := false;
+    while (j < labelLen && !mismatch) {
+      if (peek8(buf + i + j) != StrCharAt(label, j)) {
+        mismatch := true;
+      } else {
+        j := j + 1;
+      }
+    }
+    if (!mismatch) {
+      pos := i + labelLen;
+    } else {
+      i := i + 1;
+    }
+  }
+  if (pos < 0) { munmap(buf, 4096); return 0; }
+
+  while (pos < n && peek8(buf + pos) == 32) {
+    pos := pos + 1;
+  }
+
+  var val: int64 := 0;
+  var done: bool := false;
+  while (pos < n && !done) {
+    var ch: int64 := peek8(buf + pos);
+    if (ch < 48 || ch > 57) {
+      done := true;
+    } else {
+      val := val * 10 + ch - 48;
+      pos := pos + 1;
+    }
+  }
+
+  munmap(buf, 4096);
+  return val;
+}
+
 pub fn get_total_memory_mb(): int64 {
-  return 0;
+  return _readMemInfoKB("MemTotal:") / 1024;
 }
 
 pub fn get_available_memory_mb(): int64 {
-  return 0;
+  return _readMemInfoKB("MemAvailable:") / 1024;
 }
 
 // ============================================================================
