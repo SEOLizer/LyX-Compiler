@@ -28,7 +28,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ✅ |
 | WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | ✅ |
 | WP-STB-13 | `std/svg/elements.lyx` | `_svgWinline` no-op Placeholder | XS | 🔄 |
-| WP-STB-14 | `std/ini.lyx` | Set*/Delete*/GetSection* alle Stubs | M | ⬜ |
+| WP-STB-14 | `std/ini.lyx` | Set*/Delete*/GetSection* alle Stubs | M | 🔄 |
 | WP-STB-15 | `std/db/mysql.lyx` | `MySQLPoolCreate/Destroy` Stubs | S | ⬜ |
 
 Aufwand-Schätzung: XS < 1h · S = 1–2h · M = 3–6h · L = 1–2 Tage · XL = mehrere Tage
@@ -517,7 +517,7 @@ emittieren.
 
 ---
 
-### WP-STB-14: `ini.lyx` — Set* / Delete* / GetSection* Funktionen ⬜
+### WP-STB-14: `ini.lyx` — Set* / Delete* / GetSection* Funktionen 🔄
 
 **Branch:** `feat/std-stubs-14`
 **Datei:** `std/ini.lyx` (ab Zeile 382)
