@@ -25,8 +25,8 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ✅ |
 | WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ✅ |
 | WP-STB-10 | `std/qt5_core.lyx` | 5 C++-Wrapper-Stubs (brauchen `libqtlyx.so`-Ergänzung) | M | ✅ |
-| WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ⬜ |
-| WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | ⬜ |
+| WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ✅ |
+| WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | 🔄 |
 | WP-STB-13 | `std/svg/elements.lyx` | `_svgWinline` no-op Placeholder | XS | ⬜ |
 
 Aufwand-Schätzung: XS < 1h · S = 1–2h · M = 3–6h · L = 1–2 Tage · XL = mehrere Tage
@@ -426,7 +426,7 @@ einfachsten als opaker Pointer (int64 = Heap-Adresse) mit
 
 ---
 
-### WP-STB-11: `lyxvision/` — Offene UI-TODOs ⬜
+### WP-STB-11: `lyxvision/` — Offene UI-TODOs ✅
 
 **Branch:** `feat/std-stubs-11`
 **Dateien:**
@@ -470,7 +470,7 @@ ergänzen, vor dem Move speichern, im Restore-Branch wiederherstellen.
 
 ---
 
-### WP-STB-12: `net/quic.lyx` — QUIC Payload-Länge bei Verschlüsselung ⬜
+### WP-STB-12: `net/quic.lyx` — QUIC Payload-Länge bei Verschlüsselung 🔄
 
 **Branch:** `feat/std-stubs-12`
 **Datei:** `std/net/quic.lyx` (Zeile 320)
@@ -551,3 +551,5 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 | 2026-05-23 | WP-STB-01 ✅ — datetime.lyx vollständig. Zwei Bugs entdeckt: Off-by-one Jan/Feb (Hinnant-Algorithmus), negative Division in Lyx unsigned behandelt |
 | 2026-05-23 | WP-STB-06 ✅ — ini.lyx + yaml.lyx: doc-Handle als Raw-Text-Buffer (mmap). _iniFindSection/_iniFindKeyValue Scanner. LoadFile/SaveFile über open/read/write/close Builtins. GetString/HasSection/HasKey/GetSectionCount real implementiert. |
 | 2026-05-23 | WP-STB-07 ✅ — thread.lyx TLS: globale mmap-Tabelle (64 Slots × 32 Keys × 264 Bytes). _tlsInit/_tlsFindSlot. TLSKeyCreate/TLSSetValue/TLSGetValue via sys_gettid() + Slot-Lookup. |
+| 2026-05-24 | WP-STB-11 ✅ — lyxvision: TerminalWriteStr/WriteAnsi mit peek8, TerminalDraw mit FillRect, TWindow prevX/Y/W/H + WindowZoom Save/Restore, AppInsertWindow via GroupInsert, Tab-Focus in ProgramRun. Struct-Literal-Init auf var+Feldzuweisungen umgestellt. |
+| 2026-05-24 | WP-STB-12 🔄 — quic.lyx: Length-Feld in QUICBuildInitialPacket: 2-Byte-VarInt-Placeholder reserviert, nach Payload-Assembly rückwärts gefüllt (RFC 9000 §17.2). |
