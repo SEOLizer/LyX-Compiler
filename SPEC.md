@@ -642,6 +642,9 @@ Imports, die mit `std.` beginnen, sind speziell: Sie überspringen die lokale Au
 import std.math;
 import std.io;
 import std.string;
+
+// Mehrere Module in einer Zeile (kommagetrennt, gleichwertig)
+import std.math, std.io, std.string;
 ```
 
 ### Include-Pfade (`-I`)
