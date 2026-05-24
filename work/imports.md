@@ -66,7 +66,7 @@ beim nächsten `_sn(tail, next_decl)` überschrieben und n2/n3 gehen verloren.
 
 ## 3. Arbeitsschritte (Work Packages)
 
-### WP-1: `_parseImport()` — Komma-Schleife und Knoten-Kette
+### WP-1: `_parseImport()` — Komma-Schleife und Knoten-Kette ✅
 
 **Titel & Ziel:** Die Funktion `_parseImport()` so erweitern, dass nach jedem
 geparseten Modulpfad geprüft wird, ob ein Komma folgt. Falls ja, wird ein weiterer
@@ -140,7 +140,7 @@ fn _parseImport(): int64 {
 
 ---
 
-### WP-2: Parse-Schleife — Tail-Pointer nach Kette korrekt setzen
+### WP-2: Parse-Schleife — Tail-Pointer nach Kette korrekt setzen ✅
 
 **Titel & Ziel:** Nach einem `_parseImport()`-Aufruf muss der `tail`-Pointer der
 äußeren Schleife auf den **letzten Knoten** der zurückgegebenen Kette gesetzt werden,
@@ -180,7 +180,7 @@ einen Einzelknoten zurückgeben, terminiert die `while`-Schleife sofort in Itera
 
 ---
 
-### WP-3: Tests
+### WP-3: Tests 🔄
 
 **Titel & Ziel:** Neue Testfälle hinzufügen, die die korrekte Expansion und
 Fehlerbehandlung der neuen Syntax prüfen.
@@ -214,10 +214,10 @@ import a b;                      // Fehlendes Komma → Fehler (fällt auf `;` z
 
 ## Zusammenfassung der Änderungen
 
-| WP | Datei | Zeilen | Art der Änderung |
-|---|---|---|---|
-| WP-1 | `src/parser.lyx` | 1846–1863 | `_parseImport()` mit Komma-Schleife |
-| WP-2 | `src/parser.lyx` | 2322–2325 | Tail-Walk nach `_parseImport()` |
-| WP-3 | `tests/lyx/` | neu | Testdateien |
+| WP | Datei | Zeilen | Art der Änderung | Status |
+|---|---|---|---|---|
+| WP-1 | `src/parser.lyx` | 1846–1863 | `_parseImport()` mit Komma-Schleife | ✅ |
+| WP-2 | `src/parser.lyx` | 2322–2325 | Tail-Walk nach `_parseImport()` | ✅ |
+| WP-3 | `tests/lyx/`, `*.md` | neu | Testdateien + Doku-Update | 🔄 |
 
 Lexer, Sema, IR-Lowering und Codegen bleiben **unverändert**.

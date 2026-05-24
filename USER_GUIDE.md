@@ -221,9 +221,12 @@ fn main(): int64 {
 ### 3.1 Using Modules
 
 ```lyx
+// Einzelne Imports (klassisch)
 import std.math;
 import std.string;
-import std.os;
+
+// Oder mehrere Module in einer Zeile
+import std.math, std.string, std.os;
 
 fn main(): int64 {
   var abs_val: int64 := Abs64(-42);

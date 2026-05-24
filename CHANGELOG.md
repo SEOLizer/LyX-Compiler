@@ -1,5 +1,10 @@
 # Changelog - Lyx Compiler
 
+## Unreleased
+
+### Parser
+- **Multi-import syntax**: `import a, b, c;` expandiert direkt in drei `NK_IMPORT`-Knoten — kein neuer AST-Knoten, Sema/Lowering/Codegen unverändert. Beide Formen sind gültig.
+
 ## Version 0.7.0-aerospace (April 2026) 🎉
 
 ### 🚀 **DO-178C Compliance**
