@@ -2044,9 +2044,58 @@ long long _qt_font_dialog(long long parent, long long family, long long size) {
     Q_UNUSED(parent);
     Q_UNUSED(family);
     Q_UNUSED(size);
-    // Note: Full QFontDialog needs Qt5::Widgets  
+    // Note: Full QFontDialog needs Qt5::Widgets
     // Simple stub - returns 0
     return 0;
+}
+
+// ============================================================================
+// WP-STB-10: QCoreApplication + QString wrappers
+// ============================================================================
+
+// QCoreApplicationExists() — 1 if a QCoreApplication instance exists, else 0
+long long QCoreApplicationExists() {
+    return QCoreApplication::instance() != nullptr ? 1 : 0;
+}
+
+// QCoreApplicationQuit() — request the event loop to exit
+void QCoreApplicationQuit() {
+    if (QCoreApplication::instance()) {
+        QCoreApplication::quit();
+    }
+}
+
+// QCoreApplicationProcessEvents() — drain the Qt event queue once
+void QCoreApplicationProcessEvents() {
+    if (QCoreApplication::instance()) {
+        QCoreApplication::processEvents();
+    }
+}
+
+// QStringFromUtf8(ptr) — heap-allocate a QString from a UTF-8 C string.
+// Returns an opaque pointer (cast to int64 in Lyx).
+// Caller must free with QStringFree().
+long long QStringFromUtf8(long long ptr) {
+    if (ptr == 0) return 0;
+    const char* s = reinterpret_cast<const char*>(ptr);
+    return reinterpret_cast<long long>(new QString(QString::fromUtf8(s)));
+}
+
+// QStringToUtf8(qs) — convert opaque QString pointer to a heap-allocated
+// null-terminated UTF-8 C string.  Caller must free() the result.
+long long QStringToUtf8(long long qs) {
+    if (qs == 0) return 0;
+    QString* s = reinterpret_cast<QString*>(qs);
+    QByteArray ba = s->toUtf8();
+    char* buf = static_cast<char*>(malloc(ba.size() + 1));
+    if (!buf) return 0;
+    memcpy(buf, ba.constData(), ba.size() + 1);
+    return reinterpret_cast<long long>(buf);
+}
+
+// QStringFree(qs) — delete a QString allocated by QStringFromUtf8()
+void QStringFree(long long qs) {
+    if (qs != 0) delete reinterpret_cast<QString*>(qs);
 }
 
 } // extern "C"
