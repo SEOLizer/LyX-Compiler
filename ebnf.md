@@ -104,7 +104,7 @@ TopDecl      = ConDecl
              | UtypeDecl
              ;
 
-ImportDecl   = "import" DotPath ";" ;
+ImportDecl   = "import" DotPath { "," DotPath } ";" ;
 
 (* Konstanten *)
 ConDecl      = [ "pub" ] "con" Ident ":" Type ":=" ConstExpr ";" ;
