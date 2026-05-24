@@ -282,11 +282,30 @@ pub fn GetBool(doc: int64, section: pchar, key: pchar, default_val: bool): bool 
 
 // Get float value
 pub fn GetFloat(doc: int64, section: pchar, key: pchar, default_val: f64): f64 {
-    if (doc == 0 || section == 0 || key == 0) {
-        return default_val;
+    if (doc == 0 || section == 0 || key == 0) { return default_val; }
+    var val: pchar := GetString(doc, section, key, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var pos: int64 := 0;
+    var neg: int64 := 0;
+    if (StrCharAt(val, 0) == 45) { neg := 1; pos := 1; }
+    var ipart: f64 := 0.0;
+    while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+        ipart := ipart * 10.0 + ((StrCharAt(val, pos) - 48) as f64);
+        pos := pos + 1;
     }
-    // Would parse float
-    return default_val;
+    var fpart: f64 := 0.0;
+    if (StrCharAt(val, pos) == 46) {
+        pos := pos + 1;
+        var frac: f64 := 0.1;
+        while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+            fpart := fpart + ((StrCharAt(val, pos) - 48) as f64) * frac;
+            frac := frac * 0.1;
+            pos := pos + 1;
+        }
+    }
+    var result: f64 := ipart + fpart;
+    if (neg == 1) { result := 0.0 - result; }
+    return result;
 }
 
 // ============================================================================
@@ -375,54 +394,243 @@ pub fn WriteFile(doc: int64, path: pchar): bool {
 }
 
 // ============================================================================
+// Internal helpers for buffer rebuild
+// ============================================================================
+
+fn _iniCopyRange(dst: pchar, dpos: int64, src: pchar, start: int64, end: int64): int64 {
+    var i: int64 := start;
+    while (i < end) {
+        StrSetChar(dst, dpos, StrCharAt(src, i));
+        dpos := dpos + 1;
+        i := i + 1;
+    }
+    return dpos;
+}
+
+fn _iniWriteStr(dst: pchar, dpos: int64, src: pchar): int64 {
+    var i: int64 := 0;
+    while (StrCharAt(src, i) != 0) {
+        StrSetChar(dst, dpos, StrCharAt(src, i));
+        dpos := dpos + 1;
+        i := i + 1;
+    }
+    return dpos;
+}
+
+// Returns position of start of the line containing pos.
+fn _iniLineStart(content: pchar, pos: int64): int64 {
+    while (pos > 0 && StrCharAt(content, pos - 1) != 10 && StrCharAt(content, pos - 1) != 13) {
+        pos := pos - 1;
+    }
+    return pos;
+}
+
+// Returns position right after the end of the line that begins at pos.
+fn _iniLineAfter(content: pchar, clen: int64, pos: int64): int64 {
+    while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13 && StrCharAt(content, pos) != 0) {
+        pos := pos + 1;
+    }
+    while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Returns start of next section header (a '[' line) after spos, or clen.
+fn _iniSectionEnd(content: pchar, clen: int64, spos: int64): int64 {
+    var pos: int64 := spos;
+    while (pos < clen) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) { return pos; }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return clen;
+}
+
+// Internal: copy result from tmp back into doc buffer and free tmp.
+fn _iniCommit(doc: int64, tmp: pchar, out: int64) {
+    var content: pchar := doc as pchar;
+    var i: int64 := 0;
+    while (i <= out) {
+        StrSetChar(content, i, StrCharAt(tmp, i));
+        i := i + 1;
+    }
+    munmap(tmp, INI_BUFFER_SIZE);
+}
+
+// ============================================================================
 // Modification - Full Implementation
 // ============================================================================
 
-// Set string value
 pub fn SetString(doc: int64, section: pchar, key: pchar, value: pchar): void {
-    if (doc == 0 || section == 0 || key == 0 || value == 0) {
-        return;
+    if (doc == 0 || section == 0 || key == 0 || value == 0) { return; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return; }
+    var out: int64 := 0;
+
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) {
+        // Section not found: append [section]\nkey=value\n
+        out := _iniCopyRange(tmp, out, content, 0, clen);
+        if (clen > 0 && StrCharAt(content, clen - 1) != 10) {
+            StrSetChar(tmp, out, 10); out := out + 1;
+        }
+        StrSetChar(tmp, out, 91); out := out + 1;
+        out := _iniWriteStr(tmp, out, section);
+        StrSetChar(tmp, out, 93); out := out + 1;
+        StrSetChar(tmp, out, 10); out := out + 1;
+        out := _iniWriteStr(tmp, out, key);
+        StrSetChar(tmp, out, 61); out := out + 1;
+        out := _iniWriteStr(tmp, out, value);
+        StrSetChar(tmp, out, 10); out := out + 1;
+    } else {
+        var vstart: int64 := _iniFindKeyValue(content, clen, spos, key, klen);
+        if (vstart >= 0) {
+            // Key found: replace the entire line
+            var lineStart: int64 := _iniLineStart(content, vstart);
+            var lineAfter: int64 := _iniLineAfter(content, clen, vstart);
+            out := _iniCopyRange(tmp, out, content, 0, lineStart);
+            out := _iniWriteStr(tmp, out, key);
+            StrSetChar(tmp, out, 61); out := out + 1;
+            out := _iniWriteStr(tmp, out, value);
+            StrSetChar(tmp, out, 10); out := out + 1;
+            out := _iniCopyRange(tmp, out, content, lineAfter, clen);
+        } else {
+            // Key not found: insert before end of section
+            var sectEnd: int64 := _iniSectionEnd(content, clen, spos);
+            out := _iniCopyRange(tmp, out, content, 0, sectEnd);
+            out := _iniWriteStr(tmp, out, key);
+            StrSetChar(tmp, out, 61); out := out + 1;
+            out := _iniWriteStr(tmp, out, value);
+            StrSetChar(tmp, out, 10); out := out + 1;
+            out := _iniCopyRange(tmp, out, content, sectEnd, clen);
+        }
     }
-    // Would add/update in internal structure
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
 }
 
-// Set integer value
 pub fn SetInt(doc: int64, section: pchar, key: pchar, value: int64): void {
     if (doc == 0 || section == 0 || key == 0) { return; }
-    // TODO: implement in-place text mutation
+    SetString(doc, section, key, IntToStr(value));
 }
 
-// Set boolean value
 pub fn SetBool(doc: int64, section: pchar, key: pchar, value: bool): void {
-    if (doc == 0 || section == 0 || key == 0) {
-        return;
-    }
-    // Would set "true" or "false"
+    if (doc == 0 || section == 0 || key == 0) { return; }
+    if (value) { SetString(doc, section, key, "true"); }
+    else        { SetString(doc, section, key, "false"); }
 }
 
-// Set float value
 pub fn SetFloat(doc: int64, section: pchar, key: pchar, value: f64): void {
-    if (doc == 0 || section == 0 || key == 0) {
-        return;
+    if (doc == 0 || section == 0 || key == 0) { return; }
+    var buf: pchar := mmap(0, 64, 3, 34, -1, 0);
+    if (buf == 0) { return; }
+    var pos: int64 := 0;
+    var v: f64 := value;
+    if (v < 0.0) { StrSetChar(buf, pos, 45); pos := pos + 1; v := 0.0 - v; }
+    var ipart: int64 := v as int64;
+    pos := _iniWriteStr(buf, pos, IntToStr(ipart));
+    StrSetChar(buf, pos, 46); pos := pos + 1;
+    var fpart: f64 := v - (ipart as f64);
+    var d: int64 := 0;
+    while (d < 6) {
+        fpart := fpart * 10.0;
+        var digit: int64 := fpart as int64;
+        StrSetChar(buf, pos, digit + 48); pos := pos + 1;
+        fpart := fpart - (digit as f64);
+        d := d + 1;
     }
-    // Would convert to string and set
+    StrSetChar(buf, pos, 0);
+    SetString(doc, section, key, buf);
+    munmap(buf, 64);
 }
 
-// Delete key from section
 pub fn DeleteKey(doc: int64, section: pchar, key: pchar): bool {
-    if (doc == 0 || section == 0 || key == 0) {
-        return false;
-    }
-    // Would delete from internal structure
+    if (doc == 0 || section == 0 || key == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return false; }
+    var vstart: int64 := _iniFindKeyValue(content, clen, spos, key, klen);
+    if (vstart < 0) { return false; }
+
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return false; }
+
+    var lineStart: int64 := _iniLineStart(content, vstart);
+    var lineAfter: int64 := _iniLineAfter(content, clen, vstart);
+    var out: int64 := 0;
+    out := _iniCopyRange(tmp, out, content, 0, lineStart);
+    out := _iniCopyRange(tmp, out, content, lineAfter, clen);
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
     return true;
 }
 
-// Delete entire section
 pub fn DeleteSection(doc: int64, section: pchar): bool {
-    if (doc == 0 || section == 0) {
-        return false;
+    if (doc == 0 || section == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+
+    // Find the start of the [section] header line
+    var pos: int64 := 0;
+    var sectLineStart: int64 := -1;
+    while (pos < clen) {
+        var lineStart: int64 := pos;
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) {
+            var p2: int64 := lp + 1;
+            while (p2 < clen && (StrCharAt(content, p2) == 32 || StrCharAt(content, p2) == 9)) {
+                p2 := p2 + 1;
+            }
+            var si: int64 := 0;
+            while (si < slen && p2 + si < clen && StrCharAt(content, p2 + si) == StrCharAt(section, si)) {
+                si := si + 1;
+            }
+            if (si == slen) {
+                var after: int64 := p2 + si;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 93) {
+                    sectLineStart := lineStart;
+                    pos := _iniLineAfter(content, clen, lp);
+                    break;
+                }
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
     }
-    // Would delete section from internal structure
+    if (sectLineStart < 0) { return false; }
+
+    var sectBodyEnd: int64 := _iniSectionEnd(content, clen, pos);
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return false; }
+    var out: int64 := 0;
+    out := _iniCopyRange(tmp, out, content, 0, sectLineStart);
+    out := _iniCopyRange(tmp, out, content, sectBodyEnd, clen);
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
     return true;
 }
 
@@ -497,25 +705,116 @@ pub fn GetSectionCount(doc: int64): int64 {
     return count;
 }
 
-// Get list of all section names
+// Get list of all section names — each name is null-terminated in output.
+// Returns number of sections written.
 pub fn GetSections(doc: int64, output: pchar, max_count: int64): int64 {
     if (doc == 0 || output == 0 || max_count <= 0) { return 0; }
-    // Would write section names to output
-    return 0;
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var count: int64 := 0;
+    var pos: int64 := 0;
+    var outPos: int64 := 0;
+    while (pos < clen && count < max_count) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) {
+            lp := lp + 1;
+            while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+                lp := lp + 1;
+            }
+            while (lp < clen && StrCharAt(content, lp) != 93 && StrCharAt(content, lp) != 10 && StrCharAt(content, lp) != 13 && StrCharAt(content, lp) != 0) {
+                StrSetChar(output, outPos, StrCharAt(content, lp));
+                outPos := outPos + 1;
+                lp := lp + 1;
+            }
+            StrSetChar(output, outPos, 0);
+            outPos := outPos + 1;
+            count := count + 1;
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
 }
 
-// Get number of keys in section
+// Get number of key=value entries in section.
 pub fn GetKeyCount(doc: int64, section: pchar): int64 {
     if (doc == 0 || section == 0) { return 0; }
-    // Would return count from internal structure
-    return 0;
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return 0; }
+    var count: int64 := 0;
+    var pos: int64 := spos;
+    while (pos < clen) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp >= clen) { break; }
+        var c: int64 := StrCharAt(content, lp);
+        if (c == 91) { break; }
+        if (c != 35 && c != 59 && c != 10 && c != 13 && c != 0) {
+            var ep: int64 := lp;
+            while (ep < clen && StrCharAt(content, ep) != 10 && StrCharAt(content, ep) != 13 && StrCharAt(content, ep) != 0) {
+                if (StrCharAt(content, ep) == 61) { count := count + 1; break; }
+                ep := ep + 1;
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
 }
 
-// Get list of keys in section
+// Get key names in section — each name is null-terminated in output.
+// Returns number of keys written.
 pub fn GetKeys(doc: int64, section: pchar, output: pchar, max_count: int64): int64 {
     if (doc == 0 || section == 0 || output == 0 || max_count <= 0) { return 0; }
-    // Would write key names to output
-    return 0;
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return 0; }
+    var count: int64 := 0;
+    var pos: int64 := spos;
+    var outPos: int64 := 0;
+    while (pos < clen && count < max_count) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp >= clen) { break; }
+        var c: int64 := StrCharAt(content, lp);
+        if (c == 91) { break; }
+        if (c != 35 && c != 59 && c != 10 && c != 13 && c != 0) {
+            var keyStart: int64 := lp;
+            var ep: int64 := lp;
+            var found: int64 := 0;
+            while (ep < clen && StrCharAt(content, ep) != 10 && StrCharAt(content, ep) != 13 && StrCharAt(content, ep) != 0) {
+                if (StrCharAt(content, ep) == 61) { found := 1; break; }
+                ep := ep + 1;
+            }
+            if (found == 1) {
+                var keyEnd: int64 := ep;
+                while (keyEnd > keyStart && (StrCharAt(content, keyEnd - 1) == 32 || StrCharAt(content, keyEnd - 1) == 9)) {
+                    keyEnd := keyEnd - 1;
+                }
+                var ki: int64 := keyStart;
+                while (ki < keyEnd) {
+                    StrSetChar(output, outPos, StrCharAt(content, ki));
+                    outPos := outPos + 1;
+                    ki := ki + 1;
+                }
+                StrSetChar(output, outPos, 0);
+                outPos := outPos + 1;
+                count := count + 1;
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
 }
 
 // ============================================================================
