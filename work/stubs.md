@@ -29,7 +29,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-12 | `std/net/quic.lyx` | QUIC Verschlüsselungs-Längenfeld Placeholder | S | ✅ |
 | WP-STB-13 | `std/svg/elements.lyx` | `_svgWinline` no-op Placeholder | XS | 🔄 |
 | WP-STB-14 | `std/ini.lyx` | Set*/Delete*/GetSection* alle Stubs | M | ✅ |
-| WP-STB-15 | `std/db/mysql.lyx` | `MySQLPoolCreate/Destroy` Stubs | S | 🔄 |
+| WP-STB-15 | `std/db/mysql.lyx` | `MySQLPoolCreate/Destroy` Stubs | S | ✅ |
 
 Aufwand-Schätzung: XS < 1h · S = 1–2h · M = 3–6h · L = 1–2 Tage · XL = mehrere Tage
 
@@ -559,7 +559,7 @@ Abschnitt für Abschnitt kopieren und den geänderten Wert einsetzen.
 
 ---
 
-### WP-STB-15: `db/mysql.lyx` — Connection Pool 🔄
+### WP-STB-15: `db/mysql.lyx` — Connection Pool ✅
 
 **Branch:** `feat/std-stubs-15`
 **Datei:** `std/db/mysql.lyx` (ab Zeile 1786)
@@ -640,4 +640,4 @@ können zusammengehen, da beide `hash.lyx` betreffen).
 | 2026-05-24 | WP-STB-13 🔄 — svg/elements.lyx: veraltetes _svgWinline-Relikt in SvgSetFillGradient entfernt. _svgWinline ist in xml.lyx vollständig implementiert; die Zeile war ein no-op aus einer früheren Halbimplementierung. |
 | 2026-05-24 | Stub-Audit erweitert: 2 neue WPs (STB-14, STB-15) aus zweitem Scan. LDAP-Placeholders als korrekt back-gefülltes Pattern identifiziert (kein Stub). |
 | 2026-05-24 | WP-STB-14 ✅ — ini.lyx: SetString/Int/Bool/Float, GetFloat, DeleteKey, DeleteSection, GetSections, GetKeyCount, GetKeys vollständig via Buffer-Rebuild-Pattern implementiert. |
-| 2026-05-24 | WP-STB-15 🔄 — mysql.lyx: MySQLPoolCreate/Destroy implementiert. Pool-Layout: mmap-Block mit max/count + connSlot[]-Array. Destroy schließt offene Verbindungen (fd + interne mmap-Member). |
+| 2026-05-24 | WP-STB-15 ✅ — mysql.lyx: MySQLPoolCreate/Destroy implementiert. Pool-Layout: mmap-Block mit max/count + connSlot[]-Array. Destroy schließt offene Verbindungen (fd + interne mmap-Member). |
