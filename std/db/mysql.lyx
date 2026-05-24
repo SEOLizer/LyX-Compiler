@@ -1780,14 +1780,53 @@ pub fn MySQLStmtReset(stmt: MySQLStmt): void {
 }
 
 // ============================================================================
-// Connection Pool (Stub)
+// Connection Pool
+//
+// Pool layout in mmap buffer:
+//   [0..7]       maxConnections (int64)
+//   [8..15]      connCount — occupied slots (int64)
+//   [16+i*8]     connSlot[i] — pointer to mmap'd MySQLConn block, 0 = free
+//
+// Use MySQLPoolAcquire / MySQLPoolRelease (future) to borrow connections.
 // ============================================================================
 
 pub fn MySQLPoolCreate(maxConnections: int64): int64 {
-    return 0;
+    if (maxConnections <= 0) { return 0; }
+    var poolSize: int64 := 16 + maxConnections * 8;
+    var pool: int64 := mmap(0, poolSize, 3, 34, -1, 0);
+    if (pool == 0) { return 0; }
+    poke64(pool, maxConnections);
+    poke64(pool + 8, 0);
+    var i: int64 := 0;
+    while (i < maxConnections) {
+        poke64(pool + 16 + i * 8, 0);
+        i := i + 1;
+    }
+    return pool;
 }
 
 pub fn MySQLPoolDestroy(poolHandle: int64): void {
+    if (poolHandle == 0) { return; }
+    var maxConn: int64 := peek64(poolHandle);
+    var i: int64 := 0;
+    while (i < maxConn) {
+        var slot: int64 := peek64(poolHandle + 16 + i * 8);
+        if (slot != 0) {
+            // Close socket (fd is first field of MySQLConn, offset 0)
+            var fd: int64 := peek64(slot);
+            if (fd >= 0) { sys_close(fd); }
+            // Free internal mmap'd members (mirrors freeMySQLConn)
+            var serverVer: int64 := peek64(slot + 64);
+            if (serverVer != 0) { munmap(serverVer, 64); }
+            var serverScramble: int64 := peek64(slot + 96);
+            if (serverScramble != 0) { munmap(serverScramble, 20); }
+            var lastError: int64 := peek64(slot + 104);
+            if (lastError != 0) { munmap(lastError, 256); }
+            munmap(slot, 152);  // 19 fields × 8 bytes
+        }
+        i := i + 1;
+    }
+    munmap(poolHandle, 16 + maxConn * 8);
 }
 
 // ============================================================================
