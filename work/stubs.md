@@ -22,7 +22,7 @@ Dieses Dokument listet alle als Stub oder TODO markierten Stellen in den
 | WP-STB-05 | `std/net/socket.lyx` | `getPeerCredentials()` gibt immer `-1` zurück | S | ✅ |
 | WP-STB-06 | `std/ini.lyx`, `std/yaml.lyx` | `LoadFile`/`SaveFile` (blockiert auf Syscalls) | S | ✅ |
 | WP-STB-07 | `std/thread.lyx` | TLS: `TLSKeyCreate`, `TLSSet/GetValue` | M | ✅ |
-| WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ⬜ |
+| WP-STB-08 | `std/fasttext.lyx` | `SaveModel`/`LoadModel` + Vocab-Initialisierung | M | ✅ |
 | WP-STB-09 | `std/lfd_parser.lyx` | Gesamte Datei ist Stub — Parser komplett fehlt | XL | ⬜ |
 | WP-STB-10 | `std/qt5_core.lyx` | 5 C++-Wrapper-Stubs (brauchen `libqtlyx.so`-Ergänzung) | M | ⬜ |
 | WP-STB-11 | `std/lyxvision/*.lyx` | 5 UI-TODOs (Event-Routing, StrLen, Buffer-Render, …) | M | ⬜ |
@@ -307,7 +307,7 @@ Empfehlung: Option A für Einstieg, in Kommentar auf Option B hinweisen.
 
 ---
 
-### WP-STB-08: `fasttext.lyx` — SaveModel / LoadModel + Vocab ⬜
+### WP-STB-08: `fasttext.lyx` — SaveModel / LoadModel + Vocab ✅
 
 **Branch:** `feat/std-stubs-08`
 **Datei:** `std/fasttext.lyx` (Zeilen 46, 342, 348)
