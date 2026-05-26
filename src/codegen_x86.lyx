@@ -86,6 +86,7 @@ con CGN_UTYPE_DECL:     int64 := 91; // WP-BC-16: utype declaration (compile-tim
 con CGN_TYPE_RINGBUF:   int64 := 92; // WP-BC-17: RingBuffer<T> type node
 con CGN_TYPE_PARALLEL:  int64 := 93; // WP-BC-18: parallel Array<T> type node
 con CGN_SIMD_NEW:       int64 := 94; // WP-BC-18: parallel Array<T>(size) expression
+con CGN_FOR_C:          int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
 con CGN_REPEAT_UNTIL:    int64 := 77; // WP-BC-04: repeat { body } until (cond)
 con CGN_TUPLE_VAR_DECL:  int64 := 78; // WP-BC-05: var a, b := fn()
 con CGN_MAP_LIT:         int64 := 79; // WP-BC-06: { key: val, ... }
@@ -4440,6 +4441,9 @@ pub type Codegen = class {
     } else if (k == CGN_FOR) {
       self.cg_genFor(ni);
 
+    } else if (k == CGN_FOR_C) {
+      self.cg_genForC(ni);
+
     } else if (k == CGN_SWITCH) {
       self.cg_genSwitch(ni);
 
@@ -5037,6 +5041,82 @@ pub type Codegen = class {
       bh := nextLink;
     }
     // Restore break/continue lists
+    self.curBreakHead := savedBreakHead;
+    self.curContHead := savedContHead;
+  }
+
+  // ------------------------------------------------------------------
+  // C-style for loop code generation
+  // NK_FOR_C: c0=NK_VAR_DECL(init), c1=cond, c2=step, c3=body
+  // ------------------------------------------------------------------
+  fn cg_genForC(ni: int64) {
+    // Init: declare and initialize the loop variable
+    var initNi: int64 := self.cg_nc0(ni);
+    if (initNi >= 0) {
+      var name: pchar := self.cg_nsval(initNi);
+      var nlen: int64 := self.cg_nslen(initNi);
+      var off: int64 := self.cg_addLocal(name, nlen);
+      var initExpr: int64 := self.cg_nc1(initNi);
+      if (initExpr >= 0) {
+        self.cg_genExpr(initExpr);
+        self.cg_storeRax(off);
+      }
+    }
+    var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead: int64 := self.curContHead;
+    self.curBreakHead := -1;
+    self.curContHead := -1;
+    // loopTop: condition check
+    var loopTop: int64 := self.codeLen;
+    // Condition (c1): if absent loop is infinite
+    var condNi: int64 := self.cg_nc1(ni);
+    var jmpExit: int64 := -1;
+    if (condNi >= 0) {
+      self.cg_genExpr(condNi);
+      // test rax, rax; jz exit
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
+      jmpExit := self.codeLen;
+      self.cg_e32(0);
+    }
+    // Body (c3)
+    var bodyNi: int64 := self.cg_nc3(ni);
+    if (bodyNi >= 0) { self.cg_genBlock(bodyNi); }
+    // contPos: continue lands here (step runs before next condition check)
+    var contPos: int64 := self.codeLen;
+    var ch: int64 := self.curContHead;
+    while (ch != -1) {
+      var b0: int64 := peek8(self.code + ch) as int64;
+      var b1: int64 := peek8(self.code + ch + 1) as int64;
+      var b2: int64 := peek8(self.code + ch + 2) as int64;
+      var b3: int64 := peek8(self.code + ch + 3) as int64;
+      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + ch, contPos - ch - 4);
+      ch := nextLink;
+    }
+    // Step (c2)
+    var stepNi: int64 := self.cg_nc2(ni);
+    if (stepNi >= 0) { self.cg_genStmt(stepNi); }
+    // jmp back to loopTop
+    self.cg_e8(0xE9);
+    self.cg_e32(loopTop - self.codeLen - 4);
+    // Patch condition exit jump
+    if (jmpExit >= 0) {
+      poke32(self.code + jmpExit, self.codeLen - jmpExit - 4);
+    }
+    // Patch all break jumps to here
+    var bh: int64 := self.curBreakHead;
+    while (bh != -1) {
+      var bb0: int64 := peek8(self.code + bh) as int64;
+      var bb1: int64 := peek8(self.code + bh + 1) as int64;
+      var bb2: int64 := peek8(self.code + bh + 2) as int64;
+      var bb3: int64 := peek8(self.code + bh + 3) as int64;
+      var nextLink: int64 := bb0 + bb1 * 256 + bb2 * 65536 + bb3 * 16777216;
+      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
+      poke32(self.code + bh, self.codeLen - bh - 4);
+      bh := nextLink;
+    }
     self.curBreakHead := savedBreakHead;
     self.curContHead := savedContHead;
   }
