@@ -129,6 +129,7 @@ pub con NK_UTYPE_DECL:      int64 := 91;  // WP-BC-16: utype unit-type declarati
 pub con NK_TYPE_RINGBUF:    int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 pub con NK_TYPE_PARALLEL:   int64 := 93;  // WP-BC-18: parallel Array<T> type node
 pub con NK_SIMD_NEW:        int64 := 94;  // WP-BC-18: parallel Array<T>(size) expression
+pub con NK_FOR_C:           int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
 
 // ============================================================================
 // IRLower Class
@@ -1146,8 +1147,11 @@ pub type IRLower = class {
     else if (k == NK_TUPLE_VAR_DECL) {
       self.lowerTupleVarDecl(stmt);
     }
-    else if (k == NK_FOR) { 
-      self.lowerFor(stmt); 
+    else if (k == NK_FOR) {
+      self.lowerRangeFor(stmt);
+    }
+    else if (k == NK_FOR_C) {
+      self.lowerFor(stmt);
     }
     else if (k == NK_RETURN) { 
       self.lowerReturn(stmt); 
@@ -1371,8 +1375,89 @@ pub type IRLower = class {
   // For Statement Lowering
   // ------------------------------------------------------------------
 
+  fn lowerRangeFor(stmt: int64) {
+    // for VAR := start to/downto end [do] { body }
+    // sOff/sLen = var name, c0 = start expr, c1 = end expr, c2 = body, iVal = dir (0=to,1=downto)
+    var varSlot: int64 := self.allocTemp();
+
+    // Register var name → slot in localNameBuf
+    if self.localNameCnt >= self.localNameCap {
+      var rfNewCap: int64 := self.localNameCap * 2;
+      var rfNb: int64 := mmap(0, rfNewCap * 24, 3, 34, -1, 0);
+      var rfI: int64 := 0;
+      while rfI < self.localNameCnt * 24 {
+        poke8(rfNb + rfI, peek8(self.localNameBuf + rfI));
+        rfI := rfI + 1;
+      }
+      self.localNameBuf := rfNb;
+      self.localNameCap := rfNewCap;
+    }
+    var rfRec: int64 := self.localNameBuf + self.localNameCnt * 24;
+    poke64(rfRec +  0, peek64(self.nodeOff(stmt) + 64));
+    poke64(rfRec +  8, self.nodeSLen(stmt));
+    poke64(rfRec + 16, varSlot);
+    self.localNameCnt := self.localNameCnt + 1;
+
+    // Init: varSlot = start
+    var startTemp: int64 := self.lowerExpr(self.nodeC0(stmt));
+    self.irAddInstrDirect(IRO_STORE_LOCAL, varSlot, startTemp, -1, 0);
+
+    var loopLbl: int64 := self.genLabel();
+    var contLbl: int64 := self.genLabel();
+    var exitLbl: int64 := self.genLabel();
+
+    var savedExit: int64 := self.loopExitLabel;
+    var savedCont: int64 := self.loopContLabel;
+    self.loopExitLabel := exitLbl;
+    self.loopContLabel := contLbl;
+
+    // loopLbl:
+    self.irEmitLabel(loopLbl);
+
+    // Condition: load var, load limit, compare
+    var varTemp: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, varTemp, varSlot, -1, 0);
+    var limitTemp: int64 := self.lowerExpr(self.nodeC1(stmt));
+    var condTemp: int64 := self.allocTemp();
+    var dir: int64 := self.nodeIVal(stmt);
+    if (dir == 0) {
+      self.irAddInstrDirect(IRO_CMP_LE, condTemp, varTemp, limitTemp, 0);
+    } else {
+      self.irAddInstrDirect(IRO_CMP_GE, condTemp, varTemp, limitTemp, 0);
+    }
+    self.irEmitBrFalse(condTemp, exitLbl);
+
+    // Body
+    if (self.nodeC2(stmt) >= 0) { self.lowerBlock(self.nodeC2(stmt)); }
+
+    // contLbl:
+    self.irEmitLabel(contLbl);
+
+    // Step: var := var +/- 1
+    var curTemp: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, curTemp, varSlot, -1, 0);
+    var oneTemp: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, oneTemp, -1, -1, 1);
+    var nextTemp: int64 := self.allocTemp();
+    if (dir == 0) {
+      self.irAddInstrDirect(IRO_ADD, nextTemp, curTemp, oneTemp, 0);
+    } else {
+      self.irAddInstrDirect(IRO_SUB, nextTemp, curTemp, oneTemp, 0);
+    }
+    self.irAddInstrDirect(IRO_STORE_LOCAL, varSlot, nextTemp, -1, 0);
+
+    // goto loopLbl
+    self.irEmitJmp(loopLbl);
+
+    // exitLbl:
+    self.irEmitLabel(exitLbl);
+
+    self.loopExitLabel := savedExit;
+    self.loopContLabel := savedCont;
+  }
+
   fn lowerFor(stmt: int64) {
-    // For loop structure:
+    // C-style for loop:
     // C0: init (assign or var decl)
     // C1: condition
     // C2: step
