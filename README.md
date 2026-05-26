@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.6B
+Lyx Compiler v0.8.6C
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -1165,6 +1165,7 @@ Optionen:
   --ir-source-map IR Source Mapping: Zeilennummern in IR-Dump (WP-D)
   --type-reasoning Type-Checker Reasoning: detailliertes Typ-Logging (WP-E)
   --constraint-log Constraint-Log ausgeben: Typ-Constraints (WP-G)
+  --quiet          Versions- und Copyright-Banner unterdrücken
   -g               DWARF Debug Info für gdb/lldb/VS Code
 
 TOR-Optionen (DO-178C Tool Qualification):

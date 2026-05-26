@@ -1,4 +1,4 @@
-# Lyx v0.8.6B – Sprachspezifikation
+# Lyx v0.8.6C – Sprachspezifikation
 
 Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
 
@@ -69,7 +69,7 @@ Alle Integer-Literale werden intern als `int64` behandelt.
 * Zuweisung: `:=`
 * Arithmetik: `+ - * / %`
 * Inkrement/Dekrement (Statement): `++` `--`
-* **String-Verkettung**: `+` (bei `pchar + pchar`)
+* **String-Verkettung**: `+` (bei `pchar + pchar` → neuer `pchar`, beliebig kettenbar)
 * Vergleich: `== != < <= > >=`
   * `bool == bool` erlaubt (z. B. `x == true`, `x == false`)
   * `bool == <anderer Typ>` → Compile-Fehler
@@ -83,6 +83,40 @@ Alle Integer-Literale werden intern als `int64` behandelt.
 * Ellipsis: `...` (Variadic)
 * Namespace: `::` (Enum-Zugriff: `Color::Red`)
 * Sonstiges: `(` `)` `{` `}` `[` `]` `:` `,` `;` `.` `@`
+
+### String-Verkettung mit `+`
+
+Der `+`-Operator wird automatisch als String-Verkettung interpretiert, sobald mindestens ein Operand vom Typ `pchar` ist. Das Ergebnis ist ein neu allokierter `pchar`.
+
+```ebnf
+StrConcatExpr = PcharExpr "+" PcharExpr { "+" PcharExpr } ;
+
+PcharExpr = StringLiteral          (* "..."c *)
+          | Ident                   (* Variable vom Typ pchar *)
+          | IntToStr "(" Expr ")"
+          | StrFromInt "(" Expr ")"
+          | StrConcat "(" Expr "," Expr ")"
+          | StrSub "(" Expr "," Expr "," Expr ")"
+          | FloatToStr "(" Expr ")"
+          | ArgvGetStr "(" Expr "," Expr ")"
+          | StrConcatExpr
+          ;
+```
+
+**Chaining** ist beliebig tief möglich, da `pchar + pchar → pchar` links-assoziativ ausgewertet wird:
+
+```lyx
+// Zwei Teile
+PrintStr("Hello, " + name);
+
+// Drei Teile
+PrintStr("x=" + IntToStr(x) + "\n"c);
+
+// Vier und mehr Teile
+PrintStr("a=" + IntToStr(a) + " b=" + IntToStr(b) + " c=" + IntToStr(c) + "\n"c);
+```
+
+**Hinweis:** Liegt *kein* Operand von `+` im Typ `pchar` vor, wird `+` als arithmetische Addition behandelt.
 
 ---
 
