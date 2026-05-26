@@ -566,6 +566,78 @@ pub type Codegen = class {
     return peek8(self.localIsArray + idx);
   }
 
+  // Returns 1 if expression node ni produces a pchar value.
+  // Covers: string literals, pchar-typed locals, known string-returning builtins,
+  // and + binops where either operand is pchar (enabling chaining).
+  fn cg_isPcharExpr(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_STR) { return 1; }
+    if (k == CGN_IDENT) {
+      var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (idx >= 0) {
+        var tb: int64 := self.localTypes + idx * 16;
+        var tp: pchar := peek64(tb) as pchar;
+        var tl: int64 := peek64(tb + 8);
+        if (self.cg_seq(tp, tl, "pchar", 5)) { return 1; }
+      }
+      return 0;
+    }
+    if (k == CGN_CALL) {
+      var fp: pchar := self.cg_nsval(ni);
+      var fl: int64 := self.cg_nslen(ni);
+      if (self.cg_seq(fp, fl, "IntToStr",    8))  { return 1; }
+      if (self.cg_seq(fp, fl, "StrFromInt",  10)) { return 1; }
+      if (self.cg_seq(fp, fl, "StrConcat",   9))  { return 1; }
+      if (self.cg_seq(fp, fl, "StrAppendStr",12)) { return 1; }
+      if (self.cg_seq(fp, fl, "StrSub",      6))  { return 1; }
+      if (self.cg_seq(fp, fl, "FloatToStr",  10)) { return 1; }
+      if (self.cg_seq(fp, fl, "ArgvGetStr",  10)) { return 1; }
+      return 0;
+    }
+    if (k == CGN_BINOP && self.cg_nival(ni) == CGT_PLUS) {
+      if (self.cg_isPcharExpr(self.cg_nc0(ni)) != 0) { return 1; }
+      if (self.cg_isPcharExpr(self.cg_nc1(ni)) != 0) { return 1; }
+    }
+    return 0;
+  }
+
+  // Emit StrConcat inline body. Assumes rdi=a, rsi=b on entry; result in rax.
+  fn cg_emitStrConcatBody() {
+    self.cg_e8(0x57);  // push rdi (a)
+    self.cg_e8(0x56);  // push rsi (b)
+    var sc1pp: int64 := self.cg_emitCall();
+    poke32(self.code + sc1pp, CG_H_STRLEN - sc1pp - 4);
+    self.cg_e8(0x50);  // push rax (len_a)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rdi, [rsp+8]=b
+    var sc2pp: int64 := self.cg_emitCall();
+    poke32(self.code + sc2pp, CG_H_STRLEN - sc2pp - 4);
+    self.cg_e8(0x50);  // push rax (len_b)
+    // [rsp]=len_b [rsp+8]=len_a [rsp+16]=b [rsp+24]=a
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rsi,[rsp]=len_b
+    self.cg_e8(0x48); self.cg_e8(0x03); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x08);  // add rsi,[rsp+8]=len_a
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11);  // add rsi,17
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi,edi
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,3
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,9
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall mmap → rax=buf
+    self.cg_e8(0x50);  // push rax (buf)
+    // [rsp]=buf [rsp+8]=len_b [rsp+16]=len_a [rsp+24]=b [rsp+32]=a
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rdi,[rsp]=buf
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20);  // mov rsi,[rsp+32]=a
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x10);  // mov rcx,[rsp+16]=len_a
+    self.cg_e8(0xF3); self.cg_e8(0xA4);  // rep movsb (copy a)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18);  // mov rsi,[rsp+24]=b
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rcx,[rsp+8]=len_b
+    self.cg_e8(0xF3); self.cg_e8(0xA4);  // rep movsb (copy b)
+    self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x00);  // mov byte[rdi],0 (null term)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x24);  // mov rax,[rsp]=buf
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x28);  // add rsp,40
+  }
+
   // WP-13: Find captured variable from outer function's frame via static link
   // Returns the offset in the captured environment, or 0 if not found
   fn cg_findCapturedVar(name: pchar, nlen: int64): int64 {
@@ -2367,6 +2439,14 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);  // mov rbx, rax
         self.cg_movRaxImm(rhsVal);
         self.cg_emitBinOp(op);
+      } else if (op == CGT_PLUS && (self.cg_isPcharExpr(lhsNi) != 0 || self.cg_isPcharExpr(rhsNi) != 0)) {
+        // pchar + pchar → StrConcat: eval lhs→rdi, rhs→rsi, emit concat body
+        self.cg_genExpr(lhsNi);
+        self.cg_pushRax();
+        self.cg_genExpr(rhsNi);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax (b)
+        self.cg_popRdi();                                         // pop rdi     (a)
+        self.cg_emitStrConcatBody();
       } else {
         // General: eval LHS, push; eval RHS; pop rbx
         self.cg_genExpr(lhsNi);
@@ -3957,72 +4037,11 @@ pub type Codegen = class {
 
     } else if (self.cg_seq(fname, fnlen, "StrConcat", 9)) {
       // StrConcat(a,b): rdi=a, rsi=b → rax=new string (a++b)
-      self.cg_e8(0x57);  // push rdi (a)
-      self.cg_e8(0x56);  // push rsi (b)
-      var sc1pp: int64 := self.cg_emitCall();
-      poke32(self.code + sc1pp, CG_H_STRLEN - sc1pp - 4);  // strlen(a)→rax=len_a
-      self.cg_e8(0x50);  // push rax (len_a)
-      // [rsp]=len_a [rsp+8]=b [rsp+16]=a
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rdi, [rsp+8] = b
-      var sc2pp: int64 := self.cg_emitCall();
-      poke32(self.code + sc2pp, CG_H_STRLEN - sc2pp - 4);  // strlen(b)→rax=len_b
-      self.cg_e8(0x50);  // push rax (len_b)
-      // [rsp]=len_b [rsp+8]=len_a [rsp+16]=b [rsp+24]=a
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rsi, [rsp] = len_b
-      self.cg_e8(0x48); self.cg_e8(0x03); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x08);  // add rsi, [rsp+8] = len_a
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11);  // add rsi, 17
-      self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi, edi
-      self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx, 3
-      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
-      self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
-      self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall (mmap) → rax=buf
-      self.cg_e8(0x50);  // push rax (buf)
-      // [rsp]=buf [rsp+8]=len_b [rsp+16]=len_a [rsp+24]=b [rsp+32]=a
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rdi, [rsp] = buf
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20);  // mov rsi, [rsp+32] = a
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x10);  // mov rcx, [rsp+16] = len_a
-      self.cg_e8(0xF3); self.cg_e8(0xA4);  // rep movsb (rdi → buf+len_a)
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18);  // mov rsi, [rsp+24] = b
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rcx, [rsp+8] = len_b
-      self.cg_e8(0xF3); self.cg_e8(0xA4);  // rep movsb
-      self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x00);  // mov byte [rdi], 0 (null term)
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x24);  // mov rax, [rsp] = buf
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x28);  // add rsp, 40
+      self.cg_emitStrConcatBody();
 
     } else if (self.cg_seq(fname, fnlen, "StrAppendStr", 12) || self.cg_seq(fname, fnlen, "StrAppend", 9)) {
       // StrAppendStr(a,b): same impl as StrConcat (returns new allocation)
-      self.cg_e8(0x57);
-      self.cg_e8(0x56);
-      var sas1pp: int64 := self.cg_emitCall();
-      poke32(self.code + sas1pp, CG_H_STRLEN - sas1pp - 4);
-      self.cg_e8(0x50);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08);
-      var sas2pp: int64 := self.cg_emitCall();
-      poke32(self.code + sas2pp, CG_H_STRLEN - sas2pp - 4);
-      self.cg_e8(0x50);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);
-      self.cg_e8(0x48); self.cg_e8(0x03); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x08);
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11);
-      self.cg_e8(0x31); self.cg_e8(0xFF);
-      self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);
-      self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x0F); self.cg_e8(0x05);
-      self.cg_e8(0x50);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x00);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x10);
-      self.cg_e8(0xF3); self.cg_e8(0xA4);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x08);
-      self.cg_e8(0xF3); self.cg_e8(0xA4);
-      self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x00);
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x24);
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x28);
+      self.cg_emitStrConcatBody();
 
     } else if (self.cg_seq(fname, fnlen, "StrCopy", 7)) {
       // StrCopy(s): rdi=s → rax=mmap copy
