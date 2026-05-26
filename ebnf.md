@@ -31,7 +31,7 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for do repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype`
+`fn var let co con if else while for do downto to repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype`
 
 > `wraps` und `range` sind **Soft-Keywords**: Sie werden nur in `utype`-Deklarationen nach dem Konversionsfaktor erkannt und dürfen als normale Bezeichner verwendet werden.
 
@@ -150,6 +150,16 @@ BreakStmt    = "break" ";" ;
 ContinueStmt = "continue" ";" ;
 ReturnStmt   = "return" [ Expr ] ";" ;
 ExprStmt     = Expr ";" ;
+
+(* For-Schleifen — zwei Varianten *)
+ForStmt      = ForRangeStmt | ForCStmt ;
+
+(* Range-basiert: for i := start to end [do] { } *)
+ForRangeStmt = "for" Ident ":=" Expr ( "to" | "downto" ) Expr [ "do" ] Block ;
+
+(* C-Style:       for i := init; cond; step [do] { } *)
+ForCStmt     = "for" Ident ":=" Expr ";" [ Expr ] ";" [ ForStep ] [ "do" ] Block ;
+ForStep      = LValue ( "++" | "--" | ":=" Expr ) ;
 
 LValue       = Ident { "." Ident | "[" Expr "]" } ;
 Block        = "{" { Statement } "}" ;
