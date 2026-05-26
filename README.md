@@ -1138,7 +1138,9 @@ Verwendung: lyxc <datei.lyx> [-o <output>] [--target=TARGET] [--arch=ARCH]
 Optionen:
   -o <datei>          Ausgabedatei (Standard: a.out bzw. a.exe)
   -I <pfad>         Include-Pfad für Module hinzufügen (mehrfach verwendbar)
+                    (Env-Var: LYX_PATH)
   --std-path=PATH     Pfad zur Standardbibliothek überschreiben
+                    (Env-Var: LYX_STD_PATH)
   --target=TARGET    Zielplattform (win64, linux, arm64, macosx64, macos-arm64, esp32, riscv)
   --arch=ARCH       Architektur (x86_64, arm64, xtensa, riscv)
   --target-energy=<1-5>  Energy-Ziel setzen (1=Minimal, 5=Extreme)
@@ -1459,11 +1461,49 @@ Output:
 [TRACE]   -> Trying: /usr/lib/lyx/std/io.lyx ... FOUND!
 ```
 
+#### Umgebungsvariablen für Importpfade
+
+Der Compiler unterstützt zwei Umgebungsvariablen als dauerhafte Alternative zu den CLI-Flags `-I` und `--std-path`. CLI-Flags haben immer Vorrang.
+
+| Variable | Entspricht | Zweck |
+|----------|-----------|-------|
+| `LYX_PATH` | `-I <pfad>` | Eigene Module und Bibliotheken |
+| `LYX_STD_PATH` | `--std-path=<pfad>` | Standardbibliothek / System-Units |
+
+**`LYX_PATH`** — allgemeiner Include-Pfad für eigene `.lyx`-Module:
+
+```bash
+export LYX_PATH=/usr/include/lyx/units
+lyxc main.lyx   # findet import mymodule als /usr/include/lyx/units/mymodule.lyx
+```
+
+**`LYX_STD_PATH`** — Pfad zur Standard-Unit-Bibliothek:
+
+```bash
+export LYX_STD_PATH=/usr/include/lyx/units/std
+lyxc main.lyx   # findet import std.math als /usr/include/lyx/units/std/std/math.lyx
+```
+
+**Suchlogik für `import mymodule;`:**
+
+1. `./mymodule.lyx` (relativ zum Arbeitsverzeichnis)
+2. `$LYX_PATH/mymodule.lyx` (oder `-I`-Pfad)
+3. `$LYX_STD_PATH/mymodule.lyx` (oder `--std-path`-Pfad)
+4. Fehler: `codegen: cannot read import`
+
+Empfohlene System-Installation:
+
+```bash
+# /etc/profile.d/lyx.sh oder ~/.bashrc
+export LYX_PATH=/usr/include/lyx/units
+export LYX_STD_PATH=/usr/include/lyx/units/std
+```
+
 #### Standard Library Path
 
 The compiler searches for the standard library in this order:
 
-1. `LYX_STD_PATH` environment variable
+1. `LYX_STD_PATH` environment variable (or `--std-path` CLI flag)
 2. Relative to compiler binary: `../std/`
 3. System path: `/usr/lib/lyx/std/`
 4. Fallback: `./std/`
