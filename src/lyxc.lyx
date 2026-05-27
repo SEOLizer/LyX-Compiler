@@ -3589,6 +3589,163 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
 }
 
 // ============================================================================
+// WP-LIC-11: --check-binary — inspect .lyx_lic watermark in an ELF binary
+// ============================================================================
+
+fn _lic_printHexByte(b: int64): void {
+  var buf: int64 := mmap(0, 2, 3, 34, -1, 0);
+  var hi: int64 := (b >> 4) & 0xF;
+  var lo: int64 := b & 0xF;
+  var chHi: int64 := hi + 48;
+  if hi >= 10 { chHi := hi + 55; }
+  var chLo: int64 := lo + 48;
+  if lo >= 10 { chLo := lo + 55; }
+  poke8(buf,     chHi);
+  poke8(buf + 1, chLo);
+  write(1, buf as pchar, 2);
+  munmap(buf, 2);
+}
+
+pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
+  var path: pchar := cfg.checkBinary as pchar;
+
+  var fd: int64 := open(path, 0, 0);
+  if fd < 0 {
+    EPrintStr("check-binary: Datei nicht gefunden: "c);
+    EPrintStrLn(path);
+    return 1;
+  }
+
+  // Read ELF header (64 bytes)
+  var ehdr: int64 := mmap(0, 64, 3, 34, -1, 0);
+  var nr: int64 := read(fd, ehdr as pchar, 64);
+  if nr < 64 {
+    EPrintStrLn("check-binary: Datei zu klein oder kein ELF"c);
+    close(fd);
+    munmap(ehdr, 64);
+    return 1;
+  }
+
+  // Verify ELF magic: 0x7F 'E' 'L' 'F'
+  if peek8(ehdr) != 0x7F || peek8(ehdr+1) != 69 || peek8(ehdr+2) != 76 || peek8(ehdr+3) != 70 {
+    EPrintStrLn("check-binary: kein gueltiges ELF-Binary"c);
+    close(fd);
+    munmap(ehdr, 64);
+    return 1;
+  }
+
+  var shoff:    int64 := peek64(ehdr + 40);
+  var shnum:    int64 := peek16(ehdr + 60);
+  var shstrndx: int64 := peek16(ehdr + 62);
+  munmap(ehdr, 64);
+
+  if shoff == 0 || shnum == 0 {
+    PrintStr("check-binary: "c); PrintStrLn(path);
+    PrintStrLn("  Kein .lyx_lic — nicht lizenziert"c);
+    close(fd);
+    return 0;
+  }
+
+  // Read all section headers
+  var shdrsSize: int64 := shnum * 64;
+  var shdrs: int64 := mmap(0, shdrsSize + 8, 3, 34, -1, 0);
+  lseek(fd, shoff, 0);
+  read(fd, shdrs as pchar, shdrsSize);
+
+  // Read .shstrtab
+  var strsHdr: int64 := shdrs + shstrndx * 64;
+  var strsOff:  int64 := peek64(strsHdr + 24);
+  var strsSize: int64 := peek64(strsHdr + 32);
+  var strs: int64 := mmap(0, strsSize + 8, 3, 34, -1, 0);
+  lseek(fd, strsOff, 0);
+  read(fd, strs as pchar, strsSize);
+
+  // Search for .lyx_lic section: bytes 46 108 121 120 95 108 105 99 0 = ".lyx_lic\0"
+  var licOff:  int64 := 0;
+  var licSize: int64 := 0;
+  var si: int64 := 0;
+  while si < shnum {
+    var sh: int64 := shdrs + si * 64;
+    var nameOff: int64 := peek32(sh);
+    if nameOff >= 0 && nameOff + 9 <= strsSize {
+      var nm: int64 := strs + nameOff;
+      if peek8(nm)   == 46  && peek8(nm+1) == 108 && peek8(nm+2) == 121 &&
+         peek8(nm+3) == 120 && peek8(nm+4) == 95  && peek8(nm+5) == 108 &&
+         peek8(nm+6) == 105 && peek8(nm+7) == 99  && peek8(nm+8) == 0 {
+        licOff  := peek64(sh + 24);
+        licSize := peek64(sh + 32);
+      }
+    }
+    si := si + 1;
+  }
+  munmap(shdrs, shdrsSize + 8);
+  munmap(strs, strsSize + 8);
+
+  if licOff == 0 {
+    PrintStr("check-binary: "c); PrintStrLn(path);
+    PrintStrLn("  Kein .lyx_lic — nicht lizenziert"c);
+    close(fd);
+    return 0;
+  }
+
+  if licSize < 16 {
+    EPrintStrLn("check-binary: .lyx_lic Sektion zu klein"c);
+    close(fd);
+    return 1;
+  }
+
+  // Read the 16-byte payload
+  var payload: int64 := mmap(0, 16, 3, 34, -1, 0);
+  lseek(fd, licOff, 0);
+  read(fd, payload as pchar, 16);
+  close(fd);
+
+  PrintStr("check-binary: "c); PrintStrLn(path);
+  PrintStr("  Fingerprint: "c);
+  var pi: int64 := 0;
+  while pi < 8 {
+    _lic_printHexByte(peek8(payload + pi));
+    pi := pi + 1;
+  }
+  PrintStr("\n"c);
+  PrintStr("  KeyChecksum: "c);
+  pi := 0;
+  while pi < 4 {
+    _lic_printHexByte(peek8(payload + 8 + pi));
+    pi := pi + 1;
+  }
+  PrintStr("\n"c);
+  PrintStr("  Version:     "c);
+  PrintInt(peek8(payload + 12));
+  PrintStr("\n"c);
+
+  // Key comparison: verify keyChecksum = SHA256(licenseKey)[0..3]
+  var keyHash: int64 := 0;
+  var keyOk: bool := false;
+  var ki: int64 := 0;
+  if cfg.licenseKey != 0 {
+    keyHash := mmap(0, 32, 3, 34, -1, 0);
+    lic_sha256(cfg.licenseKey, cfg.licenseKeyLen, keyHash);
+    keyOk := true;
+    while ki < 4 {
+      if peek8(keyHash + ki) != peek8(payload + 8 + ki) { keyOk := false; }
+      ki := ki + 1;
+    }
+    munmap(keyHash, 32);
+    if keyOk {
+      PrintStrLn("  KeyChecksum: OK — Schluessel stimmt ueberein"c);
+    } else {
+      PrintStrLn("  KeyChecksum: MISMATCH — anderer Lizenzschluessel"c);
+    }
+  } else {
+    PrintStrLn("  KeyChecksum: (kein Schluessel geladen — --license-file= angeben zum Vergleich)"c);
+  }
+
+  munmap(payload, 16);
+  return 0;
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -3669,6 +3826,15 @@ pub fn main(argc: int64, argv: pchar): int64 {
     if not lic_loadAndVerify(cfg, argc, argv) {
       return 1;
     }
+  }
+
+  // WP-LIC-11: --check-binary — inspect .lyx_lic watermark
+  if cfg.checkBinary != 0 {
+    // In dev builds, try to load the license silently for key comparison
+    if LYXC_LICENSE_REQUIRED == 0 && not cfg.noLicense && cfg.licenseKey == 0 {
+      lic_loadAndVerify(cfg, argc, argv);
+    }
+    return lic_checkBinary(cfg, argc, argv);
   }
 
   // Get input file
