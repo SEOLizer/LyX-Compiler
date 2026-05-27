@@ -1,0 +1,112 @@
+// WP-LIC-03: Lizenzschlüssel-Ableitung
+//
+// Algorithmus:
+//   input = norm(name) || "|" || norm(email) || "|" || 0x01
+//   digest = HMAC-SHA256(masterSecret, input)
+//   raw    = Base32Encode(digest)            // 51 Zeichen
+//   key    = FormatKey(raw)                  // XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+//
+// norm(s) = trim(s) + toLower(s)
+
+import src.crypto.lic_secret;
+import src.crypto.lic_hmac;
+import src.crypto.lic_base32;
+
+fn _lic_trimStart(src: int64, srcLen: int64): int64 {
+  var i: int64 := 0;
+  while i < srcLen {
+    var c: int64 := peek8(src + i);
+    if c != 32 && c != 9 && c != 10 && c != 13 { return i; }
+    i := i + 1;
+  }
+  return srcLen;
+}
+
+fn _lic_trimEnd(src: int64, srcLen: int64, lo: int64): int64 {
+  var i: int64 := srcLen - 1;
+  while i >= lo {
+    var c: int64 := peek8(src + i);
+    if c != 32 && c != 9 && c != 10 && c != 13 { return i + 1; }
+    i := i - 1;
+  }
+  return lo;
+}
+
+fn _lic_lowerByte(c: int64): int64 {
+  if c >= 65 && c <= 90 { return c + 32; }
+  return c;
+}
+
+// Kopiert trim(src)+toLower nach dst; gibt Länge zurück.
+fn _lic_normStr(src: int64, srcLen: int64, dst: int64): int64 {
+  var lo: int64 := _lic_trimStart(src, srcLen);
+  var hi: int64 := _lic_trimEnd(src, srcLen, lo);
+  var n: int64 := hi - lo;
+  var i: int64 := 0;
+  while i < n {
+    poke8(dst + i, _lic_lowerByte(peek8(src + lo + i)));
+    i := i + 1;
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// lic_deriveKey
+//
+// name/nameLen:   Inhabername (beliebige Schreibweise, führende/nachfolgende Leerzeichen OK)
+// email/emailLen: E-Mail-Adresse (beliebige Schreibweise)
+// outKey29:       Aufrufer-allokierter Puffer, mind. 30 Bytes
+//                 → "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX\0"
+// ---------------------------------------------------------------------------
+pub fn lic_deriveKey(name: int64, nameLen: int64, email: int64, emailLen: int64, outKey29: pchar) {
+  // Maximale Eingabelänge: trim(name) + "|" + trim(email) + "|" + 0x01
+  // Obere Schranke: nameLen + emailLen + 3
+  var inMax: int64 := nameLen + emailLen + 3;
+  var inBuf: int64 := mmap(0, inMax, 3, 34, -1, 0);
+  if inBuf == 0 { return; }
+
+  var pos: int64 := 0;
+
+  // norm(name)
+  var nLen: int64 := _lic_normStr(name, nameLen, inBuf + pos);
+  pos := pos + nLen;
+
+  // "|"
+  poke8(inBuf + pos, 124);   // '|'
+  pos := pos + 1;
+
+  // norm(email)
+  var eLen: int64 := _lic_normStr(email, emailLen, inBuf + pos);
+  pos := pos + eLen;
+
+  // "|" + 0x01
+  poke8(inBuf + pos, 124);   // '|'
+  pos := pos + 1;
+  poke8(inBuf + pos, 1);
+  pos := pos + 1;
+
+  // Master-Secret abrufen
+  var secBuf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if secBuf == 0 { munmap(inBuf, inMax); return; }
+  lic_getMasterSecret(secBuf);
+
+  // HMAC-SHA256
+  var digest: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if digest == 0 { lic_zeroSecret(secBuf); munmap(secBuf, 32); munmap(inBuf, inMax); return; }
+  lic_hmacSha256(secBuf, 32, inBuf, pos, digest);
+
+  // Secret sofort löschen
+  lic_zeroSecret(secBuf);
+  munmap(secBuf, 32);
+  munmap(inBuf, inMax);
+
+  // Base32 → 51 Zeichen
+  var encBuf: int64 := mmap(0, 56, 3, 34, -1, 0);
+  if encBuf == 0 { munmap(digest, 32); return; }
+  lic_base32Encode(digest, 32, encBuf as pchar);
+  munmap(digest, 32);
+
+  // Formatieren: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+  lic_base32FormatKey(encBuf as pchar, 51, outKey29);
+  munmap(encBuf, 56);
+}

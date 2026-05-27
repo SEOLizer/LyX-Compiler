@@ -43,6 +43,10 @@ import src.backend.xtensa;
 import src.lfd_codegen;
 import src.lyu_writer;
 import src.lyu_reader;
+import src.crypto.lic_types;
+import src.crypto.lic_parse;
+import src.crypto.lic_derive;
+import src.lic_build_flags;
 
 // ============================================================================
 // Compiler Constants
@@ -83,6 +87,8 @@ con OUTPUT_TYPE_SHARED_LIB: int64 := 1;
 // Android API levels (WP-AND-03)
 con ANDROID_API_MIN:     int64 := 21;   // Android 5.0 — first 64-bit ARM
 con ANDROID_API_DEFAULT: int64 := 26;   // Android 8.0 — current target baseline
+
+// (LicenseInfo and LIC_ERR_* are defined in src.crypto.lic_types)
 
 // ============================================================================
 // Command Line Options
@@ -259,6 +265,15 @@ pub type CompilerConfig = class {
   // section and reserved for future API-conditional codegen choices.
   androidApiLevel:  int64;
 
+  // WP-LIC-06: License CLI flags
+  licenseFile:   int64;   // --license-file=<path>  (pchar into argv)
+  licenseKey:    int64;   // pchar to 29-char verified key (persistent mmap), 0 = none
+  licenseKeyLen: int64;   // always 29 when licenseKey is set
+  licenseName:   int64;   // --name=NAME             (pchar into argv)
+  licenseEmail:  int64;   // --email=EMAIL           (pchar into argv)
+  checkBinary:   int64;   // --check-binary=<path>   (pchar into argv)
+  noLicense:     bool;    // --no-license
+
   // Compilation state
   exitCode: int64;
   earlyExit: bool;
@@ -339,6 +354,13 @@ pub type CompilerConfig = class {
     self.globalRelocCount := 0;
     self.irModulePtr      := 0;
     self.androidApiLevel  := ANDROID_API_DEFAULT;
+    self.licenseFile   := 0;
+    self.licenseKey    := 0;
+    self.licenseKeyLen := 0;
+    self.licenseName   := 0;
+    self.licenseEmail  := 0;
+    self.checkBinary   := 0;
+    self.noLicense     := false;
     self.exitCode := 0;
     self.earlyExit := false;
     self.errorCount := 0;
@@ -449,7 +471,7 @@ pub type CompilerConfig = class {
     if self.earlyExit {
       return false;
     }
-    if self.inputFile == 0 && self.unitInfoFile <= 1 {
+    if self.inputFile == 0 && self.unitInfoFile <= 1 && self.checkBinary == 0 {
       self.printHelp();
       self.exitCode := 1;
       return false;
@@ -868,10 +890,36 @@ pub type CompilerConfig = class {
       self.optLevel := OPT_NONE;
       return;
     }
-    
+
     // --no-lint (disable linter)
     if StrCmp(arg, "--no-lint"c) == 0 {
       self.enableLint := false;
+      return;
+    }
+
+    // WP-LIC-06: License flags
+    if StrStartsWith(arg, "--license-file=") {
+      self.licenseFile := arg + 15;
+      return;
+    }
+    if StrStartsWith(arg, "--license=") {
+      self.licenseKey := arg + 10;
+      return;
+    }
+    if StrStartsWith(arg, "--name=") {
+      self.licenseName := arg + 7;
+      return;
+    }
+    if StrStartsWith(arg, "--email=") {
+      self.licenseEmail := arg + 8;
+      return;
+    }
+    if StrStartsWith(arg, "--check-binary=") {
+      self.checkBinary := arg + 15;
+      return;
+    }
+    if StrCmp(arg, "--no-license"c) == 0 {
+      self.noLicense := true;
       return;
     }
   }
@@ -970,6 +1018,16 @@ pub type CompilerConfig = class {
     PrintStrLn("  --build-info           Build-Identifikation ausgeben (TOR-002)");
     PrintStrLn("  --config               Aktive Konfiguration ausgeben (TOR-003)");
     PrintStrLn("  --help                 Diese Hilfe anzeigen");
+    if LYXC_LICENSE_REQUIRED == 1 {
+      PrintStrLn("");
+      PrintStrLn("Lizenz-Optionen:");
+      PrintStrLn("  --license-file=<pfad>  Lizenzdatei explizit angeben");
+      PrintStrLn("  --license=KEY          Lizenzschluessel direkt uebergeben");
+      PrintStrLn("  --name=NAME            Inhabername direkt uebergeben");
+      PrintStrLn("  --email=EMAIL          E-Mail-Adresse direkt uebergeben");
+      PrintStrLn("  --check-binary=<pfad>  Wasserzeichen einer Binary pruefen");
+      PrintStrLn("  --no-license           Lizenzpruefung deaktivieren (nur Dev-Builds)");
+    }
   }
   
   // ---------------------------------------------------------------------------
@@ -1156,6 +1214,8 @@ pub type CompilerConfig = class {
       if self.runtimeChecks {
         cg.runtimeChecks := 1;
       }
+      cg.licenseKey    := self.licenseKey;
+      cg.licenseKeyLen := self.licenseKeyLen;
       cg.Generate(astRoot);
       cg.WriteELF(outPath);
       self._passEnd("codegen-x86_64"c, _t5x);
@@ -3409,6 +3469,283 @@ pub fn lyx_getEnvVar(argc: int64, argv: pchar, name: pchar): pchar {
 }
 
 // ============================================================================
+// WP-LIC-08: License Verification
+// ============================================================================
+
+pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
+  var info: LicenseInfo := new LicenseInfo();
+  info.Init();
+  var found: bool := false;
+
+  // (1) --license-file=<path> (also covers LYX_LICENSE_FILE via cfg)
+  if not found && cfg.licenseFile != 0 {
+    found := lic_parseFile(cfg.licenseFile as pchar, info);
+    if not found {
+      EPrintStr("lyxc: Lizenzdatei nicht lesbar: "c);
+      EPrintStr(cfg.licenseFile as pchar);
+      EPrintStr("\n"c);
+      return false;
+    }
+  }
+
+  // (2) --license=KEY + --name=NAME + --email=EMAIL (also env vars LYX_LICENSE_*)
+  if not found && cfg.licenseKey != 0 && cfg.licenseName != 0 && cfg.licenseEmail != 0 {
+    info.key      := cfg.licenseKey   as pchar;
+    info.keyLen   := StrLen(cfg.licenseKey   as pchar);
+    info.name     := cfg.licenseName  as pchar;
+    info.nameLen  := StrLen(cfg.licenseName  as pchar);
+    info.email    := cfg.licenseEmail as pchar;
+    info.emailLen := StrLen(cfg.licenseEmail as pchar);
+    info.errCode  := LIC_OK;
+    found := true;
+  }
+
+  // (3) ~/.lyx/license.key
+  if not found {
+    var home: pchar := lyx_getEnvVar(argc, argv, "HOME"c);
+    if home != 0 as pchar {
+      var homeLen: int64 := StrLen(home);
+      var suffix: pchar := "/.lyx/license.key"c;
+      var sfxLen: int64 := 17;
+      var pathBuf: int64 := mmap(0, homeLen + sfxLen + 1, 3, 34, -1, 0);
+      if pathBuf != 0 {
+        var pi: int64 := 0;
+        while pi < homeLen { poke8(pathBuf + pi, peek8(home as int64 + pi)); pi := pi + 1; }
+        pi := 0;
+        while pi < sfxLen { poke8(pathBuf + homeLen + pi, peek8(suffix as int64 + pi)); pi := pi + 1; }
+        poke8(pathBuf + homeLen + sfxLen, 0);
+        found := lic_parseFile(pathBuf as pchar, info);
+        munmap(pathBuf, homeLen + sfxLen + 1);
+      }
+    }
+  }
+
+  // (4) ./license.key
+  if not found {
+    found := lic_parseFile("./license.key"c, info);
+  }
+
+  // No license found at all
+  if not found {
+    EPrintStr("lyxc: keine Lizenz gefunden.\n"c);
+    EPrintStr("  Erstelle ~/.lyx/license.key:\n"c);
+    EPrintStr("    name=Vorname Nachname\n"c);
+    EPrintStr("    email=user@example.com\n"c);
+    EPrintStr("    key=XXXXX-XXXXX-XXXXX-XXXXX-XXXXX\n"c);
+    return false;
+  }
+
+  // Completeness check
+  if info.nameLen == 0 || info.emailLen == 0 {
+    EPrintStr("lyxc: Lizenzdatei unvollstaendig (Name oder E-Mail fehlt).\n"c);
+    lic_infoFree(info);
+    return false;
+  }
+  if info.keyLen == 0 {
+    EPrintStr("lyxc: Lizenzdatei unvollstaendig (Schluessel fehlt).\n"c);
+    lic_infoFree(info);
+    return false;
+  }
+
+  // Derive expected key from name + email
+  var expected: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if expected == 0 { lic_infoFree(info); return false; }
+  lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+
+  // WP-LIC-10: copy the provided key into a persistent buffer before freeing info
+  // cfg.licenseKey will be set to this buffer on success so codegen can embed it
+  var keyBuf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if keyBuf != 0 {
+    var kb: int64 := 0;
+    while kb < info.keyLen && kb < 29 {
+      poke8(keyBuf + kb, peek8(info.key as int64 + kb));
+      kb := kb + 1;
+    }
+  }
+
+  // Constant-time compare — always scan all 29 positions regardless of mismatch
+  var diff: int64 := 0;
+  var ci: int64 := 0;
+  while ci < 29 {
+    var got: int64 := 0;
+    var exp: int64 := peek8(expected + ci);
+    if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
+    diff := diff | (got ^ exp);
+    ci := ci + 1;
+  }
+  munmap(expected, 32);
+  lic_infoFree(info);
+
+  if diff != 0 {
+    EPrintStr("lyxc: ungueltiger Lizenzschluessel.\n"c);
+    if keyBuf != 0 { munmap(keyBuf, 32); }
+    return false;
+  }
+
+  // Store verified key for WP-LIC-10 watermark embedding
+  cfg.licenseKey    := keyBuf;
+  cfg.licenseKeyLen := 29;
+  return true;
+}
+
+// ============================================================================
+// WP-LIC-11: --check-binary — inspect .lyx_lic watermark in an ELF binary
+// ============================================================================
+
+fn _lic_printHexByte(b: int64): void {
+  var buf: int64 := mmap(0, 2, 3, 34, -1, 0);
+  var hi: int64 := (b >> 4) & 0xF;
+  var lo: int64 := b & 0xF;
+  var chHi: int64 := hi + 48;
+  if hi >= 10 { chHi := hi + 55; }
+  var chLo: int64 := lo + 48;
+  if lo >= 10 { chLo := lo + 55; }
+  poke8(buf,     chHi);
+  poke8(buf + 1, chLo);
+  write(1, buf as pchar, 2);
+  munmap(buf, 2);
+}
+
+pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
+  var path: pchar := cfg.checkBinary as pchar;
+
+  var fd: int64 := open(path, 0, 0);
+  if fd < 0 {
+    EPrintStr("check-binary: Datei nicht gefunden: "c);
+    EPrintStrLn(path);
+    return 1;
+  }
+
+  // Read ELF header (64 bytes)
+  var ehdr: int64 := mmap(0, 64, 3, 34, -1, 0);
+  var nr: int64 := read(fd, ehdr as pchar, 64);
+  if nr < 64 {
+    EPrintStrLn("check-binary: Datei zu klein oder kein ELF"c);
+    close(fd);
+    munmap(ehdr, 64);
+    return 1;
+  }
+
+  // Verify ELF magic: 0x7F 'E' 'L' 'F'
+  if peek8(ehdr) != 0x7F || peek8(ehdr+1) != 69 || peek8(ehdr+2) != 76 || peek8(ehdr+3) != 70 {
+    EPrintStrLn("check-binary: kein gueltiges ELF-Binary"c);
+    close(fd);
+    munmap(ehdr, 64);
+    return 1;
+  }
+
+  var shoff:    int64 := peek64(ehdr + 40);
+  var shnum:    int64 := peek16(ehdr + 60);
+  var shstrndx: int64 := peek16(ehdr + 62);
+  munmap(ehdr, 64);
+
+  if shoff == 0 || shnum == 0 {
+    PrintStr("check-binary: "c); PrintStrLn(path);
+    PrintStrLn("  Kein .lyx_lic — nicht lizenziert"c);
+    close(fd);
+    return 0;
+  }
+
+  // Read all section headers
+  var shdrsSize: int64 := shnum * 64;
+  var shdrs: int64 := mmap(0, shdrsSize + 8, 3, 34, -1, 0);
+  lseek(fd, shoff, 0);
+  read(fd, shdrs as pchar, shdrsSize);
+
+  // Read .shstrtab
+  var strsHdr: int64 := shdrs + shstrndx * 64;
+  var strsOff:  int64 := peek64(strsHdr + 24);
+  var strsSize: int64 := peek64(strsHdr + 32);
+  var strs: int64 := mmap(0, strsSize + 8, 3, 34, -1, 0);
+  lseek(fd, strsOff, 0);
+  read(fd, strs as pchar, strsSize);
+
+  // Search for .lyx_lic section: bytes 46 108 121 120 95 108 105 99 0 = ".lyx_lic\0"
+  var licOff:  int64 := 0;
+  var licSize: int64 := 0;
+  var si: int64 := 0;
+  while si < shnum {
+    var sh: int64 := shdrs + si * 64;
+    var nameOff: int64 := peek32(sh);
+    if nameOff >= 0 && nameOff + 9 <= strsSize {
+      var nm: int64 := strs + nameOff;
+      if peek8(nm)   == 46  && peek8(nm+1) == 108 && peek8(nm+2) == 121 &&
+         peek8(nm+3) == 120 && peek8(nm+4) == 95  && peek8(nm+5) == 108 &&
+         peek8(nm+6) == 105 && peek8(nm+7) == 99  && peek8(nm+8) == 0 {
+        licOff  := peek64(sh + 24);
+        licSize := peek64(sh + 32);
+      }
+    }
+    si := si + 1;
+  }
+  munmap(shdrs, shdrsSize + 8);
+  munmap(strs, strsSize + 8);
+
+  if licOff == 0 {
+    PrintStr("check-binary: "c); PrintStrLn(path);
+    PrintStrLn("  Kein .lyx_lic — nicht lizenziert"c);
+    close(fd);
+    return 0;
+  }
+
+  if licSize < 16 {
+    EPrintStrLn("check-binary: .lyx_lic Sektion zu klein"c);
+    close(fd);
+    return 1;
+  }
+
+  // Read the 16-byte payload
+  var payload: int64 := mmap(0, 16, 3, 34, -1, 0);
+  lseek(fd, licOff, 0);
+  read(fd, payload as pchar, 16);
+  close(fd);
+
+  PrintStr("check-binary: "c); PrintStrLn(path);
+  PrintStr("  Fingerprint: "c);
+  var pi: int64 := 0;
+  while pi < 8 {
+    _lic_printHexByte(peek8(payload + pi));
+    pi := pi + 1;
+  }
+  PrintStr("\n"c);
+  PrintStr("  KeyChecksum: "c);
+  pi := 0;
+  while pi < 4 {
+    _lic_printHexByte(peek8(payload + 8 + pi));
+    pi := pi + 1;
+  }
+  PrintStr("\n"c);
+  PrintStr("  Version:     "c);
+  PrintInt(peek8(payload + 12));
+  PrintStr("\n"c);
+
+  // Key comparison: verify keyChecksum = SHA256(licenseKey)[0..3]
+  var keyHash: int64 := 0;
+  var keyOk: bool := false;
+  var ki: int64 := 0;
+  if cfg.licenseKey != 0 {
+    keyHash := mmap(0, 32, 3, 34, -1, 0);
+    lic_sha256(cfg.licenseKey, cfg.licenseKeyLen, keyHash);
+    keyOk := true;
+    while ki < 4 {
+      if peek8(keyHash + ki) != peek8(payload + 8 + ki) { keyOk := false; }
+      ki := ki + 1;
+    }
+    munmap(keyHash, 32);
+    if keyOk {
+      PrintStrLn("  KeyChecksum: OK — Schluessel stimmt ueberein"c);
+    } else {
+      PrintStrLn("  KeyChecksum: MISMATCH — anderer Lizenzschluessel"c);
+    }
+  } else {
+    PrintStrLn("  KeyChecksum: (kein Schluessel geladen — --license-file= angeben zum Vergleich)"c);
+  }
+
+  munmap(payload, 16);
+  return 0;
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -3431,6 +3768,24 @@ pub fn main(argc: int64, argv: pchar): int64 {
   if cfg.stdPath == 0 {
     var es: pchar := lyx_getEnvVar(argc, argv, "LYX_STD_PATH"c);
     if es != 0 as pchar { cfg.stdPath := es as int64; }
+  }
+
+  // WP-LIC-07: License env vars — CLI flags take priority, env vars fill gaps
+  if cfg.licenseFile == 0 {
+    var ev: pchar := lyx_getEnvVar(argc, argv, "LYX_LICENSE_FILE"c);
+    if ev != 0 as pchar { cfg.licenseFile := ev as int64; }
+  }
+  if cfg.licenseKey == 0 {
+    var ev: pchar := lyx_getEnvVar(argc, argv, "LYX_LICENSE_KEY"c);
+    if ev != 0 as pchar { cfg.licenseKey := ev as int64; }
+  }
+  if cfg.licenseName == 0 {
+    var ev: pchar := lyx_getEnvVar(argc, argv, "LYX_LICENSE_NAME"c);
+    if ev != 0 as pchar { cfg.licenseName := ev as int64; }
+  }
+  if cfg.licenseEmail == 0 {
+    var ev: pchar := lyx_getEnvVar(argc, argv, "LYX_LICENSE_EMAIL"c);
+    if ev != 0 as pchar { cfg.licenseEmail := ev as int64; }
   }
 
   // Print version banner unless suppressed with --quiet
@@ -3464,6 +3819,22 @@ pub fn main(argc: int64, argv: pchar): int64 {
       return 1;
     }
     return 0;
+  }
+
+  // WP-LIC-08: License verification (only in release builds)
+  if LYXC_LICENSE_REQUIRED == 1 && not cfg.noLicense {
+    if not lic_loadAndVerify(cfg, argc, argv) {
+      return 1;
+    }
+  }
+
+  // WP-LIC-11: --check-binary — inspect .lyx_lic watermark
+  if cfg.checkBinary != 0 {
+    // In dev builds, try to load the license silently for key comparison
+    if LYXC_LICENSE_REQUIRED == 0 && not cfg.noLicense && cfg.licenseKey == 0 {
+      lic_loadAndVerify(cfg, argc, argv);
+    }
+    return lic_checkBinary(cfg, argc, argv);
   }
 
   // Get input file

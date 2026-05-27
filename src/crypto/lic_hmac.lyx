@@ -1,0 +1,219 @@
+// WP-LIC-02: SHA-256 und HMAC-SHA256 als eigenständiges Modul
+//
+// Extrahiert aus std/net/quic.lyx (_qROR32, _qSHA256Block, _qSHA256, _qHMACSHA256).
+// Algorithmus unverändert — nur Präfix und Sichtbarkeit angepasst.
+//
+// Öffentliche API:
+//   lic_sha256(input, inLen, out32)
+//   lic_hmacSha256(key, keyLen, msg, msgLen, out32)
+
+// ---------------------------------------------------------------------------
+// Interner Helfer: 32-Bit-Rotate-Right
+// ---------------------------------------------------------------------------
+fn _lic_ror32(x: int64, n: int64): int64 {
+  return ((x >> n) | (x << (32 - n))) & 4294967295;
+}
+
+// ---------------------------------------------------------------------------
+// Interner Helfer: SHA-256 Block-Kompression
+// state: int64-Puffer (8 × int64, 64 Bytes), block: 64 Bytes, K: 64 × int64
+// ---------------------------------------------------------------------------
+fn _lic_sha256Block(state: int64, block: int64, K: int64) {
+  var Wbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+  if (Wbuf == 0) { return; }
+
+  var i: int64 := 0;
+  while (i < 16) {
+    var b0: int64 := peek8(block + i*4 + 0);
+    var b1: int64 := peek8(block + i*4 + 1);
+    var b2: int64 := peek8(block + i*4 + 2);
+    var b3: int64 := peek8(block + i*4 + 3);
+    poke64(Wbuf + i*8, b0*16777216 + b1*65536 + b2*256 + b3);
+    i := i + 1;
+  }
+
+  i := 16;
+  while (i < 64) {
+    var w15: int64 := peek64(Wbuf + (i-15)*8);
+    var w2:  int64 := peek64(Wbuf + (i-2)*8);
+    var w16: int64 := peek64(Wbuf + (i-16)*8);
+    var w7:  int64 := peek64(Wbuf + (i-7)*8);
+    var sig0: int64 := (_lic_ror32(w15, 7) ^ _lic_ror32(w15, 18) ^ (w15 >> 3)) & 4294967295;
+    var sig1: int64 := (_lic_ror32(w2, 17) ^ _lic_ror32(w2, 19)  ^ (w2  >> 10)) & 4294967295;
+    poke64(Wbuf + i*8, (sig1 + w7 + sig0 + w16) & 4294967295);
+    i := i + 1;
+  }
+
+  var sha_a: int64 := peek64(state + 0);
+  var sha_b: int64 := peek64(state + 8);
+  var sha_c: int64 := peek64(state + 16);
+  var sha_d: int64 := peek64(state + 24);
+  var sha_e: int64 := peek64(state + 32);
+  var sha_f: int64 := peek64(state + 40);
+  var sha_g: int64 := peek64(state + 48);
+  var sha_h: int64 := peek64(state + 56);
+
+  var ri: int64 := 0;
+  while (ri < 64) {
+    var ki: int64 := peek64(K + ri*8);
+    var wi: int64 := peek64(Wbuf + ri*8);
+    var S1:  int64 := (_lic_ror32(sha_e, 6) ^ _lic_ror32(sha_e, 11) ^ _lic_ror32(sha_e, 25)) & 4294967295;
+    var ch:  int64 := ((sha_e & sha_f) ^ ((4294967295 ^ sha_e) & sha_g)) & 4294967295;
+    var t1:  int64 := (sha_h + S1 + ch + ki + wi) & 4294967295;
+    var S0:  int64 := (_lic_ror32(sha_a, 2) ^ _lic_ror32(sha_a, 13) ^ _lic_ror32(sha_a, 22)) & 4294967295;
+    var maj: int64 := ((sha_a & sha_b) ^ (sha_a & sha_c) ^ (sha_b & sha_c)) & 4294967295;
+    var t2:  int64 := (S0 + maj) & 4294967295;
+    sha_h := sha_g;
+    sha_g := sha_f;
+    sha_f := sha_e;
+    sha_e := (sha_d + t1) & 4294967295;
+    sha_d := sha_c;
+    sha_c := sha_b;
+    sha_b := sha_a;
+    sha_a := (t1 + t2) & 4294967295;
+    ri := ri + 1;
+  }
+
+  poke64(state + 0,  (peek64(state + 0)  + sha_a) & 4294967295);
+  poke64(state + 8,  (peek64(state + 8)  + sha_b) & 4294967295);
+  poke64(state + 16, (peek64(state + 16) + sha_c) & 4294967295);
+  poke64(state + 24, (peek64(state + 24) + sha_d) & 4294967295);
+  poke64(state + 32, (peek64(state + 32) + sha_e) & 4294967295);
+  poke64(state + 40, (peek64(state + 40) + sha_f) & 4294967295);
+  poke64(state + 48, (peek64(state + 48) + sha_g) & 4294967295);
+  poke64(state + 56, (peek64(state + 56) + sha_h) & 4294967295);
+
+  munmap(Wbuf, 512);
+}
+
+// ---------------------------------------------------------------------------
+// lic_sha256 — SHA-256 Hash
+//
+// input:  Puffer mit inLen Bytes
+// out32:  Aufrufer-allokierter Ausgabepuffer, mind. 32 Bytes
+// ---------------------------------------------------------------------------
+pub fn lic_sha256(input: int64, inLen: int64, out32: int64) {
+  var K: int64 := mmap(0, 512, 3, 34, -1, 0);
+  if (K == 0) { return; }
+
+  // SHA-256 K-Konstanten (RFC 6234 / FIPS 180-4)
+  poke64(K+0,   1116352408); poke64(K+8,   1899447441); poke64(K+16,  3049323471); poke64(K+24,  3921009573);
+  poke64(K+32,  961987163);  poke64(K+40,  1508970993); poke64(K+48,  2453635748); poke64(K+56,  2870763221);
+  poke64(K+64,  3624381080); poke64(K+72,  310598401);  poke64(K+80,  607225278);  poke64(K+88,  1426881987);
+  poke64(K+96,  1925078388); poke64(K+104, 2162078206); poke64(K+112, 2614888103); poke64(K+120, 3248222580);
+  poke64(K+128, 3835390401); poke64(K+136, 4022224774); poke64(K+144, 264347078);  poke64(K+152, 604807628);
+  poke64(K+160, 770255983);  poke64(K+168, 1249150122); poke64(K+176, 1555081692); poke64(K+184, 1996064986);
+  poke64(K+192, 2554220882); poke64(K+200, 2821834349); poke64(K+208, 2952996808); poke64(K+216, 3210313671);
+  poke64(K+224, 3336571891); poke64(K+232, 3584528711); poke64(K+240, 113926993);  poke64(K+248, 338241895);
+  poke64(K+256, 666307205);  poke64(K+264, 773529912);  poke64(K+272, 1294757372); poke64(K+280, 1396182291);
+  poke64(K+288, 1695183700); poke64(K+296, 1986661051); poke64(K+304, 2177026350); poke64(K+312, 2456956037);
+  poke64(K+320, 2730485921); poke64(K+328, 2820302411); poke64(K+336, 3259730800); poke64(K+344, 3345764771);
+  poke64(K+352, 3516065817); poke64(K+360, 3600352804); poke64(K+368, 4094571909); poke64(K+376, 275423344);
+  poke64(K+384, 430227734);  poke64(K+392, 506948616);  poke64(K+400, 659060556);  poke64(K+408, 883997877);
+  poke64(K+416, 958139571);  poke64(K+424, 1322822218); poke64(K+432, 1537002063); poke64(K+440, 1747873779);
+  poke64(K+448, 1955562222); poke64(K+456, 2024104815); poke64(K+464, 2227730452); poke64(K+472, 2361852424);
+  poke64(K+480, 2428436474); poke64(K+488, 2756734187); poke64(K+496, 3204031479); poke64(K+504, 3329325298);
+
+  // SHA-256 Initialwerte (Wurzeln der ersten 8 Primzahlen)
+  var state: int64 := mmap(0, 64, 3, 34, -1, 0);
+  if (state == 0) { munmap(K, 512); return; }
+  poke64(state+0,  1779033703); poke64(state+8,  3144134277);
+  poke64(state+16, 1013904242); poke64(state+24, 2773480762);
+  poke64(state+32, 1359893119); poke64(state+40, 2600822924);
+  poke64(state+48, 528734635);  poke64(state+56, 1541459225);
+
+  // Padding: input || 0x80 || zeros || bit_length (8 Bytes big-endian)
+  var padLen: int64 := inLen + 1;
+  var rem: int64 := padLen - (padLen / 64) * 64;
+  if (rem <= 56) {
+    padLen := padLen + (56 - rem);
+  } else {
+    padLen := padLen + (120 - rem);
+  }
+  padLen := padLen + 8;
+
+  var padded: int64 := mmap(0, padLen, 3, 34, -1, 0);
+  if (padded == 0) { munmap(state, 64); munmap(K, 512); return; }
+
+  var i: int64 := 0;
+  while (i < inLen) { poke8(padded + i, peek8(input + i)); i := i + 1; }
+  poke8(padded + inLen, 128);
+
+  var bitLen: int64 := inLen * 8;
+  var lp: int64 := padLen - 8;
+  poke8(padded + lp + 0, (bitLen >> 56) & 255);
+  poke8(padded + lp + 1, (bitLen >> 48) & 255);
+  poke8(padded + lp + 2, (bitLen >> 40) & 255);
+  poke8(padded + lp + 3, (bitLen >> 32) & 255);
+  poke8(padded + lp + 4, (bitLen >> 24) & 255);
+  poke8(padded + lp + 5, (bitLen >> 16) & 255);
+  poke8(padded + lp + 6, (bitLen >> 8)  & 255);
+  poke8(padded + lp + 7,  bitLen        & 255);
+
+  var numBlocks: int64 := padLen / 64;
+  i := 0;
+  while (i < numBlocks) { _lic_sha256Block(state, padded + i*64, K); i := i + 1; }
+  munmap(padded, padLen);
+  munmap(K, 512);
+
+  // Ausgabe: 8 big-endian 32-Bit-Wörter
+  i := 0;
+  while (i < 8) {
+    var word: int64 := peek64(state + i*8);
+    poke8(out32 + i*4 + 0, (word >> 24) & 255);
+    poke8(out32 + i*4 + 1, (word >> 16) & 255);
+    poke8(out32 + i*4 + 2, (word >> 8)  & 255);
+    poke8(out32 + i*4 + 3,  word        & 255);
+    i := i + 1;
+  }
+  munmap(state, 64);
+}
+
+// ---------------------------------------------------------------------------
+// lic_hmacSha256 — HMAC-SHA256 (RFC 2104)
+//
+// key/keyLen: HMAC-Schlüssel (wird auf 64 Bytes normiert)
+// msg/msgLen: Nachricht
+// out32:      Aufrufer-allokierter Ausgabepuffer, mind. 32 Bytes
+// ---------------------------------------------------------------------------
+pub fn lic_hmacSha256(key: int64, keyLen: int64, msg: int64, msgLen: int64, out32: int64) {
+  var k: int64 := mmap(0, 64, 3, 34, -1, 0);
+  if (k == 0) { return; }
+
+  var i: int64 := 0;
+  while (i < 64) { poke8(k + i, 0); i := i + 1; }
+
+  if (keyLen > 64) {
+    lic_sha256(key, keyLen, k);
+  } else {
+    i := 0;
+    while (i < keyLen) { poke8(k + i, peek8(key + i)); i := i + 1; }
+  }
+
+  // Inner hash: HMAC-inner = (key ^ ipad) || msg
+  var iMsgLen: int64 := 64 + msgLen;
+  var iMsg: int64 := mmap(0, iMsgLen, 3, 34, -1, 0);
+  if (iMsg == 0) { munmap(k, 64); return; }
+  i := 0;
+  while (i < 64)    { poke8(iMsg + i,      peek8(k + i) ^ 54); i := i + 1; }  // ipad = 0x36
+  i := 0;
+  while (i < msgLen){ poke8(iMsg + 64 + i, peek8(msg + i));    i := i + 1; }
+
+  var inner: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (inner == 0) { munmap(iMsg, iMsgLen); munmap(k, 64); return; }
+  lic_sha256(iMsg, iMsgLen, inner);
+  munmap(iMsg, iMsgLen);
+
+  // Outer hash: (key ^ opad) || inner
+  var oMsg: int64 := mmap(0, 96, 3, 34, -1, 0);
+  if (oMsg == 0) { munmap(inner, 32); munmap(k, 64); return; }
+  i := 0;
+  while (i < 64) { poke8(oMsg + i,      peek8(k + i) ^ 92); i := i + 1; }  // opad = 0x5C
+  i := 0;
+  while (i < 32) { poke8(oMsg + 64 + i, peek8(inner + i));  i := i + 1; }
+
+  lic_sha256(oMsg, 96, out32);
+  munmap(oMsg, 96);
+  munmap(inner, 32);
+  munmap(k, 64);
+}
