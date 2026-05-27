@@ -88,7 +88,7 @@ Mit `lyxc --check-binary <binary> --license-file=<key>` kann verifiziert werden,
 
 ## Work Packages
 
-### WP-LIC-01 — Datenstrukturen und Lizenz-Struct
+### WP-LIC-01 — Datenstrukturen und Lizenz-Struct ✅
 **Ziel:** `LicenseInfo`-Struct in `lyxc.lyx` + Konstanten für Fehlercodes.
 ```
 LicenseInfo {
@@ -106,7 +106,7 @@ LicenseInfo {
 
 ---
 
-### WP-LIC-02 — Crypto-Modul `src/crypto/lic_hmac.lyx`
+### WP-LIC-02 — Crypto-Modul `src/crypto/lic_hmac.lyx` ✅
 **Ziel:** SHA-256 und HMAC-SHA256 aus `std/net/quic.lyx` extrahieren und als öffentliche Funktionen in einem eigenständigen Modul bereitstellen.
 
 ```lyx
@@ -121,7 +121,7 @@ Keine Anpassung am Algorithmus — nur Sichtbarkeit von `fn` auf `pub fn` und Um
 
 ---
 
-### WP-LIC-03 — Key-Derivation `lic_deriveKey`
+### WP-LIC-03 — Key-Derivation `lic_deriveKey` ✅
 **Ziel:** Aus Name + E-Mail + Master-Secret den Schlüssel ableiten.
 
 ```lyx
@@ -142,7 +142,7 @@ Schritte intern:
 
 ---
 
-### WP-LIC-04 — Crockford-Base32-Encoder
+### WP-LIC-04 — Crockford-Base32-Encoder ✅
 **Ziel:** `lic_base32Encode(input: int64, inLen: int64, out: pchar): int64` — reiner Bit-Shifter über den Crockford-Zeichensatz.
 
 **Abhängigkeiten:** keine  
@@ -150,7 +150,7 @@ Schritte intern:
 
 ---
 
-### WP-LIC-05 — Lizenz-Datei-Parser `lic_parseFile`
+### WP-LIC-05 — Lizenz-Datei-Parser `lic_parseFile` ✅
 **Ziel:** `~/.lyx/license.key` einlesen und in `LicenseInfo` befüllen.
 
 ```lyx
@@ -164,7 +164,7 @@ Einfacher Zeilen-Scanner: für jede Zeile `key=value` splitten, bekannte Keys be
 
 ---
 
-### WP-LIC-06 — CLI-Integration
+### WP-LIC-06 — CLI-Integration ✅
 **Ziel:** Neue CLI-Flags in `CompilerConfig`:
 
 | Flag | Beschreibung |
@@ -184,7 +184,7 @@ In `printHelp()` nur ausgeben wenn `LYXC_LICENSE_REQUIRED` aktiv.
 
 ---
 
-### WP-LIC-07 — Umgebungsvariablen
+### WP-LIC-07 — Umgebungsvariablen ✅
 **Ziel:** Lizenz-Lookup über Env-Variablen via `lyx_getEnvVar` (bereits vorhanden).
 
 | Variable | Entspricht |
@@ -199,7 +199,7 @@ In `printHelp()` nur ausgeben wenn `LYXC_LICENSE_REQUIRED` aktiv.
 
 ---
 
-### WP-LIC-08 — Verifikationslogik in `lyxc.lyx`
+### WP-LIC-08 — Verifikationslogik in `lyxc.lyx` ✅
 **Ziel:** Beim Start (nach `parseCLI`, nach Env-Var-Lesen, vor Compilation):
 
 ```
@@ -222,7 +222,7 @@ Constant-Time-Vergleich (kein Early-Exit → verhindert Timing-Angriffe).
 
 ---
 
-### WP-LIC-09 — Key-Generator `--gen-key`
+### WP-LIC-09 — Key-Generator `lyxc-keygen` ✅
 **Ziel:** Schlüssel für einen Kunden erzeugen.
 
 ```bash
@@ -246,7 +246,7 @@ Nutzt denselben `lic_deriveKey` wie die Verifikation.
 
 ---
 
-### WP-LIC-10 — Binär-Wasserzeichen (ELF)
+### WP-LIC-10 — Binär-Wasserzeichen (ELF) ✅
 **Ziel:** In jede erzeugte ELF-Datei eine `.lyx_lic`-Section einbetten.
 
 In `codegen_x86.lyx` (`cg_writeELF`):
@@ -264,7 +264,7 @@ ELF Section-Header für `.lyx_lic` hinzufügen (Typ `SHT_NOTE = 7`, 16 Bytes, ni
 
 ---
 
-### WP-LIC-11 — `--check-binary`
+### WP-LIC-11 — `--check-binary` ✅
 **Ziel:** Prüfen ob eine Binary von einem bestimmten Lizenzschlüssel erzeugt wurde.
 
 ```bash
@@ -283,7 +283,7 @@ Liest `.lyx_lic`-Section aus dem ELF, reberechnet Werte aus Lizenzschlüssel.
 
 ---
 
-### WP-LIC-12 — Compile-Time-Flag `LYXC_LICENSE_REQUIRED`
+### WP-LIC-12 — Compile-Time-Flag `LYXC_LICENSE_REQUIRED` ✅
 **Ziel:** Makefile-Variable steuert ob Lizenzprüfung aktiv ist.
 
 ```makefile
@@ -304,7 +304,7 @@ Wenn `1`: Vollständige Prüfung, Wasserzeichen immer eingebettet.
 
 ---
 
-### WP-LIC-13 — Master-Secret-Obfuskation
+### WP-LIC-13 — Master-Secret-Obfuskation ✅
 **Ziel:** Das 32-Byte-Master-Secret nicht als zusammenhängendes Literal in der Binary speichern.
 
 Strategie:
@@ -344,7 +344,7 @@ WP-LIC-11  (check-binary)
 
 | # | Frage | Optionen |
 |---|-------|---------|
-| F-1 | Soll `--gen-key` in `lyxc` selbst oder in einem separaten `lyxc-keygen`-Binary liegen? | In lyxc einfacher; separates Binary schützt besser gegen Schlüsselmissbrauch |
+| F-1 | Soll `--gen-key` in `lyxc` selbst oder in einem separaten `lyxc-keygen`-Binary liegen? | **Entschieden:** separates `lyxc-keygen`-Binary (nicht ausgeliefert) — schützt gegen Schlüsselmissbrauch |
 | F-2 | Wasserzeichen auch in Mach-O (macOS) und PE (Windows)? | PE hat Debug-Directories, Mach-O hat `__TEXT,__lyx_lic` LC — empfohlen für v2 |
 | F-3 | Soll ein abgelaufener/gesperrter Schlüssel erkannt werden? | Erfordert Online-Check oder Revocation-List — Scope für v2 |
 | F-4 | Grace-Period bei fehlendem Schlüssel (z. B. 30 Tage Testbetrieb)? | Machbar mit Build-Timestamp im Binary — Scope nach Bedarf |
