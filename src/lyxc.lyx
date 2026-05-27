@@ -45,6 +45,7 @@ import src.lyu_writer;
 import src.lyu_reader;
 import src.crypto.lic_types;
 import src.crypto.lic_parse;
+import src.crypto.lic_derive;
 import src.lic_build_flags;
 
 // ============================================================================
@@ -3471,6 +3472,111 @@ pub fn lyx_getEnvVar(argc: int64, argv: pchar, name: pchar): pchar {
 }
 
 // ============================================================================
+// WP-LIC-08: License Verification
+// ============================================================================
+
+pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
+  var info: LicenseInfo := new LicenseInfo();
+  info.Init();
+  var found: bool := false;
+
+  // (1) --license-file=<path> (also covers LYX_LICENSE_FILE via cfg)
+  if not found && cfg.licenseFile != 0 {
+    found := lic_parseFile(cfg.licenseFile as pchar, info);
+    if not found {
+      EPrintStr("lyxc: Lizenzdatei nicht lesbar: "c);
+      EPrintStr(cfg.licenseFile as pchar);
+      EPrintStr("\n"c);
+      return false;
+    }
+  }
+
+  // (2) --license=KEY + --name=NAME + --email=EMAIL (also env vars LYX_LICENSE_*)
+  if not found && cfg.licenseKey != 0 && cfg.licenseName != 0 && cfg.licenseEmail != 0 {
+    info.key      := cfg.licenseKey   as pchar;
+    info.keyLen   := StrLen(cfg.licenseKey   as pchar);
+    info.name     := cfg.licenseName  as pchar;
+    info.nameLen  := StrLen(cfg.licenseName  as pchar);
+    info.email    := cfg.licenseEmail as pchar;
+    info.emailLen := StrLen(cfg.licenseEmail as pchar);
+    info.errCode  := LIC_OK;
+    found := true;
+  }
+
+  // (3) ~/.lyx/license.key
+  if not found {
+    var home: pchar := lyx_getEnvVar(argc, argv, "HOME"c);
+    if home != 0 as pchar {
+      var homeLen: int64 := StrLen(home);
+      var suffix: pchar := "/.lyx/license.key"c;
+      var sfxLen: int64 := 17;
+      var pathBuf: int64 := mmap(0, homeLen + sfxLen + 1, 3, 34, -1, 0);
+      if pathBuf != 0 {
+        var pi: int64 := 0;
+        while pi < homeLen { poke8(pathBuf + pi, peek8(home as int64 + pi)); pi := pi + 1; }
+        pi := 0;
+        while pi < sfxLen { poke8(pathBuf + homeLen + pi, peek8(suffix as int64 + pi)); pi := pi + 1; }
+        poke8(pathBuf + homeLen + sfxLen, 0);
+        found := lic_parseFile(pathBuf as pchar, info);
+        munmap(pathBuf, homeLen + sfxLen + 1);
+      }
+    }
+  }
+
+  // (4) ./license.key
+  if not found {
+    found := lic_parseFile("./license.key"c, info);
+  }
+
+  // No license found at all
+  if not found {
+    EPrintStr("lyxc: keine Lizenz gefunden.\n"c);
+    EPrintStr("  Erstelle ~/.lyx/license.key:\n"c);
+    EPrintStr("    name=Vorname Nachname\n"c);
+    EPrintStr("    email=user@example.com\n"c);
+    EPrintStr("    key=XXXXX-XXXXX-XXXXX-XXXXX-XXXXX\n"c);
+    return false;
+  }
+
+  // Completeness check
+  if info.nameLen == 0 || info.emailLen == 0 {
+    EPrintStr("lyxc: Lizenzdatei unvollstaendig (Name oder E-Mail fehlt).\n"c);
+    lic_infoFree(info);
+    return false;
+  }
+  if info.keyLen == 0 {
+    EPrintStr("lyxc: Lizenzdatei unvollstaendig (Schluessel fehlt).\n"c);
+    lic_infoFree(info);
+    return false;
+  }
+
+  // Derive expected key from name + email
+  var expected: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if expected == 0 { lic_infoFree(info); return false; }
+  lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+
+  // Constant-time compare — always scan all 29 positions regardless of mismatch
+  var diff: int64 := 0;
+  var ci: int64 := 0;
+  while ci < 29 {
+    var got: int64 := 0;
+    var exp: int64 := peek8(expected + ci);
+    if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
+    diff := diff | (got ^ exp);
+    ci := ci + 1;
+  }
+  munmap(expected, 32);
+  lic_infoFree(info);
+
+  if diff != 0 {
+    EPrintStr("lyxc: ungueltiger Lizenzschluessel.\n"c);
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -3544,6 +3650,13 @@ pub fn main(argc: int64, argv: pchar): int64 {
       return 1;
     }
     return 0;
+  }
+
+  // WP-LIC-08: License verification (only in release builds; --gen-key bypasses)
+  if LYXC_LICENSE_REQUIRED == 1 && not cfg.noLicense && not cfg.genKey {
+    if not lic_loadAndVerify(cfg, argc, argv) {
+      return 1;
+    }
   }
 
   // Get input file
