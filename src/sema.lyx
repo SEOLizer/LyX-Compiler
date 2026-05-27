@@ -144,6 +144,8 @@ con SNK_TYPE_RINGBUF:    int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 con SNK_TYPE_PARALLEL:   int64 := 93;  // WP-BC-18: parallel Array<T> type node
 con SNK_SIMD_NEW:        int64 := 94;  // WP-BC-18: parallel Array<T>(size) expression
 con SNK_FOR_C:           int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
+con SNK_AT_IF:           int64 := 103; // @if conditional compilation: c0=cond, c1=then-block, c2=else-block|-1
+con SNK_AT_DIRECTIVE:    int64 := 104; // @io_check/@overflow_check: iv=kind(0/1), c0=val(0/1)
 
 // WP-16: OOP nodes
 con SNK_CLASS_DECL:   int64 := 69;
@@ -635,6 +637,65 @@ pub type Sema = class {
   }
 
   // ------------------------------------------------------------------
+  // WP-CS-06: @if constant-folding helpers
+  // ------------------------------------------------------------------
+
+  fn _lookupConst(name: pchar, nlen: int64): int64 {
+    var si: int64 := self.Lookup(name, nlen);
+    if (si < 0) { return 0; }
+    if (self.SymKind(si) != SYM_CON) { return 0; }
+    var nodeIdx: int64 := self.SymNodeIdx(si);
+    if (self.IsInjCon(nodeIdx) != 0) { return self.InjConValue(nodeIdx); }
+    if (nodeIdx < 0) { return 0; }
+    var initNi: int64 := self.sn_c1(nodeIdx);
+    if (initNi < 0) { return 0; }
+    return self._evalConstExpr(initNi);
+  }
+
+  fn _evalConstExpr(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == 40) { return self.sn_iVal(ni); }  // NK_LIT_INT
+    if (k == 44) { return self.sn_iVal(ni); }  // NK_LIT_BOOL
+    if (k == SNK_IDENT) {
+      return self._lookupConst(self.sn_sVal(ni), self.sn_sLen(ni));
+    }
+    if (k == SNK_UNOP) {  // TK_NOT = 87
+      var uop: int64 := self.sn_iVal(ni);
+      var cv: int64 := self._evalConstExpr(self.sn_c0(ni));
+      if (uop == 87) { if (cv == 0) { return 1; } else { return 0; } }
+      return 0;
+    }
+    if (k == SNK_BINOP) {
+      var bop: int64 := self.sn_iVal(ni);
+      var lv: int64 := self._evalConstExpr(self.sn_c0(ni));
+      if (bop == 85) { if (lv == 0) { return 0; } return self._evalConstExpr(self.sn_c1(ni)); }  // TK_AND
+      if (bop == 86) { if (lv != 0) { return 1; } return self._evalConstExpr(self.sn_c1(ni)); }  // TK_OR
+      var rv: int64 := self._evalConstExpr(self.sn_c1(ni));
+      if (bop == 79) { if (lv == rv) { return 1; } else { return 0; } }  // TK_EQ2 ==
+      if (bop == 80) { if (lv != rv) { return 1; } else { return 0; } }  // TK_NEQ !=
+      if (bop == 81) { if (lv < rv)  { return 1; } else { return 0; } }  // TK_LT  <
+      if (bop == 82) { if (lv <= rv) { return 1; } else { return 0; } }  // TK_LE  <=
+      if (bop == 83) { if (lv > rv)  { return 1; } else { return 0; } }  // TK_GT  >
+      if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
+      return 0;
+    }
+    self._errorNode("@if: non-constant expression in condition", ni);
+    return 0;
+  }
+
+  fn _pruneAtIf(ni: int64): void {
+    var condVal: int64 := self._evalConstExpr(self.sn_c0(ni));
+    var liveBlock: int64 := -1;
+    if (condVal != 0) { liveBlock := self.sn_c1(ni); }
+    else              { liveBlock := self.sn_c2(ni); }
+    var liveHead: int64 := -1;
+    if (liveBlock >= 0) { liveHead := self.sn_c0(liveBlock); }
+    poke64(self.sn_off(ni),     SNK_BLOCK);  // mutate kind → SNK_BLOCK
+    poke64(self.sn_off(ni) + 8, liveHead);   // c0 = head of live branch declarations
+  }
+
+  // ------------------------------------------------------------------
   // Pass 1: collect top-level declarations
   // ------------------------------------------------------------------
 
@@ -670,6 +731,15 @@ pub type Sema = class {
       self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
     } else if (k == SNK_UTYPE_DECL) {
       self._pushSym(name, nlen, SYM_TYPE, TY_F64, ni);
+    } else if (k == SNK_AT_IF) {
+      self._pruneAtIf(ni);
+      self._p1Decl(ni);  // recurse — ni is now SNK_BLOCK
+    } else if (k == SNK_BLOCK) {  // inlined @if branch
+      var child: int64 := self.sn_c0(ni);
+      while (child >= 0) {
+        self._p1Decl(child);
+        child := self.sn_next(child);
+      }
     }
   }
 
@@ -1133,6 +1203,9 @@ pub type Sema = class {
       }
       // Check that the constraint uses the 'value' keyword
       // (This is a simplified check - full implementation would analyze the constraint tree)
+    } else if (k == SNK_AT_IF) {  // statement-level @if
+      self._pruneAtIf(ni);
+      self._checkStmt(ni);  // recurse — ni is now SNK_BLOCK, handled above
     }
     // NK_BREAK, NK_IMPORT: nothing to check
   }
@@ -1572,6 +1645,12 @@ pub type Sema = class {
       // dim declarations are compile-time only; no body to check
     } else if (k == SNK_UTYPE_DECL) {
       // utype declarations are compile-time only; no body to check
+    } else if (k == SNK_BLOCK) {  // inlined @if branch (mutated by Pass1)
+      var child: int64 := self.sn_c0(ni);
+      while (child >= 0) {
+        self._p2Decl(child);
+        child := self.sn_next(child);
+      }
     }
   }
 
