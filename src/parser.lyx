@@ -99,7 +99,7 @@ pub con NK_ARRAY_LIT:    int64 := 100; // WP-BC-51: [e1, e2, ...] array literal
 pub con NK_TYPE_ARRAY_FIXED: int64 := 101; // WP-BC-51: T[N] fixed-size array type
 pub con NK_FOR_C:        int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
 pub con NK_AT_IF:        int64 := 103; // WP-CS-01: @if/@else bedingte Kompilierung; c0=ConstExpr, c1=then(NK_BLOCK), c2=else(NK_BLOCK)|0
-pub con NK_AT_DIRECTIVE: int64 := 104; // WP-CS-01: @io_check/@overflow_check; iv=kind(0=io_check,1=overflow_check), iv2=value(0=false,1=true)
+pub con NK_AT_DIRECTIVE: int64 := 104; // WP-CS-01: @io_check/@overflow_check; iv=kind(0=io_check,1=overflow_check), c0=value(0=false,1=true)
 pub con NK_REPEAT_UNTIL:   int64 := 77;  // WP-BC-04: repeat { body } until (cond)
 pub con NK_TUPLE_VAR_DECL: int64 := 78;  // WP-BC-05: var a, b := fn()
 pub con NK_MAP_LIT:        int64 := 79;  // WP-BC-06: { key: val, ... }
@@ -1243,6 +1243,17 @@ pub type Parser = class {
       self.Advance();  // consume @
       return self._parseAtIf(0);
     }
+    // WP-CS-04: @io_check / @overflow_check at statement level
+    if (k == TK_AT && self.Peek2() == TK_IDENT) {
+      if (self._tokTextEq(self.cur + 1, "io_check"c) != 0) {
+        self.Advance();  // consume @
+        return self._parseAtDirective(0);
+      }
+      if (self._tokTextEq(self.cur + 1, "overflow_check"c) != 0) {
+        self.Advance();  // consume @
+        return self._parseAtDirective(1);
+      }
+    }
     if (k == TK_IF)     { return self._parseIf(); }
     if (k == TK_WHILE)  { return self._parseWhile(); }
     if (k == TK_FOR)    { return self._parseFor(); }
@@ -2293,10 +2304,18 @@ pub type Parser = class {
       }
       decl := -1;
       annoFlags := 0;
-      // Nested @if
+      // Nested @if / @directive
       if (self.Peek() == TK_AT && self.Peek2() == TK_IF) {
         self.Advance();
         decl := self._parseAtIf(1);
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "io_check"c) != 0) {
+        self.Advance();
+        decl := self._parseAtDirective(0);
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "overflow_check"c) != 0) {
+        self.Advance();
+        decl := self._parseAtDirective(1);
       } else {
         while (self.Check(TK_AT) != 0) {
           self.Advance();
@@ -2407,6 +2426,31 @@ pub type Parser = class {
     return n;
   }
 
+  // WP-CS-04: Parse @io_check(bool) or @overflow_check(bool);
+  // kind=0 → @io_check, kind=1 → @overflow_check.
+  // Caller has consumed '@'; current token is the directive-name ident.
+  fn _parseAtDirective(kind: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();  // consume "io_check" / "overflow_check" ident
+    self.Expect(TK_LPAREN);
+    var val: int64 := 0;
+    if (self.Check(TK_TRUE) != 0) {
+      val := 1;
+      self.Advance();
+    } else if (self.Check(TK_FALSE) != 0) {
+      val := 0;
+      self.Advance();
+    } else {
+      self._err("@io_check/@overflow_check: expected true or false");
+    }
+    self.Expect(TK_RPAREN);
+    self.Match(TK_SEMI);
+    var n: int64 := self._alloc(NK_AT_DIRECTIVE, ti);
+    self._siv(n, kind);   // 0=io_check, 1=overflow_check
+    self._sc0(n, val);    // 0=false, 1=true  (no iv2 slot in node layout)
+    return n;
+  }
+
   // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
@@ -2418,7 +2462,7 @@ pub type Parser = class {
     while (self.Peek() != TK_EOF) {
       if (self.hadError != 0) { return head; }
 
-      // WP-CS-02: @if at top level — must check before annotation loop
+      // WP-CS-02/04: @if and @directive — must check before annotation loop
       if (self.Peek() == TK_AT && self.Peek2() == TK_IF) {
         self.Advance();  // consume @
         var atDecl: int64 := self._parseAtIf(1);
@@ -2427,6 +2471,24 @@ pub type Parser = class {
           else { self._sn(tail, atDecl); }
           tail := atDecl;
           while (self.NNext(tail) != -1) { tail := self.NNext(tail); }
+        }
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "io_check"c) != 0) {
+        self.Advance();  // consume @
+        var dirDecl: int64 := self._parseAtDirective(0);
+        if (dirDecl >= 0) {
+          if (head == -1) { head := dirDecl; }
+          else { self._sn(tail, dirDecl); }
+          tail := dirDecl;
+        }
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "overflow_check"c) != 0) {
+        self.Advance();  // consume @
+        var dirDecl: int64 := self._parseAtDirective(1);
+        if (dirDecl >= 0) {
+          if (head == -1) { head := dirDecl; }
+          else { self._sn(tail, dirDecl); }
+          tail := dirDecl;
         }
       } else {
 
