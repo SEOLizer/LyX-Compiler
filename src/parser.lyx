@@ -2265,6 +2265,134 @@ pub type Parser = class {
   }
 
   // ==================================================================
+  // WP-CS-02: @if conditional compilation helpers
+  // ==================================================================
+
+  // Parse top-level declarations until } or EOF; returns NK_BLOCK.
+  // Caller must have already consumed '{'.
+  fn _parseTopDeclBody(): int64 {
+    var ti: int64 := self.cur;
+    var n: int64 := self._alloc(NK_BLOCK, ti);
+    var head: int64 := -1;
+    var tail: int64 := -1;
+    var decl: int64 := -1;
+    var annoFlags: int64 := 0;
+    var isPub: int64 := 0;
+    var flag: int64 := 0;
+    var depth: int64 := 0;
+    var k: int64 := 0;
+    while (self.Peek() != TK_RBRACE && self.Peek() != TK_EOF) {
+      if (self.hadError != 0) {
+        self._sc0(n, head);
+        return n;
+      }
+      decl := -1;
+      annoFlags := 0;
+      // Nested @if
+      if (self.Peek() == TK_AT && self.Peek2() == TK_IF) {
+        self.Advance();
+        decl := self._parseAtIf(1);
+      } else {
+        while (self.Check(TK_AT) != 0) {
+          self.Advance();
+          flag := 0;
+          if (self.Check(TK_IDENT) != 0) {
+            flag := self._annoNameToFlag(self.cur);
+            annoFlags := annoFlags | flag;
+            self.Advance();
+          }
+          if (self.Check(TK_LPAREN) != 0) {
+            self.Advance();
+            depth := 1;
+            while (depth > 0 && self.Peek() != TK_EOF) {
+              if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+              else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+              self.Advance();
+            }
+          }
+        }
+        isPub := 0;
+        if (self.Match(TK_PUB) != 0) { isPub := 1; }
+        while (self.Check(TK_AT) != 0) {
+          self.Advance();
+          flag := 0;
+          if (self.Check(TK_IDENT) != 0) {
+            flag := self._annoNameToFlag(self.cur);
+            annoFlags := annoFlags | flag;
+            self.Advance();
+          }
+          if (self.Check(TK_LPAREN) != 0) {
+            self.Advance();
+            depth := 1;
+            while (depth > 0 && self.Peek() != TK_EOF) {
+              if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+              else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+              self.Advance();
+            }
+          }
+        }
+        k := self.Peek();
+        if (k == TK_FN) {
+          decl := self.ParseFuncDecl(isPub);
+          if decl != -1 { self._siv(decl, annoFlags); }
+        }
+        else if (k == TK_VAR)    { decl := self.ParseVarDecl(isPub); }
+        else if (k == TK_LET)    { decl := self.ParseLetDecl(isPub); }
+        else if (k == TK_CON)    { decl := self.ParseConDecl(isPub); }
+        else if (k == TK_STRUCT) { decl := self.ParseStructDecl(isPub); }
+        else if (k == TK_ENUM)   { decl := self.ParseEnumDecl(isPub); }
+        else if (k == TK_IMPORT) { decl := self._parseImport(); }
+        else if (k == TK_TYPE)   { decl := self._parseTypeDecl(isPub); }
+        else if (k == TK_EXTERN) { decl := self._parseExternDecl(); }
+        else if (k == TK_DIM)    { decl := self._parseDimDecl(isPub); }
+        else if (k == TK_UTYPE)  { decl := self._parseUtypeDecl(isPub); }
+        else if (k == TK_STATIC) { decl := self.ParseStaticDecl(isPub); }
+        else if (k == TK_UNIT) {
+          self.Advance();
+          while (self.Peek() != TK_SEMI && self.Peek() != TK_EOF) { self.Advance(); }
+          self.Match(TK_SEMI);
+        }
+        else {
+          self._err("unexpected token in @if body");
+          self.Advance();
+        }
+      }
+      if (decl >= 0) {
+        if (head == -1) { head := decl; tail := decl; }
+        else { self._sn(tail, decl); tail := decl; }
+        while (self.NNext(tail) != -1) { tail := self.NNext(tail); }
+      }
+    }
+    self._sc0(n, head);
+    return n;
+  }
+
+  // Parse @if(expr) { ... } [@else { ... }]; caller has consumed '@'.
+  fn _parseAtIf(toplevel: int64): int64 {
+    var ti: int64 := self.cur;
+    self.Expect(TK_IF);
+    self.Expect(TK_LPAREN);
+    var cond: int64 := self.ParseExpr();
+    self.Expect(TK_RPAREN);
+    self.Expect(TK_LBRACE);
+    var thenBody: int64 := self._parseTopDeclBody();
+    self.Expect(TK_RBRACE);
+    var elseBody: int64 := -1;
+    if (self.Peek() == TK_AT && self.Peek2() == TK_ELSE) {
+      self.Advance();  // consume @
+      self.Advance();  // consume else
+      self.Expect(TK_LBRACE);
+      elseBody := self._parseTopDeclBody();
+      self.Expect(TK_RBRACE);
+    }
+    var n: int64 := self._alloc(NK_AT_IF, ti);
+    self._sc0(n, cond);
+    self._sc1(n, thenBody);
+    self._sc2(n, elseBody);
+    return n;
+  }
+
+  // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
 
@@ -2274,6 +2402,18 @@ pub type Parser = class {
 
     while (self.Peek() != TK_EOF) {
       if (self.hadError != 0) { return head; }
+
+      // WP-CS-02: @if at top level — must check before annotation loop
+      if (self.Peek() == TK_AT && self.Peek2() == TK_IF) {
+        self.Advance();  // consume @
+        var atDecl: int64 := self._parseAtIf(1);
+        if (atDecl >= 0) {
+          if (head == -1) { head := atDecl; }
+          else { self._sn(tail, atDecl); }
+          tail := atDecl;
+          while (self.NNext(tail) != -1) { tail := self.NNext(tail); }
+        }
+      } else {
 
       // WP-AND-02 Phase B/B2: capture annotations (was: WP-BC-54 skip).
       // Annotations may appear before OR after the `pub` keyword.
@@ -2381,6 +2521,8 @@ pub type Parser = class {
         tail := decl;
         while (self.NNext(tail) != -1) { tail := self.NNext(tail); }
       }
+      }  // end else (non-@if branch)
+
     }
 
     return head;
@@ -2427,6 +2569,8 @@ pub type Parser = class {
     if (k == NK_MAP_ENTRY)      { return "MAP_ENTRY"; }
     if (k == NK_FOR)         { return "FOR"; }
     if (k == NK_FOR_C)       { return "FOR_C"; }
+    if (k == NK_AT_IF)       { return "AT_IF"; }
+    if (k == NK_AT_DIRECTIVE){ return "AT_DIRECTIVE"; }
     if (k == NK_SWITCH)      { return "SWITCH"; }
     if (k == NK_CASE)        { return "CASE"; }
     if (k == NK_BREAK)       { return "BREAK"; }
