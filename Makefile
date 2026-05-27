@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags
+.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -95,7 +95,14 @@ $(DATA_DST)/%.lyu: data/%.lyx lyxc
 	@echo "  precompile $<"
 	./lyxc --compile-unit $< -o $@
 
+# ── Keygen (nicht für Endkunden — nur intern verwenden) ──────────────────────
+
+# Baut lyxc-keygen mit dem Seed-Binary (kein lyxc nötig).
+# NICHT ins Paket aufnehmen — nur lokal für die Schlüssel-Ausstellung nutzen.
+keygen:
+	$(SEED) src/lyxc_keygen.lyx -I src -o lyxc-keygen
+
 # ── Aufräumen ─────────────────────────────────────────────────────────────────
 
 clean:
-	rm -f lyxc lyxc.new
+	rm -f lyxc lyxc.new lyxc-keygen
