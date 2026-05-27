@@ -7,6 +7,9 @@
 SEED := src/lyxc_bootstrap
 SRC  := src/lyxc.lyx
 
+# WP-LIC-12: 0 = Lizenzprüfung aus (Dev-Default), 1 = Lizenzprüfung an (Release)
+LYXC_LICENSE_REQUIRED ?= 0
+
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
@@ -20,21 +23,25 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin
+.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
+# Build-Flag-Datei schreiben (immer vor der Kompilierung)
+lic_build_flags:
+	@printf 'con LYXC_LICENSE_REQUIRED: int64 := %s;\n' $(LYXC_LICENSE_REQUIRED) > src/lic_build_flags.lyx
+
 # Aus Seed-Binary kompilieren (erster Bootstrap-Schritt)
-build:
+build: lic_build_flags
 	$(SEED) $(SRC) -o lyxc
 
 # Selbstkompilierung: lyxc kompiliert sich selbst (erfordert vorhandenes lyxc)
-bootstrap: lyxc
+bootstrap: lyxc lic_build_flags
 	./lyxc $(SRC) -o lyxc.new
 	mv lyxc.new lyxc
 
 # Singularitätsprüfung: S3 (Seed→Quelle) == S4 (S3→Quelle)
-singularity:
+singularity: lic_build_flags
 	@echo "=== Singularitätsprüfung ==="
 	$(SEED) $(SRC) -o /tmp/lyxc_s3
 	/tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4
