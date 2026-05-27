@@ -88,6 +88,8 @@ con CGN_TYPE_RINGBUF:   int64 := 92; // WP-BC-17: RingBuffer<T> type node
 con CGN_TYPE_PARALLEL:  int64 := 93; // WP-BC-18: parallel Array<T> type node
 con CGN_SIMD_NEW:       int64 := 94; // WP-BC-18: parallel Array<T>(size) expression
 con CGN_FOR_C:          int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
+con CGN_AT_IF:          int64 := 103; // WP-CS-01: @if (nach Sema-Pruning nicht mehr sichtbar; Alias für Vollständigkeit)
+con CGN_AT_DIRECTIVE:   int64 := 104; // WP-CS-08: @io_check/@overflow_check; iv=kind, iv2=value
 con CGN_REPEAT_UNTIL:    int64 := 77; // WP-BC-04: repeat { body } until (cond)
 con CGN_TUPLE_VAR_DECL:  int64 := 78; // WP-BC-05: var a, b := fn()
 con CGN_MAP_LIT:         int64 := 79; // WP-BC-06: { key: val, ... }
@@ -167,6 +169,9 @@ con CG_VMT_PATCH_SZ: int64 := 24; // codeOff(8) + classNamePtr(8) + classNameLen
 // WP-12: Exception handling globals pre-reserved at start of data section
 con CG_EXN_VAL: int64 := 0;   // data[0..7]:  current exception value (_lyx_exn_val)
 con CG_EXN_PTR: int64 := 8;   // data[8..15]: current handler jmp_buf ptr (_lyx_exn_ptr)
+
+// WP-CS-09: I/O result global pre-reserved after exception globals
+con CG_IO_RESULT: int64 := 16; // data[16..23]: _lyx_io_result (last I/O syscall return value)
 
 // ============================================================================
 // Codegen class
@@ -323,6 +328,16 @@ pub type Codegen = class {
 
   // WP-BC-48: --runtime-checks — emit bounds/null/zero checks inline
   runtimeChecks: int64;
+
+  // WP-CS-07: @io_check / @overflow_check runtime flags
+  ioCheckEnabled:       int64;  // 0=off (default), 1=on
+  overflowCheckEnabled: int64;  // 0=off (default), 1=on
+
+  // WP-CS-09: cached data offset of the io_error message string; -1 = not yet emitted
+  ioCheckMsgOff: int64;
+
+  // WP-CS-10: cached data offset of the overflow error message string; -1 = not yet emitted
+  overflowMsgOff: int64;
 
   // Import search paths (mirrors sema's includePath/stdPath)
   // Set by lyxc after CLI parsing / env-var reading
@@ -761,6 +776,12 @@ pub type Codegen = class {
   // resolution inside method bodies where only locals would otherwise work.
   // ------------------------------------------------------------------
 
+  // WP-CS-05: public entry point to pre-seed conTable with compile-time constants
+  pub fn AddBuiltinCon(name: pchar, val: int64): void {
+    var _nlen: int64 := StrLen(name);
+    self.cg_addCon(name, _nlen, val);
+  }
+
   fn cg_addCon(name: pchar, nlen: int64, val: int64) {
     if (self.conCount >= self.conCap) {
       var nc: int64 := self.conCap * 2;
@@ -1188,6 +1209,73 @@ pub type Codegen = class {
     self.cg_addPatch(pp, dataOff, 0, CG_PATCH_STR);
   }
 
+  // WP-CS-09: mov [rip+CG_IO_RESULT], rax  (48 89 05 disp32)
+  fn cg_emitIoResultSave() {
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, CG_IO_RESULT, 0, CG_PATCH_STR);
+  }
+
+  // WP-CS-09: if rax < 0 (syscall error): panic with io error message
+  fn cg_emitIoCheckPanic() {
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+    self.cg_e8(0x79);                                         // jns .ok
+    var pSkip: int64 := self.codeLen;
+    self.cg_e8(0);
+    if (self.ioCheckMsgOff < 0) {
+      self.ioCheckMsgOff := self.dataLen;
+      // "lyxc: I/O error (use @io_check(false) to suppress)\n\0"
+      self.cg_edata(108); self.cg_edata(121); self.cg_edata(120); self.cg_edata(99);   // lyxc
+      self.cg_edata(58);  self.cg_edata(32);                                           // ": "
+      self.cg_edata(73);  self.cg_edata(47);  self.cg_edata(79);  self.cg_edata(32);  // "I/O "
+      self.cg_edata(101); self.cg_edata(114); self.cg_edata(114); self.cg_edata(111); self.cg_edata(114); // "error"
+      self.cg_edata(32);                                                                // " "
+      self.cg_edata(40);                                                                // "("
+      self.cg_edata(117); self.cg_edata(115); self.cg_edata(101);                      // "use"
+      self.cg_edata(32);                                                                // " "
+      self.cg_edata(64);                                                                // "@"
+      self.cg_edata(105); self.cg_edata(111); self.cg_edata(95);                       // "io_"
+      self.cg_edata(99);  self.cg_edata(104); self.cg_edata(101); self.cg_edata(99); self.cg_edata(107); // "check"
+      self.cg_edata(40);  self.cg_edata(102); self.cg_edata(97);  self.cg_edata(108); self.cg_edata(115); self.cg_edata(101); self.cg_edata(41); // "(false)"
+      self.cg_edata(32);  self.cg_edata(116); self.cg_edata(111); self.cg_edata(32);  // " to "
+      self.cg_edata(115); self.cg_edata(117); self.cg_edata(112); self.cg_edata(112); self.cg_edata(114); // "suppr"
+      self.cg_edata(101); self.cg_edata(115); self.cg_edata(115);                      // "ess"
+      self.cg_edata(41);                                                                // ")"
+      self.cg_edata(10);                                                                // "\n"
+      self.cg_edata(0);                                                                 // NUL
+    }
+    self.cg_emitLeaRdiData(self.ioCheckMsgOff);
+    self.cg_emitPanicBody();
+    // .ok:
+    poke8(self.code + pSkip, (self.codeLen - pSkip - 1) & 255);
+  }
+
+  // WP-CS-10: if OF is set (signed overflow): panic with overflow message
+  fn cg_emitOverflowPanic() {
+    self.cg_e8(0x71);                                               // jno .ok
+    var pSkip: int64 := self.codeLen;
+    self.cg_e8(0);
+    if (self.overflowMsgOff < 0) {
+      self.overflowMsgOff := self.dataLen;
+      // "lyxc: integer overflow detected\n\0"
+      self.cg_edata(108); self.cg_edata(121); self.cg_edata(120); self.cg_edata(99);   // lyxc
+      self.cg_edata(58);  self.cg_edata(32);                                           // ": "
+      self.cg_edata(105); self.cg_edata(110); self.cg_edata(116); self.cg_edata(101); // "inte"
+      self.cg_edata(103); self.cg_edata(101); self.cg_edata(114); self.cg_edata(32);  // "ger "
+      self.cg_edata(111); self.cg_edata(118); self.cg_edata(101); self.cg_edata(114); // "over"
+      self.cg_edata(102); self.cg_edata(108); self.cg_edata(111); self.cg_edata(119); // "flow"
+      self.cg_edata(32);                                                                // " "
+      self.cg_edata(100); self.cg_edata(101); self.cg_edata(116); self.cg_edata(101); // "dete"
+      self.cg_edata(99);  self.cg_edata(116); self.cg_edata(101); self.cg_edata(100); // "cted"
+      self.cg_edata(10);  self.cg_edata(0);                                            // "\n\0"
+    }
+    self.cg_emitLeaRdiData(self.overflowMsgOff);
+    self.cg_emitPanicBody();
+    // .ok:
+    poke8(self.code + pSkip, (self.codeLen - pSkip - 1) & 255);
+  }
+
   // WP-12: Emit longjmp code. rax must hold jmp_buf base pointer.
   // Restores rbx, rbp, r12..r15; sets rsp=rax; then jmp [rsp+56] (catch label).
   fn cg_genLongjmp() {
@@ -1528,13 +1616,16 @@ pub type Codegen = class {
     if (op == CGT_PLUS) {
       // add rax, rbx  (48 01 D8)
       self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD8);
+      if (self.overflowCheckEnabled != 0) { self.cg_emitOverflowPanic(); }
     } else if (op == CGT_MINUS) {
-      // sub rbx, rax; mov rax, rbx  (left - right)
+      // sub rbx, rax; mov rax, rbx  (left - right); mov preserves OF
       self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC3);  // sub rbx, rax
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
+      if (self.overflowCheckEnabled != 0) { self.cg_emitOverflowPanic(); }
     } else if (op == CGT_STAR) {
       // imul rax, rbx  (48 0F AF C3)
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xC3);
+      if (self.overflowCheckEnabled != 0) { self.cg_emitOverflowPanic(); }
     } else if (op == CGT_SLASH) {
       // idiv: rax=right(divisor), rbx=left(dividend); want left/right
       // WP-BC-48: --runtime-checks → zero-check divisor before div
@@ -3064,11 +3155,15 @@ pub type Codegen = class {
       self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10, rcx
       self.cg_movRaxImm(9);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "munmap", 6)) {
       // munmap(addr, len): Linux syscall 11
       self.cg_movRaxImm(11);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "free", 4)) {
       // free(ptr): no-op in bootstrap (all heap is mmap'd; leaks are acceptable)
@@ -3209,6 +3304,8 @@ pub type Codegen = class {
       // rdi=path, rsi=flags, rdx=mode
       self.cg_movRaxImm(2);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "read", 4) ||
                self.cg_seq(fname, fnlen, "sys_read", 8)) {
@@ -3216,6 +3313,8 @@ pub type Codegen = class {
       // rdi=fd, rsi=buf, rdx=count
       self.cg_movRaxImm(0);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "write", 5) ||
                self.cg_seq(fname, fnlen, "write_raw", 9) ||
@@ -3224,6 +3323,8 @@ pub type Codegen = class {
       // rdi=fd, rsi=buf, rdx=count
       self.cg_movRaxImm(1);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "close", 5) ||
                self.cg_seq(fname, fnlen, "sys_close", 9)) {
@@ -3231,12 +3332,24 @@ pub type Codegen = class {
       // rdi=fd
       self.cg_movRaxImm(3);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
 
     } else if (self.cg_seq(fname, fnlen, "lseek", 5)) {
       // lseek(fd, offset, whence): int64 -- sys_lseek = 8
       // rdi=fd, rsi=offset, rdx=whence
       self.cg_movRaxImm(8);
       self.cg_e8(0x0F); self.cg_e8(0x05);
+      self.cg_emitIoResultSave();
+      if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
+
+    } else if (self.cg_seq(fname, fnlen, "IOResult", 8)) {
+      // WP-CS-09: IOResult(): int64 — returns last I/O syscall return value
+      // mov rax, [rip + CG_IO_RESULT]  (48 8B 05 disp32)
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+      var iopp: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(iopp, CG_IO_RESULT, 0, CG_PATCH_STR);
 
     } else if (self.cg_seq(fname, fnlen, "sys_socket", 10)) {
       // socket(domain, type, protocol): int64 -- sys_socket = 41
@@ -4688,6 +4801,12 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
+
+    } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07: @io_check / @overflow_check
+      var kind: int64 := self.cg_nival(ni);   // 0=io_check, 1=overflow_check
+      var val:  int64 := self.cg_nc0(ni);     // 0=false, 1=true
+      if (kind == 0) { self.ioCheckEnabled       := val; }
+      if (kind == 1) { self.overflowCheckEnabled := val; }
 
     } else {
       // Other statement kinds: skip
@@ -6293,6 +6412,14 @@ pub type Codegen = class {
         }
       } else if (k == CGN_DIM_DECL || k == CGN_UTYPE_DECL) {
         // WP-BC-16: dim/utype are compile-time-only; no code generated
+      } else if (k == CGN_BLOCK) {
+        // WP-CS-06: inlined @if branch — recurse into children
+        self.cg_genFile(self.cg_nc0(cur));
+      } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07: top-level @io_check / @overflow_check
+        var kind: int64 := self.cg_nival(cur);
+        var val:  int64 := self.cg_nc0(cur);
+        if (kind == 0) { self.ioCheckEnabled       := val; }
+        if (kind == 1) { self.overflowCheckEnabled := val; }
       }
       cur := self.cg_nnext(cur);
     }
@@ -6328,7 +6455,7 @@ pub type Codegen = class {
 
     self.dataCap := 16384;
     self.data    := mmap(0, self.dataCap, 3, 34, -1, 0);
-    self.dataLen := 16;  // WP-12: pre-reserve 16 bytes for exception globals (EXN_VAL@0, EXN_PTR@8)
+    self.dataLen := 24;  // WP-12/CS-09: pre-reserve 24 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16)
 
     self.localCap  := 64;
     self.locals    := mmap(0, self.localCap * CG_LOCAL_SZ, 3, 34, -1, 0);
@@ -6411,6 +6538,14 @@ pub type Codegen = class {
 
     // WP-BC-48: runtime checks (off by default)
     self.runtimeChecks := 0;
+
+    // WP-CS-07: directive flags — io_check off by default (compiler probes files via open())
+    self.ioCheckEnabled       := 0;
+    self.overflowCheckEnabled := 0;
+
+    // WP-CS-09/10: panic messages not yet emitted
+    self.ioCheckMsgOff   := -1;
+    self.overflowMsgOff  := -1;
 
     self.includePath := 0;
     self.stdPath     := 0;

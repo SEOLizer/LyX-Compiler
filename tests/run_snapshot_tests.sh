@@ -7,9 +7,11 @@
 #   ./tests/run_snapshot_tests.sh foo bar  # run only tests matching those names
 #
 # Each test lives in tests/snapshot/ and consists of:
-#   NAME.lyx      — the Lyx source program
-#   NAME.expected — expected stdout (created/updated by --update)
-#   NAME.exit     — expected exit code (optional; defaults to 0)
+#   NAME.lyx           — the Lyx source program
+#   NAME.expected      — expected stdout (runtime) or compiler output (compile_fail)
+#   NAME.exit          — expected exit code (optional; defaults to 0)
+#   NAME.compile_fail  — marker: test expects the compiler to fail (non-zero exit);
+#                        .expected then holds the expected compiler stderr/stdout
 #
 # Exit code: 0 if all tests pass, 1 if any fail.
 
@@ -69,6 +71,33 @@ run_test() {
       SKIP=$((SKIP + 1))
       return
     fi
+  fi
+
+  # compile_fail tests: expect the compiler itself to fail
+  local compile_fail_file="${lyx_file%.lyx}.compile_fail"
+  if [ -f "$compile_fail_file" ]; then
+    local cf_out
+    local cf_exit=0
+    cf_out=$("$LYXC" "$lyx_file" -o "$bin" 2>&1) || cf_exit=$?
+    if [ $UPDATE -eq 1 ]; then
+      printf '%s' "$cf_out" > "$expected_file"
+      echo -e "${GREEN}UPDATE${RESET} $name  (compile_fail)"
+      PASS=$((PASS + 1))
+    elif [ $cf_exit -eq 0 ]; then
+      echo -e "${RED}FAIL ${RESET} $name  (expected compile error, but compiler succeeded)"
+      FAIL=$((FAIL + 1))
+    elif [ ! -f "$expected_file" ]; then
+      echo -e "${YELLOW}MISS ${RESET} $name  (no .expected — run with --update)"
+      FAIL=$((FAIL + 1))
+    elif [ "$cf_out" = "$(cat "$expected_file")" ]; then
+      echo -e "${GREEN}PASS ${RESET} $name"
+      PASS=$((PASS + 1))
+    else
+      echo -e "${RED}FAIL ${RESET} $name  (compile error output mismatch)"
+      diff <(cat "$expected_file") <(echo "$cf_out") | head -10 | sed 's/^/       /'
+      FAIL=$((FAIL + 1))
+    fi
+    return
   fi
 
   # Compile
