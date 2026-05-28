@@ -135,7 +135,8 @@ con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (
 //   _lyx_strcharat:  offset 295 (6 bytes)
 //   _lyx_eprint_str: offset 301 (26 bytes)  — stderr variant
 //   _lyx_eprint_int: offset 327 (104 bytes) — stderr variant
-//   user code:       offset 431
+//   _lyx_f64_to_str: offset 431 (335 bytes) — WP-BI-04
+//   user code:       offset 766
 con CG_H_START:      int64 := 0;
 con CG_H_STRLEN:     int64 := 79;
 con CG_H_PRINTSTR:   int64 := 94;
@@ -144,7 +145,8 @@ con CG_H_STRSUB:     int64 := 224;
 con CG_H_STRCHARAT:  int64 := 295;
 con CG_H_EPRINTSTR:  int64 := 301;
 con CG_H_EPRINTINT:  int64 := 327;
-con CG_H_USER:       int64 := 431;
+con CG_H_F64STR:     int64 := 431;
+con CG_H_USER:       int64 := 766;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -179,6 +181,9 @@ con CG_RAND_STATE: int64 := 24; // data[24..31]: _lyx_rand_state
 // Command-line argument globals — saved in _start before call to main
 con CG_ARGC: int64 := 32; // data[32..39]: _lyx_argc
 con CG_ARGV: int64 := 40; // data[40..47]: _lyx_argv (pointer to argv[0])
+
+// WP-BI-04: FloatToStr static scratch buffer (32 bytes; max output ~28 chars)
+con CG_FLOAT_BUF: int64 := 48; // data[48..79]: _lyx_float_buf
 
 // ============================================================================
 // Codegen class
@@ -3108,12 +3113,12 @@ pub type Codegen = class {
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "EPrintFloat", 11)) {
-      // EPrintFloat(f): stub — print "0.0" to stderr
-      var epfOff: int64 := self.dataLen;
-      self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(0);
-      self.cg_emitLeaRdiData(epfOff);
-      var pp: int64 := self.cg_emitCall();
-      poke32(self.code + pp, CG_H_EPRINTSTR - pp - 4);
+      // EPrintFloat(f: f64): call _lyx_f64_to_str(xmm0) → rax=buf → call _lyx_eprint_str
+      var ppEpf: int64 := self.cg_emitCall();
+      poke32(self.code + ppEpf, CG_H_F64STR - ppEpf - 4);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+      var ppEps: int64 := self.cg_emitCall();
+      poke32(self.code + ppEps, CG_H_EPRINTSTR - ppEps - 4);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "EPrintBool", 10)) {
@@ -4139,19 +4144,18 @@ pub type Codegen = class {
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "PrintFloat", 10)) {
-      // PrintFloat(f): stub — print "0.0\n"
-      var pfOff: int64 := self.dataLen;
-      self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(10); self.cg_edata(0);  // "0.0\n\0"
-      self.cg_emitLeaRdiData(pfOff);
-      var ppPF: int64 := self.cg_emitCall();
-      poke32(self.code + ppPF, CG_H_PRINTSTR - ppPF - 4);
+      // PrintFloat(f: f64): call _lyx_f64_to_str(xmm0) → rax=buf → call _lyx_print_str
+      var ppPf: int64 := self.cg_emitCall();
+      poke32(self.code + ppPf, CG_H_F64STR - ppPf - 4);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+      var ppPs: int64 := self.cg_emitCall();
+      poke32(self.code + ppPs, CG_H_PRINTSTR - ppPs - 4);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "FloatToStr", 10)) {
-      // FloatToStr(f): stub — return pointer to "0.0"
-      var ftsOff: int64 := self.dataLen;
-      self.cg_edata(48); self.cg_edata(46); self.cg_edata(48); self.cg_edata(0);  // "0.0\0"
-      self.cg_emitLeaRaxData(ftsOff);
+      // FloatToStr(f: f64): call _lyx_f64_to_str(xmm0) → rax = buffer pointer
+      var ppFts: int64 := self.cg_emitCall();
+      poke32(self.code + ppFts, CG_H_F64STR - ppFts - 4);
 
     } else if (self.cg_seq(fname, fnlen, "StrEquals", 9)) {
       // StrEquals(a,b): rdi=a, rsi=b → rax=1 if equal, 0 otherwise
@@ -6221,7 +6225,229 @@ pub type Codegen = class {
     // ret                  C3
     self.cg_e8(0xC3);
     // eprint_int is 104 bytes  ✓
-    // Total helpers: 65+15+26+104+71+6+26+104 = 417 = CG_H_USER  ✓
+
+    // ---- _lyx_f64_to_str (335 bytes, starts at offset 431) ---- WP-BI-04
+    // Input:  rdi = f64 value as raw IEEE-754 bits (Lyx bootstrap calling convention)
+    // Output: rax = pointer to CG_FLOAT_BUF (null-terminated string)
+    // Clobbers: rdi, rsi, rdx, rcx, rax, rbx (saved), xmm0, xmm1
+    // Format: [-]<integer>.<6 fraction digits>
+    //
+    // movq xmm0, rdi          66 48 0F 6E C7   (load f64 bits from rdi into xmm0)
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC7);
+    // push rbx                53
+    self.cg_e8(0x53);
+    // sub rsp, 24             48 83 EC 18
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x18);
+    // lea rdi, [rip+CG_FLOAT_BUF]   48 8D 3D disp32
+    self.cg_emitLeaRdiData(CG_FLOAT_BUF);
+    // pxor xmm1, xmm1         66 0F EF C9
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC9);
+    // ucomisd xmm0, xmm1      66 0F 2E C1
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xC1);
+    // jae .pos (+18)          73 12
+    self.cg_e8(0x73); self.cg_e8(0x12);
+    // [negative branch: 18 bytes]
+    // mov byte [rdi], '-'     C6 07 2D
+    self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x2D);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // pxor xmm1, xmm1         66 0F EF C9
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC9);
+    // subsd xmm1, xmm0        F2 0F 5C C8   (xmm1 = 0.0 - xmm0)
+    self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC8);
+    // movsd xmm0, xmm1        F2 0F 10 C1
+    self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0xC1);
+    // [.pos: jae target — 40 bytes from start]
+    // cvttsd2si rsi, xmm0     F2 48 0F 2C F0
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2C); self.cg_e8(0xF0);
+    // cvtsi2sd xmm1, rsi      F2 48 0F 2A CE
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xCE);
+    // subsd xmm0, xmm1        F2 0F 5C C1   (frac = f - intpart)
+    self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC1);
+    // lea rbx, [rsp+23]       48 8D 5C 24 17
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x17);
+    // test rsi, rsi           48 85 F6
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xF6);
+    // jnz .intloop (+8)       75 08
+    self.cg_e8(0x75); self.cg_e8(0x08);
+    // [zero case: write '0']
+    // mov byte [rbx], '0'     C6 03 30
+    self.cg_e8(0xC6); self.cg_e8(0x03); self.cg_e8(0x30);
+    // dec rbx                 48 FF CB
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCB);
+    // jmp .intdone (+35)      EB 23
+    self.cg_e8(0xEB); self.cg_e8(0x23);
+    // [.intloop: — 72 bytes from start]
+    // test rsi, rsi           48 85 F6
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xF6);
+    // jz .intdone (+30)       74 1E
+    self.cg_e8(0x74); self.cg_e8(0x1E);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // mov rcx, 10             48 C7 C1 0A 00 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x0A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rax            48 89 C6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);
+    // add rdx, 48             48 83 C2 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x30);
+    // mov [rbx], dl           88 13
+    self.cg_e8(0x88); self.cg_e8(0x13);
+    // dec rbx                 48 FF CB
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCB);
+    // jmp .intloop (-37)      EB DD
+    self.cg_e8(0xEB); self.cg_e8(0xDD);
+    // [.intdone: — 107 bytes from start]
+    // inc rbx                 48 FF C3
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC3);
+    // lea rcx, [rsp+24]       48 8D 4C 24 18  (one past end of stack buf)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x18);
+    // [.copyint: — 115 bytes from start]
+    // cmp rbx, rcx            48 39 CB
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xCB);
+    // jge .copyidone (+12)    7D 0C
+    self.cg_e8(0x7D); self.cg_e8(0x0C);
+    // mov al, [rbx]           8A 03
+    self.cg_e8(0x8A); self.cg_e8(0x03);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rbx                 48 FF C3
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC3);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // jmp .copyint (-17)      EB EF
+    self.cg_e8(0xEB); self.cg_e8(0xEF);
+    // [.copyidone: — 132 bytes from start]
+    // mov byte [rdi], '.'     C6 07 2E
+    self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x2E);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // movabs rax, 1000000.0   48 B8 00 00 00 00 80 84 2E 41  (0x412E848000000000)
+    self.cg_e8(0x48); self.cg_e8(0xB8);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x80); self.cg_e8(0x84); self.cg_e8(0x2E); self.cg_e8(0x41);
+    // movq xmm1, rax          66 48 0F 6E C8
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC8);
+    // mulsd xmm0, xmm1        F2 0F 59 C1
+    self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC1);
+    // cvttsd2si rsi, xmm0     F2 48 0F 2C F0  (6-digit integer)
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2C); self.cg_e8(0xF0);
+    // --- fraction digit 1: power=100000 ---
+    // mov rcx, 100000         48 C7 C1 A0 86 01 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0xA0); self.cg_e8(0x86); self.cg_e8(0x01); self.cg_e8(0x00);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rdx            48 89 D6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // --- fraction digit 2: power=10000 ---
+    // mov rcx, 10000          48 C7 C1 10 27 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x10); self.cg_e8(0x27); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rdx            48 89 D6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // --- fraction digit 3: power=1000 ---
+    // mov rcx, 1000           48 C7 C1 E8 03 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0xE8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rdx            48 89 D6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // --- fraction digit 4: power=100 ---
+    // mov rcx, 100            48 C7 C1 64 00 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x64); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rdx            48 89 D6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // --- fraction digit 5: power=10 ---
+    // mov rcx, 10             48 C7 C1 0A 00 00 00
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x0A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // xor rdx, rdx            48 31 D2
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    // idiv rcx                48 F7 F9
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    // mov rsi, rdx            48 89 D6
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // --- fraction digit 6: rsi has last digit (no division needed) ---
+    // mov rax, rsi            48 89 F0
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);
+    // add rax, 48             48 83 C0 30
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x30);
+    // mov [rdi], al           88 07
+    self.cg_e8(0x88); self.cg_e8(0x07);
+    // inc rdi                 48 FF C7
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);
+    // null terminate
+    // mov byte [rdi], 0       C6 07 00
+    self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x00);
+    // lea rax, [rip+CG_FLOAT_BUF]   48 8D 05 disp32
+    self.cg_emitLeaRaxData(CG_FLOAT_BUF);
+    // add rsp, 24             48 83 C4 18
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x18);
+    // pop rbx                 5B
+    self.cg_e8(0x5B);
+    // ret                     C3
+    self.cg_e8(0xC3);
+    // _lyx_f64_to_str is 335 bytes  ✓
+    // Total helpers: 79+15+26+104+71+6+26+104+335 = 766 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -6600,7 +6826,7 @@ pub type Codegen = class {
 
     self.dataCap := 16384;
     self.data    := mmap(0, self.dataCap, 3, 34, -1, 0);
-    self.dataLen := 48;  // WP-12/CS-09/RAND/BI-01: pre-reserve 48 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40)
+    self.dataLen := 80;  // WP-12/CS-09/RAND/BI-01/BI-04: pre-reserve 80 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48)
 
     self.localCap  := 64;
     self.locals    := mmap(0, self.localCap * CG_LOCAL_SZ, 3, 34, -1, 0);
