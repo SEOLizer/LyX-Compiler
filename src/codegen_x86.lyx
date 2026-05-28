@@ -5231,56 +5231,51 @@ pub type Codegen = class {
     }
   }
 
+  // WP-EN-05: copy-unrolling with U copies (U = cg_unrollFactor()).
+  // Each copy: eval cond → jz exit, body.
+  // Continue in copy K (K<U-1) → start of copy K+1's condition.
+  // Continue in last copy → loopTop.
+  // All breaks → exit.
   fn cg_genWhile(ni: int64) {
-    var loopTop: int64 := self.codeLen;
-    // Condition
-    self.cg_genExpr(self.cg_nc0(ni));
-    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
-    self.cg_e8(0x0F); self.cg_e8(0x84);  // jz exit (forward)
-    var jzPos: int64 := self.codeLen;
-    self.cg_e32(0);
-    // Save and reset break/continue lists for this loop
+    var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
-    var savedContHead: int64 := self.curContHead;
-    self.curBreakHead := -1;
-    self.curContHead := -1;
-    // Body
-    self.cg_genBlock(self.cg_nc1(ni));
-    // loop_cont: patch all continue jumps to here
-    var ch: int64 := self.curContHead;
-    while (ch != -1) {
-      var b0: int64 := peek8(self.code + ch) as int64;
-      var b1: int64 := peek8(self.code + ch + 1) as int64;
-      var b2: int64 := peek8(self.code + ch + 2) as int64;
-      var b3: int64 := peek8(self.code + ch + 3) as int64;
-      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      poke32(self.code + ch, loopTop - ch - 4);
-      ch := nextLink;
+    var savedContHead:  int64 := self.curContHead;
+    var allBreakHead:   int64 := -1;
+    var jzHead:         int64 := -1;
+    var prevContHead:   int64 := -1;
+    var loopTop:        int64 := self.codeLen;
+
+    var copy: int64 := 0;
+    while (copy < U) {
+      // Patch previous copy's continue list to here (start of this copy's condition)
+      if (prevContHead != -1) { self.cg_patchList(prevContHead, self.codeLen); }
+      // Condition
+      self.cg_genExpr(self.cg_nc0(ni));
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+      self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
+      self.cg_e32(jzHead);
+      jzHead := self.codeLen - 4;
+      // Body
+      self.curBreakHead := -1;
+      self.curContHead  := -1;
+      self.cg_genBlock(self.cg_nc1(ni));
+      // Accumulate break list; save this copy's continue list for later
+      allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
+      prevContHead := self.curContHead;
+      copy := copy + 1;
     }
-    // jmp back to loopTop
+    // Last copy's continue list → loopTop
+    if (prevContHead != -1) { self.cg_patchList(prevContHead, loopTop); }
+    // jmp loopTop
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
-    // Patch jz to here (loop exit)
-    poke32(self.code + jzPos, self.codeLen - jzPos - 4);
-    // Patch all break jumps to here (walk linked list stored in placeholders)
-    var bh: int64 := self.curBreakHead;
-    while (bh != -1) {
-      // Read 4-byte link stored in placeholder (little-endian)
-      var b0: int64 := peek8(self.code + bh) as int64;
-      var b1: int64 := peek8(self.code + bh + 1) as int64;
-      var b2: int64 := peek8(self.code + bh + 2) as int64;
-      var b3: int64 := peek8(self.code + bh + 3) as int64;
-      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
-      // Sign-extend if high bit set (handles -1 sentinel)
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      // Patch this break's jmp to jump to current loop exit
-      poke32(self.code + bh, self.codeLen - bh - 4);
-      bh := nextLink;
-    }
+    // .exit: patch all condition exits and break jumps
+    var exitPos: int64 := self.codeLen;
+    self.cg_patchList(jzHead, exitPos);
+    self.cg_patchList(allBreakHead, exitPos);
     // Restore outer loop's break/continue lists
     self.curBreakHead := savedBreakHead;
-    self.curContHead := savedContHead;
+    self.curContHead  := savedContHead;
   }
 
   // WP-BC-04: repeat { body } until (cond)
@@ -5349,149 +5344,122 @@ pub type Codegen = class {
     self.cg_storeRdx(off2);
   }
 
+  // WP-EN-05: copy-unrolling for range-based for.
+  // Each copy: cond → jz exit, body, step (continue lands before step).
   fn cg_genFor(ni: int64) {
-    // for v = start to/downto limit { body }
     var name: pchar := self.cg_nsval(ni);
     var nlen: int64 := self.cg_nslen(ni);
-    var dir: int64  := self.cg_nival(ni);  // 0=to, 1=downto
-    var off: int64 := self.cg_addLocal(name, nlen);
+    var dir:  int64 := self.cg_nival(ni);  // 0=to, 1=downto
+    var off:  int64 := self.cg_addLocal(name, nlen);
     // Init: v = start
     self.cg_genExpr(self.cg_nc0(ni));
     self.cg_storeRax(off);
-    var loopTop: int64 := self.codeLen;
-    // Save and reset break/continue lists for this loop
+
+    var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
-    var savedContHead: int64 := self.curContHead;
-    self.curBreakHead := -1;
-    self.curContHead := -1;
-    // Cond: v <= limit (to) or v >= limit (downto)
-    self.cg_loadRax(off);
-    self.cg_pushRax();
-    self.cg_genExpr(self.cg_nc1(ni));
-    self.cg_popRbx();  // rbx=v, rax=limit
-    // cmp rbx, rax
-    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
-    self.cg_e8(0x0F);
-    if (dir == 0) { self.cg_e8(0x8F); }  // jg exit (v > limit)
-    else { self.cg_e8(0x8C); }            // jl exit (v < limit downto)
-    var jmpExit: int64 := self.codeLen;
-    self.cg_e32(0);
-    // Body
-    self.cg_genBlock(self.cg_nc2(ni));
-    // contPos: patch all continue jumps here (before step, so increment still runs)
-    var contPos: int64 := self.codeLen;
-    var ch: int64 := self.curContHead;
-    while (ch != -1) {
-      var b0: int64 := peek8(self.code + ch) as int64;
-      var b1: int64 := peek8(self.code + ch + 1) as int64;
-      var b2: int64 := peek8(self.code + ch + 2) as int64;
-      var b3: int64 := peek8(self.code + ch + 3) as int64;
-      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      poke32(self.code + ch, contPos - ch - 4);
-      ch := nextLink;
+    var savedContHead:  int64 := self.curContHead;
+    var allBreakHead:   int64 := -1;
+    var jzHead:         int64 := -1;
+    var loopTop:        int64 := self.codeLen;
+
+    var copy: int64 := 0;
+    while (copy < U) {
+      // Condition: v <= limit (to) or v >= limit (downto)
+      self.cg_loadRax(off);
+      self.cg_pushRax();
+      self.cg_genExpr(self.cg_nc1(ni));
+      self.cg_popRbx();  // rbx=v, rax=limit
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);  // cmp rbx, rax
+      self.cg_e8(0x0F);
+      if (dir == 0) { self.cg_e8(0x8F); }  // jg exit (v > limit)
+      else          { self.cg_e8(0x8C); }  // jl exit (v < limit, downto)
+      self.cg_e32(jzHead);
+      jzHead := self.codeLen - 4;
+      // Body
+      self.curBreakHead := -1;
+      self.curContHead  := -1;
+      self.cg_genBlock(self.cg_nc2(ni));
+      // contPos: continue lands here, before step
+      self.cg_patchList(self.curContHead, self.codeLen);
+      allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
+      // Step: v++ or v--
+      self.cg_loadRax(off);
+      if (dir == 0) { self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0); }  // inc rax
+      else          { self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC8); }  // dec rax
+      self.cg_storeRax(off);
+      copy := copy + 1;
     }
-    // Step: v := v + 1 (or -1 for downto)
-    self.cg_loadRax(off);
-    if (dir == 0) { self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0); }  // inc rax
-    else { self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC8); }            // dec rax
-    self.cg_storeRax(off);
-    // jmp back to condition
+    // jmp loopTop
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
-    // Patch condition exit jump
-    poke32(self.code + jmpExit, self.codeLen - jmpExit - 4);
-    // Patch all break jumps to here (exit position)
-    var bh: int64 := self.curBreakHead;
-    while (bh != -1) {
-      var bb0: int64 := peek8(self.code + bh) as int64;
-      var bb1: int64 := peek8(self.code + bh + 1) as int64;
-      var bb2: int64 := peek8(self.code + bh + 2) as int64;
-      var bb3: int64 := peek8(self.code + bh + 3) as int64;
-      var nextLink: int64 := bb0 + bb1 * 256 + bb2 * 65536 + bb3 * 16777216;
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      poke32(self.code + bh, self.codeLen - bh - 4);
-      bh := nextLink;
-    }
-    // Restore break/continue lists
+    // .exit
+    var exitPos: int64 := self.codeLen;
+    self.cg_patchList(jzHead, exitPos);
+    self.cg_patchList(allBreakHead, exitPos);
     self.curBreakHead := savedBreakHead;
-    self.curContHead := savedContHead;
+    self.curContHead  := savedContHead;
   }
 
   // ------------------------------------------------------------------
   // C-style for loop code generation
   // NK_FOR_C: c0=NK_VAR_DECL(init), c1=cond, c2=step, c3=body
   // ------------------------------------------------------------------
+  // WP-EN-05: copy-unrolling for C-style for (init; cond; step) { body }.
+  // Each copy: cond → jz exit, body, step (continue lands before step).
   fn cg_genForC(ni: int64) {
     // Init: declare and initialize the loop variable
     var initNi: int64 := self.cg_nc0(ni);
     if (initNi >= 0) {
       var name: pchar := self.cg_nsval(initNi);
       var nlen: int64 := self.cg_nslen(initNi);
-      var off: int64 := self.cg_addLocal(name, nlen);
+      var off:  int64 := self.cg_addLocal(name, nlen);
       var initExpr: int64 := self.cg_nc1(initNi);
       if (initExpr >= 0) {
         self.cg_genExpr(initExpr);
         self.cg_storeRax(off);
       }
     }
+
+    var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
-    var savedContHead: int64 := self.curContHead;
-    self.curBreakHead := -1;
-    self.curContHead := -1;
-    // loopTop: condition check
-    var loopTop: int64 := self.codeLen;
-    // Condition (c1): if absent loop is infinite
-    var condNi: int64 := self.cg_nc1(ni);
-    var jmpExit: int64 := -1;
-    if (condNi >= 0) {
-      self.cg_genExpr(condNi);
-      // test rax, rax; jz exit
-      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
-      self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
-      jmpExit := self.codeLen;
-      self.cg_e32(0);
+    var savedContHead:  int64 := self.curContHead;
+    var allBreakHead:   int64 := -1;
+    var jzHead:         int64 := -1;
+    var condNi:         int64 := self.cg_nc1(ni);
+    var stepNi:         int64 := self.cg_nc2(ni);
+    var bodyNi:         int64 := self.cg_nc3(ni);
+    var loopTop:        int64 := self.codeLen;
+
+    var copy: int64 := 0;
+    while (copy < U) {
+      // Condition (optional — absent means infinite loop)
+      if (condNi >= 0) {
+        self.cg_genExpr(condNi);
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+        self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
+        self.cg_e32(jzHead);
+        jzHead := self.codeLen - 4;
+      }
+      // Body
+      self.curBreakHead := -1;
+      self.curContHead  := -1;
+      if (bodyNi >= 0) { self.cg_genBlock(bodyNi); }
+      // contPos: continue lands here, before step
+      self.cg_patchList(self.curContHead, self.codeLen);
+      allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
+      // Step
+      if (stepNi >= 0) { self.cg_genStmt(stepNi); }
+      copy := copy + 1;
     }
-    // Body (c3)
-    var bodyNi: int64 := self.cg_nc3(ni);
-    if (bodyNi >= 0) { self.cg_genBlock(bodyNi); }
-    // contPos: continue lands here (step runs before next condition check)
-    var contPos: int64 := self.codeLen;
-    var ch: int64 := self.curContHead;
-    while (ch != -1) {
-      var b0: int64 := peek8(self.code + ch) as int64;
-      var b1: int64 := peek8(self.code + ch + 1) as int64;
-      var b2: int64 := peek8(self.code + ch + 2) as int64;
-      var b3: int64 := peek8(self.code + ch + 3) as int64;
-      var nextLink: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      poke32(self.code + ch, contPos - ch - 4);
-      ch := nextLink;
-    }
-    // Step (c2)
-    var stepNi: int64 := self.cg_nc2(ni);
-    if (stepNi >= 0) { self.cg_genStmt(stepNi); }
-    // jmp back to loopTop
+    // jmp loopTop
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
-    // Patch condition exit jump
-    if (jmpExit >= 0) {
-      poke32(self.code + jmpExit, self.codeLen - jmpExit - 4);
-    }
-    // Patch all break jumps to here
-    var bh: int64 := self.curBreakHead;
-    while (bh != -1) {
-      var bb0: int64 := peek8(self.code + bh) as int64;
-      var bb1: int64 := peek8(self.code + bh + 1) as int64;
-      var bb2: int64 := peek8(self.code + bh + 2) as int64;
-      var bb3: int64 := peek8(self.code + bh + 3) as int64;
-      var nextLink: int64 := bb0 + bb1 * 256 + bb2 * 65536 + bb3 * 16777216;
-      if (nextLink >= 2147483648) { nextLink := nextLink - 4294967296; }
-      poke32(self.code + bh, self.codeLen - bh - 4);
-      bh := nextLink;
-    }
+    // .exit
+    var exitPos: int64 := self.codeLen;
+    self.cg_patchList(jzHead, exitPos);
+    self.cg_patchList(allBreakHead, exitPos);
     self.curBreakHead := savedBreakHead;
-    self.curContHead := savedContHead;
+    self.curContHead  := savedContHead;
   }
 
   // ------------------------------------------------------------------
@@ -5909,6 +5877,46 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
   // Function declaration
   // ------------------------------------------------------------------
+
+  // WP-EN-05: read the stored 4-byte linked-list link at `pos` in code buffer,
+  // sign-extended to int64 (-1 = end-of-list sentinel).
+  fn cg_readLink(pos: int64): int64 {
+    var b0: int64 := peek8(self.code + pos) as int64;
+    var b1: int64 := peek8(self.code + pos + 1) as int64;
+    var b2: int64 := peek8(self.code + pos + 2) as int64;
+    var b3: int64 := peek8(self.code + pos + 3) as int64;
+    var v: int64 := b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+    if (v >= 2147483648) { v := v - 4294967296; }
+    return v;
+  }
+
+  // WP-EN-05: walk a linked list of rel32 placeholders and patch each to
+  // (target - pos - 4). `head` = first node offset, -1 = empty.
+  fn cg_patchList(head: int64, target: int64) {
+    var p: int64 := head;
+    while (p != -1) {
+      var nxt: int64 := self.cg_readLink(p);
+      poke32(self.code + p, target - p - 4);
+      p := nxt;
+    }
+  }
+
+  // WP-EN-05: append `dst` to the tail of the `src` linked list and return
+  // the new head.  The tail is the node whose stored link equals -1.
+  // If `src` == -1 (empty), returns `dst` unchanged.
+  fn cg_mergeBreakList(dst: int64, src: int64): int64 {
+    if (src == -1) { return dst; }
+    var p: int64 := src;
+    while (true) {
+      var nxt: int64 := self.cg_readLink(p);
+      if (nxt == -1) {
+        poke32(self.code + p, dst);
+        return src;
+      }
+      p := nxt;
+    }
+    return src;
+  }
 
   // WP-EN-04: unroll factor for current function's energy level
   // Level 1→1, 2→2, 3→4, 4→4, 5→8
