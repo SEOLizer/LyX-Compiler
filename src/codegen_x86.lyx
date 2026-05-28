@@ -127,16 +127,17 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:          offset 0   (79 bytes)  — WP-BI-01: +14 for argc/argv save
-//   _lyx_strlen:     offset 79  (15 bytes)
-//   _lyx_print_str:  offset 94  (26 bytes)
-//   _lyx_print_int:  offset 120 (104 bytes)
-//   _lyx_strsub:     offset 224 (71 bytes)
-//   _lyx_strcharat:  offset 295 (6 bytes)
-//   _lyx_eprint_str: offset 301 (26 bytes)  — stderr variant
-//   _lyx_eprint_int: offset 327 (104 bytes) — stderr variant
-//   _lyx_f64_to_str: offset 431 (335 bytes) — WP-BI-04
-//   user code:       offset 766
+//   _start:           offset 0   (79 bytes)  — WP-BI-01: +14 for argc/argv save
+//   _lyx_strlen:      offset 79  (15 bytes)
+//   _lyx_print_str:   offset 94  (26 bytes)
+//   _lyx_print_int:   offset 120 (104 bytes)
+//   _lyx_strsub:      offset 224 (71 bytes)
+//   _lyx_strcharat:   offset 295 (6 bytes)
+//   _lyx_eprint_str:  offset 301 (26 bytes)  — stderr variant
+//   _lyx_eprint_int:  offset 327 (104 bytes) — stderr variant
+//   _lyx_f64_to_str:  offset 431 (335 bytes) — WP-BI-04
+//   _lyx_strsplit:    offset 766 (215 bytes) — WP-BI-05
+//   user code:        offset 981
 con CG_H_START:      int64 := 0;
 con CG_H_STRLEN:     int64 := 79;
 con CG_H_PRINTSTR:   int64 := 94;
@@ -146,7 +147,8 @@ con CG_H_STRCHARAT:  int64 := 295;
 con CG_H_EPRINTSTR:  int64 := 301;
 con CG_H_EPRINTINT:  int64 := 327;
 con CG_H_F64STR:     int64 := 431;
-con CG_H_USER:       int64 := 766;
+con CG_H_STRSPLIT:   int64 := 766;
+con CG_H_USER:       int64 := 981;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -4039,8 +4041,9 @@ pub type Codegen = class {
       poke8(self.code + jmpTD, self.codeLen - jmpTD - 1);
 
     } else if (self.cg_seq(fname, fnlen, "StrSplit", 8)) {
-      // StrSplit(s,delim): stub — return null (complex, not needed for bootstrap self-hosting)
-      self.cg_zeroRax();
+      // StrSplit(s,delim): call _lyx_strsplit → rax = pchar[] DynArray
+      var ppSS: int64 := self.cg_emitCall();
+      poke32(self.code + ppSS, CG_H_STRSPLIT - ppSS - 4);
 
     } else if (self.cg_seq(fname, fnlen, "Random", 6)) {
       // Random(): xorshift64 PRNG; state in CG_RAND_STATE
@@ -6447,7 +6450,110 @@ pub type Codegen = class {
     // ret                     C3
     self.cg_e8(0xC3);
     // _lyx_f64_to_str is 335 bytes  ✓
-    // Total helpers: 79+15+26+104+71+6+26+104+335 = 766 = CG_H_USER  ✓
+
+    // ---- _lyx_strsplit (215 bytes, starts at offset 766) — WP-BI-05 ----
+    // StrSplit(s: pchar, delim: pchar): pchar[]
+    // rdi=s, rsi=delim → rax=DynArray ptr ([+0]=cap,[+8]=len,[+16+i*8]=pchar[i])
+    // Uses callee-saved: rbx=count, r12=s, r13=delim, r14=dlen, r15=arr
+    //
+    // Block 1: Prologue (9 bytes)
+    self.cg_e8(0x53);                                           // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);                        // push r12
+    self.cg_e8(0x41); self.cg_e8(0x55);                        // push r13
+    self.cg_e8(0x41); self.cg_e8(0x56);                        // push r14
+    self.cg_e8(0x41); self.cg_e8(0x57);                        // push r15
+    // Block 2: Save s/delim, strlen(delim)→r14 (17 bytes)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xFC);     // mov r12, rdi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF5);     // mov r13, rsi
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xEF);     // mov rdi, r13
+    var ss1pp: int64 := self.cg_emitCall();
+    poke32(self.code + ss1pp, CG_H_STRLEN - ss1pp - 4);        // call _lyx_strlen
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC6);     // mov r14, rax
+    // Block 3: strlen(s)→rax, allocate (slen+2)*8+16 bytes → r15 (56 bytes)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE7);     // mov rdi, r12
+    var ss2pp: int64 := self.cg_emitCall();
+    poke32(self.code + ss2pp, CG_H_STRLEN - ss2pp - 4);        // call _lyx_strlen
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x02); // add rax, 2
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC0); self.cg_e8(0x08); // imul rax,rax,8
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10); // add rax, 16
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);     // mov rsi, rax
+    self.cg_e8(0x31); self.cg_e8(0xFF);                        // xor edi, edi
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx,3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov r10d,34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); // mov r8,-1
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);     // xor r9d, r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,9
+    self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall → rax=arr
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC7);     // mov r15, rax
+    // Block 4: Init fill (5 bytes)
+    self.cg_e8(0x31); self.cg_e8(0xDB);                        // xor ebx, ebx  (count=0)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE7);     // mov rdi, r12  (pos=s)
+    // Block 5: if dlen==0 skip fill loop → fill_last (5 bytes)
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xF6);     // test r14, r14
+    self.cg_e8(0x74); self.cg_e8(0x51);                        // jz .fill_last (+81)
+    // Block 6: Fill loop — inline StrFind(rdi,r13)→rax then strsub (81 bytes)
+    // .fill_top: (backward jump target)
+    // --- inline StrFind: rdi=haystack, r13=needle → rax=match_pos or -1 ---
+    self.cg_e8(0x31); self.cg_e8(0xC0);                        // xor eax,eax  (i=0)
+    // .find_outer:
+    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x14); self.cg_e8(0x07); // movzx edx,byte[rdi+rax]
+    self.cg_e8(0x85); self.cg_e8(0xD2);                        // test edx,edx
+    self.cg_e8(0x74); self.cg_e8(0x20);                        // jz .find_nf (+32, target=offset42 from find_outer)
+    self.cg_e8(0x31); self.cg_e8(0xC9);                        // xor ecx,ecx  (j=0)
+    // .find_inner:
+    self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x74); self.cg_e8(0x0D); self.cg_e8(0x00); // movzx esi,byte[r13+rcx+0]  (mod=01,disp8=0)
+    self.cg_e8(0x85); self.cg_e8(0xF6);                        // test esi,esi
+    self.cg_e8(0x74); self.cg_e8(0x19);                        // jz .find_found (+25, target=offset47 from find_outer)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x14); self.cg_e8(0x07); // lea rdx,[rdi+rax]
+    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x14); self.cg_e8(0x0A); // movzx edx,byte[rdx+rcx]
+    self.cg_e8(0x3B); self.cg_e8(0xD6);                        // cmp edx,esi
+    self.cg_e8(0x75); self.cg_e8(0x04);                        // jne .find_mismatch (+4)
+    self.cg_e8(0xFF); self.cg_e8(0xC1);                        // inc ecx  (j++)
+    self.cg_e8(0xEB); self.cg_e8(0xE6);                        // jmp .find_inner (-26, target=12 from find_outer)
+    // .find_mismatch:
+    self.cg_e8(0xFF); self.cg_e8(0xC0);                        // inc eax  (i++)
+    self.cg_e8(0xEB); self.cg_e8(0xD8);                        // jmp .find_outer (-40, target=2 from find_outer)
+    // .find_nf:
+    self.cg_e8(0xB8); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); // mov eax,-1
+    // .find_found: (rax = match_pos or 0xFFFFFFFF)
+    // --- post-find: check result, extract segment ---
+    self.cg_e8(0x85); self.cg_e8(0xC0);                        // test eax,eax
+    self.cg_e8(0x78); self.cg_e8(0x1E);                        // js .fill_last (+30)
+    // found: compute next_start = rdi+rax+r14, save; call strsub(rdi,0,rax)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF9);     // mov rcx, rdi
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC1);     // add rcx, rax
+    self.cg_e8(0x4C); self.cg_e8(0x01); self.cg_e8(0xF1);     // add rcx, r14
+    self.cg_e8(0x51);                                           // push rcx (next_start)
+    self.cg_e8(0x31); self.cg_e8(0xF6);                        // xor esi, esi  (start=0)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);     // mov rdx, rax  (len=match_pos)
+    var ss3pp: int64 := self.cg_emitCall();
+    poke32(self.code + ss3pp, CG_H_STRSUB - ss3pp - 4);        // call _lyx_strsub
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0xDF); self.cg_e8(0x10); // mov [r15+16+rbx*8],rax
+    self.cg_e8(0xFF); self.cg_e8(0xC3);                        // inc ebx
+    self.cg_e8(0x5F);                                           // pop rdi (= next_start)
+    self.cg_e8(0xEB); self.cg_e8(0xAF);                        // jmp .fill_top (-81)
+    // Block 7: .fill_last — last segment from rdi to end of s (22 bytes)
+    // strlen doesn't clobber rdi, so rdi still = segment_start after call
+    var ss4pp: int64 := self.cg_emitCall();
+    poke32(self.code + ss4pp, CG_H_STRLEN - ss4pp - 4);        // call _lyx_strlen
+    self.cg_e8(0x31); self.cg_e8(0xF6);                        // xor esi, esi  (start=0)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);     // mov rdx, rax  (len)
+    var ss5pp: int64 := self.cg_emitCall();
+    poke32(self.code + ss5pp, CG_H_STRSUB - ss5pp - 4);        // call _lyx_strsub
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0xDF); self.cg_e8(0x10); // mov [r15+16+rbx*8],rax
+    self.cg_e8(0xFF); self.cg_e8(0xC3);                        // inc ebx
+    // Block 8: Finalize — store cap=len=rbx, return r15 (20 bytes)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0x1F);     // mov [r15], rbx      (cap)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0x5F); self.cg_e8(0x08); // mov [r15+8], rbx (len)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xF8);     // mov rax, r15
+    self.cg_e8(0x41); self.cg_e8(0x5F);                        // pop r15
+    self.cg_e8(0x41); self.cg_e8(0x5E);                        // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5D);                        // pop r13
+    self.cg_e8(0x41); self.cg_e8(0x5C);                        // pop r12
+    self.cg_e8(0x5B);                                           // pop rbx
+    self.cg_e8(0xC3);                                           // ret
+    // _lyx_strsplit is 215 bytes  ✓
+    // Total helpers: 79+15+26+104+71+6+26+104+335+215 = 981 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
