@@ -13,7 +13,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 0.8.6C
+VERSION   := 0.8.7A
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -31,20 +31,23 @@ DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 lic_build_flags:
 	@printf 'con LYXC_LICENSE_REQUIRED: int64 := %s;\n' $(LYXC_LICENSE_REQUIRED) > src/lic_build_flags.lyx
 
+# RAM-Limit für Bootstrap-Läufe: verhindert OOM-Kill der Shell bei Endlosschleifen.
+ULIMIT_VM := ulimit -v $$(( 8 * 1024 * 1024 )) &&
+
 # Aus Seed-Binary kompilieren (erster Bootstrap-Schritt)
 build: lic_build_flags
-	$(SEED) $(SRC) -o lyxc
+	$(ULIMIT_VM) $(SEED) $(SRC) -o lyxc
 
 # Selbstkompilierung: lyxc kompiliert sich selbst (erfordert vorhandenes lyxc)
 bootstrap: lyxc lic_build_flags
-	./lyxc $(SRC) -o lyxc.new
+	$(ULIMIT_VM) ./lyxc $(SRC) -o lyxc.new
 	mv lyxc.new lyxc
 
 # Singularitätsprüfung: S3 (Seed→Quelle) == S4 (S3→Quelle)
 singularity: lic_build_flags
 	@echo "=== Singularitätsprüfung ==="
-	$(SEED) $(SRC) -o /tmp/lyxc_s3
-	/tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4
+	$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3
+	$(ULIMIT_VM) /tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4
 	@sha256sum /tmp/lyxc_s3 /tmp/lyxc_s4
 	@diff /tmp/lyxc_s3 /tmp/lyxc_s4 \
 		&& echo "SINGULAR: S3 == S4" \
@@ -100,7 +103,7 @@ $(DATA_DST)/%.lyu: data/%.lyx lyxc
 # Baut lyxc-keygen mit dem Seed-Binary (kein lyxc nötig).
 # NICHT ins Paket aufnehmen — nur lokal für die Schlüssel-Ausstellung nutzen.
 keygen:
-	$(SEED) src/lyxc_keygen.lyx -I src -o lyxc-keygen
+	$(ULIMIT_VM) $(SEED) src/lyxc_keygen.lyx -I src -o lyxc-keygen
 
 # ── Aufräumen ─────────────────────────────────────────────────────────────────
 
