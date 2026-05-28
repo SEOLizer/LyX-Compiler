@@ -115,6 +115,7 @@ begin
 
   // === energy ===
   AddTest('tests/lyx/energy/test_energy_simple.lyx', 0, 'energy: simple tracking');
+  AddTest('tests/lyx/energy/test_energy_unroll.lyx', 0, 'energy: loop unrolling correctness (WP-EN-07)');
 
   // === lint ===
   AddTest('tests/lyx/lint/naming.lyx', 0, 'lint: naming convention');
