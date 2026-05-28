@@ -127,24 +127,24 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:          offset 0   (65 bytes)
-//   _lyx_strlen:     offset 65  (15 bytes)
-//   _lyx_print_str:  offset 80  (26 bytes)
-//   _lyx_print_int:  offset 106 (104 bytes)
-//   _lyx_strsub:     offset 210 (71 bytes)
-//   _lyx_strcharat:  offset 281 (6 bytes)
-//   _lyx_eprint_str: offset 287 (26 bytes)  — stderr variant
-//   _lyx_eprint_int: offset 313 (104 bytes) — stderr variant
-//   user code:       offset 417
+//   _start:          offset 0   (79 bytes)  — WP-BI-01: +14 for argc/argv save
+//   _lyx_strlen:     offset 79  (15 bytes)
+//   _lyx_print_str:  offset 94  (26 bytes)
+//   _lyx_print_int:  offset 120 (104 bytes)
+//   _lyx_strsub:     offset 224 (71 bytes)
+//   _lyx_strcharat:  offset 295 (6 bytes)
+//   _lyx_eprint_str: offset 301 (26 bytes)  — stderr variant
+//   _lyx_eprint_int: offset 327 (104 bytes) — stderr variant
+//   user code:       offset 431
 con CG_H_START:      int64 := 0;
-con CG_H_STRLEN:     int64 := 65;
-con CG_H_PRINTSTR:   int64 := 80;
-con CG_H_PRINTINT:   int64 := 106;
-con CG_H_STRSUB:     int64 := 210;
-con CG_H_STRCHARAT:  int64 := 281;
-con CG_H_EPRINTSTR:  int64 := 287;
-con CG_H_EPRINTINT:  int64 := 313;
-con CG_H_USER:       int64 := 417;
+con CG_H_STRLEN:     int64 := 79;
+con CG_H_PRINTSTR:   int64 := 94;
+con CG_H_PRINTINT:   int64 := 120;
+con CG_H_STRSUB:     int64 := 224;
+con CG_H_STRCHARAT:  int64 := 295;
+con CG_H_EPRINTSTR:  int64 := 301;
+con CG_H_EPRINTINT:  int64 := 327;
+con CG_H_USER:       int64 := 431;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -175,6 +175,10 @@ con CG_IO_RESULT: int64 := 16; // data[16..23]: _lyx_io_result (last I/O syscall
 
 // Random PRNG state — xorshift64 seed
 con CG_RAND_STATE: int64 := 24; // data[24..31]: _lyx_rand_state
+
+// Command-line argument globals — saved in _start before call to main
+con CG_ARGC: int64 := 32; // data[32..39]: _lyx_argc
+con CG_ARGV: int64 := 40; // data[40..47]: _lyx_argv (pointer to argv[0])
 
 // ============================================================================
 // Codegen class
@@ -4009,12 +4013,12 @@ pub type Codegen = class {
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "GetArgC", 7)) {
-      // GetArgC(): stub — return 0 (argv not saved at startup yet)
-      self.cg_zeroRax();
+      // GetArgC(): return argc saved by _start
+      self.cg_loadRaxGlobal(CG_ARGC);
 
     } else if (self.cg_seq(fname, fnlen, "GetArgV", 7)) {
-      // GetArgV(): stub — return 0
-      self.cg_zeroRax();
+      // GetArgV(): return argv pointer saved by _start
+      self.cg_loadRaxGlobal(CG_ARGV);
 
     } else if (self.cg_seq(fname, fnlen, "ArgvGetStr", 10)) {
       // ArgvGetStr(argv,i): same as ArgvGet
@@ -4022,8 +4026,10 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);                      // mov rax, [rax]
 
     } else if (self.cg_seq(fname, fnlen, "GetArg", 6)) {
-      // GetArg(i): stub — return null (argv not saved at startup)
-      self.cg_zeroRax();
+      // GetArg(i): return argv[i] using argv saved by _start; rdi = i
+      self.cg_loadRaxGlobal(CG_ARGV);                                              // mov rax, [rip+CG_ARGV]
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x04); self.cg_e8(0xF8);    // lea rax, [rax+rdi*8]
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);                       // mov rax, [rax]
 
     } else if (self.cg_seq(fname, fnlen, "PrintChar", 9)) {
       // PrintChar(c): write char c (in rdi) as single byte to stdout
@@ -5828,6 +5834,17 @@ pub type Codegen = class {
     self.cg_e8(0x5F);
     // 48 89 E6         mov rsi, rsp     -- rsi = &argv[0] (argv pointer)
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);
+    // WP-BI-01: save argc and argv to globals so GetArgC/GetArgV/GetArg can read them
+    // 48 89 3D xx xx xx xx   mov [rip+CG_ARGC], rdi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x3D);
+    var ppArgC: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(ppArgC, CG_ARGC, 0, CG_PATCH_STR);
+    // 48 89 35 xx xx xx xx   mov [rip+CG_ARGV], rsi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x35);
+    var ppArgV: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(ppArgV, CG_ARGV, 0, CG_PATCH_STR);
     // E8 xx xx xx xx   call main        (patched after all functions)
     self.cg_e8(0xE8);
     var pp: int64 := self.codeLen;
@@ -5840,9 +5857,9 @@ pub type Codegen = class {
     self.cg_e8(0x3C); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
     // 0F 05            syscall
     self.cg_e8(0x0F); self.cg_e8(0x05);
-    // _start is now 65 bytes  ✓
+    // _start is now 79 bytes  ✓  (WP-BI-01: +14 for argc/argv save)
 
-    // ---- _lyx_strlen (15 bytes, starts at offset 65) ----
+    // ---- _lyx_strlen (15 bytes, starts at offset 79) ----
     // xor rax, rax
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
     // cmp byte [rdi+rax], 0
@@ -5857,7 +5874,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // strlen is now 15 bytes  ✓
 
-    // ---- _lyx_print_str (26 bytes, starts at offset 80) ----
+    // ---- _lyx_print_str (26 bytes, starts at offset 94) ----
     // push rdi
     self.cg_e8(0x57);
     // call _lyx_strlen  (rel32 = 21 - 42 = -21; relative offset unchanged after +4 shift)
@@ -5878,7 +5895,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // print_str is now 26 bytes  ✓
 
-    // ---- _lyx_print_int (104 bytes, starts at offset 106) ----
+    // ---- _lyx_print_int (104 bytes, starts at offset 120) ----
     // sub rsp, 24          48 83 EC 18
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x18);
     // lea rsi, [rsp+23]    48 8D 74 24 17
@@ -5948,7 +5965,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // print_int is 104 bytes  ✓
 
-    // ---- _lyx_strsub (71 bytes, starts at offset 210) ----
+    // ---- _lyx_strsub (71 bytes, starts at offset 224) ----
     // StrSub(s: pchar, start: int64, len: int64): pchar
     // rdi=s, rsi=start, rdx=len
     // mmap(0, len+17, 3, 34, -1, 0) → rax = new buffer
@@ -6006,7 +6023,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // strsub is 71 bytes  ✓
 
-    // ---- _lyx_strcharat (6 bytes, starts at offset 281) ----
+    // ---- _lyx_strcharat (6 bytes, starts at offset 295) ----
     // StrCharAt(s: pchar, i: int64): int64
     // rdi=s, rsi=i, return rax = byte at s[i] zero-extended
     // movzx rax, byte [rdi+rsi]
@@ -6015,7 +6032,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // strcharat is 6 bytes  ✓
 
-    // ---- _lyx_eprint_str (26 bytes, starts at offset 287) ---- stderr variant
+    // ---- _lyx_eprint_str (26 bytes, starts at offset 301) ---- stderr variant
     // push rdi
     self.cg_e8(0x57);
     // call _lyx_strlen  (rel32 = 65 - (287+1+4+1) = 65 - 293 = -228)
@@ -6036,7 +6053,7 @@ pub type Codegen = class {
     self.cg_e8(0xC3);
     // eprint_str is 26 bytes  ✓
 
-    // ---- _lyx_eprint_int (104 bytes, starts at offset 313) ---- stderr variant
+    // ---- _lyx_eprint_int (104 bytes, starts at offset 327) ---- stderr variant
     // Identical to _lyx_print_int but writes to fd=2 instead of fd=1.
     // sub rsp, 24          48 83 EC 18
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x18);
@@ -6485,7 +6502,7 @@ pub type Codegen = class {
 
     self.dataCap := 16384;
     self.data    := mmap(0, self.dataCap, 3, 34, -1, 0);
-    self.dataLen := 32;  // WP-12/CS-09/RAND: pre-reserve 32 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24)
+    self.dataLen := 48;  // WP-12/CS-09/RAND/BI-01: pre-reserve 48 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40)
 
     self.localCap  := 64;
     self.locals    := mmap(0, self.localCap * CG_LOCAL_SZ, 3, 34, -1, 0);
