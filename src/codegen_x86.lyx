@@ -127,17 +127,21 @@ con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
 con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
-//   _start:           offset 0   (79 bytes)  — WP-BI-01: +14 for argc/argv save
-//   _lyx_strlen:      offset 79  (15 bytes)
-//   _lyx_print_str:   offset 94  (26 bytes)
-//   _lyx_print_int:   offset 120 (104 bytes)
-//   _lyx_strsub:      offset 224 (71 bytes)
-//   _lyx_strcharat:   offset 295 (6 bytes)
-//   _lyx_eprint_str:  offset 301 (26 bytes)  — stderr variant
-//   _lyx_eprint_int:  offset 327 (104 bytes) — stderr variant
-//   _lyx_f64_to_str:  offset 431 (335 bytes) — WP-BI-04
-//   _lyx_strsplit:    offset 766 (215 bytes) — WP-BI-05
-//   user code:        offset 981
+//   _start:           offset 0    (79 bytes)  — WP-BI-01: +14 for argc/argv save
+//   _lyx_strlen:      offset 79   (15 bytes)
+//   _lyx_print_str:   offset 94   (26 bytes)
+//   _lyx_print_int:   offset 120  (104 bytes)
+//   _lyx_strsub:      offset 224  (71 bytes)
+//   _lyx_strcharat:   offset 295  (6 bytes)
+//   _lyx_eprint_str:  offset 301  (26 bytes)  — stderr variant
+//   _lyx_eprint_int:  offset 327  (104 bytes) — stderr variant
+//   _lyx_f64_to_str:  offset 431  (335 bytes) — WP-BI-04
+//   _lyx_strsplit:    offset 766  (215 bytes) — WP-BI-05
+//   _lyx_map_new:     offset 981  (47 bytes)  — WP-BI-06
+//   _lyx_map_set:     offset 1028 (93 bytes)  — WP-BI-06
+//   _lyx_map_get:     offset 1121 (72 bytes)  — WP-BI-06
+//   _lyx_map_has:     offset 1193 (73 bytes)  — WP-BI-06
+//   user code:        offset 1266
 con CG_H_START:      int64 := 0;
 con CG_H_STRLEN:     int64 := 79;
 con CG_H_PRINTSTR:   int64 := 94;
@@ -148,7 +152,11 @@ con CG_H_EPRINTSTR:  int64 := 301;
 con CG_H_EPRINTINT:  int64 := 327;
 con CG_H_F64STR:     int64 := 431;
 con CG_H_STRSPLIT:   int64 := 766;
-con CG_H_USER:       int64 := 981;
+con CG_H_MAP_NEW:    int64 := 981;
+con CG_H_MAP_SET:    int64 := 1028;
+con CG_H_MAP_GET:    int64 := 1121;
+con CG_H_MAP_HAS:    int64 := 1193;
+con CG_H_USER:       int64 := 1266;
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -2797,16 +2805,67 @@ pub type Codegen = class {
       self.cg_loadRax(closureOff);
 
     } else if (k == CGN_MAP_LIT) {
-      // WP-BC-06: { key: val, ... } — stub returns null (no runtime map impl)
-      self.cg_zeroRax();
+      // WP-BI-06: { key: val, ... } — allocate hash map, insert all entries
+      // Count entries to compute initial capacity (next power of 2 >= n*2, min 8)
+      var cnt: int64 := 0;
+      var tmpE: int64 := self.cg_nc0(ni);
+      while (tmpE != -1) { cnt := cnt + 1; tmpE := self.cg_nnext(tmpE); }
+      var cap: int64 := 8;
+      while (cap < cnt * 2) { cap := cap * 2; }
+      // Call _lyx_map_new(cap) → rax = map ptr
+      self.cg_e8(0xBF); self.cg_e32(cap);                           // mov edi, cap
+      var ppMN: int64 := self.cg_emitCall();
+      poke32(self.code + ppMN, CG_H_MAP_NEW - ppMN - 4);
+      self.cg_e8(0x50);                                              // push rax (map ptr)
+      // Insert each entry: key→rsi, val→rdx, map→rdi, call _lyx_map_set
+      var entry: int64 := self.cg_nc0(ni);
+      while (entry != -1) {
+        self.cg_genExpr(self.cg_nc0(entry));                         // key → rax
+        self.cg_e8(0x50);                                            // push rax (save key)
+        self.cg_genExpr(self.cg_nc1(entry));                         // val → rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);      // mov rdx, rax
+        self.cg_e8(0x5E);                                            // pop rsi (key)
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24); // mov rdi,[rsp]
+        var ppMS: int64 := self.cg_emitCall();
+        poke32(self.code + ppMS, CG_H_MAP_SET - ppMS - 4);
+        entry := self.cg_nnext(entry);
+      }
+      self.cg_e8(0x58);                                              // pop rax (return map ptr)
 
     } else if (k == CGN_SET_LIT) {
-      // WP-BC-06: { val, ... } — stub returns null (no runtime set impl)
-      self.cg_zeroRax();
+      // WP-BI-06: { val, ... } — allocate hash map used as set (value always 1)
+      var cnt: int64 := 0;
+      var tmpEl: int64 := self.cg_nc0(ni);
+      while (tmpEl != -1) { cnt := cnt + 1; tmpEl := self.cg_nnext(tmpEl); }
+      var cap: int64 := 8;
+      while (cap < cnt * 2) { cap := cap * 2; }
+      // Call _lyx_map_new(cap) → rax = map ptr
+      self.cg_e8(0xBF); self.cg_e32(cap);                           // mov edi, cap
+      var ppSN: int64 := self.cg_emitCall();
+      poke32(self.code + ppSN, CG_H_MAP_NEW - ppSN - 4);
+      self.cg_e8(0x50);                                              // push rax (map ptr)
+      // Insert each element: elem→rsi, value=1→rdx, map→rdi, call _lyx_map_set
+      var el: int64 := self.cg_nc0(ni);
+      while (el != -1) {
+        self.cg_genExpr(el);                                         // elem → rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);      // mov rsi, rax
+        self.cg_e8(0xBA); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx, 1
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24); // mov rdi,[rsp]
+        var ppSS: int64 := self.cg_emitCall();
+        poke32(self.code + ppSS, CG_H_MAP_SET - ppSS - 4);
+        el := self.cg_nnext(el);
+      }
+      self.cg_e8(0x58);                                              // pop rax (return map ptr)
 
     } else if (k == CGN_IN_EXPR) {
-      // WP-BC-06: lhs in rhs — stub returns 0 (false)
-      self.cg_zeroRax();
+      // WP-BI-06: lhs in rhs — call _lyx_map_has(map=rhs, key=lhs) → 1 or 0
+      self.cg_genExpr(self.cg_nc1(ni));                              // rhs (collection) → rax
+      self.cg_e8(0x50);                                              // push rax (map ptr)
+      self.cg_genExpr(self.cg_nc0(ni));                              // lhs (element) → rax
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);        // mov rsi, rax (key)
+      self.cg_e8(0x5F);                                              // pop rdi (map ptr)
+      var ppMH: int64 := self.cg_emitCall();
+      poke32(self.code + ppMH, CG_H_MAP_HAS - ppMH - 4);
 
     } else if (k == 100) {
       // WP-BC-51: NK_ARRAY_LIT — [e1, e2, ...] stack-allocated array with {cap,len} header
@@ -6553,7 +6612,160 @@ pub type Codegen = class {
     self.cg_e8(0x5B);                                           // pop rbx
     self.cg_e8(0xC3);                                           // ret
     // _lyx_strsplit is 215 bytes  ✓
-    // Total helpers: 79+15+26+104+71+6+26+104+335+215 = 981 = CG_H_USER  ✓
+
+    // ---- _lyx_map_new (47 bytes, starts at offset 981) — WP-BI-06 ----
+    // _lyx_map_new(rdi=cap) → rax=ptr
+    // Layout: [ptr+0]=cap, [ptr+8]=len=0, [ptr+16]=seed=0
+    // Slots at [ptr+24..], each 24 bytes: [+0]=key(0=empty,-1=del), [+8]=val, [+16]=hash
+    // Allocates (cap+1)*24 bytes via mmap(anon); mmap zeroes memory so all slots start empty.
+    // Block 1: save rbx, move cap to rbx (4 bytes)
+    self.cg_e8(0x53);                                                // push rbx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx, rdi
+    // Block 2: mmap(0, (cap+1)*24, PROT_R|W, MAP_PRIV|ANON, -1, 0) (38 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x73); self.cg_e8(0x01); // lea rsi,[rbx+1]
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xF6); self.cg_e8(0x18); // imul rsi,rsi,24
+    self.cg_e8(0x31); self.cg_e8(0xFF);                             // xor edi,edi (addr=0)
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx,3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov r10d,34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); // mov r8,-1
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);          // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,9 (SYS_mmap)
+    self.cg_e8(0x0F); self.cg_e8(0x05);                             // syscall → rax=ptr
+    // Block 3: store cap, restore rbx, return (5 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x18);          // mov [rax],rbx (cap)
+    self.cg_e8(0x5B);                                                // pop rbx
+    self.cg_e8(0xC3);                                                // ret
+    // _lyx_map_new is 47 bytes ✓
+
+    // ---- _lyx_map_set (93 bytes, starts at offset 1028) — WP-BI-06 ----
+    // _lyx_map_set(rdi=map, rsi=key, rdx=value) — insert or update key→value
+    // Open addressing: idx = key & (cap-1); probe until empty(0) or matching key
+    // rbx=map, r12=key, r13=value, r14=cap-1(mask)
+    // Block 1: prologue (7 bytes)
+    self.cg_e8(0x53);                                                // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
+    self.cg_e8(0x41); self.cg_e8(0x55);                             // push r13
+    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
+    // Block 2: setup — save args, load cap-1 mask (21 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD5);          // mov r13,rdx
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]  (cap)
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14  (cap→mask)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12  (key)
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14  (initial idx)
+    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 28
+    // slot_ptr = map+24+idx*24; check slot_key for empty or match
+    // REX note: r10 in reg field (REX.R=1); rcx/rbx in rm field (non-extended, REX.B=0) → REX=4C
+    //           r10 in rm field (extended, REX.B=1) → REX=4D; r12 in rm field (REX.B=1) → REX=4D
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10 in rm)
+    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .do_insert (+13)
+    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12 in rm)
+    self.cg_e8(0x74); self.cg_e8(0x13);                             // je .do_update (+19)
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
+    // Block 4: .do_insert — increment len, fall through to update (11 bytes)
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x53); self.cg_e8(0x08); // mov r10,[rbx+8]  REX.B=0 (rbx)
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC2);          // inc r10
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x53); self.cg_e8(0x08); // mov [rbx+8],r10  REX.B=0 (rbx)
+    // Block 5: .do_update — store key, value, hash=key (11 bytes)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x21);          // mov [rcx],r12    REX.B=0 (rcx)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08); // mov [rcx+8],r13  REX.B=0 (rcx)
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x61); self.cg_e8(0x10); // mov [rcx+16],r12 REX.B=0 (rcx)
+    // Block 6: epilogue (8 bytes)
+    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5D);                             // pop r13
+    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
+    self.cg_e8(0x5B);                                                // pop rbx
+    self.cg_e8(0xC3);                                                // ret
+    // _lyx_map_set is 93 bytes ✓
+
+    // ---- _lyx_map_get (72 bytes, starts at offset 1121) — WP-BI-06 ----
+    // _lyx_map_get(rdi=map, rsi=key) → rax=value (0 if not found)
+    // rbx=map, r12=key, r14=cap-1(mask)
+    // Block 1: prologue (5 bytes)
+    self.cg_e8(0x53);                                                // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
+    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
+    // Block 2: setup (18 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 23
+    // REX note: r10 in reg (REX.R=1); rcx/rbx non-extended (REX.B=0) → REX=4C
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10)
+    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .not_found (+13)
+    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12)
+    self.cg_e8(0x74); self.cg_e8(0x0C);                             // je .found (+12)
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
+    // Block 4: .not_found → return 0 (4 bytes)
+    self.cg_e8(0x31); self.cg_e8(0xC0);                             // xor eax,eax
+    self.cg_e8(0xEB); self.cg_e8(0x04);                             // jmp .done (+4)
+    // Block 5: .found → return value (4 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x08); // mov rax,[rcx+8]
+    // Block 6: .done / epilogue (6 bytes)
+    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
+    self.cg_e8(0x5B);                                                // pop rbx
+    self.cg_e8(0xC3);                                                // ret
+    // _lyx_map_get is 72 bytes ✓
+
+    // ---- _lyx_map_has (73 bytes, starts at offset 1193) — WP-BI-06 ----
+    // _lyx_map_has(rdi=map, rsi=key) → rax=1 if found, 0 otherwise
+    // rbx=map, r12=key, r14=cap-1(mask)
+    // Block 1: prologue (5 bytes)
+    self.cg_e8(0x53);                                                // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
+    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
+    // Block 2: setup (18 bytes)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 23
+    // REX note: r10 in reg (REX.R=1); rcx non-extended (REX.B=0) → REX=4C
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10)
+    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .not_found (+13)
+    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12)
+    self.cg_e8(0x74); self.cg_e8(0x0C);                             // je .found (+12)
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
+    // Block 4: .not_found → return 0 (4 bytes)
+    self.cg_e8(0x31); self.cg_e8(0xC0);                             // xor eax,eax
+    self.cg_e8(0xEB); self.cg_e8(0x05);                             // jmp .done (+5)
+    // Block 5: .found → return 1 (5 bytes)
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,1
+    // Block 6: .done / epilogue (6 bytes)
+    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
+    self.cg_e8(0x5B);                                                // pop rbx
+    self.cg_e8(0xC3);                                                // ret
+    // _lyx_map_has is 73 bytes ✓
+    // Total helpers: 79+15+26+104+71+6+26+104+335+215+47+93+72+73 = 1266 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
