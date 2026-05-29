@@ -54,7 +54,7 @@ PdfSetPageRotation(doc, pageIdx, degrees)   // degrees: 0, 90, 180, 270
 
 ---
 
-### WP-PDF-23: Form XObjects ⬜
+### WP-PDF-23: Form XObjects ✅
 
 **Ziel:** Wiederverwendbare Grafikblöcke (Logo, Kopfzeile) einmal definieren
 und auf mehreren Seiten platzieren.
