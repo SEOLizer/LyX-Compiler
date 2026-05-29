@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.8A
+Lyx Compiler v0.8.8B
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -3390,6 +3390,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.4.0** | std/math: Fixed-Point math (Sqrt64, Clamp64, Lerp64, Map64, Sin64, Cos64, Hypot64) |
 | **v0.4.1** | std/geo: GeoPoint type, DistanceM, BoundingBox, DMS parsing, Navigation |
 | **v0.8.8A** | ✅ **`defer`** (LIFO RAII, early-return safe) · ✅ **`con` parameters** (read-only qualifier, sema-enforced) · ✅ **`@volatile`** variables (optimizer barrier) · ✅ **Compiler-Switch Pragmas** (`@io_check`, `@overflow_check`, `@bounds_check`, `@debug_info`, `@optimization_level`) · ✅ **IR Optimizer Levels O0–O3** (gated, 20-pass aggressive mode) · ✅ **DAA** (`--daa`/`--daa-strict`) · ✅ **StrTrim/StrFind/StrSplit** real builtins · ✅ **FloatToStr/EPrintFloat** · ✅ **Map/Set as real hashtable** · ✅ `append` alias for `push` |
+| **v0.8.8B** | ✅ **`con`-Ausdruck-Fix**: negative Literale (`-1`), Arithmetik (`2*3+1`), Bit-Ops (`0xFF & 0x0F`) in `con`-Deklarationen korrekt ausgewertet (`cg_evalConExpr` in Codegen) · ✅ **`std/db/sqlite`**: vollständige SQLite3-Bibliothek (WP-SQ-01–08, FFI, Prepared Statements, Transaktionen, Blob, 5 Demos) |
 | **v1.0.0** | Stable systems language: Modules stable, SysV ABI stable, std.io/fs, Diagnostics |
 
 ---

@@ -1,4 +1,4 @@
-# Lyx v0.8.8A – Sprachspezifikation
+# Lyx v0.8.8B – Sprachspezifikation
 
 Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
 
