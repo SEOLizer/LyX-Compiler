@@ -558,8 +558,8 @@ Before implementing major language changes, please discuss them through an issue
 
 ---
 
-# License
+# License 
 
-Copyright © Andreas Röhne
+Copyright © Andreas Röne
 
 All rights reserved.
