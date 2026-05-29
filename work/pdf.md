@@ -145,7 +145,7 @@ PdfRdrExtractText(rdr, pageIdx, buf, maxLen)   // NUL-terminiert
 
 ---
 
-### WP-PDF-25: Spot-Farben ⬜
+### WP-PDF-25: Spot-Farben ✅
 
 **Ziel:** PANTONE und andere Sonderfarben für Druckvorstufe.
 

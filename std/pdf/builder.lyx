@@ -187,6 +187,23 @@ pub con PDF_DOC_PAGESHADMASKS:    int64 := 3848;  // int64* per-page shading bit
 // WP-PDF-19: per-page pre-compressed content flag
 pub con PDF_DOC_PAGEPRECOMP:      int64 := 3856;  // int64* 0=normal 1=content already FlateDecode-compressed
 
+// WP-PDF-25: Spot colors (Separation color spaces)
+pub con PDF_DOC_SPOTCOUNT:        int64 := 3864;  // int64 count
+pub con PDF_DOC_SPOTCAP:          int64 := 3872;  // int64 capacity
+pub con PDF_DOC_SPOTBUF:          int64 := 3880;  // int64* record buffer
+pub con PDF_DOC_PAGESPOTMASKS:    int64 := 3888;  // int64* per-page spot color bitmask
+
+// Spot color record layout (56 bytes each)
+pub con PDF_SPOT_NAMEBUF:         int64 := 0;   // int64* name string (mmap'd, NUL-term)
+pub con PDF_SPOT_NAMELEN:         int64 := 8;   // int64 name allocation length
+pub con PDF_SPOT_C100:            int64 := 16;  // int64 cyan    ×100 (0–10000)
+pub con PDF_SPOT_M100:            int64 := 24;  // int64 magenta ×100
+pub con PDF_SPOT_Y100:            int64 := 32;  // int64 yellow  ×100
+pub con PDF_SPOT_K100:            int64 := 40;  // int64 black   ×100
+pub con PDF_SPOT_FNID:            int64 := 48;  // int64 PDF object ID for tint function
+pub con PDF_SPOT_RECSIZE:         int64 := 56;
+pub con PDF_SPOT_INITIAL_CAP:     int64 := 8;
+
 // Shading record layout (88 bytes each)
 pub con PDF_SHAD_TYPE:            int64 := 0;   // int64: 2=linear, 3=radial
 pub con PDF_SHAD_PAGE:            int64 := 8;   // int64: page index
@@ -352,6 +369,16 @@ pub fn PdfNew(): int64 {
   var pagePrecomp: int64 := mmapAlloc(arrSize);
   if (pagePrecomp != 0) { zeroMem(pagePrecomp, arrSize); }
   poke64(doc + PDF_DOC_PAGEPRECOMP, pagePrecomp);
+
+  // Spot color buffer (WP-PDF-25)
+  var pageSpotMasks: int64 := mmapAlloc(arrSize);
+  if (pageSpotMasks != 0) { zeroMem(pageSpotMasks, arrSize); }
+  var spotBufInit:   int64 := mmapAlloc(PDF_SPOT_INITIAL_CAP * PDF_SPOT_RECSIZE);
+  if (spotBufInit != 0) { zeroMem(spotBufInit, PDF_SPOT_INITIAL_CAP * PDF_SPOT_RECSIZE); }
+  poke64(doc + PDF_DOC_PAGESPOTMASKS, pageSpotMasks);
+  poke64(doc + PDF_DOC_SPOTCOUNT,     0);
+  poke64(doc + PDF_DOC_SPOTCAP,       PDF_SPOT_INITIAL_CAP);
+  poke64(doc + PDF_DOC_SPOTBUF,       spotBufInit);
 
   // Image arrays
   var imgCap:   int64 := PDF_INITIAL_IMAGE_CAP;
@@ -660,6 +687,24 @@ pub fn PdfFree(doc: int64): void {
 
   var pgPrecomp: int64 := peek64(doc + PDF_DOC_PAGEPRECOMP);
   if (pgPrecomp != 0) { munmap(pgPrecomp, arrSize); }
+
+  // Free spot color name strings and buffer (WP-PDF-25)
+  var spotCount5: int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
+  var spotCap5:   int64 := peek64(doc + PDF_DOC_SPOTCAP);
+  var spotBuf5:   int64 := peek64(doc + PDF_DOC_SPOTBUF);
+  var pgSpotPtr:  int64 := peek64(doc + PDF_DOC_PAGESPOTMASKS);
+  if (spotBuf5 != 0) {
+    var spi5: int64 := 0;
+    while (spi5 < spotCount5) {
+      var sprec5: int64 := spotBuf5 + spi5 * PDF_SPOT_RECSIZE;
+      var snbuf:  int64 := peek64(sprec5 + PDF_SPOT_NAMEBUF);
+      var snlen:  int64 := peek64(sprec5 + PDF_SPOT_NAMELEN);
+      if (snbuf != 0 && snlen > 0) { munmap(snbuf, snlen); }
+      spi5 := spi5 + 1;
+    }
+    munmap(spotBuf5, spotCap5 * PDF_SPOT_RECSIZE);
+  }
+  if (pgSpotPtr != 0) { munmap(pgSpotPtr, arrSize); }
 
   // Free compressed image data, then image metadata arrays
   var imgCap:   int64 := peek64(doc + PDF_DOC_IMAGECAP);
@@ -1284,9 +1329,11 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
 
   var shadCount:    int64 := peek64(doc + PDF_DOC_SHADCOUNT);
   var shadBuf:      int64 := peek64(doc + PDF_DOC_SHADBUF);
+  var spotCount:    int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
+  var spotBuf:      int64 := peek64(doc + PDF_DOC_SPOTBUF);
 
   // Allocate XRef offset table
-  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount) * 8;
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -1535,6 +1582,27 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     si := si + 1;
   }
 
+  // --- Spot color tint-function objects (WP-PDF-25) ---
+  var ski: int64 := 0;
+  while (ski < spotCount) {
+    var skrec: int64 := spotBuf + ski * PDF_SPOT_RECSIZE;
+    var skfn:  int64 := peek64(skrec + PDF_SPOT_FNID);
+    var skc:   int64 := peek64(skrec + PDF_SPOT_C100);
+    var skm:   int64 := peek64(skrec + PDF_SPOT_M100);
+    var sky:   int64 := peek64(skrec + PDF_SPOT_Y100);
+    var skk:   int64 := peek64(skrec + PDF_SPOT_K100);
+    poke64(xrefs + skfn * 8, pos);
+    pos := pdfObjHdr(out, pos, skfn);
+    pos := pdfStr(out, pos, "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [");
+    pos := pdfReal100(out, pos, skc); poke8(out+pos, 32); pos := pos+1;
+    pos := pdfReal100(out, pos, skm); poke8(out+pos, 32); pos := pos+1;
+    pos := pdfReal100(out, pos, sky); poke8(out+pos, 32); pos := pos+1;
+    pos := pdfReal100(out, pos, skk);
+    pos := pdfStr(out, pos, "] /N 1 >>");
+    pos := pdfObjFtr(out, pos);
+    ski := ski + 1;
+  }
+
   // --- Per-page objects ---
   i := 0;
   while (i < pageCount) {
@@ -1614,6 +1682,44 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
           pos := pdfRef(out, pos, sjId);
         }
         sj := sj + 1;
+      }
+      pos := pdfStr(out, pos, " >>");
+    }
+    // /ColorSpace resource: spot colors used on this page (WP-PDF-25)
+    var spMasks: int64 := peek64(doc + PDF_DOC_PAGESPOTMASKS);
+    var spMask:  int64 := peek64(spMasks + i * 8);
+    if (spMask != 0) {
+      pos := pdfStr(out, pos, " /ColorSpace <<");
+      var spj: int64 := 0;
+      while (spj < spotCount) {
+        if ((spMask >> spj) & 1 != 0) {
+          var sprec: int64 := spotBuf + spj * PDF_SPOT_RECSIZE;
+          var spfn:  int64 := peek64(sprec + PDF_SPOT_FNID);
+          var spnam: int64 := peek64(sprec + PDF_SPOT_NAMEBUF);
+          pos := pdfStr(out, pos, " /SP");
+          pos := pdfInt(out, pos, spj);
+          pos := pdfStr(out, pos, " [/Separation /");
+          // Write spot name with space→#20 encoding for use as PDF name
+          var spni: int64 := 0;
+          while (1 == 1) {
+            var spnc: int64 := peek8(spnam + spni);
+            if (spnc == 0) { break; }
+            if (spnc == 32) {
+              poke8(out+pos, 35); pos:=pos+1;
+              poke8(out+pos, 50); pos:=pos+1;
+              poke8(out+pos, 48); pos:=pos+1;
+            } else if (spnc == 35) {
+              poke8(out+pos, 35); pos:=pos+1;
+              poke8(out+pos, 50); pos:=pos+1;
+              poke8(out+pos, 51); pos:=pos+1;
+            } else { poke8(out+pos, spnc); pos:=pos+1; }
+            spni := spni + 1;
+          }
+          pos := pdfStr(out, pos, " /DeviceCMYK ");
+          pos := pdfRef(out, pos, spfn);
+          pos := pdfStr(out, pos, "]");
+        }
+        spj := spj + 1;
       }
       pos := pdfStr(out, pos, " >>");
     }
