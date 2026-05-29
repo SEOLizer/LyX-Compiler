@@ -1,0 +1,699 @@
+// std/pdf/ttfont.lyx
+// TrueType font embedding with subsetting (WP-PDF-24)
+// Supports Unicode text via Type0/CIDFontType2 with Identity-H encoding.
+
+@description("TrueType font embedding: PdfLoadFont, PdfSetFontTT, PdfTextAtUTF8")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.ttfont;
+
+import std.pdf.builder;
+import std.pdf.objects;
+
+// ============================================================================
+// Internal: big-endian readers
+// ============================================================================
+
+fn _ttU16(buf: int64, off: int64): int64 {
+  return ((peek8(buf+off) << 8) | peek8(buf+off+1)) & 0xFFFF;
+}
+fn _ttU32(buf: int64, off: int64): int64 {
+  return (peek8(buf+off) << 24) | (peek8(buf+off+1) << 16) | (peek8(buf+off+2) << 8) | peek8(buf+off+3);
+}
+fn _ttI16(buf: int64, off: int64): int64 {
+  var v: int64 := _ttU16(buf, off);
+  if (v >= 32768) { v := v - 65536; }
+  return v;
+}
+
+// ============================================================================
+// Internal: find table offset/length by 4-char tag (big-endian uint32)
+// Returns offset into file, or -1. Stores length at outLen if outLen != 0.
+// ============================================================================
+
+fn _ttFindTable(data: int64, tag: int64, outLen: int64): int64 {
+  var numTables: int64 := _ttU16(data, 4);
+  var i: int64 := 0;
+  while (i < numTables) {
+    var entry: int64 := 12 + i * 16;
+    var t: int64 := _ttU32(data, entry);
+    if (t == tag) {
+      if (outLen != 0) { poke64(outLen, _ttU32(data, entry + 8)); }
+      return _ttU32(data, entry + 4);
+    }
+    i := i + 1;
+  }
+  return -1;
+}
+
+// ============================================================================
+// Internal: cmap Format 4 lookup — Unicode codepoint → glyph ID
+// cmap4: pointer to the start of the Format 4 subtable in the file
+// ============================================================================
+
+fn _ttCmap4Lookup(cmap4: int64, cp: int64): int64 {
+  if (cmap4 == 0 || cp > 0xFFFF) { return 0; }
+  var segCount: int64 := _ttU16(cmap4, 6) >> 1;
+  var endArray:   int64 := cmap4 + 14;
+  var startArray: int64 := endArray + segCount * 2 + 2;  // +2 for reservedPad
+  var deltaArray: int64 := startArray + segCount * 2;
+  var rangeArray: int64 := deltaArray + segCount * 2;
+  var i: int64 := 0;
+  while (i < segCount) {
+    var end: int64 := _ttU16(endArray, i * 2);
+    if (cp <= end) {
+      var start: int64 := _ttU16(startArray, i * 2);
+      if (cp < start) { return 0; }
+      var rangeOff: int64 := _ttU16(rangeArray, i * 2);
+      if (rangeOff == 0) {
+        var delta: int64 := _ttI16(deltaArray, i * 2);
+        return (cp + delta) & 0xFFFF;
+      }
+      // glyphIdArray index: rangeOffset[i]/2 + (cp - start) - (segCount - i)
+      var glyphIdx: int64 := rangeArray + i * 2 + rangeOff + (cp - start) * 2;
+      var gid: int64 := _ttU16(glyphIdx, 0);
+      if (gid == 0) { return 0; }
+      var delta2: int64 := _ttI16(deltaArray, i * 2);
+      return (gid + delta2) & 0xFFFF;
+    }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// ============================================================================
+// Internal: reverse lookup — glyph ID → Unicode codepoint (via cmap4 scan)
+// Used for ToUnicode CMap generation. Returns 0 if not found.
+// ============================================================================
+
+pub fn _ttGlyphToUnicode(ttrec: int64, gid: int64): int64 {
+  var data:  int64 := peek64(ttrec + PDF_TT_DATA);
+  var c4off: int64 := peek64(ttrec + PDF_TT_CMAP4_OFF);
+  if (data == 0 || c4off == 0) { return gid; }  // fallback: assume identity
+  var cmap4:    int64 := data + c4off;
+  var segCount: int64 := _ttU16(cmap4, 6) >> 1;
+  var endArray:   int64 := cmap4 + 14;
+  var startArray: int64 := endArray + segCount * 2 + 2;
+  var deltaArray: int64 := startArray + segCount * 2;
+  var rangeArray: int64 := deltaArray + segCount * 2;
+  var i: int64 := 0;
+  while (i < segCount) {
+    var end:   int64 := _ttU16(endArray, i * 2);
+    var start: int64 := _ttU16(startArray, i * 2);
+    var delta: int64 := _ttI16(deltaArray, i * 2);
+    var roff:  int64 := _ttU16(rangeArray, i * 2);
+    if (roff == 0) {
+      // All codepoints in [start..end] map to (cp + delta) mod 65536
+      // Reverse: gid = (cp + delta) & 0xFFFF → cp = (gid - delta) & 0xFFFF
+      var cp: int64 := (gid - delta) & 0xFFFF;
+      if (cp >= start && cp <= end) { return cp; }
+    } else {
+      // Scan glyphIdArray entries
+      var cp: int64 := start;
+      while (cp <= end) {
+        var idx: int64 := rangeArray + i * 2 + roff + (cp - start) * 2;
+        var arrGid: int64 := _ttU16(idx, 0);
+        if (arrGid != 0) {
+          arrGid := (arrGid + delta) & 0xFFFF;
+          if (arrGid == gid) { return cp; }
+        }
+        cp := cp + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return gid;  // fallback: identity
+}
+
+// ============================================================================
+// Internal: get glyph data offset and length from loca + glyf tables
+// ============================================================================
+
+fn _ttGlyphOffset(ttrec: int64, glyphId: int64): int64 {
+  var data:    int64 := peek64(ttrec + PDF_TT_DATA);
+  var locaOff: int64 := peek64(ttrec + PDF_TT_LOCA_OFF);
+  var gyfOff:  int64 := peek64(ttrec + PDF_TT_GLYF_OFF);
+  var fmt:     int64 := peek64(ttrec + PDF_TT_LOCAFMT);
+  if (fmt == 0) { return gyfOff + _ttU16(data, locaOff + glyphId * 2) * 2; }
+  return gyfOff + _ttU32(data, locaOff + glyphId * 4);
+}
+
+fn _ttGlyphLen(ttrec: int64, glyphId: int64): int64 {
+  var data:    int64 := peek64(ttrec + PDF_TT_DATA);
+  var locaOff: int64 := peek64(ttrec + PDF_TT_LOCA_OFF);
+  var gyfOff:  int64 := peek64(ttrec + PDF_TT_GLYF_OFF);
+  var fmt:     int64 := peek64(ttrec + PDF_TT_LOCAFMT);
+  var o1: int64 := 0;  var o2: int64 := 0;
+  if (fmt == 0) {
+    o1 := _ttU16(data, locaOff + glyphId * 2) * 2;
+    o2 := _ttU16(data, locaOff + (glyphId+1) * 2) * 2;
+  } else {
+    o1 := _ttU32(data, locaOff + glyphId * 4);
+    o2 := _ttU32(data, locaOff + (glyphId+1) * 4);
+  }
+  return o2 - o1;
+}
+
+// ============================================================================
+// Internal: mark glyph as used; if composite, recursively mark components
+// ============================================================================
+
+fn _ttMarkGlyph(ttrec: int64, gid: int64): void {
+  var ng: int64 := peek64(ttrec + PDF_TT_NUMGLYPHS);
+  if (gid < 0 || gid >= ng) { return; }
+  var used: int64 := peek64(ttrec + PDF_TT_GLYPHUSED);
+  if (used == 0) { return; }
+  var byte: int64 := gid >> 3;
+  var bit:  int64 := gid & 7;
+  if ((peek8(used + byte) >> bit) & 1 != 0) { return; }  // already marked
+  poke8(used + byte, peek8(used + byte) | (1 << bit));
+  // Check if composite (numberOfContours == -1)
+  var data:    int64 := peek64(ttrec + PDF_TT_DATA);
+  var glyfOff: int64 := _ttGlyphOffset(ttrec, gid);
+  var glyfLen: int64 := _ttGlyphLen(ttrec, gid);
+  if (glyfLen < 2) { return; }
+  var nContours: int64 := _ttI16(data, glyfOff);
+  if (nContours != -1) { return; }  // simple glyph, done
+  // Composite: walk component records
+  var p: int64 := glyfOff + 10;  // skip header (10 bytes)
+  var more: int64 := 1;
+  while (more != 0 && p + 4 <= glyfOff + glyfLen) {
+    var flags: int64 := _ttU16(data, p);
+    var compId: int64 := _ttU16(data, p + 2);
+    _ttMarkGlyph(ttrec, compId);
+    // Advance past this component
+    var argSize: int64 := 2;  // default: 2 bytes per arg (ARG_1_AND_2_ARE_WORDS = bit 0)
+    if ((flags & 1) != 0) { argSize := 4; }
+    p := p + 4 + argSize;
+    if ((flags & 8) != 0) { p := p + 2; }   // WE_HAVE_A_SCALE
+    else if ((flags & 64) != 0) { p := p + 4; }  // WE_HAVE_AN_X_AND_Y_SCALE
+    else if ((flags & 128) != 0) { p := p + 8; }  // WE_HAVE_A_TWO_BY_TWO
+    more := flags & 0x20;  // MORE_COMPONENTS
+  }
+}
+
+// ============================================================================
+// Internal: build subset TTF
+// Returns mmap'd buffer: first 8 bytes = length as int64, then subset TTF bytes.
+// Caller must munmap(result, length + 8).
+// ============================================================================
+
+pub fn _ttBuildSubset(ttrec: int64): int64 {
+  var data:    int64 := peek64(ttrec + PDF_TT_DATA);
+  var dataSize:int64 := peek64(ttrec + PDF_TT_DATASIZE);
+  var ng:      int64 := peek64(ttrec + PDF_TT_NUMGLYPHS);
+  var used:    int64 := peek64(ttrec + PDF_TT_GLYPHUSED);
+  if (data == 0 || dataSize == 0) { return 0; }
+  // Always mark glyph 0 (notdef) as used
+  if (used != 0) { poke8(used, peek8(used) | 1); }
+
+  // --- Pass 1: compute new glyf table size ---
+  var newGlyfSize: int64 := 0;
+  var gi: int64 := 0;
+  while (gi < ng) {
+    if (used == 0 || (peek8(used + (gi>>3)) >> (gi&7)) & 1 != 0) {
+      var glen: int64 := _ttGlyphLen(ttrec, gi);
+      // Align to 4 bytes
+      newGlyfSize := newGlyfSize + ((glen + 3) & ~3);
+    }
+    gi := gi + 1;
+  }
+
+  // Subset TTF structure (7 tables): cmap, glyf, head, hhea, hmtx, loca, maxp
+  var N_TABLES: int64 := 7;
+  var headerSize: int64 := 12 + N_TABLES * 16;
+  // loca: long format = (ng+1) * 4 bytes
+  var newLocaSize: int64 := (ng + 1) * 4;
+  var cmapLen:  int64 := peek64(ttrec + PDF_TT_CMAP4_LEN) + 4;  // include cmap header (4 bytes: version+numSubtables) before subtable
+  var headLen:  int64 := peek64(ttrec + PDF_TT_HEAD_LEN);
+  var hheaLen:  int64 := peek64(ttrec + PDF_TT_HHEA_LEN);
+  var hmtxLen:  int64 := peek64(ttrec + PDF_TT_HMTX_LEN);
+  var maxpLen:  int64 := peek64(ttrec + PDF_TT_MAXP_LEN);
+
+  // Use original cmap table (entire table)
+  var cmapOff:  int64 := _ttFindTable(data, 0x636D6170, 0);  // 'cmap'
+  var cmapFullLen: int64 := cmapLen;
+  if (cmapOff >= 0) {
+    var cl: int64 := 0;
+    _ttFindTable(data, 0x636D6170, cmapOff + dataSize);  // dummy call
+    // Actually get real cmap table length
+    var numT: int64 := _ttU16(data, 4);
+    var ti2: int64 := 0;
+    while (ti2 < numT) {
+      var e2: int64 := 12 + ti2 * 16;
+      if (_ttU32(data, e2) == 0x636D6170) { cl := _ttU32(data, e2 + 8); break; }
+      ti2 := ti2 + 1;
+    }
+    if (cl > 0) { cmapFullLen := cl; }
+  }
+
+  var totalSize: int64 := headerSize + headLen + hheaLen + maxpLen + hmtxLen + cmapFullLen + newLocaSize + newGlyfSize + 64;
+  var outBuf: int64 := mmap(0, totalSize + 8, 3, 34, -1, 0);
+  if (outBuf == 0) { return 0; }
+  var out: int64 := outBuf + 8;  // first 8 bytes = length
+  var p: int64 := 0;
+
+  // Reserve space for offset table + table directory
+  p := headerSize;
+
+  // Write tables and record offsets
+  var tblOff: int64 := mmap(0, N_TABLES * 16, 3, 34, -1, 0);
+  if (tblOff == 0) { munmap(outBuf, totalSize + 8); return 0; }
+  // tblOff[i] = {tag(4), offset(4), length(4), pad(4)}
+
+  var tIdx: int64 := 0;
+
+  // cmap table (copy original)
+  var cmapFileOff: int64 := cmapOff;
+  if (cmapFileOff >= 0) {
+    poke64(tblOff + tIdx * 16,      0x636D6170);  // tag 'cmap'
+    poke64(tblOff + tIdx * 16 + 4,  p);
+    poke64(tblOff + tIdx * 16 + 8,  cmapFullLen);
+    var cmi: int64 := 0; while (cmi < cmapFullLen) { poke8(out+p+cmi, peek8(data+cmapFileOff+cmi)); cmi:=cmi+1; }
+    p := p + ((cmapFullLen + 3) & ~3);
+    tIdx := tIdx + 1;
+  }
+
+  // glyf table (subset)
+  poke64(tblOff + tIdx * 16,      0x676C7966);  // 'glyf'
+  poke64(tblOff + tIdx * 16 + 4,  p);
+  var glyfStart: int64 := p;
+  // Also build loca table (long format) in a temp buffer
+  var newLoca: int64 := mmap(0, newLocaSize, 3, 34, -1, 0);
+  if (newLoca == 0) { munmap(tblOff, N_TABLES*16); munmap(outBuf, totalSize+8); return 0; }
+  var locaPos: int64 := 0;
+  gi := 0;
+  while (gi < ng) {
+    poke8(newLoca + gi*4,   locaPos         & 0xFF);
+    poke8(newLoca + gi*4+1, (locaPos >> 8)  & 0xFF);
+    poke8(newLoca + gi*4+2, (locaPos >> 16) & 0xFF);
+    poke8(newLoca + gi*4+3, (locaPos >> 24) & 0xFF);
+    if (used == 0 || (peek8(used + (gi>>3)) >> (gi&7)) & 1 != 0) {
+      var glen: int64 := _ttGlyphLen(ttrec, gi);
+      var gsrc: int64 := _ttGlyphOffset(ttrec, gi);
+      var gci: int64 := 0; while (gci < glen) { poke8(out+p+gci, peek8(data+gsrc+gci)); gci:=gci+1; }
+      var padded: int64 := (glen + 3) & ~3;
+      while (glen < padded) { poke8(out+p+glen, 0); glen:=glen+1; }
+      locaPos := locaPos + padded;
+      p := p + padded;
+    }
+    gi := gi + 1;
+  }
+  // Final loca entry
+  poke8(newLoca + ng*4,   locaPos         & 0xFF);
+  poke8(newLoca + ng*4+1, (locaPos >> 8)  & 0xFF);
+  poke8(newLoca + ng*4+2, (locaPos >> 16) & 0xFF);
+  poke8(newLoca + ng*4+3, (locaPos >> 24) & 0xFF);
+  var newGlyfActual: int64 := p - glyfStart;
+  poke64(tblOff + tIdx * 16 + 8, newGlyfActual);
+  var gAlign: int64 := newGlyfActual & 3;
+  if (gAlign != 0) { p := p + (4 - gAlign); }
+  tIdx := tIdx + 1;
+
+  // head table (copy, update indexToLocFormat = 1)
+  var headOff: int64 := peek64(ttrec + PDF_TT_HEAD_OFF);
+  poke64(tblOff + tIdx * 16, 0x68656164);  // 'head'
+  poke64(tblOff + tIdx * 16 + 4, p);
+  poke64(tblOff + tIdx * 16 + 8, headLen);
+  var hdi: int64 := 0; while (hdi < headLen) { poke8(out+p+hdi, peek8(data+headOff+hdi)); hdi:=hdi+1; }
+  // Set indexToLocFormat = 1 (long) at offset 50 in head table
+  poke8(out+p+50, 0); poke8(out+p+51, 1);
+  p := p + ((headLen + 3) & ~3);
+  tIdx := tIdx + 1;
+
+  // hhea table
+  var hheaOff: int64 := peek64(ttrec + PDF_TT_HHEA_OFF);
+  poke64(tblOff + tIdx * 16, 0x68686561);  // 'hhea'
+  poke64(tblOff + tIdx * 16 + 4, p);
+  poke64(tblOff + tIdx * 16 + 8, hheaLen);
+  var hhi: int64 := 0; while (hhi < hheaLen) { poke8(out+p+hhi, peek8(data+hheaOff+hhi)); hhi:=hhi+1; }
+  p := p + ((hheaLen + 3) & ~3);
+  tIdx := tIdx + 1;
+
+  // hmtx table
+  var hmtxOff: int64 := peek64(ttrec + PDF_TT_HMTX_OFF);
+  poke64(tblOff + tIdx * 16, 0x686D7478);  // 'hmtx'
+  poke64(tblOff + tIdx * 16 + 4, p);
+  poke64(tblOff + tIdx * 16 + 8, hmtxLen);
+  var hmi: int64 := 0; while (hmi < hmtxLen) { poke8(out+p+hmi, peek8(data+hmtxOff+hmi)); hmi:=hmi+1; }
+  p := p + ((hmtxLen + 3) & ~3);
+  tIdx := tIdx + 1;
+
+  // loca table (new, long format)
+  poke64(tblOff + tIdx * 16, 0x6C6F6361);  // 'loca'
+  poke64(tblOff + tIdx * 16 + 4, p);
+  poke64(tblOff + tIdx * 16 + 8, newLocaSize);
+  var lci: int64 := 0; while (lci < newLocaSize) { poke8(out+p+lci, peek8(newLoca+lci)); lci:=lci+1; }
+  p := p + ((newLocaSize + 3) & ~3);
+  tIdx := tIdx + 1;
+
+  // maxp table
+  var maxpOff: int64 := peek64(ttrec + PDF_TT_MAXP_OFF);
+  poke64(tblOff + tIdx * 16, 0x6D617870);  // 'maxp'
+  poke64(tblOff + tIdx * 16 + 4, p);
+  poke64(tblOff + tIdx * 16 + 8, maxpLen);
+  var mxi: int64 := 0; while (mxi < maxpLen) { poke8(out+p+mxi, peek8(data+maxpOff+mxi)); mxi:=mxi+1; }
+  p := p + ((maxpLen + 3) & ~3);
+  // tIdx = N_TABLES (7)
+
+  // Write offset table (TTF header)
+  // sfVersion = 0x00010000 (TrueType)
+  poke8(out,   0); poke8(out+1, 1); poke8(out+2, 0); poke8(out+3, 0);
+  // numTables
+  poke8(out+4, 0); poke8(out+5, N_TABLES & 0xFF);
+  // searchRange, entrySelector, rangeShift (not critical for rendering)
+  poke8(out+6, 0); poke8(out+7, 112);   // 7 * 16 = 112, nearest power-of-2 * 16 = 64
+  poke8(out+8, 0); poke8(out+9, 2);
+  poke8(out+10,0); poke8(out+11,48);
+  // Write table directory
+  var di: int64 := 0;
+  while (di < N_TABLES) {
+    var dbase: int64 := 12 + di * 16;
+    var tag:   int64 := peek64(tblOff + di * 16);
+    var toff:  int64 := peek64(tblOff + di * 16 + 4);
+    var tlen:  int64 := peek64(tblOff + di * 16 + 8);
+    // tag (4 bytes BE)
+    poke8(out+dbase,   (tag >> 24) & 0xFF);
+    poke8(out+dbase+1, (tag >> 16) & 0xFF);
+    poke8(out+dbase+2, (tag >>  8) & 0xFF);
+    poke8(out+dbase+3, tag & 0xFF);
+    // checksum = 0 (simplified)
+    poke8(out+dbase+4,0); poke8(out+dbase+5,0); poke8(out+dbase+6,0); poke8(out+dbase+7,0);
+    // offset
+    poke8(out+dbase+8,  (toff >> 24) & 0xFF);
+    poke8(out+dbase+9,  (toff >> 16) & 0xFF);
+    poke8(out+dbase+10, (toff >>  8) & 0xFF);
+    poke8(out+dbase+11, toff & 0xFF);
+    // length
+    poke8(out+dbase+12, (tlen >> 24) & 0xFF);
+    poke8(out+dbase+13, (tlen >> 16) & 0xFF);
+    poke8(out+dbase+14, (tlen >>  8) & 0xFF);
+    poke8(out+dbase+15, tlen & 0xFF);
+    di := di + 1;
+  }
+
+  munmap(tblOff, N_TABLES * 16);
+  munmap(newLoca, newLocaSize);
+  // Store length in first 8 bytes
+  poke64(outBuf, p);
+  return outBuf;
+}
+
+// ============================================================================
+// PdfFinalizeFont — pre-build subset font; call before PdfSave for smaller file
+//
+// Collects all marked glyphs, builds a minimal subset TTF, and stores it in
+// the TT font record (PDF_TT_SUBSET / PDF_TT_SUBLEN). PdfSave will use this
+// subset instead of the full TTF → significantly smaller /FontFile2 stream.
+//
+// Optional: if not called, PdfSave embeds the full TTF file.
+// ============================================================================
+
+pub fn PdfFinalizeFont(doc: int64, fontId: int64): void {
+  if (doc == 0 || fontId < 0 || fontId >= peek64(doc + PDF_DOC_TTCOUNT)) { return; }
+  var rec: int64 := peek64(doc + PDF_DOC_TTBUF) + fontId * PDF_TT_RECSIZE;
+  // Free any previous subset
+  var oldSub: int64 := peek64(rec + PDF_TT_SUBSET);
+  var oldLen: int64 := peek64(rec + PDF_TT_SUBLEN);
+  if (oldSub != 0 && oldLen > 0) { munmap(oldSub, oldLen + 8); }
+  poke64(rec + PDF_TT_SUBSET, 0);
+  poke64(rec + PDF_TT_SUBLEN, 0);
+  // Build subset
+  var result: int64 := _ttBuildSubset(rec);
+  if (result == 0) { return; }
+  var subLen: int64 := peek64(result);
+  poke64(rec + PDF_TT_SUBSET, result + 8);
+  poke64(rec + PDF_TT_SUBLEN, subLen);
+}
+
+// ============================================================================
+// Internal: grow TT font record buffer
+// ============================================================================
+
+fn _ttGrow(doc: int64): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_TTCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_TTCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_TTBUF);
+  if (count < cap) { return buf + count * PDF_TT_RECSIZE; }
+  var newCap: int64 := cap * 2;
+  var newBuf: int64 := mmap(0, newCap * PDF_TT_RECSIZE, 3, 34, -1, 0);
+  if (newBuf == 0) { return 0; }
+  var bi: int64 := 0;
+  while (bi < count * PDF_TT_RECSIZE) { poke8(newBuf+bi, peek8(buf+bi)); bi:=bi+1; }
+  munmap(buf, cap * PDF_TT_RECSIZE);
+  poke64(doc + PDF_DOC_TTCAP, newCap);
+  poke64(doc + PDF_DOC_TTBUF, newBuf);
+  return newBuf + count * PDF_TT_RECSIZE;
+}
+
+// ============================================================================
+// PdfLoadFont — load a TrueType font from a .ttf file
+//
+// Returns fontId (≥ 0) on success, -1 on failure.
+// The fontId is passed to PdfSetFontTT and PdfTextAtUTF8.
+// ============================================================================
+
+pub fn PdfLoadFont(doc: int64, path: pchar): int64 {
+  if (doc == 0 || path == 0) { return -1; }
+  // Read file into mmap'd buffer
+  var fd: int64 := open(path, 0, 0);
+  if (fd < 0) { return -1; }
+  var cap: int64 := 524288;  // 512 KB initial
+  var buf: int64 := mmap(0, cap, 3, 34, -1, 0);
+  if (buf == 0) { close(fd); return -1; }
+  var total: int64 := 0;
+  while (1 == 1) {
+    if (cap - total < 4096) {
+      var newCap: int64 := cap * 2;
+      var newBuf: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      if (newBuf == 0) { break; }
+      var ci: int64 := 0; while (ci < total) { poke8(newBuf+ci, peek8(buf+ci)); ci:=ci+1; }
+      munmap(buf, cap); buf := newBuf; cap := newCap;
+    }
+    var n: int64 := read(fd, buf + total, 4096);
+    if (n <= 0) { break; }
+    total := total + n;
+  }
+  close(fd);
+  if (total < 12) { munmap(buf, cap); return -1; }
+
+  // Parse tables
+  var tmpLen: int64 := 0;
+  var headOff: int64 := _ttFindTable(buf, 0x68656164, tmpLen + 0);  // 'head'
+  var headLen: int64 := 0;
+  headOff := _ttFindTable(buf, 0x68656164, tmpLen + 0);
+  // Redo with outLen pointers using RDR_TMP workaround: just re-read from directory
+  var numT: int64 := _ttU16(buf, 4);
+  var headO: int64 := -1;  var headL: int64 := 0;
+  var hheaO: int64 := -1;  var hheaL: int64 := 0;
+  var maxpO: int64 := -1;  var maxpL: int64 := 0;
+  var hmtxO: int64 := -1;  var hmtxL: int64 := 0;
+  var cmapO: int64 := -1;  var cmapL: int64 := 0;
+  var locaO: int64 := -1;
+  var glyfO: int64 := -1;  var glyfL: int64 := 0;
+  var ti: int64 := 0;
+  while (ti < numT) {
+    var e:     int64 := 12 + ti * 16;
+    var tg:    int64 := _ttU32(buf, e);
+    var toff2: int64 := _ttU32(buf, e + 4);
+    var tlen2: int64 := _ttU32(buf, e + 8);
+    if (tg == 0x68656164) { headO := toff2; headL := tlen2; }
+    else if (tg == 0x68686561) { hheaO := toff2; hheaL := tlen2; }
+    else if (tg == 0x6D617870) { maxpO := toff2; maxpL := tlen2; }
+    else if (tg == 0x686D7478) { hmtxO := toff2; hmtxL := tlen2; }
+    else if (tg == 0x636D6170) { cmapO := toff2; cmapL := tlen2; }
+    else if (tg == 0x6C6F6361) { locaO := toff2; }
+    else if (tg == 0x676C7966) { glyfO := toff2; glyfL := tlen2; }
+    ti := ti + 1;
+  }
+  if (headO < 0 || hheaO < 0 || maxpO < 0 || hmtxO < 0 || cmapO < 0 || locaO < 0 || glyfO < 0) {
+    munmap(buf, cap); return -1;
+  }
+
+  // Read head fields
+  var upm:       int64 := _ttU16(buf, headO + 18);
+  var locaFmt:   int64 := _ttI16(buf, headO + 50);
+  var xMin:      int64 := _ttI16(buf, headO + 36);
+  var yMin:      int64 := _ttI16(buf, headO + 38);
+  var xMax:      int64 := _ttI16(buf, headO + 40);
+  var yMax:      int64 := _ttI16(buf, headO + 42);
+  var numGlyphs: int64 := _ttU16(buf, maxpO + 4);
+  var nHMetrics: int64 := _ttU16(buf, hheaO + 34);
+
+  // Find cmap Format 4 subtable (platform 3, encoding 1 or platform 0)
+  var cmap4Off: int64 := 0;  var cmap4Len: int64 := 0;
+  var numSubs: int64 := _ttU16(buf, cmapO + 2);
+  var si: int64 := 0;
+  while (si < numSubs) {
+    var sbase: int64 := cmapO + 4 + si * 8;
+    var platId: int64 := _ttU16(buf, sbase);
+    var encId:  int64 := _ttU16(buf, sbase + 2);
+    var subOff: int64 := _ttU32(buf, sbase + 4);
+    var subAbs: int64 := cmapO + subOff;
+    if ((platId == 3 && encId == 1) || platId == 0) {
+      if (_ttU16(buf, subAbs) == 4) {  // Format 4
+        cmap4Off := subAbs;
+        cmap4Len := _ttU16(buf, subAbs + 2);
+        break;
+      }
+    }
+    si := si + 1;
+  }
+
+  // Allocate glyph usage bitmap
+  var glyphUsed: int64 := mmap(0, 8192, 3, 34, -1, 0);
+  if (glyphUsed != 0) {
+    var gi2: int64 := 0; while (gi2 < 8192) { poke8(glyphUsed+gi2, 0); gi2:=gi2+1; }
+  }
+
+  // Allocate TT font record
+  var rec: int64 := _ttGrow(doc);
+  if (rec == 0) { munmap(buf, cap); if (glyphUsed != 0) { munmap(glyphUsed, 8192); } return -1; }
+
+  // Allocate PDF object IDs (5 per font)
+  var baseId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, baseId + 5);
+
+  // Fill record
+  poke64(rec + PDF_TT_DATA,      buf);
+  poke64(rec + PDF_TT_DATASIZE,  total);
+  poke64(rec + PDF_TT_UPM,       upm);
+  poke64(rec + PDF_TT_NUMGLYPHS, numGlyphs);
+  poke64(rec + PDF_TT_NHMETRICS, nHMetrics);
+  poke64(rec + PDF_TT_LOCAFMT,   locaFmt);
+  poke64(rec + PDF_TT_HEAD_OFF,  headO);
+  poke64(rec + PDF_TT_HEAD_LEN,  headL);
+  poke64(rec + PDF_TT_HHEA_OFF,  hheaO);
+  poke64(rec + PDF_TT_HHEA_LEN,  hheaL);
+  poke64(rec + PDF_TT_MAXP_OFF,  maxpO);
+  poke64(rec + PDF_TT_MAXP_LEN,  maxpL);
+  poke64(rec + PDF_TT_HMTX_OFF,  hmtxO);
+  poke64(rec + PDF_TT_HMTX_LEN,  hmtxL);
+  poke64(rec + PDF_TT_CMAP4_OFF, cmap4Off);
+  poke64(rec + PDF_TT_CMAP4_LEN, cmap4Len);
+  poke64(rec + PDF_TT_LOCA_OFF,  locaO);
+  poke64(rec + PDF_TT_GLYF_OFF,  glyfO);
+  poke64(rec + PDF_TT_GLYF_LEN,  glyfL);
+  poke64(rec + PDF_TT_GLYPHUSED, glyphUsed);
+  poke64(rec + PDF_TT_DESCID,    baseId);
+  poke64(rec + PDF_TT_CIDFONTID, baseId + 1);
+  poke64(rec + PDF_TT_TYPE0ID,   baseId + 2);
+  poke64(rec + PDF_TT_TUNICODEID,baseId + 3);
+  poke64(rec + PDF_TT_FILEID,    baseId + 4);
+  poke64(rec + PDF_TT_PAGEMASK,  0);
+  // Scale bbox to 1000 units/EM (PDF convention)
+  if (upm > 0) {
+    poke64(rec + PDF_TT_XMIN, xMin * 1000 / upm);
+    poke64(rec + PDF_TT_YMIN, yMin * 1000 / upm);
+    poke64(rec + PDF_TT_XMAX, xMax * 1000 / upm);
+    poke64(rec + PDF_TT_YMAX, yMax * 1000 / upm);
+  }
+
+  var fontId: int64 := peek64(doc + PDF_DOC_TTCOUNT);
+  poke64(doc + PDF_DOC_TTCOUNT, fontId + 1);
+  return fontId;
+}
+
+// ============================================================================
+// PdfSetFontTT — select a TrueType font for subsequent PdfTextAtUTF8 calls
+//
+// fontId: value returned by PdfLoadFont
+// size:   font size in PDF points (e.g. 14.0)
+// ============================================================================
+
+pub fn PdfSetFontTT(doc: int64, page: int64, fontId: int64, size: f64): void {
+  if (doc == 0 || fontId < 0 || fontId >= peek64(doc + PDF_DOC_TTCOUNT)) { return; }
+  // Record page usage
+  var rec: int64 := peek64(doc + PDF_DOC_TTBUF) + fontId * PDF_TT_RECSIZE;
+  var mask: int64 := peek64(rec + PDF_TT_PAGEMASK);
+  poke64(rec + PDF_TT_PAGEMASK, mask | (1 << page));
+  // Update current TT font for page
+  var curFonts: int64 := peek64(doc + PDF_DOC_TTCURFONTS);
+  if (curFonts != 0) { poke64(curFonts + page * 8, fontId); }
+  // Emit font selection to content stream
+  PdfContentEnsure(doc, page, 32);
+  var buf: int64 := pdfXBuf(doc, page);
+  var pos: int64 := pdfXPos(doc, page);
+  pos := pdfStr(buf, pos, "/TF");
+  pos := pdfInt(buf, pos, fontId);
+  poke8(buf+pos, 32); pos:=pos+1;
+  pos := pdfReal(buf, pos, size);
+  pos := pdfStr(buf, pos, " Tf\n");
+  pdfXSetPos(doc, page, pos);
+}
+
+// ============================================================================
+// PdfTextAtUTF8 — place UTF-8 encoded text using the current TrueType font
+//
+// x, y: position in PDF points (bottom-left origin)
+// text: UTF-8 encoded string
+//
+// Must be called after PdfSetFontTT on the same page.
+// ============================================================================
+
+pub fn PdfTextAtUTF8(doc: int64, page: int64, x: f64, y: f64, text: pchar): void {
+  if (doc == 0 || text == 0) { return; }
+  var curFonts: int64 := peek64(doc + PDF_DOC_TTCURFONTS);
+  var fontId:   int64 := -1;
+  if (curFonts != 0) { fontId := peek64(curFonts + page * 8); }
+  if (fontId < 0 || fontId >= peek64(doc + PDF_DOC_TTCOUNT)) { return; }
+  var rec:   int64 := peek64(doc + PDF_DOC_TTBUF) + fontId * PDF_TT_RECSIZE;
+  var cmap4: int64 := peek64(rec + PDF_TT_CMAP4_OFF);
+  var data:  int64 := peek64(rec + PDF_TT_DATA);
+
+  // Count codepoints to allocate glyph array
+  var textLen: int64 := StrLen(text);
+  if (textLen == 0) { return; }
+
+  // Emit: BT x y Td <glyphIds> Tj ET
+  PdfContentEnsure(doc, page, textLen * 4 + 64);
+  var buf: int64 := pdfXBuf(doc, page);
+  var pos: int64 := pdfXPos(doc, page);
+  pos := pdfStr(buf, pos, "BT ");
+  pos := pdfReal(buf, pos, x); poke8(buf+pos, 32); pos:=pos+1;
+  pos := pdfReal(buf, pos, y);
+  pos := pdfStr(buf, pos, " Td <");
+
+  // Walk UTF-8 bytes, decode to Unicode, map to glyph ID
+  var ti: int64 := 0;
+  while (ti < textLen) {
+    var b0: int64 := StrCharAt(text, ti);
+    var cp: int64 := 0;
+    if (b0 < 0x80) {
+      cp := b0; ti := ti + 1;
+    } else if ((b0 & 0xE0) == 0xC0 && ti + 1 < textLen) {
+      cp := ((b0 & 0x1F) << 6) | (StrCharAt(text, ti+1) & 0x3F);
+      ti := ti + 2;
+    } else if ((b0 & 0xF0) == 0xE0 && ti + 2 < textLen) {
+      cp := ((b0 & 0x0F) << 12) | ((StrCharAt(text, ti+1) & 0x3F) << 6) | (StrCharAt(text, ti+2) & 0x3F);
+      ti := ti + 3;
+    } else if ((b0 & 0xF8) == 0xF0 && ti + 3 < textLen) {
+      cp := ((b0 & 0x07) << 18) | ((StrCharAt(text, ti+1) & 0x3F) << 12) |
+            ((StrCharAt(text, ti+2) & 0x3F) << 6) | (StrCharAt(text, ti+3) & 0x3F);
+      ti := ti + 4;
+    } else { ti := ti + 1; continue; }
+
+    // Map codepoint to glyph ID
+    var gid: int64 := 0;
+    if (cmap4 != 0 && data != 0) {
+      gid := _ttCmap4Lookup(data + cmap4, cp);
+    } else { gid := cp & 0xFFFF; }
+    if (gid == 0 && cp != 0) { gid := 0; }  // notdef for unmapped
+
+    // Mark glyph as used (including composite components)
+    _ttMarkGlyph(rec, gid);
+
+    // Write glyph ID as 4 hex chars (2 bytes big-endian)
+    var h1: int64 := (gid >> 12) & 0xF;
+    var h2: int64 := (gid >>  8) & 0xF;
+    var h3: int64 := (gid >>  4) & 0xF;
+    var h4: int64 :=  gid        & 0xF;
+    if(h1<10){poke8(buf+pos,48+h1);}else{poke8(buf+pos,55+h1);} pos:=pos+1;
+    if(h2<10){poke8(buf+pos,48+h2);}else{poke8(buf+pos,55+h2);} pos:=pos+1;
+    if(h3<10){poke8(buf+pos,48+h3);}else{poke8(buf+pos,55+h3);} pos:=pos+1;
+    if(h4<10){poke8(buf+pos,48+h4);}else{poke8(buf+pos,55+h4);} pos:=pos+1;
+  }
+
+  pos := pdfStr(buf, pos, "> Tj ET\n");
+  pdfXSetPos(doc, page, pos);
+}

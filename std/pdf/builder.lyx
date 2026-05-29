@@ -214,6 +214,48 @@ pub con PDF_DOC_ENCUKEY:          int64 := 4008;  // int64* 32-byte /U value
 pub con PDF_DOC_ENCREADY:         int64 := 4016;  // int64 1=keys computed
 pub con PDF_DOC_ENCCURID:         int64 := 4024;  // int64 current object ID during PdfSave
 
+// WP-PDF-24: TrueType font embedding
+pub con PDF_DOC_TTCOUNT:          int64 := 4032;  // int64 number of loaded TT fonts
+pub con PDF_DOC_TTCAP:            int64 := 4040;  // int64 capacity
+pub con PDF_DOC_TTBUF:            int64 := 4048;  // int64* TT font record buffer
+pub con PDF_DOC_TTCURFONTS:       int64 := 4056;  // int64* current TT fontId per page (int64[64])
+
+// TT font record layout (240 bytes each)
+pub con PDF_TT_DATA:              int64 := 0;    // int64* raw TTF bytes (mmap'd)
+pub con PDF_TT_DATASIZE:          int64 := 8;    // int64 file size
+pub con PDF_TT_UPM:               int64 := 16;   // int64 units per EM
+pub con PDF_TT_NUMGLYPHS:         int64 := 24;   // int64 numGlyphs
+pub con PDF_TT_NHMETRICS:         int64 := 32;   // int64 numberOfHMetrics
+pub con PDF_TT_LOCAFMT:           int64 := 40;   // int64 indexToLocFormat (0=short 1=long)
+pub con PDF_TT_HEAD_OFF:          int64 := 48;   // int64 head table offset in file
+pub con PDF_TT_HEAD_LEN:          int64 := 56;   // int64 head table length
+pub con PDF_TT_HHEA_OFF:          int64 := 64;   // int64 hhea table offset
+pub con PDF_TT_HHEA_LEN:          int64 := 72;   // int64 hhea table length
+pub con PDF_TT_MAXP_OFF:          int64 := 80;   // int64 maxp table offset
+pub con PDF_TT_MAXP_LEN:          int64 := 88;   // int64 maxp table length
+pub con PDF_TT_HMTX_OFF:          int64 := 96;   // int64 hmtx table offset
+pub con PDF_TT_HMTX_LEN:          int64 := 104;  // int64 hmtx table length
+pub con PDF_TT_CMAP4_OFF:         int64 := 112;  // int64 cmap Format 4 subtable offset in file
+pub con PDF_TT_CMAP4_LEN:         int64 := 120;  // int64 cmap Format 4 length
+pub con PDF_TT_LOCA_OFF:          int64 := 128;  // int64 loca table offset
+pub con PDF_TT_GLYF_OFF:          int64 := 136;  // int64 glyf table offset
+pub con PDF_TT_GLYF_LEN:          int64 := 144;  // int64 glyf table length
+pub con PDF_TT_GLYPHUSED:         int64 := 152;  // int64* 8192-byte glyph usage bitmap
+pub con PDF_TT_DESCID:            int64 := 160;  // int64 FontDescriptor PDF object ID
+pub con PDF_TT_CIDFONTID:         int64 := 168;  // int64 CIDFont PDF object ID
+pub con PDF_TT_TYPE0ID:           int64 := 176;  // int64 Type0 font PDF object ID
+pub con PDF_TT_TUNICODEID:        int64 := 184;  // int64 ToUnicode CMap PDF object ID
+pub con PDF_TT_FILEID:            int64 := 192;  // int64 FontFile2 stream PDF object ID
+pub con PDF_TT_PAGEMASK:          int64 := 200;  // int64 page usage bitmask
+pub con PDF_TT_XMIN:              int64 := 208;  // int64 bbox xMin (×1000/UPM)
+pub con PDF_TT_YMIN:              int64 := 216;  // int64 bbox yMin
+pub con PDF_TT_XMAX:              int64 := 224;  // int64 bbox xMax
+pub con PDF_TT_YMAX:              int64 := 232;  // int64 bbox yMax
+pub con PDF_TT_SUBSET:            int64 := 240;  // int64* pre-built subset TTF (mmap'd), 0=use full DATA
+pub con PDF_TT_SUBLEN:            int64 := 248;  // int64 subset byte length
+pub con PDF_TT_RECSIZE:           int64 := 256;
+pub con PDF_TT_INITIAL_CAP:       int64 := 4;
+
 // Encryption type constants
 pub con PDF_ENC_NONE:             int64 := 0;
 pub con PDF_ENC_RC4_128:          int64 := 1;
@@ -439,6 +481,16 @@ pub fn PdfNew(): int64 {
   var pagePrecomp: int64 := mmapAlloc(arrSize);
   if (pagePrecomp != 0) { zeroMem(pagePrecomp, arrSize); }
   poke64(doc + PDF_DOC_PAGEPRECOMP, pagePrecomp);
+
+  // TrueType font buffer (WP-PDF-24)
+  var ttBufInit:    int64 := mmapAlloc(PDF_TT_INITIAL_CAP * PDF_TT_RECSIZE);
+  if (ttBufInit != 0) { zeroMem(ttBufInit, PDF_TT_INITIAL_CAP * PDF_TT_RECSIZE); }
+  var ttCurFonts:   int64 := mmapAlloc(pageCap * 8);
+  if (ttCurFonts != 0) { zeroMem(ttCurFonts, pageCap * 8); var tci: int64:=0; while(tci<pageCap){poke64(ttCurFonts+tci*8,-1);tci:=tci+1;} }
+  poke64(doc + PDF_DOC_TTCOUNT,    0);
+  poke64(doc + PDF_DOC_TTCAP,      PDF_TT_INITIAL_CAP);
+  poke64(doc + PDF_DOC_TTBUF,      ttBufInit);
+  poke64(doc + PDF_DOC_TTCURFONTS, ttCurFonts);
 
   // Encryption fields (WP-PDF-17) — zeroed by zeroMem above; no extra allocation needed
   // PDF_DOC_ENCTYPE=0 (none), passwords/keys allocated lazily on PdfSetEncryption
@@ -774,6 +826,29 @@ pub fn PdfFree(doc: int64): void {
 
   var pgPrecomp: int64 := peek64(doc + PDF_DOC_PAGEPRECOMP);
   if (pgPrecomp != 0) { munmap(pgPrecomp, arrSize); }
+
+  // Free TrueType font data (WP-PDF-24)
+  var ttCount7: int64 := peek64(doc + PDF_DOC_TTCOUNT);
+  var ttCap7:   int64 := peek64(doc + PDF_DOC_TTCAP);
+  var ttBuf7:   int64 := peek64(doc + PDF_DOC_TTBUF);
+  var ttCF7:    int64 := peek64(doc + PDF_DOC_TTCURFONTS);
+  if (ttBuf7 != 0) {
+    var ti7: int64 := 0;
+    while (ti7 < ttCount7) {
+      var trec7: int64 := ttBuf7 + ti7 * PDF_TT_RECSIZE;
+      var tdata: int64 := peek64(trec7 + PDF_TT_DATA);
+      var tsize: int64 := peek64(trec7 + PDF_TT_DATASIZE);
+      var tused: int64 := peek64(trec7 + PDF_TT_GLYPHUSED);
+      if (tdata != 0 && tsize > 0) { munmap(tdata, tsize); }
+      if (tused != 0) { munmap(tused, 8192); }
+      var tsub: int64 := peek64(trec7 + PDF_TT_SUBSET);
+      var tsubl:int64 := peek64(trec7 + PDF_TT_SUBLEN);
+      if (tsub != 0 && tsubl > 0) { munmap(tsub - 8, tsubl + 8); }
+      ti7 := ti7 + 1;
+    }
+    munmap(ttBuf7, ttCap7 * PDF_TT_RECSIZE);
+  }
+  if (ttCF7 != 0) { munmap(ttCF7, pageCap * 8); }
 
   // Free encryption buffers (WP-PDF-17)
   var encUpwd: int64 := peek64(doc + PDF_DOC_ENCUPWD);
@@ -1897,11 +1972,13 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var acroObjId:    int64 := peek64(doc + PDF_DOC_ACROOBJID);
   var encType:      int64 := peek64(doc + PDF_DOC_ENCTYPE);
   var encReady:     int64 := peek64(doc + PDF_DOC_ENCREADY);
+  var ttCount:      int64 := peek64(doc + PDF_DOC_TTCOUNT);
+  var ttBuf:        int64 := peek64(doc + PDF_DOC_TTBUF);
 
   // Allocate XRef offset table
   var encObjAlloc: int64 := 0;
   if (encType != PDF_ENC_NONE && encReady != 0) { encObjAlloc := 1; }
-  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount + formCount + rgCount + encObjAlloc + 4) * 8;
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount + formCount + rgCount + encObjAlloc + ttCount * 5 + 8) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -2387,6 +2464,19 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
       }
       fj := fj + 1;
     }
+    // TT font entries (WP-PDF-24): /TF{n} ref for each TT font used on this page
+    var ttfj: int64 := 0;
+    while (ttfj < ttCount) {
+      var ttfRec: int64 := ttBuf + ttfj * PDF_TT_RECSIZE;
+      var ttfPM:  int64 := peek64(ttfRec + PDF_TT_PAGEMASK);
+      if ((ttfPM >> i) & 1 != 0) {
+        pos := pdfStr(out, pos, " /TF");
+        pos := pdfInt(out, pos, ttfj);
+        poke8(out+pos, 32); pos:=pos+1;
+        pos := pdfRef(out, pos, peek64(ttfRec + PDF_TT_TYPE0ID));
+      }
+      ttfj := ttfj + 1;
+    }
     pos := pdfStr(out, pos, " >>");
     // /XObject resource: images + form xobjects used on this page
     var imgMask:  int64 := arrGet(peek64(doc + PDF_DOC_PAGEIMAGEMASKS), i);
@@ -2802,6 +2892,166 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     }
     pos := pdfStr(out, pos, "> >>");
     pos := pdfObjFtr(out, pos);
+  }
+
+  // --- TrueType font objects (WP-PDF-24) ---
+  // Each TT font emits 5 objects: FontFile2 stream, FontDescriptor, CIDFont, ToUnicode, Type0
+  var tti: int64 := 0;
+  while (tti < ttCount) {
+    var ttrec:   int64 := ttBuf + tti * PDF_TT_RECSIZE;
+    var ttData:  int64 := peek64(ttrec + PDF_TT_DATA);
+    var ttSize:  int64 := peek64(ttrec + PDF_TT_DATASIZE);
+    var ttUPM:   int64 := peek64(ttrec + PDF_TT_UPM);
+    var ttNG:    int64 := peek64(ttrec + PDF_TT_NUMGLYPHS);
+    var ttDescId:int64 := peek64(ttrec + PDF_TT_DESCID);
+    var ttCidId: int64 := peek64(ttrec + PDF_TT_CIDFONTID);
+    var ttT0Id:  int64 := peek64(ttrec + PDF_TT_TYPE0ID);
+    var ttTuId:  int64 := peek64(ttrec + PDF_TT_TUNICODEID);
+    var ttFid:   int64 := peek64(ttrec + PDF_TT_FILEID);
+    var ttGused: int64 := peek64(ttrec + PDF_TT_GLYPHUSED);
+    var ttXMin:  int64 := peek64(ttrec + PDF_TT_XMIN);
+    var ttYMin:  int64 := peek64(ttrec + PDF_TT_YMIN);
+    var ttXMax:  int64 := peek64(ttrec + PDF_TT_XMAX);
+    var ttYMax:  int64 := peek64(ttrec + PDF_TT_YMAX);
+
+    // Use pre-built subset if available (via PdfFinalizeFont), else full TTF
+    var subBuf: int64 := peek64(ttrec + PDF_TT_SUBSET);
+    var subLen: int64 := peek64(ttrec + PDF_TT_SUBLEN);
+
+    // FontFile2 stream
+    poke64(xrefs + ttFid * 8, pos);
+    pos := pdfObjHdr(out, pos, ttFid);
+    var fontDataLen: int64 := ttSize;
+    var fontData:    int64 := ttData;
+    if (subLen > 0) { fontDataLen := subLen; fontData := subBuf; }
+    pos := pdfStr(out, pos, "<< /Length ");
+    pos := pdfInt(out, pos, fontDataLen);
+    pos := pdfStr(out, pos, " /Length1 ");
+    pos := pdfInt(out, pos, fontDataLen);
+    pos := pdfStr(out, pos, " >>\nstream\n");
+    pos := pdfBytes(out, pos, fontData, fontDataLen);
+    pos := pdfStr(out, pos, "\nendstream");
+    pos := pdfObjFtr(out, pos);
+
+    // FontDescriptor
+    poke64(xrefs + ttDescId * 8, pos);
+    pos := pdfObjHdr(out, pos, ttDescId);
+    pos := pdfStr(out, pos, "<< /Type /FontDescriptor /FontName /DejaVuSans /Flags 32 /FontBBox [");
+    pos := pdfInt(out, pos, ttXMin); poke8(out+pos,32); pos:=pos+1;
+    pos := pdfInt(out, pos, ttYMin); poke8(out+pos,32); pos:=pos+1;
+    pos := pdfInt(out, pos, ttXMax); poke8(out+pos,32); pos:=pos+1;
+    pos := pdfInt(out, pos, ttYMax);
+    pos := pdfStr(out, pos, "] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 ");
+    pos := pdfRef(out, pos, ttFid);
+    pos := pdfStr(out, pos, " >>");
+    pos := pdfObjFtr(out, pos);
+
+    // ToUnicode CMap stream
+    poke64(xrefs + ttTuId * 8, pos);
+    pos := pdfObjHdr(out, pos, ttTuId);
+    // Build ToUnicode CMap content
+    var cmap1: pchar := "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /Adobe-Identity-UCS def /CMapType 2 def 1 begincodespacerange <0000> <FFFF> endcodespacerange "c;
+    var cmap2: pchar := "beginbfchar\n"c;
+    var cmap3: pchar := "endbfchar\nendcmap CMap currentdict end end\n"c;
+    // Count mappings (glyph→unicode for used glyphs)
+    var mapCount: int64 := 0;
+    if (ttGused != 0) {
+      var gii: int64 := 1;  // skip glyph 0 (notdef)
+      while (gii < ttNG && gii < 65536) {
+        if ((peek8(ttGused + (gii >> 3)) >> (gii & 7)) & 1 != 0) { mapCount := mapCount + 1; }
+        gii := gii + 1;
+      }
+    }
+    var cmapLen: int64 := StrLen(cmap1) + StrLen(cmap2) + mapCount * 24 + StrLen(cmap3);
+    pos := pdfStr(out, pos, "<< /Length ");
+    pos := pdfInt(out, pos, cmapLen);
+    pos := pdfStr(out, pos, " >>\nstream\n");
+    pos := pdfStr(out, pos, cmap1);
+    pos := pdfStr(out, pos, cmap2);
+    // Write glyph→unicode mappings: <glyphId> <unicodeCodepoint>
+    // We store unicode→glyph in cmap; for ToUnicode we need glyph→unicode.
+    // Walk used glyphs and emit their Unicode mappings using the cmap4 reverse lookup.
+    if (ttGused != 0) {
+      var ttu_gi: int64 := 1;
+      while (ttu_gi < ttNG && ttu_gi < 65536) {
+        if ((peek8(ttGused + (ttu_gi >> 3)) >> (ttu_gi & 7)) & 1 != 0) {
+          // Inline reverse cmap4 lookup: glyph ID → Unicode codepoint
+          var ttc4d: int64 := peek64(ttrec + PDF_TT_DATA);
+          var ttc4o: int64 := peek64(ttrec + PDF_TT_CMAP4_OFF);
+          var uc: int64 := ttu_gi;  // fallback: identity
+          if (ttc4d != 0 && ttc4o != 0) {
+            var c4: int64 := ttc4d + ttc4o;
+            var nSeg: int64 := (((peek8(c4+6)<<8)|peek8(c4+7)) & 0xFFFF) >> 1;
+            var ea: int64 := c4 + 14;
+            var sa: int64 := ea + nSeg*2 + 2;
+            var da: int64 := sa + nSeg*2;
+            var ra: int64 := da + nSeg*2;
+            var si2: int64 := 0;
+            while (si2 < nSeg) {
+              var eEnd:   int64 := ((peek8(ea+si2*2)<<8)|peek8(ea+si2*2+1)) & 0xFFFF;
+              var eStart: int64 := ((peek8(sa+si2*2)<<8)|peek8(sa+si2*2+1)) & 0xFFFF;
+              var eDelta: int64 := ((peek8(da+si2*2)<<8)|peek8(da+si2*2+1)) & 0xFFFF;
+              if (eDelta >= 32768) { eDelta := eDelta - 65536; }
+              var eRoff:  int64 := ((peek8(ra+si2*2)<<8)|peek8(ra+si2*2+1)) & 0xFFFF;
+              if (eRoff == 0) {
+                var cp2: int64 := (ttu_gi - eDelta) & 0xFFFF;
+                if (cp2 >= eStart && cp2 <= eEnd) { uc := cp2; si2 := nSeg; }
+              } else {
+                var cpS: int64 := eStart;
+                while (cpS <= eEnd) {
+                  var idx2: int64 := ra + si2*2 + eRoff + (cpS - eStart)*2;
+                  var arrG: int64 := ((peek8(idx2)<<8)|peek8(idx2+1)) & 0xFFFF;
+                  if (arrG != 0) {
+                    arrG := (arrG + eDelta) & 0xFFFF;
+                    if (arrG == ttu_gi) { uc := cpS; cpS := eEnd + 1; si2 := nSeg; }
+                  }
+                  cpS := cpS + 1;
+                }
+              }
+              si2 := si2 + 1;
+            }
+          }
+          if (uc > 0) {
+            poke8(out+pos, 60); pos:=pos+1;  // <
+            var g4: int64 := (ttu_gi >> 12)&0xF; if(g4<10){poke8(out+pos,48+g4);}else{poke8(out+pos,55+g4);} pos:=pos+1;
+            g4:=(ttu_gi>>8)&0xF; if(g4<10){poke8(out+pos,48+g4);}else{poke8(out+pos,55+g4);} pos:=pos+1;
+            g4:=(ttu_gi>>4)&0xF; if(g4<10){poke8(out+pos,48+g4);}else{poke8(out+pos,55+g4);} pos:=pos+1;
+            g4:=ttu_gi&0xF;     if(g4<10){poke8(out+pos,48+g4);}else{poke8(out+pos,55+g4);} pos:=pos+1;
+            pos := pdfStr(out, pos, "> <");
+            var u4: int64 := (uc >> 12)&0xF; if(u4<10){poke8(out+pos,48+u4);}else{poke8(out+pos,55+u4);} pos:=pos+1;
+            u4:=(uc>>8)&0xF; if(u4<10){poke8(out+pos,48+u4);}else{poke8(out+pos,55+u4);} pos:=pos+1;
+            u4:=(uc>>4)&0xF; if(u4<10){poke8(out+pos,48+u4);}else{poke8(out+pos,55+u4);} pos:=pos+1;
+            u4:=uc&0xF;      if(u4<10){poke8(out+pos,48+u4);}else{poke8(out+pos,55+u4);} pos:=pos+1;
+            poke8(out+pos, 62); pos:=pos+1;  // >
+            poke8(out+pos, 10); pos:=pos+1;  // \n
+          }
+        }
+        ttu_gi := ttu_gi + 1;
+      }
+    }
+    pos := pdfStr(out, pos, cmap3);
+    pos := pdfStr(out, pos, "\nendstream");
+    pos := pdfObjFtr(out, pos);
+
+    // CIDFont (CIDFontType2)
+    poke64(xrefs + ttCidId * 8, pos);
+    pos := pdfObjHdr(out, pos, ttCidId);
+    pos := pdfStr(out, pos, "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /DejaVuSans /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ");
+    pos := pdfRef(out, pos, ttDescId);
+    pos := pdfStr(out, pos, " /DW 1000 /CIDToGIDMap /Identity >>");
+    pos := pdfObjFtr(out, pos);
+
+    // Type0 font
+    poke64(xrefs + ttT0Id * 8, pos);
+    pos := pdfObjHdr(out, pos, ttT0Id);
+    pos := pdfStr(out, pos, "<< /Type /Font /Subtype /Type0 /BaseFont /DejaVuSans /Encoding /Identity-H /DescendantFonts [");
+    pos := pdfRef(out, pos, ttCidId);
+    pos := pdfStr(out, pos, "] /ToUnicode ");
+    pos := pdfRef(out, pos, ttTuId);
+    pos := pdfStr(out, pos, " >>");
+    pos := pdfObjFtr(out, pos);
+
+    tti := tti + 1;
   }
 
   var xrefStart: int64 := pos;
