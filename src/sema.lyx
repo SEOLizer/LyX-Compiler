@@ -256,6 +256,11 @@ pub type Sema = class {
   debugInfoEnabled:   int64;  // 0=off (default), 1=on
   optLevel:           int64;  // 2=default, 0=none, 1=min, 3=aggressive
 
+  // WP-AS-15: Definite Assignment Analysis (DAA)
+  daaEnabled: int64;   // 0=off (default in v0.9, opt-in), 1=warn, 2=error
+  daaBuf:     int64;   // mmap'd scratch buffer for DAA uninit-set {namePtr:8, nameLen:8} * 256
+  daaCapacity: int64;  // max entries in daaBuf
+
   // WP-EN-03: @energy top-level directive state
   energyLevel: int64;  // 0=not set, 1-5=active
 
@@ -402,6 +407,19 @@ pub type Sema = class {
       line := self.sn_tokLine(tokIdx);
     }
     self._error(msg, line);
+  }
+
+  // WP-AS-15: emit a warning (does not increment errorCount)
+  fn _warnNode(msg: pchar, ni: int64) {
+    var tokIdx: int64 := self.sn_tokIdx(ni);
+    var line: int64 := 0;
+    if (tokIdx >= 0 && tokIdx < self.pTokCount) {
+      line := self.sn_tokLine(tokIdx);
+    }
+    PrintStr("warning(line "c);
+    PrintInt(line);
+    PrintStr("): "c);
+    PrintStrLn(msg);
   }
 
   // ------------------------------------------------------------------
@@ -1292,15 +1310,132 @@ pub type Sema = class {
 
     // Check body (c2)
     var body: int64 := self.sn_c2(ni);
-    if (body >= 0) { 
+    if (body >= 0) {
       // WP-13: Analyze body for nested function captures
       self._analyzeCaptures(body, funcName, funcNameLen);
-      self._checkStmt(body); 
+      self._checkStmt(body);
+      // WP-AS-15: DAA — check after body so locals are known
+      if (self.daaEnabled != 0) { self._daaBlock(body, 0); }
     }
 
     self._popScope();
   }
-  
+
+  // WP-AS-15: mark a name as initialized in the uninit set (remove entry)
+  fn _daaMarkInit(nm: pchar, nl: int64, uninitCount: int64): int64 {
+    var i: int64 := 0;
+    while (i < uninitCount) {
+      var ePtr: pchar := peek64(self.daaBuf + i * 16) as pchar;
+      var eLen: int64 := peek64(self.daaBuf + i * 16 + 8);
+      if (self._strNEq(nm, nl, ePtr, eLen)) {
+        // Shift remaining entries down
+        var j: int64 := i;
+        while (j < uninitCount - 1) {
+          poke64(self.daaBuf + j * 16,     peek64(self.daaBuf + (j + 1) * 16));
+          poke64(self.daaBuf + j * 16 + 8, peek64(self.daaBuf + (j + 1) * 16 + 8));
+          j := j + 1;
+        }
+        return uninitCount - 1;
+      }
+      i := i + 1;
+    }
+    return uninitCount;
+  }
+
+  // WP-AS-15: check expression for reads of uninit vars; returns uninitCount unchanged
+  fn _daaCheckExpr(ni: int64, uninitCount: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_FUNC_DECL) { return; }  // nested fn: own scope, skip
+    if (k == SNK_IDENT) {
+      var nm: pchar := self.sn_sVal(ni);
+      var nl: int64 := self.sn_sLen(ni);
+      var i: int64 := 0;
+      while (i < uninitCount) {
+        var ePtr: pchar := peek64(self.daaBuf + i * 16) as pchar;
+        var eLen: int64 := peek64(self.daaBuf + i * 16 + 8);
+        if (self._strNEq(nm, nl, ePtr, eLen)) {
+          if (self.daaEnabled >= 2) {
+            self._errorNode("variable used before initialization"c, ni);
+          } else {
+            self._warnNode("variable possibly used before initialization"c, ni);
+          }
+        }
+        i := i + 1;
+      }
+      return;
+    }
+    // Recurse into children
+    self._daaCheckExpr(self.sn_c0(ni), uninitCount);
+    self._daaCheckExpr(self.sn_c1(ni), uninitCount);
+    self._daaCheckExpr(self.sn_c2(ni), uninitCount);
+    self._daaCheckExpr(self.sn_c3(ni), uninitCount);
+  }
+
+  // WP-AS-15: walk a block sequentially, tracking uninit vars.
+  // Returns updated uninitCount (for caller to ignore — we mutate daaBuf in place).
+  fn _daaBlock(blockNi: int64, uninitCount: int64): int64 {
+    if (blockNi < 0) { return uninitCount; }
+    var k: int64 := self.sn_kind(blockNi);
+    if (k == SNK_BLOCK) {
+      var stmt: int64 := self.sn_c0(blockNi);
+      while (stmt >= 0) {
+        uninitCount := self._daaStmt(stmt, uninitCount);
+        stmt := self.sn_next(stmt);
+      }
+    } else {
+      uninitCount := self._daaStmt(blockNi, uninitCount);
+    }
+    return uninitCount;
+  }
+
+  // WP-AS-15: handle a single statement in DAA pass
+  fn _daaStmt(ni: int64, uninitCount: int64): int64 {
+    if (ni < 0) { return uninitCount; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_VAR_DECL) {
+      var initExpr: int64 := self.sn_c1(ni);
+      if (initExpr >= 0) {
+        // Has initializer: check init expr, then var is initialized
+        self._daaCheckExpr(initExpr, uninitCount);
+      } else {
+        // No initializer: add to uninit set (zero-init makes it safe at runtime, but DAA warns)
+        if (uninitCount < self.daaCapacity) {
+          poke64(self.daaBuf + uninitCount * 16,     self.sn_sVal(ni) as int64);
+          poke64(self.daaBuf + uninitCount * 16 + 8, self.sn_sLen(ni));
+          uninitCount := uninitCount + 1;
+        }
+      }
+    } else if (k == SNK_ASSIGN) {
+      // Check RHS first (reads)
+      self._daaCheckExpr(self.sn_c1(ni), uninitCount);
+      // Mark LHS as initialized if it's a plain ident
+      var lhs: int64 := self.sn_c0(ni);
+      if (self.sn_kind(lhs) == SNK_IDENT) {
+        uninitCount := self._daaMarkInit(self.sn_sVal(lhs), self.sn_sLen(lhs), uninitCount);
+      }
+    } else if (k == SNK_BLOCK) {
+      uninitCount := self._daaBlock(ni, uninitCount);
+    } else if (k == SNK_IF) {
+      // Condition check
+      self._daaCheckExpr(self.sn_c0(ni), uninitCount);
+      // Conservative: recurse into branches without merging init sets
+      self._daaBlock(self.sn_c1(ni), uninitCount);
+      if (self.sn_c2(ni) >= 0) { self._daaBlock(self.sn_c2(ni), uninitCount); }
+    } else if (k == SNK_WHILE) {
+      self._daaCheckExpr(self.sn_c0(ni), uninitCount);
+      self._daaBlock(self.sn_c1(ni), uninitCount);
+    } else if (k == SNK_RETURN) {
+      self._daaCheckExpr(self.sn_c0(ni), uninitCount);
+    } else if (k == SNK_FUNC_DECL) {
+      // Nested function: skip (own scope)
+    } else {
+      // All other stmts: check all expressions recursively
+      self._daaCheckExpr(ni, uninitCount);
+    }
+    return uninitCount;
+  }
+
   // WP-13: Analyze nested function bodies for captured variables
   fn _analyzeCaptures(blockNi: int64, outerName: pchar, outerNameLen: int64) {
     if (blockNi < 0) { return; }
@@ -2004,6 +2139,11 @@ pub type Sema = class {
     self.boundsCheckEnabled := 1;  // on by default (safety-first)
     self.debugInfoEnabled   := 0;
     self.optLevel           := 2;  // default optimisation level
+
+    // WP-AS-15: DAA — off by default (opt-in in v0.9 via --daa CLI flag)
+    self.daaEnabled  := 0;
+    self.daaCapacity := 256;
+    self.daaBuf      := mmap(0, 256 * 16, 3, 34, -1, 0);
 
     // WP-EN-03
     self.energyLevel := 0;
