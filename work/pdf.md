@@ -193,7 +193,7 @@ PdfFlattenForms(doc)   // alle Felder in statischen Inhalt umwandeln
 
 ---
 
-### WP-PDF-17: Verschlüsselung & Passwortschutz ⬜
+### WP-PDF-17: Verschlüsselung & Passwortschutz ✅
 
 **Ziel:** PDF mit User- und Owner-Passwort schützen; Berechtigungen einschränken
 (Drucken, Kopieren, Bearbeiten).

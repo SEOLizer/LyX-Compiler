@@ -203,6 +203,34 @@ pub con PDF_DOC_RGBUF:            int64 := 3936;  // int64* radio group record b
 pub con PDF_DOC_FORMFLAT:         int64 := 3944;  // int64 1=flattened (skip AcroForm)
 pub con PDF_DOC_ACROOBJID:        int64 := 3952;  // int64 AcroForm dict object ID (0=none)
 
+// WP-PDF-17: Encryption (Standard Security Handler, RC4-128)
+pub con PDF_DOC_ENCTYPE:          int64 := 3960;  // int64 0=none 1=RC4-128
+pub con PDF_DOC_ENCPERMS:         int64 := 3968;  // int64 permission flags (PDF P value)
+pub con PDF_DOC_ENCUPWD:          int64 := 3976;  // int64* user  password (≤32 bytes, mmap'd)
+pub con PDF_DOC_ENCOPWD:          int64 := 3984;  // int64* owner password (≤32 bytes, mmap'd)
+pub con PDF_DOC_ENCFKEY:          int64 := 3992;  // int64* 16-byte file encryption key
+pub con PDF_DOC_ENCOKEY:          int64 := 4000;  // int64* 32-byte /O value
+pub con PDF_DOC_ENCUKEY:          int64 := 4008;  // int64* 32-byte /U value
+pub con PDF_DOC_ENCREADY:         int64 := 4016;  // int64 1=keys computed
+pub con PDF_DOC_ENCCURID:         int64 := 4024;  // int64 current object ID during PdfSave
+
+// Encryption type constants
+pub con PDF_ENC_NONE:             int64 := 0;
+pub con PDF_ENC_RC4_128:          int64 := 1;
+pub con PDF_ENC_AES128:           int64 := 2;   // reserved (not implemented)
+pub con PDF_ENC_AES256:           int64 := 3;   // reserved (not implemented)
+
+// Permission bit constants (OR together for PdfSetPermissions)
+pub con PDF_PERM_PRINT:           int64 := 4;     // bit 3
+pub con PDF_PERM_MODIFY:          int64 := 8;     // bit 4
+pub con PDF_PERM_COPY:            int64 := 16;    // bit 5
+pub con PDF_PERM_ANNOT:           int64 := 32;    // bit 6
+pub con PDF_PERM_FILL:            int64 := 256;   // bit 9
+pub con PDF_PERM_EXTRACT:         int64 := 512;   // bit 10
+pub con PDF_PERM_ASSEMBLE:        int64 := 1024;  // bit 11
+pub con PDF_PERM_PRINT_HQ:        int64 := 2048;  // bit 12
+pub con PDF_PERM_ALL:             int64 := 3900;  // all above bits
+
 // Form field record layout (120 bytes each)
 pub con PDF_FORM_TYPE:            int64 := 0;    // int64: 1=text 2=checkbox 3=radio 4=combo
 pub con PDF_FORM_PAGE:            int64 := 8;    // int64: page index
@@ -411,6 +439,9 @@ pub fn PdfNew(): int64 {
   var pagePrecomp: int64 := mmapAlloc(arrSize);
   if (pagePrecomp != 0) { zeroMem(pagePrecomp, arrSize); }
   poke64(doc + PDF_DOC_PAGEPRECOMP, pagePrecomp);
+
+  // Encryption fields (WP-PDF-17) — zeroed by zeroMem above; no extra allocation needed
+  // PDF_DOC_ENCTYPE=0 (none), passwords/keys allocated lazily on PdfSetEncryption
 
   // AcroForms buffer (WP-PDF-18)
   var formBufInit: int64 := mmapAlloc(PDF_FORM_INITIAL_CAP * PDF_FORM_RECSIZE);
@@ -743,6 +774,18 @@ pub fn PdfFree(doc: int64): void {
 
   var pgPrecomp: int64 := peek64(doc + PDF_DOC_PAGEPRECOMP);
   if (pgPrecomp != 0) { munmap(pgPrecomp, arrSize); }
+
+  // Free encryption buffers (WP-PDF-17)
+  var encUpwd: int64 := peek64(doc + PDF_DOC_ENCUPWD);
+  var encOpwd: int64 := peek64(doc + PDF_DOC_ENCOPWD);
+  var encFkey: int64 := peek64(doc + PDF_DOC_ENCFKEY);
+  var encOkey: int64 := peek64(doc + PDF_DOC_ENCOKEY);
+  var encUkey: int64 := peek64(doc + PDF_DOC_ENCUKEY);
+  if (encUpwd != 0) { munmap(encUpwd, 32); }
+  if (encOpwd != 0) { munmap(encOpwd, 32); }
+  if (encFkey != 0) { munmap(encFkey, 16); }
+  if (encOkey != 0) { munmap(encOkey, 32); }
+  if (encUkey != 0) { munmap(encUkey, 32); }
 
   // Free form field name/value strings and buffer (WP-PDF-18)
   var formCount6: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
@@ -1353,12 +1396,441 @@ fn _pdfTransForPage(buf: int64, count: int64, pageIdx: int64): int64 {
 }
 
 // ============================================================================
+// WP-PDF-17: RC4-128 encryption (Standard Security Handler, V=2, R=3)
+// ============================================================================
+
+// MD5 round-constant table: 64 × uint32 stored as int64 in a mmap'd buffer.
+fn _md5FillK(k: int64): void {
+  poke64(k,    0xD76AA478); poke64(k+8,   0xE8C7B756); poke64(k+16,  0x242070DB); poke64(k+24,  0xC1BDCEEE);
+  poke64(k+32, 0xF57C0FAF); poke64(k+40,  0x4787C62A); poke64(k+48,  0xA8304613); poke64(k+56,  0xFD469501);
+  poke64(k+64, 0x698098D8); poke64(k+72,  0x8B44F7AF); poke64(k+80,  0xFFFF5BB1); poke64(k+88,  0x895CD7BE);
+  poke64(k+96, 0x6B901122); poke64(k+104, 0xFD987193); poke64(k+112, 0xA679438E); poke64(k+120, 0x49B40821);
+  poke64(k+128,0xF61E2562); poke64(k+136, 0xC040B340); poke64(k+144, 0x265E5A51); poke64(k+152, 0xE9B6C7AA);
+  poke64(k+160,0xD62F105D); poke64(k+168, 0x02441453); poke64(k+176, 0xD8A1E681); poke64(k+184, 0xE7D3FBC8);
+  poke64(k+192,0x21E1CDE6); poke64(k+200, 0xC33707D6); poke64(k+208, 0xF4D50D87); poke64(k+216, 0x455A14ED);
+  poke64(k+224,0xA9E3E905); poke64(k+232, 0xFCEFA3F8); poke64(k+240, 0x676F02D9); poke64(k+248, 0x8D2A4C8A);
+  poke64(k+256,0xFFFA3942); poke64(k+264, 0x8771F681); poke64(k+272, 0x6D9D6122); poke64(k+280, 0xFDE5380C);
+  poke64(k+288,0xA4BEEA44); poke64(k+296, 0x4BDECFA9); poke64(k+304, 0xF6BB4B60); poke64(k+312, 0xBEBFBC70);
+  poke64(k+320,0x289B7EC6); poke64(k+328, 0xEAA127FA); poke64(k+336, 0xD4EF3085); poke64(k+344, 0x04881D05);
+  poke64(k+352,0xD9D4D039); poke64(k+360, 0xE6DB99E5); poke64(k+368, 0x1FA27CF8); poke64(k+376, 0xC4AC5665);
+  poke64(k+384,0xF4292244); poke64(k+392, 0x432AFF97); poke64(k+400, 0xAB9423A7); poke64(k+408, 0xFC93A039);
+  poke64(k+416,0x655B59C3); poke64(k+424, 0x8F0CCC92); poke64(k+432, 0xFFEFF47D); poke64(k+440, 0x85845DD1);
+  poke64(k+448,0x6FA87E4F); poke64(k+456, 0xFE2CE6E0); poke64(k+464, 0xA3014314); poke64(k+472, 0x4E0811A1);
+  poke64(k+480,0xF7537E82); poke64(k+488, 0xBD3AF235); poke64(k+496, 0x2AD7D2BB); poke64(k+504, 0xEB86D391);
+}
+
+// Process one 64-byte MD5 block. state = 4×int64 (a,b,c,d). kbuf = 64 K constants.
+fn _md5Block(state: int64, block: int64, kbuf: int64): void {
+  var a: int64 := peek64(state);
+  var b: int64 := peek64(state + 8);
+  var c: int64 := peek64(state + 16);
+  var d: int64 := peek64(state + 24);
+  var i: int64 := 0;
+  while (i < 64) {
+    var f: int64 := 0;  var g: int64 := 0;  var s: int64 := 0;
+    var si: int64 := i & 3;
+    if (i < 16) {
+      f := (b & c) | ((~b) & 0xFFFFFFFF & d);
+      g := i;
+      if (si==0){s:=7;}else if(si==1){s:=12;}else if(si==2){s:=17;}else{s:=22;}
+    } else if (i < 32) {
+      f := (d & b) | ((~d) & 0xFFFFFFFF & c);
+      g := (5 * i + 1) & 15;
+      if (si==0){s:=5;}else if(si==1){s:=9;}else if(si==2){s:=14;}else{s:=20;}
+    } else if (i < 48) {
+      f := b ^ c ^ d;
+      g := (3 * i + 5) & 15;
+      if (si==0){s:=4;}else if(si==1){s:=11;}else if(si==2){s:=16;}else{s:=23;}
+    } else {
+      f := c ^ (b | ((~d) & 0xFFFFFFFF));
+      g := (7 * i) & 15;
+      if (si==0){s:=6;}else if(si==1){s:=10;}else if(si==2){s:=15;}else{s:=21;}
+    }
+    var wg: int64 := ( peek8(block+g*4) | (peek8(block+g*4+1)<<8) |
+                       (peek8(block+g*4+2)<<16) | (peek8(block+g*4+3)<<24) ) & 0xFFFFFFFF;
+    var tmp: int64 := (f + a + peek64(kbuf + i*8) + wg) & 0xFFFFFFFF;
+    tmp := ((tmp << s) | ((tmp & 0xFFFFFFFF) >> (32 - s))) & 0xFFFFFFFF;
+    a := d;  d := c;  c := b;
+    b := (b + tmp) & 0xFFFFFFFF;
+    i := i + 1;
+  }
+  poke64(state,      (peek64(state)      + a) & 0xFFFFFFFF);
+  poke64(state + 8,  (peek64(state + 8)  + b) & 0xFFFFFFFF);
+  poke64(state + 16, (peek64(state + 16) + c) & 0xFFFFFFFF);
+  poke64(state + 24, (peek64(state + 24) + d) & 0xFFFFFFFF);
+}
+
+// Compute MD5(data, len) → 16 bytes at output.
+fn _md5(data: int64, len: int64, output: int64): void {
+  var state: int64 := mmap(0, 32,  3, 34, -1, 0);
+  var kbuf:  int64 := mmap(0, 512, 3, 34, -1, 0);
+  var pbuf:  int64 := mmap(0, 128, 3, 34, -1, 0);
+  if (state == 0 || kbuf == 0 || pbuf == 0) {
+    if (state != 0) { munmap(state, 32); }
+    if (kbuf  != 0) { munmap(kbuf,  512); }
+    if (pbuf  != 0) { munmap(pbuf,  128); }
+    return;
+  }
+  // Init state: a b c d
+  poke64(state,      0x67452301);
+  poke64(state + 8,  0xEFCDAB89);
+  poke64(state + 16, 0x98BADCFE);
+  poke64(state + 24, 0x10325476);
+  _md5FillK(kbuf);
+  // Process full 64-byte blocks
+  var off: int64 := 0;
+  while (off + 64 <= len) {
+    _md5Block(state, data + off, kbuf);
+    off := off + 64;
+  }
+  // Build padding block(s)
+  var rem: int64 := len - off;
+  var pi: int64 := 0;
+  while (pi < rem) { poke8(pbuf + pi, peek8(data + off + pi)); pi := pi + 1; }
+  poke8(pbuf + rem, 0x80);
+  var fillTo: int64 := 56;
+  if (rem >= 56) { fillTo := 120; }
+  pi := rem + 1;
+  while (pi < fillTo) { poke8(pbuf + pi, 0); pi := pi + 1; }
+  // Length in bits, little-endian 64-bit
+  var bits: int64 := len * 8;
+  poke8(pbuf+fillTo,   bits        & 0xFF);
+  poke8(pbuf+fillTo+1, (bits >>  8) & 0xFF);
+  poke8(pbuf+fillTo+2, (bits >> 16) & 0xFF);
+  poke8(pbuf+fillTo+3, (bits >> 24) & 0xFF);
+  poke8(pbuf+fillTo+4, (bits >> 32) & 0xFF);
+  poke8(pbuf+fillTo+5, (bits >> 40) & 0xFF);
+  poke8(pbuf+fillTo+6, (bits >> 48) & 0xFF);
+  poke8(pbuf+fillTo+7, (bits >> 56) & 0xFF);
+  _md5Block(state, pbuf, kbuf);
+  if (fillTo == 120) { _md5Block(state, pbuf + 64, kbuf); }
+  // Output: 4 words in LE order
+  var wi: int64 := 0;
+  while (wi < 4) {
+    var w: int64 := peek64(state + wi * 8);
+    poke8(output + wi*4,   w        & 0xFF);
+    poke8(output + wi*4+1, (w >> 8)  & 0xFF);
+    poke8(output + wi*4+2, (w >> 16) & 0xFF);
+    poke8(output + wi*4+3, (w >> 24) & 0xFF);
+    wi := wi + 1;
+  }
+  munmap(state, 32);  munmap(kbuf, 512);  munmap(pbuf, 128);
+}
+
+// RC4 Key-Scheduling Algorithm. state: 256-byte buffer, key: keyLen bytes.
+fn _rc4Init(state: int64, key: int64, keyLen: int64): void {
+  var i: int64 := 0;
+  while (i < 256) { poke8(state + i, i); i := i + 1; }
+  var j: int64 := 0;
+  i := 0;
+  while (i < 256) {
+    j := (j + peek8(state+i) + peek8(key + (i & (keyLen-1)))) & 0xFF;  // keyLen must be power-of-2 for & trick
+    // safer: j := (j + peek8(state+i) + peek8(key + (i % keyLen))) & 0xFF; but % not available
+    var tmp: int64 := peek8(state+i); poke8(state+i, peek8(state+j)); poke8(state+j, tmp);
+    i := i + 1;
+  }
+}
+
+// RC4 encrypt/decrypt: data in-place (or outbuf != data for separate buffers).
+fn _rc4Crypt(state: int64, data: int64, len: int64): void {
+  var i: int64 := 0;  var j: int64 := 0;  var k: int64 := 0;
+  while (k < len) {
+    i := (i + 1) & 0xFF;
+    j := (j + peek8(state + i)) & 0xFF;
+    var tmp: int64 := peek8(state+i); poke8(state+i, peek8(state+j)); poke8(state+j, tmp);
+    var ks: int64 := peek8(state + ((peek8(state+i) + peek8(state+j)) & 0xFF));
+    poke8(data + k, peek8(data + k) ^ ks);
+    k := k + 1;
+  }
+}
+
+// RC4 with modulo keyLen (for non-power-of-2 key lengths like 16).
+fn _rc4InitMod(state: int64, key: int64, keyLen: int64): void {
+  var i: int64 := 0;
+  while (i < 256) { poke8(state + i, i); i := i + 1; }
+  var j: int64 := 0;
+  i := 0;
+  while (i < 256) {
+    var ki: int64 := i;
+    while (ki >= keyLen) { ki := ki - keyLen; }  // ki = i % keyLen
+    j := (j + peek8(state+i) + peek8(key + ki)) & 0xFF;
+    var tmp: int64 := peek8(state+i); poke8(state+i, peek8(state+j)); poke8(state+j, tmp);
+    i := i + 1;
+  }
+}
+
+// Compute per-object RC4 key: MD5(fileKey[0..15] + objId[0..2] + {0,0}).
+// Output: 16 bytes at keyOut.
+fn _pdfObjKey(fileKey: int64, objId: int64, keyOut: int64): void {
+  var tmp: int64 := mmap(0, 21, 3, 34, -1, 0);
+  if (tmp == 0) { return; }
+  var ti: int64 := 0;
+  while (ti < 16) { poke8(tmp+ti, peek8(fileKey+ti)); ti:=ti+1; }
+  poke8(tmp+16, objId         & 0xFF);
+  poke8(tmp+17, (objId >>  8) & 0xFF);
+  poke8(tmp+18, (objId >> 16) & 0xFF);
+  poke8(tmp+19, 0);  poke8(tmp+20, 0);
+  _md5(tmp, 21, keyOut);
+  munmap(tmp, 21);
+}
+
+// Encrypt a mmap'd stream buffer in-place using RC4 with per-object key.
+fn _pdfEncryptStream(doc: int64, objId: int64, buf: int64, len: int64): void {
+  var fileKey: int64 := peek64(doc + PDF_DOC_ENCFKEY);
+  if (fileKey == 0 || buf == 0 || len <= 0) { return; }
+  var objKey:  int64 := mmap(0, 16, 3, 34, -1, 0);
+  var state:   int64 := mmap(0, 256, 3, 34, -1, 0);
+  if (objKey == 0 || state == 0) {
+    if (objKey != 0) { munmap(objKey, 16); }
+    if (state  != 0) { munmap(state,  256); }
+    return;
+  }
+  _pdfObjKey(fileKey, objId, objKey);
+  _rc4InitMod(state, objKey, 16);
+  _rc4Crypt(state, buf, len);
+  munmap(objKey, 16);  munmap(state, 256);
+}
+
+// Encrypt string bytes and write as hex <..> to output buffer. Returns new pos.
+fn _pdfEncStr(out: int64, pos: int64, src: int64, len: int64, doc: int64, objId: int64): int64 {
+  var fileKey: int64 := peek64(doc + PDF_DOC_ENCFKEY);
+  if (fileKey == 0 || src == 0 || len <= 0) {
+    // Fallback: write unencrypted as literal
+    poke8(out+pos, 40); pos:=pos+1;
+    var fi: int64 := 0;
+    while (fi < len) { var fc: int64 := peek8(src+fi); if(fc==40||fc==41||fc==92){poke8(out+pos,92);pos:=pos+1;} poke8(out+pos,fc);pos:=pos+1;fi:=fi+1; }
+    poke8(out+pos, 41); pos:=pos+1;
+    return pos;
+  }
+  var objKey: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var enc:    int64 := mmap(0, len, 3, 34, -1, 0);
+  var state:  int64 := mmap(0, 256, 3, 34, -1, 0);
+  if (objKey == 0 || enc == 0 || state == 0) {
+    if (objKey != 0) { munmap(objKey, 16); }
+    if (enc    != 0) { munmap(enc, len); }
+    if (state  != 0) { munmap(state, 256); }
+    return pos;
+  }
+  var ci: int64 := 0;
+  while (ci < len) { poke8(enc+ci, peek8(src+ci)); ci:=ci+1; }
+  _pdfObjKey(fileKey, objId, objKey);
+  _rc4InitMod(state, objKey, 16);
+  _rc4Crypt(state, enc, len);
+  poke8(out+pos, 60); pos:=pos+1;  // '<'
+  var hi: int64 := 0;
+  while (hi < len) {
+    var hb: int64 := peek8(enc+hi);
+    var hn: int64 := (hb >> 4) & 0xF;  var hl: int64 := hb & 0xF;
+    if (hn < 10) { poke8(out+pos, 48+hn); } else { poke8(out+pos, 55+hn); } pos:=pos+1;
+    if (hl < 10) { poke8(out+pos, 48+hl); } else { poke8(out+pos, 55+hl); } pos:=pos+1;
+    hi := hi + 1;
+  }
+  poke8(out+pos, 62); pos:=pos+1;  // '>'
+  munmap(objKey, 16);  munmap(enc, len);  munmap(state, 256);
+  return pos;
+}
+
+// PDF standard password padding string (32 bytes, Algorithm 2 step 1).
+fn _pdfPadPwd(src: pchar, out: int64): void {
+  var pad: pchar := "\x28\xBF\x4E\x5E\x4E\x75\x8A\x41\x64\x00\x4E\x56\xFF\xFA\x01\x08\x2E\x2E\x00\xB6\xD0\x68\x3E\x80\x2F\x0C\xA9\xFE\x64\x53\x69\x7A"c;
+  var srcLen: int64 := 0;
+  if (src != 0) { srcLen := StrLen(src); if (srcLen > 32) { srcLen := 32; } }
+  var i: int64 := 0;
+  while (i < srcLen) { poke8(out+i, StrCharAt(src, i)); i:=i+1; }
+  while (i < 32) { poke8(out+i, StrCharAt(pad, i-srcLen)); i:=i+1; }
+}
+
+// Compute all encryption keys and store in doc struct.
+// Implements PDF Standard Security Handler R=3, V=2, 128-bit RC4.
+fn _pdfPrepareEncryption(doc: int64): void {
+  if (peek64(doc + PDF_DOC_ENCREADY) != 0) { return; }
+  // Allocate /Encrypt dict object ID
+  var encId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, encId + 1);
+  poke64(doc + PDF_DOC_ENCCURID, encId);
+  // Allocate output buffers
+  var fileKey: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var oKey:    int64 := mmap(0, 32, 3, 34, -1, 0);
+  var uKey:    int64 := mmap(0, 32, 3, 34, -1, 0);
+  var tmp:     int64 := mmap(0, 128, 3, 34, -1, 0);
+  var state:   int64 := mmap(0, 256, 3, 34, -1, 0);
+  if (fileKey==0||oKey==0||uKey==0||tmp==0||state==0) {
+    if(fileKey!=0){munmap(fileKey,16);} if(oKey!=0){munmap(oKey,32);} if(uKey!=0){munmap(uKey,32);}
+    if(tmp!=0){munmap(tmp,128);} if(state!=0){munmap(state,256);}
+    return;
+  }
+  // --- Algorithm 3: Compute /O (owner key) ---
+  var pwdBuf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (pwdBuf == 0) {
+    munmap(fileKey,16);munmap(oKey,32);munmap(uKey,32);munmap(tmp,128);munmap(state,256);
+    return;
+  }
+  // 3a: MD5(pad(ownerPassword)) × 51
+  var opwd: pchar := 0;
+  var opwdBuf: int64 := peek64(doc + PDF_DOC_ENCOPWD);
+  // Treat ownerPassword; if none, use userPassword
+  var upwdBuf: int64 := peek64(doc + PDF_DOC_ENCUPWD);
+  _pdfPadPwd(0, pwdBuf);  // pad with empty owner password → use padding only
+  if (opwdBuf != 0) {
+    var oi: int64 := 0;
+    while (oi < 32) { poke8(pwdBuf+oi, peek8(opwdBuf+oi)); oi:=oi+1; }
+  } else if (upwdBuf != 0) {
+    // fallback: use user password as owner password
+    var oi2: int64 := 0;
+    while (oi2 < 32) { poke8(pwdBuf+oi2, peek8(upwdBuf+oi2)); oi2:=oi2+1; }
+  }
+  _md5(pwdBuf, 32, tmp);
+  // 50 additional MD5 rounds
+  var ri: int64 := 0;
+  while (ri < 50) { _md5(tmp, 16, tmp); ri:=ri+1; }
+  // tmp[0..15] = owner RC4 key
+  // 3b: RC4-encrypt padded user password with owner RC4 key
+  _pdfPadPwd(0, pwdBuf);  // pad(userPassword)
+  if (upwdBuf != 0) {
+    var ui2: int64 := 0;
+    while (ui2 < 32) { poke8(pwdBuf+ui2, peek8(upwdBuf+ui2)); ui2:=ui2+1; }
+  }
+  _rc4InitMod(state, tmp, 16);
+  _rc4Crypt(state, pwdBuf, 32);  // oKey intermediate
+  // 3c: 19 more RC4 rounds with key XOR i
+  var xorKey: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (xorKey != 0) {
+    var step: int64 := 1;
+    while (step <= 19) {
+      var xi: int64 := 0;
+      while (xi < 16) { poke8(xorKey+xi, peek8(tmp+xi) ^ step); xi:=xi+1; }
+      _rc4InitMod(state, xorKey, 16);
+      _rc4Crypt(state, pwdBuf, 32);
+      step := step + 1;
+    }
+    munmap(xorKey, 16);
+  }
+  var oci: int64 := 0;
+  while (oci < 32) { poke8(oKey+oci, peek8(pwdBuf+oci)); oci:=oci+1; }
+  // --- Algorithm 2: Compute file encryption key ---
+  // Input: pad(userPwd) + /O + P (4 bytes LE) + fileId (16 bytes zero)
+  _pdfPadPwd(0, tmp);
+  if (upwdBuf != 0) {
+    var ui3: int64 := 0;
+    while (ui3 < 32) { poke8(tmp+ui3, peek8(upwdBuf+ui3)); ui3:=ui3+1; }
+  }
+  var ti: int64 := 32;
+  while (ti < 64) { poke8(tmp+ti, peek8(oKey+(ti-32))); ti:=ti+1; }
+  var perms: int64 := peek64(doc + PDF_DOC_ENCPERMS);
+  poke8(tmp+64, perms         & 0xFF);
+  poke8(tmp+65, (perms >>  8) & 0xFF);
+  poke8(tmp+66, (perms >> 16) & 0xFF);
+  poke8(tmp+67, (perms >> 24) & 0xFF);
+  // fileId: 16 zero bytes (positions 68..83)
+  var zi: int64 := 68; while (zi < 84) { poke8(tmp+zi, 0); zi:=zi+1; }
+  _md5(tmp, 84, fileKey);
+  // 50 extra MD5 rounds
+  var ri2: int64 := 0;
+  while (ri2 < 50) { _md5(fileKey, 16, fileKey); ri2:=ri2+1; }
+  // fileKey[0..15] = file encryption key
+  // --- Algorithm 4a: Compute /U (R=3) ---
+  // h = MD5(padding + fileId(16 zeros))
+  var padBuf: int64 := mmap(0, 48, 3, 34, -1, 0);
+  if (padBuf != 0) {
+    _pdfPadPwd(0, padBuf);  // 32 bytes padding
+    var pi2: int64 := 32; while (pi2 < 48) { poke8(padBuf+pi2, 0); pi2:=pi2+1; }
+    _md5(padBuf, 48, tmp);   // tmp[0..15] = h
+    munmap(padBuf, 48);
+  }
+  // RC4-encrypt h with fileKey
+  _rc4InitMod(state, fileKey, 16);
+  _rc4Crypt(state, tmp, 16);
+  // 19 more rounds XOR
+  var xk2: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (xk2 != 0) {
+    var step2: int64 := 1;
+    while (step2 <= 19) {
+      var xi2: int64 := 0;
+      while (xi2 < 16) { poke8(xk2+xi2, peek8(fileKey+xi2) ^ step2); xi2:=xi2+1; }
+      _rc4InitMod(state, xk2, 16);
+      _rc4Crypt(state, tmp, 16);
+      step2 := step2 + 1;
+    }
+    munmap(xk2, 16);
+  }
+  // /U = tmp[0..15] + 16 zero bytes
+  var uki: int64 := 0;
+  while (uki < 16) { poke8(uKey+uki, peek8(tmp+uki)); uki:=uki+1; }
+  while (uki < 32) { poke8(uKey+uki, 0); uki:=uki+1; }
+  // Store results
+  poke64(doc + PDF_DOC_ENCFKEY, fileKey);
+  poke64(doc + PDF_DOC_ENCOKEY, oKey);
+  poke64(doc + PDF_DOC_ENCUKEY, uKey);
+  poke64(doc + PDF_DOC_ENCREADY, 1);
+  munmap(pwdBuf,32); munmap(tmp,128); munmap(state,256);
+}
+
+// ============================================================================
+// WP-PDF-17: Public API — call before PdfSave
+// ============================================================================
+
+// Set user password (required for opening the document; max 32 bytes).
+pub fn PdfSetUserPassword(doc: int64, pwd: pchar): void {
+  if (doc == 0 || pwd == 0) { return; }
+  var buf: int64 := peek64(doc + PDF_DOC_ENCUPWD);
+  if (buf == 0) { buf := mmap(0, 32, 3, 34, -1, 0); if (buf==0){return;} poke64(doc + PDF_DOC_ENCUPWD, buf); }
+  var len: int64 := StrLen(pwd); if (len > 32) { len := 32; }
+  var i: int64 := 0;
+  while (i < len) { poke8(buf+i, StrCharAt(pwd, i)); i:=i+1; }
+  while (i < 32) { poke8(buf+i, 0); i:=i+1; }
+  poke64(doc + PDF_DOC_ENCREADY, 0);  // invalidate cached keys
+}
+
+// Set owner password (required for editing rights; max 32 bytes).
+pub fn PdfSetOwnerPassword(doc: int64, pwd: pchar): void {
+  if (doc == 0 || pwd == 0) { return; }
+  var buf: int64 := peek64(doc + PDF_DOC_ENCOPWD);
+  if (buf == 0) { buf := mmap(0, 32, 3, 34, -1, 0); if (buf==0){return;} poke64(doc + PDF_DOC_ENCOPWD, buf); }
+  var len: int64 := StrLen(pwd); if (len > 32) { len := 32; }
+  var i: int64 := 0;
+  while (i < len) { poke8(buf+i, StrCharAt(pwd, i)); i:=i+1; }
+  while (i < 32) { poke8(buf+i, 0); i:=i+1; }
+  poke64(doc + PDF_DOC_ENCREADY, 0);
+}
+
+// Set permission flags. OR together PDF_PERM_* constants for allowed operations.
+// Default: PDF_PERM_ALL (-4 = all allowed). Restrictions take effect with user password.
+pub fn PdfSetPermissions(doc: int64, flags: int64): void {
+  if (doc == 0) { return; }
+  // P = bits 13-32 all set (0xFFFFF000) | allowed bits 3-12 | bits 1-2 must be 0
+  var p: int64 := (0xFFFFF000 | (flags & 0xFFC)) & 0xFFFFFFFC;
+  poke64(doc + PDF_DOC_ENCPERMS, p);
+  poke64(doc + PDF_DOC_ENCREADY, 0);
+}
+
+// Enable encryption. Only PDF_ENC_RC4_128 is implemented; others are accepted
+// but degrade to RC4-128. Call PdfSetUserPassword before PdfSave.
+pub fn PdfSetEncryption(doc: int64, encType: int64): void {
+  if (doc == 0) { return; }
+  if (encType == PDF_ENC_NONE) {
+    poke64(doc + PDF_DOC_ENCTYPE,  PDF_ENC_NONE);
+    poke64(doc + PDF_DOC_ENCREADY, 0);
+    return;
+  }
+  poke64(doc + PDF_DOC_ENCTYPE, PDF_ENC_RC4_128);
+  // Default permissions: all allowed
+  if (peek64(doc + PDF_DOC_ENCPERMS) == 0) {
+    poke64(doc + PDF_DOC_ENCPERMS, 0xFFFFFFFC & 0xFFFFFFFF);
+  }
+  poke64(doc + PDF_DOC_ENCREADY, 0);
+}
+
+// ============================================================================
 // PdfSave — serialize document to a PDF file
 // Returns: 0 on success, negative on error
 // ============================================================================
 
 pub fn PdfSave(doc: int64, path: pchar): int64 {
   if (doc == 0) { return -1; }
+  // Prepare encryption keys before reading nextId (WP-PDF-17)
+  if (peek64(doc + PDF_DOC_ENCTYPE) != PDF_ENC_NONE) {
+    _pdfPrepareEncryption(doc);
+  }
 
   var pageCount:   int64 := peek64(doc + PDF_DOC_PAGECOUNT);
   var nextId:      int64 := peek64(doc + PDF_DOC_NEXTID);
@@ -1423,9 +1895,13 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var rgBuf:        int64 := peek64(doc + PDF_DOC_RGBUF);
   var formFlat:     int64 := peek64(doc + PDF_DOC_FORMFLAT);
   var acroObjId:    int64 := peek64(doc + PDF_DOC_ACROOBJID);
+  var encType:      int64 := peek64(doc + PDF_DOC_ENCTYPE);
+  var encReady:     int64 := peek64(doc + PDF_DOC_ENCREADY);
 
   // Allocate XRef offset table
-  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount + formCount + rgCount + 4) * 8;
+  var encObjAlloc: int64 := 0;
+  if (encType != PDF_ENC_NONE && encReady != 0) { encObjAlloc := 1; }
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount + formCount + rgCount + encObjAlloc + 4) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -2085,6 +2561,7 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
       if (czbuf != 0) {
         var czlen: int64 := zlibCompress(cbuf, clen, czbuf);
         if (czlen > 0) {
+          if (encType != PDF_ENC_NONE && encReady != 0) { _pdfEncryptStream(doc, contentId, czbuf, czlen); }
           pos := pdfStr(out, pos, "<< /Length ");
           pos := pdfInt(out, pos, czlen);
           pos := pdfStr(out, pos, " /Filter /FlateDecode >>\nstream\n");
@@ -2097,14 +2574,21 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
       }
     }
     if (emitted == 0) {
+      var encBuf: int64 := cbuf;
+      if (encType != PDF_ENC_NONE && encReady != 0 && clen > 0) {
+        encBuf := mmap(0, clen, 3, 34, -1, 0);
+        if (encBuf != 0) {
+          var eci: int64 := 0; while (eci < clen) { poke8(encBuf+eci, peek8(cbuf+eci)); eci:=eci+1; }
+          _pdfEncryptStream(doc, contentId, encBuf, clen);
+        } else { encBuf := cbuf; }
+      }
       pos := pdfStr(out, pos, "<< /Length ");
       pos := pdfInt(out, pos, clen);
       pos := pdfStr(out, pos, " >>\nstream\n");
-      if (clen > 0) {
-        pos := pdfBytes(out, pos, cbuf, clen);
-      }
+      if (clen > 0) { pos := pdfBytes(out, pos, encBuf, clen); }
       pos := pdfStr(out, pos, "endstream");
       pos := pdfObjFtr(out, pos);
+      if (encBuf != cbuf) { munmap(encBuf, clen); }
     }
 
     i := i + 1;
@@ -2115,12 +2599,34 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     poke64(xrefs + infoId * 8, pos);
     pos := pdfObjHdr(out, pos, infoId);
     pos := pdfStr(out, pos, "<<");
-    pos := _pdfMetaField(out, pos, " /Title ",    doc + PDF_DOC_META_TITLE,    256);
-    pos := _pdfMetaField(out, pos, " /Author ",   doc + PDF_DOC_META_AUTHOR,   256);
-    pos := _pdfMetaField(out, pos, " /Subject ",  doc + PDF_DOC_META_SUBJECT,  256);
-    pos := _pdfMetaField(out, pos, " /Keywords ", doc + PDF_DOC_META_KEYWORDS, 256);
-    pos := _pdfMetaField(out, pos, " /Creator ",  doc + PDF_DOC_META_CREATOR,  128);
-    pos := _pdfMetaField(out, pos, " /Producer ", doc + PDF_DOC_META_PRODUCER, 128);
+    if (encType != PDF_ENC_NONE && encReady != 0) {
+      // Encrypted metadata strings
+      var mfields: int64 := 6;
+      var moffs: int64 := 0;
+      while (mfields > 0) {
+        var msrc: int64 := 0;  var mkey: pchar := 0;  var mmax: int64 := 0;
+        if (moffs == 0) { msrc:=doc+PDF_DOC_META_TITLE;    mkey:=" /Title "c;    mmax:=256; }
+        else if(moffs==1){msrc:=doc+PDF_DOC_META_AUTHOR;   mkey:=" /Author "c;   mmax:=256; }
+        else if(moffs==2){msrc:=doc+PDF_DOC_META_SUBJECT;  mkey:=" /Subject "c;  mmax:=256; }
+        else if(moffs==3){msrc:=doc+PDF_DOC_META_KEYWORDS; mkey:=" /Keywords "c; mmax:=256; }
+        else if(moffs==4){msrc:=doc+PDF_DOC_META_CREATOR;  mkey:=" /Creator "c;  mmax:=128; }
+        else             {msrc:=doc+PDF_DOC_META_PRODUCER; mkey:=" /Producer "c; mmax:=128; }
+        if (peek8(msrc) != 0) {
+          pos := pdfStr(out, pos, mkey);
+          var mlen: int64 := 0;
+          while (mlen < mmax && peek8(msrc+mlen) != 0) { mlen:=mlen+1; }
+          pos := _pdfEncStr(out, pos, msrc, mlen, doc, infoId);
+        }
+        moffs := moffs + 1;  mfields := mfields - 1;
+      }
+    } else {
+      pos := _pdfMetaField(out, pos, " /Title ",    doc + PDF_DOC_META_TITLE,    256);
+      pos := _pdfMetaField(out, pos, " /Author ",   doc + PDF_DOC_META_AUTHOR,   256);
+      pos := _pdfMetaField(out, pos, " /Subject ",  doc + PDF_DOC_META_SUBJECT,  256);
+      pos := _pdfMetaField(out, pos, " /Keywords ", doc + PDF_DOC_META_KEYWORDS, 256);
+      pos := _pdfMetaField(out, pos, " /Creator ",  doc + PDF_DOC_META_CREATOR,  128);
+      pos := _pdfMetaField(out, pos, " /Producer ", doc + PDF_DOC_META_PRODUCER, 128);
+    }
     pos := pdfStr(out, pos, " >>");
     pos := pdfObjFtr(out, pos);
   }
@@ -2266,6 +2772,38 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   }
 
   // --- XRef section ---
+  // Emit /Encrypt dict object (WP-PDF-17)
+  if (encType != PDF_ENC_NONE && encReady != 0) {
+    var encDictId: int64 := peek64(doc + PDF_DOC_ENCCURID);
+    var encOKey: int64 := peek64(doc + PDF_DOC_ENCOKEY);
+    var encUKey: int64 := peek64(doc + PDF_DOC_ENCUKEY);
+    var encPerms: int64 := peek64(doc + PDF_DOC_ENCPERMS);
+    poke64(xrefs + encDictId * 8, pos);
+    pos := pdfObjHdr(out, pos, encDictId);
+    pos := pdfStr(out, pos, "<< /Filter /Standard /V 2 /R 3 /Length 128 /P ");
+    pos := pdfInt(out, pos, encPerms);
+    pos := pdfStr(out, pos, " /O <");
+    var oi: int64 := 0;
+    while (oi < 32) {
+      var ob: int64 := peek8(encOKey + oi);
+      var oh: int64 := (ob >> 4) & 0xF;  var ol: int64 := ob & 0xF;
+      if (oh < 10) { poke8(out+pos, 48+oh); } else { poke8(out+pos, 55+oh); } pos:=pos+1;
+      if (ol < 10) { poke8(out+pos, 48+ol); } else { poke8(out+pos, 55+ol); } pos:=pos+1;
+      oi := oi + 1;
+    }
+    pos := pdfStr(out, pos, "> /U <");
+    var ui: int64 := 0;
+    while (ui < 32) {
+      var ub: int64 := peek8(encUKey + ui);
+      var uh: int64 := (ub >> 4) & 0xF;  var ul2: int64 := ub & 0xF;
+      if (uh < 10) { poke8(out+pos, 48+uh); } else { poke8(out+pos, 55+uh); } pos:=pos+1;
+      if (ul2 < 10) { poke8(out+pos, 48+ul2); } else { poke8(out+pos, 55+ul2); } pos:=pos+1;
+      ui := ui + 1;
+    }
+    pos := pdfStr(out, pos, "> >>");
+    pos := pdfObjFtr(out, pos);
+  }
+
   var xrefStart: int64 := pos;
   var xrefCount: int64 := nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount;
 
@@ -2291,6 +2829,37 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   if (hasInfo != 0) {
     pos := pdfStr(out, pos, " /Info ");
     pos := pdfRef(out, pos, infoId);
+  }
+  // /Encrypt reference (WP-PDF-17)
+  if (encType != PDF_ENC_NONE && encReady != 0) {
+    var encObjId: int64 := peek64(doc + PDF_DOC_ENCCURID);
+    pos := pdfStr(out, pos, " /Encrypt ");
+    pos := pdfRef(out, pos, encObjId);
+    // /ID [<fileId> <fileId>] — use first 16 bytes of /U value as file ID
+    var uid: int64 := peek64(doc + PDF_DOC_ENCUKEY);
+    if (uid != 0) {
+      pos := pdfStr(out, pos, " /ID [<");
+      var ii: int64 := 0;
+      while (ii < 16) {
+        var hb: int64 := peek8(uid + ii);
+        var hn: int64 := (hb >> 4) & 0xF;
+        var ln: int64 := hb & 0xF;
+        if (hn < 10) { poke8(out+pos, 48+hn); } else { poke8(out+pos, 55+hn); } pos:=pos+1;
+        if (ln < 10) { poke8(out+pos, 48+ln); } else { poke8(out+pos, 55+ln); } pos:=pos+1;
+        ii := ii + 1;
+      }
+      pos := pdfStr(out, pos, "><");
+      ii := 0;
+      while (ii < 16) {
+        var hb2: int64 := peek8(uid + ii);
+        var hn2: int64 := (hb2 >> 4) & 0xF;
+        var ln2: int64 := hb2 & 0xF;
+        if (hn2 < 10) { poke8(out+pos, 48+hn2); } else { poke8(out+pos, 55+hn2); } pos:=pos+1;
+        if (ln2 < 10) { poke8(out+pos, 48+ln2); } else { poke8(out+pos, 55+ln2); } pos:=pos+1;
+        ii := ii + 1;
+      }
+      pos := pdfStr(out, pos, ">]");
+    }
   }
   pos := pdfStr(out, pos, " >>\nstartxref\n");
   pos := pdfInt(out, pos, xrefStart);
