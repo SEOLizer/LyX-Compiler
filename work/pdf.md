@@ -254,7 +254,7 @@ PdfTextAtUTF8(doc, page, 72.0, 720.0, "Привет мир")
 
 ---
 
-### WP-PDF-26: XMP-Metadaten ⬜
+### WP-PDF-26: XMP-Metadaten ✅
 
 **Ziel:** Extended Metadata Platform (XMP) als XML-Stream im Catalog —
 Voraussetzung für PDF/A.
