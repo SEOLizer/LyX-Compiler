@@ -125,7 +125,7 @@ PdfMergeAll(dst, src)                           // alle Seiten von src in dst
 
 ---
 
-### WP-PDF-21: Textextraktion im Reader ⬜
+### WP-PDF-21: Textextraktion im Reader ✅
 
 **Ziel:** Rohtext aus einer Seite des gelesenen PDFs extrahieren.
 
