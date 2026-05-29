@@ -276,7 +276,7 @@ PdfGenerateXMP(doc)           // automatisch aus /Info-Dict generieren
 
 ---
 
-### WP-PDF-27: PDF/A-Konformität ⬜
+### WP-PDF-27: PDF/A-Konformität ✅
 
 **Ziel:** PDF/A-1b-konformes Ausgabeformat für Langzeitarchivierung.
 
