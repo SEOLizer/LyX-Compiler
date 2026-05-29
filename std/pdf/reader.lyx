@@ -852,3 +852,304 @@ pub fn PdfMergeAll(dst: int64, src: int64): void {
     idx := idx + 1;
   }
 }
+
+// ============================================================================
+// WP-PDF-21: Text extraction from PDF content streams
+// ============================================================================
+
+// Return a pointer into the reader's mmap'd file data pointing at the first
+// byte of the content stream for objId. Stores stream length at PDF_RDR_TMP.
+// Returns 0 if the object is not found, has no stream, or is FlateDecode-
+// compressed (no decompressor available).
+fn _rdObjStreamRaw(rdr: int64, objId: int64): int64 {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var pos:  int64 := _rdObjStart(rdr, objId);
+  if (pos < 0 || pos + 1 >= size) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  if (peek8(data + pos) != 60 || peek8(data + pos + 1) != 60) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  var slen: int64 := _rdDictGetInt(rdr, pos + 2, "Length");
+  if (slen <= 0) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  // Reject compressed streams (FlateDecode)
+  var fp: int64 := _rdScanDictForKey(rdr, pos + 2, "Filter");
+  if (fp >= 0) {
+    fp := _rdSkipWs(rdr, fp);
+    if (_rdMatchStr(data, fp, "/FlateDecode") != 0) {
+      poke64(rdr + PDF_RDR_TMP, 0); return 0;
+    }
+  }
+  var sp: int64 := _rdFindStr(rdr, pos, "stream");
+  if (sp < 0) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  sp := sp + 6;
+  if (sp < size && peek8(data + sp) == 13) { sp := sp + 1; }
+  if (sp < size && peek8(data + sp) == 10) { sp := sp + 1; }
+  if (sp + slen > size) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  poke64(rdr + PDF_RDR_TMP, slen);
+  return data + sp;
+}
+
+// Parse a PDF content stream and write extracted text into buf (NUL-terminated).
+// Handles: BT/ET, Td/TD (line-break detection), Tj, TJ, literal and hex strings.
+// Line breaks are emitted as \n when a downward Td/TD move is detected.
+fn _exProcessStream(stream: int64, slen: int64, buf: int64, maxLen: int64): void {
+  var sp:      int64 := 0;
+  var bpos:    int64 := 0;
+  var inBT:    int64 := 0;
+  var hadText: int64 := 0;
+  var prevN:   int64 := 0;   // second-to-last parsed number (×100)
+  var lastN:   int64 := 0;   // most recent parsed number (×100)
+  var nc:      int64 := 0;   // numbers accumulated since last non-number token
+
+  while (sp < slen && bpos + 1 < maxLen) {
+    var c: int64 := peek8(stream + sp);
+
+    // Whitespace
+    if (c == 32 || c == 9 || c == 10 || c == 13) { sp := sp + 1; continue; }
+
+    // Comment: % to end of line
+    if (c == 37) {
+      while (sp < slen && peek8(stream + sp) != 10 && peek8(stream + sp) != 13) { sp := sp + 1; }
+      continue;
+    }
+
+    // Name (/Foo) — skip entirely, reset number accumulator
+    if (c == 47) {
+      sp := sp + 1;
+      while (sp < slen) {
+        var nc2: int64 := peek8(stream + sp);
+        if (nc2 <= 32 || nc2 == 47 || nc2 == 40 || nc2 == 41 || nc2 == 60 || nc2 == 62 || nc2 == 91 || nc2 == 93) { break; }
+        sp := sp + 1;
+      }
+      nc := 0;
+      continue;
+    }
+
+    // Number (integer or float, possibly negative)
+    if (c == 45 || c == 46 || (c >= 48 && c <= 57)) {
+      var neg: int64 := 0;
+      if (c == 45) { neg := 1; sp := sp + 1; }
+      var iv: int64 := 0;
+      while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57) {
+        iv := iv * 10 + (peek8(stream + sp) - 48); sp := sp + 1;
+      }
+      iv := iv * 100;
+      if (sp < slen && peek8(stream + sp) == 46) {
+        sp := sp + 1;
+        var frac: int64 := 0;  var fd: int64 := 0;
+        while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57 && fd < 2) {
+          frac := frac * 10 + (peek8(stream + sp) - 48); fd := fd + 1; sp := sp + 1;
+        }
+        while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57) { sp := sp + 1; }
+        if (fd == 1) { frac := frac * 10; }
+        iv := iv + frac;
+      }
+      if (neg != 0) { iv := 0 - iv; }
+      prevN := lastN;  lastN := iv;  nc := nc + 1;
+      continue;
+    }
+
+    // Literal string (...)
+    if (c == 40) {
+      sp := sp + 1;
+      var depth: int64 := 1;
+      while (sp < slen && depth > 0) {
+        var sc: int64 := peek8(stream + sp);
+        if (sc == 92 && sp + 1 < slen) {
+          sp := sp + 1;
+          var ec: int64 := peek8(stream + sp); sp := sp + 1;
+          if (ec == 10 || ec == 13) {
+            if (ec == 13 && sp < slen && peek8(stream + sp) == 10) { sp := sp + 1; }
+          } else if (ec >= 48 && ec <= 55) {
+            var oct: int64 := ec - 48;
+            if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { oct := oct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+            if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { oct := oct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+            if (inBT != 0 && oct >= 32 && oct <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, oct); bpos:=bpos+1; }
+          } else {
+            var out: int64 := ec;
+            if (ec == 110 || ec == 114) { out := 32; }
+            if (ec == 116) { out := 9; }
+            if (inBT != 0 && out >= 32 && out <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, out); bpos:=bpos+1; }
+          }
+        } else if (sc == 40) { depth := depth + 1; sp := sp + 1; }
+        else if (sc == 41) { depth := depth - 1; sp := sp + 1; }
+        else {
+          if (inBT != 0 && sc >= 32 && sc <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, sc); bpos:=bpos+1; }
+          sp := sp + 1;
+        }
+      }
+      if (inBT != 0) { hadText := 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Hex string <AB CD>  (not << which is a dict)
+    if (c == 60 && sp + 1 < slen && peek8(stream + sp + 1) != 60) {
+      sp := sp + 1;
+      while (sp < slen && peek8(stream + sp) != 62) {
+        var h1: int64 := peek8(stream + sp); sp := sp + 1;
+        if (h1 == 32 || h1 == 9 || h1 == 10 || h1 == 13) { continue; }
+        // second hex digit (optional if at >)
+        var h2: int64 := 48;  // default '0'
+        if (sp < slen && peek8(stream + sp) != 62) {
+          var hc: int64 := peek8(stream + sp);
+          if (hc != 32 && hc != 9 && hc != 10 && hc != 13) { h2 := hc; sp := sp + 1; }
+        }
+        var d1: int64 := 0;  var d2: int64 := 0;
+        if (h1 >= 48 && h1 <= 57) { d1 := h1 - 48; }
+        else if (h1 >= 65 && h1 <= 70) { d1 := h1 - 55; }
+        else if (h1 >= 97 && h1 <= 102) { d1 := h1 - 87; }
+        if (h2 >= 48 && h2 <= 57) { d2 := h2 - 48; }
+        else if (h2 >= 65 && h2 <= 70) { d2 := h2 - 55; }
+        else if (h2 >= 97 && h2 <= 102) { d2 := h2 - 87; }
+        var hb: int64 := d1 * 16 + d2;
+        if (inBT != 0 && hb >= 32 && hb <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, hb); bpos:=bpos+1; }
+      }
+      if (sp < slen) { sp := sp + 1; }
+      if (inBT != 0) { hadText := 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Dict << >> — skip
+    if (c == 60 && sp + 1 < slen && peek8(stream + sp + 1) == 60) {
+      sp := sp + 2;
+      var dd: int64 := 1;
+      while (sp + 1 < slen && dd > 0) {
+        if (peek8(stream+sp) == 60 && peek8(stream+sp+1) == 60) { dd:=dd+1; sp:=sp+2; }
+        else if (peek8(stream+sp) == 62 && peek8(stream+sp+1) == 62) { dd:=dd-1; sp:=sp+2; }
+        else { sp := sp + 1; }
+      }
+      nc := 0;
+      continue;
+    }
+
+    // Array [...] — TJ arguments: process strings inline, skip kerning numbers
+    if (c == 91) {
+      sp := sp + 1;
+      while (sp < slen && peek8(stream + sp) != 93) {
+        var ac: int64 := peek8(stream + sp);
+        if (ac == 32 || ac == 9 || ac == 10 || ac == 13) { sp:=sp+1; continue; }
+        if (ac == 40) {
+          sp := sp + 1;
+          var adepth: int64 := 1;
+          while (sp < slen && adepth > 0) {
+            var asc: int64 := peek8(stream + sp);
+            if (asc == 92 && sp + 1 < slen) {
+              sp := sp + 1;
+              var aec: int64 := peek8(stream + sp); sp := sp + 1;
+              if (aec >= 48 && aec <= 55) {
+                var aoct: int64 := aec - 48;
+                if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { aoct:=aoct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+                if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { aoct:=aoct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+                if (inBT != 0 && aoct >= 32 && aoct <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, aoct); bpos:=bpos+1; }
+              } else if (aec != 10 && aec != 13 && aec >= 32 && aec <= 126) {
+                if (inBT != 0 && bpos + 1 < maxLen) { poke8(buf+bpos, aec); bpos:=bpos+1; }
+              }
+            } else if (asc == 40) { adepth:=adepth+1; sp:=sp+1; }
+            else if (asc == 41) { adepth:=adepth-1; sp:=sp+1; }
+            else {
+              if (inBT != 0 && asc >= 32 && asc <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, asc); bpos:=bpos+1; }
+              sp := sp + 1;
+            }
+          }
+          if (inBT != 0) { hadText := 1; }
+          continue;
+        }
+        // Kerning number — skip
+        if (ac == 45 || ac == 46 || (ac >= 48 && ac <= 57)) {
+          if (ac == 45) { sp := sp + 1; }
+          while (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 57) { sp:=sp+1; }
+          if (sp < slen && peek8(stream+sp) == 46) { sp:=sp+1; while (sp<slen && peek8(stream+sp)>=48 && peek8(stream+sp)<=57) { sp:=sp+1; } }
+          continue;
+        }
+        sp := sp + 1;
+      }
+      if (sp < slen) { sp := sp + 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Operator: sequence of letters (and *)
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 39) {
+      var opStart: int64 := sp;
+      sp := sp + 1;
+      if (c != 39) {  // ' is single-char operator
+        while (sp < slen) {
+          var oc: int64 := peek8(stream + sp);
+          if (!((oc >= 65 && oc <= 90) || (oc >= 97 && oc <= 122) || oc == 42)) { break; }
+          sp := sp + 1;
+        }
+      }
+      var opLen: int64 := sp - opStart;
+      var c0: int64 := c;
+      var c1: int64 := 0;
+      if (opLen >= 2) { c1 := peek8(stream + opStart + 1); }
+
+      if (c0 == 66 && c1 == 84 && opLen == 2) {  // BT
+        inBT := 1; nc := 0; prevN := 0; lastN := 0;
+      } else if (c0 == 69 && c1 == 84 && opLen == 2) {  // ET
+        inBT := 0; nc := 0;
+      } else if (c0 == 84 && (c1 == 100 || c1 == 68) && opLen == 2) {  // Td / TD
+        // prevN=tx(×100), lastN=ty(×100); negative ty = move down = new line
+        if (nc >= 2 && lastN < -100 && hadText != 0 && bpos + 1 < maxLen) {
+          poke8(buf + bpos, 10); bpos := bpos + 1;
+        }
+        nc := 0;
+      } else if (c0 == 39 && opLen == 1) {  // ' — move to next line and show string
+        if (hadText != 0 && bpos + 1 < maxLen) { poke8(buf + bpos, 10); bpos := bpos + 1; }
+        nc := 0;
+      } else {
+        nc := 0;
+      }
+      continue;
+    }
+
+    sp := sp + 1;
+  }
+
+  if (bpos < maxLen) { poke8(buf + bpos, 0); }
+}
+
+// ============================================================================
+// PdfRdrExtractText — public API (WP-PDF-21)
+//
+// Extract text from page srcPageIdx of reader rdr into buf (max maxLen bytes,
+// NUL-terminated). Lines separated by \n where Td/TD moves text downward.
+//
+// Limitations:
+//  - Only works if the content stream is UNCOMPRESSED (PdfSetCompression 0).
+//    FlateDecode streams return an empty string (no decompressor available).
+//  - Only Standard printable ASCII (0x20–0x7E) is extracted.
+//  - Only Lyx-generated content is fully supported (BT/ET, Td, Tj, TJ).
+// ============================================================================
+
+pub fn PdfRdrExtractText(rdr: int64, pageIdx: int64, buf: int64, maxLen: int64): void {
+  if (rdr == 0 || buf == 0 || maxLen <= 0) { return; }
+  poke8(buf, 0);
+  if (pageIdx < 0 || pageIdx >= peek64(rdr + PDF_RDR_PAGECOUNT)) { return; }
+
+  var data:    int64 := peek64(rdr + PDF_RDR_DATA);
+  var size:    int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var rootId:  int64 := peek64(rdr + PDF_RDR_ROOTID);
+  var rp:      int64 := _rdObjStart(rdr, rootId);
+  if (rp < 0) { return; }
+  if (rp + 1 >= size || peek8(data + rp) != 60 || peek8(data + rp + 1) != 60) { return; }
+  var pagesId: int64 := _rdDictGetRef(rdr, rp + 2, "Pages");
+  if (pagesId <= 0) { return; }
+  var pageId:  int64 := _rdFindPage(rdr, pagesId, pageIdx);
+  if (pageId <= 0) { return; }
+
+  // Get /Contents ref
+  var pp: int64 := _rdObjStart(rdr, pageId);
+  if (pp < 0) { return; }
+  if (pp + 1 >= size || peek8(data + pp) != 60 || peek8(data + pp + 1) != 60) { return; }
+  var contId: int64 := _rdDictGetRef(rdr, pp + 2, "Contents");
+  if (contId <= 0) { return; }
+
+  // Get raw stream pointer
+  var stream: int64 := _rdObjStreamRaw(rdr, contId);
+  if (stream == 0) { return; }
+  var slen: int64 := peek64(rdr + PDF_RDR_TMP);
+  if (slen <= 0) { return; }
+
+  _exProcessStream(stream, slen, buf, maxLen);
+}
