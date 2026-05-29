@@ -226,7 +226,7 @@ gleichzeitig aktiv sein.
 
 ---
 
-### WP-PDF-24: TrueType-Font-Einbettung ⬜
+### WP-PDF-24: TrueType-Font-Einbettung ✅
 
 **Ziel:** Beliebige TrueType-Fonts (`.ttf`) einbetten mit Subsetting
 (nur verwendete Glyphen), sodass das PDF auf jedem Gerät identisch aussieht.
