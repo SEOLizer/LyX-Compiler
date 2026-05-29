@@ -1,0 +1,381 @@
+// std/pdf/forms.lyx
+// AcroForms: interactive PDF form fields (WP-PDF-18)
+
+@description("PDF AcroForms: PdfAddTextField, PdfAddCheckbox, PdfAddRadioButton, PdfAddComboBox, PdfFlattenForms")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.forms;
+
+import std.pdf.builder;
+import std.pdf.objects;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+// Ensure the AcroForm dict object ID is allocated (lazy, first-field call).
+fn _formEnsureAcro(doc: int64): void {
+  if (peek64(doc + PDF_DOC_ACROOBJID) == 0) {
+    var id: int64 := peek64(doc + PDF_DOC_NEXTID);
+    poke64(doc + PDF_DOC_NEXTID, id + 1);
+    poke64(doc + PDF_DOC_ACROOBJID, id);
+    // Also register Helvetica (slot 0) for /DA default appearance
+    if (peek64(doc + PDF_DOC_FONTIDS) == 0) {
+      var fid: int64 := peek64(doc + PDF_DOC_NEXTID);
+      poke64(doc + PDF_DOC_NEXTID, fid + 1);
+      poke64(doc + PDF_DOC_FONTIDS, fid);
+    }
+  }
+}
+
+// Grow form field buffer. Returns pointer to new (zeroed) record slot, or 0.
+fn _formGrow(doc: int64): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_FORMCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_FORMBUF);
+  if (count < cap) { return buf + count * PDF_FORM_RECSIZE; }
+  var newCap: int64 := cap * 2;
+  var newBuf: int64 := mmap(0, newCap * PDF_FORM_RECSIZE, 3, 34, -1, 0);
+  if (newBuf == 0) { return 0; }
+  var bi: int64 := 0;
+  while (bi < count * PDF_FORM_RECSIZE) { poke8(newBuf+bi, peek8(buf+bi)); bi:=bi+1; }
+  munmap(buf, cap * PDF_FORM_RECSIZE);
+  poke64(doc + PDF_DOC_FORMCAP, newCap);
+  poke64(doc + PDF_DOC_FORMBUF, newBuf);
+  return newBuf + count * PDF_FORM_RECSIZE;
+}
+
+// Grow radio group buffer. Returns pointer to new record slot, or 0.
+fn _rgGrow(doc: int64): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_RGCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_RGCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_RGBUF);
+  if (count < cap) { return buf + count * PDF_RG_RECSIZE; }
+  var newCap: int64 := cap * 2;
+  var newBuf: int64 := mmap(0, newCap * PDF_RG_RECSIZE, 3, 34, -1, 0);
+  if (newBuf == 0) { return 0; }
+  var bi: int64 := 0;
+  while (bi < count * PDF_RG_RECSIZE) { poke8(newBuf+bi, peek8(buf+bi)); bi:=bi+1; }
+  munmap(buf, cap * PDF_RG_RECSIZE);
+  poke64(doc + PDF_DOC_RGCAP, newCap);
+  poke64(doc + PDF_DOC_RGBUF, newBuf);
+  return newBuf + count * PDF_RG_RECSIZE;
+}
+
+// Find radio group index by name. Returns index or -1 if not found.
+fn _rgFind(doc: int64, name: pchar): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_RGCOUNT);
+  var buf:   int64 := peek64(doc + PDF_DOC_RGBUF);
+  var i: int64 := 0;
+  while (i < count) {
+    var rnb: int64 := peek64(buf + i * PDF_RG_RECSIZE + PDF_RG_NAMEBUF);
+    if (rnb != 0) {
+      var ok: int64 := 1;  var j: int64 := 0;
+      while (1 == 1) {
+        var a: int64 := peek8(rnb + j);
+        var b: int64 := StrCharAt(name, j);
+        if (a != b) { ok := 0; break; }
+        if (a == 0) { break; }
+        j := j + 1;
+      }
+      if (ok != 0) { return i; }
+    }
+    i := i + 1;
+  }
+  return -1;
+}
+
+// Copy a pchar string into a new mmap'd buffer. Stores ptr at rec+nameOff, len at rec+lenOff.
+fn _formStoreStr(rec: int64, nameOff: int64, lenOff: int64, s: pchar): void {
+  if (s == 0) { return; }
+  var nlen: int64 := StrLen(s) + 1;
+  var nbuf: int64 := mmap(0, nlen, 3, 34, -1, 0);
+  if (nbuf == 0) { return; }
+  var ni: int64 := 0;
+  while (ni < nlen) { poke8(nbuf+ni, StrCharAt(s, ni)); ni:=ni+1; }
+  poke64(rec + nameOff, nbuf);
+  poke64(rec + lenOff,  nlen);
+}
+
+// Allocate two consecutive PDF object IDs. Returns the first.
+fn _formAlloc2(doc: int64): int64 {
+  var id: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, id + 2);
+  return id;
+}
+
+// ============================================================================
+// PdfAddTextField — editable single-line text field
+//
+// pos  = PdfPackCoords(x100, y100)  bottom-left corner
+// size = PdfPackCoords(w100, h100)  width × height
+// name: field name used as /T in the widget dict
+// defaultValue: initial /V string
+//
+// Returns fieldId (index), or -1 on failure.
+// ============================================================================
+
+pub fn PdfAddTextField(doc: int64, page: int64, pos: int64, size: int64, name: pchar, defaultValue: pchar): int64 {
+  if (doc == 0) { return -1; }
+  _formEnsureAcro(doc);
+  var rec: int64 := _formGrow(doc);
+  if (rec == 0) { return -1; }
+  var x1: int64 := (pos >> 32) & 0xFFFFFFFF;
+  var y1: int64 := pos & 0xFFFFFFFF;
+  var w:  int64 := (size >> 32) & 0xFFFFFFFF;
+  var h:  int64 := size & 0xFFFFFFFF;
+  var objId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, objId + 1);
+  poke64(rec + PDF_FORM_TYPE,  PDF_FORM_TEXT);
+  poke64(rec + PDF_FORM_PAGE,  page);
+  poke64(rec + PDF_FORM_X1,    x1);
+  poke64(rec + PDF_FORM_Y1,    y1);
+  poke64(rec + PDF_FORM_X2,    x1 + w);
+  poke64(rec + PDF_FORM_Y2,    y1 + h);
+  poke64(rec + PDF_FORM_OBJID, objId);
+  _formStoreStr(rec, PDF_FORM_NAMEBUF, PDF_FORM_NAMELEN, name);
+  _formStoreStr(rec, PDF_FORM_VALBUF,  PDF_FORM_VALLEN,  defaultValue);
+  var fieldId: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  poke64(doc + PDF_DOC_FORMCOUNT, fieldId + 1);
+  return fieldId;
+}
+
+// ============================================================================
+// PdfAddCheckbox — on/off checkbox
+//
+// pos     = PdfPackCoords(x100, y100)
+// size100 = side length ×100 (square)
+// checked : 1 = initially checked, 0 = unchecked
+//
+// Returns fieldId or -1.
+// ============================================================================
+
+pub fn PdfAddCheckbox(doc: int64, page: int64, pos: int64, size100: int64, name: pchar, checked: int64): int64 {
+  if (doc == 0) { return -1; }
+  _formEnsureAcro(doc);
+  var rec: int64 := _formGrow(doc);
+  if (rec == 0) { return -1; }
+  var x1: int64 := (pos >> 32) & 0xFFFFFFFF;
+  var y1: int64 := pos & 0xFFFFFFFF;
+  var ids: int64 := _formAlloc2(doc);  // ids = widget, ids+1 = AP /Yes; we need 3 actually
+  var apYes: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, apYes + 2);  // apYes, apOff
+  poke64(rec + PDF_FORM_TYPE,   PDF_FORM_CHECKBOX);
+  poke64(rec + PDF_FORM_PAGE,   page);
+  poke64(rec + PDF_FORM_X1,     x1);
+  poke64(rec + PDF_FORM_Y1,     y1);
+  poke64(rec + PDF_FORM_X2,     x1 + size100);
+  poke64(rec + PDF_FORM_Y2,     y1 + size100);
+  poke64(rec + PDF_FORM_OBJID,  ids);
+  poke64(rec + PDF_FORM_AP_YES, apYes);
+  poke64(rec + PDF_FORM_AP_OFF, apYes + 1);
+  poke64(rec + PDF_FORM_FLAGS,  checked);
+  _formStoreStr(rec, PDF_FORM_NAMEBUF, PDF_FORM_NAMELEN, name);
+  var fieldId: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  poke64(doc + PDF_DOC_FORMCOUNT, fieldId + 1);
+  return fieldId;
+}
+
+// ============================================================================
+// PdfAddRadioButton — one button in a named radio group
+//
+// pos       = PdfPackCoords(x100, y100)
+// size100   = side length ×100 (square)
+// groupName : shared group name (auto-created if new)
+// value     : the string value this button represents (e.g. "Option1")
+//
+// Returns fieldId or -1.
+// ============================================================================
+
+pub fn PdfAddRadioButton(doc: int64, page: int64, pos: int64, size100: int64, groupName: pchar, value: pchar): int64 {
+  if (doc == 0 || groupName == 0) { return -1; }
+  _formEnsureAcro(doc);
+  // Find or create radio group
+  var rgIdx: int64 := _rgFind(doc, groupName);
+  if (rgIdx < 0) {
+    var rgrec: int64 := _rgGrow(doc);
+    if (rgrec == 0) { return -1; }
+    var rgObjId: int64 := peek64(doc + PDF_DOC_NEXTID);
+    poke64(doc + PDF_DOC_NEXTID, rgObjId + 1);
+    poke64(rgrec + PDF_RG_OBJID, rgObjId);
+    _formStoreStr(rgrec, PDF_RG_NAMEBUF, PDF_RG_NAMELEN, groupName);
+    rgIdx := peek64(doc + PDF_DOC_RGCOUNT);
+    poke64(doc + PDF_DOC_RGCOUNT, rgIdx + 1);
+  }
+  var rec: int64 := _formGrow(doc);
+  if (rec == 0) { return -1; }
+  var x1: int64 := (pos >> 32) & 0xFFFFFFFF;
+  var y1: int64 := pos & 0xFFFFFFFF;
+  var wObjId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, wObjId + 1);
+  var apYes: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, apYes + 2);
+  poke64(rec + PDF_FORM_TYPE,   PDF_FORM_RADIO);
+  poke64(rec + PDF_FORM_PAGE,   page);
+  poke64(rec + PDF_FORM_X1,     x1);
+  poke64(rec + PDF_FORM_Y1,     y1);
+  poke64(rec + PDF_FORM_X2,     x1 + size100);
+  poke64(rec + PDF_FORM_Y2,     y1 + size100);
+  poke64(rec + PDF_FORM_OBJID,  wObjId);
+  poke64(rec + PDF_FORM_AP_YES, apYes);
+  poke64(rec + PDF_FORM_AP_OFF, apYes + 1);
+  poke64(rec + PDF_FORM_FLAGS,  rgIdx);
+  _formStoreStr(rec, PDF_FORM_VALBUF, PDF_FORM_VALLEN, value);
+  var fieldId: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  poke64(doc + PDF_DOC_FORMCOUNT, fieldId + 1);
+  return fieldId;
+}
+
+// ============================================================================
+// PdfAddComboBox — dropdown list (items added with PdfComboAddItem)
+//
+// pos  = PdfPackCoords(x100, y100)
+// size = PdfPackCoords(w100, h100)
+//
+// Returns fieldId or -1.
+// ============================================================================
+
+pub fn PdfAddComboBox(doc: int64, page: int64, pos: int64, size: int64, name: pchar): int64 {
+  if (doc == 0) { return -1; }
+  _formEnsureAcro(doc);
+  var rec: int64 := _formGrow(doc);
+  if (rec == 0) { return -1; }
+  var x1: int64 := (pos >> 32) & 0xFFFFFFFF;
+  var y1: int64 := pos & 0xFFFFFFFF;
+  var w:  int64 := (size >> 32) & 0xFFFFFFFF;
+  var h:  int64 := size & 0xFFFFFFFF;
+  var objId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, objId + 1);
+  poke64(rec + PDF_FORM_TYPE,  PDF_FORM_COMBO);
+  poke64(rec + PDF_FORM_PAGE,  page);
+  poke64(rec + PDF_FORM_X1,    x1);
+  poke64(rec + PDF_FORM_Y1,    y1);
+  poke64(rec + PDF_FORM_X2,    x1 + w);
+  poke64(rec + PDF_FORM_Y2,    y1 + h);
+  poke64(rec + PDF_FORM_OBJID, objId);
+  _formStoreStr(rec, PDF_FORM_NAMEBUF, PDF_FORM_NAMELEN, name);
+  var fieldId: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  poke64(doc + PDF_DOC_FORMCOUNT, fieldId + 1);
+  return fieldId;
+}
+
+// ============================================================================
+// PdfComboAddItem — append an item to a ComboBox /Opt array
+//
+// fieldId: value returned by PdfAddComboBox
+// item:    display string for the item
+// ============================================================================
+
+pub fn PdfComboAddItem(doc: int64, fieldId: int64, item: pchar): void {
+  if (doc == 0 || item == 0) { return; }
+  var formCount: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  if (fieldId < 0 || fieldId >= formCount) { return; }
+  var rec: int64 := peek64(doc + PDF_DOC_FORMBUF) + fieldId * PDF_FORM_RECSIZE;
+  if (peek64(rec + PDF_FORM_TYPE) != PDF_FORM_COMBO) { return; }
+  var ilen:   int64 := StrLen(item) + 1;  // +1 for NUL separator
+  var oldBuf: int64 := peek64(rec + PDF_FORM_VALBUF);
+  var oldLen: int64 := peek64(rec + PDF_FORM_VALLEN);
+  var newLen: int64 := oldLen + ilen;
+  var newBuf: int64 := mmap(0, newLen, 3, 34, -1, 0);
+  if (newBuf == 0) { return; }
+  // Copy existing items
+  var ci: int64 := 0;
+  while (ci < oldLen) { poke8(newBuf+ci, peek8(oldBuf+ci)); ci:=ci+1; }
+  // Append new item (including NUL terminator as separator)
+  var ii: int64 := 0;
+  while (ii < ilen) { poke8(newBuf+oldLen+ii, StrCharAt(item, ii)); ii:=ii+1; }
+  if (oldBuf != 0 && oldLen > 0) { munmap(oldBuf, oldLen); }
+  poke64(rec + PDF_FORM_VALBUF,    newBuf);
+  poke64(rec + PDF_FORM_VALLEN,    newLen);
+  poke64(rec + PDF_FORM_ITEMCOUNT, peek64(rec + PDF_FORM_ITEMCOUNT) + 1);
+}
+
+// ============================================================================
+// PdfFlattenForms — convert all form fields to static visual content
+//
+// Draws the field appearance into the page content stream, then sets the
+// FORMFLAT flag so PdfSave skips the /AcroForm dict and Widget annotations.
+// After flattening, the PDF is no longer interactive.
+// ============================================================================
+
+pub fn PdfFlattenForms(doc: int64): void {
+  if (doc == 0) { return; }
+  var formCount: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  var formBuf:   int64 := peek64(doc + PDF_DOC_FORMBUF);
+  var fi: int64 := 0;
+  while (fi < formCount) {
+    var frec:  int64 := formBuf + fi * PDF_FORM_RECSIZE;
+    var ftype: int64 := peek64(frec + PDF_FORM_TYPE);
+    var fpage: int64 := peek64(frec + PDF_FORM_PAGE);
+    var fx1:   int64 := peek64(frec + PDF_FORM_X1);
+    var fy1:   int64 := peek64(frec + PDF_FORM_Y1);
+    var fx2:   int64 := peek64(frec + PDF_FORM_X2);
+    var fy2:   int64 := peek64(frec + PDF_FORM_Y2);
+    var fw:    int64 := fx2 - fx1;
+    var fh:    int64 := fy2 - fy1;
+    // Draw field background (white fill, black stroke border)
+    PdfContentEnsure(doc, fpage, 256);
+    var buf: int64 := pdfXBuf(doc, fpage);
+    var pos: int64 := pdfXPos(doc, fpage);
+    pos := pdfStr(buf, pos, "q 1 1 1 rg 0 0 0 RG 0.5 w ");
+    pos := pdfReal100(buf, pos, fx1); poke8(buf+pos, 32); pos:=pos+1;
+    pos := pdfReal100(buf, pos, fy1); poke8(buf+pos, 32); pos:=pos+1;
+    pos := pdfReal100(buf, pos, fw);  poke8(buf+pos, 32); pos:=pos+1;
+    pos := pdfReal100(buf, pos, fh);
+    pos := pdfStr(buf, pos, " re B\n");
+    // Type-specific appearance
+    if (ftype == PDF_FORM_CHECKBOX || ftype == PDF_FORM_RADIO) {
+      var checked: int64 := peek64(frec + PDF_FORM_FLAGS);
+      var isChecked: int64 := 0;
+      if (ftype == PDF_FORM_CHECKBOX && checked != 0) { isChecked := 1; }
+      if (isChecked != 0) {
+        // Draw X mark (10% inset)
+        var ix1: int64 := fx1 + fw / 10;  var iy1: int64 := fy1 + fh / 10;
+        var ix2: int64 := fx2 - fw / 10;  var iy2: int64 := fy2 - fh / 10;
+        pos := pdfStr(buf, pos, "0 0 0 RG 1 w ");
+        pos := pdfReal100(buf, pos, ix1); poke8(buf+pos,32); pos:=pos+1;
+        pos := pdfReal100(buf, pos, iy1);
+        pos := pdfStr(buf, pos, " m ");
+        pos := pdfReal100(buf, pos, ix2); poke8(buf+pos,32); pos:=pos+1;
+        pos := pdfReal100(buf, pos, iy2);
+        pos := pdfStr(buf, pos, " l S ");
+        pos := pdfReal100(buf, pos, ix2); poke8(buf+pos,32); pos:=pos+1;
+        pos := pdfReal100(buf, pos, iy1);
+        pos := pdfStr(buf, pos, " m ");
+        pos := pdfReal100(buf, pos, ix1); poke8(buf+pos,32); pos:=pos+1;
+        pos := pdfReal100(buf, pos, iy2);
+        pos := pdfStr(buf, pos, " l S\n");
+      }
+    } else if (ftype == PDF_FORM_TEXT) {
+      // Render default value as static text
+      var fval: int64 := peek64(frec + PDF_FORM_VALBUF);
+      if (fval != 0 && peek8(fval) != 0) {
+        var fontId: int64 := peek64(doc + PDF_DOC_FONTIDS);
+        if (fontId == 0) {
+          fontId := peek64(doc + PDF_DOC_NEXTID);
+          poke64(doc + PDF_DOC_NEXTID, fontId + 1);
+          poke64(doc + PDF_DOC_FONTIDS, fontId);
+        }
+        var mask: int64 := peek64(doc + PDF_DOC_PAGEFONTMASK + fpage * 8);
+        poke64(doc + PDF_DOC_PAGEFONTMASK + fpage * 8, mask | 1);
+        pos := pdfStr(buf, pos, "BT /F0 10 Tf 0 0 0 rg ");
+        pos := pdfReal100(buf, pos, fx1 + 200); poke8(buf+pos,32); pos:=pos+1;
+        pos := pdfReal100(buf, pos, fy1 + 200);
+        pos := pdfStr(buf, pos, " Td (");
+        var vi: int64 := 0;
+        while (1 == 1) {
+          var vc: int64 := peek8(fval + vi);
+          if (vc == 0) { break; }
+          if (vc == 40 || vc == 41 || vc == 92) { poke8(buf+pos, 92); pos:=pos+1; }
+          poke8(buf+pos, vc); pos:=pos+1;
+          vi := vi + 1;
+        }
+        pos := pdfStr(buf, pos, ") Tj ET\n");
+      }
+    }
+    pos := pdfStr(buf, pos, "Q\n");
+    pdfXSetPos(doc, fpage, pos);
+    fi := fi + 1;
+  }
+  poke64(doc + PDF_DOC_FORMFLAT, 1);
+}
