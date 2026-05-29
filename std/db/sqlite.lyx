@@ -1,0 +1,158 @@
+// std/db/sqlite.lyx — SQLite3 FFI-Binding für Lyx
+//
+// Wraps libsqlite3 via extern fn ... link "libsqlite3.so.0".
+// Alle Pointer (sqlite3*, sqlite3_stmt*) werden als int64 dargestellt.
+//
+// WP-SQ-01: FFI-Deklarationen & Konstanten
+// WP-SQ-02: Connection-Typ & Open/Close/Exec
+
+unit std.db.sqlite;
+
+// ============================================================================
+// FFI — C-Funktionen aus libsqlite3
+// ============================================================================
+
+// Verbindung
+extern fn sqlite3_open(filename: pchar, ppDb: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_close(db: int64): int64 link "libsqlite3.so.0";
+
+// Direkte SQL-Ausführung (kein Result-Set)
+extern fn sqlite3_exec(db: int64, sql: pchar, cb: int64, arg: int64, errmsg: int64): int64 link "libsqlite3.so.0";
+
+// Prepared Statements
+extern fn sqlite3_prepare_v2(db: int64, sql: pchar, nByte: int64, ppStmt: int64, pzTail: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_step(stmt: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_reset(stmt: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_finalize(stmt: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_clear_bindings(stmt: int64): int64 link "libsqlite3.so.0";
+
+// Parameter-Binding (1-basierter Index)
+extern fn sqlite3_bind_int64(stmt: int64, i: int64, v: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_bind_double(stmt: int64, i: int64, v: f64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_bind_text(stmt: int64, i: int64, v: pchar, n: int64, destructor: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_bind_null(stmt: int64, i: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_bind_blob(stmt: int64, i: int64, v: int64, n: int64, destructor: int64): int64 link "libsqlite3.so.0";
+
+// Column-Accessoren (0-basierter Index)
+extern fn sqlite3_column_int64(stmt: int64, i: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_column_double(stmt: int64, i: int64): f64 link "libsqlite3.so.0";
+extern fn sqlite3_column_text(stmt: int64, i: int64): pchar link "libsqlite3.so.0";
+extern fn sqlite3_column_blob(stmt: int64, i: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_column_bytes(stmt: int64, i: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_column_type(stmt: int64, i: int64): int64 link "libsqlite3.so.0";
+
+// Column-Metadaten
+extern fn sqlite3_column_count(stmt: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_column_name(stmt: int64, i: int64): pchar link "libsqlite3.so.0";
+
+// Datenbank-Metadaten
+extern fn sqlite3_last_insert_rowid(db: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_changes(db: int64): int64 link "libsqlite3.so.0";
+extern fn sqlite3_get_autocommit(db: int64): int64 link "libsqlite3.so.0";
+
+// Fehlerbehandlung
+extern fn sqlite3_errmsg(db: int64): pchar link "libsqlite3.so.0";
+extern fn sqlite3_errcode(db: int64): int64 link "libsqlite3.so.0";
+
+// ============================================================================
+// Konstanten — Rückgabecodes
+// ============================================================================
+
+pub con SQLITE_OK:         int64 := 0;
+pub con SQLITE_ERROR:      int64 := 1;
+pub con SQLITE_BUSY:       int64 := 5;
+pub con SQLITE_NOMEM:      int64 := 7;
+pub con SQLITE_NOTFOUND:   int64 := 12;
+pub con SQLITE_MISUSE:     int64 := 21;
+pub con SQLITE_CONSTRAINT: int64 := 19;
+pub con SQLITE_ROW:        int64 := 100;
+pub con SQLITE_DONE:       int64 := 101;
+
+// ============================================================================
+// Konstanten — Spalten-Typkodes
+// ============================================================================
+
+pub con SQLITE_INTEGER: int64 := 1;
+pub con SQLITE_FLOAT:   int64 := 2;
+pub con SQLITE_TEXT:    int64 := 3;
+pub con SQLITE_BLOB:    int64 := 4;
+pub con SQLITE_NULL:    int64 := 5;
+
+// ============================================================================
+// Konstanten — Destruktor-Sentinels (für sqlite3_bind_text / _blob)
+// ============================================================================
+
+pub con SQLITE_STATIC:    int64 := 0;
+pub con SQLITE_TRANSIENT: int64 := 0xFFFFFFFFFFFFFFFF; // = -1 (negative con-Literals sind in Lyx 0)
+
+// ============================================================================
+// Typ: SQLiteDB
+//
+// Speicherlayout (mmap, 24 Bytes):
+//   +0  handle       (int64) — sqlite3*
+//   +8  _reserved    (int64) — 0, reserviert für path-Pointer
+//   +16 last_errcode (int64) — Fehlercode der letzten Operation
+// ============================================================================
+
+pub type SQLiteDB = struct {
+    handle:       int64;
+    _reserved:    int64;
+    last_errcode: int64;
+};
+
+con _SQ_DB_SIZE: int64 := 24;
+
+// ============================================================================
+// WP-SQ-02: Verbindungsverwaltung
+// ============================================================================
+
+// SQLiteOpen öffnet oder erstellt eine SQLite-Datenbank.
+// Gibt einen SQLiteDB-Pointer (int64) zurück; 0 bei Fehler.
+// Für In-Memory-DBs: SQLiteOpen(":memory:")
+pub fn SQLiteOpen(path: pchar): int64 {
+    var p: int64 := mmap(0, _SQ_DB_SIZE, 3, 34, -1, 0);
+    if (p <= 0) { return 0; }
+    // sqlite3_open schreibt den sqlite3*-Handle in ein vom Aufrufer bereitgestelltes Slot
+    var slot: int64 := mmap(0, 8, 3, 34, -1, 0);
+    if (slot <= 0) { munmap(p, _SQ_DB_SIZE); return 0; }
+    var rc: int64 := sqlite3_open(path, slot);
+    var handle: int64 := peek64(slot);
+    munmap(slot, 8);
+    if (rc != SQLITE_OK) {
+        if (handle != 0) { sqlite3_close(handle); }
+        munmap(p, _SQ_DB_SIZE);
+        return 0;
+    }
+    poke64(p,      handle);
+    poke64(p + 8,  0);
+    poke64(p + 16, 0);
+    return p;
+}
+
+// SQLiteClose schließt die Verbindung und gibt den SQLiteDB-Speicher frei.
+pub fn SQLiteClose(db: int64): void {
+    if (db == 0) { return; }
+    var handle: int64 := peek64(db);
+    if (handle != 0) { sqlite3_close(handle); }
+    munmap(db, _SQ_DB_SIZE);
+}
+
+// SQLiteExec führt ein SQL-Statement ohne Ergebnismenge aus
+// (CREATE TABLE, INSERT ohne Bind, PRAGMA, …).
+// Gibt true bei Erfolg zurück.
+pub fn SQLiteExec(db: int64, sql: pchar): bool {
+    var handle: int64 := peek64(db);
+    var rc: int64 := sqlite3_exec(handle, sql, 0, 0, 0);
+    poke64(db + 16, rc);
+    return rc == SQLITE_OK;
+}
+
+// SQLiteErrmsg gibt die Fehlermeldung der letzten Operation zurück.
+pub fn SQLiteErrmsg(db: int64): pchar {
+    return sqlite3_errmsg(peek64(db));
+}
+
+// SQLiteErrno gibt den Fehlercode der letzten Operation zurück.
+pub fn SQLiteErrno(db: int64): int64 {
+    return sqlite3_errcode(peek64(db));
+}
