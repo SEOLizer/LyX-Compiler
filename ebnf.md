@@ -1,4 +1,4 @@
-# Lyx v0.9 – Sprachspezifikation
+# Lyx v0.8.8A – Sprachspezifikation
 
 Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
 
@@ -245,7 +245,7 @@ BoolLiteral = "true" | "false" ;
 
 ---
 
-## Compilerschalter-Pragmas II: @bounds_check / @debug_info / @optimization_level (v0.9 ✅ ABGESCHLOSSEN – WP-AS-01..06)
+## Compilerschalter-Pragmas II: @bounds_check / @debug_info / @optimization_level (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-01..06)
 
 Drei neue Direktiven, die bestehende `NK_AT_DIRECTIVE`-Infrastruktur nutzen.
 
@@ -282,7 +282,7 @@ AtDirective = AtDirective
 
 ---
 
-## `defer` — RAII (v0.9 ✅ ABGESCHLOSSEN – WP-AS-07..10)
+## `defer` — RAII (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-07..10)
 
 `defer` verschiebt die Ausführung eines Statements auf den Zeitpunkt des Funktionsverlassens (Go-Semantik).
 
@@ -324,7 +324,7 @@ fn lifo_test(): int64 {
 
 ---
 
-## `con`-Parameter — Read-Only-Qualifier (v0.9 ✅ ABGESCHLOSSEN – WP-AS-11..13)
+## `con`-Parameter — Read-Only-Qualifier (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-11..13)
 
 Parameter können mit `con` als read-only markiert werden. Schreibzugriffe darauf sind ein Sema-Fehler.
 
@@ -354,7 +354,7 @@ fn bad(con x: int64): int64 {
 
 ---
 
-## `@volatile` — Hardware-Register-Variablen (v0.9 ✅ ABGESCHLOSSEN – WP-AS-16..19)
+## `@volatile` — Hardware-Register-Variablen (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-16..19)
 
 Variablen können mit `@volatile` als hardware-volatile markiert werden, um Compiler-Optimierungen zu verhindern.
 
@@ -383,7 +383,7 @@ while (irq_counter == prev_count) { }   // KORREKT: irq_counter wird jedes Mal g
 
 ---
 
-## Definite Assignment Analysis — DAA (v0.9 ✅ ABGESCHLOSSEN – WP-AS-15)
+## Definite Assignment Analysis — DAA (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-15)
 
 Optionale Analyse, die warnt wenn eine Variable gelesen wird, bevor sie initialisiert wurde.
 
@@ -396,7 +396,7 @@ Optionale Analyse, die warnt wenn eine Variable gelesen wird, bevor sie initiali
 
 ### Semantik
 
-* **Default**: DAA ist deaktiviert (opt-in in v0.9, Pflicht in v1.0).
+* **Default**: DAA ist deaktiviert (opt-in in v0.8.8A, Pflicht in v1.0).
 * `var x: T;` ohne Initializer → `x` wird als "möglicherweise nicht initialisiert" markiert.
 * `var x: T := expr;` → `x` gilt als initialisiert.
 * `x := expr;` (Zuweisung) → markiert `x` als initialisiert.
@@ -717,7 +717,7 @@ while (x < 100) limit(1000) {
 - **IR (Runtime)**: `EmitRangeCheck` erzeugt `cmpge` + `and` + `brfalse` + `panic`-Sequenz.
 - **IR-Optimierung**: Konstante Initialisierungen werden durch Constant Folding ggf. wegeliminiert.
 
-## @integrity – Integritäts-Management (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+## @integrity – Integritäts-Management (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
 
 Einheit- und Funktions-Level-Annotationen für Strahlungstoleranz und DO-178C-Compliance.
 Implementiert aerospace.pdf v2 Sections 2.5.1–2.5.2.
@@ -790,7 +790,7 @@ Drei identische Kopien mit 4096-Byte-Abstand → Single-Event-Upset-Erkennung vi
 - **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe`-Variante wenn `UnitIntegrity.Mode ≠ imNone`.
 - **Unterstützte Backends**: x86_64, ARM64, RISC-V.
 
-### VerifyIntegrity() Builtin (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
+### VerifyIntegrity() Builtin (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
 
 Die `VerifyIntegrity()` Funktion führt zur Laufzeit einen TMR (Triple Modular Redundancy) Mehrheitsentscheid durch:
 
@@ -825,7 +825,7 @@ fn main(): int64 {
 - **Backend x86_64**: Generiert `movabs rdi, data_va` + 3x `mov` + 3x `cmp`/`inc` + `cmp $2`/`jge`
 - **Patching**: CRC32 wird NACH Code-Generierung berechnet, dann Data-Adresse gepatcht
 
-### Endianness-Annotationen (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
+### Endianness-Annotationen (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
 
 Structs können mit `@big_endian` oder `@little_endian` annotiert werden für Telemetrie-Daten:
 
@@ -856,7 +856,7 @@ type TelemetryFrame = @big_endian struct {
 - **AST**: `FEndian: TEndianType` in `TAstStructDecl`
 - **Parser**: Endian-Annotation wird in `ParseTypeDecl` vor `struct` geparst
 
-### Flat Structs (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
+### Flat Structs (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
 
 Structs können mit dem `flat` Keyword annotiert werden, um sicherzustellen, dass sie keine Pointer-Felder enthalten – essentiell für Zero-Copy-Serialisierung:
 
@@ -878,7 +878,7 @@ type TelemetryFrame = flat struct {
 };
 ```
 
-### Bit-Level Memory Mapping (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
+### Bit-Level Memory Mapping (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
 
 In `@packed` Structs können Felder mit `at(N)` eine explizite Bit-Position erhalten:
 
@@ -900,7 +900,7 @@ type Thruster = packed struct {
 };
 ```
 
-### @redundant – Triple Modular Redundancy (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
+### @redundant – Triple Modular Redundancy (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
 
 Globale Variablen können mit `@redundant` annotiert werden, um automatisch drei physisch getrennte Kopien im RAM zu erzeugen.
 **Kombinierbar mit `@volatile`** (für Hardware-Sensor-TMR):
@@ -924,7 +924,7 @@ var thrust_vector: int64;
 var sensor_reading: int64;   // TMR + volatile: Hardware-Sensor mit SEU-Schutz
 ```
 
-### @flight_crit – FP-Deterministik (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
+### @flight_crit – FP-Deterministik (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
 
 Funktionen können mit `@flight_crit` annotiert werden, um deterministisches Floating-Point-Verhalten zu garantieren:
 

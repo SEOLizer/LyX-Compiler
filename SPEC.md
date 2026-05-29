@@ -1389,7 +1389,7 @@ lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
 
 ---
 
-## @integrity – Integritäts-Management (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+## @integrity – Integritäts-Management (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
 
 Einheit- und Funktions-Level-Annotationen für strahlungstolerante und sicherheitskritische Code-Segmente.
 Implementiert **aerospace.pdf v2 Sections 2.5.1–2.5.2**.
