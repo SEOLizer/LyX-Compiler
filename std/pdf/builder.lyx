@@ -178,6 +178,27 @@ pub con PDF_DOC_XOBJCAP:          int64 := 3800;  // int64 capacity
 pub con PDF_DOC_XOBJBUF:          int64 := 3808;  // int64* record buffer
 pub con PDF_DOC_PAGEXOBJMASKS:    int64 := 3816;  // int64* per-page xobj bitmask
 
+// WP-PDF-22: Shading (linear/radial gradients)
+pub con PDF_DOC_SHADCOUNT:        int64 := 3824;  // int64 count
+pub con PDF_DOC_SHADCAP:          int64 := 3832;  // int64 capacity
+pub con PDF_DOC_SHADBUF:          int64 := 3840;  // int64* record buffer
+pub con PDF_DOC_PAGESHADMASKS:    int64 := 3848;  // int64* per-page shading bitmask
+
+// Shading record layout (88 bytes each)
+pub con PDF_SHAD_TYPE:            int64 := 0;   // int64: 2=linear, 3=radial
+pub con PDF_SHAD_PAGE:            int64 := 8;   // int64: page index
+pub con PDF_SHAD_X0:              int64 := 16;  // int64: x0_100 (linear start / radial center)
+pub con PDF_SHAD_Y0:              int64 := 24;  // int64: y0_100
+pub con PDF_SHAD_X1:              int64 := 32;  // int64: x1_100 (linear end / same as X0 for radial)
+pub con PDF_SHAD_Y1:              int64 := 40;  // int64: y1_100
+pub con PDF_SHAD_R0:              int64 := 48;  // int64: inner radius ×100 (radial); 0 for linear
+pub con PDF_SHAD_R1:              int64 := 56;  // int64: outer radius ×100 (radial); 0 for linear
+pub con PDF_SHAD_C0:              int64 := 64;  // int64: packed start color (r100<<48|g100<<32|b100<<16)
+pub con PDF_SHAD_C1:              int64 := 72;  // int64: packed end color
+pub con PDF_SHAD_OBJID:           int64 := 80;  // int64: PDF object ID
+pub con PDF_SHAD_RECSIZE:         int64 := 88;
+pub con PDF_SHAD_INITIAL_CAP:     int64 := 8;
+
 // Form XObject record layout (80 bytes each)
 pub con PDF_XOBJ_OBJID:           int64 := 0;
 pub con PDF_XOBJ_W100:            int64 := 8;
@@ -313,6 +334,16 @@ pub fn PdfNew(): int64 {
   poke64(doc + PDF_DOC_XOBJCOUNT,  0);
   poke64(doc + PDF_DOC_XOBJCAP,    PDF_XOBJ_INITIAL_CAP);
   poke64(doc + PDF_DOC_XOBJBUF,    xobjBuf);
+
+  // Shading buffer (WP-PDF-22)
+  var pageShadMasks: int64 := mmapAlloc(arrSize);
+  if (pageShadMasks != 0) { zeroMem(pageShadMasks, arrSize); }
+  var shadBufInit: int64 := mmapAlloc(PDF_SHAD_INITIAL_CAP * PDF_SHAD_RECSIZE);
+  if (shadBufInit != 0) { zeroMem(shadBufInit, PDF_SHAD_INITIAL_CAP * PDF_SHAD_RECSIZE); }
+  poke64(doc + PDF_DOC_PAGESHADMASKS, pageShadMasks);
+  poke64(doc + PDF_DOC_SHADCOUNT,     0);
+  poke64(doc + PDF_DOC_SHADCAP,       PDF_SHAD_INITIAL_CAP);
+  poke64(doc + PDF_DOC_SHADBUF,       shadBufInit);
 
   // Image arrays
   var imgCap:   int64 := PDF_INITIAL_IMAGE_CAP;
@@ -611,6 +642,13 @@ pub fn PdfFree(doc: int64): void {
     }
     munmap(xobjBuf2, xobjCap2 * PDF_XOBJ_RECSIZE);
   }
+
+  // Free shading buffer (WP-PDF-22)
+  var shadBuf3: int64 := peek64(doc + PDF_DOC_SHADBUF);
+  var shadCap3: int64 := peek64(doc + PDF_DOC_SHADCAP);
+  var pgShadPtr: int64 := peek64(doc + PDF_DOC_PAGESHADMASKS);
+  if (shadBuf3  != 0) { munmap(shadBuf3,  shadCap3 * PDF_SHAD_RECSIZE); }
+  if (pgShadPtr != 0) { munmap(pgShadPtr, arrSize); }
 
   // Free compressed image data, then image metadata arrays
   var imgCap:   int64 := peek64(doc + PDF_DOC_IMAGECAP);
@@ -1233,8 +1271,11 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var layerBuf:     int64 := peek64(doc + PDF_DOC_LAYERBUF);
   var layerBaseId:  int64 := attachBaseId + attachObjCount;
 
+  var shadCount:    int64 := peek64(doc + PDF_DOC_SHADCOUNT);
+  var shadBuf:      int64 := peek64(doc + PDF_DOC_SHADBUF);
+
   // Allocate XRef offset table
-  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount) * 8;
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -1432,6 +1473,57 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     xi := xi + 1;
   }
 
+  // --- Shading objects (WP-PDF-22) ---
+  var si: int64 := 0;
+  while (si < shadCount) {
+    var srec:  int64 := shadBuf + si * PDF_SHAD_RECSIZE;
+    var sId:   int64 := peek64(srec + PDF_SHAD_OBJID);
+    var sType: int64 := peek64(srec + PDF_SHAD_TYPE);
+    var sx0:   int64 := peek64(srec + PDF_SHAD_X0);
+    var sy0:   int64 := peek64(srec + PDF_SHAD_Y0);
+    var sx1:   int64 := peek64(srec + PDF_SHAD_X1);
+    var sy1:   int64 := peek64(srec + PDF_SHAD_Y1);
+    var sr0:   int64 := peek64(srec + PDF_SHAD_R0);
+    var sr1:   int64 := peek64(srec + PDF_SHAD_R1);
+    var sc0:   int64 := peek64(srec + PDF_SHAD_C0);
+    var sc1:   int64 := peek64(srec + PDF_SHAD_C1);
+
+    poke64(xrefs + sId * 8, pos);
+    pos := pdfObjHdr(out, pos, sId);
+    pos := pdfStr(out, pos, "<< /ShadingType ");
+    pos := pdfInt(out, pos, sType);
+    pos := pdfStr(out, pos, " /ColorSpace /DeviceRGB /Coords [");
+    pos := pdfReal100(out, pos, sx0); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, sy0); poke8(out + pos, 32); pos := pos + 1;
+    if (sType == 3) {
+      pos := pdfReal100(out, pos, sr0); poke8(out + pos, 32); pos := pos + 1;
+    }
+    pos := pdfReal100(out, pos, sx1); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, sy1);
+    if (sType == 3) {
+      poke8(out + pos, 32); pos := pos + 1;
+      pos := pdfReal100(out, pos, sr1);
+    }
+    // Color function: FunctionType 2 linear interpolation
+    var sr100: int64 := (sc0 >> 48) & 0xFFFF;
+    var sg100: int64 := (sc0 >> 32) & 0xFFFF;
+    var sb100: int64 := (sc0 >> 16) & 0xFFFF;
+    var er100: int64 := (sc1 >> 48) & 0xFFFF;
+    var eg100: int64 := (sc1 >> 32) & 0xFFFF;
+    var eb100: int64 := (sc1 >> 16) & 0xFFFF;
+    pos := pdfStr(out, pos, "] /Function << /FunctionType 2 /Domain [0 1] /C0 [");
+    pos := pdfReal100(out, pos, sr100); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, sg100); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, sb100);
+    pos := pdfStr(out, pos, "] /C1 [");
+    pos := pdfReal100(out, pos, er100); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, eg100); poke8(out + pos, 32); pos := pos + 1;
+    pos := pdfReal100(out, pos, eb100);
+    pos := pdfStr(out, pos, "] /N 1 >> /Extend [true true] >>");
+    pos := pdfObjFtr(out, pos);
+    si := si + 1;
+  }
+
   // --- Per-page objects ---
   i := 0;
   while (i < pageCount) {
@@ -1493,6 +1585,24 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
           }
           xj := xj + 1;
         }
+      }
+      pos := pdfStr(out, pos, " >>");
+    }
+    // /Shading resource: shadings used on this page (WP-PDF-22)
+    var sMasks: int64 := peek64(doc + PDF_DOC_PAGESHADMASKS);
+    var sMask:  int64 := peek64(sMasks + i * 8);
+    if (sMask != 0) {
+      pos := pdfStr(out, pos, " /Shading <<");
+      var sj: int64 := 0;
+      while (sj < shadCount) {
+        if ((sMask >> sj) & 1 != 0) {
+          var sjId: int64 := peek64(shadBuf + sj * PDF_SHAD_RECSIZE + PDF_SHAD_OBJID);
+          pos := pdfStr(out, pos, " /SH");
+          pos := pdfInt(out, pos, sj);
+          poke8(out + pos, 32); pos := pos + 1;
+          pos := pdfRef(out, pos, sjId);
+        }
+        sj := sj + 1;
       }
       pos := pdfStr(out, pos, " >>");
     }

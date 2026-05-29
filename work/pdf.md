@@ -78,7 +78,7 @@ PdfDrawXObject(doc, page, xobj, x, y, w, h)
 
 ---
 
-### WP-PDF-22: Verläufe / Shading ⬜
+### WP-PDF-22: Verläufe / Shading ✅
 
 **Ziel:** Lineare und radiale Farbverläufe als Füllmuster.
 

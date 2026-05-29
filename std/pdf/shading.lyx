@@ -1,0 +1,149 @@
+// std/pdf/shading.lyx
+// PDF shading: linear and radial gradient fills (WP-PDF-22)
+
+@description("PDF shading: PdfLinearGradient, PdfRadialGradient, PdfPackColor, PdfPackCoords")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.shading;
+
+import std.pdf.builder;
+import std.pdf.objects;
+
+// ============================================================================
+// Color / coordinate packing helpers
+// ============================================================================
+
+// Pack RGB components (×100, range 0–10000) into a single int64.
+// Encoding: r100<<48 | g100<<32 | b100<<16  (same as PdfSetTextColor).
+// Example: pure red   = PdfPackColor(10000, 0, 0)
+//          mid-grey   = PdfPackColor(5000, 5000, 5000)
+//          white      = PdfPackColor(10000, 10000, 10000)
+pub fn PdfPackColor(r100: int64, g100: int64, b100: int64): int64 {
+  return (r100 << 48) | (g100 << 32) | (b100 << 16);
+}
+
+// Pack two ×100 coordinates into one int64: high 32 bits = x100, low 32 bits = y100.
+// Use this to pass points / sizes to PdfLinearGradient and PdfRadialGradient.
+pub fn PdfPackCoords(x100: int64, y100: int64): int64 {
+  return (x100 << 32) | (y100 & 0xFFFFFFFF);
+}
+
+// ============================================================================
+// Internal helpers — all ≤ 6 arguments
+// ============================================================================
+
+fn _shadGrow(doc: int64): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_SHADCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_SHADCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_SHADBUF);
+  if (count < cap) { return buf + count * PDF_SHAD_RECSIZE; }
+
+  var newCap: int64 := cap * 2;
+  var newBuf: int64 := mmap(0, newCap * PDF_SHAD_RECSIZE, 3, 34, -1, 0);
+  if (newBuf == 0) { return 0; }
+  var bi: int64 := 0;
+  while (bi < count * PDF_SHAD_RECSIZE) {
+    poke8(newBuf + bi, peek8(buf + bi));
+    bi := bi + 1;
+  }
+  munmap(buf, cap * PDF_SHAD_RECSIZE);
+  poke64(doc + PDF_DOC_SHADCAP, newCap);
+  poke64(doc + PDF_DOC_SHADBUF, newBuf);
+  return newBuf + count * PDF_SHAD_RECSIZE;
+}
+
+fn _shadWriteCoords(rec: int64, x0: int64, y0: int64, x1: int64, y1: int64): void {
+  poke64(rec + PDF_SHAD_X0, x0);
+  poke64(rec + PDF_SHAD_Y0, y0);
+  poke64(rec + PDF_SHAD_X1, x1);
+  poke64(rec + PDF_SHAD_Y1, y1);
+}
+
+fn _shadWriteRadii(rec: int64, r0: int64, r1: int64): void {
+  poke64(rec + PDF_SHAD_R0, r0);
+  poke64(rec + PDF_SHAD_R1, r1);
+}
+
+fn _shadWriteColors(rec: int64, c0: int64, c1: int64): void {
+  poke64(rec + PDF_SHAD_C0, c0);
+  poke64(rec + PDF_SHAD_C1, c1);
+}
+
+// Register the completed record: assign PDF object ID, update page mask, emit content stream.
+fn _shadRegister(doc: int64, page: int64, shadType: int64, rec: int64): void {
+  var objId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, objId + 1);
+  poke64(rec + PDF_SHAD_OBJID, objId);
+  poke64(rec + PDF_SHAD_TYPE,  shadType);
+  poke64(rec + PDF_SHAD_PAGE,  page);
+
+  var n: int64 := peek64(doc + PDF_DOC_SHADCOUNT);
+  poke64(doc + PDF_DOC_SHADCOUNT, n + 1);
+
+  // Set bit n in per-page shading mask
+  var masks: int64 := peek64(doc + PDF_DOC_PAGESHADMASKS);
+  var m:     int64 := peek64(masks + page * 8);
+  poke64(masks + page * 8, m | (1 << n));
+
+  // Emit into content stream: q /SH{n} sh Q
+  PdfContentEnsure(doc, page, 24);
+  var buf: int64 := pdfXBuf(doc, page);
+  var pos: int64 := pdfXPos(doc, page);
+  pos := pdfStr(buf, pos, "q /SH");
+  pos := pdfInt(buf, pos, n);
+  pos := pdfStr(buf, pos, " sh Q\n");
+  pdfXSetPos(doc, page, pos);
+}
+
+// ============================================================================
+// PdfLinearGradient — axial (Type 2) gradient fill
+//
+// Fills the current clipping region with a gradient from c0 at p0 to c1 at p1.
+// p0, p1 : PdfPackCoords(x100, y100)  — start and end points in PDF user-space
+// c0, c1 : PdfPackColor(r100, g100, b100) — start and end colours
+//
+// Note: no explicit clip is set — the gradient fills the entire page unless
+// PdfSaveState / PdfClip / PdfRestoreState is used around the call.
+// ============================================================================
+
+pub fn PdfLinearGradient(doc: int64, page: int64, p0: int64, p1: int64, c0: int64, c1: int64): void {
+  if (doc == 0) { return; }
+  var rec: int64 := _shadGrow(doc);
+  if (rec == 0) { return; }
+
+  var x0: int64 := (p0 >> 32) & 0xFFFFFFFF;
+  var y0: int64 := p0 & 0xFFFFFFFF;
+  var x1: int64 := (p1 >> 32) & 0xFFFFFFFF;
+  var y1: int64 := p1 & 0xFFFFFFFF;
+
+  _shadWriteCoords(rec, x0, y0, x1, y1);
+  _shadWriteRadii(rec, 0, 0);
+  _shadWriteColors(rec, c0, c1);
+  _shadRegister(doc, page, 2, rec);
+}
+
+// ============================================================================
+// PdfRadialGradient — radial (Type 3) gradient fill (concentric circles)
+//
+// Fills with a gradient from c0 at the inner circle to c1 at the outer circle.
+// Both circles share the same centre (cx, cy).
+// center : PdfPackCoords(cx100, cy100) — common centre
+// radii  : PdfPackCoords(r0_100, r1_100) — inner (r0) and outer (r1) radius
+// c0, c1 : PdfPackColor(r100, g100, b100)
+// ============================================================================
+
+pub fn PdfRadialGradient(doc: int64, page: int64, center: int64, radii: int64, c0: int64, c1: int64): void {
+  if (doc == 0) { return; }
+  var rec: int64 := _shadGrow(doc);
+  if (rec == 0) { return; }
+
+  var cx: int64 := (center >> 32) & 0xFFFFFFFF;
+  var cy: int64 := center & 0xFFFFFFFF;
+  var r0: int64 := (radii  >> 32) & 0xFFFFFFFF;
+  var r1: int64 := radii  & 0xFFFFFFFF;
+
+  _shadWriteCoords(rec, cx, cy, cx, cy);
+  _shadWriteRadii(rec, r0, r1);
+  _shadWriteColors(rec, c0, c1);
+  _shadRegister(doc, page, 3, rec);
+}
