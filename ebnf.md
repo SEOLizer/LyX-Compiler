@@ -1,1789 +1,955 @@
-# Lyx v0.8.8C – Sprachspezifikation
+# Lyx v0.8.8C — Canonical EBNF Grammar
 
-Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
-
----
-
-## 1) Lexikalische Regeln
-
-### Whitespace
-
-* Leerzeichen, Tabs, Zeilenumbrüche trennen Tokens.
-
-### Kommentare
-
-* Zeilenkommentar: `//` bis Zeilenende
-* Blockkommentar (optional, empfohlen): `/* ... */` (nicht verschachtelt)
-
-### Identifier
-
-* Regex: `[A-Za-z_][A-Za-z0-9_]*`
-* case-sensitive
-
-### Literale
-
-* **Int64**: Dezimal: `0` oder `[1-9][0-9]*` (optional führendes `-` als unary operator)
-* **Float64**: `[0-9]+ '.' [0-9]+` (z.B. `3.14159`, `2.718`)
-* **Stringliteral**: `" ... "` mit Escapes:
-
-    * `\n`, `\r`, `\t`, `\\`, `\"`, `\0`
-    * Ergebnis ist **nullterminiert** im `.rodata`
-
-### Keywords (reserviert)
-
-`fn var let co con if else while for do downto to repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype defer`
-
-> `wraps` und `range` sind **Soft-Keywords**: Sie werden nur in `utype`-Deklarationen nach dem Konversionsfaktor erkannt und dürfen als normale Bezeichner verwendet werden.
-
-> `defer` ist ein **Soft-Keyword**: Es wird als `TK_IDENT` geparst und nur im Statement-Kontext erkannt.
-
-> `const` ist ein Alias für `con` (legacy-Kompatibilität).  
-> `pub` ist ein Alias für das interne `public`-Token.
-
-### Integer-Literale mit verschiedenen Basen
-
-Lyx unterstützt Integer-Literale in verschiedenen Zahlenbasen:
-
-```
-IntLiteral    := DecimalLiteral | HexLiteral | BinaryLiteral | OctalLiteral ;
-DecimalLiteral := [0-9] { [0-9_] } ;
-HexLiteral     := ( '0x' | '0X' | '$' ) [0-9a-fA-F_] { [0-9a-fA-F_] } ;
-BinaryLiteral  := ( '0b' | '0B' | '%' ) [01_] { [01_] } ;
-OctalLiteral   := ( '0o' | '&' ) [0-7_] { [0-7_] } ;
-```
-
-Unterstriche (`_`) können als Trenner zur Lesbarkeit verwendet werden.
-
-**Beispiele:**
-```
-42           // Dezimal
-0xFF, $FF   // Hexadezimal (255)
-0b1010, %1010 // Binär (10)
-0o77, &77    // Oktal (63)
-1_000_000    // Mit Unterstrich
-0b1100_1010  // Binär mit Unterstrich (202)
-```
-
-Alle Integer-Literale werden intern als `int64` behandelt.
-
-### Operatoren / Trennzeichen
-
-* Zuweisung: `:=`
-* Arithmetik: `+ - * / %`
-* Inkrement/Dekrement (Statement): `++` `--`
-* **String-Verkettung**: `+` (bei `pchar + pchar` → neuer `pchar`, beliebig kettenbar)
-* Vergleich: `== != < <= > >=`
-  * `bool == bool` erlaubt (z. B. `x == true`, `x == false`)
-  * `bool == <anderer Typ>` → Compile-Fehler
-* Logik: `&& || !` (Short-Circuit; Operanden müssen `bool` sein)
-* Bitweise: `& | ^ ~ << >> |~`
-  * `|~` = bitweises NOR
-* Null-Safety: `?` (nullable Typ), `??` (Null-Coalescing), `?.` (Safe-Call)
-* Pipe: `|>` (Funktions-Pipeline)
-* Fat Arrow: `=>` (Pattern-Matching-Zweig)
-* Range: `..` (z. B. `range 0..100`)
-* Ellipsis: `...` (Variadic)
-* Namespace: `::` (Enum-Zugriff: `Color::Red`)
-* Sonstiges: `(` `)` `{` `}` `[` `]` `:` `,` `;` `.` `@`
-
-### String-Verkettung mit `+`
-
-Der `+`-Operator wird automatisch als String-Verkettung interpretiert, sobald mindestens ein Operand vom Typ `pchar` ist. Das Ergebnis ist ein neu allokierter `pchar`.
-
-```ebnf
-StrConcatExpr = PcharExpr "+" PcharExpr { "+" PcharExpr } ;
-
-PcharExpr = StringLiteral          (* "..."c *)
-          | Ident                   (* Variable vom Typ pchar *)
-          | IntToStr "(" Expr ")"
-          | StrFromInt "(" Expr ")"
-          | StrConcat "(" Expr "," Expr ")"
-          | StrSub "(" Expr "," Expr "," Expr ")"
-          | FloatToStr "(" Expr ")"
-          | ArgvGetStr "(" Expr "," Expr ")"
-          | StrConcatExpr
-          ;
-```
-
-**Chaining** ist beliebig tief möglich, da `pchar + pchar → pchar` links-assoziativ ausgewertet wird:
-
-```lyx
-// Zwei Teile
-PrintStr("Hello, " + name);
-
-// Drei Teile
-PrintStr("x=" + IntToStr(x) + "\n"c);
-
-// Vier und mehr Teile
-PrintStr("a=" + IntToStr(a) + " b=" + IntToStr(b) + " c=" + IntToStr(c) + "\n"c);
-```
-
-**Hinweis:** Liegt *kein* Operand von `+` im Typ `pchar` vor, wird `+` als arithmetische Addition behandelt.
+Status: Draft
+Target parser: Recursive Descent + Pratt Expression Parser
+Scope: Concrete syntax only.
 
 ---
 
-## 1b) Top-Level-Deklarationen (Grammatik-Übersicht)
+# 1. Lexical Grammar
 
 ```ebnf
-Program      = [ UnitDecl ] { TopDecl } ;
-UnitDecl     = [ IntegrityAttr ] "unit" DotPath ";" ;
-DotPath      = Ident { "." Ident } ;
+Letter              = "A"…"Z" | "a"…"z" | "_" ;
+Digit               = "0"…"9" ;
+HexDigit            = Digit | "A"…"F" | "a"…"f" ;
+BinaryDigit         = "0" | "1" ;
+OctalDigit          = "0"…"7" ;
 
-TopDecl      = ConDecl
-             | VarDecl
-             | FnDecl
-             | TypeDecl
-             | EnumDecl
-             | ExternFnDecl
-             | ImportDecl
-             | DimDecl
-             | UtypeDecl
-             | AtDirective
-             ;
+Ident               = Letter { Letter | Digit } ;
 
-ImportDecl   = "import" DotPath { "," DotPath } ";" ;
+DecimalLiteral      = Digit { Digit | "_" } ;
 
-(* Konstanten *)
-ConDecl      = [ "pub" ] "con" Ident ":" Type ":=" ConstExpr ";" ;
-ConstExpr    = Literal | Ident | UnaryOp ConstExpr | ConstExpr BinOp ConstExpr ;
+HexLiteral          = ( "0x" | "0X" | "$" )
+                      HexDigit { HexDigit | "_" } ;
 
-(* Variablen / co-Variablen — WP-AS-16/17: @volatile optional *)
-VarDecl      = [ "pub" ] [ "@redundant" ] [ "@volatile" ]
-               ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
+BinaryLiteral       = ( "0b" | "0B" | "%" )
+                      BinaryDigit { BinaryDigit | "_" } ;
 
-(* Funktionen *)
-FnDecl       = { FuncAttr } [ "pub" ] "fn" Ident [ "[" TypeParamList "]" ]
-               "(" [ ParamList ] ")" [ ":" ReturnType ] Block ;
-ExternFnDecl = "extern" "fn" Ident "(" [ ParamList ] ")" [ ":" Type ]
-               "link" StringLit ";" ;
+OctalLiteral        = ( "0o" | "0O" | "&" )
+                      OctalDigit { OctalDigit | "_" } ;
 
-(* WP-AS-11/12: con-Qualifier für read-only Parameter *)
-ParamList    = Param { "," Param } ;
-Param        = [ "con" ] Ident ":" Type ;
-ReturnType   = Type | "(" Type { "," Type } ")" ;   (* Tuple-Rückgabe *)
+IntLiteral          = DecimalLiteral
+                    | HexLiteral
+                    | BinaryLiteral
+                    | OctalLiteral ;
 
-(* Typen *)
-TypeDecl     = [ "pub" ] "type" Ident "=" TypeDef ";" ;
-TypeDef      = BaseIntType [ RangeClause ]          (* Range-Typ *)
-             | [ EndianAttr ] "struct" "{" { StructField } "}"
-             | "flat" "struct" "{" { StructField } "}"
-             | "packed" "struct" "{" { PackedField } "}"
-             | ClassDef
-             ;
+FloatLiteral        = Digit { Digit | "_" }
+                      "."
+                      Digit { Digit | "_" } ;
 
-StructField  = Ident ":" Type ";" ;
-PackedField  = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
+StringLiteral       = '"'
+                      { StringChar | EscapeSequence }
+                      '"' ;
 
-(* Compiler-Direktiven (können auf Top-Level und in Funktionskörpern stehen) *)
-AtDirective  = "@io_check"          "(" BoolLiteral ")" ";"
-             | "@overflow_check"    "(" BoolLiteral ")" ";"
-             | "@bounds_check"      "(" BoolLiteral ")" ";"
-             | "@debug_info"        "(" BoolLiteral ")" ";"
-             | "@optimization_level" "(" IntLiteral ")" ";"    (* 0..3 *)
-             ;
-BoolLiteral  = "true" | "false" ;
+StringChar          = ? any Unicode scalar value except '"', '\', CR, LF ? ;
 
-(* Statements *)
-Statement    = VarDecl | ConDecl
-             | AssignStmt | IncDecStmt
-             | IfStmt | WhileStmt | ForStmt | RepeatStmt | SwitchStmt | MatchStmt
-             | ReturnStmt | BreakStmt | ContinueStmt
-             | ExprStmt | Block
-             | NestedFnDecl
-             | DeferStmt
-             | AtDirective
-             ;
+EscapeSequence      = "\\" ( "n" | "r" | "t" | "\\" | '"' | "0" ) ;
 
-AssignStmt   = LValue ":=" Expr ";" ;
-IncDecStmt   = LValue ( "++" | "--" ) ";" ;
-BreakStmt    = "break" ";" ;
-ContinueStmt = "continue" ";" ;
-ReturnStmt   = "return" [ Expr ] ";" ;
-ExprStmt     = Expr ";" ;
+BoolLiteral         = "true" | "false" ;
+NullLiteral         = "null" ;
 
-(* WP-AS-07/08: defer — RAII, Go-Semantik LIFO, gilt für gesamte Funktion *)
-DeferStmt    = "defer" Statement ;
+Literal             = IntLiteral
+                    | FloatLiteral
+                    | StringLiteral
+                    | BoolLiteral
+                    | NullLiteral ;
+```
 
-(* For-Schleifen — zwei Varianten *)
-ForStmt      = ForRangeStmt | ForCStmt ;
+## 1.1 Lexer Disambiguation Rules
 
-(* Range-basiert: for i := start to end [do] { } *)
-ForRangeStmt = "for" Ident ":=" Expr ( "to" | "downto" ) Expr [ "do" ] Block ;
+```text
+The lexer SHALL use longest-match tokenization.
 
-(* C-Style:       for i := init; cond; step [do] { } *)
-ForCStmt     = "for" Ident ":=" Expr ";" [ Expr ] ";" [ ForStep ] [ "do" ] Block ;
-ForStep      = LValue ( "++" | "--" | ":=" Expr ) ;
+The token "??" SHALL be recognized before "?".
 
-(* WP-BC-04: repeat { body } until ( cond ) *)
-RepeatStmt   = "repeat" Block "until" "(" Expr ")" ";" ;
+The token "?." SHALL be recognized before "?".
 
-LValue       = Ident { "." Ident | "[" Expr "]" } ;
-Block        = "{" { Statement } "}" ;
+The token "|>" SHALL be recognized before "|".
+
+The token "|~" SHALL be recognized before "|".
+
+The token "..." SHALL be recognized before "..".
+The token ".." SHALL be recognized before ".".
+
+A "." following an integer literal begins a FloatLiteral only if the next character is Digit.
+Otherwise "." SHALL be emitted as a Dot token.
+
+Examples:
+42.0        => FloatLiteral
+42.toStr()  => IntLiteral "." Ident "(" ")"
+42.member   => IntLiteral "." Ident
 ```
 
 ---
 
-## Compilerschalter-Pragmas I: @io_check / @overflow_check (v0.8.x ✅ ABGESCHLOSSEN)
+# 2. Keywords
 
-Inline-Direktiven zur Aktivierung/Deaktivierung von Runtime-Checks auf Statement- und Top-Level-Ebene.
+## 2.1 Reserved Keywords
 
-```ebnf
-AtDirective = "@io_check"       "(" BoolLiteral ")" ";"
-            | "@overflow_check" "(" BoolLiteral ")" ";" ;
-BoolLiteral = "true" | "false" ;
+```text
+fn var let co con
+if else while for do downto to repeat until
+switch case break continue default return
+true false null
+extern unit import pub as
+array struct flat packed class extends
+new dispose super static self Self
+private protected
+panic assert check
+enum match try catch throw limit
+virtual override abstract
+dim utype
 ```
 
-| Direktive | Default | Beschreibung |
-|-----------|---------|--------------|
-| `@io_check(true/false)` | `false` | Aktiviert/deaktiviert I/O-Syscall-Fehlerprüfung |
-| `@overflow_check(true/false)` | `false` | Aktiviert/deaktiviert Integer-Overflow-Prüfung |
+## 2.2 Soft Keywords
 
-```lyx
-@io_check(true);       // ab hier: I/O-Fehler führen zu panic
-@overflow_check(true); // ab hier: Integer-Überlauf führt zu panic
+```text
+range wraps defer
 ```
 
----
+Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
 
-## Compilerschalter-Pragmas II: @bounds_check / @debug_info / @optimization_level (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-01..06)
+```text
+"defer" is recognized as DeferStmt only when an identifier token with text "defer"
+appears in statement position and is followed by a token sequence that can start a Statement.
 
-Drei neue Direktiven, die bestehende `NK_AT_DIRECTIVE`-Infrastruktur nutzen.
-
-```ebnf
-AtDirective = AtDirective
-            | "@bounds_check"      "(" BoolLiteral ")" ";"
-            | "@debug_info"        "(" BoolLiteral ")" ";"
-            | "@optimization_level" "(" IntLiteral ")" ";" ;
-```
-
-| Direktive | `iv` | Default | Beschreibung |
-|-----------|------|---------|--------------|
-| `@bounds_check(bool)` | 2 | `true` | Array-Index-Bounds-Check aktivieren/deaktivieren |
-| `@debug_info(bool)` | 3 | `false` | Debug-Informationen in Ausgabe einbetten |
-| `@optimization_level(N)` | 4 | `2` | IR-Optimierungsstufe: 0=keine, 1=minimal, 2=Standard, 3=aggressiv |
-
-### Semantik
-
-```lyx
-@bounds_check(false);      // Deaktiviert Array-Bounds-Check in diesem Scope
-@debug_info(true);         // Debug-Info aktivieren
-@optimization_level(0);    // Keine Optimierungen (z. B. für zertifizierte Funktionen)
-@optimization_level(3);    // Aggressiv (Loop-Unrolling bei @energy-Funktionen)
-```
-
-### IR-Optimierungsstufen
-
-| Level | Name | Passes |
-|-------|------|--------|
-| 0 | Keine | Kein Pass ausgeführt |
-| 1 | Minimal | Nur Dead-Code-Elimination + eliminateUnreachableBlocks |
-| 2 | Standard (default) | + Constant Folding, Copy Propagation, Strength Reduction, CSE |
-| 3 | Aggressiv | Wie 2, aber bis zu 20 Iterationsrunden statt 10 |
-
----
-
-## `defer` — RAII (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-07..10)
-
-`defer` verschiebt die Ausführung eines Statements auf den Zeitpunkt des Funktionsverlassens (Go-Semantik).
-
-```ebnf
-DeferStmt = "defer" Statement ;
-```
-
-### Semantik
-
-* **Scope**: Pro Funktion (nicht Block-Level). Deferred Statements werden beim Verlassen der gesamten Funktion ausgeführt.
-* **LIFO-Reihenfolge**: Mehrere `defer`s in einer Funktion werden in umgekehrter Reihenfolge ausgeführt (letztes `defer` zuerst).
-* **Early Return**: Deferred Statements werden vor jedem `return` ausgeführt.
-* **Rückgabewert**: Falls die Funktion einen Wert zurückgibt, wird `rax` vor der Defer-Emission gesichert (`push rax`) und danach wiederhergestellt (`pop rax`).
-* `defer` ist ein **Soft-Keyword** (kein Lexer-Token), wird via `_tokTextEq` erkannt.
-
-### Beispiele
-
-```lyx
-fn cleanup(): int64 {
-    defer dispose buf;         // wird beim Funktionsende ausgeführt
-    var buf: MyBuffer := new MyBuffer();
-    // ... Arbeit ...
-    return 0;                  // defer läuft hier
-}
-
-fn lifo_test(): int64 {
-    defer tag(1);   // zweiter defer — läuft zuerst (LIFO)
-    defer tag(2);   // erster defer  — läuft zuletzt
-    return 0;
-    // Ausführungsreihenfolge: tag(2), dann tag(1)
-}
-```
-
-### Codegen-Verhalten
-
-1. **Pre-Pass** `cg_collectDefers`: Traversiert den Funktionskörper, sammelt alle `NK_DEFER`-c0-Nodes in `deferBuf` (LIFO-Buffer, max. 64 Entries).
-2. **Beim `return`**: Falls `deferCount > 0` und Rückgabewert vorhanden → `push rax`, Defers emittieren, `pop rax`.
-3. **Impliziter Return**: `cg_emitDefers()` vor `xor rax, rax` + Epilog.
-
----
-
-## `con`-Parameter — Read-Only-Qualifier (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-11..13)
-
-Parameter können mit `con` als read-only markiert werden. Schreibzugriffe darauf sind ein Sema-Fehler.
-
-```ebnf
-Param = [ "con" ] Ident ":" Type ;
-```
-
-### Semantik
-
-* `con x: T` — der Parameter `x` darf innerhalb der Funktion nicht zugewiesen werden.
-* Jede Zuweisung (`x := ...`) auf einen `con`-Parameter → `sema error: assignment to con-parameter not allowed`.
-* **Shallow-Const**: Nur der Parameter selbst ist geschützt, nicht seine Felder (bei Structs/Klassen).
-* Kombination mit anderen Qualifiern ist erlaubt: `fn f(con a: int64, b: int64): int64`
-
-### Beispiele
-
-```lyx
-fn add(con a: int64, con b: int64): int64 {
-    return a + b;   // OK: lesen erlaubt
-}
-
-fn bad(con x: int64): int64 {
-    x := 5;         // ERROR: assignment to con-parameter not allowed
-    return x;
-}
+Otherwise, "defer" remains a normal identifier.
 ```
 
 ---
 
-## `@volatile` — Hardware-Register-Variablen (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-16..19)
-
-Variablen können mit `@volatile` als hardware-volatile markiert werden, um Compiler-Optimierungen zu verhindern.
+# 3. Program Structure
 
 ```ebnf
-VarDecl = [ "pub" ] [ "@redundant" ] [ "@volatile" ]
-          ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
-```
+Program             = [ UnitDecl ] { TopDecl } EOF ;
 
-### Semantik
+UnitDecl            = [ IntegrityAttr ] "unit" [ DotPath ] ";" ;
 
-* `@volatile var x: T` — Variable `x` darf nicht durch den IR-Optimizer wegoptimiert (CSE, Load-After-Store-Propagation) werden.
-* Das Volatile-Flag wird in der Symboltabelle gespeichert (`SymIsVolatile()`).
-* Kombinierbar mit `@redundant`: `@redundant @volatile var sensor: int64;`
-* **x86_64**: Durch den stack-basierten Codegen ohne Registerallokation ist volatile auf dieser Plattform automatisch erfüllt. Kein `mfence` notwendig für reine Software-volatile (x86_64 hat TSO-Speichermodell).
-* **Einschränkung**: `@volatile` mit `con` ist semantisch widersprüchlich und wird von Sema als Fehler gemeldet.
+DotPath             = Ident { "." Ident } ;
 
-### Anwendungsfall
+TopDecl             = ImportDecl
+                    | ConstDecl
+                    | VarDecl
+                    | FnDecl
+                    | ExternFnDecl
+                    | TypeDecl
+                    | EnumDecl
+                    | DimDecl
+                    | UtypeDecl
+                    | Directive ;
 
-```lyx
-@volatile var irq_counter: int64 := 0;   // Hardware-Interrupt-Zähler
-@volatile var status_reg:  int64 := at(0x40021000);  // Memory-Mapped I/O
-
-// Ohne @volatile könnte der Compiler in Schleifen optimieren:
-while (irq_counter == prev_count) { }   // KORREKT: irq_counter wird jedes Mal geladen
+ImportDecl          = "import" DotPath { "," DotPath } ";" ;
 ```
 
 ---
 
-## Definite Assignment Analysis — DAA (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-15)
+# 4. Attributes and Directives
 
-Optionale Analyse, die warnt wenn eine Variable gelesen wird, bevor sie initialisiert wurde.
+```ebnf
+Visibility          = "pub" ;
 
-### CLI-Flags
+Directive           = IoCheckDirective
+                    | OverflowCheckDirective
+                    | BoundsCheckDirective
+                    | DebugInfoDirective
+                    | OptimizationLevelDirective ;
 
-```
---daa         Aktiviert DAA als Warnung (daaEnabled = 1)
---daa-strict  Aktiviert DAA als Fehler  (daaEnabled = 2)
-```
+IoCheckDirective            = "@io_check" "(" BoolLiteral ")" ";" ;
+OverflowCheckDirective      = "@overflow_check" "(" BoolLiteral ")" ";" ;
+BoundsCheckDirective        = "@bounds_check" "(" BoolLiteral ")" ";" ;
+DebugInfoDirective          = "@debug_info" "(" BoolLiteral ")" ";" ;
+OptimizationLevelDirective  = "@optimization_level" "(" IntLiteral ")" ";" ;
 
-### Semantik
+FuncAttr            = EnergyAttr
+                    | DalAttr
+                    | CriticalAttr
+                    | WcetAttr
+                    | StackLimitAttr
+                    | IntegrityAttr
+                    | FlightCritAttr ;
 
-* **Default**: DAA ist deaktiviert (opt-in in v0.8.8A, Pflicht in v1.0).
-* `var x: T;` ohne Initializer → `x` wird als "möglicherweise nicht initialisiert" markiert.
-* `var x: T := expr;` → `x` gilt als initialisiert.
-* `x := expr;` (Zuweisung) → markiert `x` als initialisiert.
-* Lesen von `x` während es "uninitialisiert" → Warnung/Fehler.
-* **Konservativ für if/else**: Initialisierungen in Verzweigungen werden nicht zusammengeführt (mögliche Falsch-Positive).
-* **Zero-Init (WP-AS-14)**: Alle uninitialisierten Locals werden mit `0` / `null` initialisiert → DAA-Warnungen sind sicher, da kein echtes UB entsteht.
+EnergyAttr          = "@energy" "(" IntLiteral ")" ;
 
-### Beispiel
+DalAttr             = "@dal" "(" DalLevel ")" ;
+DalLevel            = "A" | "B" | "C" | "D" ;
 
-```lyx
-fn example(): int64 {
-    var x: int64;         // nicht initialisiert
-    var y: int64 := 0;    // initialisiert
-    return x + y;         // WARNING: variable x possibly used before initialization
-}
+CriticalAttr        = "@critical" ;
+
+WcetAttr            = "@wcet" "(" IntLiteral ")" ;
+
+StackLimitAttr      = "@stack_limit" "(" IntLiteral ")" ;
+
+FlightCritAttr      = "@flight_crit" ;
+
+IntegrityAttr       = "@integrity" "(" IntegrityParams ")" ;
+
+IntegrityParams     = IntegrityMode [ "," IntegrityInterval ] ;
+
+IntegrityMode       = "mode" ":"
+                      ( "software_lockstep"
+                      | "scrubbed"
+                      | "hardware_ecc" ) ;
+
+IntegrityInterval   = "interval" ":" IntLiteral ;
+
+VarAttr             = "@redundant"
+                    | "@volatile" ;
+
+EndianAttr          = "@big_endian"
+                    | "@little_endian" ;
 ```
 
 ---
 
-## Energy-Aware-Compiling (v0.3.1+ ✅ ABGESCHLOSSEN)
+# 5. Declarations
 
-### @energy Pragma
+```ebnf
+ConstDecl           = [ Visibility ]
+                      "con"
+                      Ident
+                      ":"
+                      Type
+                      ":="
+                      ConstExpr
+                      ";" ;
 
-Funktionen können mit einem Energy-Level kompiliert werden:
+VarDecl             = [ Visibility ]
+                      { VarAttr }
+                      VarKind
+                      IdentList
+                      ":"
+                      Type
+                      [ ":=" Expr ]
+                      ";" ;
 
-```
-EnergyAttr = "@energy" "(" IntLiteral ")"
-FnDecl = [ EnergyAttr ] "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
-NestedFnDecl = "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block
+VarKind             = "var" | "let" | "co" ;
+
+IdentList           = Ident { "," Ident } ;
 ```
 
 ---
 
-## Safety-Pragmas (v0.8.0 ✅ ABGESCHLOSSEN – aerospace-todo P1 #6)
-
-Funktionen können mit Safety-Annotationen für DO-178C-Compliance versehen werden.
-Mehrere `@`-Attribute können in beliebiger Reihenfolge vor `fn` stehen.
-
-### EBNF
+# 6. Functions
 
 ```ebnf
-FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr | FlightCritAttr ;
-EnergyAttr = "@energy"      "(" IntLiteral ")" ;   // 1..5
-DALAttr    = "@dal"         "(" DALLevel   ")" ;   // A | B | C | D
-CriticalAttr = "@critical" ;                        // kein Argument
-WCETAttr   = "@wcet"        "(" IntLiteral ")" ;   // μs > 0
-StackLimitAttr = "@stack_limit" "(" IntLiteral ")" ; // Bytes > 0
-IntegrityAttr  = "@integrity" "(" "mode" ":" IntegrityMode [ "," "interval" ":" IntLiteral ] ")" ;
-FlightCritAttr = "@flight_crit" ;
-IntegrityMode  = "software_lockstep" | "scrubbed" | "hardware_ecc" ;
+FnDecl              = { FuncAttr }
+                      [ Visibility ]
+                      "fn"
+                      Ident
+                      [ TypeParamClause ]
+                      "(" [ ParamList ] ")"
+                      [ ":" ReturnType ]
+                      Block ;
 
-DALLevel   = "A" | "B" | "C" | "D" ;
+NestedFnDecl        = "fn"
+                      Ident
+                      [ TypeParamClause ]
+                      "(" [ ParamList ] ")"
+                      [ ":" ReturnType ]
+                      Block ;
 
-FnDecl = { FuncAttr } "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block ;
+ExternFnDecl        = "extern"
+                      "fn"
+                      Ident
+                      "(" [ ParamList ] ")"
+                      [ ":" Type ]
+                      "link"
+                      StringLiteral
+                      ";" ;
+
+TypeParamClause     = "[" TypeParamList "]" ;
+
+TypeParamList       = Ident { "," Ident } ;
+
+ParamList           = Param { "," Param } ;
+
+Param               = [ "con" ] Ident ":" Type ;
+
+ReturnType          = Type | TupleType ;
 ```
 
-### Semantik
+---
 
-| Pragma | Bedeutung | Validierung |
-|--------|-----------|-------------|
-| `@dal(A)` | DO-178C DAL A (höchstes Sicherheitslevel) | `@critical` wird empfohlen (Warning) |
-| `@dal(B)` | DO-178C DAL B | — |
-| `@dal(C)` | DO-178C DAL C | — |
-| `@dal(D)` | DO-178C DAL D (niedrigstes) | — |
-| `@critical` | Sicherheitskritische Funktion | Nicht auf `extern fn` erlaubt |
-| `@wcet(N)` | WCET-Budget in Mikrosekunden | N > 0; nicht auf `extern fn` erlaubt |
-| `@stack_limit(N)` | Maximale Stack-Nutzung in Bytes | N > 0; nicht auf `extern fn` erlaubt |
-| `@flight_crit` | FP-deterministisch; impliziert `@critical`; setzt MXCSR auf Round-to-Zero | — |
-
-### Beispiele
-
-```lyx
-// Einfache Annotationen
-@dal(A) @critical @wcet(100) @stack_limit(512)
-fn autopilot_update(): int64 {
-  return 0;
-}
-
-// DAL-B mit WCET-Budget
-@dal(B) @wcet(1000)
-fn fuel_monitor(): int64 {
-  return 1;
-}
-
-// Kombiniert mit @energy
-@energy(3) @dal(C)
-fn sensor_read(): int64 {
-  return 42;
-}
-
-// @flight_crit — deterministisches FP
-@flight_crit
-fn compute_trajectory(): f64 {
-  return 0.5 * gravity * time * time;
-}
-```
-
-### Compiler-Verhalten
-
-- **Parsing**: Alle Attribute werden vor dem `fn`-Keyword gelesen (Reihenfolge beliebig).
-- **Sema-Check**: Ungültige Kombinationen werden als Error oder Warning gemeldet.
-- **IR-Propagation**: `SafetyPragmas` werden in `TIRFunction` übertragen und stehen für
-  zukünftige WCET-Analyse, Stack-Verifizierung und Assembly-Listing-Annotierung zur Verfügung.
-- **DAL-A ohne `@critical`**: Warning (kein Fehler) – starke Empfehlung zur Markierung.
-
-## Range-Typen (v0.8.3 ✅ ABGESCHLOSSEN – aerospace-todo P1 #7)
-
-Integer-Typen mit eingeschlossenen Wertebereichen für DO-178C-Compliance.
-Compile-Time-Checks für Literale, Runtime-Checks für nicht-konstante Werte.
-
-### EBNF
+# 7. Type Grammar
 
 ```ebnf
-TypeDecl     = "type" Ident "=" BaseIntType [ RangeClause ] ";" ;
-RangeClause  = "range" RangeBound ".." RangeBound ;
-RangeBound   = [ "-" ] IntLiteral ;
-BaseIntType  = "int8" | "int16" | "int32" | "int64"
-             | "uint8" | "uint16" | "uint32" | "uint64"
-             | "isize" | "usize" ;
+TypeDecl            = [ Visibility ] "type" Ident "=" TypeDef ";" ;
+
+TypeDef             = Type
+                    | RangeTypeDef
+                    | StructDef
+                    | FlatStructDef
+                    | PackedStructDef
+                    | ClassDef ;
+
+RangeTypeDef        = BaseIntType RangeClause ;
+
+RangeClause         = "range" RangeBound ".." RangeBound ;
+
+RangeBound          = [ "-" ] IntLiteral ;
+
+Type                = PrimaryType [ "?" ] ;
+
+PrimaryType         = BuiltinType
+                    | Ident
+                    | QualifiedIdent
+                    | ArrayType
+                    | ParallelArrayType
+                    | TupleType
+                    | MapType
+                    | SetType ;
+
+BuiltinType         = "bool"
+                    | BaseIntType
+                    | "f32"
+                    | "f64"
+                    | "pchar"
+                    | "void" ;
+
+BaseIntType         = "int8"
+                    | "int16"
+                    | "int32"
+                    | "int64"
+                    | "uint8"
+                    | "uint16"
+                    | "uint32"
+                    | "uint64"
+                    | "isize"
+                    | "usize" ;
+
+QualifiedIdent      = Ident "::" Ident ;
+
+ArrayType           = "array" "[" Type "]"
+                    | "Array" "<" Type ">" ;
+
+ParallelArrayType   = "ParallelArray" "<" Type ">" ;
+
+TupleType           = "(" Type "," Type { "," Type } ")" ;
+
+MapType             = "Map" "<" Type "," Type ">" ;
+
+SetType             = "Set" "<" Type ">" ;
 ```
 
-### Semantik
+---
 
-| Merkmal | Beschreibung |
-|---------|-------------|
-| Wertebereich | Inklusive Grenzen: `[Min..Max]` |
-| Basistyp | Muss ein Integer-Typ sein |
-| Compile-Time-Check | Literale außerhalb des Bereichs → `error: value N is out of range [Min..Max] for type T` |
-| Runtime-Check | Nicht-konstante Ausdrücke → IR-Vergleiche + `panic` bei Verletzung |
-| Redeclaration | Zweite Deklaration desselben Namens → Fehler |
-
-### Beispiele
-
-```lyx
-// Aeronautische Wertebereiche
-type Altitude  = int64 range -1000..60000;   // Meter über MSL
-type Speed     = int64 range 0..300;          // Knoten
-type Percent   = int64 range 0..100;          // Prozentwert
-
-// Compile-Time Fehler (Literal außerhalb Bereich):
-var alt: Altitude := 70000;   // error: value 70000 is out of range [-1000..60000] for type Altitude
-
-// Gültige Zuweisung:
-var alt: Altitude := 5000;    // OK
-
-// Runtime-Check (nicht-konstanter Wert):
-var spd: Speed := get_speed();  // Runtime: panic wenn get_speed() > 300
-```
-
-### Kombination mit Safety-Pragmas
-
-```lyx
-type Altitude = int64 range -1000..60000;
-
-@dal(A) @critical @wcet(50)
-fn set_target_altitude(alt: int64): int64 {
-  return 0;
-}
-```
-
-## Dimensionale Analyse / Unit-Typen (v0.8.4 ✅ ABGESCHLOSSEN)
-
-Compile-Zeit Einheitensicherheit für physikalische Größen: Dimensionsfehler (z. B. `km + s`) werden zur Compile-Zeit erkannt. Unit-Typen kompilieren zu `f64` ohne Laufzeit-Overhead.
-
-### EBNF
+# 8. Structs
 
 ```ebnf
-(* Dimensionsdeklaration *)
-DimDecl      = [ "pub" ] "dim" Ident [ "=" DimExpr ] ";" ;
-DimExpr      = Ident { ( "*" | "/" ) Ident } ;
+StructDef           = [ EndianAttr ]
+                      "struct"
+                      "{"
+                      { StructField }
+                      "}" ;
 
-(* Unit-Typ-Deklaration *)
-UtypeDecl    = [ "pub" ] "utype" Ident ":" Ident "=" NumericFactor
-               [ RangeModifier ] ";" ;
-NumericFactor = FloatLit | IntLit ;
-RangeModifier = ( "wraps" | "range" ) NumericFactor ".." NumericFactor ;
+FlatStructDef       = "flat"
+                      "struct"
+                      "{"
+                      { StructField }
+                      "}" ;
+
+PackedStructDef     = "packed"
+                      "struct"
+                      "{"
+                      { PackedField }
+                      "}" ;
+
+StructField         = Ident ":" Type ";" ;
+
+PackedField         = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
 ```
 
-### Dimensionen
+---
 
-Basisdimensionen haben keinen Ausdruck; abgeleitete Dimensionen werden aus anderen Dimensionen kombiniert:
-
-```lyx
-pub dim Length;                      // Basisdimension
-pub dim Time;
-pub dim Speed = Length / Time;       // abgeleitete Dimension
-pub dim Area  = Length * Length;
-```
-
-### Unit-Typen
-
-Unit-Typen binden einen numerischen Typ an eine Dimension und einen SI-Konversionsfaktor:
-
-```lyx
-pub utype m:   Length = 1.0;         // SI-Basiseinheit
-pub utype km:  Length = 1000.0;      // 1 km = 1000 m
-pub utype h:   Time   = 3600.0;      // 1 h = 3600 s
-pub utype kmh: Speed  = 0.277778;    // 1 km/h = 0.277778 m/s
-```
-
-### Dimensionsprüfung
-
-Der Compiler prüft zur Compile-Zeit, dass Operanden kompatibler Dimension sind:
-
-```lyx
-var dist: km := 100.0;
-var t:    h  := 2.0;
-var spd:  kmh := dist / t;   // OK: Length/Time → Speed
-var bad:  km  := dist + t;   // Compile-Fehler: Dimension mismatch (Length ≠ Time)
-```
-
-### Unit-Konvertierung mit `as`
-
-Werte können zwischen kompatiblen Einheiten konvertiert werden. Der Compiler prüft Dimensionskompatibilität und emittiert `fmul` mit dem Faktor `src.factor / target.factor`:
-
-```lyx
-var d_km: km := 1.0;
-var d_m:  m  := d_km as m;    // 1 km → 1000.0 m  (fmul mit 1000.0)
-
-var mass: kg  := 0.5;
-var mg:   g   := mass as g;   // 0.5 kg → 500.0 g  (fmul mit 1000.0)
-
-var bad: s := d_km as s;      // Fehler: cannot convert "km" (Length) to "s" (Time)
-```
-
-Konvertierungen mit Literalen werden durch den IR-Optimierer constant-gefaltet.
-
-### Range-Modifier für Unit-Typen
-
-Unit-Typen können optional mit Bereichsgrenzen versehen werden:
-
-| Modifier | Syntax | Verhalten |
-|----------|--------|-----------|
-| `range` | `range MIN..MAX` | Compile-Fehler bei Konstanten außerhalb `[MIN, MAX)`; Runtime-Panic bei dynamischen Werten |
-| `wraps` | `wraps MIN..MAX` | Zyklischer Umlauf: Werte werden modulo `[MIN, MAX)` gefaltet — kein Fehler |
-
-```lyx
-// Geprüfter Bereich: Überlauf ist ein Fehler
-pub utype alt: Length = 1.0 range 0.0..12000.0;
-
-var a: alt := 15000.0;         // Compile-Fehler: value 15000 is out of range [0..12000)
-a := a + climb;                // Runtime-Panic wenn Ergebnis außerhalb [0, 12000)
-
-// Zyklischer Umlauf: Überlauf ist gewollt
-pub utype hdg: Heading = 1.0 wraps 0.0..360.0;
-
-var h: hdg := 350.0;
-h := h + 20.0;                 // → 10.0  (370 mod 360)
-var h2: hdg := 720.0;          // → 0.0   (720 mod 360)
-```
-
-**Wrap-Formel** (branchless):
-```
-norm   = value − min
-rem    = norm − trunc(norm / range) × range
-result = rem + range × (rem < 0.0) + min
-```
-
-### Precompiled Units (`.lyu`)
-
-`dim`- und `utype`-Deklarationen werden in `.lyu`-Dateien exportiert und beim Import automatisch wiederhergestellt. Das TypeInfo-Format für `utype` ist:
-
-```
-"DimName|Factor"                  // ohne Range
-"DimName|Factor|W:min:max"        // wraps
-"DimName|Factor|R:min:max"        // range
-```
-
-### Beispiel: Navigationssystem
-
-```lyx
-unit nav.types;
-
-import std.units;   // m, km, h, kmh, s, ...
-
-pub dim Heading;
-pub utype hdg: Heading = 1.0 wraps 0.0..360.0;   // Kompasskurs, zyklisch
-
-pub fn ground_speed(dist: km, t: h): kmh {
-  return dist / t;
-}
-
-pub fn bearing_add(base: hdg, delta: hdg): hdg {
-  return base + delta;   // wraps automatisch
-}
-```
-
-### Bounded While Loops (v0.8.3 ✅ ABGESCHLOSSEN – aerospace-todo P1 #47)
-
-Für deterministische Echtzeit-Ausführung können While-Schleifen mit einem `limit` versehen werden:
+# 9. Classes
 
 ```ebnf
-WhileStmt     := 'while' '(' Expr ')' [ 'limit' '(' Expr ')' ] Block ;
+ClassDef            = [ "abstract" ]
+                      "class"
+                      [ "extends" Type ]
+                      "{"
+                      { ClassMember }
+                      "}" ;
+
+ClassMember         = FieldDecl
+                    | MethodDecl ;
+
+FieldDecl           = [ MemberVisibility ]
+                      [ "static" ]
+                      Ident
+                      ":"
+                      Type
+                      ";" ;
+
+MethodDecl          = { FuncAttr }
+                      [ MemberVisibility ]
+                      [ MethodModifier ]
+                      "fn"
+                      Ident
+                      [ TypeParamClause ]
+                      "(" [ ParamList ] ")"
+                      [ ":" ReturnType ]
+                      ( Block | ";" ) ;
+
+MethodModifier      = "static"
+                    | "virtual"
+                    | "override"
+                    | "abstract" ;
+
+MemberVisibility    = "private"
+                    | "protected"
+                    | "pub" ;
 ```
 
-**Beispiel:**
-```lyx
-// Unbounded (wie bisher)
-while (x < 100) {
-  x := x + 1;
-}
+---
 
-// Bounded (max. 1000 Iterationen)
-while (x < 100) limit(1000) {
-  x := x + 1;
-}
-```
-
-- Das `limit` muss ein Integer-Literal oder ein konstanter Ausdruck sein
-- Compiler warnt bei nicht-bounded Loops in @flight_crit Sektionen
-- WCET-Analyse kann bounded loops genauer berechnen
-
-### Compiler-Verhalten
-
-- **Lexer**: `..` wird als Token `tkDotDot` erkannt (vor `.` und vor `...`).
-- **Parser**: `range Min..Max` wird nach dem Basistyp geparst; `ParseRangeInt` akzeptiert optionales `-` + `IntLit`.
-- **Sema (Compile-Time)**: Literale werden beim ersten Compile-Pass mit `RangeMin`/`RangeMax` verglichen.
-- **IR (Runtime)**: `EmitRangeCheck` erzeugt `cmpge` + `and` + `brfalse` + `panic`-Sequenz.
-- **IR-Optimierung**: Konstante Initialisierungen werden durch Constant Folding ggf. wegeliminiert.
-
-## @integrity – Integritäts-Management (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
-
-Einheit- und Funktions-Level-Annotationen für Strahlungstoleranz und DO-178C-Compliance.
-Implementiert aerospace.pdf v2 Sections 2.5.1–2.5.2.
-
-### EBNF
+# 10. Enums
 
 ```ebnf
-IntegrityAttr  = "@integrity" "(" IntegrityParams ")" ;
-IntegrityParams = IntegrityMode [ "," IntegrityInterval ] ;
-IntegrityMode   = "mode" ":" ( "software_lockstep" | "scrubbed" | "hardware_ecc" ) ;
-IntegrityInterval = "interval" ":" IntLiteral ;        // ms > 0
+EnumDecl            = [ Visibility ]
+                      "enum"
+                      Ident
+                      "{"
+                      EnumBody
+                      "}"
+                      [ ";" ] ;
 
-(* Unit-Level: steht vor dem unit-Keyword, erste Deklaration der Datei *)
-UnitDecl = [ IntegrityAttr ] "unit" DotPath ";" { TopDecl } ;
+EnumBody            = EnumMember { "," EnumMember } [ "," ] ;
 
-(* Funktion-Level: zusammen mit anderen @-Attributen vor fn *)
-FuncAttr = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr ;
+EnumMember          = Ident [ "=" IntLiteral ] ;
 ```
 
-### Semantik
+---
 
-| Merkmal | Beschreibung |
-|---------|-------------|
-| `mode: software_lockstep` | Redundante Ausführung mit Ergebnisvergleich |
-| `mode: scrubbed` | Periodischer Hintergrund-CRC-Memory-Sweep |
-| `mode: hardware_ecc` | Vertraut auf Hardware-ECC-Speicherkorrektur |
-| `interval: N` | Prüf-/Scrub-Intervall in Millisekunden |
-| Auf `extern fn` | Fehler: nicht erlaubt |
-| `scrubbed` ohne `interval` | Warnung: Intervall empfohlen |
-
-### Beispiele
-
-```lyx
-// Unit-Level (löst .meta_safe ELF-Sektion aus)
-@integrity(mode: scrubbed, interval: 100)
-unit nav.core;
-
-fn main(): int64 { return 42; }
-
-// Funktion-Level (kein .meta_safe)
-@dal(A) @integrity(mode: software_lockstep, interval: 50)
-fn autopilot_step(): int64 { return 0; }
-```
-
-### .meta_safe ELF-Sektion
-
-Bei Unit-Level `@integrity` erzeugt der Compiler eine `.meta_safe` ELF-Sektion (8232 Bytes):
-
-```
-[0..7]    code_start_va   uint64 LE  – Start-VA des Code-Segments
-[8..15]   code_end_va     uint64 LE  – End-VA des Code-Segments
-[16..19]  mode            uint32 LE  – 1=lockstep, 2=scrubbed, 3=hardware_ecc
-[20..23]  interval_ms     uint32 LE  – Intervall in ms
-[24..31]  recovery_ptr    uint64 LE  – Recovery-Zeiger (0 = nicht gesetzt)
-[32..35]  hash_copy_1     uint32 LE  – CRC32 IEEE 802.3 des Codes
-[36..4127]  padding        4092 B    – 4096-Byte-Separation
-[4128..4131] hash_copy_2  uint32 LE  – identische CRC32-Kopie 2
-[4132..8223] padding       4092 B    – 4096-Byte-Separation
-[8224..8227] hash_copy_3  uint32 LE  – identische CRC32-Kopie 3
-[8228..8231] padding          4 B    – Abschluss-Padding
-```
-
-Drei identische Kopien mit 4096-Byte-Abstand → Single-Event-Upset-Erkennung via Mehrheitsabstimmung.
-
-### Compiler-Verhalten
-
-- **Parser**: `@integrity` vor `unit` oder `fn` – Pending-Feld-Ansatz in `ParseProgram`.
-- **Sema**: extern-fn-Fehler + scrubbed-ohne-interval-Warnung in `sema.pas`.
-- **IR**: `TIRModule.UnitIntegrity` speichert das Unit-Level-Attribut.
-- **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe`-Variante wenn `UnitIntegrity.Mode ≠ imNone`.
-- **Unterstützte Backends**: x86_64, ARM64, RISC-V.
-
-### VerifyIntegrity() Builtin (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
-
-Die `VerifyIntegrity()` Funktion führt zur Laufzeit einen TMR (Triple Modular Redundancy) Mehrheitsentscheid durch:
+# 11. Dimensions and Unit Types
 
 ```ebnf
+DimDecl             = [ Visibility ]
+                      "dim"
+                      Ident
+                      [ "=" DimExpr ]
+                      ";" ;
+
+DimExpr             = DimTerm { ( "*" | "/" ) DimTerm } ;
+
+DimTerm             = Ident ;
+
+UtypeDecl           = [ Visibility ]
+                      "utype"
+                      Ident
+                      ":"
+                      Ident
+                      "="
+                      NumericFactor
+                      [ UtypeRangeModifier ]
+                      ";" ;
+
+NumericFactor       = IntLiteral | FloatLiteral ;
+
+UtypeRangeModifier  = "range" NumericFactor ".." NumericFactor
+                    | "wraps" NumericFactor ".." NumericFactor ;
+```
+
+---
+
+# 12. Statements
+
+```ebnf
+Block               = "{" { Statement } "}" ;
+
+Statement           = Block
+                    | Directive
+                    | ConstDecl
+                    | VarDecl
+                    | TupleUnpackStmt
+                    | NestedFnDecl
+                    | AssignStmt
+                    | IncDecStmt
+                    | IfStmt
+                    | WhileStmt
+                    | ForStmt
+                    | RepeatStmt
+                    | SwitchStmt
+                    | MatchStmt
+                    | TryStmt
+                    | ThrowStmt
+                    | ReturnStmt
+                    | BreakStmt
+                    | ContinueStmt
+                    | DeferStmt
+                    | ExprStmt ;
+
+TupleUnpackStmt     = "var"
+                      Ident
+                      ","
+                      Ident
+                      { "," Ident }
+                      ":="
+                      Expr
+                      ";" ;
+
+AssignStmt          = LValue ":=" Expr ";" ;
+
+IncDecStmt          = LValue ( "++" | "--" ) ";" ;
+
+IfStmt              = "if"
+                      "(" Expr ")"
+                      Block
+                      [ "else" ElseBranch ] ;
+
+ElseBranch          = IfStmt | Block ;
+
+WhileStmt           = "while"
+                      "(" Expr ")"
+                      [ "limit" "(" ConstExpr ")" ]
+                      Block ;
+
+ForStmt             = ForRangeStmt
+                    | ForCStyleStmt ;
+
+ForRangeStmt        = "for"
+                      Ident
+                      ":="
+                      Expr
+                      ( "to" | "downto" )
+                      Expr
+                      [ "do" ]
+                      Block ;
+
+ForCStyleStmt       = "for"
+                      Ident
+                      ":="
+                      Expr
+                      ";"
+                      [ Expr ]
+                      ";"
+                      [ ForStep ]
+                      [ "do" ]
+                      Block ;
+
+ForStep             = LValue ( "++" | "--" | ":=" Expr ) ;
+
+RepeatStmt          = "repeat"
+                      Block
+                      "until"
+                      "(" Expr ")"
+                      ";" ;
+
+SwitchStmt          = "switch"
+                      "(" Expr ")"
+                      "{"
+                      { SwitchCase }
+                      [ SwitchDefault ]
+                      "}" ;
+
+SwitchCase          = "case" ConstExpr ":" { Statement } ;
+
+SwitchDefault       = "default" ":" { Statement } ;
+
+MatchStmt           = "match"
+                      Expr
+                      "{"
+                      { MatchCase }
+                      [ MatchDefault ]
+                      "}" ;
+
+MatchCase           = "case"
+                      Pattern
+                      { "|" Pattern }
+                      "=>"
+                      Block ;
+
+MatchDefault        = "default" "=>" Block ;
+
+TryStmt             = "try"
+                      Block
+                      "catch"
+                      "(" Ident ":" Type ")"
+                      Block ;
+
+ThrowStmt           = "throw" Expr ";" ;
+
+ReturnStmt          = "return" [ Expr ] ";" ;
+
+BreakStmt           = "break" ";" ;
+
+ContinueStmt        = "continue" ";" ;
+
+DeferStmt           = "defer" Statement ;
+
+ExprStmt            = Expr ";" ;
+```
+
+## 12.1 If/Else Binding Rule
+
+```text
+The then-branch of an IfStmt SHALL always be a Block.
+
+An "else" branch binds to the nearest preceding IfStmt that does not already have an else branch.
+
+Because the then-branch requires a Block, the classic dangling-else example
+
+    if (a) if (b) { f(); } else { g(); }
+
+is syntactically invalid in Lyx.
+
+The valid form is:
+
+    if (a) {
+        if (b) { f(); } else { g(); }
+    }
+```
+
+---
+
+# 13. LValues
+
+```ebnf
+LValue              = Ident { LValueSuffix } ;
+
+LValueSuffix        = "." Ident
+                    | "[" Expr "]" ;
+```
+
+---
+
+# 14. Patterns
+
+```ebnf
+Pattern             = LiteralPattern
+                    | IdentPattern
+                    | EnumPattern
+                    | WildcardPattern
+                    | TuplePattern ;
+
+LiteralPattern      = Literal ;
+
+IdentPattern        = Ident ;
+
+EnumPattern         = QualifiedIdent ;
+
+WildcardPattern     = "_" ;
+
+TuplePattern        = "(" Pattern "," Pattern { "," Pattern } ")" ;
+```
+
+---
+
+# 15. Runtime Expression Grammar
+
+The runtime expression grammar is precedence-ordered. The lowest precedence is defined first.
+
+```ebnf
+Expr                = PipeExpr ;
+
+PipeExpr            = NullCoalesceExpr
+                      { "|>" PipeTarget } ;
+
+PipeTarget          = Ident [ "(" [ PipeArgList ] ")" ]
+                    | QualifiedIdent [ "(" [ PipeArgList ] ")" ]
+                    | FieldPipelineTarget ;
+
+FieldPipelineTarget = Ident "." Ident [ "(" [ PipeArgList ] ")" ] ;
+
+PipeArgList         = "?" { "," Expr }
+                    | Expr { "," Expr } ;
+
+NullCoalesceExpr    = LogicalOrExpr
+                      { "??" LogicalOrExpr } ;
+
+LogicalOrExpr       = LogicalAndExpr
+                      { "||" LogicalAndExpr } ;
+
+LogicalAndExpr      = BitwiseOrExpr
+                      { "&&" BitwiseOrExpr } ;
+
+BitwiseOrExpr       = BitwiseXorExpr
+                      { ( "|" | "|~" ) BitwiseXorExpr } ;
+
+BitwiseXorExpr      = BitwiseAndExpr
+                      { "^" BitwiseAndExpr } ;
+
+BitwiseAndExpr      = EqualityExpr
+                      { "&" EqualityExpr } ;
+
+EqualityExpr        = RelationalExpr
+                      { ( "==" | "!=" ) RelationalExpr } ;
+
+RelationalExpr      = ShiftExpr
+                      { ( "<" | "<=" | ">" | ">=" | "in" ) ShiftExpr } ;
+
+ShiftExpr           = AdditiveExpr
+                      { ( "<<" | ">>" ) AdditiveExpr } ;
+
+AdditiveExpr        = MultiplicativeExpr
+                      { ( "+" | "-" ) MultiplicativeExpr } ;
+
+MultiplicativeExpr  = UnaryExpr
+                      { ( "*" | "/" | "%" ) UnaryExpr } ;
+
+UnaryExpr           = ( "+" | "-" | "!" | "~" ) UnaryExpr
+                    | CastExpr ;
+
+CastExpr            = PostfixExpr [ "as" Type ] ;
+
+PostfixExpr         = PrimaryExpr { PostfixSuffix } ;
+
+PostfixSuffix       = CallSuffix
+                    | GenericCallSuffix
+                    | IndexSuffix
+                    | FieldSuffix
+                    | SafeFieldSuffix ;
+
+CallSuffix          = "(" [ ArgList ] ")" ;
+
+GenericCallSuffix   = "[" TypeArgList "]" "(" [ ArgList ] ")" ;
+
+IndexSuffix         = "[" Expr "]" ;
+
+FieldSuffix         = "." Ident ;
+
+SafeFieldSuffix     = "?." Ident ;
+
+PrimaryExpr         = Literal
+                    | SelfExpr
+                    | SuperExpr
+                    | Ident
+                    | QualifiedIdent
+                    | BuiltinCall
+                    | NewExpr
+                    | DisposeExpr
+                    | TupleExpr
+                    | "(" Expr ")" ;
+
+SelfExpr            = "self" | "Self" ;
+
+SuperExpr           = "super" ;
+
+TupleExpr           = "(" Expr "," Expr { "," Expr } ")" ;
+
+ArgList             = Expr { "," Expr } ;
+
+TypeArgList         = Type { "," Type } ;
+```
+
+---
+
+# 16. Built-in and Special Expressions
+
+```ebnf
+BuiltinCall         = CheckExpr
+                    | PanicExpr
+                    | AssertExpr
+                    | VerifyIntegrityCall ;
+
+CheckExpr           = "check" "(" Expr ")" ;
+
+PanicExpr           = "panic" "(" [ Expr ] ")" ;
+
+AssertExpr          = "assert" "(" Expr ")" ;
+
 VerifyIntegrityCall = "VerifyIntegrity" "(" ")" ;
-CallExpr            = VerifyIntegrityCall | Ident "(" [ ArgList ] ")" | Ident "::" Ident "(" [ ArgList ] ")" ;
+
+NewExpr             = "new" Type "(" [ ArgList ] ")" ;
+
+DisposeExpr         = "dispose" Expr ;
 ```
-
-**Semantik:**
-- Rückgabetyp: `bool` — `true` wenn 2 von 3 CRC32-Hashes übereinstimmen, sonst `false`
-- Parameter: keine
-- Die 3 CRC32-Hashes werden zur Compile-Zeit berechnet und in den Data-Buffer geschrieben
-- Zur Laufzeit liest der generierte Code alle 3 Hashes und führt einen Mehrheitsvergleich durch
-
-**Beispiel:**
-```lyx
-@integrity(mode: scrubbed, interval: 100)
-unit;
-
-fn main(): int64 {
-  if (VerifyIntegrity()) {
-    return 0;  // Integrity verified
-  } else {
-    return 1;  // Integrity check failed
-  }
-}
-```
-
-**Compiler-Architektur:**
-- **Sema**: `VerifyIntegrity() -> bool` als globales Builtin registriert
-- **IR**: Neue Operation `irVerifyIntegrity`
-- **Backend x86_64**: Generiert `movabs rdi, data_va` + 3x `mov` + 3x `cmp`/`inc` + `cmp $2`/`jge`
-- **Patching**: CRC32 wird NACH Code-Generierung berechnet, dann Data-Adresse gepatcht
-
-### Endianness-Annotationen (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
-
-Structs können mit `@big_endian` oder `@little_endian` annotiert werden für Telemetrie-Daten:
-
-```ebnf
-EndianAttr    = "@big_endian" | "@little_endian" ;
-StructDecl    = [ EndianAttr ] "struct" "{" { StructField } "}" ;
-StructField   = Ident ":" Type ";" ;
-```
-
-**Semantik:**
-- `@big_endian`: Struct-Felder werden in Big-Endian-Byte-Reihenfolge serialisiert
-- `@little_endian`: Struct-Felder werden in Little-Endian-Byte-Reihenfolge serialisiert
-- Ohne Annotation: Native Endianness der Zielarchitektur (x86_64 = LE, ARM64 = LE, PowerPC = BE)
-- Kombinierbar mit `@packed` für hardwarenahe Register-Strukturen
-
-**Beispiel:**
-```lyx
-type TelemetryFrame = @big_endian struct {
-  timestamp: int64;
-  temperature: int16;
-  status_flags: int8;
-};
-```
-
-**Compiler-Architektur:**
-- **Lexer**: `tkBigEndian`, `tkLittleEndian` Tokens (erkennt `@big_endian`/`@little_endian` als einzelne Tokens)
-- **Backend-Typen**: `TEndianType = (enNative, enBigEndian, enLittleEndian)`
-- **AST**: `FEndian: TEndianType` in `TAstStructDecl`
-- **Parser**: Endian-Annotation wird in `ParseTypeDecl` vor `struct` geparst
-
-### Flat Structs (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
-
-Structs können mit dem `flat` Keyword annotiert werden, um sicherzustellen, dass sie keine Pointer-Felder enthalten – essentiell für Zero-Copy-Serialisierung:
-
-```ebnf
-FlatStructDecl = "flat" "struct" "{" { StructField } "}" ;
-StructField    = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
-```
-
-**Semantik:**
-- `flat struct` darf keine Pointer-Felder (`pchar`, `pchar?`, `fn ptr`) enthalten
-- Verschachtelte Structs in flat structs werden ebenfalls geprüft
-- Dient der Garantie, dass die Struktur direkt bitweise kopiert werden kann
-
-**Beispiel:**
-```lyx
-type TelemetryFrame = flat struct {
-  timestamp: int64;
-  temperature: int16;
-};
-```
-
-### Bit-Level Memory Mapping (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
-
-In `@packed` Structs können Felder mit `at(N)` eine explizite Bit-Position erhalten:
-
-```ebnf
-PackedStructDecl = "packed" "struct" "{" { PackedField } "}" ;
-PackedField      = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
-```
-
-**Semantik:**
-- `at(N)` gibt die Start-Bitposition des Feldes an (0-basiert)
-- Nur in `packed struct` erlaubt – reguläre Structs verwenden Byte-Alignment
-- Typ bestimmt die Feldbreite (z.B. `bool` = 1 Bit, `int64` = 64 Bits)
-
-**Beispiel:**
-```lyx
-type Thruster = packed struct {
-  power: int64 at(0);
-  is_active: bool at(64);
-};
-```
-
-### @redundant – Triple Modular Redundancy (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
-
-Globale Variablen können mit `@redundant` annotiert werden, um automatisch drei physisch getrennte Kopien im RAM zu erzeugen.
-**Kombinierbar mit `@volatile`** (für Hardware-Sensor-TMR):
-
-```ebnf
-RedundantVarDecl = [ "@redundant" ] [ "@volatile" ] ( "var" | "let" ) Ident ":" Type [ ":=" Expr ] ";" ;
-```
-
-**Semantik:**
-- Der Compiler allokiert drei Kopien der Variable
-- Lesezugriff: Majority-Vote (2 von 3 müssen übereinstimmen)
-- Schreibzugriff: Alle drei Kopien werden beschrieben
-- Self-Healing: Abweichende Kopie wird automatisch repariert
-
-**Beispiel:**
-```lyx
-@redundant
-var thrust_vector: int64;
-
-@redundant @volatile
-var sensor_reading: int64;   // TMR + volatile: Hardware-Sensor mit SEU-Schutz
-```
-
-### @flight_crit – FP-Deterministik (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
-
-Funktionen können mit `@flight_crit` annotiert werden, um deterministisches Floating-Point-Verhalten zu garantieren:
-
-```ebnf
-FuncAttr = FuncAttr | "@flight_crit" ;
-```
-
-**Semantik:**
-- Impliziert automatisch `@critical`
-- Setzt MXCSR auf Round-to-Zero (0x7F80) im Prolog
-- Stellt originalen MXCSR im Epilog wieder her
-- Deaktiviert FP-Constant-Folding im Optimizer
-
-**Beispiel:**
-```lyx
-@flight_crit
-fn compute_trajectory(): f64 {
-  return 0.5 * gravity * time * time;
-}
-```
-
-### Verschachtelte Funktionen (Nested Functions)
-
-Seit v0.5.3 können Funktionen innerhalb anderer Funktionen deklariert werden.
-Sie werden während des Lowering auf Top-Level gehoben (Lifting). Seit v0.5.3+
-unterstützen sie **Closures** — Zugriff auf Variablen des umgebenden Scopes
-via Static-Link (Parent-RBP als versteckter Parameter).
-
-```ebnf
-Block = "{" { Statement } "}"
-Statement = VarDecl | IfStmt | WhileStmt | ReturnStmt | AssignStmt | ExprStmt | Block | NestedFnDecl
-```
-
-Beispiel (Closure):
-```lyx
-fn outer(): int64 {
-  var x: int64 := 42;
-  fn inner(): int64 {
-    return x;  // greift auf x aus outer() zu (Closure)
-  }
-  return inner();
-}
-```
-
-Einschränkungen:
-- Closures sind read-only — Variablen aus dem äußeren Scope können nicht verändert werden
-- Max. Verschachtelungstiefe: beliebig (jede Ebene bekommt einen Static-Link)
-- Kein Heap-Allokation — Static-Link nutzt bestehende Stack-Frames
-
-Beispiele:
-```lyx
-@energy(1)
-fn low_power_mode(): int64 {
-  // Kompiliert mit Energy-Level 1 (minimal)
-  return 0;
-}
-
-@energy(5)
-fn high_performance(): int64 {
-  // Kompiliert mit Energy-Level 5 (extrem)
-  return compute();
-}
-```
-
-### Energy-Levels
-
-| Level | Name | Loop Unroll | Battery | SIMD | FPU |
-|-------|------|-------------|---------|------|-----|
-| 1 | Minimal | 4× | ✅ | — | — |
-| 2 | Low | 2× | ✅ | — | — |
-| 3 | Medium | 1× | ✅ | ✅ | — |
-| 4 | High | — | ✅ | ✅ | ✅ |
-| 5 | Extreme | 8× | ✅ | ✅ | ✅ |
 
 ---
 
-## 2) Typen
+# 17. Constant Expression Grammar
 
-### Primitive Typen
-
-```ebnf
-Type = BaseIntType | FloatType | "bool" | "void"
-     | "pchar" | "pchar?"
-     | "array" | "Map" "<" Type "," Type ">"
-     | "Set" "<" Type ">"
-     | Type "[" IntLiteral "]"     (* Statisches Array: T[N] z. B. int64[4] *)
-     | Type "[" "]"                (* Dynamisches Array-Typ-Suffix: T[]     *)
-     | Ident            (* benannter Typ / Struct / Klasse / Class-Referenz *)
-     | "fn" "(" [ ParamList ] ")" [ ":" Type ]   (* Funktionszeiger *)
-     ;
-
-BaseIntType = "int8"  | "int16"  | "int32"  | "int64"
-            | "uint8" | "uint16" | "uint32" | "uint64"
-            | "int"                          (* Alias für int64 *)
-            | "isize" | "usize"
-            ;
-FloatType   = "f32" | "f64" ;
-```
-
-**Statische Arrays** `T[N]` werden inline im Struct-Layout oder im Stack-Frame gespeichert (`N × sizeof(T)` Bytes). `N` muss ein Integer-Literal oder konstanter Ausdruck sein.
-
-| Typ | Größe | Beschreibung |
-|-----|-------|--------------|
-| `int8` … `int64` | 1–8 Bytes | Signed Integer |
-| `uint8` … `uint64` | 1–8 Bytes | Unsigned Integer |
-| `f32`, `f64` | 4 / 8 Bytes | Floating-Point |
-| `bool` | 1 Byte | `true` / `false` |
-| `void` | — | Nur als Rückgabetyp |
-| `pchar` | 8 Bytes | Non-nullable Pointer (null-terminierte Strings) |
-| `pchar?` | 8 Bytes | Nullable Pointer |
-| `array` | 24 Bytes | Dynamic Array Fat-Pointer (ptr/len/cap) |
-| `T[N]` | N × sizeof(T) | Statisches Array (stack/struct-inline) |
-| `Map<K,V>` | — | Hash-Map (heap-allokiert) |
-| `Set<T>` | — | Hash-Set (heap-allokiert) |
-| `parallel Array<T>` | — | SIMD-Array (v0.2.2) |
-
-### SIMD / ParallelArray (v0.2.2 ✅ ABGESCHLOSSEN)
-
-ParallelArrays sind heap-allokierte, SIMD-optimierte Arrays mit einem festen Element-Typ:
-
-```lyx
-var vec: parallel Array<Int64> := parallel Array<Int64>(1000);
-var first: int64 := vec[0];       // Skalar-Rückgabe
-vec[0] := 42;                      // Element-Zuweisung
-var sum: parallel Array<Int64> := vec + vec;  // element-weise SIMD-Op
-```
-
-**Element-Typen**: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `F32`, `F64`
-
-**SIMD-Operatoren** (element-weise): `+`, `-`, `*`, `/`, `&&`, `||`, `^`, `==`, `!=`, `<`, `<=`, `>`, `>=`
-
-**Speichermodell**:
-- Heap-allokiert via `irAlloc`/mmap mit 16-Byte-Alignment (SSE2)
-- Gespeichert als einzelner Pointer-Slot im Stack-Frame
-- Index-Zugriff gibt einen Skalar des Element-Typs zurück
-
-### Nullable Typen (v0.4.0 ✅ ABGESCHLOSSEN)
-
-### Panic und Assert (v0.3.2 ✅ ABGESCHLOSSEN)
-
-### check() Builtin (v0.8.3 ✅ ABGESCHLOSSEN)
+Constant expressions use the same precedence model as runtime expressions, but with a restricted primary set.
 
 ```ebnf
-CheckExpr := 'check' '(' Expr ')' ;
+ConstExpr                 = ConstPipeExpr ;
+
+ConstPipeExpr             = ConstNullCoalesceExpr
+                            { "|>" ConstPipeTarget } ;
+
+ConstPipeTarget           = Ident [ "(" [ ConstPipeArgList ] ")" ]
+                          | QualifiedIdent [ "(" [ ConstPipeArgList ] ")" ] ;
+
+ConstPipeArgList          = "?" { "," ConstExpr }
+                          | ConstExpr { "," ConstExpr } ;
+
+ConstNullCoalesceExpr     = ConstLogicalOrExpr
+                            { "??" ConstLogicalOrExpr } ;
+
+ConstLogicalOrExpr        = ConstLogicalAndExpr
+                            { "||" ConstLogicalAndExpr } ;
+
+ConstLogicalAndExpr       = ConstBitwiseOrExpr
+                            { "&&" ConstBitwiseOrExpr } ;
+
+ConstBitwiseOrExpr        = ConstBitwiseXorExpr
+                            { ( "|" | "|~" ) ConstBitwiseXorExpr } ;
+
+ConstBitwiseXorExpr       = ConstBitwiseAndExpr
+                            { "^" ConstBitwiseAndExpr } ;
+
+ConstBitwiseAndExpr       = ConstEqualityExpr
+                            { "&" ConstEqualityExpr } ;
+
+ConstEqualityExpr         = ConstRelationalExpr
+                            { ( "==" | "!=" ) ConstRelationalExpr } ;
+
+ConstRelationalExpr       = ConstShiftExpr
+                            { ( "<" | "<=" | ">" | ">=" | "in" ) ConstShiftExpr } ;
+
+ConstShiftExpr            = ConstAdditiveExpr
+                            { ( "<<" | ">>" ) ConstAdditiveExpr } ;
+
+ConstAdditiveExpr         = ConstMultiplicativeExpr
+                            { ( "+" | "-" ) ConstMultiplicativeExpr } ;
+
+ConstMultiplicativeExpr   = ConstUnaryExpr
+                            { ( "*" | "/" | "%" ) ConstUnaryExpr } ;
+
+ConstUnaryExpr            = ( "+" | "-" | "!" | "~" ) ConstUnaryExpr
+                          | ConstCastExpr ;
+
+ConstCastExpr             = ConstPostfixExpr [ "as" Type ] ;
+
+ConstPostfixExpr          = ConstPrimaryExpr { ConstPostfixSuffix } ;
+
+ConstPostfixSuffix        = ConstCallSuffix
+                          | ConstIndexSuffix
+                          | ConstFieldSuffix
+                          | ConstSafeFieldSuffix ;
+
+ConstCallSuffix           = "(" [ ConstArgList ] ")" ;
+
+ConstIndexSuffix          = "[" ConstExpr "]" ;
+
+ConstFieldSuffix          = "." Ident ;
+
+ConstSafeFieldSuffix      = "?." Ident ;
+
+ConstPrimaryExpr          = Literal
+                          | Ident
+                          | QualifiedIdent
+                          | ConstTupleExpr
+                          | "(" ConstExpr ")" ;
+
+ConstTupleExpr            = "(" ConstExpr "," ConstExpr { "," ConstExpr } ")" ;
+
+ConstArgList              = ConstExpr { "," ConstExpr } ;
 ```
 
-`check(cond)` ist eine runtime-only Assertion ohne Fehlermeldung. Wenn die Bedingung `false` ist, wird `panic` aufgerufen (Exit-Code 1).
+## 17.1 Constant Expression Parsing Rule
 
-```lyx
-fn main(): int64 {
-  check(x > 0);  // panic wenn x <= 0
-  return 0;
-}
+```text
+ConstExpr SHALL be parsed with the same precedence and associativity rules as Expr.
+
+Parenthesized constant expressions SHALL restart parsing at ConstExpr.
+
+Therefore, the following expression is syntactically valid:
+
+    (5 + 3)
+
+The grammar defines syntax only.
+Whether a construct is compile-time evaluable is a semantic decision.
 ```
-
-### Enum-Deklarationen (v0.5.7 ✅ ABGESCHLOSSEN)
-
-```ebnf
-EnumDecl    := 'enum' Ident '{' EnumBody '}' ';'? ;
-EnumBody    := EnumMember { ',' EnumMember } ;
-EnumMember  := Ident [ '=' IntLiteral ] ;
-EnumAccess  := Ident '::' Ident ;
-```
-
-Enum-Werte sind implizit `int64`. Der erste Wert startet bei 0 (sofern nicht explizit angegeben).
-
-```lyx
-enum Direction { North, South, East, West }
-enum HttpStatus { Ok = 200, NotFound = 404, ServerError = 500 }
-
-var d: int64 := Direction::North;   // 0
-var s: int64 := HttpStatus::Ok;     // 200
-```
-
-### Generics / Parametrische Polymorphie (v0.5.7 ✅ ABGESCHLOSSEN)
-
-```ebnf
-GenericFnDecl  := 'fn' Ident '[' TypeParamList ']' '(' [ ParamList ] ')' [ ':' Type ] Block ;
-TypeParamList  := Ident { ',' Ident } ;
-GenericCall    := Ident '[' TypeArgList ']' '(' [ ArgList ] ')' ;
-TypeArgList    := Type { ',' Type } ;
-```
-
-Generics werden über **Monomorphisierung** implementiert: Pro Typ-Argument wird eine spezialisierte Funktion erzeugt (z.B. `max_G_int64`).
-
-```lyx
-fn max[T](a: T, b: T): T {
-  if (a > b) { return a; }
-  return b;
-}
-
-fn main(): int64 {
-  var m: int64 := max[int64](10, 20);  // spezialisiert zu max_G_int64
-  return 0;
-}
-```
-
-### Pattern Matching (v0.5.7 ✅ ABGESCHLOSSEN)
-
-```ebnf
-MatchStmt   := 'match' Expr '{' { CaseClause } [ DefaultClause ] '}' ;
-CaseClause  := 'case' CaseValue { '|' CaseValue } '=>' Block ;
-CaseValue   := Expr ;
-DefaultClause := 'default' '=>' Block ;
-```
-
-**Unterschiede zu `switch`:**
-- Kein `(` `)` um den Match-Ausdruck
-- `=>` statt `:` als Trennzeichen
-- `|` für OR-Patterns innerhalb eines `case`
-- Kein `break` nötig (kein Fall-Through)
-
-```lyx
-fn classify(n: int64): int64 {
-  match n {
-    case 0 => { return 0; }
-    case 1 | 2 | 3 => { return 1; }
-    default => { return 2; }
-  }
-}
-```
-
-### Tuple-Rückgaben (v0.5.7 ✅ ABGESCHLOSSEN)
-
-```ebnf
-TupleReturnType := '(' Type { ',' Type } ')' ;
-TupleReturnExpr := '(' Expr { ',' Expr } ')' ;
-TupleUnpack     := 'var' Ident { ',' Ident } ':=' CallExpr ';' ;
-FnDeclReturn    := ':' ( Type | TupleReturnType ) ;
-```
-
-```lyx
-fn divmod(a: int64, b: int64): (int64, int64) {
-  return (a / b, a % b);
-}
-
-fn main(): int64 {
-  var q, r := divmod(17, 5);
-  return 0;
-}
-```
-
-### Ausnahmebehandlung / Exception Handling (v0.5.7 ✅ ABGESCHLOSSEN)
-
-```ebnf
-TryStmt    := 'try' Block 'catch' '(' Ident ':' Type ')' Block ;
-ThrowStmt  := 'throw' Expr ';' ;
-```
-
-```lyx
-fn risky(x: int64): int64 {
-  if (x < 0) { throw -1; }
-  return x * 2;
-}
-
-fn main(): int64 {
-  try {
-    var r: int64 := risky(-5);
-  } catch (e: int64) {
-    PrintLn("caught");
-  }
-  return 0;
-}
-```
-
-### Map und Set (v0.5.0 ✅ ABGESCHLOSSEN)
-
-Maps und Sets sind heap-allokierte assoziative Datenstrukturen.
-
-**Grammatik:**
-```
-MapType       := 'Map' '<' Type ',' Type '>' ;
-SetType       := 'Set' '<' Type '>' ;
-MapLiteral    := '{' [ MapEntry { ',' MapEntry } ] '}' ;
-SetLiteral    := '{' Expr { ',' Expr } '}' ;
-MapEntry      := Expr ':' Expr ;
-InExpr        := Expr 'in' Expr ;
-MapIndexExpr  := Expr '[' Expr ']' ;
-MapIndexAssign := Expr '[' Expr ']' ':=' Expr ;
-```
-
-**Map-Literal (Key-Value-Paare mit Doppelpunkt):**
-```lyx
-var scores: Map<int64, int64> := {1: 100, 2: 200, 3: 300};
-var empty: Map<int64, int64> := {};
-```
-
-**Set-Literal (Werte ohne Doppelpunkt):**
-```lyx
-var ids: Set<int64> := {10, 20, 30};
-```
-
-**Implementierte Operationen:**
-
-| Operation | Syntax | Beschreibung |
-|-----------|--------|--------------|
-| Insert/Update | `map[key] := value` | Setzt oder überschreibt Key |
-| Get | `map[key]` | Gibt Value zurück |
-| Contains | `key in map` | Prüft Existenz (bool) |
-| Size | `len(map)` | Anzahl Einträge |
-| Set Add | via Literal | Erstellt Set mit Werten |
-| Set Contains | `value in set` | Prüft Mitgliedschaft (bool) |
-
-**Erlaubte Key/Element-Typen:** `int64`, `bool` (aktuell)
-**Value-Typen (Map):** `int64` (aktuell)
-
-**Speichermodell:**
-- Heap-allokiert via `mmap` syscall
-- Layout: `[len:8 bytes][cap:8 bytes][entries:16*cap bytes]`
-- Entry-Format: `[key:8 bytes][value:8 bytes]`
-- Lineare Suche O(n) — geeignet für kleine Sammlungen (< 100 Einträge)
-- Initiale Kapazität: 8 Entries
-
-**IR-Opcodes:**
-- `irMapNew`, `irMapSet`, `irMapGet`, `irMapContains`, `irMapLen`
-- `irSetNew`, `irSetAdd`, `irSetContains`, `irSetLen`
-
-**Nicht implementiert (geplant):**
-- `remove()` — Löschen von Einträgen
-- `keys()` / `values()` — Iteratoren
-- `for key, value in map` — Iteration
-- Hash-basierter O(1) Lookup mit FNV-1a
-
-### Dynamic Arrays (v0.5.7 ✅ ABGESCHLOSSEN)
-
-Dynamic Arrays sind heap-allokierte Arrays mit Fat-Pointer (ptr/len/cap):
-
-| Operation | Syntax | Beschreibung |
-|-----------|--------|--------------|
-| Create | `var a: array := [];` | Leeres Array erstellen |
-| Create with literal | `var a: array := [1, 2, 3];` | Array mit Initialwerten |
-| Push | `push(a, value)` | Element am Ende hinzufügen |
-| Append | `append(a, value)` | Alias für `push` |
-| Length | `len(a)` | Anzahl Elemente |
-| Pop | `pop(a)` | Letztes Element entfernen und zurückgeben |
-| Index | `a[i]` | Element lesen/schreiben |
-| Free | `free(a)` | Speicher freigeben |
-
-**Speichermodell:**
-- Fat-Pointer (3 × 8 bytes): `[ptr:8][len:8][cap:8]`
-- ptr zeigt auf heap-allokierten Speicher (via mmap)
-- Automatisches Resizing bei `push` wenn Kapazität erreicht
-
-**IR-Opcodes:**
-- `irDynArrayPush`, `irDynArrayLen`, `irDynArrayPop`, `irDynArrayFree`
-
-**Beispiele:**
-```lyx
-fn main(): int64 {
-  var a: array := [];
-  push(a, 10);
-  push(a, 20);
-  push(a, 30);
-
-  PrintLn(len(a));  // 3
-
-  var x: int64 := pop(a);  // x = 30
-  PrintLn(len(a));  // 2
-
-  free(a);
-  return 0;
-}
-```
-
-### Regex-Literale (v0.4.2 ✅ ABGESCHLOSSEN)
-
-### Pipe-Operator `|>` (v0.8.x ✅ ABGESCHLOSSEN)
-
-Der Pipe-Operator leitet den linken Ausdruck als ersten Parameter an die rechte Funktion weiter:
-
-```ebnf
-PipeExpr = Expr "|>" Ident [ "(" PipeArgList ")" ] ;
-PipeArgList = "?" { "," Expr } | Expr { "," Expr } ;
-```
-
-```lyx
-// expr |> fn  →  fn(expr)
-var result: int64 := 42 |> double;
-
-// expr |> fn(?, arg)  →  fn(expr, arg)
-var s: pchar := 100 |> IntToStr;
-
-// Chaining
-var v: int64 := raw_val |> validate |> normalize |> clamp;
-```
-
-### Inkrement- und Dekrement-Operatoren (✅ ABGESCHLOSSEN)
-
-Die Operatoren `++` und `--` sind als **Postfix-Statements** verfügbar:
-
-```
-IncDecStmt      := LValue ( '++' | '--' ) ';' ;
-LValue          := Ident { FieldOrIndexSuffix } ;
-FieldOrIndexSuffix
-                := '.' Ident
-                | '[' Expr ']' ;
-```
-
-**Desugaring:**
-- `x++` wird zu `x := x + 1`
-- `x--` wird zu `x := x - 1`
-
-**Beispiele:**
-```lyx
-counter++;           // counter := counter + 1
-arr[idx]++;          // arr[idx] := arr[idx] + 1
-player.health--;     // player.health := player.health - 1
-```
-
-**Wichtig:** Dies sind Statements, keine Expressions. Sie können nicht in Ausdrücken verwendet werden.
-
-### Return-Regeln
-
-* Funktion mit Rückgabetyp `int64/bool/pchar/f64` muss auf allen Pfaden `return <expr>;` liefern
-* Funktion mit `void` erlaubt `return;` oder gar keinen return (dann implizit `return;`)
-
-### Type-Casting Regeln
-
-* `as`-Casting ist explizit und erlaubt folgende Konvertierungen:
-  * `int64 as f64`: Integer zu Float (SSE2 cvtsi2sd)
-  * `f64 as int64`: Float zu Integer mit Truncation (SSE2 cvttsd2si)
-  * Identity Casts: `int64 as int64`, `f64 as f64` (No-Op)
-  * **Unit-Konvertierung**: `dist as m` — wandelt einen Wert zwischen kompatiblen Unit-Typen um; emittiert `fmul` mit `srcFactor / targetFactor`; Dimensionskompatibilität wird zur Compile-Zeit geprüft
-* Cast-Kompatibilität wird zur Compile-Zeit geprüft
-* Ungültige Casts erzeugen Compile-Fehler
-
-### Bool-Regeln
-
-* `if`/`while` verlangen `bool` als Bedingung
-* `&&`/`||` short-circuit; beide Operanden müssen `bool` sein
-* `!` negiert einen `bool`-Ausdruck
-* **Vergleich mit `==` / `!=`**:
-  * `bool == bool` → erlaubt, Ergebnis `bool` (ermöglicht `x == true`, `x == false`)
-  * `bool == <anderer Typ>` → Compile-Fehler: *"bool can only be compared with true or false"*
-  * `bool` direkt in Bedingungen verwenden (`if (x)`) ist bevorzugt gegenüber `if (x == true)`
-
-### Builtin-Funktionen
-
-* Über 30 Builtin-Funktionen sind ohne Import verfügbar
-* Builtins werden nicht als externe Symbole behandelt (statische ELF-Generation)
-* String-Builtins arbeiten mit null-terminierten pchar
-* Math-Builtins nutzen native x86-64 Instruktionen für maximale Performance
 
 ---
 
-## 8) Codegen-Anforderungen (Backend v0.1.7)
+# 18. Operator Precedence
 
-### Output
-
-* ELF64 Executable, Linux x86_64
-* `_start` als Entry
-* Automatische Static/Dynamic ELF Auswahl
-
-### Minimaler Instruction-Satz (Backend-Emitter)
-
-* `mov reg, imm64`
-* `mov reg, [rbp-off]` / `mov [rbp-off], reg` (locals)
-* `lea reg, [rip+disp32]` (globale Variablen, RIP-relative Adressierung)
-* `add/sub/imul/idiv` (int64 arith)
-* `cmp` + `setcc`/`cmov` oder Sprünge (bool)
-* `jmp`, `je/jne/jl/jle/jg/jge` (control flow)
-* `call`, `ret` (Funktionen)
-* `syscall` (builtins/entry)
-
-### Heap-Speicher (Klassen)
-
-* `new`: `mmap` syscall für Allokation
-* `dispose`: `munmap` syscall für Freigabe
-* VMT (Virtual Method Table) für virtuelle Methoden ✅ (v0.5.1)
-
-### Runtime-Snippets (eingebettet)
-
-* `Print` / `PrintLn`: compile-time Multi-Arg-Dispatch → `PrintStr`/`PrintInt`/`PrintFloat`/`PrintBool` je nach Typ (bis zu 6 Args); `PrintLn` hängt `\n` an
-* `EPrint` / `EPrintLn`: wie `Print`/`PrintLn`, aber auf stderr (fd=2)
-* `EPrintFloat(f: f64)`: gibt f64-Wert auf stderr aus
-* `PrintFloat(f: f64)`: gibt f64-Wert auf stdout aus
-* `PrintStr`: strlen-loop + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
-* `PrintInt`: itoa + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
-* `Random`: LCG-Implementierung (seed * 1103515245 + 12345) mod 2^31
-* `RandomSeed`: Setzt LCG-Seed im Data-Segment
-
-**Dynamic String Builtins** (mmap-basierte Strings, Header `[cap:8][len:8][data...]`):
-* `StrNew(cap)` / `StrFree(s)`: Allokation / Freigabe via mmap/munmap
-* `StrLen(s)` / `StrCharAt(s,i)` / `StrSetChar(s,i,c)`: Grundoperationen
-* `StrAppend(dest,src)`: Immer-reallozierende Konkatenation, gibt neuen Pointer zurück
-* `StrAppendStr(dest,src)`: In-place Append, gibt denselben Pointer zurück
-* `StrConcat(a,b)` / `StrCopy(s)`: Neue Puffer-Allokation
-* `StrFindChar(s,ch,start)` / `StrSub(s,start,len)`: Suche und Extraktion
-* `StrStartsWith(s,prefix)` / `StrEndsWith(s,suffix)` / `StrEquals(a,b)`: Vergleiche
-* `IntToStr(n)` / `StrFromInt(n)`: Integer-zu-String-Konvertierung
-* `FloatToStr(f: f64)`: f64-zu-String-Konvertierung (WP-BI-04)
-* `StrTrim(s)`: führende und abschließende Whitespaces entfernen (WP-BI-02)
-* `StrFind(s, sub)`: naive O(n·m) Substring-Suche, gibt Offset oder -1 zurück (WP-BI-03)
-* `StrSplit(s, delim)`: teilt `s` am Trennzeichen `delim`, gibt `array` von `pchar` zurück (WP-BI-05)
-* `FileGetSize(path)`: Dateigröße via open+lseek+close
-
-**HashMap Builtins** (FNV-1a O(1), string→int64):
-* `HashNew(cap)` / `HashSet(m,k,v)` / `HashGet(m,k)` / `HashHas(m,k)`
-
-**Argv Builtins**:
-* `GetArgC()` / `GetArg(i)`: Zugriff auf Kommandozeilenargumente
+| Level | Operators                                                  | Associativity |
+| ----: | ---------------------------------------------------------- | ------------- |
+|     1 | `\|>`                                                      | Left          |
+|     2 | `??`                                                       | Left          |
+|     3 | `\|\|`                                                     | Left          |
+|     4 | `&&`                                                       | Left          |
+|     5 | `\|`, `\|~`                                                | Left          |
+|     6 | `^`                                                        | Left          |
+|     7 | `&`                                                        | Left          |
+|     8 | `==`, `!=`                                                 | Left          |
+|     9 | `<`, `<=`, `>`, `>=`, `in`                                 | Left          |
+|    10 | `<<`, `>>`                                                 | Left          |
+|    11 | `+`, `-`                                                   | Left          |
+|    12 | `*`, `/`, `%`                                              | Left          |
+|    13 | unary `+`, unary `-`, `!`, `~`                             | Right         |
+|    14 | `as`                                                       | Left          |
+|    15 | call, generic call, index, field access, safe field access | Left          |
 
 ---
 
-## 9) Beispiele
+# 19. Parser Requirements
 
-### Hello
+```text
+The grammar SHALL be free of left recursion.
 
-```lyx
-fn main(): int64 {
-  PrintLn("Hello Lyx");
-  return 0;
-}
+The grammar SHALL be compatible with recursive descent parsing.
+
+Expression parsing SHOULD be implemented using a Pratt parser or an equivalent precedence parser.
+
+ConstExpr parsing SHOULD use the same precedence parser infrastructure as Expr with a restricted primary-expression set.
+
+Every referenced nonterminal SHALL be defined exactly once.
+
+The lexer SHALL apply longest-match tokenization.
+
+Syntax and semantics SHALL remain separated.
+
+Semantic restrictions such as type compatibility, name resolution, overload resolution, visibility, constness, ownership, lifetime, range checks, and ABI behavior are not part of this EBNF.
+
+Soft keywords SHALL require contextual parsing predicates.
 ```
-
-### Globale Variablen
-
-```lyx
-var counter: int64 := 0;
-
-fn increment() {
-  counter := counter + 1;
-}
-
-fn main(): int64 {
-  PrintLn(counter);  // 0
-  increment();
-  increment();
-  PrintLn(counter);  // 2
-  return 0;
-}
-```
-
-### Klassen mit Vererbung
-
-```lyx
-type Animal = class {
-  name: pchar;
-
-  fn speak() {
-    PrintLn("Some sound");
-  }
-};
-
-type Dog = class extends Animal {
-  breed: pchar;
-
-  fn speak() {
-    PrintLn("Woof!");
-  }
-
-  fn Create(n: pchar, b: pchar) {
-    self.name := n;
-    self.breed := b;
-  }
-
-  fn Destroy() {
-    PrintLn("Dog destroyed");
-  }
-};
-
-fn main(): int64 {
-  var d: Dog := new Dog("Buddy", "Labrador");
-  d.speak();              // "Woof!"
-  dispose d;
-  return 0;
-}
-```
-
-### Virtual Methods und VMT
-
-Virtuelle Methoden ermöglichen Polymorphismus durch eine Virtual Method Table (VMT):
-
-```lyx
-type TBase = class {
-  val: int64;
-
-  // Virtual method - can be overridden
-  virtual fn GetValue(): int64 {
-    return self.val;
-  }
-};
-
-type TDerived = class extends TBase {
-  extra: int64;
-
-  // Override the virtual method from base class
-  override fn GetValue(): int64 {
-    return self.val + self.extra;
-  }
-};
-
-fn main(): int64 {
-  var base: TBase := new TBase();
-  base.val := 10;
-
-  var derived: TDerived := new TDerived();
-  derived.val := 20;
-  derived.extra := 30;
-
-  // Polymorphic calls via VMT
-  PrintLn(base.GetValue());    // Calls TBase.GetValue() -> 10
-  PrintLn(derived.GetValue()); // Calls TDerived.GetValue() -> 50
-
-  dispose base;
-  dispose derived;
-  return 0;
-}
-```
-
-**Grammatik für virtuelle und abstrakte Methoden:**
-
-```
-ClassDecl       := 'type' Ident '=' 'class' [ 'extends' Ident ] '{' { ( FieldDecl | MethodDecl ) } '}' ;
-MethodDecl      := [ ( 'virtual' | 'override' | 'abstract' ) ] 'fn' Ident '(' [ ParamList ] ')' [ ':' Type ] ( Block | ';' ) ;
-VirtualFlag     := 'virtual' ;
-OverrideFlag    := 'override' ;
-AbstractFlag    := 'abstract' ;
-```
-
-**VMT-Semantik:**
-- `virtual fn` deklariert eine Methode als virtuell. Die Methode erhält einen festen Slot in der VMT der Klasse.
-- `override fn` überschreibt eine virtuelle Methode der Basisklasse. Der Slot bleibt erhalten.
-- `abstract fn` deklariert eine Methode ohne Implementierung. Die Methode muss von einer konkreten Subklasse überschrieben werden.
-- `abstract` impliziert automatisch `virtual`.
-- Virtuelle Methodenaufrufe werden zur Laufzeit über die VMT dispatcht.
-- Ohne `virtual`/`override`/`abstract` wird die Methode statisch gebunden (direkter `call`).
-
-**Abstract-Syntax:**
-```
-type Animal = class {
-  abstract fn Speak(): int64;
-};
-
-type Dog = class extends Animal {
-  override fn Speak(): int64 { return 1; }
-};
-```
-
-**Fehler bei Abstrakten Klassen:**
-- Eine Klasse mit mindestens einer abstrakten Methode ist abstrakt und kann nicht instanziiert werden.
-- Compiler-Fehler: `cannot instantiate abstract class: <ClassName>`
-
-**Beispiel-VMT-Layout:**
-```
-[type TBase]:
-  .data:
-    _vmt_TBase:
-      dq _L_TBase_GetValue    ; VMT-Index 0
-
-[type TDerived]:
-  .data:
-    _vmt_TDerived:
-      dq _L_TDerived_GetValue  ; überschreibt TBase.GetValue
-```
-
-### Klassen als Feldtypen – Class Embedding (v0.8.4 ✅ ABGESCHLOSSEN)
-
-Klassen können als Feld-Typen in Structs, anderen Klassen und in statischen Arrays verwendet werden. In allen Fällen wird die Klasse als **8-Byte-Heap-Pointer** gespeichert – es findet keine Inline-Einbettung statt.
-
-#### Grammatik
-
-```ebnf
-(* Keine syntaktischen Erweiterungen nötig — bereits durch Ident in Type abgedeckt *)
-StructField = Ident ":" Type ";" ;          (* Type darf Klassenname oder T[N] sein *)
-ClassField  = Ident ":" Type ";" ;          (* desgleichen *)
-```
-
-**Zulässige Kombinationen:**
-
-| Kombination | Syntax | Speichermodell |
-|---|---|---|
-| Class-in-Struct | `struct { node: MyClass; }` | 8 Bytes (Pointer) im Struct |
-| Class-in-Struct-Array | `struct { items: MyClass[4]; }` | 4 × 8 = 32 Bytes (Pointer-Array) |
-| Class-in-Class | `class { left: MyClass; }` | 8 Bytes (Pointer) im Heap-Objekt |
-| Self-Referenz | `class { next: Self; }` | 8 Bytes (Pointer) – erzeugt verkettete Liste |
-
-#### Beispiele
-
-**class in struct:**
-```lyx
-type Node = class {
-  value: int64;
-};
-
-type Container = struct {
-  id:   int64;
-  node: Node;    // 8-Byte-Pointer auf heap-allokiertes Node-Objekt
-};
-
-fn main(): int64 {
-  var n: Node      := new Node;
-  n.value          := 42;
-  var c: Container := Container {};
-  c.id   := 1;
-  c.node := n;
-
-  var ref: Node := c.node;   // Pointer laden
-  PrintLn(ref.value);        // 42
-  return 0;
-}
-```
-
-**class in statischem Array (als Struct-Feld):**
-```lyx
-type Pool = struct {
-  count: int64;
-  items: Node[4];   // 4 Pointer-Slots = 32 Bytes
-};
-
-fn main(): int64 {
-  var n: Node   := new Node;
-  n.value       := 77;
-  var p: Pool   := Pool {};
-  p.count       := 1;
-  p.items[0]    := n;
-
-  var ref: Node := p.items[0];
-  PrintLn(ref.value);  // 77
-  return 0;
-}
-```
-
-**class in class (selbstreferenziell):**
-```lyx
-type Node = class {
-  value: int64;
-  next:  Node;    // Pointer auf nächstes Node-Objekt (kann null sein)
-};
-
-type Tree = class {
-  val:  int64;
-  left: Node;
-  right: Node;
-};
-```
-
-#### Einschränkungen
-
-- **Verkettete Feldzugriffe** wie `container.node.field` erzeugen noch keinen korrekten Code für den Fall, dass das Zwischenfeld eine Klassenreferenz in einem Struct ist. Workaround: Zwischenvariable verwenden:
-  ```lyx
-  var ref: Node := container.node;
-  var v:   int64 := ref.value;   // korrekt
-  ```
-- **Dispose**: Wird die Klasse innerhalb einer Struct nicht explizit per `dispose` freigegeben, bleibt der Heap-Speicher bestehen (kein GC).
-- **Flat Structs**: `flat struct` darf keine Klassenfelder enthalten (Pointer-Regel).
-
-#### Compiler-Implementierung
-
-- **Sema `ComputeStructLayouts`**: `ElemTypeName` wird in `FClassTypes` nachgeschlagen → 8 Bytes pro Element.
-- **Sema `ComputeClassLayouts`**: Statische Array-Felder werden vollständig unterstützt (analog zu Structs).
-- **IR `LowerExpr` (WP6 Read)**: `addrBase = struct_base + fieldOffset` (früher fehlerhaft als `irSub`).
-- **IR `LowerStmt` (WP6 Write)**: Neuer Handler für `p.items[i] := v` bei Struct-Feld-Static-Arrays.
 
 ---
 
-### Random
+# 20. Known Semantic Decisions Not Defined by EBNF
 
-```lyx
-fn main(): int64 {
-  RandomSeed(42);
-
-  var r1: int64 := Random();
-  var r2: int64 := Random();
-
-  PrintLn(r1);
-  PrintLn(r2);
-  return 0;
-}
+```text
+switch fallthrough behavior
+pattern matching exhaustiveness
+generic specialization rules
+method dispatch rules
+self/Self/super binding rules
+ownership and disposal semantics
+runtime behavior of defer
+ABI layout rules
+packed and flat struct memory layout
+range-type runtime checking
+unit-type conversion semantics
+overflow behavior
+nullability type rules
+visibility and module export rules
 ```
 
-### Bitweise Operatoren
+---
 
-```lyx
-fn main(): int64 {
-  var a: int64 := 12;
-  var b: int64 := 10;
+# 21. Grammar Completeness Checklist
 
-  PrintLn(a & b);    // AND:  8
-  PrintLn(a | b);    // OR:  14
-  PrintLn(a ^ b);    // XOR:  6
-  PrintLn(1 << 4);   // SHL: 16
-  PrintLn(256 >> 3); // SHR: 32
-  PrintLn(~0);       // NOT: -1
+```text
+All referenced lexical nonterminals are defined.
 
-  // Kombination: Mask-and-Shift
-  var flags: int64 := (5 << 4) | 3;  // = 83
-  PrintLn(flags);
+All referenced declaration nonterminals are defined.
 
-  return 0;
-}
+All referenced type nonterminals are defined.
+
+All referenced statement nonterminals are defined.
+
+All referenced expression nonterminals are defined.
+
+All referenced constant-expression nonterminals are defined.
+
+All referenced attribute and directive nonterminals are defined.
+
+The grammar contains no direct left recursion.
+
+The expression grammar is precedence ordered.
+
+The constant-expression grammar mirrors runtime expression precedence.
+
+The nullable type suffix is limited to one "?".
+
+The lexer disambiguates ".", "..", "...", "?", "??", "?.", "|", "|>", and "|~".
+
+The IfStmt grammar requires a Block for the then-branch, avoiding the classic dangling-else ambiguity.
 ```
 
-**Präzedenz** (niedrig → hoch): `||` → `&&` → `|` → `^` → `&` → Vergleich → `<< >>` → `+ -` → `* / %` → Unär (`! - ~`)
+End of canonical grammar.
 
-### defer – RAII Beispiel
-
-```lyx
-fn main(): int64 {
-    var gSeq: int64 := 0;
-    defer gSeq := gSeq + 1;    // defer A — läuft zuletzt (LIFO)
-    defer gSeq := gSeq + 10;   // defer B — läuft zuerst  (LIFO)
-    // Reihenfolge: B → A → Ergebnis: gSeq = 10 + 1 = 11
-    return 0;
-}
-```
-
-### con-Parameter Beispiel
-
-```lyx
-fn scale(con factor: int64, value: int64): int64 {
-    // factor := 2;  // ERROR: assignment to con-parameter not allowed
-    return factor * value;
-}
-
-fn main(): int64 {
-    PrintLn(scale(3, 7));  // 21
-    return 0;
-}
-```
-
-### Variablen + while + Type-Casting
-
-```lyx
-con LIMIT: int64 := 5;
-
-fn main(): int64 {
-  var i: int64 := 0;
-  while (i < LIMIT) {
-    PrintLn(i);
-
-    // Type-Casting Beispiel
-    var f: f64 := i as f64;
-    var sqrt_val: f64 := sqrt(f);
-    var back_to_int: int64 := sqrt_val as int64;
-
-    // String-Konvertierung
-    var str_val: pchar := IntToStr(i);
-    PrintLn("String: ", str_val);
-
-    i := i + 1;
-  }
-  return 0;
-}
-```
-
-### Module-System Beispiel
-
-```lyx
-unit math.utils;
-
-import std.string;
-
-pub fn factorial(n: int64): int64 {
-  if (n <= 1) { return 1; }
-  return n * factorial(n - 1);
-}
-
-pub fn format_number(x: int64): pchar {
-  return IntToStr(abs(x));
-}
-```
