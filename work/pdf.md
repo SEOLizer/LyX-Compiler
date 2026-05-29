@@ -99,7 +99,7 @@ PdfRadialGradient(doc, page, cx, cy, r0, r1, ri0, gi0, bi0, ri1, gi1, bi1)
 
 ---
 
-### WP-PDF-19: PDF mergen / Seiten einfügen ⬜
+### WP-PDF-19: PDF mergen / Seiten einfügen ✅
 
 **Ziel:** Seiten aus bestehenden PDFs in ein neues Dokument kopieren.
 
