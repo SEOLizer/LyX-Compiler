@@ -256,6 +256,13 @@ examples/
 ├── games/               # Spiele
 │   └── game1/
 │
+├── sqlite/              # SQLite3 Demos (std.db.sqlite)
+│   ├── demo_sqlite_crud.lyx         # CRUD: CREATE/INSERT/SELECT/UPDATE/DELETE
+│   ├── demo_sqlite_batch.lyx        # Transaktion vs. Einzel-Commits (~1500× Speedup)
+│   ├── demo_sqlite_stmt.lyx         # Prepared Statement 100× wiederverwenden
+│   ├── demo_sqlite_types.lyx        # INTEGER/FLOAT/TEXT/BLOB/NULL-Typen prüfen
+│   └── demo_sqlite_blob.lyx         # 1 KB Blob-Roundtrip, byteweiser Vergleich
+│
 └── lyxvision/           # Lyxvision GUI-Demos
 ```
 
@@ -288,6 +295,7 @@ examples/
 | **io/net** | Netzwerk-Programmierung | TCP/UDP/DNS Beispiele |
 | **hardware** | Hardware-Zugriff | GPIO, I2C, SPI, 1-Wire |
 | **units** | Modul-System | Import/Export, Bibliotheken |
+| **sqlite** | SQLite3-Datenbank | `demo_sqlite_crud.lyx`, `demo_sqlite_batch.lyx`, `demo_sqlite_blob.lyx` |
 
 ### Bauen
 
@@ -1628,6 +1636,7 @@ Database (std.db):
 - `std.db.mysql`: MySQL database client
 - `std.db.redis`: Redis client
 - `std.db.redis_simple`: Simplified Redis client
+- `std.db.sqlite`: SQLite3 client (libsqlite3 FFI — Open/Close/Exec, Prepared Statements, Transactions, Blob)
 
 Crypto:
 - `std.crypto.aes`: AES encryption
