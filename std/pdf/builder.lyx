@@ -193,6 +193,48 @@ pub con PDF_DOC_SPOTCAP:          int64 := 3872;  // int64 capacity
 pub con PDF_DOC_SPOTBUF:          int64 := 3880;  // int64* record buffer
 pub con PDF_DOC_PAGESPOTMASKS:    int64 := 3888;  // int64* per-page spot color bitmask
 
+// WP-PDF-18: AcroForms (interactive form fields)
+pub con PDF_DOC_FORMCOUNT:        int64 := 3896;  // int64 total field count
+pub con PDF_DOC_FORMCAP:          int64 := 3904;  // int64 capacity
+pub con PDF_DOC_FORMBUF:          int64 := 3912;  // int64* field record buffer
+pub con PDF_DOC_RGCOUNT:          int64 := 3920;  // int64 radio group count
+pub con PDF_DOC_RGCAP:            int64 := 3928;  // int64
+pub con PDF_DOC_RGBUF:            int64 := 3936;  // int64* radio group record buffer
+pub con PDF_DOC_FORMFLAT:         int64 := 3944;  // int64 1=flattened (skip AcroForm)
+pub con PDF_DOC_ACROOBJID:        int64 := 3952;  // int64 AcroForm dict object ID (0=none)
+
+// Form field record layout (120 bytes each)
+pub con PDF_FORM_TYPE:            int64 := 0;    // int64: 1=text 2=checkbox 3=radio 4=combo
+pub con PDF_FORM_PAGE:            int64 := 8;    // int64: page index
+pub con PDF_FORM_X1:              int64 := 16;   // int64: left   ×100
+pub con PDF_FORM_Y1:              int64 := 24;   // int64: bottom ×100
+pub con PDF_FORM_X2:              int64 := 32;   // int64: right  ×100
+pub con PDF_FORM_Y2:              int64 := 40;   // int64: top    ×100
+pub con PDF_FORM_NAMEBUF:         int64 := 48;   // int64* field name /T
+pub con PDF_FORM_NAMELEN:         int64 := 56;   // int64
+pub con PDF_FORM_VALBUF:          int64 := 64;   // int64* default value / radio value / items
+pub con PDF_FORM_VALLEN:          int64 := 72;   // int64 allocation length
+pub con PDF_FORM_OBJID:           int64 := 80;   // int64 widget annotation object ID
+pub con PDF_FORM_AP_YES:          int64 := 88;   // int64 AP /Yes stream obj ID (checkbox/radio)
+pub con PDF_FORM_AP_OFF:          int64 := 96;   // int64 AP /Off stream obj ID
+pub con PDF_FORM_FLAGS:           int64 := 104;  // int64 (checkbox: 0/1=checked; radio: groupIdx; combo: item count)
+pub con PDF_FORM_ITEMCOUNT:       int64 := 112;  // int64 (combo: number of /Opt items)
+pub con PDF_FORM_RECSIZE:         int64 := 120;
+pub con PDF_FORM_INITIAL_CAP:     int64 := 16;
+
+// Radio group record layout (40 bytes each)
+pub con PDF_RG_NAMEBUF:           int64 := 0;    // int64* group name
+pub con PDF_RG_NAMELEN:           int64 := 8;    // int64
+pub con PDF_RG_OBJID:             int64 := 16;   // int64 parent field object ID
+pub con PDF_RG_RECSIZE:           int64 := 24;
+pub con PDF_RG_INITIAL_CAP:       int64 := 8;
+
+// Form field type constants
+pub con PDF_FORM_TEXT:            int64 := 1;
+pub con PDF_FORM_CHECKBOX:        int64 := 2;
+pub con PDF_FORM_RADIO:           int64 := 3;
+pub con PDF_FORM_COMBO:           int64 := 4;
+
 // Spot color record layout (56 bytes each)
 pub con PDF_SPOT_NAMEBUF:         int64 := 0;   // int64* name string (mmap'd, NUL-term)
 pub con PDF_SPOT_NAMELEN:         int64 := 8;   // int64 name allocation length
@@ -369,6 +411,20 @@ pub fn PdfNew(): int64 {
   var pagePrecomp: int64 := mmapAlloc(arrSize);
   if (pagePrecomp != 0) { zeroMem(pagePrecomp, arrSize); }
   poke64(doc + PDF_DOC_PAGEPRECOMP, pagePrecomp);
+
+  // AcroForms buffer (WP-PDF-18)
+  var formBufInit: int64 := mmapAlloc(PDF_FORM_INITIAL_CAP * PDF_FORM_RECSIZE);
+  if (formBufInit != 0) { zeroMem(formBufInit, PDF_FORM_INITIAL_CAP * PDF_FORM_RECSIZE); }
+  var rgBufInit:   int64 := mmapAlloc(PDF_RG_INITIAL_CAP * PDF_RG_RECSIZE);
+  if (rgBufInit != 0) { zeroMem(rgBufInit, PDF_RG_INITIAL_CAP * PDF_RG_RECSIZE); }
+  poke64(doc + PDF_DOC_FORMCOUNT, 0);
+  poke64(doc + PDF_DOC_FORMCAP,   PDF_FORM_INITIAL_CAP);
+  poke64(doc + PDF_DOC_FORMBUF,   formBufInit);
+  poke64(doc + PDF_DOC_RGCOUNT,   0);
+  poke64(doc + PDF_DOC_RGCAP,     PDF_RG_INITIAL_CAP);
+  poke64(doc + PDF_DOC_RGBUF,     rgBufInit);
+  poke64(doc + PDF_DOC_FORMFLAT,  0);
+  poke64(doc + PDF_DOC_ACROOBJID, 0);
 
   // Spot color buffer (WP-PDF-25)
   var pageSpotMasks: int64 := mmapAlloc(arrSize);
@@ -687,6 +743,36 @@ pub fn PdfFree(doc: int64): void {
 
   var pgPrecomp: int64 := peek64(doc + PDF_DOC_PAGEPRECOMP);
   if (pgPrecomp != 0) { munmap(pgPrecomp, arrSize); }
+
+  // Free form field name/value strings and buffer (WP-PDF-18)
+  var formCount6: int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  var formCap6:   int64 := peek64(doc + PDF_DOC_FORMCAP);
+  var formBuf6:   int64 := peek64(doc + PDF_DOC_FORMBUF);
+  if (formBuf6 != 0) {
+    var fi6: int64 := 0;
+    while (fi6 < formCount6) {
+      var frec6: int64 := formBuf6 + fi6 * PDF_FORM_RECSIZE;
+      var fnb: int64 := peek64(frec6 + PDF_FORM_NAMEBUF); var fnl: int64 := peek64(frec6 + PDF_FORM_NAMELEN);
+      var fvb: int64 := peek64(frec6 + PDF_FORM_VALBUF);  var fvl: int64 := peek64(frec6 + PDF_FORM_VALLEN);
+      if (fnb != 0 && fnl > 0) { munmap(fnb, fnl); }
+      if (fvb != 0 && fvl > 0) { munmap(fvb, fvl); }
+      fi6 := fi6 + 1;
+    }
+    munmap(formBuf6, formCap6 * PDF_FORM_RECSIZE);
+  }
+  var rgCount6: int64 := peek64(doc + PDF_DOC_RGCOUNT);
+  var rgCap6:   int64 := peek64(doc + PDF_DOC_RGCAP);
+  var rgBuf6:   int64 := peek64(doc + PDF_DOC_RGBUF);
+  if (rgBuf6 != 0) {
+    var ri6: int64 := 0;
+    while (ri6 < rgCount6) {
+      var rrec6: int64 := rgBuf6 + ri6 * PDF_RG_RECSIZE;
+      var rnb: int64 := peek64(rrec6 + PDF_RG_NAMEBUF); var rnl: int64 := peek64(rrec6 + PDF_RG_NAMELEN);
+      if (rnb != 0 && rnl > 0) { munmap(rnb, rnl); }
+      ri6 := ri6 + 1;
+    }
+    munmap(rgBuf6, rgCap6 * PDF_RG_RECSIZE);
+  }
 
   // Free spot color name strings and buffer (WP-PDF-25)
   var spotCount5: int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
@@ -1331,9 +1417,15 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   var shadBuf:      int64 := peek64(doc + PDF_DOC_SHADBUF);
   var spotCount:    int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
   var spotBuf:      int64 := peek64(doc + PDF_DOC_SPOTBUF);
+  var formCount:    int64 := peek64(doc + PDF_DOC_FORMCOUNT);
+  var formBuf:      int64 := peek64(doc + PDF_DOC_FORMBUF);
+  var rgCount:      int64 := peek64(doc + PDF_DOC_RGCOUNT);
+  var rgBuf:        int64 := peek64(doc + PDF_DOC_RGBUF);
+  var formFlat:     int64 := peek64(doc + PDF_DOC_FORMFLAT);
+  var acroObjId:    int64 := peek64(doc + PDF_DOC_ACROOBJID);
 
   // Allocate XRef offset table
-  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount) * 8;
+  var xrefSize: int64 := (nextId + hasInfo + annotCount + outlineObjCount + attachObjCount + layerCount + shadCount + spotCount + formCount + rgCount + 4) * 8;
   var xrefs: int64 := mmapAlloc(xrefSize);
   if (xrefs == 0) {
     munmap(out, PDF_OUT_BUF_SIZE);
@@ -1400,6 +1492,11 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
   }
   if (layerCount > 0) {
     pos := _pdfWriteOCProperties(out, pos, layerBuf, layerCount, layerBaseId);
+  }
+  // AcroForm reference (WP-PDF-18)
+  if (formCount > 0 && formFlat == 0 && acroObjId > 0) {
+    pos := pdfStr(out, pos, " /AcroForm ");
+    pos := pdfRef(out, pos, acroObjId);
   }
   pos := pdfStr(out, pos, " >>\nendobj\n");
 
@@ -1603,6 +1700,186 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     ski := ski + 1;
   }
 
+  // --- AcroForms objects (WP-PDF-18) ---
+  if (formCount > 0 && formFlat == 0 && acroObjId > 0) {
+    // Appearance streams (AP /Yes and /Off) for checkboxes and radio buttons
+    var apYesContent: pchar := "q 0.5 w 0 0 1 1 re S 0.1 0.1 m 0.9 0.9 l S 0.9 0.1 m 0.1 0.9 l S Q"c;
+    var apOffContent: pchar := "q 0.5 w 0 0 1 1 re S Q"c;
+    var apYesLen: int64 := StrLen(apYesContent);
+    var apOffLen: int64 := StrLen(apOffContent);
+    var fai: int64 := 0;
+    while (fai < formCount) {
+      var farec: int64 := formBuf + fai * PDF_FORM_RECSIZE;
+      var fatype: int64 := peek64(farec + PDF_FORM_TYPE);
+      if (fatype == PDF_FORM_CHECKBOX || fatype == PDF_FORM_RADIO) {
+        var apYes: int64 := peek64(farec + PDF_FORM_AP_YES);
+        var apOff: int64 := peek64(farec + PDF_FORM_AP_OFF);
+        // Emit /Yes AP
+        poke64(xrefs + apYes * 8, pos);
+        pos := pdfObjHdr(out, pos, apYes);
+        pos := pdfStr(out, pos, "<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Length ");
+        pos := pdfInt(out, pos, apYesLen);
+        pos := pdfStr(out, pos, " >>\nstream\n");
+        pos := pdfStr(out, pos, apYesContent);
+        pos := pdfStr(out, pos, "\nendstream");
+        pos := pdfObjFtr(out, pos);
+        // Emit /Off AP
+        poke64(xrefs + apOff * 8, pos);
+        pos := pdfObjHdr(out, pos, apOff);
+        pos := pdfStr(out, pos, "<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Length ");
+        pos := pdfInt(out, pos, apOffLen);
+        pos := pdfStr(out, pos, " >>\nstream\n");
+        pos := pdfStr(out, pos, apOffContent);
+        pos := pdfStr(out, pos, "\nendstream");
+        pos := pdfObjFtr(out, pos);
+      }
+      fai := fai + 1;
+    }
+
+    // Radio group parent field objects
+    var rgi: int64 := 0;
+    while (rgi < rgCount) {
+      var rgrec: int64 := rgBuf + rgi * PDF_RG_RECSIZE;
+      var rgObjId: int64 := peek64(rgrec + PDF_RG_OBJID);
+      var rgName:  int64 := peek64(rgrec + PDF_RG_NAMEBUF);
+      poke64(xrefs + rgObjId * 8, pos);
+      pos := pdfObjHdr(out, pos, rgObjId);
+      pos := pdfStr(out, pos, "<< /FT /Btn /Ff 32768 /T (");
+      // Write group name
+      var rgni: int64 := 0;
+      while (1 == 1) { var rgnc: int64 := peek8(rgName+rgni); if (rgnc==0){break;} poke8(out+pos,rgnc); pos:=pos+1; rgni:=rgni+1; }
+      pos := pdfStr(out, pos, ") /V /Off /Kids [");
+      // List all radio button widget refs in this group
+      var rbj: int64 := 0;
+      while (rbj < formCount) {
+        var rbrec: int64 := formBuf + rbj * PDF_FORM_RECSIZE;
+        if (peek64(rbrec + PDF_FORM_TYPE) == PDF_FORM_RADIO && peek64(rbrec + PDF_FORM_FLAGS) == rgi) {
+          pos := pdfRef(out, pos, peek64(rbrec + PDF_FORM_OBJID));
+          poke8(out+pos, 32); pos:=pos+1;
+        }
+        rbj := rbj + 1;
+      }
+      pos := pdfStr(out, pos, "] >>");
+      pos := pdfObjFtr(out, pos);
+      rgi := rgi + 1;
+    }
+
+    // Widget annotation objects for each field
+    var fwi: int64 := 0;
+    while (fwi < formCount) {
+      var fwrec:  int64 := formBuf + fwi * PDF_FORM_RECSIZE;
+      var fwtype: int64 := peek64(fwrec + PDF_FORM_TYPE);
+      var fwobj:  int64 := peek64(fwrec + PDF_FORM_OBJID);
+      var fwpg:   int64 := peek64(fwrec + PDF_FORM_PAGE);
+      var fwx1:   int64 := peek64(fwrec + PDF_FORM_X1);
+      var fwy1:   int64 := peek64(fwrec + PDF_FORM_Y1);
+      var fwx2:   int64 := peek64(fwrec + PDF_FORM_X2);
+      var fwy2:   int64 := peek64(fwrec + PDF_FORM_Y2);
+      var fwnam:  int64 := peek64(fwrec + PDF_FORM_NAMEBUF);
+      var fwval:  int64 := peek64(fwrec + PDF_FORM_VALBUF);
+      poke64(xrefs + fwobj * 8, pos);
+      pos := pdfObjHdr(out, pos, fwobj);
+      pos := pdfStr(out, pos, "<< /Type /Annot /Subtype /Widget");
+      // Field type
+      if (fwtype == PDF_FORM_TEXT) {
+        pos := pdfStr(out, pos, " /FT /Tx /Ff 0");
+      } else if (fwtype == PDF_FORM_CHECKBOX) {
+        pos := pdfStr(out, pos, " /FT /Btn /Ff 0");
+      } else if (fwtype == PDF_FORM_RADIO) {
+        pos := pdfStr(out, pos, " /FT /Btn /Ff 32768");
+      } else if (fwtype == PDF_FORM_COMBO) {
+        pos := pdfStr(out, pos, " /FT /Ch /Ff 131072");
+      }
+      // Rect
+      pos := pdfStr(out, pos, " /Rect [");
+      pos := pdfReal100(out, pos, fwx1); poke8(out+pos,32); pos:=pos+1;
+      pos := pdfReal100(out, pos, fwy1); poke8(out+pos,32); pos:=pos+1;
+      pos := pdfReal100(out, pos, fwx2); poke8(out+pos,32); pos:=pos+1;
+      pos := pdfReal100(out, pos, fwy2);
+      pos := pdfStr(out, pos, "]");
+      // Field name /T
+      pos := pdfStr(out, pos, " /T (");
+      if (fwnam != 0) { var tni: int64 := 0; while(1==1){var tnc:int64:=peek8(fwnam+tni);if(tnc==0){break;}poke8(out+pos,tnc);pos:=pos+1;tni:=tni+1;} }
+      pos := pdfStr(out, pos, ")");
+      // Page reference /P
+      pos := pdfStr(out, pos, " /P ");
+      pos := pdfRef(out, pos, arrGet(pageIds, fwpg));
+      // Type-specific fields
+      if (fwtype == PDF_FORM_TEXT) {
+        pos := pdfStr(out, pos, " /DA (/F0 10 Tf 0 g) /V (");
+        if (fwval != 0) { var dvi: int64 := 0; while(1==1){var dvc:int64:=peek8(fwval+dvi);if(dvc==0){break;}poke8(out+pos,dvc);pos:=pos+1;dvi:=dvi+1;} }
+        pos := pdfStr(out, pos, ") /MK << /BC [0 0 0] /BG [1 1 1] >>");
+      } else if (fwtype == PDF_FORM_CHECKBOX) {
+        var checked: int64 := peek64(fwrec + PDF_FORM_FLAGS);
+        var apYes:   int64 := peek64(fwrec + PDF_FORM_AP_YES);
+        var apOff:   int64 := peek64(fwrec + PDF_FORM_AP_OFF);
+        if (checked != 0) { pos := pdfStr(out, pos, " /AS /Yes"); } else { pos := pdfStr(out, pos, " /AS /Off"); }
+        pos := pdfStr(out, pos, " /AP << /N << /Yes ");
+        pos := pdfRef(out, pos, apYes);
+        pos := pdfStr(out, pos, " /Off ");
+        pos := pdfRef(out, pos, apOff);
+        pos := pdfStr(out, pos, " >> >> /MK << /BC [0 0 0] /BG [1 1 1] >>");
+      } else if (fwtype == PDF_FORM_RADIO) {
+        var rgIdx:   int64 := peek64(fwrec + PDF_FORM_FLAGS);
+        var rbApYes: int64 := peek64(fwrec + PDF_FORM_AP_YES);
+        var rbApOff: int64 := peek64(fwrec + PDF_FORM_AP_OFF);
+        var rbVal:   int64 := fwval;
+        pos := pdfStr(out, pos, " /AS /Off /Parent ");
+        pos := pdfRef(out, pos, peek64(rgBuf + rgIdx * PDF_RG_RECSIZE + PDF_RG_OBJID));
+        pos := pdfStr(out, pos, " /AP << /N << /");
+        if (rbVal != 0) { var rvi: int64 := 0; while(1==1){var rvc:int64:=peek8(rbVal+rvi);if(rvc==0){break;}poke8(out+pos,rvc);pos:=pos+1;rvi:=rvi+1;} }
+        pos := pdfStr(out, pos, " ");
+        pos := pdfRef(out, pos, rbApYes);
+        pos := pdfStr(out, pos, " /Off ");
+        pos := pdfRef(out, pos, rbApOff);
+        pos := pdfStr(out, pos, " >> >>");
+      } else if (fwtype == PDF_FORM_COMBO) {
+        // /Opt array from NUL-separated items in fwval
+        var itemCount: int64 := peek64(fwrec + PDF_FORM_ITEMCOUNT);
+        pos := pdfStr(out, pos, " /Opt [");
+        if (fwval != 0 && itemCount > 0) {
+          var oip: int64 := fwval;
+          var oic: int64 := 0;
+          while (oic < itemCount) {
+            pos := pdfStr(out, pos, " (");
+            while (peek8(oip) != 0) { poke8(out+pos, peek8(oip)); pos:=pos+1; oip:=oip+1; }
+            pos := pdfStr(out, pos, ")");
+            oip := oip + 1;  // skip NUL separator
+            oic := oic + 1;
+          }
+        }
+        pos := pdfStr(out, pos, " ] /MK << /BC [0 0 0] /BG [1 1 1] >>");
+      }
+      pos := pdfStr(out, pos, " >>");
+      pos := pdfObjFtr(out, pos);
+      fwi := fwi + 1;
+    }
+
+    // AcroForm dict object
+    poke64(xrefs + acroObjId * 8, pos);
+    pos := pdfObjHdr(out, pos, acroObjId);
+    pos := pdfStr(out, pos, "<< /Fields [");
+    // List top-level fields: text, checkbox, combo + radio group parents (not individual radio buttons)
+    var fli: int64 := 0;
+    while (fli < formCount) {
+      var flrec: int64 := formBuf + fli * PDF_FORM_RECSIZE;
+      if (peek64(flrec + PDF_FORM_TYPE) != PDF_FORM_RADIO) {
+        pos := pdfRef(out, pos, peek64(flrec + PDF_FORM_OBJID));
+        poke8(out+pos, 32); pos:=pos+1;
+      }
+      fli := fli + 1;
+    }
+    // Radio group parents
+    var fli2: int64 := 0;
+    while (fli2 < rgCount) {
+      pos := pdfRef(out, pos, peek64(rgBuf + fli2 * PDF_RG_RECSIZE + PDF_RG_OBJID));
+      poke8(out+pos, 32); pos:=pos+1;
+      fli2 := fli2 + 1;
+    }
+    pos := pdfStr(out, pos, "] /NeedAppearances true >>");
+    pos := pdfObjFtr(out, pos);
+  }
+
   // --- Per-page objects ---
   i := 0;
   while (i < pageCount) {
@@ -1728,17 +2005,22 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
     }
     pos := pdfStr(out, pos, " >> /Contents ");
     pos := pdfRef(out, pos, contentId);
-    // /Annots array for annotations on this page
+    // /Annots array: regular annotations + form widget annotations
     var hasAnnotsOnPage: int64 := 0;
     var ak0: int64 := 0;
     while (ak0 < annotCount) {
-      if (peek64(annotBuf + ak0 * PDF_ANNOT_RECSIZE + PDF_ANNOT_PAGE) == i) {
-        hasAnnotsOnPage := 1;
-        break;
-      }
+      if (peek64(annotBuf + ak0 * PDF_ANNOT_RECSIZE + PDF_ANNOT_PAGE) == i) { hasAnnotsOnPage := 1; break; }
       ak0 := ak0 + 1;
     }
-    if (hasAnnotsOnPage != 0) {
+    var hasWidgets: int64 := 0;
+    if (formCount > 0 && formFlat == 0) {
+      var wk0: int64 := 0;
+      while (wk0 < formCount) {
+        if (peek64(formBuf + wk0 * PDF_FORM_RECSIZE + PDF_FORM_PAGE) == i) { hasWidgets := 1; break; }
+        wk0 := wk0 + 1;
+      }
+    }
+    if (hasAnnotsOnPage != 0 || hasWidgets != 0) {
       pos := pdfStr(out, pos, " /Annots [");
       var ak1: int64 := 0;
       while (ak1 < annotCount) {
@@ -1747,6 +2029,16 @@ pub fn PdfSave(doc: int64, path: pchar): int64 {
           poke8(out + pos, 32); pos := pos + 1;
         }
         ak1 := ak1 + 1;
+      }
+      if (hasWidgets != 0) {
+        var wk1: int64 := 0;
+        while (wk1 < formCount) {
+          if (peek64(formBuf + wk1 * PDF_FORM_RECSIZE + PDF_FORM_PAGE) == i) {
+            pos := pdfRef(out, pos, peek64(formBuf + wk1 * PDF_FORM_RECSIZE + PDF_FORM_OBJID));
+            poke8(out+pos, 32); pos:=pos+1;
+          }
+          wk1 := wk1 + 1;
+        }
       }
       pos := pdfStr(out, pos, "]");
     }

@@ -167,7 +167,7 @@ PdfSetFillSpot(doc, page, spotId, 0.5)
 
 ---
 
-### WP-PDF-18: Formularfelder (AcroForms) ⬜
+### WP-PDF-18: Formularfelder (AcroForms) ✅
 
 **Ziel:** Interaktive Formularfelder: Textfelder, Checkboxen, Radiobuttons, Dropdowns.
 
