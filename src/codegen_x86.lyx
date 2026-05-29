@@ -91,6 +91,7 @@ con CGN_FOR_C:          int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=c
 con CGN_AT_IF:          int64 := 103; // WP-CS-01: @if (nach Sema-Pruning nicht mehr sichtbar; Alias für Vollständigkeit)
 con CGN_AT_DIRECTIVE:   int64 := 104; // WP-CS-08: @io_check/@overflow_check; iv=kind, iv2=value
 con CGN_AT_ENERGY:      int64 := 105; // WP-EN-04: @energy(N) — iv=level(1-5)
+con CGN_DEFER:          int64 := 106; // WP-AS-07/10: defer Stmt; c0=deferred statement
 con ANNO_ENERGY_SHIFT:  int64 := 8;   // WP-EN-04: bits 8-10 of NK_FUNC_DECL iVal
 con CGN_REPEAT_UNTIL:    int64 := 77; // WP-BC-04: repeat { body } until (cond)
 con CGN_TUPLE_VAR_DECL:  int64 := 78; // WP-BC-05: var a, b := fn()
@@ -366,6 +367,16 @@ pub type Codegen = class {
   // WP-EN-01: energy levels — 0 = not set (codegen will default to 3)
   globalEnergyLevel: int64;  // from CLI --target-energy
   fnEnergyLevel:     int64;  // effective for current function
+
+  // WP-AS-04/05: @bounds_check / @debug_info / @optimization_level scope flags
+  boundsCheckEnabled: int64;  // 1=on (default 1), 0=off
+  debugInfoEnabled:   int64;  // set by @debug_info(true) — aliases debugMode
+  optLevel:           int64;  // 0=none, 1=min, 2=default, 3=aggressive
+
+  // WP-AS-10: defer emission buffer (LIFO)
+  deferBuf:   int64;  // mmap'd int64 array of node indices
+  deferCount: int64;
+  deferCap:   int64;
 
   // Import search paths (mirrors sema's includePath/stdPath)
   // Set by lyxc after CLI parsing / env-var reading
@@ -4780,10 +4791,23 @@ pub type Codegen = class {
 
     } else if (k == CGN_RETURN) {
       var expr: int64 := self.cg_nc0(ni);
-      if (expr >= 0) {
-        self.cg_genExpr(expr);
+      if (self.deferCount > 0) {
+        // WP-AS-10: save return value around defer emission
+        if (expr >= 0) {
+          self.cg_genExpr(expr);
+          self.cg_pushRax();
+          self.cg_emitDefers();
+          self.cg_popRax();
+        } else {
+          self.cg_emitDefers();
+          self.cg_zeroRax();
+        }
       } else {
-        self.cg_zeroRax();
+        if (expr >= 0) {
+          self.cg_genExpr(expr);
+        } else {
+          self.cg_zeroRax();
+        }
       }
       self.cg_emitEpilogue();
 
@@ -5008,17 +5032,70 @@ pub type Codegen = class {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
 
-    } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07: @io_check / @overflow_check
-      var kind: int64 := self.cg_nival(ni);   // 0=io_check, 1=overflow_check
-      var val:  int64 := self.cg_nc0(ni);     // 0=false, 1=true
+    } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05
+      var kind: int64 := self.cg_nival(ni);
+      var val:  int64 := self.cg_nc0(ni);
       if (kind == 0) { self.ioCheckEnabled       := val; }
       if (kind == 1) { self.overflowCheckEnabled := val; }
+      if (kind == 2) { self.boundsCheckEnabled   := val; }  // WP-AS-04
+      if (kind == 3) { self.debugMode            := val; }  // WP-AS-05: @debug_info aliases debugMode
+      if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
 
     } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: @energy(N); statement override
       self.fnEnergyLevel := self.cg_nival(ni);
 
+    } else if (k == CGN_DEFER) {
+      // WP-AS-10/19: defer nodes are collected in cg_collectDefers pre-pass;
+      // do not emit inline — they will be emitted at function exit points.
+
     } else {
       // Other statement kinds: skip
+    }
+  }
+
+  // WP-AS-10: first pass — collect NK_DEFER c0 nodes into deferBuf (LIFO append).
+  // Does NOT recurse into nested function declarations.
+  fn cg_collectDefers(ni: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_DEFER) {
+      if (self.deferCount < self.deferCap) {
+        poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
+        self.deferCount := self.deferCount + 1;
+      }
+      return;
+    }
+    if (k == CGN_BLOCK) {
+      var s: int64 := self.cg_nc0(ni);
+      while (s >= 0) { self.cg_collectDefers(s); s := self.cg_nnext(s); }
+      return;
+    }
+    if (k == CGN_IF) {
+      self.cg_collectDefers(self.cg_nc1(ni));
+      self.cg_collectDefers(self.cg_nc2(ni));
+      return;
+    }
+    if (k == CGN_WHILE || k == CGN_REPEAT_UNTIL) {
+      self.cg_collectDefers(self.cg_nc1(ni));
+      return;
+    }
+    if (k == CGN_FOR) {
+      self.cg_collectDefers(self.cg_nc2(ni));
+      return;
+    }
+    if (k == CGN_FOR_C) {
+      self.cg_collectDefers(self.cg_nc3(ni));
+      return;
+    }
+    // CGN_FUNC_DECL and all expression-only nodes: stop traversal
+  }
+
+  // WP-AS-10: emit deferred statements in LIFO order (last defer first).
+  fn cg_emitDefers() {
+    var i: int64 := self.deferCount - 1;
+    while (i >= 0) {
+      self.cg_genStmt(peek64(self.deferBuf + i * 8));
+      i := i - 1;
     }
   }
 
@@ -5948,7 +6025,7 @@ pub type Codegen = class {
     } else if (self.globalEnergyLevel >= 1) {
       self.fnEnergyLevel := self.globalEnergyLevel;
     } else {
-      self.fnEnergyLevel := 3;
+      self.fnEnergyLevel := 1;  // default: no unrolling (bootstrap-safe)
     }
 
     // Reset locals
@@ -5982,9 +6059,13 @@ pub type Codegen = class {
 
     // Generate function body (child2 = block)
     var body: int64 := self.cg_nc2(ni);
+    // WP-AS-10: collect defers before generating body so return points can emit them
+    self.deferCount := 0;
+    self.cg_collectDefers(body);
     self.cg_genBlock(body);
 
-    // Implicit return (xor rax, rax; epilogue)
+    // Implicit return — emit defers first, then xor rax,rax + epilogue
+    self.cg_emitDefers();  // WP-AS-10
     self.cg_zeroRax();
     self.cg_emitEpilogue();
 
@@ -7145,11 +7226,14 @@ pub type Codegen = class {
       } else if (k == CGN_BLOCK) {
         // WP-CS-06: inlined @if branch — recurse into children
         self.cg_genFile(self.cg_nc0(cur));
-      } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07: top-level @io_check / @overflow_check
+      } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05 top-level
         var kind: int64 := self.cg_nival(cur);
         var val:  int64 := self.cg_nc0(cur);
         if (kind == 0) { self.ioCheckEnabled       := val; }
         if (kind == 1) { self.overflowCheckEnabled := val; }
+        if (kind == 2) { self.boundsCheckEnabled   := val; }  // WP-AS-04
+        if (kind == 3) { self.debugMode            := val; }  // WP-AS-05
+        if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
       } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: top-level @energy(N)
         self.fnEnergyLevel := self.cg_nival(cur);
       }
@@ -7281,7 +7365,17 @@ pub type Codegen = class {
 
     // WP-EN-01: energy levels
     self.globalEnergyLevel := 0;
-    self.fnEnergyLevel     := 3;  // default: Medium
+    self.fnEnergyLevel     := 1;  // default: no unrolling (bootstrap-safe)
+
+    // WP-AS-04/05: directive flags
+    self.boundsCheckEnabled := 1;  // on by default
+    self.debugInfoEnabled   := 0;
+    self.optLevel           := 2;
+
+    // WP-AS-10: defer buffer
+    self.deferCap   := 64;
+    self.deferBuf   := mmap(0, self.deferCap * 8, 3, 34, -1, 0);
+    self.deferCount := 0;
 
     self.includePath := 0;
     self.stdPath     := 0;
