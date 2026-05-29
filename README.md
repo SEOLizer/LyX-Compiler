@@ -4,7 +4,7 @@
 It produces directly executable binaries for multiple platforms without libc, without linker, using pure syscalls or WinAPI.
 
 ```
-Lyx Compiler v0.8.7B
+Lyx Compiler v0.8.8A
 Copyright (c) 2026 Andreas Röne. All rights reserved.
 
 ✅ Cross-Compilation: Linux x86_64, Linux ARM64, Windows x64,
@@ -25,6 +25,7 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Threading Library (std.thread) with pthread, mutex, cond, TLS, atomic
 ✅ IR-Level Inlining Optimization (v0.4.3)
 ✅ IR-Level Optimizer (v0.5.0): Constant Folding, CSE, DCE, Copy Propagation, Strength Reduction
+✅ IR Optimizer Levels: O0=none, O1=DCE-only, O2=default, O3=aggressive (20 rounds) — @optimization_level pragma (v0.8.8A)
 ✅ PascalCase Naming Conventions (v0.4.3)
 ✅ Integrated Linter with 13 Rules (v0.4.3 / v0.5.5)
 ✅ Peephole Optimizer (v0.5.0): Constant folding, identity ops, redundant moves
@@ -35,13 +36,14 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ CLI Arguments (argc/argv) in Static ELF
 ✅ Option Types: Nullable Pointer (pchar?) with Null-Coalescing (??)
 ✅ SIMD: ParallelArray<T> with Element-wise Operations
-✅ Dynamic Arrays: push/pop/len/free
+✅ Dynamic Arrays: push/pop/len/free/append
 ✅ QBool: Probabilistic Boolean Type for quantum-like computing
-✅ Associative Arrays: Map<K,V> and Set<T> with O(n) lookup
+✅ Associative Arrays: Map<K,V> and Set<T> with O(1) hash lookup (v0.8.8A)
 ✅ In-Situ Data Visualizer: Inspect() builtin for runtime debugging
 ✅ String Concatenation: pchar + pchar via mmap'd buffers (v0.5.5)
-✅ Pipe Operator with ? Placeholder: expr |> fn(?, arg) — explicit argument position in pipe chains (v0.9.1)
-✅ Float Formatting: PrintFloat(f64) and :width:decimals format specifier (v0.5.5)
+✅ Pipe Operator with ? Placeholder: expr |> fn(?, arg) — explicit argument position in pipe chains (v0.8.8A.1)
+✅ Float Formatting: PrintFloat(f64), FloatToStr(f64), EPrintFloat(f64), :width:decimals format specifier (v0.8.8A)
+✅ String Utility Builtins: StrTrim, StrFind, StrSplit — real builtin implementations (v0.8.8A)
 ✅ Enum Types: enum keyword with :: member access (v0.5.7)
 ✅ Exception Handling: try/catch/throw with nested scopes (v0.5.7)
 ✅ Multi-Return / Tuples: return (a, b) and var a, b := f() (v0.5.7)
@@ -49,11 +51,12 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Pattern Matching: match/case/default with => and OR patterns | (v0.5.7)
 ✅ MC/DC Instrumentation: DO-178C DAL A coverage (--mcdc, --mcdc-report) (v0.7.0)
 ✅ Assembly Listing: Source-annotated assembly output with hex bytes (--asm-listing) (v0.7.0)
-✅ Runtime Assertions: Bounds, Null, Zero, Boolean checks at runtime (--runtime-checks) (v0.9.0)
-✅ DWARF Debug Info: DWARF 4 sections for gdb/lldb/VS Code (-g) (v0.9.0)
-✅ Simple Profiler: Function call timing via profile_enter/profile_leave/profile_report (--profile) (v0.9.0)
-✅ Trace Builtins: trace/trace_int/trace_str for debugging (--trace) (v0.9.0)
+✅ Runtime Assertions: Bounds, Null, Zero, Boolean checks at runtime (--runtime-checks) (v0.8.8A)
+✅ DWARF Debug Info: DWARF 4 sections for gdb/lldb/VS Code (-g) (v0.8.8A)
+✅ Simple Profiler: Function call timing via profile_enter/profile_leave/profile_report (--profile) (v0.8.8A)
+✅ Trace Builtins: trace/trace_int/trace_str for debugging (--trace) (v0.8.8A)
 ✅ Static Analysis: Data-Flow, Live-Vars, Const-Prop, Null-Ptr, Array-Bounds, Termination, Stack (--static-analysis) (v0.7.0)
+✅ Definite Assignment Analysis (DAA): opt-in uninit-variable detection (--daa warn, --daa-strict error) (v0.8.8A)
 ✅ Test Generation: Fuzzing, Boundary-Value, Mutation Testing, Symbolic Execution (v0.7.0)
 ✅ ESP32 Safety: Watchdog, Brownout, Flash-Verify, MPU, Stack-Canary (v0.7.0)
 ✅ ARM Cortex-M Safety: MPU, Fault-Handlers, Stack-Canary, TrustZone stubs (v0.7.0)
@@ -67,14 +70,18 @@ Copyright (c) 2026 Andreas Röne. All rights reserved.
 ✅ Safety Pragmas: @dal(A|B|C|D), @critical, @wcet(N), @stack_limit(N) — DO-178C function-level annotations (v0.8.0)
 ✅ Range Types: type T = int64 range Min..Max — compile-time and runtime bounds checking (v0.8.2)
 ✅ check() Builtin: check(cond) — runtime-only assertion without message, panics if false (v0.8.2)
-✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.9.0)
-✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.9.0)
-✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.9.0)
-✅ Endianness Annotations: @big_endian / @little_endian on structs for telemetry byte-order management (v0.9.0)
-✅ Flat Structs: `flat struct` — compiler-enforced zero-pointer guarantee for zero-copy serialization (v0.9.0)
-✅ Bit-Level Memory Mapping: `packed struct` with `at(N)` bit-position fields for hardware register mapping (v0.9.0)
-✅ @redundant: Triple Modular Redundancy for global variables — 3 RAM copies with majority-vote reads (v0.9.0)
-✅ @flight_crit: Strict FP determinism — MXCSR round-to-zero, disabled FP constant folding (v0.9.0)
+✅ Integrity Management: @integrity(mode, interval) — unit/function-level radiation protection; .meta_safe ELF section with triple CRC32 (v0.8.8A)
+✅ VerifyIntegrity() Builtin: Runtime TMR majority-vote integrity check — compares 3 CRC32 hashes at runtime (v0.8.8A)
+✅ TMR Hash-Store: Compile-time CRC32 triple-hash embedded in data section; runtime comparison via movabs + cmp (v0.8.8A)
+✅ Endianness Annotations: @big_endian / @little_endian on structs for telemetry byte-order management (v0.8.8A)
+✅ Flat Structs: `flat struct` — compiler-enforced zero-pointer guarantee for zero-copy serialization (v0.8.8A)
+✅ Bit-Level Memory Mapping: `packed struct` with `at(N)` bit-position fields for hardware register mapping (v0.8.8A)
+✅ @redundant: Triple Modular Redundancy for global variables — 3 RAM copies with majority-vote reads (v0.8.8A)
+✅ @flight_crit: Strict FP determinism — MXCSR round-to-zero, disabled FP constant folding (v0.8.8A)
+✅ @volatile Variables: Hardware-register semantics — load/store never elided by optimizer (v0.8.8A)
+✅ defer Statement: RAII/Go-style resource cleanup — LIFO execution at function exit, early-return safe (v0.8.8A)
+✅ con Parameters: Read-only function parameter qualifier — sema-enforced, zero-cost (v0.8.8A)
+✅ Compiler-Switch Pragmas: @io_check / @overflow_check / @bounds_check / @debug_info — per-function on/off (v0.8.8A)
 ✅ Dimensional Analysis: dim/utype keywords — compile-time unit safety (km+s → error), zero-cost f64 (v0.8.4)
 ✅ Unit Conversion: expr as TargetUnit — same-dimension cast with compile-time dimension check, fmul factor (v0.8.4)
 ✅ Unit Range Modifiers: range MIN..MAX (checked) and wraps MIN..MAX (cyclic overflow) on utype declarations (v0.8.4)
@@ -737,7 +744,7 @@ Any integer base type (`int8`–`int64`, `uint8`–`uint64`, `isize`, `usize`) c
 The bounds are inclusive on both ends. Violations in constant initializers are caught at compile time.
 Non-constant values receive a runtime bounds check emitted as IR compare+branch+panic.
 
-### Integrity Management (v0.9.0)
+### Integrity Management (v0.8.8A)
 
 Unit-level integrity annotations for radiation-tolerant and safety-critical code (DO-178C, aerospace.pdf Section 2.5):
 
@@ -1167,6 +1174,8 @@ Optionen:
   --ir-source-map IR Source Mapping: Zeilennummern in IR-Dump (WP-D)
   --type-reasoning Type-Checker Reasoning: detailliertes Typ-Logging (WP-E)
   --constraint-log Constraint-Log ausgeben: Typ-Constraints (WP-G)
+  --daa            Definite Assignment Analysis: uninitialized reads → warning
+  --daa-strict     Definite Assignment Analysis: uninitialized reads → error
   --quiet          Versions- und Copyright-Banner unterdrücken
   -g               DWARF Debug Info für gdb/lldb/VS Code
 
@@ -2858,7 +2867,7 @@ fn main(): int64 {
 ### Reserved Keywords
 
 ```
-fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super  virtual  override
+fn  var  let  co  con  if  else  while  switch  case  break  default  return  true  false  extern  array  as  import  pub  unit  type  struct  static  self  Self  class  extends  new  dispose  super  virtual  override  defer
 ```
 
 - `extern` is used for external function declarations
@@ -2874,6 +2883,159 @@ fn  var  let  co  con  if  else  while  switch  case  break  default  return  tr
 - `override` overrides a virtual method from base class
 - `self` references the current instance in methods
 - `Self` as return type in methods (resolves to struct type)
+- `defer` schedules a statement to run at function exit (LIFO order; soft-keyword)
+
+### `defer` — RAII / Guaranteed Cleanup (v0.8.8A)
+
+`defer` schedules a statement to run when the current function exits, regardless of which `return` is hit. Multiple defers execute in **LIFO** order (last-in, first-out):
+
+```lyx
+fn processFile(path: pchar): int64 {
+    var fd: int64 := open(path, 0, 0);
+    defer close(fd);          // always runs on exit
+
+    var buf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+    defer munmap(buf, 4096);  // runs before close(fd) (LIFO)
+
+    if (fd < 0) { return -1; }  // defers still fire here
+    // ... process file ...
+    return 0;
+}
+```
+
+```lyx
+// Defers run LIFO: tag(2) first, then tag(1)
+var gSeq: int64 := 0;
+fn tag(n: int64): int64 { gSeq := (gSeq * 16) + n; return 0; }
+
+fn doDefers(): int64 {
+    defer tag(1);   // runs second
+    defer tag(2);   // runs first
+    return 0;
+}
+// After doDefers(): gSeq == 33  (2*16 + 1)
+```
+
+**Rules:**
+- `defer stmt;` — statement is any valid Lyx statement (function call, assignment, block)
+- Defers are collected per function, emitted before every `return` / `exit`
+- LIFO order guaranteed by codegen pre-pass (`cg_collectDefers` + `cg_emitDefers`)
+- Early `return` inside `if`/`while` triggers all pending defers
+
+### `con` Parameters — Read-Only Qualifier (v0.8.8A)
+
+`con` marks a function parameter as **read-only**. Any assignment to a `con` parameter is a sema error:
+
+```lyx
+fn add(con a: int64, con b: int64): int64 {
+    return a + b;   // OK: reading is fine
+}
+
+fn bad(con x: int64): int64 {
+    x := 5;         // ERROR: assignment to con-parameter
+    return x;
+}
+```
+
+`con` parameters are zero-cost — the qualifier is enforced by the semantic pass only and has no runtime effect.
+
+### `@volatile` Variables — Hardware-Register Access (v0.8.8A)
+
+`@volatile` prevents the IR optimizer from eliding loads or stores to a variable. Use it for memory-mapped hardware registers:
+
+```lyx
+@volatile var statusReg: int64 := 0;
+@volatile let rxReady:   int64 := 0;
+
+fn pollUntilReady(): int64 {
+    while (statusReg == 0) { }  // load never optimized away
+    return rxReady;
+}
+```
+
+`@volatile` is combinable with `@redundant` for TMR protection of volatile registers.
+
+### Compiler-Switch Pragmas (v0.8.8A)
+
+Per-function on/off switches for safety-critical code paths:
+
+```lyx
+fn riskyCalc(): int64 {
+    @overflow_check(false);    // disable overflow trapping
+    @bounds_check(false);      // disable array bounds checks
+    var arr: int64[4];
+    arr[0] := 10;
+    return arr[0];
+}
+
+fn safeSection(): int64 {
+    @io_check(true);           // enable I/O error checks
+    @debug_info(true);         // embed debug metadata
+    return 0;
+}
+
+@optimization_level(0)         // O0: no optimization for this function
+fn debugMe(): int64 { return 42; }
+```
+
+| Pragma | Values | Effect |
+|--------|--------|--------|
+| `@io_check(b)` | `true`/`false` | Enable/disable I/O syscall error checks |
+| `@overflow_check(b)` | `true`/`false` | Enable/disable integer overflow trapping |
+| `@bounds_check(b)` | `true`/`false` | Enable/disable array index bounds checks |
+| `@debug_info(b)` | `true`/`false` | Enable/disable DWARF debug metadata for this function |
+| `@optimization_level(n)` | `0`–`3` | IR optimizer level: 0=none, 1=DCE-only, 2=default, 3=aggressive |
+
+**IR Optimization Levels:**
+
+| Level | Passes | Rounds |
+|-------|--------|--------|
+| O0 | None — optimizer skipped entirely | — |
+| O1 | Dead-Code Elimination, Unreachable-Block Elimination | up to 10 |
+| O2 | O1 + Constant Folding, Copy Propagation, Strength Reduction, CSE | up to 10 |
+| O3 | O2 (aggressive) | up to 20 |
+
+Override globally with `--no-opt` (forces O0) or per-function with `@optimization_level(n)`.
+
+### Definite Assignment Analysis — DAA (v0.8.8A)
+
+DAA warns or errors when a variable is read before being initialized. Opt-in via CLI:
+
+```bash
+./lyxc program.lyx --daa          # warn on uninitialized reads
+./lyxc program.lyx --daa-strict   # error on uninitialized reads
+```
+
+```lyx
+fn example(): int64 {
+    var x: int64;     // no initializer
+    return x;         // warning: x may be uninitialized (--daa)
+                      // error   (--daa-strict)
+}
+
+fn safe(): int64 {
+    var y: int64;
+    y := 42;          // assigned before read — no warning
+    return y;
+}
+```
+
+**Design:** Conservative, function-scoped analysis. `if`/`while` branches are checked independently (no SSA merge). Zero false negatives — all uninitialized paths are caught; occasional false positives possible in complex branches. Default off in v0.8.8A (opt-in) because existing code relies on zero-initialization semantics.
+
+### Float Conversion Builtins (v0.8.8A)
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `FloatToStr(x)` | `f64 -> pchar` | Converts float to heap-allocated string with 6 decimal places |
+| `EPrintFloat(x)` | `f64 -> void` | Prints float to stderr |
+| `PrintFloat(x)` | `f64 -> void` | Prints float to stdout with sign + 6 decimals |
+
+```lyx
+var pi: f64 := 3.14159265;
+var s: pchar := FloatToStr(pi);  // "3.141593"
+PrintStr(s);
+EPrintFloat(pi);                  // to stderr
+```
 
 ---
 
@@ -3218,6 +3380,7 @@ FloatLit    := [0-9]+ '.' [0-9]+ ;
 | **v0.3.2** | Directories: getdents64, DirIter |
 | **v0.4.0** | std/math: Fixed-Point math (Sqrt64, Clamp64, Lerp64, Map64, Sin64, Cos64, Hypot64) |
 | **v0.4.1** | std/geo: GeoPoint type, DistanceM, BoundingBox, DMS parsing, Navigation |
+| **v0.8.8A** | ✅ **`defer`** (LIFO RAII, early-return safe) · ✅ **`con` parameters** (read-only qualifier, sema-enforced) · ✅ **`@volatile`** variables (optimizer barrier) · ✅ **Compiler-Switch Pragmas** (`@io_check`, `@overflow_check`, `@bounds_check`, `@debug_info`, `@optimization_level`) · ✅ **IR Optimizer Levels O0–O3** (gated, 20-pass aggressive mode) · ✅ **DAA** (`--daa`/`--daa-strict`) · ✅ **StrTrim/StrFind/StrSplit** real builtins · ✅ **FloatToStr/EPrintFloat** · ✅ **Map/Set as real hashtable** · ✅ `append` alias for `push` |
 | **v1.0.0** | Stable systems language: Modules stable, SysV ABI stable, std.io/fs, Diagnostics |
 
 ---

@@ -1,4 +1,4 @@
-# Lyx v0.8.7B – Sprachspezifikation
+# Lyx v0.8.8A – Sprachspezifikation
 
 Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar durch saubere Trennung von Frontend/IR/Backend.
 
@@ -31,9 +31,11 @@ Ziel: Minimaler, nativer Compiler für **Linux x86_64 (ELF64)**, erweiterbar dur
 
 ### Keywords (reserviert)
 
-`fn var let co con if else while for do downto to repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype`
+`fn var let co con if else while for do downto to repeat switch case break continue default return true false null extern unit import pub as array struct flat packed class extends new dispose super static self Self private protected panic assert check enum match try catch throw limit virtual override abstract dim utype defer`
 
 > `wraps` und `range` sind **Soft-Keywords**: Sie werden nur in `utype`-Deklarationen nach dem Konversionsfaktor erkannt und dürfen als normale Bezeichner verwendet werden.
+
+> `defer` ist ein **Soft-Keyword**: Es wird als `TK_IDENT` geparst und nur im Statement-Kontext erkannt.
 
 > `const` ist ein Alias für `con` (legacy-Kompatibilität).  
 > `pub` ist ein Alias für das interne `public`-Token.
@@ -136,6 +138,7 @@ TopDecl      = ConDecl
              | ImportDecl
              | DimDecl
              | UtypeDecl
+             | AtDirective
              ;
 
 ImportDecl   = "import" DotPath { "," DotPath } ";" ;
@@ -144,8 +147,9 @@ ImportDecl   = "import" DotPath { "," DotPath } ";" ;
 ConDecl      = [ "pub" ] "con" Ident ":" Type ":=" ConstExpr ";" ;
 ConstExpr    = Literal | Ident | UnaryOp ConstExpr | ConstExpr BinOp ConstExpr ;
 
-(* Variablen / co-Variablen *)
-VarDecl      = [ "pub" ] [ "@redundant" ] ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
+(* Variablen / co-Variablen — WP-AS-16/17: @volatile optional *)
+VarDecl      = [ "pub" ] [ "@redundant" ] [ "@volatile" ]
+               ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
 
 (* Funktionen *)
 FnDecl       = { FuncAttr } [ "pub" ] "fn" Ident [ "[" TypeParamList "]" ]
@@ -153,8 +157,9 @@ FnDecl       = { FuncAttr } [ "pub" ] "fn" Ident [ "[" TypeParamList "]" ]
 ExternFnDecl = "extern" "fn" Ident "(" [ ParamList ] ")" [ ":" Type ]
                "link" StringLit ";" ;
 
+(* WP-AS-11/12: con-Qualifier für read-only Parameter *)
 ParamList    = Param { "," Param } ;
-Param        = Ident ":" Type ;
+Param        = [ "con" ] Ident ":" Type ;
 ReturnType   = Type | "(" Type { "," Type } ")" ;   (* Tuple-Rückgabe *)
 
 (* Typen *)
@@ -169,6 +174,15 @@ TypeDef      = BaseIntType [ RangeClause ]          (* Range-Typ *)
 StructField  = Ident ":" Type ";" ;
 PackedField  = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
 
+(* Compiler-Direktiven (können auf Top-Level und in Funktionskörpern stehen) *)
+AtDirective  = "@io_check"          "(" BoolLiteral ")" ";"
+             | "@overflow_check"    "(" BoolLiteral ")" ";"
+             | "@bounds_check"      "(" BoolLiteral ")" ";"
+             | "@debug_info"        "(" BoolLiteral ")" ";"
+             | "@optimization_level" "(" IntLiteral ")" ";"    (* 0..3 *)
+             ;
+BoolLiteral  = "true" | "false" ;
+
 (* Statements *)
 Statement    = VarDecl | ConDecl
              | AssignStmt | IncDecStmt
@@ -176,6 +190,8 @@ Statement    = VarDecl | ConDecl
              | ReturnStmt | BreakStmt | ContinueStmt
              | ExprStmt | Block
              | NestedFnDecl
+             | DeferStmt
+             | AtDirective
              ;
 
 AssignStmt   = LValue ":=" Expr ";" ;
@@ -184,6 +200,9 @@ BreakStmt    = "break" ";" ;
 ContinueStmt = "continue" ";" ;
 ReturnStmt   = "return" [ Expr ] ";" ;
 ExprStmt     = Expr ";" ;
+
+(* WP-AS-07/08: defer — RAII, Go-Semantik LIFO, gilt für gesamte Funktion *)
+DeferStmt    = "defer" Statement ;
 
 (* For-Schleifen — zwei Varianten *)
 ForStmt      = ForRangeStmt | ForCStmt ;
@@ -195,8 +214,204 @@ ForRangeStmt = "for" Ident ":=" Expr ( "to" | "downto" ) Expr [ "do" ] Block ;
 ForCStmt     = "for" Ident ":=" Expr ";" [ Expr ] ";" [ ForStep ] [ "do" ] Block ;
 ForStep      = LValue ( "++" | "--" | ":=" Expr ) ;
 
+(* WP-BC-04: repeat { body } until ( cond ) *)
+RepeatStmt   = "repeat" Block "until" "(" Expr ")" ";" ;
+
 LValue       = Ident { "." Ident | "[" Expr "]" } ;
 Block        = "{" { Statement } "}" ;
+```
+
+---
+
+## Compilerschalter-Pragmas I: @io_check / @overflow_check (v0.8.x ✅ ABGESCHLOSSEN)
+
+Inline-Direktiven zur Aktivierung/Deaktivierung von Runtime-Checks auf Statement- und Top-Level-Ebene.
+
+```ebnf
+AtDirective = "@io_check"       "(" BoolLiteral ")" ";"
+            | "@overflow_check" "(" BoolLiteral ")" ";" ;
+BoolLiteral = "true" | "false" ;
+```
+
+| Direktive | Default | Beschreibung |
+|-----------|---------|--------------|
+| `@io_check(true/false)` | `false` | Aktiviert/deaktiviert I/O-Syscall-Fehlerprüfung |
+| `@overflow_check(true/false)` | `false` | Aktiviert/deaktiviert Integer-Overflow-Prüfung |
+
+```lyx
+@io_check(true);       // ab hier: I/O-Fehler führen zu panic
+@overflow_check(true); // ab hier: Integer-Überlauf führt zu panic
+```
+
+---
+
+## Compilerschalter-Pragmas II: @bounds_check / @debug_info / @optimization_level (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-01..06)
+
+Drei neue Direktiven, die bestehende `NK_AT_DIRECTIVE`-Infrastruktur nutzen.
+
+```ebnf
+AtDirective = AtDirective
+            | "@bounds_check"      "(" BoolLiteral ")" ";"
+            | "@debug_info"        "(" BoolLiteral ")" ";"
+            | "@optimization_level" "(" IntLiteral ")" ";" ;
+```
+
+| Direktive | `iv` | Default | Beschreibung |
+|-----------|------|---------|--------------|
+| `@bounds_check(bool)` | 2 | `true` | Array-Index-Bounds-Check aktivieren/deaktivieren |
+| `@debug_info(bool)` | 3 | `false` | Debug-Informationen in Ausgabe einbetten |
+| `@optimization_level(N)` | 4 | `2` | IR-Optimierungsstufe: 0=keine, 1=minimal, 2=Standard, 3=aggressiv |
+
+### Semantik
+
+```lyx
+@bounds_check(false);      // Deaktiviert Array-Bounds-Check in diesem Scope
+@debug_info(true);         // Debug-Info aktivieren
+@optimization_level(0);    // Keine Optimierungen (z. B. für zertifizierte Funktionen)
+@optimization_level(3);    // Aggressiv (Loop-Unrolling bei @energy-Funktionen)
+```
+
+### IR-Optimierungsstufen
+
+| Level | Name | Passes |
+|-------|------|--------|
+| 0 | Keine | Kein Pass ausgeführt |
+| 1 | Minimal | Nur Dead-Code-Elimination + eliminateUnreachableBlocks |
+| 2 | Standard (default) | + Constant Folding, Copy Propagation, Strength Reduction, CSE |
+| 3 | Aggressiv | Wie 2, aber bis zu 20 Iterationsrunden statt 10 |
+
+---
+
+## `defer` — RAII (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-07..10)
+
+`defer` verschiebt die Ausführung eines Statements auf den Zeitpunkt des Funktionsverlassens (Go-Semantik).
+
+```ebnf
+DeferStmt = "defer" Statement ;
+```
+
+### Semantik
+
+* **Scope**: Pro Funktion (nicht Block-Level). Deferred Statements werden beim Verlassen der gesamten Funktion ausgeführt.
+* **LIFO-Reihenfolge**: Mehrere `defer`s in einer Funktion werden in umgekehrter Reihenfolge ausgeführt (letztes `defer` zuerst).
+* **Early Return**: Deferred Statements werden vor jedem `return` ausgeführt.
+* **Rückgabewert**: Falls die Funktion einen Wert zurückgibt, wird `rax` vor der Defer-Emission gesichert (`push rax`) und danach wiederhergestellt (`pop rax`).
+* `defer` ist ein **Soft-Keyword** (kein Lexer-Token), wird via `_tokTextEq` erkannt.
+
+### Beispiele
+
+```lyx
+fn cleanup(): int64 {
+    defer dispose buf;         // wird beim Funktionsende ausgeführt
+    var buf: MyBuffer := new MyBuffer();
+    // ... Arbeit ...
+    return 0;                  // defer läuft hier
+}
+
+fn lifo_test(): int64 {
+    defer tag(1);   // zweiter defer — läuft zuerst (LIFO)
+    defer tag(2);   // erster defer  — läuft zuletzt
+    return 0;
+    // Ausführungsreihenfolge: tag(2), dann tag(1)
+}
+```
+
+### Codegen-Verhalten
+
+1. **Pre-Pass** `cg_collectDefers`: Traversiert den Funktionskörper, sammelt alle `NK_DEFER`-c0-Nodes in `deferBuf` (LIFO-Buffer, max. 64 Entries).
+2. **Beim `return`**: Falls `deferCount > 0` und Rückgabewert vorhanden → `push rax`, Defers emittieren, `pop rax`.
+3. **Impliziter Return**: `cg_emitDefers()` vor `xor rax, rax` + Epilog.
+
+---
+
+## `con`-Parameter — Read-Only-Qualifier (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-11..13)
+
+Parameter können mit `con` als read-only markiert werden. Schreibzugriffe darauf sind ein Sema-Fehler.
+
+```ebnf
+Param = [ "con" ] Ident ":" Type ;
+```
+
+### Semantik
+
+* `con x: T` — der Parameter `x` darf innerhalb der Funktion nicht zugewiesen werden.
+* Jede Zuweisung (`x := ...`) auf einen `con`-Parameter → `sema error: assignment to con-parameter not allowed`.
+* **Shallow-Const**: Nur der Parameter selbst ist geschützt, nicht seine Felder (bei Structs/Klassen).
+* Kombination mit anderen Qualifiern ist erlaubt: `fn f(con a: int64, b: int64): int64`
+
+### Beispiele
+
+```lyx
+fn add(con a: int64, con b: int64): int64 {
+    return a + b;   // OK: lesen erlaubt
+}
+
+fn bad(con x: int64): int64 {
+    x := 5;         // ERROR: assignment to con-parameter not allowed
+    return x;
+}
+```
+
+---
+
+## `@volatile` — Hardware-Register-Variablen (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-16..19)
+
+Variablen können mit `@volatile` als hardware-volatile markiert werden, um Compiler-Optimierungen zu verhindern.
+
+```ebnf
+VarDecl = [ "pub" ] [ "@redundant" ] [ "@volatile" ]
+          ( "var" | "let" | "co" ) Ident ":" Type [ ":=" Expr ] ";" ;
+```
+
+### Semantik
+
+* `@volatile var x: T` — Variable `x` darf nicht durch den IR-Optimizer wegoptimiert (CSE, Load-After-Store-Propagation) werden.
+* Das Volatile-Flag wird in der Symboltabelle gespeichert (`SymIsVolatile()`).
+* Kombinierbar mit `@redundant`: `@redundant @volatile var sensor: int64;`
+* **x86_64**: Durch den stack-basierten Codegen ohne Registerallokation ist volatile auf dieser Plattform automatisch erfüllt. Kein `mfence` notwendig für reine Software-volatile (x86_64 hat TSO-Speichermodell).
+* **Einschränkung**: `@volatile` mit `con` ist semantisch widersprüchlich und wird von Sema als Fehler gemeldet.
+
+### Anwendungsfall
+
+```lyx
+@volatile var irq_counter: int64 := 0;   // Hardware-Interrupt-Zähler
+@volatile var status_reg:  int64 := at(0x40021000);  // Memory-Mapped I/O
+
+// Ohne @volatile könnte der Compiler in Schleifen optimieren:
+while (irq_counter == prev_count) { }   // KORREKT: irq_counter wird jedes Mal geladen
+```
+
+---
+
+## Definite Assignment Analysis — DAA (v0.8.8A ✅ ABGESCHLOSSEN – WP-AS-15)
+
+Optionale Analyse, die warnt wenn eine Variable gelesen wird, bevor sie initialisiert wurde.
+
+### CLI-Flags
+
+```
+--daa         Aktiviert DAA als Warnung (daaEnabled = 1)
+--daa-strict  Aktiviert DAA als Fehler  (daaEnabled = 2)
+```
+
+### Semantik
+
+* **Default**: DAA ist deaktiviert (opt-in in v0.8.8A, Pflicht in v1.0).
+* `var x: T;` ohne Initializer → `x` wird als "möglicherweise nicht initialisiert" markiert.
+* `var x: T := expr;` → `x` gilt als initialisiert.
+* `x := expr;` (Zuweisung) → markiert `x` als initialisiert.
+* Lesen von `x` während es "uninitialisiert" → Warnung/Fehler.
+* **Konservativ für if/else**: Initialisierungen in Verzweigungen werden nicht zusammengeführt (mögliche Falsch-Positive).
+* **Zero-Init (WP-AS-14)**: Alle uninitialisierten Locals werden mit `0` / `null` initialisiert → DAA-Warnungen sind sicher, da kein echtes UB entsteht.
+
+### Beispiel
+
+```lyx
+fn example(): int64 {
+    var x: int64;         // nicht initialisiert
+    var y: int64 := 0;    // initialisiert
+    return x + y;         // WARNING: variable x possibly used before initialization
+}
 ```
 
 ---
@@ -223,13 +438,14 @@ Mehrere `@`-Attribute können in beliebiger Reihenfolge vor `fn` stehen.
 ### EBNF
 
 ```ebnf
-FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr ;
+FuncAttr   = EnergyAttr | DALAttr | CriticalAttr | WCETAttr | StackLimitAttr | IntegrityAttr | FlightCritAttr ;
 EnergyAttr = "@energy"      "(" IntLiteral ")" ;   // 1..5
 DALAttr    = "@dal"         "(" DALLevel   ")" ;   // A | B | C | D
 CriticalAttr = "@critical" ;                        // kein Argument
 WCETAttr   = "@wcet"        "(" IntLiteral ")" ;   // μs > 0
 StackLimitAttr = "@stack_limit" "(" IntLiteral ")" ; // Bytes > 0
 IntegrityAttr  = "@integrity" "(" "mode" ":" IntegrityMode [ "," "interval" ":" IntLiteral ] ")" ;
+FlightCritAttr = "@flight_crit" ;
 IntegrityMode  = "software_lockstep" | "scrubbed" | "hardware_ecc" ;
 
 DALLevel   = "A" | "B" | "C" | "D" ;
@@ -248,6 +464,7 @@ FnDecl = { FuncAttr } "fn" Ident "(" [ ParamList ] ")" [ ":" Type ] Block ;
 | `@critical` | Sicherheitskritische Funktion | Nicht auf `extern fn` erlaubt |
 | `@wcet(N)` | WCET-Budget in Mikrosekunden | N > 0; nicht auf `extern fn` erlaubt |
 | `@stack_limit(N)` | Maximale Stack-Nutzung in Bytes | N > 0; nicht auf `extern fn` erlaubt |
+| `@flight_crit` | FP-deterministisch; impliziert `@critical`; setzt MXCSR auf Round-to-Zero | — |
 
 ### Beispiele
 
@@ -270,11 +487,11 @@ fn sensor_read(): int64 {
   return 42;
 }
 
-// Mehrere Sicherheitslevel in einem Programm
-@dal(A) @critical @wcet(50)  fn engine_cutoff():   int64 { return 0; }
-@dal(B) @wcet(200)           fn navigation():      int64 { return 1; }
-@dal(C)                      fn cabin_pressure():  int64 { return 2; }
-@dal(D)                      fn log_event():       int64 { return 3; }
+// @flight_crit — deterministisches FP
+@flight_crit
+fn compute_trajectory(): f64 {
+  return 0.5 * gravity * time * time;
+}
 ```
 
 ### Compiler-Verhalten
@@ -500,7 +717,7 @@ while (x < 100) limit(1000) {
 - **IR (Runtime)**: `EmitRangeCheck` erzeugt `cmpge` + `and` + `brfalse` + `panic`-Sequenz.
 - **IR-Optimierung**: Konstante Initialisierungen werden durch Constant Folding ggf. wegeliminiert.
 
-## @integrity – Integritäts-Management (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+## @integrity – Integritäts-Management (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
 
 Einheit- und Funktions-Level-Annotationen für Strahlungstoleranz und DO-178C-Compliance.
 Implementiert aerospace.pdf v2 Sections 2.5.1–2.5.2.
@@ -573,7 +790,7 @@ Drei identische Kopien mit 4096-Byte-Abstand → Single-Event-Upset-Erkennung vi
 - **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe`-Variante wenn `UnitIntegrity.Mode ≠ imNone`.
 - **Unterstützte Backends**: x86_64, ARM64, RISC-V.
 
-### VerifyIntegrity() Builtin (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
+### VerifyIntegrity() Builtin (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #45/#46)
 
 Die `VerifyIntegrity()` Funktion führt zur Laufzeit einen TMR (Triple Modular Redundancy) Mehrheitsentscheid durch:
 
@@ -608,7 +825,7 @@ fn main(): int64 {
 - **Backend x86_64**: Generiert `movabs rdi, data_va` + 3x `mov` + 3x `cmp`/`inc` + `cmp $2`/`jge`
 - **Patching**: CRC32 wird NACH Code-Generierung berechnet, dann Data-Adresse gepatcht
 
-### Endianness-Annotationen (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
+### Endianness-Annotationen (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #52)
 
 Structs können mit `@big_endian` oder `@little_endian` annotiert werden für Telemetrie-Daten:
 
@@ -639,7 +856,7 @@ type TelemetryFrame = @big_endian struct {
 - **AST**: `FEndian: TEndianType` in `TAstStructDecl`
 - **Parser**: Endian-Annotation wird in `ParseTypeDecl` vor `struct` geparst
 
-### Flat Structs (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
+### Flat Structs (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #57)
 
 Structs können mit dem `flat` Keyword annotiert werden, um sicherzustellen, dass sie keine Pointer-Felder enthalten – essentiell für Zero-Copy-Serialisierung:
 
@@ -661,7 +878,7 @@ type TelemetryFrame = flat struct {
 };
 ```
 
-### Bit-Level Memory Mapping (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
+### Bit-Level Memory Mapping (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #50)
 
 In `@packed` Structs können Felder mit `at(N)` eine explizite Bit-Position erhalten:
 
@@ -683,12 +900,13 @@ type Thruster = packed struct {
 };
 ```
 
-### @redundant – Triple Modular Redundancy (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
+### @redundant – Triple Modular Redundancy (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #51)
 
-Globale Variablen können mit `@redundant` annotiert werden, um automatisch drei physisch getrennte Kopien im RAM zu erzeugen:
+Globale Variablen können mit `@redundant` annotiert werden, um automatisch drei physisch getrennte Kopien im RAM zu erzeugen.
+**Kombinierbar mit `@volatile`** (für Hardware-Sensor-TMR):
 
 ```ebnf
-RedundantVarDecl = "@redundant" ( "var" | "let" ) Ident ":" Type [ ":=" Expr ] ";" ;
+RedundantVarDecl = [ "@redundant" ] [ "@volatile" ] ( "var" | "let" ) Ident ":" Type [ ":=" Expr ] ";" ;
 ```
 
 **Semantik:**
@@ -701,9 +919,12 @@ RedundantVarDecl = "@redundant" ( "var" | "let" ) Ident ":" Type [ ":=" Expr ] "
 ```lyx
 @redundant
 var thrust_vector: int64;
+
+@redundant @volatile
+var sensor_reading: int64;   // TMR + volatile: Hardware-Sensor mit SEU-Schutz
 ```
 
-### @flight_crit – FP-Deterministik (v0.9.0 ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
+### @flight_crit – FP-Deterministik (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P2 #58)
 
 Funktionen können mit `@flight_crit` annotiert werden, um deterministisches Floating-Point-Verhalten zu garantieren:
 
@@ -789,7 +1010,8 @@ Type = BaseIntType | FloatType | "bool" | "void"
      | "pchar" | "pchar?"
      | "array" | "Map" "<" Type "," Type ">"
      | "Set" "<" Type ">"
-     | "[" IntLiteral "]" Type   (* Statisches Array (inline) *)
+     | Type "[" IntLiteral "]"     (* Statisches Array: T[N] z. B. int64[4] *)
+     | Type "[" "]"                (* Dynamisches Array-Typ-Suffix: T[]     *)
      | Ident            (* benannter Typ / Struct / Klasse / Class-Referenz *)
      | "fn" "(" [ ParamList ] ")" [ ":" Type ]   (* Funktionszeiger *)
      ;
@@ -802,7 +1024,7 @@ BaseIntType = "int8"  | "int16"  | "int32"  | "int64"
 FloatType   = "f32" | "f64" ;
 ```
 
-**Statische Arrays** `[N]T` werden inline im Struct-Layout oder im Stack-Frame gespeichert (`N × sizeof(T)` Bytes). `N` muss ein Integer-Literal sein.
+**Statische Arrays** `T[N]` werden inline im Struct-Layout oder im Stack-Frame gespeichert (`N × sizeof(T)` Bytes). `N` muss ein Integer-Literal oder konstanter Ausdruck sein.
 
 | Typ | Größe | Beschreibung |
 |-----|-------|--------------|
@@ -814,6 +1036,7 @@ FloatType   = "f32" | "f64" ;
 | `pchar` | 8 Bytes | Non-nullable Pointer (null-terminierte Strings) |
 | `pchar?` | 8 Bytes | Nullable Pointer |
 | `array` | 24 Bytes | Dynamic Array Fat-Pointer (ptr/len/cap) |
+| `T[N]` | N × sizeof(T) | Statisches Array (stack/struct-inline) |
 | `Map<K,V>` | — | Hash-Map (heap-allokiert) |
 | `Set<T>` | — | Hash-Set (heap-allokiert) |
 | `parallel Array<T>` | — | SIMD-Array (v0.2.2) |
@@ -969,7 +1192,7 @@ fn main(): int64 {
 
 ### Map und Set (v0.5.0 ✅ ABGESCHLOSSEN)
 
-Maps und Sets sind heap-allokierte assoziative Datenstrukturen mit linearer Suche (O(n) Lookup).
+Maps und Sets sind heap-allokierte assoziative Datenstrukturen.
 
 **Grammatik:**
 ```
@@ -1034,6 +1257,7 @@ Dynamic Arrays sind heap-allokierte Arrays mit Fat-Pointer (ptr/len/cap):
 | Create | `var a: array := [];` | Leeres Array erstellen |
 | Create with literal | `var a: array := [1, 2, 3];` | Array mit Initialwerten |
 | Push | `push(a, value)` | Element am Ende hinzufügen |
+| Append | `append(a, value)` | Alias für `push` |
 | Length | `len(a)` | Anzahl Elemente |
 | Pop | `pop(a)` | Letztes Element entfernen und zurückgeben |
 | Index | `a[i]` | Element lesen/schreiben |
@@ -1054,18 +1278,38 @@ fn main(): int64 {
   push(a, 10);
   push(a, 20);
   push(a, 30);
-  
+
   PrintLn(len(a));  // 3
-  
+
   var x: int64 := pop(a);  // x = 30
   PrintLn(len(a));  // 2
-  
+
   free(a);
   return 0;
 }
 ```
 
 ### Regex-Literale (v0.4.2 ✅ ABGESCHLOSSEN)
+
+### Pipe-Operator `|>` (v0.8.x ✅ ABGESCHLOSSEN)
+
+Der Pipe-Operator leitet den linken Ausdruck als ersten Parameter an die rechte Funktion weiter:
+
+```ebnf
+PipeExpr = Expr "|>" Ident [ "(" PipeArgList ")" ] ;
+PipeArgList = "?" { "," Expr } | Expr { "," Expr } ;
+```
+
+```lyx
+// expr |> fn  →  fn(expr)
+var result: int64 := 42 |> double;
+
+// expr |> fn(?, arg)  →  fn(expr, arg)
+var s: pchar := 100 |> IntToStr;
+
+// Chaining
+var v: int64 := raw_val |> validate |> normalize |> clamp;
+```
 
 ### Inkrement- und Dekrement-Operatoren (✅ ABGESCHLOSSEN)
 
@@ -1117,7 +1361,7 @@ player.health--;     // player.health := player.health - 1
   * `bool == <anderer Typ>` → Compile-Fehler: *"bool can only be compared with true or false"*
   * `bool` direkt in Bedingungen verwenden (`if (x)`) ist bevorzugt gegenüber `if (x == true)`
 
-### Builtin-Funktionen Regeln
+### Builtin-Funktionen
 
 * Über 30 Builtin-Funktionen sind ohne Import verfügbar
 * Builtins werden nicht als externe Symbole behandelt (statische ELF-Generation)
@@ -1155,6 +1399,8 @@ player.health--;     // player.health := player.health - 1
 
 * `Print` / `PrintLn`: compile-time Multi-Arg-Dispatch → `PrintStr`/`PrintInt`/`PrintFloat`/`PrintBool` je nach Typ (bis zu 6 Args); `PrintLn` hängt `\n` an
 * `EPrint` / `EPrintLn`: wie `Print`/`PrintLn`, aber auf stderr (fd=2)
+* `EPrintFloat(f: f64)`: gibt f64-Wert auf stderr aus
+* `PrintFloat(f: f64)`: gibt f64-Wert auf stdout aus
 * `PrintStr`: strlen-loop + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
 * `PrintInt`: itoa + write (fd=1) — Einzel-Builtin, weiterhin verfügbar
 * `Random`: LCG-Implementierung (seed * 1103515245 + 12345) mod 2^31
@@ -1169,6 +1415,10 @@ player.health--;     // player.health := player.health - 1
 * `StrFindChar(s,ch,start)` / `StrSub(s,start,len)`: Suche und Extraktion
 * `StrStartsWith(s,prefix)` / `StrEndsWith(s,suffix)` / `StrEquals(a,b)`: Vergleiche
 * `IntToStr(n)` / `StrFromInt(n)`: Integer-zu-String-Konvertierung
+* `FloatToStr(f: f64)`: f64-zu-String-Konvertierung (WP-BI-04)
+* `StrTrim(s)`: führende und abschließende Whitespaces entfernen (WP-BI-02)
+* `StrFind(s, sub)`: naive O(n·m) Substring-Suche, gibt Offset oder -1 zurück (WP-BI-03)
+* `StrSplit(s, delim)`: teilt `s` am Trennzeichen `delim`, gibt `array` von `pchar` zurück (WP-BI-05)
 * `FileGetSize(path)`: Dateigröße via open+lseek+close
 
 **HashMap Builtins** (FNV-1a O(1), string→int64):
@@ -1213,7 +1463,7 @@ fn main(): int64 {
 ```lyx
 type Animal = class {
   name: pchar;
-  
+
   fn speak() {
     PrintLn("Some sound");
   }
@@ -1221,16 +1471,16 @@ type Animal = class {
 
 type Dog = class extends Animal {
   breed: pchar;
-  
+
   fn speak() {
     PrintLn("Woof!");
   }
-  
+
   fn Create(n: pchar, b: pchar) {
     self.name := n;
     self.breed := b;
   }
-  
+
   fn Destroy() {
     PrintLn("Dog destroyed");
   }
@@ -1251,7 +1501,7 @@ Virtuelle Methoden ermöglichen Polymorphismus durch eine Virtual Method Table (
 ```lyx
 type TBase = class {
   val: int64;
-  
+
   // Virtual method - can be overridden
   virtual fn GetValue(): int64 {
     return self.val;
@@ -1260,7 +1510,7 @@ type TBase = class {
 
 type TDerived = class extends TBase {
   extra: int64;
-  
+
   // Override the virtual method from base class
   override fn GetValue(): int64 {
     return self.val + self.extra;
@@ -1270,15 +1520,15 @@ type TDerived = class extends TBase {
 fn main(): int64 {
   var base: TBase := new TBase();
   base.val := 10;
-  
+
   var derived: TDerived := new TDerived();
   derived.val := 20;
   derived.extra := 30;
-  
+
   // Polymorphic calls via VMT
   PrintLn(base.GetValue());    // Calls TBase.GetValue() -> 10
   PrintLn(derived.GetValue()); // Calls TDerived.GetValue() -> 50
-  
+
   dispose base;
   dispose derived;
   return 0;
@@ -1339,7 +1589,7 @@ Klassen können als Feld-Typen in Structs, anderen Klassen und in statischen Arr
 
 ```ebnf
 (* Keine syntaktischen Erweiterungen nötig — bereits durch Ident in Type abgedeckt *)
-StructField = Ident ":" Type ";" ;          (* Type darf Klassenname oder [N]Klassenname sein *)
+StructField = Ident ":" Type ";" ;          (* Type darf Klassenname oder T[N] sein *)
 ClassField  = Ident ":" Type ";" ;          (* desgleichen *)
 ```
 
@@ -1348,7 +1598,7 @@ ClassField  = Ident ":" Type ";" ;          (* desgleichen *)
 | Kombination | Syntax | Speichermodell |
 |---|---|---|
 | Class-in-Struct | `struct { node: MyClass; }` | 8 Bytes (Pointer) im Struct |
-| Class-in-Struct-Array | `struct { items: [4]MyClass; }` | 4 × 8 = 32 Bytes (Pointer-Array) |
+| Class-in-Struct-Array | `struct { items: MyClass[4]; }` | 4 × 8 = 32 Bytes (Pointer-Array) |
 | Class-in-Class | `class { left: MyClass; }` | 8 Bytes (Pointer) im Heap-Objekt |
 | Self-Referenz | `class { next: Self; }` | 8 Bytes (Pointer) – erzeugt verkettete Liste |
 
@@ -1382,7 +1632,7 @@ fn main(): int64 {
 ```lyx
 type Pool = struct {
   count: int64;
-  items: [4]Node;   // 4 Pointer-Slots = 32 Bytes
+  items: Node[4];   // 4 Pointer-Slots = 32 Bytes
 };
 
 fn main(): int64 {
@@ -1436,10 +1686,10 @@ type Tree = class {
 ```lyx
 fn main(): int64 {
   RandomSeed(42);
-  
+
   var r1: int64 := Random();
   var r2: int64 := Random();
-  
+
   PrintLn(r1);
   PrintLn(r2);
   return 0;
@@ -1470,6 +1720,32 @@ fn main(): int64 {
 
 **Präzedenz** (niedrig → hoch): `||` → `&&` → `|` → `^` → `&` → Vergleich → `<< >>` → `+ -` → `* / %` → Unär (`! - ~`)
 
+### defer – RAII Beispiel
+
+```lyx
+fn main(): int64 {
+    var gSeq: int64 := 0;
+    defer gSeq := gSeq + 1;    // defer A — läuft zuletzt (LIFO)
+    defer gSeq := gSeq + 10;   // defer B — läuft zuerst  (LIFO)
+    // Reihenfolge: B → A → Ergebnis: gSeq = 10 + 1 = 11
+    return 0;
+}
+```
+
+### con-Parameter Beispiel
+
+```lyx
+fn scale(con factor: int64, value: int64): int64 {
+    // factor := 2;  // ERROR: assignment to con-parameter not allowed
+    return factor * value;
+}
+
+fn main(): int64 {
+    PrintLn(scale(3, 7));  // 21
+    return 0;
+}
+```
+
 ### Variablen + while + Type-Casting
 
 ```lyx
@@ -1479,16 +1755,16 @@ fn main(): int64 {
   var i: int64 := 0;
   while (i < LIMIT) {
     PrintLn(i);
-    
+
     // Type-Casting Beispiel
     var f: f64 := i as f64;
     var sqrt_val: f64 := sqrt(f);
     var back_to_int: int64 := sqrt_val as int64;
-    
+
     // String-Konvertierung
-    var str_val: pchar := int_to_str(i);
+    var str_val: pchar := IntToStr(i);
     PrintLn("String: ", str_val);
-    
+
     i := i + 1;
   }
   return 0;
@@ -1508,16 +1784,6 @@ pub fn factorial(n: int64): int64 {
 }
 
 pub fn format_number(x: int64): pchar {
-  return int_to_str(abs(x));
+  return IntToStr(abs(x));
 }
 ```
-
-... (rest unchanged)
-
-Diese Erweiterung passt zu Lyxs Pascal-ähnlichem Stil, erweitert um AI/ML-Features aus Sever/A.[web:21][page:0] Der Parser braucht ~10 neue Regeln; Codegen kann LLVM/CUDA-Backend nutzen für GPU (z. B. via FFI zu cuBLAS).[cite:15]
-
-## Implementierungs-Hinweise
-- **Tensor-Codegen**: Compiler erzeugt CUDA-Kernels; Fallback zu CPU via OpenBLAS.
-- **Probabilistic**: Zero-Cost Abstractions – option/result als Tagged Unions (1 Byte Discriminant).
-- **GPU-Setup**: Built-in `@gpu` triggert Linker-Flags (-lcudart); für Linux/RTX3060.[cite:12]
-- **Nächster Schritt**: Vollständige EBNF-Datei oder Parser-Test in Rust/Lark generieren?

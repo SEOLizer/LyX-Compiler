@@ -145,6 +145,15 @@ begin
   // === fs ===
   AddTest('tests/lyx/fs/test_rename.lyx', 1, 'fs: rename test');
 
+  // === as (WP-AS-20) ===
+  AddTest('tests/lyx/as/test_defer_lifo.lyx', 33, 'as: defer LIFO order');
+  AddTest('tests/lyx/as/test_defer_early_return.lyx', 42, 'as: defer before early return');
+  AddTest('tests/lyx/as/test_bounds_check_off.lyx', 0, 'as: @bounds_check(false)');
+  AddTest('tests/lyx/as/test_volatile_basic.lyx', 0, 'as: @volatile var basic');
+  AddTest('tests/lyx/as/test_opt_level.lyx', 0, 'as: @optimization_level pragma');
+  AddTest('tests/lyx/as/test_con_param.lyx', -1, 'as: con-param write rejected (compile-fail)');
+  AddTest('tests/lyx/as/test_con_param_ok.lyx', 11, 'as: con-param read-only ok');
+
   // Build compiler first
   Writeln('Building compiler...');
   ret := RunCmdCapture('fpc -O2 -Mobjfpc -Sh -FUlib/ -Fuutil/ -Fufrontend/ -Fuir/ -Fubackend/ -Fubackend/x86_64/ -Fubackend/elf/ -Fubackend/pe/ -Fubackend/arm64/ lyxc.lpr -olyxc', txt);
@@ -165,8 +174,22 @@ begin
   begin
     outBin := '/tmp/lyxtest_' + ExtractFileName(ChangeFileExt(Tests[i].LyxFile, ''));
 
-    // Compile
+    // Compile (ExpectedRC = -1 means "expected compile failure")
     ret := RunCmdCapture('./lyxc ' + Tests[i].LyxFile + ' -o ' + outBin, txt);
+    if Tests[i].ExpectedRC = -1 then
+    begin
+      if ret <> 0 then
+      begin
+        Writeln('PASS ', Tests[i].Description);
+        Inc(passed);
+      end
+      else
+      begin
+        Writeln('FAIL [expected compile error but compiled OK] ', Tests[i].Description, ' (', Tests[i].LyxFile, ')');
+        Inc(failed);
+      end;
+      Continue;
+    end;
     if ret <> 0 then
     begin
       Writeln('FAIL [compile] ', Tests[i].Description, ' (', Tests[i].LyxFile, ')');
