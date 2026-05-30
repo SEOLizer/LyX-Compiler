@@ -206,6 +206,9 @@ pub type Parser = class {
   // Error state
   hadError: int64;
 
+  // WP-1.2: set to 1 inside const-expression contexts (con decl, @if, array size)
+  inConstExpr: int64;
+
   // WP-AND-02 Phase B2: side table for @jni(class="...", method="...") args.
   // Records are 40 bytes: [funcNodeId:i64, classOff:i64, classLen:i64, methodOff:i64, methodLen:i64].
   // Offsets are into self.src. Populated by ParseJniArgs, queried by lyxc.lyx.
@@ -731,31 +734,103 @@ pub type Parser = class {
   }
 
   // ==================================================================
-  // Expression parsing (precedence climbing)
+  // WP-1.2: Pratt Expression Parser
   // ==================================================================
 
-  fn ParseExpr(): int64 { return self.ParsePipe(); }
+  // Entry point — replaces the old precedence-climbing chain.
+  fn ParseExpr(): int64 { return self.ParseExprPrec(0); }
 
-  // WP-BC-51: pipe operator  expr |> fn  →  fn(expr)
-  //           expr |> fn(?, arg)  →  fn(expr, arg)
-  fn ParsePipe(): int64 {
-    var lhs: int64 := self.ParseNullCoal();
-    while (self.Check(TK_PIPE) != 0) {
+  // Infix binding power for operator token kind.
+  // Higher value = tighter binding.  0 = not an infix operator.
+  // Even values leave room for right-associativity (pass bp-1 to recurse).
+  //
+  // Table (matches v0.9.0 milestone spec):
+  //   Lvl  BP   Operators
+  //    1    2   |> |~   (pipe-forward / pipe-cast)
+  //    2    4   ??      (null-coalescence, right-assoc)
+  //    3    6   ||
+  //    4    8   &&
+  //    5   10   == !=
+  //    6   12   < <= > >= in
+  //    7   14   ..
+  //    8   16   |
+  //    9   18   ^
+  //   10   20   &
+  //   11   22   << >>
+  //   12   24   + -
+  //   13   26   * / %
+  fn _infixBP(op: int64): int64 {
+    if (op == TK_PIPE || op == TK_NOR) { return 2; }
+    if (op == TK_NULLCL)               { return 4; }
+    if (op == TK_OR)                   { return 6; }
+    if (op == TK_AND)                  { return 8; }
+    if (op == TK_EQ2 || op == TK_NEQ) { return 10; }
+    if (op == TK_LT  || op == TK_LE  || op == TK_GT ||
+        op == TK_GE  || op == TK_IN)  { return 12; }
+    if (op == TK_RANGE)                { return 14; }
+    if (op == TK_BITOR)                { return 16; }
+    if (op == TK_BITXOR)               { return 18; }
+    if (op == TK_BITAND)               { return 20; }
+    if (op == TK_SHL || op == TK_SHR) { return 22; }
+    if (op == TK_PLUS || op == TK_MINUS)                        { return 24; }
+    if (op == TK_STAR || op == TK_SLASH || op == TK_PERCENT)    { return 26; }
+    return 0;
+  }
+
+  // Pratt expression parser.
+  // minBP: minimum binding power to consume; callers pass 0 for the full expression,
+  //        or infixBP(op) for left-associativity, or infixBP(op)-1 for right-associativity.
+  fn ParseExprPrec(minBP: int64): int64 {
+    var lhs: int64 := self.ParseUnary();
+    while (1 == 1) {
+      var op: int64 := self.TokKind(self.cur);
+      var bp: int64 := self._infixBP(op);
+      if (bp == 0 || bp <= minBP) { break; }
       var ti: int64 := self.cur;
-      self.Advance();
-      var nameTok: int64 := self.cur;
-      self.Expect(TK_IDENT);
-      var call: int64 := self._alloc(NK_CALL, nameTok);
-      self._ssv(call, self._tokOff(nameTok), self._tokLen(nameTok));
-      self._siv(call, 0);
-      if (self.Check(TK_LPAREN) != 0) {
-        self.Advance();
-        self._sc0(call, self._parsePipeArgList(lhs));
-        self.Expect(TK_RPAREN);
+      self.Advance();  // consume operator
+
+      if (op == TK_NULLCL) {
+        // ?? right-associative: recurse at bp-1 so same-level grabs rightward
+        var rhs: int64 := self.ParseExprPrec(bp - 1);
+        var n: int64 := self._alloc(NK_NULL_COAL, ti);
+        self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+
+      } else if (op == TK_IN) {
+        var rhs: int64 := self.ParseExprPrec(bp);
+        var n: int64 := self._alloc(NK_IN_EXPR, ti);
+        self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+
+      } else if (op == TK_RANGE) {
+        var rhs: int64 := self.ParseExprPrec(bp);
+        var n: int64 := self._alloc(NK_RANGE, ti);
+        self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
+
+      } else if (op == TK_PIPE) {
+        // |> pipe-forward: rhs is IDENT [( [? , args...] )]
+        if (self.inConstExpr != 0) {
+          self._err("pipe-forward not allowed in const expression"c);
+          return lhs;
+        }
+        var nameTok: int64 := self.cur;
+        self.Expect(TK_IDENT);
+        var call: int64 := self._alloc(NK_CALL, nameTok);
+        self._ssv(call, self._tokOff(nameTok), self._tokLen(nameTok));
+        self._siv(call, 0);
+        if (self.Check(TK_LPAREN) != 0) {
+          self.Advance();
+          self._sc0(call, self._parsePipeArgList(lhs));
+          self.Expect(TK_RPAREN);
+        } else {
+          self._sc0(call, lhs);
+        }
+        lhs := call;
+
       } else {
-        self._sc0(call, lhs);
+        // Standard left-associative binary operator
+        var rhs: int64 := self.ParseExprPrec(bp);
+        var n: int64 := self._alloc(NK_BINOP, ti);
+        self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
       }
-      lhs := call;
     }
     return lhs;
   }
@@ -783,138 +858,6 @@ pub type Parser = class {
       tail := arg;
     }
     return head;
-  }
-
-  // WP-BC-14: null coalescing operator x ?? fallback
-  fn ParseNullCoal(): int64 {
-    var lhs: int64 := self.ParseOr();
-    while (self.Check(TK_NULLCL) != 0) {
-      var ti: int64 := self.cur; self.Advance();
-      var rhs: int64 := self.ParseOr();
-      var n: int64 := self._alloc(NK_NULL_COAL, ti);
-      self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseOr(): int64 {
-    var lhs: int64 := self.ParseAnd();
-    while (self.Check(TK_OR) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseAnd();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseAnd(): int64 {
-    var lhs: int64 := self.ParseEq();
-    while (self.Check(TK_AND) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseEq();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseBitOr(): int64 {
-    var lhs: int64 := self.ParseBitXor();
-    while (self.Check(TK_BITOR) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseBitXor();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseBitXor(): int64 {
-    var lhs: int64 := self.ParseBitAnd();
-    while (self.Check(TK_BITXOR) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseBitAnd();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseBitAnd(): int64 {
-    var lhs: int64 := self.ParseShift();
-    while (self.Check(TK_BITAND) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseShift();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseEq(): int64 {
-    var lhs: int64 := self.ParseRel();
-    while (self.Check(TK_EQ2) != 0 || self.Check(TK_NEQ) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseRel();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseRel(): int64 {
-    var lhs: int64 := self.ParseBitOr();
-    while (self.Check(TK_LT) != 0 || self.Check(TK_LE) != 0 ||
-           self.Check(TK_GT) != 0 || self.Check(TK_GE) != 0 ||
-           self.Check(TK_IN) != 0) {
-      var ti: int64 := self.cur;
-      if (self.Check(TK_IN) != 0) {
-        self.Advance();
-        var rhs: int64 := self.ParseBitOr();
-        var n: int64 := self._alloc(NK_IN_EXPR, ti);
-        self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-      } else {
-        var op: int64 := self.Advance();
-        var rhs: int64 := self.ParseBitOr();
-        var n: int64 := self._alloc(NK_BINOP, ti);
-        self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-      }
-    }
-    return lhs;
-  }
-
-  fn ParseShift(): int64 {
-    var lhs: int64 := self.ParseAdd();
-    while (self.Check(TK_SHL) != 0 || self.Check(TK_SHR) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseAdd();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseAdd(): int64 {
-    var lhs: int64 := self.ParseMul();
-    while (self.Check(TK_PLUS) != 0 || self.Check(TK_MINUS) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseMul();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
-  }
-
-  fn ParseMul(): int64 {
-    var lhs: int64 := self.ParseUnary();
-    while (self.Check(TK_STAR) != 0 || self.Check(TK_SLASH) != 0 || self.Check(TK_PERCENT) != 0) {
-      var ti: int64 := self.cur; var op: int64 := self.Advance();
-      var rhs: int64 := self.ParseUnary();
-      var n: int64 := self._alloc(NK_BINOP, ti);
-      self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
-    }
-    return lhs;
   }
 
   fn ParseUnary(): int64 {
@@ -994,15 +937,7 @@ pub type Parser = class {
         self._sc0(n, base);      // source expression
         self._sc1(n, checkType); // type to check
         base := n;
-      // WP-17: Range expression (e.g., 1..100)
-      } else if (self.Check(TK_RANGE) != 0 && stop == 0) {
-        var ti: int64 := self.cur;
-        self.Advance();
-        var end: int64 := self.ParsePrimary();  // Parse end of range
-        var n: int64 := self._alloc(NK_RANGE, ti);
-        self._sc0(n, base);   // start of range
-        self._sc1(n, end);    // end of range
-        base := n;
+      // WP-17: Range expression (..) is now handled in ParseExprPrec (infix bp=14)
       // WP-BC-13: format expression expr:width[:decimals] — only when : is followed by INT
       } else if (self.Check(TK_COLON) != 0 && self.TokKind(self.cur + 1) == TK_INT) {
         var ti: int64 := self.cur;
@@ -1136,6 +1071,10 @@ pub type Parser = class {
         // Not a call — treat type args as a comparison (unusual; fall through)
       }
       if (self.Check(100) != 0) {  // TK_LPAREN=100
+        // WP-1.2: function calls forbidden in const expressions
+        if (self.inConstExpr != 0) {
+          self._err("function call not allowed in const expression"c);
+        }
         self.Advance();
         var n: int64 := self._alloc(NK_CALL, ti);
         self._ssv(n, self._tokOff(ti), self._tokLen(ti));
@@ -1880,7 +1819,13 @@ pub type Parser = class {
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
     if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
-    if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
+    if (self.Match(TK_ASSIGN) != 0) {
+      // WP-1.2: const expressions forbid function calls and closures
+      var prevConst: int64 := self.inConstExpr;
+      self.inConstExpr := 1;
+      self._sc1(n, self.ParseExpr());
+      self.inConstExpr := prevConst;
+    }
     self.Match(TK_SEMI);
     return n;
   }
