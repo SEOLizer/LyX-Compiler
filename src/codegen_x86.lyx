@@ -316,8 +316,10 @@ pub type Codegen = class {
   outerFuncNameLen: int64;
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
-  localIsArray:     int64;
-  localArraySize:   int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
+  localIsArray:      int64;
+  localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
+  // WP-3.1: byte buffer parallel to locals, 1 = @redundant var (TMR triple storage)
+  localIsRedundant:  int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -515,6 +517,11 @@ pub type Codegen = class {
       i := 0;
       while (i < self.localCount * 8) { poke8(sb+i, peek8(self.localArraySize+i)); i:=i+1; }
       self.localArraySize := sb;
+      // WP-3.1: grow redundant flag buffer
+      var rb: int64 := mmap(0, nc, 3, 34, -1, 0);
+      i := 0;
+      while (i < self.localCount) { poke8(rb+i, peek8(self.localIsRedundant+i)); i:=i+1; }
+      self.localIsRedundant := rb;
       self.localCap := nc;
     }
     self.frameSize := self.frameSize + 8;
@@ -526,8 +533,9 @@ pub type Codegen = class {
     var toff: int64 := self.localTypes + self.localCount * 16;
     poke64(toff,     0);
     poke64(toff + 8, 0);
-    poke8(self.localIsArray + self.localCount, 0);
-    poke64(self.localArraySize + self.localCount * 8, 0);
+    poke8(self.localIsArray      + self.localCount, 0);
+    poke64(self.localArraySize   + self.localCount * 8, 0);
+    poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
     self.localCount := self.localCount + 1;
     return 0 - self.frameSize;
   }
@@ -555,6 +563,46 @@ pub type Codegen = class {
       i := i - 1;
     }
     return -1;
+  }
+
+  // WP-3.1: TMR helpers
+
+  fn cg_isLocalRedundant(idx: int64): int64 {
+    if (idx < 0) { return 0; }
+    return peek8(self.localIsRedundant + idx) as int64;
+  }
+
+  // Emit inline x86_64 majority vote for three copies at offA, offB, offC (rbp-relative).
+  // Algorithm:
+  //   load rax=A, rdx=B, rcx=C
+  //   if B==C: if A==B: done (all equal, result=A)
+  //            else:    result=B, self-heal A  (B is majority)
+  //   else:    result=A  (A==B, A==C, or triple mismatch → keep A)
+  // Always uses 32-bit rbp displacement forms for predictable encoding.
+  fn cg_emitTmrRead(offA: int64, offB: int64, offC: int64) {
+    // mov rax, [rbp+offA]  (48 8B 85 off32)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(offA);
+    // mov rdx, [rbp+offB]  (48 8B 95 off32)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x95); self.cg_e32(offB);
+    // mov rcx, [rbp+offC]  (48 8B 8D off32)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(offC);
+    // cmp rdx, rcx  (48 39 CA) — 3 bytes
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xCA);
+    // jne +15  (75 0F) — skip the B==C branch entirely → result stays rax=A
+    // delta = cmp(3) + je(2) + mov_rax_rdx(3) + store_off32(7) = 15
+    self.cg_e8(0x75); self.cg_e8(15);
+    // B==C path:
+    // cmp rax, rdx  (48 39 D0) — 3 bytes
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD0);
+    // je +10  (74 0A) — A==B==C: result=A already, skip heal
+    // delta = mov_rax_rdx(3) + store_off32(7) = 10
+    self.cg_e8(0x74); self.cg_e8(10);
+    // B==C but A!=B: result = B, self-heal A
+    // mov rax, rdx  (48 89 D0) — 3 bytes
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
+    // mov [rbp+offA], rax  (48 89 85 off32) — 7 bytes — self-heal
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(offA);
+    // done: rax = majority value
   }
 
   // Global variable table helpers
@@ -2597,7 +2645,13 @@ pub type Codegen = class {
       var nlen: int64 := self.cg_nslen(ni);
       var off: int64 := self.cg_findLocal(name, nlen);
       if (off != 0) {
-        self.cg_loadRax(off);
+        // WP-3.1: @redundant vars use TMR majority-vote read
+        var ridx: int64 := self.cg_findLocalIdx(name, nlen);
+        if (ridx >= 0 && self.cg_isLocalRedundant(ridx) != 0) {
+          self.cg_emitTmrRead(off, off - 8, off - 16);
+        } else {
+          self.cg_loadRax(off);
+        }
       } else {
         // WP-13: Check if this is a captured variable from outer scope
         // If we have a static link, check if variable is captured via outer frame
@@ -4802,7 +4856,19 @@ pub type Codegen = class {
         }
         }
       }
-      self.cg_storeRax(off);
+      // WP-3.1: @redundant vars need 3 slots; mark + write all copies
+      var isRedundant: int64 := (self.cg_nival(ni) & 4) != 0;
+      if (isRedundant != 0) {
+        poke8(self.localIsRedundant + localIdx, 1);
+        // Reserve 2 extra stack slots (B and C) without named entries
+        self.frameSize := self.frameSize + 16;
+        // Write value to all 3 copies (rax still holds init value or 0)
+        self.cg_storeRax(off);
+        self.cg_storeRax(off - 8);
+        self.cg_storeRax(off - 16);
+      } else {
+        self.cg_storeRax(off);
+      }
 
     } else if (k == CGN_ASSIGN) {
       var lhs: int64 := self.cg_nc0(ni);
@@ -4813,7 +4879,15 @@ pub type Codegen = class {
         var nlen: int64 := self.cg_nslen(lhs);
         var off: int64 := self.cg_findLocal(name, nlen);
         if (off != 0) {
-          self.cg_storeRax(off);
+          // WP-3.1: @redundant vars write all 3 copies
+          var lidx: int64 := self.cg_findLocalIdx(name, nlen);
+          if (lidx >= 0 && self.cg_isLocalRedundant(lidx) != 0) {
+            self.cg_storeRax(off);
+            self.cg_storeRax(off - 8);
+            self.cg_storeRax(off - 16);
+          } else {
+            self.cg_storeRax(off);
+          }
         } else {
           var goff: int64 := self.cg_findGlobal(name, nlen);
           if (goff >= 0) { self.cg_storeRaxGlobal(goff); }
@@ -7460,7 +7534,9 @@ pub type Codegen = class {
     self.licenseKeyLen := 0;
 
     // Per-local array flag (WP-10b)
-    self.localIsArray := mmap(0, self.localCap, 3, 34, -1, 0);
+    self.localIsArray     := mmap(0, self.localCap, 3, 34, -1, 0);
+    // WP-3.1: per-local redundant flag
+    self.localIsRedundant := mmap(0, self.localCap, 3, 34, -1, 0);
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
