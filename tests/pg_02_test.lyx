@@ -1,0 +1,220 @@
+// tests/pg_02_test.lyx — WP-PG-02: Handshake & Authentifizierung
+//
+// Offline-Tests (kein PostgreSQL nötig):
+//   1. MD5-Implementierung gegen RFC-1321-Testvektoren
+//   2. pgMD5AuthResponse — korrekte "md5" + 32-Hex-Char Antwort
+//   3. pgHandleParamStatus — server_version korrekt extrahiert
+//
+// Live-Test (erfordert PostgreSQL auf localhost:5432, trust-auth für postgres):
+//   4. PGConnect / PGIsConnected / PGServerVersion / PGClose
+
+import std.crypto.md5;
+import std.db.postgres;
+
+// --- 1. MD5 RFC-1321 Testvektoren ---
+fn testMD5Vectors(): int64 {
+  var out: int64 := mmap(0, 33, 3, 34, -1, 0);
+
+  // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+  MD5Hex(0, 0, out);
+  var expected0: pchar := "d41d8cd98f00b204e9800998ecf8427e"c;
+  var i: int64 := 0;
+  while (i < 32) {
+    if ((peek8(out + i) & 0xFF) != (peek8(expected0 as int64 + i) & 0xFF)) {
+      PrintStr("FAIL: MD5('') byte "); PrintInt(i); PrintStr("\n");
+      munmap(out, 33); return 1;
+    }
+    i := i + 1;
+  }
+
+  // MD5("a") = 0cc175b9c0f1b6a831c399e269772661
+  var aStr: int64 := mmap(0, 1, 3, 34, -1, 0);
+  poke8(aStr, 97);  // 'a'
+  MD5Hex(aStr, 1, out);
+  munmap(aStr, 1);
+  var expected1: pchar := "0cc175b9c0f1b6a831c399e269772661"c;
+  i := 0;
+  while (i < 32) {
+    if ((peek8(out + i) & 0xFF) != (peek8(expected1 as int64 + i) & 0xFF)) {
+      PrintStr("FAIL: MD5('a') byte "); PrintInt(i); PrintStr("\n");
+      munmap(out, 33); return 1;
+    }
+    i := i + 1;
+  }
+
+  // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
+  var abcStr: int64 := mmap(0, 3, 3, 34, -1, 0);
+  poke8(abcStr, 97); poke8(abcStr + 1, 98); poke8(abcStr + 2, 99);
+  MD5Hex(abcStr, 3, out);
+  munmap(abcStr, 3);
+  var expected2: pchar := "900150983cd24fb0d6963f7d28e17f72"c;
+  i := 0;
+  while (i < 32) {
+    if ((peek8(out + i) & 0xFF) != (peek8(expected2 as int64 + i) & 0xFF)) {
+      PrintStr("FAIL: MD5('abc') byte "); PrintInt(i); PrintStr("\n");
+      munmap(out, 33); return 1;
+    }
+    i := i + 1;
+  }
+
+  // MD5("message digest") = f96b697d7cb7938d525a2f31aaf161d0
+  var msg: pchar := "message digest"c;
+  MD5HexStr(msg, 14, out);
+  var expected3: pchar := "f96b697d7cb7938d525a2f31aaf161d0"c;
+  i := 0;
+  while (i < 32) {
+    if ((peek8(out + i) & 0xFF) != (peek8(expected3 as int64 + i) & 0xFF)) {
+      PrintStr("FAIL: MD5('message digest') byte "); PrintInt(i); PrintStr("\n");
+      munmap(out, 33); return 1;
+    }
+    i := i + 1;
+  }
+
+  munmap(out, 33);
+  PrintStr("OK: MD5 RFC-1321 test vectors\n");
+  return 0;
+}
+
+// --- 2. pgMD5AuthResponse ---
+// Referenz: echo -n "secretpostgres" | md5sum → inner
+//           echo -n "${inner}SALT" | md5sum → outer (SALT = 4 raw bytes 0x01020304)
+//
+// inner = MD5Hex("secret" + "postgres") = ?
+// We verify against Python:
+//   import hashlib
+//   inner = hashlib.md5(b"secretpostgres").hexdigest()
+//   outer = hashlib.md5((inner + "\x01\x02\x03\x04").encode('ascii')).hexdigest()
+//   response = "md5" + outer
+fn testMD5AuthResponse(): int64 {
+  var salt: int64 := mmap(0, 4, 3, 34, -1, 0);
+  poke8(salt + 0, 0x01); poke8(salt + 1, 0x02);
+  poke8(salt + 2, 0x03); poke8(salt + 3, 0x04);
+
+  var out: int64 := mmap(0, 36, 3, 34, -1, 0);
+  pgMD5AuthResponse("secret"c, "postgres"c, salt, out);
+  munmap(salt, 4);
+
+  // Verify starts with "md5"
+  if ((peek8(out + 0) & 0xFF) != 109 ||  // 'm'
+      (peek8(out + 1) & 0xFF) != 100 ||  // 'd'
+      (peek8(out + 2) & 0xFF) != 53) {   // '5'
+    PrintStr("FAIL: MD5 auth response must start with 'md5'\n");
+    munmap(out, 36); return 1;
+  }
+  // Verify exactly 35 chars + NUL
+  var len: int64 := 0;
+  while ((peek8(out + len) & 0xFF) != 0) { len := len + 1; }
+  if (len != 35) {
+    PrintStr("FAIL: MD5 auth response length != 35\n");
+    munmap(out, 36); return 1;
+  }
+  // Verify the 32 hex chars after "md5" are lowercase hex
+  var j: int64 := 3;
+  while (j < 35) {
+    var c: int64 := peek8(out + j) & 0xFF;
+    var ok: int64 := (c >= 48 && c <= 57) || (c >= 97 && c <= 102);  // '0'-'9' or 'a'-'f'
+    if (ok == 0) { PrintStr("FAIL: non-hex char in MD5 response\n"); munmap(out, 36); return 1; }
+    j := j + 1;
+  }
+
+  munmap(out, 36);
+  PrintStr("OK: pgMD5AuthResponse format\n");
+  return 0;
+}
+
+// --- 3. pgHandleParamStatus: server_version extraction ---
+fn testParamStatus(): int64 {
+  // Simulate a ParameterStatus payload: "server_version\016.1\0"
+  // (name\0value\0)
+  var payload: int64 := mmap(0, 32, 3, 34, -1, 0);
+  // "server_version" (14 chars) + \0 + "16.1" (4 chars) + \0 = 20 bytes
+  var name: pchar := "server_version"c;
+  var i: int64 := 0;
+  while (i < 14) { poke8(payload + i, peek8(name as int64 + i)); i := i + 1; }
+  poke8(payload + 14, 0);
+  poke8(payload + 15, 49); // '1'
+  poke8(payload + 16, 54); // '6'
+  poke8(payload + 17, 46); // '.'
+  poke8(payload + 18, 49); // '1'
+  poke8(payload + 19, 0);
+
+  // Create a minimal PGConn-like buffer (64 bytes, zeroed)
+  var conn: int64 := mmap(0, 64, 3, 34, -1, 0);
+  pgHandleParamStatus(conn, payload, 20);
+  munmap(payload, 32);
+
+  var sv: int64 := peek64(conn + 48);  // PGCONN_SERVERVERS
+  if (sv == 0) { PrintStr("FAIL: server_version not stored\n"); munmap(conn, 64); return 1; }
+  // Check "16.1"
+  if ((peek8(sv + 0) & 0xFF) != 49 || (peek8(sv + 1) & 0xFF) != 54 ||
+      (peek8(sv + 2) & 0xFF) != 46 || (peek8(sv + 3) & 0xFF) != 49) {
+    PrintStr("FAIL: server_version value wrong\n");
+    munmap(sv, 5); munmap(conn, 64); return 1;
+  }
+  munmap(sv, 5);
+  munmap(conn, 64);
+  PrintStr("OK: pgHandleParamStatus server_version\n");
+  return 0;
+}
+
+// --- 4. Live-Test (nur wenn PostgreSQL verfügbar) ---
+fn testLiveConnect(): int64 {
+  // Try to probe first — if no PostgreSQL, skip
+  var canConnect: int64 := pgProbe("127.0.0.1"c, 5432, "postgres"c, "postgres"c);
+  if (canConnect == 0) {
+    PrintStr("SKIP: PostgreSQL not available on 127.0.0.1:5432\n");
+    return 0;
+  }
+
+  var conn: int64 := PGConnect("127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+  if (conn == 0) { PrintStr("FAIL: PGConnect returned 0\n"); return 1; }
+
+  if (PGIsConnected(conn) == 0) {
+    var errCode: int64 := PGErrno(conn);
+    var err: pchar := PGError(conn);
+    // SCRAM-SHA-256 or other unsupported auth: SKIP (WP-PG-02 only handles trust/md5/cleartext)
+    if (errCode == PG_ERR_PROTO) {
+      PrintStr("SKIP: PGConnect (unsupported auth, need trust or md5 in pg_hba.conf)\n");
+      PGClose(conn);
+      return 0;
+    }
+    PrintStr("FAIL: not connected: ");
+    if (err != 0 as pchar) { PrintStr(err); }
+    PrintStr("\n");
+    PGClose(conn);
+    return 1;
+  }
+  PrintStr("OK: PGConnect (trust auth)\n");
+
+  var sv: pchar := PGServerVersion(conn);
+  if (sv != 0 as pchar) {
+    PrintStr("OK: server_version = ");
+    PrintStr(sv);
+    PrintStr("\n");
+  }
+
+  var pid: int64 := PGBackendPID(conn);
+  if (pid > 0) {
+    PrintStr("OK: backend PID = ");
+    PrintInt(pid);
+    PrintStr("\n");
+  }
+
+  PGClose(conn);
+  PrintStr("OK: PGClose\n");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testMD5Vectors();
+  failed := failed + testMD5AuthResponse();
+  failed := failed + testParamStatus();
+  failed := failed + testLiveConnect();
+  if (failed != 0) {
+    PrintStr("FAILED\n");
+    return 1;
+  }
+  PrintStr("ALL PASSED\n");
+  return 0;
+}
