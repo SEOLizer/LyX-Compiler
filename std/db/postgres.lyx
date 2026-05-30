@@ -1793,6 +1793,151 @@ pub fn PGStmtDescribe(conn: int64, name: pchar): int64 {
   return 0;
 }
 
+// ============================================================================
+// WP-PG-07: Parameter-Binding (Text-Format)
+// ============================================================================
+
+// Grows params array to hold index i, frees any old param there,
+// allocates a fresh PGParam. Returns PGParam* or 0 on failure.
+fn pgAllocParamAt(stmt: int64, i: int64): int64 {
+  if (stmt == 0 || i < 0) { return 0; }
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var alloc:  int64 := peek64(stmt + PGSTMT_PARAMS_ALLOC);
+
+  if (i >= alloc) {
+    var newAlloc: int64 := alloc * 2;
+    if (newAlloc < i + 1) { newAlloc := i + 4; }
+    var newArr: int64 := mmap(0, newAlloc * 8, 3, 34, -1, 0);
+    if (params != 0 && alloc > 0) {
+      var ci: int64 := 0;
+      while (ci < alloc) { poke64(newArr + ci * 8, peek64(params + ci * 8)); ci := ci + 1; }
+      munmap(params, alloc * 8);
+    }
+    params := newArr;
+    poke64(stmt + PGSTMT_PARAMS,       params);
+    poke64(stmt + PGSTMT_PARAMS_ALLOC, newAlloc);
+  }
+
+  var old: int64 := peek64(params + i * 8);
+  if (old != 0) {
+    var tv: int64 := peek64(old + PGPARAM_TEXT_VAL);
+    var tl: int64 := peek64(old + PGPARAM_LEN);
+    if (tv != 0 && tl > 0) { munmap(tv, tl + 1); }
+    munmap(old, PGPARAM_SZ);
+    poke64(params + i * 8, 0);
+  }
+
+  var p: int64 := mmap(0, PGPARAM_SZ, 3, 34, -1, 0);
+  poke64(params + i * 8, p);
+
+  var count: int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  if (i + 1 > count) { poke64(stmt + PGSTMT_PARAM_COUNT, i + 1); }
+  return p;
+}
+
+// Formats int64 as decimal into buf, returns char count (excl. NUL)
+fn pgFormatInt64(val: int64, buf: int64): int64 {
+  if (val == 0) { poke8(buf, 48); poke8(buf + 1, 0); return 1; }
+  var tmp: int64 := mmap(0, 24, 3, 34, -1, 0);
+  var isNeg: int64 := 0;
+  var n: int64 := val;
+  if (n < 0) { isNeg := 1; n := 0 - n; }
+  var pos: int64 := 0;
+  while (n > 0) { poke8(tmp + pos, (n % 10) + 48); n := n / 10; pos := pos + 1; }
+  var out: int64 := 0;
+  if (isNeg != 0) { poke8(buf, 45); out := 1; }
+  var i: int64 := pos - 1;
+  while (i >= 0) { poke8(buf + out, peek8(tmp + i)); out := out + 1; i := i - 1; }
+  poke8(buf + out, 0);
+  munmap(tmp, 24);
+  return out;
+}
+
+// Formats f64 as decimal with 6 fractional digits.
+// Scales to int64 first to avoid the 0.0-x f64 negation bug.
+fn pgFormatFloat64(val: f64, buf: int64): int64 {
+  var scaled:  f64   := val * (1000000 as f64);
+  var iscaled: int64 := scaled as int64;
+  var out: int64 := 0;
+  if (iscaled < 0) { poke8(buf, 45); out := 1; iscaled := 0 - iscaled; }
+  var intPart:  int64 := iscaled / 1000000;
+  var fracPart: int64 := iscaled - intPart * 1000000;
+
+  var tmp: int64 := mmap(0, 32, 3, 34, -1, 0);
+  var iLen: int64 := pgFormatInt64(intPart, tmp);
+  var k: int64 := 0;
+  while (k < iLen) { poke8(buf + out, peek8(tmp + k)); out := out + 1; k := k + 1; }
+
+  poke8(buf + out, 46); out := out + 1;  // '.'
+
+  var digits: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var j: int64 := 5;
+  var f: int64 := fracPart;
+  while (j >= 0) { poke8(digits + j, (f % 10) + 48); f := f / 10; j := j - 1; }
+  j := 0;
+  while (j < 6) { poke8(buf + out, peek8(digits + j)); out := out + 1; j := j + 1; }
+
+  poke8(buf + out, 0);
+  munmap(tmp, 32);
+  munmap(digits, 8);
+  return out;
+}
+
+// Binds int64 to parameter slot i (0-based) as decimal text
+pub fn PGBindInt(stmt: int64, i: int64, v: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := mmap(0, 24, 3, 34, -1, 0);
+  var len: int64 := pgFormatInt64(v, buf);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds f64 to parameter slot i as decimal text (6 decimal places)
+pub fn PGBindFloat(stmt: int64, i: int64, v: f64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  var len: int64 := pgFormatFloat64(v, buf);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds string to parameter slot i (heap copy — no escaping needed in text protocol)
+pub fn PGBindStr(stmt: int64, i: int64, v: pchar) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  if (v == 0 as pchar) { poke64(p + PGPARAM_IS_NULL, 1); return; }
+  var len: int64 := pgStrLen(v as int64);
+  var buf: int64 := mmap(0, len + 1, 3, 34, -1, 0);
+  var k: int64 := 0;
+  while (k <= len) { poke8(buf + k, peek8(v as int64 + k)); k := k + 1; }
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds bool to parameter slot i ("t" or "f")
+pub fn PGBindBool(stmt: int64, i: int64, v: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := mmap(0, 2, 3, 34, -1, 0);
+  if (v != 0) { poke8(buf, 116); } else { poke8(buf, 102); }  // 't' / 'f'
+  poke8(buf + 1, 0);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      1);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds NULL to parameter slot i
+pub fn PGBindNull(stmt: int64, i: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  poke64(p + PGPARAM_IS_NULL, 1);
+}
+
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
 pub fn PGPing(conn: int64): int64 {
   if (conn == 0) { return 0; }
