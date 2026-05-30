@@ -173,7 +173,7 @@ Backend → Frontend:
 |-------|--------|-----|
 | 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 ✅ |
 | 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
-| 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 |
+| 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
 | 6 | Demos & Integrationstests | PG-12 |
@@ -440,7 +440,7 @@ PG_OID_TIMESTAMP 1114 PG_OID_NUMERIC 1700  PG_OID_BYTEA  17
 
 ---
 
-### WP-PG-07: Parameter-Binding (Text-Format) ⬜
+### WP-PG-07: Parameter-Binding (Text-Format) ✅
 
 **Ziel:** Alle Binde-Typen für Prepared Statements implementieren (Text-Format,
 da universell und einfacher als Binärformat).
