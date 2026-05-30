@@ -176,7 +176,7 @@ Backend → Frontend:
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 ✅ |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 ✅ |
-| 6 | Demos & Integrationstests | PG-12 |
+| 6 | Demos & Integrationstests | PG-12 ✅ |
 
 ---
 
@@ -609,7 +609,7 @@ COPY ist typischerweise 10–50× schneller als präparierte INSERTs.
 
 ---
 
-### WP-PG-12: Demos & Integrationstests ⬜
+### WP-PG-12: Demos & Integrationstests ✅
 
 **Ziel:** Vollständige Beispielprogramme, die alle Features praxisnah abdecken
 und als Regressionsbasis dienen.
