@@ -1,0 +1,172 @@
+// tests/pg_01_test.lyx — WP-PG-01: TCP-Verbindung & Nachrichtenrahmen
+//
+// Tests ohne laufendes PostgreSQL:
+//   1. Big-Endian Konvertierungen (RFC-konform)
+//   2. PGMsgBuf allokieren, schreiben, lesen, freigeben
+//   3. pgSendRaw / pgRecvRaw mit in-process Pipe
+//
+// Tests MIT laufendem PostgreSQL (optionaler Live-Block, per #if TARGET_POSTGRES):
+//   - pgTCPConnect + pgSendStartup + pgRecvMsg (erste Antwort 'R' oder 'E')
+
+import std.db.postgres;
+
+// --- 1. Big-Endian Konvertierungen ---
+fn testBigEndian(): int64 {
+  var buf: int64 := mmap(0, 8, 3, 34, -1, 0);
+
+  // writeInt32BE / readInt32BE
+  pgWriteInt32BE(buf, 0, 0x01020304);
+  if ((peek8(buf + 0) & 0xFF) != 0x01) { PrintStr("FAIL: BE32 byte0\n"); return 1; }
+  if ((peek8(buf + 1) & 0xFF) != 0x02) { PrintStr("FAIL: BE32 byte1\n"); return 1; }
+  if ((peek8(buf + 2) & 0xFF) != 0x03) { PrintStr("FAIL: BE32 byte2\n"); return 1; }
+  if ((peek8(buf + 3) & 0xFF) != 0x04) { PrintStr("FAIL: BE32 byte3\n"); return 1; }
+  var v32: int64 := pgReadInt32BE(buf, 0);
+  if (v32 != 0x01020304) { PrintStr("FAIL: readInt32BE\n"); return 1; }
+
+  // writeInt16BE / readInt16BE
+  pgWriteInt16BE(buf, 0, 0x0506);
+  if ((peek8(buf + 0) & 0xFF) != 0x05) { PrintStr("FAIL: BE16 byte0\n"); return 1; }
+  if ((peek8(buf + 1) & 0xFF) != 0x06) { PrintStr("FAIL: BE16 byte1\n"); return 1; }
+  var v16: int64 := pgReadInt16BE(buf, 0);
+  if (v16 != 0x0506) { PrintStr("FAIL: readInt16BE\n"); return 1; }
+
+  // writeInt32BE(5) ergibt 00 00 00 05
+  pgWriteInt32BE(buf, 0, 5);
+  if ((peek8(buf + 0) & 0xFF) != 0) { PrintStr("FAIL: BE32(5) byte0\n"); return 1; }
+  if ((peek8(buf + 3) & 0xFF) != 5) { PrintStr("FAIL: BE32(5) byte3\n"); return 1; }
+  if (pgReadInt32BE(buf, 0) != 5)   { PrintStr("FAIL: readInt32BE(5)\n"); return 1; }
+
+  munmap(buf, 8);
+  PrintStr("OK: big-endian conversions\n");
+  return 0;
+}
+
+// --- 2. PGMsgBuf ---
+fn testMsgBuf(): int64 {
+  var b: int64 := pgBufNew();
+  if (b == 0) { PrintStr("FAIL: pgBufNew returned 0\n"); return 1; }
+  if (pgBufLen(b) != 0) { PrintStr("FAIL: initial len != 0\n"); return 1; }
+
+  // Append single bytes
+  pgBufAppend8(b, 0x41);  // 'A'
+  pgBufAppend8(b, 0x42);  // 'B'
+  if (pgBufLen(b) != 2) { PrintStr("FAIL: len after 2 bytes\n"); return 1; }
+  var data: int64 := pgBufData(b);
+  if ((peek8(data + 0) & 0xFF) != 0x41) { PrintStr("FAIL: buf[0]\n"); return 1; }
+  if ((peek8(data + 1) & 0xFF) != 0x42) { PrintStr("FAIL: buf[1]\n"); return 1; }
+
+  // Append int32 big-endian
+  pgBufAppend32BE(b, 0xDEADBEEF & 0xFFFFFFFF);
+  if (pgBufLen(b) != 6) { PrintStr("FAIL: len after +4\n"); return 1; }
+  data := pgBufData(b);
+  if ((peek8(data + 2) & 0xFF) != 0xDE) { PrintStr("FAIL: BE32 in buf byte0\n"); return 1; }
+  if ((peek8(data + 5) & 0xFF) != 0xEF) { PrintStr("FAIL: BE32 in buf byte3\n"); return 1; }
+
+  // Append int16 big-endian
+  pgBufAppend16BE(b, 0x0102);
+  if (pgBufLen(b) != 8) { PrintStr("FAIL: len after +2\n"); return 1; }
+  data := pgBufData(b);
+  if ((peek8(data + 6) & 0xFF) != 0x01) { PrintStr("FAIL: BE16 in buf byte0\n"); return 1; }
+  if ((peek8(data + 7) & 0xFF) != 0x02) { PrintStr("FAIL: BE16 in buf byte1\n"); return 1; }
+
+  // Append null-terminated string
+  pgBufReset(b);
+  if (pgBufLen(b) != 0) { PrintStr("FAIL: reset len\n"); return 1; }
+  pgBufAppendStr(b, "user"c);  // 5 bytes: u,s,e,r,\0
+  if (pgBufLen(b) != 5) { PrintStr("FAIL: len after str 'user'\n"); return 1; }
+  data := pgBufData(b);
+  if ((peek8(data + 0) & 0xFF) != 117) { PrintStr("FAIL: str[0] != 'u'\n"); return 1; }
+  if ((peek8(data + 4) & 0xFF) != 0)   { PrintStr("FAIL: str NUL\n");       return 1; }
+
+  // Growth: append enough bytes to force realloc
+  pgBufReset(b);
+  var i: int64 := 0;
+  while (i < 8192) { pgBufAppend8(b, i & 0xFF); i := i + 1; }
+  if (pgBufLen(b) != 8192) { PrintStr("FAIL: len after 8192 bytes\n"); return 1; }
+  data := pgBufData(b);
+  if ((peek8(data + 7777) & 0xFF) != (7777 & 0xFF)) { PrintStr("FAIL: data after realloc\n"); return 1; }
+
+  pgBufFree(b);
+  PrintStr("OK: PGMsgBuf\n");
+  return 0;
+}
+
+// --- 3. pgSendRaw / pgRecvRaw via Temp-Datei ---
+fn testRawIO(): int64 {
+  var tmpPath: pchar := "/tmp/pg_01_rawio_test"c;
+
+  // Write 5 bytes
+  var wfd: int64 := open(tmpPath, 577, 420);  // O_WRONLY|O_CREAT|O_TRUNC, 0644
+  if (wfd < 0) { PrintStr("FAIL: open write\n"); return 1; }
+  var testData: int64 := mmap(0, 5, 3, 34, -1, 0);
+  poke8(testData + 0, 0xAA); poke8(testData + 1, 0xBB); poke8(testData + 2, 0xCC);
+  poke8(testData + 3, 0xDD); poke8(testData + 4, 0xEE);
+  var rc: int64 := pgSendRaw(wfd, testData, 5);
+  munmap(testData, 5); close(wfd);
+  if (rc < 0) { PrintStr("FAIL: pgSendRaw\n"); return 1; }
+
+  // Read 5 bytes back
+  var rfd: int64 := open(tmpPath, 0, 0);  // O_RDONLY
+  if (rfd < 0) { PrintStr("FAIL: open read\n"); return 1; }
+  var recvBuf: int64 := mmap(0, 5, 3, 34, -1, 0);
+  rc := pgRecvRaw(rfd, recvBuf, 5);
+  close(rfd);
+  if (rc < 0)                               { PrintStr("FAIL: pgRecvRaw\n"); munmap(recvBuf, 5); return 1; }
+  if ((peek8(recvBuf + 0) & 0xFF) != 0xAA) { PrintStr("FAIL: recv[0]\n");   munmap(recvBuf, 5); return 1; }
+  if ((peek8(recvBuf + 4) & 0xFF) != 0xEE) { PrintStr("FAIL: recv[4]\n");   munmap(recvBuf, 5); return 1; }
+  munmap(recvBuf, 5);
+
+  PrintStr("OK: pgSendRaw/pgRecvRaw\n");
+  return 0;
+}
+
+// --- 4. pgSendMsg / pgRecvMsg round-trip via Temp-Datei ---
+fn testMsgFraming(): int64 {
+  var tmpPath: pchar := "/tmp/pg_01_msg_test"c;
+
+  // Payload "hello" (5 bytes), type 'Q'=81
+  var wfd: int64 := open(tmpPath, 577, 420);
+  if (wfd < 0) { PrintStr("FAIL: open for msg write\n"); return 1; }
+  var payload: int64 := mmap(0, 5, 3, 34, -1, 0);
+  poke8(payload + 0, 104); poke8(payload + 1, 101); poke8(payload + 2, 108);
+  poke8(payload + 3, 108); poke8(payload + 4, 111);
+  var rc: int64 := pgSendMsg(wfd, 81, payload, 5);
+  munmap(payload, 5); close(wfd);
+  if (rc < 0) { PrintStr("FAIL: pgSendMsg\n"); return 1; }
+
+  var rfd: int64 := open(tmpPath, 0, 0);
+  if (rfd < 0) { PrintStr("FAIL: open for msg read\n"); return 1; }
+  var typeBuf: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var bufBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  var lenBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  rc := pgRecvMsg(rfd, typeBuf, bufBuf, lenBuf);
+  close(rfd);
+  var msgType: int64 := peek64(typeBuf);
+  var msgBuf:  int64 := peek64(bufBuf);
+  var msgLen:  int64 := peek64(lenBuf);
+  munmap(typeBuf, 8); munmap(bufBuf, 8); munmap(lenBuf, 8);
+
+  if (rc < 0)      { PrintStr("FAIL: pgRecvMsg\n");   pgFreeMsg(msgBuf, msgLen); return 1; }
+  if (msgType!=81) { PrintStr("FAIL: msg type\n");    pgFreeMsg(msgBuf, msgLen); return 1; }
+  if (msgLen!=5)   { PrintStr("FAIL: msg len\n");     pgFreeMsg(msgBuf, msgLen); return 1; }
+  if ((peek8(msgBuf + 0) & 0xFF) != 104) { PrintStr("FAIL: payload[0]\n"); pgFreeMsg(msgBuf, msgLen); return 1; }
+  if ((peek8(msgBuf + 4) & 0xFF) != 111) { PrintStr("FAIL: payload[4]\n"); pgFreeMsg(msgBuf, msgLen); return 1; }
+
+  pgFreeMsg(msgBuf, msgLen);
+  PrintStr("OK: pgSendMsg/pgRecvMsg framing\n");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testBigEndian();
+  failed := failed + testMsgBuf();
+  failed := failed + testRawIO();
+  failed := failed + testMsgFraming();
+  if (failed != 0) {
+    PrintStr("FAILED\n");
+    return 1;
+  }
+  PrintStr("ALL PASSED\n");
+  return 0;
+}

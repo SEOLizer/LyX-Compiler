@@ -1,0 +1,501 @@
+// std/db/postgres.lyx — PostgreSQL Frontend/Backend Protocol v3 Client
+// WP-PG-01: TCP-Verbindung & Nachrichtenrahmen
+//
+// Reine Lyx-Implementierung ohne externe Abhängigkeiten (kein libpq).
+// Protokoll: PostgreSQL v3 (Protocol 3.0 / wire format since PostgreSQL 7.4+)
+
+unit std.db.postgres;
+
+import std.string;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con PG_PROTOCOL_MAJOR:   int64 := 3;
+pub con PG_PROTOCOL_MINOR:   int64 := 0;
+pub con PG_PROTOCOL_VERSION: int64 := 196608;  // (3 << 16) | 0
+
+// Fehler-Codes
+pub con PG_ERR_NONE:         int64 := 0;
+pub con PG_ERR_SOCKET:       int64 := 3001;
+pub con PG_ERR_CONNECT:      int64 := 3002;
+pub con PG_ERR_OOM:          int64 := 3003;
+pub con PG_ERR_SEND:         int64 := 3004;
+pub con PG_ERR_RECV:         int64 := 3005;
+pub con PG_ERR_PROTO:        int64 := 3006;
+
+// Backend-Nachrichten-Typen (Server → Client)
+pub con PG_MSG_AUTH:         int64 := 82;   // 'R'
+pub con PG_MSG_PARAM_STATUS: int64 := 83;   // 'S'
+pub con PG_MSG_BACKEND_KEY:  int64 := 75;   // 'K'
+pub con PG_MSG_READY:        int64 := 90;   // 'Z'
+pub con PG_MSG_ROW_DESC:     int64 := 84;   // 'T'
+pub con PG_MSG_DATA_ROW:     int64 := 68;   // 'D'
+pub con PG_MSG_CMD_COMPLETE: int64 := 67;   // 'C'
+pub con PG_MSG_ERROR:        int64 := 69;   // 'E'
+pub con PG_MSG_NOTICE:       int64 := 78;   // 'N'
+pub con PG_MSG_PARSE_DONE:   int64 := 49;   // '1'
+pub con PG_MSG_BIND_DONE:    int64 := 50;   // '2'
+pub con PG_MSG_NO_DATA:      int64 := 110;  // 'n'
+pub con PG_MSG_EMPTY_QUERY:  int64 := 73;   // 'I'
+pub con PG_MSG_NOTIFY:       int64 := 65;   // 'A'
+pub con PG_MSG_COPY_IN:      int64 := 71;   // 'G'
+pub con PG_MSG_COPY_OUT:     int64 := 72;   // 'H'
+pub con PG_MSG_COPY_DATA:    int64 := 100;  // 'd'
+pub con PG_MSG_COPY_DONE:    int64 := 99;   // 'c'
+
+// Frontend-Nachrichten-Typen (Client → Server)
+pub con PG_FE_QUERY:         int64 := 81;   // 'Q'
+pub con PG_FE_PARSE:         int64 := 80;   // 'P'
+pub con PG_FE_BIND:          int64 := 66;   // 'B'
+pub con PG_FE_EXECUTE:       int64 := 69;   // 'E'
+pub con PG_FE_DESCRIBE:      int64 := 68;   // 'D'
+pub con PG_FE_SYNC:          int64 := 83;   // 'S'
+pub con PG_FE_CLOSE:         int64 := 67;   // 'C'
+pub con PG_FE_TERMINATE:     int64 := 88;   // 'X'
+pub con PG_FE_PASSWORD:      int64 := 112;  // 'p'
+pub con PG_FE_COPY_DATA:     int64 := 100;  // 'd'
+pub con PG_FE_COPY_DONE:     int64 := 99;   // 'c'
+pub con PG_FE_COPY_FAIL:     int64 := 102;  // 'f'
+
+// Auth-Subtypen
+pub con PG_AUTH_OK:          int64 := 0;
+pub con PG_AUTH_CLEARTEXT:   int64 := 3;
+pub con PG_AUTH_MD5:         int64 := 5;
+pub con PG_AUTH_SASL:        int64 := 10;
+
+// ReadyForQuery-Transaktionsstatus
+pub con PG_TX_IDLE:          int64 := 73;   // 'I'
+pub con PG_TX_ACTIVE:        int64 := 84;   // 'T'
+pub con PG_TX_ERROR:         int64 := 69;   // 'E'
+
+// PGMsgBuf-Kapazität initial
+con PG_BUF_INIT_CAP: int64 := 4096;
+
+// ============================================================================
+// Big-Endian Hilfsfunktionen
+// ============================================================================
+
+// Schreibt 32-Bit-Wert big-endian in buf[off..off+3]
+pub fn pgWriteInt32BE(buf: int64, off: int64, v: int64) {
+  poke8(buf + off,     (v >> 24) & 0xFF);
+  poke8(buf + off + 1, (v >> 16) & 0xFF);
+  poke8(buf + off + 2, (v >> 8)  & 0xFF);
+  poke8(buf + off + 3, v         & 0xFF);
+}
+
+// Liest 32-Bit-Wert big-endian aus buf[off..off+3]
+pub fn pgReadInt32BE(buf: int64, off: int64): int64 {
+  var b0: int64 := peek8(buf + off)     & 0xFF;
+  var b1: int64 := peek8(buf + off + 1) & 0xFF;
+  var b2: int64 := peek8(buf + off + 2) & 0xFF;
+  var b3: int64 := peek8(buf + off + 3) & 0xFF;
+  return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+// Schreibt 16-Bit-Wert big-endian in buf[off..off+1]
+pub fn pgWriteInt16BE(buf: int64, off: int64, v: int64) {
+  poke8(buf + off,     (v >> 8) & 0xFF);
+  poke8(buf + off + 1, v        & 0xFF);
+}
+
+// Liest 16-Bit-Wert big-endian aus buf[off..off+1]
+pub fn pgReadInt16BE(buf: int64, off: int64): int64 {
+  var b0: int64 := peek8(buf + off)     & 0xFF;
+  var b1: int64 := peek8(buf + off + 1) & 0xFF;
+  return (b0 << 8) | b1;
+}
+
+// ============================================================================
+// PGMsgBuf — dynamischer Nachrichtenaufbau-Buffer
+// ============================================================================
+// Speicher-Layout: buf(int64) + cap(int64) + len(int64) = 24 Bytes
+
+con PGMSGBUF_SZ: int64 := 24;
+
+// Allokiert einen neuen PGMsgBuf, gibt Zeiger zurück
+pub fn pgBufNew(): int64 {
+  var b: int64 := mmap(0, PGMSGBUF_SZ, 3, 34, -1, 0);
+  var data: int64 := mmap(0, PG_BUF_INIT_CAP, 3, 34, -1, 0);
+  poke64(b,      data);           // buf
+  poke64(b + 8,  PG_BUF_INIT_CAP); // cap
+  poke64(b + 16, 0);              // len
+  return b;
+}
+
+pub fn pgBufFree(b: int64) {
+  if (b == 0) { return; }
+  var data: int64 := peek64(b);
+  var cap:  int64 := peek64(b + 8);
+  if (data != 0) { munmap(data, cap); }
+  munmap(b, PGMSGBUF_SZ);
+}
+
+pub fn pgBufReset(b: int64) {
+  poke64(b + 16, 0);
+}
+
+fn pgBufGrow(b: int64, need: int64) {
+  var cap: int64 := peek64(b + 8);
+  var len: int64 := peek64(b + 16);
+  if (cap >= len + need) { return; }
+  var nc: int64 := cap * 2;
+  while (nc < len + need) { nc := nc * 2; }
+  var old: int64 := peek64(b);
+  var nb:  int64 := mmap(0, nc, 3, 34, -1, 0);
+  var i:   int64 := 0;
+  while (i < len) { poke8(nb + i, peek8(old + i)); i := i + 1; }
+  munmap(old, cap);
+  poke64(b,     nb);
+  poke64(b + 8, nc);
+}
+
+pub fn pgBufAppend8(b: int64, v: int64) {
+  pgBufGrow(b, 1);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  poke8(data + len, v & 0xFF);
+  poke64(b + 16, len + 1);
+}
+
+pub fn pgBufAppend16BE(b: int64, v: int64) {
+  pgBufGrow(b, 2);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  pgWriteInt16BE(data, len, v);
+  poke64(b + 16, len + 2);
+}
+
+pub fn pgBufAppend32BE(b: int64, v: int64) {
+  pgBufGrow(b, 4);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  pgWriteInt32BE(data, len, v);
+  poke64(b + 16, len + 4);
+}
+
+pub fn pgBufAppendStr(b: int64, s: pchar) {
+  if (s == 0 as pchar) { pgBufAppend8(b, 0); return; }
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(s as int64 + i) & 0xFF;
+    pgBufAppend8(b, c);
+    if (c == 0) { break; }
+    i := i + 1;
+  }
+}
+
+// Schreibt n Bytes aus src in den Buffer
+pub fn pgBufAppendBytes(b: int64, src: int64, n: int64) {
+  pgBufGrow(b, n);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  var i:    int64 := 0;
+  while (i < n) { poke8(data + len + i, peek8(src + i)); i := i + 1; }
+  poke64(b + 16, len + n);
+}
+
+pub fn pgBufLen(b: int64): int64 {
+  return peek64(b + 16);
+}
+
+pub fn pgBufData(b: int64): int64 {
+  return peek64(b);
+}
+
+// ============================================================================
+// TCP-Primitiven
+// ============================================================================
+
+// IPv4-Byte aus Host-String lesen (vor dem nächsten '.' oder '\0')
+fn pgParseIPv4Byte(host: pchar, off: int64): int64 {
+  var val: int64 := 0;
+  var i: int64 := off;
+  while (true) {
+    var c: int64 := peek8(host as int64 + i) & 0xFF;
+    if (c == 0 || c == 46) { break; }  // '\0' or '.'
+    val := val * 10 + (c - 48);
+    i := i + 1;
+  }
+  return val;
+}
+
+// Überspringt ein IPv4-Segment, gibt Offset nach dem '.' zurück
+fn pgSkipIPv4Part(host: pchar, off: int64): int64 {
+  var i: int64 := off;
+  while (true) {
+    var c: int64 := peek8(host as int64 + i) & 0xFF;
+    if (c == 0) { return i; }
+    if (c == 46) { return i + 1; }
+    i := i + 1;
+  }
+  return i;
+}
+
+// Öffnet TCP-Socket zu host:port, gibt fd zurück oder -1 bei Fehler
+pub fn pgTCPConnect(host: pchar, port: int64): int64 {
+  var fd: int64 := sys_socket(2, 1, 0);
+  if (fd < 0) { return -1; }
+
+  var addr: int64 := mmap(0, 16, 3, 34, -1, 0);
+  poke8(addr,     2);   // AF_INET
+  poke8(addr + 1, 0);
+  // Port big-endian
+  poke8(addr + 2, (port >> 8) & 0xFF);
+  poke8(addr + 3, port & 0xFF);
+  // IPv4-Adresse
+  var o0: int64 := 0;
+  var b0: int64 := pgParseIPv4Byte(host, o0);
+  var o1: int64 := pgSkipIPv4Part(host, o0);
+  var b1: int64 := pgParseIPv4Byte(host, o1);
+  var o2: int64 := pgSkipIPv4Part(host, o1);
+  var b2: int64 := pgParseIPv4Byte(host, o2);
+  var o3: int64 := pgSkipIPv4Part(host, o2);
+  var b3: int64 := pgParseIPv4Byte(host, o3);
+  poke8(addr + 4, b0);
+  poke8(addr + 5, b1);
+  poke8(addr + 6, b2);
+  poke8(addr + 7, b3);
+  var k: int64 := 0;
+  while (k < 8) { poke8(addr + 8 + k, 0); k := k + 1; }
+
+  var rc: int64 := sys_connect(fd, addr, 16);
+  munmap(addr, 16);
+  if (rc < 0) { sys_close(fd); return -1; }
+  return fd;
+}
+
+// ============================================================================
+// Rohe I/O (exakte Byte-Übertragung)
+// ============================================================================
+
+// Schreibt exakt `len` Bytes aus buf über fd (retry bei partiellen writes)
+// Gibt 0 bei Erfolg zurück, -1 bei Fehler
+pub fn pgSendRaw(fd: int64, buf: int64, len: int64): int64 {
+  var sent: int64 := 0;
+  while (sent < len) {
+    var n: int64 := sys_write(fd, buf + sent, len - sent);
+    if (n <= 0) { return -1; }
+    sent := sent + n;
+  }
+  return 0;
+}
+
+// Liest exakt `len` Bytes in buf (retry bei partiellen reads)
+// Gibt 0 bei Erfolg, -1 bei Fehler oder EOF
+pub fn pgRecvRaw(fd: int64, buf: int64, len: int64): int64 {
+  var got: int64 := 0;
+  while (got < len) {
+    var n: int64 := sys_read(fd, buf + got, len - got);
+    if (n <= 0) { return -1; }
+    got := got + n;
+  }
+  return 0;
+}
+
+// ============================================================================
+// PG-Nachrichten senden
+// ============================================================================
+
+// Sendet eine PG-Nachricht: [type(1)][length BE(4) = payloadLen+4][payload]
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgSendMsg(fd: int64, msgType: int64, payload: int64, payloadLen: int64): int64 {
+  // Header: 1 Byte type + 4 Byte length (big-endian, zählt sich selbst mit)
+  var hdr: int64 := mmap(0, 5, 3, 34, -1, 0);
+  poke8(hdr, msgType & 0xFF);
+  pgWriteInt32BE(hdr, 1, payloadLen + 4);
+  var rc: int64 := pgSendRaw(fd, hdr, 5);
+  munmap(hdr, 5);
+  if (rc < 0) { return -1; }
+  if (payloadLen > 0) {
+    if (pgSendRaw(fd, payload, payloadLen) < 0) { return -1; }
+  }
+  return 0;
+}
+
+// Sendet eine Nachricht aus einem PGMsgBuf
+pub fn pgSendMsgBuf(fd: int64, msgType: int64, b: int64): int64 {
+  var data: int64 := pgBufData(b);
+  var len:  int64 := pgBufLen(b);
+  return pgSendMsg(fd, msgType, data, len);
+}
+
+// ============================================================================
+// StartupMessage (kein Type-Byte, nur Length + Protocol + Parameter)
+// ============================================================================
+
+// Baut und sendet die StartupMessage:
+// [4 Byte total length BE][4 Byte protocol=196608]
+// ["user\0" user "\0"]["database\0" db "\0"]["application_name\0lyx\0"]["\0"]
+pub fn pgSendStartup(fd: int64, user: pchar, database: pchar): int64 {
+  var b: int64 := pgBufNew();
+
+  // protocol version
+  pgBufAppend32BE(b, PG_PROTOCOL_VERSION);
+
+  // "user\0" + username + "\0"
+  pgBufAppendStr(b, "user"c);      // includes trailing \0
+  pgBufAppendStr(b, user);         // includes trailing \0
+
+  // "database\0" + dbname + "\0"
+  pgBufAppendStr(b, "database"c);
+  pgBufAppendStr(b, database);
+
+  // "application_name\0lyx\0"
+  pgBufAppendStr(b, "application_name"c);
+  pgBufAppendStr(b, "lyx"c);
+
+  // Terminating \0
+  pgBufAppend8(b, 0);
+
+  var payloadLen: int64 := pgBufLen(b);
+  var totalLen:   int64 := payloadLen + 4;  // +4 für die Length-Feld selbst
+
+  // StartupMessage: kein type-Byte; nur [4 Byte length][payload]
+  var lenBuf: int64 := mmap(0, 4, 3, 34, -1, 0);
+  pgWriteInt32BE(lenBuf, 0, totalLen);
+  var rc: int64 := pgSendRaw(fd, lenBuf, 4);
+  munmap(lenBuf, 4);
+  if (rc < 0) { pgBufFree(b); return -1; }
+
+  rc := pgSendRaw(fd, pgBufData(b), payloadLen);
+  pgBufFree(b);
+  return rc;
+}
+
+// ============================================================================
+// PG-Nachrichten empfangen
+// ============================================================================
+
+// Liest die nächste PG-Nachricht vom Server.
+// outType: Zeiger auf int64 → wird mit dem 1-Byte-Typ befüllt
+// outBuf:  Zeiger auf int64 → wird mit mmap-Puffer der Payload befüllt (Aufrufer muss freigeben)
+// outLen:  Zeiger auf int64 → wird mit Payload-Länge befüllt
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgRecvMsg(fd: int64, outType: int64, outBuf: int64, outLen: int64): int64 {
+  // Lese 1 Byte type + 4 Byte length
+  var hdr: int64 := mmap(0, 5, 3, 34, -1, 0);
+  if (pgRecvRaw(fd, hdr, 5) < 0) {
+    munmap(hdr, 5);
+    return -1;
+  }
+  var msgType:    int64 := peek8(hdr) & 0xFF;
+  var msgLen:     int64 := pgReadInt32BE(hdr, 1);  // inkl. 4 Bytes Length-Feld selbst
+  munmap(hdr, 5);
+
+  poke64(outType, msgType);
+
+  var payloadLen: int64 := msgLen - 4;
+  if (payloadLen < 0) { return -1; }
+
+  poke64(outLen, payloadLen);
+
+  if (payloadLen == 0) {
+    poke64(outBuf, 0);
+    return 0;
+  }
+
+  var payload: int64 := mmap(0, payloadLen + 1, 3, 34, -1, 0);
+  if (pgRecvRaw(fd, payload, payloadLen) < 0) {
+    munmap(payload, payloadLen + 1);
+    return -1;
+  }
+  poke64(outBuf, payload);
+  return 0;
+}
+
+// Gibt einen mit pgRecvMsg allokierten Payload frei
+pub fn pgFreeMsg(buf: int64, len: int64) {
+  if (buf != 0 && len > 0) { munmap(buf, len + 1); }
+}
+
+// ============================================================================
+// Nachrichten verwerfen bis zu einem bestimmten Typ
+// Nützlich um ParameterStatus-Flood nach Auth durchzuarbeiten
+// ============================================================================
+
+// Liest Nachrichten und verwirft sie bis Typ `stopType` empfangen wird.
+// Gibt den Payload des StopType zurück (Aufrufer muss ihn freigeben).
+// outBuf/outLen werden auf den letzten (stop-)Payload gesetzt.
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgSkipUntil(fd: int64, stopType: int64, outBuf: int64, outLen: int64): int64 {
+  while (true) {
+    var msgType:    int64 := 0;
+    var msgBuf:     int64 := 0;
+    var msgLen:     int64 := 0;
+    var typeBuf:    int64 := mmap(0, 8, 3, 34, -1, 0);
+    var bufBuf:     int64 := mmap(0, 8, 3, 34, -1, 0);
+    var lenBuf:     int64 := mmap(0, 8, 3, 34, -1, 0);
+
+    var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
+    msgType := peek64(typeBuf);
+    msgBuf  := peek64(bufBuf);
+    msgLen  := peek64(lenBuf);
+    munmap(typeBuf, 8); munmap(bufBuf, 8); munmap(lenBuf, 8);
+
+    if (rc < 0) { return -1; }
+
+    if (msgType == stopType) {
+      poke64(outBuf, msgBuf);
+      poke64(outLen, msgLen);
+      return 0;
+    }
+    // Verwerfen
+    pgFreeMsg(msgBuf, msgLen);
+  }
+  return -1;
+}
+
+// ============================================================================
+// Fehler aus ErrorResponse extrahieren
+// ErrorResponse-Payload: [field-type(1)][text\0] ... [\0]
+// Feld 'M' = Message, 'C' = SQLSTATE Code, 'S' = Severity
+// ============================================================================
+
+// Gibt einen Zeiger auf das Feld fieldType im ErrorResponse-Payload zurück,
+// oder 0 wenn nicht vorhanden
+pub fn pgErrorField(payload: int64, payloadLen: int64, fieldType: int64): int64 {
+  var pos: int64 := 0;
+  while (pos < payloadLen) {
+    var ft: int64 := peek8(payload + pos) & 0xFF;
+    pos := pos + 1;
+    if (ft == 0) { break; }
+    // Find end of string (next \0)
+    var start: int64 := pos;
+    while (pos < payloadLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+    if (ft == fieldType) { return payload + start; }
+    pos := pos + 1;  // skip the \0
+  }
+  return 0;
+}
+
+// ============================================================================
+// Test-Hilfe: einfache Verbindungs-Probe
+// ============================================================================
+
+// Prüft ob ein PostgreSQL-Server auf host:port erreichbar ist.
+// Sendet StartupMessage, liest erste Antwort, schließt sofort wieder.
+// Gibt 1 zurück wenn eine Antwort empfangen wurde, 0 bei Fehler.
+pub fn pgProbe(host: pchar, port: int64, user: pchar, database: pchar): int64 {
+  var fd: int64 := pgTCPConnect(host, port);
+  if (fd < 0) { return 0; }
+
+  if (pgSendStartup(fd, user, database) < 0) {
+    sys_close(fd);
+    return 0;
+  }
+
+  // Erste Antwort lesen (AuthenticationRequest 'R' oder ErrorResponse 'E')
+  var typeBuf: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var bufBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  var lenBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
+  var msgBuf: int64 := peek64(bufBuf);
+  var msgLen: int64 := peek64(lenBuf);
+  munmap(typeBuf, 8); munmap(bufBuf, 8); munmap(lenBuf, 8);
+  pgFreeMsg(msgBuf, msgLen);
+
+  sys_close(fd);
+  return 1;
+}
