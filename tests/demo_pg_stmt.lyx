@@ -1,0 +1,94 @@
+// demo_pg_stmt.lyx — WP-PG-12 Demo 2: Prepared Statements & Re-Use
+//
+// Bereitet ein INSERT-Statement vor und führt es 1000x mit verschiedenen
+// Bindings aus. Zeigt korrekte Ergebnisse und Row-Count.
+
+import std.db.postgres;
+
+extern fn sys_clock_gettime(clockid: int64, tp: pchar): int64;
+
+fn nowMs(): int64 {
+  var ts: int64 := mmap(0, 16, 3, 34, -1, 0);
+  sys_clock_gettime(1, ts as pchar);
+  var ms: int64 := peek64(ts) * 1000 + peek64(ts + 8) / 1000000;
+  munmap(ts, 16);
+  return ms;
+}
+
+fn connect(): int64 {
+  var probe: int64 := pgProbe("127.0.0.1"c, 5432, "postgres"c, "postgres"c);
+  if (probe == 0) { PrintStr("SKIP: PostgreSQL not available\n"); return 0; }
+  var conn: int64 := PGConnect("127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+  if (conn == 0) { PrintStr("SKIP: TCP error\n"); return 0; }
+  if (PGIsConnected(conn) == 0) {
+    if (PGErrno(conn) == PG_ERR_PROTO) { PrintStr("SKIP: unsupported auth (need trust/md5)\n"); }
+    else { PrintStr("SKIP: not connected\n"); }
+    PGClose(conn); return 0;
+  }
+  return conn;
+}
+
+pub fn main(): int64 {
+  var conn: int64 := connect();
+  if (conn == 0) { return 0; }
+
+  var r0: int64 := PGQuery(conn, "DROP TABLE IF EXISTS pg_demo_stmt"c);
+  if (r0 != 0) { PGFreeResult(r0); }
+  var r1: int64 := PGQuery(conn,
+    "CREATE TABLE pg_demo_stmt (id INT, val TEXT)"c);
+  if (r1 == 0) { PrintStr("FAIL: CREATE\n"); PGClose(conn); return 1; }
+  PGFreeResult(r1);
+
+  var stmt: int64 := PGStmtPrepare(conn, "ins_stmt"c,
+    "INSERT INTO pg_demo_stmt VALUES ($1, $2)"c);
+  if (stmt == 0) { PrintStr("FAIL: prepare\n"); PGClose(conn); return 1; }
+
+  var t0: int64 := nowMs();
+
+  var i: int64 := 0;
+  while (i < 1000) {
+    PGStmtReset(stmt);
+    PGBindInt(stmt, 0, i);
+    PGBindStr(stmt, 1, "item"c);
+    var r: int64 := PGStmtExecute(conn, stmt);
+    if (r == 0) {
+      PrintStr("FAIL: execute at "); PrintInt(i); PrintStr("\n");
+      PGStmtFree(stmt); PGClose(conn); return 1;
+    }
+    PGFreeResult(r);
+    i := i + 1;
+  }
+
+  var t1: int64 := nowMs();
+
+  PGStmtClose(conn, "ins_stmt"c);
+  PGStmtFree(stmt);
+
+  // Verify
+  var rCnt: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg_demo_stmt"c);
+  if (rCnt == 0) { PrintStr("FAIL: COUNT\n"); PGClose(conn); return 1; }
+  PGFetchRow(rCnt);
+  var cnt: int64 := PGGetInt(rCnt, 0);
+  PGFreeResult(rCnt);
+
+  // Verify a specific row
+  var rCheck: int64 := PGQuery(conn, "SELECT val FROM pg_demo_stmt WHERE id=500"c);
+  if (rCheck == 0 || PGNumRows(rCheck) == 0) {
+    PrintStr("FAIL: row check\n");
+    if (rCheck != 0) { PGFreeResult(rCheck); }
+    PGClose(conn); return 1;
+  }
+  PGFetchRow(rCheck);
+  var v: pchar := PGGetStr(rCheck, 0);
+  PGFreeResult(rCheck);
+
+  PrintStr("1000 executes in "); PrintInt(t1 - t0); PrintStr(" ms\n");
+  PrintStr("COUNT = "); PrintInt(cnt); PrintStr("\n");
+  PrintStr("row 500: val = "); PrintStr(v); PrintStr("\n");
+
+  var rDrop: int64 := PGQuery(conn, "DROP TABLE pg_demo_stmt"c);
+  if (rDrop != 0) { PGFreeResult(rDrop); }
+  PGClose(conn);
+  PrintStr("OK\n");
+  return 0;
+}
