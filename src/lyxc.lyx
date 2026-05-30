@@ -149,6 +149,174 @@ pub type CLIOptions = struct {
 };
 
 // ============================================================================
+// WP-3.2: CRC32 (IEEE 802.3) + .meta_safe section post-processor
+// ============================================================================
+
+// IEEE 802.3 CRC32: polynomial 0xEDB88320 (bit-reversed 0x04C11DB7).
+// Returns the 32-bit CRC of data[0..len-1] as a positive int64.
+fn ms_crc32(data: int64, len: int64): int64 {
+  var crc: int64 := 0xFFFFFFFF;
+  var i: int64 := 0;
+  while (i < len) {
+    crc := crc ^ (peek8(data + i) & 0xFF);
+    var b: int64 := 0;
+    while (b < 8) {
+      if ((crc & 1) != 0) {
+        crc := ((crc >> 1) & 0x7FFFFFFF) ^ (0 - 306674912);
+        // 0xEDB88320 as signed int64:  0xEDB88320 = 3988292384
+        // As negative two's-complement: 3988292384 - 4294967296 = -306674912
+      } else {
+        crc := (crc >> 1) & 0x7FFFFFFF;
+      }
+      b := b + 1;
+    }
+    i := i + 1;
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// Append a .meta_safe section to the ELF binary at `path`.
+// codeOff  = file offset of .text (120 for static x86_64 ELF)
+// codeLen  = length of .text in bytes
+// dataLen  = length of .data in bytes (follows .text immediately)
+fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64) {
+  // Open and read the existing binary
+  var fd: int64 := open(path, 0, 0);  // O_RDONLY
+  if (fd < 0) { PrintStr("meta-safe: cannot open binary\n"); return; }
+  var fileSize: int64 := lseek(fd, 0, 2);
+  lseek(fd, 0, 0);
+  var buf: int64 := mmap(0, fileSize + 4096, 3, 34, -1, 0);
+  read(fd, buf as pchar, fileSize);
+  close(fd);
+
+  // Compute CRC32 per 4096-byte page of .text
+  var pageSize: int64 := 4096;
+  var pageCount: int64 := (codeLen + pageSize - 1) / pageSize;
+  // .meta_safe payload: Magic(4) + PageCount(4) + CodeLen(8) + pageCount×{pageOffset:4, crc32:4}
+  // Total header: 16 bytes; entries at offset 16
+  var payloadSize: int64 := 16 + pageCount * 8;
+  var payload: int64 := mmap(0, payloadSize, 3, 34, -1, 0);
+
+  // Magic: "META" = bytes 0x4D 0x45 0x54 0x41
+  poke8(payload + 0, 0x4D);  // M
+  poke8(payload + 1, 0x45);  // E
+  poke8(payload + 2, 0x54);  // T
+  poke8(payload + 3, 0x41);  // A
+  poke32(payload + 4, pageCount);
+  poke64(payload + 8, codeLen);  // actual .text byte count for verifier
+
+  var pi: int64 := 0;
+  while (pi < pageCount) {
+    var pageOff:    int64 := pi * pageSize;
+    var fileOff:    int64 := codeOff + pageOff;
+    var remaining:  int64 := codeLen - pageOff;
+    var len:        int64 := pageSize;
+    if (remaining < pageSize) { len := remaining; }
+    var crc: int64 := ms_crc32(buf + fileOff, len);
+    var entry: int64 := payload + 16 + pi * 8;
+    poke32(entry,     pageOff);  // pageOffset (relative to .text start)
+    poke32(entry + 4, crc);      // crc32
+    pi := pi + 1;
+  }
+
+  // Build .shstrtab: "\0.meta_safe\0.shstrtab\0"
+  // Offsets: 0=\0, 1=.meta_safe (10 chars), 12=\0, 13=.shstrtab (9 chars), 23=\0 → 24 bytes
+  var shstrSize:  int64 := 24;
+  var shstr: int64 := mmap(0, shstrSize, 3, 34, -1, 0);  // zeroed
+  poke8(shstr + 1,  46);  // '.'
+  poke8(shstr + 2,  109); // 'm'
+  poke8(shstr + 3,  101); // 'e'
+  poke8(shstr + 4,  116); // 't'
+  poke8(shstr + 5,  97);  // 'a'
+  poke8(shstr + 6,  95);  // '_'
+  poke8(shstr + 7,  115); // 's'
+  poke8(shstr + 8,  97);  // 'a'
+  poke8(shstr + 9,  102); // 'f'
+  poke8(shstr + 10, 101); // 'e'
+  // byte 11: already \0
+  poke8(shstr + 12, 46);  // '.'
+  poke8(shstr + 13, 115); // 's'
+  poke8(shstr + 14, 104); // 'h'
+  poke8(shstr + 15, 115); // 's'
+  poke8(shstr + 16, 116); // 't'
+  poke8(shstr + 17, 114); // 'r'
+  poke8(shstr + 18, 116); // 't'
+  poke8(shstr + 19, 97);  // 'a'
+  poke8(shstr + 20, 98);  // 'b'
+  // byte 21: already \0; bytes 22-23: padding
+
+  // Layout of new file:
+  //   [0 .. fileSize-1]          : original ELF
+  //   [fileSize .. +payloadSize]  : .meta_safe payload
+  //   [fileSize+payloadSize .. ]  : .shstrtab (24 bytes)
+  //   [fileSize+payloadSize+24..] : 3 × 64-byte section headers (aligned to 8)
+  var shoff:    int64 := fileSize + payloadSize + shstrSize;
+  var newSize:  int64 := shoff + 3 * 64;
+
+  // Build new ELF buffer
+  var nbuf: int64 := mmap(0, newSize, 3, 34, -1, 0);
+  // Copy original ELF
+  var ci: int64 := 0;
+  while (ci < fileSize) { poke8(nbuf + ci, peek8(buf + ci)); ci := ci + 1; }
+  // Append .meta_safe payload
+  ci := 0;
+  while (ci < payloadSize) { poke8(nbuf + fileSize + ci, peek8(payload + ci)); ci := ci + 1; }
+  // Append .shstrtab
+  ci := 0;
+  while (ci < shstrSize) { poke8(nbuf + fileSize + payloadSize + ci, peek8(shstr + ci)); ci := ci + 1; }
+
+  // Update ELF header:
+  //   e_shoff      = shoff (offset of section header table)
+  //   e_shnum      = 3 (NULL, .meta_safe, .shstrtab)
+  //   e_shstrndx   = 2 (.shstrtab is entry 2)
+  poke64(nbuf + 40, shoff);  // e_shoff
+  poke16(nbuf + 60, 3);      // e_shnum
+  poke16(nbuf + 62, 2);      // e_shstrndx
+
+  // Section header table (3 × 64 bytes, each Elf64_Shdr):
+  // [0] NULL section — all zeros
+  var sh0: int64 := nbuf + shoff;
+  // (already zeroed by mmap)
+
+  // [1] .meta_safe — SHT_NOTE=7, SHF_ALLOC|SHF_READONLY=6
+  var sh1: int64 := nbuf + shoff + 64;
+  poke32(sh1,      1);                        // sh_name = 1 (offset in .shstrtab)
+  poke32(sh1 + 4,  7);                        // sh_type = SHT_NOTE
+  poke64(sh1 + 8,  2);                        // sh_flags = SHF_ALLOC (read-only; no SHF_WRITE/SHF_EXECINSTR)
+  poke64(sh1 + 16, 0);                        // sh_addr = 0 (not loaded)
+  poke64(sh1 + 24, fileSize);                 // sh_offset = right after original ELF
+  poke64(sh1 + 32, payloadSize);              // sh_size
+  poke32(sh1 + 40, 0);                        // sh_link
+  poke32(sh1 + 44, 0);                        // sh_info
+  poke64(sh1 + 48, 4);                        // sh_addralign
+  poke64(sh1 + 56, 0);                        // sh_entsize
+
+  // [2] .shstrtab — SHT_STRTAB=3
+  var sh2: int64 := nbuf + shoff + 128;
+  poke32(sh2,      12);                       // sh_name = 12 (offset of ".shstrtab" in .shstrtab)
+  poke32(sh2 + 4,  3);                        // sh_type = SHT_STRTAB
+  poke64(sh2 + 8,  0);                        // sh_flags
+  poke64(sh2 + 16, 0);                        // sh_addr
+  poke64(sh2 + 24, fileSize + payloadSize);   // sh_offset
+  poke64(sh2 + 32, shstrSize);                // sh_size
+  poke32(sh2 + 40, 0);                        // sh_link
+  poke32(sh2 + 44, 0);                        // sh_info
+  poke64(sh2 + 48, 1);                        // sh_addralign
+  poke64(sh2 + 56, 0);                        // sh_entsize
+
+  // Write new ELF file (overwrite)
+  var wfd: int64 := open(path, 577, 493);  // O_WRONLY|O_CREAT|O_TRUNC, 0755
+  if (wfd < 0) { PrintStr("meta-safe: cannot write binary\n"); munmap(nbuf, newSize); return; }
+  write(wfd, nbuf as pchar, newSize);
+  close(wfd);
+
+  munmap(buf, fileSize + 4096);
+  munmap(payload, payloadSize);
+  munmap(shstr, shstrSize);
+  munmap(nbuf, newSize);
+}
+
+// ============================================================================
 // Compiler Configuration
 // ============================================================================
 
@@ -215,6 +383,9 @@ pub type CompilerConfig = class {
   // WP-BC-49: DWARF debug symbol generation
   debugSymbols: bool;
 
+  // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
+  metaSafe: bool;
+
   // WP-BC-50: .lyu pre-compiled unit format
   compileUnit:   bool;    // --compile-unit: write .lyu after sema
   unitInfoFile:  int64;   // --unit-info: 0=unset, 1=sentinel, 2=set (path in unitInfoPath)
@@ -275,6 +446,9 @@ pub type CompilerConfig = class {
   checkBinary:   int64;   // --check-binary=<path>   (pchar into argv)
   noLicense:     bool;    // --no-license
   daaWarn:       int64;   // WP-AS-15: 0=off, 1=warn, 2=error
+
+  // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
+  metaSafe: bool;
 
   // Compilation state
   exitCode: int64;
@@ -337,6 +511,7 @@ pub type CompilerConfig = class {
     self.provenance     := false;
     self.runtimeChecks  := false;
     self.debugSymbols   := false;
+    self.metaSafe       := false;
     self.compileUnit    := false;
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
@@ -824,6 +999,12 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-3.2: --meta-safe
+    if StrCmp(arg, "--meta-safe"c) == 0 {
+      self.metaSafe := true;
+      return;
+    }
+
     // WP-BC-49: --debug-symbols
     if StrCmp(arg, "--debug-symbols"c) == 0 {
       self.debugSymbols := true;
@@ -1243,6 +1424,10 @@ pub type CompilerConfig = class {
       }
       cg.Generate(astRoot);
       cg.WriteELF(outPath);
+      // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
+      if self.metaSafe {
+        ms_appendMetaSafe(outPath, 120, cg.codeLen, cg.dataLen);
+      }
       self._passEnd("codegen-x86_64"c, _t5x);
       return self.exitCode;
     }
