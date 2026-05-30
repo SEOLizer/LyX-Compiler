@@ -2369,6 +2369,182 @@ pub fn PGNotifPayload(notif: int64): pchar {
   return peek64(notif + PGNOTIF_PAYLOAD) as pchar;
 }
 
+// ============================================================================
+// WP-PG-11: COPY IN — Bulk-Insert
+// ============================================================================
+
+// Escapes a string value for PostgreSQL CSV COPY:
+// wraps in double-quotes, doubles any internal double-quote.
+// Returns char count written to dst (excl. NUL).
+// If src is 0, writes nothing (empty = NULL marker for caller to decide).
+pub fn pgCsvEscape(dst: int64, src: pchar): int64 {
+  if (src == 0 as pchar) { poke8(dst, 0); return 0; }
+  var out: int64 := 0;
+  poke8(dst + out, 34); out := out + 1;  // opening "
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(src as int64 + i) & 0xFF;
+    if (c == 0) { break; }
+    if (c == 34) { poke8(dst + out, 34); out := out + 1; }  // "" for "
+    poke8(dst + out, c); out := out + 1;
+    i := i + 1;
+  }
+  poke8(dst + out, 34); out := out + 1;  // closing "
+  poke8(dst + out, 0);
+  return out;
+}
+
+// Sends "COPY table [(columns)] FROM STDIN WITH (FORMAT CSV)"
+// and waits for CopyInResponse ('G'). Returns 1 on success, 0 on error.
+pub fn PGCopyBegin(conn: int64, table: pchar, columns: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+
+  var sql: int64 := 0;
+  if (columns == 0 as pchar) {
+    sql := pgConcat3("COPY "c, table, " FROM STDIN WITH (FORMAT CSV)"c);
+  } else {
+    sql := pgConcat5("COPY "c, table, " ("c, columns, ") FROM STDIN WITH (FORMAT CSV)"c);
+  }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var sqlLen: int64 := pgStrLen(sql) + 1;
+  var rc: int64 := pgSendMsg(fd, PG_FE_QUERY, sql, sqlLen);
+  munmap(sql, sqlLen);
+  if (rc < 0) { pgConnSetError(conn, PG_ERR_SEND, "copy begin send failed"c); return 0; }
+
+  // Wait for CopyInResponse or error
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "copy begin recv failed"c);
+      pgFreeRecv(r); return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_COPY_IN) {
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 1;
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 0;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Sends one CSV row as CopyData ('d').
+// values: pointer to int64[count] — each element is pchar (0 = NULL).
+// NULL fields emit an empty unquoted field (PostgreSQL CSV default NULL = '').
+// Non-NULL fields are quoted: "value" with internal " escaped as "".
+pub fn PGCopyRow(conn: int64, values: int64, count: int64): int64 {
+  if (conn == 0 || values == 0 || count <= 0) { return 0; }
+  var b: int64 := pgConnMsgBuf(conn);
+  pgBufReset(b);
+  var i: int64 := 0;
+  while (i < count) {
+    if (i > 0) { pgBufAppend8(b, 44); }  // ','
+    var v: int64 := peek64(values + i * 8);
+    if (v != 0) {
+      pgBufAppend8(b, 34);  // opening "
+      var j: int64 := 0;
+      while (true) {
+        var c: int64 := peek8(v + j) & 0xFF;
+        if (c == 0) { break; }
+        if (c == 34) { pgBufAppend8(b, 34); }  // double the quote
+        pgBufAppend8(b, c);
+        j := j + 1;
+      }
+      pgBufAppend8(b, 34);  // closing "
+    }
+    // NULL: nothing (empty unquoted field)
+    i := i + 1;
+  }
+  pgBufAppend8(b, 10);  // '\n'
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var rc: int64 := pgSendMsgBuf(fd, PG_FE_COPY_DATA, b);
+  var result: int64 := 0;
+  if (rc >= 0) { result := 1; }
+  return result;
+}
+
+// Signals end of COPY data, waits for CommandComplete + ReadyForQuery.
+// Returns 1 on success (rows inserted), 0 on error.
+pub fn PGCopyEnd(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  if (pgSendMsg(fd, PG_FE_COPY_DONE, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "copy done send failed"c); return 0;
+  }
+
+  var r: int64 := pgAllocRecv();
+  var success: int64 := 0;
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "copy end recv failed"c);
+      pgFreeRecv(r); return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_CMD_COMPLETE) {
+      var tmp: int64 := pgResultNew();
+      pgParseCommandTag(tmp, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(tmp + PGRESULT_AFFECTED_ROWS));
+      PGFreeResult(tmp);
+      pgFreeRecvMsg(r);
+      success := 1;
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      success := 0;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return success;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Aborts an active COPY IN by sending CopyFail ('f') with an error message.
+// Returns 1 after draining the server response, 0 on send error.
+pub fn PGCopyAbort(conn: int64, errmsg: pchar): int64 {
+  if (conn == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var msg: pchar := errmsg;
+  if (msg == 0 as pchar) { msg := "COPY aborted by client"c; }
+  var msgLen: int64 := pgStrLen(msg as int64) + 1;
+  if (pgSendMsg(fd, PG_FE_COPY_FAIL, msg as int64, msgLen) < 0) { return 0; }
+
+  // Drain until ReadyForQuery
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return 0; }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 1;
+    }
+    if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+    }
+    pgFreeRecvMsg(r);
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
 pub fn PGPing(conn: int64): int64 {
   if (conn == 0) { return 0; }
