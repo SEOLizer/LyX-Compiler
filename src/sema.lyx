@@ -434,6 +434,40 @@ pub type Sema = class {
     PrintStrLn(msg);
   }
 
+  // WP-2.2-A: Print a non-NUL-terminated source substring (for error messages).
+  fn _printSrcName(name: pchar, len: int64) {
+    var buf: int64 := mmap(0, len + 1, 3, 34, -1, 0);
+    if (buf == 0) { PrintStr("(?)"c); return; }
+    var i: int64 := 0;
+    while (i < len) { poke8(buf + i, StrCharAt(name, i)); i := i + 1; }
+    poke8(buf + len, 0);
+    PrintStr(buf as pchar);
+    munmap(buf, len + 1);
+  }
+
+  // WP-2.2-A: Given an SNK_IDENT discriminant node, return the SNK_ENUM_DECL
+  // node index of the variable's enum type, or -1 if it is not an enum.
+  fn _findEnumDeclForIdent(identNi: int64): int64 {
+    var nm: pchar := self.sn_sVal(identNi);
+    var nl: int64 := self.sn_sLen(identNi);
+    var sym: int64 := self.Lookup(nm, nl);
+    if (sym < 0) { return -1; }
+    var sk: int64 := self.SymKind(sym);
+    if (sk != SYM_VAR && sk != SYM_PARAM) { return -1; }
+    // Variable/parameter declaration → c0 holds the type node
+    var declNi: int64 := self.SymNodeIdx(sym);
+    if (declNi < 0) { return -1; }
+    var typeNi: int64 := self.sn_c0(declNi);
+    if (typeNi < 0) { return -1; }
+    // Type node sVal/sLen give the enum's name
+    var typeName: pchar := self.sn_sVal(typeNi);
+    var typeLen:  int64 := self.sn_sLen(typeNi);
+    var enumSym: int64 := self.Lookup(typeName, typeLen);
+    if (enumSym < 0) { return -1; }
+    if (self.SymKind(enumSym) != SYM_ENUM) { return -1; }
+    return self.SymNodeIdx(enumSym);
+  }
+
   // ------------------------------------------------------------------
   // Type resolution
   // ------------------------------------------------------------------
@@ -1149,98 +1183,105 @@ pub type Sema = class {
     // WP-15: Pattern matching
     } else if (k == SNK_MATCH) {
       // c0 = discriminant, c1 = cases (sn_next-linked)
-      self._checkExpr(self.sn_c0(ni));
+      var discrim: int64 := self.sn_c0(ni);
+      self._checkExpr(discrim);
       var mc: int64 := self.sn_c1(ni);
       var caseCount: int64 := 0;
+      var hasWildcard: int64 := 0;
       while (mc >= 0) {
-        // pattern (c0) and body (c1)
-        // For now, just check the body expression
         var patNode: int64 := self.sn_c0(mc);
         var bodyNode: int64 := self.sn_c1(mc);
-        
-        // WP-BC-11: check guard expression (c2 of case node)
         var guardNode: int64 := self.sn_c2(mc);
         if (guardNode >= 0) { self._checkExpr(guardNode); }
-
-        // WP-15: Check pattern type and validate
         var patKind: int64 := self.sn_kind(patNode);
-        // WP-BC-11: or-pattern — recurse on both sides
         if (patKind == SNK_PATTERN_OR) {
           var lp: int64 := self.sn_c0(patNode);
           var rp: int64 := self.sn_c1(patNode);
           if (lp >= 0) { self._checkExpr(lp); }
           if (rp >= 0) { self._checkExpr(rp); }
-        } else if (patKind == SNK_PATTERN_LIT) {
-          // Literal pattern - ok
         } else if (patKind == SNK_PATTERN_WILD) {
-          // Wildcard pattern - ok
+          hasWildcard := 1;
         } else if (patKind == SNK_PATTERN_BIND) {
-          // Binding pattern (x @ pattern) - check inner pattern
           var innerPat: int64 := self.sn_c0(patNode);
           if (innerPat >= 0) { self._checkStmt(innerPat); }
+          hasWildcard := 1;  // binding pattern covers all values
         } else if (patKind == SNK_PATTERN_ENUM) {
-          // WP-15: Enum payload pattern - validate variant name
           var variantName: pchar := self.sn_sVal(patNode);
           var variantLen: int64 := self.sn_sLen(patNode);
-          // Verify variant exists in the discriminant's enum type
-          // Lookup the variant name in the symbol table
           var variantSym: int64 := self.Lookup(variantName, variantLen);
           if (variantSym >= 0) {
-            var varSymKind: int64 := self.SymKind(variantSym);
-            if (varSymKind != SYM_CON) {
-              self._errorNode("enum pattern: not a valid enum variant", patNode);
+            if (self.SymKind(variantSym) != SYM_CON) {
+              self._errorNode("enum pattern: not a valid enum variant"c, patNode);
             }
           } else {
-            self._errorNode("enum pattern: variant not found", patNode);
+            self._errorNode("enum pattern: variant not found"c, patNode);
           }
         } else if (patKind == SNK_PATTERN_STRUCT) {
-          // WP-15: Struct destructure pattern - validate field patterns
           var structTypeName: pchar := self.sn_sVal(patNode);
           var structTypeLen: int64 := self.sn_sLen(patNode);
-          // Verify struct type exists
           var structSym: int64 := self.Lookup(structTypeName, structTypeLen);
           if (structSym >= 0) {
             var structSymKind: int64 := self.SymKind(structSym);
-            if (structSymKind != SYM_STRUCT && structSymKind != SYM_CLASS) {
-              self._errorNode("struct pattern: not a struct or class type", patNode);
+            if (structSymKind != SYM_STRUCT && structSymKind != SYM_TYPE) {
+              self._errorNode("struct pattern: not a struct type"c, patNode);
             }
           } else {
-            self._errorNode("struct pattern: type not found", patNode);
+            self._errorNode("struct pattern: type not found"c, patNode);
           }
-          // Validate field patterns (c0 = first field pattern)
           var fieldPat: int64 := self.sn_c0(patNode);
-          while (fieldPat >= 0) {
-            self._checkStmt(fieldPat);
-            fieldPat := self.sn_next(fieldPat);
-          }
+          while (fieldPat >= 0) { self._checkStmt(fieldPat); fieldPat := self.sn_next(fieldPat); }
         }
-        // WP-15: Exhaustiveness check - compare matched type with case patterns
-        // Check if there's a wildcard or if we have exhaustive coverage
-        var hasWildcard: int64 := 0;
-        var hasBind: int64 := 0;
-        var mc2: int64 := self.sn_c1(ni);  // first case
-        while (mc2 >= 0) {
-          var patNode2: int64 := self.sn_c0(mc2);
-          var patKind2: int64 := self.sn_kind(patNode2);
-          if (patKind2 == SNK_PATTERN_WILD) { hasWildcard := 1; }
-          else if (patKind2 == SNK_PATTERN_BIND) { hasBind := 1; }
-          mc2 := self.sn_next(mc2);
-        }
-        // If no wildcard, no binding pattern, and no exhaustive coverage, warn
-        if (hasWildcard == 0 && hasBind == 0) {
-          // For enum types, we could check all variants are covered
-          // For now, just emit a warning (not an error, to allow partial matches)
-          // Note: Full exhaustiveness checking requires enum variant analysis
-          // which would need additional data structures
-        }
-        
         self._checkStmt(bodyNode);
         caseCount := caseCount + 1;
         mc := self.sn_next(mc);
       }
-      // WP-15: Stub - could add exhaustiveness warning here
-      if (caseCount == 0) {
-        self._errorNode("match expression has no cases", ni);
+      if (caseCount == 0) { self._errorNode("match expression has no cases"c, ni); }
+
+      // WP-2.2-A: Exhaustiveness check for enum discriminants.
+      // Only triggered when the discriminant is an identifier of enum type
+      // and no wildcard/binding case was found.
+      if (hasWildcard == 0 && self.sn_kind(discrim) == SNK_IDENT) {
+        var enumDecl: int64 := self._findEnumDeclForIdent(discrim);
+        if (enumDecl >= 0) {
+          // Walk every declared enum member and verify coverage
+          var mem: int64 := self.sn_c0(enumDecl);
+          while (mem >= 0) {
+            var mName: pchar := self.sn_sVal(mem);
+            var mLen:  int64 := self.sn_sLen(mem);
+            var covered: int64 := 0;
+            var mc3: int64 := self.sn_c1(ni);
+            while (mc3 >= 0 && covered == 0) {
+              var pat3: int64 := self.sn_c0(mc3);
+              var pk3: int64 := self.sn_kind(pat3);
+              if (pk3 == SNK_PATTERN_ENUM || pk3 == SNK_PATTERN_LIT) {
+                if (self._strNEq(self.sn_sVal(pat3), self.sn_sLen(pat3), mName, mLen) != 0) {
+                  covered := 1;
+                }
+              } else if (pk3 == SNK_PATTERN_OR) {
+                // Or-pattern: check both sides
+                var lp3: int64 := self.sn_c0(pat3);
+                var rp3: int64 := self.sn_c1(pat3);
+                if (lp3 >= 0 && self._strNEq(self.sn_sVal(lp3), self.sn_sLen(lp3), mName, mLen) != 0) { covered := 1; }
+                if (rp3 >= 0 && self._strNEq(self.sn_sVal(rp3), self.sn_sLen(rp3), mName, mLen) != 0) { covered := 1; }
+              }
+              mc3 := self.sn_next(mc3);
+            }
+            if (covered == 0) {
+              // Report error with variant name included
+              var tokIdx: int64 := self.sn_tokIdx(ni);
+              var line: int64 := 0;
+              if (tokIdx >= 0 && tokIdx < self.pTokCount) { line := self.sn_tokLine(tokIdx); }
+              PrintStr("sema error (line "c);
+              PrintInt(line);
+              PrintStr("): match does not cover variant '"c);
+              self._printSrcName(mName, mLen);
+              PrintStr("' — add a case or a wildcard _ => { ... }\n"c);
+              self.hadError   := 1;
+              self.errorCount := self.errorCount + 1;
+            }
+            mem := self.sn_next(mem);
+          }
+        }
       }
     } else if (k == SNK_MATCH_CASE) {
       // c0 = pattern, c1 = body
