@@ -172,7 +172,7 @@ Backend → Frontend:
 | Phase | Inhalt | WPs |
 |-------|--------|-----|
 | 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 ✅ |
-| 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 (PG-03, PG-04 ✅) |
+| 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
@@ -353,7 +353,7 @@ möglichen Backend-Antworten korrekt parsen.
 
 ---
 
-### WP-PG-05: Result-Set Accessoren ⬜
+### WP-PG-05: Result-Set Accessoren ✅
 
 **Ziel:** Ergonomische Funktionen zum Traversieren und Lesen von Abfrageergebnissen.
 

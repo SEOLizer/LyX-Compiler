@@ -1295,7 +1295,82 @@ pub fn PGQuery(conn: int64, sql: pchar): int64 {
   return 0;
 }
 
-// Basic result accessors (full set in WP-PG-05)
+// ============================================================================
+// WP-PG-05: Result-Set Accessoren
+// ============================================================================
+
+// PostgreSQL OID-Konstanten (häufige Typen)
+pub con PG_OID_BOOL:      int64 := 16;
+pub con PG_OID_BYTEA:     int64 := 17;
+pub con PG_OID_INT8:      int64 := 20;
+pub con PG_OID_INT2:      int64 := 21;
+pub con PG_OID_INT4:      int64 := 23;
+pub con PG_OID_TEXT:      int64 := 25;
+pub con PG_OID_FLOAT4:    int64 := 700;
+pub con PG_OID_FLOAT8:    int64 := 701;
+pub con PG_OID_VARCHAR:   int64 := 1043;
+pub con PG_OID_DATE:      int64 := 1082;
+pub con PG_OID_TIMESTAMP: int64 := 1114;
+pub con PG_OID_NUMERIC:   int64 := 1700;
+
+// --- Internal helpers ---
+
+// Returns pointer to PGRow at rowIdx, or 0 if out of bounds
+fn pgGetRow(result: int64, rowIdx: int64): int64 {
+  if (rowIdx < 0) { return 0; }
+  var rowCount: int64 := peek64(result + PGRESULT_ROW_COUNT);
+  if (rowIdx >= rowCount) { return 0; }
+  return peek64(peek64(result + PGRESULT_ROWS) + rowIdx * 8);
+}
+
+// Parses signed decimal integer from NUL/non-digit terminated string
+fn pgParseSignedInt(s: int64): int64 {
+  if (s == 0) { return 0; }
+  var c: int64 := peek8(s) & 0xFF;
+  if (c == 45) { return 0 - pgParseInt(s + 1); }  // '-'
+  return pgParseInt(s);
+}
+
+// Parses f64 from decimal string, handles sign and fractional part.
+// Uses integer accumulation to avoid 0.0-x negation bug.
+fn pgParseFloat(s: int64): f64 {
+  if (s == 0) { return 0 as f64; }
+  var i: int64 := 0;
+  var neg: int64 := 0;
+  var c: int64 := peek8(s) & 0xFF;
+  if (c == 45) { neg := 1; i := i + 1; }  // '-'
+
+  // Accumulate all significant digits as one integer + decimal count
+  var combined: int64 := 0;
+  var decimals: int64 := 0;
+  var inFrac: int64 := 0;
+  while (true) {
+    c := peek8(s + i) & 0xFF;
+    if (c == 46 && inFrac == 0) {
+      inFrac := 1;
+      i := i + 1;
+    } else if (c >= 48 && c <= 57) {
+      combined := combined * 10 + (c - 48);
+      if (inFrac != 0) { decimals := decimals + 1; }
+      i := i + 1;
+    } else {
+      break;
+    }
+  }
+
+  // Apply sign in integer space to avoid the 0.0-x f64 bug
+  if (neg != 0) { combined := 0 - combined; }
+
+  var result: f64 := combined as f64;
+  var j: int64 := 0;
+  while (j < decimals) {
+    result := result / (10 as f64);
+    j := j + 1;
+  }
+  return result;
+}
+
+// --- Public accessors (WP-PG-04 basics kept here) ---
 
 pub fn PGNumRows(result: int64): int64 {
   if (result == 0) { return 0; }
@@ -1310,6 +1385,89 @@ pub fn PGNumFields(result: int64): int64 {
 pub fn PGAffectedRows(result: int64): int64 {
   if (result == 0) { return 0; }
   return peek64(result + PGRESULT_AFFECTED_ROWS);
+}
+
+// Advances cursor to next row. Returns 1 if a row is available, 0 if exhausted.
+// PGRESULT_CURRENT_ROW is the "next to fetch" index (starts at 0).
+// After a successful call, accessors read at current_row-1.
+pub fn PGFetchRow(result: int64): int64 {
+  if (result == 0) { return 0; }
+  var cur: int64 := peek64(result + PGRESULT_CURRENT_ROW);
+  var cnt: int64 := peek64(result + PGRESULT_ROW_COUNT);
+  if (cur >= cnt) { return 0; }
+  poke64(result + PGRESULT_CURRENT_ROW, cur + 1);
+  return 1;
+}
+
+// Returns column value as NUL-terminated string, or 0 for NULL/out-of-bounds.
+pub fn PGGetStr(result: int64, col: int64): pchar {
+  if (result == 0) { return 0 as pchar; }
+  var rowIdx: int64 := peek64(result + PGRESULT_CURRENT_ROW) - 1;
+  var row: int64 := pgGetRow(result, rowIdx);
+  if (row == 0) { return 0 as pchar; }
+  var count: int64 := peek64(row + PGROW_COUNT);
+  if (col < 0 || col >= count) { return 0 as pchar; }
+  if (peek64(peek64(row + PGROW_IS_NULL) + col * 8) != 0) { return 0 as pchar; }
+  return peek64(peek64(row + PGROW_VALUES) + col * 8) as pchar;
+}
+
+// Returns column value parsed as int64 (text → int64).
+pub fn PGGetInt(result: int64, col: int64): int64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0; }
+  return pgParseSignedInt(s as int64);
+}
+
+// Returns column value parsed as f64 (text → f64).
+pub fn PGGetFloat(result: int64, col: int64): f64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0 as f64; }
+  return pgParseFloat(s as int64);
+}
+
+// Returns column value as bool: "t", "T", "true", "1" → 1; else → 0.
+pub fn PGGetBool(result: int64, col: int64): int64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0; }
+  var c0: int64 := peek8(s as int64) & 0xFF;
+  if (c0 == 116) { return 1; }  // 't'
+  if (c0 == 84)  { return 1; }  // 'T'
+  if (c0 == 49)  { return 1; }  // '1'
+  return 0;
+}
+
+// Returns 1 if the value at (row, col) is NULL, 0 otherwise.
+// Uses explicit row index (not cursor-based).
+pub fn PGIsNull(result: int64, row: int64, col: int64): int64 {
+  if (result == 0) { return 1; }
+  var rowPtr: int64 := pgGetRow(result, row);
+  if (rowPtr == 0) { return 1; }
+  var count: int64 := peek64(rowPtr + PGROW_COUNT);
+  if (col < 0 || col >= count) { return 1; }
+  return peek64(peek64(rowPtr + PGROW_IS_NULL) + col * 8) != 0;
+}
+
+// Returns field name for column col, or 0 if out of bounds.
+pub fn PGGetFieldName(result: int64, col: int64): pchar {
+  if (result == 0) { return 0 as pchar; }
+  var fc: int64 := peek64(result + PGRESULT_FIELD_COUNT);
+  if (col < 0 || col >= fc) { return 0 as pchar; }
+  return peek64(peek64(result + PGRESULT_FIELDS) + col * PGFIELD_SZ + PGFIELD_NAME) as pchar;
+}
+
+// Returns PostgreSQL type OID for column col (e.g. 23 = int4, 25 = text).
+pub fn PGGetFieldTypeOid(result: int64, col: int64): int64 {
+  if (result == 0) { return 0; }
+  var fc: int64 := peek64(result + PGRESULT_FIELD_COUNT);
+  if (col < 0 || col >= fc) { return 0; }
+  return peek64(peek64(result + PGRESULT_FIELDS) + col * PGFIELD_SZ + PGFIELD_TYPE_OID);
+}
+
+// Positions cursor so next PGFetchRow returns row `row`.
+pub fn PGDataSeek(result: int64, row: int64) {
+  if (result == 0) { return; }
+  if (row < 0) { poke64(result + PGRESULT_CURRENT_ROW, 0); return; }
+  poke64(result + PGRESULT_CURRENT_ROW, row);
 }
 
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
