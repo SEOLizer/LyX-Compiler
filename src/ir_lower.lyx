@@ -130,6 +130,7 @@ pub con NK_TYPE_RINGBUF:    int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 pub con NK_TYPE_PARALLEL:   int64 := 93;  // WP-BC-18: parallel Array<T> type node
 pub con NK_SIMD_NEW:        int64 := 94;  // WP-BC-18: parallel Array<T>(size) expression
 pub con NK_FOR_C:           int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
+pub con NK_FOR_RANGE:       int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
 
 // ============================================================================
 // IRLower Class
@@ -1150,6 +1151,9 @@ pub type IRLower = class {
     else if (k == NK_FOR) {
       self.lowerRangeFor(stmt);
     }
+    else if (k == NK_FOR_RANGE) {
+      self.lowerCallRange(stmt);
+    }
     else if (k == NK_FOR_C) {
       self.lowerFor(stmt);
     }
@@ -1454,6 +1458,62 @@ pub type IRLower = class {
 
     self.loopExitLabel := savedExit;
     self.loopContLabel := savedCont;
+  }
+
+  // WP-1.1-A: for i in range(start, stop) — stop is exclusive (IRO_CMP_LT)
+  fn lowerCallRange(stmt: int64) {
+    var varSlot: int64 := self.allocTemp();
+    if self.localNameCnt >= self.localNameCap {
+      var crNewCap: int64 := self.localNameCap * 2;
+      var crNb: int64 := mmap(0, crNewCap * 24, 3, 34, -1, 0);
+      var crI: int64 := 0;
+      while crI < self.localNameCnt * 24 {
+        poke8(crNb + crI, peek8(self.localNameBuf + crI));
+        crI := crI + 1;
+      }
+      self.localNameBuf := crNb;
+      self.localNameCap := crNewCap;
+    }
+    var crRec: int64 := self.localNameBuf + self.localNameCnt * 24;
+    poke64(crRec +  0, peek64(self.nodeOff(stmt) + 64));
+    poke64(crRec +  8, self.nodeSLen(stmt));
+    poke64(crRec + 16, varSlot);
+    self.localNameCnt := self.localNameCnt + 1;
+
+    var crStart: int64 := self.lowerExpr(self.nodeC0(stmt));
+    self.irAddInstrDirect(IRO_STORE_LOCAL, varSlot, crStart, -1, 0);
+
+    var crLoop: int64 := self.genLabel();
+    var crCont: int64 := self.genLabel();
+    var crExit: int64 := self.genLabel();
+    var crSavedExit: int64 := self.loopExitLabel;
+    var crSavedCont: int64 := self.loopContLabel;
+    self.loopExitLabel := crExit;
+    self.loopContLabel := crCont;
+
+    self.irEmitLabel(crLoop);
+    var crVar: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, crVar, varSlot, -1, 0);
+    var crLimit: int64 := self.lowerExpr(self.nodeC1(stmt));
+    var crCond: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_LT, crCond, crVar, crLimit, 0);
+    self.irEmitBrFalse(crCond, crExit);
+
+    if (self.nodeC2(stmt) >= 0) { self.lowerBlock(self.nodeC2(stmt)); }
+
+    self.irEmitLabel(crCont);
+    var crCur: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, crCur, varSlot, -1, 0);
+    var crOne: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, crOne, -1, -1, 1);
+    var crNext: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, crNext, crCur, crOne, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, varSlot, crNext, -1, 0);
+    self.irEmitJmp(crLoop);
+
+    self.irEmitLabel(crExit);
+    self.loopExitLabel := crSavedExit;
+    self.loopContLabel := crSavedCont;
   }
 
   fn lowerFor(stmt: int64) {

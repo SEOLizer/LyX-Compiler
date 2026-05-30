@@ -102,6 +102,8 @@ pub con NK_AT_IF:        int64 := 103; // WP-CS-01: @if/@else bedingte Kompilier
 pub con NK_AT_DIRECTIVE: int64 := 104; // WP-CS-01: @io_check/@overflow_check; iv=kind(0=io_check,1=overflow_check), c0=value(0=false,1=true)
 pub con NK_AT_ENERGY:    int64 := 105; // WP-EN-02: @energy(N) — iv=level(1-5)
 pub con NK_DEFER:        int64 := 106; // WP-AS-07: defer Stmt; c0=deferred statement
+pub con NK_FOR_RANGE:    int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
+                                        //   sOff/sLen=var, c0=start, c1=stop(excl), c2=body
 pub con ANNO_ENERGY_SHIFT: int64 := 8; // WP-EN-02: Bits 8-10 in iVal von NK_FUNC_DECL
 
 // WP-AS-11: NK_PARAM flag — bit 0 of iv signals a const-qualified parameter
@@ -116,6 +118,7 @@ pub con AT_DIR_OPT_LEVEL:    int64 := 4; // @optimization_level(0..3)
 
 // WP-AS-16: NK_VAR_DECL flag — bit 0 of iv signals a volatile variable
 pub con VAR_FLAG_VOLATILE: int64 := 1; // NK_VAR_DECL.iv bit 0: hardware-register / memory-mapped I/O
+pub con VAR_FLAG_WRAPS:    int64 := 2; // WP-1.1-A: NK_VAR_DECL.iv bit 1: wraps overflow semantics
 pub con NK_REPEAT_UNTIL:   int64 := 77;  // WP-BC-04: repeat { body } until (cond)
 pub con NK_TUPLE_VAR_DECL: int64 := 78;  // WP-BC-05: var a, b := fn()
 pub con NK_MAP_LIT:        int64 := 79;  // WP-BC-06: { key: val, ... }
@@ -412,6 +415,12 @@ pub type Parser = class {
     }
     if peek8(s + len) != 0 { return 0; }
     return 1;
+  }
+
+  // WP-1.1-A: central soft-keyword test — token at tokIdx must be TK_IDENT matching keyword.
+  fn _isSoftKw(tokIdx: int64, keyword: pchar): int64 {
+    if (self.TokKind(tokIdx) != TK_IDENT) { return 0; }
+    return self._tokTextEq(tokIdx, keyword);
   }
 
   // WP-AND-02 Phase B: map an annotation identifier (after '@') to its flag bit.
@@ -1364,7 +1373,7 @@ pub type Parser = class {
     if (k == TK_LBRACE) { return self.ParseBlock(); }
 
     // WP-AS-08: defer <Stmt> — soft-keyword via TK_IDENT
-    if (k == TK_IDENT && self._tokTextEq(self.cur, "defer"c) != 0) {
+    if (k == TK_IDENT && self._isSoftKw(self.cur, "defer"c) != 0) {
       self.Advance();  // consume "defer"
       var inner: int64 := self.ParseStmt();
       var n: int64 := self._alloc(NK_DEFER, ti);
@@ -1452,6 +1461,33 @@ pub type Parser = class {
     self.Advance();
     var varTok: int64 := self.cur;
     self.Expect(TK_IDENT);
+
+    // WP-1.1-A: for i in range([start,] stop) { }
+    if (self.Check(TK_IN) != 0 && self._isSoftKw(self.cur + 1, "range"c) != 0) {
+      self.Advance();  // consume 'in'
+      self.Advance();  // consume 'range'
+      self.Expect(TK_LPAREN);
+      var arg0: int64 := self.ParseExpr();
+      var arg1: int64 := -1;
+      if (self.Match(TK_COMMA) != 0) { arg1 := self.ParseExpr(); }
+      self.Expect(TK_RPAREN);
+      self.Match(TK_DO);
+      var body: int64 := self.ParseBlock();
+      var rn: int64 := self._alloc(NK_FOR_RANGE, ti);
+      self._ssv(rn, self._tokOff(varTok), self._tokLen(varTok));
+      if (arg1 >= 0) {
+        self._sc0(rn, arg0);   // explicit start
+        self._sc1(rn, arg1);   // explicit stop (exclusive)
+      } else {
+        var zero: int64 := self._alloc(NK_LIT_INT, ti);
+        self._siv(zero, 0);
+        self._sc0(rn, zero);   // start = 0
+        self._sc1(rn, arg0);   // stop = n (exclusive)
+      }
+      self._sc2(rn, body);
+      return rn;
+    }
+
     self.Expect(TK_ASSIGN);
     var initExpr: int64 := self.ParseExpr();
 
@@ -1744,7 +1780,14 @@ pub type Parser = class {
     var n: int64 := self._alloc(NK_VAR_DECL, ti);
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
-    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_COLON) != 0) {
+      self._sc0(n, self.ParseType());
+      // WP-1.1-A: 'wraps' soft-keyword after type for overflow-wrapping semantics
+      if (self._isSoftKw(self.cur, "wraps"c) != 0) {
+        self.Advance();
+        self._siv(n, self.NIVal(n) | VAR_FLAG_WRAPS);
+      }
+    }
     if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
     else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
     self.Match(TK_SEMI);
@@ -1760,7 +1803,13 @@ pub type Parser = class {
     var n: int64 := self._alloc(NK_VAR_DECL, ti);
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
-    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_COLON) != 0) {
+      self._sc0(n, self.ParseType());
+      if (self._isSoftKw(self.cur, "wraps"c) != 0) {
+        self.Advance();
+        self._siv(n, self.NIVal(n) | VAR_FLAG_WRAPS);
+      }
+    }
     if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
     else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
     self.Match(TK_SEMI);
@@ -1779,7 +1828,13 @@ pub type Parser = class {
     var n: int64 := self._alloc(NK_VAR_DECL, ti);
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
-    if (self.Match(TK_COLON) != 0) { self._sc0(n, self.ParseType()); }
+    if (self.Match(TK_COLON) != 0) {
+      self._sc0(n, self.ParseType());
+      if (self._isSoftKw(self.cur, "wraps"c) != 0) {
+        self.Advance();
+        self._siv(n, self.NIVal(n) | VAR_FLAG_WRAPS);
+      }
+    }
     if (self.Match(TK_ASSIGN) != 0) { self._sc1(n, self.ParseExpr()); }
     else if (self.Match(TK_EQ1) != 0) { self._sc1(n, self.ParseExpr()); }
     self.Match(TK_SEMI);
@@ -2867,6 +2922,7 @@ pub type Parser = class {
     if (k == NK_MAP_ENTRY)      { return "MAP_ENTRY"; }
     if (k == NK_FOR)         { return "FOR"; }
     if (k == NK_FOR_C)       { return "FOR_C"; }
+    if (k == NK_FOR_RANGE)   { return "FOR_RANGE"; }
     if (k == NK_AT_IF)       { return "AT_IF"; }
     if (k == NK_AT_DIRECTIVE){ return "AT_DIRECTIVE"; }
     if (k == NK_AT_ENERGY)   { return "AT_ENERGY"; }
