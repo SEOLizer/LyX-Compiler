@@ -1470,6 +1470,329 @@ pub fn PGDataSeek(result: int64, row: int64) {
   poke64(result + PGRESULT_CURRENT_ROW, row);
 }
 
+// ============================================================================
+// WP-PG-06: Extended Query Protocol (Prepared Statements)
+// ============================================================================
+
+pub con PG_MSG_CLOSE_DONE: int64 := 51;   // '3' — CloseComplete
+pub con PG_MSG_PARAM_DESC: int64 := 116;  // 't' — ParameterDescription
+
+// PGStmt layout (6 × int64 = 48 bytes)
+con PGSTMT_SZ:           int64 := 48;
+con PGSTMT_NAME:         int64 := 0;    // pchar — heap copy of stmt name
+con PGSTMT_SQL:          int64 := 8;    // pchar — heap copy of SQL
+con PGSTMT_PARAM_COUNT:  int64 := 16;   // int64 — number of bound params
+con PGSTMT_PARAMS:       int64 := 24;   // int64 — pointer to PGParam* array
+con PGSTMT_PARAMS_ALLOC: int64 := 32;   // int64 — allocated param slots
+con PGSTMT_CONN:         int64 := 40;   // int64 — back-reference to PGConn
+
+// PGParam layout (3 × int64 = 24 bytes) — populated by WP-PG-07 bind functions
+pub con PGPARAM_SZ:       int64 := 24;
+pub con PGPARAM_TEXT_VAL: int64 := 0;   // int64 — pchar, heap-allocated text
+pub con PGPARAM_LEN:      int64 := 8;   // int64 — byte length (excl. NUL)
+pub con PGPARAM_IS_NULL:  int64 := 16;  // int64 — 1=NULL, 0=value
+
+fn pgStmtNew(conn: int64, name: pchar, sql: pchar): int64 {
+  var s: int64 := mmap(0, PGSTMT_SZ, 3, 34, -1, 0);
+  poke64(s + PGSTMT_NAME, pgDupStr(name));
+  poke64(s + PGSTMT_SQL,  pgDupStr(sql));
+  poke64(s + PGSTMT_CONN, conn);
+  return s;
+}
+
+// Clears all bound params and frees their memory
+pub fn PGStmtReset(stmt: int64) {
+  if (stmt == 0) { return; }
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var count:  int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  var i: int64 := 0;
+  while (i < count) {
+    var p: int64 := peek64(params + i * 8);
+    if (p != 0) {
+      var tv: int64 := peek64(p + PGPARAM_TEXT_VAL);
+      var tl: int64 := peek64(p + PGPARAM_LEN);
+      if (tv != 0 && tl > 0) { munmap(tv, tl + 1); }
+      munmap(p, PGPARAM_SZ);
+    }
+    i := i + 1;
+  }
+  poke64(stmt + PGSTMT_PARAM_COUNT, 0);
+}
+
+// Frees client-side PGStmt memory (call after PGStmtClose)
+pub fn PGStmtFree(stmt: int64) {
+  if (stmt == 0) { return; }
+  PGStmtReset(stmt);
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var alloc:  int64 := peek64(stmt + PGSTMT_PARAMS_ALLOC);
+  if (params != 0 && alloc > 0) { munmap(params, alloc * 8); }
+  pgFreeStr(peek64(stmt + PGSTMT_NAME));
+  pgFreeStr(peek64(stmt + PGSTMT_SQL));
+  munmap(stmt, PGSTMT_SZ);
+}
+
+// Sends Parse + Sync, returns PGStmt* or 0 on error
+pub fn PGStmtPrepare(conn: int64, name: pchar, sql: pchar): int64 {
+  if (conn == 0) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) {
+    pgConnSetError(conn, PG_ERR_CONNECT, "not connected"c);
+    return 0;
+  }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Build Parse payload: name\0 + sql\0 + numParams(0)
+  pgBufReset(b);
+  pgBufAppendStr(b, name);
+  pgBufAppendStr(b, sql);
+  pgBufAppend16BE(b, 0);  // 0 param type hints — server infers
+  if (pgSendMsgBuf(fd, PG_FE_PARSE, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send parse failed"c);
+    return 0;
+  }
+  if (pgSendMsg(fd, PG_FE_SYNC, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send sync failed"c);
+    return 0;
+  }
+
+  var stmt:     int64 := pgStmtNew(conn, name, sql);
+  var hadError: int64 := 0;
+  var r:        int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed in prepare"c);
+      pgFreeRecv(r);
+      PGStmtFree(stmt);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_PARSE_DONE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      hadError := 1;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      if (hadError != 0) { PGStmtFree(stmt); return 0; }
+      return stmt;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  PGStmtFree(stmt);
+  return 0;
+}
+
+// Builds Bind message payload into b from stmt's param array
+fn pgBuildBindPayload(b: int64, stmtName: int64, paramCount: int64, params: int64) {
+  pgBufAppend8(b, 0);                    // empty portal name (NUL only)
+  pgBufAppendStr(b, stmtName as pchar);  // stmt name + NUL
+  pgBufAppend16BE(b, 0);                 // 0 format codes — all text
+  pgBufAppend16BE(b, paramCount);
+  var i: int64 := 0;
+  while (i < paramCount) {
+    var p: int64 := 0;
+    if (params != 0) { p := peek64(params + i * 8); }
+    if (p != 0 && peek64(p + PGPARAM_IS_NULL) == 0) {
+      var tl: int64 := peek64(p + PGPARAM_LEN);
+      pgBufAppend32BE(b, tl);
+      pgBufAppendBytes(b, peek64(p + PGPARAM_TEXT_VAL), tl);
+    } else {
+      pgBufAppend32BE(b, 4294967295);  // NULL (-1 as uint32)
+    }
+    i := i + 1;
+  }
+  pgBufAppend16BE(b, 0);  // 0 result format codes — all text
+}
+
+// Sends Bind + Execute + Sync, parses response, returns PGResult or 0 on error
+pub fn PGStmtExecute(conn: int64, stmt: int64): int64 {
+  if (conn == 0 || stmt == 0) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) {
+    pgConnSetError(conn, PG_ERR_CONNECT, "not connected"c);
+    return 0;
+  }
+
+  var fd:         int64 := peek64(conn + PGCONN_FD);
+  var b:          int64 := pgConnMsgBuf(conn);
+  var namePtr:    int64 := peek64(stmt + PGSTMT_NAME);
+  var paramCount: int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  var params:     int64 := peek64(stmt + PGSTMT_PARAMS);
+
+  // Send Bind
+  pgBufReset(b);
+  pgBuildBindPayload(b, namePtr, paramCount, params);
+  if (pgSendMsgBuf(fd, PG_FE_BIND, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send bind failed"c);
+    return 0;
+  }
+
+  // Send Execute: empty portal + maxRows=0
+  pgBufReset(b);
+  pgBufAppend8(b, 0);
+  pgBufAppend32BE(b, 0);
+  if (pgSendMsgBuf(fd, PG_FE_EXECUTE, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send execute failed"c);
+    return 0;
+  }
+
+  // Send Sync
+  if (pgSendMsg(fd, PG_FE_SYNC, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send sync failed"c);
+    return 0;
+  }
+
+  var result:   int64 := pgResultNew();
+  var hadError: int64 := 0;
+  var r:        int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed in execute"c);
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_BIND_DONE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ROW_DESC) {
+      pgParseRowDescription(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_DATA_ROW) {
+      pgParseDataRow(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_CMD_COMPLETE) {
+      pgParseCommandTag(result, payload);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_EMPTY_QUERY) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      hadError := 1;
+    } else if (msgType == PG_MSG_NOTICE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      if (hadError != 0) { PGFreeResult(result); return 0; }
+      return result;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Sends Close (statement) + Sync, drains until ReadyForQuery
+pub fn PGStmtClose(conn: int64, name: pchar) {
+  if (conn == 0) { return; }
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) { return; }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Close payload: 'S' + name\0
+  pgBufReset(b);
+  pgBufAppend8(b, 83);  // 'S' — statement (not portal)
+  pgBufAppendStr(b, name);
+  pgSendMsgBuf(fd, PG_FE_CLOSE, b);
+  pgSendMsg(fd, PG_FE_SYNC, 0, 0);
+
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return; }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      return;
+    }
+    if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+    }
+    pgFreeRecvMsg(r);
+  }
+  pgFreeRecv(r);
+}
+
+// Describes a prepared statement, returns PGResult with field metadata (0 rows)
+pub fn PGStmtDescribe(conn: int64, name: pchar): int64 {
+  if (conn == 0) { return 0; }
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) { return 0; }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Describe payload: 'S' + name\0
+  pgBufReset(b);
+  pgBufAppend8(b, 83);  // 'S' — statement
+  pgBufAppendStr(b, name);
+  pgSendMsgBuf(fd, PG_FE_DESCRIBE, b);
+  pgSendMsg(fd, PG_FE_SYNC, 0, 0);
+
+  var result: int64 := pgResultNew();
+  var r:      int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_PARAM_DESC) {
+      pgFreeRecvMsg(r);  // skip — param OIDs not needed here
+    } else if (msgType == PG_MSG_ROW_DESC) {
+      pgParseRowDescription(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_NO_DATA) {
+      pgFreeRecvMsg(r);  // non-SELECT statement — no result columns
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      return result;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return 0;
+}
+
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
 pub fn PGPing(conn: int64): int64 {
   if (conn == 0) { return 0; }
