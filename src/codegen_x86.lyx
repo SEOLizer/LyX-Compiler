@@ -178,7 +178,8 @@ con CGN_TYPE_DECL: int64 := 10;   // NK_TYPE_DECL from parser
 con CGN_FIELD_DECL:int64 := 7;    // NK_FIELD_DECL from parser
 con CG_CLASS_SZ:   int64 := 56;   // className(8)+classLen(8)+fieldsPtr(8)+fieldCnt(8)+vmtDataOff(8)+vmtSlotCount(8)+vmtMethodListPtr(8)
 con CG_VMT_METH_PATCH_SZ: int64 := 16;  // vmtDataSlotOff(8) + methodCodeStart(8)
-con CG_CFIELD_SZ:  int64 := 40;   // fieldName(8)+fieldLen(8)+fieldOffset(8)+typeNamePtr(8)+typeNameLen(8)
+con CG_CFIELD_SZ:  int64 := 48;   // fieldName(8)+fieldLen(8)+fieldOffset(8)+typeNamePtr(8)+typeNameLen(8)+flags(8)
+// flags at fb+40: bits 0=bigEndian, bits 8..15=typeWidth (1/2/4/8)
 con CG_VMT_PATCH_SZ: int64 := 24; // codeOff(8) + classNamePtr(8) + classNameLen(8)
 
 // WP-12: Exception handling globals pre-reserved at start of data section
@@ -1934,6 +1935,56 @@ pub type Codegen = class {
     return -1;
   }
 
+  // WP-4.1-B: return fb+40 flags for a named field: bit0=bigEndian, bits8..15=typeWidth.
+  // Returns 0 if field not found or not big_endian.
+  fn cg_getFieldBigEndian(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + 16);
+    var cnt:  int64 := peek64(base + 24);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar   := peek64(fb) as pchar;
+      var n: int64   := peek64(fb + 8);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        return peek64(fb + 40);
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // WP-4.1-B: emit BSWAP/XCHG on rax after loading a big_endian field (load result in rax).
+  fn cg_emitBswapRax(typeWidth: int64) {
+    if (typeWidth == 2) {
+      // XCHG al, ah: 86 C4
+      self.cg_e8(0x86); self.cg_e8(0xC4);
+      // movzx rax, ax: 48 0F B7 C0 (zero-extend to 64 bits)
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);
+    } else if (typeWidth == 4) {
+      // BSWAP eax: 0F C8 (zeroes upper 32 bits of rax)
+      self.cg_e8(0x0F); self.cg_e8(0xC8);
+    } else {
+      // BSWAP rax: 48 0F C8
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xC8);
+    }
+  }
+
+  // WP-4.1-B: emit BSWAP/XCHG on rsi before storing a big_endian field (value in rsi).
+  fn cg_emitBswapRsi(typeWidth: int64) {
+    if (typeWidth == 2) {
+      // ROL si, 8: 66 C1 C6 08
+      self.cg_e8(0x66); self.cg_e8(0xC1); self.cg_e8(0xC6); self.cg_e8(8);
+    } else if (typeWidth == 4) {
+      // BSWAP esi: 0F CE
+      self.cg_e8(0x0F); self.cg_e8(0xCE);
+    } else {
+      // BSWAP rsi: 48 0F CE
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xCE);
+    }
+  }
+
   fn cg_buildClassLayout(ni: int64) {
     var className: pchar := self.cg_nsval(ni);
     var classLen:  int64 := self.cg_nslen(ni);
@@ -1961,6 +2012,10 @@ pub type Codegen = class {
         poke64(fb + 24, 0);
         poke64(fb + 32, 0);
       }
+      // WP-4.1-B: store big_endian flag + type width at fb+40
+      var beFlag: int64 := (self.cg_nival(tmp) >> 1) & 1;  // bit 1 of field iVal
+      var tWidth: int64 := self.cg_typeSize(ftypeNode);
+      poke64(fb + 40, beFlag | (tWidth << 8));
       offset := offset + 8;
       i := i + 1;
       tmp := self.cg_nnext(tmp);
@@ -2122,6 +2177,10 @@ pub type Codegen = class {
         poke64(fb + 24, 0);
         poke64(fb + 32, 0);
       }
+      // WP-4.1-B: store big_endian flag + type width at fb+40
+      var beFlag2: int64 := (self.cg_nival(tmp) >> 1) & 1;
+      var tWidth2: int64 := self.cg_typeSize(ftypeNode);
+      poke64(fb + 40, beFlag2 | (tWidth2 << 8));
       // WP-4.1-A: field stride
       if (isPacked != 0) {
         offset := offset + self.cg_typeSize(ftypeNode);
@@ -2479,6 +2538,14 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(foff);
     } else {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(foff);
+    }
+    // WP-4.1-B: emit BSWAP after load for @big_endian fields
+    if (foff >= 0 && classIdx >= 0) {
+      var beInfo: int64 := self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen);
+      if ((beInfo & 1) != 0) {
+        var tWidth: int64 := (beInfo >> 8) & 0xFF;
+        self.cg_emitBswapRax(tWidth);
+      }
     }
   }
 
@@ -4904,6 +4971,15 @@ pub type Codegen = class {
         var foff: int64 := -1;
         if (classIdx >= 0) { foff := self.cg_getFieldOffset(classIdx, fieldName, fieldLen); }
         self.cg_popRsi();
+        // WP-4.1-B: emit BSWAP on rsi before storing @big_endian fields
+        var beInfo2: int64 := 0;
+        if (classIdx >= 0 && foff >= 0) {
+          beInfo2 := self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen);
+          if ((beInfo2 & 1) != 0) {
+            var tWidth3: int64 := (beInfo2 >> 8) & 0xFF;
+            self.cg_emitBswapRsi(tWidth3);
+          }
+        }
         if (foff == 0) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x30);
         } else if (foff > 0 && foff <= 127) {
