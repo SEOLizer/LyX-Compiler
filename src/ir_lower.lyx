@@ -130,6 +130,7 @@ pub con NK_TYPE_RINGBUF:    int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 pub con NK_TYPE_PARALLEL:   int64 := 93;  // WP-BC-18: parallel Array<T> type node
 pub con NK_SIMD_NEW:        int64 := 94;  // WP-BC-18: parallel Array<T>(size) expression
 pub con NK_FOR_C:           int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
+pub con NK_DEFER:           int64 := 106; // WP-2.2-B: defer Stmt; c0=deferred statement
 pub con NK_FOR_RANGE:       int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
 
 // ============================================================================
@@ -201,6 +202,15 @@ pub type IRLower = class {
   typeArgs: int64;           // current type arguments for generic instantiation
   typeArgCount: int64;
 
+  // WP-2.2-B: Defer scope stack
+  // Flat buffer of deferred statement node indices — block-scoped LIFO.
+  // Records: {stmtNodeIdx: int64} = 8 bytes each.
+  // On block entry: save deferCount. On block exit: emit LIFO from saved..deferCount-1, restore.
+  // On return: emit ALL entries LIFO (entire stack), then jump.
+  deferBuf:   int64;
+  deferCount: int64;
+  deferCap:   int64;
+
   // WP-2.1: Generic monomorphization support
   // Override function name used by _addFunc when lowering a specialization
   overrideFuncName:    pchar;   // non-null = use this name in _addFunc
@@ -248,6 +258,10 @@ pub type IRLower = class {
     self.typeArgs := 0;
     self.typeArgCount := 0;
     self.funcInstrStart := 0;
+    // WP-2.2-B: defer stack
+    self.deferCap   := 32;
+    self.deferBuf   := mmap(0, 32 * 8, 3, 34, -1, 0);
+    self.deferCount := 0;
     // WP-2.1: generics
     self.overrideFuncName    := 0;
     self.overrideFuncNameLen := 0;
@@ -1185,8 +1199,24 @@ pub type IRLower = class {
     else if (k == NK_FOR_C) {
       self.lowerFor(stmt);
     }
-    else if (k == NK_RETURN) { 
-      self.lowerReturn(stmt); 
+    else if (k == NK_RETURN) {
+      self.lowerReturn(stmt);
+    }
+    else if (k == NK_DEFER) {
+      // WP-2.2-B: push the deferred statement onto the scope stack
+      var inner: int64 := self.nodeC0(stmt);
+      if (inner >= 0) {
+        if (self.deferCount >= self.deferCap) {
+          var dc: int64 := self.deferCap * 2;
+          var db: int64 := mmap(0, dc * 8, 3, 34, -1, 0);
+          var di: int64 := 0;
+          while (di < self.deferCount * 8) { poke8(db + di, peek8(self.deferBuf + di)); di := di + 1; }
+          munmap(self.deferBuf, self.deferCap * 8);
+          self.deferBuf := db; self.deferCap := dc;
+        }
+        poke64(self.deferBuf + self.deferCount * 8, inner);
+        self.deferCount := self.deferCount + 1;
+      }
     }
     else if (k == NK_EXPR_STMT) { 
       var expr: int64 := self.nodeC0(stmt); 
@@ -1269,12 +1299,27 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerBlock(block: int64) {
+    // WP-2.2-B: save the defer-stack depth for this scope
+    var scopeStart: int64 := self.deferCount;
     var stmt: int64 := self.nodeC0(block);
-    if (stmt < 0) { return; }
+    if (stmt < 0) {
+      // empty block — still need to restore scope (no defers to emit)
+      self.deferCount := scopeStart;
+      return;
+    }
     while (stmt >= 0) {
       self.lowerStmt(stmt);
       stmt := self.nodeNext(stmt);
     }
+    // WP-2.2-B: emit this block's deferred stmts in LIFO order (normal exit path)
+    var di: int64 := self.deferCount - 1;
+    while (di >= scopeStart) {
+      var defNode: int64 := peek64(self.deferBuf + di * 8);
+      self.lowerStmt(defNode);
+      di := di - 1;
+    }
+    // Pop this scope's entries from the stack
+    self.deferCount := scopeStart;
   }
   
   // ------------------------------------------------------------------
@@ -1602,13 +1647,18 @@ pub type IRLower = class {
   
   fn lowerReturn(stmt: int64) {
     var retVal: int64 := self.nodeC0(stmt);
-    if (retVal >= 0) { 
+    if (retVal >= 0) {
       var retTemp: int64 := self.lowerExpr(retVal);
-      // Emit: store retTemp to retValTemp (local variable)
       self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, 0);
     }
-    
-    // Emit: goto funcExit
+    // WP-2.2-B: on early return, emit ALL accumulated deferred stmts (entire stack)
+    // in LIFO order — covers all enclosing scopes up to the function boundary.
+    var ri: int64 := self.deferCount - 1;
+    while (ri >= 0) {
+      var defNode: int64 := peek64(self.deferBuf + ri * 8);
+      self.lowerStmt(defNode);
+      ri := ri - 1;
+    }
     self.irEmitJmp(self.funcExitLabel);
   }
   
