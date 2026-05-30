@@ -1,0 +1,176 @@
+// tests/pg_08_test.lyx — WP-PG-08: Transaktionen & Savepoints
+//
+// Offline:
+//   1. PGInTransaction(0) = 0, PGTxFailed(0) = 0
+//
+// Live (PostgreSQL localhost:5432 trust/md5):
+//   2. BEGIN + 100 INSERTs + COMMIT → COUNT(*) = 100
+//   3. BEGIN + INSERT + ROLLBACK → Daten nicht in DB
+//   4. BEGIN + INSERT + SAVEPOINT + INSERT + ROLLBACK TO → nur erste Row, TX offen
+//   5. PGTxFailed nach Constraint-Verletzung = 1, ROLLBACK erholt TX
+//   6. PGBeginReadOnly blockiert schreibende Queries
+//   7. PGInTransaction / PGTxFailed korrekte Statusanzeige
+
+import std.db.postgres;
+
+fn testOffline(): int64 {
+  if (PGInTransaction(0) != 0) { PrintStr("FAIL: PGInTransaction(0)\n"); return 1; }
+  if (PGTxFailed(0) != 0)      { PrintStr("FAIL: PGTxFailed(0)\n");      return 1; }
+  PrintStr("OK: PGInTransaction/PGTxFailed on null safe\n");
+  return 0;
+}
+
+fn testLive(): int64 {
+  var probe: int64 := pgProbe("127.0.0.1"c, 5432, "postgres"c, "postgres"c);
+  if (probe == 0) { PrintStr("SKIP: PostgreSQL not available\n"); return 0; }
+
+  var conn: int64 := PGConnect("127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+  if (conn == 0) { PrintStr("SKIP: TCP error\n"); return 0; }
+  if (PGIsConnected(conn) == 0) {
+    if (PGErrno(conn) == PG_ERR_PROTO) { PrintStr("SKIP: unsupported auth (need trust/md5)\n"); }
+    else { PrintStr("SKIP: not connected\n"); }
+    PGClose(conn); return 0;
+  }
+
+  // Setup
+  var r0: int64 := PGQuery(conn, "DROP TABLE IF EXISTS pg08_bulk"c);
+  if (r0 != 0) { PGFreeResult(r0); }
+  var r0b: int64 := PGQuery(conn, "DROP TABLE IF EXISTS pg08_uniq"c);
+  if (r0b != 0) { PGFreeResult(r0b); }
+
+  var rC1: int64 := PGQuery(conn, "CREATE TABLE pg08_bulk (id INT, val TEXT)"c);
+  if (rC1 == 0) { PrintStr("FAIL: CREATE pg08_bulk\n"); PGClose(conn); return 1; }
+  PGFreeResult(rC1);
+
+  var rC2: int64 := PGQuery(conn, "CREATE TABLE pg08_uniq (id INT UNIQUE)"c);
+  if (rC2 == 0) { PrintStr("FAIL: CREATE pg08_uniq\n"); PGClose(conn); return 1; }
+  PGFreeResult(rC2);
+
+  // --- 2. BEGIN + 100 INSERTs + COMMIT ---
+  if (PGBegin(conn) == 0) { PrintStr("FAIL: PGBegin\n"); PGClose(conn); return 1; }
+  if (PGInTransaction(conn) == 0) { PrintStr("FAIL: PGInTransaction after BEGIN\n"); PGClose(conn); return 1; }
+
+  var stmt: int64 := PGStmtPrepare(conn, "ins_bulk"c, "INSERT INTO pg08_bulk VALUES ($1,$2)"c);
+  if (stmt == 0) { PrintStr("FAIL: prepare ins_bulk\n"); PGClose(conn); return 1; }
+
+  var i: int64 := 0;
+  while (i < 100) {
+    PGStmtReset(stmt);
+    PGBindInt(stmt, 0, i);
+    PGBindStr(stmt, 1, "row"c);
+    var rb: int64 := PGStmtExecute(conn, stmt);
+    if (rb == 0) { PrintStr("FAIL: bulk insert\n"); PGStmtFree(stmt); PGClose(conn); return 1; }
+    PGFreeResult(rb);
+    i := i + 1;
+  }
+
+  if (PGCommit(conn) == 0) { PrintStr("FAIL: PGCommit\n"); PGStmtFree(stmt); PGClose(conn); return 1; }
+  if (PGInTransaction(conn) != 0) { PrintStr("FAIL: still in TX after COMMIT\n"); PGStmtFree(stmt); PGClose(conn); return 1; }
+
+  PGStmtClose(conn, "ins_bulk"c);
+  PGStmtFree(stmt);
+
+  var rCnt: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg08_bulk"c);
+  if (rCnt == 0) { PrintStr("FAIL: COUNT query\n"); PGClose(conn); return 1; }
+  PGFetchRow(rCnt);
+  var cnt: int64 := PGGetInt(rCnt, 0);
+  PGFreeResult(rCnt);
+  if (cnt != 100) { PrintStr("FAIL: bulk COUNT != 100, got "); PrintInt(cnt); PrintStr("\n"); PGClose(conn); return 1; }
+  PrintStr("OK: BEGIN + 100 INSERTs + COMMIT = 100 rows\n");
+
+  // --- 3. BEGIN + INSERT + ROLLBACK → keine Daten ---
+  if (PGBegin(conn) == 0) { PrintStr("FAIL: BEGIN for rollback\n"); PGClose(conn); return 1; }
+  var rIns: int64 := PGQuery(conn, "INSERT INTO pg08_bulk VALUES (999,'rollback_me')"c);
+  if (rIns == 0) { PrintStr("FAIL: INSERT before rollback\n"); PGClose(conn); return 1; }
+  PGFreeResult(rIns);
+  if (PGRollback(conn) == 0) { PrintStr("FAIL: PGRollback\n"); PGClose(conn); return 1; }
+
+  var rChk: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg08_bulk WHERE id=999"c);
+  if (rChk == 0) { PrintStr("FAIL: COUNT after rollback\n"); PGClose(conn); return 1; }
+  PGFetchRow(rChk);
+  var chk: int64 := PGGetInt(rChk, 0);
+  PGFreeResult(rChk);
+  if (chk != 0) { PrintStr("FAIL: rolled-back row still present\n"); PGClose(conn); return 1; }
+  PrintStr("OK: PGRollback — rolled-back data absent\n");
+
+  // --- 4. SAVEPOINT: INSERT + SP + INSERT + ROLLBACK TO SP ---
+  if (PGBegin(conn) == 0) { PrintStr("FAIL: BEGIN for savepoint\n"); PGClose(conn); return 1; }
+
+  var rA: int64 := PGQuery(conn, "INSERT INTO pg08_bulk VALUES (200,'keep')"c);
+  if (rA == 0) { PrintStr("FAIL: INSERT before savepoint\n"); PGClose(conn); return 1; }
+  PGFreeResult(rA);
+
+  if (PGSavepoint(conn, "sp1"c) == 0) { PrintStr("FAIL: PGSavepoint\n"); PGClose(conn); return 1; }
+
+  var rB: int64 := PGQuery(conn, "INSERT INTO pg08_bulk VALUES (201,'discard')"c);
+  if (rB == 0) { PrintStr("FAIL: INSERT after savepoint\n"); PGClose(conn); return 1; }
+  PGFreeResult(rB);
+
+  if (PGRollbackTo(conn, "sp1"c) == 0) { PrintStr("FAIL: PGRollbackTo\n"); PGClose(conn); return 1; }
+  if (PGInTransaction(conn) == 0) { PrintStr("FAIL: TX closed after RollbackTo\n"); PGClose(conn); return 1; }
+
+  if (PGCommit(conn) == 0) { PrintStr("FAIL: COMMIT after RollbackTo\n"); PGClose(conn); return 1; }
+
+  var rSP: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg08_bulk WHERE id IN (200,201)"c);
+  if (rSP == 0) { PrintStr("FAIL: savepoint verify query\n"); PGClose(conn); return 1; }
+  PGFetchRow(rSP);
+  var spCnt: int64 := PGGetInt(rSP, 0);
+  PGFreeResult(rSP);
+  if (spCnt != 1) {
+    PrintStr("FAIL: savepoint — expected 1 row, got "); PrintInt(spCnt); PrintStr("\n");
+    PGClose(conn); return 1;
+  }
+  PrintStr("OK: SAVEPOINT + ROLLBACK TO — 1 kept, 1 discarded, TX survived\n");
+
+  // --- 5. PGTxFailed nach Constraint-Verletzung ---
+  if (PGBegin(conn) == 0) { PrintStr("FAIL: BEGIN for constraint\n"); PGClose(conn); return 1; }
+  var rU1: int64 := PGQuery(conn, "INSERT INTO pg08_uniq VALUES (42)"c);
+  if (rU1 == 0) { PrintStr("FAIL: first unique insert\n"); PGClose(conn); return 1; }
+  PGFreeResult(rU1);
+
+  var rU2: int64 := PGQuery(conn, "INSERT INTO pg08_uniq VALUES (42)"c);
+  // This should fail with duplicate key violation
+  if (rU2 != 0) {
+    PrintStr("FAIL: duplicate insert should return 0\n");
+    PGFreeResult(rU2); PGClose(conn); return 1;
+  }
+  if (PGTxFailed(conn) == 0) {
+    PrintStr("FAIL: PGTxFailed should be 1 after constraint violation\n");
+    PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGTxFailed = 1 after constraint violation\n");
+
+  if (PGRollback(conn) == 0) { PrintStr("FAIL: ROLLBACK after tx error\n"); PGClose(conn); return 1; }
+  if (PGTxFailed(conn) != 0) { PrintStr("FAIL: PGTxFailed still 1 after ROLLBACK\n"); PGClose(conn); return 1; }
+  if (PGInTransaction(conn) != 0) { PrintStr("FAIL: still in TX after ROLLBACK\n"); PGClose(conn); return 1; }
+  PrintStr("OK: ROLLBACK recovers from failed TX\n");
+
+  // --- 6. PGBeginReadOnly blockiert Writes ---
+  if (PGBeginReadOnly(conn) == 0) { PrintStr("FAIL: PGBeginReadOnly\n"); PGClose(conn); return 1; }
+  var rWrite: int64 := PGQuery(conn, "INSERT INTO pg08_bulk VALUES (999,'readonly')"c);
+  if (rWrite != 0) {
+    PrintStr("FAIL: write in READ ONLY TX should fail\n");
+    PGFreeResult(rWrite); PGRollback(conn); PGClose(conn); return 1;
+  }
+  PGRollback(conn);
+  PrintStr("OK: PGBeginReadOnly blocks writes\n");
+
+  // Cleanup
+  var rD1: int64 := PGQuery(conn, "DROP TABLE pg08_bulk"c);
+  if (rD1 != 0) { PGFreeResult(rD1); }
+  var rD2: int64 := PGQuery(conn, "DROP TABLE pg08_uniq"c);
+  if (rD2 != 0) { PGFreeResult(rD2); }
+
+  PGClose(conn);
+  PrintStr("OK: PGClose\n");
+  return 0;
+}
+
+pub fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testOffline();
+  failed := failed + testLive();
+  if (failed != 0) { PrintStr("FAILED\n"); return 1; }
+  PrintStr("ALL PASSED\n");
+  return 0;
+}
