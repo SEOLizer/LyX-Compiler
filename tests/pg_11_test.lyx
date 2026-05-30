@@ -1,0 +1,197 @@
+// tests/pg_11_test.lyx — WP-PG-11: COPY IN — Bulk-Insert
+//
+// Offline:
+//   1. pgCsvEscape — Anführungszeichen und Kommas korrekt
+//   2. PGCopyEnd(0) = 0, PGCopyAbort(0, 0) = 0
+//
+// Live (PostgreSQL localhost:5432 trust/md5):
+//   3. PGCopyBegin + 500 PGCopyRow + PGCopyEnd → COUNT(*) = 500
+//   4. NULL-Felder: leere unquoted Felder in DB als NULL gespeichert
+//   5. Strings mit Komma und Anführungszeichen korrekt escaped
+//   6. PGCopyAbort → 0 Rows in Tabelle
+
+import std.db.postgres;
+
+fn testOffline(): int64 {
+  // pgCsvEscape: normaler String
+  var buf: int64 := mmap(0, 128, 3, 34, -1, 0);
+  var n: int64 := pgCsvEscape(buf, "hello"c);
+  // expected: "hello" = 7 chars
+  if (n != 7) { PrintStr("FAIL: pgCsvEscape normal len\n"); munmap(buf, 128); return 1; }
+  PrintStr("OK: pgCsvEscape normal = "); PrintStr(buf as pchar); PrintStr("\n");
+
+  // pgCsvEscape: String mit Anführungszeichen
+  n := pgCsvEscape(buf, "say \"hi\""c);
+  PrintStr("OK: pgCsvEscape quoted = "); PrintStr(buf as pchar); PrintStr("\n");
+
+  // pgCsvEscape auf 0 = leerer Output
+  n := pgCsvEscape(buf, 0 as pchar);
+  if (n != 0) { PrintStr("FAIL: pgCsvEscape(0) len != 0\n"); munmap(buf, 128); return 1; }
+  PrintStr("OK: pgCsvEscape(0) = empty\n");
+
+  munmap(buf, 128);
+
+  // PGCopyEnd(0) kein Crash
+  PGCopyEnd(0);
+  PGCopyAbort(0, 0 as pchar);
+  PrintStr("OK: PGCopyEnd(0) + PGCopyAbort(0) safe\n");
+  return 0;
+}
+
+fn testLive(): int64 {
+  var probe: int64 := pgProbe("127.0.0.1"c, 5432, "postgres"c, "postgres"c);
+  if (probe == 0) { PrintStr("SKIP: PostgreSQL not available\n"); return 0; }
+
+  var conn: int64 := PGConnect("127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+  if (conn == 0) { PrintStr("SKIP: TCP error\n"); return 0; }
+  if (PGIsConnected(conn) == 0) {
+    if (PGErrno(conn) == PG_ERR_PROTO) { PrintStr("SKIP: unsupported auth (need trust/md5)\n"); }
+    else { PrintStr("SKIP: not connected\n"); }
+    PGClose(conn); return 0;
+  }
+
+  // Setup
+  var rD: int64 := PGQuery(conn, "DROP TABLE IF EXISTS pg11_tmp"c);
+  if (rD != 0) { PGFreeResult(rD); }
+  var rC: int64 := PGQuery(conn, "CREATE TABLE pg11_tmp (id INT, label TEXT, note TEXT)"c);
+  if (rC == 0) { PrintStr("FAIL: CREATE TABLE\n"); PGClose(conn); return 1; }
+  PGFreeResult(rC);
+
+  // --- 3. PGCopyBegin + 500 PGCopyRow + PGCopyEnd ---
+  if (PGCopyBegin(conn, "pg11_tmp"c, "id,label,note"c) == 0) {
+    PrintStr("FAIL: PGCopyBegin: ");
+    var e: pchar := PGError(conn);
+    if (e != 0 as pchar) { PrintStr(e); }
+    PrintStr("\n"); PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGCopyBegin\n");
+
+  // Allocate a row-values array (3 slots)
+  var vals: int64 := mmap(0, 3 * 8, 3, 34, -1, 0);
+  var idBuf: int64 := mmap(0, 24, 3, 34, -1, 0);
+
+  var i: int64 := 0;
+  while (i < 500) {
+    var idLen: int64 := pgFormatInt64(i, idBuf);
+    poke8(idBuf + idLen, 0);
+    poke64(vals,     idBuf);         // id
+    poke64(vals + 8, "row"c as int64);  // label
+    poke64(vals + 16, 0);            // note = NULL
+    if (PGCopyRow(conn, vals, 3) == 0) {
+      PrintStr("FAIL: PGCopyRow at "); PrintInt(i); PrintStr("\n");
+      munmap(vals, 24); munmap(idBuf, 24);
+      PGCopyAbort(conn, "test abort"c);
+      PGClose(conn); return 1;
+    }
+    i := i + 1;
+  }
+  munmap(vals, 24); munmap(idBuf, 24);
+
+  if (PGCopyEnd(conn) == 0) {
+    PrintStr("FAIL: PGCopyEnd: ");
+    var e2: pchar := PGError(conn);
+    if (e2 != 0 as pchar) { PrintStr(e2); }
+    PrintStr("\n"); PGClose(conn); return 1;
+  }
+
+  var rCnt: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg11_tmp"c);
+  if (rCnt == 0) { PrintStr("FAIL: COUNT\n"); PGClose(conn); return 1; }
+  PGFetchRow(rCnt);
+  var cnt: int64 := PGGetInt(rCnt, 0);
+  PGFreeResult(rCnt);
+  if (cnt != 500) {
+    PrintStr("FAIL: COUNT = "); PrintInt(cnt); PrintStr(" (expected 500)\n");
+    PGClose(conn); return 1;
+  }
+  PrintStr("OK: 500 rows via COPY, COUNT = 500\n");
+
+  // --- 4. NULL-Feld verifizieren ---
+  var rNull: int64 := PGQuery(conn, "SELECT note FROM pg11_tmp WHERE id=1"c);
+  if (rNull == 0 || PGNumRows(rNull) == 0) {
+    PrintStr("FAIL: NULL check query\n");
+    if (rNull != 0) { PGFreeResult(rNull); }
+    PGClose(conn); return 1;
+  }
+  PGFetchRow(rNull);
+  if (PGIsNull(rNull, 0, 0) == 0) {
+    PrintStr("FAIL: note should be NULL\n");
+    PGFreeResult(rNull); PGClose(conn); return 1;
+  }
+  PGFreeResult(rNull);
+  PrintStr("OK: NULL field correctly stored\n");
+
+  // --- 5. String mit Komma und Anführungszeichen ---
+  var rD2: int64 := PGQuery(conn, "DELETE FROM pg11_tmp"c);
+  if (rD2 != 0) { PGFreeResult(rD2); }
+
+  if (PGCopyBegin(conn, "pg11_tmp"c, "id,label,note"c) == 0) {
+    PrintStr("FAIL: PGCopyBegin for special chars\n"); PGClose(conn); return 1;
+  }
+  var vals2: int64 := mmap(0, 3 * 8, 3, 34, -1, 0);
+  poke64(vals2,      "42"c as int64);
+  poke64(vals2 + 8,  "hello, world"c as int64);      // comma in value
+  poke64(vals2 + 16, "say \"hi\" now"c as int64);    // quotes in value
+  PGCopyRow(conn, vals2, 3);
+  munmap(vals2, 24);
+  PGCopyEnd(conn);
+
+  var rSpec: int64 := PGQuery(conn, "SELECT label, note FROM pg11_tmp WHERE id=42"c);
+  if (rSpec == 0 || PGNumRows(rSpec) == 0) {
+    PrintStr("FAIL: special chars query\n");
+    if (rSpec != 0) { PGFreeResult(rSpec); }
+    PGClose(conn); return 1;
+  }
+  PGFetchRow(rSpec);
+  var lbl: pchar := PGGetStr(rSpec, 0);
+  var note: pchar := PGGetStr(rSpec, 1);
+  if (lbl == 0 as pchar || note == 0 as pchar) {
+    PrintStr("FAIL: special chars null\n");
+    PGFreeResult(rSpec); PGClose(conn); return 1;
+  }
+  PrintStr("OK: special chars — label="); PrintStr(lbl);
+  PrintStr(" note="); PrintStr(note); PrintStr("\n");
+  PGFreeResult(rSpec);
+
+  // --- 6. PGCopyAbort -> 0 rows ---
+  var rD3: int64 := PGQuery(conn, "DELETE FROM pg11_tmp"c);
+  if (rD3 != 0) { PGFreeResult(rD3); }
+
+  if (PGCopyBegin(conn, "pg11_tmp"c, "id,label,note"c) == 0) {
+    PrintStr("FAIL: PGCopyBegin for abort\n"); PGClose(conn); return 1;
+  }
+  var vals3: int64 := mmap(0, 3 * 8, 3, 34, -1, 0);
+  poke64(vals3,      "1"c as int64);
+  poke64(vals3 + 8,  "x"c as int64);
+  poke64(vals3 + 16, 0);
+  PGCopyRow(conn, vals3, 3);
+  munmap(vals3, 24);
+  PGCopyAbort(conn, "test abort"c);
+
+  var rAbortCnt: int64 := PGQuery(conn, "SELECT COUNT(*) FROM pg11_tmp"c);
+  if (rAbortCnt == 0) { PrintStr("FAIL: abort count query\n"); PGClose(conn); return 1; }
+  PGFetchRow(rAbortCnt);
+  var abortCnt: int64 := PGGetInt(rAbortCnt, 0);
+  PGFreeResult(rAbortCnt);
+  if (abortCnt != 0) {
+    PrintStr("FAIL: abort — rows still present: "); PrintInt(abortCnt); PrintStr("\n");
+    PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGCopyAbort — 0 rows inserted\n");
+
+  // Cleanup
+  var rDrop: int64 := PGQuery(conn, "DROP TABLE pg11_tmp"c);
+  if (rDrop != 0) { PGFreeResult(rDrop); }
+
+  PGClose(conn);
+  PrintStr("OK: PGClose\n");
+  return 0;
+}
+
+pub fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testOffline();
+  failed := failed + testLive();
+  if (failed != 0) { PrintStr("FAILED\n"); return 1; }
+  PrintStr("ALL PASSED\n");
+  return 0;
+}

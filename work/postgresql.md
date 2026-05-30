@@ -175,7 +175,7 @@ Backend → Frontend:
 | 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 ✅ |
-| 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 (PG-10 ✅) |
+| 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 ✅ |
 | 6 | Demos & Integrationstests | PG-12 |
 
 ---
@@ -578,7 +578,7 @@ ob ein `A`-Frame vorangestellt war.
 
 ---
 
-### WP-PG-11: COPY IN — Bulk-Insert ⬜
+### WP-PG-11: COPY IN — Bulk-Insert ✅
 
 **Ziel:** Das PostgreSQL COPY-Protokoll für hochperformante Masseneinfügungen
 implementieren.
