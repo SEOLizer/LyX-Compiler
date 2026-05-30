@@ -175,7 +175,7 @@ Backend → Frontend:
 | 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 ✅ |
-| 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
+| 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 (PG-10 ✅) |
 | 6 | Demos & Integrationstests | PG-12 |
 
 ---
@@ -543,7 +543,7 @@ Connection-Pool für mehrere gleichzeitige Verbindungen.
 
 ---
 
-### WP-PG-10: LISTEN / NOTIFY ⬜
+### WP-PG-10: LISTEN / NOTIFY ✅
 
 **Ziel:** Asynchrone Pub/Sub-Benachrichtigungen über PostgreSQL-Channels implementieren.
 
