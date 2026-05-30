@@ -174,7 +174,7 @@ Backend → Frontend:
 | 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 ✅ |
 | 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
-| 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 |
+| 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 (PG-08 ✅) |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
 | 6 | Demos & Integrationstests | PG-12 |
 
@@ -475,7 +475,7 @@ separaten WP ergänzt werden.
 
 ---
 
-### WP-PG-08: Transaktionen & Savepoints ⬜
+### WP-PG-08: Transaktionen & Savepoints ✅
 
 **Ziel:** Vollständige Transaktionsverwaltung inkl. Savepoints für verschachtelte
 Transaktionen.
