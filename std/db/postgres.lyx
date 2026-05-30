@@ -2206,6 +2206,169 @@ pub fn PGPoolRelease(pg: int64, conn: int64) {
   }
 }
 
+// ============================================================================
+// WP-PG-10: LISTEN / NOTIFY
+// ============================================================================
+
+extern fn sys_select(nfds: int64, readfds: pchar, writefds: pchar, exceptfds: pchar, timeout: pchar): int64;
+
+// PGNotification layout (3 x int64 = 24 bytes)
+con PGNOTIF_SZ:      int64 := 24;
+con PGNOTIF_PID:     int64 := 0;   // int64 — backend PID that sent the notify
+con PGNOTIF_CHANNEL: int64 := 8;   // int64 — pchar, heap-allocated channel name
+con PGNOTIF_PAYLOAD: int64 := 16;  // int64 — pchar, heap-allocated payload string
+
+// Returns 1 if fd has readable data (non-blocking poll via select timeout=0)
+fn pgSocketReadable(fd: int64): int64 {
+  var fds: int64 := mmap(0, 128, 3, 34, -1, 0);
+  var byteIdx: int64 := fd / 8;
+  var bitIdx:  int64 := fd - byteIdx * 8;
+  poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
+  var tv: int64 := mmap(0, 16, 3, 34, -1, 0);  // {tv_sec=0, tv_usec=0}
+  var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
+  munmap(fds, 128);
+  munmap(tv, 16);
+  var result: int64 := 0;
+  if (n > 0) { result := 1; }
+  return result;
+}
+
+// Parses a NotificationResponse payload ('A') into a fresh PGNotification struct.
+// payload format: [pid: int32 BE][channel: cstring][payload: cstring]
+fn pgParseNotification(payload: int64, payLen: int64): int64 {
+  if (payLen < 5) { return 0; }
+  var pid: int64 := pgReadInt32BE(payload, 0);
+  var pos: int64 := 4;
+
+  var chanStart: int64 := pos;
+  while (pos < payLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+  var chanLen: int64 := pos - chanStart;
+  pos := pos + 1;
+
+  var pvStart: int64 := pos;
+  while (pos < payLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+  var pvLen: int64 := pos - pvStart;
+
+  var notif: int64 := mmap(0, PGNOTIF_SZ, 3, 34, -1, 0);
+  poke64(notif + PGNOTIF_PID, pid);
+
+  var chanBuf: int64 := mmap(0, chanLen + 1, 3, 34, -1, 0);
+  var i: int64 := 0;
+  while (i < chanLen) { poke8(chanBuf + i, peek8(payload + chanStart + i)); i := i + 1; }
+  poke8(chanBuf + chanLen, 0);
+  poke64(notif + PGNOTIF_CHANNEL, chanBuf);
+
+  var pvBuf: int64 := mmap(0, pvLen + 1, 3, 34, -1, 0);
+  i := 0;
+  while (i < pvLen) { poke8(pvBuf + i, peek8(payload + pvStart + i)); i := i + 1; }
+  poke8(pvBuf + pvLen, 0);
+  poke64(notif + PGNOTIF_PAYLOAD, pvBuf);
+
+  return notif;
+}
+
+// Tries to read one message from fd; returns PGNotification* if it is a NOTIFY, else 0.
+fn pgReadNotification(fd: int64): int64 {
+  var r: int64 := pgAllocRecv();
+  if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return 0; }
+  var msgType: int64 := pgRecvType(r);
+  var payload: int64 := pgRecvBuf(r);
+  var payLen:  int64 := pgRecvLen(r);
+  var notif: int64 := 0;
+  if (msgType == PG_MSG_NOTIFY) {
+    notif := pgParseNotification(payload, payLen);
+  }
+  pgFreeRecvMsg(r);
+  pgFreeRecv(r);
+  return notif;
+}
+
+// Subscribes to a PostgreSQL notification channel
+pub fn PGListen(conn: int64, channel: pchar): int64 {
+  return pgExecWithName(conn, "LISTEN"c, channel);
+}
+
+// Unsubscribes from a notification channel
+pub fn PGUnlisten(conn: int64, channel: pchar): int64 {
+  return pgExecWithName(conn, "UNLISTEN"c, channel);
+}
+
+// Sends a NOTIFY to a channel with an optional payload
+pub fn PGNotify(conn: int64, channel: pchar, payload: pchar): int64 {
+  if (conn == 0 || channel == 0 as pchar) { return 0; }
+  var plen: int64 := 0;
+  if (payload != 0 as pchar) { plen := pgStrLen(payload as int64); }
+  var esc: int64 := mmap(0, plen * 2 + 2, 3, 34, -1, 0);
+  var escLen: int64 := 0;
+  if (payload != 0 as pchar) { escLen := PGEscapeStr(esc, payload); }
+  poke8(esc + escLen, 0);
+  var sql: int64 := pgConcat5("NOTIFY "c, channel, ", '"c, esc as pchar, "'"c);
+  munmap(esc, plen * 2 + 2);
+  var r: int64 := PGQuery(conn, sql as pchar);
+  munmap(sql, pgStrLen(sql) + 1);
+  if (r == 0) { return 0; }
+  PGFreeResult(r);
+  return 1;
+}
+
+// Polls the socket non-blocking; returns PGNotification* if a NOTIFY is pending, else 0
+pub fn PGGetNotification(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  if (PGIsConnected(conn) == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  if (pgSocketReadable(fd) == 0) { return 0; }
+  return pgReadNotification(fd);
+}
+
+// Frees a PGNotification struct
+pub fn PGFreeNotification(notif: int64) {
+  if (notif == 0) { return; }
+  var ch: int64 := peek64(notif + PGNOTIF_CHANNEL);
+  if (ch != 0) { munmap(ch, pgStrLen(ch) + 1); }
+  var pv: int64 := peek64(notif + PGNOTIF_PAYLOAD);
+  if (pv != 0) { munmap(pv, pgStrLen(pv) + 1); }
+  munmap(notif, PGNOTIF_SZ);
+}
+
+// Blocks up to timeout_ms waiting for a notification; returns PGNotification* or 0
+pub fn PGWaitNotification(conn: int64, timeout_ms: int64): int64 {
+  if (conn == 0) { return 0; }
+  if (PGIsConnected(conn) == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+
+  var fds: int64 := mmap(0, 128, 3, 34, -1, 0);
+  var byteIdx: int64 := fd / 8;
+  var bitIdx:  int64 := fd - byteIdx * 8;
+  poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
+
+  var secs:  int64 := timeout_ms / 1000;
+  var usecs: int64 := (timeout_ms - secs * 1000) * 1000;
+  var tv: int64 := mmap(0, 16, 3, 34, -1, 0);
+  poke64(tv, secs);
+  poke64(tv + 8, usecs);
+
+  var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
+  munmap(fds, 128);
+  munmap(tv, 16);
+
+  if (n <= 0) { return 0; }
+  return pgReadNotification(fd);
+}
+
+// PGNotification accessors
+pub fn PGNotifPid(notif: int64): int64 {
+  if (notif == 0) { return 0; }
+  return peek64(notif + PGNOTIF_PID);
+}
+pub fn PGNotifChannel(notif: int64): pchar {
+  if (notif == 0) { return 0 as pchar; }
+  return peek64(notif + PGNOTIF_CHANNEL) as pchar;
+}
+pub fn PGNotifPayload(notif: int64): pchar {
+  if (notif == 0) { return 0 as pchar; }
+  return peek64(notif + PGNOTIF_PAYLOAD) as pchar;
+}
+
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
 pub fn PGPing(conn: int64): int64 {
   if (conn == 0) { return 0; }
