@@ -391,7 +391,7 @@ PG_OID_TIMESTAMP 1114 PG_OID_NUMERIC 1700  PG_OID_BYTEA  17
 
 ---
 
-### WP-PG-06: Extended Query Protocol (Prepared Statements) ⬜
+### WP-PG-06: Extended Query Protocol (Prepared Statements) ✅
 
 **Ziel:** Das Extended Query Protocol implementieren: Parse → Bind → Execute → Sync.
 
