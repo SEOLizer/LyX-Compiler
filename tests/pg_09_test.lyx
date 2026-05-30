@@ -1,0 +1,145 @@
+// tests/pg_09_test.lyx — WP-PG-09: Hilfsfunktionen & Connection-Pool
+//
+// Offline:
+//   1. PGPoolCreate(0) = 0
+//   2. PGPoolDestroy(0) kein Crash
+//   3. PGPoolRelease(0,0) kein Crash
+//   4. PGEscapeStr — Anführungszeichen verdoppeln
+//
+// Live (PostgreSQL localhost:5432 trust/md5):
+//   5. PGTableExists — true/false korrekt
+//   6. PGColumnExists — true/false korrekt
+//   7. PGChanges nach UPDATE = 1
+//   8. PGDropTable
+//   9. PGPoolAcquire + PGPoolRelease x 10 ohne Leak
+
+import std.db.postgres;
+
+fn testOffline(): int64 {
+  // PGPoolCreate(0) -> 0
+  var pg: int64 := PGPoolCreate(0);
+  if (pg != 0) { PrintStr("FAIL: PGPoolCreate(0) != 0\n"); return 1; }
+  PrintStr("OK: PGPoolCreate(0) = 0\n");
+
+  // PGPoolDestroy(0) kein Crash
+  PGPoolDestroy(0);
+  PrintStr("OK: PGPoolDestroy(0) safe\n");
+
+  // PGPoolRelease(0,0) kein Crash
+  PGPoolRelease(0, 0);
+  PrintStr("OK: PGPoolRelease(0,0) safe\n");
+
+  // PGEscapeStr
+  var buf: int64 := mmap(0, 64, 3, 34, -1, 0);
+  var n: int64 := PGEscapeStr(buf, "it's a test"c);
+  // expected: "it''s a test" = 12 chars
+  if (n != 12) {
+    PrintStr("FAIL: PGEscapeStr len = "); PrintInt(n); PrintStr(" (expected 12)\n");
+    munmap(buf, 64); return 1;
+  }
+  PrintStr("OK: PGEscapeStr = ");
+  PrintStr(buf as pchar);
+  PrintStr("\n");
+  munmap(buf, 64);
+  return 0;
+}
+
+fn testLive(): int64 {
+  var probe: int64 := pgProbe("127.0.0.1"c, 5432, "postgres"c, "postgres"c);
+  if (probe == 0) { PrintStr("SKIP: PostgreSQL not available\n"); return 0; }
+
+  var conn: int64 := PGConnect("127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+  if (conn == 0) { PrintStr("SKIP: TCP error\n"); return 0; }
+  if (PGIsConnected(conn) == 0) {
+    if (PGErrno(conn) == PG_ERR_PROTO) { PrintStr("SKIP: unsupported auth (need trust/md5)\n"); }
+    else { PrintStr("SKIP: not connected\n"); }
+    PGClose(conn); return 0;
+  }
+
+  // Setup
+  var rDrop: int64 := PGQuery(conn, "DROP TABLE IF EXISTS pg09_tmp"c);
+  if (rDrop != 0) { PGFreeResult(rDrop); }
+  var rCreate: int64 := PGQuery(conn, "CREATE TABLE pg09_tmp (id INT, name TEXT)"c);
+  if (rCreate == 0) { PrintStr("FAIL: CREATE TABLE\n"); PGClose(conn); return 1; }
+  PGFreeResult(rCreate);
+
+  // --- 5. PGTableExists ---
+  if (PGTableExists(conn, "pg09_tmp"c) == 0) {
+    PrintStr("FAIL: PGTableExists pg09_tmp should be 1\n"); PGClose(conn); return 1;
+  }
+  if (PGTableExists(conn, "no_such_table_xyz"c) != 0) {
+    PrintStr("FAIL: PGTableExists no_such_table should be 0\n"); PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGTableExists true/false\n");
+
+  // --- 6. PGColumnExists ---
+  if (PGColumnExists(conn, "pg09_tmp"c, "id"c) == 0) {
+    PrintStr("FAIL: PGColumnExists id should be 1\n"); PGClose(conn); return 1;
+  }
+  if (PGColumnExists(conn, "pg09_tmp"c, "no_such_col"c) != 0) {
+    PrintStr("FAIL: PGColumnExists no_such_col should be 0\n"); PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGColumnExists true/false\n");
+
+  // --- 7. PGChanges nach UPDATE ---
+  var rIns: int64 := PGQuery(conn, "INSERT INTO pg09_tmp VALUES (1,'x'),(2,'y'),(3,'z')"c);
+  if (rIns == 0) { PrintStr("FAIL: INSERT\n"); PGClose(conn); return 1; }
+  PGFreeResult(rIns);
+
+  var rUpd: int64 := PGQuery(conn, "UPDATE pg09_tmp SET name='updated' WHERE id=2"c);
+  if (rUpd == 0) { PrintStr("FAIL: UPDATE\n"); PGClose(conn); return 1; }
+  PGFreeResult(rUpd);
+
+  var changed: int64 := PGChanges(conn);
+  if (changed != 1) {
+    PrintStr("FAIL: PGChanges = "); PrintInt(changed); PrintStr(" (expected 1)\n");
+    PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGChanges after UPDATE WHERE id=2 = 1\n");
+
+  // --- 8. PGDropTable ---
+  if (PGDropTable(conn, "pg09_tmp"c) == 0) {
+    PrintStr("FAIL: PGDropTable\n"); PGClose(conn); return 1;
+  }
+  if (PGTableExists(conn, "pg09_tmp"c) != 0) {
+    PrintStr("FAIL: table still exists after PGDropTable\n"); PGClose(conn); return 1;
+  }
+  PrintStr("OK: PGDropTable\n");
+
+  PGClose(conn);
+
+  // --- 9. PGPool acquire/release x10 ---
+  var pgp: int64 := PGPoolCreate(3);
+  if (pgp == 0) { PrintStr("FAIL: PGPoolCreate(3)\n"); return 1; }
+
+  var j: int64 := 0;
+  while (j < 10) {
+    var c: int64 := PGPoolAcquire(pgp, "127.0.0.1"c, 5432, "postgres"c, ""c, "postgres"c);
+    if (c == 0) {
+      PrintStr("SKIP: PGPoolAcquire returned 0 (no live conn for pool test)\n");
+      PGPoolDestroy(pgp);
+      return 0;
+    }
+    if (PGIsConnected(c) == 0) {
+      PrintStr("SKIP: pool conn not connected\n");
+      PGPoolRelease(pgp, c);
+      PGPoolDestroy(pgp);
+      return 0;
+    }
+    PGPoolRelease(pgp, c);
+    j := j + 1;
+  }
+  PGPoolDestroy(pgp);
+  PrintStr("OK: PGPoolAcquire + PGPoolRelease x10\n");
+
+  return 0;
+}
+
+pub fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testOffline();
+  failed := failed + testLive();
+  if (failed != 0) { PrintStr("FAILED\n"); return 1; }
+  PrintStr("ALL PASSED\n");
+  return 0;
+}

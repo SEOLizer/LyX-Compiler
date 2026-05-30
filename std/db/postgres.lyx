@@ -615,21 +615,22 @@ fn pgFreeRecvMsg(r: int64) {
 //   + serverVersPtr(8) + errMsgPtr(8) + hostPtr(8) + port(8)
 //   + userPtr(8) + passwordPtr(8) + databasePtr(8) + msgBufPtr(8)
 
-con PGCONN_SZ:         int64 := 112;
+con PGCONN_SZ:         int64 := 120;
 con PGCONN_FD:         int64 := 0;
 con PGCONN_STATUS:     int64 := 8;
 con PGCONN_LASTERR:    int64 := 16;
 con PGCONN_PID:        int64 := 24;
 con PGCONN_SECRETKEY:  int64 := 32;
 con PGCONN_TXSTATUS:   int64 := 40;
-con PGCONN_SERVERVERS: int64 := 48;   // pchar to server_version string (heap)
-con PGCONN_ERRMSG:     int64 := 56;   // pchar to last error message (heap)
-con PGCONN_HOST:       int64 := 64;   // WP-PG-03: pchar to host string (heap copy)
-con PGCONN_PORT:       int64 := 72;   // WP-PG-03: port number
-con PGCONN_USER:       int64 := 80;   // WP-PG-03: pchar to user string (heap copy)
-con PGCONN_PASSWORD:   int64 := 88;   // WP-PG-03: pchar to password (heap copy, zeroed after auth)
-con PGCONN_DATABASE:   int64 := 96;   // WP-PG-03: pchar to database string (heap copy)
-con PGCONN_MSGBUF:     int64 := 104;  // WP-PG-03: reusable PGMsgBuf* for query sending
+con PGCONN_SERVERVERS: int64 := 48;
+con PGCONN_ERRMSG:     int64 := 56;
+con PGCONN_HOST:       int64 := 64;
+con PGCONN_PORT:       int64 := 72;
+con PGCONN_USER:       int64 := 80;
+con PGCONN_PASSWORD:   int64 := 88;
+con PGCONN_DATABASE:   int64 := 96;
+con PGCONN_MSGBUF:     int64 := 104;
+con PGCONN_CHANGES:    int64 := 112;  // WP-PG-09: affected rows of last command
 
 pub con PG_STATUS_DISCONNECTED: int64 := 0;
 pub con PG_STATUS_CONNECTED:    int64 := 1;
@@ -1261,6 +1262,7 @@ pub fn PGQuery(conn: int64, sql: pchar): int64 {
 
     } else if (msgType == PG_MSG_CMD_COMPLETE) {
       pgParseCommandTag(result, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(result + PGRESULT_AFFECTED_ROWS));
       pgFreeRecvMsg(r);
 
     } else if (msgType == PG_MSG_EMPTY_QUERY) {
@@ -1679,6 +1681,7 @@ pub fn PGStmtExecute(conn: int64, stmt: int64): int64 {
       pgFreeRecvMsg(r);
     } else if (msgType == PG_MSG_CMD_COMPLETE) {
       pgParseCommandTag(result, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(result + PGRESULT_AFFECTED_ROWS));
       pgFreeRecvMsg(r);
     } else if (msgType == PG_MSG_EMPTY_QUERY) {
       pgFreeRecvMsg(r);
@@ -1996,6 +1999,211 @@ pub fn PGTxFailed(conn: int64): int64 {
 pub fn PGSetAutoCommit(conn: int64, on: int64): int64 {
   if (conn == 0) { return 0; }
   return 1;
+}
+
+// ============================================================================
+// WP-PG-09: Hilfsfunktionen & Connection-Pool
+// ============================================================================
+
+// Returns affected rows from the last query on this connection
+pub fn PGChanges(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_CHANGES);
+}
+
+// Returns the last auto-generated sequence value in this session
+pub fn PGLastInsertId(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  var r: int64 := PGQuery(conn, "SELECT lastval()"c);
+  if (r == 0) { return 0; }
+  PGFetchRow(r);
+  var id: int64 := PGGetInt(r, 0);
+  PGFreeResult(r);
+  return id;
+}
+
+// Escapes src by doubling single-quotes (' → '') into dst. Returns char count (excl. NUL).
+pub fn PGEscapeStr(dst: int64, src: pchar): int64 {
+  if (src == 0 as pchar) { poke8(dst, 0); return 0; }
+  var i: int64 := 0;
+  var out: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(src as int64 + i) & 0xFF;
+    if (c == 0) { break; }
+    if (c == 39) { poke8(dst + out, 39); out := out + 1; }  // double the quote
+    poke8(dst + out, c); out := out + 1;
+    i := i + 1;
+  }
+  poke8(dst + out, 0);
+  return out;
+}
+
+// Concatenates three pchar parts into a fresh mmap buffer (caller must munmap).
+// Returns pointer to the NUL-terminated result string.
+fn pgConcat3(a: pchar, b: pchar, c: pchar): int64 {
+  var al: int64 := pgStrLen(a as int64);
+  var bl: int64 := pgStrLen(b as int64);
+  var cl: int64 := pgStrLen(c as int64);
+  var buf: int64 := mmap(0, al + bl + cl + 1, 3, 34, -1, 0);
+  var i: int64 := 0;
+  while (i < al) { poke8(buf + i,          peek8(a as int64 + i)); i := i + 1; }
+  i := 0;
+  while (i < bl) { poke8(buf + al + i,     peek8(b as int64 + i)); i := i + 1; }
+  i := 0;
+  while (i <= cl) { poke8(buf + al + bl + i, peek8(c as int64 + i)); i := i + 1; }
+  return buf;
+}
+
+// Concatenates five pchar parts into a fresh mmap buffer.
+fn pgConcat5(a: pchar, b: pchar, c: pchar, d: pchar, e: pchar): int64 {
+  var al: int64 := pgStrLen(a as int64);
+  var bl: int64 := pgStrLen(b as int64);
+  var cl: int64 := pgStrLen(c as int64);
+  var dl: int64 := pgStrLen(d as int64);
+  var el: int64 := pgStrLen(e as int64);
+  var total: int64 := al + bl + cl + dl + el + 1;
+  var buf: int64 := mmap(0, total, 3, 34, -1, 0);
+  var off: int64 := 0;
+  var i: int64 := 0;
+  while (i < al) { poke8(buf + off, peek8(a as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < bl) { poke8(buf + off, peek8(b as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < cl) { poke8(buf + off, peek8(c as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < dl) { poke8(buf + off, peek8(d as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i <= el) { poke8(buf + off, peek8(e as int64 + i)); off := off + 1; i := i + 1; }
+  return buf;
+}
+
+// Returns 1 if table exists in any non-system schema, 0 otherwise.
+pub fn PGTableExists(conn: int64, table: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar) { return 0; }
+  var sql: int64 := pgConcat3(
+    "SELECT 1 FROM information_schema.tables WHERE table_name='"c,
+    table,
+    "' AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
+  var r: int64 := PGQuery(conn, sql as pchar);
+  munmap(sql, pgStrLen(sql) + 1);
+  if (r == 0) { return 0; }
+  var found: int64 := 0;
+  if (PGNumRows(r) > 0) { found := 1; }
+  PGFreeResult(r);
+  return found;
+}
+
+// Returns 1 if column exists in table (any non-system schema), 0 otherwise.
+pub fn PGColumnExists(conn: int64, table: pchar, column: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar || column == 0 as pchar) { return 0; }
+  var sql: int64 := pgConcat5(
+    "SELECT 1 FROM information_schema.columns WHERE table_name='"c,
+    table,
+    "' AND column_name='"c,
+    column,
+    "' AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
+  var r: int64 := PGQuery(conn, sql as pchar);
+  munmap(sql, pgStrLen(sql) + 1);
+  if (r == 0) { return 0; }
+  var found: int64 := 0;
+  if (PGNumRows(r) > 0) { found := 1; }
+  PGFreeResult(r);
+  return found;
+}
+
+// Executes DROP TABLE IF EXISTS table
+pub fn PGDropTable(conn: int64, table: pchar): int64 {
+  return pgExecWithName(conn, "DROP TABLE IF EXISTS"c, table);
+}
+
+// ============================================================================
+// Connection-Pool
+// ============================================================================
+
+// PGPool layout (3 × int64 = 24 bytes)
+con PGPOOL_SZ:    int64 := 24;
+con PGPOOL_SIZE:  int64 := 0;   // int64 — number of slots
+con PGPOOL_CONNS: int64 := 8;   // int64 — pointer to int64[size] of PGConn*
+con PGPOOL_BUSY:  int64 := 16;  // int64 — pointer to int64[size] flags (0=free,1=busy)
+
+// Allocates a connection pool with the given number of slots (all initially empty)
+pub fn PGPoolCreate(size: int64): int64 {
+  if (size < 1) { return 0; }
+  var pg: int64 := mmap(0, PGPOOL_SZ, 3, 34, -1, 0);
+  poke64(pg + PGPOOL_SIZE,  size);
+  poke64(pg + PGPOOL_CONNS, mmap(0, size * 8, 3, 34, -1, 0));
+  poke64(pg + PGPOOL_BUSY,  mmap(0, size * 8, 3, 34, -1, 0));
+  return pg;
+}
+
+// Closes all connections and frees pool memory
+pub fn PGPoolDestroy(pg: int64) {
+  if (pg == 0) { return; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+  var i: int64 := 0;
+  while (i < size) {
+    var conn: int64 := peek64(conns + i * 8);
+    if (conn != 0) { PGClose(conn); }
+    i := i + 1;
+  }
+  if (conns != 0) { munmap(conns, size * 8); }
+  if (busy  != 0) { munmap(busy,  size * 8); }
+  munmap(pg, PGPOOL_SZ);
+}
+
+// Returns a free connected slot (reuses existing or opens new). Returns 0 if all slots busy.
+pub fn PGPoolAcquire(pg: int64, host: pchar, port: int64, user: pchar, password: pchar, database: pchar): int64 {
+  if (pg == 0) { return 0; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+
+  // First pass: reuse an idle, connected slot
+  var i: int64 := 0;
+  while (i < size) {
+    if (peek64(busy + i * 8) == 0) {
+      var conn: int64 := peek64(conns + i * 8);
+      if (conn != 0 && PGIsConnected(conn) != 0) {
+        poke64(busy + i * 8, 1);
+        return conn;
+      }
+    }
+    i := i + 1;
+  }
+
+  // Second pass: open a new connection in a free slot
+  i := 0;
+  while (i < size) {
+    if (peek64(busy + i * 8) == 0) {
+      var old: int64 := peek64(conns + i * 8);
+      if (old != 0) { PGClose(old); poke64(conns + i * 8, 0); }
+      var conn: int64 := PGConnect(host, port, user, password, database);
+      if (conn != 0 && PGIsConnected(conn) != 0) {
+        poke64(conns + i * 8, conn);
+        poke64(busy  + i * 8, 1);
+        return conn;
+      }
+      if (conn != 0) { PGClose(conn); }
+    }
+    i := i + 1;
+  }
+
+  return 0;
+}
+
+// Marks a connection as free so it can be reused
+pub fn PGPoolRelease(pg: int64, conn: int64) {
+  if (pg == 0 || conn == 0) { return; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+  var i: int64 := 0;
+  while (i < size) {
+    if (peek64(conns + i * 8) == conn) { poke64(busy + i * 8, 0); return; }
+    i := i + 1;
+  }
 }
 
 // Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück

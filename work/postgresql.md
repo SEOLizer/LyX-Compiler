@@ -174,7 +174,7 @@ Backend → Frontend:
 | 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 ✅ |
 | 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 ✅ |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 ✅ |
-| 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 (PG-08 ✅) |
+| 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 ✅ |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
 | 6 | Demos & Integrationstests | PG-12 |
 
@@ -510,7 +510,7 @@ Alle Transaktionsfunktionen verwenden intern `PGQuery`.
 
 ---
 
-### WP-PG-09: Hilfsfunktionen & Connection-Pool ⬜
+### WP-PG-09: Hilfsfunktionen & Connection-Pool ✅
 
 **Ziel:** Praktische Utilities für häufige Aufgaben und einen einfachen
 Connection-Pool für mehrere gleichzeitige Verbindungen.
