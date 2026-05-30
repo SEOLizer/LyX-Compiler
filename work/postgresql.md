@@ -171,8 +171,8 @@ Backend → Frontend:
 
 | Phase | Inhalt | WPs |
 |-------|--------|-----|
-| 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 |
-| 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 |
+| 1 | TCP, Nachrichtenrahmen, Handshake, Auth | PG-01 – PG-02 ✅ |
+| 2 | Connection-Typ, Simple Query, Result-Set | PG-03 – PG-05 (PG-03, PG-04 ✅) |
 | 3 | Extended Query: Prepared Statements + Binding | PG-06 – PG-07 |
 | 4 | Transaktionen, Savepoints, Hilfsfunktionen | PG-08 – PG-09 |
 | 5 | LISTEN/NOTIFY & COPY IN | PG-10 – PG-11 |
@@ -184,7 +184,7 @@ Backend → Frontend:
 
 ---
 
-### WP-PG-01: TCP-Verbindung & Nachrichtenrahmen ⬜
+### WP-PG-01: TCP-Verbindung & Nachrichtenrahmen ✅
 
 **Ziel:** Rohe TCP-Verbindung zu PostgreSQL aufbauen und den zuverlässigen
 Lese-/Schreib-Layer für PG-Nachrichten implementieren.
@@ -217,7 +217,7 @@ Lese-/Schreib-Layer für PG-Nachrichten implementieren.
 
 ---
 
-### WP-PG-02: Handshake & Authentifizierung ⬜
+### WP-PG-02: Handshake & Authentifizierung ✅
 
 **Ziel:** Den vollständigen Verbindungsaufbau mit Authentifizierung implementieren —
 von StartupMessage bis ReadyForQuery.
@@ -260,7 +260,7 @@ von StartupMessage bis ReadyForQuery.
 
 ---
 
-### WP-PG-03: Connection-Typ & PGConnect/PGClose ⬜
+### WP-PG-03: Connection-Typ & PGConnect/PGClose ✅
 
 **Ziel:** Den öffentlichen `PGConn`-Struct einführen und die primären
 Verbindungsfunktionen implementieren.
@@ -306,7 +306,7 @@ Verbindungsfunktionen implementieren.
 
 ---
 
-### WP-PG-04: Simple Query Protocol ⬜
+### WP-PG-04: Simple Query Protocol ✅
 
 **Ziel:** Einfache SQL-Anfragen über das Query-Protokoll senden und alle
 möglichen Backend-Antworten korrekt parsen.
