@@ -11,15 +11,16 @@ import src.parser;
 // Symbol kinds
 // ============================================================================
 
-pub con SYM_BUILTIN: int64 := 0;
-pub con SYM_FUNC:    int64 := 1;
-pub con SYM_VAR:     int64 := 2;
-pub con SYM_STRUCT:  int64 := 3;
-pub con SYM_PARAM:   int64 := 4;
-pub con SYM_CON:     int64 := 5;
-pub con SYM_ENUM:    int64 := 6;
-pub con SYM_FIELD:   int64 := 7;
-pub con SYM_TYPE:    int64 := 8;
+pub con SYM_BUILTIN:      int64 := 0;
+pub con SYM_FUNC:         int64 := 1;
+pub con SYM_VAR:          int64 := 2;
+pub con SYM_STRUCT:       int64 := 3;
+pub con SYM_PARAM:        int64 := 4;
+pub con SYM_CON:          int64 := 5;
+pub con SYM_ENUM:         int64 := 6;
+pub con SYM_FIELD:        int64 := 7;
+pub con SYM_TYPE:         int64 := 8;
+pub con SYM_GENERIC_FUNC: int64 := 10; // WP-2.1: generic function declaration
 
 // ============================================================================
 // WP-11: Primitive type IDs (erweitert)
@@ -224,10 +225,20 @@ pub type Sema = class {
   importedCount: int64;
   importedCap:   int64;
 
-  // WP-14: Generic instantiation cache
+  // WP-14/2.1: Generic instantiation cache
+  // Record layout (64 bytes each):
+  //  +0  genNamePtr:8   pointer to generic function name
+  //  +8  genNameLen:8   length of generic function name
+  //  +16 typeHash:8     hash of type arguments
+  //  +24 instNamePtr:8  pointer to mangled name buffer
+  //  +32 instNameLen:8  length of mangled name
+  //  +40 instSymIdx:8   symbol table index of specialization
+  //  +48 genNodeIdx:8   AST node index of the generic declaration
+  //  +56 typeArgsNi:8   AST node index of first type-arg node
   instCache: int64;
   instCount: int64;
   instCap:   int64;
+  instDepth: int64;  // WP-2.1: recursion depth guard
 
   // WP-13: Capture analysis for closures
   // Track which outer-scope variables are captured by nested functions
@@ -770,6 +781,9 @@ pub type Sema = class {
         self._pushSym(mName, mLen, SYM_CON, TY_INT64, mem);
         mem := self.sn_next(mem);
       }
+    } else if (k == SNK_GENERIC_DECL) {
+      // WP-2.1: register generic function — type params in c0, body in c2
+      self._pushSym(name, nlen, SYM_GENERIC_FUNC, TY_VOID, ni);
     } else if (k == SNK_CON_DECL) {
       self._pushSym(name, nlen, SYM_CON, TY_INT64, ni);
     } else if (k == SNK_VAR_DECL) {
@@ -1558,10 +1572,16 @@ pub type Sema = class {
     self.capturedCount := self.capturedCount + 1;
   }
 
-  // WP-14: Resolve generic function call with type arguments
-  // WP-14: Resolve generic function call with type arguments
-  // e.g., Foo<int64>(arg1, arg2) → instantiate Foo with T=int64
+  // WP-2.1: Resolve generic function call with type arguments.
+  // e.g., max[int64](3, 7) → instantiate max with T=int64 → max__int64
   fn _resolveGenericCall(fnName: pchar, fnLen: int64, typeArgsNi: int64) {
+    // WP-2.1: recursion guard — prevents infinite instantiation loops
+    if (self.instDepth > 8) {
+      self._error("recursive generic instantiation detected"c);
+      return;
+    }
+    self.instDepth := self.instDepth + 1;
+
     // 1. Validate that type arguments are valid types
     var ta: int64 := typeArgsNi;
     var argCount: int64 := 0;
@@ -1640,123 +1660,129 @@ pub type Sema = class {
     // 3. Try to get existing monomorphized instance, or create one
     var instIdx: int64 := self._getMonomorphInstance(fnName, fnLen, typeArgsNi);
     if (instIdx < 0) {
-      // 4. Create new monomorphized instance
-      self._createMonomorphInstance(fnName, fnLen, typeArgsNi);
+      // 4. Create new monomorphized instance — find the generic node index
+      var genNodeIdx: int64 := -1;
+      var genSym2: int64 := self.Lookup(fnName, fnLen);
+      if (genSym2 >= 0) { genNodeIdx := self.SymNodeIdx(genSym2); }
+      self._createMonomorphInstance(fnName, fnLen, typeArgsNi, genNodeIdx);
     }
+
+    self.instDepth := self.instDepth - 1;
   }
 
-  // WP-14: Create a new monomorphized function instance
-  // Generates a specialized symbol name like "Foo_int64" and registers it
-  fn _createMonomorphInstance(genName: pchar, genLen: int64, typeArgsNi: int64) {
-    // Build specialized name: "genName_type1_type2_..."
-    var nameBuf: int64 := mmap(0, genLen + 256, 3, 34, -1, 0);
+  // WP-2.1: Map a type ID to its canonical name string for name mangling.
+  fn _typeName(tid: int64): pchar {
+    if (tid == TY_INT64)   { return "int64"c; }
+    if (tid == TY_INT32)   { return "int32"c; }
+    if (tid == TY_INT16)   { return "int16"c; }
+    if (tid == TY_INT8)    { return "int8"c; }
+    if (tid == TY_UINT64)  { return "uint64"c; }
+    if (tid == TY_UINT32)  { return "uint32"c; }
+    if (tid == TY_UINT16)  { return "uint16"c; }
+    if (tid == TY_UINT8)   { return "uint8"c; }
+    if (tid == TY_FLOAT64) { return "f64"c; }
+    if (tid == TY_FLOAT32) { return "f32"c; }
+    if (tid == TY_PCHAR)   { return "pchar"c; }
+    if (tid == TY_BOOL)    { return "bool"c; }
+    if (tid == TY_VOID)    { return "void"c; }
+    return "T"c;
+  }
+
+  // WP-2.1: Create a new monomorphized function instance.
+  // Builds a mangled name "genName__type1__type2", registers it as SYM_FUNC,
+  // and caches the mapping so IR-lowering can find the specialization.
+  fn _createMonomorphInstance(genName: pchar, genLen: int64, typeArgsNi: int64, genNodeIdx: int64) {
+    // Build mangled name: "genName__type1__type2..."
+    var nameBuf: int64 := mmap(0, genLen + 512, 3, 34, -1, 0);
     var pos: int64 := 0;
-    // Copy generic function name
     var i: int64 := 0;
     while (i < genLen) {
       poke8(nameBuf + pos, StrCharAt(genName, i));
-      pos := pos + 1;
-      i := i + 1;
+      pos := pos + 1; i := i + 1;
     }
-    // Append type arguments
     var ta: int64 := typeArgsNi;
     while (ta >= 0) {
-      poke8(nameBuf + pos, 95);  // '_'
-      pos := pos + 1;
-      var tid: int64 := self.ResolveType(ta);
-      // Append type name
+      // Double-underscore separator per spec (max__int64 not max_int64)
+      poke8(nameBuf + pos, 95); pos := pos + 1;
+      poke8(nameBuf + pos, 95); pos := pos + 1;
+      // Use the source type name from the AST node when available
+      var tName: pchar;
+      var tLen: int64 := 0;
       if (self.sn_kind(ta) == SNK_TYPE_NAME) {
-        var tName: pchar := self.sn_sVal(ta);
-        var tLen: int64 := self.sn_sLen(ta);
-        var j: int64 := 0;
-        while (j < tLen) {
-          poke8(nameBuf + pos, StrCharAt(tName, j));
-          pos := pos + 1;
-          j := j + 1;
-        }
+        tName := self.sn_sVal(ta);
+        tLen  := self.sn_sLen(ta);
       } else {
-        // Fallback: append type ID as number
-        poke8(nameBuf + pos, 116); pos := pos + 1;  // 't'
-        poke8(nameBuf + pos, 48 + tid); pos := pos + 1;
+        tName := self._typeName(self.ResolveType(ta));
+        tLen  := StrLen(tName);
+      }
+      var j: int64 := 0;
+      while (j < tLen) {
+        poke8(nameBuf + pos, StrCharAt(tName, j));
+        pos := pos + 1; j := j + 1;
       }
       ta := self.sn_next(ta);
     }
-    poke8(nameBuf + pos, 0);  // null terminator
+    poke8(nameBuf + pos, 0);
 
-    // Register the specialized symbol
-    var instSymIdx: int64 := self._pushSym(9, nameBuf as pchar, pos, 0);  // SYM_FUNC
-    // 9 = SYM_FUNC (same as regular function)
+    // Register specialized symbol pointing to the generic declaration's body
+    self._pushSym(nameBuf as pchar, pos, SYM_FUNC, TY_VOID, genNodeIdx);
+    var instSymIdx: int64 := self.symCount - 1;
 
-    // Cache the instantiation
-    // Cache entry: {genNamePtr:8, genNameLen:8, typeArgsHash:8, instNamePtr:8, instNameLen:8, instSymIdx:8} = 48 bytes
+    // Grow cache if needed (64-byte records)
+    con INST_REC: int64 := 64;
     if (self.instCount >= self.instCap) {
       var nc: int64 := self.instCap * 2;
       if (nc == 0) { nc := 8; }
-      var nb: int64 := mmap(0, nc * 48, 3, 34, -1, 0);
+      var nb: int64 := mmap(0, nc * INST_REC, 3, 34, -1, 0);
       var j: int64 := 0;
-      while (j < self.instCount * 48) {
-        poke8(nb + j, peek8(self.instCache + j));
-        j := j + 1;
+      while (j < self.instCount * INST_REC) {
+        poke8(nb + j, peek8(self.instCache + j)); j := j + 1;
       }
-      if (self.instCache != 0) { munmap(self.instCache, self.instCap * 48); }
-      self.instCache := nb;
-      self.instCap := nc;
+      if (self.instCache != 0) { munmap(self.instCache, self.instCap * INST_REC); }
+      self.instCache := nb; self.instCap := nc;
     }
-    var base: int64 := self.instCache + self.instCount * 48;
-    poke64(base,      genName as int64);
-    poke64(base + 8,  genLen);
     // Compute type hash
     var typeHash: int64 := 0;
     var th: int64 := typeArgsNi;
     while (th >= 0) {
-      var tid: int64 := self.ResolveType(th);
-      typeHash := typeHash * 31 + tid;
+      typeHash := typeHash * 31 + self.ResolveType(th);
       th := self.sn_next(th);
     }
-    poke64(base + 16, typeHash);
-    poke64(base + 24, nameBuf);
-    poke64(base + 32, pos);
-    poke64(base + 40, instSymIdx);
+    var base: int64 := self.instCache + self.instCount * INST_REC;
+    poke64(base,      genName as int64); // +0  genNamePtr
+    poke64(base + 8,  genLen);           // +8  genNameLen
+    poke64(base + 16, typeHash);         // +16 typeHash
+    poke64(base + 24, nameBuf);          // +24 instNamePtr
+    poke64(base + 32, pos);              // +32 instNameLen
+    poke64(base + 40, instSymIdx);       // +40 instSymIdx
+    poke64(base + 48, genNodeIdx);       // +48 genFuncNodeIdx (WP-2.1)
+    poke64(base + 56, typeArgsNi);       // +56 typeArgsNi (WP-2.1)
     self.instCount := self.instCount + 1;
-
-    // Note: Full monomorphization would also copy the function body
-    // and replace type parameters with concrete types. For the bootstrap,
-    // we just register the symbol and rely on the codegen to handle it.
   }
-  
-  // WP-14: Get or create monomorphized function instance
-  // Returns the specialized function name or -1 if not found
+
+  // WP-2.1: Look up an existing monomorphized instance in the cache.
+  // Returns instSymIdx (≥0) if found, -1 if not yet instantiated.
   fn _getMonomorphInstance(genName: pchar, genLen: int64, typeArgsNi: int64): int64 {
-    // Search instantiation cache for existing specialization
-    // Cache entry format: {genNamePtr:8, genNameLen:8, typeArgsHash:8, instNamePtr:8, instNameLen:8, instSymIdx:8} = 48 bytes
-    
-    // Compute a simple hash from type arguments
+    con INST_REC: int64 := 64;
     var typeHash: int64 := 0;
     var ta: int64 := typeArgsNi;
     while (ta >= 0) {
-      var tid: int64 := self.ResolveType(ta);
-      typeHash := typeHash * 31 + tid;
+      typeHash := typeHash * 31 + self.ResolveType(ta);
       ta := self.sn_next(ta);
     }
-    
-    // Search for existing specialization
     var i: int64 := 0;
     while (i < self.instCount) {
-      var base: int64 := self.instCache + i * 48;
-      var funcN: pchar := peek64(base) as pchar;
+      var base: int64 := self.instCache + i * INST_REC;
       var fnlen: int64 := peek64(base + 8);
       var typeH: int64 := peek64(base + 16);
-      // Compare function name and type hash
       if (fnlen == genLen && typeH == typeHash) {
-        if (self._strNEq(funcN, fnlen, genName, genLen)) {
-          // Found existing specialization - return symbol index
+        var funcN: pchar := peek64(base) as pchar;
+        if (self._strNEq(funcN, fnlen, genName, genLen) != 0) {
           return peek64(base + 40);
         }
       }
       i := i + 1;
     }
-    
-    // No existing specialization found
     return -1;
   }
 
@@ -1764,6 +1790,10 @@ pub type Sema = class {
     var k: int64 := self.sn_kind(ni);
     if (k == SNK_FUNC_DECL) {
       self._checkFuncDecl(ni);
+    } else if (k == SNK_GENERIC_DECL) {
+      // WP-2.1: generic declarations are not checked directly —
+      // only their monomorphized instances (emitted by IR lowerer) are.
+      return;
     } else if (k == SNK_STRUCT_DECL) {
       // Check struct field types
       var field: int64 := self.sn_c0(ni);

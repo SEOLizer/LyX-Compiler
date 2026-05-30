@@ -200,6 +200,21 @@ pub type IRLower = class {
   // Generic type arguments
   typeArgs: int64;           // current type arguments for generic instantiation
   typeArgCount: int64;
+
+  // WP-2.1: Generic monomorphization support
+  // Override function name used by _addFunc when lowering a specialization
+  overrideFuncName:    pchar;   // non-null = use this name in _addFunc
+  overrideFuncNameLen: int64;
+  // Registry of generic function declarations seen in lowerModule pre-pass
+  // Records: {namePtr:8, nameLen:8, nodeIdx:8} = 24 bytes each
+  genFuncBuf:   int64;
+  genFuncCount: int64;
+  genFuncCap:   int64;
+  // Queue of pending specializations to emit after the main lowering loop
+  // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
+  pendingGenBuf:   int64;
+  pendingGenCount: int64;
+  pendingGenCap:   int64;
   
   // ------------------------------------------------------------------
   // Initialization
@@ -233,6 +248,15 @@ pub type IRLower = class {
     self.typeArgs := 0;
     self.typeArgCount := 0;
     self.funcInstrStart := 0;
+    // WP-2.1: generics
+    self.overrideFuncName    := 0;
+    self.overrideFuncNameLen := 0;
+    self.genFuncCap   := 16;
+    self.genFuncBuf   := mmap(0, 16 * 24, 3, 34, -1, 0);
+    self.genFuncCount := 0;
+    self.pendingGenCap   := 16;
+    self.pendingGenBuf   := mmap(0, 16 * 32, 3, 34, -1, 0);
+    self.pendingGenCount := 0;
   }
   
   // Helper function to call IRModule methods via vtable
@@ -801,6 +825,10 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerCall(expr: int64): int64 {
+    // WP-2.1: generic calls (iVal=2) go through the monomorphization path
+    if (self.nodeIVal(expr) == 2) {
+      return self.lowerGenericCall(expr);
+    }
     // NK_CALL: sVal = function name, C0 = first argument (linked via nodeNext)
     var dest: int64 := self.allocTemp();
     var fname: pchar := self.nodeSVal(expr);
@@ -1860,7 +1888,8 @@ pub type IRLower = class {
     // resolves correctly.
     var pfCur: int64 := decls;
     while pfCur >= 0 {
-      if self.nodeKind(pfCur) == NK_FUNC_DECL {
+      var pfKind: int64 := self.nodeKind(pfCur);
+      if pfKind == NK_FUNC_DECL {
         // Skip `extern fn ... link` decls (bodyless NK_FUNC_DECL with the
         // packed library span in c3): they are FFI imports, not internal
         // functions. Registering them in funcBuffer would make lowerCall
@@ -1873,6 +1902,24 @@ pub type IRLower = class {
           var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
           self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
         }
+      } else if pfKind == NK_GENERIC_DECL {
+        // WP-2.1: register generic declarations in genFuncBuf, NOT funcBuffer.
+        // They are not emitted directly — only their specializations are.
+        if (self.genFuncCount >= self.genFuncCap) {
+          var gfc: int64 := self.genFuncCap * 2;
+          var gfb: int64 := mmap(0, gfc * 24, 3, 34, -1, 0);
+          var gfi: int64 := 0;
+          while gfi < self.genFuncCount * 24 {
+            poke8(gfb + gfi, peek8(self.genFuncBuf + gfi)); gfi := gfi + 1;
+          }
+          munmap(self.genFuncBuf, self.genFuncCap * 24);
+          self.genFuncBuf := gfb; self.genFuncCap := gfc;
+        }
+        var gfRec: int64 := self.genFuncBuf + self.genFuncCount * 24;
+        poke64(gfRec,      self.nodeSVal(pfCur) as int64);
+        poke64(gfRec + 8,  self.nodeSLen(pfCur));
+        poke64(gfRec + 16, pfCur);
+        self.genFuncCount := self.genFuncCount + 1;
       }
       pfCur := self.nodeNext(pfCur);
     }
@@ -1887,6 +1934,8 @@ pub type IRLower = class {
         if bodyIsExtern == 0 {
           self.lowerFunc(cur);
         }
+      } else if (kind == NK_GENERIC_DECL) {
+        // WP-2.1: generic declarations are emitted only as specializations (see below)
       } else if (kind == NK_IMPORT) {
         // WP-AND-upstream-fix v3: actually lower imported function bodies.
         // Sema's _sema_processImport reads + parses imports but disposes the
@@ -1935,8 +1984,34 @@ pub type IRLower = class {
       }
       cur := self.nodeNext(cur);
     }
+
+    // WP-2.1: emit pending generic specializations collected during this module.
+    // Each pending record: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8}
+    var pi: int64 := 0;
+    while (pi < self.pendingGenCount) {
+      var pRec: int64 := self.pendingGenBuf + pi * 32;
+      var pEmitted: int64 := peek64(pRec + 24);
+      if (pEmitted == 0) {
+        poke64(pRec + 24, 1);  // mark as emitted
+        var mangPtr: pchar := peek64(pRec) as pchar;
+        var mangLen: int64 := peek64(pRec + 8);
+        var gNodeIdx: int64 := peek64(pRec + 16);
+        if (gNodeIdx >= 0) {
+          // Register the specialization in funcBuffer so calls resolve
+          var mangOff: int64 := self.irAddString(mangPtr, mangLen);
+          self.irAddFunc(mangOff, mangLen, 0, 0);
+          // Lower the generic body with the mangled name
+          self.overrideFuncName    := mangPtr;
+          self.overrideFuncNameLen := mangLen;
+          self.lowerFunc(gNodeIdx);
+          self.overrideFuncName    := 0;
+          self.overrideFuncNameLen := 0;
+        }
+      }
+      pi := pi + 1;
+    }
   }
-  
+
   // ------------------------------------------------------------------
   // Accessors
   // ------------------------------------------------------------------
@@ -1948,8 +2023,16 @@ pub type IRLower = class {
   // — earlier attempts to break by setting `fi := funcLen` hung the
   // seed compiler while it processed this source.
   fn _addFunc() {
-    var fnNamePtr: pchar := self.nodeSVal(self.curFunc);
-    var fnNameLen: int64 := self.nodeSLen(self.curFunc);
+    // WP-2.1: when lowering a monomorphized specialization, use the mangled name
+    var fnNamePtr: pchar;
+    var fnNameLen: int64;
+    if (self.overrideFuncName != 0) {
+      fnNamePtr := self.overrideFuncName;
+      fnNameLen := self.overrideFuncNameLen;
+    } else {
+      fnNamePtr := self.nodeSVal(self.curFunc);
+      fnNameLen := self.nodeSLen(self.curFunc);
+    }
 
     var funcBuf2: int64 := peek64(self.ir + 80);
     var strBuf2:  int64 := peek64(self.ir + 32);
@@ -2432,37 +2515,117 @@ pub type IRLower = class {
   // WP-20: Generics Lowering
   // ============================================================================
   
-  // Generic function instantiation call
+  // WP-2.1: Lower a generic call like max[int64](3, 7).
+  // NK_CALL with iVal=2:
+  //   sVal/sLen = generic function name ("max")
+  //   c0        = first argument (linked via nodeNext)
+  //   c2        = first type-arg AST node (NK_TYPE_NAME "int64", linked via nodeNext)
   fn lowerGenericCall(expr: int64): int64 {
-    // C0: generic function name
-    // C1: type arguments (linked list)
-    // C2: regular arguments
-    var genFuncName: int64 := self.nodeC0(expr);
-    var typeArgs: int64 := self.nodeC1(expr);
-    var args: int64 := self.nodeC2(expr);
-    
-    // Process type arguments to get type hash
-    var typeHash: int64 := 0;
-    var curType: int64 := typeArgs;
-    while (curType >= 0) {
-      // Hash each type
-      curType := self.nodeNext(curType);
-    }
-    
-    // Look up in instantiation cache
-    // If found: use monomorphized function name
-    // If not found: generate new instance
-    
-    // Process regular arguments
-    var curArg: int64 := args;
-    while (curArg >= 0) {
-      self.lowerExpr(curArg);
-      curArg := self.nodeNext(curArg);
-    }
-    
     var dest: int64 := self.allocTemp();
-    
-    // Emit: call <mangled_name>(typeArgs..., args...)
+    var genName: pchar := self.nodeSVal(expr);
+    var genLen: int64  := self.nodeSLen(expr);
+    var typeArgNode: int64 := self.nodeC2(expr);
+    var arg0: int64 := self.nodeC0(expr);
+
+    // Build mangled name: "genName__type1__type2..."
+    var mangBuf: int64 := mmap(0, genLen + 512, 3, 34, -1, 0);
+    if (mangBuf == 0) { return dest; }
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    while (i < genLen) {
+      poke8(mangBuf + pos, StrCharAt(genName, i)); pos := pos + 1; i := i + 1;
+    }
+    var ta: int64 := typeArgNode;
+    while (ta >= 0) {
+      poke8(mangBuf + pos, 95); pos := pos + 1;  // '_'
+      poke8(mangBuf + pos, 95); pos := pos + 1;  // '_'
+      var tName: pchar := self.nodeSVal(ta);
+      var tLen: int64  := self.nodeSLen(ta);
+      var j: int64 := 0;
+      while (j < tLen) {
+        poke8(mangBuf + pos, StrCharAt(tName, j)); pos := pos + 1; j := j + 1;
+      }
+      ta := self.nodeNext(ta);
+    }
+    poke8(mangBuf + pos, 0);
+
+    // Find the generic declaration node by searching genFuncBuf
+    var genFuncNodeIdx: int64 := -1;
+    var gi: int64 := 0;
+    while (gi < self.genFuncCount) {
+      var gRec: int64 := self.genFuncBuf + gi * 24;
+      var gNPtr: pchar := peek64(gRec) as pchar;
+      var gNLen: int64 := peek64(gRec + 8);
+      if (gNLen == genLen) {
+        var match: int64 := 1;
+        var k: int64 := 0;
+        while (k < genLen) {
+          if (StrCharAt(gNPtr, k) != StrCharAt(genName, k)) { match := 0; break; }
+          k := k + 1;
+        }
+        if (match != 0) { genFuncNodeIdx := peek64(gRec + 16); break; }
+      }
+      gi := gi + 1;
+    }
+
+    // Check if this specialization is already in the pending queue
+    var already: int64 := 0;
+    var pi: int64 := 0;
+    while (pi < self.pendingGenCount) {
+      var pRec: int64 := self.pendingGenBuf + pi * 32;
+      var pLen: int64 := peek64(pRec + 8);
+      if (pLen == pos) {
+        var pPtr: pchar := peek64(pRec) as pchar;
+        var m2: int64 := 1; var k2: int64 := 0;
+        while (k2 < pos) {
+          if (StrCharAt(pPtr, k2) != StrCharAt(mangBuf as pchar, k2)) { m2 := 0; break; }
+          k2 := k2 + 1;
+        }
+        if (m2 != 0) { already := 1; break; }
+      }
+      pi := pi + 1;
+    }
+
+    // Enqueue if not yet pending
+    if (already == 0 && genFuncNodeIdx >= 0) {
+      if (self.pendingGenCount >= self.pendingGenCap) {
+        var pnc: int64 := self.pendingGenCap * 2;
+        var pnb: int64 := mmap(0, pnc * 32, 3, 34, -1, 0);
+        var pni: int64 := 0;
+        while pni < self.pendingGenCount * 32 {
+          poke8(pnb + pni, peek8(self.pendingGenBuf + pni)); pni := pni + 1;
+        }
+        munmap(self.pendingGenBuf, self.pendingGenCap * 32);
+        self.pendingGenBuf := pnb; self.pendingGenCap := pnc;
+      }
+      var pRec2: int64 := self.pendingGenBuf + self.pendingGenCount * 32;
+      poke64(pRec2,      mangBuf);           // mangledPtr
+      poke64(pRec2 + 8,  pos);               // mangledLen
+      poke64(pRec2 + 16, genFuncNodeIdx);    // genFuncNodeIdx
+      poke64(pRec2 + 24, 0);                 // emitted = false
+      self.pendingGenCount := self.pendingGenCount + 1;
+    }
+
+    // Lower the actual call arguments
+    var argTemps: int64 := mmap(0, 64 * 8, 3, 34, -1, 0);  // up to 64 args
+    var argCount: int64 := 0;
+    var argNode: int64 := arg0;
+    while (argNode >= 0 && argCount < 64) {
+      var aTemp: int64 := self.lowerExpr(argNode);
+      poke64(argTemps + argCount * 8, aTemp);
+      argCount := argCount + 1;
+      argNode := self.nodeNext(argNode);
+    }
+    // Emit: call mangled_name(arg0, arg1, ...)
+    var mangNameOff: int64 := self.irAddString(mangBuf as pchar, pos);
+    var ai: int64 := 0;
+    while (ai < argCount) {
+      self.irAddInstrDirect(IRO_STORE_LOCAL, ai, peek64(argTemps + ai * 8), -1, 0);
+      ai := ai + 1;
+    }
+    self.irAddInstrDirect(IRO_CALL, dest, mangNameOff, -1, argCount);
+    munmap(argTemps, 64 * 8);
+    // Note: mangBuf is kept alive (stored in pendingGenBuf) until module lowering completes
     return dest;
   }
   
