@@ -67,6 +67,7 @@ con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
 con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
+con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
@@ -505,6 +506,9 @@ pub type Codegen = class {
   // WP-LIC-10: license watermark — set by lyxc after successful verification
   licenseKey:    int64;   // pchar to 29-char key (e.g. "WXDHJ-NFZ18-…"), 0 = no watermark
   licenseKeyLen: int64;   // always 29 when set
+
+  // WP-MEM-05: top-level AST head for default-param lookup in cg_genCall
+  topLevelHead: int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -3146,6 +3150,10 @@ pub type Codegen = class {
       }
       }  // end else (not const-foldable)
 
+    } else if (k == CGN_NAMED_ARG) {
+      // WP-MEM-05: named arg in an expression context — evaluate the value (c0)
+      self.cg_genExpr(self.cg_nc0(ni));
+
     } else if (k == CGN_CALL) {
       self.cg_genCall(ni);
 
@@ -3638,6 +3646,67 @@ pub type Codegen = class {
     var cur: int64 := argNode;
     while (cur != -1) { argc := argc + 1; cur := self.cg_nnext(cur); }
 
+    // WP-MEM-05: mmap(size: N) or mmap(len: N) — expand single named arg to 6-arg syscall
+    if (isMethod == 0 && argc == 1 && argNode >= 0 && self.cg_nkind(argNode) == CGN_NAMED_ARG) {
+      var mmArg: pchar := self.cg_nsval(argNode);
+      var mmLen: int64 := self.cg_nslen(argNode);
+      var isMmapName: int64 := 0;
+      if (fnlen == 4) {
+        if (StrCharAt(fname,0)==109 && StrCharAt(fname,1)==109 &&
+            StrCharAt(fname,2)==97  && StrCharAt(fname,3)==112) { isMmapName := 1; }
+      }
+      var isLenArg: int64 := 0;
+      if (mmLen == 4) {
+        if (StrCharAt(mmArg,0)==115 && StrCharAt(mmArg,1)==105 &&
+            StrCharAt(mmArg,2)==122 && StrCharAt(mmArg,3)==101) { isLenArg := 1; } // "size"
+      }
+      if (mmLen == 3) {
+        if (StrCharAt(mmArg,0)==108 && StrCharAt(mmArg,1)==101 &&
+            StrCharAt(mmArg,2)==110) { isLenArg := 1; } // "len"
+      }
+      if (isMmapName != 0 && isLenArg != 0) {
+        self.cg_movRaxImm(0);    self.cg_pushRax();  // addr=0
+        self.cg_genExpr(self.cg_nc0(argNode)); self.cg_pushRax();  // len=value
+        self.cg_movRaxImm(3);    self.cg_pushRax();  // prot=PROT_RW
+        self.cg_movRaxImm(34);   self.cg_pushRax();  // flags=MAP_ANON
+        self.cg_movRaxImm(-1);   self.cg_pushRax();  // fd=-1
+        self.cg_movRaxImm(0);    self.cg_pushRax();  // offset=0
+        self.cg_e8(0x41); self.cg_e8(0x59);  // pop r9
+        self.cg_e8(0x41); self.cg_e8(0x58);  // pop r8
+        self.cg_popRcx(); self.cg_popRdx(); self.cg_popRsi(); self.cg_popRdi();
+        self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10,rcx
+        self.cg_movRaxImm(9); self.cg_e8(0x0F); self.cg_e8(0x05);
+        self.cg_emitIoResultSave();
+        if (self.ioCheckEnabled != 0) { self.cg_emitIoCheckPanic(); }
+        return;
+      }
+    }
+
+    // WP-MEM-05: default params — find callee in same-module top-level declarations
+    // and emit default expressions for trailing params not covered by explicit args.
+    // Only applies to user-defined functions (isMethod == 0, not a builtin).
+    var cgDefFuncNi: int64 := -1;
+    if (isMethod == 0 && self.topLevelHead >= 0) {
+      var cgScan: int64 := self.topLevelHead;
+      while (cgScan >= 0) {
+        if (self.cg_nkind(cgScan) == CGN_FUNC_DECL) {
+          if (self.cg_nslen(cgScan) == fnlen) {
+            var cgFN: pchar := self.cg_nsval(cgScan);
+            var cgMatch: int64 := 1;
+            var cgJ: int64 := 0;
+            while (cgJ < fnlen) {
+              if (cgMatch != 0) {
+                if (StrCharAt(cgFN, cgJ) != StrCharAt(fname, cgJ)) { cgMatch := 0; }
+              }
+              cgJ := cgJ + 1;
+            }
+            if (cgMatch != 0) { cgDefFuncNi := cgScan; cgScan := -2; }
+          }
+        }
+        if (cgScan >= 0) { cgScan := self.cg_nnext(cgScan); }
+      }
+    }
+
     // For method calls: push self (object) as first arg
     if (isMethod == 1) {
       self.cg_genExpr(self.cg_nc0(ni));
@@ -3651,6 +3720,25 @@ pub type Codegen = class {
       self.cg_genExpr(cur);
       self.cg_pushRax();
       cur := self.cg_nnext(cur);
+    }
+
+    // WP-MEM-05: emit default expressions for remaining params
+    if (cgDefFuncNi >= 0) {
+      var cgPn: int64 := self.cg_nc0(cgDefFuncNi);
+      var cgSkip: int64 := 0;
+      while (cgSkip < argc && cgPn >= 0) {
+        cgPn := self.cg_nnext(cgPn);
+        cgSkip := cgSkip + 1;
+      }
+      while (cgPn >= 0) {
+        var cgDef: int64 := self.cg_nc1(cgPn);
+        if (cgDef >= 0) {
+          self.cg_genExpr(cgDef);
+          self.cg_pushRax();
+          argc := argc + 1;
+        }
+        cgPn := self.cg_nnext(cgPn);
+      }
     }
 
     // Pop args into registers
@@ -8092,6 +8180,7 @@ pub type Codegen = class {
   }
 
   fn Generate(head: int64) {
+    self.topLevelHead := head;  // WP-MEM-05: save for default-param lookup
     self.cg_genFile(head);
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
