@@ -219,7 +219,7 @@ pub fn IsLink(path: pchar): bool
 
 ---
 
-## WP-FS-06: Symlinks — Symlink, ReadLink ⬜
+## WP-FS-06: Symlinks — Symlink, ReadLink ✅
 
 **Ziel:** Symbolische Links erstellen und auflesen.
 
