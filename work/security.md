@@ -108,12 +108,12 @@ CPU-Spin (Busy-Wait) beim Warten auf Output.
 
 **Teilschritte:**
 
-- [ ] **3.1** `libssh2_session_hostkey()` nach Handshake aufrufen
-- [ ] **3.2** `libssh2_knownhost_init()` + `libssh2_knownhost_readfile()` für `~/.ssh/known_hosts`
-- [ ] **3.3** `libssh2_knownhost_check()` gegen erhaltenen Host Key
-- [ ] **3.4** Bei unbekanntem Host: TOFU oder Fehler + Fingerprint
-- [ ] **3.5** Public-Key-Auth als Option: `libssh2_userauth_publickey_fromfile_ex()`
-- [ ] **3.6** Busy-Wait durch `poll()`/`select()` auf Socket ersetzen
+- [x] **3.1** `libssh2_session_hostkey()` nach Handshake — liefert Roh-Key + Typ
+- [x] **3.2** `libssh2_knownhost_init()` + `libssh2_knownhost_readfile()` für `~/.ssh/known_hosts` (via `getenv("HOME")`)
+- [x] **3.3** `libssh2_knownhost_checkp()` gegen erhaltenen Host Key (PLAIN + RAW Encoding)
+- [x] **3.4** MISMATCH → Verbindung abbrechen; NOTFOUND + TOFU → `libssh2_knownhost_addc()` + writefile; STRICT → fail. `SSHConnectVerified(session, host, port, policy)` für explizite Policy-Wahl
+- [x] **3.5** `SSHAuthPublicKey(session, username, privateKeyPath, passphrase)` via `libssh2_userauth_publickey_fromfile_ex()`
+- [x] **3.6** Busy-Wait in `SSHExecOutput` durch `ssh_wait_socket()` ersetzt: `libssh2_session_block_directions()` + `sys_select()` auf Socket-FD
 
 **Definition of Done:**
 - Bekannter Host → erfolgreiche Verbindung
@@ -612,7 +612,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 |----|-------|--------|----------------|-------|------|
 | 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 |
 | 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 3 | SSH-Host-Key-Verifikation | ⬜ | – | – | – |
+| 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
 | 4 | MongoDB-Treiber absichern | ⬜ | – | – | – |
 | 5 | Gefährliche FFI-Externs | ⬜ | – | – | – |
 | 6 | W^X für ELF-Binaries | ⬜ | – | – | – |

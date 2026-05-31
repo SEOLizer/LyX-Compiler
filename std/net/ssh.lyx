@@ -31,7 +31,9 @@ extern fn libssh2_session_free(session: int64): int64 link "libssh2.so.1";
 extern fn libssh2_session_handshake(session: int64, sock: int64): int64 link "libssh2.so.1";
 extern fn libssh2_session_disconnect_ex(session: int64, reason: int64, description: int64, lang: int64): int64 link "libssh2.so.1";
 extern fn libssh2_session_set_timeout(session: int64, timeout: int64) link "libssh2.so.1";
+extern fn libssh2_session_block_directions(session: int64): int64 link "libssh2.so.1";
 extern fn libssh2_userauth_password_ex(session: int64, username: int64, username_len: int64, password: int64, password_len: int64, passwd_change_cb: int64): int64 link "libssh2.so.1";
+extern fn libssh2_userauth_publickey_fromfile_ex(session: int64, username: int64, username_len: int64, publickey: int64, privatekey: int64, passphrase: int64): int64 link "libssh2.so.1";
 extern fn libssh2_channel_open_ex(session: int64, channel_type: int64, channel_type_len: int64, window_size: int64, packet_size: int64, message: int64, message_len: int64): int64 link "libssh2.so.1";
 extern fn libssh2_channel_process_startup(channel: int64, request: int64, request_len: int64, message: int64, message_len: int64): int64 link "libssh2.so.1";
 extern fn libssh2_channel_read_ex(channel: int64, stream_id: int64, buf: int64, buflen: int64): int64 link "libssh2.so.1";
@@ -43,10 +45,53 @@ extern fn libssh2_channel_free(channel: int64): int64 link "libssh2.so.1";
 extern fn libssh2_channel_wait_closed(channel: int64): int64 link "libssh2.so.1";
 extern fn libssh2_session_last_error(session: int64, errmsg: int64, errmsg_len: int64, want_buf: int64): int64 link "libssh2.so.1";
 
+// Host key verification (WP-3)
+extern fn libssh2_session_hostkey(session: int64, len: int64, type_: int64): int64 link "libssh2.so.1";
+extern fn libssh2_hostkey_hash(session: int64, hash_type: int64): int64 link "libssh2.so.1";
+extern fn libssh2_knownhost_init(session: int64): int64 link "libssh2.so.1";
+extern fn libssh2_knownhost_free(hosts: int64) link "libssh2.so.1";
+extern fn libssh2_knownhost_readfile(hosts: int64, filename: int64, type_: int64): int64 link "libssh2.so.1";
+extern fn libssh2_knownhost_writefile(hosts: int64, filename: int64, type_: int64): int64 link "libssh2.so.1";
+extern fn libssh2_knownhost_checkp(hosts: int64, host: int64, port: int64, key: int64, keylen: int64, typemask: int64, knownhost: int64): int64 link "libssh2.so.1";
+extern fn libssh2_knownhost_addc(hosts: int64, host: int64, salt: int64, key: int64, keylen: int64, comment: int64, commentlen: int64, typemask: int64, store: int64): int64 link "libssh2.so.1";
+
+// getenv for $HOME path (WP-3)
+extern fn getenv(name: int64): int64 link "libc.so.6";
+
+// select for poll instead of busy-wait (WP-3.6)
+extern fn sys_select(nfds: int64, readfds: pchar, writefds: pchar, exceptfds: pchar, timeout: pchar): int64;
+
 // SSH constants
 pub con SSH_PORT: int64 := 22;
 pub con LIBSSH2_INIT_NOCRYPTO: int64 := 0;
 pub con LIBSSH2_INIT_NOCRYPTO_DEPRECATED: int64 := 1;
+
+// libssh2 knownhost check results
+pub con LIBSSH2_KNOWNHOST_CHECK_MATCH:    int64 := 0;
+pub con LIBSSH2_KNOWNHOST_CHECK_MISMATCH: int64 := 1;
+pub con LIBSSH2_KNOWNHOST_CHECK_NOTFOUND: int64 := 2;
+pub con LIBSSH2_KNOWNHOST_CHECK_FAILURE:  int64 := 3;
+
+// libssh2 knownhost typemask components
+con LIBSSH2_KNOWNHOST_TYPE_PLAIN:   int64 := 1;
+con LIBSSH2_KNOWNHOST_KEYENC_RAW:   int64 := 65536;    // 1<<16
+con LIBSSH2_KNOWNHOST_KEY_SSHRSA:   int64 := 524288;   // 2<<18
+con LIBSSH2_KNOWNHOST_KEY_SSHDSS:   int64 := 786432;   // 3<<18
+con LIBSSH2_KNOWNHOST_KEY_ECDSA256: int64 := 1048576;  // 4<<18
+con LIBSSH2_KNOWNHOST_KEY_ECDSA384: int64 := 1310720;  // 5<<18
+con LIBSSH2_KNOWNHOST_KEY_ECDSA521: int64 := 1572864;  // 6<<18
+con LIBSSH2_KNOWNHOST_KEY_ED25519:  int64 := 1835008;  // 7<<18
+con LIBSSH2_KNOWNHOST_FILE_OPENSSH: int64 := 1;
+
+// libssh2 hostkey hash types
+pub con LIBSSH2_HOSTKEY_HASH_SHA256: int64 := 3;
+
+// libssh2 EAGAIN
+con LIBSSH2_ERROR_EAGAIN: int64 := 0xFFFFFFFFFFFFFFDB;  // -37
+
+// SSH host-key policy
+pub con SSH_HOSTKEY_POLICY_TOFU:   int64 := 1;  // trust-on-first-use (default)
+pub con SSH_HOSTKEY_POLICY_STRICT: int64 := 0;  // fail if not in known_hosts
 
 // SSH session wrapper
 pub type SSHSession = struct {
@@ -129,12 +174,21 @@ pub fn SSHConnect(session: SSHSession, host: int64, port: int64): int64 {
   // Perform SSH handshake
   ret := libssh2_session_handshake(session.session, conn.fd);
   if (ret != 0) {
+    sys_close(conn.fd);
     return -1;
   }
-  
+
   // Set timeout (30 seconds)
   libssh2_session_set_timeout(session.session, 30000);
-  
+
+  // Verify host key against ~/.ssh/known_hosts — TOFU policy (WP-3.1–3.4)
+  ret := ssh_verify_hostkey(session.session, host, port, SSH_HOSTKEY_POLICY_TOFU);
+  if (ret != 0) {
+    libssh2_session_disconnect_ex(session.session, 11, "Host key verification failed", 0);
+    sys_close(conn.fd);
+    return -1;
+  }
+
   session.connected := 1;
   return 0;
 }
@@ -334,21 +388,195 @@ pub fn SSHExecOutput(session: SSHSession, command: int64, maxOutput: int64): int
       break;
     }
     if (n == 0) {
-      // Check for EOF
       if (libssh2_channel_eof(channel.channel) != 0) {
         break;
       }
-      // No data yet, small delay
-      var i: int64 := 0;
-      while (i < 10000) {
-        i := i + 1;
-      }
+      // Block on socket instead of busy-wait (WP-3.6)
+      ssh_wait_socket(session.sock, session.session);
     }
     totalRead := totalRead + n;
   }
   
   SSHSendEof(channel);
   SSHClose(channel);
-  
+
   return buf;
+}
+
+// ============================================================================
+// WP-3: Internal helpers
+// ============================================================================
+
+fn ssh_hostkey_typemask(hktype: int64): int64 {
+  var keybits: int64;
+  if (hktype == 1)      { keybits := LIBSSH2_KNOWNHOST_KEY_SSHRSA; }
+  else if (hktype == 2) { keybits := LIBSSH2_KNOWNHOST_KEY_SSHDSS; }
+  else if (hktype == 3) { keybits := LIBSSH2_KNOWNHOST_KEY_ECDSA256; }
+  else if (hktype == 4) { keybits := LIBSSH2_KNOWNHOST_KEY_ECDSA384; }
+  else if (hktype == 5) { keybits := LIBSSH2_KNOWNHOST_KEY_ECDSA521; }
+  else if (hktype == 6) { keybits := LIBSSH2_KNOWNHOST_KEY_ED25519; }
+  else                  { keybits := LIBSSH2_KNOWNHOST_KEY_SSHRSA; }
+  return LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW | keybits;
+}
+
+fn ssh_known_hosts_path(outBuf: int64): int64 {
+  var home: int64 := getenv("HOME");
+  var i: int64 := 0;
+  if (home != 0) {
+    while (peek8(home + i) != 0) {
+      poke8(outBuf + i, peek8(home + i));
+      i := i + 1;
+    }
+  } else {
+    // fallback: /root
+    poke8(outBuf + 0, 47);  poke8(outBuf + 1, 114); poke8(outBuf + 2, 111);
+    poke8(outBuf + 3, 111); poke8(outBuf + 4, 116); i := 5;
+  }
+  // append /.ssh/known_hosts
+  poke8(outBuf + i, 47);  i := i + 1;  // /
+  poke8(outBuf + i, 46);  i := i + 1;  // .
+  poke8(outBuf + i, 115); i := i + 1;  // s
+  poke8(outBuf + i, 115); i := i + 1;  // s
+  poke8(outBuf + i, 104); i := i + 1;  // h
+  poke8(outBuf + i, 47);  i := i + 1;  // /
+  poke8(outBuf + i, 107); i := i + 1;  // k
+  poke8(outBuf + i, 110); i := i + 1;  // n
+  poke8(outBuf + i, 111); i := i + 1;  // o
+  poke8(outBuf + i, 119); i := i + 1;  // w
+  poke8(outBuf + i, 110); i := i + 1;  // n
+  poke8(outBuf + i, 95);  i := i + 1;  // _
+  poke8(outBuf + i, 104); i := i + 1;  // h
+  poke8(outBuf + i, 111); i := i + 1;  // o
+  poke8(outBuf + i, 115); i := i + 1;  // s
+  poke8(outBuf + i, 116); i := i + 1;  // t
+  poke8(outBuf + i, 115); i := i + 1;  // s
+  poke8(outBuf + i, 0);
+  return i;
+}
+
+// Verify host key against ~/.ssh/known_hosts.
+// policy: SSH_HOSTKEY_POLICY_TOFU adds+persists unknown hosts;
+//         SSH_HOSTKEY_POLICY_STRICT fails on unknown hosts.
+// Returns 0 on success, -1 on mismatch or failure.
+fn ssh_verify_hostkey(session: int64, host: int64, port: int64, policy: int64): int64 {
+  var lenPtr: int64 := alloc(8);
+  var typePtr: int64 := alloc(8);
+  poke64(lenPtr, 0); poke64(typePtr, 0);
+
+  var key: int64 := libssh2_session_hostkey(session, lenPtr, typePtr);
+  if (key == 0) {
+    free(lenPtr, 8); free(typePtr, 8);
+    return -1;
+  }
+
+  var klen: int64 := peek64(lenPtr);
+  var ktype: int64 := peek8(typePtr) | (peek8(typePtr + 1) << 8) |
+                      (peek8(typePtr + 2) << 16) | (peek8(typePtr + 3) << 24);
+  free(lenPtr, 8); free(typePtr, 8);
+
+  var hosts: int64 := libssh2_knownhost_init(session);
+  if (hosts == 0) { return -1; }
+
+  var pathBuf: int64 := alloc(512);
+  ssh_known_hosts_path(pathBuf);
+  libssh2_knownhost_readfile(hosts, pathBuf, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+
+  var tmask: int64 := ssh_hostkey_typemask(ktype);
+  var check: int64 := libssh2_knownhost_checkp(hosts, host, port, key, klen, tmask, 0);
+
+  var result: int64;
+  if (check == LIBSSH2_KNOWNHOST_CHECK_MATCH) {
+    result := 0;
+  } else if (check == LIBSSH2_KNOWNHOST_CHECK_NOTFOUND) {
+    if (policy == SSH_HOSTKEY_POLICY_TOFU) {
+      libssh2_knownhost_addc(hosts, host, 0, key, klen, 0, 0, tmask, 0);
+      libssh2_knownhost_writefile(hosts, pathBuf, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+      result := 0;
+    } else {
+      result := -1;
+    }
+  } else {
+    // MISMATCH or FAILURE — potential MITM
+    result := -1;
+  }
+
+  free(pathBuf, 512);
+  libssh2_knownhost_free(hosts);
+  return result;
+}
+
+// Block on the SSH socket fd using select() — replaces CPU busy-wait.
+// direction: result of libssh2_session_block_directions()
+fn ssh_wait_socket(sock: int64, session: int64) {
+  var dir: int64 := libssh2_session_block_directions(session);
+  var fdset: int64 := alloc(128);
+  var i: int64 := 0;
+  while (i < 128) { poke8(fdset + i, 0); i := i + 1; }
+  var byteIdx: int64 := sock / 8;
+  var bitMask: int64 := 1 << (sock % 8);
+  poke8(fdset + byteIdx, peek8(fdset + byteIdx) | bitMask);
+  var tv: int64 := alloc(16);
+  poke64(tv + 0, 10);   // 10s timeout
+  poke64(tv + 8, 0);
+  if ((dir & 1) != 0) {
+    sys_select(sock + 1, fdset as pchar, 0, 0, tv as pchar);
+  } else {
+    sys_select(sock + 1, 0, fdset as pchar, 0, tv as pchar);
+  }
+  free(fdset, 128);
+  free(tv, 16);
+}
+
+// ============================================================================
+// WP-3.4: SSHConnectVerified — explicit host-key policy
+// ============================================================================
+
+pub fn SSHConnectVerified(session: SSHSession, host: int64, port: int64, policy: int64): int64 {
+  var ip: int64;
+  var conn: TCPConn;
+  var ret: int64;
+
+  if (session.session == 0) { return -1; }
+
+  ip := GetHostByName(host);
+  if (ip == 0) { return -1; }
+
+  conn := TCPConnect(ip, port);
+  if (conn.fd < 0) { return -1; }
+
+  session.sock := conn.fd;
+
+  ret := libssh2_session_handshake(session.session, conn.fd);
+  if (ret != 0) {
+    sys_close(conn.fd);
+    return -1;
+  }
+
+  libssh2_session_set_timeout(session.session, 30000);
+
+  ret := ssh_verify_hostkey(session.session, host, port, policy);
+  if (ret != 0) {
+    libssh2_session_disconnect_ex(session.session, 11, "Host key verification failed", 0);
+    sys_close(conn.fd);
+    return -1;
+  }
+
+  session.connected := 1;
+  return 0;
+}
+
+// ============================================================================
+// WP-3.5: Public-Key authentication
+// ============================================================================
+
+pub fn SSHAuthPublicKey(session: SSHSession, username: int64, privateKeyPath: int64, passphrase: int64): int64 {
+  if (session.connected == 0) { return -1; }
+  var userLen: int64 := SSHStrLen(username);
+  var ret: int64 := libssh2_userauth_publickey_fromfile_ex(
+    session.session, username, userLen, 0, privateKeyPath, passphrase);
+  if (ret == 0) {
+    session.authenticated := 1;
+    return 0;
+  }
+  return -1;
 }
