@@ -81,18 +81,6 @@ Response-Parsing: nur Status-Code und Content-Length.
 
 ---
 
-### FEAT-07 — `std/hash.lyx`: HMAC-MD5 und xxHash64 fehlen noch
-
-**Erledigtes:** SHA-256 Multi-Block (`SHA256Init/Update/Final`), HMAC-SHA256, HashMap. ✅
-
-**Noch fehlend:**
-
-| Feature | Beschreibung |
-|---------|-------------|
-| HMAC-MD5 | Für Legacy-Protokolle (IMAP CRAM-MD5 etc.) |
-| xxHash64 | Schnellster nicht-kryptografischer Hash |
-
----
 
 ### FEAT-08 — `std/db/mysql.lyx`: Prepared Statements und Transaktionen fehlen
 
@@ -257,7 +245,6 @@ Response-Parsing: nur Status-Code und Content-Length.
 | FEAT-01 | `std/net/http.lyx` | ⬜ Offen | Mittel | Sehr hoch |
 | FEAT-02 | `std/fs.lyx` | 🟡 Fast fertig (nur FileGlob) | Klein | Sehr hoch |
 | FEAT-06 | `std/net/tls.lyx` | ⬜ Offen | Mittel | Hoch |
-| FEAT-07 | `std/hash.lyx` | 🟡 Fast fertig (HMAC-MD5, xxHash64) | Klein | Mittel |
 | FEAT-08 | `std/db/mysql.lyx` | ⬜ Offen | Groß | Mittel |
 | FEAT-09 | `std/db/redis.lyx` | ⬜ Offen | Mittel | Mittel |
 | FEAT-10 | `std/regex.lyx` | ⬜ Offen | Mittel | Mittel |
@@ -275,6 +262,6 @@ Response-Parsing: nur Status-Code und Content-Length.
 | FEAT-03 | `std/math.lyx` | GCD/LCM/IsPrime/NextPrime/IsPowerOfTwo/PopCount + SinF64/CosF64/TanF64/ExpF64/LogF64/SqrtF64/FloorF64/CeilF64/RoundF64/AbsF64/MinF64/MaxF64/PowF64 |
 | FEAT-04 | `std/string.lyx` | StrJoin/StrStartsWith/StrEndsWith/StrPadLeft/StrPadRight/StrRepeat/StrToInt64/Int64ToStr |
 | FEAT-05 | `std/list.lyx` | ListInt64 vollständig + Sort/Clone/Contains/Remove; Vec2List; RingBufferVec2; StaticList8/16; StackInt64; QueueInt64 |
-| FEAT-07 | `std/hash.lyx` | SHA-256 Multi-Block (RFC-konform) + HMAC-SHA256 + HashMap |
+| FEAT-07 | `std/hash.lyx` | SHA-256 Multi-Block + HMAC-SHA256 + HashMap + MD5 Streaming + HMAC-MD5 + xxHash64 |
 | FEAT-11 | `std/log.lyx` | log_set_file/color/timestamp + log_infof/debugf/warnf/errorf |
 | FEAT-02 | `std/fs.lyx` | MkDirAll + Readlink + MkTemp (nur FileGlob noch offen) |
