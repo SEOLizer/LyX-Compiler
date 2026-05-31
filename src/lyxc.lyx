@@ -52,6 +52,20 @@ import src.lic_build_flags;
 // Compiler Constants
 // ============================================================================
 
+// Export buffer entry (24 bytes: namePtr + nameLen + addr)
+con EXPBUF_SZ:          int64 := 24;
+con EXPBUF_OFF_NAMELEN: int64 := 8;
+con EXPBUF_OFF_ADDR:    int64 := 16;
+
+// Global reloc buffer entry (16 bytes: slotCodeOff + globalIdx)
+con GRELOCBUF_SZ:       int64 := 16;
+con GRELOCBUF_OFF_GIDX: int64 := 8;
+
+// LYU metadata header (custom format, poke64 at +8 = codeLen)
+con LYU_META_OFF_CODELEN: int64 := 8;
+
+// ELF reloc buffer entry in emit_arm64 (24 bytes: offset + info + addend)
+con RELOC_SZ:        int64 := 24;
 
 // Target architectures
 con TARGET_X86_64:       int64 := 1;
@@ -203,7 +217,7 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   poke8(payload + 2, 0x54);  // T
   poke8(payload + 3, 0x41);  // A
   poke32(payload + 4, pageCount);
-  poke64(payload + 8, codeLen);  // actual .text byte count for verifier
+  poke64(payload + LYU_META_OFF_CODELEN, codeLen);  // actual .text byte count for verifier
 
   var pi: int64 := 0;
   while (pi < pageCount) {
@@ -269,7 +283,7 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   //   e_shoff      = shoff (offset of section header table)
   //   e_shnum      = 3 (NULL, .meta_safe, .shstrtab)
   //   e_shstrndx   = 2 (.shstrtab is entry 2)
-  poke64(nbuf + 40, shoff);  // e_shoff
+  poke64(nbuf + ELF64_EHDR_OFF_SHOFF, shoff);  // e_shoff
   poke16(nbuf + 60, 3);      // e_shnum
   poke16(nbuf + 62, 2);      // e_shstrndx
 
@@ -282,27 +296,27 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   var sh1: int64 := nbuf + shoff + 64;
   poke32(sh1,      1);                        // sh_name = 1 (offset in .shstrtab)
   poke32(sh1 + 4,  7);                        // sh_type = SHT_NOTE
-  poke64(sh1 + 8,  2);                        // sh_flags = SHF_ALLOC (read-only; no SHF_WRITE/SHF_EXECINSTR)
-  poke64(sh1 + 16, 0);                        // sh_addr = 0 (not loaded)
-  poke64(sh1 + 24, fileSize);                 // sh_offset = right after original ELF
-  poke64(sh1 + 32, payloadSize);              // sh_size
+  poke64(sh1 + ELF64_SHDR_OFF_FLAGS,  2);                        // sh_flags = SHF_ALLOC (read-only; no SHF_WRITE/SHF_EXECINSTR)
+  poke64(sh1 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr = 0 (not loaded)
+  poke64(sh1 + ELF64_SHDR_OFF_OFFSET, fileSize);                 // sh_offset = right after original ELF
+  poke64(sh1 + ELF64_SHDR_OFF_SIZE, payloadSize);              // sh_size
   poke32(sh1 + 40, 0);                        // sh_link
   poke32(sh1 + 44, 0);                        // sh_info
-  poke64(sh1 + 48, 4);                        // sh_addralign
-  poke64(sh1 + 56, 0);                        // sh_entsize
+  poke64(sh1 + ELF64_SHDR_OFF_ALIGN, 4);                        // sh_addralign
+  poke64(sh1 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
 
   // [2] .shstrtab — SHT_STRTAB=3
   var sh2: int64 := nbuf + shoff + 128;
   poke32(sh2,      12);                       // sh_name = 12 (offset of ".shstrtab" in .shstrtab)
   poke32(sh2 + 4,  3);                        // sh_type = SHT_STRTAB
-  poke64(sh2 + 8,  0);                        // sh_flags
-  poke64(sh2 + 16, 0);                        // sh_addr
-  poke64(sh2 + 24, fileSize + payloadSize);   // sh_offset
-  poke64(sh2 + 32, shstrSize);                // sh_size
+  poke64(sh2 + ELF64_SHDR_OFF_FLAGS,  0);                        // sh_flags
+  poke64(sh2 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr
+  poke64(sh2 + ELF64_SHDR_OFF_OFFSET, fileSize + payloadSize);   // sh_offset
+  poke64(sh2 + ELF64_SHDR_OFF_SIZE, shstrSize);                // sh_size
   poke32(sh2 + 40, 0);                        // sh_link
   poke32(sh2 + 44, 0);                        // sh_info
-  poke64(sh2 + 48, 1);                        // sh_addralign
-  poke64(sh2 + 56, 0);                        // sh_entsize
+  poke64(sh2 + ELF64_SHDR_OFF_ALIGN, 1);                        // sh_addralign
+  poke64(sh2 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
 
   // Write new ELF file (overwrite)
   var wfd: int64 := open(path, 577, 493);  // O_WRONLY|O_CREAT|O_TRUNC, 0755
@@ -1608,8 +1622,8 @@ pub type CompilerConfig = class {
     var nd: int64 := astRoot;
     while (nd >= 0) {
       if (peek64(nodes + nd * 88) == 95) {  // LFD_NK_FORM = 95
-        var nameOff: int64 := peek64(nodes + nd * 88 + 64);
-        var nameLen: int64 := peek64(nodes + nd * 88 + 72);
+        var nameOff: int64 := peek64(nodes + nd * PARSER_NODE_SIZE + NODE_OFF_SVAL);
+        var nameLen: int64 := peek64(nodes + nd * PARSER_NODE_SIZE + NODE_OFF_SLEN);
 
         // Build base path: inputFile directory + formName
         var inputLen: int64 := StrLen(inputFile);
@@ -1700,7 +1714,7 @@ pub type CompilerConfig = class {
           PrintStrLn(cppPath);
         }
       }
-      nd := peek64(nodes + nd * 88 + 40);  // next
+      nd := peek64(nodes + nd * PARSER_NODE_SIZE + NODE_OFF_NEXT);  // next
     }
   }
 
@@ -1804,7 +1818,7 @@ pub type CompilerConfig = class {
 
   fn emitARM64(irMod: int64): int64 {
     // If the IR module has functions, use the IR-based emitter.
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
@@ -1940,7 +1954,7 @@ pub type CompilerConfig = class {
   fn emitMacOSARM64(irMod: int64): int64 {
     // macOS ARM64 (Apple Silicon): 16-byte _start stub + IR-emitted code.
     // Syscall convention: number in x16, SVC #0x80; exit = 0x2000001.
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
@@ -2032,7 +2046,7 @@ pub type CompilerConfig = class {
     if outPath == 0 as pchar { outPath := "a.exe"c; }
     var wab: WinARM64Backend := new WinARM64Backend();
     wab.Init();
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
@@ -2051,7 +2065,7 @@ pub type CompilerConfig = class {
     if outPath == 0 as pchar { outPath := "a.out"c; }
     var rlb: RiscvLinuxBackend := new RiscvLinuxBackend();
     rlb.Init();
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitRISCV64 := new EmitRISCV64();
       emitter.init(irMod);
@@ -2070,7 +2084,7 @@ pub type CompilerConfig = class {
     if outPath == 0 as pchar { outPath := "a.elf"c; }
     var acb: ARMCMBackend := new ARMCMBackend();
     acb.Init();
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitARMCM := new EmitARMCM();
       emitter.init(irMod);
@@ -2089,7 +2103,7 @@ pub type CompilerConfig = class {
     if outPath == 0 as pchar { outPath := "a.elf"c; }
     var xb: XtensaBackend := new XtensaBackend();
     xb.Init();
-    var funcCount: int64 := peek64(irMod + 96);
+    var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
       var emitter: EmitXtensa := new EmitXtensa();
       emitter.init(irMod);
@@ -2187,10 +2201,10 @@ pub type CompilerConfig = class {
       var off: int64 := parser.nodes + cur * PARSER_NODE_SIZE;
       var kind: int64 := peek64(off + 0);
       if kind == NK_FUNC_DECL {
-        var anno: int64 := peek64(off + 56);
+        var anno: int64 := peek64(off + NODE_OFF_IVAL);
         if (anno & EXPORT_MASK) != 0 { count := count + 1; }
       }
-      cur := peek64(off + 40);
+      cur := peek64(off + NODE_OFF_NEXT);
     }
 
     self.exportCount := count;
@@ -2206,7 +2220,7 @@ pub type CompilerConfig = class {
       var off2:  int64 := parser.nodes + cur * PARSER_NODE_SIZE;
       var kind2: int64 := peek64(off2 + 0);
       if kind2 == NK_FUNC_DECL {
-        var anno2: int64 := peek64(off2 + 56);
+        var anno2: int64 := peek64(off2 + NODE_OFF_IVAL);
         if (anno2 & EXPORT_MASK) != 0 {
           var addr: int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           var namePtr: int64 := 0;
@@ -2215,31 +2229,31 @@ pub type CompilerConfig = class {
             var jniRec: int64 := parser.FindJniEntry(cur);
             if jniRec != 0 {
               var cOff: int64 := peek64(jniRec +  8);
-              var cLen: int64 := peek64(jniRec + 16);
-              var mOff: int64 := peek64(jniRec + 24);
-              var mLen: int64 := peek64(jniRec + 32);
+              var cLen: int64 := peek64(jniRec + JNI_REC_OFF_CLASSLEN);
+              var mOff: int64 := peek64(jniRec + JNI_REC_OFF_METHODOFF);
+              var mLen: int64 := peek64(jniRec + JNI_REC_OFF_METHODLEN);
               var beforeLen: int64 := self.mangledNamesLen;
               namePtr := self._mangleJniName((parser.src as int64) + cOff, cLen,
                                              (parser.src as int64) + mOff, mLen);
               nameLen := self.mangledNamesLen - beforeLen - 1;  // exclude NUL
             } else {
               // @jni without args parsed — fall back to the raw function name.
-              namePtr := (parser.src as int64) + peek64(off2 + 64);
-              nameLen := peek64(off2 + 72);
+              namePtr := (parser.src as int64) + peek64(off2 + NODE_OFF_SVAL);
+              nameLen := peek64(off2 + NODE_OFF_SLEN);
             }
           } else {
-            namePtr := (parser.src as int64) + peek64(off2 + 64);
-            nameLen := peek64(off2 + 72);
+            namePtr := (parser.src as int64) + peek64(off2 + NODE_OFF_SVAL);
+            nameLen := peek64(off2 + NODE_OFF_SLEN);
           }
           var rec: int64 := self.exportBuf + idx * 24;
           poke64(rec +  0, namePtr);
           poke64(rec +  8, nameLen);
-          poke64(rec + 16, addr);
+          poke64(rec + EXPBUF_OFF_ADDR, addr);
           idx := idx + 1;
         }
         funcId := funcId + 1;
       }
-      cur := peek64(off2 + 40);
+      cur := peek64(off2 + NODE_OFF_NEXT);
     }
   }
 
@@ -2270,7 +2284,7 @@ pub type CompilerConfig = class {
     var interpStr: pchar := "/lib/ld-linux-aarch64.so.1";
     var interpLen: int64 := StrLen(interpStr) + 1;
     var nExt: int64 := self.armExternCount;
-    var strBuf: int64 := peek64(self.irModulePtr + 32);   // IR string table
+    var strBuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_STRBUF);   // IR string table
 
     // ---- .dynstr: \0 + distinct lib names + symbol names ----
     var dynstr: int64 := mmap(0, 65536, 3, 34, -1, 0);
@@ -2284,8 +2298,8 @@ pub type CompilerConfig = class {
     var ei: int64 := 0;
     while ei < nExt {
       var eb: int64 := self.armExternBuf + ei * 32;
-      var libOff: int64 := peek64(eb + 16);
-      var libLen: int64 := peek64(eb + 24);
+      var libOff: int64 := peek64(eb + CG_EXTERN_OFF_LIBPTR);
+      var libLen: int64 := peek64(eb + CG_EXTERN_OFF_LIBLEN);
       var u: int64 := 0;
       var found: int64 := -1;
       while u < uniqCount {
@@ -2314,7 +2328,7 @@ pub type CompilerConfig = class {
     while ei < nExt {
       var eb2: int64 := self.armExternBuf + ei * 32;
       var nmOff: int64 := peek64(eb2);
-      var nmLen: int64 := peek64(eb2 + 8);
+      var nmLen: int64 := peek64(eb2 + CG_EXTERN_OFF_NAMELEN);
       var soff: int64 := dsLen;
       var j2: int64 := 0;
       while j2 < nmLen { poke8(dynstr + dsLen, peek8(strBuf + nmOff + j2)); dsLen := dsLen + 1; j2 := j2 + 1; }
@@ -2346,9 +2360,9 @@ pub type CompilerConfig = class {
     poke16(buf + 16, 2);             // ET_EXEC
     poke16(buf + 18, 183);           // EM_AARCH64
     poke32(buf + 20, 1);
-    poke64(buf + 24, 0x401000);      // e_entry
-    poke64(buf + 32, 64);            // e_phoff
-    poke64(buf + 40, 0);             // e_shoff
+    poke64(buf + ELF64_EHDR_OFF_ENTRY, 0x401000);
+    poke64(buf + ELF64_EHDR_OFF_PHOFF, 64);
+    poke64(buf + ELF64_EHDR_OFF_SHOFF, 0);
     poke32(buf + 48, 0);
     poke16(buf + 52, 64);
     poke16(buf + 54, 56);
@@ -2358,16 +2372,16 @@ pub type CompilerConfig = class {
     // program headers
     var ph: int64 := buf + 64;
     poke32(ph, 1); poke32(ph + 4, 7);                                   // PT_LOAD, RWX
-    poke64(ph + 8, 0); poke64(ph + 16, baseVA); poke64(ph + 24, baseVA);
-    poke64(ph + 32, fileSize); poke64(ph + 40, fileSize); poke64(ph + 48, 0x10000);
+    poke64(ph + ELF64_PHDR_OFF_OFFSET, 0); poke64(ph + ELF64_PHDR_OFF_VADDR, baseVA); poke64(ph + ELF64_PHDR_OFF_PADDR, baseVA);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, fileSize); poke64(ph + ELF64_PHDR_OFF_MEMSZ, fileSize); poke64(ph + ELF64_PHDR_OFF_ALIGN, 0x10000);
     var ph2: int64 := buf + 120;
     poke32(ph2, 3); poke32(ph2 + 4, 4);                                 // PT_INTERP, R
-    poke64(ph2 + 8, interpOff); poke64(ph2 + 16, baseVA + interpOff); poke64(ph2 + 24, baseVA + interpOff);
-    poke64(ph2 + 32, interpLen); poke64(ph2 + 40, interpLen); poke64(ph2 + 48, 1);
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, interpOff); poke64(ph2 + ELF64_PHDR_OFF_VADDR, baseVA + interpOff); poke64(ph2 + ELF64_PHDR_OFF_PADDR, baseVA + interpOff);
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, interpLen); poke64(ph2 + ELF64_PHDR_OFF_MEMSZ, interpLen); poke64(ph2 + ELF64_PHDR_OFF_ALIGN, 1);
     var ph3: int64 := buf + 176;
     poke32(ph3, 2); poke32(ph3 + 4, 6);                                 // PT_DYNAMIC, RW
-    poke64(ph3 + 8, dynOff); poke64(ph3 + 16, baseVA + dynOff); poke64(ph3 + 24, baseVA + dynOff);
-    poke64(ph3 + 32, dynSize); poke64(ph3 + 40, dynSize); poke64(ph3 + 48, 8);
+    poke64(ph3 + ELF64_PHDR_OFF_OFFSET, dynOff); poke64(ph3 + ELF64_PHDR_OFF_VADDR, baseVA + dynOff); poke64(ph3 + ELF64_PHDR_OFF_PADDR, baseVA + dynOff);
+    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, dynSize); poke64(ph3 + ELF64_PHDR_OFF_MEMSZ, dynSize); poke64(ph3 + ELF64_PHDR_OFF_ALIGN, 8);
 
     // .interp
     var ii: int64 := 0;
@@ -2402,8 +2416,8 @@ pub type CompilerConfig = class {
       var src: int64 := self.relocBuf + ri * 24;
       var ra: int64 := buf + relaOff + ri * 24;
       poke64(ra, 0x401000 + self.codeStubOff + peek64(src));   // r_offset (slot VA)
-      poke64(ra + 8, peek64(src + 8));                          // r_info (sym<<32|GLOB_DAT)
-      poke64(ra + 16, peek64(src + 16));                        // r_addend
+      poke64(ra + 8, peek64(src + ELF64_RELA_OFF_INFO));                          // r_info (sym<<32|GLOB_DAT)
+      poke64(ra + 16, peek64(src + ELF64_RELA_OFF_ADDEND));                        // r_addend
       ri := ri + 1;
     }
 
@@ -2411,19 +2425,19 @@ pub type CompilerConfig = class {
     var dp: int64 := buf + dynOff;
     var u2: int64 := 0;
     while u2 < uniqCount {
-      poke64(dp, 1); poke64(dp + 8, peek64(uniqLibStr + u2 * 8)); dp := dp + 16;  // DT_NEEDED
+      poke64(dp, 1); poke64(dp + ELF64_DYN_OFF_VAL, peek64(uniqLibStr + u2 * 8)); dp := dp + 16;  // DT_NEEDED
       u2 := u2 + 1;
     }
-    poke64(dp, 4);  poke64(dp + 8, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
-    poke64(dp, 5);  poke64(dp + 8, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
-    poke64(dp, 6);  poke64(dp + 8, baseVA + dynsymOff); dp := dp + 16;   // DT_SYMTAB
-    poke64(dp, 10); poke64(dp + 8, dynstrSize);         dp := dp + 16;   // DT_STRSZ
-    poke64(dp, 11); poke64(dp + 8, 24);                 dp := dp + 16;   // DT_SYMENT
-    poke64(dp, 7);  poke64(dp + 8, baseVA + relaOff);   dp := dp + 16;   // DT_RELA
-    poke64(dp, 8);  poke64(dp + 8, relaSize);           dp := dp + 16;   // DT_RELASZ
-    poke64(dp, 9);  poke64(dp + 8, 24);                 dp := dp + 16;   // DT_RELAENT
-    poke64(dp, 30); poke64(dp + 8, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
-    poke64(dp, 0);  poke64(dp + 8, 0);                                    // DT_NULL
+    poke64(dp, 4);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + ELF64_DYN_OFF_VAL, dynstrSize);         dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + ELF64_DYN_OFF_VAL, 24);                 dp := dp + 16;   // DT_SYMENT
+    poke64(dp, 7);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + relaOff);   dp := dp + 16;   // DT_RELA
+    poke64(dp, 8);  poke64(dp + ELF64_DYN_OFF_VAL, relaSize);           dp := dp + 16;   // DT_RELASZ
+    poke64(dp, 9);  poke64(dp + ELF64_DYN_OFF_VAL, 24);                 dp := dp + 16;   // DT_RELAENT
+    poke64(dp, 30); poke64(dp + ELF64_DYN_OFF_VAL, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + ELF64_DYN_OFF_VAL, 0);                                    // DT_NULL
 
     var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;
     munmap(buf, fileSize);
@@ -2496,11 +2510,11 @@ pub type CompilerConfig = class {
     // e_version (offset 20): EV_CURRENT = 1
     poke32(elfBuf + 20, 1);
     // e_entry (offset 24): entry point = 0x401000
-    poke64(elfBuf + 24, 0x401000);
+    poke64(elfBuf + ELF64_EHDR_OFF_ENTRY, 0x401000);
     // e_phoff (offset 32): program header offset = 64
-    poke64(elfBuf + 32, 64);
+    poke64(elfBuf + ELF64_EHDR_OFF_PHOFF, 64);
     // e_shoff (offset 40): no section headers = 0
-    poke64(elfBuf + 40, 0);
+    poke64(elfBuf + ELF64_EHDR_OFF_SHOFF, 0);
     // e_flags (offset 48): 0
     poke32(elfBuf + 48, 0);
     // e_ehsize (offset 52): 64
@@ -2567,7 +2581,7 @@ pub type CompilerConfig = class {
     var expNamesBytes: int64 := 0;
     var ei: int64 := 0;
     while ei < expCount {
-      expNamesBytes := expNamesBytes + peek64(expBuf + ei * 24 + 8) + 1;
+      expNamesBytes := expNamesBytes + peek64(expBuf + ei * EXPBUF_SZ + EXPBUF_OFF_NAMELEN) + 1;
       ei := ei + 1;
     }
 
@@ -2576,7 +2590,7 @@ pub type CompilerConfig = class {
     // global-load slot before any layout depends on relaSize.
     var globalCountEarly: int64 := 0;
     if self.irModulePtr != 0 {
-      globalCountEarly := peek64(self.irModulePtr + 120);
+      globalCountEarly := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN);
     }
     var extraGlobalRelocs: int64 := self.globalRelocCount;
     var relCount: int64 := self.relocCount + extraGlobalRelocs;
@@ -2690,9 +2704,9 @@ pub type CompilerConfig = class {
     if self.target == TARGET_ANDROID_ARM64 { emach := 183; }
     poke16(buf + 18, emach);                        // e_machine
     poke32(buf + 20, 1);                            // e_version
-    poke64(buf + 24, 0);                            // e_entry = 0 (shared lib)
-    poke64(buf + 32, 64);                           // e_phoff
-    poke64(buf + 40, 0);                            // e_shoff = 0 (no section headers)
+    poke64(buf + ELF64_EHDR_OFF_ENTRY, 0);
+    poke64(buf + ELF64_EHDR_OFF_PHOFF, 64);
+    poke64(buf + ELF64_EHDR_OFF_SHOFF, 0);
     poke32(buf + 48, 0);                            // e_flags
     poke16(buf + 52, 64);                           // e_ehsize
     poke16(buf + 54, 56);                           // e_phentsize
@@ -2775,25 +2789,25 @@ pub type CompilerConfig = class {
     // Tag values via Elf64_Dyn (d_tag: i64, d_un: u64).
     var d: int64 := dynOff;
     // DT_HASH = 4
-    poke64(buf + d, 4);         poke64(buf + d + 8, hashOff);    d := d + 16;
+    poke64(buf + d, 4);         poke64(buf + d + ELF64_DYN_OFF_VAL, hashOff);    d := d + 16;
     // DT_STRTAB = 5
-    poke64(buf + d, 5);         poke64(buf + d + 8, dynstrOff);  d := d + 16;
+    poke64(buf + d, 5);         poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrOff);  d := d + 16;
     // DT_SYMTAB = 6
-    poke64(buf + d, 6);         poke64(buf + d + 8, dynsymOff);  d := d + 16;
+    poke64(buf + d, 6);         poke64(buf + d + ELF64_DYN_OFF_VAL, dynsymOff);  d := d + 16;
     // DT_STRSZ = 10
-    poke64(buf + d, 10);        poke64(buf + d + 8, dynstrSize); d := d + 16;
+    poke64(buf + d, 10);        poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrSize); d := d + 16;
     // DT_SYMENT = 11
-    poke64(buf + d, 11);        poke64(buf + d + 8, 24);         d := d + 16;
+    poke64(buf + d, 11);        poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;
     // DT_SONAME = 14 (string at offset 1 into .dynstr)
-    poke64(buf + d, 14);        poke64(buf + d + 8, 1);          d := d + 16;
+    poke64(buf + d, 14);        poke64(buf + d + ELF64_DYN_OFF_VAL, 1);          d := d + 16;
     // Phase C: DT_RELA / DT_RELASZ / DT_RELAENT if any relocations present.
     if hasRelocs != 0 {
-      poke64(buf + d, 7);       poke64(buf + d + 8, relaOff);    d := d + 16;  // DT_RELA
-      poke64(buf + d, 8);       poke64(buf + d + 8, relaSize);   d := d + 16;  // DT_RELASZ
-      poke64(buf + d, 9);       poke64(buf + d + 8, 24);         d := d + 16;  // DT_RELAENT
+      poke64(buf + d, 7);       poke64(buf + d + ELF64_DYN_OFF_VAL, relaOff);    d := d + 16;  // DT_RELA
+      poke64(buf + d, 8);       poke64(buf + d + ELF64_DYN_OFF_VAL, relaSize);   d := d + 16;  // DT_RELASZ
+      poke64(buf + d, 9);       poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;  // DT_RELAENT
     }
     // DT_NULL = 0 (terminator)
-    poke64(buf + d, 0);         poke64(buf + d + 8, 0);
+    poke64(buf + d, 0);         poke64(buf + d + ELF64_DYN_OFF_VAL, 0);
 
     // ---- .dynstr ----
     // Byte 0: NUL (already zero)
@@ -2812,7 +2826,7 @@ pub type CompilerConfig = class {
     while ej < expCount {
       var rec: int64 := expBuf + ej * 24;
       var nPtr: int64 := peek64(rec + 0);          // absolute name pointer
-      var nLen: int64 := peek64(rec + 8);
+      var nLen: int64 := peek64(rec + EXPBUF_OFF_NAMELEN);
       var nameStart: int64 := nextStr;             // record where this name lands
       var ci: int64 := 0;
       while ci < nLen {
@@ -2833,14 +2847,14 @@ pub type CompilerConfig = class {
     while ek < expCount {
       var rec2:  int64 := expBuf + ek * 24;
       var dnOff: int64 := peek64(rec2 + 0);        // offset into .dynstr (set above)
-      var addr:  int64 := peek64(rec2 + 16);       // st_value
+      var addr:  int64 := peek64(rec2 + EXPBUF_OFF_ADDR);       // st_value
       var symOff: int64 := dynsymOff + (1 + ek) * 24;
       poke32(buf + symOff + 0,  dnOff);            // st_name
       poke8(buf + symOff + 4,   0x12);             // st_info = (STB_GLOBAL<<4)|STT_FUNC
       poke8(buf + symOff + 5,   0);                // st_other
       poke16(buf + symOff + 6,  1);                // st_shndx (placeholder, any non-zero)
-      poke64(buf + symOff + 8,  addr);             // st_value
-      poke64(buf + symOff + 16, 0);                // st_size (unknown)
+      poke64(buf + symOff + ELF64_SYM_OFF_VALUE,  addr);             // st_value
+      poke64(buf + symOff + ELF64_SYM_OFF_SIZE, 0);                // st_size (unknown)
       ek := ek + 1;
     }
 
@@ -2875,11 +2889,11 @@ pub type CompilerConfig = class {
         var src: int64 := relBuf + ri * 24;
         var rOffCode: int64 := peek64(src +  0);
         var rInfo:    int64 := peek64(src +  8);
-        var rAddend:  int64 := peek64(src + 16);
+        var rAddend:  int64 := peek64(src + ELF64_RELA_OFF_ADDEND);
         var dst: int64 := relaOff + ri * 24;
         poke64(buf + dst +  0, codeOff + rOffCode);
         poke64(buf + dst +  8, rInfo);
-        poke64(buf + dst + 16, rAddend);
+        poke64(buf + dst + ELF64_RELA_OFF_ADDEND, rAddend);
         ri := ri + 1;
       }
       // WP-AND-upstream-fix v5: append per-global R_AARCH64_RELATIVE entries.
@@ -2892,9 +2906,9 @@ pub type CompilerConfig = class {
       if hasGlobals != 0 {
         var gi: int64 := 0;
         while gi < self.globalRelocCount {
-          var gsrc: int64 := self.globalRelocBuf + gi * 16;
+          var gsrc: int64 := self.globalRelocBuf + gi * GRELOCBUF_SZ;
           var slotCodeOff: int64 := peek64(gsrc + 0);
-          var gIdx:        int64 := peek64(gsrc + 8);
+          var gIdx:        int64 := peek64(gsrc + GRELOCBUF_OFF_GIDX);
           var gAddend:     int64 := globalsOff + gIdx * 8;
           // Bake the resolved address into the literal-pool slot.
           poke64(buf + codeOff + slotCodeOff, gAddend);
@@ -2902,7 +2916,7 @@ pub type CompilerConfig = class {
           var gdst: int64 := relaOff + (self.relocCount + gi) * 24;
           poke64(buf + gdst +  0, codeOff + slotCodeOff);
           poke64(buf + gdst +  8, 1027);       // R_AARCH64_RELATIVE
-          poke64(buf + gdst + 16, gAddend);
+          poke64(buf + gdst + ELF64_RELA_OFF_ADDEND, gAddend);
           gi := gi + 1;
         }
       }
@@ -2913,7 +2927,7 @@ pub type CompilerConfig = class {
     // Sourced from the IR module's globalBuffer, which ir_lower populated
     // during the lowerModule pre-pass.
     if hasGlobals != 0 {
-      var gbuf: int64 := peek64(self.irModulePtr + 104);
+      var gbuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALBUF);
       var dgi: int64 := 0;
       while dgi < globalCount {
         poke64(buf + globalsOff + dgi * 8, peek64(gbuf + dgi * 8));
@@ -3312,14 +3326,14 @@ pub type CompilerConfig = class {
     while cur >= 0 {
       var base: int64 := nodes + cur * 88;
       var kind: int64 := peek64(base);
-      var nc0:  int64 := peek64(base + 8);
-      var nc1:  int64 := peek64(base + 16);
-      var nc2:  int64 := peek64(base + 24);
-      var nc3:  int64 := peek64(base + 32);
-      var nxt:  int64 := peek64(base + 40);
-      var iVal: int64 := peek64(base + 56);
-      var sOff: int64 := peek64(base + 64);
-      var sLen: int64 := peek64(base + 72);
+      var nc0:  int64 := peek64(base + NODE_OFF_C0);
+      var nc1:  int64 := peek64(base + NODE_OFF_C1);
+      var nc2:  int64 := peek64(base + NODE_OFF_C2);
+      var nc3:  int64 := peek64(base + NODE_OFF_C3);
+      var nxt:  int64 := peek64(base + NODE_OFF_NEXT);
+      var iVal: int64 := peek64(base + NODE_OFF_IVAL);
+      var sOff: int64 := peek64(base + NODE_OFF_SVAL);
+      var sLen: int64 := peek64(base + NODE_OFF_SLEN);
 
       var d: int64 := 0;
       while d < depth {
@@ -3400,8 +3414,8 @@ pub type CompilerConfig = class {
       } else {
         var base: int64 := pNodes + astNi * 88;
         var kind: int64 := peek64(base);
-        var sOff: int64 := peek64(base + 64);
-        var sLen: int64 := peek64(base + 72);
+        var sOff: int64 := peek64(base + NODE_OFF_SVAL);
+        var sLen: int64 := peek64(base + NODE_OFF_SLEN);
         PrintStr("AST["c);
         PrintInt(astNi);
         PrintStr("] "c);
@@ -3956,7 +3970,7 @@ pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
     return 1;
   }
 
-  var shoff:    int64 := peek64(ehdr + 40);
+  var shoff:    int64 := peek64(ehdr + ELF64_EHDR_OFF_SHOFF);
   var shnum:    int64 := peek16(ehdr + 60);
   var shstrndx: int64 := peek16(ehdr + 62);
   munmap(ehdr, 64);
@@ -3976,8 +3990,8 @@ pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
 
   // Read .shstrtab
   var strsHdr: int64 := shdrs + shstrndx * 64;
-  var strsOff:  int64 := peek64(strsHdr + 24);
-  var strsSize: int64 := peek64(strsHdr + 32);
+  var strsOff:  int64 := peek64(strsHdr + ELF64_SHDR_OFF_OFFSET);
+  var strsSize: int64 := peek64(strsHdr + ELF64_SHDR_OFF_SIZE);
   var strs: int64 := mmap(0, strsSize + 8, 3, 34, -1, 0);
   lseek(fd, strsOff, 0);
   read(fd, strs as pchar, strsSize);
@@ -3994,8 +4008,8 @@ pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
       if peek8(nm)   == 46  && peek8(nm+1) == 108 && peek8(nm+2) == 121 &&
          peek8(nm+3) == 120 && peek8(nm+4) == 95  && peek8(nm+5) == 108 &&
          peek8(nm+6) == 105 && peek8(nm+7) == 99  && peek8(nm+8) == 0 {
-        licOff  := peek64(sh + 24);
-        licSize := peek64(sh + 32);
+        licOff  := peek64(sh + ELF64_SHDR_OFF_OFFSET);
+        licSize := peek64(sh + ELF64_SHDR_OFF_SIZE);
       }
     }
     si := si + 1;
