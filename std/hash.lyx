@@ -1933,3 +1933,412 @@ pub fn PasswordStrength(password: pchar): int64 {
 }
 
 // End of std/hash.lyx
+
+// ============================================================================
+// FEAT-07: SHA-256 Multi-Block Streaming API
+// Context layout (128 bytes):
+//   [0..31]  : h0..h7 (je int64, nur lower 32 Bits genutzt)
+//   [64..71] : total bytes processed (int64)
+//   [72]     : buffer fill level (int64)
+//   [80..143]: 64-byte partial block buffer
+// ============================================================================
+
+con SHA256_CTX_SIZE: int64 := 144;
+con SHA256_H_OFF:    int64 := 0;   // 8 × int64 = 64 bytes for h0..h7
+con SHA256_LEN_OFF:  int64 := 64;  // total bytes processed
+con SHA256_FILL_OFF: int64 := 72;  // partial block fill level
+con SHA256_BUF_OFF:  int64 := 80;  // 64-byte block buffer
+
+// SHA-256 K constants (first 64)
+fn sha256_k(i: int64): int64 {
+  if (i ==  0) { return 0x428a2f98; } if (i ==  1) { return 0x71374491; }
+  if (i ==  2) { return 0xb5c0fbcf; } if (i ==  3) { return 0xe9b5dba5; }
+  if (i ==  4) { return 0x3956c25b; } if (i ==  5) { return 0x59f111f1; }
+  if (i ==  6) { return 0x923f82a4; } if (i ==  7) { return 0xab1c5ed5; }
+  if (i ==  8) { return 0xd807aa98; } if (i ==  9) { return 0x12835b01; }
+  if (i == 10) { return 0x243185be; } if (i == 11) { return 0x550c7dc3; }
+  if (i == 12) { return 0x72be5d74; } if (i == 13) { return 0x80deb1fe; }
+  if (i == 14) { return 0x9bdc06a7; } if (i == 15) { return 0xc19bf174; }
+  if (i == 16) { return 0xe49b69c1; } if (i == 17) { return 0xefbe4786; }
+  if (i == 18) { return 0x0fc19dc6; } if (i == 19) { return 0x240ca1cc; }
+  if (i == 20) { return 0x2de92c6f; } if (i == 21) { return 0x4a7484aa; }
+  if (i == 22) { return 0x5cb0a9dc; } if (i == 23) { return 0x76f988da; }
+  if (i == 24) { return 0x983e5152; } if (i == 25) { return 0xa831c66d; }
+  if (i == 26) { return 0xb00327c8; } if (i == 27) { return 0xbf597fc7; }
+  if (i == 28) { return 0xc6e00bf3; } if (i == 29) { return 0xd5a79147; }
+  if (i == 30) { return 0x06ca6351; } if (i == 31) { return 0x14292967; }
+  if (i == 32) { return 0x27b70a85; } if (i == 33) { return 0x2e1b2138; }
+  if (i == 34) { return 0x4d2c6dfc; } if (i == 35) { return 0x53380d13; }
+  if (i == 36) { return 0x650a7354; } if (i == 37) { return 0x766a0abb; }
+  if (i == 38) { return 0x81c2c92e; } if (i == 39) { return 0x92722c85; }
+  if (i == 40) { return 0xa2bfe8a1; } if (i == 41) { return 0xa81a664b; }
+  if (i == 42) { return 0xc24b8b70; } if (i == 43) { return 0xc76c51a3; }
+  if (i == 44) { return 0xd192e819; } if (i == 45) { return 0xd6990624; }
+  if (i == 46) { return 0xf40e3585; } if (i == 47) { return 0x106aa070; }
+  if (i == 48) { return 0x19a4c116; } if (i == 49) { return 0x1e376c08; }
+  if (i == 50) { return 0x2748774c; } if (i == 51) { return 0x34b0bcb5; }
+  if (i == 52) { return 0x391c0cb3; } if (i == 53) { return 0x4ed8aa4a; }
+  if (i == 54) { return 0x5b9cca4f; } if (i == 55) { return 0x682e6ff3; }
+  if (i == 56) { return 0x748f82ee; } if (i == 57) { return 0x78a5636f; }
+  if (i == 58) { return 0x84c87814; } if (i == 59) { return 0x8cc70208; }
+  if (i == 60) { return 0x90befffa; } if (i == 61) { return 0xa4506ceb; }
+  if (i == 62) { return 0xbef9a3f7; } if (i == 63) { return 0xc67178f2; }
+  return 0;
+}
+
+// Compress one 64-byte block into context state
+fn sha256_compress(ctx: int64, block: int64): void {
+  var w: int64 := alloc(64 * 8);
+  var i: int64 := 0;
+  // Load first 16 words from block (big-endian 32-bit)
+  while (i < 16) {
+    var off: int64 := i * 4;
+    var b0: int64 := peek8(block + off);
+    var b1: int64 := peek8(block + off + 1);
+    var b2: int64 := peek8(block + off + 2);
+    var b3: int64 := peek8(block + off + 3);
+    poke64(w + i * 8, ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0xFFFFFFFF);
+    i := i + 1;
+  }
+  // Expand to 64 words
+  while (i < 64) {
+    var w2:  int64 := peek64(w + (i-2)  * 8);
+    var w7:  int64 := peek64(w + (i-7)  * 8);
+    var w15: int64 := peek64(w + (i-15) * 8);
+    var w16: int64 := peek64(w + (i-16) * 8);
+    var s0: int64 := Gamma0(w15);
+    var s1: int64 := Gamma1(w2);
+    poke64(w + i * 8, (w16 + s0 + w7 + s1) & 0xFFFFFFFF);
+    i := i + 1;
+  }
+  // Initialize working variables from state
+  var a: int64 := peek64(ctx + SHA256_H_OFF);
+  var b: int64 := peek64(ctx + SHA256_H_OFF + 8);
+  var c: int64 := peek64(ctx + SHA256_H_OFF + 16);
+  var d: int64 := peek64(ctx + SHA256_H_OFF + 24);
+  var e: int64 := peek64(ctx + SHA256_H_OFF + 32);
+  var f: int64 := peek64(ctx + SHA256_H_OFF + 40);
+  var g: int64 := peek64(ctx + SHA256_H_OFF + 48);
+  var h: int64 := peek64(ctx + SHA256_H_OFF + 56);
+  // 64 rounds
+  i := 0;
+  while (i < 64) {
+    var s1: int64 := Sigma1(e);
+    var ch: int64 := Ch(e, f, g);
+    var t1: int64 := (h + s1 + ch + sha256_k(i) + peek64(w + i * 8)) & 0xFFFFFFFF;
+    var s0: int64 := Sigma0(a);
+    var mj: int64 := Maj(a, b, c);
+    var t2: int64 := (s0 + mj) & 0xFFFFFFFF;
+    h := g; g := f; f := e;
+    e := (d + t1) & 0xFFFFFFFF;
+    d := c; c := b; b := a;
+    a := (t1 + t2) & 0xFFFFFFFF;
+    i := i + 1;
+  }
+  // Update state
+  poke64(ctx + SHA256_H_OFF,      (peek64(ctx + SHA256_H_OFF)      + a) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 8,  (peek64(ctx + SHA256_H_OFF + 8)  + b) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 16, (peek64(ctx + SHA256_H_OFF + 16) + c) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 24, (peek64(ctx + SHA256_H_OFF + 24) + d) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 32, (peek64(ctx + SHA256_H_OFF + 32) + e) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 40, (peek64(ctx + SHA256_H_OFF + 40) + f) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 48, (peek64(ctx + SHA256_H_OFF + 48) + g) & 0xFFFFFFFF);
+  poke64(ctx + SHA256_H_OFF + 56, (peek64(ctx + SHA256_H_OFF + 56) + h) & 0xFFFFFFFF);
+  free(w, 64 * 8);
+}
+
+pub fn SHA256Init(ctx: int64): void {
+  poke64(ctx + SHA256_H_OFF,       0x6a09e667);
+  poke64(ctx + SHA256_H_OFF + 8,   0xbb67ae85);
+  poke64(ctx + SHA256_H_OFF + 16,  0x3c6ef372);
+  poke64(ctx + SHA256_H_OFF + 24,  0xa54ff53a);
+  poke64(ctx + SHA256_H_OFF + 32,  0x510e527f);
+  poke64(ctx + SHA256_H_OFF + 40,  0x9b05688c);
+  poke64(ctx + SHA256_H_OFF + 48,  0x1f83d9ab);
+  poke64(ctx + SHA256_H_OFF + 56,  0x5be0cd19);
+  poke64(ctx + SHA256_LEN_OFF, 0);
+  poke64(ctx + SHA256_FILL_OFF, 0);
+}
+
+pub fn SHA256Update(ctx: int64, data: int64, len: int64): void {
+  var i: int64 := 0;
+  var fill: int64 := peek64(ctx + SHA256_FILL_OFF);
+  while (i < len) {
+    poke8(ctx + SHA256_BUF_OFF + fill, peek8(data + i));
+    fill := fill + 1;
+    if (fill == 64) {
+      sha256_compress(ctx, ctx + SHA256_BUF_OFF);
+      poke64(ctx + SHA256_LEN_OFF, peek64(ctx + SHA256_LEN_OFF) + 64);
+      fill := 0;
+    }
+    i := i + 1;
+  }
+  poke64(ctx + SHA256_FILL_OFF, fill);
+}
+
+// Finalizes and writes 32-byte digest to outBuf (caller must allocate ≥32 bytes)
+pub fn SHA256Final(ctx: int64, outBuf: int64): void {
+  var fill: int64 := peek64(ctx + SHA256_FILL_OFF);
+  var totalLen: int64 := peek64(ctx + SHA256_LEN_OFF) + fill;
+  // Append 0x80
+  poke8(ctx + SHA256_BUF_OFF + fill, 0x80);
+  fill := fill + 1;
+  if (fill > 56) {
+    while (fill < 64) { poke8(ctx + SHA256_BUF_OFF + fill, 0); fill := fill + 1; }
+    sha256_compress(ctx, ctx + SHA256_BUF_OFF);
+    fill := 0;
+  }
+  while (fill < 56) { poke8(ctx + SHA256_BUF_OFF + fill, 0); fill := fill + 1; }
+  // Append length in bits as big-endian 64-bit
+  var bitLen: int64 := totalLen * 8;
+  var j: int64 := 7;
+  while (j >= 0) {
+    poke8(ctx + SHA256_BUF_OFF + 56 + (7 - j), (bitLen >> (j * 8)) & 0xFF);
+    j := j - 1;
+  }
+  sha256_compress(ctx, ctx + SHA256_BUF_OFF);
+  // Write digest (big-endian 32-bit words)
+  var hi: int64 := 0;
+  while (hi < 8) {
+    var word: int64 := peek64(ctx + SHA256_H_OFF + hi * 8);
+    poke8(outBuf + hi * 4,     (word >> 24) & 0xFF);
+    poke8(outBuf + hi * 4 + 1, (word >> 16) & 0xFF);
+    poke8(outBuf + hi * 4 + 2, (word >>  8) & 0xFF);
+    poke8(outBuf + hi * 4 + 3,  word        & 0xFF);
+    hi := hi + 1;
+  }
+}
+
+// Convenience: hash a pchar, return alloc'd 32-byte digest
+pub fn SHA256Hash(data: pchar): int64 {
+  var ctx: int64 := alloc(SHA256_CTX_SIZE);
+  SHA256Init(ctx);
+  SHA256Update(ctx, data as int64, StrLen(data));
+  var out: int64 := alloc(32);
+  SHA256Final(ctx, out);
+  free(ctx, SHA256_CTX_SIZE);
+  return out;
+}
+
+// ============================================================================
+// FEAT-07: HMAC-SHA256
+// HMAC(key, msg) = SHA256((key XOR opad) || SHA256((key XOR ipad) || msg))
+// ============================================================================
+
+pub fn HMACSHA256(key: int64, keyLen: int64, msg: int64, msgLen: int64): int64 {
+  var kblock: int64 := alloc(64);
+  var i: int64 := 0;
+  while (i < 64) { poke8(kblock + i, 0); i := i + 1; }
+  if (keyLen > 64) {
+    var kctx: int64 := alloc(SHA256_CTX_SIZE);
+    SHA256Init(kctx);
+    SHA256Update(kctx, key, keyLen);
+    SHA256Final(kctx, kblock);
+    free(kctx, SHA256_CTX_SIZE);
+  } else {
+    i := 0;
+    while (i < keyLen) { poke8(kblock + i, peek8(key + i)); i := i + 1; }
+  }
+  // Inner hash: SHA256((key XOR ipad) || msg)
+  var ipad: int64 := alloc(64);
+  i := 0; while (i < 64) { poke8(ipad + i, peek8(kblock + i) ^ 0x36); i := i + 1; }
+  var ictx: int64 := alloc(SHA256_CTX_SIZE);
+  SHA256Init(ictx);
+  SHA256Update(ictx, ipad, 64);
+  SHA256Update(ictx, msg, msgLen);
+  var innerHash: int64 := alloc(32);
+  SHA256Final(ictx, innerHash);
+  free(ictx, SHA256_CTX_SIZE);
+  free(ipad, 64);
+  // Outer hash: SHA256((key XOR opad) || innerHash)
+  var opad: int64 := alloc(64);
+  i := 0; while (i < 64) { poke8(opad + i, peek8(kblock + i) ^ 0x5C); i := i + 1; }
+  var octx: int64 := alloc(SHA256_CTX_SIZE);
+  SHA256Init(octx);
+  SHA256Update(octx, opad, 64);
+  SHA256Update(octx, innerHash, 32);
+  var out: int64 := alloc(32);
+  SHA256Final(octx, out);
+  free(octx, SHA256_CTX_SIZE);
+  free(opad, 64);
+  free(innerHash, 32);
+  free(kblock, 64);
+  return out;
+}
+
+// ============================================================================
+// FEAT-07: HashMap (open-addressing, pchar keys, int64 values)
+// Header: [cap:int64][count:int64][bucketsPtr:int64]
+// Bucket: [keyPtr:int64][keyLen:int64][value:int64][state:int64] (32 bytes)
+//   state: 0=empty, 1=occupied, 2=deleted
+// ============================================================================
+
+con HM_HDR_CAP:     int64 := 0;
+con HM_HDR_CNT:     int64 := 8;
+con HM_HDR_PTR:     int64 := 16;
+con HM_HDR_SIZE:    int64 := 24;
+con HM_BUCKET_SIZE: int64 := 32;
+con HM_BKT_KEY:     int64 := 0;
+con HM_BKT_KLEN:    int64 := 8;
+con HM_BKT_VAL:     int64 := 16;
+con HM_BKT_STATE:   int64 := 24;
+con HM_EMPTY:       int64 := 0;
+con HM_OCCUPIED:    int64 := 1;
+con HM_DELETED:     int64 := 2;
+
+fn _hmHash(key: pchar, keyLen: int64, cap: int64): int64 {
+  var h: int64 := HashFNV1a64(key);
+  var idx: int64 := h % cap;
+  if (idx < 0) { idx := 0 - idx; }
+  return idx % cap;
+}
+
+fn _hmFind(hm: int64, key: pchar, keyLen: int64): int64 {
+  var cap: int64 := peek64(hm + HM_HDR_CAP);
+  var bptr: int64 := peek64(hm + HM_HDR_PTR);
+  var idx: int64 := _hmHash(key, keyLen, cap);
+  var probes: int64 := 0;
+  while (probes < cap) {
+    var boff: int64 := bptr + idx * HM_BUCKET_SIZE;
+    var state: int64 := peek64(boff + HM_BKT_STATE);
+    if (state == HM_EMPTY) { return -1; }
+    if (state == HM_OCCUPIED) {
+      var bklen: int64 := peek64(boff + HM_BKT_KLEN);
+      if (bklen == keyLen) {
+        var bkptr: int64 := peek64(boff + HM_BKT_KEY);
+        var hmm: int64 := 1; var mj: int64 := 0;
+        while (mj < keyLen && hmm != 0) {
+          if (peek8(bkptr + mj) != StrCharAt(key, mj)) { hmm := 0; }
+          mj := mj + 1;
+        }
+        if (hmm != 0) { return idx; }
+      }
+    }
+    idx := (idx + 1) % cap;
+    probes := probes + 1;
+  }
+  return -1;
+}
+
+fn _hmGrow(hm: int64): void {
+  var oldCap: int64 := peek64(hm + HM_HDR_CAP);
+  var newCap: int64 := oldCap * 2;
+  var oldPtr: int64 := peek64(hm + HM_HDR_PTR);
+  var newPtr: int64 := alloc(newCap * HM_BUCKET_SIZE);
+  var j: int64 := 0;
+  while (j < newCap * HM_BUCKET_SIZE) { poke8(newPtr + j, 0); j := j + 1; }
+  poke64(hm + HM_HDR_CAP, newCap);
+  poke64(hm + HM_HDR_PTR, newPtr);
+  poke64(hm + HM_HDR_CNT, 0);
+  // Re-insert all occupied entries
+  var i: int64 := 0;
+  while (i < oldCap) {
+    var boff: int64 := oldPtr + i * HM_BUCKET_SIZE;
+    if (peek64(boff + HM_BKT_STATE) == HM_OCCUPIED) {
+      var kp: int64 := peek64(boff + HM_BKT_KEY);
+      var kl: int64 := peek64(boff + HM_BKT_KLEN);
+      var v:  int64 := peek64(boff + HM_BKT_VAL);
+      HashMapSet(hm, kp as pchar, kl, v);
+    }
+    i := i + 1;
+  }
+  free(oldPtr, oldCap * HM_BUCKET_SIZE);
+}
+
+pub fn HashMapNew(capacity: int64): int64 {
+  var cap: int64 := capacity;
+  if (cap < 8) { cap := 8; }
+  var hm: int64 := alloc(HM_HDR_SIZE);
+  var bptr: int64 := alloc(cap * HM_BUCKET_SIZE);
+  var j: int64 := 0;
+  while (j < cap * HM_BUCKET_SIZE) { poke8(bptr + j, 0); j := j + 1; }
+  poke64(hm + HM_HDR_CAP, cap);
+  poke64(hm + HM_HDR_CNT, 0);
+  poke64(hm + HM_HDR_PTR, bptr);
+  return hm;
+}
+
+pub fn HashMapSet(hm: int64, key: pchar, keyLen: int64, value: int64): void {
+  if (hm == 0) { return; }
+  var cap: int64 := peek64(hm + HM_HDR_CAP);
+  var cnt: int64 := peek64(hm + HM_HDR_CNT);
+  // Grow if load > 75%
+  if (cnt * 4 >= cap * 3) { _hmGrow(hm); cap := peek64(hm + HM_HDR_CAP); }
+  var bptr: int64 := peek64(hm + HM_HDR_PTR);
+  var idx: int64 := _hmHash(key, keyLen, cap);
+  var probes: int64 := 0;
+  while (probes < cap) {
+    var boff: int64 := bptr + idx * HM_BUCKET_SIZE;
+    var state: int64 := peek64(boff + HM_BKT_STATE);
+    if (state == HM_EMPTY || state == HM_DELETED) {
+      // Copy key
+      var kp: int64 := alloc(keyLen + 1);
+      var kj: int64 := 0;
+      while (kj < keyLen) { poke8(kp + kj, StrCharAt(key, kj)); kj := kj + 1; }
+      poke8(kp + keyLen, 0);
+      poke64(boff + HM_BKT_KEY,   kp);
+      poke64(boff + HM_BKT_KLEN,  keyLen);
+      poke64(boff + HM_BKT_VAL,   value);
+      poke64(boff + HM_BKT_STATE, HM_OCCUPIED);
+      poke64(hm + HM_HDR_CNT, cnt + 1);
+      return;
+    }
+    if (state == HM_OCCUPIED) {
+      var bklen: int64 := peek64(boff + HM_BKT_KLEN);
+      if (bklen == keyLen) {
+        var bkptr: int64 := peek64(boff + HM_BKT_KEY);
+        var hmm2: int64 := 1; var mj2: int64 := 0;
+        while (mj2 < keyLen && hmm2 != 0) {
+          if (peek8(bkptr + mj2) != StrCharAt(key, mj2)) { hmm2 := 0; }
+          mj2 := mj2 + 1;
+        }
+        if (hmm2 != 0) { poke64(boff + HM_BKT_VAL, value); return; }
+      }
+    }
+    idx := (idx + 1) % cap;
+    probes := probes + 1;
+  }
+}
+
+pub fn HashMapGet(hm: int64, key: pchar, keyLen: int64): int64 {
+  if (hm == 0) { return 0; }
+  var idx: int64 := _hmFind(hm, key, keyLen);
+  if (idx < 0) { return 0; }
+  return peek64(peek64(hm + HM_HDR_PTR) + idx * HM_BUCKET_SIZE + HM_BKT_VAL);
+}
+
+pub fn HashMapHas(hm: int64, key: pchar, keyLen: int64): bool {
+  if (hm == 0) { return false; }
+  return _hmFind(hm, key, keyLen) >= 0;
+}
+
+pub fn HashMapDel(hm: int64, key: pchar, keyLen: int64): void {
+  if (hm == 0) { return; }
+  var idx: int64 := _hmFind(hm, key, keyLen);
+  if (idx < 0) { return; }
+  var boff: int64 := peek64(hm + HM_HDR_PTR) + idx * HM_BUCKET_SIZE;
+  poke64(boff + HM_BKT_STATE, HM_DELETED);
+  poke64(hm + HM_HDR_CNT, peek64(hm + HM_HDR_CNT) - 1);
+}
+
+pub fn HashMapCount(hm: int64): int64 {
+  if (hm == 0) { return 0; }
+  return peek64(hm + HM_HDR_CNT);
+}
+
+pub fn HashMapFree(hm: int64): void {
+  if (hm == 0) { return; }
+  var cap: int64 := peek64(hm + HM_HDR_CAP);
+  var bptr: int64 := peek64(hm + HM_HDR_PTR);
+  var i: int64 := 0;
+  while (i < cap) {
+    var boff: int64 := bptr + i * HM_BUCKET_SIZE;
+    if (peek64(boff + HM_BKT_STATE) == HM_OCCUPIED) {
+      var klen: int64 := peek64(boff + HM_BKT_KLEN);
+      free(peek64(boff + HM_BKT_KEY), klen + 1);
+    }
+    i := i + 1;
+  }
+  free(bptr, cap * HM_BUCKET_SIZE);
+  free(hm, HM_HDR_SIZE);
+}
