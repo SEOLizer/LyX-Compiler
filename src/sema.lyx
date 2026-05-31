@@ -176,23 +176,20 @@ con SNK_TYPE_NAME:   int64 := 60;
 con SNK_TYPE_ARRAY:  int64 := 61;
 
 // ============================================================================
-// Symbol entry layout: 48 bytes (SEMA_SYM_SIZE)
-//   +0:  name       (int64 = pchar pointer, into src or to literal for builtins)
-//   +8:  nameLen    (int64)
-//   +16: kind       (int64)  -- SYM_xxx
-//   +24: typeId     (int64)  -- TY_xxx
-//   +32: nodeIdx    (int64)  -- AST node index (-1 = none, -2 = builtin)
-//   +40: isVolatile (int64)  -- WP-AS-18: 1 if @volatile var
+// Symbol record — declared as Lyx struct (WP-POKE-08)
 // ============================================================================
+
+pub type SymRecord = struct {
+  name:       pchar;
+  nameLen:    int64;
+  kind:       int64;
+  typeId:     int64;
+  nodeIdx:    int64;
+  isVolatile: int64;
+};
 
 pub con SEMA_SYM_SIZE: int64 := 48;
 
-// Symbol record field offsets
-con SYM_OFF_NAMELEN:  int64 := 8;
-con SYM_OFF_KIND:     int64 := 16;
-con SYM_OFF_TYPEID:   int64 := 24;
-con SYM_OFF_NODEIDX:  int64 := 32;
-con SYM_OFF_VOLATILE: int64 := 40;
 
 // AST node field offsets (SEMA_NODE_SIZE = 88)
 con NODE_OFF_C0:     int64 := 8;
@@ -251,7 +248,7 @@ pub type Sema = class {
   pTokCount:  int64;
 
   // Symbol table (flat buffer of SEMA_SYM_SIZE byte entries)
-  syms:     int64;
+  syms:     Array<SymRecord>;  // WP-POKE-08: heap array of symbol records
   symCount: int64;
   symCap:   int64;
 
@@ -363,25 +360,28 @@ pub type Sema = class {
   // Symbol table helpers
   // ------------------------------------------------------------------
 
-  fn _soff(i: int64): int64          { return self.syms + i * SEMA_SYM_SIZE; }
-  pub fn SymName(i: int64): pchar    { return peek64(self._soff(i)) as pchar; }
-  pub fn SymNameLen(i: int64): int64    { return peek64(self._soff(i) + SYM_OFF_NAMELEN); }
-  pub fn SymKind(i: int64): int64       { return peek64(self._soff(i) + SYM_OFF_KIND); }
-  pub fn SymTypeId(i: int64): int64     { return peek64(self._soff(i) + SYM_OFF_TYPEID); }
-  pub fn SymNodeIdx(i: int64): int64    { return peek64(self._soff(i) + SYM_OFF_NODEIDX); }
-  pub fn SymIsVolatile(i: int64): int64 { return peek64(self._soff(i) + SYM_OFF_VOLATILE); }
-  pub fn SymCount(): int64             { return self.symCount; }
+  fn _soff(i: int64): int64             { return self.syms + 16 + i * SEMA_SYM_SIZE; }
+  pub fn SymName(i: int64): pchar       { return peek64(self._soff(i)) as pchar; }
+  pub fn SymNameLen(i: int64): int64    { return peek64(self._soff(i) + 8); }
+  pub fn SymKind(i: int64): int64       { return peek64(self._soff(i) + 16); }
+  pub fn SymTypeId(i: int64): int64     { return peek64(self._soff(i) + 24); }
+  pub fn SymNodeIdx(i: int64): int64    { return peek64(self._soff(i) + 32); }
+  pub fn SymIsVolatile(i: int64): int64 { return peek64(self._soff(i) + 40); }
+  pub fn SymCount(): int64              { return self.symCount; }
 
-  pub fn SetSymNodeIdx(i: int64, val: int64)  { poke64(self._soff(i) + SYM_OFF_NODEIDX,  val); }
-  pub fn SetSymVolatile(i: int64, val: int64) { poke64(self._soff(i) + SYM_OFF_VOLATILE, val); }
-  pub fn SetSymKind(i: int64, val: int64)     { poke64(self._soff(i) + SYM_OFF_KIND,     val); }
-  pub fn SetSymTypeId(i: int64, val: int64)   { poke64(self._soff(i) + SYM_OFF_TYPEID,   val); }
+  pub fn SetSymNodeIdx(i: int64, val: int64)  { poke64(self._soff(i) + 32, val); }
+  pub fn SetSymVolatile(i: int64, val: int64) { poke64(self._soff(i) + 40, val); }
+  pub fn SetSymKind(i: int64, val: int64)     { poke64(self._soff(i) + 16, val); }
+  pub fn SetSymTypeId(i: int64, val: int64)   { poke64(self._soff(i) + 24, val); }
 
   fn _growSyms() {
     var newCap: int64 := self.symCap * 2;
-    var nb: int64 := mmap(0, newCap * SEMA_SYM_SIZE, 3, 34, -1, 0);
-    var i: int64 := 0;
-    memcpy(nb, self.syms, self.symCount * SEMA_SYM_SIZE);
+    var nb: int64 := mmap(0, newCap * SEMA_SYM_SIZE + 16, 3, 34, -1, 0);
+    // Copy existing symbol data (skip old header, write past new header)
+    memcpy(nb + 16, self.syms + 16, self.symCount * SEMA_SYM_SIZE);
+    // Set new header: cap and current len
+    poke64(nb,     newCap);
+    poke64(nb + 8, self.symCount);
     self.syms   := nb;
     self.symCap := newCap;
   }
@@ -389,12 +389,13 @@ pub type Sema = class {
   fn _pushSym(name: pchar, nameLen: int64, kind: int64, typeId: int64, nodeIdx: int64) {
     if (self.symCount >= self.symCap) { self._growSyms(); }
     var off: int64 := self._soff(self.symCount);
-    poke64(off,                     name as int64);
-    poke64(off + SYM_OFF_NAMELEN,  nameLen);
-    poke64(off + SYM_OFF_KIND,     kind);
-    poke64(off + SYM_OFF_TYPEID,   typeId);
-    poke64(off + SYM_OFF_NODEIDX,  nodeIdx);
-    poke64(off + SYM_OFF_VOLATILE, 0);
+    poke64(off,      name as int64);
+    poke64(off + 8,  nameLen);
+    poke64(off + 16, kind);
+    poke64(off + 24, typeId);
+    poke64(off + 32, nodeIdx);
+    poke64(off + 40, 0);
+    poke64(self.syms + 8, self.symCount + 1);
     self.symCount := self.symCount + 1;
   }
 
@@ -2304,7 +2305,9 @@ pub type Sema = class {
     self.pTokCount  := 1000000;
 
     self.symCap   := 256;
-    self.syms     := mmap(0, self.symCap * SEMA_SYM_SIZE, 3, 34, -1, 0);
+    self.syms     := mmap(0, self.symCap * SEMA_SYM_SIZE + 16, 3, 34, -1, 0);
+    poke64(self.syms, self.symCap);  // Array header: cap
+    poke64(self.syms + 8, 0);        // Array header: len
     self.symCount := 0;
 
     self.scopeCap   := 64;

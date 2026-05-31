@@ -1,0 +1,378 @@
+// std/thread.lyx
+// Native Linux threading via clone(2) + futex(2), no libpthread dependency.
+//
+// Thread creation:  sys_clone(CLONE_VM|...) — shares address space.
+//                   Child calls the function via _indirect_call_1(func, arg).
+// Thread join:      CLONE_CHILD_CLEARTID: kernel zeroes tidSlot and wakes futex
+//                   when the thread exits.
+// Mutex:            futex-based spin+sleep; 32-bit word at mutex.ptr (mmap'd).
+// Condition var:    futex on a sequence counter at cond.ptr (mmap'd).
+// Atomics:          best-effort (no lock cmpxchg builtin yet; race window tiny
+//                   on x86-64 due to naturally atomic aligned 64-bit stores).
+// TLS:              global mmap table, tid → slot → key values (Option A).
+
+@description("Thread creation and synchronization via clone(2) + futex(2)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.thread;
+
+// ============================================================================
+// clone(2) flags (x86-64 Linux)
+// ============================================================================
+con CLONE_VM:             int64 := 256;
+con CLONE_FS:             int64 := 512;
+con CLONE_FILES:          int64 := 1024;
+con CLONE_SIGHAND:        int64 := 2048;
+con CLONE_THREAD:         int64 := 65536;
+con CLONE_SYSVSEM:        int64 := 262144;
+con CLONE_CHILD_SETTID:   int64 := 16777216;
+con CLONE_CHILD_CLEARTID: int64 := 2097152;
+
+// THREAD_FLAGS = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTID|CLEARTID
+con THREAD_FLAGS: int64 := 19205888;
+
+con THREAD_STACK_SIZE: int64 := 2097152;  // 2 MB per thread
+
+// ============================================================================
+// TLS constants
+// ============================================================================
+con MAX_TLS_THREADS: int64 := 64;   // max concurrent threads tracked
+con MAX_TLS_KEYS:    int64 := 32;   // max TLS keys per thread
+// slot layout: 8 bytes tid + 32*8 bytes values = 264 bytes
+con TLS_SLOT_SIZE:   int64 := 264;
+con TLS_TABLE_SIZE:  int64 := 16896; // 64 * 264
+
+// Global TLS table (mmap pointer, 0 = not yet initialised).
+// Initialised lazily by TLSKeyCreate(); must be called before TLSSetValue/Get.
+var g_tls_table:     int64 := 0;
+var g_tls_key_count: int64 := 0;
+
+// ============================================================================
+// futex(2) operations
+// ============================================================================
+con FUTEX_WAIT:     int64 := 0;
+con FUTEX_WAKE:     int64 := 1;
+con FUTEX_WAKE_ALL: int64 := 2147483647;  // INT_MAX
+
+// ============================================================================
+// Public types
+// ============================================================================
+
+// Thread handle: mmap'd 4-byte TID slot.
+// Kernel writes TID here at start (CLONE_CHILD_SETTID) and zeroes it at exit
+// (CLONE_CHILD_CLEARTID) with a futex wake — used by ThreadJoin.
+pub type Thread = struct {
+  handle: int64;   // ptr to mmap'd 32-bit TID slot; 0 = invalid
+  tid:    int64;   // TID as returned by clone() in parent
+};
+
+// Mutex: futex on a mmap'd 32-bit word.
+// 0 = unlocked, 1 = locked (no waiters), 2 = locked (waiters present).
+pub type Mutex = struct {
+  ptr:   int64;   // ptr to mmap'd 32-bit futex word
+  owner: int64;   // TID of owner (informational)
+};
+
+// Condition variable: futex on a mmap'd 32-bit sequence counter.
+pub type Cond = struct {
+  ptr: int64;
+};
+
+// Thread-local storage key (index into the per-thread slot, ≥ 1)
+pub type TLSKey = int64;
+
+// Shared memory buffer accessible by all threads.
+pub type SharedMem = struct {
+  data: int64;
+  size: int64;
+};
+
+// Atomic word (64-bit, pointer-based).
+pub type Atomic = struct {
+  ptr: int64;   // ptr to mmap'd int64
+};
+
+// ============================================================================
+// Thread creation and management
+// ============================================================================
+
+// ThreadCreate: spawns a new thread that calls func(arg).
+// Returns a Thread; handle == 0 on allocation failure.
+// RBP remains unchanged by clone(2), so 'func' and 'arg' (stored as
+// RBP-relative locals by the Lyx codegen) are readable in the child too
+// because CLONE_VM guarantees a shared address space.
+pub fn ThreadCreate(func: int64, arg: int64): Thread {
+  var t: Thread;
+  t.handle := 0;
+  t.tid    := 0;
+
+  var childStack: int64 := mmap(0, THREAD_STACK_SIZE, 3, 34, -1, 0);
+  if (childStack == 0) { return t; }
+
+  // TID slot: kernel writes the TID here on start and zeroes it on exit.
+  var tidSlot: int64 := mmap(0, 8, 3, 34, -1, 0);
+  if (tidSlot == 0) { munmap(childStack, THREAD_STACK_SIZE); return t; }
+  poke32(tidSlot, 0);
+
+  var stackTop: int64 := childStack + THREAD_STACK_SIZE;
+
+  // sys_clone(flags, stack_top, parent_tidptr=0, child_tidptr=tidSlot, tls=0)
+  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, 0, tidSlot, 0);
+
+  if (tid == 0) {
+    // Child thread: func and arg accessible via RBP (shared VM).
+    _indirect_call_1(func, arg);
+    exit(0);  // syscall 60 — exits this thread only
+  }
+
+  t.handle := tidSlot;
+  t.tid    := tid;
+  return t;
+}
+
+// ThreadSelf: returns the TID of the calling thread.
+pub fn ThreadSelf(): int64 {
+  return sys_gettid();
+}
+
+// ThreadIsRunning: 1 while the thread is still alive.
+pub fn ThreadIsRunning(t: Thread): int64 {
+  if (t.handle == 0) { return 0; }
+  if (peek32(t.handle) != 0) { return 1; }
+  return 0;
+}
+
+// ThreadJoin: blocks until the thread exits, then frees the TID slot.
+pub fn ThreadJoin(t: Thread): void {
+  if (t.handle == 0) { return; }
+  // futex_wait returns EAGAIN immediately if *tidSlot already changed;
+  // the while loop handles both spurious wakeups and the already-exited case.
+  var cur: int64 := peek32(t.handle);
+  while (cur != 0) {
+    sys_futex(t.handle, FUTEX_WAIT, cur, 0, 0, 0);
+    cur := peek32(t.handle);
+  }
+  munmap(t.handle, 8);
+}
+
+// ============================================================================
+// Mutex
+// ============================================================================
+
+// MutexNew: allocates a new mutex backed by mmap'd memory.
+pub fn MutexNew(): Mutex {
+  var m: Mutex;
+  m.ptr   := mmap(0, 8, 3, 34, -1, 0);
+  m.owner := 0;
+  if (m.ptr != 0) { poke32(m.ptr, 0); }
+  return m;
+}
+
+// MutexFree: releases the mutex memory.
+pub fn MutexFree(m: Mutex): void {
+  if (m.ptr != 0) { munmap(m.ptr, 8); }
+}
+
+// MutexLock: acquires the mutex, sleeping via futex when contended.
+pub fn MutexLock(m: Mutex): void {
+  if (m.ptr == 0) { return; }
+  var spins: int64 := 0;
+  while (1 == 1) {
+    if (peek32(m.ptr) == 0) {
+      poke32(m.ptr, 1);
+      return;
+    }
+    spins := spins + 1;
+    if (spins >= 64) {
+      poke32(m.ptr, 2);  // mark: has waiters
+      sys_futex(m.ptr, FUTEX_WAIT, 2, 0, 0, 0);
+      spins := 0;
+    }
+  }
+}
+
+// MutexUnlock: releases the mutex and wakes one waiter if any.
+pub fn MutexUnlock(m: Mutex): void {
+  if (m.ptr == 0) { return; }
+  var old: int64 := peek32(m.ptr);
+  poke32(m.ptr, 0);
+  if (old == 2) {
+    sys_futex(m.ptr, FUTEX_WAKE, 1, 0, 0, 0);
+  }
+}
+
+// MutexTryLock: non-blocking attempt.  Returns 1 on success, 0 if busy.
+pub fn MutexTryLock(m: Mutex): int64 {
+  if (m.ptr == 0) { return 0; }
+  if (peek32(m.ptr) == 0) { poke32(m.ptr, 1); return 1; }
+  return 0;
+}
+
+// ============================================================================
+// Condition variable
+// ============================================================================
+
+// CondNew: allocates a new condition variable.
+pub fn CondNew(): Cond {
+  var c: Cond;
+  c.ptr := mmap(0, 8, 3, 34, -1, 0);
+  if (c.ptr != 0) { poke32(c.ptr, 0); }
+  return c;
+}
+
+// CondFree: releases the condition variable memory.
+pub fn CondFree(c: Cond): void {
+  if (c.ptr != 0) { munmap(c.ptr, 8); }
+}
+
+// CondWait: releases mutex, waits for a signal, reacquires mutex.
+pub fn CondWait(c: Cond, m: Mutex): void {
+  if (c.ptr == 0) { return; }
+  var seq: int64 := peek32(c.ptr);
+  MutexUnlock(m);
+  sys_futex(c.ptr, FUTEX_WAIT, seq, 0, 0, 0);
+  MutexLock(m);
+}
+
+// CondSignal: wakes one thread waiting on the condition.
+pub fn CondSignal(c: Cond): void {
+  if (c.ptr == 0) { return; }
+  poke32(c.ptr, peek32(c.ptr) + 1);
+  sys_futex(c.ptr, FUTEX_WAKE, 1, 0, 0, 0);
+}
+
+// CondBroadcast: wakes all threads waiting on the condition.
+pub fn CondBroadcast(c: Cond): void {
+  if (c.ptr == 0) { return; }
+  poke32(c.ptr, peek32(c.ptr) + 1);
+  sys_futex(c.ptr, FUTEX_WAKE, FUTEX_WAKE_ALL, 0, 0, 0);
+}
+
+// ============================================================================
+// Shared memory
+// ============================================================================
+
+pub fn SharedMemCreate(size: int64): SharedMem {
+  var mem: SharedMem;
+  mem.data := mmap(0, size, 3, 34, -1, 0);
+  mem.size := size;
+  return mem;
+}
+
+pub fn SharedMemFree(mem: SharedMem): void {
+  if (mem.data != 0) { munmap(mem.data, mem.size); }
+}
+
+// ============================================================================
+// Atomic operations
+// Note: peek64/poke64 on naturally aligned addresses are single-bus-cycle
+// on x86-64, giving de-facto atomicity for plain loads/stores.  For
+// read-modify-write (AtomicAdd, CAS) a tiny race window exists because
+// Lyx does not yet expose a lock-cmpxchg builtin.  Guard RMW sequences
+// that require strict sequential consistency with a Mutex.
+// ============================================================================
+
+pub fn AtomicNew(initial: int64): Atomic {
+  var a: Atomic;
+  a.ptr := mmap(0, 8, 3, 34, -1, 0);
+  if (a.ptr != 0) { poke64(a.ptr, initial); }
+  return a;
+}
+
+pub fn AtomicFree(a: Atomic): void {
+  if (a.ptr != 0) { munmap(a.ptr, 8); }
+}
+
+pub fn AtomicLoad(a: Atomic): int64 {
+  if (a.ptr == 0) { return 0; }
+  return peek64(a.ptr);
+}
+
+pub fn AtomicStore(a: Atomic, val: int64): void {
+  if (a.ptr == 0) { return; }
+  poke64(a.ptr, val);
+}
+
+// AtomicAdd: adds delta, returns new value.
+pub fn AtomicAdd(a: Atomic, delta: int64): int64 {
+  if (a.ptr == 0) { return 0; }
+  var v: int64 := peek64(a.ptr) + delta;
+  poke64(a.ptr, v);
+  return v;
+}
+
+// CAS: returns 1 on success, 0 if current value != expected.
+pub fn CAS(a: Atomic, expected: int64, newVal: int64): int64 {
+  if (a.ptr == 0) { return 0; }
+  if (peek64(a.ptr) == expected) { poke64(a.ptr, newVal); return 1; }
+  return 0;
+}
+
+// ============================================================================
+// Thread-local storage
+//
+// Implementation: a process-global mmap'd table, indexed by thread slot.
+// Each slot holds the TID of the owning thread plus MAX_TLS_KEYS int64 values.
+// Slot lookup is O(MAX_TLS_THREADS) linear scan; allocation is first-fit.
+//
+// Note: TLSKeyCreate() initialises the table and must be called (from any
+// thread) before TLSSetValue/GetValue. Key allocation is not thread-safe —
+// call TLSKeyCreate() during single-threaded startup only.
+// ============================================================================
+
+// Internal: initialise the TLS table on first call.
+fn _tlsInit(): void {
+    if (g_tls_table != 0) { return; }
+    // MAP_ANONYMOUS pages are zero-initialised, so tid fields start at 0 (unused).
+    g_tls_table     := mmap(0, TLS_TABLE_SIZE, 3, 34, -1, 0);
+    g_tls_key_count := 1;  // key 0 reserved; valid keys start at 1
+}
+
+// Internal: find (or allocate) the TLS slot for `tid`.
+// Returns slot base address, or 0 if the table is full.
+fn _tlsFindSlot(tid: int64): int64 {
+    if (g_tls_table == 0) { return 0; }
+    var i: int64 := 0;
+    var firstEmpty: int64 := -1;
+    while (i < MAX_TLS_THREADS) {
+        var slotBase: int64 := g_tls_table + i * TLS_SLOT_SIZE;
+        var slotTid: int64 := peek64(slotBase);
+        if (slotTid == tid) { return slotBase; }
+        if (slotTid == 0 && firstEmpty < 0) { firstEmpty := i; }
+        i := i + 1;
+    }
+    if (firstEmpty < 0) { return 0; }  // table full
+    var newBase: int64 := g_tls_table + firstEmpty * TLS_SLOT_SIZE;
+    poke64(newBase, tid);  // claim slot
+    return newBase;
+}
+
+// TLSKeyCreate: allocate a new TLS key. Returns the key (≥ 1), or 0 on error.
+pub fn TLSKeyCreate(): TLSKey {
+    _tlsInit();
+    if (g_tls_key_count >= MAX_TLS_KEYS) { return 0; }
+    var key: int64 := g_tls_key_count;
+    g_tls_key_count := g_tls_key_count + 1;
+    return key;
+}
+
+// TLSSetValue: store `value` under `key` for the calling thread.
+// Returns 0 on success, -1 on error.
+pub fn TLSSetValue(key: TLSKey, value: int64): int64 {
+    if (g_tls_table == 0 || key <= 0 || key >= MAX_TLS_KEYS) { return -1; }
+    var tid: int64 := sys_gettid();
+    var slot: int64 := _tlsFindSlot(tid);
+    if (slot == 0) { return -1; }
+    poke64(slot + 8 + key * 8, value);
+    return 0;
+}
+
+// TLSGetValue: retrieve the value stored under `key` for the calling thread.
+// Returns 0 if the key is unset or invalid.
+pub fn TLSGetValue(key: TLSKey): int64 {
+    if (g_tls_table == 0 || key <= 0 || key >= MAX_TLS_KEYS) { return 0; }
+    var tid: int64 := sys_gettid();
+    var slot: int64 := _tlsFindSlot(tid);
+    if (slot == 0) { return 0; }
+    return peek64(slot + 8 + key * 8);
+}

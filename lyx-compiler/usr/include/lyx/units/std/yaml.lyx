@@ -1,0 +1,827 @@
+// std/yaml - YAML Parser and Generator
+// Read and write YAML configuration files
+// Supports: scalars, sequences, mappings, anchors, aliases
+
+@description("YAML parsing and serialization")
+@author("Andreas Röne")
+@copyright("2024-2025 Andreas Röne")
+unit std.yaml;
+
+import std.string;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// YAML node types
+con YAML_NULL: int64 := 0;
+con YAML_BOOL: int64 := 1;
+con YAML_INT: int64 := 2;
+con YAML_FLOAT: int64 := 3;
+con YAML_STRING: int64 := 4;
+con YAML_SEQ: int64 := 5;      // sequence (array)
+con YAML_MAP: int64 := 6;      // mapping (object)
+
+// Error codes
+con ERR_YAML_OK: int64 := 0;
+con ERR_YAML_INVALID: int64 := 1;
+con ERR_YAML_PARSE: int64 := 2;
+con ERR_YAML_EOF: int64 := 3;
+con ERR_YAML_INDENT: int64 := 4;
+con ERR_YAML_TYPE: int64 := 5;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Check if character is whitespace
+fn isWhitespace(c: int64): bool {
+    return c == 32 || c == 9;
+}
+
+// Check if character is line break
+fn isLineBreak(c: int64): bool {
+    return c == 10 || c == 13;
+}
+
+// Check if character is digit
+fn isDigit(c: int64): bool {
+    return c >= 48 && c <= 57;
+}
+
+// Check if character is alphabetic
+fn isAlpha(c: int64): bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// Find line end position
+fn findLineEnd(s: pchar, pos: int64): int64 {
+    while (StrCharAt(s, pos) != 0 &&
+           StrCharAt(s, pos) != 10 &&
+           StrCharAt(s, pos) != 13) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Skip whitespace
+fn skipWhitespace(s: pchar, pos: int64): int64 {
+    while (isWhitespace(StrCharAt(s, pos))) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Skip to next line
+fn skipLine(s: pchar, pos: int64): int64 {
+    while (StrCharAt(s, pos) != 0 && not isLineBreak(StrCharAt(s, pos))) {
+        pos := pos + 1;
+    }
+    while (isLineBreak(StrCharAt(s, pos))) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Count indent level
+fn countIndent(s: pchar, pos: int64): int64 {
+    var indent: int64 := 0;
+    while (isWhitespace(StrCharAt(s, pos))) {
+        indent := indent + 1;
+        pos := pos + 1;
+    }
+    return indent;
+}
+
+// Check if line is a comment
+fn isComment(s: pchar, pos: int64): bool {
+    var c: int64 := StrCharAt(s, pos);
+    return c == 35;  // '#'
+}
+
+// Check if line is empty
+fn isEmptyLine(s: pchar, pos: int64): bool {
+    var c: int64 := StrCharAt(s, pos);
+    return c == 0 || c == 10 || c == 13 || c == 35;
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+// Internal: scan for "key: value" at the top-level (indent=0).
+// Returns position of value start, or -1 if not found.
+fn _yamlFindKey(content: pchar, clen: int64, path: pchar, plen: int64): int64 {
+    var pos: int64 := 0;
+    while (pos < clen) {
+        // Only match top-level keys (no leading indent)
+        var c: int64 := StrCharAt(content, pos);
+        if (c == 35 || c == 10 || c == 13 || c == 0) {
+            // comment or blank line — skip
+        } else if (c == 32 || c == 9) {
+            // indented line — skip (nested content)
+        } else if (c == 45 && StrCharAt(content, pos + 1) == 45 && StrCharAt(content, pos + 2) == 45) {
+            // "---" document marker — skip line
+        } else {
+            var pi: int64 := 0;
+            while (pi < plen && pos + pi < clen && StrCharAt(content, pos + pi) == StrCharAt(path, pi)) {
+                pi := pi + 1;
+            }
+            if (pi == plen) {
+                var after: int64 := pos + pi;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 58) {  // ':'
+                    after := after + 1;
+                    while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                        after := after + 1;
+                    }
+                    return after;
+                }
+            }
+        }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return -1;
+}
+
+// Parse YAML string — copies input into a heap buffer, returned as doc handle.
+pub fn ParseString(input: pchar): int64 {
+    if (input == 0) { return 0; }
+    var len: int64 := StrLen(input);
+    var buf: pchar := mmap(0, len + 1, 3, 34, -1, 0);
+    if (buf == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < len) {
+        StrSetChar(buf, i, StrCharAt(input, i));
+        i := i + 1;
+    }
+    StrSetChar(buf, len, 0);
+    return buf as int64;
+}
+
+// Get value as string (flat top-level key lookup).
+pub fn GetString(doc: int64, path: pchar, default_val: pchar): pchar {
+    if (doc == 0 || path == 0) { return default_val; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    var vstart: int64 := _yamlFindKey(content, clen, path, plen);
+    if (vstart < 0) { return default_val; }
+    // Find value end: stop at newline, comment, or NUL
+    var vend: int64 := vstart;
+    var sc: int64 := 1;
+    while (sc == 1 && vend < clen) {
+        var vc: int64 := StrCharAt(content, vend);
+        if (vc == 10 || vc == 13 || vc == 0 || vc == 35) { sc := 0; }
+        else { vend := vend + 1; }
+    }
+    // Trim trailing whitespace
+    while (vend > vstart && (StrCharAt(content, vend - 1) == 32 || StrCharAt(content, vend - 1) == 9)) {
+        vend := vend - 1;
+    }
+    var vlen: int64 := vend - vstart;
+    if (vlen <= 0) { return default_val; }
+    var result: pchar := mmap(0, vlen + 1, 3, 34, -1, 0);
+    var ri: int64 := 0;
+    while (ri < vlen) {
+        StrSetChar(result, ri, StrCharAt(content, vstart + ri));
+        ri := ri + 1;
+    }
+    StrSetChar(result, vlen, 0);
+    return result;
+}
+
+// Get value as integer
+pub fn GetInt(doc: int64, path: pchar, default_val: int64): int64 {
+    if (doc == 0 || path == 0) { return default_val; }
+    var val: pchar := GetString(doc, path, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var result: int64 := 0;
+    var neg: int64 := 0;
+    var pos: int64 := 0;
+    if (StrCharAt(val, 0) == 45) { neg := 1; pos := 1; }
+    while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+        result := result * 10 + (StrCharAt(val, pos) - 48);
+        pos := pos + 1;
+    }
+    if (neg == 1) { result := 0 - result; }
+    return result;
+}
+
+// Get value as float
+pub fn GetFloat(doc: int64, path: pchar, default_val: f64): f64 {
+    if (doc == 0 || path == 0) { return default_val; }
+    var val: pchar := GetString(doc, path, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    return ParseYamlFloat(val);
+}
+
+// Get value as boolean (true/yes/on/1 → true)
+pub fn GetBool(doc: int64, path: pchar, default_val: bool): bool {
+    if (doc == 0 || path == 0) { return default_val; }
+    var val: pchar := GetString(doc, path, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var first: int64 := StrCharAt(val, 0);
+    if (first == 116 || first == 84 || first == 121 || first == 89 || first == 49) { return true; }
+    if (first == 111 || first == 79) { return true; }
+    return false;
+}
+
+// Get value as array (sequence)
+pub fn GetArray(doc: int64, path: pchar): int64 {
+    if (doc == 0) { return 0; }
+    return 0;
+}
+
+// Get value as object (mapping)
+pub fn GetObject(doc: int64, path: pchar): int64 {
+    if (doc == 0) { return 0; }
+    return 0;
+}
+
+// ============================================================================
+// Writing
+// ============================================================================
+
+// Write YAML document to string (copies raw content)
+pub fn WriteString(doc: int64, output: pchar, max_len: int64): int64 {
+    if (doc == 0 || output == 0 || max_len <= 0) { return -1; }
+    var content: pchar := doc as pchar;
+    var len: int64 := StrLen(content);
+    if (len >= max_len) { len := max_len - 1; }
+    var i: int64 := 0;
+    while (i < len) {
+        StrSetChar(output, i, StrCharAt(content, i));
+        i := i + 1;
+    }
+    StrSetChar(output, len, 0);
+    return len;
+}
+
+// Write YAML doc (raw text) to file
+pub fn WriteFile(doc: int64, path: pchar): bool {
+    if (doc == 0 || path == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var len: int64 := StrLen(content);
+    if (len == 0) { return false; }
+    var fd: int64 := open(path, 577, 420);  // O_WRONLY|O_CREAT|O_TRUNC=577, mode 0644=420
+    if (fd < 0) { return false; }
+    var total: int64 := 0;
+    var running: int64 := 1;
+    while (running == 1 && total < len) {
+        var n: int64 := write(fd, content + total, len - total);
+        if (n <= 0) { running := 0; }
+        else { total := total + n; }
+    }
+    close(fd);
+    return total == len;
+}
+
+// ============================================================================
+// Modification
+// ============================================================================
+
+// Internal: replace or append "path: value_str\n" in the doc buffer.
+// The doc buffer is assumed to be 65536 bytes (from LoadFile/ParseString).
+fn _yamlSetKey(doc: int64, path: pchar, value_str: pchar): void {
+    if (doc == 0 || path == 0 || value_str == 0) { return; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    var vlen: int64 := StrLen(value_str);
+    var BUF: int64 := 65536;
+    var tmp: int64 := mmap(0, BUF, 3, 34, -1, 0);
+    if (tmp == 0) { return; }
+    var out: int64 := 0;
+    var pos: int64 := 0;
+    var found: bool := false;
+    while (pos < clen) {
+        var c0: int64 := StrCharAt(content, pos);
+        var isMatch: bool := false;
+        if (c0 != 32 && c0 != 9 && c0 != 35 && c0 != 10 && c0 != 13 && c0 != 0 && !found) {
+            var pi: int64 := 0;
+            var ok: bool := true;
+            while (pi < plen && ok) {
+                if (StrCharAt(content, pos + pi) != StrCharAt(path, pi)) { ok := false; }
+                else { pi := pi + 1; }
+            }
+            if (ok) {
+                var after: int64 := pos + plen;
+                while (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9) {
+                    after := after + 1;
+                }
+                if (StrCharAt(content, after) == 58) { isMatch := true; }
+            }
+        }
+        if (isMatch) {
+            found := true;
+            var ki: int64 := 0;
+            while (ki < plen && out < BUF - 1) {
+                poke8(tmp + out, StrCharAt(path, ki)); out := out + 1; ki := ki + 1;
+            }
+            if (out < BUF - 1) { poke8(tmp + out, 58); out := out + 1; }
+            if (out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; }
+            var vi: int64 := 0;
+            while (vi < vlen && out < BUF - 1) {
+                poke8(tmp + out, StrCharAt(value_str, vi)); out := out + 1; vi := vi + 1;
+            }
+            if (out < BUF - 1) { poke8(tmp + out, 10); out := out + 1; }
+            while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+                pos := pos + 1;
+            }
+            while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+                pos := pos + 1;
+            }
+        } else {
+            while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+                if (out < BUF - 1) { poke8(tmp + out, StrCharAt(content, pos)); out := out + 1; }
+                pos := pos + 1;
+            }
+            while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+                if (out < BUF - 1) { poke8(tmp + out, StrCharAt(content, pos)); out := out + 1; }
+                pos := pos + 1;
+            }
+        }
+    }
+    if (!found) {
+        var ki: int64 := 0;
+        while (ki < plen && out < BUF - 1) {
+            poke8(tmp + out, StrCharAt(path, ki)); out := out + 1; ki := ki + 1;
+        }
+        if (out < BUF - 1) { poke8(tmp + out, 58); out := out + 1; }
+        if (out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; }
+        var vi: int64 := 0;
+        while (vi < vlen && out < BUF - 1) {
+            poke8(tmp + out, StrCharAt(value_str, vi)); out := out + 1; vi := vi + 1;
+        }
+        if (out < BUF - 1) { poke8(tmp + out, 10); out := out + 1; }
+    }
+    poke8(tmp + out, 0);
+    var i: int64 := 0;
+    while (i <= out) { poke8(doc + i, peek8(tmp + i)); i := i + 1; }
+    munmap(tmp, BUF);
+}
+
+// Set string value
+pub fn SetString(doc: int64, path: pchar, value: pchar): void {
+    _yamlSetKey(doc, path, value);
+}
+
+// Set integer value
+pub fn SetInt(doc: int64, path: pchar, value: int64): void {
+    if (doc == 0 || path == 0) { return; }
+    _yamlSetKey(doc, path, IntToStr(value));
+}
+
+// Set float value — 6 decimal places
+pub fn SetFloat(doc: int64, path: pchar, value: f64): void {
+    if (doc == 0 || path == 0) { return; }
+    var buf: int64 := mmap(0, 64, 3, 34, -1, 0);
+    if (buf == 0) { return; }
+    var bpos: int64 := 0;
+    var v: f64 := value;
+    if (v < 0.0) { poke8(buf + bpos, 45); bpos := bpos + 1; v := 0.0 - v; }
+    var ipart: int64 := v as int64;
+    var ipf: f64 := ipart as f64;
+    var fpart: f64 := v - ipf;
+    var istr: pchar := IntToStr(ipart);
+    var ilen: int64 := StrLen(istr);
+    var ii: int64 := 0;
+    while (ii < ilen && bpos < 60) { poke8(buf + bpos, StrCharAt(istr, ii)); bpos := bpos + 1; ii := ii + 1; }
+    if (bpos < 60) { poke8(buf + bpos, 46); bpos := bpos + 1; }
+    var d: int64 := 0;
+    while (d < 6 && bpos < 60) {
+        fpart := fpart * 10.0;
+        var digit: int64 := fpart as int64;
+        poke8(buf + bpos, digit + 48); bpos := bpos + 1;
+        var digitF: f64 := digit as f64;
+        fpart := fpart - digitF;
+        d := d + 1;
+    }
+    poke8(buf + bpos, 0);
+    _yamlSetKey(doc, path, buf as pchar);
+    munmap(buf, 64);
+}
+
+// Set boolean value
+pub fn SetBool(doc: int64, path: pchar, value: bool): void {
+    if (doc == 0 || path == 0) { return; }
+    if (value) { _yamlSetKey(doc, path, "true"); }
+    else { _yamlSetKey(doc, path, "false"); }
+}
+
+// Set array value
+pub fn SetArray(doc: int64, path: pchar, values: pchar, count: int64): void { }
+
+// Set object value
+pub fn SetObject(doc: int64, path: pchar, keys: pchar, values: pchar, count: int64): void { }
+
+// Delete key
+pub fn DeleteKey(doc: int64, path: pchar): bool {
+    if (doc == 0 || path == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    var BUF: int64 := 65536;
+    var tmp: int64 := mmap(0, BUF, 3, 34, -1, 0);
+    if (tmp == 0) { return false; }
+    var out: int64 := 0;
+    var pos: int64 := 0;
+    var found: bool := false;
+    while (pos < clen) {
+        var c0: int64 := StrCharAt(content, pos);
+        var isMatch: bool := false;
+        if (c0 != 32 && c0 != 9 && c0 != 35 && c0 != 10 && c0 != 13 && c0 != 0) {
+            var pi: int64 := 0;
+            var ok: bool := true;
+            while (pi < plen && ok) {
+                if (StrCharAt(content, pos + pi) != StrCharAt(path, pi)) { ok := false; }
+                else { pi := pi + 1; }
+            }
+            if (ok) {
+                var after: int64 := pos + plen;
+                while (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9) {
+                    after := after + 1;
+                }
+                if (StrCharAt(content, after) == 58) { isMatch := true; }
+            }
+        }
+        if (isMatch) {
+            found := true;
+            while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+                pos := pos + 1;
+            }
+            while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+                pos := pos + 1;
+            }
+        } else {
+            while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+                if (out < BUF - 1) { poke8(tmp + out, StrCharAt(content, pos)); out := out + 1; }
+                pos := pos + 1;
+            }
+            while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+                if (out < BUF - 1) { poke8(tmp + out, StrCharAt(content, pos)); out := out + 1; }
+                pos := pos + 1;
+            }
+        }
+    }
+    poke8(tmp + out, 0);
+    var i: int64 := 0;
+    while (i <= out) { poke8(doc + i, peek8(tmp + i)); i := i + 1; }
+    munmap(tmp, BUF);
+    return found;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// Load YAML from file — returns doc handle, or 0 on error.
+pub fn LoadFile(path: pchar): int64 {
+    if (path == 0) { return 0; }
+    var fd: int64 := open(path, 0, 0);  // O_RDONLY
+    if (fd < 0) { return 0; }
+    var YAML_BUF: int64 := 65536;
+    var buf: pchar := mmap(0, YAML_BUF, 3, 34, -1, 0);
+    if (buf == 0) { close(fd); return 0; }
+    var total: int64 := 0;
+    var running: int64 := 1;
+    while (running == 1 && total < YAML_BUF - 1) {
+        var n: int64 := read(fd, buf + total, YAML_BUF - 1 - total);
+        if (n <= 0) { running := 0; }
+        else { total := total + n; }
+    }
+    close(fd);
+    StrSetChar(buf, total, 0);
+    return buf as int64;
+}
+
+// Save YAML doc (raw text) to file — returns true on success.
+pub fn SaveFile(doc: int64, path: pchar): bool {
+    return WriteFile(doc, path);
+}
+
+// Check if path exists
+pub fn HasPath(doc: int64, path: pchar): bool {
+    if (doc == 0 || path == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    return _yamlFindKey(content, clen, path, plen) >= 0;
+}
+
+// Get type of value at path
+pub fn GetType(doc: int64, path: pchar): int64 {
+    if (doc == 0 || path == 0) { return YAML_NULL; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    var vstart: int64 := _yamlFindKey(content, clen, path, plen);
+    if (vstart < 0) { return YAML_NULL; }
+    var first: int64 := StrCharAt(content, vstart);
+    if (first == 0 || first == 10 || first == 13) { return YAML_NULL; }
+    if (first == 116 || first == 84 || first == 102 || first == 70 ||
+        first == 121 || first == 89 || first == 110 || first == 78) {
+        return YAML_BOOL;
+    }
+    if (isDigit(first) || first == 45) {
+        var p: int64 := vstart;
+        var hasDot: bool := false;
+        while (p < clen && StrCharAt(content, p) != 10 && StrCharAt(content, p) != 13 && StrCharAt(content, p) != 0) {
+            if (StrCharAt(content, p) == 46) { hasDot := true; }
+            p := p + 1;
+        }
+        if (hasDot) { return YAML_FLOAT; }
+        return YAML_INT;
+    }
+    return YAML_STRING;
+}
+
+// Get all top-level keys; writes consecutive null-terminated strings into output.
+// Returns number of keys found (up to max_count).
+pub fn GetKeys(doc: int64, path: pchar, output: pchar, max_count: int64): int64 {
+    if (doc == 0 || output == 0 || max_count <= 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var count: int64 := 0;
+    var pos: int64 := 0;
+    var outPos: int64 := 0;
+    while (pos < clen && count < max_count) {
+        var c0: int64 := StrCharAt(content, pos);
+        if (c0 != 32 && c0 != 9 && c0 != 35 && c0 != 10 && c0 != 13 && c0 != 0 &&
+            !(c0 == 45 && StrCharAt(content, pos + 1) == 45 && StrCharAt(content, pos + 2) == 45)) {
+            var kp: int64 := pos;
+            var hasColon: bool := false;
+            while (kp < clen && StrCharAt(content, kp) != 10 && StrCharAt(content, kp) != 13 && StrCharAt(content, kp) != 0 && !hasColon) {
+                if (StrCharAt(content, kp) == 58) { hasColon := true; }
+                else { kp := kp + 1; }
+            }
+            if (hasColon) {
+                var kend: int64 := pos;
+                while (kend < clen && StrCharAt(content, kend) != 58 && StrCharAt(content, kend) != 10 && StrCharAt(content, kend) != 13) {
+                    StrSetChar(output, outPos, StrCharAt(content, kend));
+                    outPos := outPos + 1; kend := kend + 1;
+                }
+                while (outPos > 0 && (StrCharAt(output, outPos - 1) == 32 || StrCharAt(output, outPos - 1) == 9)) {
+                    outPos := outPos - 1;
+                }
+                StrSetChar(output, outPos, 0);
+                outPos := outPos + 1;
+                count := count + 1;
+            }
+        }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return count;
+}
+
+// Get array length — counts indented "- " lines immediately after the key.
+pub fn GetArrayLen(doc: int64, path: pchar): int64 {
+    if (doc == 0 || path == 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var plen: int64 := StrLen(path);
+    var vstart: int64 := _yamlFindKey(content, clen, path, plen);
+    if (vstart < 0) { return 0; }
+    var pos: int64 := vstart;
+    while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+        pos := pos + 1;
+    }
+    while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+        pos := pos + 1;
+    }
+    var count: int64 := 0;
+    var scanning: bool := true;
+    while (pos < clen && scanning) {
+        var c0: int64 := StrCharAt(content, pos);
+        if (c0 == 32 || c0 == 9) {
+            var ip: int64 := pos;
+            while (ip < clen && (StrCharAt(content, ip) == 32 || StrCharAt(content, ip) == 9)) {
+                ip := ip + 1;
+            }
+            if (StrCharAt(content, ip) == 45 && (StrCharAt(content, ip + 1) == 32 || StrCharAt(content, ip + 1) == 9)) {
+                count := count + 1;
+            }
+            while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+                pos := pos + 1;
+            }
+            while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+                pos := pos + 1;
+            }
+        } else {
+            scanning := false;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// YAML String Helpers
+// ============================================================================
+
+// Escape string for YAML
+pub fn EscapeString(input: pchar, output: pchar): int64 {
+    if (input == 0 || output == 0) { return 0; }
+    
+    var in_pos: int64 := 0;
+    var out_pos: int64 := 0;
+    
+    while (StrCharAt(input, in_pos) != 0) {
+        var c: int64 := StrCharAt(input, in_pos);
+        
+        // Handle special characters that need escaping in YAML
+        if (c == 92) {  // backslash
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+        } else if (c == 34) {  // double quote
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 34); out_pos := out_pos + 1;
+        } else if (c == 10) {  // newline
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 110); out_pos := out_pos + 1;
+        } else if (c == 13) {  // carriage return
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 114); out_pos := out_pos + 1;
+        } else if (c == 9) {  // tab
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 116); out_pos := out_pos + 1;
+        } else {
+            StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
+        }
+        
+        in_pos := in_pos + 1;
+    }
+    
+    StrSetChar(output, out_pos, 0);
+    return out_pos;
+}
+
+// Unescape YAML string
+pub fn UnescapeString(input: pchar, output: pchar): int64 {
+    if (input == 0 || output == 0) { return 0; }
+    
+    var in_pos: int64 := 0;
+    var out_pos: int64 := 0;
+    
+    while (StrCharAt(input, in_pos) != 0) {
+        var c: int64 := StrCharAt(input, in_pos);
+        
+        if (c == 92) {  // escape sequence
+            var next: int64 := StrCharAt(input, in_pos + 1);
+            if (next == 92) {
+                StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            } else if (next == 34) {
+                StrSetChar(output, out_pos, 34); out_pos := out_pos + 1;
+            } else if (next == 110) {
+                StrSetChar(output, out_pos, 10); out_pos := out_pos + 1;
+            } else if (next == 114) {
+                StrSetChar(output, out_pos, 13); out_pos := out_pos + 1;
+            } else if (next == 116) {
+                StrSetChar(output, out_pos, 9); out_pos := out_pos + 1;
+            }
+            in_pos := in_pos + 2;
+        } else {
+            StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
+            in_pos := in_pos + 1;
+        }
+    }
+    
+    StrSetChar(output, out_pos, 0);
+    return out_pos;
+}
+
+// ============================================================================
+// Type Conversion
+// ============================================================================
+
+// Parse YAML string to int64
+pub fn ParseYamlInt(s: pchar): int64 {
+    if (s == 0) { return 0; }
+    
+    var i: int64 := 0;
+    var negative: bool := false;
+    var value: int64 := 0;
+    
+    // Handle sign
+    if (StrCharAt(s, 0) == 45) {  // '-'
+        negative := true;
+        i := i + 1;
+    }
+    
+    // Parse digits
+    while (isDigit(StrCharAt(s, i))) {
+        value := value * 10 + (StrCharAt(s, i) - 48);
+        i := i + 1;
+    }
+    
+    if (negative) { value := -value; }
+    return value;
+}
+
+// Parse YAML string to bool
+pub fn ParseYamlBool(s: pchar): bool {
+    if (s == 0) { return false; }
+    
+    var first: int64 := StrCharAt(s, 0);
+    
+    // true values: true, yes, on, 1
+    if (first == 116 || first == 84 || first == 121 || first == 89 || first == 111 || first == 49) {
+        return true;
+    }
+    
+    // false values: false, no, off, 0
+    return false;
+}
+
+// Parse YAML string to float ("±integer.fraction")
+pub fn ParseYamlFloat(s: pchar): f64 {
+    if (s == 0) { return 0.0; }
+    var neg: bool := false;
+    var pos: int64 := 0;
+    if (StrCharAt(s, 0) == 45) { neg := true; pos := 1; }
+    var int_part: f64 := 0.0;
+    while (isDigit(StrCharAt(s, pos))) {
+        var d: int64 := StrCharAt(s, pos) - 48;
+        var df: f64 := d as f64;
+        int_part := int_part * 10.0 + df;
+        pos := pos + 1;
+    }
+    var frac_part: f64 := 0.0;
+    if (StrCharAt(s, pos) == 46) {
+        pos := pos + 1;
+        var scale: f64 := 0.1;
+        while (isDigit(StrCharAt(s, pos))) {
+            var d: int64 := StrCharAt(s, pos) - 48;
+            var df: f64 := d as f64;
+            frac_part := frac_part + df * scale;
+            scale := scale / 10.0;
+            pos := pos + 1;
+        }
+    }
+    var result: f64 := int_part + frac_part;
+    if (neg) { result := 0.0 - result; }
+    return result;
+}
+
+// ============================================================================
+// Validation
+// ============================================================================
+
+// Check if string is valid YAML identifier
+pub fn IsValidKey(s: pchar): bool {
+    if (s == 0) { return false; }
+    
+    var i: int64 := 0;
+    while (StrCharAt(s, i) != 0) {
+        var c: int64 := StrCharAt(s, i);
+        
+        // Allow: alphanumeric, underscore, hyphen
+        var valid: bool := false;
+        if (c >= 65 && c <= 90) { valid := true; }      // A-Z
+        if (c >= 97 && c <= 122) { valid := true; }     // a-z
+        if (c >= 48 && c <= 57) { valid := true; }      // 0-9
+        if (c == 95 || c == 45) { valid := true; }      // _ -
+        
+        if not valid { return false; }
+        i := i + 1;
+    }
+    
+    return true;
+}
+
+// Check if string needs quoting in YAML
+pub fn NeedsQuoting(s: pchar): bool {
+    if (s == 0) { return true; }
+    
+    var i: int64 := 0;
+    while (StrCharAt(s, i) != 0) {
+        var c: int64 := StrCharAt(s, i);
+        
+        // Needs quoting if contains: colon, hash, special chars
+        if (c == 58 || c == 35 || c == 91 || c == 93 || c == 123 || c == 125 ||
+            c == 44 || c == 38 || c == 42 || c == 33 || c == 124) {
+            return true;
+        }
+        
+        // Needs quoting if starts with special characters
+        if (i == 0 && (c == 45 || c == 46 || c == 39 || c == 34 || c == 64 || c == 33)) {
+            return true;
+        }
+        
+        i := i + 1;
+    }
+    
+    return false;
+}

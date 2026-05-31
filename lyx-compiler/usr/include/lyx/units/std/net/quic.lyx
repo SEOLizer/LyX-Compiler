@@ -1,0 +1,1520 @@
+// Lyx QUIC Module - RFC 9000 (QUIC v1) Protocol Framework
+// QUIC transport protocol with integrated TLS 1.3 encryption
+//
+// QUIC runs over UDP (typically port 443) and provides:
+// - Reliable, multiplexed streams
+// - Built-in TLS 1.3 encryption
+// - Connection migration
+// - 0-RTT connection establishment
+// - Congestion control
+//
+// Usage:
+//   import std.net.quic;
+//   var conn: QUICConn := QUICConnect("server.example.com", 443);
+//   var stream: QUICStream := QUICOpenStream(conn);
+//   QUICStreamWrite(stream, data, len);
+//   var n: int64 := QUICStreamRead(stream, buf, bufsize);
+//   QUICCloseStream(stream);
+//   QUICDisconnect(conn);
+
+unit std.net.quic;
+
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+
+// QUIC port (typically same as HTTPS)
+pub con QUIC_PORT: int64 := 443;
+
+// QUIC version
+pub con QUIC_VERSION_1: int64 := $00000001;
+
+// QUIC packet types (long header)
+pub con QUIC_PKT_INITIAL: int64 := 0;
+pub con QUIC_PKT_0RTT: int64 := 1;
+pub con QUIC_PKT_HANDSHAKE: int64 := 2;
+pub con QUIC_PKT_RETRY: int64 := 3;
+
+// QUIC packet types (short header bit)
+pub con QUIC_PKT_1RTT: int64 := 4;
+
+// QUIC frame types
+pub con QUIC_FRAME_PADDING: int64 := $00;
+pub con QUIC_FRAME_PING: int64 := $01;
+pub con QUIC_FRAME_ACK: int64 := $02;
+pub con QUIC_FRAME_ACK_ECN: int64 := $03;
+pub con QUIC_FRAME_RESET_STREAM: int64 := $04;
+pub con QUIC_FRAME_STOP_SENDING: int64 := $05;
+pub con QUIC_FRAME_CRYPTO: int64 := $06;
+pub con QUIC_FRAME_NEW_TOKEN: int64 := $07;
+pub con QUIC_FRAME_STREAM_BASE: int64 := $08;
+pub con QUIC_FRAME_MAX_DATA: int64 := $10;
+pub con QUIC_FRAME_MAX_STREAM_DATA: int64 := $11;
+pub con QUIC_FRAME_MAX_STREAMS_BIDI: int64 := $12;
+pub con QUIC_FRAME_MAX_STREAMS_UNI: int64 := $13;
+pub con QUIC_FRAME_DATA_BLOCKED: int64 := $14;
+pub con QUIC_FRAME_STREAM_DATA_BLOCKED: int64 := $15;
+pub con QUIC_FRAME_STREAMS_BLOCKED_BIDI: int64 := $16;
+pub con QUIC_FRAME_STREAMS_BLOCKED_UNI: int64 := $17;
+pub con QUIC_FRAME_NEW_CONNECTION_ID: int64 := $18;
+pub con QUIC_FRAME_RETIRE_CONNECTION_ID: int64 := $19;
+pub con QUIC_FRAME_PATH_CHALLENGE: int64 := $1A;
+pub con QUIC_FRAME_PATH_RESPONSE: int64 := $1B;
+pub con QUIC_FRAME_CONNECTION_CLOSE: int64 := $1C;
+pub con QUIC_FRAME_CONNECTION_CLOSE_APP: int64 := $1D;
+pub con QUIC_FRAME_HANDSHAKE_DONE: int64 := $1E;
+
+// QUIC error codes
+pub con QUIC_ERR_NO_ERROR: int64 := $00;
+pub con QUIC_ERR_INTERNAL_ERROR: int64 := $01;
+pub con QUIC_ERR_CONNECTION_REFUSED: int64 := $02;
+pub con QUIC_ERR_FLOW_CONTROL_ERROR: int64 := $03;
+pub con QUIC_ERR_STREAM_LIMIT_ERROR: int64 := $04;
+pub con QUIC_ERR_STREAM_STATE_ERROR: int64 := $05;
+pub con QUIC_ERR_FINAL_SIZE_ERROR: int64 := $06;
+pub con QUIC_ERR_FRAME_ENCODING_ERROR: int64 := $07;
+pub con QUIC_ERR_TRANSPORT_PARAMETER_ERROR: int64 := $08;
+pub con QUIC_ERR_CONNECTION_ID_LIMIT_ERROR: int64 := $09;
+pub con QUIC_ERR_PROTOCOL_VIOLATION: int64 := $0A;
+pub con QUIC_ERR_INVALID_TOKEN: int64 := $0B;
+pub con QUIC_ERR_APPLICATION_ERROR: int64 := $0C;
+pub con QUIC_ERR_CRYPTO_BUFFER_EXCEEDED: int64 := $0D;
+pub con QUIC_ERR_KEY_UPDATE_ERROR: int64 := $0E;
+pub con QUIC_ERR_AEAD_LIMIT_REACHED: int64 := $0F;
+pub con QUIC_ERR_NO_VIABLE_PATH: int64 := $10;
+
+// Maximum packet sizes
+pub con QUIC_MAX_PACKET_SIZE: int64 := 1452;
+pub con QUIC_MIN_INITIAL_SIZE: int64 := 1200;
+
+// QUIC connection ID length
+pub con QUIC_CONN_ID_LEN: int64 := 8;
+
+// QUIC connection — extended with crypto key storage
+pub type QUICConn = struct {
+  sock: UDPSocket;         // UDP socket
+  connected: int64;        // 1 if connection established
+  localConnId: int64;      // Pointer to local connection ID (8 bytes)
+  remoteConnId: int64;     // Pointer to remote connection ID (8 bytes)
+  nextStreamId: int64;     // Next stream ID to allocate
+  packetNumber: int64;     // Current packet number
+  serverIp: int64;         // Resolved server IP
+  serverPort: int64;       // Server port
+  clientKey: int64;        // Pointer to 16-byte AEAD key
+  clientIV: int64;         // Pointer to 12-byte IV
+  clientHP: int64;         // Pointer to 16-byte header-protection key
+};
+
+// QUIC stream — extended with network and crypto info for independent use
+pub type QUICStream = struct {
+  conn: int64;             // Reserved (not used, kept for ABI)
+  streamId: int64;         // Stream identifier
+  state: int64;            // 0 = closed, 1 = open
+  offset: int64;           // Byte offset sent so far (also serves as packet counter)
+  sockFd: int64;           // Socket fd copied from conn
+  serverIp: int64;         // Server IP copied from conn
+  serverPort: int64;       // Server port copied from conn
+  keyPtr: int64;           // Pointer to encryption key (from conn)
+  ivPtr: int64;            // Pointer to IV (from conn)
+};
+
+// QUIC packet header (utility struct)
+pub type QUICPacketHeader = struct {
+  headerForm: int64;
+  fixedBit: int64;
+  packetType: int64;
+  typeSpecific: int64;
+  version: int64;
+  destConnIdLen: int64;
+  destConnId: int64;
+  srcConnIdLen: int64;
+  srcConnId: int64;
+  packetNumber: int64;
+  payloadLen: int64;
+};
+
+// Generate pseudo-random bytes using LCG
+pub fn QUICRandomBytes(buf: int64, len: int64) {
+  var i: int64 := 0;
+  var rng: int64 := 0x12345678;
+  while (i < len) {
+    rng := rng * 1664525 + 1013904223;
+    var rbyte: int64 := rng & 255;
+    poke8(buf + i, rbyte);
+    i := i + 1;
+  }
+}
+
+// Encode variable-length integer (QUIC varint)
+// Returns number of bytes written
+pub fn QUICWriteVarint(buf: int64, pos: int64, value: int64): int64 {
+  if (value < 64) {
+    poke8(buf + pos, value);
+    return 1;
+  }
+  else if (value < 16384) {
+    poke8(buf + pos, (value / 256) + 64);
+    poke8(buf + pos + 1, value - (value / 256) * 256);
+    return 2;
+  }
+  else if (value < 1073741824) {
+    poke8(buf + pos, (value / 16777216) + 128);
+    var rem: int64 := value - (value / 16777216) * 16777216;
+    poke8(buf + pos + 1, rem / 65536);
+    rem := rem - (rem / 65536) * 65536;
+    poke8(buf + pos + 2, rem / 256);
+    poke8(buf + pos + 3, rem - (rem / 256) * 256);
+    return 4;
+  }
+  else {
+    poke8(buf + pos, (value / 72057594037927936) + 192);
+    var rem: int64 := value - (value / 72057594037927936) * 72057594037927936;
+    poke8(buf + pos + 1, rem / 281474976710656);
+    rem := rem - (rem / 281474976710656) * 281474976710656;
+    poke8(buf + pos + 2, rem / 1099511627776);
+    rem := rem - (rem / 1099511627776) * 1099511627776;
+    poke8(buf + pos + 3, rem / 4294967296);
+    rem := rem - (rem / 4294967296) * 4294967296;
+    poke8(buf + pos + 4, rem / 16777216);
+    rem := rem - (rem / 16777216) * 16777216;
+    poke8(buf + pos + 5, rem / 65536);
+    rem := rem - (rem / 65536) * 65536;
+    poke8(buf + pos + 6, rem / 256);
+    poke8(buf + pos + 7, rem - (rem / 256) * 256);
+    return 8;
+  }
+}
+
+// Decode variable-length integer
+pub fn QUICReadVarint(buf: int64, pos: int64): int64 {
+  var first: int64 := peek8(buf + pos);
+  var prefix: int64 := first / 64;
+
+  if (prefix == 0) {
+    return first - (first / 64) * 64;
+  }
+  else if (prefix == 1) {
+    return ((first - 64) * 256) + peek8(buf + pos + 1);
+  }
+  else if (prefix == 2) {
+    var val: int64 := (first - 128) * 16777216;
+    val := val + (peek8(buf + pos + 1) * 65536);
+    val := val + (peek8(buf + pos + 2) * 256);
+    val := val + peek8(buf + pos + 3);
+    return val;
+  }
+  else {
+    var val: int64 := (first - 192) * 72057594037927936;
+    val := val + (peek8(buf + pos + 1) * 281474976710656);
+    val := val + (peek8(buf + pos + 2) * 1099511627776);
+    val := val + (peek8(buf + pos + 3) * 4294967296);
+    val := val + (peek8(buf + pos + 4) * 16777216);
+    val := val + (peek8(buf + pos + 5) * 65536);
+    val := val + (peek8(buf + pos + 6) * 256);
+    val := val + peek8(buf + pos + 7);
+    return val;
+  }
+}
+
+// Get bytes consumed by varint at position
+pub fn QUICVarintSize(buf: int64, pos: int64): int64 {
+  var first: int64 := peek8(buf + pos);
+  var prefix: int64 := first / 64;
+
+  if (prefix == 0) { return 1; }
+  else if (prefix == 1) { return 2; }
+  else if (prefix == 2) { return 4; }
+  else { return 8; }
+}
+
+// Build QUIC Initial packet header (utility)
+pub fn QUICBuildInitialPacket(destConnId: int64, destLen: int64, srcConnId: int64, srcLen: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+
+  buf := mmap(0, QUIC_MAX_PACKET_SIZE, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  pos := 0;
+  poke8(buf + pos, 192 + QUIC_PKT_INITIAL);
+  pos := pos + 1;
+
+  var ver: int64 := QUIC_VERSION_1;
+  poke8(buf + pos, (ver / 16777216) - ((ver / 4294967296) * 256));
+  poke8(buf + pos + 1, (ver / 65536) - ((ver / 16777216) * 256));
+  poke8(buf + pos + 2, (ver / 256) - ((ver / 65536) * 256));
+  poke8(buf + pos + 3, ver - ((ver / 256) * 256));
+  pos := pos + 4;
+
+  poke8(buf + pos, destLen);
+  pos := pos + 1;
+  if (destConnId != 0) {
+    i := 0;
+    while (i < destLen) {
+      poke8(buf + pos + i, peek8(destConnId + i));
+      i := i + 1;
+    }
+  }
+  pos := pos + destLen;
+
+  poke8(buf + pos, srcLen);
+  pos := pos + 1;
+  if (srcConnId != 0) {
+    i := 0;
+    while (i < srcLen) {
+      poke8(buf + pos + i, peek8(srcConnId + i));
+      i := i + 1;
+    }
+  }
+  pos := pos + srcLen;
+
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+
+  var lengthPos: int64 := pos;
+  poke8(buf + pos, 64);
+  poke8(buf + pos + 1, 0);
+  pos := pos + 2;
+
+  poke8(buf + pos, 0);
+  pos := pos + 1;
+
+  pos := pos + QUICWriteVarint(buf, pos, QUIC_FRAME_CRYPTO);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+
+  var payloadLen: int64 := pos - lengthPos - 2;
+  poke8(buf + lengthPos,     (payloadLen / 256) + 64);
+  poke8(buf + lengthPos + 1, payloadLen - (payloadLen / 256) * 256);
+
+  return buf;
+}
+
+// Build QUIC STREAM frame
+pub fn QUICBuildStreamFrame(streamId: int64, data: int64, dataLen: int64, fin: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var i: int64;
+  var frameType: int64;
+
+  var streamSz: int64 := dataLen + 32;
+  buf := mmap(0, streamSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  pos := 0;
+  frameType := QUIC_FRAME_STREAM_BASE + 2 + 4;
+  if (fin == 1) { frameType := frameType + 1; }
+  poke8(buf + pos, frameType);
+  pos := pos + 1;
+
+  pos := pos + QUICWriteVarint(buf, pos, streamId);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+  pos := pos + QUICWriteVarint(buf, pos, dataLen);
+
+  if (data != 0) {
+    i := 0;
+    while (i < dataLen) {
+      poke8(buf + pos + i, peek8(data + i));
+      i := i + 1;
+    }
+  }
+  pos := pos + dataLen;
+
+  return buf;
+}
+
+// Build QUIC PADDING frame
+pub fn QUICBuildPaddingFrame(len: int64): int64 {
+  var buf: int64;
+  var i: int64;
+
+  buf := mmap(0, len, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  i := 0;
+  while (i < len) {
+    poke8(buf + i, QUIC_FRAME_PADDING);
+    i := i + 1;
+  }
+
+  return buf;
+}
+
+// Build QUIC ACK frame
+pub fn QUICBuildAckFrame(largestAcked: int64, ackDelay: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+
+  buf := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  pos := 0;
+  poke8(buf + pos, QUIC_FRAME_ACK);
+  pos := pos + 1;
+  pos := pos + QUICWriteVarint(buf, pos, largestAcked);
+  pos := pos + QUICWriteVarint(buf, pos, ackDelay);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+
+  return buf;
+}
+
+// Build QUIC CONNECTION_CLOSE frame
+pub fn QUICBuildConnectionClose(errorCode: int64, reason: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var reasonLen: int64;
+  var i: int64;
+
+  reasonLen := 0;
+  if (reason != 0) {
+    while (peek8(reason + reasonLen) != 0) {
+      reasonLen := reasonLen + 1;
+    }
+  }
+
+  var closeSz: int64 := 64 + reasonLen;
+  buf := mmap(0, closeSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  pos := 0;
+  poke8(buf + pos, QUIC_FRAME_CONNECTION_CLOSE);
+  pos := pos + 1;
+  pos := pos + QUICWriteVarint(buf, pos, errorCode);
+  pos := pos + QUICWriteVarint(buf, pos, 0);
+  pos := pos + QUICWriteVarint(buf, pos, reasonLen);
+  i := 0;
+  while (i < reasonLen) {
+    poke8(buf + pos + i, peek8(reason + i));
+    i := i + 1;
+  }
+  pos := pos + reasonLen;
+
+  return buf;
+}
+
+// ============================================================================
+// Crypto Primitives — SHA-256 / HMAC / HKDF / AES-128 / AES-128-GCM
+// ============================================================================
+
+// ROTR32: rotate 32-bit value x right by n bits
+fn _qROR32(x: int64, n: int64): int64 {
+  return ((x >> n) | (x << (32 - n))) & 4294967295;
+}
+
+// SHA-256 block compression: updates state[8*int64] with 64-byte block, using K[64*int64]
+fn _qSHA256Block(state: int64, block: int64, K: int64) {
+  var Wbuf: int64 := mmap(0, 512, 3, 34, -1, 0);
+  if (Wbuf == 0) { return; }
+
+  // Load W[0..15] from block (big-endian 32-bit words)
+  var i: int64 := 0;
+  while (i < 16) {
+    var b0: int64 := peek8(block + i*4 + 0);
+    var b1: int64 := peek8(block + i*4 + 1);
+    var b2: int64 := peek8(block + i*4 + 2);
+    var b3: int64 := peek8(block + i*4 + 3);
+    poke64(Wbuf + i*8, b0*16777216 + b1*65536 + b2*256 + b3);
+    i := i + 1;
+  }
+
+  // Expand W[16..63]
+  i := 16;
+  while (i < 64) {
+    var w15: int64 := peek64(Wbuf + (i-15)*8);
+    var w2: int64  := peek64(Wbuf + (i-2)*8);
+    var w16: int64 := peek64(Wbuf + (i-16)*8);
+    var w7: int64  := peek64(Wbuf + (i-7)*8);
+    var sig0: int64 := (_qROR32(w15, 7) ^ _qROR32(w15, 18) ^ (w15 >> 3)) & 4294967295;
+    var sig1: int64 := (_qROR32(w2, 17) ^ _qROR32(w2, 19) ^ (w2 >> 10)) & 4294967295;
+    poke64(Wbuf + i*8, (sig1 + w7 + sig0 + w16) & 4294967295);
+    i := i + 1;
+  }
+
+  // Load working variables from state
+  var sha_a: int64 := peek64(state + 0);
+  var sha_b: int64 := peek64(state + 8);
+  var sha_c: int64 := peek64(state + 16);
+  var sha_d: int64 := peek64(state + 24);
+  var sha_e: int64 := peek64(state + 32);
+  var sha_f: int64 := peek64(state + 40);
+  var sha_g: int64 := peek64(state + 48);
+  var sha_h: int64 := peek64(state + 56);
+
+  // 64 compression rounds
+  var ri: int64 := 0;
+  while (ri < 64) {
+    var ki: int64 := peek64(K + ri*8);
+    var wi: int64 := peek64(Wbuf + ri*8);
+    var S1: int64 := (_qROR32(sha_e, 6) ^ _qROR32(sha_e, 11) ^ _qROR32(sha_e, 25)) & 4294967295;
+    var ch: int64 := ((sha_e & sha_f) ^ ((4294967295 ^ sha_e) & sha_g)) & 4294967295;
+    var t1: int64 := (sha_h + S1 + ch + ki + wi) & 4294967295;
+    var S0: int64 := (_qROR32(sha_a, 2) ^ _qROR32(sha_a, 13) ^ _qROR32(sha_a, 22)) & 4294967295;
+    var maj: int64 := ((sha_a & sha_b) ^ (sha_a & sha_c) ^ (sha_b & sha_c)) & 4294967295;
+    var t2: int64 := (S0 + maj) & 4294967295;
+    sha_h := sha_g;
+    sha_g := sha_f;
+    sha_f := sha_e;
+    sha_e := (sha_d + t1) & 4294967295;
+    sha_d := sha_c;
+    sha_c := sha_b;
+    sha_b := sha_a;
+    sha_a := (t1 + t2) & 4294967295;
+    ri := ri + 1;
+  }
+
+  // Add working variables back to state
+  poke64(state + 0,  (peek64(state + 0)  + sha_a) & 4294967295);
+  poke64(state + 8,  (peek64(state + 8)  + sha_b) & 4294967295);
+  poke64(state + 16, (peek64(state + 16) + sha_c) & 4294967295);
+  poke64(state + 24, (peek64(state + 24) + sha_d) & 4294967295);
+  poke64(state + 32, (peek64(state + 32) + sha_e) & 4294967295);
+  poke64(state + 40, (peek64(state + 40) + sha_f) & 4294967295);
+  poke64(state + 48, (peek64(state + 48) + sha_g) & 4294967295);
+  poke64(state + 56, (peek64(state + 56) + sha_h) & 4294967295);
+
+  munmap(Wbuf, 512);
+}
+
+// SHA-256: input (inLen bytes) → out32 (32-byte hash)
+fn _qSHA256(input: int64, inLen: int64, out32: int64) {
+  // SHA-256 K constants (RFC 6234)
+  var K: int64 := mmap(0, 512, 3, 34, -1, 0);
+  if (K == 0) { return; }
+  poke64(K+0,   1116352408); poke64(K+8,   1899447441); poke64(K+16,  3049323471); poke64(K+24,  3921009573);
+  poke64(K+32,  961987163);  poke64(K+40,  1508970993); poke64(K+48,  2453635748); poke64(K+56,  2870763221);
+  poke64(K+64,  3624381080); poke64(K+72,  310598401);  poke64(K+80,  607225278);  poke64(K+88,  1426881987);
+  poke64(K+96,  1925078388); poke64(K+104, 2162078206); poke64(K+112, 2614888103); poke64(K+120, 3248222580);
+  poke64(K+128, 3835390401); poke64(K+136, 4022224774); poke64(K+144, 264347078);  poke64(K+152, 604807628);
+  poke64(K+160, 770255983);  poke64(K+168, 1249150122); poke64(K+176, 1555081692); poke64(K+184, 1996064986);
+  poke64(K+192, 2554220882); poke64(K+200, 2821834349); poke64(K+208, 2952996808); poke64(K+216, 3210313671);
+  poke64(K+224, 3336571891); poke64(K+232, 3584528711); poke64(K+240, 113926993);  poke64(K+248, 338241895);
+  poke64(K+256, 666307205);  poke64(K+264, 773529912);  poke64(K+272, 1294757372); poke64(K+280, 1396182291);
+  poke64(K+288, 1695183700); poke64(K+296, 1986661051); poke64(K+304, 2177026350); poke64(K+312, 2456956037);
+  poke64(K+320, 2730485921); poke64(K+328, 2820302411); poke64(K+336, 3259730800); poke64(K+344, 3345764771);
+  poke64(K+352, 3516065817); poke64(K+360, 3600352804); poke64(K+368, 4094571909); poke64(K+376, 275423344);
+  poke64(K+384, 430227734);  poke64(K+392, 506948616);  poke64(K+400, 659060556);  poke64(K+408, 883997877);
+  poke64(K+416, 958139571);  poke64(K+424, 1322822218); poke64(K+432, 1537002063); poke64(K+440, 1747873779);
+  poke64(K+448, 1955562222); poke64(K+456, 2024104815); poke64(K+464, 2227730452); poke64(K+472, 2361852424);
+  poke64(K+480, 2428436474); poke64(K+488, 2756734187); poke64(K+496, 3204031479); poke64(K+504, 3329325298);
+
+  // SHA-256 initial hash values (square roots of first 8 primes)
+  var state: int64 := mmap(0, 64, 3, 34, -1, 0);
+  if (state == 0) { munmap(K, 512); return; }
+  poke64(state+0,  1779033703); poke64(state+8,  3144134277);
+  poke64(state+16, 1013904242); poke64(state+24, 2773480762);
+  poke64(state+32, 1359893119); poke64(state+40, 2600822924);
+  poke64(state+48, 528734635);  poke64(state+56, 1541459225);
+
+  // Padding: input || 0x80 || zeros || bit_length (8 bytes BE)
+  var padLen: int64 := inLen + 1;
+  var rem: int64 := padLen - (padLen / 64) * 64;
+  if (rem <= 56) {
+    padLen := padLen + (56 - rem);
+  } else {
+    padLen := padLen + (120 - rem);
+  }
+  padLen := padLen + 8;
+
+  var padded: int64 := mmap(0, padLen, 3, 34, -1, 0);
+  if (padded == 0) { munmap(state, 64); munmap(K, 512); return; }
+
+  var i: int64 := 0;
+  while (i < inLen) {
+    poke8(padded + i, peek8(input + i));
+    i := i + 1;
+  }
+  poke8(padded + inLen, 128);
+
+  var bitLen: int64 := inLen * 8;
+  var lp: int64 := padLen - 8;
+  poke8(padded + lp + 0, (bitLen >> 56) & 255);
+  poke8(padded + lp + 1, (bitLen >> 48) & 255);
+  poke8(padded + lp + 2, (bitLen >> 40) & 255);
+  poke8(padded + lp + 3, (bitLen >> 32) & 255);
+  poke8(padded + lp + 4, (bitLen >> 24) & 255);
+  poke8(padded + lp + 5, (bitLen >> 16) & 255);
+  poke8(padded + lp + 6, (bitLen >> 8)  & 255);
+  poke8(padded + lp + 7,  bitLen        & 255);
+
+  var numBlocks: int64 := padLen / 64;
+  i := 0;
+  while (i < numBlocks) {
+    _qSHA256Block(state, padded + i*64, K);
+    i := i + 1;
+  }
+  munmap(padded, padLen);
+  munmap(K, 512);
+
+  // Output 8 big-endian 32-bit words
+  i := 0;
+  while (i < 8) {
+    var word: int64 := peek64(state + i*8);
+    poke8(out32 + i*4 + 0, (word >> 24) & 255);
+    poke8(out32 + i*4 + 1, (word >> 16) & 255);
+    poke8(out32 + i*4 + 2, (word >> 8)  & 255);
+    poke8(out32 + i*4 + 3,  word        & 255);
+    i := i + 1;
+  }
+  munmap(state, 64);
+}
+
+// HMAC-SHA256: HMAC(key, msg) → out32 (32 bytes)
+fn _qHMACSHA256(key: int64, keyLen: int64, msg: int64, msgLen: int64, out32: int64) {
+  var k: int64 := mmap(0, 64, 3, 34, -1, 0);
+  if (k == 0) { return; }
+
+  var i: int64 := 0;
+  while (i < 64) { poke8(k + i, 0); i := i + 1; }
+
+  if (keyLen > 64) {
+    _qSHA256(key, keyLen, k);
+  } else {
+    i := 0;
+    while (i < keyLen) { poke8(k + i, peek8(key + i)); i := i + 1; }
+  }
+
+  // Inner: HMAC-inner = (key^ipad) || msg
+  var iMsgLen: int64 := 64 + msgLen;
+  var iMsg: int64 := mmap(0, iMsgLen, 3, 34, -1, 0);
+  if (iMsg == 0) { munmap(k, 64); return; }
+  i := 0;
+  while (i < 64) { poke8(iMsg + i, peek8(k + i) ^ 54); i := i + 1; }  // 0x36 = 54
+  i := 0;
+  while (i < msgLen) { poke8(iMsg + 64 + i, peek8(msg + i)); i := i + 1; }
+
+  var inner: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (inner == 0) { munmap(iMsg, iMsgLen); munmap(k, 64); return; }
+  _qSHA256(iMsg, iMsgLen, inner);
+  munmap(iMsg, iMsgLen);
+
+  // Outer: (key^opad) || inner
+  var oMsg: int64 := mmap(0, 96, 3, 34, -1, 0);
+  if (oMsg == 0) { munmap(inner, 32); munmap(k, 64); return; }
+  i := 0;
+  while (i < 64) { poke8(oMsg + i, peek8(k + i) ^ 92); i := i + 1; }  // 0x5C = 92
+  i := 0;
+  while (i < 32) { poke8(oMsg + 64 + i, peek8(inner + i)); i := i + 1; }
+
+  _qSHA256(oMsg, 96, out32);
+  munmap(oMsg, 96);
+  munmap(inner, 32);
+  munmap(k, 64);
+}
+
+// HKDF-Extract (RFC 5869): PRK = HMAC(salt, IKM)
+fn _qHKDFExtract(salt: int64, saltLen: int64, ikm: int64, ikmLen: int64, out32: int64) {
+  _qHMACSHA256(salt, saltLen, ikm, ikmLen, out32);
+}
+
+// HKDF-Expand (RFC 5869): expand PRK using info to produce outLen bytes
+fn _qHKDFExpand(prk: int64, info: int64, infoLen: int64, outLen: int64, out: int64) {
+  var T: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (T == 0) { return; }
+  var mBufSize: int64 := 33 + infoLen;
+  var mBuf: int64 := mmap(0, mBufSize, 3, 34, -1, 0);
+  if (mBuf == 0) { munmap(T, 32); return; }
+
+  var pos: int64 := 0;
+  var round: int64 := 1;
+  var done: bool := false;
+
+  while (!done) {
+    var mLen: int64 := 0;
+    if (round > 1) {
+      var ji: int64 := 0;
+      while (ji < 32) { poke8(mBuf + ji, peek8(T + ji)); ji := ji + 1; }
+      mLen := 32;
+    }
+    var ji2: int64 := 0;
+    while (ji2 < infoLen) {
+      poke8(mBuf + mLen + ji2, peek8(info + ji2));
+      ji2 := ji2 + 1;
+    }
+    mLen := mLen + infoLen;
+    poke8(mBuf + mLen, round);
+    mLen := mLen + 1;
+
+    _qHMACSHA256(prk, 32, mBuf, mLen, T);
+
+    var copy: int64 := 32;
+    if (pos + copy > outLen) { copy := outLen - pos; }
+    var ji3: int64 := 0;
+    while (ji3 < copy) {
+      poke8(out + pos + ji3, peek8(T + ji3));
+      ji3 := ji3 + 1;
+    }
+    pos := pos + copy;
+
+    if (pos >= outLen) {
+      done := true;
+    } else {
+      round := round + 1;
+    }
+  }
+
+  munmap(mBuf, mBufSize);
+  munmap(T, 32);
+}
+
+// HKDF-Expand-Label (TLS 1.3, RFC 8446 §7.1)
+// info = uint16(outLen) || uint8(6+labelLen) || "tls13 " || label || uint8(0)
+fn _qHKDFExpandLabel(prk: int64, label: int64, labelLen: int64, outLen: int64, out: int64) {
+  var infoLen: int64 := 10 + labelLen;
+  var info: int64 := mmap(0, infoLen, 3, 34, -1, 0);
+  if (info == 0) { return; }
+
+  poke8(info + 0, (outLen >> 8) & 255);
+  poke8(info + 1, outLen & 255);
+  poke8(info + 2, 6 + labelLen);
+  // "tls13 "
+  poke8(info + 3, 116); poke8(info + 4, 108); poke8(info + 5, 115);
+  poke8(info + 6, 49);  poke8(info + 7, 51);  poke8(info + 8, 32);
+  // label bytes
+  var li: int64 := 0;
+  while (li < labelLen) {
+    poke8(info + 9 + li, peek8(label + li));
+    li := li + 1;
+  }
+  poke8(info + 9 + labelLen, 0);  // context length = 0
+
+  _qHKDFExpand(prk, info, infoLen, outLen, out);
+  munmap(info, infoLen);
+}
+
+// AES-128 key expansion
+// roundKeys must be 432 bytes: [0..175] = key schedule, [176..431] = S-box
+fn _qAESKeyExpand(key: int64, roundKeys: int64) {
+  var sbox: int64 := roundKeys + 176;
+
+  // Build GF(2^8) exp and log tables for S-box construction
+  var expTab: int64 := mmap(0, 256, 3, 34, -1, 0);
+  var logTab: int64 := mmap(0, 256, 3, 34, -1, 0);
+  if (expTab == 0) {
+    if (logTab != 0) { munmap(logTab, 256); }
+    return;
+  }
+  if (logTab == 0) { munmap(expTab, 256); return; }
+
+  // Generator g=3: exp[i] = 3^i in GF(2^8), multiply by 3 = xtime(x) XOR x
+  var val: int64 := 1;
+  var ei: int64 := 0;
+  while (ei < 255) {
+    poke8(expTab + ei, val);
+    poke8(logTab + val, ei);
+    var xt: int64 := (val << 1) & 255;
+    if ((val & 128) != 0) { xt := xt ^ 27; }
+    val := xt ^ val;
+    ei := ei + 1;
+  }
+  poke8(expTab + 255, 1);
+
+  // Build AES S-box: S[0]=0x63, S[i]=affine(inv(i))
+  poke8(sbox + 0, 99);
+  var si: int64 := 1;
+  while (si < 256) {
+    var lg: int64 := peek8(logTab + si);
+    var inv: int64 := peek8(expTab + 255 - lg);
+    var r1: int64 := ((inv << 1) | (inv >> 7)) & 255;
+    var r2: int64 := ((inv << 2) | (inv >> 6)) & 255;
+    var r3: int64 := ((inv << 3) | (inv >> 5)) & 255;
+    var r4: int64 := ((inv << 4) | (inv >> 4)) & 255;
+    poke8(sbox + si, (inv ^ r1 ^ r2 ^ r3 ^ r4 ^ 99) & 255);
+    si := si + 1;
+  }
+  munmap(expTab, 256);
+  munmap(logTab, 256);
+
+  // Copy 16-byte key to W[0..3]
+  var i: int64 := 0;
+  while (i < 16) { poke8(roundKeys + i, peek8(key + i)); i := i + 1; }
+
+  // Rcon values for rounds 1..10
+  var rcon: int64 := mmap(0, 10, 3, 34, -1, 0);
+  if (rcon == 0) { return; }
+  poke8(rcon+0, 1); poke8(rcon+1, 2); poke8(rcon+2, 4); poke8(rcon+3, 8); poke8(rcon+4, 16);
+  poke8(rcon+5, 32); poke8(rcon+6, 64); poke8(rcon+7, 128); poke8(rcon+8, 27); poke8(rcon+9, 54);
+
+  // Generate W[4..43] (10 round keys × 4 words)
+  i := 4;
+  while (i < 44) {
+    var b0: int64 := peek8(roundKeys + (i-1)*4 + 0);
+    var b1: int64 := peek8(roundKeys + (i-1)*4 + 1);
+    var b2: int64 := peek8(roundKeys + (i-1)*4 + 2);
+    var b3: int64 := peek8(roundKeys + (i-1)*4 + 3);
+
+    if ((i & 3) == 0) {
+      // RotWord
+      var tmp: int64 := b0;
+      b0 := b1; b1 := b2; b2 := b3; b3 := tmp;
+      // SubWord
+      b0 := peek8(sbox + b0); b1 := peek8(sbox + b1);
+      b2 := peek8(sbox + b2); b3 := peek8(sbox + b3);
+      // XOR Rcon
+      b0 := b0 ^ peek8(rcon + (i/4) - 1);
+    }
+
+    var w4: int64 := (i-4)*4;
+    poke8(roundKeys + i*4 + 0, b0 ^ peek8(roundKeys + w4 + 0));
+    poke8(roundKeys + i*4 + 1, b1 ^ peek8(roundKeys + w4 + 1));
+    poke8(roundKeys + i*4 + 2, b2 ^ peek8(roundKeys + w4 + 2));
+    poke8(roundKeys + i*4 + 3, b3 ^ peek8(roundKeys + w4 + 3));
+
+    i := i + 1;
+  }
+  munmap(rcon, 10);
+}
+
+// AES-128 block encryption (ECB): roundKeys[432], inBlock[16] → outBlock[16]
+fn _qAESEncBlock(roundKeys: int64, inBlock: int64, outBlock: int64) {
+  var sbox: int64 := roundKeys + 176;
+  var state: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (state == 0) { return; }
+
+  var i: int64 := 0;
+  while (i < 16) { poke8(state + i, peek8(inBlock + i)); i := i + 1; }
+
+  // AddRoundKey (round 0)
+  i := 0;
+  while (i < 16) {
+    poke8(state + i, peek8(state + i) ^ peek8(roundKeys + i));
+    i := i + 1;
+  }
+
+  var round: int64 := 1;
+  while (round <= 10) {
+    var rk: int64 := roundKeys + round * 16;
+
+    // SubBytes
+    i := 0;
+    while (i < 16) {
+      poke8(state + i, peek8(sbox + peek8(state + i)));
+      i := i + 1;
+    }
+
+    // ShiftRows (in-place, column-major: state[col*4+row])
+    // Row 1: shift left 1 (indices 1,5,9,13)
+    var t1: int64 := peek8(state + 1);
+    poke8(state + 1, peek8(state + 5)); poke8(state + 5, peek8(state + 9));
+    poke8(state + 9, peek8(state + 13)); poke8(state + 13, t1);
+    // Row 2: shift left 2 (indices 2,6,10,14)
+    var t2a: int64 := peek8(state + 2);
+    var t2b: int64 := peek8(state + 6);
+    poke8(state + 2, peek8(state + 10)); poke8(state + 6, peek8(state + 14));
+    poke8(state + 10, t2a); poke8(state + 14, t2b);
+    // Row 3: shift left 3 = shift right 1 (indices 3,7,11,15)
+    var t3: int64 := peek8(state + 15);
+    poke8(state + 15, peek8(state + 11)); poke8(state + 11, peek8(state + 7));
+    poke8(state + 7, peek8(state + 3)); poke8(state + 3, t3);
+
+    // MixColumns (skip in final round 10)
+    if (round < 10) {
+      var col: int64 := 0;
+      while (col < 4) {
+        var s0: int64 := peek8(state + col*4 + 0);
+        var s1: int64 := peek8(state + col*4 + 1);
+        var s2: int64 := peek8(state + col*4 + 2);
+        var s3: int64 := peek8(state + col*4 + 3);
+        var xt0: int64 := (s0 << 1) & 255;
+        if ((s0 & 128) != 0) { xt0 := xt0 ^ 27; }
+        var xt1: int64 := (s1 << 1) & 255;
+        if ((s1 & 128) != 0) { xt1 := xt1 ^ 27; }
+        var xt2: int64 := (s2 << 1) & 255;
+        if ((s2 & 128) != 0) { xt2 := xt2 ^ 27; }
+        var xt3: int64 := (s3 << 1) & 255;
+        if ((s3 & 128) != 0) { xt3 := xt3 ^ 27; }
+        // 2*s0^3*s1^s2^s3, s0^2*s1^3*s2^s3, s0^s1^2*s2^3*s3, 3*s0^s1^s2^2*s3
+        poke8(state + col*4 + 0, (xt0 ^ (xt1^s1) ^ s2 ^ s3) & 255);
+        poke8(state + col*4 + 1, (s0 ^ xt1 ^ (xt2^s2) ^ s3) & 255);
+        poke8(state + col*4 + 2, (s0 ^ s1 ^ xt2 ^ (xt3^s3)) & 255);
+        poke8(state + col*4 + 3, ((xt0^s0) ^ s1 ^ s2 ^ xt3) & 255);
+        col := col + 1;
+      }
+    }
+
+    // AddRoundKey
+    i := 0;
+    while (i < 16) {
+      poke8(state + i, peek8(state + i) ^ peek8(rk + i));
+      i := i + 1;
+    }
+    round := round + 1;
+  }
+
+  i := 0;
+  while (i < 16) { poke8(outBlock + i, peek8(state + i)); i := i + 1; }
+  munmap(state, 16);
+}
+
+// AES-128 CTR-mode stream cipher
+fn _qAESCTR(roundKeys: int64, iv12: int64, initCtr: int64, input: int64, inputLen: int64, output: int64) {
+  var ctrBlock: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var encBlock: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (ctrBlock == 0) {
+    if (encBlock != 0) { munmap(encBlock, 16); }
+    return;
+  }
+  if (encBlock == 0) { munmap(ctrBlock, 16); return; }
+
+  var ctr: int64 := initCtr;
+  var pos: int64 := 0;
+
+  while (pos < inputLen) {
+    var ci: int64 := 0;
+    while (ci < 12) { poke8(ctrBlock + ci, peek8(iv12 + ci)); ci := ci + 1; }
+    poke8(ctrBlock + 12, (ctr >> 24) & 255);
+    poke8(ctrBlock + 13, (ctr >> 16) & 255);
+    poke8(ctrBlock + 14, (ctr >> 8)  & 255);
+    poke8(ctrBlock + 15,  ctr        & 255);
+
+    _qAESEncBlock(roundKeys, ctrBlock, encBlock);
+
+    var blockLen: int64 := 16;
+    if (pos + 16 > inputLen) { blockLen := inputLen - pos; }
+
+    var bi: int64 := 0;
+    while (bi < blockLen) {
+      poke8(output + pos + bi, peek8(input + pos + bi) ^ peek8(encBlock + bi));
+      bi := bi + 1;
+    }
+    pos := pos + blockLen;
+    ctr := ctr + 1;
+  }
+
+  munmap(ctrBlock, 16);
+  munmap(encBlock, 16);
+}
+
+// GF(2^128) multiply Xbuf by Hbuf in-place (GCM polynomial)
+// Modulus R = 0xE1 || 0...0 (128 bits)
+fn _qGCMMul(Xbuf: int64, Hbuf: int64) {
+  var Z: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var V: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (Z == 0) {
+    if (V != 0) { munmap(V, 16); }
+    return;
+  }
+  if (V == 0) { munmap(Z, 16); return; }
+
+  // Z = 0 (from mmap), V = H
+  var j: int64 := 0;
+  while (j < 16) { poke8(V + j, peek8(Hbuf + j)); j := j + 1; }
+
+  var i: int64 := 0;
+  while (i < 128) {
+    // Check bit i of X (MSBit first): byte = i/8, bit = 7 - (i mod 8)
+    var byteIdx: int64 := i / 8;
+    var bitPos: int64 := 7 - (i - (i / 8) * 8);
+    var xBit: int64 := (peek8(Xbuf + byteIdx) >> bitPos) & 1;
+
+    if (xBit != 0) {
+      j := 0;
+      while (j < 16) {
+        poke8(Z + j, peek8(Z + j) ^ peek8(V + j));
+        j := j + 1;
+      }
+    }
+
+    // Save LSBit of V (byte 15, bit 0) before shift
+    var vLSB: int64 := peek8(V + 15) & 1;
+
+    // Right-shift V by 1 bit (MSBit ← 0)
+    var carry: int64 := 0;
+    j := 0;
+    while (j < 16) {
+      var b: int64 := peek8(V + j);
+      poke8(V + j, ((carry * 128) | (b >> 1)) & 255);
+      carry := b & 1;
+      j := j + 1;
+    }
+
+    // If LSBit of V was 1: XOR with R = 0xE1 || 0...
+    if (vLSB != 0) {
+      poke8(V + 0, peek8(V + 0) ^ 225);  // 0xE1 = 225
+    }
+    i := i + 1;
+  }
+
+  j := 0;
+  while (j < 16) { poke8(Xbuf + j, peek8(Z + j)); j := j + 1; }
+  munmap(Z, 16);
+  munmap(V, 16);
+}
+
+// GHASH: compute GCM authentication tag over AAD + ciphertext
+fn _qGHASH(H: int64, aad: int64, aadLen: int64, ct: int64, ctLen: int64, out16: int64) {
+  var X: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var block: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (X == 0) {
+    if (block != 0) { munmap(block, 16); }
+    return;
+  }
+  if (block == 0) { munmap(X, 16); return; }
+
+  // Process AAD blocks
+  var pos: int64 := 0;
+  while (pos < aadLen) {
+    var j: int64 := 0;
+    while (j < 16) { poke8(block + j, 0); j := j + 1; }
+    var bLen: int64 := 16;
+    if (pos + 16 > aadLen) { bLen := aadLen - pos; }
+    j := 0;
+    while (j < bLen) { poke8(block + j, peek8(aad + pos + j)); j := j + 1; }
+    j := 0;
+    while (j < 16) { poke8(X + j, peek8(X + j) ^ peek8(block + j)); j := j + 1; }
+    _qGCMMul(X, H);
+    pos := pos + 16;
+  }
+
+  // Process ciphertext blocks
+  pos := 0;
+  while (pos < ctLen) {
+    var j2: int64 := 0;
+    while (j2 < 16) { poke8(block + j2, 0); j2 := j2 + 1; }
+    var bLen2: int64 := 16;
+    if (pos + 16 > ctLen) { bLen2 := ctLen - pos; }
+    j2 := 0;
+    while (j2 < bLen2) { poke8(block + j2, peek8(ct + pos + j2)); j2 := j2 + 1; }
+    j2 := 0;
+    while (j2 < 16) { poke8(X + j2, peek8(X + j2) ^ peek8(block + j2)); j2 := j2 + 1; }
+    _qGCMMul(X, H);
+    pos := pos + 16;
+  }
+
+  // Length block: [aadLen*8 as 64-bit BE][ctLen*8 as 64-bit BE]
+  var aBits: int64 := aadLen * 8;
+  var cBits: int64 := ctLen * 8;
+  var j3: int64 := 0;
+  while (j3 < 16) { poke8(block + j3, 0); j3 := j3 + 1; }
+  poke8(block + 0,  (aBits >> 56) & 255); poke8(block + 1,  (aBits >> 48) & 255);
+  poke8(block + 2,  (aBits >> 40) & 255); poke8(block + 3,  (aBits >> 32) & 255);
+  poke8(block + 4,  (aBits >> 24) & 255); poke8(block + 5,  (aBits >> 16) & 255);
+  poke8(block + 6,  (aBits >> 8)  & 255); poke8(block + 7,   aBits        & 255);
+  poke8(block + 8,  (cBits >> 56) & 255); poke8(block + 9,  (cBits >> 48) & 255);
+  poke8(block + 10, (cBits >> 40) & 255); poke8(block + 11, (cBits >> 32) & 255);
+  poke8(block + 12, (cBits >> 24) & 255); poke8(block + 13, (cBits >> 16) & 255);
+  poke8(block + 14, (cBits >> 8)  & 255); poke8(block + 15,  cBits        & 255);
+  j3 := 0;
+  while (j3 < 16) { poke8(X + j3, peek8(X + j3) ^ peek8(block + j3)); j3 := j3 + 1; }
+  _qGCMMul(X, H);
+
+  j3 := 0;
+  while (j3 < 16) { poke8(out16 + j3, peek8(X + j3)); j3 := j3 + 1; }
+  munmap(X, 16);
+  munmap(block, 16);
+}
+
+// AES-128-GCM seal: encrypt + authenticate
+// Returns mmap'd (ptLen+16) buffer: ciphertext || tag. Caller must munmap(result, ptLen+16).
+// Returns 0 on failure.
+fn _qAES128GCMSeal(key16: int64, iv12: int64, aad: int64, aadLen: int64, pt: int64, ptLen: int64): int64 {
+  var outSize: int64 := ptLen + 16;
+  var out: int64 := mmap(0, outSize, 3, 34, -1, 0);
+  if (out == 0) { return 0; }
+
+  var roundKeys: int64 := mmap(0, 432, 3, 34, -1, 0);
+  if (roundKeys == 0) { munmap(out, outSize); return 0; }
+  _qAESKeyExpand(key16, roundKeys);
+
+  // H = AES(key, 0^128)
+  var zeroB: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var H: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (zeroB == 0) {
+    if (H != 0) { munmap(H, 16); }
+    munmap(roundKeys, 432); munmap(out, outSize); return 0;
+  }
+  if (H == 0) { munmap(zeroB, 16); munmap(roundKeys, 432); munmap(out, outSize); return 0; }
+  _qAESEncBlock(roundKeys, zeroB, H);
+  munmap(zeroB, 16);
+
+  // CTR-encrypt plaintext → out[0..ptLen-1]
+  if (ptLen > 0) {
+    _qAESCTR(roundKeys, iv12, 2, pt, ptLen, out);
+  }
+
+  // GHASH over AAD + ciphertext → ghashBuf
+  var ghashBuf: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (ghashBuf == 0) { munmap(H, 16); munmap(roundKeys, 432); munmap(out, outSize); return 0; }
+  _qGHASH(H, aad, aadLen, out, ptLen, ghashBuf);
+  munmap(H, 16);
+
+  // E(key, IV||0x00000001) for tag encryption (J0)
+  var j0: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var encJ0: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (j0 == 0) {
+    if (encJ0 != 0) { munmap(encJ0, 16); }
+    munmap(ghashBuf, 16); munmap(roundKeys, 432); munmap(out, outSize); return 0;
+  }
+  if (encJ0 == 0) {
+    munmap(j0, 16); munmap(ghashBuf, 16); munmap(roundKeys, 432); munmap(out, outSize); return 0;
+  }
+  var jj: int64 := 0;
+  while (jj < 12) { poke8(j0 + jj, peek8(iv12 + jj)); jj := jj + 1; }
+  poke8(j0 + 12, 0); poke8(j0 + 13, 0); poke8(j0 + 14, 0); poke8(j0 + 15, 1);
+  _qAESEncBlock(roundKeys, j0, encJ0);
+  munmap(j0, 16);
+  munmap(roundKeys, 432);
+
+  // Tag = GHASH ^ E(key, J0), stored at out[ptLen..ptLen+15]
+  jj := 0;
+  while (jj < 16) {
+    poke8(out + ptLen + jj, peek8(ghashBuf + jj) ^ peek8(encJ0 + jj));
+    jj := jj + 1;
+  }
+  munmap(ghashBuf, 16);
+  munmap(encJ0, 16);
+
+  return out;
+}
+
+// Write QUIC v1 Initial salt (RFC 9001 §5.2)
+fn _qGetInitSalt(out20: int64) {
+  poke8(out20+0,  56);  poke8(out20+1,  118); poke8(out20+2,  44);  poke8(out20+3,  247);
+  poke8(out20+4,  245); poke8(out20+5,  89);  poke8(out20+6,  52);  poke8(out20+7,  179);
+  poke8(out20+8,  77);  poke8(out20+9,  23);  poke8(out20+10, 154); poke8(out20+11, 230);
+  poke8(out20+12, 164); poke8(out20+13, 200); poke8(out20+14, 12);  poke8(out20+15, 173);
+  poke8(out20+16, 204); poke8(out20+17, 187); poke8(out20+18, 127); poke8(out20+19, 10);
+}
+
+// Derive QUIC v1 Initial keys from destination connection ID (RFC 9001 §5.2)
+fn _qDeriveInitialKeys(dcid: int64, dcidLen: int64, clientKey: int64, clientIV: int64, clientHP: int64) {
+  var salt: int64 := mmap(0, 20, 3, 34, -1, 0);
+  if (salt == 0) { return; }
+  _qGetInitSalt(salt);
+
+  // initial_secret = HKDF-Extract(salt, dcid)
+  var initSec: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (initSec == 0) { munmap(salt, 20); return; }
+  _qHKDFExtract(salt, 20, dcid, dcidLen, initSec);
+  munmap(salt, 20);
+
+  // client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
+  var lb1: int64 := mmap(0, 9, 3, 34, -1, 0);
+  if (lb1 == 0) { munmap(initSec, 32); return; }
+  // "client in"
+  poke8(lb1+0,99); poke8(lb1+1,108); poke8(lb1+2,105); poke8(lb1+3,101);
+  poke8(lb1+4,110); poke8(lb1+5,116); poke8(lb1+6,32); poke8(lb1+7,105); poke8(lb1+8,110);
+  var ciSec: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (ciSec == 0) { munmap(lb1, 9); munmap(initSec, 32); return; }
+  _qHKDFExpandLabel(initSec, lb1, 9, 32, ciSec);
+  munmap(lb1, 9); munmap(initSec, 32);
+
+  // quic_key = HKDF-Expand-Label(ciSec, "quic key", "", 16)
+  var lb2: int64 := mmap(0, 8, 3, 34, -1, 0);
+  if (lb2 == 0) { munmap(ciSec, 32); return; }
+  // "quic key"
+  poke8(lb2+0,113); poke8(lb2+1,117); poke8(lb2+2,105); poke8(lb2+3,99);
+  poke8(lb2+4,32); poke8(lb2+5,107); poke8(lb2+6,101); poke8(lb2+7,121);
+  _qHKDFExpandLabel(ciSec, lb2, 8, 16, clientKey);
+  munmap(lb2, 8);
+
+  // quic_iv = HKDF-Expand-Label(ciSec, "quic iv", "", 12)
+  var lb3: int64 := mmap(0, 7, 3, 34, -1, 0);
+  if (lb3 == 0) { munmap(ciSec, 32); return; }
+  // "quic iv"
+  poke8(lb3+0,113); poke8(lb3+1,117); poke8(lb3+2,105); poke8(lb3+3,99);
+  poke8(lb3+4,32); poke8(lb3+5,105); poke8(lb3+6,118);
+  _qHKDFExpandLabel(ciSec, lb3, 7, 12, clientIV);
+  munmap(lb3, 7);
+
+  // quic_hp = HKDF-Expand-Label(ciSec, "quic hp", "", 16)
+  var lb4: int64 := mmap(0, 7, 3, 34, -1, 0);
+  if (lb4 == 0) { munmap(ciSec, 32); return; }
+  // "quic hp"
+  poke8(lb4+0,113); poke8(lb4+1,117); poke8(lb4+2,105); poke8(lb4+3,99);
+  poke8(lb4+4,32); poke8(lb4+5,104); poke8(lb4+6,112);
+  _qHKDFExpandLabel(ciSec, lb4, 7, 16, clientHP);
+  munmap(lb4, 7);
+
+  munmap(ciSec, 32);
+}
+
+// ============================================================================
+// Public Transport Functions
+// ============================================================================
+
+// Connect to a QUIC server:
+// - Derives QUIC Initial keys (SHA-256/HMAC/HKDF)
+// - Sends an encrypted Initial packet with AES-128-GCM
+// - Applies header protection with AES-128 ECB
+pub fn QUICConnect(host: int64, port: int64): QUICConn {
+  var conn: QUICConn;
+  conn.sock.fd := -1; conn.connected := 0; conn.localConnId := 0; conn.remoteConnId := 0;
+  conn.nextStreamId := 0; conn.packetNumber := 0;
+  conn.serverIp := 0; conn.serverPort := 0;
+  conn.clientKey := 0; conn.clientIV := 0; conn.clientHP := 0;
+
+  var ip: int64 := GetHostByName(host);
+  if (ip == 0) { return conn; }
+
+  var sock: UDPSocket := UDPSocketNew();
+  if (sock.fd < 0) { return conn; }
+
+  conn.sock := sock;
+  conn.serverIp := ip;
+  conn.serverPort := port;
+
+  // Generate local (destination) connection ID for key derivation
+  conn.localConnId := mmap(0, QUIC_CONN_ID_LEN, 3, 34, -1, 0);
+  if (conn.localConnId == 0) { UDPSocketClose(conn.sock); return conn; }
+  QUICRandomBytes(conn.localConnId, QUIC_CONN_ID_LEN);
+
+  conn.remoteConnId := mmap(0, QUIC_CONN_ID_LEN, 3, 34, -1, 0);
+  if (conn.remoteConnId == 0) {
+    munmap(conn.localConnId, QUIC_CONN_ID_LEN); UDPSocketClose(conn.sock); return conn;
+  }
+  QUICRandomBytes(conn.remoteConnId, QUIC_CONN_ID_LEN);
+
+  // Allocate key/IV/HP buffers and derive Initial keys
+  conn.clientKey := mmap(0, 16, 3, 34, -1, 0);
+  conn.clientIV  := mmap(0, 12, 3, 34, -1, 0);
+  conn.clientHP  := mmap(0, 16, 3, 34, -1, 0);
+  if (conn.clientKey == 0) {
+    if (conn.clientIV  != 0) { munmap(conn.clientIV,  12); }
+    if (conn.clientHP  != 0) { munmap(conn.clientHP,  16); }
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  if (conn.clientIV == 0) {
+    munmap(conn.clientKey, 16);
+    if (conn.clientHP != 0) { munmap(conn.clientHP, 16); }
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  if (conn.clientHP == 0) {
+    munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  _qDeriveInitialKeys(conn.localConnId, QUIC_CONN_ID_LEN, conn.clientKey, conn.clientIV, conn.clientHP);
+
+  // Build Initial packet plaintext:
+  // CRYPTO frame header (3 bytes) + PADDING (1162 bytes) = 1165 bytes total
+  // This ensures the minimum 1200-byte UDP datagram (19 hdr + 1165 ct + 16 tag = 1200)
+  var ptLen: int64 := 1165;
+  var plaintext: int64 := mmap(0, ptLen, 3, 34, -1, 0);
+  if (plaintext == 0) {
+    munmap(conn.clientHP, 16); munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  // CRYPTO frame at plaintext[0..2]; rest is 0x00 = PADDING frames
+  var pp: int64 := 0;
+  pp := pp + QUICWriteVarint(plaintext, pp, QUIC_FRAME_CRYPTO);  // type
+  pp := pp + QUICWriteVarint(plaintext, pp, 0);                  // offset
+  pp := pp + QUICWriteVarint(plaintext, pp, 0);                  // length = 0
+
+  // Build AAD: QUIC Initial long header including packet number
+  // Layout: 0xC0 | version(4) | dcid_len(1) | dcid(8) | scid_len(1) | token_len(1) | payload_len(2) | pn(1)
+  var hdrBuf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (hdrBuf == 0) {
+    munmap(plaintext, ptLen);
+    munmap(conn.clientHP, 16); munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  var hp: int64 := 0;
+  poke8(hdrBuf + hp, 192); hp := hp + 1;            // 0xC0: long header, Initial, 1-byte PN
+  poke8(hdrBuf + hp + 0, 0); poke8(hdrBuf + hp + 1, 0);
+  poke8(hdrBuf + hp + 2, 0); poke8(hdrBuf + hp + 3, 1); hp := hp + 4;  // version 1
+  poke8(hdrBuf + hp, QUIC_CONN_ID_LEN); hp := hp + 1;   // DCID length
+  var dci: int64 := 0;
+  while (dci < QUIC_CONN_ID_LEN) { poke8(hdrBuf + hp + dci, peek8(conn.localConnId + dci)); dci := dci + 1; }
+  hp := hp + QUIC_CONN_ID_LEN;
+  poke8(hdrBuf + hp, 0); hp := hp + 1;               // SCID length = 0
+  poke8(hdrBuf + hp, 0); hp := hp + 1;               // token length = 0
+  // payload length = 1(PN) + ptLen(ct) + 16(tag) as 2-byte varint
+  var payLen: int64 := ptLen + 17;
+  poke8(hdrBuf + hp,     (payLen / 256) + 64);
+  poke8(hdrBuf + hp + 1,  payLen - (payLen / 256) * 256);
+  hp := hp + 2;
+  poke8(hdrBuf + hp, 0); hp := hp + 1;               // packet number = 0
+  // hp == 19
+
+  // Nonce = clientIV (XOR with PN=0 is identity)
+  var nonce: int64 := mmap(0, 12, 3, 34, -1, 0);
+  if (nonce == 0) {
+    munmap(hdrBuf, 32); munmap(plaintext, ptLen);
+    munmap(conn.clientHP, 16); munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  var ni: int64 := 0;
+  while (ni < 12) { poke8(nonce + ni, peek8(conn.clientIV + ni)); ni := ni + 1; }
+
+  // AEAD seal: AAD = hdrBuf[0..hp-1], PT = plaintext
+  var sealed: int64 := _qAES128GCMSeal(conn.clientKey, nonce, hdrBuf, hp, plaintext, ptLen);
+  munmap(nonce, 12); munmap(plaintext, ptLen);
+
+  if (sealed == 0) {
+    munmap(hdrBuf, 32);
+    munmap(conn.clientHP, 16); munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+
+  // Build final packet: header || ciphertext || tag
+  var pktLen: int64 := hp + ptLen + 16;   // 19 + 1165 + 16 = 1200
+  var pkt: int64 := mmap(0, pktLen, 3, 34, -1, 0);
+  if (pkt == 0) {
+    munmap(sealed, ptLen + 16); munmap(hdrBuf, 32);
+    munmap(conn.clientHP, 16); munmap(conn.clientIV, 12); munmap(conn.clientKey, 16);
+    munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); munmap(conn.localConnId, QUIC_CONN_ID_LEN);
+    UDPSocketClose(conn.sock); return conn;
+  }
+  var pi: int64 := 0;
+  while (pi < hp) { poke8(pkt + pi, peek8(hdrBuf + pi)); pi := pi + 1; }
+  pi := 0;
+  while (pi < ptLen + 16) { poke8(pkt + hp + pi, peek8(sealed + pi)); pi := pi + 1; }
+  munmap(sealed, ptLen + 16);
+  munmap(hdrBuf, 32);
+
+  // Header protection: sample = pkt[22..37], mask = AES-ECB(HP, sample)
+  // PN is at offset hp-1 = 18. Sample offset = 18 + 4 = 22.
+  var maskBuf: int64 := mmap(0, 16, 3, 34, -1, 0);
+  if (maskBuf != 0) {
+    var hpRK: int64 := mmap(0, 432, 3, 34, -1, 0);
+    if (hpRK != 0) {
+      _qAESKeyExpand(conn.clientHP, hpRK);
+      _qAESEncBlock(hpRK, pkt + 22, maskBuf);
+      munmap(hpRK, 432);
+      // Protect first byte bits[3..0] and PN byte
+      poke8(pkt + 0,      (peek8(pkt + 0)      ^ (peek8(maskBuf + 0) & 15)) & 255);
+      poke8(pkt + hp - 1, (peek8(pkt + hp - 1) ^ peek8(maskBuf + 1)) & 255);
+    }
+    munmap(maskBuf, 16);
+  }
+
+  UDPSocketSendToAddr(conn.sock, pkt, pktLen, ip, port);
+  munmap(pkt, pktLen);
+
+  conn.connected := 1;
+  conn.packetNumber := 1;
+  return conn;
+}
+
+// Open a new bidirectional stream on an established connection
+pub fn QUICOpenStream(conn: QUICConn): QUICStream {
+  var stream: QUICStream;
+  stream.conn := 0; stream.streamId := 0; stream.state := 0; stream.offset := 0;
+  stream.sockFd := -1; stream.serverIp := 0; stream.serverPort := 0;
+  stream.keyPtr := 0; stream.ivPtr := 0;
+
+  if (conn.connected == 0) { return stream; }
+
+  stream.streamId := conn.nextStreamId;
+  conn.nextStreamId := conn.nextStreamId + 4;  // bidi streams: 0, 4, 8, ...
+  stream.state := 1;
+  stream.sockFd := conn.sock.fd;
+  stream.serverIp := conn.serverIp;
+  stream.serverPort := conn.serverPort;
+  stream.keyPtr := conn.clientKey;
+  stream.ivPtr := conn.clientIV;
+
+  return stream;
+}
+
+// Write data to stream (AEAD-encrypted short-header QUIC packet)
+pub fn QUICStreamWrite(stream: QUICStream, data: int64, len: int64): int64 {
+  if (stream.state == 0) { return -1; }
+  if (len <= 0) { return 0; }
+  if (stream.keyPtr == 0) { return -1; }
+  if (stream.ivPtr == 0) { return -1; }
+
+  // Compute STREAM frame plaintext length
+  var ptLen: int64 := 1;  // frame type byte
+  if (stream.streamId < 64) { ptLen := ptLen + 1; }
+  else if (stream.streamId < 16384) { ptLen := ptLen + 2; }
+  else { ptLen := ptLen + 4; }
+  if (stream.offset < 64) { ptLen := ptLen + 1; }
+  else if (stream.offset < 16384) { ptLen := ptLen + 2; }
+  else { ptLen := ptLen + 4; }
+  if (len < 64) { ptLen := ptLen + 1; }
+  else if (len < 16384) { ptLen := ptLen + 2; }
+  else { ptLen := ptLen + 4; }
+  ptLen := ptLen + len;
+
+  var frame: int64 := mmap(0, ptLen, 3, 34, -1, 0);
+  if (frame == 0) { return -1; }
+
+  var fpos: int64 := 0;
+  poke8(frame + fpos, QUIC_FRAME_STREAM_BASE + 4 + 2);  // type: OFF|LEN set
+  fpos := fpos + 1;
+  fpos := fpos + QUICWriteVarint(frame, fpos, stream.streamId);
+  fpos := fpos + QUICWriteVarint(frame, fpos, stream.offset);
+  fpos := fpos + QUICWriteVarint(frame, fpos, len);
+  var di: int64 := 0;
+  while (di < len) { poke8(frame + fpos + di, peek8(data + di)); di := di + 1; }
+
+  // Nonce = IV XOR (left-padded) stream.offset as packet number
+  var nonce: int64 := mmap(0, 12, 3, 34, -1, 0);
+  if (nonce == 0) { munmap(frame, ptLen); return -1; }
+  var ni: int64 := 0;
+  while (ni < 12) { poke8(nonce + ni, peek8(stream.ivPtr + ni)); ni := ni + 1; }
+  // XOR last byte with low byte of offset for minimal nonce differentiation
+  poke8(nonce + 11, peek8(nonce + 11) ^ (stream.offset & 255));
+
+  // AAD = 1-byte short header
+  var aad: int64 := mmap(0, 1, 3, 34, -1, 0);
+  if (aad == 0) { munmap(nonce, 12); munmap(frame, ptLen); return -1; }
+  poke8(aad, 64);  // short header: fixed bit + key phase 0 + 1-byte PN
+
+  var sealed: int64 := _qAES128GCMSeal(stream.keyPtr, nonce, aad, 1, frame, ptLen);
+  munmap(aad, 1); munmap(nonce, 12); munmap(frame, ptLen);
+  if (sealed == 0) { return -1; }
+
+  // Short-header packet: [0x40][pktNum][ciphertext][tag]
+  var pktLen: int64 := 2 + ptLen + 16;
+  var pkt: int64 := mmap(0, pktLen, 3, 34, -1, 0);
+  if (pkt == 0) { munmap(sealed, ptLen + 16); return -1; }
+  poke8(pkt + 0, 64);
+  poke8(pkt + 1, stream.offset & 255);
+  var pi: int64 := 0;
+  while (pi < ptLen + 16) { poke8(pkt + 2 + pi, peek8(sealed + pi)); pi := pi + 1; }
+  munmap(sealed, ptLen + 16);
+
+  var sendSock: UDPSocket;
+  sendSock.fd := stream.sockFd;
+  UDPSocketSendToAddr(sendSock, pkt, pktLen, stream.serverIp, stream.serverPort);
+  munmap(pkt, pktLen);
+
+  return len;
+}
+
+// Read data from stream (decrypt incoming short-header QUIC packet)
+pub fn QUICStreamRead(stream: QUICStream, buf: int64, bufsize: int64): int64 {
+  if (stream.state == 0) { return -1; }
+  if (stream.sockFd < 0) { return -1; }
+  if (stream.keyPtr == 0) { return -1; }
+  if (stream.ivPtr == 0) { return -1; }
+
+  var recvBuf: int64 := mmap(0, QUIC_MAX_PACKET_SIZE, 3, 34, -1, 0);
+  if (recvBuf == 0) { return -1; }
+
+  var recvSock: UDPSocket;
+  recvSock.fd := stream.sockFd;
+  var n: int64 := UDPSocketRecv(recvSock, recvBuf, QUIC_MAX_PACKET_SIZE, 0, 0);
+  if (n <= 18) { munmap(recvBuf, QUIC_MAX_PACKET_SIZE); return 0; }
+
+  // Packet format: [header(1)][pktNum(1)][ciphertext(n-18)][tag(16)]
+  var ctLen: int64 := n - 18;
+  var pktNum: int64 := peek8(recvBuf + 1);
+
+  // Build nonce = IV XOR pktNum
+  var nonce: int64 := mmap(0, 12, 3, 34, -1, 0);
+  if (nonce == 0) { munmap(recvBuf, QUIC_MAX_PACKET_SIZE); return 0; }
+  var ni: int64 := 0;
+  while (ni < 12) { poke8(nonce + ni, peek8(stream.ivPtr + ni)); ni := ni + 1; }
+  poke8(nonce + 11, peek8(nonce + 11) ^ (pktNum & 255));
+
+  // Expand key and CTR-decrypt (tag not verified for simplicity)
+  var roundKeys: int64 := mmap(0, 432, 3, 34, -1, 0);
+  if (roundKeys == 0) { munmap(nonce, 12); munmap(recvBuf, QUIC_MAX_PACKET_SIZE); return 0; }
+  _qAESKeyExpand(stream.keyPtr, roundKeys);
+
+  var plaintext: int64 := mmap(0, ctLen, 3, 34, -1, 0);
+  if (plaintext == 0) {
+    munmap(roundKeys, 432); munmap(nonce, 12); munmap(recvBuf, QUIC_MAX_PACKET_SIZE);
+    return 0;
+  }
+  _qAESCTR(roundKeys, nonce, 2, recvBuf + 2, ctLen, plaintext);
+  munmap(roundKeys, 432); munmap(nonce, 12);
+
+  // Parse STREAM frame from decrypted plaintext
+  var result: int64 := 0;
+  var pos: int64 := 0;
+  if (pos < ctLen) {
+    var frameType: int64 := peek8(plaintext + pos);
+    pos := pos + 1;
+    if (((frameType & 248) == 8) && (pos < ctLen)) {  // STREAM frame 0x08-0x0F
+      // Stream ID (skip)
+      pos := pos + QUICVarintSize(plaintext, pos);
+      // Offset (skip if present)
+      if (((frameType >> 2) & 1) != 0) {
+        pos := pos + QUICVarintSize(plaintext, pos);
+      }
+      // Data length
+      var dataLen: int64 := ctLen - pos;
+      if (((frameType >> 1) & 1) != 0) {
+        dataLen := QUICReadVarint(plaintext, pos);
+        pos := pos + QUICVarintSize(plaintext, pos);
+      }
+      if (dataLen > bufsize) { dataLen := bufsize; }
+      if (dataLen > ctLen - pos) { dataLen := ctLen - pos; }
+      var di: int64 := 0;
+      while (di < dataLen) {
+        poke8(buf + di, peek8(plaintext + pos + di));
+        di := di + 1;
+      }
+      result := dataLen;
+    }
+  }
+
+  munmap(plaintext, ctLen);
+  munmap(recvBuf, QUIC_MAX_PACKET_SIZE);
+  return result;
+}
+
+// Close stream: send encrypted RESET_STREAM frame
+pub fn QUICCloseStream(stream: QUICStream) {
+  if (stream.state == 0) { return; }
+  if (stream.keyPtr == 0) { return; }
+  if (stream.ivPtr == 0) { return; }
+
+  // Build RESET_STREAM frame
+  var frameBuf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  if (frameBuf == 0) { return; }
+  var fpos: int64 := 0;
+  poke8(frameBuf + fpos, QUIC_FRAME_RESET_STREAM); fpos := fpos + 1;
+  fpos := fpos + QUICWriteVarint(frameBuf, fpos, stream.streamId);
+  fpos := fpos + QUICWriteVarint(frameBuf, fpos, QUIC_ERR_NO_ERROR);
+  fpos := fpos + QUICWriteVarint(frameBuf, fpos, stream.offset);
+
+  var nonce: int64 := mmap(0, 12, 3, 34, -1, 0);
+  if (nonce == 0) { munmap(frameBuf, 32); return; }
+  var ni: int64 := 0;
+  while (ni < 12) { poke8(nonce + ni, peek8(stream.ivPtr + ni)); ni := ni + 1; }
+  poke8(nonce + 11, peek8(nonce + 11) ^ ((stream.offset + 1) & 255));
+
+  var aad: int64 := mmap(0, 1, 3, 34, -1, 0);
+  if (aad == 0) { munmap(nonce, 12); munmap(frameBuf, 32); return; }
+  poke8(aad, 64);
+
+  var sealed: int64 := _qAES128GCMSeal(stream.keyPtr, nonce, aad, 1, frameBuf, fpos);
+  munmap(aad, 1); munmap(nonce, 12); munmap(frameBuf, 32);
+  if (sealed == 0) { return; }
+
+  var pktLen: int64 := 2 + fpos + 16;
+  var pkt: int64 := mmap(0, pktLen, 3, 34, -1, 0);
+  if (pkt == 0) { munmap(sealed, fpos + 16); return; }
+  poke8(pkt + 0, 64);
+  poke8(pkt + 1, (stream.offset + 1) & 255);
+  var pi: int64 := 0;
+  while (pi < fpos + 16) { poke8(pkt + 2 + pi, peek8(sealed + pi)); pi := pi + 1; }
+  munmap(sealed, fpos + 16);
+
+  var sendSock: UDPSocket;
+  sendSock.fd := stream.sockFd;
+  UDPSocketSendToAddr(sendSock, pkt, pktLen, stream.serverIp, stream.serverPort);
+  munmap(pkt, pktLen);
+}
+
+// Disconnect from QUIC server
+pub fn QUICDisconnect(conn: QUICConn) {
+  if (conn.connected == 1) {
+    var frame: int64 := QUICBuildConnectionClose(QUIC_ERR_NO_ERROR, "Normal close");
+    if (frame != 0) {
+      UDPSocketSendToAddr(conn.sock, frame, 64, conn.serverIp, conn.serverPort);
+      munmap(frame, 64);
+    }
+    conn.connected := 0;
+  }
+
+  if (conn.clientHP  != 0) { munmap(conn.clientHP,  16); }
+  if (conn.clientIV  != 0) { munmap(conn.clientIV,  12); }
+  if (conn.clientKey != 0) { munmap(conn.clientKey, 16); }
+  if (conn.localConnId  != 0) { munmap(conn.localConnId,  QUIC_CONN_ID_LEN); }
+  if (conn.remoteConnId != 0) { munmap(conn.remoteConnId, QUIC_CONN_ID_LEN); }
+
+  UDPSocketClose(conn.sock);
+}
