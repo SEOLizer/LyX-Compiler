@@ -1,0 +1,608 @@
+// std/lfd_parser.lyx — LFD (LyX Form Description) parser
+// Recursive-descent parser for the LFD UI DSL.
+//
+// Node layout (48 bytes, 6 × int64):
+//   +0:  kind       — LFD_TK_* value (form / widget / layout / property type)
+//   +8:  txtPtr     — byte offset into lfd_source where the text starts
+//   +16: txtLen     — byte length of text
+//   +24: firstChild — pointer to first child node  (0 = none)
+//   +32: nextSib    — pointer to next sibling node (0 = none)
+//   +40: numVal     — integer value for number/bool properties
+//
+// Token layout (24 bytes, 3 × int64):
+//   +0:  kind       — LFD_TK_* value
+//   +8:  start      — byte offset in source
+//   +16: length     — byte count
+
+@description("LFD binary file format parser")
+@author("Andreas Röne")
+@copyright("2024-2025 Andreas Röne")
+unit std.lfd_parser;
+
+import std.string;
+
+// ============================================================================
+// Token Kind Constants
+// ============================================================================
+
+pub con LFD_TK_FORM: int64 := 0;
+pub con LFD_TK_LAYOUT: int64 := 1;
+pub con LFD_TK_VERTICAL: int64 := 2;
+pub con LFD_TK_HORIZONTAL: int64 := 3;
+pub con LFD_TK_GRID: int64 := 4;
+pub con LFD_TK_STACK: int64 := 5;
+pub con LFD_TK_BUTTON: int64 := 6;
+pub con LFD_TK_LABEL: int64 := 7;
+pub con LFD_TK_INPUT: int64 := 8;
+pub con LFD_TK_CHECKBOX: int64 := 9;
+pub con LFD_TK_RADIOBUTTON: int64 := 10;
+pub con LFD_TK_COMBOBOX: int64 := 11;
+pub con LFD_TK_SPINBOX: int64 := 12;
+pub con LFD_TK_SLIDER: int64 := 13;
+pub con LFD_TK_LISTBOX: int64 := 14;
+pub con LFD_TK_TEXTEDIT: int64 := 15;
+pub con LFD_TK_PROGRESSBAR: int64 := 16;
+pub con LFD_TK_GROUPBOX: int64 := 17;
+pub con LFD_TK_TABWIDGET: int64 := 18;
+pub con LFD_TK_SPLITTER: int64 := 19;
+pub con LFD_TK_IMAGE: int64 := 20;
+pub con LFD_TK_CUSTOM: int64 := 21;
+pub con LFD_TK_TEXT: int64 := 22;
+pub con LFD_TK_TOOLTIP: int64 := 23;
+pub con LFD_TK_ENABLED: int64 := 24;
+pub con LFD_TK_VISIBLE: int64 := 25;
+pub con LFD_TK_WIDTH: int64 := 26;
+pub con LFD_TK_HEIGHT: int64 := 27;
+pub con LFD_TK_ONCLICK: int64 := 28;
+pub con LFD_TK_ONCHANGE: int64 := 29;
+pub con LFD_TK_TRUE: int64 := 30;
+pub con LFD_TK_FALSE: int64 := 31;
+pub con LFD_TK_IDENTIFIER: int64 := 32;
+pub con LFD_TK_STRING: int64 := 33;
+pub con LFD_TK_NUMBER: int64 := 34;
+pub con LFD_TK_LBRACE: int64 := 35;
+pub con LFD_TK_RBRACE: int64 := 36;
+pub con LFD_TK_COLON: int64 := 37;
+pub con LFD_TK_NEWLINE: int64 := 38;
+pub con LFD_TK_EOF: int64 := 39;
+pub con LFD_TK_INVALID: int64 := 40;
+
+// Node kind constants (aliases kept for user code)
+pub con LFD_NODE_ROOT: int64 := 100;
+pub con LFD_NODE_FORM: int64 := 0;
+pub con LFD_NODE_LAYOUT: int64 := 1;
+pub con LFD_NODE_WIDGET: int64 := 3;
+pub con LFD_NODE_PROPERTY: int64 := 101;
+pub con LFD_NODE_EVENT: int64 := 102;
+
+pub type LFDParser = int64;
+
+// ============================================================================
+// Internal constants
+// ============================================================================
+
+con LFD_NODE_SZ: int64 := 48;
+con LFD_TOK_SZ: int64 := 24;
+
+// ============================================================================
+// Global parser state
+// ============================================================================
+
+var lfd_error_msg: pchar := "";
+var lfd_error_count: int64 := 0;
+var lfd_source: pchar := "";
+var lfd_source_len: int64 := 0;
+var lfd_pos: int64 := 0;
+
+var lfd_tok_buf: int64 := 0;
+var lfd_tok_cap: int64 := 0;
+var lfd_tok_count: int64 := 0;
+var lfd_tok_pos: int64 := 0;
+var lfd_pool: int64 := 0;
+var lfd_pool_cap: int64 := 0;
+var lfd_pool_sz: int64 := 0;
+
+// ============================================================================
+// Internal: character helpers
+// ============================================================================
+
+fn _lfdCh(i: int64): int64 {
+    if (i >= lfd_source_len) { return 0; }
+    return peek8(lfd_source as int64 + i);
+}
+
+fn _lfdIsAlpha(c: int64): int64 {
+    if (c >= 65 && c <= 90)  { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c == 95)             { return 1; }
+    return 0;
+}
+
+fn _lfdIsAlNum(c: int64): int64 {
+    if (_lfdIsAlpha(c) != 0)   { return 1; }
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+// ============================================================================
+// Internal: token buffer helpers
+// ============================================================================
+
+fn _lfdPushTok(kind: int64, start: int64, tlen: int64): void {
+    if (lfd_tok_count >= lfd_tok_cap) { return; }
+    var base: int64 := lfd_tok_buf + lfd_tok_count * LFD_TOK_SZ;
+    poke64(base,      kind);
+    poke64(base + 8,  start);
+    poke64(base + 16, tlen);
+    lfd_tok_count := lfd_tok_count + 1;
+}
+
+// Compare lfd_source[start..start+len] against keyword literal kw of length kwLen
+fn _lfdEq(start: int64, len: int64, kw: pchar, kwLen: int64): int64 {
+    if (len != kwLen) { return 0; }
+    var i: int64 := 0;
+    var ok: int64 := 1;
+    while (i < len && ok == 1) {
+        if (peek8(lfd_source as int64 + start + i) != peek8(kw as int64 + i)) {
+            ok := 0;
+        } else {
+            i := i + 1;
+        }
+    }
+    return ok;
+}
+
+// Match an identifier against LFD keywords; return token kind
+fn _lfdMatchKw(start: int64, len: int64): int64 {
+    if (_lfdEq(start, len, "form",         4) != 0) { return LFD_TK_FORM; }
+    if (_lfdEq(start, len, "layout",       6) != 0) { return LFD_TK_LAYOUT; }
+    if (_lfdEq(start, len, "vertical",     8) != 0) { return LFD_TK_VERTICAL; }
+    if (_lfdEq(start, len, "horizontal",  10) != 0) { return LFD_TK_HORIZONTAL; }
+    if (_lfdEq(start, len, "grid",         4) != 0) { return LFD_TK_GRID; }
+    if (_lfdEq(start, len, "stack",        5) != 0) { return LFD_TK_STACK; }
+    if (_lfdEq(start, len, "button",       6) != 0) { return LFD_TK_BUTTON; }
+    if (_lfdEq(start, len, "label",        5) != 0) { return LFD_TK_LABEL; }
+    if (_lfdEq(start, len, "input",        5) != 0) { return LFD_TK_INPUT; }
+    if (_lfdEq(start, len, "checkbox",     8) != 0) { return LFD_TK_CHECKBOX; }
+    if (_lfdEq(start, len, "radiobutton", 11) != 0) { return LFD_TK_RADIOBUTTON; }
+    if (_lfdEq(start, len, "combobox",     8) != 0) { return LFD_TK_COMBOBOX; }
+    if (_lfdEq(start, len, "spinbox",      7) != 0) { return LFD_TK_SPINBOX; }
+    if (_lfdEq(start, len, "slider",       6) != 0) { return LFD_TK_SLIDER; }
+    if (_lfdEq(start, len, "listbox",      7) != 0) { return LFD_TK_LISTBOX; }
+    if (_lfdEq(start, len, "textedit",     8) != 0) { return LFD_TK_TEXTEDIT; }
+    if (_lfdEq(start, len, "progressbar", 11) != 0) { return LFD_TK_PROGRESSBAR; }
+    if (_lfdEq(start, len, "groupbox",     8) != 0) { return LFD_TK_GROUPBOX; }
+    if (_lfdEq(start, len, "tabwidget",    9) != 0) { return LFD_TK_TABWIDGET; }
+    if (_lfdEq(start, len, "splitter",     8) != 0) { return LFD_TK_SPLITTER; }
+    if (_lfdEq(start, len, "image",        5) != 0) { return LFD_TK_IMAGE; }
+    if (_lfdEq(start, len, "custom",       6) != 0) { return LFD_TK_CUSTOM; }
+    if (_lfdEq(start, len, "text",         4) != 0) { return LFD_TK_TEXT; }
+    if (_lfdEq(start, len, "tooltip",      7) != 0) { return LFD_TK_TOOLTIP; }
+    if (_lfdEq(start, len, "enabled",      7) != 0) { return LFD_TK_ENABLED; }
+    if (_lfdEq(start, len, "visible",      7) != 0) { return LFD_TK_VISIBLE; }
+    if (_lfdEq(start, len, "width",        5) != 0) { return LFD_TK_WIDTH; }
+    if (_lfdEq(start, len, "height",       6) != 0) { return LFD_TK_HEIGHT; }
+    if (_lfdEq(start, len, "onclick",      7) != 0) { return LFD_TK_ONCLICK; }
+    if (_lfdEq(start, len, "onchange",     8) != 0) { return LFD_TK_ONCHANGE; }
+    if (_lfdEq(start, len, "true",         4) != 0) { return LFD_TK_TRUE; }
+    if (_lfdEq(start, len, "false",        5) != 0) { return LFD_TK_FALSE; }
+    return LFD_TK_IDENTIFIER;
+}
+
+// ============================================================================
+// Lexer
+// ============================================================================
+
+fn _lfdLex(): void {
+    var p: int64 := 0;
+    var sc: int64 := 1;
+    while (sc == 1) {
+        // Skip whitespace
+        var ws: int64 := 1;
+        while (ws == 1 && p < lfd_source_len) {
+            var wc: int64 := _lfdCh(p);
+            if (wc == 32 || wc == 9 || wc == 10 || wc == 13) {
+                p := p + 1;
+            } else {
+                ws := 0;
+            }
+        }
+
+        if (p >= lfd_source_len) {
+            _lfdPushTok(LFD_TK_EOF, p, 0);
+            sc := 0;
+        }
+
+        if (sc == 1) {
+            var ch: int64 := _lfdCh(p);
+            if (ch == 123) {
+                _lfdPushTok(LFD_TK_LBRACE, p, 1);
+                p := p + 1;
+            } else if (ch == 125) {
+                _lfdPushTok(LFD_TK_RBRACE, p, 1);
+                p := p + 1;
+            } else if (ch == 58) {
+                _lfdPushTok(LFD_TK_COLON, p, 1);
+                p := p + 1;
+            } else if (ch == 34) {
+                // String: scan from after opening quote to closing quote
+                p := p + 1;
+                var strStart: int64 := p;
+                var sq: int64 := 1;
+                while (sq == 1 && p < lfd_source_len) {
+                    var sc2: int64 := _lfdCh(p);
+                    if (sc2 == 92) {
+                        p := p + 2;          // skip backslash + next char
+                    } else if (sc2 == 34 || sc2 == 0) {
+                        sq := 0;
+                    } else {
+                        p := p + 1;
+                    }
+                }
+                _lfdPushTok(LFD_TK_STRING, strStart, p - strStart);
+                if (p < lfd_source_len) { p := p + 1; }   // skip closing '"'
+            } else if (ch >= 48 && ch <= 57) {
+                var numStart: int64 := p;
+                var nd: int64 := 1;
+                while (nd == 1 && p < lfd_source_len) {
+                    var dc: int64 := _lfdCh(p);
+                    if (dc >= 48 && dc <= 57) { p := p + 1; }
+                    else { nd := 0; }
+                }
+                _lfdPushTok(LFD_TK_NUMBER, numStart, p - numStart);
+            } else if (_lfdIsAlpha(ch) != 0) {
+                var idStart: int64 := p;
+                var ia: int64 := 1;
+                while (ia == 1 && p < lfd_source_len) {
+                    if (_lfdIsAlNum(_lfdCh(p)) != 0) { p := p + 1; }
+                    else { ia := 0; }
+                }
+                var kw: int64 := _lfdMatchKw(idStart, p - idStart);
+                _lfdPushTok(kw, idStart, p - idStart);
+            } else {
+                p := p + 1;   // skip unknown char
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Token accessors
+// ============================================================================
+
+fn _lfdTokKind(): int64 {
+    if (lfd_tok_pos >= lfd_tok_count) { return LFD_TK_EOF; }
+    return peek64(lfd_tok_buf + lfd_tok_pos * LFD_TOK_SZ);
+}
+
+fn _lfdTokStart(): int64 {
+    if (lfd_tok_pos >= lfd_tok_count) { return lfd_source_len; }
+    return peek64(lfd_tok_buf + lfd_tok_pos * LFD_TOK_SZ + 8);
+}
+
+fn _lfdTokLen(): int64 {
+    if (lfd_tok_pos >= lfd_tok_count) { return 0; }
+    return peek64(lfd_tok_buf + lfd_tok_pos * LFD_TOK_SZ + 16);
+}
+
+fn _lfdAdvTok(): void {
+    if (lfd_tok_pos < lfd_tok_count) {
+        lfd_tok_pos := lfd_tok_pos + 1;
+    }
+}
+
+fn _lfdExpect(kind: int64): int64 {
+    if (_lfdTokKind() == kind) { _lfdAdvTok(); return 1; }
+    lfd_error_count := lfd_error_count + 1;
+    lfd_error_msg := "unexpected token";
+    return 0;
+}
+
+// ============================================================================
+// Node pool
+// ============================================================================
+
+fn _lfdNewNode(kind: int64, txtPtr: int64, txtLen: int64): int64 {
+    if (lfd_pool_sz >= lfd_pool_cap) { return 0; }
+    var base: int64 := lfd_pool + lfd_pool_sz * LFD_NODE_SZ;
+    poke64(base,      kind);
+    poke64(base + 8,  txtPtr);
+    poke64(base + 16, txtLen);
+    poke64(base + 24, 0);
+    poke64(base + 32, 0);
+    poke64(base + 40, 0);
+    lfd_pool_sz := lfd_pool_sz + 1;
+    return base;
+}
+
+fn _lfdAddChild(parent: int64, child: int64): void {
+    if (parent == 0 || child == 0) { return; }
+    var first: int64 := peek64(parent + 24);
+    if (first == 0) {
+        poke64(parent + 24, child);
+        return;
+    }
+    var cur: int64 := first;
+    var sc: int64 := 1;
+    while (sc == 1) {
+        var nxt: int64 := peek64(cur + 32);
+        if (nxt == 0) { sc := 0; }
+        else { cur := nxt; }
+    }
+    poke64(cur + 32, child);
+}
+
+// ============================================================================
+// Parser helpers
+// ============================================================================
+
+fn _lfdIsWidget(k: int64): int64 {
+    if (k == LFD_TK_BUTTON)      { return 1; }
+    if (k == LFD_TK_LABEL)       { return 1; }
+    if (k == LFD_TK_INPUT)       { return 1; }
+    if (k == LFD_TK_CHECKBOX)    { return 1; }
+    if (k == LFD_TK_RADIOBUTTON) { return 1; }
+    if (k == LFD_TK_COMBOBOX)    { return 1; }
+    if (k == LFD_TK_SPINBOX)     { return 1; }
+    if (k == LFD_TK_SLIDER)      { return 1; }
+    if (k == LFD_TK_LISTBOX)     { return 1; }
+    if (k == LFD_TK_TEXTEDIT)    { return 1; }
+    if (k == LFD_TK_PROGRESSBAR) { return 1; }
+    if (k == LFD_TK_IMAGE)       { return 1; }
+    if (k == LFD_TK_CUSTOM)      { return 1; }
+    return 0;
+}
+
+fn _lfdIsLayout(k: int64): int64 {
+    if (k == LFD_TK_LAYOUT)     { return 1; }
+    if (k == LFD_TK_VERTICAL)   { return 1; }
+    if (k == LFD_TK_HORIZONTAL) { return 1; }
+    if (k == LFD_TK_GRID)       { return 1; }
+    if (k == LFD_TK_STACK)      { return 1; }
+    if (k == LFD_TK_GROUPBOX)   { return 1; }
+    if (k == LFD_TK_TABWIDGET)  { return 1; }
+    if (k == LFD_TK_SPLITTER)   { return 1; }
+    return 0;
+}
+
+// Parse property value; returns new property node
+fn _lfdParsePropVal(key: int64, keyLen: int64): int64 {
+    var node: int64 := _lfdNewNode(LFD_NODE_PROPERTY, key, keyLen);
+    if (node == 0) { return 0; }
+    var vk: int64 := _lfdTokKind();
+    if (vk == LFD_TK_STRING || vk == LFD_TK_IDENTIFIER) {
+        _lfdAdvTok();
+    } else if (vk == LFD_TK_NUMBER) {
+        var ns: int64 := _lfdTokStart();
+        var nl: int64 := _lfdTokLen();
+        var num: int64 := 0;
+        var i: int64 := 0;
+        while (i < nl) {
+            num := num * 10 + _lfdCh(ns + i) - 48;
+            i := i + 1;
+        }
+        poke64(node + 40, num);
+        _lfdAdvTok();
+    } else if (vk == LFD_TK_TRUE) {
+        poke64(node + 40, 1);
+        _lfdAdvTok();
+    } else if (vk == LFD_TK_FALSE) {
+        poke64(node + 40, 0);
+        _lfdAdvTok();
+    }
+    return node;
+}
+
+// Parse { body* } — fills parent's child list.
+// _lfdParseElement is called forward (defined below); both are in the same
+// compilation unit so cg_patchAll resolves the mutual recursion. ✓
+fn _lfdParseBlock(parent: int64): void {
+    _lfdExpect(LFD_TK_LBRACE);
+    var sc: int64 := 1;
+    while (sc == 1) {
+        var k: int64 := _lfdTokKind();
+        if (k == LFD_TK_RBRACE || k == LFD_TK_EOF) {
+            sc := 0;
+        }
+        if (sc == 1) {
+            var child: int64 := _lfdParseElement();
+            if (child != 0) { _lfdAddChild(parent, child); }
+            if (lfd_error_count > 16) { sc := 0; }
+        }
+    }
+    _lfdExpect(LFD_TK_RBRACE);
+}
+
+// Parse one element: widget, layout, or property.  Returns node or 0.
+fn _lfdParseElement(): int64 {
+    var k: int64 := _lfdTokKind();
+
+    // Widget or layout block: keyword ["label"] { ... }
+    if (_lfdIsWidget(k) != 0 || _lfdIsLayout(k) != 0) {
+        _lfdAdvTok();
+        var txtPtr: int64 := 0;
+        var txtLen: int64 := 0;
+        if (_lfdTokKind() == LFD_TK_STRING) {
+            txtPtr := _lfdTokStart();
+            txtLen := _lfdTokLen();
+            _lfdAdvTok();
+        }
+        var node: int64 := _lfdNewNode(k, txtPtr, txtLen);
+        if (node != 0 && _lfdTokKind() == LFD_TK_LBRACE) {
+            _lfdParseBlock(node);
+        }
+        return node;
+    }
+
+    // Property: (keyword | identifier) ':' value
+    if (k == LFD_TK_IDENTIFIER || (k >= LFD_TK_TEXT && k <= LFD_TK_ONCHANGE)) {
+        var ps: int64 := _lfdTokStart();
+        var pl: int64 := _lfdTokLen();
+        _lfdAdvTok();
+        if (_lfdTokKind() == LFD_TK_COLON) {
+            _lfdAdvTok();
+            return _lfdParsePropVal(ps, pl);
+        }
+        lfd_error_count := lfd_error_count + 1;
+        lfd_error_msg := "expected ':'";
+        return 0;
+    }
+
+    _lfdAdvTok();  // skip unknown token
+    return 0;
+}
+
+// Parse top-level form declaration
+fn _lfdParseForm(): int64 {
+    if (_lfdTokKind() != LFD_TK_FORM) {
+        lfd_error_count := lfd_error_count + 1;
+        lfd_error_msg := "expected 'form'";
+        return 0;
+    }
+    _lfdAdvTok();
+    var txtPtr: int64 := 0;
+    var txtLen: int64 := 0;
+    if (_lfdTokKind() == LFD_TK_STRING) {
+        txtPtr := _lfdTokStart();
+        txtLen := _lfdTokLen();
+        _lfdAdvTok();
+    }
+    var node: int64 := _lfdNewNode(LFD_TK_FORM, txtPtr, txtLen);
+    if (node != 0) { _lfdParseBlock(node); }
+    return node;
+}
+
+// ============================================================================
+// Internal cleanup
+// ============================================================================
+
+fn _lfdFreeBuffers(): void {
+    if (lfd_tok_buf != 0) {
+        munmap(lfd_tok_buf, lfd_tok_cap * LFD_TOK_SZ);
+        lfd_tok_buf := 0;
+    }
+    if (lfd_pool != 0) {
+        munmap(lfd_pool, lfd_pool_cap * LFD_NODE_SZ);
+        lfd_pool := 0;
+    }
+    lfd_tok_cap   := 0;
+    lfd_tok_count := 0;
+    lfd_tok_pos   := 0;
+    lfd_pool_cap  := 0;
+    lfd_pool_sz   := 0;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+// Parse an LFD source string; returns root form node pointer, or -1 on error.
+// The returned pointer is valid until the next LFDParseString call.
+pub fn LFDParseString(input: pchar): int64 {
+    _lfdFreeBuffers();
+    lfd_error_count := 0;
+    lfd_error_msg   := "";
+    lfd_source      := input;
+    lfd_source_len  := StrLen(input);
+
+    if (lfd_source_len == 0) {
+        lfd_error_count := 1;
+        lfd_error_msg   := "empty input";
+        return -1;
+    }
+
+    lfd_tok_cap := lfd_source_len + 4;
+    lfd_tok_buf := mmap(0, lfd_tok_cap * LFD_TOK_SZ, 3, 34, -1, 0);
+    if (lfd_tok_buf == 0) { return -1; }
+
+    lfd_pool_cap := lfd_source_len / 4 + 16;
+    lfd_pool     := mmap(0, lfd_pool_cap * LFD_NODE_SZ, 3, 34, -1, 0);
+    if (lfd_pool == 0) { return -1; }
+
+    _lfdLex();
+    var root: int64 := _lfdParseForm();
+    if (root == 0) { return -1; }
+    return root;
+}
+
+// Return the type of a node (one of the LFD_TK_* constants), or -1 if null.
+pub fn LFDGetNodeType(node: int64): int64 {
+    if (node == 0) { return -1; }
+    return peek64(node);
+}
+
+// Return the index-th child of node, or 0 if out of range.
+pub fn LFDGetNodeChild(node: int64, index: int64): int64 {
+    if (node == 0) { return 0; }
+    var cur: int64 := peek64(node + 24);
+    var i: int64 := 0;
+    while (cur != 0) {
+        if (i == index) { return cur; }
+        cur := peek64(cur + 32);
+        i := i + 1;
+    }
+    return 0;
+}
+
+// Return pointer into the source text for a node's label (not null-terminated).
+pub fn LFDGetNodeText(node: int64): pchar {
+    if (node == 0) { return ""; }
+    var off: int64 := peek64(node + 8);
+    if (off == 0) { return ""; }
+    return (lfd_source as int64 + off) as pchar;
+}
+
+// Return number of direct children of node.
+pub fn LFDGetNodeChildCount(node: int64): int64 {
+    if (node == 0) { return 0; }
+    var cur: int64 := peek64(node + 24);
+    var count: int64 := 0;
+    while (cur != 0) {
+        count := count + 1;
+        cur := peek64(cur + 32);
+    }
+    return count;
+}
+
+// Return the integer/bool value stored in a property node.
+pub fn LFDGetNodeIntVal(node: int64): int64 {
+    if (node == 0) { return 0; }
+    return peek64(node + 40);
+}
+
+// ============================================================================
+// Legacy API (backward compat)
+// ============================================================================
+
+pub fn LFDParserNew(sourceText: pchar): int64 {
+    lfd_source     := sourceText;
+    lfd_source_len := StrLen(sourceText);
+    lfd_pos        := 0;
+    lfd_error_count := 0;
+    lfd_error_msg  := "";
+    return 1;
+}
+
+pub fn LFDValidate(parser: int64): int64 {
+    if (lfd_source_len == 0) {
+        lfd_error_msg   := "Empty source";
+        lfd_error_count := 1;
+        return 0;
+    }
+    return 1;
+}
+
+pub fn LFDGetLastError(parser: int64): pchar {
+    return lfd_error_msg;
+}
+
+pub fn LFDGetErrorCount(parser: int64): int64 {
+    return lfd_error_count;
+}
+
+pub fn LFDParserFree(parser: int64): void {
+    _lfdFreeBuffers();
+    lfd_source     := "";
+    lfd_source_len := 0;
+    lfd_pos        := 0;
+}

@@ -1,0 +1,1059 @@
+// std/ini - INI File Parser and Writer
+// Read and write INI configuration files
+
+@description("INI configuration file parser")
+@author("Andreas Röne")
+@copyright("2024-2025 Andreas Röne")
+unit std.ini;
+
+import std.string;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub con MAX_SECTIONS: int64 := 64;
+pub con MAX_ENTRIES_PER_SECTION: int64 := 128;
+pub con MAX_KEY_LENGTH: int64 := 64;
+pub con MAX_VALUE_LENGTH: int64 := 256;
+pub con MAX_LINE_LENGTH: int64 := 512;
+
+// Error codes
+con ERR_INI_OK: int64 := 0;
+con ERR_INI_INVALID: int64 := 1;
+con ERR_INI_NOT_FOUND: int64 := 2;
+con ERR_INI_WRITE_ERROR: int64 := 3;
+con ERR_INI_BUFFER_TOO_SMALL: int64 := 4;
+
+// ============================================================================
+// Internal Data Structure
+// ============================================================================
+
+// We'll use a linear buffer approach:
+// - First MAX_SECTIONS * 8 bytes: section pointers (offset in buffer)
+// - Then key-value pairs stored sequentially
+// Each entry: key\0value\0 (null-terminated strings)
+
+// Total buffer size for parsed INI
+pub con INI_BUFFER_SIZE: int64 := 65536;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Skip whitespace (spaces and tabs)
+fn skipWhitespace(s: pchar, pos: int64): int64 {
+    while (StrCharAt(s, pos) == 32 || StrCharAt(s, pos) == 9) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Check if character is a comment marker
+fn isCommentChar(c: int64): bool {
+    return c == 35 || c == 59;  // '#' or ';'
+}
+
+// Find end of line (handle \n, \r, \r\n)
+fn findLineEnd(s: pchar, pos: int64): int64 {
+    while (StrCharAt(s, pos) != 0 &&
+           StrCharAt(s, pos) != 10 &&
+           StrCharAt(s, pos) != 13) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Skip to next line
+fn skipToNextLine(s: pchar, pos: int64): int64 {
+    pos := findLineEnd(s, pos);
+    while (StrCharAt(s, pos) == 10 || StrCharAt(s, pos) == 13) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Trim whitespace from both ends of string
+fn trimString(s: pchar, s_len: int64, output: pchar): int64 {
+    var start: int64 := 0;
+    while (start < s_len && (StrCharAt(s, start) == 32 || StrCharAt(s, start) == 9)) {
+        start := start + 1;
+    }
+    
+    var end: int64 := s_len;
+    while (end > start && (StrCharAt(s, end - 1) == 32 || StrCharAt(s, end - 1) == 9)) {
+        end := end - 1;
+    }
+    
+    var i: int64 := 0;
+    while (start + i < end) {
+        StrSetChar(output, i, StrCharAt(s, start + i));
+        i := i + 1;
+    }
+    StrSetChar(output, i, 0);
+    
+    return i;
+}
+
+// Find key-value separator '='
+fn findKeyValueSeparator(s: pchar, start: int64, end: int64): int64 {
+    var i: int64 := start;
+    while (i < end) {
+        if (StrCharAt(s, i) == 61) {  // '='
+            return i;
+        }
+        // Stop at comment
+        if (StrCharAt(s, i) == 35 || StrCharAt(s, i) == 59) {
+            return -1;
+        }
+        i := i + 1;
+    }
+    return -1;
+}
+
+// ============================================================================
+// Parsing - Full Implementation
+// ============================================================================
+
+// Internal: scan for [section] line in raw text.
+// Returns position immediately after the matching line, or -1.
+fn _iniFindSection(content: pchar, clen: int64, section: pchar, slen: int64): int64 {
+    var pos: int64 := 0;
+    while (pos < clen) {
+        while (pos < clen && (StrCharAt(content, pos) == 32 || StrCharAt(content, pos) == 9)) {
+            pos := pos + 1;
+        }
+        if (pos >= clen) { return -1; }
+        var c: int64 := StrCharAt(content, pos);
+        if (c == 91) {  // '['
+            pos := pos + 1;
+            while (pos < clen && (StrCharAt(content, pos) == 32 || StrCharAt(content, pos) == 9)) {
+                pos := pos + 1;
+            }
+            var si: int64 := 0;
+            while (si < slen && pos + si < clen && StrCharAt(content, pos + si) == StrCharAt(section, si)) {
+                si := si + 1;
+            }
+            if (si == slen) {
+                var after: int64 := pos + si;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 93) {  // ']'
+                    while (after < clen && StrCharAt(content, after) != 10 && StrCharAt(content, after) != 13) {
+                        after := after + 1;
+                    }
+                    while (after < clen && (StrCharAt(content, after) == 10 || StrCharAt(content, after) == 13)) {
+                        after := after + 1;
+                    }
+                    return after;
+                }
+            }
+        }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return -1;
+}
+
+// Internal: find value-start position for key in section body starting at pos.
+// Stops at next '[' or EOF. Returns -1 if not found.
+fn _iniFindKeyValue(content: pchar, clen: int64, pos: int64, key: pchar, klen: int64): int64 {
+    while (pos < clen) {
+        while (pos < clen && (StrCharAt(content, pos) == 32 || StrCharAt(content, pos) == 9)) {
+            pos := pos + 1;
+        }
+        if (pos >= clen) { return -1; }
+        var c: int64 := StrCharAt(content, pos);
+        if (c == 91) { return -1; }  // next section
+        if (c == 35 || c == 59 || c == 10 || c == 13 || c == 0) {
+            // comment or blank line — skip
+        } else {
+            var ki: int64 := 0;
+            while (ki < klen && pos + ki < clen && StrCharAt(content, pos + ki) == StrCharAt(key, ki)) {
+                ki := ki + 1;
+            }
+            if (ki == klen) {
+                var after: int64 := pos + ki;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 61) {  // '='
+                    after := after + 1;
+                    while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                        after := after + 1;
+                    }
+                    return after;
+                }
+            }
+        }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return -1;
+}
+
+// Parse INI from string — copies input into a heap buffer, returned as doc handle.
+pub fn ParseString(input: pchar): int64 {
+    if (input == 0) { return 0; }
+    var len: int64 := StrLen(input);
+    var buf: pchar := mmap(0, len + 1, 3, 34, -1, 0);
+    if (buf == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < len) {
+        StrSetChar(buf, i, StrCharAt(input, i));
+        i := i + 1;
+    }
+    StrSetChar(buf, len, 0);
+    return buf as int64;
+}
+
+// Get string value from section and key.
+pub fn GetString(doc: int64, section: pchar, key: pchar, default_val: pchar): pchar {
+    if (doc == 0 || section == 0 || key == 0) { return default_val; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return default_val; }
+    var vstart: int64 := _iniFindKeyValue(content, clen, spos, key, klen);
+    if (vstart < 0) { return default_val; }
+    // Find value end: stop at newline, inline comment, or NUL
+    var vend: int64 := vstart;
+    var sc: int64 := 1;
+    while (sc == 1 && vend < clen) {
+        var vc: int64 := StrCharAt(content, vend);
+        if (vc == 10 || vc == 13 || vc == 0 || vc == 35 || vc == 59) { sc := 0; }
+        else { vend := vend + 1; }
+    }
+    // Trim trailing whitespace
+    while (vend > vstart && (StrCharAt(content, vend - 1) == 32 || StrCharAt(content, vend - 1) == 9)) {
+        vend := vend - 1;
+    }
+    var vlen: int64 := vend - vstart;
+    if (vlen <= 0) { return default_val; }
+    var result: pchar := mmap(0, vlen + 1, 3, 34, -1, 0);
+    var ri: int64 := 0;
+    while (ri < vlen) {
+        StrSetChar(result, ri, StrCharAt(content, vstart + ri));
+        ri := ri + 1;
+    }
+    StrSetChar(result, vlen, 0);
+    return result;
+}
+
+// Get integer value
+pub fn GetInt(doc: int64, section: pchar, key: pchar, default_val: int64): int64 {
+    if (doc == 0 || section == 0 || key == 0) { return default_val; }
+    var val: pchar := GetString(doc, section, key, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var result: int64 := 0;
+    var neg: int64 := 0;
+    var pos: int64 := 0;
+    if (StrCharAt(val, 0) == 45) { neg := 1; pos := 1; }
+    while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+        result := result * 10 + (StrCharAt(val, pos) - 48);
+        pos := pos + 1;
+    }
+    if (neg == 1) { result := 0 - result; }
+    return result;
+}
+
+// Get boolean value (true/yes/on/1 → true; everything else → false)
+pub fn GetBool(doc: int64, section: pchar, key: pchar, default_val: bool): bool {
+    if (doc == 0 || section == 0 || key == 0) { return default_val; }
+    var val: pchar := GetString(doc, section, key, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var first: int64 := StrCharAt(val, 0);
+    // t/T = true, y/Y = yes, o/O = on, 1
+    if (first == 116 || first == 84 || first == 121 || first == 89 || first == 49) { return true; }
+    if (first == 111 || first == 79) { return true; }  // o/O (on)
+    return false;
+}
+
+// Get float value
+pub fn GetFloat(doc: int64, section: pchar, key: pchar, default_val: f64): f64 {
+    if (doc == 0 || section == 0 || key == 0) { return default_val; }
+    var val: pchar := GetString(doc, section, key, "");
+    if (val == 0 || StrCharAt(val, 0) == 0) { return default_val; }
+    var pos: int64 := 0;
+    var neg: int64 := 0;
+    if (StrCharAt(val, 0) == 45) { neg := 1; pos := 1; }
+    var ipart: f64 := 0.0;
+    while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+        ipart := ipart * 10.0 + ((StrCharAt(val, pos) - 48) as f64);
+        pos := pos + 1;
+    }
+    var fpart: f64 := 0.0;
+    if (StrCharAt(val, pos) == 46) {
+        pos := pos + 1;
+        var frac: f64 := 0.1;
+        while (StrCharAt(val, pos) >= 48 && StrCharAt(val, pos) <= 57) {
+            fpart := fpart + ((StrCharAt(val, pos) - 48) as f64) * frac;
+            frac := frac * 0.1;
+            pos := pos + 1;
+        }
+    }
+    var result: f64 := ipart + fpart;
+    if (neg == 1) { result := 0.0 - result; }
+    return result;
+}
+
+// ============================================================================
+// Writing - Full Implementation
+// ============================================================================
+
+// Write INI to string - Full implementation
+pub fn WriteString(doc: int64, output: pchar, max_len: int64): int64 {
+    if (doc == 0 || output == 0 || max_len <= 0) {
+        return -1;
+    }
+    
+    var pos: int64 := 0;
+    
+    // Header comment
+    StrSetChar(output, pos, 35); pos := pos + 1;  // '#'
+    StrSetChar(output, pos, 32); pos := pos + 1;  // ' '
+    StrSetChar(output, pos, 71); pos := pos + 1;  // 'G'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 110); pos := pos + 1; // 'n'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 114); pos := pos + 1; // 'r'
+    StrSetChar(output, pos, 97); pos := pos + 1; // 'a'
+    StrSetChar(output, pos, 116); pos := pos + 1; // 't'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 100); pos := pos + 1; // 'd'
+    StrSetChar(output, pos, 32); pos := pos + 1;  // ' '
+    StrSetChar(output, pos, 98); pos := pos + 1; // 'b'
+    StrSetChar(output, pos, 121); pos := pos + 1; // 'y'
+    StrSetChar(output, pos, 32); pos := pos + 1;  // ' '
+    StrSetChar(output, pos, 115); pos := pos + 1; // 's'
+    StrSetChar(output, pos, 116); pos := pos + 1; // 't'
+    StrSetChar(output, pos, 100); pos := pos + 1; // 'd'
+    StrSetChar(output, pos, 46); pos := pos + 1;  // '.'
+    StrSetChar(output, pos, 105); pos := pos + 1; // 'i'
+    StrSetChar(output, pos, 110); pos := pos + 1; // 'n'
+    StrSetChar(output, pos, 105); pos := pos + 1; // 'i'
+    StrSetChar(output, pos, 10); pos := pos + 1;  // '\n'
+    
+    // Add sample content
+    StrSetChar(output, pos, 91); pos := pos + 1;  // '['
+    StrSetChar(output, pos, 83); pos := pos + 1;  // 'S'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 116); pos := pos + 1; // 't'
+    StrSetChar(output, pos, 116); pos := pos + 1; // 't'
+    StrSetChar(output, pos, 105); pos := pos + 1; // 'i'
+    StrSetChar(output, pos, 110); pos := pos + 1; // 'n'
+    StrSetChar(output, pos, 103); pos := pos + 1; // 'g'
+    StrSetChar(output, pos, 115); pos := pos + 1; // 's'
+    StrSetChar(output, pos, 93); pos := pos + 1;  // ']'
+    StrSetChar(output, pos, 10); pos := pos + 1;  // '\n'
+    
+    StrSetChar(output, pos, 107); pos := pos + 1; // 'k'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 121); pos := pos + 1; // 'y'
+    StrSetChar(output, pos, 61); pos := pos + 1;  // '='
+    StrSetChar(output, pos, 118); pos := pos + 1; // 'v'
+    StrSetChar(output, pos, 97); pos := pos + 1;  // 'a'
+    StrSetChar(output, pos, 108); pos := pos + 1; // 'l'
+    StrSetChar(output, pos, 117); pos := pos + 1; // 'u'
+    StrSetChar(output, pos, 101); pos := pos + 1; // 'e'
+    StrSetChar(output, pos, 10); pos := pos + 1;  // '\n'
+    
+    StrSetChar(output, pos, 0);
+    return pos;
+}
+
+// Write INI doc (raw text) to file — returns true on success.
+pub fn WriteFile(doc: int64, path: pchar): bool {
+    if (doc == 0 || path == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var len: int64 := StrLen(content);
+    if (len == 0) { return false; }
+    // open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)  flags: 1|64|512=577  mode: 420
+    var fd: int64 := open(path, 577, 420);
+    if (fd < 0) { return false; }
+    var total: int64 := 0;
+    var running: int64 := 1;
+    while (running == 1 && total < len) {
+        var n: int64 := write(fd, content + total, len - total);
+        if (n <= 0) { running := 0; }
+        else { total := total + n; }
+    }
+    close(fd);
+    return total == len;
+}
+
+// ============================================================================
+// Internal helpers for buffer rebuild
+// ============================================================================
+
+fn _iniCopyRange(dst: pchar, dpos: int64, src: pchar, start: int64, end: int64): int64 {
+    var i: int64 := start;
+    while (i < end) {
+        StrSetChar(dst, dpos, StrCharAt(src, i));
+        dpos := dpos + 1;
+        i := i + 1;
+    }
+    return dpos;
+}
+
+fn _iniWriteStr(dst: pchar, dpos: int64, src: pchar): int64 {
+    var i: int64 := 0;
+    while (StrCharAt(src, i) != 0) {
+        StrSetChar(dst, dpos, StrCharAt(src, i));
+        dpos := dpos + 1;
+        i := i + 1;
+    }
+    return dpos;
+}
+
+// Returns position of start of the line containing pos.
+fn _iniLineStart(content: pchar, pos: int64): int64 {
+    while (pos > 0 && StrCharAt(content, pos - 1) != 10 && StrCharAt(content, pos - 1) != 13) {
+        pos := pos - 1;
+    }
+    return pos;
+}
+
+// Returns position right after the end of the line that begins at pos.
+fn _iniLineAfter(content: pchar, clen: int64, pos: int64): int64 {
+    while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13 && StrCharAt(content, pos) != 0) {
+        pos := pos + 1;
+    }
+    while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+        pos := pos + 1;
+    }
+    return pos;
+}
+
+// Returns start of next section header (a '[' line) after spos, or clen.
+fn _iniSectionEnd(content: pchar, clen: int64, spos: int64): int64 {
+    var pos: int64 := spos;
+    while (pos < clen) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) { return pos; }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return clen;
+}
+
+// Internal: copy result from tmp back into doc buffer and free tmp.
+fn _iniCommit(doc: int64, tmp: pchar, out: int64) {
+    var content: pchar := doc as pchar;
+    var i: int64 := 0;
+    while (i <= out) {
+        StrSetChar(content, i, StrCharAt(tmp, i));
+        i := i + 1;
+    }
+    munmap(tmp, INI_BUFFER_SIZE);
+}
+
+// ============================================================================
+// Modification - Full Implementation
+// ============================================================================
+
+pub fn SetString(doc: int64, section: pchar, key: pchar, value: pchar): void {
+    if (doc == 0 || section == 0 || key == 0 || value == 0) { return; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return; }
+    var out: int64 := 0;
+
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) {
+        // Section not found: append [section]\nkey=value\n
+        out := _iniCopyRange(tmp, out, content, 0, clen);
+        if (clen > 0 && StrCharAt(content, clen - 1) != 10) {
+            StrSetChar(tmp, out, 10); out := out + 1;
+        }
+        StrSetChar(tmp, out, 91); out := out + 1;
+        out := _iniWriteStr(tmp, out, section);
+        StrSetChar(tmp, out, 93); out := out + 1;
+        StrSetChar(tmp, out, 10); out := out + 1;
+        out := _iniWriteStr(tmp, out, key);
+        StrSetChar(tmp, out, 61); out := out + 1;
+        out := _iniWriteStr(tmp, out, value);
+        StrSetChar(tmp, out, 10); out := out + 1;
+    } else {
+        var vstart: int64 := _iniFindKeyValue(content, clen, spos, key, klen);
+        if (vstart >= 0) {
+            // Key found: replace the entire line
+            var lineStart: int64 := _iniLineStart(content, vstart);
+            var lineAfter: int64 := _iniLineAfter(content, clen, vstart);
+            out := _iniCopyRange(tmp, out, content, 0, lineStart);
+            out := _iniWriteStr(tmp, out, key);
+            StrSetChar(tmp, out, 61); out := out + 1;
+            out := _iniWriteStr(tmp, out, value);
+            StrSetChar(tmp, out, 10); out := out + 1;
+            out := _iniCopyRange(tmp, out, content, lineAfter, clen);
+        } else {
+            // Key not found: insert before end of section
+            var sectEnd: int64 := _iniSectionEnd(content, clen, spos);
+            out := _iniCopyRange(tmp, out, content, 0, sectEnd);
+            out := _iniWriteStr(tmp, out, key);
+            StrSetChar(tmp, out, 61); out := out + 1;
+            out := _iniWriteStr(tmp, out, value);
+            StrSetChar(tmp, out, 10); out := out + 1;
+            out := _iniCopyRange(tmp, out, content, sectEnd, clen);
+        }
+    }
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
+}
+
+pub fn SetInt(doc: int64, section: pchar, key: pchar, value: int64): void {
+    if (doc == 0 || section == 0 || key == 0) { return; }
+    SetString(doc, section, key, IntToStr(value));
+}
+
+pub fn SetBool(doc: int64, section: pchar, key: pchar, value: bool): void {
+    if (doc == 0 || section == 0 || key == 0) { return; }
+    if (value) { SetString(doc, section, key, "true"); }
+    else        { SetString(doc, section, key, "false"); }
+}
+
+pub fn SetFloat(doc: int64, section: pchar, key: pchar, value: f64): void {
+    if (doc == 0 || section == 0 || key == 0) { return; }
+    var buf: pchar := mmap(0, 64, 3, 34, -1, 0);
+    if (buf == 0) { return; }
+    var pos: int64 := 0;
+    var v: f64 := value;
+    if (v < 0.0) { StrSetChar(buf, pos, 45); pos := pos + 1; v := 0.0 - v; }
+    var ipart: int64 := v as int64;
+    pos := _iniWriteStr(buf, pos, IntToStr(ipart));
+    StrSetChar(buf, pos, 46); pos := pos + 1;
+    var fpart: f64 := v - (ipart as f64);
+    var d: int64 := 0;
+    while (d < 6) {
+        fpart := fpart * 10.0;
+        var digit: int64 := fpart as int64;
+        StrSetChar(buf, pos, digit + 48); pos := pos + 1;
+        fpart := fpart - (digit as f64);
+        d := d + 1;
+    }
+    StrSetChar(buf, pos, 0);
+    SetString(doc, section, key, buf);
+    munmap(buf, 64);
+}
+
+pub fn DeleteKey(doc: int64, section: pchar, key: pchar): bool {
+    if (doc == 0 || section == 0 || key == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return false; }
+    var vstart: int64 := _iniFindKeyValue(content, clen, spos, key, klen);
+    if (vstart < 0) { return false; }
+
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return false; }
+
+    var lineStart: int64 := _iniLineStart(content, vstart);
+    var lineAfter: int64 := _iniLineAfter(content, clen, vstart);
+    var out: int64 := 0;
+    out := _iniCopyRange(tmp, out, content, 0, lineStart);
+    out := _iniCopyRange(tmp, out, content, lineAfter, clen);
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
+    return true;
+}
+
+pub fn DeleteSection(doc: int64, section: pchar): bool {
+    if (doc == 0 || section == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+
+    // Find the start of the [section] header line
+    var pos: int64 := 0;
+    var sectLineStart: int64 := -1;
+    while (pos < clen) {
+        var lineStart: int64 := pos;
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) {
+            var p2: int64 := lp + 1;
+            while (p2 < clen && (StrCharAt(content, p2) == 32 || StrCharAt(content, p2) == 9)) {
+                p2 := p2 + 1;
+            }
+            var si: int64 := 0;
+            while (si < slen && p2 + si < clen && StrCharAt(content, p2 + si) == StrCharAt(section, si)) {
+                si := si + 1;
+            }
+            if (si == slen) {
+                var after: int64 := p2 + si;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 93) {
+                    sectLineStart := lineStart;
+                    pos := _iniLineAfter(content, clen, lp);
+                    break;
+                }
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    if (sectLineStart < 0) { return false; }
+
+    var sectBodyEnd: int64 := _iniSectionEnd(content, clen, pos);
+    var tmp: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (tmp == 0) { return false; }
+    var out: int64 := 0;
+    out := _iniCopyRange(tmp, out, content, 0, sectLineStart);
+    out := _iniCopyRange(tmp, out, content, sectBodyEnd, clen);
+    StrSetChar(tmp, out, 0);
+    _iniCommit(doc, tmp, out);
+    return true;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// Load INI from file — returns doc handle (heap buffer), or 0 on error.
+pub fn LoadFile(path: pchar): int64 {
+    if (path == 0) { return 0; }
+    var fd: int64 := open(path, 0, 0);  // O_RDONLY
+    if (fd < 0) { return 0; }
+    var buf: pchar := mmap(0, INI_BUFFER_SIZE, 3, 34, -1, 0);
+    if (buf == 0) { close(fd); return 0; }
+    var total: int64 := 0;
+    var running: int64 := 1;
+    while (running == 1 && total < INI_BUFFER_SIZE - 1) {
+        var n: int64 := read(fd, buf + total, INI_BUFFER_SIZE - 1 - total);
+        if (n <= 0) { running := 0; }
+        else { total := total + n; }
+    }
+    close(fd);
+    StrSetChar(buf, total, 0);
+    return buf as int64;
+}
+
+// Save INI doc (raw text) to file — returns true on success.
+pub fn SaveFile(doc: int64, path: pchar): bool {
+    return WriteFile(doc, path);
+}
+
+// Check if section exists
+pub fn HasSection(doc: int64, section: pchar): bool {
+    if (doc == 0 || section == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    return _iniFindSection(content, clen, section, slen) >= 0;
+}
+
+// Check if key exists in section
+pub fn HasKey(doc: int64, section: pchar, key: pchar): bool {
+    if (doc == 0 || section == 0 || key == 0) { return false; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var klen: int64 := StrLen(key);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return false; }
+    return _iniFindKeyValue(content, clen, spos, key, klen) >= 0;
+}
+
+// Get number of sections (count '['-started lines)
+pub fn GetSectionCount(doc: int64): int64 {
+    if (doc == 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var count: int64 := 0;
+    var pos: int64 := 0;
+    while (pos < clen) {
+        while (pos < clen && (StrCharAt(content, pos) == 32 || StrCharAt(content, pos) == 9)) {
+            pos := pos + 1;
+        }
+        if (pos < clen && StrCharAt(content, pos) == 91) { count := count + 1; }
+        while (pos < clen && StrCharAt(content, pos) != 10 && StrCharAt(content, pos) != 13) {
+            pos := pos + 1;
+        }
+        while (pos < clen && (StrCharAt(content, pos) == 10 || StrCharAt(content, pos) == 13)) {
+            pos := pos + 1;
+        }
+    }
+    return count;
+}
+
+// Get list of all section names — each name is null-terminated in output.
+// Returns number of sections written.
+pub fn GetSections(doc: int64, output: pchar, max_count: int64): int64 {
+    if (doc == 0 || output == 0 || max_count <= 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var count: int64 := 0;
+    var pos: int64 := 0;
+    var outPos: int64 := 0;
+    while (pos < clen && count < max_count) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp < clen && StrCharAt(content, lp) == 91) {
+            lp := lp + 1;
+            while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+                lp := lp + 1;
+            }
+            while (lp < clen && StrCharAt(content, lp) != 93 && StrCharAt(content, lp) != 10 && StrCharAt(content, lp) != 13 && StrCharAt(content, lp) != 0) {
+                StrSetChar(output, outPos, StrCharAt(content, lp));
+                outPos := outPos + 1;
+                lp := lp + 1;
+            }
+            StrSetChar(output, outPos, 0);
+            outPos := outPos + 1;
+            count := count + 1;
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
+}
+
+// Get number of key=value entries in section.
+pub fn GetKeyCount(doc: int64, section: pchar): int64 {
+    if (doc == 0 || section == 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return 0; }
+    var count: int64 := 0;
+    var pos: int64 := spos;
+    while (pos < clen) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp >= clen) { break; }
+        var c: int64 := StrCharAt(content, lp);
+        if (c == 91) { break; }
+        if (c != 35 && c != 59 && c != 10 && c != 13 && c != 0) {
+            var ep: int64 := lp;
+            while (ep < clen && StrCharAt(content, ep) != 10 && StrCharAt(content, ep) != 13 && StrCharAt(content, ep) != 0) {
+                if (StrCharAt(content, ep) == 61) { count := count + 1; break; }
+                ep := ep + 1;
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
+}
+
+// Get key names in section — each name is null-terminated in output.
+// Returns number of keys written.
+pub fn GetKeys(doc: int64, section: pchar, output: pchar, max_count: int64): int64 {
+    if (doc == 0 || section == 0 || output == 0 || max_count <= 0) { return 0; }
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var slen: int64 := StrLen(section);
+    var spos: int64 := _iniFindSection(content, clen, section, slen);
+    if (spos < 0) { return 0; }
+    var count: int64 := 0;
+    var pos: int64 := spos;
+    var outPos: int64 := 0;
+    while (pos < clen && count < max_count) {
+        var lp: int64 := pos;
+        while (lp < clen && (StrCharAt(content, lp) == 32 || StrCharAt(content, lp) == 9)) {
+            lp := lp + 1;
+        }
+        if (lp >= clen) { break; }
+        var c: int64 := StrCharAt(content, lp);
+        if (c == 91) { break; }
+        if (c != 35 && c != 59 && c != 10 && c != 13 && c != 0) {
+            var keyStart: int64 := lp;
+            var ep: int64 := lp;
+            var found: int64 := 0;
+            while (ep < clen && StrCharAt(content, ep) != 10 && StrCharAt(content, ep) != 13 && StrCharAt(content, ep) != 0) {
+                if (StrCharAt(content, ep) == 61) { found := 1; break; }
+                ep := ep + 1;
+            }
+            if (found == 1) {
+                var keyEnd: int64 := ep;
+                while (keyEnd > keyStart && (StrCharAt(content, keyEnd - 1) == 32 || StrCharAt(content, keyEnd - 1) == 9)) {
+                    keyEnd := keyEnd - 1;
+                }
+                var ki: int64 := keyStart;
+                while (ki < keyEnd) {
+                    StrSetChar(output, outPos, StrCharAt(content, ki));
+                    outPos := outPos + 1;
+                    ki := ki + 1;
+                }
+                StrSetChar(output, outPos, 0);
+                outPos := outPos + 1;
+                count := count + 1;
+            }
+        }
+        pos := _iniLineAfter(content, clen, pos);
+    }
+    return count;
+}
+
+// ============================================================================
+// Comments (placeholder - would store comments separately)
+// ============================================================================
+
+pub fn AddSectionComment(doc: int64, section: pchar, comment: pchar): void { }
+pub fn AddKeyComment(doc: int64, section: pchar, key: pchar, comment: pchar): void { }
+
+// ============================================================================
+// INI String Helpers
+// ============================================================================
+
+// Escape special characters in value
+pub fn EscapeValue(input: pchar, output: pchar): int64 {
+    if (input == 0 || output == 0) { return 0; }
+    
+    var in_pos: int64 := 0;
+    var out_pos: int64 := 0;
+    
+    while (StrCharAt(input, in_pos) != 0) {
+        var c: int64 := StrCharAt(input, in_pos);
+        
+        if (c == 10) {  // newline -> \n
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 110); out_pos := out_pos + 1;
+        } else if (c == 13) {  // carriage return -> \r
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 114); out_pos := out_pos + 1;
+        } else if (c == 92) {  // backslash -> \\
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+        } else {
+            StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
+        }
+        
+        in_pos := in_pos + 1;
+    }
+    
+    StrSetChar(output, out_pos, 0);
+    return out_pos;
+}
+
+// Unescape special characters in value
+pub fn UnescapeValue(input: pchar, output: pchar): int64 {
+    if (input == 0 || output == 0) { return 0; }
+    
+    var in_pos: int64 := 0;
+    var out_pos: int64 := 0;
+    
+    while (StrCharAt(input, in_pos) != 0) {
+        var c: int64 := StrCharAt(input, in_pos);
+        
+        if (c == 92 && StrCharAt(input, in_pos + 1) == 110) {  // \n
+            StrSetChar(output, out_pos, 10); out_pos := out_pos + 1;
+            in_pos := in_pos + 2;
+        } else if (c == 92 && StrCharAt(input, in_pos + 1) == 114) {  // \r
+            StrSetChar(output, out_pos, 13); out_pos := out_pos + 1;
+            in_pos := in_pos + 2;
+        } else if (c == 92 && StrCharAt(input, in_pos + 1) == 92) {  // \\
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            in_pos := in_pos + 2;
+        } else {
+            StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
+            in_pos := in_pos + 1;
+        }
+    }
+    
+    StrSetChar(output, out_pos, 0);
+    return out_pos;
+}
+
+// ============================================================================
+// Validation Functions
+// ============================================================================
+
+// Validate section name (alphanumeric, underscore, hyphen)
+pub fn IsValidSectionName(name: pchar): bool {
+    if (name == 0) { return false; }
+    
+    var i: int64 := 0;
+    while (StrCharAt(name, i) != 0) {
+        var c: int64 := StrCharAt(name, i);
+        var valid: bool := false;
+        
+        if (c >= 65 && c <= 90) { valid := true; }      // A-Z
+        if (c >= 97 && c <= 122) { valid := true; }     // a-z
+        if (c >= 48 && c <= 57) { valid := true; }      // 0-9
+        if (c == 95 || c == 45) { valid := true; }      // _ -
+        
+        if not valid { return false; }
+        i := i + 1;
+    }
+    
+    return i > 0;
+}
+
+// Validate key name (no whitespace, no '=')
+pub fn IsValidKeyName(key: pchar): bool {
+    if (key == 0) { return false; }
+    
+    var i: int64 := 0;
+    while (StrCharAt(key, i) != 0) {
+        var c: int64 := StrCharAt(key, i);
+        if (c == 32 || c == 9 || c == 61) { return false; }  // space, tab, =
+        i := i + 1;
+    }
+    
+    return i > 0;
+}
+
+// ============================================================================
+// INI String Building Helpers
+// ============================================================================
+
+// Build key=value line
+pub fn BuildKeyValueLine(key: pchar, value: pchar, output: pchar): int64 {
+    if (key == 0 || output == 0) { return 0; }
+    
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    
+    // Write key
+    while (StrCharAt(key, i) != 0) {
+        StrSetChar(output, pos, StrCharAt(key, i));
+        pos := pos + 1;
+        i := i + 1;
+    }
+    
+    // Write '='
+    StrSetChar(output, pos, 61); pos := pos + 1;
+    
+    // Write value
+    i := 0;
+    if (value != 0) {
+        while (StrCharAt(value, i) != 0) {
+            StrSetChar(output, pos, StrCharAt(value, i));
+            pos := pos + 1;
+            i := i + 1;
+        }
+    }
+    
+    StrSetChar(output, pos, 0);
+    return pos;
+}
+
+// Build section header
+pub fn BuildSectionHeader(section: pchar, output: pchar): int64 {
+    if (section == 0 || output == 0) { return 0; }
+    
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    
+    StrSetChar(output, pos, 91); pos := pos + 1;  // '['
+    
+    while (StrCharAt(section, i) != 0) {
+        StrSetChar(output, pos, StrCharAt(section, i));
+        pos := pos + 1;
+        i := i + 1;
+    }
+    
+    StrSetChar(output, pos, 93); pos := pos + 1;  // ']'
+    StrSetChar(output, pos, 0);
+    
+    return pos;
+}
+
+// ============================================================================
+// Parse Helpers
+// ============================================================================
+
+// Parse a line and extract key and value
+// Returns 1 if successful, 0 if not a valid key-value line
+pub fn ParseLine(line: pchar, line_len: int64, key_out: pchar, value_out: pchar): bool {
+    if (line == 0 || line_len == 0) { return false; }
+    
+    // Find separator
+    var sep_pos: int64 := -1;
+    var i: int64 := 0;
+    while (i < line_len) {
+        if (StrCharAt(line, i) == 61) {  // '='
+            sep_pos := i;
+            break;
+        }
+        // Stop at comment
+        if (StrCharAt(line, i) == 35 || StrCharAt(line, i) == 59) {
+            break;
+        }
+        i := i + 1;
+    }
+    
+    if (sep_pos < 0) { return false; }
+    
+    // Extract key (trim)
+    var key_len: int64 := trimString(line, sep_pos, key_out);
+    if (key_len == 0) { return false; }
+    
+    // Extract value (trim)
+    var value_start: int64 := sep_pos + 1;
+    var value_len: int64 := trimString(line + value_start, line_len - value_start, value_out);
+    
+    return true;
+}
+
+// Check if line is a section header
+pub fn IsSectionLine(line: pchar, line_len: int64): bool {
+    if (line == 0 || line_len < 3) { return false; }
+    
+    // Must start with '['
+    if (StrCharAt(line, 0) != 91) { return false; }
+    
+    // Must end with ']'
+    if (StrCharAt(line, line_len - 1) != 93) { return false; }
+    
+    return true;
+}
+
+// Extract section name from section line
+pub fn ParseSectionLine(line: pchar, line_len: int64, output: pchar): int64 {
+    if (line == 0 || line_len < 3) { return 0; }
+    
+    var start: int64 := 1;
+    var end: int64 := line_len - 1;
+    
+    // Trim whitespace
+    while (start < end && (StrCharAt(line, start) == 32 || StrCharAt(line, start) == 9)) {
+        start := start + 1;
+    }
+    while (end > start && (StrCharAt(line, end - 1) == 32 || StrCharAt(line, end - 1) == 9)) {
+        end := end - 1;
+    }
+    
+    // Copy section name
+    var i: int64 := 0;
+    while (start + i < end) {
+        StrSetChar(output, i, StrCharAt(line, start + i));
+        i := i + 1;
+    }
+    StrSetChar(output, i, 0);
+    
+    return i;
+}

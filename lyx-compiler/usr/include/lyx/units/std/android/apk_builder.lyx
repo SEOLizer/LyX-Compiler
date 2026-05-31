@@ -1,0 +1,125 @@
+// Lyx Android Stdlib - APK builder
+// WP-AND-08
+//
+// High-level helper on top of std.android.zip_writer that places APK
+// entries at canonical paths. Produces an UNSIGNED APK — `apksigner sign`
+// (or PackagingV1Sign() in a future Phase B) must be run before the
+// archive will install on a device.
+//
+// Required inputs (pre-built, supplied by caller):
+//   * A compiled libfoo.so (Lyx --target=android-arm64 --shared output)
+//   * AndroidManifest.xml in BINARY AXML form (compile with `aapt2 compile`
+//     + `aapt2 link` from the text XML that std.android.manifest_gen
+//     produces). Text manifests are NOT accepted by modern Android.
+//   * classes.dex stub (the absolute minimum is a valid Dex header with
+//     a single empty class; `d8 --min-api 21 stub.smali` works, or
+//     pick up a hand-crafted byte blob).
+//
+// Architecture lib path follows the Android convention:
+//   armeabi-v7a   →   lib/armeabi-v7a/lib<name>.so
+//   arm64-v8a     →   lib/arm64-v8a/lib<name>.so
+//   x86           →   lib/x86/lib<name>.so
+//   x86_64        →   lib/x86_64/lib<name>.so
+
+unit std.android.apk_builder;
+
+import std.android.zip_writer;
+
+pub con APK_ARCH_ARM64:   int64 := 1;
+pub con APK_ARCH_ARMV7:   int64 := 2;
+pub con APK_ARCH_X86:     int64 := 3;
+pub con APK_ARCH_X86_64:  int64 := 4;
+
+fn _archDir(arch: int64): pchar {
+  if arch == APK_ARCH_ARM64  { return "lib/arm64-v8a/"c; }
+  if arch == APK_ARCH_ARMV7  { return "lib/armeabi-v7a/"c; }
+  if arch == APK_ARCH_X86    { return "lib/x86/"c; }
+  if arch == APK_ARCH_X86_64 { return "lib/x86_64/"c; }
+  return "lib/unknown/"c;
+}
+
+pub type ApkBuilder = class {
+  zw: ZipWriter;
+
+  fn Init() {
+    self.zw := new ZipWriter();
+    self.zw.Init();
+  }
+
+  // Add the compiled AXML manifest. MUST come first in the archive so the
+  // Android package manager can read it without scanning further.
+  pub fn AddAxmlManifest(axmlBuf: int64, axmlLen: int64): int64 {
+    return self.zw.AddFileStored("AndroidManifest.xml"c, axmlBuf, axmlLen);
+  }
+
+  // Add the classes.dex stub.
+  pub fn AddDexStub(dexBuf: int64, dexLen: int64): int64 {
+    return self.zw.AddFileStored("classes.dex"c, dexBuf, dexLen);
+  }
+
+  // Add a native library at lib/<arch>/lib<name>.so.
+  pub fn AddSharedLib(arch: int64, libName: pchar, soBuf: int64, soLen: int64): int64 {
+    // Build "lib/<arch>/lib<libName>.so" into a scratch buffer.
+    var dir: pchar := _archDir(arch);
+    var dirLen: int64 := StrLen(dir);
+    var nameLen: int64 := StrLen(libName);
+    var total: int64 := dirLen + 3 + nameLen + 3;
+    var path: int64 := mmap(0, total + 1, 3, 34, -1, 0);
+    var p: int64 := 0;
+    var i: int64 := 0;
+    while i < dirLen { poke8(path + p, peek8(dir + i)); p := p + 1; i := i + 1; }
+    poke8(path + p, 108); p := p + 1;   // 'l'
+    poke8(path + p, 105); p := p + 1;   // 'i'
+    poke8(path + p,  98); p := p + 1;   // 'b'
+    i := 0;
+    while i < nameLen { poke8(path + p, peek8(libName + i)); p := p + 1; i := i + 1; }
+    poke8(path + p,  46); p := p + 1;   // '.'
+    poke8(path + p, 115); p := p + 1;   // 's'
+    poke8(path + p, 111); p := p + 1;   // 'o'
+    poke8(path + p,   0);
+    var rc: int64 := self.zw.AddFileStored(path as pchar, soBuf, soLen);
+    munmap(path, total + 1);
+    return rc;
+  }
+
+  // Add an arbitrary resource at the caller-supplied archive path.
+  pub fn AddResource(archivePath: pchar, buf: int64, len: int64): int64 {
+    return self.zw.AddFileStored(archivePath, buf, len);
+  }
+
+  // Finish the archive. Returns the buffer pointer; GetLen returns size.
+  // Caller must still sign the resulting APK before `adb install` succeeds.
+  pub fn Finalize(): void {
+    self.zw.Finalize();
+  }
+
+  pub fn GetBuf(): int64 { return self.zw.GetBuf(); }
+  pub fn GetLen(): int64 { return self.zw.GetLen(); }
+};
+
+// ---------------------------------------------------------------------------
+// External-tool pipeline notes (Phase B deferred):
+//
+//   AXML compile (text -> binary):
+//     aapt2 compile -o build/res.zip res/
+//     aapt2 link    -o app.unsigned.apk \
+//                   --manifest AndroidManifest.xml \
+//                   -I $ANDROID_SDK/platforms/android-34/android.jar
+//
+//   Dex stub (one empty Java class):
+//     echo 'public class Stub {}' > Stub.java
+//     javac --release 21 Stub.java
+//     d8 --min-api 21 --output classes/ Stub.class
+//
+//   Signing (after ApkBuilder.Finalize writes app.unsigned.apk):
+//     apksigner sign --ks debug.keystore --ks-pass pass:android \
+//                    --out app.apk app.unsigned.apk
+//
+//   Install:
+//     adb install -r app.apk
+//
+// A future Phase B can replace each of these with pure-Lyx implementations:
+//   * AXML encoder       — std.android.axml_encoder
+//   * Dex stub generator — std.android.dex_gen
+//   * v1 JAR signing     — std.android.apk_sign (needs SHA-1 + RSA)
+//   * adb wrapper        — std.android.adb       (just exec("adb", [...]))

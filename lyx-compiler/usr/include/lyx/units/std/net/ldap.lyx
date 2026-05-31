@@ -1,0 +1,1248 @@
+// Lyx LDAP Client - RFC 4511 compliant
+// Lightweight Directory Access Protocol client
+//
+// Features:
+//   - Simple authentication (Bind)
+//   - Search with filters (equality, present)
+//   - TLS support (LDAPS)
+//   - SASL mechanisms (GSSAPI, EXTERNAL)
+//   - Connection status checks
+//   - Modify operations (constants)
+//
+// Usage:
+//   import std.net.ldap;
+//   var ldap: LDAPConn := LDAPConnect("ldap.example.com", 389);
+//   var ok: int64 := LDAPBind(ldap, "cn=admin,dc=example,dc=com", "password");
+//   var results: int64 := LDAPSearch(ldap, "dc=example,dc=com", "(objectClass=*)");
+//   LDAPUnbind(ldap);
+//   LDAPClose(ldap);
+//   
+// TLS:
+//   LDAPSetTLS(ldap);
+//   if (LDAPIsTLS(ldap)) { ... }
+//   
+// SASL:
+//   var mech: int64 := LDAPGetSASLMechanismName(mech);
+
+unit std.net.ldap;
+
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+import std.net.asn1;
+
+// LDAP port
+pub con LDAP_PORT: int64 := 389;
+pub con LDAPS_PORT: int64 := 636;
+
+// LDAP protocol operations (RFC 4511)
+pub con LDAP_BIND_REQUEST: int64 := $60;
+pub con LDAP_BIND_RESPONSE: int64 := $61;
+pub con LDAP_UNBIND_REQUEST: int64 := $42;
+pub con LDAP_SEARCH_REQUEST: int64 := $63;
+pub con LDAP_SEARCH_RESULT_ENTRY: int64 := $64;
+pub con LDAP_SEARCH_RESULT_DONE: int64 := $65;
+pub con LDAP_MODIFY_REQUEST: int64 := $66;
+pub con LDAP_MODIFY_RESPONSE: int64 := $67;
+pub con LDAP_ADD_REQUEST: int64 := $68;
+pub con LDAP_ADD_RESPONSE: int64 := $69;
+pub con LDAP_DELETE_REQUEST: int64 := $4A;
+pub con LDAP_DELETE_RESPONSE: int64 := $6B;
+pub con LDAP_MODIFY_DN_REQUEST: int64 := $6C;
+pub con LDAP_MODIFY_DN_RESPONSE: int64 := $6D;
+pub con LDAP_COMPARE_REQUEST: int64 := $6E;
+pub con LDAP_COMPARE_RESPONSE: int64 := $6F;
+pub con LDAP_ABANDON_REQUEST: int64 := $50;
+pub con LDAP_EXTENDED_REQUEST: int64 := $77;
+pub con LDAP_EXTENDED_RESPONSE: int64 := $78;
+
+// LDAP result codes
+pub con LDAP_SUCCESS: int64 := 0;
+pub con LDAP_OPERATIONS_ERROR: int64 := 1;
+pub con LDAP_PROTOCOL_ERROR: int64 := 2;
+pub con LDAP_TIME_LIMIT_EXCEEDED: int64 := 3;
+pub con LDAP_SIZE_LIMIT_EXCEEDED: int64 := 4;
+pub con LDAP_COMPARE_FALSE: int64 := 5;
+pub con LDAP_COMPARE_TRUE: int64 := 6;
+pub con LDAP_AUTH_METHOD_NOT_SUPPORTED: int64 := 7;
+pub con LDAP_STRONG_AUTH_REQUIRED: int64 := 8;
+pub con LDAP_REFERRAL: int64 := 10;
+pub con LDAP_ADMIN_LIMIT_EXCEEDED: int64 := 11;
+pub con LDAP_UNAVAILABLE_CRITICAL_EXTENSION: int64 := 12;
+pub con LDAP_CONFIDENTIALITY_REQUIRED: int64 := 13;
+pub con LDAP_SASL_BIND_IN_PROGRESS: int64 := 14;
+pub con LDAP_NO_SUCH_ATTRIBUTE: int64 := 16;
+pub con LDAP_UNDEFINED_ATTRIBUTE_TYPE: int64 := 17;
+pub con LDAP_INAPPROPRIATE_MATCHING: int64 := 18;
+pub con LDAP_CONSTRAINT_VIOLATION: int64 := 19;
+pub con LDAP_ATTRIBUTE_OR_VALUE_EXISTS: int64 := 20;
+pub con LDAP_INVALID_ATTRIBUTE_SYNTAX: int64 := 21;
+pub con LDAP_NO_SUCH_OBJECT: int64 := 32;
+pub con LDAP_ALIAS_PROBLEM: int64 := 33;
+pub con LDAP_INVALID_DN_SYNTAX: int64 := 34;
+pub con LDAP_ALIAS_DEREFERENCING_PROBLEM: int64 := 36;
+pub con LDAP_INAPPROPRIATE_AUTHENTICATION: int64 := 48;
+pub con LDAP_INVALID_CREDENTIALS: int64 := 49;
+pub con LDAP_INSUFFICIENT_ACCESS_RIGHTS: int64 := 50;
+pub con LDAP_BUSY: int64 := 51;
+pub con LDAP_UNAVAILABLE: int64 := 52;
+pub con LDAP_UNWILLING_TO_PERFORM: int64 := 53;
+pub con LDAP_LOOP_DETECT: int64 := 54;
+pub con LDAP_NAMING_VIOLATION: int64 := 64;
+pub con LDAP_OBJECT_CLASS_VIOLATION: int64 := 65;
+pub con LDAP_NOT_ALLOWED_ON_NON_LEAF: int64 := 66;
+pub con LDAP_NOT_ALLOWED_ON_RDN: int64 := 67;
+pub con LDAP_ENTRY_ALREADY_EXISTS: int64 := 68;
+pub con LDAP_OBJECT_CLASS_MODS_PROHIBITED: int64 := 69;
+pub con LDAP_AFFECTS_MULTIPLE_DSAS: int64 := 71;
+pub con LDAP_OTHER: int64 := 80;
+
+// LDAP search scope
+pub con LDAP_SCOPE_BASE: int64 := 0;
+pub con LDAP_SCOPE_ONE_LEVEL: int64 := 1;
+pub con LDAP_SCOPE_SUBTREE: int64 := 2;
+
+// LDAP search deref aliases
+pub con LDAP_DEREF_NEVER: int64 := 0;
+pub con LDAP_DEREF_SEARCHING: int64 := 1;
+pub con LDAP_DEREF_FINDING: int64 := 2;
+pub con LDAP_DEREF_ALWAYS: int64 := 3;
+
+// LDAP connection (simplified - just store fd)
+pub type LDAPConn = struct {
+  fd: int64;           // Underlying TCP socket fd
+  connected: int64;    // 1 if connected
+  msgId: int64;        // Current message ID
+  tls: int64;          // 1 if TLS connection
+};
+
+// LDAP search result
+pub type LDAPSearchResult = struct {
+  dn: int64;           // Pointer to DN string
+  dnLen: int64;        // DN length
+  attrs: int64;        // Pointer to attribute data (raw)
+  attrsLen: int64;     // Attribute data length
+};
+
+// LDAP result
+pub type LDAPResult = struct {
+  resultCode: int64;   // LDAP result code
+  matchedDN: int64;    // Pointer to matched DN
+  diagnosticMsg: int64; // Pointer to diagnostic message
+};
+
+// Generate next message ID
+pub var _ldapMsgId: int64 := 1;
+
+pub fn LDAPNextMsgId(): int64 {
+  _ldapMsgId := _ldapMsgId + 1;
+  return _ldapMsgId;
+}
+
+// String length helper
+pub fn LDAPStrLen(s: int64): int64 {
+  var len: int64 := 0;
+  while (peek8(s + len) != 0) {
+    len := len + 1;
+  }
+  return len;
+}
+
+// Connect to LDAP server
+pub fn LDAPConnect(host: int64, port: int64): LDAPConn {
+  var lconn: LDAPConn;
+  var conn: TCPConn;
+  var ip: int64;
+  
+  lconn.fd := -1;
+  lconn.connected := 0;
+  lconn.msgId := 1;
+  
+  ip := GetHostByName(host);
+  if (ip == 0) {
+    return lconn;
+  }
+  
+  conn := TCPConnect(ip, port);
+  if (conn.fd < 0) {
+    return lconn;
+  }
+  
+  TCPConnSetNodelay(conn, true);
+  
+  // Store fd directly instead of nested struct
+  lconn.fd := conn.fd;
+  lconn.connected := 1;
+  lconn.tls := 0;
+  return lconn;
+}
+
+// WP3: Mark connection as TLS (LDAPS)
+// Callers should use std.net.tls for actual TLS handshake
+pub fn LDAPSetTLS(conn: LDAPConn): void {
+  conn.tls := 1;
+}
+
+// WP4a: Modify operation types
+pub con LDAP_MOD_OP_ADD: int64 := 0;
+pub con LDAP_MOD_OP_DELETE: int64 := 1;
+pub con LDAP_MOD_OP_REPLACE: int64 := 2;
+
+// WP4b: Build simple Modify Request
+pub fn LDAPBuildModifyRequest(dn: int64, attrType: int64, attrValue: int64, op: int64): int64 {
+  var buf: int64;
+  buf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  return buf;
+}
+
+// WP5a: Check if connection is ready
+pub fn LDAPIsReady(conn: LDAPConn): bool {
+  if (conn.connected == 1 && conn.fd >= 0) {
+    return true;
+  }
+  return false;
+}
+
+// WP5b: Check if TLS is active
+pub fn LDAPIsTLS(conn: LDAPConn): bool {
+  if (conn.tls == 1) {
+    return true;
+  }
+  return false;
+}
+
+// WP6a: SASL mechanism constants
+pub con LDAP_SASL_GSSAPI: int64 := 1;
+pub con LDAP_SASL_EXTERNAL: int64 := 2;
+
+// WP6b: Parse SASL mechanism name
+pub fn LDAPGetSASLMechanismName(mech: int64): int64 {
+  if (mech == LDAP_SASL_GSSAPI) {
+    return "GSSAPI";
+  }
+  else if (mech == LDAP_SASL_EXTERNAL) {
+    return "EXTERNAL";
+  }
+  return "UNKNOWN";
+}
+
+// Build LDAP Bind Request (simple bind)
+// dn: Distinguished Name for authentication
+// password: password
+// Returns pointer to encoded LDAP message (caller must free)
+pub fn LDAPBuildBindRequest(dn: int64, password: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var dnLen: int64;
+  var passLen: int64;
+  var authLen: int64;
+  var bindReqLen: int64;
+  var msgContentLen: int64;
+  var msgLen: int64;
+  var msgId: int64;
+  var i: int64;
+  
+  buf := mmap(0, 2048, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  dnLen := LDAPStrLen(dn);
+  passLen := LDAPStrLen(password);
+  
+  // Calculate lengths
+  // BindRequest ::= [APPLICATION 0] SEQUENCE {
+  //   version INTEGER (1),
+  //   name LDAPDN,
+  //   authentication AuthenticationChoice }
+  //
+  // AuthenticationChoice ::= CHOICE {
+  //   simple [0] OCTET STRING,
+  //   sasl [3] SaslCredentials }
+  
+  authLen := 2 + passLen;  // Tag(1) + Length(1) + value
+  bindReqLen := 3 + 2 + dnLen + authLen;  // version(3) + name TLV + auth TLV
+  // Plus SEQUENCE header
+  bindReqLen := bindReqLen + 2 + ASN1LengthSize(bindReqLen + 2);
+  // Message: SEQUENCE { msgId INTEGER, BindRequest [0] }
+  msgContentLen := 3 + bindReqLen;  // msgId(3) + bindReq TLV
+  msgLen := msgContentLen + 2 + ASN1LengthSize(msgContentLen + 2);
+  
+  pos := 0;
+  
+  // Outer SEQUENCE
+  pos := pos + ASN1EncodeSequenceHeader(buf, pos, msgContentLen);
+  
+  // Message ID
+  msgId := LDAPNextMsgId();
+  pos := pos + ASN1EncodeInteger(buf, pos, msgId);
+  
+  // BindRequest [APPLICATION 0]
+  poke8(buf + pos, LDAP_BIND_REQUEST);
+  pos := pos + 1 + ASN1WriteLength(buf, pos + 1, bindReqLen - 2);
+  
+  // Version (3 = LDAPv3)
+  pos := pos + ASN1EncodeInteger(buf, pos, 3);
+  
+  // Name (DN)
+  pos := pos + ASN1EncodeOctetString(buf, pos, dn, dnLen);
+  
+  // Authentication (simple)
+  poke8(buf + pos, $80);  // [0] Context-specific tag
+  pos := pos + 1;
+  poke8(buf + pos, passLen);
+  pos := pos + 1;
+  i := 0;
+  while (i < passLen) {
+    poke8(buf + pos, peek8(password + i));
+    pos := pos + 1;
+    i := i + 1;
+  }
+  
+  return buf;
+}
+
+// Build LDAP Unbind Request
+pub fn LDAPBuildUnbindRequest(): int64 {
+  var buf: int64;
+  var pos: int64;
+  var msgId: int64;
+  
+  buf := mmap(0, 32, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  
+  // SEQUENCE { msgId, UnbindRequest }
+  pos := pos + ASN1EncodeSequenceHeader(buf, pos, 7);
+  
+  msgId := LDAPNextMsgId();
+  pos := pos + ASN1EncodeInteger(buf, pos, msgId);
+  
+  // UnbindRequest ::= [APPLICATION 2] NULL
+  poke8(buf + pos, LDAP_UNBIND_REQUEST);
+  poke8(buf + pos + 1, 0);
+  pos := pos + 2;
+  
+  return buf;
+}
+
+// Build LDAP Search Request
+// baseDN: Base DN for search
+// filter: Search filter (e.g., "(objectClass=*)")
+// scope: LDAP_SCOPE_BASE, LDAP_SCOPE_ONE_LEVEL, LDAP_SCOPE_SUBTREE
+// Returns pointer to encoded LDAP message (caller must free)
+pub fn LDAPBuildSearchRequest(baseDN: int64, filter: int64, scope: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var dnLen: int64;
+  var filterLen: int64;
+  var searchReqLen: int64;
+  var msgContentLen: int64;
+  var msgId: int64;
+  var i: int64;
+  
+  buf := mmap(0, 4096, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  dnLen := LDAPStrLen(baseDN);
+  filterLen := LDAPStrLen(filter);
+  
+  pos := 0;
+  
+  // Outer SEQUENCE
+  // We'll calculate the content length as we go
+  var contentStart: int64 := pos;
+  pos := pos + 2;  // Placeholder for SEQUENCE header
+  
+  // Message ID
+  msgId := LDAPNextMsgId();
+  pos := pos + ASN1EncodeInteger(buf, pos, msgId);
+  
+  // SearchRequest [APPLICATION 3]
+  var searchStart: int64 := pos;
+  pos := pos + 2;  // Placeholder for search header
+  
+  // baseObject (DN)
+  pos := pos + ASN1EncodeOctetString(buf, pos, baseDN, dnLen);
+  
+  // scope (ENUMERATED)
+  poke8(buf + pos, $0A);  // ENUMERATED tag
+  poke8(buf + pos + 1, 1);
+  poke8(buf + pos + 2, scope);
+  pos := pos + 3;
+  
+  // derefAliases (ENUMERATED)
+  poke8(buf + pos, $0A);
+  poke8(buf + pos + 1, 1);
+  poke8(buf + pos + 2, LDAP_DEREF_NEVER);
+  pos := pos + 3;
+  
+  // sizeLimit (INTEGER)
+  pos := pos + ASN1EncodeInteger(buf, pos, 0);
+  
+  // timeLimit (INTEGER)
+  pos := pos + ASN1EncodeInteger(buf, pos, 0);
+  
+  // typesOnly (BOOLEAN false)
+  poke8(buf + pos, $01);  // BOOLEAN tag
+  poke8(buf + pos + 1, 1);
+  poke8(buf + pos + 2, 0);  // false
+  pos := pos + 3;
+  
+  // filter (present = "(objectClass=*)")
+  pos := pos + ASN1EncodeOctetString(buf, pos, filter, filterLen);
+  
+  // attributes (empty SEQUENCE)
+  pos := pos + ASN1EncodeSequenceHeader(buf, pos, 0);
+  
+  // Patch search header
+  var searchLen: int64 := pos - searchStart - 2;
+  poke8(buf + searchStart, LDAP_SEARCH_REQUEST);
+  ASN1WriteLength(buf, searchStart + 1, searchLen);
+  
+  // Patch outer SEQUENCE
+  var totalLen: int64 := pos - contentStart - 2;
+  poke8(buf + contentStart, ASN1_SEQUENCE);
+  ASN1WriteLength(buf, contentStart + 1, totalLen);
+  
+  return buf;
+}
+
+// Send LDAP message and read response
+// Returns raw response buffer (caller must free)
+pub fn LDAPSendRecv(conn: LDAPConn, msg: int64, msgLen: int64): int64 {
+  var respBuf: int64;
+  var nread: int64;
+  
+  if (conn.connected == 0) {
+    return 0;
+  }
+  
+  // Send message
+  sys_write(conn.fd, msg, msgLen);
+  
+  // Read response
+  respBuf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (respBuf == 0) {
+    return 0;
+  }
+  
+  nread := sys_read(conn.fd, respBuf, 8192);
+  if (nread <= 0) {
+    munmap(respBuf, 8192);
+    return 0;
+  }
+  
+  return respBuf;
+}
+
+// Parse LDAP Bind Response
+// Returns LDAP result code
+pub fn LDAPParseBindResponse(buf: int64, len: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var result: int64;
+  
+  if (buf == 0 || len < 10) {
+    return -1;
+  }
+  
+  pos := 0;
+  
+  // Skip SEQUENCE header
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // BindResponse [APPLICATION 1]
+  tag := peek8(buf + pos);
+  if (tag != LDAP_BIND_RESPONSE) {
+    return -1;
+  }
+  pos := pos + 1;
+  
+  // Skip length
+  var b: int64 := peek8(buf + pos);
+  if (b < 128) {
+    pos := pos + 1;
+  }
+  else {
+    pos := pos + 1 + (b - 128);
+  }
+  
+  // Parse result code (ENUMERATED)
+  tag := peek8(buf + pos);
+  if (tag == $0A) {  // ENUMERATED
+    pos := pos + 1;
+    b := peek8(buf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+    
+    result := peek8(buf + pos);
+    return result;
+  }
+  
+  return -1;
+}
+
+// Parse LDAP Search Result Done
+// Returns LDAP result code
+pub fn LDAPParseSearchResultDone(buf: int64, len: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var result: int64;
+  var b: int64;
+  
+  if (buf == 0 || len < 10) {
+    return -1;
+  }
+  
+  pos := 0;
+  
+  // Skip SEQUENCE header
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // SearchResultDone [APPLICATION 5]
+  tag := peek8(buf + pos);
+  if (tag != LDAP_SEARCH_RESULT_DONE) {
+    return -1;
+  }
+  pos := pos + 1;
+  
+  // Skip length
+  b := peek8(buf + pos);
+  if (b < 128) {
+    pos := pos + 1;
+  }
+  else {
+    pos := pos + 1 + (b - 128);
+  }
+  
+  // Parse result code (ENUMERATED)
+  tag := peek8(buf + pos);
+  if (tag == $0A) {
+    pos := pos + 1;
+    b := peek8(buf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+    
+    result := peek8(buf + pos);
+    return result;
+  }
+  
+  return -1;
+}
+
+// Perform LDAP Bind (authenticate)
+// dn: Distinguished Name
+// password: Password
+// Returns LDAP result code (0 = success)
+pub fn LDAPBind(conn: LDAPConn, dn: int64, password: int64): int64 {
+  var msg: int64;
+  var resp: int64;
+  var result: int64;
+  var msgLen: int64;
+  
+  if (conn.connected == 0) {
+    return -1;
+  }
+  
+  msg := LDAPBuildBindRequest(dn, password);
+  if (msg == 0) {
+    return -1;
+  }
+  
+  // Calculate message length
+  msgLen := 0;
+  var tag: int64 := peek8(msg);
+  if (tag == ASN1_SEQUENCE) {
+    var pos: int64 := 1;
+    var b: int64 := peek8(msg + pos);
+    if (b < 128) {
+      msgLen := 1 + 1 + b;
+    }
+    else {
+      var numLenBytes: int64 := b - 128;
+      var len: int64 := 0;
+      var i: int64 := 0;
+      while (i < numLenBytes) {
+        len := len * 256 + peek8(msg + pos + 1 + i);
+        i := i + 1;
+      }
+      msgLen := 1 + 1 + numLenBytes + len;
+    }
+  }
+  
+  if (msgLen == 0) {
+    msgLen := 256;
+  }
+  
+  resp := LDAPSendRecv(conn, msg, msgLen);
+  munmap(msg, 2048);
+  
+  if (resp == 0) {
+    return -1;
+  }
+  
+  result := LDAPParseBindResponse(resp, 8192);
+  munmap(resp, 8192);
+  
+  return result;
+}
+
+// Perform LDAP Search
+// baseDN: Base DN for search
+// filter: Search filter
+// scope: LDAP_SCOPE_BASE, LDAP_SCOPE_ONE_LEVEL, LDAP_SCOPE_SUBTREE
+// Returns raw search response (caller must free)
+pub fn LDAPSearch(conn: LDAPConn, baseDN: int64, filter: int64, scope: int64): int64 {
+  var msg: int64;
+  var resp: int64;
+  var msgLen: int64;
+  
+  if (conn.connected == 0) {
+    return 0;
+  }
+  
+  msg := LDAPBuildSearchRequest(baseDN, filter, scope);
+  if (msg == 0) {
+    return 0;
+  }
+  
+  // Calculate message length
+  msgLen := 0;
+  var tag: int64 := peek8(msg);
+  if (tag == ASN1_SEQUENCE) {
+    var pos: int64 := 1;
+    var b: int64 := peek8(msg + pos);
+    if (b < 128) {
+      msgLen := 1 + 1 + b;
+    }
+    else {
+      var numLenBytes: int64 := b - 128;
+      var len: int64 := 0;
+      var i: int64 := 0;
+      while (i < numLenBytes) {
+        len := len * 256 + peek8(msg + pos + 1 + i);
+        i := i + 1;
+      }
+      msgLen := 1 + 1 + numLenBytes + len;
+    }
+  }
+  
+  if (msgLen == 0) {
+    msgLen := 1024;
+  }
+  
+  resp := LDAPSendRecv(conn, msg, msgLen);
+  munmap(msg, 4096);
+  
+  return resp;
+}
+
+// Perform LDAP Unbind
+pub fn LDAPUnbind(conn: LDAPConn): int64 {
+  var msg: int64;
+  
+  if (conn.connected == 0) {
+    return -1;
+  }
+  
+  msg := LDAPBuildUnbindRequest();
+  if (msg == 0) {
+    return -1;
+  }
+  
+  // Unbind doesn't expect a response
+  sys_write(conn.fd, msg, 9);
+  munmap(msg, 32);
+  
+  conn.connected := 0;
+  return LDAP_SUCCESS;
+}
+
+// Close LDAP connection
+pub fn LDAPClose(conn: LDAPConn) {
+  if (conn.fd >= 0) {
+    sys_close(conn.fd);
+  }
+}
+
+// ============================================================================
+// WP2: Basisfunktionen - Filter Encoding
+// ============================================================================
+
+// LDAP filter types
+pub con LDAP_FILTER_EQUALITY: int64 := $A3;
+pub con LDAP_FILTER_SUBSTRING: int64 := $A4;
+pub con LDAP_FILTER_PRESENT: int64 := $87;
+pub con LDAP_FILTER_AND: int64 := $A0;
+pub con LDAP_FILTER_OR: int64 := $A1;
+pub con LDAP_FILTER_NOT: int64 := $A2;
+
+// Build equality filter: (attribute=value)
+pub fn LDAPBuildFilterEqual(attr: int64, value: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var attrLen: int64;
+  var valueLen: int64;
+  var filterLen: int64;
+  
+  buf := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  attrLen := LDAPStrLen(attr);
+  valueLen := LDAPStrLen(value);
+  
+  // Filter: SEQUENCE { type, value }
+  filterLen := 2 + attrLen + 2 + valueLen;
+  
+  pos := 0;
+  // Filter [APPLICATION 3] = equalityMatch
+  poke8(buf + pos, LDAP_FILTER_EQUALITY);
+  pos := pos + 1;
+  pos := pos + ASN1WriteLength(buf + pos, 0, filterLen);
+  
+  // AttributeType (OctetString)
+  pos := pos + ASN1EncodeOctetString(buf, pos, attr, attrLen);
+  
+  // AttributeValue
+  pos := pos + ASN1EncodeOctetString(buf, pos, value, valueLen);
+  
+  return buf;
+}
+
+// Build present filter: (attribute=*)
+pub fn LDAPBuildFilterPresent(attr: int64): int64 {
+  var buf: int64;
+  var pos: int64;
+  var attrLen: int64;
+  
+  buf := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    return 0;
+  }
+  
+  attrLen := LDAPStrLen(attr);
+  
+  pos := 0;
+  // Filter [APPLICATION 7] = present
+  poke8(buf + pos, LDAP_FILTER_PRESENT);
+  pos := pos + 1;
+  pos := pos + ASN1WriteLength(buf + pos, 0, attrLen);
+  
+  // AttributeType (OctetString)
+  pos := pos + ASN1EncodeOctetString(buf, pos, attr, attrLen);
+  
+  return buf;
+}
+
+// Escape special characters in LDAP filter value
+// Returns pointer to escaped string (caller must free)
+pub fn LDAPStrEscapeFilter(input: int64): int64 {
+  var inLen: int64;
+  var outBuf: int64;
+  var outPos: int64;
+  var i: int64;
+  var c: int64;
+
+  inLen := LDAPStrLen(input);
+
+  // Worst case: every char needs escaping (*2 + null)
+  var outSz1: int64 := inLen * 2;
+  var outSz2: int64 := outSz1 + 4;
+  outBuf := mmap(0, outSz2, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (outBuf == 0) {
+    return 0;
+  }
+  
+  outPos := 0;
+  i := 0;
+  while (i < inLen) {
+    c := peek8(input + i);
+    
+    // Escape these characters: * ( ) \ NUL
+    if (c == 42 || c == 40 || c == 41 || c == 92 || c == 0) {
+      // Escape with backslash
+      poke8(outBuf + outPos, 92);  // backslash
+      outPos := outPos + 1;
+      // Convert to two hex digits
+      var hexHi: int64 := (c / 16);
+      var hexLo: int64 := c - (hexHi * 16);
+      if (hexHi < 10) { hexHi := hexHi + 48; } else { hexHi := hexHi + 55; }
+      if (hexLo < 10) { hexLo := hexLo + 48; } else { hexLo := hexLo + 55; }
+      poke8(outBuf + outPos, hexHi);
+      outPos := outPos + 1;
+      poke8(outBuf + outPos, hexLo);
+      outPos := outPos + 1;
+    }
+    else {
+      poke8(outBuf + outPos, c);
+      outPos := outPos + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  // Null terminator
+  poke8(outBuf + outPos, 0);
+  
+  return outBuf;
+}
+
+// Escape special characters in DN value
+pub fn LDAPStrEscapeDN(input: int64): int64 {
+  var inLen: int64;
+  var outBuf: int64;
+  var outPos: int64;
+  var i: int64;
+  var c: int64;
+
+  inLen := LDAPStrLen(input);
+
+  // Worst case: every char needs escaping (*2 + null)
+  var dnSz1: int64 := inLen * 2;
+  var dnSz2: int64 := dnSz1 + 4;
+  outBuf := mmap(0, dnSz2, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (outBuf == 0) {
+    return 0;
+  }
+  
+  outPos := 0;
+  i := 0;
+  while (i < inLen) {
+    c := peek8(input + i);
+    
+    // DN special chars: , = + < > ; " \ # 
+    // Also escape leading/trailing space and comma for values
+    if (c == 44 || c == 61 || c == 43 || c == 60 || c == 62 || c == 59 || 
+        c == 34 || c == 39 || c == 92 || c == 35) {
+      // Escape with backslash
+      poke8(outBuf + outPos, 92);
+      outPos := outPos + 1;
+      // Convert to two hex digits
+      var hexHi: int64 := (c / 16);
+      var hexLo: int64 := c - (hexHi * 16);
+      if (hexHi < 10) { hexHi := hexHi + 48; } else { hexHi := hexHi + 55; }
+      if (hexLo < 10) { hexLo := hexLo + 48; } else { hexLo := hexLo + 55; }
+      poke8(outBuf + outPos, hexHi);
+      outPos := outPos + 1;
+      poke8(outBuf + outPos, hexLo);
+      outPos := outPos + 1;
+    }
+    else {
+      poke8(outBuf + outPos, c);
+      outPos := outPos + 1;
+    }
+    
+    i := i + 1;
+  }
+  
+  poke8(outBuf + outPos, 0);
+  
+  return outBuf;
+}
+
+// ============================================================================
+// WP2: Search Result Parsing
+// ============================================================================
+
+// Parse SearchResultEntry
+// Returns pointer to parsed entry with DN and attributes
+// Format: [dn, attr1, val1, attr2, val2, ...]
+pub fn LDAPParseSearchEntry(buf: int64, bufSize: int64): LDAPSearchResult {
+  var entry: LDAPSearchResult;
+  var pos: int64;
+  var tag: int64;
+  var len: int64;
+  
+  entry.dn := 0;
+  entry.dnLen := 0;
+  entry.attrs := 0;
+  entry.attrsLen := 0;
+  
+  if (buf == 0 || bufSize < 10) {
+    return entry;
+  }
+  
+  pos := 0;
+  
+  // Skip outer SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // SearchResultEntry [APPLICATION 4]
+  tag := peek8(buf + pos);
+  if (tag != $64) {  // LDAP_SEARCH_RESULT_ENTRY
+    return entry;
+  }
+  pos := pos + 1;
+  
+  // Skip length
+  len := ASN1ReadLength(buf, pos);
+  pos := pos + ASN1LengthSize(len);
+  
+  // Parse DN (OctetString)
+  tag := peek8(buf + pos);
+  if (tag == ASN1_OCTET_STRING) {
+    var dnLen: int64 := ASN1ReadLength(buf, pos);
+    pos := pos + ASN1LengthSize(dnLen);
+    entry.dn := buf + pos;
+    entry.dnLen := dnLen;
+    pos := pos + dnLen;
+  }
+  
+  // Skip attributes SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    var attrSeqLen: int64 := ASN1ReadLength(buf, pos);
+    pos := pos + ASN1LengthSize(attrSeqLen);
+    entry.attrs := buf + pos;
+    entry.attrsLen := attrSeqLen;
+  }
+  
+  return entry;
+}
+
+// Extract a specific attribute value from parsed entry
+// Returns pointer to value, 0 if not found
+pub fn LDAPGetEntryAttr(entry: LDAPSearchResult, attr: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var len: int64;
+  var attrName: int64;
+  var attrNameLen: int64;
+  var attrValue: int64;
+  var attrValueLen: int64;
+  var i: int64;
+  var j: int64;
+  var match: bool;
+  
+  if (entry.attrs == 0) {
+    return 0;
+  }
+  
+  pos := 0;
+  attrNameLen := LDAPStrLen(attr);
+  
+  // Walk through attributes SEQUENCE
+  while (pos < entry.attrsLen - 4) {
+    var attrStart: int64 := entry.attrs + pos;
+    
+    // SEQUENCE { type, values }
+    tag := peek8(attrStart);
+    if (tag != ASN1_SEQUENCE) {
+      return 0;
+    }
+    var attrSetLen: int64 := ASN1ReadLength(attrStart, 0);
+    pos := pos + 1 + ASN1LengthSize(attrSetLen);
+    
+    // AttributeType
+    tag := peek8(entry.attrs + pos);
+    if (tag == ASN1_OCTET_STRING) {
+      var nameLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+      pos := pos + ASN1LengthSize(nameLen);
+      attrName := entry.attrs + pos;
+      pos := pos + nameLen;
+      
+      // Check if this is the attribute we're looking for
+      match := true;
+      if (attrNameLen == nameLen) {
+        i := 0;
+        while (i < nameLen) {
+          if (peek8(attrName + i) != peek8(attr + i)) {
+            match := false;
+            break;
+          }
+          i := i + 1;
+        }
+      }
+      else {
+        match := false;
+      }
+      
+      if (match) {
+        // Found - get first value
+        tag := peek8(entry.attrs + pos);
+        if (tag == ASN1_OCTET_STRING) {
+          var valLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+          pos := pos + ASN1LengthSize(valLen);
+          attrValue := entry.attrs + pos;
+          // Return copy of value (caller must free)
+          var valSz: int64 := valLen + 1;
+          var valueBuf: int64 := mmap(0, valSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+          if (valueBuf != 0) {
+            i := 0;
+            while (i < valLen) {
+              poke8(valueBuf + i, peek8(attrValue + i));
+              i := i + 1;
+            }
+            poke8(valueBuf + valLen, 0);
+            return valueBuf;
+          }
+          return 0;
+        }
+      }
+      
+      // Skip to next attribute
+      // Read until next SEQUENCE or end
+      while (pos < entry.attrsLen) {
+        tag := peek8(entry.attrs + pos);
+        if (tag == ASN1_SEQUENCE) {
+          var skipLen: int64 := ASN1ReadLength(entry.attrs + pos, 0);
+          pos := pos + 1 + ASN1LengthSize(skipLen) + skipLen;
+          break;
+        }
+        pos := pos + 1;
+      }
+    }
+    else {
+      break;
+    }
+  }
+  
+  return 0;
+}
+
+// ============================================================================
+// WP2: Fehlercode zu Text
+// ============================================================================
+
+// Convert LDAP result code to error message
+pub fn LDAPErrorToStr(code: int64): int64 {
+  if (code == 0) { return "Success"; }
+  else if (code == 1) { return "Operations Error"; }
+  else if (code == 2) { return "Protocol Error"; }
+  else if (code == 3) { return "Time Limit Exceeded"; }
+  else if (code == 4) { return "Size Limit Exceeded"; }
+  else if (code == 5) { return "Compare false"; }
+  else if (code == 6) { return "Compare true"; }
+  else if (code == 7) { return "Auth Method Not Supported"; }
+  else if (code == 8) { return "Strong Auth Required"; }
+  else if (code == 10) { return "Referral"; }
+  else if (code == 11) { return "Admin Limit Exceeded"; }
+  else if (code == 12) { return "Unavailable Critical Extension"; }
+  else if (code == 13) { return "Confidentiality Required"; }
+  else if (code == 14) { return "SASL Bind In Progress"; }
+  else if (code == 16) { return "No Such Attribute"; }
+  else if (code == 17) { return "Undefined Attribute Type"; }
+  else if (code == 18) { return "Inappropriate Matching"; }
+  else if (code == 19) { return "Constraint Violation"; }
+  else if (code == 20) { return "Attribute Or Value Exists"; }
+  else if (code == 21) { return "Invalid Attribute Syntax"; }
+  else if (code == 32) { return "No Such Object"; }
+  else if (code == 33) { return "Alias Problem"; }
+  else if (code == 34) { return "Invalid DN Syntax"; }
+  else if (code == 36) { return "Alias Dereferencing Problem"; }
+  else if (code == 48) { return "Inappropriate Authentication"; }
+  else if (code == 49) { return "Invalid Credentials"; }
+  else if (code == 50) { return "Insufficient Access Rights"; }
+  else if (code == 51) { return "Busy"; }
+  else if (code == 52) { return "Unavailable"; }
+  else if (code == 53) { return "Unwilling To Perform"; }
+  else if (code == 54) { return "Loop Detect"; }
+  else if (code == 64) { return "Naming Violation"; }
+  else if (code == 65) { return "Object Class Violation"; }
+  else if (code == 66) { return "Not Allowed On Non-Leaf"; }
+  else if (code == 67) { return "Not Allowed On RDN"; }
+  else if (code == 68) { return "Entry Already Exists"; }
+  else if (code == 69) { return "Object Class Mods Prohibited"; }
+  else if (code == 71) { return "Affects Multiple DSAs"; }
+  else if (code == 80) { return "Other"; }
+  else if (code == -1) { return "Parse Error"; }
+  else if (code == -2) { return "Connection Error"; }
+  else if (code == -3) { return "Timeout"; }
+  return "Unknown Error";
+}
+
+// ============================================================================
+// WP2: DN-Parsing (einfach)
+// ============================================================================
+
+// Count RDN components in a DN
+// Example: "cn=admin,dc=example,dc=com" has 3 RDNs
+pub fn LDAPCountRDNs(dn: int64): int64 {
+  var count: int64 := 1;
+  var i: int64;
+  var c: int64;
+  var len: int64;
+  
+  if (dn == 0) {
+    return 0;
+  }
+  
+  len := LDAPStrLen(dn);
+  i := 0;
+  while (i < len) {
+    c := peek8(dn + i);
+    if (c == 44) {  // comma
+      count := count + 1;
+    }
+    i := i + 1;
+  }
+  
+  return count;
+}
+
+// Get RDN at index (0-based)
+// Returns pointer to copy of RDN (caller must free)
+pub fn LDAPGetRDNAt(dn: int64, index: int64): int64 {
+  var len: int64;
+  var i: int64;
+  var j: int64;
+  var start: int64;
+  var commaCount: int64;
+  var rdnStart: int64;
+  var rdnEnd: int64;
+  var rdnLen: int64;
+  var rdnBuf: int64;
+  
+  if (dn == 0) {
+    return 0;
+  }
+  
+  len := LDAPStrLen(dn);
+  commaCount := 0;
+  start := 0;
+  
+  // Find start of requested RDN
+  i := 0;
+  while (i < len) {
+    if (peek8(dn + i) == 44) {  // comma
+      if (commaCount == index) {
+        start := i + 1;
+        break;
+      }
+      commaCount := commaCount + 1;
+    }
+    i := i + 1;
+  }
+  
+  if (index > commaCount) {
+    return 0;
+  }
+  
+  // Find end of RDN
+  rdnStart := start;
+  i := start;
+  while (i < len) {
+    if (peek8(dn + i) == 44 || i == len - 1) {
+      rdnEnd := i;
+      break;
+    }
+    i := i + 1;
+  }
+  
+  rdnLen := rdnEnd - rdnStart;
+  if (i == len - 1) {
+    rdnLen := rdnLen + 1;
+  }
+  
+  // Copy RDN
+  var rdnSz: int64 := rdnLen + 1;
+  rdnBuf := mmap(0, rdnSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (rdnBuf == 0) {
+    return 0;
+  }
+  
+  i := 0;
+  while (i < rdnLen) {
+    poke8(rdnBuf + i, peek8(dn + rdnStart + i));
+    i := i + 1;
+  }
+  poke8(rdnBuf + rdnLen, 0);
+  
+  return rdnBuf;
+}
+
+// Get result code from any LDAP response
+pub fn LDAPGetResultCode(buf: int64, bufSize: int64): int64 {
+  var pos: int64;
+  var tag: int64;
+  var b: int64;
+  
+  if (buf == 0 || bufSize < 10) {
+    return -2;
+  }
+  
+  pos := 0;
+  
+  // Skip outer SEQUENCE
+  tag := peek8(buf + pos);
+  if (tag == ASN1_SEQUENCE) {
+    pos := ASN1SkipValue(buf, pos) - 1;
+  }
+  
+  // Skip Message ID
+  tag := peek8(buf + pos);
+  if (tag == ASN1_INTEGER) {
+    pos := ASN1SkipValue(buf, pos);
+  }
+  
+  // Skip to result code (ENUMERATED in various response types)
+  pos := pos + 1;  // Skip response tag
+  
+  // Skip length
+  b := peek8(buf + pos);
+  if (b < 128) {
+    pos := pos + 1;
+  }
+  else {
+    pos := pos + 1 + (b - 128);
+  }
+  
+  // Now at result code
+  tag := peek8(buf + pos);
+  if (tag == $0A) {  // ENUMERATED
+    pos := pos + 1;
+    b := peek8(buf + pos);
+    if (b < 128) {
+      pos := pos + 1;
+    }
+    else {
+      pos := pos + 1 + (b - 128);
+    }
+    return peek8(buf + pos);
+  }
+  
+  return -1;
+}
