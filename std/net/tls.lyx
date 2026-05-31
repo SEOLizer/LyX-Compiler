@@ -19,12 +19,18 @@ unit std.net.tls;
 // loader abort with "undefined symbol", so they are intentionally absent.
 
 // TLS Method and Context
-extern fn TLS_method(): int64 link "libssl.so.3";
+extern fn TLS_client_method(): int64 link "libssl.so.3";
 extern fn SSL_CTX_new(method: int64): int64 link "libssl.so.3";
 extern fn SSL_CTX_free(ctx: int64) link "libssl.so.3";
+extern fn SSL_CTX_ctrl(ctx: int64, cmd: int64, larg: int64, parg: int64): int64 link "libssl.so.3";
 
 // Set default verify paths (for certificate validation)
 extern fn SSL_CTX_set_default_verify_paths(ctx: int64): int64 link "libssl.so.3";
+
+// Hostname verification (WP-2)
+extern fn SSL_get1_peer_certificate(ssl: int64): int64 link "libssl.so.3";
+extern fn X509_check_host(cert: int64, chk: int64, chklen: int64, flags: int64, peername: int64): int64 link "libcrypto.so.3";
+extern fn X509_free(cert: int64) link "libcrypto.so.3";
 
 // SSL object
 extern fn SSL_new(ctx: int64): int64 link "libssl.so.3";
@@ -60,6 +66,10 @@ pub con SSL_VERIFY_NONE: int64 := 0;
 pub con SSL_VERIFY_PEER: int64 := 1;
 pub con X509_V_OK: int64 := 0;
 
+// TLS version constants (WP-2.4)
+con SSL_CTRL_SET_MIN_PROTO_VERSION: int64 := 123;
+pub con TLS1_2_VERSION: int64 := 771;   // 0x0303
+
 // TLS error codes
 pub con TLS_OK: int64 := 0;
 pub con TLS_ERR_INIT: int64 := -1;
@@ -69,6 +79,7 @@ pub con TLS_ERR_CONNECT: int64 := -4;
 pub con TLS_ERR_READ: int64 := -5;
 pub con TLS_ERR_WRITE: int64 := -6;
 pub con TLS_ERR_VERIFY: int64 := -7;
+pub con TLS_ERR_HOSTNAME: int64 := -8;
 
 // TLS Context (opaque wrapper around SSL_CTX*)
 pub type TLSContext = struct {
@@ -94,20 +105,23 @@ pub fn TLSInit(): TLSContext {
   ctx.initialized := 0;
 
   // OpenSSL 3.x initializes itself on first use — no explicit init call needed.
-  // Create TLS context
-  method := TLS_method();
+  // TLS_client_method: explicit client-only context, no DTLS (WP-2.5)
+  method := TLS_client_method();
   if (method == 0) {
     return ctx;
   }
-  
+
   sslCtx := SSL_CTX_new(method);
   if (sslCtx == 0) {
     return ctx;
   }
-  
+
   // Set default certificate verification paths
   SSL_CTX_set_default_verify_paths(sslCtx);
-  
+
+  // Require TLS 1.2 minimum — reject TLS 1.0 and 1.1 (WP-2.4)
+  SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, 0);
+
   ctx.ctx := sslCtx;
   ctx.initialized := 1;
   return ctx;
@@ -160,15 +174,31 @@ pub fn TLSConnect(ctx: TLSContext, fd: int64, hostname: int64): TLSConn {
     return conn;
   }
   
-  // Verify certificate
+  // Verify certificate chain (WP-2.1)
   ret := SSL_get_verify_result(ssl);
   if (ret != X509_V_OK) {
-    // Certificate verification failed
     SSL_shutdown(ssl);
     SSL_free(ssl);
     return conn;
   }
-  
+
+  // Hostname verification against SubjectAltName / CommonName (WP-2.2 + 2.3)
+  if (hostname != 0) {
+    var cert: int64 := SSL_get1_peer_certificate(ssl);
+    if (cert == 0) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      return conn;
+    }
+    var hostOk: int64 := X509_check_host(cert, hostname, 0, 0, 0);
+    X509_free(cert);
+    if (hostOk != 1) {
+      SSL_shutdown(ssl);
+      SSL_free(ssl);
+      return conn;
+    }
+  }
+
   conn.ssl := ssl;
   conn.fd := fd;
   conn.connected := 1;
