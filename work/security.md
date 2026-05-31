@@ -1,0 +1,650 @@
+# Sicherheits-Fahrplan — Aurum/Lyx
+
+> Erstellt: 2026-05-31 (Security Audit)
+> Status: ⬜ geplant | 🔄 in Arbeit | ✅ erledigt
+
+---
+
+## Gesamtübersicht
+
+| Phase | Schwerpunkt | WPs | Aufwand | Status |
+|-------|------------|-----|---------|--------|
+| 1 | 🔴 Kritische Sicherheitslücken | WP-1 – WP-4 | ~11–14 Tage | ⬜ |
+| 2 | 🟠 Hohe Sicherheitsrisiken | WP-5 – WP-11 | ~12–14 Tage | ⬜ |
+| 3 | 🟡 Mittelstufe | WP-12 – WP-17 | ~6–8 Tage | ⬜ |
+| 4 | 🔵 Langfristig / Niedrig | WP-18 – WP-22 | ~10–14 Tage | ⬜ |
+
+**Kritischer Pfad:** WP-1 → (parallel: WP-2, WP-3, WP-4) → WP-5 → WP-6 → WP-8
+
+---
+
+## Phase 1 — 🔴 Kritische Sicherheitslücken (sofort handeln)
+
+---
+
+### WP-1: Kryptografische Hash-Funktionen korrigieren
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/hash.lyx` |
+| **Aufwand** | 5–7 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ⬜ |
+
+**Problem:** Alle Passwort-Hashing-Funktionen (BCrypt, Argon2, PBKDF2, SHA-256, MD5) sind nicht-funktionale Stubs.
+FNV-1a (nicht-kryptografisch) wird in ALLEN Hash-Funktionen verwendet.
+`GenerateSalt()` ist deterministisch (kein Zufall).
+`HashPassword` (1000 Iterationen) und `HashPasswordSimple` (100 Iterationen FNV-1a) sind in Sekunden geknackt.
+Kein constant-time Vergleich für Byte-Arrays vorhanden.
+
+**Teilschritte:**
+
+- [ ] **1.1** SHA-256 korrekt implementieren:
+      - 512-Bit Blöcke, Message Schedule W[0..63], 64 Runden
+      - Korrektes Padding nach FIPS 180-4 (Längen-Bits am Ende)
+      - Verifikation mit NIST CAVP-Testvektoren
+- [ ] **1.2** SHA-384/512 (SHA-2 Familie) analog korrigieren
+- [ ] **1.3** HMAC-SHA256 korrekt implementieren (RFC 2104):
+      - ipad/opad-Konstruktion, doppelte Hash-Operation
+      - Verifikation mit RFC 4231-Testvektoren
+- [ ] **1.4** PBKDF2-HMAC-SHA256 korrekt implementieren (RFC 2898):
+      - DK-Blöcke (je Hash-Länge), XOR-Faltung, HMAC in der Schleife
+      - Verifikation mit RFC 6070-Testvektoren
+- [ ] **1.5** BCrypt korrekt implementieren oder per FFI anbinden:
+      - EksBlowfish mit P-Array (18×32 Bit) + S-Boxen (4×256×32 Bit)
+      - Cost-Faktor ≥ 10, Salt aus CSPRNG
+      - Oder: FFI an `libbcrypt`/`libsodium`
+- [ ] **1.6** Argon2id korrekt implementieren oder per FFI anbinden:
+      - BLAKE2b als Grundelement, memory-hard Segmente
+      - Oder: FFI an `libsodium` (`crypto_pwhash`)
+- [ ] **1.7** `GenerateSalt()` durch echten CSPRNG ersetzen:
+      - `getrandom()`-Syscall (Linux 3.17+) oder `/dev/urandom`
+- [ ] **1.8** FNV-1a aus allen kryptografischen Kontexten entfernen
+- [ ] **1.9** Constant-Time Compare für Byte-Arrays jeder Länge:
+      - XOR-über alle Bytes, Ergebnis prüfen, kein early-exit
+- [ ] **1.10** `HashPassword` / `HashPasswordSimple` ersetzen oder als unsicher markieren
+
+**Definition of Done:**
+- SHA-256("abc") = `ba7816bf8f01cfea414140de5dae2ec73b00361bbef0469121afc7f88ac2e7a`
+- HMAC-SHA256 mit RFC 4231-Testvektoren bestanden
+- PBKDF2 mit 1000 Iterationen erzeugt korrekte RFC 6070-Vektoren
+- BCrypt kann existierende `$2b$`-Hashes verifizieren
+- Timing-safe Compare ist implementiert und getestet
+- Kein FNV-1a mehr in Passwort-Funktionen
+
+---
+
+### WP-2: TLS-Hostname-Verifikation einbauen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/tls.lyx`, `std/net/https.lyx` |
+| **Aufwand** | 2 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ⬜ |
+
+**Problem:** Nach dem SSL-Handshake wird nur `SSL_get_verify_result()` geprüft.
+Die Zertifikatskette wird validiert, aber **NIEMALS** der Hostname gegen SubjectAltName/CommonName.
+Ein Angreifer mit *irgendeinem* gültigen TLS-Zertifikat kann MITM auf ALLE HTTPS-Verbindungen durchführen.
+Zusätzlich: `TLS_method()` statt `TLS_client_method()` aktiviert fälschlich DTLS.
+Keine TLS-Versionseinschränkung (TLS 1.0/1.1 sind noch erlaubt).
+
+**Teilschritte:**
+
+- [ ] **2.1** `SSL_get1_peer_certificate()` nach erfolgreichem Handshake aufrufen
+- [ ] **2.2** `X509_check_host()` mit angefragtem Hostnamen aufrufen
+- [ ] **2.3** Bei Fehler: Verbindung abbrechen + Fehlermeldung "hostname mismatch"
+- [ ] **2.4** TLS-Minimum-Version auf TLS 1.2 setzen (`SSL_CTX_set_min_proto_version`)
+- [ ] **2.5** `TLS_method()` durch `TLS_client_method()` ersetzen
+- [ ] **2.6** HTTPS-Integrationstests schreiben:
+      - Erfolg: `example.com` mit gültigem Cert
+      - Fehler: `example.com` mit Cert für `attacker.com`
+
+**Definition of Done:**
+- Hostname-Verifikation schlägt fehl bei nicht-match
+- TLS 1.0/1.1 werden abgelehnt
+- Kein DTLS mehr fälschlich aktiviert
+
+---
+
+### WP-3: SSH-Host-Key-Verifikation einbauen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/ssh.lyx` |
+| **Aufwand** | 2 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ⬜ |
+
+**Problem:** `libssh2_session_handshake()` wird aufgerufen, ohne danach den Host Key zu prüfen.
+Es gibt keinen Aufruf von `libssh2_knownhost_check()` oder `libssh2_session_hostkey()`.
+Jede SSH-Verbindung akzeptiert stillschweigend jeden beliebigen Host Key (MITM).
+Nur Passwort-Auth, keine Public-Key-Authentifizierung.
+CPU-Spin (Busy-Wait) beim Warten auf Output.
+
+**Teilschritte:**
+
+- [ ] **3.1** `libssh2_session_hostkey()` nach Handshake aufrufen
+- [ ] **3.2** `libssh2_knownhost_init()` + `libssh2_knownhost_readfile()` für `~/.ssh/known_hosts`
+- [ ] **3.3** `libssh2_knownhost_check()` gegen erhaltenen Host Key
+- [ ] **3.4** Bei unbekanntem Host: TOFU oder Fehler + Fingerprint
+- [ ] **3.5** Public-Key-Auth als Option: `libssh2_userauth_publickey_fromfile_ex()`
+- [ ] **3.6** Busy-Wait durch `poll()`/`select()` auf Socket ersetzen
+
+**Definition of Done:**
+- Bekannter Host → erfolgreiche Verbindung
+- Unbekannter / falscher Key → Abbruch
+- Public-Key-Auth funktioniert
+- Kein CPU-Spin mehr
+
+---
+
+### WP-4: MongoDB-Treiber absichern
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/mongo.lyx` |
+| **Aufwand** | 2–3 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ⬜ |
+
+**Problem:** Auth-Konstanten definiert aber nie implementiert.
+Nur unverschlüsseltes TCP, kein TLS.
+`MongoDocAddString` ist ein Dummy (gibt immer 0 zurück).
+`MONGO_AUTH_PLAIN` würde Credentials im Klartext senden.
+
+**Teilschritte:**
+
+- [ ] **4.1** TLS-Connect für MongoDB (Wrapper um `tls.lyx`, abhängig von WP-2)
+- [ ] **4.2** SCRAM-SHA-256-Authentifizierung (RFC 7677)
+- [ ] **4.3** `MongoDocAddString` korrekt implementieren (BSON-Encoding)
+- [ ] **4.4** `MONGO_AUTH_PLAIN` ohne TLS automatisch ablehnen
+- [ ] **4.5** `MongoPool` implementieren oder als stub dokumentieren
+
+**Alternative:** Modul als "unfertig – nicht für Produktion" dokumentieren.
+
+**Definition of Done:**
+- TLS-Verbindung mit Auth → Erfolg
+- PLAIN ohne TLS → Fehler
+- BSON-Serialisierung funktioniert korrekt
+
+---
+
+## Phase 2 — 🟠 Hohe Sicherheitsrisiken (dringend)
+
+---
+
+### WP-5: Gefährliche FFI-Externs absichern
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/frontend/ffi_parser.lyx` |
+| **Aufwand** | 1–2 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** `system()`, `sprintf()`, `gets()`, `strcpy()`, `strcat()` aus libc sind als FFI-Externs registriert.
+Jedes Lyx-Programm kann damit beliebige Shell-Kommandos ausführen – ohne Sandbox, ohne Validation.
+
+**Teilschritte:**
+
+- [ ] **5.1** `system()` als Extern entfernen oder hinter `unsafe`-Flag verstecken
+- [ ] **5.2** `sprintf()`, `gets()` als Extern entfernen
+- [ ] **5.3** `strcpy()`, `strcat()` durch sichere Alternativen ersetzen (`strlcpy`/`strlcat`)
+- [ ] **5.4** Prüfen, ob Stdlib `system()`/`execve()` verwendet; ggf. sichere Wrapper bauen
+
+**Definition of Done:**
+- `system()` nicht mehr direkt aus Lyx aufrufbar
+- `sprintf`/`gets` entfernt
+- String-Kopien nutzen size-bewusste Funktionen
+
+---
+
+### WP-6: W^X für generierte ELF-Binaries
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/lyxc.lyx`, `src/backend/elf/write_elf.lyx` |
+| **Aufwand** | 2–3 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** Generierte ELF-Dateien haben RWX-Programmheaders (`PF_R | PF_W | PF_X`).
+Code, Stack und Heap in derselben ausführbaren Region – W^X verletzt.
+Buffer-Overflow führt direkt zu Code-Execution.
+Kein PIE (Position Independent Executable) → ASLR unwirksam.
+
+**Teilschritte:**
+
+- [ ] **6.1** PT_LOAD in zwei Segmente aufteilen: RX (Code) + RW (Daten)
+- [ ] **6.2** `.text` → RX-Segment, `.data`/`.bss` → RW-Segment
+- [ ] **6.3** PIE-Unterstützung einbauen (Relocation-Tables)
+- [ ] **6.4** Bestehende Programme/Tests mit neuen Einstellungen testen
+
+**Risiko:** PIE erfordert Relocation-Tables, die der Compiler noch nicht vollständig unterstützt.
+
+**Definition of Done:**
+- `readelf -l` zeigt getrennte LOAD-Segmente mit RX und RW
+- `checksec --elf` zeigt "No execute" und "PIE enabled"
+- Alle Tests laufen durch
+
+---
+
+### WP-7: Path Traversal in File-Operationen verhindern
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/sema.lyx`, `src/codegen_x86.lyx`, `std/fs.lyx` |
+| **Aufwand** | 1 Tag |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** Compiler öffnet Dateien aus `import`-Anweisungen ohne Prüfung auf `..`-Traversal.
+Ein bösartiges `.lyx`-File könnte beliebige Dateien lesen.
+
+**Teilschritte:**
+
+- [ ] **7.1** `_sema_readFile()` auf `..`-Komponenten prüfen
+- [ ] **7.2** `_cg_readFile()` analog absichern
+- [ ] **7.3** Stdlib-File-Operationen (`FileExists`, `Mkdir`, `Remove`, etc.) auf `..` prüfen
+
+**Definition of Done:**
+- `import ../../../etc/passwd` wird mit Fehler abgewiesen
+- Normale relative Imports funktionieren weiter
+
+---
+
+### WP-8: SQL Injection in DB-Treibern schließen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/db/mysql.lyx`, `std/db/postgres.lyx`, `std/db/sqlite.lyx` |
+| **Aufwand** | 3–4 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** MySQL: `MySQLQuery()` sendet rohes SQL per `COM_QUERY`.
+PostgreSQL: `PGDropTable()`, `PGTableExists()` bauen SQL per String-Konkatenation.
+SQLite: `SQLiteDropTable()` konkateniert Tabellennamen direkt.
+Keine Prepared Statements als Default.
+
+**Teilschritte:**
+
+- [ ] **8.1** MySQL: `MySQLQuery()` deprecated; `MySQLExecutePrepared()` als Standard
+- [ ] **8.2** PostgreSQL: `PGQueryParam()` mit Extended Query / Parametern
+- [ ] **8.3** PostgreSQL: `PGDropTable()`, `PGColumnExists()`, `PGTableExists()` auf Parameter umstellen
+- [ ] **8.4** SQLite: `SQLiteExecParam()` (Wrapper um `sqlite3_bind_*`)
+- [ ] **8.5** SQLite: `SQLiteDropTable()`, `SQLiteSetJournalMode()` auf Parameter umstellen
+- [ ] **8.6** Alle String-Konkatenationen in SQL-Kontexten eliminieren
+- [ ] **8.7** Integrationstests mit bösartigen Eingaben
+
+**Definition of Done:**
+- `MySQLQuery("... WHERE name = '" + name + "'")` abgefangen
+- `PGDropTable(conn, "users; DROP TABLE admins --")` löscht nur users
+- SQLite-Parameter-Queries arbeiten korrekt
+
+---
+
+### WP-9: HTTP-Client absichern
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/http.lyx` |
+| **Aufwand** | 2 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** `HTTPGet`/`HTTPPost` validieren weder Host noch Path.
+CR/LF-Injection (Request Smuggling) und Path Traversal möglich.
+Buffer fix auf 4KB (Request) bzw. 8KB (Response) → Truncation.
+
+**Teilschritte:**
+
+- [ ] **9.1** Host auf erlaubte Zeichen validieren (kein CR/LF)
+- [ ] **9.2** Path auf CR/LF-Injection prüfen (Ablehnung bei `\r`/`\n`)
+- [ ] **9.3** Request-Buffer dynamisch allozieren (Start 4KB, wachsen bei Bedarf)
+- [ ] **9.4** Response-Buffer: `Content-Length` auswerten und in Schleife lesen
+- [ ] **9.5** Timeout für Response-Lesen implementieren
+
+**Definition of Done:**
+- HTTP-Anfrage mit `\r\n` im Path wird abgewiesen
+- Responses > 8KB werden vollständig gelesen
+
+---
+
+### WP-10: Integer-Overflow-Prüfungen einbauen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/sema.lyx`, `src/codegen_x86.lyx`, `src/lyxc.lyx`, `src/crypto/lic_hmac.lyx` |
+| **Aufwand** | 2 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** `len + 1`, `cnt * fieldSize`, `shnum * 64`, `inLen * 8` – mehrfach ohne Overflow-Prüfung.
+Bei manipulierten Eingaben kann daraus eine kleine oder negative Allokation resultieren.
+
+**Teilschritte:**
+
+- [ ] **10.1** `len + 1` → Prüfung auf `len == MAX_INT64`
+- [ ] **10.2** `cnt * fieldSize` → Prüfung auf Overflow (Division oder `__builtin_mul_overflow`)
+- [ ] **10.3** `inLen * 8` (Bit-Längen) → Prüfung auf `inLen > MAX_INT64 / 8`
+- [ ] **10.4** `shnum * 64` → Prüfung auf sinnvolles Maximum (`shnum < 65536`)
+
+**Definition of Done:**
+- Bei potentiell überlaufender Größe kommt Fehler, kein Absturz
+- Alle kritischen Multiplikationen/Additionen sind geprüft
+
+---
+
+### WP-11: Redis-Treiber korrigieren
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/db/redis.lyx` |
+| **Aufwand** | 1 Tag |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** `RedisConnect()` ignoriert `host`-Parameter → immer nur localhost.
+`RedisLRange()` sendet hardcodierte "0"/"-1" statt Parameter.
+`RedisHIncrBy()` hardcodet increment auf "1".
+`RedisZAdd()` hardcodet score "100" / member "player1".
+Empfangsbuffer nur 512 Bytes → Datenstummelung.
+
+**Teilschritte:**
+
+- [ ] **11.1** `RedisConnect()`: `host`-Parameter an Socket-Adresse weitergeben
+- [ ] **11.2** `RedisLRange()`: Start/Stop-Parameter statt Hardcodierung
+- [ ] **11.3** `RedisHIncrBy()`: increment-Parameter statt "1"
+- [ ] **11.4** `RedisZAdd()`: score + member-Parameter statt Hardcodierung
+- [ ] **11.5** Empfangsbuffer auf 64KB erhöhen oder dynamisch machen
+
+**Definition of Done:**
+- `RedisConnect("myhost", 6379)` verbindet zu myhost
+- Keine hardcodierten Werte mehr in Redis-Befehlen
+
+---
+
+## Phase 3 — 🟡 Mittelstufe
+
+---
+
+### WP-12: SMTP mit TLS und Header-Sanitisierung
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/smtp.lyx` |
+| **Aufwand** | 2 Tage |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** Kein STARTTLS – Credentials (AUTH) gehen im Klartext.
+From/To/Subject werden roh in Header kopiert → CRLF-Injection.
+
+**Teilschritte:**
+
+- [ ] **12.1** STARTTLS (Port 25 → EHLO → STARTTLS → TLS)
+- [ ] **12.2** SMTPS (Port 465, direkt TLS)
+- [ ] **12.3** From/To/Subject auf CRLF-Injection prüfen
+- [ ] **12.4** AUTH nur über TLS erlauben
+
+**Definition of Done:**
+- E-Mail-Versand über STARTTLS funktioniert
+- Header mit `\r\n` werden abgewiesen/escaped
+- Klartext-AUTH ohne TLS wird verweigert
+
+---
+
+### WP-13: Crypto-Memory sicher löschen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/crypto/lic_hmac.lyx`, `src/crypto/lic_secret.lyx` |
+| **Aufwand** | 1 Tag |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** SHA-256-State, HMAC-Keys und gepaddete Blöcke werden per `munmap` freigegeben ohne vorheriges Zeroing.
+Compiler könnte Zeroing-Stores wegoptimieren (keine Memory Barrier).
+
+**Teilschritte:**
+
+- [ ] **13.1** `explicit_bzero()`/`memset_s()` oder Compiler-Barriere vor munmap
+- [ ] **13.2** `__sync_synchronize()` nach Zeroing gegen Optimierung
+- [ ] **13.3** Alle Fehlerpfade in `lic_sha256`/`lic_hmacSha256` auf korrektes Cleanup prüfen
+
+**Definition of Done:**
+- Nach `lic_hmacSha256` sind alle temporären Buffer genullt
+- Assembly-Check bestätigt: Zeroing wird nicht wegoptimiert
+
+---
+
+### WP-14: DNS-Parser mit Größenlimits
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `std/net/dns.lyx` |
+| **Aufwand** | 1 Tag |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** DNS-Response-Parsing ohne obere Schranke bei Domain-Name-Decompression.
+Potentieller Buffer-Overread / Loop-Angriff via zirkuläre Pointer.
+
+**Teilschritte:**
+
+- [ ] **14.1** Max 255 Bytes pro Domain-Name (RFC 1035)
+- [ ] **14.2** Max 100 Pointer (gegen Loop-Angriffe)
+- [ ] **14.3** Max Response-Größe 65535 Bytes (DNS-UDP-Limit)
+
+**Definition of Done:**
+- Zirkuläre Pointer werden erkannt und abgewiesen
+- Domain > 255 Zeichen → Fehler
+
+---
+
+### WP-15: Constant-Time Crypto für HMAC
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/crypto/lic_hmac.lyx`, `src/crypto/lic_derive.lyx` |
+| **Aufwand** | 1–2 Tage |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** HMAC-Vergleiche und Schlüsselableitung sind potentiell nicht constant-time.
+Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
+
+**Teilschritte:**
+
+- [ ] **15.1** Alle HMAC-Vergleiche auf constant-time prüfen (kein early-exit)
+- [ ] **15.2** Zeitlich konstanter Speicherzugriff im SHA-256-Kernel
+
+**Definition of Done:**
+- HMAC-Vergleich 32 Bytes braucht immer gleiche Zeit
+- Keine branch-on-secret-data im SHA-256-Kernel
+
+---
+
+### WP-16: `gen_lic_secret.py` sicherer machen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `tools/gen_lic_secret.py` |
+| **Aufwand** | 0.5 Tage |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** Das generierte Master-Secret wird ans Terminal ausgegeben (Scrollback, Logs, History).
+
+**Teilschritte:**
+
+- [ ] **16.1** Secret in Datei mit 600er-Permissions schreiben (statt stdout)
+- [ ] **16.2** Optional Direktausgabe mit verstärkter Warnung
+
+**Definition of Done:**
+- Secret landet nicht mehr ungeschützt in Terminal-History
+
+---
+
+### WP-17: Teilimplementierte Annotationen dokumentieren
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `COMPILER_MANUAL.md`, ggf. `doc/` |
+| **Aufwand** | 0.5 Tage |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** `@redundant`, `@big_endian` sind nur auf Parser-Level implementiert, haben kein Codegen.
+Wer sie nutzt, bekommt einen falschen Sicherheitseindruck.
+
+**Teilschritte:**
+
+- [ ] **17.1** In der Doku klarstellen: "Parser-Level only, kein Codegen"
+- [ ] **17.2** ggf. Compiler-Warnung bei Verteilung dieser Annotationen
+
+**Definition of Done:**
+- Doku erwähnt explizit den Implementierungsstatus jeder Annotation
+
+---
+
+## Phase 4 — 🔵 Langfristig / Niedrige Priorität
+
+---
+
+### WP-18: Stack-Canaries in generierte ELFs einbauen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/codegen_x86.lyx`, `src/backend/*` |
+| **Aufwand** | 3–5 Tage (Forschung) |
+| **Priorität** | 🔵 Niedrig |
+| **Status** | ⬜ |
+
+**Problem:** Generierte Binaries haben keinen Stack-Schutz (Canaries).
+Buffer-Overflow auf dem Stack führt direkt zu Code-Execution.
+
+---
+
+### WP-19: ARM64-Dynamic-Linking-Bugs fixen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/backend/arm64/` |
+| **Aufwand** | 2–3 Tage |
+| **Priorität** | 🔵 Niedrig |
+| **Status** | ⬜ |
+
+**Referenz:** `todo.md` – offene PLT/GOT-Bugs im ARM64-Backend.
+
+---
+
+### WP-20: `.meta_safe` CRC32-Code-Integrität implementieren
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/lyxc.lyx`, `std/meta_safe.lyx` |
+| **Aufwand** | 3–4 Tage |
+| **Priorität** | 🔵 Niedrig |
+| **Status** | ⬜ |
+
+**Problem:** Runtime-Code-Integritätsprüfung (CRC32) ist geplant aber nicht implementiert.
+
+---
+
+### WP-21: Debug-Datei aus dem Repo entfernen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/s1-debug.md` |
+| **Aufwand** | 0.1 Tage |
+| **Priorität** | 🔵 Niedrig |
+| **Status** | ⬜ |
+
+**Problem:** Enthält Memory-Dumps und Debug-Info, die einem Angreifer nützen könnten.
+
+---
+
+### WP-22: Automatisierte Security-Tests im CI
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `.github/workflows/ci.yml`, `tests/security/` |
+| **Aufwand** | 2–3 Tage |
+| **Priorität** | 🔵 Niedrig |
+| **Status** | ⬜ |
+
+**Vorschläge:**
+- Regressionstests für WP-1 (Testvektoren)
+- Integrationstests für WP-2, WP-3 (MITM erkennen)
+- Fuzzing-Tests für WP-7, WP-10, WP-14
+- SAST-Scanner für WP-5 (gefährliche FFI-Externs)
+
+---
+
+## Anhang: Ursprüngliche Fundstellen (Referenz)
+
+Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sind:
+
+| # | Fundort | Zeilen | Kurzbeschreibung |
+|---|---------|--------|------------------|
+| 1 | `src/frontend/ffi_parser.lyx` | 410–506 | `system()`, `sprintf()`, `gets()`, `strcpy()`, `execve()` als FFI-Externs |
+| 2 | `src/lyxc.lyx` | 2523–2524 | RWX-Programmheader (`PF_R | PF_W | PF_X`) |
+| 3 | `src/backend/elf/write_elf.lyx` | 426 | RWX-Programmheader |
+| 4 | `src/lyxc.lyx` | 2499, 2528 | Feste Base-Adresse 0x401000 (kein PIE) |
+| 5 | `src/sema.lyx` | 553–596 | Path Traversal in `_sema_readFile()` |
+| 6 | `src/codegen_x86.lyx` | 7133–7140 | Path Traversal in `_cg_readFile()` |
+| 7 | `src/sema.lyx` | 441, 591 | Integer Overflow (`len + 1`) |
+| 8 | `src/codegen_x86.lyx` | 1997, 2151, 2229, 3095 | Integer Overflow (`cnt * size`) |
+| 9 | `src/lyxc.lyx` | 1714, 2201, 3972 | Integer Overflow / Buffer ohne Bounds-Check |
+| 10 | `src/crypto/lic_hmac.lyx` | 96–157 | Kein Zeroing von Crypto-Memory |
+| 11 | `src/crypto/lic_hmac.lyx` | 142 | Integer Overflow (`inLen * 8`) |
+| 12 | `src/lyu_reader.lyx` | 24–51, 131–143 | Keine obere Schranke bei .lyu-Parsing |
+| 13 | `std/hash.lyx` | 196–238 | SHA-256 bricht nach 1 Byte/Runde ab, kein Padding |
+| 14 | `std/hash.lyx` | 244–273 | `HashPassword`/`HashPasswordSimple` unsicher |
+| 15 | `std/hash.lyx` | 1553–1880 | BCrypt/Argon2/PBKDF2/Scrypt alles Stubs |
+| 16 | `std/hash.lyx` | 1898–1910 | `GenerateSalt` deterministisch |
+| 17 | `std/net/tls.lyx` | 89–99 | Fehlende Hostname-Verifikation |
+| 18 | `std/net/https.lyx` | 52–56, 120–124 | Fehlende Hostname-Verifikation (geerbt) |
+| 19 | `std/net/ssh.lyx` | 105–112 | Fehlende Host-Key-Prüfung |
+| 20 | `std/net/mongo.lyx` | 42–53, 90, 152–153 | Kein TLS, kein Auth |
+| 21 | `std/net/http.lyx` | 59–60, 115–145 | Keine URL-Validierung, fixe Buffer |
+| 22 | `std/net/smtp.lyx` | (alle) | Kein TLS, Header-Injection |
+| 23 | `std/net/dns.lyx` | (alle) | Keine Größenlimits beim Parsing |
+| 24 | `std/db/mysql.lyx` | 446, 642 | SQL Injection (`COM_QUERY`) |
+| 25 | `std/db/postgres.lyx` | 525–527, 494–496 | SQL Injection (String-Konkatenation) |
+| 26 | `std/db/sqlite.lyx` | 150 | SQL Injection (`sqlite3_exec` roh) |
+| 27 | `std/db/redis.lyx` | ~99 | `RedisConnect` ignoriert `host`-Parameter |
+| 28 | `tools/gen_lic_secret.py` | 69–71 | Secret-Ausgabe auf Console |
+| 29 | `src/s1-debug.md` | (alle) | Debug-Datei mit Memory-Dumps |
+
+---
+
+## Bearbeitungsstatus
+
+| WP | Titel | Status | Verantwortlich | Start | Ende |
+|----|-------|--------|----------------|-------|------|
+| 1 | Kryptografische Hash-Funktionen korrigieren | ⬜ | – | – | – |
+| 2 | TLS-Hostname-Verifikation | ⬜ | – | – | – |
+| 3 | SSH-Host-Key-Verifikation | ⬜ | – | – | – |
+| 4 | MongoDB-Treiber absichern | ⬜ | – | – | – |
+| 5 | Gefährliche FFI-Externs | ⬜ | – | – | – |
+| 6 | W^X für ELF-Binaries | ⬜ | – | – | – |
+| 7 | Path Traversal verhindern | ⬜ | – | – | – |
+| 8 | SQL Injection schließen | ⬜ | – | – | – |
+| 9 | HTTP-Client absichern | ⬜ | – | – | – |
+| 10 | Integer-Overflow-Prüfungen | ⬜ | – | – | – |
+| 11 | Redis-Treiber korrigieren | ⬜ | – | – | – |
+| 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – |
+| 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – |
+| 14 | DNS-Parser mit Limits | ⬜ | – | – | – |
+| 15 | Constant-Time Crypto | ⬜ | – | – | – |
+| 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – |
+| 17 | Teilimplementierte Annotationen dokumentieren | ⬜ | – | – | – |
+| 18 | Stack-Canaries | ⬜ | – | – | – |
+| 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – |
+| 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – |
+| 21 | Debug-Datei entfernen | ⬜ | – | – | – |
+| 22 | Security-Tests im CI | ⬜ | – | – | – |

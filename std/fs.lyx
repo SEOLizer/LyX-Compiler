@@ -60,6 +60,19 @@ con SYS_EXIT: int64 := 60;
 // Wrapper-Funktionen sind nicht nötig; die Hilfsfunktionen unten nutzen sie direkt.
 // ============================================================================
 
+// Directory open flag
+pub con O_DIRECTORY: int64 := 65536;  // 0200000 octal — open must be a directory
+
+// Directory entry types (d_type field from getdents64)
+pub con DT_UNKNOWN: int64 := 0;
+pub con DT_FIFO:    int64 := 1;
+pub con DT_CHR:     int64 := 2;
+pub con DT_DIR:     int64 := 4;
+pub con DT_BLK:     int64 := 6;
+pub con DT_REG:     int64 := 8;
+pub con DT_LNK:     int64 := 10;
+pub con DT_SOCK:    int64 := 12;
+
 // ============================================================================
 // Konstanten für lseek
 // ============================================================================
@@ -458,6 +471,145 @@ pub fn PathBase(dest: pchar, path: pchar): pchar {
   }
   StrSetChar(dest, j, 0);
   return dest;
+}
+
+// ============================================================================
+// Directory Listing — v0.3.2
+// ============================================================================
+//
+// DirList returns an opaque handle (mmap'd buffer) with this layout:
+//   [0..7]  count      int64 — number of entries (excludes . and ..)
+//   [8..15] totalSize  int64 — full buffer size (needed for DirFree)
+//   [16..]  entries    — each entry:
+//             [+0..+7]  nameLen  int64
+//             [+8]      type     byte  (DT_* constant)
+//             [+9..]    name     bytes (nameLen bytes, null-terminated)
+//
+// Usage:
+//   var d: int64 := DirList("/tmp");
+//   var n: int64 := DirEntryCount(d);
+//   var t: int64 := DirEntryType(d, "foo.txt", 7);
+//   DirFree(d);
+
+con DIR_BUF_CAPACITY: int64 := 524288;   // 512 KB — max total result buffer
+con DIR_RAW_BUF_SIZE: int64 := 32768;    // 32 KB — getdents64 read chunk
+
+pub fn DirList(path: pchar): int64 {
+  var dirfd: int64 := open(path, O_RDONLY | O_DIRECTORY, 0);
+  if (dirfd < 0) {
+    return 0;
+  }
+
+  var rawBuf: int64 := mmap(0, DIR_RAW_BUF_SIZE, 3, 34, -1, 0);
+  var resBuf: int64 := mmap(0, DIR_BUF_CAPACITY, 3, 34, -1, 0);
+  var resPos: int64 := 16;  // skip count(8) + totalSize(8)
+  var count:  int64 := 0;
+
+  while (true) {
+    var nRead: int64 := getdents64(dirfd, rawBuf, DIR_RAW_BUF_SIZE);
+    if (nRead <= 0) {
+      break;
+    }
+
+    var pos: int64 := 0;
+    while (pos < nRead) {
+      var entryLen: int64 := peek16(rawBuf + pos + 16);
+      if (entryLen <= 0) {
+        break;
+      }
+
+      var namePtr:   int64 := rawBuf + pos + 19;
+      var firstChar: int64 := peek8(namePtr);
+
+      // Skip . and ..
+      if (firstChar != 46) {
+        var dType:   int64 := peek8(rawBuf + pos + 18);
+        var nameLen: int64 := 0;
+        while (peek8(namePtr + nameLen) != 0) {
+          nameLen := nameLen + 1;
+        }
+
+        // Guard against buffer overflow
+        if (resPos + 8 + 1 + nameLen + 1 < DIR_BUF_CAPACITY) {
+          poke64(resBuf + resPos, nameLen);
+          resPos := resPos + 8;
+          poke8(resBuf + resPos, dType);
+          resPos := resPos + 1;
+          var i: int64 := 0;
+          while (i < nameLen) {
+            poke8(resBuf + resPos + i, peek8(namePtr + i));
+            i := i + 1;
+          }
+          poke8(resBuf + resPos + nameLen, 0);
+          resPos := resPos + nameLen + 1;
+          count := count + 1;
+        }
+      }
+
+      pos := pos + entryLen;
+    }
+  }
+
+  close(dirfd);
+  munmap(rawBuf, DIR_RAW_BUF_SIZE);
+
+  poke64(resBuf,     count);
+  poke64(resBuf + 8, DIR_BUF_CAPACITY);
+  return resBuf;
+}
+
+// Returns the number of entries in a DirList result (excludes . and ..)
+pub fn DirEntryCount(dirlist: int64): int64 {
+  if (dirlist == 0) {
+    return 0;
+  }
+  return peek64(dirlist);
+}
+
+// Returns the DT_* type of the named entry, or DT_UNKNOWN if not found.
+// nameLen must match the exact byte length of name (without null terminator).
+pub fn DirEntryType(dirlist: int64, name: pchar, nameLen: int64): int64 {
+  if (dirlist == 0) {
+    return DT_UNKNOWN;
+  }
+  var count:  int64 := peek64(dirlist);
+  var pos:    int64 := 16;
+  var found:  int64 := 0;
+  var eLen:   int64 := 0;
+  var eType:  int64 := 0;
+  var mismatch: int64 := 0;
+  var i:      int64 := 0;
+  while (found < count) {
+    eLen  := peek64(dirlist + pos);
+    pos   := pos + 8;
+    eType := peek8(dirlist + pos);
+    pos   := pos + 1;
+    if (eLen == nameLen) {
+      mismatch := 0;
+      i := 0;
+      while (i < nameLen) {
+        if (peek8(dirlist + pos + i) != peek8(name + i)) {
+          mismatch := 1;
+          break;
+        }
+        i := i + 1;
+      }
+      if (mismatch == 0) {
+        return eType;
+      }
+    }
+    pos   := pos + eLen + 1;
+    found := found + 1;
+  }
+  return DT_UNKNOWN;
+}
+
+// Releases the memory allocated by DirList.
+pub fn DirFree(dirlist: int64): void {
+  if (dirlist != 0) {
+    var totalSize: int64 := peek64(dirlist + 8);
+    munmap(dirlist, totalSize);
+  }
 }
 
 // JoinHoch / Resolve: kombiniert Basis-Pfad mit relativem Pfad
