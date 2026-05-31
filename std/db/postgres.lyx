@@ -7,6 +7,7 @@
 
 unit std.db.postgres;
 
+import std.alloc;
 import std.string;
 import std.crypto.md5;
 
@@ -118,8 +119,8 @@ con PGMSGBUF_SZ: int64 := 24;
 
 // Allokiert einen neuen PGMsgBuf, gibt Zeiger zurück
 pub fn pgBufNew(): int64 {
-  var b: int64 := mmap(0, PGMSGBUF_SZ, 3, 34, -1, 0);
-  var data: int64 := mmap(0, PG_BUF_INIT_CAP, 3, 34, -1, 0);
+  var b: int64 := alloc(PGMSGBUF_SZ);
+  var data: int64 := alloc(PG_BUF_INIT_CAP);
   poke64(b,      data);           // buf
   poke64(b + 8,  PG_BUF_INIT_CAP); // cap
   poke64(b + 16, 0);              // len
@@ -130,8 +131,8 @@ pub fn pgBufFree(b: int64) {
   if (b == 0) { return; }
   var data: int64 := peek64(b);
   var cap:  int64 := peek64(b + 8);
-  if (data != 0) { munmap(data, cap); }
-  munmap(b, PGMSGBUF_SZ);
+  if (data != 0) { free(data, cap); }
+  free(b, PGMSGBUF_SZ);
 }
 
 pub fn pgBufReset(b: int64) {
@@ -145,10 +146,10 @@ fn pgBufGrow(b: int64, need: int64) {
   var nc: int64 := cap * 2;
   while (nc < len + need) { nc := nc * 2; }
   var old: int64 := peek64(b);
-  var nb:  int64 := mmap(0, nc, 3, 34, -1, 0);
+  var nb:  int64 := alloc(nc);
   var i:   int64 := 0;
   while (i < len) { poke8(nb + i, peek8(old + i)); i := i + 1; }
-  munmap(old, cap);
+  free(old, cap);
   poke64(b,     nb);
   poke64(b + 8, nc);
 }
@@ -240,7 +241,7 @@ pub fn pgTCPConnect(host: pchar, port: int64): int64 {
   var fd: int64 := sys_socket(2, 1, 0);
   if (fd < 0) { return -1; }
 
-  var addr: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var addr: int64 := alloc(16);
   poke8(addr,     2);   // AF_INET
   poke8(addr + 1, 0);
   // Port big-endian
@@ -263,7 +264,7 @@ pub fn pgTCPConnect(host: pchar, port: int64): int64 {
   while (k < 8) { poke8(addr + 8 + k, 0); k := k + 1; }
 
   var rc: int64 := sys_connect(fd, addr, 16);
-  munmap(addr, 16);
+  free(addr, 16);
   if (rc < 0) { sys_close(fd); return -1; }
   return fd;
 }
@@ -304,11 +305,11 @@ pub fn pgRecvRaw(fd: int64, buf: int64, len: int64): int64 {
 // Gibt 0 bei Erfolg, -1 bei Fehler
 pub fn pgSendMsg(fd: int64, msgType: int64, payload: int64, payloadLen: int64): int64 {
   // Header: 1 Byte type + 4 Byte length (big-endian, zählt sich selbst mit)
-  var hdr: int64 := mmap(0, 5, 3, 34, -1, 0);
+  var hdr: int64 := alloc(5);
   poke8(hdr, msgType & 0xFF);
   pgWriteInt32BE(hdr, 1, payloadLen + 4);
   var rc: int64 := pgSendRaw(fd, hdr, 5);
-  munmap(hdr, 5);
+  free(hdr, 5);
   if (rc < 0) { return -1; }
   if (payloadLen > 0) {
     if (pgSendRaw(fd, payload, payloadLen) < 0) { return -1; }
@@ -355,10 +356,10 @@ pub fn pgSendStartup(fd: int64, user: pchar, database: pchar): int64 {
   var totalLen:   int64 := payloadLen + 4;  // +4 für die Length-Feld selbst
 
   // StartupMessage: kein type-Byte; nur [4 Byte length][payload]
-  var lenBuf: int64 := mmap(0, 4, 3, 34, -1, 0);
+  var lenBuf: int64 := alloc(4);
   pgWriteInt32BE(lenBuf, 0, totalLen);
   var rc: int64 := pgSendRaw(fd, lenBuf, 4);
-  munmap(lenBuf, 4);
+  free(lenBuf, 4);
   if (rc < 0) { pgBufFree(b); return -1; }
 
   rc := pgSendRaw(fd, pgBufData(b), payloadLen);
@@ -377,14 +378,14 @@ pub fn pgSendStartup(fd: int64, user: pchar, database: pchar): int64 {
 // Gibt 0 bei Erfolg, -1 bei Fehler
 pub fn pgRecvMsg(fd: int64, outType: int64, outBuf: int64, outLen: int64): int64 {
   // Lese 1 Byte type + 4 Byte length
-  var hdr: int64 := mmap(0, 5, 3, 34, -1, 0);
+  var hdr: int64 := alloc(5);
   if (pgRecvRaw(fd, hdr, 5) < 0) {
-    munmap(hdr, 5);
+    free(hdr, 5);
     return -1;
   }
   var msgType:    int64 := peek8(hdr) & 0xFF;
   var msgLen:     int64 := pgReadInt32BE(hdr, 1);  // inkl. 4 Bytes Length-Feld selbst
-  munmap(hdr, 5);
+  free(hdr, 5);
 
   poke64(outType, msgType);
 
@@ -398,9 +399,9 @@ pub fn pgRecvMsg(fd: int64, outType: int64, outBuf: int64, outLen: int64): int64
     return 0;
   }
 
-  var payload: int64 := mmap(0, payloadLen + 1, 3, 34, -1, 0);
+  var payload: int64 := alloc(payloadLen + 1);
   if (pgRecvRaw(fd, payload, payloadLen) < 0) {
-    munmap(payload, payloadLen + 1);
+    free(payload, payloadLen + 1);
     return -1;
   }
   poke64(outBuf, payload);
@@ -409,7 +410,7 @@ pub fn pgRecvMsg(fd: int64, outType: int64, outBuf: int64, outLen: int64): int64
 
 // Gibt einen mit pgRecvMsg allokierten Payload frei
 pub fn pgFreeMsg(buf: int64, len: int64) {
-  if (buf != 0 && len > 0) { munmap(buf, len + 1); }
+  if (buf != 0 && len > 0) { free(buf, len + 1); }
 }
 
 // ============================================================================
@@ -426,15 +427,15 @@ pub fn pgSkipUntil(fd: int64, stopType: int64, outBuf: int64, outLen: int64): in
     var msgType:    int64 := 0;
     var msgBuf:     int64 := 0;
     var msgLen:     int64 := 0;
-    var typeBuf:    int64 := mmap(0, 8, 3, 34, -1, 0);
-    var bufBuf:     int64 := mmap(0, 8, 3, 34, -1, 0);
-    var lenBuf:     int64 := mmap(0, 8, 3, 34, -1, 0);
+    var typeBuf:    int64 := alloc(8);
+    var bufBuf:     int64 := alloc(8);
+    var lenBuf:     int64 := alloc(8);
 
     var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
     msgType := peek64(typeBuf);
     msgBuf  := peek64(bufBuf);
     msgLen  := peek64(lenBuf);
-    munmap(typeBuf, 8); munmap(bufBuf, 8); munmap(lenBuf, 8);
+    free(typeBuf, 8); free(bufBuf, 8); free(lenBuf, 8);
 
     if (rc < 0) { return -1; }
 
@@ -489,13 +490,13 @@ pub fn pgProbe(host: pchar, port: int64, user: pchar, database: pchar): int64 {
   }
 
   // Erste Antwort lesen (AuthenticationRequest 'R' oder ErrorResponse 'E')
-  var typeBuf: int64 := mmap(0, 8, 3, 34, -1, 0);
-  var bufBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
-  var lenBuf:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  var typeBuf: int64 := alloc(8);
+  var bufBuf:  int64 := alloc(8);
+  var lenBuf:  int64 := alloc(8);
   var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
   var msgBuf: int64 := peek64(bufBuf);
   var msgLen: int64 := peek64(lenBuf);
-  munmap(typeBuf, 8); munmap(bufBuf, 8); munmap(lenBuf, 8);
+  free(typeBuf, 8); free(bufBuf, 8); free(lenBuf, 8);
   pgFreeMsg(msgBuf, msgLen);
 
   sys_close(fd);
@@ -548,25 +549,25 @@ pub fn pgMD5AuthResponse(password: pchar, user: pchar, salt: int64, out: int64) 
   var userLen: int64 := pgStrLen(user as int64);
 
   // inner = MD5Hex(password + user)
-  var combined1: int64 := mmap(0, passLen + userLen + 1, 3, 34, -1, 0);
+  var combined1: int64 := alloc(passLen + userLen + 1);
   pgConcat(combined1, password as int64, passLen, user as int64, userLen);
-  var inner: int64 := mmap(0, 33, 3, 34, -1, 0);  // 32 hex chars + NUL
+  var inner: int64 := alloc(33);  // 32 hex chars + NUL
   pgMD5Hex(combined1, passLen + userLen, inner);
-  munmap(combined1, passLen + userLen + 1);
+  free(combined1, passLen + userLen + 1);
 
   // outer = MD5Hex(inner[0..31] + salt[0..3])
-  var combined2: int64 := mmap(0, 36, 3, 34, -1, 0);  // 32 + 4 bytes
+  var combined2: int64 := alloc(36);  // 32 + 4 bytes
   var i: int64 := 0;
   while (i < 32) { poke8(combined2 + i, peek8(inner + i)); i := i + 1; }
   poke8(combined2 + 32, peek8(salt + 0) & 0xFF);
   poke8(combined2 + 33, peek8(salt + 1) & 0xFF);
   poke8(combined2 + 34, peek8(salt + 2) & 0xFF);
   poke8(combined2 + 35, peek8(salt + 3) & 0xFF);
-  munmap(inner, 33);
+  free(inner, 33);
 
-  var outer: int64 := mmap(0, 33, 3, 34, -1, 0);
+  var outer: int64 := alloc(33);
   pgMD5Hex(combined2, 36, outer);
-  munmap(combined2, 36);
+  free(combined2, 36);
 
   // response = "md5" + outer (35 chars + NUL)
   poke8(out + 0, 109); // 'm'
@@ -575,7 +576,7 @@ pub fn pgMD5AuthResponse(password: pchar, user: pchar, salt: int64, out: int64) 
   i := 0;
   while (i < 32) { poke8(out + 3 + i, peek8(outer + i)); i := i + 1; }
   poke8(out + 35, 0);
-  munmap(outer, 33);
+  free(outer, 33);
 }
 
 // Sendet eine PasswordMessage: type='p', payload = NUL-terminierter Passwort-String
@@ -589,8 +590,8 @@ con PGRECV_TYPE: int64 := 0;
 con PGRECV_BUF:  int64 := 8;
 con PGRECV_LEN:  int64 := 16;
 
-fn pgAllocRecv(): int64 { return mmap(0, 24, 3, 34, -1, 0); }
-fn pgFreeRecv(r: int64) { munmap(r, 24); }
+fn pgAllocRecv(): int64 { return alloc(24); }
+fn pgFreeRecv(r: int64) { free(r, 24); }
 
 fn pgDoRecv(fd: int64, r: int64): int64 {
   var rc: int64 := pgRecvMsg(fd, r + PGRECV_TYPE, r + PGRECV_BUF, r + PGRECV_LEN);
@@ -638,7 +639,7 @@ pub con PG_STATUS_IN_TX:        int64 := 2;   // WP-PG-03: active transaction
 pub con PG_STATUS_TX_ERROR:     int64 := 3;   // WP-PG-03: transaction in error state
 
 fn pgConnNew(): int64 {
-  var c: int64 := mmap(0, PGCONN_SZ, 3, 34, -1, 0);  // zeroed by mmap
+  var c: int64 := alloc(PGCONN_SZ);  // zeroed by mmap
   poke64(c + PGCONN_FD,       -1);
   poke64(c + PGCONN_STATUS,   PG_STATUS_DISCONNECTED);
   poke64(c + PGCONN_LASTERR,  PG_ERR_NONE);
@@ -653,27 +654,27 @@ fn pgConnNew(): int64 {
 fn pgDupStr(s: pchar): int64 {
   if (s == 0 as pchar) { return 0; }
   var len: int64 := pgStrLen(s as int64) + 1;
-  var buf: int64 := mmap(0, len, 3, 34, -1, 0);
+  var buf: int64 := alloc(len);
   pgStrCopy(buf, s);
   return buf;
 }
 
 // Heap-String freigeben
 fn pgFreeStr(p: int64) {
-  if (p != 0) { munmap(p, pgStrLen(p) + 1); }
+  if (p != 0) { free(p, pgStrLen(p) + 1); }
 }
 
 fn pgConnSetError(c: int64, code: int64, msg: pchar) {
   poke64(c + PGCONN_LASTERR, code);
   // free old errmsg if any
   var old: int64 := peek64(c + PGCONN_ERRMSG);
-  if (old != 0) { munmap(old, pgStrLen(old) + 1); }
+  if (old != 0) { free(old, pgStrLen(old) + 1); }
   if (msg == 0 as pchar) {
     poke64(c + PGCONN_ERRMSG, 0);
     return;
   }
   var len: int64 := pgStrLen(msg as int64) + 1;
-  var buf: int64 := mmap(0, len, 3, 34, -1, 0);
+  var buf: int64 := alloc(len);
   pgStrCopy(buf, msg);
   poke64(c + PGCONN_ERRMSG, buf);
 }
@@ -695,9 +696,9 @@ fn pgConnSetErrorFromPayload(c: int64, payload: int64, payloadLen: int64) {
 // Stores a copy of the server_version ParameterStatus value
 fn pgConnSetServerVersion(c: int64, val: int64) {
   var old: int64 := peek64(c + PGCONN_SERVERVERS);
-  if (old != 0) { munmap(old, pgStrLen(old) + 1); }
+  if (old != 0) { free(old, pgStrLen(old) + 1); }
   var len: int64 := pgStrLen(val) + 1;
-  var buf: int64 := mmap(0, len, 3, 34, -1, 0);
+  var buf: int64 := alloc(len);
   var i: int64 := 0;
   while (i < len) { poke8(buf + i, peek8(val + i)); i := i + 1; }
   poke64(c + PGCONN_SERVERVERS, buf);
@@ -785,16 +786,16 @@ pub fn pgHandshake(conn: int64, user: pchar, password: pchar, database: pchar): 
           return -1;
         }
         var salt: int64 := payload + 4;
-        var response: int64 := mmap(0, 36, 3, 34, -1, 0);  // "md5" + 32 hex + NUL
+        var response: int64 := alloc(36);  // "md5" + 32 hex + NUL
         pgMD5AuthResponse(password, user, salt, response);
         pgFreeRecvMsg(r);
         if (pgSendMsg(fd, PG_FE_PASSWORD, response, 36) < 0) {
-          munmap(response, 36);
+          free(response, 36);
           pgConnSetError(conn, PG_ERR_SEND, "send md5 password failed"c);
           pgFreeRecv(r);
           return -1;
         }
-        munmap(response, 36);
+        free(response, 36);
 
       } else {
         // Unsupported auth method (SASL etc.)
@@ -890,11 +891,11 @@ pub fn PGClose(conn: int64) {
   var fd: int64 := peek64(conn + PGCONN_FD);
   if (fd >= 0) {
     // Terminate: type='X', length=4, kein Payload
-    var hdr: int64 := mmap(0, 5, 3, 34, -1, 0);
+    var hdr: int64 := alloc(5);
     poke8(hdr, PG_FE_TERMINATE & 0xFF);
     pgWriteInt32BE(hdr, 1, 4);
     pgSendRaw(fd, hdr, 5);
-    munmap(hdr, 5);
+    free(hdr, 5);
     sys_close(fd);
     poke64(conn + PGCONN_FD, -1);
   }
@@ -909,7 +910,7 @@ pub fn PGClose(conn: int64) {
   // Reusable msg_buf freigeben
   var mb: int64 := peek64(conn + PGCONN_MSGBUF);
   if (mb != 0) { pgBufFree(mb); }
-  munmap(conn, PGCONN_SZ);
+  free(conn, PGCONN_SZ);
 }
 
 // Zugriffs-Accessoren
@@ -1010,8 +1011,8 @@ con PG_ROW_ALLOC_INIT: int64 := 16;
 con PG_NULL_LEN:       int64 := 4294967295;  // 0xFFFFFFFF — NULL indicator in DataRow
 
 fn pgResultNew(): int64 {
-  var r: int64 := mmap(0, PGRESULT_SZ, 3, 34, -1, 0);
-  var rowsArr: int64 := mmap(0, PG_ROW_ALLOC_INIT * 8, 3, 34, -1, 0);
+  var r: int64 := alloc(PGRESULT_SZ);
+  var rowsArr: int64 := alloc(PG_ROW_ALLOC_INIT * 8);
   poke64(r + PGRESULT_ROWS,      rowsArr);
   poke64(r + PGRESULT_ROW_ALLOC, PG_ROW_ALLOC_INIT);
   return r;
@@ -1072,12 +1073,12 @@ fn pgParseRowDescription(result: int64, payload: int64, payloadLen: int64) {
   poke64(result + PGRESULT_FIELD_COUNT, numFields);
   if (numFields == 0) { return; }
 
-  var fields: int64 := mmap(0, numFields * PGFIELD_SZ, 3, 34, -1, 0);
+  var fields: int64 := alloc(numFields * PGFIELD_SZ);
   poke64(result + PGRESULT_FIELDS, fields);
 
   // Use full payload as upper bound for name storage (conservative but safe)
   var fbSz: int64 := payloadLen + 1;
-  var fb: int64 := mmap(0, fbSz, 3, 34, -1, 0);
+  var fb: int64 := alloc(fbSz);
   poke64(result + PGRESULT_FIELD_BUF,    fb);
   poke64(result + PGRESULT_FIELD_BUF_SZ, fbSz);
 
@@ -1121,27 +1122,27 @@ fn pgParseDataRow(result: int64, payload: int64, payloadLen: int64) {
   var rowsArr:  int64 := peek64(result + PGRESULT_ROWS);
   if (rowCount >= rowAlloc) {
     var newAlloc: int64 := rowAlloc * 2;
-    var newArr:   int64 := mmap(0, newAlloc * 8, 3, 34, -1, 0);
+    var newArr:   int64 := alloc(newAlloc * 8);
     var ci: int64 := 0;
     while (ci < rowAlloc) {
       poke64(newArr + ci * 8, peek64(rowsArr + ci * 8));
       ci := ci + 1;
     }
-    munmap(rowsArr, rowAlloc * 8);
+    free(rowsArr, rowAlloc * 8);
     rowsArr  := newArr;
     rowAlloc := newAlloc;
     poke64(result + PGRESULT_ROWS,      rowsArr);
     poke64(result + PGRESULT_ROW_ALLOC, rowAlloc);
   }
 
-  var row:   int64 := mmap(0, PGROW_SZ, 3, 34, -1, 0);
+  var row:   int64 := alloc(PGROW_SZ);
   var vals:  int64 := 0;
   var lens:  int64 := 0;
   var nulls: int64 := 0;
   if (numCols > 0) {
-    vals  := mmap(0, numCols * 8, 3, 34, -1, 0);
-    lens  := mmap(0, numCols * 8, 3, 34, -1, 0);
-    nulls := mmap(0, numCols * 8, 3, 34, -1, 0);
+    vals  := alloc(numCols * 8);
+    lens  := alloc(numCols * 8);
+    nulls := alloc(numCols * 8);
   }
   poke64(row + PGROW_VALUES,  vals);
   poke64(row + PGROW_LENGTHS, lens);
@@ -1159,7 +1160,7 @@ fn pgParseDataRow(result: int64, payload: int64, payloadLen: int64) {
       poke64(lens  + j * 8, 0);
     } else {
       poke64(nulls + j * 8, 0);
-      var vbuf: int64 := mmap(0, valLen + 1, 3, 34, -1, 0);
+      var vbuf: int64 := alloc(valLen + 1);
       var vi: int64 := 0;
       while (vi < valLen) { poke8(vbuf + vi, peek8(payload + pos + vi)); vi := vi + 1; }
       poke8(vbuf + valLen, 0);
@@ -1195,29 +1196,29 @@ pub fn PGFreeResult(result: int64) {
         if (peek64(nulls + j * 8) == 0) {
           var vp: int64 := peek64(vals + j * 8);
           var vl: int64 := peek64(lens + j * 8);
-          if (vp != 0) { munmap(vp, vl + 1); }
+          if (vp != 0) { free(vp, vl + 1); }
         }
         j := j + 1;
       }
       if (count > 0) {
-        if (vals  != 0) { munmap(vals,  count * 8); }
-        if (lens  != 0) { munmap(lens,  count * 8); }
-        if (nulls != 0) { munmap(nulls, count * 8); }
+        if (vals  != 0) { free(vals,  count * 8); }
+        if (lens  != 0) { free(lens,  count * 8); }
+        if (nulls != 0) { free(nulls, count * 8); }
       }
-      munmap(row, PGROW_SZ);
+      free(row, PGROW_SZ);
     }
     i := i + 1;
   }
-  if (rows != 0 && rowAlloc > 0) { munmap(rows, rowAlloc * 8); }
+  if (rows != 0 && rowAlloc > 0) { free(rows, rowAlloc * 8); }
 
   var fields: int64 := peek64(result + PGRESULT_FIELDS);
-  if (fields != 0 && fieldCount > 0) { munmap(fields, fieldCount * PGFIELD_SZ); }
+  if (fields != 0 && fieldCount > 0) { free(fields, fieldCount * PGFIELD_SZ); }
 
   var fbuf: int64 := peek64(result + PGRESULT_FIELD_BUF);
   var fbsz: int64 := peek64(result + PGRESULT_FIELD_BUF_SZ);
-  if (fbuf != 0 && fbsz > 0) { munmap(fbuf, fbsz); }
+  if (fbuf != 0 && fbsz > 0) { free(fbuf, fbsz); }
 
-  munmap(result, PGRESULT_SZ);
+  free(result, PGRESULT_SZ);
 }
 
 // Sends a simple SQL query, collects all response messages, returns PGResult or 0 on error
@@ -1495,7 +1496,7 @@ pub con PGPARAM_LEN:      int64 := 8;   // int64 — byte length (excl. NUL)
 pub con PGPARAM_IS_NULL:  int64 := 16;  // int64 — 1=NULL, 0=value
 
 fn pgStmtNew(conn: int64, name: pchar, sql: pchar): int64 {
-  var s: int64 := mmap(0, PGSTMT_SZ, 3, 34, -1, 0);
+  var s: int64 := alloc(PGSTMT_SZ);
   poke64(s + PGSTMT_NAME, pgDupStr(name));
   poke64(s + PGSTMT_SQL,  pgDupStr(sql));
   poke64(s + PGSTMT_CONN, conn);
@@ -1513,8 +1514,8 @@ pub fn PGStmtReset(stmt: int64) {
     if (p != 0) {
       var tv: int64 := peek64(p + PGPARAM_TEXT_VAL);
       var tl: int64 := peek64(p + PGPARAM_LEN);
-      if (tv != 0 && tl > 0) { munmap(tv, tl + 1); }
-      munmap(p, PGPARAM_SZ);
+      if (tv != 0 && tl > 0) { free(tv, tl + 1); }
+      free(p, PGPARAM_SZ);
     }
     i := i + 1;
   }
@@ -1527,10 +1528,10 @@ pub fn PGStmtFree(stmt: int64) {
   PGStmtReset(stmt);
   var params: int64 := peek64(stmt + PGSTMT_PARAMS);
   var alloc:  int64 := peek64(stmt + PGSTMT_PARAMS_ALLOC);
-  if (params != 0 && alloc > 0) { munmap(params, alloc * 8); }
+  if (params != 0 && alloc > 0) { free(params, alloc * 8); }
   pgFreeStr(peek64(stmt + PGSTMT_NAME));
   pgFreeStr(peek64(stmt + PGSTMT_SQL));
-  munmap(stmt, PGSTMT_SZ);
+  free(stmt, PGSTMT_SZ);
 }
 
 // Sends Parse + Sync, returns PGStmt* or 0 on error
@@ -1810,11 +1811,11 @@ fn pgAllocParamAt(stmt: int64, i: int64): int64 {
   if (i >= alloc) {
     var newAlloc: int64 := alloc * 2;
     if (newAlloc < i + 1) { newAlloc := i + 4; }
-    var newArr: int64 := mmap(0, newAlloc * 8, 3, 34, -1, 0);
+    var newArr: int64 := alloc(newAlloc * 8);
     if (params != 0 && alloc > 0) {
       var ci: int64 := 0;
       while (ci < alloc) { poke64(newArr + ci * 8, peek64(params + ci * 8)); ci := ci + 1; }
-      munmap(params, alloc * 8);
+      free(params, alloc * 8);
     }
     params := newArr;
     poke64(stmt + PGSTMT_PARAMS,       params);
@@ -1825,12 +1826,12 @@ fn pgAllocParamAt(stmt: int64, i: int64): int64 {
   if (old != 0) {
     var tv: int64 := peek64(old + PGPARAM_TEXT_VAL);
     var tl: int64 := peek64(old + PGPARAM_LEN);
-    if (tv != 0 && tl > 0) { munmap(tv, tl + 1); }
-    munmap(old, PGPARAM_SZ);
+    if (tv != 0 && tl > 0) { free(tv, tl + 1); }
+    free(old, PGPARAM_SZ);
     poke64(params + i * 8, 0);
   }
 
-  var p: int64 := mmap(0, PGPARAM_SZ, 3, 34, -1, 0);
+  var p: int64 := alloc(PGPARAM_SZ);
   poke64(params + i * 8, p);
 
   var count: int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
@@ -1841,7 +1842,7 @@ fn pgAllocParamAt(stmt: int64, i: int64): int64 {
 // Formats int64 as decimal into buf, returns char count (excl. NUL)
 fn pgFormatInt64(val: int64, buf: int64): int64 {
   if (val == 0) { poke8(buf, 48); poke8(buf + 1, 0); return 1; }
-  var tmp: int64 := mmap(0, 24, 3, 34, -1, 0);
+  var tmp: int64 := alloc(24);
   var isNeg: int64 := 0;
   var n: int64 := val;
   if (n < 0) { isNeg := 1; n := 0 - n; }
@@ -1852,7 +1853,7 @@ fn pgFormatInt64(val: int64, buf: int64): int64 {
   var i: int64 := pos - 1;
   while (i >= 0) { poke8(buf + out, peek8(tmp + i)); out := out + 1; i := i - 1; }
   poke8(buf + out, 0);
-  munmap(tmp, 24);
+  free(tmp, 24);
   return out;
 }
 
@@ -1866,14 +1867,14 @@ fn pgFormatFloat64(val: f64, buf: int64): int64 {
   var intPart:  int64 := iscaled / 1000000;
   var fracPart: int64 := iscaled - intPart * 1000000;
 
-  var tmp: int64 := mmap(0, 32, 3, 34, -1, 0);
+  var tmp: int64 := alloc(32);
   var iLen: int64 := pgFormatInt64(intPart, tmp);
   var k: int64 := 0;
   while (k < iLen) { poke8(buf + out, peek8(tmp + k)); out := out + 1; k := k + 1; }
 
   poke8(buf + out, 46); out := out + 1;  // '.'
 
-  var digits: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var digits: int64 := alloc(8);
   var j: int64 := 5;
   var f: int64 := fracPart;
   while (j >= 0) { poke8(digits + j, (f % 10) + 48); f := f / 10; j := j - 1; }
@@ -1881,8 +1882,8 @@ fn pgFormatFloat64(val: f64, buf: int64): int64 {
   while (j < 6) { poke8(buf + out, peek8(digits + j)); out := out + 1; j := j + 1; }
 
   poke8(buf + out, 0);
-  munmap(tmp, 32);
-  munmap(digits, 8);
+  free(tmp, 32);
+  free(digits, 8);
   return out;
 }
 
@@ -1890,7 +1891,7 @@ fn pgFormatFloat64(val: f64, buf: int64): int64 {
 pub fn PGBindInt(stmt: int64, i: int64, v: int64) {
   var p: int64 := pgAllocParamAt(stmt, i);
   if (p == 0) { return; }
-  var buf: int64 := mmap(0, 24, 3, 34, -1, 0);
+  var buf: int64 := alloc(24);
   var len: int64 := pgFormatInt64(v, buf);
   poke64(p + PGPARAM_TEXT_VAL, buf);
   poke64(p + PGPARAM_LEN,      len);
@@ -1901,7 +1902,7 @@ pub fn PGBindInt(stmt: int64, i: int64, v: int64) {
 pub fn PGBindFloat(stmt: int64, i: int64, v: f64) {
   var p: int64 := pgAllocParamAt(stmt, i);
   if (p == 0) { return; }
-  var buf: int64 := mmap(0, 32, 3, 34, -1, 0);
+  var buf: int64 := alloc(32);
   var len: int64 := pgFormatFloat64(v, buf);
   poke64(p + PGPARAM_TEXT_VAL, buf);
   poke64(p + PGPARAM_LEN,      len);
@@ -1914,7 +1915,7 @@ pub fn PGBindStr(stmt: int64, i: int64, v: pchar) {
   if (p == 0) { return; }
   if (v == 0 as pchar) { poke64(p + PGPARAM_IS_NULL, 1); return; }
   var len: int64 := pgStrLen(v as int64);
-  var buf: int64 := mmap(0, len + 1, 3, 34, -1, 0);
+  var buf: int64 := alloc(len + 1);
   var k: int64 := 0;
   while (k <= len) { poke8(buf + k, peek8(v as int64 + k)); k := k + 1; }
   poke64(p + PGPARAM_TEXT_VAL, buf);
@@ -1926,7 +1927,7 @@ pub fn PGBindStr(stmt: int64, i: int64, v: pchar) {
 pub fn PGBindBool(stmt: int64, i: int64, v: int64) {
   var p: int64 := pgAllocParamAt(stmt, i);
   if (p == 0) { return; }
-  var buf: int64 := mmap(0, 2, 3, 34, -1, 0);
+  var buf: int64 := alloc(2);
   if (v != 0) { poke8(buf, 116); } else { poke8(buf, 102); }  // 't' / 'f'
   poke8(buf + 1, 0);
   poke64(p + PGPARAM_TEXT_VAL, buf);
@@ -1957,14 +1958,14 @@ fn pgExecSimple(conn: int64, sql: pchar): int64 {
 fn pgExecWithName(conn: int64, prefix: pchar, name: pchar): int64 {
   var plen: int64 := pgStrLen(prefix as int64);
   var nlen: int64 := pgStrLen(name as int64);
-  var buf: int64 := mmap(0, plen + nlen + 2, 3, 34, -1, 0);
+  var buf: int64 := alloc(plen + nlen + 2);
   var i: int64 := 0;
   while (i < plen) { poke8(buf + i, peek8(prefix as int64 + i)); i := i + 1; }
   poke8(buf + plen, 32);  // space
   i := 0;
   while (i <= nlen) { poke8(buf + plen + 1 + i, peek8(name as int64 + i)); i := i + 1; }
   var r: int64 := PGQuery(conn, buf as pchar);
-  munmap(buf, plen + nlen + 2);
+  free(buf, plen + nlen + 2);
   if (r == 0) { return 0; }
   PGFreeResult(r);
   return 1;
@@ -2044,7 +2045,7 @@ fn pgConcat3(a: pchar, b: pchar, c: pchar): int64 {
   var al: int64 := pgStrLen(a as int64);
   var bl: int64 := pgStrLen(b as int64);
   var cl: int64 := pgStrLen(c as int64);
-  var buf: int64 := mmap(0, al + bl + cl + 1, 3, 34, -1, 0);
+  var buf: int64 := alloc(al + bl + cl + 1);
   var i: int64 := 0;
   while (i < al) { poke8(buf + i,          peek8(a as int64 + i)); i := i + 1; }
   i := 0;
@@ -2062,7 +2063,7 @@ fn pgConcat5(a: pchar, b: pchar, c: pchar, d: pchar, e: pchar): int64 {
   var dl: int64 := pgStrLen(d as int64);
   var el: int64 := pgStrLen(e as int64);
   var total: int64 := al + bl + cl + dl + el + 1;
-  var buf: int64 := mmap(0, total, 3, 34, -1, 0);
+  var buf: int64 := alloc(total);
   var off: int64 := 0;
   var i: int64 := 0;
   while (i < al) { poke8(buf + off, peek8(a as int64 + i)); off := off + 1; i := i + 1; }
@@ -2085,7 +2086,7 @@ pub fn PGTableExists(conn: int64, table: pchar): int64 {
     table,
     "' AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
   var r: int64 := PGQuery(conn, sql as pchar);
-  munmap(sql, pgStrLen(sql) + 1);
+  free(sql, pgStrLen(sql) + 1);
   if (r == 0) { return 0; }
   var found: int64 := 0;
   if (PGNumRows(r) > 0) { found := 1; }
@@ -2103,7 +2104,7 @@ pub fn PGColumnExists(conn: int64, table: pchar, column: pchar): int64 {
     column,
     "' AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
   var r: int64 := PGQuery(conn, sql as pchar);
-  munmap(sql, pgStrLen(sql) + 1);
+  free(sql, pgStrLen(sql) + 1);
   if (r == 0) { return 0; }
   var found: int64 := 0;
   if (PGNumRows(r) > 0) { found := 1; }
@@ -2129,10 +2130,10 @@ con PGPOOL_BUSY:  int64 := 16;  // int64 — pointer to int64[size] flags (0=fre
 // Allocates a connection pool with the given number of slots (all initially empty)
 pub fn PGPoolCreate(size: int64): int64 {
   if (size < 1) { return 0; }
-  var pg: int64 := mmap(0, PGPOOL_SZ, 3, 34, -1, 0);
+  var pg: int64 := alloc(PGPOOL_SZ);
   poke64(pg + PGPOOL_SIZE,  size);
-  poke64(pg + PGPOOL_CONNS, mmap(0, size * 8, 3, 34, -1, 0));
-  poke64(pg + PGPOOL_BUSY,  mmap(0, size * 8, 3, 34, -1, 0));
+  poke64(pg + PGPOOL_CONNS, alloc(size * 8));
+  poke64(pg + PGPOOL_BUSY,  alloc(size * 8));
   return pg;
 }
 
@@ -2148,9 +2149,9 @@ pub fn PGPoolDestroy(pg: int64) {
     if (conn != 0) { PGClose(conn); }
     i := i + 1;
   }
-  if (conns != 0) { munmap(conns, size * 8); }
-  if (busy  != 0) { munmap(busy,  size * 8); }
-  munmap(pg, PGPOOL_SZ);
+  if (conns != 0) { free(conns, size * 8); }
+  if (busy  != 0) { free(busy,  size * 8); }
+  free(pg, PGPOOL_SZ);
 }
 
 // Returns a free connected slot (reuses existing or opens new). Returns 0 if all slots busy.
@@ -2220,14 +2221,14 @@ con PGNOTIF_PAYLOAD: int64 := 16;  // int64 — pchar, heap-allocated payload st
 
 // Returns 1 if fd has readable data (non-blocking poll via select timeout=0)
 fn pgSocketReadable(fd: int64): int64 {
-  var fds: int64 := mmap(0, 128, 3, 34, -1, 0);
+  var fds: int64 := alloc(128);
   var byteIdx: int64 := fd / 8;
   var bitIdx:  int64 := fd - byteIdx * 8;
   poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
-  var tv: int64 := mmap(0, 16, 3, 34, -1, 0);  // {tv_sec=0, tv_usec=0}
+  var tv: int64 := alloc(16);  // {tv_sec=0, tv_usec=0}
   var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
-  munmap(fds, 128);
-  munmap(tv, 16);
+  free(fds, 128);
+  free(tv, 16);
   var result: int64 := 0;
   if (n > 0) { result := 1; }
   return result;
@@ -2249,16 +2250,16 @@ fn pgParseNotification(payload: int64, payLen: int64): int64 {
   while (pos < payLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
   var pvLen: int64 := pos - pvStart;
 
-  var notif: int64 := mmap(0, PGNOTIF_SZ, 3, 34, -1, 0);
+  var notif: int64 := alloc(PGNOTIF_SZ);
   poke64(notif + PGNOTIF_PID, pid);
 
-  var chanBuf: int64 := mmap(0, chanLen + 1, 3, 34, -1, 0);
+  var chanBuf: int64 := alloc(chanLen + 1);
   var i: int64 := 0;
   while (i < chanLen) { poke8(chanBuf + i, peek8(payload + chanStart + i)); i := i + 1; }
   poke8(chanBuf + chanLen, 0);
   poke64(notif + PGNOTIF_CHANNEL, chanBuf);
 
-  var pvBuf: int64 := mmap(0, pvLen + 1, 3, 34, -1, 0);
+  var pvBuf: int64 := alloc(pvLen + 1);
   i := 0;
   while (i < pvLen) { poke8(pvBuf + i, peek8(payload + pvStart + i)); i := i + 1; }
   poke8(pvBuf + pvLen, 0);
@@ -2298,14 +2299,14 @@ pub fn PGNotify(conn: int64, channel: pchar, payload: pchar): int64 {
   if (conn == 0 || channel == 0 as pchar) { return 0; }
   var plen: int64 := 0;
   if (payload != 0 as pchar) { plen := pgStrLen(payload as int64); }
-  var esc: int64 := mmap(0, plen * 2 + 2, 3, 34, -1, 0);
+  var esc: int64 := alloc(plen * 2 + 2);
   var escLen: int64 := 0;
   if (payload != 0 as pchar) { escLen := PGEscapeStr(esc, payload); }
   poke8(esc + escLen, 0);
   var sql: int64 := pgConcat5("NOTIFY "c, channel, ", '"c, esc as pchar, "'"c);
-  munmap(esc, plen * 2 + 2);
+  free(esc, plen * 2 + 2);
   var r: int64 := PGQuery(conn, sql as pchar);
-  munmap(sql, pgStrLen(sql) + 1);
+  free(sql, pgStrLen(sql) + 1);
   if (r == 0) { return 0; }
   PGFreeResult(r);
   return 1;
@@ -2324,10 +2325,10 @@ pub fn PGGetNotification(conn: int64): int64 {
 pub fn PGFreeNotification(notif: int64) {
   if (notif == 0) { return; }
   var ch: int64 := peek64(notif + PGNOTIF_CHANNEL);
-  if (ch != 0) { munmap(ch, pgStrLen(ch) + 1); }
+  if (ch != 0) { free(ch, pgStrLen(ch) + 1); }
   var pv: int64 := peek64(notif + PGNOTIF_PAYLOAD);
-  if (pv != 0) { munmap(pv, pgStrLen(pv) + 1); }
-  munmap(notif, PGNOTIF_SZ);
+  if (pv != 0) { free(pv, pgStrLen(pv) + 1); }
+  free(notif, PGNOTIF_SZ);
 }
 
 // Blocks up to timeout_ms waiting for a notification; returns PGNotification* or 0
@@ -2336,20 +2337,20 @@ pub fn PGWaitNotification(conn: int64, timeout_ms: int64): int64 {
   if (PGIsConnected(conn) == 0) { return 0; }
   var fd: int64 := peek64(conn + PGCONN_FD);
 
-  var fds: int64 := mmap(0, 128, 3, 34, -1, 0);
+  var fds: int64 := alloc(128);
   var byteIdx: int64 := fd / 8;
   var bitIdx:  int64 := fd - byteIdx * 8;
   poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
 
   var secs:  int64 := timeout_ms / 1000;
   var usecs: int64 := (timeout_ms - secs * 1000) * 1000;
-  var tv: int64 := mmap(0, 16, 3, 34, -1, 0);
+  var tv: int64 := alloc(16);
   poke64(tv, secs);
   poke64(tv + 8, usecs);
 
   var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
-  munmap(fds, 128);
-  munmap(tv, 16);
+  free(fds, 128);
+  free(tv, 16);
 
   if (n <= 0) { return 0; }
   return pgReadNotification(fd);
@@ -2410,7 +2411,7 @@ pub fn PGCopyBegin(conn: int64, table: pchar, columns: pchar): int64 {
   var fd: int64 := peek64(conn + PGCONN_FD);
   var sqlLen: int64 := pgStrLen(sql) + 1;
   var rc: int64 := pgSendMsg(fd, PG_FE_QUERY, sql, sqlLen);
-  munmap(sql, sqlLen);
+  free(sql, sqlLen);
   if (rc < 0) { pgConnSetError(conn, PG_ERR_SEND, "copy begin send failed"c); return 0; }
 
   // Wait for CopyInResponse or error
