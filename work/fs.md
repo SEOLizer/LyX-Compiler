@@ -154,7 +154,7 @@ pub fn IsAbsolutePath(path: pchar): bool
 
 ---
 
-## WP-FS-05: Stat — Datei-Metadaten ⬜
+## WP-FS-05: Stat — Datei-Metadaten ✅
 
 **Ziel:** Änderungszeit, Zugriffszeit, Dateigröße und Berechtigungen aus einem
 einzigen Syscall lesen (`stat`). Aktuell verwendet `FileSize` einen `lseek`-Umweg;
