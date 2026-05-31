@@ -2097,6 +2097,28 @@ pub type Codegen = class {
     return -1;
   }
 
+  // Returns 1 if the named class field has type "Array<T>" (any T), 0 otherwise.
+  fn cg_isFieldArray(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        var tp: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+        var tl: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+        if (tp != 0 as pchar && tl == 5 && self.cg_seq(tp, tl, "Array", 5)) { return 1; }
+        return 0;
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
   // WP-4.1-B: emit BSWAP/XCHG on rax after loading a big_endian field (load result in rax).
   fn cg_emitBswapRax(typeWidth: int64) {
     if (typeWidth == 2) {
@@ -2146,10 +2168,21 @@ pub type Codegen = class {
       poke64(fb,      self.cg_nsval(tmp) as int64);
       poke64(fb + CG_CFIELD_OFF_FIELDLEN,  self.cg_nslen(tmp));
       poke64(fb + CG_CFIELD_OFF_OFFSET, offset);
+      poke64(fb + CG_CFIELD_OFF_ELEMTYPEPTR, 0);
+      poke64(fb + CG_CFIELD_OFF_ELEMTYPELEN, 0);
       var ftypeNode: int64 := self.cg_nc0(tmp);
       if (ftypeNode >= 0 && self.cg_nkind(ftypeNode) == 60) {
-        poke64(fb + CG_CFIELD_OFF_TYPENAMEPTR, self.cg_nsval(ftypeNode) as int64);
-        poke64(fb + CG_CFIELD_OFF_TYPENAMELEN, self.cg_nslen(ftypeNode));
+        var ftn: pchar := self.cg_nsval(ftypeNode);
+        var ftl: int64 := self.cg_nslen(ftypeNode);
+        poke64(fb + CG_CFIELD_OFF_TYPENAMEPTR, ftn as int64);
+        poke64(fb + CG_CFIELD_OFF_TYPENAMELEN, ftl);
+        if (self.cg_seq(ftn, ftl, "Array", 5)) {
+          var elemNode: int64 := self.cg_nc1(ftypeNode);
+          if (elemNode >= 0 && self.cg_nkind(elemNode) == 60) {
+            poke64(fb + CG_CFIELD_OFF_ELEMTYPEPTR, self.cg_nsval(elemNode) as int64);
+            poke64(fb + CG_CFIELD_OFF_ELEMTYPELEN, self.cg_nslen(elemNode));
+          }
+        }
       } else {
         poke64(fb + CG_CFIELD_OFF_TYPENAMEPTR, 0);
         poke64(fb + CG_CFIELD_OFF_TYPENAMELEN, 0);
@@ -3198,13 +3231,9 @@ pub type Codegen = class {
           isArray := 1;
           arrElemClassIdx := eClassIdx;
           arrElemSize := self.cg_classStructSize(eClassIdx);
-        } else {
-          // Check if field type is a plain array (no struct element)
-          var fldClassIdx: int64 := self.cg_getFieldClassIdx(parentCi, fldNm, fldNl);
-          if (fldClassIdx < 0) {
-            // Not a struct field type — check type name for "Array"
-            // (this handles Array<int64> class fields)
-          }
+        } else if (self.cg_isFieldArray(parentCi, fldNm, fldNl) != 0) {
+          isArray := 1;
+          // arrElemSize bleibt 8 (scalar Array<int64> etc.)
         }
       }
       if (isPchar == 1) {
@@ -5420,6 +5449,12 @@ pub type Codegen = class {
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
+        } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
+          var lhsInner: int64 := self.cg_nc0(lhsBase);
+          var lhsFldNm: pchar := self.cg_nsval(lhsBase);
+          var lhsFldNl: int64 := self.cg_nslen(lhsBase);
+          var lhsParentCi: int64 := self.cg_objClassIdx(lhsInner);
+          if (self.cg_isFieldArray(lhsParentCi, lhsFldNm, lhsFldNl) != 0) { lhsIsArray := 1; }
         }
         if (lhsIsArray == 1) {
           // array<T> local: skip 16-byte header
