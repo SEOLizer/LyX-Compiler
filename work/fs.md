@@ -250,7 +250,7 @@ pub fn ReadLink(path: pchar, buf: pchar, bufLen: int64): int64
 
 ---
 
-## WP-FS-07: MkdirAll — Rekursives Verzeichnis erstellen ⬜
+## WP-FS-07: MkdirAll — Rekursives Verzeichnis erstellen ✅
 
 **Ziel:** `MkdirAll("/a/b/c/d", mode)` erstellt alle fehlenden Pfad-Komponenten,
 analog zu `mkdir -p`. Häufig benötigt beim Aufbau von Verzeichnisstrukturen.
