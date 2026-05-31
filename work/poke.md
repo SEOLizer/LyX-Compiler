@@ -44,7 +44,7 @@
 
 ---
 
-### WP-POKE-01: `memcpy` Builtin ⬜
+### WP-POKE-01: `memcpy` Builtin ✅
 
 **Ziel:** `memcpy(dst, src, len)` als Compiler-Builtin — ersetzt ~159 Byte-Kopierschleifen
 und ist die Voraussetzung für effizientes Umkopieren in Phase 2.
@@ -70,7 +70,7 @@ codegen_x86.lyx nach `getdents64`.
 
 ---
 
-### WP-POKE-02: `memset` Builtin ⬜
+### WP-POKE-02: `memset` Builtin ✅
 
 **Ziel:** `memset(dst, val, len)` — füllt einen Speicherbereich mit einem Byte-Wert.
 Ergänzt memcpy und eliminiert weitere Initialisierungs-Schleifen.
