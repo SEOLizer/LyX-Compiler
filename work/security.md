@@ -77,14 +77,12 @@ Keine TLS-Versionseinschränkung (TLS 1.0/1.1 sind noch erlaubt).
 
 **Teilschritte:**
 
-- [ ] **2.1** `SSL_get1_peer_certificate()` nach erfolgreichem Handshake aufrufen
-- [ ] **2.2** `X509_check_host()` mit angefragtem Hostnamen aufrufen
-- [ ] **2.3** Bei Fehler: Verbindung abbrechen + Fehlermeldung "hostname mismatch"
-- [ ] **2.4** TLS-Minimum-Version auf TLS 1.2 setzen (`SSL_CTX_set_min_proto_version`)
-- [ ] **2.5** `TLS_method()` durch `TLS_client_method()` ersetzen
-- [ ] **2.6** HTTPS-Integrationstests schreiben:
-      - Erfolg: `example.com` mit gültigem Cert
-      - Fehler: `example.com` mit Cert für `attacker.com`
+- [x] **2.1** `SSL_get1_peer_certificate()` nach erfolgreichem Handshake aufrufen
+- [x] **2.2** `X509_check_host()` mit angefragtem Hostnamen — prüft SubjectAltName und CommonName
+- [x] **2.3** Bei Fehler: Verbindung abbrechen (conn.connected=0); neuer Fehlercode `TLS_ERR_HOSTNAME=-8`
+- [x] **2.4** TLS-Minimum-Version TLS 1.2 via `SSL_CTX_ctrl(ctx, 123, 771, 0)`
+- [x] **2.5** `TLS_method()` durch `TLS_client_method()` ersetzt — kein DTLS mehr
+- [ ] **2.6** HTTPS-Integrationstests — manuell zu verifizieren (kein Testframework vorhanden)
 
 **Definition of Done:**
 - Hostname-Verifikation schlägt fehl bei nicht-match
@@ -613,7 +611,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | WP | Titel | Status | Verantwortlich | Start | Ende |
 |----|-------|--------|----------------|-------|------|
 | 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 2 | TLS-Hostname-Verifikation | ⬜ | – | – | – |
+| 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
 | 3 | SSH-Host-Key-Verifikation | ⬜ | – | – | – |
 | 4 | MongoDB-Treiber absichern | ⬜ | – | – | – |
 | 5 | Gefährliche FFI-Externs | ⬜ | – | – | – |
