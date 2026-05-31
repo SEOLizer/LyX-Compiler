@@ -90,7 +90,7 @@ pub con DEFAULT_DIR_MODE: int64 := 493;  // 0755
 
 ---
 
-## WP-FS-03: File-Utilities (Copy, Move, ReadAll) ⬜
+## WP-FS-03: File-Utilities (Copy, Move, ReadAll) ✅
 
 **Ziel:** Komfort-Operationen die auf bestehenden Primitiven aufbauen.
 
