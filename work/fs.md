@@ -20,7 +20,7 @@ Symlink-Support, rekursive Operationen, automatisch allokierendes FileReadAll.
 
 ---
 
-## WP-FS-01: File-Existence & Type-Checks ⬜
+## WP-FS-01: File-Existence & Type-Checks ✅
 
 **Ziel:** Die häufigsten Prüffragen „Existiert die Datei?", „Ist es ein Verzeichnis?"
 direkt beantworten können.
