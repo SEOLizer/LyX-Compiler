@@ -50,7 +50,7 @@ pub fn IsFile(path: pchar): bool
 
 ---
 
-## WP-FS-02: Verzeichnis-Schreib-Ops & Umbenennungen ⬜
+## WP-FS-02: Verzeichnis-Schreib-Ops & Umbenennungen ✅
 
 **Ziel:** Die bereits als Compiler-Builtins vorhandenen Syscalls
 (`mkdir`, `rmdir`, `rename`, `chmod`) als saubere pub-Funktionen in `std/fs` anbieten.
