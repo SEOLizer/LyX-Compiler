@@ -137,22 +137,6 @@ Response-Parsing: nur Status-Code und Content-Length.
 
 ---
 
-### FEAT-12 — `std/net/dns.lyx`: CAA/DNSSEC fehlen, kein System-Resolver
-
-**Ist-Zustand:** Sehr vollständig – A, AAAA, CNAME, MX, NS, TXT, SOA, PTR, SRV mit Google/Cloudflare-Shortcuts.
-
-**Fehlende Features (kleine Lücken):**
-
-| Feature | Beschreibung |
-|---------|-------------|
-| CAA-Record | `DNSResolveCAA` – Certification Authority Authorization |
-| DS / DNSKEY | DNSSEC-Validierungsrecords |
-| System-Resolver | `DNSResolveSystem(host)` → `/etc/resolv.conf` parsen statt hartkodierter IP |
-| DoH (DNS over HTTPS) | `DNSResolveDoH(host)` via `https://dns.google/dns-query` |
-| Response-Caching | In-Memory TTL-Cache für häufige Lookups |
-| Reverse-Lookup für IPv6 | `DNSResolvePtr6(ipv6)` → `ip6.arpa`-Format |
-
----
 
 ### FEAT-13 — `std/net/mqtt.lyx`: QoS 1/2, Retained Messages, Last Will fehlen
 
@@ -248,7 +232,7 @@ Response-Parsing: nur Status-Code und Content-Length.
 | FEAT-08 | `std/db/mysql.lyx` | ⬜ Offen | Groß | Mittel |
 | FEAT-09 | `std/db/redis.lyx` | ⬜ Offen | Mittel | Mittel |
 | FEAT-10 | `std/regex.lyx` | ⬜ Offen | Mittel | Mittel |
-| FEAT-12 | `std/net/dns.lyx` | ⬜ Offen | Klein | Niedrig |
+| FEAT-12 | `std/net/dns.lyx` | ✅ Erledigt | Klein | Niedrig |
 | FEAT-13 | `std/net/mqtt.lyx` | ⬜ Offen | Mittel | Mittel |
 | FEAT-14 | `std/vector.lyx` | ⬜ Offen | Mittel | Mittel |
 | FEAT-16 | `std/lyxvision/` | ⬜ Offen | Groß | Mittel |
@@ -265,3 +249,4 @@ Response-Parsing: nur Status-Code und Content-Length.
 | FEAT-07 | `std/hash.lyx` | SHA-256 Multi-Block + HMAC-SHA256 + HashMap + MD5 Streaming + HMAC-MD5 + xxHash64 |
 | FEAT-11 | `std/log.lyx` | log_set_file/color/timestamp + log_infof/debugf/warnf/errorf |
 | FEAT-02 | `std/fs.lyx` | MkDirAll + Readlink + MkTemp (nur FileGlob noch offen) |
+| FEAT-12 | `std/net/dns.lyx` | CAA/DS/DNSKEY-Records + System-Resolver (/etc/resolv.conf) + Response-Cache (TTL) + IPv6-PTR (ip6.arpa) + DoH (DNS over HTTPS) + DNSResolvePTR-Fix |
