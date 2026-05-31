@@ -1037,3 +1037,149 @@ pub fn MkdirAll(path: pchar, mode: int64): bool {
 
   return IsDirectory(path);
 }
+
+// ============================================================================
+// WP-FS-08: DirWalk — Rekursive Verzeichnis-Traversal
+// ============================================================================
+//
+// Ergebnis-Buffer-Layout:
+//   [0..7]   count     int64 — Anzahl Einträge gesamt
+//   [8..15]  totalSize int64 — Puffergröße für DirWalkFree
+//   [16..23] writePos  int64 — aktueller Schreib-Cursor (intern)
+//   [24..]   Einträge  — je: pathLen(8) + type(1) + fullPath(pathLen) + NUL
+//
+// Symlinks auf Verzeichnisse werden NICHT verfolgt (verhindert Loops).
+// Maximale Tiefe: 32 Ebenen. Puffer: 4 MB.
+
+con DIRWALK_BUF_SIZE:  int64 := 4194304;  // 4 MB
+con DIRWALK_MAX_DEPTH: int64 := 32;
+con DIRWALK_HDR_SIZE:  int64 := 24;
+
+// Privat: einen Eintrag in den Ergebnis-Buffer schreiben
+fn dw_addEntry(resBuf: int64, fullPath: pchar, pathLen: int64, eType: int64): void {
+  var wpos: int64 := peek64(resBuf + 16);
+  var needed: int64 := 8 + 1 + pathLen + 1;
+  if (wpos + needed >= DIRWALK_BUF_SIZE) {
+    return;
+  }
+  poke64(resBuf + wpos, pathLen);
+  wpos := wpos + 8;
+  poke8(resBuf + wpos, eType);
+  wpos := wpos + 1;
+  var i: int64 := 0;
+  while (i < pathLen) {
+    poke8(resBuf + wpos + i, StrCharAt(fullPath, i));
+    i := i + 1;
+  }
+  poke8(resBuf + wpos + pathLen, 0);
+  wpos := wpos + pathLen + 1;
+  poke64(resBuf + 16, wpos);
+  poke64(resBuf, peek64(resBuf) + 1);
+}
+
+// Privat: rekursiver Traversal-Kern
+fn dw_recurse(root: pchar, resBuf: int64, depth: int64): void {
+  if (depth > DIRWALK_MAX_DEPTH) {
+    return;
+  }
+  var d: int64 := DirList(root);
+  if (d == 0) {
+    return;
+  }
+  var count: int64 := peek64(d);
+  var pos: int64 := 16;
+  var pathBuf: pchar := StrNew(4096);
+  var idx: int64 := 0;
+  while (idx < count) {
+    var nameLen: int64 := peek64(d + pos);
+    pos := pos + 8;
+    var eType: int64 := peek8(d + pos);
+    pos := pos + 1;
+    var namePtr: pchar := (d + pos) as pchar;
+    PathJoin(pathBuf, root, namePtr);
+    var fullLen: int64 := StrLen(pathBuf);
+    dw_addEntry(resBuf, pathBuf, fullLen, eType);
+    if (eType == DT_DIR) {
+      dw_recurse(pathBuf, resBuf, depth + 1);
+    }
+    pos := pos + nameLen + 1;
+    idx := idx + 1;
+  }
+  DirFree(d);
+  munmap(pathBuf as int64, 4096);
+}
+
+// Privat: lineares Suchen des i-ten Eintrags; gibt Zeiger auf Entry zurück (0 = nicht gefunden)
+fn dw_findEntry(result: int64, index: int64): int64 {
+  if (result == 0) {
+    return 0;
+  }
+  var count: int64 := peek64(result);
+  if (index < 0 || index >= count) {
+    return 0;
+  }
+  var pos: int64 := DIRWALK_HDR_SIZE;
+  var i: int64 := 0;
+  while (i < index) {
+    var nameLen: int64 := peek64(result + pos);
+    pos := pos + 8 + 1 + nameLen + 1;
+    i := i + 1;
+  }
+  return result + pos;
+}
+
+// Durchläuft root rekursiv. Gibt opakes Handle zurück (0 = Fehler).
+// Symlinks auf Verzeichnisse werden nicht verfolgt.
+pub fn DirWalk(root: pchar): int64 {
+  if (!IsDirectory(root)) {
+    return 0;
+  }
+  var buf: int64 := mmap(0, DIRWALK_BUF_SIZE, 3, 34, -1, 0);
+  poke64(buf,      0);                 // count
+  poke64(buf + 8,  DIRWALK_BUF_SIZE); // totalSize
+  poke64(buf + 16, DIRWALK_HDR_SIZE); // writePos
+  dw_recurse(root, buf, 0);
+  return buf;
+}
+
+// Gibt die Anzahl der gefundenen Einträge zurück.
+pub fn DirWalkCount(result: int64): int64 {
+  if (result == 0) {
+    return 0;
+  }
+  return peek64(result);
+}
+
+// Schreibt den vollständigen Pfad des index-ten Eintrags null-terminiert nach outBuf.
+// Gibt die Pfad-Länge zurück, -1 bei ungültigem Index.
+pub fn DirWalkPath(result: int64, index: int64, outBuf: pchar): int64 {
+  var entry: int64 := dw_findEntry(result, index);
+  if (entry == 0) {
+    return -1;
+  }
+  var pathLen: int64 := peek64(entry);
+  var namePtr: int64 := entry + 9;
+  var i: int64 := 0;
+  while (i < pathLen) {
+    StrSetChar(outBuf, i, peek8(namePtr + i));
+    i := i + 1;
+  }
+  StrSetChar(outBuf, pathLen, 0);
+  return pathLen;
+}
+
+// Gibt den DT_*-Typ des index-ten Eintrags zurück.
+pub fn DirWalkType(result: int64, index: int64): int64 {
+  var entry: int64 := dw_findEntry(result, index);
+  if (entry == 0) {
+    return DT_UNKNOWN;
+  }
+  return peek8(entry + 8);
+}
+
+// Gibt den von DirWalk allokierten Buffer frei.
+pub fn DirWalkFree(result: int64): void {
+  if (result != 0) {
+    munmap(result, DIRWALK_BUF_SIZE);
+  }
+}

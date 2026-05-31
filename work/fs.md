@@ -284,7 +284,7 @@ pub fn MkdirAll(path: pchar, mode: int64): bool
 
 ---
 
-## WP-FS-08: DirWalk — Rekursive Verzeichnis-Traversal ⬜
+## WP-FS-08: DirWalk — Rekursive Verzeichnis-Traversal ✅
 
 **Ziel:** Ein komplettes Verzeichnis rekursiv durchlaufen. Grundlage für Tools wie
 `find`, rekursives Kopieren, Datei-Suche.
