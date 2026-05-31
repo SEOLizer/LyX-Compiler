@@ -1,4 +1,4 @@
-# Lyx v0.9.0B — Canonical EBNF Grammar
+# Lyx v0.9.0C — Canonical EBNF Grammar
 
 Status: Draft
 Target parser: Recursive Descent + Pratt Expression Parser
@@ -263,7 +263,7 @@ TypeParamList       = Ident { "," Ident } ;
 
 ParamList           = Param { "," Param } ;
 
-Param               = [ "con" ] Ident ":" Type ;
+Param               = [ "con" ] Ident ":" Type [ "=" Expr ] ;
 
 ReturnType          = Type | TupleType ;
 ```
@@ -727,9 +727,44 @@ SuperExpr           = "super" ;
 
 TupleExpr           = "(" Expr "," Expr { "," Expr } ")" ;
 
-ArgList             = Expr { "," Expr } ;
+ArgList             = Arg { "," Arg } ;
+
+Arg                 = NamedArg
+                    | Expr ;
+
+NamedArg            = Ident ":" Expr ;
 
 TypeArgList         = Type { "," Type } ;
+```
+
+## 15.1 Named Arguments and Default Parameters
+
+```text
+A NamedArg "name : Expr" in a call passes the argument by name.
+The parser disambiguates NamedArg from a bare Expr by two-token lookahead:
+if the current token is Ident and the next token is ":" (not ":="),
+the sequence is treated as NamedArg.
+
+A Param may carry an optional default value "= Expr".
+Default values MUST be compile-time evaluable (constants or literals).
+A call may omit trailing arguments that have defaults; the compiler
+fills them in during code generation.
+Named arguments may be used to pass a non-first parameter by name
+when all omitted leading parameters have defaults.
+```
+
+## 15.2 Chained Postfix Access
+
+```text
+PostfixSuffix may be chained arbitrarily, enabling patterns such as
+
+    self.arr[i].field       — array element then struct field
+    obj.method()[j].prop    — call result indexed then field
+    a[i][j]                 — multi-dimensional index
+
+The grammar captures this through the { PostfixSuffix } repetition on
+PostfixExpr; no additional production is needed.
+LValue follows the same rule via the { LValueSuffix } repetition.
 ```
 
 ---
@@ -834,7 +869,10 @@ ConstPrimaryExpr          = Literal
 
 ConstTupleExpr            = "(" ConstExpr "," ConstExpr { "," ConstExpr } ")" ;
 
-ConstArgList              = ConstExpr { "," ConstExpr } ;
+ConstArgList              = ConstArg { "," ConstArg } ;
+
+ConstArg                  = Ident ":" ConstExpr
+                          | ConstExpr ;
 ```
 
 ## 17.1 Constant Expression Parsing Rule
@@ -917,6 +955,8 @@ unit-type conversion semantics
 overflow behavior
 nullability type rules
 visibility and module export rules
+default parameter value evaluation order and scoping
+named argument resolution when callee is an imported or builtin function
 ```
 
 ---
@@ -949,6 +989,14 @@ The nullable type suffix is limited to one "?".
 The lexer disambiguates ".", "..", "...", "?", "??", "?.", "|", "|>", and "|~".
 
 The IfStmt grammar requires a Block for the then-branch, avoiding the classic dangling-else ambiguity.
+
+Param supports an optional default value "= Expr" (WP-MEM-05).
+
+ArgList entries may be positional Expr or named Ident ":" Expr (WP-MEM-05).
+
+NamedArg disambiguation: Ident ":" is a NamedArg only when the next token is ":" (not ":=").
+
+Chained PostfixSuffix enables struct-array element field access: arr[i].field (WP-POKE-09).
 ```
 
 End of canonical grammar.
