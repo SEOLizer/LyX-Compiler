@@ -125,7 +125,7 @@ Alternative: ersten 8 Bytes als Länge speichern (wie DirList) → `FileReadFree
 
 ---
 
-## WP-FS-04: Pfad-Utilities — PathJoin & IsAbsolutePath ⬜
+## WP-FS-04: Pfad-Utilities — PathJoin & IsAbsolutePath ✅
 
 **Ziel:** Die zwei häufigsten Pfad-Operationen die aktuell fehlen.
 `PathNormalize/Dir/Ext/Base/Resolve` sind vorhanden, aber Kombinieren und Prüfen fehlt.
