@@ -138,7 +138,11 @@ TopDecl             = ImportDecl
                     | UtypeDecl
                     | Directive ;
 
-ImportDecl          = "import" DotPath { "," DotPath } ";" ;
+ImportDecl          = "import" ImportItem { "," ImportItem } ";" ;
+
+ImportItem          = DotPath
+                      [ "grant"    "[" CapabilityList "]" ]
+                      [ "restrict" "[" CapabilityList "]" ] ;
 ```
 
 ---
@@ -166,7 +170,9 @@ FuncAttr            = EnergyAttr
                     | WcetAttr
                     | StackLimitAttr
                     | IntegrityAttr
-                    | FlightCritAttr ;
+                    | FlightCritAttr
+                    | CapabilityAttr
+                    | UsesCallerCap ;
 
 EnergyAttr          = "@energy" "(" IntLiteral ")" ;
 
@@ -248,7 +254,8 @@ NestedFnDecl        = "fn"
                       [ ":" ReturnType ]
                       Block ;
 
-ExternFnDecl        = "extern"
+ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
+                      "extern"
                       "fn"
                       Ident
                       "(" [ ParamList ] ")"
@@ -1000,4 +1007,67 @@ Chained PostfixSuffix enables struct-array element field access: arr[i].field (W
 ```
 
 End of canonical grammar.
+
+---
+
+# 22. LCBS Capability Grammar (WP-L1)
+
+```ebnf
+(* Capability annotation for functions, modules and classes *)
+CapabilityAttr    = "@capabilities" "(" ( "[" CapabilityList "]" | "dynamic" ) ")" ;
+
+UsesCallerCap     = "@uses_caller_cap" "(" "[" CapabilityList "]" ")" ;
+
+CapabilityList    = CapabilityDecl { "," CapabilityDecl } ;
+
+CapabilityDecl    = CapabilityPath
+                    [ "(" CapabilityArgList ")" ]
+                    [ "@fastpath" ] ;
+
+CapabilityPath    = Ident { "." Ident } ;
+
+CapabilityArgList = CapabilityArg { "," CapabilityArg } ;
+
+CapabilityArg     = Ident ":" CapabilityArgValue ;
+
+CapabilityArgValue = StringLiteral
+                   | IntLiteral
+                   | Ident
+                   | NetworkTarget
+                   | "dynamic" ;
+
+(* Network address with optional CIDR and port *)
+NetworkTarget     = StringLiteral ":" PortSpec ;
+
+PortSpec          = "*"
+                  | IntLiteral
+                  | IntLiteral "-" IntLiteral ;
+```
+
+## 22.1 ImportItem with grant/restrict (amended from Section 3)
+
+`grant` and `restrict` are soft keywords (tokenised as identifiers, interpreted contextually).
+
+```text
+Effective capabilities rule:
+  Without grant:  C(M) = C(M_declared) ∩ C(parent)
+  With grant:     C(M) = grant_set ∩ C(parent)
+  With restrict:  C(M) = C(M_declared) ∩ C(parent) ∩ restrict_set
+  Invariant:      C(M) ⊆ C(parent)
+```
+
+## 22.2 AST Node Mapping
+
+| Syntax | AST Node | Fields |
+|--------|----------|--------|
+| `@capabilities([...])` | `NK_CAPABILITY_ATTR` | c0=first NK_CAPABILITY_DECL; iVal=0 |
+| `@capabilities(dynamic)` | `NK_CAPABILITY_ATTR` | c0=-1; iVal=1 |
+| `fs.read(path: "/etc")` | `NK_CAPABILITY_DECL` | sOff/sLen=path; c0=first NK_CAPABILITY_ARG; iVal: bit0=@fastpath |
+| `path: "/etc"` | `NK_CAPABILITY_ARG` | sOff/sLen=key; c0=value node |
+| `"192.168.1.0/24":5000` | `NK_NETWORK_TARGET` | sOff/sLen=addr; iVal=port (0=wildcard) |
+| `grant [...]` on import | `NK_GRANT_CLAUSE` | c0=first NK_CAPABILITY_DECL |
+| `restrict [...]` on import | `NK_RESTRICT_CLAUSE` | c0=first NK_CAPABILITY_DECL |
+| `@uses_caller_cap([...])` | `NK_USES_CALLER_CAP` | c0=first NK_CAPABILITY_DECL |
+| `NK_IMPORT` with grant | `NK_IMPORT` | sOff/sLen=path; c1=NK_GRANT_CLAUSE; c2=NK_RESTRICT_CLAUSE |
+| `@cap(path) extern fn` | `NK_FUNC_DECL` (extern) | c2=NK_CAPABILITY_ATTR; c3=link-target |
 
