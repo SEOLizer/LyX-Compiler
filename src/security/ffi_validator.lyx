@@ -1,0 +1,188 @@
+// ===========================================================================
+// WP-L5: FFI-Klassifizierung + Signatur-Validierung
+// ===========================================================================
+// Klassifiziert extern fn-Deklarationen in vier Klassen:
+//
+//   Klasse 0 (Safe):       reine Berechnung, kein Seiteneffekt
+//   Klasse 1 (OS Resource): OS-Zugriff, erlaubt mit Capability
+//   Klasse 2 (Process):    Prozesssteuerung, erlaubt mit Capability
+//   Klasse 3 (Verboten):   immer verboten — Build bricht ab
+//
+// Design: Classify und Hilfsprüfungen als eigenständige Top-Level-Funktionen
+// (keine Klassen-Methoden-Ketten), um VMT-Dispatch-Probleme zu vermeiden.
+
+// ============================================================================
+// Klassen-Konstanten
+// ============================================================================
+
+pub con FFI_CLASS_SAFE:      int64 := 0;
+pub con FFI_CLASS_OS:        int64 := 1;
+pub con FFI_CLASS_PROCESS:   int64 := 2;
+pub con FFI_CLASS_FORBIDDEN: int64 := 3;
+
+// ============================================================================
+// Hilfsfunktion: längengebundener Namensvergleich gegen null-term. Literal
+// ============================================================================
+
+pub fn ffi_nameEq(lit: pchar, name: pchar, nameLen: int64): bool {
+  var i: int64 := 0;
+  while i < nameLen {
+    if StrCharAt(lit, i) != StrCharAt(name, i) { return false; }
+    i := i + 1;
+  }
+  return StrCharAt(lit, nameLen) == 0;
+}
+
+// ============================================================================
+// Klassifizierungs-Funktionen (Top-Level, kein VMT)
+// ============================================================================
+
+// True wenn Name in der Hard-Blacklist steht.
+pub fn ffi_isHardBlacklisted(name: pchar, nameLen: int64): bool {
+  if ffi_nameEq("gets"c,     name, nameLen) { return true; }
+  if ffi_nameEq("system"c,   name, nameLen) { return true; }
+  if ffi_nameEq("popen"c,    name, nameLen) { return true; }
+  if ffi_nameEq("sprintf"c,  name, nameLen) { return true; }
+  if ffi_nameEq("vsprintf"c, name, nameLen) { return true; }
+  if ffi_nameEq("strcpy"c,   name, nameLen) { return true; }
+  if ffi_nameEq("strcat"c,   name, nameLen) { return true; }
+  if ffi_nameEq("wcscpy"c,   name, nameLen) { return true; }
+  if ffi_nameEq("wcscat"c,   name, nameLen) { return true; }
+  if ffi_nameEq("execve"c,   name, nameLen) { return true; }
+  if ffi_nameEq("execvp"c,   name, nameLen) { return true; }
+  if ffi_nameEq("execlp"c,   name, nameLen) { return true; }
+  if ffi_nameEq("execl"c,    name, nameLen) { return true; }
+  if ffi_nameEq("execle"c,   name, nameLen) { return true; }
+  if ffi_nameEq("execvpe"c,  name, nameLen) { return true; }
+  return false;
+}
+
+// True wenn Name zur Format-String-Familie gehört.
+pub fn ffi_isFormatStringFamily(name: pchar, nameLen: int64): bool {
+  if ffi_nameEq("printf"c,   name, nameLen) { return true; }
+  if ffi_nameEq("fprintf"c,  name, nameLen) { return true; }
+  if ffi_nameEq("scanf"c,    name, nameLen) { return true; }
+  if ffi_nameEq("fscanf"c,   name, nameLen) { return true; }
+  if ffi_nameEq("sscanf"c,   name, nameLen) { return true; }
+  if ffi_nameEq("vprintf"c,  name, nameLen) { return true; }
+  if ffi_nameEq("vfprintf"c, name, nameLen) { return true; }
+  if ffi_nameEq("vscanf"c,   name, nameLen) { return true; }
+  return false;
+}
+
+// True wenn Name zur strncpy/strncat-Familie gehört (Klasse 1, Warnung).
+pub fn ffi_isStrncpyFamily(name: pchar, nameLen: int64): bool {
+  if ffi_nameEq("strncpy"c, name, nameLen) { return true; }
+  if ffi_nameEq("strncat"c, name, nameLen) { return true; }
+  if ffi_nameEq("wcsncpy"c, name, nameLen) { return true; }
+  if ffi_nameEq("wcsncat"c, name, nameLen) { return true; }
+  return false;
+}
+
+// Klassifiziert eine extern fn-Deklaration vollständig.
+// name/nameLen:   Funktionsname (längengebunden aus AST)
+// pcharCount:     Anzahl pchar/^-Parameter (aus iVal)
+// sizeCount:      Anzahl u64/usize/…-Parameter (aus iVal)
+// variadic:       1 wenn ... (aus iVal)
+// hasFormatCap:   true wenn @capabilities([system.unsafe.format_string]) gesetzt
+pub fn ffi_classify(name: pchar, nameLen: int64,
+                    pcharCount: int64, sizeCount: int64, variadic: int64,
+                    hasFormatCap: bool): int64 {
+  // 1. Hard-Blacklist
+  if ffi_isHardBlacklisted(name, nameLen) { return FFI_CLASS_FORBIDDEN; }
+
+  // 2. Format-String-Familie
+  if ffi_isFormatStringFamily(name, nameLen) {
+    if hasFormatCap { return FFI_CLASS_OS; }
+    return FFI_CLASS_FORBIDDEN;
+  }
+
+  // 3. Bekannte sichere Funktionen (Klasse 0)
+  if ffi_nameEq("strlcpy"c,  name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("strlcat"c,  name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("snprintf"c, name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("vsnprintf"c,name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("memcpy"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("memmove"c,  name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("memset"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("memcmp"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("strlen"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("malloc"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("free"c,     name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("realloc"c,  name, nameLen) { return FFI_CLASS_SAFE; }
+  if ffi_nameEq("calloc"c,   name, nameLen) { return FFI_CLASS_SAFE; }
+
+  // 4. strncpy/strncat-Familie → Klasse 1 (Warnung, kein Fehler)
+  if ffi_isStrncpyFamily(name, nameLen) { return FFI_CLASS_OS; }
+
+  // 5. Signatur-basiert: ≥2 pchar ohne Größenlimit → Klasse 3
+  if pcharCount >= 2 && sizeCount == 0 { return FFI_CLASS_FORBIDDEN; }
+
+  // 6. Bekannte Klasse-1-Funktionen
+  if ffi_nameEq("open"c,          name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("close"c,         name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("read"c,          name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("write"c,         name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("fopen"c,         name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("fclose"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("fread"c,         name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("fwrite"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("socket"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("bind"c,          name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("listen"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("connect"c,       name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("getenv"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("setenv"c,        name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("time"c,          name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("clock_gettime"c, name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("exit"c,          name, nameLen) { return FFI_CLASS_OS; }
+  if ffi_nameEq("abort"c,         name, nameLen) { return FFI_CLASS_OS; }
+
+  // 7. Klasse-2-Funktionen
+  if ffi_nameEq("fork"c,     name, nameLen) { return FFI_CLASS_PROCESS; }
+  if ffi_nameEq("execveat"c, name, nameLen) { return FFI_CLASS_PROCESS; }
+  if ffi_nameEq("kill"c,     name, nameLen) { return FFI_CLASS_PROCESS; }
+
+  return FFI_CLASS_SAFE;
+}
+
+// Fehlermeldungen
+pub fn ffi_blacklistMsg(): pchar {
+  return "extern fn in FFI-Blacklist (Klasse 3) — direkter Aufruf verboten"c;
+}
+pub fn ffi_signatureMsg(): pchar {
+  return "extern fn: ≥2 pchar-Parameter ohne Größenlimit (Klasse 3 via Signatur)"c;
+}
+pub fn ffi_formatStringMsg(): pchar {
+  return "extern fn ist Format-String-Funktion — @capabilities([system.unsafe.format_string]) erforderlich"c;
+}
+pub fn ffi_strncpyWarnMsg(): pchar {
+  return "extern fn: strncpy/strncat schreibt keinen NUL-Terminator — strlcpy/strlcat bevorzugen"c;
+}
+
+// ============================================================================
+// FfiValidator: dünne Klasse als API-Wrapper (alle Logik in Top-Level-Fns)
+// ============================================================================
+
+pub type FfiValidator = class {
+  pub fn Init(): void {}
+
+  pub fn IsHardBlacklisted(name: pchar, nameLen: int64): bool {
+    return ffi_isHardBlacklisted(name, nameLen);
+  }
+  pub fn IsFormatStringFamily(name: pchar, nameLen: int64): bool {
+    return ffi_isFormatStringFamily(name, nameLen);
+  }
+  pub fn IsStrncpyFamily(name: pchar, nameLen: int64): bool {
+    return ffi_isStrncpyFamily(name, nameLen);
+  }
+  pub fn Classify(name: pchar, nameLen: int64,
+                  pcharCount: int64, sizeCount: int64, variadic: int64,
+                  hasFormatCap: bool): int64 {
+    return ffi_classify(name, nameLen, pcharCount, sizeCount, variadic, hasFormatCap);
+  }
+  pub fn BlacklistErrorMsg(): pchar   { return ffi_blacklistMsg(); }
+  pub fn SignatureErrorMsg(): pchar   { return ffi_signatureMsg(); }
+  pub fn FormatStringErrorMsg(): pchar{ return ffi_formatStringMsg(); }
+  pub fn StrncpyWarnMsg(): pchar      { return ffi_strncpyWarnMsg(); }
+};

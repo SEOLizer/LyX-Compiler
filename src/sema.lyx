@@ -10,6 +10,7 @@ import src.std.alloc;
 import src.security.capabilities;
 import src.security.capability_resolver;
 import src.security.cap_graph;
+import src.security.ffi_validator;
 
 // ============================================================================
 // Symbol kinds
@@ -1811,8 +1812,57 @@ pub type Sema = class {
     }
   }
 
+  // WP-L5: Prüft extern fn-Deklarationen auf FFI-Sicherheitsklasse.
+  // Wird in _checkFuncDecl aufgerufen wenn iVal & 1 == 1 und c3 != -1 (extern fn).
+  fn _checkExternFn(ni: int64): void {
+    var iVal:    int64 := self.sn_iVal(ni);
+    var name:    pchar := self.sn_sVal(ni);
+    var nameLen: int64 := self.sn_sLen(ni);
+
+    // Signatur-Info aus iVal entpacken (WP-L5: Parser speichert dort)
+    var pcharCount: int64 := (iVal >> 8) & 0xFF;
+    var sizeCount:  int64 := (iVal >> 16) & 0xFF;
+    var variadic:   int64 := (iVal >> 24) & 1;
+
+    // Prüfen ob @capabilities([system.unsafe.format_string]) gesetzt
+    var hasFormatCap: bool := false;
+    var capAttrNi: int64 := self.sn_c2(ni);
+    if capAttrNi >= 0 && self.sn_kind(capAttrNi) == SNK_CAPABILITY_ATTR {
+      var capReg: CapabilityRegistry;
+      capReg.Init();
+      var decl: int64 := self.sn_c0(capAttrNi);
+      while decl >= 0 {
+        var cPath: pchar  := self.sn_sVal(decl);
+        var cLen:  int64  := self.sn_sLen(decl);
+        if capReg.LookupId(cPath, cLen) == CAP_SYSTEM_UNSAFE_FORMAT {
+          hasFormatCap := true;
+        }
+        decl := self.sn_next(decl);
+      }
+    }
+
+    var cls: int64 := ffi_classify(name, nameLen, pcharCount, sizeCount, variadic, hasFormatCap);
+
+    if cls == FFI_CLASS_FORBIDDEN {
+      if ffi_isHardBlacklisted(name, nameLen) {
+        self._errorNode(ffi_blacklistMsg(), ni);
+      } else if ffi_isFormatStringFamily(name, nameLen) {
+        self._errorNode(ffi_formatStringMsg(), ni);
+      } else {
+        self._errorNode(ffi_signatureMsg(), ni);
+      }
+    } else if ffi_isStrncpyFamily(name, nameLen) {
+      self._warnNode(ffi_strncpyWarnMsg(), ni);
+    }
+  }
+
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
+
+    // WP-L5: extern fn-Validierung (iVal & 1 = extern, c3 != -1 = hat link-String)
+    if (self.sn_iVal(ni) & 1) != 0 && self.sn_c3(ni) != -1 {
+      self._checkExternFn(ni);
+    }
 
     // WP-13: Capture analysis - track current function for nested function detection
     var funcName: pchar := self.sn_sVal(ni);
