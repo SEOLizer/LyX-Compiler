@@ -9,6 +9,7 @@ import src.parser;
 import src.std.alloc;
 import src.security.capabilities;
 import src.security.capability_resolver;
+import src.security.cap_graph;
 
 // ============================================================================
 // Symbol kinds
@@ -340,6 +341,10 @@ pub type Sema = class {
   importCapCache:  int64;   // ptr: (nameHash:8, capSetPtr:8) Paare
   importCapCount:  int64;
   importCapCap:    int64;
+
+  // WP-L4: Transitiver Capability-Graph
+  capGraph:        CapGraph;  // Modul-Import-Graph für transitive Hülle
+  rootNodeIdx:     int64;     // Graph-Index des Wurzelmoduls (aktuell kompilierte Datei)
 
   // ------------------------------------------------------------------
   // Node access helpers
@@ -789,6 +794,44 @@ pub type Sema = class {
       capScanNi := self.sn_next(capScanNi);
     }
     self._cacheImportCaps(modName, modLen, importedCaps);
+
+    // WP-L4: Knoten im Cap-Graph anlegen und eigene Caps setzen
+    var nodeIdx: int64 := self.capGraph.AddNode(modName, modLen);
+    if nodeIdx >= 0 {
+      self.capGraph.SetOwnCapsFromCapSet(nodeIdx, importedCaps.entries, importedCaps.count);
+
+      // @uses_caller_cap-Caps zu eigenen Caps hinzufügen
+      var ucScanNi: int64 := head;
+      while ucScanNi >= 0 {
+        if self.sn_kind(ucScanNi) == SNK_USES_CALLER_CAP {
+          var ucDecl: int64 := self.sn_c0(ucScanNi);
+          while ucDecl >= 0 {
+            var ucPath: pchar  := self.sn_sVal(ucDecl);
+            var ucLen:  int64  := self.sn_sLen(ucDecl);
+            var ucReg:  CapabilityRegistry;
+            ucReg.Init();
+            var ucId: int64 := ucReg.LookupId(ucPath, ucLen);
+            if ucId >= 0 {
+              self.capGraph.AddOwnCap(nodeIdx, ucId, self._hashCapArgs(self.sn_c0(ucDecl)));
+            }
+            ucDecl := self.sn_next(ucDecl);
+          }
+        }
+        ucScanNi := self.sn_next(ucScanNi);
+      }
+
+      // Kanten zu direkten Imports dieses Moduls hinzufügen
+      var impScanNi: int64 := head;
+      while impScanNi >= 0 {
+        if self.sn_kind(impScanNi) == SNK_IMPORT {
+          var subName: pchar  := self.sn_sVal(impScanNi);
+          var subLen:  int64  := self.sn_sLen(impScanNi);
+          var subIdx:  int64  := self.capGraph.AddNode(subName, subLen);
+          self.capGraph.AddEdge(nodeIdx, subIdx);
+        }
+        impScanNi := self.sn_next(impScanNi);
+      }
+    }
 
     self.src    := savedSrc;
     self.pNodes := savedNodes;
@@ -1729,6 +1772,45 @@ pub type Sema = class {
     dispose effectiveCaps;
   }
 
+  // WP-L4: Wurzelknoten anlegen, Kanten eintragen, Compute() aufrufen.
+  // head: AST-Kopf des aktuell kompilierten Moduls.
+  // rootName / rootLen: Modulname des Wurzelknotens (für Graph-Identifikation).
+  fn _buildCapGraph(head: int64, rootName: pchar, rootLen: int64): void {
+    // Wurzelknoten
+    self.rootNodeIdx := self.capGraph.AddNode(rootName, rootLen);
+    if self.rootNodeIdx >= 0 {
+      self.capGraph.SetOwnCapsFromCapSet(self.rootNodeIdx, self.currModuleCaps.entries, self.currModuleCaps.count);
+
+      // Kanten zu direkten Imports des Wurzelmoduls
+      var ni: int64 := head;
+      while ni >= 0 {
+        if self.sn_kind(ni) == SNK_IMPORT {
+          var subName: pchar := self.sn_sVal(ni);
+          var subLen:  int64 := self.sn_sLen(ni);
+          var subIdx:  int64 := self.capGraph.AddNode(subName, subLen);
+          self.capGraph.AddEdge(self.rootNodeIdx, subIdx);
+        }
+        ni := self.sn_next(ni);
+      }
+    }
+
+    // Transitive Hülle berechnen
+    self.capGraph.Compute();
+
+    // Zyklus-Fehler melden
+    if self.capGraph.HadCycle() {
+      var fromIdx: int64 := self.capGraph.CycleFrom();
+      var toIdx:   int64 := self.capGraph.CycleTo();
+      PrintStr("sema error: zyklischer Import erkannt: "c);
+      PrintStr(self.capGraph.NodeName(fromIdx));
+      PrintStr(" → "c);
+      PrintStr(self.capGraph.NodeName(toIdx));
+      PrintStr(" → …\n"c);
+      self.hadError   := 1;
+      self.errorCount := self.errorCount + 1;
+    }
+  }
+
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
 
@@ -2667,14 +2749,20 @@ pub type Sema = class {
     self.importCapCount := 0;
     self.importCapCache := alloc(self.importCapCap * 16);  // 32 * (hash:8 + ptr:8)
 
+    // WP-L4: Transitiver Capability-Graph
+    self.capGraph    := new CapGraph();
+    self.capGraph.Init();
+    self.rootNodeIdx := -1;
+
     self._registerBuiltins();
   }
 
-  // Run both passes + WP-L3 capability inheritance check; returns hadError
+  // Run both passes + WP-L3/L4 capability checks; returns hadError
   fn Check(head: int64): int64 {
     self.Pass1(head);
     self.Pass2(head);
     self._checkCapabilityInheritance(head);
+    self._buildCapGraph(head, "<root>"c, 6);
     return self.hadError;
   }
 
