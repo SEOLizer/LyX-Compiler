@@ -8,6 +8,7 @@
 import src.parser;
 import src.std.alloc;
 import src.security.capabilities;
+import src.security.capability_resolver;
 
 // ============================================================================
 // Symbol kinds
@@ -155,12 +156,17 @@ con SNK_AT_ENERGY:       int64 := 105; // WP-EN-02: @energy(N) — iv=level(1-5)
 con SNK_DEFER:           int64 := 106; // WP-AS-07: defer Stmt; c0=deferred statement
 con SNK_FOR_RANGE:       int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
 
-// WP-L2: LCBS Capability-AST-Knoten (Kopien von NK_* aus parser.lyx)
+// WP-L2/L3: LCBS Capability-AST-Knoten (Kopien von NK_* aus parser.lyx)
 con SNK_CAPABILITY_ATTR:   int64 := 110; // @capabilities([...]) — c0=first CAPABILITY_DECL; iVal=1 → dynamic
 con SNK_CAPABILITY_DECL:   int64 := 111; // capability path — sOff/sLen=path; c0=first CAPABILITY_ARG
 con SNK_CAPABILITY_ARG:    int64 := 112; // argument — sOff/sLen=key; c0=value node
+con SNK_GRANT_CLAUSE:      int64 := 114; // grant [...] — c0=first CAPABILITY_DECL
+con SNK_RESTRICT_CLAUSE:   int64 := 115; // restrict [...] — c0=first CAPABILITY_DECL
 con SNK_USES_CALLER_CAP:   int64 := 116; // @uses_caller_cap([...]) — c0=first CAPABILITY_DECL
 con SNK_LIT_INT_CAP:       int64 := 40;  // NK_LIT_INT — iVal=integer literal value
+con SNK_LIT_STR_CAP:       int64 := 42;  // NK_LIT_STR — sOff/sLen=string content
+con SNK_IDENT_CAP:         int64 := 46;  // NK_IDENT — sOff/sLen=identifier text
+con SNK_NETWORK_TARGET_CAP: int64 := 113; // NK_NETWORK_TARGET — sOff/sLen=addr; iVal=port
 
 con SEMA_PARAM_FLAG_CON: int64 := 1;  // WP-AS-13: mirrors PARAM_FLAG_CON from parser
 
@@ -328,6 +334,12 @@ pub type Sema = class {
 
   // WP-EN-03: @energy top-level directive state
   energyLevel: int64;  // 0=not set, 1-5=active
+
+  // WP-L3: Capability-Vererbung
+  currModuleCaps:  CapSet;  // C(P) des aktuellen Moduls (aus @capabilities auf main/module)
+  importCapCache:  int64;   // ptr: (nameHash:8, capSetPtr:8) Paare
+  importCapCount:  int64;
+  importCapCap:    int64;
 
   // ------------------------------------------------------------------
   // Node access helpers
@@ -765,6 +777,19 @@ pub type Sema = class {
       }
       si := si + 1;
     }
+
+    // WP-L3: C(M_decl) aus dem importierten Modul extrahieren und cachen
+    var importedCaps: CapSet := new CapSet();
+    importedCaps.Init();
+    var capScanNi: int64 := head;
+    while capScanNi >= 0 {
+      if self.sn_kind(capScanNi) == SNK_CAPABILITY_ATTR && self.sn_iVal(capScanNi) == 0 {
+        self._fillCapSet(self.sn_c0(capScanNi), importedCaps);
+      }
+      capScanNi := self.sn_next(capScanNi);
+    }
+    self._cacheImportCaps(modName, modLen, importedCaps);
+
     self.src    := savedSrc;
     self.pNodes := savedNodes;
 
@@ -1492,6 +1517,216 @@ pub type Sema = class {
       }
       capDecl := self.sn_next(capDecl);
     }
+  }
+
+  // WP-L3: djb2-Hash eines längengebundenen Strings (für paramFp-Berechnung)
+  fn _djb2N(s: pchar, len: int64): int64 {
+    var h: int64 := 5381;
+    var i: int64 := 0;
+    while i < len {
+      h := h * 33 + StrCharAt(s, i);
+      i := i + 1;
+    }
+    return h;
+  }
+
+  // WP-L3: Berechnet paramFp = Hash der Argumente eines NK_CAPABILITY_DECL-Knotens.
+  // argHead: erster NK_CAPABILITY_ARG-Knoten (sn_c0 des NK_CAPABILITY_DECL).
+  // Gibt 0 zurück wenn keine Argumente vorhanden.
+  fn _hashCapArgs(argHead: int64): int64 {
+    if argHead < 0 { return 0; }
+    var h: int64 := 5381;
+    var argNode: int64 := argHead;
+    while argNode >= 0 {
+      // Hash den Schlüsselnamen
+      var keyPtr: pchar  := self.sn_sVal(argNode);
+      var keyLen: int64  := self.sn_sLen(argNode);
+      var ki: int64 := 0;
+      while ki < keyLen {
+        h := h * 33 + StrCharAt(keyPtr, ki);
+        ki := ki + 1;
+      }
+      h := h * 33 + 58;  // ':'
+      // Hash den Wert-Knoten
+      var valNode: int64 := self.sn_c0(argNode);
+      if valNode >= 0 {
+        var vk: int64 := self.sn_kind(valNode);
+        if vk == SNK_LIT_INT_CAP {
+          // Integer-Wert direkt hashen
+          var iv: int64 := self.sn_iVal(valNode);
+          h := h * 33 + iv;
+        } else if vk == SNK_LIT_STR_CAP || vk == SNK_IDENT_CAP {
+          var vPtr: pchar := self.sn_sVal(valNode);
+          var vLen: int64 := self.sn_sLen(valNode);
+          var vi: int64 := 0;
+          while vi < vLen {
+            h := h * 33 + StrCharAt(vPtr, vi);
+            vi := vi + 1;
+          }
+        } else if vk == SNK_NETWORK_TARGET_CAP {
+          // Adress-String + Port
+          var vPtr: pchar := self.sn_sVal(valNode);
+          var vLen: int64 := self.sn_sLen(valNode);
+          var vi: int64 := 0;
+          while vi < vLen {
+            h := h * 33 + StrCharAt(vPtr, vi);
+            vi := vi + 1;
+          }
+          h := h * 33 + self.sn_iVal(valNode);
+        }
+      }
+      argNode := self.sn_next(argNode);
+    }
+    return h;
+  }
+
+  // WP-L3: Füllt ein CapSet aus einer NK_CAPABILITY_DECL-Kette.
+  // declHead: erster NK_CAPABILITY_DECL-Knoten.
+  fn _fillCapSet(declHead: int64, set: CapSet): void {
+    var reg: CapabilityRegistry;
+    reg.Init();
+    var cur: int64 := declHead;
+    while cur >= 0 {
+      var path: pchar    := self.sn_sVal(cur);
+      var pathLen: int64 := self.sn_sLen(cur);
+      var capId: int64   := reg.LookupId(path, pathLen);
+      if capId >= 0 {
+        var fp: int64 := self._hashCapArgs(self.sn_c0(cur));
+        set.Add(capId, fp);
+      }
+      cur := self.sn_next(cur);
+    }
+  }
+
+  // WP-L3: Füllt currModuleCaps aus allen NK_CAPABILITY_ATTR-Knoten im AST.
+  fn _collectParentCaps(head: int64): void {
+    self.currModuleCaps.Clear();
+    var ni: int64 := head;
+    while ni >= 0 {
+      if self.sn_kind(ni) == SNK_CAPABILITY_ATTR && self.sn_iVal(ni) == 0 {
+        self._fillCapSet(self.sn_c0(ni), self.currModuleCaps);
+      }
+      ni := self.sn_next(ni);
+    }
+  }
+
+  // WP-L3: Speichert die Capabilities eines importierten Moduls im Cache.
+  fn _cacheImportCaps(modName: pchar, modLen: int64, set: CapSet): void {
+    if self.importCapCount >= self.importCapCap {
+      var newCap: int64 := self.importCapCap * 2;
+      var nb: int64 := alloc(newCap * 16);
+      memcpy(nb, self.importCapCache, self.importCapCount * 16);
+      free(self.importCapCache, self.importCapCap * 16);
+      self.importCapCache := nb;
+      self.importCapCap   := newCap;
+    }
+    var hash: int64 := self._djb2N(modName, modLen);
+    var off:  int64 := self.importCapCache + self.importCapCount * 16;
+    poke64(off,     hash);
+    poke64(off + 8, set as int64);
+    self.importCapCount := self.importCapCount + 1;
+  }
+
+  // WP-L3: Sucht C(M_decl) im Cache; Rückgabe: CapSet-Zeiger oder 0.
+  fn _lookupImportCaps(modName: pchar, modLen: int64): CapSet {
+    var hash: int64 := self._djb2N(modName, modLen);
+    var i: int64 := 0;
+    while i < self.importCapCount {
+      var off: int64 := self.importCapCache + i * 16;
+      if peek64(off) == hash {
+        return peek64(off + 8) as CapSet;
+      }
+      i := i + 1;
+    }
+    return 0 as CapSet;
+  }
+
+  // WP-L3: Hauptvalidierungspass — wird nach Pass1+Pass2 aufgerufen.
+  // Phase 1: C(P) aus @capabilities-Annotation sammeln.
+  // Phase 2: Imports gegen Vererbungsregeln prüfen.
+  fn _checkCapabilityInheritance(head: int64): void {
+    // Phase 1: C(P) aus @capabilities-Knoten sammeln
+    self._collectParentCaps(head);
+
+    // Phase 2: jeden NK_IMPORT-Knoten validieren
+    var resolver: CapabilityResolver;
+    resolver.Init();
+    var effectiveCaps: CapSet := new CapSet();
+    effectiveCaps.Init();
+
+    var ni: int64 := head;
+    while ni >= 0 {
+      if self.sn_kind(ni) == SNK_IMPORT {
+        var modName: pchar  := self.sn_sVal(ni);
+        var modLen: int64   := self.sn_sLen(ni);
+        var grantNi: int64  := self.sn_c1(ni);
+        var restrictNi: int64 := self.sn_c2(ni);
+
+        var moduleDecl: CapSet := self._lookupImportCaps(modName, modLen);
+        var hasGrant: bool := grantNi >= 0 && self.sn_kind(grantNi) == SNK_GRANT_CLAUSE;
+        var hasRestrict: bool := restrictNi >= 0 && self.sn_kind(restrictNi) == SNK_RESTRICT_CLAUSE;
+
+        // Warnung: kein explizites grant (Kriterium 6)
+        if !hasGrant {
+          self._warnNode("Import ohne explizites grant — Security-Score -2"c, ni);
+        }
+
+        if hasGrant {
+          // Regel 2: grant vorhanden
+          var grantSet: CapSet := new CapSet();
+          grantSet.Init();
+          self._fillCapSet(self.sn_c0(grantNi), grantSet);
+
+          var escId: int64 := resolver.ComputeGrant(self.currModuleCaps, grantSet, effectiveCaps);
+          if escId >= 0 {
+            // Eskalationsversuch (Kriterium 3)
+            var reg2: CapabilityRegistry;
+            reg2.Init();
+            // Fehlermeldung mit Capability-ID
+            self._errorNode("grant enthält Capability die nicht in Parent-Capabilities ist"c, grantNi);
+          }
+
+          // Breaking-Change-Prüfung (Kriterium 5)
+          if moduleDecl != 0 as CapSet {
+            var breakId: int64 := resolver.DetectBreakingChange(grantSet, moduleDecl);
+            if breakId >= 0 {
+              self._errorNode("Breaking Change: grant-Parameter stimmt nicht mit Modul-Deklaration überein"c, grantNi);
+            }
+          }
+
+          dispose grantSet;
+        } else if moduleDecl != 0 as CapSet {
+          // Regel 1: kein grant, aber C(M_decl) bekannt
+          var missingId: int64 := resolver.ComputeNoGrant(self.currModuleCaps, moduleDecl, effectiveCaps);
+          if missingId >= 0 {
+            self._errorNode("importiertes Modul deklariert Capability die im Parent fehlt"c, ni);
+          }
+        }
+
+        if hasRestrict {
+          var restrictSet: CapSet := new CapSet();
+          restrictSet.Init();
+          self._fillCapSet(self.sn_c0(restrictNi), restrictSet);
+          var restricted: CapSet := new CapSet();
+          restricted.Init();
+          resolver.ApplyRestrict(effectiveCaps, restrictSet, restricted);
+          dispose effectiveCaps;
+          effectiveCaps := restricted;
+          dispose restrictSet;
+        }
+
+        // Invarianten-Check: C(M) ⊆ C(P)
+        var violId: int64 := resolver.CheckInvariant(effectiveCaps, self.currModuleCaps);
+        if violId >= 0 {
+          self._errorNode("Invariantenverletzung: C(M) ⊄ C(P)"c, ni);
+        }
+
+        effectiveCaps.Clear();
+      }
+      ni := self.sn_next(ni);
+    }
+
+    dispose effectiveCaps;
   }
 
   fn _checkFuncDecl(ni: int64) {
@@ -2425,13 +2660,21 @@ pub type Sema = class {
     // WP-EN-03
     self.energyLevel := 0;
 
+    // WP-L3: Capability-Vererbung
+    self.currModuleCaps := new CapSet();
+    self.currModuleCaps.Init();
+    self.importCapCap   := 32;
+    self.importCapCount := 0;
+    self.importCapCache := alloc(self.importCapCap * 16);  // 32 * (hash:8 + ptr:8)
+
     self._registerBuiltins();
   }
 
-  // Run both passes; returns hadError
+  // Run both passes + WP-L3 capability inheritance check; returns hadError
   fn Check(head: int64): int64 {
     self.Pass1(head);
     self.Pass2(head);
+    self._checkCapabilityInheritance(head);
     return self.hadError;
   }
 
