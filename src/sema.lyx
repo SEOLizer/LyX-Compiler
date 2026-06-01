@@ -173,6 +173,13 @@ con SNK_NETWORK_TARGET_CAP: int64 := 113; // NK_NETWORK_TARGET — sOff/sLen=add
 
 con SEMA_PARAM_FLAG_CON: int64 := 1;  // WP-AS-13: mirrors PARAM_FLAG_CON from parser
 
+// WP-L7: @uses_caller_cap Registry-Konstanten
+// UCC-Eintragsformat: namePtr(8) + nameLen(8) + capCount(8) + capId[0..7](8*8) = 88 Bytes
+con UCC_ENTRY_SIZE:  int64 := 88;
+con UCC_MAX_CAPS:    int64 := 8;
+con UCC_MAX_ENTRIES: int64 := 128;
+con UCC_MAX_FCAPS:   int64 := 64;
+
 // WP-16: OOP nodes
 con SNK_CLASS_DECL:   int64 := 69;
 con SNK_IFACE_DECL:   int64 := 70;
@@ -350,6 +357,19 @@ pub type Sema = class {
 
   // WP-L6: Compile-Time Stripping
   capStripper:     CapStripper;  // Liste geprunter Module + Report
+
+  // WP-L7: @uses_caller_cap Registry und Callsite-Prüfung
+  // UCC-Eintragsformat (UCC_ENTRY_SIZE Bytes):
+  //   namePtr:8, nameLen:8, capCount:8, capId[0..7]:8*8 = 88 Bytes
+  uccBuf:          int64;   // flat Buffer für UCC-Einträge
+  uccCount:        int64;
+  // Effektive Capabilities der aktuell analysierten Funktion
+  // (eigene @capabilities + @uses_caller_cap = borrowable caps)
+  curFuncCapBuf:   int64;   // alloc'd int64[64]: capIds
+  curFuncCapCount: int64;
+  // Pending-Annotations vor der nächsten Funktionsdeklaration
+  pendingCapNode:  int64;   // letztes NK_CAPABILITY_ATTR vor NK_FUNC_DECL
+  pendingUccNode:  int64;   // letztes NK_USES_CALLER_CAP vor NK_FUNC_DECL
 
   // ------------------------------------------------------------------
   // Node access helpers
@@ -1036,6 +1056,8 @@ pub type Sema = class {
         if (si < 0) {
           self._errorNode("undefined function", ni);
         } else {
+          // WP-L7: Caller-Cap-Prüfung für @uses_caller_cap-annotierte Funktionen
+          self._checkCallerCap(ni, nm, nl);
           // WP-14: Check if this is a generic function call with type arguments
           // c2 contains type arguments (e.g., Foo<int64>(args))
           var typeArgs: int64 := self.sn_c2(ni);
@@ -1137,6 +1159,8 @@ pub type Sema = class {
         var si: int64 := self.Lookup(nm, nl);
         if (si < 0) {
           self._errorNode("undefined function for fn ptr", ni);
+        } else {
+          self._checkFnPtrUcc(fnRef);  // WP-L7: Warnung bei UCC-annotierten Fn-Ptr
         }
       }
 
@@ -2367,9 +2391,127 @@ pub type Sema = class {
     return -1;
   }
 
+  // WP-L7: Füllt curFuncCapBuf aus @capabilities- und @uses_caller_cap-Knoten.
+  // capAttrNi: SNK_CAPABILITY_ATTR der Funktion (-1 wenn keine); uccNi: SNK_USES_CALLER_CAP (-1 wenn keine).
+  // Geborgene UCC-Caps gelten innerhalb der Funktion als vorhanden (für transitive Propagation).
+  fn _fillCurFuncCaps(capAttrNi: int64, uccNi: int64): void {
+    self.curFuncCapCount := 0;
+    var reg: CapabilityRegistry;
+    reg.Init();
+    if capAttrNi >= 0 {
+      var capDecl: int64 := self.sn_c0(capAttrNi);
+      while capDecl >= 0 && self.curFuncCapCount < 64 {
+        var capId: int64 := reg.LookupId(self.sn_sVal(capDecl), self.sn_sLen(capDecl));
+        if capId >= 0 {
+          poke64(self.curFuncCapBuf + self.curFuncCapCount * 8, capId);
+          self.curFuncCapCount := self.curFuncCapCount + 1;
+        }
+        capDecl := self.sn_next(capDecl);
+      }
+    }
+    if uccNi >= 0 {
+      var uccDecl: int64 := self.sn_c0(uccNi);
+      while uccDecl >= 0 && self.curFuncCapCount < 64 {
+        var capId2: int64 := reg.LookupId(self.sn_sVal(uccDecl), self.sn_sLen(uccDecl));
+        if capId2 >= 0 {
+          poke64(self.curFuncCapBuf + self.curFuncCapCount * 8, capId2);
+          self.curFuncCapCount := self.curFuncCapCount + 1;
+        }
+        uccDecl := self.sn_next(uccDecl);
+      }
+    }
+  }
+
+  // WP-L7: Registriert eine @uses_caller_cap-annotierte Funktion im UCC-Puffer.
+  // funcNi: SNK_FUNC_DECL-Knoten; uccNi: SNK_USES_CALLER_CAP-Knoten.
+  fn _registerUccFn(funcNi: int64, uccNi: int64): void {
+    if self.uccCount >= 128 { return; }
+    var off: int64 := self.uccBuf + self.uccCount * 88;
+    poke64(off,     self.sn_sVal(funcNi) as int64);
+    poke64(off + 8, self.sn_sLen(funcNi));
+    var reg: CapabilityRegistry;
+    reg.Init();
+    var capDecl: int64  := self.sn_c0(uccNi);
+    var capCount: int64 := 0;
+    while capDecl >= 0 && capCount < 8 {
+      var capId: int64 := reg.LookupId(self.sn_sVal(capDecl), self.sn_sLen(capDecl));
+      if capId >= 0 {
+        poke64(off + 24 + capCount * 8, capId);
+        capCount := capCount + 1;
+      }
+      capDecl := self.sn_next(capDecl);
+    }
+    poke64(off + 16, capCount);
+    self.uccCount := self.uccCount + 1;
+  }
+
+  // WP-L7: Sucht Funktion im UCC-Puffer. Gibt Eintrag-Offset zurück, oder -1.
+  fn _lookupUcc(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while i < self.uccCount {
+      var off: int64   := self.uccBuf + i * 88;
+      var eName: pchar := peek64(off) as pchar;
+      var eLen: int64  := peek64(off + 8);
+      if self._strNEq(name, nlen, eName, eLen) { return off; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // WP-L7: Prüft ob curFuncCapBuf alle von @uses_caller_cap geforderten Caps enthält.
+  // Bei fehlendem Cap: Compiler-Fehler mit Cap-Name und Zeilennummer.
+  fn _checkCallerCap(callNi: int64, name: pchar, nlen: int64): void {
+    var uccOff: int64 := self._lookupUcc(name, nlen);
+    if uccOff < 0 { return; }
+    var reqCount: int64 := peek64(uccOff + 16);
+    var ri: int64 := 0;
+    while ri < reqCount {
+      var reqCap: int64 := peek64(uccOff + 24 + ri * 8);
+      var found: int64  := 0;
+      var ci: int64     := 0;
+      while ci < self.curFuncCapCount {
+        if peek64(self.curFuncCapBuf + ci * 8) == reqCap { found := 1; ci := self.curFuncCapCount; }
+        ci := ci + 1;
+      }
+      if found == 0 {
+        var tokIdx: int64 := self.sn_tokIdx(callNi);
+        var line: int64   := 0;
+        if tokIdx >= 0 { line := self.sn_tokLine(tokIdx); }
+        PrintStr("sema error (line "c);
+        PrintInt(line);
+        PrintStr("): Caller hat nicht: "c);
+        PrintStr(cap_nameOf(reqCap));
+        PrintStr(" (benötigt von @uses_caller_cap)\n"c);
+        self.hadError   := 1;
+        self.errorCount := self.errorCount + 1;
+      }
+      ri := ri + 1;
+    }
+  }
+
+  // WP-L7: Warnt bei Funktionszeiger auf @uses_caller_cap-annotierte Funktion.
+  fn _checkFnPtrUcc(ni: int64): void {
+    if ni < 0 { return; }
+    if self.sn_kind(ni) != SNK_IDENT { return; }
+    var uccOff: int64 := self._lookupUcc(self.sn_sVal(ni), self.sn_sLen(ni));
+    if uccOff < 0 { return; }
+    self._warnNode("@uses_caller_cap bei indirektem Aufruf nicht überprüfbar"c, ni);
+  }
+
   fn _p2Decl(ni: int64) {
     var k: int64 := self.sn_kind(ni);
+    // WP-L7: Pending-Annotationen bei nicht-annotierbaren Knoten zurücksetzen.
+    if k != SNK_CAPABILITY_ATTR && k != SNK_USES_CALLER_CAP &&
+       k != SNK_FUNC_DECL && k != SNK_BLOCK {
+      self.pendingCapNode := -1;
+      self.pendingUccNode := -1;
+    }
     if (k == SNK_FUNC_DECL) {
+      // WP-L7: Effective Caps des aktuellen Functions setzen und UCC registrieren
+      self._fillCurFuncCaps(self.pendingCapNode, self.pendingUccNode);
+      if self.pendingUccNode >= 0 { self._registerUccFn(ni, self.pendingUccNode); }
+      self.pendingCapNode := -1;
+      self.pendingUccNode := -1;
       self._checkFuncDecl(ni);
     } else if (k == SNK_GENERIC_DECL) {
       // WP-2.1: generic declarations are not checked directly —
@@ -2503,10 +2645,12 @@ pub type Sema = class {
       if (kind == 4) { self.optLevel             := val; }  // WP-AS-03
     } else if (k == SNK_AT_ENERGY) {  // WP-EN-03: top-level @energy(N)
       self.energyLevel := self.sn_iVal(ni);
-    } else if (k == SNK_CAPABILITY_ATTR) {  // WP-L2: @capabilities([...])
+    } else if (k == SNK_CAPABILITY_ATTR) {  // WP-L2/L7: @capabilities([...])
       self._checkCapabilityAttr(ni);
-    } else if (k == SNK_USES_CALLER_CAP) {  // WP-L2: @uses_caller_cap([...])
+      self.pendingCapNode := ni;  // WP-L7: für nächste fn-Deklaration merken
+    } else if (k == SNK_USES_CALLER_CAP) {  // WP-L2/L7: @uses_caller_cap([...])
       self._checkCapabilityAttr(ni);
+      self.pendingUccNode := ni;  // WP-L7: für nächste fn-Deklaration merken
     }
   }
 
@@ -2764,6 +2908,15 @@ pub type Sema = class {
   // Public API
   // ------------------------------------------------------------------
 
+  fn _initWPL7(): void {
+    self.uccBuf          := alloc(128 * 88);
+    self.uccCount        := 0;
+    self.curFuncCapBuf   := alloc(64 * 8);
+    self.curFuncCapCount := 0;
+    self.pendingCapNode  := -1;
+    self.pendingUccNode  := -1;
+  }
+
   fn Init(src: pchar, srcLen: int64, nodes: int64, nodeCount: int64, toks: int64) {
     self.src        := src;
     self.srcLen     := srcLen;
@@ -2846,6 +2999,9 @@ pub type Sema = class {
     // WP-L6: Compile-Time Stripper
     self.capStripper := new CapStripper();
     self.capStripper.Init();
+
+    // WP-L7: @uses_caller_cap Registry (in _initWPL7 um Short-Jump-Overflow zu vermeiden)
+    self._initWPL7();
 
     self._registerBuiltins();
   }
