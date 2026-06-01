@@ -1,0 +1,324 @@
+// ===========================================================================
+// WP-L4: Transitiver Capability-Graph (flat-Array-Implementierung)
+// ===========================================================================
+// Berechnet die transitive Hülle von Capability-Anforderungen über den
+// Modul-Import-Graphen:
+//
+//   benötigte_caps(m) = eigene_caps(m) ∪ ⋃(benötigte_caps(n))
+//                       für alle n, die m importiert
+//
+// Algorithmus: DFS mit Post-Order-Merge und Zykluserkennung (Drei-Farben-DFS)
+//
+// Implementierung: vollständig flat mit peek64/poke64 — kein Class-Return.
+// Alle Knoten-Felder liegen in einem kontinuierlichen Puffer.
+
+import src.security.capabilities;
+import src.std.alloc;
+
+// ============================================================================
+// Layout-Konstanten
+// ============================================================================
+
+pub con CAPGRAPH_MAX:       int64 := 256;   // max. Knoten
+pub con CAPGRAPH_MAX_EDGES: int64 := 2048;  // max. Kanten
+pub con CAPGRAPH_CAP_MAX:   int64 := 64;    // max. Caps pro Knoten
+
+// Knotenfelder (Offsets in Bytes vom Knoten-Basiszeiger)
+con CG_NODE_SIZE:      int64 := 72;   // 9 * 8 Bytes
+con CG_OFF_NAME:       int64 := 0;    // pchar (8 Bytes)
+con CG_OFF_NAMELEN:    int64 := 8;    // int64
+con CG_OFF_OWNCAPS:    int64 := 16;   // ptr auf capId-Array (8 Bytes)
+con CG_OFF_OWNCNT:     int64 := 24;   // int64
+con CG_OFF_TRANSCAPS:  int64 := 32;   // ptr auf capId-Array (8 Bytes)
+con CG_OFF_TRANSCNT:   int64 := 40;   // int64
+con CG_OFF_COLOR:      int64 := 48;   // int64: 0=WHITE, 1=GRAY, 2=BLACK
+con CG_OFF_PARAMFP:    int64 := 56;   // ptr auf paramFp-Array (parallel zu owncaps)
+con CG_OFF_TRANSFP:    int64 := 64;   // ptr auf paramFp-Array (parallel zu transcaps)
+
+pub con CAPGRAPH_WHITE: int64 := 0;
+pub con CAPGRAPH_GRAY:  int64 := 1;
+pub con CAPGRAPH_BLACK: int64 := 2;
+
+// ============================================================================
+// CapGraph
+// ============================================================================
+
+pub type CapGraph = class {
+  // Knotenpool: flat Buffer, CG_NODE_SIZE Bytes pro Knoten
+  nodesBuf:  int64;   // alloc'd CAPGRAPH_MAX * CG_NODE_SIZE
+  nodeCount: int64;
+
+  // Kantenliste: flat (fromIdx:8, toIdx:8) Paare
+  edges:     int64;   // alloc'd CAPGRAPH_MAX_EDGES * 16
+  edgeCount: int64;
+
+  // Zyklusstatus
+  hadCycle:  bool;
+  cycleFrom: int64;
+  cycleTo:   int64;
+
+  pub fn Init(): void {
+    self.nodesBuf  := alloc(CAPGRAPH_MAX * CG_NODE_SIZE);
+    self.nodeCount := 0;
+    self.edges     := alloc(CAPGRAPH_MAX_EDGES * 16);
+    self.edgeCount := 0;
+    self.hadCycle  := false;
+    self.cycleFrom := -1;
+    self.cycleTo   := -1;
+  }
+
+  // ── interne Knotenfeld-Accessoren (peek/poke) ──────────────────────────
+
+  fn _nbase(i: int64): int64 { return self.nodesBuf + i * CG_NODE_SIZE; }
+
+  fn _nName(i: int64): pchar    { return peek64(self._nbase(i) + CG_OFF_NAME)    as pchar; }
+  fn _nNameLen(i: int64): int64 { return peek64(self._nbase(i) + CG_OFF_NAMELEN); }
+  fn _nOwnBuf(i: int64): int64  { return peek64(self._nbase(i) + CG_OFF_OWNCAPS); }
+  fn _nOwnCnt(i: int64): int64  { return peek64(self._nbase(i) + CG_OFF_OWNCNT); }
+  fn _nOwnFpBuf(i: int64): int64 { return peek64(self._nbase(i) + CG_OFF_PARAMFP); }
+  fn _nTransBuf(i: int64): int64 { return peek64(self._nbase(i) + CG_OFF_TRANSCAPS); }
+  fn _nTransCnt(i: int64): int64 { return peek64(self._nbase(i) + CG_OFF_TRANSCNT); }
+  fn _nTransFpBuf(i: int64): int64{ return peek64(self._nbase(i) + CG_OFF_TRANSFP); }
+  fn _nColor(i: int64): int64   { return peek64(self._nbase(i) + CG_OFF_COLOR); }
+
+  fn _nSetName(i: int64, v: pchar)   { poke64(self._nbase(i) + CG_OFF_NAME,    v as int64); }
+  fn _nSetNameLen(i: int64, v: int64) { poke64(self._nbase(i) + CG_OFF_NAMELEN, v); }
+  fn _nSetOwnBuf(i: int64, v: int64)  { poke64(self._nbase(i) + CG_OFF_OWNCAPS, v); }
+  fn _nSetOwnCnt(i: int64, v: int64)  { poke64(self._nbase(i) + CG_OFF_OWNCNT,  v); }
+  fn _nSetOwnFpBuf(i: int64, v: int64){ poke64(self._nbase(i) + CG_OFF_PARAMFP, v); }
+  fn _nSetTransBuf(i: int64, v: int64){ poke64(self._nbase(i) + CG_OFF_TRANSCAPS, v); }
+  fn _nSetTransCnt(i: int64, v: int64){ poke64(self._nbase(i) + CG_OFF_TRANSCNT, v); }
+  fn _nSetTransFpBuf(i: int64, v: int64){poke64(self._nbase(i) + CG_OFF_TRANSFP, v); }
+  fn _nSetColor(i: int64, v: int64)   { poke64(self._nbase(i) + CG_OFF_COLOR,   v); }
+
+  // Liest capId[j] aus dem ownCaps-Array von Knoten i
+  fn _nOwnCapId(i: int64, j: int64): int64  { return peek64(self._nOwnBuf(i) + j * 8); }
+  fn _nOwnCapFp(i: int64, j: int64): int64  { return peek64(self._nOwnFpBuf(i) + j * 8); }
+  fn _nTransCapId(i: int64, j: int64): int64 { return peek64(self._nTransBuf(i) + j * 8); }
+  fn _nTransCapFp(i: int64, j: int64): int64 { return peek64(self._nTransFpBuf(i) + j * 8); }
+
+  fn _nAddTransCap(i: int64, capId: int64, fp: int64): void {
+    var cnt: int64 := self._nTransCnt(i);
+    if cnt >= CAPGRAPH_CAP_MAX { return; }
+    // Duplikat-Check
+    var j: int64 := 0;
+    while j < cnt {
+      if self._nTransCapId(i, j) == capId { return; }
+      j := j + 1;
+    }
+    poke64(self._nTransBuf(i) + cnt * 8, capId);
+    poke64(self._nTransFpBuf(i) + cnt * 8, fp);
+    self._nSetTransCnt(i, cnt + 1);
+  }
+
+  // ── Namensvergleich ────────────────────────────────────────────────────
+
+  fn _nameEq(a: pchar, aLen: int64, b: pchar, bLen: int64): bool {
+    if aLen != bLen { return false; }
+    var i: int64 := 0;
+    while i < aLen {
+      if StrCharAt(a, i) != StrCharAt(b, i) { return false; }
+      i := i + 1;
+    }
+    return true;
+  }
+
+  // ── Öffentliche API ────────────────────────────────────────────────────
+
+  // Sucht Knoten nach Namen; Rückgabe Index oder -1
+  pub fn FindNode(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while i < self.nodeCount {
+      if self._nameEq(self._nName(i), self._nNameLen(i), name, nameLen) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // Fügt Knoten hinzu (oder gibt vorhandenen zurück)
+  pub fn AddNode(name: pchar, nameLen: int64): int64 {
+    var ex: int64 := self.FindNode(name, nameLen);
+    if ex >= 0 { return ex; }
+    if self.nodeCount >= CAPGRAPH_MAX { return -1; }
+    var idx: int64 := self.nodeCount;
+    self._nSetName(idx, name);
+    self._nSetNameLen(idx, nameLen);
+    // Allocate cap arrays
+    self._nSetOwnBuf(idx,   alloc(CAPGRAPH_CAP_MAX * 8));
+    self._nSetOwnFpBuf(idx, alloc(CAPGRAPH_CAP_MAX * 8));
+    self._nSetOwnCnt(idx, 0);
+    self._nSetTransBuf(idx,   alloc(CAPGRAPH_CAP_MAX * 8));
+    self._nSetTransFpBuf(idx, alloc(CAPGRAPH_CAP_MAX * 8));
+    self._nSetTransCnt(idx, 0);
+    self._nSetColor(idx, CAPGRAPH_WHITE);
+    self.nodeCount := self.nodeCount + 1;
+    return idx;
+  }
+
+  // Setzt eigene Caps aus einem CapId+paramFp-Array
+  // capIds: ptr zu int64[count], fps: ptr zu int64[count]
+  pub fn SetOwnCapsRaw(idx: int64, capIds: int64, fps: int64, count: int64): void {
+    if idx < 0 || idx >= self.nodeCount { return; }
+    var n: int64 := count;
+    if n > CAPGRAPH_CAP_MAX { n := CAPGRAPH_CAP_MAX; }
+    memcpy(self._nOwnBuf(idx),   capIds, n * 8);
+    memcpy(self._nOwnFpBuf(idx), fps,    n * 8);
+    self._nSetOwnCnt(idx, n);
+  }
+
+  // Fügt einzelne eigene Cap hinzu (für @uses_caller_cap)
+  pub fn AddOwnCap(idx: int64, capId: int64, fp: int64): void {
+    if idx < 0 || idx >= self.nodeCount { return; }
+    var cnt: int64 := self._nOwnCnt(idx);
+    if cnt >= CAPGRAPH_CAP_MAX { return; }
+    var j: int64 := 0;
+    while j < cnt {
+      if self._nOwnCapId(idx, j) == capId { return; }
+      j := j + 1;
+    }
+    poke64(self._nOwnBuf(idx)   + cnt * 8, capId);
+    poke64(self._nOwnFpBuf(idx) + cnt * 8, fp);
+    self._nSetOwnCnt(idx, cnt + 1);
+  }
+
+  // Fügt Importkante hinzu
+  pub fn AddEdge(fromIdx: int64, toIdx: int64): void {
+    if fromIdx < 0 || toIdx < 0 || fromIdx == toIdx { return; }
+    if self.edgeCount >= CAPGRAPH_MAX_EDGES { return; }
+    // Duplikat-Check
+    var i: int64 := 0;
+    while i < self.edgeCount {
+      var off: int64 := self.edges + i * 16;
+      if peek64(off) == fromIdx && peek64(off + 8) == toIdx { return; }
+      i := i + 1;
+    }
+    poke64(self.edges + self.edgeCount * 16,     fromIdx);
+    poke64(self.edges + self.edgeCount * 16 + 8, toIdx);
+    self.edgeCount := self.edgeCount + 1;
+  }
+
+  // ── DFS ───────────────────────────────────────────────────────────────
+
+  // Kopiert transCaps von srcIdx in dstIdx (Deduplikation)
+  fn _mergeTrans(srcIdx: int64, dstIdx: int64): void {
+    var cnt: int64 := self._nTransCnt(srcIdx);
+    var i: int64 := 0;
+    while i < cnt {
+      self._nAddTransCap(dstIdx,
+        self._nTransCapId(srcIdx, i),
+        self._nTransCapFp(srcIdx, i));
+      i := i + 1;
+    }
+  }
+
+  // Rekursiver DFS
+  fn _dfs(ni: int64): void {
+    self._nSetColor(ni, CAPGRAPH_GRAY);
+
+    // transCaps aus eigenen Caps initialisieren
+    self._nSetTransCnt(ni, 0);
+    var oi: int64 := 0;
+    while oi < self._nOwnCnt(ni) {
+      self._nAddTransCap(ni,
+        self._nOwnCapId(ni, oi),
+        self._nOwnCapFp(ni, oi));
+      oi := oi + 1;
+    }
+
+    // Alle ausgehenden Kanten
+    var ei: int64 := 0;
+    while ei < self.edgeCount {
+      var eoff: int64 := self.edges + ei * 16;
+      if peek64(eoff) == ni {
+        var toIdx: int64 := peek64(eoff + 8);
+        var toColor: int64 := self._nColor(toIdx);
+        if toColor == CAPGRAPH_GRAY {
+          self.hadCycle  := true;
+          self.cycleFrom := ni;
+          self.cycleTo   := toIdx;
+          return;
+        }
+        if toColor == CAPGRAPH_WHITE {
+          self._dfs(toIdx);
+          if self.hadCycle { return; }
+        }
+        self._mergeTrans(toIdx, ni);
+      }
+      ei := ei + 1;
+    }
+
+    self._nSetColor(ni, CAPGRAPH_BLACK);
+  }
+
+  // Berechnet die transitive Hülle (Forest-DFS über alle unbesuchten Knoten)
+  pub fn Compute(): void {
+    self.hadCycle  := false;
+    self.cycleFrom := -1;
+    self.cycleTo   := -1;
+    var i: int64 := 0;
+    while i < self.nodeCount {
+      if self._nColor(i) == CAPGRAPH_WHITE {
+        self._dfs(i);
+        if self.hadCycle { return; }
+      }
+      i := i + 1;
+    }
+  }
+
+  // ── Abfrage-API (gibt int64 zurück, nie Klassen) ──────────────────────
+
+  pub fn Count(): int64 { return self.nodeCount; }
+  pub fn HadCycle(): bool   { return self.hadCycle; }
+  pub fn CycleFrom(): int64 { return self.cycleFrom; }
+  pub fn CycleTo():   int64 { return self.cycleTo; }
+
+  pub fn NodeName(idx: int64): pchar {
+    if idx < 0 || idx >= self.nodeCount { return "<unbekannt>"c; }
+    return self._nName(idx);
+  }
+  pub fn NodeNameLen(idx: int64): int64 {
+    if idx < 0 || idx >= self.nodeCount { return 0; }
+    return self._nNameLen(idx);
+  }
+
+  // Transitive Caps: Anzahl der Einträge
+  pub fn TransCapCount(nodeIdx: int64): int64 {
+    if nodeIdx < 0 || nodeIdx >= self.nodeCount { return 0; }
+    return self._nTransCnt(nodeIdx);
+  }
+
+  // Transitive Caps: capId bei Position j
+  pub fn TransCapId(nodeIdx: int64, j: int64): int64 {
+    if nodeIdx < 0 || nodeIdx >= self.nodeCount { return -1; }
+    if j < 0 || j >= self._nTransCnt(nodeIdx) { return -1; }
+    return self._nTransCapId(nodeIdx, j);
+  }
+
+  // Enthält Knoten nodeIdx die Capability capId in seiner transitiven Menge?
+  pub fn HasTransCap(nodeIdx: int64, capId: int64): bool {
+    if nodeIdx < 0 || nodeIdx >= self.nodeCount { return false; }
+    var cnt: int64 := self._nTransCnt(nodeIdx);
+    var j: int64 := 0;
+    while j < cnt {
+      if self._nTransCapId(nodeIdx, j) == capId { return true; }
+      j := j + 1;
+    }
+    return false;
+  }
+
+  // Hilfsmethode: SetOwnCaps aus einem CapSet (für sema-Integration)
+  // Nimmt CapSet-Daten als raw-Pointer (entries + count) direkt
+  pub fn SetOwnCapsFromCapSet(idx: int64, capSetEntries: int64, capSetCount: int64): void {
+    if idx < 0 || idx >= self.nodeCount { return; }
+    var n: int64 := capSetCount;
+    if n > CAPGRAPH_CAP_MAX { n := CAPGRAPH_CAP_MAX; }
+    self._nSetOwnCnt(idx, 0);
+    // CAPENTRY_SIZE = 16: (capId:8, paramFp:8)
+    var i: int64 := 0;
+    while i < n {
+      var off: int64 := capSetEntries + i * 16;
+      self.AddOwnCap(idx, peek64(off), peek64(off + 8));
+      i := i + 1;
+    }
+  }
+};
