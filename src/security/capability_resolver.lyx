@@ -1,0 +1,194 @@
+// ===========================================================================
+// WP-L3: Grant-basiertes Capability-Vererbungsmodell
+// ===========================================================================
+// Datenstrukturen und Regelwerk für das LCBS-Vererbungsmodell:
+//
+//   Regel 1 – Import ohne grant:  C(M) = C(M_decl) ∩ C(P)
+//   Regel 2 – Import mit grant:   C(M) = grant_set ∩ C(P)
+//   Regel 3 – Import mit restrict: C(M) = C(M_decl) ∩ C(P) ∩ restrict_set
+//   Regel 4 – grant + restrict:   C(M) = grant_set ∩ C(P) ∩ restrict_set
+//
+//   Invariante: ∀ M: C(M) ⊆ C(parent(M))
+//
+// Fehler:  grant_set ⊄ C(P)          → Eskalationsversuch
+//          C(M_decl) ⊄ C(P)          → Capability fehlt im Parent
+//          gleiche capId, anderer fp  → Breaking Change (Versioning)
+// Warnung: Import ohne grant-Klausel → Security-Score –2
+
+import src.security.capabilities;
+import src.std.alloc;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con CAPSET_MAX:    int64 := 64;   // max. Capabilities pro Menge
+pub con CAPENTRY_SIZE: int64 := 16;   // 8 Byte capId + 8 Byte paramFp
+
+// ============================================================================
+// CapSet — eine Menge von Capabilities
+// Jeder Eintrag: (capId: int64, paramFp: int64)
+// paramFp = djb2-Hash der serialisierten Parameter; 0 = keine Parameter
+// ============================================================================
+
+pub type CapSet = class {
+  entries: int64;   // alloc'd Puffer: CAPSET_MAX * CAPENTRY_SIZE Bytes
+  count:   int64;
+
+  pub fn Init(): void {
+    self.entries := alloc(CAPSET_MAX * CAPENTRY_SIZE);
+    self.count   := 0;
+  }
+
+  pub fn Free(): void {
+    if self.entries != 0 {
+      free(self.entries, CAPSET_MAX * CAPENTRY_SIZE);
+      self.entries := 0;
+    }
+    self.count := 0;
+  }
+
+  pub fn Clear(): void { self.count := 0; }
+
+  pub fn Add(capId: int64, paramFp: int64): void {
+    if self.count >= CAPSET_MAX { return; }
+    poke64(self.entries + self.count * CAPENTRY_SIZE,     capId);
+    poke64(self.entries + self.count * CAPENTRY_SIZE + 8, paramFp);
+    self.count := self.count + 1;
+  }
+
+  pub fn GetCapId(i: int64): int64 {
+    return peek64(self.entries + i * CAPENTRY_SIZE);
+  }
+
+  pub fn GetParamFp(i: int64): int64 {
+    return peek64(self.entries + i * CAPENTRY_SIZE + 8);
+  }
+
+  // Enthält die Menge die Capability (nur nach capId, unabhängig von Parametern)?
+  pub fn ContainsId(capId: int64): bool {
+    var i: int64 := 0;
+    while i < self.count {
+      if self.GetCapId(i) == capId { return true; }
+      i := i + 1;
+    }
+    return false;
+  }
+
+  // Enthält die Menge die Capability mit exakter Parameterübereinstimmung?
+  // paramFp=0 gilt als Wildcard (passt auf alles).
+  pub fn ContainsExact(capId: int64, paramFp: int64): bool {
+    var i: int64 := 0;
+    while i < self.count {
+      if self.GetCapId(i) == capId {
+        var fp: int64 := self.GetParamFp(i);
+        if fp == 0 || paramFp == 0 || fp == paramFp { return true; }
+      }
+      i := i + 1;
+    }
+    return false;
+  }
+};
+
+// ============================================================================
+// CapabilityResolver — implementiert die vier Vererbungsregeln
+// ============================================================================
+
+pub type CapabilityResolver = class {
+
+  pub fn Init(): void {}
+
+  // Regel 1: Import ohne grant, ohne restrict
+  //   C(M) = C(M_decl) ∩ C(P)
+  //   Fehler wenn ∃ c ∈ C(M_decl): c ∉ C(P)
+  // Rückgabe: erstes fehlendes capId (-1 = OK)
+  pub fn ComputeNoGrant(parentCaps: CapSet, moduleDecl: CapSet, out: CapSet): int64 {
+    out.Clear();
+    var missing: int64 := -1;
+    var i: int64 := 0;
+    while i < moduleDecl.count {
+      var cid: int64 := moduleDecl.GetCapId(i);
+      var fp:  int64 := moduleDecl.GetParamFp(i);
+      if parentCaps.ContainsId(cid) {
+        out.Add(cid, fp);
+      } else {
+        if missing < 0 { missing := cid; }
+      }
+      i := i + 1;
+    }
+    return missing;
+  }
+
+  // Regel 2: Import mit grant
+  //   C(M) = grant_set ∩ C(P)
+  //   Fehler wenn ∃ c ∈ grant_set: c ∉ C(P) (Eskalationsversuch)
+  // Rückgabe: erstes eskalierende capId (-1 = OK)
+  pub fn ComputeGrant(parentCaps: CapSet, grantSet: CapSet, out: CapSet): int64 {
+    out.Clear();
+    var esc: int64 := -1;
+    var i: int64 := 0;
+    while i < grantSet.count {
+      var cid: int64 := grantSet.GetCapId(i);
+      var fp:  int64 := grantSet.GetParamFp(i);
+      if parentCaps.ContainsId(cid) {
+        out.Add(cid, fp);
+      } else {
+        if esc < 0 { esc := cid; }
+      }
+      i := i + 1;
+    }
+    return esc;
+  }
+
+  // Regel 3 (restrict-Anteil): schneidet Ergebnis mit restrict_set
+  //   out = base ∩ restrictSet
+  pub fn ApplyRestrict(base: CapSet, restrictSet: CapSet, out: CapSet): void {
+    out.Clear();
+    var i: int64 := 0;
+    while i < base.count {
+      var cid: int64 := base.GetCapId(i);
+      var fp:  int64 := base.GetParamFp(i);
+      if restrictSet.ContainsId(cid) {
+        out.Add(cid, fp);
+      }
+      i := i + 1;
+    }
+  }
+
+  // Breaking-Change-Erkennung (Capability-Versioning):
+  //   Gleiche capId in grant und moduleDecl, aber unterschiedliche paramFp
+  //   → grant-Klausel des Importierenden verweist auf veraltete Parameter
+  // Rückgabe: brechendes capId (-1 = kein Breaking Change)
+  pub fn DetectBreakingChange(grantSet: CapSet, moduleDecl: CapSet): int64 {
+    var i: int64 := 0;
+    while i < grantSet.count {
+      var cid: int64 := grantSet.GetCapId(i);
+      var gFp: int64 := grantSet.GetParamFp(i);
+      if gFp != 0 {
+        var j: int64 := 0;
+        while j < moduleDecl.count {
+          if moduleDecl.GetCapId(j) == cid {
+            var mFp: int64 := moduleDecl.GetParamFp(j);
+            if mFp != 0 && mFp != gFp { return cid; }
+          }
+          j := j + 1;
+        }
+      }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // Invarianten-Check: C(M) ⊆ C(P)
+  // Sollte nach jeder Regel-Anwendung erfüllt sein.
+  // Rückgabe: verletzendes capId (-1 = OK)
+  pub fn CheckInvariant(moduleCaps: CapSet, parentCaps: CapSet): int64 {
+    var i: int64 := 0;
+    while i < moduleCaps.count {
+      var cid: int64 := moduleCaps.GetCapId(i);
+      if !parentCaps.ContainsId(cid) { return cid; }
+      i := i + 1;
+    }
+    return -1;
+  }
+};
