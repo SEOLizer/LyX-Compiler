@@ -139,11 +139,11 @@ Nur unverschlüsseltes TCP, kein TLS.
 
 **Teilschritte:**
 
-- [ ] **4.1** TLS-Connect für MongoDB (Wrapper um `tls.lyx`, abhängig von WP-2)
-- [ ] **4.2** SCRAM-SHA-256-Authentifizierung (RFC 7677)
-- [ ] **4.3** `MongoDocAddString` korrekt implementieren (BSON-Encoding)
-- [ ] **4.4** `MONGO_AUTH_PLAIN` ohne TLS automatisch ablehnen
-- [ ] **4.5** `MongoPool` implementieren oder als stub dokumentieren
+- [x] **4.1** `MongoConnectTLS(host, port, hostname)` — nutzt `TLSInit`/`TLSConnect` aus WP-2; speichert `tls_ssl`/`tls_ctx` in `MongoConn`; `MongoSend`/`MongoRead` TLS-aware
+- [x] **4.2** SCRAM-SHA-256 (RFC 5802/7677) in `MongoAuth()` — nonce(urandom)+base64, PBKDF2-SHA256, HMAC-SHA256 via libcrypto; baut saslStart/saslContinue als OP_MSG mit BSON; verifiziert Server-Signatur
+- [x] **4.3** `MongoDocAddString` — BSON-Encoding: type(1)+key(cstring)+strLen(int32 LE)+value+null; neu: `MongoDocAddInt32`, `MongoDocAddBinary`, `MongoDocFinalize`
+- [x] **4.4** `MongoAuth()` gibt -1 zurück wenn `MONGO_AUTH_PLAIN` und `tls_enabled==0`
+- [x] **4.5** `MongoPool` als "connection pooling not yet implemented" dokumentiert
 
 **Alternative:** Modul als "unfertig – nicht für Produktion" dokumentieren.
 
@@ -613,7 +613,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 |
 | 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
 | 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 4 | MongoDB-Treiber absichern | ⬜ | – | – | – |
+| 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 |
 | 5 | Gefährliche FFI-Externs | ⬜ | – | – | – |
 | 6 | W^X für ELF-Binaries | ⬜ | – | – | – |
 | 7 | Path Traversal verhindern | ⬜ | – | – | – |
