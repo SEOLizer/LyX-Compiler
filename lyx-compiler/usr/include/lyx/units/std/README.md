@@ -59,6 +59,11 @@ This directory contains standardized units serving as a comprehensive library fo
 | `std/qbool` | Quotient Boolean (ternary logic) |
 | `std/error` | Error code management |
 
+| `std/db/mysql` | MySQL/MariaDB client (Wire Protocol, Prepared Statements, Transactions) |
+| `std/db/redis` | Redis client (full command set) |
+| `std/db/redis_simple` | Simplified Redis client |
+| `std/db/sqlite` | SQLite3 client (libsqlite3 FFI — Open/Close/Exec, Prepared Statements, Transactions, Blob) |
+
 | `std/qt5_core` | Qt5 Core types, constants, application wrapper |
 | `std/qt5_gl` | OpenGL 2.1 FFI bindings (gl*, shaders, textures) |
 | `std/qt5_egl` | EGL 1.4 FFI bindings (Wayland/DRM OpenGL context) |
@@ -1476,14 +1481,9 @@ import std.systeminfo;
 import std.io;
 
 fn main(): int64 {
-  PrintStr("Logical Cores: ");
-  PrintIntLn(GetLogicalCores());
-  
-  PrintStr("Total Memory: ");
-  PrintIntLn(GetTotalMemory() / 1024);
-  
-  PrintStr("Load 1min: ");
-  PrintIntLn(GetLoadAverage1());
+  PrintLn("Logical Cores: ", GetLogicalCores());
+  PrintLn("Total Memory: ", GetTotalMemory() / 1024);
+  PrintLn("Load 1min: ", GetLoadAverage1());
   
   return 0;
 }
@@ -1928,3 +1928,135 @@ pub fn main(): int64 {
 ---
 
 *Note: Additionally, 22 native math builtins are available (see main README).*
+
+---
+
+## std/db/sqlite.lyx
+
+SQLite3 client via FFI (`libsqlite3.so.0`). Alle Handles (`sqlite3*`, `sqlite3_stmt*`) sind als `int64` dargestellt.
+
+**Abhängigkeit:** `libsqlite3-0` (kein `-dev`-Paket nötig)
+```bash
+sudo apt install libsqlite3-0   # meist bereits installiert
+```
+
+### Verbindung
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteOpen` | `(path: pchar) → int64` | DB öffnen/anlegen; `0` bei Fehler. `:memory:` für In-Memory-DB |
+| `SQLiteClose` | `(db: int64) → void` | Verbindung schließen, Speicher freigeben |
+| `SQLiteExec` | `(db: int64, sql: pchar) → bool` | SQL ohne Result-Set ausführen (CREATE/INSERT/PRAGMA …) |
+| `SQLiteErrmsg` | `(db: int64) → pchar` | Fehlermeldung der letzten Operation |
+| `SQLiteErrno` | `(db: int64) → int64` | Fehlercode der letzten Operation |
+
+### Prepared Statements
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteStmtPrepare` | `(db: int64, sql: pchar) → int64` | SQL kompilieren; `0` bei Fehler |
+| `SQLiteStmtFinalize` | `(stmt: int64) → void` | Statement freigeben |
+| `SQLiteStmtReset` | `(stmt: int64) → void` | Zurücksetzen für Re-Execution (Bindings bleiben) |
+| `SQLiteClearBindings` | `(stmt: int64) → void` | Alle Bindings auf NULL setzen |
+
+### Parameter-Binding (1-basierter Index)
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteBindInt` | `(stmt: int64, i: int64, v: int64) → bool` | `int64` binden |
+| `SQLiteBindFloat` | `(stmt: int64, i: int64, v: f64) → bool` | `f64` binden |
+| `SQLiteBindStr` | `(stmt: int64, i: int64, v: pchar) → bool` | Text binden (`SQLITE_STATIC`) |
+| `SQLiteBindNull` | `(stmt: int64, i: int64) → bool` | NULL binden |
+| `SQLiteBindBlob` | `(stmt: int64, i: int64, ptr: int64, len: int64) → bool` | Binärdaten binden |
+
+### Result-Set (0-basierter Spalten-Index)
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteStmtStep` | `(stmt: int64) → int64` | Nächste Zeile: `SQLITE_ROW`(100) / `SQLITE_DONE`(101) / Fehler |
+| `SQLiteColumnInt` | `(stmt: int64, i: int64) → int64` | INTEGER-Spalte lesen |
+| `SQLiteColumnFloat` | `(stmt: int64, i: int64) → f64` | REAL-Spalte lesen |
+| `SQLiteColumnText` | `(stmt: int64, i: int64) → pchar` | TEXT-Spalte lesen |
+| `SQLiteColumnBlob` | `(stmt: int64, i: int64) → int64` | Blob-Pointer (0 bei NULL) |
+| `SQLiteColumnBytes` | `(stmt: int64, i: int64) → int64` | Blob/Text-Länge in Bytes |
+| `SQLiteColumnIsNull` | `(stmt: int64, i: int64) → bool` | Spalte ist NULL? |
+| `SQLiteColumnType` | `(stmt: int64, i: int64) → int64` | Typ-Code (`SQLITE_INTEGER` … `SQLITE_NULL`) |
+| `SQLiteColumnCount` | `(stmt: int64) → int64` | Spaltenanzahl |
+| `SQLiteColumnName` | `(stmt: int64, i: int64) → pchar` | Spaltenname |
+
+### Transaktionen
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteBegin` | `(db: int64) → bool` | `BEGIN TRANSACTION` |
+| `SQLiteCommit` | `(db: int64) → bool` | `COMMIT` |
+| `SQLiteRollback` | `(db: int64) → bool` | `ROLLBACK` |
+| `SQLiteBeginImmediate` | `(db: int64) → bool` | `BEGIN IMMEDIATE` |
+| `SQLiteBeginExclusive` | `(db: int64) → bool` | `BEGIN EXCLUSIVE` |
+| `SQLiteInTransaction` | `(db: int64) → bool` | Transaktion aktiv? |
+
+### Hilfsfunktionen
+
+| Funktion | Signatur | Beschreibung |
+|----------|----------|--------------|
+| `SQLiteLastInsertId` | `(db: int64) → int64` | Rowid des letzten INSERT |
+| `SQLiteChanges` | `(db: int64) → int64` | Betroffene Zeilen (INSERT/UPDATE/DELETE) |
+| `SQLiteTableExists` | `(db: int64, table: pchar) → bool` | Tabelle vorhanden? |
+| `SQLiteDropTable` | `(db: int64, table: pchar) → bool` | `DROP TABLE IF EXISTS` |
+| `SQLiteVacuum` | `(db: int64) → bool` | DB-Datei komprimieren |
+| `SQLiteSetJournalMode` | `(db: int64, mode: pchar) → bool` | z. B. `"WAL"` oder `"DELETE"` |
+| `SQLiteSetCacheSize` | `(db: int64, pages: int64) → bool` | `PRAGMA cache_size` |
+
+### Konstanten
+
+```lyx
+// Rückgabecodes
+SQLITE_OK = 0    SQLITE_ERROR = 1   SQLITE_BUSY = 5
+SQLITE_ROW = 100  SQLITE_DONE = 101  SQLITE_CONSTRAINT = 19
+
+// Spaltentypen
+SQLITE_INTEGER = 1  SQLITE_FLOAT = 2  SQLITE_TEXT = 3
+SQLITE_BLOB = 4     SQLITE_NULL = 5
+
+// Destruktor-Sentinels
+SQLITE_STATIC = 0   SQLITE_TRANSIENT = -1
+```
+
+### Beispiel
+
+```lyx
+import std.io;
+import std.db.sqlite;
+
+pub fn main(): int64 {
+  var db: int64 := SQLiteOpen(":memory:");
+  SQLiteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+
+  var ins: int64 := SQLiteStmtPrepare(db, "INSERT INTO users (name, age) VALUES (?, ?)");
+  SQLiteBindStr(ins, 1, "Alice");
+  SQLiteBindInt(ins, 2, 30);
+  SQLiteStmtStep(ins);
+  SQLiteStmtFinalize(ins);
+
+  var sel: int64 := SQLiteStmtPrepare(db, "SELECT id, name, age FROM users");
+  while (SQLiteStmtStep(sel) == SQLITE_ROW) {
+    PrintInt(SQLiteColumnInt(sel, 0)); PrintStr(": ");
+    PrintStr(SQLiteColumnText(sel, 1)); PrintStr(" (");
+    PrintInt(SQLiteColumnInt(sel, 2)); PrintStr(")\n");
+  }
+  SQLiteStmtFinalize(sel);
+
+  SQLiteClose(db);
+  return 0;
+}
+```
+
+### Demos (`examples/sqlite/`)
+
+| Demo | Datei | Inhalt |
+|------|-------|--------|
+| CRUD | `demo_sqlite_crud.lyx` | CREATE/INSERT/SELECT/UPDATE/DELETE |
+| Batch | `demo_sqlite_batch.lyx` | 10k Inserts ohne vs. mit Transaktion (~1500× Speedup) |
+| Stmt Re-Use | `demo_sqlite_stmt.lyx` | 1 Prepared Statement 100× wiederverwenden |
+| Typen | `demo_sqlite_types.lyx` | INTEGER/FLOAT/TEXT/BLOB/NULL-Typen prüfen |
+| Blob | `demo_sqlite_blob.lyx` | 1 KB Blob-Roundtrip, byteweiser Vergleich |
