@@ -1,0 +1,95 @@
+// ===========================================================================
+// WP-H12: Hardware-Capability-Resolver
+// ===========================================================================
+// Berechnet gerätespezifische Landlock-Pfade für Hardware-Capabilities.
+//
+// GPIO:  hardware.gpio(pin: N)       → /dev/gpiochipX  (X=0 für Pins 0-31, X=1 für 32-53)
+// I2C:   hardware.i2c(bus: N)        → /dev/i2c-N
+// SPI:   hardware.spi(bus: N, cs: M) → /dev/spidevN.M
+// USB:   hardware.usb                → /dev/bus/usb
+//
+// hw_path_for() schreibt NUL-terminierten Pfad in einen int64-Puffer (min. 32 Bytes).
+// Gibt Länge zurück (ohne NUL); 0 bei unbekanntem capId.
+
+con HW_CAP_GPIO: int64 := 21;
+con HW_CAP_I2C:  int64 := 22;
+con HW_CAP_SPI:  int64 := 23;
+con HW_CAP_USB:  int64 := 24;
+
+// Schreibt n (>= 0) als Dezimalziffern in buf ab Offset off (kein NUL).
+// Gibt Anzahl geschriebener Bytes zurück.
+fn hw_write_dec(buf: int64, off: int64, n: int64): int64 {
+  if n < 10 {
+    poke8(buf + off, n + 48);
+    return 1;
+  }
+  var digits: int64 := 0;
+  var tmp: int64 := n;
+  while tmp > 0 { digits := digits + 1; tmp := tmp / 10; }
+  var i: int64 := digits - 1;
+  tmp := n;
+  while i >= 0 {
+    poke8(buf + off + i, tmp % 10 + 48);
+    tmp := tmp / 10;
+    i := i - 1;
+  }
+  return digits;
+}
+
+// Schreibt null-terminiertes Literal lit in buf ab off (kein NUL).
+// Gibt Anzahl geschriebener Bytes zurück.
+fn hw_write_lit(buf: int64, off: int64, lit: pchar): int64 {
+  var i: int64 := 0;
+  while StrCharAt(lit, i) != 0 {
+    poke8(buf + off + i, StrCharAt(lit, i));
+    i := i + 1;
+  }
+  return i;
+}
+
+// Gibt den korrekten allowed_access für eine Hardware-Capability zurück.
+// Gerätedateien (gpiochip, i2c, spidev) brauchen kein READ_DIR (nur für Verzeichnisse).
+// USB (/dev/bus/usb) ist ein Verzeichnis → READ_DIR einschließen.
+// Werte: EXECUTE=1, WRITE_FILE=2, READ_FILE=4, READ_DIR=8
+pub fn hw_dev_allowed(capId: int64): int64 {
+  if capId == HW_CAP_USB {
+    return 15;  // EXECUTE|READ_FILE|WRITE_FILE|READ_DIR — Verzeichnis-Traversierung
+  }
+  return 7;  // EXECUTE|READ_FILE|WRITE_FILE — Gerätedatei (kein READ_DIR → kein EINVAL)
+}
+
+// Berechnet den Landlock-Gerätepfad für eine Hardware-Capability.
+// out:    int64-Puffer (mindestens 32 Bytes)
+// arg0:   pin (GPIO), bus (I2C/SPI) oder 0 (USB)
+// arg1:   cs (SPI) oder 0 (alle anderen)
+// Gibt Pfadlänge zurück (ohne NUL-Terminator); schreibt immer NUL.
+// Gibt 0 zurück wenn capId unbekannt.
+pub fn hw_path_for(capId: int64, arg0: int64, arg1: int64, out: int64): int64 {
+  var pos: int64 := 0;
+  if capId == HW_CAP_GPIO {
+    // GPIO Pin N → /dev/gpiochipX  (X=0 für Pins 0-31, X=1 für 32-53)
+    pos := pos + hw_write_lit(out, pos, "/dev/gpiochip"c);
+    var chip: int64 := 0;
+    if arg0 >= 32 { chip := 1; }
+    pos := pos + hw_write_dec(out, pos, chip);
+  } else if capId == HW_CAP_I2C {
+    // I2C Bus N → /dev/i2c-N
+    pos := pos + hw_write_lit(out, pos, "/dev/i2c-"c);
+    pos := pos + hw_write_dec(out, pos, arg0);
+  } else if capId == HW_CAP_SPI {
+    // SPI Bus N, CS M → /dev/spidevN.M
+    pos := pos + hw_write_lit(out, pos, "/dev/spidev"c);
+    pos := pos + hw_write_dec(out, pos, arg0);
+    poke8(out + pos, 46);  // '.'
+    pos := pos + 1;
+    pos := pos + hw_write_dec(out, pos, arg1);
+  } else if capId == HW_CAP_USB {
+    // USB → /dev/bus/usb
+    pos := pos + hw_write_lit(out, pos, "/dev/bus/usb"c);
+  } else {
+    poke8(out, 0);
+    return 0;
+  }
+  poke8(out + pos, 0);  // NUL-Terminator
+  return pos;
+}
