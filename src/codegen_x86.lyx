@@ -12,6 +12,7 @@ import src.security.seccomp_gen;
 import src.security.landlock_gen;
 import src.security.proxy_gen;
 import src.security.hw_cap_resolver;
+import src.tooling.audit;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -551,6 +552,11 @@ pub type Codegen = class {
   lcbsHwArgBuf:     int64;  // alloc'd [capId(8), arg0(8), arg1(8)] × 32 Einträge = 768 Bytes
   lcbsHwArgCount:   int64;
   lcbsHwDevPathOff: int64;  // alloc'd int64[32]: Datensektion-Offsets der Gerätepfad-Strings
+
+  // WP-T13: Audit-Daten (gesammelt in cg_collectCaps)
+  lcbsMissingGrants:  int64;  // Anzahl Imports ohne explizites grant
+  lcbsFastpathCount:  int64;  // Anzahl @fastpath-Nutzungen
+  lcbsAuditSrcPath:   pchar;  // Quell-Dateipfad (gesetzt von lyxc.lyx vor Generate)
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -8347,6 +8353,11 @@ pub type Codegen = class {
     self.lcbsHwArgCount   := 0;
     self.lcbsHwDevPathOff := alloc(32 * 8);
 
+    // WP-T13: Audit-Felder
+    self.lcbsMissingGrants := 0;
+    self.lcbsFastpathCount := 0;
+    self.lcbsAuditSrcPath  := 0 as pchar;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8426,8 +8437,19 @@ pub type Codegen = class {
               }
             }
           }
+          // WP-T13: @fastpath zählen (NK_CAPABILITY_DECL.iVal bit0 = CAP_FLAG_FASTPATH)
+          if self.cg_nkind(capDecl) == 111 {
+            if (self.cg_nival(capDecl) & 1) != 0 { self.lcbsFastpathCount := self.lcbsFastpathCount + 1; }
+          }
           capDecl := self.cg_nnext(capDecl);
         }
+      }
+      // WP-T13: SNK_IMPORT (=1) ohne grant-Klausel (c1 != NK_GRANT_CLAUSE=114) zählen
+      if self.cg_nkind(ni) == 1 {
+        var grantNi: int64 := self.cg_nc1(ni);
+        var hasGrant: int64 := 0;
+        if grantNi >= 0 && self.cg_nkind(grantNi) == 114 { hasGrant := 1; }
+        if hasGrant == 0 { self.lcbsMissingGrants := self.lcbsMissingGrants + 1; }
       }
       ni := self.cg_nnext(ni);
     }
@@ -8883,6 +8905,119 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
   }
 
+  // WP-T13: Gibt den Security-Audit-Report auf stderr aus.
+  // Wird am Ende von Generate() aufgerufen (alle LCBS-Daten bekannt).
+  fn cg_runAudit(): void {
+    var seccompOk:    int64 := 0;
+    var landlockOk:   int64 := 0;
+    var landlockRules: int64 := 0;
+    var bpfRules:     int64 := 0;
+    if self.lcbsBpfDataOff >= 0 { seccompOk := 1; bpfRules := self.lcbsBpfCount; }
+    if self.lcbsEnabled != 0 && self.lcbsLandlockHandled != 0 { landlockOk := 1; }
+    // Landlock-Regelanzahl: "/" (wenn fs-Caps vorhanden) + hw device-Pfade
+    if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
+    landlockRules := landlockRules + self.lcbsHwArgCount;
+    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount);
+
+    // --- Ausgabe ---
+    EPrintStrLn("=== LCBS Security Audit =========================================="c);
+    EPrintStr("Programm:          "c);
+    if self.lcbsAuditSrcPath != 0 as pchar {
+      EPrintStrLn(self.lcbsAuditSrcPath);
+    } else {
+      EPrintStrLn("(unbekannt)"c);
+    }
+    if self.lcbsEnabled != 0 {
+      EPrintStrLn("Capability-Modell: Zero-Privilege (default deny), Grant-basiert"c);
+    } else {
+      EPrintStrLn("Capability-Modell: NONE (kein @capabilities -- keine LCBS-Haertung)"c);
+    }
+    EPrintStrLn(""c);
+
+    // Implizite Capabilities
+    EPrintStrLn("Implizite Capabilities (immer aktiv):"c);
+    EPrintStrLn("  o system.exit         -> exit_group"c);
+    EPrintStrLn("  o system.memory.heap  -> brk, mmap(MAP_ANON)"c);
+    EPrintStrLn(""c);
+
+    // Explizite Capabilities
+    if self.lcbsEnabled != 0 && self.lcbsCapCount > 0 {
+      EPrintStrLn("Explizite Capabilities:"c);
+      var ci: int64 := 0;
+      while ci < self.lcbsCapCount {
+        var cid: int64 := peek64(self.lcbsCapBuf + ci * 8);
+        EPrintStr("  + "c);
+        EPrintStrLn(audit_cap_name(cid));
+        ci := ci + 1;
+      }
+      EPrintStrLn(""c);
+    } else {
+      EPrintStrLn("Explizite Capabilities: keine"c);
+      EPrintStrLn(""c);
+    }
+
+    // Runtime-Schutz
+    EPrintStrLn("Runtime-Schutz:"c);
+    EPrintStrLn("  + W^X (RX-Code / RW-Daten getrennt)"c);
+    EPrintStrLn("  + RELRO (kein GOT im statischen ELF; dynamisch: Compiler-Garantie)"c);
+    EPrintStrLn("  o PIE  (nicht aktiv -- statisches ELF, kein ASLR)"c);
+    if seccompOk != 0 {
+      EPrintStr("  + seccomp (SECCOMP_RET_KILL_PROCESS, "c);
+      EPrintInt(bpfRules);
+      EPrintStrLn(" Regeln)"c);
+    } else {
+      EPrintStrLn("  o seccomp (nicht aktiv)"c);
+    }
+    if landlockOk != 0 {
+      EPrintStr("  + landlock ("c);
+      EPrintInt(landlockRules);
+      EPrintStrLn(" Pfad-Regeln)"c);
+    } else {
+      EPrintStrLn("  o landlock (nicht aktiv)"c);
+    }
+    if self.lcbsProxyEnabled != 0 {
+      EPrintStrLn("  + Userspace Proxy (Netzwerk)"c);
+    } else {
+      EPrintStrLn("  o Userspace Proxy (nicht aktiv)"c);
+    }
+    EPrintStrLn("  o Stack Canaries (nicht aktiv -- WP-18 offen)"c);
+    EPrintStrLn(""c);
+
+    // Score
+    EPrintStr("Sicherheits-Score: "c);
+    EPrintInt(score);
+    EPrintStrLn("/40  (PIE +0; max 45 mit Stack Canaries WP-18)"c);
+    EPrintStrLn("  +10: Kein Klasse-3-Extern ohne system.unsafe.format_string"c);
+    EPrintStrLn("  + 5: W^X aktiv"c);
+    EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel)"c);
+    EPrintStrLn("  + 0: PIE  (nicht implementiert)"c);
+    if self.lcbsMissingGrants == 0 {
+      EPrintStrLn("  +10: Grant-Modell -- alle Imports haben explizites grant"c);
+    } else {
+      var gs: int64 := 10 - self.lcbsMissingGrants * 2;
+      if gs < 0 { gs := 0; }
+      EPrintStr("  +"c); EPrintInt(gs);
+      EPrintStr(": Grant-Modell -- "c); EPrintInt(self.lcbsMissingGrants);
+      EPrintStrLn(" Import(e) ohne grant (-2 pro fehlendem grant)"c);
+    }
+    if seccompOk != 0 {
+      EPrintStrLn("  + 5: seccomp aktiv"c);
+    } else {
+      EPrintStrLn("  + 0: seccomp fehlt"c);
+    }
+    if landlockOk != 0 {
+      EPrintStrLn("  + 5: landlock aktiv"c);
+    } else {
+      EPrintStrLn("  + 0: landlock fehlt"c);
+    }
+    EPrintStrLn("   o: Stack Canaries fehlen (WP-18 offen)"c);
+    if self.lcbsFastpathCount > 0 {
+      EPrintStr("  -"c); EPrintInt(self.lcbsFastpathCount * 3);
+      EPrintStr(": @fastpath x"c); EPrintInt(self.lcbsFastpathCount); EPrintStrLn(""c);
+    }
+    EPrintStrLn("=================================================================="c);
+  }
+
   fn Generate(head: int64) {
     self.topLevelHead := head;  // WP-MEM-05: save for default-param lookup
     // WP-R9/R10/R11: collect capabilities, compute masks, generate BPF + proxy data sections
@@ -8898,6 +9033,7 @@ pub type Codegen = class {
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
+    self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
   fn WriteELF(path: pchar) {
