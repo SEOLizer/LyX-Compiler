@@ -100,9 +100,24 @@ run_test() {
     return
   fi
 
+  # Extra compiler flags from NAME.flags (one flag per line, optional)
+  local extra_flags=()
+  local flags_file="${lyx_file%.lyx}.flags"
+  if [ -f "$flags_file" ]; then
+    while IFS= read -r flag; do
+      [ -n "$flag" ] && extra_flags+=("$flag")
+    done < "$flags_file"
+  fi
+
+  # For --migrate-capabilities: output goes to stdout of the COMPILER, not to a binary
+  local is_migrate=0
+  for f in "${extra_flags[@]}"; do
+    [ "$f" = "--migrate-capabilities" ] && is_migrate=1
+  done
+
   # Compile
   local compile_out
-  if ! compile_out=$("$LYXC" "$lyx_file" -o "$bin" 2>&1); then
+  if ! compile_out=$("$LYXC" "$lyx_file" "${extra_flags[@]}" -o "$bin" 2>/dev/null); then
     if [ $UPDATE -eq 1 ]; then
       echo -e "${YELLOW}SKIP${RESET}  $name  (compile error — skipping update)"
     else
@@ -114,9 +129,14 @@ run_test() {
   fi
 
   # Run and capture stdout + exit code
+  # For --migrate-capabilities: compiler stdout IS the output (no binary to run)
   local actual_stdout
   local actual_exit=0
-  actual_stdout=$("$bin" 2>/dev/null) || actual_exit=$?
+  if [ $is_migrate -eq 1 ]; then
+    actual_stdout=$("$LYXC" "$lyx_file" "${extra_flags[@]}" -o "$bin" 2>/dev/null) || actual_exit=$?
+  else
+    actual_stdout=$("$bin" 2>/dev/null) || actual_exit=$?
+  fi
 
   local expected_exit=0
   if [ -f "$exit_file" ]; then

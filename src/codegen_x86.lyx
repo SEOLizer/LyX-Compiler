@@ -558,6 +558,9 @@ pub type Codegen = class {
   lcbsFastpathCount:  int64;  // Anzahl @fastpath-Nutzungen
   lcbsAuditSrcPath:   pchar;  // Quell-Dateipfad (gesetzt von lyxc.lyx vor Generate)
 
+  // WP-T14: --capabilities=compat: kein seccomp/landlock/proxy trotz @capabilities
+  lcbsCompatMode:     int64;  // 1 = Compat-Modus aktiv (gesetzt von lyxc.lyx)
+
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
   // ------------------------------------------------------------------
@@ -8358,6 +8361,9 @@ pub type Codegen = class {
     self.lcbsFastpathCount := 0;
     self.lcbsAuditSrcPath  := 0 as pchar;
 
+    // WP-T14: Compat-Modus (kein seccomp/landlock)
+    self.lcbsCompatMode := 0;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8459,6 +8465,7 @@ pub type Codegen = class {
   // Nur aufgerufen wenn lcbsEnabled == 1.
   fn cg_genBpfSection(): void {
     if self.lcbsEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14: Compat-Modus überspringt seccomp
     var bpfBuf: int64 := alloc(256 * 8);
     var bpfCount: int64 := seccomp_build_filter(self.lcbsCapBuf, self.lcbsCapCount, bpfBuf);
     self.lcbsBpfDataOff := self.dataLen;
@@ -8482,6 +8489,7 @@ pub type Codegen = class {
   // WP-R11: Generiert Proxy-BPF in Datensektion + reserviert proxy_fd-Slot.
   fn cg_genProxyBpfSection(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     var bpfBuf: int64 := alloc(128 * 8);
     var bpfCount: int64 := proxy_build_filter(bpfBuf);
     self.lcbsProxyBpfDataOff := self.dataLen;
@@ -8506,6 +8514,7 @@ pub type Codegen = class {
   //   4. Bei EOF (Elter beendet): exit_group(0).
   fn cg_emitProxyLoop(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     self.lcbsProxyCodeOff := self.codeLen;
 
     // Callee-saved Register retten: r13 (child_fd), r14 (alignment), rbx
@@ -8594,6 +8603,7 @@ pub type Codegen = class {
   //   Elter: speichert proxy_fd (sv[1]) in Datensektion
   fn cg_emitProxyStart(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
 
     // Stack: sv[2] (2×int = 8 Bytes, aufgefüllt auf 16)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
@@ -8671,6 +8681,7 @@ pub type Codegen = class {
   // Muss VOR cg_genFile() aufgerufen werden; cg_emitLandlockInit() verwendet die Offsets.
   fn cg_genHwDevPathSection(): void {
     if self.lcbsHwArgCount == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     var pathBuf: int64 := alloc(32);
     var hwi: int64 := 0;
     while hwi < self.lcbsHwArgCount {
@@ -8703,6 +8714,7 @@ pub type Codegen = class {
   // WP-H12: Hardware-Caps erzeugen per-Gerät-Regeln (statt breiter /dev-Regel).
   fn cg_emitLandlockInit(): void {
     if self.lcbsEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
 
     // sub rsp, 48  (Stack-Frame)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x30);
@@ -8869,6 +8881,7 @@ pub type Codegen = class {
   // Läuft NACH dem Funktions-Prolog (push rbp etc.) aber VOR dem Body.
   fn cg_emitSeccompInit(): void {
     if self.lcbsBpfDataOff < 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     // Construct sock_fprog on stack (sub rsp already done by cg_genFuncDecl prolog).
     // We use 16 extra bytes below current rsp; sub rsp,16 first.
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
@@ -8912,11 +8925,12 @@ pub type Codegen = class {
     var landlockOk:   int64 := 0;
     var landlockRules: int64 := 0;
     var bpfRules:     int64 := 0;
-    if self.lcbsBpfDataOff >= 0 { seccompOk := 1; bpfRules := self.lcbsBpfCount; }
-    if self.lcbsEnabled != 0 && self.lcbsLandlockHandled != 0 { landlockOk := 1; }
-    // Landlock-Regelanzahl: "/" (wenn fs-Caps vorhanden) + hw device-Pfade
-    if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
-    landlockRules := landlockRules + self.lcbsHwArgCount;
+    if self.lcbsCompatMode == 0 {  // WP-T14: Compat-Modus → alles inaktiv
+      if self.lcbsBpfDataOff >= 0 { seccompOk := 1; bpfRules := self.lcbsBpfCount; }
+      if self.lcbsEnabled != 0 && self.lcbsLandlockHandled != 0 { landlockOk := 1; }
+      if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
+      landlockRules := landlockRules + self.lcbsHwArgCount;
+    }
     var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount);
 
     // --- Ausgabe ---
