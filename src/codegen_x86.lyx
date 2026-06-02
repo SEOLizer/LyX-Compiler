@@ -10,6 +10,7 @@ import src.crypto.lic_hmac;
 import src.std.alloc;
 import src.security.seccomp_gen;
 import src.security.landlock_gen;
+import src.security.proxy_gen;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -537,6 +538,13 @@ pub type Codegen = class {
   lcbsLandlockAllowed:    int64;  // allowed_access für "/" Regel (0 = keine fs-Caps)
   lcbsLandlockHasDev:     int64;  // 1 wenn Hardware-Caps → /dev-Regel
   lcbsLandlockDevAllowed: int64;  // allowed_access für "/dev" Regel
+
+  // WP-R11: Userspace-Netzwerk-Proxy
+  lcbsProxyEnabled:    int64;  // 1 wenn Netzwerk-Proxy-Caps vorhanden
+  lcbsProxyBpfDataOff: int64;  // Daten-Offset des Proxy-BPF-Filters
+  lcbsProxyBpfCount:   int64;  // Anzahl Proxy-BPF-Befehle
+  lcbsProxyCodeOff:    int64;  // Code-Offset der proxy_loop-Funktion
+  lcbsProxyFdDataOff:  int64;  // Daten-Offset für proxy_fd-Speicher (4 Bytes)
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -6956,12 +6964,13 @@ pub type Codegen = class {
       param := self.cg_nnext(param);
     }
 
-    // WP-R9 & WP-R10: Landlock + seccomp am Anfang von 'main' installieren
+    // WP-R9/R10/R11: Proxy-Start → Landlock → seccomp am Anfang von 'main'
     if self.lcbsEnabled != 0 && fnlen == 4 {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
          StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
-        self.cg_emitLandlockInit();   // WP-R10: Landlock zuerst (vor seccomp)
-        self.cg_emitSeccompInit();    // WP-R9: seccomp danach
+        self.cg_emitProxyStart();   // WP-R11: Proxy fork+socketpair (vor Landlock+seccomp)
+        self.cg_emitLandlockInit(); // WP-R10: Landlock (vor seccomp)
+        self.cg_emitSeccompInit();  // WP-R9: seccomp zuletzt
       }
     }
     // Generate function body (child2 = block)
@@ -8320,6 +8329,13 @@ pub type Codegen = class {
     self.lcbsLandlockHasDev     := 0;
     self.lcbsLandlockDevAllowed := 0;
 
+    // WP-R11: Proxy init
+    self.lcbsProxyEnabled    := 0;
+    self.lcbsProxyBpfDataOff := 0 - 1;
+    self.lcbsProxyBpfCount   := 0;
+    self.lcbsProxyCodeOff    := 0 - 1;
+    self.lcbsProxyFdDataOff  := 0 - 1;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8374,6 +8390,189 @@ pub type Codegen = class {
       i := i + 1;
     }
     free(bpfBuf, 256 * 8);
+  }
+
+  // WP-R11: Setzt lcbsProxyEnabled wenn Netzwerk-Proxy-Caps vorhanden.
+  fn cg_computeProxy(): void {
+    if self.lcbsEnabled == 0 { return; }
+    if proxy_is_needed(self.lcbsCapBuf, self.lcbsCapCount) {
+      self.lcbsProxyEnabled := 1;
+    }
+  }
+
+  // WP-R11: Generiert Proxy-BPF in Datensektion + reserviert proxy_fd-Slot.
+  fn cg_genProxyBpfSection(): void {
+    if self.lcbsProxyEnabled == 0 { return; }
+    var bpfBuf: int64 := alloc(128 * 8);
+    var bpfCount: int64 := proxy_build_filter(bpfBuf);
+    self.lcbsProxyBpfDataOff := self.dataLen;
+    self.lcbsProxyBpfCount   := bpfCount;
+    var i: int64 := 0;
+    while i < bpfCount * 8 {
+      self.cg_edata(peek8(bpfBuf + i));
+      i := i + 1;
+    }
+    free(bpfBuf, 128 * 8);
+    // 4 Bytes für proxy_fd-Speicher (int32, initial 0)
+    self.lcbsProxyFdDataOff := self.dataLen;
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
+  }
+
+  // WP-R11: Emittiert den Proxy-Kindprozess-Loop BEVOR main() kompiliert wird.
+  // Eintritt: rdi = child_fd (AF_UNIX socketpair-Deskriptor des Kindes).
+  // Der Loop:
+  //   1. Installiert eigenen restriktiven seccomp-Filter (nur Netzwerk).
+  //   2. Liest 8-Byte-Anfragen vom child_fd.
+  //   3. Antwortet mit -ENOSYS (noch nicht implementiert bis WP-L1 Pfad-Args parsed).
+  //   4. Bei EOF (Elter beendet): exit_group(0).
+  fn cg_emitProxyLoop(): void {
+    if self.lcbsProxyEnabled == 0 { return; }
+    self.lcbsProxyCodeOff := self.codeLen;
+
+    // Callee-saved Register retten: r13 (child_fd), r14 (alignment), rbx
+    self.cg_e8(0x41); self.cg_e8(0x55);  // push r13
+    self.cg_e8(0x41); self.cg_e8(0x56);  // push r14
+    self.cg_e8(0x53);                    // push rbx
+    // mov r13, rdi  (child_fd sichern, Encoding: 4C 8B EF)
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0xEF);
+
+    // ---- Proxy-seccomp installieren ----
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);                     // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov [rsp+0], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+    // mov ax, proxy_bpf_count (uint16)
+    var pcnt: int64 := self.lcbsProxyBpfCount & 0xFFFF;
+    self.cg_e8(0x66); self.cg_e8(0xB8); self.cg_e8(pcnt & 0xFF); self.cg_e8((pcnt >> 8) & 0xFF);
+    self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov [rsp+0], ax
+    // lea rax, [rip + proxy_bpf_data]
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var ppPBpf: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(ppPBpf, self.lcbsProxyBpfDataOff, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+    // prctl(PR_SET_NO_NEW_PRIVS=38, 1, 0, 0, 0)
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d, r8d
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor r10d, r10d
+    self.cg_e8(0x31); self.cg_e8(0xD2);                     // xor edx, edx
+    self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBF); self.cg_e8(0x26); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xB8); self.cg_e8(0x9D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // prctl(PR_SET_SECCOMP=22, SECCOMP_MODE_FILTER=2, rsp)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE2);  // mov rdx, rsp
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor r10d, r10d
+    self.cg_e8(0xBE); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBF); self.cg_e8(0x16); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xB8); self.cg_e8(0x9D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
+
+    // Anfrage-Puffer (8 Bytes) auf Stack
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x08);  // sub rsp, 8
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);                     // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov [rsp+0], rax
+
+    // ---- Read-Loop ----
+    var loopPos: int64 := self.codeLen;
+    // read(r13d, rsp, 8)
+    self.cg_e8(0xB8); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0xEF);  // mov edi, r13d
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);  // mov rsi, rsp
+    self.cg_e8(0xBA); self.cg_e8(0x08); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+    // jle .exit (rel8, wird unten gepatcht)
+    self.cg_e8(0x7E); var jlePos: int64 := self.codeLen; self.cg_e8(0x00);
+
+    // Antwort: -38 (ENOSYS — Proxy-Protokoll noch nicht implementiert bis WP-L1)
+    self.cg_e8(0xC7); self.cg_e8(0x04); self.cg_e8(0x24);
+    self.cg_e8(0xDA); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);  // [rsp] = -38
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0xEF);  // mov edi, r13d
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);  // mov rsi, rsp
+    self.cg_e8(0xBA); self.cg_e8(0x04); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // jmp .read_loop (backward, rel8)
+    self.cg_e8(0xEB);
+    self.cg_e8((loopPos - (self.codeLen + 1)) & 0xFF);
+
+    // .exit — patch jle
+    poke8(self.code + jlePos, (self.codeLen - jlePos - 1) & 255);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);  // add rsp, 8
+    self.cg_e8(0x5B);                    // pop rbx
+    self.cg_e8(0x41); self.cg_e8(0x5E);  // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5D);  // pop r13
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi, edi
+    self.cg_e8(0xB8); self.cg_e8(0xE7); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // exit_group(0)
+  }
+
+  // WP-R11: Emittiert fork+socketpair am Anfang von main().
+  // Reihenfolge: ProxyStart → LandlockInit → SeccompInit.
+  // Nach dem fork():
+  //   Kind: rdi=child_fd → jmp proxy_loop → exit_group(0)
+  //   Elter: speichert proxy_fd (sv[1]) in Datensektion
+  fn cg_emitProxyStart(): void {
+    if self.lcbsProxyEnabled == 0 { return; }
+
+    // Stack: sv[2] (2×int = 8 Bytes, aufgefüllt auf 16)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);                     // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov [rsp+0], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+
+    // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, &sv)
+    self.cg_e8(0xB8); self.cg_e8(0x35); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBF); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x31); self.cg_e8(0xD2);  // xor edx, edx
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xE2);  // mov r10, rsp (&sv)
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var jSkip1: int64 := self.codeLen; self.cg_e32(0);  // js → SKIP_ALL
+
+    // fork() → rax = 0 (Kind) oder pid (Elter)
+    self.cg_e8(0xB8); self.cg_e8(0x39); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var jSkip2: int64 := self.codeLen; self.cg_e32(0);  // js → SKIP_ALL
+    // jnz → PARENT (rax != 0: Elter-Prozess)
+    self.cg_e8(0x0F); self.cg_e8(0x85);
+    var jParent: int64 := self.codeLen; self.cg_e32(0);
+
+    // === KIND: Proxy-Loop starten ===
+    // close(sv[1]) = [rsp+4]
+    self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x04);
+    self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // rdi = sv[0] (child_fd)
+    self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24);  // mov edi, [rsp+0]
+    // Stack wiederherstellen
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
+    // jmp proxy_loop (Rückwärts-Sprung zu lcbsProxyCodeOff)
+    self.cg_e8(0xE9);
+    self.cg_e32(self.lcbsProxyCodeOff - (self.codeLen + 4));
+
+    // === ELTER: proxy_fd speichern ===
+    poke32(self.code + jParent, self.codeLen - jParent - 4);
+    // close(sv[0]) = [rsp+0]
+    self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24);
+    self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // proxy_fd = sv[1] in Datensektion speichern
+    self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x04);  // mov eax, [rsp+4]
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0D);
+    var ppFd: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(ppFd, self.lcbsProxyFdDataOff, 0, CG_PATCH_STR);
+    self.cg_e8(0x89); self.cg_e8(0x01);  // mov [rcx], eax
+
+    // SKIP_ALL → add rsp, 16
+    poke32(self.code + jSkip1, self.codeLen - jSkip1 - 4);
+    poke32(self.code + jSkip2, self.codeLen - jSkip2 - 4);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
   }
 
   // WP-R10: Berechnet Landlock-Bitmasks nach cg_collectCaps().
@@ -8594,11 +8793,14 @@ pub type Codegen = class {
 
   fn Generate(head: int64) {
     self.topLevelHead := head;  // WP-MEM-05: save for default-param lookup
-    // WP-R9 & WP-R10: collect capabilities, compute Landlock masks, generate BPF section
-    // cg_emitLandlockInit/SeccompInit() are called later from cg_genFuncDecl when generating main
+    // WP-R9/R10/R11: collect capabilities, compute masks, generate BPF + proxy data sections
+    // cg_emitProxyStart/LandlockInit/SeccompInit() are called later from cg_genFuncDecl
     self.cg_collectCaps(head);
-    self.cg_computeLandlock();  // WP-R10: Landlock-Bitmasks aus Cap-Liste berechnen
-    self.cg_genBpfSection();
+    self.cg_computeProxy();     // WP-R11: Proxy-Bedarf bestimmen
+    self.cg_computeLandlock();  // WP-R10: Landlock-Bitmasks
+    self.cg_genProxyBpfSection(); // WP-R11: Proxy-BPF + proxy_fd-Slot in Datensektion
+    self.cg_genBpfSection();      // WP-R9: Haupt-BPF in Datensektion
+    self.cg_emitProxyLoop();      // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
     self.cg_genFile(head);
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete

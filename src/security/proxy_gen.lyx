@@ -1,0 +1,109 @@
+// ===========================================================================
+// WP-R11: Userspace-Netzwerk-Proxy — Proxy-BPF-Generierung & Cap-Check
+// ===========================================================================
+// Bestimmt ob ein Userspace-Proxy für die gegebenen Capabilities benötigt wird
+// und generiert den BPF-Filter für den Proxy-Kindprozess (nach fork()).
+//
+// Der Proxy-Prozess darf ausschließlich Netzwerk-Syscalls ausführen sowie
+// read/write/close auf dem socketpair-fd. Alle anderen Syscalls → KILL.
+//
+// Proxy-Lifecycle:
+//   _start: [kein Proxy]
+//   main() Prolog:
+//     1. socketpair(AF_UNIX, SOCK_STREAM)
+//     2. fork() → Kind: proxy_loop(child_fd); Elter: speichert proxy_fd
+//     3. cg_emitLandlockInit()
+//     4. cg_emitSeccompInit()
+//   main() Body (Benutzercode)
+
+// BPF-Opcodes (Kopien, bootstrap-sicher — keine Abhängigkeit von seccomp_gen)
+con PX_LD_ABS_W:    int64 := 0x20;
+con PX_JMP_JEQ_K:   int64 := 0x15;
+con PX_RET_K:       int64 := 0x06;
+con PX_ALLOW:       int64 := 0x7fff0000;
+con PX_KILL:        int64 := 0x80000000;
+con PX_ARCH_X86_64: int64 := 0xC000003E;
+con PX_OFF_NR:      int64 := 0;
+con PX_OFF_ARCH:    int64 := 4;
+
+// Netzwerk-Capability-IDs (Proxy benötigt für tcp/udp bind/connect)
+con PX_CAP_TCP_BIND:    int64 := 15;
+con PX_CAP_TCP_CONNECT: int64 := 16;
+con PX_CAP_UDP_BIND:    int64 := 17;
+con PX_CAP_UDP_CONNECT: int64 := 18;
+
+fn px_emit(buf: int64, idx: int64, op: int64, jt: int64, jf: int64, k: int64): void {
+  var off: int64 := buf + idx * 8;
+  poke8(off + 0, op & 0xFF);
+  poke8(off + 1, (op >> 8) & 0xFF);
+  poke8(off + 2, jt & 0xFF);
+  poke8(off + 3, jf & 0xFF);
+  poke8(off + 4, k & 0xFF);
+  poke8(off + 5, (k >> 8) & 0xFF);
+  poke8(off + 6, (k >> 16) & 0xFF);
+  poke8(off + 7, (k >> 24) & 0xFF);
+}
+
+fn px_allow_nr(buf: int64, n: int64, nr: int64): int64 {
+  px_emit(buf, n, PX_JMP_JEQ_K, 0, 1, nr);
+  px_emit(buf, n + 1, PX_RET_K, 0, 0, PX_ALLOW);
+  return n + 2;
+}
+
+// Prüft ob irgendeine Netzwerk-Capability einen Proxy erfordert.
+// (Alle tcp/udp connect/bind Caps → Proxy gestartet)
+pub fn proxy_is_needed(capBuf: int64, capCount: int64): bool {
+  var i: int64 := 0;
+  while i < capCount {
+    var id: int64 := peek64(capBuf + i * 8);
+    if id == PX_CAP_TCP_BIND    || id == PX_CAP_TCP_CONNECT ||
+       id == PX_CAP_UDP_BIND    || id == PX_CAP_UDP_CONNECT {
+      return true;
+    }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Generiert den BPF-Filter für den Proxy-Kindprozess.
+// Erlaubt: Basis + read/write/close (socketpair) + Netzwerk-Syscalls.
+// Blockiert: openat, execve, fork und alle nicht-netzwerk Syscalls.
+// Rückgabe: Anzahl der generierten BPF-Befehle.
+pub fn proxy_build_filter(bpfBuf: int64): int64 {
+  var n: int64 := 0;
+  // Architektur-Check
+  px_emit(bpfBuf, n, PX_LD_ABS_W, 0, 0, PX_OFF_ARCH); n := n + 1;
+  px_emit(bpfBuf, n, PX_JMP_JEQ_K, 1, 0, PX_ARCH_X86_64); n := n + 1;
+  px_emit(bpfBuf, n, PX_RET_K, 0, 0, PX_KILL); n := n + 1;
+  px_emit(bpfBuf, n, PX_LD_ABS_W, 0, 0, PX_OFF_NR); n := n + 1;
+  // Basis-Syscalls (immer erlaubt)
+  n := px_allow_nr(bpfBuf, n, 231);  // exit_group
+  n := px_allow_nr(bpfBuf, n, 60);   // exit
+  n := px_allow_nr(bpfBuf, n, 12);   // brk
+  n := px_allow_nr(bpfBuf, n, 9);    // mmap
+  n := px_allow_nr(bpfBuf, n, 11);   // munmap
+  n := px_allow_nr(bpfBuf, n, 157);  // prctl
+  n := px_allow_nr(bpfBuf, n, 302);  // prlimit64
+  n := px_allow_nr(bpfBuf, n, 202);  // futex
+  n := px_allow_nr(bpfBuf, n, 13);   // rt_sigaction
+  n := px_allow_nr(bpfBuf, n, 15);   // rt_sigreturn
+  // Socketpair-Kommunikation mit Hauptprogramm
+  n := px_allow_nr(bpfBuf, n, 0);    // read
+  n := px_allow_nr(bpfBuf, n, 1);    // write
+  n := px_allow_nr(bpfBuf, n, 3);    // close
+  n := px_allow_nr(bpfBuf, n, 7);    // poll
+  // Netzwerk-Syscalls (Proxy öffnet Verbindungen im Auftrag des Hauptprogramms)
+  n := px_allow_nr(bpfBuf, n, 41);   // socket
+  n := px_allow_nr(bpfBuf, n, 42);   // connect
+  n := px_allow_nr(bpfBuf, n, 43);   // accept
+  n := px_allow_nr(bpfBuf, n, 288);  // accept4
+  n := px_allow_nr(bpfBuf, n, 49);   // bind
+  n := px_allow_nr(bpfBuf, n, 50);   // listen
+  n := px_allow_nr(bpfBuf, n, 44);   // sendto
+  n := px_allow_nr(bpfBuf, n, 45);   // recvfrom
+  n := px_allow_nr(bpfBuf, n, 46);   // sendmsg
+  n := px_allow_nr(bpfBuf, n, 47);   // recvmsg
+  // Default: Kill
+  px_emit(bpfBuf, n, PX_RET_K, 0, 0, PX_KILL); n := n + 1;
+  return n;
+}
