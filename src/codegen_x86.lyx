@@ -11,6 +11,7 @@ import src.std.alloc;
 import src.security.seccomp_gen;
 import src.security.landlock_gen;
 import src.security.proxy_gen;
+import src.security.hw_cap_resolver;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -545,6 +546,11 @@ pub type Codegen = class {
   lcbsProxyBpfCount:   int64;  // Anzahl Proxy-BPF-Befehle
   lcbsProxyCodeOff:    int64;  // Code-Offset der proxy_loop-Funktion
   lcbsProxyFdDataOff:  int64;  // Daten-Offset für proxy_fd-Speicher (4 Bytes)
+
+  // WP-H12: Hardware-Capability-Argumente und Gerätepfad-Offsets
+  lcbsHwArgBuf:     int64;  // alloc'd [capId(8), arg0(8), arg1(8)] × 32 Einträge = 768 Bytes
+  lcbsHwArgCount:   int64;
+  lcbsHwDevPathOff: int64;  // alloc'd int64[32]: Datensektion-Offsets der Gerätepfad-Strings
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -8336,6 +8342,11 @@ pub type Codegen = class {
     self.lcbsProxyCodeOff    := 0 - 1;
     self.lcbsProxyFdDataOff  := 0 - 1;
 
+    // WP-H12: Hardware-Argumente + Gerätepfad-Offsets
+    self.lcbsHwArgBuf     := alloc(32 * 24);  // 32 Einträge × 3 × 8 Bytes
+    self.lcbsHwArgCount   := 0;
+    self.lcbsHwDevPathOff := alloc(32 * 8);
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8366,6 +8377,52 @@ pub type Codegen = class {
               if already == 0 {
                 poke64(self.lcbsCapBuf + self.lcbsCapCount * 8, cid);
                 self.lcbsCapCount := self.lcbsCapCount + 1;
+              }
+            }
+            // WP-H12: Hardware-Cap-Argumente separat sammeln (21=GPIO, 22=I2C, 23=SPI, 24=USB)
+            if (cid == 21 || cid == 22 || cid == 23 || cid == 24) && self.lcbsHwArgCount < 32 {
+              var hwArg0: int64 := 0;
+              var hwArg1: int64 := 0;
+              var argNode: int64 := self.cg_nc0(capDecl);
+              while argNode >= 0 {
+                var keyPtr: pchar := self.cg_nsval(argNode);
+                var keyLen: int64 := self.cg_nslen(argNode);
+                var valNode: int64 := self.cg_nc0(argNode);
+                if valNode >= 0 && self.cg_nkind(valNode) == 40 {  // NK_LIT_INT = 40
+                  var argVal: int64 := self.cg_nival(valNode);
+                  // "pin" [p=112,i=105,n=110] oder "bus" [b=98,u=117,s=115] → arg0
+                  if keyLen == 3 && (StrCharAt(keyPtr, 0) & 255) == 112 &&
+                     (StrCharAt(keyPtr, 1) & 255) == 105 && (StrCharAt(keyPtr, 2) & 255) == 110 {
+                    hwArg0 := argVal;  // pin
+                  }
+                  if keyLen == 3 && (StrCharAt(keyPtr, 0) & 255) == 98 &&
+                     (StrCharAt(keyPtr, 1) & 255) == 117 && (StrCharAt(keyPtr, 2) & 255) == 115 {
+                    hwArg0 := argVal;  // bus
+                  }
+                  // "cs" [c=99,s=115] → arg1
+                  if keyLen == 2 && (StrCharAt(keyPtr, 0) & 255) == 99 &&
+                     (StrCharAt(keyPtr, 1) & 255) == 115 {
+                    hwArg1 := argVal;
+                  }
+                }
+                argNode := self.cg_nnext(argNode);
+              }
+              // Deduplizieren nach (capId, arg0, arg1) — gerätepfadspezifisch
+              var hwAlready: int64 := 0;
+              var hwi2: int64 := 0;
+              while hwi2 < self.lcbsHwArgCount {
+                var hbase: int64 := self.lcbsHwArgBuf + hwi2 * 24;
+                if peek64(hbase) == cid && peek64(hbase + 8) == hwArg0 && peek64(hbase + 16) == hwArg1 {
+                  hwAlready := 1; hwi2 := self.lcbsHwArgCount;
+                }
+                hwi2 := hwi2 + 1;
+              }
+              if hwAlready == 0 {
+                var hbase: int64 := self.lcbsHwArgBuf + self.lcbsHwArgCount * 24;
+                poke64(hbase,      cid);
+                poke64(hbase + 8,  hwArg0);
+                poke64(hbase + 16, hwArg1);
+                self.lcbsHwArgCount := self.lcbsHwArgCount + 1;
               }
             }
           }
@@ -8588,6 +8645,30 @@ pub type Codegen = class {
     }
   }
 
+  // WP-H12: Berechnet Gerätepfade für Hardware-Caps und schreibt sie in die Datensektion.
+  // Muss VOR cg_genFile() aufgerufen werden; cg_emitLandlockInit() verwendet die Offsets.
+  fn cg_genHwDevPathSection(): void {
+    if self.lcbsHwArgCount == 0 { return; }
+    var pathBuf: int64 := alloc(32);
+    var hwi: int64 := 0;
+    while hwi < self.lcbsHwArgCount {
+      var hbase: int64 := self.lcbsHwArgBuf + hwi * 24;
+      var capId: int64 := peek64(hbase);
+      var arg0:  int64 := peek64(hbase + 8);
+      var arg1:  int64 := peek64(hbase + 16);
+      var plen:  int64 := hw_path_for(capId, arg0, arg1, pathBuf);
+      poke64(self.lcbsHwDevPathOff + hwi * 8, self.dataLen);
+      // Pfad + NUL-Terminator in Datensektion schreiben
+      var j: int64 := 0;
+      while j <= plen {
+        self.cg_edata(peek8(pathBuf + j));
+        j := j + 1;
+      }
+      hwi := hwi + 1;
+    }
+    free(pathBuf, 32);
+  }
+
   // WP-R10: Emittiert Landlock-Setup-Code am Anfang von main().
   // Reihenfolge: Landlock ZUERST, dann seccomp (Landlock-Syscalls müssen vor seccomp laufen).
   // Stack-Layout (48 Bytes):
@@ -8597,6 +8678,7 @@ pub type Codegen = class {
   //   [rsp+24] = String-Puffer: '/', '\0', ... (8 Bytes)
   //   [rsp+32] = ruleset_fd (s64)
   //   [rsp+40] = dir_fd (s64)
+  // WP-H12: Hardware-Caps erzeugen per-Gerät-Regeln (statt breiter /dev-Regel).
   fn cg_emitLandlockInit(): void {
     if self.lcbsEnabled == 0 { return; }
 
@@ -8683,44 +8765,54 @@ pub type Codegen = class {
     self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 3
     self.cg_e8(0x0F); self.cg_e8(0x05);                                          // syscall
 
-    // Hardware-Caps: /dev öffnen und Regel hinzufügen
-    if self.lcbsLandlockHasDev != 0 {
-      // 'd','e','v' in [rsp+25..27] setzen → "/dev\0"
-      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x19); self.cg_e8(0x64); // 'd'
-      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x1A); self.cg_e8(0x65); // 'e'
-      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x1B); self.cg_e8(0x76); // 'v'
-      // openat(AT_FDCWD, &[rsp+24], O_PATH, 0) → "/dev"
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x9C); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18);
-      self.cg_e8(0xBA); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x20); self.cg_e8(0x00);
-      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);
-      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x0F); self.cg_e8(0x05);
-      // test rax,rax; js rel32 → dev_close (add_rule überspringen)
+    // WP-H12: Per-device Landlock-Regeln — eine Regel pro Gerätepfad
+    // (spezifischer als WP-R10's breite /dev-Regel)
+    var ppDev:    int64 := 0;
+    var jDevSkip: int64 := 0;
+    var da:       int64 := 0;
+    var hwi:      int64 := 0;
+    while hwi < self.lcbsHwArgCount {
+      // hw_dev_allowed: Gerätedateien (GPIO/I2C/SPI) ohne READ_DIR; USB-Verzeichnis mit READ_DIR
+      da := hw_dev_allowed(peek64(self.lcbsHwArgBuf + hwi * 24));
+      // openat(AT_FDCWD=-100, devPath, O_PATH=0x200000, 0)
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7);
+      self.cg_e8(0x9C); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);     // mov rdi, -100
+      // lea rsi, [rip+devPath]
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+      ppDev := self.codeLen; self.cg_e32(0);
+      self.cg_addPatch(ppDev, peek64(self.lcbsHwDevPathOff + hwi * 8), 0, CG_PATCH_STR);
+      self.cg_e8(0xBA); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x20); self.cg_e8(0x00); // mov edx, O_PATH
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);                       // xor r10d, r10d
+      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 257
+      self.cg_e8(0x0F); self.cg_e8(0x05);                                           // syscall
+      // test rax,rax; js rel32 → dev_skip (Gerät nicht vorhanden → graceful überspringen)
       self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
       self.cg_e8(0x0F); self.cg_e8(0x88);
-      var jDevClose: int64 := self.codeLen; self.cg_e32(0);  // Placeholder jump 4
+      jDevSkip := self.codeLen; self.cg_e32(0);
       // mov [rsp+40], rax (dev_fd)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
-      // Regel für /dev hinzufügen
-      var da: int64 := self.lcbsLandlockDevAllowed;
+      // mov eax, da (allowed_access); mov [rsp+8], rax
       self.cg_e8(0xB8);
       self.cg_e8(da & 0xFF); self.cg_e8((da >> 8) & 0xFF);
       self.cg_e8((da >> 16) & 0xFF); self.cg_e8((da >> 24) & 0xFF);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+      // mov eax, [rsp+40]; mov [rsp+16], eax (parent_fd = dev_fd)
       self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
       self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);
-      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20);
-      self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x08);
-      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);
-      self.cg_e8(0xB8); self.cg_e8(0xBD); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x0F); self.cg_e8(0x05);
-      // LABEL dev_close: patch jDevClose → hier (close dev_fd)
-      poke32(self.code + jDevClose, self.codeLen - jDevClose - 4);
-      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28); // mov edi, [rsp+40]
-      self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x0F); self.cg_e8(0x05);
+      // landlock_add_rule(ruleset_fd, RULE_PATH_BENEATH=1, &path_beneath, 0)
+      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20);     // mov edi, [rsp+32]
+      self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov esi, 1
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x08); // lea rdx, [rsp+8]
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);                       // xor r10d, r10d
+      self.cg_e8(0xB8); self.cg_e8(0xBD); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 445
+      self.cg_e8(0x0F); self.cg_e8(0x05);                                           // syscall
+      // close dev_fd
+      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28);     // mov edi, [rsp+40]
+      self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 3
+      self.cg_e8(0x0F); self.cg_e8(0x05);                                           // syscall
+      // patch jDevSkip → hier
+      poke32(self.code + jDevSkip, self.codeLen - jDevSkip - 4);
+      hwi := hwi + 1;
     }
 
     // RESTRICT_LABEL: patch jRestrict3 → hier
@@ -8796,11 +8888,12 @@ pub type Codegen = class {
     // WP-R9/R10/R11: collect capabilities, compute masks, generate BPF + proxy data sections
     // cg_emitProxyStart/LandlockInit/SeccompInit() are called later from cg_genFuncDecl
     self.cg_collectCaps(head);
-    self.cg_computeProxy();     // WP-R11: Proxy-Bedarf bestimmen
-    self.cg_computeLandlock();  // WP-R10: Landlock-Bitmasks
-    self.cg_genProxyBpfSection(); // WP-R11: Proxy-BPF + proxy_fd-Slot in Datensektion
-    self.cg_genBpfSection();      // WP-R9: Haupt-BPF in Datensektion
-    self.cg_emitProxyLoop();      // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
+    self.cg_computeProxy();        // WP-R11: Proxy-Bedarf bestimmen
+    self.cg_computeLandlock();     // WP-R10: Landlock-Bitmasks
+    self.cg_genProxyBpfSection();  // WP-R11: Proxy-BPF + proxy_fd-Slot in Datensektion
+    self.cg_genBpfSection();       // WP-R9: Haupt-BPF in Datensektion
+    self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
+    self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
     self.cg_genFile(head);
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
