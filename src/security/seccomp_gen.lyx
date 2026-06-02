@@ -1,0 +1,403 @@
+// ===========================================================================
+// WP-R9: seccomp-BPF-Codegenerierung
+// ===========================================================================
+// Generiert classic BPF Bytecode (struct sock_filter) für prctl(PR_SET_SECCOMP).
+// Jeder BPF-Befehl = 8 Bytes: { op:u16LE, jt:u8, jf:u8, k:u32LE }.
+//
+// Programmstruktur:
+//   [0-2]  Architektur-Check (x86-64)
+//   [3]    Lade syscall-Nummer
+//   [4..N] Syscall-Whitelists (2-Befehlsblöcke; Argument-Filter: 5-7 Befehle)
+//   [N+1]  Default: SECCOMP_RET_KILL_PROCESS
+//
+// Implizit erlaubt (immer, auch ohne @capabilities):
+//   exit_group, exit, brk, mmap(anon), munmap, write, prctl, prlimit64
+
+import src.std.alloc;
+
+// BPF-Opcode-Konstanten (classic BPF)
+con SC_LD_ABS_W:    int64 := 0x20;  // BPF_LD|BPF_W|BPF_ABS
+con SC_ALU_AND_K:   int64 := 0x54;  // BPF_ALU|BPF_AND|BPF_K
+con SC_JMP_JEQ_K:   int64 := 0x15;  // BPF_JMP|BPF_JEQ|BPF_K
+con SC_RET_K:       int64 := 0x06;  // BPF_RET|BPF_K
+
+// seccomp Rückgabewerte
+con SC_ALLOW:    int64 := 0x7fff0000;  // SECCOMP_RET_ALLOW
+con SC_KILL:     int64 := 0x80000000;  // SECCOMP_RET_KILL_PROCESS
+
+// AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
+con SC_ARCH_X86_64:  int64 := 0xC000003E;
+
+// Offsets in struct seccomp_data
+con SC_OFF_NR:   int64 := 0;   // syscall number
+con SC_OFF_ARCH: int64 := 4;   // audit arch
+con SC_OFF_ARG0: int64 := 16;  // args[0]
+con SC_OFF_ARG1: int64 := 24;  // args[1]
+con SC_OFF_ARG2: int64 := 32;  // args[2]
+
+// Linux x86-64 syscall numbers
+con SC_SYS_READ:          int64 := 0;
+con SC_SYS_OPEN:          int64 := 2;
+con SC_SYS_WRITE:         int64 := 1;
+con SC_SYS_CLOSE:         int64 := 3;
+con SC_SYS_FSTAT:         int64 := 5;
+con SC_SYS_LSEEK:         int64 := 8;
+con SC_SYS_MMAP:          int64 := 9;
+con SC_SYS_MPROTECT:      int64 := 10;
+con SC_SYS_MUNMAP:        int64 := 11;
+con SC_SYS_BRK:           int64 := 12;
+con SC_SYS_RT_SIGACTION:  int64 := 13;
+con SC_SYS_RT_SIGRETURN:  int64 := 15;
+con SC_SYS_SOCKET:        int64 := 41;
+con SC_SYS_CONNECT:       int64 := 42;
+con SC_SYS_ACCEPT:        int64 := 43;
+con SC_SYS_SENDTO:        int64 := 44;
+con SC_SYS_RECVFROM:      int64 := 45;
+con SC_SYS_SENDMSG:       int64 := 46;
+con SC_SYS_RECVMSG:       int64 := 47;
+con SC_SYS_BIND:          int64 := 49;
+con SC_SYS_LISTEN:        int64 := 50;
+con SC_SYS_CLONE:         int64 := 56;
+con SC_SYS_FORK:          int64 := 57;
+con SC_SYS_EXECVE:        int64 := 59;
+con SC_SYS_EXIT:          int64 := 60;
+con SC_SYS_KILL:          int64 := 62;
+con SC_SYS_RMDIR:         int64 := 84;
+con SC_SYS_MLOCK:         int64 := 149;
+con SC_SYS_MLOCKALL:      int64 := 151;
+con SC_SYS_PRCTL:         int64 := 157;
+con SC_SYS_FUTEX:         int64 := 202;
+con SC_SYS_GETDENTS64:    int64 := 217;
+con SC_SYS_CLOCK_GETTIME: int64 := 228;
+con SC_SYS_EXIT_GROUP:    int64 := 231;
+con SC_SYS_TGKILL:        int64 := 234;
+con SC_SYS_OPENAT:        int64 := 257;
+con SC_SYS_UNLINKAT:      int64 := 263;
+con SC_SYS_ACCEPT4:       int64 := 288;
+con SC_SYS_PRLIMIT64:     int64 := 302;
+con SC_SYS_SCHED_SETATTR: int64 := 314;
+con SC_SYS_GETRANDOM:     int64 := 318;
+con SC_SYS_EXECVEAT:      int64 := 322;
+con SC_SYS_STATX:         int64 := 332;
+
+// Capability-ID-Konstanten (lokale Kopien, bootstrap-sicher)
+con SC_CAP_SYSTEM_EXIT:         int64 := 0;
+con SC_CAP_SYSTEM_MEMORY_HEAP:  int64 := 1;
+con SC_CAP_SYSTEM_MEMORY_STACK: int64 := 2;
+con SC_CAP_SYSTEM_TIME:         int64 := 3;
+con SC_CAP_SYSTEM_ENV:          int64 := 4;
+con SC_CAP_SYSTEM_RAND:         int64 := 5;
+con SC_CAP_FS_READ:             int64 := 7;
+con SC_CAP_FS_WRITE:            int64 := 8;
+con SC_CAP_FS_CREATE:           int64 := 9;
+con SC_CAP_FS_DELETE:           int64 := 10;
+con SC_CAP_FS_META:             int64 := 11;
+con SC_CAP_FS_EXEC:             int64 := 12;
+con SC_CAP_MEMORY_MMAP:         int64 := 13;
+con SC_CAP_MEMORY_LOCK:         int64 := 14;
+con SC_CAP_NETWORK_TCP_BIND:    int64 := 15;
+con SC_CAP_NETWORK_TCP_CONNECT: int64 := 16;
+con SC_CAP_NETWORK_UDP_BIND:    int64 := 17;
+con SC_CAP_NETWORK_UDP_CONNECT: int64 := 18;
+con SC_CAP_NETWORK_UNIX:        int64 := 19;
+con SC_CAP_NETWORK_RAW:         int64 := 20;
+con SC_CAP_HARDWARE_GPIO:       int64 := 21;
+con SC_CAP_HARDWARE_I2C:        int64 := 22;
+con SC_CAP_HARDWARE_SPI:        int64 := 23;
+con SC_CAP_HARDWARE_USB:        int64 := 24;
+con SC_CAP_PROCESS_FORK:        int64 := 25;
+con SC_CAP_PROCESS_EXEC:        int64 := 26;
+con SC_CAP_PROCESS_SIGNAL:      int64 := 27;
+con SC_CAP_PROCESS_SCHED:       int64 := 28;
+con SC_CAP_PROCESS_EXIT:        int64 := 29;
+
+// O_WRONLY=1, O_RDWR=2 — Maskierung für openat-Argument-Filter
+con SC_O_WRITE_MASK: int64 := 3;
+
+// AF_INET=2, AF_INET6=10, AF_UNIX=1
+con SC_AF_INET: int64 := 2;
+con SC_AF_UNIX: int64 := 1;
+
+// SOCK_STREAM=1, SOCK_DGRAM=2
+con SC_SOCK_STREAM: int64 := 1;
+con SC_SOCK_DGRAM:  int64 := 2;
+con SC_SOCK_TYPE_MASK: int64 := 0xF;  // mask for socket type (ignores flags like SOCK_CLOEXEC)
+
+// Längengebundener String-Vergleich mit null-terminiertem Literal
+fn sc_path_eq(lit: pchar, src: pchar, n: int64): bool {
+  var i: int64 := 0;
+  while i < n {
+    if StrCharAt(lit, i) != StrCharAt(src, i) { return false; }
+    i := i + 1;
+  }
+  return StrCharAt(lit, n) == 0;
+}
+
+// Mappt Capability-Pfad-String → Capability-ID (lokale Kopie ohne Import-Abhängigkeit)
+pub fn seccomp_cap_id_from_path(path: pchar, len: int64): int64 {
+  if sc_path_eq("system.exit"c,                 path, len) { return SC_CAP_SYSTEM_EXIT; }
+  if sc_path_eq("system.memory.heap"c,          path, len) { return SC_CAP_SYSTEM_MEMORY_HEAP; }
+  if sc_path_eq("system.memory.stack"c,         path, len) { return SC_CAP_SYSTEM_MEMORY_STACK; }
+  if sc_path_eq("system.time"c,                 path, len) { return SC_CAP_SYSTEM_TIME; }
+  if sc_path_eq("system.env"c,                  path, len) { return SC_CAP_SYSTEM_ENV; }
+  if sc_path_eq("system.rand"c,                 path, len) { return SC_CAP_SYSTEM_RAND; }
+  if sc_path_eq("fs.read"c,                     path, len) { return SC_CAP_FS_READ; }
+  if sc_path_eq("fs.write"c,                    path, len) { return SC_CAP_FS_WRITE; }
+  if sc_path_eq("fs.create"c,                   path, len) { return SC_CAP_FS_CREATE; }
+  if sc_path_eq("fs.delete"c,                   path, len) { return SC_CAP_FS_DELETE; }
+  if sc_path_eq("fs.meta"c,                     path, len) { return SC_CAP_FS_META; }
+  if sc_path_eq("fs.exec"c,                     path, len) { return SC_CAP_FS_EXEC; }
+  if sc_path_eq("memory.mmap"c,                 path, len) { return SC_CAP_MEMORY_MMAP; }
+  if sc_path_eq("memory.lock"c,                 path, len) { return SC_CAP_MEMORY_LOCK; }
+  if sc_path_eq("network.tcp.bind"c,            path, len) { return SC_CAP_NETWORK_TCP_BIND; }
+  if sc_path_eq("network.tcp.connect"c,         path, len) { return SC_CAP_NETWORK_TCP_CONNECT; }
+  if sc_path_eq("network.udp.bind"c,            path, len) { return SC_CAP_NETWORK_UDP_BIND; }
+  if sc_path_eq("network.udp.connect"c,         path, len) { return SC_CAP_NETWORK_UDP_CONNECT; }
+  if sc_path_eq("network.unix"c,                path, len) { return SC_CAP_NETWORK_UNIX; }
+  if sc_path_eq("network.raw"c,                 path, len) { return SC_CAP_NETWORK_RAW; }
+  if sc_path_eq("hardware.gpio"c,               path, len) { return SC_CAP_HARDWARE_GPIO; }
+  if sc_path_eq("hardware.i2c"c,                path, len) { return SC_CAP_HARDWARE_I2C; }
+  if sc_path_eq("hardware.spi"c,                path, len) { return SC_CAP_HARDWARE_SPI; }
+  if sc_path_eq("hardware.usb"c,                path, len) { return SC_CAP_HARDWARE_USB; }
+  if sc_path_eq("process.fork"c,                path, len) { return SC_CAP_PROCESS_FORK; }
+  if sc_path_eq("process.exec"c,                path, len) { return SC_CAP_PROCESS_EXEC; }
+  if sc_path_eq("process.signal"c,              path, len) { return SC_CAP_PROCESS_SIGNAL; }
+  if sc_path_eq("process.sched"c,               path, len) { return SC_CAP_PROCESS_SCHED; }
+  if sc_path_eq("process.exit"c,                path, len) { return SC_CAP_PROCESS_EXIT; }
+  return 0 - 1;
+}
+
+// Schreibt einen BPF-Befehl als 8 Bytes LE in buf[idx]
+fn sc_emit(buf: int64, idx: int64, op: int64, jt: int64, jf: int64, k: int64): void {
+  var off: int64 := buf + idx * 8;
+  poke8(off + 0, op & 0xFF);
+  poke8(off + 1, (op >> 8) & 0xFF);
+  poke8(off + 2, jt & 0xFF);
+  poke8(off + 3, jf & 0xFF);
+  poke8(off + 4, k & 0xFF);
+  poke8(off + 5, (k >> 8) & 0xFF);
+  poke8(off + 6, (k >> 16) & 0xFF);
+  poke8(off + 7, (k >> 24) & 0xFF);
+}
+
+// Einfacher Allow-Block: prüft exakt eine syscall-Nummer (2 Befehle)
+fn sc_allow_nr(buf: int64, n: int64, nr: int64): int64 {
+  sc_emit(buf, n,     SC_JMP_JEQ_K, 0, 1, nr);  // match → RET ALLOW; no match → skip
+  sc_emit(buf, n + 1, SC_RET_K, 0, 0, SC_ALLOW);
+  return n + 2;
+}
+
+// Prüft ob capId in capBuf[0..capCount-1] enthalten ist
+fn sc_has_cap(capBuf: int64, capCount: int64, capId: int64): bool {
+  var i: int64 := 0;
+  while i < capCount {
+    if peek64(capBuf + i * 8) == capId { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+// ===========================================================================
+// Hauptfunktion: generiert das BPF-Programm für die gegebene Capability-Menge
+// capBuf:   int64[capCount] — Array von Capability-IDs
+// capCount: Anzahl der Capabilities
+// bpfBuf:   Ausgabepuffer (mind. 256 * 8 Bytes)
+// Rückgabe: Anzahl der generierten BPF-Befehle
+// ===========================================================================
+pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int64 {
+  var n: int64 := 0;
+
+  // ---- Architektur-Check ------------------------------------------------
+  sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARCH); n := n + 1;
+  sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 1, 0, SC_ARCH_X86_64); n := n + 1; // x86-64 → skip kill
+  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_KILL); n := n + 1;
+
+  // ---- Lade syscall-Nummer ----------------------------------------------
+  sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;
+
+  // ---- Implizite Syscalls (immer erlaubt) --------------------------------
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_EXIT_GROUP);  // exit_group
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_EXIT);        // exit
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_BRK);         // brk (heap)
+  // mmap mit MAP_ANON erlauben (args[3] bit 0x20 gesetzt): Argument-Filter
+  // Vereinfachung: mmap ohne Argument-Check erlaubt (häufig genug sicher für statische Binaries)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_MMAP);        // mmap (anon & file)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_MUNMAP);      // munmap
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_WRITE);       // write (für PrintStr/stdout)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_PRCTL);       // prctl (für seccomp self-install)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_PRLIMIT64);   // prlimit64 (_start stack remove)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_FUTEX);       // futex (threading primitives)
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_RT_SIGACTION);  // signal handlers
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_RT_SIGRETURN);  // signal return
+
+  // ---- Capability-spezifische Syscalls -----------------------------------
+
+  // fs.read + fs.write + fs.create → openat
+  // Argument-Filter: wenn nur fs.read → O_RDONLY; wenn fs.write → alle Flags
+  var hasRead:   bool := sc_has_cap(capBuf, capCount, SC_CAP_FS_READ);
+  var hasWrite:  bool := sc_has_cap(capBuf, capCount, SC_CAP_FS_WRITE);
+  var hasCreate: bool := sc_has_cap(capBuf, capCount, SC_CAP_FS_CREATE);
+
+  if hasWrite || hasCreate {
+    // Beliebige open/openat-Flags erlaubt
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_OPEN);    // SYS_open = 2
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_OPENAT);  // SYS_openat = 257
+  } else if hasRead {
+    // Nur O_RDONLY (flags & 3 == 0) erlaubt für open() und openat()
+    // open(): flags ist args[1] (offset 24); openat(): flags ist args[2] (offset 32)
+    // --- open() O_RDONLY Filter (5 Befehle + NR-Reload) ---
+    sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_SYS_OPEN); n := n + 1;
+    sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1); n := n + 1;  // flags = args[1]
+    sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_O_WRITE_MASK); n := n + 1;
+    sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, 0); n := n + 1;
+    sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
+    sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;
+    // --- openat() O_RDONLY Filter (5 Befehle + NR-Reload) ---
+    sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_SYS_OPENAT); n := n + 1;
+    sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG2); n := n + 1;  // flags = args[2]
+    sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_O_WRITE_MASK); n := n + 1;
+    sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, 0); n := n + 1;
+    sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
+    sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;
+  }
+
+  if hasRead {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_READ);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOSE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_LSEEK);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FSTAT);
+  }
+  if hasWrite {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_READ);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOSE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_LSEEK);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FSTAT);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_FS_DELETE) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_UNLINKAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_RMDIR);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_FS_META) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_STATX);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_GETDENTS64);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_FS_EXEC) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EXECVEAT);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_SYSTEM_TIME) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOCK_GETTIME);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_SYSTEM_RAND) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_GETRANDOM);
+  }
+
+  // Netzwerk: socket-Typ Argument-Filter
+  var hasTcpConn: bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_TCP_CONNECT);
+  var hasUdpConn: bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_UDP_CONNECT);
+  var hasTcpBind: bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_TCP_BIND);
+  var hasUdpBind: bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_UDP_BIND);
+  var hasUnix:    bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_UNIX);
+
+  if hasTcpConn || hasUdpConn || hasTcpBind || hasUdpBind || hasUnix {
+    // socket-Aufruf: je nach vorhandenen Caps Argument-Filter generieren
+    if (hasTcpConn && hasUdpConn) || (hasTcpBind && hasUdpBind) {
+      // Alle socket-Typen erlaubt → einfacher Allow
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_SOCKET);
+    } else if hasTcpConn || hasTcpBind {
+      // Nur SOCK_STREAM (TCP): 7 Befehle
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 6, SC_SYS_SOCKET); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;  // domain
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_AF_INET); n := n + 1;  // not AF_INET → skip
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1); n := n + 1;  // type
+      sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_SOCK_TYPE_MASK); n := n + 1;
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_SOCK_STREAM); n := n + 1; // SOCK_STREAM → ALLOW
+      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
+    } else if hasUdpConn || hasUdpBind {
+      // Nur SOCK_DGRAM (UDP): 7 Befehle
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 6, SC_SYS_SOCKET); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_AF_INET); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1); n := n + 1;
+      sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_SOCK_TYPE_MASK); n := n + 1;
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_SOCK_DGRAM); n := n + 1;
+      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
+    } else if hasUnix {
+      // AF_UNIX socket
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 5, SC_SYS_SOCKET); n := n + 1;
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 2, SC_AF_UNIX); n := n + 1;
+      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;  // AF_UNIX match → allow
+      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
+    }
+    if hasTcpConn {
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_CONNECT);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_SENDTO);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_RECVFROM);
+    }
+    if hasUdpConn {
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_SENDTO);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_CONNECT);
+    }
+    if hasTcpBind {
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_BIND);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_LISTEN);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT4);
+    }
+    if hasUdpBind {
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_BIND);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_RECVFROM);
+    }
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SENDMSG);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_RECVMSG);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOSE);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_MEMORY_MMAP) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_MPROTECT);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_MEMORY_LOCK) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_MLOCK);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_MLOCKALL);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_PROCESS_FORK) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLONE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FORK);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_PROCESS_EXEC) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EXECVE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EXECVEAT);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_PROCESS_SIGNAL) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_KILL);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_TGKILL);
+  }
+
+  if sc_has_cap(capBuf, capCount, SC_CAP_PROCESS_SCHED) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SCHED_SETATTR);
+  }
+
+  var hasHw: bool := sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_GPIO) ||
+                     sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_I2C)  ||
+                     sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_SPI)  ||
+                     sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_USB);
+  if hasHw {
+    n := sc_allow_nr(bpfBuf, n, 16);  // ioctl
+  }
+
+  // ---- Standard-Aktion: Kill ----------------------------------------
+  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_KILL); n := n + 1;
+
+  return n;
+}

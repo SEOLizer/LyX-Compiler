@@ -8,6 +8,7 @@ import src.parser;
 import src.dwarf_gen;
 import src.crypto.lic_hmac;
 import src.std.alloc;
+import src.security.seccomp_gen;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -522,6 +523,13 @@ pub type Codegen = class {
 
   // WP-MEM-05: top-level AST head for default-param lookup in cg_genCall
   topLevelHead: int64;
+
+  // WP-R9: seccomp-BPF
+  lcbsCapBuf:     int64;  // alloc'd int64[64]: collected capIds
+  lcbsCapCount:   int64;
+  lcbsBpfDataOff: int64;  // data section offset of BPF instructions (-1 = disabled)
+  lcbsBpfCount:   int64;  // number of BPF instructions
+  lcbsEnabled:    int64;  // 1 if any @capabilities annotation found → install seccomp
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -6941,6 +6949,13 @@ pub type Codegen = class {
       param := self.cg_nnext(param);
     }
 
+    // WP-R9: seccomp install — emit prctl calls at start of 'main' when caps declared
+    if self.lcbsEnabled != 0 && fnlen == 4 {
+      if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
+         StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
+        self.cg_emitSeccompInit();
+      }
+    }
     // Generate function body (child2 = block)
     var body: int64 := self.cg_nc2(ni);
     // WP-AS-10: collect defers before generating body so return points can emit them
@@ -8284,14 +8299,116 @@ pub type Codegen = class {
     self.profEntries    := alloc(self.profEntryCap * CG_PROF_SZ);
     self.profEntryCount := 0;
 
+    // WP-R9: seccomp init
+    self.lcbsCapBuf     := alloc(64 * 8);
+    self.lcbsCapCount   := 0;
+    self.lcbsBpfDataOff := 0 - 1;  // -1 = no BPF generated yet
+    self.lcbsBpfCount   := 0;
+    self.lcbsEnabled    := 0;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
     self.cg_addBuiltinCons();
   }
 
+  // WP-R9: Capability-IDs aus AST sammeln (scannt alle @capabilities-Annotationen)
+  // Setzt lcbsEnabled=1 sobald irgendeine @capabilities-Annotation gefunden wird.
+  fn cg_collectCaps(astHead: int64): void {
+    var ni: int64 := astHead;
+    while ni >= 0 {
+      if self.cg_nkind(ni) == 110 {  // SNK_CAPABILITY_ATTR = 110
+        self.lcbsEnabled := 1;
+        var capDecl: int64 := self.cg_nc0(ni);
+        while capDecl >= 0 {
+          if self.cg_nkind(capDecl) == 111 {  // SNK_CAPABILITY_DECL = 111
+            var path: pchar := self.cg_nsval(capDecl);
+            var plen: int64 := self.cg_nslen(capDecl);
+            var cid: int64 := seccomp_cap_id_from_path(path, plen);
+            if cid >= 0 && self.lcbsCapCount < 64 {
+              // Deduplizieren
+              var already: int64 := 0;
+              var ci: int64 := 0;
+              while ci < self.lcbsCapCount {
+                if peek64(self.lcbsCapBuf + ci * 8) == cid { already := 1; ci := self.lcbsCapCount; }
+                ci := ci + 1;
+              }
+              if already == 0 {
+                poke64(self.lcbsCapBuf + self.lcbsCapCount * 8, cid);
+                self.lcbsCapCount := self.lcbsCapCount + 1;
+              }
+            }
+          }
+          capDecl := self.cg_nnext(capDecl);
+        }
+      }
+      ni := self.cg_nnext(ni);
+    }
+  }
+
+  // WP-R9: BPF-Programm in Datensektion schreiben; setzt lcbsBpfDataOff + lcbsBpfCount
+  // Nur aufgerufen wenn lcbsEnabled == 1.
+  fn cg_genBpfSection(): void {
+    if self.lcbsEnabled == 0 { return; }
+    var bpfBuf: int64 := alloc(256 * 8);
+    var bpfCount: int64 := seccomp_build_filter(self.lcbsCapBuf, self.lcbsCapCount, bpfBuf);
+    self.lcbsBpfDataOff := self.dataLen;
+    self.lcbsBpfCount   := bpfCount;
+    var i: int64 := 0;
+    while i < bpfCount * 8 {
+      self.cg_edata(peek8(bpfBuf + i));
+      i := i + 1;
+    }
+    free(bpfBuf, 256 * 8);
+  }
+
+  // WP-R9: Emittiert seccomp-Installation in den Anfang einer Funktion.
+  // Wird von cg_genFuncDecl aufgerufen wenn lcbsEnabled && name=="main".
+  // Läuft NACH dem Funktions-Prolog (push rbp etc.) aber VOR dem Body.
+  fn cg_emitSeccompInit(): void {
+    if self.lcbsBpfDataOff < 0 { return; }
+    // Construct sock_fprog on stack (sub rsp already done by cg_genFuncDecl prolog).
+    // We use 16 extra bytes below current rsp; sub rsp,16 first.
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
+    // xor rax, rax; mov [rsp+2..15], 0 (clear padding)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x02);
+    // mov ax, bpfCount (uint16 at [rsp+0])
+    var cnt16: int64 := self.lcbsBpfCount & 0xFFFF;
+    self.cg_e8(0x66); self.cg_e8(0xB8);
+    self.cg_e8(cnt16 & 0xFF); self.cg_e8((cnt16 >> 8) & 0xFF);
+    self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov [rsp+0], ax
+    // lea rax, [rip+bpfData]
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var ppBpf: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(ppBpf, self.lcbsBpfDataOff, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);  // mov [rsp+8], rax
+    // prctl(PR_SET_NO_NEW_PRIVS=38, 1, 0, 0, 0)
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d, r8d
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor r10d, r10d
+    self.cg_e8(0x31); self.cg_e8(0xD2);                     // xor edx, edx
+    self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBF); self.cg_e8(0x26); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xB8); self.cg_e8(0x9D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // prctl(PR_SET_SECCOMP=22, SECCOMP_MODE_FILTER=2, rsp)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE2);  // mov rdx, rsp
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor r10d, r10d
+    self.cg_e8(0xBE); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xBF); self.cg_e8(0x16); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0xB8); self.cg_e8(0x9D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
+  }
+
   fn Generate(head: int64) {
     self.topLevelHead := head;  // WP-MEM-05: save for default-param lookup
+    // WP-R9: collect capabilities from AST, generate BPF section
+    // cg_emitSeccompInit() is called later from cg_genFuncDecl when generating main
+    self.cg_collectCaps(head);
+    self.cg_genBpfSection();
     self.cg_genFile(head);
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
