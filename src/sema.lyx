@@ -289,6 +289,9 @@ pub type Sema = class {
   // WP-BC-22: current class node index (-1 = global scope)
   curClassNi: int64;
 
+  // WP-L8: current class-level @capabilities node (-1 = none)
+  classCapNode: int64;
+
   // Import deduplication (WP-10e)
   importedMods:  int64;
   importedCount: int64;
@@ -2422,6 +2425,57 @@ pub type Sema = class {
     }
   }
 
+  // WP-L8: Füllt curFuncCapBuf für Klassenmethoden: union(classCapNi, methodCapNi, uccNi).
+  fn _fillMethodCaps(classCapNi: int64, methodCapNi: int64, uccNi: int64): void {
+    self.curFuncCapCount := 0;
+    var reg: CapabilityRegistry;
+    reg.Init();
+    // Class-level caps first
+    if classCapNi >= 0 {
+      var cd: int64 := self.sn_c0(classCapNi);
+      while cd >= 0 && self.curFuncCapCount < 64 {
+        var cid: int64 := reg.LookupId(self.sn_sVal(cd), self.sn_sLen(cd));
+        if cid >= 0 {
+          poke64(self.curFuncCapBuf + self.curFuncCapCount * 8, cid);
+          self.curFuncCapCount := self.curFuncCapCount + 1;
+        }
+        cd := self.sn_next(cd);
+      }
+    }
+    // Method-own caps (union — skip duplicates)
+    if methodCapNi >= 0 {
+      var cd2: int64 := self.sn_c0(methodCapNi);
+      while cd2 >= 0 && self.curFuncCapCount < 64 {
+        var cid2: int64 := reg.LookupId(self.sn_sVal(cd2), self.sn_sLen(cd2));
+        if cid2 >= 0 {
+          var ci: int64 := 0;
+          var dup: int64 := 0;
+          while ci < self.curFuncCapCount {
+            if peek64(self.curFuncCapBuf + ci * 8) == cid2 { dup := 1; ci := self.curFuncCapCount; }
+            ci := ci + 1;
+          }
+          if dup == 0 {
+            poke64(self.curFuncCapBuf + self.curFuncCapCount * 8, cid2);
+            self.curFuncCapCount := self.curFuncCapCount + 1;
+          }
+        }
+        cd2 := self.sn_next(cd2);
+      }
+    }
+    // UCC-borrowed caps
+    if uccNi >= 0 {
+      var cd3: int64 := self.sn_c0(uccNi);
+      while cd3 >= 0 && self.curFuncCapCount < 64 {
+        var cid3: int64 := reg.LookupId(self.sn_sVal(cd3), self.sn_sLen(cd3));
+        if cid3 >= 0 {
+          poke64(self.curFuncCapBuf + self.curFuncCapCount * 8, cid3);
+          self.curFuncCapCount := self.curFuncCapCount + 1;
+        }
+        cd3 := self.sn_next(cd3);
+      }
+    }
+  }
+
   // WP-L7: Registriert eine @uses_caller_cap-annotierte Funktion im UCC-Puffer.
   // funcNi: SNK_FUNC_DECL-Knoten; uccNi: SNK_USES_CALLER_CAP-Knoten.
   fn _registerUccFn(funcNi: int64, uccNi: int64): void {
@@ -2505,7 +2559,7 @@ pub type Sema = class {
     // WP-L7: Pending-Annotationen bei nicht-annotierbaren Knoten zurücksetzen.
     // Use 0-1 instead of -1 literal: bootstrap miscompiles -1 as 0 (known bug).
     if k != SNK_CAPABILITY_ATTR && k != SNK_USES_CALLER_CAP &&
-       k != SNK_FUNC_DECL && k != SNK_BLOCK {
+       k != SNK_FUNC_DECL && k != SNK_BLOCK && k != SNK_TYPE_DECL {
       self.pendingCapNode := 0 - 1;
       self.pendingUccNode := 0 - 1;
     }
@@ -2573,6 +2627,14 @@ pub type Sema = class {
       // WP-BC-22: set class context for visibility checks
       var prevClassNi: int64 := self.curClassNi;
       if (self.sn_c1(ni) >= 0) { self.curClassNi := ni; }
+      // WP-L8: class-level @capabilities node (from pendingCapNode, set by @capabilities before class)
+      var prevClassCapNode: int64 := self.classCapNode;
+      if self.pendingCapNode >= 0 {
+        self.classCapNode := self.pendingCapNode;
+        self.pendingCapNode := 0 - 1;
+      } else {
+        self.classCapNode := 0 - 1;
+      }
       // WP-BC-19: for class declarations, check override methods have a parent
       var parentNi: int64 := self.sn_c2(ni);
       if (parentNi >= 0) {
@@ -2585,10 +2647,12 @@ pub type Sema = class {
         // Check that methods marked override exist in parent (name check only)
         var mth: int64 := self.sn_c1(ni);
         while (mth >= 0) {
-          var flags: int64 := self.sn_iVal(mth);
-          var isOverride: int64 := (flags >> 2) & 1;
-          if (isOverride != 0 && parentSym >= 0) {
-            // Minimal check: parent exists; full method signature check deferred
+          if self.sn_kind(mth) == SNK_FUNC_DECL {
+            var flags: int64 := self.sn_iVal(mth);
+            var isOverride: int64 := (flags >> 2) & 1;
+            if (isOverride != 0 && parentSym >= 0) {
+              // Minimal check: parent exists; full method signature check deferred
+            }
           }
           mth := self.sn_next(mth);
         }
@@ -2611,8 +2675,10 @@ pub type Sema = class {
               var found: int64 := 0;
               var cMth: int64 := self.sn_c1(ni);
               while (cMth >= 0) {
-                if (self._strNEq(iMthName, iMthLen, self.sn_sVal(cMth), self.sn_sLen(cMth)) != 0) {
-                  found := 1; break;
+                if self.sn_kind(cMth) == SNK_FUNC_DECL {
+                  if (self._strNEq(iMthName, iMthLen, self.sn_sVal(cMth), self.sn_sLen(cMth)) != 0) {
+                    found := 1; break;
+                  }
                 }
                 cMth := self.sn_next(cMth);
               }
@@ -2623,7 +2689,27 @@ pub type Sema = class {
         }
         ifaceListNi := self.sn_next(ifaceListNi);
       }
-      // WP-BC-22: restore class context
+      // WP-L8: check method bodies (fills curFuncCapBuf with class+method caps,
+      // then checks body so @uses_caller_cap calls inside methods are validated).
+      var mthCap: int64 := self.sn_c1(ni);
+      var pendMthCap: int64 := 0 - 1;
+      var pendMthUcc: int64 := 0 - 1;
+      while mthCap >= 0 {
+        var mk: int64 := self.sn_kind(mthCap);
+        if mk == SNK_CAPABILITY_ATTR {
+          pendMthCap := mthCap;
+        } else if mk == SNK_USES_CALLER_CAP {
+          pendMthUcc := mthCap;
+        } else if mk == SNK_FUNC_DECL {
+          self._fillMethodCaps(self.classCapNode, pendMthCap, pendMthUcc);
+          self._checkFuncDecl(mthCap);
+          pendMthCap := 0 - 1;
+          pendMthUcc := 0 - 1;
+        }
+        mthCap := self.sn_next(mthCap);
+      }
+      // WP-BC-22 / WP-L8: restore class context
+      self.classCapNode := prevClassCapNode;
       self.curClassNi := prevClassNi;
     } else if (k == SNK_IMPORT) {
       // Mark import as potentially used (will be checked by linter)
@@ -2919,6 +3005,7 @@ pub type Sema = class {
     // Use 0-1 instead of -1 literal: bootstrap miscompiles -1 as 0 (known bug).
     self.pendingCapNode  := 0 - 1;
     self.pendingUccNode  := 0 - 1;
+    self.classCapNode    := 0 - 1;
   }
 
   fn Init(src: pchar, srcLen: int64, nodes: int64, nodeCount: int64, toks: int64) {
@@ -2941,7 +3028,8 @@ pub type Sema = class {
 
     self.hadError   := 0;
     self.errorCount := 0;
-    self.curClassNi := -1;
+    self.curClassNi  := -1;
+    self.classCapNode := -1;
 
     // WP-10e: import dedup table
     self.importedCap   := 16;
