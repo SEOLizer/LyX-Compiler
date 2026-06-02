@@ -1,0 +1,110 @@
+// ===========================================================================
+// WP-R10: Landlock-Integration
+// ===========================================================================
+// Berechnet Landlock-FS-Access-Bitmasks aus einer Capability-ID-Liste.
+// Die eigentliche x86-Codeemission erfolgt in codegen_x86.lyx.
+//
+// Landlock-Syscall-Nummern (Linux 5.13+):
+//   landlock_create_ruleset  = 444
+//   landlock_add_rule        = 445
+//   landlock_restrict_self   = 446
+//
+// struct landlock_ruleset_attr  { __u64 handled_access_fs; }        // 8 Bytes
+// struct landlock_path_beneath_attr { __u64 allowed_access; __s32 parent_fd; } // 12 Bytes (packed)
+//
+// LANDLOCK_CREATE_RULESET_VERSION = 1U (flags für Version-Probe)
+// AT_FDCWD = -100   O_PATH = 0x200000   LANDLOCK_RULE_PATH_BENEATH = 1
+
+// FS-Access-Right-Konstanten (ABI 1, Kernel >= 5.13)
+con LL_EXECUTE:     int64 := 1;    // 1 << 0
+con LL_WRITE_FILE:  int64 := 2;    // 1 << 1
+con LL_READ_FILE:   int64 := 4;    // 1 << 2
+con LL_READ_DIR:    int64 := 8;    // 1 << 3
+con LL_REMOVE_DIR:  int64 := 16;   // 1 << 4
+con LL_REMOVE_FILE: int64 := 32;   // 1 << 5
+con LL_MAKE_DIR:    int64 := 128;  // 1 << 7
+con LL_MAKE_REG:    int64 := 256;  // 1 << 8
+
+// Capability-IDs (lokale Kopien, bootstrap-sicher)
+con LL_CAP_FS_READ:       int64 := 7;
+con LL_CAP_FS_WRITE:      int64 := 8;
+con LL_CAP_FS_CREATE:     int64 := 9;
+con LL_CAP_FS_DELETE:     int64 := 10;
+con LL_CAP_FS_META:       int64 := 11;
+con LL_CAP_FS_EXEC:       int64 := 12;
+con LL_CAP_HARDWARE_GPIO: int64 := 21;
+con LL_CAP_HARDWARE_I2C:  int64 := 22;
+con LL_CAP_HARDWARE_SPI:  int64 := 23;
+con LL_CAP_HARDWARE_USB:  int64 := 24;
+
+// Prüft ob capId im Capability-Buffer vorhanden ist
+fn ll_has_cap(capBuf: int64, capCount: int64, capId: int64): bool {
+  var i: int64 := 0;
+  while i < capCount {
+    if peek64(capBuf + i * 8) == capId { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn ll_has_hw(capBuf: int64, capCount: int64): bool {
+  return ll_has_cap(capBuf, capCount, LL_CAP_HARDWARE_GPIO) ||
+         ll_has_cap(capBuf, capCount, LL_CAP_HARDWARE_I2C)  ||
+         ll_has_cap(capBuf, capCount, LL_CAP_HARDWARE_SPI)  ||
+         ll_has_cap(capBuf, capCount, LL_CAP_HARDWARE_USB);
+}
+
+// Berechnet handled_access_fs: alle FS-Access-Rights die der Ruleset kontrolliert.
+// Wichtig: allowed_access einer Regel muss immer Teilmenge von handled_access_fs sein.
+pub fn landlock_compute_handled(capBuf: int64, capCount: int64): int64 {
+  // Immer READ_FILE + WRITE_FILE kontrollieren (Basis-Zugriff)
+  var h: int64 := LL_READ_FILE | LL_WRITE_FILE;
+
+  // READ_DIR für Verzeichnis-Traversierung (nötig sobald irgendein fs-Cap vorhanden)
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_READ)   ||
+     ll_has_cap(capBuf, capCount, LL_CAP_FS_WRITE)  ||
+     ll_has_cap(capBuf, capCount, LL_CAP_FS_META)   ||
+     ll_has_hw(capBuf, capCount) {
+    h := h | LL_READ_DIR;
+  }
+  // EXECUTE für ausführbare Dateien und Device-Files
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_EXEC) ||
+     ll_has_hw(capBuf, capCount) {
+    h := h | LL_EXECUTE;
+  }
+  // Erstellen und Löschen
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_CREATE) {
+    h := h | LL_MAKE_REG | LL_MAKE_DIR | LL_READ_DIR;
+  }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_DELETE) {
+    h := h | LL_REMOVE_FILE | LL_REMOVE_DIR | LL_READ_DIR;
+  }
+  return h;
+}
+
+// Berechnet allowed_access für die "/" (root) Landlock-Regel.
+// Nicht vorhandene Capabilities → keine Rechte (Landlock blockiert den Zugriff).
+pub fn landlock_compute_allowed(capBuf: int64, capCount: int64): int64 {
+  var a: int64 := 0;
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_READ)   { a := a | LL_READ_FILE | LL_READ_DIR; }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_WRITE)  { a := a | LL_WRITE_FILE | LL_READ_DIR; }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_CREATE) { a := a | LL_MAKE_REG | LL_MAKE_DIR | LL_READ_DIR; }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_DELETE) { a := a | LL_REMOVE_FILE | LL_REMOVE_DIR | LL_READ_DIR; }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_META)   { a := a | LL_READ_DIR; }
+  if ll_has_cap(capBuf, capCount, LL_CAP_FS_EXEC)   { a := a | LL_EXECUTE | LL_READ_FILE | LL_READ_DIR; }
+  return a;
+}
+
+// Gibt zurück ob Hardware-Capabilities vorhanden sind (GPIO, I2C, SPI, USB)
+pub fn landlock_has_hw(capBuf: int64, capCount: int64): bool {
+  return ll_has_hw(capBuf, capCount);
+}
+
+// Berechnet allowed_access für "/dev" (Hardware-Device-Zugriff).
+// Hardware-Caps brauchen EXECUTE (für ioctl via Device-Files), READ_FILE, WRITE_FILE, READ_DIR.
+pub fn landlock_compute_dev_allowed(capBuf: int64, capCount: int64): int64 {
+  if ll_has_hw(capBuf, capCount) {
+    return LL_EXECUTE | LL_READ_FILE | LL_WRITE_FILE | LL_READ_DIR;
+  }
+  return 0;
+}

@@ -9,6 +9,7 @@ import src.dwarf_gen;
 import src.crypto.lic_hmac;
 import src.std.alloc;
 import src.security.seccomp_gen;
+import src.security.landlock_gen;
 //
 // Design:
 //   - All method names prefixed cg_ (avoid VMT collision with Parser/Sema)
@@ -530,6 +531,12 @@ pub type Codegen = class {
   lcbsBpfDataOff: int64;  // data section offset of BPF instructions (-1 = disabled)
   lcbsBpfCount:   int64;  // number of BPF instructions
   lcbsEnabled:    int64;  // 1 if any @capabilities annotation found → install seccomp
+
+  // WP-R10: Landlock
+  lcbsLandlockHandled:    int64;  // handled_access_fs bitmask für landlock_create_ruleset
+  lcbsLandlockAllowed:    int64;  // allowed_access für "/" Regel (0 = keine fs-Caps)
+  lcbsLandlockHasDev:     int64;  // 1 wenn Hardware-Caps → /dev-Regel
+  lcbsLandlockDevAllowed: int64;  // allowed_access für "/dev" Regel
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -6949,11 +6956,12 @@ pub type Codegen = class {
       param := self.cg_nnext(param);
     }
 
-    // WP-R9: seccomp install — emit prctl calls at start of 'main' when caps declared
+    // WP-R9 & WP-R10: Landlock + seccomp am Anfang von 'main' installieren
     if self.lcbsEnabled != 0 && fnlen == 4 {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
          StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
-        self.cg_emitSeccompInit();
+        self.cg_emitLandlockInit();   // WP-R10: Landlock zuerst (vor seccomp)
+        self.cg_emitSeccompInit();    // WP-R9: seccomp danach
       }
     }
     // Generate function body (child2 = block)
@@ -8306,6 +8314,12 @@ pub type Codegen = class {
     self.lcbsBpfCount   := 0;
     self.lcbsEnabled    := 0;
 
+    // WP-R10: Landlock init
+    self.lcbsLandlockHandled    := 0;
+    self.lcbsLandlockAllowed    := 0;
+    self.lcbsLandlockHasDev     := 0;
+    self.lcbsLandlockDevAllowed := 0;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8362,6 +8376,181 @@ pub type Codegen = class {
     free(bpfBuf, 256 * 8);
   }
 
+  // WP-R10: Berechnet Landlock-Bitmasks nach cg_collectCaps().
+  fn cg_computeLandlock(): void {
+    if self.lcbsEnabled == 0 { return; }
+    self.lcbsLandlockHandled    := landlock_compute_handled(self.lcbsCapBuf, self.lcbsCapCount);
+    self.lcbsLandlockAllowed    := landlock_compute_allowed(self.lcbsCapBuf, self.lcbsCapCount);
+    self.lcbsLandlockHasDev     := 0;
+    self.lcbsLandlockDevAllowed := 0;
+    if landlock_has_hw(self.lcbsCapBuf, self.lcbsCapCount) {
+      self.lcbsLandlockHasDev     := 1;
+      self.lcbsLandlockDevAllowed := landlock_compute_dev_allowed(self.lcbsCapBuf, self.lcbsCapCount);
+    }
+  }
+
+  // WP-R10: Emittiert Landlock-Setup-Code am Anfang von main().
+  // Reihenfolge: Landlock ZUERST, dann seccomp (Landlock-Syscalls müssen vor seccomp laufen).
+  // Stack-Layout (48 Bytes):
+  //   [rsp+0]  = landlock_ruleset_attr.handled_access_fs (u64)
+  //   [rsp+8]  = path_beneath_attr.allowed_access (u64)
+  //   [rsp+16] = path_beneath_attr.parent_fd (s32) + 4 Bytes Padding
+  //   [rsp+24] = String-Puffer: '/', '\0', ... (8 Bytes)
+  //   [rsp+32] = ruleset_fd (s64)
+  //   [rsp+40] = dir_fd (s64)
+  fn cg_emitLandlockInit(): void {
+    if self.lcbsEnabled == 0 { return; }
+
+    // sub rsp, 48  (Stack-Frame)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x30);
+    // Zero stack frame: xor rax,rax; dann 6× mov [rsp+N], rax
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);                     // [rsp+0]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);  // [rsp+8]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);  // [rsp+16]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x18);  // [rsp+24]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x20);  // [rsp+32]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);  // [rsp+40]
+
+    // Version-Probe: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION=1)
+    self.cg_e8(0x31); self.cg_e8(0xFF);                                              // xor edi, edi
+    self.cg_e8(0x31); self.cg_e8(0xF6);                                              // xor esi, esi
+    self.cg_e8(0xBA); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx, 1
+    self.cg_e8(0xB8); self.cg_e8(0xBC); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 444
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                              // syscall
+    // test rax,rax; js rel32 → SKIP_ALL (Kernel < 5.13, kein Landlock)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var jSkip1: int64 := self.codeLen; self.cg_e32(0);  // Placeholder jump 1
+
+    // handled_access_fs → [rsp+0]
+    var hfs: int64 := self.lcbsLandlockHandled;
+    self.cg_e8(0xB8);
+    self.cg_e8(hfs & 0xFF); self.cg_e8((hfs >> 8) & 0xFF);
+    self.cg_e8((hfs >> 16) & 0xFF); self.cg_e8((hfs >> 24) & 0xFF);            // mov eax, hfs
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);    // mov [rsp+0], rax
+
+    // landlock_create_ruleset([rsp], 8, 0) → ruleset_fd
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE7);                       // mov rdi, rsp
+    self.cg_e8(0xBE); self.cg_e8(0x08); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov esi, 8
+    self.cg_e8(0x31); self.cg_e8(0xD2);                                          // xor edx, edx
+    self.cg_e8(0xB8); self.cg_e8(0xBC); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 444
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                          // syscall
+    // test rax,rax; js rel32 → SKIP_ALL (create_ruleset fehlgeschlagen)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var jSkip2: int64 := self.codeLen; self.cg_e32(0);  // Placeholder jump 2
+    // mov [rsp+32], rax (ruleset_fd speichern)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x20);
+
+    // '/' in [rsp+24] setzen (Rest durch Zeroing bereits 0 → terminiert)
+    self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x18); self.cg_e8(0x2F);
+
+    // openat(AT_FDCWD=-100, &[rsp+24], O_PATH=0x200000, 0)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7);
+    self.cg_e8(0x9C); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);     // mov rdi, -100
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18); // lea rsi, [rsp+24]
+    self.cg_e8(0xBA); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x20); self.cg_e8(0x00); // mov edx, O_PATH
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);                       // xor r10d, r10d
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 257
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                          // syscall
+    // test rax,rax; js rel32 → RESTRICT_LABEL (openat "/" fehlgeschlagen)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var jRestrict3: int64 := self.codeLen; self.cg_e32(0);  // Placeholder jump 3
+    // mov [rsp+40], rax (dir_fd = root_fd)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
+
+    // Regel für "/" nur hinzufügen wenn allowed_access != 0
+    if self.lcbsLandlockAllowed != 0 {
+      var afs: int64 := self.lcbsLandlockAllowed;
+      self.cg_e8(0xB8);
+      self.cg_e8(afs & 0xFF); self.cg_e8((afs >> 8) & 0xFF);
+      self.cg_e8((afs >> 16) & 0xFF); self.cg_e8((afs >> 24) & 0xFF);          // mov eax, allowed_access
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08); // mov [rsp+8], rax
+      self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);  // mov eax, [rsp+40]
+      self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);  // mov [rsp+16], eax (parent_fd)
+      // landlock_add_rule(ruleset_fd, RULE_PATH_BENEATH=1, &path_beneath, 0)
+      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20);  // mov edi, [rsp+32]
+      self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov esi, 1
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x08); // lea rdx, [rsp+8]
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);                    // xor r10d, r10d
+      self.cg_e8(0xB8); self.cg_e8(0xBD); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 445
+      self.cg_e8(0x0F); self.cg_e8(0x05);                                        // syscall (Fehler ignorieren)
+    }
+
+    // close dir_fd (root)
+    self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28);   // mov edi, [rsp+40]
+    self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 3
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                          // syscall
+
+    // Hardware-Caps: /dev öffnen und Regel hinzufügen
+    if self.lcbsLandlockHasDev != 0 {
+      // 'd','e','v' in [rsp+25..27] setzen → "/dev\0"
+      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x19); self.cg_e8(0x64); // 'd'
+      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x1A); self.cg_e8(0x65); // 'e'
+      self.cg_e8(0xC6); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x1B); self.cg_e8(0x76); // 'v'
+      // openat(AT_FDCWD, &[rsp+24], O_PATH, 0) → "/dev"
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x9C); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x18);
+      self.cg_e8(0xBA); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x20); self.cg_e8(0x00);
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);
+      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+      // test rax,rax; js rel32 → dev_close (add_rule überspringen)
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+      self.cg_e8(0x0F); self.cg_e8(0x88);
+      var jDevClose: int64 := self.codeLen; self.cg_e32(0);  // Placeholder jump 4
+      // mov [rsp+40], rax (dev_fd)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
+      // Regel für /dev hinzufügen
+      var da: int64 := self.lcbsLandlockDevAllowed;
+      self.cg_e8(0xB8);
+      self.cg_e8(da & 0xFF); self.cg_e8((da >> 8) & 0xFF);
+      self.cg_e8((da >> 16) & 0xFF); self.cg_e8((da >> 24) & 0xFF);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+      self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
+      self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);
+      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20);
+      self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x08);
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);
+      self.cg_e8(0xB8); self.cg_e8(0xBD); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+      // LABEL dev_close: patch jDevClose → hier (close dev_fd)
+      poke32(self.code + jDevClose, self.codeLen - jDevClose - 4);
+      self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28); // mov edi, [rsp+40]
+      self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+    }
+
+    // RESTRICT_LABEL: patch jRestrict3 → hier
+    poke32(self.code + jRestrict3, self.codeLen - jRestrict3 - 4);
+    // prctl(PR_SET_NO_NEW_PRIVS=38, 1, 0, 0, 0)
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor r8d, r8d
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);   // xor r10d, r10d
+    self.cg_e8(0x31); self.cg_e8(0xD2);                      // xor edx, edx
+    self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov esi, 1
+    self.cg_e8(0xBF); self.cg_e8(0x26); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edi, 38
+    self.cg_e8(0xB8); self.cg_e8(0x9D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 157
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // landlock_restrict_self(ruleset_fd, 0)
+    self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20); // mov edi, [rsp+32]
+    self.cg_e8(0x31); self.cg_e8(0xF6);                                       // xor esi, esi
+    self.cg_e8(0xB8); self.cg_e8(0xBE); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 446
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // close ruleset_fd
+    self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x20); // mov edi, [rsp+32]
+    self.cg_e8(0xB8); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, 3
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    // SKIP_ALL: patch jSkip1 und jSkip2 → add rsp, 48
+    poke32(self.code + jSkip1, self.codeLen - jSkip1 - 4);
+    poke32(self.code + jSkip2, self.codeLen - jSkip2 - 4);
+    // add rsp, 48
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x30);
+  }
+
   // WP-R9: Emittiert seccomp-Installation in den Anfang einer Funktion.
   // Wird von cg_genFuncDecl aufgerufen wenn lcbsEnabled && name=="main".
   // Läuft NACH dem Funktions-Prolog (push rbp etc.) aber VOR dem Body.
@@ -8405,9 +8594,10 @@ pub type Codegen = class {
 
   fn Generate(head: int64) {
     self.topLevelHead := head;  // WP-MEM-05: save for default-param lookup
-    // WP-R9: collect capabilities from AST, generate BPF section
-    // cg_emitSeccompInit() is called later from cg_genFuncDecl when generating main
+    // WP-R9 & WP-R10: collect capabilities, compute Landlock masks, generate BPF section
+    // cg_emitLandlockInit/SeccompInit() are called later from cg_genFuncDecl when generating main
     self.cg_collectCaps(head);
+    self.cg_computeLandlock();  // WP-R10: Landlock-Bitmasks aus Cap-Liste berechnen
     self.cg_genBpfSection();
     self.cg_genFile(head);
     self.cg_patchAll();
