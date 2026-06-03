@@ -455,15 +455,15 @@ Potentieller Buffer-Overread / Loop-Angriff via zirkuläre Pointer.
 | **Dateien** | `src/crypto/lic_hmac.lyx`, `src/crypto/lic_derive.lyx` |
 | **Aufwand** | 1–2 Tage |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** HMAC-Vergleiche und Schlüsselableitung sind potentiell nicht constant-time.
 Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 
 **Teilschritte:**
 
-- [ ] **15.1** Alle HMAC-Vergleiche auf constant-time prüfen (kein early-exit)
-- [ ] **15.2** Zeitlich konstanter Speicherzugriff im SHA-256-Kernel
+- [x] **15.1** Alle HMAC-Vergleiche auf constant-time prüfen (kein early-exit)
+- [x] **15.2** Zeitlich konstanter Speicherzugriff im SHA-256-Kernel
 
 **Definition of Done:**
 - HMAC-Vergleich 32 Bytes braucht immer gleiche Zeit
@@ -732,7 +732,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
 | 13 | Crypto-Memory sicher löschen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 14 | DNS-Parser mit Limits | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
-| 15 | Constant-Time Crypto | ⬜ | – | – | – | 🟡 |
+| 15 | Constant-Time Crypto | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – | 🟡 |
 | 17 | Annotationen dokumentieren (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
 | 18 | Stack-Canaries | ⬜ | – | – | – | 🔵 |
