@@ -304,11 +304,11 @@ Buffer fix auf 4KB (Request) bzw. 8KB (Response) → Truncation.
 
 **Teilschritte:**
 
-- [ ] **9.1** Host auf erlaubte Zeichen validieren (kein CR/LF)
-- [ ] **9.2** Path auf CR/LF-Injection prüfen (Ablehnung bei `\r`/`\n`)
-- [ ] **9.3** Request-Buffer dynamisch allozieren (Start 4KB, wachsen bei Bedarf)
-- [ ] **9.4** Response-Buffer: `Content-Length` auswerten und in Schleife lesen
-- [ ] **9.5** Timeout für Response-Lesen implementieren
+- [x] **9.1** Host auf erlaubte Zeichen validieren (kein CR/LF)
+- [x] **9.2** Path auf CR/LF-Injection prüfen (Ablehnung bei `\r`/`\n`)
+- [x] **9.3** Request-Buffer dynamisch allozieren (Start 4KB, wachsen bei Bedarf)
+- [x] **9.4** Response-Buffer: `Content-Length` auswerten und in Schleife lesen
+- [x] **9.5** Timeout für Response-Lesen implementieren
 
 **Definition of Done:**
 - HTTP-Anfrage mit `\r\n` im Path wird abgewiesen
@@ -726,7 +726,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 7 | Path Traversal (Compiler) | ⬜ | – | – | – | 🟠 |
 | 7 | Path Traversal (Stdlib/Runtime) | ✅ (Landlock) | LCBS | – | 2026-06-03 | – |
 | 8 | SQL Injection schließen | ⬜ | – | – | – | 🟠 |
-| 9 | HTTP-Client absichern | ⬜ | – | – | – | 🟠 |
+| 9 | HTTP-Client absichern | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
 | 10 | Integer-Overflow-Prüfungen | ⬜ | – | – | – | 🟠 |
 | 11 | Redis-Treiber korrigieren | ⬜ | – | – | – | 🟠 |
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
