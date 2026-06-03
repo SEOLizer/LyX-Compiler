@@ -358,11 +358,11 @@ Empfangsbuffer nur 512 Bytes → Datenstummelung.
 
 **Teilschritte:**
 
-- [ ] **11.1** `RedisConnect()`: `host`-Parameter an Socket-Adresse weitergeben
-- [ ] **11.2** `RedisLRange()`: Start/Stop-Parameter statt Hardcodierung
-- [ ] **11.3** `RedisHIncrBy()`: increment-Parameter statt "1"
-- [ ] **11.4** `RedisZAdd()`: score + member-Parameter statt Hardcodierung
-- [ ] **11.5** Empfangsbuffer auf 64KB erhöhen oder dynamisch machen
+- [x] **11.1** `RedisConnect()`: `host`-Parameter an Socket-Adresse weitergeben
+- [x] **11.2** `RedisLRange()`: Start/Stop-Parameter statt Hardcodierung
+- [x] **11.3** `RedisHIncrBy()`: increment-Parameter statt "1"
+- [x] **11.4** `RedisZAdd()`: score + member-Parameter statt Hardcodierung
+- [x] **11.5** Empfangsbuffer auf 64KB erhöhen oder dynamisch machen
 
 **Definition of Done:**
 - `RedisConnect("myhost", 6379)` verbindet zu myhost
@@ -728,7 +728,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 8 | SQL Injection schließen | ⬜ | – | – | – | 🟠 |
 | 9 | HTTP-Client absichern | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
 | 10 | Integer-Overflow-Prüfungen | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
-| 11 | Redis-Treiber korrigieren | ⬜ | – | – | – | 🟠 |
+| 11 | Redis-Treiber korrigieren | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
 | 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – | 🟡 |
 | 14 | DNS-Parser mit Limits | ⬜ | – | – | – | 🟡 |
