@@ -330,10 +330,10 @@ Bei manipulierten Eingaben kann daraus eine kleine oder negative Allokation resu
 
 **Teilschritte:**
 
-- [ ] **10.1** `len + 1` → Prüfung auf `len == MAX_INT64`
-- [ ] **10.2** `cnt * fieldSize` → Prüfung auf Overflow (Division oder `__builtin_mul_overflow`)
-- [ ] **10.3** `inLen * 8` (Bit-Längen) → Prüfung auf `inLen > MAX_INT64 / 8`
-- [ ] **10.4** `shnum * 64` → Prüfung auf sinnvolles Maximum (`shnum < 65536`)
+- [x] **10.1** `len + 1` → Prüfung auf `len == MAX_INT64`
+- [x] **10.2** `cnt * fieldSize` → Prüfung auf Overflow (Division oder `__builtin_mul_overflow`)
+- [x] **10.3** `inLen * 8` (Bit-Längen) → Prüfung auf `inLen > MAX_INT64 / 8`
+- [x] **10.4** `shnum * 64` → Prüfung auf sinnvolles Maximum (`shnum < 65536`)
 
 **Definition of Done:**
 - Bei potentiell überlaufender Größe kommt Fehler, kein Absturz
@@ -727,7 +727,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 7 | Path Traversal (Stdlib/Runtime) | ✅ (Landlock) | LCBS | – | 2026-06-03 | – |
 | 8 | SQL Injection schließen | ⬜ | – | – | – | 🟠 |
 | 9 | HTTP-Client absichern | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
-| 10 | Integer-Overflow-Prüfungen | ⬜ | – | – | – | 🟠 |
+| 10 | Integer-Overflow-Prüfungen | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
 | 11 | Redis-Treiber korrigieren | ⬜ | – | – | – | 🟠 |
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
 | 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – | 🟡 |
