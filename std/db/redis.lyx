@@ -12,6 +12,7 @@ unit std.db.redis;
 import std.alloc;
 import std.net.types;
 import std.net.syscalls;
+import std.net.dns;
 import std.string;
 
 // ============================================================================
@@ -23,7 +24,7 @@ pub type RedisConn = struct {
     host:       pchar;
     port:       int64;
     timeout_ms: int64;
-    buf:        int64;   // mmap'd receive buffer (512 bytes, always writable)
+    buf:        int64;   // mmap'd receive buffer (65536 bytes, always writable)
     buf_len:    int64;
 };
 
@@ -121,6 +122,47 @@ pub fn appendBulk(buf: int64, pos: int64, s: pchar): int64 {
     return pos;
 }
 
+// Append a RESP bulk string for an integer: $len\r\ndigits\r\n
+// Handles negative values (e.g. -1 for "end of list") correctly.
+fn appendBulkInt(buf: int64, pos: int64, val: int64): int64 {
+    var tmp: int64 := alloc(32);
+    if (tmp <= 0) { return pos; }
+    var tlen: int64 := 0;
+    if (val == 0) {
+        poke8(tmp, 48); tlen := 1;
+    } else {
+        var neg: bool := false;
+        var k: int64 := val;
+        if (k < 0) { neg := true; k := 0 - k; }
+        if (neg) { poke8(tmp, 45); tlen := 1; }   // '-'
+        var dstart: int64 := tlen;
+        while (k > 0) {
+            poke8(tmp + tlen, 48 + (k - ((k / 10) * 10)));
+            tlen := tlen + 1;
+            k := k / 10;
+        }
+        // reverse only the digit part
+        var l: int64 := dstart;
+        var r: int64 := tlen - 1;
+        while (l < r) {
+            var t: int64 := peek8(tmp + l);
+            poke8(tmp + l, peek8(tmp + r));
+            poke8(tmp + r, t);
+            l := l + 1;
+            r := r - 1;
+        }
+    }
+    poke8(buf + pos, 36); pos := pos + 1;   // '$'
+    pos := appendDec(buf, pos, tlen);
+    poke8(buf + pos, 13); poke8(buf + pos + 1, 10); pos := pos + 2;
+    var i: int64 := 0;
+    while (i < tlen) { poke8(buf + pos + i, peek8(tmp + i)); i := i + 1; }
+    pos := pos + tlen;
+    poke8(buf + pos, 13); poke8(buf + pos + 1, 10); pos := pos + 2;
+    free(tmp, 32);
+    return pos;
+}
+
 // Parse one RESP response from conn.buf (n bytes just read)
 pub fn parseResp(conn: RedisConn, n: int64): RedisReply {
     var reply: RedisReply;
@@ -193,16 +235,25 @@ pub fn RedisConnect(host: pchar, port: int64): RedisConn {
     conn.buf        := 0;
     conn.buf_len    := 0;
 
-    // Allocate a persistent writable receive buffer.
+    // WP-11.5: Allocate 64 KB receive buffer (was 512 B → data truncation).
     // String literals in Lyx live in the code segment; in dynamic ELFs that
     // segment is R-X (not writable), so sys_read into a literal -> EFAULT.
-    var buf: int64 := alloc(512);
+    var buf: int64 := alloc(65536);
     if (buf <= 0) { return conn; }
     conn.buf     := buf;
-    conn.buf_len := 512;
+    conn.buf_len := 65536;
 
     var fd: int64 := sys_socket(2, 1, 0);  // AF_INET, SOCK_STREAM
     if (fd < 0) {
+        free(conn.buf, conn.buf_len);
+        conn.buf := 0;
+        return conn;
+    }
+
+    // WP-11.1: Resolve host via DNS instead of hardcoding 127.0.0.1
+    var ip: int64 := GetHostByName(host as int64);
+    if (ip == 0) {
+        sys_close(fd);
         free(conn.buf, conn.buf_len);
         conn.buf := 0;
         return conn;
@@ -216,15 +267,15 @@ pub fn RedisConnect(host: pchar, port: int64): RedisConn {
         return conn;
     }
 
-    // sockaddr_in: AF_INET, port in network byte order, IPv4 127.0.0.1
-    poke8(addr,     2);                     // sin_family low
-    poke8(addr + 1, 0);                     // sin_family high
-    poke8(addr + 2, (port >> 8) & 0xFF);   // port high byte
-    poke8(addr + 3, port & 0xFF);          // port low byte
-    poke8(addr + 4, 0x7F);                 // 127
-    poke8(addr + 5, 0);
-    poke8(addr + 6, 0);
-    poke8(addr + 7, 1);                    // .1
+    // sockaddr_in: AF_INET, port in network byte order, resolved IPv4
+    poke8(addr,     2);                          // sin_family low
+    poke8(addr + 1, 0);                          // sin_family high
+    poke8(addr + 2, (port >> 8) & 0xFF);        // port high byte
+    poke8(addr + 3, port & 0xFF);               // port low byte
+    poke8(addr + 4, (ip >> 24) & 0xFF);         // IP byte 0
+    poke8(addr + 5, (ip >> 16) & 0xFF);         // IP byte 1
+    poke8(addr + 6, (ip >> 8) & 0xFF);          // IP byte 2
+    poke8(addr + 7, ip & 0xFF);                 // IP byte 3
 
     var result: int64 := sys_connect(fd, addr, 16);
     free(addr, 16);
@@ -496,12 +547,11 @@ pub fn RedisLRange(conn: RedisConn, key: pchar, start: int64, stop: int64): Redi
     poke8(reqbuf + pos, 52); pos := pos + 1;  // '4'
     poke8(reqbuf + pos, 13); pos := pos + 1;  // \r
     poke8(reqbuf + pos, 10); pos := pos + 1;  // \n
-    // LRANGE key start stop (bulk strings for integers)
+    // WP-11.2: use actual start/stop parameters as RESP bulk integers
     pos := appendBulk(reqbuf, pos, "LRANGE");
     pos := appendBulk(reqbuf, pos, key);
-    // Use bulk string format for start and stop integers
-    pos := appendBulk(reqbuf, pos, "0");
-    pos := appendBulk(reqbuf, pos, "-1");
+    pos := appendBulkInt(reqbuf, pos, start);
+    pos := appendBulkInt(reqbuf, pos, stop);
 
     reply := sendRaw(conn, reqbuf, pos);
     free(reqbuf, 512);
@@ -676,8 +726,8 @@ pub fn RedisHIncrBy(conn: RedisConn, key: pchar, field: pchar, increment: int64)
     pos := appendBulk(reqbuf, pos, "HINCRBY");
     pos := appendBulk(reqbuf, pos, key);
     pos := appendBulk(reqbuf, pos, field);
-    // Increment as bulk string
-    pos := appendBulk(reqbuf, pos, "1");
+    // WP-11.3: use actual increment parameter
+    pos := appendBulkInt(reqbuf, pos, increment);
 
     reply := sendRaw(conn, reqbuf, pos);
     free(reqbuf, 512);
@@ -840,9 +890,9 @@ pub fn RedisZAdd(conn: RedisConn, key: pchar, score: int64, member: pchar): Redi
     poke8(reqbuf + pos, 10); pos := pos + 1;
     pos := appendBulk(reqbuf, pos, "ZADD");
     pos := appendBulk(reqbuf, pos, key);
-    // Score as bulk string
-    pos := appendBulk(reqbuf, pos, "100");
-    pos := appendBulk(reqbuf, pos, "player1");
+    // WP-11.4: use actual score and member parameters
+    pos := appendBulkInt(reqbuf, pos, score);
+    pos := appendBulk(reqbuf, pos, member);
 
     reply := sendRaw(conn, reqbuf, pos);
     free(reqbuf, 512);
@@ -865,10 +915,8 @@ pub fn RedisZRange(conn: RedisConn, key: pchar, start: int64, stop: int64): Redi
     poke8(reqbuf + pos, 10); pos := pos + 1;
     pos := appendBulk(reqbuf, pos, "ZRANGE");
     pos := appendBulk(reqbuf, pos, key);
-    pos := appendDec(reqbuf, pos, start);
-    pos := appendCRLF(reqbuf, pos);
-    pos := appendDec(reqbuf, pos, stop);
-    pos := appendCRLF(reqbuf, pos);
+    pos := appendBulkInt(reqbuf, pos, start);
+    pos := appendBulkInt(reqbuf, pos, stop);
 
     reply := sendRaw(conn, reqbuf, pos);
     free(reqbuf, 512);
