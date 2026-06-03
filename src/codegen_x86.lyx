@@ -147,7 +147,7 @@ con CGT_SHR:     int64 := 94;
 // ELF / load address
 con CG_ELF_BASE:   int64 := 4194304;  // 0x400000
 con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
-con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
+con CG_CODE_OFF:   int64 := 176;      // WP-6: code after ELF hdr (64) + 2×phdr (56+56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
 //   _start:           offset 0    (79 bytes)  — WP-BI-01: +14 for argc/argv save
@@ -560,6 +560,8 @@ pub type Codegen = class {
 
   // WP-T14: --capabilities=compat: kein seccomp/landlock/proxy trotz @capabilities
   lcbsCompatMode:     int64;  // 1 = Compat-Modus aktiv (gesetzt von lyxc.lyx)
+  // WP-6: W^X — 1 wenn zwei PT_LOAD-Segmente (RX + RW) emittiert werden
+  lcbsWxActive:       int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -8373,6 +8375,7 @@ pub type Codegen = class {
 
     // WP-T14: Compat-Modus (kein seccomp/landlock)
     self.lcbsCompatMode := 0;
+    self.lcbsWxActive   := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
@@ -8941,7 +8944,7 @@ pub type Codegen = class {
       if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
       landlockRules := landlockRules + self.lcbsHwArgCount;
     }
-    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount);
+    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount, self.lcbsWxActive);
 
     // --- Ausgabe ---
     EPrintStrLn("=== LCBS Security Audit =========================================="c);
@@ -8982,7 +8985,11 @@ pub type Codegen = class {
 
     // Runtime-Schutz
     EPrintStrLn("Runtime-Schutz:"c);
-    EPrintStrLn("  + W^X (RX-Code / RW-Daten getrennt)"c);
+    if self.lcbsWxActive != 0 {
+      EPrintStrLn("  + W^X (RX-Code / RW-Daten getrennt — zwei PT_LOAD)"c);
+    } else {
+      EPrintStrLn("  o W^X (nicht aktiv — Single PT_LOAD RWX)"c);
+    }
     EPrintStrLn("  + RELRO (kein GOT im statischen ELF; dynamisch: Compiler-Garantie)"c);
     EPrintStrLn("  o PIE  (nicht aktiv -- statisches ELF, kein ASLR)"c);
     if seccompOk != 0 {
@@ -9012,7 +9019,11 @@ pub type Codegen = class {
     EPrintInt(score);
     EPrintStrLn("/40  (PIE +0; max 45 mit Stack Canaries WP-18)"c);
     EPrintStrLn("  +10: Kein Klasse-3-Extern ohne system.unsafe.format_string"c);
-    EPrintStrLn("  + 5: W^X aktiv"c);
+    if self.lcbsWxActive != 0 {
+      EPrintStrLn("  + 5: W^X aktiv (zwei PT_LOAD: RX + RW)"c);
+    } else {
+      EPrintStrLn("  + 0: W^X fehlt (Single PT_LOAD RWX — WP-6 offen)"c);
+    }
     EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel)"c);
     EPrintStrLn("  + 0: PIE  (nicht implementiert)"c);
     if self.lcbsMissingGrants == 0 {
@@ -9054,9 +9065,21 @@ pub type Codegen = class {
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
     self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
     self.cg_genFile(head);
+    // WP-6: Pad code to 4096-byte boundary so data starts on a page boundary.
+    // This allows two PT_LOAD segments: RX (code) and RW (data), no overlap.
+    // Padding must happen BEFORE cg_patchAll() so all disp32 patches use
+    // the aligned codeLen as the code/data boundary offset.
+    var codePad: int64 := (4096 - (self.codeLen & 4095)) & 4095;
+    var pi: int64 := 0;
+    while pi < codePad {
+      self.cg_e8(0x00);  // zero-padding in dead code region
+      pi := pi + 1;
+    }
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
+    // WP-6: static ELF gets two PT_LOADs (RX+RW); dynamic ELF still RWX
+    if self.externCount == 0 { self.lcbsWxActive := 1; }
     self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
@@ -9177,7 +9200,7 @@ pub type Codegen = class {
     poke32(buf + 48, 0);             // e_flags
     poke16(buf + 52, 64);   // e_ehsize
     poke16(buf + 54, 56);   // e_phentsize
-    poke16(buf + 56, 1);    // e_phnum
+    poke16(buf + 56, 2);    // e_phnum — WP-6: two PT_LOAD (RX code + RW data)
     poke16(buf + 58, 64);   // e_shentsize
     poke16(buf + 60, 0);    // e_shnum
     poke16(buf + 62, 0);    // e_shstrndx
@@ -9194,24 +9217,34 @@ pub type Codegen = class {
       poke16(buf + 62, 2);                    // e_shstrndx = 2 (.shstrtab)
     }
 
-    // Program header (56 bytes at offset 64)
+    // WP-6: Two PT_LOAD headers for W^X separation.
+    // phdr1 (offset 64,  56 bytes): RX — ELF header + phdrs + code (page-aligned)
+    // phdr2 (offset 120, 56 bytes): RW — data only
+    var rxSize: int64 := CG_CODE_OFF + totalCode;  // headers + page-aligned code
+    var rwOff:  int64 := rxSize;                   // data starts right after
+    var rwVaddr: int64 := CG_ELF_BASE + rwOff;
+
+    // PT_LOAD #1: RX (read + execute) — code segment
     var ph: int64 := buf + CG_PHDR_OFF;
     poke32(ph,      1);              // p_type = PT_LOAD
-    poke32(ph + 4,  7);              // p_flags = PF_R|PF_W|PF_X
+    poke32(ph + 4,  5);              // p_flags = PF_R|PF_X
     poke64(ph + ELF64_PHDR_OFF_OFFSET, 0);
     poke64(ph + 16, CG_ELF_BASE);   // p_vaddr
     poke64(ph + 24, CG_ELF_BASE);   // p_paddr
-    if (self.debugMode != 0) {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, baseSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  baseSize);
-    } else if hasWatermark {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, baseSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  baseSize);
-    } else {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, fileSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  fileSize);
-    }
-    poke64(ph + ELF64_PHDR_OFF_ALIGN,  2097152);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, rxSize);
+    poke64(ph + ELF64_PHDR_OFF_MEMSZ,  rxSize);
+    poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // PT_LOAD #2: RW (read + write) — data segment
+    var ph2: int64 := buf + CG_PHDR_OFF + 56;
+    poke32(ph2,      1);             // p_type = PT_LOAD
+    poke32(ph2 + 4,  6);             // p_flags = PF_R|PF_W
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, rwOff);
+    poke64(ph2 + 16, rwVaddr);       // p_vaddr
+    poke64(ph2 + 24, rwVaddr);       // p_paddr
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, totalData);
+    poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  totalData);
+    poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  4096);
 
     // Copy code
     var i: int64 := 0;

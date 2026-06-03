@@ -1,7 +1,25 @@
 # Sicherheits-Fahrplan — Aurum/Lyx
 
 > Erstellt: 2026-05-31 (Security Audit)
+> Neubewertet: 2026-06-03 (nach LCBS WP-L1…WP-T15)
 > Status: ⬜ geplant | 🔄 in Arbeit | ✅ erledigt
+
+---
+
+## LCBS-Einfluss auf den Fahrplan (Stand v0.9.1A)
+
+LCBS (Lyx Capability-Based Security, WP-L1–WP-T15) hat den Fahrplan in mehreren Punkten verändert:
+
+| WP | Änderung | Grund |
+|----|----------|-------|
+| WP-5 | ✅ **Erledigt** durch WP-L5 | Hard-Blacklist in `ffi_validator.lyx` — Compile-Error für `system`, `gets`, `sprintf`, `strcpy`, `execve` etc. |
+| WP-6 | ⚠️ **Audit-Bug aufgedeckt** | ELF ist weiterhin RWX (`PF_R\|PF_W\|PF_X`), aber Audit reportet hardcoded `+W^X` — Score ist für diesen Punkt unzuverlässig |
+| WP-7 | Priorität Runtime → Mittel | Landlock (WP-R10) schützt LCBS-Programme auf Kernel-Ebene; Compiler-Side bleibt Hoch |
+| WP-17 | Scope erweitert | LCBS-Annotationsökosystem (`@capabilities`, `@uses_caller_cap`, `@cap`, `@grant`) ist undokumentiert |
+| WP-18 | Urgenz gesunken | LCBS-seccomp enthält Post-Exploit — Angreifer nach Stack-Overflow kann kaum Syscalls ausführen |
+| WP-20 | Priorität gestiegen | Starke Synergie: `.meta_safe` verifiziert Code-Integrität, LCBS schränkt dann Laufzeitrechte ein |
+| WP-22 | Scope erweitert + Priorität gestiegen | LCBS-Enforcement ist automatisch testbar: seccomp, Landlock, Capability-Inheritance |
+| WP-23–25 | **Neu** | LCBS-spezifische Lücken (Audit-Integrität, seccomp-Vollständigkeit, Compat-Warnung) |
 
 ---
 
@@ -9,12 +27,13 @@
 
 | Phase | Schwerpunkt | WPs | Aufwand | Status |
 |-------|------------|-----|---------|--------|
-| 1 | 🔴 Kritische Sicherheitslücken | WP-1 – WP-4 | ~11–14 Tage | 🔄 |
-| 2 | 🟠 Hohe Sicherheitsrisiken | WP-5 – WP-11 | ~12–14 Tage | ⬜ |
+| 1 | 🔴 Kritische Sicherheitslücken | WP-1 – WP-4 | ~11–14 Tage | ✅ |
+| 2 | 🟠 Hohe Sicherheitsrisiken | WP-5 – WP-11 | ~12–14 Tage | 🔄 |
 | 3 | 🟡 Mittelstufe | WP-12 – WP-17 | ~6–8 Tage | ⬜ |
 | 4 | 🔵 Langfristig / Niedrig | WP-18 – WP-22 | ~10–14 Tage | ⬜ |
+| 5 | 🔴 LCBS-Audit-Integrität | WP-23 – WP-25 | ~2–3 Tage | ⬜ |
 
-**Kritischer Pfad:** WP-1 → (parallel: WP-2, WP-3, WP-4) → WP-5 → WP-6 → WP-8
+**Kritischer Pfad (aktualisiert):** WP-23 (Audit-Fix) → WP-6 (echtes W^X) → WP-8 (SQL) → WP-10 (Integer-Overflow)
 
 ---
 
@@ -158,48 +177,46 @@ Nur unverschlüsseltes TCP, kein TLS.
 
 ---
 
-### WP-5: Gefährliche FFI-Externs absichern
+### WP-5: Gefährliche FFI-Externs absichern ✅
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/frontend/ffi_parser.lyx` |
-| **Aufwand** | 1–2 Tage |
-| **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Dateien** | `src/security/ffi_validator.lyx` (WP-L5) |
+| **Aufwand** | erledigt |
+| **Priorität** | ~~🟠 Hoch~~ |
+| **Status** | ✅ erledigt durch LCBS WP-L5 |
 
-**Problem:** `system()`, `sprintf()`, `gets()`, `strcpy()`, `strcat()` aus libc sind als FFI-Externs registriert.
-Jedes Lyx-Programm kann damit beliebige Shell-Kommandos ausführen – ohne Sandbox, ohne Validation.
+**Lösung durch LCBS WP-L5:** `src/security/ffi_validator.lyx` implementiert eine Hard-Blacklist und Signatur-basierte Klassifizierung. Gefährliche Funktionen führen zum **Compile-Error** (`_errorNode`), nicht nur zur Warnung.
 
-**Teilschritte:**
+**Hard-Blacklist (Compile-Error):** `system`, `popen`, `gets`, `sprintf`, `vsprintf`, `strcpy`, `strcat`, `wcscpy`, `wcscat`, `execve`, `execvp`, `execlp`, `execl`, `execle`, `execvpe`
 
-- [ ] **5.1** `system()` als Extern entfernen oder hinter `unsafe`-Flag verstecken
-- [ ] **5.2** `sprintf()`, `gets()` als Extern entfernen
-- [ ] **5.3** `strcpy()`, `strcat()` durch sichere Alternativen ersetzen (`strlcpy`/`strlcat`)
-- [ ] **5.4** Prüfen, ob Stdlib `system()`/`execve()` verwendet; ggf. sichere Wrapper bauen
+**Format-String-Familie (Compile-Error ohne `@capabilities([system.unsafe.format_string])`):** `printf`, `fprintf`, `scanf`, `fscanf`, `sscanf`, `vprintf`, `vfprintf`
 
-**Definition of Done:**
-- `system()` nicht mehr direkt aus Lyx aufrufbar
-- `sprintf`/`gets` entfernt
-- String-Kopien nutzen size-bewusste Funktionen
+**Signatur-basiert geblockt:** Jede extern fn mit ≥2 `pchar`-Parametern ohne Größenlimit → Klasse 3 → Compile-Error
+
+- [x] **5.1** `system()` — Hard-Blacklist
+- [x] **5.2** `sprintf()`, `gets()` — Hard-Blacklist
+- [x] **5.3** `strcpy()`, `strcat()` — Hard-Blacklist; `strlcpy`/`strlcat` als Klasse 0 (Safe) zugelassen
+- [x] **5.4** `execve()` und alle exec-Varianten — Hard-Blacklist
 
 ---
 
-### WP-6: W^X für generierte ELF-Binaries
+### WP-6: W^X für generierte ELF-Binaries ⚠️
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/lyxc.lyx`, `src/backend/elf/write_elf.lyx` |
-| **Aufwand** | 2–3 Tage |
-| **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Dateien** | `src/codegen_x86.lyx` (Z. 9199–9200), `src/codegen_x86.lyx` (Z. 8985, 9015) |
+| **Aufwand** | 2–3 Tage (W^X) + 1 Tag (Audit-Fix) |
+| **Priorität** | 🔴 Kritisch (hochgestuft wegen Audit-Bug) |
+| **Status** | ⬜ offen — **Audit reportet fälschlicherweise W^X als aktiv** |
 
-**Problem:** Generierte ELF-Dateien haben RWX-Programmheaders (`PF_R | PF_W | PF_X`).
-Code, Stack und Heap in derselben ausführbaren Region – W^X verletzt.
-Buffer-Overflow führt direkt zu Code-Execution.
-Kein PIE (Position Independent Executable) → ASLR unwirksam.
+**Problem (unverändert):** `src/codegen_x86.lyx:9200`: `poke32(ph + 4, 7); // p_flags = PF_R|PF_W|PF_X` — Single PT_LOAD, vollständig RWX. W^X ist **nicht implementiert**.
+
+**Neuer Befund (LCBS-Audit-Bug):** Die LCBS-Audit-Funktion (`cg_runAudit`) gibt hardcoded `+ W^X (RX-Code / RW-Daten getrennt)` und `+5 Punkte W^X aktiv` aus — **ohne den tatsächlichen ELF-Header zu prüfen**. Der Security-Score ist für diesen Punkt unzuverlässig. Das ist ein Integritätsproblem des Audit-Systems selbst. → Siehe auch WP-23.
 
 **Teilschritte:**
 
+- [ ] **6.0** Audit-Funktion: W^X-Ausgabe an echten ELF-Flag-Check binden (statt hardcoded)
 - [ ] **6.1** PT_LOAD in zwei Segmente aufteilen: RX (Code) + RW (Daten)
 - [ ] **6.2** `.text` → RX-Segment, `.data`/`.bss` → RW-Segment
 - [ ] **6.3** PIE-Unterstützung einbauen (Relocation-Tables)
@@ -210,6 +227,7 @@ Kein PIE (Position Independent Executable) → ASLR unwirksam.
 **Definition of Done:**
 - `readelf -l` zeigt getrennte LOAD-Segmente mit RX und RW
 - `checksec --elf` zeigt "No execute" und "PIE enabled"
+- Audit-Report prüft tatsächlichen ELF-Header und gibt `o W^X` solange nicht umgesetzt
 - Alle Tests laufen durch
 
 ---
@@ -220,17 +238,19 @@ Kein PIE (Position Independent Executable) → ASLR unwirksam.
 |----------|------|
 | **Dateien** | `src/sema.lyx`, `src/codegen_x86.lyx`, `std/fs.lyx` |
 | **Aufwand** | 1 Tag |
-| **Priorität** | 🟠 Hoch |
+| **Priorität** | 🟠 Hoch (Compiler-Side) / 🟡 Mittel (Stdlib-Side) |
 | **Status** | ⬜ |
 
 **Problem:** Compiler öffnet Dateien aus `import`-Anweisungen ohne Prüfung auf `..`-Traversal.
 Ein bösartiges `.lyx`-File könnte beliebige Dateien lesen.
 
+**LCBS-Einfluss:** Landlock (WP-R10) schützt LCBS-Programme zur Laufzeit auf Kernel-Ebene — nur explizit in `@capabilities([fs.read(path: "...")])` deklarierte Pfade sind erreichbar. Stdlib-Traversal für annotierte Programme ist damit abgedeckt. Der **Compiler selbst** unterliegt keiner eigenen LCBS-Sandbox; 7.1 und 7.2 bleiben daher Hoch.
+
 **Teilschritte:**
 
-- [ ] **7.1** `_sema_readFile()` auf `..`-Komponenten prüfen
-- [ ] **7.2** `_cg_readFile()` analog absichern
-- [ ] **7.3** Stdlib-File-Operationen (`FileExists`, `Mkdir`, `Remove`, etc.) auf `..` prüfen
+- [ ] **7.1** `_sema_readFile()` auf `..`-Komponenten prüfen *(Compiler-Side, Hoch)*
+- [ ] **7.2** `_cg_readFile()` analog absichern *(Compiler-Side, Hoch)*
+- [ ] **7.3** Stdlib-File-Operationen (`FileExists`, `Mkdir`, `Remove`, etc.) auf `..` prüfen *(Runtime-Side, durch Landlock größtenteils abgedeckt → Mittel)*
 
 **Definition of Done:**
 - `import ../../../etc/passwd` wird mit Fehler abgewiesen
@@ -510,6 +530,8 @@ Wer sie nutzt, bekommt einen falschen Sicherheitseindruck.
 **Problem:** Generierte Binaries haben keinen Stack-Schutz (Canaries).
 Buffer-Overflow auf dem Stack führt direkt zu Code-Execution.
 
+**LCBS-Einfluss:** seccomp schränkt Post-Exploit-Möglichkeiten stark ein — ein Angreifer der via Stack-Overflow RCE erreicht, kann kaum weitere Syscalls ausführen. Stack-Canaries bleiben als erste Verteidigungslinie sinnvoll, aber LCBS reduziert die Urgenz deutlich.
+
 ---
 
 ### WP-19: ARM64-Dynamic-Linking-Bugs fixen
@@ -531,10 +553,12 @@ Buffer-Overflow auf dem Stack führt direkt zu Code-Execution.
 |----------|------|
 | **Dateien** | `src/lyxc.lyx`, `std/meta_safe.lyx` |
 | **Aufwand** | 3–4 Tage |
-| **Priorität** | 🔵 Niedrig |
+| **Priorität** | 🟡 Mittel (hochgestuft durch LCBS-Synergie) |
 | **Status** | ⬜ |
 
 **Problem:** Runtime-Code-Integritätsprüfung (CRC32) ist geplant aber nicht implementiert.
+
+**LCBS-Synergie:** `.meta_safe` verifiziert die Code-Integrität beim Start (Manipulation erkannt?), LCBS schränkt dann die Laufzeitrechte ein (Was darf der Code tun?). Kombiniert: Verifikation + Containment. Damit steigt der Wert von WP-20 deutlich.
 
 ---
 
@@ -556,15 +580,98 @@ Buffer-Overflow auf dem Stack führt direkt zu Code-Execution.
 | Attribut | Wert |
 |----------|------|
 | **Dateien** | `.github/workflows/ci.yml`, `tests/security/` |
-| **Aufwand** | 2–3 Tage |
-| **Priorität** | 🔵 Niedrig |
+| **Aufwand** | 3–4 Tage |
+| **Priorität** | 🟡 Mittel (hochgestuft durch LCBS) |
 | **Status** | ⬜ |
 
-**Vorschläge:**
+**Vorschläge (ursprünglich):**
 - Regressionstests für WP-1 (Testvektoren)
 - Integrationstests für WP-2, WP-3 (MITM erkennen)
 - Fuzzing-Tests für WP-7, WP-10, WP-14
-- SAST-Scanner für WP-5 (gefährliche FFI-Externs)
+- SAST-Scanner für WP-5 (erledigt; Regressionstests gegen Bypass-Versuche)
+
+**Neue LCBS-Testfälle:**
+- seccomp-Enforcement: verbotener Syscall → SIGSYS (nicht bloß Score-Check)
+- Landlock: Zugriff auf nicht-deklarierten Pfad → EACCES
+- Capability-Inheritance: Transitivität und Grant-Grenzen
+- Audit-Score-Regression: Basiswerte dürfen nicht sinken
+- FFI-Blacklist-Regression: `system()` als extern fn → immer Compile-Error
+- `--self-test` in CI als LCBS-Smoke-Test
+
+---
+
+## Phase 5 — 🔴 LCBS-Audit-Integrität (neu, dringend)
+
+---
+
+### WP-23: Security-Audit W^X-Reporting korrigieren
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/codegen_x86.lyx` (cg_runAudit, Z. 8985/9015) |
+| **Aufwand** | 0.5 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ⬜ |
+
+**Problem:** Die LCBS-Audit-Funktion gibt hardcoded `+ W^X (RX-Code / RW-Daten getrennt)` und `+5 Punkte W^X aktiv` aus, unabhängig vom tatsächlichen ELF-Programmheader. Das Binary hat weiterhin `PF_R|PF_W|PF_X` (Wert 7, Single PT_LOAD). Der Score täuscht Nutzer über die tatsächliche Sicherheitslage. Ein Audit-System das falsch reportet ist schlimmer als keines.
+
+**Teilschritte:**
+
+- [ ] **23.1** Audit: `lcbsWxActive`-Flag in Codegen setzen — `true` erst wenn zwei PT_LOAD-Segmente emittiert werden
+- [ ] **23.2** Audit-Ausgabe: W^X bedingt auf Flag (`+` nur wenn wirklich RX/RW getrennt, sonst `o`)
+- [ ] **23.3** Score: +5 für W^X nur wenn `lcbsWxActive`
+- [ ] **23.4** Gleiches Muster für RELRO prüfen (aktuell: RELRO-Aussage für statisches ELF korrekt, aber explizit als "kein GOT/PLT" formulieren)
+
+**Definition of Done:**
+- Solange WP-6 offen: Audit zeigt `o W^X (nicht aktiv — Single PT_LOAD RWX)`, Score +0
+- `checksec --elf` und Audit-Output sind konsistent
+
+---
+
+### WP-24: seccomp-Filter-Vollständigkeit sicherstellen
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/codegen_x86.lyx` (seccomp_build_filter), `src/security/` |
+| **Aufwand** | 1–2 Tage |
+| **Priorität** | 🟠 Hoch |
+| **Status** | ⬜ |
+
+**Problem:** Der seccomp-Filter mappt Capability-IDs auf erlaubte Syscall-Listen. Fehlen Syscalls in einer Capability-Definition (z.B. `fs.read` erlaubt `open` aber nicht `openat`), kann das Programm abstürzen obwohl LCBS es als korrekt annotiert betrachtet. Ist die Liste zu weit (zu viele Syscalls), ist die Sandbox zu permissiv.
+
+**Teilschritte:**
+
+- [ ] **24.1** Capability → Syscall-Mapping vollständig gegen Linux-5.13+ auditieren (strace-basiert)
+- [ ] **24.2** Fehlende Syscalls ergänzen (z.B. `openat2`, `statx`, `newfstatat`)
+- [ ] **24.3** Test: Programm mit `@capabilities([fs.read])` liest Datei ohne SIGSYS
+- [ ] **24.4** Test: Programm versucht nicht-deklarierten Syscall → SIGSYS bestätigt
+
+**Definition of Done:**
+- Alle stdlib-Funktionen laufen ohne seccomp-SIGSYS wenn Capability korrekt deklariert
+- Nicht-deklarierte Syscalls werden zuverlässig geblockt
+
+---
+
+### WP-25: `--capabilities=compat` Laufzeit-Warnung
+
+| Attribut | Wert |
+|----------|------|
+| **Dateien** | `src/codegen_x86.lyx` (cg_runAudit), `src/lyxc.lyx` |
+| **Aufwand** | 0.5 Tage |
+| **Priorität** | 🟡 Mittel |
+| **Status** | ⬜ |
+
+**Problem:** `--capabilities=compat` deaktiviert alle LCBS-Laufzeitschutzmaßnahmen (seccomp, Landlock, Proxy) vollständig — auch für Programme mit vollständig deklariertem `@capabilities`. Ein Entwickler der compat-Mode für ein Deployment verwendet, bekommt keinen Hinweis dass der Schutz deaktiviert ist.
+
+**Teilschritte:**
+
+- [ ] **25.1** Compiler: prominente stderr-Warnung bei `--capabilities=compat` (nicht nur Audit-Kommentar)
+- [ ] **25.2** Generierte Binary: Laufzeit-Warnung auf stderr wenn lcbsCompatMode erkannt wird (`WARNUNG: LCBS-Compat-Modus aktiv — kein Laufzeitschutz`)
+- [ ] **25.3** Audit-Score: Compat-Mode → Score-Penalty dokumentieren
+
+**Definition of Done:**
+- `./lyxc --capabilities=compat prog.lyx` gibt sichtbare stderr-Warnung
+- Generiertes Binary druckt Warnung beim Start wenn im Compat-Modus kompiliert
 
 ---
 
@@ -608,27 +715,31 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 
 ## Bearbeitungsstatus
 
-| WP | Titel | Status | Verantwortlich | Start | Ende |
-|----|-------|--------|----------------|-------|------|
-| 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 |
-| 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 |
-| 5 | Gefährliche FFI-Externs | ⬜ | – | – | – |
-| 6 | W^X für ELF-Binaries | ⬜ | – | – | – |
-| 7 | Path Traversal verhindern | ⬜ | – | – | – |
-| 8 | SQL Injection schließen | ⬜ | – | – | – |
-| 9 | HTTP-Client absichern | ⬜ | – | – | – |
-| 10 | Integer-Overflow-Prüfungen | ⬜ | – | – | – |
-| 11 | Redis-Treiber korrigieren | ⬜ | – | – | – |
-| 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – |
-| 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – |
-| 14 | DNS-Parser mit Limits | ⬜ | – | – | – |
-| 15 | Constant-Time Crypto | ⬜ | – | – | – |
-| 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – |
-| 17 | Teilimplementierte Annotationen dokumentieren | ⬜ | – | – | – |
-| 18 | Stack-Canaries | ⬜ | – | – | – |
-| 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – |
-| 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – |
-| 21 | Debug-Datei entfernen | ⬜ | – | – | – |
-| 22 | Security-Tests im CI | ⬜ | – | – | – |
+| WP | Titel | Status | Verantwortlich | Start | Ende | Prio |
+|----|-------|--------|----------------|-------|------|------|
+| 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
+| 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
+| 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
+| 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 | – |
+| 5 | Gefährliche FFI-Externs | ✅ durch WP-L5 | Claude | 2026-06-01 | 2026-06-03 | – |
+| 6 | W^X für ELF-Binaries | ⬜ **Audit-Bug** | – | – | – | 🔴 |
+| 7 | Path Traversal (Compiler) | ⬜ | – | – | – | 🟠 |
+| 7 | Path Traversal (Stdlib/Runtime) | ✅ (Landlock) | LCBS | – | 2026-06-03 | – |
+| 8 | SQL Injection schließen | ⬜ | – | – | – | 🟠 |
+| 9 | HTTP-Client absichern | ⬜ | – | – | – | 🟠 |
+| 10 | Integer-Overflow-Prüfungen | ⬜ | – | – | – | 🟠 |
+| 11 | Redis-Treiber korrigieren | ⬜ | – | – | – | 🟠 |
+| 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
+| 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – | 🟡 |
+| 14 | DNS-Parser mit Limits | ⬜ | – | – | – | 🟡 |
+| 15 | Constant-Time Crypto | ⬜ | – | – | – | 🟡 |
+| 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – | 🟡 |
+| 17 | Annotationen dokumentieren (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
+| 18 | Stack-Canaries | ⬜ | – | – | – | 🔵 |
+| 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – | 🔵 |
+| 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – | 🟡 |
+| 21 | Debug-Datei entfernen | ⬜ | – | – | – | 🔵 |
+| 22 | Security-Tests im CI (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
+| **23** | **Audit W^X-Reporting korrigieren** | ⬜ | – | – | – | **🔴** |
+| **24** | **seccomp-Filter-Vollständigkeit** | ⬜ | – | – | – | **🟠** |
+| **25** | **--capabilities=compat Warnung** | ⬜ | – | – | – | **🟡** |
