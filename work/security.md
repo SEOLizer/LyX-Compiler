@@ -431,16 +431,16 @@ Compiler könnte Zeroing-Stores wegoptimieren (keine Memory Barrier).
 | **Dateien** | `std/net/dns.lyx` |
 | **Aufwand** | 1 Tag |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** DNS-Response-Parsing ohne obere Schranke bei Domain-Name-Decompression.
 Potentieller Buffer-Overread / Loop-Angriff via zirkuläre Pointer.
 
 **Teilschritte:**
 
-- [ ] **14.1** Max 255 Bytes pro Domain-Name (RFC 1035)
-- [ ] **14.2** Max 100 Pointer (gegen Loop-Angriffe)
-- [ ] **14.3** Max Response-Größe 65535 Bytes (DNS-UDP-Limit)
+- [x] **14.1** Max 255 Bytes pro Domain-Name (RFC 1035)
+- [x] **14.2** Max 100 Pointer (gegen Loop-Angriffe)
+- [x] **14.3** Max Response-Größe 65535 Bytes (DNS-UDP-Limit)
 
 **Definition of Done:**
 - Zirkuläre Pointer werden erkannt und abgewiesen
@@ -731,7 +731,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 11 | Redis-Treiber korrigieren | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
 | 13 | Crypto-Memory sicher löschen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
-| 14 | DNS-Parser mit Limits | ⬜ | – | – | – | 🟡 |
+| 14 | DNS-Parser mit Limits | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 15 | Constant-Time Crypto | ⬜ | – | – | – | 🟡 |
 | 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – | 🟡 |
 | 17 | Annotationen dokumentieren (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
