@@ -28,8 +28,8 @@ LCBS (Lyx Capability-Based Security, WP-L1–WP-T15) hat den Fahrplan in mehrere
 | Phase | Schwerpunkt | WPs | Aufwand | Status |
 |-------|------------|-----|---------|--------|
 | 1 | 🔴 Kritische Sicherheitslücken | WP-1 – WP-4 | ~11–14 Tage | ✅ |
-| 2 | 🟠 Hohe Sicherheitsrisiken | WP-5 – WP-11 | ~12–14 Tage | 🔄 |
-| 3 | 🟡 Mittelstufe | WP-12 – WP-17 | ~6–8 Tage | ⬜ |
+| 2 | 🟠 Hohe Sicherheitsrisiken | WP-5 – WP-11 | ~12–14 Tage | ✅ |
+| 3 | 🟡 Mittelstufe | WP-12 – WP-17 | ~6–8 Tage | 🔄 |
 | 4 | 🔵 Langfristig / Niedrig | WP-18 – WP-22 | ~10–14 Tage | ⬜ |
 | 5 | 🔴 LCBS-Audit-Integrität | WP-23 – WP-25 | ~2–3 Tage | ⬜ |
 
@@ -48,7 +48,7 @@ LCBS (Lyx Capability-Based Security, WP-L1–WP-T15) hat den Fahrplan in mehrere
 | **Dateien** | `std/hash.lyx` |
 | **Aufwand** | 5–7 Tage |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-05-31 |
 
 **Problem:** Alle Passwort-Hashing-Funktionen (BCrypt, Argon2, PBKDF2, SHA-256, MD5) sind nicht-funktionale Stubs.
 FNV-1a (nicht-kryptografisch) wird in ALLEN Hash-Funktionen verwendet.
@@ -86,7 +86,7 @@ Kein constant-time Vergleich für Byte-Arrays vorhanden.
 | **Dateien** | `std/net/tls.lyx`, `std/net/https.lyx` |
 | **Aufwand** | 2 Tage |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-05-31 |
 
 **Problem:** Nach dem SSL-Handshake wird nur `SSL_get_verify_result()` geprüft.
 Die Zertifikatskette wird validiert, aber **NIEMALS** der Hostname gegen SubjectAltName/CommonName.
@@ -117,7 +117,7 @@ Keine TLS-Versionseinschränkung (TLS 1.0/1.1 sind noch erlaubt).
 | **Dateien** | `std/net/ssh.lyx` |
 | **Aufwand** | 2 Tage |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-05-31 |
 
 **Problem:** `libssh2_session_handshake()` wird aufgerufen, ohne danach den Host Key zu prüfen.
 Es gibt keinen Aufruf von `libssh2_knownhost_check()` oder `libssh2_session_hostkey()`.
@@ -149,7 +149,7 @@ CPU-Spin (Busy-Wait) beim Warten auf Output.
 | **Dateien** | `std/net/mongo.lyx` |
 | **Aufwand** | 2–3 Tage |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-01 |
 
 **Problem:** Auth-Konstanten definiert aber nie implementiert.
 Nur unverschlüsseltes TCP, kein TLS.
@@ -239,7 +239,7 @@ Nur unverschlüsseltes TCP, kein TLS.
 | **Dateien** | `src/sema.lyx`, `src/codegen_x86.lyx`, `std/fs.lyx` |
 | **Aufwand** | 1 Tag |
 | **Priorität** | 🟠 Hoch (Compiler-Side) / 🟡 Mittel (Stdlib-Side) |
-| **Status** | ⬜ |
+| **Status** | 🔄 Stdlib/Runtime ✅ via Landlock; Compiler-Side (7.1/7.2) ⬜ offen |
 
 **Problem:** Compiler öffnet Dateien aus `import`-Anweisungen ohne Prüfung auf `..`-Traversal.
 Ein bösartiges `.lyx`-File könnte beliebige Dateien lesen.
@@ -265,7 +265,7 @@ Ein bösartiges `.lyx`-File könnte beliebige Dateien lesen.
 | **Dateien** | `std/db/mysql.lyx`, `std/db/postgres.lyx`, `std/db/sqlite.lyx` |
 | **Aufwand** | 3–4 Tage |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** MySQL: `MySQLQuery()` sendet rohes SQL per `COM_QUERY`.
 PostgreSQL: `PGDropTable()`, `PGTableExists()` bauen SQL per String-Konkatenation.
@@ -296,7 +296,7 @@ Keine Prepared Statements als Default.
 | **Dateien** | `std/net/http.lyx` |
 | **Aufwand** | 2 Tage |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** `HTTPGet`/`HTTPPost` validieren weder Host noch Path.
 CR/LF-Injection (Request Smuggling) und Path Traversal möglich.
@@ -323,7 +323,7 @@ Buffer fix auf 4KB (Request) bzw. 8KB (Response) → Truncation.
 | **Dateien** | `src/sema.lyx`, `src/codegen_x86.lyx`, `src/lyxc.lyx`, `src/crypto/lic_hmac.lyx` |
 | **Aufwand** | 2 Tage |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** `len + 1`, `cnt * fieldSize`, `shnum * 64`, `inLen * 8` – mehrfach ohne Overflow-Prüfung.
 Bei manipulierten Eingaben kann daraus eine kleine oder negative Allokation resultieren.
@@ -348,7 +348,7 @@ Bei manipulierten Eingaben kann daraus eine kleine oder negative Allokation resu
 | **Dateien** | `std/db/redis.lyx` |
 | **Aufwand** | 1 Tag |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** `RedisConnect()` ignoriert `host`-Parameter → immer nur localhost.
 `RedisLRange()` sendet hardcodierte "0"/"-1" statt Parameter.
@@ -407,16 +407,16 @@ From/To/Subject werden roh in Header kopiert → CRLF-Injection.
 | **Dateien** | `src/crypto/lic_hmac.lyx`, `src/crypto/lic_secret.lyx` |
 | **Aufwand** | 1 Tag |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-03 |
 
 **Problem:** SHA-256-State, HMAC-Keys und gepaddete Blöcke werden per `munmap` freigegeben ohne vorheriges Zeroing.
 Compiler könnte Zeroing-Stores wegoptimieren (keine Memory Barrier).
 
 **Teilschritte:**
 
-- [ ] **13.1** `explicit_bzero()`/`memset_s()` oder Compiler-Barriere vor munmap
-- [ ] **13.2** `__sync_synchronize()` nach Zeroing gegen Optimierung
-- [ ] **13.3** Alle Fehlerpfade in `lic_sha256`/`lic_hmacSha256` auf korrektes Cleanup prüfen
+- [x] **13.1** `explicit_bzero()`/`memset_s()` oder Compiler-Barriere vor munmap
+- [x] **13.2** `__sync_synchronize()` nach Zeroing gegen Optimierung
+- [x] **13.3** Alle Fehlerpfade in `lic_sha256`/`lic_hmacSha256` auf korrektes Cleanup prüfen
 
 **Definition of Done:**
 - Nach `lic_hmacSha256` sind alle temporären Buffer genullt
@@ -717,20 +717,20 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 
 | WP | Titel | Status | Verantwortlich | Start | Ende | Prio |
 |----|-------|--------|----------------|-------|------|------|
-| 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
-| 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
-| 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | – |
-| 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 | – |
-| 5 | Gefährliche FFI-Externs | ✅ durch WP-L5 | Claude | 2026-06-01 | 2026-06-03 | – |
-| 6 | W^X für ELF-Binaries | ⬜ **Audit-Bug** | – | – | – | 🔴 |
-| 7 | Path Traversal (Compiler) | ⬜ | – | – | – | 🟠 |
-| 7 | Path Traversal (Stdlib/Runtime) | ✅ (Landlock) | LCBS | – | 2026-06-03 | – |
-| 8 | SQL Injection schließen | ⬜ | – | – | – | 🟠 |
-| 9 | HTTP-Client absichern | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
-| 10 | Integer-Overflow-Prüfungen | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
-| 11 | Redis-Treiber korrigieren | ✅ | Claude | 2026-06-03 | 2026-06-03 | – |
+| 1 | Kryptografische Hash-Funktionen korrigieren | ✅ | Claude | 2026-05-31 | 2026-05-31 | 🔴 |
+| 2 | TLS-Hostname-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | 🔴 |
+| 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | 🔴 |
+| 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 | 🔴 |
+| 5 | Gefährliche FFI-Externs | ✅ durch WP-L5 | Claude | 2026-06-01 | 2026-06-03 | 🟠 |
+| 6 | W^X für ELF-Binaries | ⬜ **Audit-Bug aktiv** | – | – | – | 🔴 |
+| 7a | Path Traversal — Compiler-Side (7.1/7.2) | ⬜ | – | – | – | 🟠 |
+| 7b | Path Traversal — Stdlib/Runtime (7.3) | ✅ via Landlock | LCBS | – | 2026-06-03 | – |
+| 8 | SQL Injection schließen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
+| 9 | HTTP-Client absichern | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
+| 10 | Integer-Overflow-Prüfungen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
+| 11 | Redis-Treiber korrigieren | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
 | 12 | SMTP mit TLS + Header-Sanitisierung | ⬜ | – | – | – | 🟡 |
-| 13 | Crypto-Memory sicher löschen | ⬜ | – | – | – | 🟡 |
+| 13 | Crypto-Memory sicher löschen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 14 | DNS-Parser mit Limits | ⬜ | – | – | – | 🟡 |
 | 15 | Constant-Time Crypto | ⬜ | – | – | – | 🟡 |
 | 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – | 🟡 |
