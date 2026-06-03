@@ -1,0 +1,181 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth.lyx
+//
+// WP-1: Low-Level-Syscalls für Bluetooth-Kommunikation
+//
+// Voraussetzung: Linux mit BlueZ-Daemon (AF_BLUETOOTH-Support im Kernel)
+// Plattform:     x86-64 und ARM64 (Linux)
+//
+// Zwei-Wege-Architektur:
+//   Control-Plane  → D-Bus via Unix-Socket (Discovery, Pairing, Adapter)
+//   Data-Plane     → AF_BLUETOOTH-Sockets  (L2CAP, RFCOMM, Datentransfer)
+
+unit std.hardware.bluetooth;
+
+// ============================================================================
+// Bluetooth-Adressfamilie und Protokoll-Konstanten
+// ============================================================================
+
+pub con AF_BLUETOOTH: int64 := 31;
+
+pub con BTPROTO_L2CAP:  int64 := 0;   // Logical Link Control and Adaptation
+pub con BTPROTO_HCI:    int64 := 1;   // Host Controller Interface (raw)
+pub con BTPROTO_RFCOMM: int64 := 3;   // Serial-Port-Emulation über BT
+pub con BTPROTO_BNEP:   int64 := 4;   // Bluetooth Network Encapsulation
+pub con BTPROTO_SCO:    int64 := 6;   // Synchronous Connection-Oriented (Audio)
+
+// Socket-Typen (ergänzend zu SOCK_STREAM=1, SOCK_DGRAM=2, SOCK_RAW=3)
+pub con SOCK_SEQPACKET: int64 := 5;   // für L2CAP (BLE ATT/GATT)
+
+// ATT PSM für BLE L2CAP (Protocol Service Multiplexer)
+pub con BT_PSM_ATT: int64 := 31;      // 0x001F — ATT-Protokoll
+
+// ============================================================================
+// L2CAP-Socket-Optionen (setsockopt/getsockopt)
+// ============================================================================
+
+pub con SOL_L2CAP:     int64 := 6;    // L2CAP-Protokoll-Ebene für sockopt
+pub con L2CAP_OPTIONS: int64 := 1;    // Generische L2CAP-Optionen
+pub con L2CAP_LM:      int64 := 2;    // L2CAP Link Manager (Security-Flags)
+pub con L2CAP_OMTU:    int64 := 4;    // Output MTU
+pub con L2CAP_IMTU:    int64 := 5;    // Input MTU
+
+// RFCOMM-Socket-Optionen
+pub con SOL_RFCOMM:  int64 := 18;
+pub con RFCOMM_LM:   int64 := 3;
+
+// Link-Manager-Sicherheits-Flags (für L2CAP_LM und RFCOMM_LM)
+pub con BT_LM_MASTER:  int64 := 1;
+pub con BT_LM_AUTH:    int64 := 2;
+pub con BT_LM_ENCRYPT: int64 := 4;
+pub con BT_LM_SECURE:  int64 := 8;
+
+// ============================================================================
+// HCI-ioctl-Nummern (für HCIDEVUP / HCIDEVDOWN / HCIGETDEVINFO etc.)
+// ============================================================================
+
+pub con HCIDEVUP:      int64 := 0x400448C9;
+pub con HCIDEVDOWN:    int64 := 0x400448CA;
+pub con HCIGETDEVINFO: int64 := 0x800448CB;
+pub con HCIGETDEVLIST: int64 := 0x800448CC;
+
+// ============================================================================
+// poll()-Event-Flags (für BTSocketPoll)
+// ============================================================================
+
+pub con POLLIN:   int64 := 1;    // Daten zum Lesen verfügbar
+pub con POLLPRI:  int64 := 2;    // dringende Daten
+pub con POLLOUT:  int64 := 4;    // Schreiben möglich
+pub con POLLERR:  int64 := 8;    // Fehler auf Socket
+pub con POLLHUP:  int64 := 16;   // Verbindung geschlossen
+pub con POLLNVAL: int64 := 32;   // Ungültiger Socket
+
+// ============================================================================
+// pollfd-Hilfsfunktionen
+// pollfd: { int32 fd, int16 events, int16 revents } = 8 Bytes
+// ============================================================================
+
+// Schreibt eine pollfd-Struktur in den Puffer an der Adresse ptr.
+pub fn BTPollFdSet(ptr: int64, fd: int64, events: int64) {
+  poke32(ptr,     fd);       // fd     (int32, Offset 0)
+  poke16(ptr + 4, events);   // events (int16, Offset 4)
+  poke16(ptr + 6, 0);        // revents initialisieren (Offset 6)
+}
+
+// Liest die revents aus einer pollfd-Struktur.
+pub fn BTPollFdRevents(ptr: int64): int64 {
+  return peek16(ptr + 6) & 0xFFFF;
+}
+
+// ============================================================================
+// WP-1: Syscall-Wrapper
+// Alle 13 Bluetooth-relevanten Syscalls als benannte Funktionen.
+// Die sys_*-Intrinsics erzeugen direkte syscall-Instruktionen (x86-64: 0F 05,
+// ARM64: svc #0) — kein libc-Overhead, kein Linking gegen externe Bibliotheken.
+// ============================================================================
+
+// sys_socket — AF_BLUETOOTH-Socket erzeugen
+// socktype: SOCK_STREAM (RFCOMM), SOCK_SEQPACKET (L2CAP), SOCK_RAW (HCI)
+// protocol: BTPROTO_L2CAP, BTPROTO_RFCOMM, BTPROTO_HCI, ...
+pub fn BTSocket(socktype: int64, protocol: int64): int64 {
+  return sys_socket(AF_BLUETOOTH, socktype, protocol);
+}
+
+// sys_bind — Socket an Bluetooth-Adresse binden
+pub fn BTBind(fd: int64, addrPtr: int64, addrLen: int64): int64 {
+  return sys_bind(fd, addrPtr, addrLen);
+}
+
+// sys_connect — Verbindung zu Remote-Gerät aufbauen
+pub fn BTConnect(fd: int64, addrPtr: int64, addrLen: int64): int64 {
+  return sys_connect(fd, addrPtr, addrLen);
+}
+
+// sys_listen — auf eingehende Verbindungen warten (Server)
+pub fn BTListen(fd: int64, backlog: int64): int64 {
+  return sys_listen(fd, backlog);
+}
+
+// sys_accept — eingehende Verbindung annehmen
+pub fn BTAccept(fd: int64, addrPtr: int64, addrLenPtr: int64): int64 {
+  return sys_accept(fd, addrPtr, addrLenPtr);
+}
+
+// sys_sendto — Daten senden
+pub fn BTSend(fd: int64, buf: int64, len: int64, flags: int64): int64 {
+  return sys_sendto(fd, buf, len, flags, 0, 0);
+}
+
+// sys_recvfrom — Daten empfangen
+pub fn BTRecv(fd: int64, buf: int64, len: int64, flags: int64): int64 {
+  return sys_recvfrom(fd, buf, len, flags, 0, 0);
+}
+
+// sys_sendmsg — Daten mit msghdr senden (Ancillary Data, scatter-gather)
+pub fn BTSendMsg(fd: int64, msgPtr: int64, flags: int64): int64 {
+  return sys_sendmsg(fd, msgPtr, flags);
+}
+
+// sys_recvmsg — Daten mit msghdr empfangen (Ancillary Data, scatter-gather)
+pub fn BTRecvMsg(fd: int64, msgPtr: int64, flags: int64): int64 {
+  return sys_recvmsg(fd, msgPtr, flags);
+}
+
+// sys_getsockopt — Socket-Option lesen
+pub fn BTGetSockOpt(fd: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 {
+  return sys_getsockopt(fd, level, optname, optval, optlen);
+}
+
+// sys_setsockopt — Socket-Option setzen
+pub fn BTSetSockOpt(fd: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 {
+  return sys_setsockopt(fd, level, optname, optval, optlen);
+}
+
+// sys_poll — auf Socket-Ereignisse warten
+// fdsPtr: Zeiger auf pollfd-Array (je 8 Bytes: fd:int32, events:int16, revents:int16)
+// nfds: Anzahl der pollfd-Einträge
+// timeoutMs: Timeout in ms (-1 = unendlich, 0 = sofort)
+pub fn BTSocketPoll(fdsPtr: int64, nfds: int64, timeoutMs: int64): int64 {
+  return sys_poll(fdsPtr, nfds, timeoutMs);
+}
+
+// sys_ioctl — HCI-Adapter-Steuerung (optional, z.B. HCIDEVUP / HCIGETDEVLIST)
+pub fn BTIoctl(fd: int64, request: int64, argPtr: int64): int64 {
+  return sys_ioctl(fd, request, argPtr);
+}
+
+// sys_close — Socket schließen
+pub fn BTClose(fd: int64): int64 {
+  return sys_close(fd);
+}
+
+// ============================================================================
+// Abnahmekriterium WP-1.3: Smoke-Test
+// Öffnet einen AF_BLUETOOTH/RFCOMM-Socket und schließt ihn sofort.
+// Rückgabe: 1 = Kernel hat AF_BLUETOOTH-Support, 0 = kein Bluetooth
+// ============================================================================
+pub fn BTSmokeTest(): int64 {
+  var fd: int64 := sys_socket(AF_BLUETOOTH, 1, BTPROTO_RFCOMM);
+  if (fd < 0) { return 0; }
+  sys_close(fd);
+  return 1;
+}
