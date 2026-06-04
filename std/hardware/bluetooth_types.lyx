@@ -1,0 +1,242 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_types.lyx
+//
+// WP-2: Bluetooth-Adress- und Socket-Typen
+//
+// BDAddr-Darstellung: int64 mit 48 Bit MAC (Little-Endian im Speicher)
+//   Bits  [7: 0] = b[0]  (letztes Oktett in "B5:B4:B3:B2:B1:B0"-Schreibweise)
+//   Bits [47:40] = b[5]  (erstes Oktett in Schreibweise)
+//
+// Kernel-Strukturen werden via poke8 in raw-Buffer geschrieben:
+//   sockaddr_rc  (RFCOMM): family:2 + bdaddr:6 + channel:1 + pad:1 = 10 Bytes
+//   sockaddr_l2  (L2CAP):  family:2 + psm:2 + bdaddr:6 + cid:2 + type:1 + pad:1 = 14 Bytes
+
+unit std.hardware.bluetooth_types;
+
+import std.hardware.bluetooth;
+import std.alloc;
+
+// ============================================================================
+// Größen-Konstanten (für sys_bind / sys_connect)
+// ============================================================================
+
+pub con BT_BDADDR_SIZE:      int64 := 6;    // MAC-Adresse in Bytes
+pub con BT_SOCKADDR_RC_SIZE: int64 := 10;   // sizeof(struct sockaddr_rc)
+pub con BT_SOCKADDR_L2_SIZE: int64 := 14;   // sizeof(struct sockaddr_l2)
+
+// ============================================================================
+// BDADDR-Adresstypen (für sockaddr_l2.l2_bdaddr_type)
+// ============================================================================
+
+pub con BDADDR_BREDR:     int64 := 0;   // Klassisches Bluetooth
+pub con BDADDR_LE_PUBLIC: int64 := 1;   // BLE — öffentliche Adresse
+pub con BDADDR_LE_RANDOM: int64 := 2;   // BLE — zufällige Adresse
+
+// ============================================================================
+// BDAddr-Hilfsfunktionen
+// Eine Bluetooth-MAC-Adresse wird als int64 gespeichert:
+//   b[0]..b[5] in Bits [7:0]..[47:40] (Little-Endian)
+//   obere 16 Bits = 0
+// ============================================================================
+
+// Packt 6 Einzelbytes in einen int64.
+// b5 = erstes Oktett im String ("B5:B4:B3:B2:B1:B0")
+pub fn BTAddrFromBytes(b0: int64, b1: int64, b2: int64,
+                       b3: int64, b4: int64, b5: int64): int64 {
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40);
+}
+
+// Liest ein einzelnes Byte der Adresse (byteIdx 0..5, 0 = niedrigstes).
+pub fn BTAddrGetByte(addr: int64, byteIdx: int64): int64 {
+  return (addr >> (byteIdx * 8)) & 0xFF;
+}
+
+// Identitätsfunktion für BDAddrToUInt64 — addr ist bereits ein int64.
+pub fn BTAddrToUInt64(addr: int64): int64 {
+  return addr;
+}
+
+// ============================================================================
+// Interner Helfer: Nibble → ASCII-Hex-Zeichen
+// ============================================================================
+
+fn bt_hexNibble(n: int64): int64 {
+  if (n < 10) { return n + 48; }   // '0'..'9'
+  return n + 55;                    // 'A'..'F'
+}
+
+// Interner Helfer: 2 ASCII-Hex-Zeichen ab s+pos → Byte-Wert
+fn bt_parseHexByte(s: int64, pos: int64): int64 {
+  var hi: int64 := peek8(s + pos);
+  var lo: int64 := peek8(s + pos + 1);
+  if (hi >= 97 && hi <= 102) { hi := hi - 32; }  // 'a'..'f' → 'A'..'F'
+  if (hi >= 65 && hi <= 70)  { hi := hi - 55; }  // 'A'..'F' → 10..15
+  else if (hi >= 48)          { hi := hi - 48; }  // '0'..'9' → 0..9
+  if (lo >= 97 && lo <= 102) { lo := lo - 32; }
+  if (lo >= 65 && lo <= 70)  { lo := lo - 55; }
+  else if (lo >= 48)          { lo := lo - 48; }
+  return (hi << 4) | lo;
+}
+
+// ============================================================================
+// BTAddrToStr — BDAddr-int64 → "B5:B4:B3:B2:B1:B0\0" (18 Bytes)
+// outBuf muss mindestens 18 Bytes umfassen.
+// Abnahmekriterium 2: inverse Funktion zu BTStrToAddr.
+// ============================================================================
+pub fn BTAddrToStr(addr: int64, outBuf: int64) {
+  var pos: int64 := 0;
+  var i: int64 := 5;   // von B5 (höchstes Nibble) bis B0
+  while (i >= 0) {
+    var b: int64 := (addr >> (i * 8)) & 0xFF;
+    poke8(outBuf + pos,     bt_hexNibble((b >> 4) & 0xF));
+    poke8(outBuf + pos + 1, bt_hexNibble(b & 0xF));
+    pos := pos + 2;
+    if (i > 0) {
+      poke8(outBuf + pos, 58);  // ':'
+      pos := pos + 1;
+    }
+    i := i - 1;
+  }
+  poke8(outBuf + pos, 0);  // Null-Terminator
+}
+
+// ============================================================================
+// BTStrToAddr — "B5:B4:B3:B2:B1:B0" → BDAddr-int64
+// Akzeptiert Groß- und Kleinschreibung (A-F / a-f).
+// Abnahmekriterium 2: inverse Funktion zu BTAddrToStr.
+// ============================================================================
+pub fn BTStrToAddr(s: int64): int64 {
+  // Erwartetes Format: "XX:XX:XX:XX:XX:XX" (17 Zeichen + optionales \0)
+  var b5: int64 := bt_parseHexByte(s,  0);   // erstes Oktett
+  var b4: int64 := bt_parseHexByte(s,  3);
+  var b3: int64 := bt_parseHexByte(s,  6);
+  var b2: int64 := bt_parseHexByte(s,  9);
+  var b1: int64 := bt_parseHexByte(s, 12);
+  var b0: int64 := bt_parseHexByte(s, 15);   // letztes Oktett
+  return BTAddrFromBytes(b0, b1, b2, b3, b4, b5);
+}
+
+// ============================================================================
+// BTSockAddrRcCreate — struct sockaddr_rc in Raw-Buffer schreiben (RFCOMM)
+//
+// Layout (10 Bytes):
+//   Offset 0–1: sa_family  = AF_BLUETOOTH (little-endian uint16)
+//   Offset 2–7: rc_bdaddr  = 6 Bytes MAC (little-endian b[0]..b[5])
+//   Offset 8:   rc_channel = RFCOMM-Kanal (uint8, typisch 1..30)
+//   Offset 9:   Padding    = 0
+//
+// buf muss mindestens BT_SOCKADDR_RC_SIZE (10) Bytes umfassen.
+// bdaddr: BDAddr als int64 (aus BTAddrFromBytes / BTStrToAddr)
+// Abnahmekriterium 1: SizeOf = 10 Bytes.
+// ============================================================================
+pub fn BTSockAddrRcCreate(buf: int64, bdaddr: int64, channel: int64) {
+  poke8(buf + 0, AF_BLUETOOTH & 0xFF);          // sa_family low
+  poke8(buf + 1, (AF_BLUETOOTH >> 8) & 0xFF);   // sa_family high
+  poke8(buf + 2, bdaddr & 0xFF);                 // b[0]
+  poke8(buf + 3, (bdaddr >> 8)  & 0xFF);         // b[1]
+  poke8(buf + 4, (bdaddr >> 16) & 0xFF);         // b[2]
+  poke8(buf + 5, (bdaddr >> 24) & 0xFF);         // b[3]
+  poke8(buf + 6, (bdaddr >> 32) & 0xFF);         // b[4]
+  poke8(buf + 7, (bdaddr >> 40) & 0xFF);         // b[5]
+  poke8(buf + 8, channel & 0xFF);                // rc_channel
+  poke8(buf + 9, 0);                             // padding
+}
+
+// ============================================================================
+// BTSockAddrL2Create — struct sockaddr_l2 in Raw-Buffer schreiben (L2CAP/BLE)
+//
+// Layout (14 Bytes):
+//   Offset  0–1:  l2_family     = AF_BLUETOOTH (little-endian uint16)
+//   Offset  2–3:  l2_psm        = PSM in little-endian (z.B. BT_PSM_ATT=31)
+//   Offset  4–9:  l2_bdaddr     = 6 Bytes MAC
+//   Offset 10–11: l2_cid        = 0 für Client-Sockets
+//   Offset  12:   l2_bdaddr_type= BDADDR_BREDR / BDADDR_LE_PUBLIC / BDADDR_LE_RANDOM
+//   Offset  13:   Padding       = 0
+//
+// buf muss mindestens BT_SOCKADDR_L2_SIZE (14) Bytes umfassen.
+// ============================================================================
+pub fn BTSockAddrL2Create(buf: int64, psm: int64, bdaddr: int64, addrType: int64) {
+  poke8(buf +  0, AF_BLUETOOTH & 0xFF);
+  poke8(buf +  1, (AF_BLUETOOTH >> 8) & 0xFF);
+  poke8(buf +  2, psm & 0xFF);                  // l2_psm little-endian low
+  poke8(buf +  3, (psm >> 8) & 0xFF);           // l2_psm little-endian high
+  poke8(buf +  4, bdaddr & 0xFF);               // b[0]
+  poke8(buf +  5, (bdaddr >> 8)  & 0xFF);       // b[1]
+  poke8(buf +  6, (bdaddr >> 16) & 0xFF);       // b[2]
+  poke8(buf +  7, (bdaddr >> 24) & 0xFF);       // b[3]
+  poke8(buf +  8, (bdaddr >> 32) & 0xFF);       // b[4]
+  poke8(buf +  9, (bdaddr >> 40) & 0xFF);       // b[5]
+  poke8(buf + 10, 0);                           // l2_cid low
+  poke8(buf + 11, 0);                           // l2_cid high
+  poke8(buf + 12, addrType & 0xFF);             // l2_bdaddr_type
+  poke8(buf + 13, 0);                           // padding
+}
+
+// ============================================================================
+// BTSockAddrRcRead — liest bdaddr + channel aus sockaddr_rc zurück
+// (z.B. nach BTAccept, um Remote-Adresse zu ermitteln)
+// ============================================================================
+pub fn BTSockAddrRcReadAddr(buf: int64): int64 {
+  var b0: int64 := peek8(buf + 2);
+  var b1: int64 := peek8(buf + 3);
+  var b2: int64 := peek8(buf + 4);
+  var b3: int64 := peek8(buf + 5);
+  var b4: int64 := peek8(buf + 6);
+  var b5: int64 := peek8(buf + 7);
+  return BTAddrFromBytes(b0, b1, b2, b3, b4, b5);
+}
+
+pub fn BTSockAddrRcReadChannel(buf: int64): int64 {
+  return peek8(buf + 8);
+}
+
+// ============================================================================
+// Abnahmekriterium 3: Smoke-Test für Typ-Konversionen
+// Parst eine MAC, packt sie in sockaddr_rc, liest sie zurück und vergleicht.
+// Rückgabe: 1 = alles konsistent, 0 = Fehler
+// ============================================================================
+pub fn BTTypesSmokeTest(): int64 {
+  // Bekannte Testadresse: "00:1A:7D:DA:71:11"
+  var testStr: int64 := alloc(18);
+  if (testStr == 0) { return 0; }
+  // Schreibe "00:1A:7D:DA:71:11" manuell in testStr
+  poke8(testStr+ 0,48);poke8(testStr+ 1,48);poke8(testStr+ 2,58);  // "00:"
+  poke8(testStr+ 3,49);poke8(testStr+ 4,65);poke8(testStr+ 5,58);  // "1A:"
+  poke8(testStr+ 6,55);poke8(testStr+ 7,68);poke8(testStr+ 8,58);  // "7D:"
+  poke8(testStr+ 9,68);poke8(testStr+10,65);poke8(testStr+11,58);  // "DA:"
+  poke8(testStr+12,55);poke8(testStr+13,49);poke8(testStr+14,58);  // "71:"
+  poke8(testStr+15,49);poke8(testStr+16,49);poke8(testStr+17, 0);  // "11\0"
+
+  var addr: int64 := BTStrToAddr(testStr);
+
+  // Erwarteter int64: 0x00_1A_7D_DA_71_11 = b5=0x00,b4=0x1A,b3=0x7D,b2=0xDA,b1=0x71,b0=0x11
+  var expected: int64 := 17 | (113 << 8) | (218 << 16) | (125 << 24) | (26 << 32);
+  // 0x11=17, 0x71=113, 0xDA=218, 0x7D=125, 0x1A=26, 0x00=0
+
+  if (addr != expected) { free(testStr, 18); return 0; }
+
+  // Rückkonvertierung prüfen
+  var roundTrip: int64 := alloc(18);
+  if (roundTrip == 0) { free(testStr, 18); return 0; }
+  BTAddrToStr(addr, roundTrip);
+  var i: int64 := 0;
+  var ok: int64 := 1;
+  while (i < 17) {
+    if (peek8(testStr + i) != peek8(roundTrip + i)) { ok := 0; }
+    i := i + 1;
+  }
+  free(testStr, 18);
+  free(roundTrip, 18);
+  if (ok == 0) { return 0; }
+
+  // sockaddr_rc packen und zurücklesen
+  var rcBuf: int64 := alloc(BT_SOCKADDR_RC_SIZE);
+  if (rcBuf == 0) { return 0; }
+  BTSockAddrRcCreate(rcBuf, addr, 1);
+  var readBack: int64 := BTSockAddrRcReadAddr(rcBuf);
+  var chan: int64 := BTSockAddrRcReadChannel(rcBuf);
+  free(rcBuf, BT_SOCKADDR_RC_SIZE);
+
+  if (readBack != addr) { return 0; }
+  if (chan != 1) { return 0; }
+  return 1;
+}
