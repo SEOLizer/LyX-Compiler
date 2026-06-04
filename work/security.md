@@ -560,12 +560,16 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/lyxc.lyx`, `std/meta_safe.lyx` |
-| **Aufwand** | 3–4 Tage |
+| **Dateien** | `src/lyxc.lyx`, `std/meta_safe.lyx`, `src/codegen_x86.lyx` |
+| **Aufwand** | 1 Tag (Bugfixes) |
 | **Priorität** | 🟡 Mittel (hochgestuft durch LCBS-Synergie) |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-04 |
 
-**Problem:** Runtime-Code-Integritätsprüfung (CRC32) ist geplant aber nicht implementiert.
+**Befund:** `.meta_safe` war bereits vollständig implementiert (Compiler + Runtime), hatte aber drei Bugs die `MetaSafeVerify()` zum Scheitern brachten:
+
+1. **CG_CANARY-Kollision** (`src/codegen_x86.lyx`): `self.dataLen := 80` startete String-Konstanten genau bei Offset 80 — `CG_CANARY = 80` überschrieb sie mit `sys_getrandom`-Output. Fix: `dataLen := 88`.
+2. **Page-Alignment-Bug** (`src/codegen_x86.lyx`): Padding-Formel `(4096 - (codeLen & 4095)) & 4095` berücksichtigte `CG_CODE_OFF = 176` nicht. RX/RW-Segmente teilten eine Page → Laufzeit-SIGSEGV. Fix: `(4096 - ((CG_CODE_OFF + codeLen) & 4095)) & 4095`.
+3. **Falscher codeOff** (`src/lyxc.lyx`, `std/meta_safe.lyx`): Hardcoded `120` statt korrektem `176` (`CG_CODE_OFF` = 64-byte ELF-Header + 2×56-byte PHDRs). Fix: `176`.
 
 **LCBS-Synergie:** `.meta_safe` verifiziert die Code-Integrität beim Start (Manipulation erkannt?), LCBS schränkt dann die Laufzeitrechte ein (Was darf der Code tun?). Kombiniert: Verifikation + Containment. Damit steigt der Wert von WP-20 deutlich.
 
