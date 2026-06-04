@@ -144,6 +144,127 @@ try {
 }
 ```
 
+### 2.11 Annotations
+
+Annotations modify the compiler's behavior for the decorated declaration. They are prefixed with `@` and appear immediately before the keyword they annotate.
+
+#### Overview
+
+| Annotation | Target | Status | Description |
+|------------|--------|:------:|-------------|
+| `@export` | `fn` | ✅ | Export function symbol (ELF/PE/Mach-O) |
+| `@jni(class="...", method="...")` | `fn` | ✅ | Android JNI name mangling (`Java_<class>_<method>`) |
+| `@packed` | `struct` type | ✅ | Compact field layout — natural type sizes instead of 8-byte alignment |
+| `@big_endian` | struct field | ✅ | Byte-swap (BSWAP) on load and store |
+| `@redundant` | `var` (local) | ✅ | Triple Modular Redundancy (TMR): 3 copies, majority-vote read |
+| `@capabilities([...])` | `fn` | ✅ | LCBS: declare required runtime capabilities |
+| `@uses_caller_cap([...])` | `fn` | ✅ | LCBS: inherit capabilities from caller |
+| `@cap(path)` | `extern fn` | ✅ | LCBS: map FFI call to capability path |
+| `@energy(N)` | `fn` | ✅ | Energy level override for this function (1–5) |
+
+#### `@export`
+
+Makes the function symbol publicly visible in the output binary (equivalent to `__attribute__((visibility("default")))` in C).
+
+```lyx
+@export fn add(a: int64, b: int64): int64 {
+  return a + b;
+}
+```
+
+#### `@jni(class="…", method="…")`
+
+Mangles the function name to the Android JNI format `Java_<class>_<method>`. Required for functions callable from Java/Kotlin via JNI.
+
+```lyx
+@jni(class="com/example/Main", method="hello")
+fn hello(): void {
+  PrintLn("Hello from Lyx!");
+}
+```
+
+#### `@packed` (struct)
+
+Fields are laid out at their natural type widths instead of the default 8-byte stride. Useful for binary protocols, hardware register maps, and memory-mapped I/O.
+
+| Type | Normal stride | `@packed` stride |
+|------|:-------------:|:----------------:|
+| `uint8` / `int8` / `char` | 8 bytes | 1 byte |
+| `uint16` / `int16` | 8 bytes | 2 bytes |
+| `uint32` / `int32` / `f32` | 8 bytes | 4 bytes |
+| `int64` / `f64` / `pchar` | 8 bytes | 8 bytes |
+
+```lyx
+@packed type EthernetHeader = struct {
+  dst:      uint8;   // offset 0
+  src:      uint8;   // offset 1
+  ethertype: uint16; // offset 2
+};
+```
+
+Fields may also carry explicit byte offsets with `at(N)`:
+
+```lyx
+@packed type StatusReg = struct {
+  ready: uint8 at(0);
+  flags: uint8 at(1);
+  value: uint32 at(4);
+};
+```
+
+#### `@big_endian` (struct field)
+
+Emits a `BSWAP` instruction after every load and before every store of the annotated field. Only valid on integer fields (`uint8`–`uint64`, `int8`–`int64`). Applying `@big_endian` to an `f64` field is a **compile error**.
+
+```lyx
+@packed type IPv4Header = struct {
+  @big_endian total_len: uint16;
+  @big_endian src_addr:  uint32;
+};
+```
+
+#### `@redundant` (local var)
+
+Implements Triple Modular Redundancy for the annotated local variable:
+
+- **Storage**: 3 consecutive stack slots (A, B, C)
+- **Write**: all 3 copies are updated on every assignment
+- **Read**: majority vote — returns the value present in at least 2 of 3 copies
+
+Designed for safety-critical code where a single-event upset (SEU) or stack corruption must not cause silent wrong results. Only effective on **local** `var` declarations; global variables are not eligible.
+
+```lyx
+fn criticalCounter(): int64 {
+  @redundant var count: int64 := 0;
+  count := count + 1;
+  return count;
+}
+```
+
+#### LCBS Annotations (`@capabilities`, `@uses_caller_cap`, `@cap`)
+
+These annotations are part of the Lyx Capability-Based Security (LCBS) system. See `doc/capabilities.md` for the full reference.
+
+```lyx
+@capabilities([fs.read, net.connect])
+fn fetchConfig(path: pchar): void { ... }
+
+@uses_caller_cap([fs.read])
+fn readLine(fd: int64): pchar { ... }
+
+@cap(fs.read)
+extern fn open(path: pchar, flags: int64, mode: int64): int64 link "libc.so.6";
+```
+
+#### `@energy(N)` (fn)
+
+Overrides the energy level (1 = minimal, 5 = extreme) for the annotated function, independently of the global `--target-energy` flag. Affects loop unrolling and SIMD strategy.
+
+```lyx
+@energy(5)
+fn hotLoop(data: pchar, len: int64): void { ... }
+```
+
 ---
 
 ## 3. Compiler Usage

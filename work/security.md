@@ -476,18 +476,17 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `COMPILER_MANUAL.md`, ggf. `doc/` |
+| **Dateien** | `COMPILER_MANUAL.md` |
 | **Aufwand** | 0.5 Tage |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-04 |
 
-**Problem:** `@redundant`, `@big_endian` sind nur auf Parser-Level implementiert, haben kein Codegen.
-Wer sie nutzt, bekommt einen falschen Sicherheitseindruck.
+**Befund (Audit-Korrektur):** `@redundant` (WP-3.1: TMR triple storage + majority-vote) und `@big_endian` (WP-4.1-B: BSWAP) sind vollständig im Codegen implementiert. Die ursprüngliche Diagnose "Parser-Level only" war veraltet.
 
 **Teilschritte:**
 
-- [ ] **17.1** In der Doku klarstellen: "Parser-Level only, kein Codegen"
-- [ ] **17.2** ggf. Compiler-Warnung bei Verteilung dieser Annotationen
+- [x] **17.1** Neue Section 2.11 "Annotations" in `COMPILER_MANUAL.md` — dokumentiert alle 9 Annotationen (`@export`, `@jni`, `@packed`, `@big_endian`, `@redundant`, `@capabilities`, `@uses_caller_cap`, `@cap`, `@energy`) mit Syntax, Ziel, Implementierungsstatus (alle ✅) und Beispiel
+- [x] **17.2** Compile-Error für `@big_endian` auf `f64`-Feldern bereits in `sema.lyx:2590` vorhanden; alle übrigen Annotationen haben validierten Codegen — keine zusätzliche Warnung erforderlich
 
 **Definition of Done:**
 - Doku erwähnt explizit den Implementierungsstatus jeder Annotation
@@ -626,7 +625,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 14 | DNS-Parser mit Limits | ⬜ | – | – | – |
 | 15 | Constant-Time Crypto | ⬜ | – | – | – |
 | 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – |
-| 17 | Teilimplementierte Annotationen dokumentieren | ⬜ | – | – | – |
+| 17 | Annotationen dokumentieren (Audit-Korrektur) | ✅ | Claude | 2026-06-04 | 2026-06-04 |
 | 18 | Stack-Canaries | ⬜ | – | – | – |
 | 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – |
 | 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – |
