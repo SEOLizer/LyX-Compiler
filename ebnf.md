@@ -1,4 +1,4 @@
-# Lyx v0.9.0C — Canonical EBNF Grammar
+# Lyx v0.9.1A — Canonical EBNF Grammar
 
 Status: Draft
 Target parser: Recursive Descent + Pratt Expression Parser
@@ -1010,7 +1010,9 @@ End of canonical grammar.
 
 ---
 
-# 22. LCBS Capability Grammar (WP-L1)
+# 22. LCBS Capability Grammar (WP-L1 … WP-T15)
+
+> Vollständige Dokumentation: [capabilities.md](capabilities.md)
 
 ```ebnf
 (* Capability annotation for functions, modules and classes *)
@@ -1055,6 +1057,43 @@ Effective capabilities rule:
   With restrict:  C(M) = C(M_declared) ∩ C(parent) ∩ restrict_set
   Invariant:      C(M) ⊆ C(parent)
 ```
+
+## 22.1b ExternFnDecl mit @cap (WP-L5)
+
+```ebnf
+ExternFnDecl = [ "@cap" "(" CapabilityPath ")" ]
+               "extern" "fn" Ident "(" [ ParamList ] ")" [ ":" Type ]
+               "link" StringLiteral ";" ;
+```
+
+## 22.1c UsesCallerCap (WP-L7)
+
+Vor einer Funktionsdeklaration (verkettet über `next`-Zeiger im AST):
+
+```ebnf
+UsesCallerCap = "@uses_caller_cap" "(" "[" CapabilityList "]" ")" ;
+```
+
+Der Compiler prüft an jedem Aufruf-Site, ob `C(Aufrufer) ⊇ uses_caller_cap_set`.
+
+## 22.1d Implizite Capabilities
+
+Folgende Capabilities sind immer aktiv und erscheinen im Audit-Output:
+
+```text
+system.exit         → exit_group (ID 0)
+system.memory.heap  → brk, mmap(MAP_ANON), munmap (ID 1)
+system.memory.stack → mmap(MAP_STACK) (ID 2)
+```
+
+## 22.1e CLI-Flags (WP-T13/T14/T15)
+
+| Flag | Beschreibung |
+|------|-------------|
+| *(kein Flag)* | Audit-Report immer auf stderr; seccomp+Landlock wenn @capabilities vorhanden |
+| `--migrate-capabilities` | Analysiert Programm; gibt @capabilities-Manifest auf stdout aus |
+| `--capabilities=compat` | Kein seccomp/Landlock trotz @capabilities (für Migration) |
+| `--self-test` | Führt LCBS-Integrationstest aus |
 
 ## 22.2 AST Node Mapping
 

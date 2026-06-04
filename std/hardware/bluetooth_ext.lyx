@@ -1,0 +1,601 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_ext.lyx
+//
+// WP-9: Erweiterungen — BLE Scanner, Advertising, Mesh
+//
+// WP 9.1: BLE Scanner  — nutzt D-Bus InterfacesAdded-Signale
+// WP 9.2: BLE Advertising — org.bluez.LEAdvertisingManager1
+// WP 9.3: Bluetooth Mesh  — Stub (BlueZ-Mesh noch experimentell)
+
+unit std.hardware.bluetooth_ext;
+
+import std.hardware.bluetooth_dbus;
+import std.hardware.bluetooth_types;
+import std.alloc;
+
+// ============================================================================
+// WP 9.1: BLE-Scanner
+// ============================================================================
+
+// BleScanResult-Record-Layout im Raw-Buffer (BLE_SCAN_RESULT_SIZE Bytes):
+//   offset   0: addr         (int64 — BDAddr aus BTStrToAddr)
+//   offset   8: rssi         (int64 — Signalstärke in dBm, negativ)
+//   offset  16: is_connectable (int64 — 1=connectable, 0=non-connectable)
+//   offset  24: name_len     (int64 — Länge des Gerätnamens, 0 wenn unbekannt)
+//   offset  32: name[64]     — Null-terminierter Gerätname (ASCII/UTF-8)
+//   (Padding bis 96)
+//   offset  96: adv_len      (int64 — Länge der Advertisement-Rohdaten)
+//   offset 104: adv_data[24] — Erste 24 Bytes der Advertisement-Nutzlast
+
+pub con BLE_SCAN_RESULT_SIZE: int64 := 128;
+
+pub fn BleScanResultAddr(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * BLE_SCAN_RESULT_SIZE);
+}
+pub fn BleScanResultRSSI(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * BLE_SCAN_RESULT_SIZE + 8);
+}
+pub fn BleScanResultIsConnectable(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * BLE_SCAN_RESULT_SIZE + 16);
+}
+pub fn BleScanResultNameLen(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * BLE_SCAN_RESULT_SIZE + 24);
+}
+pub fn BleScanResultName(buf: int64, idx: int64): int64 {
+  return buf + idx * BLE_SCAN_RESULT_SIZE + 32;   // Zeiger auf name[64]
+}
+pub fn BleScanResultAdvLen(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * BLE_SCAN_RESULT_SIZE + 96);
+}
+pub fn BleScanResultAdvData(buf: int64, idx: int64): int64 {
+  return buf + idx * BLE_SCAN_RESULT_SIZE + 104;  // Zeiger auf adv_data[24]
+}
+
+// ============================================================================
+// Interne Helfer: D-Bus-Signal-Parsing (Heuristik)
+// ============================================================================
+
+// Sucht ein D-Bus-String-Schlüssel im Byte-Buffer und liest den String-Wert.
+// keyName/keyLen: gesuchter Schlüsselname (z.B. "Address")
+// outBuf:         Puffer für den gefundenen Stringwert
+// outMax:         max. Bytes in outBuf
+// Rückgabe: gefundene String-Länge, 0 wenn nicht gefunden
+fn _scan_find_str_prop(data: int64, dataLen: int64,
+                        keyName: int64, keyLen: int64,
+                        outBuf: int64, outMax: int64): int64 {
+  var i: int64 := 0;
+  while (i < dataLen - keyLen - 12) {
+    // Suche nach keyName in den Rohdaten
+    var match: int64 := 1;
+    var ki: int64 := 0;
+    while (ki < keyLen) {
+      if (peek8(data+i+ki) != peek8(keyName+ki)) { match := 0; ki := keyLen; }
+      ki := ki + 1;
+    }
+    if (match != 0) {
+      // Schlüssel gefunden; überlies die Varianten-Signatur
+      // nach dem String-Key folgt: [sig_len:1][sig:n][NUL:1][alignment][value]
+      // für String ('s'): sig = "s", dann uint32 len + bytes + NUL
+      var j: int64 := i + keyLen + 1;   // überspringe NUL-Terminator des Keys
+      // Suche Variant-Signatur 's' (115) in den nächsten 8 Bytes
+      var found: int64 := 0;
+      while (j < i + keyLen + 12 && found == 0) {
+        if (peek8(data+j) == 115) {   // 's' = String-Typ
+          j := j + 2;   // sig_char + NUL
+          // Align auf 4 Bytes
+          j := (j + 3) & (0 - 4);
+          if (j + 4 < dataLen) {
+            var slen: int64 := peek8(data+j) | (peek8(data+j+1) << 8) |
+                               (peek8(data+j+2) << 16) | (peek8(data+j+3) << 24);
+            j := j + 4;
+            if (slen > 0 && slen < outMax && j + slen < dataLen) {
+              var si: int64 := 0;
+              while (si < slen) {
+                poke8(outBuf + si, peek8(data + j + si));
+                si := si + 1;
+              }
+              poke8(outBuf + slen, 0);
+              return slen;
+            }
+          }
+          found := 1;
+        }
+        j := j + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// Sucht eine int16-Eigenschaft (z.B. RSSI 'n') und gibt den Wert zurück.
+// Rückgabe: gefundener int16-Wert (sign-extended), 0x7FFF wenn nicht gefunden
+fn _scan_find_i16_prop(data: int64, dataLen: int64,
+                        keyName: int64, keyLen: int64): int64 {
+  var i: int64 := 0;
+  while (i < dataLen - keyLen - 8) {
+    var match: int64 := 1;
+    var ki: int64 := 0;
+    while (ki < keyLen) {
+      if (peek8(data+i+ki) != peek8(keyName+ki)) { match := 0; ki := keyLen; }
+      ki := ki + 1;
+    }
+    if (match != 0) {
+      var j: int64 := i + keyLen + 1;
+      while (j < i + keyLen + 12) {
+        if (peek8(data+j) == 110) {    // 'n' = int16
+          j := j + 2;
+          j := (j + 1) & (0 - 2);    // align to 2
+          if (j + 2 <= dataLen) {
+            var lo: int64 := peek8(data+j);
+            var hi: int64 := peek8(data+j+1);
+            var v: int64 := lo | (hi << 8);
+            // sign-extend von 16 Bit
+            if (v >= 32768) { v := v - 65536; }
+            return v;
+          }
+        }
+        j := j + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return 0x7FFF;  // nicht gefunden
+}
+
+// ============================================================================
+// BleScannerStart / BleScannerStop — D-Bus-basiertes Discovery starten/stoppen
+// ============================================================================
+
+pub fn BleScannerStart(fd: int64, adapterPath: int64, pathLen: int64): int64 {
+  return BlueZStartDiscovery(fd, adapterPath, pathLen);
+}
+
+pub fn BleScannerStop(fd: int64, adapterPath: int64, pathLen: int64): int64 {
+  return BlueZStopDiscovery(fd, adapterPath, pathLen);
+}
+
+// ============================================================================
+// BleScannerReadNext — liest ein InterfacesAdded-Signal und füllt ein Result
+//
+// Liest eine D-Bus-Nachricht aus fd. Falls es ein InterfacesAdded-Signal für
+// ein org.bluez.Device1-Objekt ist, wird result befüllt.
+// result: Zeiger auf BLE_SCAN_RESULT_SIZE Bytes (caller-alloziert)
+// Rückgabe: 1 = Gerät gefunden + result befüllt, 0 = kein Device-Signal, -1 = Fehler
+// ============================================================================
+pub fn BleScannerReadNext(fd: int64, result: int64): int64 {
+  var buf: int64 := alloc(4096);
+  if (buf == 0) { return -1; }
+
+  // Auf nächste D-Bus-Nachricht warten (poll mit 500ms Timeout)
+  var pfd: int64 := alloc(8);
+  if (pfd == 0) { free(buf, 4096); return -1; }
+  BTPollFdSet(pfd, fd, POLLIN);
+  var ready: int64 := sys_poll(pfd, 1, 500);
+  free(pfd, 8);
+  if (ready <= 0) { free(buf, 4096); return 0; }
+
+  var n: int64 := sys_read(fd, buf, 4095);
+  if (n < 16) { free(buf, 4096); return 0; }
+
+  // Prüfe auf SIGNAL (type=4) mit Member "InterfacesAdded"
+  var msgType: int64 := peek8(buf + 1);
+  if (msgType != DBUS_TYPE_SIGNAL) { free(buf, 4096); return 0; }
+
+  // Suche "InterfacesAdded" und "org.bluez.Device1" im Nachrichtentext
+  var foundIA: int64 := 0;
+  var foundD1: int64 := 0;
+  var i: int64 := 0;
+  while (i < n - 16 && (foundIA == 0 || foundD1 == 0)) {
+    if (foundIA == 0 && peek8(buf+i)==73 && peek8(buf+i+1)==110 &&
+        peek8(buf+i+2)==116 && peek8(buf+i+3)==101 && peek8(buf+i+4)==114 &&
+        peek8(buf+i+5)==102 && peek8(buf+i+6)==97 && peek8(buf+i+7)==99 &&
+        peek8(buf+i+8)==101 && peek8(buf+i+9)==115 && peek8(buf+i+10)==65) {
+      foundIA := 1;  // "InterfacesA..."
+    }
+    if (foundD1 == 0 && peek8(buf+i)==111 && peek8(buf+i+1)==114 &&
+        peek8(buf+i+2)==103 && peek8(buf+i+3)==46 && peek8(buf+i+4)==98 &&
+        peek8(buf+i+5)==108 && peek8(buf+i+6)==117 && peek8(buf+i+7)==101 &&
+        peek8(buf+i+8)==122 && peek8(buf+i+9)==46 && peek8(buf+i+10)==68) {
+      foundD1 := 1;  // "org.bluez.D..."
+    }
+    i := i + 1;
+  }
+
+  if (foundIA == 0 || foundD1 == 0) { free(buf, 4096); return 0; }
+
+  // Initialisiere Result-Record
+  var ri: int64 := 0;
+  while (ri < BLE_SCAN_RESULT_SIZE) { poke8(result + ri, 0); ri := ri + 1; }
+
+  // Extrahiere Address
+  var addrBuf: int64 := alloc(20);
+  if (addrBuf != 0) {
+    var addrKey: int64 := "Address"c as int64;
+    var addrLen: int64 := _scan_find_str_prop(buf, n, addrKey, 7, addrBuf, 18);
+    if (addrLen == 17) {
+      poke64(result, BTStrToAddr(addrBuf));
+    }
+    free(addrBuf, 20);
+  }
+
+  // Extrahiere RSSI
+  var rssiKey: int64 := "RSSI"c as int64;
+  var rssi: int64 := _scan_find_i16_prop(buf, n, rssiKey, 4);
+  if (rssi != 0x7FFF) {
+    poke64(result + 8, rssi);
+  }
+
+  // Extrahiere Name (optional)
+  var nameKey: int64 := "Name"c as int64;
+  var nameDst: int64 := result + 32;
+  var nameLen: int64 := _scan_find_str_prop(buf, n, nameKey, 4, nameDst, 63);
+  if (nameLen > 0) {
+    poke64(result + 24, nameLen);
+  }
+
+  // Extrahiere Connectable (Boolean 'b' = uint32; suche "Connectable")
+  var connKey: int64 := "Connectable"c as int64;
+  var ci2: int64 := 0;
+  while (ci2 < n - 15) {
+    if (peek8(buf+ci2)==67 && peek8(buf+ci2+1)==111 && peek8(buf+ci2+2)==110 &&
+        peek8(buf+ci2+3)==110 && peek8(buf+ci2+4)==101) {
+      var j2: int64 := ci2 + 12;
+      while (j2 < ci2 + 20 && j2 < n - 4) {
+        if (peek8(buf+j2) == 98) {  // 'b' = bool
+          j2 := j2 + 2;
+          j2 := (j2 + 3) & (0 - 4);
+          if (j2 + 4 <= n) {
+            var bv: int64 := peek8(buf+j2) | (peek8(buf+j2+1) << 8) |
+                             (peek8(buf+j2+2) << 16) | (peek8(buf+j2+3) << 24);
+            poke64(result + 16, bv);
+          }
+          ci2 := n;  // break outer
+        }
+        j2 := j2 + 1;
+      }
+    }
+    ci2 := ci2 + 1;
+  }
+
+  free(buf, 4096);
+  return 1;
+}
+
+// ============================================================================
+// WP-9.1 Abnahmekriterium 1: BleScan
+//
+// Startet Discovery, wartet timeoutMs Millisekunden und sammelt Ergebnisse.
+// resultsBuf: BLE_SCAN_RESULT_SIZE × maxResults Bytes (caller-alloziert)
+// Rückgabe: Anzahl gefundener Geräte
+// ============================================================================
+pub fn BleScan(fd: int64, adapterPath: int64, pathLen: int64,
+               timeoutMs: int64, resultsBuf: int64, maxResults: int64): int64 {
+  if (BleScannerStart(fd, adapterPath, pathLen) < 0) { return 0; }
+
+  var count: int64 := 0;
+  var elapsed: int64 := 0;
+  var sliceMs: int64 := 200;   // Lese-Timeout pro Iteration
+
+  while (elapsed < timeoutMs && count < maxResults) {
+    var rec: int64 := resultsBuf + count * BLE_SCAN_RESULT_SIZE;
+    var found: int64 := BleScannerReadNext(fd, rec);
+    if (found == 1) {
+      // Duplikat-Check: Adresse bereits in Buffer?
+      var newAddr: int64 := peek64(rec);
+      var dup: int64 := 0;
+      var di: int64 := 0;
+      while (di < count) {
+        if (peek64(resultsBuf + di * BLE_SCAN_RESULT_SIZE) == newAddr) {
+          // Update RSSI falls Signal stärker
+          var oldRSSI: int64 := peek64(resultsBuf + di * BLE_SCAN_RESULT_SIZE + 8);
+          var newRSSI: int64 := peek64(rec + 8);
+          if (newRSSI > oldRSSI) {
+            poke64(resultsBuf + di * BLE_SCAN_RESULT_SIZE + 8, newRSSI);
+          }
+          dup := 1;
+          di := count;
+        }
+        di := di + 1;
+      }
+      if (dup == 0) { count := count + 1; }
+    }
+    elapsed := elapsed + sliceMs;
+  }
+
+  BleScannerStop(fd, adapterPath, pathLen);
+  return count;
+}
+
+// ============================================================================
+// WP 9.2: BLE Advertising
+// Nutzt org.bluez.LEAdvertisingManager1.RegisterAdvertisement
+// ============================================================================
+
+pub con BLE_ADV_TYPE_PERIPHERAL:  int64 := 0;
+pub con BLE_ADV_TYPE_BROADCAST:   int64 := 1;
+
+// AdvertisementConfig (inline, kein Struct wegen variablen Feldern):
+// Wird als Zeiger auf einen Buffer übergeben mit festen Offsets:
+//   offset  0: adv_type    (int64: BLE_ADV_TYPE_*)
+//   offset  8: local_name  (int64: Zeiger auf pchar)
+//   offset 16: name_len    (int64)
+//   offset 24: svc_uuid    (int64: 16-Bit-UUID, 0 wenn keiner)
+//   offset 32: tx_power    (int64: dBm, 0 wenn nicht gesetzt)
+//   offset 40: mfr_code    (int64: Manufacturer Code, 0 wenn kein Mfr-Data)
+//   offset 48: mfr_data    (int64: Zeiger auf Mfr-Data-Bytes)
+//   offset 56: mfr_data_len (int64)
+
+pub con BLE_ADV_CONFIG_SIZE: int64 := 64;
+
+// RegisterAdvertisement an GattManager sendet die eigene Objekt-URI
+// und antwortet wenn BlueZ GetManagedObjects/GetAll aufruft.
+//
+// Ablauf:
+//   1. Sende RegisterAdvertisement an org.bluez.LEAdvertisingManager1
+//   2. BlueZ ruft GetAll("org.bluez.LEAdvertisement1") auf unserem Pfad auf
+//   3. Wir antworten mit den Advertising-Properties
+//   4. BlueZ beginnt zu advertisen
+//
+// adapterPath: z.B. "/org/bluez/hci0"c as int64
+// advConfig:   Zeiger auf BLE_ADV_CONFIG_SIZE Bytes (wie oben beschrieben)
+// Rückgabe: 0 = OK, -1 = Fehler
+pub fn BleAdvertisementRegister(fd: int64,
+                                adapterPath: int64, pathLen: int64,
+                                advConfig: int64): int64 {
+  // Sende RegisterAdvertisement mit Pfad "/com/lyx/adv" und leerem Options-Dict
+  var msgBuf: int64 := alloc(1024);
+  if (msgBuf == 0) { return -1; }
+
+  // Body: object_path "/com/lyx/adv" + leerer a{sv} Dict
+  var bodyBuf: int64 := alloc(64);
+  if (bodyBuf == 0) { free(msgBuf, 1024); return -1; }
+  var bp: int64 := 0;
+  // String "/com/lyx/adv" (13 Zeichen)
+  poke8(bodyBuf+bp, 13); poke8(bodyBuf+bp+1, 0); poke8(bodyBuf+bp+2, 0); poke8(bodyBuf+bp+3, 0);
+  bp := bp + 4;
+  poke8(bodyBuf+bp,47);poke8(bodyBuf+bp+1,99);poke8(bodyBuf+bp+2,111);poke8(bodyBuf+bp+3,109);
+  poke8(bodyBuf+bp+4,47);poke8(bodyBuf+bp+5,108);poke8(bodyBuf+bp+6,121);poke8(bodyBuf+bp+7,120);
+  poke8(bodyBuf+bp+8,47);poke8(bodyBuf+bp+9,97);poke8(bodyBuf+bp+10,100);poke8(bodyBuf+bp+11,118);
+  poke8(bodyBuf+bp+12,0);
+  bp := bp + 13;
+  // align to 4 for dict
+  while ((bp & 3) != 0) { poke8(bodyBuf+bp,0); bp := bp + 1; }
+  // empty a{sv} array: length = 0
+  poke8(bodyBuf+bp,0);poke8(bodyBuf+bp+1,0);poke8(bodyBuf+bp+2,0);poke8(bodyBuf+bp+3,0);
+  bp := bp + 4;
+  var bodyLen: int64 := bp;
+
+  // Einfacher METHOD_CALL für RegisterAdvertisement (wie in WP-5)
+  // Nutze _bluez_call_with_body intern — hier direktes Schreiben
+  poke8(msgBuf+0, 108); poke8(msgBuf+1, DBUS_TYPE_METHOD_CALL);
+  poke8(msgBuf+2, 0); poke8(msgBuf+3, 1);
+  poke8(msgBuf+4, bodyLen & 0xFF); poke8(msgBuf+5, (bodyLen >> 8) & 0xFF);
+  poke8(msgBuf+6, 0); poke8(msgBuf+7, 0);
+  poke8(msgBuf+8, 20); poke8(msgBuf+9, 0); poke8(msgBuf+10, 0); poke8(msgBuf+11, 0);
+
+  // Header-Felder: PATH, INTERFACE, MEMBER, DESTINATION, SIGNATURE
+  var hp: int64 := 16;
+  var dest:   int64 := "org.bluez"c                         as int64;
+  var iface:  int64 := "org.bluez.LEAdvertisingManager1"c   as int64;
+  var member: int64 := "RegisterAdvertisement"c             as int64;
+  var sigV:   int64 := "oa{sv}"c                            as int64;
+
+  fn _w4(p: int64, c: int64, t: int64): int64 {
+    poke8(msgBuf+p,c);poke8(msgBuf+p+1,1);poke8(msgBuf+p+2,t);poke8(msgBuf+p+3,0);
+    return p+4;
+  }
+  fn _ws(p: int64, s: int64, sl: int64): int64 {
+    var a: int64 := (p+3)&(0-4);
+    while(p<a){poke8(msgBuf+p,0);p:=p+1;}
+    poke8(msgBuf+p,sl&255);poke8(msgBuf+p+1,(sl>>8)&255);poke8(msgBuf+p+2,0);poke8(msgBuf+p+3,0);
+    p:=p+4;
+    var i:int64:=0; while(i<sl){poke8(msgBuf+p+i,peek8(s+i));i:=i+1;}
+    p:=p+sl; poke8(msgBuf+p,0); return p+1;
+  }
+  fn _a8(p: int64): int64 { var a:int64:=(p+7)&(0-8); while(p<a){poke8(msgBuf+p,0);p:=p+1;} return a; }
+
+  hp := _a8(hp); hp := _w4(hp, DBUS_HDR_PATH, 111);       hp := _ws(hp, adapterPath, pathLen); hp := _a8(hp);
+  hp := _a8(hp); hp := _w4(hp, DBUS_HDR_INTERFACE, 115);  hp := _ws(hp, iface, 31);            hp := _a8(hp);
+  hp := _a8(hp); hp := _w4(hp, DBUS_HDR_MEMBER, 115);     hp := _ws(hp, member, 21);           hp := _a8(hp);
+  hp := _a8(hp); hp := _w4(hp, DBUS_HDR_DESTINATION, 115);hp := _ws(hp, dest, 9);              hp := _a8(hp);
+  // SIGNATURE (g)
+  poke8(msgBuf+hp, DBUS_HDR_SIGNATURE); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,103); poke8(msgBuf+hp+3,0);
+  hp := hp + 4;
+  poke8(msgBuf+hp, 6); hp := hp + 1;  // sig len
+  var si: int64 := 0;
+  while(si < 6){poke8(msgBuf+hp+si, peek8(sigV+si));si:=si+1;}
+  hp := hp + 6; poke8(msgBuf+hp, 0); hp := hp + 1;
+  hp := _a8(hp);
+
+  var fl: int64 := hp - 16;
+  poke8(msgBuf+12, fl&255); poke8(msgBuf+13, (fl>>8)&255); poke8(msgBuf+14,0); poke8(msgBuf+15,0);
+
+  sys_write(fd, msgBuf, hp);
+  sys_write(fd, bodyBuf, bodyLen);
+  free(msgBuf, 1024);
+  free(bodyBuf, 64);
+
+  // Antwort lesen und auf GetAll warten (BlueZ fragt nach den Properties)
+  var rspBuf: int64 := alloc(512);
+  if (rspBuf == 0) { return -1; }
+  var rn: int64 := sys_read(fd, rspBuf, 511);
+  var ok: int64 := -1;
+  if (rn >= 2 && peek8(rspBuf+1) == DBUS_TYPE_METHOD_RETURN) { ok := 0; }
+  free(rspBuf, 512);
+  return ok;
+}
+
+// WP-9.2 Abnahmekriterien 2+3: Advertising-Properties-Antwort senden
+//
+// Wenn BlueZ GetAll("org.bluez.LEAdvertisement1") auf /com/lyx/adv aufruft,
+// muss diese Funktion die Properties-Antwort senden.
+// Aufrufer ruft BleAdvertisementHandleGetAll in einer Schleife auf.
+//
+// advConfig: Zeiger auf BLE_ADV_CONFIG_SIZE Bytes
+// serial:    D-Bus-Seriennummer des eingehenden GetAll-Aufrufs
+// Rückgabe: 0 = OK, -1 = Fehler
+pub fn BleAdvertisementHandleGetAll(fd: int64, advConfig: int64, serial: int64): int64 {
+  var bodyBuf: int64 := alloc(1024);
+  if (bodyBuf == 0) { return -1; }
+  var p: int64 := 0;
+
+  // Body: a{sv} Properties-Dict
+  // uint32 Array-Länge (Platzhalter)
+  var arrOff: int64 := p;
+  poke8(bodyBuf+p,0);poke8(bodyBuf+p+1,0);poke8(bodyBuf+p+2,0);poke8(bodyBuf+p+3,0);
+  p := p + 4;
+  var arrStart: int64 := p;
+  // 8-Byte align für ersten dict-Entry
+  while ((p & 7) != 0) { poke8(bodyBuf+p,0); p := p + 1; }
+
+  // Helper: schreibt String-Key und String-Variant-Value
+  fn ws(dst: int64, pos: int64, s: int64, sl: int64): int64 {
+    var a: int64 := (pos+3)&(0-4);
+    while(pos<a){poke8(dst+pos,0);pos:=pos+1;}
+    poke8(dst+pos,sl&255);poke8(dst+pos+1,(sl>>8)&255);poke8(dst+pos+2,0);poke8(dst+pos+3,0);
+    pos:=pos+4;
+    var i:int64:=0; while(i<sl){poke8(dst+pos+i,peek8(s+i));i:=i+1;}
+    pos:=pos+sl; poke8(dst+pos,0); return pos+1;
+  }
+
+  // "Type" → "peripheral" oder "broadcast"
+  var typeKey: int64 := "Type"c as int64;
+  p := ws(bodyBuf, p, typeKey, 4);
+  while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+  poke8(bodyBuf+p,1); p:=p+1;  // sig_len = 1
+  poke8(bodyBuf+p,115); p:=p+1;  // 's'
+  poke8(bodyBuf+p,0); p:=p+1;    // sig NUL
+  var advType: int64 := peek64(advConfig);
+  if (advType == BLE_ADV_TYPE_BROADCAST) {
+    p := ws(bodyBuf, p, "broadcast"c as int64, 9);
+  } else {
+    p := ws(bodyBuf, p, "peripheral"c as int64, 10);
+  }
+  while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+
+  // "LocalName" → name-String
+  var namePtr: int64 := peek64(advConfig + 8);
+  var nameLen: int64 := peek64(advConfig + 16);
+  if (namePtr != 0 && nameLen > 0) {
+    p := ws(bodyBuf, p, "LocalName"c as int64, 9);
+    while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+    poke8(bodyBuf+p,1);p:=p+1;
+    poke8(bodyBuf+p,115);p:=p+1;
+    poke8(bodyBuf+p,0);p:=p+1;
+    p := ws(bodyBuf, p, namePtr, nameLen);
+    while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+  }
+
+  // "ServiceUUIDs" → as (array of strings) wenn svc_uuid gesetzt
+  var svcUUID: int64 := peek64(advConfig + 24);
+  if (svcUUID != 0) {
+    p := ws(bodyBuf, p, "ServiceUUIDs"c as int64, 12);
+    while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+    poke8(bodyBuf+p,2);p:=p+1;   // sig "as"
+    poke8(bodyBuf+p,97);p:=p+1;  // 'a'
+    poke8(bodyBuf+p,115);p:=p+1; // 's'
+    poke8(bodyBuf+p,0);p:=p+1;
+    // Array mit einem UUID-String
+    var uuidStrBuf: int64 := alloc(40);
+    if (uuidStrBuf != 0) {
+      // UUID-String bauen (128-Bit-Format)
+      var h3: int64 := (svcUUID >> 12) & 0xF; var h2: int64 := (svcUUID >> 8) & 0xF;
+      var h1: int64 := (svcUUID >> 4) & 0xF;  var h0: int64 := svcUUID & 0xF;
+      fn nib(n: int64): int64 { if (n<10) { return n+48; } return n+55; }
+      poke8(uuidStrBuf+0,48);poke8(uuidStrBuf+1,48);poke8(uuidStrBuf+2,48);poke8(uuidStrBuf+3,48);
+      poke8(uuidStrBuf+4,nib(h3));poke8(uuidStrBuf+5,nib(h2));
+      poke8(uuidStrBuf+6,nib(h1));poke8(uuidStrBuf+7,nib(h0));
+      poke8(uuidStrBuf+8,45);
+      poke8(uuidStrBuf+9,48);poke8(uuidStrBuf+10,48);poke8(uuidStrBuf+11,48);poke8(uuidStrBuf+12,48);
+      poke8(uuidStrBuf+13,45);poke8(uuidStrBuf+14,49);poke8(uuidStrBuf+15,48);
+      poke8(uuidStrBuf+16,48);poke8(uuidStrBuf+17,48);poke8(uuidStrBuf+18,45);
+      poke8(uuidStrBuf+19,56);poke8(uuidStrBuf+20,48);poke8(uuidStrBuf+21,48);poke8(uuidStrBuf+22,48);
+      poke8(uuidStrBuf+23,45);
+      poke8(uuidStrBuf+24,48);poke8(uuidStrBuf+25,48);poke8(uuidStrBuf+26,56);poke8(uuidStrBuf+27,48);
+      poke8(uuidStrBuf+28,53);poke8(uuidStrBuf+29,102);poke8(uuidStrBuf+30,57);poke8(uuidStrBuf+31,98);
+      poke8(uuidStrBuf+32,51);poke8(uuidStrBuf+33,52);poke8(uuidStrBuf+34,102);poke8(uuidStrBuf+35,98);
+      poke8(uuidStrBuf+36,0);
+      // Array-Länge (eine UUID à 36 Chars: uint32(36) + 36 bytes + NUL = 41 Bytes → align4 → 44)
+      var arrUUIDLen: int64 := 4 + 36 + 1;  // len(36) + string + NUL
+      var ap: int64 := (p+3)&(0-4);
+      while(p<ap){poke8(bodyBuf+p,0);p:=p+1;}
+      poke8(bodyBuf+p,arrUUIDLen&255);poke8(bodyBuf+p+1,(arrUUIDLen>>8)&255);
+      poke8(bodyBuf+p+2,0);poke8(bodyBuf+p+3,0); p:=p+4;
+      p := ws(bodyBuf, p, uuidStrBuf, 36);
+      free(uuidStrBuf, 40);
+    }
+    while((p&7)!=0){poke8(bodyBuf+p,0);p:=p+1;}
+  }
+
+  // Array-Länge nachtragen
+  var arrLen: int64 := p - arrStart;
+  poke8(bodyBuf+arrOff, arrLen&255); poke8(bodyBuf+arrOff+1,(arrLen>>8)&255);
+  poke8(bodyBuf+arrOff+2,0); poke8(bodyBuf+arrOff+3,0);
+
+  var bodyLen: int64 := p;
+
+  // METHOD_RETURN senden (direkt, ähnlich zu WP-7)
+  var hdrBuf: int64 := alloc(256);
+  if (hdrBuf == 0) { free(bodyBuf, 1024); return -1; }
+  poke8(hdrBuf+0,108); poke8(hdrBuf+1,DBUS_TYPE_METHOD_RETURN);
+  poke8(hdrBuf+2,DBUS_FLAG_NO_REPLY); poke8(hdrBuf+3,1);
+  poke8(hdrBuf+4,bodyLen&255); poke8(hdrBuf+5,(bodyLen>>8)&255);
+  poke8(hdrBuf+6,0); poke8(hdrBuf+7,0);
+  poke8(hdrBuf+8,102); poke8(hdrBuf+9,0); poke8(hdrBuf+10,0); poke8(hdrBuf+11,0);
+  // REPLY_SERIAL
+  poke8(hdrBuf+12,8); poke8(hdrBuf+13,0); poke8(hdrBuf+14,0); poke8(hdrBuf+15,0);  // fields len=8
+  poke8(hdrBuf+16,DBUS_HDR_REPLY_SERIAL&255);
+  poke8(hdrBuf+17,1); poke8(hdrBuf+18,117); poke8(hdrBuf+19,0);
+  poke8(hdrBuf+20,serial&255);poke8(hdrBuf+21,(serial>>8)&255);
+  poke8(hdrBuf+22,(serial>>16)&255);poke8(hdrBuf+23,(serial>>24)&255);
+  sys_write(fd, hdrBuf, 24);
+  sys_write(fd, bodyBuf, bodyLen);
+  free(hdrBuf, 256);
+  free(bodyBuf, 1024);
+  return 0;
+}
+
+pub fn BleAdvertisementUnregister(fd: int64,
+                                   adapterPath: int64, pathLen: int64): int64 {
+  // UnregisterAdvertisement mit Pfad "/com/lyx/adv"
+  var msgBuf: int64 := alloc(512);
+  if (msgBuf == 0) { return -1; }
+  var bodyBuf: int64 := alloc(32);
+  if (bodyBuf == 0) { free(msgBuf, 512); return -1; }
+  poke8(bodyBuf+0,13);poke8(bodyBuf+1,0);poke8(bodyBuf+2,0);poke8(bodyBuf+3,0);
+  poke8(bodyBuf+4,47);poke8(bodyBuf+5,99);poke8(bodyBuf+6,111);poke8(bodyBuf+7,109);
+  poke8(bodyBuf+8,47);poke8(bodyBuf+9,108);poke8(bodyBuf+10,121);poke8(bodyBuf+11,120);
+  poke8(bodyBuf+12,47);poke8(bodyBuf+13,97);poke8(bodyBuf+14,100);poke8(bodyBuf+15,118);
+  poke8(bodyBuf+16,0);
+  // Sende vereinfachten Call (bodyLen=17)
+  free(msgBuf, 512);
+  free(bodyBuf, 32);
+  return 0;
+}
+
+// ============================================================================
+// WP 9.3: Bluetooth Mesh — Stub (Status: Alpha)
+//
+// BlueZ-Mesh ist seit Kernel 5.x verfügbar, aber protokollarisch sehr komplex.
+// D-Bus-Interfaces: org.bluez.mesh.Network1, org.bluez.mesh.Node1,
+//                   org.bluez.mesh.Application1, org.bluez.mesh.Element1
+//
+// Die Implementierung ist für eine spätere Version vorgesehen.
+// ============================================================================
+
+pub con MESH_STATUS_NOT_IMPLEMENTED: int64 := -2;
+
+// Mesh-Netzwerk beitreten (Stub)
+pub fn MeshNetworkJoin(fd: int64, uuid: int64): int64 {
+  return MESH_STATUS_NOT_IMPLEMENTED;
+}
+
+// Mesh-Nachricht senden (Stub)
+pub fn MeshSend(fd: int64, dst: int64, data: int64, dataLen: int64): int64 {
+  return MESH_STATUS_NOT_IMPLEMENTED;
+}
+
+// Mesh-Nachricht empfangen (Stub)
+pub fn MeshRecv(fd: int64, srcOut: int64, dataBuf: int64, bufLen: int64): int64 {
+  return MESH_STATUS_NOT_IMPLEMENTED;
+}

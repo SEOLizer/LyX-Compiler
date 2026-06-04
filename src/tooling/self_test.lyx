@@ -1,0 +1,127 @@
+// ===========================================================================
+// WP-T15: LCBS-Selbsttest (`--self-test`)
+// ===========================================================================
+// Führt einen Integrationstest durch: LCBS-Programme kompilieren+ausführen.
+// Verwendet nur built-in Syscall-Wrapper (sys_fork, sys_execve, sys_wait4).
+
+// Schreibt null-terminierten String in eine Datei; gibt 1 bei Erfolg zurück.
+fn st_write(path: pchar, src: pchar): int64 {
+  return FileWriteAll(path, src, StrLen(src)) as int64;
+}
+
+// Führt: prog [a0 [a1]] aus; leere Strings werden als NULL-Sentinel übersprungen.
+// Gibt den Exit-Code des Kind-Prozesses zurück (-1 bei fork-Fehler).
+fn st_exec3(prog: pchar, a0: pchar, a1: pchar): int64 {
+  var argv: int64 := alloc(4 * 8);
+  var argc: int64 := 0;
+  poke64(argv + argc * 8, prog as int64); argc := argc + 1;
+  if StrLen(a0) > 0 { poke64(argv + argc * 8, a0 as int64); argc := argc + 1; }
+  if StrLen(a1) > 0 { poke64(argv + argc * 8, a1 as int64); argc := argc + 1; }
+  poke64(argv + argc * 8, 0);
+  var pid: int64 := sys_fork();
+  if pid < 0 { free(argv, 4 * 8); return 0 - 1; }
+  if pid == 0 {
+    sys_execve(prog, argv, 0);
+    // execve fehlgeschlagen — Kind sauber beenden
+    exit(127);
+    return 0;
+  }
+  free(argv, 4 * 8);
+  var stBuf: int64 := alloc(8);
+  poke64(stBuf, 0);
+  sys_wait4(pid, stBuf, 0);
+  var code: int64 := (peek64(stBuf) >> 8) & 0xFF;
+  free(stBuf, 8);
+  return code;
+}
+
+// Führt: prog [a0..a3] aus; leere Strings werden als NULL-Sentinel übersprungen.
+fn st_exec5(prog: pchar, a0: pchar, a1: pchar, a2: pchar, a3: pchar): int64 {
+  var argv: int64 := alloc(6 * 8);
+  var argc: int64 := 0;
+  poke64(argv + argc * 8, prog as int64); argc := argc + 1;
+  if StrLen(a0) > 0 { poke64(argv + argc * 8, a0 as int64); argc := argc + 1; }
+  if StrLen(a1) > 0 { poke64(argv + argc * 8, a1 as int64); argc := argc + 1; }
+  if StrLen(a2) > 0 { poke64(argv + argc * 8, a2 as int64); argc := argc + 1; }
+  if StrLen(a3) > 0 { poke64(argv + argc * 8, a3 as int64); argc := argc + 1; }
+  poke64(argv + argc * 8, 0);
+  var pid: int64 := sys_fork();
+  if pid < 0 { free(argv, 6 * 8); return 0 - 1; }
+  if pid == 0 {
+    sys_execve(prog, argv, 0);
+    exit(127);
+    return 0;
+  }
+  free(argv, 6 * 8);
+  var stBuf: int64 := alloc(8);
+  poke64(stBuf, 0);
+  sys_wait4(pid, stBuf, 0);
+  var code: int64 := (peek64(stBuf) >> 8) & 0xFF;
+  free(stBuf, 8);
+  return code;
+}
+
+// Schreibt, kompiliert und führt ein Test-Programm aus; gibt 1 bei Erfolg zurück.
+fn st_check(lyxc: pchar, src: pchar, srcPath: pchar, outPath: pchar, desc: pchar): int64 {
+  EPrintStr("  checking: "c); EPrintStr(desc); EPrintStr(" ... "c);
+  if st_write(srcPath, src) == 0 {
+    EPrintStrLn("[FAIL] write"c); return 0;
+  }
+  if st_exec5(lyxc, srcPath, "-o"c, outPath, ""c) != 0 {
+    EPrintStrLn("[FAIL] compile"c); return 0;
+  }
+  if st_exec3(outPath, ""c, ""c) != 0 {
+    EPrintStrLn("[FAIL] run"c); return 0;
+  }
+  EPrintStrLn("[PASS]"c); return 1;
+}
+
+// Führt den vollständigen LCBS-Selbsttest durch.
+// lyxcPath: Pfad zum lyxc-Binary (argv[0]).
+// Gibt 0 bei Erfolg zurück, 1 bei Fehlern.
+pub fn run_self_test(lyxcPath: pchar): int64 {
+  EPrintStrLn("=== LCBS Self-Test =============================================="c);
+  var ok: int64 := 1;
+  var r: int64 := 0;
+
+  // Test 1: Einfaches Programm ohne LCBS
+  r := st_check(lyxcPath,
+    "fn main(): int64 { return 0; }"c,
+    "/tmp/lcbs_st1.lyx"c, "/tmp/lcbs_st1"c,
+    "kein LCBS"c);
+  if r == 0 { ok := 0; }
+
+  // Test 2: LCBS mit fs.read
+  r := st_check(lyxcPath,
+    "@capabilities([fs.read]) fn main(): int64 { return 0; }"c,
+    "/tmp/lcbs_st2.lyx"c, "/tmp/lcbs_st2"c,
+    "LCBS fs.read"c);
+  if r == 0 { ok := 0; }
+
+  // Test 3: LCBS mit hardware.gpio
+  r := st_check(lyxcPath,
+    "@capabilities([hardware.gpio(pin: 4)]) fn main(): int64 { return 0; }"c,
+    "/tmp/lcbs_st3.lyx"c, "/tmp/lcbs_st3"c,
+    "LCBS hardware.gpio"c);
+  if r == 0 { ok := 0; }
+
+  // Test 4: --migrate-capabilities gibt Exit 0
+  EPrintStr("  checking: --migrate-capabilities ... "c);
+  var wok: int64 := st_write("/tmp/lcbs_st4.lyx"c,
+    "extern fn open(p: int64, f: int64): int64 link \"libc.so.6\"; fn main(): int64 { return 0; }"c);
+  if wok != 0 {
+    var r4: int64 := st_exec5(lyxcPath, "--migrate-capabilities"c, "/tmp/lcbs_st4.lyx"c, ""c, ""c);
+    if r4 == 0 { EPrintStrLn("[PASS]"c); } else { EPrintStrLn("[FAIL]"c); ok := 0; }
+  } else { EPrintStrLn("[FAIL] write"c); ok := 0; }
+
+  // Test 5: --capabilities=compat kompiliert LCBS-Programm
+  EPrintStr("  checking: --capabilities=compat ... "c);
+  var r5: int64 := st_exec5(lyxcPath, "--capabilities=compat"c, "/tmp/lcbs_st2.lyx"c, "-o"c, "/tmp/lcbs_st5"c);
+  if r5 == 0 { EPrintStrLn("[PASS]"c); } else { EPrintStrLn("[FAIL]"c); ok := 0; }
+
+  EPrintStrLn("================================================================"c);
+  if ok != 0 { EPrintStrLn("LCBS SELF-TEST: PASSED"c); } else { EPrintStrLn("LCBS SELF-TEST: FAILED"c); }
+  EPrintStrLn("================================================================"c);
+  if ok != 0 { return 0; }
+  return 1;
+}

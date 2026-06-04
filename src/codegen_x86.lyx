@@ -147,7 +147,7 @@ con CGT_SHR:     int64 := 94;
 // ELF / load address
 con CG_ELF_BASE:   int64 := 4194304;  // 0x400000
 con CG_PHDR_OFF:   int64 := 64;       // phdr right after ELF header
-con CG_CODE_OFF:   int64 := 120;      // code starts after ELF hdr (64) + phdr (56)
+con CG_CODE_OFF:   int64 := 176;      // WP-6: code after ELF hdr (64) + 2×phdr (56+56)
 
 // Helper function offsets within code buffer (fixed layout emitted in cg_emitHelpers)
 //   _start:           offset 0    (79 bytes)  — WP-BI-01: +14 for argc/argv save
@@ -557,6 +557,11 @@ pub type Codegen = class {
   lcbsMissingGrants:  int64;  // Anzahl Imports ohne explizites grant
   lcbsFastpathCount:  int64;  // Anzahl @fastpath-Nutzungen
   lcbsAuditSrcPath:   pchar;  // Quell-Dateipfad (gesetzt von lyxc.lyx vor Generate)
+
+  // WP-T14: --capabilities=compat: kein seccomp/landlock/proxy trotz @capabilities
+  lcbsCompatMode:     int64;  // 1 = Compat-Modus aktiv (gesetzt von lyxc.lyx)
+  // WP-6: W^X — 1 wenn zwei PT_LOAD-Segmente (RX + RW) emittiert werden
+  lcbsWxActive:       int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -2123,6 +2128,8 @@ pub type Codegen = class {
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
     var cnt: int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
     if (cnt <= 0) { return 8; }
+    // WP-10.2: cnt*8 must not overflow int64
+    if (cnt > 0x1FFFFFFFFFFFFFFF) { return 8; }
     // For struct fields the last field's offset + 8 = total size
     // Simpler: fieldCnt * 8 (all fields are 8 bytes in non-packed structs)
     return cnt * 8;
@@ -2459,6 +2466,8 @@ pub type Codegen = class {
     var cnt: int64 := 0;
     var tmp: int64 := variantNode;
     while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
+    // WP-10.2: cnt*32 must not overflow; no realistic enum has >64 M variants
+    if (cnt < 0 || cnt > 0x3FFFFFFF) { return; }
     // Allocate variant array: 32 bytes per variant
     var vars: int64 := alloc(cnt * 32);
     var i: int64 := 0;
@@ -3499,6 +3508,8 @@ pub type Codegen = class {
       var el: int64 := self.cg_nc0(ni);
       while (el != -1) { cnt := cnt + 1; el := self.cg_nnext(el); }
       if (cnt > 0) {
+        // WP-10.2: cnt*8+16 must fit in int32 (x86 imm32) and must not overflow int64
+        if (cnt > 0x1FFFFFFF) { return; }
         var stackBytes: int64 := cnt * 8 + 16;
         // sub rsp, stackBytes
         self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC); self.cg_e32(stackBytes);
@@ -4191,6 +4202,12 @@ pub type Codegen = class {
                self.cg_seq(fname, fnlen, "sys_recv", 8)) {
       // recvfrom/recv: sys_recvfrom = 45
       self.cg_movRaxImm(45); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_sendmsg", 11)) {
+      // sendmsg(sockfd, *msghdr, flags): int64 -- syscall 46
+      self.cg_movRaxImm(46); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_recvmsg", 11)) {
+      // recvmsg(sockfd, *msghdr, flags): int64 -- syscall 47
+      self.cg_movRaxImm(47); self.cg_e8(0x0F); self.cg_e8(0x05);
     } else if (self.cg_seq(fname, fnlen, "sys_shutdown", 12)) {
       // shutdown(sockfd, how): int64 -- sys_shutdown = 48
       self.cg_movRaxImm(48); self.cg_e8(0x0F); self.cg_e8(0x05);
@@ -4198,6 +4215,16 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "sys_fork", 8)) {
       // fork(): int64 -- syscall 57; child returns 0, parent returns child PID
       self.cg_movRaxImm(57); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_execve", 10)) {
+      // execve(path, argv, envp): int64 -- syscall 59
+      self.cg_movRaxImm(59); self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_wait4", 9)) {
+      // wait4(pid, status, options, rusage=0): int64 -- syscall 61
+      // Linux ABI: 4th arg goes in r10; we zero r10 (rusage=NULL)
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor r10d, r10d
+      self.cg_movRaxImm(61); self.cg_e8(0x0F); self.cg_e8(0x05);
 
     } else if (self.cg_seq(fname, fnlen, "sys_clone", 9)) {
       // clone(flags, stack, parent_tid, child_tid, tls): int64 -- syscall 56
@@ -4861,7 +4888,11 @@ pub type Codegen = class {
       self.cg_e8(0xF3); self.cg_e8(0xAA);
       self.cg_zeroRax();
 
-    } else if (self.cg_seq(fname, fnlen, "ioctl", 5)) {
+    } else if (self.cg_seq(fname, fnlen, "sys_poll", 8)) {
+      // poll(*fds, nfds, timeout_ms): int64 -- syscall 7
+      self.cg_movRaxImm(7); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_ioctl", 9) ||
+               self.cg_seq(fname, fnlen, "ioctl", 5)) {
       // ioctl(fd,req,arg): syscall 16, rdi=fd, rsi=req, rdx=arg
       self.cg_movRaxImm(16);
       self.cg_e8(0x0F); self.cg_e8(0x05);
@@ -8358,6 +8389,10 @@ pub type Codegen = class {
     self.lcbsFastpathCount := 0;
     self.lcbsAuditSrcPath  := 0 as pchar;
 
+    // WP-T14: Compat-Modus (kein seccomp/landlock)
+    self.lcbsCompatMode := 0;
+    self.lcbsWxActive   := 0;
+
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
@@ -8459,6 +8494,7 @@ pub type Codegen = class {
   // Nur aufgerufen wenn lcbsEnabled == 1.
   fn cg_genBpfSection(): void {
     if self.lcbsEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14: Compat-Modus überspringt seccomp
     var bpfBuf: int64 := alloc(256 * 8);
     var bpfCount: int64 := seccomp_build_filter(self.lcbsCapBuf, self.lcbsCapCount, bpfBuf);
     self.lcbsBpfDataOff := self.dataLen;
@@ -8482,6 +8518,7 @@ pub type Codegen = class {
   // WP-R11: Generiert Proxy-BPF in Datensektion + reserviert proxy_fd-Slot.
   fn cg_genProxyBpfSection(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     var bpfBuf: int64 := alloc(128 * 8);
     var bpfCount: int64 := proxy_build_filter(bpfBuf);
     self.lcbsProxyBpfDataOff := self.dataLen;
@@ -8506,6 +8543,7 @@ pub type Codegen = class {
   //   4. Bei EOF (Elter beendet): exit_group(0).
   fn cg_emitProxyLoop(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     self.lcbsProxyCodeOff := self.codeLen;
 
     // Callee-saved Register retten: r13 (child_fd), r14 (alignment), rbx
@@ -8594,6 +8632,7 @@ pub type Codegen = class {
   //   Elter: speichert proxy_fd (sv[1]) in Datensektion
   fn cg_emitProxyStart(): void {
     if self.lcbsProxyEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
 
     // Stack: sv[2] (2×int = 8 Bytes, aufgefüllt auf 16)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
@@ -8671,6 +8710,7 @@ pub type Codegen = class {
   // Muss VOR cg_genFile() aufgerufen werden; cg_emitLandlockInit() verwendet die Offsets.
   fn cg_genHwDevPathSection(): void {
     if self.lcbsHwArgCount == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     var pathBuf: int64 := alloc(32);
     var hwi: int64 := 0;
     while hwi < self.lcbsHwArgCount {
@@ -8703,6 +8743,7 @@ pub type Codegen = class {
   // WP-H12: Hardware-Caps erzeugen per-Gerät-Regeln (statt breiter /dev-Regel).
   fn cg_emitLandlockInit(): void {
     if self.lcbsEnabled == 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
 
     // sub rsp, 48  (Stack-Frame)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x30);
@@ -8869,6 +8910,7 @@ pub type Codegen = class {
   // Läuft NACH dem Funktions-Prolog (push rbp etc.) aber VOR dem Body.
   fn cg_emitSeccompInit(): void {
     if self.lcbsBpfDataOff < 0 { return; }
+    if self.lcbsCompatMode != 0 { return; }  // WP-T14
     // Construct sock_fprog on stack (sub rsp already done by cg_genFuncDecl prolog).
     // We use 16 extra bytes below current rsp; sub rsp,16 first.
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
@@ -8912,12 +8954,13 @@ pub type Codegen = class {
     var landlockOk:   int64 := 0;
     var landlockRules: int64 := 0;
     var bpfRules:     int64 := 0;
-    if self.lcbsBpfDataOff >= 0 { seccompOk := 1; bpfRules := self.lcbsBpfCount; }
-    if self.lcbsEnabled != 0 && self.lcbsLandlockHandled != 0 { landlockOk := 1; }
-    // Landlock-Regelanzahl: "/" (wenn fs-Caps vorhanden) + hw device-Pfade
-    if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
-    landlockRules := landlockRules + self.lcbsHwArgCount;
-    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount);
+    if self.lcbsCompatMode == 0 {  // WP-T14: Compat-Modus → alles inaktiv
+      if self.lcbsBpfDataOff >= 0 { seccompOk := 1; bpfRules := self.lcbsBpfCount; }
+      if self.lcbsEnabled != 0 && self.lcbsLandlockHandled != 0 { landlockOk := 1; }
+      if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
+      landlockRules := landlockRules + self.lcbsHwArgCount;
+    }
+    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount, self.lcbsWxActive);
 
     // --- Ausgabe ---
     EPrintStrLn("=== LCBS Security Audit =========================================="c);
@@ -8958,7 +9001,11 @@ pub type Codegen = class {
 
     // Runtime-Schutz
     EPrintStrLn("Runtime-Schutz:"c);
-    EPrintStrLn("  + W^X (RX-Code / RW-Daten getrennt)"c);
+    if self.lcbsWxActive != 0 {
+      EPrintStrLn("  + W^X (RX-Code / RW-Daten getrennt — zwei PT_LOAD)"c);
+    } else {
+      EPrintStrLn("  o W^X (nicht aktiv — Single PT_LOAD RWX)"c);
+    }
     EPrintStrLn("  + RELRO (kein GOT im statischen ELF; dynamisch: Compiler-Garantie)"c);
     EPrintStrLn("  o PIE  (nicht aktiv -- statisches ELF, kein ASLR)"c);
     if seccompOk != 0 {
@@ -8988,7 +9035,11 @@ pub type Codegen = class {
     EPrintInt(score);
     EPrintStrLn("/40  (PIE +0; max 45 mit Stack Canaries WP-18)"c);
     EPrintStrLn("  +10: Kein Klasse-3-Extern ohne system.unsafe.format_string"c);
-    EPrintStrLn("  + 5: W^X aktiv"c);
+    if self.lcbsWxActive != 0 {
+      EPrintStrLn("  + 5: W^X aktiv (zwei PT_LOAD: RX + RW)"c);
+    } else {
+      EPrintStrLn("  + 0: W^X fehlt (Single PT_LOAD RWX — WP-6 offen)"c);
+    }
     EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel)"c);
     EPrintStrLn("  + 0: PIE  (nicht implementiert)"c);
     if self.lcbsMissingGrants == 0 {
@@ -9030,9 +9081,21 @@ pub type Codegen = class {
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
     self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
     self.cg_genFile(head);
+    // WP-6: Pad code to 4096-byte boundary so data starts on a page boundary.
+    // This allows two PT_LOAD segments: RX (code) and RW (data), no overlap.
+    // Padding must happen BEFORE cg_patchAll() so all disp32 patches use
+    // the aligned codeLen as the code/data boundary offset.
+    var codePad: int64 := (4096 - (self.codeLen & 4095)) & 4095;
+    var pi: int64 := 0;
+    while pi < codePad {
+      self.cg_e8(0x00);  // zero-padding in dead code region
+      pi := pi + 1;
+    }
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
+    // WP-6: static ELF gets two PT_LOADs (RX+RW); dynamic ELF still RWX
+    if self.externCount == 0 { self.lcbsWxActive := 1; }
     self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
@@ -9153,7 +9216,7 @@ pub type Codegen = class {
     poke32(buf + 48, 0);             // e_flags
     poke16(buf + 52, 64);   // e_ehsize
     poke16(buf + 54, 56);   // e_phentsize
-    poke16(buf + 56, 1);    // e_phnum
+    poke16(buf + 56, 2);    // e_phnum — WP-6: two PT_LOAD (RX code + RW data)
     poke16(buf + 58, 64);   // e_shentsize
     poke16(buf + 60, 0);    // e_shnum
     poke16(buf + 62, 0);    // e_shstrndx
@@ -9170,24 +9233,34 @@ pub type Codegen = class {
       poke16(buf + 62, 2);                    // e_shstrndx = 2 (.shstrtab)
     }
 
-    // Program header (56 bytes at offset 64)
+    // WP-6: Two PT_LOAD headers for W^X separation.
+    // phdr1 (offset 64,  56 bytes): RX — ELF header + phdrs + code (page-aligned)
+    // phdr2 (offset 120, 56 bytes): RW — data only
+    var rxSize: int64 := CG_CODE_OFF + totalCode;  // headers + page-aligned code
+    var rwOff:  int64 := rxSize;                   // data starts right after
+    var rwVaddr: int64 := CG_ELF_BASE + rwOff;
+
+    // PT_LOAD #1: RX (read + execute) — code segment
     var ph: int64 := buf + CG_PHDR_OFF;
     poke32(ph,      1);              // p_type = PT_LOAD
-    poke32(ph + 4,  7);              // p_flags = PF_R|PF_W|PF_X
+    poke32(ph + 4,  5);              // p_flags = PF_R|PF_X
     poke64(ph + ELF64_PHDR_OFF_OFFSET, 0);
     poke64(ph + 16, CG_ELF_BASE);   // p_vaddr
     poke64(ph + 24, CG_ELF_BASE);   // p_paddr
-    if (self.debugMode != 0) {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, baseSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  baseSize);
-    } else if hasWatermark {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, baseSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  baseSize);
-    } else {
-      poke64(ph + ELF64_PHDR_OFF_FILESZ, fileSize);
-      poke64(ph + ELF64_PHDR_OFF_MEMSZ,  fileSize);
-    }
-    poke64(ph + ELF64_PHDR_OFF_ALIGN,  2097152);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, rxSize);
+    poke64(ph + ELF64_PHDR_OFF_MEMSZ,  rxSize);
+    poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // PT_LOAD #2: RW (read + write) — data segment
+    var ph2: int64 := buf + CG_PHDR_OFF + 56;
+    poke32(ph2,      1);             // p_type = PT_LOAD
+    poke32(ph2 + 4,  6);             // p_flags = PF_R|PF_W
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, rwOff);
+    poke64(ph2 + 16, rwVaddr);       // p_vaddr
+    poke64(ph2 + 24, rwVaddr);       // p_paddr
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, totalData);
+    poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  totalData);
+    poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  4096);
 
     // Copy code
     var i: int64 := 0;
