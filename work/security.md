@@ -542,12 +542,17 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/backend/arm64/` |
-| **Aufwand** | 2–3 Tage |
+| **Dateien** | `src/backend/arm64/emit_arm64.lyx`, `src/lyxc.lyx` |
+| **Aufwand** | — |
 | **Priorität** | 🔵 Niedrig |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt (bereits in `feat/dynlink-v2`) |
 
-**Referenz:** `todo.md` – offene PLT/GOT-Bugs im ARM64-Backend.
+**Befund:** Die PLT/GOT-Bugs aus der ursprünglichen Security-Analyse waren bereits in Branch `feat/dynlink-v2` behoben (vor diesem Fahrplan):
+- [x] SIGBUS bei PLT/GOT-basiertem Dynamic Linking — X16-Register-Kollision behoben via X17 (`emit_arm64.lyx`: `emitCallExtern` nutzt X17 statt X16)
+- [x] `R_AARCH64_GLOB_DAT`-Relocations korrekt in `writeELFExecDynamic` (`src/lyxc.lyx:2340`)
+- [x] Float-Codegen (NEON) — behoben via format_float builtin
+
+**Offener Punkt (nicht Teil von WP-19):** Beide ARM64-ELF-Writer (`writeELF` Z. 2500 und `writeELFExecDynamic` Z. 2340) setzen `PT_LOAD p_flags = 7 (RWX)` — parallele W^X-Lücke zu WP-6 auf x86-64. Kein PIE/ASLR. Diese Punkte sind ARM64-Äquivalente von WP-6 und sollten dort mitbehandelt oder als WP-6b geführt werden.
 
 ---
 
@@ -739,8 +744,8 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 15 | Constant-Time Crypto | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 16 | gen_lic_secret.py sicherer | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
 | 17 | Annotationen dokumentieren (inkl. LCBS) | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
-| 18 | Stack-Canaries | ⬜ | – | – | – | 🔵 |
-| 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – | 🔵 |
+| 18 | Stack-Canaries | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🔵 |
+| 19 | ARM64-Dynamic-Linking-Bugs | ✅ bereits in feat/dynlink-v2 | – | – | – | 🔵 |
 | 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – | 🟡 |
 | 21 | Debug-Datei entfernen | ⬜ | – | – | – | 🔵 |
 | 22 | Security-Tests im CI (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
