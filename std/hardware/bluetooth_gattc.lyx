@@ -1,0 +1,429 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_gattc.lyx
+//
+// WP-6: GATT-Client (Generic Attribute Profile)
+//
+// GATT ist die Abstraktion über ATT (WP-4). Der Client entdeckt Services
+// und Charakteristiken, liest und schreibt Werte und abonniert Notifications.
+//
+// Ablauf:
+//   fd := L2CapConnect(bdaddr, BT_PSM_ATT, BDADDR_LE_PUBLIC)   // WP-4
+//   AttExchangeMtu(fd, 517)                                      // WP-4
+//
+//   // Service Discovery
+//   var svcBuf: int64 := alloc(GATT_SVC_RECORD_SIZE * 32);
+//   var svcCount := GattDiscoverServices(fd, svcBuf, 32);
+//
+//   // Char Discovery für einen Service
+//   var charBuf: int64 := alloc(GATT_CHAR_RECORD_SIZE * 64);
+//   var charCount := GattDiscoverChars(fd, startHandle, endHandle, charBuf, 64);
+//
+//   var hrIdx := GattFindCharByUUID(charBuf, charCount, GATT_UUID_HR_MEASUREMENT);
+//   var hrHandle := GattCharValue(charBuf, hrIdx);
+//
+//   // Enable Notifications und Daten lesen
+//   var cccdHandle := hrHandle + 1;           // üblich: CCCD = value_handle + 1
+//   GattEnableNotification(fd, cccdHandle);
+//   // ... Notification-Schleife ...
+//   var flags: int64 := 0; var bpm: int64 := 0;
+//   ReadHeartRate(fd, hrHandle, flagsAddr, bpmAddr);
+
+unit std.hardware.bluetooth_gattc;
+
+import std.hardware.bluetooth_l2cap;
+import std.alloc;
+
+// ============================================================================
+// Standard-GATT-UUIDs (16-Bit, Bluetooth-SIG)
+// ============================================================================
+
+pub con GATT_UUID_PRIMARY_SERVICE:   int64 := 0x2800;
+pub con GATT_UUID_SECONDARY_SERVICE: int64 := 0x2801;
+pub con GATT_UUID_CHARACTERISTIC:    int64 := 0x2803;  // Declaration
+pub con GATT_UUID_CCCD:              int64 := 0x2902;  // Client Char Config
+pub con GATT_UUID_SCCD:              int64 := 0x2903;  // Server Char Config
+pub con GATT_UUID_CHAR_FORMAT:       int64 := 0x2904;  // Presentation Format
+
+// Bekannte Service-UUIDs
+pub con GATT_SVC_GENERIC_ACCESS:     int64 := 0x1800;
+pub con GATT_SVC_GENERIC_ATTRIBUTE:  int64 := 0x1801;
+pub con GATT_SVC_HEART_RATE:         int64 := 0x180D;
+pub con GATT_SVC_BATTERY:            int64 := 0x180F;
+pub con GATT_SVC_DEVICE_INFO:        int64 := 0x180A;
+pub con GATT_SVC_CURRENT_TIME:       int64 := 0x1805;
+
+// Bekannte Charakteristik-UUIDs
+pub con GATT_UUID_DEVICE_NAME:       int64 := 0x2A00;
+pub con GATT_UUID_APPEARANCE:        int64 := 0x2A01;
+pub con GATT_UUID_HR_MEASUREMENT:    int64 := 0x2A37;
+pub con GATT_UUID_HR_BODY_LOCATION:  int64 := 0x2A38;
+pub con GATT_UUID_HR_CTRL_POINT:     int64 := 0x2A39;
+pub con GATT_UUID_BATTERY_LEVEL:     int64 := 0x2A19;
+pub con GATT_UUID_FIRMWARE_REV:      int64 := 0x2A26;
+pub con GATT_UUID_MODEL_NUMBER:      int64 := 0x2A24;
+
+// ============================================================================
+// Charakteristik-Eigenschafts-Flags (Byte 1 der Characteristic Declaration)
+// ============================================================================
+
+pub con GATT_PROP_BROADCAST:    int64 := 1;
+pub con GATT_PROP_READ:         int64 := 2;
+pub con GATT_PROP_WRITE_NO_RSP: int64 := 4;   // Write Command
+pub con GATT_PROP_WRITE:        int64 := 8;   // Write Request
+pub con GATT_PROP_NOTIFY:       int64 := 16;
+pub con GATT_PROP_INDICATE:     int64 := 32;
+pub con GATT_PROP_AUTH:         int64 := 64;
+pub con GATT_PROP_EXT_PROPS:    int64 := 128;
+
+// ============================================================================
+// Record-Layouts für Discovery-Ergebnisse (Raw-Buffer, nicht Lyx-Struct)
+//
+// GATT_SVC_RECORD_SIZE  = 8 Bytes:
+//   [0-1] start_handle (uint16 LE)
+//   [2-3] end_handle   (uint16 LE)
+//   [4-5] uuid         (uint16 LE)
+//   [6-7] padding
+//
+// GATT_CHAR_RECORD_SIZE = 8 Bytes:
+//   [0-1] decl_handle  (uint16 LE) — Handle der Characteristic Declaration
+//   [2-3] value_handle (uint16 LE) — Handle des Characteristic Value
+//   [4-5] uuid         (uint16 LE)
+//   [6]   properties   (uint8)
+//   [7]   padding
+// ============================================================================
+
+pub con GATT_SVC_RECORD_SIZE:  int64 := 8;
+pub con GATT_CHAR_RECORD_SIZE: int64 := 8;
+
+// Accessoren für Service-Records
+pub fn GattSvcStart(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_SVC_RECORD_SIZE;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+pub fn GattSvcEnd(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_SVC_RECORD_SIZE + 2;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+pub fn GattSvcUUID(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_SVC_RECORD_SIZE + 4;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+
+// Accessoren für Charakteristik-Records
+pub fn GattCharDecl(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_CHAR_RECORD_SIZE;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+pub fn GattCharValue(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_CHAR_RECORD_SIZE + 2;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+pub fn GattCharUUID(buf: int64, idx: int64): int64 {
+  var r: int64 := buf + idx * GATT_CHAR_RECORD_SIZE + 4;
+  return peek8(r) | (peek8(r + 1) << 8);
+}
+pub fn GattCharProps(buf: int64, idx: int64): int64 {
+  return peek8(buf + idx * GATT_CHAR_RECORD_SIZE + 6);
+}
+
+// ============================================================================
+// Interne Helfer: ATT-Discovery-Pakete senden
+// ============================================================================
+
+// ATT_READ_BY_GROUP_TYPE_REQ: [opcode:1][start:2][end:2][uuid:2]
+fn _gatt_send_by_group(fd: int64, startHandle: int64, uuid: int64): int64 {
+  var pkt: int64 := alloc(7);
+  if (pkt == 0) { return -1; }
+  poke8(pkt, ATT_OP_READ_BY_GROUP_TYPE_REQ);
+  poke8(pkt + 1, startHandle & 0xFF);
+  poke8(pkt + 2, (startHandle >> 8) & 0xFF);
+  poke8(pkt + 3, 0xFF);  // end handle = 0xFFFF
+  poke8(pkt + 4, 0xFF);
+  poke8(pkt + 5, uuid & 0xFF);
+  poke8(pkt + 6, (uuid >> 8) & 0xFF);
+  var ret: int64 := sys_sendto(fd, pkt, 7, 0, 0, 0);
+  free(pkt, 7);
+  return ret;
+}
+
+// ATT_READ_BY_TYPE_REQ: [opcode:1][start:2][end:2][uuid:2]
+fn _gatt_send_by_type(fd: int64, startHandle: int64, endHandle: int64, uuid: int64): int64 {
+  var pkt: int64 := alloc(7);
+  if (pkt == 0) { return -1; }
+  poke8(pkt, ATT_OP_READ_BY_TYPE_REQ);
+  poke8(pkt + 1, startHandle & 0xFF);
+  poke8(pkt + 2, (startHandle >> 8) & 0xFF);
+  poke8(pkt + 3, endHandle & 0xFF);
+  poke8(pkt + 4, (endHandle >> 8) & 0xFF);
+  poke8(pkt + 5, uuid & 0xFF);
+  poke8(pkt + 6, (uuid >> 8) & 0xFF);
+  var ret: int64 := sys_sendto(fd, pkt, 7, 0, 0, 0);
+  free(pkt, 7);
+  return ret;
+}
+
+// ============================================================================
+// WP-6 Abnahmekriterium 1: GattDiscoverServices
+//
+// Sendet READ_BY_GROUP_TYPE_REQ für Primary Services (0x2800) in einer Schleife,
+// bis alle Services entdeckt wurden oder maxServices erreicht ist.
+//
+// outBuf:      Puffer für GATT_SVC_RECORD_SIZE × maxServices Bytes
+// maxServices: max. Anzahl speicherbarer Services
+// Rückgabe:    Anzahl gefundener Services
+// ============================================================================
+pub fn GattDiscoverServices(fd: int64, outBuf: int64, maxServices: int64): int64 {
+  var count: int64 := 0;
+  var startHandle: int64 := 1;
+  var recvBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (recvBuf == 0) { return 0; }
+
+  while (startHandle <= 0xFFFF && count < maxServices) {
+    if (_gatt_send_by_group(fd, startHandle, GATT_UUID_PRIMARY_SERVICE) < 0) { break; }
+
+    var n: int64 := sys_recvfrom(fd, recvBuf, ATT_DEFAULT_MTU, 0, 0, 0);
+    if (n < 2) { break; }
+
+    var opcode: int64 := peek8(recvBuf);
+    if (opcode == ATT_OP_ERROR_RSP) { break; }
+    if (opcode != ATT_OP_READ_BY_GROUP_TYPE_RSP) { break; }
+
+    var itemLen: int64 := peek8(recvBuf + 1);
+    if (itemLen < 6) { break; }
+
+    var pos: int64 := 2;
+    var lastEnd: int64 := startHandle;
+    while (pos + itemLen <= n && count < maxServices) {
+      var svcStart: int64 := peek8(recvBuf+pos)   | (peek8(recvBuf+pos+1) << 8);
+      var svcEnd:   int64 := peek8(recvBuf+pos+2) | (peek8(recvBuf+pos+3) << 8);
+      var svcUUID:  int64 := peek8(recvBuf+pos+4) | (peek8(recvBuf+pos+5) << 8);
+      var rec: int64 := outBuf + count * GATT_SVC_RECORD_SIZE;
+      poke8(rec,     svcStart & 0xFF); poke8(rec + 1, (svcStart >> 8) & 0xFF);
+      poke8(rec + 2, svcEnd   & 0xFF); poke8(rec + 3, (svcEnd   >> 8) & 0xFF);
+      poke8(rec + 4, svcUUID  & 0xFF); poke8(rec + 5, (svcUUID  >> 8) & 0xFF);
+      poke8(rec + 6, 0); poke8(rec + 7, 0);
+      count := count + 1;
+      lastEnd := svcEnd;
+      pos := pos + itemLen;
+    }
+
+    if (lastEnd >= 0xFFFF) { break; }
+    startHandle := lastEnd + 1;
+  }
+
+  free(recvBuf, ATT_DEFAULT_MTU);
+  return count;
+}
+
+// ============================================================================
+// GattDiscoverChars — Charakteristiken eines Services entdecken
+//
+// Sendet READ_BY_TYPE_REQ für Characteristic Declarations (0x2803).
+//
+// startHandle, endHandle: Handlebereich des Services (aus GattSvcStart/End)
+// outBuf:   Puffer für GATT_CHAR_RECORD_SIZE × maxChars Bytes
+// maxChars: max. Anzahl speicherbarer Charakteristiken
+// Rückgabe: Anzahl gefundener Charakteristiken
+// ============================================================================
+pub fn GattDiscoverChars(fd: int64, startHandle: int64, endHandle: int64,
+                          outBuf: int64, maxChars: int64): int64 {
+  var count: int64 := 0;
+  var curStart: int64 := startHandle;
+  var recvBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (recvBuf == 0) { return 0; }
+
+  while (curStart <= endHandle && count < maxChars) {
+    if (_gatt_send_by_type(fd, curStart, endHandle, GATT_UUID_CHARACTERISTIC) < 0) { break; }
+
+    var n: int64 := sys_recvfrom(fd, recvBuf, ATT_DEFAULT_MTU, 0, 0, 0);
+    if (n < 2) { break; }
+
+    var opcode: int64 := peek8(recvBuf);
+    if (opcode == ATT_OP_ERROR_RSP) { break; }
+    if (opcode != ATT_OP_READ_BY_TYPE_RSP) { break; }
+
+    // itemLen: 7 for 16-bit UUID declarations (handle:2 + props:1 + value_handle:2 + uuid:2)
+    var itemLen: int64 := peek8(recvBuf + 1);
+    if (itemLen < 7) { break; }
+
+    var pos: int64 := 2;
+    var lastDecl: int64 := curStart;
+    while (pos + itemLen <= n && count < maxChars) {
+      var declH:  int64 := peek8(recvBuf+pos)   | (peek8(recvBuf+pos+1) << 8);
+      var props:  int64 := peek8(recvBuf+pos+2);
+      var valueH: int64 := peek8(recvBuf+pos+3) | (peek8(recvBuf+pos+4) << 8);
+      var uuid:   int64 := peek8(recvBuf+pos+5) | (peek8(recvBuf+pos+6) << 8);
+      var rec: int64 := outBuf + count * GATT_CHAR_RECORD_SIZE;
+      poke8(rec,     declH  & 0xFF); poke8(rec + 1, (declH  >> 8) & 0xFF);
+      poke8(rec + 2, valueH & 0xFF); poke8(rec + 3, (valueH >> 8) & 0xFF);
+      poke8(rec + 4, uuid   & 0xFF); poke8(rec + 5, (uuid   >> 8) & 0xFF);
+      poke8(rec + 6, props & 0xFF);
+      poke8(rec + 7, 0);
+      count := count + 1;
+      lastDecl := declH;
+      pos := pos + itemLen;
+    }
+
+    if (lastDecl >= endHandle) { break; }
+    curStart := lastDecl + 1;
+  }
+
+  free(recvBuf, ATT_DEFAULT_MTU);
+  return count;
+}
+
+// ============================================================================
+// GattFindCharByUUID — Charakteristik nach UUID suchen
+//
+// Rückgabe: Index in charBuf (0..charCount-1) oder -1 wenn nicht gefunden
+// ============================================================================
+pub fn GattFindCharByUUID(charBuf: int64, charCount: int64, uuid: int64): int64 {
+  var i: int64 := 0;
+  while (i < charCount) {
+    if (GattCharUUID(charBuf, i) == uuid) { return i; }
+    i := i + 1;
+  }
+  return -1;
+}
+
+// GattFindServiceByUUID — Service nach UUID suchen
+pub fn GattFindServiceByUUID(svcBuf: int64, svcCount: int64, uuid: int64): int64 {
+  var i: int64 := 0;
+  while (i < svcCount) {
+    if (GattSvcUUID(svcBuf, i) == uuid) { return i; }
+    i := i + 1;
+  }
+  return -1;
+}
+
+// ============================================================================
+// WP-6 Abnahmekriterium 2: GattReadChar
+// Delegiert an AttReadChar (WP-4)
+// ============================================================================
+pub fn GattReadChar(fd: int64, valueHandle: int64, dataBuf: int64, bufLen: int64): int64 {
+  return AttReadChar(fd, valueHandle, dataBuf, bufLen);
+}
+
+// ============================================================================
+// WP-6 Abnahmekriterium 3: GattWriteChar
+// Delegiert an AttWriteChar (WP-4)
+// ============================================================================
+pub fn GattWriteChar(fd: int64, valueHandle: int64, data: int64, dataLen: int64): int64 {
+  return AttWriteChar(fd, valueHandle, data, dataLen);
+}
+
+pub fn GattWriteCmd(fd: int64, valueHandle: int64, data: int64, dataLen: int64): int64 {
+  return AttWriteCmd(fd, valueHandle, data, dataLen);
+}
+
+// ============================================================================
+// WP-6 Abnahmekriterium 4: GattEnableNotification
+//
+// Schreibt 0x0001 in die CCCD (Client Characteristic Configuration Descriptor).
+// Danach sendet das Gerät ATT_HANDLE_VALUE_NTF-Pakete für diese Charakteristik.
+//
+// cccdHandle: Handle der CCCD (typisch = value_handle + 1, aber per
+//             GattDiscoverChars exakt zu bestimmen)
+// ============================================================================
+pub fn GattEnableNotification(fd: int64, cccdHandle: int64): int64 {
+  var cccd: int64 := alloc(2);
+  if (cccd == 0) { return -1; }
+  poke8(cccd,     1);   // CCCD: Bit 0 = Notifications
+  poke8(cccd + 1, 0);
+  var ret: int64 := AttWriteChar(fd, cccdHandle, cccd, 2);
+  free(cccd, 2);
+  return ret;
+}
+
+pub fn GattDisableNotification(fd: int64, cccdHandle: int64): int64 {
+  var cccd: int64 := alloc(2);
+  if (cccd == 0) { return -1; }
+  poke8(cccd, 0); poke8(cccd + 1, 0);
+  var ret: int64 := AttWriteChar(fd, cccdHandle, cccd, 2);
+  free(cccd, 2);
+  return ret;
+}
+
+pub fn GattEnableIndication(fd: int64, cccdHandle: int64): int64 {
+  var cccd: int64 := alloc(2);
+  if (cccd == 0) { return -1; }
+  poke8(cccd,     2);   // CCCD: Bit 1 = Indications
+  poke8(cccd + 1, 0);
+  var ret: int64 := AttWriteChar(fd, cccdHandle, cccd, 2);
+  free(cccd, 2);
+  return ret;
+}
+
+// ============================================================================
+// GattRecvNotification — Notification/Indication empfangen
+// Delegiert an AttRecvNotification (WP-4)
+// handleOut: Zeiger auf int64 für empfangenen Handle (0 = ignorieren)
+// ============================================================================
+pub fn GattRecvNotification(fd: int64, handleOut: int64,
+                             dataBuf: int64, bufLen: int64): int64 {
+  return AttRecvNotification(fd, handleOut, dataBuf, bufLen);
+}
+
+// ============================================================================
+// GattPoll — auf ATT-Paket warten
+// Delegiert an L2CapPoll (WP-4)
+// ============================================================================
+pub fn GattPoll(fd: int64, timeoutMs: int64): int64 {
+  return L2CapPoll(fd, timeoutMs);
+}
+
+// ============================================================================
+// WP-6 Abnahmekriterium 5: ReadHeartRate
+//
+// Liest die Heart Rate Measurement Charakteristik (0x2A37) und parst
+// das Messwertformat gemäß Bluetooth Heart Rate Profile Spec.
+//
+// Paket-Format:
+//   Byte 0: Flags
+//     Bit 0: HR-Format (0 = uint8, 1 = uint16)
+//     Bit 3: Energy Expended vorhanden
+//     Bit 4: RR-Intervall vorhanden
+//   Byte 1:   HR-Wert (uint8) wenn Bit 0 = 0
+//   Byte 1-2: HR-Wert (uint16 LE) wenn Bit 0 = 1
+//
+// flagsOut: Zeiger auf int64 für Flags-Byte (0 = ignorieren)
+// bpmOut:   Zeiger auf int64 für Herzfrequenz in BPM (0 = ignorieren)
+// Rückgabe: 1 = OK, 0 = Fehler
+// ============================================================================
+pub fn ReadHeartRate(fd: int64, hrHandle: int64,
+                     flagsOut: int64, bpmOut: int64): int64 {
+  var dataBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (dataBuf == 0) { return 0; }
+
+  var n: int64 := AttReadChar(fd, hrHandle, dataBuf, ATT_DEFAULT_MTU);
+  if (n < 2) { free(dataBuf, ATT_DEFAULT_MTU); return 0; }
+
+  var flags: int64 := peek8(dataBuf);
+  if (flagsOut != 0) { poke64(flagsOut, flags); }
+
+  var bpm: int64 := 0;
+  if ((flags & 1) == 0) {
+    bpm := peek8(dataBuf + 1);           // uint8-Format
+  } else {
+    if (n < 3) { free(dataBuf, ATT_DEFAULT_MTU); return 0; }
+    bpm := peek8(dataBuf + 1) | (peek8(dataBuf + 2) << 8);  // uint16 LE
+  }
+  if (bpmOut != 0) { poke64(bpmOut, bpm); }
+
+  free(dataBuf, ATT_DEFAULT_MTU);
+  return 1;
+}
+
+// ============================================================================
+// ReadBatteryLevel — Battery Level Charakteristik lesen (0x2A19)
+//
+// Rückgabe: Akkustand 0..100 (%), -1 bei Fehler
+// ============================================================================
+pub fn ReadBatteryLevel(fd: int64, battHandle: int64): int64 {
+  var buf: int64 := alloc(4);
+  if (buf == 0) { return -1; }
+  var n: int64 := AttReadChar(fd, battHandle, buf, 4);
+  var level: int64 := -1;
+  if (n >= 1) { level := peek8(buf) & 0xFF; }
+  free(buf, 4);
+  return level;
+}
