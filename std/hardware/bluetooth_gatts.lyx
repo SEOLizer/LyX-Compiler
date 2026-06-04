@@ -1,0 +1,744 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_gatts.lyx
+//
+// WP-7: GATT-Server (eigene BLE-Services anbieten)
+//
+// BlueZ erwartet die Profil-Registrierung vollständig über D-Bus:
+//   1. RegisterApplication bei org.bluez.GattManager1
+//   2. BlueZ ruft GetManagedObjects auf unserem Anwendungsobjekt auf
+//   3. BlueZ ruft ReadValue / WriteValue / StartNotify / StopNotify auf
+//      unseren Charakteristik-Objekten auf
+//   4. Notifications: wir senden org.freedesktop.DBus.Properties.PropertiesChanged
+//
+// Anwendungs-Pfade (Konvention):
+//   App-Root:    /com/lyx/gatt
+//   Service0:    /com/lyx/gatt/service0
+//   Char0:       /com/lyx/gatt/service0/char0
+//   Char1:       /com/lyx/gatt/service0/char1
+//
+// GATT-Charakteristik-Definitionen werden in einem Raw-Buffer übergeben
+// (GATTS_CHAR_DEF_SIZE Bytes pro Eintrag).
+
+unit std.hardware.bluetooth_gatts;
+
+import std.hardware.bluetooth_dbus;
+import std.hardware.bluetooth_gattc;
+import std.alloc;
+
+// ============================================================================
+// Konfigurationsstruktur: Charakteristik-Definition (GATTS_CHAR_DEF_SIZE Bytes)
+//
+//   offset  0: uuid       (int64 — 16-Bit-UUID in unteren 16 Bits)
+//   offset  8: properties (int64 — GATT_PROP_* Flags aus bluetooth_gattc)
+//   offset 16: value_ptr  (int64 — Zeiger auf aktuellen Wert, wird von ReadValue/WriteValue genutzt)
+//   offset 24: value_len  (int64 — Länge des Werts in Bytes, max. 20)
+// ============================================================================
+
+pub con GATTS_CHAR_DEF_SIZE: int64 := 32;
+
+pub fn GattsCharDefUUID(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * GATTS_CHAR_DEF_SIZE);
+}
+pub fn GattsCharDefProps(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * GATTS_CHAR_DEF_SIZE + 8);
+}
+pub fn GattsCharDefValuePtr(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * GATTS_CHAR_DEF_SIZE + 16);
+}
+pub fn GattsCharDefValueLen(buf: int64, idx: int64): int64 {
+  return peek64(buf + idx * GATTS_CHAR_DEF_SIZE + 24);
+}
+pub fn GattsCharDefSetValue(buf: int64, idx: int64, ptr: int64, len: int64) {
+  poke64(buf + idx * GATTS_CHAR_DEF_SIZE + 16, ptr);
+  poke64(buf + idx * GATTS_CHAR_DEF_SIZE + 24, len);
+}
+
+// ============================================================================
+// D-Bus-Serialisierungs-Helfer
+// Alle schreiben nach buf+pos und geben neue pos zurück.
+// ============================================================================
+
+// uint32 LE schreiben
+fn _gs_w32(buf: int64, pos: int64, v: int64): int64 {
+  poke8(buf+pos,   v & 0xFF);
+  poke8(buf+pos+1, (v >> 8)  & 0xFF);
+  poke8(buf+pos+2, (v >> 16) & 0xFF);
+  poke8(buf+pos+3, (v >> 24) & 0xFF);
+  return pos + 4;
+}
+
+// Auf 4-Byte-Grenze auffüllen
+fn _gs_align4(buf: int64, pos: int64): int64 {
+  var aligned: int64 := (pos + 3) & (0 - 4);
+  while (pos < aligned) { poke8(buf + pos, 0); pos := pos + 1; }
+  return aligned;
+}
+
+// Auf 8-Byte-Grenze auffüllen
+fn _gs_align8(buf: int64, pos: int64): int64 {
+  var aligned: int64 := (pos + 7) & (0 - 8);
+  while (pos < aligned) { poke8(buf + pos, 0); pos := pos + 1; }
+  return aligned;
+}
+
+// D-Bus-String schreiben: [uint32 len][bytes][NUL]
+fn _gs_write_str(buf: int64, pos: int64, s: int64, slen: int64): int64 {
+  pos := _gs_align4(buf, pos);
+  pos := _gs_w32(buf, pos, slen);
+  var i: int64 := 0;
+  while (i < slen) { poke8(buf+pos+i, peek8(s+i)); i := i + 1; }
+  pos := pos + slen;
+  poke8(buf + pos, 0); pos := pos + 1;
+  return pos;
+}
+
+// D-Bus-Signatur schreiben: [byte len][bytes][NUL]
+fn _gs_write_sig(buf: int64, pos: int64, s: int64, slen: int64): int64 {
+  poke8(buf + pos, slen); pos := pos + 1;
+  var i: int64 := 0;
+  while (i < slen) { poke8(buf+pos+i, peek8(s+i)); i := i + 1; }
+  pos := pos + slen;
+  poke8(buf + pos, 0); pos := pos + 1;
+  return pos;
+}
+
+// D-Bus-Byte-Array: [uint32 len][bytes]
+fn _gs_write_bytes(buf: int64, pos: int64, data: int64, dlen: int64): int64 {
+  pos := _gs_align4(buf, pos);
+  pos := _gs_w32(buf, pos, dlen);
+  var i: int64 := 0;
+  while (i < dlen) { poke8(buf+pos+i, peek8(data+i)); i := i + 1; }
+  return pos + dlen;
+}
+
+// 16-Bit-UUID → 128-Bit-String: "0000XXXX-0000-1000-8000-00805f9b34fb\0" (37 Bytes)
+fn _gs_uuid16_str(uuid: int64, outBuf: int64) {
+  // Hex-Nibbles
+  var h: array[4]int64;
+  h[0] := (uuid >> 12) & 0xF;
+  h[1] := (uuid >> 8)  & 0xF;
+  h[2] := (uuid >> 4)  & 0xF;
+  h[3] :=  uuid        & 0xF;
+  fn nib(n: int64): int64 { if (n < 10) { return n+48; } return n+55; }
+  // "0000" prefix
+  poke8(outBuf+ 0,48);poke8(outBuf+ 1,48);poke8(outBuf+ 2,48);poke8(outBuf+ 3,48);
+  // XXXX (our UUID)
+  poke8(outBuf+ 4, nib(h[0]));
+  poke8(outBuf+ 5, nib(h[1]));
+  poke8(outBuf+ 6, nib(h[2]));
+  poke8(outBuf+ 7, nib(h[3]));
+  // "-0000-1000-8000-00805f9b34fb"
+  poke8(outBuf+ 8,45); // '-'
+  poke8(outBuf+ 9,48);poke8(outBuf+10,48);poke8(outBuf+11,48);poke8(outBuf+12,48);
+  poke8(outBuf+13,45);
+  poke8(outBuf+14,49);poke8(outBuf+15,48);poke8(outBuf+16,48);poke8(outBuf+17,48);
+  poke8(outBuf+18,45);
+  poke8(outBuf+19,56);poke8(outBuf+20,48);poke8(outBuf+21,48);poke8(outBuf+22,48);
+  poke8(outBuf+23,45);
+  poke8(outBuf+24,48);poke8(outBuf+25,48);poke8(outBuf+26,56);poke8(outBuf+27,48);
+  poke8(outBuf+28,53);poke8(outBuf+29,102);poke8(outBuf+30,57);poke8(outBuf+31,98);
+  poke8(outBuf+32,51);poke8(outBuf+33,52);poke8(outBuf+34,102);poke8(outBuf+35,98);
+  poke8(outBuf+36,0); // NUL
+}
+
+// ============================================================================
+// GetManagedObjects-Response-Body bauen
+//
+// Erzeugt den D-Bus-Body vom Typ a{oa{sa{sv}}} für:
+//   /com/lyx/gatt/service0   → org.bluez.GattService1  {UUID, Primary}
+//   /com/lyx/gatt/service0/charN → org.bluez.GattCharacteristic1 {UUID, Service, Flags}
+//
+// charDefs:  GATTS_CHAR_DEF_SIZE × charCount Byte-Buffer (UUIDs, Props)
+// charCount: Anzahl Charakteristiken
+// svcUUID:   16-Bit-Service-UUID
+// outBuf:    Puffer für den Body (empfohlen: 4096 Bytes)
+// Rückgabe:  Body-Länge in Bytes
+// ============================================================================
+fn _gs_build_managed_objects(outBuf: int64, svcUUID: int64,
+                              charDefs: int64, charCount: int64): int64 {
+  var p: int64 := 0;
+
+  // Äußeres Array a{oa{sa{sv}}}: uint32 Array-Länge (wird am Ende eingetragen)
+  var arrLenOff: int64 := p;
+  p := _gs_w32(outBuf, p, 0);   // Platzhalter
+
+  // Für 8-Byte-Struct-Alignment der dict-Entries
+  p := _gs_align8(outBuf, p);
+  var dataStart: int64 := p;
+
+  // UUID-Puffer
+  var uuidBuf: int64 := alloc(40);
+  if (uuidBuf == 0) { return 0; }
+
+  // Strings für die bekannten D-Bus-Interfaces
+  var svcIface:  int64 := "org.bluez.GattService1"c    as int64;
+  var charIface: int64 := "org.bluez.GattCharacteristic1"c as int64;
+  var svcPath:   int64 := "/com/lyx/gatt/service0"c    as int64;
+
+  // ── Eintrag 1: /com/lyx/gatt/service0 ──────────────────────────────────
+  // Object path
+  p := _gs_write_str(outBuf, p, svcPath, 22);
+  p := _gs_align8(outBuf, p);
+
+  // a{sa{sv}} Interface-Dict:  1 Eintrag: "org.bluez.GattService1"
+  var ifaceArrOff: int64 := p;
+  p := _gs_w32(outBuf, p, 0);  // Platzhalter Länge
+  p := _gs_align8(outBuf, p);
+  var ifaceDataStart: int64 := p;
+
+  // Interface-Name "org.bluez.GattService1"
+  p := _gs_write_str(outBuf, p, svcIface, 22);
+  p := _gs_align8(outBuf, p);
+
+  // a{sv} Properties-Dict für Service: UUID (string) + Primary (bool)
+  var propArrOff: int64 := p;
+  p := _gs_w32(outBuf, p, 0);
+  p := _gs_align8(outBuf, p);
+  var propStart: int64 := p;
+
+  // "UUID" → variant 's'
+  p := _gs_write_str(outBuf, p, "UUID"c as int64, 4);
+  p := _gs_align8(outBuf, p);
+  _gs_uuid16_str(svcUUID, uuidBuf);
+  var sigS: int64 := "s"c as int64;
+  p := _gs_write_sig(outBuf, p, sigS, 1);
+  p := _gs_write_str(outBuf, p, uuidBuf, 36);
+  p := _gs_align8(outBuf, p);
+
+  // "Primary" → variant 'b' = true (4 bytes uint32 = 1)
+  p := _gs_write_str(outBuf, p, "Primary"c as int64, 7);
+  p := _gs_align8(outBuf, p);
+  var sigB: int64 := "b"c as int64;
+  p := _gs_write_sig(outBuf, p, sigB, 1);
+  p := _gs_align4(outBuf, p);
+  p := _gs_w32(outBuf, p, 1);    // true
+
+  // Props-Array-Länge nachtragen
+  var propLen: int64 := p - propStart;
+  poke8(outBuf + propArrOff,     propLen & 0xFF);
+  poke8(outBuf + propArrOff + 1, (propLen >> 8) & 0xFF);
+  poke8(outBuf + propArrOff + 2, 0);
+  poke8(outBuf + propArrOff + 3, 0);
+
+  // Interface-Dict-Länge nachtragen
+  var ifLen: int64 := p - ifaceDataStart;
+  poke8(outBuf + ifaceArrOff,     ifLen & 0xFF);
+  poke8(outBuf + ifaceArrOff + 1, (ifLen >> 8) & 0xFF);
+  poke8(outBuf + ifaceArrOff + 2, 0);
+  poke8(outBuf + ifaceArrOff + 3, 0);
+
+  p := _gs_align8(outBuf, p);
+
+  // ── Einträge 2..N: Charakteristiken ─────────────────────────────────────
+  var ci: int64 := 0;
+  while (ci < charCount) {
+    var charUUID: int64 := GattsCharDefUUID(charDefs, ci);
+    var charProps: int64 := GattsCharDefProps(charDefs, ci);
+
+    // Char-Pfad: "/com/lyx/gatt/service0/charN" (max. Einstelligkeit)
+    var charPathBuf: int64 := alloc(36);
+    if (charPathBuf == 0) { break; }
+    // Basis kopieren: "/com/lyx/gatt/service0/char"
+    var basePath: int64 := "/com/lyx/gatt/service0/char"c as int64;
+    var bi: int64 := 0;
+    while (bi < 27) { poke8(charPathBuf+bi, peek8(basePath+bi)); bi := bi + 1; }
+    poke8(charPathBuf + 27, 48 + ci);  // '0'..'9'
+    poke8(charPathBuf + 28, 0);
+    var charPathLen: int64 := 28;
+
+    // Char-Objekt-Eintrag
+    p := _gs_write_str(outBuf, p, charPathBuf, charPathLen);
+    free(charPathBuf, 36);
+    p := _gs_align8(outBuf, p);
+
+    // Interface-Dict für Char
+    var cIfArrOff: int64 := p;
+    p := _gs_w32(outBuf, p, 0);
+    p := _gs_align8(outBuf, p);
+    var cIfStart: int64 := p;
+
+    p := _gs_write_str(outBuf, p, charIface, 29);
+    p := _gs_align8(outBuf, p);
+
+    // Char-Props-Dict
+    var cPropOff: int64 := p;
+    p := _gs_w32(outBuf, p, 0);
+    p := _gs_align8(outBuf, p);
+    var cPropStart: int64 := p;
+
+    // "UUID"
+    p := _gs_write_str(outBuf, p, "UUID"c as int64, 4);
+    p := _gs_align8(outBuf, p);
+    _gs_uuid16_str(charUUID, uuidBuf);
+    p := _gs_write_sig(outBuf, p, sigS, 1);
+    p := _gs_write_str(outBuf, p, uuidBuf, 36);
+    p := _gs_align8(outBuf, p);
+
+    // "Service"
+    p := _gs_write_str(outBuf, p, "Service"c as int64, 7);
+    p := _gs_align8(outBuf, p);
+    var sigO: int64 := "o"c as int64;
+    p := _gs_write_sig(outBuf, p, sigO, 1);
+    p := _gs_write_str(outBuf, p, svcPath, 22);
+    p := _gs_align8(outBuf, p);
+
+    // "Flags" als as (array of strings) — vereinfacht: ein Flag "notify" oder "read"
+    // (vollständiges Parsing der GATT_PROP_* Flags wäre deutlich aufwändiger)
+    p := _gs_write_str(outBuf, p, "Flags"c as int64, 5);
+    p := _gs_align8(outBuf, p);
+    var sigAS: int64 := "as"c as int64;
+    p := _gs_write_sig(outBuf, p, sigAS, 2);
+    p := _gs_align4(outBuf, p);
+    var flagsArrOff: int64 := p;
+    p := _gs_w32(outBuf, p, 0);  // Platzhalter
+    var flagsStart: int64 := p;
+    if ((charProps & GATT_PROP_READ) != 0) {
+      p := _gs_write_str(outBuf, p, "read"c as int64, 4);
+    }
+    if ((charProps & GATT_PROP_WRITE) != 0) {
+      p := _gs_write_str(outBuf, p, "write"c as int64, 5);
+    }
+    if ((charProps & GATT_PROP_WRITE_NO_RSP) != 0) {
+      p := _gs_write_str(outBuf, p, "write-without-response"c as int64, 22);
+    }
+    if ((charProps & GATT_PROP_NOTIFY) != 0) {
+      p := _gs_write_str(outBuf, p, "notify"c as int64, 6);
+    }
+    if ((charProps & GATT_PROP_INDICATE) != 0) {
+      p := _gs_write_str(outBuf, p, "indicate"c as int64, 8);
+    }
+    var flagsLen: int64 := p - flagsStart;
+    poke8(outBuf+flagsArrOff, flagsLen & 0xFF);
+    poke8(outBuf+flagsArrOff+1, (flagsLen >> 8) & 0xFF);
+    poke8(outBuf+flagsArrOff+2, 0); poke8(outBuf+flagsArrOff+3, 0);
+
+    // Char-Props-Dict-Länge
+    var cPropLen: int64 := p - cPropStart;
+    poke8(outBuf+cPropOff, cPropLen & 0xFF);
+    poke8(outBuf+cPropOff+1, (cPropLen >> 8) & 0xFF);
+    poke8(outBuf+cPropOff+2, 0); poke8(outBuf+cPropOff+3, 0);
+
+    // Char-Interface-Dict-Länge
+    var cIfLen: int64 := p - cIfStart;
+    poke8(outBuf+cIfArrOff, cIfLen & 0xFF);
+    poke8(outBuf+cIfArrOff+1, (cIfLen >> 8) & 0xFF);
+    poke8(outBuf+cIfArrOff+2, 0); poke8(outBuf+cIfArrOff+3, 0);
+
+    p := _gs_align8(outBuf, p);
+    ci := ci + 1;
+  }
+
+  free(uuidBuf, 40);
+
+  // Äußere Array-Länge nachtragen
+  var totalArrLen: int64 := p - dataStart;
+  poke8(outBuf+arrLenOff, totalArrLen & 0xFF);
+  poke8(outBuf+arrLenOff+1, (totalArrLen >> 8) & 0xFF);
+  poke8(outBuf+arrLenOff+2, 0); poke8(outBuf+arrLenOff+3, 0);
+
+  return p;
+}
+
+// ============================================================================
+// D-Bus METHOD_RETURN senden
+// ============================================================================
+fn _gs_send_method_return(fd: int64, replySerial: int64,
+                          body: int64, bodyLen: int64,
+                          sig: int64, sigLen: int64): int64 {
+  var hdrBuf: int64 := alloc(256);
+  if (hdrBuf == 0) { return -1; }
+
+  // Fixed header
+  poke8(hdrBuf + 0, 108);   // 'l' little-endian
+  poke8(hdrBuf + 1, DBUS_TYPE_METHOD_RETURN);
+  poke8(hdrBuf + 2, DBUS_FLAG_NO_REPLY);
+  poke8(hdrBuf + 3, 1);     // version
+
+  // body length
+  poke8(hdrBuf + 4, bodyLen & 0xFF);
+  poke8(hdrBuf + 5, (bodyLen >> 8) & 0xFF);
+  poke8(hdrBuf + 6, 0); poke8(hdrBuf + 7, 0);
+
+  // serial (reuse 100 for server replies)
+  poke8(hdrBuf + 8, 100); poke8(hdrBuf + 9, 0);
+  poke8(hdrBuf + 10, 0); poke8(hdrBuf + 11, 0);
+
+  // Header fields: REPLY_SERIAL + optionally SIGNATURE
+  var p: int64 := 16;   // fields start
+
+  // REPLY_SERIAL (uint32)
+  p := _gs_align8(hdrBuf, p);
+  poke8(hdrBuf+p, DBUS_HDR_REPLY_SERIAL); poke8(hdrBuf+p+1, 1);
+  poke8(hdrBuf+p+2, 117); poke8(hdrBuf+p+3, 0);  // 'u' = uint32
+  p := p + 4;
+  p := _gs_align4(hdrBuf, p);
+  p := _gs_w32(hdrBuf, p, replySerial);
+
+  if (bodyLen > 0 && sigLen > 0) {
+    p := _gs_align8(hdrBuf, p);
+    poke8(hdrBuf+p, DBUS_HDR_SIGNATURE); poke8(hdrBuf+p+1, 1);
+    poke8(hdrBuf+p+2, 103); poke8(hdrBuf+p+3, 0);  // 'g' = signature
+    p := p + 4;
+    p := _gs_write_sig(hdrBuf, p, sig, sigLen);
+  }
+
+  // Array-Länge der Header-Felder
+  var fieldsLen: int64 := p - 16;
+  poke8(hdrBuf+12, fieldsLen & 0xFF);
+  poke8(hdrBuf+13, (fieldsLen >> 8) & 0xFF);
+  poke8(hdrBuf+14, 0); poke8(hdrBuf+15, 0);
+
+  // Padding für Body
+  p := _gs_align8(hdrBuf, p);
+  var hdrLen: int64 := p;
+
+  // Sende Header + Body
+  sys_write(fd, hdrBuf, hdrLen);
+  free(hdrBuf, 256);
+
+  if (bodyLen > 0) { sys_write(fd, body, bodyLen); }
+  return 0;
+}
+
+// ============================================================================
+// WP-7 Abnahmekriterium 1: GattServerRegister
+//
+// Sendet RegisterApplication an org.bluez.GattManager1.
+// Das Body-Argument: object_path + leerer a{sv}-Dict.
+//
+// dbusFd:       D-Bus-FD aus BlueZOpenConnection (WP-5)
+// adapterPath:  z.B. "/org/bluez/hci0"c as int64
+// pathLen:      Länge des adapterPath
+// Rückgabe: 0 = OK (METHOD_RETURN empfangen), -1 = Fehler
+// ============================================================================
+pub fn GattServerRegister(dbusFd: int64,
+                          adapterPath: int64, pathLen: int64): int64 {
+  // Body: object_path 'o' "/com/lyx/gatt" + a{sv} leeres Dict
+  var bodyBuf: int64 := alloc(128);
+  if (bodyBuf == 0) { return -1; }
+
+  var p: int64 := 0;
+  // Signatur des Body: "oa{sv}"
+  // object path
+  p := _gs_write_str(bodyBuf, p, "/com/lyx/gatt"c as int64, 13);
+  // empty dict a{sv}: uint32 length = 0
+  p := _gs_align4(bodyBuf, p);
+  p := _gs_w32(bodyBuf, p, 0);
+  var bodyLen: int64 := p;
+
+  // Method-Call bauen (mit Body)
+  var msgBuf: int64 := alloc(512);
+  if (msgBuf == 0) { free(bodyBuf, 128); return -1; }
+
+  // fixed header
+  poke8(msgBuf+0, 108);
+  poke8(msgBuf+1, DBUS_TYPE_METHOD_CALL);
+  poke8(msgBuf+2, 0);
+  poke8(msgBuf+3, 1);
+  poke8(msgBuf+4, bodyLen & 0xFF);
+  poke8(msgBuf+5, (bodyLen >> 8) & 0xFF);
+  poke8(msgBuf+6, 0); poke8(msgBuf+7, 0);
+  poke8(msgBuf+8, 10); poke8(msgBuf+9, 0);  // serial = 10
+  poke8(msgBuf+10, 0); poke8(msgBuf+11, 0);
+
+  var hp: int64 := 16;
+  var dest:   int64 := "org.bluez"c                as int64;
+  var iface:  int64 := "org.bluez.GattManager1"c   as int64;
+  var member: int64 := "RegisterApplication"c      as int64;
+  var sigV:   int64 := "oa{sv}"c                   as int64;
+
+  // PATH
+  poke8(msgBuf+hp, DBUS_HDR_PATH); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,111); poke8(msgBuf+hp+3,0);
+  hp := hp + 4;
+  hp := _gs_align4(msgBuf, hp);
+  hp := _gs_write_str(msgBuf, hp, adapterPath, pathLen);
+  hp := _gs_align8(msgBuf, hp);
+  // INTERFACE
+  poke8(msgBuf+hp, DBUS_HDR_INTERFACE); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,115); poke8(msgBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(msgBuf, hp);
+  hp := _gs_write_str(msgBuf, hp, iface, 22);
+  hp := _gs_align8(msgBuf, hp);
+  // MEMBER
+  poke8(msgBuf+hp, DBUS_HDR_MEMBER); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,115); poke8(msgBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(msgBuf, hp);
+  hp := _gs_write_str(msgBuf, hp, member, 19);
+  hp := _gs_align8(msgBuf, hp);
+  // DESTINATION
+  poke8(msgBuf+hp, DBUS_HDR_DESTINATION); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,115); poke8(msgBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(msgBuf, hp);
+  hp := _gs_write_str(msgBuf, hp, dest, 9);
+  hp := _gs_align8(msgBuf, hp);
+  // SIGNATURE
+  poke8(msgBuf+hp, DBUS_HDR_SIGNATURE); poke8(msgBuf+hp+1,1); poke8(msgBuf+hp+2,103); poke8(msgBuf+hp+3,0);
+  hp := hp + 4;
+  hp := _gs_write_sig(msgBuf, hp, sigV, 6);
+  hp := _gs_align8(msgBuf, hp);
+
+  // Header-Felder-Länge
+  var fieldsLen: int64 := hp - 16;
+  poke8(msgBuf+12, fieldsLen & 0xFF); poke8(msgBuf+13, (fieldsLen >> 8) & 0xFF);
+  poke8(msgBuf+14, 0); poke8(msgBuf+15, 0);
+
+  // Sende Header + Body
+  sys_write(dbusFd, msgBuf, hp);
+  sys_write(dbusFd, bodyBuf, bodyLen);
+  free(msgBuf, 512);
+  free(bodyBuf, 128);
+
+  // Empfange Antwort
+  var rspBuf: int64 := alloc(256);
+  if (rspBuf == 0) { return -1; }
+  var n: int64 := sys_read(dbusFd, rspBuf, 256);
+  var result: int64 := -1;
+  if (n >= 2 && peek8(rspBuf + 1) == DBUS_TYPE_METHOD_RETURN) { result := 0; }
+  free(rspBuf, 256);
+  return result;
+}
+
+// ============================================================================
+// GattServerHandleNext — Ein D-Bus-Methodenaufruf von BlueZ verarbeiten
+//
+// Liest den nächsten eingehenden Aufruf und reagiert:
+//   GetManagedObjects → antwortet mit Service-/Char-Hierarchie
+//   ReadValue         → antwortet mit aktuellem Charakteristik-Wert
+//   WriteValue        → schreibt in charDefs.value_ptr
+//   StartNotify       → gibt 1 zurück (Notification aktiviert)
+//   StopNotify        → gibt 2 zurück (Notification deaktiviert)
+//
+// charDefs:  Definitionsbuffer (GATTS_CHAR_DEF_SIZE × charCount)
+// charCount: Anzahl Charakteristiken
+// svcUUID:   16-Bit-Service-UUID
+// Rückgabe:  0 = GetManagedObjects, 1 = Read, 2 = Write, 3 = StartNotify,
+//            4 = StopNotify, -1 = Fehler/Unbekannt
+// ============================================================================
+pub fn GattServerHandleNext(fd: int64, svcUUID: int64,
+                             charDefs: int64, charCount: int64): int64 {
+  var recvBuf: int64 := alloc(4096);
+  if (recvBuf == 0) { return -1; }
+  var n: int64 := sys_read(fd, recvBuf, 4095);
+  if (n < 16) { free(recvBuf, 4096); return -1; }
+
+  var msgType: int64 := peek8(recvBuf + 1);
+  var serial:  int64 := peek8(recvBuf+8) | (peek8(recvBuf+9) << 8) |
+                        (peek8(recvBuf+10) << 16) | (peek8(recvBuf+11) << 24);
+
+  var result: int64 := -1;
+
+  if (msgType == DBUS_TYPE_METHOD_CALL) {
+    // Member-Name aus Header-Feldern suchen (Heuristik: Byte-Suche nach ASCII)
+    // "GetManagedObjects" (17), "ReadValue" (9), "WriteValue" (10),
+    // "StartNotify" (11), "StopNotify" (10)
+    var found: int64 := 0;
+
+    // GetManagedObjects?
+    var i: int64 := 16;
+    while (i < n - 17 && found == 0) {
+      if (peek8(recvBuf+i)==71 && peek8(recvBuf+i+1)==101 &&
+          peek8(recvBuf+i+2)==116 && peek8(recvBuf+i+3)==77) {
+        // "GetM..." — likely GetManagedObjects
+        var bodyBuf: int64 := alloc(4096);
+        if (bodyBuf != 0) {
+          var bodyLen: int64 := _gs_build_managed_objects(bodyBuf, svcUUID, charDefs, charCount);
+          var sig: int64 := "a{oa{sa{sv}}}"c as int64;
+          _gs_send_method_return(fd, serial, bodyBuf, bodyLen, sig, 13);
+          free(bodyBuf, 4096);
+        }
+        result := 0; found := 1;
+      }
+      i := i + 1;
+    }
+
+    // ReadValue?
+    i := 16;
+    while (i < n - 9 && found == 0) {
+      if (peek8(recvBuf+i)==82 && peek8(recvBuf+i+1)==101 &&
+          peek8(recvBuf+i+2)==97 && peek8(recvBuf+i+3)==100 &&
+          peek8(recvBuf+i+4)==86) {
+        // "ReadV..." — ReadValue
+        // Antworte mit Wert von char0 (vereinfacht: erstes Char)
+        var vptr: int64 := GattsCharDefValuePtr(charDefs, 0);
+        var vlen: int64 := GattsCharDefValueLen(charDefs, 0);
+        if (vptr != 0 && vlen > 0) {
+          // Body: ay (byte array) mit dem Wert
+          var rspBody: int64 := alloc(vlen + 8);
+          if (rspBody != 0) {
+            var bp: int64 := 0;
+            bp := _gs_w32(rspBody, bp, vlen);
+            var vi: int64 := 0;
+            while (vi < vlen) { poke8(rspBody+bp+vi, peek8(vptr+vi)); vi := vi + 1; }
+            bp := bp + vlen;
+            var sigAY: int64 := "ay"c as int64;
+            _gs_send_method_return(fd, serial, rspBody, bp, sigAY, 2);
+            free(rspBody, vlen + 8);
+          }
+        } else {
+          // Leere Antwort
+          _gs_send_method_return(fd, serial, 0, 0, 0, 0);
+        }
+        result := 1; found := 1;
+      }
+      i := i + 1;
+    }
+
+    // WriteValue?
+    i := 16;
+    while (i < n - 10 && found == 0) {
+      if (peek8(recvBuf+i)==87 && peek8(recvBuf+i+1)==114 &&
+          peek8(recvBuf+i+2)==105 && peek8(recvBuf+i+3)==116 &&
+          peek8(recvBuf+i+4)==101 && peek8(recvBuf+i+5)==86) {
+        // "WriteV..." — WriteValue
+        // Body enthält ay-Daten; einfaches Schreiben in char0
+        var vptr: int64 := GattsCharDefValuePtr(charDefs, 0);
+        if (vptr != 0) {
+          // Suche ay-Daten im Body (nach Header-Ende)
+          var hdrFieldsLen: int64 := peek8(recvBuf+12) | (peek8(recvBuf+13) << 8);
+          var bodyOff: int64 := (16 + hdrFieldsLen + 7) & (0 - 8);
+          if (bodyOff + 4 <= n) {
+            var dataLen: int64 := peek8(recvBuf+bodyOff) | (peek8(recvBuf+bodyOff+1) << 8) |
+                                  (peek8(recvBuf+bodyOff+2) << 16) | (peek8(recvBuf+bodyOff+3) << 24);
+            var maxLen: int64 := GattsCharDefValueLen(charDefs, 0);
+            if (dataLen > maxLen) { dataLen := maxLen; }
+            var di: int64 := 0;
+            while (di < dataLen && bodyOff + 4 + di < n) {
+              poke8(vptr + di, peek8(recvBuf + bodyOff + 4 + di));
+              di := di + 1;
+            }
+          }
+        }
+        _gs_send_method_return(fd, serial, 0, 0, 0, 0);
+        result := 2; found := 1;
+      }
+      i := i + 1;
+    }
+
+    // StartNotify?
+    i := 16;
+    while (i < n - 11 && found == 0) {
+      if (peek8(recvBuf+i)==83 && peek8(recvBuf+i+1)==116 &&
+          peek8(recvBuf+i+2)==97 && peek8(recvBuf+i+3)==114 &&
+          peek8(recvBuf+i+4)==116 && peek8(recvBuf+i+5)==78) {
+        _gs_send_method_return(fd, serial, 0, 0, 0, 0);
+        result := 3; found := 1;
+      }
+      i := i + 1;
+    }
+
+    // StopNotify?
+    i := 16;
+    while (i < n - 10 && found == 0) {
+      if (peek8(recvBuf+i)==83 && peek8(recvBuf+i+1)==116 &&
+          peek8(recvBuf+i+2)==111 && peek8(recvBuf+i+3)==112 &&
+          peek8(recvBuf+i+4)==78) {
+        _gs_send_method_return(fd, serial, 0, 0, 0, 0);
+        result := 4; found := 1;
+      }
+      i := i + 1;
+    }
+  }
+
+  free(recvBuf, 4096);
+  return result;
+}
+
+// ============================================================================
+// WP-7 Abnahmekriterium 3: GattServerSendNotification
+//
+// Sendet org.freedesktop.DBus.Properties.PropertiesChanged (SIGNAL)
+// mit geändertem "Value"-Property an alle verbundenen Clients.
+// BlueZ leitet dieses Signal als GATT-Notification weiter.
+//
+// charPath/pathLen: D-Bus-Pfad der Charakteristik
+//                  z.B. "/com/lyx/gatt/service0/char0"c as int64
+// data/dataLen:    zu sendende Nutzdaten (max. ATT_MAX_PAYLOAD = 22 Bytes)
+// ============================================================================
+pub fn GattServerSendNotification(fd: int64,
+                                   charPath: int64, pathLen: int64,
+                                   data: int64, dataLen: int64): int64 {
+  if (dataLen > ATT_MAX_PAYLOAD) { dataLen := ATT_MAX_PAYLOAD; }
+
+  // Body: sa{sv}as  (interface_name, changed_properties, invalidated_properties)
+  // Interface: "org.bluez.GattCharacteristic1"
+  // Changed: {"Value": variant('ay', data)}
+  // Invalidated: []
+  var bodyBuf: int64 := alloc(256);
+  if (bodyBuf == 0) { return -1; }
+  var p: int64 := 0;
+
+  // interface name (string)
+  var ifname: int64 := "org.bluez.GattCharacteristic1"c as int64;
+  p := _gs_write_str(bodyBuf, p, ifname, 29);
+  p := _gs_align8(bodyBuf, p);
+
+  // a{sv} changed properties: {"Value": variant('ay', data)}
+  var dictOff: int64 := p;
+  p := _gs_w32(bodyBuf, p, 0);
+  p := _gs_align8(bodyBuf, p);
+  var dictStart: int64 := p;
+
+  p := _gs_write_str(bodyBuf, p, "Value"c as int64, 5);
+  p := _gs_align8(bodyBuf, p);
+  // Variant: signature 'ay' + byte array
+  var sigAY: int64 := "ay"c as int64;
+  p := _gs_write_sig(bodyBuf, p, sigAY, 2);
+  p := _gs_write_bytes(bodyBuf, p, data, dataLen);
+  p := _gs_align8(bodyBuf, p);
+
+  var dictLen: int64 := p - dictStart;
+  poke8(bodyBuf+dictOff, dictLen & 0xFF);
+  poke8(bodyBuf+dictOff+1, (dictLen >> 8) & 0xFF);
+  poke8(bodyBuf+dictOff+2, 0); poke8(bodyBuf+dictOff+3, 0);
+
+  // as invalidated (empty)
+  p := _gs_align4(bodyBuf, p);
+  p := _gs_w32(bodyBuf, p, 0);
+
+  var bodyLen: int64 := p;
+
+  // Signal-Header bauen
+  var hdrBuf: int64 := alloc(512);
+  if (hdrBuf == 0) { free(bodyBuf, 256); return -1; }
+
+  poke8(hdrBuf+0, 108);
+  poke8(hdrBuf+1, DBUS_TYPE_SIGNAL);
+  poke8(hdrBuf+2, DBUS_FLAG_NO_REPLY);
+  poke8(hdrBuf+3, 1);
+  poke8(hdrBuf+4, bodyLen & 0xFF); poke8(hdrBuf+5, (bodyLen >> 8) & 0xFF);
+  poke8(hdrBuf+6, 0); poke8(hdrBuf+7, 0);
+  poke8(hdrBuf+8, 101); poke8(hdrBuf+9, 0);  // serial = 101
+  poke8(hdrBuf+10, 0); poke8(hdrBuf+11, 0);
+
+  var hp: int64 := 16;
+  var propIface: int64 := "org.freedesktop.DBus.Properties"c as int64;
+  var propMember: int64 := "PropertiesChanged"c               as int64;
+  var sigBody:    int64 := "sa{sv}as"c                        as int64;
+
+  // PATH
+  poke8(hdrBuf+hp,DBUS_HDR_PATH);poke8(hdrBuf+hp+1,1);poke8(hdrBuf+hp+2,111);poke8(hdrBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(hdrBuf, hp);
+  hp := _gs_write_str(hdrBuf, hp, charPath, pathLen);
+  hp := _gs_align8(hdrBuf, hp);
+  // INTERFACE
+  poke8(hdrBuf+hp,DBUS_HDR_INTERFACE);poke8(hdrBuf+hp+1,1);poke8(hdrBuf+hp+2,115);poke8(hdrBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(hdrBuf, hp);
+  hp := _gs_write_str(hdrBuf, hp, propIface, 31);
+  hp := _gs_align8(hdrBuf, hp);
+  // MEMBER
+  poke8(hdrBuf+hp,DBUS_HDR_MEMBER);poke8(hdrBuf+hp+1,1);poke8(hdrBuf+hp+2,115);poke8(hdrBuf+hp+3,0);
+  hp := hp + 4; hp := _gs_align4(hdrBuf, hp);
+  hp := _gs_write_str(hdrBuf, hp, propMember, 17);
+  hp := _gs_align8(hdrBuf, hp);
+  // SIGNATURE
+  poke8(hdrBuf+hp,DBUS_HDR_SIGNATURE);poke8(hdrBuf+hp+1,1);poke8(hdrBuf+hp+2,103);poke8(hdrBuf+hp+3,0);
+  hp := hp + 4;
+  hp := _gs_write_sig(hdrBuf, hp, sigBody, 8);
+  hp := _gs_align8(hdrBuf, hp);
+
+  var fieldsLen: int64 := hp - 16;
+  poke8(hdrBuf+12, fieldsLen & 0xFF); poke8(hdrBuf+13, (fieldsLen >> 8) & 0xFF);
+  poke8(hdrBuf+14, 0); poke8(hdrBuf+15, 0);
+
+  sys_write(fd, hdrBuf, hp);
+  sys_write(fd, bodyBuf, bodyLen);
+  free(hdrBuf, 512);
+  free(bodyBuf, 256);
+  return 0;
+}
