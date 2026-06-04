@@ -8,16 +8,17 @@
 
 LCBS ist das Sicherheitsmodell von Lyx. Es setzt das **Zero-Privilege-Prinzip** um:
 
-> Ein kompiliertes Lyx-Programm besitzt standardmäßig **keinerlei Rechte**.
-> Ressourcen werden ausschließlich durch explizite Deklarationen freigeschaltet.
+> Ein Lyx-Programm besitzt standardmäßig **keinerlei Rechte**.
+> Alle Ressourcenzugriffe müssen im Quellcode explizit deklariert werden.
 
-Drei Durchsetzungsschichten arbeiten zusammen:
+Der Compiler erzwingt diese Deklarationen auf zwei Ebenen:
 
-| Schicht | Zeitpunkt | Mechanismus |
-|---------|-----------|-------------|
-| Sprache | Compile-Zeit | `@capabilities`-Annotation, Grant-Validierung |
-| FFI | Compile-Zeit | Signatur-Klassifizierung, Blacklist |
-| Runtime | Prozessstart | seccomp-BPF + Landlock vor `main()` |
+| Ebene | Zeitpunkt | Was wird geprüft |
+|-------|-----------|-----------------|
+| Sprache | Compile-Zeit | `@capabilities`-Annotation, Grant-Validierung, `@uses_caller_cap`-Aufrufstellen |
+| Runtime | Prozessstart | Kernel-seitige Durchsetzung vor `main()` |
+
+Ein Programm ohne `@capabilities`-Annotation läuft ohne jede Einschränkung und bekommt einen niedrigen Security-Score.
 
 ---
 
@@ -34,26 +35,19 @@ fn main(): int64 {
 }
 ```
 
-Kein `@capabilities` → kein seccomp → kein Landlock. Läuft ohne Einschränkungen.
-
 ### 2.2 Programm mit Dateizugriff
 
 ```lyx
 @capabilities([fs.read])
 fn main(): int64 {
-  // Darf Dateien lesen; Schreiben ist blockiert (Landlock + seccomp)
+  // Darf Dateien lesen; Schreiben ist vollständig blockiert
   return 0;
 }
 ```
 
-Kompilieren:
 ```bash
 lyxc my_program.lyx -o my_program
 ```
-
-Der Compiler installiert automatisch:
-- seccomp: erlaubt `openat(O_RDONLY)` und `read`; blockiert `write` → SIGSYS
-- Landlock: erlaubt Lesezugriff auf `/` (Verzeichnisbaum); blockiert Schreibzugriff
 
 ### 2.3 Netzwerk + Hardware
 
@@ -74,76 +68,77 @@ fn main(): int64 {
 
 ### 3.1 Implizite Capabilities (immer aktiv, nicht deklarierbar)
 
-| Capability | Syscall | Begründung |
-|-----------|---------|-----------|
-| `system.exit` | `exit_group` | Jedes Programm muss sauber beenden können |
-| `system.memory.heap` | `brk`, `mmap(MAP_ANON)`, `munmap` | `alloc`/`free` benötigen diese Syscalls |
-| `system.memory.stack` | `mmap(MAP_STACK)` | Stack-Erweiterung bei tiefer Rekursion |
+Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `system.exit` | Sauberes Beenden des Prozesses |
+| `system.memory.heap` | Heap-Allokation (`alloc` / `free`) |
+| `system.memory.stack` | Stack-Erweiterung bei tiefer Rekursion |
 
 ### 3.2 Explizite Capabilities
 
 #### System
 
-| Capability | Syscall | Beschreibung |
-|-----------|---------|-------------|
-| `system.time` | `clock_gettime` | Systemzeit lesen |
-| `system.env` | *(Compile-Zeit-Filter)* | Umgebungsvariablen |
-| `system.rand` | `getrandom` | Kryptographisch sichere Zufallszahlen |
-| `system.unsafe.format_string` | *(none)* | Erlaubt Format-String-Funktionen (printf etc.) |
+| Capability | Beschreibung |
+|-----------|-------------|
+| `system.time` | Systemzeit lesen |
+| `system.env` | Umgebungsvariablen lesen (Compile-Zeit-Filter) |
+| `system.rand` | Kryptographisch sichere Zufallszahlen |
+| `system.unsafe.format_string` | Format-String-Funktionen (printf etc.) |
 
 #### Dateisystem
 
-| Capability | Syscall | Landlock |
-|-----------|---------|---------|
-| `fs.read` | `openat(O_RDONLY)`, `read` | READ_FILE, READ_DIR |
-| `fs.write` | `openat(O_WRONLY)`, `write` | WRITE_FILE |
-| `fs.create` | `openat(O_CREAT)` | MAKE_REG, MAKE_DIR |
-| `fs.delete` | `unlinkat`, `rmdir` | REMOVE_FILE, REMOVE_DIR |
-| `fs.meta` | `statx`, `getdents64` | READ_DIR |
-| `fs.exec` | `execveat` | EXECUTE |
+| Capability | Beschreibung |
+|-----------|-------------|
+| `fs.read` | Dateien und Verzeichnisse lesen |
+| `fs.write` | In Dateien schreiben |
+| `fs.create` | Neue Dateien und Verzeichnisse anlegen |
+| `fs.delete` | Dateien und Verzeichnisse löschen |
+| `fs.meta` | Metadaten lesen (stat, Verzeichnislisting) |
+| `fs.exec` | Ausführbare Dateien starten |
 
 #### Memory
 
-| Capability | Syscall | Beschreibung |
-|-----------|---------|-------------|
-| `memory.mmap` | `mmap(FILE\|SHARED)`, `mprotect` | Datei-Mappings |
-| `memory.lock` | `mlock`, `mlockall` | Seiten im RAM halten |
+| Capability | Beschreibung |
+|-----------|-------------|
+| `memory.mmap` | Datei-Mappings und gemeinsamer Speicher |
+| `memory.lock` | Seiten fest im RAM halten |
 
 #### Netzwerk
 
-| Capability | Syscall | Beschreibung |
-|-----------|---------|-------------|
-| `network.tcp.bind` | `bind`, `listen`, `accept` | TCP-Server |
-| `network.tcp.connect` | `socket`, `connect` | TCP-Client |
-| `network.udp.bind` | `bind`, `recvfrom` | UDP-Empfangen |
-| `network.udp.connect` | `sendto`, `connect` | UDP-Senden |
-| `network.unix` | `socket(AF_UNIX)` | Unix Domain Sockets |
-| `network.raw` | `socket(AF_PACKET)` | Raw Sockets (braucht CAP_NET_RAW) |
+| Capability | Beschreibung |
+|-----------|-------------|
+| `network.tcp.bind` | TCP-Server (bind, listen, accept) |
+| `network.tcp.connect` | TCP-Client (connect) |
+| `network.udp.bind` | UDP-Empfangen |
+| `network.udp.connect` | UDP-Senden |
+| `network.unix` | Unix Domain Sockets |
+| `network.raw` | Raw Sockets (erfordert `CAP_NET_RAW` des OS-Prozesses) |
 
 #### Hardware
 
-| Capability | Argument | Landlock-Pfad | Beschreibung |
-|-----------|---------|--------------|-------------|
-| `hardware.gpio` | `pin: N` | `/dev/gpiochip0` (Pins 0-31) oder `/dev/gpiochip1` (32-53) | GPIO-Pin |
+| Capability | Argument | Gerät | Beschreibung |
+|-----------|---------|-------|-------------|
+| `hardware.gpio` | `pin: N` | `/dev/gpiochipX` | GPIO-Pin |
 | `hardware.i2c` | `bus: N` | `/dev/i2c-N` | I2C-Bus |
 | `hardware.spi` | `bus: N, cs: M` | `/dev/spidevN.M` | SPI-Bus |
 | `hardware.usb` | *(keine)* | `/dev/bus/usb` | USB-Gerät |
 
 #### Prozess
 
-| Capability | Syscall | Beschreibung |
-|-----------|---------|-------------|
-| `process.fork` | `clone`, `fork` | Kindprozesse erzeugen |
-| `process.exec` | `execve`, `execveat` | Programme ausführen |
-| `process.signal` | `kill`, `tgkill` | Signale senden |
-| `process.sched` | `sched_setattr`, `nice` | Prozess-Priorität |
-| `process.exit` | `exit`, `exit_group` | *(redundant zu system.exit)* |
+| Capability | Beschreibung |
+|-----------|-------------|
+| `process.fork` | Kindprozesse erzeugen |
+| `process.exec` | Andere Programme ausführen |
+| `process.signal` | Signale an andere Prozesse senden |
+| `process.sched` | Prozess-Priorität ändern |
 
 ---
 
 ## 4. Capability-Argumente
 
-Viele Capabilities akzeptieren Parameter zur Feinsteuerung:
+Viele Capabilities akzeptieren Parameter zur Feinsteuerung des Zugriffs. Je präziser die Deklaration, desto höher der Security-Score.
 
 ```lyx
 @capabilities([
@@ -151,13 +146,15 @@ Viele Capabilities akzeptieren Parameter zur Feinsteuerung:
   hardware.gpio(pin: 23, direction: input, pull: up),
   hardware.i2c(bus: 1, address: 0x48),
   hardware.spi(bus: 0, cs: 0, speed: 1000000),
-  hardware.usb
+  hardware.usb,
+  fs.read(path: "/etc/config"),
+  fs.write(path: "/var/log")
 ])
 ```
 
-### Netzwerk-Adressierung
+### Netzwerk-Adressfilter
 
-Netzwerk-Capabilities können Zieladresse und Port einschränken:
+Netzwerk-Capabilities können auf bestimmte Zieladressen und Ports eingeschränkt werden:
 
 ```lyx
 @capabilities([
@@ -166,22 +163,21 @@ Netzwerk-Capabilities können Zieladresse und Port einschränken:
 ])
 ```
 
-> **Hinweis:** Die IP/Port-Filterung erfordert den Userspace-Proxy (automatisch aktiv).
+Verbindungsversuche zu nicht deklarierten Adressen oder Ports werden zur Laufzeit abgelehnt.
 
-### @fastpath — Proxy-Bypass
-
-Für latenzempfindliche Anwendungen kann der Proxy umgangen werden:
+### @fastpath — Proxy-Bypass für latenzempfindliche Pfade
 
 ```lyx
 @capabilities([
   network.udp.connect @fastpath
 ])
 fn highFreqPublisher(): void {
-  // Direkter UDP-Syscall, kein Proxy-Overhead
-  // Kein IP/Port-Filter auf LCBS-Ebene
-  // Security-Score: -3
+  // Direkter UDP-Syscall ohne Adress-/Port-Prüfung.
+  // Security-Score: -3 pro Nutzung
 }
 ```
+
+`@fastpath` deaktiviert den Adressfilter für diese Capability. Nur verwenden, wenn Latenz kritisch ist und die Zieladressen anderweitig kontrolliert werden.
 
 ---
 
@@ -189,15 +185,13 @@ fn highFreqPublisher(): void {
 
 ### 5.1 Das Prinzip
 
-Module erben Capabilities **nicht automatisch**. Stattdessen erhält ein importiertes Modul:
+Module erben Capabilities **nicht automatisch**. Ein importiertes Modul erhält:
 
 ```
 C(Modul) = C(Modul_deklariert) ∩ C(Eltermodul)
 ```
 
-Ohne explizites `grant`: das Modul bekommt nur, was es selbst deklariert hat **und** der Importierende besitzt.
-
-Mit `grant`: exakte Vergabe durch den Importierenden.
+Mit explizitem `grant` vergibt der Importierende genau die erlaubten Capabilities:
 
 ```lyx
 import
@@ -210,111 +204,62 @@ import
 
 | Situation | Regel | Effekt |
 |-----------|-------|--------|
-| Import ohne grant/restrict | `C(M) = C(M_decl) ∩ C(Parent)` | Deklariertes Minimum, gekappt auf Parent |
-| Import mit grant | `C(M) = grant_set ∩ C(Parent)` | Exakte Vergabe |
-| Import mit restrict | `C(M) = C(M_decl) ∩ C(Parent) ∩ restrict_set` | Zusätzliche Einschränkung |
+| Import ohne `grant`/`restrict` | `C(M) = C(M_decl) ∩ C(Parent)` | Deklariertes Minimum, gekappt auf Parent |
+| Import mit `grant` | `C(M) = grant_set ∩ C(Parent)` | Exakte Vergabe |
+| Import mit `restrict` | `C(M) = C(M_decl) ∩ C(Parent) ∩ restrict_set` | Zusätzliche Einschränkung |
 
 **Invariante:** `C(M) ⊆ C(Parent)` — kein Modul kann mehr Rechte haben als sein Importierender.
 
 ### 5.3 Fehlende Grants
 
-Fehlt ein `grant`, gibt der Compiler eine Warnung:
+Ein Import ohne explizites `grant` erzeugt eine Compiler-Warnung und reduziert den Security-Score:
 
 ```
 warning: Import ohne explizites grant — Security-Score -2
 ```
 
-Das Programm kompiliert trotzdem, aber der Security-Score wird reduziert.
+Das Programm kompiliert trotzdem. Für maximalen Score alle Imports mit `grant` versehen.
 
 ---
 
 ## 6. `@uses_caller_cap` — Capability-Leihe
 
-Wenn eine Bibliotheksfunktion Capabilities des **Aufrufers** benötigt (nicht eigene):
+Bibliotheksfunktionen, die Capabilities des **Aufrufers** benötigen (statt eigener), werden mit `@uses_caller_cap` annotiert:
 
 ```lyx
-// Im Bibliotheks-Modul flexible_logger:
+// In logging.lyx — das Modul selbst hat keine eigenen Capabilities
 @uses_caller_cap([fs.write])
-fn logToFile(path: pchar, msg: pchar): void {
-  // Benutzt fs.write — aber das Modul selbst hat fs.write nicht.
-  // Der AUFRUFER muss fs.write besitzen.
+fn logEvent(event: pchar): void {
+  // Benutzt fs.write des Aufrufers
 }
 ```
 
-**Semantik:**
-- Der Compiler prüft an jedem Aufruf-Site, ob der Aufrufer die geliehene Capability hat.
-- Aufruf ohne entsprechende Capability → Compile-Fehler.
-- Das Modul selbst hat `C(flexible_logger) = ∅`.
+Der Compiler prüft an jedem Aufruf-Site, ob der Aufrufer die geliehene Capability besitzt:
 
-**Beispiel — korrekter Aufruf:**
 ```lyx
-@capabilities([fs.write])
-fn saveLog(): void {
-  logToFile("/var/log/app.log"c, "started"c);  // OK: Aufrufer hat fs.write
+// Korrekter Aufruf:
+@capabilities([fs.write(path: "/var/log")])
+fn main(): int64 {
+  logEvent("app started"c);  // OK: Aufrufer hat fs.write
+  return 0;
 }
 ```
 
-**Beispiel — Fehler:**
 ```lyx
+// Fehler:
 @capabilities([fs.read])
 fn readAndLog(): void {
-  logToFile("/var/log/app.log"c, "started"c);  // FEHLER: Aufrufer hat nur fs.read
+  logEvent("started"c);  // FEHLER: Aufrufer hat nur fs.read, nicht fs.write
 }
 ```
 
----
-
-## 7. Runtime-Mechanismen
-
-### 7.1 Startup-Sequenz
-
-```
-_start / main():
-  1. Falls Netzwerk-Capabilities mit Proxy: fork() → Proxy-Prozess
-  2. Landlock-Regeln installieren  ← muss VOR seccomp sein
-  3. seccomp-BPF installieren
-  4. Benutzerprogramm main() ausführen
-```
-
-### 7.2 seccomp-BPF
-
-- Standardaktion: `SECCOMP_RET_KILL_PROCESS` (tötet sofort die gesamte Prozessgruppe)
-- Erlaubte Syscalls: exakt die deklarierten + implizite Capabilities
-- Kein SIGSYS-Handler möglich (KILL_PROCESS umgeht Signal-Handler)
-
-### 7.3 Landlock (Linux ≥ 5.13)
-
-Landlock filtert Pfadzugriffe im Kernel:
-- Für `fs.read`: `/`-Regel mit `READ_FILE|READ_DIR`
-- Für `fs.write`: `/`-Regel mit `WRITE_FILE`
-- Für Hardware: spezifische Device-Pfade (z. B. `/dev/gpiochip0`, `/dev/i2c-1`)
-- Fallback bei Kernel < 5.13: Warnung, nur seccomp aktiv
-
-Landlock muss **vor** seccomp installiert werden, da die Landlock-Syscalls (444/445/446) sonst blockiert würden.
-
-### 7.4 Userspace-Proxy (Netzwerk)
-
-Für IP/Port-Filterung (seccomp kann keine Adressen prüfen) startet der Compiler bei Netzwerk-Capabilities einen Proxy-Prozess:
-
-```
-+---[Hauptprogramm]---+       +---[Proxy]---+
-| fork+socketpair     |       | Eigener     |
-| Proxy-Fd gespeichert|<=====>| seccomp     |
-| Sendet Anfragen     |       | IP/Port-    |
-|                     |       | Whitelist   |
-+---------------------+       +-------------+
-```
-
-Der Proxy:
-- Installiert eigenen restriktiven seccomp (nur Netzwerk-Syscalls)
-- Validiert Verbindungsanfragen gegen die deklarierten Adressen/Ports
-- Beendet sich automatisch, wenn das Hauptprogramm endet (EOF auf socketpair)
+Das Modul `logging.lyx` selbst hat `C(logging) = ∅` — es besitzt keine eigenen Capabilities, nutzt aber die des Aufrufers.
 
 ---
 
-## 8. Klassen-Capabilities
+## 7. Klassen-Capabilities
 
-Capabilities können auf Klassen-Ebene deklariert werden:
+Capabilities können auf Klassen-Ebene deklariert werden und gelten dann für alle Instanzmethoden:
 
 ```lyx
 @capabilities([fs.write(path: "/var/log")])
@@ -340,9 +285,9 @@ class FileWriter {
 
 ---
 
-## 9. FFI-Klassifizierung
+## 8. Externe Funktionen (FFI)
 
-Externe Funktionen werden automatisch klassifiziert:
+Externe C-Funktionen werden automatisch in Sicherheitsklassen eingeteilt:
 
 | Klasse | Beschreibung | Beispiele |
 |--------|-------------|---------|
@@ -351,31 +296,32 @@ Externe Funktionen werden automatisch klassifiziert:
 | **2: Process** | Prozesssteuerung | `fork`, `kill` |
 | **3: Verboten** | Systemisch unsicher | `gets`, `system`, `sprintf`, `strcpy` |
 
-Klasse 3 wird abgelehnt, außer bei expliziter `@cap`-Annotation:
+Klasse-3-Funktionen lehnt der Compiler ab. Mit `@cap`-Annotation kann eine externe Funktion explizit einer Capability zugeordnet werden:
 
 ```lyx
 @cap(fs.write)
 extern fn fwrite(ptr: int64, size: int64, n: int64, f: int64): int64 link "libc.so.6";
 ```
 
-**Blacklist (Klasse 3, immer blockiert):**
-- `gets`, `system`, `popen`, `sprintf`, `vsprintf`
+**Immer blockiert (Klasse 3, keine Ausnahme):**
+- `gets`, `system`, `popen`
+- `sprintf`, `vsprintf`
 - `strcpy`, `strcat`, `wcscpy`, `wcscat`
 - `execve`, `execvp` (als direktes FFI — nur via `process.exec` erlaubt)
 
 ---
 
-## 10. CLI-Werkzeuge
+## 9. CLI-Werkzeuge
 
-### 10.1 `--migrate-capabilities`
+### 9.1 `--migrate-capabilities`
 
-Analysiert ein Lyx-Programm ohne `@capabilities` und generiert ein minimales Manifest:
+Analysiert ein bestehendes Lyx-Programm ohne `@capabilities` und generiert ein minimales Manifest als Ausgangspunkt:
 
 ```bash
 lyxc --migrate-capabilities my_program.lyx
 ```
 
-**Ausgabe:**
+**Beispielausgabe:**
 ```
 @capabilities([
   fs.read(path: "/etc/config"),
@@ -383,27 +329,27 @@ lyxc --migrate-capabilities my_program.lyx
 ])
 ```
 
-**Erkannte Funktionen:** `fopen`, `open`, `read`, `write`, `socket`, `connect`, `fork`, `getenv`, `ioctl` und viele mehr.
-
-**Dynamische Pfade** (nicht statisch analysierbar) erzeugen eine Warnung:
+Bei dynamisch konstruierten Pfaden erscheint:
 ```
 Warnung: Dynamisch konstruierte Pfade erkannt -- manuell ergaenzen
 ```
 
-### 10.2 `--capabilities=compat`
+Das erzeugte Manifest ist ein Startpunkt — Pfad-Argumente und Netzwerk-Adressen müssen manuell verfeinert werden.
 
-Kompiliert ein LCBS-Programm **ohne** seccomp/Landlock-Installation. Nützlich für die schrittweise Migration:
+### 9.2 `--capabilities=compat`
+
+Kompiliert ein LCBS-Programm ohne Kernel-Durchsetzung zur Laufzeit. Nützlich für schrittweise Migration:
 
 ```bash
 lyxc --capabilities=compat my_program.lyx -o my_program
 ```
 
-- `@capabilities` wird akzeptiert und validiert
-- Kein seccomp/Landlock zur Laufzeit
-- Der Security-Audit zeigt die fehlenden Mechanismen
-- Security-Score reduziert
+- `@capabilities` wird akzeptiert und syntaktisch validiert
+- Keine Kernel-seitige Durchsetzung zur Laufzeit
+- Security-Score wird reduziert
+- Der Security-Audit zeigt fehlende Schutzmechanismen
 
-### 10.3 `--self-test`
+### 9.3 `--self-test`
 
 Führt den LCBS-Integrationstest aus:
 
@@ -411,13 +357,9 @@ Führt den LCBS-Integrationstest aus:
 lyxc --self-test
 ```
 
-Der Selbsttest:
-1. Kompiliert Test-Programme mit verschiedenen LCBS-Capabilities
-2. Prüft BPF-Filter auf korrekte Syscall-Listen
-3. Führt die kompilierten Programme aus
-4. Meldet Ergebnis: `LCBS SELF-TEST: PASSED` oder `FAILED`
+Ergebnis: `LCBS SELF-TEST: PASSED` oder `FAILED`.
 
-### 10.4 Security-Audit
+### 9.4 Security-Audit
 
 Jeder Build gibt automatisch einen Audit-Report auf stderr aus:
 
@@ -427,8 +369,8 @@ Programm:          my_program.lyx
 Capability-Modell: Zero-Privilege (default deny), Grant-basiert
 
 Implizite Capabilities (immer aktiv):
-  o system.exit         -> exit_group
-  o system.memory.heap  -> brk, mmap(MAP_ANON)
+  o system.exit
+  o system.memory.heap
 
 Explizite Capabilities:
   + fs.read
@@ -442,31 +384,67 @@ Sicherheits-Score: 40/40
   + 5: W^X, + 5: RELRO, + 0: PIE
   +10: alle Imports mit grant
   + 5: seccomp, + 5: landlock
-  o: Stack Canaries (WP-18 offen)
 ==================================================================
 ```
 
 ---
 
-## 11. Security-Score
+## 10. Security-Score
 
-Der Score misst die Qualität des Sicherheitsmodells (aktuell max. 40):
+Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit optionalem Bonus):
 
 | Kriterium | Punkte | Bedingung |
 |-----------|--------|----------|
 | Kein Klasse-3-Extern | +10 | Build ohne FFI-Blacklist-Treffer |
-| W^X | +5 | Immer aktiv (generiertes ELF) |
+| W^X | +5 | Immer aktiv im generierten ELF |
 | RELRO | +5 | Immer aktiv (kein GOT im statischen ELF) |
 | PIE | +0 | Nicht implementiert (geplant) |
-| Grant-Vollständigkeit | +10 | Alle Imports mit explizitem `grant` (-2 pro fehlendem) |
-| seccomp | +5 | Bei aktivem LCBS |
-| landlock | +5 | Bei aktivem LCBS |
-| Stack Canaries | +5 Bonus | WP-18 (geplant) |
-| `@fastpath` | -3 | Pro Nutzung |
+| Grant-Vollständigkeit | +10 | Alle Imports mit explizitem `grant` (–2 pro fehlendem) |
+| seccomp | +5 | Bei aktivem LCBS (nicht `--capabilities=compat`) |
+| landlock | +5 | Bei aktivem LCBS (Kernel ≥ 5.13) |
+| Stack Canaries | +5 Bonus | Geplant |
+| `@fastpath` | –3 | Pro Nutzung |
 
 ---
 
-## 12. Beispiele
+## 11. Capability-Referenz (IDs)
+
+| ID | Capability | Domäne |
+|----|-----------|--------|
+| 0 | `system.exit` | Implizit |
+| 1 | `system.memory.heap` | Implizit |
+| 2 | `system.memory.stack` | Implizit |
+| 3 | `system.time` | System |
+| 4 | `system.env` | System |
+| 5 | `system.rand` | System |
+| 6 | `system.unsafe.format_string` | System |
+| 7 | `fs.read` | Dateisystem |
+| 8 | `fs.write` | Dateisystem |
+| 9 | `fs.create` | Dateisystem |
+| 10 | `fs.delete` | Dateisystem |
+| 11 | `fs.meta` | Dateisystem |
+| 12 | `fs.exec` | Dateisystem |
+| 13 | `memory.mmap` | Memory |
+| 14 | `memory.lock` | Memory |
+| 15 | `network.tcp.bind` | Netzwerk |
+| 16 | `network.tcp.connect` | Netzwerk |
+| 17 | `network.udp.bind` | Netzwerk |
+| 18 | `network.udp.connect` | Netzwerk |
+| 19 | `network.unix` | Netzwerk |
+| 20 | `network.raw` | Netzwerk |
+| 21 | `hardware.gpio` | Hardware |
+| 22 | `hardware.i2c` | Hardware |
+| 23 | `hardware.spi` | Hardware |
+| 24 | `hardware.usb` | Hardware |
+| 25 | `process.fork` | Prozess |
+| 26 | `process.exec` | Prozess |
+| 27 | `process.signal` | Prozess |
+| 28 | `process.sched` | Prozess |
+| 29 | `process.exit` | Prozess |
+
+---
+
+## 12. Vollständige Beispiele
 
 ### 12.1 Robot Controller
 
@@ -483,10 +461,10 @@ fn main(): int64 {
 }
 ```
 
-### 12.2 Modular mit Grant
+### 12.2 Modulares Programm mit Grant
 
 ```lyx
-// In robot_controller.lyx
+// robot_controller.lyx
 import
   std.hardware.gpio  grant [hardware.gpio(pin: 18)],
   std.net.udp        grant [network.udp.connect],
@@ -505,7 +483,7 @@ fn main(): int64 {
 ### 12.3 Logging-Bibliothek mit Capability-Leihe
 
 ```lyx
-// In logging.lyx — benötigt keine eigenen Capabilities
+// logging.lyx — keine eigenen Capabilities
 @uses_caller_cap([fs.write])
 fn logEvent(event: pchar): void {
   // Der Aufrufer stellt fs.write bereit
@@ -513,7 +491,7 @@ fn logEvent(event: pchar): void {
 ```
 
 ```lyx
-// In app.lyx
+// app.lyx
 @capabilities([fs.write(path: "/var/log")])
 fn main(): int64 {
   logEvent("app started"c);  // OK: Aufrufer hat fs.write
@@ -527,20 +505,21 @@ fn main(): int64 {
 
 ### Programm stirbt mit SIGSYS
 
-Ein Syscall wurde von seccomp blockiert. Ursachen:
-- Fehlende Capability deklariert (z. B. `fork` ohne `process.fork`)
-- Implizite Capability fehlt (sollte nicht passieren — system.exit/heap sind immer aktiv)
-- Externe Bibliothek ruft undokumentierten Syscall auf
+Ein Syscall wurde zur Laufzeit blockiert. Typische Ursachen:
+- Fehlende Capability (z. B. `fork` ohne `process.fork`)
+- Externe Bibliothek ruft einen Syscall auf, der nicht im Capability-Set ist
 
-**Lösung:** `strace ./mein_programm 2>&1 | grep -i "SIGSYS\|killed"`
+**Diagnose:** `strace ./mein_programm 2>&1 | grep -i "SIGSYS\|killed"`
+
+**Lösung:** Den fehlenden Syscall der richtigen Capability zuordnen und diese deklarieren.
 
 ### EACCES beim Dateizugriff
 
-Landlock blockiert den Pfad. Ursachen:
-- `fs.write` deklariert, aber O_RDONLY-Zugriff auf falschen Pfad
+Der Pfad-Zugriff wird auf Kernel-Ebene blockiert. Typische Ursachen:
+- Capability ohne Pfad-Argument deklariert, aber nur ein bestimmter Pfad ist tatsächlich erlaubt
 - Hardware-Gerät nicht deklariert (z. B. `/dev/i2c-0` ohne `hardware.i2c(bus: 0)`)
 
-**Lösung:** Capability-Argument prüfen und ggf. Pfad-Argument hinzufügen.
+**Lösung:** Capability-Argument mit dem benötigten Pfad ergänzen.
 
 ### Migration: Programm ohne `@capabilities`
 
@@ -549,76 +528,21 @@ Landlock blockiert den Pfad. Ursachen:
    lyxc --migrate-capabilities my_program.lyx
    ```
 
-2. Erzeugtes Manifest einfügen und überprüfen:
+2. Erzeugtes Manifest einfügen, zunächst im Compat-Modus testen:
    ```bash
-   lyxc --capabilities=compat my_program.lyx -o my_program  # erst testen
-   lyxc my_program.lyx -o my_program                        # dann aktivieren
+   lyxc --capabilities=compat my_program.lyx -o my_program
    ```
 
-3. Security-Audit lesen und Score verbessern (fehlende `grant`-Klauseln ergänzen).
+3. Vollständig aktivieren und Audit-Output lesen:
+   ```bash
+   lyxc my_program.lyx -o my_program
+   ```
 
-### Kernel < 5.13 (kein Landlock)
+4. Fehlende `grant`-Klauseln ergänzen, um den Security-Score zu maximieren.
 
-Der Compiler gibt eine Warnung und kompiliert nur mit seccomp. Pfad-basierte Einschränkungen sind dann nicht aktiv.
+### Kernel < 5.13
 
----
-
-## 14. Referenz: Capability-IDs
-
-| ID | Name | Domain |
-|----|------|--------|
-| 0 | system.exit | Implizit |
-| 1 | system.memory.heap | Implizit |
-| 2 | system.memory.stack | Implizit |
-| 3 | system.time | System |
-| 4 | system.env | System |
-| 5 | system.rand | System |
-| 6 | system.unsafe.format_string | System |
-| 7 | fs.read | Dateisystem |
-| 8 | fs.write | Dateisystem |
-| 9 | fs.create | Dateisystem |
-| 10 | fs.delete | Dateisystem |
-| 11 | fs.meta | Dateisystem |
-| 12 | fs.exec | Dateisystem |
-| 13 | memory.mmap | Memory |
-| 14 | memory.lock | Memory |
-| 15 | network.tcp.bind | Netzwerk |
-| 16 | network.tcp.connect | Netzwerk |
-| 17 | network.udp.bind | Netzwerk |
-| 18 | network.udp.connect | Netzwerk |
-| 19 | network.unix | Netzwerk |
-| 20 | network.raw | Netzwerk |
-| 21 | hardware.gpio | Hardware |
-| 22 | hardware.i2c | Hardware |
-| 23 | hardware.spi | Hardware |
-| 24 | hardware.usb | Hardware |
-| 25 | process.fork | Prozess |
-| 26 | process.exec | Prozess |
-| 27 | process.signal | Prozess |
-| 28 | process.sched | Prozess |
-| 29 | process.exit | Prozess |
-
----
-
-## 15. Arbeitspakete und Implementierungsstatus
-
-| WP | Titel | Status |
-|----|-------|--------|
-| WP-L1 | EBNF-Erweiterung + Parser | ✓ Implementiert |
-| WP-L2 | Capability-Hierarchie + implizite Caps | ✓ Implementiert |
-| WP-L3 | Grant-basiertes Vererbungsmodell | ✓ Implementiert |
-| WP-L4 | Transitiver Capability-Graph | ✓ Implementiert |
-| WP-L5 | FFI-Klassifizierung + Signatur-Validierung | ✓ Implementiert |
-| WP-L6 | Compile-Time Stripping | ✓ Implementiert |
-| WP-L7 | `@uses_caller_cap` (Capability-Leihe) | ✓ Implementiert |
-| WP-L8 | Klassen-Capability-Modell | ✓ Implementiert |
-| WP-R9 | seccomp-BPF-Codegenerierung | ✓ Implementiert |
-| WP-R10 | Landlock-Integration | ✓ Implementiert |
-| WP-R11 | Userspace-Netzwerk-Proxy + Lifecycle | ✓ Implementiert |
-| WP-H12 | Hardware-Capabilities + Device Tree | ✓ Implementiert |
-| WP-T13 | Security Audit Output + Score | ✓ Implementiert |
-| WP-T14 | Migration Tool (`--migrate-capabilities`) | ✓ Implementiert |
-| WP-T15 | LCBS-Selbsttest (`--self-test`) | ✓ Implementiert |
+Der Compiler gibt eine Warnung aus. Pfad-basierte Einschränkungen sind dann nicht aktiv; nur Syscall-Filterung bleibt wirksam. Für volle LCBS-Garantien ist Kernel ≥ 5.13 erforderlich.
 
 ---
 
