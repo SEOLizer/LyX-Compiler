@@ -502,13 +502,18 @@ Wer sie nutzt, bekommt einen falschen Sicherheitseindruck.
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/codegen_x86.lyx`, `src/backend/*` |
-| **Aufwand** | 3–5 Tage (Forschung) |
+| **Dateien** | `src/codegen_x86.lyx` |
+| **Aufwand** | 1 Tag |
 | **Priorität** | 🔵 Niedrig |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-04 |
 
-**Problem:** Generierte Binaries haben keinen Stack-Schutz (Canaries).
-Buffer-Overflow auf dem Stack führt direkt zu Code-Execution.
+**Lösung:**
+- `cg_emitPrologue()` / `cg_emitPrologueNested()`: reservieren `[rbp-8]` für den Canary und laden ihn aus dem `_lyx_canary`-Global (RIP-relative via `CG_PATCH_STR`)
+- `cg_emitEpilogue()`: vergleicht `[rbp-8]` via `r10/r11` (scratch, kein Eingriff in `rax` Return-Wert); bei Mismatch → `jnz __lyx_stack_fail`
+- `__lyx_stack_fail` (70 Bytes): schreibt `"stack smashing detected\n"` auf stderr, exit(1)
+- `__lyx_canary_init` (27 Bytes): `sys_getrandom(&_lyx_canary, 8, 0)` — kernel-CSPRNG, kein libc/FS-Register nötig
+- Aufruf in `main()` VOR dem Prologue (damit Prologue bereits den initialisierten Wert speichert)
+- Security-Score: +5 Punkte (35/45)
 
 ---
 

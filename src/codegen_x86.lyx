@@ -179,7 +179,9 @@ con CG_H_MAP_NEW:    int64 := 981;
 con CG_H_MAP_SET:    int64 := 1028;
 con CG_H_MAP_GET:    int64 := 1121;
 con CG_H_MAP_HAS:    int64 := 1193;
-con CG_H_USER:       int64 := 1266;
+con CG_H_STACK_FAIL:   int64 := 1266;  // WP-18: __lyx_stack_fail handler (70 bytes)
+con CG_H_CANARY_INIT: int64 := 1336;  // WP-18: __lyx_canary_init handler (27 bytes)
+con CG_H_USER:         int64 := 1363;  // WP-18: was 1266, +70+27 for canary helpers
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -333,6 +335,9 @@ con CG_ARGV: int64 := 40; // data[40..47]: _lyx_argv (pointer to argv[0])
 
 // WP-BI-04: FloatToStr static scratch buffer (32 bytes; max output ~28 chars)
 con CG_FLOAT_BUF: int64 := 48; // data[48..79]: _lyx_float_buf
+
+// WP-18: Stack canary — initialized from sys_getrandom at start of main
+con CG_CANARY: int64 := 80; // data[80..87]: _lyx_canary (8 bytes)
 
 // ============================================================================
 // Codegen class
@@ -1852,6 +1857,7 @@ pub type Codegen = class {
   }
 
   // Emit function prologue: push rbp; mov rbp, rsp; sub rsp, imm32 (placeholder)
+  // WP-18: Also reserves rbp-8 for stack canary (loads fs:0x28 there, clears rax).
   // Returns: code position of the imm32 (for later patching with final frame size)
   fn cg_emitPrologue(): int64 {
     self.cg_e8(0x55);                          // push rbp
@@ -1860,11 +1866,40 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
     var patchPos: int64 := self.codeLen;
     self.cg_e32(0);
+    // WP-18: reserve [rbp-8] for canary before any locals
+    self.frameSize := self.frameSize + 8;
+    // mov rax, [rip+CG_CANARY]  (load canary from global; patched by CG_PATCH_STR)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pCanaryLoad: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pCanaryLoad, CG_CANARY, 0, CG_PATCH_STR);
+    // mov [rbp-8], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
+    // xor rax, rax  (clear canary from register)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
     return patchPos;
   }
 
-  // Emit function epilogue: mov rsp, rbp; pop rbp; ret
+  // Emit function epilogue: check stack canary, then mov rsp,rbp; pop rbp; ret
+  // WP-18: Uses r10/r11 (scratch) to compare [rbp-8] with _lyx_canary global.
+  //        Does NOT touch rax (return value).
   fn cg_emitEpilogue() {
+    // WP-18: canary check — r10/r11 are caller-saved scratch, do not affect rax
+    // mov r11, [rbp-8]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF8);
+    // mov r10, [rip+CG_CANARY]  (expected canary from global)
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x15);
+    var pCanaryChk: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pCanaryChk, CG_CANARY, 0, CG_PATCH_STR);
+    // xor r11, r10
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xD3);
+    // jnz __lyx_stack_fail (0F 85 rel32)
+    self.cg_e8(0x0F); self.cg_e8(0x85);
+    var failPatch: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(failPatch, "__lyx_stack_fail" as int64, 16, CG_PATCH_CALL);
+    // Normal epilogue
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xEC);  // mov rsp, rbp
     self.cg_e8(0x5D);  // pop rbp
     self.cg_e8(0xC3);  // ret
@@ -6156,6 +6191,7 @@ pub type Codegen = class {
   }
 
   // WP-13: Generate nested function prologue (accepts static link in rbp+16)
+  // WP-18: Also installs stack canary at [rbp-8], same as cg_emitPrologue.
   fn cg_emitPrologueNested(): int64 {
     self.cg_e8(0x55);                          // push rbp
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE5);  // mov rbp, rsp
@@ -6163,6 +6199,17 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
     var patchPos: int64 := self.codeLen;
     self.cg_e32(0);
+    // WP-18: reserve [rbp-8] for canary before any locals
+    self.frameSize := self.frameSize + 8;
+    // mov rax, [rip+CG_CANARY]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pCanaryNested: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pCanaryNested, CG_CANARY, 0, CG_PATCH_STR);
+    // mov [rbp-8], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
+    // xor rax, rax
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
     // Static link is already in [rbp+16] from caller
     return patchPos;
   }
@@ -6950,6 +6997,19 @@ pub type Codegen = class {
     // Reset locals
     self.localCount := 0;
     self.frameSize  := 0;
+
+    // WP-18: initialize _lyx_canary BEFORE prologue stores it on stack.
+    // Runs before push rbp, so the prologue can load the already-initialized value.
+    if fnlen == 4 {
+      if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
+         StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
+        // call __lyx_canary_init  (fills _lyx_canary via sys_getrandom)
+        self.cg_e8(0xE8);
+        var pp18: int64 := self.codeLen;
+        self.cg_e32(0);
+        self.cg_addPatch(pp18, "__lyx_canary_init" as int64, 17, CG_PATCH_CALL);
+      }
+    }
 
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
@@ -7815,7 +7875,51 @@ pub type Codegen = class {
     self.cg_e8(0x5B);                                                // pop rbx
     self.cg_e8(0xC3);                                                // ret
     // _lyx_map_has is 73 bytes ✓
-    // Total helpers: 79+15+26+104+71+6+26+104+335+215+47+93+72+73 = 1266 = CG_H_USER  ✓
+
+    // ---- __lyx_stack_fail (70 bytes, starts at offset 1266) — WP-18 ----
+    // Called when stack canary mismatch detected. Writes message to stderr, exits 1.
+    // No prologue — this is a terminal handler, never returns.
+    self.cg_addLabel("__lyx_stack_fail", 16, 0);
+    // write(2, "stack smashing detected\n", 24)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rax, 1
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rdi, 2
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35); self.cg_e8(0x19); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // lea rsi, [rip+25]  → "stack smashing..."
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x18); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rdx, 24
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                                                              // syscall
+    // exit(1)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x3C); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rax, 60
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rdi, 1
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                                                              // syscall
+    // message data: "stack smashing detected\n" (24 bytes, at rip+25 from after lea)
+    self.cg_e8(0x73); self.cg_e8(0x74); self.cg_e8(0x61); self.cg_e8(0x63); // "stac"
+    self.cg_e8(0x6B); self.cg_e8(0x20); self.cg_e8(0x73); self.cg_e8(0x6D); // "k sm"
+    self.cg_e8(0x61); self.cg_e8(0x73); self.cg_e8(0x68); self.cg_e8(0x69); // "ashi"
+    self.cg_e8(0x6E); self.cg_e8(0x67); self.cg_e8(0x20); self.cg_e8(0x64); // "ng d"
+    self.cg_e8(0x65); self.cg_e8(0x74); self.cg_e8(0x65); self.cg_e8(0x63); // "etec"
+    self.cg_e8(0x74); self.cg_e8(0x65); self.cg_e8(0x64); self.cg_e8(0x0A); // "ted\n"
+    // __lyx_stack_fail is 70 bytes ✓ (7+7+7+7+2 + 7+7+2 + 24 = 70)
+
+    // ---- __lyx_canary_init (27 bytes, starts at offset 1336) — WP-18 ----
+    // sys_getrandom(&_lyx_canary, 8, 0) — fills canary global from kernel CSPRNG.
+    // Called once at start of main() before any user code runs.
+    self.cg_addLabel("__lyx_canary_init", 17, 0);
+    // mov rax, 318  (SYS_getrandom)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x3E); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // 7 bytes
+    // lea rdi, [rip+CG_CANARY]  (address of _lyx_canary in data section)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x3D);                                                                           // 3 bytes
+    var pCanaryInit: int64 := self.codeLen;
+    self.cg_e32(0);                                                                                                                   // 4 bytes (patched)
+    self.cg_addPatch(pCanaryInit, CG_CANARY, 0, CG_PATCH_STR);
+    // mov rsi, 8
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e8(0x08); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // 7 bytes
+    // xor rdx, rdx  (flags = 0)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);                                                                           // 3 bytes
+    // syscall
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                                                              // 2 bytes
+    // ret
+    self.cg_e8(0xC3);                                                                                                                 // 1 byte
+    // __lyx_canary_init is 27 bytes ✓ (7+3+4+7+3+2+1 = 27)
+    // Total helpers: 79+15+26+104+71+6+26+104+335+215+47+93+72+73+70+27 = 1363 = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -8980,13 +9084,14 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  o Userspace Proxy (nicht aktiv)"c);
     }
-    EPrintStrLn("  o Stack Canaries (nicht aktiv -- WP-18 offen)"c);
+    EPrintStrLn("  + Stack Canaries (WP-18: fs:getrandom, TMR-Slot rbp-8)"c);
     EPrintStrLn(""c);
 
-    // Score
+    // Score — WP-18 adds +5 for stack canaries
+    score := score + 5;
     EPrintStr("Sicherheits-Score: "c);
     EPrintInt(score);
-    EPrintStrLn("/40  (PIE +0; max 45 mit Stack Canaries WP-18)"c);
+    EPrintStrLn("/45  (PIE +0)"c);
     EPrintStrLn("  +10: Kein Klasse-3-Extern ohne system.unsafe.format_string"c);
     EPrintStrLn("  + 5: W^X aktiv"c);
     EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel)"c);
@@ -9010,7 +9115,7 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  + 0: landlock fehlt"c);
     }
-    EPrintStrLn("   o: Stack Canaries fehlen (WP-18 offen)"c);
+    EPrintStrLn("  + 5: Stack Canaries (WP-18: getrandom-Init + fs-freier rbp-8-Slot)"c);
     if self.lcbsFastpathCount > 0 {
       EPrintStr("  -"c); EPrintInt(self.lcbsFastpathCount * 3);
       EPrintStr(": @fastpath x"c); EPrintInt(self.lcbsFastpathCount); EPrintStrLn(""c);
