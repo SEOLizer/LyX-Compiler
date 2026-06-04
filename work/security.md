@@ -478,14 +478,14 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 | **Dateien** | `tools/gen_lic_secret.py` |
 | **Aufwand** | 0.5 Tage |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-04 |
 
 **Problem:** Das generierte Master-Secret wird ans Terminal ausgegeben (Scrollback, Logs, History).
 
 **Teilschritte:**
 
-- [ ] **16.1** Secret in Datei mit 600er-Permissions schreiben (statt stdout)
-- [ ] **16.2** Optional Direktausgabe mit verstärkter Warnung
+- [x] **16.1** Secret in Datei mit 600er-Permissions schreiben (statt stdout) — `os.open(path, O_WRONLY|O_CREAT|O_TRUNC, 0o600)` + `os.chmod` + Sanity-Check; Default `~/.lyx/master.secret`
+- [x] **16.2** Optional Direktausgabe mit verstärkter Warnung — `--show-secret` gibt Secret auf stderr mit prominenter Sicherheitswarnung aus
 
 **Definition of Done:**
 - Secret landet nicht mehr ungeschützt in Terminal-History
@@ -733,7 +733,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 13 | Crypto-Memory sicher löschen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 14 | DNS-Parser mit Limits | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
 | 15 | Constant-Time Crypto | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟡 |
-| 16 | gen_lic_secret.py sicherer | ⬜ | – | – | – | 🟡 |
+| 16 | gen_lic_secret.py sicherer | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
 | 17 | Annotationen dokumentieren (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
 | 18 | Stack-Canaries | ⬜ | – | – | – | 🔵 |
 | 19 | ARM64-Dynamic-Linking-Bugs | ⬜ | – | – | – | 🔵 |
