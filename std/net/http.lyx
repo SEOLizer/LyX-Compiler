@@ -11,6 +11,9 @@ import std.net.types;
 pub con HTTP_PORT: int64 := 80;
 pub con HTTPS_PORT: int64 := 443;
 
+// WP-9.5: Default receive timeout in milliseconds (30 seconds)
+pub con HTTP_RECV_TIMEOUT_MS: int64 := 30000;
+
 // HTTP methods
 pub con HTTP_GET: int64 := 1;
 pub con HTTP_POST: int64 := 2;
@@ -48,297 +51,246 @@ pub type HTTPRequest = struct {
   bodySize: int64;
 };
 
+// ============================================================================
+// WP-9: Hilfsfunktionen
+// ============================================================================
+
+// WP-9.5: Read from socket with timeout.
+// Returns bytes read, 0 on timeout, <0 on error.
+fn http_readTimeout(sock: int64, buf: int64, size: int64, timeoutMs: int64): int64 {
+  var ready: int64 := SocketCanRead(sock, timeoutMs);
+  if (ready <= 0) { return ready; }
+  return sys_read(sock, buf, size);
+}
+
+// WP-9.1/9.2: Gibt 1 zurück wenn ptr CR (\r=13) oder LF (\n=10) enthält.
+fn http_hasCrLf(ptr: int64, maxLen: int64): int64 {
+  var i: int64 := 0;
+  while (i < maxLen) {
+    var c: int64 := peek8(ptr + i);
+    if (c == 0) { return 0; }
+    if (c == 13) { return 1; }
+    if (c == 10) { return 1; }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// Berechnet die Länge eines null-terminierten Strings.
+fn http_strLen(ptr: int64): int64 {
+  var i: int64 := 0;
+  while (peek8(ptr + i) != 0) { i := i + 1; }
+  return i;
+}
+
+// Schreibt n Bytes aus src nach dst, gibt neue dst-Position zurück.
+fn http_writeMem(dst: int64, src: int64, n: int64): int64 {
+  var i: int64 := 0;
+  while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+  return dst + n;
+}
+
+// Schreibt einen pchar-String nach dst, gibt neue dst-Position zurück.
+fn http_writeStr(dst: int64, src: int64): int64 {
+  var i: int64 := 0;
+  while (peek8(src + i) != 0) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+  return dst + i;
+}
+
+// Schreibt "key: value\r\n" Header nach dst.
+fn http_writeHeader(dst: int64, key: int64, val: int64): int64 {
+  dst := http_writeStr(dst, key);
+  poke8(dst, 58); poke8(dst + 1, 32); dst := dst + 2;  // ": "
+  dst := http_writeStr(dst, val);
+  poke8(dst, 13); poke8(dst + 1, 10); dst := dst + 2;  // "\r\n"
+  return dst;
+}
+
+// Schreibt eine dezimale int64 nach dst, gibt neue dst-Position zurück.
+fn http_writeInt(dst: int64, n: int64): int64 {
+  if (n == 0) { poke8(dst, 48); return dst + 1; }
+  var tmp: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var len: int64 := 0;
+  var v: int64 := n;
+  while (v > 0) {
+    poke8(tmp + len, 48 + (v - ((v / 10) * 10)));
+    v := v / 10;
+    len := len + 1;
+  }
+  var i: int64 := 0;
+  while (i < len) { poke8(dst + i, peek8(tmp + (len - 1 - i))); i := i + 1; }
+  munmap(tmp, 24);
+  return dst + len;
+}
+
+// ============================================================================
 // Build HTTP request string
-// Returns pointer to allocated request string (caller must free with munmap)
+// WP-9.1/9.2: Validiert Host und Path auf CR/LF-Injection.
+// WP-9.3: Alloziert dynamisch basierend auf tatsächlicher Anfragegröße.
+// Gibt Pointer zurück; die ersten 8 Bytes sind die Allokationsgröße,
+// die nächsten 8 Bytes die tatsächliche Request-Länge.
+// Eigentlicher Request-Content ab Offset 16.
+// ============================================================================
 pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
-  var buf: int64;
-  var pos: int64;
-  var i: int64;
-  
-  // Allocate buffer (max 4KB for request)
-  buf := mmap(0, 4096, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (buf == 0) {
-    return 0;
-  }
-  pos := 0;
-  
-  // Write method (write the literal once — not in a counting loop)
+  var hostLen: int64 := http_strLen(req.host);
+  var pathLen: int64 := http_strLen(req.path);
+
+  // WP-9.1: Host auf CR/LF prüfen
+  if (http_hasCrLf(req.host, hostLen) != 0) { return 0; }
+  // WP-9.2: Path auf CR/LF prüfen
+  if (http_hasCrLf(req.path, pathLen) != 0) { return 0; }
+
+  // WP-9.3: Allokationsgröße dynamisch berechnen
+  // 16 Byte Metadaten + Method + Path + HTTP-Version + Host-Header +
+  // Connection-Header + Content-Length + CRLF + Body
+  var allocSize: int64 := 16 + 8 + pathLen + 12 + 7 + hostLen + 2 +
+                          21 + 32 + 2 + req.bodySize + 16;
+  var buf: int64 := mmap(0, allocSize, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  var p: int64 := buf + 16;  // request content starts after metadata
+
+  // Method
   if (req.method == HTTP_GET) {
-    poke8(buf + pos, 71);     // G
-    poke8(buf + pos + 1, 69); // E
-    poke8(buf + pos + 2, 84); // T
-    poke8(buf + pos + 3, 32); // space
-    pos := pos + 4;
+    poke8(p, 71); poke8(p+1, 69); poke8(p+2, 84); poke8(p+3, 32);
+    p := p + 4;
   } else if (req.method == HTTP_POST) {
-    poke8(buf + pos, 80);     // P
-    poke8(buf + pos + 1, 79); // O
-    poke8(buf + pos + 2, 83); // S
-    poke8(buf + pos + 3, 84); // T
-    poke8(buf + pos + 4, 32); // space
-    pos := pos + 5;
+    poke8(p, 80); poke8(p+1, 79); poke8(p+2, 83); poke8(p+3, 84); poke8(p+4, 32);
+    p := p + 5;
+  } else if (req.method == HTTP_PUT) {
+    poke8(p, 80); poke8(p+1, 85); poke8(p+2, 84); poke8(p+3, 32);
+    p := p + 4;
+  } else if (req.method == HTTP_DELETE) {
+    poke8(p, 68); poke8(p+1, 69); poke8(p+2, 76); poke8(p+3, 69); poke8(p+4, 84);
+    poke8(p+5, 69); poke8(p+6, 32);
+    p := p + 7;
   }
-  
-  // Write path
-  i := 0;
-  while (i < 256) {
-    var c: int64 := peek8(req.path + i);
-    if (c == 0) {
-      break;
-    }
-    poke8(buf + pos, c);
-    i := i + 1;
-    pos := pos + 1;
-  }
-  
-  // Write HTTP version " HTTP/1.1" (once)
-  poke8(buf + pos, 32);     // space
-  poke8(buf + pos + 1, 72); // H
-  poke8(buf + pos + 2, 84); // T
-  poke8(buf + pos + 3, 84); // T
-  poke8(buf + pos + 4, 80); // P
-  poke8(buf + pos + 5, 47); // /
-  poke8(buf + pos + 6, 49); // 1
-  poke8(buf + pos + 7, 46); // .
-  poke8(buf + pos + 8, 49); // 1
-  pos := pos + 9;
-  
-  // Newline
-  poke8(buf + pos, 13); pos := pos + 1;  // \r
-  poke8(buf + pos, 10); pos := pos + 1;  // \n
-  
-  // Host header name "Host:" (once)
-  poke8(buf + pos, 72);      // H
-  poke8(buf + pos + 1, 111); // o
-  poke8(buf + pos + 2, 115); // s
-  poke8(buf + pos + 3, 116); // t
-  poke8(buf + pos + 4, 58);  // :
-  pos := pos + 5;
-  poke8(buf + pos, 32); pos := pos + 1; // space
-  
-  // Host value
-  i := 0;
-  while (i < 256) {
-    var c: int64 := peek8(req.host + i);
-    if (c == 0) {
-      break;
-    }
-    poke8(buf + pos, c);
-    i := i + 1;
-    pos := pos + 1;
-  }
-  
-  // Newline
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
 
-  // Connection: close — tell the server to end the stream after the response,
-  // so a read-until-close client (HTTPSGet) terminates instead of blocking on
-  // an HTTP/1.1 keep-alive connection.
-  poke8(buf + pos, 67);  pos := pos + 1;  // C
-  poke8(buf + pos, 111); pos := pos + 1;  // o
-  poke8(buf + pos, 110); pos := pos + 1;  // n
-  poke8(buf + pos, 110); pos := pos + 1;  // n
-  poke8(buf + pos, 101); pos := pos + 1;  // e
-  poke8(buf + pos, 99);  pos := pos + 1;  // c
-  poke8(buf + pos, 116); pos := pos + 1;  // t
-  poke8(buf + pos, 105); pos := pos + 1;  // i
-  poke8(buf + pos, 111); pos := pos + 1;  // o
-  poke8(buf + pos, 110); pos := pos + 1;  // n
-  poke8(buf + pos, 58);  pos := pos + 1;  // :
-  poke8(buf + pos, 32);  pos := pos + 1;  // space
-  poke8(buf + pos, 99);  pos := pos + 1;  // c
-  poke8(buf + pos, 108); pos := pos + 1;  // l
-  poke8(buf + pos, 111); pos := pos + 1;  // o
-  poke8(buf + pos, 115); pos := pos + 1;  // s
-  poke8(buf + pos, 101); pos := pos + 1;  // e
-  poke8(buf + pos, 13);  pos := pos + 1;  // \r
-  poke8(buf + pos, 10);  pos := pos + 1;  // \n
+  // Path + " HTTP/1.1\r\n"
+  p := http_writeStr(p, req.path);
+  poke8(p,32);poke8(p+1,72);poke8(p+2,84);poke8(p+3,84);poke8(p+4,80);
+  poke8(p+5,47);poke8(p+6,49);poke8(p+7,46);poke8(p+8,49);poke8(p+9,13);poke8(p+10,10);
+  p := p + 11;
 
-  // Content-Length header for POST
-  if ((req.method == HTTP_POST) && (req.bodySize > 0)) {
-    poke8(buf + pos, 67);       // C
-    poke8(buf + pos + 1, 111);  // o
-    poke8(buf + pos + 2, 110);  // n
-    poke8(buf + pos + 3, 116);  // t
-    poke8(buf + pos + 4, 101);  // e
-    poke8(buf + pos + 5, 110);  // n
-    poke8(buf + pos + 6, 116);  // t
-    poke8(buf + pos + 7, 45);   // -
-    poke8(buf + pos + 8, 76);   // L
-    poke8(buf + pos + 9, 101);  // e
-    poke8(buf + pos + 10, 110); // n
-    poke8(buf + pos + 11, 103); // g
-    poke8(buf + pos + 12, 116); // t
-    poke8(buf + pos + 13, 104); // h
-    poke8(buf + pos + 14, 58);  // :
-    poke8(buf + pos + 15, 32);  // space
-    pos := pos + 16;
+  // Host header
+  poke8(p,72);poke8(p+1,111);poke8(p+2,115);poke8(p+3,116);poke8(p+4,58);poke8(p+5,32);
+  p := p + 6;
+  p := http_writeStr(p, req.host);
+  poke8(p,13);poke8(p+1,10); p := p + 2;
 
-    // Simple decimal conversion (up to 6 digits)
-    var len: int64 := req.bodySize;
-    if (len >= 100000) { 
-      var d: int64 := len / 100000;
-      d := d - ((len / 1000000) * 10);
-      poke8(buf + pos, 48 + d); 
-      pos := pos + 1; 
-    }
-    if (len >= 10000) { 
-      var d: int64 := len / 10000;
-      d := d - ((len / 100000) * 10);
-      poke8(buf + pos, 48 + d); 
-      pos := pos + 1; 
-    }
-    if (len >= 1000) { 
-      var d: int64 := len / 1000;
-      d := d - ((len / 10000) * 10);
-      poke8(buf + pos, 48 + d); 
-      pos := pos + 1; 
-    }
-    if (len >= 100) { 
-      var d: int64 := len / 100;
-      d := d - ((len / 1000) * 10);
-      poke8(buf + pos, 48 + d); 
-      pos := pos + 1; 
-    }
-    if (len >= 10) { 
-      var d: int64 := len / 10;
-      d := d - ((len / 100) * 10);
-      poke8(buf + pos, 48 + d); 
-      pos := pos + 1; 
-    }
-    var lastDigit: int64 := len - ((len / 10) * 10);
-    poke8(buf + pos, 48 + lastDigit); 
-    pos := pos + 1;
-    
-    // Newline
-    poke8(buf + pos, 13); pos := pos + 1;
-    poke8(buf + pos, 10); pos := pos + 1;
+  // Connection: close
+  poke8(p,67);poke8(p+1,111);poke8(p+2,110);poke8(p+3,110);poke8(p+4,101);
+  poke8(p+5,99);poke8(p+6,116);poke8(p+7,105);poke8(p+8,111);poke8(p+9,110);
+  poke8(p+10,58);poke8(p+11,32);poke8(p+12,99);poke8(p+13,108);poke8(p+14,111);
+  poke8(p+15,115);poke8(p+16,101);poke8(p+17,13);poke8(p+18,10);
+  p := p + 19;
+
+  // Content-Length for POST/PUT with body
+  if ((req.method == HTTP_POST || req.method == HTTP_PUT) && req.bodySize > 0) {
+    poke8(p,67);poke8(p+1,111);poke8(p+2,110);poke8(p+3,116);poke8(p+4,101);
+    poke8(p+5,110);poke8(p+6,116);poke8(p+7,45);poke8(p+8,76);poke8(p+9,101);
+    poke8(p+10,110);poke8(p+11,103);poke8(p+12,116);poke8(p+13,104);poke8(p+14,58);poke8(p+15,32);
+    p := p + 16;
+    p := http_writeInt(p, req.bodySize);
+    poke8(p,13);poke8(p+1,10); p := p + 2;
   }
-  
+
   // End of headers
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // Body for POST
-  if ((req.method == HTTP_POST) && (req.bodySize > 0) && (req.body != 0)) {
-    i := 0;
-    while (i < req.bodySize) {
-      poke8(buf + pos, peek8(req.body + i));
-      i := i + 1;
-      pos := pos + 1;
-    }
+  poke8(p,13);poke8(p+1,10); p := p + 2;
+
+  // Body
+  if ((req.method == HTTP_POST || req.method == HTTP_PUT) && req.bodySize > 0 && req.body != 0) {
+    p := http_writeMem(p, req.body, req.bodySize);
   }
-  
+
+  // Store metadata: [allocSize][reqSize]
+  var reqSize: int64 := p - (buf + 16);
+  poke64(buf,     allocSize);
+  poke64(buf + 8, reqSize);
+
   return buf;
 }
 
+// ============================================================================
 // Send HTTP request and get response
-// Returns HTTPResponse with allocated body (caller must free with munmap)
+// WP-9.3: Sendet nur tatsächliche Request-Bytes.
+// WP-9.4: Liest Response-Body basierend auf Content-Length in einer Schleife.
+// ============================================================================
 pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
   var response: HTTPResponse;
-  var conn: TCPConn;
-  var ip: int64;
-  var sock: int64;
-  var buf: int64;
-  var requestBuf: int64;
-  var n: int64;
-  var i: int64;
-  
-  // Initialize response
   response.statusCode := 0;
   response.statusText := 0;
   response.headerCount := 0;
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
-  
+
   // Resolve hostname
-  ip := GetHostByName(request.host);
-  if (ip == 0) {
-    return response;
-  }
-  
+  var ip: int64 := GetHostByName(request.host);
+  if (ip == 0) { return response; }
+
   // Connect
-  conn := TCPConnect(ip, request.port);
-  if (conn.fd < 0) {
-    return response;
-  }
-  sock := conn.fd;
-  
-  // Build request
-  requestBuf := HTTPRequestBuild(request);
-  if (requestBuf == 0) {
-    sys_close(sock);
-    return response;
-  }
-  
-  // Send request
-  n := sys_write(sock, requestBuf, 4096);
-  munmap(requestBuf, 4096);
-  
-  if (n < 0) {
-    sys_close(sock);
-    return response;
-  }
-  
-  // Receive response (simple: read up to 8KB)
-  buf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (buf == 0) {
-    sys_close(sock);
-    return response;
-  }
-  
-  n := sys_read(sock, buf, 8192);
-  sys_close(sock);
-  
-  if (n <= 0) {
-    munmap(buf, 8192);
-    return response;
-  }
-  
-  // Parse status line (simple: look for "HTTP/1.1 XXX")
-  i := 0;
-  while (i < n - 13) {
-    // Look for "HTTP/"
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
+  var conn: TCPConn := TCPConnect(ip, request.port);
+  if (conn.fd < 0) { return response; }
+  var sock: int64 := conn.fd;
+
+  // Build request (validated + dynamically sized)
+  var reqBuf: int64 := HTTPRequestBuild(request);
+  if (reqBuf == 0) { sys_close(sock); return response; }
+
+  // Read metadata from buffer header
+  var allocSize: int64 := peek64(reqBuf);
+  var reqSize:   int64 := peek64(reqBuf + 8);
+
+  // WP-9.3: Sende nur tatsächliche Request-Bytes
+  var n: int64 := sys_write(sock, reqBuf + 16, reqSize);
+  munmap(reqBuf, allocSize);
+
+  if (n < 0) { sys_close(sock); return response; }
+
+  // WP-9.4: Lese Response in Schleife basierend auf Content-Length
+  // Initial read: 8192 bytes (response header + start of body)
+  var bufSize: int64 := 8192;
+  var buf: int64 := mmap(0, bufSize, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { sys_close(sock); return response; }
+
+  // WP-9.5: Erstes Lesen mit Timeout
+  n := http_readTimeout(sock, buf, bufSize, HTTP_RECV_TIMEOUT_MS);
+  if (n <= 0) { sys_close(sock); munmap(buf, bufSize); return response; }
+  var totalRead: int64 := n;
+
+  // Parse status code
+  var i: int64 := 0;
+  while (i < totalRead - 13) {
+    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 &&
         peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
         peek8(buf + i + 4) == 47) {
-      
-      // Skip to status code
-      i := i + 9; // Skip "HTTP/1.1 "
-      
-      // Parse 3-digit status code
+      i := i + 9;
       response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i)   - 48);
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i+1) - 48);
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i+2) - 48);
       break;
     }
     i := i + 1;
   }
-  
-  // Find Content-Length header
+
+  // Parse Content-Length
   i := 0;
-  while (i < n - 16) {
-    // Look for "Content-Length:"
-    if (peek8(buf + i) == 67 && peek8(buf + i + 1) == 111 &&
-        peek8(buf + i + 2) == 110 && peek8(buf + i + 3) == 116 &&
-        peek8(buf + i + 4) == 101 && peek8(buf + i + 5) == 110 &&
-        peek8(buf + i + 6) == 116 && peek8(buf + i + 7) == 45 &&
-        peek8(buf + i + 8) == 76 && peek8(buf + i + 9) == 101 &&
-        peek8(buf + i + 10) == 110 && peek8(buf + i + 11) == 103 &&
-        peek8(buf + i + 12) == 116 && peek8(buf + i + 13) == 104) {
-      
-      i := i + 14; // Skip "Content-Length: "
-      
-      // Parse content length
+  while (i < totalRead - 16) {
+    if (peek8(buf+i)==67 && peek8(buf+i+1)==111 && peek8(buf+i+2)==110 &&
+        peek8(buf+i+3)==116 && peek8(buf+i+4)==101 && peek8(buf+i+5)==110 &&
+        peek8(buf+i+6)==116 && peek8(buf+i+7)==45 && peek8(buf+i+8)==76 &&
+        peek8(buf+i+9)==101 && peek8(buf+i+10)==110 && peek8(buf+i+11)==103 &&
+        peek8(buf+i+12)==116 && peek8(buf+i+13)==104) {
+      i := i + 14;
+      // skip ": " (colon, optional space)
+      if (peek8(buf + i) == 58) { i := i + 1; }
+      if (peek8(buf + i) == 32) { i := i + 1; }
       response.contentLength := 0;
-      while (i < n) {
+      while (i < totalRead) {
         var c: int64 := peek8(buf + i);
-        if (c < 48 || c > 57) {
-          break;  // Not a digit
-        }
+        if (c < 48 || c > 57) { break; }
         response.contentLength := response.contentLength * 10 + (c - 48);
         i := i + 1;
       }
@@ -346,43 +298,80 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
     }
     i := i + 1;
   }
-  
-  // Find end of headers (\\r\\n\\r\\n)
+
+  // Find end of headers (\r\n\r\n)
   var bodyStart: int64 := 0;
   i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
+  while (i < totalRead - 4) {
+    if (peek8(buf+i)==13 && peek8(buf+i+1)==10 &&
+        peek8(buf+i+2)==13 && peek8(buf+i+3)==10) {
       bodyStart := i + 4;
       break;
     }
     i := i + 1;
   }
-  
-  // Extract body
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i := i + 1;
+
+  // WP-9.4: Wenn Content-Length > bereits empfangene Body-Bytes, weiter lesen
+  if (bodyStart > 0 && response.contentLength > 0) {
+    var alreadyHave: int64 := totalRead - bodyStart;
+    var need: int64 := response.contentLength - alreadyHave;
+
+    if (need > 0) {
+      // Expandiere buf auf Header + vollständiger Body
+      var newSize: int64 := bodyStart + response.contentLength + 1;
+      var newBuf: int64 := mmap(0, newSize, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (newBuf != 0) {
+        // Kopiere bereits Gelesenes
+        var j: int64 := 0;
+        while (j < totalRead) { poke8(newBuf + j, peek8(buf + j)); j := j + 1; }
+        munmap(buf, bufSize);
+        buf := newBuf;
+        bufSize := newSize;
+
+        // WP-9.5: Lese fehlende Body-Bytes in Schleife mit Timeout
+        var pos: int64 := totalRead;
+        var remaining: int64 := need;
+        while (remaining > 0) {
+          var chunk: int64 := http_readTimeout(sock, buf + pos, remaining, HTTP_RECV_TIMEOUT_MS);
+          if (chunk <= 0) { break; }
+          pos := pos + chunk;
+          remaining := remaining - chunk;
         }
+        totalRead := pos;
+      }
+    }
+  }
+
+  sys_close(sock);
+
+  // Body extrahieren
+  if (bodyStart > 0) {
+    var bodyLen: int64 := totalRead - bodyStart;
+    if (response.contentLength > 0 && response.contentLength < bodyLen) {
+      bodyLen := response.contentLength;
+    }
+    if (bodyLen > 0) {
+      response.bodyPtr := mmap(0, bodyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (response.bodyPtr != 0) {
+        var j: int64 := 0;
+        while (j < bodyLen) {
+          poke8(response.bodyPtr + j, peek8(buf + bodyStart + j));
+          j := j + 1;
+        }
+        poke8(response.bodyPtr + bodyLen, 0);
         response.bodySize := bodyLen;
       }
     }
   }
-  
-  munmap(buf, 8192);
+
+  munmap(buf, bufSize);
   return response;
 }
 
 // Free HTTP response body
 pub fn HTTPResponseFree(response: HTTPResponse) {
   if (response.bodyPtr != 0) {
-    munmap(response.bodyPtr, response.bodySize);
+    munmap(response.bodyPtr, response.bodySize + 1);
   }
 }
 
@@ -396,7 +385,6 @@ pub fn HTTPGet(host: int64, path: int64): HTTPResponse {
   req.headers := 0;
   req.body := 0;
   req.bodySize := 0;
-  
   return HTTPSend(req);
 }
 
@@ -410,6 +398,5 @@ pub fn HTTPPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRes
   req.headers := 0;
   req.body := body;
   req.bodySize := bodySize;
-  
   return HTTPSend(req);
 }

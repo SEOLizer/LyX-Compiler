@@ -48,6 +48,8 @@ import src.crypto.lic_parse;
 import src.crypto.lic_derive;
 import src.lic_build_flags;
 import src.std.alloc;
+import src.tooling.migrate_caps;
+import src.tooling.self_test;
 
 // ============================================================================
 // Compiler Constants
@@ -384,6 +386,13 @@ pub type CompilerConfig = class {
   // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
   metaSafe: bool;
 
+  // WP-T14: Migration Tool + Compat-Modus
+  migrateCaps: bool;  // --migrate-capabilities: Manifest generieren und ausgeben
+  capCompat:   bool;  // --capabilities=compat: kein seccomp/landlock trotz @capabilities
+
+  // WP-T15: LCBS-Selbsttest
+  selfTest: bool;  // --self-test
+
   // WP-BC-50: .lyu pre-compiled unit format
   compileUnit:   bool;    // --compile-unit: write .lyu after sema
   unitInfoFile:  int64;   // --unit-info: 0=unset, 1=sentinel, 2=set (path in unitInfoPath)
@@ -448,6 +457,10 @@ pub type CompilerConfig = class {
   // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
   metaSafe: bool;
 
+  // WP-T14: Migration Tool + Compat-Modus
+  migrateCaps: bool;
+  capCompat:   bool;
+
   // Compilation state
   exitCode: int64;
   earlyExit: bool;
@@ -510,6 +523,9 @@ pub type CompilerConfig = class {
     self.runtimeChecks  := false;
     self.debugSymbols   := false;
     self.metaSafe       := false;
+    self.migrateCaps    := false;
+    self.capCompat      := false;
+    self.selfTest       := false;
     self.compileUnit    := false;
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
@@ -647,7 +663,7 @@ pub type CompilerConfig = class {
     if self.earlyExit {
       return false;
     }
-    if self.inputFile == 0 && self.unitInfoFile <= 1 && self.checkBinary == 0 {
+    if self.inputFile == 0 && self.unitInfoFile <= 1 && self.checkBinary == 0 && !self.selfTest && !self.migrateCaps {
       self.printHelp();
       self.exitCode := 1;
       return false;
@@ -1009,6 +1025,23 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-T14: --migrate-capabilities / --capabilities=compat
+    if StrCmp(arg, "--migrate-capabilities"c) == 0 {
+      self.migrateCaps := true;
+      return;
+    }
+    if StrCmp(arg, "--capabilities=compat"c) == 0 {
+      self.capCompat := true;
+      return;
+    }
+
+    // WP-T15: --self-test
+    if StrCmp(arg, "--self-test"c) == 0 {
+      self.selfTest := true;
+      return;
+    }
+
+
     // WP-BC-50: --compile-unit / --unit-info
     if StrCmp(arg, "--compile-unit"c) == 0 {
       self.compileUnit := true;
@@ -1023,7 +1056,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("0.9.0C"c);
+      PrintStrLn("0.9.1A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1045,7 +1078,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("0.9.0C"c);
+      PrintStrLn("0.9.1A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1158,7 +1191,7 @@ pub type CompilerConfig = class {
   }
   
   fn printHelp(): void {
-    PrintStrLn("lyxc 0.9.0C (bootstrap)");
+    PrintStrLn("lyxc 0.9.1A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1228,6 +1261,15 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   pub fn Compile(inputFile: pchar, outputFile: pchar): int64 {
+    // WP-T15: --self-test — LCBS-Integrationstest (läuft vor dem normalen Compile-Pfad)
+    if self.selfTest {
+      // inputFile = argv[0] (lyxc-Binary-Pfad) wenn via main() übergeben
+      var lyxcPath: pchar := inputFile;
+      if lyxcPath == 0 as pchar { lyxcPath := "./lyxc"c; }
+      self.exitCode := run_self_test(lyxcPath);
+      return self.exitCode;
+    }
+
     // Stage 0: C header parsing (--include flag) — runs independently, then exits
     if self.cHeaderFile > 1 {
       var hdrPath: pchar := self.cHeaderFile as pchar;
@@ -1285,6 +1327,13 @@ pub type CompilerConfig = class {
     // If astRoot is 0 but we have nodes, use index 0 for IRLower
     if astRoot == 0 && parser.nodeCount > 0 {
       astRoot := 0;  // Index 0 for IRLower
+    }
+
+    // WP-T14: --migrate-capabilities → Capability-Manifest aus Parser-AST generieren.
+    // Läuft VOR der sema-Validierung (vermeidet FFI-Klasse-3-Fehler für Legacy-Code).
+    if self.migrateCaps {
+      mc_run_and_print(parser.nodes, source, astRoot);
+      return self.exitCode;
     }
 
     // WP-BC-41: LFD Qt-UI-Builder — emit .h/.cpp for any NK_LFD_FORM nodes
@@ -1423,6 +1472,7 @@ pub type CompilerConfig = class {
         cg.globalEnergyLevel  := sema.energyLevel;           // WP-EN-03: top-level @energy
       }
       cg.lcbsAuditSrcPath := inputFile;  // WP-T13: Quelldatei für Audit-Header
+      if self.capCompat { cg.lcbsCompatMode := 1; }  // WP-T14: kein seccomp/landlock
       cg.Generate(astRoot);
       cg.WriteELF(outPath);
       // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
@@ -3792,7 +3842,10 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
     memcpy(keyBuf, info.key as int64, info.keyLen && kb < 29);
   }
 
-  // Constant-time compare — always scan all 29 positions regardless of mismatch
+  // WP-15.1: Constant-time compare — immer alle 29 Positionen, kein early-exit.
+  // XOR + OR-Akkumulation: diff != 0 ↔ mindestens eine Byte-Differenz.
+  // Timing hängt nur von der festen Schlüssellänge (29) ab.
+  // (Für direkte Digest-Vergleiche: lic_hmacEqual aus lic_hmac.lyx verwenden.)
   var diff: int64 := 0;
   var ci: int64 := 0;
   while ci < 29 {
@@ -3875,6 +3928,9 @@ pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
     return 0;
   }
 
+  // WP-10.4: shnum aus ELF-Header (uint16, max 65535); shnum*64 passt sicher in int64,
+  // aber trotzdem explizit prüfen um manipulierte Dateien abzufangen.
+  if (shnum > 65535) { close(fd); return 0; }
   // Read all section headers
   var shdrsSize: int64 := shnum * 64;
   var shdrs: int64 := alloc(shdrsSize + 8);
@@ -3885,6 +3941,10 @@ pub fn lic_checkBinary(cfg: CompilerConfig, argc: int64, argv: pchar): int64 {
   var strsHdr: int64 := shdrs + shstrndx * 64;
   var strsOff:  int64 := peek64(strsHdr + ELF64_SHDR_OFF_OFFSET);
   var strsSize: int64 := peek64(strsHdr + ELF64_SHDR_OFF_SIZE);
+  // WP-10.4: strsSize aus Datei; strsSize+8 darf nicht überlaufen (>2 GB ist unrealistisch)
+  if (strsSize < 0 || strsSize > 0x7FFFFFFF) {
+    free(shdrs, shdrsSize + 8); close(fd); return 0;
+  }
   var strs: int64 := alloc(strsSize + 8);
   lseek(fd, strsOff, 0);
   read(fd, strs as pchar, strsSize);
@@ -4019,7 +4079,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 0.9.0C — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 0.9.1A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
@@ -4064,6 +4124,12 @@ pub fn main(argc: int64, argv: pchar): int64 {
       lic_loadAndVerify(cfg, argc, argv);
     }
     return lic_checkBinary(cfg, argc, argv);
+  }
+
+  // WP-T15: --self-test benötigt kein Input-File
+  if cfg.selfTest {
+    var lyxcPath: pchar := peek64(argv as int64) as pchar;  // argv[0]
+    return run_self_test(lyxcPath);
   }
 
   // Get input file
