@@ -49,10 +49,13 @@ bootstrap: lyxc lic_build_flags
 singularity: lic_build_flags
 	@echo "=== Singularitätsprüfung ==="
 	@for i in 1 2 3 4 5; do \
-		$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3 > /dev/null && break; \
-		echo "  [Versuch $$i fehlgeschlagen, retry...]"; \
+		$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3 2>/dev/null && break; \
+		echo "  [S3-Versuch $$i fehlgeschlagen, retry...]"; \
 	done; test -f /tmp/lyxc_s3
-	$(ULIMIT_VM) /tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4 > /dev/null
+	@for i in 1 2 3 4 5; do \
+		$(ULIMIT_VM) /tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4 2>/dev/null && break; \
+		echo "  [S4-Versuch $$i fehlgeschlagen, retry...]"; \
+	done; test -f /tmp/lyxc_s4
 	@sha256sum /tmp/lyxc_s3 /tmp/lyxc_s4
 	@diff /tmp/lyxc_s3 /tmp/lyxc_s4 \
 		&& echo "SINGULAR: S3 == S4" \
