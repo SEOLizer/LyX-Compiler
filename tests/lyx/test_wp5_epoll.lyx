@@ -1,0 +1,113 @@
+// WP-5: Test für std/net/epoll — epoll & I/O-Multiplexing
+import std.net.epoll;
+import std.time;
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  PrintLn("=== WP-5: epoll & I/O-Multiplexing ===");
+
+  // --- Test 1: EpollCreate ---
+  var epFd: int64 := EpollCreate();
+  if (epFd < 0) {
+    Print("FAIL: EpollCreate="); PrintLn(epFd); return 1;
+  }
+  Print("OK: EpollCreate — epFd="); PrintLn(epFd);
+
+  // --- Test 2: timerfd in epoll — EpollAdd + EpollWait ---
+  // TimerFd aus WP-4: 30ms Timer
+  var tfd: int64 := TimerFdCreate(CLOCK_MONOTONIC, TFD_CLOEXEC);
+  if (tfd < 0) { PrintLn("FAIL: TimerFdCreate"); return 1; }
+  var r: int64 := TimerFdSetTime(tfd, 0, 30000000);
+  if (r != 0) { PrintLn("FAIL: TimerFdSetTime"); return 1; }
+
+  r := EpollAdd(epFd, tfd, EPOLLIN, tfd);
+  if (r != 0) {
+    Print("FAIL: EpollAdd(tfd)="); PrintLn(r); return 1;
+  }
+  PrintLn("OK: EpollAdd(timerfd, EPOLLIN)");
+
+  // EpollWait — blockiert bis Timer abläuft (max 200ms)
+  var evBuf: int64 := alloc(EPOLL_EVENT_SIZE * 4);
+  var t0: int64 := GetTimeMs();
+  var n: int64 := EpollWait(epFd, evBuf, 4, 200);
+  var elapsed: int64 := GetTimeMs() - t0;
+
+  if (n == 1) {
+    var flags: int64 := EpollEventFlags(evBuf, 0);
+    var data:  int64 := EpollEventData(evBuf, 0);
+    if ((flags & EPOLLIN) != 0 && data == tfd) {
+      Print("OK: EpollWait timerfd — n=1 elapsed="); Print(elapsed); PrintLn("ms");
+    } else {
+      Print("FAIL: unerwartete Event flags="); Print(flags);
+      Print(" data="); PrintLn(data); return 1;
+    }
+  } else {
+    Print("FAIL: EpollWait n="); PrintLn(n); return 1;
+  }
+
+  // Timer lesen um fd zurückzusetzen
+  TimerFdRead(tfd);
+
+  // --- Test 3: EpollDel ---
+  r := EpollDel(epFd, tfd);
+  if (r == 0) {
+    PrintLn("OK: EpollDel(timerfd)");
+  } else {
+    Print("FAIL: EpollDel="); PrintLn(r); return 1;
+  }
+  close(tfd);
+
+  // --- Test 4: eventfd — Signalisierung ohne fork ---
+  var efd: int64 := EventFdCreate(0, EFD_CLOEXEC);
+  if (efd < 0) {
+    Print("FAIL: EventFdCreate="); PrintLn(efd); return 1;
+  }
+  Print("OK: EventFdCreate — efd="); PrintLn(efd);
+
+  // eventfd in epoll registrieren
+  r := EpollAdd(epFd, efd, EPOLLIN, efd);
+  if (r != 0) { Print("FAIL: EpollAdd(efd)="); PrintLn(r); return 1; }
+
+  // Signal senden (Zähler += 1)
+  r := EventFdSignal(efd);
+  if (r < 0) { Print("FAIL: EventFdSignal="); PrintLn(r); return 1; }
+  PrintLn("OK: EventFdSignal");
+
+  // EpollWait — soll sofort zurückkehren (Zähler > 0)
+  n := EpollWait(epFd, evBuf, 4, 50);
+  if (n == 1) {
+    var evFlags: int64 := EpollEventFlags(evBuf, 0);
+    var evData:  int64 := EpollEventData(evBuf, 0);
+    if ((evFlags & EPOLLIN) != 0 && evData == efd) {
+      PrintLn("OK: EpollWait eventfd — Signal empfangen");
+    } else {
+      Print("FAIL: eventfd Event flags="); Print(evFlags);
+      Print(" data="); PrintLn(evData); return 1;
+    }
+  } else {
+    Print("FAIL: EpollWait(eventfd) n="); PrintLn(n); return 1;
+  }
+
+  // Zähler lesen
+  var count: int64 := EventFdRead(efd);
+  if (count == 1) {
+    Print("OK: EventFdRead — count="); PrintLn(count);
+  } else {
+    Print("FAIL: EventFdRead count="); PrintLn(count); return 1;
+  }
+  EpollDel(epFd, efd);
+  close(efd);
+
+  // --- Test 5: EpollWait Timeout (kein Event → gibt 0 zurück) ---
+  n := EpollWait(epFd, evBuf, 4, 10);
+  if (n == 0) {
+    PrintLn("OK: EpollWait timeout — n=0 (keine Events)");
+  } else {
+    Print("FAIL: EpollWait Timeout n="); PrintLn(n); return 1;
+  }
+
+  free(evBuf, EPOLL_EVENT_SIZE * 4);
+  close(epFd);
+
+  PrintLn("=== WP-5: alle Tests bestanden ===");
+  return 0;
+}
