@@ -1,0 +1,132 @@
+// WP-19: Test fuer std/bpf -- BPF Maps, Programme, Instruktionen
+import std.bpf;
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  PrintLn("=== WP-19: bpf -- BPF-Programme ===");
+
+  // ============================================================
+  // --- Teil 1: BPF Array-Map ---
+  // ============================================================
+  PrintLn("--- BPF Map ---");
+
+  // Test 1: BpfMapCreate(ARRAY) -- key=uint32, value=uint64, 4 Eintraege
+  var mapFd: int64 := BpfMapCreate(BPF_MAP_TYPE_ARRAY, 4, 8, 4);
+  if (mapFd < 0) {
+    if (mapFd == -1) {
+      PrintLn("INFO: BpfMapCreate -- EPERM (unprivileged_bpf_disabled, Syscall erreichbar)");
+    } else {
+      if (mapFd == -13) {
+        PrintLn("INFO: BpfMapCreate -- EACCES (BPF gesperrt, Syscall erreichbar)");
+      } else {
+        Print("FAIL: BpfMapCreate unerwarteter Fehler="); PrintLn(mapFd); return 1;
+      }
+    }
+  } else {
+    Print("OK: BpfMapCreate(ARRAY, 4x8) -- fd="); PrintLn(mapFd);
+
+    // Test 2: BpfMapUpdate -- Schluessel 0 auf Wert 42 setzen
+    var key: int64 := mmap(0, 8, 3, 34, -1, 0);
+    var val: int64 := mmap(0, 8, 3, 34, -1, 0);
+    poke32(key, 0);      // Index 0
+    poke64(val, 42);     // Wert = 42
+    var ur: int64 := BpfMapUpdate(mapFd, key, val, BPF_ANY);
+    if (ur < 0) {
+      Print("FAIL: BpfMapUpdate="); PrintLn(ur);
+      munmap(key, 8); munmap(val, 8); close(mapFd); return 1;
+    }
+    PrintLn("OK: BpfMapUpdate(key=0, val=42)");
+
+    // Test 3: BpfMapLookup -- Wert wieder lesen
+    var got: int64 := mmap(0, 8, 3, 34, -1, 0);
+    var lr: int64 := BpfMapLookup(mapFd, key, got);
+    if (lr < 0) {
+      Print("FAIL: BpfMapLookup="); PrintLn(lr);
+      munmap(got, 8); munmap(key, 8); munmap(val, 8); close(mapFd); return 1;
+    }
+    var v: int64 := peek64(got);
+    if (v != 42) {
+      Print("FAIL: BpfMapLookup Wert="); PrintLn(v);
+      munmap(got, 8); munmap(key, 8); munmap(val, 8); close(mapFd); return 1;
+    }
+    PrintLn("OK: BpfMapLookup(key=0) = 42");
+
+    munmap(got, 8);
+    munmap(key, 8);
+    munmap(val, 8);
+    close(mapFd);
+  }
+
+  // ============================================================
+  // --- Teil 2: BPF-Programm -- minimaler Socket-Filter ---
+  // ============================================================
+  PrintLn("--- BPF Programm ---");
+
+  // Minimales BPF-Programm: gibt 0 zurueck (alle Pakete erlaubt)
+  //   insn[0]: BPF_MOV64_IMM(r0, 0)  -- r0 = 0
+  //   insn[1]: BPF_EXIT               -- return r0
+  var insns: int64 := mmap(0, BPF_INSN_SIZE * 2, 3, 34, -1, 0);
+  BpfEmitRaw(insns, 0, BpfInsn(BPF_OP_MOV64_IMM, BPF_R0, 0, 0, 0));
+  BpfEmitRaw(insns, 1, BpfInsn(BPF_OP_EXIT,      0,      0, 0, 0));
+
+  // Test 4: BpfProgLoad(SOCKET_FILTER)
+  var license: pchar := "GPL";
+  var logBuf: int64 := mmap(0, 4096, 3, 34, -1, 0);
+  var progFd: int64 := BpfProgLoad(BPF_PROG_TYPE_SOCKET_FILTER, insns, 2, license, logBuf, 4096);
+
+  if (progFd < 0) {
+    if (progFd == -1 || progFd == -13) {
+      PrintLn("INFO: BpfProgLoad -- EPERM/EACCES (BPF gesperrt, Syscall erreichbar)");
+    } else {
+      if (progFd == -22) {
+        PrintLn("INFO: BpfProgLoad -- EINVAL (Verifier-Fehler oder Version)");
+        // Log ausgeben falls vorhanden
+        var logByte: int64 := peek8(logBuf);
+        if (logByte != 0) {
+          Print("  Verifier: "); PrintLn(logBuf as pchar);
+        }
+      } else {
+        Print("FAIL: BpfProgLoad unerwarteter Fehler="); PrintLn(progFd);
+        munmap(logBuf, 4096); munmap(insns, BPF_INSN_SIZE * 2); return 1;
+      }
+    }
+  } else {
+    Print("OK: BpfProgLoad(SOCKET_FILTER, 2 insns) -- fd="); PrintLn(progFd);
+    close(progFd);
+  }
+
+  // ============================================================
+  // --- Teil 3: BpfEmit -- Instruktions-Encoding pruefen ---
+  // ============================================================
+  PrintLn("--- BpfEmit Encoding ---");
+
+  // Test 5: BPF_OP_MOV64_IMM(r0, 42) -- Byte-Layout pruefen
+  var buf: int64 := mmap(0, 16, 3, 34, -1, 0);
+  BpfEmitRaw(buf, 0, BpfInsn(BPF_OP_MOV64_IMM, BPF_R0, 0, 0, 42));
+
+  var b0: int64 := peek8(buf);       // code = 0xB7
+  var b1: int64 := peek8(buf + 1);   // dst=0, src=0 -> 0x00
+  var imm: int64 := peek32(buf + 4); // imm = 42
+  if (b0 != 0xB7 || b1 != 0 || imm != 42) {
+    Print("FAIL: BpfEmit code="); Print(b0);
+    Print(" reg="); Print(b1);
+    Print(" imm="); PrintLn(imm);
+    munmap(buf, 16); munmap(logBuf, 4096); munmap(insns, BPF_INSN_SIZE * 2); return 1;
+  }
+  PrintLn("OK: BpfEmit MOV64_IMM(r0,42) -- Encoding korrekt");
+
+  // Test 6: BPF_OP_EXIT -- Byte-Layout pruefen
+  BpfEmitRaw(buf, 1, BpfInsn(BPF_OP_EXIT, 0, 0, 0, 0));
+  var ex0: int64 := peek8(buf + 8);  // code = 0x95
+  if (ex0 != 0x95) {
+    Print("FAIL: BpfEmit EXIT code="); PrintLn(ex0);
+    munmap(buf, 16); munmap(logBuf, 4096); munmap(insns, BPF_INSN_SIZE * 2); return 1;
+  }
+  PrintLn("OK: BpfEmit EXIT -- Encoding korrekt (0x95)");
+
+  munmap(buf, 16);
+  munmap(logBuf, 4096);
+  munmap(insns, BPF_INSN_SIZE * 2);
+
+  PrintLn("=== WP-19: alle Tests bestanden ===");
+  return 0;
+}

@@ -1,0 +1,254 @@
+// std/bpf -- WP-19: BPF-Programme
+// Wrapper um sys_bpf (321).
+//
+// BPF (Berkeley Packet Filter / extended BPF) ist ein Kernel-Subsystem
+// fuer sichere, verifizierte Programme im Kernel-Kontext. Haupteinsatz:
+// Tracing, Netzwerk-Filterung, Performance-Monitoring.
+//
+// Einschraenkungen: Auf Produktionssystemen erfordert BPF meistens
+// CAP_BPF oder CAP_SYS_ADMIN. Wenn unprivileged_bpf_disabled=1 (Ubuntu-
+// Default), schlaegt selbst das Anlegen einfacher Maps mit EPERM fehl.
+//
+// Dieser Wrapper bietet: Map-CRUD, Programm-Laden, Instruktions-Helfer.
+
+import std.alloc;
+
+// ============================================================
+// bpf() Kommando-Codes
+// ============================================================
+
+pub con BPF_MAP_CREATE:           int64 := 0;
+pub con BPF_MAP_LOOKUP_ELEM:      int64 := 1;
+pub con BPF_MAP_UPDATE_ELEM:      int64 := 2;
+pub con BPF_MAP_DELETE_ELEM:      int64 := 3;
+pub con BPF_MAP_GET_NEXT_KEY:     int64 := 4;
+pub con BPF_PROG_LOAD:            int64 := 5;
+pub con BPF_OBJ_PIN:              int64 := 6;
+pub con BPF_OBJ_GET:              int64 := 7;
+pub con BPF_PROG_ATTACH:          int64 := 8;
+pub con BPF_PROG_DETACH:          int64 := 9;
+pub con BPF_PROG_TEST_RUN:        int64 := 10;
+pub con BPF_MAP_GET_FD_BY_ID:     int64 := 14;
+pub con BPF_PROG_GET_FD_BY_ID:    int64 := 13;
+
+// ============================================================
+// BPF-Map-Typen
+// ============================================================
+
+pub con BPF_MAP_TYPE_UNSPEC:      int64 := 0;
+pub con BPF_MAP_TYPE_HASH:        int64 := 1;
+pub con BPF_MAP_TYPE_ARRAY:       int64 := 2;
+pub con BPF_MAP_TYPE_PROG_ARRAY:  int64 := 3;
+pub con BPF_MAP_TYPE_PERF_EVENT_ARRAY: int64 := 4;
+pub con BPF_MAP_TYPE_PERCPU_HASH: int64 := 5;
+pub con BPF_MAP_TYPE_PERCPU_ARRAY: int64 := 6;
+pub con BPF_MAP_TYPE_STACK_TRACE: int64 := 7;
+pub con BPF_MAP_TYPE_QUEUE:       int64 := 18;
+pub con BPF_MAP_TYPE_STACK:       int64 := 19;
+pub con BPF_MAP_TYPE_RINGBUF:     int64 := 27;
+
+// BPF_MAP_UPDATE_ELEM flags
+pub con BPF_ANY:     int64 := 0;   // Anlegen oder Ersetzen
+pub con BPF_NOEXIST: int64 := 1;   // Nur anlegen wenn nicht vorhanden
+pub con BPF_EXIST:   int64 := 2;   // Nur ersetzen wenn vorhanden
+
+// ============================================================
+// BPF-Programm-Typen
+// ============================================================
+
+pub con BPF_PROG_TYPE_UNSPEC:         int64 := 0;
+pub con BPF_PROG_TYPE_SOCKET_FILTER:  int64 := 1;
+pub con BPF_PROG_TYPE_KPROBE:         int64 := 2;
+pub con BPF_PROG_TYPE_SCHED_CLS:      int64 := 3;
+pub con BPF_PROG_TYPE_SCHED_ACT:      int64 := 4;
+pub con BPF_PROG_TYPE_TRACEPOINT:     int64 := 5;
+pub con BPF_PROG_TYPE_XDP:            int64 := 6;
+pub con BPF_PROG_TYPE_PERF_EVENT:     int64 := 7;
+
+// ============================================================
+// bpf_attr -- Groesse und Feld-Offsets
+// ============================================================
+
+// Universeller Puffer fuer alle bpf()-Kommandos
+pub con BPF_ATTR_SIZE: int64 := 128;
+
+// Felder fuer BPF_MAP_CREATE
+pub con BPF_MAP_C_TYPE:         int64 := 0;   // map_type (uint32)
+pub con BPF_MAP_C_KEY_SIZE:     int64 := 4;   // key_size (uint32)
+pub con BPF_MAP_C_VALUE_SIZE:   int64 := 8;   // value_size (uint32)
+pub con BPF_MAP_C_MAX_ENTRIES:  int64 := 12;  // max_entries (uint32)
+pub con BPF_MAP_C_FLAGS:        int64 := 16;  // map_flags (uint32)
+
+// Felder fuer BPF_MAP_{LOOKUP,UPDATE,DELETE,GET_NEXT_KEY}_ELEM
+pub con BPF_MAP_E_FD:           int64 := 0;   // map_fd (uint32)
+pub con BPF_MAP_E_KEY:          int64 := 8;   // key pointer (uint64, +4 alignment pad)
+pub con BPF_MAP_E_VALUE:        int64 := 16;  // value pointer (uint64)
+pub con BPF_MAP_E_FLAGS:        int64 := 24;  // flags (uint64)
+
+// Felder fuer BPF_PROG_LOAD
+pub con BPF_PROG_TYPE_OFF:      int64 := 0;   // prog_type (uint32)
+pub con BPF_PROG_INSN_CNT:      int64 := 4;   // insn_cnt (uint32)
+pub con BPF_PROG_INSNS:         int64 := 8;   // insns pointer (uint64)
+pub con BPF_PROG_LICENSE:       int64 := 16;  // license string pointer (uint64)
+pub con BPF_PROG_LOG_LEVEL:     int64 := 24;  // log_level (uint32)
+pub con BPF_PROG_LOG_SIZE:      int64 := 28;  // log_size (uint32)
+pub con BPF_PROG_LOG_BUF:       int64 := 32;  // log_buf pointer (uint64)
+pub con BPF_PROG_KERN_VERSION:  int64 := 40;  // kern_version (uint32)
+
+// ============================================================
+// BPF-Instruktions-Encoding
+// ============================================================
+
+// Jede BPF-Instruktion ist 8 Bytes:
+//   +0: opcode (uint8)
+//   +1: dst_reg(low 4 bit) | src_reg(high 4 bit)
+//   +2: offset (int16, little-endian)
+//   +4: immediate (int32, little-endian)
+pub con BPF_INSN_SIZE: int64 := 8;
+
+// Opcodes (haeufig verwendet)
+pub con BPF_OP_MOV64_IMM:  int64 := 0xB7;  // BPF_ALU64|BPF_MOV|BPF_K
+pub con BPF_OP_MOV64_REG:  int64 := 0xBF;  // BPF_ALU64|BPF_MOV|BPF_X
+pub con BPF_OP_MOV32_IMM:  int64 := 0xB4;  // BPF_ALU|BPF_MOV|BPF_K
+pub con BPF_OP_ADD64_IMM:  int64 := 0x07;  // BPF_ALU64|BPF_ADD|BPF_K
+pub con BPF_OP_ADD64_REG:  int64 := 0x0F;  // BPF_ALU64|BPF_ADD|BPF_X
+pub con BPF_OP_EXIT:       int64 := 0x95;  // BPF_JMP|BPF_EXIT
+pub con BPF_OP_CALL:       int64 := 0x85;  // BPF_JMP|BPF_CALL
+pub con BPF_OP_JMP_A:      int64 := 0x05;  // BPF_JMP|BPF_JA (unconditional jump)
+pub con BPF_OP_JEQ_IMM:    int64 := 0x15;  // BPF_JMP|BPF_JEQ|BPF_K
+pub con BPF_OP_JNE_IMM:    int64 := 0x55;  // BPF_JMP|BPF_JNE|BPF_K
+pub con BPF_OP_STW:        int64 := 0x62;  // store 32-bit to stack
+pub con BPF_OP_LDW:        int64 := 0x61;  // load 32-bit from memory
+pub con BPF_OP_LDMAPFD:    int64 := 0x18;  // load map fd (2-insn pseudo-ld)
+
+// Register-Nummern
+pub con BPF_R0:  int64 := 0;   // Rueckgabewert
+pub con BPF_R1:  int64 := 1;   // Argument 1
+pub con BPF_R2:  int64 := 2;   // Argument 2
+pub con BPF_R3:  int64 := 3;   // Argument 3
+pub con BPF_R4:  int64 := 4;   // Argument 4
+pub con BPF_R5:  int64 := 5;   // Argument 5
+pub con BPF_R6:  int64 := 6;   // Callee-gespeichert
+pub con BPF_R7:  int64 := 7;   // Callee-gespeichert
+pub con BPF_R8:  int64 := 8;   // Callee-gespeichert
+pub con BPF_R9:  int64 := 9;   // Callee-gespeichert
+pub con BPF_R10: int64 := 10;  // Frame-Pointer (nur-lesen)
+
+// ============================================================
+// Instruktions-Helfer
+// ============================================================
+
+// BpfInsn: kodiert eine BPF-Instruktion als 8-Byte-int64 (Little-Endian).
+// code: Opcode-Byte (BPF_OP_*)
+// dst:  Zielregister (0..10)
+// src:  Quellregister (0..10)
+// off:  16-Bit-Sprung/Speicher-Offset
+// imm:  32-Bit-Immediat-Wert (Vorzeichen korrekt durch int64-Arithmetik)
+pub fn BpfInsn(code: int64, dst: int64, src: int64, off: int64, imm: int64): int64 {
+  var v: int64 := code;
+  v := v | ((dst & 15) * 256);
+  v := v | ((src & 15) * 4096);
+  v := v | ((off & 0xFFFF) * 65536);
+  v := v | (imm * 4294967296);
+  return v;
+}
+
+// BpfEmitRaw: schreibt eine vorberechnete Instruktion (8 Bytes) in den Puffer.
+// buf: Instruktionspuffer
+// n:   0-basierter Instruktions-Index
+pub fn BpfEmitRaw(buf: int64, n: int64, insn: int64): int64 {
+  poke64(buf + n * BPF_INSN_SIZE, insn);
+  return 0;
+}
+
+// ============================================================
+// BPF-Map-Operationen
+// ============================================================
+
+// BpfMapCreate: legt eine neue BPF-Map an.
+// mapType:    BPF_MAP_TYPE_*
+// keySize:    Schluesselgroesse in Bytes
+// valSize:    Wertgroesse in Bytes
+// maxEntries: Maximale Anzahl Eintraege
+// Gibt map_fd (>= 0) oder -errno zurueck.
+pub fn BpfMapCreate(mapType: int64, keySize: int64, valSize: int64, maxEntries: int64): int64 {
+  var attr: int64 := alloc(BPF_ATTR_SIZE);
+  if (attr == 0) { return -12; }
+  poke32(attr + BPF_MAP_C_TYPE,        mapType as int32);
+  poke32(attr + BPF_MAP_C_KEY_SIZE,    keySize as int32);
+  poke32(attr + BPF_MAP_C_VALUE_SIZE,  valSize as int32);
+  poke32(attr + BPF_MAP_C_MAX_ENTRIES, maxEntries as int32);
+  var fd: int64 := sys_bpf(BPF_MAP_CREATE, attr, BPF_ATTR_SIZE);
+  free(attr, BPF_ATTR_SIZE);
+  return fd;
+}
+
+// BpfMapLookup: liest einen Wert aus der Map.
+// mapFd:  Dateideskriptor der Map
+// key:    Zeiger auf den Schluessel
+// valOut: Zeiger auf den Ausgabepuffer fuer den Wert
+pub fn BpfMapLookup(mapFd: int64, key: int64, valOut: int64): int64 {
+  var attr: int64 := alloc(BPF_ATTR_SIZE);
+  if (attr == 0) { return -12; }
+  poke32(attr + BPF_MAP_E_FD,    mapFd as int32);
+  poke64(attr + BPF_MAP_E_KEY,   key);
+  poke64(attr + BPF_MAP_E_VALUE, valOut);
+  var r: int64 := sys_bpf(BPF_MAP_LOOKUP_ELEM, attr, BPF_ATTR_SIZE);
+  free(attr, BPF_ATTR_SIZE);
+  return r;
+}
+
+// BpfMapUpdate: schreibt oder aktualisiert einen Wert in der Map.
+// flags: BPF_ANY, BPF_NOEXIST oder BPF_EXIST
+pub fn BpfMapUpdate(mapFd: int64, key: int64, val: int64, flags: int64): int64 {
+  var attr: int64 := alloc(BPF_ATTR_SIZE);
+  if (attr == 0) { return -12; }
+  poke32(attr + BPF_MAP_E_FD,    mapFd as int32);
+  poke64(attr + BPF_MAP_E_KEY,   key);
+  poke64(attr + BPF_MAP_E_VALUE, val);
+  poke64(attr + BPF_MAP_E_FLAGS, flags);
+  var r: int64 := sys_bpf(BPF_MAP_UPDATE_ELEM, attr, BPF_ATTR_SIZE);
+  free(attr, BPF_ATTR_SIZE);
+  return r;
+}
+
+// BpfMapDelete: entfernt einen Eintrag aus der Map.
+pub fn BpfMapDelete(mapFd: int64, key: int64): int64 {
+  var attr: int64 := alloc(BPF_ATTR_SIZE);
+  if (attr == 0) { return -12; }
+  poke32(attr + BPF_MAP_E_FD,  mapFd as int32);
+  poke64(attr + BPF_MAP_E_KEY, key);
+  var r: int64 := sys_bpf(BPF_MAP_DELETE_ELEM, attr, BPF_ATTR_SIZE);
+  free(attr, BPF_ATTR_SIZE);
+  return r;
+}
+
+// ============================================================
+// BPF-Programm-Laden
+// ============================================================
+
+// BpfProgLoad: laedt ein BPF-Programm in den Kernel.
+// progType: BPF_PROG_TYPE_*
+// insns:    Zeiger auf Array von BPF-Instruktionen (je 8 Bytes)
+// insnCnt:  Anzahl der Instruktionen
+// license:  Lizenz-String (z.B. "GPL")
+// logBuf:   Zeiger auf Verifier-Log-Puffer (0 = kein Log)
+// logSize:  Groesse des Log-Puffers (0 wenn logBuf=0)
+// Gibt prog_fd (>= 0) oder -errno zurueck.
+pub fn BpfProgLoad(progType: int64, insns: int64, insnCnt: int64,
+                   license: pchar, logBuf: int64, logSize: int64): int64 {
+  var attr: int64 := alloc(BPF_ATTR_SIZE);
+  if (attr == 0) { return -12; }
+  poke32(attr + BPF_PROG_TYPE_OFF,  progType as int32);
+  poke32(attr + BPF_PROG_INSN_CNT,  insnCnt as int32);
+  poke64(attr + BPF_PROG_INSNS,     insns);
+  poke64(attr + BPF_PROG_LICENSE,   license as int64);
+  if (logBuf != 0) {
+    poke32(attr + BPF_PROG_LOG_LEVEL, 1);
+    poke32(attr + BPF_PROG_LOG_SIZE,  logSize as int32);
+    poke64(attr + BPF_PROG_LOG_BUF,   logBuf);
+  }
+  var fd: int64 := sys_bpf(BPF_PROG_LOAD, attr, BPF_ATTR_SIZE);
+  free(attr, BPF_ATTR_SIZE);
+  return fd;
+}
