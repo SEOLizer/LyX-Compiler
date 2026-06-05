@@ -1,0 +1,177 @@
+// std/mqueue — WP-11: POSIX Message Queues
+// Wrapper um sys_mq_open, sys_mq_unlink, sys_mq_timedsend,
+// sys_mq_timedreceive, sys_mq_getsetattr
+//
+// Queue-Namen dürfen mit '/' beginnen (z.B. "/meine_queue") — das führende
+// '/' wird intern wie beim glibc-Wrapper vor dem Syscall entfernt, da der
+// Kernel-Lookup (lookup_one_len) Schrägstriche im Namen ablehnt.
+// Queues erscheinen im Dateisystem als /dev/mqueue/<name>.
+
+import std.alloc;
+
+// mqNamePtr: gibt Zeiger auf ersten Nicht-'/'-Buchstaben zurück.
+fn mqNamePtr(name: pchar): pchar {
+  if (peek8(name as int64) == 47) { return (name as int64 + 1) as pchar; }
+  return name;
+}
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+// Open-Flags (wie O_*)
+pub con MQ_OPEN_RDONLY:   int64 := 0;     // Nur lesen
+pub con MQ_OPEN_WRONLY:   int64 := 1;     // Nur schreiben
+pub con MQ_OPEN_RDWR:     int64 := 2;     // Lesen und schreiben
+pub con MQ_OPEN_CREATE:   int64 := 64;    // 0x40 — Queue anlegen falls nicht vorhanden
+pub con MQ_OPEN_EXCL:     int64 := 128;   // 0x80 — Fehler wenn Queue schon existiert
+pub con MQ_OPEN_NONBLOCK: int64 := 2048;  // 0x800 — nicht-blockierend
+
+// mq_attr Struktur (64 Bytes, 8 long-Felder je 8 Bytes)
+//   +0:  mq_flags   (O_NONBLOCK oder 0)
+//   +8:  mq_maxmsg  (max. Anzahl Nachrichten in der Queue)
+//   +16: mq_msgsize (max. Nachrichtenlänge in Bytes)
+//   +24: mq_curmsgs (aktuelle Anzahl Nachrichten, Read-Only)
+//   +32: __reserved (32 Bytes Padding)
+pub con MQ_ATTR_SIZE:       int64 := 64;
+pub con MQ_ATTR_FLAGS:      int64 := 0;
+pub con MQ_ATTR_MAXMSG:     int64 := 8;
+pub con MQ_ATTR_MSGSIZE:    int64 := 16;
+pub con MQ_ATTR_CURMSGS:    int64 := 24;
+
+// Standard-Queue-Parameter (wenn attr=NULL bei MqOpen)
+pub con MQ_DEFAULT_MAXMSG:  int64 := 10;
+pub con MQ_DEFAULT_MSGSIZE: int64 := 8192;
+
+// Maximale Nachrichtenpriorität
+pub con MQ_PRIO_MAX: int64 := 32767;
+
+// timespec-Größe für Timeout-Berechnung
+pub con MQ_TIMESPEC_SIZE: int64 := 16;
+pub con MQ_NS_PER_SEC:    int64 := 1000000000;
+
+// ============================================================
+// Queue öffnen / schließen / löschen
+// ============================================================
+
+// MqOpen: öffnet oder erstellt eine POSIX-Message-Queue.
+// name:  Queue-Name, muss mit '/' beginnen (z.B. "/meine_queue")
+// flags: Kombination aus MQ_OPEN_RDONLY/WRONLY/RDWR + MQ_OPEN_CREATE
+// mode:  Zugriffsrechte bei MQ_OPEN_CREATE (z.B. 420 = 0644)
+// Verwendet System-Defaults (max. 10 Nachrichten, 8192 Bytes).
+pub fn MqOpen(name: pchar, flags: int64, mode: int64): int64 {
+  return sys_mq_open(mqNamePtr(name), flags, mode, 0);
+}
+
+// MqOpenWith: wie MqOpen, aber mit expliziter Kapazität.
+// maxmsg:  maximale Anzahl gleichzeitiger Nachrichten
+// msgsize: maximale Länge einer einzelnen Nachricht
+pub fn MqOpenWith(name: pchar, flags: int64, mode: int64,
+                  maxmsg: int64, msgsize: int64): int64 {
+  var attr: int64 := alloc(MQ_ATTR_SIZE);
+  if (attr == 0) { return -1; }
+  poke64(attr + MQ_ATTR_FLAGS,   0);
+  poke64(attr + MQ_ATTR_MAXMSG,  maxmsg);
+  poke64(attr + MQ_ATTR_MSGSIZE, msgsize);
+  poke64(attr + MQ_ATTR_CURMSGS, 0);
+  var fd: int64 := sys_mq_open(mqNamePtr(name), flags, mode, attr);
+  free(attr, MQ_ATTR_SIZE);
+  return fd;
+}
+
+// MqClose: schließt den Queue-Deskriptor (wie close(fd)).
+pub fn MqClose(fd: int64): int64 {
+  return close(fd);
+}
+
+// MqUnlink: löscht die Queue aus dem System.
+// Die Queue existiert weiter bis alle Deskriptoren geschlossen sind.
+pub fn MqUnlink(name: pchar): int64 {
+  return sys_mq_unlink(mqNamePtr(name));
+}
+
+// ============================================================
+// Nachrichten senden
+// ============================================================
+
+// MqSend: sendet eine Nachricht (blockiert bei voller Queue).
+// fd:     Queue-Deskriptor
+// msg:    Zeiger auf Nachricht
+// msgLen: Länge der Nachricht
+// prio:   Priorität (0..MQ_PRIO_MAX, höher = zuerst)
+pub fn MqSend(fd: int64, msg: int64, msgLen: int64, prio: int64): int64 {
+  return sys_mq_timedsend(fd, msg, msgLen, prio, 0);
+}
+
+// MqTimedSend: sendet mit absolutem Timeout (Nanosekunden seit CLOCK_REALTIME).
+// Gibt -ETIMEDOUT (-110) zurück wenn Queue voll und Timeout abgelaufen.
+pub fn MqTimedSend(fd: int64, msg: int64, msgLen: int64,
+                   prio: int64, timeoutNs: int64): int64 {
+  var ts: int64 := alloc(MQ_TIMESPEC_SIZE);
+  if (ts == 0) { return -1; }
+  poke64(ts,     timeoutNs / MQ_NS_PER_SEC);
+  poke64(ts + 8, timeoutNs % MQ_NS_PER_SEC);
+  var r: int64 := sys_mq_timedsend(fd, msg, msgLen, prio, ts);
+  free(ts, MQ_TIMESPEC_SIZE);
+  return r;
+}
+
+// ============================================================
+// Nachrichten empfangen
+// ============================================================
+
+// MqRecv: empfängt eine Nachricht (blockiert bei leerer Queue).
+// fd:      Queue-Deskriptor
+// buf:     Empfangspuffer
+// bufLen:  Puffergröße (muss >= mq_msgsize sein)
+// prioOut: Zeiger auf int64 für Priorität (0 = ignorieren)
+// Gibt Anzahl empfangener Bytes zurück, oder < 0 bei Fehler.
+pub fn MqRecv(fd: int64, buf: int64, bufLen: int64, prioOut: int64): int64 {
+  return sys_mq_timedreceive(fd, buf, bufLen, prioOut, 0);
+}
+
+// MqTimedRecv: empfängt mit absolutem Timeout (Nanosekunden seit CLOCK_REALTIME).
+pub fn MqTimedRecv(fd: int64, buf: int64, bufLen: int64,
+                   prioOut: int64, timeoutNs: int64): int64 {
+  var ts: int64 := alloc(MQ_TIMESPEC_SIZE);
+  if (ts == 0) { return -1; }
+  poke64(ts,     timeoutNs / MQ_NS_PER_SEC);
+  poke64(ts + 8, timeoutNs % MQ_NS_PER_SEC);
+  var r: int64 := sys_mq_timedreceive(fd, buf, bufLen, prioOut, ts);
+  free(ts, MQ_TIMESPEC_SIZE);
+  return r;
+}
+
+// ============================================================
+// Queue-Attribute lesen / ändern
+// ============================================================
+
+// MqGetAttr: liest die aktuellen Queue-Attribute in einen mq_attr-Puffer.
+// attrBuf: alloc(MQ_ATTR_SIZE)
+pub fn MqGetAttr(fd: int64, attrBuf: int64): int64 {
+  return sys_mq_getsetattr(fd, 0, attrBuf);
+}
+
+// MqGetMaxMsg: liefert die maximale Anzahl Nachrichten der Queue.
+pub fn MqGetMaxMsg(fd: int64): int64 {
+  var attr: int64 := alloc(MQ_ATTR_SIZE);
+  if (attr == 0) { return -1; }
+  var r: int64 := sys_mq_getsetattr(fd, 0, attr);
+  var v: int64 := 0;
+  if (r == 0) { v := peek64(attr + MQ_ATTR_MAXMSG); }
+  free(attr, MQ_ATTR_SIZE);
+  if (r < 0) { return r; }
+  return v;
+}
+
+// MqGetCurMsgs: liefert die aktuelle Anzahl wartender Nachrichten.
+pub fn MqGetCurMsgs(fd: int64): int64 {
+  var attr: int64 := alloc(MQ_ATTR_SIZE);
+  if (attr == 0) { return -1; }
+  var r: int64 := sys_mq_getsetattr(fd, 0, attr);
+  var v: int64 := 0;
+  if (r == 0) { v := peek64(attr + MQ_ATTR_CURMSGS); }
+  free(attr, MQ_ATTR_SIZE);
+  if (r < 0) { return r; }
+  return v;
+}

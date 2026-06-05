@@ -1,0 +1,478 @@
+// ===========================================================================
+// WP-T14: Capability-Migration-Tool  (`--migrate-capabilities`)
+// ===========================================================================
+// Analysiert den semantischen AST und gibt ein minimales @capabilities([...])-
+// Manifest auf stdout aus.  Warnungen gehen auf stderr.
+//
+// Verwendung (in lyxc.lyx): mc_run_and_print(parser.nodes, source, astRoot)
+//
+// Erkannte Capabilities:
+//   fs.read     — fopen, open, openat, read, fread, pread64, getline
+//   fs.write    — write, fwrite, pwrite64, fputs, puts, fprintf
+//   fs.create   — creat
+//   fs.delete   — unlink, unlinkat, remove, rmdir
+//   fs.meta     — stat, lstat, fstat, statx, getdents64
+//   fs.exec     — execve, execveat, execvp, execlp
+//   memory.mmap — mmap, mprotect
+//   memory.lock — mlock, mlockall
+//   network.tcp.bind    — bind, listen, accept, accept4
+//   network.tcp.connect — socket, connect, send, recv, setsockopt
+//   network.udp.connect — sendto, recvfrom, sendmsg, recvmsg
+//   process.fork   — fork, clone
+//   process.exec   — execve, execveat  (auch fs.exec)
+//   process.signal — kill, tgkill
+//   process.sched  — sched_setattr, nice
+//   system.time    — time, clock_gettime
+//   system.rand    — getrandom, rand, random
+//   system.env     — getenv, setenv, unsetenv
+//   hardware.gpio  — ioctl  (mit Hinweis: Device manuell prüfen)
+
+// ── AST-Zugriffs-Konstanten (Bootstrap-sichere Kopien aus codegen_x86.lyx) ──
+con MC_NODE_SZ:  int64 := 88;
+con MC_OFF_KIND: int64 := 0;
+con MC_OFF_C0:   int64 := 8;
+con MC_OFF_C1:   int64 := 16;
+con MC_OFF_C2:   int64 := 24;
+con MC_OFF_C3:   int64 := 32;
+con MC_OFF_NEXT: int64 := 40;
+con MC_OFF_SOFF: int64 := 64;  // Offset des Namens in pSrc
+con MC_OFF_SLEN: int64 := 72;
+
+// Inline-Hilfsfunktionen für Node-Zugriff
+fn mc_kind(nodes: int64, i: int64): int64 { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_KIND); }
+fn mc_c0(nodes: int64, i: int64): int64   { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_C0); }
+fn mc_c1(nodes: int64, i: int64): int64   { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_C1); }
+fn mc_c2(nodes: int64, i: int64): int64   { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_C2); }
+fn mc_c3(nodes: int64, i: int64): int64   { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_C3); }
+fn mc_next(nodes: int64, i: int64): int64 { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_NEXT); }
+fn mc_soff(nodes: int64, i: int64): int64 { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_SOFF); }
+fn mc_slen(nodes: int64, i: int64): int64 { return peek64(nodes + i * MC_NODE_SZ + MC_OFF_SLEN); }
+
+// Vergleicht AST-Namen (Länge slen, Offset soff in pSrc) mit C-Literal
+fn mc_name_eq(pSrc: pchar, soff: int64, slen: int64, lit: pchar): bool {
+  var i: int64 := 0;
+  while i < slen {
+    if (StrCharAt(pSrc, soff + i) & 255) != (StrCharAt(lit, i) & 255) { return false; }
+    i := i + 1;
+  }
+  return StrCharAt(lit, slen) == 0;
+}
+
+// Capability-ID für einen Funktionsnamen (-1 = unbekannt).
+fn mc_map_cap(pSrc: pchar, soff: int64, slen: int64): int64 {
+  // fs.read (7)
+  if mc_name_eq(pSrc, soff, slen, "fopen"c)     { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "open"c)      { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "openat"c)    { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "read"c)      { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "fread"c)     { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "pread64"c)   { return 7; }
+  if mc_name_eq(pSrc, soff, slen, "getline"c)   { return 7; }
+  // fs.write (8)
+  if mc_name_eq(pSrc, soff, slen, "write"c)     { return 8; }
+  if mc_name_eq(pSrc, soff, slen, "fwrite"c)    { return 8; }
+  if mc_name_eq(pSrc, soff, slen, "pwrite64"c)  { return 8; }
+  if mc_name_eq(pSrc, soff, slen, "fputs"c)     { return 8; }
+  if mc_name_eq(pSrc, soff, slen, "puts"c)      { return 8; }
+  if mc_name_eq(pSrc, soff, slen, "fprintf"c)   { return 8; }
+  // fs.create (9)
+  if mc_name_eq(pSrc, soff, slen, "creat"c)     { return 9; }
+  // fs.delete (10)
+  if mc_name_eq(pSrc, soff, slen, "unlink"c)    { return 10; }
+  if mc_name_eq(pSrc, soff, slen, "unlinkat"c)  { return 10; }
+  if mc_name_eq(pSrc, soff, slen, "remove"c)    { return 10; }
+  if mc_name_eq(pSrc, soff, slen, "rmdir"c)     { return 10; }
+  // fs.meta (11)
+  if mc_name_eq(pSrc, soff, slen, "stat"c)      { return 11; }
+  if mc_name_eq(pSrc, soff, slen, "lstat"c)     { return 11; }
+  if mc_name_eq(pSrc, soff, slen, "fstat"c)     { return 11; }
+  if mc_name_eq(pSrc, soff, slen, "statx"c)     { return 11; }
+  if mc_name_eq(pSrc, soff, slen, "getdents64"c){ return 11; }
+  // fs.exec (12) — auch process.exec (26) bei execve-Familie
+  if mc_name_eq(pSrc, soff, slen, "execve"c)    { return 12; }
+  if mc_name_eq(pSrc, soff, slen, "execveat"c)  { return 12; }
+  if mc_name_eq(pSrc, soff, slen, "execvp"c)    { return 12; }
+  if mc_name_eq(pSrc, soff, slen, "execlp"c)    { return 12; }
+  // memory.mmap (13)
+  if mc_name_eq(pSrc, soff, slen, "mmap"c)      { return 13; }
+  if mc_name_eq(pSrc, soff, slen, "mprotect"c)  { return 13; }
+  // memory.lock (14)
+  if mc_name_eq(pSrc, soff, slen, "mlock"c)     { return 14; }
+  if mc_name_eq(pSrc, soff, slen, "mlockall"c)  { return 14; }
+  // network.tcp.bind (15)
+  if mc_name_eq(pSrc, soff, slen, "bind"c)      { return 15; }
+  if mc_name_eq(pSrc, soff, slen, "listen"c)    { return 15; }
+  if mc_name_eq(pSrc, soff, slen, "accept"c)    { return 15; }
+  if mc_name_eq(pSrc, soff, slen, "accept4"c)   { return 15; }
+  // network.tcp.connect (16)
+  if mc_name_eq(pSrc, soff, slen, "socket"c)    { return 16; }
+  if mc_name_eq(pSrc, soff, slen, "connect"c)   { return 16; }
+  if mc_name_eq(pSrc, soff, slen, "send"c)      { return 16; }
+  if mc_name_eq(pSrc, soff, slen, "recv"c)      { return 16; }
+  if mc_name_eq(pSrc, soff, slen, "setsockopt"c){ return 16; }
+  // network.udp.connect (18)
+  if mc_name_eq(pSrc, soff, slen, "sendto"c)    { return 18; }
+  if mc_name_eq(pSrc, soff, slen, "recvfrom"c)  { return 18; }
+  if mc_name_eq(pSrc, soff, slen, "sendmsg"c)   { return 18; }
+  if mc_name_eq(pSrc, soff, slen, "recvmsg"c)   { return 18; }
+  // process.fork (25)
+  if mc_name_eq(pSrc, soff, slen, "fork"c)      { return 25; }
+  if mc_name_eq(pSrc, soff, slen, "clone"c)     { return 25; }
+  // process.exec (26)
+  if mc_name_eq(pSrc, soff, slen, "execve"c)    { return 26; }
+  // process.signal (27)
+  if mc_name_eq(pSrc, soff, slen, "kill"c)      { return 27; }
+  if mc_name_eq(pSrc, soff, slen, "tgkill"c)    { return 27; }
+  // process.sched (28)
+  if mc_name_eq(pSrc, soff, slen, "sched_setattr"c) { return 28; }
+  if mc_name_eq(pSrc, soff, slen, "nice"c)      { return 28; }
+  // system.time (3)
+  if mc_name_eq(pSrc, soff, slen, "time"c)      { return 3; }
+  if mc_name_eq(pSrc, soff, slen, "clock_gettime"c) { return 3; }
+  // system.rand (5)
+  if mc_name_eq(pSrc, soff, slen, "getrandom"c) { return 5; }
+  if mc_name_eq(pSrc, soff, slen, "rand"c)      { return 5; }
+  if mc_name_eq(pSrc, soff, slen, "random"c)    { return 5; }
+  // system.env (4)
+  if mc_name_eq(pSrc, soff, slen, "getenv"c)    { return 4; }
+  if mc_name_eq(pSrc, soff, slen, "setenv"c)    { return 4; }
+  if mc_name_eq(pSrc, soff, slen, "unsetenv"c)  { return 4; }
+  // hardware.gpio (21) — ioctl auf Device-Files
+  if mc_name_eq(pSrc, soff, slen, "ioctl"c)     { return 21; }
+  return 0 - 1;
+}
+
+// Welches Argument (0-basiert) enthält den Pfad? -1 wenn kein Pfad-Argument.
+fn mc_path_arg_idx(pSrc: pchar, soff: int64, slen: int64): int64 {
+  // openat(dirfd, path, flags): Pfad ist arg1
+  if mc_name_eq(pSrc, soff, slen, "openat"c)   { return 1; }
+  if mc_name_eq(pSrc, soff, slen, "unlinkat"c)  { return 1; }
+  if mc_name_eq(pSrc, soff, slen, "statx"c)     { return 1; }
+  // getenv, setenv etc.: Pfad ist arg0 (der Name)
+  if mc_name_eq(pSrc, soff, slen, "getenv"c)    { return 0; }
+  // fopen, open, stat, creat, unlink, execve, etc.: Pfad ist arg0
+  if mc_name_eq(pSrc, soff, slen, "fopen"c)     { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "open"c)      { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "creat"c)     { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "unlink"c)    { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "remove"c)    { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "rmdir"c)     { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "stat"c)      { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "lstat"c)     { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "execve"c)    { return 0; }
+  if mc_name_eq(pSrc, soff, slen, "execvp"c)    { return 0; }
+  return 0 - 1;  // kein Pfad-Argument
+}
+
+// ── State-Offsets ─────────────────────────────────────────────────────────
+// state = alloc'd [capBits:8, pathBuf:8, pathCount:8, hasDynPath:8] = 32 Bytes
+// pathBuf = alloc'd [capId:8, pathOff:8, pathLen:8] × 32 = 768 Bytes
+con MC_ST_CAPBITS:    int64 := 0;
+con MC_ST_PATHBUF:    int64 := 8;
+con MC_ST_PATHCOUNT:  int64 := 16;
+con MC_ST_HASDYNPATH: int64 := 24;
+con MC_ST_SZ:         int64 := 32;
+con MC_PATH_SZ:       int64 := 24;
+con MC_PATH_CAPID:    int64 := 0;
+con MC_PATH_OFF:      int64 := 8;
+con MC_PATH_LEN:      int64 := 16;
+con MC_PATH_MAX:      int64 := 32;
+
+// Verarbeitet einen NK_CALL-Knoten (49): extrahiert Capability und ggf. Pfad.
+fn mc_process_call(nodes: int64, pSrc: pchar, ni: int64, state: int64): void {
+  var soff: int64 := mc_soff(nodes, ni);
+  var slen: int64 := mc_slen(nodes, ni);
+  var capId: int64 := mc_map_cap(pSrc, soff, slen);
+  if capId < 0 { return; }
+  // Capability-Bit setzen
+  var bits: int64 := peek64(state + MC_ST_CAPBITS);
+  poke64(state + MC_ST_CAPBITS, bits | (1 << capId));
+  // Pfad-Argument extrahieren (nur für fs.*-Capabilities)
+  var pathIdx: int64 := mc_path_arg_idx(pSrc, soff, slen);
+  if pathIdx >= 0 && capId >= 7 && capId <= 12 {
+    // Argument pathIdx aus der Argument-Liste holen
+    var arg: int64 := mc_c0(nodes, ni);
+    var ai: int64 := 0;
+    while ai < pathIdx && arg >= 0 {
+      arg := mc_next(nodes, arg);
+      ai := ai + 1;
+    }
+    if arg >= 0 {
+      if mc_kind(nodes, arg) == 42 {  // NK_LIT_STR = 42
+        // Pfad-Literal: sOff zeigt auf '"', sLen schließt '"' und ggf. 'c'-Suffix ein
+        // Inhalt: sOff+1 .. sOff+sLen-2 (beide '"' entfernt), 'c'-Suffix extra abziehen
+        var rawOff: int64 := mc_soff(nodes, arg);
+        var rawLen: int64 := mc_slen(nodes, arg);
+        var adjOff: int64 := rawOff + 1;
+        var adjLen: int64 := rawLen - 2;
+        if (StrCharAt(pSrc, rawOff + rawLen - 1) & 255) == 99 { adjLen := adjLen - 1; }
+        if adjLen < 0 { adjLen := 0; }
+        var pc: int64 := peek64(state + MC_ST_PATHCOUNT);
+        if pc < MC_PATH_MAX {
+          var pb: int64 := peek64(state + MC_ST_PATHBUF);
+          var pe: int64 := pb + pc * MC_PATH_SZ;
+          poke64(pe + MC_PATH_CAPID, capId);
+          poke64(pe + MC_PATH_OFF,   adjOff);
+          poke64(pe + MC_PATH_LEN,   adjLen);
+          poke64(state + MC_ST_PATHCOUNT, pc + 1);
+        }
+      } else {
+        // Kein String-Literal: dynamischer Pfad
+        poke64(state + MC_ST_HASDYNPATH, 1);
+      }
+    }
+  }
+}
+
+// Rekursive Ausdrucks-/Statement-Analyse (Tiefe begrenzt auf 30)
+fn mc_walk_expr(nodes: int64, pSrc: pchar, ni: int64, state: int64, depth: int64): void {
+  if ni < 0 || depth > 30 { return; }
+  var k: int64 := mc_kind(nodes, ni);
+  if k == 49 {  // NK_CALL
+    mc_process_call(nodes, pSrc, ni, state);
+    var arg: int64 := mc_c0(nodes, ni);
+    while arg >= 0 {
+      mc_walk_expr(nodes, pSrc, arg, state, depth + 1);
+      arg := mc_next(nodes, arg);
+    }
+  } else if k == 47 || k == 48 {  // NK_BINOP / NK_UNOP
+    mc_walk_expr(nodes, pSrc, mc_c0(nodes, ni), state, depth + 1);
+    mc_walk_expr(nodes, pSrc, mc_c1(nodes, ni), state, depth + 1);
+  }
+}
+
+fn mc_walk_stmt(nodes: int64, pSrc: pchar, ni: int64, state: int64, depth: int64): void {
+  if ni < 0 || depth > 30 { return; }
+  var k: int64 := mc_kind(nodes, ni);
+  if k == 20 {  // NK_BLOCK
+    var stmt: int64 := mc_c0(nodes, ni);
+    while stmt >= 0 {
+      mc_walk_stmt(nodes, pSrc, stmt, state, depth + 1);
+      stmt := mc_next(nodes, stmt);
+    }
+  } else if k == 21 {  // NK_IF
+    mc_walk_expr(nodes, pSrc, mc_c0(nodes, ni), state, depth + 1);
+    mc_walk_stmt(nodes, pSrc, mc_c1(nodes, ni), state, depth + 1);
+    mc_walk_stmt(nodes, pSrc, mc_c2(nodes, ni), state, depth + 1);
+  } else if k == 22 {  // NK_WHILE
+    mc_walk_expr(nodes, pSrc, mc_c0(nodes, ni), state, depth + 1);
+    mc_walk_stmt(nodes, pSrc, mc_c1(nodes, ni), state, depth + 1);
+  } else if k == 23 {  // NK_RETURN
+    mc_walk_expr(nodes, pSrc, mc_c0(nodes, ni), state, depth + 1);
+  } else if k == 24 {  // NK_EXPR_STMT
+    mc_walk_expr(nodes, pSrc, mc_c0(nodes, ni), state, depth + 1);
+  } else if k == 25 {  // NK_ASSIGN
+    mc_walk_expr(nodes, pSrc, mc_c1(nodes, ni), state, depth + 1);
+  } else if k == 4 {  // NK_VAR_DECL
+    mc_walk_expr(nodes, pSrc, mc_c1(nodes, ni), state, depth + 1);
+  }
+}
+
+// Gibt den Capability-Namen für das Manifest zurück.
+fn mc_cap_name(capId: int64): pchar {
+  if capId == 3  { return "system.time"c; }
+  if capId == 4  { return "system.env"c; }
+  if capId == 5  { return "system.rand"c; }
+  if capId == 7  { return "fs.read"c; }
+  if capId == 8  { return "fs.write"c; }
+  if capId == 9  { return "fs.create"c; }
+  if capId == 10 { return "fs.delete"c; }
+  if capId == 11 { return "fs.meta"c; }
+  if capId == 12 { return "fs.exec"c; }
+  if capId == 13 { return "memory.mmap"c; }
+  if capId == 14 { return "memory.lock"c; }
+  if capId == 15 { return "network.tcp.bind"c; }
+  if capId == 16 { return "network.tcp.connect"c; }
+  if capId == 17 { return "network.udp.bind"c; }
+  if capId == 18 { return "network.udp.connect"c; }
+  if capId == 21 { return "hardware.gpio"c; }
+  if capId == 22 { return "hardware.i2c"c; }
+  if capId == 23 { return "hardware.spi"c; }
+  if capId == 24 { return "hardware.usb"c; }
+  if capId == 25 { return "process.fork"c; }
+  if capId == 26 { return "process.exec"c; }
+  if capId == 27 { return "process.signal"c; }
+  if capId == 28 { return "process.sched"c; }
+  if capId == 29 { return "process.exit"c; }
+  return "unknown"c;
+}
+
+// Gibt an ob diese Capability einen manuellen Hinweis (Adresse/Port) braucht.
+fn mc_needs_addr_hint(capId: int64): bool {
+  return capId == 15 || capId == 16 || capId == 17 || capId == 18;
+}
+
+// Druckt einen längengebundenen String (pSrc + off, len Bytes) auf stdout.
+fn mc_print_strn(pSrc: pchar, off: int64, len: int64): void {
+  var buf: int64 := alloc(len + 1);
+  var i: int64 := 0;
+  while i < len {
+    poke8(buf + i, StrCharAt(pSrc, off + i));
+    i := i + 1;
+  }
+  poke8(buf + len, 0);
+  PrintStr(buf as pchar);
+  free(buf, len + 1);
+}
+
+// Sucht den ersten gespeicherten Pfad für capId. Gibt pathIndex zurück oder -1.
+fn mc_first_path(pathBuf: int64, pathCount: int64, capId: int64): int64 {
+  var i: int64 := 0;
+  while i < pathCount {
+    var pe: int64 := pathBuf + i * MC_PATH_SZ;
+    if peek64(pe + MC_PATH_CAPID) == capId { return i; }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
+// Zählt wie viele unterschiedliche Pfade für capId gespeichert sind.
+fn mc_path_count_for(pathBuf: int64, pathCount: int64, capId: int64): int64 {
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while i < pathCount {
+    var pe: int64 := pathBuf + i * MC_PATH_SZ;
+    if peek64(pe + MC_PATH_CAPID) == capId { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
+
+// Druckt eine einzelne Capability-Zeile im Manifest-Format.
+fn mc_print_cap_line(pSrc: pchar, capId: int64, pathBuf: int64, pathCount: int64, isLast: int64): void {
+  PrintStr("  "c);
+  PrintStr(mc_cap_name(capId));
+  // Pfad-Argument für fs.*-Capabilities
+  if capId >= 7 && capId <= 12 {
+    var n: int64 := mc_path_count_for(pathBuf, pathCount, capId);
+    var pi: int64 := mc_first_path(pathBuf, pathCount, capId);
+    if pi >= 0 && n == 1 {
+      // Genau ein Pfad bekannt
+      var pe: int64 := pathBuf + pi * MC_PATH_SZ;
+      PrintStr("(path: \""c);
+      mc_print_strn(pSrc, peek64(pe + MC_PATH_OFF), peek64(pe + MC_PATH_LEN));
+      PrintStr("\")"c);
+    } else if n > 1 {
+      // Mehrere Pfade: manuelle Ergänzung empfohlen
+    }
+  }
+  // Komma (außer letzter Eintrag)
+  if isLast == 0 { PrintStr(","c); }
+  // Kommentar für netzwerk-/hardware-Caps
+  if mc_needs_addr_hint(capId) {
+    PrintStr("  // Adresse und Port manuell ergaenzen"c);
+  }
+  if capId == 21 {
+    PrintStr("  // Device-Pfad und Pin/Bus manuell pruefen"c);
+  }
+  PrintStrLn(""c);
+}
+
+// Analysiert den AST und gibt das generierte @capabilities([...])-Manifest aus.
+// Ausgabe auf stdout; Warnungen auf stderr.
+pub fn mc_run_and_print(nodes: int64, pSrc: pchar, head: int64): void {
+  // State allozieren
+  var state: int64 := alloc(MC_ST_SZ);
+  var pathBuf: int64 := alloc(MC_PATH_MAX * MC_PATH_SZ);
+  poke64(state + MC_ST_CAPBITS,    0);
+  poke64(state + MC_ST_PATHBUF,    pathBuf);
+  poke64(state + MC_ST_PATHCOUNT,  0);
+  poke64(state + MC_ST_HASDYNPATH, 0);
+
+  // 1. Pass: extern fn-Deklarationen → Capabilities
+  var ni: int64 := head;
+  while ni >= 0 {
+    var k: int64 := mc_kind(nodes, ni);
+    if k == 2 {  // NK_FUNC_DECL
+      if mc_c2(nodes, ni) < 0 && mc_c3(nodes, ni) >= 0 {  // extern fn
+        var soff: int64 := mc_soff(nodes, ni);
+        var slen: int64 := mc_slen(nodes, ni);
+        var capId: int64 := mc_map_cap(pSrc, soff, slen);
+        if capId >= 0 {
+          var bits: int64 := peek64(state + MC_ST_CAPBITS);
+          poke64(state + MC_ST_CAPBITS, bits | (1 << capId));
+        }
+      }
+    }
+    ni := mc_next(nodes, ni);
+  }
+
+  // 2. Pass: Funktions-Bodies → Call-Sites analysieren (Pfad-Extraktion)
+  ni := head;
+  while ni >= 0 {
+    var k2: int64 := mc_kind(nodes, ni);
+    if k2 == 2 {  // NK_FUNC_DECL
+      var body: int64 := mc_c2(nodes, ni);
+      if body >= 0 {
+        mc_walk_stmt(nodes, pSrc, body, state, 0);
+      }
+    }
+    ni := mc_next(nodes, ni);
+  }
+
+  // Manifest ausgeben
+  var capBits: int64 := peek64(state + MC_ST_CAPBITS);
+  var pathCount: int64 := peek64(state + MC_ST_PATHCOUNT);
+  var hasDynPath: int64 := peek64(state + MC_ST_HASDYNPATH);
+
+  // Warnung bei dynamischen Pfaden
+  if hasDynPath != 0 {
+    EPrintStrLn("Warnung: Dynamisch konstruierte Pfade erkannt -- Pfad kann nicht statisch analysiert werden; manuell ergaenzen"c);
+  }
+
+  if capBits == 0 {
+    EPrintStrLn("Hinweis: Keine bekannten OS-Capabilities erkannt (keine extern fn mit gemappten Funktionsnamen)"c);
+    PrintStrLn("// Kein @capabilities-Manifest erforderlich (keine OS-Ressourcen)"c);
+    free(state, MC_ST_SZ);
+    free(pathBuf, MC_PATH_MAX * MC_PATH_SZ);
+    return;
+  }
+
+  // Capability-Ausgabe in fester Reihenfolge: system→fs→memory→network→process→hardware
+  // Wir schreiben alle aktiven Caps in einen Ausgabepuffer (capId-Liste), dann drucken wir.
+  var capList: int64 := alloc(30 * 8);
+  var capListCount: int64 := 0;
+
+  // Feste Ausgabe-Reihenfolge: system → fs → memory → network → process → hardware
+  // Schreibt aktive Cap-IDs geordnet in capList (kein Array-Literal, kein nested fn)
+  var ids: int64 := alloc(27 * 8);
+  poke64(ids +  0, 3);  poke64(ids +  8, 4);  poke64(ids + 16, 5);
+  poke64(ids + 24, 6);  poke64(ids + 32, 7);  poke64(ids + 40, 8);
+  poke64(ids + 48, 9);  poke64(ids + 56, 10); poke64(ids + 64, 11);
+  poke64(ids + 72, 12); poke64(ids + 80, 13); poke64(ids + 88, 14);
+  poke64(ids + 96, 15); poke64(ids +104, 16); poke64(ids +112, 17);
+  poke64(ids +120, 18); poke64(ids +128, 19); poke64(ids +136, 20);
+  poke64(ids +144, 25); poke64(ids +152, 26); poke64(ids +160, 27);
+  poke64(ids +168, 28); poke64(ids +176, 29);
+  poke64(ids +184, 21); poke64(ids +192, 22); poke64(ids +200, 23);
+  poke64(ids +208, 24);
+  var oi: int64 := 0;
+  while oi < 27 {
+    var cid2: int64 := peek64(ids + oi * 8);
+    if ((capBits >> cid2) & 1) != 0 {
+      poke64(capList + capListCount * 8, cid2);
+      capListCount := capListCount + 1;
+    }
+    oi := oi + 1;
+  }
+  free(ids, 27 * 8);
+
+  PrintStrLn("@capabilities(["c);
+  var li: int64 := 0;
+  while li < capListCount {
+    var cid: int64 := peek64(capList + li * 8);
+    var isLast: int64 := 0;
+    if li == capListCount - 1 { isLast := 1; }
+    mc_print_cap_line(pSrc, cid, pathBuf, pathCount, isLast);
+    li := li + 1;
+  }
+  PrintStrLn("])"c);
+
+  if pathCount > 1 {
+    EPrintStrLn("Hinweis: Mehrere Pfade erkannt -- Capability-Argumente beziehen sich auf den ersten gefundenen Pfad"c);
+  }
+
+  free(capList, 30 * 8);
+  free(state, MC_ST_SZ);
+  free(pathBuf, MC_PATH_MAX * MC_PATH_SZ);
+}

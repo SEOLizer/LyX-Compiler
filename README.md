@@ -2,7 +2,7 @@
 
 > A self-hosting systems programming language focused on native code generation, predictable performance, minimal runtime dependencies, and long-term maintainability.
 
-![Version](https://img.shields.io/badge/version-v0.9.0C-blue)
+![Version](https://img.shields.io/badge/version-v0.9.1A-blue)
 ![Status](https://img.shields.io/badge/status-self--hosting-success)
 ![Platform](https://img.shields.io/badge/linux-x86__64-success)
 ![License](https://img.shields.io/badge/license-proprietary-lightgrey)
@@ -32,6 +32,7 @@ Today Lyx includes:
 - Advanced memory layout control
 - Safety-critical programming extensions
 - Multi-stage optimization pipeline
+- **Capability-Based Security (LCBS)** — Zero-Privilege runtime sandboxing
 
 The compiler is written in Lyx and successfully compiles itself.
 
@@ -555,6 +556,48 @@ Lyx is built around a small set of principles:
 Contributions, bug reports, design discussions, and language proposals are welcome.
 
 Before implementing major language changes, please discuss them through an issue or design proposal.
+
+---
+
+# Security (LCBS)
+
+Lyx includes a built-in **Capability-Based Security** system (LCBS) that enforces Zero-Privilege by default.
+
+```lyx
+// Without @capabilities: no OS access, no network, no hardware
+fn main(): int64 {
+  PrintLn("Safe by default.");
+  return 0;
+}
+
+// Explicitly declare what you need:
+@capabilities([fs.read, hardware.gpio(pin: 18)])
+fn sensorMain(): int64 {
+  // Only file reads and GPIO pin 18 are permitted.
+  // All other syscalls → SIGSYS (seccomp KILL_PROCESS).
+  // All other paths → EACCES (Landlock).
+  return 0;
+}
+```
+
+**Runtime mechanisms** (all installed automatically before `main()`):
+- **seccomp-BPF** — syscall whitelist; `SECCOMP_RET_KILL_PROCESS` for violations
+- **Landlock** — path-based filesystem isolation (Linux ≥ 5.13)
+- **Userspace Proxy** — IP/port filtering for network capabilities
+
+**Migration tools:**
+```bash
+lyxc --migrate-capabilities old_program.lyx   # generate @capabilities manifest
+lyxc --capabilities=compat old_program.lyx    # compile without sandbox (transition)
+lyxc --self-test                               # run LCBS integration tests
+```
+
+**Security Audit** is printed to stderr on every build:
+```
+Sicherheits-Score: 40/40  (+10 FFI, +5 W^X, +5 RELRO, +10 grant, +5 seccomp, +5 landlock)
+```
+
+Full documentation: [capabilities.md](capabilities.md)
 
 ---
 

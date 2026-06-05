@@ -1,0 +1,149 @@
+// std/net/epoll — WP-5: epoll & I/O-Multiplexing
+// Wrapper um sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait,
+// sys_epoll_pwait, sys_eventfd2, sys_ppoll
+
+import std.alloc;
+
+// ============================================================
+// epoll_event — Struktur (x86-64 Linux, packed = 12 Bytes)
+//   +0:  events  (uint32 — welche Events)
+//   +4:  data    (uint64 — Nutzdaten: fd, ptr oder beliebiger uint64)
+// ============================================================
+pub con EPOLL_EVENT_SIZE: int64 := 12;
+
+// events-Bits
+pub con EPOLLIN:      int64 := 1;          // fd lesbar
+pub con EPOLLOUT:     int64 := 4;          // fd schreibbar
+pub con EPOLLERR:     int64 := 8;          // Fehler (immer aktiv)
+pub con EPOLLHUP:     int64 := 16;         // Hangup (immer aktiv)
+pub con EPOLLRDHUP:   int64 := 8192;       // 0x2000 — Peer hat Verbindung geschlossen
+pub con EPOLLPRI:     int64 := 2;          // Dringende Daten (OOB)
+pub con EPOLLWAKEUP:  int64 := 536870912;  // 0x20000000 — verhindert Suspend
+pub con EPOLLONESHOT: int64 := 1073741824; // 0x40000000 — fd nach Event deregistrieren
+pub con EPOLLET:      int64 := 2147483648; // 0x80000000 — Edge-Triggered Modus
+
+// epoll_ctl-Operationen
+pub con EPOLL_CTL_ADD: int64 := 1;
+pub con EPOLL_CTL_DEL: int64 := 2;
+pub con EPOLL_CTL_MOD: int64 := 3;
+
+// epoll_create1-Flags
+pub con EPOLL_CLOEXEC: int64 := 524288;   // 0x80000
+
+// eventfd-Flags
+pub con EFD_CLOEXEC:   int64 := 524288;   // 0x80000
+pub con EFD_NONBLOCK:  int64 := 2048;     // 0x800
+pub con EFD_SEMAPHORE: int64 := 1;
+
+// ============================================================
+// epoll — Instanz erstellen
+// ============================================================
+
+// EpollCreate: erstellt eine neue epoll-Instanz (mit EPOLL_CLOEXEC).
+// Gibt den epoll-fd zurück, oder < 0 bei Fehler.
+pub fn EpollCreate(): int64 {
+  return sys_epoll_create1(EPOLL_CLOEXEC);
+}
+
+// ============================================================
+// fd registrieren / ändern / entfernen
+// ============================================================
+
+// EpollAdd: registriert fd am epoll-fd.
+// events: Kombination aus EPOLLIN, EPOLLOUT, EPOLLET etc.
+// data:   Nutzdaten die beim Event zurückgeliefert werden (oft = fd selbst).
+pub fn EpollAdd(epFd: int64, fd: int64, events: int64, data: int64): int64 {
+  var ev: int64 := alloc(EPOLL_EVENT_SIZE);
+  if (ev == 0) { return -1; }
+  poke32(ev,     events);  // events-Feld (uint32)
+  poke64(ev + 4, data);    // data-Feld   (uint64)
+  var r: int64 := sys_epoll_ctl(epFd, EPOLL_CTL_ADD, fd, ev);
+  free(ev, EPOLL_EVENT_SIZE);
+  return r;
+}
+
+// EpollMod: ändert die überwachten Events für fd.
+pub fn EpollMod(epFd: int64, fd: int64, events: int64, data: int64): int64 {
+  var ev: int64 := alloc(EPOLL_EVENT_SIZE);
+  if (ev == 0) { return -1; }
+  poke32(ev,     events);
+  poke64(ev + 4, data);
+  var r: int64 := sys_epoll_ctl(epFd, EPOLL_CTL_MOD, fd, ev);
+  free(ev, EPOLL_EVENT_SIZE);
+  return r;
+}
+
+// EpollDel: entfernt fd aus der epoll-Instanz.
+pub fn EpollDel(epFd: int64, fd: int64): int64 {
+  // Seit Linux 2.6.9 ist event* bei EPOLL_CTL_DEL ignoriert (darf NULL sein).
+  return sys_epoll_ctl(epFd, EPOLL_CTL_DEL, fd, 0);
+}
+
+// ============================================================
+// Warten auf Events
+// ============================================================
+
+// EpollWait: wartet auf Events.
+// evBuf:     alloc(EPOLL_EVENT_SIZE * maxEvents) — Puffer für zurückgelieferte Events.
+// maxEvents: maximale Anzahl Events pro Aufruf.
+// timeoutMs: -1 = blockieren, 0 = sofort zurückgeben, > 0 = Millisekunden.
+// Gibt Anzahl der aufgetretenen Events zurück, oder < 0 bei Fehler.
+pub fn EpollWait(epFd: int64, evBuf: int64, maxEvents: int64, timeoutMs: int64): int64 {
+  return sys_epoll_wait(epFd, evBuf, maxEvents, timeoutMs);
+}
+
+// ============================================================
+// epoll_event — Felder aus Event-Puffer lesen
+// ============================================================
+
+// EpollEventFlags: liefert das events-Feld (uint32) des idx-ten Events.
+pub fn EpollEventFlags(evBuf: int64, idx: int64): int64 {
+  // events sitzt in den ersten 4 Bytes; peek64 liest 8 Bytes → maskieren
+  return peek64(evBuf + idx * EPOLL_EVENT_SIZE) & 4294967295;
+}
+
+// EpollEventData: liefert das 8-Byte-Datenfeld des idx-ten Events.
+pub fn EpollEventData(evBuf: int64, idx: int64): int64 {
+  return peek64(evBuf + idx * EPOLL_EVENT_SIZE + 4);
+}
+
+// EpollEventFd: liefert den fd aus dem Datenfeld (untere 32 Bits von data).
+pub fn EpollEventFd(evBuf: int64, idx: int64): int64 {
+  return peek64(evBuf + idx * EPOLL_EVENT_SIZE + 4) & 2147483647;
+}
+
+// ============================================================
+// eventfd — thread-sichere fd-basierte Signalisierung
+// ============================================================
+
+// EventFdCreate: erstellt einen neuen eventfd-Counter.
+// initVal: Startwert des Zählers (üblicherweise 0).
+// flags:   EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE (oder 0).
+pub fn EventFdCreate(initVal: int64, flags: int64): int64 {
+  return sys_eventfd2(initVal, flags);
+}
+
+// EventFdSignal: erhöht den eventfd-Zähler um 1 (weckt Wartende).
+pub fn EventFdSignal(fd: int64): int64 {
+  var val: int64 := alloc(8);
+  if (val == 0) { return -1; }
+  poke64(val, 1);
+  var r: int64 := write(fd, val, 8);
+  free(val, 8);
+  return r;
+}
+
+// EventFdRead: liest und resettet den Zähler (blockiert wenn 0).
+// Gibt den Zählerwert zurück (≥ 1), oder < 0 bei Fehler.
+pub fn EventFdRead(fd: int64): int64 {
+  var val: int64 := alloc(8);
+  if (val == 0) { return -1; }
+  var n: int64 := sys_read(fd, val, 8);
+  var count: int64 := 0;
+  if (n == 8) {
+    count := peek64(val);
+  }
+  free(val, 8);
+  if (n < 0) { return n; }
+  return count;
+}

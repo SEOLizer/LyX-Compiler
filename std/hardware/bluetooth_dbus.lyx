@@ -1,0 +1,578 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_dbus.lyx
+//
+// WP-5: D-Bus-Control-Plane (BlueZ)
+//
+// Kommunikation über den D-Bus-System-Socket:
+//   /var/run/dbus/system_bus_socket  (AF_UNIX, SOCK_STREAM)
+//
+// Zwei-Schichten-Architektur:
+//   1. Schicht: D-Bus-Protokoll (Auth, Message-Builder, Response-Reader)
+//   2. Schicht: BlueZ-High-Level (Discovery, Pairing, GATT-Connect)
+//
+// Einschränkungen dieser Implementierung:
+//   - Nur METHOD_CALL ohne Argumente (StartDiscovery, Pair, Connect, etc.)
+//   - GetManagedObjects: leitet rohen Reply-Buffer weiter; Adresssuche heuristisch
+//   - Kein vollständiger D-Bus-Deserializer (kein allgemeines a{oa{sa{sv}}}-Parsing)
+
+unit std.hardware.bluetooth_dbus;
+
+import std.hardware.bluetooth_types;
+import std.alloc;
+
+// D-Bus libc-Funktion für UID-Abfrage
+extern fn getuid(): int64 link "libc.so.6";
+
+// ============================================================================
+// D-Bus-Protokoll-Konstanten
+// ============================================================================
+
+pub con DBUS_TYPE_METHOD_CALL:   int64 := 1;
+pub con DBUS_TYPE_METHOD_RETURN: int64 := 2;
+pub con DBUS_TYPE_ERROR:         int64 := 3;
+pub con DBUS_TYPE_SIGNAL:        int64 := 4;
+
+pub con DBUS_FLAG_NO_REPLY:  int64 := 1;
+pub con DBUS_FLAG_NO_AUTOSTART: int64 := 2;
+
+// Header-Feld-Codes
+pub con DBUS_HDR_PATH:        int64 := 1;
+pub con DBUS_HDR_INTERFACE:   int64 := 2;
+pub con DBUS_HDR_MEMBER:      int64 := 3;
+pub con DBUS_HDR_ERROR_NAME:  int64 := 4;
+pub con DBUS_HDR_REPLY_SERIAL: int64 := 5;
+pub con DBUS_HDR_DESTINATION: int64 := 6;
+pub con DBUS_HDR_SENDER:      int64 := 7;
+pub con DBUS_HDR_SIGNATURE:   int64 := 8;
+
+// BlueZ-D-Bus-Konstanten
+pub con BLUEZ_BUS:        int64 := 0;  // "org.bluez" (see string literals below)
+pub con DBUS_BUS:         int64 := 0;  // "org.freedesktop.DBus"
+
+// ============================================================================
+// Interne Helfer: D-Bus-Nachrichtenbau
+// ============================================================================
+
+fn _dbus_hex(n: int64): int64 {
+  if (n < 10) { return n + 48; }
+  return n + 55;
+}
+
+// Schreibt n Null-Bytes ab pos, gibt pos+n zurück (Padding)
+fn _dbus_pad(buf: int64, pos: int64, n: int64): int64 {
+  var i: int64 := 0;
+  while (i < n) { poke8(buf + pos + i, 0); i := i + 1; }
+  return pos + n;
+}
+
+// Rundet pos auf 4-Byte-Grenze auf
+fn _dbus_align4(pos: int64): int64 {
+  return (pos + 3) & (0 - 4);
+}
+
+// Rundet pos auf 8-Byte-Grenze auf
+fn _dbus_align8(pos: int64): int64 {
+  return (pos + 7) & (0 - 8);
+}
+
+// Schreibt uint32 little-endian nach buf+pos, gibt pos+4 zurück
+fn _dbus_w32(buf: int64, pos: int64, v: int64): int64 {
+  poke8(buf + pos,     v & 0xFF);
+  poke8(buf + pos + 1, (v >> 8)  & 0xFF);
+  poke8(buf + pos + 2, (v >> 16) & 0xFF);
+  poke8(buf + pos + 3, (v >> 24) & 0xFF);
+  return pos + 4;
+}
+
+// Schreibt D-Bus-String (uint32 len + bytes + NUL) nach buf+pos
+// pos muss 4-Byte-aligned sein; gibt neue pos zurück
+fn _dbus_write_str(buf: int64, pos: int64, s: int64, slen: int64): int64 {
+  pos := _dbus_w32(buf, pos, slen);
+  var i: int64 := 0;
+  while (i < slen) { poke8(buf + pos + i, peek8(s + i)); i := i + 1; }
+  pos := pos + slen;
+  poke8(buf + pos, 0); pos := pos + 1;  // NUL-Terminator
+  return pos;
+}
+
+// Schreibt ein D-Bus-Header-Feld: STRUCT{BYTE code, VARIANT{sig, value}}
+// type_char: 's' (115) für String, 'o' (111) für ObjectPath, 'u' (117) für uint32
+// Gibt neue pos zurück; pos muss 8-Byte-aligned sein (Struct-Alignment)
+fn _dbus_write_field_str(buf: int64, pos: int64, code: int64,
+                          type_char: int64, s: int64, slen: int64): int64 {
+  // STRUCT{BYTE, VARIANT}: Struct startet bei 8-Byte-Grenze
+  poke8(buf + pos, code);     // Feldcode
+  poke8(buf + pos + 1, 1);    // Signatur-Länge = 1
+  poke8(buf + pos + 2, type_char); // 's' oder 'o'
+  poke8(buf + pos + 3, 0);    // NUL
+  pos := pos + 4;
+  // String-Wert muss 4-Byte-aligned sein
+  pos := _dbus_align4(pos);
+  pos := _dbus_write_str(buf, pos, s, slen);
+  return pos;
+}
+
+fn _dbus_write_field_u32(buf: int64, pos: int64, code: int64, v: int64): int64 {
+  poke8(buf + pos, code);
+  poke8(buf + pos + 1, 1);
+  poke8(buf + pos + 2, 117);  // 'u' = uint32
+  poke8(buf + pos + 3, 0);
+  pos := pos + 4;
+  pos := _dbus_align4(pos);
+  pos := _dbus_w32(buf, pos, v);
+  return pos;
+}
+
+// ============================================================================
+// D-Bus-METHOD_CALL-Nachricht ohne Argumente bauen
+//
+// Schreibt eine vollständige D-Bus-Nachricht in buf.
+// dest/path/iface/member: Strings als (ptr, len)-Paare
+// Gibt die Gesamtlänge der Nachricht zurück.
+// buf muss mindestens 512 Bytes groß sein.
+// ============================================================================
+fn _dbus_build_call(buf: int64, serial: int64,
+                    dest: int64, destLen: int64,
+                    path: int64, pathLen: int64,
+                    iface: int64, ifaceLen: int64,
+                    member: int64, memberLen: int64): int64 {
+  // Fester Header (12 Bytes): endian, type, flags, version, bodyLen, serial
+  poke8(buf + 0, 108);   // 'l' = little-endian
+  poke8(buf + 1, DBUS_TYPE_METHOD_CALL);
+  poke8(buf + 2, 0);     // flags
+  poke8(buf + 3, 1);     // protocol version
+  // body_length und serial vorerst Platzhalter, werden am Ende gesetzt
+  poke8(buf + 4, 0); poke8(buf + 5, 0); poke8(buf + 6, 0); poke8(buf + 7, 0);
+  poke8(buf + 8, serial & 0xFF);
+  poke8(buf + 9, (serial >> 8) & 0xFF);
+  poke8(buf + 10, 0); poke8(buf + 11, 0);
+  // offset 12-15: uint32 header-fields array length (noch unbekannt)
+  poke8(buf + 12, 0); poke8(buf + 13, 0); poke8(buf + 14, 0); poke8(buf + 15, 0);
+
+  // Header-Felder ab Offset 16 (8-Byte-aligned vom Array-Start)
+  var p: int64 := 16;   // Felder-Daten beginnen hier
+
+  // Feld: PATH (object path, 'o')
+  p := _dbus_write_field_str(buf, p, DBUS_HDR_PATH, 111, path, pathLen);
+  p := _dbus_align8(p);
+
+  // Feld: INTERFACE ('s')
+  p := _dbus_write_field_str(buf, p, DBUS_HDR_INTERFACE, 115, iface, ifaceLen);
+  p := _dbus_align8(p);
+
+  // Feld: MEMBER ('s')
+  p := _dbus_write_field_str(buf, p, DBUS_HDR_MEMBER, 115, member, memberLen);
+  p := _dbus_align8(p);
+
+  // Feld: DESTINATION ('s')
+  p := _dbus_write_field_str(buf, p, DBUS_HDR_DESTINATION, 115, dest, destLen);
+  // Kein align8 nach letztem Feld — Padding zum Body folgt separat
+
+  // Header-Felder-Array-Länge nachträglich eintragen
+  var fieldsBytesLen: int64 := p - 16;
+  poke8(buf + 12, fieldsBytesLen & 0xFF);
+  poke8(buf + 13, (fieldsBytesLen >> 8) & 0xFF);
+  poke8(buf + 14, 0); poke8(buf + 15, 0);
+
+  // Body beginnt am nächsten 8-Byte-Boundary nach den Header-Feldern
+  // (D-Bus-Spec: body beginnt nach Header+Alignment)
+  var bodyStart: int64 := _dbus_align8(p);
+  // Null-Body: 0 Bytes
+  // body_length ins Fixed-Header schreiben (bleibt 0)
+
+  return bodyStart;   // Gesamtlänge der Nachricht
+}
+
+// ============================================================================
+// D-Bus-Antwort lesen
+// Gibt Nachrichtentyp zurück (2=RETURN, 3=ERROR, 0=Fehler)
+// Schreibt den Body in outBody (optional) und dessen Länge in outBodyLen
+// ============================================================================
+fn _dbus_recv_reply(fd: int64, buf: int64, maxLen: int64,
+                    outBody: int64, outBodyLen: int64): int64 {
+  var n: int64 := sys_read(fd, buf, maxLen);
+  if (n < 16) { return 0; }
+
+  var msgType: int64 := peek8(buf + 1);
+  var bodyLen: int64 := peek8(buf + 4) | (peek8(buf + 5) << 8) |
+                        (peek8(buf + 6) << 16) | (peek8(buf + 7) << 24);
+
+  if (outBodyLen != 0) { poke64(outBodyLen, bodyLen); }
+  if (outBody != 0 && bodyLen > 0) {
+    var hdrFieldsLen: int64 := peek8(buf + 12) | (peek8(buf + 13) << 8) |
+                               (peek8(buf + 14) << 16) | (peek8(buf + 15) << 24);
+    var bodyOff: int64 := _dbus_align8(16 + hdrFieldsLen);
+    if (bodyOff + bodyLen <= n) {
+      var i: int64 := 0;
+      while (i < bodyLen) {
+        poke8(outBody + i, peek8(buf + bodyOff + i));
+        i := i + 1;
+      }
+    }
+  }
+
+  return msgType;
+}
+
+// ============================================================================
+// SASL EXTERNAL-Authentifizierung
+//
+// Sendet: \0AUTH EXTERNAL <hex_uid>\r\nBEGIN\r\n
+// Erwartet: OK <guid>\r\n
+// Rückgabe: 0 = OK, -1 = Fehler
+// ============================================================================
+fn _dbus_auth(fd: int64): int64 {
+  var uid: int64 := getuid();
+
+  // UID in Dezimal-String wandeln
+  var decBuf: int64 := alloc(24);
+  if (decBuf == 0) { return -1; }
+  var decLen: int64 := 0;
+  if (uid == 0) {
+    poke8(decBuf, 48); decLen := 1;
+  } else {
+    var tmp: array[20]int64;
+    var n: int64 := 0;
+    var k: int64 := uid;
+    while (k > 0) {
+      tmp[n] := 48 + (k - ((k / 10) * 10));
+      k := k / 10;
+      n := n + 1;
+    }
+    var i: int64 := n - 1;
+    while (i >= 0) {
+      poke8(decBuf + decLen, tmp[i]);
+      decLen := decLen + 1;
+      i := i - 1;
+    }
+  }
+
+  // Dezimal-String hex-kodieren ("1000" → "31303030")
+  var hexBuf: int64 := alloc(64);
+  if (hexBuf == 0) { free(decBuf, 24); return -1; }
+  var hexLen: int64 := 0;
+  var j: int64 := 0;
+  while (j < decLen) {
+    var b: int64 := peek8(decBuf + j);
+    poke8(hexBuf + hexLen,     _dbus_hex((b >> 4) & 0xF));
+    poke8(hexBuf + hexLen + 1, _dbus_hex(b & 0xF));
+    hexLen := hexLen + 2;
+    j := j + 1;
+  }
+  free(decBuf, 24);
+
+  // Sende: \0AUTH EXTERNAL <hex>\r\n
+  // Auth-Paket: NUL + "AUTH EXTERNAL " + hex + "\r\n"
+  var authBufLen: int64 := 1 + 14 + hexLen + 2;
+  var authBuf: int64 := alloc(authBufLen);
+  if (authBuf == 0) { free(hexBuf, 64); return -1; }
+  poke8(authBuf, 0);   // NUL (obligatorisch in D-Bus-Auth)
+  // "AUTH EXTERNAL " (14 Bytes: 65,85,84,72,32,69,88,84,69,82,78,65,76,32)
+  poke8(authBuf+1,65);poke8(authBuf+2,85);poke8(authBuf+3,84);poke8(authBuf+4,72);
+  poke8(authBuf+5,32);poke8(authBuf+6,69);poke8(authBuf+7,88);poke8(authBuf+8,84);
+  poke8(authBuf+9,69);poke8(authBuf+10,82);poke8(authBuf+11,78);poke8(authBuf+12,65);
+  poke8(authBuf+13,76);poke8(authBuf+14,32);
+  var ai: int64 := 0;
+  while (ai < hexLen) { poke8(authBuf + 15 + ai, peek8(hexBuf + ai)); ai := ai + 1; }
+  poke8(authBuf + 15 + hexLen, 13);   // \r
+  poke8(authBuf + 16 + hexLen, 10);   // \n
+  free(hexBuf, 64);
+  sys_write(fd, authBuf, authBufLen);
+  free(authBuf, authBufLen);
+
+  // Empfange "OK <guid>\r\n"
+  var rspBuf: int64 := alloc(128);
+  if (rspBuf == 0) { return -1; }
+  var rn: int64 := sys_read(fd, rspBuf, 127);
+  var ok: int64 := -1;
+  // Prüfe ob Antwort mit "OK" beginnt (79, 75)
+  if (rn >= 2 && peek8(rspBuf) == 79 && peek8(rspBuf + 1) == 75) { ok := 0; }
+  free(rspBuf, 128);
+  if (ok < 0) { return -1; }
+
+  // Sende "BEGIN\r\n" (66,69,71,73,78,13,10)
+  var beginBuf: int64 := alloc(7);
+  if (beginBuf == 0) { return -1; }
+  poke8(beginBuf,66);poke8(beginBuf+1,69);poke8(beginBuf+2,71);
+  poke8(beginBuf+3,73);poke8(beginBuf+4,78);poke8(beginBuf+5,13);poke8(beginBuf+6,10);
+  sys_write(fd, beginBuf, 7);
+  free(beginBuf, 7);
+
+  return 0;
+}
+
+// ============================================================================
+// D-Bus-Hello — obligatorischer erster Methodenaufruf
+//
+// Sendet Hello an org.freedesktop.DBus und empfängt unseren eindeutigen Namen.
+// nameBuf: Puffer für den Bus-Namen (z.B. ":1.42"), mind. 64 Bytes.
+// Rückgabe: Länge des empfangenen Namens, -1 bei Fehler.
+// ============================================================================
+fn _dbus_hello(fd: int64, nameBuf: int64): int64 {
+  var msgBuf: int64 := alloc(512);
+  if (msgBuf == 0) { return -1; }
+
+  // Strings für Hello-Methodenaufruf
+  var dbus_path:   int64 := "/org/freedesktop/DBus"c as int64;
+  var dbus_iface:  int64 := "org.freedesktop.DBus"c  as int64;
+  var dbus_member: int64 := "Hello"c                  as int64;
+  var dbus_dest:   int64 := "org.freedesktop.DBus"c  as int64;
+
+  var msgLen: int64 := _dbus_build_call(msgBuf, 1,
+    dbus_dest,   20,
+    dbus_path,   21,
+    dbus_iface,  20,
+    dbus_member, 5);
+
+  sys_write(fd, msgBuf, msgLen);
+
+  // Antwort lesen: METHOD_RETURN mit String-Body (unser Bus-Name)
+  var rspBuf: int64 := alloc(512);
+  var rspLen: int64 := 0;
+  if (rspBuf != 0) {
+    var rspBodyBuf: int64 := alloc(64);
+    var bodyLen: int64 := 0;
+    var rspBodyLen: int64 := alloc(8);
+    if (rspBodyBuf != 0 && rspBodyLen != 0) {
+      poke64(rspBodyLen, 0);
+      var msgType: int64 := _dbus_recv_reply(fd, rspBuf, 512, rspBodyBuf, rspBodyLen);
+      if (msgType == DBUS_TYPE_METHOD_RETURN) {
+        bodyLen := peek64(rspBodyLen);
+        // Body: uint32 string-len + string + NUL (D-Bus-String)
+        if (bodyLen >= 6) {
+          var slen: int64 := peek8(rspBodyBuf) | (peek8(rspBodyBuf + 1) << 8) |
+                             (peek8(rspBodyBuf + 2) << 16) | (peek8(rspBodyBuf + 3) << 24);
+          if (slen > 0 && slen < 63 && nameBuf != 0) {
+            var si: int64 := 0;
+            while (si < slen) {
+              poke8(nameBuf + si, peek8(rspBodyBuf + 4 + si));
+              si := si + 1;
+            }
+            poke8(nameBuf + slen, 0);
+            rspLen := slen;
+          }
+        }
+      }
+      free(rspBodyLen, 8);
+    }
+    if (rspBodyBuf != 0) { free(rspBodyBuf, 64); }
+    free(rspBuf, 512);
+  }
+  free(msgBuf, 512);
+  return rspLen;
+}
+
+// ============================================================================
+// WP-5 Abnahmekriterium 1: BlueZOpenConnection
+//
+// Verbindet sich mit dem D-Bus-System-Socket, authentifiziert sich
+// und sendet Hello. Rückgabe: D-Bus-FD (≥ 0) oder -1 bei Fehler.
+// ============================================================================
+pub fn BlueZOpenConnection(): int64 {
+  // Unix-Domain-Socket erstellen
+  var fd: int64 := sys_socket(1, 1, 0);  // AF_UNIX=1, SOCK_STREAM=1
+  if (fd < 0) { return -1; }
+
+  // sockaddr_un für /var/run/dbus/system_bus_socket
+  var sockPath: int64 := "/var/run/dbus/system_bus_socket"c as int64;
+  var pathLen: int64 := 31;
+  var addrLen: int64 := 2 + pathLen + 1;
+  var addr: int64 := alloc(addrLen);
+  if (addr == 0) { sys_close(fd); return -1; }
+  poke8(addr,     1);  // AF_UNIX low
+  poke8(addr + 1, 0);  // AF_UNIX high
+  var pi: int64 := 0;
+  while (pi < pathLen) { poke8(addr + 2 + pi, peek8(sockPath + pi)); pi := pi + 1; }
+  poke8(addr + 2 + pathLen, 0);
+
+  var ret: int64 := sys_connect(fd, addr, addrLen);
+  free(addr, addrLen);
+  if (ret < 0) { sys_close(fd); return -1; }
+
+  // SASL EXTERNAL-Authentifizierung
+  if (_dbus_auth(fd) < 0) { sys_close(fd); return -1; }
+
+  // Hello — obligatorisch (ignoriere Bus-Namen für jetzt)
+  var nameBuf: int64 := alloc(64);
+  if (nameBuf != 0) {
+    _dbus_hello(fd, nameBuf);
+    free(nameBuf, 64);
+  }
+
+  return fd;
+}
+
+// ============================================================================
+// Interner Helfer: BlueZ-Methodenaufruf ohne Argumente senden
+//
+// path/pathLen:     D-Bus-Objektpfad des Adapters oder Geräts
+// member/memberLen: Methodenname
+// Rückgabe: 0 = OK (METHOD_RETURN), -1 = Fehler oder ERROR-Reply
+// ============================================================================
+fn _bluez_call(fd: int64, serial: int64,
+               path: int64, pathLen: int64,
+               iface: int64, ifaceLen: int64,
+               member: int64, memberLen: int64): int64 {
+  var msgBuf: int64 := alloc(1024);
+  if (msgBuf == 0) { return -1; }
+
+  var dest: int64 := "org.bluez"c as int64;
+  var msgLen: int64 := _dbus_build_call(msgBuf, serial,
+    dest, 9, path, pathLen, iface, ifaceLen, member, memberLen);
+
+  sys_write(fd, msgBuf, msgLen);
+  free(msgBuf, 1024);
+
+  // Antwort lesen
+  var rspBuf: int64 := alloc(256);
+  if (rspBuf == 0) { return -1; }
+  var msgType: int64 := _dbus_recv_reply(fd, rspBuf, 256, 0, 0);
+  free(rspBuf, 256);
+
+  if (msgType == DBUS_TYPE_METHOD_RETURN) { return 0; }
+  return -1;
+}
+
+// ============================================================================
+// WP-5 Abnahmekriterium 2: BlueZStartDiscovery / BlueZStopDiscovery
+//
+// adapterPath: z.B. "/org/bluez/hci0"c as int64 (16 Zeichen)
+// Rückgabe: 0 = OK, -1 = Fehler
+// ============================================================================
+pub fn BlueZStartDiscovery(fd: int64, adapterPath: int64, pathLen: int64): int64 {
+  var iface:  int64 := "org.bluez.Adapter1"c as int64;
+  var member: int64 := "StartDiscovery"c      as int64;
+  return _bluez_call(fd, 2, adapterPath, pathLen, iface, 18, member, 14);
+}
+
+pub fn BlueZStopDiscovery(fd: int64, adapterPath: int64, pathLen: int64): int64 {
+  var iface:  int64 := "org.bluez.Adapter1"c as int64;
+  var member: int64 := "StopDiscovery"c       as int64;
+  return _bluez_call(fd, 3, adapterPath, pathLen, iface, 18, member, 13);
+}
+
+// ============================================================================
+// BlueZGetManagedObjects — alle verwalteten BlueZ-Objekte abrufen
+//
+// Sendet GetManagedObjects an org.freedesktop.DBus.ObjectManager.
+// outBuf: Puffer für den rohen D-Bus-Reply (empfohlen: 65536 Bytes)
+// maxLen: Puffergröße
+// Rückgabe: empfangene Bytes (> 0) oder -1
+// ============================================================================
+pub fn BlueZGetManagedObjects(fd: int64, outBuf: int64, maxLen: int64): int64 {
+  var msgBuf: int64 := alloc(1024);
+  if (msgBuf == 0) { return -1; }
+
+  var dest:   int64 := "org.bluez"c                                  as int64;
+  var path:   int64 := "/"c                                           as int64;
+  var iface:  int64 := "org.freedesktop.DBus.ObjectManager"c         as int64;
+  var member: int64 := "GetManagedObjects"c                           as int64;
+
+  var msgLen: int64 := _dbus_build_call(msgBuf, 4,
+    dest, 9, path, 1, iface, 34, member, 17);
+  sys_write(fd, msgBuf, msgLen);
+  free(msgBuf, 1024);
+
+  var n: int64 := sys_read(fd, outBuf, maxLen);
+  return n;
+}
+
+// ============================================================================
+// WP-5 Abnahmekriterium 3: BlueZPairDevice
+//
+// devicePath: D-Bus-Pfad des Geräts (z.B. "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+// Rückgabe: 0 = OK, -1 = Fehler
+// ============================================================================
+pub fn BlueZPairDevice(fd: int64, devicePath: int64, pathLen: int64): int64 {
+  var iface:  int64 := "org.bluez.Device1"c as int64;
+  var member: int64 := "Pair"c              as int64;
+  return _bluez_call(fd, 5, devicePath, pathLen, iface, 17, member, 4);
+}
+
+// ============================================================================
+// WP-5 Abnahmekriterium 4: BlueZConnectDevice
+//
+// Ruft Connect auf org.bluez.Device1 auf, um eine BLE-GATT-Verbindung
+// herzustellen. Danach kann der Aufrufer einen L2CAP-Socket auf der
+// Bluetooth-Adresse des Geräts öffnen (siehe WP-4 L2CapConnect).
+// Rückgabe: 0 = OK, -1 = Fehler
+// ============================================================================
+pub fn BlueZConnectDevice(fd: int64, devicePath: int64, pathLen: int64): int64 {
+  var iface:  int64 := "org.bluez.Device1"c as int64;
+  var member: int64 := "Connect"c           as int64;
+  return _bluez_call(fd, 6, devicePath, pathLen, iface, 17, member, 7);
+}
+
+// ============================================================================
+// BlueZDisconnectDevice — Verbindung trennen
+// ============================================================================
+pub fn BlueZDisconnectDevice(fd: int64, devicePath: int64, pathLen: int64): int64 {
+  var iface:  int64 := "org.bluez.Device1"c as int64;
+  var member: int64 := "Disconnect"c        as int64;
+  return _bluez_call(fd, 7, devicePath, pathLen, iface, 17, member, 10);
+}
+
+// ============================================================================
+// BlueZFindDeviceAddress — Bluetooth-Adresse aus GetManagedObjects-Reply extrahieren
+//
+// Sucht heuristisch im rohen D-Bus-Reply-Buffer nach der BDAddr eines Geräts.
+// Strategie: Suche nach "Address" (7 Bytes) gefolgt von einem D-Bus-String
+// mit dem Format "XX:XX:XX:XX:XX:XX".
+//
+// data/dataLen: GetManagedObjects-Reply-Buffer
+// addrBuf:     Puffer für die gefundene Adresse (mind. 18 Bytes)
+// Rückgabe: 1 = Adresse gefunden, 0 = nicht gefunden
+// ============================================================================
+pub fn BlueZFindDeviceAddress(data: int64, dataLen: int64, addrBuf: int64): int64 {
+  // Suche nach ASCII "Address" (65,100,100,114,101,115,115)
+  var i: int64 := 0;
+  while (i < dataLen - 24) {
+    if (peek8(data+i)==65 && peek8(data+i+1)==100 && peek8(data+i+2)==100 &&
+        peek8(data+i+3)==114 && peek8(data+i+4)==101 && peek8(data+i+5)==115 &&
+        peek8(data+i+6)==115) {
+      // "Address" gefunden; suche nachfolgendes "XX:XX:XX:XX:XX:XX"-Muster
+      var j: int64 := i + 7;
+      while (j < i + 64 && j < dataLen - 17) {
+        // Prüfe ob ab j ein MAC-Format steht: X X : X X : X X : X X : X X : X X
+        if (peek8(data+j+2)==58 && peek8(data+j+5)==58 && peek8(data+j+8)==58 &&
+            peek8(data+j+11)==58 && peek8(data+j+14)==58) {
+          // Adresse kopieren
+          var k: int64 := 0;
+          while (k < 17) {
+            poke8(addrBuf + k, peek8(data + j + k));
+            k := k + 1;
+          }
+          poke8(addrBuf + 17, 0);
+          return 1;
+        }
+        j := j + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// ============================================================================
+// BlueZDiscoverDevices — Kompletter Discovery-Zyklus
+//
+// 1. StartDiscovery
+// 2. Warte timeoutMs Millisekunden (sys_poll mit nfds=0 als Sleep)
+// 3. StopDiscovery
+// 4. GetManagedObjects → outBuf
+// Rückgabe: Bytes im outBuf (Aufrufer parst mit BlueZFindDeviceAddress)
+// ============================================================================
+pub fn BlueZDiscoverDevices(fd: int64, adapterPath: int64, pathLen: int64,
+                            timeoutMs: int64, outBuf: int64, maxLen: int64): int64 {
+  BlueZStartDiscovery(fd, adapterPath, pathLen);
+  // Sleep via poll(NULL, 0, timeoutMs)
+  sys_poll(0, 0, timeoutMs);
+  BlueZStopDiscovery(fd, adapterPath, pathLen);
+  return BlueZGetManagedObjects(fd, outBuf, maxLen);
+}
+
+// ============================================================================
+// BlueZClose — D-Bus-Verbindung schließen
+// ============================================================================
+pub fn BlueZClose(fd: int64) {
+  sys_close(fd);
+}
