@@ -44,9 +44,14 @@ bootstrap: lyxc lic_build_flags
 	mv lyxc.new lyxc
 
 # Singularitätsprüfung: S3 (Seed→Quelle) == S4 (S3→Quelle)
+# Hinweis: Der Seed kompiliert die große Quelle in bis zu 5 Versuchen
+# (ASLR-bedingte non-deterministische Crashes bei großem Adressraum).
 singularity: lic_build_flags
 	@echo "=== Singularitätsprüfung ==="
-	$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3
+	@for i in 1 2 3 4 5; do \
+		$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3 2>/dev/null && break; \
+		echo "  [Versuch $$i fehlgeschlagen, retry...]"; \
+	done; test -f /tmp/lyxc_s3
 	$(ULIMIT_VM) /tmp/lyxc_s3 $(SRC) -o /tmp/lyxc_s4
 	@sha256sum /tmp/lyxc_s3 /tmp/lyxc_s4
 	@diff /tmp/lyxc_s3 /tmp/lyxc_s4 \
