@@ -377,3 +377,97 @@ pub fn TLSGetValue(key: TLSKey): int64 {
     if (slot == 0) { return 0; }
     return peek64(slot + 8 + key * 8);
 }
+
+// ============================================================================
+// WP-17: futex2 -- Neue Synchronisierungs-API (Kernel 5.16+/6.7+)
+//
+// futex_wait/wake/requeue (454-456) ersetzen die alten FUTEX_WAIT/WAKE-Ops
+// mit einer aufgeraeumt(er)en API. futex_waitv (449) erlaubt das simultane
+// Warten auf mehrere Futexe -- wie poll(2) fuer Synchronisationsprimitive.
+// ============================================================================
+
+// futex2-Groessen-Flags (welche Breite hat die futex-Variable)
+pub con FUTEX2_SIZE_U8:  int64 := 0;
+pub con FUTEX2_SIZE_U16: int64 := 1;
+pub con FUTEX2_SIZE_U32: int64 := 2;  // Standard-Fall: 32-Bit-Futex
+pub con FUTEX2_SIZE_U64: int64 := 3;
+
+// FUTEX2_PRIVATE: Futex ist prozess-privat (kein Shared-Memory-Overhead).
+pub con FUTEX2_PRIVATE: int64 := 128;  // 0x80
+
+// FUTEX_BITSET_MATCH_ANY: kein Bitset-Filter -- alle Wartenden treffen zu.
+pub con FUTEX_BITSET_MATCH_ANY: int64 := 4294967295;  // 0xFFFFFFFF
+
+// CLOCK_MONOTONIC fuer Timeout-Berechnungen
+pub con FUTEX2_CLOCK_MONOTONIC: int64 := 1;
+pub con FUTEX2_CLOCK_REALTIME:  int64 := 0;
+
+// futex_waitv-Eintrag (24 Bytes):
+//   +0:  val   (uint64) -- erwarteter Wert
+//   +8:  uaddr (uint64) -- Futex-Adresse
+//   +16: flags (uint32) -- FUTEX2_SIZE_* | FUTEX2_PRIVATE
+//   +20: reserved (uint32) -- muss 0 sein
+pub con FUTEX_WAITV_SIZE:  int64 := 24;
+pub con FUTEX_WAITV_VAL:   int64 := 0;
+pub con FUTEX_WAITV_UADDR: int64 := 8;
+pub con FUTEX_WAITV_FLAGS: int64 := 16;
+
+// Futex2Wait: wartet bis *addr != val (blockiert). Gibt 0 bei Erfolg,
+// -EAGAIN (-11) wenn addr schon != val, -ETIMEDOUT (-110) bei Timeout.
+// flags: z.B. FUTEX2_SIZE_U32 | FUTEX2_PRIVATE
+pub fn Futex2Wait(addr: int64, val: int64, flags: int64): int64 {
+  return sys_futex_wait(addr, val, FUTEX_BITSET_MATCH_ANY, flags, 0,
+                        FUTEX2_CLOCK_MONOTONIC);
+}
+
+// Futex2Wake: weckt bis zu `nr` Wartende an `addr`.
+// Gibt Anzahl geweckter Threads zurueck (0 wenn keine warten).
+pub fn Futex2Wake(addr: int64, nr: int64, flags: int64): int64 {
+  return sys_futex_wake(addr, FUTEX_BITSET_MATCH_ANY, nr, flags);
+}
+
+// Futex2WakeAll: weckt alle Wartenden an `addr`.
+pub fn Futex2WakeAll(addr: int64, flags: int64): int64 {
+  return sys_futex_wake(addr, FUTEX_BITSET_MATCH_ANY, 2147483647, flags);
+}
+
+// Futex2WaitV: wartet simultan auf mehrere Futexe (erster EAGAIN-freier gewinnt).
+// waiters: Zeiger auf Array von FUTEX_WAITV_SIZE-Byte-Eintraegen (alloc/mmap).
+// count:   Anzahl Eintraege (max. 128 laut Kernel).
+// Gibt Index des ausloesenden Futex zurueck, oder -EAGAIN/-ETIMEOUT.
+pub fn Futex2WaitV(waiters: int64, count: int64): int64 {
+  return sys_futex_waitv(waiters, count, 0, 0, FUTEX2_CLOCK_MONOTONIC);
+}
+
+// Futex2WaitVEntry: hilfsfunktion -- befuellt einen waitv-Eintrag.
+pub fn Futex2WaitVEntry(entry: int64, uaddr: int64, val: int64, flags: int64): int64 {
+  poke64(entry + FUTEX_WAITV_VAL,   val);
+  poke64(entry + FUTEX_WAITV_UADDR, uaddr);
+  poke32(entry + FUTEX_WAITV_FLAGS, flags as int32);
+  poke32(entry + FUTEX_WAITV_FLAGS + 4, 0);
+  return 0;
+}
+
+// Futex2Requeue: verschiebt Wartende von fromAddr nach toAddr.
+// flags:     FUTEX2_SIZE_* | FUTEX2_PRIVATE (gilt fuer beide Futexe)
+// cmpVal:    erwarteter Wert an fromAddr -- bei Nichtübereinstimmung -EAGAIN.
+// nrWake:    diese Anzahl an fromAddr direkt wecken.
+// nrRequeue: diese Anzahl nach toAddr umleiten.
+// Struct-Layout: val(8)+uaddr(8)+flags(4)+reserved(4) = 24 Bytes je Eintrag (wie futex_waitv).
+// Gibt Anzahl gesamtbehandelter Threads zurueck.
+pub fn Futex2Requeue(fromAddr: int64, toAddr: int64, flags: int64,
+                     cmpVal: int64, nrWake: int64, nrRequeue: int64): int64 {
+  var params: int64 := alloc(48);
+  if (params == 0) { return -12; }
+  poke64(params,      cmpVal);            // waitobj[0].val (compare-Wert)
+  poke64(params + 8,  fromAddr);          // waitobj[0].uaddr
+  poke32(params + 16, flags as int32);    // waitobj[0].flags
+  poke32(params + 20, 0);                 // waitobj[0].reserved
+  poke64(params + 24, 0);                 // waitobj[1].val = 0 (unused)
+  poke64(params + 32, toAddr);            // waitobj[1].uaddr
+  poke32(params + 40, flags as int32);    // waitobj[1].flags
+  poke32(params + 44, 0);                 // waitobj[1].reserved
+  var r: int64 := sys_futex_requeue(params, 0, nrWake, nrRequeue);
+  free(params, 48);
+  return r;
+}
