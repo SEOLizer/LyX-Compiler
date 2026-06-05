@@ -1,0 +1,351 @@
+// std/io_uring -- WP-13: io_uring Asynchrones I/O (Kernel 5.1+)
+// Wrapper um sys_io_uring_setup (425), sys_io_uring_enter (426),
+// sys_io_uring_register (427).
+//
+// Grundprinzip: SQEs (Submission Queue Entries) werden ueber mmap-geteilte
+// Ring-Puffer zwischen Kernel und Userspace ausgetauscht. CQEs (Completion
+// Queue Entries) erscheinen im CQ-Ring sobald Operationen abgeschlossen sind.
+//
+// Verwendung:
+//   var ring: int64 := IoUringCreate(8);
+//   var sqe:  int64 := IoUringGetSQE(ring);
+//   IoUringSQESetNop(sqe, 42);          // oder SetRead/SetWrite
+//   IoUringSubmit(ring);
+//   var cqe: int64 := IoUringWaitCQE(ring);
+//   var res: int64 := IoUringCQEResult(cqe);
+//   IoUringCQESeen(ring, cqe);
+//   IoUringFree(ring);
+
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+// io_uring_params Groesse und Feld-Offsets
+pub con IORING_PARAMS_SIZE:     int64 := 120;
+pub con IORING_PARAMS_SQ_ENTS:  int64 := 0;    // uint32 sq_entries
+pub con IORING_PARAMS_CQ_ENTS:  int64 := 4;    // uint32 cq_entries
+pub con IORING_PARAMS_FEATURES: int64 := 20;   // uint32 features
+// sq_off (ab Offset +40)
+pub con IORING_PARAMS_SQ_HEAD:  int64 := 40;
+pub con IORING_PARAMS_SQ_TAIL:  int64 := 44;
+pub con IORING_PARAMS_SQ_MASK:  int64 := 48;
+pub con IORING_PARAMS_SQ_ARR:   int64 := 64;
+// cq_off (ab Offset +80)
+pub con IORING_PARAMS_CQ_HEAD:  int64 := 80;
+pub con IORING_PARAMS_CQ_TAIL:  int64 := 84;
+pub con IORING_PARAMS_CQ_MASK:  int64 := 88;
+pub con IORING_PARAMS_CQ_CQES:  int64 := 100;
+
+// IORING_FEAT_SINGLE_MMAP: SQ- und CQ-Ring teilen eine mmap-Region
+pub con IORING_FEAT_SINGLE_MMAP: int64 := 1;
+
+// mmap-Offsets fuer io_uring Ringe
+pub con IORING_OFF_SQ_RING: int64 := 0;
+pub con IORING_OFF_CQ_RING: int64 := 134217728;    // 0x8000000
+pub con IORING_OFF_SQES:    int64 := 268435456;    // 0x10000000
+
+// Strukturgroessen
+pub con IORING_SQE_SIZE: int64 := 64;
+pub con IORING_CQE_SIZE: int64 := 16;
+
+// io_uring_enter Flags
+pub con IORING_ENTER_GETEVENTS: int64 := 1;
+
+// Op-Codes fuer SQEs
+pub con IORING_OP_NOP:     int64 := 0;
+pub con IORING_OP_READV:   int64 := 1;
+pub con IORING_OP_WRITEV:  int64 := 2;
+pub con IORING_OP_TIMEOUT: int64 := 11;
+pub con IORING_OP_ACCEPT:  int64 := 13;
+pub con IORING_OP_CONNECT: int64 := 16;
+pub con IORING_OP_READ:    int64 := 22;
+pub con IORING_OP_WRITE:   int64 := 23;
+pub con IORING_OP_SEND:    int64 := 26;
+pub con IORING_OP_RECV:    int64 := 27;
+
+// SQE-Feld-Offsets (64-Byte-Struktur)
+pub con SQE_OPCODE:    int64 := 0;   // uint8
+pub con SQE_FLAGS:     int64 := 1;   // uint8
+pub con SQE_FD:        int64 := 4;   // int32
+pub con SQE_OFF:       int64 := 8;   // uint64 (Datei-Offset)
+pub con SQE_ADDR:      int64 := 16;  // uint64 (Puffer-Zeiger)
+pub con SQE_LEN:       int64 := 24;  // uint32 (Pufferlaenge)
+pub con SQE_USER_DATA: int64 := 32;  // uint64 (frei waehlbar)
+
+// CQE-Feld-Offsets (16-Byte-Struktur)
+pub con CQE_USER_DATA: int64 := 0;   // uint64
+pub con CQE_RES:       int64 := 8;   // int32 (Ergebnis, negativ = Fehler)
+
+// IoRing-Deskriptor-Layout (alloc'd, 152 Bytes)
+pub con IO_RING_SIZE:           int64 := 152;
+pub con IO_RING_FD:             int64 := 0;
+pub con IO_RING_SQ_RING:        int64 := 8;
+pub con IO_RING_SQ_RING_SZ:     int64 := 16;
+pub con IO_RING_SQES:           int64 := 24;
+pub con IO_RING_SQES_SZ:        int64 := 32;
+pub con IO_RING_CQ_RING:        int64 := 40;
+pub con IO_RING_CQ_RING_SZ:     int64 := 48;
+pub con IO_RING_SQ_HEAD_PTR:    int64 := 56;
+pub con IO_RING_SQ_TAIL_PTR:    int64 := 64;
+pub con IO_RING_SQ_MASK:        int64 := 72;
+pub con IO_RING_SQ_ARR_PTR:     int64 := 80;
+pub con IO_RING_SQ_ENTRIES:     int64 := 88;
+pub con IO_RING_CQ_HEAD_PTR:    int64 := 96;
+pub con IO_RING_CQ_TAIL_PTR:    int64 := 104;
+pub con IO_RING_CQ_MASK:        int64 := 112;
+pub con IO_RING_CQ_CQES_PTR:    int64 := 120;
+pub con IO_RING_CQ_ENTRIES:     int64 := 128;
+pub con IO_RING_SQ_LOCAL_TAIL:  int64 := 136;
+pub con IO_RING_SINGLE_MMAP:    int64 := 144;  // 1 = SINGLE_MMAP aktiv
+
+// ============================================================
+// Ring-Verwaltung
+// ============================================================
+
+// IoUringCreate: initialisiert einen io_uring mit mindestens `entries` Slots.
+// Allokiert Ring-Deskriptor, ruft io_uring_setup, mappt alle Ringe.
+// Gibt Ring-Deskriptor-Zeiger zurueck oder 0 bei Fehler.
+pub fn IoUringCreate(entries: int64): int64 {
+  var params: int64 := alloc(IORING_PARAMS_SIZE);
+  if (params == 0) { return 0; }
+
+  var fd: int64 := sys_io_uring_setup(entries, params);
+  if (fd < 0) { free(params, IORING_PARAMS_SIZE); return 0; }
+
+  // Tatsaechliche Ringgroessen aus params (Kernel rundet auf 2er-Potenz)
+  var sqEntries: int64 := peek32(params + IORING_PARAMS_SQ_ENTS);
+  var cqEntries: int64 := peek32(params + IORING_PARAMS_CQ_ENTS);
+  var features:  int64 := peek32(params + IORING_PARAMS_FEATURES);
+
+  // Offsets (sq_off.* und cq_off.* sind Offsets innerhalb der gemappten Ringe)
+  var sqHeadOff: int64 := peek32(params + IORING_PARAMS_SQ_HEAD);
+  var sqTailOff: int64 := peek32(params + IORING_PARAMS_SQ_TAIL);
+  var sqMaskOff: int64 := peek32(params + IORING_PARAMS_SQ_MASK);
+  var sqArrOff:  int64 := peek32(params + IORING_PARAMS_SQ_ARR);
+  var cqHeadOff: int64 := peek32(params + IORING_PARAMS_CQ_HEAD);
+  var cqTailOff: int64 := peek32(params + IORING_PARAMS_CQ_TAIL);
+  var cqMaskOff: int64 := peek32(params + IORING_PARAMS_CQ_MASK);
+  var cqCqesOff: int64 := peek32(params + IORING_PARAMS_CQ_CQES);
+
+  // Ring-Groessen berechnen
+  var sqRingSz: int64 := sqArrOff + sqEntries * 4;
+  var sqesSz:   int64 := sqEntries * IORING_SQE_SIZE;
+  var cqRingSz: int64 := cqCqesOff + cqEntries * IORING_CQE_SIZE;
+
+  free(params, IORING_PARAMS_SIZE);
+
+  // mmap: SQE-Array (immer separat bei IORING_OFF_SQES)
+  var sqes: int64 := mmap(0, sqesSz, 3, 1, fd, IORING_OFF_SQES);
+  if (sqes < 0) { close(fd); return 0; }
+
+  // mmap: SQ-Ring (und ggf. CQ-Ring bei SINGLE_MMAP)
+  var sqRing:     int64 := 0;
+  var cqRing:     int64 := 0;
+  var cqRingMmSz: int64 := 0;   // tatsaechlich belegte mmap-Groesse fuer CQ
+  var singleMmap: int64 := 0;
+
+  if ((features & IORING_FEAT_SINGLE_MMAP) != 0) {
+    // SINGLE_MMAP: SQ und CQ teilen eine gemeinsame Region
+    var totalSz: int64 := sqRingSz;
+    if (cqRingSz > totalSz) { totalSz := cqRingSz; }
+    sqRing := mmap(0, totalSz, 3, 1, fd, IORING_OFF_SQ_RING);
+    if (sqRing < 0) {
+      munmap(sqes, sqesSz); close(fd); return 0;
+    }
+    sqRingSz    := totalSz;
+    cqRing      := sqRing;
+    cqRingMmSz  := 0;    // kein separates munmap beim Freigeben
+    singleMmap  := 1;
+  } else {
+    sqRing := mmap(0, sqRingSz, 3, 1, fd, IORING_OFF_SQ_RING);
+    if (sqRing < 0) {
+      munmap(sqes, sqesSz); close(fd); return 0;
+    }
+    cqRing := mmap(0, cqRingSz, 3, 1, fd, IORING_OFF_CQ_RING);
+    if (cqRing < 0) {
+      munmap(sqRing, sqRingSz); munmap(sqes, sqesSz); close(fd); return 0;
+    }
+    cqRingMmSz := cqRingSz;
+  }
+
+  var ring: int64 := alloc(IO_RING_SIZE);
+  if (ring == 0) {
+    if (singleMmap == 0) { munmap(cqRing, cqRingMmSz); }
+    munmap(sqRing, sqRingSz); munmap(sqes, sqesSz); close(fd); return 0;
+  }
+
+  poke64(ring + IO_RING_FD,          fd);
+  poke64(ring + IO_RING_SQ_RING,     sqRing);
+  poke64(ring + IO_RING_SQ_RING_SZ,  sqRingSz);
+  poke64(ring + IO_RING_SQES,        sqes);
+  poke64(ring + IO_RING_SQES_SZ,     sqesSz);
+  poke64(ring + IO_RING_CQ_RING,     cqRing);
+  poke64(ring + IO_RING_CQ_RING_SZ,  cqRingMmSz);
+  poke64(ring + IO_RING_SQ_HEAD_PTR, sqRing + sqHeadOff);
+  poke64(ring + IO_RING_SQ_TAIL_PTR, sqRing + sqTailOff);
+  poke64(ring + IO_RING_SQ_MASK,     peek32(sqRing + sqMaskOff));
+  poke64(ring + IO_RING_SQ_ARR_PTR,  sqRing + sqArrOff);
+  poke64(ring + IO_RING_SQ_ENTRIES,  sqEntries);
+  poke64(ring + IO_RING_CQ_HEAD_PTR, cqRing + cqHeadOff);
+  poke64(ring + IO_RING_CQ_TAIL_PTR, cqRing + cqTailOff);
+  poke64(ring + IO_RING_CQ_MASK,     peek32(cqRing + cqMaskOff));
+  poke64(ring + IO_RING_CQ_CQES_PTR, cqRing + cqCqesOff);
+  poke64(ring + IO_RING_CQ_ENTRIES,  cqEntries);
+  poke64(ring + IO_RING_SQ_LOCAL_TAIL, 0);
+  poke64(ring + IO_RING_SINGLE_MMAP, singleMmap);
+
+  return ring;
+}
+
+// IoUringFd: liefert den io_uring-Dateideskriptor.
+pub fn IoUringFd(ring: int64): int64 {
+  return peek64(ring + IO_RING_FD);
+}
+
+// IoUringFree: gibt alle Ring-Ressourcen frei.
+pub fn IoUringFree(ring: int64): int64 {
+  if (ring == 0) { return 0; }
+  var cqSz: int64 := peek64(ring + IO_RING_CQ_RING_SZ);
+  if (cqSz > 0) { munmap(peek64(ring + IO_RING_CQ_RING), cqSz); }
+  munmap(peek64(ring + IO_RING_SQES),    peek64(ring + IO_RING_SQES_SZ));
+  munmap(peek64(ring + IO_RING_SQ_RING), peek64(ring + IO_RING_SQ_RING_SZ));
+  close(peek64(ring + IO_RING_FD));
+  free(ring, IO_RING_SIZE);
+  return 0;
+}
+
+// IoUringEnter: ruft sys_io_uring_enter direkt auf (sig=NULL, sigsz=0).
+pub fn IoUringEnter(fd: int64, toSubmit: int64, minComplete: int64, flags: int64): int64 {
+  return sys_io_uring_enter(fd, toSubmit, minComplete, flags);
+}
+
+// ============================================================
+// SQE-Verwaltung
+// ============================================================
+
+// IoUringGetSQE: gibt Zeiger auf die naechste freie SQE zurueck.
+// Gibt 0 zurueck wenn der Ring voll ist.
+// Die SQE wird auf Null gesetzt vor der Rueckgabe.
+pub fn IoUringGetSQE(ring: int64): int64 {
+  var localTail: int64 := peek64(ring + IO_RING_SQ_LOCAL_TAIL);
+  var head:      int64 := peek32(peek64(ring + IO_RING_SQ_HEAD_PTR));
+  var entries:   int64 := peek64(ring + IO_RING_SQ_ENTRIES);
+  if ((localTail - head) >= entries) { return 0; }
+  var mask: int64 := peek64(ring + IO_RING_SQ_MASK);
+  var slot: int64 := localTail & mask;
+  var sqe:  int64 := peek64(ring + IO_RING_SQES) + slot * IORING_SQE_SIZE;
+  poke64(sqe,      0); poke64(sqe +  8, 0); poke64(sqe + 16, 0);
+  poke64(sqe + 24, 0); poke64(sqe + 32, 0); poke64(sqe + 40, 0);
+  poke64(sqe + 48, 0); poke64(sqe + 56, 0);
+  // sq_ring.array[slot] auf diesen Slot-Index setzen
+  poke32(peek64(ring + IO_RING_SQ_ARR_PTR) + slot * 4, slot as int32);
+  poke64(ring + IO_RING_SQ_LOCAL_TAIL, localTail + 1);
+  return sqe;
+}
+
+// IoUringSubmit: veroeffentlicht alle vorbereiteten SQEs und ruft enter auf.
+pub fn IoUringSubmit(ring: int64): int64 {
+  var localTail: int64 := peek64(ring + IO_RING_SQ_LOCAL_TAIL);
+  var ringTail:  int64 := peek32(peek64(ring + IO_RING_SQ_TAIL_PTR));
+  var toSubmit:  int64 := localTail - ringTail;
+  if (toSubmit <= 0) { return 0; }
+  poke32(peek64(ring + IO_RING_SQ_TAIL_PTR), localTail as int32);
+  return sys_io_uring_enter(peek64(ring + IO_RING_FD), toSubmit, 0, 0);
+}
+
+// IoUringSubmitAndWait: submit + blockiere bis minComplete CQEs fertig sind.
+pub fn IoUringSubmitAndWait(ring: int64, minComplete: int64): int64 {
+  var localTail: int64 := peek64(ring + IO_RING_SQ_LOCAL_TAIL);
+  var ringTail:  int64 := peek32(peek64(ring + IO_RING_SQ_TAIL_PTR));
+  var toSubmit:  int64 := localTail - ringTail;
+  if (toSubmit > 0) {
+    poke32(peek64(ring + IO_RING_SQ_TAIL_PTR), localTail as int32);
+  }
+  return sys_io_uring_enter(peek64(ring + IO_RING_FD), toSubmit, minComplete,
+                            IORING_ENTER_GETEVENTS);
+}
+
+// ============================================================
+// CQE-Verwaltung
+// ============================================================
+
+// IoUringPeekCQE: gibt Zeiger auf naechste CQE oder 0 wenn keine vorhanden.
+pub fn IoUringPeekCQE(ring: int64): int64 {
+  var head: int64 := peek32(peek64(ring + IO_RING_CQ_HEAD_PTR));
+  var tail: int64 := peek32(peek64(ring + IO_RING_CQ_TAIL_PTR));
+  if (head == tail) { return 0; }
+  var mask: int64 := peek64(ring + IO_RING_CQ_MASK);
+  return peek64(ring + IO_RING_CQ_CQES_PTR) + (head & mask) * IORING_CQE_SIZE;
+}
+
+// IoUringWaitCQE: blockiert bis eine CQE verfuegbar ist.
+pub fn IoUringWaitCQE(ring: int64): int64 {
+  var cqe: int64 := IoUringPeekCQE(ring);
+  while (cqe == 0) {
+    sys_io_uring_enter(peek64(ring + IO_RING_FD), 0, 1, IORING_ENTER_GETEVENTS);
+    cqe := IoUringPeekCQE(ring);
+  }
+  return cqe;
+}
+
+// IoUringCQESeen: markiert die aktuelle CQE als verarbeitet (head um 1 erhoehen).
+pub fn IoUringCQESeen(ring: int64, cqe: int64): int64 {
+  var head: int64 := peek32(peek64(ring + IO_RING_CQ_HEAD_PTR));
+  poke32(peek64(ring + IO_RING_CQ_HEAD_PTR), (head + 1) as int32);
+  return 0;
+}
+
+// IoUringCQEResult: liest das Ergebnis einer CQE (negativ = Fehler-Errno).
+pub fn IoUringCQEResult(cqe: int64): int64 {
+  var r: int64 := peek32(cqe + CQE_RES);
+  // sign-extend int32 -> int64
+  if (r > 2147483647) { return r - 4294967296; }
+  return r;
+}
+
+// IoUringCQEUserData: liest user_data aus einer CQE.
+pub fn IoUringCQEUserData(cqe: int64): int64 {
+  return peek64(cqe + CQE_USER_DATA);
+}
+
+// ============================================================
+// SQE-Setup-Helfer
+// ============================================================
+
+// IoUringSQESetNop: konfiguriert ein SQE als No-Op (fuer Tests).
+pub fn IoUringSQESetNop(sqe: int64, userData: int64): int64 {
+  poke8(sqe + SQE_OPCODE, IORING_OP_NOP);
+  poke64(sqe + SQE_USER_DATA, userData);
+  return 0;
+}
+
+// IoUringSQESetRead: konfiguriert ein SQE fuer einen asynchronen Read.
+// fd:       Quelldateideskriptor
+// buf:      Zielpuffer
+// len:      Anzahl Bytes
+// offset:   Dateioffset (0 = Anfang, -1 = aktuelle Position bei Pipes/Sockets)
+// userData: beliebige Kennung, erscheint in der CQE
+pub fn IoUringSQESetRead(sqe: int64, fd: int64, buf: int64,
+                         len: int64, offset: int64, userData: int64): int64 {
+  poke8(sqe + SQE_OPCODE, IORING_OP_READ);
+  poke32(sqe + SQE_FD,    fd as int32);
+  poke64(sqe + SQE_OFF,   offset);
+  poke64(sqe + SQE_ADDR,  buf);
+  poke32(sqe + SQE_LEN,   len as int32);
+  poke64(sqe + SQE_USER_DATA, userData);
+  return 0;
+}
+
+// IoUringSQESetWrite: konfiguriert ein SQE fuer einen asynchronen Write.
+pub fn IoUringSQESetWrite(sqe: int64, fd: int64, buf: int64,
+                          len: int64, offset: int64, userData: int64): int64 {
+  poke8(sqe + SQE_OPCODE, IORING_OP_WRITE);
+  poke32(sqe + SQE_FD,    fd as int32);
+  poke64(sqe + SQE_OFF,   offset);
+  poke64(sqe + SQE_ADDR,  buf);
+  poke32(sqe + SQE_LEN,   len as int32);
+  poke64(sqe + SQE_USER_DATA, userData);
+  return 0;
+}
