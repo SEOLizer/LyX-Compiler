@@ -6,6 +6,8 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.time;
 
+import std.alloc;
+
 pub type date      = int64; // days since epoch
 pub type time      = int64; // seconds since midnight
 pub type datetime  = int64; // Unix seconds
@@ -272,4 +274,174 @@ pub fn ZoneCEST(): TimeZone {
 pub fn ApplyTimeZone(dt: datetime, zone: TimeZone): datetime {
   var off: int64 := zone.offset_seconds;
   return dt + off;
+}
+
+// ============================================================
+// WP-4: Syscall-basierte Zeit- und Timer-Funktionen
+// ============================================================
+
+// Clock-IDs (POSIX)
+pub con CLOCK_REALTIME:            int64 := 0;
+pub con CLOCK_MONOTONIC:           int64 := 1;
+pub con CLOCK_PROCESS_CPUTIME_ID:  int64 := 2;
+pub con CLOCK_THREAD_CPUTIME_ID:   int64 := 3;
+pub con CLOCK_MONOTONIC_RAW:       int64 := 4;
+pub con CLOCK_BOOTTIME:            int64 := 7;
+
+// clock_nanosleep / timerfd Flags
+pub con TIMER_ABSTIME:      int64 := 1;  // absoluter Zeitpunkt statt relativ
+
+// timerfd Flags
+pub con TFD_CLOEXEC:        int64 := 524288;  // 0x80000
+pub con TFD_NONBLOCK:       int64 := 2048;    // 0x800
+pub con TFD_TIMER_ABSTIME:  int64 := 1;
+pub con TFD_TIMER_CANCEL_ON_SET: int64 := 2;
+
+// timespec / timeval Struktur-Größen
+pub con TIMESPEC_SIZE:  int64 := 16;  // { tv_sec:8, tv_nsec:8 }
+pub con TIMEVAL_SIZE:   int64 := 16;  // { tv_sec:8, tv_usec:8 }
+pub con ITIMERSPEC_SIZE: int64 := 32; // { it_interval:timespec, it_value:timespec }
+
+// Nanosekunden-Konstanten
+pub con NS_PER_MS:  int64 := 1000000;      // 1 ms  in ns
+pub con NS_PER_SEC: int64 := 1000000000;   // 1 s   in ns
+pub con US_PER_SEC: int64 := 1000000;      // 1 s   in µs
+
+// ============================================================
+// Schlafen
+// ============================================================
+
+// Sleep: schläft mindestens ms Millisekunden.
+// Gibt 0 bei Erfolg, -EINTR wenn durch Signal unterbrochen.
+pub fn Sleep(ms: int64): int64 {
+  var ts: int64 := alloc(TIMESPEC_SIZE);
+  if (ts == 0) { return -1; }
+  poke64(ts,     ms / 1000);           // tv_sec
+  poke64(ts + 8, (ms % 1000) * NS_PER_MS); // tv_nsec
+  var r: int64 := sys_nanosleep(ts, 0);
+  free(ts, TIMESPEC_SIZE);
+  return r;
+}
+
+// SleepNs: schläft mindestens ns Nanosekunden.
+pub fn SleepNs(ns: int64): int64 {
+  var ts: int64 := alloc(TIMESPEC_SIZE);
+  if (ts == 0) { return -1; }
+  poke64(ts,     ns / NS_PER_SEC);
+  poke64(ts + 8, ns % NS_PER_SEC);
+  var r: int64 := sys_nanosleep(ts, 0);
+  free(ts, TIMESPEC_SIZE);
+  return r;
+}
+
+// SleepUntil: schläft bis zum absoluten Zeitpunkt absNs (Nanosekunden seit Epoche).
+// clockId: CLOCK_MONOTONIC oder CLOCK_REALTIME.
+pub fn SleepUntil(clockId: int64, absNs: int64): int64 {
+  var ts: int64 := alloc(TIMESPEC_SIZE);
+  if (ts == 0) { return -1; }
+  poke64(ts,     absNs / NS_PER_SEC);
+  poke64(ts + 8, absNs % NS_PER_SEC);
+  var r: int64 := sys_clock_nanosleep(clockId, TIMER_ABSTIME, ts, 0);
+  free(ts, TIMESPEC_SIZE);
+  return r;
+}
+
+// ============================================================
+// Uhrzeit lesen
+// ============================================================
+
+// GetTimeNs: liefert die aktuelle Zeit in Nanosekunden (via clock_gettime).
+// clockId: CLOCK_REALTIME, CLOCK_MONOTONIC, etc.
+pub fn GetTimeNs(clockId: int64): int64 {
+  var ts: int64 := alloc(TIMESPEC_SIZE);
+  if (ts == 0) { return 0; }
+  clock_gettime(clockId, ts);
+  var sec:  int64 := peek64(ts);
+  var nsec: int64 := peek64(ts + 8);
+  free(ts, TIMESPEC_SIZE);
+  return sec * NS_PER_SEC + nsec;
+}
+
+// GetTimeMs: liefert Millisekunden seit CLOCK_MONOTONIC-Epoche.
+pub fn GetTimeMs(): int64 {
+  return GetTimeNs(CLOCK_MONOTONIC) / NS_PER_MS;
+}
+
+// GetTimeOfDay: schreibt Unix-Sekunden und Mikrosekunden in die Ausgabe-Buffer.
+// tvSecOut / tvUsecOut: je alloc(8); danach via peek64() lesen.
+pub fn GetTimeOfDay(tvSecOut: int64, tvUsecOut: int64): int64 {
+  var tv: int64 := alloc(TIMEVAL_SIZE);
+  if (tv == 0) { return -1; }
+  var r: int64 := sys_gettimeofday(tv, 0);
+  if (r == 0) {
+    poke64(tvSecOut,  peek64(tv));
+    poke64(tvUsecOut, peek64(tv + 8));
+  }
+  free(tv, TIMEVAL_SIZE);
+  return r;
+}
+
+// GetUnixMs: liefert aktuelle Zeit als Millisekunden seit Unix-Epoche.
+pub fn GetUnixMs(): int64 {
+  var tv: int64 := alloc(TIMEVAL_SIZE);
+  if (tv == 0) { return 0; }
+  sys_gettimeofday(tv, 0);
+  var sec:  int64 := peek64(tv);
+  var usec: int64 := peek64(tv + 8);
+  free(tv, TIMEVAL_SIZE);
+  return sec * 1000 + usec / 1000;
+}
+
+// ============================================================
+// timerfd — Kernel-Timer über fd (epoll-integrierbar)
+// ============================================================
+
+// TimerFdCreate: erstellt einen neuen timerfd.
+// clockId: CLOCK_REALTIME oder CLOCK_MONOTONIC.
+// flags: TFD_CLOEXEC | TFD_NONBLOCK (oder 0).
+pub fn TimerFdCreate(clockId: int64, flags: int64): int64 {
+  return sys_timerfd_create(clockId, flags);
+}
+
+// TimerFdSetTime: stellt den Timer ein.
+// intervalNs: Wiederholintervall in ns (0 = einmalig).
+// valueNs:    erste Ablaufzeit in ns (relativ, ab sofort).
+pub fn TimerFdSetTime(fd: int64, intervalNs: int64, valueNs: int64): int64 {
+  var its: int64 := alloc(ITIMERSPEC_SIZE);
+  if (its == 0) { return -1; }
+  // it_interval (Offset 0): Wiederholungsintervall
+  poke64(its,      intervalNs / NS_PER_SEC);
+  poke64(its + 8,  intervalNs % NS_PER_SEC);
+  // it_value (Offset 16): erste Ablaufzeit
+  poke64(its + 16, valueNs / NS_PER_SEC);
+  poke64(its + 24, valueNs % NS_PER_SEC);
+  var r: int64 := sys_timerfd_settime(fd, 0, its, 0);
+  free(its, ITIMERSPEC_SIZE);
+  return r;
+}
+
+// TimerFdGetTime: liest die verbleibende Zeit bis zum nächsten Ablauf.
+// Gibt Nanosekunden zurück, oder 0 wenn abgelaufen.
+pub fn TimerFdGetTime(fd: int64): int64 {
+  var its: int64 := alloc(ITIMERSPEC_SIZE);
+  if (its == 0) { return 0; }
+  sys_timerfd_gettime(fd, its);
+  var sec:  int64 := peek64(its + 16);
+  var nsec: int64 := peek64(its + 24);
+  free(its, ITIMERSPEC_SIZE);
+  return sec * NS_PER_SEC + nsec;
+}
+
+// TimerFdRead: liest die Anzahl der Abläufe seit letztem Lesen (blockierend).
+// Gibt die Ablauf-Anzahl zurück (uint64), oder < 0 bei Fehler.
+pub fn TimerFdRead(fd: int64): int64 {
+  var buf: int64 := alloc(8);
+  if (buf == 0) { return -1; }
+  var n: int64 := sys_read(fd, buf, 8);
+  var count: int64 := 0;
+  if (n == 8) {
+    count := peek64(buf);
+  }
+  free(buf, 8);
+  return count;
 }
