@@ -1,0 +1,136 @@
+// WP-6: Test für std/net/socket WP-6-Ergänzungen
+import std.net.socket;
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  PrintLn("=== WP-6: Netzwerk-Ergänzungen ===");
+
+  // --- Test 1: SocketGetOwnAddr — bind auf Port 0, Port via getsockname lesen ---
+  var tcpFd: int64 := sys_socket(2, 1, 0);  // AF_INET, SOCK_STREAM (blocking)
+  if (tcpFd < 0) { PrintLn("FAIL: socket"); return 1; }
+
+  var bindAddr: int64 := mmap(0, SOCKADDR_IN_SIZE, 3, 34, -1, 0);
+  poke16(bindAddr, 2); poke16(bindAddr+2, 0); poke32(bindAddr+4, 16777343);
+  var r: int64 := sys_bind(tcpFd, bindAddr, SOCKADDR_IN_SIZE);
+  munmap(bindAddr, SOCKADDR_IN_SIZE);
+  if (r != 0) { PrintLn("FAIL: bind"); return 1; }
+
+  var ownAddr: int64 := mmap(0, SOCKADDR_IN_SIZE, 3, 34, -1, 0);
+  r := SocketGetOwnAddr(tcpFd, ownAddr, SOCKADDR_IN_SIZE);
+  if (r == 0) {
+    var portBE: int64 := peek16(ownAddr + 2);
+    var port: int64 := ((portBE & 255) << 8) | ((portBE >> 8) & 255);
+    if (port > 0 && port < 65536) {
+      Print("OK: SocketGetOwnAddr — Port="); PrintLn(port);
+    } else {
+      Print("FAIL: ungültiger Port="); PrintLn(port);
+      munmap(ownAddr, SOCKADDR_IN_SIZE); close(tcpFd); return 1;
+    }
+  } else {
+    Print("FAIL: SocketGetOwnAddr="); PrintLn(r);
+    munmap(ownAddr, SOCKADDR_IN_SIZE); close(tcpFd); return 1;
+  }
+  munmap(ownAddr, SOCKADDR_IN_SIZE);
+  close(tcpFd);
+
+  // --- Test 2: AcceptNonBlocking auf leer lauschenden Non-Blocking-Socket → EAGAIN ---
+  // Socket mit SOCK_NONBLOCK erstellen (separate Variable um Reihenfolge zu kontrollieren)
+  var nbFd: int64 := sys_socket(2, 1, 0);  // Blocking zunächst
+  if (nbFd < 0) { PrintLn("FAIL: socket2"); return 1; }
+  var bindAddr2: int64 := mmap(0, SOCKADDR_IN_SIZE, 3, 34, -1, 0);
+  poke16(bindAddr2, 2); poke16(bindAddr2+2, 0); poke32(bindAddr2+4, 16777343);
+  sys_bind(nbFd, bindAddr2, SOCKADDR_IN_SIZE);
+  munmap(bindAddr2, SOCKADDR_IN_SIZE);
+  sys_listen(nbFd, 1);
+  // Jetzt auf non-blocking setzen (F_GETFL=3, F_SETFL=4)
+  var curFlags: int64 := sys_fcntl(nbFd, 3, 0);
+  sys_fcntl(nbFd, 4, curFlags | 2048);  // O_NONBLOCK = 2048
+  var addrBuf2: int64 := mmap(0, SOCKADDR_IN_SIZE, 3, 34, -1, 0);
+  r := AcceptNonBlocking(nbFd, addrBuf2, SOCKADDR_IN_SIZE);
+  munmap(addrBuf2, SOCKADDR_IN_SIZE);
+  close(nbFd);
+  if (r == -11 || r == -35) {
+    PrintLn("OK: AcceptNonBlocking — EAGAIN (keine Verbindung wartend)");
+  } else {
+    Print("FAIL: AcceptNonBlocking erwartet EAGAIN, bekam "); PrintLn(r); return 1;
+  }
+
+  // --- Test 3: SocketGetPeerAddr auf unverbundenem Socket → ENOTCONN (-107) ---
+  var udpFd: int64 := sys_socket(2, 2, 0);  // AF_INET, SOCK_DGRAM
+  if (udpFd < 0) { PrintLn("FAIL: udp socket"); return 1; }
+  var peerAddr: int64 := mmap(0, SOCKADDR_IN_SIZE, 3, 34, -1, 0);
+  r := SocketGetPeerAddr(udpFd, peerAddr, SOCKADDR_IN_SIZE);
+  munmap(peerAddr, SOCKADDR_IN_SIZE);
+  close(udpFd);
+  if (r == -107) {
+    PrintLn("OK: SocketGetPeerAddr — ENOTCONN (-107) auf unverbundenem Socket");
+  } else {
+    Print("FAIL: SocketGetPeerAddr erwartet -107, bekam "); PrintLn(r); return 1;
+  }
+
+  // --- Test 4: SendMmsg + RecvMmsg über AF_UNIX SOCK_DGRAM socketpair ---
+  var fdsBuf: int64 := mmap(0, 8, 3, 34, -1, 0);
+  r := sys_socketpair(1, 2, 0, fdsBuf);  // AF_UNIX=1, SOCK_DGRAM=2
+  if (r != 0) { Print("FAIL: socketpair="); PrintLn(r); return 1; }
+  var both: int64 := peek64(fdsBuf);
+  var fd0: int64 := both & 2147483647;
+  var fd1: int64 := (both >> 32) & 2147483647;
+  munmap(fdsBuf, 8);
+  Print("OK: socketpair — fd0="); Print(fd0); Print(" fd1="); PrintLn(fd1);
+
+  var msg0: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var msg1: int64 := mmap(0, 8, 3, 34, -1, 0);
+  poke8(msg0, 65); poke8(msg0+1, 66); poke8(msg0+2, 67);  // "ABC"
+  poke8(msg1, 88); poke8(msg1+1, 89); poke8(msg1+2, 90);  // "XYZ"
+
+  var iovOut: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var vec: int64 := MmsgAlloc(2, iovOut);
+  var iov: int64 := peek64(iovOut);
+  munmap(iovOut, 8);
+  if (vec == 0) { PrintLn("FAIL: MmsgAlloc"); return 1; }
+
+  MmsgSetBuf(iov, 0, msg0, 3);
+  MmsgSetBuf(iov, 1, msg1, 3);
+
+  var sent: int64 := SendMmsg(fd1, vec, 2, 0);
+  if (sent == 2) {
+    PrintLn("OK: SendMmsg — 2 Nachrichten gesendet");
+  } else {
+    Print("FAIL: SendMmsg="); PrintLn(sent); return 1;
+  }
+  MmsgFree(vec, iov, 2);
+  munmap(msg0, 8); munmap(msg1, 8);
+
+  var rbuf0: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var rbuf1: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var riovOut: int64 := mmap(0, 8, 3, 34, -1, 0);
+  var rvec: int64 := MmsgAlloc(2, riovOut);
+  var riov: int64 := peek64(riovOut);
+  munmap(riovOut, 8);
+  if (rvec == 0) { PrintLn("FAIL: MmsgAlloc recv"); return 1; }
+
+  MmsgSetBuf(riov, 0, rbuf0, 8);
+  MmsgSetBuf(riov, 1, rbuf1, 8);
+
+  var recvd: int64 := RecvMmsg(fd0, rvec, 2, 0);
+  if (recvd == 2) {
+    var len0: int64 := MmsgGetLen(rvec, 0);
+    var len1: int64 := MmsgGetLen(rvec, 1);
+    var ok: bool := (len0 == 3 && len1 == 3);
+    ok := ok && (peek8(rbuf0) == 65 && peek8(rbuf0+1) == 66 && peek8(rbuf0+2) == 67);
+    ok := ok && (peek8(rbuf1) == 88 && peek8(rbuf1+1) == 89 && peek8(rbuf1+2) == 90);
+    if (ok) {
+      PrintLn("OK: RecvMmsg — 2 Nachrichten, Inhalt korrekt");
+    } else {
+      PrintLn("FAIL: RecvMmsg Inhalt falsch"); return 1;
+    }
+  } else {
+    Print("FAIL: RecvMmsg="); PrintLn(recvd); return 1;
+  }
+
+  MmsgFree(rvec, riov, 2);
+  munmap(rbuf0, 8); munmap(rbuf1, 8);
+  close(fd0); close(fd1);
+
+  PrintLn("=== WP-6: alle Tests bestanden ===");
+  return 0;
+}
