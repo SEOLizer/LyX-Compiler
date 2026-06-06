@@ -1,0 +1,309 @@
+// tests/usb_wp1_test.lyx
+// WP-1 + WP-1.1: USB Low-Level Syscalls & Hilfsfunktionen
+//
+// Abnahmekriterien:
+// WP-1: 1. Syscalls aufrufbar  3. getdents64-Directory-Listing  4. lseek Reset
+// WP-1.1: 1. IsNumeric  2. ParseNum  3. BuildPath  4. kein Buffer-Overflow
+
+unit tests.usb_wp1_test;
+
+import std.hardware.usb_syscalls;
+import std.hardware.usb_util;
+import std.alloc;
+
+// ============================================================
+// WP-1 Tests: Syscall-Wrapper
+// ============================================================
+
+// AC-1: open, read, close, lseek aufrufbar + AC-4: lseek(fd,0,SEEK_SET)
+fn testOpenReadLseek(): int64 {
+  // Öffne /proc/version — immer lesbar, gut reproduzierbar
+  var path: pchar := "/proc/version"c;
+  var fd: int64 := usb_open(path, USB_O_RDONLY);
+  if (fd < 0) {
+    PrintLn("FAIL: open /proc/version");
+    return 1;
+  }
+
+  var buf: int64 := alloc(256);
+
+  // Erstes Lesen
+  var n1: int64 := usb_read(fd, buf, 255);
+  if (n1 <= 0) {
+    PrintLn("FAIL: read /proc/version (first)");
+    usb_close(fd);
+    free(buf, 256);
+    return 1;
+  }
+  poke8(buf + n1, 0);
+
+  // AC-4: lseek zurück auf Byte 0
+  var seekRet: int64 := usb_lseek(fd, 0, USB_SEEK_SET);
+  if (seekRet < 0) {
+    PrintLn("FAIL: lseek SEEK_SET");
+    usb_close(fd);
+    free(buf, 256);
+    return 1;
+  }
+
+  // Zweites Lesen — muss gleich viele Bytes liefern
+  var n2: int64 := usb_read(fd, buf, 255);
+  if (n2 != n1) {
+    PrintLn("FAIL: lseek did not reset position");
+    usb_close(fd);
+    free(buf, 256);
+    return 1;
+  }
+
+  usb_close(fd);
+  free(buf, 256);
+  PrintLn("OK: open/read/lseek");
+  return 0;
+}
+
+// AC-3: getdents64 — Verzeichnis auflisten
+fn testGetdents64(): int64 {
+  var path: pchar := "/tmp"c;
+  var fd: int64 := usb_open(path, USB_O_RDONLY | USB_O_DIRECTORY);
+  if (fd < 0) {
+    PrintLn("FAIL: open /tmp as directory");
+    return 1;
+  }
+
+  var buf: int64 := alloc(4096);
+  var nRead: int64 := usb_getdents64(fd, buf, 4096);
+  usb_close(fd);
+
+  if (nRead <= 0) {
+    PrintLn("FAIL: getdents64 /tmp returned <= 0");
+    free(buf, 4096);
+    return 1;
+  }
+
+  // Mindestens einen gültigen Eintrag parsen (reclen > 0)
+  var recLen: int64 := Dirent64RecLen(buf);
+  if (recLen <= 0) {
+    PrintLn("FAIL: first dirent reclen is 0");
+    free(buf, 4096);
+    return 1;
+  }
+
+  free(buf, 4096);
+  PrintLn("OK: getdents64");
+  return 0;
+}
+
+// ============================================================
+// WP-1.1 Tests: Hilfstypen & -funktionen
+// ============================================================
+
+// AC-1: IsNumeric
+fn testIsNumeric(): int64 {
+  var failed: int64 := 0;
+
+  var s1: pchar := "001"c;
+  if (UsbIsNumeric(s1 as int64) != 1) {
+    PrintLn("FAIL: IsNumeric(\"001\") should be 1");
+    failed := failed + 1;
+  }
+
+  var s2: pchar := "00a"c;
+  if (UsbIsNumeric(s2 as int64) != 0) {
+    PrintLn("FAIL: IsNumeric(\"00a\") should be 0");
+    failed := failed + 1;
+  }
+
+  var s3: pchar := ""c;
+  if (UsbIsNumeric(s3 as int64) != 0) {
+    PrintLn("FAIL: IsNumeric(\"\") should be 0");
+    failed := failed + 1;
+  }
+
+  var s4: pchar := "42"c;
+  if (UsbIsNumeric(s4 as int64) != 1) {
+    PrintLn("FAIL: IsNumeric(\"42\") should be 1");
+    failed := failed + 1;
+  }
+
+  if (failed == 0) {
+    PrintLn("OK: IsNumeric");
+  }
+  return failed;
+}
+
+// AC-2: ParseNum
+fn testParseNum(): int64 {
+  var failed: int64 := 0;
+
+  var s1: pchar := "042"c;
+  var v1: int64 := UsbParseNum(s1 as int64);
+  if (v1 != 42) {
+    PrintLn("FAIL: ParseNum(\"042\") != 42");
+    failed := failed + 1;
+  }
+
+  var s2: pchar := "0"c;
+  var v2: int64 := UsbParseNum(s2 as int64);
+  if (v2 != 0) {
+    PrintLn("FAIL: ParseNum(\"0\") != 0");
+    failed := failed + 1;
+  }
+
+  var s3: pchar := "255"c;
+  var v3: int64 := UsbParseNum(s3 as int64);
+  if (v3 != 255) {
+    PrintLn("FAIL: ParseNum(\"255\") != 255");
+    failed := failed + 1;
+  }
+
+  var s4: pchar := "1000"c;
+  var v4: int64 := UsbParseNum(s4 as int64);
+  if (v4 != 1000) {
+    PrintLn("FAIL: ParseNum(\"1000\") != 1000");
+    failed := failed + 1;
+  }
+
+  if (failed == 0) {
+    PrintLn("OK: ParseNum");
+  }
+  return failed;
+}
+
+// AC-3+4: BuildPath — kein Buffer-Overflow
+fn testBuildPath(): int64 {
+  var failed: int64 := 0;
+  var buf: int64 := alloc(64);
+
+  var base: pchar    := "/dev/bus/usb/"c;
+  var seg: pchar     := "001"c;
+  var suffix: pchar  := "/"c;
+
+  UsbBuildPath(base as int64, seg as int64, suffix as int64, buf, 64);
+
+  // Erwartung: "/dev/bus/usb/001/"
+  var expected: pchar := "/dev/bus/usb/001/"c;
+  var expPtr: int64 := expected as int64;
+  var ok: int64 := 1;
+  var i: int64 := 0;
+  while (true) {
+    var ce: int64 := peek8(expPtr + i);
+    var cb: int64 := peek8(buf + i);
+    if (ce != cb) {
+      ok := 0;
+      break;
+    }
+    if (ce == 0) {
+      break;
+    }
+    i := i + 1;
+  }
+
+  if (ok == 0) {
+    PrintLn("FAIL: BuildPath result mismatch");
+    failed := failed + 1;
+  }
+
+  // AC-4: Kein Buffer-Overflow bei kleinem Puffer (buf_size=10)
+  // Allocate 11 Bytes: [0..9] = writeable buffer, [10] = Sentinel (darf nie angefasst werden)
+  var smallBuf: int64 := alloc(11);
+  poke8(smallBuf + 10, 0xAA);  // Sentinel NACH dem Puffer
+  UsbBuildPath(base as int64, seg as int64, suffix as int64, smallBuf, 10);
+  // BuildPath schreibt max buf_size-1=9 Zeichen und NUL an [9] — [10] bleibt unangetastet
+  var sentinel: int64 := peek8(smallBuf + 10);
+  if (sentinel != 0xAA) {
+    PrintLn("FAIL: BuildPath buffer overflow detected");
+    failed := failed + 1;
+  }
+  free(smallBuf, 11);
+
+  // Leeres Suffix
+  var buf2: int64 := alloc(64);
+  var suffix2: pchar := ""c;
+  UsbBuildPath(base as int64, seg as int64, suffix2 as int64, buf2, 64);
+  var exp2: pchar := "/dev/bus/usb/001"c;
+  var exp2Ptr: int64 := exp2 as int64;
+  var ok2: int64 := 1;
+  i := 0;
+  while (true) {
+    var ce: int64 := peek8(exp2Ptr + i);
+    var cb: int64 := peek8(buf2 + i);
+    if (ce != cb) { ok2 := 0; break; }
+    if (ce == 0) { break; }
+    i := i + 1;
+  }
+  if (ok2 == 0) {
+    PrintLn("FAIL: BuildPath empty suffix mismatch");
+    failed := failed + 1;
+  }
+  free(buf2, 64);
+
+  free(buf, 64);
+  if (failed == 0) {
+    PrintLn("OK: BuildPath");
+  }
+  return failed;
+}
+
+// ============================================================
+// Dirent64 Accessor Test (direkter Puffer-Test)
+// ============================================================
+fn testDirent64Accessors(): int64 {
+  // Baue manuell eine linux_dirent64-Struktur im Speicher:
+  // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name("abc\0" + Padding)
+  var buf: int64 := alloc(32);
+  poke64(buf,      0x0102030405060708);  // d_ino
+  poke64(buf + 8,  0x0807060504030201);  // d_off
+  poke16(buf + 16, 24);                  // d_reclen = 24
+  poke8 (buf + 18, 8);                   // d_type = DT_REG
+  poke8 (buf + 19, 97);                  // 'a'
+  poke8 (buf + 20, 98);                  // 'b'
+  poke8 (buf + 21, 99);                  // 'c'
+  poke8 (buf + 22, 0);                   // NUL
+
+  var failed: int64 := 0;
+
+  if (Dirent64Ino(buf) != 0x0102030405060708) {
+    PrintLn("FAIL: Dirent64Ino");
+    failed := failed + 1;
+  }
+  if (Dirent64RecLen(buf) != 24) {
+    PrintLn("FAIL: Dirent64RecLen");
+    failed := failed + 1;
+  }
+  if (Dirent64Type(buf) != 8) {
+    PrintLn("FAIL: Dirent64Type");
+    failed := failed + 1;
+  }
+  var namePtr: int64 := Dirent64Name(buf);
+  if (peek8(namePtr) != 97) {
+    PrintLn("FAIL: Dirent64Name[0] != 'a'");
+    failed := failed + 1;
+  }
+  if (peek8(namePtr + 1) != 98) {
+    PrintLn("FAIL: Dirent64Name[1] != 'b'");
+    failed := failed + 1;
+  }
+
+  free(buf, 32);
+  if (failed == 0) {
+    PrintLn("OK: Dirent64 accessors");
+  }
+  return failed;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testOpenReadLseek();
+  failed := failed + testGetdents64();
+  failed := failed + testIsNumeric();
+  failed := failed + testParseNum();
+  failed := failed + testBuildPath();
+  failed := failed + testDirent64Accessors();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
