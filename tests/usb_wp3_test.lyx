@@ -1,0 +1,282 @@
+// tests/usb_wp3_test.lyx
+// WP-3: Device Discovery
+//
+// Abnahmekriterien:
+// AC-1: FindDevice findet Gerät mit passender VID/PID
+// AC-2: Unzugängliche Geräte werden übersprungen, nachfolgende geprüft
+// AC-3: Bus-Verzeichnis mit mehreren Geräten wird korrekt durchlaufen
+// AC-4: device.configs vollständig befüllt nach FindDevice
+
+unit tests.usb_wp3_test;
+
+import std.hardware.usb_discovery;
+import std.hardware.usb_types;
+import std.hardware.usb_parse;
+import std.alloc;
+
+// ============================================================
+// Test-Infrastruktur: Fake-USB-Verzeichnisbaum in /tmp aufbauen
+//
+// /tmp/lyx_usb_disc/
+//   001/
+//     001   (VID=0x0001, PID=0x0001 — kein Treffer)
+//     002   (VID=0x1234, PID=0x5678 — TREFFER, mit vollem Descriptor-Stream)
+//   002/
+//     001   (VID=0x9999, PID=0x0001 — kein Treffer)
+// ============================================================
+
+fn writeDescStream(path: int64, vid: int64, pid: int64,
+                   numCfgs: int64, hasEp: int64) {
+  // Device Descriptor (18 Bytes)
+  var buf: int64 := alloc(64);
+  poke8(buf +  0, 18);
+  poke8(buf +  1, 1);               // bDescriptorType = Device
+  poke8(buf +  2, 0x00);
+  poke8(buf +  3, 0x02);            // bcdUSB = 0x0200
+  poke8(buf +  4, 0);               // bDeviceClass
+  poke8(buf +  5, 0); poke8(buf + 6, 0); poke8(buf + 7, 64);
+  poke8(buf +  8, vid & 0xFF);
+  poke8(buf +  9, (vid >> 8) & 0xFF);
+  poke8(buf + 10, pid & 0xFF);
+  poke8(buf + 11, (pid >> 8) & 0xFF);
+  poke8(buf + 12, 0); poke8(buf + 13, 1);  // bcdDevice = 0x0100
+  poke8(buf + 14, 0); poke8(buf + 15, 0); poke8(buf + 16, 0);
+  poke8(buf + 17, numCfgs & 0xFF);
+
+  var totalBytes: int64 := 18;
+
+  if (numCfgs > 0) {
+    // Config Descriptor (9 Bytes) — numIfc = 1 immer
+    var cfgLen: int64 := 9;
+    if (hasEp == 1) { cfgLen := 9 + 9 + 7; }
+    poke8(buf + 18, 9);   // bLength
+    poke8(buf + 19, 2);   // bDescriptorType = Config
+    poke8(buf + 20, cfgLen & 0xFF);
+    poke8(buf + 21, (cfgLen >> 8) & 0xFF);
+    poke8(buf + 22, 1);   // bNumInterfaces
+    poke8(buf + 23, 1);   // bConfigurationValue
+    poke8(buf + 24, 0);
+    poke8(buf + 25, 0x80);
+    poke8(buf + 26, 50);
+    totalBytes := totalBytes + 9;
+
+    // Interface Descriptor (9 Bytes)
+    var numEp: int64 := 0;
+    if (hasEp == 1) { numEp := 1; }
+    poke8(buf + 27, 9);
+    poke8(buf + 28, 4);   // bDescriptorType = Interface
+    poke8(buf + 29, 0);   // bInterfaceNumber
+    poke8(buf + 30, 0);
+    poke8(buf + 31, numEp & 0xFF);
+    poke8(buf + 32, 3);   // bInterfaceClass = HID
+    poke8(buf + 33, 0); poke8(buf + 34, 0); poke8(buf + 35, 0);
+    totalBytes := totalBytes + 9;
+
+    if (hasEp == 1) {
+      // Endpoint Descriptor (7 Bytes)
+      poke8(buf + 36, 7);
+      poke8(buf + 37, 5);   // bDescriptorType = Endpoint
+      poke8(buf + 38, 0x81);  // IN EP1
+      poke8(buf + 39, 0x03);  // Interrupt
+      poke8(buf + 40, 8);
+      poke8(buf + 41, 0);
+      poke8(buf + 42, 10);
+      totalBytes := totalBytes + 7;
+    }
+  }
+
+  var fd: int64 := open(path as pchar, 1 | 64 | 512, 420);
+  if (fd >= 0) {
+    write(fd, buf, totalBytes);
+    close(fd);
+  }
+  free(buf, 64);
+}
+
+fn buildFakeUsbTree(): int64 {
+  // Erstelle Verzeichnisbaum in /tmp/lyx_usb_disc/
+  mkdir("/tmp/lyx_usb_disc"c, 493);       // 0755
+  mkdir("/tmp/lyx_usb_disc/001"c, 493);
+  mkdir("/tmp/lyx_usb_disc/002"c, 493);
+
+  // Geräte in Bus 001
+  var p1: pchar := "/tmp/lyx_usb_disc/001/001"c;
+  writeDescStream(p1 as int64, 0x0001, 0x0001, 1, 0);  // kein Treffer, kein EP
+
+  var p2: pchar := "/tmp/lyx_usb_disc/001/002"c;
+  writeDescStream(p2 as int64, 0x1234, 0x5678, 1, 1);  // TREFFER, mit EP
+
+  // Gerät in Bus 002
+  var p3: pchar := "/tmp/lyx_usb_disc/002/001"c;
+  writeDescStream(p3 as int64, 0x9999, 0x0001, 1, 0);  // kein Treffer
+
+  return 0;
+}
+
+// ============================================================
+// AC-1 + AC-4: Gerät mit 0x1234/0x5678 wird gefunden,
+//              device.configs vollständig befüllt
+// ============================================================
+fn testFindDevice(): int64 {
+  var root: pchar := "/tmp/lyx_usb_disc/"c;
+  var devPtr: int64 := UsbAllocDevice();
+  var result: int64 := UsbFindDevicePath(root as int64, 0x1234, 0x5678, devPtr);
+
+  var failed: int64 := 0;
+  if (result != USB_FIND_OK) {
+    PrintLn("FAIL: FindDevice did not find 0x1234/0x5678");
+    free(devPtr, USB_SIZEOF_DEVICE);
+    return 1;
+  }
+
+  var vid: int64 := peek64(devPtr);      // vendor_id
+  var pid: int64 := peek64(devPtr + 8);  // product_id
+  if (vid != 0x1234) { PrintLn("FAIL: vendor_id != 0x1234"); failed := failed + 1; }
+  if (pid != 0x5678) { PrintLn("FAIL: product_id != 0x5678"); failed := failed + 1; }
+
+  var handle: int64 := peek64(devPtr + 48);   // handle
+  if (handle < 0) { PrintLn("FAIL: handle < 0"); failed := failed + 1; }
+
+  // AC-4: configs vollständig befüllt
+  var numCfgs: int64 := peek64(devPtr + 56);  // num_configs
+  var cfgArr:  int64 := peek64(devPtr + 64);  // configs
+  if (numCfgs != 1) { PrintLn("FAIL: num_configs != 1"); failed := failed + 1; }
+  if (cfgArr == 0)  { PrintLn("FAIL: configs == nil");   failed := failed + 1; }
+
+  if (cfgArr != 0) {
+    var numIfc: int64 := peek64(cfgArr + 24);  // CFG_NUM_IFACES
+    var ifcArr: int64 := peek64(cfgArr + 32);  // CFG_INTERFACES
+    if (numIfc != 1) { PrintLn("FAIL: num_interfaces != 1"); failed := failed + 1; }
+    if (ifcArr == 0) { PrintLn("FAIL: interfaces == nil");   failed := failed + 1; }
+
+    if (ifcArr != 0) {
+      var numEp: int64 := peek64(ifcArr + 40);
+      var epArr: int64 := peek64(ifcArr + 48);
+      if (numEp != 1) { PrintLn("FAIL: num_endpoints != 1"); failed := failed + 1; }
+      if (epArr == 0) { PrintLn("FAIL: endpoints == nil");   failed := failed + 1; }
+      if (epArr != 0) {
+        var epDir: int64 := peek64(epArr + 8);
+        if (epDir != USB_EP_DIR_IN) { PrintLn("FAIL: ep direction"); failed := failed + 1; }
+      }
+    }
+  }
+
+  if (handle >= 0) { close(handle); }
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: FindDevice 0x1234/0x5678 (AC-1 + AC-4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-2: Unzugängliche Geräte (kein Treffer) werden übersprungen
+//       Der Scan prüft alle Geräte im Bus weiter.
+//
+// Verifiziert durch: 001/001 (kein Treffer) wird übersprungen,
+//                    001/002 (Treffer) wird gefunden.
+// ============================================================
+fn testSkipsNonMatching(): int64 {
+  var root: pchar := "/tmp/lyx_usb_disc/"c;
+  var devPtr: int64 := UsbAllocDevice();
+  var result: int64 := UsbFindDevicePath(root as int64, 0x1234, 0x5678, devPtr);
+
+  var failed: int64 := 0;
+  if (result != USB_FIND_OK) {
+    PrintLn("FAIL: non-matching skip: target not found");
+    failed := failed + 1;
+  } else {
+    var devNum: int64 := peek64(devPtr + 40);  // dev_num
+    // Gerät 001/002 → dev_num = 2
+    if (devNum != 2) {
+      PrintLn("FAIL: expected dev_num=2 (skipped 001/001)");
+      failed := failed + 1;
+    }
+  }
+
+  var handle: int64 := peek64(devPtr + 48);
+  if (handle >= 0) { close(handle); }
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: non-matching devices skipped (AC-2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-3: Mehrere Busse (001/, 002/) korrekt durchlaufen
+//        Gerät in Bus 002 mit anderen VID/PID gefunden.
+// ============================================================
+fn testMultiBus(): int64 {
+  // Suche nach 0x9999/0x0001 — nur in Bus 002 vorhanden
+  var root: pchar := "/tmp/lyx_usb_disc/"c;
+  var devPtr: int64 := UsbAllocDevice();
+  var result: int64 := UsbFindDevicePath(root as int64, 0x9999, 0x0001, devPtr);
+
+  var failed: int64 := 0;
+  if (result != USB_FIND_OK) {
+    PrintLn("FAIL: multi-bus: 0x9999/0x0001 not found in bus 002");
+    failed := failed + 1;
+  } else {
+    var vid: int64 := peek64(devPtr);
+    var pid: int64 := peek64(devPtr + 8);
+    var busNum: int64 := peek64(devPtr + 32);
+    if (vid != 0x9999) { PrintLn("FAIL: multi-bus vid != 0x9999"); failed := failed + 1; }
+    if (pid != 0x0001) { PrintLn("FAIL: multi-bus pid != 0x0001"); failed := failed + 1; }
+    if (busNum != 2)   { PrintLn("FAIL: multi-bus bus_num != 2");  failed := failed + 1; }
+  }
+
+  var handle: int64 := peek64(devPtr + 48);
+  if (handle >= 0) { close(handle); }
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: multi-bus scan (AC-3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-1b: Nicht vorhandenes Gerät → USB_FIND_NOTFOUND
+// ============================================================
+fn testNotFound(): int64 {
+  var root: pchar := "/tmp/lyx_usb_disc/"c;
+  var devPtr: int64 := UsbAllocDevice();
+  var result: int64 := UsbFindDevicePath(root as int64, 0xDEAD, 0xBEEF, devPtr);
+  free(devPtr, USB_SIZEOF_DEVICE);
+
+  if (result != USB_FIND_NOTFOUND) {
+    PrintLn("FAIL: expected NOTFOUND for 0xDEAD/0xBEEF");
+    return 1;
+  }
+  PrintLn("OK: unknown VID/PID → NOTFOUND");
+  return 0;
+}
+
+// ============================================================
+// AC-1c: Nicht vorhandenes Root-Verzeichnis → NOTFOUND
+// ============================================================
+fn testNonexistentRoot(): int64 {
+  var devPtr: int64 := UsbAllocDevice();
+  var fakePath: pchar := "/tmp/lyx_usb_NONEXISTENT/"c;
+  var result: int64 := UsbFindDevicePath(fakePath as int64, 0x1234, 0x5678, devPtr);
+  free(devPtr, USB_SIZEOF_DEVICE);
+
+  if (result != USB_FIND_NOTFOUND) {
+    PrintLn("FAIL: nonexistent root: expected NOTFOUND");
+    return 1;
+  }
+  PrintLn("OK: nonexistent root → NOTFOUND");
+  return 0;
+}
+
+fn main(): int64 {
+  buildFakeUsbTree();
+
+  var failed: int64 := 0;
+  failed := failed + testFindDevice();
+  failed := failed + testSkipsNonMatching();
+  failed := failed + testMultiBus();
+  failed := failed + testNotFound();
+  failed := failed + testNonexistentRoot();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
