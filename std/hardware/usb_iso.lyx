@@ -1,0 +1,161 @@
+// std/hardware/usb_iso.lyx
+// WP-8.1: Isochrone Transfers (Audio/Video)
+// Plattform: Linux ARM64 / x86_64 — usbdevfs ioctl-Schnittstelle
+//
+// ISO-Transfers nutzen dieselben SUBMITURB/REAPURB-IOCTLs wie Interrupt-Transfers,
+// aber mit typ=USBDEVFS_URB_TYPE_ISO und angehängten Paket-Deskriptoren.
+//
+// ISO-URB-Layout im Speicher:
+//   [0..55]  struct usbdevfs_urb (56 Bytes) — mit number_of_packets gesetzt
+//   [56..]   N × struct usbdevfs_iso_packet_desc (je 12 Bytes)
+//
+// Die IOCTL-Größe in USBDEVFS_SUBMITURB bezieht sich nur auf den Basis-URB (56 Bytes);
+// der Kernel liest die Paket-Deskriptoren anhand number_of_packets selbst.
+
+unit std.hardware.usb_iso;
+
+import std.hardware.usb_interrupt;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+pub con USB_ISO_PACKET_SIZE: int64 := 12;   // sizeof(usbdevfs_iso_packet_desc)
+
+// struct usbdevfs_iso_packet_desc-Feld-Offsets (relativ zu Paketbeginn)
+pub con ISO_PKT_OFF_LENGTH:        int64 := 0;   // uint32 — gewünschte Länge
+pub con ISO_PKT_OFF_ACTUAL_LENGTH: int64 := 4;   // uint32 — tatsächlich empfangen
+pub con ISO_PKT_OFF_STATUS:        int64 := 8;   // int32  — 0 = OK
+
+// Offset der Paket-Deskriptoren im ISO-URB (nach dem Basis-URB)
+pub con ISO_PKT_ARRAY_OFF: int64 := 56;    // = USB_URB_STRUCT_SIZE
+
+// ============================================================
+// ISO-URB allokieren / freigeben
+// Gesamtgröße: 56 + num_packets × 12 Bytes
+// ============================================================
+pub fn UsbAllocIsoUrb(num_packets: int64): int64 {
+  var total: int64 := USB_URB_STRUCT_SIZE + num_packets * USB_ISO_PACKET_SIZE;
+  var ptr: int64 := alloc(total);
+  if (ptr == 0) { return 0; }
+  // URB-Teil nullen (7 × poke64)
+  var i: int64 := 0;
+  while (i < 7) { poke64(ptr + i * 8, 0); i := i + 1; }
+  // Paket-Deskriptoren nullen
+  var j: int64 := 0;
+  while (j < num_packets) {
+    var base: int64 := ptr + ISO_PKT_ARRAY_OFF + j * USB_ISO_PACKET_SIZE;
+    poke32(base, 0); poke32(base + 4, 0); poke32(base + 8, 0);
+    j := j + 1;
+  }
+  return ptr;
+}
+
+pub fn UsbFreeIsoUrb(urbPtr: int64, num_packets: int64) {
+  free(urbPtr, USB_URB_STRUCT_SIZE + num_packets * USB_ISO_PACKET_SIZE);
+}
+
+// ============================================================
+// UsbInitIsoRead — befüllt ISO-URB für IN-Lesen
+// Setzt URB-Felder und initialisiert alle Paket-Deskriptoren.
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbInitIsoRead(urbPtr: int64, endpoint: int64,
+                       buffer: int64, packet_size: int64, num_packets: int64) {
+  poke8 (urbPtr + URB_OFF_TYPE,         USBDEVFS_URB_TYPE_ISO & 0xFF);
+  poke8 (urbPtr + URB_OFF_ENDPOINT,     endpoint & 0xFF);
+  poke64(urbPtr + URB_OFF_BUFFER,       buffer);
+  poke32(urbPtr + URB_OFF_BUFFER_LENGTH,
+         (packet_size * num_packets) & 0xFFFFFFFF);
+  poke32(urbPtr + URB_OFF_NUM_PACKETS,  num_packets & 0xFFFFFFFF);
+
+  // Jedes Paket: length = packet_size, actual_length = 0, status = 0
+  var i: int64 := 0;
+  while (i < num_packets) {
+    var base: int64 := urbPtr + ISO_PKT_ARRAY_OFF + i * USB_ISO_PACKET_SIZE;
+    poke32(base,     packet_size & 0xFFFFFFFF);
+    poke32(base + 4, 0);
+    poke32(base + 8, 0);
+    i := i + 1;
+  }
+}
+
+// ============================================================
+// UsbSubmitIsoUrb — reicht einen bereits initialisierten ISO-URB ein
+// Rückgabe: 0 = Erfolg, negativer Fehlercode sonst.
+// ============================================================
+pub fn UsbSubmitIsoUrb(dev_fd: int64, urbPtr: int64): int64 {
+  return sys_ioctl(dev_fd, USBDEVFS_SUBMITURB, urbPtr);
+}
+
+// ============================================================
+// UsbSubmitIsoRead — Convenience: allokiert, initialisiert und reicht ein
+// Rückgabe: ISO-URB-Zeiger (Heap) oder 0 bei Fehler.
+// Aufrufer muss nach ReapIsoUrb UsbFreeIsoUrb(ptr, num_packets) aufrufen.
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbSubmitIsoRead(dev_fd: int64, endpoint: int64,
+                         buffer: int64, packet_size: int64, num_packets: int64): int64 {
+  var urb: int64 := UsbAllocIsoUrb(num_packets);
+  if (urb == 0) { return 0; }
+  UsbInitIsoRead(urb, endpoint, buffer, packet_size, num_packets);
+  var ret: int64 := UsbSubmitIsoUrb(dev_fd, urb);
+  if (ret < 0) {
+    UsbFreeIsoUrb(urb, num_packets);
+    return 0;
+  }
+  return urb;
+}
+
+// ============================================================
+// UsbReapIsoUrb — blockierender Abruf des nächsten fertigen ISO-URBs
+// Rückgabe: Zeiger auf den fertigen ISO-URB oder 0 bei Fehler.
+// ============================================================
+pub fn UsbReapIsoUrb(dev_fd: int64): int64 {
+  var buf: int64 := alloc(8);
+  poke64(buf, 0);
+  var ret: int64 := sys_ioctl(dev_fd, USBDEVFS_REAPURB, buf);
+  var result: int64 := peek64(buf);
+  free(buf, 8);
+  if (ret < 0) { return 0; }
+  return result;
+}
+
+// ============================================================
+// UsbReapIsoUrbNd — nicht-blockierend (EAGAIN wenn kein URB fertig)
+// ============================================================
+pub fn UsbReapIsoUrbNd(dev_fd: int64): int64 {
+  var buf: int64 := alloc(8);
+  poke64(buf, 0);
+  var ret: int64 := sys_ioctl(dev_fd, USBDEVFS_REAPURBNDELAY, buf);
+  var result: int64 := peek64(buf);
+  free(buf, 8);
+  if (ret < 0) { return 0; }
+  return result;
+}
+
+// ============================================================
+// ISO-Paket-Accessoren
+// urbPtr: Zeiger auf ISO-URB, i: Paket-Index (0-basiert)
+// ============================================================
+
+// Gewünschte Länge des Pakets (vor Transfer gesetzt)
+pub fn UsbIsoPacketLen(urbPtr: int64, i: int64): int64 {
+  return peek32(urbPtr + ISO_PKT_ARRAY_OFF + i * USB_ISO_PACKET_SIZE) & 0xFFFFFFFF;
+}
+
+// Tatsächlich empfangene Bytes (vom Kernel nach Transfer gesetzt) — AC-3
+pub fn UsbIsoPacketActualLen(urbPtr: int64, i: int64): int64 {
+  return peek32(urbPtr + ISO_PKT_ARRAY_OFF + i * USB_ISO_PACKET_SIZE + 4) & 0xFFFFFFFF;
+}
+
+// Status des Pakets (0 = OK) — AC-4
+pub fn UsbIsoPacketStatus(urbPtr: int64, i: int64): int64 {
+  return peek32(urbPtr + ISO_PKT_ARRAY_OFF + i * USB_ISO_PACKET_SIZE + 8);
+}
+
+// error_count des Basis-URBs (Gesamtfehleranzahl aller Pakete) — AC-4
+pub fn UsbIsoErrorCount(urbPtr: int64): int64 {
+  return peek32(urbPtr + URB_OFF_ERROR_COUNT) & 0xFFFFFFFF;
+}
