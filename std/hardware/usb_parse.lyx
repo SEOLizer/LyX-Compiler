@@ -1,0 +1,194 @@
+// std/hardware/usb_parse.lyx
+// WP-2.1: Configuration-Parsing — Descriptor-Strom → Config/Interface/Endpoint-Baum
+// Plattform: Linux ARM64 / x86_64
+
+unit std.hardware.usb_parse;
+
+import std.hardware.usb_syscalls;
+import std.hardware.usb_types;
+import std.alloc;
+
+pub con USB_MAX_DESC_BUF: int64 := 4096;
+
+// ============================================================
+// Struct-Feld-Offsets (alle int64 = 8 Bytes pro Feld)
+// Müssen exakt mit den Struct-Definitionen in usb_types.lyx übereinstimmen.
+// ============================================================
+
+// UsbDevice-Felder
+con DEV_VENDOR_ID:    int64 := 0;
+con DEV_PRODUCT_ID:   int64 := 8;
+con DEV_DEVICE_CLASS: int64 := 16;
+con DEV_USB_VERSION:  int64 := 24;
+con DEV_BUS_NUM:      int64 := 32;
+con DEV_DEV_NUM:      int64 := 40;
+con DEV_HANDLE:       int64 := 48;
+con DEV_NUM_CONFIGS:  int64 := 56;
+con DEV_CONFIGS:      int64 := 64;
+
+// UsbConfiguration-Felder
+con CFG_CONFIG_VALUE: int64 := 0;
+con CFG_ATTRIBUTES:   int64 := 8;
+con CFG_MAX_POWER_MA: int64 := 16;
+con CFG_NUM_IFACES:   int64 := 24;
+con CFG_INTERFACES:   int64 := 32;
+
+// UsbInterface-Felder
+con IFC_IFACE_NUM:   int64 := 0;
+con IFC_ALT_SETTING: int64 := 8;
+con IFC_CLASS:       int64 := 16;
+con IFC_SUBCLASS:    int64 := 24;
+con IFC_PROTOCOL:    int64 := 32;
+con IFC_NUM_EP:      int64 := 40;
+con IFC_ENDPOINTS:   int64 := 48;
+
+// ============================================================
+// Hilfsfunktion: Speicherblock mit 0 füllen (8-Byte-Chunks)
+// size muss ein Vielfaches von 8 sein.
+// ============================================================
+fn usbp_zero(ptr: int64, size: int64) {
+  var i: int64 := 0;
+  while (i < size) {
+    poke64(ptr + i, 0);
+    i := i + 8;
+  }
+}
+
+// ============================================================
+// UsbAllocDevice — allokiert und nullt eine UsbDevice-Struktur.
+// Rückgabe: Zeiger auf USB_SIZEOF_DEVICE Bytes (0 bei OOM).
+// ============================================================
+pub fn UsbAllocDevice(): int64 {
+  var ptr: int64 := alloc(USB_SIZEOF_DEVICE);
+  if (ptr == 0) { return 0; }
+  usbp_zero(ptr, USB_SIZEOF_DEVICE);
+  return ptr;
+}
+
+// ============================================================
+// UsbParseConfiguration
+//
+// Liest den vollständigen Descriptor-Strom von dev_fd und
+// befüllt die UsbDevice-Struktur an devicePtr.
+// devicePtr muss auf USB_SIZEOF_DEVICE alloc'd + genullten Speicher zeigen.
+//
+// Rückgabe: 1 = Erfolg (≥ 1 Konfiguration geparst), 0 = Fehler.
+//
+// AC-5: sys_lseek-Fehler (nicht-seekbare FD) → sofort 0.
+// AC-3: bLength < 2 → Schleife bricht ab (kein Absturz).
+// ============================================================
+pub fn UsbParseConfiguration(dev_fd: int64, devicePtr: int64): int64 {
+  // AC-5: Dateizeiger auf Byte 0 setzen
+  if (usb_lseek(dev_fd, 0, USB_SEEK_SET) < 0) { return 0; }
+
+  var buf: int64 := alloc(USB_MAX_DESC_BUF);
+  var total: int64 := usb_read(dev_fd, buf, USB_MAX_DESC_BUF);
+  if (total < USB_SIZEOF_DEVICE_DESC) {
+    free(buf, USB_MAX_DESC_BUF);
+    return 0;
+  }
+
+  // Device Descriptor auswerten (Byte 0..bLength-1)
+  var devDescLen: int64 := UsbDevDesc_bLength(buf);
+  if (devDescLen < USB_SIZEOF_DEVICE_DESC) {
+    devDescLen := USB_SIZEOF_DEVICE_DESC;
+  }
+
+  var numConfigs: int64 := UsbDevDesc_bNumConfigurations(buf);
+  if (numConfigs <= 0) {
+    free(buf, USB_MAX_DESC_BUF);
+    return 0;
+  }
+
+  // Device-Basisfelder schreiben
+  poke64(devicePtr + DEV_DEVICE_CLASS, UsbDevDesc_bDeviceClass(buf));
+  poke64(devicePtr + DEV_USB_VERSION,  UsbDevDesc_bcdUSB(buf));
+  poke64(devicePtr + DEV_NUM_CONFIGS,  numConfigs);
+
+  // Konfigurationsarray allokieren und nullen
+  var cfgArrSize: int64 := numConfigs * USB_SIZEOF_CONFIGURATION;
+  var cfgArr: int64 := alloc(cfgArrSize);
+  usbp_zero(cfgArr, cfgArrSize);
+  poke64(devicePtr + DEV_CONFIGS, cfgArr);
+
+  // Descriptor-Strom ab Byte devDescLen durchlaufen
+  var offset:  int64 := devDescLen;
+  var cfgIdx:  int64 := -1;
+  var ifcIdx:  int64 := -1;
+  var epIdx:   int64 := 0;
+  var curCfg:  int64 := 0;
+  var curIfc:  int64 := 0;
+
+  while (offset + 2 <= total) {
+    var hdr:   int64 := buf + offset;
+    var bLen:  int64 := UsbDescHdr_bLength(hdr);
+    var bType: int64 := UsbDescHdr_bDescType(hdr);
+
+    // AC-3: Korruptionsschutz — bLength < 2 oder über Pufferende
+    if (bLen < 2) { break; }
+    if (offset + bLen > total) { break; }
+
+    if (bType == USB_DT_CONFIG) {
+      cfgIdx := cfgIdx + 1;
+      if (cfgIdx >= numConfigs) {
+        break;  // mehr Configs als angegeben → sicher abbrechen
+      }
+      curCfg := cfgArr + cfgIdx * USB_SIZEOF_CONFIGURATION;
+      var numIfc: int64 := UsbCfgDesc_bNumInterfaces(hdr);
+      poke64(curCfg + CFG_CONFIG_VALUE, UsbCfgDesc_bConfigurationValue(hdr));
+      poke64(curCfg + CFG_ATTRIBUTES,   UsbCfgDesc_bmAttributes(hdr));
+      poke64(curCfg + CFG_MAX_POWER_MA, UsbCfgDesc_bMaxPower(hdr) * 2);
+      poke64(curCfg + CFG_NUM_IFACES,   numIfc);
+      if (numIfc > 0) {
+        var ifcArrSize: int64 := numIfc * USB_SIZEOF_INTERFACE;
+        var ifcArr: int64 := alloc(ifcArrSize);
+        usbp_zero(ifcArr, ifcArrSize);
+        poke64(curCfg + CFG_INTERFACES, ifcArr);
+      }
+      ifcIdx := -1;
+      curIfc := 0;
+    } else if (bType == USB_DT_INTERFACE) {
+      if (curCfg != 0) {
+        var numIfcInCfg: int64 := peek64(curCfg + CFG_NUM_IFACES);
+        ifcIdx := ifcIdx + 1;
+        if (ifcIdx < numIfcInCfg) {
+          var ifcArr: int64 := peek64(curCfg + CFG_INTERFACES);
+          curIfc := ifcArr + ifcIdx * USB_SIZEOF_INTERFACE;
+          var numEp: int64 := UsbIfDesc_bNumEndpoints(hdr);
+          poke64(curIfc + IFC_IFACE_NUM,   UsbIfDesc_bInterfaceNumber(hdr));
+          poke64(curIfc + IFC_ALT_SETTING,  UsbIfDesc_bAlternateSetting(hdr));
+          poke64(curIfc + IFC_CLASS,        UsbIfDesc_bInterfaceClass(hdr));
+          poke64(curIfc + IFC_SUBCLASS,     UsbIfDesc_bInterfaceSubClass(hdr));
+          poke64(curIfc + IFC_PROTOCOL,     UsbIfDesc_bInterfaceProtocol(hdr));
+          poke64(curIfc + IFC_NUM_EP,       numEp);
+          if (numEp > 0) {
+            var epArrSize: int64 := numEp * USB_SIZEOF_ENDPOINT;
+            var epArr: int64 := alloc(epArrSize);
+            usbp_zero(epArr, epArrSize);
+            poke64(curIfc + IFC_ENDPOINTS, epArr);
+          }
+          epIdx := 0;
+        }
+      }
+    } else if (bType == USB_DT_ENDPOINT) {
+      if (curIfc != 0) {
+        var numEpInIfc: int64 := peek64(curIfc + IFC_NUM_EP);
+        if (epIdx < numEpInIfc) {
+          var epArr: int64 := peek64(curIfc + IFC_ENDPOINTS);
+          UsbEndpointFromDesc(epArr + epIdx * USB_SIZEOF_ENDPOINT, hdr);
+          epIdx := epIdx + 1;
+        }
+      }
+    }
+    // Alle anderen Descriptor-Typen (class-spezifisch, HID-Report, etc.)
+    // werden stillschweigend übersprungen.
+
+    offset := offset + bLen;
+  }
+
+  free(buf, USB_MAX_DESC_BUF);
+
+  // AC-4: Erfolgreich wenn ≥ 1 Konfiguration geparst
+  if (cfgIdx >= 0) { return 1; }
+  return 0;
+}
