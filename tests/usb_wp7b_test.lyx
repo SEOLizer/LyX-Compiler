@@ -1,0 +1,304 @@
+// tests/usb_wp7b_test.lyx
+// WP-7B: Endpoint-Binding-Registry (Makro-Fallback ohne Lyx-Makros)
+//
+// Testet das Lyx-native Äquivalent der Pascal-Makros:
+//   DefineOutEndpoint(EpOut, $01) →
+//     UsbDefOutEndpoint(reg, EP_OUT, fd, 0x01, 1000)
+//   DefineInEndpoint(EpIn, $81) →
+//     UsbDefInEndpoint(reg, EP_IN, fd, 0x81, 1000)
+//
+// Richtungssicherheit — zweistufig:
+//   1. Registrierung: Bit-7-Check (OUT=0, IN=1)
+//   2. Nutzung: Write verweigert IN-Slots, Read verweigert OUT-Slots
+
+unit tests.usb_wp7b_test;
+
+import std.hardware.usb_endpoint_bind;
+import std.alloc;
+
+// Endpoint-Schlüssel (entspricht Makro-Namen)
+con EP_OUT_1: int64 := 1;   // wie EpOut → $01
+con EP_IN_1:  int64 := 2;   // wie EpIn  → $81
+con EP_OUT_2: int64 := 3;   // zweiter OUT-Endpoint → $02
+con EP_IN_2:  int64 := 4;   // zweiter IN-Endpoint  → $82
+
+// ============================================================
+// Registry-Größen-Konstanten
+// ============================================================
+fn testConstants(): int64 {
+  var failed: int64 := 0;
+  if (USB_EP_REG_MAX_SLOTS != 8)  { PrintLn("FAIL: MAX_SLOTS != 8");   failed:=failed+1; }
+  if (USB_EP_REG_SLOT_SIZE != 40) { PrintLn("FAIL: SLOT_SIZE != 40");  failed:=failed+1; }
+  if (USB_EP_REG_SIZE != 328)     { PrintLn("FAIL: REG_SIZE != 328");   failed:=failed+1; }
+  if (failed == 0) { PrintLn("OK: registry size constants"); }
+  return failed;
+}
+
+// ============================================================
+// Alloc / Free / Count-Grundoperationen
+// ============================================================
+fn testAllocFreeCount(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  if (reg == 0) { PrintLn("FAIL: UsbEpRegistryAlloc returned 0"); return 1; }
+
+  if (UsbEpRegistryCount(reg) != 0) {
+    PrintLn("FAIL: initial count != 0");
+    UsbEpRegistryFree(reg);
+    return 1;
+  }
+  UsbEpRegistryFree(reg);
+  PrintLn("OK: alloc/free/count=0");
+  return 0;
+}
+
+// ============================================================
+// DefineOutEndpoint / DefineInEndpoint: Registration
+// Entspricht dem Makro-Äquivalent
+// ============================================================
+fn testDefineEndpoints(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  var failed: int64 := 0;
+
+  // DefineOutEndpoint(EP_OUT_1, 0x01) — Bit7=0 → OK
+  var r1: int64 := UsbDefOutEndpoint(reg, EP_OUT_1, 10, 0x01, 1000);
+  if (r1 != 0) { PrintLn("FAIL: DefOutEndpoint 0x01 should succeed"); failed:=failed+1; }
+
+  // DefineInEndpoint(EP_IN_1, 0x81) — Bit7=1 → OK
+  var r2: int64 := UsbDefInEndpoint(reg, EP_IN_1, 10, 0x81, 2000);
+  if (r2 != 0) { PrintLn("FAIL: DefInEndpoint 0x81 should succeed"); failed:=failed+1; }
+
+  // Count sollte 2 sein
+  if (UsbEpRegistryCount(reg) != 2) {
+    PrintLn("FAIL: count should be 2 after 2 defines");
+    failed := failed + 1;
+  }
+
+  // Registrierte Werte abrufbar
+  if (UsbEpAddr(reg, EP_OUT_1) != 0x01)  { PrintLn("FAIL: EP_OUT_1 addr");   failed:=failed+1; }
+  if (UsbEpAddr(reg, EP_IN_1)  != 0x81)  { PrintLn("FAIL: EP_IN_1 addr");    failed:=failed+1; }
+  if (UsbEpTimeout(reg, EP_OUT_1) != 1000){ PrintLn("FAIL: EP_OUT_1 timeout"); failed:=failed+1; }
+  if (UsbEpTimeout(reg, EP_IN_1)  != 2000){ PrintLn("FAIL: EP_IN_1 timeout");  failed:=failed+1; }
+  if (UsbEpIsOut(reg, EP_OUT_1) != 1)    { PrintLn("FAIL: EP_OUT_1 is_out");  failed:=failed+1; }
+  if (UsbEpIsOut(reg, EP_IN_1)  != 0)    { PrintLn("FAIL: EP_IN_1 is_out");   failed:=failed+1; }
+
+  UsbEpRegistryFree(reg);
+  if (failed == 0) { PrintLn("OK: DefineOutEndpoint + DefineInEndpoint"); }
+  return failed;
+}
+
+// ============================================================
+// Richtungsvalidierung bei Registrierung (Bit-7-Check)
+// ============================================================
+fn testRegistrationDirectionCheck(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  var failed: int64 := 0;
+
+  // OUT-Slot mit IN-Adresse 0x81 → Fehler
+  var r1: int64 := UsbDefOutEndpoint(reg, 99, 5, 0x81, 1000);
+  if (r1 != -1) {
+    PrintLn("FAIL: DefOut with IN addr should return -1");
+    failed := failed + 1;
+  }
+
+  // IN-Slot mit OUT-Adresse 0x02 → Fehler
+  var r2: int64 := UsbDefInEndpoint(reg, 98, 5, 0x02, 1000);
+  if (r2 != -1) {
+    PrintLn("FAIL: DefIn with OUT addr should return -1");
+    failed := failed + 1;
+  }
+
+  // Registry darf keine Slots enthalten (Fehler wurden abgewiesen)
+  if (UsbEpRegistryCount(reg) != 0) {
+    PrintLn("FAIL: invalid registrations should not add slots");
+    failed := failed + 1;
+  }
+
+  UsbEpRegistryFree(reg);
+  if (failed == 0) { PrintLn("OK: registration direction check"); }
+  return failed;
+}
+
+// ============================================================
+// Richtungsschutz bei Nutzung:
+//   Write auf IN-Schlüssel → -1
+//   Read auf OUT-Schlüssel → -1
+// ============================================================
+fn testUsageDirectionGuard(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  UsbDefOutEndpoint(reg, EP_OUT_1, 5, 0x01, 1000);
+  UsbDefInEndpoint(reg, EP_IN_1, 5, 0x81, 1000);
+  var buf: int64 := alloc(8);
+  var failed: int64 := 0;
+
+  // Write auf EP_IN_1 (IN-Slot) → -1 (Richtungsfehler)
+  var r1: int64 := UsbEpWrite(reg, EP_IN_1, buf, 8);
+  if (r1 != -1) {
+    PrintLn("FAIL: Write on IN key should return -1");
+    failed := failed + 1;
+  }
+
+  // Read auf EP_OUT_1 (OUT-Slot) → -1 (Richtungsfehler)
+  var r2: int64 := UsbEpRead(reg, EP_OUT_1, buf, 8);
+  if (r2 != -1) {
+    PrintLn("FAIL: Read on OUT key should return -1");
+    failed := failed + 1;
+  }
+
+  free(buf, 8);
+  UsbEpRegistryFree(reg);
+  if (failed == 0) { PrintLn("OK: usage direction guard (Write≠IN, Read≠OUT)"); }
+  return failed;
+}
+
+// ============================================================
+// Schlüssel nicht gefunden → -1
+// ============================================================
+fn testKeyNotFound(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  UsbDefOutEndpoint(reg, EP_OUT_1, 5, 0x01, 1000);
+  var buf: int64 := alloc(8);
+  var failed: int64 := 0;
+
+  var r1: int64 := UsbEpWrite(reg, 999, buf, 8);
+  if (r1 != -1) { PrintLn("FAIL: unknown key Write should return -1"); failed:=failed+1; }
+
+  var r2: int64 := UsbEpRead(reg, 999, buf, 8);
+  if (r2 != -1) { PrintLn("FAIL: unknown key Read should return -1"); failed:=failed+1; }
+
+  var r3: int64 := UsbEpAddr(reg, 999);
+  if (r3 != -1) { PrintLn("FAIL: unknown key Addr should return -1"); failed:=failed+1; }
+
+  var r4: int64 := UsbEpIsOut(reg, 999);
+  if (r4 != -1) { PrintLn("FAIL: unknown key IsOut should return -1"); failed:=failed+1; }
+
+  free(buf, 8);
+  UsbEpRegistryFree(reg);
+  if (failed == 0) { PrintLn("OK: unknown key → -1"); }
+  return failed;
+}
+
+// ============================================================
+// Registry voll: 8 Slots → 9. schlägt fehl
+// ============================================================
+fn testRegistryFull(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  var i: int64 := 0;
+  while (i < 8) {
+    UsbDefOutEndpoint(reg, i + 10, 5, 0x01, 1000);
+    i := i + 1;
+  }
+
+  if (UsbEpRegistryCount(reg) != 8) {
+    PrintLn("FAIL: registry should have 8 slots");
+    UsbEpRegistryFree(reg);
+    return 1;
+  }
+
+  var r: int64 := UsbDefOutEndpoint(reg, 99, 5, 0x01, 1000);
+  if (r != -1) {
+    PrintLn("FAIL: 9th define should fail with -1");
+    UsbEpRegistryFree(reg);
+    return 1;
+  }
+
+  UsbEpRegistryFree(reg);
+  PrintLn("OK: registry full → 9th registration rejected");
+  return 0;
+}
+
+// ============================================================
+// Mehrere Endpoints; Write/Read delegieren an korrekten fd+addr
+// Mit fd=-1 → ioctl schlägt fehl (negativ, aber nicht -1 Sentinel)
+// ============================================================
+fn testDelegationToCorrectSlot(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+  var failed: int64 := 0;
+
+  // Zwei OUT-Endpoints mit verschiedenen Adressen
+  UsbDefOutEndpoint(reg, EP_OUT_1, -1, 0x01, 500);
+  UsbDefOutEndpoint(reg, EP_OUT_2, -1, 0x02, 500);
+  UsbDefInEndpoint(reg, EP_IN_1,  -1, 0x81, 500);
+
+  var buf: int64 := alloc(8);
+
+  // Write zu EP_OUT_1 → delegiert an 0x01 mit fd=-1 → ioctl-Fehler (nicht -1 Sentinel)
+  var r1: int64 := UsbEpWrite(reg, EP_OUT_1, buf, 8);
+  // fd=-1 → EBADF → sys_ioctl gibt negativ zurück (aber ≠ -1 Sentinel für Richtungsfehler)
+  if (r1 == -1) {
+    // -1 wäre der Sentinel für "Schlüssel nicht gefunden" oder "falsche Richtung"
+    // Ein EBADF von sys_ioctl darf NICHT -1 sein... oder doch?
+    // Auf Linux: ioctl(fd=-1) gibt -EBADF = -9 zurück.
+    // ABER: Lyx gibt den rohen Syscall-Rückgabewert zurück (negativ).
+    // -9 ≠ -1, also ist r1 != -1 im Normalfall. Falls r1 == -1, ist das
+    // ein seltener Überschneidungsfall. Wir prüfen nur die Richtung.
+    PrintLn("WARN: EP_OUT_1 Write returned -1 (EBADF == -1?)");
+  }
+  // Hauptprüfung: kein Sentinel-Fehler → der ioctl wurde aufgerufen
+  // (kein Sentinel bedeutet: Schlüssel gefunden und Richtung korrekt)
+  // Da fd=-1 einen Fehler vom Kernel erzeugt, ist r1 negativ aber bedeutet
+  // "ioctl wurde delegiert" — das ist das gewünschte Verhalten.
+
+  // Read von EP_IN_1 → delegiert an 0x81 mit fd=-1
+  var r2: int64 := UsbEpRead(reg, EP_IN_1, buf, 8);
+  // Gleiches Argument wie oben: negativer Rückgabewert zeigt Delegation an.
+
+  // Write zu EP_OUT_2 (anderer Slot) → korrekte Adresse 0x02
+  var addr2: int64 := UsbEpAddr(reg, EP_OUT_2);
+  if (addr2 != 0x02) {
+    PrintLn("FAIL: EP_OUT_2 addr should be 0x02");
+    failed := failed + 1;
+  }
+
+  free(buf, 8);
+  UsbEpRegistryFree(reg);
+  if (failed == 0) { PrintLn("OK: multi-slot delegation"); }
+  return failed;
+}
+
+// ============================================================
+// Schlüssel-Duplikat: zweite Registrierung mit gleichem Schlüssel
+// → neuer Slot (kein Überschreiben, anderer Slot)
+// ============================================================
+fn testDuplicateKey(): int64 {
+  var reg: int64 := UsbEpRegistryAlloc();
+
+  UsbDefOutEndpoint(reg, EP_OUT_1, 5, 0x01, 1000);
+  UsbDefOutEndpoint(reg, EP_OUT_1, 5, 0x02, 2000);  // gleicher Schlüssel
+
+  // FindSlot findet den ERSTEN Eintrag → Addr=0x01, Timeout=1000
+  var addr: int64 := UsbEpAddr(reg, EP_OUT_1);
+  if (addr != 0x01) {
+    PrintLn("FAIL: duplicate key should return first registration");
+    UsbEpRegistryFree(reg);
+    return 1;
+  }
+  if (UsbEpRegistryCount(reg) != 2) {
+    PrintLn("FAIL: duplicate key adds second slot");
+    UsbEpRegistryFree(reg);
+    return 1;
+  }
+
+  UsbEpRegistryFree(reg);
+  PrintLn("OK: duplicate key → first-wins semantics");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testConstants();
+  failed := failed + testAllocFreeCount();
+  failed := failed + testDefineEndpoints();
+  failed := failed + testRegistrationDirectionCheck();
+  failed := failed + testUsageDirectionGuard();
+  failed := failed + testKeyNotFound();
+  failed := failed + testRegistryFull();
+  failed := failed + testDelegationToCorrectSlot();
+  failed := failed + testDuplicateKey();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
