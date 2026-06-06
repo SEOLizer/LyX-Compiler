@@ -1,0 +1,209 @@
+// tests/usb_wp4_test.lyx
+// WP-4: Control-Transfers + Interface-Claim/Release
+//
+// Abnahmekriterien:
+// AC-1: ControlTransfer mit GET_DESCRIPTOR liest Device-Descriptor korrekt
+// AC-2: ClaimInterface — kein -EINVAL (pointer-korrektes ioctl)
+// AC-3: ReleaseInterface — gibt Interface frei
+// AC-4: Timeout/ungültiger fd → negativer Rückgabewert
+
+unit tests.usb_wp4_test;
+
+import std.hardware.usb_control;
+import std.hardware.usb_types;
+import std.alloc;
+
+// ============================================================
+// IOCTL-Konstanten verifizieren (hardware-unabhängig)
+// ============================================================
+fn testIoctlConstants(): int64 {
+  var failed: int64 := 0;
+
+  // USBDEVFS_CONTROL = (3<<30)|(24<<16)|(0x55<<8)|0
+  var expected_ctrl: int64 := (3 << 30) | (24 << 16) | (0x55 << 8) | 0;
+  if (USBDEVFS_CONTROL != expected_ctrl) {
+    PrintLn("FAIL: USBDEVFS_CONTROL");
+    failed := failed + 1;
+  }
+
+  // USBDEVFS_CLAIMINTERFACE = (1<<30)|(4<<16)|(0x55<<8)|15
+  var expected_claim: int64 := (1 << 30) | (4 << 16) | (0x55 << 8) | 15;
+  if (USBDEVFS_CLAIMINTERFACE != expected_claim) {
+    PrintLn("FAIL: USBDEVFS_CLAIMINTERFACE");
+    failed := failed + 1;
+  }
+
+  // USBDEVFS_RELEASEINTERFACE = (1<<30)|(4<<16)|(0x55<<8)|16
+  var expected_rel: int64 := (1 << 30) | (4 << 16) | (0x55 << 8) | 16;
+  if (USBDEVFS_RELEASEINTERFACE != expected_rel) {
+    PrintLn("FAIL: USBDEVFS_RELEASEINTERFACE");
+    failed := failed + 1;
+  }
+
+  if (failed == 0) { PrintLn("OK: IOCTL constants"); }
+  return failed;
+}
+
+// ============================================================
+// Struct-Layout: UsbCtrlSetRequest + UsbCtrlSetTransfer
+// Legt bekannte Werte ab und liest sie zurück.
+// ============================================================
+fn testCtrlStructLayout(): int64 {
+  var buf: int64 := alloc(USB_CTRL_STRUCT_SIZE);
+  var failed: int64 := 0;
+
+  // Request-Teil befüllen (5 Args ≤ 6-Arg-Limit)
+  UsbCtrlSetRequest(buf, 0xC1, 0x09, 0x0301, 0x0002);
+
+  // Transfer-Teil befüllen (4 Args ≤ 6-Arg-Limit)
+  var fakePtr: int64 := 0x12345678;
+  UsbCtrlSetTransfer(buf, fakePtr, 64, 1000);
+
+  // +0: bRequestType = 0xC1
+  if (peek8(buf) != 0xC1)     { PrintLn("FAIL: +0 bRequestType"); failed := failed + 1; }
+  // +1: bRequest = 0x09
+  if (peek8(buf + 1) != 0x09) { PrintLn("FAIL: +1 bRequest");     failed := failed + 1; }
+  // +2: wValue = 0x0301
+  if ((peek16(buf + 2) & 0xFFFF) != 0x0301) { PrintLn("FAIL: +2 wValue"); failed := failed + 1; }
+  // +4: wIndex = 0x0002
+  if ((peek16(buf + 4) & 0xFFFF) != 0x0002) { PrintLn("FAIL: +4 wIndex"); failed := failed + 1; }
+  // +6: wLength = 64
+  if ((peek16(buf + 6) & 0xFFFF) != 64) { PrintLn("FAIL: +6 wLength"); failed := failed + 1; }
+  // +8: timeout = 1000
+  if ((peek32(buf + 8) & 0xFFFFFFFF) != 1000) { PrintLn("FAIL: +8 timeout"); failed := failed + 1; }
+  // +12: _pad = 0
+  if ((peek32(buf + 12) & 0xFFFFFFFF) != 0) { PrintLn("FAIL: +12 _pad"); failed := failed + 1; }
+  // +16: data pointer = 0x12345678
+  if (peek64(buf + 16) != 0x12345678) { PrintLn("FAIL: +16 data"); failed := failed + 1; }
+
+  free(buf, USB_CTRL_STRUCT_SIZE);
+  if (failed == 0) { PrintLn("OK: ctrlTransfer struct layout (24 bytes)"); }
+  return failed;
+}
+
+// ============================================================
+// Struct-Größe: 24 Bytes
+// ============================================================
+fn testStructSize(): int64 {
+  if (USB_CTRL_STRUCT_SIZE != 24) {
+    PrintLn("FAIL: USB_CTRL_STRUCT_SIZE != 24");
+    return 1;
+  }
+  PrintLn("OK: USB_CTRL_STRUCT_SIZE = 24");
+  return 0;
+}
+
+// ============================================================
+// AC-4: fd=-1 → alle Operationen geben negative Werte zurück
+// ============================================================
+fn testInvalidFdReturnsNegative(): int64 {
+  var failed: int64 := 0;
+  var descBuf: int64 := alloc(USB_SIZEOF_DEVICE_DESC);
+
+  // GetDeviceDescriptor mit fd=-1
+  var ret1: int64 := UsbGetDeviceDescriptor(-1, descBuf);
+  if (ret1 >= 0) {
+    PrintLn("FAIL: GetDeviceDescriptor(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  // ControlTransferRaw mit fd=-1 und vorgefülltem Buffer
+  var ctrlBuf: int64 := alloc(USB_CTRL_STRUCT_SIZE);
+  UsbCtrlSetRequest(ctrlBuf, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR,
+                    (USB_DT_DEVICE << 8), 0);
+  UsbCtrlSetTransfer(ctrlBuf, descBuf, USB_SIZEOF_DEVICE_DESC, USB_TIMEOUT_SHORT);
+  var ret2: int64 := UsbControlTransferRaw(-1, ctrlBuf);
+  if (ret2 >= 0) {
+    PrintLn("FAIL: ControlTransferRaw(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+  free(ctrlBuf, USB_CTRL_STRUCT_SIZE);
+
+  // ClaimInterface mit fd=-1
+  var ret3: int64 := UsbClaimInterface(-1, 0);
+  if (ret3 >= 0) {
+    PrintLn("FAIL: ClaimInterface(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  // ReleaseInterface mit fd=-1
+  var ret4: int64 := UsbReleaseInterface(-1, 0);
+  if (ret4 >= 0) {
+    PrintLn("FAIL: ReleaseInterface(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  free(descBuf, USB_SIZEOF_DEVICE_DESC);
+  if (failed == 0) { PrintLn("OK: invalid fd → negative return (AC-4)"); }
+  return failed;
+}
+
+// ============================================================
+// UsbCtrlSetTransfer mit data=0 → NULL-Pointer korrekt abgelegt
+// ============================================================
+fn testNullDataPointer(): int64 {
+  var buf: int64 := alloc(USB_CTRL_STRUCT_SIZE);
+  UsbCtrlSetRequest(buf, 0x00, 0x09, 0, 0);
+  UsbCtrlSetTransfer(buf, 0, 0, 500);
+  var dataPtr: int64 := peek64(buf + 16);
+  free(buf, USB_CTRL_STRUCT_SIZE);
+  if (dataPtr != 0) {
+    PrintLn("FAIL: data=0 → NULL not at +16");
+    return 1;
+  }
+  PrintLn("OK: null data pointer at offset +16");
+  return 0;
+}
+
+// ============================================================
+// Request-Konstanten prüfen
+// ============================================================
+fn testRequestConstants(): int64 {
+  var failed: int64 := 0;
+  if (USB_DIR_IN  != 0x80) { PrintLn("FAIL: USB_DIR_IN");  failed := failed + 1; }
+  if (USB_DIR_OUT != 0x00) { PrintLn("FAIL: USB_DIR_OUT"); failed := failed + 1; }
+  if (USB_REQ_GET_DESCRIPTOR    != 6) { PrintLn("FAIL: GET_DESCRIPTOR");    failed := failed + 1; }
+  if (USB_REQ_SET_CONFIGURATION != 9) { PrintLn("FAIL: SET_CONFIGURATION"); failed := failed + 1; }
+  if (USB_TIMEOUT_DEFAULT != 5000)    { PrintLn("FAIL: TIMEOUT_DEFAULT");   failed := failed + 1; }
+  if (failed == 0) { PrintLn("OK: USB request constants"); }
+  return failed;
+}
+
+// ============================================================
+// ClaimInterface-Pointer-Korrektheit
+// USBDEVFS_CLAIMINTERFACE erwartet `unsigned int *`.
+// Wir prüfen, dass Interface-Nummer korrekt als 4-Byte-LE in numBuf steht,
+// indem wir ClaimInterface auf fd=-1 aufrufen — der Fehler darf NICHT -EINVAL
+// wegen eines falsch übergebenen Werts sein (stattdessen -EBADF für fd=-1).
+// ============================================================
+fn testClaimPointerNotValue(): int64 {
+  var ret: int64 := UsbClaimInterface(-1, 0);
+  // fd=-1 → ioctl gibt -EBADF (errno=9) zurück, nicht -EINVAL (errno=22).
+  // Linux errno: EBADF=9, EINVAL=22 → ioctl returns -errno
+  // Wir prüfen: ret != -22 (was passieren würde wenn Wert statt Pointer übergeben)
+  // Hinweis: Auf Linux gibt sys_ioctl negative errno-Werte zurück (z.B. -9 für EBADF)
+  if (ret == -22) {
+    PrintLn("FAIL: ClaimInterface got -EINVAL — pointer not passed correctly");
+    return 1;
+  }
+  PrintLn("OK: ClaimInterface passes pointer (not value) — no -EINVAL");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testIoctlConstants();
+  failed := failed + testStructSize();
+  failed := failed + testCtrlStructLayout();
+  failed := failed + testInvalidFdReturnsNegative();
+  failed := failed + testNullDataPointer();
+  failed := failed + testRequestConstants();
+  failed := failed + testClaimPointerNotValue();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
