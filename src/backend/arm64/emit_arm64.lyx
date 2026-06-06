@@ -116,6 +116,15 @@ pub type EmitARM64 = class {
   externCount: int64;
   externCap:   int64;
 
+  // WP-D2: Windows target mode — replaces Linux syscalls with BL placeholders
+  // that WinARM64Backend resolves to Windows API helper stubs after emit().
+  // winPatchBuf holds 16-byte records: {codeOffset:i64, helperId:i64}.
+  // Helper IDs: 1=PrintStr, 2=PrintInt, 3=Exit, 4=Alloc, 5=Free.
+  winMode:       int64;
+  winPatchBuf:   int64;
+  winPatchCount: int64;
+  winPatchCap:   int64;
+
 
   // -------------------------------------------------------------------------
   // Init
@@ -150,6 +159,12 @@ pub type EmitARM64 = class {
     self.externCap   := 64;
     self.externBuf   := alloc(self.externCap * 32);
     self.externCount := 0;
+
+    // WP-D2: Windows mode — off by default
+    self.winMode       := 0;
+    self.winPatchCap   := 64;
+    self.winPatchBuf   := alloc(self.winPatchCap * 16);
+    self.winPatchCount := 0;
   }
 
   fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
@@ -158,6 +173,28 @@ pub type EmitARM64 = class {
   fn getExternCount(): int64      { return self.externCount; }
 
   fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
+
+  // WP-D2: Windows mode helpers
+  pub fn setWinMode(m: int64) { self.winMode := m; }
+  pub fn getWinPatchBuf(): int64 { return self.winPatchBuf; }
+  pub fn getWinPatchCount(): int64 { return self.winPatchCount; }
+
+  fn addWinPatch(codeOff: int64, helperId: int64) {
+    if self.winPatchCount >= self.winPatchCap {
+      var nc: int64 := self.winPatchCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      var i: int64 := 0;
+      while i < self.winPatchCount * 16 {
+        poke8(nb + i, peek8(self.winPatchBuf + i));
+        i := i + 1;
+      }
+      self.winPatchBuf := nb;
+      self.winPatchCap := nc;
+    }
+    poke64(self.winPatchBuf + self.winPatchCount * 16,     codeOff);
+    poke64(self.winPatchBuf + self.winPatchCount * 16 + 8, helperId);
+    self.winPatchCount := self.winPatchCount + 1;
+  }
 
   // WP-AND-02 Phase C: opt into PIC code emission. Caller flips this BEFORE
   // calling emit(); takes effect for emitLoadGlobal / emitStoreGlobal.
@@ -792,7 +829,29 @@ pub type EmitARM64 = class {
   }
 
   fn emitBuiltinCall(id: int64, dest: int64) {
-    // Builtin id dispatch — emit inline syscall or helper sequence
+    // WP-D2: Windows mode — emit BL placeholder to helper stubs instead of syscalls
+    if self.winMode != 0 {
+      if id == 1 {
+        // PrintStr: x0=str, x1=len → wab_printstr helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
+        self.addWinPatch(self.codeLen, 1);
+        self.emit32(0x94000000);  // BL placeholder
+      } else if id == 2 {
+        // PrintInt: x0=int64 → wab_printint helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 2);
+        self.emit32(0x94000000);
+      } else if id == 3 {
+        // Exit: x0=exitcode → wab_exit helper (calls ExitProcess)
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 3);
+        self.emit32(0x94000000);
+      }
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
+    // Linux path — emit inline syscalls
     if id == 1 {
       // PrintStr: write(1, x0, x1)  — args already in x0,x1 by convention
       self.emitMovImmReg(ARM64_X0, 1);   // fd=stdout
@@ -913,7 +972,15 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn emitAlloc(sizeSlot: int64, dest: int64) {
-    // mmap(0, size, PROT_RW=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
+    // WP-D2: Windows mode — call wab_alloc helper (VirtualAlloc)
+    if self.winMode != 0 {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(sizeSlot));
+      self.addWinPatch(self.codeLen, 4);
+      self.emit32(0x94000000);  // BL placeholder → wab_alloc
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
+    // Linux: mmap(0, size, PROT_RW=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
     self.emitMovImmReg(ARM64_X0, 0);   // addr=0
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(sizeSlot));
     self.emitMovImmReg(ARM64_X2, 3);   // PROT_READ|PROT_WRITE
@@ -926,6 +993,14 @@ pub type EmitARM64 = class {
   }
 
   fn emitFree(ptrSlot: int64) {
+    // WP-D2: Windows mode — call wab_free helper (VirtualFree)
+    if self.winMode != 0 {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+      self.addWinPatch(self.codeLen, 5);
+      self.emit32(0x94000000);  // BL placeholder → wab_free
+      return;
+    }
+    // Linux: munmap
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitMovImmReg(ARM64_X1, 0);
     self.emitMovImmReg(ARM64_X8, SYS_MUNMAP);
