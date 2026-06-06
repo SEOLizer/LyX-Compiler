@@ -1,0 +1,382 @@
+// tests/usb_wp21_test.lyx
+// WP-2.1: ParseConfiguration — Descriptor-Strom → Config/Interface/Endpoint-Baum
+//
+// Abnahmekriterien:
+// AC-1: Bekanntes Gerät → korrekte num_interfaces, num_endpoints
+// AC-2: 2 Configs, 3 Interfaces → vollständig geparst
+// AC-3: bLength=0 → sauber abgebrochen (kein Absturz, return 0)
+// AC-4: interfaces/endpoints korrekt allokiert oder nil
+// AC-5: lseek-Fehler (ungültiger fd) → return 0
+
+unit tests.usb_wp21_test;
+
+import std.hardware.usb_parse;
+import std.hardware.usb_types;
+import std.alloc;
+
+// ============================================================
+// Hilfsfunktionen: Descriptor-Bytes bauen
+// ============================================================
+
+fn buildDevDesc(buf: int64, numConfigs: int64) {
+  poke8(buf +  0, 18);    // bLength
+  poke8(buf +  1, 1);     // bDescriptorType = USB_DT_DEVICE
+  poke8(buf +  2, 0x00);  // bcdUSB low
+  poke8(buf +  3, 0x02);  // bcdUSB high  → 0x0200
+  poke8(buf +  4, 0x00);  // bDeviceClass
+  poke8(buf +  5, 0x00);
+  poke8(buf +  6, 0x00);
+  poke8(buf +  7, 64);    // bMaxPacketSize0
+  poke8(buf +  8, 0xCD);  // idVendor low
+  poke8(buf +  9, 0xAB);  // idVendor high  → 0xABCD
+  poke8(buf + 10, 0x01);  // idProduct low
+  poke8(buf + 11, 0xEF);  // idProduct high → 0xEF01
+  poke8(buf + 12, 0x00);
+  poke8(buf + 13, 0x01);  // bcdDevice → 0x0100
+  poke8(buf + 14, 0);
+  poke8(buf + 15, 0);
+  poke8(buf + 16, 0);
+  poke8(buf + 17, numConfigs & 0xFF);
+}
+
+fn buildCfgDesc(buf: int64, cfgVal: int64, numIfc: int64, totalLen: int64) {
+  poke8(buf + 0, 9);              // bLength
+  poke8(buf + 1, 2);              // bDescriptorType = USB_DT_CONFIG
+  poke8(buf + 2, totalLen & 0xFF);
+  poke8(buf + 3, (totalLen >> 8) & 0xFF);
+  poke8(buf + 4, numIfc & 0xFF);  // bNumInterfaces
+  poke8(buf + 5, cfgVal & 0xFF);  // bConfigurationValue
+  poke8(buf + 6, 0);              // iConfiguration
+  poke8(buf + 7, 0x80);           // bmAttributes
+  poke8(buf + 8, 50);             // bMaxPower = 50 → 100 mA
+}
+
+fn buildIfcDesc(buf: int64, ifcNum: int64, numEp: int64, cls: int64) {
+  poke8(buf + 0, 9);              // bLength
+  poke8(buf + 1, 4);              // bDescriptorType = USB_DT_INTERFACE
+  poke8(buf + 2, ifcNum & 0xFF);  // bInterfaceNumber
+  poke8(buf + 3, 0);              // bAlternateSetting
+  poke8(buf + 4, numEp & 0xFF);   // bNumEndpoints
+  poke8(buf + 5, cls & 0xFF);     // bInterfaceClass
+  poke8(buf + 6, 0);
+  poke8(buf + 7, 0);
+  poke8(buf + 8, 0);
+}
+
+fn buildEpDesc(buf: int64, epAddr: int64, bmAttr: int64, maxPkt: int64, interval: int64) {
+  poke8(buf + 0, 7);              // bLength
+  poke8(buf + 1, 5);              // bDescriptorType = USB_DT_ENDPOINT
+  poke8(buf + 2, epAddr & 0xFF);
+  poke8(buf + 3, bmAttr & 0xFF);
+  poke8(buf + 4, maxPkt & 0xFF);
+  poke8(buf + 5, (maxPkt >> 8) & 0xFF);
+  poke8(buf + 6, interval & 0xFF);
+}
+
+// Schreibt Bytes in eine Temp-Datei und gibt deren fd zurück.
+// path: null-terminierter Pfad (pchar als int64).
+fn writeToTmpFile(path: int64, data: int64, dataLen: int64): int64 {
+  // O_WRONLY=1, O_CREAT=64, O_TRUNC=512
+  var fd: int64 := open(path as pchar, 1 | 64 | 512, 420);  // 420 = 0644
+  if (fd < 0) { return -1; }
+  write(fd, data, dataLen);
+  close(fd);
+  // Jetzt lesend öffnen
+  var rfd: int64 := open(path as pchar, 0, 0);  // O_RDONLY=0
+  return rfd;
+}
+
+// ============================================================
+// AC-1 + AC-4: Einfaches Gerät — 1 Config, 1 Interface, 1 Endpoint
+// ============================================================
+fn testSimpleDevice(): int64 {
+  // Stream: DevDesc + CfgDesc + IfcDesc + EpDesc = 18+9+9+7 = 43 Bytes
+  var stream: int64 := alloc(64);
+  buildDevDesc(stream, 1);
+  buildCfgDesc(stream + 18, 1, 1, 25);     // totalLen = 9+9+7 = 25
+  buildIfcDesc(stream + 27, 0, 1, 3);      // HID class = 3
+  buildEpDesc (stream + 36, 0x81, 0x03, 8, 10);  // IN Interrupt EP1, 8B, 10ms
+
+  var path: pchar := "/tmp/lyx_usb_test1.bin"c;
+  var fd: int64 := writeToTmpFile(path as int64, stream, 43);
+  free(stream, 64);
+
+  if (fd < 0) {
+    PrintLn("FAIL: simple device — could not create temp file");
+    return 1;
+  }
+
+  var devPtr: int64 := UsbAllocDevice();
+  var ok: int64 := UsbParseConfiguration(fd, devPtr);
+  close(fd);
+
+  var failed: int64 := 0;
+  if (ok != 1)  { PrintLn("FAIL: simple device: ParseConfiguration returned 0"); failed := failed + 1; }
+
+  var numCfgs: int64 := peek64(devPtr + 56);  // DEV_NUM_CONFIGS
+  if (numCfgs != 1) { PrintLn("FAIL: simple device: num_configs != 1"); failed := failed + 1; }
+
+  var cfgArr: int64 := peek64(devPtr + 64);   // DEV_CONFIGS
+  if (cfgArr == 0) {
+    PrintLn("FAIL: simple device: configs == nil");
+    free(devPtr, USB_SIZEOF_DEVICE);
+    return failed + 1;
+  }
+
+  // AC-4: interfaces allokiert
+  var numIfc: int64 := peek64(cfgArr + 24);   // CFG_NUM_IFACES
+  var ifcArr: int64 := peek64(cfgArr + 32);   // CFG_INTERFACES
+  if (numIfc != 1) { PrintLn("FAIL: simple device: num_interfaces != 1"); failed := failed + 1; }
+  if (ifcArr == 0) { PrintLn("FAIL: simple device: interfaces == nil");   failed := failed + 1; }
+
+  if (ifcArr != 0) {
+    var numEp: int64 := peek64(ifcArr + 40);  // IFC_NUM_EP
+    var epArr: int64 := peek64(ifcArr + 48);  // IFC_ENDPOINTS
+    if (numEp != 1) { PrintLn("FAIL: simple device: num_endpoints != 1"); failed := failed + 1; }
+    if (epArr == 0) { PrintLn("FAIL: simple device: endpoints == nil");   failed := failed + 1; }
+
+    if (epArr != 0) {
+      // EP: direction = IN, number = 1, transfer = Interrupt, max_packet = 8
+      var epDir:   int64 := peek64(epArr + 8);   // direction
+      var epNum:   int64 := peek64(epArr + 16);  // number
+      var epTrans: int64 := peek64(epArr + 24);  // transfer_type
+      var epPkt:   int64 := peek64(epArr + 32);  // max_packet
+      if (epDir   != USB_EP_DIR_IN)       { PrintLn("FAIL: ep direction");    failed := failed + 1; }
+      if (epNum   != 1)                   { PrintLn("FAIL: ep number");       failed := failed + 1; }
+      if (epTrans != USB_TRANS_INTERRUPT) { PrintLn("FAIL: ep transfer type");failed := failed + 1; }
+      if (epPkt   != 8)                   { PrintLn("FAIL: ep max_packet");   failed := failed + 1; }
+    }
+  }
+
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: simple device (AC-1 + AC-4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-2: 2 Configs, Config1 hat 3 Interfaces (0 EP / 1 EP / 2 EPs)
+// ============================================================
+fn testMultiConfig(): int64 {
+  // Gesamt-Layout:
+  // [  0..17] DevDesc (bNumConfigs=2)
+  // [ 18..26] Config1 (cfgVal=1, numIfc=3)
+  //   [ 27..35] Ifc0 (ifcNum=0, numEP=0)
+  //   [ 36..44] Ifc1 (ifcNum=1, numEP=1)
+  //   [ 45..51] EP 0x81 Interrupt IN 8B
+  //   [ 52..60] Ifc2 (ifcNum=2, numEP=2)
+  //   [ 61..67] EP 0x01 Bulk OUT 64B
+  //   [ 68..74] EP 0x82 Bulk IN  64B
+  // [ 75..83] Config2 (cfgVal=2, numIfc=1)
+  //   [ 84..92] Ifc0 (ifcNum=0, numEP=1)
+  //   [ 93..99] EP 0x83 Bulk IN 512B
+  // Total: 100 Bytes
+
+  var stream: int64 := alloc(128);
+  buildDevDesc(stream, 2);
+  buildCfgDesc(stream + 18, 1, 3, 57);   // Config1: 9+9+9+7+9+7+7=57
+  buildIfcDesc(stream + 27, 0, 0, 0);    // Ifc0: 0 EPs
+  buildIfcDesc(stream + 36, 1, 1, 0);    // Ifc1: 1 EP
+  buildEpDesc (stream + 45, 0x81, 0x03, 8, 1);   // IN Interrupt EP1
+  buildIfcDesc(stream + 52, 2, 2, 0);    // Ifc2: 2 EPs
+  buildEpDesc (stream + 61, 0x01, 0x02, 64, 0);  // OUT Bulk EP1
+  buildEpDesc (stream + 68, 0x82, 0x02, 64, 0);  // IN Bulk EP2
+  buildCfgDesc(stream + 75, 2, 1, 25);   // Config2: 9+9+7=25
+  buildIfcDesc(stream + 84, 0, 1, 0);    // Ifc0: 1 EP
+  buildEpDesc(stream + 93, 0x83, 0x02, 512, 0);  // IN Bulk EP3, 512B
+
+  var path: pchar := "/tmp/lyx_usb_test2.bin"c;
+  var fd: int64 := writeToTmpFile(path as int64, stream, 100);
+  free(stream, 128);
+
+  if (fd < 0) {
+    PrintLn("FAIL: multi-config — could not create temp file");
+    return 1;
+  }
+
+  var devPtr: int64 := UsbAllocDevice();
+  var ok: int64 := UsbParseConfiguration(fd, devPtr);
+  close(fd);
+
+  var failed: int64 := 0;
+  if (ok != 1) { PrintLn("FAIL: multi-config: ParseConfiguration returned 0"); failed := failed + 1; }
+
+  var numCfgs: int64 := peek64(devPtr + 56);
+  if (numCfgs != 2) { PrintLn("FAIL: multi-config: num_configs != 2"); failed := failed + 1; }
+
+  var cfgArr: int64 := peek64(devPtr + 64);
+  if (cfgArr != 0) {
+    // Config 1
+    var cfg1: int64 := cfgArr;                             // UsbConfigAt(cfgArr, 0)
+    var cfg2: int64 := cfgArr + USB_SIZEOF_CONFIGURATION;  // UsbConfigAt(cfgArr, 1)
+
+    var c1CfgVal: int64 := peek64(cfg1 + 0);   // CFG_CONFIG_VALUE
+    var c1NumIfc: int64 := peek64(cfg1 + 24);  // CFG_NUM_IFACES
+    var c1IfcArr: int64 := peek64(cfg1 + 32);  // CFG_INTERFACES
+    if (c1CfgVal != 1) { PrintLn("FAIL: cfg1 configValue != 1"); failed := failed + 1; }
+    if (c1NumIfc != 3) { PrintLn("FAIL: cfg1 num_interfaces != 3"); failed := failed + 1; }
+    if (c1IfcArr == 0) { PrintLn("FAIL: cfg1 interfaces == nil");  failed := failed + 1; }
+
+    if (c1IfcArr != 0) {
+      // Ifc0: 0 EPs
+      var ifc0: int64 := c1IfcArr;
+      var i0NumEp: int64 := peek64(ifc0 + 40);
+      var i0EpArr: int64 := peek64(ifc0 + 48);
+      if (i0NumEp != 0) { PrintLn("FAIL: cfg1/ifc0 numEP != 0"); failed := failed + 1; }
+      if (i0EpArr != 0) { PrintLn("FAIL: cfg1/ifc0 endpoints != nil"); failed := failed + 1; }
+
+      // Ifc1: 1 EP (IN Interrupt)
+      var ifc1: int64 := c1IfcArr + USB_SIZEOF_INTERFACE;
+      var i1NumEp: int64 := peek64(ifc1 + 40);
+      var i1EpArr: int64 := peek64(ifc1 + 48);
+      if (i1NumEp != 1) { PrintLn("FAIL: cfg1/ifc1 numEP != 1"); failed := failed + 1; }
+      if (i1EpArr == 0) { PrintLn("FAIL: cfg1/ifc1 endpoints == nil"); failed := failed + 1; }
+      if (i1EpArr != 0) {
+        var ep0Dir: int64 := peek64(i1EpArr + 8);
+        if (ep0Dir != USB_EP_DIR_IN) { PrintLn("FAIL: cfg1/ifc1/ep0 direction"); failed := failed + 1; }
+      }
+
+      // Ifc2: 2 EPs
+      var ifc2: int64 := c1IfcArr + 2 * USB_SIZEOF_INTERFACE;
+      var i2NumEp: int64 := peek64(ifc2 + 40);
+      var i2EpArr: int64 := peek64(ifc2 + 48);
+      if (i2NumEp != 2) { PrintLn("FAIL: cfg1/ifc2 numEP != 2"); failed := failed + 1; }
+      if (i2EpArr == 0) { PrintLn("FAIL: cfg1/ifc2 endpoints == nil"); failed := failed + 1; }
+      if (i2EpArr != 0) {
+        var ep0D: int64 := peek64(i2EpArr + 8);                         // EP0 dir
+        var ep1D: int64 := peek64(i2EpArr + USB_SIZEOF_ENDPOINT + 8);   // EP1 dir
+        if (ep0D != USB_EP_DIR_OUT) { PrintLn("FAIL: cfg1/ifc2/ep0 OUT"); failed := failed + 1; }
+        if (ep1D != USB_EP_DIR_IN)  { PrintLn("FAIL: cfg1/ifc2/ep1 IN");  failed := failed + 1; }
+      }
+    }
+
+    // Config 2
+    var c2CfgVal: int64 := peek64(cfg2 + 0);
+    var c2NumIfc: int64 := peek64(cfg2 + 24);
+    var c2IfcArr: int64 := peek64(cfg2 + 32);
+    if (c2CfgVal != 2) { PrintLn("FAIL: cfg2 configValue != 2"); failed := failed + 1; }
+    if (c2NumIfc != 1) { PrintLn("FAIL: cfg2 num_interfaces != 1"); failed := failed + 1; }
+    if (c2IfcArr == 0) { PrintLn("FAIL: cfg2 interfaces == nil"); failed := failed + 1; }
+    if (c2IfcArr != 0) {
+      var c2Ifc0NumEp: int64 := peek64(c2IfcArr + 40);
+      var c2Ifc0EpArr: int64 := peek64(c2IfcArr + 48);
+      if (c2Ifc0NumEp != 1) { PrintLn("FAIL: cfg2/ifc0 numEP != 1"); failed := failed + 1; }
+      if (c2Ifc0EpArr == 0) { PrintLn("FAIL: cfg2/ifc0 endpoints == nil"); failed := failed + 1; }
+      if (c2Ifc0EpArr != 0) {
+        var epMaxPkt: int64 := peek64(c2Ifc0EpArr + 32);  // max_packet
+        if (epMaxPkt != 512) { PrintLn("FAIL: cfg2/ifc0/ep0 max_packet != 512"); failed := failed + 1; }
+      }
+    }
+  }
+
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: multi-config (AC-2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-3: Korrupter Descriptor (bLength=0) → sauber abgebrochen
+// ============================================================
+fn testCorruptDescriptor(): int64 {
+  // DevDesc (18 Bytes), dann Eintrag mit bLength=0
+  var stream: int64 := alloc(22);
+  buildDevDesc(stream, 1);   // bNumConfigs=1
+  poke8(stream + 18, 0);     // bLength = 0 ← korrupt!
+  poke8(stream + 19, 2);     // bDescriptorType = Config (wird nicht erreicht)
+
+  var path: pchar := "/tmp/lyx_usb_test3.bin"c;
+  var fd: int64 := writeToTmpFile(path as int64, stream, 20);
+  free(stream, 22);
+
+  if (fd < 0) {
+    PrintLn("FAIL: corrupt — could not create temp file");
+    return 1;
+  }
+
+  var devPtr: int64 := UsbAllocDevice();
+  var ok: int64 := UsbParseConfiguration(fd, devPtr);
+  close(fd);
+  free(devPtr, USB_SIZEOF_DEVICE);
+
+  var failed: int64 := 0;
+  if (ok != 0) {
+    PrintLn("FAIL: corrupt descriptor: expected return 0, got 1");
+    failed := failed + 1;
+  }
+  if (failed == 0) { PrintLn("OK: corrupt descriptor (AC-3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-5: lseek auf ungültigem fd → return 0
+// ============================================================
+fn testInvalidFd(): int64 {
+  var devPtr: int64 := UsbAllocDevice();
+  var ok: int64 := UsbParseConfiguration(-1, devPtr);  // fd=-1 → lseek fails
+  free(devPtr, USB_SIZEOF_DEVICE);
+
+  if (ok != 0) {
+    PrintLn("FAIL: invalid fd: expected return 0");
+    return 1;
+  }
+  PrintLn("OK: lseek failure → return 0 (AC-5)");
+  return 0;
+}
+
+// ============================================================
+// AC-4: Interface/Endpoint 0 EPs → endpoints == 0 (nil)
+// ============================================================
+fn testZeroEndpoints(): int64 {
+  // Interface mit 0 Endpoints → endpoints zeigt auf 0
+  var stream: int64 := alloc(40);
+  buildDevDesc(stream, 1);
+  buildCfgDesc(stream + 18, 1, 1, 18);  // totalLen = 9+9 = 18
+  buildIfcDesc(stream + 27, 0, 0, 0);   // numEP = 0
+
+  var path: pchar := "/tmp/lyx_usb_test4.bin"c;
+  var fd: int64 := writeToTmpFile(path as int64, stream, 36);
+  free(stream, 40);
+
+  if (fd < 0) {
+    PrintLn("FAIL: zero-ep — could not create temp file");
+    return 1;
+  }
+
+  var devPtr: int64 := UsbAllocDevice();
+  var ok: int64 := UsbParseConfiguration(fd, devPtr);
+  close(fd);
+
+  var failed: int64 := 0;
+  if (ok != 1) { PrintLn("FAIL: zero-ep: expected ok=1"); failed := failed + 1; }
+
+  var cfgArr: int64 := peek64(devPtr + 64);
+  if (cfgArr != 0) {
+    var ifcArr: int64 := peek64(cfgArr + 32);
+    if (ifcArr != 0) {
+      var epArr: int64 := peek64(ifcArr + 48);
+      if (epArr != 0) {
+        PrintLn("FAIL: zero-ep: endpoints should be nil");
+        failed := failed + 1;
+      }
+    }
+  }
+
+  free(devPtr, USB_SIZEOF_DEVICE);
+  if (failed == 0) { PrintLn("OK: zero endpoints → nil (AC-4)"); }
+  return failed;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testSimpleDevice();
+  failed := failed + testMultiConfig();
+  failed := failed + testCorruptDescriptor();
+  failed := failed + testInvalidFd();
+  failed := failed + testZeroEndpoints();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
