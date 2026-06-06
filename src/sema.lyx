@@ -2567,6 +2567,84 @@ pub type Sema = class {
     self._warnNode("@uses_caller_cap bei indirektem Aufruf nicht überprüfbar"c, ni);
   }
 
+  // WP-A3: Returns byte size of a field's type node for at(offset) overlap checking.
+  // Uses direct string comparison with token-accurate lengths (without null terminator).
+  fn _semFieldTypeSize(typeNi: int64): int64 {
+    if (typeNi < 0) { return 8; }
+    var tn: pchar := self.sn_sVal(typeNi);
+    var tl: int64 := self.sn_sLen(typeNi);
+    // 1-byte: int8, u8, char
+    if (tl == 4 && self._strNEq(tn, tl, "int8"c, 4)) { return 1; }
+    if (tl == 2 && self._strNEq(tn, tl, "u8"c,   2)) { return 1; }
+    if (tl == 4 && self._strNEq(tn, tl, "char"c, 4)) { return 1; }
+    // 2-byte: int16, u16
+    if (tl == 5 && self._strNEq(tn, tl, "int16"c, 5)) { return 2; }
+    if (tl == 3 && self._strNEq(tn, tl, "u16"c,   3)) { return 2; }
+    // 4-byte: int32, u32, f32
+    if (tl == 5 && self._strNEq(tn, tl, "int32"c, 5)) { return 4; }
+    if (tl == 3 && self._strNEq(tn, tl, "u32"c,   3)) { return 4; }
+    if (tl == 3 && self._strNEq(tn, tl, "f32"c,   3)) { return 4; }
+    return 8;  // int64, u64, f64, pchar, bool, structs: 8 bytes
+  }
+
+  // WP-A3: ConstExpr, monotonicity, and O(n²) overlap check for at(offset) fields.
+  fn _checkAtOffsetFields(firstField: int64) {
+    var hasOff: int64 := 0;
+    var tmpf: int64 := firstField;
+    while (tmpf >= 0) {
+      if ((self.sn_iVal(tmpf) & 1) != 0) { hasOff := 1; break; }
+      tmpf := self.sn_next(tmpf);
+    }
+    if (hasOff == 0) { return; }
+    var prevOff: int64 := -1;
+    var offBuf:  int64 := alloc(64 * 8);
+    var szBuf:   int64 := alloc(64 * 8);
+    var nodBuf:  int64 := alloc(64 * 8);
+    var nOff:    int64 := 0;
+    var fld:     int64 := firstField;
+    while (fld >= 0 && nOff < 64) {
+      if ((self.sn_iVal(fld) & 1) != 0) {
+        var offNi: int64 := self.sn_c1(fld);
+        if (offNi >= 0) {
+          if (self.sn_kind(offNi) != 40) {
+            self._errorNode("at(offset): value must be a compile-time integer constant"c, fld);
+          }
+          var fOff: int64 := self.sn_iVal(offNi);
+          if (fOff < prevOff) {
+            self._errorNode("struct field at(offset) must not decrease relative to previous field"c, fld);
+          }
+          prevOff := fOff;
+          poke64(offBuf + nOff * 8, fOff);
+          poke64(szBuf  + nOff * 8, self._semFieldTypeSize(self.sn_c0(fld)));
+          poke64(nodBuf + nOff * 8, fld);
+          nOff := nOff + 1;
+        }
+      }
+      fld := self.sn_next(fld);
+    }
+    var ai:   int64 := 0;
+    var aOff: int64 := 0;
+    var aSz:  int64 := 0;
+    var bi:   int64 := 0;
+    var bOff: int64 := 0;
+    var bSz:  int64 := 0;
+    while (ai < nOff) {
+      aOff := peek64(offBuf + ai * 8);
+      aSz  := peek64(szBuf  + ai * 8);
+      bi   := ai + 1;
+      while (bi < nOff) {
+        bOff := peek64(offBuf + bi * 8);
+        bSz  := peek64(szBuf  + bi * 8);
+        if (aOff < bOff + bSz && bOff < aOff + aSz) {
+          var errNi: int64 := peek64(nodBuf + bi * 8);
+          self._errorNode("struct field at(offset) overlaps with previous field"c, errNi);
+        }
+        bi := bi + 1;
+      }
+      ai := ai + 1;
+    }
+  }
+
   fn _p2Decl(ni: int64) {
     var k: int64 := self.sn_kind(ni);
     // WP-L7: Pending-Annotationen bei nicht-annotierbaren Knoten zurücksetzen.
@@ -2588,15 +2666,8 @@ pub type Sema = class {
       // only their monomorphized instances (emitted by IR lowerer) are.
       return;
     } else if (k == SNK_STRUCT_DECL) {
-      // Check struct field types and validate explicit at(offset) offsets (WP-4.1-A)
+      // Check struct field types and @big_endian constraints (WP-4.1-A/B/A3)
       var field: int64 := self.sn_c0(ni);
-      var prevOffset: int64 := -1;
-      var hasPackedOffset: int64 := 0;
-      var tmpf: int64 := field;
-      while (tmpf >= 0) {
-        if ((self.sn_iVal(tmpf) & 1) != 0) { hasPackedOffset := 1; break; }
-        tmpf := self.sn_next(tmpf);
-      }
       while (field >= 0) {
         var typeNode: int64 := self.sn_c0(field);
         if (typeNode >= 0) { self.ResolveType(typeNode); }
@@ -2608,19 +2679,10 @@ pub type Sema = class {
             self._errorNode("@big_endian cannot be applied to f64 fields"c, field);
           }
         }
-        // WP-4.1-A: validate explicit offsets are monotonically non-decreasing
-        if (hasPackedOffset != 0 && (self.sn_iVal(field) & 1) != 0) {
-          var offsetNi: int64 := self.sn_c1(field);
-          if (offsetNi >= 0) {
-            var fieldOff: int64 := self.sn_iVal(offsetNi);
-            if (fieldOff < prevOffset) {
-              self._errorNode("struct field at(offset) must not decrease relative to previous field"c, field);
-            }
-            prevOffset := fieldOff;
-          }
-        }
         field := self.sn_next(field);
       }
+      // WP-A3: ConstExpr + monotonicity + overlap check
+      self._checkAtOffsetFields(self.sn_c0(ni));
     } else if (k == SNK_ENUM_DECL) {
       // Check enum variant payload types
       var variant: int64 := self.sn_c0(ni);
@@ -2731,6 +2793,11 @@ pub type Sema = class {
           }
           mthCap := self.sn_next(mthCap);
         }
+      }
+      // WP-A3: For struct-type declarations (type X = struct {}), validate at(offset) fields.
+      // Struct nodes have c1 < 0 (no methods) and c0 pointing to first field (NK_FIELD_DECL = 7).
+      if (self.sn_c1(ni) < 0 && self.sn_c0(ni) >= 0 && self.sn_kind(self.sn_c0(ni)) == 7) {
+        self._checkAtOffsetFields(self.sn_c0(ni));
       }
       // WP-BC-22 / WP-L8: restore class context
       self.classCapNode := prevClassCapNode;
