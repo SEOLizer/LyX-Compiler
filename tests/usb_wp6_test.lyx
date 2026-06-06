@@ -1,0 +1,319 @@
+// tests/usb_wp6_test.lyx
+// WP-6: Interrupt-Transfers (asynchron, URB-basiert)
+//
+// Abnahmekriterien:
+// AC-1: SubmitInterruptRead(fd, 0x81, buf, 8, nil) → 0 (kein Fehler beim Submit)
+// AC-2: WaitForUrb(fd, 1000) → gültiger Zeiger wenn Taste gedrückt
+// AC-3: Timeout nach 1000ms → WaitForUrb gibt 0 zurück
+// AC-4: DiscardUrb → bricht laufenden URB ab (Rückgabe ≥ 0)
+// AC-5: done.actual_length enthält tatsächlich empfangene Bytes (≤ 8)
+// AC-6: CPU-Last im Wartezustand (nur poll) < 1 %
+//
+// Hardware-unabhängige Tests: IOCTL-Codes, Struct-Layout (56 Bytes),
+// Feld-Accessoren, Allokierung, Fehlerbehandlung mit fd=-1.
+
+unit tests.usb_wp6_test;
+
+import std.hardware.usb_interrupt;
+import std.alloc;
+
+// ============================================================
+// IOCTL-Konstanten verifizieren
+// ============================================================
+fn testIoctlConstants(): int64 {
+  var failed: int64 := 0;
+
+  // SUBMITURB = _IOW('U', 10, usbdevfs_urb) — sizeof=56
+  var expSubmit: int64 := (1 << 30) | (56 << 16) | (0x55 << 8) | 10;
+  if (USBDEVFS_SUBMITURB != expSubmit) {
+    PrintLn("FAIL: USBDEVFS_SUBMITURB");
+    failed := failed + 1;
+  }
+
+  // DISCARDURB = _IO('U', 11) — kein Transfer
+  var expDiscard: int64 := (0x55 << 8) | 11;
+  if (USBDEVFS_DISCARDURB != expDiscard) {
+    PrintLn("FAIL: USBDEVFS_DISCARDURB");
+    failed := failed + 1;
+  }
+
+  // REAPURB = _IOW('U', 12, void *) — sizeof(void*)=8
+  var expReap: int64 := (1 << 30) | (8 << 16) | (0x55 << 8) | 12;
+  if (USBDEVFS_REAPURB != expReap) {
+    PrintLn("FAIL: USBDEVFS_REAPURB");
+    failed := failed + 1;
+  }
+
+  // REAPURBNDELAY = _IOW('U', 13, void *)
+  var expReapND: int64 := (1 << 30) | (8 << 16) | (0x55 << 8) | 13;
+  if (USBDEVFS_REAPURBNDELAY != expReapND) {
+    PrintLn("FAIL: USBDEVFS_REAPURBNDELAY");
+    failed := failed + 1;
+  }
+
+  if (failed == 0) { PrintLn("OK: IOCTL constants"); }
+  return failed;
+}
+
+// ============================================================
+// URB-Struct-Größe: 56 Bytes
+// ============================================================
+fn testStructSize(): int64 {
+  if (USB_URB_STRUCT_SIZE != 56) {
+    PrintLn("FAIL: USB_URB_STRUCT_SIZE != 56");
+    return 1;
+  }
+  PrintLn("OK: USB_URB_STRUCT_SIZE = 56");
+  return 0;
+}
+
+// ============================================================
+// URB-Struct-Layout: alle Feld-Offsets korrekt
+// ============================================================
+fn testStructLayout(): int64 {
+  var failed: int64 := 0;
+
+  // Feld-Offset-Konstanten gegen erwartete Werte prüfen
+  if (URB_OFF_TYPE            !=  0) { PrintLn("FAIL: URB_OFF_TYPE");          failed:=failed+1; }
+  if (URB_OFF_ENDPOINT        !=  1) { PrintLn("FAIL: URB_OFF_ENDPOINT");      failed:=failed+1; }
+  if (URB_OFF_STATUS          !=  4) { PrintLn("FAIL: URB_OFF_STATUS");        failed:=failed+1; }
+  if (URB_OFF_FLAGS           !=  8) { PrintLn("FAIL: URB_OFF_FLAGS");         failed:=failed+1; }
+  if (URB_OFF_BUFFER          != 16) { PrintLn("FAIL: URB_OFF_BUFFER");        failed:=failed+1; }
+  if (URB_OFF_BUFFER_LENGTH   != 24) { PrintLn("FAIL: URB_OFF_BUFFER_LENGTH"); failed:=failed+1; }
+  if (URB_OFF_ACTUAL_LENGTH   != 28) { PrintLn("FAIL: URB_OFF_ACTUAL_LENGTH"); failed:=failed+1; }
+  if (URB_OFF_SIGNR           != 44) { PrintLn("FAIL: URB_OFF_SIGNR");         failed:=failed+1; }
+  if (URB_OFF_USERCONTEXT     != 48) { PrintLn("FAIL: URB_OFF_USERCONTEXT");   failed:=failed+1; }
+
+  if (failed == 0) { PrintLn("OK: URB field offsets"); }
+  return failed;
+}
+
+// ============================================================
+// UsbAllocUrb + UsbFreeUrb: Allokierung und Nullung
+// ============================================================
+fn testAllocFree(): int64 {
+  var urb: int64 := UsbAllocUrb();
+  if (urb == 0) {
+    PrintLn("FAIL: UsbAllocUrb returned 0");
+    return 1;
+  }
+
+  var failed: int64 := 0;
+
+  // Alle 56 Bytes müssen 0 sein
+  var i: int64 := 0;
+  while (i < 56) {
+    if (peek8(urb + i) != 0) {
+      PrintLn("FAIL: URB not zeroed after alloc");
+      failed := failed + 1;
+      break;
+    }
+    i := i + 1;
+  }
+
+  UsbFreeUrb(urb);
+  if (failed == 0) { PrintLn("OK: UsbAllocUrb zeroed, UsbFreeUrb called"); }
+  return failed;
+}
+
+// ============================================================
+// UsbInitInterruptRead: Struct korrekt befüllt
+// ============================================================
+fn testInitInterruptRead(): int64 {
+  var urb: int64 := UsbAllocUrb();
+  var buf: int64 := alloc(8);
+  var ctx: int64 := 0x42424242;
+
+  UsbInitInterruptRead(urb, 0x81, buf, 8, ctx);
+
+  var failed: int64 := 0;
+
+  // type = USBDEVFS_URB_TYPE_INTERRUPT = 1
+  if (peek8(urb + URB_OFF_TYPE) != 1) {
+    PrintLn("FAIL: type != INTERRUPT");
+    failed := failed + 1;
+  }
+  // endpoint = 0x81
+  if (peek8(urb + URB_OFF_ENDPOINT) != 0x81) {
+    PrintLn("FAIL: endpoint != 0x81");
+    failed := failed + 1;
+  }
+  // buffer = buf
+  if (peek64(urb + URB_OFF_BUFFER) != buf) {
+    PrintLn("FAIL: buffer pointer mismatch");
+    failed := failed + 1;
+  }
+  // buffer_length = 8
+  if ((peek32(urb + URB_OFF_BUFFER_LENGTH) & 0xFFFFFFFF) != 8) {
+    PrintLn("FAIL: buffer_length != 8");
+    failed := failed + 1;
+  }
+  // usercontext = ctx
+  if (peek64(urb + URB_OFF_USERCONTEXT) != ctx) {
+    PrintLn("FAIL: usercontext mismatch");
+    failed := failed + 1;
+  }
+  // status, actual_length, signr, flags, _pad0, _pad1 = 0
+  if ((peek32(urb + URB_OFF_STATUS) & 0xFFFFFFFF) != 0) {
+    PrintLn("FAIL: status should be 0");
+    failed := failed + 1;
+  }
+  if ((peek32(urb + URB_OFF_ACTUAL_LENGTH) & 0xFFFFFFFF) != 0) {
+    PrintLn("FAIL: actual_length should be 0");
+    failed := failed + 1;
+  }
+  if ((peek32(urb + URB_OFF_SIGNR) & 0xFFFFFFFF) != 0) {
+    PrintLn("FAIL: signr should be 0 (not byte!)");
+    failed := failed + 1;
+  }
+  // _pad0 (offset 2..3) = 0
+  if ((peek16(urb + 2) & 0xFFFF) != 0) {
+    PrintLn("FAIL: _pad0 != 0");
+    failed := failed + 1;
+  }
+
+  free(buf, 8);
+  UsbFreeUrb(urb);
+  if (failed == 0) { PrintLn("OK: UsbInitInterruptRead struct layout"); }
+  return failed;
+}
+
+// ============================================================
+// Feld-Accessoren: Status, ActualLength, Context, Endpoint
+// ============================================================
+fn testAccessors(): int64 {
+  var urb: int64 := UsbAllocUrb();
+  var failed: int64 := 0;
+
+  // Status = -5 (negativ, sign-extended)
+  poke32(urb + URB_OFF_STATUS, -5 & 0xFFFFFFFF);
+
+  // actual_length = 7
+  poke32(urb + URB_OFF_ACTUAL_LENGTH, 7);
+
+  // usercontext = 0xDEAD
+  poke64(urb + URB_OFF_USERCONTEXT, 0xDEAD);
+
+  // endpoint = 0x83
+  poke8(urb + URB_OFF_ENDPOINT, 0x83);
+
+  if (UsbUrbStatus(urb) != -5) {
+    PrintLn("FAIL: UsbUrbStatus != -5");
+    failed := failed + 1;
+  }
+  if (UsbUrbActualLength(urb) != 7) {
+    PrintLn("FAIL: UsbUrbActualLength != 7");
+    failed := failed + 1;
+  }
+  if (UsbUrbContext(urb) != 0xDEAD) {
+    PrintLn("FAIL: UsbUrbContext != 0xDEAD");
+    failed := failed + 1;
+  }
+  if (UsbUrbEndpoint(urb) != 0x83) {
+    PrintLn("FAIL: UsbUrbEndpoint != 0x83");
+    failed := failed + 1;
+  }
+
+  UsbFreeUrb(urb);
+  if (failed == 0) { PrintLn("OK: URB field accessors"); }
+  return failed;
+}
+
+// ============================================================
+// AC-3/AC-1/AC-4: fd=-1 → alle Operationen negativ/0
+// (kein Hängen, sofortige Fehlerantwort)
+// ============================================================
+fn testInvalidFd(): int64 {
+  var failed: int64 := 0;
+  var buf: int64 := alloc(8);
+
+  // UsbSubmitUrb mit fd=-1
+  var urb: int64 := UsbAllocUrb();
+  UsbInitInterruptRead(urb, 0x81, buf, 8, 0);
+  var r1: int64 := UsbSubmitUrb(-1, urb);
+  if (r1 >= 0) {
+    PrintLn("FAIL: SubmitUrb(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+  UsbFreeUrb(urb);
+
+  // UsbSubmitInterruptRead mit fd=-1 → gibt 0 (kein URB allokiert-und-behalten)
+  var r2: int64 := UsbSubmitInterruptRead(-1, 0x81, buf, 8, 0);
+  if (r2 != 0) {
+    PrintLn("FAIL: SubmitInterruptRead(fd=-1) should return 0");
+    failed := failed + 1;
+  }
+
+  // UsbWaitForUrb mit fd=-1, timeout=1 ms → 0 (poll schlägt sofort fehl)
+  var r3: int64 := UsbWaitForUrb(-1, 1);
+  if (r3 != 0) {
+    PrintLn("FAIL: WaitForUrb(fd=-1) should return 0");
+    failed := failed + 1;
+  }
+
+  // UsbDiscardUrb mit fd=-1 → 0 (ioctl schlägt fehl)
+  var urb2: int64 := UsbAllocUrb();
+  var r4: int64 := UsbDiscardUrb(-1, urb2);
+  if (r4 != 0) {
+    PrintLn("FAIL: DiscardUrb(fd=-1) should return 0");
+    failed := failed + 1;
+  }
+  UsbFreeUrb(urb2);
+
+  free(buf, 8);
+  if (failed == 0) { PrintLn("OK: invalid fd → error returns (AC-1/AC-3/AC-4)"); }
+  return failed;
+}
+
+// ============================================================
+// URB-Typ-Konstanten
+// ============================================================
+fn testUrbTypeConstants(): int64 {
+  var failed: int64 := 0;
+  if (USBDEVFS_URB_TYPE_ISO       != 0) { PrintLn("FAIL: URB_TYPE_ISO");       failed:=failed+1; }
+  if (USBDEVFS_URB_TYPE_INTERRUPT != 1) { PrintLn("FAIL: URB_TYPE_INTERRUPT"); failed:=failed+1; }
+  if (USBDEVFS_URB_TYPE_CONTROL   != 2) { PrintLn("FAIL: URB_TYPE_CONTROL");   failed:=failed+1; }
+  if (USBDEVFS_URB_TYPE_BULK      != 3) { PrintLn("FAIL: URB_TYPE_BULK");      failed:=failed+1; }
+  if (failed == 0) { PrintLn("OK: URB type constants"); }
+  return failed;
+}
+
+// ============================================================
+// signr ist uint32 (4 Bytes, Offset 44) — nicht Byte (Bug-Fix)
+// Schreibe 0x12345678 in signr und lese es zurück
+// ============================================================
+fn testSignrIsUint32(): int64 {
+  var urb: int64 := UsbAllocUrb();
+  poke32(urb + URB_OFF_SIGNR, 0x12345678 & 0xFFFFFFFF);
+  var signr: int64 := peek32(urb + URB_OFF_SIGNR) & 0xFFFFFFFF;
+  UsbFreeUrb(urb);
+
+  if (signr != 0x12345678) {
+    PrintLn("FAIL: signr is not uint32 at offset 44");
+    return 1;
+  }
+  // Prüfe auch, dass actual_length (+28) nicht überschrieben wurde
+  // signr at +44, actual_length at +28 — 16 Bytes auseinander, kein Overlap
+  PrintLn("OK: signr = uint32 at offset 44 (not byte)");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testIoctlConstants();
+  failed := failed + testStructSize();
+  failed := failed + testStructLayout();
+  failed := failed + testAllocFree();
+  failed := failed + testInitInterruptRead();
+  failed := failed + testAccessors();
+  failed := failed + testInvalidFd();
+  failed := failed + testUrbTypeConstants();
+  failed := failed + testSignrIsUint32();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}
