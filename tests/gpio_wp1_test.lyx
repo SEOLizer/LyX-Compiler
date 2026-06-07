@@ -1,0 +1,196 @@
+// tests/gpio_wp1_test.lyx
+// WP-1: Low-Level-Syscalls & Compiler-Intrinsics für GPIO
+//
+// Abnahmekriterien:
+// AC-1: Alle Syscall-Wrapper sind deklariert und aufrufbar
+// AC-3: mem_barrier() und inst_barrier() laufen ohne Fehler
+//       (AC-3 Disassembly-Test ist manuell auf ARM64 Hardware zu prüfen)
+// AC-4: /dev/null per GpioOpen öffnen und per GpioClose schließen
+
+unit tests.gpio_wp1_test;
+
+import std.hardware.gpio_syscalls;
+import std.hardware.gpio_barriers;
+import std.alloc;
+
+// ============================================================
+// AC-4: GpioOpen + GpioClose mit /dev/null
+// ============================================================
+fn testOpenClose(): int64 {
+  var path: pchar := "/dev/null"c;
+  var fd: int64 := GpioOpen(path, GPIO_O_RDWR);
+  if (fd < 0) {
+    PrintLn("FAIL: GpioOpen(/dev/null) returned < 0");
+    return 1;
+  }
+  var r: int64 := GpioClose(fd);
+  if (r < 0) {
+    PrintLn("FAIL: GpioClose returned < 0");
+    return 1;
+  }
+  PrintLn("OK: GpioOpen/GpioClose (/dev/null) — AC-4");
+  return 0;
+}
+
+// ============================================================
+// AC-1: GpioRead — liest von /dev/zero
+// ============================================================
+fn testRead(): int64 {
+  var path: pchar := "/dev/zero"c;
+  var fd: int64 := GpioOpen(path, GPIO_O_RDONLY);
+  if (fd < 0) {
+    PrintLn("FAIL: GpioOpen(/dev/zero) returned < 0");
+    return 1;
+  }
+  var buf: int64 := alloc(8);
+  poke64(buf, 0xDEADBEEF);
+  var n: int64 := GpioRead(fd, buf, 8);
+  GpioClose(fd);
+
+  if (n != 8) {
+    PrintLn("FAIL: GpioRead from /dev/zero should return 8");
+    free(buf, 8);
+    return 1;
+  }
+  // /dev/zero liefert Nullbytes
+  if (peek64(buf) != 0) {
+    PrintLn("FAIL: GpioRead from /dev/zero should deliver zero bytes");
+    free(buf, 8);
+    return 1;
+  }
+  free(buf, 8);
+  PrintLn("OK: GpioRead — AC-1");
+  return 0;
+}
+
+// ============================================================
+// AC-1: GpioIoctl — mit ungültigem fd → negativer Rückgabewert
+// ============================================================
+fn testIoctlInvalidFd(): int64 {
+  var r: int64 := GpioIoctl(-1, 0, 0);
+  if (r >= 0) {
+    PrintLn("FAIL: GpioIoctl(fd=-1) should return negative");
+    return 1;
+  }
+  PrintLn("OK: GpioIoctl(fd=-1) → negative — AC-1");
+  return 0;
+}
+
+// ============================================================
+// AC-1: GpioPoll — mit ungültigem fd, timeout=1ms → sofort -1
+// ============================================================
+fn testPollTimeout(): int64 {
+  var pfd: int64 := alloc(8);
+  GpioPollFdSet(pfd, -1, GPIO_POLLIN);
+  var r: int64 := GpioPoll(pfd, 1, 1);
+  free(pfd, 8);
+  // fd=-1 → POLLNVAL in revents → poll gibt 1 zurück (event recognized)
+  // oder -1 (EBADF). Beides zeigt, dass der Syscall funktioniert.
+  // Wir prüfen nur, dass der Aufruf nicht hängt.
+  PrintLn("OK: GpioPoll returned (did not hang) — AC-1");
+  return 0;
+}
+
+// ============================================================
+// AC-1: GpioMmap + GpioMunmap — anonymes Mapping als Funktionstest
+// ============================================================
+fn testMmapMunmap(): int64 {
+  // Anonymes Read-Write-Mapping (kein Gerät) zum Testen der Syscall-Wrapper.
+  // MAP_ANONYMOUS = 32, MAP_PRIVATE = 2 (kein MAP_SHARED, da kein fd)
+  var addr: int64 := GpioMmap(0, 4096, GPIO_PROT_RW, 34, -1, 0);
+  // 34 = MAP_PRIVATE(2) | MAP_ANONYMOUS(32)
+  if (addr == GPIO_MAP_FAILED || addr == 0) {
+    PrintLn("FAIL: GpioMmap anonymous failed");
+    return 1;
+  }
+  // Schreiben und Lesen verifizieren
+  poke64(addr, 0xCAFEBABE);
+  if (peek64(addr) != 0xCAFEBABE) {
+    PrintLn("FAIL: mmap'd memory not readable");
+    GpioMunmap(addr, 4096);
+    return 1;
+  }
+  var r: int64 := GpioMunmap(addr, 4096);
+  if (r < 0) {
+    PrintLn("FAIL: GpioMunmap returned < 0");
+    return 1;
+  }
+  PrintLn("OK: GpioMmap/GpioMunmap — AC-1");
+  return 0;
+}
+
+// ============================================================
+// AC-3: mem_barrier() und inst_barrier() — laufen ohne Crash
+// Auf x86-64: MFENCE / LFENCE wird emittiert (verifizierbar via objdump).
+// Auf ARM64:  DMB SY / ISB wird emittiert.
+// ============================================================
+fn testBarriers(): int64 {
+  // Vor und nach dem Barrier-Aufruf schreiben wir in einen
+  // Puffer — das stellt sicher, dass der Barrier nicht wegoptimiert
+  // werden kann und tatsächlich zwischen zwei Speicherzugriffen steht.
+  var buf: int64 := alloc(16);
+  poke64(buf, 1);
+  mem_barrier();            // AC-3: erzeugt MFENCE / DMB SY
+  poke64(buf + 8, 2);
+  mem_barrier();
+
+  inst_barrier();           // AC-3: erzeugt LFENCE / ISB
+
+  var v1: int64 := peek64(buf);
+  var v2: int64 := peek64(buf + 8);
+  free(buf, 16);
+
+  if (v1 != 1 || v2 != 2) {
+    PrintLn("FAIL: memory around barriers corrupted");
+    return 1;
+  }
+  PrintLn("OK: mem_barrier() + inst_barrier() — AC-3");
+  return 0;
+}
+
+// ============================================================
+// Konstanten-Check
+// ============================================================
+fn testConstants(): int64 {
+  var failed: int64 := 0;
+  if (GPIO_O_RDONLY != 0) { PrintLn("FAIL: O_RDONLY"); failed:=failed+1; }
+  if (GPIO_O_RDWR   != 2) { PrintLn("FAIL: O_RDWR");   failed:=failed+1; }
+  if (GPIO_O_SYNC   != 4096) { PrintLn("FAIL: O_SYNC"); failed:=failed+1; }
+  if (GPIO_PROT_READ  != 1) { PrintLn("FAIL: PROT_READ");  failed:=failed+1; }
+  if (GPIO_PROT_WRITE != 2) { PrintLn("FAIL: PROT_WRITE"); failed:=failed+1; }
+  if (GPIO_MAP_SHARED != 1) { PrintLn("FAIL: MAP_SHARED"); failed:=failed+1; }
+  if (GPIO_POLLIN != 1) { PrintLn("FAIL: POLLIN"); failed:=failed+1; }
+  if (failed == 0) { PrintLn("OK: GPIO constants"); }
+  return failed;
+}
+
+// ============================================================
+// pollfd-Hilfsfunktionen
+// ============================================================
+fn testPollFd(): int64 {
+  var buf: int64 := alloc(8);
+  GpioPollFdSet(buf, 42, GPIO_POLLIN);
+  var failed: int64 := 0;
+  if ((peek32(buf) & 0xFFFFFFFF) != 42) { PrintLn("FAIL: pollfd.fd"); failed:=failed+1; }
+  if ((peek16(buf + 4) & 0xFFFF) != 1)  { PrintLn("FAIL: pollfd.events"); failed:=failed+1; }
+  if ((peek16(buf + 6) & 0xFFFF) != 0)  { PrintLn("FAIL: pollfd.revents"); failed:=failed+1; }
+  free(buf, 8);
+  if (failed == 0) { PrintLn("OK: GpioPollFdSet/Revents"); }
+  return failed;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testConstants();
+  failed := failed + testOpenClose();
+  failed := failed + testRead();
+  failed := failed + testIoctlInvalidFd();
+  failed := failed + testPollTimeout();
+  failed := failed + testMmapMunmap();
+  failed := failed + testBarriers();
+  failed := failed + testPollFd();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  return 0;
+}

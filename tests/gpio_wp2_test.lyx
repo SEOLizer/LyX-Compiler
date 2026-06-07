@@ -1,0 +1,431 @@
+// tests/gpio_wp2_test.lyx
+// WP-2: MMIO-GPIO-Implementierung
+//
+// Hardware-unabhängige Tests via Fake-Register-Buffer:
+//   ctx.gpio_mem wird auf heap-allokierten Puffer gesetzt
+//   → alle Register-Manipulationen sind testbar ohne echtes GPIO.
+//
+// Abnahmekriterien:
+// AC-WP2.1: Konstanten korrekt (GPIO_BASE, Register-Offsets)
+// AC-WP2.2: GpioInit scheitert graceful ohne /dev/gpiomem
+//           GpioClose auf nicht-init. Ctx → kein Crash
+// AC-WP2.3: SetPinMode → korrekte GPFSEL-Bits
+// AC-WP2.4: WritePin High/Low → korrekte GPSET/GPCLR-Bits
+//           ReadPin → korrekte Auswertung von GPLEV
+// AC-WP2.5: SetPullMode → korrekte Bits in PUP_PDN_REG
+
+unit tests.gpio_wp2_test;
+
+import std.hardware.gpio_mmio;
+import std.hardware.rpi4;
+import std.alloc;
+
+// ============================================================
+// Hilfsfunktion: Context mit Fake-Register-Buffer initialisieren
+// Fake-Buffer: 256 Bytes (groß genug für alle GPIO-Register-Offsets bis 0xF0)
+// ============================================================
+fn makeFakeCtx(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  var fakeMem: int64 := alloc(256);
+  // Alle Register auf 0 setzen
+  var i: int64 := 0;
+  while (i < 32) { poke64(fakeMem + i * 8, 0); i := i + 1; }
+  // In ctx eintragen
+  poke64(ctx,     fakeMem);  // gpio_mem
+  poke64(ctx + 8, 1);        // is_mapped = 1
+  poke64(ctx + 16, 1);       // has_new_pull = 1 (neue Register)
+  return ctx;
+}
+
+fn freeFakeCtx(ctx: int64) {
+  var fakeMem: int64 := peek64(ctx);
+  free(fakeMem, 256);
+  GpioCtxFree(ctx);
+}
+
+// ============================================================
+// AC-WP2.1: Platform-Konstanten
+// ============================================================
+fn testRpi4Constants(): int64 {
+  var failed: int64 := 0;
+  if (RPI4_GPIO_BASE   != 0xFE200000) { PrintLn("FAIL: GPIO_BASE");    failed:=failed+1; }
+  if (RPI4_GPSET0      != 0x1C)       { PrintLn("FAIL: GPSET0 off");   failed:=failed+1; }
+  if (RPI4_GPSET1      != 0x20)       { PrintLn("FAIL: GPSET1 off");   failed:=failed+1; }
+  if (RPI4_GPCLR0      != 0x28)       { PrintLn("FAIL: GPCLR0 off");   failed:=failed+1; }
+  if (RPI4_GPCLR1      != 0x2C)       { PrintLn("FAIL: GPCLR1 off");   failed:=failed+1; }
+  if (RPI4_GPLEV0      != 0x34)       { PrintLn("FAIL: GPLEV0 off");   failed:=failed+1; }
+  if (RPI4_GPLEV1      != 0x38)       { PrintLn("FAIL: GPLEV1 off");   failed:=failed+1; }
+  if (RPI4_GPPUD       != 0x94)       { PrintLn("FAIL: GPPUD off");    failed:=failed+1; }
+  if (RPI4_PUP_PDN_REG0 != 0xE4)     { PrintLn("FAIL: PUP_PDN_REG0"); failed:=failed+1; }
+  if (RPI4_PUP_PDN_REG1 != 0xE8)     { PrintLn("FAIL: PUP_PDN_REG1"); failed:=failed+1; }
+  if (RPI4_MAX_PIN     != 53)         { PrintLn("FAIL: MAX_PIN");       failed:=failed+1; }
+  if (RPI4_MODE_INPUT  != 0)          { PrintLn("FAIL: MODE_INPUT");   failed:=failed+1; }
+  if (RPI4_MODE_OUTPUT != 1)          { PrintLn("FAIL: MODE_OUTPUT");  failed:=failed+1; }
+  if (RPI4_PULL_NONE   != 0)          { PrintLn("FAIL: PULL_NONE");    failed:=failed+1; }
+  if (RPI4_PULL_DOWN   != 1)          { PrintLn("FAIL: PULL_DOWN");    failed:=failed+1; }
+  if (RPI4_PULL_UP     != 2)          { PrintLn("FAIL: PULL_UP");      failed:=failed+1; }
+  if (failed == 0) { PrintLn("OK: RPi4 platform constants (WP-2.1)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.2: GpioInit scheitert ohne /dev/gpiomem (x86-64 Testmaschine)
+// ============================================================
+fn testInitFails(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  var r: int64 := GpioInit(ctx);
+  // Auf x86-64 gibt es kein /dev/gpiomem → GpioInit sollte 0 zurückgeben
+  // (oder 1, falls /dev/mem existiert und mmap funktioniert — sehr unwahrscheinlich)
+  // Wir prüfen nur, dass kein Crash auftritt.
+  if (r != 0) {
+    // Falls ein Mapping gelungen ist (unwahrscheinlich), direkt wieder freigeben
+    GpioClose(ctx);
+  }
+  GpioCtxFree(ctx);
+  PrintLn("OK: GpioInit graceful without /dev/gpiomem (WP-2.2)");
+  return 0;
+}
+
+// AC-WP2.2: GpioClose auf nicht-initialisiertem Ctx → kein Crash
+fn testCloseUninit(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  GpioClose(ctx);   // is_mapped=0 → No-op
+  GpioClose(ctx);   // doppeltes Close → auch No-op
+  GpioCtxFree(ctx);
+  PrintLn("OK: GpioClose on uninit ctx (WP-2.2)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP2.3: SetPinMode — GPFSEL-Bits korrekt
+//
+// Pin 18: reg=1, shift=24 → GPFSEL1 bei Byte-Offset 4
+// Input:  Bits 26-24 = 000 → GPFSEL1 Bit 24-26 gelöscht
+// Output: Bits 26-24 = 001 → GPFSEL1 Bit 24 gesetzt
+// ============================================================
+fn testSetPinMode(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+  var failed: int64 := 0;
+
+  // Pin 18: GPFSEL1 (Byte-Offset 4), bit_shift = (18-10)*3 = 24
+  var fsel1Off: int64 := 4;
+
+  // Vorbelegen mit Nicht-Null um Löschen zu verifizieren
+  poke32(mem + fsel1Off, 0x07000000 & 0xFFFFFFFF);  // Bits 24-26 gesetzt
+
+  // SetPinMode(18, Input) → Bits 24-26 müssen 000 sein
+  GpioSetPinMode(ctx, 18, GPIO_PIN_INPUT);
+  var fsel1: int64 := peek32(mem + fsel1Off) & 0xFFFFFFFF;
+  if ((fsel1 & 0x07000000) != 0) {
+    PrintLn("FAIL: Pin18 Input should clear bits 24-26");
+    failed := failed + 1;
+  }
+
+  // SetPinMode(18, Output) → Bit 24 gesetzt, 25-26 gelöscht
+  GpioSetPinMode(ctx, 18, GPIO_PIN_OUTPUT);
+  fsel1 := peek32(mem + fsel1Off) & 0xFFFFFFFF;
+  if ((fsel1 & 0x07000000) != 0x01000000) {
+    PrintLn("FAIL: Pin18 Output should set bit 24 only (001)");
+    failed := failed + 1;
+  }
+
+  // Pin 0: GPFSEL0 (Byte-Offset 0), bit_shift=0
+  GpioSetPinMode(ctx, 0, GPIO_PIN_OUTPUT);
+  var fsel0: int64 := peek32(mem) & 0xFFFFFFFF;
+  if ((fsel0 & 7) != 1) {
+    PrintLn("FAIL: Pin0 Output should set bit 0");
+    failed := failed + 1;
+  }
+
+  // Pin 9: GPFSEL0, shift=27 (letzte 3 Bits)
+  GpioSetPinMode(ctx, 9, GPIO_PIN_OUTPUT);
+  fsel0 := peek32(mem) & 0xFFFFFFFF;
+  if (((fsel0 >> 27) & 7) != 1) {
+    PrintLn("FAIL: Pin9 Output should set bits 27-29");
+    failed := failed + 1;
+  }
+
+  // Pin 53: GPFSEL5 (Byte-Offset 20), shift=(53-50)*3=9
+  GpioSetPinMode(ctx, 53, GPIO_PIN_OUTPUT);
+  var fsel5: int64 := peek32(mem + 20) & 0xFFFFFFFF;
+  if (((fsel5 >> 9) & 7) != 1) {
+    PrintLn("FAIL: Pin53 Output should set bits 9-11 in GPFSEL5");
+    failed := failed + 1;
+  }
+
+  // Pin 54 → ungültig, sollte 0 zurückgeben
+  var r: int64 := GpioSetPinMode(ctx, 54, GPIO_PIN_OUTPUT);
+  if (r != 0) {
+    PrintLn("FAIL: Pin54 should return 0 (invalid)");
+    failed := failed + 1;
+  }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: GpioSetPinMode GPFSEL bits (WP-2.3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.4: WritePin — GPSET/GPCLR-Bits korrekt
+//
+// Pin 18 (< 32): GPSET0 bei 0x1C, GPCLR0 bei 0x28
+// Pin 34 (>= 32): GPSET1 bei 0x20, GPCLR1 bei 0x2C
+// ============================================================
+fn testWritePin(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+  var failed: int64 := 0;
+
+  // Pin 18 High → GPSET0 Bit 18 gesetzt
+  GpioWritePin(ctx, 18, GPIO_PIN_HIGH);
+  var gpset0: int64 := peek32(mem + RPI4_GPSET0) & 0xFFFFFFFF;
+  if ((gpset0 & (1 << 18)) == 0) {
+    PrintLn("FAIL: Pin18 High should set GPSET0 bit 18");
+    failed := failed + 1;
+  }
+
+  // Reset GPSET0 für nächsten Test
+  poke32(mem + RPI4_GPSET0, 0);
+
+  // Pin 18 Low → GPCLR0 Bit 18 gesetzt
+  GpioWritePin(ctx, 18, GPIO_PIN_LOW);
+  var gpclr0: int64 := peek32(mem + RPI4_GPCLR0) & 0xFFFFFFFF;
+  if ((gpclr0 & (1 << 18)) == 0) {
+    PrintLn("FAIL: Pin18 Low should set GPCLR0 bit 18");
+    failed := failed + 1;
+  }
+
+  poke32(mem + RPI4_GPCLR0, 0);
+
+  // Pin 34 High → GPSET1 Bit 2 (34-32=2)
+  GpioWritePin(ctx, 34, GPIO_PIN_HIGH);
+  var gpset1: int64 := peek32(mem + RPI4_GPSET1) & 0xFFFFFFFF;
+  if ((gpset1 & (1 << 2)) == 0) {
+    PrintLn("FAIL: Pin34 High should set GPSET1 bit 2");
+    failed := failed + 1;
+  }
+
+  poke32(mem + RPI4_GPSET1, 0);
+
+  // Pin 34 Low → GPCLR1 Bit 2
+  GpioWritePin(ctx, 34, GPIO_PIN_LOW);
+  var gpclr1: int64 := peek32(mem + RPI4_GPCLR1) & 0xFFFFFFFF;
+  if ((gpclr1 & (1 << 2)) == 0) {
+    PrintLn("FAIL: Pin34 Low should set GPCLR1 bit 2");
+    failed := failed + 1;
+  }
+
+  // Pin 54 → ungültig
+  var r: int64 := GpioWritePin(ctx, 54, GPIO_PIN_HIGH);
+  if (r != 0) { PrintLn("FAIL: Pin54 Write should return 0"); failed:=failed+1; }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: GpioWritePin GPSET/GPCLR bits (WP-2.4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.4: ReadPin — GPLEV korrekt ausgewertet
+// ============================================================
+fn testReadPin(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+  var failed: int64 := 0;
+
+  // Alle GPLEV-Register = 0 → alle Pins LOW
+  if (GpioReadPin(ctx, 18) != 0) {
+    PrintLn("FAIL: Pin18 should read 0 when GPLEV0=0");
+    failed := failed + 1;
+  }
+
+  // GPLEV0 Bit 18 setzen → Pin 18 HIGH
+  poke32(mem + RPI4_GPLEV0, 1 << 18);
+  if (GpioReadPin(ctx, 18) != 1) {
+    PrintLn("FAIL: Pin18 should read 1 when GPLEV0 bit 18 set");
+    failed := failed + 1;
+  }
+  if (GpioReadPin(ctx, 17) != 0) {
+    PrintLn("FAIL: Pin17 should still read 0");
+    failed := failed + 1;
+  }
+
+  // Pin 34: GPLEV1 Bit 2 (34-32=2)
+  poke32(mem + RPI4_GPLEV0, 0);
+  poke32(mem + RPI4_GPLEV1, 1 << 2);
+  if (GpioReadPin(ctx, 34) != 1) {
+    PrintLn("FAIL: Pin34 should read 1 when GPLEV1 bit 2 set");
+    failed := failed + 1;
+  }
+
+  // Pin 54 → ungültig → -1
+  if (GpioReadPin(ctx, 54) != -1) {
+    PrintLn("FAIL: Pin54 should return -1 (invalid)");
+    failed := failed + 1;
+  }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: GpioReadPin GPLEV bits (WP-2.4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.5: SetPullMode — neue BCM2711-Register-Bits
+//
+// Pin 23: REG1 (0xE8), shift=(23-16)*2=14
+//   PullDown (1): Bits 14-15 = 01
+//   PullUp   (2): Bits 14-15 = 10
+//   None     (0): Bits 14-15 = 00
+// ============================================================
+fn testSetPullModeNew(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+  var failed: int64 := 0;
+
+  // Pin 23: REG1 bei Offset 0xE8, bit_shift = (23-16)*2 = 14
+  var reg1Off: int64 := 0xE8;
+
+  // PullDown → 01 in Bits 14-15
+  GpioSetPullMode(ctx, 23, GPIO_PULL_DOWN);
+  var reg1: int64 := peek32(mem + reg1Off) & 0xFFFFFFFF;
+  if (((reg1 >> 14) & 3) != 1) {
+    PrintLn("FAIL: Pin23 PullDown should set 01 in bits 14-15");
+    failed := failed + 1;
+  }
+
+  // PullUp → 10 in Bits 14-15
+  GpioSetPullMode(ctx, 23, GPIO_PULL_UP);
+  reg1 := peek32(mem + reg1Off) & 0xFFFFFFFF;
+  if (((reg1 >> 14) & 3) != 2) {
+    PrintLn("FAIL: Pin23 PullUp should set 10 in bits 14-15");
+    failed := failed + 1;
+  }
+
+  // None → 00 in Bits 14-15
+  GpioSetPullMode(ctx, 23, GPIO_PULL_NONE);
+  reg1 := peek32(mem + reg1Off) & 0xFFFFFFFF;
+  if (((reg1 >> 14) & 3) != 0) {
+    PrintLn("FAIL: Pin23 None should clear bits 14-15");
+    failed := failed + 1;
+  }
+
+  // Pin 0: REG0 (0xE4), shift=0
+  GpioSetPullMode(ctx, 0, GPIO_PULL_UP);
+  var reg0: int64 := peek32(mem + 0xE4) & 0xFFFFFFFF;
+  if ((reg0 & 3) != 2) {
+    PrintLn("FAIL: Pin0 PullUp should set 10 in bits 0-1");
+    failed := failed + 1;
+  }
+
+  // Pin 32: REG2 (0xEC), shift=0
+  GpioSetPullMode(ctx, 32, GPIO_PULL_DOWN);
+  var reg2: int64 := peek32(mem + 0xEC) & 0xFFFFFFFF;
+  if ((reg2 & 3) != 1) {
+    PrintLn("FAIL: Pin32 PullDown should set 01 in bits 0-1 of REG2");
+    failed := failed + 1;
+  }
+
+  // Pin 54 → ungültig
+  var r: int64 := GpioSetPullMode(ctx, 54, GPIO_PULL_UP);
+  if (r != 0) { PrintLn("FAIL: Pin54 PullMode should return 0"); failed:=failed+1; }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: GpioSetPullMode new BCM2711 format (WP-2.5)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.5: Legacy-Pull-Protokoll
+// ============================================================
+fn testSetPullModeLegacy(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+
+  // Legacy-Modus aktivieren
+  poke64(ctx + 16, 0);  // has_new_pull = 0
+
+  // PullUp auf Pin 23 (< 32)
+  GpioSetPullMode(ctx, 23, GPIO_PULL_UP);
+
+  // Nach dem Protokoll:
+  // Step 1: GPPUD = 2 (PullUp) → wird dann auf 0 zurückgesetzt
+  // Step 2: GPPUDCLK0 Bit 23 wird gesetzt → dann wieder 0
+  // Am Ende: GPPUD = 0, GPPUDCLK0 = 0 (zurückgesetzt)
+  var gppud:    int64 := peek32(mem + RPI4_GPPUD) & 0xFFFFFFFF;
+  var gppudclk: int64 := peek32(mem + RPI4_GPPUDCLK0) & 0xFFFFFFFF;
+
+  if (gppud != 0) {
+    PrintLn("FAIL: Legacy: GPPUD should be 0 after reset");
+    poke64(ctx + 16, 1);
+    freeFakeCtx(ctx);
+    return 1;
+  }
+  if (gppudclk != 0) {
+    PrintLn("FAIL: Legacy: GPPUDCLK0 should be 0 after reset");
+    poke64(ctx + 16, 1);
+    freeFakeCtx(ctx);
+    return 1;
+  }
+
+  poke64(ctx + 16, 1);  // zurücksetzen für freeFakeCtx
+  freeFakeCtx(ctx);
+  PrintLn("OK: GpioSetPullMode legacy protocol (WP-2.5)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP2.3: GpioSetPinMode setzt Bits benachbarter Pins nicht
+// ============================================================
+fn testPinModeSideEffects(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var mem: int64 := peek64(ctx);
+  var failed: int64 := 0;
+
+  // Pin 10 und Pin 11 in GPFSEL1 konfigurieren
+  // Pin 10: shift=0, Pin 11: shift=3
+  GpioSetPinMode(ctx, 10, GPIO_PIN_OUTPUT);  // Bit 0 setzen
+  GpioSetPinMode(ctx, 11, GPIO_PIN_OUTPUT);  // Bit 3 setzen
+
+  var fsel1: int64 := peek32(mem + 4) & 0xFFFFFFFF;
+  if ((fsel1 & 7) != 1) {
+    PrintLn("FAIL: Pin10 should be Output (bit 0)");
+    failed := failed + 1;
+  }
+  if (((fsel1 >> 3) & 7) != 1) {
+    PrintLn("FAIL: Pin11 should be Output (bits 3-5)");
+    failed := failed + 1;
+  }
+
+  // Pin 10 auf Input zurücksetzen → Pin 11 darf nicht beeinflusst werden
+  GpioSetPinMode(ctx, 10, GPIO_PIN_INPUT);
+  fsel1 := peek32(mem + 4) & 0xFFFFFFFF;
+  if ((fsel1 & 7) != 0) {
+    PrintLn("FAIL: Pin10 should be Input (bits 0-2 = 000)");
+    failed := failed + 1;
+  }
+  if (((fsel1 >> 3) & 7) != 1) {
+    PrintLn("FAIL: Pin11 Output should not be affected by Pin10 change");
+    failed := failed + 1;
+  }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: SetPinMode no side effects on adjacent pins (WP-2.3)"); }
+  return failed;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testRpi4Constants();
+  failed := failed + testInitFails();
+  failed := failed + testCloseUninit();
+  failed := failed + testSetPinMode();
+  failed := failed + testWritePin();
+  failed := failed + testReadPin();
+  failed := failed + testSetPullModeNew();
+  failed := failed + testSetPullModeLegacy();
+  failed := failed + testPinModeSideEffects();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  return 0;
+}

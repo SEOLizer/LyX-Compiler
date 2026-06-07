@@ -1,0 +1,239 @@
+// tests/gpio_wp4b_test.lyx
+// WP-4b: Typsichere Pin-Wrapper — OutputPin / InputPin
+//
+// Abnahmekriterien:
+// AC-WP4b.1: GpioOutputPinWrite setzt korrekte GPSET/GPCLR-Bits
+// AC-WP4b.2: GpioInputPinRead liest korrekte GPLEV-Bits
+// AC-WP4b.3: OutputPinInit setzt GPFSEL korrekt auf OUTPUT
+// AC-WP4b.4: InputPinInit setzt GPFSEL korrekt auf INPUT + Pull
+// AC-WP4b.5: Init mit ungültigem Pin (54) → 0
+// AC-WP4b.6: Typsicherheit per Konvention:
+//   GpioOutputPinRead  — existiert nicht → Compiler-Fehler
+//   GpioInputPinWrite  — existiert nicht → Compiler-Fehler
+//   (hier dokumentiert; Verifikation: auskommentierter Code unten)
+
+unit tests.gpio_wp4b_test;
+
+import std.hardware.gpio_pin;
+import std.hardware.gpio_mmio;
+import std.hardware.rpi4;
+import std.alloc;
+
+// ============================================================
+// Hilfsfunktion: Fake-MMIO-Kontext (wie in WP-2-Tests)
+// ============================================================
+fn makeFakeCtx(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  var fakeMem: int64 := alloc(256);
+  var i: int64 := 0;
+  while (i < 32) { poke64(fakeMem + i * 8, 0); i := i + 1; }
+  poke64(ctx,      fakeMem);
+  poke64(ctx + 8,  1);
+  poke64(ctx + 16, 1);
+  return ctx;
+}
+
+fn freeFakeCtx(ctx: int64) {
+  var fakeMem: int64 := peek64(ctx);
+  free(fakeMem, 256);
+  GpioCtxFree(ctx);
+}
+
+// ============================================================
+// AC-WP4b.3: OutputPinInit setzt GPFSEL auf OUTPUT
+// ============================================================
+fn testOutputPinInit(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var mem: int64 := peek64(gc);
+  var failed: int64 := 0;
+
+  var pin: int64 := GpioOutputPinAlloc(gc, 18);
+  if (pin == 0) { PrintLn("FAIL: OutputPinAlloc returned 0"); freeFakeCtx(gc); return 1; }
+
+  var r: int64 := GpioOutputPinInit(pin, GPIO_PULL_NONE);
+  if (r != 1) { PrintLn("FAIL: OutputPinInit returned != 1"); failed:=failed+1; }
+
+  // Pin 18 → GPFSEL1 (offset 4), bits 24-26 = 001
+  var fsel1: int64 := peek32(mem + 4) & 0xFFFFFFFF;
+  if (((fsel1 >> 24) & 7) != 1) {
+    PrintLn("FAIL: OutputPinInit should set GPFSEL1 bits 24-26 = 001 (OUTPUT)");
+    failed := failed + 1;
+  }
+
+  GpioOutputPinFree(pin);
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: OutputPinInit sets GPFSEL to OUTPUT (WP-4b.3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP4b.1: OutputPinWrite setzt GPSET/GPCLR-Bits
+// ============================================================
+fn testOutputPinWrite(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var mem: int64 := peek64(gc);
+  var failed: int64 := 0;
+
+  var pin: int64 := GpioOutputPinAlloc(gc, 18);
+  GpioOutputPinInit(pin, GPIO_PULL_NONE);
+
+  // Write HIGH → GPSET0 Bit 18
+  poke32(mem + RPI4_GPSET0, 0);
+  var r: int64 := GpioOutputPinWrite(pin, GPIO_PIN_HIGH);
+  if (r != 1) { PrintLn("FAIL: OutputPinWrite HIGH returned != 1"); failed:=failed+1; }
+  var gpset0: int64 := peek32(mem + RPI4_GPSET0) & 0xFFFFFFFF;
+  if ((gpset0 & (1 << 18)) == 0) {
+    PrintLn("FAIL: OutputPinWrite HIGH should set GPSET0 bit 18");
+    failed := failed + 1;
+  }
+
+  // Write LOW → GPCLR0 Bit 18
+  poke32(mem + RPI4_GPCLR0, 0);
+  r := GpioOutputPinWrite(pin, GPIO_PIN_LOW);
+  if (r != 1) { PrintLn("FAIL: OutputPinWrite LOW returned != 1"); failed:=failed+1; }
+  var gpclr0: int64 := peek32(mem + RPI4_GPCLR0) & 0xFFFFFFFF;
+  if ((gpclr0 & (1 << 18)) == 0) {
+    PrintLn("FAIL: OutputPinWrite LOW should set GPCLR0 bit 18");
+    failed := failed + 1;
+  }
+
+  GpioOutputPinFree(pin);
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: OutputPinWrite sets GPSET/GPCLR bits (WP-4b.1)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP4b.4: InputPinInit setzt GPFSEL auf INPUT + Pull
+// ============================================================
+fn testInputPinInit(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var mem: int64 := peek64(gc);
+  var failed: int64 := 0;
+
+  // Vorbelegen: Pin 23 als OUTPUT setzen, dann auf INPUT zurücksetzen
+  var fsel2Off: int64 := 8;  // GPFSEL2 (Pins 20-29)
+  poke32(mem + fsel2Off, 0x07000000 & 0xFFFFFFFF);  // Bits 9-11 (Pin23 shift=(23-20)*3=9)
+
+  var pin: int64 := GpioInputPinAlloc(gc, 23);
+  if (pin == 0) { PrintLn("FAIL: InputPinAlloc returned 0"); freeFakeCtx(gc); return 1; }
+
+  var r: int64 := GpioInputPinInit(pin, GPIO_PULL_UP);
+  if (r != 1) { PrintLn("FAIL: InputPinInit returned != 1"); failed:=failed+1; }
+
+  // GPFSEL2 bits 9-11 (Pin 23: reg=2, shift=(23-20)*3=9) müssen 000 (INPUT) sein
+  var fsel2: int64 := peek32(mem + fsel2Off) & 0xFFFFFFFF;
+  if (((fsel2 >> 9) & 7) != 0) {
+    PrintLn("FAIL: InputPinInit should set GPFSEL2 bits 9-11 = 000 (INPUT)");
+    failed := failed + 1;
+  }
+
+  // PUP_PDN_REG1 (0xE8): Pin 23 → reg=(23/16)=1, shift=(23%16)*2=14 → bits 14-15 = 10 (PullUp)
+  var reg1: int64 := peek32(mem + 0xE8) & 0xFFFFFFFF;
+  if (((reg1 >> 14) & 3) != 2) {
+    PrintLn("FAIL: InputPinInit PullUp should set PUP_PDN_REG1 bits 14-15 = 10");
+    failed := failed + 1;
+  }
+
+  GpioInputPinFree(pin);
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: InputPinInit sets GPFSEL to INPUT + PullUp (WP-4b.4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP4b.2: InputPinRead liest GPLEV-Bits
+// ============================================================
+fn testInputPinRead(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var mem: int64 := peek64(gc);
+  var failed: int64 := 0;
+
+  var pin: int64 := GpioInputPinAlloc(gc, 23);
+  GpioInputPinInit(pin, GPIO_PULL_NONE);
+
+  // GPLEV0 = 0 → Pin 23 LOW
+  poke32(mem + RPI4_GPLEV0, 0);
+  if (GpioInputPinRead(pin) != 0) {
+    PrintLn("FAIL: InputPinRead should return 0 when GPLEV0=0");
+    failed := failed + 1;
+  }
+
+  // GPLEV0 Bit 23 setzen → Pin 23 HIGH
+  poke32(mem + RPI4_GPLEV0, 1 << 23);
+  if (GpioInputPinRead(pin) != 1) {
+    PrintLn("FAIL: InputPinRead should return 1 when GPLEV0 bit 23 set");
+    failed := failed + 1;
+  }
+
+  GpioInputPinFree(pin);
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: InputPinRead reads GPLEV bits (WP-4b.2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP4b.5: Init mit ungültigem Pin → 0
+// ============================================================
+fn testInvalidPin(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  var outPin: int64 := GpioOutputPinAlloc(gc, 54);
+  var r: int64 := GpioOutputPinInit(outPin, GPIO_PULL_NONE);
+  if (r != 0) {
+    PrintLn("FAIL: OutputPinInit(pin=54) should return 0");
+    failed := failed + 1;
+  }
+  GpioOutputPinFree(outPin);
+
+  var inPin: int64 := GpioInputPinAlloc(gc, 54);
+  r := GpioInputPinInit(inPin, GPIO_PULL_NONE);
+  if (r != 0) {
+    PrintLn("FAIL: InputPinInit(pin=54) should return 0");
+    failed := failed + 1;
+  }
+  // InputPinRead auf ungültigem Pin → -1
+  if (GpioInputPinRead(inPin) != -1) {
+    PrintLn("FAIL: InputPinRead(pin=54) should return -1");
+    failed := failed + 1;
+  }
+  GpioInputPinFree(inPin);
+
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: Init/Read with invalid pin returns 0/-1 (WP-4b.5)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP4b.6: Typsicherheit dokumentiert
+//
+// Die folgenden Aufrufe existieren nicht und erzeugen
+// "unknown function"-Compiler-Fehler:
+//   GpioOutputPinRead(pin)   — nicht definiert
+//   GpioInputPinWrite(pin, state) — nicht definiert
+//
+// Zum Verifizieren: eine der folgenden Zeilen einkommentieren,
+// Kompilierung schlägt mit Compiler-Fehler fehl (kein Linker-Fehler):
+//   // GpioOutputPinRead(outPin);
+//   // GpioInputPinWrite(inPin, GPIO_PIN_HIGH);
+// ============================================================
+fn testTypeSafetyDocumented(): int64 {
+  PrintLn("OK: Type safety by convention — GpioOutputPinRead / GpioInputPinWrite");
+  PrintLn("    do not exist → compiler error on misuse (WP-4b.6)");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testOutputPinInit();
+  failed := failed + testOutputPinWrite();
+  failed := failed + testInputPinInit();
+  failed := failed + testInputPinRead();
+  failed := failed + testInvalidPin();
+  failed := failed + testTypeSafetyDocumented();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  return 0;
+}

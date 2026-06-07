@@ -1,0 +1,170 @@
+// tests/gpio_wp20_test.lyx
+// WP-2.0: Memory-Barrier-Vertragstest für MMIO-Schreibzugriffe
+//
+// Abnahmekriterien:
+// AC-WP2.0.1: GpioMemBarrier / GpioInstBarrier führen ohne Crash aus
+// AC-WP2.0.2: Jede schreibende MMIO-Funktion (SetPinMode, WritePin,
+//             SetPullMode) gibt 1 zurück → Barrier-Codepfad wurde
+//             vollständig durchlaufen
+// AC-WP2.0.3: Sequenz mehrerer Schreibvorgänge hintereinander stabil
+// AC-WP2.0.4: Disassembly — auf x86-64: MFENCE (0F AE F0) nach jedem
+//             Register-Write; auf ARM64: dmb sy (BF 3F 03 D5)
+//             (manuell auf RPi4-Hardware zu prüfen, hier ausgeführter
+//             Smoke-Test ohne Disassembly-Analyse)
+
+unit tests.gpio_wp20_test;
+
+import std.hardware.gpio_barriers;
+import std.hardware.gpio_mmio;
+import std.hardware.rpi4;
+import std.alloc;
+
+// ============================================================
+// Hilfsfunktion: Fake-Ctx analog zu WP-2-Tests
+// ============================================================
+fn makeFakeCtx(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  var fakeMem: int64 := alloc(256);
+  var i: int64 := 0;
+  while (i < 32) { poke64(fakeMem + i * 8, 0); i := i + 1; }
+  poke64(ctx,      fakeMem);
+  poke64(ctx + 8,  1);   // is_mapped = 1
+  poke64(ctx + 16, 1);   // has_new_pull = 1
+  return ctx;
+}
+
+fn freeFakeCtx(ctx: int64) {
+  var fakeMem: int64 := peek64(ctx);
+  free(fakeMem, 256);
+  GpioCtxFree(ctx);
+}
+
+// ============================================================
+// AC-WP2.0.1: Barrier-Intrinsics laufen ohne Absturz
+// ============================================================
+fn testBarrierIntrinsics(): int64 {
+  GpioMemBarrier();
+  GpioInstBarrier();
+  GpioMemBarrier();
+  PrintLn("OK: GpioMemBarrier + GpioInstBarrier execute (WP-2.0.1)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP2.0.2: Schreibende Funktionen geben 1 zurück
+//   → vollständiger Barrier-Codepfad durchlaufen
+// ============================================================
+fn testWriteFunctionsReturnOk(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  // GpioSetPinMode (enthält mem_barrier() nach poke32)
+  var r: int64 := GpioSetPinMode(ctx, 4, GPIO_PIN_OUTPUT);
+  if (r != 1) { PrintLn("FAIL: SetPinMode return != 1"); failed := failed + 1; }
+
+  // GpioWritePin High (enthält mem_barrier() nach poke32)
+  r := GpioWritePin(ctx, 4, GPIO_PIN_HIGH);
+  if (r != 1) { PrintLn("FAIL: WritePin High return != 1"); failed := failed + 1; }
+
+  // GpioWritePin Low
+  r := GpioWritePin(ctx, 4, GPIO_PIN_LOW);
+  if (r != 1) { PrintLn("FAIL: WritePin Low return != 1"); failed := failed + 1; }
+
+  // GpioSetPullMode new (enthält mem_barrier() nach poke32)
+  r := GpioSetPullMode(ctx, 4, GPIO_PULL_UP);
+  if (r != 1) { PrintLn("FAIL: SetPullMode new return != 1"); failed := failed + 1; }
+
+  // GpioSetPullMode legacy (enthält 4× mem_barrier())
+  poke64(ctx + 16, 0);
+  r := GpioSetPullMode(ctx, 4, GPIO_PULL_DOWN);
+  if (r != 1) { PrintLn("FAIL: SetPullMode legacy return != 1"); failed := failed + 1; }
+  poke64(ctx + 16, 1);
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: All write functions returned 1 (barrier path complete) (WP-2.0.2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.0.3: Sequenz vieler Schreibvorgänge hintereinander stabil
+//   Simuliert einen typischen GPIO-Nutzungspfad:
+//   Init-Mode → Write HIGH × 10 → Write LOW × 10 → Pull-Change
+// ============================================================
+fn testWriteSequenceStable(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  GpioSetPinMode(ctx, 17, GPIO_PIN_OUTPUT);
+  GpioMemBarrier();   // Zwischen SetPinMode und erstem WritePin (Faustregel WP-2.0)
+
+  var i: int64 := 0;
+  while (i < 10) {
+    var r: int64 := GpioWritePin(ctx, 17, GPIO_PIN_HIGH);
+    if (r != 1) { failed := failed + 1; }
+    r := GpioWritePin(ctx, 17, GPIO_PIN_LOW);
+    if (r != 1) { failed := failed + 1; }
+    i := i + 1;
+  }
+
+  GpioSetPullMode(ctx, 17, GPIO_PULL_UP);
+  GpioSetPinMode(ctx, 17, GPIO_PIN_INPUT);
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: Write sequence (20 ops) stable (WP-2.0.3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.0.3: Pin-Range-Grenzen — Barriers auch bei high-Pin (Pin 53)
+// ============================================================
+fn testHighPinBarrierPath(): int64 {
+  var ctx: int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  var r: int64 := GpioSetPinMode(ctx, 53, GPIO_PIN_OUTPUT);
+  if (r != 1) { PrintLn("FAIL: Pin53 SetPinMode return != 1"); failed := failed + 1; }
+
+  r := GpioWritePin(ctx, 53, GPIO_PIN_HIGH);
+  if (r != 1) { PrintLn("FAIL: Pin53 WritePin High return != 1"); failed := failed + 1; }
+
+  r := GpioWritePin(ctx, 53, GPIO_PIN_LOW);
+  if (r != 1) { PrintLn("FAIL: Pin53 WritePin Low return != 1"); failed := failed + 1; }
+
+  r := GpioSetPullMode(ctx, 53, GPIO_PULL_NONE);
+  if (r != 1) { PrintLn("FAIL: Pin53 SetPullMode return != 1"); failed := failed + 1; }
+
+  freeFakeCtx(ctx);
+  if (failed == 0) { PrintLn("OK: High-pin (53) barrier path complete (WP-2.0.3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP2.0.4: Smoke-Test — mfence/dmb in erzeugte Binary
+//   Auf dieser Testmaschine (x86-64) prüfen wir, dass
+//   mem_barrier() ohne SIGILL läuft.
+//   Vollständige Disassembly-Auswertung (dmb sy → BF 3F 03 D5)
+//   ist manuell auf ARM64-Hardware durchzuführen.
+// ============================================================
+fn testBarrierSmokeNoSIGILL(): int64 {
+  var i: int64 := 0;
+  while (i < 100) {
+    GpioMemBarrier();
+    i := i + 1;
+  }
+  PrintLn("OK: 100x GpioMemBarrier without SIGILL (WP-2.0.4 smoke)");
+  PrintLn("NOTE: dmb sy / mfence Disassembly-Check is manual on ARM64 hardware");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testBarrierIntrinsics();
+  failed := failed + testWriteFunctionsReturnOk();
+  failed := failed + testWriteSequenceStable();
+  failed := failed + testHighPinBarrierPath();
+  failed := failed + testBarrierSmokeNoSIGILL();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  return 0;
+}
