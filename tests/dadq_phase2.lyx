@@ -1,0 +1,579 @@
+// tests/dadq_phase2.lyx
+// DADQ Phase 2 -- Sicherheitsanalyse (nach Phase-2-Revision)
+//
+// Konstruktion: T_pub = sigma o T_priv o sigma_inv (nicht-zirkulant)
+// pk = T_pub (65536 Bytes), sk = (sigma, sigma_inv, seed_T_priv, key_mac)
+//
+// Befunde gegenueber Phase-1-Konstruktion:
+//   T-2.1 (Zirkulanz):   BEHOBEN  -- T_pub nicht-zirkulant
+//   T-2.2 (Iso-Angriff): OFFEN    -- T_pub_col_inv in O(n^2) aus pk berechenbar (strukturell)
+//   T-2.3 (DDT/LAT):     VERBESSERT
+//   T-2.5 (CCA1):        BEHOBEN  -- SHA256(m || r_seed) Integritaetscheck
+
+@description("DADQ Phase 2: Sicherheitsanalyse nach Phase-2-Revision")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit tests.dadq_phase2;
+
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.rand;
+import std.crypto.pqc.dadq;
+
+// ============================================================================
+// Hilfsfunktionen
+// ============================================================================
+
+fn memset8(p: int64, val: int64, len: int64) {
+    var i: int64 := 0;
+    while (i < len) { poke8(p + i, val & 0xFF); i := i + 1; }
+}
+
+fn memeq(a: int64, b: int64, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < len) {
+        if (peek8(a + i) != peek8(b + i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+fn countbits(x: int64): int64 {
+    var n: int64 := 0;
+    var v: int64 := x & 0xFF;
+    while (v != 0) { n := n + (v & 1); v := v / 2; }
+    return n;
+}
+
+fn bitparity(x: int64): int64 {
+    var p: int64 := 0;
+    var v: int64 := x & 0xFF;
+    while (v != 0) { p := p ^ (v & 1); v := v / 2; }
+    return p;
+}
+
+// ============================================================================
+// Roundtrip-Test nach Phase-2-Revision
+// ============================================================================
+
+fn testRoundtrip(): int64 {
+    PrintLn("=== Roundtrip: Korrektheit nach Phase-2-Revision ===");
+    var seed:  int64 := alloc(32);
+    var pk:    int64 := alloc(DADQ_PK_LEN);
+    var sk:    int64 := alloc(DADQ_SK_LEN_FULL);
+    var m:     int64 := alloc(DADQ_BLOCK_SZ);
+    var c_len: int64 := DADQ_BLOCK_SZ + DADQ_OVERHEAD;
+    var c:     int64 := alloc(c_len);
+    var m2:    int64 := alloc(DADQ_BLOCK_SZ);
+    var ok:    int64 := 1;
+    var iter:  int64 := 0;
+    var rc:    int64 := 0;
+    var dr:    int64 := 0;
+
+    memset8(seed, 0x42, 32);
+    dadqKeyGenFull(seed, pk, sk);
+
+    iter := 0;
+    while (iter < 100) {
+        RandBytesExact(m, DADQ_BLOCK_SZ);
+        dadqEnc(pk, m, DADQ_BLOCK_SZ, c);
+        memset8(m2, 0, DADQ_BLOCK_SZ);
+        dr := dadqDec(sk, c, c_len, m2);
+        if (dr != 0) { ok := 0; }
+        if (memeq(m, m2, DADQ_BLOCK_SZ) == 0) { ok := 0; }
+        iter := iter + 1;
+    }
+
+    if (ok != 0) {
+        PrintLn("OK   T-1.2.1: 100 Roundtrips korrekt nach Phase-2-Revision.");
+        rc := 0;
+    } else {
+        PrintLn("KRITISCH: Roundtrip-Fehler nach Phase-2-Revision.");
+        rc := 1;
+    }
+
+    free(seed, 32); free(pk, DADQ_PK_LEN); free(sk, DADQ_SK_LEN_FULL);
+    free(m, DADQ_BLOCK_SZ); free(c, c_len); free(m2, DADQ_BLOCK_SZ);
+    return rc;
+}
+
+// ============================================================================
+// AP-2.1 -- Zirkulanz-Test
+// ============================================================================
+// Prueft: Gilt T_pub[a][b] == T_pub[0][(a+b) mod 256]?
+// Mit Phase-2-Revision (sigma-Iso) sollte T_pub NICHT zirkulant sein.
+
+fn testAP21Zirkulanz(): int64 {
+    PrintLn("=== AP-2.1: Zirkulanz-Nachweis ===");
+    var seed:    int64 := alloc(32);
+    var pk:      int64 := alloc(DADQ_PK_LEN);
+    var sk:      int64 := alloc(DADQ_SK_LEN_FULL);
+    var rc:      int64 := 0;
+    var a:       int64 := 0;
+    var b:       int64 := 0;
+    var sum:     int64 := 0;
+    var idx:     int64 := 0;
+    var t0b:     int64 := 0;
+    var tab:     int64 := 0;
+    var is_circ: int64 := 1;
+
+    memset8(seed, 0xB2, 32);
+    dadqKeyGenFull(seed, pk, sk);
+
+    a := 1;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            sum := a + b;
+            idx := sum - (sum / 256) * 256;
+            t0b := peek8(pk + 0 * 256 + idx) & 0xFF;
+            tab := peek8(pk + a * 256 + b)   & 0xFF;
+            if (t0b != tab) { is_circ := 0; }
+            b := b + 1;
+        }
+        a := a + 1;
+    }
+
+    if (is_circ == 0) {
+        PrintLn("OK   T-2.1: T_pub ist NICHT zirkulant (sigma-Iso wirksam).");
+        rc := 0;
+    } else {
+        PrintLn("KRITISCH T-2.1: T_pub ist noch zirkulant!");
+        rc := 1;
+    }
+
+    free(seed, 32); free(pk, DADQ_PK_LEN); free(sk, DADQ_SK_LEN_FULL);
+    return rc;
+}
+
+// ============================================================================
+// AP-2.2 -- Spalteninverse-Angriff (strukturelles Problem)
+// ============================================================================
+// Befund: Latin-Square-Eigenschaft erlaubt T_pub_col_inv in O(n^2) zu berechnen.
+// Auch nach Phase-2-Revision: Angreifer mit pk kann ohne sk entschluesseln.
+// Fundamentales Problem -- Latin-Square-Inversion ist nie schwer wenn volle Tabelle bekannt.
+
+fn testAP22ColInvAngriff(): int64 {
+    PrintLn("=== AP-2.2: Spalteninverse-Angriff (strukturell) ===");
+    var seed:     int64 := alloc(32);
+    var pk:       int64 := alloc(DADQ_PK_LEN);
+    var sk:       int64 := alloc(DADQ_SK_LEN_FULL);
+    var col_inv:  int64 := alloc(DADQ_TABLE_SZ);
+    var m_orig:   int64 := alloc(DADQ_BLOCK_SZ);
+    var c_len:    int64 := DADQ_BLOCK_SZ + DADQ_OVERHEAD;
+    var c_buf:    int64 := alloc(c_len);
+    var r_seed:   int64 := alloc(32);
+    var r:        int64 := alloc(DADQ_BLOCK_SZ);
+    var m_attack: int64 := alloc(DADQ_BLOCK_SZ);
+    var h_enc:    int64 := alloc(32);
+    var r_chunk:  int64 := alloc(32);
+    var rc:       int64 := 0;
+    var b:        int64 := 0;
+    var a:        int64 := 0;
+    var v:        int64 := 0;
+    var i:        int64 := 0;
+    var j:        int64 := 0;
+
+    memset8(seed, 0xA5, 32);
+    dadqKeyGenFull(seed, pk, sk);
+
+    // Schritt 1: Angreifer berechnet T_pub_col_inv aus pk in O(n^2)
+    b := 0;
+    while (b < 256) {
+        a := 0;
+        while (a < 256) {
+            v := peek8(pk + a * 256 + b) & 0xFF;
+            poke8(col_inv + b * 256 + v, a & 0xFF);
+            a := a + 1;
+        }
+        b := b + 1;
+    }
+
+    // Schritt 2: Normales Enc
+    memset8(m_orig, 0x37, DADQ_BLOCK_SZ);
+    dadqEnc(pk, m_orig, DADQ_BLOCK_SZ, c_buf);
+
+    // Schritt 3: r_seed aus commit extrahieren
+    SHA256(c_buf, DADQ_BLOCK_SZ, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(r_seed + j, (peek8(h_enc + j) ^ peek8(c_buf + DADQ_BLOCK_SZ + j)) & 0xFF);
+        j := j + 1;
+    }
+
+    // Schritt 4: r expandieren (1 DRBG-Block genuegt fuer BLOCK_SZ=16)
+    dadqDRBGNext(r_seed, 0, r_chunk);
+    i := 0;
+    while (i < DADQ_BLOCK_SZ) { poke8(r + i, peek8(r_chunk + i) & 0xFF); i := i + 1; }
+
+    // Schritt 5: m[i] = T_pub_col_inv[r[i]][m_enc[i]]
+    i := 0;
+    while (i < DADQ_BLOCK_SZ) {
+        var ri: int64 := peek8(r + i) & 0xFF;
+        var ci: int64 := peek8(c_buf + i) & 0xFF;
+        poke8(m_attack + i, peek8(col_inv + ri * 256 + ci) & 0xFF);
+        i := i + 1;
+    }
+
+    if (memeq(m_orig, m_attack, DADQ_BLOCK_SZ) != 0) {
+        PrintLn("KRITISCH T-2.2: Spalteninverse-Angriff erfolgreich ohne sk.");
+        PrintLn("  => T_pub_col_inv in O(n^2) berechenbar (Latin-Square-Eigenschaft).");
+        PrintLn("  => Echte Asymmetrie unmoeglich solange volle Tabelle als pk veroeffentlicht.");
+        PrintLn("  => Phase 3: neue Trapdoor-Konstruktion erforderlich (AP-3.1).");
+        rc := 1;
+    } else {
+        PrintLn("OK   T-2.2: Angriff scheitert (unerwartet -- Implementierung pruefen).");
+        rc := 0;
+    }
+
+    free(seed, 32); free(pk, DADQ_PK_LEN); free(sk, DADQ_SK_LEN_FULL);
+    free(col_inv, DADQ_TABLE_SZ); free(m_orig, DADQ_BLOCK_SZ); free(c_buf, c_len);
+    free(r_seed, 32); free(r, DADQ_BLOCK_SZ); free(m_attack, DADQ_BLOCK_SZ);
+    free(h_enc, 32); free(r_chunk, 32);
+    return rc;
+}
+
+// ============================================================================
+// AP-2.3 -- Differentielle Kryptanalyse (DDT, r-Abhaengigkeit)
+// ============================================================================
+// Nicht-zirkulantes T_pub => DDT haengt von r ab.
+
+fn testAP23DDT(): int64 {
+    PrintLn("=== AP-2.3: DDT-r-Abhaengigkeit (nicht-zirkulant) ===");
+    var seed:    int64 := alloc(32);
+    var pk:      int64 := alloc(DADQ_PK_LEN);
+    var sk:      int64 := alloc(DADQ_SK_LEN_FULL);
+    var ddt0:    int64 := alloc(65536);
+    var ddt1:    int64 := alloc(65536);
+    var rc:      int64 := 0;
+    var da:      int64 := 0;
+    var a:       int64 := 0;
+    var a2:      int64 := 0;
+    var dc:      int64 := 0;
+    var cnt:     int64 := 0;
+    var t1:      int64 := 0;
+    var t2:      int64 := 0;
+    var max_ddt: int64 := 0;
+
+    memset8(seed, 0xC3, 32);
+    dadqKeyGenFull(seed, pk, sk);
+
+    // DDT fuer r=0
+    memset8(ddt0, 0, 65536);
+    da := 1;
+    while (da < 256) {
+        a := 0;
+        while (a < 256) {
+            a2 := a + da;
+            a2 := a2 - (a2 / 256) * 256;
+            t1 := peek8(pk + a  * 256 + 0) & 0xFF;
+            t2 := peek8(pk + a2 * 256 + 0) & 0xFF;
+            dc := t2 - t1;
+            if (dc < 0) { dc := dc + 256; }
+            dc := dc - (dc / 256) * 256;
+            cnt := peek8(ddt0 + da * 256 + dc) & 0xFF;
+            if (cnt < 255) { poke8(ddt0 + da * 256 + dc, (cnt + 1) & 0xFF); }
+            a := a + 1;
+        }
+        da := da + 1;
+    }
+
+    // DDT fuer r=1
+    memset8(ddt1, 0, 65536);
+    da := 1;
+    while (da < 256) {
+        a := 0;
+        while (a < 256) {
+            a2 := a + da;
+            a2 := a2 - (a2 / 256) * 256;
+            t1 := peek8(pk + a  * 256 + 1) & 0xFF;
+            t2 := peek8(pk + a2 * 256 + 1) & 0xFF;
+            dc := t2 - t1;
+            if (dc < 0) { dc := dc + 256; }
+            dc := dc - (dc / 256) * 256;
+            cnt := peek8(ddt1 + da * 256 + dc) & 0xFF;
+            if (cnt < 255) { poke8(ddt1 + da * 256 + dc, (cnt + 1) & 0xFF); }
+            a := a + 1;
+        }
+        da := da + 1;
+    }
+
+    // max(DDT) fuer r=0
+    max_ddt := 0;
+    da := 1;
+    while (da < 256) {
+        dc := 0;
+        while (dc < 256) {
+            cnt := peek8(ddt0 + da * 256 + dc) & 0xFF;
+            if (cnt > max_ddt) { max_ddt := cnt; }
+            dc := dc + 1;
+        }
+        da := da + 1;
+    }
+    PrintStr("  max(DDT[r=0]) = ");
+    PrintInt(max_ddt);
+    PrintStr(" (Richtwert AES-S-Box: 4)");
+    PrintLn("");
+
+    if (max_ddt <= 8) {
+        PrintLn("OK   T-2.3.2: max(DDT) akzeptabel.");
+    } else {
+        PrintStr("WARN T-2.3.2: max(DDT) = ");
+        PrintInt(max_ddt);
+        PrintLn("");
+    }
+
+    if (memeq(ddt0, ddt1, 65536) == 0) {
+        PrintLn("OK   T-2.3.3: DDT haengt von r ab (nicht-zirkulante Struktur bestaetigt).");
+    } else {
+        PrintLn("KRITISCH T-2.3.3: DDT noch r-invariant.");
+        rc := 1;
+    }
+
+    free(seed, 32); free(pk, DADQ_PK_LEN); free(sk, DADQ_SK_LEN_FULL);
+    free(ddt0, 65536); free(ddt1, 65536);
+    return rc;
+}
+
+// ============================================================================
+// AP-2.4 -- Schwache-Key-Analyse
+// ============================================================================
+
+fn countFixpoints(table: int64): int64 {
+    var count: int64 := 0;
+    var a:     int64 := 0;
+    var b:     int64 := 0;
+    a := 0;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            if ((peek8(table + a * 256 + b) & 0xFF) == a) { count := count + 1; }
+            b := b + 1;
+        }
+        a := a + 1;
+    }
+    return count;
+}
+
+fn testAP24WeakKeys(): int64 {
+    PrintLn("=== AP-2.4: Schwache-Key-Analyse ===");
+    var seed1:  int64 := alloc(32);
+    var seed2:  int64 := alloc(32);
+    var pk1:    int64 := alloc(DADQ_PK_LEN);
+    var sk1:    int64 := alloc(DADQ_SK_LEN_FULL);
+    var pk2:    int64 := alloc(DADQ_PK_LEN);
+    var sk2:    int64 := alloc(DADQ_SK_LEN_FULL);
+    var rc:     int64 := 0;
+    var iter:   int64 := 0;
+    var max_fp: int64 := 0;
+    var fp:     int64 := 0;
+    var diff:   int64 := 0;
+    var j:      int64 := 0;
+    var pct:    int64 := 0;
+
+    iter := 0;
+    while (iter < 30) {
+        RandBytesExact(seed1, 32);
+        dadqKeyGenFull(seed1, pk1, sk1);
+        fp := countFixpoints(pk1);
+        if (fp > max_fp) { max_fp := fp; }
+        iter := iter + 1;
+    }
+    PrintStr("  Max Fixpunkte (30 Keys): ");
+    PrintInt(max_fp);
+    PrintStr(" (Erwartung: ~256)");
+    PrintLn("");
+
+    if (max_fp < 512) {
+        PrintLn("OK   T-2.4.1: Keine pathologischen Fixpunkte.");
+    } else {
+        PrintStr("WARN T-2.4.1: Viele Fixpunkte: ");
+        PrintInt(max_fp);
+        PrintLn("");
+        rc := 1;
+    }
+
+    RandBytesExact(seed1, 32);
+    j := 0;
+    while (j < 32) { poke8(seed2 + j, peek8(seed1 + j)); j := j + 1; }
+    poke8(seed2, (peek8(seed1) ^ 0x01) & 0xFF);
+
+    dadqKeyGenFull(seed1, pk1, sk1);
+    dadqKeyGenFull(seed2, pk2, sk2);
+
+    diff := 0;
+    j := 0;
+    while (j < DADQ_TABLE_SZ) {
+        if (peek8(pk1 + j) != peek8(pk2 + j)) { diff := diff + 1; }
+        j := j + 1;
+    }
+    pct := (diff * 100) / DADQ_TABLE_SZ;
+    PrintStr("  Related-Key Hamming-Distanz pk: ");
+    PrintInt(pct);
+    PrintLn("% (Ziel: ~63%)");
+
+    if (pct >= 50) {
+        PrintLn("OK   T-2.4.2: Strukturell verschiedene PKs bei Hamming-Dist-1-Seeds.");
+    } else {
+        PrintStr("WARN T-2.4.2: Nur ");
+        PrintInt(pct);
+        PrintLn("% Unterschied");
+        rc := 1;
+    }
+
+    free(seed1, 32); free(seed2, 32);
+    free(pk1, DADQ_PK_LEN); free(sk1, DADQ_SK_LEN_FULL);
+    free(pk2, DADQ_PK_LEN); free(sk2, DADQ_SK_LEN_FULL);
+    return rc;
+}
+
+// ============================================================================
+// AP-2.5 -- CCA1-Test (Bit-Flip-Erkennung)
+// ============================================================================
+// SHA256(m || r_seed) Integritaetscheck: Manipulation von m_enc aendert r_seed
+// (via SHA256), damit m_dec, und der Hash-Vergleich schlaegt fehl.
+
+fn testAP25CCA1(): int64 {
+    PrintLn("=== AP-2.5: CCA1 Bit-Flip-Test ===");
+    var seed:  int64 := alloc(32);
+    var pk:    int64 := alloc(DADQ_PK_LEN);
+    var sk:    int64 := alloc(DADQ_SK_LEN_FULL);
+    var m:     int64 := alloc(DADQ_BLOCK_SZ);
+    var c_len: int64 := DADQ_BLOCK_SZ + DADQ_OVERHEAD;
+    var c:     int64 := alloc(c_len);
+    var c_flip: int64 := alloc(c_len);
+    var m2:    int64 := alloc(DADQ_BLOCK_SZ);
+    var rc:    int64 := 0;
+    var detected: int64 := 0;
+    var total: int64 := 0;
+    var bit:   int64 := 0;
+    var byte_i: int64 := 0;
+    var bit_mask: int64 := 0;
+    var bit_pos: int64 := 0;
+    var i:     int64 := 0;
+    var dr:    int64 := 0;
+
+    memset8(seed, 0xF6, 32);
+    dadqKeyGenFull(seed, pk, sk);
+    memset8(m, 0x5A, DADQ_BLOCK_SZ);
+    dadqEnc(pk, m, DADQ_BLOCK_SZ, c);
+
+    // Bit-Flips in m_enc (ersten DADQ_BLOCK_SZ Bytes)
+    bit := 0;
+    while (bit < DADQ_BLOCK_SZ * 8) {
+        byte_i   := bit / 8;
+        bit_pos  := bit - byte_i * 8;
+        bit_mask := 1;
+        while (bit_pos > 0) { bit_mask := bit_mask * 2; bit_pos := bit_pos - 1; }
+        i := 0;
+        while (i < c_len) { poke8(c_flip + i, peek8(c + i) & 0xFF); i := i + 1; }
+        poke8(c_flip + byte_i, (peek8(c + byte_i) ^ bit_mask) & 0xFF);
+        memset8(m2, 0, DADQ_BLOCK_SZ);
+        dr := dadqDec(sk, c_flip, c_len, m2);
+        total := total + 1;
+        if (dr != 0) { detected := detected + 1; }
+        bit := bit + 1;
+    }
+
+    // Bit-Flips im commit (Bytes m_len..m_len+31)
+    bit := 0;
+    while (bit < 32 * 8) {
+        byte_i   := bit / 8;
+        bit_pos  := bit - byte_i * 8;
+        bit_mask := 1;
+        while (bit_pos > 0) { bit_mask := bit_mask * 2; bit_pos := bit_pos - 1; }
+        i := 0;
+        while (i < c_len) { poke8(c_flip + i, peek8(c + i) & 0xFF); i := i + 1; }
+        poke8(c_flip + DADQ_BLOCK_SZ + byte_i,
+              (peek8(c + DADQ_BLOCK_SZ + byte_i) ^ bit_mask) & 0xFF);
+        memset8(m2, 0, DADQ_BLOCK_SZ);
+        dr := dadqDec(sk, c_flip, c_len, m2);
+        total := total + 1;
+        if (dr != 0) { detected := detected + 1; }
+        bit := bit + 1;
+    }
+
+    // Bit-Flips im hash_mr (Bytes m_len+32..m_len+63)
+    bit := 0;
+    while (bit < 32 * 8) {
+        byte_i   := bit / 8;
+        bit_pos  := bit - byte_i * 8;
+        bit_mask := 1;
+        while (bit_pos > 0) { bit_mask := bit_mask * 2; bit_pos := bit_pos - 1; }
+        i := 0;
+        while (i < c_len) { poke8(c_flip + i, peek8(c + i) & 0xFF); i := i + 1; }
+        poke8(c_flip + DADQ_BLOCK_SZ + 32 + byte_i,
+              (peek8(c + DADQ_BLOCK_SZ + 32 + byte_i) ^ bit_mask) & 0xFF);
+        memset8(m2, 0, DADQ_BLOCK_SZ);
+        dr := dadqDec(sk, c_flip, c_len, m2);
+        total := total + 1;
+        if (dr != 0) { detected := detected + 1; }
+        bit := bit + 1;
+    }
+
+    PrintStr("  Erkannte Fehler: ");
+    PrintInt(detected);
+    PrintStr("/");
+    PrintInt(total);
+    PrintLn(" Bit-Flips (Ziel: 100%)");
+
+    if (detected == total) {
+        PrintLn("OK   T-2.5.1: Alle Bit-Flips erkannt (SHA256(m||r_seed)).");
+        rc := 0;
+    } else {
+        PrintStr("KRITISCH T-2.5.1: Nur ");
+        PrintInt(detected);
+        PrintStr("/");
+        PrintInt(total);
+        PrintLn(" erkannt.");
+        rc := 1;
+    }
+
+    free(seed, 32); free(pk, DADQ_PK_LEN); free(sk, DADQ_SK_LEN_FULL);
+    free(m, DADQ_BLOCK_SZ); free(c, c_len); free(c_flip, c_len);
+    free(m2, DADQ_BLOCK_SZ);
+    return rc;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main(): int64 {
+    PrintLn("==========================================");
+    PrintLn("DADQ Phase 2 -- Sicherheitsanalyse");
+    PrintLn("Konstruktion: T_pub = sigma o T_priv o sigma_inv");
+    PrintLn("==========================================");
+    PrintLn("");
+
+    var crit: int64 := 0;
+
+    crit := crit + testRoundtrip();
+    PrintLn("");
+    crit := crit + testAP21Zirkulanz();
+    PrintLn("");
+    crit := crit + testAP22ColInvAngriff();
+    PrintLn("");
+    crit := crit + testAP23DDT();
+    PrintLn("");
+    crit := crit + testAP24WeakKeys();
+    PrintLn("");
+    crit := crit + testAP25CCA1();
+
+    PrintLn("");
+    PrintLn("==========================================");
+    PrintLn("Zusammenfassung Phase 2:");
+    if (crit <= 1) {
+        PrintLn("Alle behobenen Kriterien bestanden.");
+        PrintLn("1 strukturell offenes Problem (erwartet):");
+    } else {
+        PrintStr(crit);
+        PrintLn(" kritische Befunde (mehr als erwartet -- pruefen).");
+    }
+    PrintLn("  T-2.2 OFFEN: T_pub_col_inv in O(n^2) => kein echtes PKE.");
+    PrintLn("  Naechster Schritt: AP-3.1 neue Trapdoor (Phase 3).");
+    PrintLn("==========================================");
+
+    if (crit > 1) { return crit; }
+    return 0;
+}

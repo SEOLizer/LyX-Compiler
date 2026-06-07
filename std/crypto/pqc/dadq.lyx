@@ -1,34 +1,41 @@
 // std/crypto/pqc/dadq.lyx
 // WP-DADQ-01: Dynamically Dimensioned Alternating Quasigroup Cryptosystem
+// Phase 2 Revision: sigma-Isomorphismus-Konstruktion
 //
-// Design-Grundlage: work/dadq_decisions.md (F-1..F-5)
-// Mathematische Spec: work/dadq_phase0.md
+// Phase-2-Befunde (work/dadq_phase2_results.md):
+//   KRITISCH T-2.1: Zirkulante T => Polynomgrad univariat => BEHOBEN: T_pub = sigma o T_priv o sigma_inv
+//   KRITISCH T-2.2: Isomorphismus-Angriff trivial => T_pub_col_inv in O(n^2) berechenbar (strukturell, Phase 3)
+//   KRITISCH T-2.3.3: DDT r-invariant (Zirkulanz) => BEHOBEN: T_pub nicht-zirkulant
+//   KRITISCH T-2.5.1: Konsistenzcheck tautologisch => BEHOBEN: SHA256(m || r_seed)
 //
-// Algebraische Struktur:
-//   Q = (Z_{256}, *) wobei * durch eine 256x256 Latin-Square-Tabelle T definiert ist.
-//   T[a][b] := pi[(a + b) mod 256]  wobei pi eine geheime Permutation aus dem Seed ist.
-//   Latin-Square: Zeilen und Spalten sind jeweils Shifts von pi => bijektiv.
+// Algebraische Struktur (Phase 2):
+//   T_priv = zirkulante Latin-Square aus seed_T_priv: T_priv[a][b] := pi[(a+b) mod 256]
+//   T_pub  = sigma-Isomorphismus: T_pub[a][b] := sigma[T_priv[sigma_inv[a]][sigma_inv[b]]]
+//   T_pub ist eine Latin-Square (Iso-Abschluss) aber nicht zirkulant => bessere Diffusion
 //
-// Falltuer-Konstruktion (AP-0.2):
-//   pk = seed_T (32 Bytes) -- T_pub on-demand aus Seed rekonstruierbar
-//   sk = (sigma[256], sigma_inv[256], seed_D[32], seed_T[32]) = 576 Bytes
+// Schluessel (Phase 2):
+//   pk = T_pub[256][256]         65536 Bytes (volle Tabelle)
+//   sk = (sigma[256], sigma_inv[256], seed_T_priv[32], key_mac[32]) = 576 Bytes
 //
-// Encryption: m_enc[i] = T[m[i]][r[i]];  c = m_enc || (r XOR SHA256(m_enc))
-// Decryption: r = commit XOR SHA256(m_enc);  m[i] = T_col_inv[r[i]][m_enc[i]]
+// Encryption:
+//   r_seed <- random 32 Bytes
+//   r[i]   = DRBG(r_seed, i)   (expand auf m_len Bytes)
+//   m_enc[i] = T_pub[m[i]][r[i]]   (Table-Lookup in pk)
+//   commit = r_seed XOR SHA256(m_enc)
+//   hash_mr = SHA256(m || r_seed)    (Integritaets-Commitment)
+//   c = m_enc || commit || hash_mr
 //
-// Korrektheitsbeweis:
-//   m_enc[i] = T[m[i]][r[i]]  (Def. Enc)
-//   T_col_inv[r[i]][m_enc[i]] = m[i]  (Latin-Square: Spalte r[i] ist Permutation)
+// Decryption:
+//   r_seed = SHA256(m_enc) XOR commit
+//   r[i]   = DRBG(r_seed, i)
+//   m[i]   = sigma[T_priv_col_inv[sigma_inv[r[i]]][sigma_inv[m_enc[i]]]]
+//   verify: SHA256(m_dec || r_seed) == hash_mr
 //
-// Sicherheitsargument AP-0.4:
-//   Polynomgrad von T ueber GF(2^8) ca. 255 => Groebner-Basis-Angriff unpraktikabel.
+// Hinweis Phase 2: Das System bleibt strukturell symmetrisch, da T_pub_col_inv
+// in O(n^2) aus T_pub berechnet werden kann (Latin-Square-Eigenschaft).
+// Echte Asymmetrie erfordert eine grundlegende Neukonstruktion (AP-3.1).
 //
-// Public API:
-//   dadqKeyGenFull(master_seed, pk, sk)
-//   dadqEnc(pk, m, m_len, c)       -- c muss m_len+32 Bytes gross sein
-//   dadqDec(sk, c, c_len, m): int64  -- 0=OK, -1=ungueltig
-//   dadqEncAlloc(pk, m, m_len): int64
-//   dadqDecAlloc(sk, c, c_len): int64
+// Ciphertext-Overhead: 64 Bytes (commit[32] + hash_mr[32])
 
 unit std.crypto.pqc.dadq;
 
@@ -39,23 +46,20 @@ import std.crypto.rand;
 // --- Groessenkonstanten ---
 
 pub con DADQ_SEED_LEN:    int64 := 32;
-pub con DADQ_PK_LEN:      int64 := 32;
-pub con DADQ_SK_LEN:      int64 := 544;
-pub con DADQ_SK_LEN_FULL: int64 := 576;  // sk[544..575] = seed_T fuer dadqDec
-pub con DADQ_OVERHEAD:    int64 := 32;
-pub con DADQ_TABLE_SZ:    int64 := 65536; // 256x256 Bytes
+pub con DADQ_PK_LEN:      int64 := 65536;  // T_pub[256][256] Bytes
+pub con DADQ_SK_LEN:      int64 := 544;    // sigma(256) + sigma_inv(256) + seed_T_priv(32) + key_mac(32... wait 256+256+32=544)
+pub con DADQ_SK_LEN_FULL: int64 := 576;    // + key_mac[32]
+pub con DADQ_OVERHEAD:    int64 := 64;     // commit(32) + hash_mr(32)
+pub con DADQ_TABLE_SZ:    int64 := 65536;  // 256x256 Bytes
 pub con DADQ_BLOCK_SZ:    int64 := 16;
 
 // --- SHA-256-basierte DRBG ---
-// out_i = SHA256(seed || counter_i), liefert 32 Bytes pro Aufruf.
+// out_i = SHA256(seed || counter_le64), liefert 32 Bytes pro Aufruf.
 
 fn dadqDRBGNext(seed: int64, counter: int64, out: int64) {
     var buf: int64 := alloc(40);
     var i: int64 := 0;
-    while (i < 32) {
-        poke8(buf + i, peek8(seed + i));
-        i := i + 1;
-    }
+    while (i < 32) { poke8(buf + i, peek8(seed + i)); i := i + 1; }
     poke8(buf + 32, counter & 0xFF);
     poke8(buf + 33, (counter >> 8)  & 0xFF);
     poke8(buf + 34, (counter >> 16) & 0xFF);
@@ -69,7 +73,6 @@ fn dadqDRBGNext(seed: int64, counter: int64, out: int64) {
 }
 
 // --- Fisher-Yates-Shuffle via DRBG ---
-// Erzeugt eine zufaellige Permutation von {0..255} in perm[0..255].
 
 fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
     var dseed:   int64 := alloc(33);
@@ -81,19 +84,13 @@ fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
     var j:       int64 := 0;
     var tmp:     int64 := 0;
 
-    while (i < 32) {
-        poke8(dseed + i, peek8(seed + i));
-        i := i + 1;
-    }
+    while (i < 32) { poke8(dseed + i, peek8(seed + i)); i := i + 1; }
     poke8(dseed + 32, domain_byte & 0xFF);
     SHA256(dseed, 33, dseed_h);
     free(dseed, 33);
 
     i := 0;
-    while (i < 256) {
-        poke8(perm + i, i & 0xFF);
-        i := i + 1;
-    }
+    while (i < 256) { poke8(perm + i, i & 0xFF); i := i + 1; }
 
     chunk := 0;
     while (chunk < 8) {
@@ -101,7 +98,6 @@ fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
         chunk := chunk + 1;
     }
 
-    // Fisher-Yates: i von 255 downto 1
     i := 255;
     while (i >= 1) {
         r_byte := peek8(rng_buf + (255 - i)) & 0xFF;
@@ -111,14 +107,12 @@ fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
         poke8(perm + j, tmp & 0xFF);
         i := i - 1;
     }
-
     free(rng_buf, 256);
     free(dseed_h, 32);
 }
 
-// --- Latin-Square-Tabelle generieren ---
-// AP-0.1: T[a][b] := pi[(a + b) mod 256]
-// Latin-Square: Zeile a = shift von pi um a => bijektiv. Analog Spalten.
+// --- Zirkulante Latin-Square (intern fuer T_priv) ---
+// T[a][b] := pi[(a + b) mod 256]
 
 fn dadqGenTable(seed: int64, domain_byte: int64, table: int64) {
     var perm: int64 := alloc(256);
@@ -126,9 +120,7 @@ fn dadqGenTable(seed: int64, domain_byte: int64, table: int64) {
     var b:    int64 := 0;
     var sum:  int64 := 0;
     var idx:  int64 := 0;
-
     dadqGenPerm(seed, domain_byte, perm);
-
     a := 0;
     while (a < 256) {
         b := 0;
@@ -140,19 +132,43 @@ fn dadqGenTable(seed: int64, domain_byte: int64, table: int64) {
         }
         a := a + 1;
     }
-
     free(perm, 256);
+}
+
+// --- sigma-Isomorphismus: T_pub = sigma o T_priv o sigma_inv ---
+// T_pub[a][b] = sigma[T_priv[sigma_inv[a]][sigma_inv[b]]]
+// Nicht-zirkulant, da sigma eine echte Byte-Permutation ist.
+
+fn dadqGenTableSigmaIso(seed_T_priv: int64, sigma: int64, sigma_inv: int64, T_pub: int64) {
+    var T_priv: int64 := alloc(DADQ_TABLE_SZ);
+    var a:      int64 := 0;
+    var b:      int64 := 0;
+    var sa:     int64 := 0;
+    var sb:     int64 := 0;
+    var v:      int64 := 0;
+    dadqGenTable(seed_T_priv, 0xAB, T_priv);
+    a := 0;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            sa := peek8(sigma_inv + a) & 0xFF;
+            sb := peek8(sigma_inv + b) & 0xFF;
+            v  := peek8(T_priv + sa * 256 + sb) & 0xFF;
+            poke8(T_pub + a * 256 + b, peek8(sigma + v) & 0xFF);
+            b := b + 1;
+        }
+        a := a + 1;
+    }
+    free(T_priv, DADQ_TABLE_SZ);
 }
 
 // --- Spalteninverse der Tabelle ---
 // col_inv[b][v] = a  sodass  T[a][b] = v
-// Existenz und Eindeutigkeit: Latin-Square-Eigenschaft.
 
 fn dadqBuildColInv(table: int64, col_inv: int64) {
     var b: int64 := 0;
     var a: int64 := 0;
     var v: int64 := 0;
-
     b := 0;
     while (b < 256) {
         a := 0;
@@ -165,46 +181,14 @@ fn dadqBuildColInv(table: int64, col_inv: int64) {
     }
 }
 
-// --- Block-Verschluesselung ---
-// m_enc[i] := T_pub[m[i]][r[i]]   fuer i = 0..len-1
-
-fn dadqBlockEnc(table: int64, m: int64, r: int64, m_enc: int64, len: int64) {
-    var i:  int64 := 0;
-    var mi: int64 := 0;
-    var ri: int64 := 0;
-
-    i := 0;
-    while (i < len) {
-        mi := peek8(m + i) & 0xFF;
-        ri := peek8(r + i) & 0xFF;
-        poke8(m_enc + i, peek8(table + mi * 256 + ri) & 0xFF);
-        i := i + 1;
-    }
-}
-
-// --- Block-Entschluesselung via Spalteninverse ---
-// m[i] := T_col_inv[r[i]][m_enc[i]]
-// Korrektheit: m_enc[i] = T[m[i]][r[i]] => T_col_inv[r[i]][m_enc[i]] = m[i]
-
-fn dadqBlockDec(col_inv: int64, m_enc: int64, r: int64, m: int64, len: int64) {
-    var i:   int64 := 0;
-    var ri:  int64 := 0;
-    var enc: int64 := 0;
-
-    i := 0;
-    while (i < len) {
-        ri  := peek8(r + i) & 0xFF;
-        enc := peek8(m_enc + i) & 0xFF;
-        poke8(m + i, peek8(col_inv + ri * 256 + enc) & 0xFF);
-        i := i + 1;
-    }
-}
-
-// --- KeyGen intern ---
-// pk[0..31]    = seed_T
-// sk[0..255]   = sigma
-// sk[256..511] = sigma_inv
-// sk[512..543] = seed_D
+// --- Schluessel-Generierung ---
+// SK-Layout:
+//   sk[0..255]   = sigma
+//   sk[256..511] = sigma_inv
+//   sk[512..543] = seed_T_priv
+//   sk[544..575] = key_mac (reserviert fuer Phase 4 FO-Transform)
+//
+// PK: T_pub = sigma o T_priv o sigma_inv (65536 Bytes)
 
 pub fn dadqKeyGen(master_seed: int64, pk: int64, sk: int64) {
     var buf:        int64 := alloc(33);
@@ -216,17 +200,18 @@ pub fn dadqKeyGen(master_seed: int64, pk: int64, sk: int64) {
     while (i < 32) { poke8(buf + i, peek8(master_seed + i)); i := i + 1; }
 
     poke8(buf + 32, 0x01);
-    SHA256(buf, 33, pk);
+    SHA256(buf, 33, seed_sigma);     // seed_sigma
 
     poke8(buf + 32, 0x02);
-    SHA256(buf, 33, seed_sigma);
+    SHA256(buf, 33, sk + 512);       // sk[512..543] = seed_T_priv
 
     poke8(buf + 32, 0x03);
-    SHA256(buf, 33, sk + 512);
+    SHA256(buf, 33, sk + 544);       // sk[544..575] = key_mac
 
     free(buf, 33);
 
-    dadqGenPerm(seed_sigma, 0x00, sk);
+    dadqGenPerm(seed_sigma, 0x00, sk);  // sk[0..255] = sigma
+    free(seed_sigma, 32);
 
     i := 0;
     while (i < 256) {
@@ -235,110 +220,193 @@ pub fn dadqKeyGen(master_seed: int64, pk: int64, sk: int64) {
         i := i + 1;
     }
 
-    free(seed_sigma, 32);
+    // pk = T_pub = sigma o T_priv o sigma_inv
+    dadqGenTableSigmaIso(sk + 512, sk, sk + 256, pk);
 }
 
-// --- KeyGen Full: speichert seed_T in sk[544..575] fuer dadqDec ohne pk ---
+// dadqKeyGenFull ist jetzt identisch mit dadqKeyGen (kein seed_T-Copy mehr noetig)
+// Behalten fuer API-Kompatibilitaet.
 
 pub fn dadqKeyGenFull(master_seed: int64, pk: int64, sk: int64) {
-    var i: int64 := 0;
     dadqKeyGen(master_seed, pk, sk);
-    i := 0;
-    while (i < 32) {
-        poke8(sk + 544 + i, peek8(pk + i));
-        i := i + 1;
-    }
 }
 
 // --- Enc ---
-// pk:    Zeiger auf DADQ_PK_LEN Bytes (seed_T)
+// pk:    Zeiger auf DADQ_PK_LEN (65536) Bytes = T_pub
 // m:     Zeiger auf m_len Bytes Klartext
-// c:     Zeiger auf m_len + DADQ_OVERHEAD Bytes (Ausgabe)
-// Layout: c[0..m_len-1] = m_enc,  c[m_len..m_len+31] = r XOR SHA256(m_enc)
+// c:     Zeiger auf m_len + DADQ_OVERHEAD (64) Bytes (Ausgabe)
+// Layout: c[0..m_len-1]    = m_enc
+//         c[m_len..m_len+31]   = commit = r_seed XOR SHA256(m_enc)
+//         c[m_len+32..m_len+63] = hash_mr = SHA256(m || r_seed)
 
 pub fn dadqEnc(pk: int64, m: int64, m_len: int64, c: int64) {
-    var table:  int64 := alloc(DADQ_TABLE_SZ);
-    var r:      int64 := alloc(m_len);
-    var h_enc:  int64 := alloc(32);
-    var j:      int64 := 0;
-    var r_byte: int64 := 0;
-
-    dadqGenTable(pk, 0xAB, table);
-    RandBytesExact(r, m_len);
-    dadqBlockEnc(table, m, r, c, m_len);
-    SHA256(c, m_len, h_enc);
-
-    j := 0;
-    while (j < 32) {
-        r_byte := 0;
-        if (j < m_len) { r_byte := peek8(r + j) & 0xFF; }
-        poke8(c + m_len + j, (r_byte ^ (peek8(h_enc + j) & 0xFF)) & 0xFF);
-        j := j + 1;
-    }
-
-    free(h_enc, 32);
-    free(r, m_len);
-    free(table, DADQ_TABLE_SZ);
-}
-
-// --- Dec ---
-// sk:    Zeiger auf DADQ_SK_LEN_FULL (576) Bytes; sk[544..575] = seed_T
-// c:     Zeiger auf c_len Bytes Ciphertext
-// m:     Zeiger auf c_len - DADQ_OVERHEAD Bytes (Ausgabe)
-// Rueckgabe: 0 = Erfolg, -1 = ungueltig
-
-pub fn dadqDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
-    var m_len:    int64 := c_len - DADQ_OVERHEAD;
-    var table:    int64 := 0;
-    var col_inv:  int64 := 0;
-    var h_enc:    int64 := 0;
-    var r:        int64 := 0;
-    var c_check:  int64 := 0;
-    var seed_T:   int64 := 0;
-    var ok:       int64 := 1;
+    var r_seed:   int64 := alloc(32);
+    var r:        int64 := alloc(m_len);
+    var h_enc:    int64 := alloc(32);
+    var h_mr:     int64 := alloc(32);
+    var hash_in:  int64 := alloc(m_len + 32);
+    var r_chunk:  int64 := alloc(32);
     var i:        int64 := 0;
     var j:        int64 := 0;
-    var h_byte:   int64 := 0;
-    var commit_b: int64 := 0;
+    var chunk:    int64 := 0;
+    var mi:       int64 := 0;
+    var ri:       int64 := 0;
 
-    if (m_len <= 0) { return (0 - 1); }
-
-    seed_T  := sk + 544;
-    table   := alloc(DADQ_TABLE_SZ);
-    col_inv := alloc(DADQ_TABLE_SZ);
-    h_enc   := alloc(32);
-    r       := alloc(m_len);
-    c_check := alloc(m_len);
-
-    dadqGenTable(seed_T, 0xAB, table);
-    dadqBuildColInv(table, col_inv);
-    SHA256(c, m_len, h_enc);
-
-    j := 0;
-    while (j < m_len) {
-        h_byte   := 0;
-        commit_b := 0;
-        if (j < 32) { h_byte   := peek8(h_enc + j) & 0xFF; }
-        if (j < 32) { commit_b := peek8(c + m_len + j) & 0xFF; }
-        poke8(r + j, (h_byte ^ commit_b) & 0xFF);
-        j := j + 1;
+    // Zufaelliger r_seed und DRBG-Expansion auf m_len Bytes
+    RandBytesExact(r_seed, 32);
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i := i + 1;
+        }
+        chunk := chunk + 1;
     }
 
-    dadqBlockDec(col_inv, c, r, m, m_len);
-
-    dadqBlockEnc(table, m, r, c_check, m_len);
-    ok := 1;
+    // m_enc[i] = T_pub[m[i]][r[i]]
     i := 0;
     while (i < m_len) {
-        if (peek8(c_check + i) != peek8(c + i)) { ok := 0; }
+        mi := peek8(m + i) & 0xFF;
+        ri := peek8(r + i) & 0xFF;
+        poke8(c + i, peek8(pk + mi * 256 + ri) & 0xFF);
         i := i + 1;
     }
 
-    free(c_check, m_len);
-    free(r, m_len);
+    // commit = r_seed XOR SHA256(m_enc)
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(c + m_len + j, (peek8(r_seed + j) ^ peek8(h_enc + j)) & 0xFF);
+        j := j + 1;
+    }
+
+    // hash_mr = SHA256(m || r_seed)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr);
+    j := 0;
+    while (j < 32) { poke8(c + m_len + 32 + j, peek8(h_mr + j) & 0xFF); j := j + 1; }
+
+    free(r_chunk, 32);
+    free(hash_in, m_len + 32);
+    free(h_mr, 32);
     free(h_enc, 32);
-    free(col_inv, DADQ_TABLE_SZ);
-    free(table, DADQ_TABLE_SZ);
+    free(r, m_len);
+    free(r_seed, 32);
+}
+
+// --- Dec ---
+// sk:    Zeiger auf DADQ_SK_LEN_FULL (576) Bytes
+// c:     Zeiger auf c_len Bytes Ciphertext
+// m:     Zeiger auf c_len - DADQ_OVERHEAD Bytes (Ausgabe)
+// Rueckgabe: 0 = Erfolg, -1 = ungueltig (Manipulation erkannt)
+
+pub fn dadqDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
+    var m_len:       int64 := c_len - DADQ_OVERHEAD;
+    var sigma:       int64 := 0;
+    var sigma_inv:   int64 := 0;
+    var seed_T_priv: int64 := 0;
+    var T_priv:      int64 := 0;
+    var T_col_inv:   int64 := 0;
+    var r_seed:      int64 := 0;
+    var r:           int64 := 0;
+    var h_enc:       int64 := 0;
+    var h_mr_check:  int64 := 0;
+    var hash_in:     int64 := 0;
+    var r_chunk:     int64 := 0;
+    var ok:          int64 := 0;
+    var i:           int64 := 0;
+    var j:           int64 := 0;
+    var chunk:       int64 := 0;
+    var ri:          int64 := 0;
+    var ci:          int64 := 0;
+    var sr:          int64 := 0;
+    var sc:          int64 := 0;
+    var sm:          int64 := 0;
+
+    if (m_len <= 0) { return (0 - 1); }
+
+    sigma       := sk;
+    sigma_inv   := sk + 256;
+    seed_T_priv := sk + 512;
+
+    T_priv     := alloc(DADQ_TABLE_SZ);
+    T_col_inv  := alloc(DADQ_TABLE_SZ);
+    r_seed     := alloc(32);
+    r          := alloc(m_len);
+    h_enc      := alloc(32);
+    h_mr_check := alloc(32);
+    hash_in    := alloc(m_len + 32);
+    r_chunk    := alloc(32);
+
+    // T_priv (zirkulant) und seine Spalteninverse
+    dadqGenTable(seed_T_priv, 0xAB, T_priv);
+    dadqBuildColInv(T_priv, T_col_inv);
+
+    // r_seed aus commit wiederherstellen: r_seed = SHA256(m_enc) XOR commit
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(r_seed + j, (peek8(h_enc + j) ^ peek8(c + m_len + j)) & 0xFF);
+        j := j + 1;
+    }
+
+    // r auf m_len Bytes expandieren
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i := i + 1;
+        }
+        chunk := chunk + 1;
+    }
+
+    // Entschluesseln via sigma-Isomorphismus:
+    // m[i] = sigma[T_priv_col_inv[sigma_inv[r[i]]][sigma_inv[m_enc[i]]]]
+    i := 0;
+    while (i < m_len) {
+        ri := peek8(r + i) & 0xFF;
+        ci := peek8(c + i) & 0xFF;
+        sr := peek8(sigma_inv + ri) & 0xFF;
+        sc := peek8(sigma_inv + ci) & 0xFF;
+        sm := peek8(T_col_inv + sr * 256 + sc) & 0xFF;
+        poke8(m + i, peek8(sigma + sm) & 0xFF);
+        i := i + 1;
+    }
+
+    // Integritaetscheck: SHA256(m_dec || r_seed) == hash_mr
+    // Nicht-tautologisch: Manipulation von m_enc aendert r_seed (via SHA256) und damit m_dec.
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr_check);
+
+    ok := 1;
+    j := 0;
+    while (j < 32) {
+        if (peek8(h_mr_check + j) != peek8(c + m_len + 32 + j)) { ok := 0; }
+        j := j + 1;
+    }
+
+    free(r_chunk, 32);
+    free(hash_in, m_len + 32);
+    free(h_mr_check, 32);
+    free(h_enc, 32);
+    free(r, m_len);
+    free(r_seed, 32);
+    free(T_col_inv, DADQ_TABLE_SZ);
+    free(T_priv, DADQ_TABLE_SZ);
 
     if (ok == 0) { return (0 - 1); }
     return 0;
@@ -360,10 +428,7 @@ pub fn dadqDecAlloc(sk: int64, c: int64, c_len: int64): int64 {
     if (m_len <= 0) { return 0; }
     m  := alloc(m_len);
     rc := dadqDec(sk, c, c_len, m);
-    if (rc != 0) {
-        free(m, m_len);
-        return 0;
-    }
+    if (rc != 0) { free(m, m_len); return 0; }
     return m;
 }
 
