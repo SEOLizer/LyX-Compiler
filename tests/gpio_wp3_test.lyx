@@ -1,0 +1,205 @@
+// tests/gpio_wp3_test.lyx
+// WP-3: ioctl-Interface — Chip-Info, Line-Request, Set/Get-Values
+//
+// Abnahmekriterien (x86-64 Testmaschine, kein GPIO-Hardware):
+// AC-WP3.1.1: Struct-Größen-Konstanten stimmen mit C sizeof() überein
+// AC-WP3.1.2: ioctl-Codes stimmen mit Linux-Header überein
+// AC-WP3.1.3: gpioZeroMem / Alloc/Free funktionieren ohne Crash
+// AC-WP3.2.2: GpioGetChipInfo auf nicht-existierendem Pfad → 0
+// AC-WP3.3.1: GpioRequestLines mit num_lines > 64 → -1 (kein Kernel-Kontakt)
+// AC-WP3.3.2: GpioRequestLines auf nicht-existierendem Pfad → -1
+// AC-WP3.3.5: GpioReleaseLine(fd=-1) → kein Crash
+//
+// Auf RPi4-Hardware zusätzlich manuell zu prüfen:
+//   AC-WP3.2.1: GetChipInfo("/dev/gpiochip4") → lines == 54
+//   AC-WP3.3.3: RequestLines + SetLineValues setzt physische Pins
+//   AC-WP3.3.4: GetLineValues liest korrekte Pegel
+
+unit tests.gpio_wp3_test;
+
+import std.hardware.gpio_ioctl;
+import std.alloc;
+
+// ============================================================
+// AC-WP3.1.1: Struct-Größen und Offsets
+// ============================================================
+fn testStructSizes(): int64 {
+  var failed: int64 := 0;
+
+  if (GPIO_CHIP_INFO_SIZE   != 68)  { PrintLn("FAIL: GPIO_CHIP_INFO_SIZE != 68");   failed:=failed+1; }
+  if (GPIO_LINE_VALUES_SIZE != 16)  { PrintLn("FAIL: GPIO_LINE_VALUES_SIZE != 16"); failed:=failed+1; }
+  if (GPIO_LINE_ATTR_SIZE   != 16)  { PrintLn("FAIL: GPIO_LINE_ATTR_SIZE != 16");   failed:=failed+1; }
+  if (GPIO_LINE_CFG_ATTR_SIZE != 24){ PrintLn("FAIL: GPIO_LINE_CFG_ATTR_SIZE != 24"); failed:=failed+1; }
+  if (GPIO_LINE_CONFIG_SIZE != 272) { PrintLn("FAIL: GPIO_LINE_CONFIG_SIZE != 272"); failed:=failed+1; }
+  if (GPIO_LINE_REQUEST_SIZE != 592){ PrintLn("FAIL: GPIO_LINE_REQUEST_SIZE != 592"); failed:=failed+1; }
+
+  // Offsets in gpio_v2_line_request
+  if (GPIO_LINE_REQUEST_OFFSETS   != 0)   { PrintLn("FAIL: REQ_OFFSETS != 0");   failed:=failed+1; }
+  if (GPIO_LINE_REQUEST_CONSUMER  != 256) { PrintLn("FAIL: REQ_CONSUMER != 256"); failed:=failed+1; }
+  if (GPIO_LINE_REQUEST_CONFIG    != 288) { PrintLn("FAIL: REQ_CONFIG != 288");   failed:=failed+1; }
+  if (GPIO_LINE_REQUEST_NUM_LINES != 560) { PrintLn("FAIL: REQ_NUM_LINES != 560"); failed:=failed+1; }
+  if (GPIO_LINE_REQUEST_FD        != 588) { PrintLn("FAIL: REQ_FD != 588");       failed:=failed+1; }
+
+  // Offsets in gpiochip_info
+  if (GPIO_CHIP_INFO_NAME  != 0)  { PrintLn("FAIL: CHIP_NAME != 0");  failed:=failed+1; }
+  if (GPIO_CHIP_INFO_LABEL != 32) { PrintLn("FAIL: CHIP_LABEL != 32"); failed:=failed+1; }
+  if (GPIO_CHIP_INFO_LINES != 64) { PrintLn("FAIL: CHIP_LINES != 64"); failed:=failed+1; }
+
+  if (failed == 0) { PrintLn("OK: Struct sizes and offsets match C sizeof() (WP-3.1.1)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP3.1.2: ioctl-Codes
+// ============================================================
+fn testIoctlCodes(): int64 {
+  var failed: int64 := 0;
+
+  if (GPIO_GET_CHIPINFO_IOCTL       != 0x8044B401) {
+    PrintLn("FAIL: GPIO_GET_CHIPINFO_IOCTL wrong");   failed:=failed+1;
+  }
+  if (GPIO_V2_GET_LINE_IOCTL        != 0xC250B407) {
+    PrintLn("FAIL: GPIO_V2_GET_LINE_IOCTL wrong");    failed:=failed+1;
+  }
+  if (GPIO_V2_LINE_GET_VALUES_IOCTL != 0xC010B40E) {
+    PrintLn("FAIL: GPIO_V2_LINE_GET_VALUES_IOCTL wrong"); failed:=failed+1;
+  }
+  if (GPIO_V2_LINE_SET_VALUES_IOCTL != 0xC010B40F) {
+    PrintLn("FAIL: GPIO_V2_LINE_SET_VALUES_IOCTL wrong"); failed:=failed+1;
+  }
+
+  if (failed == 0) { PrintLn("OK: ioctl codes match Linux header (WP-3.1.2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP3.1.3: Alloc/Free von Structs — kein Crash
+// ============================================================
+fn testAllocFree(): int64 {
+  // gpiochip_info alloc/free
+  var info: int64 := alloc(GPIO_CHIP_INFO_SIZE);
+  if (info == 0) { PrintLn("FAIL: alloc GPIO_CHIP_INFO"); return 1; }
+  poke32(info + GPIO_CHIP_INFO_LINES, 54);
+  if (GpioChipInfoLines(info) != 54) {
+    PrintLn("FAIL: GpioChipInfoLines accessor");
+    GpioChipInfoFree(info);
+    return 1;
+  }
+  GpioChipInfoFree(info);
+
+  // gpio_v2_line_values alloc/free
+  var v: int64 := alloc(GPIO_LINE_VALUES_SIZE);
+  if (v == 0) { PrintLn("FAIL: alloc GPIO_LINE_VALUES"); return 1; }
+  poke64(v + GPIO_LINE_VALUES_BITS, 0xDEADBEEF);
+  poke64(v + GPIO_LINE_VALUES_MASK, 0x0F0F0F0F);
+  if ((peek64(v + GPIO_LINE_VALUES_BITS) & 0xFFFFFFFF) != 0xDEADBEEF) {
+    PrintLn("FAIL: GPIO_LINE_VALUES_BITS read-back");
+    free(v, GPIO_LINE_VALUES_SIZE);
+    return 1;
+  }
+  free(v, GPIO_LINE_VALUES_SIZE);
+
+  // gpio_v2_line_request alloc/free (592 Bytes)
+  var req: int64 := alloc(GPIO_LINE_REQUEST_SIZE);
+  if (req == 0) { PrintLn("FAIL: alloc GPIO_LINE_REQUEST"); return 1; }
+  poke32(req + GPIO_LINE_REQUEST_NUM_LINES, 2);
+  if ((peek32(req + GPIO_LINE_REQUEST_NUM_LINES) & 0xFFFFFFFF) != 2) {
+    PrintLn("FAIL: GPIO_LINE_REQUEST_NUM_LINES read-back");
+    free(req, GPIO_LINE_REQUEST_SIZE);
+    return 1;
+  }
+  free(req, GPIO_LINE_REQUEST_SIZE);
+
+  PrintLn("OK: Alloc/Free of all struct sizes without crash (WP-3.1.3)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP3.2.2: GetChipInfo auf nicht-existierendem Pfad → 0
+// ============================================================
+fn testGetChipInfoNotFound(): int64 {
+  var info: int64 := GpioGetChipInfo("/dev/gpiochip_nonexistent"c);
+  if (info != 0) {
+    PrintLn("FAIL: GpioGetChipInfo should return 0 for nonexistent path");
+    GpioChipInfoFree(info);
+    return 1;
+  }
+  PrintLn("OK: GpioGetChipInfo returns 0 for nonexistent path (WP-3.2.2)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP3.3.1: RequestLines mit num_lines > 64 → -1
+// ============================================================
+fn testRequestLinesTooMany(): int64 {
+  var pins: int64 := alloc(68 * 4);
+  var i: int64 := 0;
+  while (i < 68) { poke32(pins + i * 4, i); i := i + 1; }
+
+  var r: int64 := GpioRequestLines("/dev/gpiochip0"c, pins, 65,
+                                    GPIO_V2_LINE_FLAG_OUTPUT, "test"c);
+  free(pins, 68 * 4);
+
+  if (r != -1) {
+    PrintLn("FAIL: RequestLines with 65 pins should return -1");
+    return 1;
+  }
+  PrintLn("OK: GpioRequestLines(num_lines=65) returns -1 (WP-3.3.1)");
+  return 0;
+}
+
+// AC-WP3.3.1: num_lines = 0 → -1
+fn testRequestLinesZero(): int64 {
+  var pins: int64 := alloc(4);
+  poke32(pins, 18);
+  var r: int64 := GpioRequestLines("/dev/gpiochip0"c, pins, 0,
+                                    GPIO_V2_LINE_FLAG_OUTPUT, "test"c);
+  free(pins, 4);
+  if (r != -1) { PrintLn("FAIL: RequestLines with 0 pins should return -1"); return 1; }
+  PrintLn("OK: GpioRequestLines(num_lines=0) returns -1 (WP-3.3.1)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP3.3.2: RequestLines auf nicht-existierendem Pfad → -1
+// ============================================================
+fn testRequestLinesNotFound(): int64 {
+  var pins: int64 := alloc(4);
+  poke32(pins, 18);
+  var r: int64 := GpioRequestLines("/dev/gpiochip_nonexistent"c, pins, 1,
+                                    GPIO_V2_LINE_FLAG_OUTPUT, "test"c);
+  free(pins, 4);
+  if (r != -1) {
+    PrintLn("FAIL: RequestLines on nonexistent path should return -1");
+    return 1;
+  }
+  PrintLn("OK: GpioRequestLines returns -1 for nonexistent chip (WP-3.3.2)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP3.3.5: GpioReleaseLine mit ungültigem Fd — kein Crash
+// ============================================================
+fn testReleaseInvalidFd(): int64 {
+  GpioReleaseLine(-1);   // close(-1) → EBADF, kein Crash
+  GpioReleaseLine(9999); // close(9999) → EBADF, kein Crash
+  PrintLn("OK: GpioReleaseLine with invalid fds — no crash (WP-3.3.5)");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testStructSizes();
+  failed := failed + testIoctlCodes();
+  failed := failed + testAllocFree();
+  failed := failed + testGetChipInfoNotFound();
+  failed := failed + testRequestLinesTooMany();
+  failed := failed + testRequestLinesZero();
+  failed := failed + testRequestLinesNotFound();
+  failed := failed + testReleaseInvalidFd();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  PrintLn("NOTE: AC-WP3.2.1, 3.3.3, 3.3.4 require RPi4 hardware — manual test");
+  return 0;
+}
