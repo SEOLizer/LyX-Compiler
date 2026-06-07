@@ -1,0 +1,110 @@
+// std/crypto/pqc/hybrid.lyx
+// WP-PQC-09: Hybrid-KEM — X25519 + ML-KEM-768 (wie Signal/Google/Apple PQ3)
+//
+// Kombiniert klassische (X25519) und post-quantenkryptographische (ML-KEM-768)
+// Schlüsseleinkapselung. Schützt auch wenn ein Verfahren kompromittiert wird.
+//
+// Schlüsselgrößen:
+//   PK: 32 (X25519) + 1184 (ML-KEM-768) = 1216 Bytes
+//   SK: 32 (X25519) + 2400 (ML-KEM-768) = 2432 Bytes
+//   CT: 32 (X25519 ephemeral PK) + 1088 (ML-KEM-768 CT) = 1120 Bytes
+//   SS: 32 Bytes
+//
+// KDF: SHAKE-256(ss_x25519 || ss_mlkem || ct_x25519 || ct_mlkem, 32 Bytes)
+// (Kombiniert beide Shared Secrets + Ciphertexts für Forward Secrecy)
+//
+// API nimmt explizite Seeds/Randomness für deterministische Tests.
+// seed: 64 Bytes = seed_x25519(32) || seed_mlkem(64)
+// rand: 64 Bytes = rand_x25519(32) || rand_mlkem(32)
+
+unit std.crypto.pqc.hybrid;
+
+import std.crypto.x25519;
+import std.crypto.pqc.mlkem;
+import std.crypto.keccak;
+import std.alloc;
+
+pub con HYBRID_PK:  int64 := 1216;   // 32 + 1184
+pub con HYBRID_SK:  int64 := 2432;   // 32 + 2400
+pub con HYBRID_CT:  int64 := 1120;   // 32 + 1088
+pub con HYBRID_SS:  int64 := 32;
+
+// ─── KDF: SHAKE-256(ss_x || ss_k || ct_x || ct_k, 32 Bytes) ─────────────────
+
+fn hybrid_kdf(ss_x: int64, ss_k: int64, ct_x: int64, ct_k: int64, out: int64) {
+  // Konkatenation: 32 + 32 + 32 + 1088 = 1184 Bytes
+  var buf: int64 := alloc(1184);
+  var i: int64 := 0;
+  while (i < 32)   { poke8(buf+i,    peek8(ss_x+i)); i := i+1; }
+  i := 0;
+  while (i < 32)   { poke8(buf+32+i, peek8(ss_k+i)); i := i+1; }
+  i := 0;
+  while (i < 32)   { poke8(buf+64+i, peek8(ct_x+i)); i := i+1; }
+  i := 0;
+  while (i < 1088) { poke8(buf+96+i, peek8(ct_k+i)); i := i+1; }
+  SHAKE256(buf, 1184, out, 32);
+  free(buf, 1184);
+}
+
+// ─── HybridKEMKeyGen ─────────────────────────────────────────────────────────
+// seed: 64 Bytes (seed_x25519[0..31] || seed_mlkem[32..95])
+// pk:   HYBRID_PK Bytes (pk_x25519 || pk_mlkem)
+// sk:   HYBRID_SK Bytes (sk_x25519 || sk_mlkem)
+pub fn HybridKEMKeyGen(seed: int64, pk: int64, sk: int64) {
+  // X25519 KeyGen (32-Byte-Seed → 32-Byte-PK, 32-Byte-SK)
+  X25519KeyGen(seed, pk, sk);
+
+  // ML-KEM-768 KeyGen (32+32 = 64-Byte-Seed → PK, SK)
+  MLKEMKeyGen(seed + 32, 3, pk + 32, sk + 32);
+}
+
+// ─── HybridKEMEncapsulate ────────────────────────────────────────────────────
+// pk:   HYBRID_PK Bytes
+// rand: 64 Bytes (rand_x25519[0..31] || rand_mlkem[32..63])
+// ct:   HYBRID_CT Bytes (ct_x25519 || ct_mlkem)
+// ss:   32 Bytes
+pub fn HybridKEMEncapsulate(pk: int64, rand: int64, ct: int64, ss: int64) {
+  var ss_x: int64 := alloc(32);
+  var ss_k: int64 := alloc(32);
+
+  // X25519 Encapsulate:
+  //   ephemeral_sk = rand[0..31] (clamped inside X25519)
+  //   ct_x = X25519(ephemeral_sk, base_point=9)
+  //   ss_x = X25519(ephemeral_sk, pk_x25519)
+  var base: int64 := alloc(32);
+  var i: int64 := 0;
+  while (i < 32) { poke8(base+i, 0); i := i+1; }
+  poke8(base, 9);
+
+  X25519(ct, rand, base);            // ct_x = X25519(rand, 9)
+  X25519(ss_x, rand, pk);            // ss_x = X25519(rand, pk_x25519)
+  free(base, 32);
+
+  // ML-KEM-768 Encapsulate (k=3)
+  MLKEMEncapsulate(pk + 32, 3, rand + 32, ct + 32, ss_k);
+
+  // Kombiniere via KDF
+  hybrid_kdf(ss_x, ss_k, ct, ct + 32, ss);
+
+  free(ss_x, 32); free(ss_k, 32);
+}
+
+// ─── HybridKEMDecapsulate ────────────────────────────────────────────────────
+// sk:   HYBRID_SK Bytes
+// ct:   HYBRID_CT Bytes
+// ss:   32 Bytes
+pub fn HybridKEMDecapsulate(sk: int64, ct: int64, ss: int64) {
+  var ss_x: int64 := alloc(32);
+  var ss_k: int64 := alloc(32);
+
+  // X25519 Decapsulate: ss_x = X25519(sk_x25519, ct_x25519)
+  X25519SharedSecret(sk, ct, ss_x);
+
+  // ML-KEM-768 Decapsulate (k=3)
+  MLKEMDecapsulate(sk + 32, 3, ct + 32, ss_k);
+
+  // Kombiniere via KDF
+  hybrid_kdf(ss_x, ss_k, ct, ct + 32, ss);
+
+  free(ss_x, 32); free(ss_k, 32);
+}
