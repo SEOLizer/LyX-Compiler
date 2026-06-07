@@ -1,0 +1,345 @@
+// std/crypto/ntt.lyx
+// WP-PQC-05: NTT / Polynomring-Arithmetik
+//
+// Implementiert Number Theoretic Transform für:
+//   ML-KEM  (FIPS 203): R_q = Z_3329[X]/(X^256+1), ζ=17
+//   ML-DSA  (FIPS 204): R_q = Z_8380417[X]/(X^256+1), ζ=1753
+//
+// NTT-Variante: Cooley-Tukey vorwärts (FIPS 203 Alg. 9)
+//               Gentleman-Sande invers  (FIPS 203 Alg. 10)
+// Zeta-Tabelle: ζ^BitRev7(k) mod q, k=1..127
+//
+// Polynom: 256 × int64, jeder Wert ∈ [0, q).
+// Speicher: 256 × 8 = 2048 Bytes (POLY_BYTES).
+
+unit std.crypto.ntt;
+
+import std.alloc;
+import std.crypto.keccak;
+
+pub con POLY_BYTES: int64 := 2048;
+pub con KYBER_Q:   int64 := 3329;
+pub con DILITH_Q:  int64 := 8380417;
+
+pub fn NTTPolyNew(): int64  { return alloc(2048); }
+pub fn NTTPolyFree(p: int64) { free(p, 2048); }
+
+// ─── interne Hilfsfunktionen ─────────────────────────────────────────────────
+
+// Modulare Reduktion: x mod q (für positive x)
+fn kmod(x: int64, q: int64): int64 {
+  return x - (x/q)*q;
+}
+
+// 7-Bit-Bit-Umkehrung: brv7(k) für k∈[0..127]
+fn brv7(x: int64): int64 {
+  var r: int64 := 0;
+  var v: int64 := x;
+  var i: int64 := 0;
+  while (i < 7) { r := (r << 1) | (v & 1); v := v >> 1; i := i+1; }
+  return r;
+}
+
+// ─── Kyber-Zeta-Tabelle ──────────────────────────────────────────────────────
+// zt[k*8] = 17^brv7(k) mod 3329, k=1..127  (zt[0] unbenutzt)
+fn kyber_init_zetas(zt: int64) {
+  var pows: int64 := alloc(1024);
+  var z: int64 := 1;
+  var i: int64 := 0;
+  while (i < 128) { poke64(pows+i*8, z); z := kmod(z*17, 3329); i := i+1; }
+  i := 1;
+  while (i < 128) { poke64(zt+i*8, peek64(pows+brv7(i)*8)); i := i+1; }
+  free(pows, 1024);
+}
+
+// 8-Bit-Bit-Umkehrung für Dilithium (256-Punkt-NTT, k=0..255)
+fn brv8(x: int64): int64 {
+  var r: int64 := 0;
+  var v: int64 := x;
+  var i: int64 := 0;
+  while (i < 8) { r := (r << 1) | (v & 1); v := v >> 1; i := i+1; }
+  return r;
+}
+
+// ─── Dilithium-Zeta-Tabelle ──────────────────────────────────────────────────
+// zt[k*8] = 1753^brv8(k) mod 8380417, k=1..255  (zt[0] unbenutzt, 2048B)
+fn dilith_init_zetas(zt: int64) {
+  var pows: int64 := alloc(2048);
+  var z: int64 := 1;
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(pows+i*8, z);
+    z := z*1753 - (z*1753/8380417)*8380417;
+    i := i+1;
+  }
+  i := 1;
+  while (i < 256) { poke64(zt+i*8, peek64(pows+brv8(i)*8)); i := i+1; }
+  free(pows, 2048);
+}
+
+// ─── Kyber NTT / INTT ────────────────────────────────────────────────────────
+
+// Vorwärts-NTT in-place (FIPS 203 Alg. 9, Cooley-Tukey)
+pub fn KyberNTT(f: int64) {
+  var zt: int64 := alloc(1024);
+  kyber_init_zetas(zt);
+  var k: int64 := 1;
+  var lv: int64 := 128;
+  while (lv >= 2) {
+    var start: int64 := 0;
+    while (start < 256) {
+      var zeta: int64 := peek64(zt + k*8);
+      k := k+1;
+      var j: int64 := start;
+      while (j < start + lv) {
+        var fj:  int64 := peek64(f + j*8);
+        var fjl: int64 := peek64(f + (j+lv)*8);
+        var t:   int64 := kmod(zeta * fjl, 3329);
+        poke64(f + (j+lv)*8, kmod(fj - t + 3329, 3329));
+        poke64(f + j*8,      kmod(fj + t, 3329));
+        j := j+1;
+      }
+      start := start + 2*lv;
+    }
+    lv := lv >> 1;
+  }
+  free(zt, 1024);
+}
+
+// Inverse NTT in-place (Gentleman-Sande, Reference-Variante: +zeta)
+// Skalierungsfaktor: 128^{-1} mod 3329 = 3303
+pub fn KyberINTT(f: int64) {
+  var zt: int64 := alloc(1024);
+  kyber_init_zetas(zt);
+  var k: int64 := 127;
+  var lv: int64 := 2;
+  while (lv <= 128) {
+    var start: int64 := 0;
+    while (start < 256) {
+      var zb: int64 := peek64(zt + k*8);
+      k := k-1;
+      var j: int64 := start;
+      while (j < start + lv) {
+        var t:   int64 := peek64(f + j*8);
+        var fjl: int64 := peek64(f + (j+lv)*8);
+        poke64(f + j*8,      kmod(t + fjl, 3329));
+        poke64(f + (j+lv)*8, kmod(zb * kmod(fjl - t + 3329, 3329), 3329));
+        j := j+1;
+      }
+      start := start + 2*lv;
+    }
+    lv := lv << 1;
+  }
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(f + i*8, kmod(peek64(f + i*8) * 3303, 3329));
+    i := i+1;
+  }
+  free(zt, 1024);
+}
+
+// ─── Kyber Polynom-Arithmetik ─────────────────────────────────────────────────
+
+// Punktweise Multiplikation zweier Polynome im NTT-Bereich (FIPS 203 Alg. 11)
+// Jedes 4er-Tupel (4i..4i+3) enthält zwei Grad-1-Polynome mit ±gamma[i].
+pub fn KyberPolyMul(fa: int64, fb: int64, fc: int64) {
+  var zt: int64 := alloc(1024);
+  kyber_init_zetas(zt);
+  var i: int64 := 0;
+  while (i < 64) {
+    var base: int64 := i*4;
+    var gp: int64 := peek64(zt + (64+i)*8);
+    var gn: int64 := 3329 - gp;
+    var a0: int64 := peek64(fa + base*8);
+    var a1: int64 := peek64(fa + (base+1)*8);
+    var b0: int64 := peek64(fb + base*8);
+    var b1: int64 := peek64(fb + (base+1)*8);
+    var c0: int64 := kmod(kmod(a0*b0, 3329) + kmod(gp * kmod(a1*b1, 3329), 3329), 3329);
+    var c1: int64 := kmod(kmod(a0*b1, 3329) + kmod(a1*b0, 3329), 3329);
+    poke64(fc + base*8, c0);
+    poke64(fc + (base+1)*8, c1);
+    a0 := peek64(fa + (base+2)*8);
+    a1 := peek64(fa + (base+3)*8);
+    b0 := peek64(fb + (base+2)*8);
+    b1 := peek64(fb + (base+3)*8);
+    c0 := kmod(kmod(a0*b0, 3329) + kmod(gn * kmod(a1*b1, 3329), 3329), 3329);
+    c1 := kmod(kmod(a0*b1, 3329) + kmod(a1*b0, 3329), 3329);
+    poke64(fc + (base+2)*8, c0);
+    poke64(fc + (base+3)*8, c1);
+    i := i+1;
+  }
+  free(zt, 1024);
+}
+
+pub fn KyberPolyAdd(fa: int64, fb: int64, fc: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(fc+i*8, kmod(peek64(fa+i*8) + peek64(fb+i*8), 3329));
+    i := i+1;
+  }
+}
+
+pub fn KyberPolySub(fa: int64, fb: int64, fc: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(fc+i*8, kmod(peek64(fa+i*8) - peek64(fb+i*8) + 3329, 3329));
+    i := i+1;
+  }
+}
+
+pub fn KyberPolyReduce(f: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(f+i*8, kmod(peek64(f+i*8), 3329));
+    i := i+1;
+  }
+}
+
+pub fn KyberPolyCopy(src: int64, dst: int64) {
+  var i: int64 := 0;
+  while (i < 2048) { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+pub fn KyberPolyZero(f: int64) {
+  var i: int64 := 0;
+  while (i < 2048) { poke8(f+i, 0); i := i+1; }
+}
+
+// ─── Kyber Sampling ──────────────────────────────────────────────────────────
+
+// SampleNTT (FIPS 203 Alg. 6): uniform-random Polynom über SHAKE-128
+// seed: 32 Bytes, x/y: je 1 Byte (Matrix-Index), out: NTT-Polynom
+pub fn KyberSampleNTT(seed: int64, x: int64, y: int64, out: int64) {
+  var inbuf: int64 := alloc(34);
+  var xof: int64 := alloc(768);
+  var i: int64 := 0;
+  var c0: int64 := 0;
+  var c1: int64 := 0;
+  var c2: int64 := 0;
+  var d1: int64 := 0;
+  var d2: int64 := 0;
+  var count: int64 := 0;
+  while (i < 32) { poke8(inbuf+i, peek8(seed+i)); i := i+1; }
+  poke8(inbuf+32, x & 0xFF);
+  poke8(inbuf+33, y & 0xFF);
+  SHAKE128(inbuf, 34, xof, 768);
+  i := 0;
+  while (i <= 765 && count < 256) {
+    c0 := peek8(xof+i); c1 := peek8(xof+i+1); c2 := peek8(xof+i+2);
+    d1 := c0 | ((c1 & 0xF) << 8);
+    d2 := (c1 >> 4) | (c2 << 4);
+    if (d1 < 3329 && count < 256) { poke64(out+count*8, d1); count := count+1; }
+    if (d2 < 3329 && count < 256) { poke64(out+count*8, d2); count := count+1; }
+    i := i+3;
+  }
+  free(xof, 768); free(inbuf, 34);
+}
+
+// SamplePolyCBD (FIPS 203 Alg. 7): zentrale Binomialverteilung eta
+// prf_out: 64*eta Bytes PRF-Ausgabe, out: Polynom mit Koeff. in [0,q)
+pub fn KyberSampleCBD(prf_out: int64, eta: int64, out: int64) {
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var a: int64 := 0;
+  var b: int64 := 0;
+  var bp: int64 := 0;
+  while (i < 256) {
+    a := 0; b := 0; j := 0;
+    while (j < eta) {
+      bp := 2*i*eta + j;
+      a := a + ((peek8(prf_out + bp/8) >> (bp & 7)) & 1);
+      bp := 2*i*eta + eta + j;
+      b := b + ((peek8(prf_out + bp/8) >> (bp & 7)) & 1);
+      j := j+1;
+    }
+    poke64(out + i*8, kmod(a - b + 3329, 3329));
+    i := i+1;
+  }
+}
+
+// ─── Dilithium NTT / INTT ────────────────────────────────────────────────────
+
+// Dilithium NTT: vollständiges 256-Punkt-NTT (8 Stufen, lv=128..1)
+pub fn DilithiumNTT(f: int64) {
+  var zt: int64 := alloc(2048);
+  dilith_init_zetas(zt);
+  var k: int64 := 1;
+  var lv: int64 := 128;
+  while (lv >= 1) {
+    var start: int64 := 0;
+    while (start < 256) {
+      var zeta: int64 := peek64(zt + k*8);
+      k := k+1;
+      var j: int64 := start;
+      while (j < start + lv) {
+        var fj:  int64 := peek64(f + j*8);
+        var fjl: int64 := peek64(f + (j+lv)*8);
+        var t:   int64 := kmod(zeta * fjl, 8380417);
+        poke64(f + (j+lv)*8, kmod(fj - t + 8380417, 8380417));
+        poke64(f + j*8,      kmod(fj + t, 8380417));
+        j := j+1;
+      }
+      start := start + 2*lv;
+    }
+    lv := lv >> 1;
+  }
+  free(zt, 2048);
+}
+
+// Dilithium INTT: negierte Zetas, Skalierung 256^{-1} mod 8380417 = 8347681
+pub fn DilithiumINTT(f: int64) {
+  var zt: int64 := alloc(2048);
+  dilith_init_zetas(zt);
+  var k: int64 := 255;
+  var lv: int64 := 1;
+  while (lv <= 128) {
+    var start: int64 := 0;
+    while (start < 256) {
+      var zb: int64 := peek64(zt + k*8);
+      k := k-1;
+      var j: int64 := start;
+      while (j < start + lv) {
+        var t:   int64 := peek64(f + j*8);
+        var fjl: int64 := peek64(f + (j+lv)*8);
+        poke64(f + j*8,      kmod(t + fjl, 8380417));
+        poke64(f + (j+lv)*8, kmod(zb * kmod(fjl - t + 8380417, 8380417), 8380417));
+        j := j+1;
+      }
+      start := start + 2*lv;
+    }
+    lv := lv << 1;
+  }
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(f + i*8, kmod(peek64(f + i*8) * 8347681, 8380417));
+    i := i+1;
+  }
+  free(zt, 2048);
+}
+
+// ─── Dilithium Polynom-Arithmetik ─────────────────────────────────────────────
+
+// Dilithium: vollständige 256-Punkt NTT → skalare punktweise Multiplikation
+pub fn DilithiumPolyMul(fa: int64, fb: int64, fc: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(fc+i*8, kmod(peek64(fa+i*8) * peek64(fb+i*8), 8380417));
+    i := i+1;
+  }
+}
+
+pub fn DilithiumPolyAdd(fa: int64, fb: int64, fc: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(fc+i*8, kmod(peek64(fa+i*8) + peek64(fb+i*8), 8380417));
+    i := i+1;
+  }
+}
+
+pub fn DilithiumPolySub(fa: int64, fb: int64, fc: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(fc+i*8, kmod(peek64(fa+i*8) - peek64(fb+i*8) + 8380417, 8380417));
+    i := i+1;
+  }
+}

@@ -1,0 +1,250 @@
+// examples/crypto/pqc_demo.lyx
+// WP-PQC-11: Post-Quantum-gesicherte Nachrichtenübertragung
+//
+// Szenario: Alice schickt Bob eine verschlüsselte, signierte Nachricht.
+//   Schlüsselaustausch:  ML-KEM-768  (NIST FIPS 203)
+//   Signatur:            ML-DSA-65   (NIST FIPS 204)
+//   Nachrichtenstrom:    AES-256-CTR (NIST SP 800-38A)
+//
+// Ablauf:
+//   1. Alice erzeugt ML-KEM-768-Schlüsselpaar (für Bob zur Encap)
+//   2. Alice erzeugt ML-DSA-65-Schlüsselpaar  (für Signatur)
+//   3. Bob   erzeugt ML-KEM-768-Schlüsselpaar
+//   4. Alice kapselt ss = KEM.Encap(bob_pk) ein → ct_kem
+//   5. Alice verschlüsselt Klartext mit AES-256-CTR(ss) → ct_msg
+//   6. Alice signiert (ct_kem ∥ ct_msg) → sig
+//   7. Bob  entkapselt ss = KEM.Decap(alice_ct_kem)
+//   8. Bob  verifiziert sig mit Alice's DSA-PK
+//   9. Bob  entschlüsselt ct_msg → Klartext
+
+import std.crypto.pqc.pqc;
+import std.crypto.aes;
+import std.alloc;
+import std.time;
+
+// ─── Hilfsfunktionen ─────────────────────────────────────────────────────────
+
+fn memcopy(dst: int64, src: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+fn mem_eq(a: int64, b: int64, n: int64): int64 {
+  var i: int64 := 0;
+  while (i < n) { if (peek8(a+i) != peek8(b+i)) { return 0; } i := i+1; }
+  return 1;
+}
+
+// Druckt Nanosekunden als "X.Y ms" (>= 1 ms) oder "Z us"
+fn PrintTiming(ns: int64) {
+  var us: int64 := ns / 1000;
+  if (us >= 1000) {
+    var ms:  int64 := us / 1000;
+    var dec: int64 := (us % 1000) / 100;
+    PrintInt(ms); Print("."); PrintInt(dec); Print(" ms");
+  } else {
+    PrintInt(us); Print(" us");
+  }
+}
+
+// Druckt n Bytes als Hex (max. 8 Bytes, dann "...")
+fn PrintHexShort(buf: int64, n: int64) {
+  var limit: int64 := n;
+  if (limit > 8) { limit := 8; }
+  var tmp: int64 := alloc(2);
+  poke8(tmp+1, 0);
+  var i: int64 := 0;
+  while (i < limit) {
+    var b: int64 := peek8(buf+i);
+    var hi: int64 := (b>>4) & 0xF;
+    var lo: int64 := b & 0xF;
+    if (hi < 10) { poke8(tmp, 48+hi); } else { poke8(tmp, 55+hi); }
+    PrintStr(tmp);
+    if (lo < 10) { poke8(tmp, 48+lo); } else { poke8(tmp, 55+lo); }
+    PrintStr(tmp);
+    i := i+1;
+  }
+  free(tmp, 2);
+  if (n > 8) { Print("..."); }
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────────
+
+fn main(): int64 {
+  PrintLn("[PQC-Demo] Post-Quantum-gesicherte Nachrichtenübertragung");
+  PrintLn("=========================================================");
+  PrintLn("Algorithmen: ML-KEM-768 + ML-DSA-65 + AES-256-CTR");
+  PrintLn("");
+
+  // ── [1] Schlüsselerzeugung ─────────────────────────────────────────────────
+  PrintLn("[1] Schlüsselerzeugung");
+
+  var t0: int64 := GetTimeNs(CLOCK_MONOTONIC);
+  var alice_kem: int64 := PQCKeyGen(PQC_ALG_MLKEM_768);
+  var t_alice_kem_kg: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  var alice_dsa: int64 := PQCKeyGen(PQC_ALG_MLDSA_65);
+  var t_alice_dsa_kg: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  var bob_kem: int64 := PQCKeyGen(PQC_ALG_MLKEM_768);
+  var t_bob_kem_kg: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  Print("  Alice ML-KEM-768:  pk="); PrintInt(PQCGetPublicKeyLen(alice_kem));
+  Print(" B, sk="); PrintInt(PQCGetSecretKeyLen(alice_kem)); PrintLn(" B");
+  Print("  Alice ML-DSA-65:   pk="); PrintInt(PQCGetPublicKeyLen(alice_dsa));
+  Print(" B, sk="); PrintInt(PQCGetSecretKeyLen(alice_dsa)); PrintLn(" B");
+  Print("  Bob   ML-KEM-768:  pk="); PrintInt(PQCGetPublicKeyLen(bob_kem));
+  Print(" B, sk="); PrintInt(PQCGetSecretKeyLen(bob_kem)); PrintLn(" B");
+  PrintLn("");
+
+  // ── Alice exportiert DSA-PK für Bob ───────────────────────────────────────
+  var dsa_pk_export: int64 := alloc(MLDSA65_PK);
+  PQCExportPublicKey(alice_dsa, dsa_pk_export);
+  // Bob importiert Alice's DSA-Verifikationsschlüssel
+  var alice_dsa_pub: int64 := PQCImportPublicKey(PQC_ALG_MLDSA_65, dsa_pk_export, MLDSA65_PK);
+  free(dsa_pk_export, MLDSA65_PK);
+
+  // ── [2] Alice → Bob: Verschlüsseln + Signieren ────────────────────────────
+  PrintLn("[2] Alice verschlüsselt und signiert die Nachricht");
+
+  // Klartext
+  var plain: pchar := "Hallo Post-Quantum!";
+  var plain_len: int64 := 19;
+  var plain_buf: int64 := alloc(plain_len);
+  var i: int64 := 0;
+  while (i < plain_len) { poke8(plain_buf+i, peek8(plain+i)); i := i+1; }
+
+  // ML-KEM-768 Encapsulate: Alice erzeugt ct_kem + ss für Bob's PK
+  var ct_kem_len: int64 := PQCCTLen(PQC_ALG_MLKEM_768);
+  var ct_kem:     int64 := alloc(ct_kem_len);
+  var ss_alice:   int64 := alloc(PQC_SS_LEN);
+
+  // Encap braucht nur Bob's Public Key → importiere für saubere Trennung
+  var bob_pk_buf: int64 := alloc(MLKEM768_PK);
+  PQCExportPublicKey(bob_kem, bob_pk_buf);
+  var bob_kem_pub: int64 := PQCImportPublicKey(PQC_ALG_MLKEM_768, bob_pk_buf, MLKEM768_PK);
+  free(bob_pk_buf, MLKEM768_PK);
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  PQCEncapsulate(bob_kem_pub, ct_kem, ss_alice);
+  var t_encap: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+  PQCFreeKeyPair(bob_kem_pub);
+
+  // AES-256-CTR: Nachricht mit ss verschlüsseln
+  var ct_msg: int64 := alloc(plain_len);
+  var aes_iv: int64 := alloc(16);
+  i := 0; while (i < 16) { poke8(aes_iv+i, 0); i := i+1; }
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  AES256CTR(ss_alice, aes_iv, plain_buf, plain_len, ct_msg);
+  var t_encrypt: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  // ML-DSA-65 Signatur: Alice signiert (ct_kem ∥ ct_msg)
+  var sign_buf_len: int64 := ct_kem_len + plain_len;
+  var sign_buf:     int64 := alloc(sign_buf_len);
+  memcopy(sign_buf,              ct_kem,  ct_kem_len);
+  memcopy(sign_buf + ct_kem_len, ct_msg,  plain_len);
+
+  var sig_max: int64 := PQCSigLen(PQC_ALG_MLDSA_65);
+  var sig:     int64 := alloc(sig_max);
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  var sig_len: int64 := PQCSign(alice_dsa, sign_buf, sign_buf_len, sig);
+  var t_sign: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+  free(sign_buf, sign_buf_len);
+
+  Print("  Klartext:     \"Hallo Post-Quantum!\"  ("); PrintInt(plain_len); PrintLn(" Bytes)");
+  Print("  KEM-CT:       "); PrintInt(ct_kem_len); PrintLn(" Bytes");
+  Print("  Geheimtext:   "); PrintInt(plain_len); Print(" Bytes  [");
+  PrintHexShort(ct_msg, plain_len); PrintLn("]");
+  Print("  Signatur:     "); PrintInt(sig_len); PrintLn(" Bytes");
+  PrintLn("");
+
+  // ── [3] Bob verifiziert und entschlüsselt ─────────────────────────────────
+  PrintLn("[3] Bob verifiziert und entschlüsselt");
+
+  // Bob entkapselt den Shared Secret
+  var ss_bob: int64 := alloc(PQC_SS_LEN);
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  PQCDecapsulate(bob_kem, ct_kem, ss_bob);
+  var t_decap: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  // Shared Secrets vergleichen
+  var ss_match: int64 := mem_eq(ss_alice, ss_bob, PQC_SS_LEN);
+  Print("  Shared Secret:   "); PrintInt(PQC_SS_LEN); Print(" Bytes  [");
+  PrintHexShort(ss_bob, PQC_SS_LEN); Print("]  Alice=Bob: ");
+  if (ss_match != 0) { PrintLn("JA"); } else { PrintLn("NEIN (FEHLER)"); }
+
+  // Bob verifiziert Alice's Signatur über (ct_kem ∥ ct_msg)
+  var verify_buf: int64 := alloc(sign_buf_len);
+  memcopy(verify_buf,              ct_kem,  ct_kem_len);
+  memcopy(verify_buf + ct_kem_len, ct_msg,  plain_len);
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  var ok_sig: int64 := PQCVerify(alice_dsa_pub, verify_buf, sign_buf_len, sig, sig_len);
+  var t_verify: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+  free(verify_buf, sign_buf_len);
+
+  Print("  Signaturprüfung: ");
+  if (ok_sig != 0) { PrintLn("OK"); } else { PrintLn("FEHLER"); }
+
+  // Bob entschlüsselt die Nachricht
+  var decrypted: int64 := alloc(plain_len);
+  i := 0; while (i < 16) { poke8(aes_iv+i, 0); i := i+1; }
+
+  t0 := GetTimeNs(CLOCK_MONOTONIC);
+  AES256CTR(ss_bob, aes_iv, ct_msg, plain_len, decrypted);
+  var t_decrypt: int64 := GetTimeNs(CLOCK_MONOTONIC) - t0;
+
+  // null-terminiert für Print(pchar)
+  var disp: int64 := alloc(plain_len+1);
+  memcopy(disp, decrypted, plain_len);
+  poke8(disp+plain_len, 0);
+  Print("  Klartext:        \"");
+  PrintStr(disp);
+  free(disp, plain_len+1);
+  var decr_ok: int64 := mem_eq(decrypted, plain_buf, plain_len);
+  Print("\"  (Decrypted=Original: ");
+  if (decr_ok != 0) { PrintLn("JA)"); } else { PrintLn("NEIN)"); }
+  PrintLn("");
+
+  // ── [4] Timings ───────────────────────────────────────────────────────────
+  PrintLn("[4] Timings");
+  Print("  Alice ML-KEM-768 KeyGen:  "); PrintTiming(t_alice_kem_kg); PrintLn("");
+  Print("  Alice ML-DSA-65  KeyGen:  "); PrintTiming(t_alice_dsa_kg); PrintLn("");
+  Print("  Bob   ML-KEM-768 KeyGen:  "); PrintTiming(t_bob_kem_kg);   PrintLn("");
+  Print("  ML-KEM-768 Encapsulate:   "); PrintTiming(t_encap);        PrintLn("");
+  Print("  AES-256-CTR Encrypt:      "); PrintTiming(t_encrypt);      PrintLn("");
+  Print("  ML-DSA-65 Sign:           "); PrintTiming(t_sign);         PrintLn("");
+  Print("  ML-KEM-768 Decapsulate:   "); PrintTiming(t_decap);        PrintLn("");
+  Print("  ML-DSA-65 Verify:         "); PrintTiming(t_verify);       PrintLn("");
+  Print("  AES-256-CTR Decrypt:      "); PrintTiming(t_decrypt);      PrintLn("");
+  PrintLn("");
+
+  // ── Ergebnis ──────────────────────────────────────────────────────────────
+  var all_ok: int64 := ss_match & ok_sig & decr_ok;
+  if (all_ok != 0) {
+    PrintLn("[PQC-Demo] ERFOLGREICH — Nachricht sicher übertragen.");
+  } else {
+    PrintLn("[PQC-Demo] FEHLER — Prüfung fehlgeschlagen.");
+  }
+
+  // ── Aufräumen ─────────────────────────────────────────────────────────────
+  PQCFreeKeyPair(alice_kem);
+  PQCFreeKeyPair(alice_dsa);
+  PQCFreeKeyPair(bob_kem);
+  PQCFreeKeyPair(alice_dsa_pub);
+  free(ct_kem, ct_kem_len);
+  free(ss_alice, PQC_SS_LEN);
+  free(ss_bob, PQC_SS_LEN);
+  free(ct_msg, plain_len);
+  free(plain_buf, plain_len);
+  free(aes_iv, 16);
+  free(sig, sig_max);
+  free(decrypted, plain_len);
+
+  if (all_ok != 0) { return 0; }
+  return 1;
+}

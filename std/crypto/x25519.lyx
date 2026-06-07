@@ -1,0 +1,389 @@
+// std/crypto/x25519.lyx
+// X25519 Diffie-Hellman (Curve25519, RFC 7748)
+//
+// Feld: GF(2^255 - 19), p = 2^255 - 19
+// Darstellung: 10 int64-Limbs, alternierend 26/25 Bit
+//   limb[i] liegt bei Bitposition b[i] = [0,26,51,77,102,128,153,179,204,230]
+//   Breiten:                             [26,25,26,25, 26, 25, 26, 25, 26, 25]
+//
+// Montgomery-Leiter (RFC 7748 §5): constant-time Skalarmultiplikation
+// Öffentliche API:
+//   X25519(out, k, u)              — k: 32-Byte-Skalar, u: 32-Byte-u-Koordinate
+//   X25519KeyGen(seed, pk, sk)     — pk = X25519(sk, 9)
+//   X25519SharedSecret(sk, pk, ss) — ss = X25519(sk, pk)
+
+unit std.crypto.x25519;
+
+import std.alloc;
+
+pub con X25519_PK: int64 := 32;
+pub con X25519_SK: int64 := 32;
+pub con X25519_SS: int64 := 32;
+
+// ─── Feldelement: 80 Bytes = 10 × int64 ──────────────────────────────────────
+
+fn fe_new(): int64 { return alloc(80); }
+fn fe_del(f: int64) { free(f, 80); }
+
+fn fe_copy(dst: int64, src: int64) {
+  var i: int64 := 0;
+  while (i < 80) { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+fn fe_zero(h: int64) {
+  var i: int64 := 0;
+  while (i < 10) { poke64(h+i*8, 0); i := i+1; }
+}
+
+fn fe_small(h: int64, v: int64) {
+  fe_zero(h); poke64(h, v);
+}
+
+// ─── Carry-Normalisierung (2 Sweeps) ─────────────────────────────────────────
+// Stellt sicher, dass alle Limbs in [0, 2^w-1] liegen.
+
+fn fe_carry(h: int64) {
+  var c: int64 := 0; var v: int64 := 0;
+  var pass: int64 := 0;
+  while (pass < 2) {
+    v:=peek64(h+0);  c:=v>>26; poke64(h+0, v&0x3FFFFFF); poke64(h+8,  peek64(h+8) +c);
+    v:=peek64(h+8);  c:=v>>25; poke64(h+8, v&0x1FFFFFF); poke64(h+16, peek64(h+16)+c);
+    v:=peek64(h+16); c:=v>>26; poke64(h+16,v&0x3FFFFFF); poke64(h+24, peek64(h+24)+c);
+    v:=peek64(h+24); c:=v>>25; poke64(h+24,v&0x1FFFFFF); poke64(h+32, peek64(h+32)+c);
+    v:=peek64(h+32); c:=v>>26; poke64(h+32,v&0x3FFFFFF); poke64(h+40, peek64(h+40)+c);
+    v:=peek64(h+40); c:=v>>25; poke64(h+40,v&0x1FFFFFF); poke64(h+48, peek64(h+48)+c);
+    v:=peek64(h+48); c:=v>>26; poke64(h+48,v&0x3FFFFFF); poke64(h+56, peek64(h+56)+c);
+    v:=peek64(h+56); c:=v>>25; poke64(h+56,v&0x1FFFFFF); poke64(h+64, peek64(h+64)+c);
+    v:=peek64(h+64); c:=v>>26; poke64(h+64,v&0x3FFFFFF); poke64(h+72, peek64(h+72)+c);
+    v:=peek64(h+72); c:=v>>25; poke64(h+72,v&0x1FFFFFF); poke64(h+0,  peek64(h+0) +c*19);
+    pass := pass+1;
+  }
+}
+
+// ─── Addition / Subtraktion ───────────────────────────────────────────────────
+
+fn fe_add(h: int64, f: int64, g: int64) {
+  var i: int64 := 0;
+  while (i < 10) {
+    poke64(h+i*8, peek64(f+i*8) + peek64(g+i*8));
+    i := i+1;
+  }
+}
+
+// Subtraktion mit 2p-Offset (verhindert negative Limbs)
+// 2p in Limbs: [134217690, 67108862, 134217726, 67108862, ...]
+fn fe_sub(h: int64, f: int64, g: int64) {
+  poke64(h+0,  134217690 + peek64(f+0)  - peek64(g+0));
+  poke64(h+8,   67108862 + peek64(f+8)  - peek64(g+8));
+  poke64(h+16, 134217726 + peek64(f+16) - peek64(g+16));
+  poke64(h+24,  67108862 + peek64(f+24) - peek64(g+24));
+  poke64(h+32, 134217726 + peek64(f+32) - peek64(g+32));
+  poke64(h+40,  67108862 + peek64(f+40) - peek64(g+40));
+  poke64(h+48, 134217726 + peek64(f+48) - peek64(g+48));
+  poke64(h+56,  67108862 + peek64(f+56) - peek64(g+56));
+  poke64(h+64, 134217726 + peek64(f+64) - peek64(g+64));
+  poke64(h+72,  67108862 + peek64(f+72) - peek64(g+72));
+}
+
+// Multiplikation mit kleiner Konstante (s ≤ 2^20, damit kein Overflow)
+fn fe_mul_scalar(h: int64, f: int64, s: int64) {
+  var i: int64 := 0;
+  while (i < 10) { poke64(h+i*8, peek64(f+i*8)*s); i := i+1; }
+  fe_carry(h);
+}
+
+// ─── Feldmultiplikation h = f * g mod p ──────────────────────────────────────
+// Schoolbook-Formel mit Reduktion via 2^255 ≡ 19:
+//   Faktor 19 für Paare mit b[i]+b[j] = b[k]+255 (Wrap um genau 255 Bits)
+//   Faktor 38 für Paare mit b[i]+b[j] = b[k]+256 (Wrap + 1 Bit Versatz → 2×19)
+// Alle Limbs ≤ 2^26, max Akkumulator ≈ 2^59.5 < 2^63 → kein int64-Overflow.
+
+fn fe_mul(h: int64, f: int64, g: int64) {
+  var f0:int64:=peek64(f+0); var f1:int64:=peek64(f+8); var f2:int64:=peek64(f+16);
+  var f3:int64:=peek64(f+24); var f4:int64:=peek64(f+32); var f5:int64:=peek64(f+40);
+  var f6:int64:=peek64(f+48); var f7:int64:=peek64(f+56); var f8:int64:=peek64(f+64);
+  var f9:int64:=peek64(f+72);
+  var g0:int64:=peek64(g+0); var g1:int64:=peek64(g+8); var g2:int64:=peek64(g+16);
+  var g3:int64:=peek64(g+24); var g4:int64:=peek64(g+32); var g5:int64:=peek64(g+40);
+  var g6:int64:=peek64(g+48); var g7:int64:=peek64(g+56); var g8:int64:=peek64(g+64);
+  var g9:int64:=peek64(g+72);
+
+  poke64(h+0,  f0*g0 + (f1*g9+f9*g1)*38 + (f2*g8+f8*g2)*19 + (f3*g7+f7*g3)*38 + (f4*g6+f6*g4)*19 + f5*g5*38);
+  poke64(h+8,  f0*g1 + f1*g0 + (f2*g9+f9*g2+f3*g8+f8*g3+f4*g7+f7*g4+f5*g6+f6*g5)*19);
+  poke64(h+16, f0*g2 + f2*g0 + f1*g1*2 + (f3*g9+f9*g3)*38 + (f4*g8+f8*g4)*19 + (f5*g7+f7*g5)*38 + f6*g6*19);
+  poke64(h+24, f0*g3 + f3*g0 + f1*g2 + f2*g1 + (f4*g9+f9*g4+f5*g8+f8*g5+f6*g7+f7*g6)*19);
+  poke64(h+32, f0*g4 + f4*g0 + (f1*g3+f3*g1)*2 + f2*g2 + (f5*g9+f9*g5)*38 + (f6*g8+f8*g6)*19 + f7*g7*38);
+  poke64(h+40, f0*g5 + f5*g0 + f1*g4 + f4*g1 + f2*g3 + f3*g2 + (f6*g9+f9*g6+f7*g8+f8*g7)*19);
+  poke64(h+48, f0*g6 + f6*g0 + (f1*g5+f5*g1)*2 + f2*g4 + f4*g2 + f3*g3*2 + (f7*g9+f9*g7)*38 + f8*g8*19);
+  poke64(h+56, f0*g7 + f7*g0 + f1*g6 + f6*g1 + f2*g5 + f5*g2 + f3*g4 + f4*g3 + (f8*g9+f9*g8)*19);
+  poke64(h+64, f0*g8 + f8*g0 + (f1*g7+f7*g1)*2 + f2*g6 + f6*g2 + (f3*g5+f5*g3)*2 + f4*g4 + f9*g9*38);
+  poke64(h+72, f0*g9 + f9*g0 + f1*g8 + f8*g1 + f2*g7 + f7*g2 + f3*g6 + f6*g3 + f4*g5 + f5*g4);
+  fe_carry(h);
+}
+
+fn fe_sq(h: int64, f: int64) { fe_mul(h, f, f); }
+
+// ─── Constant-Time Swap ───────────────────────────────────────────────────────
+
+fn fe_cswap(f: int64, g: int64, sw: int64) {
+  // sw = 0 → no swap, sw = 1 → swap (mask = 0 - sw)
+  var mask: int64 := 0 - sw;
+  var i: int64 := 0;
+  while (i < 10) {
+    var x: int64 := (peek64(f+i*8) ^ peek64(g+i*8)) & mask;
+    poke64(f+i*8, peek64(f+i*8) ^ x);
+    poke64(g+i*8, peek64(g+i*8) ^ x);
+    i := i+1;
+  }
+}
+
+// ─── Byte-Konvertierung ───────────────────────────────────────────────────────
+
+fn fe_from_bytes(h: int64, b: int64) {
+  // Bit-Positionen: [0,26,51,77,102,128,153,179,204,230], Breiten: [26,25,26,25,26,25,26,25,26,25]
+  // Bit 255 wird maskiert (RFC 7748 §5: high bit clear for u-coordinates)
+  var buf: int64 := alloc(32);
+  var i: int64 := 0;
+  while (i < 31) { poke8(buf+i, peek8(b+i)); i := i+1; }
+  poke8(buf+31, peek8(b+31) & 0x7F);  // clear bit 255
+
+  var ps: int64 := alloc(80);
+  var ws: int64 := alloc(80);
+  poke64(ps+0,0); poke64(ps+8,26); poke64(ps+16,51); poke64(ps+24,77); poke64(ps+32,102);
+  poke64(ps+40,128); poke64(ps+48,153); poke64(ps+56,179); poke64(ps+64,204); poke64(ps+72,230);
+  poke64(ws+0,26); poke64(ws+8,25); poke64(ws+16,26); poke64(ws+24,25); poke64(ws+32,26);
+  poke64(ws+40,25); poke64(ws+48,26); poke64(ws+56,25); poke64(ws+64,26); poke64(ws+72,25);
+
+  i := 0;
+  while (i < 10) {
+    var p: int64 := peek64(ps+i*8);
+    var w: int64 := peek64(ws+i*8);
+    var bidx: int64 := p >> 3;
+    var boff: int64 := p & 7;
+    var raw: int64 := peek8(buf+bidx) | (peek8(buf+bidx+1)<<8) | (peek8(buf+bidx+2)<<16) | (peek8(buf+bidx+3)<<24);
+    poke64(h+i*8, (raw >> boff) & ((1<<w)-1));
+    i := i+1;
+  }
+  free(buf, 32); free(ps, 80); free(ws, 80);
+}
+
+// Vollständige Reduktion mod p: h := h mod p ∈ [0, p)
+fn fe_reduce(h: int64) {
+  fe_carry(h);
+  // Addiere 19, propagiere Übertrag → Bit 255 des Ergebnisses zeigt ob h >= p
+  var h0:int64:=peek64(h+0)+19; var c:int64:=h0>>26; h0:=h0&0x3FFFFFF;
+  var h1:int64:=peek64(h+8)+c;  c:=h1>>25; h1:=h1&0x1FFFFFF;
+  var h2:int64:=peek64(h+16)+c; c:=h2>>26; h2:=h2&0x3FFFFFF;
+  var h3:int64:=peek64(h+24)+c; c:=h3>>25; h3:=h3&0x1FFFFFF;
+  var h4:int64:=peek64(h+32)+c; c:=h4>>26; h4:=h4&0x3FFFFFF;
+  var h5:int64:=peek64(h+40)+c; c:=h5>>25; h5:=h5&0x1FFFFFF;
+  var h6:int64:=peek64(h+48)+c; c:=h6>>26; h6:=h6&0x3FFFFFF;
+  var h7:int64:=peek64(h+56)+c; c:=h7>>25; h7:=h7&0x1FFFFFF;
+  var h8:int64:=peek64(h+64)+c; c:=h8>>26; h8:=h8&0x3FFFFFF;
+  var h9:int64:=peek64(h+72)+c; c:=h9>>25; h9:=h9&0x1FFFFFF;
+  // c=1: h >= p; h0..h9 = (h+19) mod 2^255 = h - p  (korrekte Reduktion)
+  // c=0: h < p; keine Änderung nötig
+  if (c != 0) {
+    poke64(h+0,h0); poke64(h+8,h1); poke64(h+16,h2); poke64(h+24,h3);
+    poke64(h+32,h4); poke64(h+40,h5); poke64(h+48,h6); poke64(h+56,h7);
+    poke64(h+64,h8); poke64(h+72,h9);
+  }
+}
+
+fn fe_to_bytes(b: int64, h: int64) {
+  // Normalisiere, reduziere mod p, packe Bits in 32-Byte-Array (little-endian)
+  fe_reduce(h);
+  var i: int64 := 0;
+  while (i < 32) { poke8(b+i, 0); i := i+1; }
+
+  var ps: int64 := alloc(80);
+  var ws: int64 := alloc(80);
+  poke64(ps+0,0); poke64(ps+8,26); poke64(ps+16,51); poke64(ps+24,77); poke64(ps+32,102);
+  poke64(ps+40,128); poke64(ps+48,153); poke64(ps+56,179); poke64(ps+64,204); poke64(ps+72,230);
+  poke64(ws+0,26); poke64(ws+8,25); poke64(ws+16,26); poke64(ws+24,25); poke64(ws+32,26);
+  poke64(ws+40,25); poke64(ws+48,26); poke64(ws+56,25); poke64(ws+64,26); poke64(ws+72,25);
+
+  i := 0;
+  while (i < 10) {
+    var p: int64 := peek64(ps+i*8);
+    var w: int64 := peek64(ws+i*8);
+    var val: int64 := peek64(h+i*8);
+    var j: int64 := 0;
+    while (j < w) {
+      var bp: int64 := p + j;
+      poke8(b+(bp>>3), peek8(b+(bp>>3)) | (((val>>j)&1)<<(bp&7)));
+      j := j+1;
+    }
+    i := i+1;
+  }
+  free(ps, 80); free(ws, 80);
+}
+
+// ─── Invertierung: out = z^(p-2) mod p via Fermat ────────────────────────────
+// Additionskette für p-2 = 2^255 - 21 (aus DJB-Referenzimplementierung)
+
+fn fe_invert(out: int64, z: int64) {
+  var t0: int64 := fe_new();  // diverse Zwischenwerte
+  var t1: int64 := fe_new();
+  var z9: int64 := fe_new();
+  var z11: int64 := fe_new();
+  var z31: int64 := fe_new();
+  var z_10: int64 := fe_new();
+  var z_20: int64 := fe_new();
+  var z_40: int64 := fe_new();
+  var z_50: int64 := fe_new();
+  var z100: int64 := fe_new();
+  var z200: int64 := fe_new();
+  var z250: int64 := fe_new();
+
+  fe_sq(t0, z);              // z^2
+  fe_sq(t1, t0); fe_sq(t1, t1);  // z^8
+  fe_mul(z9, t1, z);         // z^9
+  fe_mul(z11, z9, t0);       // z^11
+  fe_sq(t0, z11);            // z^22
+  fe_mul(z31, t0, z9);       // z^31 = z^(2^5-1)
+
+  fe_sq(t0, z31);
+  var i: int64 := 1;
+  while (i < 5) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z_10, t0, z31);     // z^(2^10-1)
+
+  fe_sq(t0, z_10);
+  i := 1;
+  while (i < 10) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z_20, t0, z_10);    // z^(2^20-1)
+
+  fe_sq(t0, z_20);
+  i := 1;
+  while (i < 20) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z_40, t0, z_20);    // z^(2^40-1)
+
+  fe_sq(t0, z_40);
+  i := 1;
+  while (i < 10) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z_50, t0, z_10);    // z^(2^50-1)
+
+  fe_sq(t0, z_50);
+  i := 1;
+  while (i < 50) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z100, t0, z_50);    // z^(2^100-1)
+
+  fe_sq(t0, z100);
+  i := 1;
+  while (i < 100) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z200, t0, z100);    // z^(2^200-1)
+
+  fe_sq(t0, z200);
+  i := 1;
+  while (i < 50) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(z250, t0, z_50);    // z^(2^250-1)
+
+  // z^(2^255-21) = z250^(2^5) * z11
+  fe_sq(t0, z250);
+  i := 1;
+  while (i < 5) { fe_sq(t0, t0); i := i+1; }
+  fe_mul(out, t0, z11);
+
+  fe_del(t0); fe_del(t1); fe_del(z9); fe_del(z11); fe_del(z31);
+  fe_del(z_10); fe_del(z_20); fe_del(z_40); fe_del(z_50);
+  fe_del(z100); fe_del(z200); fe_del(z250);
+}
+
+// ─── Montgomery-Leiter (RFC 7748 §5) ─────────────────────────────────────────
+// Berechnet k·P auf Curve25519; k als geklemmter 32-Byte-Skalar,
+// u als 32-Byte-u-Koordinate (bereits fe_from_bytes angewendet).
+
+fn x25519_ladder(out: int64, k: int64, x1: int64) {
+  var x2: int64 := fe_new(); var z2: int64 := fe_new();
+  var x3: int64 := fe_new(); var z3: int64 := fe_new();
+  var A:  int64 := fe_new(); var AA: int64 := fe_new();
+  var B:  int64 := fe_new(); var BB: int64 := fe_new();
+  var E:  int64 := fe_new(); var C:  int64 := fe_new();
+  var D:  int64 := fe_new(); var DA: int64 := fe_new();
+  var CB: int64 := fe_new(); var tmp:int64 := fe_new();
+
+  fe_small(x2, 1); fe_zero(z2);
+  fe_copy(x3, x1); fe_small(z3, 1);
+  var sw: int64 := 0;
+
+  var t: int64 := 254;
+  while (t >= 0) {
+    var byte_idx: int64 := t >> 3;
+    var bit_off:  int64 := t & 7;
+    var kt: int64 := (peek8(k + byte_idx) >> bit_off) & 1;
+    sw := sw ^ kt;
+    fe_cswap(x2, x3, sw);
+    fe_cswap(z2, z3, sw);
+    sw := kt;
+
+    fe_add(A,  x2, z2);   fe_sq(AA, A);
+    fe_sub(B,  x2, z2);   fe_sq(BB, B);
+    fe_sub(E,  AA, BB);
+    fe_add(C,  x3, z3);
+    fe_sub(D,  x3, z3);
+    fe_mul(DA, D, A);
+    fe_mul(CB, C, B);
+
+    // x3 = (DA+CB)^2
+    fe_add(tmp, DA, CB);   fe_sq(x3, tmp);
+    // z3 = x1 * (DA-CB)^2
+    fe_sub(tmp, DA, CB);   fe_sq(tmp, tmp);   fe_mul(z3, x1, tmp);
+    // x2 = AA*BB
+    fe_mul(x2, AA, BB);
+    // z2 = E * (AA + a24*E)  where a24 = (A-2)/4 = (486662-2)/4 = 121665
+    fe_mul_scalar(tmp, E, 121665);
+    fe_add(tmp, AA, tmp);
+    fe_mul(z2, E, tmp);
+
+    t := t - 1;
+  }
+  fe_cswap(x2, x3, sw);
+  fe_cswap(z2, z3, sw);
+
+  // out = x2 * z2^(p-2) = x2 / z2  (projective → affin)
+  fe_invert(tmp, z2);
+  fe_mul(out, x2, tmp);
+
+  fe_del(x2); fe_del(z2); fe_del(x3); fe_del(z3);
+  fe_del(A); fe_del(AA); fe_del(B); fe_del(BB);
+  fe_del(E); fe_del(C); fe_del(D); fe_del(DA); fe_del(CB); fe_del(tmp);
+}
+
+// ─── Öffentliche API ──────────────────────────────────────────────────────────
+
+// X25519(out, k, u): 32-Byte-Ergebnis = k·u auf Curve25519
+// Klemmt k intern (RFC 7748 §5)
+pub fn X25519(out: int64, k: int64, u: int64) {
+  // Geklemmter Skalar (Kopie)
+  var ks: int64 := alloc(32);
+  var i: int64 := 0;
+  while (i < 32) { poke8(ks+i, peek8(k+i)); i := i+1; }
+  poke8(ks+0,  peek8(ks+0)  & 248);          // Bits 0-2 löschen
+  poke8(ks+31, (peek8(ks+31) & 127) | 64);   // Bit 255 löschen, Bit 254 setzen
+
+  var u_fe: int64 := fe_new();
+  var out_fe: int64 := fe_new();
+  fe_from_bytes(u_fe, u);
+  x25519_ladder(out_fe, ks, u_fe);
+  fe_to_bytes(out, out_fe);
+
+  free(ks, 32); fe_del(u_fe); fe_del(out_fe);
+}
+
+// Schlüsselerzeugung: sk = seed (geklämmt), pk = X25519(sk, 9)
+pub fn X25519KeyGen(seed: int64, pk: int64, sk: int64) {
+  var i: int64 := 0;
+  while (i < 32) { poke8(sk+i, peek8(seed+i)); i := i+1; }
+  // Basispunkt u=9 als 32 Bytes (little-endian)
+  var base: int64 := alloc(32);
+  i := 0;
+  while (i < 32) { poke8(base+i, 0); i := i+1; }
+  poke8(base+0, 9);
+  X25519(pk, sk, base);
+  free(base, 32);
+}
+
+// Shared Secret: ss = X25519(sk, pk)
+pub fn X25519SharedSecret(sk: int64, pk: int64, ss: int64) {
+  X25519(ss, sk, pk);
+}
