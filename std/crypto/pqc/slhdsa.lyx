@@ -1,0 +1,693 @@
+// std/crypto/pqc/slhdsa.lyx
+// WP-PQC-08: SLH-DSA (SPHINCS+, NIST FIPS 205)
+//
+// SHA2-Instanziierung (simple construction):
+//   F/H/T_l/PRF: SHA-256(0^(64-n) || PK.seed || ADRS || in)[0..n-1]
+//   PRF_msg:     HMAC-SHA256(SK.prf, opt_rand || msg)[0..n-1]
+//   H_msg:       MGF1-SHA256(SHA-256(R || PK.seed || PK.root || msg), m)
+//
+// ADRS-Layout (32 Bytes):
+//   [0-3]  layer  [4-15] tree  [16-19] type  [20-23] keypair
+//   [24-27] chain/tree_height  [28-31] hash/tree_index
+//
+// Parametersätze: SLH-DSA-SHA2-128s und SLH-DSA-SHA2-256s
+
+unit std.crypto.pqc.slhdsa;
+
+import std.crypto.sha256;
+import std.alloc;
+
+// ─── ADRS-Typ-Codes ──────────────────────────────────────────────────────
+pub con SLH_WOTS:       int64 := 0;
+pub con SLH_WOTS_PK:    int64 := 1;
+pub con SLH_TREE:       int64 := 2;
+pub con SLH_FORS_TREE:  int64 := 3;
+pub con SLH_FORS_ROOTS: int64 := 4;
+pub con SLH_WOTS_PRF:   int64 := 5;
+pub con SLH_FORS_PRF:   int64 := 6;
+
+// ─── Schlüssel- und Signaturgrößen ────────────────────────────────────────
+pub con SLH_128S_SK:  int64 := 64;
+pub con SLH_128S_PK:  int64 := 32;
+pub con SLH_128S_SIG: int64 := 7856;
+pub con SLH_256S_SK:  int64 := 128;
+pub con SLH_256S_PK:  int64 := 64;
+pub con SLH_256S_SIG: int64 := 29792;
+// Mini-Parametersatz für schnelle Korrektheitstests (nicht FIPS-konform)
+// n=16, h=4, d=2, a=2, k=4, w=16, h'=2, len=35
+pub con SLH_MINI_SIG: int64 := 1392;
+
+// ─── Parameter-Block (96 Bytes) ──────────────────────────────────────────
+// +0:n  +8:h  +16:d  +24:a  +32:k  +40:w  +48:h'  +56:len1
+// +64:len  +72:m  +80:mdfb(=ceil(k*a/8))  +88:mitb(=ceil((h-h')/8))
+pub con SLH_PS: int64 := 96;
+
+pub fn SLHParams128s(ps: int64) {
+  poke64(ps+0,16); poke64(ps+8,63); poke64(ps+16,7);  poke64(ps+24,12);
+  poke64(ps+32,14); poke64(ps+40,16); poke64(ps+48,9); poke64(ps+56,32);
+  poke64(ps+64,35); poke64(ps+72,30); poke64(ps+80,21); poke64(ps+88,7);
+}
+pub fn SLHParamsMini(ps: int64) {
+  // n=16, h=4, d=2, a=2, k=4, w=16 — schnell, nicht FIPS-konform
+  poke64(ps+0,16); poke64(ps+8,4);  poke64(ps+16,2);  poke64(ps+24,2);
+  poke64(ps+32,4);  poke64(ps+40,16); poke64(ps+48,2);  poke64(ps+56,32);
+  poke64(ps+64,35); poke64(ps+72,3);  poke64(ps+80,1);  poke64(ps+88,1);
+}
+pub fn SLHParams256s(ps: int64) {
+  poke64(ps+0,32); poke64(ps+8,64); poke64(ps+16,8);  poke64(ps+24,14);
+  poke64(ps+32,22); poke64(ps+40,16); poke64(ps+48,8); poke64(ps+56,64);
+  poke64(ps+64,67); poke64(ps+72,47); poke64(ps+80,39); poke64(ps+88,7);
+}
+
+// ─── ADRS-Hilfsfunktionen ────────────────────────────────────────────────
+fn wbe4(b: int64, v: int64) {
+  poke8(b,(v>>24)&0xFF); poke8(b+1,(v>>16)&0xFF); poke8(b+2,(v>>8)&0xFF); poke8(b+3,v&0xFF);
+}
+fn rbe4(b: int64): int64 {
+  return ((peek8(b)<<24)|(peek8(b+1)<<16)|(peek8(b+2)<<8)|peek8(b+3));
+}
+fn acopy(d: int64, s: int64) {
+  var i: int64 := 0; while (i < 32) { poke8(d+i,peek8(s+i)); i := i+1; }
+}
+fn asetlayer(a: int64, v: int64) { wbe4(a, v); }
+fn asettree(a: int64, v: int64) {
+  poke8(a+4,0); poke8(a+5,0); poke8(a+6,0); poke8(a+7,0);
+  poke8(a+8,(v>>56)&0xFF); poke8(a+9,(v>>48)&0xFF);
+  poke8(a+10,(v>>40)&0xFF); poke8(a+11,(v>>32)&0xFF);
+  wbe4(a+12, v & 0xFFFFFFFF);
+}
+// asettype: keeps keypair (20-23), clears 24-31 — for WOTS/FORS types
+fn asettype(a: int64, t: int64) {
+  wbe4(a+16, t);
+  var i: int64 := 24; while (i < 32) { poke8(a+i,0); i := i+1; }
+}
+// asettypex: also clears keypair — for TREE type (no keypair field)
+fn asettypex(a: int64, t: int64) {
+  wbe4(a+16, t);
+  var i: int64 := 20; while (i < 32) { poke8(a+i,0); i := i+1; }
+}
+fn asetkp(a: int64, v: int64)   { wbe4(a+20, v); }
+fn asetch(a: int64, v: int64)   { wbe4(a+24, v); }
+fn aseththt(a: int64, v: int64) { wbe4(a+24, v); }
+fn asetthi(a: int64, v: int64)  { wbe4(a+28, v); }
+fn agetkp(a: int64): int64      { return rbe4(a+20); }
+
+// ─── Speicher-Utilities ──────────────────────────────────────────────────
+fn scopy(d: int64, s: int64, n: int64) {
+  var i: int64 := 0; while (i < n) { poke8(d+i,peek8(s+i)); i := i+1; }
+}
+fn szero(b: int64, n: int64) {
+  var i: int64 := 0; while (i < n) { poke8(b+i,0); i := i+1; }
+}
+// Lese n Bytes big-endian als int64 (n <= 8)
+fn srbe(buf: int64, nb: int64): int64 {
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < nb) { v := (v << 8) | (peek8(buf+i) & 0xFF); i := i+1; }
+  return v;
+}
+// Extrahiere bcount Bits ab Bitposition bstart aus Puffer (MSB-first)
+fn sbits(buf: int64, bstart: int64, bcount: int64): int64 {
+  var bo: int64 := bstart >> 3;
+  var bi: int64 := bstart & 7;
+  var b0: int64 := peek8(buf+bo);
+  var b1: int64 := peek8(buf+bo+1);
+  var b2: int64 := 0;
+  if ((bi + bcount) > 16) { b2 := peek8(buf+bo+2); }
+  var v: int64 := (b0 << 16) | (b1 << 8) | b2;
+  var sh: int64 := 24 - bi - bcount;
+  return (v >> sh) & ((1 << bcount) - 1);
+}
+
+// ─── Hash-Primitive ──────────────────────────────────────────────────────
+
+// Tweakable Hash: SHA-256(0^(64-n) || pk_seed || ADRS || in)[0..n-1]
+fn thash(ps: int64, pks: int64, adrs: int64, ibuf: int64, ilen: int64, out: int64) {
+  var n: int64 := peek64(ps);
+  var bl: int64 := 64 + 32 + ilen;
+  var buf: int64 := alloc(bl);
+  var tmp: int64 := alloc(32);
+  szero(buf, 64-n);
+  scopy(buf+(64-n), pks, n); scopy(buf+64, adrs, 32); scopy(buf+96, ibuf, ilen);
+  SHA256(buf, bl, tmp);
+  scopy(out, tmp, n);
+  free(tmp,32); free(buf,bl);
+}
+
+fn slhprf(ps: int64, pks: int64, sks: int64, adrs: int64, out: int64) {
+  thash(ps, pks, adrs, sks, peek64(ps), out);
+}
+
+// PRF_msg: HMAC-SHA256(SK.prf, opt_rand || msg)[0..n-1]
+fn slhprf_msg(ps: int64, skprf: int64, orand: int64, msg: int64, mlen: int64, out: int64) {
+  var n: int64 := peek64(ps);
+  var kp: int64 := alloc(64);
+  var ii: int64 := alloc(64+n+mlen);
+  var oi: int64 := alloc(96);
+  var inn: int64 := alloc(32);
+  var tmp: int64 := alloc(32);
+  var i: int64 := 0;
+  scopy(kp, skprf, n); while (i < 64-n) { poke8(kp+n+i,0); i := i+1; }
+  i := 0; while (i < 64) { poke8(ii+i, peek8(kp+i)^0x36); i := i+1; }
+  i := 0; while (i < 64) { poke8(oi+i, peek8(kp+i)^0x5C); i := i+1; }
+  scopy(ii+64, orand, n); scopy(ii+64+n, msg, mlen);
+  SHA256(ii, 64+n+mlen, inn);
+  scopy(oi+64, inn, 32); SHA256(oi, 96, tmp);
+  scopy(out, tmp, n);
+  free(tmp,32); free(inn,32); free(oi,96); free(ii,64+n+mlen); free(kp,64);
+}
+
+// H_msg: SHA256(R||PK.seed||PK.root||msg) → MGF1 → m Bytes
+// rpk = alloc(3*n) = R || PK.seed || PK.root
+fn slhhmsg(ps: int64, rpk: int64, msg: int64, mlen: int64, out: int64) {
+  var n: int64 := peek64(ps);
+  var m: int64 := peek64(ps+72);
+  var sl: int64 := 3*n + mlen;
+  var si: int64 := alloc(sl);
+  var seed: int64 := alloc(32);
+  var mbuf: int64 := alloc(36);
+  var blk: int64 := alloc(32);
+  scopy(si, rpk, 3*n); scopy(si+3*n, msg, mlen);
+  SHA256(si, sl, seed);
+  free(si, sl);
+  scopy(mbuf, seed, 32);
+  var pos: int64 := 0;
+  var ctr: int64 := 0;
+  while (pos < m) {
+    wbe4(mbuf+32, ctr);
+    SHA256(mbuf, 36, blk);
+    var tc: int64 := m - pos;
+    if (tc > 32) { tc := 32; }
+    scopy(out+pos, blk, tc);
+    pos := pos+tc; ctr := ctr+1;
+  }
+  free(blk,32); free(mbuf,36); free(seed,32);
+}
+
+// ─── WOTS+ ───────────────────────────────────────────────────────────────
+
+// base_w: konvertiere n Bytes in len1 Basis-16-Ziffern (High-Nibble zuerst)
+fn basew(ibuf: int64, obuf: int64, len1: int64) {
+  var bi: int64 := 0;
+  var i: int64 := 0;
+  while (i < len1) {
+    if ((i & 1) == 0) { poke8(obuf+i, (peek8(ibuf+bi) >> 4) & 0xF); }
+    else              { poke8(obuf+i, peek8(ibuf+bi) & 0xF); bi := bi+1; }
+    i := i+1;
+  }
+}
+
+// chain: wende F `steps` mal ab `start` an, modifiziert val in-place
+fn wchain(ps: int64, val: int64, start: int64, steps: int64, pks: int64, adrs: int64) {
+  var i: int64 := start;
+  while (i < start+steps) {
+    asetch(adrs, i);
+    thash(ps, pks, adrs, val, peek64(ps), val);
+    i := i+1;
+  }
+}
+
+fn wotssign(ps: int64, sks: int64, pks: int64, msg: int64, adrs: int64, sig: int64) {
+  var n: int64 := peek64(ps);
+  var l1: int64 := peek64(ps+56);
+  var len: int64 := peek64(ps+64);
+  var dg: int64 := alloc(len);
+  var ca: int64 := alloc(32);
+  var sk: int64 := alloc(n);
+  var csum: int64 := 0;
+  var i: int64 := 0;
+  basew(msg, dg, l1);
+  while (i < l1) { csum := csum+(15-peek8(dg+i)); i := i+1; }
+  poke8(dg+l1,  (csum>>8)&0xF);
+  poke8(dg+l1+1,(csum>>4)&0xF);
+  poke8(dg+l1+2, csum&0xF);
+  i := 0;
+  while (i < len) {
+    acopy(ca,adrs); asettype(ca,SLH_WOTS_PRF); asetch(ca,i);
+    slhprf(ps, pks, sks, ca, sk);
+    scopy(sig+i*n, sk, n);
+    acopy(ca,adrs); asettype(ca,SLH_WOTS); asetch(ca,i);
+    wchain(ps, sig+i*n, 0, peek8(dg+i), pks, ca);
+    i := i+1;
+  }
+  free(sk,n); free(ca,32); free(dg,len);
+}
+
+fn wotspkfromsig(ps: int64, pks: int64, msg: int64, sig: int64, adrs: int64, pkout: int64) {
+  var n: int64 := peek64(ps);
+  var l1: int64 := peek64(ps+56);
+  var len: int64 := peek64(ps+64);
+  var dg: int64 := alloc(len);
+  var cb: int64 := alloc(len*n);
+  var ca: int64 := alloc(32);
+  var csum: int64 := 0;
+  var i: int64 := 0;
+  basew(msg, dg, l1);
+  while (i < l1) { csum := csum+(15-peek8(dg+i)); i := i+1; }
+  poke8(dg+l1,  (csum>>8)&0xF);
+  poke8(dg+l1+1,(csum>>4)&0xF);
+  poke8(dg+l1+2, csum&0xF);
+  i := 0;
+  while (i < len) {
+    acopy(ca,adrs); asettype(ca,SLH_WOTS); asetch(ca,i);
+    scopy(cb+i*n, sig+i*n, n);
+    wchain(ps, cb+i*n, peek8(dg+i), 15-peek8(dg+i), pks, ca);
+    i := i+1;
+  }
+  acopy(ca,adrs); asettype(ca,SLH_WOTS_PK);
+  thash(ps, pks, ca, cb, len*n, pkout);
+  free(ca,32); free(cb,len*n); free(dg,len);
+}
+
+fn wotspkgen(ps: int64, sks: int64, pks: int64, adrs: int64, pkout: int64) {
+  var n: int64 := peek64(ps);
+  var len: int64 := peek64(ps+64);
+  var cb: int64 := alloc(len*n);
+  var ca: int64 := alloc(32);
+  var sk: int64 := alloc(n);
+  var i: int64 := 0;
+  while (i < len) {
+    acopy(ca,adrs); asettype(ca,SLH_WOTS_PRF); asetch(ca,i);
+    slhprf(ps, pks, sks, ca, sk);
+    scopy(cb+i*n, sk, n);
+    acopy(ca,adrs); asettype(ca,SLH_WOTS); asetch(ca,i);
+    wchain(ps, cb+i*n, 0, 15, pks, ca);
+    i := i+1;
+  }
+  acopy(ca,adrs); asettype(ca,SLH_WOTS_PK);
+  thash(ps, pks, ca, cb, len*n, pkout);
+  free(sk,n); free(ca,32); free(cb,len*n);
+}
+
+// ─── XMSS-Teilbaum-Root ───────────────────────────────────────────────────
+// seeds = sk_seed || pk_seed (2*n Bytes); hz = Baumhöhe
+fn xmssstree(ps: int64, seeds: int64, adrs: int64, start: int64, hz: int64, rout: int64) {
+  var n: int64 := peek64(ps);
+  var pks: int64 := seeds+n;
+  if (hz == 0) {
+    var la: int64 := alloc(32);
+    acopy(la,adrs); asetkp(la,start);
+    wotspkgen(ps, seeds, pks, la, rout);
+    free(la,32); return;
+  }
+  var es: int64 := n+16;
+  var stk: int64 := alloc((hz+1)*es);
+  var sp: int64 := 0;
+  var nl: int64 := 1 << hz;
+  var la: int64 := alloc(32);
+  var na: int64 := alloc(32);
+  var tn: int64 := alloc(n);
+  var lr: int64 := alloc(2*n);
+  var i: int64 := 0;
+  while (i < nl) {
+    acopy(la,adrs); asetkp(la,start+i);
+    wotspkgen(ps, seeds, pks, la, tn);
+    scopy(stk+sp*es, tn, n);
+    poke64(stk+sp*es+n,   0);
+    poke64(stk+sp*es+n+8, start+i);
+    sp := sp+1;
+    var mg: int64 := 1;
+    while (mg == 1) {
+      if (sp < 2) { mg := 0; }
+      else {
+        var h1: int64 := peek64(stk+(sp-1)*es+n);
+        var h2: int64 := peek64(stk+(sp-2)*es+n);
+        if (h1 != h2) { mg := 0; }
+        else {
+          var hm: int64 := h1+1;
+          var tl: int64 := peek64(stk+(sp-2)*es+n+8);
+          var tp: int64 := tl >> 1;
+          scopy(lr,   stk+(sp-2)*es, n);
+          scopy(lr+n, stk+(sp-1)*es, n);
+          acopy(na,adrs); asettypex(na,SLH_TREE); aseththt(na,hm); asetthi(na,tp);
+          thash(ps, pks, na, lr, 2*n, tn);
+          sp := sp-2;
+          scopy(stk+sp*es, tn, n);
+          poke64(stk+sp*es+n,   hm);
+          poke64(stk+sp*es+n+8, tp);
+          sp := sp+1;
+        }
+      }
+    }
+    i := i+1;
+  }
+  scopy(rout, stk, n);
+  free(lr,2*n); free(tn,n); free(na,32); free(la,32); free(stk,(hz+1)*es);
+}
+
+// ─── XMSS Sign & PK-from-Sig ─────────────────────────────────────────────
+// sig = WOTS+sig(len*n) || auth(h'*n)
+fn xmsssign(ps: int64, seeds: int64, msg: int64, leaf: int64, adrs: int64, sig: int64) {
+  var n: int64 := peek64(ps);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var pks: int64 := seeds+n;
+  var wa: int64 := alloc(32);
+  acopy(wa,adrs); asettype(wa,SLH_WOTS); asetkp(wa,leaf);
+  wotssign(ps, seeds, pks, msg, wa, sig);
+  free(wa,32);
+  var j: int64 := 0;
+  while (j < hp) {
+    var ss: int64 := ((leaf >> j) ^ 1) << j;
+    var ta: int64 := alloc(32);
+    acopy(ta,adrs);
+    xmssstree(ps, seeds, ta, ss, j, sig+len*n+j*n);
+    free(ta,32);
+    j := j+1;
+  }
+}
+
+// adrs.kp = leaf_idx; sig = WOTS+sig || auth
+fn xmsspkfromsig(ps: int64, pks: int64, msg: int64, sig: int64, adrs: int64, rout: int64) {
+  var n: int64 := peek64(ps);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var leaf: int64 := agetkp(adrs);
+  var wa: int64 := alloc(32);
+  var node: int64 := alloc(n);
+  var lr: int64 := alloc(2*n);
+  var na: int64 := alloc(32);
+  acopy(wa,adrs); asettype(wa,SLH_WOTS); asetkp(wa,leaf);
+  wotspkfromsig(ps, pks, msg, sig, wa, node);
+  free(wa,32);
+  var j: int64 := 0;
+  while (j < hp) {
+    var authj: int64 := sig+len*n+j*n;
+    acopy(na,adrs); asettypex(na,SLH_TREE); aseththt(na,j+1); asetthi(na,leaf>>(j+1));
+    if (((leaf >> j) & 1) == 0) {
+      scopy(lr, node, n); scopy(lr+n, authj, n);
+    } else {
+      scopy(lr, authj, n); scopy(lr+n, node, n);
+    }
+    thash(ps, pks, na, lr, 2*n, node);
+    j := j+1;
+  }
+  scopy(rout, node, n);
+  free(na,32); free(lr,2*n); free(node,n);
+}
+
+// ─── FORS ────────────────────────────────────────────────────────────────
+// Single-pass FORS-Baum: Root + Auth-Pfad für Blatt target
+// seeds=sk_seed||pk_seed, cfg=alloc(16)=(tree_i,target), auth=a*n Bytes
+// target >= 0x7FFFFFFF → kein Auth-Pfad
+fn forstree(ps: int64, seeds: int64, adrs: int64, cfg: int64, rout: int64, auth: int64) {
+  var n: int64 := peek64(ps);
+  var a: int64 := peek64(ps+24);
+  var ti: int64 := peek64(cfg);
+  var tgt: int64 := peek64(cfg+8);
+  var nl: int64 := 1 << a;
+  var pks: int64 := seeds+n;
+  var es: int64 := n+16;
+  var stk: int64 := alloc((a+1)*es);
+  var sp: int64 := 0;
+  var pa: int64 := alloc(32);
+  var la: int64 := alloc(32);
+  var na: int64 := alloc(32);
+  var tv: int64 := alloc(n);
+  var lr: int64 := alloc(2*n);
+  var noauth: int64 := 0;
+  if (tgt >= 0x7FFFFFFF) { noauth := 1; }
+  var i: int64 := 0;
+  while (i < nl) {
+    var gi: int64 := ti*nl + i;
+    // FORS-Blatt: PRF → F
+    acopy(pa,adrs); asettype(pa,SLH_FORS_PRF); aseththt(pa,0); asetthi(pa,gi);
+    slhprf(ps, pks, seeds, pa, tv);
+    acopy(la,adrs); asettype(la,SLH_FORS_TREE); aseththt(la,0); asetthi(la,gi);
+    thash(ps, pks, la, tv, n, tv);
+    scopy(stk+sp*es, tv, n);
+    poke64(stk+sp*es+n, 0); poke64(stk+sp*es+n+8, gi);
+    sp := sp+1;
+    var mg: int64 := 1;
+    while (mg == 1) {
+      if (sp < 2) { mg := 0; }
+      else {
+        var h1: int64 := peek64(stk+(sp-1)*es+n);
+        var h2: int64 := peek64(stk+(sp-2)*es+n);
+        if (h1 != h2) { mg := 0; }
+        else {
+          var hm: int64 := h1+1;
+          var tl: int64 := peek64(stk+(sp-2)*es+n+8);
+          var tp: int64 := tl >> 1;
+          // Auth-Extraktion
+          if (noauth == 0) {
+            var tg: int64 := ti*nl + tgt;
+            var ta: int64 := tg >> h1;
+            if (tl == ta) { scopy(auth+h1*n, stk+(sp-1)*es, n); }
+            if ((tl+1) == ta) { scopy(auth+h1*n, stk+(sp-2)*es, n); }
+          }
+          scopy(lr,   stk+(sp-2)*es, n);
+          scopy(lr+n, stk+(sp-1)*es, n);
+          acopy(na,adrs); asettype(na,SLH_FORS_TREE); aseththt(na,hm); asetthi(na,tp);
+          thash(ps, pks, na, lr, 2*n, tv);
+          sp := sp-2;
+          scopy(stk+sp*es, tv, n);
+          poke64(stk+sp*es+n, hm); poke64(stk+sp*es+n+8, tp);
+          sp := sp+1;
+        }
+      }
+    }
+    i := i+1;
+  }
+  scopy(rout, stk, n);
+  free(lr,2*n); free(tv,n); free(na,32); free(la,32); free(pa,32);
+  free(stk,(a+1)*es);
+}
+
+fn forssign(ps: int64, seeds: int64, adrs: int64, md: int64, sigf: int64, fpkout: int64) {
+  var n: int64 := peek64(ps);
+  var a: int64 := peek64(ps+24);
+  var k: int64 := peek64(ps+32);
+  var pks: int64 := seeds+n;
+  var tsz: int64 := (a+1)*n;
+  var roots: int64 := alloc(k*n);
+  var cfg: int64 := alloc(16);
+  var pa: int64 := alloc(32);
+  var i: int64 := 0;
+  while (i < k) {
+    var tgt: int64 := sbits(md, i*a, a);
+    var gl: int64 := i*(1 << a) + tgt;
+    // SK-Blatt speichern
+    acopy(pa,adrs); asettype(pa,SLH_FORS_PRF); aseththt(pa,0); asetthi(pa,gl);
+    slhprf(ps, pks, seeds, pa, sigf+i*tsz);
+    // Baum + Auth-Pfad
+    poke64(cfg, i); poke64(cfg+8, tgt);
+    forstree(ps, seeds, adrs, cfg, roots+i*n, sigf+i*tsz+n);
+    i := i+1;
+  }
+  var ra: int64 := alloc(32);
+  acopy(ra,adrs); asettype(ra,SLH_FORS_ROOTS);
+  thash(ps, pks, ra, roots, k*n, fpkout);
+  free(ra,32); free(pa,32); free(cfg,16); free(roots,k*n);
+}
+
+fn forspkfromsig(ps: int64, pks: int64, md: int64, sigf: int64, adrs: int64, pkout: int64) {
+  var n: int64 := peek64(ps);
+  var a: int64 := peek64(ps+24);
+  var k: int64 := peek64(ps+32);
+  var tsz: int64 := (a+1)*n;
+  var roots: int64 := alloc(k*n);
+  var la: int64 := alloc(32);
+  var na: int64 := alloc(32);
+  var node: int64 := alloc(n);
+  var lr: int64 := alloc(2*n);
+  var i: int64 := 0;
+  while (i < k) {
+    var tgt: int64 := sbits(md, i*a, a);
+    var gl: int64 := i*(1 << a) + tgt;
+    // Blatt-Hash aus SK
+    acopy(la,adrs); asettype(la,SLH_FORS_TREE); aseththt(la,0); asetthi(la,gl);
+    thash(ps, pks, la, sigf+i*tsz, n, node);
+    // Auth-Pfad verifizieren
+    var j: int64 := 0;
+    while (j < a) {
+      var authj: int64 := sigf+i*tsz+n+j*n;
+      acopy(na,adrs); asettype(na,SLH_FORS_TREE); aseththt(na,j+1); asetthi(na,gl>>(j+1));
+      if (((tgt >> j) & 1) == 0) {
+        scopy(lr, node, n); scopy(lr+n, authj, n);
+      } else {
+        scopy(lr, authj, n); scopy(lr+n, node, n);
+      }
+      thash(ps, pks, na, lr, 2*n, node);
+      j := j+1;
+    }
+    scopy(roots+i*n, node, n);
+    i := i+1;
+  }
+  var ra: int64 := alloc(32);
+  acopy(ra,adrs); asettype(ra,SLH_FORS_ROOTS);
+  thash(ps, pks, ra, roots, k*n, pkout);
+  free(ra,32); free(lr,2*n); free(node,n); free(na,32); free(la,32); free(roots,k*n);
+}
+
+// ─── Hypertree (HT) ──────────────────────────────────────────────────────
+// seeds=sk_seed||pk_seed; idx=h-Bit-Index; msg=FORS-PK (n Bytes)
+fn htsign(ps: int64, seeds: int64, msg: int64, idx: int64, sigh: int64) {
+  var n: int64 := peek64(ps);
+  var d: int64 := peek64(ps+16);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var lsz: int64 := (len+hp)*n;
+  var cur: int64 := alloc(n);
+  var nxt: int64 := alloc(n);
+  var adrs: int64 := alloc(32);
+  scopy(cur, msg, n);
+  var l: int64 := 0;
+  while (l < d) {
+    var li: int64 := (idx >> (l*hp)) & ((1 << hp)-1);
+    var ts: int64 := (l+1)*hp;
+    var ti: int64 := 0;
+    if (ts < 64) { ti := idx >> ts; }
+    asetlayer(adrs,l); asettree(adrs,ti);
+    xmsssign(ps, seeds, cur, li, adrs, sigh+l*lsz);
+    asetkp(adrs, li);
+    xmsspkfromsig(ps, seeds+n, cur, sigh+l*lsz, adrs, nxt);
+    scopy(cur, nxt, n);
+    l := l+1;
+  }
+  free(adrs,32); free(nxt,n); free(cur,n);
+}
+
+fn htverify(ps: int64, pks: int64, msg: int64, idx: int64, sigh: int64, pkroot: int64): int64 {
+  var n: int64 := peek64(ps);
+  var d: int64 := peek64(ps+16);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var lsz: int64 := (len+hp)*n;
+  var cur: int64 := alloc(n);
+  var nxt: int64 := alloc(n);
+  var adrs: int64 := alloc(32);
+  scopy(cur, msg, n);
+  var l: int64 := 0;
+  while (l < d) {
+    var li: int64 := (idx >> (l*hp)) & ((1 << hp)-1);
+    var ts: int64 := (l+1)*hp;
+    var ti: int64 := 0;
+    if (ts < 64) { ti := idx >> ts; }
+    asetlayer(adrs,l); asettree(adrs,ti); asetkp(adrs,li);
+    xmsspkfromsig(ps, pks, cur, sigh+l*lsz, adrs, nxt);
+    scopy(cur, nxt, n);
+    l := l+1;
+  }
+  var ok: int64 := 1;
+  var i: int64 := 0;
+  while (i < n) {
+    if (peek8(cur+i) != peek8(pkroot+i)) { ok := 0; }
+    i := i+1;
+  }
+  free(adrs,32); free(nxt,n); free(cur,n);
+  return ok;
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────
+// sk = SK.seed || SK.prf || PK.seed || PK.root  (4*n Bytes)
+// pk = PK.seed || PK.root                        (2*n Bytes)
+
+pub fn SLHDSAKeyGen(ps: int64, skseed: int64, skprf: int64, pkseed: int64, sk: int64, pk: int64) {
+  var n: int64 := peek64(ps);
+  var d: int64 := peek64(ps+16);
+  var hp: int64 := peek64(ps+48);
+  var seeds: int64 := alloc(2*n);
+  scopy(seeds, skseed, n); scopy(seeds+n, pkseed, n);
+  var adrs: int64 := alloc(32);
+  asetlayer(adrs, d-1); asettree(adrs, 0);
+  var pkroot: int64 := alloc(n);
+  xmssstree(ps, seeds, adrs, 0, hp, pkroot);
+  free(adrs,32); free(seeds,2*n);
+  scopy(sk,       skseed, n);
+  scopy(sk+n,     skprf,  n);
+  scopy(sk+2*n,   pkseed, n);
+  scopy(sk+3*n,   pkroot, n);
+  scopy(pk,       pkseed, n);
+  scopy(pk+n,     pkroot, n);
+  free(pkroot,n);
+}
+
+// optrand=0 → deterministisch (PK.seed); sonst Zeiger auf n Bytes Zufall
+pub fn SLHDSASign(ps: int64, sk: int64, msg: int64, mlen: int64, optrand: int64, sig: int64): int64 {
+  var n: int64 := peek64(ps);
+  var d: int64 := peek64(ps+16);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var k: int64 := peek64(ps+32);
+  var a: int64 := peek64(ps+24);
+  var m: int64 := peek64(ps+72);
+  var mdfb: int64 := peek64(ps+80);
+  var mitb: int64 := peek64(ps+88);
+  var h: int64 := peek64(ps+8);
+  var skseed: int64 := sk;
+  var skprf: int64 := sk+n;
+  var pkseed: int64 := sk+2*n;
+  var pkroot: int64 := sk+3*n;
+
+  var R: int64 := sig;
+  var orand2: int64 := optrand;
+  if (orand2 == 0) { orand2 := pkseed; }
+  slhprf_msg(ps, skprf, orand2, msg, mlen, R);
+
+  var hmsg: int64 := alloc(m);
+  var rpk: int64 := alloc(3*n);
+  scopy(rpk, R, n); scopy(rpk+n, pkseed, n); scopy(rpk+2*n, pkroot, n);
+  slhhmsg(ps, rpk, msg, mlen, hmsg);
+  free(rpk,3*n);
+
+  var md: int64 := hmsg;
+  var milb: int64 := m - mdfb - mitb;
+  var hmhp: int64 := h - hp;
+  var itree: int64 := srbe(hmsg+mdfb, mitb) & ((1 << hmhp)-1);
+  var ileaf: int64 := srbe(hmsg+mdfb+mitb, milb) & ((1 << hp)-1);
+  var idx: int64 := (itree << hp) | ileaf;
+
+  var seeds: int64 := alloc(2*n);
+  scopy(seeds, skseed, n); scopy(seeds+n, pkseed, n);
+  var adrs: int64 := alloc(32);
+  asetlayer(adrs,0); asettree(adrs,itree); asetkp(adrs,ileaf);
+
+  var sfsz: int64 := k*(a+1)*n;
+  var fpk: int64 := alloc(n);
+  forssign(ps, seeds, adrs, md, sig+n, fpk);
+
+  var shsz: int64 := d*(len+hp)*n;
+  htsign(ps, seeds, fpk, idx, sig+n+sfsz);
+
+  free(fpk,n); free(adrs,32); free(seeds,2*n); free(hmsg,m);
+  return n + sfsz + shsz;
+}
+
+pub fn SLHDSAVerify(ps: int64, pk: int64, msg: int64, mlen: int64, sig: int64): int64 {
+  var n: int64 := peek64(ps);
+  var d: int64 := peek64(ps+16);
+  var hp: int64 := peek64(ps+48);
+  var len: int64 := peek64(ps+64);
+  var k: int64 := peek64(ps+32);
+  var a: int64 := peek64(ps+24);
+  var m: int64 := peek64(ps+72);
+  var mdfb: int64 := peek64(ps+80);
+  var mitb: int64 := peek64(ps+88);
+  var h: int64 := peek64(ps+8);
+  var pkseed: int64 := pk;
+  var pkroot: int64 := pk+n;
+
+  var hmsg: int64 := alloc(m);
+  var rpk: int64 := alloc(3*n);
+  scopy(rpk, sig, n); scopy(rpk+n, pkseed, n); scopy(rpk+2*n, pkroot, n);
+  slhhmsg(ps, rpk, msg, mlen, hmsg);
+  free(rpk,3*n);
+
+  var milb: int64 := m - mdfb - mitb;
+  var hmhp: int64 := h - hp;
+  var itree: int64 := srbe(hmsg+mdfb, mitb) & ((1 << hmhp)-1);
+  var ileaf: int64 := srbe(hmsg+mdfb+mitb, milb) & ((1 << hp)-1);
+  var idx: int64 := (itree << hp) | ileaf;
+
+  var adrs: int64 := alloc(32);
+  asetlayer(adrs,0); asettree(adrs,itree); asetkp(adrs,ileaf);
+  var sfsz: int64 := k*(a+1)*n;
+  var fpk: int64 := alloc(n);
+  forspkfromsig(ps, pkseed, hmsg, sig+n, adrs, fpk);
+  free(adrs,32);
+
+  var ok: int64 := htverify(ps, pkseed, fpk, idx, sig+n+sfsz, pkroot);
+  free(fpk,n); free(hmsg,m);
+  return ok;
+}
