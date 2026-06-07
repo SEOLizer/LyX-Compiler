@@ -1,4 +1,4 @@
-# Lyx v0.9.2A — Canonical EBNF Grammar
+# Lyx v0.9.3A — Canonical EBNF Grammar
 
 Status: Draft
 Target parser: Recursive Descent + Pratt Expression Parser
