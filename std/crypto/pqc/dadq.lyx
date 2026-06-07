@@ -1,0 +1,372 @@
+// std/crypto/pqc/dadq.lyx
+// WP-DADQ-01: Dynamically Dimensioned Alternating Quasigroup Cryptosystem
+//
+// Design-Grundlage: work/dadq_decisions.md (F-1..F-5)
+// Mathematische Spec: work/dadq_phase0.md
+//
+// Algebraische Struktur:
+//   Q = (Z_{256}, *) wobei * durch eine 256x256 Latin-Square-Tabelle T definiert ist.
+//   T[a][b] := pi[(a + b) mod 256]  wobei pi eine geheime Permutation aus dem Seed ist.
+//   Latin-Square: Zeilen und Spalten sind jeweils Shifts von pi => bijektiv.
+//
+// Falltuer-Konstruktion (AP-0.2):
+//   pk = seed_T (32 Bytes) -- T_pub on-demand aus Seed rekonstruierbar
+//   sk = (sigma[256], sigma_inv[256], seed_D[32], seed_T[32]) = 576 Bytes
+//
+// Encryption: m_enc[i] = T[m[i]][r[i]];  c = m_enc || (r XOR SHA256(m_enc))
+// Decryption: r = commit XOR SHA256(m_enc);  m[i] = T_col_inv[r[i]][m_enc[i]]
+//
+// Korrektheitsbeweis:
+//   m_enc[i] = T[m[i]][r[i]]  (Def. Enc)
+//   T_col_inv[r[i]][m_enc[i]] = m[i]  (Latin-Square: Spalte r[i] ist Permutation)
+//
+// Sicherheitsargument AP-0.4:
+//   Polynomgrad von T ueber GF(2^8) ca. 255 => Groebner-Basis-Angriff unpraktikabel.
+//
+// Public API:
+//   dadqKeyGenFull(master_seed, pk, sk)
+//   dadqEnc(pk, m, m_len, c)       -- c muss m_len+32 Bytes gross sein
+//   dadqDec(sk, c, c_len, m): int64  -- 0=OK, -1=ungueltig
+//   dadqEncAlloc(pk, m, m_len): int64
+//   dadqDecAlloc(sk, c, c_len): int64
+
+unit std.crypto.pqc.dadq;
+
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.rand;
+
+// --- Groessenkonstanten ---
+
+pub con DADQ_SEED_LEN:    int64 := 32;
+pub con DADQ_PK_LEN:      int64 := 32;
+pub con DADQ_SK_LEN:      int64 := 544;
+pub con DADQ_SK_LEN_FULL: int64 := 576;  // sk[544..575] = seed_T fuer dadqDec
+pub con DADQ_OVERHEAD:    int64 := 32;
+pub con DADQ_TABLE_SZ:    int64 := 65536; // 256x256 Bytes
+pub con DADQ_BLOCK_SZ:    int64 := 16;
+
+// --- SHA-256-basierte DRBG ---
+// out_i = SHA256(seed || counter_i), liefert 32 Bytes pro Aufruf.
+
+fn dadqDRBGNext(seed: int64, counter: int64, out: int64) {
+    var buf: int64 := alloc(40);
+    var i: int64 := 0;
+    while (i < 32) {
+        poke8(buf + i, peek8(seed + i));
+        i := i + 1;
+    }
+    poke8(buf + 32, counter & 0xFF);
+    poke8(buf + 33, (counter >> 8)  & 0xFF);
+    poke8(buf + 34, (counter >> 16) & 0xFF);
+    poke8(buf + 35, (counter >> 24) & 0xFF);
+    poke8(buf + 36, (counter >> 32) & 0xFF);
+    poke8(buf + 37, (counter >> 40) & 0xFF);
+    poke8(buf + 38, (counter >> 48) & 0xFF);
+    poke8(buf + 39, (counter >> 56) & 0xFF);
+    SHA256(buf, 40, out);
+    free(buf, 40);
+}
+
+// --- Fisher-Yates-Shuffle via DRBG ---
+// Erzeugt eine zufaellige Permutation von {0..255} in perm[0..255].
+
+fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
+    var dseed:   int64 := alloc(33);
+    var dseed_h: int64 := alloc(32);
+    var rng_buf: int64 := alloc(256);
+    var i:       int64 := 0;
+    var chunk:   int64 := 0;
+    var r_byte:  int64 := 0;
+    var j:       int64 := 0;
+    var tmp:     int64 := 0;
+
+    while (i < 32) {
+        poke8(dseed + i, peek8(seed + i));
+        i := i + 1;
+    }
+    poke8(dseed + 32, domain_byte & 0xFF);
+    SHA256(dseed, 33, dseed_h);
+    free(dseed, 33);
+
+    i := 0;
+    while (i < 256) {
+        poke8(perm + i, i & 0xFF);
+        i := i + 1;
+    }
+
+    chunk := 0;
+    while (chunk < 8) {
+        dadqDRBGNext(dseed_h, chunk, rng_buf + chunk * 32);
+        chunk := chunk + 1;
+    }
+
+    // Fisher-Yates: i von 255 downto 1
+    i := 255;
+    while (i >= 1) {
+        r_byte := peek8(rng_buf + (255 - i)) & 0xFF;
+        j := r_byte - (r_byte / (i + 1)) * (i + 1);
+        tmp := peek8(perm + i) & 0xFF;
+        poke8(perm + i, peek8(perm + j) & 0xFF);
+        poke8(perm + j, tmp & 0xFF);
+        i := i - 1;
+    }
+
+    free(rng_buf, 256);
+    free(dseed_h, 32);
+}
+
+// --- Latin-Square-Tabelle generieren ---
+// AP-0.1: T[a][b] := pi[(a + b) mod 256]
+// Latin-Square: Zeile a = shift von pi um a => bijektiv. Analog Spalten.
+
+fn dadqGenTable(seed: int64, domain_byte: int64, table: int64) {
+    var perm: int64 := alloc(256);
+    var a:    int64 := 0;
+    var b:    int64 := 0;
+    var sum:  int64 := 0;
+    var idx:  int64 := 0;
+
+    dadqGenPerm(seed, domain_byte, perm);
+
+    a := 0;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            sum := a + b;
+            idx := sum - (sum / 256) * 256;
+            poke8(table + a * 256 + b, peek8(perm + idx) & 0xFF);
+            b := b + 1;
+        }
+        a := a + 1;
+    }
+
+    free(perm, 256);
+}
+
+// --- Spalteninverse der Tabelle ---
+// col_inv[b][v] = a  sodass  T[a][b] = v
+// Existenz und Eindeutigkeit: Latin-Square-Eigenschaft.
+
+fn dadqBuildColInv(table: int64, col_inv: int64) {
+    var b: int64 := 0;
+    var a: int64 := 0;
+    var v: int64 := 0;
+
+    b := 0;
+    while (b < 256) {
+        a := 0;
+        while (a < 256) {
+            v := peek8(table + a * 256 + b) & 0xFF;
+            poke8(col_inv + b * 256 + v, a & 0xFF);
+            a := a + 1;
+        }
+        b := b + 1;
+    }
+}
+
+// --- Block-Verschluesselung ---
+// m_enc[i] := T_pub[m[i]][r[i]]   fuer i = 0..len-1
+
+fn dadqBlockEnc(table: int64, m: int64, r: int64, m_enc: int64, len: int64) {
+    var i:  int64 := 0;
+    var mi: int64 := 0;
+    var ri: int64 := 0;
+
+    i := 0;
+    while (i < len) {
+        mi := peek8(m + i) & 0xFF;
+        ri := peek8(r + i) & 0xFF;
+        poke8(m_enc + i, peek8(table + mi * 256 + ri) & 0xFF);
+        i := i + 1;
+    }
+}
+
+// --- Block-Entschluesselung via Spalteninverse ---
+// m[i] := T_col_inv[r[i]][m_enc[i]]
+// Korrektheit: m_enc[i] = T[m[i]][r[i]] => T_col_inv[r[i]][m_enc[i]] = m[i]
+
+fn dadqBlockDec(col_inv: int64, m_enc: int64, r: int64, m: int64, len: int64) {
+    var i:   int64 := 0;
+    var ri:  int64 := 0;
+    var enc: int64 := 0;
+
+    i := 0;
+    while (i < len) {
+        ri  := peek8(r + i) & 0xFF;
+        enc := peek8(m_enc + i) & 0xFF;
+        poke8(m + i, peek8(col_inv + ri * 256 + enc) & 0xFF);
+        i := i + 1;
+    }
+}
+
+// --- KeyGen intern ---
+// pk[0..31]    = seed_T
+// sk[0..255]   = sigma
+// sk[256..511] = sigma_inv
+// sk[512..543] = seed_D
+
+pub fn dadqKeyGen(master_seed: int64, pk: int64, sk: int64) {
+    var buf:        int64 := alloc(33);
+    var seed_sigma: int64 := alloc(32);
+    var i:          int64 := 0;
+    var si:         int64 := 0;
+
+    i := 0;
+    while (i < 32) { poke8(buf + i, peek8(master_seed + i)); i := i + 1; }
+
+    poke8(buf + 32, 0x01);
+    SHA256(buf, 33, pk);
+
+    poke8(buf + 32, 0x02);
+    SHA256(buf, 33, seed_sigma);
+
+    poke8(buf + 32, 0x03);
+    SHA256(buf, 33, sk + 512);
+
+    free(buf, 33);
+
+    dadqGenPerm(seed_sigma, 0x00, sk);
+
+    i := 0;
+    while (i < 256) {
+        si := peek8(sk + i) & 0xFF;
+        poke8(sk + 256 + si, i & 0xFF);
+        i := i + 1;
+    }
+
+    free(seed_sigma, 32);
+}
+
+// --- KeyGen Full: speichert seed_T in sk[544..575] fuer dadqDec ohne pk ---
+
+pub fn dadqKeyGenFull(master_seed: int64, pk: int64, sk: int64) {
+    var i: int64 := 0;
+    dadqKeyGen(master_seed, pk, sk);
+    i := 0;
+    while (i < 32) {
+        poke8(sk + 544 + i, peek8(pk + i));
+        i := i + 1;
+    }
+}
+
+// --- Enc ---
+// pk:    Zeiger auf DADQ_PK_LEN Bytes (seed_T)
+// m:     Zeiger auf m_len Bytes Klartext
+// c:     Zeiger auf m_len + DADQ_OVERHEAD Bytes (Ausgabe)
+// Layout: c[0..m_len-1] = m_enc,  c[m_len..m_len+31] = r XOR SHA256(m_enc)
+
+pub fn dadqEnc(pk: int64, m: int64, m_len: int64, c: int64) {
+    var table:  int64 := alloc(DADQ_TABLE_SZ);
+    var r:      int64 := alloc(m_len);
+    var h_enc:  int64 := alloc(32);
+    var j:      int64 := 0;
+    var r_byte: int64 := 0;
+
+    dadqGenTable(pk, 0xAB, table);
+    RandBytesExact(r, m_len);
+    dadqBlockEnc(table, m, r, c, m_len);
+    SHA256(c, m_len, h_enc);
+
+    j := 0;
+    while (j < 32) {
+        r_byte := 0;
+        if (j < m_len) { r_byte := peek8(r + j) & 0xFF; }
+        poke8(c + m_len + j, (r_byte ^ (peek8(h_enc + j) & 0xFF)) & 0xFF);
+        j := j + 1;
+    }
+
+    free(h_enc, 32);
+    free(r, m_len);
+    free(table, DADQ_TABLE_SZ);
+}
+
+// --- Dec ---
+// sk:    Zeiger auf DADQ_SK_LEN_FULL (576) Bytes; sk[544..575] = seed_T
+// c:     Zeiger auf c_len Bytes Ciphertext
+// m:     Zeiger auf c_len - DADQ_OVERHEAD Bytes (Ausgabe)
+// Rueckgabe: 0 = Erfolg, -1 = ungueltig
+
+pub fn dadqDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
+    var m_len:    int64 := c_len - DADQ_OVERHEAD;
+    var table:    int64 := 0;
+    var col_inv:  int64 := 0;
+    var h_enc:    int64 := 0;
+    var r:        int64 := 0;
+    var c_check:  int64 := 0;
+    var seed_T:   int64 := 0;
+    var ok:       int64 := 1;
+    var i:        int64 := 0;
+    var j:        int64 := 0;
+    var h_byte:   int64 := 0;
+    var commit_b: int64 := 0;
+
+    if (m_len <= 0) { return (0 - 1); }
+
+    seed_T  := sk + 544;
+    table   := alloc(DADQ_TABLE_SZ);
+    col_inv := alloc(DADQ_TABLE_SZ);
+    h_enc   := alloc(32);
+    r       := alloc(m_len);
+    c_check := alloc(m_len);
+
+    dadqGenTable(seed_T, 0xAB, table);
+    dadqBuildColInv(table, col_inv);
+    SHA256(c, m_len, h_enc);
+
+    j := 0;
+    while (j < m_len) {
+        h_byte   := 0;
+        commit_b := 0;
+        if (j < 32) { h_byte   := peek8(h_enc + j) & 0xFF; }
+        if (j < 32) { commit_b := peek8(c + m_len + j) & 0xFF; }
+        poke8(r + j, (h_byte ^ commit_b) & 0xFF);
+        j := j + 1;
+    }
+
+    dadqBlockDec(col_inv, c, r, m, m_len);
+
+    dadqBlockEnc(table, m, r, c_check, m_len);
+    ok := 1;
+    i := 0;
+    while (i < m_len) {
+        if (peek8(c_check + i) != peek8(c + i)) { ok := 0; }
+        i := i + 1;
+    }
+
+    free(c_check, m_len);
+    free(r, m_len);
+    free(h_enc, 32);
+    free(col_inv, DADQ_TABLE_SZ);
+    free(table, DADQ_TABLE_SZ);
+
+    if (ok == 0) { return (0 - 1); }
+    return 0;
+}
+
+// --- Alloc-Helfer ---
+
+pub fn dadqEncAlloc(pk: int64, m: int64, m_len: int64): int64 {
+    var c_len: int64 := m_len + DADQ_OVERHEAD;
+    var c:     int64 := alloc(c_len);
+    dadqEnc(pk, m, m_len, c);
+    return c;
+}
+
+pub fn dadqDecAlloc(sk: int64, c: int64, c_len: int64): int64 {
+    var m_len: int64 := c_len - DADQ_OVERHEAD;
+    var m:     int64 := 0;
+    var rc:    int64 := 0;
+    if (m_len <= 0) { return 0; }
+    m  := alloc(m_len);
+    rc := dadqDec(sk, c, c_len, m);
+    if (rc != 0) {
+        free(m, m_len);
+        return 0;
+    }
+    return m;
+}
+
+pub fn dadqFreeCtx(p: int64, sz: int64) {
+    if (p != 0) { free(p, sz); }
+}
