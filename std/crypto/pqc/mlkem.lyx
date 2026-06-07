@@ -1,0 +1,563 @@
+// std/crypto/pqc/mlkem.lyx
+// WP-PQC-06: ML-KEM (CRYSTALS-Kyber, NIST FIPS 203)
+//
+// Key Encapsulation Mechanism — ersetzt ECDH/RSA-OAEP.
+// Sicherheit basiert auf Module Learning With Errors (MLWE).
+//
+// Drei Sicherheitsstufen:
+//   ML-KEM-512  (k=2): AES-128-äquivalent
+//   ML-KEM-768  (k=3): AES-192-äquivalent
+//   ML-KEM-1024 (k=4): AES-256-äquivalent
+//
+// Abhängigkeiten:
+//   WP-PQC-01: std/crypto/keccak.lyx  (SHA3-256, SHA3-512, SHAKE-256)
+//   WP-PQC-04: std/crypto/ct.lyx      (CTMemEqual, CTSelect)
+//   WP-PQC-05: std/crypto/ntt.lyx     (KyberNTT, KyberINTT, ...)
+//
+// Speicherlayout SK: dk_pke (384*k) || ek (384*k+32) || H(ek) (32) || z (32)
+// Alle Pointer sind caller-alloziert. Größen aus MLKEM{512,768,1024}_{PK,SK,CT}.
+
+unit std.crypto.pqc.mlkem;
+
+import std.crypto.keccak;
+import std.crypto.ntt;
+import std.crypto.ct;
+import std.alloc;
+
+// ─── Schlüssel- und Ciphertext-Größen ────────────────────────────────────────
+pub con MLKEM512_PK:  int64 := 800;
+pub con MLKEM512_SK:  int64 := 1632;
+pub con MLKEM512_CT:  int64 := 768;
+pub con MLKEM768_PK:  int64 := 1184;
+pub con MLKEM768_SK:  int64 := 2400;
+pub con MLKEM768_CT:  int64 := 1088;
+pub con MLKEM1024_PK: int64 := 1568;
+pub con MLKEM1024_SK: int64 := 3168;
+pub con MLKEM1024_CT: int64 := 1568;
+
+// ─── Interne Parameter aus k ──────────────────────────────────────────────────
+
+fn mlkem_eta1(k: int64): int64 {
+  if (k == 2) { return 3; }
+  return 2;
+}
+
+fn mlkem_du(k: int64): int64 {
+  if (k == 4) { return 11; }
+  return 10;
+}
+
+fn mlkem_dv(k: int64): int64 {
+  if (k == 4) { return 5; }
+  return 4;
+}
+
+// ─── Compress / Decompress ────────────────────────────────────────────────────
+//
+// Compress_d(x)   = floor((2^d * x + q/2) / q) mod 2^d
+// Decompress_d(y) = round(q * y / 2^d)         = (q*y + 2^(d-1)) >> d
+
+fn mlkem_compress(x: int64, d: int64): int64 {
+  return (((1 << d) * x + 1664) / 3329) & ((1 << d) - 1);
+}
+
+fn mlkem_decompress(y: int64, d: int64): int64 {
+  return (3329 * y + (1 << (d - 1))) >> d;
+}
+
+// ─── ByteEncode_d / ByteDecode_d (FIPS 203 Algorithmen 4/5) ──────────────────
+//
+// Packt 256 Koeffizienten (je d Bits, LSB-zuerst) in 32*d Bytes.
+// Allgemeine Implementierung für alle in ML-KEM vorkommenden d-Werte.
+
+fn mlkem_encode(poly: int64, d: int64, dst: int64) {
+  var total: int64 := 32 * d;
+  var i: int64 := 0;
+  while (i < total) { poke8(dst + i, 0); i := i + 1; }
+  i := 0;
+  while (i < 256) {
+    var val: int64 := peek64(poly + i * 8);
+    var j: int64 := 0;
+    while (j < d) {
+      var bp: int64 := i * d + j;
+      poke8(dst + (bp >> 3),
+            peek8(dst + (bp >> 3)) | (((val >> j) & 1) << (bp & 7)));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+}
+
+fn mlkem_decode(data: int64, d: int64, poly: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    var val: int64 := 0;
+    var j: int64 := 0;
+    while (j < d) {
+      var bp: int64 := i * d + j;
+      val := val | (((peek8(data + (bp >> 3)) >> (bp & 7)) & 1) << j);
+      j := j + 1;
+    }
+    poke64(poly + i * 8, val);
+    i := i + 1;
+  }
+}
+
+// ─── PRF: SHAKE-256(sigma || b, 64*eta Bytes) ────────────────────────────────
+
+fn mlkem_prf(sigma: int64, b: int64, eta: int64, dst: int64) {
+  var buf: int64 := alloc(33);
+  var i: int64 := 0;
+  while (i < 32) { poke8(buf + i, peek8(sigma + i)); i := i + 1; }
+  poke8(buf + 32, b & 0xFF);
+  SHAKE256(buf, 33, dst, 64 * eta);
+  free(buf, 33);
+}
+
+// ─── Hash-Funktionen (Kurznamen für interne Nutzung) ─────────────────────────
+
+fn mlkem_G(data: int64, len: int64, dst: int64) { SHA3_512(data, len, dst); }
+fn mlkem_H(data: int64, len: int64, dst: int64) { SHA3_256(data, len, dst); }
+fn mlkem_J(data: int64, len: int64, dst: int64) { SHAKE256(data, len, dst, 32); }
+
+// ─── Polynom-Vektor-Operationen ───────────────────────────────────────────────
+
+fn polyvec_ntt(v: int64, k: int64) {
+  var i: int64 := 0;
+  while (i < k) { KyberNTT(v + i * 2048); i := i + 1; }
+}
+
+fn polyvec_intt(v: int64, k: int64) {
+  var i: int64 := 0;
+  while (i < k) { KyberINTT(v + i * 2048); i := i + 1; }
+}
+
+fn polyvec_add(a: int64, b: int64, c: int64, k: int64) {
+  var i: int64 := 0;
+  while (i < k) {
+    KyberPolyAdd(a + i * 2048, b + i * 2048, c + i * 2048);
+    i := i + 1;
+  }
+}
+
+// ─── A * v_hat oder A^T * v_hat (beide im NTT-Bereich) ───────────────────────
+// transpose=0: w[i] = Σⱼ A[i,j] ⊙ v[j]
+// transpose=1: w[i] = Σⱼ A[j,i] ⊙ v[j]  (= A^T * v)
+
+fn matvec_ntt(rho: int64, v_hat: int64, w_hat: int64, k: int64, transpose: int64) {
+  var a_poly: int64 := NTTPolyNew();
+  var prod: int64   := NTTPolyNew();
+  var i: int64 := 0;
+  while (i < k) {
+    KyberPolyZero(w_hat + i * 2048);
+    var j: int64 := 0;
+    while (j < k) {
+      var row: int64 := i;
+      var col: int64 := j;
+      if (transpose != 0) { row := j; col := i; }
+      KyberSampleNTT(rho, row, col, a_poly);
+      KyberPolyMul(a_poly, v_hat + j * 2048, prod);
+      KyberPolyAdd(w_hat + i * 2048, prod, w_hat + i * 2048);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  NTTPolyFree(a_poly);
+  NTTPolyFree(prod);
+}
+
+// Skalarprodukt zweier NTT-Vektoren → 1 NTT-Polynom
+fn inner_product_ntt(a_hat: int64, b_hat: int64, dst: int64, k: int64) {
+  var prod: int64 := NTTPolyNew();
+  KyberPolyZero(dst);
+  var i: int64 := 0;
+  while (i < k) {
+    KyberPolyMul(a_hat + i * 2048, b_hat + i * 2048, prod);
+    KyberPolyAdd(dst, prod, dst);
+    i := i + 1;
+  }
+  NTTPolyFree(prod);
+}
+
+// ─── Encode/Decode eines k-Polynom-Vektors ───────────────────────────────────
+
+fn polyvec_encode(v: int64, k: int64, d: int64, dst: int64) {
+  var pb: int64 := 32 * d;  // Bytes pro Polynom
+  var i: int64 := 0;
+  while (i < k) {
+    mlkem_encode(v + i * 2048, d, dst + i * pb);
+    i := i + 1;
+  }
+}
+
+fn polyvec_decode(data: int64, k: int64, d: int64, v: int64) {
+  var pb: int64 := 32 * d;
+  var i: int64 := 0;
+  while (i < k) {
+    mlkem_decode(data + i * pb, d, v + i * 2048);
+    i := i + 1;
+  }
+}
+
+// Compress_d + ByteEncode_d für einen Polynom-Vektor
+fn polyvec_compress_encode(v: int64, k: int64, d: int64, dst: int64) {
+  var tmp: int64 := NTTPolyNew();
+  var pb: int64 := 32 * d;
+  var i: int64 := 0;
+  while (i < k) {
+    var ci: int64 := 0;
+    while (ci < 256) {
+      poke64(tmp + ci * 8, mlkem_compress(peek64(v + i * 2048 + ci * 8), d));
+      ci := ci + 1;
+    }
+    mlkem_encode(tmp, d, dst + i * pb);
+    i := i + 1;
+  }
+  NTTPolyFree(tmp);
+}
+
+// ByteDecode_d + Decompress_d für einen Polynom-Vektor
+fn polyvec_decode_decompress(data: int64, k: int64, d: int64, v: int64) {
+  var pb: int64 := 32 * d;
+  var i: int64 := 0;
+  while (i < k) {
+    mlkem_decode(data + i * pb, d, v + i * 2048);
+    var ci: int64 := 0;
+    while (ci < 256) {
+      poke64(v + i * 2048 + ci * 8,
+             mlkem_decompress(peek64(v + i * 2048 + ci * 8), d));
+      ci := ci + 1;
+    }
+    i := i + 1;
+  }
+}
+
+// ─── K-PKE.KeyGen (FIPS 203 Algorithmus 12) ──────────────────────────────────
+// d_seed: 32-Byte-Seed
+// ek:     384*k+32 Bytes (Public Key)
+// dk_pke: 384*k Bytes   (privater PKE-Schlüssel)
+
+fn kpke_keygen(d_seed: int64, k: int64, ek: int64, dk_pke: int64) {
+  var eta1: int64 := mlkem_eta1(k);
+  var pb: int64   := k * 2048;
+
+  // (rho, sigma) = G(d || k)
+  var g_in:  int64 := alloc(33);
+  var g_out: int64 := alloc(64);
+  var i: int64 := 0;
+  while (i < 32) { poke8(g_in + i, peek8(d_seed + i)); i := i + 1; }
+  poke8(g_in + 32, k & 0xFF);
+  mlkem_G(g_in, 33, g_out);
+  var rho:   int64 := g_out;
+  var sigma: int64 := g_out + 32;
+
+  var s_hat: int64 := alloc(pb);
+  var e_hat: int64 := alloc(pb);
+  var t_hat: int64 := alloc(pb);
+  var prf:   int64 := alloc(192);  // max 64*eta1 = 192 für eta1=3
+
+  // s[i] = SampleCBD_eta1(PRF(sigma, i));  s_hat[i] = NTT(s[i])
+  i := 0;
+  while (i < k) {
+    mlkem_prf(sigma, i, eta1, prf);
+    KyberSampleCBD(prf, eta1, s_hat + i * 2048);
+    KyberNTT(s_hat + i * 2048);
+    i := i + 1;
+  }
+
+  // e[i] = SampleCBD_eta1(PRF(sigma, k+i));  e_hat[i] = NTT(e[i])
+  i := 0;
+  while (i < k) {
+    mlkem_prf(sigma, k + i, eta1, prf);
+    KyberSampleCBD(prf, eta1, e_hat + i * 2048);
+    KyberNTT(e_hat + i * 2048);
+    i := i + 1;
+  }
+  free(prf, 192);
+
+  // t_hat = A * s_hat + e_hat   (alles im NTT-Bereich)
+  matvec_ntt(rho, s_hat, t_hat, k, 0);
+  polyvec_add(t_hat, e_hat, t_hat, k);
+
+  // ek = ByteEncode_12(t_hat) || rho
+  polyvec_encode(t_hat, k, 12, ek);
+  i := 0;
+  while (i < 32) { poke8(ek + k * 384 + i, peek8(rho + i)); i := i + 1; }
+
+  // dk_pke = ByteEncode_12(s_hat)
+  polyvec_encode(s_hat, k, 12, dk_pke);
+
+  free(s_hat, pb); free(e_hat, pb); free(t_hat, pb);
+  free(g_in, 33);  free(g_out, 64);
+}
+
+// ─── K-PKE.Encrypt (FIPS 203 Algorithmus 13) ─────────────────────────────────
+// ek:     Public Key (384*k+32 Bytes)
+// m:      Klartext (32 Bytes)
+// r_seed: 32-Byte-Zufallsseed
+// ct:     Ciphertext (32*du*k + 32*dv Bytes)
+
+fn kpke_encrypt(ek: int64, k: int64, m: int64, r_seed: int64, ct: int64) {
+  var eta1: int64 := mlkem_eta1(k);
+  var eta2: int64 := 2;
+  var du:   int64 := mlkem_du(k);
+  var dv:   int64 := mlkem_dv(k);
+  var pb:   int64 := k * 2048;
+
+  // t_hat und rho aus ek lesen
+  var t_hat: int64 := alloc(pb);
+  polyvec_decode(ek, k, 12, t_hat);
+  var rho: int64 := ek + k * 384;
+
+  // r[i], e1[i], e2 via CBD samplen
+  var r_hat: int64 := alloc(pb);
+  var e1:    int64 := alloc(pb);
+  var e2:    int64 := NTTPolyNew();
+  var prf:   int64 := alloc(192);
+
+  var i: int64 := 0;
+  while (i < k) {
+    mlkem_prf(r_seed, i, eta1, prf);
+    KyberSampleCBD(prf, eta1, r_hat + i * 2048);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < k) {
+    mlkem_prf(r_seed, k + i, eta2, prf);
+    KyberSampleCBD(prf, eta2, e1 + i * 2048);
+    i := i + 1;
+  }
+  mlkem_prf(r_seed, 2 * k, eta2, prf);
+  KyberSampleCBD(prf, eta2, e2);
+  free(prf, 192);
+
+  // r_hat = NTT(r)
+  polyvec_ntt(r_hat, k);
+
+  // u = INTT(A^T * r_hat) + e1
+  var u: int64 := alloc(pb);
+  matvec_ntt(rho, r_hat, u, k, 1);  // transpose=1
+  polyvec_intt(u, k);
+  polyvec_add(u, e1, u, k);
+
+  // v = INTT(t_hat^T * r_hat) + e2 + Decompress_1(m)
+  var v: int64 := NTTPolyNew();
+  inner_product_ntt(t_hat, r_hat, v, k);
+  KyberINTT(v);
+  KyberPolyAdd(v, e2, v);
+
+  // Nachricht m als Polynom: msg[i] = Decompress_1(bit i von m)
+  var msg: int64 := NTTPolyNew();
+  mlkem_decode(m, 1, msg);
+  i := 0;
+  while (i < 256) {
+    poke64(msg + i * 8, mlkem_decompress(peek64(msg + i * 8), 1));
+    i := i + 1;
+  }
+  KyberPolyAdd(v, msg, v);
+
+  // c1 = ByteEncode_du(Compress_du(u))
+  var c1_size: int64 := 32 * du * k;
+  polyvec_compress_encode(u, k, du, ct);
+
+  // c2 = ByteEncode_dv(Compress_dv(v))
+  i := 0;
+  while (i < 256) {
+    poke64(msg + i * 8, mlkem_compress(peek64(v + i * 8), dv));
+    i := i + 1;
+  }
+  mlkem_encode(msg, dv, ct + c1_size);
+
+  free(t_hat, pb); free(r_hat, pb); free(e1, pb); free(u, pb);
+  NTTPolyFree(e2); NTTPolyFree(v); NTTPolyFree(msg);
+}
+
+// ─── K-PKE.Decrypt (FIPS 203 Algorithmus 14) ─────────────────────────────────
+// dk_pke: 384*k Bytes (= ByteEncode_12(s_hat))
+// ct:     Ciphertext
+// m_out:  32-Byte-Ausgabe
+
+fn kpke_decrypt(dk_pke: int64, k: int64, ct: int64, m_out: int64) {
+  var du: int64 := mlkem_du(k);
+  var dv: int64 := mlkem_dv(k);
+  var pb: int64 := k * 2048;
+  var c1_size: int64 := 32 * du * k;
+
+  // s_hat = ByteDecode_12(dk_pke)
+  var s_hat: int64 := alloc(pb);
+  polyvec_decode(dk_pke, k, 12, s_hat);
+
+  // u = Decompress_du(ByteDecode_du(c1))
+  var u: int64 := alloc(pb);
+  polyvec_decode_decompress(ct, k, du, u);
+
+  // v = Decompress_dv(ByteDecode_dv(c2))
+  var v: int64 := NTTPolyNew();
+  mlkem_decode(ct + c1_size, dv, v);
+  var ci: int64 := 0;
+  while (ci < 256) {
+    poke64(v + ci * 8, mlkem_decompress(peek64(v + ci * 8), dv));
+    ci := ci + 1;
+  }
+
+  // w = INTT(s_hat^T ⊙ NTT(u))
+  polyvec_ntt(u, k);
+  var w: int64 := NTTPolyNew();
+  inner_product_ntt(s_hat, u, w, k);
+  KyberINTT(w);
+
+  // diff = v - w
+  var diff: int64 := NTTPolyNew();
+  KyberPolySub(v, w, diff);
+
+  // m = ByteEncode_1(Compress_1(diff))
+  var tmp: int64 := NTTPolyNew();
+  ci := 0;
+  while (ci < 256) {
+    poke64(tmp + ci * 8, mlkem_compress(peek64(diff + ci * 8), 1));
+    ci := ci + 1;
+  }
+  mlkem_encode(tmp, 1, m_out);
+
+  free(s_hat, pb); free(u, pb);
+  NTTPolyFree(v); NTTPolyFree(w); NTTPolyFree(diff); NTTPolyFree(tmp);
+}
+
+// ─── ML-KEM.KeyGen (FIPS 203 Algorithmus 16) ─────────────────────────────────
+// seed:  64 Bytes: seed[0..31]=d (PKE-Seed), seed[32..63]=z (Rejection-Key)
+// k:     2/3/4 für ML-KEM-512/768/1024
+// pk:    Empfänger für Public Key  (800/1184/1568 Bytes)
+// sk:    Empfänger für Secret Key  (1632/2400/3168 Bytes)
+// Layout SK: dk_pke || ek || H(ek) || z
+pub fn MLKEMKeyGen(seed: int64, k: int64, pk: int64, sk: int64): int64 {
+  var d: int64 := seed;
+  var z: int64 := seed + 32;
+
+  var dk_pke_size: int64 := 384 * k;
+  var pk_size:     int64 := 384 * k + 32;
+
+  // PKE-Schlüsselpaar
+  var dk_pke: int64 := alloc(dk_pke_size);
+  kpke_keygen(d, k, pk, dk_pke);
+
+  // h = SHA3-256(pk)
+  var h: int64 := alloc(32);
+  mlkem_H(pk, pk_size, h);
+
+  // sk = dk_pke || pk || h || z
+  var i: int64 := 0;
+  while (i < dk_pke_size) { poke8(sk + i, peek8(dk_pke + i)); i := i + 1; }
+  i := 0;
+  while (i < pk_size) { poke8(sk + dk_pke_size + i, peek8(pk + i)); i := i + 1; }
+  i := 0;
+  while (i < 32) { poke8(sk + dk_pke_size + pk_size + i, peek8(h + i)); i := i + 1; }
+  i := 0;
+  while (i < 32) {
+    poke8(sk + dk_pke_size + pk_size + 32 + i, peek8(z + i));
+    i := i + 1;
+  }
+
+  free(dk_pke, dk_pke_size);
+  free(h, 32);
+  return 0;
+}
+
+// ─── ML-KEM.Encapsulate (FIPS 203 Algorithmus 17) ────────────────────────────
+// pk:         Public Key
+// k:          2/3/4
+// randomness: 32 Bytes Zufallsdaten (m = H(randomness))
+// ct:         Empfänger für Ciphertext
+// sharedKey:  Empfänger für Shared Key (32 Bytes)
+pub fn MLKEMEncapsulate(pk: int64, k: int64, randomness: int64, ct: int64, sharedKey: int64): int64 {
+  var pk_size: int64 := 384 * k + 32;
+
+  // m = H(randomness)
+  var m: int64 := alloc(32);
+  mlkem_H(randomness, 32, m);
+
+  // h_pk = H(pk)
+  var h_pk: int64 := alloc(32);
+  mlkem_H(pk, pk_size, h_pk);
+
+  // (K_bar, r) = G(m || h_pk)
+  var g_in:  int64 := alloc(64);
+  var g_out: int64 := alloc(64);
+  var i: int64 := 0;
+  while (i < 32) { poke8(g_in + i, peek8(m + i)); i := i + 1; }
+  while (i < 64) { poke8(g_in + i, peek8(h_pk + i - 32)); i := i + 1; }
+  mlkem_G(g_in, 64, g_out);
+  var K_bar: int64 := g_out;
+  var r:     int64 := g_out + 32;
+
+  // Ciphertext erzeugen
+  kpke_encrypt(pk, k, m, r, ct);
+
+  // SharedKey = K_bar (erste 32 Bytes von G-Ausgabe)
+  i := 0;
+  while (i < 32) { poke8(sharedKey + i, peek8(K_bar + i)); i := i + 1; }
+
+  free(m, 32); free(h_pk, 32); free(g_in, 64); free(g_out, 64);
+  return 0;
+}
+
+// ─── ML-KEM.Decapsulate (FIPS 203 Algorithmus 18) ────────────────────────────
+// sk:        Secret Key
+// k:         2/3/4
+// ct:        Ciphertext
+// sharedKey: Empfänger für Shared Key (32 Bytes)
+// Implizite Ablehnung: falscher CT → pseudozufälliger (aber deterministischer) Key
+pub fn MLKEMDecapsulate(sk: int64, k: int64, ct: int64, sharedKey: int64): int64 {
+  var dk_pke_size: int64 := 384 * k;
+  var pk_size:     int64 := 384 * k + 32;
+  var ct_size:     int64 := 32 * mlkem_du(k) * k + 32 * mlkem_dv(k);
+
+  // SK-Komponenten
+  var dk_pke: int64 := sk;
+  var ek:     int64 := sk + dk_pke_size;
+  var h:      int64 := sk + dk_pke_size + pk_size;
+  var z:      int64 := sk + dk_pke_size + pk_size + 32;
+
+  // m' = K-PKE.Decrypt(dk_pke, ct)
+  var m_prime: int64 := alloc(32);
+  kpke_decrypt(dk_pke, k, ct, m_prime);
+
+  // (K_bar', r') = G(m' || h)
+  var g_in:  int64 := alloc(64);
+  var g_out: int64 := alloc(64);
+  var i: int64 := 0;
+  while (i < 32) { poke8(g_in + i, peek8(m_prime + i)); i := i + 1; }
+  while (i < 64) { poke8(g_in + i, peek8(h + i - 32)); i := i + 1; }
+  mlkem_G(g_in, 64, g_out);
+  var K_bar_prime: int64 := g_out;
+  var r_prime:     int64 := g_out + 32;
+
+  // ct' = Re-encrypt mit m' und r'
+  var ct_prime: int64 := alloc(ct_size);
+  kpke_encrypt(ek, k, m_prime, r_prime, ct_prime);
+
+  // K_bar_reject = J(z || ct, 32 Bytes)  (Ablehnung-Key)
+  var j_in_size: int64 := 32 + ct_size;
+  var j_in: int64 := alloc(j_in_size);
+  i := 0;
+  while (i < 32)      { poke8(j_in + i, peek8(z + i)); i := i + 1; }
+  i := 0;
+  while (i < ct_size) { poke8(j_in + 32 + i, peek8(ct + i)); i := i + 1; }
+  var K_reject: int64 := alloc(32);
+  mlkem_J(j_in, j_in_size, K_reject);
+  free(j_in, j_in_size);
+
+  // CT-Vergleich (constant-time): ok=-1 wenn ct==ct', ok=0 sonst
+  var ok: int64 := CTMemEqual(ct, ct_prime, ct_size);
+
+  // SharedKey = K_bar_prime wenn ok, sonst K_reject  (immer constant-time)
+  i := 0;
+  while (i < 32) {
+    poke8(sharedKey + i,
+          CTSelect(peek8(K_bar_prime + i), peek8(K_reject + i), ok) & 0xFF);
+    i := i + 1;
+  }
+
+  free(m_prime, 32); free(g_in, 64); free(g_out, 64);
+  free(ct_prime, ct_size); free(K_reject, 32);
+  return 0;
+}
