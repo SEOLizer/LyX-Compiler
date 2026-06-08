@@ -1461,3 +1461,159 @@ pub fn UDPSocketBindIPv6(sock: UDPSocket, ip6Hi: int64, ip6Lo: int64, port: int6
   munmap(addr, 28);
   return ret;
 }
+
+// ============================================================================
+// WP-07: Low-level IPv6 socket primitives
+// SocketNewV6 / BindV6 / ConnectV6 — raw fd-level wrappers for sys_socket,
+// sys_bind, sys_connect using sockaddr_in6 (28 bytes).
+// ============================================================================
+
+// Create a new IPv6 TCP socket.  Returns fd >= 0 on success, < 0 on error.
+pub fn SocketNewV6(): int64 {
+  return sys_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+}
+
+// Bind fd to an IPv6 address and port.
+// ip6Hi / ip6Lo: IPv6 address as high/low int64 halves (use IPv6MakeHi/Lo or
+//   IPv6AnyHi/Lo, IPv6LoopbackHi/Lo from std/net/types).
+// port: host byte order.  Returns 0 on success, negative on error.
+pub fn BindV6(fd: int64, ip6Hi: int64, ip6Lo: int64, port: int64): int64 {
+  var addr: int64 := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) { return -1; }
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+  var r: int64 := sys_bind(fd, addr, 28);
+  munmap(addr, 28);
+  return r;
+}
+
+// Connect fd to an IPv6 peer.
+// Returns 0 on success, negative on error.
+pub fn ConnectV6(fd: int64, ip6Hi: int64, ip6Lo: int64, port: int64): int64 {
+  var addr: int64 := mmap(0, 28, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (addr <= 0) { return -1; }
+  SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
+  var r: int64 := sys_connect(fd, addr, 28);
+  munmap(addr, 28);
+  return r;
+}
+
+// ============================================================================
+// WP-6: Netzwerk-Ergänzungen — Konstanten zuerst (Lyx: kein Forward-Lookup)
+// ============================================================================
+
+// Socket-Flags für accept4 / socket
+pub con SOCK_NONBLOCK: int64 := 2048;    // 0x800
+pub con SOCK_CLOEXEC:  int64 := 524288;  // 0x80000
+
+// sockaddr-Puffer-Größen
+pub con SOCKADDR_IN_SIZE:  int64 := 16;
+pub con SOCKADDR_IN6_SIZE: int64 := 28;
+pub con SOCKADDR_MAX_SIZE: int64 := 128;
+
+// mmsghdr-Struktur (x86-64, 64 Bytes)
+pub con MMSGHDR_SIZE:  int64 := 64;
+pub con MSGHDR_SIZE:   int64 := 56;
+pub con IOVEC_SIZE_MM: int64 := 16;  // { iov_base:8, iov_len:8 }
+
+// SocketGetOwnAddr: liest die eigene (lokale) Adresse des Sockets.
+// addrBuf: alloc(SOCKADDR_IN_SIZE), addrLen: Puffergröße.
+pub fn SocketGetOwnAddr(fd: int64, addrBuf: int64, addrLen: int64): int64 {
+  var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (lenBuf <= 0) { return -1; }
+  poke32(lenBuf, addrLen);
+  var r: int64 := sys_getsockname(fd, addrBuf, lenBuf);
+  munmap(lenBuf, 8);
+  return r;
+}
+
+// SocketGetPeerAddr: liest die Remote-Adresse einer verbundenen Verbindung.
+pub fn SocketGetPeerAddr(fd: int64, addrBuf: int64, addrLen: int64): int64 {
+  var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (lenBuf <= 0) { return -1; }
+  poke32(lenBuf, addrLen);
+  var r: int64 := sys_getpeername(fd, addrBuf, lenBuf);
+  munmap(lenBuf, 8);
+  return r;
+}
+
+// AcceptNonBlocking: akzeptiert eine Verbindung nicht-blockierend (SOCK_NONBLOCK|SOCK_CLOEXEC).
+// Gibt neuen fd zurück; bei keiner wartenden Verbindung: -EAGAIN (-11).
+pub fn AcceptNonBlocking(fd: int64, addrBuf: int64, addrLen: int64): int64 {
+  var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (lenBuf <= 0) { return -1; }
+  poke32(lenBuf, addrLen);
+  var r: int64 := sys_accept4(fd, addrBuf, lenBuf, SOCK_NONBLOCK | SOCK_CLOEXEC);
+  munmap(lenBuf, 8);
+  return r;
+}
+
+// AcceptBlocking: akzeptiert eine Verbindung blockierend (mit SOCK_CLOEXEC).
+pub fn AcceptBlocking(fd: int64, addrBuf: int64, addrLen: int64): int64 {
+  var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (lenBuf <= 0) { return -1; }
+  poke32(lenBuf, addrLen);
+  var r: int64 := sys_accept4(fd, addrBuf, lenBuf, SOCK_CLOEXEC);
+  munmap(lenBuf, 8);
+  return r;
+}
+
+// ============================================================================
+// mmsghdr-Helfer für sendmmsg / recvmmsg (Batch-I/O)
+// ============================================================================
+
+// MmsgAlloc: alloziert vec + iov-Array (je vlen Einträge).
+// iovOut: alloc(8)-Buffer, erhält den iov-Zeiger.
+// Gibt den vec-Zeiger zurück (0 bei Fehler).
+pub fn MmsgAlloc(vlen: int64, iovOut: int64): int64 {
+  var vec: int64 := mmap(0, MMSGHDR_SIZE * vlen, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (vec <= 0) { poke64(iovOut, 0); return 0; }
+  var iov: int64 := mmap(0, IOVEC_SIZE_MM * vlen, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (iov <= 0) {
+    munmap(vec, MMSGHDR_SIZE * vlen);
+    poke64(iovOut, 0);
+    return 0;
+  }
+  var i: int64 := 0;
+  while (i < vlen) {
+    var hdr: int64 := vec + i * MMSGHDR_SIZE;
+    poke64(hdr,      0);                        // msg_name = NULL
+    poke32(hdr + 8,  0);                        // msg_namelen = 0
+    poke64(hdr + 16, iov + i * IOVEC_SIZE_MM);  // msg_iov
+    poke64(hdr + 24, 1);                        // msg_iovlen = 1
+    poke64(hdr + 32, 0);                        // msg_control = NULL
+    poke64(hdr + 40, 0);                        // msg_controllen = 0
+    poke32(hdr + 48, 0);                        // msg_flags = 0
+    poke32(hdr + 56, 0);                        // msg_len = 0
+    i := i + 1;
+  }
+  poke64(iovOut, iov);
+  return vec;
+}
+
+// MmsgFree: gibt vec und iov frei.
+pub fn MmsgFree(vec: int64, iov: int64, vlen: int64) {
+  if (vec != 0) { munmap(vec, MMSGHDR_SIZE * vlen); }
+  if (iov != 0) { munmap(iov, IOVEC_SIZE_MM * vlen); }
+}
+
+// MmsgSetBuf: setzt den Datenpuffer für Eintrag idx.
+pub fn MmsgSetBuf(iov: int64, idx: int64, buf: int64, bufLen: int64) {
+  var base: int64 := iov + idx * IOVEC_SIZE_MM;
+  poke64(base,     buf);
+  poke64(base + 8, bufLen);
+}
+
+// MmsgGetLen: liest die empfangene Byte-Anzahl aus mmsghdr[idx].msg_len.
+pub fn MmsgGetLen(vec: int64, idx: int64): int64 {
+  return peek64(vec + idx * MMSGHDR_SIZE + 56) & 4294967295;
+}
+
+// SendMmsg: sendet vlen Nachrichten in einem Syscall (Batch-Send).
+pub fn SendMmsg(fd: int64, vec: int64, vlen: int64, flags: int64): int64 {
+  return sys_sendmmsg(fd, vec, vlen, flags);
+}
+
+// RecvMmsg: empfängt bis zu vlen Nachrichten in einem Syscall (Batch-Receive).
+pub fn RecvMmsg(fd: int64, vec: int64, vlen: int64, flags: int64): int64 {
+  return sys_recvmmsg(fd, vec, vlen, flags, 0);
+}
