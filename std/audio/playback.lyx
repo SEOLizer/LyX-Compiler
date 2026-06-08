@@ -1,33 +1,178 @@
-// std/audio/playback - Audio playback using external tools
-// Version: 0.1.0
+// std/audio/playback - Unified high-level audio playback API (WP-05)
+// Phase A: ALSA backend (also covers PipeWire via ALSA-PipeWire bridge)
+// Phase C: MP3 playback via libmpg123
 
 unit std.audio.playback;
 
-import std.os;
+import std.audio;
+import std.audio.alsa;
+import std.audio.mpg123;
 
-// Play WAV file using aplay
-pub fn PlayWAV(path: pchar): int64 {
-  // Use fork + exec to run aplay
-  var pid: int64;
-  pid := sys_fork();
+// ============================================================
+// Phase A - AudioOpen / AudioPlayWAV / AudioPlayPCM / AudioClose
+// ============================================================
 
-  if (pid == 0) {
-    // Child process - run aplay
-    return 0;
-  } else if (pid > 0) {
-    // Parent process - wait for child
-    var status: int64;
-    status := 0;
-    sys_wait4(pid, status, 0);
-    return 0;
-  }
-
-  return -1;
+// Open the default ALSA playback device.
+// Returns ALSA handle on success, 0 on failure.
+pub fn AudioOpen(device: pchar): int64 {
+  return ALSAAudioOpen();
 }
 
-// Simple audio player using system()
-pub fn PlayWAVSystem(path: pchar): int64 {
-  PrintLn("WAV file ready: ", path);
-  PrintLn("Use: aplay ", path);
-  return 0;
+// Play a WAV file on an already-open ALSA handle.
+// Returns AUDIO_OK (0) on success, negative error code on failure.
+pub fn AudioPlayWAV(handle: int64, path: pchar): int64 {
+  if (handle == 0) { return AUDIO_ERROR; }
+
+  var info: AudioInfo;
+  var result: int64 := WAVParse(path, info);
+  if (result != AUDIO_OK) { return result; }
+  if (info.dataSize <= 0) { return AUDIO_ERROR; }
+
+  result := ALSASetFormat(handle, info.sampleRate, info.channels, info.bitsPerSample);
+  if (result != ALSA_OK) { return AUDIO_ERROR; }
+
+  result := ALSAPrepare(handle);
+  if (result != ALSA_OK) { return AUDIO_ERROR; }
+
+  var buf: int64 := WAVReadData(path, info);
+  if (buf == 0) { return AUDIO_ERROR; }
+
+  result := ALSAWriteGeneric(handle, buf, info.dataSize, info.channels, info.bitsPerSample);
+
+  free(buf, info.dataSize);
+
+  if (result < 0) { return AUDIO_ERROR; }
+  return AUDIO_OK;
+}
+
+// Play raw PCM data on an already-open ALSA handle.
+// buffer:       pointer to PCM data (int16, little-endian, interleaved)
+// dataSize:     byte count of buffer
+// sampleRate:   e.g. 44100
+// channels:     1 = mono, 2 = stereo
+// bitsPerSample: 8 or 16
+pub fn AudioPlayPCM(handle: int64, buffer: int64, dataSize: int64, sampleRate: int64, channels: int64, bitsPerSample: int64): int64 {
+  if (handle == 0) { return AUDIO_ERROR; }
+  if (buffer == 0 || dataSize <= 0) { return AUDIO_ERROR; }
+
+  var result: int64 := ALSASetFormat(handle, sampleRate, channels, bitsPerSample);
+  if (result != ALSA_OK) { return AUDIO_ERROR; }
+
+  result := ALSAPrepare(handle);
+  if (result != ALSA_OK) { return AUDIO_ERROR; }
+
+  result := ALSAWriteGeneric(handle, buffer, dataSize, channels, bitsPerSample);
+  if (result < 0) { return AUDIO_ERROR; }
+  return AUDIO_OK;
+}
+
+// Close the ALSA audio device.
+pub fn AudioClose(handle: int64) {
+  ALSAClose(handle);
+}
+
+// ============================================================
+// Phase C - MP3 playback via libmpg123 + ALSA
+// ============================================================
+
+// Play an MP3 file on an already-open ALSA handle.
+// Returns AUDIO_OK on success, negative error code on failure.
+pub fn AudioPlayMP3(handle: int64, path: pchar): int64 {
+  if (handle == 0) { return AUDIO_ERROR; }
+
+  var mh: int64 := MP3Init();
+  if (mh == 0) { return AUDIO_ERROR; }
+
+  var result: int64 := MP3OpenFile(mh, path);
+  if (result != MPG123_OK) {
+    MP3Close(mh);
+    return AUDIO_ERROR;
+  }
+
+  var ratePtr:  int64 := mmap(0, 8, 3, 34, -1, 0);
+  var chPtr:    int64 := mmap(0, 8, 3, 34, -1, 0);
+  var encPtr:   int64 := mmap(0, 8, 3, 34, -1, 0);
+  if (ratePtr == 0 || chPtr == 0 || encPtr == 0) {
+    if (ratePtr != 0) { munmap(ratePtr, 8); }
+    if (chPtr   != 0) { munmap(chPtr,   8); }
+    if (encPtr  != 0) { munmap(encPtr,  8); }
+    MP3Close(mh);
+    return AUDIO_ERROR;
+  }
+
+  var pcmBuf:  int64 := mmap(0, 16384, 3, 34, -1, 0);
+  var donePtr: int64 := mmap(0, 8, 3, 34, -1, 0);
+  if (pcmBuf == 0 || donePtr == 0) {
+    if (pcmBuf  != 0) { munmap(pcmBuf,  16384); }
+    if (donePtr != 0) { munmap(donePtr, 8); }
+    munmap(ratePtr, 8); munmap(chPtr, 8); munmap(encPtr, 8);
+    MP3Close(mh);
+    return AUDIO_ERROR;
+  }
+
+  poke64(donePtr, 0);
+  result := MP3Read(mh, pcmBuf, 16384, donePtr);
+  if (result != MPG123_OK && result != MPG123_NEW_FORMAT) {
+    munmap(pcmBuf, 16384); munmap(donePtr, 8);
+    munmap(ratePtr, 8); munmap(chPtr, 8); munmap(encPtr, 8);
+    MP3Close(mh);
+    return AUDIO_ERROR;
+  }
+
+  MP3GetFormatFull(mh, ratePtr, chPtr, encPtr);
+  var rate:     int64 := peek64(ratePtr);
+  var channels: int64 := peek64(chPtr);
+  munmap(ratePtr, 8); munmap(chPtr, 8); munmap(encPtr, 8);
+
+  if (rate < 1)     { rate     := 44100; }
+  if (channels < 1) { channels := 2;     }
+
+  var alsaResult: int64 := ALSASetFormat(handle, rate, channels, 16);
+  if (alsaResult != ALSA_OK) {
+    munmap(pcmBuf, 16384); munmap(donePtr, 8);
+    MP3Close(mh);
+    return AUDIO_ERROR;
+  }
+  ALSAPrepare(handle);
+
+  var done: int64 := peek64(donePtr);
+  if (done > 0) {
+    ALSAWriteGeneric(handle, pcmBuf, done, channels, 16);
+  }
+
+  while (1 == 1) {
+    poke64(donePtr, 0);
+    result := MP3Read(mh, pcmBuf, 16384, donePtr);
+    if (result == MPG123_DONE) { break; }
+    if (result != MPG123_OK && result != MPG123_NEW_FORMAT) { break; }
+    done := peek64(donePtr);
+    if (done > 0) {
+      ALSAWriteGeneric(handle, pcmBuf, done, channels, 16);
+    }
+  }
+
+  munmap(pcmBuf, 16384);
+  munmap(donePtr, 8);
+  MP3Close(mh);
+  return AUDIO_OK;
+}
+
+// ============================================================
+// Convenience: open, play, close in one call
+// ============================================================
+
+pub fn PlayWAV(path: pchar): int64 {
+  var h: int64 := AudioOpen("default"c);
+  if (h == 0) { return AUDIO_ERROR; }
+  var result: int64 := AudioPlayWAV(h, path);
+  AudioClose(h);
+  return result;
+}
+
+pub fn PlayMP3(path: pchar): int64 {
+  var h: int64 := AudioOpen("default"c);
+  if (h == 0) { return AUDIO_ERROR; }
+  var result: int64 := AudioPlayMP3(h, path);
+  AudioClose(h);
+  return result;
 }
