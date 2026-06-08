@@ -77,6 +77,10 @@ con WAB_H_PRINTINT: int64 := 2;
 con WAB_H_EXIT:     int64 := 3;
 con WAB_H_ALLOC:    int64 := 4;
 con WAB_H_FREE:     int64 := 5;
+// WP-01: string operation helpers
+con WAB_H_STRSUB:    int64 := 6;
+con WAB_H_STRCONCAT: int64 := 7;
+con WAB_H_STRCOPY:   int64 := 8;
 
 // Helper function sizes in bytes (verified instruction-by-instruction)
 con WAB_HS_PRINTSTR: int64 := 88;   // 22 instructions
@@ -84,6 +88,10 @@ con WAB_HS_PRINTINT: int64 := 148;  // 37 instructions
 con WAB_HS_EXIT:     int64 := 16;   // 4 instructions
 con WAB_HS_ALLOC:    int64 := 44;   // 11 instructions
 con WAB_HS_FREE:     int64 := 32;   // 8 instructions
+// WP-01
+con WAB_HS_STRSUB:    int64 := 108;  // 27 instructions
+con WAB_HS_STRCONCAT: int64 := 172;  // 43 instructions
+con WAB_HS_STRCOPY:   int64 := 112;  // 28 instructions
 
 // Helper section offsets (relative to helper section start)
 con WAB_HO_PRINTSTR:  int64 := 0;
@@ -91,7 +99,11 @@ con WAB_HO_PRINTINT:  int64 := 88;   // 0 + 88
 con WAB_HO_EXIT:      int64 := 236;  // 88 + 148
 con WAB_HO_ALLOC:     int64 := 252;  // 236 + 16
 con WAB_HO_FREE:      int64 := 296;  // 252 + 44
-con WAB_HELPERS_SIZE: int64 := 328;  // 296 + 32
+// WP-01
+con WAB_HO_STRSUB:    int64 := 328;  // 296 + 32
+con WAB_HO_STRCONCAT: int64 := 436;  // 328 + 108
+con WAB_HO_STRCOPY:   int64 := 608;  // 436 + 172
+con WAB_HELPERS_SIZE: int64 := 720;  // 608 + 112
 
 // ============================================================================
 // WinARM64Backend
@@ -440,6 +452,148 @@ pub type WinARM64Backend = class {
   }
 
   // -------------------------------------------------------------------------
+  // wab_emitStrSubHelper (108 bytes = 27 instructions)
+  // Input: x0=s, x1=start, x2=len → x0=new_ptr
+  // Allocates len+1 bytes, copies len bytes from s+start, null-terminates.
+  // ADRP+LDR for VirtualAlloc at offsets +40, +44 (relative to helper start).
+  // -------------------------------------------------------------------------
+
+  fn wab_emitStrSubHelper() {
+    self.wab_ce32(0xA9BD53F3);  //  0: STP x19,x20,[sp,#-48]!
+    self.wab_ce32(0xA9017BF5);  //  4: STP x21,x30,[sp,#16]
+    self.wab_ce32(0xF90013F6);  //  8: STR x22,[sp,#32]
+    self.wab_ce32(0xAA0003F3);  // 12: MOV x19,x0  (s)
+    self.wab_ce32(0xAA0103F4);  // 16: MOV x20,x1  (start)
+    self.wab_ce32(0xAA0203F5);  // 20: MOV x21,x2  (len)
+    // VirtualAlloc(NULL, len+1, 0x3000, 4)
+    self.wab_ce32(0xD2800000);  // 24: MOVZ x0,#0
+    self.wab_ce32(0x910006A1);  // 28: ADD x1,x21,#1
+    self.wab_ce32(0xD2860002);  // 32: MOVZ x2,#0x3000
+    self.wab_ce32(0xD2800083);  // 36: MOVZ x3,#4
+    self.wab_ce32(0x90000009);  // 40: ADRP x9,placeholder  [+40]
+    self.wab_ce32(0xF9400129);  // 44: LDR x9,[x9,#0]       [+44]
+    self.wab_ce32(0xD63F0120);  // 48: BLR x9  (VirtualAlloc → x0=new_ptr)
+    self.wab_ce32(0xAA0003F6);  // 52: MOV x22,x0  (save new_ptr)
+    // src = s + start, dst = new_ptr
+    self.wab_ce32(0x8B140262);  // 56: ADD x2,x19,x20  (src=s+start)
+    self.wab_ce32(0xAA1603E3);  // 60: MOV x3,x22  (dst=new_ptr)
+    // copy loop (CBZ x21,.done at +5 instrs → offset 84)
+    self.wab_ce32(0xB40000B5);  // 64: CBZ x21,.done  (+5 → offset 84)
+    self.wab_ce32(0x38401449);  // 68: LDRB w9,[x2],#1  ← .copy_loop
+    self.wab_ce32(0x38001469);  // 72: STRB w9,[x3],#1
+    self.wab_ce32(0xD10006B5);  // 76: SUB x21,x21,#1
+    self.wab_ce32(0xB5FFFFB5);  // 80: CBNZ x21,.copy_loop  (-3)
+    self.wab_ce32(0x3900007F);  // 84: STRB wzr,[x3]  ← .done (null terminate)
+    self.wab_ce32(0xAA1603E0);  // 88: MOV x0,x22
+    self.wab_ce32(0xF94013F6);  // 92: LDR x22,[sp,#32]
+    self.wab_ce32(0xA9417BF5);  // 96: LDP x21,x30,[sp,#16]
+    self.wab_ce32(0xA8C353F3);  // 100: LDP x19,x20,[sp],#48
+    self.wab_ce32(0xD65F03C0);  // 104: RET
+    // 27 instructions = 108 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
+  // wab_emitStrConcatHelper (172 bytes = 43 instructions)
+  // Input: x0=a, x1=b → x0=new_ptr
+  // Computes strlen(a)+strlen(b)+1, VirtualAllocs, copies a then b, null-terminates.
+  // ADRP+LDR for VirtualAlloc at offsets +80, +84 (relative to helper start).
+  // -------------------------------------------------------------------------
+
+  fn wab_emitStrConcatHelper() {
+    self.wab_ce32(0xA9BB53F3);  //  0: STP x19,x20,[sp,#-80]!
+    self.wab_ce32(0xA9015BF5);  //  4: STP x21,x22,[sp,#16]
+    self.wab_ce32(0xA9027BF7);  //  8: STP x23,x30,[sp,#32]
+    self.wab_ce32(0xAA0003F3);  // 12: MOV x19,x0  (a)
+    self.wab_ce32(0xAA0103F4);  // 16: MOV x20,x1  (b)
+    // strlen(a): scan x2 byte-by-byte until null
+    self.wab_ce32(0xAA1303E2);  // 20: MOV x2,x19
+    self.wab_ce32(0x38401449);  // 24: LDRB w9,[x2],#1  ← .scan_a
+    self.wab_ce32(0xB5FFFFE9);  // 28: CBNZ x9,.scan_a  (-1)
+    self.wab_ce32(0xCB130055);  // 32: SUB x21,x2,x19  (lenA+1)
+    self.wab_ce32(0xD10006B5);  // 36: SUB x21,x21,#1  (lenA)
+    // strlen(b): scan x2 byte-by-byte until null
+    self.wab_ce32(0xAA1403E2);  // 40: MOV x2,x20
+    self.wab_ce32(0x38401449);  // 44: LDRB w9,[x2],#1  ← .scan_b
+    self.wab_ce32(0xB5FFFFE9);  // 48: CBNZ x9,.scan_b  (-1)
+    self.wab_ce32(0xCB140056);  // 52: SUB x22,x2,x20  (lenB+1)
+    self.wab_ce32(0xD10006D6);  // 56: SUB x22,x22,#1  (lenB)
+    // VirtualAlloc(NULL, lenA+lenB+1, 0x3000, 4)
+    self.wab_ce32(0x8B1602A1);  // 60: ADD x1,x21,x22  (lenA+lenB)
+    self.wab_ce32(0x91000421);  // 64: ADD x1,x1,#1    (dwSize)
+    self.wab_ce32(0xD2800000);  // 68: MOVZ x0,#0
+    self.wab_ce32(0xD2860002);  // 72: MOVZ x2,#0x3000
+    self.wab_ce32(0xD2800083);  // 76: MOVZ x3,#4
+    self.wab_ce32(0x90000009);  // 80: ADRP x9,placeholder  [+80]
+    self.wab_ce32(0xF9400129);  // 84: LDR x9,[x9,#0]       [+84]
+    self.wab_ce32(0xD63F0120);  // 88: BLR x9  (VirtualAlloc → x0=new_ptr)
+    self.wab_ce32(0xAA0003F7);  // 92: MOV x23,x0  (save new_ptr)
+    // copy a → new_ptr (CBZ x21,.copy_b at +5 → offset 124)
+    self.wab_ce32(0xAA1303E2);  // 96: MOV x2,x19
+    self.wab_ce32(0xAA1703E3);  // 100: MOV x3,x23
+    self.wab_ce32(0xB40000B5);  // 104: CBZ x21,.copy_b  (+5 → offset 124)
+    self.wab_ce32(0x38401449);  // 108: LDRB w9,[x2],#1  ← .copy_a
+    self.wab_ce32(0x38001469);  // 112: STRB w9,[x3],#1
+    self.wab_ce32(0xD10006B5);  // 116: SUB x21,x21,#1
+    self.wab_ce32(0xB5FFFFB5);  // 120: CBNZ x21,.copy_a  (-3)
+    // copy b → new_ptr+lenA (CBZ x22,.null_term at +5 → offset 148)
+    self.wab_ce32(0xAA1403E2);  // 124: MOV x2,x20  ← .copy_b
+    self.wab_ce32(0xB40000B6);  // 128: CBZ x22,.null_term  (+5 → offset 148)
+    self.wab_ce32(0x38401449);  // 132: LDRB w9,[x2],#1  ← .copy_b_loop
+    self.wab_ce32(0x38001469);  // 136: STRB w9,[x3],#1
+    self.wab_ce32(0xD10006D6);  // 140: SUB x22,x22,#1
+    self.wab_ce32(0xB5FFFFB6);  // 144: CBNZ x22,.copy_b_loop  (-3)
+    self.wab_ce32(0x3900007F);  // 148: STRB wzr,[x3]  ← .null_term
+    self.wab_ce32(0xAA1703E0);  // 152: MOV x0,x23
+    self.wab_ce32(0xA9427BF7);  // 156: LDP x23,x30,[sp,#32]
+    self.wab_ce32(0xA9415BF5);  // 160: LDP x21,x22,[sp,#16]
+    self.wab_ce32(0xA8C553F3);  // 164: LDP x19,x20,[sp],#80
+    self.wab_ce32(0xD65F03C0);  // 168: RET
+    // 43 instructions = 172 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
+  // wab_emitStrCopyHelper (112 bytes = 28 instructions)
+  // Input: x0=s → x0=new_ptr
+  // Computes strlen(s), VirtualAllocs strlen+1 bytes, copies the string.
+  // ADRP+LDR for VirtualAlloc at offsets +48, +52 (relative to helper start).
+  // -------------------------------------------------------------------------
+
+  fn wab_emitStrCopyHelper() {
+    self.wab_ce32(0xA9BE53F3);  //  0: STP x19,x20,[sp,#-32]!
+    self.wab_ce32(0xA9017BF5);  //  4: STP x21,x30,[sp,#16]
+    self.wab_ce32(0xAA0003F3);  //  8: MOV x19,x0  (s)
+    // strlen(s): scan x2 until null byte
+    self.wab_ce32(0xAA1303E2);  // 12: MOV x2,x19
+    self.wab_ce32(0x38401449);  // 16: LDRB w9,[x2],#1  ← .scan_s
+    self.wab_ce32(0xB5FFFFE9);  // 20: CBNZ x9,.scan_s  (-1)
+    self.wab_ce32(0xCB130054);  // 24: SUB x20,x2,x19  (len+1)
+    self.wab_ce32(0xD1000694);  // 28: SUB x20,x20,#1  (len)
+    // VirtualAlloc(NULL, len+1, 0x3000, 4)
+    self.wab_ce32(0xD2800000);  // 32: MOVZ x0,#0
+    self.wab_ce32(0x91000681);  // 36: ADD x1,x20,#1
+    self.wab_ce32(0xD2860002);  // 40: MOVZ x2,#0x3000
+    self.wab_ce32(0xD2800083);  // 44: MOVZ x3,#4
+    self.wab_ce32(0x90000009);  // 48: ADRP x9,placeholder  [+48]
+    self.wab_ce32(0xF9400129);  // 52: LDR x9,[x9,#0]       [+52]
+    self.wab_ce32(0xD63F0120);  // 56: BLR x9  (VirtualAlloc → x0=new_ptr)
+    self.wab_ce32(0xAA0003F5);  // 60: MOV x21,x0  (save new_ptr)
+    // copy s → new_ptr (CBZ x20,.done at +5 → offset 92)
+    self.wab_ce32(0xAA1303E2);  // 64: MOV x2,x19  (src=s)
+    self.wab_ce32(0xAA1503E3);  // 68: MOV x3,x21  (dst=new_ptr)
+    self.wab_ce32(0xB40000B4);  // 72: CBZ x20,.done  (+5 → offset 92)
+    self.wab_ce32(0x38401449);  // 76: LDRB w9,[x2],#1  ← .copy_loop
+    self.wab_ce32(0x38001469);  // 80: STRB w9,[x3],#1
+    self.wab_ce32(0xD1000694);  // 84: SUB x20,x20,#1
+    self.wab_ce32(0xB5FFFFB4);  // 88: CBNZ x20,.copy_loop  (-3)
+    self.wab_ce32(0x3900007F);  // 92: STRB wzr,[x3]  ← .done (null terminate)
+    self.wab_ce32(0xAA1503E0);  // 96: MOV x0,x21
+    self.wab_ce32(0xA9417BF5);  // 100: LDP x21,x30,[sp,#16]
+    self.wab_ce32(0xA8C253F3);  // 104: LDP x19,x20,[sp],#32
+    self.wab_ce32(0xD65F03C0);  // 108: RET
+    // 28 instructions = 112 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
   // Patch all ADRP+LDR pairs and BL placeholders after code is complete.
   // Called after helper stubs are appended and codeLen is final.
   // -------------------------------------------------------------------------
@@ -462,6 +616,15 @@ pub type WinARM64Backend = class {
 
     // 5. wab_free: VirtualFree at hs+296+12
     self.wab_patchADRPLDR(hs + WAB_HO_FREE + 12, WAB_IAT_VIRTUALFREE);
+
+    // WP-01: wab_strsub VirtualAlloc at hs+WAB_HO_STRSUB+40
+    self.wab_patchADRPLDR(hs + WAB_HO_STRSUB + 40, WAB_IAT_VIRTUALALLOC);
+
+    // WP-01: wab_strconcat VirtualAlloc at hs+WAB_HO_STRCONCAT+80
+    self.wab_patchADRPLDR(hs + WAB_HO_STRCONCAT + 80, WAB_IAT_VIRTUALALLOC);
+
+    // WP-01: wab_strcopy VirtualAlloc at hs+WAB_HO_STRCOPY+48
+    self.wab_patchADRPLDR(hs + WAB_HO_STRCOPY + 48, WAB_IAT_VIRTUALALLOC);
   }
 
   // -------------------------------------------------------------------------
@@ -479,12 +642,15 @@ pub type WinARM64Backend = class {
   // -------------------------------------------------------------------------
 
   fn wab_patchWinBLs(patches: int64, patchCount: int64, userLen: int64) {
-    var helperOffsets: int64 := alloc(8 * 8);
-    poke64(helperOffsets + WAB_H_PRINTSTR * 8, WAB_HO_PRINTSTR);
-    poke64(helperOffsets + WAB_H_PRINTINT * 8, WAB_HO_PRINTINT);
-    poke64(helperOffsets + WAB_H_EXIT     * 8, WAB_HO_EXIT);
-    poke64(helperOffsets + WAB_H_ALLOC    * 8, WAB_HO_ALLOC);
-    poke64(helperOffsets + WAB_H_FREE     * 8, WAB_HO_FREE);
+    var helperOffsets: int64 := alloc(16 * 8);
+    poke64(helperOffsets + WAB_H_PRINTSTR  * 8, WAB_HO_PRINTSTR);
+    poke64(helperOffsets + WAB_H_PRINTINT  * 8, WAB_HO_PRINTINT);
+    poke64(helperOffsets + WAB_H_EXIT      * 8, WAB_HO_EXIT);
+    poke64(helperOffsets + WAB_H_ALLOC     * 8, WAB_HO_ALLOC);
+    poke64(helperOffsets + WAB_H_FREE      * 8, WAB_HO_FREE);
+    poke64(helperOffsets + WAB_H_STRSUB    * 8, WAB_HO_STRSUB);
+    poke64(helperOffsets + WAB_H_STRCONCAT * 8, WAB_HO_STRCONCAT);
+    poke64(helperOffsets + WAB_H_STRCOPY   * 8, WAB_HO_STRCOPY);
 
     var i: int64 := 0;
     while i < patchCount {
@@ -492,7 +658,7 @@ pub type WinARM64Backend = class {
       var codeOff:  int64 := peek64(rec);          // offset within EmitARM64 buffer
       var helperId: int64 := peek64(rec + 8);
 
-      if helperId >= 1 && helperId <= 5 {
+      if helperId >= 1 && helperId <= 8 {
         var hOff: int64 := peek64(helperOffsets + helperId * 8);
         var delta_bytes:  int64 := (userLen + hOff) - codeOff;
         var delta_instrs: int64 := delta_bytes / 4;
@@ -781,11 +947,14 @@ pub type WinARM64Backend = class {
 
     // 3. Record helper section start and emit helper stubs
     self.helperStart := self.codeLen;  // = WAB_START_SIZE + irLen
-    self.wab_emitPrintStrHelper();     // WAB_HO_PRINTSTR = 0
-    self.wab_emitPrintIntHelper();     // WAB_HO_PRINTINT = 88
-    self.wab_emitExitHelper();         // WAB_HO_EXIT     = 236
-    self.wab_emitAllocHelper();        // WAB_HO_ALLOC    = 252
-    self.wab_emitFreeHelper();         // WAB_HO_FREE     = 296
+    self.wab_emitPrintStrHelper();     // WAB_HO_PRINTSTR  = 0
+    self.wab_emitPrintIntHelper();     // WAB_HO_PRINTINT  = 88
+    self.wab_emitExitHelper();         // WAB_HO_EXIT      = 236
+    self.wab_emitAllocHelper();        // WAB_HO_ALLOC     = 252
+    self.wab_emitFreeHelper();         // WAB_HO_FREE      = 296
+    self.wab_emitStrSubHelper();       // WAB_HO_STRSUB    = 328
+    self.wab_emitStrConcatHelper();    // WAB_HO_STRCONCAT = 436
+    self.wab_emitStrCopyHelper();      // WAB_HO_STRCOPY   = 608
 
     // 4. Patch ADRP+LDR for Windows API IAT calls
     self.wab_patchIAT();
