@@ -6,7 +6,7 @@
 
 ---
 
-## LCBS-Einfluss auf den Fahrplan (Stand v0.9.3B)
+## LCBS-Einfluss auf den Fahrplan (Stand v0.9.4A)
 
 LCBS (Lyx Capability-Based Security, WP-L1–WP-T15) hat den Fahrplan in mehreren Punkten verändert:
 
