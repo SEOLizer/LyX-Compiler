@@ -181,6 +181,22 @@ fn dadqBuildColInv(table: int64, col_inv: int64) {
     }
 }
 
+// --- AP-6.1: Constant-Time Byte-Vergleich ---
+// Schleife laeuft IMMER alle n Iterationen (kein Kurzschluss).
+// Leakt nur das finale Gleichheits-Ergebnis, nicht die Position des ersten Unterschieds.
+// Rueckgabe: 1 wenn gleich, 0 wenn verschieden.
+
+fn ctMemEq(a: int64, b: int64, n: int64): int64 {
+    var diff: int64 := 0;
+    var i:    int64 := 0;
+    while (i < n) {
+        diff := diff | ((peek8(a + i) & 0xFF) ^ (peek8(b + i) & 0xFF));
+        i := i + 1;
+    }
+    if (diff == 0) { return 1; }
+    return 0;
+}
+
 // --- Schluessel-Generierung ---
 // SK-Layout:
 //   sk[0..255]   = sigma
@@ -384,20 +400,14 @@ pub fn dadqDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
         i := i + 1;
     }
 
-    // Integritaetscheck: SHA256(m_dec || r_seed) == hash_mr
-    // Nicht-tautologisch: Manipulation von m_enc aendert r_seed (via SHA256) und damit m_dec.
+    // Integritaetscheck: SHA256(m_dec || r_seed) == hash_mr  (CT)
     i := 0;
     while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
     j := 0;
     while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
     SHA256(hash_in, m_len + 32, h_mr_check);
 
-    ok := 1;
-    j := 0;
-    while (j < 32) {
-        if (peek8(h_mr_check + j) != peek8(c + m_len + 32 + j)) { ok := 0; }
-        j := j + 1;
-    }
+    ok := ctMemEq(h_mr_check, c + m_len + 32, 32);
 
     free(r_chunk, 32);
     free(hash_in, m_len + 32);
@@ -686,28 +696,20 @@ pub fn dadqFODec(sk_fo: int64, c: int64, c_len: int64, m: int64): int64 {
         i := i + 1;
     }
 
-    // FO-Check (nicht-tautologisch): HMAC(key_fo, m_dec) == r_seed_rec
+    // FO-Check (nicht-tautologisch, CT): HMAC(key_fo, m_dec) == r_seed_rec
+    // AP-6.1: beide Checks laufen IMMER (kein if-Guard), um Timing-Oracle zu vermeiden.
     dadqHMACSHA256(key_fo, m, m_len, r_seed_exp);
-    ok := 1;
-    j := 0;
-    while (j < 32) {
-        if (peek8(r_seed_exp + j) != peek8(r_seed_rec + j)) { ok := 0; }
-        j := j + 1;
-    }
 
-    // Hash-MR-Check: SHA256(m_dec || r_seed_rec) == hash_mr
-    if (ok != 0) {
-        i := 0;
-        while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
-        j := 0;
-        while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed_rec + j) & 0xFF); j := j + 1; }
-        SHA256(hash_in, m_len + 32, h_mr_check);
-        j := 0;
-        while (j < 32) {
-            if (peek8(h_mr_check + j) != peek8(c + m_len + 32 + j)) { ok := 0; }
-            j := j + 1;
-        }
-    }
+    // Hash-MR-Check: SHA256(m_dec || r_seed_rec) == hash_mr  (CT, immer ausgefuehrt)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed_rec + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr_check);
+
+    // CT-Vergleich: beide Ergebnisse akkumulieren ohne Kurzschluss
+    ok := ctMemEq(r_seed_exp, r_seed_rec, 32);
+    ok := ok & ctMemEq(h_mr_check, c + m_len + 32, 32);
 
     free(r_chunk, 32); free(hash_in, m_len + 32); free(h_mr_check, 32);
     free(h_enc, 32); free(r, m_len);
@@ -716,6 +718,49 @@ pub fn dadqFODec(sk_fo: int64, c: int64, c_len: int64, m: int64): int64 {
 
     if (ok == 0) { return (0 - 1); }
     return 0;
+}
+
+// ============================================================================
+// Phase 6 -- Implementierungshaertung (AP-6.1, AP-6.2, AP-6.3)
+// ============================================================================
+
+// --- AP-6.3: Sichere Speicherloeschung ---
+
+pub fn dadqZeroize(buf: int64, n: int64) {
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, 0); i := i + 1; }
+}
+
+// --- AP-6.2: Seed-Entropie-Validierung ---
+// Rueckgabe: 0 = gueltig, -1 = schwacher Seed (all-zero oder alle Bytes identisch).
+
+pub fn dadqValidateSeed(seed: int64): int64 {
+    var sum:  int64 := 0;
+    var same: int64 := 1;
+    var b0:   int64 := 0;
+    var bi:   int64 := 0;
+    var i:    int64 := 0;
+    b0 := peek8(seed) & 0xFF;
+    i := 0;
+    while (i < 32) {
+        bi := peek8(seed + i) & 0xFF;
+        sum := sum + bi;
+        if (bi != b0) { same := 0; }
+        i := i + 1;
+    }
+    if (sum == 0) { return (0 - 1); }
+    if (same != 0) { return (0 - 1); }
+    return 0;
+}
+
+// --- AP-6.2: Sichere KeyGen mit internem CSPRNG-Seed ---
+
+pub fn dadqFOKeyGenRand(sk_fo: int64) {
+    var seed: int64 := alloc(32);
+    RandBytesExact(seed, 32);
+    dadqFOKeyGen(seed, sk_fo);
+    dadqZeroize(seed, 32);
+    free(seed, 32);
 }
 
 // --- Alloc-Helfer ---
