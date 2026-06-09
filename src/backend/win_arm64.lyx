@@ -96,6 +96,9 @@ con WAB_H_STRCOPY:   int64 := 8;
 con WAB_H_PRINTF:      int64 := 9;
 // WP-08: Printf full format-string helper (%s/%d/%f/%%)
 con WAB_H_PRINTF_FULL: int64 := 10;
+// WP-13: Inspect helpers (stderr output)
+con WAB_H_INSPECT_STR: int64 := 11;
+con WAB_H_INSPECT_INT: int64 := 12;
 
 // Helper function sizes in bytes (verified instruction-by-instruction)
 con WAB_HS_PRINTSTR: int64 := 88;   // 22 instructions
@@ -110,6 +113,9 @@ con WAB_HS_STRCOPY:   int64 := 112;  // 28 instructions
 // WP-08
 con WAB_HS_PRINTF:      int64 := 100;  // 25 instructions
 con WAB_HS_PRINTF_FULL: int64 := 340;  // 85 instructions — full format-string walker
+// WP-13
+con WAB_HS_INSPECT_STR: int64 := 88;   // 22 instructions (same as PRINTSTR, stderr handle)
+con WAB_HS_INSPECT_INT: int64 := 148;  // 37 instructions (same as PRINTINT, calls INSPECT_STR)
 
 // Helper section offsets (relative to helper section start)
 con WAB_HO_PRINTSTR:  int64 := 0;
@@ -124,7 +130,10 @@ con WAB_HO_STRCOPY:   int64 := 608;  // 436 + 172
 // WP-08
 con WAB_HO_PRINTF:      int64 := 720;   // 608 + 112
 con WAB_HO_PRINTF_FULL: int64 := 820;   // 720 + 100
-con WAB_HELPERS_SIZE:   int64 := 1160;  // 820 + 340
+// WP-13
+con WAB_HO_INSPECT_STR: int64 := 1160;  // 820 + 340
+con WAB_HO_INSPECT_INT: int64 := 1248;  // 1160 + 88
+con WAB_HELPERS_SIZE:   int64 := 1396;  // 1248 + 148 (was 1160)
 
 // ============================================================================
 // WinARM64Backend
@@ -787,6 +796,95 @@ pub type WinARM64Backend = class {
   }
 
   // -------------------------------------------------------------------------
+  // wab_emitInspectStrHelper (88 bytes = 22 instructions)  WP-13
+  // Identical to wab_emitPrintStrHelper EXCEPT instruction 4:
+  //   MOVN x0, #10 (0x92800140) → stdout (-11)  [printstr]
+  //   MOVN x0, #11 (0x92800160) → stderr (-12)  [inspect_str]
+  // Input: x0=pchar, x1=len
+  // ADRP+LDR patches at helper-relative offsets +20 and +60 (same as PRINTSTR).
+  // -------------------------------------------------------------------------
+
+  fn wab_emitInspectStrHelper() {
+    self.wab_ce32(0xA9BD53F3);  //  0: STP x19,x20,[sp,#-48]!
+    self.wab_ce32(0xA9017BF5);  //  4: STP x21,x30,[sp,#16]
+    self.wab_ce32(0xAA0003F3);  //  8: MOV x19, x0  (str ptr)
+    self.wab_ce32(0xAA1003F4);  // 12: MOV x20, x1  (len)
+    // GetStdHandle(STD_ERROR_HANDLE = -12)
+    self.wab_ce32(0x92800160);  // 16: MOVN x0, #11  (x0 = ~11 = -12 = stderr)
+    self.wab_ce32(0x90000009);  // 20: ADRP x9, placeholder  [+20]
+    self.wab_ce32(0xF9400129);  // 24: LDR x9,[x9,#0] placeholder  [+24]
+    self.wab_ce32(0xD63F0120);  // 28: BLR x9  (GetStdHandle → x0=handle)
+    self.wab_ce32(0xAA0003F5);  // 32: MOV x21, x0  (save handle)
+    // WriteFile(handle, buf, len, &bytesWritten, NULL)
+    self.wab_ce32(0xD10043FF);  // 36: SUB sp, sp, #16
+    self.wab_ce32(0xAA1503E0);  // 40: MOV x0, x21
+    self.wab_ce32(0xAA1303E1);  // 44: MOV x1, x19
+    self.wab_ce32(0xAA1403E2);  // 48: MOV x2, x20
+    self.wab_ce32(0x910003E3);  // 52: ADD x3, sp, #0
+    self.wab_ce32(0xD2800004);  // 56: MOVZ x4, #0
+    self.wab_ce32(0x90000009);  // 60: ADRP x9, placeholder  [+60]
+    self.wab_ce32(0xF9400129);  // 64: LDR x9,[x9,#0] placeholder  [+64]
+    self.wab_ce32(0xD63F0120);  // 68: BLR x9  (WriteFile)
+    self.wab_ce32(0x910043FF);  // 72: ADD sp, sp, #16
+    self.wab_ce32(0xA9417BF5);  // 76: LDP x21,x30,[sp,#16]
+    self.wab_ce32(0xA8C353F3);  // 80: LDP x19,x20,[sp],#48
+    self.wab_ce32(0xD65F03C0);  // 84: RET
+    // 22 instructions = 88 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
+  // wab_emitInspectIntHelper (148 bytes = 37 instructions)  WP-13
+  // Byte-for-byte identical to wab_emitPrintIntHelper because:
+  //   Both emit a BL at helper-relative offset 128.
+  //   wab_printint  at HO=88:  BL at 88+128=216,  target=0  → delta=-54 → 0x97FFFFCA
+  //   wab_inspect_int at HO=1248: BL at 1248+128=1376, target=1160 → delta=-54 → 0x97FFFFCA
+  // So the BL encoding is identical even though it targets wab_inspect_str (stderr).
+  // -------------------------------------------------------------------------
+
+  fn wab_emitInspectIntHelper() {
+    self.wab_ce32(0xA9BB53F3);  //  0: STP x19,x20,[sp,#-80]!
+    self.wab_ce32(0xA9015BF5);  //  4: STP x21,x22,[sp,#16]
+    self.wab_ce32(0xA9027BF7);  //  8: STP x23,x30,[sp,#32]
+    self.wab_ce32(0xAA0003F3);  // 12: MOV x19, x0
+    self.wab_ce32(0x9100EFF4);  // 16: ADD x20, sp, #59
+    self.wab_ce32(0xD2800015);  // 20: MOVZ x21, #0
+    self.wab_ce32(0xD2800616);  // 24: MOVZ x22, #48
+    self.wab_ce32(0xB5000073);  // 28: CBNZ x19, +3
+    self.wab_ce32(0x39000296);  // 32: STRB w22, [x20]
+    self.wab_ce32(0x14000012);  // 36: B +18
+    self.wab_ce32(0xF100027F);  // 40: CMP x19, #0
+    self.wab_ce32(0x5400006A);  // 44: B.GE +3
+    self.wab_ce32(0xCB1303F3);  // 48: NEG x19, x19
+    self.wab_ce32(0xD2800035);  // 52: MOVZ x21, #1
+    self.wab_ce32(0xB4000133);  // 56: CBZ x19, +9
+    self.wab_ce32(0xD2800157);  // 60: MOVZ x23, #10
+    self.wab_ce32(0x9AD70E61);  // 64: SDIV x1, x19, x23
+    self.wab_ce32(0x9B17CC22);  // 68: MSUB x2, x1, x23, x19
+    self.wab_ce32(0x8B160042);  // 72: ADD x2, x2, x22
+    self.wab_ce32(0x39000282);  // 76: STRB w2, [x20]
+    self.wab_ce32(0xD1000694);  // 80: SUB x20, x20, #1
+    self.wab_ce32(0xAA1003F3);  // 84: MOV x19, x1
+    self.wab_ce32(0x17FFFFF8);  // 88: B -8
+    self.wab_ce32(0xB4000095);  // 92: CBZ x21, +4
+    self.wab_ce32(0xD28005B7);  // 96: MOVZ x23, #45
+    self.wab_ce32(0x39000297);  // 100: STRB w23, [x20]
+    self.wab_ce32(0xD1000694);  // 104: SUB x20, x20, #1
+    self.wab_ce32(0x91000694);  // 108: ADD x20, x20, #1
+    self.wab_ce32(0x9100EFF5);  // 112: ADD x21, sp, #59
+    self.wab_ce32(0xCB1402A1);  // 116: SUB x1, x21, x20
+    self.wab_ce32(0x91000421);  // 120: ADD x1, x1, #1
+    self.wab_ce32(0xAA1403E0);  // 124: MOV x0, x20
+    // BL wab_inspect_str: 88 bytes before this helper → delta_instrs=-54
+    // (same delta as wab_printint → wab_printstr)
+    self.wab_ce32(0x97FFFFCA);  // 128: BL wab_inspect_str (-54 instrs)
+    self.wab_ce32(0xA9427BF7);  // 132: LDP x23,x30,[sp,#32]
+    self.wab_ce32(0xA9415BF5);  // 136: LDP x21,x22,[sp,#16]
+    self.wab_ce32(0xA8C553F3);  // 140: LDP x19,x20,[sp],#80
+    self.wab_ce32(0xD65F03C0);  // 144: RET
+    // 37 instructions = 148 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
   // Patch all ADRP+LDR pairs and BL placeholders after code is complete.
   // Called after helper stubs are appended and codeLen is final.
   // -------------------------------------------------------------------------
@@ -818,6 +916,10 @@ pub type WinARM64Backend = class {
 
     // WP-01: wab_strcopy VirtualAlloc at hs+WAB_HO_STRCOPY+48
     self.wab_patchADRPLDR(hs + WAB_HO_STRCOPY + 48, WAB_IAT_VIRTUALALLOC);
+
+    // WP-13: wab_inspect_str GetStdHandle at hs+WAB_HO_INSPECT_STR+20, WriteFile at +60
+    self.wab_patchADRPLDR(hs + WAB_HO_INSPECT_STR + 20, WAB_IAT_GETSTDHANDLE);
+    self.wab_patchADRPLDR(hs + WAB_HO_INSPECT_STR + 60, WAB_IAT_WRITEFILE);
   }
 
   // -------------------------------------------------------------------------
@@ -844,8 +946,10 @@ pub type WinARM64Backend = class {
     poke64(helperOffsets + WAB_H_STRSUB    * 8, WAB_HO_STRSUB);
     poke64(helperOffsets + WAB_H_STRCONCAT * 8, WAB_HO_STRCONCAT);
     poke64(helperOffsets + WAB_H_STRCOPY   * 8, WAB_HO_STRCOPY);
-    poke64(helperOffsets + WAB_H_PRINTF      * 8, WAB_HO_PRINTF);
-    poke64(helperOffsets + WAB_H_PRINTF_FULL * 8, WAB_HO_PRINTF_FULL);
+    poke64(helperOffsets + WAB_H_PRINTF        * 8, WAB_HO_PRINTF);
+    poke64(helperOffsets + WAB_H_PRINTF_FULL   * 8, WAB_HO_PRINTF_FULL);
+    poke64(helperOffsets + WAB_H_INSPECT_STR   * 8, WAB_HO_INSPECT_STR);
+    poke64(helperOffsets + WAB_H_INSPECT_INT   * 8, WAB_HO_INSPECT_INT);
 
     var i: int64 := 0;
     while i < patchCount {
@@ -853,7 +957,7 @@ pub type WinARM64Backend = class {
       var codeOff:  int64 := peek64(rec);          // offset within EmitARM64 buffer
       var helperId: int64 := peek64(rec + 8);
 
-      if helperId >= 1 && helperId <= 10 {
+      if helperId >= 1 && helperId <= 12 {
         var hOff: int64 := peek64(helperOffsets + helperId * 8);
         var delta_bytes:  int64 := (userLen + hOff) - codeOff;
         var delta_instrs: int64 := delta_bytes / 4;
@@ -1183,8 +1287,10 @@ pub type WinARM64Backend = class {
     self.wab_emitStrSubHelper();       // WAB_HO_STRSUB    = 328
     self.wab_emitStrConcatHelper();    // WAB_HO_STRCONCAT = 436
     self.wab_emitStrCopyHelper();      // WAB_HO_STRCOPY   = 608
-    self.wab_emitPrintfHelper();       // WAB_HO_PRINTF      = 720
-    self.wab_emitPrintfFullHelper();   // WAB_HO_PRINTF_FULL = 820
+    self.wab_emitPrintfHelper();        // WAB_HO_PRINTF        = 720
+    self.wab_emitPrintfFullHelper();    // WAB_HO_PRINTF_FULL   = 820
+    self.wab_emitInspectStrHelper();    // WAB_HO_INSPECT_STR   = 1160
+    self.wab_emitInspectIntHelper();    // WAB_HO_INSPECT_INT   = 1248
 
     // 4. Patch ADRP+LDR for Windows API IAT calls
     self.wab_patchIAT();
