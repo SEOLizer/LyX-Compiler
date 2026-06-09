@@ -19,7 +19,7 @@
 | WP-09 | Windows VMT — Hardware-Verifikation | Mittel | [ ] Offen |
 | WP-10 | ARM64 Linux — PIE Binary (ET_DYN) | Niedrig | [ ] Offen |
 | WP-11 | macOS x86_64 — StrEndsWith | Niedrig | [x] Erledigt |
-| WP-12 | Xtensa/ESP32 — PrintInt (echte itoa) | Niedrig | [ ] Offen |
+| WP-12 | Xtensa/ESP32 — PrintInt (echte itoa) | Niedrig | [x] Erledigt |
 
 ---
 
@@ -189,11 +189,17 @@ Bekannte Einschränkung: x86_64-Cross-Compilation schlägt wegen `InjectConBool`
 
 ## WP-12 · Xtensa/ESP32 — PrintInt
 
-**Priorität:** Niedrig
+**Priorität:** Niedrig  
+**Status:** ✅ erledigt (WP-D3, commit d0fd8a7)
 
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | Echte itoa-Loop | Aktuell gibt `PrintInt` nur den Literal-String `"INT"` aus |
+| # | Aufgabe | Detail | Status |
+|---|---------|--------|--------|
+| 1 | Echte itoa-Loop | Iterative Subtraktion (×10), Digit-Buffer sp+8..23, UART 0x60000000 | ✅ erledigt |
+
+**Implementierung:** `xt_emitPrintIntHelper()` in `src/backend/xtensa.lyx` (111 Bytes, 37 Xtensa-Instruktionen).  
+Digits werden rückwärts in Stack-Buffer sp+8..23 gespeichert, vorwärts via S8I → a5=0x60000000 ausgegeben.  
+Negative Zahlen: NEG + direktes `-` an UART. Zero: korrekt als `0` ausgegeben.  
+**Test:** `tests/wp12_esp32_printint.lyx` → Xtensa ELF32, e_machine=0x5e, e_entry=0x400800xx.
 
 ---
 
