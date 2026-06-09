@@ -1,6 +1,7 @@
 # Aurum — Offene Arbeitspakete
 
 > Stand: 2026-06-09. Nur noch offene Punkte; erledigte WPs sind entfernt.
+> Zuletzt erledigt: WP-02 (PR #706), WP-08 (PR #707).
 
 ---
 
@@ -8,78 +9,8 @@
 
 | WP | Titel | Prio | Offen |
 |----|-------|------|-------|
-| WP-02 | macOS x86_64 — Closures | Hoch | Upvalue-Capture (VMT + DynArray erledigt) |
-| WP-08 | Windows ARM64 — Printf Formatstrings | Mittel | %s / %d / %f (PrintFloat erledigt) |
 | WP-09 | Windows ARM64 VMT — Hardware-Verifikation | Mittel | Hardware-Lauf ausstehend |
 | WP-13 | Inspect Debug-Visualizer — ARM64 + Windows ARM64 | Niedrig | Nicht implementiert |
-
----
-
-## WP-02 · macOS x86_64 — Closures
-
-**Priorität:** Hoch
-
-**Was bereits erledigt ist**
-VMT-Dispatch (PR #693: `mxb_patchVMTAddrs`) und DynArray (`push`, `pop`, `len`, `free` mit macOS mmap-Flags) sind vollständig implementiert und getestet.
-
-**Aufgabe**
-Closures mit Upvalue-Capture für macOS x86_64: eine innere Funktion soll eine Variable aus dem umgebenden Frame lesen und schreiben können.
-
-**Kontext**
-Der aktuelle Test `tests/wp02_macos_closures.lyx` enthält den Hinweis *"Closures with upvalue capture require further compiler work (sema gap)"*. Das bedeutet: der IR-Lowering-Schritt erzeugt keinen Static-Link-Zeiger und kein Upvalue-Frame-Layout. Dateien: `src/sema.lyx`, `src/ir_lower.lyx`, `src/codegen_x86.lyx` (macOS-Pfad via Codegen ist identisch zu Linux, da die macOS-Binary verbatim-kopiert wird).
-
-| Schritt | Datei | Änderung |
-|---------|-------|----------|
-| 1 | `src/sema.lyx` | Upvalue-Variablen in inneren Funktionen markieren; Static-Link-Slot im Frame reservieren |
-| 2 | `src/ir_lower.lyx` | `IRO_LOAD_UPVAL` / `IRO_STORE_UPVAL` Instruktionen emittieren; Static-Link als versteckten ersten Parameter weitergeben |
-| 3 | `src/codegen_x86.lyx` | Static-Link via `rdi`/Stack-Slot laden; Upvalue-Loads/Stores über Frame-Pointer der Elternfunktion |
-
-**Nutzen**
-Closures sind Voraussetzung für funktionale Idiome: `map`, `filter`, `forEach` mit Lambda-Syntax. Ohne Upvalue-Capture müssen alle Variablen als Parameter durchgereicht werden.
-
-**Abnahme**
-```lyx
-fn makeCounter(): fn(): int64 {
-  var n: int64 := 0;
-  return fn(): int64 { n := n + 1; return n; };
-}
-var c := makeCounter();
-c(); c(); var v := c();  // v == 3
-```
-Kompiliert und gibt `3` auf macOS x86_64 aus. Bestehende VMT- und DynArray-Tests bleiben grün.
-
----
-
-## WP-08 · Windows ARM64 — Printf Formatstrings
-
-**Priorität:** Mittel
-
-**Was bereits erledigt ist**
-`PrintFloat(f64)` ist implementiert (PR #701): `wab_emitPrintfHelper` (100 Bytes) in `src/backend/win_arm64.lyx` zerlegt eine `f64` über Integer-Arithmetik in Vor- und Nachkommateil und gibt beide via `wab_printint`/`wab_printstr` aus. `USER32.DLL`/`wsprintfA` ist im IAT gelinkt.
-
-**Aufgabe**
-Vollständige Formatstring-Funktion `Printf(fmt, ...)` mit den Spezifizierern `%s`, `%d` und `%f` für Windows ARM64 implementieren, intern via `wsprintfA`.
-
-**Kontext**
-`wsprintfA` ist eine `cdecl`-Funktion in `USER32.DLL` (bereits gelinkt). Die Microsoft ARM64-ABI übergibt die ersten vier Argumente in `x0–x3`; weitere Argumente kommen auf den Stack. `wsprintfA` erwartet: `x0=dst_buf`, `x1=fmt`, `x2..`=varargs.
-
-| Format-Spezifizierer | Verhalten |
-|---------------------|-----------|
-| `%s` | ANSI-String-Pointer (`pchar`) |
-| `%d` | `int64` als Dezimalzahl |
-| `%f` | `f64` mit 6 Nachkommastellen |
-| `%%` | Literal-`%` |
-
-Implementierungspfad: neuer Builtin-ID (oder Erweiterung des bestehenden `wab_emitPrintfHelper`), der varargs aus dem IR-Slot-Array in die richtigen Register/Stack-Positionen legt und dann `wsprintfA` aufruft. Der resultierende String wird anschließend via `wab_printstr` ausgegeben.
-
-**Nutzen**
-Einzeilige formatierte Ausgabe ohne manuelle String-Konkatenation — unerlässlich für Debugging, Logging und User-facing Output auf Windows ARM64.
-
-**Abnahme**
-- `Printf("x=%d, s=%s\n"c, 42, "hello"c)` gibt `x=42, s=hello` aus.
-- `Printf("%f\n"c, 3.14)` gibt `3.140000` aus.
-- `Printf("100%%\n"c)` gibt `100%` aus.
-- Bestehender `PrintFloat`-Test (`tests/wp08_win_arm64_printf.lyx`) bleibt grün.
 
 ---
 
