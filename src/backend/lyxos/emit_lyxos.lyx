@@ -1,0 +1,430 @@
+// LX-01: Lyx OS Backend — ELF-Grundgerüst + .note.lyx-abi
+// LX-02: Codegen-Skelett (IR-Dispatch, SYSCALL-Makro, Slot-Modell)
+//
+// ELF-Layout (x86-64 EXEC, statisch):
+//   0x0000  ELF header        64 B
+//   0x0040  PH[0] PT_LOAD RX  56 B  (covers whole file)
+//   0x0078  PH[1] PT_NOTE R   56 B  (.note.lyx-abi)
+//   0x00B0  padding            …
+//   0x1000  .text (_start)     N B   (IR-compiled code)
+//   0x1000+N .note.lyx-abi    24 B
+//
+// Syscall ABI (syscalls.md §2.2):
+//   in:  rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5, r9=a6
+//   out: rax=errcode, rdx=value
+//   clobbered: rcx, r11
+//   callee-saved: rbx, rbp, r12–r15
+//
+// sys_exit_group = 0x0002 (lyxos)
+
+import src.ir;
+
+// ---------------------------------------------------------------------------
+// EmitLyxOS — x86-64 code generator for --target=lyxos
+// ---------------------------------------------------------------------------
+
+pub type EmitLyxOS = class {
+    irMod:    int64;   // pointer to IRModule
+    codeBuf:  int64;   // mmap'd output buffer
+    codeLen:  int64;   // bytes written so far
+    codeCap:  int64;
+
+    pub fn init(ir: int64): void {
+        self.irMod   := ir;
+        self.codeCap := 65536;
+        self.codeBuf := alloc(self.codeCap);
+        self.codeLen := 0;
+    }
+
+    fn grow(need: int64): void {
+        if (self.codeLen + need) <= self.codeCap { return; }
+        var nc: int64 := self.codeCap * 2;
+        while nc < (self.codeLen + need) { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.codeBuf, self.codeLen);
+        self.codeBuf := nb;
+        self.codeCap := nc;
+    }
+
+    pub fn emit8(v: int64): void {
+        self.grow(1);
+        poke8(self.codeBuf + self.codeLen, v & 0xFF);
+        self.codeLen := self.codeLen + 1;
+    }
+
+    pub fn emit32(v: int64): void {
+        self.grow(4);
+        poke8(self.codeBuf + self.codeLen + 0,  v        & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
+        self.codeLen := self.codeLen + 4;
+    }
+
+    pub fn emit64(v: int64): void {
+        self.grow(8);
+        poke8(self.codeBuf + self.codeLen + 0,  v        & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 4, (v >> 32) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 5, (v >> 40) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 6, (v >> 48) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 7, (v >> 56) & 0xFF);
+        self.codeLen := self.codeLen + 8;
+    }
+
+    // Patch a u32 at an already-written offset.
+    fn patch32(off: int64, v: int64): void {
+        poke8(self.codeBuf + off + 0,  v        & 0xFF);
+        poke8(self.codeBuf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+    }
+
+    // Patch a u64 at an already-written offset.
+    fn patch64(off: int64, v: int64): void {
+        poke8(self.codeBuf + off + 0,  v        & 0xFF);
+        poke8(self.codeBuf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+        poke8(self.codeBuf + off + 4, (v >> 32) & 0xFF);
+        poke8(self.codeBuf + off + 5, (v >> 40) & 0xFF);
+        poke8(self.codeBuf + off + 6, (v >> 48) & 0xFF);
+        poke8(self.codeBuf + off + 7, (v >> 56) & 0xFF);
+    }
+
+    // --- Syscall helpers ---
+
+    // SYSCALL instruction: 0F 05
+    fn emitSyscall(): void {
+        self.emit8(0x0F);
+        self.emit8(0x05);
+    }
+
+    // MOV rax, imm64  (REX.W B8+rd)
+    fn emitMovRaxImm(v: int64): void {
+        self.emit8(0x48);   // REX.W
+        self.emit8(0xB8);   // MOV rax, imm64
+        self.emit64(v);
+    }
+
+    // MOV rdi, imm32  (sign-extended)  — xor edi,edi for 0
+    fn emitMovRdiImm32(v: int64): void {
+        if v == 0 {
+            // XOR edi, edi  (31 FF)  — also zeroes rdi via zero-extension
+            self.emit8(0x31);
+            self.emit8(0xFF);
+        } else {
+            // MOV edi, imm32  (BF imm32)
+            self.emit8(0xBF);
+            self.emit32(v);
+        }
+    }
+
+    // Emit: sys_exit_group(code)  [lyxos syscall 0x0002]
+    fn emitSysExitGroup(code: int64): void {
+        self.emitMovRaxImm(2);        // rax = 0x0002
+        self.emitMovRdiImm32(code);   // rdi = exit code
+        self.emitSyscall();
+    }
+
+    // Patch a u32 at an already-written position.
+    pub fn patchCallRel32(off: int64, rel32: int64): void {
+        self.patch32(off, rel32);
+    }
+
+    // --- Slot model (rbp-based locals, 8 bytes each) ---
+    // slot 0 → [rbp - 8], slot 1 → [rbp - 16], etc.
+    fn slotOff(slot: int64): int64 {
+        return 0 - (slot + 1) * 8;
+    }
+
+    // --- Function prologue / epilogue ---
+
+    fn emitPrologue(localCount: int64): void {
+        // PUSH rbp
+        self.emit8(0x55);
+        // MOV rbp, rsp
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xE5);
+        // SUB rsp, localCount*8  (align to 16: round up to even)
+        var frameBytes: int64 := localCount * 8;
+        var aligned: int64 := ((frameBytes + 15) / 16) * 16;
+        if aligned > 0 {
+            if aligned <= 127 {
+                // SUB rsp, imm8  (48 83 EC imm8)
+                self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC);
+                self.emit8(aligned);
+            } else {
+                // SUB rsp, imm32  (48 81 EC imm32)
+                self.emit8(0x48); self.emit8(0x81); self.emit8(0xEC);
+                self.emit32(aligned);
+            }
+        }
+    }
+
+    fn emitEpilogue(): void {
+        // MOV rsp, rbp
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xEC);
+        // POP rbp
+        self.emit8(0x5D);
+        // RET
+        self.emit8(0xC3);
+    }
+
+    // --- _start entry point ---
+    // Emits the _start stub with a placeholder CALL rel32 = 0.
+    // Caller must patch offset 4 with the correct rel32 after emitting functions.
+    // Layout (from buffer offset 0):
+    //   +0  XOR rbp, rbp  (3 bytes)
+    //   +3  CALL rel32    (5 bytes)  ← rel32 at +4, callNextIP = 8
+    //   +8  MOV edi, eax  (2 bytes)
+    //   +10 MOV rax, 2    (10 bytes)
+    //   +20 SYSCALL        (2 bytes)
+    pub fn emitStartStub(): void {
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);  // XOR rbp, rbp
+        self.emit8(0xE8); self.emit32(0);                       // CALL +0 (placeholder)
+        self.emit8(0x89); self.emit8(0xC7);                     // MOV edi, eax
+        self.emitMovRaxImm(2);                                  // MOV rax, 2
+        self.emitSyscall();                                     // SYSCALL
+    }
+
+    // --- IR instruction dispatch (LX-02 skeleton) ---
+    // Currently: stub that emits nothing. Expanded per LX-02.
+    fn emitInstr(idx: int64): void {
+        var instrBuf: int64 := peek64(self.irMod + IR_MOD_OFF_INSTRBUF);
+        var iBase:    int64 := instrBuf + idx * IR_INSTR_SIZE;
+        var op:       int64 := peek64(iBase + 0);
+        var dest:     int64 := peek64(iBase + IR_INSTR_OFF_DEST);
+        var src1:     int64 := peek64(iBase + IR_INSTR_OFF_SRC1);
+        var src2:     int64 := peek64(iBase + IR_INSTR_OFF_SRC2);
+        var imm:      int64 := peek64(iBase + IR_INSTR_OFF_IMMINT);
+        // LX-02: full dispatch will be added here
+    }
+
+    // Emit all IR functions.
+    // Returns byte offset of `main` in the output buffer (for _start CALL).
+    fn emitFunctions(): int64 {
+        var funcBuf:  int64 := peek64(self.irMod + IR_MOD_OFF_FUNCBUF);
+        var funcLen:  int64 := peek64(self.irMod + IR_MOD_OFF_FUNCLEN);
+        var strBuf:   int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
+        var mainOff:  int64 := self.codeLen;   // default: first func
+
+        var fi: int64 := 0;
+        while fi < funcLen {
+            var fBase:       int64 := funcBuf + fi * IR_FUNC_SIZE;
+            var fnNameOff:   int64 := peek64(fBase + 0);
+            var fnNameLen:   int64 := peek64(fBase + IR_FUNC_OFF_NAMELEN);
+            var fnInstrsOff: int64 := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
+            var fnInstrCnt:  int64 := peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
+            var fnLocals:    int64 := peek64(fBase + IR_FUNC_OFF_LOCALCOUNT);
+
+            // Record offset of main()
+            if fnNameLen == 4 {
+                var p: int64 := strBuf + fnNameOff;
+                if peek8(p+0)==109 && peek8(p+1)==97 && peek8(p+2)==105 && peek8(p+3)==110 {
+                    mainOff := self.codeLen;
+                }
+            }
+
+            var firstIdx: int64 := fnInstrsOff / IR_INSTR_SIZE;
+            self.emitPrologue(fnLocals);
+            var ii: int64 := 0;
+            while ii < fnInstrCnt {
+                self.emitInstr(firstIdx + ii);
+                ii := ii + 1;
+            }
+            // Fallback return value 0 in rax if no explicit FUNC_EXIT was emitted
+            self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
+            self.emitEpilogue();
+
+            fi := fi + 1;
+        }
+        return mainOff;
+    }
+
+    pub fn getCodeBuf(): int64 { return self.codeBuf; }
+    pub fn getCodeLen(): int64 { return self.codeLen; }
+};
+
+// ---------------------------------------------------------------------------
+// LyxOsELFWriter — writes the ELF binary with .note.lyx-abi
+// ---------------------------------------------------------------------------
+
+pub type LyxOsELFWriter = class {
+    buf: int64;
+    len: int64;
+    cap: int64;
+
+    // Prefixed elf_ to avoid VMT collision with EmitLyxOS.init/grow/patch32/patch64
+    fn elf_init(): void {
+        self.cap := 65536;
+        self.buf := alloc(self.cap);
+        self.len := 0;
+    }
+
+    fn elf_grow(need: int64): void {
+        if (self.len + need) <= self.cap { return; }
+        var nc: int64 := self.cap * 2;
+        while nc < (self.len + need) { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.buf, self.len);
+        self.buf := nb;
+        self.cap := nc;
+    }
+
+    fn elf_w8(v: int64): void {
+        self.elf_grow(1);
+        poke8(self.buf + self.len, v & 0xFF);
+        self.len := self.len + 1;
+    }
+
+    fn elf_w16(v: int64): void {
+        self.elf_grow(2);
+        poke8(self.buf + self.len + 0, v & 0xFF);
+        poke8(self.buf + self.len + 1, (v >> 8) & 0xFF);
+        self.len := self.len + 2;
+    }
+
+    fn elf_w32(v: int64): void {
+        self.elf_grow(4);
+        poke8(self.buf + self.len + 0,  v        & 0xFF);
+        poke8(self.buf + self.len + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        self.len := self.len + 4;
+    }
+
+    fn elf_w64(v: int64): void {
+        self.elf_grow(8);
+        poke8(self.buf + self.len + 0,  v        & 0xFF);
+        poke8(self.buf + self.len + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        poke8(self.buf + self.len + 4, (v >> 32) & 0xFF);
+        poke8(self.buf + self.len + 5, (v >> 40) & 0xFF);
+        poke8(self.buf + self.len + 6, (v >> 48) & 0xFF);
+        poke8(self.buf + self.len + 7, (v >> 56) & 0xFF);
+        self.len := self.len + 8;
+    }
+
+    fn elf_patch32(off: int64, v: int64): void {
+        poke8(self.buf + off + 0,  v        & 0xFF);
+        poke8(self.buf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + off + 3, (v >> 24) & 0xFF);
+    }
+
+    fn elf_patch64(off: int64, v: int64): void {
+        poke8(self.buf + off + 0,  v        & 0xFF);
+        poke8(self.buf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + off + 3, (v >> 24) & 0xFF);
+        poke8(self.buf + off + 4, (v >> 32) & 0xFF);
+        poke8(self.buf + off + 5, (v >> 40) & 0xFF);
+        poke8(self.buf + off + 6, (v >> 48) & 0xFF);
+        poke8(self.buf + off + 7, (v >> 56) & 0xFF);
+    }
+
+    fn elf_padTo(target: int64): void {
+        while self.len < target { self.elf_w8(0); }
+    }
+
+    // Write the .note.lyx-abi section payload (24 bytes):
+    //   namesz=4, descsz=8, type=1, "LYX\0", major=1, minor=0
+    fn elf_writeNote(): void {
+        self.elf_w32(4);              // namesz: "LYX\0" = 4 bytes
+        self.elf_w32(8);              // descsz: major(4) + minor(4) = 8 bytes
+        self.elf_w32(1);              // type = 1 (NT_VERSION)
+        self.elf_w8(76);              // 'L'
+        self.elf_w8(89);              // 'Y'
+        self.elf_w8(88);              // 'X'
+        self.elf_w8(0);               // '\0'
+        self.elf_w32(1);              // major = 1
+        self.elf_w32(0);              // minor = 0
+    }
+
+    // Build and write the ELF file.
+    // codeBuf/codeLen: compiled machine code (_start + functions).
+    pub fn writeELF(path: pchar, codeBuf: int64, codeLen: int64): bool {
+        self.elf_init();
+        if self.buf == 0 { return false; }  // alloc failed
+
+        var pageSize:   int64 := 4096;           // 0x1000
+        var baseVaddr:  int64 := 0x400000;
+        var codeOff:    int64 := pageSize;        // .text at file offset 0x1000
+        var noteOff:    int64 := codeOff + codeLen;
+        var noteSize:   int64 := 24;
+        var fileSize:   int64 := noteOff + noteSize;
+
+        var entryVaddr: int64 := baseVaddr + codeOff;   // 0x401000 = _start
+        var noteVaddr:  int64 := baseVaddr + noteOff;
+
+        // --- ELF header (64 bytes) ---
+        // e_ident magic
+        self.elf_w8(127); self.elf_w8(69); self.elf_w8(76); self.elf_w8(70);  // \x7fELF
+        self.elf_w8(2);   // EI_CLASS = ELFCLASS64
+        self.elf_w8(1);   // EI_DATA  = ELFDATA2LSB (little-endian)
+        self.elf_w8(1);   // EI_VERSION = EV_CURRENT
+        self.elf_w8(0);   // EI_OSABI = ELFOSABI_NONE  (0 = System V / LyxOS)
+        self.elf_w64(0);  // EI_ABIVERSION + padding (8 bytes)
+        self.elf_w16(2);  // e_type = ET_EXEC
+        self.elf_w16(62); // e_machine = EM_X86_64
+        self.elf_w32(1);  // e_version = EV_CURRENT
+        self.elf_w64(entryVaddr);  // e_entry
+        self.elf_w64(64);          // e_phoff = 64 (right after ELF header)
+        self.elf_w64(0);           // e_shoff = 0 (no section headers)
+        self.elf_w32(0);           // e_flags
+        self.elf_w16(64);          // e_ehsize
+        self.elf_w16(56);          // e_phentsize
+        self.elf_w16(2);           // e_phnum = 2 (PT_LOAD, PT_NOTE)
+        self.elf_w16(64);          // e_shentsize
+        self.elf_w16(0);           // e_shnum
+        self.elf_w16(0);           // e_shstrndx
+
+        // --- Program headers (2 × 56 bytes) ---
+        // Bootstrap Bug 4: max 5 explicit args. elf_writePH had 7 → inline instead.
+        // PH[0]: PT_LOAD (R-X) — covers entire file
+        self.elf_grow(56);
+        self.elf_w32(1);           // p_type  = PT_LOAD
+        self.elf_w32(5);           // p_flags = R|X
+        self.elf_w64(0);           // p_offset
+        self.elf_w64(baseVaddr);   // p_vaddr
+        self.elf_w64(baseVaddr);   // p_paddr
+        self.elf_w64(fileSize);    // p_filesz
+        self.elf_w64(fileSize);    // p_memsz
+        self.elf_w64(pageSize);    // p_align
+
+        // PH[1]: PT_NOTE (R) — .note.lyx-abi only
+        self.elf_grow(56);
+        self.elf_w32(4);           // p_type  = PT_NOTE
+        self.elf_w32(4);           // p_flags = R
+        self.elf_w64(noteOff);     // p_offset
+        self.elf_w64(noteVaddr);   // p_vaddr
+        self.elf_w64(noteVaddr);   // p_paddr
+        self.elf_w64(noteSize);    // p_filesz
+        self.elf_w64(noteSize);    // p_memsz
+        self.elf_w64(4);           // p_align
+
+        // --- Padding to page boundary ---
+        self.elf_padTo(codeOff);
+
+        // --- .text: compiled code ---
+        var ci: int64 := 0;
+        while ci < codeLen {
+            self.elf_w8(peek8(codeBuf + ci));
+            ci := ci + 1;
+        }
+
+        // --- .note.lyx-abi ---
+        self.elf_writeNote();
+
+        // --- Write to file ---
+        var fd: int64 := open(path, 577, 493);   // O_WRONLY|O_CREAT|O_TRUNC, 0755
+        if fd == -1 { return false; }
+        write(fd, self.buf as pchar, self.len);
+        close(fd);
+        chmod(path, 493);
+        return true;
+    }
+};
