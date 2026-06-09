@@ -1,7 +1,7 @@
 # Aurum — Offene Arbeitspakete
 
 > Stand: 2026-06-09. Nur noch offene Punkte; erledigte WPs sind entfernt.
-> Zuletzt erledigt: WP-02 (PR #706), WP-08 (PR #707), WP-13 (PR offen).
+> Zuletzt erledigt: WP-02 (PR #706), WP-08 (PR #707), WP-13 (PR #708).
 
 ---
 
