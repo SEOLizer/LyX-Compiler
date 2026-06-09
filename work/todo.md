@@ -1,211 +1,136 @@
-# Aurum — Arbeitspakete
+# Aurum — Offene Arbeitspakete
 
-> Stand: 2026-06-08. Jedes WP ist eigenständig bearbeitbar. Status nach Abschluss updaten.
+> Stand: 2026-06-09. Nur noch offene Punkte; erledigte WPs sind entfernt.
 
 ---
 
 ## Übersicht
 
-| WP | Titel | Prio | Status |
-|----|-------|------|--------|
-| WP-01 | Windows ARM64 — StrSub / StrConcat / StrCopy | Hoch | [ ] Offen |
-| WP-02 | macOS x86_64 — VMT / DynArray / Closures | Hoch | [ ] Offen |
-| WP-03 | ARM64 Linux — CRT-Init für Dynamic Linking | Hoch | [ ] Offen |
-| WP-04 | Compiler — Tuple-Return-Typ `[T, T]` | Hoch | [ ] Offen |
-| WP-05 | std/audio.lyx — Audio Unit (WAV / ALSA / MP3) | Mittel | [ ] Offen |
-| WP-06 | macOS x86_64 — Socket-Builtins | Mittel | [ ] Offen |
-| WP-07 | std.net — IPv6 Support | Mittel | [ ] Offen |
-| WP-08 | Windows ARM64 — printf via wsprintfA | Mittel | [ ] Offen |
-| WP-09 | Windows VMT — Hardware-Verifikation | Mittel | [ ] Offen |
-| WP-10 | ARM64 Linux — PIE Binary (ET_DYN) | Niedrig | [ ] Offen |
-| WP-11 | macOS x86_64 — StrEndsWith | Niedrig | [x] Erledigt |
-| WP-12 | Xtensa/ESP32 — PrintInt (echte itoa) | Niedrig | [x] Erledigt |
+| WP | Titel | Prio | Offen |
+|----|-------|------|-------|
+| WP-02 | macOS x86_64 — Closures | Hoch | Upvalue-Capture (VMT + DynArray erledigt) |
+| WP-08 | Windows ARM64 — Printf Formatstrings | Mittel | %s / %d / %f (PrintFloat erledigt) |
+| WP-09 | Windows ARM64 VMT — Hardware-Verifikation | Mittel | Hardware-Lauf ausstehend |
+| WP-13 | Inspect Debug-Visualizer — ARM64 + Windows ARM64 | Niedrig | Nicht implementiert |
 
 ---
 
-## WP-01 · Windows ARM64 — String-Funktionen
+## WP-02 · macOS x86_64 — Closures
 
-**Priorität:** Hoch  
-**Problem:** `StrSub`, `StrConcat`, `StrCopy` allozieren Speicher, kopieren aber nicht. Aufrufer erhalten Puffer mit Zufallsinhalt — stilles Fehlverhalten, kein Compile- oder Runtime-Error.
+**Priorität:** Hoch
 
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | `StrSub(s, start, len)` | VirtualAlloc + memcpy-Loop über `len` Bytes ab `start` |
-| 2 | `StrConcat(a, b)` | VirtualAlloc(lenA + lenB + 1) + beide Strings kopieren |
-| 3 | `StrCopy(s)` | VirtualAlloc + lstrlenA + memcpy |
+**Was bereits erledigt ist**
+VMT-Dispatch (PR #693: `mxb_patchVMTAddrs`) und DynArray (`push`, `pop`, `len`, `free` mit macOS mmap-Flags) sind vollständig implementiert und getestet.
 
----
+**Aufgabe**
+Closures mit Upvalue-Capture für macOS x86_64: eine innere Funktion soll eine Variable aus dem umgebenden Frame lesen und schreiben können.
 
-## WP-02 · macOS x86_64 — Kern-Features
+**Kontext**
+Der aktuelle Test `tests/wp02_macos_closures.lyx` enthält den Hinweis *"Closures with upvalue capture require further compiler work (sema gap)"*. Das bedeutet: der IR-Lowering-Schritt erzeugt keinen Static-Link-Zeiger und kein Upvalue-Frame-Layout. Dateien: `src/sema.lyx`, `src/ir_lower.lyx`, `src/codegen_x86.lyx` (macOS-Pfad via Codegen ist identisch zu Linux, da die macOS-Binary verbatim-kopiert wird).
 
-**Priorität:** Hoch  
-**Problem:** VMT blockiert Object-Oriented-Code auf macOS vollständig. DynArray und Closures funktionieren auf allen anderen Targets, nur macOS fehlt.
+| Schritt | Datei | Änderung |
+|---------|-------|----------|
+| 1 | `src/sema.lyx` | Upvalue-Variablen in inneren Funktionen markieren; Static-Link-Slot im Frame reservieren |
+| 2 | `src/ir_lower.lyx` | `IRO_LOAD_UPVAL` / `IRO_STORE_UPVAL` Instruktionen emittieren; Static-Link als versteckten ersten Parameter weitergeben |
+| 3 | `src/codegen_x86.lyx` | Static-Link via `rdi`/Stack-Slot laden; Upvalue-Loads/Stores über Frame-Pointer der Elternfunktion |
 
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | VMT / Virtual Calls | Dispatch-Tabelle aufbauen + `new`-Initialisierung |
-| 2 | DynArray | Push/Pop/Len/Free — analog x86_64 Linux implementieren |
-| 3 | Closures / Static-Link | Capture-Variablen über Frame-Grenze (Upvalue-Pointer) |
+**Nutzen**
+Closures sind Voraussetzung für funktionale Idiome: `map`, `filter`, `forEach` mit Lambda-Syntax. Ohne Upvalue-Capture müssen alle Variablen als Parameter durchgereicht werden.
 
-Empfohlene Reihenfolge: VMT → DynArray → Closures (unabhängig, VMT ist der Blocker).
-
----
-
-## WP-03 · ARM64 Linux — CRT-Init
-
-**Priorität:** Hoch  
-**Problem:** Ohne korrekten CRT-Start-Code scheitern dynamisch gegen libc gelinkte Programme beim Aufruf von Funktionen, die `__libc_start_main` voraussetzen.
-
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | CRT-Start-Code emittieren | `_start` → `__libc_start_main(main, argc, argv, ...)` |
-| 2 | argc/argv aus Linux ABI | rdi (argc) + rsi (argv-Zeiger) korrekt an `main` weitergeben |
+**Abnahme**
+```lyx
+fn makeCounter(): fn(): int64 {
+  var n: int64 := 0;
+  return fn(): int64 { n := n + 1; return n; };
+}
+var c := makeCounter();
+c(); c(); var v := c();  // v == 3
+```
+Kompiliert und gibt `3` auf macOS x86_64 aus. Bestehende VMT- und DynArray-Tests bleiben grün.
 
 ---
 
-## WP-04 · Compiler — Tuple-Return-Typ
-
-**Priorität:** Hoch  
-**Problem:** `BoundingBoxFromPoints` und `CalculateBoundingBox` in `std/geo.lyx` können `[GeoPoint, GeoPoint]` nicht als Return-Type deklarieren. Der Parser behandelt `[...]` in Typ-Positionen als Array-Elementtyp, nicht als Tuple. Fünf koordinierte Änderungen nötig.
-
-| Schritt | Datei | Aufgabe |
-|---------|-------|---------|
-| 1 | `ast.pas` | `atTuple` Knotentyp + `TTupleElemTypes`-Record |
-| 2 | `parser.pas` | `[T, T, ...]` in `ParseTypeExFull` → Tuple statt Array wenn Identifier-Liste |
-| 3 | `sema.pas` | Return-Type-Check für Tuple-Annotationen; Stellenzahl prüfen |
-| 4 | `lower_ast_to_ir.pas` | Tuple-Return lowern → `irReturnStruct` oder Hidden-Pointer |
-| 5 | `x86_64_emit.pas` | SysV ABI: 2 Structs ≤16B → RAX:RDX, >16B → Hidden-Ptr in RDI |
-
----
-
-## WP-05 · std/audio.lyx — Audio Unit
-
-**Priorität:** Mittel  
-**Problem:** Komplett neues Modul, kein einziger Punkt existiert. Drei Phasen; Phase A ist Voraussetzung für B und C.
-
-**Phase A — WAV + ALSA (Basis)**
-
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| A1 | API Design | `AudioOpen`, `AudioPlay`, `AudioClose` in `std/audio.lyx` |
-| A2 | WAV Parser | RIFF-WAVE: fmt-Chunk + data-Chunk lesen |
-| A3 | WAV Decoder | PCM 8-bit unsigned, 16-bit signed, Mono/Stereo |
-| A4 | ALSA Syscalls | `snd_pcm_open`, `snd_pcm_write`, `snd_pcm_close` via FFI |
-| A5 | Tests | `tests/audio_test.lyx` — WAV laden + abspielen |
-
-**Phase B — PipeWire (Alternative zu ALSA)**
-
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| B1 | PipeWire Support | `pw_stream_connect`, `pw_stream_write` als Alternative zu ALSA |
-
-**Phase C — MP3**
-
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| C1 | MP3 Parser | ID3v2 Tag-Parsing, Frame-Header Dekodierung |
-| C2 | MP3 Decoder | Minimaler Frame-Extraktor oder FFI zu `libmpg123` |
-| C3 | Tests | `tests/audio_test.lyx` um MP3 erweitern |
-
----
-
-## WP-06 · macOS x86_64 — Socket-Builtins
-
-**Priorität:** Mittel  
-**Hinweis:** macOS verwendet `0x2000000`-Präfix vor Syscall-Nummern (z.B. `socket` = `0x2000061`).
-
-| # | Aufgabe |
-|---|---------|
-| 1 | `sys_socket`, `sys_bind`, `sys_listen`, `sys_accept`, `sys_connect` |
-| 2 | `sys_recvfrom`, `sys_sendto`, `sys_setsockopt`, `sys_getsockopt`, `sys_shutdown` |
-
----
-
-## WP-07 · std.net — IPv6
-
-**Priorität:** Mittel  
-**Problem:** `SockAddrIn6` ist in `std/net/socket.lyx` definiert, aber nirgends verwendet.
-
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | AF_INET6 in sys_bind / sys_connect | `sockaddr_in6` befüllen + übergeben |
-| 2 | GetHostByName erweitern | AAAA-Records auswerten, IPv6-Adresse zurückgeben |
-| 3 | Neue API-Funktionen | `SocketNewV6`, `BindV6`, `ConnectV6` in `std/net/socket.lyx` |
-
----
-
-## WP-08 · Windows ARM64 — printf
+## WP-08 · Windows ARM64 — Printf Formatstrings
 
 **Priorität:** Mittel
 
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | printf via `wsprintfA` | Format-String-Parsing für `%s`, `%d`, `%f` |
+**Was bereits erledigt ist**
+`PrintFloat(f64)` ist implementiert (PR #701): `wab_emitPrintfHelper` (100 Bytes) in `src/backend/win_arm64.lyx` zerlegt eine `f64` über Integer-Arithmetik in Vor- und Nachkommateil und gibt beide via `wab_printint`/`wab_printstr` aus. `USER32.DLL`/`wsprintfA` ist im IAT gelinkt.
+
+**Aufgabe**
+Vollständige Formatstring-Funktion `Printf(fmt, ...)` mit den Spezifizierern `%s`, `%d` und `%f` für Windows ARM64 implementieren, intern via `wsprintfA`.
+
+**Kontext**
+`wsprintfA` ist eine `cdecl`-Funktion in `USER32.DLL` (bereits gelinkt). Die Microsoft ARM64-ABI übergibt die ersten vier Argumente in `x0–x3`; weitere Argumente kommen auf den Stack. `wsprintfA` erwartet: `x0=dst_buf`, `x1=fmt`, `x2..`=varargs.
+
+| Format-Spezifizierer | Verhalten |
+|---------------------|-----------|
+| `%s` | ANSI-String-Pointer (`pchar`) |
+| `%d` | `int64` als Dezimalzahl |
+| `%f` | `f64` mit 6 Nachkommastellen |
+| `%%` | Literal-`%` |
+
+Implementierungspfad: neuer Builtin-ID (oder Erweiterung des bestehenden `wab_emitPrintfHelper`), der varargs aus dem IR-Slot-Array in die richtigen Register/Stack-Positionen legt und dann `wsprintfA` aufruft. Der resultierende String wird anschließend via `wab_printstr` ausgegeben.
+
+**Nutzen**
+Einzeilige formatierte Ausgabe ohne manuelle String-Konkatenation — unerlässlich für Debugging, Logging und User-facing Output auf Windows ARM64.
+
+**Abnahme**
+- `Printf("x=%d, s=%s\n"c, 42, "hello"c)` gibt `x=42, s=hello` aus.
+- `Printf("%f\n"c, 3.14)` gibt `3.140000` aus.
+- `Printf("100%%\n"c)` gibt `100%` aus.
+- Bestehender `PrintFloat`-Test (`tests/wp08_win_arm64_printf.lyx`) bleibt grün.
 
 ---
 
-## WP-09 · Windows VMT — Hardware-Verifikation
+## WP-09 · Windows ARM64 VMT — Hardware-Verifikation
 
-**Priorität:** Mittel  
-**Problem:** Virtual Calls wurden nur unter QEMU verifiziert.  
-**Status:** Test-Binary bereit (`tests/wp09_win_arm64_vmt.lyx` → `wp09_vmt.exe`, PE32+/Aarch64 verified).  
-Ausführung auf echter Windows ARM64 Hardware noch ausstehend.
+**Priorität:** Mittel
 
-| # | Aufgabe | Status |
-|---|---------|--------|
-| 1 | Virtual-Dispatch-Test auf echter Windows ARM64 Hardware ausführen | ⏳ ausstehend |
-| 2 | Ergebnis (Pass/Fail + Gerät) in Commit-Message dokumentieren | ⏳ ausstehend |
+**Aufgabe**
+Das bestehende Testprogramm `tests/wp09_win_arm64_vmt.lyx` auf echter Windows ARM64 Hardware ausführen und das Ergebnis dokumentieren.
 
----
+**Kontext**
+Das PE32+/Aarch64-Binary ist fertig kompiliert und wurde unter QEMU-Emulation verifiziert. Ein QEMU-Lauf ist kein Ersatz für echte Hardware — Mikroarchitektur-Details (Alignment, Cache-Kohärenz, Calling-Convention-Randfälle) können abweichen. Das Testprogramm prüft zwei unabhängige Klassen mit VMT-Dispatch (`Counter`, `Accumulator`) und erwartet folgende Konsolenausgabe:
+```
+3
+60
+PASS
+```
 
-## WP-10 · ARM64 Linux — PIE Binary
+**Nutzen**
+Erst ein erfolgreicher Lauf auf echter Hardware schließt den Verifikationskreis für den gesamten Windows ARM64 Codegen-Pfad ab. Ohne diesen Nachweis bleibt die Produktionsreife des Backends unklar.
 
-**Priorität:** Niedrig  
-**Status:** ELF-Writer geändert (`src/lyxc.lyx` → `writeELF`): ET_DYN + loadVA=0x1000 für `LYX_TC_ARM64`.  
-Test-Datei: `tests/wp10_arm64_pie.lyx`.  
-Bekannte Einschränkung: x86_64-Cross-Compilation schlägt wegen `InjectConBool`-Shadowing fehl; nativ auf ARM64 Linux ausführen.
-
-| # | Aufgabe | Detail | Status |
-|---|---------|--------|--------|
-| 1 | `ET_DYN` im ELF-Header | Nur ELF-Writer ändern; kein IR-Änderungsbedarf | ✅ erledigt |
+**Abnahme**
+- Programm gibt `3`, `60`, `PASS` auf der Konsole aus — kein Absturz, kein falsches Ergebnis.
+- Gerät und OS-Version werden im Commit-Message dokumentiert (z.B. `Surface Pro X, Windows 11 ARM64, Build 26100`).
 
 ---
 
-## WP-11 · macOS x86_64 — StrEndsWith
+## WP-13 · Inspect Debug-Visualizer — ARM64 Linux + Windows ARM64
 
-**Priorität:** Niedrig  
-**Status:** ✅ erledigt
+**Priorität:** Niedrig
 
-| # | Aufgabe | Status |
-|---|---------|--------|
-| 1 | `StrEndsWith` vollständig implementieren | ✅ erledigt |
+**Aufgabe**
+Den `Inspect(expr)`-Builtin für ARM64 Linux und Windows ARM64 implementieren.
 
-**Root Cause:** `repe cmpsb` mit `rcx=0` (leeres Suffix) führt nicht aus und lässt ZF undefiniert.  
-`sete al` las dann ZF des vorherigen `sub`-Befehls → false statt true.  
-**Fix:** `test rcx, rcx; jz .sewzero` vor `repe cmpsb`; `.sewzero` setzt `eax=1` direkt.  
-**Betrifft:** `src/codegen_x86.lyx` + `bootstrap/codegen_x86.lyx`; macOS-Binary ist korrekt (verbatim-copy von offset 301+).
+**Kontext**
+Die x86_64-Referenz-Implementierung existiert in `src/codegen_x86.lyx` ab Zeile 5040 (WP-BC-39). Sie gibt `[Inspect:varname] value\n` auf stderr aus und extrahiert den Variablennamen direkt aus dem AST-Node. Die interne Hilfsfunktion `cg_emitInspectPrintInt()` enthält eine vollständige inline-itoa-Sequenz.
 
----
+In `src/backend/arm64/emit_arm64.lyx` und `src/backend/win_arm64.lyx` fehlt jede Inspect-Implementierung — `grep` liefert keine Treffer.
 
-## WP-12 · Xtensa/ESP32 — PrintInt
+| Target | Syscall / API | Datenadressen | itoa |
+|--------|--------------|---------------|------|
+| ARM64 Linux | `write(2, buf, len)` via `svc #0` | ADRP + ADD | SDIV + MSUB Loop |
+| Windows ARM64 | `WriteFile(GetStdHandle(-12), ...)` via IAT | ADRP + ADD | identisch ARM64 |
 
-**Priorität:** Niedrig  
-**Status:** ✅ erledigt (WP-D3, commit d0fd8a7)
+Der Variablenname wird zur Compile-Zeit aus dem AST-Node gelesen (wie in x86_64) und in den Daten-Abschnitt geschrieben.
 
-| # | Aufgabe | Detail | Status |
-|---|---------|--------|--------|
-| 1 | Echte itoa-Loop | Iterative Subtraktion (×10), Digit-Buffer sp+8..23, UART 0x60000000 | ✅ erledigt |
+**Nutzen**
+`Inspect(x)` ist ein importfreies, einzeiliges Debug-Werkzeug. Auf ARM64 Linux und Windows ARM64 fehlt es heute — Entwickler müssen auf `PrintLn` + manuelle Konvertierungen ausweichen.
 
-**Implementierung:** `xt_emitPrintIntHelper()` in `src/backend/xtensa.lyx` (111 Bytes, 37 Xtensa-Instruktionen).  
-Digits werden rückwärts in Stack-Buffer sp+8..23 gespeichert, vorwärts via S8I → a5=0x60000000 ausgegeben.  
-Negative Zahlen: NEG + direktes `-` an UART. Zero: korrekt als `0` ausgegeben.  
-**Test:** `tests/wp12_esp32_printint.lyx` → Xtensa ELF32, e_machine=0x5e, e_entry=0x400800xx.
-
----
-
-## Deferred
-
-| Thema | Begründung |
-|-------|------------|
-| `Inspect` — Debug-Visualizer (ARM64 + Windows ARM64) | Existiert auch nicht im Referenz-Backend x86_64; erst relevant wenn x86_64-Implementierung vorliegt |
-
+**Abnahme**
+- ARM64 Linux: `var x: int64 := 42; Inspect(x)` → stderr: `[Inspect:x] 42`
+- ARM64 Linux: `Inspect(2 + 3)` → stderr: `[Inspect:?] 5`
+- Windows ARM64: gleiches Verhalten, Ausgabe via `WriteFile` auf STDERR-Handle (`GetStdHandle(-12)`)
+- Bestehende x86_64-Tests bleiben grün.
