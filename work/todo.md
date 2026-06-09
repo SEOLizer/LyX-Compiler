@@ -147,12 +147,14 @@ Empfohlene Reihenfolge: VMT → DynArray → Closures (unabhängig, VMT ist der 
 ## WP-09 · Windows VMT — Hardware-Verifikation
 
 **Priorität:** Mittel  
-**Problem:** Virtual Calls wurden nur unter QEMU verifiziert.
+**Problem:** Virtual Calls wurden nur unter QEMU verifiziert.  
+**Status:** Test-Binary bereit (`tests/wp09_win_arm64_vmt.lyx` → `wp09_vmt.exe`, PE32+/Aarch64 verified).  
+Ausführung auf echter Windows ARM64 Hardware noch ausstehend.
 
-| # | Aufgabe |
-|---|---------|
-| 1 | Virtual-Dispatch-Test auf echter Windows ARM64 Hardware ausführen |
-| 2 | Ergebnis (Pass/Fail + Gerät) in Commit-Message dokumentieren |
+| # | Aufgabe | Status |
+|---|---------|--------|
+| 1 | Virtual-Dispatch-Test auf echter Windows ARM64 Hardware ausführen | ⏳ ausstehend |
+| 2 | Ergebnis (Pass/Fail + Gerät) in Commit-Message dokumentieren | ⏳ ausstehend |
 
 ---
 
