@@ -160,11 +160,14 @@ Ausführung auf echter Windows ARM64 Hardware noch ausstehend.
 
 ## WP-10 · ARM64 Linux — PIE Binary
 
-**Priorität:** Niedrig
+**Priorität:** Niedrig  
+**Status:** ELF-Writer geändert (`src/lyxc.lyx` → `writeELF`): ET_DYN + loadVA=0x1000 für `LYX_TC_ARM64`.  
+Test-Datei: `tests/wp10_arm64_pie.lyx`.  
+Bekannte Einschränkung: x86_64-Cross-Compilation schlägt wegen `InjectConBool`-Shadowing fehl; nativ auf ARM64 Linux ausführen.
 
-| # | Aufgabe | Detail |
-|---|---------|--------|
-| 1 | `ET_DYN` im ELF-Header | Nur ELF-Writer ändern; kein IR-Änderungsbedarf |
+| # | Aufgabe | Detail | Status |
+|---|---------|--------|--------|
+| 1 | `ET_DYN` im ELF-Header | Nur ELF-Writer ändern; kein IR-Änderungsbedarf | ✅ erledigt |
 
 ---
 
