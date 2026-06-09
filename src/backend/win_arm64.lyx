@@ -93,7 +93,9 @@ con WAB_H_STRSUB:    int64 := 6;
 con WAB_H_STRCONCAT: int64 := 7;
 con WAB_H_STRCOPY:   int64 := 8;
 // WP-08: PrintFloat helper (wsprintfA IAT added; helper uses int decomposition)
-con WAB_H_PRINTF:    int64 := 9;
+con WAB_H_PRINTF:      int64 := 9;
+// WP-08: Printf full format-string helper (%s/%d/%f/%%)
+con WAB_H_PRINTF_FULL: int64 := 10;
 
 // Helper function sizes in bytes (verified instruction-by-instruction)
 con WAB_HS_PRINTSTR: int64 := 88;   // 22 instructions
@@ -106,7 +108,8 @@ con WAB_HS_STRSUB:    int64 := 108;  // 27 instructions
 con WAB_HS_STRCONCAT: int64 := 172;  // 43 instructions
 con WAB_HS_STRCOPY:   int64 := 112;  // 28 instructions
 // WP-08
-con WAB_HS_PRINTF:    int64 := 100;  // 25 instructions
+con WAB_HS_PRINTF:      int64 := 100;  // 25 instructions
+con WAB_HS_PRINTF_FULL: int64 := 340;  // 85 instructions — full format-string walker
 
 // Helper section offsets (relative to helper section start)
 con WAB_HO_PRINTSTR:  int64 := 0;
@@ -119,8 +122,9 @@ con WAB_HO_STRSUB:    int64 := 328;  // 296 + 32
 con WAB_HO_STRCONCAT: int64 := 436;  // 328 + 108
 con WAB_HO_STRCOPY:   int64 := 608;  // 436 + 172
 // WP-08
-con WAB_HO_PRINTF:    int64 := 720;  // 608 + 112
-con WAB_HELPERS_SIZE: int64 := 820;  // 720 + 100
+con WAB_HO_PRINTF:      int64 := 720;   // 608 + 112
+con WAB_HO_PRINTF_FULL: int64 := 820;   // 720 + 100
+con WAB_HELPERS_SIZE:   int64 := 1160;  // 820 + 340
 
 // ============================================================================
 // WinARM64Backend
@@ -656,6 +660,133 @@ pub type WinARM64Backend = class {
   }
 
   // -------------------------------------------------------------------------
+  // wab_emitPrintfFullHelper (340 bytes = 85 instructions)  WP-08
+  // Input: x0=fmt, x1=arg1, x2=arg2, x3=arg3
+  // Walks format string, dispatches %s/%d/%f/%% to wab_printstr/wab_printint.
+  //
+  // Stack frame: 112 bytes
+  //   sp+0:   x19,x20   (fmt ptr, run_start)
+  //   sp+16:  x21,x22   (run_len, arg_ptr)
+  //   sp+32:  x23,x24   (current char, str/int temp)
+  //   sp+48:  x25,x30   (scan ptr, LR)
+  //   sp+64:  d8        (float temp)
+  //   sp+72:  d9        (float temp)
+  //   sp+80:  arg1
+  //   sp+88:  arg2
+  //   sp+96:  arg3
+  //   sp+104: temp_byte (for %% and '.' output)
+  //
+  // Labels (helper-relative byte offsets):
+  //   LOOP=52  SPECIFIER=84  PLAIN_CHAR=136  DO_PCT=144
+  //   DO_INT=168  DO_STR=180  DO_FLT=216  END_NULL=296  EPILOGUE=312
+  //
+  // BL targets (helper section offsets):
+  //   wab_printstr = WAB_HO_PRINTSTR = 0
+  //   wab_printint = WAB_HO_PRINTINT = 88
+  // -------------------------------------------------------------------------
+
+  fn wab_emitPrintfFullHelper() {
+    // PROLOGUE (10 instructions = 40 bytes)
+    self.wab_ce32(0xA9B953F3);  //  0: STP x19,x20,[sp,#-112]!
+    self.wab_ce32(0xA9015BF5);  //  4: STP x21,x22,[sp,#16]
+    self.wab_ce32(0xA90263F7);  //  8: STP x23,x24,[sp,#32]
+    self.wab_ce32(0xA9037BF9);  // 12: STP x25,x30,[sp,#48]
+    self.wab_ce32(0xFD0023E8);  // 16: STR d8,[sp,#64]
+    self.wab_ce32(0xFD0027E9);  // 20: STR d9,[sp,#72]
+    self.wab_ce32(0xF9002BE1);  // 24: STR x1,[sp,#80]   (arg1)
+    self.wab_ce32(0xF9002FE2);  // 28: STR x2,[sp,#88]   (arg2)
+    self.wab_ce32(0xF90033E3);  // 32: STR x3,[sp,#96]   (arg3)
+    // INIT (4 instructions = 16 bytes)
+    self.wab_ce32(0xAA0003F3);  // 36: MOV x19,x0        (fmt ptr)
+    self.wab_ce32(0xAA0003F4);  // 40: MOV x20,x0        (run_start)
+    self.wab_ce32(0xD2800015);  // 44: MOVZ x21,#0       (run_len=0)
+    self.wab_ce32(0x910143F6);  // 48: ADD x22,sp,#80    (arg_ptr)
+    // LOOP (offset 52)
+    self.wab_ce32(0x38401677);  // 52: LDRB w23,[x19],#1
+    self.wab_ce32(0xB4000797);  // 56: CBZ x23,END_NULL  (→296, +60)
+    self.wab_ce32(0x710096FF);  // 60: CMP w23,#37       ('%')
+    self.wab_ce32(0x54000241);  // 64: B.NE PLAIN_CHAR   (→136, +18)
+    // flush current run
+    self.wab_ce32(0xB4000095);  // 68: CBZ x21,SPECIFIER (→84, +4)
+    self.wab_ce32(0xAA1403E0);  // 72: MOV x0,x20
+    self.wab_ce32(0xAA1503E1);  // 76: MOV x1,x21
+    self.wab_ce32(0x97FFFF1F);  // 80: BL wab_printstr   (H=80, δ=-225)
+    // SPECIFIER (offset 84)
+    self.wab_ce32(0xD2800015);  // 84: MOVZ x21,#0       (reset run_len)
+    self.wab_ce32(0x38401677);  // 88: LDRB w23,[x19],#1 (read specifier)
+    self.wab_ce32(0xAA1303F4);  // 92: MOV x20,x19       (run_start after spec)
+    self.wab_ce32(0xB4000657);  // 96: CBZ x23,END_NULL  (→296, +50)
+    self.wab_ce32(0x710192FF);  // 100: CMP w23,#100     ('d')
+    self.wab_ce32(0x54000200);  // 104: B.EQ DO_INT      (→168, +16)
+    self.wab_ce32(0x7101CEFF);  // 108: CMP w23,#115     ('s')
+    self.wab_ce32(0x54000220);  // 112: B.EQ DO_STR      (→180, +17)
+    self.wab_ce32(0x71019AFF);  // 116: CMP w23,#102     ('f')
+    self.wab_ce32(0x54000300);  // 120: B.EQ DO_FLT      (→216, +24)
+    self.wab_ce32(0x710096FF);  // 124: CMP w23,#37      ('%')
+    self.wab_ce32(0x54000080);  // 128: B.EQ DO_PCT      (→144, +4)
+    self.wab_ce32(0x17FFFFEC);  // 132: B LOOP           (→52, -20)
+    // PLAIN_CHAR (offset 136)
+    self.wab_ce32(0x910006B5);  // 136: ADD x21,x21,#1   (run_len++)
+    self.wab_ce32(0x17FFFFEA);  // 140: B LOOP           (→52, -22)
+    // DO_PCT (offset 144): emit literal '%'
+    self.wab_ce32(0x528004B7);  // 144: MOVZ w23,#37     ('%')
+    self.wab_ce32(0x3901A3F7);  // 148: STRB w23,[sp,#104]
+    self.wab_ce32(0x9101A3E0);  // 152: ADD x0,sp,#104
+    self.wab_ce32(0xD2800021);  // 156: MOVZ x1,#1
+    self.wab_ce32(0x97FFFF0B);  // 160: BL wab_printstr  (H=160, δ=-245)
+    self.wab_ce32(0x17FFFFE4);  // 164: B LOOP           (→52, -28)
+    // DO_INT (offset 168): print integer arg
+    self.wab_ce32(0xF84086C0);  // 168: LDR x0,[x22],#8  (next arg)
+    self.wab_ce32(0x97FFFF1E);  // 172: BL wab_printint  (H=172, δ=-226)
+    self.wab_ce32(0x17FFFFE1);  // 176: B LOOP           (→52, -31)
+    // DO_STR (offset 180): print string arg
+    self.wab_ce32(0xF84086D8);  // 180: LDR x24,[x22],#8 (next arg → str ptr)
+    self.wab_ce32(0xAA1803F9);  // 184: MOV x25,x24      (scan ptr)
+    self.wab_ce32(0x38401737);  // 188: LDRB w23,[x25],#1 ← strlen loop
+    self.wab_ce32(0x35FFFFF7);  // 192: CBNZ w23,.-4     (→188, -1)
+    self.wab_ce32(0xCB180321);  // 196: SUB x1,x25,x24   (len+1)
+    self.wab_ce32(0xD1000421);  // 200: SUB x1,x1,#1     (len)
+    self.wab_ce32(0xAA1803E0);  // 204: MOV x0,x24       (str ptr)
+    self.wab_ce32(0x97FFFEFF);  // 208: BL wab_printstr  (H=208, δ=-257)
+    self.wab_ce32(0x17FFFFD8);  // 212: B LOOP           (→52, -40)
+    // DO_FLT (offset 216): print float arg
+    self.wab_ce32(0xF84086C0);  // 216: LDR x0,[x22],#8  (next arg = f64 bits)
+    self.wab_ce32(0x9E670008);  // 220: FMOV d8,x0       (load IEEE-754)
+    self.wab_ce32(0x9E780118);  // 224: FCVTZS x24,d8    (int part → x24)
+    self.wab_ce32(0xAA1803E0);  // 228: MOV x0,x24
+    self.wab_ce32(0x97FFFF0F);  // 232: BL wab_printint  (H=232, δ=-241)
+    self.wab_ce32(0x528005D7);  // 236: MOVZ w23,#46     ('.')
+    self.wab_ce32(0x3901A3F7);  // 240: STRB w23,[sp,#104]
+    self.wab_ce32(0x9101A3E0);  // 244: ADD x0,sp,#104
+    self.wab_ce32(0xD2800021);  // 248: MOVZ x1,#1
+    self.wab_ce32(0x97FFFEF4);  // 252: BL wab_printstr  (H=252, δ=-268)
+    self.wab_ce32(0x9E620309);  // 256: SCVTF d9,x24     (float(int_part))
+    self.wab_ce32(0x1E693908);  // 260: FSUB d8,d8,d9    (frac)
+    self.wab_ce32(0x1E608108);  // 264: FABS d8,d8
+    self.wab_ce32(0xD2E825D9);  // 268: MOVZ x25,#0x412E,LSL#48  (1e6 high)
+    self.wab_ce32(0xF2D09019);  // 272: MOVK x25,#0x8480,LSL#32  (1e6 low)
+    self.wab_ce32(0x9E670329);  // 276: FMOV d9,x25      (d9 = 1e6)
+    self.wab_ce32(0x1E690908);  // 280: FMUL d8,d8,d9    (frac × 1e6)
+    self.wab_ce32(0x9E780100);  // 284: FCVTZS x0,d8     (frac digits)
+    self.wab_ce32(0x97FFFF01);  // 288: BL wab_printint  (H=288, δ=-255)
+    self.wab_ce32(0x17FFFFC4);  // 292: B LOOP           (→52, -60)
+    // END_NULL (offset 296): flush remaining plain-text run, then exit
+    self.wab_ce32(0xB4000095);  // 296: CBZ x21,EPILOGUE (→312, +4)
+    self.wab_ce32(0xAA1403E0);  // 300: MOV x0,x20
+    self.wab_ce32(0xAA1503E1);  // 304: MOV x1,x21
+    self.wab_ce32(0x97FFFEE6);  // 308: BL wab_printstr  (H=308, δ=-282)
+    // EPILOGUE (offset 312)
+    self.wab_ce32(0xFD4027E9);  // 312: LDR d9,[sp,#72]
+    self.wab_ce32(0xFD4023E8);  // 316: LDR d8,[sp,#64]
+    self.wab_ce32(0xA9437BF9);  // 320: LDP x25,x30,[sp,#48]
+    self.wab_ce32(0xA94263F7);  // 324: LDP x23,x24,[sp,#32]
+    self.wab_ce32(0xA9415BF5);  // 328: LDP x21,x22,[sp,#16]
+    self.wab_ce32(0xA8C753F3);  // 332: LDP x19,x20,[sp],#112
+    self.wab_ce32(0xD65F03C0);  // 336: RET
+    // 85 instructions = 340 bytes ✓
+  }
+
+  // -------------------------------------------------------------------------
   // Patch all ADRP+LDR pairs and BL placeholders after code is complete.
   // Called after helper stubs are appended and codeLen is final.
   // -------------------------------------------------------------------------
@@ -713,7 +844,8 @@ pub type WinARM64Backend = class {
     poke64(helperOffsets + WAB_H_STRSUB    * 8, WAB_HO_STRSUB);
     poke64(helperOffsets + WAB_H_STRCONCAT * 8, WAB_HO_STRCONCAT);
     poke64(helperOffsets + WAB_H_STRCOPY   * 8, WAB_HO_STRCOPY);
-    poke64(helperOffsets + WAB_H_PRINTF    * 8, WAB_HO_PRINTF);
+    poke64(helperOffsets + WAB_H_PRINTF      * 8, WAB_HO_PRINTF);
+    poke64(helperOffsets + WAB_H_PRINTF_FULL * 8, WAB_HO_PRINTF_FULL);
 
     var i: int64 := 0;
     while i < patchCount {
@@ -721,7 +853,7 @@ pub type WinARM64Backend = class {
       var codeOff:  int64 := peek64(rec);          // offset within EmitARM64 buffer
       var helperId: int64 := peek64(rec + 8);
 
-      if helperId >= 1 && helperId <= 9 {
+      if helperId >= 1 && helperId <= 10 {
         var hOff: int64 := peek64(helperOffsets + helperId * 8);
         var delta_bytes:  int64 := (userLen + hOff) - codeOff;
         var delta_instrs: int64 := delta_bytes / 4;
@@ -1051,7 +1183,8 @@ pub type WinARM64Backend = class {
     self.wab_emitStrSubHelper();       // WAB_HO_STRSUB    = 328
     self.wab_emitStrConcatHelper();    // WAB_HO_STRCONCAT = 436
     self.wab_emitStrCopyHelper();      // WAB_HO_STRCOPY   = 608
-    self.wab_emitPrintfHelper();       // WAB_HO_PRINTF    = 720
+    self.wab_emitPrintfHelper();       // WAB_HO_PRINTF      = 720
+    self.wab_emitPrintfFullHelper();   // WAB_HO_PRINTF_FULL = 820
 
     // 4. Patch ADRP+LDR for Windows API IAT calls
     self.wab_patchIAT();
