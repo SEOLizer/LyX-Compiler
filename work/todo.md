@@ -18,7 +18,7 @@
 | WP-08 | Windows ARM64 — printf via wsprintfA | Mittel | [ ] Offen |
 | WP-09 | Windows VMT — Hardware-Verifikation | Mittel | [ ] Offen |
 | WP-10 | ARM64 Linux — PIE Binary (ET_DYN) | Niedrig | [ ] Offen |
-| WP-11 | macOS x86_64 — StrEndsWith | Niedrig | [ ] Offen |
+| WP-11 | macOS x86_64 — StrEndsWith | Niedrig | [x] Erledigt |
 | WP-12 | Xtensa/ESP32 — PrintInt (echte itoa) | Niedrig | [ ] Offen |
 
 ---
@@ -173,11 +173,17 @@ Bekannte Einschränkung: x86_64-Cross-Compilation schlägt wegen `InjectConBool`
 
 ## WP-11 · macOS x86_64 — StrEndsWith
 
-**Priorität:** Niedrig
+**Priorität:** Niedrig  
+**Status:** ✅ erledigt
 
-| # | Aufgabe |
-|---|---------|
-| 1 | `StrEndsWith` vollständig implementieren (aktuell Stub) |
+| # | Aufgabe | Status |
+|---|---------|--------|
+| 1 | `StrEndsWith` vollständig implementieren | ✅ erledigt |
+
+**Root Cause:** `repe cmpsb` mit `rcx=0` (leeres Suffix) führt nicht aus und lässt ZF undefiniert.  
+`sete al` las dann ZF des vorherigen `sub`-Befehls → false statt true.  
+**Fix:** `test rcx, rcx; jz .sewzero` vor `repe cmpsb`; `.sewzero` setzt `eax=1` direkt.  
+**Betrifft:** `src/codegen_x86.lyx` + `bootstrap/codegen_x86.lyx`; macOS-Binary ist korrekt (verbatim-copy von offset 301+).
 
 ---
 
