@@ -47,7 +47,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-10 | IPC & Synchronisation (0x0400–0x040C)         | 3     | Mittel  | LX-09            | ✅ Fertig |
 | LX-11 | Zeit-Syscalls (0x0500–0x0504)                 | 3     | Mittel  | LX-03            | ✅ Fertig |
 | LX-12 | Capabilities + Pledge + Unveil (0x0700–0x0708)| 4     | Hoch    | LX-09            | ✅ Fertig |
-| LX-13 | Task-Scheduler & `@parallel` (0x0B00–0x0B09)  | 4     | Mittel  | LX-09            | Offen |
+| LX-13 | Task-Scheduler & `@parallel` (0x0B00–0x0B09)  | 4     | Mittel  | LX-09            | ✅ Fertig |
 | LX-14 | KI-Basis: Model + Context + Infer (0x0800–0x0806) | 5  | Mittel | LX-05            | Offen |
 | LX-15 | KI-Embedding & Vektorindex (0x0807–0x080C)    | 5     | Mittel  | LX-14            | Offen |
 | LX-16 | Semantisches Paging & Wissensgraph (0x080D–0x0812) | 5 | Niedrig | LX-15          | Offen |
