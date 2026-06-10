@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
+.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -70,6 +70,30 @@ test: lyxc
 	@/tmp/lyxc_hello_test
 	@rm -f /tmp/lyxc_hello_test
 	@echo "OK"
+
+test-lyxos: lyxc
+	@echo "=== LyxOS Integrations-Kompilierungstest ==="
+	@for f in \
+		tests/lyxos/lx00_lbf_magic.lyx \
+		tests/lyxos/lx03_entry.lyx \
+		tests/lyxos/lx04_io.lyx \
+		tests/lyxos/lx05_alloc.lyx \
+		tests/lyxos/lx06_fs.lyx \
+		tests/lyxos/lx08_net.lyx \
+		tests/lyxos/lx09_spawn.lyx \
+		tests/lyxos/lx10_mutex.lyx \
+		tests/lyxos/lx11_timer.lyx \
+		tests/lyxos/lx12_pledge.lyx \
+		tests/lyxos/lx13_parallel.lyx \
+		tests/lyxos/lx14_ai_infer.lyx \
+		tests/lyxos/lx21_two_ret.lyx; do \
+		printf "  %-40s" "$$f"; \
+		./lyxc $$f --target=lyxos --emit=lbf -o /tmp/lyxos_test.lbf \
+			&& echo "OK" \
+			|| (echo "FAIL" && exit 1); \
+	done
+	@rm -f /tmp/lyxos_test.lbf
+	@echo "=== Alle LyxOS-Tests kompiliert ==="
 
 snapshot: lyxc
 	@bash tests/run_snapshot_tests.sh

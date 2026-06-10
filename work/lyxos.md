@@ -57,7 +57,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | ✅ Fertig |
 | LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | ✅ Fertig |
 | LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | ✅ Fertig |
-| LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | Offen |
+| LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | ✅ Fertig |
 | LX-24 | lbf_run — IR-Bytecode-Interpreter             | 0     | Hoch    | LX-00, LX-04     | ✅ Erledigt |
 | LX-25 | LBF-Nativ: Block Header I/O                   | 8     | Hoch    | —                | Offen |
 | LX-26 | LBF-Nativ: Genesis-Content Serializer         | 8     | Hoch    | LX-25            | Offen |
