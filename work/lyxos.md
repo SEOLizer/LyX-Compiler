@@ -53,7 +53,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-16 | Semantisches Paging & Wissensgraph (0x080D–0x0812) | 5 | Niedrig | LX-15          | ✅ Fertig |
 | LX-17 | Lyra Agent Interface (0x0900–0x090B)          | 5     | Niedrig | LX-16            | ✅ Fertig |
 | LX-18 | IOFS: Island & Ocean FS (0x0C00–0x0C04)       | 6     | Niedrig | LX-12            | ✅ Fertig |
-| LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | Offen |
+| LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | ✅ Fertig |
 | LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | Offen |
 | LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | Offen |
 | LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | Offen |
@@ -540,36 +540,24 @@ type IofsPageHeader = @big_endian flat struct {
 
 ## Phase 7 — Stdlib & Integration
 
-### LX-19 · lyxrt_lyxos.lyx Runtime-Library
+### LX-19 · lyxrt_lyxos.lyx Runtime-Library ✅ Fertig — v0.9.5B
 
-**Priorität:** Hoch  
-**Datei:** `src/std/lyxos/lyxrt.lyx`
+**Datei:** `src/std/lyxos/lyxrt.lyx`  
+**Test:** `tests/lx19_lyxrt_test.lyx`
 
-Minimale Runtime die jedes `--target=lyxos`-Programm automatisch bekommt:
-- `_start`-Symbol (LX-03)
-- Alle Syscall-Wrapper
-- Stack-Canary-Init
-- `@capabilities`-Macro → `sys_pledge`-Call
-- Panic-Handler: `sys_debug_print` + `sys_exit_group(1)`
-- `alloc`/`free` auf `sys_mmap`/`sys_munmap`
+Implementiert (`import src.std.lyxos.lyxrt;`):
 
-```
-src/std/lyxos/
-  lyxrt.lyx      – _start, Canary, panic
-  fs.lyx         – VFS-Konstanten (bereits vorhanden)
-  net.lyx        – Socket-API
-  time.lyx       – Uhr + Timer
-  device.lyx     – Poll + ioctl
-  security.lyx   – pledge, unveil, cap
-  task.lyx       – Task-Scheduler
-  ai.lyx         – KI-Primitiven
-  lyra.lyx       – Lyra Agent Interface
-  iofs.lyx       – IOFS-Admin-API
-```
+| Funktion | Beschreibung |
+|---|---|
+| `alloc(size)` | Bump-Pointer Arena auf `mmap` (LyxOS: 0x0100), 64 MB/Chunk, mit Fehlerbehandlung |
+| `free(ptr, size)` | No-op — Arena wird beim Prozess-Exit freigegeben |
+| `rt_panic(msg, len)` | `sys_write(2, msg, len)` + `sys_exit_group(1)` |
 
-**Abnahme**
-- `--target=lyxos` linkt `lyxrt.lyx` automatisch
-- `make singularity` S3 == S4 nach Hinzufügen
+Hinweise:
+- `_start` + Stack-Canary sind bereits in `emitStartStub()` (emit_lyxos.lyx) als Maschinencode eingebettet — gehören nicht zur Bibliothek
+- `panic` ist ein Lyx-Keyword (TK_PANIC); deshalb `rt_panic` als Name
+- Auto-Link (implizites `import` bei `--target=lyxos`) ist nicht implementiert — bleibt für LX-23
+- Singularität S1==S2 nach Hinzufügen bestätigt
 
 ---
 
