@@ -59,7 +59,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | ✅ Fertig |
 | LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | ✅ Fertig |
 | LX-24 | lbf_run — IR-Bytecode-Interpreter             | 0     | Hoch    | LX-00, LX-04     | ✅ Erledigt |
-| LX-25 | LBF-Nativ: Block Header I/O                   | 8     | Hoch    | —                | Offen |
+| LX-25 | LBF-Nativ: Block Header I/O                   | 8     | Hoch    | —                | ✅ Fertig |
 | LX-26 | LBF-Nativ: Genesis-Content Serializer         | 8     | Hoch    | LX-25            | Offen |
 | LX-27 | LBF-Nativ: TLV-Framework                      | 8     | Hoch    | LX-26            | Offen |
 | LX-28 | LBF-Nativ: Section Block Emitter              | 8     | Hoch    | LX-25            | Offen |

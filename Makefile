@@ -69,6 +69,10 @@ test: lyxc
 	./lyxc examples/basics/hello.lyx -o /tmp/lyxc_hello_test
 	@/tmp/lyxc_hello_test
 	@rm -f /tmp/lyxc_hello_test
+	@echo "--- LX-25: Block Header ---"
+	./lyxc tests/lx25_block_header_test.lyx -o /tmp/lyxc_lx25_test
+	@/tmp/lyxc_lx25_test
+	@rm -f /tmp/lyxc_lx25_test
 	@echo "OK"
 
 test-lyxos: lyxc
@@ -86,7 +90,8 @@ test-lyxos: lyxc
 		tests/lyxos/lx12_pledge.lyx \
 		tests/lyxos/lx13_parallel.lyx \
 		tests/lyxos/lx14_ai_infer.lyx \
-		tests/lyxos/lx21_two_ret.lyx; do \
+		tests/lyxos/lx21_two_ret.lyx \
+		tests/lyxos/lx25_block_header.lyx; do \
 		printf "  %-40s" "$$f"; \
 		./lyxc $$f --target=lyxos --emit=lbf -o /tmp/lyxos_test.lbf \
 			&& echo "OK" \
