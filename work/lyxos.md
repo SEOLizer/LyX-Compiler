@@ -56,7 +56,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | ✅ Fertig |
 | LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | ✅ Fertig |
 | LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | ✅ Fertig |
-| LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | Offen |
+| LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | ✅ Fertig |
 | LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | Offen |
 | LX-24 | lbf_run — IR-Bytecode-Interpreter             | 0     | Hoch    | LX-00, LX-04     | ✅ Erledigt |
 | LX-25 | LBF-Nativ: Block Header I/O                   | 8     | Hoch    | —                | Offen |
@@ -605,13 +605,22 @@ Singularität: S2 == S3 bestätigt.
 
 ---
 
-### LX-22 · Debug & Telemetrie (0x0A00–0x0A05)
+### LX-22 · Debug & Telemetrie (0x0A00–0x0A05) ✅ Fertig — v0.9.5B
 
-**Priorität:** Niedrig
+**Dateien:** `src/std/lyxos/debug.lyx`  
+**Test:** `tests/lx22_debug_test.lyx`
 
-`sys_debug_print` (0x0A00) — Kernel-Debug-Output (Port 0xE9/COM1), No-Op in Release.
-`sys_trace_event` (0x0A01), `sys_perf_counter` (0x0A02), `sys_stack_trace` (0x0A03),
-`sys_watchpoint_set` (0x0A04), `sys_watchpoint_clear` (0x0A05).
+| ID | Builtin | Syscall | Argc | Beschreibung |
+|---|---|---|---|---|
+| 145 | `sys_debug_print(msg, len)` | 0x0A00 | 2 | Kernel-Output (Port 0xE9/COM1), No-Op in Release |
+| 146 | `sys_trace_event(event_id, data, len)` | 0x0A01 | 3 | Kernel-Trace-Event |
+| 147 | `sys_perf_counter(counter_id)` | 0x0A02 | 1 | Hardware-Perf-Counter lesen |
+| 148 | `sys_stack_trace(out_buf, max_frames)` | 0x0A03 | 2 | Stack-Trace in Buffer |
+| 149 | `sys_watchpoint_set(addr, size, flags)` | 0x0A04 | 3 | Watchpoint setzen |
+| 150 | `sys_watchpoint_clear(addr)` | 0x0A05 | 1 | Watchpoint löschen |
+
+Konstanten: `TRACE_*`, `PERF_*`, `WP_*` in `src/std/lyxos/debug.lyx`.  
+Singularität S1==S2 bestätigt.
 
 ---
 
