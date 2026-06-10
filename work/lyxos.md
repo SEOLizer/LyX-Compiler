@@ -2,7 +2,7 @@
 
 **lyxc-Ziel:** `--target=lyxos`  
 **ABI-Referenz:** `work/lyxos/syscalls.md` (ABI v1.0, 137 Syscalls)  
-**Stand:** v0.9.5A  
+**Stand:** v0.9.6A  
 **Branch-Namensschema:** `feat/lyxos-lx<nn>-<kürzel>`
 
 ---
@@ -44,7 +44,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-07 | I/O-Geräte & Poll (0x0300–0x0305)             | 2     | Mittel  | LX-06            | ✅ Fertig |
 | LX-08 | Netzwerk (0x0600–0x0609)                      | 2     | Mittel  | LX-06            | ✅ Fertig |
 | LX-09 | Prozess & Threads vollständig (0x0000–0x000D) | 3     | Hoch    | LX-05            | ✅ Fertig |
-| LX-10 | IPC & Synchronisation (0x0400–0x040C)         | 3     | Mittel  | LX-09            | Offen |
+| LX-10 | IPC & Synchronisation (0x0400–0x040C)         | 3     | Mittel  | LX-09            | ✅ Fertig |
 | LX-11 | Zeit-Syscalls (0x0500–0x0504)                 | 3     | Mittel  | LX-03            | Offen |
 | LX-12 | Capabilities + Pledge + Unveil (0x0700–0x0708)| 4     | Hoch    | LX-09            | Offen |
 | LX-13 | Task-Scheduler & `@parallel` (0x0B00–0x0B09)  | 4     | Mittel  | LX-09            | Offen |
