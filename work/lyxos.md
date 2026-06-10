@@ -34,7 +34,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 
 | LX   | Titel                                          | Phase | Prio    | Abhängigkeit     | Status |
 |------|------------------------------------------------|-------|---------|------------------|--------|
-| LX-00 | `--emit=lbf` IR-Serialisierer (lbf_writer)   | 0     | Hoch    | —                | Offen |
+| LX-00 | `--emit=lbf` IR-Serialisierer (lbf_writer)   | 0     | Hoch    | —                | ✅ Fertig |
 | LX-01 | Target-Registrierung & ELF-Grundgerüst        | 1     | Hoch    | —                | ✅ Erledigt |
 | LX-02 | emit_lyxos.lyx Codegen-Skelett                | 1     | Hoch    | LX-01            | ✅ Erledigt |
 | LX-03 | Prozess-Lebenszyklus & Entry-Point            | 1     | Hoch    | LX-02            | ✅ Erledigt |
