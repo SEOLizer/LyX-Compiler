@@ -51,7 +51,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-14 | KI-Basis: Model + Context + Infer (0x0800–0x0806) | 5  | Mittel | LX-05            | ✅ Fertig |
 | LX-15 | KI-Embedding & Vektorindex (0x0807–0x080C)    | 5     | Mittel  | LX-14            | ✅ Fertig |
 | LX-16 | Semantisches Paging & Wissensgraph (0x080D–0x0812) | 5 | Niedrig | LX-15          | ✅ Fertig |
-| LX-17 | Lyra Agent Interface (0x0900–0x090B)          | 5     | Niedrig | LX-16            | Offen |
+| LX-17 | Lyra Agent Interface (0x0900–0x090B)          | 5     | Niedrig | LX-16            | ✅ Fertig |
 | LX-18 | IOFS: Island & Ocean FS (0x0C00–0x0C04)       | 6     | Niedrig | LX-12            | Offen |
 | LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | Offen |
 | LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | Offen |
