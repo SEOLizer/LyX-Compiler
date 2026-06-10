@@ -24,16 +24,20 @@ import src.ir;
 // ---------------------------------------------------------------------------
 
 pub type EmitLyxOS = class {
-    irMod:    int64;   // pointer to IRModule
-    codeBuf:  int64;   // mmap'd output buffer
-    codeLen:  int64;   // bytes written so far
-    codeCap:  int64;
+    irMod:         int64;   // pointer to IRModule
+    codeBuf:       int64;   // mmap'd output buffer
+    codeLen:       int64;   // bytes written so far
+    codeCap:       int64;
+    strPatchBuf:   int64;   // array of (leaOff: int64, strOff: int64) pairs for CONST_STR
+    strPatchCount: int64;
 
     pub fn init(ir: int64): void {
-        self.irMod   := ir;
-        self.codeCap := 65536;
-        self.codeBuf := alloc(self.codeCap);
-        self.codeLen := 0;
+        self.irMod         := ir;
+        self.codeCap       := 65536;
+        self.codeBuf       := alloc(self.codeCap);
+        self.codeLen       := 0;
+        self.strPatchBuf   := alloc(4096);
+        self.strPatchCount := 0;
     }
 
     fn grow(need: int64): void {
@@ -236,8 +240,106 @@ pub type EmitLyxOS = class {
         self.emit32(0);
     }
 
-    // LEA rax, [rip + strOff] stub — wired up in LX-04+
+    // LEA rax, [rip + rel32] with forward patch; rel32 resolved in emitStrPool().
     fn emitConstStr(strOff: int64, dest: int64): void {
+        var pBase:  int64 := self.strPatchBuf + self.strPatchCount * 16;
+        var curLen: int64 := self.codeLen;
+        poke64(pBase + 0, curLen);
+        poke64(pBase + 8, strOff);
+        self.strPatchCount := self.strPatchCount + 1;
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x05);
+        self.emit32(0);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    fn emitStrPool(): void {
+        var strBuf:     int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
+        var strLen:     int64 := peek64(self.irMod + IR_MOD_OFF_STRLEN);
+        var poolStart:  int64 := self.codeLen;
+        var patchCount: int64 := self.strPatchCount;
+        var patchBuf:   int64 := self.strPatchBuf;
+        var pi: int64 := 0;
+        while pi < patchCount {
+            var patchBase: int64 := patchBuf + pi * 16;
+            var leaOff: int64 := peek64(patchBase + 0);
+            var strOff: int64 := peek64(patchBase + 8);
+            var rel32: int64 := (poolStart + strOff) - (leaOff + 7);
+            self.patch32(leaOff + 3, rel32);
+            pi := pi + 1;
+        }
+        var si: int64 := 0;
+        while si < strLen {
+            self.emit8(peek8(strBuf + si));
+            si := si + 1;
+        }
+    }
+
+    fn emitMovRsiFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x75);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0xB5);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovRdxFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x55);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x95);
+            self.emit32(off);
+        }
+    }
+
+    fn emitPrintStr(): void {
+        self.emitMovRsiFromSlot(0);
+        self.emitMovRdxFromSlot(1);
+        self.emit8(0xBF); self.emit32(1);
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+    }
+
+    fn emitPrintInt(): void {
+        self.emitMovRaxFromSlot(0);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x20);
+        self.emit8(0x45); self.emit8(0x31); self.emit8(0xC0);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x79); self.emit8(9);
+        self.emit8(0x41); self.emit8(0xB8); self.emit32(1);
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xD8);
+        self.emit8(0x41); self.emit8(0xB9); self.emit32(10);
+        self.emit8(0x41); self.emit8(0xBB); self.emit32(23);
+        self.emit8(0x31); self.emit8(0xD2);
+        self.emit8(0x49); self.emit8(0xF7); self.emit8(0xF1);
+        self.emit8(0x83); self.emit8(0xC2); self.emit8(0x30);
+        self.emit8(0x42); self.emit8(0x88); self.emit8(0x14); self.emit8(0x1C);
+        self.emit8(0x41); self.emit8(0xFF); self.emit8(0xCB);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x75); self.emit8(0xEC);
+        self.emit8(0x45); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x74); self.emit8(8);
+        self.emit8(0x42); self.emit8(0xC6); self.emit8(0x04); self.emit8(0x1C); self.emit8(0x2D);
+        self.emit8(0x41); self.emit8(0xFF); self.emit8(0xCB);
+        self.emit8(0x4A); self.emit8(0x8D); self.emit8(0x74); self.emit8(0x1C); self.emit8(0x01);
+        self.emit8(0xBA); self.emit32(23);
+        self.emit8(0x44); self.emit8(0x29); self.emit8(0xDA);
+        self.emit8(0xBF); self.emit32(1);
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x20);
+    }
+
+    fn emitBuiltinCall(id: int64): void {
+        if id == 1 {
+            self.emitPrintStr();
+        } else if id == 2 {
+            self.emitPrintInt();
+        }
     }
 
     // --- IR instruction dispatch ---
@@ -260,13 +362,15 @@ pub type EmitLyxOS = class {
         } else if op == 62 {                    // IRO_STORE_LOCAL
             self.emitMovRaxFromSlot(src1);
             self.emitMovSlotFromRax(dest);
+        } else if op == 80 {                    // IRO_CALL_BUILTIN
+            self.emitBuiltinCall(imm);
         } else if op == 81 {                    // IRO_CALL
             self.emitCall(src1, dest);
         } else if op == 94 {                    // IRO_FUNC_EXIT
             self.emitMovRaxFromSlot(src1);
             self.emitEpilogue();
         }
-        // 80 (CALL_BUILTIN), 90 (JMP), 93 (LABEL), all others: no code
+        // 90 (JMP), 93 (LABEL), all others: no code
     }
 
     // Emit all IR functions.
