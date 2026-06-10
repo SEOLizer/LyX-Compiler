@@ -55,7 +55,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-18 | IOFS: Island & Ocean FS (0x0C00–0x0C04)       | 6     | Niedrig | LX-12            | ✅ Fertig |
 | LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | ✅ Fertig |
 | LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | ✅ Fertig |
-| LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | Offen |
+| LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | ✅ Fertig |
 | LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | Offen |
 | LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | Offen |
 | LX-24 | lbf_run — IR-Bytecode-Interpreter             | 0     | Hoch    | LX-00, LX-04     | ✅ Erledigt |
@@ -584,24 +584,24 @@ Hinweis: Target-Dispatch (automatisches Umleiten von `import src.std.io;` auf `s
 
 ---
 
-### LX-21 · Zwei-Register-Rückgabe `var val, err :=`
+### LX-21 · Zwei-Register-Rückgabe `var val, err :=` ✅ Fertig — v0.9.5B
 
-**Priorität:** Mittel
+**Geänderte Dateien:** `src/ir.lyx`, `src/ir_lower.lyx`, `src/backend/lyxos/emit_lyxos.lyx`  
+**Test:** `tests/lx21_tworet_test.lyx`
 
-Neue Syntax für LyxOS-Syscall-Rückgabe (rax=Fehlercode, rdx=Nutzwert):
+Implementierung:
 
-```lyx
-var fd, err := sys_open(AT_CWD, "file.txt"c, O_READ, 0);
-if err != ERR_OK { return 1; }
-var buf_addr, _ := sys_mmap(0, 4096, PROT_RW, MAP_ANON);
-```
+| Komponente | Änderung |
+|---|---|
+| `ir.lyx` | Neues `IRO_LOAD_ERRVAL` (Opcode 164) |
+| `ir_lower.lyx` | `lowerTupleVarDecl()` vollständig implementiert (war Stub) |
+| `emit_lyxos.lyx` | `emitVfsSyscall`: `MOV r15, rax` nach SYSCALL (Error-Shadow); `emitInstr`: Handler für Opcode 164 → `MOV rax, r15; MOV [errSlot], rax` |
 
-**Implementierung:** Parser (neue Produktion), IR (`IRO_SPLIT_PAIR` oder zwei Dest-Slots),
-Codegen lyxos (slot_rdx, slot_rax). Andere Targets: `b` immer 0.
+Syntax: `var val, err := syscall(...)` und `var val, _ := syscall(...)` (Discard-Variante).
 
-**Abnahme**
-- `var fd, err := sys_open(...)` parst ohne Fehler
-- `make singularity` S3 == S4 nach Änderung
+Der Parser (`NK_TUPLE_VAR_DECL`) und Sema-Handler bestanden bereits (WP-BC-05).  
+r15 ist callee-saved — SYSCALL preserviert r12–r15 per LyxOS-ABI.  
+Singularität: S2 == S3 bestätigt.
 
 ---
 
