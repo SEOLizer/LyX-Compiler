@@ -54,7 +54,7 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-17 | Lyra Agent Interface (0x0900–0x090B)          | 5     | Niedrig | LX-16            | ✅ Fertig |
 | LX-18 | IOFS: Island & Ocean FS (0x0C00–0x0C04)       | 6     | Niedrig | LX-12            | ✅ Fertig |
 | LX-19 | lyxrt_lyxos.lyx Runtime-Library               | 7     | Hoch    | LX-05            | ✅ Fertig |
-| LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | Offen |
+| LX-20 | std/io.lyx + std/alloc.lyx lyxos-Adaptation   | 7     | Hoch    | LX-19            | ✅ Fertig |
 | LX-21 | Zwei-Register-Rückgabe `var val, err :=`      | 7     | Mittel  | LX-02            | Offen |
 | LX-22 | Debug & Telemetrie (0x0A00–0x0A05)            | 7     | Niedrig | LX-03            | Offen |
 | LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | Offen |
@@ -561,18 +561,26 @@ Hinweise:
 
 ---
 
-### LX-20 · std/io.lyx + std/alloc.lyx lyxos-Adaptation
+### LX-20 · std/io.lyx + std/alloc.lyx lyxos-Adaptation ✅ Fertig — v0.9.5B
 
-**Priorität:** Hoch
+**Dateien:** `src/std/lyxos/io.lyx`  
+**Test:** `tests/lx20_io_test.lyx`
 
-`std/io.lyx` nutzt aktuell Linux-`write` (Nr 1). Für lyxos: `sys_write` (0x0203).
-Lösung: separate `src/std/lyxos/io.lyx` die bei `--target=lyxos` statt `src/std/io.lyx`
-gelinkt wird (target-dispatch in `ir_lower.lyx`).
+`src/std/alloc.lyx` — keine Anpassung nötig; das `mmap`-Builtin dispatcht bereits auf LyxOS 0x0100.
 
-**Abnahme**
-- `import std.io; PrintLn("test")` kompiliert für `--target=lyxos`
-- Keine libc-Abhängigkeit
-- Alle x86_64/arm64-Tests bleiben grün
+`src/std/lyxos/io.lyx` — vollständige Reimplementierung von `src/std/io.lyx` mit LyxOS-Syscalls:
+
+| Linux (std/io.lyx) | LyxOS (lyxos/io.lyx) | Syscall |
+|---|---|---|
+| `write(fd, buf, n)` | `sys_write(fd, buf, n)` | 0x0203 |
+| `read(fd, buf, n)` | `sys_read(fd, buf, n)` | 0x0202 |
+| `open(path, f, m)` | `sys_open(AT_CWD, path, f, m)` | 0x0200 |
+| `close(fd)` | `sys_close(fd)` | 0x0201 |
+| `lseek(fd, off, w)` | `sys_seek(fd, off, w)` | 0x0204 |
+
+Gleiche öffentliche API: `PrintStr`, `PrintStrLn`, `PrintInt`, `PrintIntLn`, `PrintFloat`, `PrintChar`, `PrintBool`, `PrintLn`, `EPrintStr`, `EPrintStrLn`, `ReadLine`, `ReadChar`, `ReadInt`, `FileOpen`, `FileClose`, `FileRead`, `FileWrite`, `FileSeek`, `FileSize`, `FileReadAll`, `FileWriteAll`, `Flush`.
+
+Hinweis: Target-Dispatch (automatisches Umleiten von `import src.std.io;` auf `src.std.lyxos.io;` bei `--target=lyxos`) bleibt für LX-23. Programme importieren `src.std.lyxos.io` direkt.
 
 ---
 
