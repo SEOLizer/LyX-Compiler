@@ -41,9 +41,9 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-04 | Basis-I/O (PrintStr/PrintInt → sys_write)     | 1     | Hoch    | LX-03            | ✅ Erledigt |
 | LX-05 | Speicherverwaltung (sys_mmap / sys_munmap)     | 1     | Hoch    | LX-03            | ✅ Erledigt |
 | LX-06 | Vollständiges Dateisystem VFS (0x0200–0x0215) | 2     | Hoch    | LX-04            | ✅ Erledigt |
-| LX-07 | I/O-Geräte & Poll (0x0300–0x0305)             | 2     | Mittel  | LX-06            | Offen |
-| LX-08 | Netzwerk (0x0600–0x0609)                      | 2     | Mittel  | LX-06            | Offen |
-| LX-09 | Prozess & Threads vollständig (0x0000–0x000D) | 3     | Hoch    | LX-05            | Offen |
+| LX-07 | I/O-Geräte & Poll (0x0300–0x0305)             | 2     | Mittel  | LX-06            | ✅ Fertig |
+| LX-08 | Netzwerk (0x0600–0x0609)                      | 2     | Mittel  | LX-06            | ✅ Fertig |
+| LX-09 | Prozess & Threads vollständig (0x0000–0x000D) | 3     | Hoch    | LX-05            | ✅ Fertig |
 | LX-10 | IPC & Synchronisation (0x0400–0x040C)         | 3     | Mittel  | LX-09            | Offen |
 | LX-11 | Zeit-Syscalls (0x0500–0x0504)                 | 3     | Mittel  | LX-03            | Offen |
 | LX-12 | Capabilities + Pledge + Unveil (0x0700–0x0708)| 4     | Hoch    | LX-09            | Offen |
