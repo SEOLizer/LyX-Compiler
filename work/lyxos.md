@@ -60,9 +60,9 @@ lbf_loader prog.lbf                                     → POSIX-Loader (mmap +
 | LX-23 | Integrations-Testsuite & Singularitätsprüfung | 7     | Hoch    | LX-20, LX-24     | ✅ Fertig |
 | LX-24 | lbf_run — IR-Bytecode-Interpreter             | 0     | Hoch    | LX-00, LX-04     | ✅ Erledigt |
 | LX-25 | LBF-Nativ: Block Header I/O                   | 8     | Hoch    | —                | ✅ Fertig |
-| LX-26 | LBF-Nativ: Genesis-Content Serializer         | 8     | Hoch    | LX-25            | Offen |
-| LX-27 | LBF-Nativ: TLV-Framework                      | 8     | Hoch    | LX-26            | Offen |
-| LX-28 | LBF-Nativ: Section Block Emitter              | 8     | Hoch    | LX-25            | Offen |
+| LX-26 | LBF-Nativ: Genesis-Content Serializer         | 8     | Hoch    | LX-25            | ✅ Fertig |
+| LX-27 | LBF-Nativ: TLV-Framework                      | 8     | Hoch    | LX-26            | ✅ Fertig |
+| LX-28 | LBF-Nativ: Section Block Emitter              | 8     | Hoch    | LX-25            | ✅ Fertig |
 | LX-29 | LBF-Nativ: Supply Chain Security              | 8     | Hoch    | LX-25–LX-27      | Offen |
 | LX-30 | LBF-Nativ: lyxc-Backend `--target=lyxos` → LYX! | 8  | Hoch    | LX-25–LX-29      | Offen |
 | LX-31 | LBF-Nativ: lbf_loader POSIX-Loader           | 8     | Hoch    | LX-25, LX-28, LX-29 | Offen |

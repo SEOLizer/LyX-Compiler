@@ -73,6 +73,18 @@ test: lyxc
 	./lyxc tests/lx25_block_header_test.lyx -o /tmp/lyxc_lx25_test
 	@/tmp/lyxc_lx25_test
 	@rm -f /tmp/lyxc_lx25_test
+	@echo "--- LX-26: Genesis Serializer ---"
+	./lyxc tests/lx26_genesis_test.lyx -o /tmp/lyxc_lx26_test
+	@/tmp/lyxc_lx26_test
+	@rm -f /tmp/lyxc_lx26_test
+	@echo "--- LX-27: TLV-Framework ---"
+	./lyxc tests/lx27_tlv_test.lyx -o /tmp/lyxc_lx27_test
+	@/tmp/lyxc_lx27_test
+	@rm -f /tmp/lyxc_lx27_test
+	@echo "--- LX-28: Section Block Emitter ---"
+	./lyxc tests/lx28_sections_test.lyx -o /tmp/lyxc_lx28_test
+	@/tmp/lyxc_lx28_test
+	@rm -f /tmp/lyxc_lx28_test
 	@echo "OK"
 
 test-lyxos: lyxc
@@ -91,7 +103,10 @@ test-lyxos: lyxc
 		tests/lyxos/lx13_parallel.lyx \
 		tests/lyxos/lx14_ai_infer.lyx \
 		tests/lyxos/lx21_two_ret.lyx \
-		tests/lyxos/lx25_block_header.lyx; do \
+		tests/lyxos/lx25_block_header.lyx \
+		tests/lyxos/lx26_genesis.lyx \
+		tests/lyxos/lx27_tlv.lyx \
+		tests/lyxos/lx28_sections.lyx; do \
 		printf "  %-40s" "$$f"; \
 		./lyxc $$f --target=lyxos --emit=lbf -o /tmp/lyxos_test.lbf \
 			&& echo "OK" \

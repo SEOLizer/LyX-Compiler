@@ -1,0 +1,101 @@
+// src/tools/lbf/sections.lyx — LX-28 Section Block Emitter für LBF-Nativ (LYX!)
+//
+// Erzeugt die Code- und Datensegment-Blöcke (Block 1..N) eines LBF-Nativ-Files.
+// Jeder Block ist exakt 4096 Bytes (64 B Header + 4032 B Payload), CRC32C-gesichert.
+//
+// CRC32C deckt nur den Payload (buf+64..buf+4095). Daher ist der Aufruf von
+// lbf_header_set_immutable(buf) NACH section_build_block zulässig und invalidiert
+// den CRC nicht.
+//
+// Import: import src.tools.lbf.sections;
+
+import src.std.alloc;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+
+// ── section_block_count ───────────────────────────────────────────────────────
+//
+// Gibt die Anzahl der 4096-Byte-Blöcke zurück, die für data_len Bytes benötigt werden.
+// Gibt 0 zurück wenn data_len == 0 (.bss — kein physischer Block geschrieben).
+
+pub fn section_block_count(data_len: int64): int64 {
+    if data_len == 0 { return 0; }
+    return (data_len + LBF_PAYLOAD_SIZE - 1) / LBF_PAYLOAD_SIZE;
+}
+
+// ── section_build_block ───────────────────────────────────────────────────────
+//
+// Befüllt den 4096-Byte-Puffer bei buf mit einem vollständigen LBF-Block.
+// Nullt den gesamten Block, schreibt den Block-Header und kopiert copy_len
+// Bytes aus data_src in den Payload-Bereich (buf+64..buf+64+copy_len-1).
+// Die restlichen Payload-Bytes bleiben 0x00.
+//
+// Das Immutable-Flag wird NICHT gesetzt. Für .text/.rodata: nach dem Aufruf
+// lbf_header_set_immutable(buf) aufrufen (invalidiert den CRC nicht).
+
+pub fn section_build_block(buf: int64, data_src: int64, copy_len: int64,
+                            block_index: int64, total_blocks: int64,
+                            compiled_at: int64) {
+    var zi: int64 := 0;
+    while zi < LBF_BLOCK_SIZE {
+        poke64(buf + zi, 0);
+        zi := zi + 8;
+    }
+
+    lbf_header_init(buf, block_index, total_blocks, compiled_at, 0);
+
+    var payload: int64 := buf + LBF_HEADER_SIZE;
+    var ci: int64 := 0;
+    while ci < copy_len {
+        poke8(payload + ci, peek8(data_src + ci));
+        ci := ci + 1;
+    }
+
+    lbf_header_set_crc(buf, payload);
+}
+
+// ── section_emit ─────────────────────────────────────────────────────────────
+//
+// Schreibt alle Segment-Blöcke eines Abschnitts auf den File-Descriptor fd.
+// sect_type: LBF_SECT_TYPE_TEXT / RODATA / DATA / BSS.
+// start_block: block_index des ersten zu schreibenden Blocks.
+// total_blocks: Gesamtanzahl der Blöcke in der LBF-Datei.
+//
+// .text und .rodata erhalten das Immutable-Flag (flags bit0 = 1).
+// .bss (data_len == 0) schreibt keine Bytes und gibt sofort 0 zurück.
+// Rückgabe: 0 bei Erfolg, -1 bei Schreibfehler.
+
+pub fn section_emit(fd: int64, data: int64, data_len: int64, sect_type: int64,
+                    start_block: int64, total_blocks: int64): int64 {
+    if data_len == 0 { return 0; }
+
+    var is_immutable: int64 := 0;
+    if sect_type == LBF_SECT_TYPE_TEXT   { is_immutable := 1; }
+    if sect_type == LBF_SECT_TYPE_RODATA { is_immutable := 1; }
+
+    var blk_count: int64 := section_block_count(data_len);
+    var buf: int64 := alloc(LBF_BLOCK_SIZE);
+
+    var bi: int64 := 0;
+    while bi < blk_count {
+        var data_off: int64 := bi * LBF_PAYLOAD_SIZE;
+        var remaining: int64 := data_len - data_off;
+        var copy_len: int64 := remaining;
+        if copy_len > LBF_PAYLOAD_SIZE { copy_len := LBF_PAYLOAD_SIZE; }
+
+        section_build_block(buf, data + data_off, copy_len,
+                            start_block + bi, total_blocks, 0);
+        if is_immutable != 0 { lbf_header_set_immutable(buf); }
+
+        var written: int64 := sys_write(fd, buf, LBF_BLOCK_SIZE);
+        if written != LBF_BLOCK_SIZE {
+            free(buf, LBF_BLOCK_SIZE);
+            return 0 - 1;
+        }
+
+        bi := bi + 1;
+    }
+
+    free(buf, LBF_BLOCK_SIZE);
+    return 0;
+}
