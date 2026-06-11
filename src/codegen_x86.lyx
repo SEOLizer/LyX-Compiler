@@ -2097,6 +2097,72 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);  // movzx rax, al
   }
 
+  // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
+  fn cg_isF64Expr(ni: int64): int64 {
+    if ni < 0 { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if k == CGN_LIT_FLOAT { return 1; }
+    if k == CGN_IDENT {
+      var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if idx < 0 { return 0; }
+      var tb:  int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+      var tp:  pchar := peek64(tb) as pchar;
+      var tln: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      return self.cg_seq(tp, tln, "f64"c, 3);
+    }
+    if k == CGN_BINOP {
+      if self.cg_isF64Expr(self.cg_nc0(ni)) != 0 { return 1; }
+      return self.cg_isF64Expr(self.cg_nc1(ni));
+    }
+    if k == CGN_CALL {
+      var fp: pchar := self.cg_nsval(ni);
+      var fl: int64 := self.cg_nslen(ni);
+      if self.cg_seq(fp, fl, "fAdd",  4) { return 1; }
+      if self.cg_seq(fp, fl, "fSub",  4) { return 1; }
+      if self.cg_seq(fp, fl, "fMul",  4) { return 1; }
+      if self.cg_seq(fp, fl, "fDiv",  4) { return 1; }
+      if self.cg_seq(fp, fl, "fNeg",  4) { return 1; }
+      if self.cg_seq(fp, fl, "fAbs",  4) { return 1; }
+      if self.cg_seq(fp, fl, "sqrt",  4) { return 1; }
+      return 0;
+    }
+    return 0;
+  }
+
+  // f64 binary op: rbx=lhs IEEE-754 bits, rax=rhs IEEE-754 bits. Result in rax.
+  fn cg_emitF64BinOp(op: int64) {
+    // movq xmm0, rbx  (lhs)
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC3);
+    // movq xmm1, rax  (rhs)
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC8);
+    if op == CGT_PLUS {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x58); self.cg_e8(0xC1);  // addsd xmm0, xmm1
+    } else if op == CGT_MINUS {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC1);  // subsd xmm0, xmm1
+    } else if op == CGT_STAR {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC1);  // mulsd xmm0, xmm1
+    } else if op == CGT_SLASH {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5E); self.cg_e8(0xC1);  // divsd xmm0, xmm1
+    } else if op == CGT_GT || op == CGT_LT || op == CGT_EQ2 ||
+              op == CGT_NEQ || op == CGT_GE || op == CGT_LE {
+      // ucomisd xmm0, xmm1  (66 0F 2E C1)
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xC1);
+      if op == CGT_GT  { self.cg_e8(0x0F); self.cg_e8(0x97); self.cg_e8(0xC0); }  // seta  al
+      if op == CGT_LT  { self.cg_e8(0x0F); self.cg_e8(0x92); self.cg_e8(0xC0); }  // setb  al
+      if op == CGT_EQ2 { self.cg_e8(0x0F); self.cg_e8(0x94); self.cg_e8(0xC0); }  // sete  al
+      if op == CGT_NEQ { self.cg_e8(0x0F); self.cg_e8(0x95); self.cg_e8(0xC0); }  // setne al
+      if op == CGT_GE  { self.cg_e8(0x0F); self.cg_e8(0x93); self.cg_e8(0xC0); }  // setae al
+      if op == CGT_LE  { self.cg_e8(0x0F); self.cg_e8(0x96); self.cg_e8(0xC0); }  // setbe al
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);     // movzx rax, al
+      return;
+    } else {
+      self.cg_zeroRax();
+      return;
+    }
+    // movq rax, xmm0  — result back to GP
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+  }
+
   // Emit binary operation: rax=right operand, rbx=left operand (from stack pop)
   // Result left in rax.
   fn cg_emitBinOp(op: int64) {
@@ -3388,7 +3454,11 @@ pub type Codegen = class {
         self.cg_pushRax();
         self.cg_genExpr(rhsNi);
         self.cg_popRbx();
-        self.cg_emitBinOp(op);
+        if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+          self.cg_emitF64BinOp(op);
+        } else {
+          self.cg_emitBinOp(op);
+        }
       }
 
     } else if (k == CGN_UNOP) {
