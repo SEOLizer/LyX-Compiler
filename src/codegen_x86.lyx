@@ -446,6 +446,11 @@ pub type Codegen = class {
   vmtMethodPatchCount:  int64;
   vmtMethodPatchCap:    int64;
 
+  // f64-returning user-defined functions: {namePtr:8, nameLen:8} = 16 bytes per entry
+  f64FuncList:  int64;
+  f64FuncCount: int64;
+  f64FuncCap:   int64;
+
   // WP-BC-24: deferred generic monomorphization list
   // Entry: {mangledNamePtr:8, mangledNameLen:8, genericFuncNode:8} = 24 bytes
   monoList:  int64;
@@ -2097,6 +2102,50 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);  // movzx rax, al
   }
 
+  fn cg_registerF64Func(name: pchar, nameLen: int64) {
+    if (self.f64FuncCount >= self.f64FuncCap) {
+      var nc: int64 := self.f64FuncCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.f64FuncList, self.f64FuncCount * 16);
+      self.f64FuncList := nb;
+      self.f64FuncCap  := nc;
+    }
+    var base: int64 := self.f64FuncList + self.f64FuncCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    self.f64FuncCount := self.f64FuncCount + 1;
+  }
+
+  fn cg_isF64Func(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.f64FuncCount) {
+      var base: int64 := self.f64FuncList + i * 16;
+      var n: pchar  := peek64(base) as pchar;
+      var l: int64  := peek64(base + 8);
+      if (self.cg_seq(n, l, name, nameLen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Pre-pass: scan all CGN_FUNC_DECL nodes and register those returning f64.
+  fn cg_collectF64Funcs(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL) {
+        var retNi: int64 := self.cg_nc1(cur);
+        if (retNi >= 0) {
+          var rname: pchar := self.cg_nsval(retNi);
+          var rlen:  int64 := self.cg_nslen(retNi);
+          if (self.cg_seq(rname, rlen, "f64", 3) != 0) {
+            self.cg_registerF64Func(self.cg_nsval(cur), self.cg_nslen(cur));
+          }
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
   fn cg_isF64Expr(ni: int64): int64 {
     if ni < 0 { return 0; }
@@ -2111,20 +2160,18 @@ pub type Codegen = class {
       return self.cg_seq(tp, tln, "f64"c, 3);
     }
     if k == CGN_BINOP {
+      var bop: int64 := self.cg_nival(ni);
+      // Comparisons and logical ops produce int64 (0/1), not f64 — don't recurse.
+      if bop == CGT_AND || bop == CGT_OR { return 0; }
+      if bop == CGT_EQ2 || bop == CGT_NEQ { return 0; }
+      if bop == CGT_LT || bop == CGT_LE || bop == CGT_GT || bop == CGT_GE { return 0; }
       if self.cg_isF64Expr(self.cg_nc0(ni)) != 0 { return 1; }
       return self.cg_isF64Expr(self.cg_nc1(ni));
     }
     if k == CGN_CALL {
       var fp: pchar := self.cg_nsval(ni);
       var fl: int64 := self.cg_nslen(ni);
-      if self.cg_seq(fp, fl, "fAdd",  4) { return 1; }
-      if self.cg_seq(fp, fl, "fSub",  4) { return 1; }
-      if self.cg_seq(fp, fl, "fMul",  4) { return 1; }
-      if self.cg_seq(fp, fl, "fDiv",  4) { return 1; }
-      if self.cg_seq(fp, fl, "fNeg",  4) { return 1; }
-      if self.cg_seq(fp, fl, "fAbs",  4) { return 1; }
-      if self.cg_seq(fp, fl, "sqrt",  4) { return 1; }
-      return 0;
+      return self.cg_isF64Func(fp, fl);
     }
     return 0;
   }
@@ -9259,6 +9306,9 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
 
   fn cg_genFile(head: int64) {
+    // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
+    self.cg_collectF64Funcs(head);
+
     var cur: int64 := head;
     while (cur != -1) {
       var k: int64 := self.cg_nkind(cur);
@@ -9493,6 +9543,18 @@ pub type Codegen = class {
     self.vmtMethodPatchCap   := 64;
     self.vmtMethodPatches    := alloc(self.vmtMethodPatchCap * CG_VMT_METH_PATCH_SZ);
     self.vmtMethodPatchCount := 0;
+
+    // f64-returning function table (pre-populated with known builtins)
+    self.f64FuncCap   := 64;
+    self.f64FuncList  := alloc(self.f64FuncCap * 16);
+    self.f64FuncCount := 0;
+    self.cg_registerF64Func("fAdd"c,  4);
+    self.cg_registerF64Func("fSub"c,  4);
+    self.cg_registerF64Func("fMul"c,  4);
+    self.cg_registerF64Func("fDiv"c,  4);
+    self.cg_registerF64Func("fNeg"c,  4);
+    self.cg_registerF64Func("fAbs"c,  4);
+    self.cg_registerF64Func("sqrt"c,  4);
 
     // WP-BC-24: deferred monomorphization list
     self.monoCap   := 32;
