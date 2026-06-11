@@ -1436,9 +1436,10 @@ pub type Codegen = class {
           var rel32: int64 := targetOff - codeOff - 4;
           poke32(self.code + codeOff, rel32);
         } else {
-          // AP-3: Skip unresolved patches instead of crashing
-          // Write 0xCC (int3) to mark as unimplemented
-          poke8(self.code + codeOff, 204);  // int3
+          EPrintStr("error: undefined function '"c);
+          sys_write(2, namePtr, nlen);
+          EPrintStr("' — no codegen implementation found\n"c);
+          exit(1);
         }
       } else if (kind == CG_PATCH_EXTERN) {
         // FFI call disp32 — resolved in cg_writeELFDynamic once the GOT
@@ -4081,6 +4082,7 @@ pub type Codegen = class {
     }
 
     var argc: int64 := 0;
+    var isStaticCall: int64 := 0;
     var cur: int64 := argNode;
     while (cur != -1) { argc := argc + 1; cur := self.cg_nnext(cur); }
 
@@ -4145,11 +4147,23 @@ pub type Codegen = class {
       }
     }
 
-    // For method calls: push self (object) as first arg
+    // For method calls: push self (object) as first arg.
+    // Static calls (TypeName.Method() where TypeName is a class, not a variable) skip self-push.
     if (isMethod == 1) {
-      self.cg_genExpr(self.cg_nc0(ni));
-      self.cg_pushRax();
-      argc := argc + 1;
+      var smObj: int64 := self.cg_nc0(ni);
+      if (self.cg_nkind(smObj) == CGN_IDENT) {
+        var smName: pchar := self.cg_nsval(smObj);
+        var smLen:  int64 := self.cg_nslen(smObj);
+        if (self.cg_findLocalIdx(smName, smLen) < 0 &&
+            self.cg_findClass(smName, smLen) >= 0) {
+          isStaticCall := 1;
+        }
+      }
+      if (isStaticCall == 0) {
+        self.cg_genExpr(smObj);
+        self.cg_pushRax();
+        argc := argc + 1;
+      }
     }
 
     // Evaluate each arg and push
@@ -4220,6 +4234,21 @@ pub type Codegen = class {
         self.cg_addPatch(pp, mangBuf, mangLen, CG_PATCH_CALL);
         // Track mangled method name buffer for cleanup after patching (BUG-02)
         self.cg_trackTempBuf(mangBuf, mangLen + 1);
+      } else if (isStaticCall != 0) {
+        // TypeName.Method() — mangle as TypeName_Method
+        var stName: pchar := self.cg_nsval(objNode);
+        var stLen:  int64 := self.cg_nslen(objNode);
+        var stMangLen: int64 := stLen + 1 + fnlen;
+        var stMangBuf: int64 := alloc(stMangLen + 1);
+        var stMi: int64 := 0;
+        while (stMi < stLen) { poke8(stMangBuf + stMi, StrCharAt(stName, stMi)); stMi := stMi + 1; }
+        StrSetChar(stMangBuf as pchar, stLen, 95);
+        var stMj: int64 := 0;
+        while (stMj < fnlen) { poke8(stMangBuf + stLen + 1 + stMj, StrCharAt(fname, stMj)); stMj := stMj + 1; }
+        poke8(stMangBuf + stMangLen, 0);
+        var stPp: int64 := self.cg_emitCall();
+        self.cg_addPatch(stPp, stMangBuf, stMangLen, CG_PATCH_CALL);
+        self.cg_trackTempBuf(stMangBuf, stMangLen + 1);
       } else {
         var pp: int64 := self.cg_emitCall();
         self.cg_addPatch(pp, fname as int64, fnlen, CG_PATCH_CALL);
@@ -4625,6 +4654,17 @@ pub type Codegen = class {
       // WP-BC-44: clock_gettime(clockid: int64, ts: int64): int64 -- sys_clock_gettime = 228
       // rdi=clockid, rsi=ts (timespec*)
       self.cg_movRaxImm(228);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "nanosleep", 9)) {
+      // nanosleep(req: int64, rem: int64): int64 -- sys_nanosleep = 35
+      // rdi=req (timespec*), rsi=rem (timespec* or 0)
+      self.cg_movRaxImm(35);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "chown", 5)) {
+      // chown(path: pchar, owner: int64, group: int64): int64 -- sys_chown = 92
+      self.cg_movRaxImm(92);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
     } else if (self.cg_seq(fname, fnlen, "chmod", 5)) {
@@ -6399,6 +6439,27 @@ pub type Codegen = class {
       self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
       self.cg_e8(0x5C);                                                 // pop rsp (restore)
 
+    } else if (self.cg_seq(fname, fnlen, "sizeof", 6)) {
+      // sizeof(Type) → compile-time byte size of class/struct
+      var soArg: int64 := argNode;
+      var soSize: int64 := 8;
+      if (soArg >= 0) {
+        var soName: pchar := self.cg_nsval(soArg);
+        var soLen:  int64 := self.cg_nslen(soArg);
+        var soClassIdx: int64 := self.cg_findClass(soName, soLen);
+        if (soClassIdx >= 0) {
+          var soCb: int64 := self.classLayouts + soClassIdx * CG_CLASS_SZ;
+          var soFldCnt:   int64 := peek64(soCb + CG_CLASS_OFF_FIELDCNT);
+          var soVmtSlots: int64 := peek64(soCb + CG_CLASS_OFF_VMTSLOTS);
+          if (soVmtSlots > 0) {
+            soSize := (soFldCnt + 1) * 8;
+          } else {
+            soSize := soFldCnt * 8;
+          }
+        }
+      }
+      self.cg_movRaxImm(soSize);
+
     } else {
       // User-defined function call: emit call + patch
       var pp: int64 := self.cg_emitCall();
@@ -6462,6 +6523,37 @@ pub type Codegen = class {
         var sizeNode: int64 := self.cg_nc1(typeNode);
         if (sizeNode >= 0 && self.cg_nkind(sizeNode) == CGN_LIT_INT) {
           poke64(self.localArraySize + localIdx * 8, self.cg_nival(sizeNode));
+        }
+      }
+      // Infer class type when declared as int64 but initialized from:
+      //   var x: int64 := SomeClass.Create(...)  — static constructor
+      //   var x: int64 := expr as SomeClass       — explicit cast
+      if (self.cg_getLocalClassIdx(name, nlen) < 0) {
+        var infInit: int64 := self.cg_nc1(ni);
+        if (infInit >= 0) {
+          // Pattern 1: TypeName.Method() static constructor
+          if (self.cg_nkind(infInit) == CGN_CALL && self.cg_nival(infInit) == 1) {
+            var infObj: int64 := self.cg_nc0(infInit);
+            if (self.cg_nkind(infObj) == CGN_IDENT) {
+              var infName: pchar := self.cg_nsval(infObj);
+              var infLen:  int64 := self.cg_nslen(infObj);
+              if (self.cg_findLocalIdx(infName, infLen) < 0 &&
+                  self.cg_findClass(infName, infLen) >= 0) {
+                self.cg_setLocalType(localIdx, infName, infLen);
+              }
+            }
+          }
+          // Pattern 2: expr as SomeClass
+          if (self.cg_nkind(infInit) == CGN_CAST) {
+            var castType: int64 := self.cg_nc1(infInit);
+            if (castType >= 0) {
+              var ctName: pchar := self.cg_nsval(castType);
+              var ctLen:  int64 := self.cg_nslen(castType);
+              if (self.cg_findClass(ctName, ctLen) >= 0) {
+                self.cg_setLocalType(localIdx, ctName, ctLen);
+              }
+            }
+          }
         }
       }
       var init: int64 := self.cg_nc1(ni);
@@ -7067,7 +7159,7 @@ pub type Codegen = class {
       var nlen: int64 := self.cg_nslen(ni);
       // Skip built-in identifiers and constants
       if (self.cg_findLocal(name, nlen) == 0 &&
-          self.cg_findCon(name, nlen) == 0) {
+          self.cg_hasConVal(name, nlen) == 0) {
         // Not local and not constant — check if already captured
         if (self.cg_findCapturedVar(name, nlen) == 0) {
           // Register as captured; offset resolved at runtime via static link
