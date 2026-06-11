@@ -42,6 +42,8 @@ import src.backend.arm_cm_backend;
 import src.backend.xtensa;
 import src.lfd_codegen;
 import src.lyu_writer;
+import src.lbf_writer;
+import src.backend.lyxos.emit_lyxos;
 import src.lyu_reader;
 import src.crypto.lic_types;
 import src.crypto.lic_parse;
@@ -84,6 +86,7 @@ con LYX_TC_ARM_CM4:        int64 := 10;
 con LYX_TC_XTENSA:         int64 := 11;
 con LYX_TC_ANDROID_ARM64:  int64 := 12;
 con LYX_TC_ANDROID_X86_64: int64 := 13;
+con LYX_TC_LYXOS:          int64 := 14;
 
 // Optimization levels
 con OPT_NONE: int64 := 0;
@@ -163,6 +166,7 @@ pub type CLIOptions = struct {
   defineMacros: int64;
   emitRelocs: bool;
   stripDebug: bool;
+  emitLBF: bool;
 };
 
 // ============================================================================
@@ -461,6 +465,9 @@ pub type CompilerConfig = class {
   noLibcInit: bool;
   arm64LibcStartMainUsed: bool;
 
+  // LX-00: --emit=lbf: serialize IR to .lbf bytecode (only with --target=lyxos)
+  emitLBF: bool;
+
   // WP-T14: Migration Tool + Compat-Modus
   migrateCaps: bool;
   capCompat:   bool;
@@ -741,6 +748,9 @@ pub type CompilerConfig = class {
       } else if StrCmp(val, "riscv"c) == 0 {
         self.target := LYX_TC_RISCV64;
         self.format := FORMAT_ELF;
+      } else if StrCmp(val, "lyxos"c) == 0 {
+        self.target := LYX_TC_LYXOS;
+        self.format := FORMAT_ELF;
       }
       return;
     }
@@ -899,6 +909,10 @@ pub type CompilerConfig = class {
     }
     if StrCmp(arg, "--emit-asm"c) == 0 {
       self.emitASM := true;
+      return;
+    }
+    if StrCmp(arg, "--emit=lbf"c) == 0 {
+      self.emitLBF := true;
       return;
     }
     if StrCmp(arg, "--list"c) == 0 {
@@ -1068,7 +1082,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("0.9.5A"c);
+      PrintStrLn("0.9.6A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1090,7 +1104,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("0.9.5A"c);
+      PrintStrLn("0.9.6A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1203,7 +1217,7 @@ pub type CompilerConfig = class {
   }
   
   fn printHelp(): void {
-    PrintStrLn("lyxc 0.9.5A (bootstrap)");
+    PrintStrLn("lyxc 0.9.6A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1221,6 +1235,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --android-api=N        Android API-Level (21..34+, Default 26)");
     PrintStrLn("  --target-energy=<1-5>  Energy-Ziel (1=Minimal, 5=Extreme)");
     PrintStrLn("  --emit-asm             IR als Pseudo-Assembler ausgeben");
+    PrintStrLn("  --emit=lbf             IR als .lbf-Bytecode ausgeben (nur --target=lyxos)");
     PrintStrLn("  --asm-listing          Assembly-Listing mit Source-Zeilen (DO-178C 6.1)");
     PrintStrLn("  --dump-relocs          Relocations und externe Symbole anzeigen");
     PrintStrLn("  --trace-imports        Import-Aufloesung debuggen");
@@ -1453,6 +1468,13 @@ pub type CompilerConfig = class {
       return self.exitCode;
     }
 
+    // LX-00: validate --emit=lbf before any fast-path early returns
+    if self.emitLBF && self.target != LYX_TC_LYXOS {
+      EPrintStrLn("error: --emit=lbf requires --target=lyxos");
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
     // Stage 5-8 (x86_64 fast path): use direct AST→ELF Codegen (proven, no IR needed)
     // WP-BC-47: skip fast path when --provenance is set (needs IR)
     // WP-AND-02: skip fast path for shared-lib output (needs ET_DYN writer via writeBinary)
@@ -1590,6 +1612,24 @@ pub type CompilerConfig = class {
       PrintStrLn("Stage 7: Code Generation...");
     }
 
+    // LX-00: --emit=lbf — serialize IR to .lbf bytecode file (lyxos target only)
+    if self.emitLBF {
+      if self.target != LYX_TC_LYXOS {
+        EPrintStrLn("error: --emit=lbf requires --target=lyxos");
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+      var outFile: pchar := self.outputFile;
+      if outFile == 0 { outFile := "a.lbf"c; }
+      var lbfw: LBFWriter := new LBFWriter();
+      if !lbfw.serialize(irMod as int64, outFile) {
+        EPrintStrLn("error: failed to write .lbf file");
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+      return self.exitCode;
+    }
+
     var codeBuffer: int64 := 0;
 
     if self.target == LYX_TC_X86_64 {
@@ -1617,6 +1657,8 @@ pub type CompilerConfig = class {
       codeBuffer := self.emitRISCV(irMod as int64);
     } else if self.target == LYX_TC_ARM_CM {
       codeBuffer := self.emitARMCm(irMod as int64);
+    } else if self.target == LYX_TC_LYXOS {
+      codeBuffer := self.emitLyxOS(irMod as int64);
     }
 
     if codeBuffer == 0 {
@@ -1625,8 +1667,8 @@ pub type CompilerConfig = class {
       return self.exitCode;
     }
 
-    // Windows ARM64 / Linux RISC-V / ARM CM4 / Xtensa: file already written inside emit*
-    if self.target == LYX_TC_WINDOWS_ARM64 || self.target == LYX_TC_LINUX_RISCV64 || self.target == LYX_TC_ARM_CM4 || self.target == LYX_TC_XTENSA {
+    // Windows ARM64 / Linux RISC-V / ARM CM4 / Xtensa / LyxOS: file already written inside emit*
+    if self.target == LYX_TC_WINDOWS_ARM64 || self.target == LYX_TC_LINUX_RISCV64 || self.target == LYX_TC_ARM_CM4 || self.target == LYX_TC_XTENSA || self.target == LYX_TC_LYXOS {
       return self.exitCode;
     }
 
@@ -2239,7 +2281,40 @@ pub type CompilerConfig = class {
     self.codeSize := emitter.emit();
     return emitter.getCodeBuf();
   }
-  
+
+  // LX-01/LX-02: Lyx OS x86-64 backend.
+  // Compiles IR → machine code, then writes ELF with .note.lyx-abi.
+  fn emitLyxOS(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.out"c; }
+
+    var emitter: EmitLyxOS := new EmitLyxOS();
+    emitter.init(irMod);
+
+    // _start is emitted first at offset 0 with a placeholder CALL rel32=0.
+    // Layout: XOR rbp,rbp(3) + CALL(5) + ... — callNextIP = 8.
+    emitter.emitStartStub();
+
+    // Emit all IR functions. mainOff = absolute buffer offset of main().
+    var mainOff: int64 := emitter.emitFunctions();
+
+    // Append IR string pool and patch all CONST_STR LEA rel32s (LX-04).
+    emitter.emitStrPool();
+
+    // Patch CALL rel32 in _start now that mainOff is known.
+    // rel32 at buf+28, callNextIP = 32  (LX-03 _start = 46 bytes)
+    emitter.patchCallRel32(28, mainOff - 32);
+
+    var elf: LyxOsELFWriter := new LyxOsELFWriter();
+    if !elf.writeELF(outPath, emitter.getCodeBuf(), emitter.getCodeLen()) {
+      EPrintStrLn("error: lyxos: failed to write ELF");
+      self.exitCode := 1;
+      return 1;
+    }
+    self.codeSize := emitter.getCodeLen();
+    return 1;
+  }
+
   // ---------------------------------------------------------------------------
   // Binary Writing
   // ---------------------------------------------------------------------------
@@ -3210,18 +3285,13 @@ pub type CompilerConfig = class {
   }
 
   fn writePE(path: pchar, code: int64, size: int64): bool {
-    var writer: int64 := PE64Writer.Create();
-    writer.SetEntry(0x401000);
-    writer.SetTextSection(code, size, 0x401000);
-    
-    var output: int64 := writer.Write();
-    var outputSize: int64 := writer.GetSize();
-    
-    var result: bool := FileWriteAll(path, output as pchar, outputSize);
-    
-    writer.Free();
-    
-    return result;
+    var writer: TPE64Writer := new TPE64Writer();
+    writer.Init();
+    writer.SetCode(code, size);
+    writer.SetEntryRVA(0x1000);
+    writer.WriteStatic(path as int64, StrLen(path));
+    writer.Destroy();
+    return 1 as bool;
   }
   
   fn writeMachO(path: pchar, code: int64, size: int64): bool {
@@ -4229,7 +4299,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 0.9.5A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 0.9.6A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

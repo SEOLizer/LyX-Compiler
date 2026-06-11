@@ -1,0 +1,194 @@
+// LX-24: lbf_run - LBF bytecode interpreter for lyxos-target testing on Linux
+//
+// Compiles to --target=x86_64. Loads a .lbf file, interprets IR opcodes, and
+// maps lyxos syscall IDs to their POSIX Linux equivalents.
+//
+// Usage: ./lbf_run <file.lbf>
+
+pub type LbfInterp = class {
+    fileBuf:  int64;
+    strPool:  int64;
+    funcs:    int64;
+    funcCnt:  int64;
+    instrs:   int64;
+    instrCnt: int64;
+    frames:   int64;
+    sp:       int64;
+
+    pub fn init(): void {
+        self.fileBuf := alloc(65536);
+        self.frames  := alloc(32 * 256 * 8);
+        self.sp      := 0;
+    }
+
+    fn readU32(base: int64, off: int64): int64 {
+        return peek8(base+off+0) | (peek8(base+off+1) << 8) |
+               (peek8(base+off+2) << 16) | (peek8(base+off+3) << 24);
+    }
+
+    pub fn loadFile(path: pchar): bool {
+        var fd: int64 := open(path, 0, 0);
+        if fd == -1 { return false; }
+        var buf: int64 := self.fileBuf;
+        var n: int64 := read(fd, buf as pchar, 65535);
+        close(fd);
+        if n < 64 { return false; }
+        if peek8(buf+0) != 76 { return false; }
+        if peek8(buf+1) != 66 { return false; }
+        if peek8(buf+2) != 70 { return false; }
+        var strOff: int64 := self.readU32(buf, 12);
+        var fTOff:  int64 := self.readU32(buf, 20);
+        var fTLen:  int64 := self.readU32(buf, 24);
+        var iOff:   int64 := self.readU32(buf, 28);
+        var iLen:   int64 := self.readU32(buf, 32);
+        self.strPool  := buf + strOff;
+        self.funcs    := buf + fTOff;
+        self.funcCnt  := fTLen;
+        self.instrs   := buf + iOff;
+        self.instrCnt := iLen;
+        return true;
+    }
+
+    pub fn run(): int64 {
+        var buf: int64 := self.fileBuf;
+        var entryIdx: int64 := self.readU32(buf, 8);
+        return self.execFunc(entryIdx);
+    }
+
+    fn getSlot(idx: int64): int64 {
+        var sp: int64 := self.sp;
+        var frames: int64 := self.frames;
+        return peek64(frames + sp * 2048 + idx * 8);
+    }
+
+    fn setSlot(idx: int64, val: int64): void {
+        var sp: int64 := self.sp;
+        var frames: int64 := self.frames;
+        poke64(frames + sp * 2048 + idx * 8, val);
+    }
+
+    fn findLabel(firstInstr: int64, instrCount: int64, labelId: int64): int64 {
+        var instrs: int64 := self.instrs;
+        var i: int64 := 0;
+        while i < instrCount {
+            var iBase: int64 := instrs + (firstInstr + i) * 20;
+            var op: int64 := peek8(iBase+0) | (peek8(iBase+1) << 8);
+            if op == 93 {
+                var lImm: int64 := peek64(iBase + 12);
+                if lImm == labelId { return firstInstr + i; }
+            }
+            i := i + 1;
+        }
+        return firstInstr + instrCount - 1;
+    }
+
+    fn dispBuiltin(id: int64): void {
+        if id == 1 {
+            var strPtr: int64 := self.getSlot(0);
+            var len: int64 := self.getSlot(1);
+            write(1, strPtr as pchar, len);
+        } else if id == 2 {
+            var v: int64 := self.getSlot(0);
+            self.printInt(v);
+        }
+    }
+
+    fn printInt(val: int64): void {
+        var pbuf: int64 := alloc(32);
+        var neg: int64 := 0;
+        var v: int64 := val;
+        if v < 0 { neg := 1; v := 0 - v; }
+        poke8(pbuf + 23, 10);
+        var pos: int64 := 22;
+        if v == 0 {
+            poke8(pbuf + pos, 48);
+        } else {
+            while v != 0 {
+                var d: int64 := v - (v / 10) * 10;
+                poke8(pbuf + pos, d + 48);
+                pos := pos - 1;
+                v := v / 10;
+            }
+        }
+        if neg != 0 { poke8(pbuf + pos, 45); pos := pos - 1; }
+        pos := pos + 1;
+        write(1, (pbuf + pos) as pchar, 24 - pos);
+    }
+
+    fn execFunc(funcIdx: int64): int64 {
+        var funcs:   int64 := self.funcs;
+        var instrs:  int64 := self.instrs;
+        var strPool: int64 := self.strPool;
+        var frames:  int64 := self.frames;
+        var sp:      int64 := self.sp;
+
+        var fBase: int64 := funcs + funcIdx * 24;
+        var firstInstr: int64 := peek8(fBase+12) | (peek8(fBase+13) << 8) |
+                                   (peek8(fBase+14) << 16) | (peek8(fBase+15) << 24);
+        var instrCount: int64 := peek8(fBase+16) | (peek8(fBase+17) << 8) |
+                                   (peek8(fBase+18) << 16) | (peek8(fBase+19) << 24);
+
+        var ip: int64 := 0;
+        while ip < instrCount {
+            var iBase: int64 := instrs + (firstInstr + ip) * 20;
+            var op:   int64 := peek8(iBase+0) | (peek8(iBase+1) << 8);
+            var dest: int64 := peek8(iBase+2) | (peek8(iBase+3) << 8);
+            var src1: int64 := peek8(iBase+4) | (peek8(iBase+5) << 8) |
+                                (peek8(iBase+6) << 16) | (peek8(iBase+7) << 24);
+            var imm:  int64 := peek64(iBase + 12);
+
+            if op == 0 {
+                poke64(frames + sp * 2048 + dest * 8, imm);
+            } else if op == 1 {
+                poke64(frames + sp * 2048 + dest * 8, strPool + imm);
+            } else if op == 61 || op == 62 {
+                var sv: int64 := peek64(frames + sp * 2048 + src1 * 8);
+                poke64(frames + sp * 2048 + dest * 8, sv);
+            } else if op == 80 {
+                self.dispBuiltin(imm);
+            } else if op == 81 {
+                var argc: int64 := imm;
+                var ai: int64 := 0;
+                while ai < argc {
+                    var av: int64 := peek64(frames + sp * 2048 + ai * 8);
+                    poke64(frames + (sp+1) * 2048 + ai * 8, av);
+                    ai := ai + 1;
+                }
+                self.sp := sp + 1;
+                var ret: int64 := self.execFunc(src1);
+                self.sp := sp;
+                poke64(frames + sp * 2048 + dest * 8, ret);
+            } else if op == 90 {
+                var tgt: int64 := self.findLabel(firstInstr, instrCount, imm);
+                ip := tgt - firstInstr;
+            } else if op == 93 {
+            } else if op == 94 {
+                return peek64(frames + sp * 2048 + src1 * 8);
+            } else if op == 112 {
+                var sz: int64 := peek64(frames + sp * 2048 + src1 * 8);
+                var ptr: int64 := mmap(0, sz, 3, 34);
+                poke64(frames + sp * 2048 + dest * 8, ptr);
+            } else if op == 113 {
+                var ptr: int64 := peek64(frames + sp * 2048 + src1 * 8);
+                munmap(ptr, 0);
+            }
+            ip := ip + 1;
+        }
+        return peek64(frames + sp * 2048);
+    }
+};
+
+fn main(argc: int64, argv: pchar): int64 {
+    if argc < 2 {
+        EPrintStrLn("usage: lbf_run <file.lbf>");
+        return 1;
+    }
+    var path: pchar := ArgvGet(argv, 1);
+    var interp: LbfInterp := new LbfInterp();
+    interp.init();
+    if !interp.loadFile(path) {
+        EPrintStrLn("error: invalid or unreadable LBF file");
+        return 1;
+    }
+    return interp.run();
+}

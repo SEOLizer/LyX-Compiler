@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
+.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -69,7 +69,51 @@ test: lyxc
 	./lyxc examples/basics/hello.lyx -o /tmp/lyxc_hello_test
 	@/tmp/lyxc_hello_test
 	@rm -f /tmp/lyxc_hello_test
+	@echo "--- LX-25: Block Header ---"
+	./lyxc tests/lx25_block_header_test.lyx -o /tmp/lyxc_lx25_test
+	@/tmp/lyxc_lx25_test
+	@rm -f /tmp/lyxc_lx25_test
+	@echo "--- LX-26: Genesis Serializer ---"
+	./lyxc tests/lx26_genesis_test.lyx -o /tmp/lyxc_lx26_test
+	@/tmp/lyxc_lx26_test
+	@rm -f /tmp/lyxc_lx26_test
+	@echo "--- LX-27: TLV-Framework ---"
+	./lyxc tests/lx27_tlv_test.lyx -o /tmp/lyxc_lx27_test
+	@/tmp/lyxc_lx27_test
+	@rm -f /tmp/lyxc_lx27_test
+	@echo "--- LX-28: Section Block Emitter ---"
+	./lyxc tests/lx28_sections_test.lyx -o /tmp/lyxc_lx28_test
+	@/tmp/lyxc_lx28_test
+	@rm -f /tmp/lyxc_lx28_test
 	@echo "OK"
+
+test-lyxos: lyxc
+	@echo "=== LyxOS Integrations-Kompilierungstest ==="
+	@for f in \
+		tests/lyxos/lx00_lbf_magic.lyx \
+		tests/lyxos/lx03_entry.lyx \
+		tests/lyxos/lx04_io.lyx \
+		tests/lyxos/lx05_alloc.lyx \
+		tests/lyxos/lx06_fs.lyx \
+		tests/lyxos/lx08_net.lyx \
+		tests/lyxos/lx09_spawn.lyx \
+		tests/lyxos/lx10_mutex.lyx \
+		tests/lyxos/lx11_timer.lyx \
+		tests/lyxos/lx12_pledge.lyx \
+		tests/lyxos/lx13_parallel.lyx \
+		tests/lyxos/lx14_ai_infer.lyx \
+		tests/lyxos/lx21_two_ret.lyx \
+		tests/lyxos/lx25_block_header.lyx \
+		tests/lyxos/lx26_genesis.lyx \
+		tests/lyxos/lx27_tlv.lyx \
+		tests/lyxos/lx28_sections.lyx; do \
+		printf "  %-40s" "$$f"; \
+		./lyxc $$f --target=lyxos --emit=lbf -o /tmp/lyxos_test.lbf \
+			&& echo "OK" \
+			|| (echo "FAIL" && exit 1); \
+	done
+	@rm -f /tmp/lyxos_test.lbf
+	@echo "=== Alle LyxOS-Tests kompiliert ==="
 
 snapshot: lyxc
 	@bash tests/run_snapshot_tests.sh

@@ -1,6 +1,6 @@
 # Lyx Capability-Based Security (LCBS)
 
-> **Version:** 3.0 · **Ab:** lyxc v0.9.5A · **Plattform:** Linux x86-64 (Kernel ≥ 5.13)
+> **Version:** 3.0 · **Ab:** lyxc v0.9.6A · **Plattform:** Linux x86-64 (Kernel ≥ 5.13)
 
 ---
 

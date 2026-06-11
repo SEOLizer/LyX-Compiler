@@ -7,6 +7,7 @@
 
 import src.parser;
 import src.std.alloc;
+import src.std.io;
 import src.security.capabilities;
 import src.security.capability_resolver;
 import src.security.cap_graph;
@@ -376,6 +377,9 @@ pub type Sema = class {
   pendingCapNode:  int64;   // letztes NK_CAPABILITY_ATTR vor NK_FUNC_DECL
   pendingUccNode:  int64;   // letztes NK_USES_CALLER_CAP vor NK_FUNC_DECL
 
+  // BUG-3: current source file path for error messages (null = root module)
+  curFile: pchar;
+
   // ------------------------------------------------------------------
   // Node access helpers
   // Prefixed sn_ to avoid VMT collision with Parser methods of same name.
@@ -506,6 +510,10 @@ pub type Sema = class {
   // ------------------------------------------------------------------
 
   fn _error(msg: pchar, line: int64) {
+    if self.curFile != 0 as pchar {
+      PrintStr(self.curFile);
+      PrintStr(": ");
+    }
     PrintStr("sema error (line ");
     PrintInt(line);
     PrintStr("): ");
@@ -805,13 +813,27 @@ pub type Sema = class {
     var p: Parser := new Parser();
     p.Init(src, StrLen(src));
     var head: int64 := p.Parse();
-    if (p.hadError != 0) { dispose p; return; }
+    if (p.hadError != 0) {
+      PrintStr("sema error: parse error in imported module '"c);
+      sys_write(1, modName as int64, modLen);
+      PrintStr("'\n"c);
+      self.hadError   := 1;
+      self.errorCount := self.errorCount + 1;
+      dispose p;
+      return;
+    }
 
     // WP-L6: Caps ZUERST extrahieren (vor Pass1) für Pruning-Entscheidung
-    var savedSrc:   pchar := self.src;
-    var savedNodes: int64 := self.pNodes;
-    self.src    := p.src;
-    self.pNodes := p.nodes;
+    var savedSrc:      pchar := self.src;
+    var savedNodes:    int64 := self.pNodes;
+    var savedToks:     int64 := self.pToks;
+    var savedTokCount: int64 := self.pTokCount;
+    var savedCurFile:  pchar := self.curFile;
+    self.src       := p.src;
+    self.pNodes    := p.nodes;
+    self.pToks     := p.toks;
+    self.pTokCount := p.tokCount;
+    self.curFile   := path;
 
     // @capabilities extrahieren (für WP-L3 Cache und WP-L4 Graph)
     var importedCaps: CapSet := new CapSet();
@@ -853,8 +875,11 @@ pub type Sema = class {
       memcpy(nameCopy, modName as int64, modLen);
       poke8(nameCopy + modLen, 0);
       self.capStripper.AddStripped(nameCopy as pchar, modLen);
-      self.src    := savedSrc;
-      self.pNodes := savedNodes;
+      self.src       := savedSrc;
+      self.pNodes    := savedNodes;
+      self.pToks     := savedToks;
+      self.pTokCount := savedTokCount;
+      self.curFile   := savedCurFile;
       dispose p;
       return;
     }
@@ -904,8 +929,14 @@ pub type Sema = class {
       }
     }
 
-    self.src    := savedSrc;
-    self.pNodes := savedNodes;
+    // BUG-3: type-check function bodies in imported module
+    self.Pass2(head);
+
+    self.src       := savedSrc;
+    self.pNodes    := savedNodes;
+    self.pToks     := savedToks;
+    self.pTokCount := savedTokCount;
+    self.curFile   := savedCurFile;
 
     dispose p;
   }
@@ -924,6 +955,47 @@ pub type Sema = class {
     var initNi: int64 := self.sn_c1(nodeIdx);
     if (initNi < 0) { return 0; }
     return self._evalConstExpr(initNi);
+  }
+
+  // BUG-5: compute compile-time size of a class or struct by name
+  fn _sizeofType(name: pchar, nlen: int64): int64 {
+    if self._strNEq(name, nlen, "int64"c, 5) { return 8; }
+    if self._strNEq(name, nlen, "bool"c,  4) { return 8; }
+    if self._strNEq(name, nlen, "f64"c,   3) { return 8; }
+    if self._strNEq(name, nlen, "pchar"c, 5) { return 8; }
+    var si: int64 := self.Lookup(name, nlen);
+    if si < 0 { return 8; }
+    var nodeIdx: int64 := self.SymNodeIdx(si);
+    if nodeIdx < 0 { return 8; }
+    var kk: int64 := self.sn_kind(nodeIdx);
+    if kk == SNK_TYPE_DECL {
+      var fieldCnt: int64 := 0;
+      var tmp: int64 := self.sn_c0(nodeIdx);
+      while tmp >= 0 {
+        if self.sn_kind(tmp) == 7 { fieldCnt := fieldCnt + 1; }
+        tmp := self.sn_next(tmp);
+      }
+      var vmtSlots: int64 := 0;
+      var mth: int64 := self.sn_c1(nodeIdx);
+      while mth >= 0 {
+        if self.sn_kind(mth) == SNK_FUNC_DECL {
+          if ((self.sn_iVal(mth) >> 1) & 1) != 0 { vmtSlots := vmtSlots + 1; }
+        }
+        mth := self.sn_next(mth);
+      }
+      if vmtSlots > 0 { return (fieldCnt + 1) * 8; }
+      return fieldCnt * 8;
+    }
+    if kk == SNK_STRUCT_DECL {
+      var fieldCnt: int64 := 0;
+      var tmp: int64 := self.sn_c0(nodeIdx);
+      while tmp >= 0 {
+        if self.sn_kind(tmp) == 7 { fieldCnt := fieldCnt + 1; }
+        tmp := self.sn_next(tmp);
+      }
+      return fieldCnt * 8;
+    }
+    return 8;
   }
 
   fn _evalConstExpr(ni: int64): int64 {
@@ -963,6 +1035,16 @@ pub type Sema = class {
       if (bop == 82) { if (lv <= rv) { return 1; } else { return 0; } }  // TK_LE  <=
       if (bop == 83) { if (lv > rv)  { return 1; } else { return 0; } }  // TK_GT  >
       if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
+      return 0;
+    }
+    if (k == SNK_CALL) {
+      // sizeof(TypeName) is a compile-time constant (BUG-5)
+      if self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), "sizeof"c, 6) {
+        var argNi: int64 := self.sn_c0(ni);
+        if argNi >= 0 {
+          return self._sizeofType(self.sn_sVal(argNi), self.sn_sLen(argNi));
+        }
+      }
       return 0;
     }
     self._errorNode("@if: non-constant expression in condition", ni);
@@ -1279,6 +1361,10 @@ pub type Sema = class {
       self._popScope();
 
     } else if (k == SNK_VAR_DECL) {
+      // BUG-8: reject 'self' as a variable name (reserved keyword in class methods)
+      if self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), "self"c, 4) {
+        self._errorNode("'self' is a reserved keyword and cannot be used as a variable name", ni);
+      }
       var typeNi: int64 := self.sn_c0(ni);
       var initNi: int64 := self.sn_c1(ni);
       var tid: int64 := self.ResolveType(typeNi);
@@ -2896,6 +2982,107 @@ pub type Sema = class {
   }
 
   fn _registerBuiltins() {
+    // LX-22: Debug & Telemetrie (0x0A00–0x0A05) — IDs 145–150
+    self._regBuiltin("sys_debug_print");
+    self._regBuiltin("sys_trace_event");
+    self._regBuiltin("sys_perf_counter");
+    self._regBuiltin("sys_stack_trace");
+    self._regBuiltin("sys_watchpoint_set");
+    self._regBuiltin("sys_watchpoint_clear");
+    // LX-18: IOFS (0x0C00–0x0C04) — IDs 140–144
+    self._regBuiltin("sys_iofs_mount");
+    self._regBuiltin("sys_iofs_compact");
+    self._regBuiltin("sys_iofs_page_info");
+    self._regBuiltin("sys_iofs_sandbox_enter");
+    self._regBuiltin("sys_iofs_sandbox_exit");
+    // LX-17: Lyra Agent Interface (0x0900–0x090B) — IDs 128–139
+    self._regBuiltin("sys_intent_submit");
+    self._regBuiltin("sys_intent_wait");
+    self._regBuiltin("sys_intent_cancel");
+    self._regBuiltin("sys_lyra_event");
+    self._regBuiltin("sys_dream_register");
+    self._regBuiltin("sys_dream_unregister");
+    self._regBuiltin("sys_memory_store");
+    self._regBuiltin("sys_memory_recall");
+    self._regBuiltin("sys_memory_search");
+    self._regBuiltin("sys_context_push");
+    self._regBuiltin("sys_context_pop");
+    self._regBuiltin("sys_timeline_query");
+    // LX-16: Semantisches Paging & Wissensgraph (0x080D–0x0812) — IDs 122–127
+    self._regBuiltin("sys_sem_annotate");
+    self._regBuiltin("sys_sem_query");
+    self._regBuiltin("sys_graph_node_create");
+    self._regBuiltin("sys_graph_edge_add");
+    self._regBuiltin("sys_graph_edge_remove");
+    self._regBuiltin("sys_graph_query");
+    // LX-15: KI-Embedding & Vektorindex (0x0807–0x080C) — IDs 116–121
+    self._regBuiltin("sys_ai_embed");
+    self._regBuiltin("sys_ai_token_count");
+    self._regBuiltin("sys_ai_search");
+    self._regBuiltin("sys_ai_index_create");
+    self._regBuiltin("sys_ai_index_insert");
+    self._regBuiltin("sys_ai_index_delete");
+    // LX-14: KI-Basis (0x0800–0x0806) — IDs 109–115
+    self._regBuiltin("sys_ai_model_load");
+    self._regBuiltin("sys_ai_model_unload");
+    self._regBuiltin("sys_ai_model_info");
+    self._regBuiltin("sys_ai_ctx_create");
+    self._regBuiltin("sys_ai_ctx_destroy");
+    self._regBuiltin("sys_ai_infer");
+    self._regBuiltin("sys_ai_infer_sync");
+    // LX-13: Task-Scheduler & Parallelität (0x0B00–0x0B09) — IDs 99–108
+    self._regBuiltin("sys_task_spawn");
+    self._regBuiltin("sys_task_await");
+    self._regBuiltin("sys_task_cancel");
+    self._regBuiltin("sys_task_group_create");
+    self._regBuiltin("sys_task_group_add");
+    self._regBuiltin("sys_task_group_await");
+    self._regBuiltin("sys_cpu_count");
+    self._regBuiltin("sys_cpu_topology");
+    self._regBuiltin("sys_affinity_hint");
+    self._regBuiltin("sys_numa_alloc");
+    // LX-12: Capabilities + Pledge + Unveil (0x0700–0x0708) — IDs 90–98
+    self._regBuiltin("sys_cap_create");
+    self._regBuiltin("sys_cap_restrict");
+    self._regBuiltin("sys_cap_rights");
+    self._regBuiltin("sys_pledge");
+    self._regBuiltin("sys_unveil");
+    self._regBuiltin("sys_uid_get");
+    self._regBuiltin("sys_gid_get");
+    self._regBuiltin("sys_setuid");
+    self._regBuiltin("sys_seccomp");
+    // LX-11: Zeit-Syscalls (0x0500–0x0504) — IDs 85–89
+    self._regBuiltin("sys_clock_get");
+    self._regBuiltin("sys_clock_set");
+    self._regBuiltin("sys_timer_create");
+    self._regBuiltin("sys_timer_set");
+    self._regBuiltin("sys_timer_wait");
+    // LX-10: IPC & Synchronisation (0x0400–0x040C) — an den Anfang wegen Bootstrap-Limit
+    self._regBuiltin("sys_mutex_lock");
+    self._regBuiltin("sys_mutex_unlock");
+    self._regBuiltin("sys_sem_create");
+    self._regBuiltin("sys_sem_wait");
+    self._regBuiltin("sys_sem_post");
+    self._regBuiltin("sys_sem_destroy");
+    self._regBuiltin("sys_channel_create");
+    self._regBuiltin("sys_channel_send");
+    self._regBuiltin("sys_channel_recv");
+    self._regBuiltin("sys_notify_create");
+    self._regBuiltin("sys_notify_send");
+    self._regBuiltin("sys_notify_recv");
+    self._regBuiltin("sys_futex");
+    // LX-09: LyxOS Prozess & Threads (0x0000–0x000D) — sys_getpid/gettid/getrandom bereits unten
+    self._regBuiltin("sys_version");
+    self._regBuiltin("sys_exit");
+    self._regBuiltin("sys_exit_group");
+    self._regBuiltin("sys_spawn");
+    self._regBuiltin("sys_thread_spawn");
+    self._regBuiltin("sys_thread_exit");
+    self._regBuiltin("sys_wait");
+    self._regBuiltin("sys_yield");
+    self._regBuiltin("sys_sleep_ns");
+    self._regBuiltin("sys_priority");
+    self._regBuiltin("sys_signal_mask");
     // Memory
     self._regBuiltin("mmap");
     self._regBuiltin("munmap");
@@ -2922,6 +3109,7 @@ pub type Sema = class {
     self._regBuiltin("StrLen");
     self._regBuiltin("StrCharAt");
     self._regBuiltin("StrEquals");
+    self._regBuiltin("StrEq");
     self._regBuiltin("StrStartsWith");
     self._regBuiltin("StrEndsWith");
     self._regBuiltin("StrConcat");
@@ -2962,8 +3150,12 @@ pub type Sema = class {
     self._regBuiltin("lseek");
     self._regBuiltin("IOResult"); // WP-CS-09: read _lyx_io_result
 
+    // sizeof is a compile-time builtin (BUG-5)
+    self._regBuiltin("sizeof");
+
     // WP-BC-02: additional builtins
     self._regBuiltin("chmod");
+    self._regBuiltin("chown");
     self._regBuiltin("getpid");
     self._regBuiltin("unlink");
     self._regBuiltin("rename");
@@ -2980,15 +3172,8 @@ pub type Sema = class {
     self._regBuiltin("breakpoint");
     self._regBuiltin("Println");
     self._regBuiltin("StrFromInt");
-    self._regBuiltin("StrEquals");
-    self._regBuiltin("StrEndsWith");
-    self._regBuiltin("StrConcat");
-    self._regBuiltin("StrCopy");
-    self._regBuiltin("StrAppendStr");
     self._regBuiltin("Random");
     self._regBuiltin("RandomSeed");
-    self._regBuiltin("FloatToStr");
-    self._regBuiltin("PrintFloat");
     self._regBuiltin("GetArg");
     // WP-BC-39: Inspect(expr) — in-situ data visualizer
     self._regBuiltin("Inspect");
@@ -3000,8 +3185,9 @@ pub type Sema = class {
     self._regBuiltin("trace");
     self._regBuiltin("trace_int");
     self._regBuiltin("trace_str");
-    // WP-BC-44: clock_gettime for --trace-passes timing
+    // WP-BC-44: clock_gettime / nanosleep for --trace-passes timing
     self._regBuiltin("clock_gettime");
+    self._regBuiltin("nanosleep");
     // WP-BC-51: array builtins
     self._regBuiltin("len");
     self._regBuiltin("push");
@@ -3236,6 +3422,31 @@ pub type Sema = class {
     // WP-GPIO-1: Memory / Instruction Barrier Intrinsics
     self._regBuiltin("mem_barrier");   // ARM64: DMB SY  x86-64: MFENCE
     self._regBuiltin("inst_barrier");  // ARM64: ISB     x86-64: LFENCE
+    // LX-06: LyxOS VFS syscalls (0x0200–0x0215) — fehlende Namen aus fs.lyx
+    self._regBuiltin("sys_open");
+    self._regBuiltin("sys_seek");
+    self._regBuiltin("sys_stat");
+    self._regBuiltin("sys_mkdir");
+    self._regBuiltin("sys_unlink");
+    self._regBuiltin("sys_rename");
+    self._regBuiltin("sys_readdir");
+    self._regBuiltin("sys_symlink");
+    self._regBuiltin("sys_readlink");
+    self._regBuiltin("sys_umount");
+    self._regBuiltin("sys_content_id");
+
+    // LX-07: LyxOS I/O-Geräte & Poll (0x0300–0x0305)
+    self._regBuiltin("sys_poll");
+    self._regBuiltin("sys_ioctl");
+    self._regBuiltin("sys_mmap_device");
+    self._regBuiltin("sys_irq_bind");
+    self._regBuiltin("sys_port_in");
+    self._regBuiltin("sys_port_out");
+
+    // LX-08: LyxOS Netzwerk (0x0600–0x0609) — sys_socket..sys_shutdown bereits ab LX-06
+    self._regBuiltin("sys_sendmsg");
+    self._regBuiltin("sys_recvmsg");
+
   }
 
   // ------------------------------------------------------------------
@@ -3275,6 +3486,7 @@ pub type Sema = class {
     self.errorCount := 0;
     self.curClassNi  := -1;
     self.classCapNode := -1;
+    self.curFile     := 0 as pchar;
 
     // WP-10e: import dedup table
     self.importedCap   := 16;
