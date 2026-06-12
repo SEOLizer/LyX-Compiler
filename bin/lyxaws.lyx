@@ -1,0 +1,895 @@
+// bin/lyxaws.lyx — AWS CLI for Lyx
+// WP-AWS-14
+// Usage: lyxaws <service> <command> [options]
+
+unit bin.lyxaws;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.cloud.s3;
+import std.cloud.ec2;
+import std.cloud.iam;
+import std.cloud.dynamodb;
+import std.cloud.lambda;
+import std.cloud.sqs;
+import std.cloud.sns;
+import std.cloud.cloudwatch;
+import std.cloud.secrets;
+import std.alloc;
+import std.io;
+import std.fs;
+
+// ── Argument helpers ──────────────────────────────────────────────────────────
+
+fn argEq(a: pchar, b: pchar): int64 {
+    return StrEquals(a, b);
+}
+
+fn argStart(a: pchar, prefix: pchar): int64 {
+    return StrStartsWith(a, prefix);
+}
+
+fn argAfter(a: pchar, prefix: pchar): pchar {
+    var pl: int64 := StrLen(prefix);
+    return (a as int64 + pl) as pchar;
+}
+
+fn flagVal(argc: int64, argv: pchar, flag: pchar): pchar {
+    var fl: int64 := StrLen(flag);
+    var i: int64 := 1;
+    while (i < argc) {
+        var arg: pchar := ArgvGet(argv, i);
+        if (StrStartsWith(arg, flag) == 1) {
+            if (StrLen(arg) > fl && (StrCharAt(arg, fl) & 0xFF) == 61) {
+                return (arg as int64 + fl + 1) as pchar;
+            }
+            if (StrEquals(arg, flag) == 1 && i+1 < argc) {
+                return ArgvGet(argv, i+1);
+            }
+        }
+        i:=i+1;
+    }
+    return 0 as pchar;
+}
+
+fn flagBool(argc: int64, argv: pchar, flag: pchar): int64 {
+    var i: int64 := 1;
+    while (i < argc) {
+        var arg: pchar := ArgvGet(argv, i);
+        if (StrEquals(arg, flag) == 1) { return 1; }
+        i:=i+1;
+    }
+    return 0;
+}
+
+fn loadCreds(argc: int64, argv: pchar): AWSCreds {
+    var profile: pchar := flagVal(argc, argv, "--profile"c);
+    var keyId:   pchar := flagVal(argc, argv, "--access-key"c);
+    var secret:  pchar := flagVal(argc, argv, "--secret-key"c);
+    var region:  pchar := flagVal(argc, argv, "--region"c);
+    if (keyId != 0 as pchar && secret != 0 as pchar) {
+        var c: AWSCreds := AWSCredentialsStatic(keyId, secret);
+        if (region != 0 as pchar) {
+            c.region := region as int64;
+        }
+        return c;
+    }
+    if (profile != 0 as pchar) {
+        var c2: AWSCreds := AWSCredentialsProfile(profile);
+        if (region != 0 as pchar) { c2.region := region as int64; }
+        return c2;
+    }
+    return AWSCredentialsDefault();
+}
+
+fn getRegion(argc: int64, argv: pchar, creds: AWSCreds): pchar {
+    var r: pchar := flagVal(argc, argv, "--region"c);
+    if (r != 0 as pchar) { return r; }
+    if (creds.region != 0) { return creds.region as pchar; }
+    return "us-east-1"c;
+}
+
+fn printLine(s: pchar) {
+    PrintLn(s);
+}
+
+fn printKV(key: pchar, val: pchar) {
+    Print(key); Print(": "c); PrintLn(val);
+}
+
+fn printKI(key: pchar, val: int64) {
+    var tmp: int64 := alloc(24); Int64ToStr(val, tmp as pchar);
+    Print(key); Print(": "c); PrintLn(tmp as pchar);
+    free(tmp, 24);
+}
+
+fn printNull(label: pchar, val: int64) {
+    Print(label); Print(": "c);
+    if (val != 0) { PrintLn(val as pchar); } else { PrintLn("(none)"c); }
+}
+
+// ── usage ─────────────────────────────────────────────────────────────────────
+
+fn printUsage() {
+    PrintLn("lyxaws — AWS CLI"c);
+    PrintLn("Usage: lyxaws <service> <command> [options]"c);
+    PrintLn(""c);
+    PrintLn("Services:"c);
+    PrintLn("  auth           Check credentials"c);
+    PrintLn("  s3             S3 object storage"c);
+    PrintLn("  ec2            EC2 compute"c);
+    PrintLn("  iam            IAM identity & access"c);
+    PrintLn("  sts            STS temporary credentials"c);
+    PrintLn("  dynamodb       DynamoDB tables & items"c);
+    PrintLn("  lambda         Lambda functions"c);
+    PrintLn("  sqs            SQS queues & messages"c);
+    PrintLn("  sns            SNS topics & subscriptions"c);
+    PrintLn("  cloudwatch     CloudWatch metrics & logs"c);
+    PrintLn("  secrets        Secrets Manager"c);
+    PrintLn("  ssm            SSM Parameter Store"c);
+    PrintLn(""c);
+    PrintLn("Global flags:"c);
+    PrintLn("  --region <r>        AWS region"c);
+    PrintLn("  --profile <p>       AWS credentials profile"c);
+    PrintLn("  --access-key <k>    AWS access key ID"c);
+    PrintLn("  --secret-key <s>    AWS secret access key"c);
+}
+
+// ── auth ──────────────────────────────────────────────────────────────────────
+
+fn cmdAuth(argc: int64, argv: pchar) {
+    var creds: AWSCreds := loadCreds(argc, argv);
+    if (creds.accessKey == 0) {
+        PrintLn("Error: no credentials found"c);
+        return;
+    }
+    Print("Access Key: "c); PrintLn(creds.accessKey as pchar);
+    Print("Source: "c);
+    if (creds.source == 1) { PrintLn("static"c); }
+    else if (creds.source == 2) { PrintLn("environment"c); }
+    else if (creds.source == 3) { PrintLn("~/.aws/credentials"c); }
+    else { PrintLn("unknown"c); }
+    if (creds.region != 0) {
+        Print("Region: "c); PrintLn(creds.region as pchar);
+    }
+    PrintLn("Credentials loaded OK."c);
+    AWSCredentialsFree(creds);
+}
+
+// ── s3 ────────────────────────────────────────────────────────────────────────
+
+fn cmdS3(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws s3 <ls|get|put|rm|mb|rb|presign> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: S3Client := S3Connect(creds, region);
+
+    if (argEq(cmd, "ls"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        if (bucket == 0 as pchar && argc > 3) { bucket := ArgvGet(argv, 3); }
+        if (bucket == 0 as pchar) {
+            var result: int64 := S3ListBuckets(client);
+            if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+            else { PrintLn("(no buckets or error)"c); }
+        } else {
+            var prefix: pchar := flagVal(argc, argv, "--prefix"c);
+            var result: int64 := S3ListObjects(client, bucket, prefix);
+            if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+            else { PrintLn("(no objects or error)"c); }
+        }
+    } else if (argEq(cmd, "get"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        var key:    pchar := flagVal(argc, argv, "--key"c);
+        var output: pchar := flagVal(argc, argv, "--output"c);
+        if (bucket == 0 as pchar || key == 0 as pchar) {
+            PrintLn("Error: --bucket and --key required"c); return;
+        }
+        if (output != 0 as pchar) {
+            var ok: int64 := S3GetObjectFile(client, bucket, key, output);
+            if (ok == 0) { Print("Saved to "c); PrintLn(output); }
+            else { PrintLn("Error downloading"c); }
+        } else {
+            var data: int64 := S3GetObject(client, bucket, key);
+            if (data != 0) { PrintLn(data as pchar); free(data, StrLen(data as pchar)+1); }
+            else { PrintLn("Error or not found"c); }
+        }
+    } else if (argEq(cmd, "put"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        var key:    pchar := flagVal(argc, argv, "--key"c);
+        var file:   pchar := flagVal(argc, argv, "--file"c);
+        var ct:     pchar := flagVal(argc, argv, "--content-type"c);
+        if (bucket == 0 as pchar || key == 0 as pchar) {
+            PrintLn("Error: --bucket and --key required"c); return;
+        }
+        if (ct == 0 as pchar) { ct := "application/octet-stream"c; }
+        var ok: int64 := 0;
+        if (file != 0 as pchar) {
+            ok := S3PutObjectFile(client, bucket, key, file, ct);
+        } else {
+            PrintLn("Error: --file required for put"c); return;
+        }
+        if (ok == 0) { PrintLn("Upload successful"c); } else { PrintLn("Upload failed"c); }
+    } else if (argEq(cmd, "rm"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        var key:    pchar := flagVal(argc, argv, "--key"c);
+        if (bucket == 0 as pchar || key == 0 as pchar) {
+            PrintLn("Error: --bucket and --key required"c); return;
+        }
+        var ok: int64 := S3DeleteObject(client, bucket, key);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "mb"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        if (bucket == 0 as pchar && argc > 3) { bucket := ArgvGet(argv, 3); }
+        if (bucket == 0 as pchar) { PrintLn("Error: bucket name required"c); return; }
+        var ok: int64 := S3CreateBucket(client, bucket);
+        if (ok == 1) { Print("Created bucket: "c); PrintLn(bucket); }
+        else { PrintLn("Error creating bucket"c); }
+    } else if (argEq(cmd, "rb"c) == 1) {
+        var bucket: pchar := flagVal(argc, argv, "--bucket"c);
+        if (bucket == 0 as pchar && argc > 3) { bucket := ArgvGet(argv, 3); }
+        if (bucket == 0 as pchar) { PrintLn("Error: bucket name required"c); return; }
+        var ok: int64 := S3DeleteBucket(client, bucket);
+        if (ok == 1) { Print("Deleted bucket: "c); PrintLn(bucket); }
+        else { PrintLn("Error deleting bucket"c); }
+    } else if (argEq(cmd, "presign"c) == 1) {
+        var bucket:  pchar := flagVal(argc, argv, "--bucket"c);
+        var key:     pchar := flagVal(argc, argv, "--key"c);
+        var expStr:  pchar := flagVal(argc, argv, "--expires"c);
+        var expires: int64 := 3600;
+        if (expStr != 0 as pchar) {
+            var tmp: int64 := alloc(8); expires := StrToInt64(expStr, tmp); free(tmp, 8);
+        }
+        if (bucket == 0 as pchar || key == 0 as pchar) {
+            PrintLn("Error: --bucket and --key required"c); return;
+        }
+        var url: int64 := S3PresignURL(client, bucket, key, expires);
+        if (url != 0) { PrintLn(url as pchar); free(url, StrLen(url as pchar)+1); }
+        else { PrintLn("Error generating presigned URL"c); }
+    } else {
+        Print("Unknown s3 command: "c); PrintLn(cmd);
+    }
+    S3Close(client);
+}
+
+// ── ec2 ───────────────────────────────────────────────────────────────────────
+
+fn cmdEC2(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws ec2 <describe|run|stop|start|terminate|images|keys|sgs|vpcs|volumes> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: EC2Client := EC2Connect(creds, region);
+
+    if (argEq(cmd, "describe"c) == 1) {
+        var result: int64 := EC2DescribeInstances(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No instances or error"c); }
+    } else if (argEq(cmd, "run"c) == 1) {
+        var ami:   pchar := flagVal(argc, argv, "--ami"c);
+        var itype: pchar := flagVal(argc, argv, "--type"c);
+        var key:   pchar := flagVal(argc, argv, "--key"c);
+        var subnet:pchar := flagVal(argc, argv, "--subnet"c);
+        var sg:    pchar := flagVal(argc, argv, "--sg"c);
+        if (ami == 0 as pchar) { PrintLn("Error: --ami required"c); return; }
+        if (itype == 0 as pchar) { itype := "t3.micro"c; }
+        var id: int64 := EC2RunInstances(client, ami, itype, 1, 1, key, subnet, sg);
+        if (id != 0) { Print("Instance ID: "c); PrintLn(id as pchar); free(id, StrLen(id as pchar)+1); }
+        else { PrintLn("Launch failed"c); }
+    } else if (argEq(cmd, "stop"c) == 1) {
+        var id: pchar := flagVal(argc, argv, "--id"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: instance ID required"c); return; }
+        var ok: int64 := EC2StopInstances(client, id);
+        if (ok == 1) { PrintLn("Stop requested"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "start"c) == 1) {
+        var id: pchar := flagVal(argc, argv, "--id"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: instance ID required"c); return; }
+        var ok: int64 := EC2StartInstances(client, id);
+        if (ok == 1) { PrintLn("Start requested"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "terminate"c) == 1) {
+        var id: pchar := flagVal(argc, argv, "--id"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: instance ID required"c); return; }
+        var ok: int64 := EC2TerminateInstances(client, id);
+        if (ok == 1) { PrintLn("Terminated"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "images"c) == 1) {
+        var owner: pchar := flagVal(argc, argv, "--owner"c);
+        var result: int64 := EC2DescribeImages(client, owner);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No images or error"c); }
+    } else if (argEq(cmd, "keys"c) == 1) {
+        var result: int64 := EC2DescribeKeyPairs(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No key pairs or error"c); }
+    } else if (argEq(cmd, "sgs"c) == 1) {
+        var result: int64 := EC2DescribeSecurityGroups(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No security groups or error"c); }
+    } else if (argEq(cmd, "vpcs"c) == 1) {
+        var result: int64 := EC2DescribeVpcs(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No VPCs or error"c); }
+    } else if (argEq(cmd, "volumes"c) == 1) {
+        var result: int64 := EC2DescribeVolumes(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No volumes or error"c); }
+    } else if (argEq(cmd, "azs"c) == 1) {
+        var result: int64 := EC2DescribeAvailabilityZones(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown ec2 command: "c); PrintLn(cmd);
+    }
+    EC2Close(client);
+}
+
+// ── iam ───────────────────────────────────────────────────────────────────────
+
+fn cmdIAM(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws iam <list-users|get-user|list-roles|get-role|list-policies|list-keys> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var client: IAMClient := IAMConnect(creds);
+
+    if (argEq(cmd, "list-users"c) == 1) {
+        var result: int64 := IAMListUsers(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No users or error"c); }
+    } else if (argEq(cmd, "get-user"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        var u: IAMUser := IAMGetUser(client, name);
+        printNull("UserId",   u.userId);
+        printNull("UserName", u.userName);
+        printNull("ARN",      u.arn);
+        IAMUserFree(u);
+    } else if (argEq(cmd, "list-roles"c) == 1) {
+        var result: int64 := IAMListRoles(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No roles or error"c); }
+    } else if (argEq(cmd, "get-role"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar) { PrintLn("Error: --name required"c); return; }
+        var r: IAMRole := IAMGetRole(client, name);
+        printNull("RoleId",   r.roleId);
+        printNull("RoleName", r.roleName);
+        printNull("ARN",      r.arn);
+        IAMRoleFree(r);
+    } else if (argEq(cmd, "list-policies"c) == 1) {
+        var scope: pchar := flagVal(argc, argv, "--scope"c);
+        var result: int64 := IAMListPolicies(client, scope);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No policies or error"c); }
+    } else if (argEq(cmd, "create-key"c) == 1) {
+        var user: pchar := flagVal(argc, argv, "--user"c);
+        var result: int64 := IAMCreateAccessKey(client, user);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown iam command: "c); PrintLn(cmd);
+    }
+    IAMClose(client);
+}
+
+// ── sts ───────────────────────────────────────────────────────────────────────
+
+fn cmdSTS(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws sts <whoami|assume-role|session-token> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: STSClient := STSConnect(creds, region);
+
+    if (argEq(cmd, "whoami"c) == 1) {
+        var result: int64 := STSGetCallerIdentity(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "assume-role"c) == 1) {
+        var arn:     pchar := flagVal(argc, argv, "--role-arn"c);
+        var session: pchar := flagVal(argc, argv, "--session"c);
+        var durStr:  pchar := flagVal(argc, argv, "--duration"c);
+        var dur: int64 := 3600;
+        if (durStr != 0 as pchar) {
+            var tmp: int64 := alloc(8); dur := StrToInt64(durStr, tmp); free(tmp, 8);
+        }
+        if (arn == 0 as pchar) { PrintLn("Error: --role-arn required"c); return; }
+        if (session == 0 as pchar) { session := "lyxaws-session"c; }
+        var c: STSCredentials := STSAssumeRole(client, arn, session, dur);
+        printNull("AccessKeyId",     c.accessKeyId);
+        printNull("SecretAccessKey", c.secretAccessKey);
+        printNull("SessionToken",    c.sessionToken);
+        printNull("Expiration",      c.expiration);
+        STSCredentialsFree(c);
+    } else if (argEq(cmd, "session-token"c) == 1) {
+        var durStr: pchar := flagVal(argc, argv, "--duration"c);
+        var dur: int64 := 43200;
+        if (durStr != 0 as pchar) {
+            var tmp: int64 := alloc(8); dur := StrToInt64(durStr, tmp); free(tmp, 8);
+        }
+        var c2: STSCredentials := STSGetSessionToken(client, dur);
+        printNull("AccessKeyId",     c2.accessKeyId);
+        printNull("SecretAccessKey", c2.secretAccessKey);
+        printNull("SessionToken",    c2.sessionToken);
+        printNull("Expiration",      c2.expiration);
+        STSCredentialsFree(c2);
+    } else {
+        Print("Unknown sts command: "c); PrintLn(cmd);
+    }
+    STSClose(client);
+}
+
+// ── dynamodb ──────────────────────────────────────────────────────────────────
+
+fn cmdDynamoDB(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws dynamodb <list|describe|get|put|delete|scan> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: DDBClient := DDBConnect(creds, region);
+
+    if (argEq(cmd, "list"c) == 1) {
+        var result: int64 := DDBListTables(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No tables or error"c); }
+    } else if (argEq(cmd, "describe"c) == 1) {
+        var table: pchar := flagVal(argc, argv, "--table"c);
+        if (table == 0 as pchar && argc > 3) { table := ArgvGet(argv, 3); }
+        if (table == 0 as pchar) { PrintLn("Error: table name required"c); return; }
+        var result: int64 := DDBDescribeTable(client, table);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "get"c) == 1) {
+        var table: pchar := flagVal(argc, argv, "--table"c);
+        var key:   pchar := flagVal(argc, argv, "--key"c);
+        var val:   pchar := flagVal(argc, argv, "--value"c);
+        if (table == 0 as pchar || key == 0 as pchar || val == 0 as pchar) {
+            PrintLn("Error: --table, --key, --value required"c); return;
+        }
+        var result: int64 := DDBGetItem(client, table, key, "S"c, val);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Not found or error"c); }
+    } else if (argEq(cmd, "scan"c) == 1) {
+        var table: pchar := flagVal(argc, argv, "--table"c);
+        if (table == 0 as pchar && argc > 3) { table := ArgvGet(argv, 3); }
+        if (table == 0 as pchar) { PrintLn("Error: table name required"c); return; }
+        var result: int64 := DDBScan(client, table, 0 as pchar, 0 as pchar, 0);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error or empty"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var table: pchar := flagVal(argc, argv, "--table"c);
+        var key:   pchar := flagVal(argc, argv, "--key"c);
+        var val:   pchar := flagVal(argc, argv, "--value"c);
+        if (table == 0 as pchar || key == 0 as pchar || val == 0 as pchar) {
+            PrintLn("Error: --table, --key, --value required"c); return;
+        }
+        var ok: int64 := DDBDeleteItem(client, table, key, "S"c, val);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown dynamodb command: "c); PrintLn(cmd);
+    }
+    DDBClose(client);
+}
+
+// ── lambda ────────────────────────────────────────────────────────────────────
+
+fn cmdLambda(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws lambda <list|get|invoke|delete|versions> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: LambdaClient := LambdaConnect(creds, region);
+
+    if (argEq(cmd, "list"c) == 1) {
+        var result: int64 := LambdaListFunctions(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No functions or error"c); }
+    } else if (argEq(cmd, "get"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: function name required"c); return; }
+        var result: int64 := LambdaGetFunction(client, name);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Not found or error"c); }
+    } else if (argEq(cmd, "invoke"c) == 1) {
+        var name:    pchar := flagVal(argc, argv, "--name"c);
+        var payload: pchar := flagVal(argc, argv, "--payload"c);
+        if (name == 0 as pchar) { PrintLn("Error: --name required"c); return; }
+        var pl: int64 := 0; var pdata: int64 := 0;
+        if (payload != 0 as pchar) {
+            pl := StrLen(payload);
+            pdata := payload as int64;
+        }
+        var result: int64 := LambdaInvoke(client, name, pdata, pl, "RequestResponse"c);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error or no response"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: function name required"c); return; }
+        var ok: int64 := LambdaDeleteFunction(client, name);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "versions"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: function name required"c); return; }
+        var result: int64 := LambdaListVersions(client, name);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown lambda command: "c); PrintLn(cmd);
+    }
+    LambdaClose(client);
+}
+
+// ── sqs ───────────────────────────────────────────────────────────────────────
+
+fn cmdSQS(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws sqs <list|create|url|delete|send|receive|purge> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: SQSClient := SQSConnect(creds, region);
+
+    if (argEq(cmd, "list"c) == 1) {
+        var prefix: pchar := flagVal(argc, argv, "--prefix"c);
+        var result: int64 := SQSListQueues(client, prefix);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No queues or error"c); }
+    } else if (argEq(cmd, "create"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: queue name required"c); return; }
+        var url: int64 := SQSCreateQueue(client, name, 30, 345600);
+        if (url != 0) { Print("Queue URL: "c); PrintLn(url as pchar); free(url, StrLen(url as pchar)+1); }
+        else { PrintLn("Error creating queue"c); }
+    } else if (argEq(cmd, "url"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: queue name required"c); return; }
+        var url: int64 := SQSGetQueueUrl(client, name);
+        if (url != 0) { PrintLn(url as pchar); free(url, StrLen(url as pchar)+1); }
+        else { PrintLn("Not found"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var qurl: pchar := flagVal(argc, argv, "--url"c);
+        if (qurl == 0 as pchar && argc > 3) { qurl := ArgvGet(argv, 3); }
+        if (qurl == 0 as pchar) { PrintLn("Error: queue URL required"c); return; }
+        var ok: int64 := SQSDeleteQueue(client, qurl);
+        if (ok == 1) { PrintLn("Queue deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "send"c) == 1) {
+        var qurl: pchar := flagVal(argc, argv, "--url"c);
+        var body: pchar := flagVal(argc, argv, "--body"c);
+        if (qurl == 0 as pchar || body == 0 as pchar) {
+            PrintLn("Error: --url and --body required"c); return;
+        }
+        var msgId: int64 := SQSSendMessage(client, qurl, body, 0);
+        if (msgId != 0) { Print("MessageId: "c); PrintLn(msgId as pchar); free(msgId, StrLen(msgId as pchar)+1); }
+        else { PrintLn("Error sending message"c); }
+    } else if (argEq(cmd, "receive"c) == 1) {
+        var qurl: pchar := flagVal(argc, argv, "--url"c);
+        var waitStr: pchar := flagVal(argc, argv, "--wait"c);
+        var wait: int64 := 0;
+        if (waitStr != 0 as pchar) {
+            var tmp: int64 := alloc(8); wait := StrToInt64(waitStr, tmp); free(tmp, 8);
+        }
+        if (qurl == 0 as pchar) { PrintLn("Error: --url required"c); return; }
+        var result: int64 := SQSReceiveMessages(client, qurl, 10, wait);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No messages or error"c); }
+    } else if (argEq(cmd, "purge"c) == 1) {
+        var qurl: pchar := flagVal(argc, argv, "--url"c);
+        if (qurl == 0 as pchar && argc > 3) { qurl := ArgvGet(argv, 3); }
+        if (qurl == 0 as pchar) { PrintLn("Error: queue URL required"c); return; }
+        var ok: int64 := SQSPurgeQueue(client, qurl);
+        if (ok == 1) { PrintLn("Queue purged"c); } else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown sqs command: "c); PrintLn(cmd);
+    }
+    SQSClose(client);
+}
+
+// ── sns ───────────────────────────────────────────────────────────────────────
+
+fn cmdSNS(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws sns <list|create|delete|publish|subscribe|unsubscribe> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: SNSClient := SNSConnect(creds, region);
+
+    if (argEq(cmd, "list"c) == 1) {
+        var result: int64 := SNSListTopics(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No topics or error"c); }
+    } else if (argEq(cmd, "create"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: topic name required"c); return; }
+        var arn: int64 := SNSCreateTopic(client, name);
+        if (arn != 0) { Print("TopicArn: "c); PrintLn(arn as pchar); free(arn, StrLen(arn as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var arn: pchar := flagVal(argc, argv, "--arn"c);
+        if (arn == 0 as pchar && argc > 3) { arn := ArgvGet(argv, 3); }
+        if (arn == 0 as pchar) { PrintLn("Error: topic ARN required"c); return; }
+        var ok: int64 := SNSDeleteTopic(client, arn);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "publish"c) == 1) {
+        var arn:     pchar := flagVal(argc, argv, "--arn"c);
+        var subject: pchar := flagVal(argc, argv, "--subject"c);
+        var message: pchar := flagVal(argc, argv, "--message"c);
+        if (arn == 0 as pchar || message == 0 as pchar) {
+            PrintLn("Error: --arn and --message required"c); return;
+        }
+        var msgId: int64 := SNSPublish(client, arn, subject, message);
+        if (msgId != 0) { Print("MessageId: "c); PrintLn(msgId as pchar); free(msgId, StrLen(msgId as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "subscribe"c) == 1) {
+        var arn:      pchar := flagVal(argc, argv, "--arn"c);
+        var protocol: pchar := flagVal(argc, argv, "--protocol"c);
+        var endpoint: pchar := flagVal(argc, argv, "--endpoint"c);
+        if (arn == 0 as pchar || protocol == 0 as pchar || endpoint == 0 as pchar) {
+            PrintLn("Error: --arn, --protocol, --endpoint required"c); return;
+        }
+        var subArn: int64 := SNSSubscribe(client, arn, protocol, endpoint);
+        if (subArn != 0) { Print("SubscriptionArn: "c); PrintLn(subArn as pchar); free(subArn, StrLen(subArn as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "unsubscribe"c) == 1) {
+        var subArn: pchar := flagVal(argc, argv, "--sub-arn"c);
+        if (subArn == 0 as pchar && argc > 3) { subArn := ArgvGet(argv, 3); }
+        if (subArn == 0 as pchar) { PrintLn("Error: subscription ARN required"c); return; }
+        var ok: int64 := SNSUnsubscribe(client, subArn);
+        if (ok == 1) { PrintLn("Unsubscribed"c); } else { PrintLn("Error"c); }
+    } else {
+        Print("Unknown sns command: "c); PrintLn(cmd);
+    }
+    SNSClose(client);
+}
+
+// ── cloudwatch ────────────────────────────────────────────────────────────────
+
+fn cmdCW(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws cloudwatch <list-metrics|get-stats|list-alarms|logs-groups|logs-streams|logs-events> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+
+    if (argEq(cmd, "list-metrics"c) == 1) {
+        var client: CWClient := CWConnect(creds, region);
+        var ns:     pchar := flagVal(argc, argv, "--namespace"c);
+        var metric: pchar := flagVal(argc, argv, "--metric"c);
+        var result: int64 := CWListMetrics(client, ns, metric);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No metrics or error"c); }
+        CWClose(client);
+    } else if (argEq(cmd, "get-stats"c) == 1) {
+        var client: CWClient := CWConnect(creds, region);
+        var ns:     pchar := flagVal(argc, argv, "--namespace"c);
+        var metric: pchar := flagVal(argc, argv, "--metric"c);
+        var start:  pchar := flagVal(argc, argv, "--start"c);
+        var end2:   pchar := flagVal(argc, argv, "--end"c);
+        var stat:   pchar := flagVal(argc, argv, "--stat"c);
+        if (ns == 0 as pchar || metric == 0 as pchar) {
+            PrintLn("Error: --namespace and --metric required"c); CWClose(client); return;
+        }
+        if (stat == 0 as pchar) { stat := "Average"c; }
+        var result: int64 := CWGetMetricStatistics(client, ns, metric, start, end2, 300, stat, 0 as pchar);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No data or error"c); }
+        CWClose(client);
+    } else if (argEq(cmd, "list-alarms"c) == 1) {
+        var client: CWClient := CWConnect(creds, region);
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        var result: int64 := CWDescribeAlarms(client, name);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No alarms or error"c); }
+        CWClose(client);
+    } else if (argEq(cmd, "logs-groups"c) == 1) {
+        var logsClient: CWLogsClient := CWLogsConnect(creds, region);
+        var prefix: pchar := flagVal(argc, argv, "--prefix"c);
+        var result: int64 := CWLogsDescribeLogGroups(logsClient, prefix);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No log groups or error"c); }
+        CWLogsClose(logsClient);
+    } else if (argEq(cmd, "logs-streams"c) == 1) {
+        var logsClient: CWLogsClient := CWLogsConnect(creds, region);
+        var group:  pchar := flagVal(argc, argv, "--group"c);
+        var prefix: pchar := flagVal(argc, argv, "--prefix"c);
+        if (group == 0 as pchar) { PrintLn("Error: --group required"c); CWLogsClose(logsClient); return; }
+        var result: int64 := CWLogsDescribeLogStreams(logsClient, group, prefix);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No streams or error"c); }
+        CWLogsClose(logsClient);
+    } else if (argEq(cmd, "logs-events"c) == 1) {
+        var logsClient: CWLogsClient := CWLogsConnect(creds, region);
+        var group:  pchar := flagVal(argc, argv, "--group"c);
+        var stream: pchar := flagVal(argc, argv, "--stream"c);
+        var limitStr: pchar := flagVal(argc, argv, "--limit"c);
+        var limit: int64 := 100;
+        if (limitStr != 0 as pchar) {
+            var tmp: int64 := alloc(8); limit := StrToInt64(limitStr, tmp); free(tmp, 8);
+        }
+        if (group == 0 as pchar || stream == 0 as pchar) {
+            PrintLn("Error: --group and --stream required"c); CWLogsClose(logsClient); return;
+        }
+        var result: int64 := CWLogsGetLogEvents(logsClient, group, stream, 0, 0, limit);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No events or error"c); }
+        CWLogsClose(logsClient);
+    } else {
+        Print("Unknown cloudwatch command: "c); PrintLn(cmd);
+    }
+}
+
+// ── secrets ───────────────────────────────────────────────────────────────────
+
+fn cmdSecrets(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws secrets <list|get|create|put|delete|describe> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: SecretsClient := SecretsConnect(creds, region);
+
+    if (argEq(cmd, "list"c) == 1) {
+        var result: int64 := SecretsListSecrets(client);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No secrets or error"c); }
+    } else if (argEq(cmd, "get"c) == 1) {
+        var id: pchar := flagVal(argc, argv, "--id"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: secret ID required"c); return; }
+        var val: int64 := SecretsGetString(client, id);
+        if (val != 0) { PrintLn(val as pchar); free(val, StrLen(val as pchar)+1); }
+        else { PrintLn("Not found or error"c); }
+    } else if (argEq(cmd, "create"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        var val2: pchar := flagVal(argc, argv, "--value"c);
+        var desc: pchar := flagVal(argc, argv, "--desc"c);
+        if (name == 0 as pchar || val2 == 0 as pchar) {
+            PrintLn("Error: --name and --value required"c); return;
+        }
+        var result: int64 := SecretsCreateSecret(client, name, val2, desc, 0 as pchar);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "put"c) == 1) {
+        var id:  pchar := flagVal(argc, argv, "--id"c);
+        var val: pchar := flagVal(argc, argv, "--value"c);
+        if (id == 0 as pchar || val == 0 as pchar) {
+            PrintLn("Error: --id and --value required"c); return;
+        }
+        var result: int64 := SecretsPutValue(client, id, val);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var id:    pchar := flagVal(argc, argv, "--id"c);
+        var force: int64 := flagBool(argc, argv, "--force"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: secret ID required"c); return; }
+        var ok: int64 := SecretsDeleteSecret(client, id, 7, force);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "describe"c) == 1) {
+        var id: pchar := flagVal(argc, argv, "--id"c);
+        if (id == 0 as pchar && argc > 3) { id := ArgvGet(argv, 3); }
+        if (id == 0 as pchar) { PrintLn("Error: secret ID required"c); return; }
+        var result: int64 := SecretsDescribeSecret(client, id);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("Not found or error"c); }
+    } else {
+        Print("Unknown secrets command: "c); PrintLn(cmd);
+    }
+    SecretsClose(client);
+}
+
+// ── ssm ───────────────────────────────────────────────────────────────────────
+
+fn cmdSSM(argc: int64, argv: pchar) {
+    if (argc < 3) {
+        PrintLn("Usage: lyxaws ssm <get|put|delete|list|path> [args]"c);
+        return;
+    }
+    var cmd: pchar := ArgvGet(argv, 2);
+    var creds: AWSCreds := loadCreds(argc, argv);
+    var region: pchar := getRegion(argc, argv, creds);
+    var client: SSMClient := SSMConnect(creds, region);
+
+    if (argEq(cmd, "get"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: parameter name required"c); return; }
+        var val: int64 := SSMGetParameterValue(client, name);
+        if (val != 0) { PrintLn(val as pchar); free(val, StrLen(val as pchar)+1); }
+        else { PrintLn("Not found or error"c); }
+    } else if (argEq(cmd, "put"c) == 1) {
+        var name:   pchar := flagVal(argc, argv, "--name"c);
+        var val:    pchar := flagVal(argc, argv, "--value"c);
+        var ptype:  pchar := flagVal(argc, argv, "--type"c);
+        var secure: int64 := flagBool(argc, argv, "--secure"c);
+        if (name == 0 as pchar || val == 0 as pchar) {
+            PrintLn("Error: --name and --value required"c); return;
+        }
+        if (ptype == 0 as pchar) {
+            if (secure != 0) { ptype := "SecureString"c; } else { ptype := "String"c; }
+        }
+        var ok: int64 := SSMPutParameter(client, name, val, ptype, 1, 0 as pchar);
+        if (ok == 1) { PrintLn("Parameter stored"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "delete"c) == 1) {
+        var name: pchar := flagVal(argc, argv, "--name"c);
+        if (name == 0 as pchar && argc > 3) { name := ArgvGet(argv, 3); }
+        if (name == 0 as pchar) { PrintLn("Error: parameter name required"c); return; }
+        var ok: int64 := SSMDeleteParameter(client, name);
+        if (ok == 1) { PrintLn("Deleted"c); } else { PrintLn("Error"c); }
+    } else if (argEq(cmd, "list"c) == 1) {
+        var filter: pchar := flagVal(argc, argv, "--filter"c);
+        var result: int64 := SSMDescribeParameters(client, filter);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No parameters or error"c); }
+    } else if (argEq(cmd, "path"c) == 1) {
+        var path: pchar := flagVal(argc, argv, "--path"c);
+        if (path == 0 as pchar && argc > 3) { path := ArgvGet(argv, 3); }
+        if (path == 0 as pchar) { PrintLn("Error: path required"c); return; }
+        var result: int64 := SSMGetParametersByPath(client, path, 1, 1);
+        if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        else { PrintLn("No parameters or error"c); }
+    } else {
+        Print("Unknown ssm command: "c); PrintLn(cmd);
+    }
+    SSMClose(client);
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    if (argc < 2) { printUsage(); return 1; }
+    var service: pchar := ArgvGet(argv, 1);
+    if (argEq(service, "auth"c) == 1) { cmdAuth(argc, argv); }
+    else if (argEq(service, "s3"c) == 1) { cmdS3(argc, argv); }
+    else if (argEq(service, "ec2"c) == 1) { cmdEC2(argc, argv); }
+    else if (argEq(service, "iam"c) == 1) { cmdIAM(argc, argv); }
+    else if (argEq(service, "sts"c) == 1) { cmdSTS(argc, argv); }
+    else if (argEq(service, "dynamodb"c) == 1 || argEq(service, "ddb"c) == 1) { cmdDynamoDB(argc, argv); }
+    else if (argEq(service, "lambda"c) == 1) { cmdLambda(argc, argv); }
+    else if (argEq(service, "sqs"c) == 1) { cmdSQS(argc, argv); }
+    else if (argEq(service, "sns"c) == 1) { cmdSNS(argc, argv); }
+    else if (argEq(service, "cloudwatch"c) == 1 || argEq(service, "cw"c) == 1) { cmdCW(argc, argv); }
+    else if (argEq(service, "secrets"c) == 1 || argEq(service, "sm"c) == 1) { cmdSecrets(argc, argv); }
+    else if (argEq(service, "ssm"c) == 1) { cmdSSM(argc, argv); }
+    else if (argEq(service, "--help"c) == 1 || argEq(service, "help"c) == 1 || argEq(service, "-h"c) == 1) {
+        printUsage();
+    } else {
+        Print("Unknown service: "c); PrintLn(service);
+        printUsage();
+        return 1;
+    }
+    return 0;
+}

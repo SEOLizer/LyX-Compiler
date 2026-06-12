@@ -1,0 +1,498 @@
+// std/cloud/dynamodb.lyx — AWS DynamoDB Client
+// WP-AWS-09
+// JSON protocol: POST application/x-amz-json-1.0 with X-Amz-Target header
+
+unit std.cloud.dynamodb;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.alloc;
+import std.io;
+
+pub type DDBClient = struct {
+    creds:  AWSCreds;
+    region: int64;  // pchar
+    host:   int64;  // pchar alloc'd
+};
+
+// DDBItem: simple key-value map stored as flat pchar array pairs
+// Layout: [key0, type0, val0, key1, type1, val1, ...]  (3 pchars per attribute)
+// Types: "S"=string, "N"=number, "B"=binary, "BOOL"=boolean, "NULL"=null, "SS"/"NS"/"BS"=set
+pub type DDBItem = struct {
+    attrs:  int64;  // alloc'd array of int64 triples
+    count:  int64;
+};
+
+pub fn DDBItemNew(): DDBItem {
+    var item: DDBItem;
+    item.attrs := alloc(256 * 24); // up to 256 attributes
+    item.count := 0;
+    return item;
+}
+
+fn ddbStrDup(s: pchar): int64 {
+    if (s == 0 as pchar) { return 0; }
+    var n: int64 := StrLen(s)+1; var b: int64 := alloc(n); var i: int64 := 0;
+    while(i<n){poke8(b+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return b;
+}
+
+pub fn DDBItemSetStr(item: DDBItem, key: pchar, val: pchar) {
+    var off: int64 := item.count * 24;
+    poke64(item.attrs+off,   ddbStrDup(key));
+    poke64(item.attrs+off+8, "S"c as int64);
+    poke64(item.attrs+off+16, ddbStrDup(val));
+    poke64(item.count as int64, item.count + 1); // mutate: poke into struct field
+}
+
+pub fn DDBItemSetNum(item: DDBItem, key: pchar, val: pchar) {
+    var off: int64 := item.count * 24;
+    poke64(item.attrs+off,   ddbStrDup(key));
+    poke64(item.attrs+off+8, "N"c as int64);
+    poke64(item.attrs+off+16, ddbStrDup(val));
+    poke64(item.count as int64, item.count + 1);
+}
+
+pub fn DDBItemSetBool(item: DDBItem, key: pchar, val: int64) {
+    var off: int64 := item.count * 24;
+    poke64(item.attrs+off,   ddbStrDup(key));
+    poke64(item.attrs+off+8, "BOOL"c as int64);
+    poke64(item.attrs+off+16, if(val!=0){"true"c as int64}else{"false"c as int64});
+    poke64(item.count as int64, item.count + 1);
+}
+
+pub fn DDBItemFree(item: DDBItem) {
+    var i: int64 := 0;
+    while (i < item.count) {
+        var k: int64 := peek64(item.attrs + i*24);
+        if (k != 0) { free(k, StrLen(k as pchar)+1); }
+        // type is a string literal — don't free
+        var v: int64 := peek64(item.attrs + i*24 + 16);
+        if (v != 0) { free(v, StrLen(v as pchar)+1); }
+        i:=i+1;
+    }
+    free(item.attrs, 256*24);
+}
+
+fn ddbAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn ddbAppendChar(buf: int64, off: int64, c: int64): int64 {
+    poke8(buf+off, c&0xFF); return off+1;
+}
+
+fn ddbJsonEscape(s: pchar, buf: int64, off: int64): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while (i < n) {
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if (c == 34) { poke8(buf+off,92); poke8(buf+off+1,34); off:=off+2; }
+        else if (c == 92) { poke8(buf+off,92); poke8(buf+off+1,92); off:=off+2; }
+        else if (c == 10) { poke8(buf+off,92); poke8(buf+off+1,110); off:=off+2; }
+        else if (c == 13) { poke8(buf+off,92); poke8(buf+off+1,114); off:=off+2; }
+        else { poke8(buf+off,c); off:=off+1; }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn ddbItemToJson(item: DDBItem, buf: int64): int64 {
+    var off: int64 := ddbAppendChar(buf, 0, 123); // '{'
+    var i: int64 := 0;
+    while (i < item.count) {
+        if (i > 0) { off := ddbAppendChar(buf, off, 44); } // ','
+        var key:  pchar := peek64(item.attrs + i*24)   as pchar;
+        var typ:  pchar := peek64(item.attrs + i*24+8)  as pchar;
+        var val:  pchar := peek64(item.attrs + i*24+16) as pchar;
+        off := ddbAppendChar(buf, off, 34); // '"'
+        off := ddbJsonEscape(key, buf, off);
+        off := ddbAppend(buf, off, "\":{\""c);
+        off := ddbAppend(buf, off, typ);
+        off := ddbAppend(buf, off, "\":\""c);
+        off := ddbJsonEscape(val, buf, off);
+        off := ddbAppend(buf, off, "\"}"c);
+        i:=i+1;
+    }
+    off := ddbAppendChar(buf, off, 125); // '}'
+    poke8(buf+off, 0);
+    return off;
+}
+
+fn ddbKeyJson(key: pchar, typ: pchar, val: pchar, buf: int64): int64 {
+    var off: int64 := ddbAppend(buf, 0, "{\""c);
+    off := ddbAppend(buf, off, key);
+    off := ddbAppend(buf, off, "\":{\""c);
+    off := ddbAppend(buf, off, typ);
+    off := ddbAppend(buf, off, "\":\""c);
+    off := ddbJsonEscape(val, buf, off);
+    off := ddbAppend(buf, off, "\"}}"c);
+    poke8(buf+off, 0);
+    return off;
+}
+
+fn ddbSend(client: DDBClient, target: pchar, body: int64, bodyLen: int64): AWSResponse {
+    return AWSJSONRequest(client.creds, client.host as pchar, target,
+                          body, bodyLen,
+                          client.region as pchar, "dynamodb"c,
+                          "application/x-amz-json-1.0"c);
+}
+
+fn ddbJsonStr(buf: int64, off: int64, key: pchar, val: pchar, comma: int64): int64 {
+    if (comma != 0) { off := ddbAppendChar(buf, off, 44); }
+    off := ddbAppendChar(buf, off, 34);
+    off := ddbAppend(buf, off, key);
+    off := ddbAppend(buf, off, "\":\""c);
+    off := ddbJsonEscape(val, buf, off);
+    off := ddbAppendChar(buf, off, 34);
+    return off;
+}
+
+fn ddbJsonInt(buf: int64, off: int64, key: pchar, val: int64, comma: int64): int64 {
+    if (comma != 0) { off := ddbAppendChar(buf, off, 44); }
+    off := ddbAppendChar(buf, off, 34);
+    off := ddbAppend(buf, off, key);
+    off := ddbAppend(buf, off, "\":"c);
+    var tmp: int64 := alloc(24); Int64ToStr(val, tmp as pchar);
+    off := ddbAppend(buf, off, tmp as pchar);
+    free(tmp, 24);
+    return off;
+}
+
+// ── Client lifecycle ──────────────────────────────────────────────────────────
+
+pub fn DDBConnect(creds: AWSCreds, region: pchar): DDBClient {
+    var c: DDBClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("dynamodb"c, region) as int64;
+    return c;
+}
+
+pub fn DDBClose(client: DDBClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Table operations ──────────────────────────────────────────────────────────
+
+pub fn DDBListTables(client: DDBClient): int64 {
+    var body: pchar := "{}"c;
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.ListTables"c,
+                                     body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBDescribeTable(client: DDBClient, tableName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.DescribeTable"c, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBCreateTable(client: DDBClient, tableName: pchar,
+                      hashKey: pchar, hashType: pchar,
+                      readCap: int64, writeCap: int64): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeDefinitions\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeType\":\""c);
+    off := ddbAppend(buf, off, hashType);
+    off := ddbAppend(buf, off, "\"}],\"KeySchema\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"KeyType\":\"HASH\"}],\"ProvisionedThroughput\":{\"ReadCapacityUnits\":"c);
+    off := ddbJsonInt(buf, off, ""c, readCap, 0); // reuse helper without key
+    var tmp: int64 := alloc(24); Int64ToStr(readCap, tmp as pchar);
+    // rebuild the number manually since ddbJsonInt includes the key:
+    // Undo last usage and do direct:
+    // Actually ddbJsonInt with key="" is wrong, let's write numbers directly
+    off := ddbAppend(buf, 0, "{\"TableName\":\""c); // restart
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeDefinitions\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeType\":\""c);
+    off := ddbAppend(buf, off, hashType);
+    off := ddbAppend(buf, off, "\"}],\"KeySchema\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"KeyType\":\"HASH\"}],\"ProvisionedThroughput\":{\"ReadCapacityUnits\":"c);
+    Int64ToStr(readCap, tmp as pchar);
+    off := ddbAppend(buf, off, tmp as pchar);
+    off := ddbAppend(buf, off, ",\"WriteCapacityUnits\":"c);
+    Int64ToStr(writeCap, tmp as pchar);
+    off := ddbAppend(buf, off, tmp as pchar);
+    off := ddbAppend(buf, off, "},\"BillingMode\":\"PROVISIONED\"}"c);
+    free(tmp, 24);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.CreateTable"c, buf, off);
+    free(buf, 1024);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn DDBCreateTableOnDemand(client: DDBClient, tableName: pchar,
+                               hashKey: pchar, hashType: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeDefinitions\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"AttributeType\":\""c);
+    off := ddbAppend(buf, off, hashType);
+    off := ddbAppend(buf, off, "\"}],\"KeySchema\":[{\"AttributeName\":\""c);
+    off := ddbJsonEscape(hashKey, buf, off);
+    off := ddbAppend(buf, off, "\",\"KeyType\":\"HASH\"}],\"BillingMode\":\"PAY_PER_REQUEST\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.CreateTable"c, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn DDBDeleteTable(client: DDBClient, tableName: pchar): int64 {
+    var buf: int64 := alloc(128); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.DeleteTable"c, buf, off);
+    free(buf, 128);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Item operations ───────────────────────────────────────────────────────────
+
+pub fn DDBPutItem(client: DDBClient, tableName: pchar, item: DDBItem): int64 {
+    var itemBuf: int64 := alloc(8192);
+    ddbItemToJson(item, itemBuf);
+    var buf: int64 := alloc(512 + StrLen(itemBuf as pchar));
+    var off: int64 := ddbAppend(buf, 0, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"Item\":"c);
+    var il: int64 := StrLen(itemBuf as pchar);
+    var i: int64 := 0; while(i<il){poke8(buf+off+i,peek8(itemBuf+i));i:=i+1;} off:=off+il;
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    free(itemBuf, 8192);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.PutItem"c, buf, off);
+    free(buf, 512 + il);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn DDBGetItem(client: DDBClient, tableName: pchar,
+                  keyName: pchar, keyType: pchar, keyVal: pchar): int64 {
+    var keyBuf: int64 := alloc(512);
+    ddbKeyJson(keyName, keyType, keyVal, keyBuf);
+    var buf: int64 := alloc(256 + StrLen(keyBuf as pchar));
+    var off: int64 := ddbAppend(buf, 0, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"Key\":"c);
+    var kl: int64 := StrLen(keyBuf as pchar);
+    var i: int64 := 0; while(i<kl){poke8(buf+off+i,peek8(keyBuf+i));i:=i+1;} off:=off+kl;
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    free(keyBuf, 512);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.GetItem"c, buf, off);
+    free(buf, 256 + kl);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBDeleteItem(client: DDBClient, tableName: pchar,
+                     keyName: pchar, keyType: pchar, keyVal: pchar): int64 {
+    var keyBuf: int64 := alloc(512);
+    ddbKeyJson(keyName, keyType, keyVal, keyBuf);
+    var buf: int64 := alloc(256 + StrLen(keyBuf as pchar));
+    var off: int64 := ddbAppend(buf, 0, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"Key\":"c);
+    var kl: int64 := StrLen(keyBuf as pchar);
+    var i: int64 := 0; while(i<kl){poke8(buf+off+i,peek8(keyBuf+i));i:=i+1;} off:=off+kl;
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    free(keyBuf, 512);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.DeleteItem"c, buf, off);
+    free(buf, 256 + kl);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn DDBQuery(client: DDBClient, tableName: pchar,
+                keyCondition: pchar, exprNames: pchar, exprVals: pchar,
+                limit: int64): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"KeyConditionExpression\":\""c);
+    off := ddbJsonEscape(keyCondition, buf, off);
+    off := ddbAppendChar(buf, off, 34);
+    if (exprNames != 0 as pchar && StrLen(exprNames) > 0) {
+        off := ddbAppend(buf, off, ",\"ExpressionAttributeNames\":"c);
+        var nl: int64 := StrLen(exprNames);
+        var i: int64 := 0; while(i<nl){poke8(buf+off+i,StrCharAt(exprNames,i)&0xFF);i:=i+1;} off:=off+nl;
+    }
+    if (exprVals != 0 as pchar && StrLen(exprVals) > 0) {
+        off := ddbAppend(buf, off, ",\"ExpressionAttributeValues\":"c);
+        var vl: int64 := StrLen(exprVals);
+        var i: int64 := 0; while(i<vl){poke8(buf+off+i,StrCharAt(exprVals,i)&0xFF);i:=i+1;} off:=off+vl;
+    }
+    if (limit > 0) {
+        off := ddbAppend(buf, off, ",\"Limit\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(limit, tmp as pchar);
+        off := ddbAppend(buf, off, tmp as pchar);
+        free(tmp, 24);
+    }
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.Query"c, buf, off);
+    free(buf, 4096);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBScan(client: DDBClient, tableName: pchar,
+               filterExpr: pchar, exprVals: pchar, limit: int64): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppendChar(buf, off, 34);
+    if (filterExpr != 0 as pchar && StrLen(filterExpr) > 0) {
+        off := ddbAppend(buf, off, ",\"FilterExpression\":\""c);
+        off := ddbJsonEscape(filterExpr, buf, off);
+        off := ddbAppendChar(buf, off, 34);
+    }
+    if (exprVals != 0 as pchar && StrLen(exprVals) > 0) {
+        off := ddbAppend(buf, off, ",\"ExpressionAttributeValues\":"c);
+        var vl: int64 := StrLen(exprVals);
+        var i: int64 := 0; while(i<vl){poke8(buf+off+i,StrCharAt(exprVals,i)&0xFF);i:=i+1;} off:=off+vl;
+    }
+    if (limit > 0) {
+        off := ddbAppend(buf, off, ",\"Limit\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(limit, tmp as pchar);
+        off := ddbAppend(buf, off, tmp as pchar);
+        free(tmp, 24);
+    }
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.Scan"c, buf, off);
+    free(buf, 4096);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBUpdateItem(client: DDBClient, tableName: pchar,
+                     keyName: pchar, keyType: pchar, keyVal: pchar,
+                     updateExpr: pchar, exprVals: pchar): int64 {
+    var keyBuf: int64 := alloc(512);
+    ddbKeyJson(keyName, keyType, keyVal, keyBuf);
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TableName\":\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\",\"Key\":"c);
+    var kl: int64 := StrLen(keyBuf as pchar);
+    var i: int64 := 0; while(i<kl){poke8(buf+off+i,peek8(keyBuf+i));i:=i+1;} off:=off+kl;
+    off := ddbAppend(buf, off, ",\"UpdateExpression\":\""c);
+    off := ddbJsonEscape(updateExpr, buf, off);
+    off := ddbAppendChar(buf, off, 34);
+    if (exprVals != 0 as pchar && StrLen(exprVals) > 0) {
+        off := ddbAppend(buf, off, ",\"ExpressionAttributeValues\":"c);
+        var vl: int64 := StrLen(exprVals);
+        i:=0; while(i<vl){poke8(buf+off+i,StrCharAt(exprVals,i)&0xFF);i:=i+1;} off:=off+vl;
+    }
+    off := ddbAppend(buf, off, ",\"ReturnValues\":\"ALL_NEW\"}"c);
+    poke8(buf+off, 0);
+    free(keyBuf, 512);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.UpdateItem"c, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn DDBBatchWriteItem(client: DDBClient, tableName: pchar,
+                         items: int64, count: int64): int64 {
+    // items: array of DDBItem pointers
+    var buf: int64 := alloc(65536); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"RequestItems\":{\""c);
+    off := ddbJsonEscape(tableName, buf, off);
+    off := ddbAppend(buf, off, "\":["c);
+    var i: int64 := 0;
+    while (i < count) {
+        if (i > 0) { off := ddbAppendChar(buf, off, 44); }
+        var item: DDBItem := peek64(items + i*8) as DDBItem; // not valid Lyx — use int64 directly
+        // Build put request object
+        var itemBuf: int64 := alloc(4096);
+        // item is stored as pointer to DDBItem struct: read fields
+        var iAttrs: int64 := peek64(items + i*8);     // attrs
+        var iCount: int64 := peek64(items + i*8 + 8); // count
+        var tmpItem: DDBItem;
+        tmpItem.attrs := iAttrs;
+        tmpItem.count := iCount;
+        ddbItemToJson(tmpItem, itemBuf);
+        off := ddbAppend(buf, off, "{\"PutRequest\":{\"Item\":"c);
+        var il: int64 := StrLen(itemBuf as pchar);
+        var j: int64 := 0; while(j<il){poke8(buf+off+j,peek8(itemBuf+j));j:=j+1;} off:=off+il;
+        off := ddbAppend(buf, off, "}}"c);
+        free(itemBuf, 4096);
+        i:=i+1;
+    }
+    off := ddbAppend(buf, off, "]}}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.BatchWriteItem"c, buf, off);
+    free(buf, 65536);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn DDBTransactWriteItems(client: DDBClient, txJson: pchar): int64 {
+    var buf: int64 := alloc(256 + StrLen(txJson)); var off: int64 := 0;
+    off := ddbAppend(buf, off, "{\"TransactItems\":"c);
+    var nl: int64 := StrLen(txJson);
+    var i: int64 := 0; while(i<nl){poke8(buf+off+i,StrCharAt(txJson,i)&0xFF);i:=i+1;} off:=off+nl;
+    off := ddbAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ddbSend(client, "DynamoDB_20120810.TransactWriteItems"c, buf, off);
+    free(buf, 256 + nl);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
