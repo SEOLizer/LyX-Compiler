@@ -1,0 +1,337 @@
+// lpm/core/verify.lyx — Paket-Integritätsprüfung
+// WP-PM-10
+//
+// SHA256-Checksums aus FILES.sha256 prüfen.
+// ECDSA-Signaturverifikation via SIGNATURE.sig.
+
+unit lpm.core.verify;
+
+import std.string;
+import std.alloc;
+import std.io;
+import std.fs;
+import std.hash;
+import std.crypto.ecc;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con ERR_VERIFY_OK:        int64 := 0;
+pub con ERR_VERIFY_CHECKSUM:  int64 := 1;
+pub con ERR_VERIFY_SIG:       int64 := 2;
+pub con ERR_VERIFY_IO:        int64 := 3;
+pub con ERR_VERIFY_NO_SIG:    int64 := 4;
+
+// ============================================================================
+// Hilfsfunktionen
+// ============================================================================
+
+// Liest einen Hex-String (64 Zeichen für SHA256) in ein 32-Byte-Array.
+fn hexDecode(hexStr: int64, out: int64, outLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < outLen) {
+        var hi: int64 := peek8(hexStr + i * 2);
+        var lo: int64 := peek8(hexStr + i * 2 + 1);
+
+        fn hexVal(c: int64): int64 {
+            if ((c >= 48) & (c <= 57)) { return c - 48; }
+            if ((c >= 97) & (c <= 102)) { return c - 87; }
+            if ((c >= 65) & (c <= 70)) { return c - 55; }
+            return 0;
+        }
+
+        poke8(out + i, (hexVal(hi) << 4) | hexVal(lo));
+        i := i + 1;
+    }
+    return 1;
+}
+
+// Konvertiert 32 Bytes in Hex-String (64 Zeichen + Null).
+fn hexEncode(data: int64, out: int64): void {
+    con HEX: int64 := "0123456789abcdef";
+    var i: int64 := 0;
+    while (i < 32) {
+        var b: int64 := peek8(data + i);
+        poke8(out + i * 2,     peek8(HEX + (b >> 4)));
+        poke8(out + i * 2 + 1, peek8(HEX + (b & 0xF)));
+        i := i + 1;
+    }
+    poke8(out + 64, 0);
+}
+
+// ============================================================================
+// SHA256-Checksummen-Verifikation
+// ============================================================================
+
+// Prüft alle Dateien in destDir gegen FILES.sha256.
+// Format: "<hexhash>  <relative/path>\n"
+pub fn VerifyChecksums(destDir: int64): int64 {
+    var dLen: int64 := StrLen(destDir);
+    var checksumFile: int64 := alloc(dLen + 16);
+    StrCpyN(checksumFile, destDir, dLen);
+    StrCpyN(checksumFile + dLen, "/FILES.sha256", 13);
+    poke8(checksumFile + dLen + 13, 0);
+
+    if (FileExists(checksumFile) == 0) {
+        free(checksumFile);
+        return ERR_VERIFY_IO;
+    }
+
+    var data: int64 := FileReadAll(checksumFile);
+    free(checksumFile);
+    if (data == 0) { return ERR_VERIFY_IO; }
+
+    var pos: int64 := 0;
+    var dataLen: int64 := StrLen(data);
+    var hashBuf: int64 := alloc(68);   // 64 Hex-Zeichen + Null
+    var pathBuf: int64 := alloc(512);
+    var computed: int64 := alloc(32);  // SHA256-Ausgabe
+    var computedHex: int64 := alloc(68);
+    var fullPath: int64 := alloc(1024);
+
+    while (pos < dataLen) {
+        // Zeile lesen
+        var lStart: int64 := pos;
+        while ((pos < dataLen) & (peek8(data + pos) != 10)) { pos := pos + 1; }
+        var lEnd: int64 := pos;
+        if (pos < dataLen) { pos := pos + 1; }
+
+        if (lEnd - lStart < 68) { }
+        else {
+            // Ersten 64 Zeichen = SHA256-Hash
+            StrCpyN(hashBuf, data + lStart, 64);
+            poke8(hashBuf + 64, 0);
+
+            // Leerzeichen überspringen
+            var nameStart: int64 := lStart + 64;
+            while ((nameStart < lEnd) & (peek8(data + nameStart) == 32)) { nameStart := nameStart + 1; }
+
+            var nameLen: int64 := lEnd - nameStart;
+            // Trailing \r entfernen
+            while ((nameLen > 0) & (peek8(data + nameStart + nameLen - 1) == 13)) { nameLen := nameLen - 1; }
+
+            if (nameLen > 0) {
+                StrCpyN(pathBuf, data + nameStart, nameLen);
+                poke8(pathBuf + nameLen, 0);
+
+                // Vollständigen Pfad aufbauen
+                StrCpyN(fullPath, destDir, dLen);
+                poke8(fullPath + dLen, 47);
+                StrCpyN(fullPath + dLen + 1, pathBuf, nameLen);
+                poke8(fullPath + dLen + 1 + nameLen, 0);
+
+                if (FileExists(fullPath) == 1) {
+                    var fdata: int64 := FileReadAll(fullPath);
+                    var fsize: int64 := FileSize(fullPath);
+                    if (fdata != 0) {
+                        SHA256(fdata, fsize, computed);
+                        hexEncode(computed, computedHex);
+                        if (StrCmpN(computedHex, hashBuf, 64) != 0) {
+                            free(fdata); free(data);
+                            free(hashBuf); free(pathBuf);
+                            free(computed); free(computedHex); free(fullPath);
+                            return ERR_VERIFY_CHECKSUM;
+                        }
+                        free(fdata);
+                    }
+                }
+            }
+        }
+    }
+
+    free(data); free(hashBuf); free(pathBuf);
+    free(computed); free(computedHex); free(fullPath);
+    return ERR_VERIFY_OK;
+}
+
+// Berechnet SHA256 einer Datei und gibt Hex-String zurück. Aufrufer muss free().
+pub fn ComputeFileSHA256(filePath: int64): int64 {
+    var data: int64 := FileReadAll(filePath);
+    if (data == 0) { return 0; }
+    var size: int64 := FileSize(filePath);
+    var hash: int64 := alloc(32);
+    SHA256(data, size, hash);
+    free(data);
+    var hex: int64 := alloc(68);
+    hexEncode(hash, hex);
+    free(hash);
+    return hex;
+}
+
+// Erstellt FILES.sha256 für alle Dateien in sourceDir.
+// files: null-terminiertes Array von pchar (Dateinamen relativ zu sourceDir)
+// fileCount: Anzahl Dateien
+pub fn CreateChecksumFile(sourceDir: int64, files: int64, fileCount: int64): int64 {
+    var sLen: int64 := StrLen(sourceDir);
+    var checksumPath: int64 := alloc(sLen + 16);
+    StrCpyN(checksumPath, sourceDir, sLen);
+    StrCpyN(checksumPath + sLen, "/FILES.sha256", 13);
+    poke8(checksumPath + sLen + 13, 0);
+
+    var buf: int64 := alloc(fileCount * 600 + 4);
+    var pos: int64 := 0;
+
+    var hash: int64 := alloc(32);
+    var hex: int64 := alloc(68);
+    var fullPath: int64 := alloc(1024);
+
+    var i: int64 := 0;
+    while (i < fileCount) {
+        var fname: int64 := peek64(files + i * 8);
+        if (fname != 0) {
+            var fLen: int64 := StrLen(fname);
+            StrCpyN(fullPath, sourceDir, sLen);
+            poke8(fullPath + sLen, 47);
+            StrCpyN(fullPath + sLen + 1, fname, fLen);
+            poke8(fullPath + sLen + 1 + fLen, 0);
+
+            if (FileExists(fullPath) == 1) {
+                var fdata: int64 := FileReadAll(fullPath);
+                var fsize: int64 := FileSize(fullPath);
+                if (fdata != 0) {
+                    SHA256(fdata, fsize, hash);
+                    hexEncode(hash, hex);
+                    free(fdata);
+
+                    StrCpyN(buf + pos, hex, 64);
+                    pos := pos + 64;
+                    poke8(buf + pos, 32); pos := pos + 1;
+                    poke8(buf + pos, 32); pos := pos + 1;
+                    StrCpyN(buf + pos, fname, fLen);
+                    pos := pos + fLen;
+                    poke8(buf + pos, 10); pos := pos + 1;
+                }
+            }
+        }
+        i := i + 1;
+    }
+
+    poke8(buf + pos, 0);
+    var rc: int64 := FileWriteAll(checksumPath, buf, pos);
+    free(buf); free(hash); free(hex); free(fullPath); free(checksumPath);
+    if (rc == 0) { return ERR_VERIFY_IO; }
+    return ERR_VERIFY_OK;
+}
+
+// ============================================================================
+// Publisher-Signatur (ECDSA/secp256k1)
+// ============================================================================
+
+// Liest den vertrauenswürdigen Publisher-Key aus trustedKeyPath.
+// Format: 64-Byte roher Schlüssel (pubx 32 Bytes + puby 32 Bytes).
+fn loadTrustedKey(trustedKeyPath: int64, pubx: int64, puby: int64): int64 {
+    if (FileExists(trustedKeyPath) == 0) { return 0; }
+    var data: int64 := FileReadAll(trustedKeyPath);
+    if (data == 0) { return 0; }
+    var size: int64 := FileSize(trustedKeyPath);
+    if (size < 64) { free(data); return 0; }
+    StrCpyN(pubx, data, 32);
+    StrCpyN(puby, data + 32, 32);
+    free(data);
+    return 1;
+}
+
+// Verifiziert SIGNATURE.sig im extrahierten Paket gegen den bekannten Publisher-Key.
+// destDir: extrahiertes Paket-Verzeichnis
+// trustedKeyPath: Pfad zur trusted.pub Datei
+pub fn VerifySignature(destDir: int64, trustedKeyPath: int64): int64 {
+    var dLen: int64 := StrLen(destDir);
+
+    var sigPath: int64 := alloc(dLen + 20);
+    StrCpyN(sigPath, destDir, dLen);
+    StrCpyN(sigPath + dLen, "/SIGNATURE.sig", 14);
+    poke8(sigPath + dLen + 14, 0);
+
+    if (FileExists(sigPath) == 0) {
+        free(sigPath);
+        return ERR_VERIFY_NO_SIG;
+    }
+
+    // Signatur einlesen: 64 Bytes (r: 32 Bytes + s: 32 Bytes)
+    var sigData: int64 := FileReadAll(sigPath);
+    var sigSize: int64 := FileSize(sigPath);
+    free(sigPath);
+
+    if ((sigData == 0) | (sigSize < 64)) {
+        if (sigData != 0) { free(sigData); }
+        return ERR_VERIFY_SIG;
+    }
+
+    // Files.sha256 als Hash-Input nehmen
+    var hashInput: int64 := alloc(dLen + 16);
+    StrCpyN(hashInput, destDir, dLen);
+    StrCpyN(hashInput + dLen, "/FILES.sha256", 13);
+    poke8(hashInput + dLen + 13, 0);
+
+    var hashData: int64 := FileReadAll(hashInput);
+    var hashSize: int64 := FileSize(hashInput);
+    free(hashInput);
+
+    if (hashData == 0) { free(sigData); return ERR_VERIFY_IO; }
+
+    var msgHash: int64 := alloc(32);
+    SHA256(hashData, hashSize, msgHash);
+    free(hashData);
+
+    // Publisher-Key laden
+    var pubx: int64 := alloc(32);
+    var puby: int64 := alloc(32);
+    if (loadTrustedKey(trustedKeyPath, pubx, puby) == 0) {
+        free(sigData); free(msgHash); free(pubx); free(puby);
+        return ERR_VERIFY_NO_SIG;
+    }
+
+    // ECDSA-Verifikation
+    var r: int64 := sigData;
+    var s: int64 := sigData + 32;
+    var ok: int64 := ECDSAVerify(msgHash, pubx, puby, r, s);
+
+    free(sigData); free(msgHash); free(pubx); free(puby);
+
+    if (ok != 1) { return ERR_VERIFY_SIG; }
+    return ERR_VERIFY_OK;
+}
+
+// Signiert ein Paket: SHA256(FILES.sha256) → ECDSA-Signatur → SIGNATURE.sig
+// sourceDir: Paket-Verzeichnis (enthält bereits FILES.sha256)
+// privKey: 32-Byte privater Schlüssel
+pub fn SignPackage(sourceDir: int64, privKey: int64): int64 {
+    var sLen: int64 := StrLen(sourceDir);
+
+    var checksumPath: int64 := alloc(sLen + 16);
+    StrCpyN(checksumPath, sourceDir, sLen);
+    StrCpyN(checksumPath + sLen, "/FILES.sha256", 13);
+    poke8(checksumPath + sLen + 13, 0);
+
+    var data: int64 := FileReadAll(checksumPath);
+    var size: int64 := FileSize(checksumPath);
+    free(checksumPath);
+    if (data == 0) { return ERR_VERIFY_IO; }
+
+    var msgHash: int64 := alloc(32);
+    SHA256(data, size, msgHash);
+    free(data);
+
+    var r: int64 := alloc(32);
+    var s: int64 := alloc(32);
+    var rc: int64 := ECDSASign(msgHash, privKey, r, s);
+    free(msgHash);
+
+    if (rc != 0) { free(r); free(s); return ERR_VERIFY_SIG; }
+
+    // Signatur schreiben: r || s (64 Bytes)
+    var sigPath: int64 := alloc(sLen + 20);
+    StrCpyN(sigPath, sourceDir, sLen);
+    StrCpyN(sigPath + sLen, "/SIGNATURE.sig", 14);
+    poke8(sigPath + sLen + 14, 0);
+
+    var sigBuf: int64 := alloc(64);
+    StrCpyN(sigBuf, r, 32);
+    StrCpyN(sigBuf + 32, s, 32);
+    var written: int64 := FileWriteAll(sigPath, sigBuf, 64);
+
+    free(r); free(s); free(sigBuf); free(sigPath);
+    if (written == 0) { return ERR_VERIFY_IO; }
+    return ERR_VERIFY_OK;
+}
