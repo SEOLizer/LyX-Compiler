@@ -1,0 +1,84 @@
+// tests/cf_demo2_workers_kv_r2.lyx — Demo 2: Worker + KV + R2 Edge App
+// WP-CF-16
+
+unit tests.cf_demo2_workers_kv_r2;
+
+import std.cloud.cf.credentials;
+import std.cloud.cf.transport;
+import std.cloud.cf.zones;
+import std.cloud.cf.workers;
+import std.cloud.cf.kv;
+import std.cloud.cf.r2;
+import std.io;
+import std.alloc;
+
+pub fn main(argc: int64, argv: int64): int64 {
+    var creds: CFCredentials := CFCredentialsFromEnv();
+    var c: CFClient;
+    c.authType:=creds.authType; c.token:=creds.token; c.apiKey:=creds.apiKey;
+    c.email:=creds.email; c.accountId:=creds.accountId; c.zoneId:=creds.zoneId;
+    c.timeout:=30000; c.maxRetries:=3;
+
+    if (c.authType == 0) {
+        PrintLn("Error: set CF_AUTH_TOKEN and CF_ACCOUNT_ID"c); return 1;
+    }
+
+    var accountId: pchar := creds.accountId as pchar;
+    PrintLn("=== CF Demo 2: Worker + KV + R2 ==="c);
+
+    // ── KV Namespace ──────────────────────────────────────────────────────────
+    Print("Creating KV namespace 'app-cache'..."c);
+    var ns: CFKVNamespace := KVNamespaceCreate(c, accountId, "app-cache"c);
+    if (ns.id == 0) { PrintLn(" FAILED"c); return 1; }
+    PrintLn(" OK"c);
+    Print("NS ID: "c); PrintLn(ns.id as pchar);
+
+    var config: pchar := "{\"maxItems\":100}"c;
+    var cl: int64 := StrLen(config);
+    Print("Storing config in KV..."c);
+    var kvOk: int64 := KVPut(c, accountId, ns.id as pchar, "config"c, config as int64, cl);
+    if (kvOk == 1) { PrintLn(" OK"c); } else { PrintLn(" FAILED"c); }
+
+    // ── R2 Bucket ─────────────────────────────────────────────────────────────
+    Print("Creating R2 bucket 'app-assets'..."c);
+    var r2: R2Conn := R2Connect(c, accountId);
+    var bucketOk: int64 := R2BucketCreate(c, accountId, "app-assets"c, "WEUR"c);
+    if (bucketOk == 1) { PrintLn(" OK"c); } else { PrintLn(" (may already exist)"c); }
+
+    var html: pchar := "<html><body><h1>Hello from Lyx!</h1></body></html>"c;
+    var htmlLen: int64 := StrLen(html);
+    Print("Uploading index.html to R2..."c);
+    var upOk: int64 := R2Upload(r2, "app-assets"c, "index.html"c,
+        html as int64, htmlLen, "text/html"c);
+    if (upOk == 1) { PrintLn(" OK"c); } else { PrintLn(" FAILED"c); }
+
+    // ── Worker Script ─────────────────────────────────────────────────────────
+    var script: pchar := "export default { async fetch(req, env) { const config = await env.CACHE.get('config'); return new Response('Config: ' + config, {headers:{'content-type':'text/plain'}}); } }"c;
+    var sl: int64 := StrLen(script);
+
+    // Build bindings JSON with KV namespace
+    var bindings: int64 := alloc(256);
+    var bo: int64 := cftAppend(bindings, 0, "[{\"type\":\"kv_namespace\",\"name\":\"CACHE\",\"namespace_id\":\""c);
+    bo := cftAppend(bindings, bo, ns.id as pchar);
+    bo := cftAppend(bindings, bo, "\"}]"c); poke8(bindings+bo, 0);
+
+    Print("Deploying Worker 'edge-app'..."c);
+    var wOk: int64 := WorkerDeployWithBindings(c, accountId, "edge-app"c,
+        script as int64, sl, bindings, bo);
+    free(bindings, 256);
+    if (wOk == 1) { PrintLn(" OK"c); } else { PrintLn(" FAILED"c); }
+
+    // ── Route ─────────────────────────────────────────────────────────────────
+    var zoneId: pchar := creds.zoneId as pchar;
+    if (zoneId != 0 as pchar) {
+        Print("Creating worker route..."c);
+        var route: CFWorkerRoute := WorkerRouteCreate(c, zoneId,
+            "example.com/app/*"c, "edge-app"c);
+        if (route.id != 0) { PrintLn(" OK"c); } else { PrintLn(" FAILED"c); }
+        CFWorkerRouteFree(route);
+    }
+
+    CFKVNamespaceFree(ns);
+    PrintLn("Done."c);
+    return 0;
+}

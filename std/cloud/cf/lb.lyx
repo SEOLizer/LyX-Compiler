@@ -1,0 +1,352 @@
+// std/cloud/cf/lb.lyx — Cloudflare Load Balancing (Health Checks, Pools, LBs)
+// WP-CF-06
+
+unit std.cloud.cf.lb;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFHealthCheck = struct {
+    id:             int64;  // pchar
+    name:           int64;  // pchar
+    hcType:         int64;  // pchar: "http","https","tcp"
+    address:        int64;  // pchar
+    port:           int64;
+    path:           int64;  // pchar
+    interval:       int64;
+    timeout:        int64;
+    retries:        int64;
+    expectedCodes:  int64;  // pchar
+    method:         int64;  // pchar
+    created:        int64;  // pchar
+};
+
+pub type CFOrigin = struct {
+    name:    int64;  // pchar
+    address: int64;  // pchar
+    enabled: int64;
+    weight:  int64;  // stored as int64 milliunits (1.0 = 1000)
+    header:  int64;  // pchar — host header override
+};
+
+pub type CFPool = struct {
+    id:               int64;  // pchar
+    name:             int64;  // pchar
+    description:      int64;  // pchar
+    enabled:          int64;
+    originsJson:      int64;  // pchar — raw origins JSON
+    minimumOrigins:   int64;
+    monitor:          int64;  // pchar — health check ID
+    notificationEmail:int64;  // pchar
+};
+
+pub type CFLoadBalancer = struct {
+    id:              int64;  // pchar
+    name:            int64;  // pchar
+    defaultPoolsJson:int64;  // pchar — JSON array of pool IDs
+    fallbackPool:    int64;  // pchar
+    steering:        int64;  // pchar
+    sessionAffinity: int64;  // pchar
+    ttl:             int64;
+    proxied:         int64;
+    enabled:         int64;
+};
+
+fn lbFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFHealthCheckFree(h: CFHealthCheck) {
+    lbFreeIfSet(h.id); lbFreeIfSet(h.name); lbFreeIfSet(h.hcType);
+    lbFreeIfSet(h.address); lbFreeIfSet(h.path); lbFreeIfSet(h.expectedCodes);
+    lbFreeIfSet(h.method); lbFreeIfSet(h.created);
+}
+
+pub fn CFPoolFree(p: CFPool) {
+    lbFreeIfSet(p.id); lbFreeIfSet(p.name); lbFreeIfSet(p.description);
+    lbFreeIfSet(p.originsJson); lbFreeIfSet(p.monitor);
+    lbFreeIfSet(p.notificationEmail);
+}
+
+pub fn CFLoadBalancerFree(lb: CFLoadBalancer) {
+    lbFreeIfSet(lb.id); lbFreeIfSet(lb.name); lbFreeIfSet(lb.defaultPoolsJson);
+    lbFreeIfSet(lb.fallbackPool); lbFreeIfSet(lb.steering); lbFreeIfSet(lb.sessionAffinity);
+}
+
+fn parseHC(json: int64, jl: int64): CFHealthCheck {
+    var h: CFHealthCheck;
+    h.id             := cfExtractValue(json, jl, "id"c);
+    h.name           := cfExtractValue(json, jl, "name"c);
+    h.hcType         := cfExtractValue(json, jl, "type"c);
+    h.address        := cfExtractValue(json, jl, "address"c);
+    h.port           := cfExtractInt(json, jl, "port"c);
+    h.path           := cfExtractValue(json, jl, "path"c);
+    h.interval       := cfExtractInt(json, jl, "interval"c);
+    h.timeout        := cfExtractInt(json, jl, "timeout"c);
+    h.retries        := cfExtractInt(json, jl, "retries"c);
+    h.expectedCodes  := cfExtractValue(json, jl, "expected_codes"c);
+    h.method         := cfExtractValue(json, jl, "method"c);
+    h.created        := cfExtractValue(json, jl, "created_on"c);
+    return h;
+}
+
+fn parsePool(json: int64, jl: int64): CFPool {
+    var p: CFPool;
+    p.id               := cfExtractValue(json, jl, "id"c);
+    p.name             := cfExtractValue(json, jl, "name"c);
+    p.description      := cfExtractValue(json, jl, "description"c);
+    p.enabled          := cfExtractBool(json, jl, "enabled"c);
+    p.originsJson      := cfExtractValue(json, jl, "origins"c);
+    p.minimumOrigins   := cfExtractInt(json, jl, "minimum_origins"c);
+    p.monitor          := cfExtractValue(json, jl, "monitor"c);
+    p.notificationEmail:= cfExtractValue(json, jl, "notification_email"c);
+    return p;
+}
+
+fn parseLB(json: int64, jl: int64): CFLoadBalancer {
+    var lb: CFLoadBalancer;
+    lb.id               := cfExtractValue(json, jl, "id"c);
+    lb.name             := cfExtractValue(json, jl, "name"c);
+    lb.defaultPoolsJson := cfExtractValue(json, jl, "default_pools"c);
+    lb.fallbackPool     := cfExtractValue(json, jl, "fallback_pool"c);
+    lb.steering         := cfExtractValue(json, jl, "steering_policy"c);
+    lb.sessionAffinity  := cfExtractValue(json, jl, "session_affinity"c);
+    lb.ttl              := cfExtractInt(json, jl, "ttl"c);
+    lb.proxied          := cfExtractBool(json, jl, "proxied"c);
+    lb.enabled          := cfExtractBool(json, jl, "enabled"c);
+    return lb;
+}
+
+// Health Checks (account-level)
+
+pub fn HealthCheckCreate(c: CFClient, accountId: pchar,
+                          name: pchar, hcType: pchar, address: pchar,
+                          path: pchar, interval: int64, expectedCodes: pchar): CFHealthCheck {
+    var apiPath: int64 := alloc(256);
+    var po: int64 := cftAppend(apiPath, 0, "/accounts/"c);
+    po := cftAppend(apiPath, po, accountId);
+    po := cftAppend(apiPath, po, "/load_balancers/monitors"c); poke8(apiPath+po, 0);
+    var jname:  int64 := cfJsonEscape(name);
+    var jtype:  int64 := cfJsonEscape(hcType);
+    var jaddr:  int64 := cfJsonEscape(address);
+    var jpath:  int64 := cfJsonEscape(path);
+    var jcodes: int64 := cfJsonEscape(expectedCodes);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"type\":\""c);
+    off := cftAppend(body, off, jtype as pchar);
+    off := cftAppend(body, off, "\",\"address\":\""c);
+    off := cftAppend(body, off, jaddr as pchar);
+    off := cftAppend(body, off, "\",\"path\":\""c);
+    off := cftAppend(body, off, jpath as pchar);
+    off := cftAppend(body, off, "\",\"interval\":"c);
+    off := cftAppendInt(body, off, interval);
+    off := cftAppend(body, off, ",\"timeout\":5,\"retries\":2,\"expected_codes\":\""c);
+    off := cftAppend(body, off, jcodes as pchar);
+    off := cftAppend(body, off, "\",\"method\":\"GET\"}"c); poke8(body+off, 0);
+    lbFreeIfSet(jname);lbFreeIfSet(jtype);lbFreeIfSet(jaddr);
+    lbFreeIfSet(jpath);lbFreeIfSet(jcodes);
+    var r: CFResponse := CFPost(c, apiPath as pchar, body, off);
+    free(apiPath, 256); free(body, 512);
+    var h: CFHealthCheck;
+    h.id:=0; h.name:=0; h.hcType:=0; h.address:=0; h.port:=80;
+    h.path:=0; h.interval:=60; h.timeout:=5; h.retries:=2;
+    h.expectedCodes:=0; h.method:=0; h.created:=0;
+    if (r.success == 1 && r.result != 0) { h = parseHC(r.result, r.resultLen); }
+    CFResponseFree(r); return h;
+}
+
+pub fn HealthCheckDelete(c: CFClient, accountId: pchar, id: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/monitors/"c);
+    po := cftAppend(path, po, id); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn HealthCheckList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/monitors"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+// Origin Pools
+
+pub fn PoolCreate(c: CFClient, accountId: pchar,
+                  name: pchar, description: pchar,
+                  originsJson: pchar, originsLen: int64,
+                  monitorId: pchar, minOrigins: int64): CFPool {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/pools"c); poke8(path+po, 0);
+    var jname: int64 := cfJsonEscape(name);
+    var jdesc: int64 := cfJsonEscape(description);
+    var body: int64 := alloc(originsLen + 512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"description\":\""c);
+    off := cftAppend(body, off, jdesc as pchar);
+    off := cftAppend(body, off, "\",\"enabled\":true,\"origins\":"c);
+    off := cftAppendN(body, off, originsJson as int64, originsLen);
+    off := cftAppend(body, off, ",\"minimum_origins\":"c);
+    off := cftAppendInt(body, off, minOrigins);
+    if (monitorId != 0 as pchar && StrLen(monitorId) > 0) {
+        off := cftAppend(body, off, ",\"monitor\":\""c);
+        off := cftAppend(body, off, monitorId);
+        off := cftAppend(body, off, "\""c);
+    }
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    lbFreeIfSet(jname); lbFreeIfSet(jdesc);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, originsLen+512);
+    var p: CFPool;
+    p.id:=0; p.name:=0; p.description:=0; p.enabled:=0;
+    p.originsJson:=0; p.minimumOrigins:=0; p.monitor:=0; p.notificationEmail:=0;
+    if (r.success == 1 && r.result != 0) { p = parsePool(r.result, r.resultLen); }
+    CFResponseFree(r); return p;
+}
+
+pub fn PoolDelete(c: CFClient, accountId: pchar, poolId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/pools/"c);
+    po := cftAppend(path, po, poolId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn PoolGet(c: CFClient, accountId: pchar, poolId: pchar): CFPool {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/pools/"c);
+    po := cftAppend(path, po, poolId); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var p: CFPool;
+    p.id:=0; p.name:=0; p.description:=0; p.enabled:=0;
+    p.originsJson:=0; p.minimumOrigins:=0; p.monitor:=0; p.notificationEmail:=0;
+    if (r.success == 1 && r.result != 0) { p = parsePool(r.result, r.resultLen); }
+    CFResponseFree(r); return p;
+}
+
+pub fn PoolList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/pools"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn PoolHealthGet(c: CFClient, accountId: pchar, poolId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/load_balancers/pools/"c);
+    po := cftAppend(path, po, poolId);
+    po := cftAppend(path, po, "/health"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Load Balancers
+
+pub fn LBCreate(c: CFClient, zoneId: pchar,
+                name: pchar, defaultPoolsJson: pchar, poolsLen: int64,
+                fallbackPool: pchar, steering: pchar, proxied: int64): CFLoadBalancer {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/load_balancers"c); poke8(path+po, 0);
+    var jname:     int64 := cfJsonEscape(name);
+    var jfallback: int64 := cfJsonEscape(fallbackPool);
+    var jsteering: int64 := cfJsonEscape(steering);
+    var body: int64 := alloc(poolsLen + 512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"default_pools\":"c);
+    off := cftAppendN(body, off, defaultPoolsJson as int64, poolsLen);
+    off := cftAppend(body, off, ",\"fallback_pool\":\""c);
+    off := cftAppend(body, off, jfallback as pchar);
+    off := cftAppend(body, off, "\",\"steering_policy\":\""c);
+    off := cftAppend(body, off, jsteering as pchar);
+    off := cftAppend(body, off, "\",\"session_affinity\":\"none\",\"proxied\":"c);
+    if (proxied==1){off:=cftAppend(body,off,"true"c);}else{off:=cftAppend(body,off,"false"c);}
+    off := cftAppend(body, off, ",\"enabled\":true}"c); poke8(body+off, 0);
+    lbFreeIfSet(jname); lbFreeIfSet(jfallback); lbFreeIfSet(jsteering);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, poolsLen+512);
+    var lb: CFLoadBalancer;
+    lb.id:=0; lb.name:=0; lb.defaultPoolsJson:=0; lb.fallbackPool:=0;
+    lb.steering:=0; lb.sessionAffinity:=0; lb.ttl:=0; lb.proxied:=0; lb.enabled:=0;
+    if (r.success == 1 && r.result != 0) { lb = parseLB(r.result, r.resultLen); }
+    CFResponseFree(r); return lb;
+}
+
+pub fn LBDelete(c: CFClient, zoneId: pchar, lbId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/load_balancers/"c);
+    po := cftAppend(path, po, lbId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn LBGet(c: CFClient, zoneId: pchar, lbId: pchar): CFLoadBalancer {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/load_balancers/"c);
+    po := cftAppend(path, po, lbId); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var lb: CFLoadBalancer;
+    lb.id:=0; lb.name:=0; lb.defaultPoolsJson:=0; lb.fallbackPool:=0;
+    lb.steering:=0; lb.sessionAffinity:=0; lb.ttl:=0; lb.proxied:=0; lb.enabled:=0;
+    if (r.success == 1 && r.result != 0) { lb = parseLB(r.result, r.resultLen); }
+    CFResponseFree(r); return lb;
+}
+
+pub fn LBList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/load_balancers"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn LBHealthGet(c: CFClient, zoneId: pchar, lbId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/load_balancers/"c);
+    po := cftAppend(path, po, lbId);
+    po := cftAppend(path, po, "/status"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
