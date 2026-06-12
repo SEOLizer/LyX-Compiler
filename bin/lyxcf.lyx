@@ -1,0 +1,902 @@
+// bin/lyxcf.lyx — Cloudflare CLI (lyxcf)
+// WP-CF-15: Full CLI dispatcher for all CF SDK modules
+
+unit bin.lyxcf;
+
+import std.cloud.cf.credentials;
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.cloud.cf.zones;
+import std.cloud.cf.dns;
+import std.cloud.cf.cache;
+import std.cloud.cf.waf;
+import std.cloud.cf.lb;
+import std.cloud.cf.workers;
+import std.cloud.cf.kv;
+import std.cloud.cf.r2;
+import std.cloud.cf.d1;
+import std.cloud.cf.pages;
+import std.cloud.cf.tunnel;
+import std.cloud.cf.analytics;
+import std.cloud.cf.email;
+import std.io;
+import std.alloc;
+
+extern fn getenv(name: pchar): pchar;
+extern fn exit(code: int64): int64;
+
+fn streq(a: pchar, b: pchar): int64 {
+    var i: int64 := 0;
+    while ((peek8(a+i)&0xFF) != 0 && (peek8(b+i)&0xFF) != 0) {
+        if ((peek8(a+i)&0xFF) != (peek8(b+i)&0xFF)) { return 0; }
+        i := i + 1;
+    }
+    if ((peek8(a+i)&0xFF) != (peek8(b+i)&0xFF)) { return 0; }
+    return 1;
+}
+
+fn argEq(argc: int64, argv: int64, idx: int64, s: pchar): int64 {
+    if (idx >= argc) { return 0; }
+    var p: pchar := peek64(argv + idx * 8) as pchar;
+    return streq(p, s);
+}
+
+fn argGet(argc: int64, argv: int64, idx: int64): pchar {
+    if (idx >= argc) { return ""c; }
+    return peek64(argv + idx * 8) as pchar;
+}
+
+fn printUsage() {
+    PrintLn("lyxcf — Cloudflare CLI"c);
+    PrintLn(""c);
+    PrintLn("Usage: lyxcf <command> [subcommand] [args...]"c);
+    PrintLn(""c);
+    PrintLn("Commands:"c);
+    PrintLn("  auth     check | token"c);
+    PrintLn("  zone     list | get | create | delete | pause | unpause | settings"c);
+    PrintLn("  dns      list | get | create | update | delete | upsert | import | export"c);
+    PrintLn("  cache    purge-all | purge | purge-tags | rules"c);
+    PrintLn("  firewall rules | block-ip | block-country | allow-ip | rate-limits"c);
+    PrintLn("  lb       pools | load-balancers | health"c);
+    PrintLn("  workers  scripts | routes | kv | secrets | cron"c);
+    PrintLn("  r2       buckets | objects"c);
+    PrintLn("  d1       databases | execute | query | tables | schema"c);
+    PrintLn("  pages    projects | deployments | domains | env"c);
+    PrintLn("  tunnel   list | create | delete | token | info | route | dns-route"c);
+    PrintLn("  analytics dashboard | top-ips | top-urls | firewall-events"c);
+    PrintLn("  email    status | enable | rules | catch-all | destinations"c);
+    PrintLn(""c);
+    PrintLn("Auth via env: CF_AUTH_TOKEN=<token> or CF_AUTH_KEY=<key> CF_AUTH_EMAIL=<email>"c);
+    PrintLn("              CF_ACCOUNT_ID=<id>  CF_ZONE_ID=<id>"c);
+}
+
+fn clientFromEnv(): CFClient {
+    var creds: CFCredentials := CFCredentialsFromEnv();
+    var c: CFClient;
+    c.authType   := creds.authType;
+    c.token      := creds.token;
+    c.apiKey     := creds.apiKey;
+    c.email      := creds.email;
+    c.accountId  := creds.accountId;
+    c.zoneId     := creds.zoneId;
+    c.timeout    := 30000;
+    c.maxRetries := 3;
+    return c;
+}
+
+fn getAccountId(c: CFClient): pchar {
+    var env: pchar := getenv("CF_ACCOUNT_ID"c);
+    if (env != 0 as pchar) { return env; }
+    return c.accountId as pchar;
+}
+
+fn getZoneId(c: CFClient): pchar {
+    var env: pchar := getenv("CF_ZONE_ID"c);
+    if (env != 0 as pchar) { return env; }
+    return c.zoneId as pchar;
+}
+
+fn printJson(json: int64) {
+    if (json == 0) { PrintLn("[no result]"c); return; }
+    PrintLn(json as pchar);
+    free(json, StrLen(json as pchar)+1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdAuth(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    if (streq(sub, "check"c) == 1 || streq(sub, ""c) == 1) {
+        var ok: int64 := CFValidateToken(c);
+        if (ok == 1) { PrintLn("Token valid."c); }
+        else         { PrintLn("Token INVALID or network error."c); }
+        return;
+    }
+    if (streq(sub, "token"c) == 1) {
+        var tok: pchar := c.token as pchar;
+        if (tok != 0 as pchar) { PrintLn(tok); }
+        else { PrintLn("[no token set]"c); }
+        return;
+    }
+    PrintLn("auth: unknown subcommand"c); PrintLn("  check | token"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// zone
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdZone(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "list"c) == 1) {
+        var j: int64 := ZoneList(c);
+        printJson(j); return;
+    }
+    if (streq(sub, "get"c) == 1) {
+        var domain: pchar := argGet(argc, argv, 3);
+        if (streq(domain, ""c) == 1) { PrintLn("usage: zone get <domain|id>"c); return; }
+        var z: CFZone := ZoneGetByDomain(c, domain);
+        if (z.id != 0) { PrintLn(z.id as pchar); }
+        else { PrintLn("[not found]"c); }
+        CFZoneFree(z); return;
+    }
+    if (streq(sub, "create"c) == 1) {
+        var domain: pchar := argGet(argc, argv, 3);
+        var z: CFZone := ZoneCreate(c, accountId, domain, 0 as pchar);
+        if (z.id != 0) { Print("Created zone: "c); PrintLn(z.id as pchar); }
+        else { PrintLn("Failed to create zone"c); }
+        CFZoneFree(z); return;
+    }
+    if (streq(sub, "delete"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ok: int64 := ZoneDelete(c, zoneId);
+        if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "pause"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ok: int64 := ZonePause(c, zoneId);
+        if (ok == 1) { PrintLn("Paused."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "unpause"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ok: int64 := ZoneUnpause(c, zoneId);
+        if (ok == 1) { PrintLn("Unpaused."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "settings"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var j: int64 := ZoneSettingsGetAll(c, zoneId);
+        printJson(j); return;
+    }
+    if (streq(sub, "purge"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ok: int64 := CachePurgeAll(c, zoneId);
+        if (ok == 1) { PrintLn("Cache purged."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    PrintLn("zone: unknown subcommand"c);
+    PrintLn("  list | get <domain> | create <domain> | delete <id>"c);
+    PrintLn("  pause <id> | unpause <id> | settings <id> | purge <id>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dns
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdDNS(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+
+    if (streq(sub, "list"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := DNSRecordList(c, zoneId);
+        printJson(j); return;
+    }
+    if (streq(sub, "get"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var recId: pchar  := argGet(argc, argv, 4);
+        var rec: CFDNSRecord := DNSRecordGet(c, zoneId, recId);
+        if (rec.id != 0) { Print(rec.name as pchar); Print(" "c); PrintLn(rec.content as pchar); }
+        else { PrintLn("[not found]"c); }
+        CFDNSRecordFree(rec); return;
+    }
+    if (streq(sub, "create"c) == 1) {
+        var zoneId:  pchar := argGet(argc, argv, 3);
+        var recType: pchar := argGet(argc, argv, 4);
+        var name:    pchar := argGet(argc, argv, 5);
+        var content: pchar := argGet(argc, argv, 6);
+        var rec: CFDNSRecord := DNSRecordCreate(c, zoneId, recType, name, content, 1, 1);
+        if (rec.id != 0) { Print("Created: "c); PrintLn(rec.id as pchar); }
+        else { PrintLn("Failed."c); }
+        CFDNSRecordFree(rec); return;
+    }
+    if (streq(sub, "delete"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var recId:  pchar := argGet(argc, argv, 4);
+        var ok: int64 := DNSRecordDelete(c, zoneId, recId);
+        if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "upsert"c) == 1) {
+        var zoneId:  pchar := argGet(argc, argv, 3);
+        var recType: pchar := argGet(argc, argv, 4);
+        var name:    pchar := argGet(argc, argv, 5);
+        var content: pchar := argGet(argc, argv, 6);
+        var rec: CFDNSRecord := DNSRecordUpsert(c, zoneId, recType, name, content, 1, 1);
+        if (rec.id != 0) { Print("Upserted: "c); PrintLn(rec.id as pchar); }
+        else { PrintLn("Failed."c); }
+        CFDNSRecordFree(rec); return;
+    }
+    if (streq(sub, "export"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var j: int64 := DNSZoneExport(c, zoneId);
+        printJson(j); return;
+    }
+    PrintLn("dns: unknown subcommand"c);
+    PrintLn("  list <zoneId> | get <zoneId> <recId>"c);
+    PrintLn("  create <zoneId> <TYPE> <name> <content>"c);
+    PrintLn("  delete <zoneId> <recId> | upsert <zoneId> <TYPE> <name> <content>"c);
+    PrintLn("  export <zoneId>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdCache(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+
+    if (streq(sub, "purge-all"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var ok: int64 := CachePurgeAll(c, zoneId);
+        if (ok == 1) { PrintLn("Cache purged."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "purge"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var url:    pchar := argGet(argc, argv, 4);
+        var urls: int64 := alloc(8); poke64(urls, url as int64);
+        var ok: int64 := CachePurgeFiles(c, zoneId, urls, 1);
+        free(urls, 8);
+        if (ok == 1) { PrintLn("Purged."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "purge-tags"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var tag:    pchar := argGet(argc, argv, 4);
+        var tags: int64 := alloc(8); poke64(tags, tag as int64);
+        var ok: int64 := CachePurgeTags(c, zoneId, tags, 1);
+        free(tags, 8);
+        if (ok == 1) { PrintLn("Tags purged."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "rules"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := CacheRuleList(c, zoneId);
+        printJson(j); return;
+    }
+    PrintLn("cache: purge-all <zoneId> | purge <zoneId> <url> | purge-tags <zoneId> <tag> | rules <zoneId>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// firewall
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdFirewall(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+
+    if (streq(sub, "rules"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := FirewallRuleList(c, zoneId);
+        printJson(j); return;
+    }
+    if (streq(sub, "block-ip"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ip:     pchar := argGet(argc, argv, 4);
+        var ok: int64 := FirewallBlockIP(c, zoneId, ip, "Blocked by lyxcf"c);
+        if (ok == 1) { PrintLn("IP blocked."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "allow-ip"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        var ip:     pchar := argGet(argc, argv, 4);
+        var ok: int64 := FirewallAllowIP(c, zoneId, ip, "Allowed by lyxcf"c);
+        if (ok == 1) { PrintLn("IP allowed."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "block-country"c) == 1) {
+        var zoneId:   pchar := argGet(argc, argv, 3);
+        var countryCode: pchar := argGet(argc, argv, 4);
+        var countries: int64 := alloc(8); poke64(countries, countryCode as int64);
+        var ok: int64 := FirewallBlockCountry(c, zoneId, countries, 1, "Country block"c);
+        free(countries, 8);
+        if (ok == 1) { PrintLn("Country blocked."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "rate-limits"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := RateLimitList(c, zoneId);
+        printJson(j); return;
+    }
+    PrintLn("firewall: rules | block-ip | allow-ip | block-country | rate-limits"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// workers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdWorkers(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "scripts"c) == 1) {
+        var j: int64 := WorkerList(c, accountId);
+        printJson(j); return;
+    }
+    if (streq(sub, "routes"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := WorkerRouteList(c, zoneId);
+        printJson(j); return;
+    }
+    if (streq(sub, "deploy"c) == 1) {
+        var name:   pchar := argGet(argc, argv, 3);
+        var script: pchar := argGet(argc, argv, 4);
+        var sl: int64 := StrLen(script);
+        var ok: int64 := WorkerDeploy(c, accountId, name, script as int64, sl);
+        if (ok == 1) { PrintLn("Deployed."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "delete"c) == 1) {
+        var name: pchar := argGet(argc, argv, 3);
+        var ok: int64 := WorkerDelete(c, accountId, name);
+        if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "kv"c) == 1) {
+        var ksub: pchar := argGet(argc, argv, 3);
+        if (streq(ksub, "list"c) == 1) {
+            var j: int64 := KVNamespaceList(c, accountId);
+            printJson(j); return;
+        }
+        if (streq(ksub, "get"c) == 1) {
+            var nsId: pchar := argGet(argc, argv, 4);
+            var key:  pchar := argGet(argc, argv, 5);
+            var val: int64 := KVGet(c, accountId, nsId, key);
+            printJson(val); return;
+        }
+        if (streq(ksub, "put"c) == 1) {
+            var nsId:  pchar := argGet(argc, argv, 4);
+            var key:   pchar := argGet(argc, argv, 5);
+            var value: pchar := argGet(argc, argv, 6);
+            var vl: int64 := StrLen(value);
+            var ok: int64 := KVPut(c, accountId, nsId, key, value as int64, vl);
+            if (ok == 1) { PrintLn("Set."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        if (streq(ksub, "delete"c) == 1) {
+            var nsId: pchar := argGet(argc, argv, 4);
+            var key:  pchar := argGet(argc, argv, 5);
+            var ok: int64 := KVDelete(c, accountId, nsId, key);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("workers kv: list | get <nsId> <key> | put <nsId> <key> <val> | delete <nsId> <key>"c);
+        return;
+    }
+    if (streq(sub, "secrets"c) == 1) {
+        var name:  pchar := argGet(argc, argv, 3);
+        var ssub:  pchar := argGet(argc, argv, 4);
+        if (streq(ssub, "list"c) == 1) {
+            var j: int64 := WorkerSecretList(c, accountId, name);
+            printJson(j); return;
+        }
+        if (streq(ssub, "set"c) == 1) {
+            var skey: pchar := argGet(argc, argv, 5);
+            var sval: pchar := argGet(argc, argv, 6);
+            var ok: int64 := WorkerSecretSet(c, accountId, name, skey, sval);
+            if (ok == 1) { PrintLn("Secret set."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        if (streq(ssub, "delete"c) == 1) {
+            var skey: pchar := argGet(argc, argv, 5);
+            var ok: int64 := WorkerSecretDelete(c, accountId, name, skey);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("workers secrets <name>: list | set <key> <val> | delete <key>"c);
+        return;
+    }
+    if (streq(sub, "cron"c) == 1) {
+        var name: pchar := argGet(argc, argv, 3);
+        var j: int64 := WorkerCronList(c, accountId, name);
+        printJson(j); return;
+    }
+    PrintLn("workers: scripts | routes [zoneId] | deploy <name> <script>"c);
+    PrintLn("         delete <name> | kv ... | secrets <name> ... | cron <name>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// r2
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdR2(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "buckets"c) == 1) {
+        var bsub: pchar := argGet(argc, argv, 3);
+        if (streq(bsub, "list"c) == 1 || streq(bsub, ""c) == 1) {
+            var j: int64 := R2BucketList(c, accountId);
+            printJson(j); return;
+        }
+        if (streq(bsub, "create"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var ok: int64 := R2BucketCreate(c, accountId, name, "WEUR"c);
+            if (ok == 1) { PrintLn("Bucket created."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        if (streq(bsub, "delete"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var ok: int64 := R2BucketDelete(c, accountId, name);
+            if (ok == 1) { PrintLn("Bucket deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("r2 buckets: list | create <name> | delete <name>"c);
+        return;
+    }
+    if (streq(sub, "objects"c) == 1) {
+        var osub:   pchar := argGet(argc, argv, 3);
+        var bucket: pchar := argGet(argc, argv, 4);
+        var key:    pchar := argGet(argc, argv, 5);
+
+        var r2: R2Conn := R2Connect(c, accountId);
+
+        if (streq(osub, "list"c) == 1) {
+            var j: int64 := R2List(r2, bucket, ""c, 1000);
+            printJson(j); return;
+        }
+        if (streq(osub, "get"c) == 1) {
+            var sz: int64 := 0;
+            var data: int64 := R2Download(r2, bucket, key, &sz);
+            if (data != 0) {
+                sys_write(1, data, sz);
+                sys_munmap(data, sz+1);
+            } else { PrintLn("[not found]"c); }
+            return;
+        }
+        if (streq(osub, "put"c) == 1) {
+            var local: pchar := argGet(argc, argv, 6);
+            // Read local file and upload
+            var fd: int64 := sys_open(local, 0, 0);
+            if (fd < 0) { Print("Cannot open: "c); PrintLn(local); return; }
+            var buf: int64 := alloc(4096*1024);
+            var n: int64 := sys_read(fd, buf, 4096*1024);
+            sys_close(fd);
+            if (n > 0) {
+                var ok: int64 := R2Upload(r2, bucket, key, buf, n, "application/octet-stream"c);
+                if (ok == 1) { PrintLn("Uploaded."c); } else { PrintLn("Failed."c); }
+            } else { PrintLn("Empty file or read error."c); }
+            free(buf, 4096*1024);
+            return;
+        }
+        if (streq(osub, "delete"c) == 1) {
+            var ok: int64 := R2Delete(r2, bucket, key);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("r2 objects: list <bucket> | get <bucket> <key> | put <bucket> <key> <localfile> | delete <bucket> <key>"c);
+        return;
+    }
+    PrintLn("r2: buckets | objects"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// d1
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdD1(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "databases"c) == 1) {
+        var dsub: pchar := argGet(argc, argv, 3);
+        if (streq(dsub, "list"c) == 1 || streq(dsub, ""c) == 1) {
+            var j: int64 := D1List(c, accountId);
+            printJson(j); return;
+        }
+        if (streq(dsub, "create"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var db: CFD1Database := D1Create(c, accountId, name);
+            if (db.uuid != 0) { Print("Created: "c); PrintLn(db.uuid as pchar); }
+            else { PrintLn("Failed."c); }
+            CFD1DatabaseFree(db); return;
+        }
+        if (streq(dsub, "delete"c) == 1) {
+            var dbId: pchar := argGet(argc, argv, 4);
+            var ok: int64 := D1Delete(c, accountId, dbId);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("d1 databases: list | create <name> | delete <id>"c);
+        return;
+    }
+    if (streq(sub, "execute"c) == 1) {
+        var dbId: pchar := argGet(argc, argv, 3);
+        var sql:  pchar := argGet(argc, argv, 4);
+        var r: D1Result := D1Exec(c, accountId, dbId, sql);
+        Print("rows_affected: "c);
+        var rbuf: int64 := alloc(24);
+        var rstr: int64 := int64ToStr(r.rowsAffected, rbuf);
+        PrintLn(rbuf as pchar); free(rbuf, 24);
+        if (r.results != 0) { PrintLn(r.results as pchar); }
+        D1ResultFree(r); return;
+    }
+    if (streq(sub, "query"c) == 1) {
+        var dbId: pchar := argGet(argc, argv, 3);
+        var sql:  pchar := argGet(argc, argv, 4);
+        var r: D1Result := D1Exec(c, accountId, dbId, sql);
+        if (r.results != 0) { printJson(r.results); r.results := 0; }
+        else { PrintLn("[no results]"c); }
+        D1ResultFree(r); return;
+    }
+    if (streq(sub, "tables"c) == 1) {
+        var dbId: pchar := argGet(argc, argv, 3);
+        var j: int64 := D1Tables(c, accountId, dbId);
+        printJson(j); return;
+    }
+    if (streq(sub, "schema"c) == 1) {
+        var dbId:  pchar := argGet(argc, argv, 3);
+        var table: pchar := argGet(argc, argv, 4);
+        var j: int64 := D1Schema(c, accountId, dbId, table);
+        printJson(j); return;
+    }
+    PrintLn("d1: databases | execute <dbId> <sql> | query <dbId> <sql>"c);
+    PrintLn("    tables <dbId> | schema <dbId> <table>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pages
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdPages(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "projects"c) == 1) {
+        var psub: pchar := argGet(argc, argv, 3);
+        if (streq(psub, "list"c) == 1 || streq(psub, ""c) == 1) {
+            var j: int64 := PagesProjectList(c, accountId);
+            printJson(j); return;
+        }
+        if (streq(psub, "get"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var p: CFPagesProject := PagesProjectGet(c, accountId, name);
+            if (p.name != 0) { Print("URL: https://"c); Print(p.subdomain as pchar); PrintLn(".pages.dev"c); }
+            else { PrintLn("[not found]"c); }
+            CFPagesProjectFree(p); return;
+        }
+        if (streq(psub, "delete"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var ok: int64 := PagesProjectDelete(c, accountId, name);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        if (streq(psub, "deploy"c) == 1) {
+            var name: pchar := argGet(argc, argv, 4);
+            var branch: pchar := argGet(argc, argv, 5);
+            var dep: CFPagesDeployment := PagesDeploy(c, accountId, name, branch);
+            if (dep.id != 0) { Print("Deployment: "c); PrintLn(dep.id as pchar); }
+            else { PrintLn("Failed."c); }
+            CFPagesDeploymentFree(dep); return;
+        }
+        PrintLn("pages projects: list | get <name> | delete <name> | deploy <name> [branch]"c);
+        return;
+    }
+    if (streq(sub, "deployments"c) == 1) {
+        var dsub: pchar := argGet(argc, argv, 3);
+        var name: pchar := argGet(argc, argv, 4);
+        if (streq(dsub, "list"c) == 1) {
+            var j: int64 := PagesDeploymentList(c, accountId, name);
+            printJson(j); return;
+        }
+        if (streq(dsub, "rollback"c) == 1) {
+            var depId: pchar := argGet(argc, argv, 5);
+            var ok: int64 := PagesDeploymentRollback(c, accountId, name, depId);
+            if (ok == 1) { PrintLn("Rollback triggered."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("pages deployments: list <name> | rollback <name> <deployId>"c);
+        return;
+    }
+    if (streq(sub, "domains"c) == 1) {
+        var name: pchar := argGet(argc, argv, 3);
+        var dsub: pchar := argGet(argc, argv, 4);
+        if (streq(dsub, "list"c) == 1 || streq(dsub, ""c) == 1) {
+            var j: int64 := PagesDomainList(c, accountId, name);
+            printJson(j); return;
+        }
+        if (streq(dsub, "add"c) == 1) {
+            var domain: pchar := argGet(argc, argv, 5);
+            var ok: int64 := PagesDomainAdd(c, accountId, name, domain);
+            if (ok == 1) { PrintLn("Domain added."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("pages domains <name>: list | add <domain>"c);
+        return;
+    }
+    if (streq(sub, "env"c) == 1) {
+        var name: pchar := argGet(argc, argv, 3);
+        var esub: pchar := argGet(argc, argv, 4);
+        if (streq(esub, "list"c) == 1) {
+            var j: int64 := PagesEnvList(c, accountId, name);
+            printJson(j); return;
+        }
+        if (streq(esub, "set"c) == 1) {
+            var key: pchar := argGet(argc, argv, 5);
+            var val: pchar := argGet(argc, argv, 6);
+            var ok: int64 := PagesEnvSet(c, accountId, name, key, val, 0, "production"c);
+            if (ok == 1) { PrintLn("Env set."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("pages env <name>: list | set <key> <val>"c);
+        return;
+    }
+    PrintLn("pages: projects | deployments | domains | env"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// lb
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdLB(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "pools"c) == 1) {
+        var j: int64 := PoolList(c, accountId);
+        printJson(j); return;
+    }
+    if (streq(sub, "load-balancers"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := LBList(c, zoneId);
+        printJson(j); return;
+    }
+    if (streq(sub, "health"c) == 1) {
+        var poolId: pchar := argGet(argc, argv, 3);
+        var j: int64 := PoolHealthGet(c, accountId, poolId);
+        printJson(j); return;
+    }
+    PrintLn("lb: pools | load-balancers [zoneId] | health <poolId>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tunnel
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdTunnel(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+    var accountId: pchar := getAccountId(c);
+
+    if (streq(sub, "list"c) == 1) {
+        var j: int64 := TunnelList(c, accountId);
+        printJson(j); return;
+    }
+    if (streq(sub, "create"c) == 1) {
+        var name: pchar   := argGet(argc, argv, 3);
+        var secret: pchar := argGet(argc, argv, 4);
+        if (streq(secret, ""c) == 1) { secret = "changeme-please-use-32-chars-min"c; }
+        var t: CFTunnel := TunnelCreate(c, accountId, name, secret);
+        if (t.id != 0) { Print("Created: "c); PrintLn(t.id as pchar); }
+        else { PrintLn("Failed."c); }
+        CFTunnelFree(t); return;
+    }
+    if (streq(sub, "delete"c) == 1) {
+        var id: pchar := argGet(argc, argv, 3);
+        TunnelCleanup(c, accountId, id);
+        var ok: int64 := TunnelDelete(c, accountId, id);
+        if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "token"c) == 1) {
+        var id: pchar := argGet(argc, argv, 3);
+        var tok: int64 := TunnelToken(c, accountId, id);
+        if (tok != 0) { PrintLn(tok as pchar); free(tok, StrLen(tok as pchar)+1); }
+        else { PrintLn("[failed]"c); }
+        return;
+    }
+    if (streq(sub, "info"c) == 1) {
+        var id: pchar := argGet(argc, argv, 3);
+        var cfg: int64 := TunnelConfigGet(c, accountId, id);
+        printJson(cfg);
+        var conns: int64 := TunnelConnectionList(c, accountId, id);
+        printJson(conns);
+        return;
+    }
+    if (streq(sub, "route"c) == 1) {
+        var rsub:    pchar := argGet(argc, argv, 3);
+        var tunnId:  pchar := argGet(argc, argv, 4);
+        var hostname: pchar := argGet(argc, argv, 5);
+        var service:  pchar := argGet(argc, argv, 6);
+        if (streq(rsub, "add"c) == 1) {
+            var ok: int64 := TunnelIngressAdd(c, accountId, tunnId, hostname, service, 0 as pchar);
+            if (ok == 1) { PrintLn("Route added."c); } else { PrintLn("Failed."c); }
+        } else if (streq(rsub, "list"c) == 1) {
+            var j: int64 := TunnelIngressList(c, accountId, tunnId);
+            printJson(j);
+        } else {
+            PrintLn("tunnel route: add <id> <hostname> <service> | list <id>"c);
+        }
+        return;
+    }
+    if (streq(sub, "dns-route"c) == 1) {
+        var tunnId:   pchar := argGet(argc, argv, 3);
+        var hostname: pchar := argGet(argc, argv, 4);
+        var zoneId:   pchar := getZoneId(c);
+        var ok: int64 := TunnelDNSRoute(c, zoneId, tunnId, hostname, 1);
+        if (ok == 1) { PrintLn("DNS route created."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    PrintLn("tunnel: list | create <name> [secret] | delete <id>"c);
+    PrintLn("        token <id> | info <id>"c);
+    PrintLn("        route add|list <id> [hostname] [service]"c);
+    PrintLn("        dns-route <id> <hostname>"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// analytics
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdAnalytics(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+
+    if (streq(sub, "dashboard"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := AnalyticsDashboard(c, zoneId, 0 as pchar, 0 as pchar);
+        printJson(j); return;
+    }
+    if (streq(sub, "top-ips"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := AnalyticsTop10IPs(c, zoneId, 0 as pchar);
+        printJson(j); return;
+    }
+    if (streq(sub, "top-urls"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := AnalyticsTop10URLs(c, zoneId, 0 as pchar);
+        printJson(j); return;
+    }
+    if (streq(sub, "firewall-events"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var j: int64 := AnalyticsFirewallEvents(c, zoneId, 0 as pchar, 50);
+        printJson(j); return;
+    }
+    PrintLn("analytics: dashboard | top-ips | top-urls | firewall-events [zoneId]"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// email
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cmdEmail(argc: int64, argv: int64, c: CFClient) {
+    var sub: pchar := argGet(argc, argv, 2);
+
+    if (streq(sub, "status"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var s: CFEmailSettings := EmailRoutingGet(c, zoneId);
+        if (s.enabled == 1) { PrintLn("Email routing: ENABLED"c); }
+        else { PrintLn("Email routing: DISABLED"c); }
+        CFEmailSettingsFree(s); return;
+    }
+    if (streq(sub, "enable"c) == 1) {
+        var zoneId: pchar := argGet(argc, argv, 3);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        var ok: int64 := EmailRoutingEnable(c, zoneId);
+        if (ok == 1) { PrintLn("Enabled."c); } else { PrintLn("Failed."c); }
+        return;
+    }
+    if (streq(sub, "rules"c) == 1) {
+        var rsub:   pchar := argGet(argc, argv, 3);
+        var zoneId: pchar := argGet(argc, argv, 4);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        if (streq(rsub, "list"c) == 1) {
+            var j: int64 := EmailRuleList(c, zoneId);
+            printJson(j); return;
+        }
+        if (streq(rsub, "create"c) == 1) {
+            var fromAddr: pchar := argGet(argc, argv, 5);
+            var toAddr:   pchar := argGet(argc, argv, 6);
+            var rule: CFEmailRule := EmailRuleCreate(c, zoneId,
+                "Forward rule"c, 1,
+                "literal"c, "to"c, fromAddr,
+                "forward"c, toAddr);
+            if (rule.id != 0) { Print("Rule created: "c); PrintLn(rule.id as pchar); }
+            else { PrintLn("Failed."c); }
+            CFEmailRuleFree(rule); return;
+        }
+        if (streq(rsub, "delete"c) == 1) {
+            var ruleId: pchar := argGet(argc, argv, 5);
+            var ok: int64 := EmailRuleDelete(c, zoneId, ruleId);
+            if (ok == 1) { PrintLn("Deleted."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        PrintLn("email rules: list <zoneId> | create <zoneId> <from> <to> | delete <zoneId> <ruleId>"c);
+        return;
+    }
+    if (streq(sub, "catch-all"c) == 1) {
+        var csub:   pchar := argGet(argc, argv, 3);
+        var zoneId: pchar := argGet(argc, argv, 4);
+        if (streq(zoneId, ""c) == 1) { zoneId = getZoneId(c); }
+        if (streq(csub, "set"c) == 1) {
+            var action: pchar := argGet(argc, argv, 5);
+            var dest:   pchar := argGet(argc, argv, 6);
+            var ok: int64 := EmailCatchAllSet(c, zoneId, action, dest, 1);
+            if (ok == 1) { PrintLn("Catch-all set."c); } else { PrintLn("Failed."c); }
+            return;
+        }
+        var ca: CFEmailRule := EmailCatchAllGet(c, zoneId);
+        if (ca.actions != 0) { PrintLn(ca.actions as pchar); }
+        else { PrintLn("[not configured]"c); }
+        CFEmailRuleFree(ca); return;
+    }
+    if (streq(sub, "destinations"c) == 1) {
+        var accountId: pchar := getAccountId(c);
+        var j: int64 := EmailDestinationList(c, accountId);
+        printJson(j); return;
+    }
+    PrintLn("email: status | enable | rules list|create|delete | catch-all [set] | destinations"c);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn main(argc: int64, argv: int64): int64 {
+    if (argc < 2) { printUsage(); return 1; }
+
+    var cmd: pchar := argGet(argc, argv, 1);
+
+    if (streq(cmd, "help"c) == 1 || streq(cmd, "--help"c) == 1 || streq(cmd, "-h"c) == 1) {
+        printUsage(); return 0;
+    }
+
+    var c: CFClient := clientFromEnv();
+
+    if (c.authType == 0) {
+        PrintLn("Error: no credentials found."c);
+        PrintLn("Set CF_AUTH_TOKEN or CF_AUTH_KEY + CF_AUTH_EMAIL"c);
+        return 1;
+    }
+
+    if (streq(cmd, "auth"c) == 1)      { cmdAuth(argc, argv, c); return 0; }
+    if (streq(cmd, "zone"c) == 1)      { cmdZone(argc, argv, c); return 0; }
+    if (streq(cmd, "dns"c) == 1)       { cmdDNS(argc, argv, c); return 0; }
+    if (streq(cmd, "cache"c) == 1)     { cmdCache(argc, argv, c); return 0; }
+    if (streq(cmd, "firewall"c) == 1)  { cmdFirewall(argc, argv, c); return 0; }
+    if (streq(cmd, "lb"c) == 1)        { cmdLB(argc, argv, c); return 0; }
+    if (streq(cmd, "workers"c) == 1)   { cmdWorkers(argc, argv, c); return 0; }
+    if (streq(cmd, "r2"c) == 1)        { cmdR2(argc, argv, c); return 0; }
+    if (streq(cmd, "d1"c) == 1)        { cmdD1(argc, argv, c); return 0; }
+    if (streq(cmd, "pages"c) == 1)     { cmdPages(argc, argv, c); return 0; }
+    if (streq(cmd, "tunnel"c) == 1)    { cmdTunnel(argc, argv, c); return 0; }
+    if (streq(cmd, "analytics"c) == 1) { cmdAnalytics(argc, argv, c); return 0; }
+    if (streq(cmd, "email"c) == 1)     { cmdEmail(argc, argv, c); return 0; }
+
+    Print("Unknown command: "c); PrintLn(cmd);
+    printUsage();
+    return 1;
+}

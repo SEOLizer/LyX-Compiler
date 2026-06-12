@@ -1,0 +1,437 @@
+// std/cloud/cf/dns.lyx — Cloudflare DNS record management
+// WP-CF-03
+
+unit std.cloud.cf.dns;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFDNSRecord = struct {
+    id:         int64;  // pchar
+    zoneId:     int64;  // pchar
+    zoneName:   int64;  // pchar
+    recType:    int64;  // pchar: "A","AAAA","CNAME","MX","TXT","NS","SRV","CAA","PTR"
+    name:       int64;  // pchar — FQDN
+    content:    int64;  // pchar — IP, hostname, TXT content
+    ttl:        int64;  // 1 = auto
+    proxied:    int64;  // 0/1
+    proxiable:  int64;
+    priority:   int64;  // MX/SRV/URI
+    locked:     int64;
+    created:    int64;  // pchar
+    modified:   int64;  // pchar
+    // SRV extra fields
+    srvService: int64;  // pchar
+    srvProto:   int64;  // pchar
+    srvWeight:  int64;
+    srvPort:    int64;
+    srvTarget:  int64;  // pchar
+};
+
+pub fn CFDNSRecordFree(r: CFDNSRecord) {
+    if (r.id         != 0) { free(r.id,         StrLen(r.id         as pchar)+1); }
+    if (r.zoneId     != 0) { free(r.zoneId,     StrLen(r.zoneId     as pchar)+1); }
+    if (r.zoneName   != 0) { free(r.zoneName,   StrLen(r.zoneName   as pchar)+1); }
+    if (r.recType    != 0) { free(r.recType,    StrLen(r.recType    as pchar)+1); }
+    if (r.name       != 0) { free(r.name,       StrLen(r.name       as pchar)+1); }
+    if (r.content    != 0) { free(r.content,    StrLen(r.content    as pchar)+1); }
+    if (r.created    != 0) { free(r.created,    StrLen(r.created    as pchar)+1); }
+    if (r.modified   != 0) { free(r.modified,   StrLen(r.modified   as pchar)+1); }
+    if (r.srvService != 0) { free(r.srvService, StrLen(r.srvService as pchar)+1); }
+    if (r.srvProto   != 0) { free(r.srvProto,   StrLen(r.srvProto   as pchar)+1); }
+    if (r.srvTarget  != 0) { free(r.srvTarget,  StrLen(r.srvTarget  as pchar)+1); }
+}
+
+fn dnsEmptyRecord(): CFDNSRecord {
+    var r: CFDNSRecord;
+    r.id:=0; r.zoneId:=0; r.zoneName:=0; r.recType:=0;
+    r.name:=0; r.content:=0; r.ttl:=1; r.proxied:=0; r.proxiable:=0;
+    r.priority:=0; r.locked:=0; r.created:=0; r.modified:=0;
+    r.srvService:=0; r.srvProto:=0; r.srvWeight:=0; r.srvPort:=0; r.srvTarget:=0;
+    return r;
+}
+
+fn parseRecord(json: int64, jl: int64): CFDNSRecord {
+    var r: CFDNSRecord := dnsEmptyRecord();
+    r.id        := cfExtractValue(json, jl, "id"c);
+    r.zoneId    := cfExtractValue(json, jl, "zone_id"c);
+    r.zoneName  := cfExtractValue(json, jl, "zone_name"c);
+    r.recType   := cfExtractValue(json, jl, "type"c);
+    r.name      := cfExtractValue(json, jl, "name"c);
+    r.content   := cfExtractValue(json, jl, "content"c);
+    r.ttl       := cfExtractInt(json,  jl, "ttl"c);
+    r.proxied   := cfExtractBool(json, jl, "proxied"c);
+    r.proxiable := cfExtractBool(json, jl, "proxiable"c);
+    r.priority  := cfExtractInt(json,  jl, "priority"c);
+    r.locked    := cfExtractBool(json, jl, "locked"c);
+    r.created   := cfExtractValue(json, jl, "created_on"c);
+    r.modified  := cfExtractValue(json, jl, "modified_on"c);
+    return r;
+}
+
+fn dnsPath(zoneId: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/dns_records"c);
+    poke8(buf+off, 0); return buf;
+}
+
+fn dnsRecordPath(zoneId: pchar, recordId: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/dns_records/"c);
+    off := cftAppend(buf, off, recordId);
+    poke8(buf+off, 0); return buf;
+}
+
+fn dnsBody(recType: pchar, name: pchar, content: pchar, ttl: int64, proxied: int64): int64 {
+    var jtype:    int64 := cfJsonEscape(recType);
+    var jname:    int64 := cfJsonEscape(name);
+    var jcontent: int64 := cfJsonEscape(content);
+    var buf: int64 := alloc(1024);
+    var off: int64 := cftAppend(buf, 0, "{\"type\":\""c);
+    off := cftAppend(buf, off, jtype as pchar);
+    off := cftAppend(buf, off, "\",\"name\":\""c);
+    off := cftAppend(buf, off, jname as pchar);
+    off := cftAppend(buf, off, "\",\"content\":\""c);
+    off := cftAppend(buf, off, jcontent as pchar);
+    off := cftAppend(buf, off, "\",\"ttl\":"c);
+    off := cftAppendInt(buf, off, ttl);
+    off := cftAppend(buf, off, ",\"proxied\":"c);
+    if (proxied == 1) {
+        off := cftAppend(buf, off, "true"c);
+    } else {
+        off := cftAppend(buf, off, "false"c);
+    }
+    off := cftAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    free(jtype, StrLen(jtype as pchar)+1);
+    free(jname, StrLen(jname as pchar)+1);
+    free(jcontent, StrLen(jcontent as pchar)+1);
+    return buf;
+}
+
+// Core CRUD
+
+pub fn DNSRecordCreate(c: CFClient, zoneId: pchar,
+                       recType: pchar, name: pchar, content: pchar,
+                       ttl: int64, proxied: int64): CFDNSRecord {
+    var path: int64 := dnsPath(zoneId);
+    var body: int64 := dnsBody(recType, name, content, ttl, proxied);
+    var r: CFResponse := CFPost(c, path as pchar, body, StrLen(body as pchar));
+    free(path, 512); free(body, 1024);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+
+pub fn DNSRecordUpdate(c: CFClient, zoneId: pchar, recordId: pchar,
+                       content: pchar, ttl: int64, proxied: int64): CFDNSRecord {
+    var path: int64 := dnsRecordPath(zoneId, recordId);
+    // Need type — do a get first, but spec says PUT with full body
+    // Use PATCH for content-only update
+    var jcontent: int64 := cfJsonEscape(content);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"content\":\""c);
+    off := cftAppend(body, off, jcontent as pchar);
+    off := cftAppend(body, off, "\",\"ttl\":"c);
+    off := cftAppendInt(body, off, ttl);
+    off := cftAppend(body, off, ",\"proxied\":"c);
+    if (proxied==1){off:=cftAppend(body,off,"true"c);}else{off:=cftAppend(body,off,"false"c);}
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    free(jcontent, StrLen(jcontent as pchar)+1);
+    var r: CFResponse := CFPut(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+
+pub fn DNSRecordPatch(c: CFClient, zoneId: pchar, recordId: pchar, content: pchar): CFDNSRecord {
+    var path: int64 := dnsRecordPath(zoneId, recordId);
+    var jcontent: int64 := cfJsonEscape(content);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"content\":\""c);
+    off := cftAppend(body, off, jcontent as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    free(jcontent, StrLen(jcontent as pchar)+1);
+    var r: CFResponse := CFPatch(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+
+pub fn DNSRecordDelete(c: CFClient, zoneId: pchar, recordId: pchar): int64 {
+    var path: int64 := dnsRecordPath(zoneId, recordId);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn DNSRecordGet(c: CFClient, zoneId: pchar, recordId: pchar): CFDNSRecord {
+    var path: int64 := dnsRecordPath(zoneId, recordId);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+
+pub fn DNSRecordList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := dnsPath(zoneId);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 512); return result;
+}
+
+pub fn DNSRecordListByType(c: CFClient, zoneId: pchar, recType: pchar): int64 {
+    var path: int64 := alloc(512);
+    var off: int64 := cftAppend(path, 0, "/zones/"c);
+    off := cftAppend(path, off, zoneId);
+    off := cftAppend(path, off, "/dns_records?type="c);
+    off := cftAppend(path, off, recType); poke8(path+off, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 512); return result;
+}
+
+pub fn DNSRecordListByName(c: CFClient, zoneId: pchar, name: pchar): int64 {
+    var path: int64 := alloc(512);
+    var off: int64 := cftAppend(path, 0, "/zones/"c);
+    off := cftAppend(path, off, zoneId);
+    off := cftAppend(path, off, "/dns_records?name="c);
+    off := cftAppend(path, off, name); poke8(path+off, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 512); return result;
+}
+
+pub fn DNSRecordFind(c: CFClient, zoneId: pchar, recType: pchar, name: pchar): CFDNSRecord {
+    var path: int64 := alloc(512);
+    var off: int64 := cftAppend(path, 0, "/zones/"c);
+    off := cftAppend(path, off, zoneId);
+    off := cftAppend(path, off, "/dns_records?type="c);
+    off := cftAppend(path, off, recType);
+    off := cftAppend(path, off, "&name="c);
+    off := cftAppend(path, off, name); poke8(path+off, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) {
+        var rl: int64 := r.resultLen;
+        if (rl > 2 && (peek8(r.result) & 0xFF) == 91) {
+            var j: int64 := 1;
+            while (j < rl && (peek8(r.result+j) & 0xFF) != 123) { j := j+1; }
+            if (j < rl) {
+                var depth: int64 := 0; var k: int64 := j;
+                while (k < rl) {
+                    var ch: int64 := peek8(r.result+k) & 0xFF;
+                    if (ch==123) { depth:=depth+1; }
+                    if (ch==125) { depth:=depth-1; if(depth==0){k:=k+1;break;} }
+                    k:=k+1;
+                }
+                var obj: int64 := cftDupN(r.result+j, k-j);
+                rec = parseRecord(obj, k-j);
+                free(obj, k-j+1);
+            }
+        }
+    }
+    CFResponseFree(r); return rec;
+}
+
+pub fn DNSRecordUpsert(c: CFClient, zoneId: pchar,
+                       recType: pchar, name: pchar, content: pchar,
+                       ttl: int64, proxied: int64): CFDNSRecord {
+    var existing: CFDNSRecord := DNSRecordFind(c, zoneId, recType, name);
+    if (existing.id != 0) {
+        var id: pchar := existing.id as pchar;
+        var updated: CFDNSRecord := DNSRecordUpdate(c, zoneId, id, content, ttl, proxied);
+        CFDNSRecordFree(existing);
+        return updated;
+    }
+    return DNSRecordCreate(c, zoneId, recType, name, content, ttl, proxied);
+}
+
+pub fn DNSRecordDeleteByName(c: CFClient, zoneId: pchar, name: pchar): int64 {
+    var list: int64 := DNSRecordListByName(c, zoneId, name);
+    if (list == 0) { return 0; }
+    var deleted: int64 := 0;
+    // Iterate over JSON array of records and delete each by ID
+    var ll: int64 := StrLen(list as pchar);
+    var i: int64 := 0;
+    while (i < ll) {
+        if ((peek8(list+i)&0xFF) == 123) { // '{'
+            var depth: int64 := 1; var k: int64 := i+1;
+            while (k < ll && depth > 0) {
+                var ch: int64 := peek8(list+k) & 0xFF;
+                if (ch==123){depth:=depth+1;}
+                if (ch==125){depth:=depth-1;}
+                k:=k+1;
+            }
+            var obj: int64 := cftDupN(list+i, k-i);
+            var objLen: int64 := k-i;
+            var id: int64 := cfExtractValue(obj, objLen, "id"c);
+            if (id != 0) {
+                DNSRecordDelete(c, zoneId, id as pchar);
+                free(id, StrLen(id as pchar)+1);
+                deleted := deleted+1;
+            }
+            free(obj, objLen+1);
+            i := k;
+        } else {
+            i := i+1;
+        }
+    }
+    free(list, ll+1);
+    return deleted;
+}
+
+pub fn DNSRecordDeleteByType(c: CFClient, zoneId: pchar, recType: pchar, name: pchar): int64 {
+    var existing: CFDNSRecord := DNSRecordFind(c, zoneId, recType, name);
+    if (existing.id == 0) { return 0; }
+    var ok: int64 := DNSRecordDelete(c, zoneId, existing.id as pchar);
+    CFDNSRecordFree(existing);
+    return ok;
+}
+
+// Specialized create functions
+
+pub fn DNSRecordCreateA(c: CFClient, zoneId: pchar, name: pchar, ip: pchar, proxied: int64): CFDNSRecord {
+    return DNSRecordCreate(c, zoneId, "A"c, name, ip, 1, proxied);
+}
+pub fn DNSRecordCreateAAAA(c: CFClient, zoneId: pchar, name: pchar, ipv6: pchar, proxied: int64): CFDNSRecord {
+    return DNSRecordCreate(c, zoneId, "AAAA"c, name, ipv6, 1, proxied);
+}
+pub fn DNSRecordCreateCNAME(c: CFClient, zoneId: pchar, name: pchar, target: pchar, proxied: int64): CFDNSRecord {
+    return DNSRecordCreate(c, zoneId, "CNAME"c, name, target, 1, proxied);
+}
+pub fn DNSRecordCreateMX(c: CFClient, zoneId: pchar, name: pchar, mailServer: pchar, priority: int64): CFDNSRecord {
+    var pj: int64 := cfJsonEscape(mailServer);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"type\":\"MX\",\"name\":\""c);
+    off := cftAppend(body, off, name);
+    off := cftAppend(body, off, "\",\"content\":\""c);
+    off := cftAppend(body, off, pj as pchar);
+    off := cftAppend(body, off, "\",\"priority\":"c);
+    off := cftAppendInt(body, off, priority);
+    off := cftAppend(body, off, ",\"ttl\":300}"c); poke8(body+off, 0);
+    free(pj, StrLen(pj as pchar)+1);
+    var path: int64 := dnsPath(zoneId);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+pub fn DNSRecordCreateTXT(c: CFClient, zoneId: pchar, name: pchar, content: pchar): CFDNSRecord {
+    return DNSRecordCreate(c, zoneId, "TXT"c, name, content, 300, 0);
+}
+pub fn DNSRecordCreateSRV(c: CFClient, zoneId: pchar,
+                           service: pchar, proto: pchar, name: pchar,
+                           priority: int64, weight: int64, port: int64,
+                           target: pchar): CFDNSRecord {
+    var jservice: int64 := cfJsonEscape(service);
+    var jproto:   int64 := cfJsonEscape(proto);
+    var jname:    int64 := cfJsonEscape(name);
+    var jtarget:  int64 := cfJsonEscape(target);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"type\":\"SRV\",\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"data\":{\"service\":\""c);
+    off := cftAppend(body, off, jservice as pchar);
+    off := cftAppend(body, off, "\",\"proto\":\""c);
+    off := cftAppend(body, off, jproto as pchar);
+    off := cftAppend(body, off, "\",\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"priority\":"c);
+    off := cftAppendInt(body, off, priority);
+    off := cftAppend(body, off, ",\"weight\":"c);
+    off := cftAppendInt(body, off, weight);
+    off := cftAppend(body, off, ",\"port\":"c);
+    off := cftAppendInt(body, off, port);
+    off := cftAppend(body, off, ",\"target\":\""c);
+    off := cftAppend(body, off, jtarget as pchar);
+    off := cftAppend(body, off, "\"},\"ttl\":120}"c); poke8(body+off, 0);
+    free(jservice, StrLen(jservice as pchar)+1);
+    free(jproto, StrLen(jproto as pchar)+1);
+    free(jname, StrLen(jname as pchar)+1);
+    free(jtarget, StrLen(jtarget as pchar)+1);
+    var path: int64 := dnsPath(zoneId);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 1024);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+pub fn DNSRecordCreateCAA(c: CFClient, zoneId: pchar,
+                           name: pchar, flags: int64, tag: pchar, value: pchar): CFDNSRecord {
+    var jtag:   int64 := cfJsonEscape(tag);
+    var jvalue: int64 := cfJsonEscape(value);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"type\":\"CAA\",\"name\":\""c);
+    off := cftAppend(body, off, name);
+    off := cftAppend(body, off, "\",\"data\":{\"flags\":"c);
+    off := cftAppendInt(body, off, flags);
+    off := cftAppend(body, off, ",\"tag\":\""c);
+    off := cftAppend(body, off, jtag as pchar);
+    off := cftAppend(body, off, "\",\"value\":\""c);
+    off := cftAppend(body, off, jvalue as pchar);
+    off := cftAppend(body, off, "\"},\"ttl\":300}"c); poke8(body+off, 0);
+    free(jtag, StrLen(jtag as pchar)+1);
+    free(jvalue, StrLen(jvalue as pchar)+1);
+    var path: int64 := dnsPath(zoneId);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var rec: CFDNSRecord := dnsEmptyRecord();
+    if (r.success == 1 && r.result != 0) { rec = parseRecord(r.result, r.resultLen); }
+    CFResponseFree(r); return rec;
+}
+
+// Import / Export (BIND zone format)
+
+pub fn DNSZoneExport(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/dns_records/export"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.statusCode == 200 && r.result != 0) {
+        result = cftDupN(r.result, r.resultLen);
+    }
+    CFResponseFree(r); return result;
+}
+
+pub fn DNSZoneImport(c: CFClient, zoneId: pchar, bindZoneFile: pchar, fileLen: int64): int64 {
+    // POST multipart/form-data with the zone file as "file" field
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/dns_records/import"c); poke8(path+po, 0);
+    // Build simple multipart body
+    var boundary: pchar := "lyxcf-dns-import-boundary"c;
+    var body: int64 := alloc(fileLen + 512);
+    var off: int64 := cftAppend(body, 0, "--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"zone.txt\"\r\n"c);
+    off := cftAppend(body, off, "Content-Type: text/dns\r\n\r\n"c);
+    off := cftAppendN(body, off, bindZoneFile as int64, fileLen);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "--\r\n"c); poke8(body+off, 0);
+    // Build Content-Type header with boundary
+    var ctBuf: int64 := alloc(128);
+    var cto: int64 := cftAppend(ctBuf, 0, "multipart/form-data; boundary="c);
+    cto := cftAppend(ctBuf, cto, boundary); poke8(ctBuf+cto, 0);
+    var r: CFResponse := CFPutRaw(c, path as pchar, ctBuf as pchar, body, off);
+    free(path, 256); free(body, fileLen+512); free(ctBuf, 128);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) {
+        result = cftDupN(r.result, r.resultLen);
+    }
+    CFResponseFree(r); return result;
+}

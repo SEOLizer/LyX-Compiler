@@ -1,0 +1,411 @@
+// std/cloud/cf/pages.lyx — Cloudflare Pages
+// WP-CF-11
+
+unit std.cloud.cf.pages;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFPagesProject = struct {
+    id:           int64;  // pchar
+    name:         int64;  // pchar
+    subdomain:    int64;  // pchar
+    productionBranch: int64; // pchar
+    buildCmd:     int64;  // pchar
+    rootDir:      int64;  // pchar
+    distDir:      int64;  // pchar
+    created:      int64;  // pchar
+    deployHookUrl: int64; // pchar
+};
+
+pub type CFPagesDeployment = struct {
+    id:            int64;  // pchar
+    shortId:       int64;  // pchar
+    projectId:     int64;  // pchar
+    projectName:   int64;  // pchar
+    environment:   int64;  // pchar
+    url:           int64;  // pchar
+    latestStage:   int64;  // pchar
+    created:       int64;  // pchar
+    modified:      int64;  // pchar
+};
+
+fn pgFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFPagesProjectFree(p: CFPagesProject) {
+    pgFreeIfSet(p.id); pgFreeIfSet(p.name); pgFreeIfSet(p.subdomain);
+    pgFreeIfSet(p.productionBranch); pgFreeIfSet(p.buildCmd);
+    pgFreeIfSet(p.rootDir); pgFreeIfSet(p.distDir);
+    pgFreeIfSet(p.created); pgFreeIfSet(p.deployHookUrl);
+}
+
+pub fn CFPagesDeploymentFree(d: CFPagesDeployment) {
+    pgFreeIfSet(d.id); pgFreeIfSet(d.shortId); pgFreeIfSet(d.projectId);
+    pgFreeIfSet(d.projectName); pgFreeIfSet(d.environment);
+    pgFreeIfSet(d.url); pgFreeIfSet(d.latestStage);
+    pgFreeIfSet(d.created); pgFreeIfSet(d.modified);
+}
+
+fn parsePagesProject(json: int64, jl: int64): CFPagesProject {
+    var p: CFPagesProject;
+    p.id              := cfExtractValue(json, jl, "id"c);
+    p.name            := cfExtractValue(json, jl, "name"c);
+    p.subdomain       := cfExtractValue(json, jl, "subdomain"c);
+    p.productionBranch := cfExtractValue(json, jl, "production_branch"c);
+    p.buildCmd        := cfExtractValue(json, jl, "build_command"c);
+    p.rootDir         := cfExtractValue(json, jl, "root_dir"c);
+    p.distDir         := cfExtractValue(json, jl, "destination_dir"c);
+    p.created         := cfExtractValue(json, jl, "created_on"c);
+    p.deployHookUrl   := cfExtractValue(json, jl, "deploy_hook_url"c);
+    return p;
+}
+
+fn parsePagesDeployment(json: int64, jl: int64): CFPagesDeployment {
+    var d: CFPagesDeployment;
+    d.id          := cfExtractValue(json, jl, "id"c);
+    d.shortId     := cfExtractValue(json, jl, "short_id"c);
+    d.projectId   := cfExtractValue(json, jl, "project_id"c);
+    d.projectName := cfExtractValue(json, jl, "project_name"c);
+    d.environment := cfExtractValue(json, jl, "environment"c);
+    d.url         := cfExtractValue(json, jl, "url"c);
+    d.created     := cfExtractValue(json, jl, "created_on"c);
+    d.modified    := cfExtractValue(json, jl, "modified_on"c);
+    // Latest stage name from stages array first element
+    var stages: int64 := cfExtractValue(json, jl, "latest_stage"c);
+    if (stages != 0) {
+        var sl: int64 := StrLen(stages as pchar);
+        d.latestStage := cfExtractValue(stages, sl, "name"c);
+        free(stages, sl+1);
+    } else { d.latestStage := 0; }
+    return d;
+}
+
+fn pagesPath(accountId: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/pages/projects"c);
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+fn pagesProjectPath(accountId: pchar, projectName: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/pages/projects/"c);
+    off := cftAppend(buf, off, projectName);
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+fn pagesDeployPath(accountId: pchar, projectName: pchar,
+                   deployId: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/pages/projects/"c);
+    off := cftAppend(buf, off, projectName);
+    off := cftAppend(buf, off, "/deployments"c);
+    if (deployId != 0 as pchar) {
+        off := cftAppend(buf, off, "/"c);
+        off := cftAppend(buf, off, deployId);
+    }
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+// Project management
+
+pub fn PagesProjectCreate(c: CFClient, accountId: pchar, name: pchar,
+                          productionBranch: pchar, buildCmd: pchar,
+                          rootDir: pchar, distDir: pchar): CFPagesProject {
+    var path: int64 := pagesPath(accountId, 0 as pchar);
+    var jname: int64 := cfJsonEscape(name);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"production_branch\":\""c);
+    var jbranch: int64 := cfJsonEscape(productionBranch);
+    off := cftAppend(body, off, jbranch as pchar);
+    off := cftAppend(body, off, "\",\"build_config\":{"c);
+    if (buildCmd != 0 as pchar) {
+        var jcmd: int64 := cfJsonEscape(buildCmd);
+        off := cftAppend(body, off, "\"build_command\":\""c);
+        off := cftAppend(body, off, jcmd as pchar);
+        off := cftAppend(body, off, "\""c);
+        pgFreeIfSet(jcmd);
+        if (distDir != 0 as pchar) {
+            var jdist: int64 := cfJsonEscape(distDir);
+            off := cftAppend(body, off, ",\"destination_dir\":\""c);
+            off := cftAppend(body, off, jdist as pchar);
+            off := cftAppend(body, off, "\""c);
+            pgFreeIfSet(jdist);
+        }
+        if (rootDir != 0 as pchar) {
+            var jroot: int64 := cfJsonEscape(rootDir);
+            off := cftAppend(body, off, ",\"root_dir\":\""c);
+            off := cftAppend(body, off, jroot as pchar);
+            off := cftAppend(body, off, "\""c);
+            pgFreeIfSet(jroot);
+        }
+    }
+    off := cftAppend(body, off, "}}"c); poke8(body+off, 0);
+    pgFreeIfSet(jname); pgFreeIfSet(jbranch);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 1024);
+    var proj: CFPagesProject;
+    proj.id:=0; proj.name:=0; proj.subdomain:=0; proj.productionBranch:=0;
+    proj.buildCmd:=0; proj.rootDir:=0; proj.distDir:=0; proj.created:=0; proj.deployHookUrl:=0;
+    if (r.success == 1 && r.result != 0) { proj = parsePagesProject(r.result, r.resultLen); }
+    CFResponseFree(r); return proj;
+}
+
+pub fn PagesProjectDelete(c: CFClient, accountId: pchar, projectName: pchar): int64 {
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesProjectGet(c: CFClient, accountId: pchar, projectName: pchar): CFPagesProject {
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var proj: CFPagesProject;
+    proj.id:=0; proj.name:=0; proj.subdomain:=0; proj.productionBranch:=0;
+    proj.buildCmd:=0; proj.rootDir:=0; proj.distDir:=0; proj.created:=0; proj.deployHookUrl:=0;
+    if (r.success == 1 && r.result != 0) { proj = parsePagesProject(r.result, r.resultLen); }
+    CFResponseFree(r); return proj;
+}
+
+pub fn PagesProjectList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := pagesPath(accountId, 0 as pchar);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 512); return result;
+}
+
+pub fn PagesProjectUpdate(c: CFClient, accountId: pchar, projectName: pchar,
+                          body: int64, bodyLen: int64): CFPagesProject {
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var r: CFResponse := CFPatch(c, path as pchar, body, bodyLen);
+    free(path, 512);
+    var proj: CFPagesProject;
+    proj.id:=0; proj.name:=0; proj.subdomain:=0; proj.productionBranch:=0;
+    proj.buildCmd:=0; proj.rootDir:=0; proj.distDir:=0; proj.created:=0; proj.deployHookUrl:=0;
+    if (r.success == 1 && r.result != 0) { proj = parsePagesProject(r.result, r.resultLen); }
+    CFResponseFree(r); return proj;
+}
+
+// Deploy from URL / branch
+
+pub fn PagesDeploy(c: CFClient, accountId: pchar, projectName: pchar,
+                   branch: pchar): CFPagesDeployment {
+    var path: int64 := pagesDeployPath(accountId, projectName, 0 as pchar, 0 as pchar);
+    var body: int64 := alloc(256);
+    var off: int64 := 0;
+    if (branch != 0 as pchar) {
+        var jb: int64 := cfJsonEscape(branch);
+        off := cftAppend(body, 0, "{\"branch\":\""c);
+        off := cftAppend(body, off, jb as pchar);
+        off := cftAppend(body, off, "\"}"c);
+        pgFreeIfSet(jb);
+    } else {
+        off := cftAppend(body, 0, "{}"c);
+    }
+    poke8(body+off, 0);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 256);
+    var dep: CFPagesDeployment;
+    dep.id:=0; dep.shortId:=0; dep.projectId:=0; dep.projectName:=0;
+    dep.environment:=0; dep.url:=0; dep.latestStage:=0; dep.created:=0; dep.modified:=0;
+    if (r.success == 1 && r.result != 0) { dep = parsePagesDeployment(r.result, r.resultLen); }
+    CFResponseFree(r); return dep;
+}
+
+pub fn PagesDeployDir(c: CFClient, accountId: pchar, projectName: pchar,
+                      localDir: pchar, branch: pchar): CFPagesDeployment {
+    // Direct Upload — builds multipart from directory listing
+    // This is a simplified implementation that sends a placeholder bundle
+    // Real implementation would recursively read files and multipart encode
+    var path: int64 := pagesDeployPath(accountId, projectName, 0 as pchar, 0 as pchar);
+    var boundary: pchar := "LyxPagesBoundary12345"c;
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"branch\"\r\n\r\n"c);
+    if (branch != 0 as pchar) { off := cftAppend(body, off, branch); }
+    else { off := cftAppend(body, off, "main"c); }
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "--\r\n"c); poke8(body+off, 0);
+    var ct: int64 := alloc(128);
+    var cto: int64 := cftAppend(ct, 0, "multipart/form-data; boundary="c);
+    cto := cftAppend(ct, cto, boundary); poke8(ct+cto, 0);
+    var r: CFResponse := CFPutRaw(c, path as pchar, ct as pchar, body, off);
+    free(body, 1024); free(ct, 128); free(path, 512);
+    var dep: CFPagesDeployment;
+    dep.id:=0; dep.shortId:=0; dep.projectId:=0; dep.projectName:=0;
+    dep.environment:=0; dep.url:=0; dep.latestStage:=0; dep.created:=0; dep.modified:=0;
+    if (r.success == 1 && r.result != 0) { dep = parsePagesDeployment(r.result, r.resultLen); }
+    CFResponseFree(r); return dep;
+}
+
+// Deployment management
+
+pub fn PagesDeploymentGet(c: CFClient, accountId: pchar, projectName: pchar,
+                          deployId: pchar): CFPagesDeployment {
+    var path: int64 := pagesDeployPath(accountId, projectName, deployId, 0 as pchar);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var dep: CFPagesDeployment;
+    dep.id:=0; dep.shortId:=0; dep.projectId:=0; dep.projectName:=0;
+    dep.environment:=0; dep.url:=0; dep.latestStage:=0; dep.created:=0; dep.modified:=0;
+    if (r.success == 1 && r.result != 0) { dep = parsePagesDeployment(r.result, r.resultLen); }
+    CFResponseFree(r); return dep;
+}
+
+pub fn PagesDeploymentList(c: CFClient, accountId: pchar, projectName: pchar): int64 {
+    var path: int64 := pagesDeployPath(accountId, projectName, 0 as pchar, 0 as pchar);
+    var result: int64 := CFGetAll(c, path as pchar, 25);
+    free(path, 512); return result;
+}
+
+pub fn PagesDeploymentRetry(c: CFClient, accountId: pchar, projectName: pchar,
+                             deployId: pchar): CFPagesDeployment {
+    var path: int64 := pagesDeployPath(accountId, projectName, deployId, "/retry"c);
+    var r: CFResponse := CFPost(c, path as pchar, 0, 0);
+    free(path, 512);
+    var dep: CFPagesDeployment;
+    dep.id:=0; dep.shortId:=0; dep.projectId:=0; dep.projectName:=0;
+    dep.environment:=0; dep.url:=0; dep.latestStage:=0; dep.created:=0; dep.modified:=0;
+    if (r.success == 1 && r.result != 0) { dep = parsePagesDeployment(r.result, r.resultLen); }
+    CFResponseFree(r); return dep;
+}
+
+pub fn PagesDeploymentRollback(c: CFClient, accountId: pchar, projectName: pchar,
+                                deployId: pchar): int64 {
+    var path: int64 := pagesDeployPath(accountId, projectName, deployId, "/rollback"c);
+    var r: CFResponse := CFPost(c, path as pchar, 0, 0);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesDeploymentDelete(c: CFClient, accountId: pchar, projectName: pchar,
+                              deployId: pchar): int64 {
+    var path: int64 := pagesDeployPath(accountId, projectName, deployId, 0 as pchar);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesDeploymentLogs(c: CFClient, accountId: pchar, projectName: pchar,
+                            deployId: pchar): int64 {
+    var path: int64 := pagesDeployPath(accountId, projectName, deployId, "/history/logs"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Custom domain management
+
+pub fn PagesDomainAdd(c: CFClient, accountId: pchar, projectName: pchar,
+                      domain: pchar): int64 {
+    var path: int64 := pagesProjectPath(accountId, projectName, "/domains"c);
+    var jd: int64 := cfJsonEscape(domain);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jd as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    pgFreeIfSet(jd);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesDomainDelete(c: CFClient, accountId: pchar, projectName: pchar,
+                         domain: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/pages/projects/"c);
+    po := cftAppend(path, po, projectName);
+    po := cftAppend(path, po, "/domains/"c);
+    po := cftAppend(path, po, domain); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesDomainList(c: CFClient, accountId: pchar, projectName: pchar): int64 {
+    var path: int64 := pagesProjectPath(accountId, projectName, "/domains"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Environment variable management
+
+pub fn PagesEnvSet(c: CFClient, accountId: pchar, projectName: pchar,
+                   envKey: pchar, envValue: pchar, isSecret: int64,
+                   environment: pchar): int64 {
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var jk: int64 := cfJsonEscape(envKey);
+    var jv: int64 := cfJsonEscape(envValue);
+    var jenv: int64 := cfJsonEscape(environment);
+    var typeStr: pchar := "plain_text"c;
+    if (isSecret == 1) { typeStr := "secret_text"c; }
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"deployment_configs\":{\""c);
+    off := cftAppend(body, off, jenv as pchar);
+    off := cftAppend(body, off, "\":{\"env_vars\":{\""c);
+    off := cftAppend(body, off, jk as pchar);
+    off := cftAppend(body, off, "\":{\"value\":\""c);
+    off := cftAppend(body, off, jv as pchar);
+    off := cftAppend(body, off, "\",\"type\":\""c);
+    off := cftAppend(body, off, typeStr);
+    off := cftAppend(body, off, "\"}}}}}"c); poke8(body+off, 0);
+    pgFreeIfSet(jk); pgFreeIfSet(jv); pgFreeIfSet(jenv);
+    var r: CFResponse := CFPatch(c, path as pchar, body, off);
+    free(path, 512); free(body, 1024);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesEnvDelete(c: CFClient, accountId: pchar, projectName: pchar,
+                      envKey: pchar, environment: pchar): int64 {
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var jk: int64 := cfJsonEscape(envKey);
+    var jenv: int64 := cfJsonEscape(environment);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"deployment_configs\":{\""c);
+    off := cftAppend(body, off, jenv as pchar);
+    off := cftAppend(body, off, "\":{\"env_vars\":{\""c);
+    off := cftAppend(body, off, jk as pchar);
+    off := cftAppend(body, off, "\":null}}}}"c); poke8(body+off, 0);
+    pgFreeIfSet(jk); pgFreeIfSet(jenv);
+    var r: CFResponse := CFPatch(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn PagesEnvList(c: CFClient, accountId: pchar, projectName: pchar): int64 {
+    var proj: CFPagesProject := PagesProjectGet(c, accountId, projectName);
+    // Return project JSON so caller can inspect deployment_configs.env_vars
+    if (proj.name == 0) { return 0; }
+    var path: int64 := pagesProjectPath(accountId, projectName, 0 as pchar);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r);
+    CFPagesProjectFree(proj);
+    return result;
+}
