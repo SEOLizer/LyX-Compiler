@@ -1,13 +1,14 @@
 # Lyx PDF-Bibliothek (`std/pdf`) — Offene Work Packages
 
-**Abgeschlossen:** WP-PDF-01–16  
+**Abgeschlossen:** WP-PDF-01–16, WP-PDF-20  
 (Objekte, Seiten, Text, Grafik, Komprimierung, Bilder, Metadaten,
 Annotierungen, Reader, Outlines, Seitenbeschriftungen, Seitenübergänge,
-Viewer-Einstellungen, Named Destinations, Dateianhänge, Ebenen/OCG)
+Viewer-Einstellungen, Named Destinations, Dateianhänge, Ebenen/OCG,
+Seitenrotation)
 
-**Offen:** WP-PDF-17–27 (alle unten, nach Phase geordnet)
+**Offen:** WP-PDF-17–19, WP-PDF-21–27 (alle unten, nach Phase geordnet)
 
-**Konvention:** WP-PDF-NN. Status: ⬜ Offen.
+**Konvention:** WP-PDF-NN. Status: ⬜ Offen / ✅ Abgeschlossen.
 
 ---
 
@@ -15,7 +16,7 @@ Viewer-Einstellungen, Named Destinations, Dateianhänge, Ebenen/OCG)
 
 | WP | Titel | Phase | Aufwand | Abhängigkeiten |
 |----|-------|-------|---------|----------------|
-| PDF-20 | Seitenrotation | 1 | Klein | — |
+| PDF-20 | Seitenrotation ✅ | 1 | Klein | — |
 | PDF-23 | Form XObjects | 1 | Mittel | — |
 | PDF-22 | Verläufe / Shading | 1 | Mittel | — |
 | PDF-19 | Merge / Seiten einfügen | 1 | Mittel | WP-PDF-09 (Reader) |
@@ -33,7 +34,7 @@ Viewer-Einstellungen, Named Destinations, Dateianhänge, Ebenen/OCG)
 
 ---
 
-### WP-PDF-20: Seitenrotation ⬜
+### WP-PDF-20: Seitenrotation ✅
 
 **Ziel:** Einzelne Seiten rotieren (0 / 90 / 180 / 270 Grad).
 
