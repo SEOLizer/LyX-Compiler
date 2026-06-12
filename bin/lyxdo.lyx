@@ -1,0 +1,1397 @@
+// bin/lyxdo.lyx — lyxdo CLI: DigitalOcean control tool in Lyx
+// WP-DO-13
+// Usage: lyxdo <command> [subcommand] [args] [--flags]
+
+unit bin.lyxdo;
+
+import std.cloud.do.transport;
+import std.cloud.do.credentials;
+import std.cloud.do.droplets;
+import std.cloud.do.networking;
+import std.cloud.do.volumes;
+import std.cloud.do.databases;
+import std.cloud.do.kubernetes;
+import std.cloud.do.spaces;
+import std.cloud.do.apps;
+import std.cloud.do.registry;
+import std.cloud.do.functions;
+import std.cloud.do.monitoring;
+import std.alloc;
+import std.io;
+import std.fs;
+import std.env;
+import std.string;
+
+// --- Utilities ---
+
+fn argEq(a: pchar, b: pchar): int64 {
+    if (a == 0 as pchar || b == 0 as pchar) { return 0; }
+    return StrEquals(a, b) as int64;
+}
+
+fn argStart(a: pchar, prefix: pchar): int64 {
+    if (a == 0 as pchar || prefix == 0 as pchar) { return 0; }
+    return StrStartsWith(a, prefix) as int64;
+}
+
+fn argAfter(a: pchar, prefix: pchar): pchar {
+    var pl: int64 := StrLen(prefix);
+    return (a as int64 + pl) as pchar;
+}
+
+fn flagVal(argc: int64, argv: pchar, flag: pchar): pchar {
+    // supports --flag value and --flag=value
+    var i: int64 := 1;
+    while (i < argc) {
+        var arg: pchar := ArgvGet(argv, i);
+        if (StrEquals(arg, flag) as int64 == 1) {
+            if (i + 1 < argc) { return ArgvGet(argv, i + 1); }
+            return 0 as pchar;
+        }
+        var dashdash: int64 := StrLen(flag) + 1;
+        var buf: int64 := alloc(dashdash + 2);
+        var fl: int64 := StrLen(flag);
+        var j: int64 := 0;
+        while(j<fl){poke8(buf+j,StrCharAt(flag,j)&0xFF);j:=j+1;}
+        poke8(buf+fl, 61); poke8(buf+fl+1, 0); // '='
+        if (argStart(arg, buf as pchar) == 1) {
+            free(buf, dashdash + 2);
+            return argAfter(arg, buf as pchar);
+        }
+        free(buf, dashdash + 2);
+        i := i + 1;
+    }
+    return 0 as pchar;
+}
+
+fn flagBool(argc: int64, argv: pchar, flag: pchar): int64 {
+    var i: int64 := 1;
+    while (i < argc) {
+        var arg: pchar := ArgvGet(argv, i);
+        if (StrEquals(arg, flag) as int64 == 1) { return 1; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+fn printLn2(a: pchar, b: pchar) {
+    PrintLn(a);
+    PrintLn(b);
+}
+
+fn sep() { PrintLn("--"c); }
+
+fn printKV(key: pchar, val: int64) {
+    var buf: int64 := alloc(24);
+    var s: pchar := Int64ToStr(val, buf);
+    Print(key); Print(": "c); PrintLn(s);
+    free(buf, 24);
+}
+
+fn printKS(key: pchar, val: int64) {
+    Print(key); Print(": "c);
+    if (val == 0) { PrintLn("(none)"c); }
+    else { PrintLn(val as pchar); }
+}
+
+fn printStr(val: int64) {
+    if (val == 0) { Print("(none)"c); }
+    else { Print(val as pchar); }
+}
+
+fn usage() {
+    PrintLn("lyxdo — DigitalOcean CLI"c);
+    PrintLn("Usage: lyxdo <command> [subcommand] [flags]"c);
+    PrintLn(""c);
+    PrintLn("Commands:"c);
+    PrintLn("  auth         Token-Verwaltung"c);
+    PrintLn("  account      Konto-Info"c);
+    PrintLn("  compute      Droplets, SSH-Keys, Images, Sizes"c);
+    PrintLn("  spaces       Object Storage"c);
+    PrintLn("  database     Managed Databases"c);
+    PrintLn("  kubernetes   DOKS Cluster"c);
+    PrintLn("  networking   Domains, LB, VPC, Firewall, Floating-IPs"c);
+    PrintLn("  volume       Block Storage"c);
+    PrintLn("  apps         App Platform"c);
+    PrintLn("  registry     Container Registry"c);
+    PrintLn("  functions    Serverless Functions"c);
+    PrintLn("  monitoring   Metriken und Alerts"c);
+    PrintLn(""c);
+    PrintLn("Globale Flags:"c);
+    PrintLn("  --token <token>   API-Token (überschreibt DIGITALOCEAN_TOKEN)"c);
+    PrintLn("  --config <path>   Konfig-Datei (default: ~/.config/lyxdo/config.json)"c);
+    PrintLn("  --region <region> Standard-Region"c);
+}
+
+fn loadCreds(argc: int64, argv: pchar): DOCredentials {
+    var tok: pchar := flagVal(argc, argv, "--token"c);
+    if (tok != 0 as pchar) { return DOCredentialsFromToken(tok); }
+    var cfg: pchar := flagVal(argc, argv, "--config"c);
+    if (cfg != 0 as pchar) { return DOCredentialsFromFile(cfg); }
+    return DOCredentialsDefault();
+}
+
+// --- auth ---
+
+fn cmdAuth(argc: int64, argv: pchar): int64 {
+    if (argc < 3) { PrintLn("Usage: lyxdo auth <init|token>"c); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    if (argEq(sub, "init"c) == 1) {
+        PrintLn("Bitte DIGITALOCEAN_TOKEN setzen oder --token verwenden."c);
+        PrintLn("Beispiel: export DIGITALOCEAN_TOKEN=dop_v1_..."c);
+        return 0;
+    }
+    if (argEq(sub, "token"c) == 1) {
+        var creds: DOCredentials := loadCreds(argc, argv);
+        if (creds.token == 0) { PrintLn("Kein Token gefunden."c); return 1; }
+        PrintLn(creds.token as pchar);
+        DOCredentialsFree(creds);
+        return 0;
+    }
+    if (argEq(sub, "list"c) == 1) {
+        var cfgPath: int64 := DOConfigPath() as int64;
+        PrintLn("Gespeicherte Konfiguration:"c);
+        Print("  "c); PrintLn(cfgPath as pchar);
+        free(cfgPath, StrLen(cfgPath as pchar) + 1);
+        return 0;
+    }
+    PrintLn("Unbekannter auth-Unterbefehl."c);
+    return 1;
+}
+
+// --- account ---
+
+fn cmdAccount(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token. Bitte DIGITALOCEAN_TOKEN setzen."c); return 1; }
+    var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+    if (argc >= 3 && argEq(ArgvGet(argv, 2), "ratelimit"c) == 1) {
+        var resp: HTTPResponse := DOGet(cl, "/v2/account"c);
+        PrintLn("Rate Limit Header:"c);
+        // headers are in resp.headers as HTTPHeader array
+        HTTPResponseFree(resp);
+        DOCredentialsFree(creds);
+        return 0;
+    }
+    var resp: HTTPResponse := DOGet(cl, "/v2/account"c);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) {
+        PrintLn("--- Account ---"c);
+        var email: int64 := doJsonStr(resp.bodyPtr, "email"c);
+        var uuid: int64 := doJsonStr(resp.bodyPtr, "uuid"c);
+        var status: int64 := doJsonStr(resp.bodyPtr, "status"c);
+        var dropletLimit: int64 := doJsonInt(resp.bodyPtr, "droplet_limit"c);
+        printKS("Email"c, email);
+        printKS("UUID"c, uuid);
+        printKS("Status"c, status);
+        printKV("Droplet-Limit"c, dropletLimit);
+        if (email != 0) { free(email, StrLen(email as pchar) + 1); }
+        if (uuid  != 0) { free(uuid,  StrLen(uuid  as pchar) + 1); }
+        if (status != 0) { free(status, StrLen(status as pchar) + 1); }
+    } else {
+        PrintLn("Fehler beim Abrufen des Accounts."c);
+    }
+    HTTPResponseFree(resp);
+    DOCredentialsFree(creds);
+    return 0;
+}
+
+// --- compute ---
+
+fn cmdComputeDroplet(creds: DOCredentials, argc: int64, argv: pchar): int64 {
+    if (argc < 4) {
+        PrintLn("Usage: lyxdo compute droplet <list|get|create|delete|start|stop|reboot|snapshot|resize|ip>"c);
+        return 1;
+    }
+    var sub: pchar := ArgvGet(argv, 3);
+
+    if (argEq(sub, "list"c) == 1) {
+        var tag: pchar := flagVal(argc, argv, "--tag"c);
+        var json: int64 := 0;
+        if (tag != 0 as pchar) {
+            var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+            var pathBuf: int64 := alloc(256);
+            doMakePath(pathBuf, "/v2/droplets?tag_name="c, tag);
+            json := DOGetAll(cl, pathBuf as pchar, "droplets"c);
+            free(pathBuf, 256);
+        } else {
+            var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+            json := DOGetAll(cl, "/v2/droplets"c, "droplets"c);
+        }
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar) + 1); }
+        return 0;
+    }
+
+    if (argEq(sub, "get"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet get <id>"c); return 1; }
+        var id: pchar := ArgvGet(argv, 4);
+        var numBuf: int64 := alloc(24);
+        var did: int64 := StrToInt64(id, numBuf);
+        free(numBuf, 24);
+        var d: DODroplet := DropletGet(creds, did);
+        printKS("ID"c, d.id as int64);
+        printKS("Name"c, d.name);
+        printKS("Status"c, d.status);
+        printKS("Region"c, d.region);
+        printKS("Size"c, d.size);
+        printKS("Image"c, d.image);
+        printKS("IPv4"c, d.ipv4);
+        DODropletFree(d);
+        return 0;
+    }
+
+    if (argEq(sub, "create"c) == 1) {
+        var name: pchar   := flagVal(argc, argv, "--name"c);
+        var region: pchar := flagVal(argc, argv, "--region"c);
+        var size: pchar   := flagVal(argc, argv, "--size"c);
+        var image: pchar  := flagVal(argc, argv, "--image"c);
+        if (name == 0 as pchar || region == 0 as pchar || size == 0 as pchar || image == 0 as pchar) {
+            PrintLn("Pflicht: --name --region --size --image"c); return 1;
+        }
+        var sshKeys: pchar := flagVal(argc, argv, "--ssh-keys"c);
+        var d: DODroplet := DropletCreateSimple(creds, name, region, size, image, sshKeys);
+        if (d.id == 0) { PrintLn("Fehler beim Erstellen des Droplets."c); return 1; }
+        Print("Erstellt: ID "c); PrintLn(d.id as pchar);
+        DODropletFree(d);
+        return 0;
+    }
+
+    if (argEq(sub, "delete"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet delete <id>"c); return 1; }
+        var id2: pchar := ArgvGet(argv, 4);
+        var numBuf2: int64 := alloc(24);
+        var did2: int64 := StrToInt64(id2, numBuf2);
+        free(numBuf2, 24);
+        var ok: int64 := DropletDelete(creds, did2);
+        if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "start"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet start <id>"c); return 1; }
+        var numBuf3: int64 := alloc(24);
+        var did3: int64 := StrToInt64(ArgvGet(argv, 4), numBuf3);
+        free(numBuf3, 24);
+        var ok2: int64 := DropletPowerOn(creds, did3);
+        if (ok2 == 1) { PrintLn("Start-Action ausgelöst."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "stop"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet stop <id>"c); return 1; }
+        var numBuf4: int64 := alloc(24);
+        var did4: int64 := StrToInt64(ArgvGet(argv, 4), numBuf4);
+        free(numBuf4, 24);
+        var ok3: int64 := DropletPowerOff(creds, did4);
+        if (ok3 == 1) { PrintLn("Stop-Action ausgelöst."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "reboot"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet reboot <id>"c); return 1; }
+        var numBuf5: int64 := alloc(24);
+        var did5: int64 := StrToInt64(ArgvGet(argv, 4), numBuf5);
+        free(numBuf5, 24);
+        var ok4: int64 := DropletReboot(creds, did5);
+        if (ok4 == 1) { PrintLn("Reboot ausgelöst."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "snapshot"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet snapshot <id> --snapshot-name <n>"c); return 1; }
+        var numBuf6: int64 := alloc(24);
+        var did6: int64 := StrToInt64(ArgvGet(argv, 4), numBuf6);
+        free(numBuf6, 24);
+        var snName: pchar := flagVal(argc, argv, "--snapshot-name"c);
+        if (snName == 0 as pchar) { PrintLn("Pflicht: --snapshot-name"c); return 1; }
+        var ok5: int64 := DropletSnapshot(creds, did6, snName);
+        if (ok5 == 1) { PrintLn("Snapshot-Action ausgelöst."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "resize"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet resize <id> --size <s>"c); return 1; }
+        var numBuf7: int64 := alloc(24);
+        var did7: int64 := StrToInt64(ArgvGet(argv, 4), numBuf7);
+        free(numBuf7, 24);
+        var newSize: pchar := flagVal(argc, argv, "--size"c);
+        if (newSize == 0 as pchar) { PrintLn("Pflicht: --size"c); return 1; }
+        var resizeDisk: int64 := flagBool(argc, argv, "--resize-disk"c);
+        var ok6: int64 := DropletResize(creds, did7, newSize, resizeDisk);
+        if (ok6 == 1) { PrintLn("Resize-Action ausgelöst."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    if (argEq(sub, "ip"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute droplet ip <id>"c); return 1; }
+        var numBuf8: int64 := alloc(24);
+        var did8: int64 := StrToInt64(ArgvGet(argv, 4), numBuf8);
+        free(numBuf8, 24);
+        var ip: int64 := DropletGetIP(creds, did8);
+        if (ip == 0) { PrintLn("(keine IP)"c); } else { PrintLn(ip as pchar); free(ip, StrLen(ip as pchar)+1); }
+        return 0;
+    }
+
+    PrintLn("Unbekannter compute droplet Unterbefehl."c);
+    return 1;
+}
+
+fn cmdComputeSSHKey(creds: DOCredentials, argc: int64, argv: pchar): int64 {
+    if (argc < 4) { PrintLn("Usage: lyxdo compute ssh-key <list|create|delete>"c); return 1; }
+    var sub: pchar := ArgvGet(argv, 3);
+
+    if (argEq(sub, "list"c) == 1) {
+        var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+        var json: int64 := DOGetAll(cl, "/v2/account/keys"c, "ssh_keys"c);
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+        return 0;
+    }
+
+    if (argEq(sub, "create"c) == 1) {
+        var name: pchar   := flagVal(argc, argv, "--name"c);
+        var keyFile: pchar := flagVal(argc, argv, "--public-key-file"c);
+        if (name == 0 as pchar || keyFile == 0 as pchar) {
+            PrintLn("Pflicht: --name --public-key-file"c); return 1;
+        }
+        var keySz: int64 := FileSize(keyFile);
+        if (keySz <= 0) { PrintLn("Public-Key-Datei nicht gefunden."c); return 1; }
+        var keyData: int64 := alloc(keySz + 1);
+        ReadFile(keyFile, keyData as pchar, keySz);
+        poke8(keyData+keySz,0);
+        var key: DOSSHKey := SSHKeyCreate(creds, name, keyData as pchar);
+        free(keyData, keySz + 1);
+        if (key.id == 0) { PrintLn("Fehler beim Erstellen."c); return 1; }
+        Print("SSH-Key ID: "c); PrintLn(key.id as pchar);
+        SSHKeyFree(key);
+        return 0;
+    }
+
+    if (argEq(sub, "delete"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo compute ssh-key delete <id>"c); return 1; }
+        var ok: int64 := SSHKeyDelete(creds, ArgvGet(argv, 4));
+        if (ok == 1) { PrintLn("SSH-Key gelöscht."c); } else { PrintLn("Fehler."c); }
+        return 0;
+    }
+
+    PrintLn("Unbekannter ssh-key Unterbefehl."c);
+    return 1;
+}
+
+fn cmdCompute(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo compute <droplet|ssh-key|image|size>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "droplet"c) == 1) { ret := cmdComputeDroplet(creds, argc, argv); }
+    else if (argEq(sub, "ssh-key"c) == 1) { ret := cmdComputeSSHKey(creds, argc, argv); }
+    else if (argEq(sub, "image"c) == 1) {
+        var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+        var typeFlag: pchar := flagVal(argc, argv, "--type"c);
+        var path: pchar := "/v2/images?type=distribution"c;
+        if (typeFlag != 0 as pchar) { path := "/v2/images"c; }
+        var json: int64 := DOGetAll(cl, path, "images"c);
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+    }
+    else if (argEq(sub, "size"c) == 1) {
+        var cl2: DOClient; cl2.token := creds.token; cl2.tokenLen := creds.tokenLen;
+        var json2: int64 := DOGetAll(cl2, "/v2/sizes"c, "sizes"c);
+        if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+    }
+    else { PrintLn("Unbekannter compute Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- spaces ---
+
+fn cmdSpaces(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo spaces <ls|cp|rm|mb|rb|url|presign>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var region: pchar := flagVal(argc, argv, "--region"c);
+    if (region == 0 as pchar) { region := "fra1"c; }
+    var ret: int64 := 0;
+
+    if (argEq(sub, "ls"c) == 1) {
+        if (argc >= 4) {
+            // parse spaces://<bucket>[/<prefix>] or just <bucket>
+            var arg: pchar := ArgvGet(argv, 3);
+            var prefix: pchar := 0 as pchar;
+            var bucket: pchar := arg;
+            // find '/'
+            var sl: int64 := StrLen(arg);
+            var j: int64 := 0;
+            while(j<sl){if((StrCharAt(arg,j)&0xFF)==47){prefix:=((arg as int64)+j+1) as pchar;break;}j:=j+1;}
+            var json: int64 := SpacesObjectList(creds, bucket, region, prefix);
+            if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+        } else {
+            var json: int64 := SpacesBucketList(creds, region);
+            if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+        }
+    }
+    else if (argEq(sub, "cp"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo spaces cp <src> spaces://<bucket>/<key>"c); ret := 1; }
+        else {
+            var src: pchar := ArgvGet(argv, 3);
+            var dst: pchar := ArgvGet(argv, 4);
+            // check if src is spaces:// (download) or dst is spaces:// (upload)
+            var schemeSrc: pchar := "spaces://"c;
+            var schemeDst: pchar := "spaces://"c;
+            if (argStart(src, schemeSrc) == 1) {
+                // download: spaces://<bucket>/<key> → local
+                var rest: pchar := argAfter(src, schemeSrc);
+                var rlen: int64 := StrLen(rest);
+                var bucket: pchar := rest;
+                var key: pchar := 0 as pchar;
+                var j: int64 := 0;
+                while(j<rlen){if((StrCharAt(rest,j)&0xFF)==47){key:=((rest as int64)+j+1) as pchar;poke8(rest as int64+j,0);break;}j:=j+1;}
+                if (key == 0 as pchar) { PrintLn("Ungültiges Format: spaces://<bucket>/<key>"c); ret := 1; }
+                else { var r: int64 := SpacesObjectGetFile(creds, bucket, region, key, dst); if(r==0){PrintLn("Heruntergeladen."c);}else{PrintLn("Fehler."c);ret:=1;} }
+            } else if (argStart(dst, schemeDst) == 1) {
+                // upload: local → spaces://<bucket>/<key>
+                var rest2: pchar := argAfter(dst, schemeDst);
+                var rlen2: int64 := StrLen(rest2);
+                var bucket2: pchar := rest2;
+                var key2: pchar := 0 as pchar;
+                var j2: int64 := 0;
+                while(j2<rlen2){if((StrCharAt(rest2,j2)&0xFF)==47){key2:=((rest2 as int64)+j2+1) as pchar;poke8(rest2 as int64+j2,0);break;}j2:=j2+1;}
+                if (key2 == 0 as pchar) { PrintLn("Ungültiges Format: spaces://<bucket>/<key>"c); ret := 1; }
+                else { var r2: int64 := SpacesObjectPutFile(creds, bucket2, region, key2, src); if(r2==0){PrintLn("Hochgeladen."c);}else{PrintLn("Fehler."c);ret:=1;} }
+            } else { PrintLn("Mindestens src oder dst muss spaces:// sein."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "rm"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo spaces rm spaces://<bucket>/<key>"c); ret := 1; }
+        else {
+            var arg: pchar := ArgvGet(argv, 3);
+            var scheme: pchar := "spaces://"c;
+            var rest: pchar := argAfter(arg, scheme);
+            var rlen: int64 := StrLen(rest);
+            var bucket: pchar := rest;
+            var key: pchar := 0 as pchar;
+            var j: int64 := 0;
+            while(j<rlen){if((StrCharAt(rest,j)&0xFF)==47){key:=((rest as int64)+j+1) as pchar;poke8(rest as int64+j,0);break;}j:=j+1;}
+            var ok: int64 := SpacesObjectDelete(creds, bucket, region, key);
+            if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "mb"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo spaces mb <bucket>"c); ret := 1; }
+        else {
+            var ok2: int64 := SpacesBucketCreate(creds, ArgvGet(argv, 3), region);
+            if (ok2 == 1) { PrintLn("Bucket erstellt."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "rb"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo spaces rb <bucket>"c); ret := 1; }
+        else {
+            var ok3: int64 := SpacesBucketDelete(creds, ArgvGet(argv, 3), region);
+            if (ok3 == 1) { PrintLn("Bucket gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "url"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo spaces url <bucket>/<key>"c); ret := 1; }
+        else {
+            var arg2: pchar := ArgvGet(argv, 3);
+            var alen: int64 := StrLen(arg2);
+            var bucket3: pchar := arg2;
+            var key3: pchar := 0 as pchar;
+            var j3: int64 := 0;
+            while(j3<alen){if((StrCharAt(arg2,j3)&0xFF)==47){key3:=((arg2 as int64)+j3+1) as pchar;poke8(arg2 as int64+j3,0);break;}j3:=j3+1;}
+            var url: int64 := SpacesPresignURL(creds, bucket3, region, key3, 3600);
+            if (url != 0) { PrintLn(url as pchar); free(url, StrLen(url as pchar)+1); }
+        }
+    }
+    else if (argEq(sub, "presign"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo spaces presign <bucket>/<key> [--ttl 3600]"c); ret := 1; }
+        else {
+            var arg3: pchar := ArgvGet(argv, 3);
+            var alen2: int64 := StrLen(arg3);
+            var bucket4: pchar := arg3;
+            var key4: pchar := 0 as pchar;
+            var j4: int64 := 0;
+            while(j4<alen2){if((StrCharAt(arg3,j4)&0xFF)==47){key4:=((arg3 as int64)+j4+1) as pchar;poke8(arg3 as int64+j4,0);break;}j4:=j4+1;}
+            var ttlStr: pchar := flagVal(argc, argv, "--ttl"c);
+            var ttl: int64 := 3600;
+            if (ttlStr != 0 as pchar) { var nb: int64 := alloc(24); ttl := StrToInt64(ttlStr, nb); free(nb, 24); }
+            var url2: int64 := SpacesPresignURL(creds, bucket4, region, key4, ttl);
+            if (url2 != 0) { PrintLn(url2 as pchar); free(url2, StrLen(url2 as pchar)+1); }
+        }
+    }
+    else { PrintLn("Unbekannter spaces Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- database ---
+
+fn cmdDatabase(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo database <list|get|create|delete|connection|user|db|pool|firewall|replica>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+    var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+
+    if (argEq(sub, "list"c) == 1) {
+        var json: int64 := DOGetAll(cl, "/v2/databases"c, "databases"c);
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+    }
+    else if (argEq(sub, "get"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo database get <id>"c); ret := 1; }
+        else {
+            var d: DODatabase := DatabaseGet(creds, ArgvGet(argv, 3));
+            printKS("ID"c, d.id);
+            printKS("Name"c, d.name);
+            printKS("Engine"c, d.engine);
+            printKS("Status"c, d.status);
+            printKS("Region"c, d.region);
+            DODatabaseFree(d);
+        }
+    }
+    else if (argEq(sub, "create"c) == 1) {
+        var name: pchar   := flagVal(argc, argv, "--name"c);
+        var engine: pchar := flagVal(argc, argv, "--engine"c);
+        var version: pchar := flagVal(argc, argv, "--version"c);
+        var region: pchar := flagVal(argc, argv, "--region"c);
+        var size: pchar   := flagVal(argc, argv, "--size"c);
+        if (name == 0 as pchar || engine == 0 as pchar || region == 0 as pchar || size == 0 as pchar) {
+            PrintLn("Pflicht: --name --engine --region --size"c); ret := 1;
+        } else {
+            if (version == 0 as pchar) { version := "latest"c; }
+            var d2: DODatabase := DatabaseCreate(creds, name, engine, version, region, size, 1);
+            if (d2.id == 0) { PrintLn("Fehler beim Erstellen."c); ret := 1; }
+            else { Print("Erstellt: "c); PrintLn(d2.id as pchar); DODatabaseFree(d2); }
+        }
+    }
+    else if (argEq(sub, "delete"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo database delete <id>"c); ret := 1; }
+        else {
+            var ok: int64 := DatabaseDelete(creds, ArgvGet(argv, 3));
+            if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "connection"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo database connection <id>"c); ret := 1; }
+        else {
+            var conn: DODBConnection := DatabaseGetConnection(creds, ArgvGet(argv, 3));
+            printKS("URI"c, conn.uri);
+            printKS("Host"c, conn.host);
+            printKS("User"c, conn.user);
+            printKS("Password"c, conn.password);
+            DODBConnectionFree(conn);
+        }
+    }
+    else if (argEq(sub, "user"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo database user <list|create> <db-id> [username]"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            var dbId: pchar   := ArgvGet(argv, 4);
+            if (argEq(action, "list"c) == 1) {
+                var json2: int64 := DOGetAll(cl, "/v2/databases"c, "users"c);
+                if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+            } else if (argEq(action, "create"c) == 1) {
+                if (argc < 6) { PrintLn("Usage: lyxdo database user create <db-id> <username>"c); ret := 1; }
+                else {
+                    var u: DODBUser := DatabaseUserCreate(creds, dbId, ArgvGet(argv, 5));
+                    printKS("Username"c, u.name);
+                    printKS("Password"c, u.password);
+                    DODBUserFree(u);
+                }
+            }
+        }
+    }
+    else if (argEq(sub, "replica"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo database replica <list|create> <db-id>"c); ret := 1; }
+        else {
+            var action2: pchar := ArgvGet(argv, 3);
+            var dbId2: pchar   := ArgvGet(argv, 4);
+            if (argEq(action2, "list"c) == 1) {
+                var json3: int64 := DatabaseReplicaList(creds, dbId2);
+                if (json3 != 0) { PrintLn(json3 as pchar); free(json3, StrLen(json3 as pchar)+1); }
+            } else if (argEq(action2, "create"c) == 1) {
+                var rname: pchar  := flagVal(argc, argv, "--name"c);
+                var rreg: pchar   := flagVal(argc, argv, "--region"c);
+                if (rname == 0 as pchar || rreg == 0 as pchar) { PrintLn("Pflicht: --name --region"c); ret := 1; }
+                else {
+                    var rep: DODatabase := DatabaseReplicaCreate(creds, dbId2, rname, rreg);
+                    printKS("Replica-ID"c, rep.id);
+                    DODatabaseFree(rep);
+                }
+            }
+        }
+    }
+    else { PrintLn("Unbekannter database Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- kubernetes ---
+
+fn cmdKubernetes(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo kubernetes cluster|node-pool"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "cluster"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo kubernetes cluster <list|get|create|delete|kubeconfig|versions>"c); DOCredentialsFree(creds); return 1; }
+        var action: pchar := ArgvGet(argv, 3);
+
+        if (argEq(action, "list"c) == 1) {
+            var json: int64 := K8sClusterList(creds);
+            if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+        }
+        else if (argEq(action, "get"c) == 1) {
+            if (argc < 5) { PrintLn("Usage: lyxdo kubernetes cluster get <id>"c); ret := 1; }
+            else {
+                var c2: DOK8sCluster := K8sClusterGet(creds, ArgvGet(argv, 4));
+                printKS("ID"c, c2.id);
+                printKS("Name"c, c2.name);
+                printKS("Status"c, c2.status);
+                printKS("Region"c, c2.region);
+                printKS("Version"c, c2.version);
+                printKS("Endpoint"c, c2.endpoint);
+                printKS("IPv4"c, c2.ipv4);
+                DOK8sClusterFree(c2);
+            }
+        }
+        else if (argEq(action, "create"c) == 1) {
+            var name: pchar    := flagVal(argc, argv, "--name"c);
+            var region: pchar  := flagVal(argc, argv, "--region"c);
+            var version: pchar := flagVal(argc, argv, "--version"c);
+            var nsize: pchar   := flagVal(argc, argv, "--node-size"c);
+            var ncountStr: pchar := flagVal(argc, argv, "--node-count"c);
+            if (name == 0 as pchar || region == 0 as pchar || version == 0 as pchar || nsize == 0 as pchar) {
+                PrintLn("Pflicht: --name --region --version --node-size"c); ret := 1;
+            } else {
+                var ncount: int64 := 3;
+                if (ncountStr != 0 as pchar) { var nb: int64 := alloc(24); ncount := StrToInt64(ncountStr, nb); free(nb, 24); }
+                var c3: DOK8sCluster := K8sClusterCreate(creds, name, region, version, nsize, ncount);
+                if (c3.id == 0) { PrintLn("Fehler beim Erstellen."c); ret := 1; }
+                else { Print("Cluster-ID: "c); PrintLn(c3.id as pchar); DOK8sClusterFree(c3); }
+            }
+        }
+        else if (argEq(action, "delete"c) == 1) {
+            if (argc < 5) { PrintLn("Usage: lyxdo kubernetes cluster delete <id>"c); ret := 1; }
+            else {
+                var ok: int64 := K8sClusterDelete(creds, ArgvGet(argv, 4));
+                if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+            }
+        }
+        else if (argEq(action, "kubeconfig"c) == 1) {
+            if (argc < 6) { PrintLn("Usage: lyxdo kubernetes cluster kubeconfig save <id> [--output <path>]"c); ret := 1; }
+            else {
+                var saveFlag: pchar := ArgvGet(argv, 4);
+                if (argEq(saveFlag, "save"c) == 1) {
+                    var id: pchar := ArgvGet(argv, 5);
+                    var outPath: pchar := flagVal(argc, argv, "--output"c);
+                    if (outPath == 0 as pchar) { outPath := "kubeconfig.yaml"c; }
+                    var ok2: int64 := K8sKubeconfigSave(creds, id, outPath);
+                    if (ok2 == 0) { Print("Kubeconfig gespeichert: "c); PrintLn(outPath); }
+                    else { PrintLn("Fehler."c); ret := 1; }
+                } else { PrintLn("Unbekannte kubeconfig-Aktion."c); ret := 1; }
+            }
+        }
+        else if (argEq(action, "versions"c) == 1) {
+            var json2: int64 := K8sVersionList(creds);
+            if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+        }
+        else { PrintLn("Unbekannte cluster Aktion."c); ret := 1; }
+    }
+    else if (argEq(sub, "node-pool"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo kubernetes node-pool <list|create|update|delete> <cluster-id>"c); DOCredentialsFree(creds); return 1; }
+        var action2: pchar := ArgvGet(argv, 3);
+        var cid: pchar     := ArgvGet(argv, 4);
+
+        if (argEq(action2, "list"c) == 1) {
+            var json3: int64 := K8sNodePoolList(creds, cid);
+            if (json3 != 0) { PrintLn(json3 as pchar); free(json3, StrLen(json3 as pchar)+1); }
+        }
+        else if (argEq(action2, "create"c) == 1) {
+            var pname: pchar  := flagVal(argc, argv, "--name"c);
+            var psize: pchar  := flagVal(argc, argv, "--size"c);
+            var pcStr: pchar  := flagVal(argc, argv, "--count"c);
+            if (pname == 0 as pchar || psize == 0 as pchar) { PrintLn("Pflicht: --name --size"c); ret := 1; }
+            else {
+                var pc: int64 := 3;
+                if (pcStr != 0 as pchar) { var nb2: int64 := alloc(24); pc := StrToInt64(pcStr, nb2); free(nb2, 24); }
+                var pool: DOK8sNodePool := K8sNodePoolCreate(creds, cid, pname, psize, pc);
+                if (pool.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                else { Print("Pool-ID: "c); PrintLn(pool.id as pchar); DOK8sNodePoolFree(pool); }
+            }
+        }
+        else if (argEq(action2, "update"c) == 1) {
+            if (argc < 6) { PrintLn("Usage: lyxdo kubernetes node-pool update <cluster-id> <pool-id> --count <n>"c); ret := 1; }
+            else {
+                var pid: pchar    := ArgvGet(argv, 5);
+                var cntStr: pchar := flagVal(argc, argv, "--count"c);
+                var cnt: int64 := 3;
+                if (cntStr != 0 as pchar) { var nb3: int64 := alloc(24); cnt := StrToInt64(cntStr, nb3); free(nb3, 24); }
+                var pool2: DOK8sNodePool := K8sNodePoolUpdate(creds, cid, pid, cnt, 0, 0, 0);
+                if (pool2.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                else { PrintLn("Pool aktualisiert."c); DOK8sNodePoolFree(pool2); }
+            }
+        }
+        else if (argEq(action2, "delete"c) == 1) {
+            if (argc < 6) { PrintLn("Usage: lyxdo kubernetes node-pool delete <cluster-id> <pool-id>"c); ret := 1; }
+            else {
+                var ok3: int64 := K8sNodePoolDelete(creds, cid, ArgvGet(argv, 5));
+                if (ok3 == 1) { PrintLn("Pool gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+            }
+        }
+        else { PrintLn("Unbekannte node-pool Aktion."c); ret := 1; }
+    }
+    else { PrintLn("Unbekannter kubernetes Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- networking ---
+
+fn cmdNetworking(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo networking domain|load-balancer|floating-ip|vpc|firewall"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+    var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+
+    if (argEq(sub, "domain"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo networking domain <list|create|delete|records>"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            if (argEq(action, "list"c) == 1) {
+                var json: int64 := DOGetAll(cl, "/v2/domains"c, "domains"c);
+                if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+            }
+            else if (argEq(action, "create"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking domain create <domain> --ip <ip>"c); ret := 1; }
+                else {
+                    var ip: pchar := flagVal(argc, argv, "--ip"c);
+                    var ok: int64 := DomainCreate(creds, ArgvGet(argv, 4), ip);
+                    if (ok == 1) { PrintLn("Domain erstellt."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else if (argEq(action, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking domain delete <domain>"c); ret := 1; }
+                else {
+                    var ok2: int64 := DomainDelete(creds, ArgvGet(argv, 4));
+                    if (ok2 == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else if (argEq(action, "records"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking domain records <list|create|delete> <domain>"c); ret := 1; }
+                else {
+                    var raction: pchar := ArgvGet(argv, 4);
+                    var domain: pchar  := ArgvGet(argv, 5);
+                    if (argEq(raction, "list"c) == 1) {
+                        var json2: int64 := DomainRecordList(creds, domain);
+                        if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+                    }
+                    else if (argEq(raction, "create"c) == 1) {
+                        var rtype: pchar := flagVal(argc, argv, "--type"c);
+                        var rname: pchar := flagVal(argc, argv, "--name"c);
+                        var rdata: pchar := flagVal(argc, argv, "--data"c);
+                        var rttlStr: pchar := flagVal(argc, argv, "--ttl"c);
+                        var rttl: int64 := 300;
+                        if (rttlStr != 0 as pchar) { var nb: int64 := alloc(24); rttl := StrToInt64(rttlStr, nb); free(nb, 24); }
+                        if (rtype == 0 as pchar) { rtype := "A"c; }
+                        if (rname == 0 as pchar) { rname := "@"c; }
+                        var r: DODNSRecord := DomainRecordCreate(creds, domain, rtype, rname, rdata, rttl);
+                        if (r.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                        else { Print("Record-ID: "c); var nb2: int64 := alloc(24); PrintLn(Int64ToStr(r.id, nb2)); free(nb2, 24); DODNSRecordFree(r); }
+                    }
+                    else if (argEq(raction, "delete"c) == 1) {
+                        if (argc < 7) { PrintLn("Usage: lyxdo networking domain records delete <domain> <record-id>"c); ret := 1; }
+                        else {
+                            var nb3: int64 := alloc(24);
+                            var rid: int64 := StrToInt64(ArgvGet(argv, 6), nb3);
+                            free(nb3, 24);
+                            var ok3: int64 := DomainRecordDelete(creds, domain, rid);
+                            if (ok3 == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                        }
+                    }
+                    else { PrintLn("Unbekannte records Aktion."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte domain Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "floating-ip"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo networking floating-ip <list|create|assign|unassign|delete>"c); ret := 1; }
+        else {
+            var action2: pchar := ArgvGet(argv, 3);
+            if (argEq(action2, "list"c) == 1) {
+                var json3: int64 := FloatingIPList(creds);
+                if (json3 != 0) { PrintLn(json3 as pchar); free(json3, StrLen(json3 as pchar)+1); }
+            }
+            else if (argEq(action2, "create"c) == 1) {
+                var reg: pchar := flagVal(argc, argv, "--region"c);
+                if (reg == 0 as pchar) { reg := "fra1"c; }
+                var fip: DOFloatingIP := FloatingIPCreate(creds, reg);
+                printKS("IP"c, fip.ip);
+                DOFloatingIPFree(fip);
+            }
+            else if (argEq(action2, "assign"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking floating-ip assign <ip> --droplet-id <id>"c); ret := 1; }
+                else {
+                    var ip: pchar := ArgvGet(argv, 4);
+                    var didStr: pchar := flagVal(argc, argv, "--droplet-id"c);
+                    var nb4: int64 := alloc(24);
+                    var did: int64 := StrToInt64(didStr, nb4);
+                    free(nb4, 24);
+                    var ok4: int64 := FloatingIPAssign(creds, ip, did);
+                    if (ok4 == 1) { PrintLn("Zugewiesen."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else if (argEq(action2, "unassign"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking floating-ip unassign <ip>"c); ret := 1; }
+                else {
+                    var ok5: int64 := FloatingIPUnassign(creds, ArgvGet(argv, 4));
+                    if (ok5 == 1) { PrintLn("Freigegeben."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else if (argEq(action2, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking floating-ip delete <ip>"c); ret := 1; }
+                else {
+                    var ok6: int64 := FloatingIPDelete(creds, ArgvGet(argv, 4));
+                    if (ok6 == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte floating-ip Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "vpc"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo networking vpc <list|create|delete>"c); ret := 1; }
+        else {
+            var action3: pchar := ArgvGet(argv, 3);
+            if (argEq(action3, "list"c) == 1) {
+                var json4: int64 := VPCList(creds);
+                if (json4 != 0) { PrintLn(json4 as pchar); free(json4, StrLen(json4 as pchar)+1); }
+            }
+            else if (argEq(action3, "create"c) == 1) {
+                var vname: pchar   := flagVal(argc, argv, "--name"c);
+                var vreg: pchar    := flagVal(argc, argv, "--region"c);
+                var vrange: pchar  := flagVal(argc, argv, "--ip-range"c);
+                if (vname == 0 as pchar || vreg == 0 as pchar) { PrintLn("Pflicht: --name --region"c); ret := 1; }
+                else {
+                    var vpc: DOVPC := VPCCreate(creds, vname, vreg, vrange);
+                    printKS("VPC-ID"c, vpc.id);
+                    DOVPCFree(vpc);
+                }
+            }
+            else if (argEq(action3, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking vpc delete <id>"c); ret := 1; }
+                else {
+                    var ok7: int64 := VPCDelete(creds, ArgvGet(argv, 4));
+                    if (ok7 == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte vpc Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "load-balancer"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo networking load-balancer <list|get|create|delete|add-droplets>"c); ret := 1; }
+        else {
+            var action4: pchar := ArgvGet(argv, 3);
+            if (argEq(action4, "list"c) == 1) {
+                var json5: int64 := LBList(creds);
+                if (json5 != 0) { PrintLn(json5 as pchar); free(json5, StrLen(json5 as pchar)+1); }
+            }
+            else if (argEq(action4, "get"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking load-balancer get <id>"c); ret := 1; }
+                else {
+                    var lb: DOLoadBalancer := LBGet(creds, ArgvGet(argv, 4));
+                    printKS("ID"c, lb.id);
+                    printKS("Name"c, lb.name);
+                    printKS("Status"c, lb.status);
+                    printKS("IP"c, lb.ip);
+                    DOLoadBalancerFree(lb);
+                }
+            }
+            else if (argEq(action4, "create"c) == 1) {
+                var lname: pchar := flagVal(argc, argv, "--name"c);
+                var lreg: pchar  := flagVal(argc, argv, "--region"c);
+                var dids: pchar  := flagVal(argc, argv, "--droplet-ids"c);
+                if (lname == 0 as pchar || lreg == 0 as pchar) { PrintLn("Pflicht: --name --region"c); ret := 1; }
+                else {
+                    var lb2: DOLoadBalancer := LBCreate(creds, lname, lreg, dids);
+                    if (lb2.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                    else { Print("LB-ID: "c); PrintLn(lb2.id as pchar); DOLoadBalancerFree(lb2); }
+                }
+            }
+            else if (argEq(action4, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking load-balancer delete <id>"c); ret := 1; }
+                else {
+                    var ok8: int64 := LBDelete(creds, ArgvGet(argv, 4));
+                    if (ok8 == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte load-balancer Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "firewall"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo networking firewall <list|get|create|add-rules|add-droplets>"c); ret := 1; }
+        else {
+            var action5: pchar := ArgvGet(argv, 3);
+            if (argEq(action5, "list"c) == 1) {
+                var json6: int64 := FirewallList(creds);
+                if (json6 != 0) { PrintLn(json6 as pchar); free(json6, StrLen(json6 as pchar)+1); }
+            }
+            else if (argEq(action5, "get"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo networking firewall get <id>"c); ret := 1; }
+                else {
+                    var fw: DOFirewall := FirewallGet(creds, ArgvGet(argv, 4));
+                    printKS("ID"c, fw.id);
+                    printKS("Name"c, fw.name);
+                    printKS("Status"c, fw.status);
+                    DOFirewallFree(fw);
+                }
+            }
+            else if (argEq(action5, "create"c) == 1) {
+                var fname: pchar := flagVal(argc, argv, "--name"c);
+                if (fname == 0 as pchar) { PrintLn("Pflicht: --name"c); ret := 1; }
+                else {
+                    var fw2: DOFirewall := FirewallCreate(creds, fname);
+                    if (fw2.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                    else { Print("Firewall-ID: "c); PrintLn(fw2.id as pchar); DOFirewallFree(fw2); }
+                }
+            }
+            else { PrintLn("Unbekannte firewall Aktion."c); ret := 1; }
+        }
+    }
+    else { PrintLn("Unbekannter networking Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- volume ---
+
+fn cmdVolume(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo volume <list|get|create|delete|attach|detach|snapshot>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+    var cl: DOClient; cl.token := creds.token; cl.tokenLen := creds.tokenLen;
+
+    if (argEq(sub, "list"c) == 1) {
+        var json: int64 := DOGetAll(cl, "/v2/volumes"c, "volumes"c);
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+    }
+    else if (argEq(sub, "get"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo volume get <id>"c); ret := 1; }
+        else {
+            var v: DOVolume := VolumeGet(creds, ArgvGet(argv, 3));
+            printKS("ID"c, v.id);
+            printKS("Name"c, v.name);
+            printKS("Region"c, v.region);
+            printKS("Status"c, v.status);
+            printKV("Size (GB)"c, v.sizeGiB);
+            DOVolumeFree(v);
+        }
+    }
+    else if (argEq(sub, "create"c) == 1) {
+        var name: pchar    := flagVal(argc, argv, "--name"c);
+        var region: pchar  := flagVal(argc, argv, "--region"c);
+        var sizeStr: pchar := flagVal(argc, argv, "--size"c);
+        if (name == 0 as pchar || region == 0 as pchar || sizeStr == 0 as pchar) {
+            PrintLn("Pflicht: --name --region --size"c); ret := 1;
+        } else {
+            var nb: int64 := alloc(24);
+            var sz: int64 := StrToInt64(sizeStr, nb);
+            free(nb, 24);
+            var v2: DOVolume := VolumeCreate(creds, name, region, sz);
+            if (v2.id == 0) { PrintLn("Fehler."c); ret := 1; }
+            else { Print("Volume-ID: "c); PrintLn(v2.id as pchar); DOVolumeFree(v2); }
+        }
+    }
+    else if (argEq(sub, "delete"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo volume delete <id>"c); ret := 1; }
+        else {
+            var ok: int64 := VolumeDelete(creds, ArgvGet(argv, 3));
+            if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "attach"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo volume attach <id> --droplet-id <did>"c); ret := 1; }
+        else {
+            var didStr: pchar := flagVal(argc, argv, "--droplet-id"c);
+            var nb2: int64 := alloc(24);
+            var did: int64 := StrToInt64(didStr, nb2);
+            free(nb2, 24);
+            var ok2: int64 := VolumeAttach(creds, ArgvGet(argv, 3), did);
+            if (ok2 == 1) { PrintLn("Angehängt."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "detach"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo volume detach <id>"c); ret := 1; }
+        else {
+            var ok3: int64 := VolumeDetach(creds, ArgvGet(argv, 3), 0);
+            if (ok3 == 1) { PrintLn("Getrennt."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "snapshot"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo volume snapshot <id> --snapshot-name <n>"c); ret := 1; }
+        else {
+            var snName: pchar := flagVal(argc, argv, "--snapshot-name"c);
+            if (snName == 0 as pchar) { PrintLn("Pflicht: --snapshot-name"c); ret := 1; }
+            else {
+                var snap: DOSnapshot := VolumeSnapshotCreate(creds, ArgvGet(argv, 3), snName);
+                if (snap.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                else { Print("Snapshot-ID: "c); PrintLn(snap.id as pchar); DOSnapshotFree(snap); }
+            }
+        }
+    }
+    else { PrintLn("Unbekannter volume Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- apps ---
+
+fn cmdApps(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo apps <list|get|create|delete|update|deploy|logs|deployments>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "list"c) == 1) {
+        var json: int64 := AppList(creds);
+        if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+    }
+    else if (argEq(sub, "get"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo apps get <id>"c); ret := 1; }
+        else {
+            var a: DOApp := AppGet(creds, ArgvGet(argv, 3));
+            printKS("ID"c, a.id);
+            printKS("Status"c, a.status);
+            printKS("LiveURL"c, a.liveURL);
+            DOAppFree(a);
+        }
+    }
+    else if (argEq(sub, "create"c) == 1) {
+        var specPath: pchar := flagVal(argc, argv, "--spec"c);
+        if (specPath == 0 as pchar) { PrintLn("Pflicht: --spec <spec.json>"c); ret := 1; }
+        else {
+            var sz: int64 := FileSize(specPath);
+            if (sz <= 0) { PrintLn("Spec-Datei nicht gefunden."c); ret := 1; }
+            else {
+                var specData: int64 := alloc(sz + 1);
+                ReadFile(specPath, specData as pchar, sz);
+                poke8(specData+sz, 0);
+                var a2: DOApp := AppCreateFromSpec(creds, specData, sz);
+                free(specData, sz + 1);
+                if (a2.id == 0) { PrintLn("Fehler."c); ret := 1; }
+                else { Print("App-ID: "c); PrintLn(a2.id as pchar); DOAppFree(a2); }
+            }
+        }
+    }
+    else if (argEq(sub, "delete"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo apps delete <id>"c); ret := 1; }
+        else {
+            var ok: int64 := AppDelete(creds, ArgvGet(argv, 3));
+            if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "deploy"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo apps deploy <id> [--force-rebuild]"c); ret := 1; }
+        else {
+            var force: int64 := flagBool(argc, argv, "--force-rebuild"c);
+            var d: DODeployment := AppDeploy(creds, ArgvGet(argv, 3), force);
+            if (d.id == 0) { PrintLn("Fehler."c); ret := 1; }
+            else { Print("Deployment-ID: "c); PrintLn(d.id as pchar); DODeploymentFree(d); }
+        }
+    }
+    else if (argEq(sub, "logs"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo apps logs <id> [--component <n>] [--type RUN]"c); ret := 1; }
+        else {
+            var comp: pchar := flagVal(argc, argv, "--component"c);
+            var ltype: pchar := flagVal(argc, argv, "--type"c);
+            if (ltype == 0 as pchar) { ltype := "RUN"c; }
+            var json2: int64 := AppLogs(creds, ArgvGet(argv, 3), comp, ltype);
+            if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+        }
+    }
+    else if (argEq(sub, "deployments"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo apps deployments list <id>"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            if (argEq(action, "list"c) == 1) {
+                var json3: int64 := AppDeploymentList(creds, ArgvGet(argv, 4));
+                if (json3 != 0) { PrintLn(json3 as pchar); free(json3, StrLen(json3 as pchar)+1); }
+            } else { PrintLn("Unbekannte deployments Aktion."c); ret := 1; }
+        }
+    }
+    else { PrintLn("Unbekannter apps Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- registry ---
+
+fn cmdRegistry(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo registry <get|docker-credentials|repository|tag|garbage-collection>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "get"c) == 1) {
+        var r: DORegistry := RegistryGet(creds);
+        printKS("Name"c, r.name);
+        printKS("URL"c, r.serverURL);
+        printKS("Region"c, r.region);
+        printKV("Storage (bytes)"c, r.storageUsed);
+        DORegistryFree(r);
+    }
+    else if (argEq(sub, "docker-credentials"c) == 1) {
+        var json: int64 := RegistryDockerLogin(creds);
+        if (json != 0) {
+            var savePath: pchar := flagVal(argc, argv, "--save"c);
+            if (savePath != 0 as pchar) {
+                WriteFile(savePath, json as pchar, StrLen(json as pchar));
+                Print("Gespeichert: "c); PrintLn(savePath);
+            } else { PrintLn(json as pchar); }
+            free(json, StrLen(json as pchar)+1);
+        }
+    }
+    else if (argEq(sub, "repository"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo registry repository list"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            if (argEq(action, "list"c) == 1) {
+                var r2: DORegistry := RegistryGet(creds);
+                if (r2.name == 0) { PrintLn("Kein Registry gefunden."c); ret := 1; }
+                else {
+                    var json2: int64 := RegistryRepositoryList(creds, r2.name as pchar);
+                    if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+                    DORegistryFree(r2);
+                }
+            } else { PrintLn("Unbekannte repository Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "tag"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo registry tag <list|delete> <repo>"c); ret := 1; }
+        else {
+            var action2: pchar := ArgvGet(argv, 3);
+            var repo: pchar    := ArgvGet(argv, 4);
+            var r3: DORegistry := RegistryGet(creds);
+            if (r3.name == 0) { PrintLn("Kein Registry."c); ret := 1; }
+            else {
+                if (argEq(action2, "list"c) == 1) {
+                    var json3: int64 := RegistryTagList(creds, r3.name as pchar, repo);
+                    if (json3 != 0) { PrintLn(json3 as pchar); free(json3, StrLen(json3 as pchar)+1); }
+                }
+                else if (argEq(action2, "delete"c) == 1) {
+                    if (argc < 6) { PrintLn("Usage: lyxdo registry tag delete <repo> <tag>"c); ret := 1; }
+                    else {
+                        var ok: int64 := RegistryTagDelete(creds, r3.name as pchar, repo, ArgvGet(argv, 5));
+                        if (ok == 1) { PrintLn("Tag gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                    }
+                }
+                else { PrintLn("Unbekannte tag Aktion."c); ret := 1; }
+                DORegistryFree(r3);
+            }
+        }
+    }
+    else if (argEq(sub, "garbage-collection"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo registry garbage-collection run"c); ret := 1; }
+        else {
+            var action3: pchar := ArgvGet(argv, 3);
+            if (argEq(action3, "run"c) == 1) {
+                var r4: DORegistry := RegistryGet(creds);
+                if (r4.name == 0) { PrintLn("Kein Registry."c); ret := 1; }
+                else {
+                    var ok2: int64 := RegistryGarbageCollect(creds, r4.name as pchar);
+                    if (ok2 == 1) { PrintLn("GC gestartet."c); } else { PrintLn("Fehler."c); ret := 1; }
+                    DORegistryFree(r4);
+                }
+            } else { PrintLn("Unbekannte GC-Aktion."c); ret := 1; }
+        }
+    }
+    else { PrintLn("Unbekannter registry Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- functions ---
+
+fn cmdFunctions(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo functions <namespace|invoke>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "namespace"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo functions namespace <list|create|delete>"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            if (argEq(action, "list"c) == 1) {
+                var json: int64 := NamespaceList(creds);
+                if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+            }
+            else if (argEq(action, "create"c) == 1) {
+                var label: pchar  := flagVal(argc, argv, "--label"c);
+                var region: pchar := flagVal(argc, argv, "--region"c);
+                if (label == 0 as pchar || region == 0 as pchar) { PrintLn("Pflicht: --label --region"c); ret := 1; }
+                else {
+                    var ns: DONamespace := NamespaceCreate(creds, region, label);
+                    if (ns.uuid == 0) { PrintLn("Fehler."c); ret := 1; }
+                    else { Print("Namespace-UUID: "c); PrintLn(ns.uuid as pchar); DONamespaceFree(ns); }
+                }
+            }
+            else if (argEq(action, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo functions namespace delete <uuid>"c); ret := 1; }
+                else {
+                    var ok: int64 := NamespaceDelete(creds, ArgvGet(argv, 4));
+                    if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte namespace Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "invoke"c) == 1) {
+        if (argc < 5) { PrintLn("Usage: lyxdo functions invoke <ns-uuid> <function> [--param '{\"key\":\"val\"}']"c); ret := 1; }
+        else {
+            var nsId: pchar := ArgvGet(argv, 3);
+            var fn2: pchar  := ArgvGet(argv, 4);
+            var params: pchar := flagVal(argc, argv, "--param"c);
+            var paramsData: int64 := 0;
+            var paramsLen: int64  := 0;
+            if (params != 0 as pchar) { paramsData := params as int64; paramsLen := StrLen(params); }
+            var result: int64 := FunctionInvoke(creds, nsId, fn2, paramsData, paramsLen);
+            if (result != 0) { PrintLn(result as pchar); free(result, StrLen(result as pchar)+1); }
+        }
+    }
+    else { PrintLn("Unbekannter functions Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- monitoring ---
+
+fn cmdMonitoring(argc: int64, argv: pchar): int64 {
+    var creds: DOCredentials := loadCreds(argc, argv);
+    if (creds.tokenLen == 0) { PrintLn("Kein Token."c); return 1; }
+    if (argc < 3) { PrintLn("Usage: lyxdo monitoring <metrics|alert>"c); DOCredentialsFree(creds); return 1; }
+    var sub: pchar := ArgvGet(argv, 2);
+    var ret: int64 := 0;
+
+    if (argEq(sub, "metrics"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo monitoring metrics get <droplet-id> --metric cpu"c); ret := 1; }
+        else {
+            var action: pchar := ArgvGet(argv, 3);
+            if (argEq(action, "get"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo monitoring metrics get <id> --metric <cpu|memory|disk|bandwidth|load>"c); ret := 1; }
+                else {
+                    var metId: pchar    := ArgvGet(argv, 4);
+                    var metric: pchar   := flagVal(argc, argv, "--metric"c);
+                    if (metric == 0 as pchar) { metric := "cpu"c; }
+                    var startStr: pchar := flagVal(argc, argv, "--start"c);
+                    var endStr: pchar   := flagVal(argc, argv, "--end"c);
+                    var ts: int64 := 0; // default: 0 = last hour relative
+                    var te: int64 := 0;
+                    if (startStr != 0 as pchar) { var nb: int64 := alloc(24); ts := StrToInt64(startStr, nb); free(nb, 24); }
+                    if (endStr   != 0 as pchar) { var nb2: int64 := alloc(24); te := StrToInt64(endStr,   nb2); free(nb2, 24); }
+                    var json: int64 := 0;
+                    if (argEq(metric, "cpu"c) == 1)       { json := MetricDropletCPU(creds, metId, ts, te); }
+                    else if (argEq(metric, "memory"c) == 1) { json := MetricDropletMemory(creds, metId, ts, te); }
+                    else if (argEq(metric, "disk"c) == 1)   { json := MetricDropletDisk(creds, metId, ts, te); }
+                    else if (argEq(metric, "bandwidth"c) == 1) { json := MetricDropletBandwidth(creds, metId, ts, te); }
+                    else if (argEq(metric, "load"c) == 1)   { json := MetricDropletLoad(creds, metId, ts, te); }
+                    else { PrintLn("Unbekannte Metrik. Verfügbar: cpu memory disk bandwidth load"c); ret := 1; }
+                    if (json != 0) { PrintLn(json as pchar); free(json, StrLen(json as pchar)+1); }
+                }
+            } else { PrintLn("Unbekannte metrics Aktion."c); ret := 1; }
+        }
+    }
+    else if (argEq(sub, "alert"c) == 1) {
+        if (argc < 4) { PrintLn("Usage: lyxdo monitoring alert <list|create|delete>"c); ret := 1; }
+        else {
+            var action2: pchar := ArgvGet(argv, 3);
+            if (argEq(action2, "list"c) == 1) {
+                var json2: int64 := AlertList(creds);
+                if (json2 != 0) { PrintLn(json2 as pchar); free(json2, StrLen(json2 as pchar)+1); }
+            }
+            else if (argEq(action2, "create"c) == 1) {
+                var atype: pchar   := flagVal(argc, argv, "--type"c);
+                var compare: pchar := flagVal(argc, argv, "--compare"c);
+                var valStr: pchar  := flagVal(argc, argv, "--value"c);
+                var window: pchar  := flagVal(argc, argv, "--window"c);
+                var email: pchar   := flagVal(argc, argv, "--emails"c);
+                var dids: pchar    := flagVal(argc, argv, "--droplet-ids"c);
+                if (atype == 0 as pchar || compare == 0 as pchar || valStr == 0 as pchar) {
+                    PrintLn("Pflicht: --type --compare --value"c); ret := 1;
+                } else {
+                    if (window == 0 as pchar) { window := "5m"c; }
+                    var nb3: int64 := alloc(24);
+                    var aval: int64 := StrToInt64(valStr, nb3);
+                    free(nb3, 24);
+                    var a: DOAlert := AlertCreate(creds, "lyxdo-alert"c, atype, compare, aval, window, email, dids);
+                    if (a.uuid == 0) { PrintLn("Fehler."c); ret := 1; }
+                    else { Print("Alert-UUID: "c); PrintLn(a.uuid as pchar); DOAlertFree(a); }
+                }
+            }
+            else if (argEq(action2, "delete"c) == 1) {
+                if (argc < 5) { PrintLn("Usage: lyxdo monitoring alert delete <uuid>"c); ret := 1; }
+                else {
+                    var ok: int64 := AlertDelete(creds, ArgvGet(argv, 4));
+                    if (ok == 1) { PrintLn("Gelöscht."c); } else { PrintLn("Fehler."c); ret := 1; }
+                }
+            }
+            else { PrintLn("Unbekannte alert Aktion."c); ret := 1; }
+        }
+    }
+    else { PrintLn("Unbekannter monitoring Unterbefehl."c); ret := 1; }
+
+    DOCredentialsFree(creds);
+    return ret;
+}
+
+// --- main ---
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    if (argc < 2) { usage(); return 0; }
+
+    var cmd: pchar := ArgvGet(argv, 1);
+
+    if (argEq(cmd, "--help"c) == 1 || argEq(cmd, "-h"c) == 1) { usage(); return 0; }
+    if (argEq(cmd, "--version"c) == 1 || argEq(cmd, "-v"c) == 1) {
+        PrintLn("lyxdo 0.1.0 (DigitalOcean CLI, Lyx)"c);
+        return 0;
+    }
+
+    if (argEq(cmd, "auth"c)       == 1) { return cmdAuth(argc, argv); }
+    if (argEq(cmd, "account"c)    == 1) { return cmdAccount(argc, argv); }
+    if (argEq(cmd, "compute"c)    == 1) { return cmdCompute(argc, argv); }
+    if (argEq(cmd, "spaces"c)     == 1) { return cmdSpaces(argc, argv); }
+    if (argEq(cmd, "database"c)   == 1) { return cmdDatabase(argc, argv); }
+    if (argEq(cmd, "kubernetes"c) == 1) { return cmdKubernetes(argc, argv); }
+    if (argEq(cmd, "networking"c) == 1) { return cmdNetworking(argc, argv); }
+    if (argEq(cmd, "volume"c)     == 1) { return cmdVolume(argc, argv); }
+    if (argEq(cmd, "apps"c)       == 1) { return cmdApps(argc, argv); }
+    if (argEq(cmd, "registry"c)   == 1) { return cmdRegistry(argc, argv); }
+    if (argEq(cmd, "functions"c)  == 1) { return cmdFunctions(argc, argv); }
+    if (argEq(cmd, "monitoring"c) == 1) { return cmdMonitoring(argc, argv); }
+
+    Print("Unbekannter Befehl: "c);
+    PrintLn(cmd);
+    PrintLn("Führe 'lyxdo --help' für Hilfe aus."c);
+    return 1;
+}
