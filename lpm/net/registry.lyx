@@ -12,9 +12,11 @@ unit lpm.net.registry;
 import std.string;
 import std.alloc;
 import std.io;
+import lpm.core.lpmutil;
 import std.net.https;
 import std.net.http;
 import std.json;
+import lpm.core.semver;
 
 // ============================================================================
 // Konstanten
@@ -78,7 +80,7 @@ fn regStrdup(s: int64): int64 {
     if (s == 0) { return 0; }
     var len: int64 := StrLen(s);
     var buf: int64 := alloc(len + 1);
-    StrCpyN(buf, s, len);
+    lpmCpyN(buf, s, len);
     poke8(buf + len, 0);
     return buf;
 }
@@ -88,8 +90,8 @@ fn buildUrl(baseUrl: int64, path: int64): int64 {
     var bLen: int64 := StrLen(baseUrl);
     var pLen: int64 := StrLen(path);
     var url: int64 := alloc(bLen + pLen + 4);
-    StrCpyN(url, baseUrl, bLen);
-    StrCpyN(url + bLen, path, pLen);
+    lpmCpyN(url, baseUrl, bLen);
+    lpmCpyN(url + bLen, path, pLen);
     poke8(url + bLen + pLen, 0);
     return url;
 }
@@ -101,15 +103,15 @@ fn httpGet(baseUrl: int64, path: int64, apiKey: int64): int64 {
 
     // Host aus baseUrl extrahieren (alles nach "https://")
     var host: int64 := url;
-    if (StrCmpN(url, "https://", 8) == 0) { host := url + 8; }
-    else if (StrCmpN(url, "http://", 7) == 0) { host := url + 7; }
+    if (lpmCmpN(url, "https://", 8) == 0) { host := url + 8; }
+    else if (lpmCmpN(url, "http://", 7) == 0) { host := url + 7; }
 
     // Host endet vor dem ersten '/'
     var hostLen: int64 := 0;
     while ((peek8(host + hostLen) != 0) & (peek8(host + hostLen) != 47)) { hostLen := hostLen + 1; }
 
     var hostBuf: int64 := alloc(hostLen + 1);
-    StrCpyN(hostBuf, host, hostLen);
+    lpmCpyN(hostBuf, host, hostLen);
     poke8(hostBuf + hostLen, 0);
 
     // Pfad = alles ab dem '/'
@@ -117,7 +119,7 @@ fn httpGet(baseUrl: int64, path: int64, apiKey: int64): int64 {
     if (peek8(pathStart) == 0) { pathStart := "/"; }
 
     var resp: HTTPResponse;
-    if (StrCmpN(url, "https://", 8) == 0) {
+    if (lpmCmpN(url, "https://", 8) == 0) {
         resp := HTTPSGet(hostBuf, pathStart);
     } else {
         resp := HTTPGet(hostBuf, pathStart);
@@ -140,13 +142,13 @@ fn httpPost(baseUrl: int64, path: int64, body: int64, apiKey: int64): int64 {
     var url: int64 := buildUrl(baseUrl, path);
 
     var host: int64 := url;
-    if (StrCmpN(url, "https://", 8) == 0) { host := url + 8; }
+    if (lpmCmpN(url, "https://", 8) == 0) { host := url + 8; }
 
     var hostLen: int64 := 0;
     while ((peek8(host + hostLen) != 0) & (peek8(host + hostLen) != 47)) { hostLen := hostLen + 1; }
 
     var hostBuf: int64 := alloc(hostLen + 1);
-    StrCpyN(hostBuf, host, hostLen);
+    lpmCpyN(hostBuf, host, hostLen);
     poke8(hostBuf + hostLen, 0);
 
     var pathStart: int64 := host + hostLen;
@@ -163,8 +165,8 @@ fn httpPost(baseUrl: int64, path: int64, body: int64, apiKey: int64): int64 {
     // Authorization-Header hinzufügen wenn apiKey vorhanden
     if (apiKey != 0) {
         var authVal: int64 := alloc(StrLen(apiKey) + 10);
-        StrCpyN(authVal, "Bearer ", 7);
-        StrCpyN(authVal + 7, apiKey, StrLen(apiKey));
+        lpmCpyN(authVal, "Bearer ", 7);
+        lpmCpyN(authVal + 7, apiKey, StrLen(apiKey));
         poke8(authVal + 7 + StrLen(apiKey), 0);
         // Header in req eintragen (vereinfacht — bei vollständiger HTTPSend-Unterstützung)
         req.headerCount := 1;
@@ -184,12 +186,76 @@ fn httpPost(baseUrl: int64, path: int64, body: int64, apiKey: int64): int64 {
 }
 
 // ============================================================================
+// JSON-Hilfsfunktionen (module-level)
+// ============================================================================
+
+fn regNextStr(body: int64, bodyLen: int64, p: int64, res2: int64): int64 {
+    while ((peek8(body + p) != 34) & (p < bodyLen)) { p := p + 1; }
+    if (p >= bodyLen) { poke64(res2, 0); return p; }
+    p := p + 1;
+    var start: int64 := p;
+    while ((peek8(body + p) != 34) & (p < bodyLen)) { p := p + 1; }
+    var len: int64 := p - start;
+    var s: int64 := alloc(len + 1);
+    lpmCpyN(s, body + start, len);
+    poke8(s + len, 0);
+    poke64(res2, s);
+    if (p < bodyLen) { p := p + 1; }
+    return p;
+}
+
+fn regGetField(body: int64, bodyLen: int64, key: int64, keyLen: int64, dst: int64): void {
+    var p2: int64 := 0;
+    while (p2 < bodyLen) {
+        if (lpmCmpN(body + p2, key, keyLen) == 0) {
+            p2 := p2 + keyLen;
+            while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
+            if (p2 >= bodyLen) { return; }
+            p2 := p2 + 1;
+            var start: int64 := p2;
+            while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
+            var len: int64 := p2 - start;
+            var s: int64 := alloc(len + 1);
+            lpmCpyN(s, body + start, len);
+            poke8(s + len, 0);
+            poke64(dst, s);
+            return;
+        }
+        p2 := p2 + 1;
+    }
+}
+
+fn regExtractField(body: int64, key: int64, keyLen: int64): int64 {
+    var p2: int64 := 0;
+    var bodyLen: int64 := StrLen(body);
+    while (p2 < bodyLen) {
+        if (lpmCmpN(body + p2, key, keyLen) == 0) {
+            p2 := p2 + keyLen;
+            while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
+            if (p2 >= bodyLen) { return 0; }
+            p2 := p2 + 1;
+            var start: int64 := p2;
+            while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
+            var len: int64 := p2 - start;
+            var s: int64 := alloc(len + 1);
+            lpmCpyN(s, body + start, len);
+            poke8(s + len, 0);
+            return s;
+        }
+        p2 := p2 + 1;
+    }
+    return 0;
+}
+
+// ============================================================================
 // Öffentliche API
 // ============================================================================
 
 // Initialisiert RegistryClient.
 pub fn RegistryClientInit(rc: int64, baseUrl: int64, apiKey: int64): void {
-    poke64(rc,      regStrdup(baseUrl != 0 ? baseUrl : "https://registry.lyx-lang.org"));
+    var effUrl: int64 := baseUrl;
+    if (effUrl == 0) { effUrl := "https://registry.lyx-lang.org"; }
+    poke64(rc,      regStrdup(effUrl));
     poke64(rc + 8,  regStrdup(apiKey));
     poke64(rc + 16, 0);
 }
@@ -209,9 +275,9 @@ pub fn RegistrySearch(rc: int64, query: int64, out: int64): int64 {
 
     var baseUrl: int64 := peek64(rc);
     var pathBuf: int64 := alloc(StrLen(query) + 32);
-    StrCpyN(pathBuf, "/v1/search?q=", 13);
-    StrCpyN(pathBuf + 13, query, StrLen(query));
-    StrCpyN(pathBuf + 13 + StrLen(query), "&limit=20", 9);
+    lpmCpyN(pathBuf, "/v1/search?q=", 13);
+    lpmCpyN(pathBuf + 13, query, StrLen(query));
+    lpmCpyN(pathBuf + 13 + StrLen(query), "&limit=20", 9);
     poke8(pathBuf + 13 + StrLen(query) + 9, 0);
 
     var body: int64 := httpGet(baseUrl, pathBuf, peek64(rc + 8));
@@ -229,31 +295,16 @@ pub fn RegistrySearch(rc: int64, query: int64, out: int64): int64 {
     var bodyLen: int64 := StrLen(body);
     var count: int64 := 0;
 
-    fn nextStr(p: int64, res2: int64): int64 {
-        while ((peek8(body + p) != 34) & (p < bodyLen)) { p := p + 1; }
-        if (p >= bodyLen) { poke64(res2, 0); return p; }
-        p := p + 1;
-        var start: int64 := p;
-        while ((peek8(body + p) != 34) & (p < bodyLen)) { p := p + 1; }
-        var len: int64 := p - start;
-        var s: int64 := alloc(len + 1);
-        StrCpyN(s, body + start, len);
-        poke8(s + len, 0);
-        poke64(res2, s);
-        if (p < bodyLen) { p := p + 1; }
-        return p;
-    }
-
     while ((pos < bodyLen) & (count < MAX_SEARCH)) {
-        if (StrCmpN(body + pos, "\"name\"", 6) == 0) {
+        if (lpmCmpN(body + pos, "\"name\"", 6) == 0) {
             pos := pos + 6;
             var item: int64 := items + count * 24;
             var tmp: int64 := alloc(8);
-            pos := nextStr(pos, tmp);  poke64(item,      peek64(tmp));
-            pos := nextStr(pos, tmp);  // key "version"
-            pos := nextStr(pos, tmp);  poke64(item + 8,  peek64(tmp));
-            pos := nextStr(pos, tmp);  // key "description"
-            pos := nextStr(pos, tmp);  poke64(item + 16, peek64(tmp));
+            pos := regNextStr(body, bodyLen, pos, tmp);  poke64(item,      peek64(tmp));
+            pos := regNextStr(body, bodyLen, pos, tmp);  // key "version"
+            pos := regNextStr(body, bodyLen, pos, tmp);  poke64(item + 8,  peek64(tmp));
+            pos := regNextStr(body, bodyLen, pos, tmp);  // key "description"
+            pos := regNextStr(body, bodyLen, pos, tmp);  poke64(item + 16, peek64(tmp));
             free(tmp);
             count := count + 1;
         } else {
@@ -286,8 +337,8 @@ pub fn RegistryGetInfo(rc: int64, name: int64, out: int64): int64 {
     if (peek64(rc + 16) == 1) { return ERR_REG_NET; }
 
     var pathBuf: int64 := alloc(StrLen(name) + 16);
-    StrCpyN(pathBuf, "/v1/package/", 12);
-    StrCpyN(pathBuf + 12, name, StrLen(name));
+    lpmCpyN(pathBuf, "/v1/package/", 12);
+    lpmCpyN(pathBuf + 12, name, StrLen(name));
     poke8(pathBuf + 12 + StrLen(name), 0);
 
     var body: int64 := httpGet(peek64(rc), pathBuf, peek64(rc + 8));
@@ -303,32 +354,11 @@ pub fn RegistryGetInfo(rc: int64, name: int64, out: int64): int64 {
     var pos: int64 := 0;
     var bodyLen: int64 := StrLen(body);
 
-    fn getField(key: int64, keyLen: int64, dst: int64): void {
-        var p2: int64 := 0;
-        while (p2 < bodyLen) {
-            if (StrCmpN(body + p2, key, keyLen) == 0) {
-                p2 := p2 + keyLen;
-                while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
-                if (p2 >= bodyLen) { return; }
-                p2 := p2 + 1;
-                var start: int64 := p2;
-                while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
-                var len: int64 := p2 - start;
-                var s: int64 := alloc(len + 1);
-                StrCpyN(s, body + start, len);
-                poke8(s + len, 0);
-                poke64(dst, s);
-                return;
-            }
-            p2 := p2 + 1;
-        }
-    }
-
     var tmp: int64 := alloc(8);
-    getField("\"name\":", 7, tmp);      poke64(out, peek64(tmp));
-    getField("\"author\":", 9, tmp);    poke64(out + 8, peek64(tmp));
-    getField("\"license\":", 10, tmp);  poke64(out + 16, peek64(tmp));
-    getField("\"description\":", 14, tmp); poke64(out + 24, peek64(tmp));
+    regGetField(body, bodyLen, "\"name\":", 7, tmp);      poke64(out, peek64(tmp));
+    regGetField(body, bodyLen, "\"author\":", 9, tmp);    poke64(out + 8, peek64(tmp));
+    regGetField(body, bodyLen, "\"license\":", 10, tmp);  poke64(out + 16, peek64(tmp));
+    regGetField(body, bodyLen, "\"description\":", 14, tmp); poke64(out + 24, peek64(tmp));
     free(tmp);
     free(body);
     return ERR_REG_OK;
@@ -341,41 +371,18 @@ pub fn RegistryGetVersion(rc: int64, name: int64, version: int64, sha256Out: int
     var nLen: int64 := StrLen(name);
     var vLen: int64 := StrLen(version);
     var pathBuf: int64 := alloc(nLen + vLen + 16);
-    StrCpyN(pathBuf, "/v1/package/", 12);
-    StrCpyN(pathBuf + 12, name, nLen);
+    lpmCpyN(pathBuf, "/v1/package/", 12);
+    lpmCpyN(pathBuf + 12, name, nLen);
     poke8(pathBuf + 12 + nLen, 47);
-    StrCpyN(pathBuf + 12 + nLen + 1, version, vLen);
+    lpmCpyN(pathBuf + 12 + nLen + 1, version, vLen);
     poke8(pathBuf + 12 + nLen + 1 + vLen, 0);
 
     var body: int64 := httpGet(peek64(rc), pathBuf, peek64(rc + 8));
     free(pathBuf);
     if (body == 0) { return ERR_REG_NOTFOUND; }
 
-    // sha256 und download_url aus JSON extrahieren
-    fn extractField(key: int64, keyLen: int64): int64 {
-        var p2: int64 := 0;
-        var bodyLen: int64 := StrLen(body);
-        while (p2 < bodyLen) {
-            if (StrCmpN(body + p2, key, keyLen) == 0) {
-                p2 := p2 + keyLen;
-                while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
-                if (p2 >= bodyLen) { return 0; }
-                p2 := p2 + 1;
-                var start: int64 := p2;
-                while ((peek8(body + p2) != 34) & (p2 < bodyLen)) { p2 := p2 + 1; }
-                var len: int64 := p2 - start;
-                var s: int64 := alloc(len + 1);
-                StrCpyN(s, body + start, len);
-                poke8(s + len, 0);
-                return s;
-            }
-            p2 := p2 + 1;
-        }
-        return 0;
-    }
-
-    poke64(sha256Out, extractField("\"sha256\":", 9));
-    poke64(urlOut,    extractField("\"download_url\":", 15));
+    poke64(sha256Out, regExtractField(body, "\"sha256\":", 9));
+    poke64(urlOut,    regExtractField(body, "\"download_url\":", 15));
     free(body);
 
     if ((peek64(sha256Out) == 0) | (peek64(urlOut) == 0)) { return ERR_REG_PARSE; }
@@ -388,9 +395,9 @@ pub fn RegistryFetchBestVersion(rc: int64, name: int64, range: int64): int64 {
 
     var nLen: int64 := StrLen(name);
     var pathBuf: int64 := alloc(nLen + 32);
-    StrCpyN(pathBuf, "/v1/package/", 12);
-    StrCpyN(pathBuf + 12, name, nLen);
-    StrCpyN(pathBuf + 12 + nLen, "/versions", 9);
+    lpmCpyN(pathBuf, "/v1/package/", 12);
+    lpmCpyN(pathBuf + 12, name, nLen);
+    lpmCpyN(pathBuf + 12 + nLen, "/versions", 9);
     poke8(pathBuf + 12 + nLen + 9, 0);
 
     var body: int64 := httpGet(peek64(rc), pathBuf, peek64(rc + 8));
@@ -398,14 +405,12 @@ pub fn RegistryFetchBestVersion(rc: int64, name: int64, range: int64): int64 {
     if (body == 0) { return 0; }
 
     // JSON-Array von Versionsstrings durchsuchen, beste wählen
-    import lpm.core.semver;
-
-    var svRange: SemVerRange;
-    SemVerRangeParse(range, &svRange);
+    var svRange: int64 := alloc(56);
+    SemVerRangeParse(range, svRange);
 
     var bestVer: int64 := 0;
-    var bestSv: SemVer;
-    bestSv.valid := 0;
+    var bestSv: int64 := alloc(48);
+    poke64(bestSv + 40, 0);  // valid := 0
 
     var pos: int64 := 0;
     var bodyLen: int64 := StrLen(body);
@@ -418,20 +423,23 @@ pub fn RegistryFetchBestVersion(rc: int64, name: int64, range: int64): int64 {
             var len: int64 := pos - start;
             if (len > 0) {
                 var verStr: int64 := alloc(len + 1);
-                StrCpyN(verStr, body + start, len);
+                lpmCpyN(verStr, body + start, len);
                 poke8(verStr + len, 0);
 
-                var sv: SemVer;
-                if (SemVerParse(verStr, &sv) == 1) {
-                    if (SemVerSatisfies(&sv, &svRange) == 1) {
-                        if ((bestSv.valid == 0) | (SemVerCompare(&sv, &bestSv) > 0)) {
+                var sv: int64 := alloc(48);
+                if (SemVerParse(verStr, sv) == 1) {
+                    if (SemVerSatisfies(sv, svRange) == 1) {
+                        if ((peek64(bestSv + 40) == 0) | (SemVerCompare(sv, bestSv) > 0)) {
                             if (bestVer != 0) { free(bestVer); }
                             bestVer := verStr;
-                            bestSv := sv;
+                            // bestSv := sv — Inhalt kopieren
+                            var ci: int64 := 0;
+                            while (ci < 48) { poke8(bestSv + ci, peek8(sv + ci)); ci := ci + 1; }
                             verStr := 0;
                         }
                     }
                 }
+                free(sv);
                 if (verStr != 0) { free(verStr); }
             }
             if (pos < bodyLen) { pos := pos + 1; }
@@ -440,6 +448,7 @@ pub fn RegistryFetchBestVersion(rc: int64, name: int64, range: int64): int64 {
         }
     }
 
+    free(svRange); free(bestSv);
     free(body);
     return bestVer;
 }
