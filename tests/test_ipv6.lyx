@@ -1,0 +1,296 @@
+// tests/test_ipv6.lyx — WP-D4: IPv6 Socket-API Test
+//
+// Testet:
+//   ParseIPv6 / IPv6Format
+//   SockAddrIn6Create + ReadHi/Lo/Port (via TCPListenerAcceptIPv6)
+//   SocketNew6 / BindAddr6 / ConnectAddr6 (Alias-Namen)
+//   TCPListenerNewIPv6 + TCPListenerBindIPv6 + TCPListenerAcceptIPv6
+//   SocketGetPeerAddrIPv6 / SocketGetOwnAddrIPv6
+//   UDPSocketNewIPv6 + UDPSocketBindIPv6 + UDPSocketSendToIPv6 + UDPSocketRecvFromIPv6
+//   TCPConnectIPv6 (loopback round-trip)
+//
+// Voraussetzung: IPv6 Loopback (::1) muss auf dem Testsystem aktiv sein.
+
+unit tests.test_ipv6;
+
+import std.net.socket;
+import std.net.types;
+import std.net.dns;
+import std.io;
+import std.alloc;
+
+var passed: int64 := 0;
+var failed: int64 := 0;
+
+fn ok(cond: int64, name: pchar) {
+    Print("  ["c);
+    if (cond == 1) { Print("PASS"c); passed := passed + 1; }
+    else           { Print("FAIL"c); failed := failed + 1; }
+    Print("] "c); PrintLn(name);
+}
+
+// ── ParseIPv6 / IPv6Format ───────────────────────────────────────────────────
+
+fn testParseIPv6() {
+    PrintLn("testParseIPv6"c);
+
+    var hiPtr: int64 := alloc(8);
+    var loPtr: int64 := alloc(8);
+    poke64(hiPtr, 0); poke64(loPtr, 0);
+
+    // Parse "::1" (loopback)
+    var s1: pchar := "::1"c;
+    ParseIPv6(s1 as int64, 3, hiPtr, loPtr);
+    ok(peek64(hiPtr) == 0 && peek64(loPtr) == 1, "ParseIPv6 ::1"c);
+
+    // Parse "::" (any)
+    var s2: pchar := "::"c;
+    ParseIPv6(s2 as int64, 2, hiPtr, loPtr);
+    ok(peek64(hiPtr) == 0 && peek64(loPtr) == 0, "ParseIPv6 :: (any)"c);
+
+    // Parse "2001:db8::1"
+    var s3: pchar := "2001:db8::1"c;
+    ParseIPv6(s3 as int64, 11, hiPtr, loPtr);
+    var hi: int64 := peek64(hiPtr);
+    ok((hi >> 48) == 0x2001 && ((hi >> 32) & 0xFFFF) == 0x0db8, "ParseIPv6 2001:db8::1 hi"c);
+    ok(peek64(loPtr) == 1, "ParseIPv6 2001:db8::1 lo"c);
+
+    free(hiPtr, 8); free(loPtr, 8);
+}
+
+fn testIPv6Format() {
+    PrintLn("testIPv6Format"c);
+    var buf: int64 := alloc(48);
+    // ::1
+    IPv6Format(0, 1, buf);
+    ok(StrLen(buf as pchar) > 0, "IPv6Format ::1 non-empty"c);
+    Print("  IPv6Format(::1) = "c); PrintLn(buf as pchar);
+    // ::
+    IPv6Format(0, 0, buf);
+    Print("  IPv6Format(::)  = "c); PrintLn(buf as pchar);
+    free(buf, 48);
+}
+
+// ── IPv6 constants ────────────────────────────────────────────────────────────
+
+fn testIPv6Constants() {
+    PrintLn("testIPv6Constants"c);
+    ok(IPv6LoopbackHi() == 0 && IPv6LoopbackLo() == 1, "IPv6Loopback == ::1"c);
+    ok(IPv6AnyHi() == 0 && IPv6AnyLo() == 0, "IPv6Any == ::"c);
+}
+
+// ── TCP IPv6 Loopback round-trip ──────────────────────────────────────────────
+// Server bindet auf ::1:<port>, Client verbindet, schickt Daten, Server liest.
+
+fn testTCPIPv6Loopback() {
+    PrintLn("testTCPIPv6Loopback"c);
+
+    var port: int64 := 16380;
+
+    // Server-Socket aufbauen
+    var srv: TCPListener := TCPListenerNewIPv6();
+    ok(srv.fd >= 0, "TCPListenerNewIPv6 fd >= 0"c);
+    if (srv.fd < 0) { return; }
+
+    TCPListenerSetReuseAddr(srv);
+    var bindOk: int64 := TCPListenerBindIPv6(srv, IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+    ok(bindOk == 0, "TCPListenerBindIPv6 ::1"c);
+
+    var listenOk: int64 := TCPListenerListen(srv, 1);
+    ok(listenOk == 0, "TCPListenerListen"c);
+
+    // Client verbindet (nicht-blockierend ist nicht nötig — loopback ist instantan)
+    var cli: TCPConn := TCPConnectIPv6(IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+    ok(cli.fd >= 0, "TCPConnectIPv6 ::1 client fd >= 0"c);
+
+    // Server akzeptiert
+    var peerHi: int64 := alloc(8);
+    var peerLo: int64 := alloc(8);
+    var peerPort: int64 := alloc(8);
+    poke64(peerHi, 0); poke64(peerLo, 0); poke64(peerPort, 0);
+    var accepted: TCPConn := TCPListenerAcceptIPv6(srv, peerHi, peerLo, peerPort);
+    ok(accepted.fd >= 0, "TCPListenerAcceptIPv6 accepted.fd >= 0"c);
+
+    if (accepted.fd >= 0) {
+        // Peer-Adresse sollte ::1 sein
+        ok(peek64(peerHi) == 0 && peek64(peerLo) == 1, "Accept peer addr == ::1"c);
+
+        // SocketGetPeerAddrIPv6 auf dem Client-Socket
+        var gPeerHi: int64 := alloc(8);
+        var gPeerLo: int64 := alloc(8);
+        var gPeerPort: int64 := alloc(8);
+        poke64(gPeerHi, 0); poke64(gPeerLo, 0); poke64(gPeerPort, 0);
+        var gpr: int64 := SocketGetPeerAddrIPv6(cli.fd, gPeerHi, gPeerLo, gPeerPort);
+        ok(gpr == 0, "SocketGetPeerAddrIPv6 returns 0"c);
+        ok(peek64(gPeerHi) == 0 && peek64(gPeerLo) == 1, "Client peer == ::1"c);
+        ok(peek64(gPeerPort) == port, "Client peer port matches"c);
+        free(gPeerHi, 8); free(gPeerLo, 8); free(gPeerPort, 8);
+
+        // Daten senden (Client → Server)
+        var msg: pchar := "IPv6 Hello!"c;
+        var ml: int64 := StrLen(msg);
+        sys_write(cli.fd, msg as int64, ml);
+
+        // Daten empfangen (Server-Seite)
+        var rbuf: int64 := alloc(64);
+        var nr: int64 := sys_read(accepted.fd, rbuf, 63);
+        poke8(rbuf+nr, 0);
+        ok(nr == ml, "Round-trip byte count matches"c);
+        // Vergleich
+        var same: int64 := 1; var ci: int64 := 0;
+        while (ci < nr) {
+            if ((peek8(rbuf+ci)&0xFF) != (StrCharAt(msg,ci)&0xFF)) { same := 0; }
+            ci := ci + 1;
+        }
+        ok(same == 1, "Round-trip data matches"c);
+        free(rbuf, 64);
+
+        sys_close(accepted.fd);
+    }
+
+    if (cli.fd >= 0) { sys_close(cli.fd); }
+    TCPListenerClose(srv);
+    free(peerHi, 8); free(peerLo, 8); free(peerPort, 8);
+}
+
+// ── SocketNew6 / BindAddr6 / ConnectAddr6 (Alias-Namen) ─────────────────────
+
+fn testAliasNames() {
+    PrintLn("testAliasNames"c);
+    var port: int64 := 16381;
+
+    var srvFd: int64 := SocketNew6();
+    ok(srvFd >= 0, "SocketNew6 fd >= 0"c);
+    if (srvFd < 0) { return; }
+
+    // SO_REUSEADDR
+    var optBuf: int64 := alloc(4); poke32(optBuf, 1);
+    sys_setsockopt(srvFd, 1, 2, optBuf, 4); free(optBuf, 4);
+
+    var r: int64 := BindAddr6(srvFd, IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+    ok(r == 0, "BindAddr6 ::1"c);
+    sys_listen(srvFd, 1);
+
+    // Client
+    var cliFd: int64 := SocketNew6();
+    ok(cliFd >= 0, "SocketNew6 client fd >= 0"c);
+    if (cliFd >= 0) {
+        var cr: int64 := ConnectAddr6(cliFd, IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+        ok(cr == 0, "ConnectAddr6 ::1"c);
+        sys_close(cliFd);
+    }
+    sys_close(srvFd);
+}
+
+// ── UDP IPv6 round-trip ───────────────────────────────────────────────────────
+
+fn testUDPIPv6() {
+    PrintLn("testUDPIPv6"c);
+    var port: int64 := 16382;
+
+    var srv: UDPSocket := UDPSocketNewIPv6();
+    ok(srv.fd >= 0, "UDPSocketNewIPv6 server fd >= 0"c);
+    if (srv.fd < 0) { return; }
+
+    var bindOk: int64 := UDPSocketBindIPv6(srv, IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+    ok(bindOk == 0, "UDPSocketBindIPv6 ::1"c);
+
+    // Sender
+    var snd: UDPSocket := UDPSocketNewIPv6();
+    ok(snd.fd >= 0, "UDPSocketNewIPv6 sender fd >= 0"c);
+    if (snd.fd >= 0) {
+        var msg: pchar := "udp6-test"c;
+        var ml: int64 := StrLen(msg);
+        var sent: int64 := UDPSocketSendToIPv6(snd, msg as int64, ml,
+            IPv6LoopbackHi(), IPv6LoopbackLo(), port);
+        ok(sent == ml, "UDPSocketSendToIPv6 sent bytes"c);
+
+        // Empfangen
+        var rbuf: int64 := alloc(64);
+        var srcHi: int64 := alloc(8);
+        var srcLo: int64 := alloc(8);
+        var srcPort: int64 := alloc(8);
+        poke64(srcHi, 0); poke64(srcLo, 0); poke64(srcPort, 0);
+        var nr: int64 := UDPSocketRecvFromIPv6(srv, rbuf, 63, srcHi, srcLo, srcPort);
+        ok(nr == ml, "UDPSocketRecvFromIPv6 received bytes"c);
+        ok(peek64(srcHi) == 0 && peek64(srcLo) == 1, "UDP sender == ::1"c);
+
+        free(rbuf, 64); free(srcHi, 8); free(srcLo, 8); free(srcPort, 8);
+        sys_close(snd.fd);
+    }
+    sys_close(srv.fd);
+}
+
+// ── TCPConnectHostIPv6 ────────────────────────────────────────────────────────
+// Nur Parse-Test (kein echter DNS nötig) — wir testen mit bekannter Loopback-Adresse.
+
+fn testConnectHostIPv6() {
+    PrintLn("testConnectHostIPv6 (DNS AAAA skip — loopback only)"c);
+    // Der echte Hostname-Test setzt funktionierenden DNS voraus.
+    // Wir testen hier, dass GetHostByNameV6 für "localhost" entweder
+    // eine Adresse zurückgibt oder sauber fehlschlägt.
+    var hiPtr: int64 := alloc(8);
+    var loPtr: int64 := alloc(8);
+    poke64(hiPtr, 0); poke64(loPtr, 0);
+    var host: pchar := "localhost"c;
+    var ok2: int64 := 0;
+    if (GetHostByNameV6(host as int64, hiPtr, loPtr) == 1) { ok2 := 1; }
+    // Auch false ist akzeptabel (kein DNS), kein Absturz = PASS
+    ok(1, "GetHostByNameV6 does not crash"c);
+    if (ok2 == 1) {
+        Print("  Resolved localhost -> "c);
+        var buf: int64 := alloc(48);
+        IPv6Format(peek64(hiPtr), peek64(loPtr), buf);
+        PrintLn(buf as pchar);
+        free(buf, 48);
+    } else {
+        PrintLn("  (DNS AAAA not available — skip)"c);
+    }
+    free(hiPtr, 8); free(loPtr, 8);
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+pub fn main(argc: int64, argv: int64): int64 {
+    PrintLn("=== WP-D4: IPv6 Socket Tests ==="c);
+    PrintLn(""c);
+
+    testIPv6Constants();
+    testParseIPv6();
+    testIPv6Format();
+    testTCPIPv6Loopback();
+    testAliasNames();
+    testUDPIPv6();
+    testConnectHostIPv6();
+
+    PrintLn(""c);
+    PrintLn("=== Ergebnis ==="c);
+    Print("Passed: "c);
+    var pbuf: int64 := alloc(16);
+    var pi: int64 := passed; var po: int64 := 0;
+    if (pi == 0) { poke8(pbuf, 48); poke8(pbuf+1, 0); po := 1; }
+    while (pi > 0) { poke8(pbuf+po, 48+(pi%10)); pi:=pi/10; po:=po+1; }
+    var ri: int64 := 0; var rj: int64 := po-1;
+    while (ri < rj) {
+        var tmp: int64 := peek8(pbuf+ri) & 0xFF;
+        poke8(pbuf+ri, peek8(pbuf+rj)&0xFF); poke8(pbuf+rj, tmp);
+        ri:=ri+1; rj:=rj-1;
+    }
+    poke8(pbuf+po, 0); PrintLn(pbuf as pchar); free(pbuf, 16);
+
+    Print("Failed: "c);
+    var fbuf: int64 := alloc(16);
+    var fi: int64 := failed; var fo: int64 := 0;
+    if (fi == 0) { poke8(fbuf, 48); poke8(fbuf+1, 0); fo := 1; }
+    while (fi > 0) { poke8(fbuf+fo, 48+(fi%10)); fi:=fi/10; fo:=fo+1; }
+    ri := 0; rj := fo-1;
+    while (ri < rj) {
+        var tmp2: int64 := peek8(fbuf+ri) & 0xFF;
+        poke8(fbuf+ri, peek8(fbuf+rj)&0xFF); poke8(fbuf+rj, tmp2);
+        ri:=ri+1; rj:=rj-1;
+    }
+    poke8(fbuf+fo, 0); PrintLn(fbuf as pchar); free(fbuf, 16);
+
+    if (failed == 0) { PrintLn("ALL TESTS PASSED"c); return 0; }
+    PrintLn("SOME TESTS FAILED"c); return 1;
+}
