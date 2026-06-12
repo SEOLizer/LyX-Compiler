@@ -1,0 +1,363 @@
+// std/cloud/s3.lyx — AWS S3 Client
+// WP-AWS-06
+// REST-XML protocol. Virtual-hosted-style endpoints by default.
+
+unit std.cloud.s3;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.cloud.aws.sigv4;
+import std.alloc;
+import std.io;
+import std.fs;
+
+pub type S3Client = struct {
+    creds:     AWSCreds;
+    region:    int64;  // pchar
+    endpoint:  int64;  // pchar custom or 0
+    pathStyle: int64;
+};
+
+pub type S3Object = struct {
+    key:          int64;  // pchar (alloc'd)
+    size:         int64;
+    etag:         int64;  // pchar (alloc'd)
+    lastModified: int64;  // pchar (alloc'd)
+    storageClass: int64;  // pchar (alloc'd)
+};
+
+pub fn S3ObjectFree(o: S3Object) {
+    if (o.key          != 0) { free(o.key,          StrLen(o.key          as pchar)+1); }
+    if (o.etag         != 0) { free(o.etag,         StrLen(o.etag         as pchar)+1); }
+    if (o.lastModified != 0) { free(o.lastModified, StrLen(o.lastModified as pchar)+1); }
+    if (o.storageClass != 0) { free(o.storageClass, StrLen(o.storageClass as pchar)+1); }
+}
+
+fn s3Host(client: S3Client, bucket: pchar): int64 {
+    if (client.endpoint != 0) { return client.endpoint; }
+    return AWSS3Endpoint(bucket, client.region as pchar, client.pathStyle);
+}
+
+fn s3Path(client: S3Client, bucket: pchar, key: pchar): int64 {
+    var buf: int64 := alloc(1024);
+    if (client.pathStyle == 1) {
+        poke8(buf,47); // '/'
+        var bl: int64 := StrLen(bucket);
+        var i: int64 := 0;
+        while(i<bl){poke8(buf+1+i,StrCharAt(bucket,i)&0xFF);i:=i+1;}
+        poke8(buf+1+bl,47);
+        var kl: int64 := StrLen(key);
+        i:=0; while(i<kl){poke8(buf+2+bl+i,StrCharAt(key,i)&0xFF);i:=i+1;}
+        poke8(buf+2+bl+kl,0);
+    } else {
+        poke8(buf,47);
+        var kl2: int64 := StrLen(key);
+        var i2: int64 := 0;
+        while(i2<kl2){poke8(buf+1+i2,StrCharAt(key,i2)&0xFF);i2:=i2+1;}
+        poke8(buf+1+kl2,0);
+    }
+    return buf;
+}
+
+pub fn S3Connect(creds: AWSCreds, region: pchar): S3Client {
+    var c: S3Client;
+    c.creds     := creds;
+    c.region    := region as int64;
+    c.endpoint  := 0;
+    c.pathStyle := 0;
+    return c;
+}
+
+pub fn S3ConnectConfig(creds: AWSCreds, cfg: AWSServiceConfig): S3Client {
+    var c: S3Client;
+    c.creds     := creds;
+    c.region    := cfg.region;
+    c.endpoint  := cfg.endpoint;
+    c.pathStyle := 0;
+    return c;
+}
+
+pub fn S3Close(client: S3Client) {
+    AWSCredentialsFree(client.creds);
+}
+
+// ── Bucket operations ─────────────────────────────────────────────────────────
+
+pub fn S3ListBuckets(client: S3Client): int64 {
+    var host: int64 := s3Host(client, 0 as pchar);
+    if (host == 0) { host := AWSS3Endpoint(0 as pchar, client.region as pchar, 0); }
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "GET"c, "/"c, 0 as pchar, 0, 0,
+                                          client.region as pchar);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn S3CreateBucket(client: S3Client, bucket: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var region: pchar := client.region as pchar;
+    // Body: <CreateBucketConfiguration> for non-us-east-1
+    var body: int64 := 0;
+    var bodyLen: int64 := 0;
+    if (!StrEquals(region, "us-east-1"c) as int64 == 0) { // not us-east-1
+        var xml: pchar := "<CreateBucketConfiguration><LocationConstraint>"c;
+        var xml2: pchar := "</LocationConstraint></CreateBucketConfiguration>"c;
+        var rl: int64 := StrLen(region);
+        bodyLen := StrLen(xml) + rl + StrLen(xml2);
+        body := alloc(bodyLen+1);
+        var p: int64 := body;
+        var i: int64 := 0; var n: int64 := StrLen(xml);
+        while(i<n){poke8(p+i,StrCharAt(xml,i)&0xFF);i:=i+1;} p:=p+n;
+        i:=0; while(i<rl){poke8(p+i,StrCharAt(region,i)&0xFF);i:=i+1;} p:=p+rl;
+        n := StrLen(xml2);
+        i:=0; while(i<n){poke8(p+i,StrCharAt(xml2,i)&0xFF);i:=i+1;} p:=p+n;
+        poke8(p,0);
+    }
+    var path: int64 := s3Path(client, bucket, ""c);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "PUT"c, path as pchar, 0 as pchar,
+                                          body, bodyLen, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 200) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    if (body != 0) { free(body, bodyLen+1); }
+    return ok;
+}
+
+pub fn S3DeleteBucket(client: S3Client, bucket: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, ""c);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "DELETE"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return ok;
+}
+
+// ── Object operations ─────────────────────────────────────────────────────────
+
+pub fn S3PutObject(client: S3Client, bucket: pchar, key: pchar,
+                   data: int64, dataLen: int64, contentType: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "PUT"c, path as pchar, 0 as pchar,
+                                          data, dataLen, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 200) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return ok;
+}
+
+pub fn S3PutObjectFile(client: S3Client, bucket: pchar, key: pchar,
+                       localPath: pchar, contentType: pchar): int64 {
+    var sz: int64 := FileSize(localPath);
+    if (sz <= 0) { return 1; }
+    var data: int64 := alloc(sz);
+    ReadFile(localPath, data as pchar, sz);
+    var ok: int64 := S3PutObject(client, bucket, key, data, sz, contentType);
+    free(data, sz);
+    return ok;
+}
+
+pub fn S3GetObject(client: S3Client, bucket: pchar, key: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "GET"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return result;
+}
+
+pub fn S3GetObjectFile(client: S3Client, bucket: pchar, key: pchar, localPath: pchar): int64 {
+    var data: int64 := S3GetObject(client, bucket, key);
+    if (data == 0) { return 1; }
+    var n: int64 := WriteFile(localPath, data as pchar, StrLen(data as pchar));
+    free(data, StrLen(data as pchar)+1);
+    if (n > 0) { return 0; }
+    return 1;
+}
+
+pub fn S3DeleteObject(client: S3Client, bucket: pchar, key: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "DELETE"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return ok;
+}
+
+pub fn S3HeadObject(client: S3Client, bucket: pchar, key: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "HEAD"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 200) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return ok;
+}
+
+pub fn S3ObjectExists(client: S3Client, bucket: pchar, key: pchar): int64 {
+    return S3HeadObject(client, bucket, key);
+}
+
+pub fn S3ListObjects(client: S3Client, bucket: pchar, prefix: pchar): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var queryBuf: int64 := alloc(512);
+    var qoff: int64 := 0;
+    var q: pchar := "list-type=2"c; var ql: int64 := StrLen(q);
+    var i: int64 := 0;
+    while(i<ql){poke8(queryBuf+i,StrCharAt(q,i)&0xFF);i:=i+1;} qoff:=ql;
+    if (prefix != 0 as pchar && StrLen(prefix) > 0) {
+        var pfx: pchar := "&prefix="c; var pl: int64 := StrLen(pfx);
+        i:=0; while(i<pl){poke8(queryBuf+qoff+i,StrCharAt(pfx,i)&0xFF);i:=i+1;} qoff:=qoff+pl;
+        var pfl: int64 := StrLen(prefix);
+        i:=0; while(i<pfl){poke8(queryBuf+qoff+i,StrCharAt(prefix,i)&0xFF);i:=i+1;} qoff:=qoff+pfl;
+    }
+    poke8(queryBuf+qoff,0);
+    var path: int64 := s3Path(client, bucket, ""c);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "GET"c, path as pchar, queryBuf as pchar,
+                                          0, 0, client.region as pchar);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    free(queryBuf, 512);
+    return result;
+}
+
+pub fn S3CopyObject(client: S3Client,
+                    srcBucket: pchar, srcKey: pchar,
+                    dstBucket: pchar, dstKey: pchar): int64 {
+    var host: int64 := s3Host(client, dstBucket);
+    var path: int64 := s3Path(client, dstBucket, dstKey);
+    // x-amz-copy-source: /srcBucket/srcKey
+    var csBuf: int64 := alloc(512);
+    poke8(csBuf,47);
+    var bl: int64 := StrLen(srcBucket);
+    var i: int64 := 0;
+    while(i<bl){poke8(csBuf+1+i,StrCharAt(srcBucket,i)&0xFF);i:=i+1;}
+    poke8(csBuf+1+bl,47);
+    var kl: int64 := StrLen(srcKey);
+    i:=0; while(i<kl){poke8(csBuf+2+bl+i,StrCharAt(srcKey,i)&0xFF);i:=i+1;}
+    poke8(csBuf+2+bl+kl,0);
+    // We pass x-amz-copy-source via AWSS3Request body mechanism (stub — full impl needs header injection)
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "PUT"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 200) { ok := 1; }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    free(csBuf, 512);
+    return ok;
+}
+
+pub fn S3PresignURL(client: S3Client, bucket: pchar, key: pchar, expires: int64): int64 {
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+
+    var dateBuf: int64     := alloc(16);
+    var dateTimeBuf: int64 := alloc(24);
+    SigV4DateNow(dateBuf, dateTimeBuf);
+
+    var ctx: AWSSignCtx;
+    ctx.accessKey    := client.creds.accessKey;
+    ctx.secretKey    := client.creds.secretKey;
+    ctx.sessionToken := client.creds.sessionToken;
+    ctx.method       := "GET"c as int64;
+    ctx.host         := host;
+    ctx.path         := path;
+    ctx.query        := 0;
+    ctx.body         := 0;
+    ctx.bodyLen      := 0;
+    ctx.service      := "s3"c as int64;
+    ctx.region       := client.region;
+    ctx.date         := dateBuf;
+    ctx.dateTime     := dateTimeBuf;
+    ctx.authHeader   := 0;
+    var query: int64 := SigV4SignQuery(ctx as int64, expires);
+
+    var urlBuf: int64 := alloc(2048);
+    var off: int64 := 0;
+    var https: pchar := "https://"c; var hl: int64 := StrLen(https);
+    var i: int64 := 0;
+    while(i<hl){poke8(urlBuf+i,StrCharAt(https,i)&0xFF);i:=i+1;} off:=hl;
+    var hlen: int64 := StrLen(host as pchar);
+    i:=0; while(i<hlen){poke8(urlBuf+off+i,peek8(host+i));i:=i+1;} off:=off+hlen;
+    var plen: int64 := StrLen(path as pchar);
+    i:=0; while(i<plen){poke8(urlBuf+off+i,peek8(path+i));i:=i+1;} off:=off+plen;
+    poke8(urlBuf+off,63); off:=off+1; // '?'
+    if (query != 0) {
+        var ql: int64 := StrLen(query as pchar);
+        i:=0; while(i<ql){poke8(urlBuf+off+i,peek8(query+i));i:=i+1;} off:=off+ql;
+        free(query, ql+1);
+    }
+    poke8(urlBuf+off,0);
+    var result: int64 := alloc(off+1);
+    i:=0; while(i<off){poke8(result+i,peek8(urlBuf+i));i:=i+1;}
+    poke8(result+off,0);
+    free(urlBuf, 2048);
+    free(dateBuf, 16);
+    free(dateTimeBuf, 24);
+    free(path, StrLen(path as pchar)+1);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    return result;
+}
+
+pub fn S3GetObjectSize(client: S3Client, bucket: pchar, key: pchar): int64 {
+    // Returns content-length from HEAD response headers
+    var host: int64 := s3Host(client, bucket);
+    var path: int64 := s3Path(client, bucket, key);
+    var resp: AWSResponse := AWSS3Request(client.creds, host as pchar,
+                                          "HEAD"c, path as pchar, 0 as pchar,
+                                          0, 0, client.region as pchar);
+    var result: int64 := 0;
+    if (resp.statusCode == 200) {
+        var cl: pchar := AWSResponseGetHeader(resp, "content-length"c);
+        if (cl != 0 as pchar) {
+            var nb: int64 := alloc(24);
+            result := StrToInt64(cl, nb);
+            free(nb, 24);
+        }
+    }
+    AWSResponseFree(resp);
+    if (client.endpoint == 0) { free(host, StrLen(host as pchar)+1); }
+    free(path, StrLen(path as pchar)+1);
+    return result;
+}
