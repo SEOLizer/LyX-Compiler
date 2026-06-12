@@ -12,9 +12,9 @@ Felder am Ende des Metadatenblocks ergänzt, die maschinell auswertbar sind.
 
 | # | Feldname           | Typ        | Beispiel                    | Zweck |
 |---|--------------------|------------|-----------------------------|-------|
-| 4 | `compilerBuild`    | u16-String | `lyxc 0.9.6E x86_64-linux` | Welcher Compiler-Build hat diese LYU erzeugt |
+| 4 | `compilerBuild`    | u16-String | `lyxc 0.9.7A x86_64-linux` | Welcher Compiler-Build hat diese LYU erzeugt |
 | 5 | `unitVersion`      | u16-String | `1.0.0`                     | Versionsnummer der Unit selbst (für Paketmanager / API-Stabilität) |
-| 6 | `minCompilerVer`   | u16-String | `0.9.6E`                    | Mindest-Compiler-Version, die diese Unit lesen/nutzen kann |
+| 6 | `minCompilerVer`   | u16-String | `0.9.7A`                    | Mindest-Compiler-Version, die diese Unit lesen/nutzen kann |
 
 > **compilerBuild** setzt sich zusammen aus: `lyxc <VERSION> <ARCH>-<OS>`  
 > Quelle: der bestehende `--version`/`--build-info`-Pfad in `lyxc.lyx:1071`.
@@ -100,8 +100,8 @@ Offset  Größe  Feld
 
 - Konstante für den Build-String definieren (analog zu `--version`-Ausgabe):
   ```lyx
-  con LYXC_BUILD_STR: pchar := "lyxc 0.9.6E x86_64-linux"c;
-  con LYXC_MIN_VER:   pchar := "0.9.6E"c;
+  con LYXC_BUILD_STR: pchar := "lyxc 0.9.7A x86_64-linux"c;
+  con LYXC_MIN_VER:   pchar := "0.9.7A"c;
   ```
 - Alle `Serialize()`-Aufrufe auf die neue Signatur umstellen.
 - `unitVersion` wird per CLI-Flag `--unit-version <ver>` übergeben (default: `""`).
