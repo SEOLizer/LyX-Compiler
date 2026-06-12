@@ -10,6 +10,7 @@ unit lpm.core.resolver;
 import std.string;
 import std.alloc;
 import std.io;
+import lpm.core.lpmutil;
 import lpm.core.semver;
 import lpm.core.manifest;
 import lpm.core.lockfile;
@@ -36,10 +37,10 @@ pub type DepNode = struct {
     inStack:   int64;   // Zyklus-Erkennung
 };
 
-// Kante im Graph: from → to (Indizes)
+// Kante im Graph: fromIdx → toIdx (Indizes)
 type DepEdge = struct {
-    from: int64;
-    to:   int64;
+    fromIdx: int64;
+    toIdx:   int64;
 };
 
 // Resolver-Kontext
@@ -57,11 +58,7 @@ pub type Resolver = struct {
     errMsg:    int64;   // pchar
 };
 
-// Callback-Typ: Registry-Abfrage für verfügbare Versionen
-// name → beste_version (pchar), die range erfüllt.
-// Wenn nicht gefunden: 0 zurückgeben.
-// userData: beliebiger Context-Pointer
-pub type FetchVersionFn = int64;  // fn(userData, name, range): pchar
+// RegistryClient-Pointer wird direkt übergeben (kein Callback).
 
 // ============================================================================
 // Resolver-Initialisierung
@@ -102,7 +99,7 @@ fn resStrdup(s: int64): int64 {
     if (s == 0) { return 0; }
     var len: int64 := StrLen(s);
     var buf: int64 := alloc(len + 1);
-    StrCpyN(buf, s, len);
+    lpmCpyN(buf, s, len);
     poke8(buf + len, 0);
     return buf;
 }
@@ -118,7 +115,7 @@ fn resFindNode(res: int64, name: int64): int64 {
     var i: int64 := 0;
     while (i < count) {
         var node: int64 := nodes + i * 56;
-        if (StrCmp(peek64(node), name) == 0) { return i; }
+        if (lpmStrCmp(peek64(node), name) == 0) { return i; }
         i := i + 1;
     }
     return 0 - 1;
@@ -145,13 +142,13 @@ fn resAddNode(res: int64, name: int64, range: int64): int64 {
     return count;
 }
 
-// Fügt eine Kante from→to hinzu.
-fn resAddEdge(res: int64, from: int64, to: int64): void {
+// Fügt eine Kante fromIdx→toIdx hinzu.
+fn resAddEdge(res: int64, fromIdx: int64, toIdx: int64): void {
     var count: int64 := peek64(res + 24);
     if (count >= MAX_EDGES) { return; }
     var edge: int64 := peek64(res + 16) + count * 16;
-    poke64(edge,     from);
-    poke64(edge + 8, to);
+    poke64(edge,     fromIdx);
+    poke64(edge + 8, toIdx);
     poke64(res + 24, count + 1);
 }
 
@@ -160,21 +157,18 @@ fn resAddEdge(res: int64, from: int64, to: int64): void {
 // ============================================================================
 
 // Rekursive BFS: verarbeitet alle Dependencies eines Knotens.
-fn resolveNode(res: int64, nodeIdx: int64, fetchFn: int64, userData: int64): int64 {
+// resolvedVer = 0 wenn Version noch nicht bekannt (muss extern gesetzt werden).
+fn resolveNode(res: int64, nodeIdx: int64, resolvedVer: int64): int64 {
     var nodes: int64 := peek64(res);
     var node: int64 := nodes + nodeIdx * 56;
     var name: int64 := peek64(node);
     var range: int64 := peek64(node + 16);
-
-    // Version via Registry-Callback auflösen
-    // fetchFn(userData, name, range) → pchar version
-    var resolvedVer: int64 := call_fn(fetchFn, userData, name, range);
     if (resolvedVer == 0) {
         // Nicht gefunden — Fehlermeldung setzen
         var msgLen: int64 := StrLen(name) + 48;
         var msg: int64 := alloc(msgLen);
-        StrCpyN(msg, "Paket nicht gefunden: ", 22);
-        StrCpyN(msg + 22, name, StrLen(name));
+        lpmCpyN(msg, "Paket nicht gefunden: ", 22);
+        lpmCpyN(msg + 22, name, StrLen(name));
         poke8(msg + 22 + StrLen(name), 0);
         poke64(res + 48, msg);
         return ERR_RES_NOTFOUND;
@@ -184,31 +178,33 @@ fn resolveNode(res: int64, nodeIdx: int64, fetchFn: int64, userData: int64): int
     var existingVer: int64 := peek64(node + 8);
     if (existingVer != 0) {
         // Konflikt-Prüfung: Sind beide Versionen SemVer-kompatibel?
-        var svA: SemVer; var svB: SemVer;
-        SemVerParse(existingVer, &svA);
-        SemVerParse(resolvedVer, &svB);
+        var svA: int64 := alloc(48); var svB: int64 := alloc(48);
+        SemVerParse(existingVer, svA);
+        SemVerParse(resolvedVer, svB);
 
-        var newRange: SemVerRange;
-        SemVerRangeParse(range, &newRange);
+        var newRange: int64 := alloc(56);
+        SemVerRangeParse(range, newRange);
 
-        if (SemVerSatisfies(&svA, &newRange) == 0) {
+        if (SemVerSatisfies(svA, newRange) == 0) {
             // Konflikt: existierende Version erfüllt neue Range nicht
             var msgLen: int64 := StrLen(name) + StrLen(existingVer) + StrLen(range) + 64;
             var msg: int64 := alloc(msgLen);
-            StrCpyN(msg, "Versionskonflikt: ", 18);
-            StrCpyN(msg + 18, name, StrLen(name));
-            StrCpyN(msg + 18 + StrLen(name), " hat bereits ", 13);
+            lpmCpyN(msg, "Versionskonflikt: ", 18);
+            lpmCpyN(msg + 18, name, StrLen(name));
+            lpmCpyN(msg + 18 + StrLen(name), " hat bereits ", 13);
             var p: int64 := 18 + StrLen(name) + 13;
-            StrCpyN(msg + p, existingVer, StrLen(existingVer));
+            lpmCpyN(msg + p, existingVer, StrLen(existingVer));
             p := p + StrLen(existingVer);
-            StrCpyN(msg + p, ", inkompatibel mit ", 19);
+            lpmCpyN(msg + p, ", inkompatibel mit ", 19);
             p := p + 19;
-            StrCpyN(msg + p, range, StrLen(range));
+            lpmCpyN(msg + p, range, StrLen(range));
             poke8(msg + p + StrLen(range), 0);
             poke64(res + 48, msg);
+            free(svA); free(svB); free(newRange);
             return ERR_RES_CONFLICT;
         }
         // Version passt — keine Änderung nötig
+        free(svA); free(svB); free(newRange);
         return ERR_RES_OK;
     }
 
@@ -221,13 +217,12 @@ fn resolveNode(res: int64, nodeIdx: int64, fetchFn: int64, userData: int64): int
     return ERR_RES_OK;
 }
 
-// Löst alle Dependencies eines Root-Manifests auf.
-// fetchFn: Callback fn(userData, pkgName, rangeSpec): pchar version
-pub fn ResolverResolve(res: int64, mf: int64, fetchFn: int64, userData: int64): int64 {
+// Fügt alle Dependencies des Manifests als Knoten hinzu.
+// Versions-Auflösung erfolgt extern durch ResolverSetVersion.
+pub fn ResolverResolve(res: int64, mf: int64): int64 {
     var depCount: int64 := peek64(mf + 56);
     var deps: int64 := peek64(mf + 48);
 
-    // Alle direkten Dependencies als Knoten eintragen
     var i: int64 := 0;
     while (i < depCount) {
         var dep: int64 := deps + i * 16;
@@ -235,13 +230,15 @@ pub fn ResolverResolve(res: int64, mf: int64, fetchFn: int64, userData: int64): 
         var drange: int64 := peek64(dep + 8);
         var idx: int64 := resAddNode(res, dname, drange);
         if (idx < 0) { return ERR_RES_CONFLICT; }
-
-        var rc: int64 := resolveNode(res, idx, fetchFn, userData);
-        if (rc != ERR_RES_OK) { return rc; }
         i := i + 1;
     }
 
     return ERR_RES_OK;
+}
+
+// Setzt die aufgelöste Version eines Knotens (nach Registry-Lookup durch Aufrufer).
+pub fn ResolverSetVersion(res: int64, nodeIdx: int64, version: int64): int64 {
+    return resolveNode(res, nodeIdx, version);
 }
 
 // ============================================================================

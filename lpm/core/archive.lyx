@@ -11,6 +11,7 @@ unit lpm.core.archive;
 import std.string;
 import std.alloc;
 import std.io;
+import lpm.core.lpmutil;
 import std.fs;
 import std.zlib;
 
@@ -62,9 +63,9 @@ fn ensureParentDir(destDir: int64, relPath: int64): void {
     var dLen: int64 := StrLen(destDir);
     var rLen: int64 := StrLen(relPath);
     var fullPath: int64 := alloc(dLen + rLen + 4);
-    StrCpyN(fullPath, destDir, dLen);
+    lpmCpyN(fullPath, destDir, dLen);
     poke8(fullPath + dLen, 47);  // '/'
-    StrCpyN(fullPath + dLen + 1, relPath, rLen);
+    lpmCpyN(fullPath + dLen + 1, relPath, rLen);
     poke8(fullPath + dLen + 1 + rLen, 0);
 
     // Rückwärts das letzte '/' suchen und Verzeichnis anlegen
@@ -89,24 +90,24 @@ fn ensureParentDir(destDir: int64, relPath: int64): void {
 // destDir: Zielverzeichnis (muss existieren)
 pub fn ArchiveExtract(pkgPath: int64, destDir: int64): int64 {
     // Datei einlesen
-    var compressed: int64 := FileReadAll(pkgPath);
+    var compressed: int64 := lpmReadFile(pkgPath);
     if (compressed == 0) { return ERR_AR_IO; }
     var compLen: int64 := FileSize(pkgPath);
 
     // Zlib-Decompression (gzip-Format)
     var decompBuf: int64 := alloc(compLen * 8 + 65536);  // Heuristik: 8x Ratio
-    var decompLen: int64 := alloc(8);
-    var rc: int64 := ZlibDecompressGzip(compressed, compLen, decompBuf, compLen * 8 + 65536, decompLen);
+    var decompLen: int64 := ZlibDecompressToBuffer(compressed, compLen, decompBuf, compLen * 8 + 65536);
+    var rc: int64 := 0;
+    if (decompLen <= 0) { rc := 1; }
     free(compressed);
 
     if (rc != 0) {
-        free(decompBuf); free(decompLen);
+        free(decompBuf);
         return ERR_AR_DECOMP;
     }
 
     var tarData: int64 := decompBuf;
-    var tarLen: int64 := peek64(decompLen);
-    free(decompLen);
+    var tarLen: int64 := decompLen;
 
     // Tar-Blöcke verarbeiten
     var pos: int64 := 0;
@@ -128,16 +129,16 @@ pub fn ArchiveExtract(pkgPath: int64, destDir: int64): int64 {
             endCount := 0;
 
             // Dateiname (max 100 Bytes, null-terminiert)
-            StrCpyN(nameBuf, block + TAR_NAME_OFF, 100);
+            lpmCpyN(nameBuf, block + TAR_NAME_OFF, 100);
             poke8(nameBuf + 100, 0);
 
             var fileType: int64 := peek8(block + TAR_TYPE_OFF);
             var fileSize: int64 := readOctal(block + TAR_SIZE_OFF, 12);
 
             // Vollständigen Zielpfad zusammenbauen
-            StrCpyN(fullPath, destDir, dLen);
+            lpmCpyN(fullPath, destDir, dLen);
             poke8(fullPath + dLen, 47);
-            StrCpyN(fullPath + dLen + 1, nameBuf, StrLen(nameBuf));
+            lpmCpyN(fullPath + dLen + 1, nameBuf, StrLen(nameBuf));
             poke8(fullPath + dLen + 1 + StrLen(nameBuf), 0);
 
             pos := pos + TAR_BLOCK;
@@ -151,10 +152,10 @@ pub fn ArchiveExtract(pkgPath: int64, destDir: int64): int64 {
                 else if (fileType == 0) {
                     ensureParentDir(destDir, nameBuf);
                     if (fileSize > 0) {
-                        FileWriteAll(fullPath, tarData + pos, fileSize);
+                        lpmWriteFile(fullPath, tarData + pos, fileSize);
                     } else {
                         // Leere Datei anlegen
-                        FileWriteAll(fullPath, "", 0);
+                        lpmWriteFile(fullPath, "", 0);
                     }
                 }
             }
@@ -174,17 +175,18 @@ pub fn ArchiveExtract(pkgPath: int64, destDir: int64): int64 {
 // destPkg: Ausgabepfad der .lxpkg-Datei
 // files: null-terminiertes Array von pchar (Dateinamen relativ zu sourceDir)
 // fileCount: Anzahl Dateien
+fn arZeroPad(tarBuf: int64, pos: int64, upto: int64): int64 {
+    var p: int64 := pos;
+    while (p < upto) { poke8(tarBuf + p, 0); p := p + 1; }
+    return p;
+}
+
 pub fn ArchiveCreate(sourceDir: int64, destPkg: int64, files: int64, fileCount: int64): int64 {
-    // tar-Daten zusammenbauen
-    var tarBufSize: int64 := fileCount * 65536 + 4096;  // Heuristik
+    var tarBufSize: int64 := fileCount * 65536 + 4096;
     var tarBuf: int64 := alloc(tarBufSize);
     var pos: int64 := 0;
 
     var sLen: int64 := StrLen(sourceDir);
-
-    fn zeroPad(upto: int64): void {
-        while (pos < upto) { poke8(tarBuf + pos, 0); pos := pos + 1; }
-    }
 
     var i: int64 := 0;
     while (i < fileCount) {
@@ -195,22 +197,22 @@ pub fn ArchiveCreate(sourceDir: int64, destPkg: int64, files: int64, fileCount: 
         // Vollständiger Quellpfad
         var fLen: int64 := StrLen(fname);
         var srcPath: int64 := alloc(sLen + fLen + 4);
-        StrCpyN(srcPath, sourceDir, sLen);
+        lpmCpyN(srcPath, sourceDir, sLen);
         poke8(srcPath + sLen, 47);
-        StrCpyN(srcPath + sLen + 1, fname, fLen);
+        lpmCpyN(srcPath + sLen + 1, fname, fLen);
         poke8(srcPath + sLen + 1 + fLen, 0);
 
-        var fileData: int64 := FileReadAll(srcPath);
+        var fileData: int64 := lpmReadFile(srcPath);
         var fileSize: int64 := FileSize(srcPath);
         free(srcPath);
 
         if (fileData != 0) {
-            // tar-Header schreiben (512 Bytes)
             var headerStart: int64 := pos;
-            zeroPad(pos + TAR_BLOCK);
+            pos := arZeroPad(tarBuf, pos, pos + TAR_BLOCK);
 
-            // Name
-            StrCpyN(tarBuf + headerStart + TAR_NAME_OFF, fname, (fLen > 99) & 99 | fLen);
+            var copyLen: int64 := fLen;
+            if (copyLen > 99) { copyLen := 99; }
+            lpmCpyN(tarBuf + headerStart + TAR_NAME_OFF, fname, copyLen);
 
             // Größe als Oktal
             var sizeBuf: int64 := alloc(16);
@@ -222,7 +224,7 @@ pub fn ArchiveCreate(sourceDir: int64, destPkg: int64, files: int64, fileCount: 
                 sv := sv / 8;
                 oi := oi - 1;
             }
-            StrCpyN(tarBuf + headerStart + TAR_SIZE_OFF, sizeBuf, 12);
+            lpmCpyN(tarBuf + headerStart + TAR_SIZE_OFF, sizeBuf, 12);
             free(sizeBuf);
 
             // Typ: reguläre Datei '0'
@@ -245,40 +247,36 @@ pub fn ArchiveCreate(sourceDir: int64, destPkg: int64, files: int64, fileCount: 
             }
             poke8(chkBuf + 6, 32);
             poke8(chkBuf + 7, 0);
-            StrCpyN(tarBuf + headerStart + 148, chkBuf, 8);
+            lpmCpyN(tarBuf + headerStart + 148, chkBuf, 8);
             free(chkBuf);
 
             // Dateidaten schreiben
-            StrCpyN(tarBuf + pos, fileData, fileSize);
+            lpmCpyN(tarBuf + pos, fileData, fileSize);
             pos := pos + fileSize;
             free(fileData);
 
-            // Auf 512-Byte-Block auffüllen
             var nextBlock: int64 := ((pos + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK;
-            zeroPad(nextBlock);
+            pos := arZeroPad(tarBuf, pos, nextBlock);
         }
 
         i := i + 1;
         }
     }
 
-    // Zwei leere Endblöcke
-    zeroPad(pos + TAR_BLOCK * 2);
+    pos := arZeroPad(tarBuf, pos, pos + TAR_BLOCK * 2);
     var tarLen: int64 := pos;
 
-    // Gzip-Kompression
     var compBuf: int64 := alloc(tarLen + 4096);
-    var compLen: int64 := alloc(8);
-    var rc: int64 := ZlibCompressGzip(tarBuf, tarLen, compBuf, tarLen + 4096, compLen);
+    var compLen: int64 := ZlibCompressDefault(tarBuf, tarLen, compBuf);
     free(tarBuf);
 
-    if (rc != 0) {
-        free(compBuf); free(compLen);
+    if (compLen <= 0) {
+        free(compBuf);
         return ERR_AR_DECOMP;
     }
 
-    var written: int64 := FileWriteAll(destPkg, compBuf, peek64(compLen));
-    free(compBuf); free(compLen);
+    var written: int64 := lpmWriteFile(destPkg, compBuf, compLen);
+    free(compBuf);
     if (written == 0) { return ERR_AR_IO; }
     return ERR_AR_OK;
 }
@@ -288,8 +286,8 @@ pub fn ArchiveVerifyChecksums(pkgPath: int64, destDir: int64): int64 {
     // FILES.sha256 im extrahierten Verzeichnis prüfen
     var dLen: int64 := StrLen(destDir);
     var checksumPath: int64 := alloc(dLen + 16);
-    StrCpyN(checksumPath, destDir, dLen);
-    StrCpyN(checksumPath + dLen, "/FILES.sha256", 13);
+    lpmCpyN(checksumPath, destDir, dLen);
+    lpmCpyN(checksumPath + dLen, "/FILES.sha256", 13);
     poke8(checksumPath + dLen + 13, 0);
 
     if (FileExists(checksumPath) == 0) {
