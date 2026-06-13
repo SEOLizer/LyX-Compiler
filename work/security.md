@@ -621,23 +621,24 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/codegen_x86.lyx` (cg_runAudit, Z. 8985/9015) |
+| **Dateien** | `src/codegen_x86.lyx` (cg_runAudit), `src/tooling/audit.lyx` |
 | **Aufwand** | 0.5 Tage |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-13 |
 
-**Problem:** Die LCBS-Audit-Funktion gibt hardcoded `+ W^X (RX-Code / RW-Daten getrennt)` und `+5 Punkte W^X aktiv` aus, unabhängig vom tatsächlichen ELF-Programmheader. Das Binary hat weiterhin `PF_R|PF_W|PF_X` (Wert 7, Single PT_LOAD). Der Score täuscht Nutzer über die tatsächliche Sicherheitslage. Ein Audit-System das falsch reportet ist schlimmer als keines.
+**Befund:** 23.1–23.3 waren bereits korrekt implementiert (`lcbsWxActive`-Flag existierte und wurde bedingt ausgewertet). Offen war 23.4: die RELRO-Zeile sagte hardcoded `dynamisch: Compiler-Garantie`, obwohl für dynamische ELFs kein PT_GNU_RELRO emittiert wird.
 
 **Teilschritte:**
 
-- [ ] **23.1** Audit: `lcbsWxActive`-Flag in Codegen setzen — `true` erst wenn zwei PT_LOAD-Segmente emittiert werden
-- [ ] **23.2** Audit-Ausgabe: W^X bedingt auf Flag (`+` nur wenn wirklich RX/RW getrennt, sonst `o`)
-- [ ] **23.3** Score: +5 für W^X nur wenn `lcbsWxActive`
-- [ ] **23.4** Gleiches Muster für RELRO prüfen (aktuell: RELRO-Aussage für statisches ELF korrekt, aber explizit als "kein GOT/PLT" formulieren)
+- [x] **23.1** `lcbsWxActive`-Flag in `Generate()` gesetzt — `1` nur wenn `externCount == 0` (statisches ELF mit zwei PT_LOADs)
+- [x] **23.2** Audit-Ausgabe: W^X bedingt auf `lcbsWxActive`
+- [x] **23.3** Score via `audit_compute_score()`: +5 für W^X nur wenn `lcbsWxActive`
+- [x] **23.4** RELRO: `relroOk`-Parameter in `audit_compute_score()` ergänzt; Ausgabe konditional — statisch: `+ RELRO (kein GOT/PLT-Angriffsziel — statisches ELF)`, dynamisch: `o RELRO (kein PT_GNU_RELRO — dynamisches ELF, WP-6b offen)`
 
 **Definition of Done:**
-- Solange WP-6 offen: Audit zeigt `o W^X (nicht aktiv — Single PT_LOAD RWX)`, Score +0
-- `checksec --elf` und Audit-Output sind konsistent
+- Statisches ELF: `+ W^X`, `+ RELRO`, Score korrekt ✅
+- Dynamisches ELF: `o W^X`, `o RELRO`, Score korrekt ✅
+- Kein Doppelaufruf des Audits (Audit läuft in `Generate()`, einmal für alle ELF-Typen) ✅
 
 ---
 
@@ -750,9 +751,9 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 17 | Annotationen dokumentieren (inkl. LCBS) | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
 | 18 | Stack-Canaries | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🔵 |
 | 19 | ARM64-Dynamic-Linking-Bugs | ✅ bereits in feat/dynlink-v2 | – | – | – | 🔵 |
-| 20 | `.meta_safe` Code-Integrität | ⬜ | – | – | – | 🟡 |
+| 20 | `.meta_safe` Code-Integrität | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
 | 21 | Debug-Datei entfernen | ⬜ | – | – | – | 🔵 |
 | 22 | Security-Tests im CI (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
-| **23** | **Audit W^X-Reporting korrigieren** | ⬜ | – | – | – | **🔴** |
+| **23** | **Audit W^X-Reporting korrigieren** | ✅ | Claude | 2026-06-13 | 2026-06-13 | **🔴** |
 | **24** | **seccomp-Filter-Vollständigkeit** | ⬜ | – | – | – | **🟠** |
 | **25** | **--capabilities=compat Warnung** | ⬜ | – | – | – | **🟡** |
