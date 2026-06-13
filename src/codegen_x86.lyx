@@ -476,6 +476,8 @@ pub type Codegen = class {
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
   // WP-3.1: byte buffer parallel to locals, 1 = @redundant var (TMR triple storage)
   localIsRedundant:  int64;
+  // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
+  localIsSimd:       int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -716,6 +718,10 @@ pub type Codegen = class {
       i := 0;
       memcpy(rb, self.localIsRedundant, self.localCount);
       self.localIsRedundant := rb;
+      var simdb: int64 := alloc(nc);
+      i := 0;
+      memcpy(simdb, self.localIsSimd, self.localCount);
+      self.localIsSimd := simdb;
       self.localCap := nc;
     }
     self.frameSize := self.frameSize + 8;
@@ -730,6 +736,7 @@ pub type Codegen = class {
     poke8(self.localIsArray      + self.localCount, 0);
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
+    poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
     self.localCount := self.localCount + 1;
     return 0 - self.frameSize;
   }
@@ -2247,6 +2254,39 @@ pub type Codegen = class {
     self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
   }
 
+  // WP-GPU-01: Emit inline SSE2 packed-f32 loop.
+  // Convention: rdi=src1, rsi=src2, rdx=dst, rcx=element count.
+  // Result: rax = dst ptr. Clobbers: rax, rcx, xmm0, xmm1.
+  fn cg_emitSSE2BinOp(op: int64) {
+    // xor eax, eax  (byte offset = 0)
+    self.cg_e8(0x31); self.cg_e8(0xC0);
+    // shl rcx, 2  (rcx = byte count)
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);
+    // [loop]: cmp rax, rcx
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    // jge +21 (.done)
+    self.cg_e8(0x7D); self.cg_e8(0x15);
+    // movaps xmm0, [rdi+rax]  (0F 28 04 07)
+    self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
+    // movaps xmm1, [rsi+rax]  (0F 28 0C 06)
+    self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x0C); self.cg_e8(0x06);
+    // packed f32 op: addps/subps/mulps/divps xmm0, xmm1
+    self.cg_e8(0x0F);
+    if op == CGT_PLUS  { self.cg_e8(0x58); }
+    else if op == CGT_MINUS { self.cg_e8(0x5C); }
+    else if op == CGT_STAR  { self.cg_e8(0x59); }
+    else                    { self.cg_e8(0x5E); }  // CGT_SLASH → divps
+    self.cg_e8(0xC1);  // xmm0, xmm1
+    // movaps [rdx+rax], xmm0  (0F 29 04 02)
+    self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);
+    // add rax, 16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
+    // jmp -26 (back to [loop])  EB E6
+    self.cg_e8(0xEB); self.cg_e8(0xE6);
+    // [.done]: mov rax, rdx  (result ptr)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
+  }
+
   // Emit binary operation: rax=right operand, rbx=left operand (from stack pop)
   // Result left in rax.
   fn cg_emitBinOp(op: int64) {
@@ -3396,9 +3436,38 @@ pub type Codegen = class {
       self.cg_genExpr(self.cg_nc0(ni));
 
     } else if (k == CGN_SIMD_NEW) {
-      // parallel Array<T>(size) — evaluate size into rax; full SIMD alloc deferred
+      // WP-GPU-01: parallel Array<f32>(size) — alloc size*4+24 bytes (16 align + 8 count slot).
+      // Layout: [count:8B][up-to-15B padding][aligned data: size*4 bytes]
+      // ptr = (mmap_base + 23) & ~15 → always ptr-8 >= mmap_base; count stored at ptr-8.
       var sizeNode: int64 := self.cg_nc1(ni);
-      if (sizeNode >= 0) { self.cg_genExpr(sizeNode); }
+      if (sizeNode >= 0) {
+        self.cg_genExpr(sizeNode);    // rax = element count
+      } else {
+        self.cg_movRaxImm(0);
+      }
+      // push rax (element count n, saved across mmap)
+      self.cg_e8(0x50);
+      // shl rax, 2  (rax = n*4 bytes)
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);
+      // add rax, 24  (16 for alignment + 8 for count slot)
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);
+      // mmap(0, size, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
+      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+      self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
+      self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+      // pop rcx (element count n)
+      self.cg_e8(0x59);
+      // align: rax = (rax + 23) & ~15  → guarantees rax-8 >= mmap_base
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+      // store element count at ptr-8  (mov [rax-8], rcx)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);
+      // rax = 16-byte aligned SIMD ptr; count readable at ptr-8
 
     // WP-17: Range expression (1..100) - returns start value in rax
     } else if (k == CGN_RANGE) {
@@ -3532,6 +3601,78 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax (b)
         self.cg_popRdi();                                         // pop rdi     (a)
         self.cg_emitStrConcatBody();
+      } else if ((op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR || op == CGT_SLASH) &&
+                 self.cg_nkind(lhsNi) == CGN_IDENT && self.cg_nkind(rhsNi) == CGN_IDENT) {
+        // WP-GPU-01: check if both operands are parallel Array<f32> locals → SSE2 binop
+        var sLN: pchar := self.cg_nsval(lhsNi);
+        var sLL: int64 := self.cg_nslen(lhsNi);
+        var sRN: pchar := self.cg_nsval(rhsNi);
+        var sRL: int64 := self.cg_nslen(rhsNi);
+        var sLI: int64 := self.cg_findLocalIdx(sLN, sLL);
+        var sRI: int64 := self.cg_findLocalIdx(sRN, sRL);
+        if (sLI >= 0 && sRI >= 0 &&
+            peek8(self.localIsSimd + sLI) != 0 &&
+            peek8(self.localIsSimd + sRI) != 0) {
+          // Both are SIMD locals — emit vectorized SSE2 loop
+          var sLO: int64 := self.cg_findLocal(sLN, sLL);
+          var sRO: int64 := self.cg_findLocal(sRN, sRL);
+          // load lhs SIMD ptr → rdi
+          if (sLO >= -128 && sLO <= -1) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(sLO);
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(sLO);
+          }
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+          // load rhs SIMD ptr → rsi
+          if (sRO >= -128 && sRO <= -1) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(sRO);
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(sRO);
+          }
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+          // rcx = element count from ptr-8: mov rcx, [rdi-8]  (48 8B 4F F8)
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4F); self.cg_e8(0xF8);
+          // save src ptrs and count across the dst allocation syscall
+          self.cg_e8(0x51);  // push rcx
+          self.cg_e8(0x57);  // push rdi
+          self.cg_e8(0x56);  // push rsi
+          // alloc result SIMD buffer (same count): rax = rcx = count
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx
+          self.cg_e8(0x50);  // push rax (element count, saved across syscall)
+          self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax, 2
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+          self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+          self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+          self.cg_e8(0x59);  // pop rcx (element count)
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);  // mov [rax-8], rcx
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
+          // restore: rsi=rhs ptr, rdi=lhs ptr, rcx=count
+          self.cg_e8(0x5E);  // pop rsi
+          self.cg_e8(0x5F);  // pop rdi
+          self.cg_e8(0x59);  // pop rcx
+          // rdi=src1, rsi=src2, rdx=dst, rcx=count → inline SSE2 loop
+          self.cg_emitSSE2BinOp(op);
+          // rax = result SIMD ptr
+        } else {
+          // idents but not SIMD — general path
+          self.cg_genExpr(lhsNi);
+          self.cg_pushRax();
+          self.cg_genExpr(rhsNi);
+          self.cg_popRbx();
+          if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+            self.cg_emitF64BinOp(op);
+          } else {
+            self.cg_emitBinOp(op);
+          }
+        }
       } else {
         // General: eval LHS, push; eval RHS; pop rbx
         self.cg_genExpr(lhsNi);
@@ -3673,6 +3814,7 @@ pub type Codegen = class {
       var baseNode: int64 := self.cg_nc0(ni);
       var isPchar:  int64 := 0;
       var isArray:  int64 := 0;
+      var isSimd:   int64 := 0;
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
@@ -3680,6 +3822,8 @@ pub type Codegen = class {
         var blen:  int64 := self.cg_nslen(baseNode);
         var lidx: int64 := self.cg_findLocalIdx(bname, blen);
         if (lidx >= 0) {
+          // WP-GPU-01: check SIMD flag first
+          if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
           var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
           var tp: pchar := peek64(tb) as pchar;
           var tn: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
@@ -3715,7 +3859,14 @@ pub type Codegen = class {
           // arrElemSize bleibt 8 (scalar Array<int64> etc.)
         }
       }
-      if (isPchar == 1) {
+      if (isSimd == 1) {
+        // WP-GPU-01: parallel Array<f32>[i] — 4-byte stride, no header, SSE2 movss
+        // rax=base ptr, rbx=index
+        // movss xmm0, [rax+rbx*4]  (F3 0F 10 04 98)
+        self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x98);
+        // movd rax, xmm0  (66 0F 7E C0) — return f32 bits as int32 in rax
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+      } else if (isPchar == 1) {
         // movzx rax, byte [rax+rbx]
         self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
       } else if (isArray == 1 && arrElemSize > 8) {
@@ -6740,6 +6891,11 @@ pub type Codegen = class {
           }
         }
       }
+      // WP-GPU-01: CGN_TYPE_PARALLEL (=93) — mark as SIMD parallel array
+      if (typeNode >= 0 && self.cg_nkind(typeNode) == 93) {
+        poke8(self.localIsSimd + localIdx, 1);
+        poke8(self.localIsArray + localIdx, 0);  // not a regular Array
+      }
       // WP-BC-51: NK_TYPE_ARRAY_FIXED (=101) — store compile-time size
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 101) {
         poke8(self.localIsArray + localIdx, 1);
@@ -6929,9 +7085,12 @@ pub type Codegen = class {
         self.cg_popRbx();                  // rbx = index
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
+        var lhsIsSimd:  int64 := 0;
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
+          // WP-GPU-01: SIMD array store check
+          if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
         } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
           var lhsInner: int64 := self.cg_nc0(lhsBase);
           var lhsFldNm: pchar := self.cg_nsval(lhsBase);
@@ -6939,7 +7098,16 @@ pub type Codegen = class {
           var lhsParentCi: int64 := self.cg_objClassIdx(lhsInner);
           if (self.cg_isFieldArray(lhsParentCi, lhsFldNm, lhsFldNl) != 0) { lhsIsArray := 1; }
         }
-        if (lhsIsArray == 1) {
+        if (lhsIsSimd == 1) {
+          // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
+          // stack: [value(rsi)]  rax=base  rbx=index
+          // pop rcx (value bits, f32 in low 32)
+          self.cg_e8(0x59);
+          // movd xmm0, ecx  (66 0F 6E C1)
+          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+          // movss [rax+rbx*4], xmm0  (F3 0F 11 04 98)
+          self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x98);
+        } else if (lhsIsArray == 1) {
           // array<T> local: skip 16-byte header
           // lea rcx, [rax+16]
           self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
@@ -9665,6 +9833,8 @@ pub type Codegen = class {
     self.localIsArray     := alloc(self.localCap);
     // WP-3.1: per-local redundant flag
     self.localIsRedundant := alloc(self.localCap);
+    // WP-GPU-01: per-local SIMD flag
+    self.localIsSimd      := alloc(self.localCap);
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
