@@ -1,0 +1,243 @@
+// std/cloud/gcp/functions.lyx — Cloud Functions v2 + Cloud Run (WP-GCP-10)
+//
+// Public API:
+//   GCFConnect(credsPtr, project, region) -> GCFConn
+//   GCFDisconnect(c)
+//   GCFDeploy(c, name, runtime, entryPoint, source) -> GCPResponse
+//   GCFDelete(c, name) -> int64 (status)
+//   GCFGet(c, name) -> GCPResponse
+//   GCFList(c) -> GCPResponse
+//   GCFInvoke(c, name, body, bodyLen) -> GCPResponse
+//
+//   GCRConnect(credsPtr, project, region) -> GCRConn
+//   GCRDisconnect(c)
+//   GCRServiceList(c) -> GCPResponse
+//   GCRServiceGet(c, name) -> GCPResponse
+//   GCRServiceInvoke(c, name, path, body, bodyLen) -> GCPResponse
+
+unit std.cloud.gcp.functions;
+
+import std.cloud.gcp.transport;
+import std.alloc;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+pub type GCFConn = struct {
+    client:  GCPClient;
+    project: int64;   // pchar
+    region:  int64;   // pchar
+};
+
+pub type GCRConn = struct {
+    client:  GCPClient;
+    project: int64;   // pchar
+    region:  int64;   // pchar
+};
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn funStrLen(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var i: int64 := 0; while (peek8(s + i) != 0) { i := i + 1; } return i;
+}
+
+fn funStrDup(src: int64): int64 {
+    if (src == 0) { return 0; }
+    var n: int64 := funStrLen(src);
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + n, 0); return buf;
+}
+
+fn funAppend(dst: int64, pos: int64, src: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + pos + i, peek8(src + i)); i := i + 1; }
+    return pos + n;
+}
+
+fn funAppendStr(dst: int64, pos: int64, s: int64): int64 {
+    return funAppend(dst, pos, s, funStrLen(s));
+}
+
+// Build Cloud Functions v2 path:
+// /v2/projects/{proj}/locations/{region}/functions[/{name}]
+fn gcfBasePath(proj: int64, region: int64, name: int64): int64 {
+    var pfx: int64  := "/v2/projects/" as int64;
+    var mid: int64  := "/locations/" as int64;
+    var sfx: int64  := "/functions" as int64;
+    var pl: int64   := funStrLen(proj);
+    var rl: int64   := funStrLen(region);
+    var nl: int64   := funStrLen(name);
+    var pfxLen: int64 := funStrLen(pfx);
+    var midLen: int64 := funStrLen(mid);
+    var sfxLen: int64 := funStrLen(sfx);
+    var total: int64 := pfxLen + pl + midLen + rl + sfxLen + 1 + nl + 1;
+    var buf: int64   := alloc(total);
+    var pos: int64 := 0;
+    pos := funAppend(buf, pos, pfx, pfxLen);
+    pos := funAppend(buf, pos, proj, pl);
+    pos := funAppend(buf, pos, mid, midLen);
+    pos := funAppend(buf, pos, region, rl);
+    pos := funAppend(buf, pos, sfx, sfxLen);
+    if (nl > 0) {
+        poke8(buf + pos, 47); pos := pos + 1;
+        pos := funAppend(buf, pos, name, nl);
+    }
+    poke8(buf + pos, 0);
+    return buf;
+}
+
+// Build Cloud Run v2 path:
+// /v2/projects/{proj}/locations/{region}/services[/{name}]
+fn gcrBasePath(proj: int64, region: int64, name: int64): int64 {
+    var pfx: int64  := "/v2/projects/" as int64;
+    var mid: int64  := "/locations/" as int64;
+    var sfx: int64  := "/services" as int64;
+    var pl: int64   := funStrLen(proj);
+    var rl: int64   := funStrLen(region);
+    var nl: int64   := funStrLen(name);
+    var pfxLen: int64 := funStrLen(pfx);
+    var midLen: int64 := funStrLen(mid);
+    var sfxLen: int64 := funStrLen(sfx);
+    var total: int64 := pfxLen + pl + midLen + rl + sfxLen + 1 + nl + 1;
+    var buf: int64   := alloc(total);
+    var pos: int64 := 0;
+    pos := funAppend(buf, pos, pfx, pfxLen);
+    pos := funAppend(buf, pos, proj, pl);
+    pos := funAppend(buf, pos, mid, midLen);
+    pos := funAppend(buf, pos, region, rl);
+    pos := funAppend(buf, pos, sfx, sfxLen);
+    if (nl > 0) {
+        poke8(buf + pos, 47); pos := pos + 1;
+        pos := funAppend(buf, pos, name, nl);
+    }
+    poke8(buf + pos, 0);
+    return buf;
+}
+
+// ── Cloud Functions Public API ────────────────────────────────────────────────
+
+pub fn GCFConnect(credsPtr: int64, project: int64, region: int64): GCFConn {
+    var c: GCFConn;
+    c.client  := GCPClientNew(credsPtr, project, "cloudfunctions.googleapis.com" as int64);
+    c.project := funStrDup(project);
+    c.region  := funStrDup(region);
+    if (c.region == 0) { c.region := funStrDup("europe-west1" as int64); }
+    return c;
+}
+
+pub fn GCFDisconnect(c: GCFConn): void {
+    GCPClientFree(c.client);
+    if (c.project != 0) { free(c.project, funStrLen(c.project) + 1); }
+    if (c.region  != 0) { free(c.region,  funStrLen(c.region)  + 1); }
+}
+
+pub fn GCFList(c: GCFConn): GCPResponse {
+    var path: int64 := gcfBasePath(c.project, c.region, 0);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, funStrLen(path) + 1);
+    return r;
+}
+
+pub fn GCFGet(c: GCFConn, name: int64): GCPResponse {
+    var path: int64 := gcfBasePath(c.project, c.region, name);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, funStrLen(path) + 1);
+    return r;
+}
+
+pub fn GCFDelete(c: GCFConn, name: int64): int64 {
+    var path: int64 := gcfBasePath(c.project, c.region, name);
+    var r: GCPResponse := GCPDelete(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, funStrLen(path) + 1);
+    return sc;
+}
+
+// GCFDeploy — deploy a Cloud Function v2
+// runtime: "nodejs20", "python311", "go122", etc.
+// entryPoint: function entry point name
+// source: Cloud Storage URL gs://bucket/path.zip
+pub fn GCFDeploy(c: GCFConn, name: int64, runtime: int64, entryPoint: int64, source: int64): GCPResponse {
+    var path: int64 := gcfBasePath(c.project, c.region, 0);
+    var nl: int64   := funStrLen(name);
+    var rtl: int64  := funStrLen(runtime);
+    var epl: int64  := funStrLen(entryPoint);
+    var sl: int64   := funStrLen(source);
+    var bodySz: int64 := 256 + nl + rtl + epl + sl;
+    var body: int64   := alloc(bodySz);
+    var pos: int64 := 0;
+    pos := funAppendStr(body, pos, "{\"name\":\"" as int64);
+    pos := funAppend(body, pos, name, nl);
+    pos := funAppendStr(body, pos, "\",\"buildConfig\":{\"runtime\":\"" as int64);
+    pos := funAppend(body, pos, runtime, rtl);
+    pos := funAppendStr(body, pos, "\",\"entryPoint\":\"" as int64);
+    pos := funAppend(body, pos, entryPoint, epl);
+    pos := funAppendStr(body, pos, "\",\"source\":{\"storageSource\":{\"bucket\":\"" as int64);
+    pos := funAppend(body, pos, source, sl);
+    pos := funAppendStr(body, pos, "\"}}}}" as int64);
+    poke8(body + pos, 0);
+    var r: GCPResponse := GCPPost(c.client, path, body, pos);
+    free(body, bodySz);
+    free(path, funStrLen(path) + 1);
+    return r;
+}
+
+// GCFInvoke — invoke a Cloud Function directly
+pub fn GCFInvoke(c: GCFConn, name: int64, body: int64, bodyLen: int64): GCPResponse {
+    var basePath: int64 := gcfBasePath(c.project, c.region, name);
+    var bpl: int64      := funStrLen(basePath);
+    var sfx: int64      := ":call" as int64;
+    var sfxLen: int64   := 5;
+    var path: int64     := alloc(bpl + sfxLen + 1);
+    var pos: int64 := 0;
+    pos := funAppend(path, pos, basePath, bpl);
+    pos := funAppend(path, pos, sfx, sfxLen);
+    poke8(path + pos, 0);
+    free(basePath, bpl + 1);
+    var r: GCPResponse := GCPPost(c.client, path, body, bodyLen);
+    free(path, bpl + sfxLen + 1);
+    return r;
+}
+
+// ── Cloud Run Public API ──────────────────────────────────────────────────────
+
+pub fn GCRConnect(credsPtr: int64, project: int64, region: int64): GCRConn {
+    var c: GCRConn;
+    c.client  := GCPClientNew(credsPtr, project, "run.googleapis.com" as int64);
+    c.project := funStrDup(project);
+    c.region  := funStrDup(region);
+    if (c.region == 0) { c.region := funStrDup("europe-west1" as int64); }
+    return c;
+}
+
+pub fn GCRDisconnect(c: GCRConn): void {
+    GCPClientFree(c.client);
+    if (c.project != 0) { free(c.project, funStrLen(c.project) + 1); }
+    if (c.region  != 0) { free(c.region,  funStrLen(c.region)  + 1); }
+}
+
+pub fn GCRServiceList(c: GCRConn): GCPResponse {
+    var path: int64 := gcrBasePath(c.project, c.region, 0);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, funStrLen(path) + 1);
+    return r;
+}
+
+pub fn GCRServiceGet(c: GCRConn, name: int64): GCPResponse {
+    var path: int64 := gcrBasePath(c.project, c.region, name);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, funStrLen(path) + 1);
+    return r;
+}
+
+// GCRServiceInvoke — call a Cloud Run service endpoint
+pub fn GCRServiceInvoke(c: GCRConn, name: int64, path: int64, body: int64, bodyLen: int64): GCPResponse {
+    // Cloud Run services are invoked at their URL, not via the run.googleapis.com API
+    // This is a placeholder that would require the service URL
+    var r: GCPResponse;
+    r.statusCode := 501; r.body := 0; r.bodyLen := 0; r.contentType := 0;
+    return r;
+}
