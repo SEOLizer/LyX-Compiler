@@ -1,0 +1,287 @@
+// src/error_collector.lyx
+// WP-KI-02: Strukturierter Fehler-Sammler für --error-json.
+// Sammelt Compiler-Fehler und gibt sie als JSON aus, statt sie als Text zu drucken.
+
+@description("Structured error collector for --error-json (WP-KI-02)")
+@author("Andreas Röne")
+@copyright("2025 Andreas Röne")
+unit src.error_collector;
+
+import src.std.alloc;
+import src.std.io;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con EC_CAT_PARSER:  int64 := 0;
+pub con EC_CAT_SEMA:    int64 := 1;
+pub con EC_CAT_CODEGEN: int64 := 2;
+
+pub con EC_SEV_ERROR:   int64 := 0;
+pub con EC_SEV_WARNING: int64 := 1;
+pub con EC_SEV_NOTE:    int64 := 2;
+
+// Record-Layout: 80 Bytes
+// +0:  category (int64)
+// +8:  severity (int64)
+// +16: line     (int64)
+// +24: col      (int64, 0 = unbekannt)
+// +32: filePtr  (int64, pchar — Zeiger auf externen String, nicht owned)
+// +40: msgOff   (int64, Offset in msgBuf)
+// +48: msgLen   (int64)
+// +56: seqNum   (int64, 1-basierte Sequenznummer)
+pub con EC_REC_SIZE:    int64 := 80;
+pub con EC_REC_CAT:     int64 := 0;
+pub con EC_REC_SEV:     int64 := 8;
+pub con EC_REC_LINE:    int64 := 16;
+pub con EC_REC_COL:     int64 := 24;
+pub con EC_REC_FILEPTR: int64 := 32;
+pub con EC_REC_MSGOFF:  int64 := 40;
+pub con EC_REC_MSGLEN:  int64 := 48;
+pub con EC_REC_SEQNUM:  int64 := 56;
+
+// ============================================================================
+// ErrorCollector
+// ============================================================================
+
+pub type ErrorCollector = class {
+  records:  int64;   // flat Buffer: count * EC_REC_SIZE Bytes
+  count:    int64;
+  cap:      int64;
+  msgBuf:   int64;   // String-Pool für Nachrichten
+  msgLen:   int64;
+  msgCap:   int64;
+  errSeq:   int64;   // Fehlerzähler (1-basiert)
+  warnSeq:  int64;   // Warnungszähler
+
+  pub fn EcInit(): void {
+    self.cap     := 64;
+    self.records := alloc(self.cap * EC_REC_SIZE);
+    self.count   := 0;
+    self.msgCap  := 8192;
+    self.msgBuf  := alloc(self.msgCap);
+    self.msgLen  := 0;
+    self.errSeq  := 0;
+    self.warnSeq := 0;
+  }
+
+  fn EcGrowRecs(): void {
+    var nc: int64 := self.cap * 2;
+    var nb: int64 := alloc(nc * EC_REC_SIZE);
+    memcpy(nb, self.records, self.count * EC_REC_SIZE);
+    free(self.records, self.cap * EC_REC_SIZE);
+    self.records := nb;
+    self.cap     := nc;
+  }
+
+  fn EcGrowMsg(need: int64): void {
+    var nc: int64 := self.msgCap * 2;
+    while nc < self.msgLen + need { nc := nc * 2; }
+    var nb: int64 := alloc(nc);
+    memcpy(nb, self.msgBuf, self.msgLen);
+    free(self.msgBuf, self.msgCap);
+    self.msgBuf := nb;
+    self.msgCap := nc;
+  }
+
+  // Fügt einen Fehler/Warnung hinzu. file darf 0 (Root-Modul) sein.
+  // msg muss NUL-terminiert sein.
+  pub fn EcAdd(cat: int64, sev: int64, file: pchar, line: int64, msg: pchar): void {
+    if self.count >= self.cap { self.EcGrowRecs(); }
+    var mlen: int64 := StrLen(msg);
+    if self.msgLen + mlen + 1 >= self.msgCap { self.EcGrowMsg(mlen + 2); }
+    var moff: int64 := self.msgLen;
+    memcpy(self.msgBuf + moff, msg as int64, mlen);
+    poke8(self.msgBuf + moff + mlen, 0);
+    self.msgLen := self.msgLen + mlen + 1;
+
+    var seq: int64 := 0;
+    if sev == EC_SEV_WARNING {
+      self.warnSeq := self.warnSeq + 1;
+      seq := self.warnSeq;
+    } else {
+      self.errSeq := self.errSeq + 1;
+      seq := self.errSeq;
+    }
+
+    var rec: int64 := self.records + self.count * EC_REC_SIZE;
+    poke64(rec + EC_REC_CAT,     cat);
+    poke64(rec + EC_REC_SEV,     sev);
+    poke64(rec + EC_REC_LINE,    line);
+    poke64(rec + EC_REC_COL,     0);
+    poke64(rec + EC_REC_FILEPTR, file as int64);
+    poke64(rec + EC_REC_MSGOFF,  moff);
+    poke64(rec + EC_REC_MSGLEN,  mlen);
+    poke64(rec + EC_REC_SEQNUM,  seq);
+    self.count := self.count + 1;
+  }
+
+  // Gibt die Anzahl der gesammelten Einträge zurück.
+  pub fn EcCount(): int64 { return self.count; }
+
+  // ============================================================================
+  // JSON-Ausgabe-Hilfsfunktionen
+  // ============================================================================
+
+  fn EcWrByte(fd: int64, c: int64): void {
+    var b: int64 := alloc(1);
+    poke8(b, c);
+    sys_write(fd, b, 1);
+    free(b, 1);
+  }
+
+  fn EcWrStr(fd: int64, s: pchar, slen: int64): void {
+    sys_write(fd, s as int64, slen);
+  }
+
+  fn EcWrChZ(fd: int64, s: pchar): void {
+    sys_write(fd, s as int64, StrLen(s));
+  }
+
+  fn EcWrInt(fd: int64, n: int64): void {
+    var dbuf: int64 := alloc(24);
+    if n == 0 {
+      var z: int64 := alloc(1);
+      poke8(z, 48);
+      sys_write(fd, z, 1);
+      free(z, 1);
+      free(dbuf, 24);
+      return;
+    }
+    var neg: bool := false;
+    if n < 0 { neg := true; n := 0 - n; }
+    var dlen: int64 := 0;
+    var tmp: int64 := n;
+    while tmp > 0 {
+      poke8(dbuf + dlen, (tmp % 10) + 48);
+      tmp := tmp / 10;
+      dlen := dlen + 1;
+    }
+    if neg {
+      var minus: int64 := alloc(1);
+      poke8(minus, 45);
+      sys_write(fd, minus, 1);
+      free(minus, 1);
+    }
+    // reverse digits into output
+    var rbuf: int64 := alloc(24);
+    var i: int64 := 0;
+    while i < dlen {
+      poke8(rbuf + i, peek8(dbuf + (dlen - 1 - i)) as int64);
+      i := i + 1;
+    }
+    sys_write(fd, rbuf, dlen);
+    free(rbuf, 24);
+    free(dbuf, 24);
+  }
+
+  fn EcWrStrEsc(fd: int64, s: pchar, slen: int64): void {
+    self.EcWrByte(fd, 34);  // "
+    var i: int64 := 0;
+    while i < slen {
+      var c: int64 := peek8(s as int64 + i) as int64;
+      if c == 0  { i := slen; continue; }
+      if c == 34 { self.EcWrByte(fd, 92); self.EcWrByte(fd, 34); }
+      else if c == 92 { self.EcWrByte(fd, 92); self.EcWrByte(fd, 92); }
+      else if c == 10 { self.EcWrByte(fd, 92); self.EcWrByte(fd, 110); }
+      else if c == 13 { self.EcWrByte(fd, 92); self.EcWrByte(fd, 114); }
+      else if c == 9  { self.EcWrByte(fd, 92); self.EcWrByte(fd, 116); }
+      else { self.EcWrByte(fd, c); }
+      i := i + 1;
+    }
+    self.EcWrByte(fd, 34);  // "
+  }
+
+  fn EcCatStr(cat: int64): pchar {
+    if cat == EC_CAT_PARSER  { return "parser"c; }
+    if cat == EC_CAT_CODEGEN { return "codegen"c; }
+    return "sema"c;
+  }
+
+  fn EcSevStr(sev: int64): pchar {
+    if sev == EC_SEV_WARNING { return "warning"c; }
+    if sev == EC_SEV_NOTE    { return "note"c; }
+    return "error"c;
+  }
+
+  // Generiert Error-ID: LYX-S0001, LYX-P0001, LYX-W0001 etc.
+  fn EcBuildId(fd: int64, cat: int64, sev: int64, seq: int64): void {
+    self.EcWrChZ(fd, "LYX-"c);
+    if sev == EC_SEV_WARNING {
+      self.EcWrByte(fd, 87);  // W
+    } else if cat == EC_CAT_PARSER {
+      self.EcWrByte(fd, 80);  // P
+    } else if cat == EC_CAT_CODEGEN {
+      self.EcWrByte(fd, 67);  // C
+    } else {
+      self.EcWrByte(fd, 83);  // S (sema)
+    }
+    // Zero-pad to 4 digits
+    if seq < 1000 { self.EcWrByte(fd, 48); }
+    if seq < 100  { self.EcWrByte(fd, 48); }
+    if seq < 10   { self.EcWrByte(fd, 48); }
+    self.EcWrInt(fd, seq);
+  }
+
+  // Gibt alle gesammelten Fehler/Warnungen als JSON auf fd aus.
+  pub fn EcEmitJson(fd: int64): void {
+    self.EcWrChZ(fd, "{\n  \"errors\": ["c);
+    var i: int64 := 0;
+    while i < self.count {
+      if i > 0 { self.EcWrByte(fd, 44); }  // ,
+      var rec: int64 := self.records + i * EC_REC_SIZE;
+      var cat:    int64 := peek64(rec + EC_REC_CAT);
+      var sev:    int64 := peek64(rec + EC_REC_SEV);
+      var line:   int64 := peek64(rec + EC_REC_LINE);
+      var col:    int64 := peek64(rec + EC_REC_COL);
+      var fptr:   int64 := peek64(rec + EC_REC_FILEPTR);
+      var moff:   int64 := peek64(rec + EC_REC_MSGOFF);
+      var mlen:   int64 := peek64(rec + EC_REC_MSGLEN);
+      var seq:    int64 := peek64(rec + EC_REC_SEQNUM);
+      var msg: pchar := (self.msgBuf + moff) as pchar;
+
+      self.EcWrChZ(fd, "\n    {"c);
+      // errorId
+      self.EcWrChZ(fd, "\n      \"errorId\": \""c);
+      self.EcBuildId(fd, cat, sev, seq);
+      self.EcWrByte(fd, 34);  // "
+      // category
+      self.EcWrChZ(fd, ",\n      \"category\": "c);
+      self.EcWrStrEsc(fd, self.EcCatStr(cat), StrLen(self.EcCatStr(cat)));
+      // severity
+      self.EcWrChZ(fd, ",\n      \"severity\": "c);
+      self.EcWrStrEsc(fd, self.EcSevStr(sev), StrLen(self.EcSevStr(sev)));
+      // message
+      self.EcWrChZ(fd, ",\n      \"message\": "c);
+      self.EcWrStrEsc(fd, msg, mlen);
+      // locations
+      self.EcWrChZ(fd, ",\n      \"locations\": [{"c);
+      self.EcWrChZ(fd, "\"file\": "c);
+      if fptr != 0 {
+        self.EcWrStrEsc(fd, fptr as pchar, StrLen(fptr as pchar));
+      } else {
+        self.EcWrChZ(fd, "null"c);
+      }
+      self.EcWrChZ(fd, ", \"line\": "c);
+      self.EcWrInt(fd, line);
+      self.EcWrChZ(fd, ", \"col\": "c);
+      self.EcWrInt(fd, col);
+      self.EcWrChZ(fd, "}]"c);
+      // null fields
+      self.EcWrChZ(fd, ",\n      \"expected\": null"c);
+      self.EcWrChZ(fd, ",\n      \"actual\": null"c);
+      self.EcWrChZ(fd, ",\n      \"suggestion\": null"c);
+      self.EcWrChZ(fd, ",\n      \"astPath\": null"c);
+      self.EcWrChZ(fd, "\n    }"c);
+      i := i + 1;
+    }
+    if self.count > 0 { self.EcWrChZ(fd, "\n  "c); }
+    self.EcWrChZ(fd, "],\n"c);
+    self.EcWrChZ(fd, "  \"errorCount\": "c);
+    self.EcWrInt(fd, self.errSeq);
+    self.EcWrChZ(fd, ",\n  \"warningCount\": "c);
+    self.EcWrInt(fd, self.warnSeq);
+    self.EcWrChZ(fd, "\n}\n"c);
+  }
+}

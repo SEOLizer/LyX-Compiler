@@ -1,0 +1,379 @@
+// src/backend/ast_json.lyx
+// WP-KI-01: AST-Export via --ast-json / --ast-json-pretty.
+// Serialisiert den Parser-AST als maschinenlesbares JSON für KI-Agenten.
+// Format: Array von Top-Level-Knoten, jeder Knoten mit kind/kindId/line/col/sval/ival/c0..c3.
+// Children (c0..c3) sind jeweils Arrays (folgen der next-Sibling-Kette).
+
+@description("AST JSON serializer for --ast-json (WP-KI-01)")
+@author("Andreas Röne")
+@copyright("2025 Andreas Röne")
+unit src.backend.ast_json;
+
+import src.std.alloc;
+import src.std.io;
+import src.parser;
+
+con AJ_BUF_SIZE: int64 := 4096;
+con AJ_NODE_SIZE: int64 := 88;
+con AJ_TOK_SIZE:  int64 := 40;
+
+pub type AstJson = class {
+  nodes:    int64;   // Parser.nodes-Buffer (88-Byte-Records)
+  src:      pchar;   // Quelltext
+  toks:     int64;   // Parser.toks-Buffer (40-Byte-Records)
+  tokCount: int64;
+  fd:       int64;   // Ausgabe-Dateideskriptor
+  pretty:   bool;
+  indent:   int64;
+  buf:      int64;   // Write-Batch-Buffer
+  bufLen:   int64;
+  dBuf:     int64;   // Scratch-Buffer für Int→Dezimal
+
+  pub fn AjInit(nodes: int64, src: pchar, toks: int64, tokCount: int64, fd: int64): void {
+    self.nodes    := nodes;
+    self.src      := src;
+    self.toks     := toks;
+    self.tokCount := tokCount;
+    self.fd       := fd;
+    self.pretty   := false;
+    self.indent   := 0;
+    self.buf      := alloc(AJ_BUF_SIZE + 16);
+    self.bufLen   := 0;
+    self.dBuf     := alloc(24);
+  }
+
+  pub fn AjDeinit(): void {
+    self.AjFlush();
+    free(self.buf, AJ_BUF_SIZE + 16);
+    free(self.dBuf, 24);
+  }
+
+  fn AjFlush(): void {
+    if self.bufLen > 0 {
+      sys_write(self.fd, self.buf, self.bufLen);
+      self.bufLen := 0;
+    }
+  }
+
+  fn AjByte(c: int64): void {
+    if self.bufLen >= AJ_BUF_SIZE { self.AjFlush(); }
+    poke8(self.buf + self.bufLen, c);
+    self.bufLen := self.bufLen + 1;
+  }
+
+  fn AjChZ(s: pchar): void {
+    var i: int64 := 0;
+    while peek8(s as int64 + i) as int64 != 0 {
+      self.AjByte(peek8(s as int64 + i) as int64);
+      i := i + 1;
+    }
+  }
+
+  fn AjInt(n: int64): void {
+    if n == 0 { self.AjByte(48); return; }
+    var neg: bool := false;
+    if n < 0 { neg := true; n := 0 - n; }
+    var dlen: int64 := 0;
+    var tmp: int64 := n;
+    while tmp > 0 {
+      poke8(self.dBuf + dlen, (tmp % 10) + 48);
+      tmp := tmp / 10;
+      dlen := dlen + 1;
+    }
+    if neg { self.AjByte(45); }
+    var i: int64 := dlen - 1;
+    while i >= 0 {
+      self.AjByte(peek8(self.dBuf + i) as int64);
+      i := i - 1;
+    }
+  }
+
+  fn AjStrEsc(s: pchar, slen: int64): void {
+    self.AjByte(34);  // "
+    var i: int64 := 0;
+    while i < slen {
+      var c: int64 := peek8(s as int64 + i) as int64;
+      if c == 0  { i := slen; continue; }
+      if c == 34 { self.AjByte(92); self.AjByte(34); }
+      else if c == 92 { self.AjByte(92); self.AjByte(92); }
+      else if c == 10 { self.AjByte(92); self.AjByte(110); }
+      else if c == 13 { self.AjByte(92); self.AjByte(114); }
+      else if c == 9  { self.AjByte(92); self.AjByte(116); }
+      else { self.AjByte(c); }
+      i := i + 1;
+    }
+    self.AjByte(34);  // "
+  }
+
+  fn AjNL(): void {
+    if self.pretty == false { return; }
+    self.AjByte(10);
+    var i: int64 := 0;
+    while i < self.indent {
+      self.AjByte(32); self.AjByte(32);
+      i := i + 1;
+    }
+  }
+
+  fn AjSep(comma: bool): void {
+    if comma { self.AjByte(44); }
+    self.AjNL();
+  }
+
+  fn AjKey(key: pchar, comma: bool): void {
+    self.AjSep(comma);
+    self.AjStrEsc(key, StrLen(key));
+    self.AjByte(58);
+    if self.pretty { self.AjByte(32); }
+  }
+
+  // ── Node-Feld-Zugriff (88-Byte flat record) ──────────────────────────────
+  fn AjNBase(ni: int64): int64 { return self.nodes + ni * AJ_NODE_SIZE; }
+  fn AjNKind(ni: int64): int64 { return peek64(self.AjNBase(ni) + 0); }
+  fn AjNC0(ni: int64): int64   { return peek64(self.AjNBase(ni) + 8); }
+  fn AjNC1(ni: int64): int64   { return peek64(self.AjNBase(ni) + 16); }
+  fn AjNC2(ni: int64): int64   { return peek64(self.AjNBase(ni) + 24); }
+  fn AjNC3(ni: int64): int64   { return peek64(self.AjNBase(ni) + 32); }
+  fn AjNNext(ni: int64): int64 { return peek64(self.AjNBase(ni) + 40); }
+  fn AjNTok(ni: int64): int64  { return peek64(self.AjNBase(ni) + 48); }
+  fn AjNIVal(ni: int64): int64 { return peek64(self.AjNBase(ni) + 56); }
+  fn AjNSOff(ni: int64): int64 { return peek64(self.AjNBase(ni) + 64); }
+  fn AjNSLen(ni: int64): int64 { return peek64(self.AjNBase(ni) + 72); }
+  fn AjNPub(ni: int64): int64  { return peek64(self.AjNBase(ni) + 80); }
+
+  // Token-Feld-Zugriff (40-Byte flat record)
+  fn AjTLine(ti: int64): int64  { return peek64(self.toks + ti * AJ_TOK_SIZE + 32); }
+  fn AjTStart(ti: int64): int64 { return peek64(self.toks + ti * AJ_TOK_SIZE + 8); }
+
+  fn AjNodeLine(ni: int64): int64 {
+    var ti: int64 := self.AjNTok(ni);
+    if ti < 0 || ti >= self.tokCount { return 0; }
+    return self.AjTLine(ti);
+  }
+
+  fn AjNodeCol(ni: int64): int64 {
+    var ti: int64 := self.AjNTok(ni);
+    if ti < 0 || ti >= self.tokCount { return 0; }
+    var start: int64 := self.AjTStart(ti);
+    var pos: int64 := start;
+    while pos > 0 {
+      pos := pos - 1;
+      if peek8(self.src as int64 + pos) as int64 == 10 { return start - pos - 1; }
+    }
+    return start;
+  }
+
+  // Knotentyp-Name: NK_* → JSON-String
+  fn AjKindName(k: int64): pchar {
+    if k == 0   { return "NK_INVALID"c; }
+    if k == 1   { return "NK_IMPORT"c; }
+    if k == 2   { return "NK_FUNC_DECL"c; }
+    if k == 3   { return "NK_PARAM"c; }
+    if k == 4   { return "NK_VAR_DECL"c; }
+    if k == 5   { return "NK_CON_DECL"c; }
+    if k == 6   { return "NK_STRUCT_DECL"c; }
+    if k == 7   { return "NK_FIELD_DECL"c; }
+    if k == 8   { return "NK_ENUM_DECL"c; }
+    if k == 9   { return "NK_ENUM_MEM"c; }
+    if k == 10  { return "NK_TYPE_DECL"c; }
+    if k == 20  { return "NK_BLOCK"c; }
+    if k == 21  { return "NK_IF"c; }
+    if k == 22  { return "NK_WHILE"c; }
+    if k == 23  { return "NK_RETURN"c; }
+    if k == 24  { return "NK_EXPR_STMT"c; }
+    if k == 25  { return "NK_ASSIGN"c; }
+    if k == 26  { return "NK_FOR"c; }
+    if k == 27  { return "NK_SWITCH"c; }
+    if k == 28  { return "NK_CASE"c; }
+    if k == 29  { return "NK_BREAK"c; }
+    if k == 30  { return "NK_DISPOSE"c; }
+    if k == 31  { return "NK_TRY"c; }
+    if k == 32  { return "NK_CATCH"c; }
+    if k == 33  { return "NK_FINALLY"c; }
+    if k == 34  { return "NK_THROW"c; }
+    if k == 35  { return "NK_CONTINUE"c; }
+    if k == 36  { return "NK_ASSERT"c; }
+    if k == 40  { return "NK_LIT_INT"c; }
+    if k == 41  { return "NK_LIT_FLOAT"c; }
+    if k == 42  { return "NK_LIT_STR"c; }
+    if k == 43  { return "NK_LIT_CHAR"c; }
+    if k == 44  { return "NK_LIT_BOOL"c; }
+    if k == 45  { return "NK_LIT_NULL"c; }
+    if k == 46  { return "NK_IDENT"c; }
+    if k == 47  { return "NK_BINOP"c; }
+    if k == 48  { return "NK_UNOP"c; }
+    if k == 49  { return "NK_CALL"c; }
+    if k == 50  { return "NK_INDEX"c; }
+    if k == 51  { return "NK_FIELD"c; }
+    if k == 52  { return "NK_NEW"c; }
+    if k == 53  { return "NK_CAST"c; }
+    if k == 54  { return "NK_CLOSURE"c; }
+    if k == 55  { return "NK_FN_PTR"c; }
+    if k == 60  { return "NK_TYPE_NAME"c; }
+    if k == 61  { return "NK_TYPE_ARRAY"c; }
+    if k == 62  { return "NK_TYPE_PARAM"c; }
+    if k == 63  { return "NK_GENERIC_DECL"c; }
+    if k == 64  { return "NK_MATCH"c; }
+    if k == 65  { return "NK_MATCH_CASE"c; }
+    if k == 66  { return "NK_PATTERN_LIT"c; }
+    if k == 67  { return "NK_PATTERN_WILD"c; }
+    if k == 68  { return "NK_PATTERN_BIND"c; }
+    if k == 69  { return "NK_CLASS_DECL"c; }
+    if k == 70  { return "NK_IFACE_DECL"c; }
+    if k == 71  { return "NK_SUPER_CALL"c; }
+    if k == 72  { return "NK_IS_EXPR"c; }
+    if k == 73  { return "NK_RANGE"c; }
+    if k == 74  { return "NK_WHERE"c; }
+    if k == 75  { return "NK_PATTERN_ENUM"c; }
+    if k == 76  { return "NK_PATTERN_STRUCT"c; }
+    if k == 77  { return "NK_REPEAT_UNTIL"c; }
+    if k == 78  { return "NK_TUPLE_VAR_DECL"c; }
+    if k == 79  { return "NK_MAP_LIT"c; }
+    if k == 80  { return "NK_SET_LIT"c; }
+    if k == 81  { return "NK_IN_EXPR"c; }
+    if k == 82  { return "NK_MAP_ENTRY"c; }
+    if k == 83  { return "NK_POOL"c; }
+    if k == 84  { return "NK_PANIC"c; }
+    if k == 85  { return "NK_PATTERN_OR"c; }
+    if k == 86  { return "NK_FORMAT_EXPR"c; }
+    if k == 87  { return "NK_NULL_COAL"c; }
+    if k == 88  { return "NK_SAFE_CAST"c; }
+    if k == 89  { return "NK_REGEX_LIT"c; }
+    if k == 90  { return "NK_DIM_DECL"c; }
+    if k == 91  { return "NK_UTYPE_DECL"c; }
+    if k == 92  { return "NK_TYPE_RINGBUF"c; }
+    if k == 93  { return "NK_TYPE_PARALLEL"c; }
+    if k == 94  { return "NK_SIMD_NEW"c; }
+    if k == 95  { return "NK_LFD_FORM"c; }
+    if k == 96  { return "NK_LFD_WIDGET"c; }
+    if k == 97  { return "NK_LFD_LAYOUT"c; }
+    if k == 98  { return "NK_LFD_PROPERTY"c; }
+    if k == 99  { return "NK_LFD_SIGNAL"c; }
+    if k == 100 { return "NK_ARRAY_LIT"c; }
+    if k == 101 { return "NK_TYPE_ARRAY_FIXED"c; }
+    if k == 102 { return "NK_FOR_C"c; }
+    if k == 103 { return "NK_AT_IF"c; }
+    if k == 104 { return "NK_AT_DIRECTIVE"c; }
+    if k == 105 { return "NK_AT_ENERGY"c; }
+    if k == 106 { return "NK_DEFER"c; }
+    if k == 107 { return "NK_FOR_RANGE"c; }
+    if k == 108 { return "NK_NAMED_ARG"c; }
+    if k == 109 { return "NK_TYPE_TUPLE"c; }
+    if k == 110 { return "NK_CAPABILITY_ATTR"c; }
+    if k == 111 { return "NK_CAPABILITY_DECL"c; }
+    if k == 112 { return "NK_CAPABILITY_ARG"c; }
+    if k == 113 { return "NK_NETWORK_TARGET"c; }
+    if k == 114 { return "NK_GRANT_CLAUSE"c; }
+    if k == 115 { return "NK_RESTRICT_CLAUSE"c; }
+    if k == 116 { return "NK_USES_CALLER_CAP"c; }
+    return "NK_UNKNOWN"c;
+  }
+
+  // Gibt eine Sibling-Liste als JSON-Array aus (folgt der next-Kette ab `first`).
+  // key: Feldname (z.B. "c0"), first: erster Knoten-Index (-1 = null).
+  fn AjChildArray(key: pchar, first: int64, comma: bool): void {
+    self.AjKey(key, comma);
+    if first < 0 {
+      self.AjChZ("null"c);
+      return;
+    }
+    self.AjByte(91);  // [
+    self.indent := self.indent + 1;
+    var ni: int64 := first;
+    var idx: int64 := 0;
+    while ni >= 0 {
+      if idx > 0 { self.AjByte(44); }
+      self.AjNL();
+      self.AjEmitNode(ni);
+      ni := self.AjNNext(ni);
+      idx := idx + 1;
+    }
+    self.indent := self.indent - 1;
+    if self.pretty && idx > 0 { self.AjNL(); }
+    self.AjByte(93);  // ]
+  }
+
+  // Serialisiert einen einzelnen AST-Knoten als JSON-Objekt.
+  // Die next-Sibling-Kette wird NICHT verfolgt — das macht AjChildArray/AjDump.
+  fn AjEmitNode(ni: int64): void {
+    var k:    int64 := self.AjNKind(ni);
+    var soff: int64 := self.AjNSOff(ni);
+    var slen: int64 := self.AjNSLen(ni);
+    var ival: int64 := self.AjNIVal(ni);
+    var pub_: int64 := self.AjNPub(ni);
+    var c0:   int64 := self.AjNC0(ni);
+    var c1:   int64 := self.AjNC1(ni);
+    var c2:   int64 := self.AjNC2(ni);
+    var c3:   int64 := self.AjNC3(ni);
+    var line: int64 := self.AjNodeLine(ni);
+    var col:  int64 := self.AjNodeCol(ni);
+    var kname: pchar := self.AjKindName(k);
+
+    self.AjByte(123);  // {
+    self.indent := self.indent + 1;
+
+    // Pflichtfelder
+    self.AjKey("kind"c, false);
+    self.AjStrEsc(kname, StrLen(kname));
+    self.AjKey("kindId"c, true);
+    self.AjInt(k);
+    self.AjKey("line"c, true);
+    self.AjInt(line);
+    self.AjKey("col"c, true);
+    self.AjInt(col);
+
+    // Optionale Felder: nur ausgeben wenn vorhanden
+    if slen > 0 {
+      var sv: pchar := (self.src as int64 + soff) as pchar;
+      self.AjKey("sval"c, true);
+      self.AjStrEsc(sv, slen);
+    }
+    if ival != 0 {
+      self.AjKey("ival"c, true);
+      self.AjInt(ival);
+    }
+    if pub_ != 0 {
+      self.AjKey("pub"c, true);
+      self.AjChZ("true"c);
+    }
+
+    // Kinder (c0..c3) als Arrays der Sibling-Kette
+    // Sonderfall: NK_FUNC_DECL ohne Body (extern fn) — c3 enthält Library-Span (kein Knoten-Index)
+    var c3IsLib: int64 := 0;
+    if k == NK_FUNC_DECL && c2 < 0 { c3IsLib := 1; }
+
+    self.AjChildArray("c0"c, c0, true);
+    self.AjChildArray("c1"c, c1, true);
+    self.AjChildArray("c2"c, c2, true);
+    if c3IsLib != 0 {
+      self.AjKey("libSpan"c, true);
+      self.AjInt(c3);
+    } else {
+      self.AjChildArray("c3"c, c3, true);
+    }
+
+    self.indent := self.indent - 1;
+    self.AjNL();
+    self.AjByte(125);  // }
+  }
+
+  // Gibt den gesamten AST (Top-Level-Deklarationen als JSON-Array) aus.
+  pub fn AjDump(root: int64): void {
+    self.AjByte(91);  // [
+    self.indent := 1;
+    var ni: int64 := root;
+    var idx: int64 := 0;
+    while ni >= 0 {
+      if idx > 0 { self.AjByte(44); }
+      self.AjNL();
+      self.AjEmitNode(ni);
+      ni := self.AjNNext(ni);
+      idx := idx + 1;
+    }
+    self.indent := 0;
+    if self.pretty && idx > 0 { self.AjNL(); }
+    self.AjByte(93);  // ]
+    self.AjByte(10);  // newline
+    self.AjFlush();
+  }
+}
