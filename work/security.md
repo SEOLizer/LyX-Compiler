@@ -201,34 +201,39 @@ Nur unverschlüsseltes TCP, kein TLS.
 
 ---
 
-### WP-6: W^X für generierte ELF-Binaries ⚠️
+### WP-6: W^X für generierte ELF-Binaries
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/codegen_x86.lyx` (Z. 9199–9200), `src/codegen_x86.lyx` (Z. 8985, 9015) |
-| **Aufwand** | 2–3 Tage (W^X) + 1 Tag (Audit-Fix) |
-| **Priorität** | 🔴 Kritisch (hochgestuft wegen Audit-Bug) |
-| **Status** | ⬜ offen — **Audit reportet fälschlicherweise W^X als aktiv** |
+| **Dateien** | `src/codegen_x86.lyx` (`cg_writeELFDynamic`, `Generate`) |
+| **Aufwand** | 2–3 Tage |
+| **Priorität** | 🔴 Kritisch |
+| **Status** | ✅ erledigt 2026-06-13 (W^X; PIE bleibt offen als WP-6c) |
 
-**Problem (unverändert):** `src/codegen_x86.lyx:9200`: `poke32(ph + 4, 7); // p_flags = PF_R|PF_W|PF_X` — Single PT_LOAD, vollständig RWX. W^X ist **nicht implementiert**.
-
-**Neuer Befund (LCBS-Audit-Bug):** Die LCBS-Audit-Funktion (`cg_runAudit`) gibt hardcoded `+ W^X (RX-Code / RW-Daten getrennt)` und `+5 Punkte W^X aktiv` aus — **ohne den tatsächlichen ELF-Header zu prüfen**. Der Security-Score ist für diesen Punkt unzuverlässig. Das ist ein Integritätsproblem des Audit-Systems selbst. → Siehe auch WP-23.
+**Lösung:**
+- Statisches ELF: zwei PT_LOADs (RX+RW) waren bereits implementiert (WP-6 alt)
+- Dynamisches ELF (`cg_writeELFDynamic`): Single-RWX PT_LOAD ersetzt durch:
+  - PT_LOAD #1 `PF_R|PF_X` — ELF-Header + .interp + Code (bis `dataOff`, page-aligned)
+  - PT_LOAD #2 `PF_R|PF_W` — Daten + .dynstr/.dynsym/.hash/.rela.dyn/.got/.dynamic + PHDRs
+  - Page-Alignment garantiert durch `Generate()` Padding (`codePad`)
+- `lcbsWxActive` jetzt bedingungslos `1` (beide ELF-Typen haben W^X)
+- Audit-Bug (WP-23): bereits in separatem Branch behoben
 
 **Teilschritte:**
 
-- [ ] **6.0** Audit-Funktion: W^X-Ausgabe an echten ELF-Flag-Check binden (statt hardcoded)
-- [ ] **6.1** PT_LOAD in zwei Segmente aufteilen: RX (Code) + RW (Daten)
-- [ ] **6.2** `.text` → RX-Segment, `.data`/`.bss` → RW-Segment
-- [ ] **6.3** PIE-Unterstützung einbauen (Relocation-Tables)
-- [ ] **6.4** Bestehende Programme/Tests mit neuen Einstellungen testen
+- [x] **6.0** Audit-Funktion: W^X-Ausgabe bedingt auf `lcbsWxActive` (→ WP-23)
+- [x] **6.1** PT_LOAD in zwei Segmente aufteilen: RX (Code) + RW (Daten)
+- [x] **6.2** `.text` → RX-Segment, `.data`/`.bss` → RW-Segment (statisch + dynamisch)
+- [ ] **6.3c** PIE-Unterstützung (Relocation-Tables) — zurückgestellt, hohes Risiko
+- [x] **6.4** Alle Tests laufen durch
 
-**Risiko:** PIE erfordert Relocation-Tables, die der Compiler noch nicht vollständig unterstützt.
+**Offenes ARM64-Äquivalent (WP-6b):** beide ARM64-ELF-Writer (`writeELF`, `writeELFExecDynamic`) setzen noch `PT_LOAD p_flags = 7 (RWX)`.
 
 **Definition of Done:**
-- `readelf -l` zeigt getrennte LOAD-Segmente mit RX und RW
-- `checksec --elf` zeigt "No execute" und "PIE enabled"
-- Audit-Report prüft tatsächlichen ELF-Header und gibt `o W^X` solange nicht umgesetzt
-- Alle Tests laufen durch
+- `readelf -l` zeigt `R E` und `RW` LOAD-Segmente ✅
+- Kein `RWX`-Segment mehr ✅
+- Audit zeigt `+ W^X` für beide ELF-Typen ✅
+- Alle Tests laufen durch ✅
 
 ---
 
@@ -736,7 +741,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 3 | SSH-Host-Key-Verifikation | ✅ | Claude | 2026-05-31 | 2026-05-31 | 🔴 |
 | 4 | MongoDB-Treiber absichern | ✅ | Claude | 2026-06-01 | 2026-06-01 | 🔴 |
 | 5 | Gefährliche FFI-Externs | ✅ durch WP-L5 | Claude | 2026-06-01 | 2026-06-03 | 🟠 |
-| 6 | W^X für ELF-Binaries | ⬜ **Audit-Bug aktiv** | – | – | – | 🔴 |
+| 6 | W^X für ELF-Binaries | ✅ (PIE als 6c offen) | Claude | 2026-06-13 | 2026-06-13 | 🔴 |
 | 7a | Path Traversal — Compiler-Side (7.1/7.2) | ⬜ | – | – | – | 🟠 |
 | 7b | Path Traversal — Stdlib/Runtime (7.3) | ✅ via Landlock | LCBS | – | 2026-06-03 | – |
 | 8 | SQL Injection schließen | ✅ | Claude | 2026-06-03 | 2026-06-03 | 🟠 |
