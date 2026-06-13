@@ -582,9 +582,9 @@ Timing-Seitenkanal-Angriffe möglich bei lokalem Zugriff.
 | **Dateien** | `src/s1-debug.md` |
 | **Aufwand** | 0.1 Tage |
 | **Priorität** | 🔵 Niedrig |
-| **Status** | ⬜ |
+| **Status** | ✅ erledigt 2026-06-13 |
 
-**Problem:** Enthält Memory-Dumps und Debug-Info, die einem Angreifer nützen könnten.
+**Problem:** Enthielt Memory-Dumps, Hex-Dumps und Bootstrap-Debug-Notizen (Offsets, Opcodes, SIGSEGV-Adressen) — nützliche Angriffsinformationen über die interne Compiler-Struktur.
 
 ---
 
@@ -752,7 +752,7 @@ Nachfolgend die Dateien und Zeilen, die bei der Security-Analyse aufgefallen sin
 | 18 | Stack-Canaries | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🔵 |
 | 19 | ARM64-Dynamic-Linking-Bugs | ✅ bereits in feat/dynlink-v2 | – | – | – | 🔵 |
 | 20 | `.meta_safe` Code-Integrität | ✅ | Claude | 2026-06-04 | 2026-06-04 | 🟡 |
-| 21 | Debug-Datei entfernen | ⬜ | – | – | – | 🔵 |
+| 21 | Debug-Datei entfernen | ✅ | Claude | 2026-06-13 | 2026-06-13 | 🔵 |
 | 22 | Security-Tests im CI (inkl. LCBS) | ⬜ | – | – | – | 🟡 |
 | **23** | **Audit W^X-Reporting korrigieren** | ✅ | Claude | 2026-06-13 | 2026-06-13 | **🔴** |
 | **24** | **seccomp-Filter-Vollständigkeit** | ⬜ | – | – | – | **🟠** |
