@@ -10604,8 +10604,8 @@ pub type Codegen = class {
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
-    // WP-6: static ELF gets two PT_LOADs (RX+RW); dynamic ELF still RWX
-    if self.externCount == 0 { self.lcbsWxActive := 1; }
+    // WP-6/6b: both static and dynamic ELFs emit two PT_LOADs (RX+RW)
+    self.lcbsWxActive := 1;
     self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
@@ -10932,8 +10932,8 @@ pub type Codegen = class {
     var interpOff: int64 := 64;
     var interpLen: int64 := StrLen(interpStr) + 1;   // include NUL terminator
 
-    var codeOff: int64 := CG_CODE_OFF;               // 120 — unchanged
-    var dataOff: int64 := codeOff + totalCode;
+    var codeOff: int64 := CG_CODE_OFF;               // 176: ELF hdr (64) + 2×phdr (56+56)
+    var dataOff: int64 := codeOff + totalCode;        // page-aligned by Generate() padding
 
     // --- build .dynstr (\0, then distinct lib names, then symbol names) ---
     var dynstr: int64 := alloc(65536);
@@ -11002,7 +11002,7 @@ pub type Codegen = class {
     var dynCount: int64 := uniqCount + 11;                    // NEEDED*u + 11 fixed tags
     var dynSize: int64 := dynCount * 16;
     var phdrOff: int64 := ((dynOff + dynSize + 7) >> 3) << 3;
-    var phnum: int64 := 3;
+    var phnum: int64 := 4;                           // WP-6b: +1 PT_LOAD for RX/RW split
     var fileSize: int64 := phdrOff + phnum * 56;
 
     // --- patch extern call sites: disp32 = gotSlotVA - ripVA ---
@@ -11101,20 +11101,40 @@ pub type Codegen = class {
 
     // program headers at end of file
     var ph: int64 := buf + phdrOff;
-    // PT_LOAD — whole file at base, RWX
-    poke32(ph, 1); poke32(ph + 4, 7);
-    poke64(ph + 8, 0); poke64(ph + 16, CG_ELF_BASE); poke64(ph + 24, CG_ELF_BASE);
-    poke64(ph + ELF64_PHDR_OFF_FILESZ, fileSize); poke64(ph + ELF64_PHDR_OFF_MEMSZ,  fileSize); poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
-    // PT_INTERP
+
+    // WP-6b: PT_LOAD #1 — RX (read + execute): ELF header + .interp + code
+    // dataOff is page-aligned (Generate() pads code to 4096-byte boundary)
+    var rxSize: int64 := dataOff;
+    poke32(ph,      1); poke32(ph + 4, 5);                          // PT_LOAD, PF_R|PF_X
+    poke64(ph + ELF64_PHDR_OFF_OFFSET, 0);
+    poke64(ph + ELF64_PHDR_OFF_VADDR,  CG_ELF_BASE);
+    poke64(ph + ELF64_PHDR_OFF_PADDR,  CG_ELF_BASE);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, rxSize);
+    poke64(ph + ELF64_PHDR_OFF_MEMSZ,  rxSize);
+    poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // WP-6b: PT_LOAD #2 — RW (read + write): data + sections + phdrs
     var ph2: int64 := ph + 56;
-    poke32(ph2, 3); poke32(ph2 + 4, 4);
-    poke64(ph2 + 8, interpOff); poke64(ph2 + 16, CG_ELF_BASE + interpOff); poke64(ph2 + 24, CG_ELF_BASE + interpOff);
-    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, interpLen); poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  interpLen); poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  1);
-    // PT_DYNAMIC
+    var rwOff:  int64 := dataOff;
+    var rwSize: int64 := fileSize - rwOff;
+    poke32(ph2,      1); poke32(ph2 + 4, 6);                        // PT_LOAD, PF_R|PF_W
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_VADDR,  CG_ELF_BASE + rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_PADDR,  CG_ELF_BASE + rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, rwSize);
+    poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  rwSize);
+    poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // PT_INTERP
     var ph3: int64 := ph + 112;
-    poke32(ph3, 2); poke32(ph3 + 4, 6);
-    poke64(ph3 + 8, dynOff); poke64(ph3 + 16, CG_ELF_BASE + dynOff); poke64(ph3 + 24, CG_ELF_BASE + dynOff);
-    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, dynSize); poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  dynSize); poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  8);
+    poke32(ph3, 3); poke32(ph3 + 4, 4);
+    poke64(ph3 + 8, interpOff); poke64(ph3 + 16, CG_ELF_BASE + interpOff); poke64(ph3 + 24, CG_ELF_BASE + interpOff);
+    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, interpLen); poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  interpLen); poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  1);
+    // PT_DYNAMIC
+    var ph4: int64 := ph + 168;
+    poke32(ph4, 2); poke32(ph4 + 4, 6);
+    poke64(ph4 + 8, dynOff); poke64(ph4 + 16, CG_ELF_BASE + dynOff); poke64(ph4 + 24, CG_ELF_BASE + dynOff);
+    poke64(ph4 + ELF64_PHDR_OFF_FILESZ, dynSize); poke64(ph4 + ELF64_PHDR_OFF_MEMSZ,  dynSize); poke64(ph4 + ELF64_PHDR_OFF_ALIGN,  8);
 
     var fd: int64 := open(path, 577, 493);
     if (fd >= 0) {
