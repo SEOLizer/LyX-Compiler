@@ -1,0 +1,419 @@
+// std/graphdb/index.lyx
+// WP-GRP-05: TemporalIndex + TypeIndex + VectorIndex
+
+@description("GraphDB indices: temporal, type, vector similarity")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.graphdb.index;
+
+import std.alloc;
+import std.math;
+import std.graphdb.core;
+import std.graphdb.node;
+import std.graphdb.edge;
+import std.graphdb.mem;
+
+// ============================================================
+// TemporalIndex: [timestamp:8][edgeId:8] pairs, sorted by ts
+// ============================================================
+
+pub con GTIDX_OFF_ENTRIES: int64 := 0;
+pub con GTIDX_OFF_COUNT:   int64 := 8;
+pub con GTIDX_OFF_CAP:     int64 := 16;
+pub con GTIDX_SIZE:        int64 := 24;
+
+con GTIDX_INIT_CAP: int64 := 64;
+
+// ============================================================
+// TypeIndex: [typeHash:8][edgeId:8] pairs
+// ============================================================
+
+pub con GXIDX_OFF_ENTRIES: int64 := 0;
+pub con GXIDX_OFF_COUNT:   int64 := 8;
+pub con GXIDX_OFF_CAP:     int64 := 16;
+pub con GXIDX_SIZE:        int64 := 24;
+
+con GXIDX_INIT_CAP: int64 := 64;
+
+// ============================================================
+// VectorIndex: [nodeId:8][val*dims] per entry, dims stored in struct
+// ============================================================
+
+pub con GVIDX_OFF_DIMS:    int64 := 0;
+pub con GVIDX_OFF_ENTRIES: int64 := 8;
+pub con GVIDX_OFF_COUNT:   int64 := 16;
+pub con GVIDX_OFF_CAP:     int64 := 24;
+pub con GVIDX_SIZE:        int64 := 32;
+
+con GVIDX_INIT_CAP: int64 := 16;
+
+// ============================================================
+// Grow helpers
+// ============================================================
+
+fn _tidxGrow(idx: int64, need: int64) {
+    var cap: int64 := peek64(idx + GTIDX_OFF_CAP);
+    var cnt: int64 := peek64(idx + GTIDX_OFF_COUNT);
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 64; }
+    var ob: int64 := peek64(idx + GTIDX_OFF_ENTRIES);
+    var nb: int64 := alloc(nc * 16);
+    memcpy(nb, ob, cnt * 16);
+    free(ob, cap * 16);
+    poke64(idx + GTIDX_OFF_ENTRIES, nb);
+    poke64(idx + GTIDX_OFF_CAP,     nc);
+}
+
+fn _xidxGrow(idx: int64, need: int64) {
+    var cap: int64 := peek64(idx + GXIDX_OFF_CAP);
+    var cnt: int64 := peek64(idx + GXIDX_OFF_COUNT);
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 64; }
+    var ob: int64 := peek64(idx + GXIDX_OFF_ENTRIES);
+    var nb: int64 := alloc(nc * 16);
+    memcpy(nb, ob, cnt * 16);
+    free(ob, cap * 16);
+    poke64(idx + GXIDX_OFF_ENTRIES, nb);
+    poke64(idx + GXIDX_OFF_CAP,     nc);
+}
+
+fn _vidxGrow(idx: int64, need: int64) {
+    var cap: int64   := peek64(idx + GVIDX_OFF_CAP);
+    var cnt: int64   := peek64(idx + GVIDX_OFF_COUNT);
+    var dims: int64  := peek64(idx + GVIDX_OFF_DIMS);
+    var estep: int64 := 8 + dims * 8;
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 16; }
+    var ob: int64 := peek64(idx + GVIDX_OFF_ENTRIES);
+    var nb: int64 := alloc(nc * estep);
+    memcpy(nb, ob, cnt * estep);
+    free(ob, cap * estep);
+    poke64(idx + GVIDX_OFF_ENTRIES, nb);
+    poke64(idx + GVIDX_OFF_CAP,     nc);
+}
+
+// ============================================================
+// Sort helpers
+// ============================================================
+
+// Insertion sort [ts:8][id:8] ascending by ts — avoids negative indices
+fn _sortTempAsc(buf: int64, cnt: int64) {
+    var i: int64    := 1;
+    var j: int64    := 0;
+    var ins: int64  := 0;
+    var keyTs: int64 := 0;
+    var keyId: int64 := 0;
+    var rem: int64  := 0;
+    while (i < cnt) {
+        keyTs := peek64(buf + i * 16);
+        keyId := peek64(buf + i * 16 + 8);
+        ins   := 0;
+        rem   := i;
+        while (rem > 0) {
+            j := rem - 1;
+            if (peek64(buf + j * 16) > keyTs) {
+                poke64(buf + (j+1)*16,   peek64(buf + j*16));
+                poke64(buf + (j+1)*16+8, peek64(buf + j*16+8));
+                rem := j;
+            } else {
+                ins := rem;
+                rem := 0;
+            }
+        }
+        poke64(buf + ins*16,   keyTs);
+        poke64(buf + ins*16+8, keyId);
+        i := i + 1;
+    }
+}
+
+// Insertion sort [nodeId:8][score:8] descending by score
+fn _sortVidxDesc(buf: int64, cnt: int64) {
+    var i: int64    := 1;
+    var j: int64    := 0;
+    var ins: int64  := 0;
+    var keyId: int64 := 0;
+    var keySc: int64 := 0;
+    var rem: int64  := 0;
+    while (i < cnt) {
+        keyId := peek64(buf + i * 16);
+        keySc := peek64(buf + i * 16 + 8);
+        ins   := 0;
+        rem   := i;
+        while (rem > 0) {
+            j := rem - 1;
+            if (peek64(buf + j * 16 + 8) < keySc) {
+                poke64(buf + (j+1)*16,   peek64(buf + j*16));
+                poke64(buf + (j+1)*16+8, peek64(buf + j*16+8));
+                rem := j;
+            } else {
+                ins := rem;
+                rem := 0;
+            }
+        }
+        poke64(buf + ins*16,   keyId);
+        poke64(buf + ins*16+8, keySc);
+        i := i + 1;
+    }
+}
+
+// Compute dot-based cosine score * 1000000 (integer, avoids f64 complexity)
+// Returns 0 if dot <= 0 or zero magnitude
+fn _vidxScore(ent: int64, ei: int64, estep: int64, qv: int64, dims: int64, qMag: int64): int64 {
+    var eptr: int64   := ent + ei * estep + 8;
+    var dot: int64    := 0;
+    var nMagSq: int64 := 0;
+    var i: int64      := 0;
+    var qci: int64    := 0;
+    var nci: int64    := 0;
+    var nMag: int64   := 0;
+    var denom: int64  := 0;
+    while (i < dims) {
+        qci    := peek64(qv + i * 8);
+        nci    := peek64(eptr + i * 8);
+        dot    := dot + qci * nci;
+        nMagSq := nMagSq + nci * nci;
+        i      := i + 1;
+    }
+    if (dot <= 0) { return 0; }
+    nMag := Sqrt64(nMagSq);
+    if (nMag == 0) { return 0; }
+    denom := qMag * nMag;
+    if (denom == 0) { return 0; }
+    return (dot * 1000000) / denom;
+}
+
+// ============================================================
+// TemporalIndex
+// ============================================================
+
+pub fn GraphTemporalIndexInit(idx: int64) {
+    var eb: int64 := alloc(GTIDX_INIT_CAP * 16);
+    poke64(idx + GTIDX_OFF_ENTRIES, eb);
+    poke64(idx + GTIDX_OFF_COUNT,   0);
+    poke64(idx + GTIDX_OFF_CAP,     GTIDX_INIT_CAP);
+}
+
+pub fn GraphTemporalIndexFree(idx: int64) {
+    var eb: int64 := peek64(idx + GTIDX_OFF_ENTRIES);
+    var cap: int64 := peek64(idx + GTIDX_OFF_CAP);
+    if (eb != 0) { free(eb, cap * 16); }
+}
+
+pub fn GraphTemporalIndexBuild(idx: int64, store: int64) {
+    var ecnt: int64  := peek64(store + GMEM_OFF_EDGECOUNT);
+    var eptrs: int64 := peek64(store + GMEM_OFF_EDGEPTRS);
+    var ent: int64   := 0;
+    var cnt: int64   := 0;
+    var eptr: int64  := 0;
+    var eid: int64   := 0;
+    var cat: int64   := 0;
+    var i: int64     := 0;
+    // Reset count
+    poke64(idx + GTIDX_OFF_COUNT, 0);
+    while (i < ecnt) {
+        eptr := peek64(eptrs + i * 8);
+        eid  := peek64(eptr + GEDGE_OFF_ID);
+        cat  := peek64(eptr + GEDGE_OFF_CREATEDAT);
+        if (cat != 0) {
+            _tidxGrow(idx, 1);
+            ent := peek64(idx + GTIDX_OFF_ENTRIES);
+            cnt := peek64(idx + GTIDX_OFF_COUNT);
+            poke64(ent + cnt * 16,     cat);
+            poke64(ent + cnt * 16 + 8, eid);
+            poke64(idx + GTIDX_OFF_COUNT, cnt + 1);
+        }
+        i := i + 1;
+    }
+    ent := peek64(idx + GTIDX_OFF_ENTRIES);
+    cnt := peek64(idx + GTIDX_OFF_COUNT);
+    _sortTempAsc(ent, cnt);
+}
+
+pub fn GraphTemporalIndexQuery(idx: int64, tsFrom: int64, tsTo: int64, outBuf: int64, maxOut: int64): int64 {
+    var ent: int64   := peek64(idx + GTIDX_OFF_ENTRIES);
+    var cnt: int64   := peek64(idx + GTIDX_OFF_COUNT);
+    var found: int64 := 0;
+    var i: int64     := 0;
+    var ts: int64    := 0;
+    if (tsFrom > tsTo) { return 0; }
+    while (i < cnt) {
+        ts := peek64(ent + i * 16);
+        if (ts >= tsFrom) {
+            if (ts <= tsTo) {
+                if (found < maxOut) {
+                    poke64(outBuf + found * 8, peek64(ent + i * 16 + 8));
+                    found := found + 1;
+                }
+            }
+        }
+        i := i + 1;
+    }
+    return found;
+}
+
+// ============================================================
+// TypeIndex
+// ============================================================
+
+pub fn GraphTypeIndexInit(idx: int64) {
+    var eb: int64 := alloc(GXIDX_INIT_CAP * 16);
+    poke64(idx + GXIDX_OFF_ENTRIES, eb);
+    poke64(idx + GXIDX_OFF_COUNT,   0);
+    poke64(idx + GXIDX_OFF_CAP,     GXIDX_INIT_CAP);
+}
+
+pub fn GraphTypeIndexFree(idx: int64) {
+    var eb: int64  := peek64(idx + GXIDX_OFF_ENTRIES);
+    var cap: int64 := peek64(idx + GXIDX_OFF_CAP);
+    if (eb != 0) { free(eb, cap * 16); }
+}
+
+pub fn GraphTypeIndexBuild(idx: int64, store: int64) {
+    var ecnt: int64  := peek64(store + GMEM_OFF_EDGECOUNT);
+    var eptrs: int64 := peek64(store + GMEM_OFF_EDGEPTRS);
+    var ent: int64   := 0;
+    var cnt: int64   := 0;
+    var eptr: int64  := 0;
+    var eid: int64   := 0;
+    var etbuf: int64 := 0;
+    var etlen: int64 := 0;
+    var h: int64     := 0;
+    var i: int64     := 0;
+    poke64(idx + GXIDX_OFF_COUNT, 0);
+    while (i < ecnt) {
+        eptr  := peek64(eptrs + i * 8);
+        eid   := peek64(eptr + GEDGE_OFF_ID);
+        etbuf := peek64(eptr + GEDGE_OFF_ETYPEBUF);
+        etlen := peek64(eptr + GEDGE_OFF_ETYPELEN);
+        if (etbuf != 0) {
+            h := GraphIDFromStr(etbuf as pchar, etlen);
+            _xidxGrow(idx, 1);
+            ent := peek64(idx + GXIDX_OFF_ENTRIES);
+            cnt := peek64(idx + GXIDX_OFF_COUNT);
+            poke64(ent + cnt * 16,     h);
+            poke64(ent + cnt * 16 + 8, eid);
+            poke64(idx + GXIDX_OFF_COUNT, cnt + 1);
+        }
+        i := i + 1;
+    }
+}
+
+pub fn GraphTypeIndexQuery(idx: int64, etype: pchar, elen: int64, outBuf: int64, maxOut: int64): int64 {
+    var ent: int64   := peek64(idx + GXIDX_OFF_ENTRIES);
+    var cnt: int64   := peek64(idx + GXIDX_OFF_COUNT);
+    var h: int64     := GraphIDFromStr(etype, elen);
+    var found: int64 := 0;
+    var i: int64     := 0;
+    while (i < cnt) {
+        if (peek64(ent + i * 16) == h) {
+            if (found < maxOut) {
+                poke64(outBuf + found * 8, peek64(ent + i * 16 + 8));
+                found := found + 1;
+            }
+        }
+        i := i + 1;
+    }
+    return found;
+}
+
+// ============================================================
+// VectorIndex
+// ============================================================
+
+pub fn GraphVectorIndexInit(idx: int64, dims: int64) {
+    var estep: int64 := 8 + dims * 8;
+    var eb: int64    := alloc(GVIDX_INIT_CAP * estep);
+    poke64(idx + GVIDX_OFF_DIMS,    dims);
+    poke64(idx + GVIDX_OFF_ENTRIES, eb);
+    poke64(idx + GVIDX_OFF_COUNT,   0);
+    poke64(idx + GVIDX_OFF_CAP,     GVIDX_INIT_CAP);
+}
+
+pub fn GraphVectorIndexFree(idx: int64) {
+    var eb: int64    := peek64(idx + GVIDX_OFF_ENTRIES);
+    var cap: int64   := peek64(idx + GVIDX_OFF_CAP);
+    var dims: int64  := peek64(idx + GVIDX_OFF_DIMS);
+    var estep: int64 := 8 + dims * 8;
+    if (eb != 0) { free(eb, cap * estep); }
+}
+
+pub fn GraphVectorIndexBuild(idx: int64, store: int64) {
+    var dims: int64   := peek64(idx + GVIDX_OFF_DIMS);
+    var estep: int64  := 8 + dims * 8;
+    var ncnt: int64   := peek64(store + GMEM_OFF_NODECOUNT);
+    var nptrs: int64  := peek64(store + GMEM_OFF_NODEPTRS);
+    var ent: int64    := 0;
+    var cnt: int64    := 0;
+    var nptr: int64   := 0;
+    var nid: int64    := 0;
+    var vbuf: int64   := 0;
+    var vdims: int64  := 0;
+    var eptr: int64   := 0;
+    var i: int64      := 0;
+    poke64(idx + GVIDX_OFF_COUNT, 0);
+    while (i < ncnt) {
+        nptr  := peek64(nptrs + i * 8);
+        nid   := peek64(nptr + GNODE_OFF_ID);
+        vbuf  := peek64(nptr + GNODE_OFF_VECBUF);
+        vdims := peek64(nptr + GNODE_OFF_VECDIMS);
+        if (vbuf != 0) {
+            if (vdims == dims) {
+                _vidxGrow(idx, 1);
+                ent  := peek64(idx + GVIDX_OFF_ENTRIES);
+                cnt  := peek64(idx + GVIDX_OFF_COUNT);
+                eptr := ent + cnt * estep;
+                poke64(eptr, nid);
+                memcpy(eptr + 8, vbuf, dims * 8);
+                poke64(idx + GVIDX_OFF_COUNT, cnt + 1);
+            }
+        }
+        i := i + 1;
+    }
+}
+
+pub fn GraphVectorIndexSearch(idx: int64, queryVec: int64, topK: int64, outNodeIds: int64, outScores: int64): int64 {
+    var dims: int64   := peek64(idx + GVIDX_OFF_DIMS);
+    var ent: int64    := peek64(idx + GVIDX_OFF_ENTRIES);
+    var cnt: int64    := peek64(idx + GVIDX_OFF_COUNT);
+    var estep: int64  := 8 + dims * 8;
+    var qMagSq: int64 := 0;
+    var qMag: int64   := 0;
+    var i: int64      := 0;
+    var qci: int64    := 0;
+    var ret: int64    := 0;
+    var tmp: int64    := 0;
+    var ei: int64     := 0;
+    var sc: int64     := 0;
+    if (cnt == 0) { return 0; }
+    i := 0;
+    while (i < dims) {
+        qci    := peek64(queryVec + i * 8);
+        qMagSq := qMagSq + qci * qci;
+        i      := i + 1;
+    }
+    if (qMagSq == 0) { return 0; }
+    qMag := Sqrt64(qMagSq);
+    if (qMag == 0) { return 0; }
+    tmp := alloc(cnt * 16);
+    ei  := 0;
+    while (ei < cnt) {
+        sc := _vidxScore(ent, ei, estep, queryVec, dims, qMag);
+        poke64(tmp + ei * 16,     peek64(ent + ei * estep));
+        poke64(tmp + ei * 16 + 8, sc);
+        ei := ei + 1;
+    }
+    _sortVidxDesc(tmp, cnt);
+    ret := topK;
+    if (ret > cnt) { ret := cnt; }
+    i := 0;
+    while (i < ret) {
+        poke64(outNodeIds + i * 8, peek64(tmp + i * 16));
+        poke64(outScores  + i * 8, peek64(tmp + i * 16 + 8));
+        i := i + 1;
+    }
+    free(tmp, cnt * 16);
+    return ret;
+}
