@@ -1,0 +1,187 @@
+// tests/grf03_jpeg_test.lyx — GRF-03: JPEG Decoder Tests
+// Full pixel decode tested separately with real JPEG files.
+
+unit tests.grf03_jpeg_test;
+
+import std.image.core;
+import std.image.jpeg;
+import std.alloc;
+import std.io;
+
+// Build a minimal JPEG header with SOF0 for JpegMeta testing.
+// Returns byte count written. No scan data — meta only.
+fn makeJpegMetaOnly(buf: int64, w: int64, h: int64, ncomp: int64): int64 {
+    var p: int64 := buf;
+    // SOI
+    poke8(p, 0xFF); poke8(p+1, 0xD8); p := p + 2;
+    // SOF0: length = 2 + 6 + ncomp*3
+    var sofLen: int64 := 2 + 6 + ncomp * 3;
+    poke8(p, 0xFF); poke8(p+1, 0xC0); p := p + 2;
+    poke8(p, (sofLen>>8)&255); poke8(p+1, sofLen&255); p := p + 2;
+    poke8(p, 8); p := p + 1;  // bit depth = 8
+    poke8(p, (h>>8)&255); poke8(p+1, h&255); p := p + 2;
+    poke8(p, (w>>8)&255); poke8(p+1, w&255); p := p + 2;
+    poke8(p, ncomp & 255); p := p + 1;
+    var ci: int64 := 0;
+    while (ci < ncomp) {
+        poke8(p, ci + 1);   // component id
+        poke8(p+1, 0x11);   // H=1, V=1
+        poke8(p+2, 0);      // qid = 0
+        p := p + 3;
+        ci := ci + 1;
+    }
+    // EOI
+    poke8(p, 0xFF); poke8(p+1, 0xD9); p := p + 2;
+    return p - buf;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: JpegMeta reads width/height from SOF0
+    // -------------------------------------------------------------------------
+    var buf1: int64 := alloc(128);
+    makeJpegMetaOnly(buf1, 320, 240, 3);
+    var img1: int64 := alloc(GRF_SIZE);
+    // Zero-init img
+    poke64(img1 + GRF_OFF_WIDTH, 0);
+    poke64(img1 + GRF_OFF_HEIGHT, 0);
+
+    var ret1: int64 := JpegMeta(buf1, 128, img1);
+    if (ret1 != 1) {
+        PrintLn("FAIL: JpegMeta returned 0"c);
+        ok := 0;
+    } else {
+        var mw: int64 := peek64(img1 + GRF_OFF_WIDTH);
+        var mh: int64 := peek64(img1 + GRF_OFF_HEIGHT);
+        if (mw != 320) {
+            PrintLn("FAIL: JpegMeta width != 320"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: JpegMeta width=320"c);
+        }
+        if (mh != 240) {
+            PrintLn("FAIL: JpegMeta height != 240"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: JpegMeta height=240"c);
+        }
+        var mfmt: int64 := peek64(img1 + GRF_OFF_FORMAT);
+        if (mfmt != GRF_FMT_JPEG) {
+            PrintLn("FAIL: JpegMeta format != GRF_FMT_JPEG"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: JpegMeta format=GRF_FMT_JPEG"c);
+        }
+    }
+    free(buf1, 128);
+    free(img1, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 2: JpegMeta with 1-component (grayscale) JPEG
+    // -------------------------------------------------------------------------
+    var bufG: int64 := alloc(64);
+    makeJpegMetaOnly(bufG, 8, 8, 1);
+    var imgG: int64 := alloc(GRF_SIZE);
+    poke64(imgG + GRF_OFF_WIDTH, 0);
+    var retG: int64 := JpegMeta(bufG, 64, imgG);
+    if (retG != 1) {
+        PrintLn("FAIL: JpegMeta grayscale returned 0"c);
+        ok := 0;
+    } else {
+        var gw: int64 := peek64(imgG + GRF_OFF_WIDTH);
+        var gh: int64 := peek64(imgG + GRF_OFF_HEIGHT);
+        if (gw != 8 || gh != 8) {
+            PrintLn("FAIL: JpegMeta grayscale 8x8"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: JpegMeta grayscale 8x8"c);
+        }
+    }
+    free(bufG, 64);
+    free(imgG, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 3: Bad signature → JpegMeta returns 0
+    // -------------------------------------------------------------------------
+    var bufBad: int64 := alloc(16);
+    poke8(bufBad, 0x00); poke8(bufBad+1, 0x00);
+    poke8(bufBad+2, 0x00); poke8(bufBad+3, 0x00);
+    var imgBad: int64 := alloc(GRF_SIZE);
+    var retBad: int64 := JpegMeta(bufBad, 16, imgBad);
+    if (retBad != 0) {
+        PrintLn("FAIL: JpegMeta bad sig should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: JpegMeta bad sig → 0"c);
+    }
+    free(bufBad, 16);
+    free(imgBad, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 4: Progressive JPEG (SOF2 marker) → return 0
+    // -------------------------------------------------------------------------
+    var bufProg: int64 := alloc(32);
+    poke8(bufProg,    0xFF); poke8(bufProg + 1, 0xD8);  // SOI
+    poke8(bufProg+2,  0xFF); poke8(bufProg + 3, 0xC2);  // SOF2 (progressive)
+    poke8(bufProg+4,  0x00); poke8(bufProg + 5, 0x11);  // length=17
+    poke8(bufProg+6,  0x08);                              // precision
+    poke8(bufProg+7,  0x00); poke8(bufProg + 8, 0x10);  // h=16
+    poke8(bufProg+9,  0x00); poke8(bufProg + 10, 0x10); // w=16
+    poke8(bufProg+11, 0x03);                              // ncomp=3
+    poke8(bufProg+12, 0x01); poke8(bufProg+13, 0x11); poke8(bufProg+14, 0x00);
+    poke8(bufProg+15, 0x02); poke8(bufProg+16, 0x11); poke8(bufProg+17, 0x01);
+    poke8(bufProg+18, 0x03); poke8(bufProg+19, 0x11); poke8(bufProg+20, 0x01);
+    var imgProg: int64 := alloc(GRF_SIZE);
+    var retProg: int64 := JpegMeta(bufProg, 32, imgProg);
+    if (retProg != 0) {
+        PrintLn("FAIL: JpegMeta progressive should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: JpegMeta progressive → 0"c);
+    }
+    free(bufProg, 32);
+    free(imgProg, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 5: JpegDecode returns 0 on bad input (no scan data)
+    // -------------------------------------------------------------------------
+    var bufMeta: int64 := alloc(128);
+    var metaLen: int64 := makeJpegMetaOnly(bufMeta, 8, 8, 3);
+    var imgMeta: int64 := alloc(GRF_SIZE);
+    var retMeta: int64 := JpegDecode(bufMeta, metaLen, imgMeta);
+    // Should return 0 because there's no SOS/scan data
+    if (retMeta != 0) {
+        PrintLn("FAIL: JpegDecode no scan data should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: JpegDecode no scan → 0"c);
+    }
+    free(bufMeta, 128);
+    free(imgMeta, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 6: JpegDecode bad signature → 0, no crash
+    // -------------------------------------------------------------------------
+    var bufBad2: int64 := alloc(8);
+    poke8(bufBad2, 0); poke8(bufBad2+1, 0); poke8(bufBad2+2, 0); poke8(bufBad2+3, 0);
+    poke8(bufBad2+4, 0); poke8(bufBad2+5, 0); poke8(bufBad2+6, 0); poke8(bufBad2+7, 0);
+    var imgBad2: int64 := alloc(GRF_SIZE);
+    var retBad2: int64 := JpegDecode(bufBad2, 8, imgBad2);
+    if (retBad2 != 0) {
+        PrintLn("FAIL: JpegDecode bad sig should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: JpegDecode bad sig → 0"c);
+    }
+    free(bufBad2, 8);
+    free(imgBad2, GRF_SIZE);
+
+    if (ok != 0) {
+        PrintLn("=== GRF-03: ALL PASS ==="c);
+    } else {
+        PrintLn("=== GRF-03: SOME FAIL ==="c);
+    }
+    return ok;
+}

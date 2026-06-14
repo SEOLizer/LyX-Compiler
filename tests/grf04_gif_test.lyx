@@ -1,0 +1,171 @@
+// tests/grf04_gif_test.lyx — GRF-04: GIF Decoder Tests
+
+unit tests.grf04_gif_test;
+
+import std.image.core;
+import std.image.gif;
+import std.alloc;
+import std.io;
+
+// Minimal GIF89a: 1x1 pixel, 1 color (red), single frame.
+// This is the smallest valid GIF89a file (35 bytes).
+// Hex: 47 49 46 38 39 61 01 00 01 00 80 00 00 FF 00 00 00 00 00 21 F9 04 00 00 00 00 00 2C 00 00 00 00 01 00 01 00 00 02 02 44 01 00 3B
+fn make1x1RedGif(buf: int64): int64 {
+    var p: int64 := buf;
+    // Header: "GIF89a"
+    poke8(p, 0x47);poke8(p+1,0x49);poke8(p+2,0x46);poke8(p+3,0x38);
+    poke8(p+4,0x39);poke8(p+5,0x61); p:=p+6;
+    // Logical Screen Descriptor: width=1, height=1
+    poke8(p,1);poke8(p+1,0);   // width=1
+    poke8(p+2,1);poke8(p+3,0); // height=1
+    poke8(p+4,0x80);            // flags: GCT present, 2 colors (size=0 → 2^1=2 entries)
+    poke8(p+5,0);               // background color index
+    poke8(p+6,0);               // pixel aspect ratio
+    p:=p+7;
+    // Global Color Table: 2 entries × 3 bytes = 6 bytes
+    poke8(p,0xFF);poke8(p+1,0x00);poke8(p+2,0x00); // index 0: red
+    poke8(p+3,0x00);poke8(p+4,0x00);poke8(p+5,0x00); // index 1: black
+    p:=p+6;
+    // Graphic Control Extension (optional but good practice for GIF89a)
+    poke8(p,0x21);poke8(p+1,0xF9); // ext block, GCE type
+    poke8(p+2,4);                   // block size
+    poke8(p+3,0);                   // flags (no transparency)
+    poke8(p+4,0);poke8(p+5,0);     // delay = 0
+    poke8(p+6,0);                   // transparent color index
+    poke8(p+7,0);                   // block terminator
+    p:=p+8;
+    // Image Descriptor
+    poke8(p,0x2C);                  // image separator
+    poke8(p+1,0);poke8(p+2,0);     // left=0
+    poke8(p+3,0);poke8(p+4,0);     // top=0
+    poke8(p+5,1);poke8(p+6,0);     // width=1
+    poke8(p+7,1);poke8(p+8,0);     // height=1
+    poke8(p+9,0);                   // flags: no LCT, not interlaced
+    p:=p+10;
+    // LZW minimum code size = 2 (must be >= 2 for GIF)
+    poke8(p,2); p:=p+1;
+    // LZW compressed data: 1x1 = index 0 (red)
+    // For initCodeSize=2: clearCode=4, EOI=5, codes start at 3 bits
+    // Stream: Clear(4) + idx0(0) + EOI(5)
+    // In binary (3-bit codes, LSB-first): 100 000 101 = packed as:
+    // Byte 1: 000 100 = 0x04 (bits 0-2=clear=100, bits 3-7=idx0+partial)
+    // Actually for GIF LZW: bits packed LSB-first:
+    // Clear=4=100b (3 bits), idx0=0=000b (3 bits), EOI=5=101b (3 bits)
+    // Packed: 100 000 101 → first byte = bits[0..7] = 00100 100 = wait...
+    // LSB first: code 4 (=100b) → bits are 0,0,1 (LSB first)
+    // code 0 (=000b) → bits 0,0,0
+    // code 5 (=101b) → bits 1,0,1
+    // Stream: 0,0,1, 0,0,0, 1,0,1 → byte = 0b10100100 shifted... let me compute:
+    // bits in order: [0,0,1][0,0,0][1,0,1] = bit0=0,bit1=0,bit2=1,bit3=0,bit4=0,bit5=0,bit6=1,bit7=0,bit8=1
+    // byte 0 = bits[0..7] = 0b01000100 = 0x44? Let's check:
+    // bit0=0,bit1=0,bit2=1 (code4=LSB0=0,bit1=0,bit2=1)
+    // bit3=0,bit4=0,bit5=0 (code0=000)
+    // bit6=1,bit7=0 (first 2 bits of code5=101: bit0=1,bit1=0)
+    // byte0 = 0b01000100 = 0x44
+    // byte1: bit8=1 (last bit of code5=101: bit2=1), then pad=0s
+    // byte1 = 0b00000001 = 0x01
+    // Sub-block: [length=2][0x44][0x01][terminator=0x00]
+    poke8(p,2);     // sub-block length = 2
+    poke8(p+1,0x44);
+    poke8(p+2,0x01);
+    poke8(p+3,0);   // block terminator
+    p:=p+4;
+    // Trailer
+    poke8(p,0x3B); p:=p+1;
+    return p - buf;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: 1x1 Red GIF — decode and check color
+    // -------------------------------------------------------------------------
+    var gifBuf: int64 := alloc(64);
+    var gifLen: int64 := make1x1RedGif(gifBuf);
+
+    var img: int64 := alloc(GRF_SIZE);
+    var ret: int64 := GifDecode(gifBuf, gifLen, img);
+    if (ret != 1) {
+        PrintLn("FAIL: GifDecode 1x1 red returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: GifDecode 1x1 ret=1"c);
+        var px: int64 := GrfImageGetPixel(img, 0, 0);
+        // Expected: R=0xFF G=0x00 B=0x00 A=0xFF → 0xFF0000FF
+        if (px != 0xFF0000FF) {
+            PrintLn("FAIL: 1x1 red pixel wrong"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: 1x1 red pixel = 0xFF0000FF"c);
+        }
+        var fw: int64 := peek64(img + GRF_OFF_WIDTH);
+        var fh: int64 := peek64(img + GRF_OFF_HEIGHT);
+        if (fw != 1 || fh != 1) {
+            PrintLn("FAIL: GifDecode 1x1 dimensions wrong"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: GifDecode 1x1 dimensions"c);
+        }
+        var fmt: int64 := peek64(img + GRF_OFF_FORMAT);
+        if (fmt != GRF_FMT_GIF) {
+            PrintLn("FAIL: GifDecode format != GRF_FMT_GIF"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: GifDecode format=GRF_FMT_GIF"c);
+        }
+    }
+    GrfImageFree(img);
+    free(gifBuf, 64);
+
+    // -------------------------------------------------------------------------
+    // Test 2: GifGetFrameCount = 1 for single-frame GIF
+    // -------------------------------------------------------------------------
+    var gifBuf2: int64 := alloc(64);
+    var gifLen2: int64 := make1x1RedGif(gifBuf2);
+    var fc: int64 := GifGetFrameCount(gifBuf2, gifLen2);
+    if (fc != 1) {
+        PrintLn("FAIL: GifGetFrameCount != 1"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: GifGetFrameCount=1"c);
+    }
+    free(gifBuf2, 64);
+
+    // -------------------------------------------------------------------------
+    // Test 3: Bad GIF signature → return 0
+    // -------------------------------------------------------------------------
+    var badBuf: int64 := alloc(16);
+    poke8(badBuf, 0x00); poke8(badBuf+1, 0x00);
+    var imgBad: int64 := alloc(GRF_SIZE);
+    var retBad: int64 := GifDecode(badBuf, 16, imgBad);
+    if (retBad != 0) {
+        PrintLn("FAIL: GifDecode bad sig should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: GifDecode bad sig → 0"c);
+    }
+    free(badBuf, 16);
+    free(imgBad, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 4: GifGetFrameCount with bad header → 0
+    // -------------------------------------------------------------------------
+    var badBuf2: int64 := alloc(8);
+    poke8(badBuf2, 0); poke8(badBuf2+1, 0); poke8(badBuf2+2, 0); poke8(badBuf2+3, 0);
+    var fc2: int64 := GifGetFrameCount(badBuf2, 8);
+    if (fc2 != 0) {
+        PrintLn("FAIL: GifGetFrameCount bad input should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: GifGetFrameCount bad input → 0"c);
+    }
+    free(badBuf2, 8);
+
+    if (ok != 0) {
+        PrintLn("=== GRF-04: ALL PASS ==="c);
+    } else {
+        PrintLn("=== GRF-04: SOME FAIL ==="c);
+    }
+    return ok;
+}

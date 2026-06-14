@@ -1,0 +1,386 @@
+// std/image/png.lyx — GRF-02: PNG Decoder/Encoder (store-only)
+// Supports color types 0/2/4/6, bit depth 8+16, all 5 filter types.
+
+@description("PNG image decoder and store-only encoder")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.png;
+
+import std.image.core;
+import std.alloc;
+import std.fs;
+import std.zlib;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn pngGet32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+fn pngPaeth(a: int64, b: int64, c: int64): int64 {
+    var p:  int64 := a + b - c;
+    var pa: int64 := p - a; if (pa < 0) { pa := 0 - pa; }
+    var pb: int64 := p - b; if (pb < 0) { pb := 0 - pb; }
+    var pc: int64 := p - c; if (pc < 0) { pc := 0 - pc; }
+    if (pa <= pb && pa <= pc) { return a; }
+    if (pb <= pc) { return b; }
+    return c;
+}
+
+// Reconstruct one row of PNG filter data.
+// ftype: filter byte (0-4), raw: filtered bytes, prior: previous recon row (0=none),
+// out: output reconstructed row, rowW: byte width, bpp: bytes per pixel.
+fn pngReconRow(ftype: int64, raw: int64, prior: int64, out: int64, rowW: int64, bpp: int64): void {
+    var x: int64 := 0;
+    while (x < rowW) {
+        var fval:   int64 := peek8(raw + x);
+        var left:   int64 := 0;
+        var up:     int64 := 0;
+        var upleft: int64 := 0;
+        if (x >= bpp) { left := peek8(out + x - bpp); }
+        if (prior != 0) {
+            up := peek8(prior + x);
+            if (x >= bpp) { upleft := peek8(prior + x - bpp); }
+        }
+        var rval: int64 := fval;
+        if (ftype == 1) { rval := (fval + left) & 255; }
+        if (ftype == 2) { rval := (fval + up) & 255; }
+        if (ftype == 3) { rval := (fval + (left + up) / 2) & 255; }
+        if (ftype == 4) { rval := (fval + pngPaeth(left, up, upleft)) & 255; }
+        poke8(out + x, rval);
+        x := x + 1;
+    }
+}
+
+// Convert one reconstructed row to RGBA8.
+// src: reconstructed bytes, dst: RGBA8 output (4*w bytes),
+// w: pixel count, ctype: PNG color type, bps: bytes per sample (1 or 2).
+fn pngConvertRow(src: int64, dst: int64, w: int64, ctype: int64, bps: int64): void {
+    var x: int64 := 0;
+    while (x < w) {
+        var r: int64 := 255;
+        var g: int64 := 255;
+        var b: int64 := 255;
+        var a: int64 := 255;
+        if (ctype == 0) {
+            var gray: int64 := peek8(src + x * bps);
+            r := gray; g := gray; b := gray;
+        }
+        if (ctype == 2) {
+            r := peek8(src + x * 3 * bps);
+            g := peek8(src + x * 3 * bps + bps);
+            b := peek8(src + x * 3 * bps + bps * 2);
+        }
+        if (ctype == 4) {
+            var gray: int64 := peek8(src + x * 2 * bps);
+            r := gray; g := gray; b := gray;
+            a := peek8(src + x * 2 * bps + bps);
+        }
+        if (ctype == 6) {
+            r := peek8(src + x * 4 * bps);
+            g := peek8(src + x * 4 * bps + bps);
+            b := peek8(src + x * 4 * bps + bps * 2);
+            a := peek8(src + x * 4 * bps + bps * 3);
+        }
+        poke8(dst + x * 4,     r);
+        poke8(dst + x * 4 + 1, g);
+        poke8(dst + x * 4 + 2, b);
+        poke8(dst + x * 4 + 3, a);
+        x := x + 1;
+    }
+}
+
+// ============================================================================
+// PngDecode — decode PNG from memory buffer into img
+// Returns 1 on success, 0 on error.
+// ============================================================================
+
+pub fn PngDecode(buf: int64, len: int64, img: int64): int64 {
+    if (len < 33) { return 0; }
+    // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+    if (peek8(buf)     != 0x89) { return 0; }
+    if (peek8(buf + 1) != 0x50) { return 0; }
+    if (peek8(buf + 2) != 0x4E) { return 0; }
+    if (peek8(buf + 3) != 0x47) { return 0; }
+    if (peek8(buf + 4) != 0x0D) { return 0; }
+    if (peek8(buf + 5) != 0x0A) { return 0; }
+    if (peek8(buf + 6) != 0x1A) { return 0; }
+    if (peek8(buf + 7) != 0x0A) { return 0; }
+
+    // First chunk must be IHDR at offset 8
+    // IHDR length field = 13
+    var ihdrLen: int64 := pngGet32(buf, 8);
+    if (ihdrLen != 13) { return 0; }
+    // Type must be 'I' 'H' 'D' 'R'
+    if (peek8(buf + 12) != 0x49) { return 0; }
+    if (peek8(buf + 13) != 0x48) { return 0; }
+    if (peek8(buf + 14) != 0x44) { return 0; }
+    if (peek8(buf + 15) != 0x52) { return 0; }
+
+    var w:         int64 := pngGet32(buf, 16);
+    var h:         int64 := pngGet32(buf, 20);
+    var bitDepth:  int64 := peek8(buf + 24);
+    var ctype:     int64 := peek8(buf + 25);
+    var interlace: int64 := peek8(buf + 28);
+
+    if (w <= 0 || h <= 0) { return 0; }
+    if (interlace != 0) { return 0; }
+    if (bitDepth != 8 && bitDepth != 16) { return 0; }
+    if (ctype != 0 && ctype != 2 && ctype != 4 && ctype != 6) { return 0; }
+
+    var bps: int64 := 1;
+    if (bitDepth == 16) { bps := 2; }
+
+    var channels: int64 := 1;
+    if (ctype == 2) { channels := 3; }
+    if (ctype == 4) { channels := 2; }
+    if (ctype == 6) { channels := 4; }
+    var bpp:  int64 := channels * bps;
+    var rowW: int64 := w * bpp;
+
+    // First pass: count total IDAT bytes
+    // Chunk layout: [len:4][type:4][data:len][crc:4], starting at offset 33
+    // (8 sig + 4+4+13+4 IHDR = 33)
+    var pos:       int64 := 33;
+    var idatTotal: int64 := 0;
+    var running:   int64 := 1;
+    var cLen:  int64 := 0;
+    var ct0:   int64 := 0;
+    var ct1:   int64 := 0;
+    var ct2:   int64 := 0;
+    var ct3:   int64 := 0;
+
+    while (running != 0 && pos + 8 <= len) {
+        cLen := pngGet32(buf, pos);
+        ct0  := peek8(buf + pos + 4);
+        ct1  := peek8(buf + pos + 5);
+        ct2  := peek8(buf + pos + 6);
+        ct3  := peek8(buf + pos + 7);
+        // IDAT = 0x49 0x44 0x41 0x54
+        if (ct0 == 0x49 && ct1 == 0x44 && ct2 == 0x41 && ct3 == 0x54) {
+            idatTotal := idatTotal + cLen;
+        }
+        // IEND = 0x49 0x45 0x4E 0x44
+        if (ct0 == 0x49 && ct1 == 0x45 && ct2 == 0x4E && ct3 == 0x44) {
+            running := 0;
+        }
+        pos := pos + 12 + cLen;
+    }
+
+    if (idatTotal <= 2) { return 0; }
+
+    var idatBuf: int64 := alloc(idatTotal);
+    if (idatBuf == 0) { return 0; }
+
+    // Second pass: concatenate all IDAT chunk data
+    var idatPos: int64 := 0;
+    pos     := 33;
+    running := 1;
+    while (running != 0 && pos + 8 <= len) {
+        cLen := pngGet32(buf, pos);
+        ct0  := peek8(buf + pos + 4);
+        ct1  := peek8(buf + pos + 5);
+        ct2  := peek8(buf + pos + 6);
+        ct3  := peek8(buf + pos + 7);
+        if (ct0 == 0x49 && ct1 == 0x44 && ct2 == 0x41 && ct3 == 0x54) {
+            var ci: int64 := 0;
+            while (ci < cLen) {
+                poke8(idatBuf + idatPos + ci, peek8(buf + pos + 8 + ci));
+                ci := ci + 1;
+            }
+            idatPos := idatPos + cLen;
+        }
+        if (ct0 == 0x49 && ct1 == 0x45 && ct2 == 0x4E && ct3 == 0x44) {
+            running := 0;
+        }
+        pos := pos + 12 + cLen;
+    }
+
+    // Decompress: idatBuf starts with 2-byte zlib header, then DEFLATE data.
+    // InflateDEFLATE expects raw DEFLATE — skip the 2-byte zlib header.
+    var filtBufSz: int64 := h * (rowW + 1) + 64;
+    var filtBuf:   int64 := alloc(filtBufSz);
+    if (filtBuf == 0) { free(idatBuf, idatTotal); return 0; }
+
+    var nDecomp: int64 := InflateDEFLATE(idatBuf + 2, idatTotal - 2, filtBuf);
+    free(idatBuf, idatTotal);
+    if (nDecomp <= 0) { free(filtBuf, filtBufSz); return 0; }
+
+    // Allocate RGBA8 output
+    var pixLen: int64 := w * h * 4;
+    var pixels: int64 := alloc(pixLen);
+    if (pixels == 0) { free(filtBuf, filtBufSz); return 0; }
+
+    // Row reconstruction buffers: two alternating rows
+    var rowBufA: int64 := alloc(rowW + 1);
+    var rowBufB: int64 := alloc(rowW + 1);
+    if (rowBufA == 0 || rowBufB == 0) {
+        free(filtBuf, filtBufSz);
+        free(pixels, pixLen);
+        if (rowBufA != 0) { free(rowBufA, rowW + 1); }
+        if (rowBufB != 0) { free(rowBufB, rowW + 1); }
+        return 0;
+    }
+
+    var filtPos: int64 := 0;
+    var curBuf:  int64 := rowBufA;
+    var prevBuf: int64 := 0;
+    var y: int64 := 0;
+    while (y < h) {
+        var ftype: int64 := peek8(filtBuf + filtPos);
+        filtPos := filtPos + 1;
+        pngReconRow(ftype, filtBuf + filtPos, prevBuf, curBuf, rowW, bpp);
+        filtPos := filtPos + rowW;
+        pngConvertRow(curBuf, pixels + y * w * 4, w, ctype, bps);
+        // Swap buffers
+        var tmp: int64 := curBuf;
+        if (curBuf == rowBufA) { curBuf := rowBufB; } else { curBuf := rowBufA; }
+        prevBuf := tmp;
+        y := y + 1;
+    }
+
+    free(rowBufA, rowW + 1);
+    free(rowBufB, rowW + 1);
+    free(filtBuf, filtBufSz);
+
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_PNG);
+    poke64(img + GRF_OFF_PIXELS,   pixels);
+    poke64(img + GRF_OFF_PIXLEN,   pixLen);
+    return 1;
+}
+
+// ============================================================================
+// PngDecodeFile — read file then decode
+// ============================================================================
+
+pub fn PngDecodeFile(path: int64, plen: int64, img: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) { ret := PngDecode(buf, fsize, img); }
+    free(buf, fsize);
+    return ret;
+}
+
+// ============================================================================
+// PngEncode — store-only encoder (no DEFLATE compression)
+// Writes RGBA PNG using uncompressed DEFLATE stored blocks + zlib wrapper.
+// Returns bytes written, or 0 on error.
+// ============================================================================
+
+pub fn PngEncode(img: int64, outBuf: int64, maxLen: int64): int64 {
+    var w:      int64 := peek64(img + GRF_OFF_WIDTH);
+    var h:      int64 := peek64(img + GRF_OFF_HEIGHT);
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    if (w <= 0 || h <= 0 || pixels == 0 || outBuf == 0) { return 0; }
+
+    var rowW:     int64 := w * 4;
+    var filtSize: int64 := h * (rowW + 1);
+
+    // Allocate filtered row buffer (filter 0 = None: 0x00 + raw RGBA data)
+    var filtBuf: int64 := alloc(filtSize);
+    if (filtBuf == 0) { return 0; }
+
+    // Fill filtered rows and compute Adler-32 checksum
+    var adlerA: int64 := 1;
+    var adlerB: int64 := 0;
+    var fi: int64 := 0;
+    var ey: int64 := 0;
+    while (ey < h) {
+        poke8(filtBuf + fi, 0);  // filter byte = None
+        adlerB := adlerB + adlerA; if (adlerB >= 65521) { adlerB := adlerB - 65521; }
+        fi := fi + 1;
+        var ex: int64 := 0;
+        while (ex < rowW) {
+            var bval: int64 := peek8(pixels + ey * rowW + ex);
+            poke8(filtBuf + fi, bval);
+            adlerA := adlerA + bval; if (adlerA >= 65521) { adlerA := adlerA - 65521; }
+            adlerB := adlerB + adlerA; if (adlerB >= 65521) { adlerB := adlerB - 65521; }
+            fi := fi + 1;
+            ex := ex + 1;
+        }
+        ey := ey + 1;
+    }
+
+    // Compute DEFLATE block overhead and total sizes
+    var nBlocks: int64 := (filtSize + 65534) / 65535;
+    var deflSz:  int64 := nBlocks * 5 + filtSize;
+    var idatSz:  int64 := 2 + deflSz + 4;             // zlib header + deflate + adler32
+    var totalSz: int64 := 8 + 25 + 4 + 4 + idatSz + 4 + 12;
+
+    if (maxLen < totalSz) { free(filtBuf, filtSize); return 0; }
+
+    var p: int64 := outBuf;
+
+    // PNG signature
+    poke8(p,0x89);poke8(p+1,0x50);poke8(p+2,0x4E);poke8(p+3,0x47);
+    poke8(p+4,0x0D);poke8(p+5,0x0A);poke8(p+6,0x1A);poke8(p+7,0x0A);
+    p := p + 8;
+
+    // IHDR chunk (length=13, type='IHDR')
+    poke8(p,0);poke8(p+1,0);poke8(p+2,0);poke8(p+3,13); p:=p+4;
+    poke8(p,0x49);poke8(p+1,0x48);poke8(p+2,0x44);poke8(p+3,0x52); p:=p+4;
+    poke8(p,(w>>24)&255);poke8(p+1,(w>>16)&255);poke8(p+2,(w>>8)&255);poke8(p+3,w&255); p:=p+4;
+    poke8(p,(h>>24)&255);poke8(p+1,(h>>16)&255);poke8(p+2,(h>>8)&255);poke8(p+3,h&255); p:=p+4;
+    poke8(p,8);poke8(p+1,6);poke8(p+2,0);poke8(p+3,0);poke8(p+4,0); p:=p+5;
+    poke8(p,0);poke8(p+1,0);poke8(p+2,0);poke8(p+3,0); p:=p+4;  // CRC=0
+
+    // IDAT chunk
+    poke8(p,(idatSz>>24)&255);poke8(p+1,(idatSz>>16)&255);
+    poke8(p+2,(idatSz>>8)&255);poke8(p+3,idatSz&255); p:=p+4;
+    poke8(p,0x49);poke8(p+1,0x44);poke8(p+2,0x41);poke8(p+3,0x54); p:=p+4;
+
+    // zlib header: CMF=0x78, FLG=0x01  (0x78*256+0x01=30721, 30721%31=0)
+    poke8(p,0x78);poke8(p+1,0x01); p:=p+2;
+
+    // DEFLATE stored blocks
+    var rem:    int64 := filtSize;
+    var srcOff: int64 := 0;
+    while (rem > 0) {
+        var bsz: int64 := rem;
+        if (bsz > 65535) { bsz := 65535; }
+        var isFinal: int64 := 0;
+        if (bsz == rem) { isFinal := 1; }
+        poke8(p, isFinal); p := p + 1;
+        poke8(p, bsz & 255); poke8(p+1, (bsz>>8)&255); p := p + 2;
+        var nlen: int64 := bsz ^ 65535;
+        poke8(p, nlen & 255); poke8(p+1, (nlen>>8)&255); p := p + 2;
+        var bi: int64 := 0;
+        while (bi < bsz) {
+            poke8(p, peek8(filtBuf + srcOff + bi));
+            p := p + 1;
+            bi := bi + 1;
+        }
+        srcOff := srcOff + bsz;
+        rem := rem - bsz;
+    }
+
+    // Adler-32: big-endian 4 bytes = (B<<16)|A stored as [B>>8, B&0xFF, A>>8, A&0xFF]
+    poke8(p,(adlerB>>8)&255);poke8(p+1,adlerB&255);
+    poke8(p+2,(adlerA>>8)&255);poke8(p+3,adlerA&255);
+    p := p + 4;
+
+    // IDAT CRC = 0
+    poke8(p,0);poke8(p+1,0);poke8(p+2,0);poke8(p+3,0); p:=p+4;
+
+    // IEND chunk
+    poke8(p,0);poke8(p+1,0);poke8(p+2,0);poke8(p+3,0); p:=p+4;
+    poke8(p,0x49);poke8(p+1,0x45);poke8(p+2,0x4E);poke8(p+3,0x44); p:=p+4;
+    poke8(p,0);poke8(p+1,0);poke8(p+2,0);poke8(p+3,0); p:=p+4;
+
+    free(filtBuf, filtSize);
+    return p - outBuf;
+}
