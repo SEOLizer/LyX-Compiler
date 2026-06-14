@@ -1,0 +1,185 @@
+// tests/grf07_avif_test.lyx — GRF-07: AVIF Metadata Parser Tests
+
+unit tests.grf07_avif_test;
+
+import std.image.core;
+import std.image.avif;
+import std.alloc;
+import std.io;
+
+// Build a minimal AVIF-like ISOBMFF buffer:
+//   ftyp box (major_brand='avif') + meta box containing iprp > ipco > ispe
+// ispe box: width=320, height=240
+fn makeAvif320x240(buf: int64): int64 {
+    var p: int64 := buf;
+
+    // ispe box: size=20, type='ispe', version=0, flags=0, w=320 BE, h=240 BE
+    // ispe data = [version:1][flags:3][w:4][h:4] = 8 bytes payload; total box = 8+12=20
+    // But ispe has 4-byte version/flags after the 8-byte header, so:
+    // box header = 8 bytes (size+type), then version(1)+flags(3)+w(4)+h(4) = 12 bytes → total 20
+    var ispeSize: int64 := 20;
+    // ipco: container for ispe
+    var ipcoSize: int64 := 8 + ispeSize;
+    // iprp: container for ipco
+    var iprpSize: int64 := 8 + ipcoSize;
+    // meta box: 4 bytes version/flags + iprp
+    var metaSize: int64 := 8 + 4 + iprpSize;
+    // ftyp box: size(4)+type(4)+major(4)+minor(4)+compat(4) = 20 bytes
+    var ftypSize: int64 := 20;
+    var totalSize: int64 := ftypSize + metaSize;
+
+    // ftyp box
+    // size (BE): totalSize but ftyp just needs to be its own size
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3, ftypSize & 255);  // size=20
+    poke8(p+4, 0x66); poke8(p+5, 0x74); poke8(p+6, 0x79); poke8(p+7, 0x70);  // 'ftyp'
+    poke8(p+8, 0x61); poke8(p+9, 0x76); poke8(p+10, 0x69); poke8(p+11, 0x66); // 'avif'
+    poke8(p+12, 0); poke8(p+13, 0); poke8(p+14, 0); poke8(p+15, 0);           // minor version
+    poke8(p+16, 0x61); poke8(p+17, 0x76); poke8(p+18, 0x69); poke8(p+19, 0x66); // compat 'avif'
+    p := p + ftypSize;
+
+    // meta box: [size:4BE][type:4][version:1][flags:3][children...]
+    poke8(p, 0); poke8(p+1, 0); poke8(p+2, 0); poke8(p+3, metaSize & 255);
+    poke8(p+4, 0x6D); poke8(p+5, 0x65); poke8(p+6, 0x74); poke8(p+7, 0x61);  // 'meta'
+    poke8(p+8, 0); poke8(p+9, 0); poke8(p+10, 0); poke8(p+11, 0);             // version+flags
+    p := p + 12;
+
+    // iprp box: [size:4BE][type:4][children...]
+    poke8(p, 0); poke8(p+1, 0); poke8(p+2, 0); poke8(p+3, iprpSize & 255);
+    poke8(p+4, 0x69); poke8(p+5, 0x70); poke8(p+6, 0x72); poke8(p+7, 0x70);  // 'iprp'
+    p := p + 8;
+
+    // ipco box: [size:4BE][type:4][children...]
+    poke8(p, 0); poke8(p+1, 0); poke8(p+2, 0); poke8(p+3, ipcoSize & 255);
+    poke8(p+4, 0x69); poke8(p+5, 0x70); poke8(p+6, 0x63); poke8(p+7, 0x6F);  // 'ipco'
+    p := p + 8;
+
+    // ispe box: [size:4BE][type:4][version:1][flags:3][w:4BE][h:4BE]
+    poke8(p, 0); poke8(p+1, 0); poke8(p+2, 0); poke8(p+3, ispeSize & 255);
+    poke8(p+4, 0x69); poke8(p+5, 0x73); poke8(p+6, 0x70); poke8(p+7, 0x65);  // 'ispe'
+    poke8(p+8, 0); poke8(p+9, 0); poke8(p+10, 0); poke8(p+11, 0);            // version+flags
+    // width=320 = 0x00000140 BE
+    poke8(p+12, 0); poke8(p+13, 0); poke8(p+14, 0x01); poke8(p+15, 0x40);
+    // height=240 = 0x000000F0 BE
+    poke8(p+16, 0); poke8(p+17, 0); poke8(p+18, 0x00); poke8(p+19, 0xF0);
+    p := p + ispeSize;
+
+    return p - buf;
+}
+
+// Build an AVIF with 'avis' brand (sequence)
+fn makeAvisBranded(buf: int64): int64 {
+    var p: int64 := buf;
+    var ftypSize: int64 := 16;
+    // ftyp box: major_brand='avis'
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3, ftypSize & 255);
+    poke8(p+4, 0x66); poke8(p+5, 0x74); poke8(p+6, 0x79); poke8(p+7, 0x70);  // 'ftyp'
+    poke8(p+8, 0x61); poke8(p+9, 0x76); poke8(p+10, 0x69); poke8(p+11, 0x73); // 'avis'
+    poke8(p+12, 0); poke8(p+13, 0); poke8(p+14, 0); poke8(p+15, 0);
+    p := p + ftypSize;
+    return p - buf;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: AvifDetect — 'avif' major brand
+    // -------------------------------------------------------------------------
+    var buf1: int64 := alloc(256);
+    var len1: int64 := makeAvif320x240(buf1);
+    var det1: int64 := AvifDetect(buf1, len1);
+    if (det1 != 1) {
+        PrintLn("FAIL: AvifDetect 'avif' brand returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: AvifDetect 'avif' brand = 1"c);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 2: AvifMeta — 320x240
+    // -------------------------------------------------------------------------
+    var img1: int64 := alloc(GRF_SIZE);
+    var ret1: int64 := AvifMeta(buf1, len1, img1);
+    if (ret1 != 1) {
+        PrintLn("FAIL: AvifMeta 320x240 returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: AvifMeta 320x240 ret=1"c);
+        var w: int64 := peek64(img1 + GRF_OFF_WIDTH);
+        var h: int64 := peek64(img1 + GRF_OFF_HEIGHT);
+        if (w != 320) {
+            PrintLn("FAIL: AvifMeta width != 320"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: AvifMeta width=320"c);
+        }
+        if (h != 240) {
+            PrintLn("FAIL: AvifMeta height != 240"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: AvifMeta height=240"c);
+        }
+        var fmt: int64 := peek64(img1 + GRF_OFF_FORMAT);
+        if (fmt != GRF_FMT_AVIF) {
+            PrintLn("FAIL: AvifMeta format != GRF_FMT_AVIF"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: AvifMeta format=GRF_FMT_AVIF"c);
+        }
+    }
+    free(img1, GRF_SIZE);
+    free(buf1, 256);
+
+    // -------------------------------------------------------------------------
+    // Test 3: AvifDetect — 'avis' brand
+    // -------------------------------------------------------------------------
+    var buf3: int64 := alloc(32);
+    var len3: int64 := makeAvisBranded(buf3);
+    var det3: int64 := AvifDetect(buf3, len3);
+    if (det3 != 1) {
+        PrintLn("FAIL: AvifDetect 'avis' brand returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: AvifDetect 'avis' brand = 1"c);
+    }
+    free(buf3, 32);
+
+    // -------------------------------------------------------------------------
+    // Test 4: AvifDecode — returns 0 (Phase 2 not implemented)
+    // -------------------------------------------------------------------------
+    var buf4: int64 := alloc(256);
+    var len4: int64 := makeAvif320x240(buf4);
+    var img4: int64 := alloc(GRF_SIZE);
+    var ret4: int64 := AvifDecode(buf4, len4, img4);
+    if (ret4 != 0) {
+        PrintLn("FAIL: AvifDecode should return 0 (stub)"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: AvifDecode ret=0 (stub)"c);
+    }
+    free(img4, GRF_SIZE);
+    free(buf4, 256);
+
+    // -------------------------------------------------------------------------
+    // Test 5: AvifDetect — bad input → 0
+    // -------------------------------------------------------------------------
+    var buf5: int64 := alloc(16);
+    poke8(buf5, 0); poke8(buf5+1, 0); poke8(buf5+2, 0); poke8(buf5+3, 0);
+    poke8(buf5+4, 0); poke8(buf5+5, 0); poke8(buf5+6, 0); poke8(buf5+7, 0);
+    poke8(buf5+8, 0); poke8(buf5+9, 0); poke8(buf5+10, 0); poke8(buf5+11, 0);
+    var det5: int64 := AvifDetect(buf5, 16);
+    if (det5 != 0) {
+        PrintLn("FAIL: AvifDetect bad input should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: AvifDetect bad input → 0"c);
+    }
+    free(buf5, 16);
+
+    if (ok != 0) {
+        PrintLn("=== GRF-07: ALL PASS ==="c);
+    } else {
+        PrintLn("=== GRF-07: SOME FAIL ==="c);
+    }
+    return ok;
+}

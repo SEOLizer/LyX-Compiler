@@ -1,0 +1,214 @@
+// std/image/bmp.lyx — GRF-01: BMP Decoder/Encoder
+// Supports 24-bpp (BGR) and 32-bpp (BGRA), bottom-up and top-down rows.
+
+@description("BMP image decoder and encoder (24-bpp + 32-bpp)")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.bmp;
+
+import std.image.core;
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn bmpGet16(buf: int64, off: int64): int64 {
+    var lo: int64 := peek8(buf + off);
+    var hi: int64 := peek8(buf + off + 1);
+    return lo | (hi << 8);
+}
+
+fn bmpGet32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn bmpPut16(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 255);
+    poke8(buf + off + 1, (val >> 8) & 255);
+}
+
+fn bmpPut32(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 255);
+    poke8(buf + off + 1, (val >> 8)  & 255);
+    poke8(buf + off + 2, (val >> 16) & 255);
+    poke8(buf + off + 3, (val >> 24) & 255);
+}
+
+// ============================================================================
+// BmpDecode — decode BMP from memory buffer
+// Returns 1 on success, 0 on error.
+// img must be a pointer to GRF_SIZE bytes (allocated by GrfImageAlloc or caller).
+// On success, img fields are populated and a new pixel buffer is allocated.
+// ============================================================================
+
+pub fn BmpDecode(buf: int64, len: int64, img: int64): int64 {
+    // Minimum header size: 54 bytes (14 file header + 40 BITMAPINFOHEADER)
+    if (len < 54) { return 0; }
+    // Signature check: 'B' 'M'
+    if (peek8(buf) != 0x42 || peek8(buf + 1) != 0x4D) { return 0; }
+
+    var pixOff: int64 := bmpGet32(buf, 10);   // offset to pixel data
+    var hdrSz:  int64 := bmpGet32(buf, 14);   // BITMAPINFOHEADER size
+    if (hdrSz < 40) { return 0; }
+
+    var rawW:   int64 := bmpGet32(buf, 18);   // width (signed in BMP, treat as int64)
+    var rawH:   int64 := bmpGet32(buf, 22);   // height (negative = top-down)
+    var bpp:    int64 := bmpGet16(buf, 28);   // bits per pixel
+    var comp:   int64 := bmpGet32(buf, 30);   // compression (0=BI_RGB)
+
+    // Only BI_RGB (0) supported; BI_BITFIELDS (3) accepted for 32-bpp
+    if (comp != 0 && comp != 3) { return 0; }
+    // Only 24-bpp and 32-bpp supported
+    if (bpp != 24 && bpp != 32) { return 0; }
+
+    // Determine top-down vs bottom-up from sign of rawH
+    var topDown: int64 := 0;
+    var h: int64 := rawH;
+    if (rawH < 0) {
+        topDown := 1;
+        h := 0 - rawH;
+    }
+    var w: int64 := rawW;
+    if (w <= 0 || h <= 0) { return 0; }
+
+    // Row byte count (padded to 4-byte boundary)
+    var bytesPerPx: int64 := bpp / 8;
+    var rowRaw:     int64 := w * bytesPerPx;
+    var rowPad:     int64 := rowRaw + 3;
+    var rowBytes:   int64 := (rowPad / 4) * 4;
+
+    if (pixOff + rowBytes * h > len) { return 0; }
+
+    // Allocate RGBA8 output
+    var pixLen: int64 := w * h * 4;
+    var pixels: int64 := alloc(pixLen);
+    if (pixels == 0) { return 0; }
+
+    var y: int64 := 0;
+    while (y < h) {
+        // BMP rows: bottom-up unless topDown flag set
+        var srcRow: int64 := y;
+        if (topDown == 0) { srcRow := h - 1 - y; }
+        var src: int64 := buf + pixOff + srcRow * rowBytes;
+        var dst: int64 := pixels + y * w * 4;
+
+        var x: int64 := 0;
+        while (x < w) {
+            var sp: int64 := src + x * bytesPerPx;
+            var b:  int64 := peek8(sp);       // BMP stores BGR
+            var g:  int64 := peek8(sp + 1);
+            var r:  int64 := peek8(sp + 2);
+            var a:  int64 := 255;
+            if (bpp == 32) { a := peek8(sp + 3); }
+            var dp: int64 := dst + x * 4;
+            poke8(dp,     r);
+            poke8(dp + 1, g);
+            poke8(dp + 2, b);
+            poke8(dp + 3, a);
+            x := x + 1;
+        }
+        y := y + 1;
+    }
+
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_BMP);
+    poke64(img + GRF_OFF_PIXELS,   pixels);
+    poke64(img + GRF_OFF_PIXLEN,   pixLen);
+    return 1;
+}
+
+// ============================================================================
+// BmpDecodeFile — read file then decode
+// ============================================================================
+
+pub fn BmpDecodeFile(path: int64, plen: int64, img: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) { ret := BmpDecode(buf, fsize, img); }
+    free(buf, fsize);
+    return ret;
+}
+
+// ============================================================================
+// BmpEncode — encode GrfImage to 24-bpp BMP in outBuf
+// Returns bytes written, or 0 on error.
+// ============================================================================
+
+pub fn BmpEncode(img: int64, outBuf: int64, maxLen: int64): int64 {
+    var w:      int64 := peek64(img + GRF_OFF_WIDTH);
+    var h:      int64 := peek64(img + GRF_OFF_HEIGHT);
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    if (w <= 0 || h <= 0 || pixels == 0) { return 0; }
+
+    // 24-bpp, row padded to 4 bytes
+    var rowRaw:   int64 := w * 3;
+    var rowBytes: int64 := ((rowRaw + 3) / 4) * 4;
+    var pixBytes: int64 := rowBytes * h;
+    var fileSize: int64 := 54 + pixBytes;
+
+    if (outBuf == 0 || maxLen < fileSize) { return 0; }
+
+    // File header (14 bytes)
+    poke8(outBuf,     0x42); poke8(outBuf + 1, 0x4D);   // 'BM'
+    bmpPut32(outBuf, 2, fileSize);
+    bmpPut16(outBuf, 6, 0);   // reserved1
+    bmpPut16(outBuf, 8, 0);   // reserved2
+    bmpPut32(outBuf, 10, 54); // pixel offset
+
+    // BITMAPINFOHEADER (40 bytes at offset 14)
+    bmpPut32(outBuf, 14, 40);     // header size
+    bmpPut32(outBuf, 18, w);
+    bmpPut32(outBuf, 22, h);      // positive = bottom-up
+    bmpPut16(outBuf, 26, 1);      // planes
+    bmpPut16(outBuf, 28, 24);     // bpp
+    bmpPut32(outBuf, 30, 0);      // BI_RGB
+    bmpPut32(outBuf, 34, pixBytes);
+    bmpPut32(outBuf, 38, 2835);   // 72 DPI horizontal
+    bmpPut32(outBuf, 42, 2835);   // 72 DPI vertical
+    bmpPut32(outBuf, 46, 0);
+    bmpPut32(outBuf, 50, 0);
+
+    var y: int64 := 0;
+    while (y < h) {
+        // BMP bottom-up: row 0 in file = last row of image
+        var srcRow: int64 := h - 1 - y;
+        var src: int64 := pixels + srcRow * w * 4;
+        var dst: int64 := outBuf + 54 + y * rowBytes;
+
+        var x: int64 := 0;
+        while (x < w) {
+            var sp: int64 := src + x * 4;
+            var r:  int64 := peek8(sp);
+            var g:  int64 := peek8(sp + 1);
+            var b:  int64 := peek8(sp + 2);
+            var dp: int64 := dst + x * 3;
+            poke8(dp,     b);   // BMP stores BGR
+            poke8(dp + 1, g);
+            poke8(dp + 2, r);
+            x := x + 1;
+        }
+        // pad remaining bytes in row to 0
+        var pad: int64 := rowBytes - rowRaw;
+        var pi: int64 := 0;
+        while (pi < pad) {
+            poke8(dst + rowRaw + pi, 0);
+            pi := pi + 1;
+        }
+        y := y + 1;
+    }
+
+    return fileSize;
+}

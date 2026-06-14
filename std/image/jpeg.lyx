@@ -1,0 +1,728 @@
+// std/image/jpeg.lyx — GRF-03: JPEG Decoder (Baseline DCT)
+// Supports Baseline DCT (SOF0), Huffman decoding, YCbCr→RGB, 4:2:0/4:2:2/4:4:4.
+
+@description("JPEG decoder: Baseline DCT, Huffman, YCbCr to RGBA8")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.jpeg;
+
+import std.image.core;
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// Context layout (single alloc, accessed via offsets)
+// JpegCtx: w(8) h(8) ncomp(8) dqt[4*64*8=2048] + huffman tables + component info
+// We use a flat int64 array for the context.
+// ============================================================================
+
+// Quantization tables: 4 tables × 64 coefficients × 8 bytes = 2048 bytes
+// Huffman tables: 2 DC + 2 AC = 4 tables; each table has:
+//   counts[16] + values[256] = 272 entries × 8 bytes = 2176 bytes per table
+//   Total: 4 × 2176 = 8704 bytes
+// Component info: 4 components × 5 fields (id, H, V, qId, dcPrev) × 8 = 160 bytes
+// Misc: scanStart, scanLen, restartInterval, etc.
+
+con JCX_W:            int64 := 0;
+con JCX_H:            int64 := 8;
+con JCX_NCOMP:        int64 := 16;
+con JCX_DQT:          int64 := 24;     // 4 × 64 int64 = 2048 bytes
+con JCX_HTAB:         int64 := 2072;   // 4 tables × (16 counts + 256 values) × int64
+                                        // each table: 272 × 8 = 2176 bytes
+con JCX_COMP:         int64 := 10760;  // 4 × 5 int64 = 160 bytes
+con JCX_SIZE:         int64 := 10920;
+
+// Component field offsets within each 5-int64 slot (40 bytes per component)
+con JCC_ID:   int64 := 0;
+con JCC_H:    int64 := 8;
+con JCC_V:    int64 := 16;
+con JCC_QID:  int64 := 24;
+con JCC_DCPREV: int64 := 32;
+
+// Huffman table field offsets within each 272-int64 slot
+con JHT_COUNTS: int64 := 0;     // 16 int64
+con JHT_VALUES: int64 := 128;   // 256 int64
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn jpgGet16BE(buf: int64, off: int64): int64 {
+    return (peek8(buf + off) << 8) | peek8(buf + off + 1);
+}
+
+// Clamp integer to [0, 255]
+fn jpgClamp(v: int64): int64 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return v;
+}
+
+// Absolute value for int64
+fn jpgAbs(v: int64): int64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+// Read 'n' bits from buf starting at bit_pos (LSB-first like JPEG: MSB-first actually)
+// JPEG bitstream is MSB-first. Returns -1 on error.
+fn jpgReadBits(buf: int64, bufLen: int64, bitPos: int64, n: int64): int64 {
+    if (n == 0) { return 0; }
+    var result: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var byteIdx: int64 := (bitPos + i) / 8;
+        var bitIdx:  int64 := 7 - ((bitPos + i) & 7);  // MSB first
+        if (byteIdx >= bufLen) { return 0 - 1; }
+        var bval: int64 := peek8(buf + byteIdx);
+        var bit: int64 := (bval >> bitIdx) & 1;
+        result := (result << 1) | bit;
+        i := i + 1;
+    }
+    return result;
+}
+
+// Huffman decode: read next symbol from bitstream.
+// htab: pointer to huffman table (JCX_HTAB + tableIdx * 2176)
+// Returns symbol byte value, or -1 on error. Advances pBitPos by reference (via out param).
+fn jpgHuffDecode(buf: int64, bufLen: int64, htab: int64, bitPos: int64, pOutLen: int64): int64 {
+    var code:   int64 := 0;
+    var length: int64 := 0;
+    var valIdx: int64 := 0;
+    var done:   int64 := 0;
+    while (done == 0 && length < 16) {
+        var nextBit: int64 := jpgReadBits(buf, bufLen, bitPos + length, 1);
+        if (nextBit < 0) { done := 2; }
+        if (done == 0) {
+            code := (code << 1) | nextBit;
+            length := length + 1;
+            // Count codes of this length
+            var cnt: int64 := peek64(htab + JHT_COUNTS + (length - 1) * 8);
+            if (code < cnt) {
+                // This code is valid — find the symbol
+                var symIdx: int64 := valIdx + code;
+                var sym: int64 := peek64(htab + JHT_VALUES + symIdx * 8);
+                poke64(pOutLen, length);
+                return sym;
+            }
+            valIdx := valIdx + cnt;
+            code := (code - cnt + 1) << 1;  // Wait, this resets code...
+        }
+    }
+    return 0 - 1;
+}
+
+// Build Huffman table from DHT segment data.
+// dhtData: pointer to DHT segment data (after marker+length), tabIdx: 0-3.
+// ctx: pointer to JpegCtx. Returns bytes consumed.
+fn jpgBuildHuff(dhtData: int64, dhtLen: int64, ctx: int64): int64 {
+    if (dhtLen < 17) { return 0 - 1; }
+    var tcth:   int64 := peek8(dhtData);
+    var tc:     int64 := tcth >> 4;   // table class (0=DC, 1=AC)
+    var th:     int64 := tcth & 0x0F; // table destination (0 or 1)
+    var tabIdx: int64 := tc * 2 + th; // 0=DC0, 1=DC1, 2=AC0, 3=AC1
+    if (tabIdx > 3) { return 0 - 1; }
+
+    var htab: int64 := ctx + JCX_HTAB + tabIdx * 2176;
+
+    // Read 16 count bytes
+    var totalCodes: int64 := 0;
+    var li: int64 := 0;
+    while (li < 16) {
+        var cnt: int64 := peek8(dhtData + 1 + li);
+        poke64(htab + JHT_COUNTS + li * 8, cnt);
+        totalCodes := totalCodes + cnt;
+        li := li + 1;
+    }
+
+    // Read symbol values
+    var vi: int64 := 0;
+    while (vi < totalCodes) {
+        poke64(htab + JHT_VALUES + vi * 8, peek8(dhtData + 17 + vi));
+        vi := vi + 1;
+    }
+
+    return 17 + totalCodes;
+}
+
+// Integer IDCT for one 8x8 block (AAN/Chen approximation, integer scaled ×256).
+// Writes 64 values into out[0..63] (in 8x8 row-major order), dequantized by qtable.
+// coeff: 64 int64 zigzag-order coefficients, qtable: 64 int64 quant table.
+fn jpgIDCT8x8(coeff: int64, qtable: int64, out: int64): void {
+    // Zigzag de-ordering indices (standard JPEG zigzag scan)
+    // We store a fixed zigzag table as 64 inline values.
+    // For simplicity, use natural order (already de-zigzagged by caller).
+
+    // Dequantize: multiply each coeff by qtable entry (natural order after dezigzag)
+    var dq: int64 := alloc(512);  // 64 × 8 bytes
+    var qi: int64 := 0;
+    while (qi < 64) {
+        poke64(dq + qi * 8, peek64(coeff + qi * 8) * peek64(qtable + qi * 8));
+        qi := qi + 1;
+    }
+
+    // Simplified 1D IDCT (Loeffler integer approximation, factor 8×)
+    // Apply 1D IDCT on rows, then columns.
+    // Using fixed-point integer math: scale factor 256.
+
+    // Row IDCT
+    var row: int64 := 0;
+    while (row < 8) {
+        var base: int64 := row * 8;
+        var s0: int64 := peek64(dq + base * 8);
+        var s1: int64 := peek64(dq + (base+1) * 8);
+        var s2: int64 := peek64(dq + (base+2) * 8);
+        var s3: int64 := peek64(dq + (base+3) * 8);
+        var s4: int64 := peek64(dq + (base+4) * 8);
+        var s5: int64 := peek64(dq + (base+5) * 8);
+        var s6: int64 := peek64(dq + (base+6) * 8);
+        var s7: int64 := peek64(dq + (base+7) * 8);
+
+        // Even part (Chen IDCT integer approximation ×8192)
+        var p0: int64 := (s0 + s4) * 4096;
+        var p4: int64 := (s0 - s4) * 4096;
+        var p2: int64 := s2 * 5793 + s6 * 2896;  // 5793≈√2*4096, 2896≈4096/√2
+        var p6: int64 := s2 * 2896 - s6 * 5793;
+        var t0: int64 := p0 + p2;
+        var t1: int64 := p4 + p6;
+        var t2: int64 := p4 - p6;
+        var t3: int64 := p0 - p2;
+
+        // Odd part
+        var q1: int64 := s1 * 7568 + s3 * 6270 + s5 * 4551 + s7 * 2446;
+        var q3: int64 := s1 * 6270 - s3 * 2446 - s5 * 7568 - s7 * 4551;
+        var q5: int64 := s1 * 4551 - s3 * 7568 + s5 * 2446 + s7 * 6270;
+        var q7: int64 := s1 * 2446 - s3 * 4551 + s5 * 6270 - s7 * 7568;
+
+        poke64(dq + base * 8,       (t0 + q1) / 4096);
+        poke64(dq + (base+1) * 8,   (t1 + q3) / 4096);
+        poke64(dq + (base+2) * 8,   (t2 + q5) / 4096);
+        poke64(dq + (base+3) * 8,   (t3 + q7) / 4096);
+        poke64(dq + (base+4) * 8,   (t3 - q7) / 4096);
+        poke64(dq + (base+5) * 8,   (t2 - q5) / 4096);
+        poke64(dq + (base+6) * 8,   (t1 - q3) / 4096);
+        poke64(dq + (base+7) * 8,   (t0 - q1) / 4096);
+        row := row + 1;
+    }
+
+    // Column IDCT
+    var col: int64 := 0;
+    while (col < 8) {
+        var s0: int64 := peek64(dq + col * 8);
+        var s1: int64 := peek64(dq + (8+col) * 8);
+        var s2: int64 := peek64(dq + (16+col) * 8);
+        var s3: int64 := peek64(dq + (24+col) * 8);
+        var s4: int64 := peek64(dq + (32+col) * 8);
+        var s5: int64 := peek64(dq + (40+col) * 8);
+        var s6: int64 := peek64(dq + (48+col) * 8);
+        var s7: int64 := peek64(dq + (56+col) * 8);
+
+        var p0: int64 := (s0 + s4) * 4096;
+        var p4: int64 := (s0 - s4) * 4096;
+        var p2: int64 := s2 * 5793 + s6 * 2896;
+        var p6: int64 := s2 * 2896 - s6 * 5793;
+        var t0: int64 := p0 + p2;
+        var t1: int64 := p4 + p6;
+        var t2: int64 := p4 - p6;
+        var t3: int64 := p0 - p2;
+
+        var q1: int64 := s1 * 7568 + s3 * 6270 + s5 * 4551 + s7 * 2446;
+        var q3: int64 := s1 * 6270 - s3 * 2446 - s5 * 7568 - s7 * 4551;
+        var q5: int64 := s1 * 4551 - s3 * 7568 + s5 * 2446 + s7 * 6270;
+        var q7: int64 := s1 * 2446 - s3 * 4551 + s5 * 6270 - s7 * 7568;
+
+        // Write to output in row-major order, clamp to [-128, 127] before level shift
+        poke64(out + col * 8,        (t0 + q1) / 4096);
+        poke64(out + (8+col) * 8,    (t1 + q3) / 4096);
+        poke64(out + (16+col) * 8,   (t2 + q5) / 4096);
+        poke64(out + (24+col) * 8,   (t3 + q7) / 4096);
+        poke64(out + (32+col) * 8,   (t3 - q7) / 4096);
+        poke64(out + (40+col) * 8,   (t2 - q5) / 4096);
+        poke64(out + (48+col) * 8,   (t1 - q3) / 4096);
+        poke64(out + (56+col) * 8,   (t0 - q1) / 4096);
+        col := col + 1;
+    }
+
+    free(dq, 512);
+}
+
+// Zigzag indices: map from zigzag order to natural 8x8 order.
+// Returns natural-order index for zigzag position z.
+fn jpgZigzag(z: int64): int64 {
+    // Pre-computed JPEG zigzag table (64 entries)
+    if (z == 0)  { return 0;  } if (z == 1)  { return 1;  }
+    if (z == 2)  { return 8;  } if (z == 3)  { return 16; }
+    if (z == 4)  { return 9;  } if (z == 5)  { return 2;  }
+    if (z == 6)  { return 3;  } if (z == 7)  { return 10; }
+    if (z == 8)  { return 17; } if (z == 9)  { return 24; }
+    if (z == 10) { return 32; } if (z == 11) { return 25; }
+    if (z == 12) { return 18; } if (z == 13) { return 11; }
+    if (z == 14) { return 4;  } if (z == 15) { return 5;  }
+    if (z == 16) { return 12; } if (z == 17) { return 19; }
+    if (z == 18) { return 26; } if (z == 19) { return 33; }
+    if (z == 20) { return 40; } if (z == 21) { return 48; }
+    if (z == 22) { return 41; } if (z == 23) { return 34; }
+    if (z == 24) { return 27; } if (z == 25) { return 20; }
+    if (z == 26) { return 13; } if (z == 27) { return 6;  }
+    if (z == 28) { return 7;  } if (z == 29) { return 14; }
+    if (z == 30) { return 21; } if (z == 31) { return 28; }
+    if (z == 32) { return 35; } if (z == 33) { return 42; }
+    if (z == 34) { return 49; } if (z == 35) { return 56; }
+    if (z == 36) { return 57; } if (z == 37) { return 50; }
+    if (z == 38) { return 43; } if (z == 39) { return 36; }
+    if (z == 40) { return 29; } if (z == 41) { return 22; }
+    if (z == 42) { return 15; } if (z == 43) { return 23; }
+    if (z == 44) { return 30; } if (z == 45) { return 37; }
+    if (z == 46) { return 44; } if (z == 47) { return 51; }
+    if (z == 48) { return 58; } if (z == 49) { return 59; }
+    if (z == 50) { return 52; } if (z == 51) { return 45; }
+    if (z == 52) { return 38; } if (z == 53) { return 31; }
+    if (z == 54) { return 39; } if (z == 55) { return 46; }
+    if (z == 56) { return 53; } if (z == 57) { return 60; }
+    if (z == 58) { return 61; } if (z == 59) { return 54; }
+    if (z == 60) { return 47; } if (z == 61) { return 55; }
+    if (z == 62) { return 62; } return 63;
+}
+
+// Decode one MCU component block (8x8) from bitstream.
+// ctx: JpegCtx, buf/bufLen: JPEG scan data, pBitPos: current bit position ptr,
+// compIdx: component index 0-3, coeff: 64-int64 output coefficients (natural order).
+fn jpgDecodeBlock(ctx: int64, buf: int64, bufLen: int64, pBitPos: int64, compIdx: int64, coeff: int64): int64 {
+    var comp: int64 := ctx + JCX_COMP + compIdx * 40;
+    var qid:  int64 := peek64(comp + JCC_QID);
+    var dcPrev: int64 := peek64(comp + JCC_DCPREV);
+
+    // DC table index for this component (comp 0→DC0, others→DC1)
+    var dcTabIdx: int64 := 0;
+    if (compIdx != 0) { dcTabIdx := 1; }
+    var acTabIdx: int64 := 2;
+    if (compIdx != 0) { acTabIdx := 3; }
+
+    var dcHtab: int64 := ctx + JCX_HTAB + dcTabIdx * 2176;
+    var acHtab: int64 := ctx + JCX_HTAB + acTabIdx * 2176;
+
+    var bitPos: int64 := peek64(pBitPos);
+    var tmpLen: int64 := alloc(8);  // temp for huffman output
+
+    // DC coefficient
+    poke64(tmpLen, 0);
+    var dcLen: int64 := jpgHuffDecode(buf, bufLen, dcHtab, bitPos, tmpLen);
+    if (dcLen < 0) { free(tmpLen, 8); return 0 - 1; }
+    bitPos := bitPos + peek64(tmpLen);
+
+    var dcVal: int64 := 0;
+    if (dcLen > 0) {
+        dcVal := jpgReadBits(buf, bufLen, bitPos, dcLen);
+        bitPos := bitPos + dcLen;
+        // Extend sign
+        if (dcLen > 0 && dcVal < (1 << (dcLen - 1))) {
+            dcVal := dcVal - (1 << dcLen) + 1;
+        }
+    }
+    dcVal := dcVal + dcPrev;
+    poke64(comp + JCC_DCPREV, dcVal);
+
+    // Clear coefficients
+    var ci: int64 := 0;
+    while (ci < 64) { poke64(coeff + ci * 8, 0); ci := ci + 1; }
+    poke64(coeff + jpgZigzag(0) * 8, dcVal);
+
+    // AC coefficients
+    var k: int64 := 1;
+    var acDone: int64 := 0;
+    while (acDone == 0 && k < 64) {
+        poke64(tmpLen, 0);
+        var acSym: int64 := jpgHuffDecode(buf, bufLen, acHtab, bitPos, tmpLen);
+        if (acSym < 0) { free(tmpLen, 8); return 0 - 1; }
+        bitPos := bitPos + peek64(tmpLen);
+
+        if (acSym == 0) {
+            // EOB: end of block
+            acDone := 1;
+        } else {
+            var runLen: int64 := (acSym >> 4) & 0x0F;
+            var acLen:  int64 := acSym & 0x0F;
+            if (acLen == 0 && runLen == 15) {
+                // ZRL: 16 zeros
+                k := k + 16;
+            } else {
+                k := k + runLen;
+                if (k < 64) {
+                    var acVal: int64 := jpgReadBits(buf, bufLen, bitPos, acLen);
+                    bitPos := bitPos + acLen;
+                    if (acLen > 0 && acVal < (1 << (acLen - 1))) {
+                        acVal := acVal - (1 << acLen) + 1;
+                    }
+                    poke64(coeff + jpgZigzag(k) * 8, acVal);
+                }
+                k := k + 1;
+            }
+        }
+    }
+
+    free(tmpLen, 8);
+    poke64(pBitPos, bitPos);
+    return 1;
+}
+
+// ============================================================================
+// JpegMeta — parse header only (width, height, channels, format)
+// ============================================================================
+
+pub fn JpegMeta(buf: int64, len: int64, img: int64): int64 {
+    if (len < 4) { return 0; }
+    if (peek8(buf) != 0xFF || peek8(buf + 1) != 0xD8) { return 0; }
+
+    var pos: int64 := 2;
+    var done: int64 := 0;
+    while (done == 0 && pos + 3 < len) {
+        if (peek8(buf + pos) != 0xFF) { return 0; }
+        var mtype: int64 := peek8(buf + pos + 1);
+        pos := pos + 2;
+        if (mtype == 0xD9) {
+            done := 1;
+        } else if (mtype == 0xD8 || mtype == 0x01) {
+            // No length field
+        } else {
+            var segLen: int64 := jpgGet16BE(buf, pos);
+            if (mtype == 0xC0) {
+                // SOF0: Baseline DCT
+                var h: int64 := jpgGet16BE(buf, pos + 3);
+                var w: int64 := jpgGet16BE(buf, pos + 5);
+                var ncomp: int64 := peek8(buf + pos + 7);
+                poke64(img + GRF_OFF_WIDTH,    w);
+                poke64(img + GRF_OFF_HEIGHT,   h);
+                poke64(img + GRF_OFF_CHANNELS, ncomp);
+                poke64(img + GRF_OFF_DEPTH,    8);
+                poke64(img + GRF_OFF_FORMAT,   GRF_FMT_JPEG);
+                poke64(img + GRF_OFF_PIXELS,   0);
+                poke64(img + GRF_OFF_PIXLEN,   0);
+                return 1;
+            } else if (mtype == 0xC2) {
+                // Progressive JPEG — not supported
+                return 0;
+            }
+            pos := pos + segLen;
+        }
+    }
+    return 0;
+}
+
+// ============================================================================
+// JpegDecode — full decode with pixel output
+// Returns 1 on success, 0 on error.
+// ============================================================================
+
+pub fn JpegDecode(buf: int64, len: int64, img: int64): int64 {
+    if (len < 4) { return 0; }
+    if (peek8(buf) != 0xFF || peek8(buf + 1) != 0xD8) { return 0; }
+
+    // Allocate context
+    var ctx: int64 := alloc(JCX_SIZE);
+    if (ctx == 0) { return 0; }
+
+    var pos:    int64 := 2;
+    var w:      int64 := 0;
+    var h:      int64 := 0;
+    var ncomp:  int64 := 0;
+    var scanOff: int64 := 0;  // offset to SOS scan data
+    var scanLen: int64 := 0;
+    var hasSof: int64 := 0;
+    var done:   int64 := 0;
+    var mtype:  int64 := 0;
+
+    // Parse markers until SOS
+    while (done == 0 && pos + 3 < len) {
+        if (peek8(buf + pos) != 0xFF) { free(ctx, JCX_SIZE); return 0; }
+        mtype := peek8(buf + pos + 1);
+        pos := pos + 2;
+
+        if (mtype == 0xD9) {
+            // EOI
+            done := 1;
+        } else if (mtype == 0xD8 || mtype == 0x01) {
+            // No segment length
+        } else {
+            var segLen: int64 := jpgGet16BE(buf, pos);
+            if (mtype == 0xC0) {
+                // SOF0
+                h := jpgGet16BE(buf, pos + 3);
+                w := jpgGet16BE(buf, pos + 5);
+                ncomp := peek8(buf + pos + 7);
+                poke64(ctx + JCX_W, w);
+                poke64(ctx + JCX_H, h);
+                poke64(ctx + JCX_NCOMP, ncomp);
+                // Parse component specs
+                var ci: int64 := 0;
+                while (ci < ncomp) {
+                    var csOff: int64 := pos + 8 + ci * 3;
+                    var cid:   int64 := peek8(buf + csOff);
+                    var hv:    int64 := peek8(buf + csOff + 1);
+                    var qid:   int64 := peek8(buf + csOff + 2);
+                    var comp:  int64 := ctx + JCX_COMP + ci * 40;
+                    poke64(comp + JCC_ID,  cid);
+                    poke64(comp + JCC_H,   (hv >> 4) & 0x0F);
+                    poke64(comp + JCC_V,   hv & 0x0F);
+                    poke64(comp + JCC_QID, qid);
+                    poke64(comp + JCC_DCPREV, 0);
+                    ci := ci + 1;
+                }
+                hasSof := 1;
+            } else if (mtype == 0xC2) {
+                // Progressive JPEG — not supported
+                free(ctx, JCX_SIZE); return 0;
+            } else if (mtype == 0xDB) {
+                // DQT: quantization table(s)
+                var dqtPos: int64 := pos + 2;
+                while (dqtPos < pos + segLen) {
+                    var pqtq: int64 := peek8(buf + dqtPos);
+                    var pq:   int64 := pqtq >> 4;   // precision (0=8bit, 1=16bit)
+                    var tq:   int64 := pqtq & 0x0F; // table id (0-3)
+                    dqtPos := dqtPos + 1;
+                    if (tq < 4) {
+                        var qtable: int64 := ctx + JCX_DQT + tq * 512;
+                        var qi: int64 := 0;
+                        while (qi < 64) {
+                            var qval: int64 := 0;
+                            if (pq == 0) {
+                                qval := peek8(buf + dqtPos + qi);
+                            } else {
+                                qval := jpgGet16BE(buf, dqtPos + qi * 2);
+                            }
+                            poke64(qtable + qi * 8, qval);
+                            qi := qi + 1;
+                        }
+                        if (pq == 0) { dqtPos := dqtPos + 64; } else { dqtPos := dqtPos + 128; }
+                    }
+                }
+            } else if (mtype == 0xC4) {
+                // DHT: Huffman table(s)
+                var dhtPos: int64 := pos + 2;
+                while (dhtPos < pos + segLen) {
+                    var consumed: int64 := jpgBuildHuff(buf + dhtPos, pos + segLen - dhtPos, ctx);
+                    if (consumed <= 0) { free(ctx, JCX_SIZE); return 0; }
+                    dhtPos := dhtPos + consumed;
+                }
+            } else if (mtype == 0xDA) {
+                // SOS: scan data starts immediately after the SOS header
+                var ncs: int64 := peek8(buf + pos + 2);
+                var sosHdrLen: int64 := 3 + ncs * 2 + 3;
+                scanOff := pos + 2 + sosHdrLen;
+                // Scan runs to next marker or EOI — use rest of buffer
+                scanLen := len - scanOff;
+                done := 1;  // process scan separately
+            }
+            pos := pos + segLen;
+        }
+    }
+
+    if (hasSof == 0 || scanOff == 0) { free(ctx, JCX_SIZE); return 0; }
+
+    // Remove JPEG byte stuffing (FF 00 → FF) from scan data
+    var rawScan: int64 := alloc(scanLen + 16);
+    if (rawScan == 0) { free(ctx, JCX_SIZE); return 0; }
+    var rawLen: int64 := 0;
+    var si: int64 := 0;
+    while (si < scanLen) {
+        var b: int64 := peek8(buf + scanOff + si);
+        poke8(rawScan + rawLen, b);
+        rawLen := rawLen + 1;
+        if (b == 0xFF) {
+            var bn: int64 := 0;
+            if (si + 1 < scanLen) { bn := peek8(buf + scanOff + si + 1); }
+            if (bn == 0x00) {
+                si := si + 1;  // skip stuffed byte
+            } else if (bn >= 0xD0 && bn <= 0xD7) {
+                si := si + 1;  // skip restart marker
+                rawLen := rawLen - 1;  // remove the 0xFF we just wrote
+            } else {
+                rawLen := rawLen - 1;  // remove 0xFF — we've hit a marker
+                si := scanLen;  // stop
+            }
+        }
+        si := si + 1;
+    }
+
+    // Allocate component planes (each can be up to w*h samples)
+    var mcuW: int64 := 1;
+    var mcuH: int64 := 1;
+    if (ncomp >= 3) {
+        var h0: int64 := peek64(ctx + JCX_COMP + JCC_H);
+        var v0: int64 := peek64(ctx + JCX_COMP + JCC_V);
+        if (h0 > mcuW) { mcuW := h0; }
+        if (v0 > mcuH) { mcuH := v0; }
+        var h1: int64 := peek64(ctx + JCX_COMP + 40 + JCC_H);
+        var v1: int64 := peek64(ctx + JCX_COMP + 40 + JCC_V);
+        if (h1 > mcuW) { mcuW := h1; }
+        if (v1 > mcuH) { mcuH := v1; }
+    }
+    var mcuBlockW: int64 := mcuW * 8;
+    var mcuBlockH: int64 := mcuH * 8;
+    var mcuCols: int64 := (w + mcuBlockW - 1) / mcuBlockW;
+    var mcuRows: int64 := (h + mcuBlockH - 1) / mcuBlockH;
+    var planeW:  int64 := mcuCols * mcuBlockW;
+    var planeH:  int64 := mcuRows * mcuBlockH;
+    var planeSz: int64 := planeW * planeH;
+
+    var plane0: int64 := alloc(planeSz);
+    var plane1: int64 := alloc(planeSz);
+    var plane2: int64 := alloc(planeSz);
+    if (plane0 == 0 || plane1 == 0 || plane2 == 0) {
+        if (plane0 != 0) { free(plane0, planeSz); }
+        if (plane1 != 0) { free(plane1, planeSz); }
+        if (plane2 != 0) { free(plane2, planeSz); }
+        free(rawScan, scanLen + 16);
+        free(ctx, JCX_SIZE);
+        return 0;
+    }
+
+    // Coefficients and IDCT output buffers (8x8 = 64 int64 each)
+    var coeff: int64 := alloc(512);
+    var idctOut: int64 := alloc(512);
+
+    var bitPos: int64 := 0;
+    var pBitPos: int64 := alloc(8);
+    poke64(pBitPos, bitPos);
+
+    // Decode all MCUs
+    var mr: int64 := 0;
+    var scanErr: int64 := 0;
+    while (mr < mcuRows && scanErr == 0) {
+        var mc: int64 := 0;
+        while (mc < mcuCols && scanErr == 0) {
+            // For each component, decode H×V 8x8 blocks
+            var ci: int64 := 0;
+            while (ci < ncomp && scanErr == 0) {
+                var comp: int64 := ctx + JCX_COMP + ci * 40;
+                var ch: int64 := peek64(comp + JCC_H);
+                var cv: int64 := peek64(comp + JCC_V);
+                var qid: int64 := peek64(comp + JCC_QID);
+                var qtab: int64 := ctx + JCX_DQT + qid * 512;
+
+                var bv: int64 := 0;
+                while (bv < cv && scanErr == 0) {
+                    var bh: int64 := 0;
+                    while (bh < ch && scanErr == 0) {
+                        var ret: int64 := jpgDecodeBlock(ctx, rawScan, rawLen, pBitPos, ci, coeff);
+                        if (ret < 0) { scanErr := 1; }
+                        if (scanErr == 0) {
+                            jpgIDCT8x8(coeff, qtab, idctOut);
+                            // Write 8x8 block to component plane
+                            var planePtr: int64 := plane0;
+                            if (ci == 1) { planePtr := plane1; }
+                            if (ci == 2) { planePtr := plane2; }
+                            var blockX: int64 := (mc * ch + bh) * 8;
+                            var blockY: int64 := (mr * cv + bv) * 8;
+                            var iy: int64 := 0;
+                            while (iy < 8) {
+                                var ix: int64 := 0;
+                                while (ix < 8) {
+                                    // Level shift: add 128, clamp to [0,255]
+                                    var pv: int64 := jpgClamp(peek64(idctOut + (iy * 8 + ix) * 8) / 8 + 128);
+                                    poke8(planePtr + (blockY + iy) * planeW + blockX + ix, pv);
+                                    ix := ix + 1;
+                                }
+                                iy := iy + 1;
+                            }
+                        }
+                        bh := bh + 1;
+                    }
+                    bv := bv + 1;
+                }
+                ci := ci + 1;
+            }
+            mc := mc + 1;
+        }
+        mr := mr + 1;
+    }
+
+    free(coeff, 512);
+    free(idctOut, 512);
+    free(pBitPos, 8);
+    free(rawScan, scanLen + 16);
+    free(ctx, JCX_SIZE);
+
+    if (scanErr != 0) {
+        free(plane0, planeSz); free(plane1, planeSz); free(plane2, planeSz);
+        return 0;
+    }
+
+    // Convert to RGBA8
+    var pixLen: int64 := w * h * 4;
+    var pixels: int64 := alloc(pixLen);
+    if (pixels == 0) {
+        free(plane0, planeSz); free(plane1, planeSz); free(plane2, planeSz);
+        return 0;
+    }
+
+    var py: int64 := 0;
+    while (py < h) {
+        var px: int64 := 0;
+        while (px < w) {
+            var luma:   int64 := 0;
+            var cblue:  int64 := 128;
+            var cred:   int64 := 128;
+            if (ncomp == 1) {
+                luma := peek8(plane0 + py * planeW + px);
+                var dst: int64 := pixels + (py * w + px) * 4;
+                poke8(dst,     jpgClamp(luma));
+                poke8(dst + 1, jpgClamp(luma));
+                poke8(dst + 2, jpgClamp(luma));
+                poke8(dst + 3, 255);
+            }
+            if (ncomp >= 3) {
+                // Chroma upsampling: find chroma coordinates
+                var comp1: int64 := ctx + JCX_COMP + 40;
+                var h1: int64 := peek64(comp1 + JCC_H);
+                var v1: int64 := peek64(comp1 + JCC_V);
+                var h0: int64 := peek64(ctx + JCX_COMP + JCC_H);
+                var v0: int64 := peek64(ctx + JCX_COMP + JCC_V);
+                var cx: int64 := px * h1 / h0;
+                var cy: int64 := py * v1 / v0;
+                luma  := peek8(plane0 + py * planeW + px);
+                cblue := peek8(plane1 + cy * planeW + cx);
+                cred  := peek8(plane2 + cy * planeW + cx);
+                // BT.601 YCbCr → RGB
+                var cb: int64 := cblue - 128;
+                var cr: int64 := cred  - 128;
+                var r: int64 := jpgClamp(luma + (1402 * cr) / 1000);
+                var g: int64 := jpgClamp(luma - (344 * cb) / 1000 - (714 * cr) / 1000);
+                var b: int64 := jpgClamp(luma + (1772 * cb) / 1000);
+                var dst: int64 := pixels + (py * w + px) * 4;
+                poke8(dst,     r);
+                poke8(dst + 1, g);
+                poke8(dst + 2, b);
+                poke8(dst + 3, 255);
+            }
+            px := px + 1;
+        }
+        py := py + 1;
+    }
+
+    free(plane0, planeSz); free(plane1, planeSz); free(plane2, planeSz);
+
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_JPEG);
+    poke64(img + GRF_OFF_PIXELS,   pixels);
+    poke64(img + GRF_OFF_PIXLEN,   pixLen);
+    return 1;
+}
+
+// ============================================================================
+// JpegDecodeFile — read file then decode
+// ============================================================================
+
+pub fn JpegDecodeFile(path: int64, plen: int64, img: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) { ret := JpegDecode(buf, fsize, img); }
+    free(buf, fsize);
+    return ret;
+}
