@@ -11,7 +11,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 
 | WP | Titel | Priorität |
 |----|-------|-----------|
-| **7a** | Path Traversal — Compiler-Side (`_sema_readFile`, `_cg_readFile`) | 🟠 Hoch |
+| **7a** | Path Traversal — Compiler-Side (`_sema_readFile`, `_cg_readFile`) | ✅ Erledigt |
 | **12** | SMTP mit STARTTLS + Header-Sanitisierung | 🟡 Mittel |
 | **22** | Automatisierte Security-Tests im CI (inkl. LCBS) | 🟡 Mittel |
 | **24** | seccomp-Filter-Vollständigkeit (Capability→Syscall-Mapping) | 🟠 Hoch |
@@ -21,24 +21,18 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 
 ---
 
-## WP-7a: Path Traversal — Compiler-Side
+## WP-7a: Path Traversal — Compiler-Side ✅
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/sema.lyx` (`_sema_readFile`, Z. 553–596), `src/codegen_x86.lyx` (`_cg_readFile`, Z. 7133–7140) |
+| **Dateien** | `src/sema.lyx` (`_sema_processImport`, Z. 826), `src/codegen_x86.lyx` (`cg_processImport`, Z. 9391) |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ 2026-06-14 |
 
-**Problem:** Der Compiler öffnet Dateien aus `import`-Anweisungen ohne Prüfung auf `..`-Traversal. Ein bösartiges `.lyx`-File könnte beliebige Dateien des Dateisystems lesen. Der Compiler selbst unterliegt keiner LCBS-Sandbox, daher schützt Landlock hier nicht.
-
-**Teilschritte:**
-
-- [ ] **7.1** `_sema_readFile()`: Pfad-Komponenten auf `..` prüfen → Compile-Error
-- [ ] **7.2** `_cg_readFile()`: analog absichern
-
-**Definition of Done:**
-- `import ../../../etc/passwd` → Compile-Error
-- Normale relative Imports funktionieren weiter
+**Implementiert:**
+- Parser blockt `..` syntaktisch (primäre Verteidigung: `Expect(TK_IDENT)` lässt keine `.`-Tokens als Modulname zu)
+- `_sema_processImport()`: Defensive Prüfung auf `..` im Modulnamen → `EPrintStr` + `hadError := 1` + `errorCount++` (vorher fehlte die Error-Markierung)
+- `cg_processImport()`: Gleiche defensive Prüfung hinzugefügt (war zuvor komplett fehlend)
 
 ---
 
@@ -180,7 +174,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 | 6 | W^X für x86-64 ELF (statisch + dynamisch) | ✅ | 2026-06-13 | 🔴 |
 | **6b-ARM64** | **W^X für ARM64-ELF-Writer** | **⬜** | – | 🟡 |
 | **6c** | **PIE/ASLR** | **⬜ zurückgestellt** | – | 🔵 |
-| **7a** | **Path Traversal — Compiler-Side** | **⬜** | – | 🟠 |
+| **7a** | **Path Traversal — Compiler-Side** | **✅** | 2026-06-14 | 🟠 |
 | 7b | Path Traversal — Stdlib/Runtime (via Landlock) | ✅ | 2026-06-03 | – |
 | 8 | SQL Injection schließen | ✅ | 2026-06-03 | 🟠 |
 | 9 | HTTP-Client absichern | ✅ | 2026-06-03 | 🟠 |
