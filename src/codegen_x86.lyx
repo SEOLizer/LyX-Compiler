@@ -585,6 +585,9 @@ pub type Codegen = class {
 
   // WP-T14: --capabilities=compat: kein seccomp/landlock/proxy trotz @capabilities
   lcbsCompatMode:     int64;  // 1 = Compat-Modus aktiv (gesetzt von lyxc.lyx)
+  // WP-25: Runtime-Warnung im generierten Binary
+  lcbsCompatWarnOff:  int64;  // Daten-Offset der Warnung (-1 = nicht gesetzt)
+  lcbsCompatWarnLen:  int64;  // Länge der Warnung in Bytes
   // WP-6: W^X — 1 wenn zwei PT_LOAD-Segmente (RX + RW) emittiert werden
   lcbsWxActive:       int64;
 
@@ -8436,13 +8439,16 @@ pub type Codegen = class {
       param := self.cg_nnext(param);
     }
 
-    // WP-R9/R10/R11: Proxy-Start → Landlock → seccomp am Anfang von 'main'
-    if self.lcbsEnabled != 0 && fnlen == 4 {
+    // WP-25.2: Compat-Warnung + WP-R9/R10/R11: Proxy/Landlock/seccomp am Anfang von 'main'
+    if fnlen == 4 {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
          StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
-        self.cg_emitProxyStart();   // WP-R11: Proxy fork+socketpair (vor Landlock+seccomp)
-        self.cg_emitLandlockInit(); // WP-R10: Landlock (vor seccomp)
-        self.cg_emitSeccompInit();  // WP-R9: seccomp zuletzt
+        self.cg_emitCompatWarn();   // WP-25.2: Laufzeit-Warnung wenn Compat-Modus (noop sonst)
+        if self.lcbsEnabled != 0 {
+          self.cg_emitProxyStart();   // WP-R11: Proxy fork+socketpair (vor Landlock+seccomp)
+          self.cg_emitLandlockInit(); // WP-R10: Landlock (vor seccomp)
+          self.cg_emitSeccompInit();  // WP-R9: seccomp zuletzt
+        }
       }
     }
     // Generate function body (child2 = block)
@@ -9899,8 +9905,10 @@ pub type Codegen = class {
     self.lcbsAuditSrcPath  := 0 as pchar;
 
     // WP-T14: Compat-Modus (kein seccomp/landlock)
-    self.lcbsCompatMode := 0;
-    self.lcbsWxActive   := 0;
+    self.lcbsCompatMode    := 0;
+    self.lcbsCompatWarnOff := 0 - 1;
+    self.lcbsCompatWarnLen := 0;
+    self.lcbsWxActive      := 0;
 
     // Emit fixed helper stubs first
     self.cg_emitHelpers();
@@ -9997,6 +10005,41 @@ pub type Codegen = class {
       }
       ni := self.cg_nnext(ni);
     }
+  }
+
+  // WP-25.2: Warnung-String in Datensektion schreiben (nur wenn Compat-Modus aktiv)
+  fn cg_genCompatWarnSection(): void {
+    if self.lcbsCompatMode == 0 { return; }
+    var msg: pchar := "WARNUNG: Compat-Modus aktiv -- kein seccomp, kein landlock, kein Proxy!\n"c;
+    var msglen: int64 := StrLen(msg);
+    self.lcbsCompatWarnOff := self.dataLen;
+    self.lcbsCompatWarnLen := msglen;
+    var i: int64 := 0;
+    while i < msglen {
+      self.cg_edata(StrCharAt(msg, i) & 255);
+      i := i + 1;
+    }
+  }
+
+  // WP-25.2: write(2, warn_str, warn_len) am Anfang von main emittieren
+  fn cg_emitCompatWarn(): void {
+    if self.lcbsCompatMode == 0 { return; }
+    if self.lcbsCompatWarnOff < 0 { return; }
+    // mov edi, 2  (stderr)
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // lea rsi, [rip + disp32]  → Warnung-String
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+    var pp: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pp, self.lcbsCompatWarnOff, 0, CG_PATCH_STR);
+    // mov edx, warn_len
+    var wl: int64 := self.lcbsCompatWarnLen;
+    self.cg_e8(0xBA);
+    self.cg_e8(wl & 255); self.cg_e8((wl >> 8) & 255); self.cg_e8((wl >> 16) & 255); self.cg_e8((wl >> 24) & 255);
+    // mov eax, 1  (SYS_write)
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    // syscall
+    self.cg_e8(0x0F); self.cg_e8(0x05);
   }
 
   // WP-R9: BPF-Programm in Datensektion schreiben; setzt lcbsBpfDataOff + lcbsBpfCount
@@ -10475,6 +10518,11 @@ pub type Codegen = class {
 
     // --- Ausgabe ---
     EPrintStrLn("=== LCBS Security Audit =========================================="c);
+    if self.lcbsCompatMode != 0 {
+      EPrintStrLn("!!! WARNUNG: Compat-Modus (--capabilities=compat) aktiv         !!!"c);
+      EPrintStrLn("!!! seccomp, landlock, Proxy deaktiviert -- kein Laufzeitschutz !!!"c);
+      EPrintStrLn(""c);
+    }
     EPrintStr("Programm:          "c);
     if self.lcbsAuditSrcPath != 0 as pchar {
       EPrintStrLn(self.lcbsAuditSrcPath);
@@ -10587,6 +10635,9 @@ pub type Codegen = class {
       EPrintStr("  -"c); EPrintInt(self.lcbsFastpathCount * 3);
       EPrintStr(": @fastpath x"c); EPrintInt(self.lcbsFastpathCount); EPrintStrLn(""c);
     }
+    if self.lcbsCompatMode != 0 {
+      EPrintStrLn("  WARNUNG: Compat-Modus -- kein Laufzeitschutz"c);
+    }
     EPrintStrLn("=================================================================="c);
   }
 
@@ -10597,6 +10648,7 @@ pub type Codegen = class {
     self.cg_collectCaps(head);
     self.cg_computeProxy();        // WP-R11: Proxy-Bedarf bestimmen
     self.cg_computeLandlock();     // WP-R10: Landlock-Bitmasks
+    self.cg_genCompatWarnSection(); // WP-25.2: Compat-Warnung in Datensektion
     self.cg_genProxyBpfSection();  // WP-R11: Proxy-BPF + proxy_fd-Slot in Datensektion
     self.cg_genBpfSection();       // WP-R9: Haupt-BPF in Datensektion
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
