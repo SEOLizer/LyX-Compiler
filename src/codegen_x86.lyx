@@ -418,9 +418,10 @@ pub type Codegen = class {
   curClassNameLen: int64;
 
   // Module-level constant table {namePtr:8, nameLen:8, value:8} = 24 bytes per entry
-  conTable: int64;
-  conCount: int64;
-  conCap:   int64;
+  conTable:   int64;
+  conCount:   int64;
+  conCap:     int64;
+  conIsPchar: int64;  // byte buffer parallel to conTable: 1 = pchar string constant
 
   // Break support: linked list of pending jmp-rel32 placeholders in code buffer.
   // curBreakHead holds the code offset of the most recent break's 4-byte placeholder,
@@ -908,6 +909,11 @@ pub type Codegen = class {
         var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
         if (self.cg_seq(tp, tl, "pchar", 5)) { return 1; }
       }
+      // pchar string constants (pub con NAME: pchar := "..."c)
+      var cidx: int64 := self.cg_findConIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (cidx >= 0) {
+        if (peek8(self.conIsPchar + cidx) != 0) { return 1; }
+      }
       return 0;
     }
     if (k == CGN_CALL) {
@@ -1180,15 +1186,17 @@ pub type Codegen = class {
   fn cg_addCon(name: pchar, nlen: int64, val: int64) {
     if (self.conCount >= self.conCap) {
       var nc: int64 := self.conCap * 2;
-      var nb: int64 := alloc(nc * 24);
-      var i: int64 := 0;
+      var nb: int64 := alloc(nc * CG_CON_SZ);
+      var np: int64 := alloc(nc);
       memcpy(nb, self.conTable, self.conCount * CG_CON_SZ);
-      self.conTable := nb; self.conCap := nc;
+      memcpy(np, self.conIsPchar, self.conCount);
+      self.conTable := nb; self.conCap := nc; self.conIsPchar := np;
     }
     var base: int64 := self.conTable + self.conCount * CG_CON_SZ;
-    poke64(base,      name as int64);
+    poke64(base,                       name as int64);
     poke64(base + CG_CON_OFF_NAMELEN,  nlen);
-    poke64(base + CG_CON_OFF_VAL, val);
+    poke64(base + CG_CON_OFF_VAL,      val);
+    poke8(self.conIsPchar + self.conCount, 0);
     self.conCount := self.conCount + 1;
   }
 
@@ -1215,6 +1223,40 @@ pub type Codegen = class {
       i := i + 1;
     }
     return 0;
+  }
+
+  // Returns the index of a constant in conTable, or -1 if not found.
+  fn cg_findConIdx(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.conCount) {
+      var base: int64 := self.conTable + i * CG_CON_SZ;
+      var ename: pchar := peek64(base) as pchar;
+      var elen:  int64 := peek64(base + CG_CON_OFF_NAMELEN);
+      if (self.cg_seq(ename, elen, name, nlen) != 0) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  // Add a pchar string constant: stores data offset in conTable and marks conIsPchar.
+  fn cg_addConStr(name: pchar, nlen: int64, dataOff: int64) {
+    self.cg_addCon(name, nlen, dataOff);
+    poke8(self.conIsPchar + (self.conCount - 1), 1);
+  }
+
+  // Emit code to load a constant into rax.
+  // For pchar string constants: emits lea rax,[rip+disp32] with a CG_PATCH_STR patch.
+  // For int64 constants: emits mov rax, imm64.
+  fn cg_emitConLoad(name: pchar, nlen: int64) {
+    var idx: int64 := self.cg_findConIdx(name, nlen);
+    if (idx < 0) { self.cg_zeroRax(); return; }
+    var val: int64 := peek64(self.conTable + idx * CG_CON_SZ + CG_CON_OFF_VAL);
+    if (peek8(self.conIsPchar + idx) != 0) {
+      var pp: int64 := self.cg_emitLeaStr();
+      self.cg_addPatch(pp, val, 0, CG_PATCH_STR);
+    } else {
+      self.cg_movRaxImm(val);
+    }
   }
 
   // Evaluates a compile-time constant expression node and returns its int64 value.
@@ -3530,7 +3572,7 @@ pub type Codegen = class {
         } else {
           var goffC: int64 := self.cg_findGlobal(name, nlen);
           if (goffC >= 0) { self.cg_loadRaxGlobal(goffC); }
-          else if (self.cg_hasConVal(name, nlen) != 0) { self.cg_movRaxImm(self.cg_findConVal(name, nlen)); }
+          else if (self.cg_hasConVal(name, nlen) != 0) { self.cg_emitConLoad(name, nlen); }
           else { self.cg_zeroRax(); }
         }
       } else {
@@ -3554,7 +3596,7 @@ pub type Codegen = class {
             if (goff1 >= 0) {
               self.cg_loadRaxGlobal(goff1);
             } else if (self.cg_hasConVal(name, nlen) != 0) {
-              self.cg_movRaxImm(self.cg_findConVal(name, nlen));
+              self.cg_emitConLoad(name, nlen);
             } else {
               self.cg_zeroRax();
             }
@@ -3564,7 +3606,7 @@ pub type Codegen = class {
           if (goff2 >= 0) {
             self.cg_loadRaxGlobal(goff2);
           } else if (self.cg_hasConVal(name, nlen) != 0) {
-            self.cg_movRaxImm(self.cg_findConVal(name, nlen));
+            self.cg_emitConLoad(name, nlen);
           } else {
             self.cg_zeroRax();
           }
@@ -4254,6 +4296,11 @@ pub type Codegen = class {
       } else {
         var gidx: int64 := self.cg_findGlobalIdx(nm, nl);
         if (gidx >= 0 && peek8(self.globalIsPchar + gidx) != 0) { return 1; }
+        // pchar string constants
+        var cidx: int64 := self.cg_findConIdx(nm, nl);
+        if (cidx >= 0) {
+          if (peek8(self.conIsPchar + cidx) != 0) { return 1; }
+        }
       }
     }
     return 0;
@@ -9639,8 +9686,14 @@ pub type Codegen = class {
         // Populate constant table; evaluate arbitrary constant expressions
         var initNode: int64 := self.cg_nc1(cur);
         if (initNode >= 0) {
-          var conVal: int64 := self.cg_evalConExpr(initNode);
-          self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), conVal);
+          if (self.cg_nkind(initNode) == CGN_LIT_STR) {
+            // String literal init → pchar constant; store data offset + mark pchar
+            var dataOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
+            self.cg_addConStr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
+          } else {
+            var conVal: int64 := self.cg_evalConExpr(initNode);
+            self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), conVal);
+          }
         }
       } else if (k == CGN_ENUM_DECL) {
         // WP-10f: register each enum member as an int64 constant
@@ -9770,9 +9823,10 @@ pub type Codegen = class {
     self.localBase             := 0;
 
     // Module-level constant table (use literal 24 for slot size, avoids bootstrap issue)
-    self.conCap   := 256;
-    self.conTable := alloc(self.conCap * CG_CON_SZ);
-    self.conCount := 0;
+    self.conCap     := 256;
+    self.conTable   := alloc(self.conCap * CG_CON_SZ);
+    self.conCount   := 0;
+    self.conIsPchar := alloc(self.conCap);
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
