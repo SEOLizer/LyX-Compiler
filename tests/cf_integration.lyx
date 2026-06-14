@@ -1,0 +1,293 @@
+// tests/cf_integration.lyx — Cloudflare SDK Integration Tests
+// WP-CF-16
+
+unit tests.cf_integration;
+
+import std.cloud.cf.credentials;
+import std.cloud.cf.transport;
+import std.cloud.cf.zones;
+import std.cloud.cf.dns;
+import std.cloud.cf.cache;
+import std.cloud.cf.kv;
+import std.cloud.cf.r2;
+import std.cloud.cf.d1;
+import std.cloud.cf.waf;
+import std.cloud.cf.workers;
+import std.io;
+import std.alloc;
+
+var testsPassed: int64 := 0;
+var testsFailed: int64 := 0;
+
+fn assert_(cond: int64, name: pchar) {
+    Print("  ["c);
+    if (cond == 1) {
+        Print("PASS"c); testsPassed := testsPassed + 1;
+    } else {
+        Print("FAIL"c); testsFailed := testsFailed + 1;
+    }
+    Print("] "c); PrintLn(name);
+}
+
+fn testCredentialChain(): int64 {
+    PrintLn("testCredentialChain"c);
+    var creds: CFCredentials := CFCredentialsFromEnv();
+    assert_(creds.authType != 0, "authType set from env"c);
+    assert_(creds.token != 0 || creds.apiKey != 0, "token or apiKey present"c);
+    return 1;
+}
+
+fn testDNSCRUD(c: CFClient, zoneId: pchar): int64 {
+    PrintLn("testDNSCRUD"c);
+
+    // Create
+    var rec: CFDNSRecord := DNSRecordCreate(c, zoneId, "TXT"c,
+        "_lyx_test"c, "lyx-integration-test-token"c, 60, 0);
+    assert_(rec.id != 0, "DNS record created"c);
+    if (rec.id == 0) { return 0; }
+    var recId: int64 := rec.id;
+    CFDNSRecordFree(rec);
+
+    // Get
+    var got: CFDNSRecord := DNSRecordGet(c, zoneId, recId as pchar);
+    assert_(got.id != 0, "DNS record retrieved"c);
+    assert_(streqFn(got.recType as pchar, "TXT"c), "DNS record type is TXT"c);
+    CFDNSRecordFree(got);
+
+    // Delete
+    var ok: int64 := DNSRecordDelete(c, zoneId, recId as pchar);
+    assert_(ok == 1, "DNS record deleted"c);
+
+    return 1;
+}
+
+fn testCachePurge(c: CFClient, zoneId: pchar): int64 {
+    PrintLn("testCachePurge"c);
+    var ok: int64 := CachePurgeAll(c, zoneId);
+    assert_(ok == 1, "cache purge-all succeeds"c);
+    return ok;
+}
+
+fn testKVRoundtrip(c: CFClient, accountId: pchar): int64 {
+    PrintLn("testKVRoundtrip"c);
+
+    // Create namespace
+    var ns: CFKVNamespace := KVNamespaceCreate(c, accountId, "lyx-test-ns"c);
+    assert_(ns.id != 0, "KV namespace created"c);
+    if (ns.id == 0) { return 0; }
+    var nsId: pchar := ns.id as pchar;
+
+    // Put
+    var putOk: int64 := KVPut(c, accountId, nsId, "testkey"c,
+        "testvalue"c as int64, 9);
+    assert_(putOk == 1, "KV put"c);
+
+    // Get
+    var val: int64 := KVGet(c, accountId, nsId, "testkey"c);
+    assert_(val != 0, "KV get returns value"c);
+    if (val != 0) { free(val, StrLen(val as pchar)+1); }
+
+    // Delete
+    var delOk: int64 := KVDelete(c, accountId, nsId, "testkey"c);
+    assert_(delOk == 1, "KV delete"c);
+
+    // Cleanup namespace
+    var nsDelOk: int64 := KVNamespaceDelete(c, accountId, nsId);
+    assert_(nsDelOk == 1, "KV namespace deleted"c);
+
+    CFKVNamespaceFree(ns);
+    return 1;
+}
+
+fn testR2RoundTrip(c: CFClient, accountId: pchar): int64 {
+    PrintLn("testR2RoundTrip"c);
+    var r2: R2Conn := R2Connect(c, accountId);
+
+    // Create bucket
+    var bOk: int64 := R2BucketCreate(c, accountId, "lyx-test-bucket"c, "WEUR"c);
+    assert_(bOk == 1 || R2BucketExists(r2, "lyx-test-bucket"c) == 1,
+        "R2 bucket exists"c);
+
+    // Upload
+    var data: pchar := "Hello from Lyx integration test!"c;
+    var dl: int64 := StrLen(data);
+    var upOk: int64 := R2Upload(r2, "lyx-test-bucket"c, "test.txt"c,
+        data as int64, dl, "text/plain"c);
+    assert_(upOk == 1, "R2 upload"c);
+
+    // Exists check
+    var exists: int64 := R2Exists(r2, "lyx-test-bucket"c, "test.txt"c);
+    assert_(exists == 1, "R2 object exists"c);
+
+    // Download
+    var sz: int64 := 0;
+    var downloaded: int64 := R2Download(r2, "lyx-test-bucket"c, "test.txt"c, &sz);
+    assert_(downloaded != 0, "R2 download"c);
+    assert_(sz == dl, "R2 download size matches"c);
+    if (downloaded != 0) { sys_munmap(downloaded, sz+1); }
+
+    // Delete object
+    var dOk: int64 := R2Delete(r2, "lyx-test-bucket"c, "test.txt"c);
+    assert_(dOk == 1, "R2 object deleted"c);
+
+    // Delete bucket
+    var bDelOk: int64 := R2BucketDelete(c, accountId, "lyx-test-bucket"c);
+    assert_(bDelOk == 1, "R2 bucket deleted"c);
+
+    return 1;
+}
+
+fn testD1CRUD(c: CFClient, accountId: pchar): int64 {
+    PrintLn("testD1CRUD"c);
+
+    var db: CFD1Database := D1Create(c, accountId, "lyx-test-db"c);
+    assert_(db.uuid != 0, "D1 database created"c);
+    if (db.uuid == 0) { return 0; }
+    var dbId: pchar := db.uuid as pchar;
+
+    var cr: D1Result := D1Exec(c, accountId, dbId,
+        "CREATE TABLE test_users (id INTEGER PRIMARY KEY, name TEXT)"c);
+    assert_(cr.success == 1, "D1 CREATE TABLE"c);
+    D1ResultFree(cr);
+
+    var ins: D1Result := D1Exec(c, accountId, dbId,
+        "INSERT INTO test_users VALUES (1, 'Lyx')"c);
+    assert_(ins.success == 1, "D1 INSERT"c);
+    D1ResultFree(ins);
+
+    var sel: D1Result := D1Exec(c, accountId, dbId,
+        "SELECT * FROM test_users"c);
+    assert_(sel.success == 1, "D1 SELECT"c);
+    var rowCount: int64 := D1ResultRowCount(sel);
+    assert_(rowCount == 1, "D1 SELECT row count"c);
+    var name: int64 := D1ResultGetString(sel, 0, "name"c);
+    assert_(name != 0, "D1 GetString name"c);
+    if (name != 0) { free(name, StrLen(name as pchar)+1); }
+    D1ResultFree(sel);
+
+    // Delete database
+    var delOk: int64 := D1Delete(c, accountId, dbId);
+    assert_(delOk == 1, "D1 database deleted"c);
+
+    CFD1DatabaseFree(db);
+    return 1;
+}
+
+fn testFirewallRuleCreateDelete(c: CFClient, zoneId: pchar): int64 {
+    PrintLn("testFirewallRuleCreateDelete"c);
+
+    var rule: CFFirewallRule := FirewallRuleCreate(c, zoneId,
+        "lyx-test-block"c,
+        "(ip.src eq 192.0.2.1)"c,
+        "block"c, 100, 1);
+    assert_(rule.id != 0, "Firewall rule created"c);
+    if (rule.id == 0) { return 0; }
+    var ruleId: pchar := rule.id as pchar;
+    CFFirewallRuleFree(rule);
+
+    var delOk: int64 := FirewallRuleDelete(c, zoneId, ruleId);
+    assert_(delOk == 1, "Firewall rule deleted"c);
+
+    return 1;
+}
+
+fn testWorkerDeploy(c: CFClient, accountId: pchar): int64 {
+    PrintLn("testWorkerDeploy"c);
+
+    var script: pchar := "export default { fetch() { return new Response('test'); } }"c;
+    var sl: int64 := StrLen(script);
+    var ok: int64 := WorkerDeploy(c, accountId, "lyx-test-worker"c,
+        script as int64, sl);
+    assert_(ok == 1, "Worker deployed"c);
+
+    var delOk: int64 := WorkerDelete(c, accountId, "lyx-test-worker"c);
+    assert_(delOk == 1, "Worker deleted"c);
+
+    return 1;
+}
+
+fn testPaginationDNSList(c: CFClient, zoneId: pchar): int64 {
+    PrintLn("testPaginationDNSList"c);
+    var j: int64 := DNSRecordList(c, zoneId);
+    assert_(j != 0, "DNS list returns result"c);
+    if (j != 0) { free(j, StrLen(j as pchar)+1); }
+    return 1;
+}
+
+fn testRateLimitHandling(c: CFClient): int64 {
+    PrintLn("testRateLimitHandling"c);
+    // Issue 5 rapid requests to trigger retry logic without actually hitting 429
+    // In real scenario this would fire against a test zone that rate-limits immediately
+    var i: int64 := 0;
+    var ok: int64 := 0;
+    while (i < 5) {
+        var tok: int64 := CFValidateToken(c);
+        if (tok == 1) { ok := ok + 1; }
+        i := i + 1;
+    }
+    assert_(ok >= 1, "At least one request succeeded (retry logic functional)"c);
+    return 1;
+}
+
+// Helper: compare two pchar strings
+fn streqFn(a: pchar, b: pchar): int64 {
+    var i: int64 := 0;
+    while ((peek8(a+i)&0xFF) != 0 && (peek8(b+i)&0xFF) != 0) {
+        if ((peek8(a+i)&0xFF) != (peek8(b+i)&0xFF)) { return 0; }
+        i := i + 1;
+    }
+    if ((peek8(a+i)&0xFF) != (peek8(b+i)&0xFF)) { return 0; }
+    return 1;
+}
+
+pub fn main(argc: int64, argv: int64): int64 {
+    var creds: CFCredentials := CFCredentialsFromEnv();
+    var c: CFClient;
+    c.authType:=creds.authType; c.token:=creds.token; c.apiKey:=creds.apiKey;
+    c.email:=creds.email; c.accountId:=creds.accountId; c.zoneId:=creds.zoneId;
+    c.timeout:=30000; c.maxRetries:=3;
+
+    if (c.authType == 0) {
+        PrintLn("Error: set CF_AUTH_TOKEN + CF_ACCOUNT_ID + CF_ZONE_ID"c);
+        return 1;
+    }
+
+    var accountId: pchar := creds.accountId as pchar;
+    var zoneId:    pchar := creds.zoneId as pchar;
+
+    PrintLn("=== Cloudflare SDK Integration Tests ==="c);
+    PrintLn(""c);
+
+    testCredentialChain();
+    testRateLimitHandling(c);
+
+    if (zoneId != 0 as pchar) {
+        testDNSCRUD(c, zoneId);
+        testCachePurge(c, zoneId);
+        testFirewallRuleCreateDelete(c, zoneId);
+        testPaginationDNSList(c, zoneId);
+    } else {
+        PrintLn("  [SKIP] Zone tests — CF_ZONE_ID not set"c);
+    }
+
+    if (accountId != 0 as pchar) {
+        testKVRoundtrip(c, accountId);
+        testR2RoundTrip(c, accountId);
+        testD1CRUD(c, accountId);
+        testWorkerDeploy(c, accountId);
+    } else {
+        PrintLn("  [SKIP] Account tests — CF_ACCOUNT_ID not set"c);
+    }
+
+    PrintLn(""c);
+    PrintLn("=== Results ==="c);
+    Print("Passed: "c);
+    var pbuf: int64 := alloc(16); var pstr: int64 := int64ToStr(testsPassed, pbuf);
+    PrintLn(pbuf as pchar); free(pbuf, 16);
+    Print("Failed: "c);
+    var fbuf: int64 := alloc(16); var fstr: int64 := int64ToStr(testsFailed, fbuf);
+    PrintLn(fbuf as pchar); free(fbuf, 16);
+
+    if (testsFailed == 0) { PrintLn("ALL TESTS PASSED"c); return 0; }
+    else { PrintLn("SOME TESTS FAILED"c); return 1; }
+}

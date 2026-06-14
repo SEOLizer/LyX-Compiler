@@ -8,6 +8,7 @@
 import src.parser;
 import src.std.alloc;
 import src.std.io;
+import src.error_collector;  // WP-KI-02
 import src.security.capabilities;
 import src.security.capability_resolver;
 import src.security.cap_graph;
@@ -380,6 +381,9 @@ pub type Sema = class {
   // BUG-3: current source file path for error messages (null = root module)
   curFile: pchar;
 
+  // WP-KI-02: pointer to ErrorCollector (0 = text mode, ≠0 = --error-json mode)
+  errColl: int64;
+
   // ------------------------------------------------------------------
   // Node access helpers
   // Prefixed sn_ to avoid VMT collision with Parser methods of same name.
@@ -510,15 +514,21 @@ pub type Sema = class {
   // ------------------------------------------------------------------
 
   fn _error(msg: pchar, line: int64) {
-    if self.curFile != 0 as pchar {
-      PrintStr(self.curFile);
-      PrintStr(": ");
+    if self.errColl != 0 {
+      // WP-KI-02: route to ErrorCollector instead of text output
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 0, self.curFile, line, msg);
+    } else {
+      if self.curFile != 0 as pchar {
+        PrintStr(self.curFile);
+        PrintStr(": ");
+      }
+      PrintStr("sema error (line ");
+      PrintInt(line);
+      PrintStr("): ");
+      PrintStr(msg);
+      PrintStr("\n");
     }
-    PrintStr("sema error (line ");
-    PrintInt(line);
-    PrintStr("): ");
-    PrintStr(msg);
-    PrintStr("\n");
     self.hadError   := 1;
     self.errorCount := self.errorCount + 1;
   }
@@ -532,6 +542,42 @@ pub type Sema = class {
     self._error(msg, line);
   }
 
+  fn _errorNodeName(msg: pchar, ni: int64, name: pchar, nameLen: int64) {
+    var tokIdx: int64 := self.sn_tokIdx(ni);
+    var line: int64 := 0;
+    if (tokIdx >= 0 && tokIdx < self.pTokCount) {
+      line := self.sn_tokLine(tokIdx);
+    }
+    if self.errColl != 0 {
+      // WP-KI-02: build combined message "msg 'name'" and route to collector
+      var mlen: int64 := StrLen(msg);
+      var tbuf: int64 := alloc(mlen + nameLen + 5);
+      memcpy(tbuf, msg as int64, mlen);
+      poke8(tbuf + mlen,     32);  // space
+      poke8(tbuf + mlen + 1, 39);  // '
+      memcpy(tbuf + mlen + 2, name as int64, nameLen);
+      poke8(tbuf + mlen + 2 + nameLen,     39);  // '
+      poke8(tbuf + mlen + 2 + nameLen + 1, 0);   // NUL
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 0, self.curFile, line, tbuf as pchar);
+      free(tbuf, mlen + nameLen + 5);
+    } else {
+      if self.curFile != 0 as pchar {
+        PrintStr(self.curFile);
+        PrintStr(": ");
+      }
+      PrintStr("sema error (line ");
+      PrintInt(line);
+      PrintStr("): ");
+      PrintStr(msg);
+      PrintStr(" '");
+      sys_write(1, name as int64, nameLen);
+      PrintStr("'\n");
+    }
+    self.hadError   := 1;
+    self.errorCount := self.errorCount + 1;
+  }
+
   // WP-AS-15: emit a warning (does not increment errorCount)
   fn _warnNode(msg: pchar, ni: int64) {
     var tokIdx: int64 := self.sn_tokIdx(ni);
@@ -539,10 +585,15 @@ pub type Sema = class {
     if (tokIdx >= 0 && tokIdx < self.pTokCount) {
       line := self.sn_tokLine(tokIdx);
     }
-    PrintStr("warning(line "c);
-    PrintInt(line);
-    PrintStr("): "c);
-    PrintStrLn(msg);
+    if self.errColl != 0 {
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 1, self.curFile, line, msg);
+    } else {
+      PrintStr("warning(line "c);
+      PrintInt(line);
+      PrintStr("): "c);
+      PrintStrLn(msg);
+    }
   }
 
   // WP-2.2-A: Print a non-NUL-terminated source substring (for error messages).
@@ -611,13 +662,13 @@ pub type Sema = class {
     if (self._strNEq(nm, nl, "int32",   5)) { return TY_INT32;   }
     if (self._strNEq(nm, nl, "int16",   5)) { return TY_INT16;   }
     if (self._strNEq(nm, nl, "int8",    4)) { return TY_INT8;    }
-    if (self._strNEq(nm, nl, "u64",     4)) { return TY_UINT64;  }
-    if (self._strNEq(nm, nl, "u32",     4)) { return TY_UINT32;  }
-    if (self._strNEq(nm, nl, "u16",     4)) { return TY_UINT16;  }
-    if (self._strNEq(nm, nl, "u8",      3)) { return TY_UINT8;   }
+    if (self._strNEq(nm, nl, "u64",     3)) { return TY_UINT64;  }
+    if (self._strNEq(nm, nl, "u32",     3)) { return TY_UINT32;  }
+    if (self._strNEq(nm, nl, "u16",     3)) { return TY_UINT16;  }
+    if (self._strNEq(nm, nl, "u8",      2)) { return TY_UINT8;   }
     if (self._strNEq(nm, nl, "pchar",   5)) { return TY_PCHAR;   }
-    if (self._strNEq(nm, nl, "f64",     4)) { return TY_FLOAT64; }
-    if (self._strNEq(nm, nl, "f32",     4)) { return TY_FLOAT32; }
+    if (self._strNEq(nm, nl, "f64",     3)) { return TY_FLOAT64; }
+    if (self._strNEq(nm, nl, "f32",     3)) { return TY_FLOAT32; }
     if (self._strNEq(nm, nl, "char",    4)) { return TY_CHAR;    }
     // Look up user-defined type (struct / enum / type alias)
     var si: int64 := self.Lookup(nm, nl);
@@ -625,8 +676,7 @@ pub type Sema = class {
       var sk: int64 := self.SymKind(si);
       if (sk == SYM_STRUCT || sk == SYM_ENUM || sk == SYM_TYPE) { return TY_USER; }
     }
-    // Unknown name: treat as imported class type (for bootstrap, assume valid)
-    return TY_USER;
+    return TY_UNKNOWN;
   }
 
   // ------------------------------------------------------------------
@@ -773,12 +823,14 @@ pub type Sema = class {
     if (self._sema_hasImported(modName, modLen) != 0) { return; }
     self._sema_markImported(modName, modLen);
 
-    // WP-7: ".." als Modulkomponente verbieten ("..foo.bar" → "../foo/bar.lyx")
+    // WP-7a: ".." als Modulkomponente verbieten ("..foo.bar" → "../foo/bar.lyx")
     var wptd: int64 := 0;
     while wptd < modLen - 1 {
-      if (StrCharAt(modName, wptd) & 255) == 46 && (StrCharAt(modName, wptd + 1) & 255) == 46 {
+      if ((StrCharAt(modName, wptd) & 255) == 46 && (StrCharAt(modName, wptd + 1) & 255) == 46) {
         EPrintStr("sema error: import path traversal verboten: "c);
         EPrintStrLn(modName);
+        self.hadError   := 1;
+        self.errorCount := self.errorCount + 1;
         return;
       }
       wptd := wptd + 1;
@@ -1140,7 +1192,7 @@ pub type Sema = class {
       }
       var si: int64 := self.Lookup(nm, nl);
       if (si < 0) {
-        self._errorNode("undefined symbol", ni);
+        self._errorNodeName("undefined symbol", ni, nm, nl);
       }
 
     } else if (k == SNK_CALL) {
@@ -1156,7 +1208,7 @@ pub type Sema = class {
         var nl: int64 := self.sn_sLen(ni);
         var si: int64 := self.Lookup(nm, nl);
         if (si < 0) {
-          self._errorNode("undefined function", ni);
+          self._errorNodeName("undefined function", ni, nm, nl);
         } else {
           // WP-L7: Caller-Cap-Prüfung für @uses_caller_cap-annotierte Funktionen
           self._checkCallerCap(ni, nm, nl);
@@ -1204,7 +1256,7 @@ pub type Sema = class {
           while (classFld >= 0) {
             if (self._strNEq(fldName, fldLen, self.sn_sVal(classFld), self.sn_sLen(classFld)) != 0) {
               var vis: int64 := (self.sn_iVal(classFld) >> 4) & 3;
-              if (vis == 2) { self._errorNode("private field not accessible", ni); }
+              if (vis == 2) { self._errorNodeName("private field not accessible", ni, fldName, fldLen); }
               break;
             }
             classFld := self.sn_next(classFld);
@@ -1221,7 +1273,7 @@ pub type Sema = class {
         var newNi: int64 := self.SymNodeIdx(newSym);
         if (newNi >= 0) {
           var classAbstract: int64 := self.sn_iVal(newNi) & 1;
-          if (classAbstract != 0) { self._errorNode("cannot instantiate abstract class", ni); }
+          if (classAbstract != 0) { self._errorNodeName("cannot instantiate abstract class", ni, newName, newLen); }
         }
       }
       // Check constructor arguments (child0 = first arg)
@@ -1260,7 +1312,7 @@ pub type Sema = class {
         var nl: int64 := self.sn_sLen(fnRef);
         var si: int64 := self.Lookup(nm, nl);
         if (si < 0) {
-          self._errorNode("undefined function for fn ptr", ni);
+          self._errorNodeName("undefined function for fn ptr", ni, nm, nl);
         } else {
           self._checkFnPtrUcc(fnRef);  // WP-L7: Warnung bei UCC-annotierten Fn-Ptr
         }
@@ -1369,7 +1421,7 @@ pub type Sema = class {
       var initNi: int64 := self.sn_c1(ni);
       var tid: int64 := self.ResolveType(typeNi);
       if (tid == TY_UNKNOWN) {
-        self._errorNode("unknown type in var decl", ni);
+        self._errorNodeName("unknown type in var decl", ni, self.sn_sVal(typeNi), self.sn_sLen(typeNi));
       }
       self._logReason("var-decl", ni, tid);
       if (initNi >= 0) {
@@ -1396,7 +1448,7 @@ pub type Sema = class {
         if (si >= 0 && self.SymKind(si) == SYM_PARAM) {
           var paramNi: int64 := self.SymNodeIdx(si);
           if (paramNi >= 0 && (self.sn_iVal(paramNi) & SEMA_PARAM_FLAG_CON) != 0) {
-            self._errorNode("assignment to con-parameter not allowed", ni);
+            self._errorNodeName("assignment to con-parameter not allowed", ni, self.sn_sVal(lval), self.sn_sLen(lval));
           }
         }
       }
@@ -1558,10 +1610,10 @@ pub type Sema = class {
           var variantSym: int64 := self.Lookup(variantName, variantLen);
           if (variantSym >= 0) {
             if (self.SymKind(variantSym) != SYM_CON) {
-              self._errorNode("enum pattern: not a valid enum variant"c, patNode);
+              self._errorNodeName("enum pattern: not a valid enum variant"c, patNode, variantName, variantLen);
             }
           } else {
-            self._errorNode("enum pattern: variant not found"c, patNode);
+            self._errorNodeName("enum pattern: variant not found"c, patNode, variantName, variantLen);
           }
         } else if (patKind == SNK_PATTERN_STRUCT) {
           var structTypeName: pchar := self.sn_sVal(patNode);
@@ -1570,10 +1622,10 @@ pub type Sema = class {
           if (structSym >= 0) {
             var structSymKind: int64 := self.SymKind(structSym);
             if (structSymKind != SYM_STRUCT && structSymKind != SYM_TYPE) {
-              self._errorNode("struct pattern: not a struct type"c, patNode);
+              self._errorNodeName("struct pattern: not a struct type"c, patNode, structTypeName, structTypeLen);
             }
           } else {
-            self._errorNode("struct pattern: type not found"c, patNode);
+            self._errorNodeName("struct pattern: type not found"c, patNode, structTypeName, structTypeLen);
           }
           var fieldPat: int64 := self.sn_c0(patNode);
           while (fieldPat >= 0) { self._checkStmt(fieldPat); fieldPat := self.sn_next(fieldPat); }
@@ -1645,7 +1697,7 @@ pub type Sema = class {
       self._checkExpr(self.sn_c0(ni));
       var checkType: int64 := self.ResolveType(self.sn_c1(ni));
       if (checkType == TY_UNKNOWN) {
-        self._errorNode("unknown type in is expression", ni);
+        self._errorNodeName("unknown type in is expression", ni, self.sn_sVal(self.sn_c1(ni)), self.sn_sLen(self.sn_c1(ni)));
       }
     // WP-17: Range expression (1..100)
     // WP-BC-13: format expression expr:width[:decimals]
@@ -2075,7 +2127,7 @@ pub type Sema = class {
     if (retNi >= 0) {
       var retTid: int64 := self.ResolveType(retNi);
       if (retTid == TY_UNKNOWN) {
-        self._errorNode("unknown return type", ni);
+        self._errorNodeName("unknown return type", ni, self.sn_sVal(retNi), self.sn_sLen(retNi));
       }
       self._logReason("return-type"c, ni, retTid);
     }
@@ -2128,7 +2180,7 @@ pub type Sema = class {
         var eLen: int64 := peek64(self.daaBuf + i * DAA_SIZE + DAA_OFF_NAMELEN);
         if (self._strNEq(nm, nl, ePtr, eLen)) {
           if (self.daaEnabled >= 2) {
-            self._errorNode("variable used before initialization"c, ni);
+            self._errorNodeName("variable used before initialization"c, ni, nm, nl);
           } else {
             self._warnNode("variable possibly used before initialization"c, ni);
           }
@@ -2321,7 +2373,7 @@ pub type Sema = class {
     while (ta >= 0) {
       var tid: int64 := self.ResolveType(ta);
       if (tid == TY_UNKNOWN) {
-        self._errorNode("unknown type in generic arguments", ta);
+        self._errorNodeName("unknown type in generic arguments", ta, self.sn_sVal(ta), self.sn_sLen(ta));
       }
       argCount := argCount + 1;
       ta := self.sn_next(ta);
@@ -2827,7 +2879,7 @@ pub type Sema = class {
         var parentLen: int64 := self.sn_sLen(parentNi);
         var parentSym: int64 := self.Lookup(parentName, parentLen);
         if (parentSym < 0) {
-          self._errorNode("unknown parent class", ni);
+          self._errorNodeName("unknown parent class", ni, parentName, parentLen);
         }
         // Check that methods marked override exist in parent (name check only)
         var mth: int64 := self.sn_c1(ni);
@@ -2849,7 +2901,7 @@ pub type Sema = class {
         var ifaceLen:  int64 := self.sn_sLen(ifaceListNi);
         var ifaceSym:  int64 := self.Lookup(ifaceName, ifaceLen);
         if (ifaceSym < 0) {
-          self._errorNode("unknown interface", ni);
+          self._errorNodeName("unknown interface", ni, ifaceName, ifaceLen);
         } else {
           var ifaceNi: int64 := self.SymNodeIdx(ifaceSym);
           if (ifaceNi >= 0) {
@@ -2867,7 +2919,7 @@ pub type Sema = class {
                 }
                 cMth := self.sn_next(cMth);
               }
-              if (found == 0) { self._errorNode("class missing interface method", iMth); }
+              if (found == 0) { self._errorNodeName("class missing interface method", iMth, iMthName, iMthLen); }
               iMth := self.sn_next(iMth);
             }
           }

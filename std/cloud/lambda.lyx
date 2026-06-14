@@ -1,0 +1,367 @@
+// std/cloud/lambda.lyx — AWS Lambda Client
+// WP-AWS-10
+// REST-JSON protocol
+
+unit std.cloud.lambda;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.alloc;
+import std.io;
+
+pub type LambdaClient = struct {
+    creds:  AWSCreds;
+    region: int64;  // pchar
+    host:   int64;  // pchar alloc'd
+};
+
+pub type LambdaFunction = struct {
+    name:         int64;  // pchar
+    arn:          int64;  // pchar
+    runtime:      int64;  // pchar
+    handler:      int64;  // pchar
+    role:         int64;  // pchar
+    description:  int64;  // pchar
+    memoryMb:     int64;
+    timeoutSec:   int64;
+    codeSize:     int64;
+    lastModified: int64;  // pchar
+    state:        int64;  // pchar
+};
+
+pub fn LambdaFunctionFree(f: LambdaFunction) {
+    if (f.name         != 0) { free(f.name,         StrLen(f.name         as pchar)+1); }
+    if (f.arn          != 0) { free(f.arn,           StrLen(f.arn          as pchar)+1); }
+    if (f.runtime      != 0) { free(f.runtime,       StrLen(f.runtime      as pchar)+1); }
+    if (f.handler      != 0) { free(f.handler,       StrLen(f.handler      as pchar)+1); }
+    if (f.role         != 0) { free(f.role,          StrLen(f.role         as pchar)+1); }
+    if (f.description  != 0) { free(f.description,   StrLen(f.description  as pchar)+1); }
+    if (f.lastModified != 0) { free(f.lastModified,  StrLen(f.lastModified as pchar)+1); }
+    if (f.state        != 0) { free(f.state,         StrLen(f.state        as pchar)+1); }
+}
+
+fn lambdaAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn lambdaJsonEscape(s: pchar, buf: int64, off: int64): int64 {
+    if (s == 0 as pchar) { return off; }
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while (i < n) {
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if (c == 34) { poke8(buf+off,92); poke8(buf+off+1,34); off:=off+2; }
+        else if (c == 92) { poke8(buf+off,92); poke8(buf+off+1,92); off:=off+2; }
+        else if (c == 10) { poke8(buf+off,92); poke8(buf+off+1,110); off:=off+2; }
+        else { poke8(buf+off,c); off:=off+1; }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn lambdaSend(client: LambdaClient, method: pchar, path: pchar, query: pchar,
+              body: int64, bodyLen: int64): AWSResponse {
+    return AWSRestJSONRequest(client.creds, client.host as pchar,
+                              method, path, query, body, bodyLen,
+                              client.region as pchar, "lambda"c);
+}
+
+pub fn LambdaConnect(creds: AWSCreds, region: pchar): LambdaClient {
+    var c: LambdaClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("lambda"c, region) as int64;
+    return c;
+}
+
+pub fn LambdaClose(client: LambdaClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Functions ─────────────────────────────────────────────────────────────────
+
+pub fn LambdaListFunctions(client: LambdaClient): int64 {
+    var resp: AWSResponse := lambdaSend(client, "GET"c, "/2015-03-31/functions"c,
+                                        0 as pchar, 0, 0);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaGetFunction(client: LambdaClient, name: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    poke8(pathBuf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "GET"c, pathBuf as pchar,
+                                        0 as pchar, 0, 0);
+    free(pathBuf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaCreateFunction(client: LambdaClient,
+                             name: pchar, runtime: pchar, handler: pchar,
+                             roleArn: pchar, desc: pchar,
+                             zipBytes: int64, zipLen: int64,
+                             memoryMb: int64, timeoutSec: int64): int64 {
+    // zipBytes must be base64-encoded already; encode it here
+    // For simplicity, we accept pre-encoded base64 string pointer in zipBytes as pchar
+    var buf: int64 := alloc(4096 + zipLen); var off: int64 := 0;
+    off := lambdaAppend(buf, off, "{\"FunctionName\":\""c);
+    off := lambdaJsonEscape(name, buf, off);
+    off := lambdaAppend(buf, off, "\",\"Runtime\":\""c);
+    off := lambdaAppend(buf, off, runtime);
+    off := lambdaAppend(buf, off, "\",\"Handler\":\""c);
+    off := lambdaJsonEscape(handler, buf, off);
+    off := lambdaAppend(buf, off, "\",\"Role\":\""c);
+    off := lambdaJsonEscape(roleArn, buf, off);
+    off := lambdaAppend(buf, off, "\"");
+    if (desc != 0 as pchar && StrLen(desc) > 0) {
+        off := lambdaAppend(buf, off, ",\"Description\":\""c);
+        off := lambdaJsonEscape(desc, buf, off);
+        off := lambdaAppend(buf, off, "\""c);
+    }
+    off := lambdaAppend(buf, off, ",\"MemorySize\":"c);
+    var tmp: int64 := alloc(24); Int64ToStr(memoryMb, tmp as pchar);
+    off := lambdaAppend(buf, off, tmp as pchar);
+    off := lambdaAppend(buf, off, ",\"Timeout\":"c);
+    Int64ToStr(timeoutSec, tmp as pchar);
+    off := lambdaAppend(buf, off, tmp as pchar);
+    free(tmp, 24);
+    off := lambdaAppend(buf, off, ",\"Code\":{\"ZipFile\":\""c);
+    // zipBytes is pointer to base64 string
+    var zipStr: pchar := zipBytes as pchar;
+    var i: int64 := 0; var zl: int64 := StrLen(zipStr);
+    while(i<zl){poke8(buf+off+i,StrCharAt(zipStr,i)&0xFF);i:=i+1;} off:=off+zl;
+    off := lambdaAppend(buf, off, "\"}}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "POST"c, "/2015-03-31/functions"c,
+                                        0 as pchar, buf, off);
+    free(buf, 4096 + zipLen);
+    var result: int64 := 0;
+    if ((resp.statusCode == 200 || resp.statusCode == 201) && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaDeleteFunction(client: LambdaClient, name: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    poke8(pathBuf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "DELETE"c, pathBuf as pchar,
+                                        0 as pchar, 0, 0);
+    free(pathBuf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 204) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn LambdaInvoke(client: LambdaClient, name: pchar,
+                    payload: int64, payloadLen: int64,
+                    invocationType: pchar): int64 {
+    // invocationType: "RequestResponse" | "Event" | "DryRun"
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/invocations"c);
+    poke8(pathBuf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "POST"c, pathBuf as pchar,
+                                        0 as pchar, payload, payloadLen);
+    free(pathBuf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaInvokeAsync(client: LambdaClient, name: pchar,
+                          payload: int64, payloadLen: int64): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/invocations"c);
+    poke8(pathBuf+off, 0);
+    // Event invocation type — fire and forget
+    var resp: AWSResponse := lambdaSend(client, "POST"c, pathBuf as pchar,
+                                        0 as pchar, payload, payloadLen);
+    free(pathBuf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 202) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn LambdaUpdateFunctionCode(client: LambdaClient, name: pchar,
+                                 zipBase64: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/code"c);
+    poke8(pathBuf+off, 0);
+    var buf: int64 := alloc(64 + StrLen(zipBase64)); var boff: int64 := 0;
+    boff := lambdaAppend(buf, boff, "{\"ZipFile\":\""c);
+    var zl: int64 := StrLen(zipBase64);
+    var i: int64 := 0; while(i<zl){poke8(buf+boff+i,StrCharAt(zipBase64,i)&0xFF);i:=i+1;} boff:=boff+zl;
+    boff := lambdaAppend(buf, boff, "\"}"c);
+    poke8(buf+boff, 0);
+    var resp: AWSResponse := lambdaSend(client, "PUT"c, pathBuf as pchar,
+                                        0 as pchar, buf, boff);
+    free(pathBuf, 512);
+    free(buf, 64 + zl);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaUpdateFunctionConfig(client: LambdaClient, name: pchar,
+                                   memoryMb: int64, timeoutSec: int64, desc: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/configuration"c);
+    poke8(pathBuf+off, 0);
+    var buf: int64 := alloc(512); var boff: int64 := 0;
+    poke8(buf+boff, 123); boff:=boff+1;
+    var first: int64 := 1;
+    if (memoryMb > 0) {
+        boff := lambdaAppend(buf, boff, "\"MemorySize\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(memoryMb, tmp as pchar);
+        boff := lambdaAppend(buf, boff, tmp as pchar);
+        free(tmp, 24);
+        first := 0;
+    }
+    if (timeoutSec > 0) {
+        if (first == 0) { poke8(buf+boff,44); boff:=boff+1; }
+        boff := lambdaAppend(buf, boff, "\"Timeout\":"c);
+        var tmp2: int64 := alloc(24); Int64ToStr(timeoutSec, tmp2 as pchar);
+        boff := lambdaAppend(buf, boff, tmp2 as pchar);
+        free(tmp2, 24);
+        first := 0;
+    }
+    if (desc != 0 as pchar && StrLen(desc) > 0) {
+        if (first == 0) { poke8(buf+boff,44); boff:=boff+1; }
+        boff := lambdaAppend(buf, boff, "\"Description\":\""c);
+        boff := lambdaJsonEscape(desc, buf, boff);
+        poke8(buf+boff,34); boff:=boff+1;
+    }
+    poke8(buf+boff, 125); boff:=boff+1;
+    poke8(buf+boff, 0);
+    var resp: AWSResponse := lambdaSend(client, "PUT"c, pathBuf as pchar,
+                                        0 as pchar, buf, boff);
+    free(pathBuf, 512);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Aliases & Versions ────────────────────────────────────────────────────────
+
+pub fn LambdaPublishVersion(client: LambdaClient, name: pchar, desc: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/versions"c);
+    poke8(pathBuf+off, 0);
+    var buf: int64 := alloc(256); var boff: int64 := 0;
+    if (desc != 0 as pchar && StrLen(desc) > 0) {
+        boff := lambdaAppend(buf, boff, "{\"Description\":\""c);
+        boff := lambdaJsonEscape(desc, buf, boff);
+        boff := lambdaAppend(buf, boff, "\"}"c);
+    } else {
+        boff := lambdaAppend(buf, boff, "{}"c);
+    }
+    poke8(buf+boff, 0);
+    var resp: AWSResponse := lambdaSend(client, "POST"c, pathBuf as pchar,
+                                        0 as pchar, buf, boff);
+    free(pathBuf, 512);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 201 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaListVersions(client: LambdaClient, name: pchar): int64 {
+    var pathBuf: int64 := alloc(512); var off: int64 := 0;
+    off := lambdaAppend(pathBuf, off, "/2015-03-31/functions/"c);
+    off := lambdaAppend(pathBuf, off, name);
+    off := lambdaAppend(pathBuf, off, "/versions"c);
+    poke8(pathBuf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "GET"c, pathBuf as pchar,
+                                        0 as pchar, 0, 0);
+    free(pathBuf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Event Source Mappings ─────────────────────────────────────────────────────
+
+pub fn LambdaCreateEventSourceMapping(client: LambdaClient,
+                                       functionName: pchar, eventSourceArn: pchar,
+                                       batchSize: int64): int64 {
+    var buf: int64 := alloc(512); var boff: int64 := 0;
+    boff := lambdaAppend(buf, boff, "{\"FunctionName\":\""c);
+    boff := lambdaJsonEscape(functionName, buf, boff);
+    boff := lambdaAppend(buf, boff, "\",\"EventSourceArn\":\""c);
+    boff := lambdaJsonEscape(eventSourceArn, buf, boff);
+    boff := lambdaAppend(buf, boff, "\",\"BatchSize\":"c);
+    var tmp: int64 := alloc(24); Int64ToStr(batchSize, tmp as pchar);
+    boff := lambdaAppend(buf, boff, tmp as pchar);
+    free(tmp, 24);
+    boff := lambdaAppend(buf, boff, ",\"StartingPosition\":\"TRIM_HORIZON\"}"c);
+    poke8(buf+boff, 0);
+    var resp: AWSResponse := lambdaSend(client, "POST"c, "/2015-03-31/event-source-mappings"c,
+                                        0 as pchar, buf, boff);
+    free(buf, 512);
+    var result: int64 := 0;
+    if ((resp.statusCode == 200 || resp.statusCode == 202) && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn LambdaListEventSourceMappings(client: LambdaClient, functionName: pchar): int64 {
+    var queryBuf: int64 := alloc(256); var off: int64 := 0;
+    if (functionName != 0 as pchar && StrLen(functionName) > 0) {
+        off := lambdaAppend(queryBuf, off, "FunctionName="c);
+        off := lambdaAppend(queryBuf, off, functionName);
+    }
+    poke8(queryBuf+off, 0);
+    var resp: AWSResponse := lambdaSend(client, "GET"c, "/2015-03-31/event-source-mappings"c,
+                                        if(off>0){queryBuf as pchar}else{0 as pchar}, 0, 0);
+    free(queryBuf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}

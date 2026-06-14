@@ -1,0 +1,447 @@
+// std/tar.lyx — TAR-Archiv Lesen und Schreiben
+//
+// POSIX ustar Format (IEEE Std 1003.1-1988):
+//   Lesen : reguläre Dateien (typeflag '0' / 0), Verzeichnisse werden übersprungen
+//   Schreiben: reguläre Dateien, keine Komprimierung
+//
+// Header-Block: 512 Bytes; Datenblöcke auf 512-Byte-Grenzen aufgerundet
+// Namen bis 100 Bytes (kein split-header/GNU-LongLink)
+// Maximale Einträge: 4096
+
+unit std.tar;
+
+import std.alloc;
+import std.io;
+import std.string;
+import std.fs;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con TAR_BLOCK_SIZE:  int64 := 512;
+pub con TAR_MAX_ENTRIES: int64 := 4096;
+
+pub con TAR_ERR_OK:      int64 := 0;
+pub con TAR_ERR_NOTTAR:  int64 := 1;
+pub con TAR_ERR_IO:      int64 := 2;
+pub con TAR_ERR_CORRUPT: int64 := 3;
+pub con TAR_ERR_FULL:    int64 := 4;
+
+// ============================================================================
+// Struct-Offsets (Kommentare als Dokumentation)
+// ============================================================================
+// TarReader    (32 Bytes): rawData:0  rawLen:8  entries:16  entryCount:24
+// TarEntry     (32 Bytes): name:0  dataOff:8  dataLen:16  (pad):24
+// TarWriter    (16 Bytes): entries:0  entryCount:8
+// TarPendEntry (32 Bytes): name:0  dataPtr:8  dataLen:16  (pad):24
+
+// ============================================================================
+// POSIX ustar Header-Offsets
+// ============================================================================
+// [  0..  99] name       — Dateiname, null-terminiert
+// [100.. 107] mode       — Dateimodus, oktal ASCII ("0000644\0")
+// [108.. 115] uid        — User-ID, oktal ASCII
+// [116.. 123] gid        — Group-ID, oktal ASCII
+// [124.. 135] size       — Dateigröße in Bytes, oktal ASCII
+// [136.. 147] mtime      — Änderungszeit (Unix-Epoch), oktal ASCII
+// [148.. 155] checksum   — Header-Prüfsumme, oktal ASCII + Space
+// [156]       typeflag   — '0' = reguläre Datei, '5' = Verzeichnis
+// [157.. 256] linkname   — Linkziel (leer bei regulären Dateien)
+// [257.. 262] magic      — "ustar\0" (POSIX) oder "ustar  " (GNU)
+// [263.. 264] version    — "00"
+// [265.. 296] uname      — Benutzername
+// [297.. 328] gname      — Gruppenname
+// [329.. 336] devmajor   — Gerät Major-Nr, oktal ASCII
+// [337.. 344] devminor   — Gerät Minor-Nr, oktal ASCII
+// [345.. 499] prefix     — Pfad-Präfix für lange Namen
+// [500.. 511] padding
+
+// ============================================================================
+// Interne Hilfsfunktionen
+// ============================================================================
+
+// Oktal-ASCII-Feld lesen: buf[off..off+len-1] → int64
+fn tarReadOctal(buf: int64, off: int64, len: int64): int64 {
+    var result: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(buf + off + i);
+        if ((c == 0) | (c == 0x20)) { break; }
+        if ((c >= 0x30) & (c <= 0x37)) {
+            result := (result * 8) + (c - 0x30);
+        }
+        i := i + 1;
+    }
+    return result;
+}
+
+// Oktal-ASCII-Feld schreiben: val → buf[off..off+len-1] (null-terminiert)
+fn tarWriteOctal(buf: int64, off: int64, len: int64, val: int64): void {
+    var i: int64 := 0;
+    while (i < len) { poke8(buf + off + i, 0); i := i + 1; }
+    var pos: int64 := len - 2;
+    var v:   int64 := val;
+    while (pos >= 0) {
+        poke8(buf + off + pos, 0x30 + (v % 8));
+        v   := v / 8;
+        pos := pos - 1;
+    }
+}
+
+// Prüft ob ein 512-Byte-Block ausschließlich Null-Bytes enthält (End-of-Archive)
+fn tarIsZeroBlock(header: int64): int64 {
+    if (peek8(header) != 0) { return 0; }
+    var i:   int64 := 0;
+    var sum: int64 := 0;
+    while (i < 512) {
+        sum := sum | peek8(header + i);
+        i := i + 1;
+    }
+    if (sum == 0) { return 1; }
+    return 0;
+}
+
+// POSIX ustar Header-Checksum: Summe aller Bytes, Bytes 148–155 als 0x20
+fn tarChecksum(header: int64): int64 {
+    var sum: int64 := 0;
+    var i:   int64 := 0;
+    while (i < 512) {
+        if ((i >= 148) & (i < 156)) {
+            sum := sum + 32;
+        } else {
+            sum := sum + peek8(header + i);
+        }
+        i := i + 1;
+    }
+    return sum;
+}
+
+// Kopiert null-terminierten String, maxLen Zeichen + Null an Position maxLen
+fn tarCopyStr(dst: int64, src: int64, maxLen: int64): void {
+    var i: int64 := 0;
+    while (i < maxLen) {
+        var c: int64 := peek8(src + i);
+        poke8(dst + i, c);
+        if (c == 0) { break; }
+        i := i + 1;
+    }
+    poke8(dst + maxLen, 0);
+}
+
+// n Bytes von src nach dst kopieren
+fn tarCopy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// String duplizieren (heap-allokiert, null-terminiert)
+fn tarStrdup(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var len: int64 := StrLen(s);
+    var buf: int64 := alloc(len + 1);
+    tarCopy(buf, s, len);
+    poke8(buf + len, 0);
+    return buf;
+}
+
+// ============================================================================
+// TAR Reader — Lesen
+// ============================================================================
+
+// Öffnet ein TAR-Archiv aus einer Datei.
+// Gibt alloc'd Handle zurück oder 0 bei Fehler.
+// Aufrufer muss TarClose() aufrufen.
+pub fn TarOpen(path: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize < 512) { return 0; }
+
+    var raw: int64 := alloc(fsize + 1);
+    var n:   int64 := ReadFile(path, raw, fsize);
+    if (n < 512) { free(raw); return 0; }
+    poke8(raw + n, 0);
+
+    var handle:  int64 := alloc(32);
+    var entries: int64 := alloc(TAR_MAX_ENTRIES * 32);
+    poke64(handle,      raw);
+    poke64(handle + 8,  n);
+    poke64(handle + 16, entries);
+    poke64(handle + 24, 0);
+
+    var pos:       int64 := 0;
+    var count:     int64 := 0;
+    var zeroCount: int64 := 0;
+    var done:      int64 := 0;
+
+    while (((pos + 512) <= n) & (count < TAR_MAX_ENTRIES) & (done == 0)) {
+        var header: int64 := raw + pos;
+
+        if (tarIsZeroBlock(header) == 1) {
+            zeroCount := zeroCount + 1;
+            if (zeroCount >= 2) { done := 1; }
+            pos := pos + 512;
+        } else {
+            zeroCount := 0;
+
+            var typeflag: int64 := peek8(header + 156);
+            var fileSize: int64 := tarReadOctal(header, 124, 12);
+            var dataOff:  int64 := pos + 512;
+
+            var name: int64 := alloc(101);
+            tarCopyStr(name, header, 100);
+
+            if ((typeflag == 0x30) | (typeflag == 0)) {
+                if ((dataOff + fileSize) <= n) {
+                    var entry: int64 := entries + count * 32;
+                    poke64(entry,      name);
+                    poke64(entry + 8,  dataOff);
+                    poke64(entry + 16, fileSize);
+                    poke64(entry + 24, 0);
+                    count := count + 1;
+                } else {
+                    free(name);
+                }
+            } else {
+                free(name);
+            }
+
+            var dataBlocks: int64 := (fileSize + 511) / 512;
+            pos := pos + 512 + (dataBlocks * 512);
+        }
+    }
+
+    poke64(handle + 24, count);
+    return handle;
+}
+
+// Schließt ein TAR-Handle und gibt alle Ressourcen frei.
+pub fn TarClose(handle: int64): void {
+    if (handle == 0) { return; }
+    var entries: int64 := peek64(handle + 16);
+    var count:   int64 := peek64(handle + 24);
+    var i: int64 := 0;
+    while (i < count) {
+        var name: int64 := peek64(entries + i * 32);
+        if (name != 0) { free(name); }
+        i := i + 1;
+    }
+    free(entries);
+    free(peek64(handle));
+    free(handle);
+}
+
+// Gibt die Anzahl der Einträge zurück.
+pub fn TarCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 24);
+}
+
+// Gibt den Namen des i-ten Eintrags zurück (interner Puffer — nicht free'n).
+pub fn TarName(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 32);
+}
+
+// Gibt die Größe des i-ten Eintrags in Bytes zurück.
+pub fn TarSize(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 32 + 16);
+}
+
+// Liest den i-ten Eintrag in outBuf (mindestens TarSize Bytes Kapazität).
+// Gibt geschriebene Bytes zurück oder -1 bei Fehler.
+pub fn TarRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count: int64 := peek64(handle + 24);
+    if ((idx < 0) | (idx >= count)) { return 0 - 1; }
+
+    var entry:   int64 := peek64(handle + 16) + idx * 32;
+    var dataOff: int64 := peek64(entry + 8);
+    var dataLen: int64 := peek64(entry + 16);
+    var rawData: int64 := peek64(handle);
+    var rawLen:  int64 := peek64(handle + 8);
+
+    if ((dataOff + dataLen) > rawLen) { return 0 - 1; }
+    if (dataLen > maxLen) { return 0 - 1; }
+
+    tarCopy(outBuf, rawData + dataOff, dataLen);
+    return dataLen;
+}
+
+// Sucht Eintrag nach exaktem Namen. Gibt Index zurück oder -1.
+pub fn TarFind(handle: int64, name: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count:   int64 := peek64(handle + 24);
+    var entries: int64 := peek64(handle + 16);
+    var nlen:    int64 := StrLen(name);
+    var i: int64 := 0;
+    while (i < count) {
+        var ename: int64 := peek64(entries + i * 32);
+        if (ename != 0) {
+            var elen: int64 := StrLen(ename);
+            if (nlen == elen) {
+                var isMatch: int64 := 1;
+                var k: int64 := 0;
+                while (k < nlen) {
+                    if (peek8(ename + k) != peek8(name + k)) { isMatch := 0; }
+                    k := k + 1;
+                }
+                if (isMatch == 1) { return i; }
+            }
+        }
+        i := i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// TAR Writer — Schreiben
+// ============================================================================
+
+// Erstellt einen neuen TAR-Writer-Handle.
+pub fn TarWriterNew(): int64 {
+    var writer: int64 := alloc(16);
+    poke64(writer,     alloc(TAR_MAX_ENTRIES * 32));
+    poke64(writer + 8, 0);
+    return writer;
+}
+
+// Fügt einen Eintrag hinzu (Name und Daten werden kopiert).
+// Gibt TAR_ERR_OK oder TAR_ERR_FULL zurück.
+pub fn TarWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): int64 {
+    if (writer == 0) { return TAR_ERR_IO; }
+    var count: int64 := peek64(writer + 8);
+    if (count >= TAR_MAX_ENTRIES) { return TAR_ERR_FULL; }
+
+    var entries: int64 := peek64(writer);
+    var entry:   int64 := entries + count * 32;
+
+    var nameCopy: int64 := tarStrdup(name);
+    var dataCopy: int64 := alloc(dataLen + 1);
+    tarCopy(dataCopy, data, dataLen);
+    poke8(dataCopy + dataLen, 0);
+
+    poke64(entry,      nameCopy);
+    poke64(entry + 8,  dataCopy);
+    poke64(entry + 16, dataLen);
+    poke64(entry + 24, 0);
+
+    poke64(writer + 8, count + 1);
+    return TAR_ERR_OK;
+}
+
+// Schreibt das TAR-Archiv in eine Datei.
+// Gibt TAR_ERR_OK oder Fehlercode zurück.
+pub fn TarWriterSave(writer: int64, path: int64): int64 {
+    if (writer == 0) { return TAR_ERR_IO; }
+    var count:   int64 := peek64(writer + 8);
+    var entries: int64 := peek64(writer);
+
+    // Puffergröße: je Eintrag 1 Header-Block + aufgerundete Datenblöcke + 2 End-Blöcke
+    var totalBlocks: int64 := 2;
+    var i: int64 := 0;
+    while (i < count) {
+        var dlen: int64 := peek64(entries + i * 32 + 16);
+        totalBlocks := totalBlocks + 1 + ((dlen + 511) / 512);
+        i := i + 1;
+    }
+    var bufSize: int64 := totalBlocks * 512;
+    var buf: int64 := alloc(bufSize);
+    var pos: int64 := 0;
+
+    i := 0;
+    while (i < count) {
+        var entry:    int64 := entries + i * 32;
+        var ename:    int64 := peek64(entry);
+        var edata:    int64 := peek64(entry + 8);
+        var edatLen:  int64 := peek64(entry + 16);
+        var enameLen: int64 := StrLen(ename);
+
+        // Header-Block nullen
+        var header: int64 := buf + pos;
+        var j: int64 := 0;
+        while (j < 512) { poke8(header + j, 0); j := j + 1; }
+
+        // Name: max 100 Bytes
+        var nc: int64 := enameLen;
+        if (nc > 100) { nc := 100; }
+        j := 0;
+        while (j < nc) { poke8(header + j, peek8(ename + j)); j := j + 1; }
+
+        // mode = 0644 (= 420 dezimal)
+        tarWriteOctal(header, 100, 8, 420);
+        tarWriteOctal(header, 108, 8, 0);       // uid
+        tarWriteOctal(header, 116, 8, 0);       // gid
+        tarWriteOctal(header, 124, 12, edatLen); // size
+        tarWriteOctal(header, 136, 12, 0);      // mtime
+
+        // Checksum-Feld initial mit Spaces füllen
+        j := 148;
+        while (j < 156) { poke8(header + j, 0x20); j := j + 1; }
+
+        // typeflag '0' = reguläre Datei
+        poke8(header + 156, 0x30);
+
+        // magic "ustar"
+        poke8(header + 257, 0x75);  // u
+        poke8(header + 258, 0x73);  // s
+        poke8(header + 259, 0x74);  // t
+        poke8(header + 260, 0x61);  // a
+        poke8(header + 261, 0x72);  // r
+        poke8(header + 262, 0x00);
+
+        // version "00"
+        poke8(header + 263, 0x30);
+        poke8(header + 264, 0x30);
+
+        // Checksum berechnen und eintragen
+        var cksum: int64 := tarChecksum(header);
+        tarWriteOctal(header, 148, 7, cksum);
+        poke8(header + 155, 0x20);  // trailing space (GNU-Konvention)
+
+        pos := pos + 512;
+
+        // Dateidaten
+        tarCopy(buf + pos, edata, edatLen);
+        pos := pos + edatLen;
+
+        // Auf 512-Byte-Grenze auffüllen
+        var rem: int64 := edatLen % 512;
+        if (rem != 0) {
+            var pad: int64 := 512 - rem;
+            j := 0;
+            while (j < pad) { poke8(buf + pos + j, 0); j := j + 1; }
+            pos := pos + pad;
+        }
+
+        i := i + 1;
+    }
+
+    // Zwei Null-Blöcke (End-of-Archive gemäß POSIX)
+    var k: int64 := 0;
+    while (k < 1024) { poke8(buf + pos + k, 0); k := k + 1; }
+    pos := pos + 1024;
+
+    var rc: int64 := WriteFile(path, buf, pos);
+    free(buf);
+    if (rc <= 0) { return TAR_ERR_IO; }
+    return TAR_ERR_OK;
+}
+
+// Gibt den Writer und alle enthaltenen Einträge frei.
+pub fn TarWriterFree(writer: int64): void {
+    if (writer == 0) { return; }
+    var entries: int64 := peek64(writer);
+    var count:   int64 := peek64(writer + 8);
+    var i: int64 := 0;
+    while (i < count) {
+        var entry: int64 := entries + i * 32;
+        if (peek64(entry)     != 0) { free(peek64(entry)); }
+        if (peek64(entry + 8) != 0) { free(peek64(entry + 8)); }
+        i := i + 1;
+    }
+    free(entries);
+    free(writer);
+}

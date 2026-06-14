@@ -1,0 +1,325 @@
+// tests/s3_integration.lyx — S3 SDK Integration Test Suite
+// WP-S3-10
+
+unit tests.s3_integration;
+
+import std.cloud.aws.core;
+import std.cloud.s3;
+import std.io;
+import std.alloc;
+
+var testsPassed: int64 := 0;
+var testsFailed: int64 := 0;
+
+fn assert_(cond: int64, name: pchar) {
+    Print("  ["c);
+    if (cond == 1) { Print("PASS"c); testsPassed := testsPassed + 1; }
+    else           { Print("FAIL"c); testsFailed := testsFailed + 1; }
+    Print("] "c); PrintLn(name);
+}
+
+fn itoa(n: int64, buf: int64): pchar {
+    if (n == 0) { poke8(buf, 48); poke8(buf+1, 0); return buf as pchar; }
+    var tmp: int64 := alloc(24); var i: int64 := 0; var v: int64 := n;
+    while (v > 0) { poke8(tmp+i, 48+(v%10)); v:=v/10; i:=i+1; }
+    var j: int64 := 0;
+    while (j < i) { poke8(buf+j, peek8(tmp+(i-1-j))); j:=j+1; }
+    poke8(buf+i, 0); free(tmp, 24); return buf as pchar;
+}
+
+fn appendStr(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i, StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn strDup(s: pchar): int64 {
+    var n: int64 := StrLen(s); var buf: int64 := alloc(n+1); var i: int64 := 0;
+    while(i<n){poke8(buf+i, StrCharAt(s,i)&0xFF);i:=i+1;} poke8(buf+n,0); return buf;
+}
+
+fn strEq(a: pchar, b: pchar): int64 {
+    var i: int64 := 0;
+    while ((peek8(a as int64+i)&0xFF) != 0 && (peek8(b as int64+i)&0xFF) != 0) {
+        if ((peek8(a as int64+i)&0xFF) != (peek8(b as int64+i)&0xFF)) { return 0; }
+        i := i + 1;
+    }
+    if ((peek8(a as int64+i)&0xFF) != (peek8(b as int64+i)&0xFF)) { return 0; }
+    return 1;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+fn testBucketCreate(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testBucketCreate"c);
+    var ok: int64 := S3BucketCreate(client, bucket);
+    assert_(ok == 1, "bucket created"c);
+    var exists: int64 := S3BucketExists(client, bucket);
+    assert_(exists == 1, "bucket exists after create"c);
+    return ok;
+}
+
+fn testPutGetDelete(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testPutGetDelete"c);
+    var key: pchar := "test/hello.txt"c;
+    var data: pchar := "Hello S3 Integration!"c;
+    var dl: int64 := StrLen(data);
+
+    var putOk: int64 := S3PutObject(client, bucket, key, data as int64, dl, "text/plain"c);
+    assert_(putOk == 1, "PutObject"c);
+
+    var exists: int64 := S3ObjectExists(client, bucket, key);
+    assert_(exists == 1, "ObjectExists after put"c);
+
+    var body: int64 := S3GetObject(client, bucket, key);
+    assert_(body != 0, "GetObject returns body"c);
+    if (body != 0) {
+        assert_(strEq(body as pchar, data), "GetObject content matches"c);
+        free(body, StrLen(body as pchar)+1);
+    }
+
+    var size: int64 := S3GetObjectSize(client, bucket, key);
+    assert_(size == dl, "HeadObject size matches"c);
+
+    var delOk: int64 := S3DeleteObject(client, bucket, key);
+    assert_(delOk == 1, "DeleteObject"c);
+
+    var gone: int64 := S3ObjectExists(client, bucket, key);
+    assert_(gone == 0, "Object gone after delete"c);
+    return 1;
+}
+
+fn testRangeGet(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testRangeGet"c);
+    var key: pchar := "test/range.bin"c;
+    var data: pchar := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"c;
+    var dl: int64 := StrLen(data);
+    S3PutObject(client, bucket, key, data as int64, dl, "application/octet-stream"c);
+
+    var outLen: int64 := 0;
+    var chunk: int64 := S3GetObjectRange(client, bucket, key, 5, 5, &outLen);
+    assert_(chunk != 0, "GetObjectRange returns data"c);
+    if (chunk != 0) {
+        assert_(outLen == 5, "GetObjectRange length correct"c);
+        assert_((peek8(chunk)&0xFF) == 70, "GetObjectRange first byte is 'F'"c); // 'F' = 70
+        free(chunk, outLen+1);
+    }
+    S3DeleteObject(client, bucket, key);
+    return 1;
+}
+
+fn testCopyObject(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testCopyObject"c);
+    var srcKey: pchar := "test/src.txt"c;
+    var dstKey: pchar := "test/dst.txt"c;
+    var data: pchar := "copy-me"c;
+    S3PutObject(client, bucket, srcKey, data as int64, StrLen(data), "text/plain"c);
+
+    var ok: int64 := S3CopyObject(client, bucket, srcKey, bucket, dstKey);
+    assert_(ok == 1, "CopyObject"c);
+
+    var body: int64 := S3GetObject(client, bucket, dstKey);
+    assert_(body != 0, "copied object readable"c);
+    if (body != 0) {
+        assert_(strEq(body as pchar, data), "copied content matches"c);
+        free(body, StrLen(body as pchar)+1);
+    }
+    S3DeleteObject(client, bucket, srcKey);
+    S3DeleteObject(client, bucket, dstKey);
+    return 1;
+}
+
+fn testListObjects(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testListObjects"c);
+    var i: int64 := 0; var data: pchar := "x"c;
+    var keyBuf: int64 := alloc(64);
+    while (i < 5) {
+        var off: int64 := appendStr(keyBuf, 0, "list/"c);
+        var nbuf: int64 := alloc(8); itoa(i, nbuf);
+        off := appendStr(keyBuf, off, nbuf as pchar); free(nbuf, 8);
+        poke8(keyBuf+off, 0);
+        S3PutObject(client, bucket, keyBuf as pchar, data as int64, 1, "text/plain"c);
+        i := i + 1;
+    }
+    free(keyBuf, 64);
+
+    var lst: int64 := S3ListObjects(client, bucket, "list/"c, 100);
+    assert_(lst != 0, "ListObjects returns list"c);
+    if (lst != 0) {
+        assert_(S3ListCount(lst) == 5, "ListObjects count == 5"c);
+        S3ListFree(lst);
+    }
+
+    var allLst: int64 := S3ListAll(client, bucket, "list/"c);
+    if (allLst != 0) {
+        assert_(S3ListCount(allLst) == 5, "ListAll count == 5"c);
+        S3ListFree(allLst);
+    }
+
+    // Cleanup
+    var keyPtrs: int64 := alloc(5*8); i:=0;
+    var keyBuf2: int64 := alloc(64);
+    while (i < 5) {
+        var off2: int64 := appendStr(keyBuf2, 0, "list/"c);
+        var nbuf3: int64 := alloc(8); itoa(i, nbuf3);
+        off2 := appendStr(keyBuf2, off2, nbuf3 as pchar); free(nbuf3, 8);
+        poke8(keyBuf2+off2, 0);
+        poke64(keyPtrs+i*8, strDup(keyBuf2 as pchar));
+        i := i + 1;
+    }
+    free(keyBuf2, 64);
+    S3DeleteObjects(client, bucket, keyPtrs, 5);
+    i:=0; while(i<5){var k:int64:=peek64(keyPtrs+i*8);free(k,StrLen(k as pchar)+1);i:=i+1;}
+    free(keyPtrs, 40);
+    return 1;
+}
+
+fn testListWithDelimiter(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testListWithDelimiter"c);
+    S3PutObject(client, bucket, "d/a/1.txt"c, "x"c as int64, 1, "text/plain"c);
+    S3PutObject(client, bucket, "d/b/2.txt"c, "x"c as int64, 1, "text/plain"c);
+    S3PutObject(client, bucket, "d/c/3.txt"c, "x"c as int64, 1, "text/plain"c);
+
+    var lst: int64 := S3ListWithDelimiter(client, bucket, "d/"c, "/"c);
+    assert_(lst != 0, "ListWithDelimiter returns list"c);
+    if (lst != 0) {
+        assert_(S3ListPrefixCount(lst) == 3, "3 common prefixes"c);
+        S3ListFree(lst);
+    }
+    S3DeleteObject(client, bucket, "d/a/1.txt"c);
+    S3DeleteObject(client, bucket, "d/b/2.txt"c);
+    S3DeleteObject(client, bucket, "d/c/3.txt"c);
+    return 1;
+}
+
+fn testDeleteObjects(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testDeleteObjects"c);
+    var i: int64 := 0; var data: pchar := "x"c;
+    var keyBuf: int64 := alloc(64);
+    var keyPtrs: int64 := alloc(10*8);
+    while (i < 10) {
+        var off: int64 := appendStr(keyBuf, 0, "bulk/"c);
+        var nbuf: int64 := alloc(8); itoa(i, nbuf);
+        off := appendStr(keyBuf, off, nbuf as pchar); free(nbuf, 8);
+        poke8(keyBuf+off, 0);
+        poke64(keyPtrs+i*8, strDup(keyBuf as pchar));
+        S3PutObject(client, bucket, keyBuf as pchar, data as int64, 1, "text/plain"c);
+        i := i + 1;
+    }
+    free(keyBuf, 64);
+    var ok: int64 := S3DeleteObjects(client, bucket, keyPtrs, 10);
+    assert_(ok == 1, "DeleteObjects batch"c);
+    i:=0; while(i<10){var k:int64:=peek64(keyPtrs+i*8);free(k,StrLen(k as pchar)+1);i:=i+1;}
+    free(keyPtrs, 80);
+    return 1;
+}
+
+fn testMultipartUpload(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testMultipartUpload"c);
+    var key: pchar := "multi/large.bin"c;
+    var dataSize: int64 := 12 * 1024 * 1024; // 12 MB → 2 × 6 MB parts
+    var data: int64 := alloc(dataSize);
+    var i: int64 := 0;
+    while (i < dataSize) { poke8(data+i, i&0xFF); i:=i+1; }
+
+    var uploadId: int64 := S3MultipartBegin(client, bucket, key, "application/octet-stream"c);
+    assert_(uploadId != 0, "MultipartBegin"c);
+    if (uploadId == 0) { free(data, dataSize); return 0; }
+
+    var etags: int64 := alloc(16); // 2 parts
+    var partSize: int64 := 6 * 1024 * 1024;
+    var e1: int64 := S3MultipartUploadPart(client, bucket, key,
+        uploadId as pchar, 1, data, partSize);
+    var e2: int64 := S3MultipartUploadPart(client, bucket, key,
+        uploadId as pchar, 2, data+partSize, dataSize-partSize);
+    assert_(e1 != 0, "UploadPart 1"c);
+    assert_(e2 != 0, "UploadPart 2"c);
+    poke64(etags,   e1);
+    poke64(etags+8, e2);
+
+    var ok: int64 := S3MultipartComplete(client, bucket, key,
+        uploadId as pchar, etags, 2);
+    assert_(ok == 1, "MultipartComplete"c);
+
+    var sz: int64 := S3GetObjectSize(client, bucket, key);
+    assert_(sz == dataSize, "uploaded size matches"c);
+
+    if (e1 != 0) { free(e1, StrLen(e1 as pchar)+1); }
+    if (e2 != 0) { free(e2, StrLen(e2 as pchar)+1); }
+    free(etags, 16);
+    free(uploadId, StrLen(uploadId as pchar)+1);
+    free(data, dataSize);
+    S3DeleteObject(client, bucket, key);
+    return 1;
+}
+
+fn testPresignedURLs(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testPresignedURLs"c);
+    var key: pchar := "presign/test.txt"c;
+
+    var getUrl: int64 := S3PresignGet(client, bucket, key, 3600);
+    assert_(getUrl != 0, "PresignGet"c);
+    if (getUrl != 0) { free(getUrl, StrLen(getUrl as pchar)+1); }
+
+    var putUrl: int64 := S3PresignPut(client, bucket, key, 900);
+    assert_(putUrl != 0, "PresignPut"c);
+    if (putUrl != 0) { free(putUrl, StrLen(putUrl as pchar)+1); }
+
+    var delUrl: int64 := S3PresignDelete(client, bucket, key, 300);
+    assert_(delUrl != 0, "PresignDelete"c);
+    if (delUrl != 0) { free(delUrl, StrLen(delUrl as pchar)+1); }
+
+    var headUrl: int64 := S3PresignHead(client, bucket, key, 3600);
+    assert_(headUrl != 0, "PresignHead"c);
+    if (headUrl != 0) { free(headUrl, StrLen(headUrl as pchar)+1); }
+
+    return 1;
+}
+
+fn testBucketDelete(client: S3Client, bucket: pchar): int64 {
+    PrintLn("testBucketDelete"c);
+    var ok: int64 := S3BucketDelete(client, bucket);
+    assert_(ok == 1, "bucket deleted"c);
+    var exists: int64 := S3BucketExists(client, bucket);
+    assert_(exists == 0, "bucket gone after delete"c);
+    return ok;
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+pub fn main(argc: int64, argv: int64): int64 {
+    var creds: AWSCreds := AWSCredentialsFromEnv();
+    if (creds.accessKey == 0) {
+        PrintLn("Error: set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_REGION)"c);
+        return 1;
+    }
+    var region: pchar := AWSRegionFromEnv("us-east-1"c);
+    var client: S3Client := S3Connect(creds, region);
+
+    var bucket: pchar := "lyx-s3-integration-test"c;
+
+    PrintLn("=== S3 SDK Integration Tests ==="c);
+    PrintLn(""c);
+
+    testBucketCreate(client, bucket);
+    testPutGetDelete(client, bucket);
+    testRangeGet(client, bucket);
+    testCopyObject(client, bucket);
+    testListObjects(client, bucket);
+    testListWithDelimiter(client, bucket);
+    testDeleteObjects(client, bucket);
+    testMultipartUpload(client, bucket);
+    testPresignedURLs(client, bucket);
+    testBucketDelete(client, bucket);
+
+    PrintLn(""c);
+    PrintLn("=== Results ==="c);
+    Print("Passed: "c);
+    var pbuf: int64 := alloc(16); itoa(testsPassed, pbuf); PrintLn(pbuf as pchar); free(pbuf, 16);
+    Print("Failed: "c);
+    var fbuf: int64 := alloc(16); itoa(testsFailed, fbuf); PrintLn(fbuf as pchar); free(fbuf, 16);
+
+    S3Close(client);
+    if (testsFailed == 0) { PrintLn("ALL TESTS PASSED"c); return 0; }
+    PrintLn("SOME TESTS FAILED"c); return 1;
+}

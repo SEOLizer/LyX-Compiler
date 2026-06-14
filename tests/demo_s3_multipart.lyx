@@ -1,0 +1,91 @@
+// tests/demo_s3_multipart.lyx — S3 Demo: 50 MB multipart upload + byte compare
+// WP-S3-10
+
+unit tests.demo_s3_multipart;
+
+import std.cloud.aws.core;
+import std.cloud.s3;
+import std.io;
+import std.alloc;
+
+fn itoa(n: int64, buf: int64): pchar {
+    if (n == 0) { poke8(buf, 48); poke8(buf+1, 0); return buf as pchar; }
+    var tmp: int64 := alloc(24); var i: int64 := 0; var v: int64 := n;
+    while (v > 0) { poke8(tmp+i, 48+(v%10)); v:=v/10; i:=i+1; }
+    var j: int64 := 0;
+    while (j < i) { poke8(buf+j, peek8(tmp+(i-1-j))); j:=j+1; }
+    poke8(buf+i, 0); free(tmp, 24); return buf as pchar;
+}
+
+pub fn main(argc: int64, argv: int64): int64 {
+    PrintLn("=== S3 Demo: Multipart Upload (50 MB) ==="c);
+
+    var creds: AWSCreds := AWSCredentialsFromEnv();
+    if (creds.accessKey == 0) {
+        PrintLn("Error: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY"c); return 1;
+    }
+    var region: pchar := AWSRegionFromEnv("us-east-1"c);
+    var client: S3Client := S3Connect(creds, region);
+
+    var bucket: pchar := "lyx-multipart-demo"c;
+    var key:    pchar := "large-file.bin"c;
+    var dataSize: int64 := 50 * 1024 * 1024; // 50 MB
+
+    S3BucketCreate(client, bucket);
+
+    // Generate deterministic test data
+    PrintLn("Generating 50 MB test data..."c);
+    var data: int64 := alloc(dataSize);
+    var i: int64 := 0;
+    while (i < dataSize) {
+        poke8(data+i, i & 0xFF);
+        i := i + 1;
+    }
+
+    // Upload via multipart (16 MB chunks → 4 parts)
+    Print("Uploading via S3PutObjectMultipart (16 MB parts)..."c);
+    var partSize: int64 := 16 * 1024 * 1024;
+    var ok: int64 := S3PutObjectMultipart(client, bucket, key, data, dataSize,
+        "application/octet-stream"c, partSize);
+    if (ok == 1) { PrintLn(" OK"c); } else { PrintLn(" FAILED"c); return 1; }
+
+    // Verify size
+    var sz: int64 := S3GetObjectSize(client, bucket, key);
+    Print("Server-reported size: "c);
+    var sbuf: int64 := alloc(24); itoa(sz, sbuf); PrintLn(sbuf as pchar); free(sbuf, 24);
+
+    // Download and compare
+    PrintLn("Downloading for byte comparison..."c);
+    var outLen: int64 := 0;
+    var downloaded: int64 := S3GetObjectRange(client, bucket, key, 0, dataSize, &outLen);
+    if (downloaded == 0) {
+        // Fallback: full get
+        downloaded := S3GetObject(client, bucket, key);
+    }
+    if (downloaded != 0) {
+        var mismatches: int64 := 0;
+        var j: int64 := 0;
+        while (j < dataSize) {
+            if ((peek8(downloaded+j)&0xFF) != (peek8(data+j)&0xFF)) {
+                mismatches := mismatches + 1;
+            }
+            j := j + 1;
+        }
+        Print("Byte mismatches: "c);
+        var mbuf: int64 := alloc(24); itoa(mismatches, mbuf); PrintLn(mbuf as pchar); free(mbuf, 24);
+        if (mismatches == 0) { PrintLn("Round-trip PASSED"c); }
+        else { PrintLn("Round-trip FAILED (data corruption!)"c); }
+        free(downloaded, dataSize+1);
+    } else {
+        PrintLn("Download failed"c);
+    }
+
+    // Cleanup
+    free(data, dataSize);
+    S3DeleteObject(client, bucket, key);
+    S3BucketDelete(client, bucket);
+
+    S3Close(client);
+    PrintLn("Done."c);
+    return 0;
+}

@@ -1,0 +1,321 @@
+// tests/grp07_query_test.lyx
+// WP-GRP-07 Abnahmetest: GraphQueryCtx + alle Query-Funktionen
+
+unit tests.grp07_query_test;
+
+import std.graphdb.core;
+import std.graphdb.node;
+import std.graphdb.edge;
+import std.graphdb.mem;
+import std.graphdb.index;
+import std.graphdb.query;
+import std.io;
+import std.alloc;
+
+fn makeNode(id: int64): int64 {
+    var n: int64 := alloc(GNODE_SIZE);
+    GraphNodeInit(n);
+    poke64(n + GNODE_OFF_ID, id);
+    return n;
+}
+
+fn makeEdgeAt(id: int64, src: int64, tgt: int64, ts: int64): int64 {
+    var e: int64 := alloc(GEDGE_SIZE);
+    GraphEdgeInit(e);
+    poke64(e + GEDGE_OFF_ID,        id);
+    poke64(e + GEDGE_OFF_SOURCE,    src);
+    poke64(e + GEDGE_OFF_TARGET,    tgt);
+    poke64(e + GEDGE_OFF_CREATEDAT, ts);
+    return e;
+}
+
+fn countInBuf(buf: int64, cnt: int64, id: int64): int64 {
+    var i: int64 := 0;
+    var n: int64 := 0;
+    while (i < cnt) {
+        if (peek64(buf + i * 8) == id) { n := n + 1; }
+        i := i + 1;
+    }
+    return n;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // ── Store + Graph aufbauen ────────────────────────────────
+    // Nodes: A, B, C, D; A+B haben Vektoren
+    // Edges: A→B t=1000 KNOWS, A→C t=2000 KNOWS, A→D t=3000 LIKES, B→C t=4000 KNOWS
+    var s: int64    := alloc(GMEM_SIZE);
+    GraphMemStoreInit(s);
+
+    var idA: int64  := GraphIDNew();
+    var idB: int64  := GraphIDNew();
+    var idC: int64  := GraphIDNew();
+    var idD: int64  := GraphIDNew();
+    var nA: int64   := makeNode(idA);
+    var nB: int64   := makeNode(idB);
+    var nC: int64   := makeNode(idC);
+    var nD: int64   := makeNode(idD);
+
+    var vbuf: int64 := alloc(2 * 8);
+    poke64(vbuf,     1);
+    poke64(vbuf + 8, 0);
+    GraphNodeSetVec(nA, 2, vbuf);
+    poke64(vbuf,     0);
+    poke64(vbuf + 8, 1);
+    GraphNodeSetVec(nB, 2, vbuf);
+    free(vbuf, 2 * 8);
+
+    GraphMemStoreAddNode(s, nA);
+    GraphMemStoreAddNode(s, nB);
+    GraphMemStoreAddNode(s, nC);
+    GraphMemStoreAddNode(s, nD);
+
+    var idE1: int64 := GraphIDNew();
+    var idE2: int64 := GraphIDNew();
+    var idE3: int64 := GraphIDNew();
+    var idE4: int64 := GraphIDNew();
+    var eAB: int64  := makeEdgeAt(idE1, idA, idB, 1000);
+    var eAC: int64  := makeEdgeAt(idE2, idA, idC, 2000);
+    var eAD: int64  := makeEdgeAt(idE3, idA, idD, 3000);
+    var eBC: int64  := makeEdgeAt(idE4, idB, idC, 4000);
+    GraphEdgeSetType(eAB, "KNOWS"c, 5);
+    GraphEdgeSetType(eAC, "KNOWS"c, 5);
+    GraphEdgeSetType(eAD, "LIKES"c, 5);
+    GraphEdgeSetType(eBC, "KNOWS"c, 5);
+    GraphMemStoreAddEdge(s, eAB);
+    GraphMemStoreAddEdge(s, eAC);
+    GraphMemStoreAddEdge(s, eAD);
+    GraphMemStoreAddEdge(s, eBC);
+
+    // ── Indizes aufbauen ─────────────────────────────────────
+    var tidx: int64  := alloc(GTIDX_SIZE);
+    GraphTemporalIndexInit(tidx);
+    GraphTemporalIndexBuild(tidx, s);
+
+    var xidx: int64  := alloc(GXIDX_SIZE);
+    GraphTypeIndexInit(xidx);
+    GraphTypeIndexBuild(xidx, s);
+
+    var vidx: int64  := alloc(GVIDX_SIZE);
+    GraphVectorIndexInit(vidx, 2);
+    GraphVectorIndexBuild(vidx, s);
+
+    // ── QueryCtx ─────────────────────────────────────────────
+    var ctx: int64   := alloc(GQCTX_SIZE);
+    GraphQueryCtxInit(ctx, s);
+    GraphQueryCtxSetTemporalIdx(ctx, tidx);
+    GraphQueryCtxSetTypeIdx(ctx, xidx);
+    GraphQueryCtxSetVectorIdx(ctx, vidx);
+
+    var outBuf: int64 := alloc(20 * 8);
+    var cnt: int64    := 0;
+    var cnt2: int64   := 0;
+    var ep: int64     := 0;
+    var pat: int64    := alloc(GQPAT_SIZE);
+    var qvec: int64   := alloc(2 * 8);
+    var ctx2: int64   := alloc(GQCTX_SIZE);
+    var i: int64      := 0;
+    var allValid: int64 := 0;
+    var allKnows: int64 := 0;
+
+    // ── WP-GRP-07-01: kein Temporal-Index → 0 ────────────────
+    GraphQueryCtxInit(ctx2, s);
+    cnt := GraphQueryEdgesInWindow(ctx2, 1000, 4000, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: EdgesInWindow no tidx should=0"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow no tidx=0"c); }
+
+    // ── WP-GRP-07-02: maxOut=0 → 0 ───────────────────────────
+    cnt := GraphQueryEdgesInWindow(ctx, 1000, 4000, outBuf, 0);
+    if (cnt != 0) {
+        PrintLn("FAIL: EdgesInWindow maxOut=0 should=0"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow maxOut=0=0"c); }
+
+    // ── WP-GRP-07-03: Temporal [1000,2000] → 2 Edges ─────────
+    cnt := GraphQueryEdgesInWindow(ctx, 1000, 2000, outBuf, 20);
+    if (cnt != 2) {
+        PrintLn("FAIL: EdgesInWindow [1000,2000] count != 2"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow [1000,2000] count=2"c); }
+    allValid := 1;
+    i := 0;
+    while (i < cnt) {
+        ep := GraphMemStoreGetEdge(s, peek64(outBuf + i * 8));
+        if (ep == 0) { allValid := 0; }
+        i := i + 1;
+    }
+    if (allValid != 1) {
+        PrintLn("FAIL: EdgesInWindow returned invalid edge IDs"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow edge IDs valid"c); }
+
+    // ── WP-GRP-07-04: Temporal [3000,4000] → 2 Edges ─────────
+    cnt := GraphQueryEdgesInWindow(ctx, 3000, 4000, outBuf, 20);
+    if (cnt != 2) {
+        PrintLn("FAIL: EdgesInWindow [3000,4000] count != 2"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow [3000,4000] count=2"c); }
+
+    // Temporal [9999,99999] → 0
+    cnt := GraphQueryEdgesInWindow(ctx, 9999, 99999, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: EdgesInWindow out-of-range should=0"c); ok := 0;
+    } else { PrintLn("PASS: EdgesInWindow out-of-range=0"c); }
+
+    // ── WP-GRP-07-05: kein TypeIndex → 0 ─────────────────────
+    cnt := GraphQueryEdgesByType(ctx2, "KNOWS"c, 5, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: EdgesByType no typeidx should=0"c); ok := 0;
+    } else { PrintLn("PASS: EdgesByType no typeidx=0"c); }
+
+    // ── WP-GRP-07-06: TypeQuery "KNOWS" → 3 Edges ────────────
+    GraphQueryCtxSetTypeIdx(ctx2, xidx);
+    cnt := GraphQueryEdgesByType(ctx2, "KNOWS"c, 5, outBuf, 20);
+    if (cnt != 3) {
+        PrintLn("FAIL: EdgesByType KNOWS count != 3"c); ok := 0;
+    } else { PrintLn("PASS: EdgesByType KNOWS count=3"c); }
+    allKnows := 1;
+    i := 0;
+    while (i < cnt) {
+        ep := GraphMemStoreGetEdge(s, peek64(outBuf + i * 8));
+        if (ep == 0) { allKnows := 0; }
+        if (ep != 0) {
+            if (GraphEdgeTypeEq(ep, "KNOWS"c, 5) != 1) { allKnows := 0; }
+        }
+        i := i + 1;
+    }
+    if (allKnows != 1) {
+        PrintLn("FAIL: EdgesByType KNOWS: not all KNOWS edges"c); ok := 0;
+    } else { PrintLn("PASS: EdgesByType KNOWS all correct type"c); }
+
+    // "LIKES" → 1 Edge
+    cnt := GraphQueryEdgesByType(ctx2, "LIKES"c, 5, outBuf, 20);
+    if (cnt != 1) {
+        PrintLn("FAIL: EdgesByType LIKES count != 1"c); ok := 0;
+    } else { PrintLn("PASS: EdgesByType LIKES count=1"c); }
+
+    // Unknown → 0
+    cnt := GraphQueryEdgesByType(ctx2, "UNKNOWN"c, 7, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: EdgesByType UNKNOWN should=0"c); ok := 0;
+    } else { PrintLn("PASS: EdgesByType UNKNOWN=0"c); }
+
+    // ── WP-GRP-07-07: GraphQueryPattern A→KNOWS (kein Filter) ─
+    GraphQueryPatternInit(pat, idA, "KNOWS"c, 5);
+    cnt := GraphQueryPattern(ctx, pat, outBuf, 20);
+    if (cnt != 2) {
+        PrintLn("FAIL: Pattern A-KNOWS count != 2"c); ok := 0;
+    } else { PrintLn("PASS: Pattern A-KNOWS count=2"c); }
+    // B und C müssen in Ergebnis sein
+    if (countInBuf(outBuf, cnt, idB) != 1) {
+        PrintLn("FAIL: Pattern A-KNOWS missing B"c); ok := 0;
+    } else { PrintLn("PASS: Pattern A-KNOWS has B"c); }
+    if (countInBuf(outBuf, cnt, idC) != 1) {
+        PrintLn("FAIL: Pattern A-KNOWS missing C"c); ok := 0;
+    } else { PrintLn("PASS: Pattern A-KNOWS has C"c); }
+
+    // ── WP-GRP-07-08: Pattern mit tsFrom-Filter ──────────────
+    // A→B t=1000 KNOWS, A→C t=2000 KNOWS; tsFrom=1500 → nur C (t=2000>=1500)
+    GraphQueryPatternInit(pat, idA, "KNOWS"c, 5);
+    GraphQueryPatternSetTs(pat, 1500);
+    cnt := GraphQueryPattern(ctx, pat, outBuf, 20);
+    if (cnt != 1) {
+        PrintLn("FAIL: Pattern A-KNOWS tsFrom=1500 count != 1"c); ok := 0;
+    } else { PrintLn("PASS: Pattern A-KNOWS tsFrom=1500 count=1"c); }
+    if (cnt >= 1) {
+        if (peek64(outBuf) != idC) {
+            PrintLn("FAIL: Pattern tsFrom=1500 result[0] != C"c); ok := 0;
+        } else { PrintLn("PASS: Pattern tsFrom=1500 result=C"c); }
+    }
+
+    // ── WP-GRP-07-09: Pattern tsFrom future → 0 ─────────────
+    GraphQueryPatternInit(pat, idA, "KNOWS"c, 5);
+    GraphQueryPatternSetTs(pat, 9999999999999);
+    cnt := GraphQueryPattern(ctx, pat, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: Pattern future tsFrom should=0"c); ok := 0;
+    } else { PrintLn("PASS: Pattern future tsFrom=0"c); }
+
+    // ── WP-GRP-07-10: Pattern unbekannter Typ → 0 ────────────
+    GraphQueryPatternInit(pat, idA, "UNKNOWN"c, 7);
+    cnt := GraphQueryPattern(ctx, pat, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: Pattern UNKNOWN type should=0"c); ok := 0;
+    } else { PrintLn("PASS: Pattern UNKNOWN type=0"c); }
+
+    // ── WP-GRP-07-11: Pattern maxOut=0 → 0 ───────────────────
+    GraphQueryPatternInit(pat, idA, "KNOWS"c, 5);
+    cnt := GraphQueryPattern(ctx, pat, outBuf, 0);
+    if (cnt != 0) {
+        PrintLn("FAIL: Pattern maxOut=0 should=0"c); ok := 0;
+    } else { PrintLn("PASS: Pattern maxOut=0=0"c); }
+
+    // ── WP-GRP-07-12: AI kein vidx → 0 ──────────────────────
+    poke64(qvec,     1);
+    poke64(qvec + 8, 0);
+    GraphQueryCtxInit(ctx2, s);
+    cnt := GraphGetContextForAI(ctx2, qvec, 2, 0, outBuf, 20);
+    if (cnt != 0) {
+        PrintLn("FAIL: GetContextForAI no vidx should=0"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI no vidx=0"c); }
+
+    // ── WP-GRP-07-13: AI depth=0 topK=1 → 1 Seed ────────────
+    cnt := GraphGetContextForAI(ctx, qvec, 1, 0, outBuf, 20);
+    if (cnt != 1) {
+        PrintLn("FAIL: GetContextForAI depth=0 count != 1"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI depth=0 count=1"c); }
+    if (cnt >= 1) {
+        if (peek64(outBuf) != idA) {
+            PrintLn("FAIL: GetContextForAI depth=0 seed != A"c); ok := 0;
+        } else { PrintLn("PASS: GetContextForAI depth=0 seed=A"c); }
+    }
+
+    // ── WP-GRP-07-14: AI depth=0 topK=2 → 2 Seeds ───────────
+    cnt := GraphGetContextForAI(ctx, qvec, 2, 0, outBuf, 20);
+    if (cnt != 2) {
+        PrintLn("FAIL: GetContextForAI depth=0 topK=2 count != 2"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI depth=0 topK=2 count=2"c); }
+
+    // ── WP-GRP-07-15: AI depth=1 topK=1 → Seed + Nachbarn ───
+    // Seeds = {A}; A's Nachbarn = {B, C, D} → gesamt 4
+    cnt := GraphGetContextForAI(ctx, qvec, 1, 1, outBuf, 20);
+    if (cnt != 4) {
+        PrintLn("FAIL: GetContextForAI depth=1 count != 4"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI depth=1 count=4"c); }
+
+    // ── WP-GRP-07-16: AI keine Duplikate ─────────────────────
+    // depth=2 von A: A→{B,C,D}, dann B→{C} (C schon da), C+D→{} → 4 ohne Duplikate
+    cnt := GraphGetContextForAI(ctx, qvec, 1, 2, outBuf, 20);
+    if (cnt != 4) {
+        PrintLn("FAIL: GetContextForAI depth=2 count != 4"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI depth=2 count=4"c); }
+    if (countInBuf(outBuf, cnt, idC) != 1) {
+        PrintLn("FAIL: GetContextForAI C appears more than once"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI no duplicate C"c); }
+
+    // ── WP-GRP-07-17: AI maxOut=0 → 0 ───────────────────────
+    cnt := GraphGetContextForAI(ctx, qvec, 2, 1, outBuf, 0);
+    if (cnt != 0) {
+        PrintLn("FAIL: GetContextForAI maxOut=0 should=0"c); ok := 0;
+    } else { PrintLn("PASS: GetContextForAI maxOut=0=0"c); }
+
+    // ── Cleanup ───────────────────────────────────────────────
+    free(qvec, 2 * 8);
+    free(pat, GQPAT_SIZE);
+    free(outBuf, 20 * 8);
+    free(ctx, GQCTX_SIZE);
+    free(ctx2, GQCTX_SIZE);
+    GraphVectorIndexFree(vidx);
+    free(vidx, GVIDX_SIZE);
+    GraphTypeIndexFree(xidx);
+    free(xidx, GXIDX_SIZE);
+    GraphTemporalIndexFree(tidx);
+    free(tidx, GTIDX_SIZE);
+    GraphMemStoreFree(s);
+    free(s, GMEM_SIZE);
+
+    if (ok != 0) {
+        PrintLn("=== WP-GRP-07: ALL PASS ==="c);
+    } else {
+        PrintLn("=== WP-GRP-07: FAILURES ==="c);
+    }
+    return ok;
+}

@@ -446,6 +446,11 @@ pub type Codegen = class {
   vmtMethodPatchCount:  int64;
   vmtMethodPatchCap:    int64;
 
+  // f64-returning user-defined functions: {namePtr:8, nameLen:8} = 16 bytes per entry
+  f64FuncList:  int64;
+  f64FuncCount: int64;
+  f64FuncCap:   int64;
+
   // WP-BC-24: deferred generic monomorphization list
   // Entry: {mangledNamePtr:8, mangledNameLen:8, genericFuncNode:8} = 24 bytes
   monoList:  int64;
@@ -471,6 +476,8 @@ pub type Codegen = class {
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
   // WP-3.1: byte buffer parallel to locals, 1 = @redundant var (TMR triple storage)
   localIsRedundant:  int64;
+  // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
+  localIsSimd:       int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -711,6 +718,10 @@ pub type Codegen = class {
       i := 0;
       memcpy(rb, self.localIsRedundant, self.localCount);
       self.localIsRedundant := rb;
+      var simdb: int64 := alloc(nc);
+      i := 0;
+      memcpy(simdb, self.localIsSimd, self.localCount);
+      self.localIsSimd := simdb;
       self.localCap := nc;
     }
     self.frameSize := self.frameSize + 8;
@@ -725,6 +736,7 @@ pub type Codegen = class {
     poke8(self.localIsArray      + self.localCount, 0);
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
+    poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
     self.localCount := self.localCount + 1;
     return 0 - self.frameSize;
   }
@@ -1921,16 +1933,20 @@ pub type Codegen = class {
     if (i < end && StrCharAt(src, i) == 45) { neg := 1; i := i + 1; }
     var num: int64 := 0;
     var den: int64 := 1;
+    var intExtra: int64 := 0;
     while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) {
       if (num < 900000000000000) { num := num * 10 + StrCharAt(src, i) - 48; }
+      else { intExtra := intExtra + 1; }
       i := i + 1;
     }
     if (i < end && StrCharAt(src, i) == 46) {
       i := i + 1;
-      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57 && den < 100000000) {
-        num := num * 10 + StrCharAt(src, i) - 48;
-        den := den * 10;
-        i := i + 1;
+      if (intExtra == 0) {
+        while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57 && den < 100000000) {
+          num := num * 10 + StrCharAt(src, i) - 48;
+          den := den * 10;
+          i := i + 1;
+        }
       }
       while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) { i := i + 1; }
     }
@@ -1946,6 +1962,15 @@ pub type Codegen = class {
       }
     }
     if (num == 0) { return 0; }
+    // Fold dropped integer digits into the exponent (intExtra excess digits = *10^intExtra).
+    if (intExtra > 0) {
+      if (expNeg == 0) {
+        expVal := expVal + intExtra;
+      } else {
+        if (expVal > intExtra) { expVal := expVal - intExtra; }
+        else { expNeg := 0; expVal := intExtra - expVal; }
+      }
+    }
     var ej: int64 := 0;
     if (expNeg == 0) {
       while (ej < expVal && num < 100000000000000) { num := num * 10; ej := ej + 1; }
@@ -2119,6 +2144,147 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
     self.cg_e8(0x0F); self.cg_e8(0x95); self.cg_e8(0xC0);   // setnz al
     self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);  // movzx rax, al
+  }
+
+  fn cg_registerF64Func(name: pchar, nameLen: int64) {
+    if (self.f64FuncCount >= self.f64FuncCap) {
+      var nc: int64 := self.f64FuncCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.f64FuncList, self.f64FuncCount * 16);
+      self.f64FuncList := nb;
+      self.f64FuncCap  := nc;
+    }
+    var base: int64 := self.f64FuncList + self.f64FuncCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    self.f64FuncCount := self.f64FuncCount + 1;
+  }
+
+  fn cg_isF64Func(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.f64FuncCount) {
+      var base: int64 := self.f64FuncList + i * 16;
+      var n: pchar  := peek64(base) as pchar;
+      var l: int64  := peek64(base + 8);
+      if (self.cg_seq(n, l, name, nameLen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Pre-pass: scan all CGN_FUNC_DECL nodes and register those returning f64.
+  fn cg_collectF64Funcs(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL) {
+        var retNi: int64 := self.cg_nc1(cur);
+        if (retNi >= 0) {
+          var rname: pchar := self.cg_nsval(retNi);
+          var rlen:  int64 := self.cg_nslen(retNi);
+          if (self.cg_seq(rname, rlen, "f64", 3) != 0) {
+            self.cg_registerF64Func(self.cg_nsval(cur), self.cg_nslen(cur));
+          }
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
+  fn cg_isF64Expr(ni: int64): int64 {
+    if ni < 0 { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if k == CGN_LIT_FLOAT { return 1; }
+    if k == CGN_IDENT {
+      var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if idx < 0 { return 0; }
+      var tb:  int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+      var tp:  pchar := peek64(tb) as pchar;
+      var tln: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      return self.cg_seq(tp, tln, "f64"c, 3);
+    }
+    if k == CGN_BINOP {
+      var bop: int64 := self.cg_nival(ni);
+      // Comparisons and logical ops produce int64 (0/1), not f64 — don't recurse.
+      if bop == CGT_AND || bop == CGT_OR { return 0; }
+      if bop == CGT_EQ2 || bop == CGT_NEQ { return 0; }
+      if bop == CGT_LT || bop == CGT_LE || bop == CGT_GT || bop == CGT_GE { return 0; }
+      if self.cg_isF64Expr(self.cg_nc0(ni)) != 0 { return 1; }
+      return self.cg_isF64Expr(self.cg_nc1(ni));
+    }
+    if k == CGN_CALL {
+      var fp: pchar := self.cg_nsval(ni);
+      var fl: int64 := self.cg_nslen(ni);
+      return self.cg_isF64Func(fp, fl);
+    }
+    return 0;
+  }
+
+  // f64 binary op: rbx=lhs IEEE-754 bits, rax=rhs IEEE-754 bits. Result in rax.
+  fn cg_emitF64BinOp(op: int64) {
+    // movq xmm0, rbx  (lhs)
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC3);
+    // movq xmm1, rax  (rhs)
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC8);
+    if op == CGT_PLUS {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x58); self.cg_e8(0xC1);  // addsd xmm0, xmm1
+    } else if op == CGT_MINUS {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC1);  // subsd xmm0, xmm1
+    } else if op == CGT_STAR {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC1);  // mulsd xmm0, xmm1
+    } else if op == CGT_SLASH {
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5E); self.cg_e8(0xC1);  // divsd xmm0, xmm1
+    } else if op == CGT_GT || op == CGT_LT || op == CGT_EQ2 ||
+              op == CGT_NEQ || op == CGT_GE || op == CGT_LE {
+      // ucomisd xmm0, xmm1  (66 0F 2E C1)
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xC1);
+      if op == CGT_GT  { self.cg_e8(0x0F); self.cg_e8(0x97); self.cg_e8(0xC0); }  // seta  al
+      if op == CGT_LT  { self.cg_e8(0x0F); self.cg_e8(0x92); self.cg_e8(0xC0); }  // setb  al
+      if op == CGT_EQ2 { self.cg_e8(0x0F); self.cg_e8(0x94); self.cg_e8(0xC0); }  // sete  al
+      if op == CGT_NEQ { self.cg_e8(0x0F); self.cg_e8(0x95); self.cg_e8(0xC0); }  // setne al
+      if op == CGT_GE  { self.cg_e8(0x0F); self.cg_e8(0x93); self.cg_e8(0xC0); }  // setae al
+      if op == CGT_LE  { self.cg_e8(0x0F); self.cg_e8(0x96); self.cg_e8(0xC0); }  // setbe al
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);     // movzx rax, al
+      return;
+    } else {
+      self.cg_zeroRax();
+      return;
+    }
+    // movq rax, xmm0  — result back to GP
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+  }
+
+  // WP-GPU-01: Emit inline SSE2 packed-f32 loop.
+  // Convention: rdi=src1, rsi=src2, rdx=dst, rcx=element count.
+  // Result: rax = dst ptr. Clobbers: rax, rcx, xmm0, xmm1.
+  fn cg_emitSSE2BinOp(op: int64) {
+    // xor eax, eax  (byte offset = 0)
+    self.cg_e8(0x31); self.cg_e8(0xC0);
+    // shl rcx, 2  (rcx = byte count)
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);
+    // [loop]: cmp rax, rcx
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    // jge +21 (.done)
+    self.cg_e8(0x7D); self.cg_e8(0x15);
+    // movaps xmm0, [rdi+rax]  (0F 28 04 07)
+    self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
+    // movaps xmm1, [rsi+rax]  (0F 28 0C 06)
+    self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x0C); self.cg_e8(0x06);
+    // packed f32 op: addps/subps/mulps/divps xmm0, xmm1
+    self.cg_e8(0x0F);
+    if op == CGT_PLUS  { self.cg_e8(0x58); }
+    else if op == CGT_MINUS { self.cg_e8(0x5C); }
+    else if op == CGT_STAR  { self.cg_e8(0x59); }
+    else                    { self.cg_e8(0x5E); }  // CGT_SLASH → divps
+    self.cg_e8(0xC1);  // xmm0, xmm1
+    // movaps [rdx+rax], xmm0  (0F 29 04 02)
+    self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);
+    // add rax, 16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
+    // jmp -26 (back to [loop])  EB E6
+    self.cg_e8(0xEB); self.cg_e8(0xE6);
+    // [.done]: mov rax, rdx  (result ptr)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
   }
 
   // Emit binary operation: rax=right operand, rbx=left operand (from stack pop)
@@ -3270,9 +3436,38 @@ pub type Codegen = class {
       self.cg_genExpr(self.cg_nc0(ni));
 
     } else if (k == CGN_SIMD_NEW) {
-      // parallel Array<T>(size) — evaluate size into rax; full SIMD alloc deferred
+      // WP-GPU-01: parallel Array<f32>(size) — alloc size*4+24 bytes (16 align + 8 count slot).
+      // Layout: [count:8B][up-to-15B padding][aligned data: size*4 bytes]
+      // ptr = (mmap_base + 23) & ~15 → always ptr-8 >= mmap_base; count stored at ptr-8.
       var sizeNode: int64 := self.cg_nc1(ni);
-      if (sizeNode >= 0) { self.cg_genExpr(sizeNode); }
+      if (sizeNode >= 0) {
+        self.cg_genExpr(sizeNode);    // rax = element count
+      } else {
+        self.cg_movRaxImm(0);
+      }
+      // push rax (element count n, saved across mmap)
+      self.cg_e8(0x50);
+      // shl rax, 2  (rax = n*4 bytes)
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);
+      // add rax, 24  (16 for alignment + 8 for count slot)
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);
+      // mmap(0, size, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
+      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+      self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
+      self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+      // pop rcx (element count n)
+      self.cg_e8(0x59);
+      // align: rax = (rax + 23) & ~15  → guarantees rax-8 >= mmap_base
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+      // store element count at ptr-8  (mov [rax-8], rcx)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);
+      // rax = 16-byte aligned SIMD ptr; count readable at ptr-8
 
     // WP-17: Range expression (1..100) - returns start value in rax
     } else if (k == CGN_RANGE) {
@@ -3406,13 +3601,89 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax (b)
         self.cg_popRdi();                                         // pop rdi     (a)
         self.cg_emitStrConcatBody();
+      } else if ((op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR || op == CGT_SLASH) &&
+                 self.cg_nkind(lhsNi) == CGN_IDENT && self.cg_nkind(rhsNi) == CGN_IDENT) {
+        // WP-GPU-01: check if both operands are parallel Array<f32> locals → SSE2 binop
+        var sLN: pchar := self.cg_nsval(lhsNi);
+        var sLL: int64 := self.cg_nslen(lhsNi);
+        var sRN: pchar := self.cg_nsval(rhsNi);
+        var sRL: int64 := self.cg_nslen(rhsNi);
+        var sLI: int64 := self.cg_findLocalIdx(sLN, sLL);
+        var sRI: int64 := self.cg_findLocalIdx(sRN, sRL);
+        if (sLI >= 0 && sRI >= 0 &&
+            peek8(self.localIsSimd + sLI) != 0 &&
+            peek8(self.localIsSimd + sRI) != 0) {
+          // Both are SIMD locals — emit vectorized SSE2 loop
+          var sLO: int64 := self.cg_findLocal(sLN, sLL);
+          var sRO: int64 := self.cg_findLocal(sRN, sRL);
+          // load lhs SIMD ptr → rdi
+          if (sLO >= -128 && sLO <= -1) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(sLO);
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(sLO);
+          }
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+          // load rhs SIMD ptr → rsi
+          if (sRO >= -128 && sRO <= -1) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(sRO);
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(sRO);
+          }
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+          // rcx = element count from ptr-8: mov rcx, [rdi-8]  (48 8B 4F F8)
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4F); self.cg_e8(0xF8);
+          // save src ptrs and count across the dst allocation syscall
+          self.cg_e8(0x51);  // push rcx
+          self.cg_e8(0x57);  // push rdi
+          self.cg_e8(0x56);  // push rsi
+          // alloc result SIMD buffer (same count): rax = rcx = count
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx
+          self.cg_e8(0x50);  // push rax (element count, saved across syscall)
+          self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax, 2
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
+          self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
+          self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+          self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+          self.cg_e8(0x59);  // pop rcx (element count)
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);  // mov [rax-8], rcx
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
+          // restore: rsi=rhs ptr, rdi=lhs ptr, rcx=count
+          self.cg_e8(0x5E);  // pop rsi
+          self.cg_e8(0x5F);  // pop rdi
+          self.cg_e8(0x59);  // pop rcx
+          // rdi=src1, rsi=src2, rdx=dst, rcx=count → inline SSE2 loop
+          self.cg_emitSSE2BinOp(op);
+          // rax = result SIMD ptr
+        } else {
+          // idents but not SIMD — general path
+          self.cg_genExpr(lhsNi);
+          self.cg_pushRax();
+          self.cg_genExpr(rhsNi);
+          self.cg_popRbx();
+          if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+            self.cg_emitF64BinOp(op);
+          } else {
+            self.cg_emitBinOp(op);
+          }
+        }
       } else {
         // General: eval LHS, push; eval RHS; pop rbx
         self.cg_genExpr(lhsNi);
         self.cg_pushRax();
         self.cg_genExpr(rhsNi);
         self.cg_popRbx();
-        self.cg_emitBinOp(op);
+        if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+          self.cg_emitF64BinOp(op);
+        } else {
+          self.cg_emitBinOp(op);
+        }
       }
 
     } else if (k == CGN_UNOP) {
@@ -3543,6 +3814,7 @@ pub type Codegen = class {
       var baseNode: int64 := self.cg_nc0(ni);
       var isPchar:  int64 := 0;
       var isArray:  int64 := 0;
+      var isSimd:   int64 := 0;
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
@@ -3550,6 +3822,8 @@ pub type Codegen = class {
         var blen:  int64 := self.cg_nslen(baseNode);
         var lidx: int64 := self.cg_findLocalIdx(bname, blen);
         if (lidx >= 0) {
+          // WP-GPU-01: check SIMD flag first
+          if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
           var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
           var tp: pchar := peek64(tb) as pchar;
           var tn: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
@@ -3585,7 +3859,14 @@ pub type Codegen = class {
           // arrElemSize bleibt 8 (scalar Array<int64> etc.)
         }
       }
-      if (isPchar == 1) {
+      if (isSimd == 1) {
+        // WP-GPU-01: parallel Array<f32>[i] — 4-byte stride, no header, SSE2 movss
+        // rax=base ptr, rbx=index
+        // movss xmm0, [rax+rbx*4]  (F3 0F 10 04 98)
+        self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x98);
+        // movd rax, xmm0  (66 0F 7E C0) — return f32 bits as int32 in rax
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+      } else if (isPchar == 1) {
         // movzx rax, byte [rax+rbx]
         self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
       } else if (isArray == 1 && arrElemSize > 8) {
@@ -6610,6 +6891,11 @@ pub type Codegen = class {
           }
         }
       }
+      // WP-GPU-01: CGN_TYPE_PARALLEL (=93) — mark as SIMD parallel array
+      if (typeNode >= 0 && self.cg_nkind(typeNode) == 93) {
+        poke8(self.localIsSimd + localIdx, 1);
+        poke8(self.localIsArray + localIdx, 0);  // not a regular Array
+      }
       // WP-BC-51: NK_TYPE_ARRAY_FIXED (=101) — store compile-time size
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 101) {
         poke8(self.localIsArray + localIdx, 1);
@@ -6799,9 +7085,12 @@ pub type Codegen = class {
         self.cg_popRbx();                  // rbx = index
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
+        var lhsIsSimd:  int64 := 0;
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
+          // WP-GPU-01: SIMD array store check
+          if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
         } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
           var lhsInner: int64 := self.cg_nc0(lhsBase);
           var lhsFldNm: pchar := self.cg_nsval(lhsBase);
@@ -6809,7 +7098,16 @@ pub type Codegen = class {
           var lhsParentCi: int64 := self.cg_objClassIdx(lhsInner);
           if (self.cg_isFieldArray(lhsParentCi, lhsFldNm, lhsFldNl) != 0) { lhsIsArray := 1; }
         }
-        if (lhsIsArray == 1) {
+        if (lhsIsSimd == 1) {
+          // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
+          // stack: [value(rsi)]  rax=base  rbx=index
+          // pop rcx (value bits, f32 in low 32)
+          self.cg_e8(0x59);
+          // movd xmm0, ecx  (66 0F 6E C1)
+          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+          // movss [rax+rbx*4], xmm0  (F3 0F 11 04 98)
+          self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x98);
+        } else if (lhsIsArray == 1) {
           // array<T> local: skip 16-byte header
           // lea rcx, [rax+16]
           self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
@@ -9094,6 +9392,17 @@ pub type Codegen = class {
     if (self.cg_hasImported(modName, nameLen) != 0) { return; }
     self.cg_markImported(modName, nameLen);
 
+    // WP-7a: ".." als Modulkomponente verbieten
+    var wptd7: int64 := 0;
+    while wptd7 < nameLen - 1 {
+      if ((StrCharAt(modName, wptd7) & 255) == 46 && (StrCharAt(modName, wptd7 + 1) & 255) == 46) {
+        EPrintStr("codegen error: import path traversal verboten: "c);
+        EPrintStrLn(modName);
+        return;
+      }
+      wptd7 := wptd7 + 1;
+    }
+
     // Convert "bootstrap.parser" → "bootstrap/parser.lyx"
     var pathBuf: int64 := alloc(nameLen + 8);
     var i: int64 := 0;
@@ -9241,6 +9550,9 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
 
   fn cg_genFile(head: int64) {
+    // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
+    self.cg_collectF64Funcs(head);
+
     var cur: int64 := head;
     while (cur != -1) {
       var k: int64 := self.cg_nkind(cur);
@@ -9476,6 +9788,18 @@ pub type Codegen = class {
     self.vmtMethodPatches    := alloc(self.vmtMethodPatchCap * CG_VMT_METH_PATCH_SZ);
     self.vmtMethodPatchCount := 0;
 
+    // f64-returning function table (pre-populated with known builtins)
+    self.f64FuncCap   := 64;
+    self.f64FuncList  := alloc(self.f64FuncCap * 16);
+    self.f64FuncCount := 0;
+    self.cg_registerF64Func("fAdd"c,  4);
+    self.cg_registerF64Func("fSub"c,  4);
+    self.cg_registerF64Func("fMul"c,  4);
+    self.cg_registerF64Func("fDiv"c,  4);
+    self.cg_registerF64Func("fNeg"c,  4);
+    self.cg_registerF64Func("fAbs"c,  4);
+    self.cg_registerF64Func("sqrt"c,  4);
+
     // WP-BC-24: deferred monomorphization list
     self.monoCap   := 32;
     self.monoList  := alloc(self.monoCap * CG_MONO_SZ);
@@ -9520,6 +9844,8 @@ pub type Codegen = class {
     self.localIsArray     := alloc(self.localCap);
     // WP-3.1: per-local redundant flag
     self.localIsRedundant := alloc(self.localCap);
+    // WP-GPU-01: per-local SIMD flag
+    self.localIsSimd      := alloc(self.localCap);
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
@@ -10143,7 +10469,9 @@ pub type Codegen = class {
       if self.lcbsLandlockAllowed != 0 { landlockRules := landlockRules + 1; }
       landlockRules := landlockRules + self.lcbsHwArgCount;
     }
-    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount, self.lcbsWxActive);
+    var relroOk: int64 := 0;
+    if self.externCount == 0 { relroOk := 1; }
+    var score: int64 := audit_compute_score(seccompOk, landlockOk, self.lcbsMissingGrants, self.lcbsFastpathCount, self.lcbsWxActive, relroOk);
 
     // --- Ausgabe ---
     EPrintStrLn("=== LCBS Security Audit =========================================="c);
@@ -10164,6 +10492,7 @@ pub type Codegen = class {
     EPrintStrLn("Implizite Capabilities (immer aktiv):"c);
     EPrintStrLn("  o system.exit         -> exit_group"c);
     EPrintStrLn("  o system.memory.heap  -> brk, mmap(MAP_ANON)"c);
+    EPrintStrLn("  o system.rand         -> getrandom (Stack-Canary-Init, WP-24.1)"c);
     EPrintStrLn(""c);
 
     // Explizite Capabilities
@@ -10189,7 +10518,11 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  o W^X (nicht aktiv — Single PT_LOAD RWX)"c);
     }
-    EPrintStrLn("  + RELRO (kein GOT im statischen ELF; dynamisch: Compiler-Garantie)"c);
+    if self.externCount == 0 {
+      EPrintStrLn("  + RELRO (kein GOT/PLT-Angriffsziel — statisches ELF)"c);
+    } else {
+      EPrintStrLn("  o RELRO (kein PT_GNU_RELRO — dynamisches ELF, WP-6b offen)"c);
+    }
     EPrintStrLn("  o PIE  (nicht aktiv -- statisches ELF, kein ASLR)"c);
     if seccompOk != 0 {
       EPrintStr("  + seccomp (SECCOMP_RET_KILL_PROCESS, "c);
@@ -10224,7 +10557,11 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  + 0: W^X fehlt (Single PT_LOAD RWX — WP-6 offen)"c);
     }
-    EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel)"c);
+    if self.externCount == 0 {
+      EPrintStrLn("  + 5: RELRO (kein GOT/PLT-Angriffsziel — statisch)"c);
+    } else {
+      EPrintStrLn("  + 0: RELRO fehlt (kein PT_GNU_RELRO — dynamisch)"c);
+    }
     EPrintStrLn("  + 0: PIE  (nicht implementiert)"c);
     if self.lcbsMissingGrants == 0 {
       EPrintStrLn("  +10: Grant-Modell -- alle Imports haben explizites grant"c);
@@ -10279,8 +10616,8 @@ pub type Codegen = class {
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
-    // WP-6: static ELF gets two PT_LOADs (RX+RW); dynamic ELF still RWX
-    if self.externCount == 0 { self.lcbsWxActive := 1; }
+    // WP-6/6b: both static and dynamic ELFs emit two PT_LOADs (RX+RW)
+    self.lcbsWxActive := 1;
     self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
@@ -10607,8 +10944,8 @@ pub type Codegen = class {
     var interpOff: int64 := 64;
     var interpLen: int64 := StrLen(interpStr) + 1;   // include NUL terminator
 
-    var codeOff: int64 := CG_CODE_OFF;               // 120 — unchanged
-    var dataOff: int64 := codeOff + totalCode;
+    var codeOff: int64 := CG_CODE_OFF;               // 176: ELF hdr (64) + 2×phdr (56+56)
+    var dataOff: int64 := codeOff + totalCode;        // page-aligned by Generate() padding
 
     // --- build .dynstr (\0, then distinct lib names, then symbol names) ---
     var dynstr: int64 := alloc(65536);
@@ -10677,7 +11014,7 @@ pub type Codegen = class {
     var dynCount: int64 := uniqCount + 11;                    // NEEDED*u + 11 fixed tags
     var dynSize: int64 := dynCount * 16;
     var phdrOff: int64 := ((dynOff + dynSize + 7) >> 3) << 3;
-    var phnum: int64 := 3;
+    var phnum: int64 := 4;                           // WP-6b: +1 PT_LOAD for RX/RW split
     var fileSize: int64 := phdrOff + phnum * 56;
 
     // --- patch extern call sites: disp32 = gotSlotVA - ripVA ---
@@ -10776,20 +11113,40 @@ pub type Codegen = class {
 
     // program headers at end of file
     var ph: int64 := buf + phdrOff;
-    // PT_LOAD — whole file at base, RWX
-    poke32(ph, 1); poke32(ph + 4, 7);
-    poke64(ph + 8, 0); poke64(ph + 16, CG_ELF_BASE); poke64(ph + 24, CG_ELF_BASE);
-    poke64(ph + ELF64_PHDR_OFF_FILESZ, fileSize); poke64(ph + ELF64_PHDR_OFF_MEMSZ,  fileSize); poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
-    // PT_INTERP
+
+    // WP-6b: PT_LOAD #1 — RX (read + execute): ELF header + .interp + code
+    // dataOff is page-aligned (Generate() pads code to 4096-byte boundary)
+    var rxSize: int64 := dataOff;
+    poke32(ph,      1); poke32(ph + 4, 5);                          // PT_LOAD, PF_R|PF_X
+    poke64(ph + ELF64_PHDR_OFF_OFFSET, 0);
+    poke64(ph + ELF64_PHDR_OFF_VADDR,  CG_ELF_BASE);
+    poke64(ph + ELF64_PHDR_OFF_PADDR,  CG_ELF_BASE);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, rxSize);
+    poke64(ph + ELF64_PHDR_OFF_MEMSZ,  rxSize);
+    poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // WP-6b: PT_LOAD #2 — RW (read + write): data + sections + phdrs
     var ph2: int64 := ph + 56;
-    poke32(ph2, 3); poke32(ph2 + 4, 4);
-    poke64(ph2 + 8, interpOff); poke64(ph2 + 16, CG_ELF_BASE + interpOff); poke64(ph2 + 24, CG_ELF_BASE + interpOff);
-    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, interpLen); poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  interpLen); poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  1);
-    // PT_DYNAMIC
+    var rwOff:  int64 := dataOff;
+    var rwSize: int64 := fileSize - rwOff;
+    poke32(ph2,      1); poke32(ph2 + 4, 6);                        // PT_LOAD, PF_R|PF_W
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_VADDR,  CG_ELF_BASE + rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_PADDR,  CG_ELF_BASE + rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, rwSize);
+    poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  rwSize);
+    poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  4096);
+
+    // PT_INTERP
     var ph3: int64 := ph + 112;
-    poke32(ph3, 2); poke32(ph3 + 4, 6);
-    poke64(ph3 + 8, dynOff); poke64(ph3 + 16, CG_ELF_BASE + dynOff); poke64(ph3 + 24, CG_ELF_BASE + dynOff);
-    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, dynSize); poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  dynSize); poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  8);
+    poke32(ph3, 3); poke32(ph3 + 4, 4);
+    poke64(ph3 + 8, interpOff); poke64(ph3 + 16, CG_ELF_BASE + interpOff); poke64(ph3 + 24, CG_ELF_BASE + interpOff);
+    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, interpLen); poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  interpLen); poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  1);
+    // PT_DYNAMIC
+    var ph4: int64 := ph + 168;
+    poke32(ph4, 2); poke32(ph4 + 4, 6);
+    poke64(ph4 + 8, dynOff); poke64(ph4 + 16, CG_ELF_BASE + dynOff); poke64(ph4 + 24, CG_ELF_BASE + dynOff);
+    poke64(ph4 + ELF64_PHDR_OFF_FILESZ, dynSize); poke64(ph4 + ELF64_PHDR_OFF_MEMSZ,  dynSize); poke64(ph4 + ELF64_PHDR_OFF_ALIGN,  8);
 
     var fd: int64 := open(path, 577, 493);
     if (fd >= 0) {

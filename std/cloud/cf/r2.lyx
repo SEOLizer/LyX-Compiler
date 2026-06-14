@@ -1,0 +1,335 @@
+// std/cloud/cf/r2.lyx — Cloudflare R2 Object Storage (S3-compatible + CF API)
+// WP-CF-09
+
+unit std.cloud.cf.r2;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.cloud.s3;
+import std.cloud.aws.core;
+import std.alloc;
+import std.io;
+
+extern fn getenv(name: pchar): pchar
+
+pub type R2Conn = struct {
+    s3:        int64;   // S3Client (by value, stored as 32 bytes)
+    accountId: int64;   // pchar
+};
+
+// Connect R2 via S3-compatible endpoint using R2 access keys
+pub fn R2Connect(creds: CFCredentials, accountId: pchar): R2Conn {
+    var r2AccessKey: pchar := getenv("R2_ACCESS_KEY_ID"c);
+    var r2SecretKey: pchar := getenv("R2_SECRET_ACCESS_KEY"c);
+
+    // Build endpoint: <accountId>.r2.cloudflarestorage.com
+    var endpointBuf: int64 := alloc(256);
+    var eo: int64 := cftAppend(endpointBuf, 0, accountId);
+    eo := cftAppend(endpointBuf, eo, ".r2.cloudflarestorage.com"c);
+    poke8(endpointBuf + eo, 0);
+
+    var awsCreds: AWSCreds := AWSCredentialsStatic(r2AccessKey, r2SecretKey, 0 as pchar, "auto"c);
+    var s3Client: S3Client := S3ConnectConfig(awsCreds, "auto"c, endpointBuf as pchar, 0);
+    free(endpointBuf, 256);
+
+    var conn: R2Conn;
+    conn.s3        := s3Client as int64;
+    conn.accountId := cftDup(accountId);
+    return conn;
+}
+
+pub fn R2Disconnect(c: R2Conn) {
+    var s3: S3Client := c.s3 as S3Client;
+    S3Close(s3);
+    if (c.accountId != 0) { free(c.accountId, StrLen(c.accountId as pchar)+1); }
+}
+
+// Bucket management via CF API
+
+pub fn R2BucketCreate(creds: CFCredentials, accountId: pchar,
+                       bucket: pchar, location: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets"c); poke8(path+po, 0);
+    var jb: int64 := cfJsonEscape(bucket);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jb as pchar);
+    off := cftAppend(body, off, "\""c);
+    if (location != 0 as pchar && StrLen(location) > 0) {
+        var jl: int64 := cfJsonEscape(location);
+        off := cftAppend(body, off, ",\"locationHint\":\""c);
+        off := cftAppend(body, off, jl as pchar);
+        off := cftAppend(body, off, "\""c);
+        free(jl, StrLen(jl as pchar)+1);
+    }
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    free(jb, StrLen(jb as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn R2BucketDelete(creds: CFCredentials, accountId: pchar, bucket: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn R2BucketList(creds: CFCredentials, accountId: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn R2BucketExists(creds: CFCredentials, accountId: pchar, bucket: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+// Object operations via S3 API
+
+pub fn R2Upload(c: R2Conn, bucket: pchar, key: pchar, data: int64, dataLen: int64): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    var ok: int64 := S3PutObject(s3, bucket, key, data, dataLen, "application/octet-stream"c);
+    if (ok == 0) { return 1; }
+    return 0;
+}
+
+pub fn R2Download(c: R2Conn, bucket: pchar, key: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3GetObject(s3, bucket, key);
+}
+
+pub fn R2Delete(c: R2Conn, bucket: pchar, key: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3DeleteObject(s3, bucket, key);
+}
+
+pub fn R2Exists(c: R2Conn, bucket: pchar, key: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3ObjectExists(s3, bucket, key);
+}
+
+pub fn R2List(c: R2Conn, bucket: pchar, prefix: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3ListObjects(s3, bucket, prefix);
+}
+
+pub fn R2GetMeta(c: R2Conn, bucket: pchar, key: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    var obj: S3Object := S3HeadObject(s3, bucket, key);
+    // Return JSON of metadata
+    if (obj.key == 0) { return 0; }
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "{\"key\":\""c);
+    if (obj.key != 0) { off := cftAppend(buf, off, obj.key as pchar); }
+    off := cftAppend(buf, off, "\",\"size\":"c);
+    off := cftAppendInt(buf, off, obj.size);
+    off := cftAppend(buf, off, ",\"etag\":\""c);
+    if (obj.etag != 0) { off := cftAppend(buf, off, obj.etag as pchar); }
+    off := cftAppend(buf, off, "\",\"lastModified\":\""c);
+    if (obj.lastModified != 0) { off := cftAppend(buf, off, obj.lastModified as pchar); }
+    off := cftAppend(buf, off, "\"}"c); poke8(buf+off, 0);
+    if (obj.key != 0) { free(obj.key, StrLen(obj.key as pchar)+1); }
+    if (obj.etag != 0) { free(obj.etag, StrLen(obj.etag as pchar)+1); }
+    if (obj.lastModified != 0) { free(obj.lastModified, StrLen(obj.lastModified as pchar)+1); }
+    if (obj.storageClass != 0) { free(obj.storageClass, StrLen(obj.storageClass as pchar)+1); }
+    return buf;
+}
+
+pub fn R2Copy(c: R2Conn, srcBucket: pchar, srcKey: pchar, dstBucket: pchar, dstKey: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3CopyObject(s3, srcBucket, srcKey, dstBucket, dstKey);
+}
+
+// Multipart upload
+
+pub fn R2MultipartStart(c: R2Conn, bucket: pchar, key: pchar): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    // Use S3 multipart initiation (reuse S3 API from std.cloud.s3)
+    // S3MultipartStart is not yet in std.cloud.s3, build path manually
+    // For now return placeholder — real implementation requires S3 multipart support
+    return 0;
+}
+
+pub fn R2MultipartUpload(c: R2Conn, bucket: pchar, key: pchar,
+                          uploadId: pchar, partNum: int64,
+                          data: int64, dataLen: int64): int64 {
+    return 0;
+}
+
+pub fn R2MultipartComplete(c: R2Conn, bucket: pchar, key: pchar,
+                            uploadId: pchar, parts: int64, count: int64): int64 {
+    return 0;
+}
+
+pub fn R2MultipartAbort(c: R2Conn, bucket: pchar, key: pchar, uploadId: pchar): int64 {
+    return 0;
+}
+
+// Presigned URL
+
+pub fn R2PresignedURL(c: R2Conn, bucket: pchar, key: pchar,
+                       method: pchar, expirySeconds: int64): int64 {
+    var s3: S3Client := c.s3 as S3Client;
+    return S3PresignURL(s3, bucket, key, expirySeconds);
+}
+
+// Public access
+
+pub fn R2BucketEnablePublic(creds: CFCredentials, accountId: pchar, bucket: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket);
+    po := cftAppend(path, po, "/domains/managed"c); poke8(path+po, 0);
+    var body: pchar := "{\"enabled\":true}"c;
+    var r: CFResponse := CFPut(c, path as pchar, body as int64, StrLen(body));
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn R2PublicURL(accountId: pchar, bucket: pchar, key: pchar): int64 {
+    // Returns "https://pub-<hash>.r2.dev/<key>" — hash is account/bucket specific
+    // Without knowing the actual hash, we construct a placeholder
+    var buf: int64 := alloc(1024);
+    var off: int64 := cftAppend(buf, 0, "https://"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "."c);
+    off := cftAppend(buf, off, bucket);
+    off := cftAppend(buf, off, ".r2.dev/"c);
+    off := cftAppend(buf, off, key);
+    poke8(buf+off, 0); return buf;
+}
+
+pub fn R2CustomDomainAdd(creds: CFCredentials, accountId: pchar,
+                          bucket: pchar, domain: pchar, zoneId: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket);
+    po := cftAppend(path, po, "/domains/custom"c); poke8(path+po, 0);
+    var jd: int64 := cfJsonEscape(domain);
+    var jz: int64 := cfJsonEscape(zoneId);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "{\"domain\":\""c);
+    off := cftAppend(body, off, jd as pchar);
+    off := cftAppend(body, off, "\",\"zone_id\":\""c);
+    off := cftAppend(body, off, jz as pchar);
+    off := cftAppend(body, off, "\",\"enabled\":true}"c); poke8(body+off, 0);
+    free(jd, StrLen(jd as pchar)+1); free(jz, StrLen(jz as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn R2CustomDomainList(creds: CFCredentials, accountId: pchar, bucket: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket);
+    po := cftAppend(path, po, "/domains/custom"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn R2CustomDomainRemove(creds: CFCredentials, accountId: pchar,
+                             bucket: pchar, domain: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/buckets/"c);
+    po := cftAppend(path, po, bucket);
+    po := cftAppend(path, po, "/domains/custom/"c);
+    po := cftAppend(path, po, domain); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+// R2 Access Key management
+
+pub fn R2AccessKeyCreate(creds: CFCredentials, accountId: pchar,
+                          name: pchar, permissions: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/tokens"c); poke8(path+po, 0);
+    var jname: int64 := cfJsonEscape(name);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"policies\":"c);
+    if (permissions != 0 as pchar && StrLen(permissions) > 0) {
+        off := cftAppend(body, off, permissions);
+    } else {
+        off := cftAppend(body, off, "[{\"effect\":\"allow\",\"resources\":{\"com.cloudflare.edge.r2.bucket.*\":\"*\"},\"permission_groups\":[{\"id\":\"2efd5506f9c8494dacb1fa10a43e7b92\",\"name\":\"Workers R2 Storage Write\"}]}]"c);
+    }
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    free(jname, StrLen(jname as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn R2AccessKeyList(creds: CFCredentials, accountId: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/tokens"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn R2AccessKeyDelete(creds: CFCredentials, accountId: pchar, keyId: pchar): int64 {
+    var c: CFClient := CFClientNew(creds);
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/r2/tokens/"c);
+    po := cftAppend(path, po, keyId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
