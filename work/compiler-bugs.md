@@ -1,7 +1,7 @@
-# lyxc 0.9.6A — Bug-Report (LLM-Runtime-Projekt)
+# lyxc 0.9.9B — Bug-Report (LLM-Runtime-Projekt)
 
 - **Datum:** 2026-06-11
-- **Compiler:** `lyxc 0.9.6A` (`/tmp/lyxc_new`), Target `x86_64`
+- **Compiler:** `lyxc 0.9.9B` (`/tmp/lyxc_new`), Target `x86_64`
 - **Plattform:** Linux x86-64 (Kernel 6.8)
 - **Kontext:** Gefunden beim Debuggen der Tests `ll01`–`ll08` des LLM-Runtime-Projekts.
   Alle Repros sind unten inline angegeben und unabhängig vom Projekt nachstellbar.
