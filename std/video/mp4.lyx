@@ -1,0 +1,202 @@
+// std/video/mp4.lyx — VID-02: MP4/ISOBMFF Container Reader
+// Parses moov→mvhd (duration), trak→tkhd (w/h), mdia→hdlr+'vide', stsd (codec).
+
+@description("MP4 reader: ISOBMFF box traversal, video track metadata, codec detection")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.video.mp4;
+
+import std.video.core;
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn mp4Get32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+fn mp4Get64(buf: int64, off: int64): int64 {
+    var hi: int64 := mp4Get32(buf, off);
+    var lo: int64 := mp4Get32(buf, off + 4);
+    return (hi << 32) | lo;
+}
+
+// Find first box with given 4CC (BE-encoded int64) in [start, end). Returns box start or -1.
+fn mp4FindBox(buf: int64, start: int64, end: int64, cc: int64): int64 {
+    var pos: int64 := start;
+    while (pos + 8 <= end) {
+        var bsz: int64 := mp4Get32(buf, pos);
+        if (bsz < 8) { return 0 - 1; }
+        var b0: int64 := peek8(buf + pos + 4);
+        var b1: int64 := peek8(buf + pos + 5);
+        var b2: int64 := peek8(buf + pos + 6);
+        var b3: int64 := peek8(buf + pos + 7);
+        var boxcc: int64 := (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        if (boxcc == cc) { return pos; }
+        if (pos + bsz <= pos) { return 0 - 1; }  // guard against zero-size loop
+        pos := pos + bsz;
+    }
+    return 0 - 1;
+}
+
+// Map stsd entry 4CC to VID_CODEC_* constant.
+fn mp4MapCodec(cc: int64): int64 {
+    if (cc == 0x61766331) { return VID_CODEC_H264; }  // 'avc1'
+    if (cc == 0x61766333) { return VID_CODEC_H264; }  // 'avc3'
+    if (cc == 0x68766331) { return VID_CODEC_H265; }  // 'hvc1'
+    if (cc == 0x68657631) { return VID_CODEC_H265; }  // 'hev1'
+    if (cc == 0x61763031) { return VID_CODEC_AV1;  }  // 'av01'
+    if (cc == 0x6D703476) { return VID_CODEC_MP4V; }  // 'mp4v'
+    if (cc == 0x76703038) { return VID_CODEC_VP8;  }  // 'vp08'
+    if (cc == 0x76703039) { return VID_CODEC_VP9;  }  // 'vp09'
+    return VID_CODEC_UNKNOWN;
+}
+
+// ============================================================================
+// Mp4Meta — extract metadata from in-memory MP4/ISOBMFF buffer
+// ============================================================================
+
+pub fn Mp4Meta(buf: int64, len: int64, vid: int64): int64 {
+    if (len < 8) { return 0; }
+    // Must have 'ftyp' at offset 4
+    if (peek8(buf+4) != 0x66 || peek8(buf+5) != 0x74 ||
+        peek8(buf+6) != 0x79 || peek8(buf+7) != 0x70) { return 0; }
+
+    // Find moov box
+    var moov: int64 := mp4FindBox(buf, 0, len, 0x6D6F6F76);
+    if (moov < 0) { return 0; }
+    var moovSz: int64 := mp4Get32(buf, moov);
+    var moovData: int64 := moov + 8;
+    var moovEnd: int64 := moov + moovSz;
+    if (moovEnd > len) { moovEnd := len; }
+
+    // ---- Duration from mvhd ----
+    var durationMs: int64 := 0;
+    var mvhd: int64 := mp4FindBox(buf, moovData, moovEnd, 0x6D766864);
+    if (mvhd >= 0) {
+        var mvhdVersion: int64 := peek8(buf + mvhd + 8);
+        var timescale: int64 := 1;
+        var dur: int64 := 0;
+        if (mvhdVersion == 0) {
+            timescale := mp4Get32(buf, mvhd + 20);
+            dur        := mp4Get32(buf, mvhd + 24);
+        } else {
+            timescale := mp4Get32(buf, mvhd + 28);
+            dur        := mp4Get64(buf, mvhd + 32);
+        }
+        if (timescale > 0) { durationMs := dur * 1000 / timescale; }
+    }
+
+    // ---- Video track: iterate trak boxes ----
+    var vw:    int64 := 0;
+    var vh:    int64 := 0;
+    var codec: int64 := VID_CODEC_UNKNOWN;
+
+    var trakPos: int64 := moovData;
+    var found: int64 := 0;
+    while (found == 0) {
+        var trak: int64 := mp4FindBox(buf, trakPos, moovEnd, 0x7472616B);
+        if (trak < 0) { found := 1; }
+        else {
+            var trakSz:  int64 := mp4Get32(buf, trak);
+            var trakData: int64 := trak + 8;
+            var trakEnd: int64 := trak + trakSz;
+            if (trakEnd > moovEnd) { trakEnd := moovEnd; }
+
+            // Find mdia inside trak
+            var mdia: int64 := mp4FindBox(buf, trakData, trakEnd, 0x6D646961);
+            if (mdia >= 0) {
+                var mdiaSz:   int64 := mp4Get32(buf, mdia);
+                var mdiaData: int64 := mdia + 8;
+                var mdiaEnd:  int64 := mdia + mdiaSz;
+                if (mdiaEnd > trakEnd) { mdiaEnd := trakEnd; }
+
+                // Find hdlr, check handler_type == 'vide' (0x76696465)
+                var hdlr: int64 := mp4FindBox(buf, mdiaData, mdiaEnd, 0x68646C72);
+                if (hdlr >= 0) {
+                    // hdlr FullBox: [size:4][type:4][version:1][flags:3][pre_defined:4][handler:4]
+                    var ht0: int64 := peek8(buf + hdlr + 16);
+                    var ht1: int64 := peek8(buf + hdlr + 17);
+                    var ht2: int64 := peek8(buf + hdlr + 18);
+                    var ht3: int64 := peek8(buf + hdlr + 19);
+                    if (ht0 == 0x76 && ht1 == 0x69 && ht2 == 0x64 && ht3 == 0x65) {
+                        // Video track found
+
+                        // tkhd dimensions
+                        var tkhd: int64 := mp4FindBox(buf, trakData, trakEnd, 0x746B6864);
+                        if (tkhd >= 0) {
+                            var tkhdVer: int64 := peek8(buf + tkhd + 8);
+                            var woff: int64 := 84;
+                            var hoff: int64 := 88;
+                            if (tkhdVer == 1) { woff := 100; hoff := 104; }
+                            vw := mp4Get32(buf, tkhd + woff) >> 16;
+                            vh := mp4Get32(buf, tkhd + hoff) >> 16;
+                        }
+
+                        // Codec from stsd
+                        var minf: int64 := mp4FindBox(buf, mdiaData, mdiaEnd, 0x6D696E66);
+                        if (minf >= 0) {
+                            var minfSz:   int64 := mp4Get32(buf, minf);
+                            var minfData: int64 := minf + 8;
+                            var minfEnd:  int64 := minf + minfSz;
+                            if (minfEnd > mdiaEnd) { minfEnd := mdiaEnd; }
+                            var stbl: int64 := mp4FindBox(buf, minfData, minfEnd, 0x7374626C);
+                            if (stbl >= 0) {
+                                var stblSz:   int64 := mp4Get32(buf, stbl);
+                                var stblData: int64 := stbl + 8;
+                                var stblEnd:  int64 := stbl + stblSz;
+                                if (stblEnd > minfEnd) { stblEnd := minfEnd; }
+                                var stsd: int64 := mp4FindBox(buf, stblData, stblEnd, 0x73747364);
+                                // stsd: [size:4][type:4][ver:1][flags:3][count:4][entry...]
+                                // entry 4CC at stsd+20
+                                if (stsd >= 0 && stsd + 24 <= stblEnd) {
+                                    var e0: int64 := peek8(buf + stsd + 20);
+                                    var e1: int64 := peek8(buf + stsd + 21);
+                                    var e2: int64 := peek8(buf + stsd + 22);
+                                    var e3: int64 := peek8(buf + stsd + 23);
+                                    codec := mp4MapCodec((e0<<24)|(e1<<16)|(e2<<8)|e3);
+                                }
+                            }
+                        }
+                        found := 1;
+                    }
+                }
+            }
+            if (found == 0) { trakPos := trak + trakSz; }
+        }
+    }
+
+    if (vw == 0 || vh == 0) { return 0; }
+
+    poke64(vid + VID_OFF_WIDTH,       vw);
+    poke64(vid + VID_OFF_HEIGHT,      vh);
+    poke64(vid + VID_OFF_DURATION_MS, durationMs);
+    poke64(vid + VID_OFF_FPS_NUM,     0);
+    poke64(vid + VID_OFF_FPS_DEN,     1);
+    poke64(vid + VID_OFF_FRAME_COUNT, 0);
+    poke64(vid + VID_OFF_FORMAT,      VID_FMT_MP4);
+    poke64(vid + VID_OFF_CODEC,       codec);
+    return 1;
+}
+
+pub fn Mp4MetaFile(path: int64, plen: int64, vid: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) {
+        ret := Mp4Meta(buf, fsize, vid);
+        if (plen != 0) { poke64(plen, fsize); }
+    }
+    free(buf, fsize);
+    return ret;
+}

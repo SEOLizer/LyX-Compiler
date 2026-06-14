@@ -1,0 +1,280 @@
+// std/video/avi.lyx — VID-01: AVI Container Reader
+// Parses RIFF/AVI: metadata (avih, strh) + MJPEG frame extraction.
+
+@description("AVI reader: metadata, frame count, MJPEG frame extraction")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.video.avi;
+
+import std.video.core;
+import std.image.core;
+import std.image.jpeg;
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn aviGet32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Compare 4 bytes at buf+pos with 4CC encoded as big-endian int64.
+// e.g. 'RIFF' → cc=0x52494646
+fn aviEq4(buf: int64, pos: int64, cc: int64): int64 {
+    if (peek8(buf+pos)   != (cc >> 24) & 255) { return 0; }
+    if (peek8(buf+pos+1) != (cc >> 16) & 255) { return 0; }
+    if (peek8(buf+pos+2) != (cc >> 8)  & 255) { return 0; }
+    if (peek8(buf+pos+3) !=  cc        & 255) { return 0; }
+    return 1;
+}
+
+// Find a plain chunk with given 4CC in range [start, end). Returns chunk start or -1.
+fn aviFindChunk(buf: int64, start: int64, end: int64, cc: int64): int64 {
+    var pos: int64 := start;
+    while (pos + 8 <= end) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        if (aviEq4(buf, pos, cc) == 1) { return pos; }
+        var skip: int64 := csize;
+        if ((skip & 1) != 0) { skip := skip + 1; }
+        pos := pos + 8 + skip;
+    }
+    return 0 - 1;
+}
+
+// Find a LIST chunk with given list-type 4CC in range [start, end). Returns LIST chunk start or -1.
+fn aviFindList(buf: int64, start: int64, end: int64, cc: int64): int64 {
+    var pos: int64 := start;
+    while (pos + 12 <= end) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        if (csize < 4) { return 0 - 1; }
+        if (aviEq4(buf, pos, 0x4C495354) == 1 && aviEq4(buf, pos+8, cc) == 1) {
+            return pos;
+        }
+        var skip: int64 := csize;
+        if ((skip & 1) != 0) { skip := skip + 1; }
+        pos := pos + 8 + skip;
+    }
+    return 0 - 1;
+}
+
+// Map AVI fccHandler 4CC to VID_CODEC_* constant.
+fn aviMapCodec(fcc: int64): int64 {
+    if (fcc == 0x4D4A5047) { return VID_CODEC_MJPEG; }  // 'MJPG'
+    if (fcc == 0x6D6A7067) { return VID_CODEC_MJPEG; }  // 'mjpg'
+    if (fcc == 0x48323634) { return VID_CODEC_H264; }   // 'H264'
+    if (fcc == 0x61766331) { return VID_CODEC_H264; }   // 'avc1'
+    if (fcc == 0x58323634) { return VID_CODEC_H264; }   // 'X264'
+    if (fcc == 0x4D503456) { return VID_CODEC_MP4V; }   // 'MP4V'
+    if (fcc == 0x58564944) { return VID_CODEC_MP4V; }   // 'XVID'
+    if (fcc == 0x44495658) { return VID_CODEC_MP4V; }   // 'DIVX'
+    if (fcc == 0x44495633) { return VID_CODEC_MP4V; }   // 'DIV3'
+    if (fcc == 0x68766331) { return VID_CODEC_H265; }   // 'hvc1'
+    if (fcc == 0x48564331) { return VID_CODEC_H265; }   // 'HVC1'
+    return VID_CODEC_UNKNOWN;
+}
+
+// ============================================================================
+// AviMeta — extract metadata from in-memory AVI buffer
+// ============================================================================
+
+pub fn AviMeta(buf: int64, len: int64, vid: int64): int64 {
+    if (len < 12) { return 0; }
+    // 'RIFF' at 0
+    if (aviEq4(buf, 0, 0x52494646) == 0) { return 0; }
+    // 'AVI ' at 8
+    if (aviEq4(buf, 8, 0x41564920) == 0) { return 0; }
+
+    // Find LIST hdrl
+    var hdrl: int64 := aviFindList(buf, 12, len, 0x6864726C);
+    if (hdrl < 0) { return 0; }
+    var hdrlSize: int64 := aviGet32(buf, hdrl + 4);
+    var hdrlStart: int64 := hdrl + 12;
+    var hdrlEnd: int64 := hdrl + 8 + hdrlSize;
+    if (hdrlEnd > len) { hdrlEnd := len; }
+
+    // Find avih chunk inside hdrl
+    var avih: int64 := aviFindChunk(buf, hdrlStart, hdrlEnd, 0x61766968);
+    if (avih < 0) { return 0; }
+    var avihData: int64 := avih + 8;
+    var avihSize: int64 := aviGet32(buf, avih + 4);
+    if (avihSize < 40) { return 0; }
+
+    var microSecPerFrame: int64 := aviGet32(buf, avihData + 0);
+    var totalFrames:      int64 := aviGet32(buf, avihData + 16);
+    var width:            int64 := aviGet32(buf, avihData + 32);
+    var height:           int64 := aviGet32(buf, avihData + 36);
+
+    if (width == 0 || height == 0) { return 0; }
+
+    // Find first video stream in LIST strl chunks
+    var codec:  int64 := VID_CODEC_UNKNOWN;
+    var fpsNum: int64 := 0;
+    var fpsDen: int64 := 1;
+    var pos: int64 := hdrlStart;
+    var done: int64 := 0;
+
+    while (done == 0 && pos + 12 <= hdrlEnd) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        if (csize < 4) {
+            done := 1;
+        } else {
+            // Check for LIST strl
+            if (aviEq4(buf, pos, 0x4C495354) == 1 && aviEq4(buf, pos+8, 0x7374726C) == 1) {
+                var strlStart: int64 := pos + 12;
+                var strlEnd: int64 := pos + 8 + csize;
+                if (strlEnd > hdrlEnd) { strlEnd := hdrlEnd; }
+
+                var strh: int64 := aviFindChunk(buf, strlStart, strlEnd, 0x73747268);
+                if (strh >= 0) {
+                    var strhData: int64 := strh + 8;
+                    var strhSize: int64 := aviGet32(buf, strh + 4);
+                    // Check fccType == 'vids' (0x76696473)
+                    if (strhSize >= 36 && aviEq4(buf, strhData, 0x76696473) == 1) {
+                        // Read fccHandler
+                        var h0: int64 := peek8(buf + strhData + 4);
+                        var h1: int64 := peek8(buf + strhData + 5);
+                        var h2: int64 := peek8(buf + strhData + 6);
+                        var h3: int64 := peek8(buf + strhData + 7);
+                        codec  := aviMapCodec((h0 << 24) | (h1 << 16) | (h2 << 8) | h3);
+                        fpsDen := aviGet32(buf, strhData + 20);  // dwScale
+                        fpsNum := aviGet32(buf, strhData + 24);  // dwRate
+                        if (fpsDen == 0) { fpsDen := 1; }
+                        done := 1;
+                    }
+                }
+            }
+            if (done == 0) {
+                var skip: int64 := csize;
+                if ((skip & 1) != 0) { skip := skip + 1; }
+                pos := pos + 8 + skip;
+            }
+        }
+    }
+
+    var durationMs: int64 := 0;
+    if (microSecPerFrame > 0 && totalFrames > 0) {
+        durationMs := totalFrames * microSecPerFrame / 1000;
+    }
+
+    poke64(vid + VID_OFF_WIDTH,       width);
+    poke64(vid + VID_OFF_HEIGHT,      height);
+    poke64(vid + VID_OFF_DURATION_MS, durationMs);
+    poke64(vid + VID_OFF_FPS_NUM,     fpsNum);
+    poke64(vid + VID_OFF_FPS_DEN,     fpsDen);
+    poke64(vid + VID_OFF_FRAME_COUNT, totalFrames);
+    poke64(vid + VID_OFF_FORMAT,      VID_FMT_AVI);
+    poke64(vid + VID_OFF_CODEC,       codec);
+    return 1;
+}
+
+pub fn AviMetaFile(path: int64, plen: int64, vid: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) {
+        ret := AviMeta(buf, fsize, vid);
+        if (plen != 0) { poke64(plen, fsize); }
+    }
+    free(buf, fsize);
+    return ret;
+}
+
+// ============================================================================
+// AviGetFrameCount — count '00dc' (compressed video stream 0) chunks in movi
+// ============================================================================
+
+pub fn AviGetFrameCount(buf: int64, len: int64): int64 {
+    var movi: int64 := aviFindList(buf, 12, len, 0x6D6F7669);
+    if (movi < 0) { return 0; }
+    var moviSize: int64 := aviGet32(buf, movi + 4);
+    var moviStart: int64 := movi + 12;
+    var moviEnd: int64 := movi + 8 + moviSize;
+    if (moviEnd > len) { moviEnd := len; }
+
+    var count: int64 := 0;
+    var pos: int64 := moviStart;
+    while (pos + 8 <= moviEnd) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        // '00dc' = 0x30,0x30,0x64,0x63
+        if (peek8(buf+pos)==0x30 && peek8(buf+pos+1)==0x30 &&
+            peek8(buf+pos+2)==0x64 && peek8(buf+pos+3)==0x63) {
+            count := count + 1;
+        }
+        var skip: int64 := csize;
+        if ((skip & 1) != 0) { skip := skip + 1; }
+        pos := pos + 8 + skip;
+    }
+    return count;
+}
+
+// ============================================================================
+// AviGetFrameOffset — return pointer to frameIdx-th '00dc' data; store size in pFrameLen
+// pFrameLen may be 0 (ignored). Returns 0 if not found.
+// ============================================================================
+
+pub fn AviGetFrameOffset(buf: int64, len: int64, frameIdx: int64, pFrameLen: int64): int64 {
+    var movi: int64 := aviFindList(buf, 12, len, 0x6D6F7669);
+    if (movi < 0) { return 0; }
+    var moviSize: int64 := aviGet32(buf, movi + 4);
+    var moviStart: int64 := movi + 12;
+    var moviEnd: int64 := movi + 8 + moviSize;
+    if (moviEnd > len) { moviEnd := len; }
+
+    var count: int64 := 0;
+    var pos: int64 := moviStart;
+    while (pos + 8 <= moviEnd) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        if (peek8(buf+pos)==0x30 && peek8(buf+pos+1)==0x30 &&
+            peek8(buf+pos+2)==0x64 && peek8(buf+pos+3)==0x63) {
+            if (count == frameIdx) {
+                if (pFrameLen != 0) { poke64(pFrameLen, csize); }
+                return buf + pos + 8;
+            }
+            count := count + 1;
+        }
+        var skip: int64 := csize;
+        if ((skip & 1) != 0) { skip := skip + 1; }
+        pos := pos + 8 + skip;
+    }
+    return 0;
+}
+
+// ============================================================================
+// AviExtractMjpegFrame — decode MJPEG frame into GrfImage struct
+// Only useful when AviMeta reports VID_CODEC_MJPEG.
+// ============================================================================
+
+pub fn AviExtractMjpegFrame(buf: int64, len: int64, frameIdx: int64, img: int64): int64 {
+    var movi: int64 := aviFindList(buf, 12, len, 0x6D6F7669);
+    if (movi < 0) { return 0; }
+    var moviSize: int64 := aviGet32(buf, movi + 4);
+    var moviStart: int64 := movi + 12;
+    var moviEnd: int64 := movi + 8 + moviSize;
+    if (moviEnd > len) { moviEnd := len; }
+
+    var count: int64 := 0;
+    var pos: int64 := moviStart;
+    while (pos + 8 <= moviEnd) {
+        var csize: int64 := aviGet32(buf, pos + 4);
+        if (peek8(buf+pos)==0x30 && peek8(buf+pos+1)==0x30 &&
+            peek8(buf+pos+2)==0x64 && peek8(buf+pos+3)==0x63) {
+            if (count == frameIdx) {
+                return JpegDecode(buf + pos + 8, csize, img);
+            }
+            count := count + 1;
+        }
+        var skip: int64 := csize;
+        if ((skip & 1) != 0) { skip := skip + 1; }
+        pos := pos + 8 + skip;
+    }
+    return 0;
+}
