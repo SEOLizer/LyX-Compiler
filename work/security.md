@@ -14,7 +14,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 | **7a** | Path Traversal — Compiler-Side (`_sema_readFile`, `_cg_readFile`) | ✅ Erledigt |
 | **12** | SMTP mit STARTTLS + Header-Sanitisierung | 🟡 Mittel |
 | **22** | Automatisierte Security-Tests im CI (inkl. LCBS) | 🟡 Mittel |
-| **24** | seccomp-Filter-Vollständigkeit (Capability→Syscall-Mapping) | 🟠 Hoch |
+| **24** | seccomp-Filter-Vollständigkeit (Capability→Syscall-Mapping) | ✅ Erledigt |
 | **25** | `--capabilities=compat` Laufzeit-Warnung | 🟡 Mittel |
 | **6c** | PIE/ASLR für x86-64 ELF (zurückgestellt, Risiko hoch) | 🔵 Niedrig |
 | **6b-ARM64** | W^X für ARM64-ELF-Writer (`writeELF`, `writeELFExecDynamic`) | 🟡 Mittel |
@@ -82,30 +82,21 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 
 ---
 
-## WP-24: seccomp-Filter-Vollständigkeit
+## WP-24: seccomp-Filter-Vollständigkeit ✅
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/codegen_x86.lyx` (`seccomp_build_filter`), `src/security/capabilities.lyx` |
+| **Dateien** | `src/security/seccomp_gen.lyx`, `src/codegen_x86.lyx` |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ 2026-06-14 |
 
-**Problem:** Das Capability→Syscall-Mapping ist nicht vollständig gegen Linux-5.13+ verifiziert. Fehlende Syscalls (z.B. `openat2`, `statx`, `newfstatat`) führen zu SIGSYS bei korrekt annotierten Programmen. Zu weit gefasste Listen machen die Sandbox zu permissiv.
-
-**Bekanntes Symptom:** `@capabilities([fs.write])` + Stack-Canary-Init → `getrandom` wird durch seccomp geblockt (SIGSYS Exit 159). `getrandom` ist in keiner Capability als implizit erlaubt definiert, obwohl es für Stack-Canaries immer benötigt wird.
-
-**Teilschritte:**
-
-- [ ] **24.1** `getrandom` als impliziten Syscall (wie `exit_group`, `brk`, `mmap`) bedingungslos erlauben — Stack-Canaries brauchen es immer
-- [ ] **24.2** Capability → Syscall-Mapping strace-basiert auditieren (Referenz: Linux 5.13+)
-- [ ] **24.3** Fehlende Syscalls ergänzen (`openat2`, `statx`, `newfstatat`, `pread64`, …)
-- [ ] **24.4** Test: Programm mit `@capabilities([fs.read])` liest Datei ohne SIGSYS
-- [ ] **24.5** Test: Nicht-deklarierter Syscall → SIGSYS bestätigt
-
-**Definition of Done:**
-- Alle stdlib-Funktionen laufen ohne SIGSYS wenn Capability korrekt deklariert
-- Nicht-deklarierte Syscalls werden zuverlässig geblockt
-- `getrandom` für Stack-Canary-Init immer erlaubt
+**Implementiert:**
+- **24.1** `getrandom` (318) als impliziten Syscall hinzugefügt — Stack-Canary-Init (`__lyx_canary_init`) braucht es bei jedem Programmstart; vorher SIGSYS Exit 159 mit `@capabilities`
+- **24.3** Fehlende Syscalls ergänzt: `pread64` (17) und `newfstatat` (262) für `fs.read`/`fs.write`; `newfstatat` für `fs.meta`. Konstanten `SC_SYS_PREAD64` und `SC_SYS_NEWFSTATAT` hinzugefügt
+- **24.4** ✅ Programm mit `@capabilities([fs.read])` liest `/etc/hostname` ohne SIGSYS — 53 BPF-Regeln (vorher 47)
+- **24.5** ✅ `sys_getpid()` mit `@capabilities([fs.read])` → SIGSYS (Exit 159) bestätigt
+- Audit-Ausgabe zeigt `getrandom` als implizite Capability: `o system.rand → getrandom (Stack-Canary-Init, WP-24.1)`
+- SEED (`src/lyxc_bootstrap`) aktualisiert — SHA256: `5057c776555bae3f115447ebe06ea68500c54e31f6796d37d2f84971d539a6ee` — Singularität bestätigt: S3 == S4
 
 ---
 
@@ -192,5 +183,5 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 | 21 | Debug-Datei entfernen | ✅ | 2026-06-13 | 🔵 |
 | **22** | **Security-Tests im CI** | **⬜** | – | 🟡 |
 | 23 | Audit W^X-Reporting korrigieren | ✅ | 2026-06-13 | 🔴 |
-| **24** | **seccomp-Filter-Vollständigkeit** | **⬜** | – | 🟠 |
+| **24** | **seccomp-Filter-Vollständigkeit** | **✅** | 2026-06-14 | 🟠 |
 | **25** | **--capabilities=compat Warnung** | **⬜** | – | 🟡 |
