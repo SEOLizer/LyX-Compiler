@@ -15,7 +15,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 | **12** | SMTP mit STARTTLS + Header-Sanitisierung | 🟡 Mittel |
 | **22** | Automatisierte Security-Tests im CI (inkl. LCBS) | 🟡 Mittel |
 | **24** | seccomp-Filter-Vollständigkeit (Capability→Syscall-Mapping) | ✅ Erledigt |
-| **25** | `--capabilities=compat` Laufzeit-Warnung | 🟡 Mittel |
+| **25** | `--capabilities=compat` Laufzeit-Warnung | ✅ Erledigt |
 | **6c** | PIE/ASLR für x86-64 ELF (zurückgestellt, Risiko hoch) | 🔵 Niedrig |
 | **6b-ARM64** | W^X für ARM64-ELF-Writer (`writeELF`, `writeELFExecDynamic`) | 🟡 Mittel |
 
@@ -100,25 +100,19 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 
 ---
 
-## WP-25: `--capabilities=compat` Laufzeit-Warnung
+## WP-25: `--capabilities=compat` Laufzeit-Warnung ✅
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/lyxc.lyx` (Argument-Parsing), `src/codegen_x86.lyx` (Runtime-Prolog) |
+| **Dateien** | `src/lyxc.lyx`, `src/codegen_x86.lyx` |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ offen |
+| **Status** | ✅ 2026-06-14 |
 
-**Problem:** `--capabilities=compat` deaktiviert seccomp, Landlock und den Userspace-Proxy vollständig — ohne jede Warnung. Ein Entwickler der compat-Mode für Deployment nutzt, bemerkt nicht, dass der gesamte Laufzeitschutz fehlt.
-
-**Teilschritte:**
-
-- [ ] **25.1** Compiler: prominente `stderr`-Warnung beim Parsen von `--capabilities=compat`
-- [ ] **25.2** Generiertes Binary: Laufzeit-Warnung auf `stderr` beim Programmstart wenn im Compat-Modus kompiliert (eingebettetes Literal, vor `main`)
-- [ ] **25.3** Audit: Compat-Mode explizit im Score-Kommentar ausweisen (`WARNUNG: Compat-Modus — kein Laufzeitschutz`)
-
-**Definition of Done:**
-- `./lyxc --capabilities=compat prog.lyx` → sichtbare `stderr`-Warnung
-- Generiertes Binary druckt Warnung beim Start
+**Implementiert:**
+- **25.1** `lyxc.lyx`: 3-zeilige `stderr`-Warnung beim Parsen von `--capabilities=compat`
+- **25.2** `codegen_x86.lyx`: `cg_genCompatWarnSection()` schreibt Warnung-String in Datensektion; `cg_emitCompatWarn()` emittiert `write(2, ptr, len)`-Syscall am Anfang von `main`
+- **25.3** Audit zeigt `!!! WARNUNG: Compat-Modus !!!`-Header + `WARNUNG: Compat-Modus -- kein Laufzeitschutz` im Score-Block
+- SEED (`src/lyxc_bootstrap`) aktualisiert — SHA256: `de528b39...` — Singularität S3==S4 bestätigt
 
 ---
 
@@ -184,4 +178,4 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Diese Datei enthält nur noc
 | **22** | **Security-Tests im CI** | **⬜** | – | 🟡 |
 | 23 | Audit W^X-Reporting korrigieren | ✅ | 2026-06-13 | 🔴 |
 | **24** | **seccomp-Filter-Vollständigkeit** | **✅** | 2026-06-14 | 🟠 |
-| **25** | **--capabilities=compat Warnung** | **⬜** | – | 🟡 |
+| **25** | **--capabilities=compat Warnung** | **✅** | 2026-06-14 | 🟡 |
