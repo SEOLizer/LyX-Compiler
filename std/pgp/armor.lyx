@@ -1,0 +1,305 @@
+// std/pgp/armor.lyx — OpenPGP ASCII Armor (RFC 4880 §6)
+//
+// Public API:
+//   PgpArmorEncode(data, dataLen, tp, out, outMax) → encoded length
+//     tp: PGP_ARMOR_MESSAGE / PUBLIC_KEY / PRIVATE_KEY / SIGNATURE
+//     out receives: -----BEGIN PGP <tag>-----\n\nbase64...\n=CRC\n-----END PGP <tag>-----\n\0
+//
+//   PgpArmorDecode(arm, armLen, out, outMax) → decoded byte count, or -1 on CRC mismatch/bad input
+//
+//   PgpArmorType(arm, armLen) → PGP_ARMOR_* constant
+
+@description("OpenPGP ASCII Armor encode/decode (RFC 4880 §6)")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.pgp.armor;
+
+import std.pgp.core;
+import std.alloc;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn pgpTagName(tp: int64): pchar {
+    if (tp == PGP_ARMOR_MESSAGE)     { return "MESSAGE"c; }
+    if (tp == PGP_ARMOR_PUBLIC_KEY)  { return "PUBLIC KEY BLOCK"c; }
+    if (tp == PGP_ARMOR_PRIVATE_KEY) { return "PRIVATE KEY BLOCK"c; }
+    if (tp == PGP_ARMOR_SIGNATURE)   { return "SIGNATURE"c; }
+    return "MESSAGE"c;
+}
+
+fn pgpTagNameLen(tp: int64): int64 {
+    if (tp == PGP_ARMOR_MESSAGE)     { return 7; }
+    if (tp == PGP_ARMOR_PUBLIC_KEY)  { return 16; }
+    if (tp == PGP_ARMOR_PRIVATE_KEY) { return 17; }
+    if (tp == PGP_ARMOR_SIGNATURE)   { return 9; }
+    return 7;
+}
+
+// Write n bytes from pchar literal s into out[pos..], return new pos
+fn pgpWrLit(out: int64, pos: int64, s: pchar, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) {
+        poke8(out + pos + i, StrCharAt(s, i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+// Write NUL-terminated pchar s into out[pos..], return new pos
+fn pgpWrPchar(out: int64, pos: int64, s: pchar): int64 {
+    var i: int64 := 0;
+    while (StrCharAt(s, i) != 0) {
+        poke8(out + pos + i, StrCharAt(s, i));
+        i := i + 1;
+    }
+    return pos + i;
+}
+
+// Map 6-bit value to base64 alphabet char
+fn pgpB64Enc(v: int64): int64 {
+    if (v < 26) { return 0x41 + v; }           // A-Z
+    if (v < 52) { return 0x61 + v - 26; }       // a-z
+    if (v < 62) { return 0x30 + v - 52; }       // 0-9
+    if (v == 62) { return 0x2B; }               // '+'
+    return 0x2F;                                 // '/'
+}
+
+// Map base64 char to 6-bit value; returns -1 for invalid/padding
+fn pgpB64Dec(c: int64): int64 {
+    if (c >= 0x41 && c <= 0x5A) { return c - 0x41; }
+    if (c >= 0x61 && c <= 0x7A) { return c - 0x61 + 26; }
+    if (c >= 0x30 && c <= 0x39) { return c - 0x30 + 52; }
+    if (c == 0x2B) { return 62; }
+    if (c == 0x2F) { return 63; }
+    return 0 - 1;
+}
+
+// Encode srcLen bytes from src[srcOff..] as base64, write to dst[dstPos..] + '\n'
+fn pgpEncLine(src: int64, srcOff: int64, srcLen: int64, dst: int64, dstPos: int64): int64 {
+    var i: int64 := 0;
+    var p: int64 := dstPos;
+    while (i + 3 <= srcLen) {
+        var b0: int64 := peek8(src + srcOff + i);
+        var b1: int64 := peek8(src + srcOff + i + 1);
+        var b2: int64 := peek8(src + srcOff + i + 2);
+        poke8(dst + p,     pgpB64Enc((b0 >> 2) & 63));
+        poke8(dst + p + 1, pgpB64Enc(((b0 & 3) << 4) | ((b1 >> 4) & 15)));
+        poke8(dst + p + 2, pgpB64Enc(((b1 & 15) << 2) | ((b2 >> 6) & 3)));
+        poke8(dst + p + 3, pgpB64Enc(b2 & 63));
+        p := p + 4;
+        i := i + 3;
+    }
+    // 1-byte remainder
+    if (i + 1 == srcLen) {
+        var b0: int64 := peek8(src + srcOff + i);
+        poke8(dst + p,     pgpB64Enc((b0 >> 2) & 63));
+        poke8(dst + p + 1, pgpB64Enc((b0 & 3) << 4));
+        poke8(dst + p + 2, 0x3D);  // '='
+        poke8(dst + p + 3, 0x3D);  // '='
+        p := p + 4;
+    }
+    // 2-byte remainder
+    if (i + 2 == srcLen) {
+        var b0: int64 := peek8(src + srcOff + i);
+        var b1: int64 := peek8(src + srcOff + i + 1);
+        poke8(dst + p,     pgpB64Enc((b0 >> 2) & 63));
+        poke8(dst + p + 1, pgpB64Enc(((b0 & 3) << 4) | ((b1 >> 4) & 15)));
+        poke8(dst + p + 2, pgpB64Enc((b1 & 15) << 2));
+        poke8(dst + p + 3, 0x3D);  // '='
+        p := p + 4;
+    }
+    poke8(dst + p, 0x0A);  // '\n'
+    return p + 1;
+}
+
+// Write CRC-24 as '=' + 4 base64 chars + '\n'
+fn pgpWrCrc(out: int64, pos: int64, crc: int64): int64 {
+    var b0: int64 := (crc >> 16) & 255;
+    var b1: int64 := (crc >> 8) & 255;
+    var b2: int64 := crc & 255;
+    poke8(out + pos,     0x3D);  // '='
+    poke8(out + pos + 1, pgpB64Enc((b0 >> 2) & 63));
+    poke8(out + pos + 2, pgpB64Enc(((b0 & 3) << 4) | ((b1 >> 4) & 15)));
+    poke8(out + pos + 3, pgpB64Enc(((b1 & 15) << 2) | ((b2 >> 6) & 3)));
+    poke8(out + pos + 4, pgpB64Enc(b2 & 63));
+    poke8(out + pos + 5, 0x0A);  // '\n'
+    return pos + 6;
+}
+
+// Decode 4 base64 chars from s as 3 bytes → 24-bit CRC value
+fn pgpDecodeCrc4(s: int64): int64 {
+    var v0: int64 := pgpB64Dec(peek8(s));
+    var v1: int64 := pgpB64Dec(peek8(s + 1));
+    var v2: int64 := pgpB64Dec(peek8(s + 2));
+    var v3: int64 := pgpB64Dec(peek8(s + 3));
+    var b0: int64 := (v0 << 2) | (v1 >> 4);
+    var b1: int64 := ((v1 & 15) << 4) | (v2 >> 2);
+    var b2: int64 := ((v2 & 3) << 6) | v3;
+    return (b0 << 16) | (b1 << 8) | b2;
+}
+
+// Base64-decode src[0..srcLen) into dst[0..dstMax), return decoded byte count
+fn pgpB64Decode(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    while (i + 4 <= srcLen) {
+        var v0: int64 := pgpB64Dec(peek8(src + i));
+        var v1: int64 := pgpB64Dec(peek8(src + i + 1));
+        var v2: int64 := pgpB64Dec(peek8(src + i + 2));
+        var v3: int64 := pgpB64Dec(peek8(src + i + 3));
+        if (pos < dstMax) { poke8(dst + pos, ((v0 << 2) | (v1 >> 4)) & 255); pos := pos + 1; }
+        if (peek8(src + i + 2) != 0x3D && pos < dstMax) {
+            poke8(dst + pos, (((v1 & 15) << 4) | (v2 >> 2)) & 255); pos := pos + 1;
+        }
+        if (peek8(src + i + 3) != 0x3D && pos < dstMax) {
+            poke8(dst + pos, (((v2 & 3) << 6) | v3) & 255); pos := pos + 1;
+        }
+        i := i + 4;
+    }
+    return pos;
+}
+
+// Compare n bytes of buf[pos..] against pchar literal s; return 1 if equal
+fn pgpMatchN(buf: int64, pos: int64, s: pchar, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) {
+        if (peek8(buf + pos + i) != StrCharAt(s, i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+// ============================================================================
+// PgpArmorEncode — encode raw bytes as PGP ASCII armor (RFC 4880 §6.2)
+// ============================================================================
+pub fn PgpArmorEncode(data: int64, dataLen: int64, tp: int64, out: int64, outMax: int64): int64 {
+    var tag: pchar := pgpTagName(tp);
+    var pos: int64 := 0;
+
+    pos := pgpWrLit(out, pos, "-----BEGIN PGP "c, 15);
+    pos := pgpWrPchar(out, pos, tag);
+    pos := pgpWrLit(out, pos, "-----\n\n"c, 7);
+
+    // base64 data, 57 input bytes → 76 output chars per line
+    var i: int64 := 0;
+    while (i < dataLen) {
+        var n: int64 := dataLen - i;
+        if (n > 57) { n := 57; }
+        pos := pgpEncLine(data, i, n, out, pos);
+        i := i + n;
+    }
+
+    var crc: int64 := PgpCrc24(data, dataLen);
+    pos := pgpWrCrc(out, pos, crc);
+
+    pos := pgpWrLit(out, pos, "-----END PGP "c, 13);
+    pos := pgpWrPchar(out, pos, tag);
+    pos := pgpWrLit(out, pos, "-----\n"c, 6);
+
+    if (pos < outMax) { poke8(out + pos, 0); }
+    return pos;
+}
+
+// ============================================================================
+// PgpArmorDecode — decode PGP ASCII armor, verify CRC-24
+// Returns decoded byte count, or -1 on bad input / CRC mismatch
+// ============================================================================
+pub fn PgpArmorDecode(arm: int64, armLen: int64, out: int64, outMax: int64): int64 {
+    // Find "-----BEGIN PGP "
+    var i: int64 := 0;
+    var found: int64 := 0;
+    while (found == 0 && i + 15 <= armLen) {
+        if (pgpMatchN(arm, i, "-----BEGIN PGP "c, 15) != 0) { found := 1; }
+        if (found == 0) { i := i + 1; }
+    }
+    if (found == 0) { return 0 - 1; }
+
+    // Skip to end of BEGIN line
+    while (i < armLen && peek8(arm + i) != 0x0A) { i := i + 1; }
+    if (i < armLen) { i := i + 1; }  // skip '\n'
+
+    // Skip header attribute lines until blank line
+    var atBlank: int64 := 0;
+    while (atBlank == 0 && i < armLen) {
+        if (peek8(arm + i) == 0x0A) {
+            atBlank := 1;
+            i := i + 1;
+        } else {
+            while (i < armLen && peek8(arm + i) != 0x0A) { i := i + 1; }
+            if (i < armLen) { i := i + 1; }
+        }
+    }
+    if (atBlank == 0) { return 0 - 1; }
+
+    // Collect base64 characters; stop at '=' at line start (CRC) or '-' (END)
+    var tmp: int64 := alloc(armLen + 4);
+    var tmpLen: int64 := 0;
+    var crcBuf: int64 := alloc(8);
+    var crcFound: int64 := 0;
+    var lineStart: int64 := 1;
+    var done: int64 := 0;
+
+    while (done == 0 && i < armLen) {
+        var c: int64 := peek8(arm + i);
+        if (lineStart != 0 && c == 0x3D) {
+            // CRC line: '=' followed by 4 base64 chars
+            i := i + 1;
+            var j: int64 := 0;
+            while (j < 4 && i < armLen && peek8(arm + i) != 0x0A) {
+                poke8(crcBuf + j, peek8(arm + i));
+                i := i + 1;
+                j := j + 1;
+            }
+            crcFound := 1;
+            done := 1;
+        }
+        if (done == 0) {
+            if (lineStart != 0 && c == 0x2D) {
+                done := 1;  // start of -----END
+            }
+            if (done == 0) {
+                if (c != 0x0A && c != 0x0D && c != 0x20) {
+                    poke8(tmp + tmpLen, c);
+                    tmpLen := tmpLen + 1;
+                }
+                if (c == 0x0A) { lineStart := 1; } else { lineStart := 0; }
+                i := i + 1;
+            }
+        }
+    }
+
+    var outLen: int64 := pgpB64Decode(tmp, tmpLen, out, outMax);
+    free(tmp, armLen + 4);
+
+    if (crcFound != 0) {
+        var crcComputed: int64 := PgpCrc24(out, outLen);
+        var crcDecoded: int64 := pgpDecodeCrc4(crcBuf);
+        free(crcBuf, 8);
+        if (crcComputed != crcDecoded) { return 0 - 1; }
+    } else {
+        free(crcBuf, 8);
+    }
+
+    return outLen;
+}
+
+// ============================================================================
+// PgpArmorType — detect the armor type from the BEGIN header
+// ============================================================================
+pub fn PgpArmorType(arm: int64, armLen: int64): int64 {
+    var i: int64 := 0;
+    var found: int64 := 0;
+    while (found == 0 && i + 15 <= armLen) {
+        if (pgpMatchN(arm, i, "-----BEGIN PGP "c, 15) != 0) { found := 1; }
+        if (found == 0) { i := i + 1; }
+    }
+    if (found == 0) { return PGP_ARMOR_UNKNOWN; }
+    var tagStart: int64 := i + 15;
+    if (tagStart + 7 <= armLen && pgpMatchN(arm, tagStart, "MESSAGE"c, 7) != 0)             { return PGP_ARMOR_MESSAGE; }
+    if (tagStart + 16 <= armLen && pgpMatchN(arm, tagStart, "PUBLIC KEY BLOCK"c, 16) != 0)  { return PGP_ARMOR_PUBLIC_KEY; }
+    if (tagStart + 17 <= armLen && pgpMatchN(arm, tagStart, "PRIVATE KEY BLOCK"c, 17) != 0) { return PGP_ARMOR_PRIVATE_KEY; }
+    if (tagStart + 9 <= armLen && pgpMatchN(arm, tagStart, "SIGNATURE"c, 9) != 0)           { return PGP_ARMOR_SIGNATURE; }
+    return PGP_ARMOR_UNKNOWN;
+}

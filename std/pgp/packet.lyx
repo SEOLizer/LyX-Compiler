@@ -1,0 +1,119 @@
+// std/pgp/packet.lyx — OpenPGP packet format iterator (RFC 4880 §4)
+//
+// Public API:
+//   PgpPacketFirst(buf, len, pkt) → 1 if found, 0 if empty/invalid
+//   PgpPacketNext(buf, len, pkt)  → 1 if more packets, 0 at end
+//
+// pkt is a PGP_PKT_SIZE-byte struct (alloc by caller):
+//   PGP_PKT_OFF_TAG  = 0   packet type (PGP_TAG_* constant)
+//   PGP_PKT_OFF_BODY = 8   absolute pointer into buf to the body bytes
+//   PGP_PKT_OFF_BLEN = 16  body length in bytes
+//   PGP_PKT_OFF_NEXT = 24  byte offset in buf of next packet (feed back to PgpPacketNext)
+//
+// Supported:
+//   Old-format packets (ll=0,1,2,3) — RFC 4880 §4.2.1
+//   New-format packets (1-byte, 2-byte, 5-byte lengths) — RFC 4880 §4.2.2
+//   New-format partial-body headers are treated as complete (partial scan skipped)
+
+@description("OpenPGP packet format iterator (RFC 4880 §4)")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.pgp.packet;
+
+import std.pgp.core;
+
+// ============================================================================
+// Internal: decode new-format variable-length integer
+// Returns (bodyLen << 32) | headerBytes consumed after the tag byte
+// ============================================================================
+fn pgpNewLen(buf: int64, bufLen: int64, off: int64): int64 {
+    if (off >= bufLen) { return 0; }
+    var b0: int64 := peek8(buf + off);
+    if (b0 < 192) {
+        return (b0 << 32) | 1;
+    }
+    if (b0 < 224) {
+        if (off + 1 >= bufLen) { return 0; }
+        var b1: int64 := peek8(buf + off + 1);
+        var ln: int64 := (b0 - 192) * 256 + b1 + 192;
+        return (ln << 32) | 2;
+    }
+    if (b0 == 255) {
+        if (off + 5 > bufLen) { return 0; }
+        var ln: int64 := (peek8(buf+off+1) << 24) | (peek8(buf+off+2) << 16) |
+                         (peek8(buf+off+3) <<  8) |  peek8(buf+off+4);
+        return (ln << 32) | 5;
+    }
+    // partial body (224-254): 1 << (b0 & 31) bytes; expose as length, 1-byte header
+    var bits: int64 := b0 & 31;
+    var plen: int64 := 1;
+    var k: int64 := 0;
+    while (k < bits) { plen := plen * 2; k := k + 1; }
+    return (plen << 32) | 1;
+}
+
+// ============================================================================
+// Internal: parse one packet starting at buf[off]
+// ============================================================================
+fn pgpParsePacket(buf: int64, bufLen: int64, off: int64, pkt: int64): int64 {
+    if (off >= bufLen) { return 0; }
+    var tb: int64 := peek8(buf + off);
+    if ((tb & 0x80) == 0) { return 0; }  // not a valid packet tag byte
+
+    var tag:       int64 := 0;
+    var bodyStart: int64 := 0;
+    var bodyLen:   int64 := 0;
+
+    if ((tb & 0x40) != 0) {
+        // New format
+        tag := tb & 0x3F;
+        var r: int64 := pgpNewLen(buf, bufLen, off + 1);
+        bodyLen   := r >> 32;
+        bodyStart := off + 1 + (r & 0xFFFFFFFF);
+    } else {
+        // Old format
+        tag := (tb >> 2) & 0xF;
+        var ll: int64 := tb & 3;
+        if (ll == 0) {
+            bodyLen   := peek8(buf + off + 1);
+            bodyStart := off + 2;
+        } else {
+            if (ll == 1) {
+                bodyLen   := (peek8(buf+off+1) << 8) | peek8(buf+off+2);
+                bodyStart := off + 3;
+            } else {
+                if (ll == 2) {
+                    bodyLen   := (peek8(buf+off+1) << 24) | (peek8(buf+off+2) << 16) |
+                                 (peek8(buf+off+3) <<  8) |  peek8(buf+off+4);
+                    bodyStart := off + 5;
+                } else {
+                    // ll == 3: indeterminate length → until EOF
+                    bodyLen   := bufLen - off - 1;
+                    bodyStart := off + 1;
+                }
+            }
+        }
+    }
+
+    if (bodyStart + bodyLen > bufLen) { bodyLen := bufLen - bodyStart; }
+    if (bodyStart > bufLen) { return 0; }
+
+    poke64(pkt + PGP_PKT_OFF_TAG,  tag);
+    poke64(pkt + PGP_PKT_OFF_BODY, buf + bodyStart);
+    poke64(pkt + PGP_PKT_OFF_BLEN, bodyLen);
+    poke64(pkt + PGP_PKT_OFF_NEXT, bodyStart + bodyLen);
+    return 1;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn PgpPacketFirst(buf: int64, len: int64, pkt: int64): int64 {
+    return pgpParsePacket(buf, len, 0, pkt);
+}
+
+pub fn PgpPacketNext(buf: int64, len: int64, pkt: int64): int64 {
+    var nextOff: int64 := peek64(pkt + PGP_PKT_OFF_NEXT);
+    return pgpParsePacket(buf, len, nextOff, pkt);
+}
