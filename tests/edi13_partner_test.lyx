@@ -1,0 +1,374 @@
+// tests/edi13_partner_test.lyx — WP-EDI-13 Partner Profile / AS2 / SFTP tests
+unit tests.edi13_partner_test;
+
+import std.edi.partner;
+import std.alloc;
+import src.std.io;
+
+fn strEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+    if (aLen != bLen) { return 0; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (peek8(a + i) != peek8(b + i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+fn pass(n: int64) { Print("PASS "); PrintLn(n); }
+fn fail(n: int64) { Print("FAIL "); PrintLn(n); }
+fn check(n: int64, ok: int64) { if (ok == 1) { pass(n); } else { fail(n); } }
+
+fn zero(ptr: int64, sz: int64) {
+    var i: int64 := 0;
+    while (i < sz) { poke8(ptr + i, 0); i := i + 1; }
+}
+
+fn fillAs2Partner(part: int64) {
+    zero(part, EDI_PART_SIZE);
+    poke64(part + EDI_PART_PROTOCOL,   EDI_PART_PROTO_AS2);
+    poke64(part + EDI_PART_PARTNERID,  "ACME-GmbH"c as int64);
+    poke64(part + EDI_PART_PARTNERLEN, 9);
+    poke64(part + EDI_PART_OURID,      "MINE-Corp"c as int64);
+    poke64(part + EDI_PART_OURIDLEN,   9);
+    poke64(part + EDI_PART_HOST,       "as2.acme.com"c as int64);
+    poke64(part + EDI_PART_HOSTLEN,    12);
+    poke64(part + EDI_PART_PORT,       4080);
+    poke64(part + EDI_PART_PATH,       "/as2"c as int64);
+    poke64(part + EDI_PART_PATHLEN,    4);
+    poke64(part + EDI_PART_MSGTYPES,   EDI_PART_MSG_ORDERS + EDI_PART_MSG_INVOIC);
+    poke64(part + EDI_PART_OPTIONS,    EDI_PART_OPT_SIGN + EDI_PART_OPT_MDN_SYNC);
+}
+
+fn fillSftpPartner(part: int64) {
+    zero(part, EDI_PART_SIZE);
+    poke64(part + EDI_PART_PROTOCOL,   EDI_PART_PROTO_SFTP);
+    poke64(part + EDI_PART_PARTNERID,  "LOGI-AG"c as int64);
+    poke64(part + EDI_PART_PARTNERLEN, 7);
+    poke64(part + EDI_PART_OURID,      "MINE-Corp"c as int64);
+    poke64(part + EDI_PART_OURIDLEN,   9);
+    poke64(part + EDI_PART_HOST,       "sftp.logi-ag.de"c as int64);
+    poke64(part + EDI_PART_HOSTLEN,    15);
+    poke64(part + EDI_PART_PORT,       22);
+    poke64(part + EDI_PART_PATH,       "/edi/in"c as int64);
+    poke64(part + EDI_PART_PATHLEN,    7);
+    poke64(part + EDI_PART_MSGTYPES,   EDI_PART_MSG_REMADV + EDI_PART_MSG_TRANSPORT);
+    poke64(part + EDI_PART_OPTIONS,    0);
+}
+
+fn main() {
+    // ── Tests 1-4: EdiPartnerValidate ─────────────────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);
+        check(1, EdiPartnerValidate(part));
+
+        // Missing partnerID → invalid
+        poke64(part + EDI_PART_PARTNERLEN, 0);
+        check(2, EdiPartnerValidate(part) == 0);
+        poke64(part + EDI_PART_PARTNERLEN, 9);
+
+        // Unknown protocol → invalid
+        poke64(part + EDI_PART_PROTOCOL, 99);
+        check(3, EdiPartnerValidate(part) == 0);
+        poke64(part + EDI_PART_PROTOCOL, EDI_PART_PROTO_AS2);
+
+        // SFTP partner also valid
+        fillSftpPartner(part);
+        check(4, EdiPartnerValidate(part));
+
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Tests 5-8: EdiPartnerSupports ─────────────────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);  // ORDERS + INVOIC
+
+        check(5, EdiPartnerSupports(part, EDI_PART_MSG_ORDERS));
+        check(6, EdiPartnerSupports(part, EDI_PART_MSG_INVOIC));
+        check(7, EdiPartnerSupports(part, EDI_PART_MSG_REMADV) == 0);
+        check(8, EdiPartnerSupports(part, EDI_PART_MSG_TRANSPORT) == 0);
+
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Tests 9-18: EdiPartnerWrite / EdiPartnerRead round-trip (AS2) ────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);
+
+        var out: int64 := alloc(1024);
+        var written: int64 := EdiPartnerWrite(part, out, 1024);
+        check(9, written > 0);
+
+        var part2: int64 := alloc(EDI_PART_SIZE);
+        var r: int64 := EdiPartnerRead(out, written, part2);
+        check(10, r == 1);
+        check(11, peek64(part2 + EDI_PART_PROTOCOL) == EDI_PART_PROTO_AS2);
+
+        var pidPtr: int64 := peek64(part2 + EDI_PART_PARTNERID);
+        var pidLen: int64 := peek64(part2 + EDI_PART_PARTNERLEN);
+        check(12, strEq(pidPtr, pidLen, "ACME-GmbH"c as int64, 9));
+
+        var ourPtr: int64 := peek64(part2 + EDI_PART_OURID);
+        var ourLen: int64 := peek64(part2 + EDI_PART_OURIDLEN);
+        check(13, strEq(ourPtr, ourLen, "MINE-Corp"c as int64, 9));
+
+        var hostPtr: int64 := peek64(part2 + EDI_PART_HOST);
+        var hostLen: int64 := peek64(part2 + EDI_PART_HOSTLEN);
+        check(14, strEq(hostPtr, hostLen, "as2.acme.com"c as int64, 12));
+
+        check(15, peek64(part2 + EDI_PART_PORT) == 4080);
+
+        var pathPtr: int64 := peek64(part2 + EDI_PART_PATH);
+        var pathLen: int64 := peek64(part2 + EDI_PART_PATHLEN);
+        check(16, strEq(pathPtr, pathLen, "/as2"c as int64, 4));
+
+        // msgTypes must include ORDERS and INVOIC
+        check(17, EdiPartnerSupports(part2, EDI_PART_MSG_ORDERS));
+        check(18, EdiPartnerSupports(part2, EDI_PART_MSG_INVOIC));
+
+        free(part2, EDI_PART_SIZE);
+        free(out, 1024);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Tests 19-23: EdiPartnerWrite / EdiPartnerRead round-trip (SFTP) ──────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillSftpPartner(part);
+
+        var out: int64 := alloc(1024);
+        var written: int64 := EdiPartnerWrite(part, out, 1024);
+        check(19, written > 0);
+
+        var part2: int64 := alloc(EDI_PART_SIZE);
+        EdiPartnerRead(out, written, part2);
+        check(20, peek64(part2 + EDI_PART_PROTOCOL) == EDI_PART_PROTO_SFTP);
+        check(21, peek64(part2 + EDI_PART_PORT) == 22);
+
+        var hostPtr: int64 := peek64(part2 + EDI_PART_HOST);
+        var hostLen: int64 := peek64(part2 + EDI_PART_HOSTLEN);
+        check(22, strEq(hostPtr, hostLen, "sftp.logi-ag.de"c as int64, 15));
+
+        var pathPtr: int64 := peek64(part2 + EDI_PART_PATH);
+        var pathLen: int64 := peek64(part2 + EDI_PART_PATHLEN);
+        check(23, strEq(pathPtr, pathLen, "/edi/in"c as int64, 7));
+
+        free(part2, EDI_PART_SIZE);
+        free(out, 1024);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Tests 24-26: options round-trip ──────────────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);
+        // OPT_SIGN + OPT_MDN_SYNC = 1 + 4 = 5
+        var out: int64 := alloc(1024);
+        var written: int64 := EdiPartnerWrite(part, out, 1024);
+        var part2: int64 := alloc(EDI_PART_SIZE);
+        EdiPartnerRead(out, written, part2);
+        var opts: int64 := peek64(part2 + EDI_PART_OPTIONS);
+        check(24, opts == EDI_PART_OPT_SIGN + EDI_PART_OPT_MDN_SYNC);
+        check(25, (opts / EDI_PART_OPT_SIGN) - ((opts / EDI_PART_OPT_SIGN) / 2) * 2 > 0);
+        check(26, (opts / EDI_PART_OPT_MDN_SYNC) - ((opts / EDI_PART_OPT_MDN_SYNC) / 2) * 2 > 0);
+        free(part2, EDI_PART_SIZE);
+        free(out, 1024);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Tests 27-30: EdiPartnerListWrite / EdiPartnerListRead ────────────────
+    {
+        var parts: int64 := alloc(2 * EDI_PART_SIZE);
+        fillAs2Partner(parts + 0 * EDI_PART_SIZE);
+        fillSftpPartner(parts + 1 * EDI_PART_SIZE);
+
+        var out: int64 := alloc(2048);
+        var written: int64 := EdiPartnerListWrite(parts, 2, out, 2048);
+        check(27, written > 0);
+
+        var parts2: int64 := alloc(4 * EDI_PART_SIZE);
+        zero(parts2, 4 * EDI_PART_SIZE);
+        var count: int64 := EdiPartnerListRead(out, written, parts2, 4);
+        check(28, count == 2);
+        check(29, peek64(parts2 + 0 * EDI_PART_SIZE + EDI_PART_PROTOCOL) == EDI_PART_PROTO_AS2);
+        check(30, peek64(parts2 + 1 * EDI_PART_SIZE + EDI_PART_PROTOCOL) == EDI_PART_PROTO_SFTP);
+
+        free(parts2, 4 * EDI_PART_SIZE);
+        free(out, 2048);
+        free(parts, 2 * EDI_PART_SIZE);
+    }
+
+    // ── Tests 31-33: EdiPartnerFind ──────────────────────────────────────────
+    {
+        var parts: int64 := alloc(2 * EDI_PART_SIZE);
+        fillAs2Partner(parts + 0 * EDI_PART_SIZE);
+        fillSftpPartner(parts + 1 * EDI_PART_SIZE);
+
+        var rec: int64 := EdiPartnerFind(parts, 2, "ACME-GmbH"c as int64, 9);
+        check(31, rec != 0);
+        check(32, peek64(rec + EDI_PART_PROTOCOL) == EDI_PART_PROTO_AS2);
+
+        // Not found
+        var rec2: int64 := EdiPartnerFind(parts, 2, "UNKNOWN"c as int64, 7);
+        check(33, rec2 == 0);
+
+        free(parts, 2 * EDI_PART_SIZE);
+    }
+
+    // ── Tests 34-35: EdiPartnerFind for SFTP partner ─────────────────────────
+    {
+        var parts: int64 := alloc(2 * EDI_PART_SIZE);
+        fillAs2Partner(parts + 0 * EDI_PART_SIZE);
+        fillSftpPartner(parts + 1 * EDI_PART_SIZE);
+
+        var rec: int64 := EdiPartnerFind(parts, 2, "LOGI-AG"c as int64, 7);
+        check(34, rec != 0);
+        check(35, peek64(rec + EDI_PART_PROTOCOL) == EDI_PART_PROTO_SFTP);
+
+        free(parts, 2 * EDI_PART_SIZE);
+    }
+
+    // ── Tests 36-37: msgTypes bit-field round-trip through list ──────────────
+    {
+        var parts: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(parts);
+        poke64(parts + EDI_PART_MSGTYPES,
+            EDI_PART_MSG_ORDERS + EDI_PART_MSG_INVOIC +
+            EDI_PART_MSG_TRANSPORT + EDI_PART_MSG_CUSTOMS);
+
+        var out: int64 := alloc(1024);
+        EdiPartnerWrite(parts, out, 1024);
+
+        var parts2: int64 := alloc(2 * EDI_PART_SIZE);
+        EdiPartnerListRead(out, 1024, parts2, 2);
+
+        check(36, EdiPartnerSupports(parts2, EDI_PART_MSG_TRANSPORT));
+        check(37, EdiPartnerSupports(parts2, EDI_PART_MSG_CUSTOMS));
+
+        free(parts2, 2 * EDI_PART_SIZE);
+        free(out, 1024);
+        free(parts, EDI_PART_SIZE);
+    }
+
+    // ── Test 38: port 4080 round-trip via list ────────────────────────────────
+    {
+        var parts: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(parts);
+        var out: int64 := alloc(1024);
+        var written: int64 := EdiPartnerWrite(parts, out, 1024);
+        var parts2: int64 := alloc(2 * EDI_PART_SIZE);
+        zero(parts2, 2 * EDI_PART_SIZE);
+        EdiPartnerListRead(out, written, parts2, 2);
+        check(38, peek64(parts2 + EDI_PART_PORT) == 4080);
+        free(parts2, 2 * EDI_PART_SIZE);
+        free(out, 1024);
+        free(parts, EDI_PART_SIZE);
+    }
+
+    // ── Test 39: SFTP port 22 round-trip via list ─────────────────────────────
+    {
+        var parts: int64 := alloc(EDI_PART_SIZE);
+        fillSftpPartner(parts);
+        var out: int64 := alloc(1024);
+        var written: int64 := EdiPartnerWrite(parts, out, 1024);
+        var parts2: int64 := alloc(2 * EDI_PART_SIZE);
+        zero(parts2, 2 * EDI_PART_SIZE);
+        EdiPartnerListRead(out, written, parts2, 2);
+        check(39, peek64(parts2 + EDI_PART_PORT) == 22);
+        free(parts2, 2 * EDI_PART_SIZE);
+        free(out, 1024);
+        free(parts, EDI_PART_SIZE);
+    }
+
+    // ── Test 40: SEAFREIGHT msg flag round-trip ───────────────────────────────
+    {
+        var parts: int64 := alloc(EDI_PART_SIZE);
+        fillSftpPartner(parts);
+        poke64(parts + EDI_PART_MSGTYPES, EDI_PART_MSG_SEAFREIGHT + EDI_PART_MSG_CUSTOMS);
+        var out: int64 := alloc(1024);
+        EdiPartnerWrite(parts, out, 1024);
+        var parts2: int64 := alloc(2 * EDI_PART_SIZE);
+        EdiPartnerListRead(out, 1024, parts2, 2);
+        check(40, EdiPartnerSupports(parts2, EDI_PART_MSG_SEAFREIGHT));
+        free(parts2, 2 * EDI_PART_SIZE);
+        free(out, 1024);
+        free(parts, EDI_PART_SIZE);
+    }
+
+    // ── Test 41: validate missing ourID → invalid ─────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);
+        poke64(part + EDI_PART_OURIDLEN, 0);
+        check(41, EdiPartnerValidate(part) == 0);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Test 42: validate missing host → invalid ──────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillAs2Partner(part);
+        poke64(part + EDI_PART_HOSTLEN, 0);
+        check(42, EdiPartnerValidate(part) == 0);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Test 43: EdiPartnerRead fails on truncated line (< 8 fields) ─────────
+    {
+        var line: int64 := "AS2|ACME|MINE|host.com"c as int64;  // only 4 fields
+        var part: int64 := alloc(EDI_PART_SIZE);
+        var r: int64 := EdiPartnerRead(line, 22, part);
+        check(43, r == 0);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Test 44: our ID in SFTP round-trip ───────────────────────────────────
+    {
+        var part: int64 := alloc(EDI_PART_SIZE);
+        fillSftpPartner(part);
+        var out: int64 := alloc(1024);
+        EdiPartnerWrite(part, out, 1024);
+        var part2: int64 := alloc(EDI_PART_SIZE);
+        EdiPartnerRead(out, 1024, part2);
+        check(44, strEq(peek64(part2+EDI_PART_OURID), peek64(part2+EDI_PART_OURIDLEN), "MINE-Corp"c as int64, 9));
+        free(part2, EDI_PART_SIZE);
+        free(out, 1024);
+        free(part, EDI_PART_SIZE);
+    }
+
+    // ── Test 45: 3-partner list round-trip count ──────────────────────────────
+    {
+        var parts: int64 := alloc(3 * EDI_PART_SIZE);
+        fillAs2Partner(parts + 0 * EDI_PART_SIZE);
+        fillSftpPartner(parts + 1 * EDI_PART_SIZE);
+        // Third partner: AS2 variant
+        zero(parts + 2 * EDI_PART_SIZE, EDI_PART_SIZE);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PROTOCOL,   EDI_PART_PROTO_AS2);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PARTNERID,  "SHOP-AG"c as int64);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PARTNERLEN, 7);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_OURID,      "MINE-Corp"c as int64);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_OURIDLEN,   9);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_HOST,       "as2.shop-ag.com"c as int64);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_HOSTLEN,    15);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PORT,       443);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PATH,       "/as2/receive"c as int64);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_PATHLEN,    12);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_MSGTYPES,   EDI_PART_MSG_ORDERS);
+        poke64(parts + 2 * EDI_PART_SIZE + EDI_PART_OPTIONS,    EDI_PART_OPT_ENCRYPT);
+
+        var out: int64 := alloc(4096);
+        EdiPartnerListWrite(parts, 3, out, 4096);
+
+        var parts2: int64 := alloc(4 * EDI_PART_SIZE);
+        zero(parts2, 4 * EDI_PART_SIZE);
+        var n: int64 := EdiPartnerListRead(out, 4096, parts2, 4);
+        check(45, n == 3);
+
+        free(parts2, 4 * EDI_PART_SIZE);
+        free(out, 4096);
+        free(parts, 3 * EDI_PART_SIZE);
+    }
+}
