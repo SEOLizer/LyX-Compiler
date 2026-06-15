@@ -1,0 +1,642 @@
+// std/edi/customs.lyx — Customs messages: CUSCAR + CUSDEC + CUSEXP + CUSRSP
+// (WP-EDI-12)
+//
+// CUSCAR: Customs cargo report (carrier → customs).
+// CUSDEC: Customs declaration (declarant → customs).
+// CUSEXP: Customs express consignment (courier manifest).
+// CUSRSP: Customs response (customs → declarant).
+//
+// Structure: BGM + DTM + LOC (origin/dest) + NAD (declarant/carrier) +
+//   MOA (customs value) + RFF (procedure/declaration ref) + FTX (free text) +
+//   CNT + response code (CUSRSP).
+
+unit std.edi.customs;
+
+import std.edi.core;
+import std.alloc;
+
+// ── BGM qualifiers ────────────────────────────────────────────────────────────
+pub con EDI_CUS_BGM_CUSCAR: int64 := 85;
+pub con EDI_CUS_BGM_CUSDEC: int64 := 960;
+pub con EDI_CUS_BGM_CUSEXP: int64 := 962;
+pub con EDI_CUS_BGM_CUSRSP: int64 := 961;
+
+// ── CUSRSP response codes ─────────────────────────────────────────────────────
+pub con EDI_CUSRSP_ACCEPTED:  int64 := 1;  // declaration accepted
+pub con EDI_CUSRSP_REJECTED:  int64 := 2;  // declaration rejected
+pub con EDI_CUSRSP_QUERIED:   int64 := 3;  // more information needed
+pub con EDI_CUSRSP_RELEASED:  int64 := 4;  // goods released
+
+// ── EDI_CUS_HDR offsets (160 bytes) ──────────────────────────────────────────
+pub con EDI_CUS_HDR_BGMQUAL:    int64 := 0;
+pub con EDI_CUS_HDR_REF:        int64 := 8;    // BGM ref
+pub con EDI_CUS_HDR_REFLEN:     int64 := 16;
+pub con EDI_CUS_HDR_DATE:       int64 := 24;
+pub con EDI_CUS_HDR_DATELEN:    int64 := 32;
+pub con EDI_CUS_HDR_ORIGIN:     int64 := 40;   // LOC+87 origin country/port
+pub con EDI_CUS_HDR_ORIGLEN:    int64 := 48;
+pub con EDI_CUS_HDR_DEST:       int64 := 56;   // LOC+88 destination
+pub con EDI_CUS_HDR_DESTLEN:    int64 := 64;
+pub con EDI_CUS_HDR_DECLARANT:  int64 := 72;   // NAD+DT declarant name
+pub con EDI_CUS_HDR_DECLLEN:    int64 := 80;
+pub con EDI_CUS_HDR_CARRIER:    int64 := 88;   // NAD+CA carrier name
+pub con EDI_CUS_HDR_CARRLEN:    int64 := 96;
+pub con EDI_CUS_HDR_CUSTVALUE:  int64 := 104;  // MOA+126 customs value (× 100)
+pub con EDI_CUS_HDR_CURRENCY:   int64 := 112;  // CUX currency code ptr
+pub con EDI_CUS_HDR_CURLEN:     int64 := 120;
+pub con EDI_CUS_HDR_DECLREF:    int64 := 128;  // RFF+ADE declaration ref
+pub con EDI_CUS_HDR_DECLREFLEN: int64 := 136;
+pub con EDI_CUS_HDR_RSPCODE:    int64 := 144;  // CUSRSP: 1-4
+pub con EDI_CUS_HDR_PROCCODE:   int64 := 152;  // customs procedure code
+pub con EDI_CUS_HDR_SIZE:       int64 := 160;
+
+// ── EDI_CUS_ITEM offsets (48 bytes) ──────────────────────────────────────────
+pub con EDI_CUS_ITEM_DESC:      int64 := 0;    // LIN item description ptr
+pub con EDI_CUS_ITEM_DESCLEN:   int64 := 8;
+pub con EDI_CUS_ITEM_QTY:       int64 := 16;   // quantity
+pub con EDI_CUS_ITEM_VALUE:     int64 := 24;   // customs value × 100
+pub con EDI_CUS_ITEM_HSCODE:    int64 := 32;   // HS tariff code ptr
+pub con EDI_CUS_ITEM_HSCODELEN: int64 := 40;
+pub con EDI_CUS_ITEM_SIZE:      int64 := 48;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn cusPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0 || pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn cusPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn cusPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val == 0) { return cusPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var tbuf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(tbuf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := cusPutStr(out, pos, outMax, tbuf, digits);
+    free(tbuf, 24);
+    return r;
+}
+
+fn cusPutRevenue(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var euros: int64 := val / 100;
+    var cents: int64 := val - euros * 100;
+    pos := cusPutInt(out, pos, outMax, euros);
+    pos := cusPutChar(out, pos, outMax, 46);
+    if (cents < 10) { pos := cusPutChar(out, pos, outMax, 48); }
+    pos := cusPutInt(out, pos, outMax, cents);
+    return pos;
+}
+
+fn cusParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+fn cusParseRevenue(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var afterDot: int64 := 0;
+    var decimals: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) { afterDot := 1; }
+        else {
+            if (c >= 48 && c <= 57) {
+                v := v * 10 + (c - 48);
+                if (afterDot == 1) { decimals := decimals + 1; }
+            }
+        }
+        i := i + 1;
+    }
+    if (afterDot == 0) { v := v * 100; }
+    if (decimals == 1) { v := v * 10; }
+    return v;
+}
+
+fn cusTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn cusEP(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR); }
+fn cusEL(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN); }
+
+fn cusWriteCnt(out: int64, pos: int64, outMax: int64, n: int64): int64 {
+    pos := cusPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutChar(out, pos, outMax, 50);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutInt(out, pos, outMax, n);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write LOC+qual+loc::9'
+fn cusWriteLoc(out: int64, pos: int64, outMax: int64, qual: int64, locPtr: int64, locLen: int64): int64 {
+    if (locPtr == 0 || locLen == 0) { return pos; }
+    pos := cusPutStr(out, pos, outMax, "LOC"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutInt(out, pos, outMax, qual);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutStr(out, pos, outMax, locPtr, locLen);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutChar(out, pos, outMax, 57);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write RFF+qual2:ref'
+fn cusWriteRff(out: int64, pos: int64, outMax: int64, qual2: int64, refPtr: int64, refLen: int64): int64 {
+    if (refPtr == 0 || refLen == 0) { return pos; }
+    pos := cusPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutStr(out, pos, outMax, qual2, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutStr(out, pos, outMax, refPtr, refLen);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write NAD+role+name::9' (role is 2-char, e.g. "DT", "CA")
+fn cusWriteNad(out: int64, pos: int64, outMax: int64, role2: int64, namePtr: int64, nameLen: int64): int64 {
+    if (namePtr == 0 || nameLen == 0) { return pos; }
+    pos := cusPutStr(out, pos, outMax, "NAD"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutStr(out, pos, outMax, role2, 2);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutStr(out, pos, outMax, namePtr, nameLen);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := cusPutChar(out, pos, outMax, 57);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// BGM + DTM + LOC+87/88 + NAD+DT (declarant) + NAD+CA (carrier) +
+// CUX + MOA+126 + RFF+ADE; return pos
+fn cusWriteHead(hdr: int64, out: int64, outMax: int64): int64 {
+    var bgmQual:  int64 := peek64(hdr + EDI_CUS_HDR_BGMQUAL);
+    var refPtr:   int64 := peek64(hdr + EDI_CUS_HDR_REF);
+    var refLen:   int64 := peek64(hdr + EDI_CUS_HDR_REFLEN);
+    var datePtr:  int64 := peek64(hdr + EDI_CUS_HDR_DATE);
+    var origPtr:  int64 := peek64(hdr + EDI_CUS_HDR_ORIGIN);
+    var origLen:  int64 := peek64(hdr + EDI_CUS_HDR_ORIGLEN);
+    var destPtr:  int64 := peek64(hdr + EDI_CUS_HDR_DEST);
+    var destLen:  int64 := peek64(hdr + EDI_CUS_HDR_DESTLEN);
+    var declPtr:  int64 := peek64(hdr + EDI_CUS_HDR_DECLARANT);
+    var declLen:  int64 := peek64(hdr + EDI_CUS_HDR_DECLLEN);
+    var pos:      int64 := 0;
+
+    pos := cusPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutInt(out, pos, outMax, bgmQual);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := cusPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutChar(out, pos, outMax, 57);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) {
+        pos := cusPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := cusPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := cusPutStr(out, pos, outMax, datePtr, 8);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := cusPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := cusWriteLoc(out, pos, outMax, 87, origPtr, origLen);
+    pos := cusWriteLoc(out, pos, outMax, 88, destPtr, destLen);
+    pos := cusWriteNad(out, pos, outMax, "DT"c as int64, declPtr, declLen);
+
+    var carrPtr: int64 := peek64(hdr + EDI_CUS_HDR_CARRIER);
+    var carrLen: int64 := peek64(hdr + EDI_CUS_HDR_CARRLEN);
+    pos := cusWriteNad(out, pos, outMax, "CA"c as int64, carrPtr, carrLen);
+
+    var curPtr:  int64 := peek64(hdr + EDI_CUS_HDR_CURRENCY);
+    var curLen:  int64 := peek64(hdr + EDI_CUS_HDR_CURLEN);
+    var custVal: int64 := peek64(hdr + EDI_CUS_HDR_CUSTVALUE);
+
+    // CUX+2:currency:4'
+    if (curPtr != 0 && curLen > 0) {
+        pos := cusPutStr(out, pos, outMax, "CUX"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := cusPutChar(out, pos, outMax, 50);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := cusPutStr(out, pos, outMax, curPtr, curLen);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := cusPutChar(out, pos, outMax, 52);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // MOA+126:value'
+    if (custVal > 0) {
+        pos := cusPutStr(out, pos, outMax, "MOA"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := cusPutStr(out, pos, outMax, "126"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := cusPutRevenue(out, pos, outMax, custVal);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var drPtr: int64 := peek64(hdr + EDI_CUS_HDR_DECLREF);
+    var drLen: int64 := peek64(hdr + EDI_CUS_HDR_DECLREFLEN);
+    pos := cusWriteRff(out, pos, outMax, "ADE"c as int64, drPtr, drLen);
+
+    var proc: int64 := peek64(hdr + EDI_CUS_HDR_PROCCODE);
+    if (proc > 0) {
+        pos := cusPutStr(out, pos, outMax, "GIS"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := cusPutInt(out, pos, outMax, proc);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    return pos;
+}
+
+// Common reader for all customs messages
+fn cusReadMsg(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (cusTagIs(seg, 66, 71, 77) == 1) {   // BGM
+                if (n > 0) { poke64(hdr + EDI_CUS_HDR_BGMQUAL, cusParseInt(cusEP(elems,0), cusEL(elems,0))); }
+                if (n > 1) { poke64(hdr + EDI_CUS_HDR_REF, cusEP(elems,1)); poke64(hdr + EDI_CUS_HDR_REFLEN, cusEL(elems,1)); }
+            }
+
+            if (cusTagIs(seg, 68, 84, 77) == 1) {   // DTM
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 3 && peek8(qp)==49 && peek8(qp+1)==51 && peek8(qp+2)==55) {
+                            poke64(hdr + EDI_CUS_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_CUS_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (cusTagIs(seg, 76, 79, 67) == 1) {   // LOC
+                if (n > 1) {
+                    var qual: int64 := cusParseInt(cusEP(elems,0), cusEL(elems,0));
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(cusEP(elems,1), cusEL(elems,1), comps, 4);
+                    var lp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                    var ll: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                    if (qual == 87) { poke64(hdr + EDI_CUS_HDR_ORIGIN, lp); poke64(hdr + EDI_CUS_HDR_ORIGLEN, ll); }
+                    if (qual == 88) { poke64(hdr + EDI_CUS_HDR_DEST,   lp); poke64(hdr + EDI_CUS_HDR_DESTLEN, ll); }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (cusTagIs(seg, 78, 65, 68) == 1) {   // NAD
+                if (n > 1) {
+                    var qp: int64 := cusEP(elems, 0);
+                    var ql: int64 := cusEL(elems, 0);
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(cusEP(elems,1), cusEL(elems,1), comps, 4);
+                    var np: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                    var nl: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                    // "DT" = 68,84
+                    if (ql >= 2 && peek8(qp) == 68 && peek8(qp+1) == 84) {
+                        poke64(hdr + EDI_CUS_HDR_DECLARANT, np);
+                        poke64(hdr + EDI_CUS_HDR_DECLLEN,   nl);
+                    }
+                    // "CA" = 67,65
+                    if (ql >= 2 && peek8(qp) == 67 && peek8(qp+1) == 65) {
+                        poke64(hdr + EDI_CUS_HDR_CARRIER, np);
+                        poke64(hdr + EDI_CUS_HDR_CARRLEN, nl);
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // CUX = 67,85,88
+            if (cusTagIs(seg, 67, 85, 88) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_CUS_HDR_CURRENCY, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_CUS_HDR_CURLEN,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // MOA = 77,79,65
+            if (cusTagIs(seg, 77, 79, 65) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "126" = customs value
+                        if (ql == 3 && peek8(qp)==49 && peek8(qp+1)==50 && peek8(qp+2)==54) {
+                            poke64(hdr + EDI_CUS_HDR_CUSTVALUE, cusParseRevenue(
+                                peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                                peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // RFF = 82,70,70
+            if (cusTagIs(seg, 82, 70, 70) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "ADE" = 65,68,69 declaration ref
+                        if (ql == 3 && peek8(qp)==65 && peek8(qp+1)==68 && peek8(qp+2)==69) {
+                            poke64(hdr + EDI_CUS_HDR_DECLREF,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_CUS_HDR_DECLREFLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // GIS = 71,73,83 → procedure code
+            if (cusTagIs(seg, 71, 73, 83) == 1) {
+                if (n > 0) { poke64(hdr + EDI_CUS_HDR_PROCCODE, cusParseInt(cusEP(elems,0), cusEL(elems,0))); }
+            }
+
+            // STS = 83,84,83 → response code (CUSRSP)
+            if (cusTagIs(seg, 83, 84, 83) == 1) {
+                if (n > 0) { poke64(hdr + EDI_CUS_HDR_RSPCODE, cusParseInt(cusEP(elems,0), cusEL(elems,0))); }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// Read line items: LIN+n+desc' / MOA+66:value' / RFF+HS:hscode' / QTY+1:qty'
+fn cusReadItems(buf: int64, bufLen: int64, items: int64, maxItems: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx:    int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:     int64 := alloc(EDI_SEG_SIZE);
+    var elems:   int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count:   int64 := 0;
+    var curItem: int64 := 0;
+    var done:    int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // LIN = 76,73,78 → new item
+            if (cusTagIs(seg, 76, 73, 78) == 1 && count < maxItems) {
+                curItem := items + count * EDI_CUS_ITEM_SIZE;
+                var zi: int64 := 0;
+                while (zi < EDI_CUS_ITEM_SIZE) { poke8(curItem + zi, 0); zi := zi + 1; }
+                if (n > 1) {
+                    poke64(curItem + EDI_CUS_ITEM_DESC,    cusEP(elems, 1));
+                    poke64(curItem + EDI_CUS_ITEM_DESCLEN, cusEL(elems, 1));
+                }
+                count := count + 1;
+            }
+
+            // MOA+66 = item customs value
+            if (cusTagIs(seg, 77, 79, 65) == 1 && curItem != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "66" item value
+                        if (ql == 2 && peek8(qp)==54 && peek8(qp+1)==54) {
+                            poke64(curItem + EDI_CUS_ITEM_VALUE, cusParseRevenue(
+                                peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                                peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // RFF+HS = HS tariff code
+            if (cusTagIs(seg, 82, 70, 70) == 1 && curItem != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "HS" = 72,83
+                        if (ql == 2 && peek8(qp)==72 && peek8(qp+1)==83) {
+                            poke64(curItem + EDI_CUS_ITEM_HSCODE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(curItem + EDI_CUS_ITEM_HSCODELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // QTY+1:qty'
+            if (cusTagIs(seg, 81, 84, 89) == 1 && curItem != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(cusEP(elems,0), cusEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        poke64(curItem + EDI_CUS_ITEM_QTY, cusParseInt(
+                            peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                            peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// Write line items
+fn cusWriteItems(out: int64, pos: int64, outMax: int64, items: int64, itemCount: int64): int64 {
+    var i: int64 := 0;
+    while (i < itemCount) {
+        var it:      int64 := items + i * EDI_CUS_ITEM_SIZE;
+        var descPtr: int64 := peek64(it + EDI_CUS_ITEM_DESC);
+        var descLen: int64 := peek64(it + EDI_CUS_ITEM_DESCLEN);
+        var qty:     int64 := peek64(it + EDI_CUS_ITEM_QTY);
+        var val:     int64 := peek64(it + EDI_CUS_ITEM_VALUE);
+        var hsPtr:   int64 := peek64(it + EDI_CUS_ITEM_HSCODE);
+        var hsLen:   int64 := peek64(it + EDI_CUS_ITEM_HSCODELEN);
+
+        // LIN+n+desc'
+        pos := cusPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := cusPutInt(out, pos, outMax, i + 1);
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (descPtr != 0 && descLen > 0) { pos := cusPutStr(out, pos, outMax, descPtr, descLen); }
+        pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+1:qty'
+        if (qty > 0) {
+            pos := cusPutStr(out, pos, outMax, "QTY"c as int64, 3);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := cusPutChar(out, pos, outMax, 49);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := cusPutInt(out, pos, outMax, qty);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // MOA+66:value'
+        if (val > 0) {
+            pos := cusPutStr(out, pos, outMax, "MOA"c as int64, 3);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := cusPutStr(out, pos, outMax, "66"c as int64, 2);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := cusPutRevenue(out, pos, outMax, val);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // RFF+HS:hscode'
+        if (hsPtr != 0 && hsLen > 0) {
+            pos := cusPutStr(out, pos, outMax, "RFF"c as int64, 3);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := cusPutStr(out, pos, outMax, "HS"c as int64, 2);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := cusPutStr(out, pos, outMax, hsPtr, hsLen);
+            pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        i := i + 1;
+    }
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiCuscarWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_CUS_HDR_BGMQUAL, EDI_CUS_BGM_CUSCAR);
+    var pos: int64 := cusWriteHead(hdr, out, outMax);
+    pos := cusWriteItems(out, pos, outMax, items, itemCount);
+    pos := cusWriteCnt(out, pos, outMax, itemCount);
+    return pos;
+}
+
+pub fn EdiCuscarRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    cusReadMsg(buf, bufLen, hdr);
+    return cusReadItems(buf, bufLen, items, maxItems);
+}
+
+pub fn EdiCusdecWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_CUS_HDR_BGMQUAL, EDI_CUS_BGM_CUSDEC);
+    var pos: int64 := cusWriteHead(hdr, out, outMax);
+    pos := cusWriteItems(out, pos, outMax, items, itemCount);
+    pos := cusWriteCnt(out, pos, outMax, itemCount);
+    return pos;
+}
+
+pub fn EdiCusdecRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    cusReadMsg(buf, bufLen, hdr);
+    return cusReadItems(buf, bufLen, items, maxItems);
+}
+
+pub fn EdiCusexpWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_CUS_HDR_BGMQUAL, EDI_CUS_BGM_CUSEXP);
+    var pos: int64 := cusWriteHead(hdr, out, outMax);
+    pos := cusWriteItems(out, pos, outMax, items, itemCount);
+    pos := cusWriteCnt(out, pos, outMax, itemCount);
+    return pos;
+}
+
+pub fn EdiCusexpRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    cusReadMsg(buf, bufLen, hdr);
+    return cusReadItems(buf, bufLen, items, maxItems);
+}
+
+// CUSRSP: customs response — adds STS+rspCode after head (no items)
+pub fn EdiCusrspWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_CUS_HDR_BGMQUAL, EDI_CUS_BGM_CUSRSP);
+    var pos: int64 := cusWriteHead(hdr, out, outMax);
+    var code: int64 := peek64(hdr + EDI_CUS_HDR_RSPCODE);
+    // STS+code'
+    pos := cusPutStr(out, pos, outMax, "STS"c as int64, 3);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := cusPutInt(out, pos, outMax, code);
+    pos := cusPutChar(out, pos, outMax, EDI_DEF_SEG);
+    pos := cusWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+
+pub fn EdiCusrspRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return cusReadMsg(buf, bufLen, hdr);
+}
