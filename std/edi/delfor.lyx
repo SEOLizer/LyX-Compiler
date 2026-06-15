@@ -1,0 +1,535 @@
+// std/edi/delfor.lyx — Delivery scheduling: DELFOR + DELJIT (WP-EDI-05)
+//
+// DELFOR (BGM 241): rolling delivery schedule with firm (type 1) and planning (type 3) demands
+//   Cumulative quantities (SCC) validated: new cumu ≥ old cumu, else warning
+// DELJIT (BGM 251): just-in-time delivery with minute-precision datetime (DTM qualifier 201)
+//
+// EdiDelforReq (EDI_DELFOR_REQ_SIZE bytes):  Date ptr + Qty + Type (1=firm, 3=plan)
+// EdiDelforLine (EDI_DELFOR_LINE_SIZE bytes): GTIN ptr/len + CumulQty + ReqCount + Reqs[52]
+// EdiDeljitLine (EDI_DELJIT_LINE_SIZE bytes): GTIN ptr/len + Qty + Datetime ptr/len + Loc ptr/len
+//
+// Public API:
+//   EdiDelforWrite(refNum, date, lines, lineCount, out, outMax) → bytes
+//   EdiDelforRead(buf, bufLen, lines, maxLines)                  → lineCount
+//   EdiDelforCheckCumu(newCumu, oldCumu)                         → 0=ok, 1=warning
+//   EdiDeljitWrite(refNum, date, lines, lineCount, out, outMax)  → bytes
+//   EdiDeljitRead(buf, bufLen, lines, maxLines)                   → lineCount
+
+unit std.edi.delfor;
+
+import std.edi.core;
+import std.alloc;
+
+// ── EdiDelforReq offsets (per requirement slot) ───────────────────────────────
+pub con EDI_DELFOR_REQ_DATE: int64 := 0;   // ptr to 8-char "YYYYMMDD"
+pub con EDI_DELFOR_REQ_QTY:  int64 := 8;
+pub con EDI_DELFOR_REQ_TYPE: int64 := 16;  // 1=firm, 3=planning
+pub con EDI_DELFOR_REQ_SIZE: int64 := 24;
+pub con EDI_DELFOR_MAX_REQ:  int64 := 52;  // 52 weeks max
+
+// ── EdiDelforLine offsets ─────────────────────────────────────────────────────
+pub con EDI_DELFOR_LINE_GTIN:     int64 := 0;
+pub con EDI_DELFOR_LINE_GTINLEN:  int64 := 8;
+pub con EDI_DELFOR_LINE_CUMULQTY: int64 := 16;
+pub con EDI_DELFOR_LINE_REQCOUNT: int64 := 24;
+pub con EDI_DELFOR_LINE_REQS:     int64 := 32;
+// 32 + 52 * 24 = 1280
+pub con EDI_DELFOR_LINE_SIZE:     int64 := 1280;
+
+// ── EdiDeljitLine offsets ─────────────────────────────────────────────────────
+pub con EDI_DELJIT_LINE_GTIN:     int64 := 0;
+pub con EDI_DELJIT_LINE_GTINLEN:  int64 := 8;
+pub con EDI_DELJIT_LINE_QTY:      int64 := 16;
+pub con EDI_DELJIT_LINE_DATETIME: int64 := 24;   // ptr to 12-char CCYYMMDDHHMM
+pub con EDI_DELJIT_LINE_DTLEN:    int64 := 32;
+pub con EDI_DELJIT_LINE_LOC:      int64 := 40;
+pub con EDI_DELJIT_LINE_LOCLEN:   int64 := 48;
+pub con EDI_DELJIT_LINE_SIZE:     int64 := 56;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dlfStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn dlfPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn dlfPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn dlfPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return dlfPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := dlfPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+fn dlfParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+fn dlfTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn dlfElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn dlfElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — DELFOR
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write DELFOR. Each line has up to EDI_DELFOR_MAX_REQ requirements.
+// Requirements are encoded as QTY+type:qty' + DTM+64:date:102' pairs.
+pub fn EdiDelforWrite(refNum: int64, date: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var refLen: int64 := 0;
+    if (refNum != 0) { refLen := dlfStrLen(refNum); }
+
+    // BGM+241+refNum+9'  (241 = delivery schedule)
+    pos := dlfPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutStr(out, pos, outMax, "241"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refLen > 0) { pos := dlfPutStr(out, pos, outMax, refNum, refLen); }
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutChar(out, pos, outMax, 57);   // '9'
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // DTM+137:date:102'
+    if (date != 0) {
+        pos := dlfPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := dlfPutStr(out, pos, outMax, date, 8);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := dlfPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var li: int64 := 0;
+    while (li < lineCount) {
+        var line: int64 := lines + li * EDI_DELFOR_LINE_SIZE;
+        var gtinPtr:  int64 := peek64(line + EDI_DELFOR_LINE_GTIN);
+        var gtinLen:  int64 := peek64(line + EDI_DELFOR_LINE_GTINLEN);
+        var cumulQty: int64 := peek64(line + EDI_DELFOR_LINE_CUMULQTY);
+        var reqCount: int64 := peek64(line + EDI_DELFOR_LINE_REQCOUNT);
+
+        // LIN+n++GTIN:SRV'
+        pos := dlfPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutInt(out, pos, outMax, li + 1);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := dlfPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // SCC+1+cumulQty'  (cumulative scheduling quantity)
+        pos := dlfPutStr(out, pos, outMax, "SCC"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutChar(out, pos, outMax, 49);   // '1' = cumulative delivery pattern
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutInt(out, pos, outMax, cumulQty);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // Per requirement: QTY+type:qty' then DTM+64:date:102'
+        var ri: int64 := 0;
+        var maxR: int64 := reqCount;
+        if (maxR > EDI_DELFOR_MAX_REQ) { maxR := EDI_DELFOR_MAX_REQ; }
+        while (ri < maxR) {
+            var req: int64 := line + EDI_DELFOR_LINE_REQS + ri * EDI_DELFOR_REQ_SIZE;
+            var reqDate: int64 := peek64(req + EDI_DELFOR_REQ_DATE);
+            var reqQty:  int64 := peek64(req + EDI_DELFOR_REQ_QTY);
+            var reqType: int64 := peek64(req + EDI_DELFOR_REQ_TYPE);
+
+            // QTY+type:qty'  (type 1=firm, 3=planning)
+            pos := dlfPutStr(out, pos, outMax, "QTY"c as int64, 3);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := dlfPutInt(out, pos, outMax, reqType);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutInt(out, pos, outMax, reqQty);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+            // DTM+64:date:102'  (64 = delivery date)
+            if (reqDate != 0) {
+                pos := dlfPutStr(out, pos, outMax, "DTM"c as int64, 3);
+                pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+                pos := dlfPutStr(out, pos, outMax, "64"c as int64, 2);
+                pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+                pos := dlfPutStr(out, pos, outMax, reqDate, 8);
+                pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+                pos := dlfPutStr(out, pos, outMax, "102"c as int64, 3);
+                pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+            }
+            ri := ri + 1;
+        }
+        li := li + 1;
+    }
+
+    // CNT+2:lineCount'
+    pos := dlfPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutChar(out, pos, outMax, 50);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := dlfPutInt(out, pos, outMax, lineCount);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse DELFOR. Returns article line count. Reqs stored per line.
+pub fn EdiDelforRead(buf: int64, bufLen: int64, lines: int64, maxLines: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    // pending requirement (QTY seen, waiting for DTM)
+    var pendType: int64 := 0;
+    var pendQty:  int64 := 0;
+    var pendActive: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // LIN → new article
+            if (dlfTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_DELFOR_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_DELFOR_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(dlfElemPtr(elems, 2), dlfElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_DELFOR_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_DELFOR_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                    pendActive := 0;
+                }
+            }
+
+            // SCC+1+cumulQty' → cumulative quantity from elem[1]
+            if (dlfTagIs(seg, 83, 67, 67) == 1 && curLine != 0) {   // "SCC"
+                if (n > 1) {
+                    poke64(curLine + EDI_DELFOR_LINE_CUMULQTY, dlfParseInt(dlfElemPtr(elems, 1), dlfElemLen(elems, 1)));
+                }
+            }
+
+            // QTY+type:qty' → start a pending requirement
+            if (dlfTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(dlfElemPtr(elems, 0), dlfElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var tp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var tl: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var qp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // qualifier 1=firm, 3=planning
+                        if (tl >= 1 && (peek8(tp) == 49 || peek8(tp) == 51)) {
+                            pendType := dlfParseInt(tp, tl);
+                            pendQty  := dlfParseInt(qp, ql);
+                            pendActive := 1;
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // DTM+64:date:102' → finalize pending requirement
+            if (dlfTagIs(seg, 68, 84, 77) == 1 && curLine != 0 && pendActive == 1) {   // "DTM"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(dlfElemPtr(elems, 0), dlfElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // qualifier "64" = 54,52
+                        if (ql >= 2 && peek8(qp) == 54 && peek8(qp+1) == 52) {
+                            var rc: int64 := peek64(curLine + EDI_DELFOR_LINE_REQCOUNT);
+                            if (rc < EDI_DELFOR_MAX_REQ) {
+                                var req: int64 := curLine + EDI_DELFOR_LINE_REQS + rc * EDI_DELFOR_REQ_SIZE;
+                                poke64(req + EDI_DELFOR_REQ_DATE, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                                poke64(req + EDI_DELFOR_REQ_QTY,  pendQty);
+                                poke64(req + EDI_DELFOR_REQ_TYPE, pendType);
+                                poke64(curLine + EDI_DELFOR_LINE_REQCOUNT, rc + 1);
+                            }
+                            pendActive := 0;
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// Check cumulative quantity regression. Returns 0 if ok (new >= old), 1 if warning.
+pub fn EdiDelforCheckCumu(newCumu: int64, oldCumu: int64): int64 {
+    if (newCumu < oldCumu) { return 1; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — DELJIT
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write DELJIT. Lines use 12-char CCYYMMDDHHMM datetime (qualifier 201).
+pub fn EdiDeljitWrite(refNum: int64, date: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var refLen: int64 := 0;
+    if (refNum != 0) { refLen := dlfStrLen(refNum); }
+
+    // BGM+251+refNum+9'  (251 = JIT delivery message)
+    pos := dlfPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutStr(out, pos, outMax, "251"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refLen > 0) { pos := dlfPutStr(out, pos, outMax, refNum, refLen); }
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutChar(out, pos, outMax, 57);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // DTM+137:date:102'  (document date, 8-char)
+    if (date != 0) {
+        pos := dlfPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := dlfPutStr(out, pos, outMax, date, 8);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := dlfPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var li: int64 := 0;
+    while (li < lineCount) {
+        var line: int64 := lines + li * EDI_DELJIT_LINE_SIZE;
+        var gtinPtr: int64 := peek64(line + EDI_DELJIT_LINE_GTIN);
+        var gtinLen: int64 := peek64(line + EDI_DELJIT_LINE_GTINLEN);
+        var qty:     int64 := peek64(line + EDI_DELJIT_LINE_QTY);
+        var dtPtr:   int64 := peek64(line + EDI_DELJIT_LINE_DATETIME);
+        var dtLen:   int64 := peek64(line + EDI_DELJIT_LINE_DTLEN);
+        var locPtr:  int64 := peek64(line + EDI_DELJIT_LINE_LOC);
+        var locLen:  int64 := peek64(line + EDI_DELJIT_LINE_LOCLEN);
+
+        // LIN+n++GTIN:SRV'
+        pos := dlfPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutInt(out, pos, outMax, li + 1);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := dlfPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // DTM+201:ccyymmddhhmm:201'  (201 = delivery date and time, CCYYMMDDHHMM)
+        if (dtPtr != 0 && dtLen > 0) {
+            pos := dlfPutStr(out, pos, outMax, "DTM"c as int64, 3);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := dlfPutStr(out, pos, outMax, "201"c as int64, 3);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutStr(out, pos, outMax, dtPtr, dtLen);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutStr(out, pos, outMax, "201"c as int64, 3);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // QTY+1:qty'
+        pos := dlfPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := dlfPutChar(out, pos, outMax, 49);   // '1'
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := dlfPutInt(out, pos, outMax, qty);
+        pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // LOC+11:location'
+        if (locPtr != 0 && locLen > 0) {
+            pos := dlfPutStr(out, pos, outMax, "LOC"c as int64, 3);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := dlfPutStr(out, pos, outMax, "11"c as int64, 2);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := dlfPutStr(out, pos, outMax, locPtr, locLen);
+            pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        li := li + 1;
+    }
+
+    // CNT+2:lineCount'
+    pos := dlfPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := dlfPutChar(out, pos, outMax, 50);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := dlfPutInt(out, pos, outMax, lineCount);
+    pos := dlfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse DELJIT. Returns line count.
+pub fn EdiDeljitRead(buf: int64, bufLen: int64, lines: int64, maxLines: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // LIN → new line
+            if (dlfTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_DELJIT_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_DELJIT_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(dlfElemPtr(elems, 2), dlfElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_DELJIT_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_DELJIT_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                }
+            }
+
+            // DTM+201:datetime:201' → delivery datetime with minute precision
+            if (dlfTagIs(seg, 68, 84, 77) == 1 && curLine != 0) {   // "DTM"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(dlfElemPtr(elems, 0), dlfElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // qualifier "201" = 50,48,49 ('2','0','1')
+                        if (ql >= 3 && peek8(qp) == 50 && peek8(qp+1) == 48 && peek8(qp+2) == 49) {
+                            poke64(curLine + EDI_DELJIT_LINE_DATETIME, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(curLine + EDI_DELJIT_LINE_DTLEN,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // QTY+1:qty' → quantity
+            if (dlfTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(dlfElemPtr(elems, 0), dlfElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 1 && peek8(qp) == 49) {   // qualifier "1"
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_DELJIT_LINE_QTY, dlfParseInt(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // LOC+11:location'
+            if (dlfTagIs(seg, 76, 79, 67) == 1 && curLine != 0) {   // "LOC"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(dlfElemPtr(elems, 0), dlfElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(curLine + EDI_DELJIT_LINE_LOC,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_DELJIT_LINE_LOCLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
