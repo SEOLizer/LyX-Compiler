@@ -1,0 +1,764 @@
+// std/edi/core.lyx — EDIFACT Interchange Engine (WP-EDI-00)
+//
+// Implements the complete interchange envelope:
+//   UNA (character set definition), UNB/UNZ (interchange),
+//   UNG/UNE (group), UNH/UNT (message), segment tokenizer with
+//   correct escape handling, sequence numbers and duplicate detection.
+//
+// Public API:
+//   EdiCtxInit(ctx)
+//   EdiStateInit(state)
+//   EdiUnaRead(buf, bufLen, out)                    → int64 (EDI_OK / EDI_ERR_NOUNA)
+//   EdiUnaWrite(ctx, out, outMax)                   → int64 (bytes written)
+//   EdiSegCtxInit(sctx, una, startPos)
+//   EdiSegmentNext(buf, bufLen, sctx, seg)          → int64 (1=found, 0=end)
+//   EdiElementSplit(seg, out, maxOut)               → int64 (element count)
+//   EdiComponentSplit(ptr, len, out, maxOut)        → int64 (component count)
+//   EdiUnescape(src, srcLen, dst, dstMax)           → int64 (unescaped length)
+//   EdiUnbRead(buf, bufLen, ctx)                    → int64 (EDI_OK / error)
+//   EdiUnbWrite(ictx, out, outMax)                  → int64 (bytes written)
+//   EdiUnzWrite(ictx, msgCount, out, outMax)        → int64
+//   EdiUngWrite(ictx, msgType, grpRef, out, outMax) → int64
+//   EdiUneWrite(ictx, msgCount, grpRef, out, outMax)→ int64
+//   EdiUnhWrite(ictx, msgRef, msgType, out, outMax) → int64
+//   EdiUntWrite(ictx, segCount, msgRef, out, outMax)→ int64
+//   EdiSeqNext(state, partnerKey)                   → int64 (next seq no)
+//   EdiDuplicateCheck(state, partnerKey, icRef)     → int64 (1=dup, 0=new)
+
+unit std.edi.core;
+
+import std.alloc;
+
+// ── Error codes ───────────────────────────────────────────────────────────────
+pub con EDI_OK:           int64 := 0;
+pub con EDI_ERR_TRUNC:    int64 := 1;
+pub con EDI_ERR_NOUNA:    int64 := 2;
+pub con EDI_ERR_SYNTAX:   int64 := 3;
+pub con EDI_ERR_DUP:      int64 := 4;
+pub con EDI_ERR_OVERFLOW: int64 := 5;
+pub con EDI_ERR_PARTNER:  int64 := 6;
+
+// ── Charset codes ─────────────────────────────────────────────────────────────
+pub con EDI_CHARSET_UNOA: int64 := 1;   // A-Z 0-9 + few specials
+pub con EDI_CHARSET_UNOB: int64 := 2;   // Latin-1 / ISO 8859-1
+pub con EDI_CHARSET_UNOC: int64 := 3;   // UTF-8
+
+// ── Default delimiters (without UNA) ─────────────────────────────────────────
+pub con EDI_DEF_COMP: int64 := 58;   // ':'
+pub con EDI_DEF_DATA: int64 := 43;   // '+'
+pub con EDI_DEF_DEC:  int64 := 46;   // '.'
+pub con EDI_DEF_REL:  int64 := 63;   // '?'
+pub con EDI_DEF_SEG:  int64 := 39;   // '\''
+
+// ── UNA struct (EDI_UNA_SIZE bytes, caller-allocated) ────────────────────────
+pub con EDI_UNA_COMP: int64 := 0;
+pub con EDI_UNA_DATA: int64 := 8;
+pub con EDI_UNA_DEC:  int64 := 16;
+pub con EDI_UNA_REL:  int64 := 24;
+pub con EDI_UNA_RES:  int64 := 32;
+pub con EDI_UNA_SEG:  int64 := 40;
+pub con EDI_UNA_SIZE: int64 := 48;
+
+// ── Interchange context (EDI_CTX_SIZE bytes) ─────────────────────────────────
+pub con EDI_CTX_SENDER:   int64 := 0;    // ptr into caller buffer (no copy)
+pub con EDI_CTX_SNDLEN:   int64 := 8;
+pub con EDI_CTX_RCVR:     int64 := 16;
+pub con EDI_CTX_RCVLEN:   int64 := 24;
+pub con EDI_CTX_ICREF:    int64 := 32;
+pub con EDI_CTX_ICREFLEN: int64 := 40;
+pub con EDI_CTX_DATE:     int64 := 48;   // ptr to "YYYYMMDD" or "YYMMDD"
+pub con EDI_CTX_TIME:     int64 := 56;   // ptr to "HHMM"
+pub con EDI_CTX_CHARSET:  int64 := 64;
+pub con EDI_CTX_TESTFLAG: int64 := 72;   // 0=production, 1=test
+pub con EDI_CTX_COMP:     int64 := 80;
+pub con EDI_CTX_DATA:     int64 := 88;
+pub con EDI_CTX_DEC:      int64 := 96;
+pub con EDI_CTX_REL:      int64 := 104;
+pub con EDI_CTX_SEG:      int64 := 112;
+pub con EDI_CTX_MSGCOUNT: int64 := 120;
+pub con EDI_CTX_SIZE:     int64 := 128;
+
+// ── Segment iterator context (EDI_SEGCTX_SIZE bytes) ─────────────────────────
+pub con EDI_SEGCTX_POS:  int64 := 0;
+pub con EDI_SEGCTX_COMP: int64 := 8;
+pub con EDI_SEGCTX_DATA: int64 := 16;
+pub con EDI_SEGCTX_REL:  int64 := 24;
+pub con EDI_SEGCTX_SEG:  int64 := 32;
+pub con EDI_SEGCTX_SIZE: int64 := 40;
+
+// ── Segment result (EDI_SEG_SIZE bytes) ──────────────────────────────────────
+pub con EDI_SEG_PTR:  int64 := 0;   // pointer into original buffer
+pub con EDI_SEG_LEN:  int64 := 8;   // byte count (excluding segment terminator)
+pub con EDI_SEG_SIZE: int64 := 16;
+
+// ── Element / component array entry (EDI_ELEM_SIZE bytes each) ───────────────
+pub con EDI_ELEM_PTR:  int64 := 0;
+pub con EDI_ELEM_LEN:  int64 := 8;
+pub con EDI_ELEM_SIZE: int64 := 16;
+
+// ── Partner state (sequence + duplicate detection) ────────────────────────────
+pub con EDI_MAX_PARTNERS: int64 := 16;
+pub con EDI_DUP_RING:     int64 := 128;
+// Per slot: keyHash(8)+seqno(8)+ring[128×8=1024]+ringPos(8) = 1048
+pub con EDI_PARTNER_SLOT: int64 := 1048;
+// State total: count(8) + 16×1048 = 16776
+pub con EDI_STATE_SIZE:   int64 := 16776;
+pub con EDI_STATE_COUNT:  int64 := 0;
+pub con EDI_STATE_SLOTS:  int64 := 8;
+// Offsets within each partner slot
+pub con EDI_SLOT_HASH:    int64 := 0;
+pub con EDI_SLOT_SEQNO:   int64 := 8;
+pub con EDI_SLOT_RING:    int64 := 16;
+pub con EDI_SLOT_RINGPOS: int64 := 1040;   // 16 + 128×8
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ediStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+// Polynomial hash (no negative-literal dependency)
+fn ediHash(ptr: int64, len: int64): int64 {
+    var h: int64 := 17;
+    var i: int64 := 0;
+    while (i < len) {
+        h := h * 31 + peek8(ptr + i);
+        i := i + 1;
+    }
+    return h;
+}
+
+fn ediPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn ediPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+// Write decimal representation of a non-negative integer.
+fn ediPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return ediPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := ediPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+// Find or create partner slot by key string. Returns slot address, -1 if state full.
+fn ediPartnerSlot(state: int64, key: int64): int64 {
+    var keyLen: int64 := ediStrLen(key);
+    var keyHash: int64 := ediHash(key, keyLen);
+    var count: int64 := peek64(state + EDI_STATE_COUNT);
+    var i: int64 := 0;
+    while (i < count) {
+        var slotBase: int64 := state + EDI_STATE_SLOTS + i * EDI_PARTNER_SLOT;
+        if (peek64(slotBase + EDI_SLOT_HASH) == keyHash) { return slotBase; }
+        i := i + 1;
+    }
+    if (count >= EDI_MAX_PARTNERS) { return 0 - 1; }
+    var newSlot: int64 := state + EDI_STATE_SLOTS + count * EDI_PARTNER_SLOT;
+    poke64(newSlot + EDI_SLOT_HASH,    keyHash);
+    poke64(newSlot + EDI_SLOT_SEQNO,   0);
+    poke64(newSlot + EDI_SLOT_RINGPOS, 0);
+    poke64(state + EDI_STATE_COUNT, count + 1);
+    return newSlot;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Initialisation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Zero ctx and install default delimiters + UNOA charset.
+pub fn EdiCtxInit(ctx: int64) {
+    var i: int64 := 0;
+    while (i < EDI_CTX_SIZE) { poke8(ctx + i, 0); i := i + 1; }
+    poke64(ctx + EDI_CTX_COMP,    EDI_DEF_COMP);
+    poke64(ctx + EDI_CTX_DATA,    EDI_DEF_DATA);
+    poke64(ctx + EDI_CTX_DEC,     EDI_DEF_DEC);
+    poke64(ctx + EDI_CTX_REL,     EDI_DEF_REL);
+    poke64(ctx + EDI_CTX_SEG,     EDI_DEF_SEG);
+    poke64(ctx + EDI_CTX_CHARSET, EDI_CHARSET_UNOA);
+}
+
+// Zero partner-state block (must be called before EdiSeqNext / EdiDuplicateCheck).
+pub fn EdiStateInit(state: int64) {
+    var i: int64 := 0;
+    while (i < EDI_STATE_SIZE) { poke8(state + i, 0); i := i + 1; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — UNA
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Parse UNA segment. Writes defaults to out if absent.
+// Returns EDI_OK when UNA present and read, EDI_ERR_NOUNA when absent (defaults apply).
+pub fn EdiUnaRead(buf: int64, bufLen: int64, out: int64): int64 {
+    poke64(out + EDI_UNA_COMP, EDI_DEF_COMP);
+    poke64(out + EDI_UNA_DATA, EDI_DEF_DATA);
+    poke64(out + EDI_UNA_DEC,  EDI_DEF_DEC);
+    poke64(out + EDI_UNA_REL,  EDI_DEF_REL);
+    poke64(out + EDI_UNA_RES,  32);
+    poke64(out + EDI_UNA_SEG,  EDI_DEF_SEG);
+    if (bufLen < 9) { return EDI_ERR_NOUNA; }
+    if (peek8(buf)   != 85) { return EDI_ERR_NOUNA; }   // 'U'
+    if (peek8(buf+1) != 78) { return EDI_ERR_NOUNA; }   // 'N'
+    if (peek8(buf+2) != 65) { return EDI_ERR_NOUNA; }   // 'A'
+    poke64(out + EDI_UNA_COMP, peek8(buf+3) as int64);
+    poke64(out + EDI_UNA_DATA, peek8(buf+4) as int64);
+    poke64(out + EDI_UNA_DEC,  peek8(buf+5) as int64);
+    poke64(out + EDI_UNA_REL,  peek8(buf+6) as int64);
+    poke64(out + EDI_UNA_RES,  peek8(buf+7) as int64);
+    poke64(out + EDI_UNA_SEG,  peek8(buf+8) as int64);
+    return EDI_OK;
+}
+
+// Write UNA segment (9 bytes) from ctx delimiter fields.
+pub fn EdiUnaWrite(ctx: int64, out: int64, outMax: int64): int64 {
+    if (outMax < 9) { return 0 - 1; }
+    poke8(out,   85); poke8(out+1, 78); poke8(out+2, 65);   // "UNA"
+    poke8(out+3, peek64(ctx + EDI_CTX_COMP));
+    poke8(out+4, peek64(ctx + EDI_CTX_DATA));
+    poke8(out+5, peek64(ctx + EDI_CTX_DEC));
+    poke8(out+6, peek64(ctx + EDI_CTX_REL));
+    poke8(out+7, 32);
+    poke8(out+8, peek64(ctx + EDI_CTX_SEG));
+    return 9;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Segment iterator
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Initialise segment cursor from UNA (or default-filled UNA struct) and start offset.
+// startPos = 9 when UNA present, 0 otherwise.
+pub fn EdiSegCtxInit(sctx: int64, una: int64, startPos: int64) {
+    poke64(sctx + EDI_SEGCTX_POS,  startPos);
+    poke64(sctx + EDI_SEGCTX_COMP, peek64(una + EDI_UNA_COMP));
+    poke64(sctx + EDI_SEGCTX_DATA, peek64(una + EDI_UNA_DATA));
+    poke64(sctx + EDI_SEGCTX_REL,  peek64(una + EDI_UNA_REL));
+    poke64(sctx + EDI_SEGCTX_SEG,  peek64(una + EDI_UNA_SEG));
+}
+
+// Advance to the next segment. Fills seg (EDI_SEG_SIZE) with ptr+len into buf.
+// Escape character '?' prevents the next byte from being treated as a terminator.
+// Returns 1 when a segment was found, 0 at end of buffer.
+pub fn EdiSegmentNext(buf: int64, bufLen: int64, sctx: int64, seg: int64): int64 {
+    var pos:  int64 := peek64(sctx + EDI_SEGCTX_POS);
+    var rel:  int64 := peek64(sctx + EDI_SEGCTX_REL);
+    var term: int64 := peek64(sctx + EDI_SEGCTX_SEG);
+
+    // Skip CR / LF / space between segments
+    var skipping: int64 := 1;
+    while (pos < bufLen && skipping == 1) {
+        var c: int64 := peek8(buf + pos);
+        if (c == 13 || c == 10 || c == 32) {
+            pos := pos + 1;
+        } else {
+            skipping := 0;
+        }
+    }
+    if (pos >= bufLen) { return 0; }
+
+    var segStart: int64 := pos;
+    var found:    int64 := 0;
+    while (pos < bufLen && found == 0) {
+        var ch: int64 := peek8(buf + pos);
+        if (ch == rel) {
+            // Release indicator: next char is literal, skip both
+            pos := pos + 2;
+            if (pos > bufLen) { pos := bufLen; }
+        } else {
+            if (ch == term) {
+                found := 1;
+            } else {
+                pos := pos + 1;
+            }
+        }
+    }
+    if (pos == segStart) { return 0; }
+
+    poke64(seg + EDI_SEG_PTR, buf + segStart);
+    if (found == 1) {
+        poke64(seg + EDI_SEG_LEN, pos - segStart);
+        poke64(sctx + EDI_SEGCTX_POS, pos + 1);   // skip terminator
+    } else {
+        poke64(seg + EDI_SEG_LEN, pos - segStart);
+        poke64(sctx + EDI_SEGCTX_POS, pos);
+    }
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Data element and component splitting
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Split segment into data elements by DATA separator (default '+').
+// seg: EDI_SEG struct (PTR/LEN). Skips 3-char tag and the following data separator.
+// out: array of EDI_ELEM_SIZE entries. Returns element count.
+// Note: element PTR/LEN point into the original buffer and include escape chars;
+//       call EdiUnescape() to get clean values.
+pub fn EdiElementSplit(seg: int64, out: int64, maxOut: int64): int64 {
+    var ptr: int64 := peek64(seg + EDI_SEG_PTR);
+    var len: int64 := peek64(seg + EDI_SEG_LEN);
+    if (len < 4) { return 0; }   // need at least "TAG+" for any elements
+    var sep:    int64 := EDI_DEF_DATA;
+    var rel:    int64 := EDI_DEF_REL;
+    var pos:    int64 := 4;      // skip "TAG" (3) + data separator (1)
+    var eStart: int64 := 4;
+    var count:  int64 := 0;
+
+    while (pos <= len && count < maxOut) {
+        var atEnd: int64 := 0;
+        if (pos == len) { atEnd := 1; }
+        var isSep: int64 := 0;
+        if (pos < len) {
+            var ch: int64 := peek8(ptr + pos);
+            if (ch == rel) {
+                pos := pos + 2;
+                if (pos > len) { pos := len; }
+            } else {
+                if (ch == sep) {
+                    isSep := 1;
+                } else {
+                    pos := pos + 1;
+                }
+            }
+        }
+        if (isSep == 1 || atEnd == 1) {
+            poke64(out + count * EDI_ELEM_SIZE + EDI_ELEM_PTR, ptr + eStart);
+            poke64(out + count * EDI_ELEM_SIZE + EDI_ELEM_LEN, pos - eStart);
+            count := count + 1;
+            pos    := pos + 1;
+            eStart := pos;
+        }
+    }
+    return count;
+}
+
+// Split a raw data element into components by COMP separator (default ':').
+// ptr/len: raw element bytes. out: EDI_ELEM array. Returns component count.
+pub fn EdiComponentSplit(ptr: int64, len: int64, out: int64, maxOut: int64): int64 {
+    var sep:    int64 := EDI_DEF_COMP;
+    var rel:    int64 := EDI_DEF_REL;
+    var pos:    int64 := 0;
+    var eStart: int64 := 0;
+    var count:  int64 := 0;
+
+    while (pos <= len && count < maxOut) {
+        var atEnd: int64 := 0;
+        if (pos == len) { atEnd := 1; }
+        var isSep: int64 := 0;
+        if (pos < len) {
+            var ch: int64 := peek8(ptr + pos);
+            if (ch == rel) {
+                pos := pos + 2;
+                if (pos > len) { pos := len; }
+            } else {
+                if (ch == sep) {
+                    isSep := 1;
+                } else {
+                    pos := pos + 1;
+                }
+            }
+        }
+        if (isSep == 1 || atEnd == 1) {
+            poke64(out + count * EDI_ELEM_SIZE + EDI_ELEM_PTR, ptr + eStart);
+            poke64(out + count * EDI_ELEM_SIZE + EDI_ELEM_LEN, pos - eStart);
+            count := count + 1;
+            pos    := pos + 1;
+            eStart := pos;
+        }
+    }
+    return count;
+}
+
+// Remove EDIFACT release indicators ('?') from raw element bytes.
+// Returns unescaped byte count. Caller must provide dst buffer of at least srcLen bytes.
+pub fn EdiUnescape(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    var rel: int64 := EDI_DEF_REL;
+    var si:  int64 := 0;
+    var di:  int64 := 0;
+    while (si < srcLen && di < dstMax) {
+        var ch: int64 := peek8(src + si);
+        if (ch == rel && si + 1 < srcLen) {
+            si := si + 1;
+            poke8(dst + di, peek8(src + si));
+            di := di + 1;
+            si := si + 1;
+        } else {
+            poke8(dst + di, ch);
+            di := di + 1;
+            si := si + 1;
+        }
+    }
+    return di;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — UNB / UNZ
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Parse UNB segment (buf must start with "UNB", ctx must have delimiters set).
+// Fills ctx: SENDER/SNDLEN, RCVR/RCVLEN, ICREF/ICREFLEN, DATE, TIME, CHARSET, TESTFLAG.
+// All pointers set into buf (zero-copy). Returns EDI_OK or EDI_ERR_SYNTAX.
+pub fn EdiUnbRead(buf: int64, bufLen: int64, ctx: int64): int64 {
+    if (bufLen < 3) { return EDI_ERR_SYNTAX; }
+    if (peek8(buf) != 85 || peek8(buf+1) != 78 || peek8(buf+2) != 66) {
+        return EDI_ERR_SYNTAX;
+    }
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    poke64(seg + EDI_SEG_PTR, buf);
+    poke64(seg + EDI_SEG_LEN, bufLen);
+
+    var elems: int64 := alloc(16 * EDI_ELEM_SIZE);
+    var nElems: int64 := EdiElementSplit(seg, elems, 16);
+
+    // S001: syntax identifier + version  (elem 0)
+    if (nElems > 0) {
+        var e0p: int64 := peek64(elems + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+        var e0l: int64 := peek64(elems + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+        var cc: int64 := alloc(4 * EDI_ELEM_SIZE);
+        EdiComponentSplit(e0p, e0l, cc, 4);
+        var synP: int64 := peek64(cc + EDI_ELEM_PTR);
+        var synL: int64 := peek64(cc + EDI_ELEM_LEN);
+        if (synL >= 4) {
+            var last: int64 := peek8(synP + synL - 1);
+            if (last == 65) { poke64(ctx + EDI_CTX_CHARSET, EDI_CHARSET_UNOA); }
+            if (last == 66) { poke64(ctx + EDI_CTX_CHARSET, EDI_CHARSET_UNOB); }
+            if (last == 67) { poke64(ctx + EDI_CTX_CHARSET, EDI_CHARSET_UNOC); }
+        }
+        free(cc, 4 * EDI_ELEM_SIZE);
+    }
+
+    // S002: sender ID (elem 1, first component)
+    if (nElems > 1) {
+        var e1p: int64 := peek64(elems + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+        var e1l: int64 := peek64(elems + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+        var cc: int64 := alloc(4 * EDI_ELEM_SIZE);
+        EdiComponentSplit(e1p, e1l, cc, 4);
+        poke64(ctx + EDI_CTX_SENDER, peek64(cc + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+        poke64(ctx + EDI_CTX_SNDLEN, peek64(cc + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+        free(cc, 4 * EDI_ELEM_SIZE);
+    }
+
+    // S003: receiver ID (elem 2, first component)
+    if (nElems > 2) {
+        var e2p: int64 := peek64(elems + 2 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+        var e2l: int64 := peek64(elems + 2 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+        var cc: int64 := alloc(4 * EDI_ELEM_SIZE);
+        EdiComponentSplit(e2p, e2l, cc, 4);
+        poke64(ctx + EDI_CTX_RCVR,   peek64(cc + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+        poke64(ctx + EDI_CTX_RCVLEN, peek64(cc + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+        free(cc, 4 * EDI_ELEM_SIZE);
+    }
+
+    // S004: date + time  (elem 3)
+    if (nElems > 3) {
+        var e3p: int64 := peek64(elems + 3 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+        var e3l: int64 := peek64(elems + 3 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+        var cc: int64 := alloc(4 * EDI_ELEM_SIZE);
+        var nc: int64 := EdiComponentSplit(e3p, e3l, cc, 4);
+        poke64(ctx + EDI_CTX_DATE, peek64(cc + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+        if (nc > 1) {
+            poke64(ctx + EDI_CTX_TIME, peek64(cc + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+        }
+        free(cc, 4 * EDI_ELEM_SIZE);
+    }
+
+    // 0020: interchange control reference  (elem 4)
+    if (nElems > 4) {
+        poke64(ctx + EDI_CTX_ICREF,    peek64(elems + 4 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+        poke64(ctx + EDI_CTX_ICREFLEN, peek64(elems + 4 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+    }
+
+    // 0035: test indicator  (elem 10, optional)
+    if (nElems > 10) {
+        var tfP: int64 := peek64(elems + 10 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+        var tfL: int64 := peek64(elems + 10 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+        if (tfL > 0) {
+            if (peek8(tfP) == 49) { poke64(ctx + EDI_CTX_TESTFLAG, 1); }
+        }
+    }
+
+    free(elems, 16 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    return EDI_OK;
+}
+
+// Write UNB segment to out. ictx must have SENDER, RCVR, ICREF, DATE, TIME set.
+// Returns bytes written, or -1 on overflow.
+pub fn EdiUnbWrite(ictx: int64, out: int64, outMax: int64): int64 {
+    var pos:     int64 := 0;
+    var data:    int64 := peek64(ictx + EDI_CTX_DATA);
+    var comp:    int64 := peek64(ictx + EDI_CTX_COMP);
+    var seg:     int64 := peek64(ictx + EDI_CTX_SEG);
+    var charset: int64 := peek64(ictx + EDI_CTX_CHARSET);
+
+    // Tag
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 66);
+    pos := ediPutChar(out, pos, outMax, data);
+
+    // S001: syntax identifier
+    if (charset == EDI_CHARSET_UNOB) {
+        pos := ediPutChar(out, pos, outMax, 85);
+        pos := ediPutChar(out, pos, outMax, 78);
+        pos := ediPutChar(out, pos, outMax, 79);
+        pos := ediPutChar(out, pos, outMax, 66);
+    } else {
+        if (charset == EDI_CHARSET_UNOC) {
+            pos := ediPutChar(out, pos, outMax, 85);
+            pos := ediPutChar(out, pos, outMax, 78);
+            pos := ediPutChar(out, pos, outMax, 79);
+            pos := ediPutChar(out, pos, outMax, 67);
+        } else {
+            pos := ediPutChar(out, pos, outMax, 85);
+            pos := ediPutChar(out, pos, outMax, 78);
+            pos := ediPutChar(out, pos, outMax, 79);
+            pos := ediPutChar(out, pos, outMax, 65);   // UNOA (default)
+        }
+    }
+    pos := ediPutChar(out, pos, outMax, comp);
+    pos := ediPutChar(out, pos, outMax, 49);   // syntax version '1'
+    pos := ediPutChar(out, pos, outMax, data);
+
+    // S002: sender
+    var sndPtr: int64 := peek64(ictx + EDI_CTX_SENDER);
+    var sndLen: int64 := peek64(ictx + EDI_CTX_SNDLEN);
+    pos := ediPutStr(out, pos, outMax, sndPtr, sndLen);
+    pos := ediPutChar(out, pos, outMax, data);
+
+    // S003: receiver
+    var rcvPtr: int64 := peek64(ictx + EDI_CTX_RCVR);
+    var rcvLen: int64 := peek64(ictx + EDI_CTX_RCVLEN);
+    pos := ediPutStr(out, pos, outMax, rcvPtr, rcvLen);
+    pos := ediPutChar(out, pos, outMax, data);
+
+    // S004: date:time
+    var datePtr: int64 := peek64(ictx + EDI_CTX_DATE);
+    if (datePtr != 0) {
+        pos := ediPutStr(out, pos, outMax, datePtr, 8);
+    } else {
+        pos := ediPutStr(out, pos, outMax, "20000101"c as int64, 8);
+    }
+    pos := ediPutChar(out, pos, outMax, comp);
+    var timePtr: int64 := peek64(ictx + EDI_CTX_TIME);
+    if (timePtr != 0) {
+        pos := ediPutStr(out, pos, outMax, timePtr, 4);
+    } else {
+        pos := ediPutStr(out, pos, outMax, "0000"c as int64, 4);
+    }
+    pos := ediPutChar(out, pos, outMax, data);
+
+    // 0020: interchange control reference
+    var icrPtr: int64 := peek64(ictx + EDI_CTX_ICREF);
+    var icrLen: int64 := peek64(ictx + EDI_CTX_ICREFLEN);
+    pos := ediPutStr(out, pos, outMax, icrPtr, icrLen);
+
+    // 0035: test indicator (fields 5-10 are empty, field 10 = '1' if test)
+    var testFlag: int64 := peek64(ictx + EDI_CTX_TESTFLAG);
+    if (testFlag == 1) {
+        var j: int64 := 0;
+        while (j < 5) { pos := ediPutChar(out, pos, outMax, data); j := j + 1; }
+        pos := ediPutChar(out, pos, outMax, 49);
+    }
+
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// Write UNZ segment (interchange trailer).
+pub fn EdiUnzWrite(ictx: int64, msgCount: int64, out: int64, outMax: int64): int64 {
+    var pos:    int64 := 0;
+    var data:   int64 := peek64(ictx + EDI_CTX_DATA);
+    var seg:    int64 := peek64(ictx + EDI_CTX_SEG);
+    var icrPtr: int64 := peek64(ictx + EDI_CTX_ICREF);
+    var icrLen: int64 := peek64(ictx + EDI_CTX_ICREFLEN);
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 90);   // 'Z'
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutInt(out, pos, outMax, msgCount);
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, icrPtr, icrLen);
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — UNG / UNE (group envelope, optional)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write UNG (group header). msgType e.g. "INVOIC", grpRef: group control reference.
+pub fn EdiUngWrite(ictx: int64, msgType: int64, grpRef: int64, out: int64, outMax: int64): int64 {
+    var pos:  int64 := 0;
+    var data: int64 := peek64(ictx + EDI_CTX_DATA);
+    var comp: int64 := peek64(ictx + EDI_CTX_COMP);
+    var seg:  int64 := peek64(ictx + EDI_CTX_SEG);
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 71);   // 'G'
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, msgType, ediStrLen(msgType));
+    pos := ediPutChar(out, pos, outMax, data);
+    var sndPtr: int64 := peek64(ictx + EDI_CTX_SENDER);
+    pos := ediPutStr(out, pos, outMax, sndPtr, peek64(ictx + EDI_CTX_SNDLEN));
+    pos := ediPutChar(out, pos, outMax, data);
+    var rcvPtr: int64 := peek64(ictx + EDI_CTX_RCVR);
+    pos := ediPutStr(out, pos, outMax, rcvPtr, peek64(ictx + EDI_CTX_RCVLEN));
+    pos := ediPutChar(out, pos, outMax, data);
+    var datePtr: int64 := peek64(ictx + EDI_CTX_DATE);
+    if (datePtr != 0) {
+        pos := ediPutStr(out, pos, outMax, datePtr, 8);
+    } else {
+        pos := ediPutStr(out, pos, outMax, "20000101"c as int64, 8);
+    }
+    pos := ediPutChar(out, pos, outMax, comp);
+    var timePtr: int64 := peek64(ictx + EDI_CTX_TIME);
+    if (timePtr != 0) {
+        pos := ediPutStr(out, pos, outMax, timePtr, 4);
+    } else {
+        pos := ediPutStr(out, pos, outMax, "0000"c as int64, 4);
+    }
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, grpRef, ediStrLen(grpRef));
+    pos := ediPutChar(out, pos, outMax, data);
+    // Controlling agency: UN, message version: D01B
+    pos := ediPutChar(out, pos, outMax, 85); pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutChar(out, pos, outMax, 68); pos := ediPutChar(out, pos, outMax, 48);
+    pos := ediPutChar(out, pos, outMax, 49); pos := ediPutChar(out, pos, outMax, 66);
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// Write UNE (group trailer). grpRef must match the corresponding UNG.
+pub fn EdiUneWrite(ictx: int64, msgCount: int64, grpRef: int64, out: int64, outMax: int64): int64 {
+    var pos:  int64 := 0;
+    var data: int64 := peek64(ictx + EDI_CTX_DATA);
+    var seg:  int64 := peek64(ictx + EDI_CTX_SEG);
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 69);   // 'E'
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutInt(out, pos, outMax, msgCount);
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, grpRef, ediStrLen(grpRef));
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — UNH / UNT (message envelope)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write UNH (message header). msgRef: "1", msgType: "INVOIC".
+// Uses standard D:01B:UN version/release/control.
+pub fn EdiUnhWrite(ictx: int64, msgRef: int64, msgType: int64, out: int64, outMax: int64): int64 {
+    var pos:  int64 := 0;
+    var data: int64 := peek64(ictx + EDI_CTX_DATA);
+    var comp: int64 := peek64(ictx + EDI_CTX_COMP);
+    var seg:  int64 := peek64(ictx + EDI_CTX_SEG);
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 72);   // 'H'
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, msgRef, ediStrLen(msgRef));
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, msgType, ediStrLen(msgType));
+    pos := ediPutChar(out, pos, outMax, comp);
+    pos := ediPutChar(out, pos, outMax, 68);   // 'D'
+    pos := ediPutChar(out, pos, outMax, comp);
+    pos := ediPutChar(out, pos, outMax, 48); pos := ediPutChar(out, pos, outMax, 49);
+    pos := ediPutChar(out, pos, outMax, 66);   // "01B"
+    pos := ediPutChar(out, pos, outMax, comp);
+    pos := ediPutChar(out, pos, outMax, 85); pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// Write UNT (message trailer). segCount must include UNH and UNT themselves.
+pub fn EdiUntWrite(ictx: int64, segCount: int64, msgRef: int64, out: int64, outMax: int64): int64 {
+    var pos:  int64 := 0;
+    var data: int64 := peek64(ictx + EDI_CTX_DATA);
+    var seg:  int64 := peek64(ictx + EDI_CTX_SEG);
+    pos := ediPutChar(out, pos, outMax, 85);
+    pos := ediPutChar(out, pos, outMax, 78);
+    pos := ediPutChar(out, pos, outMax, 84);   // 'T'
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutInt(out, pos, outMax, segCount);
+    pos := ediPutChar(out, pos, outMax, data);
+    pos := ediPutStr(out, pos, outMax, msgRef, ediStrLen(msgRef));
+    pos := ediPutChar(out, pos, outMax, seg);
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Sequence numbers and duplicate detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Return next session-scope sequence number for partnerKey.
+// State must have been initialised with EdiStateInit.
+// Returns -1 when state has no room for a new partner (EDI_MAX_PARTNERS reached).
+pub fn EdiSeqNext(state: int64, partnerKey: int64): int64 {
+    var slot: int64 := ediPartnerSlot(state, partnerKey);
+    if (slot == 0 - 1) { return 0 - 1; }
+    var seq: int64 := peek64(slot + EDI_SLOT_SEQNO) + 1;
+    poke64(slot + EDI_SLOT_SEQNO, seq);
+    return seq;
+}
+
+// Check if icRef was already seen for this partner (duplicate detection).
+// Returns 1 if duplicate, 0 if new. Side effect: registers icRef as seen.
+// Detection window: EDI_DUP_RING = 128 most recent ICRs per partner (hash-based).
+pub fn EdiDuplicateCheck(state: int64, partnerKey: int64, icRef: int64): int64 {
+    var slot: int64 := ediPartnerSlot(state, partnerKey);
+    if (slot == 0 - 1) { return 0; }
+    var icLen:    int64 := ediStrLen(icRef);
+    var icHash:   int64 := ediHash(icRef, icLen);
+    var ringBase: int64 := slot + EDI_SLOT_RING;
+    var ringPos:  int64 := peek64(slot + EDI_SLOT_RINGPOS);
+    // Scan ring for matching hash
+    var i:     int64 := 0;
+    var found: int64 := 0;
+    while (i < EDI_DUP_RING && found == 0) {
+        if (peek64(ringBase + i * 8) == icHash) { found := 1; }
+        i := i + 1;
+    }
+    if (found == 1) { return 1; }
+    // Register: overwrite oldest slot in ring
+    poke64(ringBase + ringPos * 8, icHash);
+    var nextPos: int64 := ringPos + 1;
+    if (nextPos >= EDI_DUP_RING) { nextPos := 0; }
+    poke64(slot + EDI_SLOT_RINGPOS, nextPos);
+    return 0;
+}
